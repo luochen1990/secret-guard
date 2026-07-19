@@ -61,10 +61,7 @@ async fn spawn_proxy_full(
 
 /// 用于测试的空 SecretTable (config_path 指向临时文件).
 fn test_secret_table() -> SecretTable {
-    let id = uuid::Uuid::new_v4().to_string();
-    let path = std::path::PathBuf::from(format!("/tmp/opencode/tmp/test-secret-table-{id}.toml"));
-    let _ = std::fs::remove_file(&path);
-    SecretTable::new(vec![], path)
+    test_secret_table_with(vec![])
 }
 
 /// 构造一个含给定 entries 的 SecretTable (用于 redact 测试).

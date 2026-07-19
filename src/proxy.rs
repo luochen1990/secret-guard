@@ -63,7 +63,9 @@ const MAX_RESP_BODY_RECORD: usize = 32 * 1024 * 1024;
 /// 1. 收集请求 body.
 /// 2. 若 SecretTable 非空, 调用 [`redact_request`] 把 body 中的 secret 替换为 mock.
 ///    记录在 [`ForwardRecord`] 中的是改写后的版本 (LLM 视角).
-/// 3. 上游响应先完整缓冲 (失去流式 UX), 调用 [`restore_response`] 反向替换后回传客户端.
+/// 3. 若启用了 redact (`redaction_map` 非空), 上游响应走 buffered 路径:
+///    完整累积后 [`restore_response`] 反向替换再回传客户端 (失去流式 UX, 保证 mock→real
+///    映射正确). 否则走 streaming 路径透传, 保持最佳 UX.
 ///    (流式 + chunk boundary 处理见第五步.)
 pub async fn forward(
     State(state): State<ProxyState>,
@@ -318,14 +320,14 @@ async fn fan_out_buffered(p: BufferedParams) -> Result<Response<Body>, AppError>
     }
 
     // record 存储的是 LLM 视角 (含 mock); 客户端拿到的是 restore 后的版本.
-    let record_text = utf8_view(&acc);
+    let acc_text = utf8_view(&acc);
     let elapsed = started.elapsed().as_millis() as u64;
     records.update_response_full(
         record_id,
         ResponseUpdate {
             resp_status: status_u16,
             resp_headers: redact_headers(&resp_headers_for_record),
-            resp_body: record_text,
+            resp_body: acc_text.clone(),
             elapsed_ms: elapsed,
             streamed,
             resp_complete: error_kind.is_none(),
@@ -334,7 +336,7 @@ async fn fan_out_buffered(p: BufferedParams) -> Result<Response<Body>, AppError>
     );
 
     // restore mock → real 给客户端.
-    let client_text = restore_response(&utf8_view(&acc), &redaction_map);
+    let client_text = restore_response(&acc_text, &redaction_map);
     let client_bytes = client_text.into_bytes();
     let mut resp = Response::new(Body::from(client_bytes));
     *resp.status_mut() = resp_status;

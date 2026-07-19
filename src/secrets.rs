@@ -94,6 +94,25 @@ pub fn validate_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 校验 secret value. 防止用户误配短 / 结构性 / 含 PUA 字符的 secret
+/// (避免 redact 时破坏整个请求 body).
+pub fn validate_value(value: &str) -> Result<(), String> {
+    if value.len() < 3 {
+        return Err(format!(
+            "secret value too short (min 3 bytes), got {}",
+            value.len()
+        ));
+    }
+    // PUA 字符与 mock 输出冲突, 拒绝.
+    if value
+        .chars()
+        .any(|c| (0xE000..=0xF8FF).contains(&(c as u32)))
+    {
+        return Err("secret value must not contain Unicode PUA characters (U+E000..U+F8FF)".into());
+    }
+    Ok(())
+}
+
 /// Secret 表. 在 ProxyState 中作为共享可变状态.
 #[derive(Clone)]
 pub struct SecretTable {
@@ -145,6 +164,7 @@ impl SecretTable {
     /// 保证两个并发 upsert 不会互相覆盖. 读取 (snapshot/get) 不持此锁, 不阻塞.
     pub fn upsert(&self, entry: SecretEntry) -> anyhow::Result<(SecretEntry, UpsertKind)> {
         validate_id(&entry.id).map_err(anyhow::Error::msg)?;
+        validate_value(&entry.value).map_err(anyhow::Error::msg)?;
         let _guard = self.persist_lock.lock();
         // 1. 读当前 entries, 计算新版本.
         let (new_entries, kind) = {
@@ -255,7 +275,7 @@ mod tests {
 
     #[test]
     fn snapshot_is_isolated() {
-        let t = SecretTable::new(vec![entry("a", "v1")], PathBuf::from("/tmp/x.toml"));
+        let t = SecretTable::new(vec![entry("a", "value-1")], PathBuf::from("/tmp/x.toml"));
         let mut snap = t.snapshot();
         snap.clear();
         assert_eq!(t.snapshot().len(), 1);
@@ -265,19 +285,22 @@ mod tests {
     fn upsert_inserts_then_updates() {
         let tmp = tempfile_path();
         let t = SecretTable::new(vec![], tmp.clone());
-        let (_, k1) = t.upsert(entry("a", "v1")).unwrap();
+        let (_, k1) = t.upsert(entry("a", "value-1")).unwrap();
         assert_eq!(k1, UpsertKind::Inserted);
         assert_eq!(t.snapshot().len(), 1);
-        let (_, k2) = t.upsert(entry("a", "v2")).unwrap();
+        let (_, k2) = t.upsert(entry("a", "value-2")).unwrap();
         assert_eq!(k2, UpsertKind::Updated);
         assert_eq!(t.snapshot().len(), 1);
-        assert_eq!(t.get("a").unwrap().value, "v2");
+        assert_eq!(t.get("a").unwrap().value, "value-2");
     }
 
     #[test]
     fn delete_removes_and_persists() {
         let tmp = tempfile_path();
-        let t = SecretTable::new(vec![entry("a", "v1"), entry("b", "v2")], tmp.clone());
+        let t = SecretTable::new(
+            vec![entry("a", "value-1"), entry("b", "value-b")],
+            tmp.clone(),
+        );
         assert_eq!(t.delete("a").unwrap(), DeleteOutcome::Deleted);
         assert_eq!(t.snapshot().len(), 1);
         let cfg = Config::load_or_default(&tmp).unwrap();
@@ -325,8 +348,8 @@ mod tests {
         let t = SecretTable::new(vec![], tmp);
         let t1 = t.clone();
         let t2 = t.clone();
-        let h1 = std::thread::spawn(move || t1.upsert(entry("a", "v1")));
-        let h2 = std::thread::spawn(move || t2.upsert(entry("b", "v2")));
+        let h1 = std::thread::spawn(move || t1.upsert(entry("a", "value-a")));
+        let h2 = std::thread::spawn(move || t2.upsert(entry("b", "value-b")));
         h1.join().unwrap().unwrap();
         h2.join().unwrap().unwrap();
         let snap = t.snapshot();

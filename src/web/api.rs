@@ -143,6 +143,11 @@ impl CreateSecretRequest {
         if self.value.is_empty() {
             return Err(ApiError::validation("value must not be empty"));
         }
+        // 检查 value 合法性 (长度 + PUA 字符). 通过 SecretTable::upsert 也会再校验,
+        // 但在这里先做能给出更友好的字段级错误.
+        if let Err(e) = crate::secrets::validate_value(&self.value) {
+            return Err(ApiError::validation(e));
+        }
         Ok(SecretEntry {
             id: self.id.unwrap_or_default(),
             name: self.name.filter(|s| !s.trim().is_empty()),

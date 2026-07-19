@@ -11,7 +11,9 @@
 //! (失去流式 UX, 但保证 mock→real 映射正确, 避免 chunk 边界问题).
 //! 第五步会引入 chunk boundary 处理恢复流式.
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
@@ -40,7 +42,7 @@ pub fn mock_secret(full_context: &str, real_secret: &str) -> String {
         // 空字符串不是合法 secret; 返回 PUA 起始作为兜底.
         return char::from_u32(PUA_START).unwrap().to_string();
     }
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut hasher = DefaultHasher::new();
     real_secret.hash(&mut hasher);
     let base = hasher.finish();
     let mut codepoint = PUA_START + ((base % PUA_LEN as u64) as u32);
@@ -76,7 +78,13 @@ impl RedactionMap {
         self.real_to_mock.is_empty()
     }
 
+    /// 插入映射. 若 mock 已存在但 real 不同 (碰撞), debug_assert 失败 (开发期捕获).
     pub fn insert(&mut self, real: String, mock: String) {
+        debug_assert!(
+            !self.mock_to_real.contains_key(&mock) || self.mock_to_real.get(&mock) == Some(&real),
+            "mock collision: mock={mock:?} already maps to {:?}, attempted {real:?}",
+            self.mock_to_real.get(&mock)
+        );
         self.mock_to_real.insert(mock.clone(), real.clone());
         self.real_to_mock.insert(real, mock);
     }
@@ -100,9 +108,9 @@ impl RedactionMap {
 /// 复杂度: O(secrets × body_size). MVP 阶段 secrets 数量 <100, body <16 MiB, 可接受.
 pub fn redact_request(body: &str, secrets: &[SecretEntry]) -> (String, RedactionMap) {
     let mut sorted: Vec<&SecretEntry> = secrets.iter().collect();
+    sorted.sort_by_key(|e| Reverse(e.value.len()));
     // 去重: 同一 value 只 redact 一次.
-    sorted.sort_by_key(|e| std::cmp::Reverse(e.value.len()));
-    let mut seen_values: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut seen_values = HashSet::new();
 
     let mut redacted = body.to_string();
     let mut map = RedactionMap::default();
@@ -210,7 +218,7 @@ mod tests {
         assert!(!redacted.contains("CCC"));
         assert_eq!(map.real_to_mock.len(), 3);
         // 三个 mock 互不相同.
-        let mocks: std::collections::HashSet<_> = map.real_to_mock.values().cloned().collect();
+        let mocks: HashSet<_> = map.real_to_mock.values().cloned().collect();
         assert_eq!(mocks.len(), 3);
     }
 
