@@ -2,9 +2,11 @@
 //!
 //! 路由策略: 所有路径都进入 [`proxy::forward`] handler, 实现透明转发.
 //! 第二步会引入 `/__sg/*` 命名空间作为 Web UI / API 入口 (与业务流量隔离).
+//!
+//! Shutdown: 默认监听 SIGTERM / Ctrl-C, axum 进入 graceful shutdown 期间不再接受新连接,
+//! 已建立的连接会等到完成或超时.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 use anyhow::Context;
 use axum::{routing::any, Router};
@@ -15,25 +17,13 @@ use tracing::info;
 use crate::proxy::{forward, ProxyState};
 use crate::record::RecordStore;
 
-/// 进程级服务句柄. 在 Web UI / 配置热加载等场景下复用.
-#[derive(Clone)]
-pub struct AppState {
-    pub proxy: ProxyState,
-}
-
-impl AppState {
-    pub fn new(proxy: ProxyState) -> Self {
-        Self { proxy }
-    }
-}
-
 /// 构建 axum Router.
-pub fn build_router(state: AppState) -> Router {
+pub fn build_router(state: ProxyState) -> Router {
     Router::new()
         // catch-all: 任意方法 + 任意路径透传到上游.
-        .route("/{*path}", any(forward))
         .route("/", any(forward))
-        .with_state(state.proxy)
+        .route("/{*path}", any(forward))
+        .with_state(state)
         .layer(TraceLayer::new_for_http())
 }
 
@@ -45,7 +35,7 @@ pub fn build_upstream_client() -> anyhow::Result<reqwest::Client> {
         .context("failed to build upstream client")
 }
 
-/// 启动服务. 阻塞直到 shutdown.
+/// 启动服务. 阻塞直到 shutdown 信号到达且 drain 完成.
 pub async fn serve(
     host: &str,
     port: u16,
@@ -54,9 +44,12 @@ pub async fn serve(
 ) -> anyhow::Result<()> {
     let upstream = build_upstream_client()?;
     let records = RecordStore::new(records_capacity);
-    let proxy = ProxyState::new(upstream, upstream_base, records);
-    let state = AppState::new(proxy);
-    let app = build_router(state);
+    let proxy = ProxyState {
+        upstream,
+        upstream_base,
+        records,
+    };
+    let app = build_router(proxy);
 
     let addr: SocketAddr = format!("{host}:{port}")
         .parse()
@@ -64,13 +57,34 @@ pub async fn serve(
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind {addr} failed: is another secret-guard already running?"))?;
-    info!(%addr, "secret-guard listening");
+    info!(%addr, "secret-guard listening (Ctrl-C to stop)");
     axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
         .await
         .context("axum serve failed")?;
     Ok(())
 }
 
-// 防止 unused 警告 (Arc 后续会被引入).
-#[allow(dead_code)]
-type _ArcState = Arc<()>;
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("install ctrl_c handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => info!("received Ctrl-C, shutting down"),
+        _ = terminate => info!("received SIGTERM, shutting down"),
+    }
+}

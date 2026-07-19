@@ -1,6 +1,6 @@
 //! 配置文件 schema (TOML + serde).
 //!
-//! MVP 阶段只暴露最小字段集: 监听地址、上游 URL、(为后续步骤预留) secrets 列表.
+//! MVP 阶段暴露最小字段集: 监听地址、上游 URL、记录容量.
 //! 第三步会扩展 secret table; 此处先建立 SSOT 形状.
 
 use std::path::Path;
@@ -28,6 +28,8 @@ pub struct Config {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    /// 内存中保留的转发记录条数上限 (FIFO 淘汰).
+    pub records_capacity: usize,
 }
 
 impl Default for ServerConfig {
@@ -35,6 +37,7 @@ impl Default for ServerConfig {
         Self {
             host: "127.0.0.1".to_string(),
             port: 8787,
+            records_capacity: 1024,
         }
     }
 }
@@ -63,9 +66,13 @@ pub struct SecretsConfig {
 }
 
 impl Config {
-    /// 从 TOML 文件加载; 若文件不存在返回默认值.
+    /// 从 TOML 文件加载; 若文件不存在返回默认值并 warn.
     pub fn load_or_default(path: &Path) -> anyhow::Result<Self> {
         if !path.exists() {
+            tracing::warn!(
+                path = %path.display(),
+                "config file not found; using defaults"
+            );
             return Ok(Self::default());
         }
         let text = std::fs::read_to_string(path)

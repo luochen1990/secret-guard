@@ -5,7 +5,7 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use secret_guard::{
-    cli::{Cli, Command},
+    cli::{Cli, Command, RunArgs},
     config::Config,
     server,
 };
@@ -19,53 +19,24 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-
-    let Command::Run(args) = cli.command.unwrap_or(Command::Run(args::default_run()));
+    let args = match cli.command {
+        Some(Command::Run(args)) => args,
+        None => RunArgs::default(),
+    };
 
     let cfg = Config::load_or_default(&args.config)?;
-    let host = if cli_override(&args.host) {
-        args.host.clone()
-    } else {
-        cfg.server.host.clone()
-    };
-    let port = if args.port != 8787 || env_set("SG_PORT") {
-        args.port
-    } else {
-        cfg.server.port
-    };
-    let upstream = args
-        .upstream
-        .clone()
-        .unwrap_or_else(|| cfg.upstream.base.clone());
+    let host = args.host.unwrap_or(cfg.server.host);
+    let port = args.port.unwrap_or(cfg.server.port);
+    let upstream = args.upstream.unwrap_or(cfg.upstream.base);
+    let records_capacity = cfg.server.records_capacity;
 
     tracing::info!(
         listen = format!("{host}:{port}"),
         upstream = %upstream,
         config = ?args.config,
+        records_capacity,
         "starting secret-guard"
     );
 
-    server::serve(&host, port, upstream, 1024).await
-}
-
-// 检查 args.host 是否被显式指定: 当前实现以 default 值 "127.0.0.1" 为信号.
-// (clap 4 的 ArgAction::Set 显式 vs 默认的区分能力有限, MVP 暂用此简化策略.)
-mod args {
-    use secret_guard::RunArgs;
-    pub fn default_run() -> RunArgs {
-        RunArgs {
-            host: "127.0.0.1".into(),
-            port: 8787,
-            upstream: None,
-            config: "secret-guard.toml".into(),
-        }
-    }
-}
-
-fn cli_override(_v: &str) -> bool {
-    env_set("SG_HOST")
-}
-
-fn env_set(key: &str) -> bool {
-    std::env::var_os(key).is_some()
+    server::serve(&host, port, upstream, records_capacity).await
 }

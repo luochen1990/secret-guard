@@ -1,8 +1,9 @@
 //! 命令行参数 schema.
 //!
-//! 当前仅暴露 `run` 子命令,后续可扩展 (例如 `web`, `redact` 等离线模式).
+//! 当前仅暴露 `run` 子命令, 后续可扩展 (例如 `web`, `redact` 等离线模式).
+//! `Option<T>` 表示"是否被显式指定", 用于区分 CLI 显式覆盖 vs 配置文件回退.
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 /// secret-guard: 防止 agent 不经意间把 secret 泄露到 LLM Provider.
 #[derive(Parser, Debug)]
@@ -18,16 +19,16 @@ pub enum Command {
     Run(RunArgs),
 }
 
-/// 网关启动参数.
-#[derive(clap::Args, Debug, Clone)]
+/// 网关启动参数. `Option<T>` 字段表示 "CLI 未显式指定时回退到 config".
+#[derive(Args, Debug, Clone)]
 pub struct RunArgs {
     /// 监听地址.
-    #[arg(long, default_value = "127.0.0.1", env = "SG_HOST")]
-    pub host: String,
+    #[arg(long, env = "SG_HOST")]
+    pub host: Option<String>,
 
     /// 监听端口.
-    #[arg(long, default_value = "8787", env = "SG_PORT")]
-    pub port: u16,
+    #[arg(long, env = "SG_PORT")]
+    pub port: Option<u16>,
 
     /// 上游 LLM Provider base URL (例如 https://api.anthropic.com).
     #[arg(long, env = "SG_UPSTREAM")]
@@ -43,11 +44,14 @@ pub struct RunArgs {
     pub config: std::path::PathBuf,
 }
 
-impl RunArgs {
-    /// 若未显式指定 upstream,默认使用 Anthropic API.
-    pub fn upstream_or_default(&self) -> String {
-        self.upstream
-            .clone()
-            .unwrap_or_else(|| "https://api.anthropic.com".to_string())
+impl Default for RunArgs {
+    fn default() -> Self {
+        Self {
+            host: None,
+            port: None,
+            upstream: None,
+            // default 值仅用于 "未传子命令也启动" 的兜底, 实际 config 路径仍以 CLI/env 为准.
+            config: std::path::PathBuf::from("secret-guard.toml"),
+        }
     }
 }
