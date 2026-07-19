@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>secret-guard</title>
   <style>
     * { box-sizing: border-box; }
@@ -23,6 +24,7 @@
     }
     header .brand { font-weight: bold; }
     header .toolbar { display: flex; gap: 10px; align-items: center; }
+    header #status { min-width: 80px; }
     main { display: flex; height: calc(100vh - 38px); }
     aside {
       width: 340px;
@@ -102,6 +104,7 @@
     <span class="brand">secret-guard</span>
     <span class="toolbar">
       <span><span id="count">0</span> records</span>
+      <span id="status"></span>
       <label><input type="checkbox" id="auto" checked> auto-refresh (3s)</label>
       <button class="refresh" onclick="refresh()">refresh</button>
     </span>
@@ -112,21 +115,41 @@
   </main>
 
   <script>
+    // 集中管理 API URL, 避免字面量重复 (第三步加入 secrets 时不易拷错).
+    const API = '/__sg/api/records';
+
     let records = [];
     let selectedId = null;
 
+    function setStatus(text, cls) {
+      const el = document.getElementById('status');
+      el.textContent = text || '';
+      el.className = cls || '';
+    }
+
     async function refresh() {
       try {
-        const r = await fetch('/__sg/api/records');
-        if (!r.ok) return;
+        const r = await fetch(API, { cache: 'no-store' });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
         records = await r.json();
         document.getElementById('count').textContent = records.length;
         renderSidebar();
         if (selectedId) {
-          const detail = await fetch('/__sg/api/records/' + selectedId);
+          const detail = await fetch(`${API}/${selectedId}`, { cache: 'no-store' });
           if (detail.ok) renderDetail(await detail.json());
+          else if (detail.status === 404) {
+            // selected record was evicted; reset.
+            selectedId = null;
+            renderSidebar();
+            document.getElementById('detail').innerHTML =
+              '<div class="empty">Selected record no longer exists</div>';
+          }
         }
-      } catch (e) { console.error(e); }
+        setStatus('');
+      } catch (e) {
+        console.error(e);
+        setStatus('⚠ refresh failed', 'status-err');
+      }
     }
 
     function renderSidebar() {
@@ -136,17 +159,21 @@
         return;
       }
       el.innerHTML = records.map(r => `
-        <div class="record-item ${r.id === selectedId ? 'active' : ''}" onclick="selectRecord('${r.id}')">
+        <div class="record-item ${r.id === selectedId ? 'active' : ''}" data-id="${escapeHtml(r.id)}">
           <div>
             <span class="method method-${escapeHtml(r.method)}">${escapeHtml(r.method)}</span>
             <span>${escapeHtml(r.path)}</span>
           </div>
           <div>
-            <span class="${statusClass(r)}">${statusText(r)}</span>
-            <span class="meta">· ${r.elapsed_ms}ms · ${formatTime(r.created_at)}</span>
+            <span class="${statusClass(r)}">${escapeHtml(statusText(r))}</span>
+            <span class="meta">· ${escapeHtml(r.elapsed_ms)}ms · ${escapeHtml(formatTime(r.created_at))}</span>
           </div>
         </div>
       `).join('');
+      // 用事件委托替代内联 onclick, 避免在 HTML 属性里拼接字符串.
+      el.querySelectorAll('.record-item').forEach(node => {
+        node.addEventListener('click', () => selectRecord(node.dataset.id));
+      });
     }
 
     function statusClass(r) {
@@ -159,11 +186,10 @@
     function statusText(r) {
       if (r.error) return 'ERR';
       if (r.resp_status === 0) return '...';
-      return r.resp_status;
+      return String(r.resp_status);
     }
     function formatTime(s) {
-      try { return new Date(s).toLocaleTimeString(); }
-      catch (e) { return s; }
+      return new Date(s).toLocaleTimeString();
     }
     function escapeHtml(s) {
       return String(s).replace(/[&<>"']/g, c => ({
@@ -174,8 +200,15 @@
     async function selectRecord(id) {
       selectedId = id;
       renderSidebar();
-      const r = await fetch('/__sg/api/records/' + id);
-      if (r.ok) renderDetail(await r.json());
+      try {
+        const r = await fetch(`${API}/${id}`, { cache: 'no-store' });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        renderDetail(await r.json());
+      } catch (e) {
+        console.error(e);
+        document.getElementById('detail').innerHTML =
+          `<div class="empty status-err">Failed to load record: ${escapeHtml(e.message)}</div>`;
+      }
     }
 
     function renderDetail(r) {
@@ -195,8 +228,8 @@
           <h3>Response ${badges}</h3>
           <div>
             status:
-            <span class="${statusClass(r)}">${r.resp_status === 0 ? '(pending)' : r.resp_status}</span>
-            · ${r.elapsed_ms}ms
+            <span class="${statusClass(r)}">${r.resp_status === 0 ? '(pending)' : escapeHtml(r.resp_status)}</span>
+            · ${escapeHtml(r.elapsed_ms)}ms
           </div>
           <pre>${escapeHtml(formatHeaders(r.resp_headers))}</pre>
           <pre>${escapeHtml(r.resp_body || '<empty>')}</pre>

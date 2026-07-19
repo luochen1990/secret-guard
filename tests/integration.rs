@@ -326,8 +326,9 @@ async fn passes_query_string_through() {
 async fn web_ui_serves_html() {
     let upstream = spawn_mock_upstream().await;
     let proxy_url = spawn_proxy(upstream.url()).await;
+    // `/__sg` 无尾斜杠: 应直接返回 HTML.
     let resp = reqwest::Client::new()
-        .get(format!("{proxy_url}/__sg/"))
+        .get(format!("{proxy_url}/__sg"))
         .send()
         .await
         .unwrap();
@@ -423,4 +424,59 @@ async fn web_api_404_for_unknown_record() {
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn web_api_400_for_invalid_uuid() {
+    let upstream = spawn_mock_upstream().await;
+    let proxy_url = spawn_proxy(upstream.url()).await;
+    let resp = reqwest::Client::new()
+        .get(format!("{proxy_url}/__sg/api/records/not-a-uuid"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn web_api_records_empty_when_no_traffic() {
+    let upstream = spawn_mock_upstream().await;
+    let proxy_url = spawn_proxy(upstream.url()).await;
+    let resp = reqwest::Client::new()
+        .get(format!("{proxy_url}/__sg/api/records"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let recs = body.get("records").and_then(|v| v.as_array()).unwrap();
+    assert_eq!(recs.len(), 0);
+}
+
+#[tokio::test]
+async fn web_namespace_not_forwarded_to_upstream() {
+    // `/__sg/api/records/` (尾斜杠, axum nest 不会匹配) 必须不被 catch-all 吞掉
+    // 而泄漏到上游. 测试断言: 上游绝不应收到任何 `/__sg/*` 请求.
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("GET", mockito::Matcher::Any)
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    let proxy_url = spawn_proxy(upstream.url()).await;
+
+    // 即使尾斜杠路由未明确, 也至少不应进入 forward; 即使 404 也 OK, 关键是不应静默转发.
+    let resp = reqwest::Client::new()
+        .get(format!("{proxy_url}/__sg/api/records/"))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    // 期望 404 (or 任何非 2xx), 而非转发到上游后返回的 200.
+    assert!(
+        !status.is_success(),
+        "expected /__sg/* to NOT be forwarded upstream, got status {status}"
+    );
 }

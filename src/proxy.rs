@@ -24,7 +24,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 use crate::record::{ForwardRecord, RecordStore, ResponseUpdate};
 
@@ -358,10 +358,6 @@ fn is_sensitive_header(name: &str) -> bool {
     ) || name.contains("token")
         || name.contains("secret")
 }
-
-// 引入 info 用于未来扩展 (避免 unused 警告时直接删).
-#[allow(unused_imports)]
-use info as _info_marker;
 
 #[cfg(test)]
 mod tests {

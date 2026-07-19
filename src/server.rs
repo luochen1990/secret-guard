@@ -30,6 +30,9 @@ pub fn build_router(state: ProxyState) -> Router {
         // Web UI / API (与业务流量隔离).
         .nest("/__sg", web::router())
         .route("/__sg/", get(web::slash_redirect))
+        // `/__sg/*` 中未匹配的子路径必须返回 404, 避免被 catch-all 吞掉并转发到上游
+        // (否则用户配错 URL 时会泄漏 secret-guard 的内部 URL 给 LLM provider).
+        .route("/__sg/{*rest}", get(web::not_found))
         // catch-all: 任意方法 + 任意路径透传到上游.
         .route("/", any(forward))
         .route("/{*path}", any(forward))
