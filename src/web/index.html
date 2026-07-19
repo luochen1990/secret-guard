@@ -25,7 +25,17 @@
     header .brand { font-weight: bold; }
     header .toolbar { display: flex; gap: 10px; align-items: center; }
     header #status { min-width: 80px; }
-    main { display: flex; height: calc(100vh - 38px); }
+    nav.tabs { display: flex; gap: 4px; padding: 4px 16px; background: #2a2a2a; }
+    nav.tabs a {
+      padding: 4px 12px;
+      color: #ccc;
+      cursor: pointer;
+      border-radius: 3px;
+      font-size: 12px;
+    }
+    nav.tabs a.active { background: #444; color: #fff; }
+    nav.tabs a:hover { background: #3a3a3a; }
+    main { display: flex; height: calc(100vh - 70px); }
     aside {
       width: 340px;
       border-right: 1px solid #ddd;
@@ -97,6 +107,94 @@
     }
     .badge-stream { background: #cfe; color: #060; }
     .badge-err { background: #fcc; color: #a00; }
+    .tab-content { display: none; }
+    .tab-content.active { display: flex; flex: 1; min-height: 0; }
+
+    /* secrets table */
+    .secrets-main {
+      flex: 1;
+      padding: 12px;
+      overflow-y: auto;
+    }
+    table.secrets {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    table.secrets th, table.secrets td {
+      padding: 6px 8px;
+      text-align: left;
+      border-bottom: 1px solid #eee;
+      vertical-align: middle;
+    }
+    table.secrets th {
+      background: #f0f0f0;
+      font-size: 12px;
+      text-transform: uppercase;
+      color: #555;
+    }
+    table.secrets td.actions { white-space: nowrap; }
+    .pill {
+      display: inline-block;
+      padding: 1px 6px;
+      border-radius: 10px;
+      font-size: 11px;
+      background: #e0e7ff;
+      color: #336;
+    }
+    .pill.password { background: #fee; color: #600; }
+    .pill.apikey { background: #fed; color: #630; }
+    .pill.token { background: #efe; color: #363; }
+    .pill.cookie { background: #eef; color: #336; }
+    .pill.privatekey { background: #fee; color: #600; font-weight: bold; }
+    .pill.other { background: #eee; color: #555; }
+    button.btn {
+      padding: 3px 8px;
+      cursor: pointer;
+      border: 1px solid #888;
+      background: #fff;
+      border-radius: 3px;
+      font: inherit;
+    }
+    button.btn-danger { color: #a00; border-color: #a00; }
+    button.btn:hover { background: #eee; }
+    button.btn-danger:hover { background: #fee; }
+    .secrets-toolbar {
+      margin: 8px 0;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    dialog#secret-form {
+      border: 1px solid #888;
+      border-radius: 6px;
+      padding: 16px;
+      width: 480px;
+    }
+    dialog#secret-form form {
+      display: grid;
+      grid-template-columns: 100px 1fr;
+      gap: 8px;
+    }
+    dialog#secret-form form input[type=text],
+    dialog#secret-form form select,
+    dialog#secret-form form textarea {
+      width: 100%;
+      font: inherit;
+      padding: 4px 6px;
+      border: 1px solid #aaa;
+      border-radius: 3px;
+    }
+    dialog#secret-form form textarea {
+      font-family: ui-monospace, monospace;
+      min-height: 80px;
+    }
+    dialog#secret-form .actions {
+      grid-column: 2;
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end;
+      margin-top: 8px;
+    }
   </style>
 </head>
 <body>
@@ -109,17 +207,78 @@
       <button class="refresh" onclick="refresh()">refresh</button>
     </span>
   </header>
+  <nav class="tabs">
+    <a class="tab active" data-tab="records">Records</a>
+    <a class="tab" data-tab="secrets">Secrets</a>
+  </nav>
   <main>
-    <aside id="sidebar"><div class="empty">No records yet</div></aside>
-    <article id="detail"><div class="empty">Select a record on the left</div></article>
+    <section id="tab-records" class="tab-content active">
+      <aside id="sidebar"><div class="empty">No records yet</div></aside>
+      <article id="detail"><div class="empty">Select a record on the left</div></article>
+    </section>
+    <section id="tab-secrets" class="tab-content">
+      <div class="secrets-main">
+        <div class="secrets-toolbar">
+          <span><span id="secrets-count">0</span> secrets</span>
+          <button class="btn" onclick="openSecretForm()">+ new secret</button>
+        </div>
+        <table class="secrets">
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Name</th>
+              <th>Category</th>
+              <th>Value (masked)</th>
+              <th>Length</th>
+              <th class="actions">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="secrets-body">
+            <tr><td colspan="6" class="empty">No secrets configured</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
   </main>
+
+  <dialog id="secret-form">
+    <form method="dialog" id="secret-form-el">
+      <h3 style="grid-column: 1 / -1; margin: 0 0 8px 0;" id="secret-form-title">New secret</h3>
+      <label for="f-id">ID</label>
+      <input type="text" id="f-id" placeholder="(auto-generated if blank)">
+      <label for="f-name">Name</label>
+      <input type="text" id="f-name" placeholder="(optional)">
+      <label for="f-category">Category</label>
+      <select id="f-category"></select>
+      <label for="f-value">Value</label>
+      <textarea id="f-value" placeholder="the real secret"></textarea>
+      <div class="actions">
+        <button class="btn" value="cancel">Cancel</button>
+        <button class="btn" value="save" id="f-save">Save</button>
+      </div>
+    </form>
+  </dialog>
 
   <script>
     // 集中管理 API URL, 避免字面量重复 (第三步加入 secrets 时不易拷错).
-    const API = '/__sg/api/records';
+    const API_RECORDS = '/__sg/api/records';
+    const API_SECRETS = '/__sg/api/secrets';
 
     let records = [];
     let selectedId = null;
+    let secretsList = [];
+    let secretCategories = [];
+
+    // ─── tabs ──────────────────────────────────────────────────────────────
+    document.querySelectorAll('nav.tabs a.tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        document.querySelectorAll('nav.tabs a.tab').forEach(t => t.classList.remove('active'));
+        document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+        tab.classList.add('active');
+        document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
+        if (tab.dataset.tab === 'secrets') refreshSecrets();
+      });
+    });
 
     function setStatus(text, cls) {
       const el = document.getElementById('status');
@@ -127,18 +286,19 @@
       el.className = cls || '';
     }
 
+    // ─── records tab ──────────────────────────────────────────────────────
     async function refresh() {
       try {
-        const r = await fetch(API, { cache: 'no-store' });
+        const r = await fetch(API_RECORDS, { cache: 'no-store' });
         if (!r.ok) throw new Error('HTTP ' + r.status);
-        records = await r.json();
+        const data = await r.json();
+        records = data.records || [];
         document.getElementById('count').textContent = records.length;
         renderSidebar();
         if (selectedId) {
-          const detail = await fetch(`${API}/${selectedId}`, { cache: 'no-store' });
+          const detail = await fetch(`${API_RECORDS}/${selectedId}`, { cache: 'no-store' });
           if (detail.ok) renderDetail(await detail.json());
           else if (detail.status === 404) {
-            // selected record was evicted; reset.
             selectedId = null;
             renderSidebar();
             document.getElementById('detail').innerHTML =
@@ -148,7 +308,7 @@
         setStatus('');
       } catch (e) {
         console.error(e);
-        setStatus('⚠ refresh failed', 'status-err');
+        setStatus('refresh failed', 'status-err');
       }
     }
 
@@ -170,7 +330,6 @@
           </div>
         </div>
       `).join('');
-      // 用事件委托替代内联 onclick, 避免在 HTML 属性里拼接字符串.
       el.querySelectorAll('.record-item').forEach(node => {
         node.addEventListener('click', () => selectRecord(node.dataset.id));
       });
@@ -201,7 +360,7 @@
       selectedId = id;
       renderSidebar();
       try {
-        const r = await fetch(`${API}/${id}`, { cache: 'no-store' });
+        const r = await fetch(`${API_RECORDS}/${id}`, { cache: 'no-store' });
         if (!r.ok) throw new Error('HTTP ' + r.status);
         renderDetail(await r.json());
       } catch (e) {
@@ -242,8 +401,125 @@
       return hs.map(([k, v]) => k + ': ' + v).join('\n');
     }
 
+    // ─── secrets tab ──────────────────────────────────────────────────────
+    async function refreshSecrets() {
+      try {
+        const r = await fetch(API_SECRETS, { cache: 'no-store' });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const data = await r.json();
+        secretsList = data.secrets || [];
+        secretCategories = data.categories || [];
+        renderSecrets();
+      } catch (e) {
+        console.error(e);
+        setStatus('secrets refresh failed', 'status-err');
+      }
+    }
+
+    function renderSecrets() {
+      document.getElementById('secrets-count').textContent = secretsList.length;
+      const body = document.getElementById('secrets-body');
+      if (secretsList.length === 0) {
+        body.innerHTML = '<tr><td colspan="6" class="empty">No secrets configured</td></tr>';
+        return;
+      }
+      body.innerHTML = secretsList.map(s => `
+        <tr data-id="${escapeHtml(s.id)}">
+          <td><code>${escapeHtml(s.id)}</code></td>
+          <td>${escapeHtml(s.name || '')}</td>
+          <td><span class="pill ${escapeHtml(s.category)}">${escapeHtml(s.category)}</span></td>
+          <td><code>${escapeHtml(s.value_masked)}</code></td>
+          <td>${escapeHtml(s.value_length)}</td>
+          <td class="actions">
+            <button class="btn" onclick="editSecret('${escapeHtml(s.id)}')">edit</button>
+            <button class="btn btn-danger" onclick="deleteSecret('${escapeHtml(s.id)}')">delete</button>
+          </td>
+        </tr>
+      `).join('');
+    }
+
+    function populateCategorySelect() {
+      const sel = document.getElementById('f-category');
+      sel.innerHTML = secretCategories.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
+    }
+
+    function openSecretForm(existing) {
+      populateCategorySelect();
+      const dlg = document.getElementById('secret-form');
+      const title = document.getElementById('secret-form-title');
+      const saveBtn = document.getElementById('f-save');
+      document.getElementById('f-id').value = existing?.id || '';
+      document.getElementById('f-name').value = existing?.name || '';
+      document.getElementById('f-category').value = existing?.category || secretCategories[0] || 'apikey';
+      document.getElementById('f-value').value = existing ? '' : ''; // 编辑时也清空, 强制用户重输 (避免泄露)
+      title.textContent = existing ? `Edit secret ${existing.id}` : 'New secret';
+      dlg.dataset.editId = existing ? existing.id : '';
+      saveBtn.textContent = existing ? 'Update' : 'Create';
+      dlg.showModal();
+    }
+
+    document.getElementById('secret-form-el').addEventListener('submit', async (ev) => {
+      // 用 submit 事件而非 click, 确保是用户主动确认.
+      const dlg = document.getElementById('secret-form');
+      const btn = ev.submitter;
+      if (!btn || btn.value !== 'save') return; // cancel
+      const editId = dlg.dataset.editId;
+      const payload = {
+        id: document.getElementById('f-id').value.trim() || null,
+        name: document.getElementById('f-name').value.trim() || null,
+        category: document.getElementById('f-category').value,
+        value: document.getElementById('f-value').value,
+      };
+      try {
+        const url = editId ? `${API_SECRETS}/${encodeURIComponent(editId)}` : API_SECRETS;
+        const method = editId ? 'PUT' : 'POST';
+        const r = await fetch(url, {
+          method,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        if (!r.ok) {
+          const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+          alert('Failed: ' + (err.error || r.status));
+          return;
+        }
+        await refreshSecrets();
+        dlg.close();
+      } catch (e) {
+        alert('Error: ' + e.message);
+      }
+    });
+
+    function editSecret(id) {
+      const s = secretsList.find(x => x.id === id);
+      if (!s) return;
+      openSecretForm(s);
+    }
+
+    async function deleteSecret(id) {
+      if (!confirm(`Delete secret ${id}?`)) return;
+      try {
+        const r = await fetch(`${API_SECRETS}/${encodeURIComponent(id)}`, { method: 'DELETE' });
+        if (!r.ok && r.status !== 204) {
+          const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+          alert('Failed: ' + (err.error || r.status));
+          return;
+        }
+        await refreshSecrets();
+      } catch (e) {
+        alert('Error: ' + e.message);
+      }
+    }
+
+    // ─── bootstrap ────────────────────────────────────────────────────────
     refresh();
-    setInterval(() => { if (document.getElementById('auto').checked) refresh(); }, 3000);
+    setInterval(() => {
+      if (document.getElementById('auto').checked) {
+        const active = document.querySelector('.tab-content.active')?.id;
+        if (active === 'tab-secrets') refreshSecrets();
+        else refresh();
+      }
+    }, 3000);
   </script>
 </body>
 </html>

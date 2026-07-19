@@ -1,11 +1,13 @@
 //! 配置文件 schema (TOML + serde).
 //!
-//! MVP 阶段暴露最小字段集: 监听地址、上游 URL、记录容量.
-//! 第三步会扩展 secret table; 此处先建立 SSOT 形状.
+//! MVP 阶段暴露最小字段集: 监听地址、上游 URL、记录容量、secret 注册表.
+//! Secret 注册表与运行时 [`crate::secrets::SecretTable`] 共享同一份 `Vec<SecretEntry>`.
 
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+
+use crate::secrets::SecretEntry;
 
 /// 顶层配置.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -18,7 +20,7 @@ pub struct Config {
     #[serde(default)]
     pub upstream: UpstreamConfig,
 
-    /// (第三步填充) secret 注册表.
+    /// Secret 注册表.
     #[serde(default)]
     pub secrets: SecretsConfig,
 }
@@ -57,12 +59,12 @@ impl Default for UpstreamConfig {
     }
 }
 
-/// (第三步) secret 注册表, 当前为占位.
+/// Secret 注册表.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SecretsConfig {
-    /// 真实 secret 明文列表 (后续可换为指向 keyring / 文件路径).
-    pub entries: Vec<String>,
+    /// 真实 secret 列表.
+    pub entries: Vec<SecretEntry>,
 }
 
 impl Config {

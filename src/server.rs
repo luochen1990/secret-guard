@@ -10,6 +10,7 @@
 //! 已建立的连接会等到完成或超时.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use anyhow::Context;
 use axum::{
@@ -22,6 +23,7 @@ use tracing::info;
 
 use crate::proxy::{forward, ProxyState};
 use crate::record::RecordStore;
+use crate::secrets::{SecretEntry, SecretTable};
 use crate::web;
 
 /// 构建 axum Router.
@@ -54,13 +56,17 @@ pub async fn serve(
     port: u16,
     upstream_base: String,
     records_capacity: usize,
+    config_path: PathBuf,
+    secrets: Vec<SecretEntry>,
 ) -> anyhow::Result<()> {
     let upstream = build_upstream_client()?;
     let records = RecordStore::new(records_capacity);
+    let secret_table = SecretTable::new(secrets, config_path.clone());
     let proxy = ProxyState {
         upstream,
         upstream_base,
         records,
+        secrets: secret_table,
     };
     let app = build_router(proxy);
 

@@ -1,10 +1,14 @@
-//! Web UI 模块: 转发记录浏览器 + (第三步起) secret 配置面板.
+//! Web UI 模块: 转发记录浏览器 + secret 配置面板.
 //!
 //! 路由前缀 `/__sg` 与业务流量隔离, 由 [`crate::server::build_router`] 通过
 //! `Router::nest` 挂载. 子路由:
 //! - `GET /__sg`                  —— 单页 HTML (内嵌 CSS + vanilla JS, 零外部依赖)
 //! - `GET /__sg/api/records`      —— 所有转发记录列表 (JSON)
 //! - `GET /__sg/api/records/{id}` —— 单条记录详情 (JSON)
+//! - `GET /__sg/api/secrets`      —— secret 注册表列表 (value 已脱敏)
+//! - `POST /__sg/api/secrets`     —— 新增 secret
+//! - `PUT /__sg/api/secrets/{id}` —— 更新 secret
+//! - `DELETE /__sg/api/secrets/{id}` —— 删除 secret
 //!
 //! 注意: axum 0.8 的 `nest("/__sg", ...)` 默认匹配不带尾斜杠的 `/__sg`, 而不是 `/__sg/`.
 //! server.rs 中显式注册了 `/__sg/` -> `/__sg` 的 redirect (307, 临时), 保证两种 URL 都可用.
@@ -24,6 +28,14 @@ pub fn router() -> Router<ProxyState> {
         .route("/", get(index))
         .route("/api/records", get(api::list_records))
         .route("/api/records/{id}", get(api::get_record))
+        .route(
+            "/api/secrets",
+            get(api::list_secrets).post(api::create_secret),
+        )
+        .route(
+            "/api/secrets/{id}",
+            axum::routing::put(api::update_secret).delete(api::delete_secret),
+        )
 }
 
 /// `/__sg/` -> `/__sg` 的 trailing-slash redirect.

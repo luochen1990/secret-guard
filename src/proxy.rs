@@ -27,6 +27,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, warn};
 
 use crate::record::{ForwardRecord, RecordStore, ResponseUpdate};
+use crate::secrets::SecretTable;
 
 /// 进程级共享状态, 在 router 与 handler 间共享.
 #[derive(Clone, Debug)]
@@ -34,6 +35,7 @@ pub struct ProxyState {
     pub upstream: reqwest::Client,
     pub upstream_base: String,
     pub records: RecordStore,
+    pub secrets: SecretTable,
 }
 
 /// hop-by-hop 或在反代语义下不应原样转发的 header (RFC 7230 §6.1 + 反代常识).

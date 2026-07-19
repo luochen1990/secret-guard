@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 
-use secret_guard::{proxy::ProxyState, record::RecordStore, server};
+use secret_guard::{proxy::ProxyState, record::RecordStore, secrets::SecretTable, server};
 use tokio::net::TcpListener;
 
 /// 在随机端口启动一个 mock 上游, 返回其 server guard.
@@ -22,9 +22,13 @@ async fn spawn_mock_upstream() -> mockito::ServerGuard {
 
 /// 在随机端口启动 secret-guard, 返回其 base URL.
 async fn spawn_proxy(upstream_base: String) -> String {
-    let upstream = reqwest::Client::new();
-    let records = RecordStore::new(64);
-    spawn_proxy_with(upstream_base, upstream, records).await
+    spawn_proxy_full(
+        upstream_base,
+        reqwest::Client::new(),
+        RecordStore::new(64),
+        test_secret_table(),
+    )
+    .await
 }
 
 async fn spawn_proxy_with(
@@ -32,18 +36,36 @@ async fn spawn_proxy_with(
     upstream: reqwest::Client,
     records: RecordStore,
 ) -> String {
+    spawn_proxy_full(upstream_base, upstream, records, test_secret_table()).await
+}
+
+async fn spawn_proxy_full(
+    upstream_base: String,
+    upstream: reqwest::Client,
+    records: RecordStore,
+    secrets: SecretTable,
+) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let proxy = ProxyState {
         upstream,
         upstream_base,
         records,
+        secrets,
     };
     let app = server::build_router(proxy);
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
     format!("http://{addr}")
+}
+
+/// 用于测试的空 SecretTable (config_path 指向临时文件).
+fn test_secret_table() -> SecretTable {
+    let id = uuid::Uuid::new_v4().to_string();
+    let path = std::path::PathBuf::from(format!("/tmp/opencode/tmp/test-secret-table-{id}.toml"));
+    let _ = std::fs::remove_file(&path);
+    SecretTable::new(vec![], path)
 }
 
 async fn proxy_request(
@@ -479,4 +501,127 @@ async fn web_namespace_not_forwarded_to_upstream() {
         !status.is_success(),
         "expected /__sg/* to NOT be forwarded upstream, got status {status}"
     );
+}
+
+// ─── secrets API ──────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn secrets_api_lists_empty() {
+    let upstream = spawn_mock_upstream().await;
+    let proxy_url = spawn_proxy(upstream.url()).await;
+    let resp = reqwest::Client::new()
+        .get(format!("{proxy_url}/__sg/api/secrets"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let secrets = body.get("secrets").and_then(|v| v.as_array()).unwrap();
+    assert_eq!(secrets.len(), 0);
+    // categories 字段返回可选列表.
+    let cats = body.get("categories").and_then(|v| v.as_array()).unwrap();
+    assert!(cats.len() >= 5);
+}
+
+#[tokio::test]
+async fn secrets_api_create_lists_update_delete() {
+    let upstream = spawn_mock_upstream().await;
+    let proxy_url = spawn_proxy(upstream.url()).await;
+    let client = reqwest::Client::new();
+
+    // Create.
+    let resp = client
+        .post(format!("{proxy_url}/__sg/api/secrets"))
+        .json(&serde_json::json!({
+            "id": "test-key-1",
+            "name": "Test API Key",
+            "category": "apikey",
+            "value": "sk-test-1234567890abcdef",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let created: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(created["id"], "test-key-1");
+    assert_eq!(created["name"], "Test API Key");
+    assert_eq!(created["category"], "apikey");
+    // value 必须被脱敏, 不可返回真实值.
+    assert_ne!(created["value_masked"], "sk-test-1234567890abcdef");
+    assert!(created["value_masked"].as_str().unwrap().contains('*'));
+    assert_eq!(created["value_length"], 24);
+
+    // List 看到新增.
+    let resp = client
+        .get(format!("{proxy_url}/__sg/api/secrets"))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let secrets = body.get("secrets").and_then(|v| v.as_array()).unwrap();
+    assert_eq!(secrets.len(), 1);
+    assert_eq!(secrets[0]["id"], "test-key-1");
+
+    // Update (改名 + 换值).
+    let resp = client
+        .put(format!("{proxy_url}/__sg/api/secrets/test-key-1"))
+        .json(&serde_json::json!({
+            "name": "Renamed",
+            "category": "token",
+            "value": "new-token-value-9876543210",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let updated: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(updated["name"], "Renamed");
+    assert_eq!(updated["category"], "token");
+    assert_eq!(updated["value_length"], 26);
+
+    // Delete.
+    let resp = client
+        .delete(format!("{proxy_url}/__sg/api/secrets/test-key-1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+
+    // List 再次为空.
+    let resp = client
+        .get(format!("{proxy_url}/__sg/api/secrets"))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let secrets = body.get("secrets").and_then(|v| v.as_array()).unwrap();
+    assert_eq!(secrets.len(), 0);
+}
+
+#[tokio::test]
+async fn secrets_api_rejects_empty_value() {
+    let upstream = spawn_mock_upstream().await;
+    let proxy_url = spawn_proxy(upstream.url()).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/__sg/api/secrets"))
+        .json(&serde_json::json!({
+            "id": "bad",
+            "value": "",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn secrets_api_delete_missing_returns_404() {
+    let upstream = spawn_mock_upstream().await;
+    let proxy_url = spawn_proxy(upstream.url()).await;
+    let resp = reqwest::Client::new()
+        .delete(format!("{proxy_url}/__sg/api/secrets/does-not-exist"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
 }

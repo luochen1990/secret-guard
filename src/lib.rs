@@ -5,6 +5,7 @@
 //! - [`config`]   —— TOML 配置文件 schema (serde)
 //! - [`proxy`]    —— 透明反向代理 handler (axum + reqwest)
 //! - [`record`]   —— 转发记录模型与内存存储 (供 Web UI 消费)
+//! - [`secrets`]  —— Secret 注册表 + 内存状态 + 配置持久化
 //! - [`server`]   —— axum router 装配与服务启动
 //! - [`web`]      —— `/__sg/*` Web UI 与 JSON API
 //!
@@ -15,6 +16,7 @@ pub mod cli;
 pub mod config;
 pub mod proxy;
 pub mod record;
+pub mod secrets;
 pub mod server;
 pub mod web;
 

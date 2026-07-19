@@ -35,8 +35,17 @@ async fn main() -> Result<()> {
         upstream = %upstream,
         config = ?args.config,
         records_capacity,
+        secrets_count = cfg.secrets.entries.len(),
         "starting secret-guard"
     );
 
-    server::serve(&host, port, upstream, records_capacity).await
+    server::serve(
+        &host,
+        port,
+        upstream,
+        records_capacity,
+        args.config.clone(),
+        cfg.secrets.entries,
+    )
+    .await
 }
