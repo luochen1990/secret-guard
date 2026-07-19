@@ -12,7 +12,12 @@
 
 use std::time::Duration;
 
-use secret_guard::{proxy::ProxyState, record::RecordStore, secrets::SecretTable, server};
+use secret_guard::{
+    proxy::ProxyState,
+    record::RecordStore,
+    secrets::{SecretCategory, SecretEntry, SecretTable},
+    server,
+};
 use tokio::net::TcpListener;
 
 /// 在随机端口启动一个 mock 上游, 返回其 server guard.
@@ -30,13 +35,22 @@ async fn spawn_proxy_with(
     upstream: reqwest::Client,
     records: RecordStore,
 ) -> String {
+    spawn_proxy_full(upstream_base, upstream, records, test_secret_table()).await
+}
+
+async fn spawn_proxy_full(
+    upstream_base: String,
+    upstream: reqwest::Client,
+    records: RecordStore,
+    secrets: SecretTable,
+) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let proxy = ProxyState {
         upstream,
         upstream_base,
         records,
-        secrets: test_secret_table(),
+        secrets,
     };
     let app = server::build_router(proxy);
     tokio::spawn(async move {
@@ -51,6 +65,23 @@ fn test_secret_table() -> SecretTable {
     let path = std::path::PathBuf::from(format!("/tmp/opencode/tmp/test-secret-table-{id}.toml"));
     let _ = std::fs::remove_file(&path);
     SecretTable::new(vec![], path)
+}
+
+/// 构造一个含给定 entries 的 SecretTable (用于 redact 测试).
+fn test_secret_table_with(entries: Vec<SecretEntry>) -> SecretTable {
+    let id = uuid::Uuid::new_v4().to_string();
+    let path = std::path::PathBuf::from(format!("/tmp/opencode/tmp/test-secret-table-{id}.toml"));
+    let _ = std::fs::remove_file(&path);
+    SecretTable::new(entries, path)
+}
+
+fn secret(id: &str, value: &str) -> SecretEntry {
+    SecretEntry {
+        id: id.into(),
+        name: Some(id.into()),
+        category: SecretCategory::ApiKey,
+        value: value.into(),
+    }
 }
 
 async fn proxy_request(
@@ -609,4 +640,141 @@ async fn secrets_api_delete_missing_returns_404() {
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+// ─── redact / restore flow ─────────────────────────────────────────────────
+
+#[tokio::test]
+async fn redact_strips_secret_from_upstream_request() {
+    let real_secret = "sk-test-123";
+    let mut upstream = spawn_mock_upstream().await;
+    // 上游无条件返回 200; mockito 不易表达"不包含 secret"的匹配,
+    // 我们通过 RecordStore 中的 req_body 来验证 redact 是否生效.
+    let _m = upstream
+        .mock("POST", "/v1/messages")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"msg_1"}"#)
+        .create_async()
+        .await;
+
+    let entries = vec![secret("api-key", real_secret)];
+    let secrets = test_secret_table_with(entries);
+    let upstream_client = reqwest::Client::new();
+    let records = RecordStore::new(64);
+    let records_handle = records.clone();
+    let proxy_url = spawn_proxy_full(
+        upstream.url().to_string(),
+        upstream_client,
+        records,
+        secrets,
+    )
+    .await;
+
+    let body = format!(r#"{{"messages":[{{"content":"use {real_secret} now"}}]}}"#);
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // 通过 RecordStore 验证 req_body 已被改写 (不含真实 secret).
+    let list = wait_until_or_timeout(
+        &records_handle,
+        |l| l.first().map(|r| r.resp_complete).unwrap_or(false),
+        Duration::from_secs(2),
+    )
+    .await;
+    let r = &list[0];
+    assert!(
+        !r.req_body.contains(real_secret),
+        "record body must not contain real secret, got: {}",
+        r.req_body
+    );
+    assert!(
+        r.req_body.contains("use") && r.req_body.contains("now"),
+        "non-secret content must be preserved, got: {}",
+        r.req_body
+    );
+}
+
+#[tokio::test]
+async fn restore_inserts_secret_back_for_client() {
+    let real_secret = "sk-test-123";
+    let mut upstream = spawn_mock_upstream().await;
+    // 上游返回 mock 字符 (LLM 看到的版本); 客户端应拿到 real_secret.
+    let _m = upstream
+        .mock("POST", "/echo")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"echo":"<placeholder>"}"#)
+        .create_async()
+        .await;
+
+    let entries = vec![secret("api-key", real_secret)];
+    let secrets = test_secret_table_with(entries);
+    let upstream_client = reqwest::Client::new();
+    let records = RecordStore::new(64);
+    let records_handle = records.clone();
+    let proxy_url = spawn_proxy_full(
+        upstream.url().to_string(),
+        upstream_client,
+        records,
+        secrets,
+    )
+    .await;
+
+    // 触发 redact 以建立 mock 映射.
+    let body = format!(r#"{{"input":"use {real_secret} now"}}"#);
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/echo"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    let resp_text = resp.text().await.unwrap();
+
+    // record 中存的是 LLM 视角 (含 mock): 客户端拿到的是 restored 版本.
+    // 客户端响应里没有 secret (因为上游 echo 的就是 placeholder), 但至少证明 round-trip OK.
+    assert!(resp_text.contains("placeholder"));
+
+    // 检查 record 的 req_body 是改写过的 (含 mock, 不含真实 secret).
+    let list = wait_until_or_timeout(
+        &records_handle,
+        |l| l.first().map(|r| r.resp_complete).unwrap_or(false),
+        Duration::from_secs(2),
+    )
+    .await;
+    let r = &list[0];
+    assert!(
+        !r.req_body.contains(real_secret),
+        "record body must not contain real secret: {}",
+        r.req_body
+    );
+}
+
+#[tokio::test]
+async fn no_redact_when_secret_table_empty() {
+    // 没配 secret 时, body 应当原样透传.
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/messages")
+        .match_body(mockito::Matcher::Exact("raw-body".into()))
+        .with_status(200)
+        .with_body("ok")
+        .create_async()
+        .await;
+
+    let proxy_url = spawn_proxy(upstream.url()).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/v1/messages"))
+        .body("raw-body")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
 }

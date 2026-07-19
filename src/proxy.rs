@@ -27,6 +27,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, warn};
 
 use crate::record::{ForwardRecord, RecordStore, ResponseUpdate};
+use crate::redact::{redact_request, restore_response, RedactionMap};
 use crate::secrets::SecretTable;
 
 /// 进程级共享状态, 在 router 与 handler 间共享.
@@ -57,6 +58,13 @@ const MAX_REQ_BODY: usize = 16 * 1024 * 1024;
 const MAX_RESP_BODY_RECORD: usize = 32 * 1024 * 1024;
 
 /// 主 handler: 接收任意方法 / 任意路径的请求, 透明转发到上游.
+///
+/// Redact 流程:
+/// 1. 收集请求 body.
+/// 2. 若 SecretTable 非空, 调用 [`redact_request`] 把 body 中的 secret 替换为 mock.
+///    记录在 [`ForwardRecord`] 中的是改写后的版本 (LLM 视角).
+/// 3. 上游响应先完整缓冲 (失去流式 UX), 调用 [`restore_response`] 反向替换后回传客户端.
+///    (流式 + chunk boundary 处理见第五步.)
 pub async fn forward(
     State(state): State<ProxyState>,
     req: Request<Body>,
@@ -64,12 +72,30 @@ pub async fn forward(
     let started = Instant::now();
     let (parts, body) = req.into_parts();
 
-    // 1. 收集请求 body (为后续 secret 改写与记录做准备).
+    // 1. 收集请求 body (为 redact 与记录做准备).
     let req_bytes = to_bytes(body, MAX_REQ_BODY)
         .await
         .map_err(|e| AppError::BadBody(e.to_string()))?;
 
-    // 2. 构造上游 URL.
+    // 2. redact 请求 body (若 SecretTable 非空).
+    let secrets_snapshot = state.secrets.snapshot();
+    let (req_text_for_record, redaction_map): (String, RedactionMap) =
+        if secrets_snapshot.is_empty() {
+            (utf8_view(&req_bytes), RedactionMap::default())
+        } else {
+            let original = utf8_view(&req_bytes);
+            let (redacted, map) = redact_request(&original, &secrets_snapshot);
+            if !map.is_empty() {
+                debug!(
+                    redactions = map.real_to_mock.len(),
+                    "redacted secrets in request body"
+                );
+            }
+            (redacted, map)
+        };
+    let req_bytes_to_send = req_text_for_record.clone().into_bytes();
+
+    // 3. 构造上游 URL.
     let path_and_query = parts
         .uri
         .path_and_query()
@@ -77,26 +103,26 @@ pub async fn forward(
         .unwrap_or("/");
     let upstream_url = build_upstream_url(&state.upstream_base, path_and_query);
 
-    // 3. 复制请求 headers (剥离 hop-by-hop + Connection 列出的字段 + Host + Content-Length).
+    // 4. 复制请求 headers (剥离 hop-by-hop + Connection 列出的字段 + Host + Content-Length).
     let fwd_headers = sanitize_request_headers(&parts.headers);
 
-    // 4. 记录请求快照 (UI 友好, 敏感 header 脱敏).
+    // 5. 记录请求快照 (LLM 视角的改写后版本).
     let req_snapshot = ForwardRecord::new(
         parts.method.as_str().to_string(),
         parts.uri.path().to_string(),
         redact_headers(&fwd_headers),
-        utf8_view(&req_bytes),
+        req_text_for_record,
     );
     let record_id = state.records.push(req_snapshot);
 
     debug!(%record_id, method = %parts.method, url = %upstream_url, "forwarding request");
 
-    // 5. 发送到上游 (失败时也写回 record, 标记 incomplete).
+    // 6. 发送到上游 (失败时也写回 record, 标记 incomplete).
     let upstream_resp = match state
         .upstream
         .request(parts.method, &upstream_url)
         .headers(fwd_headers)
-        .body(req_bytes)
+        .body(req_bytes_to_send)
         .send()
         .await
     {
@@ -120,7 +146,7 @@ pub async fn forward(
         }
     };
 
-    // 6. 收集响应元数据.
+    // 7. 收集响应元数据.
     let resp_status = upstream_resp.status();
     let resp_headers = upstream_resp.headers().clone();
     let content_type = resp_headers
@@ -132,21 +158,37 @@ pub async fn forward(
 
     debug!(%record_id, status = %resp_status, streamed, "upstream responded");
 
-    // 7. 扇出响应: 一份给客户端 (流式), 一份累积给记录.
-    fan_out_response(
-        state.records.clone(),
-        record_id,
-        started,
-        upstream_resp,
-        resp_status,
-        resp_headers,
-        streamed,
-    )
-    .await
+    // 8. 处理响应: 若启用 redact, 走 buffered (完整累积再 restore);
+    //    否则保持流式透传 (最佳 UX).
+    if redaction_map.is_empty() {
+        fan_out_streaming(
+            state.records.clone(),
+            record_id,
+            started,
+            upstream_resp,
+            resp_status,
+            resp_headers,
+            streamed,
+        )
+        .await
+    } else {
+        fan_out_buffered(BufferedParams {
+            records: state.records.clone(),
+            record_id,
+            started,
+            upstream_resp,
+            resp_status,
+            resp_headers,
+            streamed,
+            redaction_map,
+        })
+        .await
+    }
 }
 
-/// 把上游响应扇出给客户端 + 记录存储.
-async fn fan_out_response(
+/// 流式扇出: 一份给客户端 (流式), 一份累积给记录.
+/// 在未启用 redact 时使用, 保持最佳 UX.
+async fn fan_out_streaming(
     records: RecordStore,
     record_id: uuid::Uuid,
     started: Instant,
@@ -159,7 +201,6 @@ async fn fan_out_response(
     let resp_headers_for_record = resp_headers.clone();
     let status_u16 = resp_status.as_u16();
 
-    // 后台 task: 读上游 chunk -> 先 send (反向压力) -> 再累积给记录.
     tokio::spawn(async move {
         let mut stream = upstream_resp.bytes_stream();
         let mut acc: Vec<u8> = Vec::new();
@@ -168,12 +209,10 @@ async fn fan_out_response(
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(b) => {
-                    // 先 send: 若 channel 关闭 (客户端断开), 提前退出.
                     if tx.send(Ok(b.clone())).await.is_err() {
                         error_kind = Some("client disconnected".into());
                         break;
                     }
-                    // 后 acc: 累积给记录 (受 MAX_RESP_BODY_RECORD 限制).
                     if !overflow {
                         let remaining = MAX_RESP_BODY_RECORD.saturating_sub(acc.len());
                         if remaining > 0 {
@@ -199,14 +238,12 @@ async fn fan_out_response(
                 }
             }
         }
-        // 流结束: 更新记录. 标记完整性.
         let elapsed = started.elapsed().as_millis() as u64;
         let body = if overflow {
             "<truncated: exceeded record cap>".to_string()
         } else {
             utf8_view(&acc)
         };
-        let complete = error_kind.is_none();
         records.update_response_full(
             record_id,
             ResponseUpdate {
@@ -215,7 +252,7 @@ async fn fan_out_response(
                 resp_body: body,
                 elapsed_ms: elapsed,
                 streamed,
-                resp_complete: complete,
+                resp_complete: error_kind.is_none(),
                 error: error_kind,
             },
         );
@@ -223,6 +260,83 @@ async fn fan_out_response(
 
     let body = Body::from_stream(ReceiverStream::new(rx));
     let mut resp = Response::new(body);
+    *resp.status_mut() = resp_status;
+    *resp.headers_mut() = build_response_headers(&resp_headers);
+    Ok(resp)
+}
+
+/// 缓冲扇出的参数包. 避免 `fan_out_buffered` 参数过多.
+struct BufferedParams {
+    records: RecordStore,
+    record_id: uuid::Uuid,
+    started: Instant,
+    upstream_resp: reqwest::Response,
+    resp_status: StatusCode,
+    resp_headers: HeaderMap,
+    streamed: bool,
+    redaction_map: RedactionMap,
+}
+
+/// 缓冲扇出: 完整累积响应, restore mock → real, 一次性返回给客户端.
+/// 失去流式 UX, 但保证 mock→real 映射正确.
+async fn fan_out_buffered(p: BufferedParams) -> Result<Response<Body>, AppError> {
+    let BufferedParams {
+        records,
+        record_id,
+        started,
+        upstream_resp,
+        resp_status,
+        resp_headers,
+        streamed,
+        redaction_map,
+    } = p;
+    let resp_headers_for_record = resp_headers.clone();
+    let status_u16 = resp_status.as_u16();
+    let cap = MAX_RESP_BODY_RECORD;
+
+    let mut stream = upstream_resp.bytes_stream();
+    let mut acc: Vec<u8> = Vec::new();
+    let mut error_kind: Option<String> = None;
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(b) => {
+                if acc.len() + b.len() > cap {
+                    let remaining = cap.saturating_sub(acc.len());
+                    if remaining > 0 {
+                        acc.extend_from_slice(&b[..remaining]);
+                    }
+                    error_kind = Some("response exceeds record cap".into());
+                    break;
+                }
+                acc.extend_from_slice(&b);
+            }
+            Err(e) => {
+                error_kind = Some(format!("upstream stream error: {e}"));
+                break;
+            }
+        }
+    }
+
+    // record 存储的是 LLM 视角 (含 mock); 客户端拿到的是 restore 后的版本.
+    let record_text = utf8_view(&acc);
+    let elapsed = started.elapsed().as_millis() as u64;
+    records.update_response_full(
+        record_id,
+        ResponseUpdate {
+            resp_status: status_u16,
+            resp_headers: redact_headers(&resp_headers_for_record),
+            resp_body: record_text,
+            elapsed_ms: elapsed,
+            streamed,
+            resp_complete: error_kind.is_none(),
+            error: error_kind,
+        },
+    );
+
+    // restore mock → real 给客户端.
+    let client_text = restore_response(&utf8_view(&acc), &redaction_map);
+    let client_bytes = client_text.into_bytes();
+    let mut resp = Response::new(Body::from(client_bytes));
     *resp.status_mut() = resp_status;
     *resp.headers_mut() = build_response_headers(&resp_headers);
     Ok(resp)
