@@ -69,6 +69,9 @@ fn base62_fixed(n: u64) -> String {
 /// 生成一个 mock secret. 形式化契约见模块级 doc.
 ///
 /// 复杂度: 平均 O(|ctx|) (一次 contains); 极端 ctx 下 O(|ctx| × probes).
+///
+/// **终止性**: hash 空间 2^64, |ctx| 含 mock 子串数远小于 2^64, probing 必然终止.
+/// 兜底 `salt > 2^32` 时 panic 而非返回错误结果, 强制暴露逻辑错误.
 pub fn mock_secret(full_context: &str, real_secret: &str) -> String {
     let mut salt: u64 = 0;
     loop {
@@ -83,9 +86,14 @@ pub fn mock_secret(full_context: &str, real_secret: &str) -> String {
             return candidate;
         }
         salt += 1;
-        // 上限保护: 理论上 |ctx| 中含 mock 子串数 << 2^64, 所以必然终止.
         if salt > (1u64 << 32) {
-            return candidate; // 极端兜底.
+            // 极端情况: ctx 中可能含 hash 空间所有 candidate 的子集 (几乎不可能).
+            // panic 而非返回错误结果, 强制暴露逻辑错误或外部攻击.
+            panic!(
+                "mock_secret probing exhausted after 2^32 attempts; \
+                 ctx likely adversarial (size={})",
+                full_context.len()
+            );
         }
     }
 }
@@ -104,13 +112,15 @@ impl RedactionMap {
         self.real_to_mock.is_empty()
     }
 
-    /// 插入映射. 若 mock 已存在但 real 不同 (碰撞), debug_assert 失败 (开发期捕获).
+    /// 插入映射. 若 mock 已存在但 real 不同 (碰撞), panic.
+    /// C4 保证 collision 实际不可能发生 (probing 挽救); 这里是 defense-in-depth.
     pub fn insert(&mut self, real: String, mock: String) {
-        debug_assert!(
-            !self.mock_to_real.contains_key(&mock) || self.mock_to_real.get(&mock) == Some(&real),
-            "mock collision: mock={mock:?} already maps to {:?}, attempted {real:?}",
-            self.mock_to_real.get(&mock)
-        );
+        if let Some(existing) = self.mock_to_real.get(&mock) {
+            assert!(
+                existing == &real,
+                "mock collision: mock={mock:?} already maps to {existing:?}, attempted {real:?}"
+            );
+        }
         self.mock_to_real.insert(mock.clone(), real.clone());
         self.real_to_mock.insert(real, mock);
     }
@@ -240,11 +250,14 @@ mod tests {
     #[test]
     fn c5_no_substring_of_real_secret() {
         // mock 不应含 real_secret 的任何 ≥4 字符连续子串.
-        // 前提: real_secret 不以 "sgm_" 开头 (validate_value 已禁止, 但测试再次检查).
+        // 前提: real_secret 不含 MOCK_PREFIX (validate_value 已强制).
+        // 若 real 含 "sgm_", validate_value 会拒绝; 所以测试中所有 real 都通过验证.
         for real in ["sk-test-123", "super-secret-xyz", "ABCDEFGH", "abcdefgh"] {
-            if real.starts_with(MOCK_PREFIX) {
-                continue;
-            }
+            // validate_value 在 SecretTable::upsert 时强制, 这里再 sanity check.
+            assert!(
+                !real.contains(MOCK_PREFIX),
+                "test fixture '{real}' should be rejected by validate_value"
+            );
             let m = mock_secret("any-ctx", real);
             for window in 4..=real.len() {
                 for sub in real.as_bytes().windows(window) {
@@ -418,12 +431,13 @@ mod tests {
             prop_assert!(m.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
         }
 
-        /// C5: mock 不含 real_secret 的 ≥4 字符子串 (前提: real 不以 "sgm_" 开头).
+        /// C5: mock 不含 real_secret 的 ≥4 字符子串.
+        /// (validate_value 已强制 real 不含 MOCK_PREFIX; proptest 输入空间遵守此前提.)
         #[test]
         fn prop_no_real_substring(
             secret in "[A-Za-z0-9]{8,20}"
         ) {
-            prop_assume!(!secret.starts_with(MOCK_PREFIX));
+            prop_assume!(!secret.contains(MOCK_PREFIX));
             let m = mock_secret("ctx", &secret);
             for window in 4..=secret.len() {
                 for sub in secret.as_bytes().windows(window) {
@@ -432,6 +446,41 @@ mod tests {
                         "mock contains substring from secret: mock={}, sub={}", m, sub_str);
                 }
             }
+        }
+
+        /// C6 多 secret round-trip: N 个 secret 同时出现在 body, restore 后严格等于原 body.
+        #[test]
+        fn prop_multi_secret_round_trip(
+            n in 1usize..10,
+            prefix in "[a-z]{0,30}",
+            suffix in "[a-z]{0,30}"
+        ) {
+            let secrets: Vec<SecretEntry> = (0..n)
+                .map(|i| entry(&format!("SECRET_{:03}", i)))
+                .collect();
+            let body = format!(
+                "{prefix}{}{suffix}",
+                secrets.iter().map(|s| s.value.as_str()).collect::<Vec<_>>().join(" /// ")
+            );
+            let (redacted, map) = redact_request(&body, &secrets);
+            let restored = restore_response(&redacted, &map);
+            prop_assert_eq!(restored, body);
+        }
+
+        /// C6 同一 secret 多次出现: round-trip 仍为 identity.
+        #[test]
+        fn prop_repeated_secret_round_trip(
+            secret in "[A-Z]{4,8}",
+            repeat in 1usize..5,
+            filler in "[a-z ]{0,30}"
+        ) {
+            let body = std::iter::repeat_n(secret.clone(), repeat)
+                .collect::<Vec<_>>()
+                .join(&filler);
+            let secrets = vec![entry(&secret)];
+            let (redacted, map) = redact_request(&body, &secrets);
+            let restored = restore_response(&redacted, &map);
+            prop_assert_eq!(restored, body);
         }
 
         /// C4 加强版: 在单次 redact_request 内, N 个不同 secret → N 个不同 mock.
