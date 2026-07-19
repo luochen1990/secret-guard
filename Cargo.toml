@@ -1,0 +1,48 @@
+[package]
+name = "secret-guard"
+version = "0.1.0"
+edition = "2021"
+description = "A lightweight LLM gateway that prevents accidental secret leakage"
+license = "MIT"
+
+[[bin]]
+name = "secret-guard"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.8", features = ["macros"] }
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+regex = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+parking_lot = "0.12"
+once_cell = "1"
+mime = "0.3"
+
+[dev-dependencies]
+tokio-test = "0.4"
+mockito = "1"
+pretty_assertions = "1"
+proptest = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

@@ -1,0 +1,9 @@
+/target
+/.direnv
+/.devenv
+/result
+*.swp
+*.swo
+.idea/
+.vscode/
+secret-guard.toml
