@@ -423,6 +423,9 @@
         body.innerHTML = '<tr><td colspan="6" class="empty">No secrets configured</td></tr>';
         return;
       }
+      // 注意: 用 data-* 属性 + 事件委托, 避免内联 onclick (会引入 XSS).
+      // escapeHtml 转义 `'` 后, 浏览器解析 HTML attribute 时会先解码,
+      // 重新把 `'` 还原到 JS 字面量, 形成存储型 XSS. dataset 自动正确处理转义.
       body.innerHTML = secretsList.map(s => `
         <tr data-id="${escapeHtml(s.id)}">
           <td><code>${escapeHtml(s.id)}</code></td>
@@ -431,12 +434,21 @@
           <td><code>${escapeHtml(s.value_masked)}</code></td>
           <td>${escapeHtml(s.value_length)}</td>
           <td class="actions">
-            <button class="btn" onclick="editSecret('${escapeHtml(s.id)}')">edit</button>
-            <button class="btn btn-danger" onclick="deleteSecret('${escapeHtml(s.id)}')">delete</button>
+            <button class="btn" data-action="edit" data-id="${escapeHtml(s.id)}">edit</button>
+            <button class="btn btn-danger" data-action="delete" data-id="${escapeHtml(s.id)}">delete</button>
           </td>
         </tr>
       `).join('');
     }
+
+    // 事件委托: 表格行内的 button click 统一处理.
+    document.getElementById('secrets-body').addEventListener('click', (e) => {
+      const btn = e.target.closest('button[data-action]');
+      if (!btn) return;
+      const id = btn.dataset.id;
+      if (btn.dataset.action === 'edit') editSecret(id);
+      else if (btn.dataset.action === 'delete') deleteSecret(id);
+    });
 
     function populateCategorySelect() {
       const sel = document.getElementById('f-category');
@@ -448,10 +460,13 @@
       const dlg = document.getElementById('secret-form');
       const title = document.getElementById('secret-form-title');
       const saveBtn = document.getElementById('f-save');
+      const idInput = document.getElementById('f-id');
       document.getElementById('f-id').value = existing?.id || '';
+      // 编辑模式下 ID 不可改 (PUT 路径以 URL 中的 id 为准).
+      idInput.disabled = !!existing;
       document.getElementById('f-name').value = existing?.name || '';
       document.getElementById('f-category').value = existing?.category || secretCategories[0] || 'apikey';
-      document.getElementById('f-value').value = existing ? '' : ''; // 编辑时也清空, 强制用户重输 (避免泄露)
+      document.getElementById('f-value').value = ''; // 编辑时也清空, 强制用户重输 (避免泄露)
       title.textContent = existing ? `Edit secret ${existing.id}` : 'New secret';
       dlg.dataset.editId = existing ? existing.id : '';
       saveBtn.textContent = existing ? 'Update' : 'Create';

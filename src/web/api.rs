@@ -5,10 +5,11 @@
 //! **安全姿态**:
 //! - GET 永不返回 secret 的 `value` 字段 (用 `mask_*` 占位符), 防止浏览器/UI 误显示.
 //! - 写操作 (POST/PUT/DELETE) 通过同源策略 + 本地监听 (默认 127.0.0.1) 保护.
+//! - 内部错误细节不通过响应体返回, 仅进 tracing.
 
 use axum::{
     extract::{Path, State},
-    http::{header, HeaderValue, StatusCode},
+    http::StatusCode,
     response::{IntoResponse, Json},
 };
 use serde::{Deserialize, Serialize};
@@ -16,13 +17,10 @@ use uuid::Uuid;
 
 use crate::proxy::ProxyState;
 use crate::record::ForwardRecord;
-use crate::secrets::{SecretCategory, SecretEntry};
+use crate::secrets::{SecretCategory, SecretEntry, UpsertKind};
 
-/// 共享的 `no-store` header 设置.
-const NO_STORE: [(header::HeaderName, HeaderValue); 1] = [(
-    header::CACHE_CONTROL,
-    HeaderValue::from_static("no-store, no-cache, must-revalidate"),
-)];
+/// 共享的 `no-store` header 设置 (axum 的 `[(name, value); N]` 接受 `(&str, &str)`).
+const NO_STORE: [(&str, &str); 1] = [("cache-control", "no-store, no-cache, must-revalidate")];
 
 // ─── /records ──────────────────────────────────────────────────────────────
 
@@ -50,9 +48,13 @@ pub struct ListRecordsResponse {
 // ─── /secrets ──────────────────────────────────────────────────────────────
 
 pub async fn list_secrets(State(state): State<ProxyState>) -> impl IntoResponse {
-    let entries = state.secrets.snapshot();
-    let secrets: Vec<SecretMasked> = entries.into_iter().map(SecretMasked::from).collect();
-    let categories: Vec<&'static str> = SecretCategory::all().iter().map(|c| c.as_str()).collect();
+    let secrets: Vec<SecretMasked> = state
+        .secrets
+        .snapshot()
+        .into_iter()
+        .map(SecretMasked::from)
+        .collect();
+    let categories: Vec<&'static str> = SecretCategory::ALL.iter().map(|(_, s)| *s).collect();
     (
         NO_STORE,
         Json(ListSecretsResponse {
@@ -65,9 +67,25 @@ pub async fn list_secrets(State(state): State<ProxyState>) -> impl IntoResponse 
 pub async fn create_secret(
     State(state): State<ProxyState>,
     Json(payload): Json<CreateSecretRequest>,
-) -> Result<impl IntoResponse, AppResponse> {
-    let entry = payload.into_entry()?;
-    let saved = state.secrets.upsert(entry).map_err(AppResponse::from_any)?;
+) -> Result<impl IntoResponse, ApiError> {
+    let mut entry = payload.into_entry()?;
+    // create 模式: 若没传 id, 自动生成; 若传了已存在的 id, 返回 409.
+    if entry.id.is_empty() {
+        entry.id = Uuid::new_v4().to_string();
+    }
+    if state.secrets.get(&entry.id).is_some() {
+        return Err(ApiError::conflict(format!(
+            "secret with id '{}' already exists; use PUT to update",
+            entry.id
+        )));
+    }
+    let (saved, kind) = state.secrets.upsert(entry).map_err(ApiError::from_any)?;
+    if kind == UpsertKind::Updated {
+        // 并发写入导致在 get 与 upsert 之间被其他请求创建; 视为 conflict.
+        return Err(ApiError::conflict(
+            "secret was concurrently created; please retry",
+        ));
+    }
     Ok((
         StatusCode::CREATED,
         NO_STORE,
@@ -79,22 +97,29 @@ pub async fn update_secret(
     State(state): State<ProxyState>,
     Path(id): Path<String>,
     Json(payload): Json<CreateSecretRequest>,
-) -> Result<impl IntoResponse, AppResponse> {
+) -> Result<impl IntoResponse, ApiError> {
+    if state.secrets.get(&id).is_none() {
+        return Err(ApiError::not_found(format!("secret {id} not found")));
+    }
     let mut entry = payload.into_entry()?;
-    entry.id = id;
-    let saved = state.secrets.upsert(entry).map_err(AppResponse::from_any)?;
-    Ok((StatusCode::OK, NO_STORE, Json(SecretMasked::from(saved))))
+    entry.id = id.clone();
+    let (saved, kind) = state.secrets.upsert(entry).map_err(ApiError::from_any)?;
+    match kind {
+        UpsertKind::Updated => Ok((StatusCode::OK, NO_STORE, Json(SecretMasked::from(saved)))),
+        UpsertKind::Inserted => Err(ApiError::not_found(format!(
+            "secret {id} was concurrently deleted; please retry"
+        ))),
+    }
 }
 
 pub async fn delete_secret(
     State(state): State<ProxyState>,
     Path(id): Path<String>,
-) -> Result<impl IntoResponse, AppResponse> {
-    let removed = state.secrets.delete(&id).map_err(AppResponse::from_any)?;
-    if removed {
-        Ok((StatusCode::NO_CONTENT, NO_STORE, ""))
-    } else {
-        Err(AppResponse::not_found(format!("secret {id} not found")))
+) -> Result<impl IntoResponse, ApiError> {
+    use crate::secrets::DeleteOutcome;
+    match state.secrets.delete(&id).map_err(ApiError::from_any)? {
+        DeleteOutcome::Deleted => Ok((StatusCode::NO_CONTENT, NO_STORE, "")),
+        DeleteOutcome::NotFound => Err(ApiError::not_found(format!("secret {id} not found"))),
     }
 }
 
@@ -114,24 +139,20 @@ pub struct CreateSecretRequest {
 }
 
 impl CreateSecretRequest {
-    fn into_entry(self) -> Result<SecretEntry, AppResponse> {
-        let id = self
-            .id
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
+    fn into_entry(self) -> Result<SecretEntry, ApiError> {
         if self.value.is_empty() {
-            return Err(AppResponse::validation("value must not be empty"));
+            return Err(ApiError::validation("value must not be empty"));
         }
         Ok(SecretEntry {
-            id,
-            name: self.name,
+            id: self.id.unwrap_or_default(),
+            name: self.name.filter(|s| !s.trim().is_empty()),
             category: self.category.unwrap_or_default(),
             value: self.value,
         })
     }
 }
 
-/// 对外返回时屏蔽真实 value. 长度过短也只显示 1 个 `*`, 不暴露长度.
+/// 对外返回时屏蔽真实 value. 长度过短也只显示 `*`, 不暴露长度.
 #[derive(Serialize)]
 pub struct SecretMasked {
     pub id: String,
@@ -153,13 +174,13 @@ impl From<SecretEntry> for SecretMasked {
     }
 }
 
-/// 对 secret 做最小信息脱敏: 保留首尾各 1 字符 (若可打印), 中间替换为 `*`.
+/// 对 secret 做最小信息脱敏: 短 (<=8) 全 `*`; 长则保留首尾各 1 + 中间 `*`.
 fn mask_value(v: &str) -> String {
     let chars: Vec<char> = v.chars().collect();
     if chars.is_empty() {
         return String::new();
     }
-    if chars.len() <= 4 {
+    if chars.len() <= 8 {
         return "*".repeat(chars.len());
     }
     let head = chars[0];
@@ -168,14 +189,14 @@ fn mask_value(v: &str) -> String {
     format!("{head}{stars}{tail}")
 }
 
-/// 错误响应 (统一为合法 JSON).
+/// API 错误: 统一为合法 JSON, 不泄露内部细节.
 #[derive(Debug)]
-pub struct AppResponse {
+pub struct ApiError {
     pub status: StatusCode,
     pub message: String,
 }
 
-impl AppResponse {
+impl ApiError {
     pub fn validation(msg: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
@@ -188,15 +209,26 @@ impl AppResponse {
             message: msg.into(),
         }
     }
-    pub fn from_any(e: anyhow::Error) -> Self {
+    pub fn conflict(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: msg.into(),
+        }
+    }
+    pub fn internal(msg: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: format!("internal error: {e}"),
+            message: msg.into(),
         }
+    }
+    pub fn from_any(e: anyhow::Error) -> Self {
+        // 详细信息进 tracing, 不回客户端.
+        tracing::error!(error = ?e, "secrets api internal error");
+        Self::internal("internal error")
     }
 }
 
-impl IntoResponse for AppResponse {
+impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         let body = Json(serde_json::json!({ "error": self.message }));
         (self.status, NO_STORE, body).into_response()
@@ -213,12 +245,12 @@ mod tests {
         assert_eq!(mask_value("a"), "*");
         assert_eq!(mask_value("ab"), "**");
         assert_eq!(mask_value("abc"), "***");
-        assert_eq!(mask_value("abcd"), "****");
+        assert_eq!(mask_value("abcdefgh"), "********"); // exactly 8 chars
     }
 
     #[test]
     fn mask_long_value_keeps_endpoints() {
-        assert_eq!(mask_value("abcde"), "a***e");
+        assert_eq!(mask_value("abcdefghi"), "a*******i"); // 9 chars
         assert_eq!(mask_value("sk-abcdef123456"), "s*************6");
     }
 
@@ -231,18 +263,5 @@ mod tests {
             value: String::new(),
         };
         assert!(req.into_entry().is_err());
-    }
-
-    #[test]
-    fn create_request_generates_id_when_missing() {
-        let req = CreateSecretRequest {
-            id: None,
-            name: None,
-            category: None,
-            value: "v".into(),
-        };
-        let entry = req.into_entry().unwrap();
-        assert!(!entry.id.is_empty());
-        assert_eq!(entry.value, "v");
     }
 }

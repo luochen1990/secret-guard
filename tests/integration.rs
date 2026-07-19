@@ -22,13 +22,7 @@ async fn spawn_mock_upstream() -> mockito::ServerGuard {
 
 /// 在随机端口启动 secret-guard, 返回其 base URL.
 async fn spawn_proxy(upstream_base: String) -> String {
-    spawn_proxy_full(
-        upstream_base,
-        reqwest::Client::new(),
-        RecordStore::new(64),
-        test_secret_table(),
-    )
-    .await
+    spawn_proxy_with(upstream_base, reqwest::Client::new(), RecordStore::new(64)).await
 }
 
 async fn spawn_proxy_with(
@@ -36,22 +30,13 @@ async fn spawn_proxy_with(
     upstream: reqwest::Client,
     records: RecordStore,
 ) -> String {
-    spawn_proxy_full(upstream_base, upstream, records, test_secret_table()).await
-}
-
-async fn spawn_proxy_full(
-    upstream_base: String,
-    upstream: reqwest::Client,
-    records: RecordStore,
-    secrets: SecretTable,
-) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let proxy = ProxyState {
         upstream,
         upstream_base,
         records,
-        secrets,
+        secrets: test_secret_table(),
     };
     let app = server::build_router(proxy);
     tokio::spawn(async move {
