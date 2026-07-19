@@ -1,7 +1,10 @@
 //! axum router 装配与服务启动.
 //!
-//! 路由策略: 所有路径都进入 [`proxy::forward`] handler, 实现透明转发.
-//! 第二步会引入 `/__sg/*` 命名空间作为 Web UI / API 入口 (与业务流量隔离).
+//! 路由策略:
+//! - `/__sg/*` 走 [`web`] 子路由 (Web UI + JSON API).
+//! - 其他所有路径进入 [`proxy::forward`] handler, 实现透明转发.
+//!
+//! axum 按精确匹配优先, `/__sg/*` 不会被 catch-all 吞掉.
 //!
 //! Shutdown: 默认监听 SIGTERM / Ctrl-C, axum 进入 graceful shutdown 期间不再接受新连接,
 //! 已建立的连接会等到完成或超时.
@@ -9,17 +12,24 @@
 use std::net::SocketAddr;
 
 use anyhow::Context;
-use axum::{routing::any, Router};
+use axum::{
+    routing::{any, get},
+    Router,
+};
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
 use crate::proxy::{forward, ProxyState};
 use crate::record::RecordStore;
+use crate::web;
 
 /// 构建 axum Router.
 pub fn build_router(state: ProxyState) -> Router {
     Router::new()
+        // Web UI / API (与业务流量隔离).
+        .nest("/__sg", web::router())
+        .route("/__sg/", get(web::slash_redirect))
         // catch-all: 任意方法 + 任意路径透传到上游.
         .route("/", any(forward))
         .route("/{*path}", any(forward))

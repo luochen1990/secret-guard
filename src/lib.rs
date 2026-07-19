@@ -6,6 +6,7 @@
 //! - [`proxy`]    —— 透明反向代理 handler (axum + reqwest)
 //! - [`record`]   —— 转发记录模型与内存存储 (供 Web UI 消费)
 //! - [`server`]   —— axum router 装配与服务启动
+//! - [`web`]      —— `/__sg/*` Web UI 与 JSON API
 //!
 //! 设计目标: 全程"协议无关", body 在字节层面流动, 中间件可对 body 做 find-and-replace.
 //! 协议无关意味着 OpenAI / Anthropic / Gemini 等任意 LLM API 都能透传, 无需 schema 同步.
@@ -15,6 +16,7 @@ pub mod config;
 pub mod proxy;
 pub mod record;
 pub mod server;
+pub mod web;
 
 pub use cli::{Cli, Command, RunArgs};
 pub use config::Config;

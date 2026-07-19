@@ -8,6 +8,7 @@
 //! - 上游 non-2xx 透传
 //! - 上游不可达时返回 502 + record 标记 incomplete
 //! - hop-by-hop / Connection 自定义 header 被剥离
+//! - Web UI: `/__sg/` HTML 与 `/__sg/api/records` JSON
 
 use std::time::Duration;
 
@@ -319,4 +320,107 @@ async fn passes_query_string_through() {
     let (status, _, _) =
         proxy_request(&proxy_url, "GET", "/v1/models?limit=10&order=desc", "", &[]).await;
     assert_eq!(status, reqwest::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn web_ui_serves_html() {
+    let upstream = spawn_mock_upstream().await;
+    let proxy_url = spawn_proxy(upstream.url()).await;
+    let resp = reqwest::Client::new()
+        .get(format!("{proxy_url}/__sg/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("secret-guard"));
+    assert!(body.contains("<html"));
+}
+
+#[tokio::test]
+async fn web_api_lists_records() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/messages")
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    let upstream_client = reqwest::Client::new();
+    let records = RecordStore::new(64);
+    let records_handle = records.clone();
+    let proxy_url = spawn_proxy_with(upstream.url().to_string(), upstream_client, records).await;
+
+    let _ = proxy_request(&proxy_url, "POST", "/v1/messages", "{}", &[]).await;
+
+    // 等待记录写回.
+    wait_until_or_timeout(
+        &records_handle,
+        |l| l.first().map(|r| r.resp_complete).unwrap_or(false),
+        Duration::from_secs(2),
+    )
+    .await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{proxy_url}/__sg/api/records"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let recs = body.get("records").and_then(|v| v.as_array()).unwrap();
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0]["method"], "POST");
+    assert_eq!(recs[0]["path"], "/v1/messages");
+}
+
+#[tokio::test]
+async fn web_api_returns_record_by_id() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/messages")
+        .with_status(200)
+        .with_body(r#"{"ok":true}"#)
+        .create_async()
+        .await;
+
+    let upstream_client = reqwest::Client::new();
+    let records = RecordStore::new(64);
+    let records_handle = records.clone();
+    let proxy_url = spawn_proxy_with(upstream.url().to_string(), upstream_client, records).await;
+
+    let _ = proxy_request(&proxy_url, "POST", "/v1/messages", r#"{"q":"hi"}"#, &[]).await;
+
+    let list = wait_until_or_timeout(
+        &records_handle,
+        |l| l.first().map(|r| r.resp_complete).unwrap_or(false),
+        Duration::from_secs(2),
+    )
+    .await;
+    let id = list[0].id;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{proxy_url}/__sg/api/records/{id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["id"], id.to_string());
+    assert_eq!(body["resp_status"], 200);
+}
+
+#[tokio::test]
+async fn web_api_404_for_unknown_record() {
+    let upstream = spawn_mock_upstream().await;
+    let proxy_url = spawn_proxy(upstream.url()).await;
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "{proxy_url}/__sg/api/records/00000000-0000-0000-0000-000000000000"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
 }
