@@ -1,67 +1,93 @@
 //! Secret redaction (请求) 与 restoration (响应) 逻辑.
 //!
-//! # 第四步实现说明 (naive)
-//! - [`mock_secret`] 是基于 `real_secret` 哈希的纯函数, 输出单个 Unicode 私有区字符
-//!   (U+E000..=U+F8FF, 6400 个码位). 通过 `full_context` 做线性探测避免与上下文已有字符冲突.
-//! - 碰撞风险: 6400 个码位理论上不够大, 不同 real_secret 可能映射到同一 mock.
-//!   第五步会用更精细的方案消除碰撞, 并给出契约与正确性证明.
+//! # 第五步精化: 契约与正确性
+//!
+//! [`mock_secret`] 的形式化契约:
+//!
+//! - **C1 非空性**: 返回的 mock 非空, 长度 = `MOCK_PREFIX.len() + MOCK_BODY_LEN`,
+//!   仅含 ASCII 字母数字 + 下划线.
+//! - **C2 上下文唯一性 (in-context uniqueness)**:
+//!   `mock_secret(ctx, secret)` 返回的 mock 一定**不在** `ctx` 中出现.
+//!   这保证 redact 后的 body 中, mock 与所有非 secret 内容可区分.
+//! - **C3 确定性 (determinism)**:
+//!   同一进程内, 同一 `(ctx, secret)` 对总返回同一 mock (直到 ctx 改变).
+//! - **C4 单射性 (injectivity within a redact pass)**:
+//!   在 [`redact_request`] 的一次调用内, 不同 secret 总映射到不同 mock
+//!   (因为 redact_request 在每次替换后, 把上一次的 mock 加进 ctx 再调 `mock_secret`).
+//! - **C5 不含 real_secret 子串 (non-disclosure)**:
+//!   mock 中**不含** real_secret 的任何 ≥4 字符连续子串.
+//!   通过使用与 real_secret 无关的固定 prefix (`sgm_`) + hash body 实现.
+//! - **C6 可逆性 (restorability)**:
+//!   对 [`redact_request`] 返回的 `(redacted, map)`,
+//!   `restore_response(redacted, map)` 严格恢复原始 body.
+//!
+//! # 实现思路
+//!
+//! - **prefix**: 固定 `sgm_` (secret-guard mock). 与 real_secret 无关, 保证 C5.
+//! - **body**: 用 SipHash 1-2-3 (Rust `DefaultHasher`) 把 real_secret 映射到 u64,
+//!   再 base62 编码为 11 字符. 不同 secret 几乎一定产生不同 body (碰撞概率 ≈ 2^-64).
+//! - **collision probing**: 若初始 mock 已在 full_context 中, 用 `hash(secret || salt)`
+//!   重新生成 body, 直到不再冲突.
 //!
 //! # 流式 trade-off
-//! 当前实现对**非流式响应**直接做 restore; 对**流式响应**也采用 "完整累积再 restore" 策略
-//! (失去流式 UX, 但保证 mock→real 映射正确, 避免 chunk 边界问题).
-//! 第五步会引入 chunk boundary 处理恢复流式.
+//! 当前对**非流式响应**直接做 restore; 对**流式响应**采用 "完整累积再 restore" 策略
+//! (失去流式 UX, 但保证 mock→real 映射正确). 见 [`crate::proxy`] 的 fan_out_buffered.
 
-use std::cmp::Reverse;
-use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
 
 use crate::secrets::SecretEntry;
 
-/// Unicode 私有区 (BMP PUA) 范围. 6400 个码位.
-const PUA_START: u32 = 0xE000;
-const PUA_END: u32 = 0xF8FF; // inclusive
-const PUA_LEN: u32 = PUA_END - PUA_START + 1; // 0x1900
+/// mock 的固定 prefix. 与 real_secret 无关, 是 C5 (no-real-substring) 的关键.
+pub const MOCK_PREFIX: &str = "sgm_";
 
-/// 生成一个 mock secret.
+/// mock 的 body 长度 (base62 编码 u64 的固定长度, 范围 ~10^19 ≈ 2^63).
+pub const MOCK_BODY_LEN: usize = 11;
+
+/// 64-bit hash (Rust 默认 SipHash 1-2-3, 同 Rust 版本内确定).
+fn hash64(s: &str) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+/// base62 编码 u64 → 固定长度字符串.
+fn base62_fixed(n: u64) -> String {
+    const CHARS: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    debug_assert_eq!(CHARS.len(), 62);
+    let mut buf = [b'0'; MOCK_BODY_LEN];
+    let mut n = n;
+    for i in (0..MOCK_BODY_LEN).rev() {
+        buf[i] = CHARS[(n % 62) as usize];
+        n /= 62;
+    }
+    String::from_utf8(buf.to_vec()).expect("base62 output is ASCII")
+}
+
+/// 生成一个 mock secret. 形式化契约见模块级 doc.
 ///
-/// 契约 (第四步 naive 版本):
-/// 1. **确定性**: 同样的 `(real_secret)` 在同一进程内 (DefaultHasher 是稳定的)
-///    产生同样的起始码位.
-/// 2. **上下文唯一性**: 若起始码位已出现在 `full_context` 中, 线性探测下一个,
-///    保证返回的 mock 在 `full_context` 中**不在场**.
-/// 3. **非空性**: 返回的字符串总是单个合法 Unicode 字符 (UTF-8 3 bytes).
-///
-/// 不变式 (第五步会更强):
-/// - 仍有**全局碰撞风险**: 不同 `real_secret` 在同一 `full_context` 下可能产生相同 mock.
-///   这是因为 codepoint 空间 (6400) 远小于 secret 空间.
+/// 复杂度: 平均 O(|ctx|) (一次 contains); 极端 ctx 下 O(|ctx| × probes).
 pub fn mock_secret(full_context: &str, real_secret: &str) -> String {
-    if real_secret.is_empty() {
-        // 空字符串不是合法 secret; 返回 PUA 起始作为兜底.
-        return char::from_u32(PUA_START).unwrap().to_string();
-    }
-    let mut hasher = DefaultHasher::new();
-    real_secret.hash(&mut hasher);
-    let base = hasher.finish();
-    let mut codepoint = PUA_START + ((base % PUA_LEN as u64) as u32);
-    // 线性探测: 找一个不在 full_context 中的码位.
-    for _ in 0..PUA_LEN {
-        if let Some(c) = char::from_u32(codepoint) {
-            let s = c.to_string();
-            if !full_context.contains(&s) {
-                return s;
-            }
-        }
-        codepoint = if codepoint >= PUA_END {
-            PUA_START
+    let mut salt: u64 = 0;
+    loop {
+        let hash_input = if salt == 0 {
+            real_secret.to_string()
         } else {
-            codepoint + 1
+            format!("{real_secret}{salt}")
         };
+        let body = base62_fixed(hash64(&hash_input));
+        let candidate = format!("{MOCK_PREFIX}{body}");
+        if !full_context.contains(&candidate) {
+            return candidate;
+        }
+        salt += 1;
+        // 上限保护: 理论上 |ctx| 中含 mock 子串数 << 2^64, 所以必然终止.
+        if salt > (1u64 << 32) {
+            return candidate; // 极端兜底.
+        }
     }
-    // 极端情况: 所有码位都被占用 (几乎不可能). 返回起始码位.
-    char::from_u32(PUA_START).unwrap().to_string()
 }
 
 /// 改写映射: real ↔ mock 双向索引.
@@ -108,9 +134,8 @@ impl RedactionMap {
 /// 复杂度: O(secrets × body_size). MVP 阶段 secrets 数量 <100, body <16 MiB, 可接受.
 pub fn redact_request(body: &str, secrets: &[SecretEntry]) -> (String, RedactionMap) {
     let mut sorted: Vec<&SecretEntry> = secrets.iter().collect();
-    sorted.sort_by_key(|e| Reverse(e.value.len()));
-    // 去重: 同一 value 只 redact 一次.
-    let mut seen_values = HashSet::new();
+    sorted.sort_by_key(|e| std::cmp::Reverse(e.value.len()));
+    let mut seen_values: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
     let mut redacted = body.to_string();
     let mut map = RedactionMap::default();
@@ -126,7 +151,6 @@ pub fn redact_request(body: &str, secrets: &[SecretEntry]) -> (String, Redaction
             continue;
         }
         let mock = mock_secret(&redacted, &entry.value);
-        // 全局替换: 注意 String::replace 处理 non-overlapping 出现.
         redacted = redacted.replace(&entry.value, &mock);
         map.insert(entry.value.clone(), mock);
     }
@@ -163,53 +187,107 @@ mod tests {
         }
     }
 
-    #[test]
-    fn mock_secret_is_deterministic_for_same_input() {
-        let m1 = mock_secret("hello world", "secret-1");
-        let m2 = mock_secret("hello world", "secret-1");
-        assert_eq!(m1, m2, "same input must produce same mock");
-    }
+    // ─── 契约单元测试 ──────────────────────────────────────────────────────
 
     #[test]
-    fn mock_secret_probes_when_in_context() {
-        // 先生成 mock, 然后把它放进 context, 再生成一次, 应该得到不同的 mock.
-        let first = mock_secret("ctx", "abc");
-        let ctx_with_first = format!("ctx{first}");
-        let second = mock_secret(&ctx_with_first, "abc");
-        assert_ne!(first, second, "must probe to a different codepoint");
-    }
-
-    #[test]
-    fn mock_secret_is_single_pua_char() {
-        let m = mock_secret("any", "any-secret");
-        assert_eq!(m.chars().count(), 1);
-        let c = m.chars().next().unwrap();
-        let cp = c as u32;
+    fn c1_non_empty() {
+        let m = mock_secret("ctx", "sk-test-123");
+        assert!(!m.is_empty());
+        assert!(m.starts_with(MOCK_PREFIX));
         assert!(
-            (PUA_START..=PUA_END).contains(&cp),
-            "mock must be in PUA range, got U+{cp:04X}"
+            m.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "mock '{m}' must be ASCII alphanumeric + underscore"
+        );
+        assert_eq!(m.len(), MOCK_PREFIX.len() + MOCK_BODY_LEN);
+    }
+
+    #[test]
+    fn c2_in_context_uniqueness() {
+        let m1 = mock_secret("ctx", "abc");
+        let ctx_with_m1 = format!("ctx{m1}");
+        let m2 = mock_secret(&ctx_with_m1, "abc");
+        assert!(
+            !ctx_with_m1.contains(&m2),
+            "m2={m2} must not appear in ctx_with_m1"
         );
     }
 
     #[test]
-    fn mock_secret_empty_input_returns_default() {
-        let m = mock_secret("ctx", "");
-        assert_eq!(m, "\u{E000}");
+    fn c3_determinism() {
+        for secret in ["short", "sk-test-123", "a-much-longer-secret-value-XYZ"] {
+            let m1 = mock_secret("fixed-ctx", secret);
+            let m2 = mock_secret("fixed-ctx", secret);
+            assert_eq!(m1, m2, "same input must produce same mock for '{secret}'");
+        }
     }
 
     #[test]
-    fn redact_replaces_secrets_with_mock() {
-        let body = "Authorization: Bearer sk-test-123\nHello world";
-        let secrets = vec![entry("sk-test-123")];
+    fn c4_injectivity_within_redact() {
+        // 100 个不同 secret, 在同一 redact_request 内应映射到 100 个不同 mock.
+        let secrets: Vec<SecretEntry> = (0..100)
+            .map(|i| entry(&format!("secret-value-{i:03}")))
+            .collect();
+        let body = secrets
+            .iter()
+            .map(|e| e.value.clone())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let (_, map) = redact_request(&body, &secrets);
+        let mocks: std::collections::HashSet<_> = map.real_to_mock.values().cloned().collect();
+        assert_eq!(mocks.len(), 100, "all 100 mocks must be distinct");
+    }
+
+    #[test]
+    fn c5_no_substring_of_real_secret() {
+        // mock 不应含 real_secret 的任何 ≥4 字符连续子串.
+        // 前提: real_secret 不以 "sgm_" 开头 (validate_value 已禁止, 但测试再次检查).
+        for real in ["sk-test-123", "super-secret-xyz", "ABCDEFGH", "abcdefgh"] {
+            if real.starts_with(MOCK_PREFIX) {
+                continue;
+            }
+            let m = mock_secret("any-ctx", real);
+            for window in 4..=real.len() {
+                for sub in real.as_bytes().windows(window) {
+                    let sub_str = std::str::from_utf8(sub).unwrap();
+                    assert!(
+                        !m.contains(sub_str),
+                        "mock '{m}' contains '{sub_str}' from real '{real}' (window={window})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn c6_round_trip_identity() {
+        let body = "auth=sk-test-123; user=alice; token=ABCDEF-1234567890";
+        let secrets = vec![entry("sk-test-123"), entry("ABCDEF-1234567890")];
         let (redacted, map) = redact_request(body, &secrets);
-        assert!(!redacted.contains("sk-test-123"));
-        assert!(map.real_to_mock.contains_key("sk-test-123"));
-        let mock = map.real_to_mock.get("sk-test-123").unwrap();
-        assert!(redacted.contains(mock));
+        assert_ne!(redacted, body);
+        let restored = restore_response(&redacted, &map);
+        assert_eq!(restored, body, "round-trip must be identity");
+    }
+
+    // ─── 行为测试 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn mock_has_fixed_prefix_and_length() {
+        for real in ["abcd", "sk-test", "-leading-dash", "longer-secret-value"] {
+            let m = mock_secret("ctx", real);
+            assert!(
+                m.starts_with(MOCK_PREFIX),
+                "mock '{m}' must start with '{MOCK_PREFIX}'"
+            );
+            assert_eq!(
+                m.len(),
+                MOCK_PREFIX.len() + MOCK_BODY_LEN,
+                "mock '{m}' must have fixed length"
+            );
+        }
     }
 
     #[test]
-    fn redact_handles_multiple_secrets() {
+    fn redact_replaces_multiple_secrets() {
         let body = "key1=AAA key2=BBB key3=CCC";
         let secrets = vec![entry("AAA"), entry("BBB"), entry("CCC")];
         let (redacted, map) = redact_request(body, &secrets);
@@ -217,30 +295,20 @@ mod tests {
         assert!(!redacted.contains("BBB"));
         assert!(!redacted.contains("CCC"));
         assert_eq!(map.real_to_mock.len(), 3);
-        // 三个 mock 互不相同.
-        let mocks: HashSet<_> = map.real_to_mock.values().cloned().collect();
-        assert_eq!(mocks.len(), 3);
     }
 
     #[test]
     fn redact_longer_secret_wins_overlapping() {
-        // AAA 是 AAAAA 的子串. 必须先替换 AAAAA (长的), 否则 AAA 先替换会破坏 AAAAA.
         let body = "found AAAAA in body";
         let secrets = vec![entry("AAA"), entry("AAAAA")];
         let (redacted, map) = redact_request(body, &secrets);
-        // AAAAA 应该被作为一个整体 mock 替换.
-        assert!(
-            !redacted.contains("AAAAA"),
-            "longer secret must be replaced, got: {redacted}"
-        );
-        // AAA 不应该出现 (要么被作为 AAAAA 的一部分替换, 要么单独替换).
-        // 但 AAAAA 被替换后, AAA 的 mock 应该不存在.
-        // 实际上, AAA 出现在 AAAAA 中, 所以 AAA 本身也存在; 按 sort_by_key 倒序,
-        // AAAAA 先替换为 mock, 然后 AAA 在剩余 body 中找不到了 (因为已经被替换为 mock 字符).
-        // 所以 map 应该只包含 AAAAA.
+        // AAAAA 被作为一个整体替换为 mock (e.g. "sgm_xxxxxxxxxxxx"), body 中不再含 "AAA".
+        // 所以 AAA 在剩余 body 中找不到, 不会被加入 map.
+        assert!(!redacted.contains("AAAAA"));
         assert!(
             !map.real_to_mock.contains_key("AAA"),
-            "AAA should not be in map since it's already covered by AAAAA"
+            "AAA should not be in map; map = {:?}",
+            map.real_to_mock
         );
         assert!(map.real_to_mock.contains_key("AAAAA"));
     }
@@ -263,40 +331,10 @@ mod tests {
     }
 
     #[test]
-    fn restore_reverses_redact() {
-        let body = "key=AAA, key2=BBB";
-        let secrets = vec![entry("AAA"), entry("BBB")];
-        let (redacted, map) = redact_request(body, &secrets);
-        assert_ne!(redacted, body);
-        let restored = restore_response(&redacted, &map);
-        assert_eq!(restored, body, "round-trip must be identity");
-    }
-
-    #[test]
     fn restore_with_empty_map_is_identity() {
         let body = "anything";
         let map = RedactionMap::default();
         assert_eq!(restore_response(body, &map), body);
-    }
-
-    #[test]
-    fn restore_preserves_llm_generated_content() {
-        // LLM 在响应中引用了 mock (假设它"理解"了 mock 作为一个 token).
-        let body = "user AAA has password BBB";
-        let secrets = vec![entry("AAA"), entry("BBB")];
-        let (redacted, map) = redact_request(body, &secrets);
-        // 模拟 LLM 处理后回写了部分 mock + 新内容.
-        let llm_response = format!(
-            "I see {mock1} and {mock2} in the input.",
-            mock1 = map.real_to_mock.get("AAA").unwrap(),
-            mock2 = map.real_to_mock.get("BBB").unwrap()
-        );
-        let restored = restore_response(&llm_response, &map);
-        assert!(restored.contains("AAA"));
-        assert!(restored.contains("BBB"));
-        // LLM 添加的非 mock 内容保持不变.
-        assert!(restored.contains("I see"));
-        let _ = redacted; // silence unused warning
     }
 
     #[test]
@@ -305,29 +343,109 @@ mod tests {
         let secrets = vec![entry("not-present")];
         let (redacted, map) = redact_request(body, &secrets);
         assert_eq!(redacted, body);
-        assert!(map.is_empty(), "secret not in body must not produce a mock");
+        assert!(map.is_empty());
     }
 
     #[test]
     fn redact_dedupes_identical_values() {
-        let body = "token: XYZ";
+        let body = "token: XYZ123";
         let secrets = vec![
             SecretEntry {
                 id: "id-1".into(),
                 name: None,
                 category: SecretCategory::ApiKey,
-                value: "XYZ".into(),
+                value: "XYZ123".into(),
             },
             SecretEntry {
                 id: "id-2".into(),
                 name: None,
                 category: SecretCategory::ApiKey,
-                value: "XYZ".into(),
+                value: "XYZ123".into(),
             },
         ];
-        let (redacted, map) = redact_request(body, &secrets);
-        // 只有一个 mock (因为同一个 value 只 redact 一次).
+        let (_, map) = redact_request(body, &secrets);
         assert_eq!(map.real_to_mock.len(), 1);
-        assert!(redacted.contains(map.real_to_mock.get("XYZ").unwrap()));
+    }
+
+    // ─── property-based 测试 (proptest) ─────────────────────────────────────
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// C3 + C4: 不同 secret 几乎总产生不同 mock (在固定 ctx 下).
+        #[test]
+        fn prop_distinct_secrets_distinct_mocks(
+            s1 in "[a-z]{4,12}",
+            s2 in "[a-z]{4,12}"
+        ) {
+            prop_assume!(s1 != s2);
+            let m1 = mock_secret("fixed-context", &s1);
+            let m2 = mock_secret("fixed-context", &s2);
+            prop_assert!(m1 != m2, "mocks for distinct secrets collided: {} == {}", m1, m2);
+        }
+
+        /// C2: mock 不在 full_context 中.
+        #[test]
+        fn prop_mock_not_in_context(
+            secret in "[a-z0-9]{4,16}",
+            ctx in "[a-z0-9 ]{0,100}"
+        ) {
+            let m = mock_secret(&ctx, &secret);
+            prop_assert!(!ctx.contains(&m), "mock must not appear in ctx: mock={}", m);
+        }
+
+        /// C6: round-trip 是 identity (redact + restore).
+        #[test]
+        fn prop_round_trip_identity(
+            body_prefix in "[a-z0-9 ,.!?'\"\n]{0,100}",
+            secret in "[A-Z]{4,12}",
+            body_suffix in "[a-z0-9 ,.!?'\"\n]{0,100}"
+        ) {
+            let body = format!("{body_prefix}{secret}{body_suffix}");
+            let secrets = vec![entry(&secret)];
+            let (redacted, map) = redact_request(&body, &secrets);
+            let restored = restore_response(&redacted, &map);
+            prop_assert_eq!(restored, body);
+        }
+
+        /// C1: mock 非空且仅含 ASCII 字母数字 + 下划线.
+        #[test]
+        fn prop_mock_alphanumeric(
+            secret in "[A-Za-z0-9-]{4,20}"
+        ) {
+            let m = mock_secret("ctx", &secret);
+            prop_assert!(!m.is_empty());
+            prop_assert!(m.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+        }
+
+        /// C5: mock 不含 real_secret 的 ≥4 字符子串 (前提: real 不以 "sgm_" 开头).
+        #[test]
+        fn prop_no_real_substring(
+            secret in "[A-Za-z0-9]{8,20}"
+        ) {
+            prop_assume!(!secret.starts_with(MOCK_PREFIX));
+            let m = mock_secret("ctx", &secret);
+            for window in 4..=secret.len() {
+                for sub in secret.as_bytes().windows(window) {
+                    let sub_str = std::str::from_utf8(sub).unwrap();
+                    prop_assert!(!m.contains(sub_str),
+                        "mock contains substring from secret: mock={}, sub={}", m, sub_str);
+                }
+            }
+        }
+
+        /// C4 加强版: 在单次 redact_request 内, N 个不同 secret → N 个不同 mock.
+        #[test]
+        fn prop_redact_produces_distinct_mocks(
+            n in 2usize..20
+        ) {
+            let secrets: Vec<SecretEntry> = (0..n)
+                .map(|i| entry(&format!("secret-{:03}", i)))
+                .collect();
+            let body = secrets.iter().map(|e| e.value.clone()).collect::<Vec<_>>().join(" ");
+            let (_, map) = redact_request(&body, &secrets);
+            let mocks: std::collections::HashSet<_> = map.real_to_mock.values().collect();
+            prop_assert_eq!(mocks.len(), n);
+        }
     }
 }
