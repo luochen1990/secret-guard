@@ -136,22 +136,15 @@ async fn dispatch(
         )));
     }
 
-    // 3. 协议匹配: MVP 仅支持 ingress == egress (identity passthrough).
-    if ingress != provider.protocol {
-        return Err(AppError::NotImplemented(format!(
-            "cross-protocol forwarding ({ingress} → {}) is not yet supported; \
-             use /{}/{}/* with a matching {} provider instead",
-            provider.protocol.name(),
-            ingress.short(),
-            provider.id,
-            ingress.name(),
-        )));
-    }
-
-    // 4. 收集请求 body (为 redact 与记录做准备).
+    // 3. 收集请求 body (跨协议和同协议都需要).
     let req_bytes = to_bytes(body, MAX_REQ_BODY)
         .await
         .map_err(|e| AppError::BadBody(e.to_string()))?;
+
+    // 4. 协议匹配: 同协议走 identity passthrough; 跨协议走 codec 翻译.
+    if ingress != provider.protocol {
+        return cross_proto_forward(state, fp, parts, req_bytes, ingress, provider, started).await;
+    }
 
     // 5. redact 请求 body (若 effective SecretTable 非空).
     let secrets_snapshot = state.secrets.effective_raw();
@@ -321,6 +314,340 @@ fn apply_provider_auth(headers: &mut HeaderMap, api_key: &str, ingress: Protocol
                 "provider api_key contains illegal header chars; skipping auth injection"
             );
         }
+    }
+}
+
+/// 跨协议转发: ingress 协议 → IR → egress 协议, 上游响应反向翻译.
+///
+/// # MVP 范围与限制
+///
+/// - 只支持 OpenAI ⇄ Anthropic 双向 (其他组合返回 501).
+/// - **强制非流式**: 上游 stream=false (即便客户端请求 stream=true). 客户端若 stream=true,
+///   目前返回 501 (`streaming cross-protocol not yet supported`).
+/// - **不应用 redact**: 跨协议时 redact map 强制为空 (因为 codec 是结构化翻译, 不能与字节级
+///   redact 共存). 若 SecretTable 非空, secrets 不会被替换为 mock — 这是已知限制,
+///   未来在 IR 阶段做结构化 redact 才能修复.
+/// - 上游错误响应 (4xx/5xx) 也通过 codec 翻译为 ingress 协议的原生错误 envelope.
+async fn cross_proto_forward(
+    state: ProxyState,
+    fp: ForwardPath,
+    parts: axum::http::request::Parts,
+    req_bytes: Bytes,
+    ingress: Protocol,
+    provider: crate::provider::Provider,
+    started: Instant,
+) -> Result<Response<Body>, AppError> {
+    use crate::codec::Protocol as CodecProtocol;
+    // trait methods 通过 CodecProtocol::reader/writer 返回的 Box<dyn Reader/Writer> 调用,
+    // 不需要显式 use trait (Rust 自动识别 method 调用).
+
+    // 0. 跨协议路径当前不应用 redact (redact 是字节级; codec 是结构化翻译).
+    //    必须显式 warn 提示 operator, 避免误以为有 secret 保护.
+    if !state.secrets.effective_raw().is_empty() {
+        warn!(
+            "cross-protocol request bypasses secret redaction; \
+             secrets in body will reach upstream verbatim \
+             (ingress={}, egress={})",
+            ingress.name(),
+            provider.protocol.name()
+        );
+    }
+
+    // 1. 检查 codec 是否支持此协议对.
+    let Some(ingress_codec) = CodecProtocol::from_native(ingress) else {
+        return Err(AppError::NotImplemented(format!(
+            "ingress protocol '{}' is not supported by codec (only openai/anthropic)",
+            ingress.name()
+        )));
+    };
+    let Some(egress_codec) = CodecProtocol::from_native(provider.protocol) else {
+        return Err(AppError::NotImplemented(format!(
+            "egress protocol '{}' is not supported by codec (only openai/anthropic)",
+            provider.protocol.name()
+        )));
+    };
+
+    let ingress_reader = ingress_codec.reader();
+    let egress_writer = egress_codec.writer();
+
+    // 2. 解析 ingress body 为 JSON.
+    let ingress_body: serde_json::Value = serde_json::from_slice(&req_bytes)
+        .map_err(|e| AppError::BadBody(format!("invalid JSON in {ingress} request body: {e}")))?;
+
+    // 3. ingress JSON → IR.
+    let mut ir = ingress_reader
+        .read_request(&ingress_body)
+        .map_err(|e| AppError::BadBody(format!("{ingress} request parse failed: {}", e.message)))?;
+
+    // 4. MVP 限制: 跨协议时不支持流式.
+    if ir.stream {
+        return Err(AppError::NotImplemented(format!(
+            "streaming cross-protocol ({ingress} → {}) is not yet supported; \
+             disable stream=true in the client request",
+            provider.protocol.name()
+        )));
+    }
+
+    // 5. 若 egress 要求 max_tokens 而 IR 缺失, 注入默认值.
+    if egress_writer.requires_max_tokens() && ir.max_tokens.is_none() {
+        ir.max_tokens = Some(crate::codec::DEFAULT_MAX_TOKENS);
+    }
+
+    // 6. 清空 extra (跨协议时 extra 字段会泄漏 ingress-only 的内容, 必须丢弃).
+    ir.extra.clear();
+
+    // 7. IR → egress body.
+    let egress_body_value = egress_writer.write_request(&ir);
+    let egress_bytes = serde_json::to_vec(&egress_body_value)
+        .map_err(|e| AppError::Internal(format!("serialize egress body failed: {e}")))?;
+
+    // 8. 构造上游 URL (egress writer 的固定 path).
+    let upstream_url = format!("{}{}", provider.base_url, egress_writer.upstream_path());
+
+    // 9. 复制请求 headers + 应用 egress 协议的 auth (注意: 用 provider.protocol, 不是 ingress).
+    let mut fwd_headers = sanitize_request_headers(&parts.headers);
+    // 删除客户端可能传的 content-type / content-length, 后面会用我们计算的新值.
+    fwd_headers.remove(axum::http::header::CONTENT_TYPE);
+    fwd_headers.remove(axum::http::header::CONTENT_LENGTH);
+    apply_provider_auth(&mut fwd_headers, &provider.effective_api_key(), provider.protocol);
+    // 跨协议时客户端不会自带 egress 协议的特定 header, 这里仅在缺失时注入默认.
+    // 用 entry().or_insert() 而非 insert(), 保留客户端主动设置更新的版本的能力.
+    if provider.protocol == Protocol::Anthropic {
+        fwd_headers
+            .entry("anthropic-version")
+            .or_insert_with(|| HeaderValue::from_static("2023-06-01"));
+    }
+
+    // 10. 记录请求快照 (用于 Web UI).
+    let path_for_record = format!(
+        "/{}/{}/{}  [{} → {}]",
+        fp.proto,
+        fp.name,
+        fp.rest.trim_start_matches('/'),
+        ingress.name(),
+        provider.protocol.name()
+    );
+    let req_text_for_record = utf8_view(&req_bytes);
+    let req_snapshot = ForwardRecord::new(
+        parts.method.as_str().to_string(),
+        path_for_record,
+        redact_headers(&fwd_headers),
+        req_text_for_record,
+    );
+    let record_id = state.records.push(req_snapshot);
+
+    debug!(
+        %record_id,
+        method = %parts.method,
+        url = %upstream_url,
+        ingress = %ingress.name(),
+        egress = %provider.protocol.name(),
+        "cross-proto forwarding"
+    );
+
+    // 11. 发送到上游.
+    let upstream_resp = match state
+        .upstream
+        .request(parts.method, &upstream_url)
+        .headers(fwd_headers)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header(axum::http::header::CONTENT_LENGTH, egress_bytes.len())
+        .body(egress_bytes)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let elapsed = started.elapsed().as_millis() as u64;
+            warn!(%record_id, error = %e, "cross-proto upstream send failed");
+            state.records.update_response_full(
+                record_id,
+                ResponseUpdate {
+                    resp_status: 502,
+                    resp_headers: vec![],
+                    resp_body: String::new(),
+                    elapsed_ms: elapsed,
+                    streamed: false,
+                    resp_complete: false,
+                    error: Some(format!("upstream send error: {e}")),
+                },
+            );
+            return Err(AppError::Upstream(e.to_string()));
+        }
+    };
+
+    // 12. 完整 buffer 上游响应 (跨协议 MVP 不支持流式). 受 MAX_RESP_BODY_RECORD 上限保护,
+    //     防止恶意/故障上游 OOM.
+    let resp_status = upstream_resp.status();
+    let resp_headers = upstream_resp.headers().clone();
+    let resp_bytes: Bytes = {
+        let mut acc: Vec<u8> = Vec::new();
+        let mut stream = upstream_resp.bytes_stream();
+        let mut exceeded = false;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(b) => {
+                    if acc.len() + b.len() > MAX_RESP_BODY_RECORD {
+                        exceeded = true;
+                        break;
+                    }
+                    acc.extend_from_slice(&b);
+                }
+                Err(e) => {
+                    let elapsed = started.elapsed().as_millis() as u64;
+                    warn!(%record_id, error = %e, "cross-proto upstream stream error mid-flight");
+                    state.records.update_response_full(
+                        record_id,
+                        ResponseUpdate {
+                            resp_status: resp_status.as_u16(),
+                            resp_headers: redact_headers(&resp_headers),
+                            resp_body: String::new(),
+                            elapsed_ms: elapsed,
+                            streamed: false,
+                            resp_complete: false,
+                            error: Some(format!("upstream stream error: {e}")),
+                        },
+                    );
+                    return Err(AppError::Upstream(e.to_string()));
+                }
+            }
+        }
+        if exceeded {
+            let elapsed = started.elapsed().as_millis() as u64;
+            warn!(
+                %record_id,
+                cap = MAX_RESP_BODY_RECORD,
+                "cross-proto upstream response exceeded cap; aborting"
+            );
+            state.records.update_response_full(
+                record_id,
+                ResponseUpdate {
+                    resp_status: 502,
+                    resp_headers: vec![],
+                    resp_body: String::new(),
+                    elapsed_ms: elapsed,
+                    streamed: false,
+                    resp_complete: false,
+                    error: Some(format!(
+                        "upstream response exceeded {MAX_RESP_BODY_RECORD} byte cap"
+                    )),
+                },
+            );
+            return Err(AppError::Upstream(format!(
+                "upstream response exceeded {MAX_RESP_BODY_RECORD} byte cap"
+            )));
+        }
+        Bytes::from(acc)
+    };
+
+    // 13. 翻译响应: egress JSON → IR → ingress JSON.
+    let egress_reader = egress_codec.reader();
+    let ingress_writer = ingress_codec.writer();
+    let (resp_status_out, resp_body_out) = translate_cross_proto_response(
+        egress_reader.as_ref(),
+        ingress_writer.as_ref(),
+        resp_status,
+        &resp_bytes,
+        provider.protocol.name(),
+        record_id,
+    );
+
+    // 14. 记录响应.
+    let elapsed = started.elapsed().as_millis() as u64;
+    state.records.update_response_full(
+        record_id,
+        ResponseUpdate {
+            resp_status: resp_status_out.as_u16(),
+            resp_headers: redact_headers(&resp_headers),
+            resp_body: utf8_view(&resp_body_out),
+            elapsed_ms: elapsed,
+            streamed: false,
+            resp_complete: true,
+            error: None,
+        },
+    );
+
+    // 15. 构造响应: 强制 content-type 为 application/json (codec 总是产出 JSON).
+    let mut resp = Response::new(Body::from(resp_body_out));
+    *resp.status_mut() = resp_status_out;
+    let mut out_headers = build_response_headers(&resp_headers);
+    out_headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    out_headers.remove(axum::http::header::CONTENT_LENGTH); // axum 会自动重算
+    *resp.headers_mut() = out_headers;
+    Ok(resp)
+}
+
+/// 把上游 egress 响应翻译为 ingress 响应.
+///
+/// 成功响应 (2xx): 通过 codec IR 翻译 body; 解析失败则原样透传 (记 warn).
+/// 错误响应 (非 2xx): 用 codec 的 write_error 翻译 envelope, 截断 message 到 4 KiB
+/// 并优先解析上游 error.message 字段作为友好提示 (避免泄漏内部细节).
+fn translate_cross_proto_response(
+    egress_reader: &dyn crate::codec::Reader,
+    ingress_writer: &dyn crate::codec::Writer,
+    resp_status: StatusCode,
+    resp_bytes: &[u8],
+    egress_proto_name: &str,
+    record_id: uuid::Uuid,
+) -> (StatusCode, Vec<u8>) {
+    if resp_status.is_success() {
+        match serde_json::from_slice::<serde_json::Value>(resp_bytes) {
+            Ok(v) => match egress_reader.read_response(&v) {
+                Ok(ir_resp) => {
+                    let translated = ingress_writer.write_response(&ir_resp);
+                    let body = serde_json::to_vec(&translated).unwrap_or_default();
+                    (resp_status, body)
+                }
+                Err(e) => {
+                    warn!(
+                        %record_id,
+                        error = %e.message,
+                        "failed to parse upstream response as {}; passing through verbatim",
+                        egress_proto_name
+                    );
+                    (resp_status, resp_bytes.to_vec())
+                }
+            },
+            Err(_) => {
+                // 非 JSON 响应 (eg. HTML 错误页): 原样返回.
+                (resp_status, resp_bytes.to_vec())
+            }
+        }
+    } else {
+        // 错误响应: 截断 + 解析上游 error.message 防止泄漏内部细节.
+        let friendly = serde_json::from_slice::<serde_json::Value>(resp_bytes)
+            .ok()
+            .and_then(|v| {
+                v.get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .map(String::from)
+            })
+            .unwrap_or_else(|| {
+                let raw = std::str::from_utf8(resp_bytes).unwrap_or("");
+                let cap = raw.len().min(4096);
+                raw[..cap].to_string()
+            });
+        let kind = http_status_to_error_kind(resp_status.as_u16());
+        let envelope = ingress_writer.write_error(resp_status.as_u16(), kind, &friendly);
+        let body = serde_json::to_vec(&envelope).unwrap_or_default();
+        (resp_status, body)
+    }
+}
+
+/// 把 HTTP status 映射为 protocol-agnostic error kind 字符串.
+fn http_status_to_error_kind(status: u16) -> &'static str {
+    match status {
+        400 => "invalid_request_error",
+        401 => "authentication_error",
+        403 => "permission_denied",
+        404 => "not_found_error",
+        429 => "rate_limit_error",
+        500..=599 => "api_error",
+        _ => "internal_error",
     }
 }
 

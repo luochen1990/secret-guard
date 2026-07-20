@@ -614,22 +614,248 @@ async fn disabled_provider_returns_503() {
 }
 
 #[tokio::test]
-async fn cross_protocol_returns_501() {
-    // provider 协议是 Anthropic, 但客户端用 /o/ (OpenAI 入口) 访问.
+async fn cross_protocol_translates_system_prompt_to_anthropic_top_level() {
+    // OpenAI messages[].role=="system" 应翻译为 Anthropic 顶层 system 字段.
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/messages")
+        .match_body(mockito::Matcher::PartialJson(
+            serde_json::json!({"system": "You are a helpful assistant."}),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"msg_x","type":"message","role":"assistant","content":[{"type":"text","text":"OK"}],"model":"claude","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}"#,
+        )
+        .create_async()
+        .await;
+    let provider = provider_with("an-main", Protocol::Anthropic, &upstream.url());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+    let body = r#"{"model":"gpt-4o","messages":[{"role":"system","content":"You are a helpful assistant."},{"role":"user","content":"Hi"}]}"#;
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/an-main/v1/chat/completions",
+        body,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn cross_protocol_anthropic_requires_max_tokens_injected() {
+    // OpenAI 客户端不带 max_tokens, 跨协议到 Anthropic 时应注入默认值 4096.
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/messages")
+        .match_body(mockito::Matcher::PartialJson(
+            serde_json::json!({"max_tokens": 4096}),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"msg_x","type":"message","role":"assistant","content":[{"type":"text","text":"OK"}],"model":"claude","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}"#,
+        )
+        .create_async()
+        .await;
+    let provider = provider_with("an-main", Protocol::Anthropic, &upstream.url());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+    let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"}]}"#;
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/an-main/v1/chat/completions",
+        body,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn cross_protocol_translates_tools_and_tool_use_round_trip() {
+    // OpenAI tools/tool_calls/tool messages → Anthropic tools/tool_use/tool_result 完整往返.
+    // 仅断言关键字段 (tools 名, tool_use 块, tool_result 关联), 不强求完整 body 等价
+    // (因为 IR 统一把 string content 升级为 array of text blocks).
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/messages")
+        .match_body(mockito::Matcher::PartialJson(
+            serde_json::json!({
+                "tools": [{"name": "get_weather"}],
+                "messages": [
+                    {"role": "user"},
+                    {"role": "assistant", "content": [{"type": "tool_use", "id": "call_1", "name": "get_weather", "input": {"city": "SF"}}]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1"}]}
+                ]
+            }),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"msg_x","type":"message","role":"assistant","content":[{"type":"text","text":"It's sunny in SF"}],"model":"claude","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}"#,
+        )
+        .create_async()
+        .await;
+    let provider = provider_with("an-main", Protocol::Anthropic, &upstream.url());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+    let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"weather?"},{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"SF\"}"}}]},{"role":"tool","tool_call_id":"call_1","content":"Sunny"}],"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}]}"#;
+    let (status, resp_body, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/an-main/v1/chat/completions",
+        body,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {resp_body}");
+    assert!(resp_body.contains("It's sunny in SF"), "got: {resp_body}");
+}
+
+#[tokio::test]
+async fn cross_protocol_translates_upstream_error_to_ingress_envelope() {
+    // 上游错误响应应通过 codec 翻译为 ingress 协议 envelope (不泄漏内部细节).
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/messages")
+        .with_status(429)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"error":{"type":"rate_limit_error","message":"Too many requests"}}"#)
+        .create_async()
+        .await;
+    let provider = provider_with("an-main", Protocol::Anthropic, &upstream.url());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+    let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"}]}"#;
+    let (status, resp_body, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/an-main/v1/chat/completions",
+        body,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::TOO_MANY_REQUESTS);
+    // OpenAI 风格 envelope.
+    assert!(
+        resp_body.contains("\"type\":\"rate_limit_error\""),
+        "got: {resp_body}"
+    );
+    assert!(resp_body.contains("Too many requests"), "got: {resp_body}");
+}
+
+#[tokio::test]
+async fn cross_protocol_translates_openai_ingress_to_anthropic_upstream() {
+    // OpenAI ingress → Anthropic upstream (端到端跨协议翻译).
+    let mut upstream = spawn_mock_upstream().await;
+    // mock 上游: 期待收到 Anthropic 格式的 /v1/messages 请求.
+    let _m = upstream
+        .mock("POST", "/v1/messages")
+        .match_header("anthropic-version", "2023-06-01")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"msg_01test","type":"message","role":"assistant","content":[{"type":"text","text":"Hi from Claude"}],"model":"claude-3-5-sonnet","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":5}}"#,
+        )
+        .create_async()
+        .await;
+    let provider = provider_with("an-main", Protocol::Anthropic, &upstream.url());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+    // OpenAI ingress 客户端发 OpenAI 格式.
+    let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}]}"#;
+    let (status, resp_body, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/an-main/v1/chat/completions",
+        body,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {resp_body}");
+    // 响应应该是 OpenAI 格式.
+    assert!(
+        resp_body.contains("\"object\":\"chat.completion\""),
+        "got: {resp_body}"
+    );
+    assert!(resp_body.contains("Hi from Claude"), "got: {resp_body}");
+    assert!(resp_body.contains("\"prompt_tokens\""), "got: {resp_body}");
+    assert!(
+        resp_body.contains("\"finish_reason\":\"stop\""),
+        "got: {resp_body}"
+    );
+}
+
+#[tokio::test]
+async fn cross_protocol_translates_anthropic_ingress_to_openai_upstream() {
+    // 反向: Anthropic ingress → OpenAI upstream.
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"chatcmpl-test","object":"chat.completion","created":1700000000,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"Hi from GPT"},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":4,"total_tokens":16}}"#,
+        )
+        .create_async()
+        .await;
+    let provider = provider_with("oa-main", Protocol::OpenAI, &upstream.url());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+    let body =
+        r#"{"model":"claude","messages":[{"role":"user","content":"Hello"}],"max_tokens":50}"#;
+    let (status, resp_body, _) =
+        proxy_request(&proxy_url, "POST", "/a/oa-main/v1/messages", body, &[]).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {resp_body}");
+    // 响应应该是 Anthropic 格式.
+    assert!(
+        resp_body.contains("\"type\":\"message\""),
+        "got: {resp_body}"
+    );
+    assert!(resp_body.contains("Hi from GPT"), "got: {resp_body}");
+    assert!(
+        resp_body.contains("\"stop_reason\":\"end_turn\""),
+        "got: {resp_body}"
+    );
+    assert!(
+        resp_body.contains("\"input_tokens\":12"),
+        "got: {resp_body}"
+    );
+}
+
+#[tokio::test]
+async fn cross_protocol_streaming_returns_501() {
+    // MVP: 跨协议 + stream=true 应返回 501 (尚未支持).
     let upstream = spawn_mock_upstream().await;
     let provider = provider_with("an-main", Protocol::Anthropic, &upstream.url());
     let proxy_url = spawn_proxy_with_provider(provider).await;
+    let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"}],"stream":true}"#;
     let (status, body, _) = proxy_request(
         &proxy_url,
         "POST",
         "/o/an-main/v1/chat/completions",
+        body,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::NOT_IMPLEMENTED);
+    assert!(body.contains("streaming cross-protocol"));
+}
+
+#[tokio::test]
+async fn cross_protocol_unknown_pair_returns_501() {
+    // Gemini/Ollama 在 codec 中尚未支持, 跨协议到这些仍应返回 501.
+    let upstream = spawn_mock_upstream().await;
+    let provider = provider_with("gem-main", Protocol::Gemini, &upstream.url());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+    let (status, body, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/gem-main/v1/chat/completions",
         "{}",
         &[],
     )
     .await;
     assert_eq!(status, reqwest::StatusCode::NOT_IMPLEMENTED);
-    assert!(body.contains("not_implemented"));
-    assert!(body.contains("cross-protocol"));
+    assert!(body.contains("not supported by codec"));
 }
 
 #[tokio::test]

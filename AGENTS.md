@@ -43,7 +43,8 @@ URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标
 - 未知 protocol 简写 → 404 `not_found`
 - 未知 provider id → 404 `not_found`
 - 禁用 provider (`enabled = false`) → 503 `unavailable`
-- ingress != egress (跨协议) → 501 `not_implemented` (未来工作)
+- 同协议 (ingress == egress): 字节透传, 不进入 codec.
+- 跨协议 OpenAI ⇄ Anthropic: 通过 `src/codec` 翻译 (IR 中介); 跨协议 + `stream=true` → 501 (流式翻译尚未支持); Gemini/Ollama 跨协议 → 501 (codec 未覆盖).
 
 ## 模块概览
 
@@ -59,12 +60,19 @@ src/
 ├── secrets.rs     # SecretEntry / SecretCategory + DynamicEntry impl + EffectiveSecret + mask_value
 ├── record.rs      # ForwardRecord / RecordStore / ResponseUpdate
 ├── redact.rs      # mock_secret + RedactionMap + redact_request + restore_response
+├── codec/         # 跨协议 codec (OpenAI ⇄ Anthropic, 借鉴 Busbar IR 设计)
+│   ├── mod.rs     # Protocol enum + Reader/Writer trait + 共享 helpers
+│   ├── ir.rs      # 协议无关 IR (IrRequest/IrResponse/IrBlock/IrMessage/IrStreamEvent/IrUsage)
+│   ├── openai.rs  # OpenAI Chat Completions Reader/Writer (含流式 fan-out)
+│   ├── anthropic.rs # Anthropic Messages Reader/Writer (含 1:1 流映射)
+│   └── stream.rs  # StreamTranslate (SSE chunk-boundary 处理 + 跨协议翻译)
 ├── proxy.rs       # ProxyState + forward/forward_no_rest + fan_out_streaming/buffered
-├── server.rs      # build_router + serve (装配 persist_lock + 共享 decisions)
-└── web/
-    ├── mod.rs     # /__sg 子 router + / 根入口 + slash_redirect + not_found
-    ├── api.rs     # JSON endpoints (records + secrets/providers CRUD + PATCH .../decision)
-    └── index.html # 单页 UI (内嵌 CSS + vanilla JS, 零外部依赖)
+│                  # + cross_proto_forward (跨协议路径, 调用 codec)
+└── server.rs      # build_router + serve (装配 persist_lock + 共享 decisions)
+    └── web/
+        ├── mod.rs     # /__sg 子 router + / 根入口 + slash_redirect + not_found
+        ├── api.rs     # JSON endpoints (records + secrets/providers CRUD + PATCH .../decision)
+        └── index.html # 单页 UI (内嵌 CSS + vanilla JS, 零外部依赖)
 ```
 
 > `ProviderTable` 与 `SecretTable` 是 [`DynamicTable<T>`](src/config.rs) 的类型别名,
@@ -153,7 +161,10 @@ PATCH  /__sg/api/providers/{id}/decision
 `forward` 接收 `Path<ForwardPath> { proto, name, rest }`, 按 URL 解析 ingress 与 provider:
 1. `Protocol::from_short(proto)` → ingress 协议 (o/a/g/l)
 2. `ProviderTable::get_effective(name)` → 目标 provider (合并 static + dynamic + decision 后的生效值)
-3. 协议匹配检查 (MVP: ingress == egress; 跨协议 → 501)
+3. 协议匹配检查:
+   - 同协议 + 无 redact: 字节透传 (`same_proto_passthrough`, 不进入 codec)
+   - 同协议 + redact: IR 路径 (`same_proto_forward`, reader → redact_ir → writer)
+   - 跨协议: IR 路径 (`cross_proto_forward`, reader → redact_ir → writer, response 反向翻译 + restore)
 4. `apply_provider_auth` 用 `provider.effective_api_key()` 注入对应协议的 auth header:
    - OpenAI / Ollama → `Authorization: Bearer <key>`
    - Anthropic → `x-api-key: <key>`
@@ -175,6 +186,31 @@ PATCH  /__sg/api/providers/{id}/decision
 `api_key_file` 让 secret-guard.toml 本身可以不含敏感数据 — toml 可以直接进 git 或 nix store,
 secret 由 sops-nix 解密到 `/run/secrets/...`, secret-guard 在请求时读取.
 这极大简化了上游 nixos module 的配置 (不用 `sops.templates` 渲染整个 toml).
+
+### 跨协议 codec (`src/codec/`)
+
+借鉴 Busbar (`GetBusbar/busbar`, Apache-2.0) 的 superset IR + Reader/Writer trait 设计,
+但大幅精简以匹配 secret-guard 的 MVP 范围.
+
+**支持矩阵**:
+- OpenAI Chat Completions ⇄ Anthropic Messages 双向 (非流式 + 流式 SSE).
+- 不在 MVP: Bedrock / Gemini / Cohere, reasoning/thinking, citations, logprobs, prompt caching.
+
+**核心抽象**:
+- `IrRequest` / `IrResponse`: 协议无关的中间表示 (chat completion 范围).
+- `Reader` trait: wire JSON/Bytes → IR; 包含 `read_request` / `read_response` / `read_response_events`.
+- `Writer` trait: IR → wire; 包含 `write_request` / `write_response` / `write_response_event` /
+  `requires_max_tokens` / `emits_sse_done_terminator` / `write_error`.
+- `StreamTranslate`: egress SSE → IR 事件流 → ingress SSE. 处理 chunk-boundary (TCP 切片),
+  CRLF/LF 双兼容, MAX_BUF 溢出 abort. 支持两种模式: 跨协议翻译 + 同协议 restore.
+
+**关键不变式**:
+- 同协议 + 无 redact 不进入 codec (字节透传), 零回归.
+- 同协议 + redact: reader → redact_ir → writer 重序列化, 失去 byte-exact 但语义等价, 恢复流式 UX.
+- 跨协议时 IR 的 `extra` 字段强制清空, 防止源协议独有字段泄漏到对端.
+- 跨协议路径响应大小受 `MAX_RESP_BODY_RECORD` (32 MiB) 保护, 防止恶意上游 OOM.
+- 错误响应翻译为 ingress 协议的原生 envelope, message 截断到 4 KiB 并优先解析上游 `error.message`.
+
 
 ### 跨表并发安全 (`src/server.rs` + `src/config.rs`)
 
@@ -315,9 +351,11 @@ client = Anthropic(
 
 ## 已知限制 (MVP)
 
-- **跨协议转换未实现**: `/o/anthropic-main/*` 这类 ingress != egress 的请求返回 501.
-  架构已为此预留 (见"后续工作").
-- 启用 redact 时, 流式响应降级为 buffered (失去 SSE 流式 UX).
+- **跨协议 + 流式响应**: OpenAI ⇄ Anthropic 跨协议时, `stream=true` 返回 501
+  (流式跨协议翻译尚未支持; 同协议仍然流式透传).
+- **跨协议 + redact**: 跨协议路径当前**不应用**字节级 redact. SecretTable 非空时会
+  log warn 提示 operator. 计划在 IR 阶段做结构化 redact 解决.
+- 启用 redact 时 (同协议), 流式响应降级为 buffered (失去 SSE 流式 UX).
 - mock_secret 用 SipHash (Rust `DefaultHasher`), 同 Rust 版本内确定, 但**不保证跨版本稳定**;
   RedactionMap 是 per-request 状态不持久化, 所以无实际影响.
 - mock 固定 15 字符 (`sgm_` + 11 char base62), 不模拟 real_secret 的格式/长度.
@@ -337,14 +375,15 @@ client = Anthropic(
 
 ## 后续工作 (非 MVP 范围)
 
-- **协议转换** (最重要的预留工作): 实现 `ProtocolCodec` trait, 每个 protocol 提供
-  `parse_request(Bytes) -> UnifiedRequest` 与 `serialize_request(UnifiedRequest) -> Bytes`,
-  通过统一 IR 桥接不同协议. 当前 URL 设计 `/{ingress}/{egress_provider}/*` 已天然支持:
-  ingress != egress 时调用 codec 链 `parse(ingress) → IR → serialize(egress)`.
-  候选 IR: OpenAI ChatCompletion (生态最广) 或自研 union type 覆盖各家特有字段.
-  关键挑战: SSE 流式响应的 chunk-boundary 转换 (sliding window + UTF-8 char 边界).
-  当前 MVP 在此处返回 501 Not Implemented (见 `proxy::dispatch`).
-- 流式响应 + redact 的 chunk boundary 处理 (用 sliding window + UTF-8 char 边界检测).
+- **跨协议流式响应翻译**: StreamTranslate 已实现 (egress SSE → IR 事件 → ingress SSE,
+  含 chunk-boundary 处理 + tool_calls/index 状态合成), 但尚未集成到 `cross_proto_forward`.
+  需要在 dispatch 路径检测上游 streaming, 接入 `StreamTranslate::feed`/`finish`, 替换当前
+  buffer-all-then-translate 策略.
+- **跨协议 + redact 的协同**: 在 IR 阶段做结构化 redact (遍历 `IrBlock::Text` 与
+  `IrBlock::ToolUse.input` 的字符串值做 mock 替换). 这比字节级 redact 更准确, 是长期方案.
+- **更多协议**: Gemini / Ollama / Bedrock / Cohere / OpenAI Responses API.
+  新增协议只需实现 Reader + Writer trait (~200 行), 不动 dispatch.
+- **协议转换** (思路已实现, 无需再做): 跨协议 codec 模块即承担此角色.
 - mock_secret 的 category-aware 生成 (Password/ApiKey/Cookie 等格式感知).
 - 配置热加载 (目前 Web UI 改 config 后, 重启才影响 CLI 参数).
 - 测试覆盖率自动上报 + fuzzing (cargo-fuzz).
