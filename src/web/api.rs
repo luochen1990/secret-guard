@@ -26,16 +26,11 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::config::OverrideMode;
-use crate::provider::{
-    DeleteOutcome as ProviderDeleteOutcome, EffectiveProvider, Protocol, Provider,
-    UpsertKind as ProviderUpsertKind,
-};
+use crate::config::{DeleteOutcome, OverrideMode, UpsertKind};
+use crate::provider::{EffectiveProvider, Protocol, Provider};
 use crate::proxy::ProxyState;
 use crate::record::ForwardRecord;
-use crate::secrets::{
-    DeleteOutcome as SecretDeleteOutcome, EffectiveSecret, SecretCategory, SecretEntry, UpsertKind,
-};
+use crate::secrets::{EffectiveSecret, SecretCategory, SecretEntry};
 
 /// 共享的 `no-store` header 设置 (axum 的 `[(name, value); N]` 接受 `(&str, &str)`).
 const NO_STORE: [(&str, &str); 1] = [("cache-control", "no-store, no-cache, must-revalidate")];
@@ -162,8 +157,8 @@ pub async fn delete_secret(
         .delete_dynamic(&id)
         .map_err(ApiError::from_any)?
     {
-        SecretDeleteOutcome::Deleted => Ok((StatusCode::NO_CONTENT, NO_STORE, "")),
-        SecretDeleteOutcome::NotFound => {
+        DeleteOutcome::Deleted => Ok((StatusCode::NO_CONTENT, NO_STORE, "")),
+        DeleteOutcome::NotFound => {
             if state.secrets.has_static(&id) {
                 Err(ApiError::conflict(
                     "cannot delete a static secret; use PATCH .../decision with \
@@ -183,6 +178,9 @@ pub async fn delete_secret(
 ///
 /// 用 [`crate::secrets::SecretTable::has_static`] 直接查 static 层, 这样
 /// decision=Disabled 状态下也能切回 Default / PreferStatic.
+///
+/// 注: `SecretTable` 现为 `DynamicTable<SecretEntry>` 的别名, has_static 是
+/// 泛型 [`DynamicTable::has_static`](crate::config::DynamicTable) 提供的方法.
 pub async fn set_secret_decision(
     State(state): State<ProxyState>,
     Path(id): Path<String>,
@@ -287,7 +285,7 @@ pub async fn create_provider(
         .providers
         .upsert_dynamic(entry)
         .map_err(ApiError::from_any)?;
-    if kind == ProviderUpsertKind::Updated {
+    if kind == UpsertKind::Updated {
         return Err(ApiError::conflict(
             "provider was concurrently created; please retry",
         ));
@@ -339,8 +337,8 @@ pub async fn delete_provider(
         .delete_dynamic(&id)
         .map_err(ApiError::from_any)?
     {
-        ProviderDeleteOutcome::Deleted => Ok((StatusCode::NO_CONTENT, NO_STORE, "")),
-        ProviderDeleteOutcome::NotFound => {
+        DeleteOutcome::Deleted => Ok((StatusCode::NO_CONTENT, NO_STORE, "")),
+        DeleteOutcome::NotFound => {
             if state.providers.has_static(&id) {
                 Err(ApiError::conflict(
                     "cannot delete a static provider; use PATCH .../decision with \

@@ -53,8 +53,10 @@ src/
 ├── lib.rs         # 库入口
 ├── cli.rs         # clap 参数 schema (--config / --state / --host / --port)
 ├── config.rs      # Config (static) / DynamicState / OverrideMode / Decisions
-├── provider.rs    # Protocol / Provider / ProviderTable + EffectiveProvider 合并视图
-├── secrets.rs     # SecretEntry / SecretCategory / SecretTable + EffectiveSecret + mask_value
+│                  # + DynamicEntry trait + DynamicTable<T> 泛型 (provider / secret 共用)
+│                  # + atomic_write / UpsertKind / DeleteOutcome
+├── provider.rs    # Protocol / Provider + DynamicEntry impl + EffectiveProvider 合并视图
+├── secrets.rs     # SecretEntry / SecretCategory + DynamicEntry impl + EffectiveSecret + mask_value
 ├── record.rs      # ForwardRecord / RecordStore / ResponseUpdate
 ├── redact.rs      # mock_secret + RedactionMap + redact_request + restore_response
 ├── proxy.rs       # ProxyState + forward/forward_no_rest + fan_out_streaming/buffered
@@ -64,6 +66,10 @@ src/
     ├── api.rs     # JSON endpoints (records + secrets/providers CRUD + PATCH .../decision)
     └── index.html # 单页 UI (内嵌 CSS + vanilla JS, 零外部依赖)
 ```
+
+> `ProviderTable` 与 `SecretTable` 是 [`DynamicTable<T>`](src/config.rs) 的类型别名,
+> 通用合并 / CRUD / 持久化算法都在 config.rs; 各模块只补充类型特定的 EffectiveView
+> 映射与 validate 钩子.
 
 ## 配置模型 (双层: Static + Dynamic)
 
@@ -154,21 +160,26 @@ PATCH  /__sg/api/providers/{id}/decision
    - Gemini → `x-goog-api-key: <key>`
    同时剥离竞争 header (避免客户端误传的对手协议 auth 干扰上游), provider 配置优先于客户端.
 
-### 跨表并发安全 (`src/server.rs` + `src/{provider,secrets}.rs`)
+### 跨表并发安全 (`src/server.rs` + `src/config.rs`)
 
-`SecretTable` 与 `ProviderTable` 共享两份同步原语 (server 启动时构造并注入):
+`SecretTable` 与 `ProviderTable` (都是 `DynamicTable<T>` 别名) 共享两份同步原语
+(server 启动时构造并注入):
 
 - **`Arc<Mutex<()>> persist_lock`**: 串行整个 RMW, 避免两表并发写 state.toml 互相覆盖.
 - **`Arc<RwLock<Decisions>> decisions`**: 同一份 per-id 决策 (因为 `[decisions]` 段同时含
   providers + secrets 两个子表, 任何一方修改都要触发 state.toml 重写, 共享同一份内存).
 
-### SecretTable / ProviderTable 持久化 (`src/secrets.rs`, `src/provider.rs`)
+### DynamicTable 持久化 (`src/config.rs`)
 
 - 内存层: `Arc<RwLock<Vec<T>>>` × 2 (static_entries 只读 + dynamic_entries 可变).
 - 持久化策略: 先写 state.toml (atomic + fsync), 再更新内存 (失败自动回滚).
 - `tmp` 文件名带 UUID, 避免并发 atomic_write 互相覆盖.
 - 每次写 dynamic 时 `DynamicState::load_or_empty(state_path)` → 改对应段 → `to_toml` → atomic_write.
   共享 persist_lock 保证读-改-写串行化, 不会丢失 decisions 段.
+- 类型钩子: `DynamicEntry` trait 让泛型表知道如何把 entry 写入 state 的对应字段
+  (`set_state_field`) 与读写 decisions 的对应子表 (`get_decision` / `set_decision`).
+  新增第三种 entry 类型只需 impl 该 trait (~25 行) 即可获得完整 CRUD / 持久化 / decision 通道.
+
 
 ## 开发流程
 

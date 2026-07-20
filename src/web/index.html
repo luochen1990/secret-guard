@@ -582,88 +582,182 @@
       return `<select class="decision-select" data-kind="${kind}" data-id="${escapeHtml(id)}">${opts}</select>`;
     }
 
-    // ─── secrets tab ──────────────────────────────────────────────────────
-    async function refreshSecrets() {
-      try {
-        const r = await fetch(API_SECRETS, { cache: 'no-store' });
-        if (!r.ok) throw new Error('HTTP ' + r.status);
-        const data = await r.json();
-        secretsList = data.secrets || [];
-        secretCategories = data.categories || [];
-        secretDecisions = data.decisions || [];
-        renderSecrets();
-      } catch (e) {
-        console.error(e);
-        setStatus('secrets refresh failed', 'status-err');
-      }
-    }
+    // ─── generic helpers (secrets + providers 共用) ───────────────────────
+    //
+    // 设计思路: 把两种资源的 CRUD / 表格渲染 / form 提交差异收进 KINDS 表,
+    // 主流程只写一次. 新增资源类型时只需在 KINDS 加一项.
 
-    function renderSecrets() {
-      renderStats('secrets-stats', secretsList);
-      const body = document.getElementById('secrets-body');
-      if (secretsList.length === 0) {
-        body.innerHTML = '<tr><td colspan="8" class="empty">No secrets configured</td></tr>';
-        return;
-      }
-      body.innerHTML = secretsList.map(s => {
-        const isStatic = !!s.static_version;
-        const isDisabled = false; // effective view 不含 disabled 项, 这里仅作预留.
-        const rowCls = s.source === 'dynamic_override' ? 'row-override'
-                     : s.source === 'static_preferred' ? 'row-preferred' : '';
-        return `
-          <tr class="${rowCls}" data-id="${escapeHtml(s.id)}">
-            <td><code>${escapeHtml(s.id)}</code></td>
-            <td>${escapeHtml(s.name || '')}</td>
-            <td><span class="pill ${escapeHtml(s.category)}">${escapeHtml(s.category)}</span></td>
-            <td><code>${escapeHtml(s.value_masked)}</code></td>
-            <td>${escapeHtml(s.value_length)}</td>
-            <td>${srcBadge(s.source)}</td>
-            <td>${decisionCell('secret', s.id, s.decision, isStatic)}</td>
-            <td class="actions">${secretActions(s)}</td>
-          </tr>
-        `;
-      }).join('');
-    }
+    const KINDS = {
+      secret: {
+        api: API_SECRETS,
+        list: () => secretsList,
+        setList: (d) => { secretsList = d.secrets || []; secretCategories = d.categories || []; secretDecisions = d.decisions || []; },
+        bodyId: 'secrets-body',
+        statsId: 'secrets-stats',
+        formDlgId: 'secret-form',
+        formElId: 'secret-form-el',
+        colspan: 8,
+        emptyText: 'No secrets configured',
+        kindParam: 'secret', // decision endpoint URL 用
+        refresh: () => refreshSecrets(),
+        renderRow: renderSecretRow,
+        populateSelects: populateCategorySelect,
+        openForm: openSecretForm,
+      },
+      provider: {
+        api: API_PROVIDERS,
+        list: () => providersList,
+        setList: (d) => { providersList = d.providers || []; providerProtocols = d.protocols || []; providerShorts = d.shorts || []; providerDecisions = d.decisions || []; },
+        bodyId: 'providers-body',
+        statsId: 'providers-stats',
+        formDlgId: 'provider-form',
+        formElId: 'provider-form-el',
+        colspan: 9,
+        emptyText: 'No providers configured',
+        kindParam: 'provider',
+        refresh: () => refreshProviders(),
+        renderRow: renderProviderRow,
+        populateSelects: populateProtocolSelect,
+        openForm: openProviderForm,
+      },
+    };
 
-    function secretActions(s) {
-      const id = escapeHtml(s.id);
-      if (s.source === 'static') {
-        // 只能 fork override (走 edit 流程) — delete 不可.
+    // 通用 actions 按钮 (source 一致 → 按钮一致). 返回 HTML 字符串.
+    function rowActions(item) {
+      const id = escapeHtml(item.id);
+      const s = item.source;
+      if (s === 'static') {
         return `<button class="btn" data-action="edit" data-id="${id}">override</button>`;
       }
-      if (s.source === 'static_preferred') {
-        // 既有 static 又有 dynamic override, 但当前 force static.
+      if (s === 'static_preferred') {
         return `<button class="btn" data-action="edit" data-id="${id}">edit dyn</button>`
              + `<button class="btn btn-danger" data-action="revert" data-id="${id}">revert</button>`;
       }
-      if (s.source === 'dynamic_override') {
+      if (s === 'dynamic_override') {
         return `<button class="btn" data-action="edit" data-id="${id}">edit</button>`
              + `<button class="btn btn-danger" data-action="revert" data-id="${id}">revert</button>`;
       }
-      // dynamic only
       return `<button class="btn" data-action="edit" data-id="${id}">edit</button>`
            + `<button class="btn btn-danger" data-action="delete" data-id="${id}">delete</button>`;
     }
 
-    // 事件委托: secret 表格行.
-    document.getElementById('secrets-body').addEventListener('click', (e) => {
-      const btn = e.target.closest('button[data-action]');
-      if (!btn) return;
-      const id = btn.dataset.id;
-      const action = btn.dataset.action;
-      if (action === 'edit') editSecret(id);
-      else if (action === 'delete') deleteSecret(id);
-      else if (action === 'revert') revertSecret(id);
-    });
-    document.getElementById('secrets-body').addEventListener('change', async (e) => {
-      const sel = e.target.closest('select.decision-select');
-      if (!sel || sel.dataset.kind !== 'secret') return;
-      await patchDecision('secret', sel.dataset.id, sel.value);
-    });
+    // 通用表格事件委托 (click + decision change).
+    function bindTableEvents(kind) {
+      const cfg = KINDS[kind];
+      const body = document.getElementById(cfg.bodyId);
+      body.addEventListener('click', (e) => {
+        const btn = e.target.closest('button[data-action]');
+        if (!btn) return;
+        const id = btn.dataset.id;
+        const action = btn.dataset.action;
+        if (action === 'edit') cfg.openForm(cfg.list().find(x => x.id === id));
+        else if (action === 'delete') deleteItem(kind, id, false);
+        else if (action === 'revert') deleteItem(kind, id, true);
+      });
+      body.addEventListener('change', async (e) => {
+        const sel = e.target.closest('select.decision-select');
+        if (!sel || sel.dataset.kind !== cfg.kindParam) return;
+        await patchDecision(kind, sel.dataset.id, sel.value);
+      });
+    }
+
+    // 通用 refresh / render (kind 特定的 row 渲染通过 cfg.renderRow 注入).
+    async function refreshKind(kind) {
+      const cfg = KINDS[kind];
+      try {
+        const r = await fetch(cfg.api, { cache: 'no-store' });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        cfg.setList(await r.json());
+        renderKind(kind);
+      } catch (e) {
+        console.error(e);
+        setStatus(`${kind} refresh failed`, 'status-err');
+      }
+    }
+
+    function renderKind(kind) {
+      const cfg = KINDS[kind];
+      const list = cfg.list();
+      renderStats(cfg.statsId, list);
+      const body = document.getElementById(cfg.bodyId);
+      if (list.length === 0) {
+        body.innerHTML = `<tr><td colspan="${cfg.colspan}" class="empty">${cfg.emptyText}</td></tr>`;
+        return;
+      }
+      body.innerHTML = list.map(item => cfg.renderRow(item)).join('');
+    }
+
+    // 通用 delete / revert. revert = true 时跳过 confirm (用更准确的提示).
+    async function deleteItem(kind, id, revert) {
+      const cfg = KINDS[kind];
+      const msg = revert
+        ? `Revert ${id} to its static baseline (drop dynamic override)?`
+        : `Delete dynamic ${kind} ${id}?`;
+      if (!confirm(msg)) return;
+      const r = await fetch(`${cfg.api}/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+        alert('Failed: ' + (err.error || r.status));
+        return;
+      }
+      await cfg.refresh();
+    }
+
+    // ─── secrets / providers tab (薄壳, 只保留类型特定的部分) ─────────────
+
+    async function refreshSecrets() { await refreshKind('secret'); }
+    async function refreshProviders() { await refreshKind('provider'); }
+
+    function renderSecretRow(s) {
+      const rowCls = rowClass(s.source);
+      return `
+        <tr class="${rowCls}" data-id="${escapeHtml(s.id)}">
+          <td><code>${escapeHtml(s.id)}</code></td>
+          <td>${escapeHtml(s.name || '')}</td>
+          <td><span class="pill ${escapeHtml(s.category)}">${escapeHtml(s.category)}</span></td>
+          <td><code>${escapeHtml(s.value_masked)}</code></td>
+          <td>${escapeHtml(s.value_length)}</td>
+          <td>${srcBadge(s.source)}</td>
+          <td>${decisionCell('secret', s.id, s.decision, !!s.static_version)}</td>
+          <td class="actions">${rowActions(s)}</td>
+        </tr>
+      `;
+    }
+
+    function renderProviderRow(p) {
+      const rowCls = rowClass(p.source);
+      return `
+        <tr class="${rowCls}" data-id="${escapeHtml(p.id)}">
+          <td><code>${escapeHtml(p.id)}</code></td>
+          <td>${escapeHtml(p.name || '')}</td>
+          <td><span class="pill">${escapeHtml(p.protocol)}</span></td>
+          <td><code>${escapeHtml(p.base_url)}</code></td>
+          <td><code>${escapeHtml(p.api_key_masked || '(none)')}</code></td>
+          <td>${p.enabled ? '✓' : '<span class="status-err">✗</span>'}</td>
+          <td>${srcBadge(p.source)}</td>
+          <td>${decisionCell('provider', p.id, p.decision, !!p.static_version)}</td>
+          <td class="actions">${rowActions(p)}</td>
+        </tr>
+      `;
+    }
+
+    function rowClass(source) {
+      if (source === 'dynamic_override') return 'row-override';
+      if (source === 'static_preferred') return 'row-preferred';
+      return '';
+    }
+
+    bindTableEvents('secret');
+    bindTableEvents('provider');
 
     function populateCategorySelect() {
       const sel = document.getElementById('f-category');
       sel.innerHTML = secretCategories.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
+    }
+
+    function populateProtocolSelect() {
+      const sel = document.getElementById('p-protocol');
+      sel.innerHTML = providerProtocols.map(p => `<option value="${escapeHtml(p)}">${escapeHtml(p)}</option>`).join('');
     }
 
     function openSecretForm(existing) {
@@ -671,175 +765,18 @@
       const dlg = document.getElementById('secret-form');
       const title = document.getElementById('secret-form-title');
       const saveBtn = document.getElementById('f-save');
-      const banner = document.getElementById('secret-form-banner');
       const idInput = document.getElementById('f-id');
-      document.getElementById('f-id').value = existing?.id || '';
+      idInput.value = existing?.id || '';
       // 编辑模式下 ID 不可改 (PUT 路径以 URL 中的 id 为准).
       idInput.disabled = !!existing;
       document.getElementById('f-name').value = existing?.name || '';
       document.getElementById('f-category').value = existing?.category || secretCategories[0] || 'apikey';
       document.getElementById('f-value').value = ''; // 强制重输, 避免泄露.
       title.textContent = existing ? `Edit secret ${existing.id}` : 'New secret';
-
-      // 编辑 static-only 时, 提示 "此次编辑会创建 dynamic override".
-      if (existing && existing.source === 'static') {
-        banner.textContent = `This id is declared statically. Saving will create a dynamic override in ${stateFileName()}; the static baseline is preserved.`;
-        banner.style.display = 'block';
-      } else {
-        banner.style.display = 'none';
-      }
+      toggleOverrideBanner(dlg, existing);
       dlg.dataset.editId = existing ? existing.id : '';
       saveBtn.textContent = existing ? 'Update' : 'Create';
       dlg.showModal();
-    }
-
-    document.getElementById('secret-form-el').addEventListener('submit', async (ev) => {
-      const dlg = document.getElementById('secret-form');
-      const btn = ev.submitter;
-      if (!btn || btn.value !== 'save') return;
-      const editId = dlg.dataset.editId;
-      const payload = {
-        id: document.getElementById('f-id').value.trim() || null,
-        name: document.getElementById('f-name').value.trim() || null,
-        category: document.getElementById('f-category').value,
-        value: document.getElementById('f-value').value,
-      };
-      try {
-        const url = editId ? `${API_SECRETS}/${encodeURIComponent(editId)}` : API_SECRETS;
-        const method = editId ? 'PUT' : 'POST';
-        const r = await fetch(url, {
-          method,
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-        });
-        if (!r.ok) {
-          const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
-          alert('Failed: ' + (err.error || r.status));
-          return;
-        }
-        await refreshSecrets();
-        dlg.close();
-      } catch (e) {
-        alert('Error: ' + e.message);
-      }
-    });
-
-    function editSecret(id) {
-      const s = secretsList.find(x => x.id === id);
-      if (!s) return;
-      openSecretForm(s);
-    }
-
-    async function deleteSecret(id) {
-      if (!confirm(`Delete dynamic secret ${id}?`)) return;
-      try {
-        const r = await fetch(`${API_SECRETS}/${encodeURIComponent(id)}`, { method: 'DELETE' });
-        if (!r.ok && r.status !== 204) {
-          const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
-          alert('Failed: ' + (err.error || r.status));
-          return;
-        }
-        await refreshSecrets();
-      } catch (e) {
-        alert('Error: ' + e.message);
-      }
-    }
-
-    async function revertSecret(id) {
-      // 删除 dynamic override → 回到 static 基线.
-      if (!confirm(`Revert ${id} to its static baseline (drop dynamic override)?`)) return;
-      await deleteSecretQuiet(id);
-    }
-
-    async function deleteSecretQuiet(id) {
-      const r = await fetch(`${API_SECRETS}/${encodeURIComponent(id)}`, { method: 'DELETE' });
-      if (!r.ok && r.status !== 204) {
-        const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
-        alert('Failed: ' + (err.error || r.status));
-        return;
-      }
-      await refreshSecrets();
-    }
-
-    // ─── providers tab ────────────────────────────────────────────────────
-    async function refreshProviders() {
-      try {
-        const r = await fetch(API_PROVIDERS, { cache: 'no-store' });
-        if (!r.ok) throw new Error('HTTP ' + r.status);
-        const data = await r.json();
-        providersList = data.providers || [];
-        providerProtocols = data.protocols || [];
-        providerShorts = data.shorts || [];
-        providerDecisions = data.decisions || [];
-        renderProviders();
-      } catch (e) {
-        console.error(e);
-        setStatus('providers refresh failed', 'status-err');
-      }
-    }
-
-    function renderProviders() {
-      renderStats('providers-stats', providersList);
-      const body = document.getElementById('providers-body');
-      if (providersList.length === 0) {
-        body.innerHTML = '<tr><td colspan="9" class="empty">No providers configured</td></tr>';
-        return;
-      }
-      body.innerHTML = providersList.map(p => {
-        const isStatic = !!p.static_version;
-        const rowCls = p.source === 'dynamic_override' ? 'row-override'
-                     : p.source === 'static_preferred' ? 'row-preferred' : '';
-        return `
-          <tr class="${rowCls}" data-id="${escapeHtml(p.id)}">
-            <td><code>${escapeHtml(p.id)}</code></td>
-            <td>${escapeHtml(p.name || '')}</td>
-            <td><span class="pill">${escapeHtml(p.protocol)}</span></td>
-            <td><code>${escapeHtml(p.base_url)}</code></td>
-            <td><code>${escapeHtml(p.api_key_masked || '(none)')}</code></td>
-            <td>${p.enabled ? '✓' : '<span class="status-err">✗</span>'}</td>
-            <td>${srcBadge(p.source)}</td>
-            <td>${decisionCell('provider', p.id, p.decision, isStatic)}</td>
-            <td class="actions">${providerActions(p)}</td>
-          </tr>
-        `;
-      }).join('');
-    }
-
-    function providerActions(p) {
-      const id = escapeHtml(p.id);
-      if (p.source === 'static') {
-        return `<button class="btn" data-action="edit" data-id="${id}">override</button>`;
-      }
-      if (p.source === 'static_preferred') {
-        return `<button class="btn" data-action="edit" data-id="${id}">edit dyn</button>`
-             + `<button class="btn btn-danger" data-action="revert" data-id="${id}">revert</button>`;
-      }
-      if (p.source === 'dynamic_override') {
-        return `<button class="btn" data-action="edit" data-id="${id}">edit</button>`
-             + `<button class="btn btn-danger" data-action="revert" data-id="${id}">revert</button>`;
-      }
-      return `<button class="btn" data-action="edit" data-id="${id}">edit</button>`
-           + `<button class="btn btn-danger" data-action="delete" data-id="${id}">delete</button>`;
-    }
-
-    document.getElementById('providers-body').addEventListener('click', (e) => {
-      const btn = e.target.closest('button[data-action]');
-      if (!btn) return;
-      const id = btn.dataset.id;
-      const action = btn.dataset.action;
-      if (action === 'edit') editProvider(id);
-      else if (action === 'delete') deleteProvider(id);
-      else if (action === 'revert') revertProvider(id);
-    });
-    document.getElementById('providers-body').addEventListener('change', async (e) => {
-      const sel = e.target.closest('select.decision-select');
-      if (!sel || sel.dataset.kind !== 'provider') return;
-      await patchDecision('provider', sel.dataset.id, sel.value);
-    });
-
-    function populateProtocolSelect() {
-      const sel = document.getElementById('p-protocol');
-      sel.innerHTML = providerProtocols.map(p => `<option value="${escapeHtml(p)}">${escapeHtml(p)}</option>`).join('');
     }
 
     function openProviderForm(existing) {
@@ -847,7 +784,6 @@
       const dlg = document.getElementById('provider-form');
       const title = document.getElementById('provider-form-title');
       const saveBtn = document.getElementById('p-save');
-      const banner = document.getElementById('provider-form-banner');
       const idInput = document.getElementById('p-id');
       idInput.value = existing?.id || '';
       idInput.disabled = !!existing;
@@ -857,84 +793,74 @@
       document.getElementById('p-api-key').value = ''; // 强制重输; 留空则覆盖为空字符串.
       document.getElementById('p-enabled').checked = existing ? existing.enabled : true;
       title.textContent = existing ? `Edit provider ${existing.id}` : 'New provider';
+      toggleOverrideBanner(dlg, existing);
+      dlg.dataset.editId = existing ? existing.id : '';
+      saveBtn.textContent = existing ? 'Update' : 'Create';
+      dlg.showModal();
+    }
 
+    /// 编辑 static-only id 时, 提示 "此次会创建 dynamic override".
+    function toggleOverrideBanner(dlg, existing) {
+      const banner = dlg.querySelector('.banner');
       if (existing && existing.source === 'static') {
         banner.textContent = `This id is declared statically. Saving will create a dynamic override; the static baseline is preserved.`;
         banner.style.display = 'block';
       } else {
         banner.style.display = 'none';
       }
-      dlg.dataset.editId = existing ? existing.id : '';
-      saveBtn.textContent = existing ? 'Update' : 'Create';
-      dlg.showModal();
     }
 
-    document.getElementById('provider-form-el').addEventListener('submit', async (ev) => {
-      const dlg = document.getElementById('provider-form');
-      const btn = ev.submitter;
-      if (!btn || btn.value !== 'save') return;
-      const editId = dlg.dataset.editId;
-      const payload = {
-        id: document.getElementById('p-id').value.trim() || null,
-        name: document.getElementById('p-name').value.trim() || null,
-        protocol: document.getElementById('p-protocol').value,
-        base_url: document.getElementById('p-base-url').value.trim(),
-        enabled: document.getElementById('p-enabled').checked,
-        api_key: document.getElementById('p-api-key').value,
-      };
-      try {
-        const url = editId ? `${API_PROVIDERS}/${encodeURIComponent(editId)}` : API_PROVIDERS;
-        const method = editId ? 'PUT' : 'POST';
-        const r = await fetch(url, {
-          method,
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-        });
-        if (!r.ok) {
-          const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
-          alert('Failed: ' + (err.error || r.status));
-          return;
+    // 通用 form submit (按 dlg + payload 构造器分发, 通过 KINDS 查表避免 ternary 字符串匹配).
+    function bindFormSubmit(kind, formId, buildPayload) {
+      const cfg = KINDS[kind];
+      document.getElementById(formId).addEventListener('submit', async (ev) => {
+        const dlg = document.getElementById(cfg.formDlgId);
+        const btn = ev.submitter;
+        if (!btn || btn.value !== 'save') return;
+        const editId = dlg.dataset.editId;
+        const payload = buildPayload();
+        try {
+          const url = editId ? `${cfg.api}/${encodeURIComponent(editId)}` : cfg.api;
+          const method = editId ? 'PUT' : 'POST';
+          const r = await fetch(url, {
+            method,
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+          if (!r.ok) {
+            const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+            alert('Failed: ' + (err.error || r.status));
+            return;
+          }
+          await cfg.refresh();
+          dlg.close();
+        } catch (e) {
+          alert('Error: ' + e.message);
         }
-        await refreshProviders();
-        dlg.close();
-      } catch (e) {
-        alert('Error: ' + e.message);
-      }
-    });
-
-    function editProvider(id) {
-      const p = providersList.find(x => x.id === id);
-      if (!p) return;
-      openProviderForm(p);
+      });
     }
 
-    async function deleteProvider(id) {
-      if (!confirm(`Delete dynamic provider ${id}?`)) return;
-      const r = await fetch(`${API_PROVIDERS}/${encodeURIComponent(id)}`, { method: 'DELETE' });
-      if (!r.ok && r.status !== 204) {
-        const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
-        alert('Failed: ' + (err.error || r.status));
-        return;
-      }
-      await refreshProviders();
-    }
+    bindFormSubmit('secret', 'secret-form-el', () => ({
+      id: document.getElementById('f-id').value.trim() || null,
+      name: document.getElementById('f-name').value.trim() || null,
+      category: document.getElementById('f-category').value,
+      value: document.getElementById('f-value').value,
+    }));
 
-    async function revertProvider(id) {
-      if (!confirm(`Revert ${id} to its static baseline (drop dynamic override)?`)) return;
-      const r = await fetch(`${API_PROVIDERS}/${encodeURIComponent(id)}`, { method: 'DELETE' });
-      if (!r.ok && r.status !== 204) {
-        const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
-        alert('Failed: ' + (err.error || r.status));
-        return;
-      }
-      await refreshProviders();
-    }
+    bindFormSubmit('provider', 'provider-form-el', () => ({
+      id: document.getElementById('p-id').value.trim() || null,
+      name: document.getElementById('p-name').value.trim() || null,
+      protocol: document.getElementById('p-protocol').value,
+      base_url: document.getElementById('p-base-url').value.trim(),
+      enabled: document.getElementById('p-enabled').checked,
+      api_key: document.getElementById('p-api-key').value,
+    }));
 
     // ─── decision PATCH ──────────────────────────────────────────────────
     async function patchDecision(kind, id, mode) {
-      const url = `${kind === 'provider' ? API_PROVIDERS : API_SECRETS}/${encodeURIComponent(id)}/decision`;
+      const cfg = KINDS[kind];
       try {
-        const r = await fetch(url, {
+        const r = await fetch(`${cfg.api}/${encodeURIComponent(id)}/decision`, {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ mode }),
@@ -942,20 +868,12 @@
         if (!r.ok) {
           const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
           alert('Decision update failed: ' + (err.error || r.status));
-          // 失败时刷新让 UI 回到真实状态.
-          if (kind === 'provider') refreshProviders(); else refreshSecrets();
-          return;
         }
-        // 成功后刷新列表 (Disabled 项会消失, Default / PreferStatic 会切换 source).
-        if (kind === 'provider') refreshProviders(); else refreshSecrets();
+        // 无论成败都刷新: 成功则更新视图, 失败则回滚下拉.
+        await cfg.refresh();
       } catch (e) {
         alert('Error: ' + e.message);
       }
-    }
-
-    function stateFileName() {
-      // 仅用于 banner 文本展示, 默认与项目约定一致.
-      return 'secret-guard.state.toml';
     }
 
     // ─── bootstrap ────────────────────────────────────────────────────────

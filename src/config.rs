@@ -1,4 +1,4 @@
-//! 配置文件 schema (TOML + serde).
+//! 配置文件 schema (TOML + serde) + 双层 (static + dynamic) 合并的泛型基础设施.
 //!
 //! # 双层配置模型 (Static + Dynamic)
 //!
@@ -22,10 +22,22 @@
 //! CRUD 删除即可移除, 不走 decision 机制.
 //!
 //! state.toml 的 `[decisions]` 段持久化这些 per-id 决策, 见 [`Decisions`].
+//!
+//! # 泛型表 (`DynamicTable<T>`)
+//!
+//! [`ProviderTable`](crate::provider::ProviderTable) 与
+//! [`SecretTable`](crate::secrets::SecretTable) 的合并 / CRUD / 持久化逻辑完全对称,
+//! 因此本模块提供泛型基础设施: [`DynamicEntry`] (类型特定钩子) + [`DynamicTable`]
+//! (共享的内存结构 + 合并 / CRUD / 持久化算法). 类型特定方法 (如 effective_snapshot
+//! 返回 `EffectiveProvider` / `EffectiveSecret`) 在各自模块以
+//! `impl DynamicTable<Provider>` / `impl DynamicTable<SecretEntry>` 的形式补充
+//! (Rust 允许对泛型具体实例添加 inherent impl, 前提是泛型本身在本地 crate).
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
 use crate::provider::Provider;
@@ -174,19 +186,25 @@ pub fn pick_effective<T>(
     }
 }
 
-/// 由 (has_static, has_dynamic, mode) 推导 EffectiveSource. 与 [`pick_effective`] 对偶:
-/// `pick_effective` 返回 None 时 (Disabled) 此函数也返回 None.
+/// 由 (has_static, has_dynamic, mode) 推导 EffectiveSource. 与 [`pick_effective`] 严格对偶:
+/// `pick_effective` 返回 None 的输入 (Disabled / 全空 / dynamic-only+PreferStatic),
+/// 本函数也返回 None. 这样 [`compute_effective_*`] 中的 `.expect` 不会在生产 panic.
 pub fn classify_source(
     has_static: bool,
     has_dynamic: bool,
     mode: OverrideMode,
 ) -> Option<EffectiveSource> {
     match (has_static, has_dynamic, mode) {
+        // Disabled: pick_effective 必返回 None.
+        (_, _, OverrideMode::Disabled) => None,
+        // 仅 static 有此 id: pick_effective 返回 static.
         (true, false, _) => Some(EffectiveSource::Static),
+        // static + dynamic 都有, mode 决定谁生效.
         (true, true, OverrideMode::Default) => Some(EffectiveSource::DynamicOverride),
         (true, true, OverrideMode::PreferStatic) => Some(EffectiveSource::StaticPreferred),
-        (false, true, _) => Some(EffectiveSource::Dynamic),
-        // Disabled / 全空 → None.
+        // 仅 dynamic 有: 仅 Default 下生效 (PreferStatic 找不到 static 时 pick_effective 返回 None).
+        (false, true, OverrideMode::Default) => Some(EffectiveSource::Dynamic),
+        // (false, true, PreferStatic) + (false, false, _) — 与 pick_effective 对偶地返回 None.
         _ => None,
     }
 }
@@ -285,6 +303,295 @@ impl Decisions {
     }
 }
 
+// ─── atomic_write 共用工具 ─────────────────────────────────────────────────
+
+/// 原子写文件: 先写带 UUID 的 `.tmp`, sync, 再 rename.
+///
+/// 同时被 [`DynamicTable::persist_dynamic`] (provider / secret 共享) 调用.
+/// `pub(crate)` 暴露给 redact 等需要原子写的模块.
+pub(crate) fn atomic_write(path: &Path, text: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("config path has no parent: {}", path.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| anyhow::anyhow!("invalid config file name: {}", path.display()))?;
+    // tmp 名带 UUID: 防止并发 persist 互相覆盖.
+    let tmp_name = format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4().simple());
+    let tmp = parent.join(&tmp_name);
+
+    let mut f = std::fs::File::create(&tmp)
+        .map_err(|e| anyhow::anyhow!("create tmp {} failed: {e}", tmp.display()))?;
+    f.write_all(text.as_bytes())
+        .map_err(|e| anyhow::anyhow!("write tmp {} failed: {e}", tmp.display()))?;
+    f.sync_all()
+        .map_err(|e| anyhow::anyhow!("fsync tmp {} failed: {e}", tmp.display()))?;
+    drop(f);
+
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::anyhow!("rename {} -> {} failed: {e}", tmp.display(), path.display())
+    })?;
+    Ok(())
+}
+
+// ─── CRUD 返回值 (provider / secret 共用同一份) ────────────────────────────
+
+/// upsert 操作是新建还是覆盖. provider 与 secret 共用.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpsertKind {
+    Inserted,
+    Updated,
+}
+
+/// delete 操作的结果. provider 与 secret 共用.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    Deleted,
+    NotFound,
+}
+
+// ─── 泛型表 (provider / secret 共享的内存结构 + 合并算法) ──────────────────
+
+/// 类型特定的钩子: 让泛型 [`DynamicTable`] 知道如何把一个 entry 类型
+/// 接入到合并 / CRUD / 持久化流水线.
+///
+/// 每个具体类型 ([`Provider`], [`SecretEntry`]) 在各自模块 impl 本 trait,
+/// 把"哪一段 state 字段是我的 / 哪一段 decisions 子表是我的"等小细节抽出来,
+/// 让 [`DynamicTable`] 的所有共有逻辑只写一次.
+pub trait DynamicEntry: Clone + Send + Sync + 'static {
+    /// 此 entry 的 id (用于去重 + decision 查找).
+    fn id(&self) -> &str;
+
+    /// 校验自身合法性 (id / value / base_url 等). 失败时返回 message.
+    fn validate(&self) -> Result<(), String>;
+
+    /// 把 entries 写到 state 对应字段 (provider → state.providers, secret → state.secrets).
+    fn set_state_field(state: &mut DynamicState, entries: Vec<Self>);
+
+    /// 读 decisions 中对应子表 (provider / secret) 的某 id.
+    fn get_decision(d: &Decisions, id: &str) -> OverrideMode;
+
+    /// 写 decisions 中对应子表的某 id.
+    fn set_decision(d: &mut Decisions, id: &str, mode: OverrideMode);
+}
+
+/// 双层 (static + dynamic) + per-id decision 的泛型表.
+///
+/// [`ProviderTable`](crate::provider::ProviderTable) / [`SecretTable`](crate::secrets::SecretTable)
+/// 都是本类型的别名. 类型特定的"对外视图"方法 (返回 EffectiveProvider / EffectiveSecret
+/// 等带 masked 字段的结构) 通过在各自模块里写 `impl DynamicTable<T>` 提供.
+///
+/// # 并发与持久化契约
+///
+/// - 内存层: `Arc<RwLock<Vec<T>>>` × 2 (static 只读 + dynamic 可变) + `Arc<RwLock<Decisions>>`.
+/// - 持久化锁: 多个 `DynamicTable` 实例 (provider + secret) 共享同一把
+///   `Arc<Mutex<()>> persist_lock`, 串行整个 read-modify-write, 防止两表互相覆盖 state.toml.
+/// - 持久化策略: **先持久化, 再更新内存** — 保证内存永远是已持久化的子集 (失败自动回滚).
+#[derive(Clone)]
+pub struct DynamicTable<T: DynamicEntry> {
+    static_entries: Arc<RwLock<Vec<T>>>,
+    dynamic_entries: Arc<RwLock<Vec<T>>>,
+    decisions: Arc<RwLock<Decisions>>,
+    persist_lock: Arc<Mutex<()>>,
+    state_path: Arc<PathBuf>,
+}
+
+impl<T: DynamicEntry> std::fmt::Debug for DynamicTable<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = self.static_entries.read();
+        let d = self.dynamic_entries.read();
+        f.debug_struct("DynamicTable")
+            .field("entry_type", &std::any::type_name::<T>())
+            .field("static_count", &s.len())
+            .field("dynamic_count", &d.len())
+            .field("state_path", &self.state_path)
+            .finish()
+    }
+}
+
+impl<T: DynamicEntry> DynamicTable<T> {
+    /// 构造表 (测试常用). 共享 lock 与 decisions 由调用方提供.
+    pub fn new(
+        static_entries: Vec<T>,
+        dynamic_entries: Vec<T>,
+        decisions: Arc<RwLock<Decisions>>,
+        state_path: PathBuf,
+    ) -> Self {
+        Self::with_persist_lock(
+            static_entries,
+            dynamic_entries,
+            decisions,
+            state_path,
+            Arc::new(Mutex::new(())),
+        )
+    }
+
+    /// 用外部共享的 `persist_lock` 构造. server 启动时创建一把锁传给 provider 与
+    /// secret 两张表, 保证两者对 state 文件的 RMW 串行化.
+    pub fn with_persist_lock(
+        static_entries: Vec<T>,
+        dynamic_entries: Vec<T>,
+        decisions: Arc<RwLock<Decisions>>,
+        state_path: PathBuf,
+        persist_lock: Arc<Mutex<()>>,
+    ) -> Self {
+        Self {
+            static_entries: Arc::new(RwLock::new(static_entries)),
+            dynamic_entries: Arc::new(RwLock::new(dynamic_entries)),
+            decisions,
+            persist_lock,
+            state_path: Arc::new(state_path),
+        }
+    }
+
+    // ─── 读: 合并视图 ──────────────────────────────────────────────────
+
+    /// 按 (static, dynamic, decision) 三元组计算 effective 视图的**原始项**.
+    /// 顺序: 先 static 出现的 id (Disabled 自动排除), 再仅 dynamic 独有的 id.
+    ///
+    /// 类型无关; 类型特定的"加 masked / provenance 字段"逻辑在调用方通过
+    /// [`Self::effective_triples`] 取三元组后自行映射.
+    pub fn effective_raw(&self) -> Vec<T> {
+        self.effective_triples()
+            .into_iter()
+            .filter_map(|(s, d, m)| pick_effective(s, d, m))
+            .collect()
+    }
+
+    /// 列出每个可见 id 的 (static_ver, dynamic_ver, mode) 三元组.
+    /// Disabled 的项 (经 pick_effective 判定返回 None) 不在结果中.
+    ///
+    /// 这是 effective_snapshot 这类"对外视图"方法的统一数据源: 调用方拿到三元组后
+    /// 用类型特定的 `compute_effective_*` 函数映射到 masked 视图.
+    pub fn effective_triples(&self) -> Vec<(Option<T>, Option<T>, OverrideMode)> {
+        let statics = self.static_entries.read();
+        let dynamics = self.dynamic_entries.read();
+        let decisions = self.decisions.read();
+
+        let mut out: Vec<(Option<T>, Option<T>, OverrideMode)> =
+            Vec::with_capacity(statics.len() + dynamics.len());
+        let mut seen: HashSet<String> = HashSet::new();
+
+        // 1. 遍历 static ids, 按 decision 决定 effective.
+        for s in statics.iter() {
+            seen.insert(s.id().to_string());
+            let dyn_opt = dynamics.iter().find(|d| d.id() == s.id()).cloned();
+            let mode = T::get_decision(&decisions, s.id());
+            if pick_effective(Some(s.clone()), dyn_opt.clone(), mode).is_some() {
+                out.push((Some(s.clone()), dyn_opt, mode));
+            }
+        }
+        // 2. dynamic-only ids: decision 不适用, 直接生效.
+        for d in dynamics.iter() {
+            if seen.contains(d.id()) {
+                continue;
+            }
+            seen.insert(d.id().to_string());
+            out.push((None, Some(d.clone()), OverrideMode::Default));
+        }
+        out
+    }
+
+    /// 路由层使用: 按 id 取 effective 原始项 (不脱敏). 不存在 / Disabled → None.
+    pub fn get_effective(&self, id: &str) -> Option<T> {
+        let statics = self.static_entries.read();
+        let dynamics = self.dynamic_entries.read();
+        let decisions = self.decisions.read();
+
+        let s = statics.iter().find(|p| p.id() == id).cloned();
+        let d = dynamics.iter().find(|p| p.id() == id).cloned();
+        let mode = s
+            .as_ref()
+            .map(|p| T::get_decision(&decisions, p.id()))
+            .unwrap_or(OverrideMode::Default);
+
+        pick_effective(s, d, mode)
+    }
+
+    /// 直接查 static 层, 不受 decision 影响. 供 Web handler 判断 "该 id 是否为 static
+    /// 来源", 特别是 decision=Disabled 时该 id 不在 effective_snapshot 中也仍能识别.
+    pub fn has_static(&self, id: &str) -> bool {
+        self.static_entries.read().iter().any(|e| e.id() == id)
+    }
+
+    // ─── 写: dynamic 层 CRUD + decision ────────────────────────────────
+
+    /// 仅 dynamic 层 CRUD —— upsert. 若 id 同时存在于 static, 此操作创建 / 更新 override.
+    /// 通过 `T::validate` 校验合法性, 持久化失败时内存自动回滚.
+    pub fn upsert_dynamic(&self, entry: T) -> anyhow::Result<(T, UpsertKind)> {
+        entry.validate().map_err(anyhow::Error::msg)?;
+
+        let _guard = self.persist_lock.lock();
+        let (new_entries, kind) = {
+            let g = self.dynamic_entries.read();
+            let mut v = g.clone();
+            if let Some(e) = v.iter_mut().find(|e| e.id() == entry.id()) {
+                *e = entry.clone();
+                (v, UpsertKind::Updated)
+            } else {
+                v.push(entry.clone());
+                (v, UpsertKind::Inserted)
+            }
+        };
+        self.persist_dynamic(&new_entries)?;
+        *self.dynamic_entries.write() = new_entries;
+        Ok((entry, kind))
+    }
+
+    /// 仅 dynamic 层 CRUD —— delete. 若 id 同时存在于 static, 此操作仅移除 override,
+    /// 保留 static (decision 不变).
+    pub fn delete_dynamic(&self, id: &str) -> anyhow::Result<DeleteOutcome> {
+        let _guard = self.persist_lock.lock();
+        let new_entries = {
+            let g = self.dynamic_entries.read();
+            if !g.iter().any(|e| e.id() == id) {
+                return Ok(DeleteOutcome::NotFound);
+            }
+            g.iter()
+                .filter(|e| e.id() != id)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        self.persist_dynamic(&new_entries)?;
+        *self.dynamic_entries.write() = new_entries;
+        Ok(DeleteOutcome::Deleted)
+    }
+
+    /// 设置对某 static id 的决策. 持久化到 state.toml.
+    ///
+    /// 满足"先持久化, 再更新内存"契约: 若 atomic_write 失败, 内存 decisions 保持旧值
+    /// (不会出现内存已切到 disabled 但磁盘还是 default 的漂移).
+    pub fn set_decision(&self, id: &str, mode: OverrideMode) -> anyhow::Result<()> {
+        let _guard = self.persist_lock.lock();
+        let new_decisions = {
+            let cur = self.decisions.read().clone();
+            let mut next = cur;
+            T::set_decision(&mut next, id, mode);
+            next
+        };
+        let mut state = DynamicState::load_or_empty(&self.state_path)?;
+        state.decisions = new_decisions.clone();
+        let text = state.to_toml()?;
+        atomic_write(&self.state_path, &text)?;
+        *self.decisions.write() = new_decisions;
+        Ok(())
+    }
+
+    // ─── 内部持久化 helper ──────────────────────────────────────────────
+
+    /// 重写 state.toml 中本表对应的段 (provider / secret). 调用方必须持有 persist_lock.
+    fn persist_dynamic(&self, new_dynamic: &[T]) -> anyhow::Result<()> {
+        let mut state = DynamicState::load_or_empty(&self.state_path)?;
+        T::set_state_field(&mut state, new_dynamic.to_vec());
+        let text = state.to_toml()?;
+        atomic_write(&self.state_path, &text)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,5 +660,240 @@ mod tests {
             parsed.decisions.secret("static-s"),
             OverrideMode::PreferStatic
         );
+    }
+
+    /// 不变式: `classify_source` 必须与 `pick_effective` 严格对偶.
+    /// 即 pick_effective 返回 None 时 classify_source 也返回 None, 反之亦然.
+    /// 用穷举所有 (has_static, has_dynamic, mode) 组合验证.
+    #[test]
+    fn classify_source_dual_to_pick_effective() {
+        #[derive(Debug)]
+        struct Dummy;
+        for has_static in [false, true] {
+            for has_dynamic in [false, true] {
+                for (mode, _) in OverrideMode::ALL {
+                    let s = has_static.then_some(Dummy);
+                    let d = has_dynamic.then_some(Dummy);
+                    let pick = pick_effective(s, d, mode).is_some();
+                    let classify = classify_source(has_static, has_dynamic, mode).is_some();
+                    assert_eq!(
+                        pick, classify,
+                        "dual violation: has_static={has_static} has_dynamic={has_dynamic} mode={mode:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+// ─── DynamicTable<T> 通用行为测试 ──────────────────────────────────────────
+//
+// provider 与 secret 的 table 行为完全对称 (两者都是 `DynamicTable<T>`),
+// 这里用 `SecretEntry` 作为 canonical 测试类型覆盖一遍, 避免在每个具体模块里重复
+// 同样的 upsert / delete / decision / persist 场景. 类型特定测试 (validate_*
+// 校验函数、effective_snapshot 的 masked 字段映射) 仍在各自模块.
+#[cfg(test)]
+mod table_tests {
+    use super::*;
+    use crate::secrets::{SecretCategory, SecretEntry, SecretTable};
+
+    fn entry(id: &str, value: &str) -> SecretEntry {
+        SecretEntry {
+            id: id.into(),
+            name: Some(format!("name-{id}")),
+            category: SecretCategory::ApiKey,
+            value: value.into(),
+        }
+    }
+
+    fn empty_decisions() -> Arc<RwLock<Decisions>> {
+        Arc::new(RwLock::new(Decisions::default()))
+    }
+
+    fn tempfile_path(prefix: &str) -> PathBuf {
+        let id = uuid::Uuid::new_v4().to_string();
+        let path = PathBuf::from(format!("/tmp/opencode/tmp/test-{prefix}-{id}.toml"));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    // ─── 合并算法 (pick_effective 通过 effective_raw / get_effective 端到端验证) ──
+
+    #[test]
+    fn effective_raw_isolated_from_internal_state() {
+        let t = SecretTable::new(
+            vec![entry("a", "va"), entry("b", "vb")],
+            vec![],
+            empty_decisions(),
+            PathBuf::from("/tmp/x.toml"),
+        );
+        // 拿到的快照是 clone, 修改不应回写.
+        let mut snap = t.effective_raw();
+        snap.clear();
+        assert_eq!(t.effective_raw().len(), 2);
+    }
+
+    #[test]
+    fn dynamic_overrides_static_by_default() {
+        let t = SecretTable::new(
+            vec![entry("a", "static-value")],
+            vec![entry("a", "dynamic-value")],
+            empty_decisions(),
+            PathBuf::from("/tmp/x.toml"),
+        );
+        assert_eq!(t.effective_raw()[0].value, "dynamic-value");
+    }
+
+    #[test]
+    fn disabled_drops_secret() {
+        let t = SecretTable::new(
+            vec![entry("a", "v")],
+            vec![],
+            empty_decisions(),
+            PathBuf::from("/tmp/x.toml"),
+        );
+        t.set_decision("a", OverrideMode::Disabled).unwrap();
+        assert!(t.effective_raw().is_empty());
+        assert!(t.get_effective("a").is_none());
+        // has_static 不受 decision 影响, 仍能识别该 id.
+        assert!(t.has_static("a"));
+    }
+
+    #[test]
+    fn get_effective_falls_back_to_static() {
+        let t = SecretTable::new(
+            vec![entry("a", "v")],
+            vec![],
+            empty_decisions(),
+            PathBuf::from("/tmp/x.toml"),
+        );
+        assert_eq!(t.get_effective("a").unwrap().value, "v");
+        assert!(t.get_effective("missing").is_none());
+    }
+
+    // ─── upsert_dynamic / delete_dynamic (含持久化) ─────────────────────
+
+    #[test]
+    fn upsert_dynamic_insert_then_update() {
+        let tmp = tempfile_path("upsert");
+        let t = SecretTable::new(vec![], vec![], empty_decisions(), tmp);
+        let (_, k1) = t.upsert_dynamic(entry("a", "value-one")).unwrap();
+        assert_eq!(k1, UpsertKind::Inserted);
+        let (_, k2) = t.upsert_dynamic(entry("a", "value-two")).unwrap();
+        assert_eq!(k2, UpsertKind::Updated);
+        assert_eq!(t.effective_raw()[0].value, "value-two");
+    }
+
+    #[test]
+    fn delete_dynamic_removes_and_persists() {
+        let tmp = tempfile_path("delete");
+        let t = SecretTable::new(
+            vec![],
+            vec![entry("a", "v1"), entry("b", "vb")],
+            empty_decisions(),
+            tmp.clone(),
+        );
+        assert_eq!(t.delete_dynamic("a").unwrap(), DeleteOutcome::Deleted);
+        assert_eq!(t.effective_raw().len(), 1);
+        let state = DynamicState::load_or_empty(&tmp).unwrap();
+        assert_eq!(state.secrets.len(), 1);
+        assert_eq!(state.secrets[0].id, "b");
+    }
+
+    #[test]
+    fn delete_dynamic_missing_returns_not_found() {
+        let tmp = tempfile_path("del-miss");
+        let t = SecretTable::new(vec![], vec![], empty_decisions(), tmp);
+        assert_eq!(t.delete_dynamic("nope").unwrap(), DeleteOutcome::NotFound);
+    }
+
+    #[test]
+    fn delete_dynamic_keeps_static_baseline() {
+        let tmp = tempfile_path("del-base");
+        let t = SecretTable::new(
+            vec![entry("a", "static")],
+            vec![entry("a", "dynamic")],
+            empty_decisions(),
+            tmp,
+        );
+        assert_eq!(t.delete_dynamic("a").unwrap(), DeleteOutcome::Deleted);
+        // dynamic override 删了, static 基线仍生效.
+        assert_eq!(t.effective_raw()[0].value, "static");
+    }
+
+    #[test]
+    fn set_decision_disabled_then_default_persists() {
+        let tmp = tempfile_path("decide");
+        let t = SecretTable::new(
+            vec![entry("a", "v")],
+            vec![],
+            empty_decisions(),
+            tmp.clone(),
+        );
+
+        t.set_decision("a", OverrideMode::Disabled).unwrap();
+        assert!(t.get_effective("a").is_none());
+
+        // 重启 (重新加载 state) 后 decision 应持久化.
+        let state = DynamicState::load_or_empty(&tmp).unwrap();
+        assert_eq!(state.decisions.secret("a"), OverrideMode::Disabled);
+
+        // 切回 Default 后再验证 effective.
+        t.set_decision("a", OverrideMode::Default).unwrap();
+        assert!(t.get_effective("a").is_some());
+    }
+
+    #[test]
+    fn prefer_static_overrides_dynamic() {
+        let t = SecretTable::new(
+            vec![entry("a", "static")],
+            vec![entry("a", "dynamic")],
+            empty_decisions(),
+            PathBuf::from("/tmp/x.toml"),
+        );
+        t.set_decision("a", OverrideMode::PreferStatic).unwrap();
+        assert_eq!(t.effective_raw()[0].value, "static");
+    }
+
+    #[test]
+    fn validate_failure_rejects_upsert() {
+        let tmp = tempfile_path("bad");
+        let t = SecretTable::new(vec![], vec![], empty_decisions(), tmp);
+        // 空 value 不通过 validate_value.
+        let bad = SecretEntry {
+            id: "x".into(),
+            name: None,
+            category: SecretCategory::ApiKey,
+            value: "x".into(), // 太短 (< 3 字节) → validate_value 失败.
+        };
+        assert!(t.upsert_dynamic(bad).is_err());
+    }
+
+    #[test]
+    fn concurrent_upserts_no_lost_update() {
+        let tmp = tempfile_path("concurrent");
+        let t = SecretTable::new(vec![], vec![], empty_decisions(), tmp);
+        let t1 = t.clone();
+        let t2 = t.clone();
+        let h1 = std::thread::spawn(move || t1.upsert_dynamic(entry("a", "value-aaa")));
+        let h2 = std::thread::spawn(move || t2.upsert_dynamic(entry("b", "value-bbb")));
+        h1.join().unwrap().unwrap();
+        h2.join().unwrap().unwrap();
+        let ids: Vec<_> = t.effective_raw().into_iter().map(|e| e.id).collect();
+        assert!(ids.contains(&"a".to_string()), "lost update: {ids:?}");
+        assert!(ids.contains(&"b".to_string()), "lost update: {ids:?}");
+    }
+
+    // ─── atomic_write 共用工具 ──────────────────────────────────────────
+
+    #[test]
+    fn atomic_write_roundtrip() {
+        let tmp = PathBuf::from(format!(
+            "/tmp/opencode/tmp/test-atomic-{}.toml",
+            uuid::Uuid::new_v4()
+        ));
+        atomic_write(&tmp, "hello").unwrap();
+        assert_eq!(std::fs::read_to_string(&tmp).unwrap(), "hello");
+        let _ = std::fs::remove_file(&tmp);
     }
 }
