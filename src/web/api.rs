@@ -15,6 +15,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::provider::{
+    DeleteOutcome as ProviderDeleteOutcome, Protocol, Provider, UpsertKind as ProviderUpsertKind,
+};
 use crate::proxy::ProxyState;
 use crate::record::ForwardRecord;
 use crate::secrets::{SecretCategory, SecretEntry, UpsertKind};
@@ -268,5 +271,162 @@ mod tests {
             value: String::new(),
         };
         assert!(req.into_entry().is_err());
+    }
+}
+
+// ─── /providers ────────────────────────────────────────────────────────────
+
+pub async fn list_providers(State(state): State<ProxyState>) -> impl IntoResponse {
+    let providers: Vec<ProviderMasked> = state
+        .providers
+        .snapshot()
+        .into_iter()
+        .map(ProviderMasked::from)
+        .collect();
+    let protocols: Vec<&'static str> = Protocol::ALL.iter().map(|(_, n, _)| *n).collect();
+    let shorts: Vec<&'static str> = Protocol::ALL.iter().map(|(_, _, s)| *s).collect();
+    (
+        NO_STORE,
+        Json(ListProvidersResponse {
+            providers,
+            protocols,
+            shorts,
+        }),
+    )
+}
+
+pub async fn create_provider(
+    State(state): State<ProxyState>,
+    Json(payload): Json<UpsertProviderRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let mut entry = payload.into_provider()?;
+    if entry.id.is_empty() {
+        entry.id = Uuid::new_v4().to_string();
+    }
+    if state.providers.get(&entry.id).is_some() {
+        return Err(ApiError::conflict(format!(
+            "provider with id '{}' already exists; use PUT to update",
+            entry.id
+        )));
+    }
+    let (saved, kind) = state.providers.upsert(entry).map_err(ApiError::from_any)?;
+    if kind == ProviderUpsertKind::Updated {
+        return Err(ApiError::conflict(
+            "provider was concurrently created; please retry",
+        ));
+    }
+    Ok((
+        StatusCode::CREATED,
+        NO_STORE,
+        Json(ProviderMasked::from(saved)),
+    ))
+}
+
+pub async fn update_provider(
+    State(state): State<ProxyState>,
+    Path(id): Path<String>,
+    Json(payload): Json<UpsertProviderRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    if state.providers.get(&id).is_none() {
+        return Err(ApiError::not_found(format!("provider {id} not found")));
+    }
+    let mut entry = payload.into_provider()?;
+    entry.id = id.clone();
+    let (saved, kind) = state.providers.upsert(entry).map_err(ApiError::from_any)?;
+    match kind {
+        ProviderUpsertKind::Updated => {
+            Ok((StatusCode::OK, NO_STORE, Json(ProviderMasked::from(saved))))
+        }
+        ProviderUpsertKind::Inserted => Err(ApiError::not_found(format!(
+            "provider {id} was concurrently deleted; please retry"
+        ))),
+    }
+}
+
+pub async fn delete_provider(
+    State(state): State<ProxyState>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    match state.providers.delete(&id).map_err(ApiError::from_any)? {
+        ProviderDeleteOutcome::Deleted => Ok((StatusCode::NO_CONTENT, NO_STORE, "")),
+        ProviderDeleteOutcome::NotFound => {
+            Err(ApiError::not_found(format!("provider {id} not found")))
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct ListProvidersResponse {
+    pub providers: Vec<ProviderMasked>,
+    pub protocols: Vec<&'static str>,
+    pub shorts: Vec<&'static str>,
+}
+
+/// 创建/更新 provider 的请求 body.
+#[derive(Debug, Deserialize)]
+pub struct UpsertProviderRequest {
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub protocol: Protocol,
+    pub base_url: String,
+    /// 可选. 省略或空字符串表示不设置 api_key (适用于 Ollama 等本地无 auth 场景).
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default = "crate::provider::default_true")]
+    pub enabled: bool,
+}
+
+impl UpsertProviderRequest {
+    fn into_provider(self) -> Result<Provider, ApiError> {
+        if let Some(id) = &self.id {
+            if !id.is_empty() {
+                if let Err(e) = crate::secrets::validate_id(id) {
+                    return Err(ApiError::validation(e));
+                }
+            }
+        }
+        if let Err(e) = crate::provider::validate_base_url(&self.base_url) {
+            return Err(ApiError::validation(e));
+        }
+        Ok(Provider {
+            id: self.id.unwrap_or_default(),
+            protocol: self.protocol,
+            base_url: self.base_url,
+            api_key: self.api_key.unwrap_or_default(),
+            enabled: self.enabled,
+            name: self.name.filter(|s| !s.trim().is_empty()),
+        })
+    }
+}
+
+/// 对外返回时屏蔽真实 api_key. 仍保留长度提示 (便于排查"是否配置了 key").
+#[derive(Serialize)]
+pub struct ProviderMasked {
+    pub id: String,
+    pub name: Option<String>,
+    pub protocol: Protocol,
+    pub base_url: String,
+    pub api_key_masked: String,
+    pub api_key_length: usize,
+    pub enabled: bool,
+}
+
+impl From<Provider> for ProviderMasked {
+    fn from(p: Provider) -> Self {
+        let api_key_length = p.api_key.chars().count();
+        Self {
+            id: p.id,
+            name: p.name,
+            protocol: p.protocol,
+            base_url: p.base_url,
+            // 空字符串返回空, 否则与 secret 共用同一份脱敏算法.
+            api_key_masked: if p.api_key.is_empty() {
+                String::new()
+            } else {
+                mask_value(&p.api_key)
+            },
+            api_key_length,
+            enabled: p.enabled,
+        }
     }
 }

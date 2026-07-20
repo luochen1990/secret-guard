@@ -7,6 +7,14 @@
 //! 4. **可观测**: 每次请求都生成 [`ForwardRecord`], 包括错误路径下的 incomplete 标记.
 //! 5. **可插拔**: 后续 secret 改写只需在 "请求 body 收集后" 与 "响应 chunk 流出前" 两处插入 hook.
 //!
+//! # 路由策略
+//! URL = `/{proto_short}/{provider_id}/*path`, 由 [`ForwardPath`] 解析:
+//! - `proto_short` 决定 ingress 协议 (o/a/g/l).
+//! - `provider_id` 决定目标 provider (含 egress 协议).
+//! - 若 ingress == egress: identity passthrough, 透传到 `provider.base_url + path`.
+//! - 若 ingress != egress: 返回 501 (跨协议转换为未来工作).
+//! - 若 provider 不存在 / 被禁用: 返回 404 / 503.
+//!
 //! # 流式响应处理
 //! 用 mpsc channel 做扇出: 一个后台 task 读取上游 chunk, 同时写一份给客户端 channel
 //! 一份累积给记录. 顺序上**先 send 后 acc**, 让客户端反向压力能尽早传到上游.
@@ -16,7 +24,7 @@ use std::time::Instant;
 
 use axum::{
     body::{to_bytes, Body},
-    extract::{Request, State},
+    extract::{Path, Request, State},
     http::{HeaderMap, HeaderValue, Response, StatusCode},
     response::IntoResponse,
 };
@@ -26,6 +34,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, warn};
 
+use crate::provider::{Protocol, ProviderTable};
 use crate::record::{ForwardRecord, RecordStore, ResponseUpdate};
 use crate::redact::{redact_request, restore_response, RedactionMap};
 use crate::secrets::SecretTable;
@@ -34,9 +43,20 @@ use crate::secrets::SecretTable;
 #[derive(Clone, Debug)]
 pub struct ProxyState {
     pub upstream: reqwest::Client,
-    pub upstream_base: String,
+    pub providers: ProviderTable,
     pub records: RecordStore,
     pub secrets: SecretTable,
+}
+
+/// axum 路径参数: `/{proto}/{name}/{*rest}`.
+///
+/// `rest` 由 axum 的 catch-all 语法 (`{*rest}`) 提供, 含前导 `/`, 例如 `/v1/chat`.
+/// 若 URL 只到 `/{proto}/{name}` 则走 [`forward_no_rest`] 单独路由.
+#[derive(serde::Deserialize, Debug)]
+pub struct ForwardPath {
+    pub proto: String,
+    pub name: String,
+    pub rest: String,
 }
 
 /// hop-by-hop 或在反代语义下不应原样转发的 header (RFC 7230 §6.1 + 反代常识).
@@ -57,29 +77,83 @@ const MAX_REQ_BODY: usize = 16 * 1024 * 1024;
 /// 单条响应 body 累积记录的上限 (32 MiB).
 const MAX_RESP_BODY_RECORD: usize = 32 * 1024 * 1024;
 
-/// 主 handler: 接收任意方法 / 任意路径的请求, 透明转发到上游.
+/// 主 handler: 路径 `/{proto}/{name}/{*rest}`, 解析后透传到对应 provider.
 ///
-/// Redact 流程:
-/// 1. 收集请求 body.
-/// 2. 若 SecretTable 非空, 调用 [`redact_request`] 把 body 中的 secret 替换为 mock.
-///    记录在 [`ForwardRecord`] 中的是改写后的版本 (LLM 视角).
-/// 3. 若启用了 redact (`redaction_map` 非空), 上游响应走 buffered 路径:
-///    完整累积后 [`restore_response`] 反向替换再回传客户端 (失去流式 UX, 保证 mock→real
-///    映射正确). 否则走 streaming 路径透传, 保持最佳 UX.
-///    (流式 + chunk boundary 处理见第五步.)
+/// 路径段语义:
+/// - `proto` = ingress 协议的单字母简写 (o/a/g/l).
+/// - `name` = 目标 provider id.
+/// - `rest` = 上游 path (含前导 `/`), query string 单独从 uri 拼回.
+///
+/// MVP: 仅支持 ingress == provider.protocol (identity passthrough);
+/// 跨协议请求返回 501 Not Implemented.
 pub async fn forward(
     State(state): State<ProxyState>,
+    Path(fp): Path<ForwardPath>,
+    req: Request<Body>,
+) -> Result<Response<Body>, AppError> {
+    dispatch(state, fp, req).await
+}
+
+/// 路径只到 `/{proto}/{name}` (没有 rest 段) 的薄包装: 等价于 rest = "/".
+pub async fn forward_no_rest(
+    State(state): State<ProxyState>,
+    Path((proto, name)): Path<(String, String)>,
+    req: Request<Body>,
+) -> Result<Response<Body>, AppError> {
+    let fp = ForwardPath {
+        proto,
+        name,
+        rest: "/".to_string(),
+    };
+    dispatch(state, fp, req).await
+}
+
+async fn dispatch(
+    state: ProxyState,
+    fp: ForwardPath,
     req: Request<Body>,
 ) -> Result<Response<Body>, AppError> {
     let started = Instant::now();
     let (parts, body) = req.into_parts();
 
-    // 1. 收集请求 body (为 redact 与记录做准备).
+    // 1. 解析 ingress 协议.
+    let ingress = Protocol::from_short(&fp.proto).ok_or_else(|| {
+        AppError::NotFound(format!(
+            "unknown protocol '/{}' (expected one of: o/a/g/l)",
+            fp.proto
+        ))
+    })?;
+
+    // 2. 查找 provider.
+    let provider = state
+        .providers
+        .get(&fp.name)
+        .ok_or_else(|| AppError::NotFound(format!("unknown provider '/{}'", fp.name)))?;
+    if !provider.enabled {
+        return Err(AppError::Unavailable(format!(
+            "provider '{}' is disabled",
+            provider.id
+        )));
+    }
+
+    // 3. 协议匹配: MVP 仅支持 ingress == egress (identity passthrough).
+    if ingress != provider.protocol {
+        return Err(AppError::NotImplemented(format!(
+            "cross-protocol forwarding ({ingress} → {}) is not yet supported; \
+             use /{}/{}/* with a matching {} provider instead",
+            provider.protocol.name(),
+            ingress.short(),
+            provider.id,
+            ingress.name(),
+        )));
+    }
+
+    // 4. 收集请求 body (为 redact 与记录做准备).
     let req_bytes = to_bytes(body, MAX_REQ_BODY)
         .await
         .map_err(|e| AppError::BadBody(e.to_string()))?;
 
-    // 2. redact 请求 body (若 SecretTable 非空).
+    // 5. redact 请求 body (若 SecretTable 非空).
     let secrets_snapshot = state.secrets.snapshot();
     let (req_text_for_record, redaction_map): (String, RedactionMap) =
         if secrets_snapshot.is_empty() {
@@ -97,21 +171,29 @@ pub async fn forward(
         };
     let req_bytes_to_send = req_text_for_record.clone().into_bytes();
 
-    // 3. 构造上游 URL.
-    let path_and_query = parts
+    // 6. 构造上游 URL: provider.base_url + rest + ?query.
+    let query = parts
         .uri
-        .path_and_query()
-        .map(|p| p.as_str())
-        .unwrap_or("/");
-    let upstream_url = build_upstream_url(&state.upstream_base, path_and_query);
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    let upstream_url = build_upstream_url(&provider.base_url, &format!("{}{query}", fp.rest));
 
-    // 4. 复制请求 headers (剥离 hop-by-hop + Connection 列出的字段 + Host + Content-Length).
-    let fwd_headers = sanitize_request_headers(&parts.headers);
+    // 7. 复制请求 headers (剥离 hop-by-hop + Connection 列出的字段 + Host + Content-Length).
+    //    若 provider 配了 api_key, 用它覆盖 Authorization / x-api-key, 避免客户端漏传或泄露.
+    let mut fwd_headers = sanitize_request_headers(&parts.headers);
+    apply_provider_auth(&mut fwd_headers, &provider.api_key, ingress);
 
-    // 5. 记录请求快照 (LLM 视角的改写后版本).
+    // 8. 记录请求快照 (LLM 视角的改写后版本).
+    let path_for_record = format!(
+        "/{}/{}/{}",
+        fp.proto,
+        fp.name,
+        fp.rest.trim_start_matches('/')
+    );
     let req_snapshot = ForwardRecord::new(
         parts.method.as_str().to_string(),
-        parts.uri.path().to_string(),
+        path_for_record,
         redact_headers(&fwd_headers),
         req_text_for_record,
     );
@@ -119,7 +201,7 @@ pub async fn forward(
 
     debug!(%record_id, method = %parts.method, url = %upstream_url, "forwarding request");
 
-    // 6. 发送到上游 (失败时也写回 record, 标记 incomplete).
+    // 9. 发送到上游 (失败时也写回 record, 标记 incomplete).
     let upstream_resp = match state
         .upstream
         .request(parts.method, &upstream_url)
@@ -148,7 +230,7 @@ pub async fn forward(
         }
     };
 
-    // 7. 收集响应元数据.
+    // 10. 收集响应元数据.
     let resp_status = upstream_resp.status();
     let resp_headers = upstream_resp.headers().clone();
     let content_type = resp_headers
@@ -160,8 +242,8 @@ pub async fn forward(
 
     debug!(%record_id, status = %resp_status, streamed, "upstream responded");
 
-    // 8. 处理响应: 若启用 redact, 走 buffered (完整累积再 restore);
-    //    否则保持流式透传 (最佳 UX).
+    // 11. 处理响应: 若启用 redact, 走 buffered (完整累积再 restore);
+    //     否则保持流式透传 (最佳 UX).
     if redaction_map.is_empty() {
         fan_out_streaming(
             state.records.clone(),
@@ -185,6 +267,59 @@ pub async fn forward(
             redaction_map,
         })
         .await
+    }
+}
+
+/// 若 provider 配置了 api_key, 注入对应的 auth header.
+///
+/// 协议约定 (尊重各 provider 官方 SDK 的默认 header):
+/// - OpenAI / Ollama: `Authorization: Bearer <key>` (OpenAI 标准; Ollama 1.17+ 也支持).
+/// - Anthropic: `x-api-key: <key>`.
+/// - Gemini: `x-goog-api-key: <key>` (Google API 官方约定; 不用 Bearer 避免与 OAuth 流程混淆).
+///
+/// 若客户端已自带对应 header, provider 的 api_key 覆盖之 — provider 配置优先.
+/// 同步剥离客户端可能误传的竞争 header (如用 OpenAI ingress 时清除 `x-api-key`,
+/// 防止上游误识别).
+fn apply_provider_auth(headers: &mut HeaderMap, api_key: &str, ingress: Protocol) {
+    let key = api_key.trim();
+    if key.is_empty() {
+        return;
+    }
+    // 目标 header 名 + 客户端可能误传的竞争 header 名 (统一剥离) + value 构造.
+    // OpenAI/Ollama 用 `Bearer <key>` 格式; Anthropic/Gemini 用裸 key.
+    let (target, competitors, value_str): (&'static str, &[&'static str], String) = match ingress {
+        Protocol::OpenAI | Protocol::Ollama => (
+            "authorization",
+            &["x-api-key", "x-goog-api-key"][..],
+            format!("Bearer {key}"),
+        ),
+        Protocol::Anthropic => (
+            "x-api-key",
+            &["authorization", "x-goog-api-key"][..],
+            key.to_string(),
+        ),
+        Protocol::Gemini => (
+            "x-goog-api-key",
+            &["authorization", "x-api-key"][..],
+            key.to_string(),
+        ),
+    };
+    for c in competitors {
+        headers.remove(*c);
+    }
+    match HeaderValue::from_str(&value_str) {
+        Ok(v) => {
+            headers.insert(target, v);
+        }
+        Err(e) => {
+            // api_key 含非法 HTTP header 字符 (控制字符 / 非 ASCII 等).
+            // 这通常是配置错误, 记 warn 让运维注意到; 不插入 header 让上游自行拒绝.
+            warn!(
+                error = %e,
+                target,
+                "provider api_key contains illegal header chars; skipping auth injection"
+            );
+        }
     }
 }
 
@@ -353,6 +488,12 @@ pub enum AppError {
     BadBody(String),
     #[error("upstream error: {0}")]
     Upstream(String),
+    #[error("not found: {0}")]
+    NotFound(String),
+    #[error("service unavailable: {0}")]
+    Unavailable(String),
+    #[error("not implemented: {0}")]
+    NotImplemented(String),
     #[error("internal: {0}")]
     Internal(String),
 }
@@ -360,19 +501,39 @@ pub enum AppError {
 #[derive(serde::Serialize)]
 struct ErrorBody {
     error: &'static str,
+    /// 人类可读的额外说明 (不泄露内部细节, 仅描述协议 / 路由层面的常见错误).
+    message: Option<String>,
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response<Body> {
-        let (status, kind) = match &self {
-            AppError::BadBody(_) => (StatusCode::BAD_REQUEST, "bad_request"),
-            AppError::Upstream(_) => (StatusCode::BAD_GATEWAY, "upstream_error"),
-            AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+        // 内部错误细节仅记录到日志, 不回写到响应 (避免信息泄露 — reqwest::Error 等通常
+        // 含完整上游 URL, 直接返回给客户端会暴露内部拓扑).
+        // 因此 Upstream / BadBody / Internal 的 message 字段用 None (客户端只看到 kind);
+        // NotFound / Unavailable / NotImplemented 的 message 描述协议/路由层面的问题,
+        // 信息量对客户端排查有用且不含敏感字段, 原样返回.
+        let (status, kind, message) = match &self {
+            AppError::BadBody(_) => (StatusCode::BAD_REQUEST, "bad_request", None),
+            AppError::Upstream(_) => (StatusCode::BAD_GATEWAY, "upstream_error", None),
+            AppError::NotFound(m) => (StatusCode::NOT_FOUND, "not_found", Some(m.clone())),
+            AppError::Unavailable(m) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                Some(m.clone()),
+            ),
+            AppError::NotImplemented(m) => (
+                StatusCode::NOT_IMPLEMENTED,
+                "not_implemented",
+                Some(m.clone()),
+            ),
+            AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal", None),
         };
-        // 内部错误细节仅记录到日志, 不回写到响应 (避免信息泄露 + 避免 JSON 注入).
         error!(error = %self, kind, "proxy error");
-        let body = serde_json::to_vec(&ErrorBody { error: kind })
-            .unwrap_or_else(|_| b"{\"error\":\"internal\"}".to_vec());
+        let body = serde_json::to_vec(&ErrorBody {
+            error: kind,
+            message,
+        })
+        .unwrap_or_else(|_| b"{\"error\":\"internal\"}".to_vec());
         let mut resp = Response::new(Body::from(body));
         *resp.status_mut() = status;
         resp.headers_mut().insert(
@@ -494,6 +655,15 @@ mod tests {
     }
 
     #[test]
+    fn build_upstream_url_handles_empty_rest() {
+        // 路径只到 /{proto}/{name} 时 rest = "/".
+        assert_eq!(
+            build_upstream_url("https://api.example.com", "/?q=1"),
+            "https://api.example.com/?q=1"
+        );
+    }
+
+    #[test]
     fn sanitize_strips_hop_by_hop_and_host() {
         let mut src = HeaderMap::new();
         src.insert("host", "example.com".parse().unwrap());
@@ -555,5 +725,54 @@ mod tests {
         let bad = &[0xFF, 0xFE, 0x00];
         let s = utf8_view(bad);
         assert!(s.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn apply_provider_auth_openai_uses_bearer() {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", "Bearer client-token".parse().unwrap());
+        apply_provider_auth(&mut h, "sk-server-side", Protocol::OpenAI);
+        assert_eq!(h.get("authorization").unwrap(), "Bearer sk-server-side");
+    }
+
+    #[test]
+    fn apply_provider_auth_anthropic_uses_x_api_key() {
+        let mut h = HeaderMap::new();
+        h.insert("x-api-key", "client-key".parse().unwrap());
+        apply_provider_auth(&mut h, "sk-ant-server", Protocol::Anthropic);
+        assert_eq!(h.get("x-api-key").unwrap(), "sk-ant-server");
+    }
+
+    #[test]
+    fn apply_provider_auth_gemini_uses_x_goog_api_key() {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", "Bearer client-tok".parse().unwrap());
+        apply_provider_auth(&mut h, "ya29.server", Protocol::Gemini);
+        // Gemini 用 x-goog-api-key, 不用 Authorization Bearer.
+        assert_eq!(h.get("x-goog-api-key").unwrap(), "ya29.server");
+        assert!(
+            h.get("authorization").is_none(),
+            "must clear competing header"
+        );
+    }
+
+    #[test]
+    fn apply_provider_auth_strips_competing_headers() {
+        // 客户端误传了竞争对手协议的 header, 应被剥离.
+        let mut h = HeaderMap::new();
+        h.insert("x-api-key", "client-anthropic".parse().unwrap());
+        h.insert("x-goog-api-key", "client-gemini".parse().unwrap());
+        apply_provider_auth(&mut h, "sk-server", Protocol::OpenAI);
+        assert_eq!(h.get("authorization").unwrap(), "Bearer sk-server");
+        assert!(h.get("x-api-key").is_none());
+        assert!(h.get("x-goog-api-key").is_none());
+    }
+
+    #[test]
+    fn apply_provider_auth_skips_empty_key() {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", "Bearer keep-me".parse().unwrap());
+        apply_provider_auth(&mut h, "   ", Protocol::OpenAI);
+        assert_eq!(h.get("authorization").unwrap(), "Bearer keep-me");
     }
 }

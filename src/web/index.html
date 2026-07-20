@@ -163,6 +163,8 @@
       display: flex;
       justify-content: space-between;
       align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
     }
     dialog#secret-form {
       border: 1px solid #888;
@@ -195,6 +197,42 @@
       justify-content: flex-end;
       margin-top: 8px;
     }
+    dialog#provider-form {
+      padding: 16px;
+      width: 480px;
+    }
+    dialog#provider-form form {
+      display: grid;
+      grid-template-columns: 100px 1fr;
+      gap: 8px;
+      align-items: center;
+    }
+    dialog#provider-form form input[type=text],
+    dialog#provider-form form input[type=password],
+    dialog#provider-form form select {
+      width: 100%;
+      font: inherit;
+      padding: 4px 6px;
+      border: 1px solid #aaa;
+      border-radius: 3px;
+    }
+    dialog#provider-form .actions {
+      grid-column: 2;
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end;
+      margin-top: 8px;
+    }
+    .hint {
+      color: #777;
+      font-size: 11px;
+      flex: 1;
+    }
+    .hint code {
+      background: #eee;
+      padding: 1px 4px;
+      border-radius: 2px;
+    }
   </style>
 </head>
 <body>
@@ -210,6 +248,7 @@
   <nav class="tabs">
     <a class="tab active" data-tab="records">Records</a>
     <a class="tab" data-tab="secrets">Secrets</a>
+    <a class="tab" data-tab="providers">Providers</a>
   </nav>
   <main>
     <section id="tab-records" class="tab-content active">
@@ -239,6 +278,31 @@
         </table>
       </div>
     </section>
+    <section id="tab-providers" class="tab-content">
+      <div class="secrets-main">
+        <div class="secrets-toolbar">
+          <span><span id="providers-count">0</span> providers</span>
+          <span class="hint">URL pattern: <code>/{proto-short}/{provider-id}/*</code> · o=OpenAI, a=Anthropic, g=Gemini, l=oLLama</span>
+          <button class="btn" onclick="openProviderForm()">+ new provider</button>
+        </div>
+        <table class="secrets">
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Name</th>
+              <th>Protocol</th>
+              <th>Base URL</th>
+              <th>API Key (masked)</th>
+              <th>Enabled</th>
+              <th class="actions">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="providers-body">
+            <tr><td colspan="7" class="empty">No providers configured</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
   </main>
 
   <dialog id="secret-form">
@@ -259,15 +323,41 @@
     </form>
   </dialog>
 
+  <dialog id="provider-form">
+    <form method="dialog" id="provider-form-el">
+      <h3 style="grid-column: 1 / -1; margin: 0 0 8px 0;" id="provider-form-title">New provider</h3>
+      <label for="p-id">ID</label>
+      <input type="text" id="p-id" placeholder="unique slug, e.g. openai-main">
+      <label for="p-name">Name</label>
+      <input type="text" id="p-name" placeholder="(optional)">
+      <label for="p-protocol">Protocol</label>
+      <select id="p-protocol"></select>
+      <label for="p-base-url">Base URL</label>
+      <input type="text" id="p-base-url" placeholder="https://api.openai.com (no trailing /)">
+      <label for="p-api-key">API Key</label>
+      <input type="password" id="p-api-key" placeholder="(optional for local providers like Ollama)">
+      <label for="p-enabled">Enabled</label>
+      <input type="checkbox" id="p-enabled" checked>
+      <div class="actions">
+        <button class="btn" value="cancel">Cancel</button>
+        <button class="btn" value="save" id="p-save">Save</button>
+      </div>
+    </form>
+  </dialog>
+
   <script>
     // 集中管理 API URL, 避免字面量重复 (第三步加入 secrets 时不易拷错).
     const API_RECORDS = '/__sg/api/records';
     const API_SECRETS = '/__sg/api/secrets';
+    const API_PROVIDERS = '/__sg/api/providers';
 
     let records = [];
     let selectedId = null;
     let secretsList = [];
     let secretCategories = [];
+    let providersList = [];
+    let providerProtocols = [];
+    let providerShorts = [];
 
     // ─── tabs ──────────────────────────────────────────────────────────────
     document.querySelectorAll('nav.tabs a.tab').forEach(tab => {
@@ -277,6 +367,7 @@
         tab.classList.add('active');
         document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
         if (tab.dataset.tab === 'secrets') refreshSecrets();
+        if (tab.dataset.tab === 'providers') refreshProviders();
       });
     });
 
@@ -526,12 +617,141 @@
       }
     }
 
+    // ─── providers tab ────────────────────────────────────────────────────
+    async function refreshProviders() {
+      try {
+        const r = await fetch(API_PROVIDERS, { cache: 'no-store' });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const data = await r.json();
+        providersList = data.providers || [];
+        providerProtocols = data.protocols || [];
+        providerShorts = data.shorts || [];
+        renderProviders();
+      } catch (e) {
+        console.error(e);
+        setStatus('providers refresh failed', 'status-err');
+      }
+    }
+
+    function renderProviders() {
+      document.getElementById('providers-count').textContent = providersList.length;
+      const body = document.getElementById('providers-body');
+      if (providersList.length === 0) {
+        body.innerHTML = '<tr><td colspan="7" class="empty">No providers configured</td></tr>';
+        return;
+      }
+      body.innerHTML = providersList.map(p => `
+        <tr data-id="${escapeHtml(p.id)}">
+          <td><code>${escapeHtml(p.id)}</code></td>
+          <td>${escapeHtml(p.name || '')}</td>
+          <td><span class="pill">${escapeHtml(p.protocol)}</span></td>
+          <td><code>${escapeHtml(p.base_url)}</code></td>
+          <td><code>${escapeHtml(p.api_key_masked || '(none)')}</code></td>
+          <td>${p.enabled ? '✓' : '<span class="status-err">✗</span>'}</td>
+          <td class="actions">
+            <button class="btn" data-action="edit" data-id="${escapeHtml(p.id)}">edit</button>
+            <button class="btn btn-danger" data-action="delete" data-id="${escapeHtml(p.id)}">delete</button>
+          </td>
+        </tr>
+      `).join('');
+    }
+
+    document.getElementById('providers-body').addEventListener('click', (e) => {
+      const btn = e.target.closest('button[data-action]');
+      if (!btn) return;
+      const id = btn.dataset.id;
+      if (btn.dataset.action === 'edit') editProvider(id);
+      else if (btn.dataset.action === 'delete') deleteProvider(id);
+    });
+
+    function populateProtocolSelect() {
+      const sel = document.getElementById('p-protocol');
+      sel.innerHTML = providerProtocols.map(p => `<option value="${escapeHtml(p)}">${escapeHtml(p)}</option>`).join('');
+    }
+
+    function openProviderForm(existing) {
+      populateProtocolSelect();
+      const dlg = document.getElementById('provider-form');
+      const title = document.getElementById('provider-form-title');
+      const saveBtn = document.getElementById('p-save');
+      const idInput = document.getElementById('p-id');
+      idInput.value = existing?.id || '';
+      idInput.disabled = !!existing;
+      document.getElementById('p-name').value = existing?.name || '';
+      document.getElementById('p-protocol').value = existing?.protocol || providerProtocols[0] || 'openai';
+      document.getElementById('p-base-url').value = existing?.base_url || '';
+      document.getElementById('p-api-key').value = ''; // 始终清空, 避免泄露; 留空则 PUT 时不更新 key
+      document.getElementById('p-enabled').checked = existing ? existing.enabled : true;
+      title.textContent = existing ? `Edit provider ${existing.id}` : 'New provider';
+      dlg.dataset.editId = existing ? existing.id : '';
+      saveBtn.textContent = existing ? 'Update' : 'Create';
+      dlg.showModal();
+    }
+
+    document.getElementById('provider-form-el').addEventListener('submit', async (ev) => {
+      const dlg = document.getElementById('provider-form');
+      const btn = ev.submitter;
+      if (!btn || btn.value !== 'save') return;
+      const editId = dlg.dataset.editId;
+      const apiKey = document.getElementById('p-api-key').value;
+      const payload = {
+        id: document.getElementById('p-id').value.trim() || null,
+        name: document.getElementById('p-name').value.trim() || null,
+        protocol: document.getElementById('p-protocol').value,
+        base_url: document.getElementById('p-base-url').value.trim(),
+        enabled: document.getElementById('p-enabled').checked,
+      };
+      // 新建必填 api_key; 编辑模式下空字符串表示不更新 (后端会以空字符串覆盖).
+      // MVP 简化: 显式让用户重输; 留空就传空字符串 (适用于 Ollama 等无 auth 场景).
+      payload.api_key = apiKey;
+      try {
+        const url = editId ? `${API_PROVIDERS}/${encodeURIComponent(editId)}` : API_PROVIDERS;
+        const method = editId ? 'PUT' : 'POST';
+        const r = await fetch(url, {
+          method,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        if (!r.ok) {
+          const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+          alert('Failed: ' + (err.error || r.status));
+          return;
+        }
+        await refreshProviders();
+        dlg.close();
+      } catch (e) {
+        alert('Error: ' + e.message);
+      }
+    });
+
+    function editProvider(id) {
+      const p = providersList.find(x => x.id === id);
+      if (!p) return;
+      openProviderForm(p);
+    }
+
+    async function deleteProvider(id) {
+      if (!confirm(`Delete provider ${id}?`)) return;
+      try {
+        const r = await fetch(`${API_PROVIDERS}/${encodeURIComponent(id)}`, { method: 'DELETE' });
+        if (!r.ok && r.status !== 204) {
+          const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+          alert('Failed: ' + (err.error || r.status));
+          return;
+        }
+        await refreshProviders();
+      } catch (e) {
+        alert('Error: ' + e.message);
+      }
+    }
+
     // ─── bootstrap ────────────────────────────────────────────────────────
     refresh();
     setInterval(() => {
       if (document.getElementById('auto').checked) {
         const active = document.querySelector('.tab-content.active')?.id;
         if (active === 'tab-secrets') refreshSecrets();
+        else if (active === 'tab-providers') refreshProviders();
         else refresh();
       }
     }, 3000);

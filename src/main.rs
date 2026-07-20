@@ -27,14 +27,13 @@ async fn main() -> Result<()> {
     let cfg = Config::load_or_default(&args.config)?;
     let host = args.host.unwrap_or(cfg.server.host);
     let port = args.port.unwrap_or(cfg.server.port);
-    let upstream = args.upstream.unwrap_or(cfg.upstream.base);
     let records_capacity = cfg.server.records_capacity;
 
     tracing::info!(
         listen = format!("{host}:{port}"),
-        upstream = %upstream,
         config = ?args.config,
         records_capacity,
+        providers_count = cfg.providers.len(),
         secrets_count = cfg.secrets.entries.len(),
         "starting secret-guard"
     );
@@ -42,9 +41,9 @@ async fn main() -> Result<()> {
     server::serve(
         &host,
         port,
-        upstream,
         records_capacity,
         args.config.clone(),
+        cfg.providers,
         cfg.secrets.entries,
     )
     .await

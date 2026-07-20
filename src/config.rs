@@ -1,12 +1,14 @@
 //! 配置文件 schema (TOML + serde).
 //!
-//! MVP 阶段暴露最小字段集: 监听地址、上游 URL、记录容量、secret 注册表.
-//! Secret 注册表与运行时 [`crate::secrets::SecretTable`] 共享同一份 `Vec<SecretEntry>`.
+//! 暴露字段集: 监听地址、记录容量、providers 列表、secrets 列表.
+//! - `providers` 与运行时 [`crate::provider::ProviderTable`] 共享同一份 `Vec<Provider>`.
+//! - `secrets` 与运行时 [`crate::secrets::SecretTable`] 共享同一份 `Vec<SecretEntry>`.
 
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::provider::Provider;
 use crate::secrets::SecretEntry;
 
 /// 顶层配置.
@@ -16,9 +18,9 @@ pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
 
-    /// 上游 LLM Provider.
+    /// LLM provider 列表 (替代旧版单一 `upstream`).
     #[serde(default)]
-    pub upstream: UpstreamConfig,
+    pub providers: Vec<Provider>,
 
     /// Secret 注册表.
     #[serde(default)]
@@ -40,21 +42,6 @@ impl Default for ServerConfig {
             host: "127.0.0.1".to_string(),
             port: 8787,
             records_capacity: 1024,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct UpstreamConfig {
-    /// LLM Provider base URL, 末尾不带 `/`.
-    pub base: String,
-}
-
-impl Default for UpstreamConfig {
-    fn default() -> Self {
-        Self {
-            base: "https://api.anthropic.com".to_string(),
         }
     }
 }

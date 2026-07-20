@@ -30,10 +30,6 @@ pub struct RunArgs {
     #[arg(long, env = "SG_PORT")]
     pub port: Option<u16>,
 
-    /// 上游 LLM Provider base URL (例如 https://api.anthropic.com).
-    #[arg(long, env = "SG_UPSTREAM")]
-    pub upstream: Option<String>,
-
     /// 配置文件路径 (TOML).
     #[arg(
         long,
@@ -49,7 +45,6 @@ impl Default for RunArgs {
         Self {
             host: None,
             port: None,
-            upstream: None,
             // default 值仅用于 "未传子命令也启动" 的兜底, 实际 config 路径仍以 CLI/env 为准.
             config: std::path::PathBuf::from("secret-guard.toml"),
         }

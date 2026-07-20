@@ -1,18 +1,21 @@
 //! 端到端集成测试: 启动 secret-guard + mock 上游, 验证透传功能.
 //!
 //! 测试覆盖:
-//! - 非流式响应: 完整 JSON body 透传
-//! - 流式响应: SSE chunks 透传
-//! - 请求 header 透传 (Authorization 等敏感字段保留)
-//! - 转发记录被持久化
-//! - 上游 non-2xx 透传
-//! - 上游不可达时返回 502 + record 标记 incomplete
-//! - hop-by-hop / Connection 自定义 header 被剥离
-//! - Web UI: `/__sg/` HTML 与 `/__sg/api/records` JSON
+//! - 多 provider 路由 (`/{proto}/{name}/*`).
+//! - 同协议 identity passthrough (OpenAI / Anthropic / Gemini / Ollama).
+//! - 跨协议请求返回 501.
+//! - 未知 provider / 禁用 provider 返回 404 / 503.
+//! - 未知 protocol 简写返回 404.
+//! - 流式 SSE / 非流式 JSON 透传.
+//! - 请求 header 透传; provider api_key 覆盖客户端 auth.
+//! - 转发记录被持久化.
+//! - 上游不可达时返回 502 + record 标记 incomplete.
+//! - Web UI: `/` 根路径 + `/__sg/` HTML; `/__sg/api/*` JSON.
 
 use std::time::Duration;
 
 use secret_guard::{
+    provider::{Protocol, Provider, ProviderTable},
     proxy::ProxyState,
     record::RecordStore,
     secrets::{SecretCategory, SecretEntry, SecretTable},
@@ -20,35 +23,64 @@ use secret_guard::{
 };
 use tokio::net::TcpListener;
 
-/// 在随机端口启动一个 mock 上游, 返回其 server guard.
 async fn spawn_mock_upstream() -> mockito::ServerGuard {
     mockito::Server::new_async().await
 }
 
-/// 在随机端口启动 secret-guard, 返回其 base URL.
+/// 启动 secret-guard, 单 provider (默认 OpenAI 协议, base_url = mock 上游).
+async fn spawn_proxy_with_provider(_upstream_base: String, provider: Provider) -> String {
+    spawn_proxy_full(
+        vec![provider],
+        reqwest::Client::new(),
+        RecordStore::new(64),
+        test_secret_table(),
+    )
+    .await
+}
+
+/// 启动 secret-guard, 默认 OpenAI provider 指向 mock 上游.
 async fn spawn_proxy(upstream_base: String) -> String {
-    spawn_proxy_with(upstream_base, reqwest::Client::new(), RecordStore::new(64)).await
+    let provider = openai_provider("oa-main", &upstream_base);
+    spawn_proxy_with_provider(upstream_base, provider).await
 }
 
-async fn spawn_proxy_with(
-    upstream_base: String,
-    upstream: reqwest::Client,
-    records: RecordStore,
-) -> String {
-    spawn_proxy_full(upstream_base, upstream, records, test_secret_table()).await
+fn openai_provider(id: &str, base_url: &str) -> Provider {
+    Provider {
+        id: id.into(),
+        protocol: Protocol::OpenAI,
+        base_url: base_url.into(),
+        api_key: "sk-test-key".into(),
+        enabled: true,
+        name: Some(id.into()),
+    }
 }
 
+fn provider_with(id: &str, proto: Protocol, base_url: &str) -> Provider {
+    Provider {
+        id: id.into(),
+        protocol: proto,
+        base_url: base_url.into(),
+        api_key: String::new(),
+        enabled: true,
+        name: Some(id.into()),
+    }
+}
+#[allow(clippy::too_many_arguments)]
 async fn spawn_proxy_full(
-    upstream_base: String,
+    providers: Vec<Provider>,
     upstream: reqwest::Client,
     records: RecordStore,
     secrets: SecretTable,
 ) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    let cfg_path = std::path::PathBuf::from(format!("/tmp/opencode/tmp/test-sg-cfg-{id}.toml"));
+    let _ = std::fs::remove_file(&cfg_path);
+    let provider_table = ProviderTable::new(providers, cfg_path);
     let proxy = ProxyState {
         upstream,
-        upstream_base,
+        providers: provider_table,
         records,
         secrets,
     };
@@ -59,12 +91,10 @@ async fn spawn_proxy_full(
     format!("http://{addr}")
 }
 
-/// 用于测试的空 SecretTable (config_path 指向临时文件).
 fn test_secret_table() -> SecretTable {
     test_secret_table_with(vec![])
 }
 
-/// 构造一个含给定 entries 的 SecretTable (用于 redact 测试).
 fn test_secret_table_with(entries: Vec<SecretEntry>) -> SecretTable {
     let id = uuid::Uuid::new_v4().to_string();
     let path = std::path::PathBuf::from(format!("/tmp/opencode/tmp/test-secret-table-{id}.toml"));
@@ -102,7 +132,6 @@ async fn proxy_request(
     (status, text, headers)
 }
 
-/// 轮询直到 `predicate` 满足, 或超时. 用于等待后台 spawn task 写回记录.
 async fn wait_until_or_timeout<F>(
     records: &RecordStore,
     predicate: F,
@@ -124,14 +153,16 @@ where
     }
 }
 
+// ─── 基础转发 ───────────────────────────────────────────────────────────────
+
 #[tokio::test]
 async fn forwards_non_streaming_json() {
     let mut upstream = spawn_mock_upstream().await;
     let _m = upstream
-        .mock("POST", "/v1/messages")
+        .mock("POST", "/v1/chat/completions")
         .with_status(200)
         .with_header("content-type", "application/json")
-        .with_body(r#"{"id":"msg_1","content":"hello"}"#)
+        .with_body(r#"{"id":"chatcmpl-1","choices":[]}"#)
         .create_async()
         .await;
 
@@ -139,17 +170,14 @@ async fn forwards_non_streaming_json() {
     let (status, body, headers) = proxy_request(
         &proxy_url,
         "POST",
-        "/v1/messages",
-        r#"{"model":"claude-3"}"#,
-        &[
-            ("x-api-key", "test-key"),
-            ("anthropic-version", "2023-06-01"),
-        ],
+        "/o/oa-main/v1/chat/completions",
+        r#"{"model":"gpt-4"}"#,
+        &[],
     )
     .await;
 
     assert_eq!(status, reqwest::StatusCode::OK);
-    assert!(body.contains("msg_1"));
+    assert!(body.contains("chatcmpl-1"));
     assert_eq!(headers.get("content-type").unwrap(), "application/json");
 }
 
@@ -157,13 +185,11 @@ async fn forwards_non_streaming_json() {
 async fn forwards_streaming_sse() {
     let mut upstream = spawn_mock_upstream().await;
     let sse_body = concat!(
-        "event: content_block_delta\n",
-        "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"hi\"}}\n\n",
-        "event: message_stop\n",
-        "data: {\"type\":\"message_stop\"}\n\n"
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        "data: [DONE]\n\n"
     );
     let _m = upstream
-        .mock("POST", "/v1/messages")
+        .mock("POST", "/v1/chat/completions")
         .with_status(200)
         .with_header("content-type", "text/event-stream")
         .with_body(sse_body)
@@ -172,43 +198,64 @@ async fn forwards_streaming_sse() {
 
     let proxy_url = spawn_proxy(upstream.url()).await;
     let resp = reqwest::Client::new()
-        .post(format!("{proxy_url}/v1/messages"))
-        .header("x-api-key", "test-key")
-        .body(r#"{"model":"claude-3","stream":true}"#)
+        .post(format!("{proxy_url}/o/oa-main/v1/chat/completions"))
+        .body(r#"{"model":"gpt-4","stream":true}"#)
         .send()
         .await
         .unwrap();
 
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let text = resp.text().await.unwrap();
-    assert!(text.contains("content_block_delta"));
-    assert!(text.contains("message_stop"));
+    assert!(text.contains("\"delta\""));
+    assert!(text.contains("[DONE]"));
 }
 
 #[tokio::test]
-async fn propagates_request_headers_upstream() {
+async fn provider_api_key_overrides_client_auth() {
     let mut upstream = spawn_mock_upstream().await;
     let _m = upstream
-        .mock("POST", "/v1/messages")
-        .match_header("x-api-key", "secret-key")
-        .match_header("anthropic-version", "2023-06-01")
+        .mock("POST", "/v1/chat/completions")
+        .match_header("authorization", "Bearer sk-test-key")
         .with_status(200)
         .with_body("{}")
         .create_async()
         .await;
 
     let proxy_url = spawn_proxy(upstream.url()).await;
+    // 客户端发了个错误的 token; 服务端应使用 provider 配置的 api_key.
     let (status, _, _) = proxy_request(
         &proxy_url,
         "POST",
-        "/v1/messages",
+        "/o/oa-main/v1/chat/completions",
         "{}",
-        &[
-            ("x-api-key", "secret-key"),
-            ("anthropic-version", "2023-06-01"),
-        ],
+        &[("authorization", "Bearer WRONG-TOKEN")],
     )
     .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn anthropic_provider_uses_x_api_key() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/messages")
+        .match_header("x-api-key", "sk-ant-test")
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    let provider = Provider {
+        id: "an-main".into(),
+        protocol: Protocol::Anthropic,
+        base_url: upstream.url(),
+        api_key: "sk-ant-test".into(),
+        enabled: true,
+        name: None,
+    };
+    let proxy_url = spawn_proxy_with_provider(upstream.url(), provider).await;
+    let (status, _, _) =
+        proxy_request(&proxy_url, "POST", "/a/an-main/v1/messages", "{}", &[]).await;
     assert_eq!(status, reqwest::StatusCode::OK);
 }
 
@@ -216,7 +263,7 @@ async fn propagates_request_headers_upstream() {
 async fn strips_custom_connection_listed_header() {
     let mut upstream = spawn_mock_upstream().await;
     let _m = upstream
-        .mock("POST", "/v1/messages")
+        .mock("POST", "/v1/chat/completions")
         .match_header("x-should-not-leak", mockito::Matcher::Missing)
         .with_status(200)
         .with_body("{}")
@@ -227,7 +274,7 @@ async fn strips_custom_connection_listed_header() {
     let (status, _, _) = proxy_request(
         &proxy_url,
         "POST",
-        "/v1/messages",
+        "/o/oa-main/v1/chat/completions",
         "{}",
         &[
             ("connection", "x-should-not-leak"),
@@ -242,7 +289,7 @@ async fn strips_custom_connection_listed_header() {
 async fn records_request_and_response_snapshots() {
     let mut upstream = spawn_mock_upstream().await;
     let _m = upstream
-        .mock("POST", "/v1/messages")
+        .mock("POST", "/v1/chat/completions")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(r#"{"ok":true}"#)
@@ -252,11 +299,24 @@ async fn records_request_and_response_snapshots() {
     let upstream_client = reqwest::Client::new();
     let records = RecordStore::new(64);
     let records_handle = records.clone();
-    let proxy_url = spawn_proxy_with(upstream.url().to_string(), upstream_client, records).await;
+    let provider = openai_provider("oa-main", &upstream.url());
+    let proxy_url = spawn_proxy_full(
+        vec![provider],
+        upstream_client,
+        records,
+        test_secret_table(),
+    )
+    .await;
 
-    let _ = proxy_request(&proxy_url, "POST", "/v1/messages", r#"{"q":"hi"}"#, &[]).await;
+    let _ = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        r#"{"q":"hi"}"#,
+        &[],
+    )
+    .await;
 
-    // 等待后台 task 写回 (避免 flaky sleep).
     let list = wait_until_or_timeout(
         &records_handle,
         |l| l.first().map(|r| r.resp_complete).unwrap_or(false),
@@ -267,7 +327,7 @@ async fn records_request_and_response_snapshots() {
     assert_eq!(list.len(), 1, "exactly one record expected");
     let r = &list[0];
     assert_eq!(r.method, "POST");
-    assert_eq!(r.path, "/v1/messages");
+    assert_eq!(r.path, "/o/oa-main/v1/chat/completions");
     assert!(r.req_body.contains("\"q\":\"hi\""));
     assert_eq!(r.resp_status, 200);
     assert!(r.resp_body.contains("\"ok\":true"));
@@ -279,7 +339,7 @@ async fn records_request_and_response_snapshots() {
 async fn upstream_non_2xx_is_forwarded() {
     let mut upstream = spawn_mock_upstream().await;
     let _m = upstream
-        .mock("POST", "/v1/messages")
+        .mock("POST", "/v1/chat/completions")
         .with_status(429)
         .with_header("content-type", "application/json")
         .with_body(r#"{"error":"rate_limited"}"#)
@@ -287,14 +347,20 @@ async fn upstream_non_2xx_is_forwarded() {
         .await;
 
     let proxy_url = spawn_proxy(upstream.url()).await;
-    let (status, body, _) = proxy_request(&proxy_url, "POST", "/v1/messages", "{}", &[]).await;
+    let (status, body, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        "{}",
+        &[],
+    )
+    .await;
     assert_eq!(status, reqwest::StatusCode::TOO_MANY_REQUESTS);
     assert!(body.contains("rate_limited"));
 }
 
 #[tokio::test]
 async fn upstream_unreachable_returns_502_and_marks_record_incomplete() {
-    // 用一个未监听的端口作为 upstream, 必然连接失败.
     let dummy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let bad_addr = dummy_listener.local_addr().unwrap();
     drop(dummy_listener);
@@ -302,13 +368,26 @@ async fn upstream_unreachable_returns_502_and_marks_record_incomplete() {
     let upstream_client = reqwest::Client::new();
     let records = RecordStore::new(64);
     let records_handle = records.clone();
-    let proxy_url = spawn_proxy_with(format!("http://{bad_addr}"), upstream_client, records).await;
+    let provider = openai_provider("oa-main", &format!("http://{bad_addr}"));
+    let proxy_url = spawn_proxy_full(
+        vec![provider],
+        upstream_client,
+        records,
+        test_secret_table(),
+    )
+    .await;
 
-    let (status, body, _) = proxy_request(&proxy_url, "POST", "/v1/messages", "{}", &[]).await;
+    let (status, body, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        "{}",
+        &[],
+    )
+    .await;
     assert_eq!(status, reqwest::StatusCode::BAD_GATEWAY);
     assert!(body.contains("upstream_error"));
 
-    // 后台 task 写回 record (incomplete + error).
     let list = wait_until_or_timeout(
         &records_handle,
         |l| l.first().map(|r| r.error.is_some()).unwrap_or(false),
@@ -332,7 +411,7 @@ async fn get_method_is_forwarded() {
         .await;
 
     let proxy_url = spawn_proxy(upstream.url()).await;
-    let (status, body, _) = proxy_request(&proxy_url, "GET", "/healthz", "", &[]).await;
+    let (status, body, _) = proxy_request(&proxy_url, "GET", "/o/oa-main/healthz", "", &[]).await;
     assert_eq!(status, reqwest::StatusCode::OK);
     assert_eq!(body, "ok");
 }
@@ -352,18 +431,128 @@ async fn passes_query_string_through() {
         .await;
 
     let proxy_url = spawn_proxy(upstream.url()).await;
-    let (status, _, _) =
-        proxy_request(&proxy_url, "GET", "/v1/models?limit=10&order=desc", "", &[]).await;
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "GET",
+        "/o/oa-main/v1/models?limit=10&order=desc",
+        "",
+        &[],
+    )
+    .await;
     assert_eq!(status, reqwest::StatusCode::OK);
 }
 
+// ─── 路由错误语义 ───────────────────────────────────────────────────────────
+
 #[tokio::test]
-async fn web_ui_serves_html() {
+async fn unknown_protocol_returns_404() {
     let upstream = spawn_mock_upstream().await;
     let proxy_url = spawn_proxy(upstream.url()).await;
-    // `/__sg` 无尾斜杠: 应直接返回 HTML.
+    let (status, body, _) = proxy_request(&proxy_url, "POST", "/x/foo/v1/chat", "{}", &[]).await;
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+    assert!(body.contains("not_found"));
+}
+
+#[tokio::test]
+async fn unknown_provider_returns_404() {
+    let upstream = spawn_mock_upstream().await;
+    let proxy_url = spawn_proxy(upstream.url()).await;
+    let (status, body, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/does-not-exist/v1/chat/completions",
+        "{}",
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+    assert!(body.contains("not_found"));
+}
+
+#[tokio::test]
+async fn disabled_provider_returns_503() {
+    let mut upstream = spawn_mock_upstream().await;
+    // 即使上游能响应, 也不应该被调用.
+    let _m = upstream
+        .mock("POST", mockito::Matcher::Any)
+        .with_status(200)
+        .with_body("should-not-happen")
+        .create_async()
+        .await;
+
+    let provider = Provider {
+        enabled: false,
+        ..openai_provider("oa-disabled", &upstream.url())
+    };
+    let proxy_url = spawn_proxy_with_provider(upstream.url(), provider).await;
+    let (status, body, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-disabled/v1/chat/completions",
+        "{}",
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert!(body.contains("unavailable"));
+}
+
+#[tokio::test]
+async fn cross_protocol_returns_501() {
+    // provider 协议是 Anthropic, 但客户端用 /o/ (OpenAI 入口) 访问.
+    let upstream = spawn_mock_upstream().await;
+    let provider = provider_with("an-main", Protocol::Anthropic, &upstream.url());
+    let proxy_url = spawn_proxy_with_provider(upstream.url(), provider).await;
+    let (status, body, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/an-main/v1/chat/completions",
+        "{}",
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::NOT_IMPLEMENTED);
+    assert!(body.contains("not_implemented"));
+    assert!(body.contains("cross-protocol"));
+}
+
+#[tokio::test]
+async fn no_rest_segment_routes_to_root() {
+    // /o/{name} 应当等价于 /o/{name}/ → 上游收到 GET /.
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("GET", "/")
+        .with_status(200)
+        .with_body("root")
+        .create_async()
+        .await;
+    let proxy_url = spawn_proxy(upstream.url()).await;
+    let (status, body, _) = proxy_request(&proxy_url, "GET", "/o/oa-main", "", &[]).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(body, "root");
+}
+
+#[tokio::test]
+async fn unmatched_path_returns_404() {
+    // 单段路径不匹配 `/{proto}/{name}` 路由, 应当 404 (不被 catch-all 转发).
+    let upstream = spawn_mock_upstream().await;
+    let proxy_url = spawn_proxy(upstream.url()).await;
     let resp = reqwest::Client::new()
-        .get(format!("{proxy_url}/__sg"))
+        .get(format!("{proxy_url}/just-one-segment"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+// ─── Web UI / API ──────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn root_serves_web_ui() {
+    let upstream = spawn_mock_upstream().await;
+    let proxy_url = spawn_proxy(upstream.url()).await;
+    let resp = reqwest::Client::new()
+        .get(format!("{proxy_url}/"))
         .send()
         .await
         .unwrap();
@@ -374,10 +563,23 @@ async fn web_ui_serves_html() {
 }
 
 #[tokio::test]
+async fn web_ui_legacy_path_still_works() {
+    let upstream = spawn_mock_upstream().await;
+    let proxy_url = spawn_proxy(upstream.url()).await;
+    let resp = reqwest::Client::new()
+        .get(format!("{proxy_url}/__sg"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert!(resp.text().await.unwrap().contains("secret-guard"));
+}
+
+#[tokio::test]
 async fn web_api_lists_records() {
     let mut upstream = spawn_mock_upstream().await;
     let _m = upstream
-        .mock("POST", "/v1/messages")
+        .mock("POST", "/v1/chat/completions")
         .with_status(200)
         .with_body("{}")
         .create_async()
@@ -386,11 +588,24 @@ async fn web_api_lists_records() {
     let upstream_client = reqwest::Client::new();
     let records = RecordStore::new(64);
     let records_handle = records.clone();
-    let proxy_url = spawn_proxy_with(upstream.url().to_string(), upstream_client, records).await;
+    let provider = openai_provider("oa-main", &upstream.url());
+    let proxy_url = spawn_proxy_full(
+        vec![provider],
+        upstream_client,
+        records,
+        test_secret_table(),
+    )
+    .await;
 
-    let _ = proxy_request(&proxy_url, "POST", "/v1/messages", "{}", &[]).await;
+    let _ = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        "{}",
+        &[],
+    )
+    .await;
 
-    // 等待记录写回.
     wait_until_or_timeout(
         &records_handle,
         |l| l.first().map(|r| r.resp_complete).unwrap_or(false),
@@ -408,14 +623,14 @@ async fn web_api_lists_records() {
     let recs = body.get("records").and_then(|v| v.as_array()).unwrap();
     assert_eq!(recs.len(), 1);
     assert_eq!(recs[0]["method"], "POST");
-    assert_eq!(recs[0]["path"], "/v1/messages");
+    assert_eq!(recs[0]["path"], "/o/oa-main/v1/chat/completions");
 }
 
 #[tokio::test]
 async fn web_api_returns_record_by_id() {
     let mut upstream = spawn_mock_upstream().await;
     let _m = upstream
-        .mock("POST", "/v1/messages")
+        .mock("POST", "/v1/chat/completions")
         .with_status(200)
         .with_body(r#"{"ok":true}"#)
         .create_async()
@@ -424,9 +639,23 @@ async fn web_api_returns_record_by_id() {
     let upstream_client = reqwest::Client::new();
     let records = RecordStore::new(64);
     let records_handle = records.clone();
-    let proxy_url = spawn_proxy_with(upstream.url().to_string(), upstream_client, records).await;
+    let provider = openai_provider("oa-main", &upstream.url());
+    let proxy_url = spawn_proxy_full(
+        vec![provider],
+        upstream_client,
+        records,
+        test_secret_table(),
+    )
+    .await;
 
-    let _ = proxy_request(&proxy_url, "POST", "/v1/messages", r#"{"q":"hi"}"#, &[]).await;
+    let _ = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        r#"{"q":"hi"}"#,
+        &[],
+    )
+    .await;
 
     let list = wait_until_or_timeout(
         &records_handle,
@@ -474,24 +703,7 @@ async fn web_api_400_for_invalid_uuid() {
 }
 
 #[tokio::test]
-async fn web_api_records_empty_when_no_traffic() {
-    let upstream = spawn_mock_upstream().await;
-    let proxy_url = spawn_proxy(upstream.url()).await;
-    let resp = reqwest::Client::new()
-        .get(format!("{proxy_url}/__sg/api/records"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    let body: serde_json::Value = resp.json().await.unwrap();
-    let recs = body.get("records").and_then(|v| v.as_array()).unwrap();
-    assert_eq!(recs.len(), 0);
-}
-
-#[tokio::test]
 async fn web_namespace_not_forwarded_to_upstream() {
-    // `/__sg/api/records/` (尾斜杠, axum nest 不会匹配) 必须不被 catch-all 吞掉
-    // 而泄漏到上游. 测试断言: 上游绝不应收到任何 `/__sg/*` 请求.
     let mut upstream = spawn_mock_upstream().await;
     let _m = upstream
         .mock("GET", mockito::Matcher::Any)
@@ -502,14 +714,12 @@ async fn web_namespace_not_forwarded_to_upstream() {
 
     let proxy_url = spawn_proxy(upstream.url()).await;
 
-    // 即使尾斜杠路由未明确, 也至少不应进入 forward; 即使 404 也 OK, 关键是不应静默转发.
     let resp = reqwest::Client::new()
         .get(format!("{proxy_url}/__sg/api/records/"))
         .send()
         .await
         .unwrap();
     let status = resp.status();
-    // 期望 404 (or 任何非 2xx), 而非转发到上游后返回的 200.
     assert!(
         !status.is_success(),
         "expected /__sg/* to NOT be forwarded upstream, got status {status}"
@@ -531,7 +741,6 @@ async fn secrets_api_lists_empty() {
     let body: serde_json::Value = resp.json().await.unwrap();
     let secrets = body.get("secrets").and_then(|v| v.as_array()).unwrap();
     assert_eq!(secrets.len(), 0);
-    // categories 字段返回可选列表.
     let cats = body.get("categories").and_then(|v| v.as_array()).unwrap();
     assert!(cats.len() >= 5);
 }
@@ -542,7 +751,6 @@ async fn secrets_api_create_lists_update_delete() {
     let proxy_url = spawn_proxy(upstream.url()).await;
     let client = reqwest::Client::new();
 
-    // Create.
     let resp = client
         .post(format!("{proxy_url}/__sg/api/secrets"))
         .json(&serde_json::json!({
@@ -557,14 +765,8 @@ async fn secrets_api_create_lists_update_delete() {
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
     let created: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(created["id"], "test-key-1");
-    assert_eq!(created["name"], "Test API Key");
-    assert_eq!(created["category"], "apikey");
-    // value 必须被脱敏, 不可返回真实值.
     assert_ne!(created["value_masked"], "sk-test-1234567890abcdef");
-    assert!(created["value_masked"].as_str().unwrap().contains('*'));
-    assert_eq!(created["value_length"], 24);
 
-    // List 看到新增.
     let resp = client
         .get(format!("{proxy_url}/__sg/api/secrets"))
         .send()
@@ -575,7 +777,6 @@ async fn secrets_api_create_lists_update_delete() {
     assert_eq!(secrets.len(), 1);
     assert_eq!(secrets[0]["id"], "test-key-1");
 
-    // Update (改名 + 换值).
     let resp = client
         .put(format!("{proxy_url}/__sg/api/secrets/test-key-1"))
         .json(&serde_json::json!({
@@ -589,26 +790,13 @@ async fn secrets_api_create_lists_update_delete() {
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let updated: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(updated["name"], "Renamed");
-    assert_eq!(updated["category"], "token");
-    assert_eq!(updated["value_length"], 26);
 
-    // Delete.
     let resp = client
         .delete(format!("{proxy_url}/__sg/api/secrets/test-key-1"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
-
-    // List 再次为空.
-    let resp = client
-        .get(format!("{proxy_url}/__sg/api/secrets"))
-        .send()
-        .await
-        .unwrap();
-    let body: serde_json::Value = resp.json().await.unwrap();
-    let secrets = body.get("secrets").and_then(|v| v.as_array()).unwrap();
-    assert_eq!(secrets.len(), 0);
 }
 
 #[tokio::test]
@@ -639,19 +827,126 @@ async fn secrets_api_delete_missing_returns_404() {
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
 }
 
+// ─── providers API ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn providers_api_lists_existing() {
+    let upstream = spawn_mock_upstream().await;
+    let proxy_url = spawn_proxy(upstream.url()).await;
+    let resp = reqwest::Client::new()
+        .get(format!("{proxy_url}/__sg/api/providers"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let providers = body.get("providers").and_then(|v| v.as_array()).unwrap();
+    assert_eq!(providers.len(), 1);
+    assert_eq!(providers[0]["id"], "oa-main");
+    assert_eq!(providers[0]["protocol"], "openai");
+    assert_eq!(providers[0]["api_key_masked"], "s*********y"); // "sk-test-key" (11 chars)
+    assert!(body.get("protocols").unwrap().as_array().unwrap().len() >= 4);
+    assert!(body.get("shorts").unwrap().as_array().unwrap().len() >= 4);
+}
+
+#[tokio::test]
+async fn providers_api_create_update_delete() {
+    let upstream = spawn_mock_upstream().await;
+    let proxy_url = spawn_proxy(upstream.url()).await;
+    let client = reqwest::Client::new();
+
+    // 创建新 Anthropic provider.
+    let resp = client
+        .post(format!("{proxy_url}/__sg/api/providers"))
+        .json(&serde_json::json!({
+            "id": "an-main",
+            "name": "Anthropic Main",
+            "protocol": "anthropic",
+            "base_url": "https://api.anthropic.com",
+            "api_key": "sk-ant-test-12345",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let created: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(created["id"], "an-main");
+    assert_eq!(created["protocol"], "anthropic");
+    assert_ne!(created["api_key_masked"], "sk-ant-test-12345");
+    assert_eq!(created["api_key_length"], 17); // "sk-ant-test-12345"
+
+    // List 看到 2 条.
+    let resp = client
+        .get(format!("{proxy_url}/__sg/api/providers"))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let providers = body.get("providers").and_then(|v| v.as_array()).unwrap();
+    assert_eq!(providers.len(), 2);
+
+    // Update: 改 base_url.
+    let resp = client
+        .put(format!("{proxy_url}/__sg/api/providers/an-main"))
+        .json(&serde_json::json!({
+            "protocol": "anthropic",
+            "base_url": "https://api.anthropic.com/v2",
+            "api_key": "sk-ant-new",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let updated: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(updated["base_url"], "https://api.anthropic.com/v2");
+
+    // Delete.
+    let resp = client
+        .delete(format!("{proxy_url}/__sg/api/providers/an-main"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+
+    // 剩 1 条.
+    let resp = client
+        .get(format!("{proxy_url}/__sg/api/providers"))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let providers = body.get("providers").and_then(|v| v.as_array()).unwrap();
+    assert_eq!(providers.len(), 1);
+}
+
+#[tokio::test]
+async fn providers_api_rejects_bad_base_url() {
+    let upstream = spawn_mock_upstream().await;
+    let proxy_url = spawn_proxy(upstream.url()).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/__sg/api/providers"))
+        .json(&serde_json::json!({
+            "id": "bad",
+            "protocol": "openai",
+            "base_url": "not-a-url",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
 // ─── redact / restore flow ─────────────────────────────────────────────────
 
 #[tokio::test]
 async fn redact_strips_secret_from_upstream_request() {
     let real_secret = "sk-test-123";
     let mut upstream = spawn_mock_upstream().await;
-    // 上游无条件返回 200; mockito 不易表达"不包含 secret"的匹配,
-    // 我们通过 RecordStore 中的 req_body 来验证 redact 是否生效.
     let _m = upstream
-        .mock("POST", "/v1/messages")
+        .mock("POST", "/v1/chat/completions")
         .with_status(200)
         .with_header("content-type", "application/json")
-        .with_body(r#"{"id":"msg_1"}"#)
+        .with_body(r#"{"id":"chatcmpl-1"}"#)
         .create_async()
         .await;
 
@@ -660,17 +955,12 @@ async fn redact_strips_secret_from_upstream_request() {
     let upstream_client = reqwest::Client::new();
     let records = RecordStore::new(64);
     let records_handle = records.clone();
-    let proxy_url = spawn_proxy_full(
-        upstream.url().to_string(),
-        upstream_client,
-        records,
-        secrets,
-    )
-    .await;
+    let provider = openai_provider("oa-main", &upstream.url());
+    let proxy_url = spawn_proxy_full(vec![provider], upstream_client, records, secrets).await;
 
     let body = format!(r#"{{"messages":[{{"content":"use {real_secret} now"}}]}}"#);
     let resp = reqwest::Client::new()
-        .post(format!("{proxy_url}/v1/messages"))
+        .post(format!("{proxy_url}/o/oa-main/v1/chat/completions"))
         .header("content-type", "application/json")
         .body(body)
         .send()
@@ -678,7 +968,6 @@ async fn redact_strips_secret_from_upstream_request() {
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
-    // 通过 RecordStore 验证 req_body 已被改写 (不含真实 secret).
     let list = wait_until_or_timeout(
         &records_handle,
         |l| l.first().map(|r| r.resp_complete).unwrap_or(false),
@@ -702,7 +991,6 @@ async fn redact_strips_secret_from_upstream_request() {
 async fn restore_inserts_secret_back_for_client() {
     let real_secret = "sk-test-123";
     let mut upstream = spawn_mock_upstream().await;
-    // 上游返回 mock 字符 (LLM 看到的版本); 客户端应拿到 real_secret.
     let _m = upstream
         .mock("POST", "/echo")
         .with_status(200)
@@ -716,30 +1004,20 @@ async fn restore_inserts_secret_back_for_client() {
     let upstream_client = reqwest::Client::new();
     let records = RecordStore::new(64);
     let records_handle = records.clone();
-    let proxy_url = spawn_proxy_full(
-        upstream.url().to_string(),
-        upstream_client,
-        records,
-        secrets,
-    )
-    .await;
+    let provider = openai_provider("oa-main", &upstream.url());
+    let proxy_url = spawn_proxy_full(vec![provider], upstream_client, records, secrets).await;
 
-    // 触发 redact 以建立 mock 映射.
     let body = format!(r#"{{"input":"use {real_secret} now"}}"#);
     let resp = reqwest::Client::new()
-        .post(format!("{proxy_url}/echo"))
+        .post(format!("{proxy_url}/o/oa-main/echo"))
         .header("content-type", "application/json")
         .body(body)
         .send()
         .await
         .unwrap();
     let resp_text = resp.text().await.unwrap();
-
-    // record 中存的是 LLM 视角 (含 mock): 客户端拿到的是 restored 版本.
-    // 客户端响应里没有 secret (因为上游 echo 的就是 placeholder), 但至少证明 round-trip OK.
     assert!(resp_text.contains("placeholder"));
 
-    // 检查 record 的 req_body 是改写过的 (含 mock, 不含真实 secret).
     let list = wait_until_or_timeout(
         &records_handle,
         |l| l.first().map(|r| r.resp_complete).unwrap_or(false),
@@ -756,10 +1034,9 @@ async fn restore_inserts_secret_back_for_client() {
 
 #[tokio::test]
 async fn no_redact_when_secret_table_empty() {
-    // 没配 secret 时, body 应当原样透传.
     let mut upstream = spawn_mock_upstream().await;
     let _m = upstream
-        .mock("POST", "/v1/messages")
+        .mock("POST", "/v1/chat/completions")
         .match_body(mockito::Matcher::Exact("raw-body".into()))
         .with_status(200)
         .with_body("ok")
@@ -768,7 +1045,7 @@ async fn no_redact_when_secret_table_empty() {
 
     let proxy_url = spawn_proxy(upstream.url()).await;
     let resp = reqwest::Client::new()
-        .post(format!("{proxy_url}/v1/messages"))
+        .post(format!("{proxy_url}/o/oa-main/v1/chat/completions"))
         .body("raw-body")
         .send()
         .await

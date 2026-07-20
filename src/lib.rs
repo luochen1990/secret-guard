@@ -3,6 +3,7 @@
 //! 模块概览:
 //! - [`cli`]      —— 命令行参数 schema (clap)
 //! - [`config`]   —— TOML 配置文件 schema (serde)
+//! - [`provider`] —— Provider 注册表 + Protocol 类型 (ingress / egress 抽象)
 //! - [`proxy`]    —— 透明反向代理 handler (axum + reqwest)
 //! - [`record`]   —— 转发记录模型与内存存储 (供 Web UI 消费)
 //! - [`redact`]   —— Secret 改写 (请求) 与还原 (响应) 逻辑
@@ -10,11 +11,13 @@
 //! - [`server`]   —— axum router 装配与服务启动
 //! - [`web`]      —— `/__sg/*` Web UI 与 JSON API
 //!
-//! 设计目标: 全程"协议无关", body 在字节层面流动, 中间件可对 body 做 find-and-replace.
-//! 协议无关意味着 OpenAI / Anthropic / Gemini 等任意 LLM API 都能透传, 无需 schema 同步.
+//! 设计目标: body 在字节层面流动, 中间件可对 body 做 find-and-replace.
+//! 路由 `/{proto_short}/{provider_id}/*path` 同时编码 ingress protocol 与 provider,
+//! 为未来跨协议转换预留钩子 (MVP 仅支持 ingress == egress 的 identity passthrough).
 
 pub mod cli;
 pub mod config;
+pub mod provider;
 pub mod proxy;
 pub mod record;
 pub mod redact;

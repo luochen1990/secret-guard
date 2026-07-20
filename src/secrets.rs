@@ -140,9 +140,20 @@ pub enum UpsertKind {
 
 impl SecretTable {
     pub fn new(entries: Vec<SecretEntry>, config_path: PathBuf) -> Self {
+        Self::with_persist_lock(entries, config_path, Arc::new(Mutex::new(())))
+    }
+
+    /// 用外部共享的 `persist_lock` 构造. 与 `ProviderTable::with_persist_lock` 对称:
+    /// server 启动时创建一把锁传给两个 table, 保证它们对 config 文件的 RMW 串行化,
+    /// 避免一方读-改-写覆盖另一方刚写入的字段.
+    pub fn with_persist_lock(
+        entries: Vec<SecretEntry>,
+        config_path: PathBuf,
+        persist_lock: Arc<Mutex<()>>,
+    ) -> Self {
         Self {
             inner: Arc::new(RwLock::new(entries)),
-            persist_lock: Arc::new(Mutex::new(())),
+            persist_lock,
             config_path: Arc::new(config_path),
         }
     }
@@ -223,7 +234,9 @@ pub enum DeleteOutcome {
 }
 
 /// 原子写文件: 先写带 UUID 的 `.tmp`, sync, 再 rename.
-fn atomic_write(path: &Path, text: &str) -> anyhow::Result<()> {
+///
+/// `pub(crate)` 以便 `provider::persist_providers` 复用同一份实现.
+pub(crate) fn atomic_write(path: &Path, text: &str) -> anyhow::Result<()> {
     use std::io::Write;
 
     let parent = path

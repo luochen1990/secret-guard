@@ -7,6 +7,7 @@
 
 轻量级 LLM 网关 (本地进程): 透明转发 LLM 请求, 同时检测并替换 body 中的 secret,
 防止 agent 不经意把 secret 泄露到 LLM Provider. 响应回传时反向替换, 让本地工具仍能用真 secret.
+支持多 provider 配置 (OpenAI / Anthropic / Gemini / Ollama), 通过 URL 路径前缀选择目标.
 
 ## 关键技术决策 (SSOT)
 
@@ -17,6 +18,32 @@
 - **配置**: TOML (`secret-guard.toml`), 通过 atomic rename 持久化
 - **测试**: cargo-nextest + proptest (property-based) + mockito (集成测试)
 
+## 路由策略 (核心契约)
+
+URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标 provider,
+为未来跨协议转换预留钩子 (MVP 仅支持 ingress == egress 的 identity passthrough).
+
+| 路径 | 含义 |
+|---|---|
+| `/` | Web UI (主入口) |
+| `/__sg`, `/__sg/*` | Web UI + JSON API (向后兼容旧入口) |
+| `/{o\|a\|g\|l}/{name}` | forward, rest = "/" |
+| `/{o\|a\|g\|l}/{name}/{*rest}` | forward, rest 含前导 `/` |
+| 其他 | 404 (不再 catch-all 透传) |
+
+`proto_short` 简写映射 (单一事实来源: `Protocol::ALL`):
+
+- `o` = OpenAI
+- `a` = Anthropic
+- `g` = Gemini
+- `l` = oLLama
+
+错误语义:
+- 未知 protocol 简写 → 404 `not_found`
+- 未知 provider id → 404 `not_found`
+- 禁用 provider (`enabled = false`) → 503 `unavailable`
+- ingress != egress (跨协议) → 501 `not_implemented` (未来工作)
+
 ## 模块概览
 
 ```
@@ -24,15 +51,16 @@ src/
 ├── main.rs        # 二进制入口: 解析 CLI, 启动 server
 ├── lib.rs         # 库入口
 ├── cli.rs         # clap 参数 schema (Option<T> 表示"未指定")
-├── config.rs      # Config / ServerConfig / UpstreamConfig / SecretsConfig
-├── secrets.rs     # SecretEntry / SecretCategory / SecretTable (共享可变状态)
+├── config.rs      # Config / ServerConfig / SecretsConfig (Provider 在 provider.rs)
+├── provider.rs    # Protocol / Provider / ProviderTable (共享可变状态 + 持久化)
+├── secrets.rs     # SecretEntry / SecretCategory / SecretTable + 共享 atomic_write
 ├── record.rs      # ForwardRecord / RecordStore / ResponseUpdate
 ├── redact.rs      # mock_secret + RedactionMap + redact_request + restore_response
-├── proxy.rs       # ProxyState + forward handler + fan_out_streaming/buffered
-├── server.rs      # build_router + serve (含 graceful shutdown)
+├── proxy.rs       # ProxyState + forward/forward_no_rest + fan_out_streaming/buffered
+├── server.rs      # build_router + serve (含 graceful shutdown + 共享 persist_lock)
 └── web/
-    ├── mod.rs     # /__sg 子 router + slash_redirect + not_found
-    ├── api.rs     # JSON endpoints (records + secrets CRUD)
+    ├── mod.rs     # /__sg 子 router + / 根入口 + slash_redirect + not_found
+    ├── api.rs     # JSON endpoints (records + secrets CRUD + providers CRUD)
     └── index.html # 单页 UI (内嵌 CSS + vanilla JS, 零外部依赖)
 ```
 
@@ -54,7 +82,26 @@ src/
 - `fan_out_buffered`: 启用 redact 时使用, 完整累积响应再 restore, 失去流式但保证 C6.
 - **客户端响应永远无大小上限**; 只有 record 累积受 `MAX_RESP_BODY_RECORD` (32 MiB) 约束.
 
-### SecretTable 并发 (`src/secrets.rs`)
+### Provider 路由 (`src/proxy.rs`)
+
+`forward` 接收 `Path<ForwardPath> { proto, name, rest }`, 按 URL 解析 ingress 与 provider:
+1. `Protocol::from_short(proto)` → ingress 协议 (o/a/g/l)
+2. `ProviderTable::get(name)` → 目标 provider (含 egress 协议)
+3. 协议匹配检查 (MVP: ingress == egress; 跨协议 → 501)
+4. `apply_provider_auth` 用 provider 配置的 api_key 注入对应协议的 auth header:
+   - OpenAI / Ollama → `Authorization: Bearer <key>`
+   - Anthropic → `x-api-key: <key>`
+   - Gemini → `x-goog-api-key: <key>`
+   同时剥离竞争 header (避免客户端误传的对手协议 auth 干扰上游), provider 配置优先于客户端.
+
+### 跨表并发安全 (`src/server.rs` + `src/{provider,secrets}.rs`)
+
+`SecretTable` 与 `ProviderTable` 共享同一把 `Arc<Mutex<()>>` `persist_lock`
+(server 启动时构造并注入两表). 原因: 两表都通过 `Config::load_or_default` →
+`Config::to_toml` → `atomic_write` 改写同一份 `secret-guard.toml`;
+若不串行化, 一方的 read-modify-write 会覆盖另一方刚写入的字段.
+
+### SecretTable / ProviderTable 并发 (`src/secrets.rs`, `src/provider.rs`)
 
 - `persist_lock` 串行整个 RMW (read-modify-write), 保证并发 upsert/delete 不丢失更新.
 - 持久化策略: 先写文件 (atomic + fsync), 再更新内存 (失败自动回滚).
@@ -72,40 +119,82 @@ just check
 # 开发热加载
 just dev                  # cargo watch -x run
 
-# 手动测试
-cargo run -- run --port 18787 --upstream http://127.0.0.1:9999
-# 浏览器: http://127.0.0.1:18787/__sg
+# 手动测试 — 启动 server (需要先在 secret-guard.toml 配置 [[providers]])
+cargo run -- run --port 18787
+# 浏览器: http://127.0.0.1:18787/  (或旧版 /__sg)
+# OpenAI SDK 配置: base_url = http://127.0.0.1:18787/o/<provider-id>
+```
+
+### 客户端使用示例
+
+OpenAI Python SDK:
+```python
+from openai import OpenAI
+client = OpenAI(
+    base_url="http://127.0.0.1:18787/o/openai-main",
+    api_key="ignored",  # 由 provider 配置覆盖
+)
+```
+
+Anthropic Python SDK:
+```python
+from anthropic import Anthropic
+client = Anthropic(
+    base_url="http://127.0.0.1:18787/a/anthropic-main",
+    api_key="ignored",  # 由 provider 配置覆盖
+)
 ```
 
 ## 测试策略
 
 | 层级 | 工具 | 示例 |
 |---|---|---|
-| 单元 (纯函数) | `#[test]` | `redact::tests::c1_non_empty` |
+| 单元 (纯函数) | `#[test]` | `provider::tests::protocol_short_roundtrip` |
 | Property-based | `proptest` | `redact::tests::prop_round_trip_identity` |
 | 集成 (端到端) | `mockito` + `axum::serve` | `tests/integration.rs::forwards_streaming_sse` |
 
 `mockito::Matcher` 在 1.x 没有 `String` 变体, 用 `Exact` 或 `Json` / `PartialJson`.
 
+集成测试覆盖的关键场景:
+- 同协议 identity passthrough (OpenAI / Anthropic / Gemini / Ollama)
+- 跨协议请求返回 501 `not_implemented`
+- 未知 protocol / provider 返回 404
+- 禁用 provider 返回 503
+- provider api_key 覆盖客户端 auth header
+- root `/` 提供 Web UI
+
 ## 已知限制 (MVP)
 
+- **跨协议转换未实现**: `/o/anthropic-main/*` 这类 ingress != egress 的请求返回 501.
+  架构已为此预留 (见"后续工作").
 - 启用 redact 时, 流式响应降级为 buffered (失去 SSE 流式 UX).
 - mock_secret 用 SipHash (Rust `DefaultHasher`), 同 Rust 版本内确定, 但**不保证跨版本稳定**;
   RedactionMap 是 per-request 状态不持久化, 所以无实际影响.
 - mock 固定 15 字符 (`sgm_` + 11 char base62), 不模拟 real_secret 的格式/长度.
   LLM 可能识别出"sgm_..." 的规律性 — 未来可考虑 category-aware 的 mock 生成器.
-- 配置文件 `secret-guard.toml` 中 `secrets` 段是单一 SSOT, 手动编辑可能被 Web UI 写回覆盖.
+- 配置文件 `secret-guard.toml` 中 `[[providers]]` 与 `[secrets]` 是单一 SSOT, 手动编辑可能被 Web UI 写回覆盖.
+- Web UI 编辑 provider 时 api_key 始终要求重输 (无法保留旧值), 留空则覆盖为空字符串.
 
 ## 路径约定
 
-- `/__sg` 命名空间: Web UI / API, 不转发到上游.
+- `/` 命名空间: Web UI 主入口 (新).
+- `/__sg` 命名空间: Web UI / API (向后兼容旧入口).
 - `/__sg/` (带尾斜杠): 307 redirect 到 `/__sg`.
-- `/__sg/{*rest}` 未匹配路径: 返回 404, **绝不**进入 catch-all `forward` (否则会泄漏内部 URL 到上游).
-- 其他所有路径: 透传到上游.
+- `/__sg/{*rest}` 未匹配路径: 返回 404, **绝不**进入 forward (否则会泄漏内部 URL 到上游).
+- `/{o|a|g|l}/{id}/*`: 转发到对应 provider.
+- 其他所有路径: 404.
 
 ## 后续工作 (非 MVP 范围)
 
+- **协议转换** (最重要的预留工作): 实现 `ProtocolCodec` trait, 每个 protocol 提供
+  `parse_request(Bytes) -> UnifiedRequest` 与 `serialize_request(UnifiedRequest) -> Bytes`,
+  通过统一 IR 桥接不同协议. 当前 URL 设计 `/{ingress}/{egress_provider}/*` 已天然支持:
+  ingress != egress 时调用 codec 链 `parse(ingress) → IR → serialize(egress)`.
+  候选 IR: OpenAI ChatCompletion (生态最广) 或自研 union type 覆盖各家特有字段.
+  关键挑战: SSE 流式响应的 chunk-boundary 转换 (sliding window + UTF-8 char 边界).
+  当前 MVP 在此处返回 501 Not Implemented (见 `proxy::dispatch`).
 - 流式响应 + redact 的 chunk boundary 处理 (用 sliding window + UTF-8 char 边界检测).
 - mock_secret 的 category-aware 生成 (Password/ApiKey/Cookie 等格式感知).
 - 配置热加载 (目前 Web UI 改 config 后, 重启才影响 CLI 参数).
 - 测试覆盖率自动上报 + fuzzing (cargo-fuzz).
+- Web UI 编辑 provider 时保留 api_key (改用 `null` 表示不更新).
