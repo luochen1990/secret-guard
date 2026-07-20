@@ -180,9 +180,10 @@ async fn dispatch(
     let upstream_url = build_upstream_url(&provider.base_url, &format!("{}{query}", fp.rest));
 
     // 7. 复制请求 headers (剥离 hop-by-hop + Connection 列出的字段 + Host + Content-Length).
-    //    若 provider 配了 api_key, 用它覆盖 Authorization / x-api-key, 避免客户端漏传或泄露.
+    //    若 provider 配了 api_key (直接值或从 api_key_file 读取), 用它覆盖
+    //    Authorization / x-api-key, 避免客户端漏传或泄露.
     let mut fwd_headers = sanitize_request_headers(&parts.headers);
-    apply_provider_auth(&mut fwd_headers, &provider.api_key, ingress);
+    apply_provider_auth(&mut fwd_headers, &provider.effective_api_key(), ingress);
 
     // 8. 记录请求快照 (LLM 视角的改写后版本).
     let path_for_record = format!(

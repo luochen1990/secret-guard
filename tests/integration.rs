@@ -50,6 +50,7 @@ fn openai_provider(id: &str, base_url: &str) -> Provider {
         protocol: Protocol::OpenAI,
         base_url: base_url.into(),
         api_key: "sk-test-key".into(),
+        api_key_file: None,
         enabled: true,
         name: Some(id.into()),
     }
@@ -61,6 +62,7 @@ fn provider_with(id: &str, proto: Protocol, base_url: &str) -> Provider {
         protocol: proto,
         base_url: base_url.into(),
         api_key: String::new(),
+        api_key_file: None,
         enabled: true,
         name: Some(id.into()),
     }
@@ -269,6 +271,85 @@ async fn provider_api_key_overrides_client_auth() {
 }
 
 #[tokio::test]
+async fn provider_api_key_file_reads_secret_from_path() {
+    // 端到端验证: provider.api_key_file 指向一个文件, secret-guard 应当在转发时读取其内容
+    // (含 trim) 并注入 Authorization header. 这是 sops-nix 等外部 secret manager 集成的关键.
+    let key_file = std::env::temp_dir().join(format!(
+        "secret-guard-test-api-key-{}.txt",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::write(&key_file, "sk-from-file\n").unwrap(); // 末尾换行应被 trim 掉
+
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .match_header("authorization", "Bearer sk-from-file")
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    let provider = Provider {
+        id: "oa-file".into(),
+        protocol: Protocol::OpenAI,
+        base_url: upstream.url(),
+        api_key: String::new(),
+        api_key_file: Some(key_file.clone()),
+        enabled: true,
+        name: None,
+    };
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-file/v1/chat/completions",
+        "{}",
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+
+    std::fs::remove_file(&key_file).ok();
+}
+
+#[tokio::test]
+async fn provider_api_key_file_missing_falls_through_to_no_auth() {
+    // api_key_file 指向不存在的文件时, effective_api_key 返回空 → apply_provider_auth 跳过.
+    // 这种"软失败"避免单个 provider 配置错误拖垮整个进程 (用户应该看到 401/403 from upstream).
+    let mut upstream = spawn_mock_upstream().await;
+    // mock 不约束 Authorization header (因为 secret-guard 不会注入任何 auth).
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    let provider = Provider {
+        id: "oa-broken".into(),
+        protocol: Protocol::OpenAI,
+        base_url: upstream.url(),
+        api_key: String::new(),
+        api_key_file: Some(std::path::PathBuf::from("/nonexistent/secret-guard-test")),
+        enabled: true,
+        name: None,
+    };
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-broken/v1/chat/completions",
+        "{}",
+        &[],
+    )
+    .await;
+    // secret-guard 不报错, 转发到上游; 上游 mock 接受了 (实际生产中上游会 401).
+    assert_eq!(status, reqwest::StatusCode::OK);
+}
+
+#[tokio::test]
 async fn anthropic_provider_uses_x_api_key() {
     let mut upstream = spawn_mock_upstream().await;
     let _m = upstream
@@ -284,6 +365,7 @@ async fn anthropic_provider_uses_x_api_key() {
         protocol: Protocol::Anthropic,
         base_url: upstream.url(),
         api_key: "sk-ant-test".into(),
+        api_key_file: None,
         enabled: true,
         name: None,
     };

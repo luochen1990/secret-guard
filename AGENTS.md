@@ -154,11 +154,27 @@ PATCH  /__sg/api/providers/{id}/decision
 1. `Protocol::from_short(proto)` → ingress 协议 (o/a/g/l)
 2. `ProviderTable::get_effective(name)` → 目标 provider (合并 static + dynamic + decision 后的生效值)
 3. 协议匹配检查 (MVP: ingress == egress; 跨协议 → 501)
-4. `apply_provider_auth` 用 provider 配置的 api_key 注入对应协议的 auth header:
+4. `apply_provider_auth` 用 `provider.effective_api_key()` 注入对应协议的 auth header:
    - OpenAI / Ollama → `Authorization: Bearer <key>`
    - Anthropic → `x-api-key: <key>`
    - Gemini → `x-goog-api-key: <key>`
    同时剥离竞争 header (避免客户端误传的对手协议 auth 干扰上游), provider 配置优先于客户端.
+
+#### api_key 的两种来源 (`Provider::effective_api_key`)
+
+`Provider` 同时支持两种 api_key 配置方式 (互斥, 同时设置会在 `validate()` 报错):
+
+| 字段 | 类型 | 适用场景 |
+|---|---|---|
+| `api_key` | `String` (直接值) | 本地 dev / 简单部署 / 不在乎 toml 含敏感数据 |
+| `api_key_file` | `Option<PathBuf>` (从文件读取) | 生产部署 / sops-nix / systemd LoadCredential / k8s secrets |
+
+优先级: 直接值 > 文件 > 空. 文件内容会被 `trim()` (容忍 sops / `echo | tee` 末尾换行符).
+读不到文件返回空字符串 — 让 `apply_provider_auth` 跳过 auth 注入, 单 provider 配置错误不会拖垮整个进程.
+
+`api_key_file` 让 secret-guard.toml 本身可以不含敏感数据 — toml 可以直接进 git 或 nix store,
+secret 由 sops-nix 解密到 `/run/secrets/...`, secret-guard 在请求时读取.
+这极大简化了上游 nixos module 的配置 (不用 `sops.templates` 渲染整个 toml).
 
 ### 跨表并发安全 (`src/server.rs` + `src/config.rs`)
 
@@ -179,6 +195,55 @@ PATCH  /__sg/api/providers/{id}/decision
 - 类型钩子: `DynamicEntry` trait 让泛型表知道如何把 entry 写入 state 的对应字段
   (`set_state_field`) 与读写 decisions 的对应子表 (`get_decision` / `set_decision`).
   新增第三种 entry 类型只需 impl 该 trait (~25 行) 即可获得完整 CRUD / 持久化 / decision 通道.
+
+
+## 部署示例 (NixOS + sops-nix)
+
+`api_key_file` 字段让 secret-guard.toml 可以完全脱敏 — 直接进 nix store, secret
+由 sops-nix 解密到独立路径. 推荐两种姿势 (任选其一, 都不需要改 NixOS module):
+
+### 姿势 1: sops.secrets + systemd LoadCredential (推荐, 不修改 sops.secrets owner)
+
+适合 secret 被多个模块共享的场景 (例如 claude-code 模块也用同一个 api_key, 已经
+设了 `owner = "lc"`). LoadCredential 让 systemd 在服务启动时把 secret mount 到
+`/run/credentials/<service>/<id>`, 自动设 mode=0400 owner=<service User>, 不需要
+修改 sops.secrets owner 避免与其他模块冲突.
+
+```nix
+systemd.services.secret-guard.serviceConfig.LoadCredential = [
+  "zai_key:${config.sops.secrets."llm__zai_coding_plan_api_key".path}"
+];
+
+services.secret-guard.configFile = (pkgs.writeText "secret-guard.toml" ''
+  [[providers]]
+  id = "zai-coding-plan"
+  protocol = "openai"
+  base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
+  api_key_file = "/run/credentials/secret-guard.service/zai_key"
+  enabled = true
+'');
+```
+
+### 姿势 2: sops.secrets + 直接路径 (需要 owner = "secret-guard")
+
+适合 secret 只给 secret-guard 用的场景. 与姿势 1 的唯一差异是 `api_key_file` 直接
+指向 sops 解密路径, 而不是经 LoadCredential 转手:
+
+```nix
+sops.secrets."zai_api_key" = { owner = "secret-guard"; };
+
+services.secret-guard.configFile = (pkgs.writeText "secret-guard.toml" ''
+  [[providers]]
+  id = "zai-coding-plan"
+  protocol = "openai"
+  base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
+  api_key_file = "${config.sops.secrets."zai_api_key".path}"
+  enabled = true
+'');
+```
+
+**不推荐**: `sops.templates` 渲染整个 toml 把 api_key 嵌入明文 — toml 无法进 nix
+store, 调试不便, 与 nixos 生态主流模式 (hermes-agent / bazarr) 不一致.
 
 
 ## 开发流程

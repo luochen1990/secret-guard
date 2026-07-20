@@ -17,11 +17,22 @@
 //! 见 [`crate::config::DynamicTable`] 的文档.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::sync::LazyLock;
+
+use parking_lot::Mutex;
 
 use crate::config::{
     classify_source, pick_effective, Decisions, DynamicEntry, DynamicState, DynamicTable,
     EffectiveSource, OverrideMode,
 };
+
+/// 记录已经 warn 过 api_key_file 读失败的 provider id.
+/// 实现健康→失败 warn 一次, 恢复后下次失败再 warn 的模式, 避免 LLM 高 QPS 场景下日志爆.
+/// 文件可读时清除记录, 让后续失败能再次 warn (运维改了配置后会看到新 warn).
+/// 用 parking_lot::Mutex 与项目其他模块 (config/server/record/secrets) 同步原语一致.
+static WARNED_API_KEY_FILE: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// 支持的 LLM 协议.
 ///
@@ -93,15 +104,72 @@ pub struct Provider {
     pub protocol: Protocol,
     /// 上游 base URL, 末尾**不带** `/`. 通过 [`validate_base_url`] 校验.
     pub base_url: String,
-    /// API key. 明文存储在本地 config 文件中 (本地进程, 不通过网络暴露).
+    /// API key 直接值. 明文存储在本地 config 文件中 (本地进程, 不通过网络暴露).
+    /// 与 [`Provider::api_key_file`] 互斥 — 同时设置会在 [`Provider::validate`] 中报错.
     #[serde(default)]
     pub api_key: String,
+    /// 可选: 从文件路径读取 api_key. 优先级低于 [`Provider::api_key`].
+    ///
+    /// 用法: 让 toml 本身不含敏感数据, secret 由外部机制 (sops-nix / systemd LoadCredential /
+    /// docker secrets / k8s secrets) 解密到独立路径, secret-guard 在请求时读取.
+    ///
+    /// 文件内容会被 `trim()` (容忍末尾换行符, 这是 sops / `echo | tee` 的常见副作用).
+    /// 文件读不到时按空 key 处理 (与 `api_key` 为空时一致), 由 [`apply_provider_auth`]
+    /// 决定是否跳过 auth header 注入.
+    ///
+    /// [`apply_provider_auth`]: crate::proxy::apply_provider_auth
+    #[serde(default)]
+    pub api_key_file: Option<std::path::PathBuf>,
     /// 是否启用. `false` 时转发到该 provider 返回 503.
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// 可选人类可读名称 (Web UI 显示).
     #[serde(default)]
     pub name: Option<String>,
+}
+
+impl Provider {
+    /// 返回生效的 api_key: 优先 [`Provider::api_key`] 直接值, 否则从
+    /// [`Provider::api_key_file`] 读取 (trim 后). 两者都未配置 → 返回空字符串.
+    ///
+    /// 不报告错误: 上层 ([`apply_provider_auth`]) 会基于空 key 决定是否跳过 auth 注入,
+    /// 单个 provider 配置错误不应拖垮整个进程.
+    ///
+    /// 但会 `warn!` 一次让运维可观测 — 文件读不到时, 仅从上游 401/403 反推原因很痛苦.
+    /// 与项目其他错误路径 (`proxy.rs` 中 `warn!` 各种 IO/header 错误) 风格一致.
+    ///
+    /// [`apply_provider_auth`]: crate::proxy::apply_provider_auth
+    pub fn effective_api_key(&self) -> String {
+        if !self.api_key.is_empty() {
+            return self.api_key.clone();
+        }
+        if let Some(path) = &self.api_key_file {
+            match std::fs::read_to_string(path) {
+                Ok(s) => {
+                    // 文件恢复可读, 清除 warn 记录, 让下次失败能再次 warn.
+                    WARNED_API_KEY_FILE.lock().remove(&self.id);
+                    return s.trim().to_string();
+                }
+                Err(e) => {
+                    // 首次失败 warn 一次, 后续同样错误静默 — 避免 LLM 高 QPS 场景日志爆.
+                    // (恢复后会再次 warn, 让运维感知到再次发生的失败.)
+                    let first_failure = WARNED_API_KEY_FILE.lock().insert(self.id.clone());
+                    if first_failure {
+                        tracing::warn!(
+                            provider_id = %self.id,
+                            path = %path.display(),
+                            error = %e,
+                            "failed to read api_key_file; falling back to empty key \
+                             (apply_provider_auth will skip auth injection, \
+                             subsequent failures for this provider will be silent \
+                             until the file becomes readable again)"
+                        );
+                    }
+                }
+            }
+        }
+        String::new()
+    }
 }
 
 /// serde `default` helper: 让 `enabled` 字段缺省为 `true`.
@@ -134,6 +202,14 @@ impl DynamicEntry for Provider {
     fn validate(&self) -> Result<(), String> {
         crate::secrets::validate_id(&self.id)?;
         validate_base_url(&self.base_url)?;
+        // api_key 与 api_key_file 互斥: 同时设置时语义不明 (effective_api_key 会优先 api_key,
+        // 但这种配置几乎肯定是误操作 — 比如 toml 既填了 api_key 又忘了删 api_key_file).
+        if !self.api_key.is_empty() && self.api_key_file.is_some() {
+            return Err(format!(
+                "provider {} has both api_key and api_key_file set; pick one",
+                self.id
+            ));
+        }
         Ok(())
     }
 
@@ -169,6 +245,8 @@ pub struct EffectiveProvider {
     pub id: String,
     pub protocol: Protocol,
     pub base_url: String,
+    /// 直接值 (api_key 字段) 的 masked 视图. 若 provider 用 api_key_file,
+    /// 这里是空字符串 — 文件内容由 effective_api_key() 在转发时读取, 不进 effective 视图.
     pub api_key_masked: String,
     pub api_key_length: usize,
     pub enabled: bool,
@@ -266,6 +344,7 @@ mod tests {
             protocol: proto,
             base_url: base.into(),
             api_key: format!("k-{id}"),
+            api_key_file: None,
             enabled: true,
             name: Some(format!("name-{id}")),
         }
@@ -311,6 +390,44 @@ mod tests {
         assert!(validate_base_url("http://localhost:11434").is_ok());
     }
 
+    // ─── toml 反序列化: api_key_file 字段必须能从 toml 正确解析为 PathBuf ──
+    //
+    // PathBuf 在 toml crate 中没有直接实现 Deserialize, 但 std::path::PathBuf
+    // 通过 serde "newtype struct" 自动获得 string → PathBuf 的反序列化能力.
+    // 这个测试 pin 住该隐含约定, 防止未来重构成 String 类型时静默破坏 toml schema.
+
+    #[test]
+    fn toml_deserializes_api_key_file_as_pathbuf() {
+        let toml_text = r#"
+            id = "test"
+            protocol = "openai"
+            base_url = "https://api.example.com"
+            api_key_file = "/run/secrets/test-key"
+            enabled = true
+        "#;
+        let p: Provider = toml::from_str(toml_text).expect("toml parse");
+        assert_eq!(
+            p.api_key_file.as_deref(),
+            Some(std::path::Path::new("/run/secrets/test-key"))
+        );
+        assert_eq!(p.api_key, ""); // 默认值
+    }
+
+    #[test]
+    fn toml_deserializes_legacy_api_key_still_works() {
+        // 只有 api_key (无 api_key_file) 的老格式必须仍然能解析.
+        let toml_text = r#"
+            id = "test"
+            protocol = "openai"
+            base_url = "https://api.example.com"
+            api_key = "sk-legacy"
+            enabled = true
+        "#;
+        let p: Provider = toml::from_str(toml_text).expect("toml parse");
+        assert_eq!(p.api_key, "sk-legacy");
+        assert!(p.api_key_file.is_none());
+    }
+
     // ─── DynamicEntry impl: Provider 特有的 validate 钩子 ───────────────
 
     #[test]
@@ -321,6 +438,7 @@ mod tests {
             protocol: Protocol::OpenAI,
             base_url: "https://x".into(),
             api_key: String::new(),
+            api_key_file: None,
             enabled: true,
             name: None,
         };
@@ -332,6 +450,7 @@ mod tests {
             protocol: Protocol::OpenAI,
             base_url: "not-a-url".into(),
             api_key: String::new(),
+            api_key_file: None,
             enabled: true,
             name: None,
         };
@@ -339,6 +458,91 @@ mod tests {
 
         // 合法 provider 通过.
         assert!(p("ok", Protocol::OpenAI, "https://x").validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_api_key_and_file_both_set() {
+        let both = Provider {
+            id: "x".into(),
+            protocol: Protocol::OpenAI,
+            base_url: "https://x".into(),
+            api_key: "sk-direct".into(),
+            api_key_file: Some(PathBuf::from("/run/secrets/whatever")),
+            enabled: true,
+            name: None,
+        };
+        let err = both.validate().unwrap_err();
+        assert!(err.contains("both api_key and api_key_file"), "got: {err}");
+    }
+
+    // ─── effective_api_key: api_key 直接值 vs api_key_file ──────────────────
+
+    #[test]
+    fn effective_api_key_prefers_direct_value() {
+        // 即便 api_key_file 指向不存在的文件, 直接值优先 (且 validate 不会让你同时设两者).
+        let p = Provider {
+            id: "x".into(),
+            protocol: Protocol::OpenAI,
+            base_url: "https://x".into(),
+            api_key: "sk-direct".into(),
+            api_key_file: None,
+            enabled: true,
+            name: None,
+        };
+        assert_eq!(p.effective_api_key(), "sk-direct");
+    }
+
+    #[test]
+    fn effective_api_key_reads_from_file_with_trim() {
+        // sops / echo | tee 普遍会在文件末尾留换行符, effective_api_key 应当 trim.
+        let tmp = PathBuf::from(format!(
+            "/tmp/opencode/tmp/test-api-key-{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(tmp.parent().unwrap()).unwrap();
+        std::fs::write(&tmp, "sk-from-file\n").unwrap();
+
+        let p = Provider {
+            id: "x".into(),
+            protocol: Protocol::OpenAI,
+            base_url: "https://x".into(),
+            api_key: String::new(),
+            api_key_file: Some(tmp.clone()),
+            enabled: true,
+            name: None,
+        };
+        assert_eq!(p.effective_api_key(), "sk-from-file");
+
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn effective_api_key_missing_file_returns_empty() {
+        // 单 provider 配置错误不应拖垮整个进程 — 返回空让 apply_provider_auth 跳过.
+        let p = Provider {
+            id: "x".into(),
+            protocol: Protocol::OpenAI,
+            base_url: "https://x".into(),
+            api_key: String::new(),
+            api_key_file: Some(PathBuf::from("/nonexistent/path/should/not/exist")),
+            enabled: true,
+            name: None,
+        };
+        assert_eq!(p.effective_api_key(), "");
+    }
+
+    #[test]
+    fn effective_api_key_neither_set_returns_empty() {
+        let p = Provider {
+            id: "x".into(),
+            protocol: Protocol::OpenAI,
+            base_url: "https://x".into(),
+            api_key: String::new(),
+            api_key_file: None,
+            enabled: true,
+            name: None,
+        };
+        assert_eq!(p.effective_api_key(), "");
     }
 
     // ─── effective_snapshot: 类型特定的 masked 视图 ─────────────────────

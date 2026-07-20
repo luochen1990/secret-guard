@@ -88,6 +88,10 @@ pub struct SecretsConfig {
 
 impl Config {
     /// 从 TOML 文件加载; 若文件不存在返回默认值并 warn.
+    ///
+    /// 加载后会对每个 provider / secret 跑 [`DynamicEntry::validate`],
+    /// 把契约违反 (如 `api_key` 与 `api_key_file` 同时设置) 在启动时就暴露出来,
+    /// 而不是等到运行时被静默吞掉.
     pub fn load_or_default(path: &Path) -> anyhow::Result<Self> {
         if !path.exists() {
             tracing::warn!(
@@ -100,6 +104,7 @@ impl Config {
             .map_err(|e| anyhow::anyhow!("read config {}: {e}", path.display()))?;
         let cfg: Self = toml::from_str(&text)
             .map_err(|e| anyhow::anyhow!("parse config {}: {e}", path.display()))?;
+        validate_entries(path, &cfg.providers, &cfg.secrets.entries)?;
         Ok(cfg)
     }
 
@@ -132,6 +137,9 @@ pub struct DynamicState {
 
 impl DynamicState {
     /// 从 TOML 文件加载; 若文件不存在返回空 state (不 warn, 这是正常情况).
+    ///
+    /// 与 [`Config::load_or_default`] 一样, 加载后会跑 validate —
+    /// 用户手编 state.toml 时也应当尽早暴露契约违反.
     pub fn load_or_empty(path: &Path) -> anyhow::Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
@@ -140,6 +148,7 @@ impl DynamicState {
             .map_err(|e| anyhow::anyhow!("read state {}: {e}", path.display()))?;
         let state: Self = toml::from_str(&text)
             .map_err(|e| anyhow::anyhow!("parse state {}: {e}", path.display()))?;
+        validate_entries(path, &state.providers, &state.secrets)?;
         Ok(state)
     }
 
@@ -147,6 +156,27 @@ impl DynamicState {
     pub fn to_toml(&self) -> anyhow::Result<String> {
         toml::to_string_pretty(self).map_err(|e| anyhow::anyhow!("serialize state: {e}"))
     }
+}
+
+/// 对 provider + secret 列表统一跑 [`DynamicEntry::validate`].
+/// 用于 [`Config::load_or_default`] 和 [`DynamicState::load_or_empty`] 的启动时校验,
+/// 把契约违反在启动时就暴露出来, 而不是被运行时代码路径静默吞掉.
+fn validate_entries(
+    path: &Path,
+    providers: &[Provider],
+    secrets: &[SecretEntry],
+) -> anyhow::Result<()> {
+    for p in providers {
+        p.validate().map_err(|e| {
+            anyhow::anyhow!("config {}: invalid provider {}: {e}", path.display(), p.id)
+        })?;
+    }
+    for s in secrets {
+        s.validate().map_err(|e| {
+            anyhow::anyhow!("config {}: invalid secret {}: {e}", path.display(), s.id)
+        })?;
+    }
+    Ok(())
 }
 
 // ─── Effective view 共用类型 + 合并算法 (provider / secret 通用) ──────────
@@ -613,6 +643,77 @@ mod tests {
         assert_eq!(d.secret("any"), OverrideMode::Default);
     }
 
+    // ─── Config::load_or_default: 启动时校验 ──────────────────────────────
+    //
+    // 互斥契约 (api_key 与 api_key_file 不能同时设) 必须在启动时就暴露,
+    // 不能被静默吞掉 — 否则用户以为在用 api_key_file, 实际 effective_api_key()
+    // 优先返回 api_key 直接值, 削弱 secret 脱敏的安全价值.
+
+    fn write_config_tmp(text: &str) -> PathBuf {
+        let id = uuid::Uuid::new_v4().to_string();
+        let path = PathBuf::from(format!("/tmp/opencode/tmp/test-cfg-{id}.toml"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    #[test]
+    fn load_or_default_rejects_provider_with_both_api_key_and_file() {
+        let path = write_config_tmp(
+            r#"
+            [[providers]]
+            id = "bad"
+            protocol = "openai"
+            base_url = "https://api.example.com"
+            api_key = "sk-direct"
+            api_key_file = "/run/secrets/whatever"
+            enabled = true
+            "#,
+        );
+        let err = Config::load_or_default(&path).unwrap_err().to_string();
+        assert!(err.contains("invalid provider"), "got: {err}");
+        assert!(
+            err.contains("bad"),
+            "error should name the offending provider"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn load_or_default_accepts_api_key_file_only() {
+        let path = write_config_tmp(
+            r#"
+            [[providers]]
+            id = "ok"
+            protocol = "openai"
+            base_url = "https://api.example.com"
+            api_key_file = "/run/secrets/ok-key"
+            enabled = true
+            "#,
+        );
+        Config::load_or_default(&path).expect("api_key_file only should pass validation");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn load_or_empty_rejects_state_with_both_api_key_and_file() {
+        // 同样的契约必须在 dynamic state 加载时也生效 (用户手编 state.toml 也能绕过).
+        let path = write_config_tmp(
+            r#"
+            [[providers]]
+            id = "bad"
+            protocol = "openai"
+            base_url = "https://api.example.com"
+            api_key = "sk-direct"
+            api_key_file = "/run/secrets/whatever"
+            enabled = true
+            "#,
+        );
+        let err = DynamicState::load_or_empty(&path).unwrap_err().to_string();
+        assert!(err.contains("invalid provider"), "got: {err}");
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn decisions_set_then_clear_compacts_storage() {
         let mut d = Decisions::default();
@@ -638,6 +739,7 @@ mod tests {
             protocol: crate::provider::Protocol::OpenAI,
             base_url: "https://api.openai.com".into(),
             api_key: "sk-test".into(),
+            api_key_file: None,
             enabled: true,
             name: Some("P1".into()),
         });
@@ -722,7 +824,7 @@ mod table_tests {
     #[test]
     fn effective_raw_isolated_from_internal_state() {
         let t = SecretTable::new(
-            vec![entry("a", "va"), entry("b", "vb")],
+            vec![entry("a", "secret-a"), entry("b", "secret-b")],
             vec![],
             empty_decisions(),
             PathBuf::from("/tmp/x.toml"),
@@ -747,7 +849,7 @@ mod table_tests {
     #[test]
     fn disabled_drops_secret() {
         let t = SecretTable::new(
-            vec![entry("a", "v")],
+            vec![entry("a", "secret-value")],
             vec![],
             empty_decisions(),
             PathBuf::from("/tmp/x.toml"),
@@ -762,12 +864,12 @@ mod table_tests {
     #[test]
     fn get_effective_falls_back_to_static() {
         let t = SecretTable::new(
-            vec![entry("a", "v")],
+            vec![entry("a", "secret-value")],
             vec![],
             empty_decisions(),
             PathBuf::from("/tmp/x.toml"),
         );
-        assert_eq!(t.get_effective("a").unwrap().value, "v");
+        assert_eq!(t.get_effective("a").unwrap().value, "secret-value");
         assert!(t.get_effective("missing").is_none());
     }
 
@@ -789,7 +891,7 @@ mod table_tests {
         let tmp = tempfile_path("delete");
         let t = SecretTable::new(
             vec![],
-            vec![entry("a", "v1"), entry("b", "vb")],
+            vec![entry("a", "v1-secret"), entry("b", "vb-secret")],
             empty_decisions(),
             tmp.clone(),
         );
@@ -825,7 +927,7 @@ mod table_tests {
     fn set_decision_disabled_then_default_persists() {
         let tmp = tempfile_path("decide");
         let t = SecretTable::new(
-            vec![entry("a", "v")],
+            vec![entry("a", "secret-value")],
             vec![],
             empty_decisions(),
             tmp.clone(),

@@ -403,8 +403,13 @@ pub struct UpsertProviderRequest {
     pub protocol: Protocol,
     pub base_url: String,
     /// 可选. 省略或空字符串表示不设置 api_key (适用于 Ollama 等本地无 auth 场景).
+    /// 与 `api_key_file` 互斥 (同时设置会在 `validate()` 报错).
     #[serde(default)]
     pub api_key: Option<String>,
+    /// 可选: 从文件路径读取 api_key. 与 `api_key` 互斥.
+    /// WebUI 创建 dynamic-only provider 时可用, 但通常只在 static config (sops 注入) 用.
+    #[serde(default)]
+    pub api_key_file: Option<String>,
     #[serde(default = "crate::provider::default_true")]
     pub enabled: bool,
 }
@@ -426,6 +431,7 @@ impl UpsertProviderRequest {
             protocol: self.protocol,
             base_url: self.base_url,
             api_key: self.api_key.unwrap_or_default(),
+            api_key_file: self.api_key_file.map(std::path::PathBuf::from),
             enabled: self.enabled,
             name: self.name.filter(|s| !s.trim().is_empty()),
         })
