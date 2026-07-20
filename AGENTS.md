@@ -10,7 +10,7 @@
 
 ## 关键技术决策 (SSOT)
 
-- **语言**: Rust 2021 edition (toolchain 1.95, via nixpkgs-26.05 stable)
+- **语言**: Rust 2021 edition (toolchain 1.96, via nixpkgs-unstable)
 - **Web 框架**: axum 0.8 (不使用 rig.rs / pingora 等高级抽象)
 - **HTTP client**: reqwest 0.12 with rustls
 - **协议无关**: body 在字节层面流动, 不解析 LLM 协议; secret 改写在字节层面
