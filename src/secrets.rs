@@ -1,26 +1,39 @@
-//! Secret 注册表: 类型定义 + 内存存储 + 配置文件持久化.
+//! Secret 注册表: 类型定义 + 内存存储 + 双层 (static + dynamic) 持久化.
 //!
-//! 设计:
-//! - [`SecretTable`] 是进程级共享状态, 由 `ProxyState` 持有.
-//! - 内存层: `Arc<RwLock<Vec<SecretEntry>>>`, 读写并发安全.
-//! - 持久化层: 任何修改都立即写回 TOML 配置文件 (原子 rename + fsync, 防止半写状态).
-//! - 失败回滚: **先持久化, 再更新内存** — 保证内存永远是已持久化的子集.
-//! - 持久化串行化: 一把独立的 `Mutex` 串行所有 persist 调用, 避免 tmp 文件冲突.
+//! # 三层数据模型
 //!
-//! 第四步的 find-and-replace 将读取这里的 [`SecretTable::snapshot`] 获取最新列表.
+//! [`SecretTable`] 同时持有:
+//! - `static_entries`: 来自 `secret-guard.toml` 的只读基线, 启动时加载, 进程内不可变.
+//! - `dynamic_entries`: 来自 `secret-guard.state.toml` 的 WebUI 编辑结果, 可 CRUD.
+//! - `decisions`: 与 [`crate::provider::ProviderTable`] 共享同一份 [`Decisions`] 实例
+//!   (因为两者都写 state.toml).
+//!
+//! # 合并语义 (effective view)
+//!
+//! 对每个 id, [`SecretTable::effective_snapshot`] 按 [`OverrideMode`] 计算实际生效值,
+//! 与 [`crate::provider::ProviderTable`] 完全对称. 见该模块的文档.
+//!
+//! # 持久化
+//!
+//! - 任何修改都立即写回 state.toml (atomic rename + fsync).
+//! - **先持久化, 再更新内存** — 失败时内存自动回滚.
+//! - 共享 `persist_lock` 串行整个 RMW, 避免与 ProviderTable 互相覆盖.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
-use crate::config::Config;
+use crate::config::{
+    classify_source, pick_effective, Decisions, DynamicState, EffectiveSource, OverrideMode,
+};
 
 /// 单条 secret 注册项.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretEntry {
-    /// 唯一 id (slug). 同一份表中必须唯一.
+    /// 唯一 id (slug). 同一份表 (static 或 dynamic) 中必须唯一.
     /// 通过 [`validate_id`] 校验合法字符集.
     pub id: String,
     /// 可选的人类可读名称 (用于 Web UI 显示).
@@ -94,13 +107,23 @@ pub fn validate_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 校验 secret value. 防止用户误配短 / 结构性 / 含 PUA 字符的 secret
-/// (避免 redact 时破坏整个请求 body).
+/// 校验 secret value. 防止用户误配短 / 结构性 / 含 PUA / 与 mock prefix 冲突的 secret
+/// (避免 redact 时破坏整个请求 body 或 round-trip identity).
+///
+/// 特别拒绝 [`crate::redact::MOCK_PREFIX`] (`sgm_`): 该 prefix 与 mock_secret 输出
+/// 共享, 若 real secret 也含此 prefix, mock 可能与 real 共享 ≥4 字符子串, 违反 C5.
 pub fn validate_value(value: &str) -> Result<(), String> {
     if value.len() < 3 {
         return Err(format!(
             "secret value too short (min 3 bytes), got {}",
             value.len()
+        ));
+    }
+    // 含 mock prefix → 与 redact 输出冲突, 拒绝.
+    if value.contains(crate::redact::MOCK_PREFIX) {
+        return Err(format!(
+            "secret value must not contain the mock prefix '{}' (reserved for redaction)",
+            crate::redact::MOCK_PREFIX
         ));
     }
     // PUA 字符与 mock 输出冲突, 拒绝.
@@ -113,73 +136,208 @@ pub fn validate_value(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Secret 表. 在 ProxyState 中作为共享可变状态.
-#[derive(Clone)]
-pub struct SecretTable {
-    inner: Arc<RwLock<Vec<SecretEntry>>>,
-    /// 独立的持久化锁: 串行所有 persist 调用, 避免 tmp 文件名竞态.
-    persist_lock: Arc<Mutex<()>>,
-    config_path: Arc<PathBuf>,
+/// 对 secret / api_key 做最小信息脱敏:
+/// - 空 → 空;
+/// - 短 (≤8 字符) → 用相同长度的 `*` 填充, 暴露长度但不暴露内容;
+/// - 长 (>8 字符) → 保留首尾各 1 字符 + 中间 `*` (长度等于原值).
+///
+/// `pub(crate)` 让 web::api / provider / secrets 共用同一份实现 (DRY).
+pub(crate) fn mask_value(v: &str) -> String {
+    let chars: Vec<char> = v.chars().collect();
+    if chars.is_empty() {
+        return String::new();
+    }
+    if chars.len() <= 8 {
+        return "*".repeat(chars.len());
+    }
+    let head = chars[0];
+    let tail = chars[chars.len() - 1];
+    let stars = "*".repeat(chars.len().saturating_sub(2));
+    format!("{head}{stars}{tail}")
 }
 
-impl std::fmt::Debug for SecretTable {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SecretTable")
-            .field("count", &self.inner.read().len())
-            .field("config_path", &self.config_path)
-            .finish()
+// ─── Effective view ────────────────────────────────────────────────────────
+
+// EffectiveSource 已抽到 `crate::config`, provider / secret 共用同一份 SSOT.
+
+/// Secret 的合并视图项. value 已脱敏 (永不回传真实值).
+#[derive(Debug, Clone, Serialize)]
+pub struct EffectiveSecret {
+    pub id: String,
+    pub name: Option<String>,
+    pub category: SecretCategory,
+    pub value_masked: String,
+    pub value_length: usize,
+
+    pub source: EffectiveSource,
+    pub decision: OverrideMode,
+    pub static_version: Option<SecretMasked>,
+    pub dynamic_version: Option<SecretMasked>,
+}
+
+/// 对外返回时屏蔽真实 value. 见 [`mask_value`] 的脱敏规则.
+#[derive(Debug, Clone, Serialize)]
+pub struct SecretMasked {
+    pub id: String,
+    pub name: Option<String>,
+    pub category: SecretCategory,
+    pub value_masked: String,
+    pub value_length: usize,
+}
+
+impl From<SecretEntry> for SecretMasked {
+    fn from(e: SecretEntry) -> Self {
+        Self {
+            id: e.id,
+            name: e.name,
+            category: e.category,
+            value_masked: crate::secrets::mask_value(&e.value),
+            value_length: e.value.chars().count(),
+        }
     }
 }
 
-/// `upsert` / `delete` 的返回值: 明确区分 "新增" / "更新" / "不存在" 语义.
+// ─── Upsert / Delete 返回值 ────────────────────────────────────────────────
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpsertKind {
     Inserted,
     Updated,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    Deleted,
+    NotFound,
+}
+
+// ─── SecretTable ───────────────────────────────────────────────────────────
+
+/// Secret 表. 在 ProxyState 中作为共享可变状态.
+#[derive(Clone)]
+pub struct SecretTable {
+    static_entries: Arc<RwLock<Vec<SecretEntry>>>,
+    dynamic_entries: Arc<RwLock<Vec<SecretEntry>>>,
+    /// 与 ProviderTable 共享.
+    decisions: Arc<RwLock<Decisions>>,
+    persist_lock: Arc<Mutex<()>>,
+    state_path: Arc<PathBuf>,
+}
+
+impl std::fmt::Debug for SecretTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = self.static_entries.read();
+        let d = self.dynamic_entries.read();
+        f.debug_struct("SecretTable")
+            .field("static_count", &s.len())
+            .field("dynamic_count", &d.len())
+            .field("state_path", &self.state_path)
+            .finish()
+    }
+}
+
 impl SecretTable {
-    pub fn new(entries: Vec<SecretEntry>, config_path: PathBuf) -> Self {
-        Self::with_persist_lock(entries, config_path, Arc::new(Mutex::new(())))
+    pub fn new(
+        static_entries: Vec<SecretEntry>,
+        dynamic_entries: Vec<SecretEntry>,
+        decisions: Arc<RwLock<Decisions>>,
+        state_path: PathBuf,
+    ) -> Self {
+        Self::with_persist_lock(
+            static_entries,
+            dynamic_entries,
+            decisions,
+            state_path,
+            Arc::new(Mutex::new(())),
+        )
     }
 
     /// 用外部共享的 `persist_lock` 构造. 与 `ProviderTable::with_persist_lock` 对称:
-    /// server 启动时创建一把锁传给两个 table, 保证它们对 config 文件的 RMW 串行化,
-    /// 避免一方读-改-写覆盖另一方刚写入的字段.
+    /// server 启动时创建一把锁传给两个 table, 保证它们对 state 文件的 RMW 串行化.
     pub fn with_persist_lock(
-        entries: Vec<SecretEntry>,
-        config_path: PathBuf,
+        static_entries: Vec<SecretEntry>,
+        dynamic_entries: Vec<SecretEntry>,
+        decisions: Arc<RwLock<Decisions>>,
+        state_path: PathBuf,
         persist_lock: Arc<Mutex<()>>,
     ) -> Self {
         Self {
-            inner: Arc::new(RwLock::new(entries)),
+            static_entries: Arc::new(RwLock::new(static_entries)),
+            dynamic_entries: Arc::new(RwLock::new(dynamic_entries)),
+            decisions,
             persist_lock,
-            config_path: Arc::new(config_path),
+            state_path: Arc::new(state_path),
         }
     }
 
-    /// 当前所有 secret 的快照 (深拷贝, 调用方可自由修改).
-    pub fn snapshot(&self) -> Vec<SecretEntry> {
-        self.inner.read().clone()
+    /// 返回 effective view 中所有生效 secret 的**原始值** (未脱敏).
+    /// 供 redact 流程使用. Disabled 的项被排除.
+    pub fn effective_raw(&self) -> Vec<SecretEntry> {
+        let statics = self.static_entries.read();
+        let dynamics = self.dynamic_entries.read();
+        let decisions = self.decisions.read();
+
+        let mut out: Vec<SecretEntry> = Vec::with_capacity(statics.len() + dynamics.len());
+        let mut seen: HashSet<String> = HashSet::new();
+
+        for s in statics.iter() {
+            seen.insert(s.id.clone());
+            let d = dynamics.iter().find(|e| e.id == s.id).cloned();
+            let mode = decisions.secret(&s.id);
+            if let Some(e) = pick_effective(Some(s.clone()), d, mode) {
+                out.push(e);
+            }
+        }
+        for d in dynamics.iter() {
+            if seen.contains(&d.id) {
+                continue;
+            }
+            seen.insert(d.id.clone());
+            if let Some(e) = pick_effective(None, Some(d.clone()), OverrideMode::Default) {
+                out.push(e);
+            }
+        }
+        out
     }
 
-    /// 通过 id 查找单条 secret.
-    pub fn get(&self, id: &str) -> Option<SecretEntry> {
-        self.inner.read().iter().find(|e| e.id == id).cloned()
+    /// 返回 effective view (供 WebUI 列表). value 已脱敏.
+    pub fn effective_snapshot(&self) -> Vec<EffectiveSecret> {
+        let statics = self.static_entries.read();
+        let dynamics = self.dynamic_entries.read();
+        let decisions = self.decisions.read();
+
+        let mut out: Vec<EffectiveSecret> = Vec::with_capacity(statics.len() + dynamics.len());
+        let mut seen: HashSet<String> = HashSet::new();
+
+        for s in statics.iter() {
+            seen.insert(s.id.clone());
+            let d = dynamics.iter().find(|e| e.id == s.id).cloned();
+            let mode = decisions.secret(&s.id);
+            if let Some(ev) = compute_effective_secret(Some(s.clone()), d, mode) {
+                out.push(ev);
+            }
+        }
+        for d in dynamics.iter() {
+            if seen.contains(&d.id) {
+                continue;
+            }
+            seen.insert(d.id.clone());
+            if let Some(ev) = compute_effective_secret(None, Some(d.clone()), OverrideMode::Default)
+            {
+                out.push(ev);
+            }
+        }
+        out
     }
 
-    /// 新增 / 覆盖 (按 id 去重). 返回最终保存的 entry + insert/update 标记.
-    /// 写回 config 文件 (失败时内存自动回滚, 因为是"先持久化再更新内存").
-    ///
-    /// 并发语义: 整个 RMW (read-modify-write) 在 [`persist_lock`] 内串行执行,
-    /// 保证两个并发 upsert 不会互相覆盖. 读取 (snapshot/get) 不持此锁, 不阻塞.
-    pub fn upsert(&self, entry: SecretEntry) -> anyhow::Result<(SecretEntry, UpsertKind)> {
+    /// 仅 dynamic 层 CRUD —— upsert. 若 id 同时存在于 static, 创建 / 更新 override.
+    pub fn upsert_dynamic(&self, entry: SecretEntry) -> anyhow::Result<(SecretEntry, UpsertKind)> {
         validate_id(&entry.id).map_err(anyhow::Error::msg)?;
         validate_value(&entry.value).map_err(anyhow::Error::msg)?;
+
         let _guard = self.persist_lock.lock();
-        // 1. 读当前 entries, 计算新版本.
         let (new_entries, kind) = {
-            let g = self.inner.read();
+            let g = self.dynamic_entries.read();
             let mut v = g.clone();
             if let Some(e) = v.iter_mut().find(|e| e.id == entry.id) {
                 *e = entry.clone();
@@ -189,53 +347,91 @@ impl SecretTable {
                 (v, UpsertKind::Inserted)
             }
         };
-        // 2. 先持久化 (失败时 inner 未变, 自动回滚).
-        self.persist_entries(&new_entries)?;
-        // 3. 持久化成功后再更新内存.
-        *self.inner.write() = new_entries;
+        self.persist_dynamic(&new_entries)?;
+        *self.dynamic_entries.write() = new_entries;
         Ok((entry, kind))
     }
 
-    /// 按 id 删除. 不存在时返回 NotFound (由调用方决定 404).
-    pub fn delete(&self, id: &str) -> anyhow::Result<DeleteOutcome> {
+    /// 仅 dynamic 层 CRUD —— delete.
+    pub fn delete_dynamic(&self, id: &str) -> anyhow::Result<DeleteOutcome> {
         let _guard = self.persist_lock.lock();
-        // 1. 计算新 entries.
-        let (new_entries, existed) = {
-            let g = self.inner.read();
+        let new_entries = {
+            let g = self.dynamic_entries.read();
             let existed = g.iter().any(|e| e.id == id);
             if !existed {
                 return Ok(DeleteOutcome::NotFound);
             }
-            let v: Vec<_> = g.iter().filter(|e| e.id != id).cloned().collect();
-            (v, true)
+            g.iter().filter(|e| e.id != id).cloned().collect::<Vec<_>>()
         };
-        // 2. 先持久化.
-        self.persist_entries(&new_entries)?;
-        // 3. 更新内存.
-        *self.inner.write() = new_entries;
-        debug_assert!(existed);
+        self.persist_dynamic(&new_entries)?;
+        *self.dynamic_entries.write() = new_entries;
         Ok(DeleteOutcome::Deleted)
     }
 
-    /// 写回 config 文件. 调用方必须持有 [`persist_lock`] (避免并发 persist 互相覆盖).
-    fn persist_entries(&self, entries: &[SecretEntry]) -> anyhow::Result<()> {
-        let mut cfg = Config::load_or_default(&self.config_path)?;
-        cfg.secrets.entries = entries.to_vec();
-        let text = cfg.to_toml()?;
-        atomic_write(&self.config_path, &text)
+    /// 设置对某 static id 的决策. 持久化到 state.toml.
+    ///
+    /// 满足"先持久化, 再更新内存"契约: 若 atomic_write 失败, 内存 decisions 保持旧值.
+    pub fn set_decision(&self, id: &str, mode: OverrideMode) -> anyhow::Result<()> {
+        let _guard = self.persist_lock.lock();
+        let new_decisions = {
+            let cur = self.decisions.read().clone();
+            let mut next = cur;
+            next.set_secret(id, mode);
+            next
+        };
+        let mut state = DynamicState::load_or_empty(&self.state_path)?;
+        state.decisions = new_decisions.clone();
+        let text = state.to_toml()?;
+        atomic_write(&self.state_path, &text)?;
+        *self.decisions.write() = new_decisions;
+        Ok(())
+    }
+
+    /// 直接查 static 层. 同 [`crate::provider::ProviderTable::has_static`].
+    pub fn has_static(&self, id: &str) -> bool {
+        self.static_entries.read().iter().any(|e| e.id == id)
+    }
+
+    // ─── 内部持久化 helper ──────────────────────────────────────────────
+
+    fn persist_dynamic(&self, new_dynamic: &[SecretEntry]) -> anyhow::Result<()> {
+        let mut state = DynamicState::load_or_empty(&self.state_path)?;
+        state.secrets = new_dynamic.to_vec();
+        let text = state.to_toml()?;
+        atomic_write(&self.state_path, &text)
     }
 }
 
-/// `delete` 的返回值, 明确区分"删除了"vs"不存在".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeleteOutcome {
-    Deleted,
-    NotFound,
+// ─── 合并算法 (薄包装, 事实源在 `crate::config`) ───────────────────────────
+
+fn compute_effective_secret(
+    static_ver: Option<SecretEntry>,
+    dynamic_ver: Option<SecretEntry>,
+    mode: OverrideMode,
+) -> Option<EffectiveSecret> {
+    let raw = pick_effective(static_ver.clone(), dynamic_ver.clone(), mode)?;
+    let source = classify_source(static_ver.is_some(), dynamic_ver.is_some(), mode)
+        .expect("pick_effective Some ⇒ classify_source Some");
+    let static_masked = static_ver.map(SecretMasked::from);
+    let dynamic_masked = dynamic_ver.map(SecretMasked::from);
+    Some(EffectiveSecret {
+        value_masked: crate::secrets::mask_value(&raw.value),
+        value_length: raw.value.chars().count(),
+        id: raw.id,
+        name: raw.name,
+        category: raw.category,
+        source,
+        decision: mode,
+        static_version: static_masked,
+        dynamic_version: dynamic_masked,
+    })
 }
+
+// ─── atomic_write 共用工具 ─────────────────────────────────────────────────
 
 /// 原子写文件: 先写带 UUID 的 `.tmp`, sync, 再 rename.
 ///
-/// `pub(crate)` 以便 `provider::persist_providers` 复用同一份实现.
+/// `pub(crate)` 以便 `provider` 复用同一份实现.
 pub(crate) fn atomic_write(path: &Path, text: &str) -> anyhow::Result<()> {
     use std::io::Write;
 
@@ -279,6 +475,10 @@ mod tests {
         }
     }
 
+    fn empty_decisions() -> Arc<RwLock<Decisions>> {
+        Arc::new(RwLock::new(Decisions::default()))
+    }
+
     fn tempfile_path() -> PathBuf {
         let id = uuid::Uuid::new_v4().to_string();
         let path = PathBuf::from(format!("/tmp/opencode/tmp/test-secrets-{id}.toml"));
@@ -287,89 +487,150 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_is_isolated() {
-        let t = SecretTable::new(vec![entry("a", "value-1")], PathBuf::from("/tmp/x.toml"));
-        let mut snap = t.snapshot();
+    fn effective_raw_isolated_from_static_only() {
+        let t = SecretTable::new(
+            vec![entry("a", "value-a"), entry("b", "value-b")],
+            vec![],
+            empty_decisions(),
+            PathBuf::from("/tmp/x.toml"),
+        );
+        let mut snap = t.effective_raw();
         snap.clear();
-        assert_eq!(t.snapshot().len(), 1);
+        assert_eq!(t.effective_raw().len(), 2, "static_entries unchanged");
     }
 
     #[test]
-    fn upsert_inserts_then_updates() {
+    fn dynamic_overrides_static_by_default() {
+        let t = SecretTable::new(
+            vec![entry("a", "static-value")],
+            vec![entry("a", "dynamic-value")],
+            empty_decisions(),
+            PathBuf::from("/tmp/x.toml"),
+        );
+        let snap = t.effective_raw();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].value, "dynamic-value");
+    }
+
+    #[test]
+    fn prefer_static_wins_over_dynamic() {
+        let t = SecretTable::new(
+            vec![entry("a", "static-value")],
+            vec![entry("a", "dynamic-value")],
+            empty_decisions(),
+            PathBuf::from("/tmp/x.toml"),
+        );
+        t.set_decision("a", OverrideMode::PreferStatic).unwrap();
+        let snap = t.effective_raw();
+        assert_eq!(snap[0].value, "static-value");
+    }
+
+    #[test]
+    fn disabled_drops_secret() {
+        let t = SecretTable::new(
+            vec![entry("a", "static-value")],
+            vec![],
+            empty_decisions(),
+            PathBuf::from("/tmp/x.toml"),
+        );
+        t.set_decision("a", OverrideMode::Disabled).unwrap();
+        assert!(t.effective_raw().is_empty());
+    }
+
+    #[test]
+    fn upsert_inserts_then_updates_dynamic() {
         let tmp = tempfile_path();
-        let t = SecretTable::new(vec![], tmp.clone());
-        let (_, k1) = t.upsert(entry("a", "value-1")).unwrap();
+        let t = SecretTable::new(vec![], vec![], empty_decisions(), tmp.clone());
+        let (_, k1) = t.upsert_dynamic(entry("a", "value-1")).unwrap();
         assert_eq!(k1, UpsertKind::Inserted);
-        assert_eq!(t.snapshot().len(), 1);
-        let (_, k2) = t.upsert(entry("a", "value-2")).unwrap();
+        let (_, k2) = t.upsert_dynamic(entry("a", "value-2")).unwrap();
         assert_eq!(k2, UpsertKind::Updated);
-        assert_eq!(t.snapshot().len(), 1);
-        assert_eq!(t.get("a").unwrap().value, "value-2");
+        let snap = t.effective_raw();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].value, "value-2");
     }
 
     #[test]
-    fn delete_removes_and_persists() {
+    fn delete_dynamic_removes_and_persists() {
         let tmp = tempfile_path();
         let t = SecretTable::new(
+            vec![],
             vec![entry("a", "value-1"), entry("b", "value-b")],
+            empty_decisions(),
             tmp.clone(),
         );
-        assert_eq!(t.delete("a").unwrap(), DeleteOutcome::Deleted);
-        assert_eq!(t.snapshot().len(), 1);
-        let cfg = Config::load_or_default(&tmp).unwrap();
-        assert_eq!(cfg.secrets.entries.len(), 1);
-        assert_eq!(cfg.secrets.entries[0].id, "b");
+        assert_eq!(t.delete_dynamic("a").unwrap(), DeleteOutcome::Deleted);
+        assert_eq!(t.effective_raw().len(), 1);
+        let state = DynamicState::load_or_empty(&tmp).unwrap();
+        assert_eq!(state.secrets.len(), 1);
+        assert_eq!(state.secrets[0].id, "b");
     }
 
     #[test]
-    fn delete_missing_returns_not_found() {
+    fn delete_dynamic_keeps_static_baseline() {
         let tmp = tempfile_path();
-        let t = SecretTable::new(vec![], tmp);
-        assert_eq!(t.delete("nope").unwrap(), DeleteOutcome::NotFound);
+        let t = SecretTable::new(
+            vec![entry("a", "static-value")],
+            vec![entry("a", "dynamic-value")],
+            empty_decisions(),
+            tmp,
+        );
+        assert_eq!(t.delete_dynamic("a").unwrap(), DeleteOutcome::Deleted);
+        let snap = t.effective_raw();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].value, "static-value");
+    }
+
+    #[test]
+    fn delete_dynamic_missing_returns_not_found() {
+        let tmp = tempfile_path();
+        let t = SecretTable::new(vec![], vec![], empty_decisions(), tmp);
+        assert_eq!(t.delete_dynamic("nope").unwrap(), DeleteOutcome::NotFound);
     }
 
     #[test]
     fn invalid_id_rejected() {
         let tmp = tempfile_path();
-        let t = SecretTable::new(vec![], tmp);
+        let t = SecretTable::new(vec![], vec![], empty_decisions(), tmp);
         let bad = SecretEntry {
             id: "has space".into(),
             name: None,
             category: SecretCategory::Other,
             value: "v".into(),
         };
-        assert!(t.upsert(bad).is_err());
+        assert!(t.upsert_dynamic(bad).is_err());
     }
 
     #[test]
     fn leading_dash_id_rejected() {
         let tmp = tempfile_path();
-        let t = SecretTable::new(vec![], tmp);
+        let t = SecretTable::new(vec![], vec![], empty_decisions(), tmp);
         let bad = SecretEntry {
             id: "-leading-dash".into(),
             name: None,
             category: SecretCategory::Other,
             value: "v".into(),
         };
-        assert!(t.upsert(bad).is_err());
+        assert!(t.upsert_dynamic(bad).is_err());
     }
 
     #[test]
     fn concurrent_upserts_no_lost_update() {
         // Smoke test: 两个线程并发 upsert 不同的 id, 两者都应该最终可见.
         let tmp = tempfile_path();
-        let t = SecretTable::new(vec![], tmp);
+        let t = SecretTable::new(vec![], vec![], empty_decisions(), tmp);
         let t1 = t.clone();
         let t2 = t.clone();
-        let h1 = std::thread::spawn(move || t1.upsert(entry("a", "value-a")));
-        let h2 = std::thread::spawn(move || t2.upsert(entry("b", "value-b")));
+        let h1 = std::thread::spawn(move || t1.upsert_dynamic(entry("a", "value-a")));
+        let h2 = std::thread::spawn(move || t2.upsert_dynamic(entry("b", "value-b")));
         h1.join().unwrap().unwrap();
         h2.join().unwrap().unwrap();
-        let snap = t.snapshot();
+        let snap = t.effective_raw();
         let ids: Vec<_> = snap.iter().map(|e| e.id.clone()).collect();
         assert!(ids.contains(&"a".to_string()), "lost update: {ids:?}");
         assert!(ids.contains(&"b".to_string()), "lost update: {ids:?}");
     }
+
     #[test]
     fn validate_id_accepts_valid_slugs() {
         assert!(validate_id("a").is_ok());

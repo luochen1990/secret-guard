@@ -28,7 +28,7 @@ async fn spawn_mock_upstream() -> mockito::ServerGuard {
 }
 
 /// 启动 secret-guard, 单 provider (默认 OpenAI 协议, base_url = mock 上游).
-async fn spawn_proxy_with_provider(_upstream_base: String, provider: Provider) -> String {
+async fn spawn_proxy_with_provider(provider: Provider) -> String {
     spawn_proxy_full(
         vec![provider],
         reqwest::Client::new(),
@@ -39,9 +39,9 @@ async fn spawn_proxy_with_provider(_upstream_base: String, provider: Provider) -
 }
 
 /// 启动 secret-guard, 默认 OpenAI provider 指向 mock 上游.
-async fn spawn_proxy(upstream_base: String) -> String {
-    let provider = openai_provider("oa-main", &upstream_base);
-    spawn_proxy_with_provider(upstream_base, provider).await
+async fn spawn_proxy(upstream_base: &str) -> String {
+    let provider = openai_provider("oa-main", upstream_base);
+    spawn_proxy_with_provider(provider).await
 }
 
 fn openai_provider(id: &str, base_url: &str) -> Provider {
@@ -72,12 +72,42 @@ async fn spawn_proxy_full(
     records: RecordStore,
     secrets: SecretTable,
 ) -> String {
+    spawn_proxy_static_dynamic(vec![], providers, upstream, records, secrets).await
+}
+
+/// 显式同时指定 static + dynamic 两层.
+/// 旧 helper (`spawn_proxy_full`) 把所有传入视为 dynamic, 仍保持向后兼容.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_proxy_static_dynamic(
+    static_providers: Vec<Provider>,
+    dynamic_providers: Vec<Provider>,
+    upstream: reqwest::Client,
+    records: RecordStore,
+    secrets: SecretTable,
+) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let id = uuid::Uuid::new_v4().to_string();
-    let cfg_path = std::path::PathBuf::from(format!("/tmp/opencode/tmp/test-sg-cfg-{id}.toml"));
-    let _ = std::fs::remove_file(&cfg_path);
-    let provider_table = ProviderTable::new(providers, cfg_path);
+    let state_path = std::path::PathBuf::from(format!("/tmp/opencode/tmp/test-sg-state-{id}.toml"));
+    let _ = std::fs::remove_file(&state_path);
+
+    // 共享 decisions + persist_lock, 模拟生产环境的双表协同.
+    let decisions = std::sync::Arc::new(parking_lot::RwLock::new(
+        secret_guard::config::Decisions::default(),
+    ));
+    let persist_lock = std::sync::Arc::new(parking_lot::Mutex::new(()));
+
+    let provider_table = ProviderTable::with_persist_lock(
+        static_providers,
+        dynamic_providers,
+        decisions.clone(),
+        state_path.clone(),
+        persist_lock.clone(),
+    );
+
+    // SecretTable 由调用方构造 (内部已带独立的 decisions + persist_lock).
+    // 测试场景下 secrets 与 providers 不共享 state 文件, 不影响测试结论.
+    let _ = (decisions, persist_lock, state_path);
     let proxy = ProxyState {
         upstream,
         providers: provider_table,
@@ -99,7 +129,11 @@ fn test_secret_table_with(entries: Vec<SecretEntry>) -> SecretTable {
     let id = uuid::Uuid::new_v4().to_string();
     let path = std::path::PathBuf::from(format!("/tmp/opencode/tmp/test-secret-table-{id}.toml"));
     let _ = std::fs::remove_file(&path);
-    SecretTable::new(entries, path)
+    let decisions = std::sync::Arc::new(parking_lot::RwLock::new(
+        secret_guard::config::Decisions::default(),
+    ));
+    // 旧测试语义: 把传入 entries 视为 dynamic (供 redact 流程使用).
+    SecretTable::new(vec![], entries, decisions, path)
 }
 
 fn secret(id: &str, value: &str) -> SecretEntry {
@@ -166,7 +200,7 @@ async fn forwards_non_streaming_json() {
         .create_async()
         .await;
 
-    let proxy_url = spawn_proxy(upstream.url()).await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
     let (status, body, headers) = proxy_request(
         &proxy_url,
         "POST",
@@ -196,7 +230,7 @@ async fn forwards_streaming_sse() {
         .create_async()
         .await;
 
-    let proxy_url = spawn_proxy(upstream.url()).await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
     let resp = reqwest::Client::new()
         .post(format!("{proxy_url}/o/oa-main/v1/chat/completions"))
         .body(r#"{"model":"gpt-4","stream":true}"#)
@@ -221,7 +255,7 @@ async fn provider_api_key_overrides_client_auth() {
         .create_async()
         .await;
 
-    let proxy_url = spawn_proxy(upstream.url()).await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
     // 客户端发了个错误的 token; 服务端应使用 provider 配置的 api_key.
     let (status, _, _) = proxy_request(
         &proxy_url,
@@ -253,7 +287,7 @@ async fn anthropic_provider_uses_x_api_key() {
         enabled: true,
         name: None,
     };
-    let proxy_url = spawn_proxy_with_provider(upstream.url(), provider).await;
+    let proxy_url = spawn_proxy_with_provider(provider).await;
     let (status, _, _) =
         proxy_request(&proxy_url, "POST", "/a/an-main/v1/messages", "{}", &[]).await;
     assert_eq!(status, reqwest::StatusCode::OK);
@@ -270,7 +304,7 @@ async fn strips_custom_connection_listed_header() {
         .create_async()
         .await;
 
-    let proxy_url = spawn_proxy(upstream.url()).await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
     let (status, _, _) = proxy_request(
         &proxy_url,
         "POST",
@@ -346,7 +380,7 @@ async fn upstream_non_2xx_is_forwarded() {
         .create_async()
         .await;
 
-    let proxy_url = spawn_proxy(upstream.url()).await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
     let (status, body, _) = proxy_request(
         &proxy_url,
         "POST",
@@ -410,7 +444,7 @@ async fn get_method_is_forwarded() {
         .create_async()
         .await;
 
-    let proxy_url = spawn_proxy(upstream.url()).await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
     let (status, body, _) = proxy_request(&proxy_url, "GET", "/o/oa-main/healthz", "", &[]).await;
     assert_eq!(status, reqwest::StatusCode::OK);
     assert_eq!(body, "ok");
@@ -430,7 +464,7 @@ async fn passes_query_string_through() {
         .create_async()
         .await;
 
-    let proxy_url = spawn_proxy(upstream.url()).await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
     let (status, _, _) = proxy_request(
         &proxy_url,
         "GET",
@@ -447,7 +481,7 @@ async fn passes_query_string_through() {
 #[tokio::test]
 async fn unknown_protocol_returns_404() {
     let upstream = spawn_mock_upstream().await;
-    let proxy_url = spawn_proxy(upstream.url()).await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
     let (status, body, _) = proxy_request(&proxy_url, "POST", "/x/foo/v1/chat", "{}", &[]).await;
     assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
     assert!(body.contains("not_found"));
@@ -456,7 +490,7 @@ async fn unknown_protocol_returns_404() {
 #[tokio::test]
 async fn unknown_provider_returns_404() {
     let upstream = spawn_mock_upstream().await;
-    let proxy_url = spawn_proxy(upstream.url()).await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
     let (status, body, _) = proxy_request(
         &proxy_url,
         "POST",
@@ -484,7 +518,7 @@ async fn disabled_provider_returns_503() {
         enabled: false,
         ..openai_provider("oa-disabled", &upstream.url())
     };
-    let proxy_url = spawn_proxy_with_provider(upstream.url(), provider).await;
+    let proxy_url = spawn_proxy_with_provider(provider).await;
     let (status, body, _) = proxy_request(
         &proxy_url,
         "POST",
@@ -502,7 +536,7 @@ async fn cross_protocol_returns_501() {
     // provider 协议是 Anthropic, 但客户端用 /o/ (OpenAI 入口) 访问.
     let upstream = spawn_mock_upstream().await;
     let provider = provider_with("an-main", Protocol::Anthropic, &upstream.url());
-    let proxy_url = spawn_proxy_with_provider(upstream.url(), provider).await;
+    let proxy_url = spawn_proxy_with_provider(provider).await;
     let (status, body, _) = proxy_request(
         &proxy_url,
         "POST",
@@ -526,7 +560,7 @@ async fn no_rest_segment_routes_to_root() {
         .with_body("root")
         .create_async()
         .await;
-    let proxy_url = spawn_proxy(upstream.url()).await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
     let (status, body, _) = proxy_request(&proxy_url, "GET", "/o/oa-main", "", &[]).await;
     assert_eq!(status, reqwest::StatusCode::OK);
     assert_eq!(body, "root");
@@ -536,7 +570,7 @@ async fn no_rest_segment_routes_to_root() {
 async fn unmatched_path_returns_404() {
     // 单段路径不匹配 `/{proto}/{name}` 路由, 应当 404 (不被 catch-all 转发).
     let upstream = spawn_mock_upstream().await;
-    let proxy_url = spawn_proxy(upstream.url()).await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
     let resp = reqwest::Client::new()
         .get(format!("{proxy_url}/just-one-segment"))
         .send()
@@ -550,7 +584,7 @@ async fn unmatched_path_returns_404() {
 #[tokio::test]
 async fn root_serves_web_ui() {
     let upstream = spawn_mock_upstream().await;
-    let proxy_url = spawn_proxy(upstream.url()).await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
     let resp = reqwest::Client::new()
         .get(format!("{proxy_url}/"))
         .send()
@@ -565,7 +599,7 @@ async fn root_serves_web_ui() {
 #[tokio::test]
 async fn web_ui_legacy_path_still_works() {
     let upstream = spawn_mock_upstream().await;
-    let proxy_url = spawn_proxy(upstream.url()).await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
     let resp = reqwest::Client::new()
         .get(format!("{proxy_url}/__sg"))
         .send()
@@ -679,7 +713,7 @@ async fn web_api_returns_record_by_id() {
 #[tokio::test]
 async fn web_api_404_for_unknown_record() {
     let upstream = spawn_mock_upstream().await;
-    let proxy_url = spawn_proxy(upstream.url()).await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
     let resp = reqwest::Client::new()
         .get(format!(
             "{proxy_url}/__sg/api/records/00000000-0000-0000-0000-000000000000"
@@ -693,7 +727,7 @@ async fn web_api_404_for_unknown_record() {
 #[tokio::test]
 async fn web_api_400_for_invalid_uuid() {
     let upstream = spawn_mock_upstream().await;
-    let proxy_url = spawn_proxy(upstream.url()).await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
     let resp = reqwest::Client::new()
         .get(format!("{proxy_url}/__sg/api/records/not-a-uuid"))
         .send()
@@ -712,7 +746,7 @@ async fn web_namespace_not_forwarded_to_upstream() {
         .create_async()
         .await;
 
-    let proxy_url = spawn_proxy(upstream.url()).await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
 
     let resp = reqwest::Client::new()
         .get(format!("{proxy_url}/__sg/api/records/"))
@@ -731,7 +765,7 @@ async fn web_namespace_not_forwarded_to_upstream() {
 #[tokio::test]
 async fn secrets_api_lists_empty() {
     let upstream = spawn_mock_upstream().await;
-    let proxy_url = spawn_proxy(upstream.url()).await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
     let resp = reqwest::Client::new()
         .get(format!("{proxy_url}/__sg/api/secrets"))
         .send()
@@ -748,7 +782,7 @@ async fn secrets_api_lists_empty() {
 #[tokio::test]
 async fn secrets_api_create_lists_update_delete() {
     let upstream = spawn_mock_upstream().await;
-    let proxy_url = spawn_proxy(upstream.url()).await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
     let client = reqwest::Client::new();
 
     let resp = client
@@ -802,7 +836,7 @@ async fn secrets_api_create_lists_update_delete() {
 #[tokio::test]
 async fn secrets_api_rejects_empty_value() {
     let upstream = spawn_mock_upstream().await;
-    let proxy_url = spawn_proxy(upstream.url()).await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
     let resp = reqwest::Client::new()
         .post(format!("{proxy_url}/__sg/api/secrets"))
         .json(&serde_json::json!({
@@ -818,7 +852,7 @@ async fn secrets_api_rejects_empty_value() {
 #[tokio::test]
 async fn secrets_api_delete_missing_returns_404() {
     let upstream = spawn_mock_upstream().await;
-    let proxy_url = spawn_proxy(upstream.url()).await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
     let resp = reqwest::Client::new()
         .delete(format!("{proxy_url}/__sg/api/secrets/does-not-exist"))
         .send()
@@ -832,7 +866,7 @@ async fn secrets_api_delete_missing_returns_404() {
 #[tokio::test]
 async fn providers_api_lists_existing() {
     let upstream = spawn_mock_upstream().await;
-    let proxy_url = spawn_proxy(upstream.url()).await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
     let resp = reqwest::Client::new()
         .get(format!("{proxy_url}/__sg/api/providers"))
         .send()
@@ -852,7 +886,7 @@ async fn providers_api_lists_existing() {
 #[tokio::test]
 async fn providers_api_create_update_delete() {
     let upstream = spawn_mock_upstream().await;
-    let proxy_url = spawn_proxy(upstream.url()).await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
     let client = reqwest::Client::new();
 
     // 创建新 Anthropic provider.
@@ -922,7 +956,7 @@ async fn providers_api_create_update_delete() {
 #[tokio::test]
 async fn providers_api_rejects_bad_base_url() {
     let upstream = spawn_mock_upstream().await;
-    let proxy_url = spawn_proxy(upstream.url()).await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
     let resp = reqwest::Client::new()
         .post(format!("{proxy_url}/__sg/api/providers"))
         .json(&serde_json::json!({
@@ -1043,7 +1077,7 @@ async fn no_redact_when_secret_table_empty() {
         .create_async()
         .await;
 
-    let proxy_url = spawn_proxy(upstream.url()).await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
     let resp = reqwest::Client::new()
         .post(format!("{proxy_url}/o/oa-main/v1/chat/completions"))
         .body("raw-body")
@@ -1051,4 +1085,573 @@ async fn no_redact_when_secret_table_empty() {
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
+}
+
+// ─── static + dynamic 合并 (新设计核心) ────────────────────────────────────
+
+/// spawn proxy, 接受 static_providers (来自声明式 config) + dynamic providers (WebUI 写过).
+async fn spawn_with_static_and_dynamic(
+    static_providers: Vec<Provider>,
+    dynamic_providers: Vec<Provider>,
+) -> String {
+    spawn_proxy_static_dynamic(
+        static_providers,
+        dynamic_providers,
+        reqwest::Client::new(),
+        RecordStore::new(64),
+        test_secret_table(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn static_provider_is_listed_with_static_source() {
+    let upstream = spawn_mock_upstream().await;
+    let s = openai_provider("static-p", &upstream.url());
+    let proxy_url = spawn_with_static_and_dynamic(vec![s], vec![]).await;
+
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{proxy_url}/__sg/api/providers"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let arr = body.get("providers").unwrap().as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["id"], "static-p");
+    assert_eq!(arr[0]["source"], "static");
+    assert_eq!(arr[0]["decision"], "default");
+    assert!(arr[0]["static_version"].is_object());
+    assert!(arr[0]["dynamic_version"].is_null());
+}
+
+#[tokio::test]
+async fn static_provider_routes_correctly() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_body("static-routed")
+        .create_async()
+        .await;
+    let s = openai_provider("static-p", &upstream.url());
+    let proxy_url = spawn_with_static_and_dynamic(vec![s], vec![]).await;
+
+    let resp = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/static-p/v1/chat/completions",
+        "{}",
+        &[],
+    )
+    .await;
+    assert_eq!(resp.0, reqwest::StatusCode::OK);
+    assert_eq!(resp.1, "static-routed");
+}
+
+#[tokio::test]
+async fn dynamic_override_replaces_static_in_routing() {
+    let mut upstream_static = spawn_mock_upstream().await;
+    let _m_static = upstream_static
+        .mock("POST", "/v1/chat/completions")
+        .with_body("from-static-upstream")
+        .create_async()
+        .await;
+    let mut upstream_dyn = spawn_mock_upstream().await;
+    let _m_dyn = upstream_dyn
+        .mock("POST", "/v1/chat/completions")
+        .with_body("from-dynamic-upstream")
+        .create_async()
+        .await;
+
+    let static_p = openai_provider("shared-id", &upstream_static.url());
+    let mut dynamic_p = openai_provider("shared-id", &upstream_dyn.url());
+    dynamic_p.api_key = "dynamic-key".into();
+    let proxy_url = spawn_with_static_and_dynamic(vec![static_p], vec![dynamic_p]).await;
+
+    let resp = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/shared-id/v1/chat/completions",
+        "{}",
+        &[],
+    )
+    .await;
+    assert_eq!(resp.1, "from-dynamic-upstream", "dynamic 应覆盖 static");
+}
+
+#[tokio::test]
+async fn decision_disabled_drops_static_provider() {
+    let upstream = spawn_mock_upstream().await;
+    let s = openai_provider("static-disabled", &upstream.url());
+    let proxy_url = spawn_with_static_and_dynamic(vec![s], vec![]).await;
+    let client = reqwest::Client::new();
+
+    // 切到 disabled.
+    let resp = client
+        .patch(format!(
+            "{proxy_url}/__sg/api/providers/static-disabled/decision"
+        ))
+        .json(&serde_json::json!({"mode": "disabled"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // List 不再包含.
+    let body: serde_json::Value = client
+        .get(format!("{proxy_url}/__sg/api/providers"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let arr = body.get("providers").unwrap().as_array().unwrap();
+    assert!(arr.is_empty(), "disabled 应从 effective view 中消失");
+
+    // 路由也 404.
+    let resp = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/static-disabled/v1/chat/completions",
+        "{}",
+        &[],
+    )
+    .await;
+    assert_eq!(resp.0, reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn decision_prefer_static_beats_dynamic_override() {
+    let mut upstream_static = spawn_mock_upstream().await;
+    let _m_static = upstream_static
+        .mock("POST", "/v1/chat/completions")
+        .with_body("static-wins")
+        .create_async()
+        .await;
+    let mut upstream_dyn = spawn_mock_upstream().await;
+    let _m_dyn = upstream_dyn
+        .mock("POST", "/v1/chat/completions")
+        .with_body("dynamic-loses")
+        .create_async()
+        .await;
+
+    let static_p = openai_provider("both", &upstream_static.url());
+    let dynamic_p = openai_provider("both", &upstream_dyn.url());
+    let proxy_url = spawn_with_static_and_dynamic(vec![static_p], vec![dynamic_p]).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .patch(format!("{proxy_url}/__sg/api/providers/both/decision"))
+        .json(&serde_json::json!({"mode": "prefer_static"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let resp = proxy_request(&proxy_url, "POST", "/o/both/v1/chat/completions", "{}", &[]).await;
+    assert_eq!(resp.1, "static-wins");
+}
+
+#[tokio::test]
+async fn put_static_provider_forks_dynamic_override() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_body("ok")
+        .create_async()
+        .await;
+    let s = openai_provider("static-p", "https://invalid-static.example");
+    let proxy_url = spawn_with_static_and_dynamic(vec![s], vec![]).await;
+    let client = reqwest::Client::new();
+
+    // 用 PUT 编辑 static provider → 服务端自动 fork 出 dynamic.
+    let resp = client
+        .put(format!("{proxy_url}/__sg/api/providers/static-p"))
+        .json(&serde_json::json!({
+            "protocol": "openai",
+            "base_url": upstream.url(),
+            "api_key": "forked-key",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let updated: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(updated["source"], "dynamic_override");
+    assert_eq!(updated["base_url"], upstream.url());
+    assert!(updated["static_version"].is_object());
+    assert!(updated["dynamic_version"].is_object());
+
+    // 路由应走 dynamic (指向 mock), 而不是 static (指向 invalid URL).
+    let resp = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/static-p/v1/chat/completions",
+        "{}",
+        &[],
+    )
+    .await;
+    assert_eq!(resp.0, reqwest::StatusCode::OK);
+    assert_eq!(resp.1, "ok");
+}
+
+#[tokio::test]
+async fn delete_static_only_provider_is_rejected() {
+    let upstream = spawn_mock_upstream().await;
+    let s = openai_provider("static-p", &upstream.url());
+    let proxy_url = spawn_with_static_and_dynamic(vec![s], vec![]).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .delete(format!("{proxy_url}/__sg/api/providers/static-p"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CONFLICT,
+        "static 永不可删, 必须走 decision=disabled"
+    );
+}
+
+#[tokio::test]
+async fn delete_dynamic_override_keeps_static_baseline() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_body("static-back")
+        .create_async()
+        .await;
+
+    let static_p = openai_provider("p", &upstream.url());
+    let mut dynamic_p = openai_provider("p", "https://dynamic-invalid.example");
+    dynamic_p.api_key = "override-key".into();
+    let proxy_url = spawn_with_static_and_dynamic(vec![static_p], vec![dynamic_p]).await;
+    let client = reqwest::Client::new();
+
+    // 删除 dynamic override → 回到 static.
+    let resp = client
+        .delete(format!("{proxy_url}/__sg/api/providers/p"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+
+    // List 显示 source 回到 static.
+    let body: serde_json::Value = client
+        .get(format!("{proxy_url}/__sg/api/providers"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let arr = body.get("providers").unwrap().as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["source"], "static");
+
+    // 路由走 static (mock), 返回 ok.
+    let resp = proxy_request(&proxy_url, "POST", "/o/p/v1/chat/completions", "{}", &[]).await;
+    assert_eq!(resp.0, reqwest::StatusCode::OK);
+    assert_eq!(resp.1, "static-back");
+}
+
+#[tokio::test]
+async fn create_post_rejects_conflict_with_static_id() {
+    let upstream = spawn_mock_upstream().await;
+    let s = openai_provider("static-p", &upstream.url());
+    let proxy_url = spawn_with_static_and_dynamic(vec![s], vec![]).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{proxy_url}/__sg/api/providers"))
+        .json(&serde_json::json!({
+            "id": "static-p",
+            "protocol": "openai",
+            "base_url": "https://other.example",
+            "api_key": "x",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn decision_endpoint_rejects_non_static_id() {
+    let upstream = spawn_mock_upstream().await;
+    let d = openai_provider("dynamic-only", &upstream.url());
+    let proxy_url = spawn_with_static_and_dynamic(vec![], vec![d]).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .patch(format!(
+            "{proxy_url}/__sg/api/providers/dynamic-only/decision"
+        ))
+        .json(&serde_json::json!({"mode": "disabled"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "decision 只对 static id 有意义"
+    );
+}
+
+#[tokio::test]
+async fn secret_decision_disabled_drops_from_redaction() {
+    // static secret + decision=disabled → redact 流程不应再使用它.
+    let mut upstream = spawn_mock_upstream().await;
+    let real_secret = "static-secret-value";
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_body("ok")
+        .create_async()
+        .await;
+
+    let provider = openai_provider("oa-main", &upstream.url());
+    // 把 secret 放入 static 层.
+    let decisions = std::sync::Arc::new(parking_lot::RwLock::new(
+        secret_guard::config::Decisions::default(),
+    ));
+    let secret_path = std::path::PathBuf::from(format!(
+        "/tmp/opencode/tmp/test-static-secret-{}.toml",
+        uuid::Uuid::new_v4()
+    ));
+    let _ = std::fs::remove_file(&secret_path);
+    let static_secrets = vec![secret("static-s", real_secret)];
+    let secrets = SecretTable::new(static_secrets, vec![], decisions, secret_path);
+
+    let proxy_url = spawn_proxy_static_dynamic(
+        vec![provider],
+        vec![],
+        reqwest::Client::new(),
+        RecordStore::new(64),
+        secrets,
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    // 禁用 static-s.
+    let resp = client
+        .patch(format!("{proxy_url}/__sg/api/secrets/static-s/decision"))
+        .json(&serde_json::json!({"mode": "disabled"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // 发请求带 secret → 应当原样转发 (redact 不再发生).
+    let (_, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        &format!("{{\"prompt\": \"{real_secret}\"}}"),
+        &[],
+    )
+    .await;
+
+    // 等记录写入, 验证 body 仍含 secret.
+    let records = wait_for_record_count(&format!("{proxy_url}/__sg/api/records"), 1).await;
+    let body = &records[0].req_body;
+    assert!(
+        body.contains(real_secret),
+        "disabled secret 应当不被 redact, body={body}"
+    );
+}
+
+/// 辅助: 当测试未持有 RecordStore handle 时, 通过 records API 轮询直到出现 count 条记录.
+async fn wait_for_record_count(
+    url: &str,
+    count: usize,
+) -> Vec<secret_guard::record::ForwardRecord> {
+    let client = reqwest::Client::new();
+    for _ in 0..50 {
+        let body: serde_json::Value = client.get(url).send().await.unwrap().json().await.unwrap();
+        let arr = body.get("records").unwrap().as_array().unwrap();
+        if arr.len() >= count {
+            return arr
+                .iter()
+                .map(|v| serde_json::from_value(v.clone()).unwrap())
+                .collect();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("timeout waiting for {count} records at {url}");
+}
+
+// ─── 额外覆盖 (针对 Code Review C1 / M2 / M4 的回归) ─────────────────────
+
+#[tokio::test]
+async fn decision_can_reenable_after_disabled() {
+    // disable → default 必须能切回, 否则用户永久锁死.
+    let upstream = spawn_mock_upstream().await;
+    let s = openai_provider("static-p", &upstream.url());
+    let proxy_url = spawn_with_static_and_dynamic(vec![s], vec![]).await;
+    let client = reqwest::Client::new();
+
+    // 1. disable.
+    let resp = client
+        .patch(format!("{proxy_url}/__sg/api/providers/static-p/decision"))
+        .json(&serde_json::json!({"mode": "disabled"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // 2. 切回 default — 此时 effective_snapshot 看不到 static-p, 但 has_static 应当返回 true.
+    let resp = client
+        .patch(format!("{proxy_url}/__sg/api/providers/static-p/decision"))
+        .json(&serde_json::json!({"mode": "default"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "Disabled 状态下也必须能切回 Default, 否则用户被永久锁死"
+    );
+
+    // 3. 重新出现在 list 中.
+    let body: serde_json::Value = client
+        .get(format!("{proxy_url}/__sg/api/providers"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let arr = body.get("providers").unwrap().as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["id"], "static-p");
+}
+
+#[tokio::test]
+async fn delete_disabled_static_id_returns_409() {
+    // 用户先 disable 了 static id, 再尝试 DELETE 应当返回 409 (而不是 404).
+    let upstream = spawn_mock_upstream().await;
+    let s = openai_provider("static-p", &upstream.url());
+    let proxy_url = spawn_with_static_and_dynamic(vec![s], vec![]).await;
+    let client = reqwest::Client::new();
+
+    client
+        .patch(format!("{proxy_url}/__sg/api/providers/static-p/decision"))
+        .json(&serde_json::json!({"mode": "disabled"}))
+        .send()
+        .await
+        .unwrap();
+
+    let resp = client
+        .delete(format!("{proxy_url}/__sg/api/providers/static-p"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CONFLICT,
+        "disabled 状态下的 static id DELETE 应当 409, 而非 404"
+    );
+}
+
+#[tokio::test]
+async fn cross_table_shared_state_no_lost_update() {
+    // 真正共享 persist_lock + decisions + state_path: 并发 POST provider + POST secret,
+    // 期望两者最终都出现在同一份 state.toml 中.
+    use secret_guard::config::Decisions;
+    use secret_guard::provider::ProviderTable;
+    use secret_guard::secrets::SecretTable;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    let state_path =
+        std::path::PathBuf::from(format!("/tmp/opencode/tmp/test-shared-state-{id}.toml"));
+    let _ = std::fs::remove_file(&state_path);
+
+    let decisions = std::sync::Arc::new(parking_lot::RwLock::new(Decisions::default()));
+    let persist_lock = std::sync::Arc::new(parking_lot::Mutex::new(()));
+
+    let provider_table = ProviderTable::with_persist_lock(
+        vec![],
+        vec![],
+        decisions.clone(),
+        state_path.clone(),
+        persist_lock.clone(),
+    );
+    let secret_table =
+        SecretTable::with_persist_lock(vec![], vec![], decisions, state_path.clone(), persist_lock);
+    let proxy = ProxyState {
+        upstream: reqwest::Client::new(),
+        providers: provider_table,
+        records: RecordStore::new(64),
+        secrets: secret_table,
+    };
+    let app = server::build_router(proxy);
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let url = format!("http://{addr}");
+
+    // 并发发起两个 POST. client 可以 clone (Arc-backed, 共享连接池).
+    let client = reqwest::Client::new();
+    let c1 = client.clone();
+    let c2 = client.clone();
+    let url1 = url.clone();
+    let url2 = url.clone();
+    let (r1, r2) = tokio::join!(
+        async move {
+            c1.post(format!("{url1}/__sg/api/providers"))
+                .json(&serde_json::json!({
+                    "id": "p-concurrent",
+                    "protocol": "openai",
+                    "base_url": "https://api.openai.com",
+                    "api_key": "k",
+                }))
+                .send()
+                .await
+                .unwrap()
+        },
+        async move {
+            c2.post(format!("{url2}/__sg/api/secrets"))
+                .json(&serde_json::json!({
+                    "id": "s-concurrent",
+                    "value": "some-secret-value",
+                }))
+                .send()
+                .await
+                .unwrap()
+        }
+    );
+    assert_eq!(r1.status(), reqwest::StatusCode::CREATED);
+    assert_eq!(r2.status(), reqwest::StatusCode::CREATED);
+
+    // state.toml 应当同时包含新 provider 和新 secret.
+    let state = secret_guard::config::DynamicState::load_or_empty(&state_path).unwrap();
+    assert_eq!(state.providers.len(), 1);
+    assert_eq!(state.secrets.len(), 1);
+    assert_eq!(state.providers[0].id, "p-concurrent");
+    assert_eq!(state.secrets[0].id, "s-concurrent");
+}
+
+#[tokio::test]
+async fn validate_value_rejects_mock_prefix() {
+    // 集成层验证 C5 前提: 含 sgm_ 的 secret 应被拒绝.
+    let upstream = spawn_mock_upstream().await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/__sg/api/secrets"))
+        .json(&serde_json::json!({
+            "id": "bad",
+            "value": "sgm_abc12345",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 }

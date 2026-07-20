@@ -15,7 +15,8 @@
 - **Web 框架**: axum 0.8 (不使用 rig.rs / pingora 等高级抽象)
 - **HTTP client**: reqwest 0.12 with rustls
 - **协议无关**: body 在字节层面流动, 不解析 LLM 协议; secret 改写在字节层面
-- **配置**: TOML (`secret-guard.toml`), 通过 atomic rename 持久化
+- **双层配置**: 声明式 `secret-guard.toml` (static, 只读) + 动态 `secret-guard.state.toml`
+  (dynamic, WebUI 写回). 见下方"配置模型".
 - **测试**: cargo-nextest + proptest (property-based) + mockito (集成测试)
 
 ## 路由策略 (核心契约)
@@ -48,20 +49,79 @@ URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标
 
 ```
 src/
-├── main.rs        # 二进制入口: 解析 CLI, 启动 server
+├── main.rs        # 二进制入口: 解析 CLI, 加载 static + dynamic, 启动 server
 ├── lib.rs         # 库入口
-├── cli.rs         # clap 参数 schema (Option<T> 表示"未指定")
-├── config.rs      # Config / ServerConfig / SecretsConfig (Provider 在 provider.rs)
-├── provider.rs    # Protocol / Provider / ProviderTable (共享可变状态 + 持久化)
-├── secrets.rs     # SecretEntry / SecretCategory / SecretTable + 共享 atomic_write
+├── cli.rs         # clap 参数 schema (--config / --state / --host / --port)
+├── config.rs      # Config (static) / DynamicState / OverrideMode / Decisions
+├── provider.rs    # Protocol / Provider / ProviderTable + EffectiveProvider 合并视图
+├── secrets.rs     # SecretEntry / SecretCategory / SecretTable + EffectiveSecret + mask_value
 ├── record.rs      # ForwardRecord / RecordStore / ResponseUpdate
 ├── redact.rs      # mock_secret + RedactionMap + redact_request + restore_response
 ├── proxy.rs       # ProxyState + forward/forward_no_rest + fan_out_streaming/buffered
-├── server.rs      # build_router + serve (含 graceful shutdown + 共享 persist_lock)
+├── server.rs      # build_router + serve (装配 persist_lock + 共享 decisions)
 └── web/
     ├── mod.rs     # /__sg 子 router + / 根入口 + slash_redirect + not_found
-    ├── api.rs     # JSON endpoints (records + secrets CRUD + providers CRUD)
+    ├── api.rs     # JSON endpoints (records + secrets/providers CRUD + PATCH .../decision)
     └── index.html # 单页 UI (内嵌 CSS + vanilla JS, 零外部依赖)
+```
+
+## 配置模型 (双层: Static + Dynamic)
+
+secret-guard 把配置拆成两个独立文件, 各自承担不同职责:
+
+| 文件 | 角色 | 谁写 | 进入 git? |
+|---|---|---|---|
+| `secret-guard.toml`        | **声明式 (static)** 配置: providers / secrets / server. | 用户手写 | ✅ 推荐 |
+| `secret-guard.state.toml`  | **动态 (dynamic)** 状态: WebUI 编辑结果 + 对 static 项的 decision. | 程序自动 | ❌ 推荐 .gitignore |
+
+- static 配置在进程内**只读**; WebUI 永不修改它.
+- 用户删除 `secret-guard.state.toml` 即可"重置"所有 WebUI 变更, 回到声明式基线.
+- 启动时 state 文件不存在是正常情况 (返回空 state).
+
+### 合并语义 (`OverrideMode`)
+
+对每个 static id, WebUI 可设置 per-item 决策 (`decisions` 段持久化到 state.toml):
+
+- `Default` (默认): 若 dynamic 中有同 id override 则用 dynamic, 否则用 static.
+- `PreferStatic`: 强制使用 static 原值, 忽略 dynamic override.
+- `Disabled`: 从 effective view 中完全排除, 既不用 static 也不用 dynamic.
+
+dynamic-only 的 id (即 static 中不存在的) 总是直接生效, 不受 decision 影响.
+
+### Effective source (4 种, 供 UI 区分)
+
+| `source` 字段 | 含义 |
+|---|---|
+| `static` | 仅 static 有此 id, 用 static. |
+| `dynamic` | 仅 dynamic 有此 id (WebUI 创建的). |
+| `dynamic_override` | static + dynamic 都有, decision=Default → 用 dynamic. |
+| `static_preferred` | static + dynamic 都有, decision=PreferStatic → 用 static. |
+
+Disabled 项不进入 effective view (UI 看不到, 路由层也拿不到).
+
+### CRUD 操作语义
+
+- **POST** 创建 dynamic-only item. 若 id 与 static 冲突 → 409 (要用 PUT 走 fork 流程).
+- **PUT** 编辑: 若 id 在 static 中, 服务端自动 fork 出一份 dynamic override (git-style 心智模型).
+- **DELETE** 仅作用于 dynamic: 若有 dynamic 删除之 (override 关系下保留 static + 重置 decision);
+  若 id 仅在 static 中 → 409 (提示用 PATCH .../decision + mode=disabled).
+- **PATCH `/{id}/decision`** 切换对 static id 的决策. 返回 `{id, resource, decision}` ack.
+
+### API endpoints (WebUI)
+
+```
+GET    /__sg/api/records[/{id}]
+GET    /__sg/api/secrets
+POST   /__sg/api/secrets
+PUT    /__sg/api/secrets/{id}
+DELETE /__sg/api/secrets/{id}
+PATCH  /__sg/api/secrets/{id}/decision     body: {"mode": "default|prefer_static|disabled"}
+
+GET    /__sg/api/providers
+POST   /__sg/api/providers
+PUT    /__sg/api/providers/{id}
+DELETE /__sg/api/providers/{id}
+PATCH  /__sg/api/providers/{id}/decision
 ```
 
 ## 关键契约
@@ -86,7 +146,7 @@ src/
 
 `forward` 接收 `Path<ForwardPath> { proto, name, rest }`, 按 URL 解析 ingress 与 provider:
 1. `Protocol::from_short(proto)` → ingress 协议 (o/a/g/l)
-2. `ProviderTable::get(name)` → 目标 provider (含 egress 协议)
+2. `ProviderTable::get_effective(name)` → 目标 provider (合并 static + dynamic + decision 后的生效值)
 3. 协议匹配检查 (MVP: ingress == egress; 跨协议 → 501)
 4. `apply_provider_auth` 用 provider 配置的 api_key 注入对应协议的 auth header:
    - OpenAI / Ollama → `Authorization: Bearer <key>`
@@ -96,16 +156,19 @@ src/
 
 ### 跨表并发安全 (`src/server.rs` + `src/{provider,secrets}.rs`)
 
-`SecretTable` 与 `ProviderTable` 共享同一把 `Arc<Mutex<()>>` `persist_lock`
-(server 启动时构造并注入两表). 原因: 两表都通过 `Config::load_or_default` →
-`Config::to_toml` → `atomic_write` 改写同一份 `secret-guard.toml`;
-若不串行化, 一方的 read-modify-write 会覆盖另一方刚写入的字段.
+`SecretTable` 与 `ProviderTable` 共享两份同步原语 (server 启动时构造并注入):
 
-### SecretTable / ProviderTable 并发 (`src/secrets.rs`, `src/provider.rs`)
+- **`Arc<Mutex<()>> persist_lock`**: 串行整个 RMW, 避免两表并发写 state.toml 互相覆盖.
+- **`Arc<RwLock<Decisions>> decisions`**: 同一份 per-id 决策 (因为 `[decisions]` 段同时含
+  providers + secrets 两个子表, 任何一方修改都要触发 state.toml 重写, 共享同一份内存).
 
-- `persist_lock` 串行整个 RMW (read-modify-write), 保证并发 upsert/delete 不丢失更新.
-- 持久化策略: 先写文件 (atomic + fsync), 再更新内存 (失败自动回滚).
+### SecretTable / ProviderTable 持久化 (`src/secrets.rs`, `src/provider.rs`)
+
+- 内存层: `Arc<RwLock<Vec<T>>>` × 2 (static_entries 只读 + dynamic_entries 可变).
+- 持久化策略: 先写 state.toml (atomic + fsync), 再更新内存 (失败自动回滚).
 - `tmp` 文件名带 UUID, 避免并发 atomic_write 互相覆盖.
+- 每次写 dynamic 时 `DynamicState::load_or_empty(state_path)` → 改对应段 → `to_toml` → atomic_write.
+  共享 persist_lock 保证读-改-写串行化, 不会丢失 decisions 段.
 
 ## 开发流程
 
@@ -121,6 +184,8 @@ just dev                  # cargo watch -x run
 
 # 手动测试 — 启动 server (需要先在 secret-guard.toml 配置 [[providers]])
 cargo run -- run --port 18787
+# state.toml 路径默认从 config 派生: secret-guard.toml → secret-guard.state.toml
+# 也可显式指定: cargo run -- run --state /tmp/my-state.toml
 # 浏览器: http://127.0.0.1:18787/  (或旧版 /__sg)
 # OpenAI SDK 配置: base_url = http://127.0.0.1:18787/o/<provider-id>
 ```
@@ -162,6 +227,15 @@ client = Anthropic(
 - 禁用 provider 返回 503
 - provider api_key 覆盖客户端 auth header
 - root `/` 提供 Web UI
+- static provider 在 effective view 与路由中生效
+- dynamic override 替换 static 路由目标
+- decision=disabled 从 effective view 移除 + 路由 404
+- decision=prefer_static 强制使用 static
+- PUT 静态 provider 自动 fork dynamic override
+- DELETE 静态 provider 返回 409 (必须走 decision 通道)
+- DELETE dynamic override 后回到 static 基线
+- POST 与 static id 冲突返回 409
+- PATCH .../decision 对 dynamic-only id 返回 404
 
 ## 已知限制 (MVP)
 
@@ -172,8 +246,9 @@ client = Anthropic(
   RedactionMap 是 per-request 状态不持久化, 所以无实际影响.
 - mock 固定 15 字符 (`sgm_` + 11 char base62), 不模拟 real_secret 的格式/长度.
   LLM 可能识别出"sgm_..." 的规律性 — 未来可考虑 category-aware 的 mock 生成器.
-- 配置文件 `secret-guard.toml` 中 `[[providers]]` 与 `[secrets]` 是单一 SSOT, 手动编辑可能被 Web UI 写回覆盖.
-- Web UI 编辑 provider 时 api_key 始终要求重输 (无法保留旧值), 留空则覆盖为空字符串.
+- static config (`secret-guard.toml`) 的 `[server]` 段当前仅在启动时读取一次,
+  WebUI 改 host/port 不会生效 (需要重启).
+- WebUI 编辑 provider 时 api_key 始终要求重输 (无法保留旧值), 留空则覆盖为空字符串.
 
 ## 路径约定
 

@@ -6,4 +6,10 @@
 *.swo
 .idea/
 .vscode/
+
+# 用户本地配置 (含可能的 secret 字段, 不应入库).
+# 同时覆盖 default + 自定义命名 (避免用户改 config 文件名后 state 泄漏).
 secret-guard.toml
+secret-guard.state.toml
+*.state.toml
+*.state

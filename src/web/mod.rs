@@ -3,16 +3,25 @@
 //! 路由策略 (由 [`crate::server::build_router`] 装配):
 //! - `GET /`             —— 单页 HTML (根路径主入口, 新).
 //! - `GET /__sg`         —— 同上 (保留旧入口, 向后兼容).
-//! - `GET /__sg/api/records[/{id}]`   —— 转发记录 API.
-//! - `GET /__sg/api/secrets` 等       —— secret CRUD.
-//! - `GET /__sg/api/providers` 等     —— provider CRUD.
+//! - `GET /__sg/api/records[/{id}]`            —— 转发记录 API.
+//! - `GET /__sg/api/secrets`                   —— effective secret 列表.
+//! - `POST /__sg/api/secrets`                  —— 创建 dynamic secret.
+//! - `PUT /__sg/api/secrets/{id}`              —— 编辑 (static 自动 fork).
+//! - `DELETE /__sg/api/secrets/{id}`           —— 删除 (仅 dynamic).
+//! - `PATCH /__sg/api/secrets/{id}/decision`   —— 切换 OverrideMode.
+//! - `GET/POST/PUT/DELETE/PATCH /__sg/api/providers[/{id}[/decision]]` —— 同上.
 //!
 //! 注意: axum 0.8 的 `nest("/__sg", ...)` 默认匹配不带尾斜杠的 `/__sg`, 而不是 `/__sg/`.
 //! server.rs 中显式注册了 `/__sg/` -> `/__sg` 的 redirect (307, 临时), 保证两种 URL 都可用.
 
 mod api;
 
-use axum::{http::StatusCode, response::Html, routing::get, Router};
+use axum::{
+    http::StatusCode,
+    response::Html,
+    routing::{get, patch},
+    Router,
+};
 
 use crate::proxy::ProxyState;
 
@@ -39,12 +48,20 @@ pub fn router() -> Router<ProxyState> {
             axum::routing::put(api::update_secret).delete(api::delete_secret),
         )
         .route(
+            "/api/secrets/{id}/decision",
+            patch(api::set_secret_decision),
+        )
+        .route(
             "/api/providers",
             get(api::list_providers).post(api::create_provider),
         )
         .route(
             "/api/providers/{id}",
             axum::routing::put(api::update_provider).delete(api::delete_provider),
+        )
+        .route(
+            "/api/providers/{id}/decision",
+            patch(api::set_provider_decision),
         )
 }
 

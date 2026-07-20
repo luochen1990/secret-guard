@@ -30,7 +30,7 @@ pub struct RunArgs {
     #[arg(long, env = "SG_PORT")]
     pub port: Option<u16>,
 
-    /// 配置文件路径 (TOML).
+    /// **声明式**配置文件路径 (TOML). 进程内只读.
     #[arg(
         long,
         short = 'c',
@@ -38,6 +38,11 @@ pub struct RunArgs {
         default_value = "secret-guard.toml"
     )]
     pub config: std::path::PathBuf,
+
+    /// **动态状态**文件路径 (TOML). WebUI 写回. 缺省时由 static config 路径派生
+    /// (例如 `secret-guard.toml` → `secret-guard.state.toml`).
+    #[arg(long, env = "SG_STATE")]
+    pub state: Option<std::path::PathBuf>,
 }
 
 impl Default for RunArgs {
@@ -45,8 +50,8 @@ impl Default for RunArgs {
         Self {
             host: None,
             port: None,
-            // default 值仅用于 "未传子命令也启动" 的兜底, 实际 config 路径仍以 CLI/env 为准.
             config: std::path::PathBuf::from("secret-guard.toml"),
+            state: None,
         }
     }
 }

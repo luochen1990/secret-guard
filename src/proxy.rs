@@ -124,10 +124,10 @@ async fn dispatch(
         ))
     })?;
 
-    // 2. 查找 provider.
+    // 2. 查找 effective provider (合并 static + dynamic + decision 后的生效值).
     let provider = state
         .providers
-        .get(&fp.name)
+        .get_effective(&fp.name)
         .ok_or_else(|| AppError::NotFound(format!("unknown provider '/{}'", fp.name)))?;
     if !provider.enabled {
         return Err(AppError::Unavailable(format!(
@@ -153,8 +153,8 @@ async fn dispatch(
         .await
         .map_err(|e| AppError::BadBody(e.to_string()))?;
 
-    // 5. redact 请求 body (若 SecretTable 非空).
-    let secrets_snapshot = state.secrets.snapshot();
+    // 5. redact 请求 body (若 effective SecretTable 非空).
+    let secrets_snapshot = state.secrets.effective_raw();
     let (req_text_for_record, redaction_map): (String, RedactionMap) =
         if secrets_snapshot.is_empty() {
             (utf8_view(&req_bytes), RedactionMap::default())

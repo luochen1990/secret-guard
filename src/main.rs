@@ -1,12 +1,14 @@
 //! secret-guard 二进制入口.
 
+use std::path::{Path, PathBuf};
+
 use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use secret_guard::{
     cli::{Cli, Command, RunArgs},
-    config::Config,
+    config::{Config, DynamicState},
     server,
 };
 
@@ -24,17 +26,28 @@ async fn main() -> Result<()> {
         None => RunArgs::default(),
     };
 
-    let cfg = Config::load_or_default(&args.config)?;
-    let host = args.host.unwrap_or(cfg.server.host);
-    let port = args.port.unwrap_or(cfg.server.port);
-    let records_capacity = cfg.server.records_capacity;
+    // 双层加载: static 来自 secret-guard.toml; dynamic 来自 state.toml.
+    let static_cfg = Config::load_or_default(&args.config)?;
+    let state_path = args
+        .state
+        .clone()
+        .unwrap_or_else(|| default_state_path(&args.config));
+    let dyn_state = DynamicState::load_or_empty(&state_path)?;
+
+    let host = args.host.unwrap_or_else(|| static_cfg.server.host.clone());
+    let port = args.port.unwrap_or(static_cfg.server.port);
+    let records_capacity = static_cfg.server.records_capacity;
 
     tracing::info!(
         listen = format!("{host}:{port}"),
-        config = ?args.config,
+        static_config = ?args.config,
+        state_file = ?state_path,
         records_capacity,
-        providers_count = cfg.providers.len(),
-        secrets_count = cfg.secrets.entries.len(),
+        static_providers = static_cfg.providers.len(),
+        static_secrets = static_cfg.secrets.entries.len(),
+        dynamic_providers = dyn_state.providers.len(),
+        dynamic_secrets = dyn_state.secrets.len(),
+        decisions = dyn_state.decisions.providers.len() + dyn_state.decisions.secrets.len(),
         "starting secret-guard"
     );
 
@@ -42,9 +55,49 @@ async fn main() -> Result<()> {
         &host,
         port,
         records_capacity,
-        args.config.clone(),
-        cfg.providers,
-        cfg.secrets.entries,
+        static_cfg.providers,
+        static_cfg.secrets.entries,
+        dyn_state,
+        state_path,
     )
     .await
+}
+
+/// state.toml 的默认路径: 与 static config 同目录, 文件名加 `.state` 后缀.
+/// 例如 `secret-guard.toml` → `secret-guard.state.toml`.
+fn default_state_path(static_config: &Path) -> PathBuf {
+    let file_name = static_config
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("secret-guard.toml");
+    let new_name = if let Some(stem) = file_name.strip_suffix(".toml") {
+        format!("{stem}.state.toml")
+    } else {
+        format!("{file_name}.state")
+    };
+    static_config.with_file_name(new_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn default_state_path_appends_state_suffix() {
+        let p = default_state_path(&PathBuf::from("secret-guard.toml"));
+        assert_eq!(p, PathBuf::from("secret-guard.state.toml"));
+    }
+
+    #[test]
+    fn default_state_path_handles_subdir() {
+        let p = default_state_path(&PathBuf::from("/etc/sg/config.toml"));
+        assert_eq!(p, PathBuf::from("/etc/sg/config.state.toml"));
+    }
+
+    #[test]
+    fn default_state_path_fallback_for_non_toml() {
+        let p = default_state_path(&PathBuf::from("config.json"));
+        assert_eq!(p, PathBuf::from("config.json.state"));
+    }
 }

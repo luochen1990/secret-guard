@@ -13,6 +13,12 @@
 //! # Shutdown
 //! 默认监听 SIGTERM / Ctrl-C, axum 进入 graceful shutdown 期间不再接受新连接,
 //! 已建立的连接会等到完成或超时.
+//!
+//! # 双层状态装配
+//! [`serve`] 接收 static + dynamic 两份配置, 在内部:
+//! 1. 共享一把 `persist_lock` 给 ProviderTable / SecretTable (避免并发 RMW 互相覆盖).
+//! 2. 共享同一份 `Decisions` 给两个表 (因为 decisions 同时含 provider / secret 决策,
+//!    任何一方修改都要触发 state.toml 重写).
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -23,7 +29,7 @@ use axum::{
     routing::{any, get},
     Router,
 };
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use tracing::info;
@@ -61,23 +67,42 @@ pub fn build_upstream_client() -> anyhow::Result<reqwest::Client> {
 }
 
 /// 启动服务. 阻塞直到 shutdown 信号到达且 drain 完成.
+///
+/// - `static_providers` / `static_secrets`: 来自 `secret-guard.toml`, 进程内只读.
+/// - `dyn_state`: 来自 `secret-guard.state.toml`, 拆为 dynamic 列表 + decisions.
+/// - `state_path`: state.toml 的写回路径.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     host: &str,
     port: u16,
     records_capacity: usize,
-    config_path: PathBuf,
-    providers: Vec<Provider>,
-    secrets: Vec<SecretEntry>,
+    static_providers: Vec<Provider>,
+    static_secrets: Vec<SecretEntry>,
+    dyn_state: crate::config::DynamicState,
+    state_path: PathBuf,
 ) -> anyhow::Result<()> {
     let upstream = build_upstream_client()?;
     let records = RecordStore::new(records_capacity);
-    // 共享一把 persist_lock 给两个 table, 保证它们对 config 文件的 RMW 串行化,
-    // 避免 SecretTable 写完 secrets 段后, ProviderTable 基于旧 cfg 写回把 secrets 覆盖掉.
+
+    // 跨表共享: persist_lock 串行整个 RMW, decisions 是同一份 mutable map.
     let persist_lock = Arc::new(Mutex::new(()));
-    let secret_table =
-        SecretTable::with_persist_lock(secrets, config_path.clone(), persist_lock.clone());
-    let provider_table =
-        ProviderTable::with_persist_lock(providers, config_path.clone(), persist_lock);
+    let decisions = Arc::new(RwLock::new(dyn_state.decisions));
+
+    let secret_table = SecretTable::with_persist_lock(
+        static_secrets,
+        dyn_state.secrets,
+        decisions.clone(),
+        state_path.clone(),
+        persist_lock.clone(),
+    );
+    let provider_table = ProviderTable::with_persist_lock(
+        static_providers,
+        dyn_state.providers,
+        decisions,
+        state_path.clone(),
+        persist_lock,
+    );
+
     let proxy = ProxyState {
         upstream,
         providers: provider_table,
@@ -92,7 +117,7 @@ pub async fn serve(
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind {addr} failed: is another secret-guard already running?"))?;
-    info!(%addr, config = ?config_path, "secret-guard listening (Ctrl-C to stop)");
+    info!(%addr, ?state_path, "secret-guard listening (Ctrl-C to stop)");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
