@@ -31,6 +31,7 @@ use crate::codec::{
     ir::{IrStreamEvent, StreamDecodeState},
     Protocol, Reader, Writer,
 };
+use crate::redact::{restore_ir_stream_event, RedactionMap};
 
 /// SSE 流终止符 sentinel (OpenAI 约定).
 pub const SSE_DONE_SENTINEL: &str = "[DONE]";
@@ -44,6 +45,13 @@ pub const MAX_BUF: usize = 16 * 1024 * 1024;
 
 /// 跨协议 SSE 翻译器. 由 [`feed`](Self::feed) 喂入 egress 字节,
 /// 由 [`finish`](Self::finish) 闭合流.
+///
+/// # 两种模式
+///
+/// - **跨协议翻译** ([`Self::new`]): ingress != egress, 把 egress SSE 翻译为 ingress SSE.
+///   不做 redact restore (跨协议时 redact 在请求侧, response 直接翻译).
+/// - **同协议 restore** ([`Self::new_same_proto_restore`]): ingress == egress, SSE 字节
+///   解析为 IR 事件, restore mock→real, 再序列化回 SSE. 用于同协议 + redact + 流式场景.
 pub struct StreamTranslate {
     ingress_writer: Box<dyn Writer>,
     egress_reader: Box<dyn Reader>,
@@ -61,10 +69,13 @@ pub struct StreamTranslate {
     start_usage: Option<crate::codec::IrUsage>,
     /// MessageStop 后是否再发 MessageDelta (post-stop guard).
     message_stopped: bool,
+    /// 同协议 restore 模式: per-event 调用 restore_ir_stream_event.
+    /// 跨协议模式: None (不做 restore).
+    redaction_map: Option<RedactionMap>,
 }
 
 impl StreamTranslate {
-    /// 构造翻译器. `None` 表示 `ingress == egress` (不需要翻译, caller 应走字节透传).
+    /// 构造跨协议翻译器. `None` 表示 `ingress == egress` (caller 应走字节透传或 restore 模式).
     pub fn new(ingress: Protocol, egress: Protocol) -> Option<Self> {
         if ingress == egress {
             return None;
@@ -79,7 +90,27 @@ impl StreamTranslate {
             emit_done: ingress.writer().emits_sse_done_terminator(),
             start_usage: None,
             message_stopped: false,
+            redaction_map: None,
         })
+    }
+
+    /// 构造同协议 + restore 模式翻译器. 用于同协议 + redact + 流式响应场景.
+    ///
+    /// 工作流: egress SSE → parse IR events → restore_ir_stream_event → 序列化回 SSE.
+    /// 失去 byte-exact (因为 IR re-serialize), 但语义等价, 同时保留流式 UX.
+    pub fn new_same_proto_restore(proto: Protocol, map: RedactionMap) -> Self {
+        Self {
+            ingress_writer: proto.writer(),
+            egress_reader: proto.reader(),
+            decode: StreamDecodeState::default(),
+            buf: Vec::new(),
+            scanned: 0,
+            aborted: false,
+            emit_done: proto.writer().emits_sse_done_terminator(),
+            start_usage: None,
+            message_stopped: false,
+            redaction_map: if map.is_empty() { None } else { Some(map) },
+        }
     }
 
     /// 喂入一段 egress SSE 字节, 返回翻译后的 ingress SSE 字节
@@ -188,6 +219,12 @@ impl StreamTranslate {
             }
             if matches!(ev, IrStreamEvent::MessageStop) {
                 self.message_stopped = true;
+            }
+
+            // 同协议 restore 模式: per-event 把 mock 替换为 real.
+            // 跨协议模式 redaction_map 为 None, 不做 restore.
+            if let Some(map) = &self.redaction_map {
+                restore_ir_stream_event(&mut ev, map);
             }
 
             self.emit_ir_event(&ev, out);

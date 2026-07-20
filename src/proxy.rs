@@ -36,7 +36,7 @@ use tracing::{debug, error, warn};
 
 use crate::provider::{Protocol, ProviderTable};
 use crate::record::{ForwardRecord, RecordStore, ResponseUpdate};
-use crate::redact::{redact_request, restore_response, RedactionMap};
+use crate::redact::{redact_ir, restore_ir_response, RedactionMap};
 use crate::secrets::SecretTable;
 
 /// 进程级共享状态, 在 router 与 handler 间共享.
@@ -141,30 +141,110 @@ async fn dispatch(
         .await
         .map_err(|e| AppError::BadBody(e.to_string()))?;
 
-    // 4. 协议匹配: 同协议走 identity passthrough; 跨协议走 codec 翻译.
+    // 4. 协议匹配: 同协议走 IR / 字节透传; 跨协议走 codec 翻译.
+    let secrets_snapshot = state.secrets.effective_raw();
     if ingress != provider.protocol {
-        return cross_proto_forward(state, fp, parts, req_bytes, ingress, provider, started).await;
+        return cross_proto_forward(
+            state,
+            fp,
+            parts,
+            req_bytes,
+            ingress,
+            provider,
+            started,
+            secrets_snapshot,
+        )
+        .await;
+    }
+    same_proto_forward(
+        state,
+        fp,
+        parts,
+        req_bytes,
+        ingress,
+        provider,
+        started,
+        secrets_snapshot,
+    )
+    .await
+}
+
+/// 同协议转发: 字节透传 (无 redact) 或 IR 路径 (启用 redact).
+///
+/// **同协议 + 无 redact**: 字节透传, 保留流式 UX. 这条路径零回归.
+/// **同协议 + redact**: 走 IR (reader → redact_ir → writer).
+///   非流式响应: buffered + restore_ir_response.
+///   流式响应: 用 StreamTranslate 同协议 + restore 模式, 恢复流式 UX.
+#[allow(clippy::too_many_arguments)]
+async fn same_proto_forward(
+    state: ProxyState,
+    fp: ForwardPath,
+    parts: axum::http::request::Parts,
+    req_bytes: Bytes,
+    ingress: Protocol,
+    provider: crate::provider::Provider,
+    started: Instant,
+    secrets_snapshot: Vec<crate::secrets::SecretEntry>,
+) -> Result<Response<Body>, AppError> {
+    if secrets_snapshot.is_empty() {
+        // 字节透传: 不进入 codec, 不做 redact. 这是最热路径 (多数 provider 无 secret).
+        return same_proto_passthrough(state, fp, parts, req_bytes, ingress, provider, started)
+            .await;
     }
 
-    // 5. redact 请求 body (若 effective SecretTable 非空).
-    let secrets_snapshot = state.secrets.effective_raw();
-    let (req_text_for_record, redaction_map): (String, RedactionMap) =
-        if secrets_snapshot.is_empty() {
-            (utf8_view(&req_bytes), RedactionMap::default())
-        } else {
-            let original = utf8_view(&req_bytes);
-            let (redacted, map) = redact_request(&original, &secrets_snapshot);
-            if !map.is_empty() {
-                debug!(
-                    redactions = map.real_to_mock.len(),
-                    "redacted secrets in request body"
-                );
-            }
-            (redacted, map)
-        };
-    let req_bytes_to_send = req_text_for_record.clone().into_bytes();
+    // IR 路径 (启用 redact).
+    use crate::codec::Protocol as CodecProtocol;
+    let Some(codec_proto) = CodecProtocol::from_native(ingress) else {
+        // codec 不支持此协议 (eg Gemini/Ollama), 但同协议需要 IR 处理.
+        // 降级到字节透传 + warn (不应用 redact).
+        warn!(
+            "secrets configured for {} provider '{}', but codec doesn't support {}; \
+             falling back to byte-level passthrough without redact",
+            ingress.name(),
+            provider.id,
+            ingress.name()
+        );
+        return same_proto_passthrough(state, fp, parts, req_bytes, ingress, provider, started)
+            .await;
+    };
 
-    // 6. 构造上游 URL: provider.base_url + rest + ?query.
+    let reader = codec_proto.reader();
+    let writer = codec_proto.writer();
+
+    // 1. 解析请求 body 为 JSON.
+    let req_body: serde_json::Value = serde_json::from_slice(&req_bytes)
+        .map_err(|e| AppError::BadBody(format!("invalid JSON in {ingress} request body: {e}")))?;
+
+    // 2. ingress JSON → IR.
+    let mut ir = reader
+        .read_request(&req_body)
+        .map_err(|e| AppError::BadBody(format!("{ingress} request parse failed: {}", e.message)))?;
+
+    // 3. MVP 限制: 流式 + redact 在 InputJsonDelta 上不 restore (跨 chunk secret 处理).
+    //    这里不阻断请求, 但若检测到流式 + redact + tools 同时存在, log warn.
+    if ir.stream && !ir.tools.is_empty() {
+        warn!(
+            "streaming + redact + tools: tool_use input_json_delta will NOT be redacted \
+             (cross-chunk secret leakage possible); see redact.rs TODO"
+        );
+    }
+
+    // 4. redact IR.
+    let redaction_map = redact_ir(&mut ir, &secrets_snapshot);
+    if !redaction_map.is_empty() {
+        debug!(
+            redactions = redaction_map.real_to_mock.len(),
+            "redacted secrets in IR request"
+        );
+    }
+
+    // 5. IR → 请求 body (同协议 writer 重序列化).
+    let new_body = writer.write_request(&ir);
+    let req_bytes_to_send = serde_json::to_vec(&new_body)
+        .map_err(|e| AppError::Internal(format!("serialize redacted body failed: {e}")))?;
+    let req_text_for_record = utf8_view(&req_bytes_to_send);
+
+    // 6. 构造上游 URL.
     let query = parts
         .uri
         .query()
@@ -172,10 +252,10 @@ async fn dispatch(
         .unwrap_or_default();
     let upstream_url = build_upstream_url(&provider.base_url, &format!("{}{query}", fp.rest));
 
-    // 7. 复制请求 headers (剥离 hop-by-hop + Connection 列出的字段 + Host + Content-Length).
-    //    若 provider 配了 api_key (直接值或从 api_key_file 读取), 用它覆盖
-    //    Authorization / x-api-key, 避免客户端漏传或泄露.
+    // 7. 复制请求 headers + 应用 auth. 删除客户端的 content-type/length (重新计算).
     let mut fwd_headers = sanitize_request_headers(&parts.headers);
+    fwd_headers.remove(axum::http::header::CONTENT_TYPE);
+    fwd_headers.remove(axum::http::header::CONTENT_LENGTH);
     apply_provider_auth(&mut fwd_headers, &provider.effective_api_key(), ingress);
 
     // 8. 记录请求快照 (LLM 视角的改写后版本).
@@ -193,32 +273,27 @@ async fn dispatch(
     );
     let record_id = state.records.push(req_snapshot);
 
-    debug!(%record_id, method = %parts.method, url = %upstream_url, "forwarding request");
+    debug!(%record_id, method = %parts.method, url = %upstream_url, "forwarding redacted same-proto request");
 
-    // 9. 发送到上游 (失败时也写回 record, 标记 incomplete).
+    // 9. 发送到上游.
     let upstream_resp = match state
         .upstream
         .request(parts.method, &upstream_url)
         .headers(fwd_headers)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header(axum::http::header::CONTENT_LENGTH, req_bytes_to_send.len())
         .body(req_bytes_to_send)
         .send()
         .await
     {
         Ok(r) => r,
         Err(e) => {
-            let elapsed = started.elapsed().as_millis() as u64;
-            warn!(%record_id, error = %e, "upstream send failed");
-            state.records.update_response_full(
+            record_upstream_failure(
+                &state.records,
                 record_id,
-                ResponseUpdate {
-                    resp_status: 502,
-                    resp_headers: vec![],
-                    resp_body: String::new(),
-                    elapsed_ms: elapsed,
-                    streamed: false,
-                    resp_complete: false,
-                    error: Some(format!("upstream send error: {e}")),
-                },
+                started,
+                502,
+                format!("upstream send error: {e}"),
             );
             return Err(AppError::Upstream(e.to_string()));
         }
@@ -236,10 +311,23 @@ async fn dispatch(
 
     debug!(%record_id, status = %resp_status, streamed, "upstream responded");
 
-    // 11. 处理响应: 若启用 redact, 走 buffered (完整累积再 restore);
-    //     否则保持流式透传 (最佳 UX).
-    if redaction_map.is_empty() {
-        fan_out_streaming(
+    // 11. 响应处理:
+    //     - 流式 + redact: StreamTranslate 同协议模式, per-event restore (恢复流式 UX).
+    //     - 非流式 + redact: buffered + restore_ir_response.
+    if streamed && resp_status.is_success() {
+        fan_out_streaming_with_restore(
+            state.records.clone(),
+            record_id,
+            started,
+            upstream_resp,
+            resp_status,
+            resp_headers,
+            codec_proto,
+            redaction_map,
+        )
+        .await
+    } else {
+        fan_out_buffered_ir(
             state.records.clone(),
             record_id,
             started,
@@ -247,21 +335,115 @@ async fn dispatch(
             resp_status,
             resp_headers,
             streamed,
+            codec_proto,
+            redaction_map,
         )
         .await
-    } else {
-        fan_out_buffered(BufferedParams {
-            records: state.records.clone(),
-            record_id,
-            started,
-            upstream_resp,
-            resp_status,
-            resp_headers,
-            streamed,
-            redaction_map,
-        })
-        .await
     }
+}
+
+/// 同协议字节透传路径 (无 redact 时使用). 这条路径是项目最初的核心契约,
+/// 必须保持 byte-exact + 流式 UX 零回归.
+async fn same_proto_passthrough(
+    state: ProxyState,
+    fp: ForwardPath,
+    parts: axum::http::request::Parts,
+    req_bytes: Bytes,
+    ingress: Protocol,
+    provider: crate::provider::Provider,
+    started: Instant,
+) -> Result<Response<Body>, AppError> {
+    let req_text_for_record = utf8_view(&req_bytes);
+    let query = parts
+        .uri
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    let upstream_url = build_upstream_url(&provider.base_url, &format!("{}{query}", fp.rest));
+
+    let mut fwd_headers = sanitize_request_headers(&parts.headers);
+    apply_provider_auth(&mut fwd_headers, &provider.effective_api_key(), ingress);
+
+    let path_for_record = format!(
+        "/{}/{}/{}",
+        fp.proto,
+        fp.name,
+        fp.rest.trim_start_matches('/')
+    );
+    let req_snapshot = ForwardRecord::new(
+        parts.method.as_str().to_string(),
+        path_for_record,
+        redact_headers(&fwd_headers),
+        req_text_for_record,
+    );
+    let record_id = state.records.push(req_snapshot);
+
+    debug!(%record_id, method = %parts.method, url = %upstream_url, "forwarding (passthrough)");
+
+    let upstream_resp = match state
+        .upstream
+        .request(parts.method, &upstream_url)
+        .headers(fwd_headers)
+        .body(req_bytes)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            record_upstream_failure(
+                &state.records,
+                record_id,
+                started,
+                502,
+                format!("upstream send error: {e}"),
+            );
+            return Err(AppError::Upstream(e.to_string()));
+        }
+    };
+
+    let resp_status = upstream_resp.status();
+    let resp_headers = upstream_resp.headers().clone();
+    let content_type = resp_headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let streamed = is_streaming(&content_type);
+
+    debug!(%record_id, status = %resp_status, streamed, "upstream responded");
+
+    fan_out_streaming(
+        state.records.clone(),
+        record_id,
+        started,
+        upstream_resp,
+        resp_status,
+        resp_headers,
+        streamed,
+    )
+    .await
+}
+
+/// 写一条 "上游请求失败" 记录 (错误路径专用 helper).
+fn record_upstream_failure(
+    records: &RecordStore,
+    record_id: uuid::Uuid,
+    started: Instant,
+    status: u16,
+    error: String,
+) {
+    records.update_response_full(
+        record_id,
+        ResponseUpdate {
+            resp_status: status,
+            resp_headers: vec![],
+            resp_body: String::new(),
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            streamed: false,
+            resp_complete: false,
+            error: Some(error),
+        },
+    );
 }
 
 /// 若 provider 配置了 api_key, 注入对应的 auth header.
@@ -324,10 +506,10 @@ fn apply_provider_auth(headers: &mut HeaderMap, api_key: &str, ingress: Protocol
 /// - 只支持 OpenAI ⇄ Anthropic 双向 (其他组合返回 501).
 /// - **强制非流式**: 上游 stream=false (即便客户端请求 stream=true). 客户端若 stream=true,
 ///   目前返回 501 (`streaming cross-protocol not yet supported`).
-/// - **不应用 redact**: 跨协议时 redact map 强制为空 (因为 codec 是结构化翻译, 不能与字节级
-///   redact 共存). 若 SecretTable 非空, secrets 不会被替换为 mock — 这是已知限制,
-///   未来在 IR 阶段做结构化 redact 才能修复.
+/// - **应用 redact**: 跨协议 + redact 通过 [`redact_ir`] 在 IR 层做替换,
+///   不会与 codec 翻译冲突. 流式响应中 TextDelta 会 restore, InputJsonDelta 跳过.
 /// - 上游错误响应 (4xx/5xx) 也通过 codec 翻译为 ingress 协议的原生错误 envelope.
+#[allow(clippy::too_many_arguments)]
 async fn cross_proto_forward(
     state: ProxyState,
     fp: ForwardPath,
@@ -336,22 +518,9 @@ async fn cross_proto_forward(
     ingress: Protocol,
     provider: crate::provider::Provider,
     started: Instant,
+    secrets_snapshot: Vec<crate::secrets::SecretEntry>,
 ) -> Result<Response<Body>, AppError> {
     use crate::codec::Protocol as CodecProtocol;
-    // trait methods 通过 CodecProtocol::reader/writer 返回的 Box<dyn Reader/Writer> 调用,
-    // 不需要显式 use trait (Rust 自动识别 method 调用).
-
-    // 0. 跨协议路径当前不应用 redact (redact 是字节级; codec 是结构化翻译).
-    //    必须显式 warn 提示 operator, 避免误以为有 secret 保护.
-    if !state.secrets.effective_raw().is_empty() {
-        warn!(
-            "cross-protocol request bypasses secret redaction; \
-             secrets in body will reach upstream verbatim \
-             (ingress={}, egress={})",
-            ingress.name(),
-            provider.protocol.name()
-        );
-    }
 
     // 1. 检查 codec 是否支持此协议对.
     let Some(ingress_codec) = CodecProtocol::from_native(ingress) else {
@@ -379,7 +548,7 @@ async fn cross_proto_forward(
         .read_request(&ingress_body)
         .map_err(|e| AppError::BadBody(format!("{ingress} request parse failed: {}", e.message)))?;
 
-    // 4. MVP 限制: 跨协议时不支持流式.
+    // 4. MVP 限制: 跨协议时不支持流式 (StreamTranslate 尚未接入 dispatch).
     if ir.stream {
         return Err(AppError::NotImplemented(format!(
             "streaming cross-protocol ({ingress} → {}) is not yet supported; \
@@ -396,20 +565,32 @@ async fn cross_proto_forward(
     // 6. 清空 extra (跨协议时 extra 字段会泄漏 ingress-only 的内容, 必须丢弃).
     ir.extra.clear();
 
-    // 7. IR → egress body.
+    // 7. redact IR (跨协议 + redact 在同层).
+    let redaction_map = redact_ir(&mut ir, &secrets_snapshot);
+    if !redaction_map.is_empty() {
+        debug!(
+            redactions = redaction_map.real_to_mock.len(),
+            "redacted secrets in cross-proto IR"
+        );
+    }
+
+    // 8. IR → egress body.
     let egress_body_value = egress_writer.write_request(&ir);
     let egress_bytes = serde_json::to_vec(&egress_body_value)
         .map_err(|e| AppError::Internal(format!("serialize egress body failed: {e}")))?;
 
-    // 8. 构造上游 URL (egress writer 的固定 path).
+    // 9. 构造上游 URL (egress writer 的固定 path).
     let upstream_url = format!("{}{}", provider.base_url, egress_writer.upstream_path());
 
-    // 9. 复制请求 headers + 应用 egress 协议的 auth (注意: 用 provider.protocol, 不是 ingress).
+    // 10. 复制请求 headers + 应用 egress 协议的 auth.
     let mut fwd_headers = sanitize_request_headers(&parts.headers);
-    // 删除客户端可能传的 content-type / content-length, 后面会用我们计算的新值.
     fwd_headers.remove(axum::http::header::CONTENT_TYPE);
     fwd_headers.remove(axum::http::header::CONTENT_LENGTH);
-    apply_provider_auth(&mut fwd_headers, &provider.effective_api_key(), provider.protocol);
+    apply_provider_auth(
+        &mut fwd_headers,
+        &provider.effective_api_key(),
+        provider.protocol,
+    );
     // 跨协议时客户端不会自带 egress 协议的特定 header, 这里仅在缺失时注入默认.
     // 用 entry().or_insert() 而非 insert(), 保留客户端主动设置更新的版本的能力.
     if provider.protocol == Protocol::Anthropic {
@@ -418,7 +599,7 @@ async fn cross_proto_forward(
             .or_insert_with(|| HeaderValue::from_static("2023-06-01"));
     }
 
-    // 10. 记录请求快照 (用于 Web UI).
+    // 11. 记录请求快照.
     let path_for_record = format!(
         "/{}/{}/{}  [{} → {}]",
         fp.proto,
@@ -445,7 +626,7 @@ async fn cross_proto_forward(
         "cross-proto forwarding"
     );
 
-    // 11. 发送到上游.
+    // 12. 发送到上游.
     let upstream_resp = match state
         .upstream
         .request(parts.method, &upstream_url)
@@ -458,32 +639,25 @@ async fn cross_proto_forward(
     {
         Ok(r) => r,
         Err(e) => {
-            let elapsed = started.elapsed().as_millis() as u64;
-            warn!(%record_id, error = %e, "cross-proto upstream send failed");
-            state.records.update_response_full(
+            record_upstream_failure(
+                &state.records,
                 record_id,
-                ResponseUpdate {
-                    resp_status: 502,
-                    resp_headers: vec![],
-                    resp_body: String::new(),
-                    elapsed_ms: elapsed,
-                    streamed: false,
-                    resp_complete: false,
-                    error: Some(format!("upstream send error: {e}")),
-                },
+                started,
+                502,
+                format!("upstream send error: {e}"),
             );
             return Err(AppError::Upstream(e.to_string()));
         }
     };
 
-    // 12. 完整 buffer 上游响应 (跨协议 MVP 不支持流式). 受 MAX_RESP_BODY_RECORD 上限保护,
-    //     防止恶意/故障上游 OOM.
+    // 13. 完整 buffer 上游响应 (跨协议 MVP 不支持流式). 受 MAX_RESP_BODY_RECORD 上限保护.
     let resp_status = upstream_resp.status();
     let resp_headers = upstream_resp.headers().clone();
     let resp_bytes: Bytes = {
         let mut acc: Vec<u8> = Vec::new();
         let mut stream = upstream_resp.bytes_stream();
         let mut exceeded = false;
+        let mut stream_err: Option<String> = None;
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(b) => {
@@ -494,31 +668,31 @@ async fn cross_proto_forward(
                     acc.extend_from_slice(&b);
                 }
                 Err(e) => {
-                    let elapsed = started.elapsed().as_millis() as u64;
-                    warn!(%record_id, error = %e, "cross-proto upstream stream error mid-flight");
-                    state.records.update_response_full(
-                        record_id,
-                        ResponseUpdate {
-                            resp_status: resp_status.as_u16(),
-                            resp_headers: redact_headers(&resp_headers),
-                            resp_body: String::new(),
-                            elapsed_ms: elapsed,
-                            streamed: false,
-                            resp_complete: false,
-                            error: Some(format!("upstream stream error: {e}")),
-                        },
-                    );
-                    return Err(AppError::Upstream(e.to_string()));
+                    stream_err = Some(e.to_string());
+                    break;
                 }
             }
         }
+        if let Some(e) = stream_err {
+            let elapsed = started.elapsed().as_millis() as u64;
+            warn!(%record_id, error = %e, "cross-proto upstream stream error mid-flight");
+            state.records.update_response_full(
+                record_id,
+                ResponseUpdate {
+                    resp_status: resp_status.as_u16(),
+                    resp_headers: redact_headers(&resp_headers),
+                    resp_body: String::new(),
+                    elapsed_ms: elapsed,
+                    streamed: false,
+                    resp_complete: false,
+                    error: Some(format!("upstream stream error: {e}")),
+                },
+            );
+            return Err(AppError::Upstream(e));
+        }
         if exceeded {
             let elapsed = started.elapsed().as_millis() as u64;
-            warn!(
-                %record_id,
-                cap = MAX_RESP_BODY_RECORD,
-                "cross-proto upstream response exceeded cap; aborting"
-            );
+            warn!(%record_id, cap = MAX_RESP_BODY_RECORD, "cross-proto upstream response exceeded cap; aborting");
             state.records.update_response_full(
                 record_id,
                 ResponseUpdate {
@@ -540,19 +714,48 @@ async fn cross_proto_forward(
         Bytes::from(acc)
     };
 
-    // 13. 翻译响应: egress JSON → IR → ingress JSON.
+    // 14. 翻译响应: egress JSON → IR → (restore redact) → ingress JSON.
     let egress_reader = egress_codec.reader();
     let ingress_writer = ingress_codec.writer();
-    let (resp_status_out, resp_body_out) = translate_cross_proto_response(
-        egress_reader.as_ref(),
-        ingress_writer.as_ref(),
-        resp_status,
-        &resp_bytes,
-        provider.protocol.name(),
-        record_id,
-    );
+    let (resp_status_out, resp_body_out): (StatusCode, Vec<u8>) = if resp_status.is_success() {
+        match serde_json::from_slice::<serde_json::Value>(&resp_bytes) {
+            Ok(v) => match egress_reader.read_response(&v) {
+                Ok(mut ir_resp) => {
+                    // restore: mock → real (跨协议 + redact 时, 客户端看到的应该是真 secret).
+                    restore_ir_response(&mut ir_resp, &redaction_map);
+                    let translated = ingress_writer.write_response(&ir_resp);
+                    let body = serde_json::to_vec(&translated).unwrap_or_default();
+                    (resp_status, body)
+                }
+                Err(e) => {
+                    warn!(%record_id, error = %e.message, "failed to parse upstream response as {}; passing through verbatim", provider.protocol.name());
+                    (resp_status, resp_bytes.to_vec())
+                }
+            },
+            Err(_) => (resp_status, resp_bytes.to_vec()),
+        }
+    } else {
+        // 错误响应: 截断 + 解析上游 error.message 防止泄漏内部细节.
+        let friendly = serde_json::from_slice::<serde_json::Value>(&resp_bytes)
+            .ok()
+            .and_then(|v| {
+                v.get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .map(String::from)
+            })
+            .unwrap_or_else(|| {
+                let raw = std::str::from_utf8(&resp_bytes).unwrap_or("");
+                let cap = raw.len().min(4096);
+                raw[..cap].to_string()
+            });
+        let kind = http_status_to_error_kind(resp_status.as_u16());
+        let envelope = ingress_writer.write_error(resp_status.as_u16(), kind, &friendly);
+        let body = serde_json::to_vec(&envelope).unwrap_or_default();
+        (resp_status, body)
+    };
 
-    // 14. 记录响应.
+    // 15. 记录响应.
     let elapsed = started.elapsed().as_millis() as u64;
     state.records.update_response_full(
         record_id,
@@ -567,7 +770,7 @@ async fn cross_proto_forward(
         },
     );
 
-    // 15. 构造响应: 强制 content-type 为 application/json (codec 总是产出 JSON).
+    // 16. 构造响应.
     let mut resp = Response::new(Body::from(resp_body_out));
     *resp.status_mut() = resp_status_out;
     let mut out_headers = build_response_headers(&resp_headers);
@@ -575,67 +778,9 @@ async fn cross_proto_forward(
         axum::http::header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
     );
-    out_headers.remove(axum::http::header::CONTENT_LENGTH); // axum 会自动重算
+    out_headers.remove(axum::http::header::CONTENT_LENGTH);
     *resp.headers_mut() = out_headers;
     Ok(resp)
-}
-
-/// 把上游 egress 响应翻译为 ingress 响应.
-///
-/// 成功响应 (2xx): 通过 codec IR 翻译 body; 解析失败则原样透传 (记 warn).
-/// 错误响应 (非 2xx): 用 codec 的 write_error 翻译 envelope, 截断 message 到 4 KiB
-/// 并优先解析上游 error.message 字段作为友好提示 (避免泄漏内部细节).
-fn translate_cross_proto_response(
-    egress_reader: &dyn crate::codec::Reader,
-    ingress_writer: &dyn crate::codec::Writer,
-    resp_status: StatusCode,
-    resp_bytes: &[u8],
-    egress_proto_name: &str,
-    record_id: uuid::Uuid,
-) -> (StatusCode, Vec<u8>) {
-    if resp_status.is_success() {
-        match serde_json::from_slice::<serde_json::Value>(resp_bytes) {
-            Ok(v) => match egress_reader.read_response(&v) {
-                Ok(ir_resp) => {
-                    let translated = ingress_writer.write_response(&ir_resp);
-                    let body = serde_json::to_vec(&translated).unwrap_or_default();
-                    (resp_status, body)
-                }
-                Err(e) => {
-                    warn!(
-                        %record_id,
-                        error = %e.message,
-                        "failed to parse upstream response as {}; passing through verbatim",
-                        egress_proto_name
-                    );
-                    (resp_status, resp_bytes.to_vec())
-                }
-            },
-            Err(_) => {
-                // 非 JSON 响应 (eg. HTML 错误页): 原样返回.
-                (resp_status, resp_bytes.to_vec())
-            }
-        }
-    } else {
-        // 错误响应: 截断 + 解析上游 error.message 防止泄漏内部细节.
-        let friendly = serde_json::from_slice::<serde_json::Value>(resp_bytes)
-            .ok()
-            .and_then(|v| {
-                v.get("error")
-                    .and_then(|e| e.get("message"))
-                    .and_then(|m| m.as_str())
-                    .map(String::from)
-            })
-            .unwrap_or_else(|| {
-                let raw = std::str::from_utf8(resp_bytes).unwrap_or("");
-                let cap = raw.len().min(4096);
-                raw[..cap].to_string()
-            });
-        let kind = http_status_to_error_kind(resp_status.as_u16());
-        let envelope = ingress_writer.write_error(resp_status.as_u16(), kind, &friendly);
-        let body = serde_json::to_vec(&envelope).unwrap_or_default();
-        (resp_status, body)
-    }
 }
 
 /// 把 HTTP status 映射为 protocol-agnostic error kind 字符串.
@@ -730,8 +875,12 @@ async fn fan_out_streaming(
     Ok(resp)
 }
 
-/// 缓冲扇出的参数包. 避免 `fan_out_buffered` 参数过多.
-struct BufferedParams {
+/// 缓冲扇出 (IR restore 版): 完整累积响应, parse 为 IR, restore mock→real,
+/// 重新序列化后一次性返回给客户端. 失去流式 UX.
+///
+/// 用于: 同协议 + redact + 非流式响应; 同协议 + redact + 流式响应但上游出错 (非 2xx).
+#[allow(clippy::too_many_arguments)]
+async fn fan_out_buffered_ir(
     records: RecordStore,
     record_id: uuid::Uuid,
     started: Instant,
@@ -739,22 +888,9 @@ struct BufferedParams {
     resp_status: StatusCode,
     resp_headers: HeaderMap,
     streamed: bool,
+    codec_proto: crate::codec::Protocol,
     redaction_map: RedactionMap,
-}
-
-/// 缓冲扇出: 完整累积响应, restore mock → real, 一次性返回给客户端.
-/// 失去流式 UX, 但保证 mock→real 映射正确.
-async fn fan_out_buffered(p: BufferedParams) -> Result<Response<Body>, AppError> {
-    let BufferedParams {
-        records,
-        record_id,
-        started,
-        upstream_resp,
-        resp_status,
-        resp_headers,
-        streamed,
-        redaction_map,
-    } = p;
+) -> Result<Response<Body>, AppError> {
     let resp_headers_for_record = resp_headers.clone();
     let status_u16 = resp_status.as_u16();
     let cap = MAX_RESP_BODY_RECORD;
@@ -782,15 +918,31 @@ async fn fan_out_buffered(p: BufferedParams) -> Result<Response<Body>, AppError>
         }
     }
 
-    // record 存储的是 LLM 视角 (含 mock); 客户端拿到的是 restore 后的版本.
-    let acc_text = utf8_view(&acc);
     let elapsed = started.elapsed().as_millis() as u64;
+
+    // Parse 为 IR (失败则原样透传, 不 restore).
+    let reader = codec_proto.reader();
+    let writer = codec_proto.writer();
+    let client_bytes: Vec<u8> = match serde_json::from_slice::<serde_json::Value>(&acc) {
+        Ok(v) => match reader.read_response(&v) {
+            Ok(mut ir) => {
+                restore_ir_response(&mut ir, &redaction_map);
+                let restored = writer.write_response(&ir);
+                serde_json::to_vec(&restored).unwrap_or_else(|_| acc.clone())
+            }
+            Err(_) => acc.clone(), // parse 失败: 原样返回 (无 restore).
+        },
+        Err(_) => acc.clone(), // 非 JSON: 原样返回.
+    };
+
+    // record 存储的是 LLM 视角 (含 mock) 的版本.
+    let acc_text = utf8_view(&acc);
     records.update_response_full(
         record_id,
         ResponseUpdate {
             resp_status: status_u16,
             resp_headers: redact_headers(&resp_headers_for_record),
-            resp_body: acc_text.clone(),
+            resp_body: acc_text,
             elapsed_ms: elapsed,
             streamed,
             resp_complete: error_kind.is_none(),
@@ -798,12 +950,106 @@ async fn fan_out_buffered(p: BufferedParams) -> Result<Response<Body>, AppError>
         },
     );
 
-    // restore mock → real 给客户端.
-    let client_text = restore_response(&acc_text, &redaction_map);
-    let client_bytes = client_text.into_bytes();
     let mut resp = Response::new(Body::from(client_bytes));
     *resp.status_mut() = resp_status;
     *resp.headers_mut() = build_response_headers(&resp_headers);
+    Ok(resp)
+}
+
+/// 流式扇出 + IR restore: 用 [`crate::codec::stream::StreamTranslate`] 同协议模式,
+/// 实时翻译 egress SSE → IR 事件 → restore → ingress SSE. 保持流式 UX.
+///
+/// 用于: 同协议 + redact + 流式响应.
+#[allow(clippy::too_many_arguments)]
+async fn fan_out_streaming_with_restore(
+    records: RecordStore,
+    record_id: uuid::Uuid,
+    started: Instant,
+    upstream_resp: reqwest::Response,
+    resp_status: StatusCode,
+    resp_headers: HeaderMap,
+    codec_proto: crate::codec::Protocol,
+    redaction_map: RedactionMap,
+) -> Result<Response<Body>, AppError> {
+    use crate::codec::stream::StreamTranslate;
+
+    let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(32);
+    let resp_headers_for_record = resp_headers.clone();
+    let status_u16 = resp_status.as_u16();
+
+    tokio::spawn(async move {
+        // 同协议 + restore 模式: ingress == egress, 但 IR re-serialize 用于 restore.
+        let mut translate = StreamTranslate::new_same_proto_restore(codec_proto, redaction_map);
+        let mut stream = upstream_resp.bytes_stream();
+        let mut acc: Vec<u8> = Vec::new();
+        let mut overflow = false;
+        let mut error_kind: Option<String> = None;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(b) => {
+                    // 喂给 StreamTranslate, 得到 restore 后的字节.
+                    let restored = translate.feed(&b);
+                    if !restored.is_empty() && tx.send(Ok(Bytes::from(restored))).await.is_err() {
+                        error_kind = Some("client disconnected".into());
+                        break;
+                    }
+                    // record 累积上游原始字节 (LLM 视角, 含 mock).
+                    if !overflow {
+                        let remaining = MAX_RESP_BODY_RECORD.saturating_sub(acc.len());
+                        if remaining > 0 {
+                            let take = remaining.min(b.len());
+                            acc.extend_from_slice(&b[..take]);
+                        }
+                        if b.len() > remaining {
+                            warn!(%record_id, cap = MAX_RESP_BODY_RECORD, "response too large to record; further chunks discarded");
+                            overflow = true;
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(%record_id, error = %e, "upstream stream error mid-flight");
+                    let io_err = std::io::Error::other(e.to_string());
+                    let _ = tx.send(Err(io_err)).await;
+                    error_kind = Some("upstream stream error".into());
+                    break;
+                }
+            }
+        }
+        // 流末尾: 让 StreamTranslate 输出剩余 buffered 字节 + 终止符.
+        // 即便 upstream error 也要发 (含 error event + [DONE]), 否则严格的 OpenAI 客户端会 hang.
+        // 仅 tx.send 失败 (client disconnect) 时跳过.
+        let tail = translate.finish();
+        if !tail.is_empty() {
+            let _ = tx.send(Ok(Bytes::from(tail))).await;
+        }
+
+        let elapsed = started.elapsed().as_millis() as u64;
+        let body = if overflow {
+            "<truncated: exceeded record cap>".to_string()
+        } else {
+            utf8_view(&acc)
+        };
+        records.update_response_full(
+            record_id,
+            ResponseUpdate {
+                resp_status: status_u16,
+                resp_headers: redact_headers(&resp_headers_for_record),
+                resp_body: body,
+                elapsed_ms: elapsed,
+                streamed: true,
+                resp_complete: error_kind.is_none(),
+                error: error_kind,
+            },
+        );
+    });
+
+    let body = Body::from_stream(ReceiverStream::new(rx));
+    let mut resp = Response::new(body);
+    *resp.status_mut() = resp_status;
+    let out_headers = build_response_headers(&resp_headers);
+    // restore 后的 SSE, content-type 仍是 text/event-stream (SSE 是 SSE).
+    // 不强改 content-type, 保留上游声明的.
+    *resp.headers_mut() = out_headers;
     Ok(resp)
 }
 

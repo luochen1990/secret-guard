@@ -43,8 +43,9 @@ URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标
 - 未知 protocol 简写 → 404 `not_found`
 - 未知 provider id → 404 `not_found`
 - 禁用 provider (`enabled = false`) → 503 `unavailable`
-- 同协议 (ingress == egress): 字节透传, 不进入 codec.
-- 跨协议 OpenAI ⇄ Anthropic: 通过 `src/codec` 翻译 (IR 中介); 跨协议 + `stream=true` → 501 (流式翻译尚未支持); Gemini/Ollama 跨协议 → 501 (codec 未覆盖).
+- 同协议 (ingress == egress): 字节透传 (无 redact) 或 IR 路径 (有 redact).
+- 跨协议 OpenAI ⇄ Anthropic: 通过 `src/codec` 翻译 (IR 中介 + redact + restore);
+  跨协议 + `stream=true` → 501 (流式翻译尚未支持); Gemini/Ollama 跨协议 → 501 (codec 未覆盖).
 
 ## 模块概览
 
@@ -59,15 +60,22 @@ src/
 ├── provider.rs    # Protocol / Provider + DynamicEntry impl + EffectiveProvider 合并视图
 ├── secrets.rs     # SecretEntry / SecretCategory + DynamicEntry impl + EffectiveSecret + mask_value
 ├── record.rs      # ForwardRecord / RecordStore / ResponseUpdate
-├── redact.rs      # mock_secret + RedactionMap + redact_request + restore_response
+├── redact.rs      # mock_with_salt + RedactionMap + redact_ir + restore_ir_response
+│                  # + restore_ir_stream_event (流式 per-event restore)
+│                  # + IR traverse helpers (block_contains / value_replace_all 等)
 ├── codec/         # 跨协议 codec (OpenAI ⇄ Anthropic, 借鉴 Busbar IR 设计)
 │   ├── mod.rs     # Protocol enum + Reader/Writer trait + 共享 helpers
 │   ├── ir.rs      # 协议无关 IR (IrRequest/IrResponse/IrBlock/IrMessage/IrStreamEvent/IrUsage)
 │   ├── openai.rs  # OpenAI Chat Completions Reader/Writer (含流式 fan-out)
 │   ├── anthropic.rs # Anthropic Messages Reader/Writer (含 1:1 流映射)
-│   └── stream.rs  # StreamTranslate (SSE chunk-boundary 处理 + 跨协议翻译)
-├── proxy.rs       # ProxyState + forward/forward_no_rest + fan_out_streaming/buffered
-│                  # + cross_proto_forward (跨协议路径, 调用 codec)
+│   └── stream.rs  # StreamTranslate (SSE chunk-boundary + 跨协议翻译 + 同协议 restore 模式)
+├── proxy.rs       # ProxyState + forward/forward_no_rest + dispatch (路由分发)
+│                  # + same_proto_passthrough (无 redact 字节透传)
+│                  # + same_proto_forward (有 redact IR 路径)
+│                  # + cross_proto_forward (跨协议 IR 翻译 + redact)
+│                  # + fan_out_streaming (流式透传)
+│                  # + fan_out_streaming_with_restore (流式 + IR restore)
+│                  # + fan_out_buffered_ir (非流式 IR restore)
 └── server.rs      # build_router + serve (装配 persist_lock + 共享 decisions)
     └── web/
         ├── mod.rs     # /__sg 子 router + / 根入口 + slash_redirect + not_found
@@ -142,18 +150,39 @@ PATCH  /__sg/api/providers/{id}/decision
 
 ### mock_secret (`src/redact.rs`)
 
-`mock_secret(full_context, real_secret) -> String` 满足 6 条形式化契约 (C1-C6),
+`mock_with_salt(real_secret, salt) -> String` 是 redact 的纯算法核心, 满足 6 条形式化契约 (C1-C6),
 完整定义见 `src/redact.rs` 文件头 doc. 关键不变式:
 
-- **C5**: mock 不含 real_secret 的 ≥4 字符连续子串.
+- **C5 (best-effort)**: mock 极大概率不含 real_secret 的 ≥4 字符连续子串 (碰撞概率 ≈ 2^-32 per secret).
   前提: `SecretTable::upsert` 通过 `validate_value` 拒绝含 `MOCK_PREFIX` ("sgm_") 的 secret.
-- **C6**: `restore_response(redact_request(body, secrets).0, map) == body` (round-trip identity).
+  `proptest-regressions/redact.txt` 记录历史失败种子 (real 全 base62 字母时风险更高).
+- **C6**: `restore_ir_response(redact_ir(...).ir, map)` 后 IR 语义等价于原 IR (round-trip identity).
   property-based 测试在 `src/redact.rs::tests::prop_*` 覆盖.
 
-### fan_out 双路径 (`src/proxy.rs`)
+### redact pipeline (`src/redact.rs` + `src/proxy.rs`)
 
-- `fan_out_streaming`: SecretTable 为空时使用, 流式透传, 最佳 UX.
-- `fan_out_buffered`: 启用 redact 时使用, 完整累积响应再 restore, 失去流式但保证 C6.
+redact 已升级为 **IR 变换** (基于 `src/codec/ir`), 与 codec 同层. 三个核心 API:
+- `redact_ir(&mut IrRequest, secrets) -> RedactionMap`: 扫描 IR 所有字符串字段, 把 secret 替换为 mock.
+- `restore_ir_response(&mut IrResponse, map)`: 非流式响应 restore.
+- `restore_ir_stream_event(&mut IrStreamEvent, map)`: 流式 per-event restore (跳过 InputJsonDelta, MVP 限制).
+
+**dispatch 路径选择** (`proxy.rs::dispatch`):
+- **同协议 + 无 redact** (SecretTable 空): `same_proto_passthrough` 字节透传 (零回归, 最热路径).
+- **同协议 + redact**: `same_proto_forward` 走 IR (reader → redact_ir → writer).
+  - 流式响应: `fan_out_streaming_with_restore` 用 StreamTranslate 同协议 restore 模式 (恢复流式 UX).
+  - 非流式响应: `fan_out_buffered_ir` 累积 + restore_ir_response.
+- **跨协议**: `cross_proto_forward` 走 IR (reader → redact_ir → extra.clear → writer).
+  - 响应: egress reader → IR → restore_ir_response → ingress writer.
+  - 流式仍返回 501 (StreamTranslate 跨协议模式尚未接入 dispatch).
+
+### fan_out 三路径 (`src/proxy.rs`)
+
+- `fan_out_streaming`: 字节流式透传, 用于 same-proto + 无 redact. 客户端响应 = 上游字节.
+- `fan_out_streaming_with_restore`: 流式 + IR restore, 用于 same-proto + redact + 流式响应.
+  用 StreamTranslate 同协议 restore 模式 (egress SSE → IR event → restore → ingress SSE).
+  失去 byte-exact (IR re-serialize), 但保留流式 UX.
+- `fan_out_buffered_ir`: 非流式 + IR restore, 用于 same-proto + redact + 非流式 / cross-proto.
+  完整累积响应, restore, 一次性返回.
 - **客户端响应永远无大小上限**; 只有 record 累积受 `MAX_RESP_BODY_RECORD` (32 MiB) 约束.
 
 ### Provider 路由 (`src/proxy.rs`)
@@ -352,10 +381,16 @@ client = Anthropic(
 ## 已知限制 (MVP)
 
 - **跨协议 + 流式响应**: OpenAI ⇄ Anthropic 跨协议时, `stream=true` 返回 501
-  (流式跨协议翻译尚未支持; 同协议仍然流式透传).
-- **跨协议 + redact**: 跨协议路径当前**不应用**字节级 redact. SecretTable 非空时会
-  log warn 提示 operator. 计划在 IR 阶段做结构化 redact 解决.
-- 启用 redact 时 (同协议), 流式响应降级为 buffered (失去 SSE 流式 UX).
+  (流式跨协议翻译尚未接入 dispatch; StreamTranslate 已实现但未集成).
+- **流式 tool_use input_json_delta 的 redact**: 流式响应中的 `IrDelta::InputJsonDelta`
+  (tool 调用参数片段) **不 restore** — 跨 chunk secret 会泄漏给客户端 (看到 mock 而非 real).
+  未来用 sliding window 缓冲尾部 N 字节解决. 见 `src/redact.rs` 文件头 TODO.
+- **C5 是概率性契约**: `mock_with_salt` 极大概率不含 real_secret ≥4 字符子串 (碰撞概率 ≈ 2^-32).
+  全 base62 字母的 secret 风险更高, `proptest-regressions/redact.txt` 记录历史失败种子.
+- **同协议 + redact 失去 byte-exact**: reader → redact_ir → writer 重序列化, 字段顺序 / 空字符串
+  归一化可能让 wire 字节略变, 但语义等价. 同协议 + 无 redact 路径仍 byte-exact.
+- **流式 + redact + 非 2xx 上游错误**: 走 `fan_out_buffered_ir`, 但 SSE 错误流不是单个 JSON,
+  parse 失败时 fallback 原样返回 (无 restore). 客户端可能看到 mock.
 - mock_secret 用 SipHash (Rust `DefaultHasher`), 同 Rust 版本内确定, 但**不保证跨版本稳定**;
   RedactionMap 是 per-request 状态不持久化, 所以无实际影响.
 - mock 固定 15 字符 (`sgm_` + 11 char base62), 不模拟 real_secret 的格式/长度.
@@ -376,14 +411,18 @@ client = Anthropic(
 ## 后续工作 (非 MVP 范围)
 
 - **跨协议流式响应翻译**: StreamTranslate 已实现 (egress SSE → IR 事件 → ingress SSE,
-  含 chunk-boundary 处理 + tool_calls/index 状态合成), 但尚未集成到 `cross_proto_forward`.
-  需要在 dispatch 路径检测上游 streaming, 接入 `StreamTranslate::feed`/`finish`, 替换当前
-  buffer-all-then-translate 策略.
-- **跨协议 + redact 的协同**: 在 IR 阶段做结构化 redact (遍历 `IrBlock::Text` 与
-  `IrBlock::ToolUse.input` 的字符串值做 mock 替换). 这比字节级 redact 更准确, 是长期方案.
+  含 chunk-boundary 处理 + tool_calls/index 状态合成 + 同协议 restore 模式),
+  但跨协议路径尚未接入 dispatch. 需要在 `cross_proto_forward` 检测 stream=true 时,
+  接入 `StreamTranslate::new(ingress, egress)` 而非返回 501.
+- **流式 InputJsonDelta 的 sliding window restore**: 流式 tool 调用参数片段跨 chunk 时
+  secret 会泄漏给客户端 (看到 mock). 用 sliding window 缓冲尾部 N 字节解决.
+  见 `src/redact.rs` 文件头 TODO.
 - **更多协议**: Gemini / Ollama / Bedrock / Cohere / OpenAI Responses API.
   新增协议只需实现 Reader + Writer trait (~200 行), 不动 dispatch.
-- **协议转换** (思路已实现, 无需再做): 跨协议 codec 模块即承担此角色.
+- **redact 性能优化**: `redact_ir` 当前对每个 secret 都 traverse IR (K * n 复杂度).
+  高 secret 数 + 大 IR 场景可能成为热点. 长期用 Aho-Corasick (多模式匹配) 一次性扫所有 mock.
+- **redact 测试基线**: 加 criterion bench 测典型场景 (10 secrets × 10KB IR, 100 × 100KB),
+  留作回归基线.
 - mock_secret 的 category-aware 生成 (Password/ApiKey/Cookie 等格式感知).
 - 配置热加载 (目前 Web UI 改 config 后, 重启才影响 CLI 参数).
 - 测试覆盖率自动上报 + fuzzing (cargo-fuzz).

@@ -126,7 +126,7 @@ pub enum IrToolChoice {
 // ─── 响应侧 (非流式) ───────────────────────────────────────────────────────
 
 /// 协议无关的非流式 chat completion 响应.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct IrResponse {
     /// assistant 回复的内容块.
     pub content: Vec<IrBlock>,
