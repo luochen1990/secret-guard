@@ -89,9 +89,13 @@ pub struct SecretsConfig {
 impl Config {
     /// 从 TOML 文件加载; 若文件不存在返回默认值并 warn.
     ///
-    /// 加载后会对每个 provider / secret 跑 [`DynamicEntry::validate`],
-    /// 把契约违反 (如 `api_key` 与 `api_key_file` 同时设置) 在启动时就暴露出来,
-    /// 而不是等到运行时被静默吞掉.
+    /// 加载序列 (启动 fail-fast):
+    /// 1. [`DynamicEntry::validate`] — 结构校验 (id 格式 / value 与 value_file 互斥).
+    /// 2. [`SecretEntry::resolve_value`] — 若设置了 `value_file`, 从文件读取写入 `value`.
+    /// 3. [`validate_value`] — resolve 后跑最终内容校验 (长度 / mock prefix / PUA),
+    ///    因为 trim 后的 value 才是 redact 实际使用的字节.
+    ///
+    /// 任一步失败都返回 `Err`, 让误配在启动时就暴露, 而不是被运行时代码路径静默吞掉.
     pub fn load_or_default(path: &Path) -> anyhow::Result<Self> {
         if !path.exists() {
             tracing::warn!(
@@ -102,9 +106,10 @@ impl Config {
         }
         let text = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("read config {}: {e}", path.display()))?;
-        let cfg: Self = toml::from_str(&text)
+        let mut cfg: Self = toml::from_str(&text)
             .map_err(|e| anyhow::anyhow!("parse config {}: {e}", path.display()))?;
-        validate_entries(path, &cfg.providers, &cfg.secrets.entries)?;
+        validate_and_resolve_secrets(path, &mut cfg.secrets.entries)?;
+        validate_providers(path, &cfg.providers)?;
         Ok(cfg)
     }
 
@@ -138,7 +143,7 @@ pub struct DynamicState {
 impl DynamicState {
     /// 从 TOML 文件加载; 若文件不存在返回空 state (不 warn, 这是正常情况).
     ///
-    /// 与 [`Config::load_or_default`] 一样, 加载后会跑 validate —
+    /// 与 [`Config::load_or_default`] 一样, 加载后会跑 validate + resolve + 内容校验 —
     /// 用户手编 state.toml 时也应当尽早暴露契约违反.
     pub fn load_or_empty(path: &Path) -> anyhow::Result<Self> {
         if !path.exists() {
@@ -146,9 +151,10 @@ impl DynamicState {
         }
         let text = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("read state {}: {e}", path.display()))?;
-        let state: Self = toml::from_str(&text)
+        let mut state: Self = toml::from_str(&text)
             .map_err(|e| anyhow::anyhow!("parse state {}: {e}", path.display()))?;
-        validate_entries(path, &state.providers, &state.secrets)?;
+        validate_and_resolve_secrets(path, &mut state.secrets)?;
+        validate_providers(path, &state.providers)?;
         Ok(state)
     }
 
@@ -158,22 +164,27 @@ impl DynamicState {
     }
 }
 
-/// 对 provider + secret 列表统一跑 [`DynamicEntry::validate`].
-/// 用于 [`Config::load_or_default`] 和 [`DynamicState::load_or_empty`] 的启动时校验,
-/// 把契约违反在启动时就暴露出来, 而不是被运行时代码路径静默吞掉.
-fn validate_entries(
-    path: &Path,
-    providers: &[Provider],
-    secrets: &[SecretEntry],
-) -> anyhow::Result<()> {
+/// 对 secret 列表跑完整 validate+resolve 序列 (fail-fast).
+///
+/// 这是 [`SecretEntry::validate_and_resolve`] 的批量包装: 三步序列 (结构 validate →
+/// resolve_value → 内容 validate_value) 的契约定义在 `SecretEntry` 上 (SSOT),
+/// 本函数只负责错误消息的 path/id 包装.
+///
+/// Provider 不需要此序列 — 见 [`SecretEntry::validate_and_resolve`] 的"与 Provider 的差异"段.
+fn validate_and_resolve_secrets(path: &Path, secrets: &mut [SecretEntry]) -> anyhow::Result<()> {
+    for s in secrets.iter_mut() {
+        s.validate_and_resolve().map_err(|e| {
+            anyhow::anyhow!("config {}: invalid secret {}: {e}", path.display(), s.id)
+        })?;
+    }
+    Ok(())
+}
+
+/// 对 provider 列表只跑结构 validate (不需要 resolve, 见 [`validate_and_resolve_secrets`] 注释).
+fn validate_providers(path: &Path, providers: &[Provider]) -> anyhow::Result<()> {
     for p in providers {
         p.validate().map_err(|e| {
             anyhow::anyhow!("config {}: invalid provider {}: {e}", path.display(), p.id)
-        })?;
-    }
-    for s in secrets {
-        s.validate().map_err(|e| {
-            anyhow::anyhow!("config {}: invalid secret {}: {e}", path.display(), s.id)
         })?;
     }
     Ok(())
@@ -711,6 +722,96 @@ mod tests {
         );
         let err = DynamicState::load_or_empty(&path).unwrap_err().to_string();
         assert!(err.contains("invalid provider"), "got: {err}");
+        assert!(
+            err.contains("bad"),
+            "error should name the offending provider"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ─── Config::load_or_default: secret 的 value_file 三步序列 ──────────
+    //
+    // value_file 模式: validate (结构) → resolve (读文件) → validate_value (内容).
+    // 与 Provider 的 api_key_file 不同点: 读文件失败要 fail-fast (secret 缺失会让
+    // redact 失效, 进而导致 secret 泄漏到 LLM provider — 正是 secret-guard 要防的事故).
+
+    /// 辅助: 创建一个临时 secret 文件.
+    fn write_secret_file(content: &str) -> PathBuf {
+        let id = uuid::Uuid::new_v4().to_string();
+        let path = PathBuf::from(format!("/tmp/opencode/tmp/test-secret-file-{id}.txt"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn load_or_default_resolves_secret_value_file() {
+        // secret value_file 指向真实文件 → load 后 value 应当是文件内容 (trim 后).
+        let secret_path = write_secret_file("sk-loaded-from-file\n");
+        let cfg_text = format!(
+            r#"
+            [[secrets.entries]]
+            id = "from-file"
+            category = "apikey"
+            value_file = "{}"
+            "#,
+            secret_path.display()
+        );
+        let path = write_config_tmp(&cfg_text);
+        let cfg = Config::load_or_default(&path).expect("value_file should resolve");
+
+        assert_eq!(cfg.secrets.entries.len(), 1);
+        let e = &cfg.secrets.entries[0];
+        assert_eq!(e.id, "from-file");
+        assert_eq!(e.value, "sk-loaded-from-file"); // 末尾换行被 trim.
+        assert!(
+            e.value_file.is_none(),
+            "value_file should be cleared after resolve"
+        );
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&secret_path).ok();
+    }
+
+    #[test]
+    fn load_or_default_rejects_secret_with_both_value_and_value_file() {
+        // value 与 value_file 互斥, 启动时必须报错 (与 provider api_key 互斥对称).
+        let secret_path = write_secret_file("irrelevant");
+        let cfg_text = format!(
+            r#"
+            [[secrets.entries]]
+            id = "bad"
+            value = "direct-value"
+            value_file = "{}"
+            "#,
+            secret_path.display()
+        );
+        let path = write_config_tmp(&cfg_text);
+        let err = Config::load_or_default(&path).unwrap_err().to_string();
+        assert!(err.contains("invalid secret"), "got: {err}");
+        assert!(
+            err.contains("both value and value_file"),
+            "err should explain mutual exclusion: {err}"
+        );
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&secret_path).ok();
+    }
+
+    #[test]
+    fn load_or_default_fails_fast_on_unreadable_secret_value_file() {
+        // value_file 指向不存在的文件 → fail-fast 启动失败.
+        // 语义不同于 Provider (warn+fallback): secret 缺失会让 redact 静默失效, 必须报错.
+        let cfg_text = r#"
+            [[secrets.entries]]
+            id = "missing"
+            value_file = "/nonexistent/secret-guard-test/no-such-file"
+            "#;
+        let path = write_config_tmp(cfg_text);
+        let err = Config::load_or_default(&path).unwrap_err().to_string();
+        assert!(err.contains("invalid secret"), "got: {err}");
+        assert!(
+            err.contains("failed to read value_file"),
+            "err should mention file read failure: {err}"
+        );
         std::fs::remove_file(&path).ok();
     }
 
@@ -805,6 +906,7 @@ mod table_tests {
             name: Some(format!("name-{id}")),
             category: SecretCategory::ApiKey,
             value: value.into(),
+            value_file: None,
         }
     }
 
@@ -967,6 +1069,7 @@ mod table_tests {
             name: None,
             category: SecretCategory::ApiKey,
             value: "x".into(), // 太短 (< 3 字节) → validate_value 失败.
+            value_file: None,
         };
         assert!(t.upsert_dynamic(bad).is_err());
     }

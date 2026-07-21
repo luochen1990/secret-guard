@@ -144,6 +144,7 @@ fn secret(id: &str, value: &str) -> SecretEntry {
         name: Some(id.into()),
         category: SecretCategory::ApiKey,
         value: value.into(),
+        value_file: None,
     }
 }
 

@@ -649,6 +649,7 @@ fn entry(value: &str) -> SecretEntry {
         name: None,
         category: SecretCategory::ApiKey,
         value: value.into(),
+        value_file: None,
     }
 }
 
@@ -895,12 +896,14 @@ mod tests {
                 name: None,
                 category: SecretCategory::ApiKey,
                 value: "XYZ123".into(),
+                value_file: None,
             },
             SecretEntry {
                 id: "id-2".into(),
                 name: None,
                 category: SecretCategory::ApiKey,
                 value: "XYZ123".into(),
+                value_file: None,
             },
         ];
         let map = redact_ir(&mut ir, &secrets);

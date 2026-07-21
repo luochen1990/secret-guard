@@ -216,6 +216,27 @@ redact 已升级为 **IR 变换** (基于 `src/codec/ir`), 与 codec 同层. 三
 secret 由 sops-nix 解密到 `/run/secrets/...`, secret-guard 在请求时读取.
 这极大简化了上游 nixos module 的配置 (不用 `sops.templates` 渲染整个 toml).
 
+#### secret value 的两种来源 (`SecretEntry::resolve_value`)
+
+与 `Provider.api_key` / `api_key_file` 对称, `SecretEntry` 也支持两种 value 配置方式
+(互斥, 同时设置会在 `validate()` 报错):
+
+| 字段 | 类型 | 适用场景 |
+|---|---|---|
+| `value` | `String` (直接值) | 本地 dev / 简单部署 / 不在乎 toml 含敏感数据 |
+| `value_file` | `Option<PathBuf>` (启动时一次性读取) | 生产部署 / sops-nix / systemd LoadCredential / k8s secrets |
+
+**生命周期与 Provider 的关键差异**:
+
+- Provider 的 `api_key_file` 是**运行时每次请求读文件** (热路径, 读不到 → warn + 空字符串 fallback,
+  单 provider 配置错误不拖垮进程). 因为 provider 失败只影响转发, 不影响安全性.
+- Secret 的 `value_file` 是**启动时一次性 resolve** (config 加载阶段读一次, 内容写入 `value` 字段,
+  清空 `value_file`). 读不到 → **fail-fast 启动失败**. 因为 secret 缺失会让 redact 静默失效,
+  进而导致真实 secret 泄漏到 LLM provider — 这正是 secret-guard 要防止的事故.
+
+resolve 后 redact 核心逻辑零改动 (按 `value` 字段做字节匹配, 无额外 IO). 文件内容会被 `trim()`
+(容忍 sops / `echo | tee` 末尾换行符).
+
 ### 跨协议 codec (`src/codec/`)
 
 借鉴 Busbar (`GetBusbar/busbar`, Apache-2.0) 的 superset IR + Reader/Writer trait 设计,
@@ -309,6 +330,40 @@ services.secret-guard.configFile = (pkgs.writeText "secret-guard.toml" ''
 
 **不推荐**: `sops.templates` 渲染整个 toml 把 api_key 嵌入明文 — toml 无法进 nix
 store, 调试不便, 与 nixos 生态主流模式 (hermes-agent / bazarr) 不一致.
+
+### secret entries 的批量注入 (value_file + LoadCredential)
+
+`SecretEntry` 同样支持 `value_file` (启动时一次性 resolve, fail-fast), 所以
+**redact 用的 secrets 列表** 也能完全脱敏地注入. 姿势与 provider 的 `api_key_file`
+完全对称: LoadCredential + toml `value_file` 引用.
+
+适合场景: 把一批符合命名模式的 sops secrets (如 `*_api_key` / `*_api_token` / `*_secret`)
+批量注入 secret-guard 做 redact, 防止 agent 不经意把它们写入 LLM prompt.
+
+```nix
+let
+  # 从 config.sops.secrets 中按模式筛选要 redact 的 key (SSOT: 只列一次).
+  redactKeys = lib.filter (k:
+    lib.hasSuffix "_api_key" k ||
+    lib.hasSuffix "_api_token" k ||
+    lib.hasSuffix "_secret" k
+  ) (builtins.attrNames config.sops.secrets);
+in {
+  # LoadCredential 与 toml entries 都从 redactKeys 派生, 永远同步.
+  systemd.services.secret-guard.serviceConfig.LoadCredential = map (k:
+    "${k}:${config.sops.secrets.${k}.path}"
+  ) redactKeys;
+
+  services.secret-guard.configFile = (pkgs.writeText "secret-guard.toml" ''
+    ${...providers 段...}
+    ${lib.concatStrings (map (k: ''
+      [[secrets.entries]]
+      id = "${k}"
+      value_file = "/run/credentials/secret-guard.service/${k}"
+    '') redactKeys)}
+  '');
+}
+```
 
 
 ## 开发流程

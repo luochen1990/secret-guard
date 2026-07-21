@@ -83,6 +83,10 @@ pub async fn create_secret(
     if entry.id.is_empty() {
         entry.id = Uuid::new_v4().to_string();
     }
+    // 完整 validate+resolve 序列 (互斥 / 文件可读 / value 内容合法).
+    // 必须在 upsert 前跑: 否则内存中 value 为空 (value_file 模式), 当次 redact 不识别此 secret.
+    // 也是 WebUI 路径上互斥校验的执行点 (见 into_entry 的注释 — 那里只做基础字段校验).
+    entry.validate_and_resolve().map_err(ApiError::validation)?;
     // 检查 effective view 中是否已存在 (含 static 来源). 不允许覆盖 static 创建同 id.
     if state
         .secrets
@@ -132,6 +136,8 @@ pub async fn update_secret(
     }
     let mut entry = payload.into_entry()?;
     entry.id = id.clone();
+    // 完整 validate+resolve 序列, 与 create_secret 一致 (见那里的注释).
+    entry.validate_and_resolve().map_err(ApiError::validation)?;
     let (saved, _kind) = state
         .secrets
         .upsert_dynamic(entry)
@@ -221,24 +227,32 @@ pub struct CreateSecretRequest {
     pub id: Option<String>,
     pub name: Option<String>,
     pub category: Option<SecretCategory>,
+    /// 直接值. 与 `value_file` 互斥 (同时设置会在 `validate()` 报错).
+    /// WebUI 默认用此字段 (用户手填); 留空且提供了 `value_file` 则走文件读取模式.
+    #[serde(default)]
     pub value: String,
+    /// 可选: 从文件路径读取 secret 明文. 与 `value` 互斥.
+    /// 主要用于 static config (sops 注入), WebUI 创建 dynamic-only secret 时一般不用,
+    /// 但保留字段以支持 "dynamic secret 引用 sops 解密路径" 的高级用例.
+    #[serde(default)]
+    pub value_file: Option<String>,
 }
 
 impl CreateSecretRequest {
     fn into_entry(self) -> Result<SecretEntry, ApiError> {
-        if self.value.is_empty() {
-            return Err(ApiError::validation("value must not be empty"));
-        }
-        // 检查 value 合法性 (长度 + PUA 字符). 通过 SecretTable::upsert 也会再校验,
-        // 但在这里先做能给出更友好的字段级错误.
-        if let Err(e) = crate::secrets::validate_value(&self.value) {
-            return Err(ApiError::validation(e));
+        // 早期字段级反馈: value 与 value_file 至少一个非空. 互斥校验和 value 内容校验
+        // 由后续 handler 中的 SecretEntry::validate_and_resolve 统一执行 (SSOT).
+        if self.value.is_empty() && self.value_file.is_none() {
+            return Err(ApiError::validation(
+                "either value or value_file must be set",
+            ));
         }
         Ok(SecretEntry {
             id: self.id.unwrap_or_default(),
             name: self.name.filter(|s| !s.trim().is_empty()),
             category: self.category.unwrap_or_default(),
             value: self.value,
+            value_file: self.value_file.map(std::path::PathBuf::from),
         })
     }
 }
@@ -514,8 +528,31 @@ mod tests {
             name: None,
             category: None,
             value: String::new(),
+            value_file: None,
         };
         assert!(req.into_entry().is_err());
+    }
+
+    #[test]
+    fn create_request_into_entry_does_not_check_mutex() {
+        // into_entry 故意不做互斥校验 (由 SecretEntry::validate_and_resolve 在 handler 层做, SSOT).
+        // 这里断言此契约: 同时填 value + value_file 时 into_entry 仍然成功,
+        // 把校验责任显式交给后续 validate_and_resolve.
+        let req = CreateSecretRequest {
+            id: Some("x".into()),
+            name: None,
+            category: None,
+            value: "direct-value".into(),
+            value_file: Some("/some/path".into()),
+        };
+        let entry = req.into_entry().expect("into_entry skips mutex check");
+        // 但 SecretEntry::validate_and_resolve 必须拒绝此组合.
+        let mut entry = entry;
+        let err = entry.validate_and_resolve().unwrap_err();
+        assert!(
+            err.contains("both value and value_file"),
+            "validate_and_resolve should reject mutex violation: {err}"
+        );
     }
 
     #[test]

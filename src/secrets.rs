@@ -36,7 +36,96 @@ pub struct SecretEntry {
     #[serde(default)]
     pub category: SecretCategory,
     /// 真实 secret 明文 (服务端使用; 永不通过 API 返回).
+    ///
+    /// 与 [`SecretEntry::value_file`] 互斥 — 同时设置会在 [`SecretEntry::validate`] 中报错.
+    /// 启动时若设置了 `value_file`, [`SecretEntry::resolve_value`] 会把文件内容 (trim 后)
+    /// 写入此字段并清空 `value_file`, 之后 redact 热路径只读 `value` (零额外 IO).
+    #[serde(default)]
     pub value: String,
+    /// 可选: 从文件路径读取 secret 明文. 与 [`SecretEntry::value`] 互斥.
+    ///
+    /// # 设计意图 (与 [`crate::provider::Provider::api_key_file`] 对称)
+    ///
+    /// 让 `secret-guard.toml` 本身不含敏感数据, secret 由外部机制 (sops-nix /
+    /// systemd LoadCredential / docker secrets / k8s secrets) 解密到独立路径.
+    /// 这极大简化了上游 nixos module 的配置 — toml 可直接进 git 或 nix store.
+    ///
+    /// # 生命周期: 启动时一次性 resolve
+    ///
+    /// 与 Provider 的 `api_key_file` (每次请求读文件, warn+fallback) 不同, secret 的
+    /// `value_file` 在 config 加载时只读一次, 把内容写入 `value` 字段后清空 `value_file`.
+    /// 这样 redact 核心逻辑 (按 `value` 做字节匹配) 零改动, 也避免热路径 N×IO.
+    ///
+    /// 读文件失败 → fail-fast (返回 Err, 由 main 传播为非零退出码). 原因: secret 是 redact 的核心数据,
+    /// 静默 fallback 到空值会让 redact 失效, 导致 secret 泄漏到 LLM provider —
+    /// 这正是 secret-guard 要防止的事故. fail-fast 让误配在部署时就暴露.
+    ///
+    /// 文件内容会被 `trim()` (容忍 sops / `echo | tee` 末尾换行符).
+    #[serde(default)]
+    pub value_file: Option<std::path::PathBuf>,
+}
+
+impl SecretEntry {
+    /// 若设置了 `value_file`, 读取文件内容写入 `value` 并清空 `value_file`.
+    /// 之后 redact 热路径只读 `value`, 无额外 IO.
+    ///
+    /// # 语义
+    ///
+    /// - `value` 非空 + `value_file` None → 不变 (直接值模式)
+    /// - `value` 空 + `value_file` Some → 读文件, trim, 写入 `value`, 清空 `value_file`
+    /// - 两者都非空 → [`SecretEntry::validate`] 已拒绝 (不会走到这里)
+    /// - 两者都空 → 不变 (由 [`validate_value`] 在 validate 阶段拒绝)
+    ///
+    /// # 错误处理: fail-fast
+    ///
+    /// 读文件失败返回 `Err`. 调用方 ([`Config::load_or_default`] /
+    /// [`DynamicState::load_or_empty`]) 会把错误转成启动失败, 让误配在部署时暴露.
+    /// 见 [`SecretEntry::value_file`] 字段文档的"生命周期"段.
+    ///
+    /// [`Config::load_or_default`]: crate::config::Config::load_or_default
+    /// [`DynamicState::load_or_empty`]: crate::config::DynamicState::load_or_empty
+    pub fn resolve_value(&mut self) -> Result<(), String> {
+        let Some(path) = self.value_file.take() else {
+            return Ok(());
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(s) => {
+                self.value = s.trim().to_string();
+                Ok(())
+            }
+            Err(e) => Err(format!(
+                "failed to read value_file for secret '{}': {} (path: {})",
+                self.id,
+                e,
+                path.display()
+            )),
+        }
+    }
+
+    /// 完整的 entry 入系统校验序列: 结构 validate → resolve_value → 内容 validate_value.
+    ///
+    /// 所有 entry 进入系统的路径 (static config 加载 / dynamic state 加载 / WebUI upsert)
+    /// 都应通过此方法, 保证 "互斥 + 文件可读 + value 内容合法" 三条契约一致执行,
+    /// 避免分散在三处的 ad-hoc 调用序列漂移.
+    ///
+    /// # 步骤设计动机
+    ///
+    /// 1. **结构 validate** ([`DynamicEntry::validate`]): id 格式 + value 与 value_file 互斥.
+    ///    在 resolve 前跑, 能在 value 还空 (value_file 模式) 时识别结构错误.
+    /// 2. **resolve_value**: 从 `value_file` 读文件写入 `value` (fail-fast: 读失败 → Err).
+    /// 3. **内容 validate** ([`validate_value`]): resolve 后 value 是最终 redact 用的字节,
+    ///    必须满足长度 / mock prefix / PUA 约束.
+    ///
+    /// # 与 Provider 的差异
+    ///
+    /// Provider 不需要此序列 — 它的 `api_key` 允许空 (Ollama 等场景), 且 `effective_api_key`
+    /// 是运行时每次请求读文件. 见 [`crate::provider::Provider::effective_api_key`].
+    pub fn validate_and_resolve(&mut self) -> Result<(), String> {
+        self.validate()?;
+        self.resolve_value()?;
+        validate_value(&self.value)?;
+        Ok(())
+    }
 }
 
 /// Secret 类别. 用于第四步选择不同的 mock 生成器.
@@ -160,7 +249,21 @@ impl DynamicEntry for SecretEntry {
 
     fn validate(&self) -> Result<(), String> {
         validate_id(&self.id)?;
-        validate_value(&self.value)?;
+        // value 与 value_file 互斥: 同时设置语义不明, 几乎肯定是误操作
+        // (比如 toml 既填了 value 又忘了删 value_file).
+        if !self.value.is_empty() && self.value_file.is_some() {
+            return Err(format!(
+                "secret {} has both value and value_file set; pick one",
+                self.id
+            ));
+        }
+        // value 内容校验 (长度 / mock prefix / PUA) 只在 value 非空时跑 —
+        // value_file 模式下 value 要等 resolve_value 才有内容, 那时再由调用方
+        // (config.rs::resolve_secret_values) 跑 validate_value 做最终内容校验.
+        // 这与 Provider::validate 不校验 api_key 内容 (允许空) 的模式对称.
+        if !self.value.is_empty() {
+            validate_value(&self.value)?;
+        }
         Ok(())
     }
 
@@ -274,6 +377,7 @@ mod tests {
             name: Some(format!("name-{id}")),
             category: SecretCategory::ApiKey,
             value: value.into(),
+            value_file: None,
         }
     }
 
@@ -416,5 +520,97 @@ mod tests {
         // "static-v" 8 字符, ≤ 8 → 全 *; length 8.
         assert_eq!(snap[0].value_masked, "********");
         assert_eq!(snap[0].value_length, 8);
+    }
+
+    // ─── value_file: 从文件路径读取 secret 明文 ─────────────────────────
+
+    /// 辅助: 创建一个临时 secret 文件 (含末尾换行, 模拟 sops / echo | tee 行为).
+    fn write_secret_file(content: &str) -> PathBuf {
+        let id = uuid::Uuid::new_v4().to_string();
+        let path = PathBuf::from(format!("/tmp/opencode/tmp/test-secret-file-{id}.txt"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // 故意加末尾换行 — resolve_value 必须 trim.
+        std::fs::write(&path, format!("{content}\n")).unwrap();
+        path
+    }
+
+    #[test]
+    fn resolve_value_reads_from_file_and_trims() {
+        let path = write_secret_file("sk-test-secret-value");
+        let mut e = SecretEntry {
+            id: "x".into(),
+            name: None,
+            category: SecretCategory::ApiKey,
+            value: String::new(),
+            value_file: Some(path),
+        };
+        assert!(e.resolve_value().is_ok());
+        assert_eq!(e.value, "sk-test-secret-value"); // 末尾换行被 trim 掉.
+        assert!(e.value_file.is_none()); // resolve 后清空 value_file.
+    }
+
+    #[test]
+    fn resolve_value_no_op_when_value_file_is_none() {
+        // 直接值模式: 没有 value_file, resolve 是 no-op, value 保持不变.
+        let mut e = SecretEntry {
+            id: "x".into(),
+            name: None,
+            category: SecretCategory::ApiKey,
+            value: "direct-value".into(),
+            value_file: None,
+        };
+        assert!(e.resolve_value().is_ok());
+        assert_eq!(e.value, "direct-value");
+    }
+
+    #[test]
+    fn resolve_value_fails_fast_on_unreadable_file() {
+        let mut e = SecretEntry {
+            id: "x".into(),
+            name: None,
+            category: SecretCategory::ApiKey,
+            value: String::new(),
+            value_file: Some(PathBuf::from("/nonexistent/secret-guard-test/no-such-file")),
+        };
+        let err = e.resolve_value().unwrap_err();
+        // 错误信息含 id + path 便于排查.
+        assert!(err.contains("x"), "err should mention secret id: {err}");
+        assert!(
+            err.contains("no-such-file"),
+            "err should mention path: {err}"
+        );
+        // fail-fast: resolve_value 在读文件前就 Option::take 走 value_file (不论成败),
+        // value 保持空. 调用方会在错误时整体放弃 entry, 不会继续用.
+        assert!(e.value.is_empty());
+        assert!(e.value_file.is_none());
+    }
+
+    #[test]
+    fn validate_rejects_both_value_and_value_file_set() {
+        let e = SecretEntry {
+            id: "x".into(),
+            name: None,
+            category: SecretCategory::ApiKey,
+            value: "some-direct-value".into(),
+            value_file: Some(PathBuf::from("/etc/passwd")),
+        };
+        let err = e.validate().unwrap_err();
+        assert!(
+            err.contains("both value and value_file"),
+            "err should explain mutual exclusion: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_value_file_with_empty_value() {
+        // value_file 模式: value 留空, validate 应当通过 (value 内容校验推迟到 resolve 后).
+        let e = SecretEntry {
+            id: "x".into(),
+            name: None,
+            category: SecretCategory::ApiKey,
+            value: String::new(),
+            value_file: Some(PathBuf::from("/some/path")),
+        };
+        assert!(e.validate().is_ok());
     }
 }
