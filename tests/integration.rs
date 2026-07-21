@@ -1086,6 +1086,7 @@ async fn cross_protocol_with_redact_round_trips_through_ir_translation() {
     let secrets = test_secret_table_with(entries);
     let upstream_client = reqwest::Client::new();
     let records = RecordStore::new(64);
+    let records_handle = records.clone();
     let provider = provider_with("an-main", Protocol::Anthropic, &upstream.url());
     let proxy_url = spawn_proxy_full(vec![provider], upstream_client, records, secrets).await;
 
@@ -1110,6 +1111,35 @@ async fn cross_protocol_with_redact_round_trips_through_ir_translation() {
         !resp_body.contains(&expected_mock),
         "client should NOT see mock; got: {resp_body}"
     );
+
+    // record body 绝不能含真实 secret (cross-proto 路径也必须 redact 后再保存).
+    // 这是 pre-existing bug 的回归测试: 早期 cross_proto_forward 直接存原始 req_bytes,
+    // 会在 record 里泄漏 secret. 现在改用 ingress writer 重序列化 redact 后的 IR.
+    let list = wait_until_or_timeout(
+        &records_handle,
+        |l| l.first().map(|r| r.resp_complete).unwrap_or(false),
+        Duration::from_secs(2),
+    )
+    .await;
+    let r = &list[0];
+    assert!(
+        !r.req_body.contains(real_secret),
+        "cross-proto record body must NOT contain real secret; got: {}",
+        r.req_body
+    );
+    assert!(
+        r.req_body.contains(&expected_mock),
+        "cross-proto record body should contain mock (redacted view); got: {}",
+        r.req_body
+    );
+    // parsed view 应当可用 (record body 是 ingress writer 重序列化的 OpenAI JSON).
+    assert_eq!(
+        r.redactions.len(),
+        1,
+        "expected 1 redaction, got: {:?}",
+        r.redactions
+    );
+    assert_eq!(r.redactions[0].1, "api-key");
 }
 
 #[tokio::test]
@@ -1382,8 +1412,12 @@ async fn web_api_returns_record_by_id() {
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["id"], id.to_string());
-    assert_eq!(body["resp_status"], 200);
+    // 新 envelope: {record, parsed_request, parsed_response, parse_error}.
+    // 默认 view=raw, parsed_* 全为 null.
+    assert_eq!(body["record"]["id"], id.to_string());
+    assert_eq!(body["record"]["resp_status"], 200);
+    assert!(body.get("parsed_request").is_some());
+    assert!(body["parsed_request"].is_null());
 }
 
 #[tokio::test]
@@ -1398,6 +1432,204 @@ async fn web_api_404_for_unknown_record() {
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn web_api_records_list_has_pagination_envelope() {
+    // 验证新 ListRecordsResponse shape: {records, total, offset, limit}.
+    // 默认 limit=50, offset=0.
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
+    let _ = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        r#"{"q":"hi"}"#,
+        &[],
+    )
+    .await;
+    // 等 1 条记录.
+    let _ = wait_for_record_count(&format!("{proxy_url}/__sg/api/records"), 1).await;
+
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{proxy_url}/__sg/api/records"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["total"], 1);
+    assert_eq!(body["offset"], 0);
+    assert_eq!(body["limit"], 50);
+    assert_eq!(body["records"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn web_api_records_list_respects_offset_limit() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", mockito::Matcher::Any)
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
+    // 发 3 条请求 → 3 条记录.
+    for _ in 0..3 {
+        let _ = proxy_request(
+            &proxy_url,
+            "POST",
+            "/o/oa-main/v1/chat/completions",
+            r#"{"q":"hi"}"#,
+            &[],
+        )
+        .await;
+    }
+    let _ = wait_for_record_count(&format!("{proxy_url}/__sg/api/records"), 3).await;
+
+    // 取第一页 (offset=0, limit=2): total=3, len=2.
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{proxy_url}/__sg/api/records?offset=0&limit=2"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["total"], 3);
+    assert_eq!(body["offset"], 0);
+    assert_eq!(body["limit"], 2);
+    assert_eq!(body["records"].as_array().unwrap().len(), 2);
+
+    // 取第二页 (offset=2, limit=2): 只剩 1 条.
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{proxy_url}/__sg/api/records?offset=2&limit=2"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["total"], 3);
+    assert_eq!(body["records"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn web_api_records_view_parsed_openai_returns_structured() {
+    // view=parsed 应当用 OpenAI codec 把 req_body 解析成结构化 JSON.
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"chatcmpl-1","choices":[{"message":{"role":"assistant","content":"hello"}}]}"#,
+        )
+        .create_async()
+        .await;
+
+    let upstream_client = reqwest::Client::new();
+    let records = RecordStore::new(64);
+    let records_handle = records.clone();
+    let provider = openai_provider("oa-main", &upstream.url());
+    let proxy_url = spawn_proxy_full(
+        vec![provider],
+        upstream_client,
+        records,
+        test_secret_table(),
+    )
+    .await;
+
+    let _ = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#,
+        &[],
+    )
+    .await;
+    let list = wait_until_or_timeout(
+        &records_handle,
+        |l| l.first().map(|r| r.resp_complete).unwrap_or(false),
+        Duration::from_secs(2),
+    )
+    .await;
+    let id = list[0].id;
+
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{proxy_url}/__sg/api/records/{id}?view=parsed"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["record"]["id"], id.to_string());
+    assert!(
+        body["parse_error"].is_null(),
+        "unexpected parse_error: {}",
+        body["parse_error"]
+    );
+    let parsed_req = &body["parsed_request"];
+    assert!(!parsed_req.is_null(), "parsed_request should not be null");
+    assert!(
+        parsed_req.get("messages").is_some(),
+        "parsed_request should have messages"
+    );
+    let parsed_resp = &body["parsed_response"];
+    assert!(!parsed_resp.is_null(), "parsed_response should not be null");
+    assert!(
+        parsed_resp.get("choices").is_some(),
+        "parsed_response should have choices"
+    );
+}
+
+#[tokio::test]
+async fn web_api_records_view_parsed_gemini_returns_error() {
+    // Gemini 不在 codec 支持范围, view=parsed 应当返回 parse_error.
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", mockito::Matcher::Any)
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    let provider = provider_with("gem-main", Protocol::Gemini, &upstream.url());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+    let _ = proxy_request(
+        &proxy_url,
+        "POST",
+        "/g/gem-main/v1/generateContent",
+        r#"{"q":"hi"}"#,
+        &[],
+    )
+    .await;
+    let records = wait_for_record_count(&format!("{proxy_url}/__sg/api/records"), 1).await;
+    let id = records[0].id;
+
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{proxy_url}/__sg/api/records/{id}?view=parsed"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["record"]["id"], id.to_string());
+    assert!(body["parsed_request"].is_null());
+    let err = body["parse_error"].as_str().unwrap();
+    assert!(
+        err.contains("gemini") || err.contains("protocol"),
+        "parse_error should mention gemini/protocol, got: {err}"
+    );
 }
 
 #[tokio::test]
@@ -1694,6 +1926,111 @@ async fn redact_strips_secret_from_upstream_request() {
         r.req_body.contains("use") && r.req_body.contains("now"),
         "non-secret content must be preserved, got: {}",
         r.req_body
+    );
+}
+
+#[tokio::test]
+async fn redact_populates_record_redactions_field() {
+    // 验证 ForwardRecord.redactions 在 same_proto + redact 路径被正确填充.
+    // 这是 WebUI 渲染 "本次请求命中哪些 secret" 的权威数据源.
+    let real_secret = "sk-redact-me-456";
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"chatcmpl-1"}"#)
+        .create_async()
+        .await;
+
+    let entries = vec![secret("my-api-key", real_secret)];
+    let secrets = test_secret_table_with(entries);
+    let upstream_client = reqwest::Client::new();
+    let records = RecordStore::new(64);
+    let records_handle = records.clone();
+    let provider = openai_provider("oa-main", &upstream.url());
+    let proxy_url = spawn_proxy_full(vec![provider], upstream_client, records, secrets).await;
+
+    // 请求体含 real_secret → codec + redact_ir 会命中.
+    let body = format!(r#"{{"messages":[{{"content":"use {real_secret}"}}]}}"#);
+    let _ = reqwest::Client::new()
+        .post(format!("{proxy_url}/o/oa-main/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+
+    let list = wait_until_or_timeout(
+        &records_handle,
+        |l| l.first().map(|r| r.resp_complete).unwrap_or(false),
+        Duration::from_secs(2),
+    )
+    .await;
+    let r = &list[0];
+    // redactions 应当有 1 条: (mock_value, "my-api-key").
+    assert_eq!(
+        r.redactions.len(),
+        1,
+        "expected 1 redaction, got: {:?}",
+        r.redactions
+    );
+    assert_eq!(r.redactions[0].1, "my-api-key", "secret id mismatch");
+    assert!(
+        r.redactions[0].0.starts_with("sgm_"),
+        "mock should start with sgm_, got: {}",
+        r.redactions[0].0
+    );
+    // 关键: redactions 中绝不能出现真实 secret.
+    assert!(
+        !r.redactions.iter().any(|(m, _)| m.contains(real_secret)),
+        "redactions must not leak real secret"
+    );
+    // 记录的 req_body 中也应当看不到真实 secret (mock 替换后).
+    assert!(!r.req_body.contains(real_secret));
+}
+
+#[tokio::test]
+async fn passthrough_path_leaves_redactions_empty() {
+    // 无 secret 配置 → passthrough 路径 → redactions 应当为空 vec.
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+    let upstream_client = reqwest::Client::new();
+    let records = RecordStore::new(64);
+    let records_handle = records.clone();
+    let provider = openai_provider("oa-main", &upstream.url());
+    let proxy_url = spawn_proxy_full(
+        vec![provider],
+        upstream_client,
+        records,
+        test_secret_table(), // 空 secrets 表
+    )
+    .await;
+
+    let _ = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        r#"{"q":"no-secret-here"}"#,
+        &[],
+    )
+    .await;
+
+    let list = wait_until_or_timeout(
+        &records_handle,
+        |l| l.first().map(|r| r.resp_complete).unwrap_or(false),
+        Duration::from_secs(2),
+    )
+    .await;
+    assert!(
+        list[0].redactions.is_empty(),
+        "passthrough path should leave redactions empty, got: {:?}",
+        list[0].redactions
     );
 }
 

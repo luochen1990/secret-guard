@@ -45,6 +45,18 @@ pub struct ForwardRecord {
     pub resp_complete: bool,
     /// 错误诊断 (仅在出错时填入; 用于 Web UI 展示).
     pub error: Option<String>,
+    /// 本次请求中实际发生的 redact 结果 (权威投影, 供 WebUI 渲染).
+    ///
+    /// 每个 tuple = `(mock_value, secret_id)`. **永不**包含真实 secret 值, 因此可以
+    /// 直接序列化到 GET API 响应. 空 vec 表示本次请求没有发生 redact
+    /// (passthrough 路径, 或同/跨协议路径但 IR 中没有 secret 命中).
+    ///
+    /// 来源: 在 [`crate::proxy`] 三处 push 点, 从 `RedactionMap` + `secrets_snapshot`
+    /// 派生而来. 仅记录命中的 secret — 若 secret 在表中但本次请求体没有, 不进入此列表.
+    ///
+    /// `#[serde(default)]` 让旧版序列化数据 (无此字段) 仍能反序列化为空 vec.
+    #[serde(default)]
+    pub redactions: Vec<(String, String)>,
 }
 
 /// 响应更新参数. 抽为结构体以避免 `update_response_full` 函数参数过多.
@@ -80,7 +92,15 @@ impl ForwardRecord {
             streamed: false,
             resp_complete: false,
             error: None,
+            redactions: Vec::new(),
         }
+    }
+
+    /// Builder: 附上 redactions (来自 `RedactionMap` + `secrets_snapshot` 的投影).
+    /// 不调用则默认空 vec (passthrough 路径).
+    pub fn with_redactions(mut self, redactions: Vec<(String, String)>) -> Self {
+        self.redactions = redactions;
+        self
     }
 }
 
@@ -195,6 +215,36 @@ impl RecordStore {
         v.reverse();
         v
     }
+
+    /// 分页列出记录 (按时间倒序). 返回 `(当前页 records, 总数)`.
+    ///
+    /// - `offset`: 0-based, 从最新一条算起. 会 clamp 到 `[0, total]`.
+    /// - `limit`: clamp 到 `[1, 200]`.
+    /// - `offset >= total`: 返回空 vec + total.
+    ///
+    /// 用 `VecDeque` 的双向迭代做高效切片 (避免全量 clone + reverse).
+    /// 适合偶尔翻页的 WebUI 场景; 若未来要做大量扫描/筛选, 再考虑加索引.
+    pub fn list_page(&self, offset: usize, limit: usize) -> (Vec<ForwardRecord>, usize) {
+        let g = self.inner.read();
+        let total = g.records.len();
+        let limit = limit.clamp(1, 200);
+        let offset = offset.min(total);
+        if offset >= total {
+            return (Vec::new(), total);
+        }
+        // records 按插入顺序 (旧→新). 我们要按时间倒序取 offset..offset+limit.
+        // 从尾部倒推: 末尾是最新一条 → skip `offset` 条 → take `limit` 条.
+        let take = limit.min(total - offset);
+        let out: Vec<ForwardRecord> = g
+            .records
+            .iter()
+            .rev()
+            .skip(offset)
+            .take(take)
+            .cloned()
+            .collect();
+        (out, total)
+    }
 }
 
 #[cfg(test)]
@@ -286,5 +336,77 @@ mod tests {
         let _ = store.push(fake_record("POST", "/a"));
         let _ = store.push(fake_record("POST", "/b"));
         assert_eq!(store.list().len(), 1);
+    }
+
+    #[test]
+    fn redactions_roundtrip_preserved() {
+        // 验证 with_redactions 设置的 redactions 能通过 push + get 完整还原.
+        // 这是 WebUI 读取 "本次请求 redact 了哪些 secret" 的权威数据源.
+        let store = RecordStore::new(8);
+        let r = fake_record("POST", "/o/x/v1/chat")
+            .with_redactions(vec![("sgm_abc".into(), "my_key".into())]);
+        let id = store.push(r);
+        let got = store.get(id).expect("record exists");
+        assert_eq!(got.redactions.len(), 1);
+        assert_eq!(got.redactions[0].0, "sgm_abc");
+        assert_eq!(got.redactions[0].1, "my_key");
+    }
+
+    #[test]
+    fn redactions_default_empty_when_not_set() {
+        // 验证 ForwardRecord::new 默认 redactions 为空 (passthrough 路径的语义).
+        let store = RecordStore::new(8);
+        let id = store.push(fake_record("POST", "/a"));
+        let got = store.get(id).expect("record exists");
+        assert!(got.redactions.is_empty());
+    }
+
+    #[test]
+    fn list_page_returns_newest_slice_and_total() {
+        // 5 条记录, path 标记插入顺序方便断言 "newest first".
+        let store = RecordStore::new(64);
+        for i in 0..5 {
+            let _ = store.push(fake_record("POST", &format!("/r{i}")));
+        }
+        // list_page(0, 2) → 最新两条 (/r4, /r3) + total=5.
+        let (page, total) = store.list_page(0, 2);
+        assert_eq!(total, 5);
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].path, "/r4");
+        assert_eq!(page[1].path, "/r3");
+    }
+
+    #[test]
+    fn list_page_offset_reaches_oldest() {
+        // offset = 4 → 跳过 4 条最新, 取 1 条最旧 (/r0).
+        let store = RecordStore::new(64);
+        for i in 0..5 {
+            let _ = store.push(fake_record("POST", &format!("/r{i}")));
+        }
+        // limit 给 10, 应被 clamp 到剩余 1.
+        let (page, total) = store.list_page(4, 10);
+        assert_eq!(total, 5);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].path, "/r0");
+    }
+
+    #[test]
+    fn list_page_clamps_inputs() {
+        let store = RecordStore::new(64);
+        for i in 0..5 {
+            let _ = store.push(fake_record("POST", &format!("/r{i}")));
+        }
+        // limit=0 → clamp 到 1.
+        let (page, total) = store.list_page(0, 0);
+        assert_eq!(total, 5);
+        assert_eq!(page.len(), 1);
+        // limit 超大 → clamp 到 200, 但实际只有 5 条, 返回全部.
+        let (page, total) = store.list_page(0, 10_000);
+        assert_eq!(total, 5);
+        assert_eq!(page.len(), 5);
+        // offset 超大 → 空页 + total.
+        let (page, total) = store.list_page(1_000, 10);
+        assert_eq!(total, 5);
+        assert!(page.is_empty());
     }
 }

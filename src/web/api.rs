@@ -19,7 +19,7 @@
 //! - 内部错误细节不通过响应体返回, 仅进 tracing.
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Json},
 };
@@ -37,25 +37,204 @@ const NO_STORE: [(&str, &str); 1] = [("cache-control", "no-store, no-cache, must
 
 // ─── /records ──────────────────────────────────────────────────────────────
 
-pub async fn list_records(State(state): State<ProxyState>) -> impl IntoResponse {
-    let records = state.records.list();
-    (NO_STORE, Json(ListRecordsResponse { records }))
+/// `GET /api/records` 查询参数.
+///
+/// - `offset`: 0-based, 从最新一条算起 (与 [`RecordStore::list_page`] 一致). 默认 0.
+/// - `limit`:  clamp 到 `[1, 200]`. 默认 50.
+///
+/// 设计: 用 `Option<usize>` 让缺失字段走默认值, 避免 axum Query 反序列化整体拒绝
+/// (例如只传 `?offset=10` 时 limit 仍取默认).
+#[derive(Debug, Deserialize)]
+pub struct RecordsQuery {
+    #[serde(default)]
+    pub offset: Option<usize>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+impl RecordsQuery {
+    /// 解析为生效的 `(offset, limit)`. 单一事实来源: 默认值 + clamp 都在这里.
+    fn resolve(&self) -> (usize, usize) {
+        let offset = self.offset.unwrap_or(0);
+        // 默认 50: 足够 WebUI 首屏, 又不会一次拖太多 (单条 record body 可能很大).
+        let limit = self.limit.unwrap_or(50);
+        (offset, limit.clamp(1, 200))
+    }
+}
+
+pub async fn list_records(
+    State(state): State<ProxyState>,
+    Query(q): Query<RecordsQuery>,
+) -> impl IntoResponse {
+    let (offset, limit) = q.resolve();
+    let (records, total) = state.records.list_page(offset, limit);
+    (
+        NO_STORE,
+        Json(ListRecordsResponse {
+            records,
+            total,
+            offset,
+            limit,
+        }),
+    )
 }
 
 pub async fn get_record(
     State(state): State<ProxyState>,
     Path(id): Path<Uuid>,
+    Query(q): Query<RecordQuery>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    state
-        .records
-        .get(id)
-        .map(|r| (NO_STORE, Json(r)))
-        .ok_or(StatusCode::NOT_FOUND)
+    let record = state.records.get(id).ok_or(StatusCode::NOT_FOUND)?;
+    // 默认 view=raw → 直接返回原 record, 无解析开销.
+    // 注意: 我们**总是**返回 GetRecordResponse envelope, 让前端 shape 固定.
+    // raw view 下 parsed_*/parse_error 全为 None.
+    let wants_parsed = q.view.as_deref() == Some("parsed");
+    if !wants_parsed {
+        return Ok((
+            NO_STORE,
+            Json(GetRecordResponse {
+                record,
+                parsed_request: None,
+                parsed_response: None,
+                parse_error: None,
+            }),
+        ));
+    }
+    // parsed view: 用 codec 把 wire body parse → IR → 重新 serialize 给前端.
+    let resp = build_parsed_response(record);
+    Ok((NO_STORE, Json(resp)))
+}
+
+/// `GET /api/records/{id}?view=` 的查询参数.
+///
+/// - `view=raw` (默认 / 省略): 仅返回 record 原文.
+/// - `view=parsed`: 尝试用 ingress 协议的 codec 把 req/resp body parse 成
+///   结构化 JSON (chat-like 视图). 失败时填 `parse_error`, 不影响 HTTP 200.
+#[derive(Debug, Deserialize)]
+pub struct RecordQuery {
+    #[serde(default)]
+    pub view: Option<String>,
+}
+
+/// `GET /api/records/{id}` 的统一响应 envelope.
+///
+/// - raw view: `record` 是原文, `parsed_*` 全 None.
+/// - parsed view: 若 codec 支持 + body 合法, `parsed_request`/`parsed_response`
+///   是 ingress writer 重序列化后的 JSON (chat-bubble 友好); 失败时填 `parse_error`.
+///
+/// 前端拿到固定 shape 后, 根据 `parse_error` 决定 fallback 到原文展示.
+#[derive(Serialize)]
+pub struct GetRecordResponse {
+    pub record: ForwardRecord,
+    pub parsed_request: Option<serde_json::Value>,
+    pub parsed_response: Option<serde_json::Value>,
+    pub parse_error: Option<String>,
+}
+
+/// 解析 record 的 req/resp body 为结构化 JSON (ingress writer 投影).
+///
+/// 单一事实来源: 所有 "parsed view 不可用" 的原因都在这里分类:
+/// - protocol 短名未知 → `parsed view not available for protocol '<X>'`
+/// - codec 不支持此协议 (Gemini/Ollama) → 同上
+/// - body 不是合法 JSON → `invalid JSON: <err>`
+/// - codec reader 解析失败 → `<reader error message>`
+///
+/// 返回的 `parsed_request` / `parsed_response` 来自 ingress writer 的
+/// `write_request` / `write_response` — 这是协议 canonical JSON 投影,
+/// 前端可以按 chat-bubble 风格渲染.
+///
+/// MVP 限制: **流式响应不解析** (ForwardRecord.resp_body 是拼接后的 SSE chunk,
+/// 不是单个 JSON). 若 `record.streamed`, 跳过 response 解析.
+fn build_parsed_response(record: ForwardRecord) -> GetRecordResponse {
+    // 1. 从 record.path 的首段提取 ingress protocol short (e.g. "/o/x/..." → "o").
+    //    cross-proto 路径形如 "/o/x/...  [openai → anthropic]", 首段仍是 ingress.
+    //    先 clone 出 short, 避免后续 move record 时 borrow 冲突.
+    let proto_short = record
+        .path
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    let Some(native) = Protocol::from_short(&proto_short) else {
+        return GetRecordResponse {
+            record,
+            parsed_request: None,
+            parsed_response: None,
+            parse_error: Some(format!(
+                "parsed view not available for protocol '{proto_short}'"
+            )),
+        };
+    };
+    let Some(codec_proto) = crate::codec::Protocol::from_native(native) else {
+        return GetRecordResponse {
+            record,
+            parsed_request: None,
+            parsed_response: None,
+            parse_error: Some(format!(
+                "parsed view not available for protocol '{}'",
+                native.name()
+            )),
+        };
+    };
+
+    let reader = codec_proto.reader();
+    let writer = codec_proto.writer();
+
+    // 2. parsed_request: 总是尝试 (req_body 永远是单 JSON, 即便是 streaming 请求).
+    let mut parsed_request = None;
+    let mut parse_error: Option<String> = None;
+    match serde_json::from_str::<serde_json::Value>(&record.req_body) {
+        Ok(v) => match reader.read_request(&v) {
+            Ok(ir) => parsed_request = Some(writer.write_request(&ir)),
+            Err(e) => parse_error = Some(e.message),
+        },
+        Err(e) => parse_error = Some(format!("invalid JSON in req_body: {e}")),
+    }
+
+    // 3. parsed_response: 仅在非流式 + 2xx + 非空时尝试.
+    //    流式响应的 resp_body 是 SSE 拼接, 不是单个 JSON, 解析必失败 → 直接跳过.
+    let mut parsed_response = None;
+    if !record.streamed
+        && record.resp_status >= 200
+        && record.resp_status < 300
+        && !record.resp_body.is_empty()
+    {
+        match serde_json::from_str::<serde_json::Value>(&record.resp_body) {
+            Ok(v) => match reader.read_response(&v) {
+                Ok(ir) => parsed_response = Some(writer.write_response(&ir)),
+                // response parse 失败: 不覆盖 request 的 parse_error (request 更重要).
+                Err(e) => {
+                    if parse_error.is_none() {
+                        parse_error = Some(format!("resp_body parse failed: {}", e.message));
+                    }
+                }
+            },
+            Err(e) => {
+                if parse_error.is_none() {
+                    parse_error = Some(format!("invalid JSON in resp_body: {e}"));
+                }
+            }
+        }
+    }
+
+    GetRecordResponse {
+        record,
+        parsed_request,
+        parsed_response,
+        parse_error,
+    }
 }
 
 #[derive(Serialize)]
 pub struct ListRecordsResponse {
     pub records: Vec<ForwardRecord>,
+    /// 总记录数 (用于前端分页器).
+    pub total: usize,
+    /// 当前页 offset (0-based).
+    pub offset: usize,
+    /// 当前页 limit (clamp 后的实际生效值, 便于前端校验).
+    pub limit: usize,
 }
 
 // ─── /secrets ──────────────────────────────────────────────────────────────
@@ -571,5 +750,144 @@ mod tests {
             mode: "bogus".to_string(),
         };
         assert!(req.into_mode().is_err());
+    }
+
+    // ─── RecordsQuery ──────────────────────────────────────────────────────
+
+    #[test]
+    fn records_query_defaults_offset_zero_limit_fifty() {
+        let q = RecordsQuery {
+            offset: None,
+            limit: None,
+        };
+        assert_eq!(q.resolve(), (0, 50));
+    }
+
+    #[test]
+    fn records_query_clamps_limit_to_range() {
+        // limit = 0 → clamp 到 1.
+        let q = RecordsQuery {
+            offset: None,
+            limit: Some(0),
+        };
+        assert_eq!(q.resolve(), (0, 1));
+        // limit 超大 → clamp 到 200.
+        let q = RecordsQuery {
+            offset: None,
+            limit: Some(10_000),
+        };
+        assert_eq!(q.resolve(), (0, 200));
+    }
+
+    // ─── build_parsed_response ────────────────────────────────────────────
+
+    /// 构造一个最小可用的 ForwardRecord for parsed-view 测试.
+    fn parsed_test_record(
+        path: &str,
+        req_body: &str,
+        resp_body: &str,
+        streamed: bool,
+    ) -> crate::record::ForwardRecord {
+        let mut r =
+            crate::record::ForwardRecord::new("POST".into(), path.into(), vec![], req_body.into());
+        r.resp_status = 200;
+        r.resp_body = resp_body.into();
+        r.streamed = streamed;
+        r.resp_complete = true;
+        r
+    }
+
+    #[test]
+    fn parsed_view_openai_request_returns_structured_json() {
+        // 合法 OpenAI chat request: codec 应当 parse 成功, write_request 输出
+        // 一个含 messages 数组的 JSON (前端 chat-bubble 渲染的基础).
+        let req_body = r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#;
+        let record = parsed_test_record("/o/oa-main/v1/chat/completions", req_body, "", false);
+        let resp = build_parsed_response(record);
+        assert!(
+            resp.parse_error.is_none(),
+            "unexpected: {:?}",
+            resp.parse_error
+        );
+        let parsed_req = resp.parsed_request.expect("parsed_request should be set");
+        assert!(
+            parsed_req.get("messages").is_some(),
+            "parsed_request should have messages"
+        );
+    }
+
+    #[test]
+    fn parsed_view_unsupported_protocol_returns_error() {
+        // Gemini 的 codec 尚未实现 → parse_error 应当包含 protocol 名.
+        let req_body = r#"{"prompt":"hi"}"#;
+        let record = parsed_test_record("/g/gem/v1/generateContent", req_body, "", false);
+        let resp = build_parsed_response(record);
+        assert!(resp.parsed_request.is_none());
+        let err = resp.parse_error.expect("gemini should report parse_error");
+        assert!(
+            err.contains("gemini") || err.contains("protocol"),
+            "error should mention protocol, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parsed_view_unknown_proto_short_returns_error() {
+        // 路径首段是未知简写 (非 o/a/g/l) → from_short 返回 None.
+        let req_body = r#"{"q":"hi"}"#;
+        let record = parsed_test_record("/x/foo/bar", req_body, "", false);
+        let resp = build_parsed_response(record);
+        assert!(resp.parsed_request.is_none());
+        let err = resp
+            .parse_error
+            .expect("unknown proto should report parse_error");
+        assert!(
+            err.contains("'x'"),
+            "error should mention the short, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parsed_view_malformed_body_returns_error() {
+        // req_body 不是合法 JSON → parse_error 应当包含 "invalid JSON".
+        let record = parsed_test_record("/o/oa-main/v1/chat/completions", "not-json{", "", false);
+        let resp = build_parsed_response(record);
+        assert!(resp.parsed_request.is_none());
+        let err = resp
+            .parse_error
+            .expect("malformed body should report parse_error");
+        assert!(
+            err.contains("invalid JSON"),
+            "error should mention invalid JSON, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parsed_view_streamed_response_not_parsed() {
+        // 即使 resp_body 是合法 JSON, streamed=true 也应跳过 response 解析
+        // (因为实际 resp_body 是 SSE 拼接, 不是单个 JSON).
+        let req_body = r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#;
+        let resp_body = r#"{"id":"x","choices":[]}"#;
+        let record =
+            parsed_test_record("/o/oa-main/v1/chat/completions", req_body, resp_body, true);
+        let resp = build_parsed_response(record);
+        // request 仍应被解析.
+        assert!(resp.parsed_request.is_some());
+        // response 不应被解析 (streamed).
+        assert!(resp.parsed_response.is_none());
+        // 不应有 error (request 成功了, response 是被显式跳过的).
+        assert!(resp.parse_error.is_none());
+    }
+
+    #[test]
+    fn parsed_view_non_2xx_response_not_parsed() {
+        // 非 2xx 响应通常是 error envelope, 不应被当作 chat response 解析.
+        let req_body = r#"{"model":"gpt-4","messages":[]}"#;
+        let mut record =
+            parsed_test_record("/o/oa-main/v1/chat/completions", req_body, "err", false);
+        record.resp_status = 500;
+        let resp = build_parsed_response(record);
+        assert!(resp.parsed_request.is_some());
+        assert!(resp.parsed_response.is_none());
+        assert!(resp.parse_error.is_none());
     }
 }

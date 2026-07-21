@@ -258,12 +258,15 @@ async fn same_proto_forward(
         fp.name,
         fp.rest.trim_start_matches('/')
     );
+    // 投影 redaction_map → (mock, secret_id) 列表 (不携带真实 secret).
+    let redactions = derive_redactions(&redaction_map, &secrets_snapshot);
     let req_snapshot = ForwardRecord::new(
         parts.method.as_str().to_string(),
         path_for_record,
         redact_headers(&fwd_headers),
         req_text_for_record,
-    );
+    )
+    .with_redactions(redactions);
     let record_id = state.records.push(req_snapshot);
 
     debug!(%record_id, method = %parts.method, url = %upstream_url, "forwarding redacted same-proto request");
@@ -417,6 +420,34 @@ async fn same_proto_passthrough(
     .await
 }
 
+/// 投影 `RedactionMap` + `secrets_snapshot` → `(mock_value, secret_id)` 列表.
+///
+/// 这是 [`ForwardRecord::redactions`] 的唯一派生入口. 输出**永不**包含真实 secret 值,
+/// 可以直接序列化到 GET API 响应中给 WebUI.
+///
+/// 匹配规则: `redaction_map.real_to_mock` 的 key (真实 secret) 与 `secrets_snapshot`
+/// 的 `value` 字段比对. 仅命中的 secret 才进入列表 (eg secret 在表中但本次请求体没有
+/// 它, 不计入). 同一 secret 多次匹配仍只投影一次 (HashMap 已去重).
+///
+/// 边角: 若两个 SecretEntry 共享同一 `value` (eg 用户重复配置), `find` 返回首个匹配;
+/// 由于 RedactionMap 按 value 去重, 对应只有一个 mock — 这种重复配置语义上就是冗余,
+/// WebUI 只展示其中一个 id 是可接受的 (它们指向相同的 secret 内容).
+fn derive_redactions(
+    redaction_map: &RedactionMap,
+    secrets_snapshot: &[crate::secrets::SecretEntry],
+) -> Vec<(String, String)> {
+    redaction_map
+        .real_to_mock
+        .iter()
+        .filter_map(|(real, mock)| {
+            secrets_snapshot
+                .iter()
+                .find(|s| s.value == *real)
+                .map(|s| (mock.clone(), s.id.clone()))
+        })
+        .collect()
+}
+
 /// 写一条 "上游请求失败" 记录 (错误路径专用 helper).
 fn record_upstream_failure(
     records: &RecordStore,
@@ -530,6 +561,7 @@ async fn cross_proto_forward(
     };
 
     let ingress_reader = ingress_codec.reader();
+    let ingress_writer = ingress_codec.writer();
     let egress_writer = egress_codec.writer();
 
     // 2. 解析 ingress body 为 JSON.
@@ -601,13 +633,23 @@ async fn cross_proto_forward(
         ingress.name(),
         provider.protocol.name()
     );
-    let req_text_for_record = utf8_view(&req_bytes);
+    // 用 redact 后的 IR 经 ingress writer 重序列化作为 record body (而非原始 req_bytes).
+    // 理由与 same_proto_forward 一致: record 应保存 "redact 后的视图" (LLM 看到的版本),
+    // 而非客户端原始 body (可能含未 redact 的真实 secret). 这里用 ingress writer 而非
+    // egress writer, 让 WebUI 的 parsed view 能用 ingress codec 正确 round-trip 解析.
+    let req_view_value = ingress_writer.write_request(&ir);
+    let req_view_bytes = serde_json::to_vec(&req_view_value)
+        .map_err(|e| AppError::Internal(format!("serialize ingress view body failed: {e}")))?;
+    let req_text_for_record = utf8_view(&req_view_bytes);
+    // 投影 redaction_map → (mock, secret_id) 列表 (不携带真实 secret).
+    let redactions = derive_redactions(&redaction_map, &secrets_snapshot);
     let req_snapshot = ForwardRecord::new(
         parts.method.as_str().to_string(),
         path_for_record,
         redact_headers(&fwd_headers),
         req_text_for_record,
-    );
+    )
+    .with_redactions(redactions);
     let record_id = state.records.push(req_snapshot);
 
     debug!(

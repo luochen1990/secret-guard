@@ -44,21 +44,11 @@
     }
     article { flex: 1; padding: 12px; overflow-y: auto; }
     .record-item {
-      padding: 8px 12px;
       border-bottom: 1px solid #eee;
       cursor: pointer;
-      line-height: 1.5;
     }
     .record-item:hover { background: #f0f0f0; }
     .record-item.active { background: #d0e7ff; }
-    .method {
-      display: inline-block;
-      min-width: 44px;
-      font-weight: bold;
-    }
-    .method-GET { color: #06a; }
-    .method-POST { color: #060; }
-    .method-PUT, .method-DELETE, .method-PATCH { color: #a00; }
     .status-ok { color: #0a0; font-weight: bold; }
     .status-err { color: #a00; font-weight: bold; }
     .status-pending { color: #888; }
@@ -270,13 +260,177 @@
       margin: 8px 0;
       font-size: 12px;
     }
+
+    /* ─── F1: table cell ellipsis + hover tooltip ─────────────────────────── */
+    /* 每个 td 内的内容用 .cell-ellipsis 包裹, 限制 max-width 并在溢出时显示省略号.
+       完整值通过外层 td 的 title 属性由浏览器原生 tooltip 呈现. */
+    table.secrets td {
+      max-width: 280px;     /* 默认上限; 下方 per-column 覆盖. */
+    }
+    table.secrets th:nth-child(1), table.secrets td:nth-child(1) { max-width: 180px; } /* ID */
+    table.secrets th:nth-child(2), table.secrets td:nth-child(2) { max-width: 180px; } /* Name */
+    table.secrets td.cell-short { max-width: 110px; } /* Category / Enabled / Length */
+    table.secrets td.cell-long  { max-width: 320px; } /* Value / BaseURL / APIKey */
+    .cell-ellipsis {
+      display: inline-block;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      vertical-align: middle;
+    }
+
+    /* ─── F2: records sidebar compact single-line ─────────────────────────── */
+    .record-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 12px;
+      line-height: 1.4;
+    }
+    .record-item .ri-left {
+      flex: 1 1 auto;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .record-item .ri-right {
+      flex: 0 0 auto;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .badge-hit {
+      background: #f59e0b;
+      color: #fff;
+      font-weight: bold;
+      padding: 0 5px;
+      border-radius: 8px;
+      font-size: 10px;
+      min-width: 16px;
+      text-align: center;
+    }
+
+    /* ─── F3: records sidebar filter bar ──────────────────────────────────── */
+    .filter-bar {
+      display: flex;
+      gap: 4px;
+      padding: 6px 8px;
+      border-bottom: 1px solid #ddd;
+      background: #f0f0f0;
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }
+    .filter-bar button {
+      flex: 1;
+      padding: 3px 8px;
+      font: inherit;
+      font-size: 12px;
+      cursor: pointer;
+      background: #fff;
+      border: 1px solid #bbb;
+      border-radius: 3px;
+      color: #333;
+    }
+    .filter-bar button.active {
+      background: #1a1a1a;
+      color: #fff;
+      border-color: #1a1a1a;
+    }
+    .filter-bar button:hover:not(.active) { background: #eee; }
+
+    /* ─── F4: load-more button ────────────────────────────────────────────── */
+    .load-more-wrap {
+      padding: 10px;
+      text-align: center;
+      border-top: 1px solid #eee;
+    }
+    button.load-more {
+      width: 100%;
+      padding: 6px;
+      font: inherit;
+      font-size: 12px;
+      cursor: pointer;
+      background: #fff;
+      border: 1px solid #888;
+      border-radius: 3px;
+    }
+    button.load-more:hover { background: #eee; }
+    button.load-more[disabled] {
+      color: #aaa;
+      border-color: #ccc;
+      cursor: not-allowed;
+      background: #f5f5f5;
+    }
+
+    /* ─── F5: detail view toggle (raw / parsed) ───────────────────────────── */
+    .view-toggle {
+      display: inline-flex;
+      gap: 2px;
+      margin-left: 10px;
+      vertical-align: middle;
+    }
+    .view-toggle button {
+      padding: 2px 10px;
+      font: inherit;
+      font-size: 11px;
+      cursor: pointer;
+      background: #fff;
+      border: 1px solid #888;
+      color: #444;
+    }
+    .view-toggle button:first-child { border-radius: 3px 0 0 3px; }
+    .view-toggle button:last-child  { border-radius: 0 3px 3px 0; border-left-width: 0; }
+    .view-toggle button.active {
+      background: #1a1a1a;
+      color: #fff;
+      border-color: #1a1a1a;
+    }
+
+    /* chat bubbles (parsed view) */
+    .chat-bubbles { margin: 4px 0; }
+    .chat-bubble {
+      padding: 6px 10px;
+      border-radius: 8px;
+      margin-bottom: 8px;
+      max-width: 88%;
+      word-break: break-word;
+      white-space: pre-wrap;
+      font-size: 12.5px;
+      line-height: 1.5;
+    }
+    .chat-bubble .bubble-role {
+      display: block;
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #888;
+      margin-bottom: 2px;
+    }
+    .bubble-user       { background: #e0e7ff; margin-left: auto;  text-align: left;  }
+    .bubble-assistant  { background: #f0f0f0; margin-right: auto; }
+    .bubble-system     { background: #fff8e0; margin: 0 auto 8px auto; max-width: 100%; border: 1px dashed #ec5; }
+    .bubble-tool       { background: #f5f5f5; margin-right: auto; font-family: ui-monospace, monospace; font-size: 11.5px; }
+
+    /* mock highlight: 标记命中的 redact mock 字符串 */
+    mark.secret-hit {
+      background: #ffe08a;
+      color: #6b3d00;
+      padding: 0 2px;
+      border-radius: 2px;
+      cursor: help;
+      font-weight: 600;
+    }
   </style>
 </head>
 <body>
   <header>
     <span class="brand">secret-guard</span>
     <span class="toolbar">
-      <span><span id="count">0</span> records</span>
+      <span><span id="count">0</span> <span id="count-label">records</span></span>
       <span id="status"></span>
       <label><input type="checkbox" id="auto" checked> auto-refresh (3s)</label>
       <button class="refresh" onclick="refresh()">refresh</button>
@@ -289,7 +443,16 @@
   </nav>
   <main>
     <section id="tab-records" class="tab-content active">
-      <aside id="sidebar"><div class="empty">No records yet</div></aside>
+      <aside id="sidebar">
+        <div class="filter-bar">
+          <button id="filter-all" class="active" type="button" onclick="setFilter('all')">All (<span id="filter-all-count">0</span>)</button>
+          <button id="filter-hits" type="button" onclick="setFilter('hits')">Hits (<span id="filter-hits-count">0</span>)</button>
+        </div>
+        <div id="record-list"><div class="empty">No records yet</div></div>
+        <div id="load-more-wrap" class="load-more-wrap" style="display:none;">
+          <button class="load-more" id="load-more-btn" type="button" onclick="loadMore()">Load more</button>
+        </div>
+      </aside>
       <article id="detail"><div class="empty">Select a record on the left</div></article>
     </section>
     <section id="tab-secrets" class="tab-content">
@@ -420,6 +583,15 @@
     let providerShorts = [];
     let providerDecisions = [];
 
+    // ─── records tab: pagination / filter / parsed-view 状态 ────────────────
+    const PAGE_SIZE = 50;
+    let loadedCount = 0;      // 当前已加载条数 (= records.length, 显式跟踪便于断言).
+    let totalCount = 0;       // 服务端已知总记录数 (来自 list API 的 total 字段).
+    let filterMode = 'all';   // 'all' | 'hits' (hits = redactions.length > 0).
+    let detailView = 'raw';   // 'raw' | 'parsed'.
+    let parsedCache = new Map(); // id -> { record, parsed_request, parsed_response, parse_error }.
+    let detailRecord = null;  // 当前详情面板渲染所用的 ForwardRecord (raw view 直接用).
+
     // ─── tabs ──────────────────────────────────────────────────────────────
     document.querySelectorAll('nav.tabs a.tab').forEach(tab => {
       tab.addEventListener('click', () => {
@@ -439,19 +611,35 @@
     }
 
     // ─── records tab ──────────────────────────────────────────────────────
+    //
+    // 分页 + 过滤语义:
+    // - 初始 / 手动 refresh(): 只拉第一页 (offset=0, limit=PAGE_SIZE), 完全替换 records.
+    // - loadMore(): 追加拉下一页 (offset=loadedCount), append 到 records.
+    // - 自动刷新 (setInterval): 也只拉第一页. 若用户已 loadMore 到第 3 页, 自动刷新会
+    //   把视图重置到第一页 — 对开发工具是可接受的 (新请求通常就是用户想看的).
+    //   这避免了 "每 3 秒重拉所有页" 的浪费.
     async function refresh() {
       try {
-        const r = await fetch(API_RECORDS, { cache: 'no-store' });
+        const r = await fetch(`${API_RECORDS}?offset=0&limit=${PAGE_SIZE}`, { cache: 'no-store' });
         if (!r.ok) throw new Error('HTTP ' + r.status);
         const data = await r.json();
         records = data.records || [];
-        document.getElementById('count').textContent = records.length;
+        totalCount = data.total || 0;
+        loadedCount = records.length;
+        // 切回第一页可能让之前加载的 parsed cache 对应的 record 不再存在; 简单起见不清 cache,
+        // LRU 自然淘汰.
+        updateCountDisplay();
         renderSidebar();
         if (selectedId) {
           const detail = await fetch(`${API_RECORDS}/${selectedId}`, { cache: 'no-store' });
-          if (detail.ok) renderDetail(await detail.json());
-          else if (detail.status === 404) {
+          if (detail.ok) {
+            const env = await detail.json();
+            detailRecord = env.record;
+            renderDetail();
+          } else if (detail.status === 404) {
+            parsedCache.delete(selectedId);
             selectedId = null;
+            detailRecord = null;
             renderSidebar();
             document.getElementById('detail').innerHTML =
               '<div class="empty">Selected record no longer exists</div>';
@@ -464,27 +652,116 @@
       }
     }
 
+    // F4: 追加加载下一页. 失败时静默 (status 提示), 不影响已加载内容.
+    async function loadMore() {
+      const btn = document.getElementById('load-more-btn');
+      if (btn) btn.disabled = true;
+      try {
+        const r = await fetch(`${API_RECORDS}?offset=${loadedCount}&limit=${PAGE_SIZE}`, { cache: 'no-store' });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const data = await r.json();
+        const more = data.records || [];
+        records = records.concat(more);
+        totalCount = data.total || totalCount;
+        loadedCount = records.length;
+        updateCountDisplay();
+        renderSidebar();
+      } catch (e) {
+        console.error(e);
+        setStatus('load more failed', 'status-err');
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+    }
+
+    // F6: header count 显示 total (而非 loadedCount), label 视情况显示 "loaded/total".
+    function updateCountDisplay() {
+      const cnt = document.getElementById('count');
+      const lbl = document.getElementById('count-label');
+      cnt.textContent = totalCount;
+      if (loadedCount < totalCount) {
+        lbl.textContent = `records (loaded ${loadedCount}/${totalCount})`;
+      } else {
+        lbl.textContent = `records`;
+      }
+    }
+
+    // F3: 更新 All / Hits 两个按钮的计数.
+    function updateFilterCounts() {
+      const allCount = records.length;
+      const hitsCount = records.filter(r => (r.redactions || []).length > 0).length;
+      const allEl = document.getElementById('filter-all-count');
+      const hitsEl = document.getElementById('filter-hits-count');
+      if (allEl) allEl.textContent = allCount;
+      if (hitsEl) hitsEl.textContent = hitsCount;
+    }
+
+    // F3: filter 按钮回调.
+    function setFilter(mode) {
+      filterMode = mode;
+      document.getElementById('filter-all').classList.toggle('active', mode === 'all');
+      document.getElementById('filter-hits').classList.toggle('active', mode === 'hits');
+      renderSidebar();
+    }
+
+    // F2/F3: 渲染侧栏列表. 先按 filterMode 过滤, 再渲染紧凑单行.
     function renderSidebar() {
-      const el = document.getElementById('sidebar');
-      if (records.length === 0) {
-        el.innerHTML = '<div class="empty">No records yet</div>';
+      const listEl = document.getElementById('record-list');
+      const loadMoreWrap = document.getElementById('load-more-wrap');
+
+      // 始终先更新计数 + load-more 可见性, 即使列表为空.
+      updateFilterCounts();
+      if (loadMoreWrap) {
+        loadMoreWrap.style.display = (loadedCount < totalCount) ? '' : 'none';
+        const btn = document.getElementById('load-more-btn');
+        if (btn) {
+          const remaining = totalCount - loadedCount;
+          btn.textContent = `Load more (${remaining} remaining of ${totalCount})`;
+        }
+      }
+
+      const filtered = (filterMode === 'hits')
+        ? records.filter(r => (r.redactions || []).length > 0)
+        : records;
+
+      if (filtered.length === 0) {
+        listEl.innerHTML = `<div class="empty">${filterMode === 'hits' ? 'No redacted records' : 'No records yet'}</div>`;
         return;
       }
-      el.innerHTML = records.map(r => `
-        <div class="record-item ${r.id === selectedId ? 'active' : ''}" data-id="${escapeHtml(r.id)}">
-          <div>
-            <span class="method method-${escapeHtml(r.method)}">${escapeHtml(r.method)}</span>
-            <span>${escapeHtml(r.path)}</span>
+      listEl.innerHTML = filtered.map(r => {
+        const pid = providerIdOf(r.path);
+        const status = escapeHtml(statusText(r));
+        const statusCls = statusClass(r);
+        const hitN = (r.redactions || []).length;
+        const hitBadge = hitN > 0 ? `<span class="badge-hit" title="${hitN} redaction(s)">${hitN}</span>` : '';
+        // title: 完整多行信息 (浏览器原生 tooltip, \n 会按 plain text 渲染).
+        const title = [
+          `${r.method} ${r.path}`,
+          `status: ${statusText(r)}`,
+          `elapsed: ${r.elapsed_ms}ms`,
+          `time: ${formatTime(r.created_at)}`,
+          `redactions: ${hitN}`,
+        ].join('\n');
+        return `
+          <div class="record-item ${r.id === selectedId ? 'active' : ''}" data-id="${escapeHtml(r.id)}" title="${escapeHtml(title)}">
+            <span class="ri-left" title="${escapeHtml(r.path)}">${escapeHtml(pid)}</span>
+            <span class="ri-right">
+              <span class="${statusCls}">${status}</span>
+              ${hitBadge}
+            </span>
           </div>
-          <div>
-            <span class="${statusClass(r)}">${escapeHtml(statusText(r))}</span>
-            <span class="meta">· ${escapeHtml(r.elapsed_ms)}ms · ${escapeHtml(formatTime(r.created_at))}</span>
-          </div>
-        </div>
-      `).join('');
-      el.querySelectorAll('.record-item').forEach(node => {
+        `;
+      }).join('');
+      listEl.querySelectorAll('.record-item').forEach(node => {
         node.addEventListener('click', () => selectRecord(node.dataset.id));
       });
+    }
+
+    // F2: 从 path 中提取 provider_id. 形如 "/o/<id>/...", split 后 index 2 是 id.
+    function providerIdOf(path) {
+      const parts = String(path || '').split('/');
+      // ["", "o", "<id>", "..."] → index 2. 若缺失返回 <unknown>.
+      return parts[2] || '<unknown>';
     }
 
     function statusClass(r) {
@@ -503,18 +780,24 @@
       return new Date(s).toLocaleTimeString();
     }
     function escapeHtml(s) {
-      return String(s).replace(/[&<>"']/g, c => ({
+      // 防 null/undefined 渲染成字面 "null" (Rust 端通常保证非 null, 这里是 defense-in-depth).
+      return String(s ?? '').replace(/[&<>"']/g, c => ({
         '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
       })[c]);
     }
 
     async function selectRecord(id) {
       selectedId = id;
+      // 切换 record 时重置为 raw 视图: parsed 是 lazy-loaded, 切到新 record 时
+      // 缓存未命中需要 fetch, 与其显示空白或闪烁, 不如统一回到 raw.
+      detailView = 'raw';
       renderSidebar();
       try {
         const r = await fetch(`${API_RECORDS}/${id}`, { cache: 'no-store' });
         if (!r.ok) throw new Error('HTTP ' + r.status);
-        renderDetail(await r.json());
+        const env = await r.json();
+        detailRecord = env.record;
+        renderDetail();
       } catch (e) {
         console.error(e);
         document.getElementById('detail').innerHTML =
@@ -522,16 +805,76 @@
       }
     }
 
-    function renderDetail(r) {
+    // F5: 切换详情视图 (raw / parsed). 切到 parsed 时按需懒加载.
+    async function setDetailView(mode) {
+      detailView = mode;
+      document.querySelectorAll('.view-toggle button').forEach(b => {
+        b.classList.toggle('active', b.dataset.view === mode);
+      });
+      if (mode === 'parsed' && selectedId && !parsedCache.has(selectedId)) {
+        // 先渲染一个 loading 占位, 避免用户在 fetch 期间看到空白.
+        document.getElementById('detail').innerHTML =
+          '<div class="empty">Loading parsed view…</div>';
+        await fetchParsed(selectedId);
+      }
+      renderDetail();
+    }
+
+    async function fetchParsed(id) {
+      try {
+        const r = await fetch(`${API_RECORDS}/${id}?view=parsed`, { cache: 'no-store' });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const env = await r.json();
+        parsedCache.set(id, env);
+        // 用 envelope 里的 record 同步 detailRecord, 保证 mock 列表来自权威后端.
+        if (env.record) detailRecord = env.record;
+        return env;
+      } catch (e) {
+        console.error(e);
+        // 缓存一个 error envelope 让后续切换不再重试.
+        parsedCache.set(id, {
+          record: detailRecord,
+          parsed_request: null,
+          parsed_response: null,
+          parse_error: String(e.message || e),
+        });
+        return null;
+      }
+    }
+
+    // 统一的 detail 渲染入口. 根据 detailView 选择 raw 或 parsed 子路径.
+    function renderDetail() {
+      if (!detailRecord) {
+        document.getElementById('detail').innerHTML =
+          '<div class="empty">Select a record on the left</div>';
+        return;
+      }
+      const r = detailRecord;
+      const toggle = `
+        <span class="view-toggle">
+          <button type="button" data-view="raw" class="${detailView === 'raw' ? 'active' : ''}" onclick="setDetailView('raw')">raw</button>
+          <button type="button" data-view="parsed" class="${detailView === 'parsed' ? 'active' : ''}" onclick="setDetailView('parsed')">parsed</button>
+        </span>
+      `;
+      if (detailView === 'parsed') {
+        renderDetailParsed(r, toggle);
+      } else {
+        renderDetailRaw(r, toggle);
+      }
+    }
+
+    function renderDetailRaw(r, toggle) {
       const el = document.getElementById('detail');
       const badges = [
         r.streamed ? '<span class="badge badge-stream">streamed</span>' : '',
         r.error ? '<span class="badge badge-err">' + escapeHtml(r.error) + '</span>' : '',
       ].join('');
+      const hitN = (r.redactions || []).length;
+      const hitBadge = hitN > 0 ? `<span class="badge-hit">${hitN} redacted</span>` : '';
       el.innerHTML = `
         <div class="section">
-          <h3>Request</h3>
-          <div><b>${escapeHtml(r.method)}</b> ${escapeHtml(r.path)}</div>
+          <h3>Request ${toggle}</h3>
+          <div><b>${escapeHtml(r.method)}</b> ${escapeHtml(r.path)} ${hitBadge}</div>
           <pre>${escapeHtml(formatHeaders(r.req_headers))}</pre>
           <pre>${escapeHtml(r.req_body || '<empty>')}</pre>
         </div>
@@ -546,6 +889,195 @@
           <pre>${escapeHtml(r.resp_body || '<empty>')}</pre>
         </div>
       `;
+    }
+
+    // F5: parsed 视图. 先尝试 parsed chat bubbles; parse_error 或无数据时回退 raw + banner.
+    function renderDetailParsed(r, toggle) {
+      const el = document.getElementById('detail');
+      const env = parsedCache.get(r.id) || {};
+      const parseError = env.parse_error || null;
+      const reqJson = env.parsed_request || null;
+      const respJson = env.parsed_response || null;
+      const hitN = (r.redactions || []).length;
+      const hitBadge = hitN > 0 ? `<span class="badge-hit">${hitN} redacted</span>` : '';
+
+      // 获取 mock 列表 (每个 [mock, secret_id]). 用于在文本里高亮命中的 mock.
+      const redactions = (r.redactions || []).map(pair => ({
+        mock: String(pair[0] || ''),
+        secretId: String(pair[1] || ''),
+      })).filter(x => x.mock.length > 0);
+
+      let html = `<div class="section"><h3>Request ${toggle}</h3>`;
+      html += `<div><b>${escapeHtml(r.method)}</b> ${escapeHtml(r.path)} ${hitBadge}</div>`;
+      if (parseError) {
+        html += `<div class="banner">Parsed view unavailable: ${escapeHtml(parseError)}. Falling back to raw body below.</div>`;
+      }
+      if (reqJson) {
+        html += renderChatRequest(reqJson, redactions);
+      } else {
+        html += `<pre>${escapeHtml(r.req_body || '<empty>')}</pre>`;
+      }
+      html += `</div>`;
+
+      // Response 段.
+      const respBadges = [
+        r.streamed ? '<span class="badge badge-stream">streamed</span>' : '',
+        r.error ? '<span class="badge badge-err">' + escapeHtml(r.error) + '</span>' : '',
+      ].join('');
+      html += `<div class="section"><h3>Response ${respBadges}</h3>`;
+      html += `<div>status: <span class="${statusClass(r)}">${r.resp_status === 0 ? '(pending)' : escapeHtml(r.resp_status)}</span> · ${escapeHtml(r.elapsed_ms)}ms</div>`;
+      if (respJson) {
+        html += renderChatResponse(respJson, redactions);
+      } else if (r.streamed) {
+        html += `<div class="banner">Streaming responses are not parsed (SSE chunks). Showing raw body below.</div>`;
+        html += `<pre>${escapeHtml(r.resp_body || '<empty>')}</pre>`;
+      } else {
+        html += `<pre>${escapeHtml(r.resp_body || '<empty>')}</pre>`;
+      }
+      html += `</div>`;
+      el.innerHTML = html;
+    }
+
+    // F5: 把 parsed_request (OpenAI / Anthropic canonical chat JSON) 渲染为 chat bubbles.
+    // 统一两种 schema:
+    //  - OpenAI: messages[] = {role, content: string | array}, 顶层无 system 字段.
+    //  - Anthropic: messages[] = {role, content: [{type:"text", text}]}, 顶层 system (string | array).
+    function renderChatRequest(reqJson, redactions) {
+      let html = '<div class="chat-bubbles">';
+      // system prompt 优先从顶层取 (Anthropic 风格).
+      const systemText = extractSystemText(reqJson.system);
+      if (systemText) {
+        html += renderBubble('system', systemText, redactions);
+      }
+      const messages = Array.isArray(reqJson.messages) ? reqJson.messages : [];
+      for (const m of messages) {
+        const role = String(m.role || 'user');
+        // OpenAI: 若 role=system 且顶层没有 system, 也归到 system bubble.
+        if (role === 'system') {
+          if (!systemText) {
+            const t = messageToText(m);
+            if (t !== null) html += renderBubble('system', t, redactions);
+          }
+          continue; // 已在顶层处理或刚补过.
+        }
+        const text = messageToText(m);
+        if (text !== null) {
+          // role=tool 也走这里: messageToText 归一化 content 为文本, bubbleClassForRole 返回 'tool'.
+          const cls = bubbleClassForRole(role);
+          html += renderBubble(cls, text, redactions, role);
+        }
+        // 处理 OpenAI 风格的 tool_calls (assistant 消息里).
+        if (role === 'assistant' && Array.isArray(m.tool_calls)) {
+          for (const tc of m.tool_calls) {
+            const fn = tc.function || {};
+            const pretty = `tool_call ${tc.id || ''}\nname: ${fn.name || ''}\narguments: ${fn.arguments || ''}`;
+            html += `<div class="chat-bubble bubble-tool"><span class="bubble-role">tool call</span>${applyMockHighlight(escapeHtml(pretty), redactions)}</div>`;
+          }
+        }
+      }
+      html += '</div>';
+      return html;
+    }
+
+    // F5: parsed_response 渲染. OpenAI: choices[0].message; Anthropic: 顶层 content[].
+    function renderChatResponse(respJson, redactions) {
+      let html = '<div class="chat-bubbles">';
+      // OpenAI shape.
+      const choice = respJson.choices && respJson.choices[0];
+      const openaiMsg = choice && choice.message;
+      if (openaiMsg) {
+        const text = messageToText(openaiMsg);
+        if (text !== null) html += renderBubble('assistant', text, redactions, 'assistant');
+        // tool_calls (OpenAI): 单独渲染为 tool bubble.
+        if (Array.isArray(openaiMsg.tool_calls)) {
+          for (const tc of openaiMsg.tool_calls) {
+            const fn = tc.function || {};
+            const pretty = `tool_call ${tc.id || ''}\nname: ${fn.name || ''}\narguments: ${fn.arguments || ''}`;
+            html += `<div class="chat-bubble bubble-tool"><span class="bubble-role">tool call</span>${applyMockHighlight(escapeHtml(pretty), redactions)}</div>`;
+          }
+        }
+      } else if (Array.isArray(respJson.content)) {
+        // Anthropic shape.
+        for (const block of respJson.content) {
+          if (block && block.type === 'text' && typeof block.text === 'string') {
+            html += renderBubble('assistant', block.text, redactions, 'assistant');
+          } else if (block && block.type === 'tool_use') {
+            const pretty = `tool_use ${block.id || ''}\nname: ${block.name || ''}\ninput: ${safeJsonStringify(block.input)}`;
+            html += `<div class="chat-bubble bubble-tool"><span class="bubble-role">tool use</span>${applyMockHighlight(escapeHtml(pretty), redactions)}</div>`;
+          }
+        }
+      } else {
+        // 未知结构: 退化为 pretty JSON.
+        html += `<pre>${escapeHtml(safeJsonStringify(respJson))}</pre>`;
+      }
+      html += '</div>';
+      return html;
+    }
+
+    function renderBubble(cls, text, redactions, roleLabel) {
+      const roleDisplay = roleLabel || cls;
+      // applyMockHighlight 期望输入是已经 escapeHtml 过的字符串.
+      const safeText = applyMockHighlight(escapeHtml(text), redactions);
+      return `<div class="chat-bubble bubble-${cls}">
+        <span class="bubble-role">${escapeHtml(roleDisplay)}</span>
+        ${safeText}
+      </div>`;
+    }
+
+    function bubbleClassForRole(role) {
+      if (role === 'user') return 'user';
+      if (role === 'assistant') return 'assistant';
+      if (role === 'tool') return 'tool';
+      return 'assistant';
+    }
+
+    // 把 message.content (string | array) 归一化为纯文本. 返回 null 表示该消息没有可展示文本
+    // (无 content / 纯 tool 块), 让调用方统一用 `if (text !== null)` 决定是否渲染.
+    function messageToText(m) {
+      const c = m.content;
+      if (c == null) return null;
+      if (typeof c === 'string') return c || null;
+      if (Array.isArray(c)) {
+        // 收集 text 块; tool_use / tool_result 单独处理 (见调用处).
+        const texts = c
+          .filter(b => b && b.type === 'text' && typeof b.text === 'string')
+          .map(b => b.text);
+        return texts.length > 0 ? texts.join('\n') : null;
+      }
+      return null;
+    }
+
+    function extractSystemText(sys) {
+      if (typeof sys === 'string') return sys;
+      if (Array.isArray(sys)) {
+        return sys
+          .filter(b => b && b.type === 'text' && typeof b.text === 'string')
+          .map(b => b.text)
+          .join('\n');
+      }
+      return '';
+    }
+
+    function safeJsonStringify(v) {
+      try { return JSON.stringify(v, null, 2); } catch (_) { return String(v); }
+    }
+
+    // F5 mock 高亮 (安全关键):
+    // - 输入必须是**已经 escapeHtml 过**的字符串 (调用方职责).
+    // - 每个 mock 也先 escapeHtml, 再用 split/join 替换, 避免把 mock 内特殊字符当 HTML 解析.
+    // - 替换后用 <mark class="secret-hit"> 包裹, title 显示命中的 secret_id (也已 escapeHtml).
+    function applyMockHighlight(escapedText, redactions) {
+      let text = escapedText;
+      if (!redactions || redactions.length === 0) return text;
+      for (const r of redactions) {
+        const escapedMock = escapeHtml(r.mock);
+        if (!escapedMock) continue;
+        const titleAttr = escapeHtml(`redacted: ${r.secretId}`);
+        const mark = `<mark class="secret-hit" data-secret-id="${escapeHtml(r.secretId)}" title="${titleAttr}">${escapedMock}</mark>`;
+        // 用 split/join 全局替换, 避开正则特殊字符 (mock 是任意 base62 字符串).
+        text = text.split(escapedMock).join(mark);
+      }
+      return text;
     }
 
     function formatHeaders(hs) {
@@ -710,13 +1242,15 @@
 
     function renderSecretRow(s) {
       const rowCls = rowClass(s.source);
+      // F1: 每个可溢出单元格的内容用 .cell-ellipsis 包裹, 并给外层 td 设置 title (浏览器原生 tooltip).
+      // 类别 / 长度 是短文本列, 用 cell-short; value 用 cell-long.
       return `
         <tr class="${rowCls}" data-id="${escapeHtml(s.id)}">
-          <td><code>${escapeHtml(s.id)}</code></td>
-          <td>${escapeHtml(s.name || '')}</td>
-          <td><span class="pill ${escapeHtml(s.category)}">${escapeHtml(s.category)}</span></td>
-          <td><code>${escapeHtml(s.value_masked)}</code></td>
-          <td>${escapeHtml(s.value_length)}</td>
+          <td title="${escapeHtml(s.id)}"><span class="cell-ellipsis"><code>${escapeHtml(s.id)}</code></span></td>
+          <td title="${escapeHtml(s.name || '')}"><span class="cell-ellipsis">${escapeHtml(s.name || '')}</span></td>
+          <td class="cell-short"><span class="pill ${escapeHtml(s.category)}">${escapeHtml(s.category)}</span></td>
+          <td class="cell-long" title="${escapeHtml(s.value_masked || '')}"><span class="cell-ellipsis"><code>${escapeHtml(s.value_masked)}</code></span></td>
+          <td class="cell-short">${escapeHtml(s.value_length)}</td>
           <td>${srcBadge(s.source)}</td>
           <td>${decisionCell('secret', s.id, s.decision, !!s.static_version)}</td>
           <td class="actions">${rowActions(s)}</td>
@@ -728,12 +1262,12 @@
       const rowCls = rowClass(p.source);
       return `
         <tr class="${rowCls}" data-id="${escapeHtml(p.id)}">
-          <td><code>${escapeHtml(p.id)}</code></td>
-          <td>${escapeHtml(p.name || '')}</td>
-          <td><span class="pill">${escapeHtml(p.protocol)}</span></td>
-          <td><code>${escapeHtml(p.base_url)}</code></td>
-          <td><code>${escapeHtml(p.api_key_masked || '(none)')}</code></td>
-          <td>${p.enabled ? '✓' : '<span class="status-err">✗</span>'}</td>
+          <td title="${escapeHtml(p.id)}"><span class="cell-ellipsis"><code>${escapeHtml(p.id)}</code></span></td>
+          <td title="${escapeHtml(p.name || '')}"><span class="cell-ellipsis">${escapeHtml(p.name || '')}</span></td>
+          <td class="cell-short"><span class="pill">${escapeHtml(p.protocol)}</span></td>
+          <td class="cell-long" title="${escapeHtml(p.base_url || '')}"><span class="cell-ellipsis"><code>${escapeHtml(p.base_url)}</code></span></td>
+          <td class="cell-long" title="${escapeHtml(p.api_key_masked || '')}"><span class="cell-ellipsis"><code>${escapeHtml(p.api_key_masked || '(none)')}</code></span></td>
+          <td class="cell-short">${p.enabled ? '✓' : '<span class="status-err">✗</span>'}</td>
           <td>${srcBadge(p.source)}</td>
           <td>${decisionCell('provider', p.id, p.decision, !!p.static_version)}</td>
           <td class="actions">${rowActions(p)}</td>

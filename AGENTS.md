@@ -60,6 +60,8 @@ src/
 ├── provider.rs    # Protocol / Provider + DynamicEntry impl + EffectiveProvider 合并视图
 ├── secrets.rs     # SecretEntry / SecretCategory + DynamicEntry impl + EffectiveSecret + mask_value
 ├── record.rs      # ForwardRecord / RecordStore / ResponseUpdate
+│                  # (ForwardRecord.redactions: Vec<(mock, secret_id)> 从 RedactionMap SSOT 派生)
+│                  # (RecordStore::list_page: offset+limit 分页, WebUI 用)
 ├── redact.rs      # mock_with_salt + RedactionMap + redact_ir + restore_ir_response
 │                  # + StreamingRestorer (流式 sliding-window restore, per-block 独立)
 │                  # + IR traverse helpers (block_contains / value_replace_all 等)
@@ -132,7 +134,8 @@ Disabled 项不进入 effective view (UI 看不到, 路由层也拿不到).
 ### API endpoints (WebUI)
 
 ```
-GET    /__sg/api/records[/{id}]
+GET    /__sg/api/records[?offset=N&limit=M]   → {records, total, offset, limit}
+GET    /__sg/api/records/{id}[?view=parsed]   → {record, parsed_request?, parsed_response?, parse_error?}
 GET    /__sg/api/secrets
 POST   /__sg/api/secrets
 PUT    /__sg/api/secrets/{id}
@@ -145,6 +148,16 @@ PUT    /__sg/api/providers/{id}
 DELETE /__sg/api/providers/{id}
 PATCH  /__sg/api/providers/{id}/decision
 ```
+
+**Records 分页**: `offset` 0-based 从最新算起; `limit` clamp 到 `[1,200]`, 默认 50.
+
+**Records parsed view**: `?view=parsed` 用 ingress 协议的 codec 把 req/resp body 解析为
+结构化 chat JSON (供 WebUI 渲染对话气泡). Gemini/Ollama 无 codec → `parse_error` + fallback raw.
+流式响应的 `resp_body` 是 SSE 拼接, 非 JSON → 跳过 response 解析 (`parsed_response=null`).
+
+**ForwardRecord.redactions**: `Vec<(mock, secret_id)>` — 从 `redact_ir` 产出的
+`RedactionMap` SSOT 派生 (见 `proxy.rs::derive_redactions`). WebUI 的 mock 高亮和 "命中"
+筛选都基于此字段, **永不**在前端重新计算, 避免前后端漂移. 不含真实 secret value, 可安全暴露.
 
 ## 关键契约
 
