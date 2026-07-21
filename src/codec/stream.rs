@@ -212,10 +212,26 @@ impl StreamTranslate {
                 }
             }
 
-            // post-stop guard: MessageStop 后任何 MessageDelta 都丢弃
-            // (避免 message_delta 在 message_stop 之后的非法 frame 顺序).
-            if self.message_stopped && matches!(ev, IrStreamEvent::MessageDelta { .. }) {
-                continue;
+            // post-stop guard: MessageStop 后若再来 MessageDelta, 仅当携带 usage 时放行
+            // (OpenAI `stream_options.include_usage: true` 的末尾 usage chunk 就出现在
+            // finish_reason chunk 之后, 我们在 reader 里把它解析为 MessageStop 之后的
+            // MessageDelta; 丢弃它会让客户端拿不到 token 统计).
+            // 无 usage 的 post-stop delta 是无意义的, 仍然丢弃.
+            //
+            // TODO(cross-proto-streaming): 当前 dispatch 对跨协议 + 流式返回 501, 所以
+            // 此 guard 只影响 OpenAI egress. 未来接入跨协议流式 (OpenAI → Anthropic) 时,
+            // Anthropic writer 会在 message_stop 之后收到 MessageDelta{usage} 并产生
+            // 非法的 wire 顺序. 届时需要把 OpenAI 末尾 usage chunk 折叠到 message_stop
+            // 之前的 message_delta, 或让 cross-proto 模式忽略此 guard.
+            if self.message_stopped {
+                if let IrStreamEvent::MessageDelta { usage, .. } = &ev {
+                    if usage.is_zero() {
+                        continue;
+                    }
+                } else if matches!(ev, IrStreamEvent::MessageStop) {
+                    // 重复的 MessageStop, 丢弃.
+                    continue;
+                }
             }
             if matches!(ev, IrStreamEvent::MessageStop) {
                 self.message_stopped = true;
@@ -557,5 +573,64 @@ mod tests {
         let mut state = StreamDecodeState::default();
         let events = reader.read_response_events("message_start", &data, &mut state);
         assert_eq!(events.len(), 1);
+    }
+
+    // ─── post-stop guard: usage 透传 / 重复 stop 抑制 ──────────────────
+
+    #[test]
+    fn post_stop_guard_passes_usage_only_message_delta_after_stop_openai_ingress() {
+        // OpenAI egress + OpenAI ingress (same-proto restore 模式).
+        // 模拟 OpenAI `stream_options.include_usage: true` 末尾 chunk:
+        // 1. finish_reason chunk (无 usage) → reader 产出 MessageDelta{stop, zero} + MessageStop
+        // 2. usage chunk (choices=[], usage 非零) → reader 产出 MessageDelta{None, usage}
+        // 客户端应该看到: 一个 finish_reason chunk + 一个 usage chunk (含 prompt_tokens 等).
+        use crate::redact::RedactionMap;
+
+        let proto = Protocol::OpenAI;
+        let mut t = StreamTranslate::new_same_proto_restore(proto, RedactionMap::default());
+
+        let finish_chunk = serde_json::json!({
+            "id": "x", "created": 0, "model": "gpt-4o",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+        });
+        let usage_chunk = serde_json::json!({
+            "id": "x", "created": 0, "model": "gpt-4o",
+            "choices": [],
+            "usage": {"prompt_tokens": 42, "completion_tokens": 7, "total_tokens": 49}
+        });
+
+        // 用单个 SSE payload 同时喂两个帧, 模拟真实上游 (TCP 切片无关键影响).
+        let sse = format!("data: {finish_chunk}\n\ndata: {usage_chunk}\n\n");
+        let out = t.feed(sse.as_bytes());
+        let s = String::from_utf8_lossy(&out);
+        // 关键: usage 必须透传给客户端 (修复前会被 post-stop guard 丢弃).
+        assert!(
+            s.contains("\"prompt_tokens\":42"),
+            "client must see usage; got: {s}"
+        );
+        assert!(
+            s.contains("\"finish_reason\":\"stop\""),
+            "finish_reason must also be emitted; got: {s}"
+        );
+    }
+
+    #[test]
+    fn post_stop_guard_drops_duplicate_message_stop() {
+        // 同协议 restore 模式: 上游异常发了两个 message_stop (eg. keepalive 帧错误解析),
+        // 应该只产生一份 [DONE] 终止符 (finish() 时 emit_done=true).
+        use crate::redact::RedactionMap;
+        let proto = Protocol::Anthropic; // message_stop 在 Anthropic 是显式 event
+        let mut t = StreamTranslate::new_same_proto_restore(proto, RedactionMap::default());
+        let sse = concat!(
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        let out = t.feed(sse.as_bytes());
+        let s = String::from_utf8_lossy(&out);
+        // 客户端应该只看到一个 message_stop frame.
+        let count = s.matches("event: message_stop").count();
+        assert_eq!(count, 1, "duplicate message_stop must be dropped; got: {s}");
     }
 }

@@ -824,6 +824,65 @@ async fn same_proto_streaming_with_redact_restores_mock_in_sse_chunks() {
 }
 
 #[tokio::test]
+async fn same_proto_streaming_with_redact_preserves_include_usage_chunk() {
+    // 回归: 同协议 + redact + 流式响应 + 上游支持 stream_options.include_usage.
+    //
+    // OpenAI `stream_options.include_usage: true` 模式下, 流末尾会有一个独立 chunk:
+    //   `choices: []` (空数组) + 顶层 `usage`.
+    // 此前 reader 把空数组当成 "无 choice" 直接 return, 丢失 usage; writer 也忽略
+    // MessageDelta 的 usage 字段. 两者叠加导致客户端 (如 opencode) 拿到 0 tokens.
+    //
+    // 该测试覆盖整条链路: 上游发出独立的 usage chunk → reader 识别 → writer 写回.
+    let real_secret = "sk-test-123";
+    let mut upstream = spawn_mock_upstream().await;
+    // 上游 SSE: 1) role chunk  2) text delta  3) finish_reason chunk (无 usage)
+    //           4) 独立 usage chunk (choices=[], 顶层 usage)  5) [DONE]
+    let sse_body =
+        format!(
+            concat!(
+                "data: {{\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-4o\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\"}},\"finish_reason\":null}}]}}\n\n",
+                "data: {{\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-4o\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"uses {real_secret}\"}},\"finish_reason\":null}}]}}\n\n",
+                "data: {{\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-4o\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\n",
+                "data: {{\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-4o\",\"choices\":[],\"usage\":{{\"prompt_tokens\":42,\"completion_tokens\":7,\"total_tokens\":49}}}}\n\n",
+                "data: [DONE]\n\n",
+            ),
+            real_secret = real_secret,
+        );
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse_body)
+        .create_async()
+        .await;
+    let entries = vec![secret("api-key", real_secret)];
+    let secrets = test_secret_table_with(entries);
+    let upstream_client = reqwest::Client::new();
+    let records = RecordStore::new(64);
+    let provider = openai_provider("oa-main", &upstream.url());
+    let proxy_url = spawn_proxy_full(vec![provider], upstream_client, records, secrets).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/o/oa-main/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"x"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let text = resp.text().await.unwrap();
+    // 关键断言: usage 必须透传给客户端 (修复前丢失, 导致 opencode 显示 "0 tokens").
+    assert!(
+        text.contains("\"prompt_tokens\":42"),
+        "client must see usage.prompt_tokens=42; got: {text}"
+    );
+    assert!(
+        text.contains("\"completion_tokens\":7"),
+        "client must see usage.completion_tokens=7; got: {text}"
+    );
+}
+
+#[tokio::test]
 async fn cross_protocol_with_redact_round_trips_through_ir_translation() {
     // 跨协议 + redact + restore: 客户端发 OpenAI (含 secret) → codec 翻译为 Anthropic
     // (含 mock) → 上游响应含 mock → codec 翻译回 OpenAI + restore mock 为 real_secret.

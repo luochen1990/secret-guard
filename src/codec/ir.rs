@@ -10,7 +10,7 @@
 //!   (字段顺序可能不同; 空文本块 / 空 content 等价性可能轻微变化, 但对 LLM 而言无差异).
 //!   不追求严格 byte-exact (字段顺序 / 空字符串归一化可能让 wire 字节略变).
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 // ─── 请求侧 ────────────────────────────────────────────────────────────────
 
@@ -188,6 +188,42 @@ impl IrUsage {
     /// 全零的零值, 用于流式累积的初始值.
     pub fn zero() -> Self {
         Self::default()
+    }
+
+    /// 是否所有字段都为零. 用于判断 usage 是否携带有效统计.
+    ///
+    /// 单一事实来源: 新增字段时只需要更新此方法, 所有 caller 自动生效.
+    /// (eg. OpenAI writer 决定是否在 chunk 中附 `usage` 字段;
+    /// StreamTranslate post-stop guard 决定是否放行 MessageDelta.)
+    pub fn is_zero(&self) -> bool {
+        self.input_tokens == 0
+            && self.output_tokens == 0
+            && self.cache_creation_input_tokens.unwrap_or(0) == 0
+            && self.cache_read_input_tokens.unwrap_or(0) == 0
+    }
+
+    /// OpenAI 风格的 `prompt_tokens`: 未缓存 input + 命中缓存 + 写入缓存 (饱和加).
+    ///
+    /// 单一事实来源: IR 归一化约定中 `input_tokens` 仅含未缓存部分, 但 OpenAI wire
+    /// 格式的 `prompt_tokens` 含 cached 总和, writer 必须加回.
+    /// 集中在此避免多处手算.
+    pub fn openai_prompt_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.cache_read_input_tokens.unwrap_or(0))
+            .saturating_add(self.cache_creation_input_tokens.unwrap_or(0))
+    }
+
+    /// 序列化为 OpenAI wire 格式的 `usage` 对象 (`{prompt_tokens, completion_tokens, total_tokens}`).
+    ///
+    /// 单一事实来源: 非流式响应与流式 MessageDelta 都用同一个 wire 形态,
+    /// 集中在此避免两处手写 JSON shape (新增字段如 `prompt_tokens_details` 时只改一处).
+    pub fn openai_usage_json(&self) -> Value {
+        let prompt_tokens = self.openai_prompt_tokens();
+        json!({
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": self.output_tokens,
+            "total_tokens": prompt_tokens.saturating_add(self.output_tokens),
+        })
     }
 }
 

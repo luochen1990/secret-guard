@@ -404,20 +404,8 @@ impl Writer for OpenAiWriter {
                 "finish_reason": write_stop_reason(resp.stop_reason),
             }]),
         );
-        // usage 反向归一化: OpenAI prompt_tokens 含 cached, 需加回.
-        let prompt_tokens = resp
-            .usage
-            .input_tokens
-            .saturating_add(resp.usage.cache_read_input_tokens.unwrap_or(0))
-            .saturating_add(resp.usage.cache_creation_input_tokens.unwrap_or(0));
-        out.insert(
-            "usage".to_string(),
-            json!({
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": resp.usage.output_tokens,
-                "total_tokens": prompt_tokens.saturating_add(resp.usage.output_tokens),
-            }),
-        );
+        // usage 反向归一化: OpenAI prompt_tokens 含 cached, 由 IrUsage 统一序列化 (SSOT).
+        out.insert("usage".to_string(), resp.usage.openai_usage_json());
         Value::Object(out)
     }
 
@@ -486,13 +474,37 @@ impl Writer for OpenAiWriter {
                 // OpenAI 没有 content_block_stop 的对应 event, 跳过.
                 return None;
             }
-            IrStreamEvent::MessageDelta { stop_reason, .. } => json!({
-                "choices": [{
-                    "index": 0,
-                    "delta": {},
-                    "finish_reason": write_stop_reason(*stop_reason),
-                }]
-            }),
+            IrStreamEvent::MessageDelta {
+                stop_reason, usage, ..
+            } => {
+                // MessageDelta 在 OpenAI wire 上有两种合法形态:
+                // 1. 带 stop_reason (finish_reason chunk): `choices:[{delta:{},finish_reason}]`,
+                //    若 usage 非零也附在顶层 (合并 chunk 形态, 上游可能这样合并).
+                // 2. 仅 usage (OpenAI `stream_options.include_usage` 末尾独立 chunk):
+                //    `choices:[]` + 顶层 `usage`. 这是规范格式 (见 OpenAI streaming 文档).
+                // 必须把 usage 写回, 否则客户端 (如 opencode) 拿不到 token 统计.
+                //
+                // 空 delta + 无 usage: 无意义, 跳过.
+                let has_usage = !usage.is_zero();
+                if stop_reason.is_none() && !has_usage {
+                    return None;
+                }
+
+                let mut chunk = match stop_reason {
+                    Some(_) => json!({
+                        "choices": [{
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": write_stop_reason(*stop_reason),
+                        }]
+                    }),
+                    None => json!({ "choices": [] }),
+                };
+                if has_usage {
+                    chunk["usage"] = usage.openai_usage_json();
+                }
+                chunk
+            }
             IrStreamEvent::MessageStop => {
                 // OpenAI 的 message_stop 由 emit_done_terminator 在 finish() 中追加.
                 return None;
@@ -746,21 +758,24 @@ fn read_openai_stream_chunk(data: &Value, state: &mut StreamDecodeState) -> Vec<
     }
 
     let choices = data.get("choices").and_then(Value::as_array);
-    // 末尾的 include_usage chunk: choices 为空或缺失, 但带 usage.
+    // 末尾的 include_usage chunk: choices 缺失或为空数组 (`choices: []`), 但带 usage.
+    // OpenAI `stream_options.include_usage: true` 的末尾 chunk 规范格式是 `choices: []`
+    // (空数组而非字段缺失), 二者语义等价, 统一处理: 发出 MessageDelta(usage),
+    // 否则 IR writer 不会把 usage 写回客户端 (opencode 等客户端会显示 0 tokens).
     let chunk_usage = data.get("usage").filter(|v| v.is_object()).map(read_usage);
-    let Some(choices) = choices else {
-        if let Some(u) = chunk_usage {
-            events.push(IrStreamEvent::MessageDelta {
-                stop_reason: None,
-                stop_sequence: None,
-                usage: u,
-            });
+    let choice0 = match choices.and_then(|c| c.first()) {
+        None => {
+            // choices 缺失或为空数组.
+            if let Some(u) = chunk_usage {
+                events.push(IrStreamEvent::MessageDelta {
+                    stop_reason: None,
+                    stop_sequence: None,
+                    usage: u,
+                });
+            }
+            return events;
         }
-        return events;
-    };
-
-    let Some(choice0) = choices.first() else {
-        return events;
+        Some(c) => c,
     };
     let delta = choice0.get("delta");
     let finish_reason = choice0.get("finish_reason").and_then(Value::as_str);
@@ -820,7 +835,7 @@ fn read_openai_stream_chunk(data: &Value, state: &mut StreamDecodeState) -> Vec<
         events.push(IrStreamEvent::MessageDelta {
             stop_reason: Some(stop_reason),
             stop_sequence: None,
-            usage: chunk_usage.clone().unwrap_or_default(),
+            usage: chunk_usage.unwrap_or_default(),
         });
         events.push(IrStreamEvent::MessageStop);
     } else if let Some(u) = chunk_usage {
@@ -1442,5 +1457,97 @@ mod tests {
             }
         ));
         assert!(matches!(events[2], IrStreamEvent::MessageStop));
+    }
+
+    // ─── include_usage (stream_options.include_usage: true) ────────────
+    //
+    // OpenAI 当客户端传 `stream_options.include_usage: true` 时, 流末尾会发一个
+    // 独立的 usage chunk: `choices: []` (空数组) + 顶层 `usage`. 这是规范明确的
+    // 格式 (见 OpenAI API reference chat/streaming).
+    //
+    // 我们必须识别这个 chunk 并以 MessageDelta 形式向上广播 usage, 否则 IR writer
+    // 不会把 usage 写回客户端, 导致 opencode 等客户端拿不到 token 统计.
+
+    #[test]
+    fn stream_chunk_include_usage_empty_choices_emits_message_delta() {
+        // 场景: finish_reason 已经在前一 chunk 发出, 然后单独一个 chunk 携带 usage,
+        // choices 是空数组 (不是缺失).
+        let chunk = json!({
+            "id": "x", "created": 0, "model": "gpt-4o",
+            "choices": [],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        });
+        let mut state = StreamDecodeState::default();
+        let events = reader().read_response_events("", &chunk, &mut state);
+        // MessageStart (首次) + MessageDelta(usage).
+        // 关键: usage 必须以 MessageDelta 形式发出.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, IrStreamEvent::MessageDelta { usage, .. }
+                    if usage.input_tokens == 10 && usage.output_tokens == 5)),
+            "expected MessageDelta with usage; got: {events:?}"
+        );
+    }
+
+    #[test]
+    fn writer_message_delta_with_only_usage_emits_empty_choices_plus_usage() {
+        // 独立 usage chunk (OpenAI stream_options.include_usage 末尾 chunk 格式):
+        // writer 必须输出 `choices: []` + `usage`, 而不是 `choices:[{delta:{}}]`.
+        let ev = IrStreamEvent::MessageDelta {
+            stop_reason: None,
+            stop_sequence: None,
+            usage: IrUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                ..Default::default()
+            },
+        };
+        let (_, chunk) = writer()
+            .write_response_event(&ev)
+            .expect("should emit chunk");
+        let choices = chunk.get("choices").and_then(Value::as_array).unwrap();
+        assert!(
+            choices.is_empty(),
+            "choices must be empty array; got: {chunk}"
+        );
+        let usage = chunk.get("usage").expect("usage must be present");
+        assert_eq!(usage.get("prompt_tokens").unwrap(), 10);
+        assert_eq!(usage.get("completion_tokens").unwrap(), 5);
+        assert_eq!(usage.get("total_tokens").unwrap(), 15);
+    }
+
+    #[test]
+    fn writer_message_delta_with_finish_reason_and_usage_emits_both() {
+        // finish_reason chunk 也带 usage (非 include_usage 模式, 或上游合并了):
+        // writer 应输出 choices[0]+finish_reason + 顶层 usage.
+        let ev = IrStreamEvent::MessageDelta {
+            stop_reason: Some(IrStopReason::EndTurn),
+            stop_sequence: None,
+            usage: IrUsage {
+                input_tokens: 7,
+                output_tokens: 3,
+                ..Default::default()
+            },
+        };
+        let (_, chunk) = writer()
+            .write_response_event(&ev)
+            .expect("should emit chunk");
+        let choices = chunk.get("choices").and_then(Value::as_array).unwrap();
+        assert_eq!(choices.len(), 1);
+        assert_eq!(choices[0].get("finish_reason").unwrap(), "stop");
+        let usage = chunk.get("usage").expect("usage must be present");
+        assert_eq!(usage.get("prompt_tokens").unwrap(), 7);
+    }
+
+    #[test]
+    fn writer_message_delta_with_no_usage_no_stop_reason_is_skipped() {
+        // 空 delta + 无 usage: writer 跳过 (返回 None).
+        let ev = IrStreamEvent::MessageDelta {
+            stop_reason: None,
+            stop_sequence: None,
+            usage: IrUsage::default(),
+        };
+        assert!(writer().write_response_event(&ev).is_none());
     }
 }
