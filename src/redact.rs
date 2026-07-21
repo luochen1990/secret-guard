@@ -26,6 +26,10 @@
 //!   前提: `SecretTable::upsert` 通过 `validate_value` 拒绝含 `MOCK_PREFIX` ("sgm_") 的 secret.
 //! - **C6 可逆性 (restorability)**: round-trip identity —
 //!   `restore_ir_response(redact_ir(...).ir, map)` 后 IR 语义等价于原 IR.
+//! - **C7 流式可逆性 (streaming restorability)**:
+//!   [`StreamingRestorer`] 在任意 chunk 切分下保证 round-trip identity —
+//!   `concat(push(c_1), push(c_2), ..., push(c_n), flush().1)` 严格等于
+//!   `content.replace(mock, real)`. UTF-8 安全 (多字节字符不在 char boundary 中间切).
 //!
 //! # 扫描覆盖范围
 //!
@@ -42,17 +46,17 @@
 //!
 //! # 流式 trade-off
 //!
-//! - **Text block / Text delta**: 必 redact.
-//! - **InputJsonDelta (流式 tool 参数片段)**: 跳过 (MVP). 跨 chunk 的 secret 会泄漏.
-//!   未来用 sliding window 缓冲尾部 N 字节 (N = max secret length) 解决.
-//!   TODO(b/secret-guard#redact-streaming): 实现 InputJsonDelta 的 sliding window restore.
+//! - **Text block / Text delta**: 必 redact. 流式响应通过 [`StreamingRestorer`] 做 sliding-window
+//!   restore (尾部缓冲 N 字节, N = max mock len - 1), 避免跨 chunk mock 丢失 round-trip.
+//! - **InputJsonDelta (流式 tool 参数片段)**: 同样走 [`StreamingRestorer`], 与 text 同算法.
+//!   per-block 独立状态, 跨 block 互不干扰.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
 
-use crate::codec::ir::{IrBlock, IrDelta, IrRequest, IrResponse, IrStreamEvent, IrTool};
+use crate::codec::ir::{IrBlock, IrDelta, IrRequest, IrResponse, IrTool};
 use crate::secrets::SecretEntry;
 
 /// mock 的固定 prefix. 与 real_secret 无关, 是 C5 (no-real-substring) 的关键.
@@ -212,39 +216,173 @@ pub fn restore_ir_response(ir: &mut IrResponse, map: &RedactionMap) {
     }
 }
 
-/// 在单个 [`IrStreamEvent`] 中反向替换 mock 为真实 secret.
+// ─── StreamingRestorer: sliding window restore ──────────────────────────────
+
+/// Block delta 类型标识, 让 [`StreamingRestorer`] 在 flush 时能恢复正确的 IrDelta variant.
 ///
-/// 流式响应的 per-event restore 路径.
+/// 一个 block 的生命周期内 (BlockStart .. BlockStop) delta 类型固定不变,
+/// restorer 每次 push 都更新 last_kind, flush 时按 last_kind 包装返回.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaKind {
+    Text,
+    InputJson,
+}
+
+impl DeltaKind {
+    pub fn to_ir_delta(self, s: String) -> IrDelta {
+        match self {
+            DeltaKind::Text => IrDelta::TextDelta(s),
+            DeltaKind::InputJson => IrDelta::InputJsonDelta(s),
+        }
+    }
+}
+
+/// Sliding-window mock→real restorer for streaming [`IrStreamEvent`]s.
 ///
-/// # 处理的事件类型
-/// - `BlockDelta { TextDelta(s) }`: 完整 redact (核心场景).
-/// - `BlockDelta { InputJsonDelta(s) }`: **跳过 + warn** (MVP). 跨 chunk secret 会泄漏.
-///   TODO: 用 sliding window 缓冲尾部 N 字节解决.
-/// - `MessageDelta { stop_sequence, .. }`: restore (与 `restore_ir_response` 行为一致).
-/// - `MessageStart` / `BlockStart` / `BlockStop` / `MessageStop`:
-///   不含 secret-carrying 字段, no-op.
-/// - `Error(s)`: error message 一般不含 secret, 但保守起见仍 restore.
-pub fn restore_ir_stream_event(ev: &mut IrStreamEvent, map: &RedactionMap) {
-    if map.is_empty() {
+/// # 为什么需要 sliding window
+///
+/// 流式响应里 mock (如 `sgm_ABC123`) 可能跨多个 chunk:
+/// ```text
+/// event 1 TextDelta: "the secret is sgm_AB"
+/// event 2 TextDelta: "C123 end"
+/// ```
+/// 单 event 不含完整 mock, 直接 [`restore_str_inplace`] 找不到匹配.
+/// [`StreamingRestorer`] 在尾部缓冲一定字节, 凑齐完整 mock 再 emit, 保证 round-trip identity.
+///
+/// # 算法
+///
+/// 1. push(content) → 与当前 buffer 拼接.
+/// 2. 在 combined 中扫描所有 mock, 取最大 `mock_end_byte_offset`.
+/// 3. `safe_end = max(mock_end_max, combined.len().saturating_sub(hold))`,
+///    `hold = max_mock_len - 1` (防御 mock 跨 chunk).
+/// 4. emit `combined[..safe_end]` (restore 后); 保留 `combined[safe_end..]` 进 buffer.
+/// 5. [`Self::flush`] 在流/Block 结束时清空 buffer, 对剩余部分做 best-effort restore.
+///
+/// # Invariant
+///
+/// - `buffer.len() ≤ hold + 3` (push 后必然 trim; +3 是 UTF-8 char boundary 回退上限).
+/// - `max_mock_len` 在构造时锁定 (proxy.rs 保证 redact snapshot 期间 RedactionMap 不变).
+/// - 一个 restorer 对应单个 block index, 期间 delta kind 不变 (text 或 input_json 二选一).
+///
+/// # Scope / Out of scope
+///
+/// - 处理 [`IrDelta::TextDelta`] 和 [`IrDelta::InputJsonDelta`] (内容字节流).
+/// - 不处理 [`IrStreamEvent::MessageDelta::stop_sequence`] / [`IrStreamEvent::Error`]
+///   (单 event 完整, 直接 [`restore_str_inplace`]).
+#[derive(Debug)]
+pub struct StreamingRestorer {
+    map: RedactionMap,
+    /// 尾部 hold 字节数 = max_mock_len - 1 (防御跨 chunk mock).
+    hold: usize,
+    /// 当前未 emit 的尾部 buffer.
+    buffer: String,
+    /// 最后一次 push 的 delta 类型. flush 时按此类型包装返回.
+    /// 默认 Text (一个 block 的第一个 push 之前不会有 flush).
+    last_kind: DeltaKind,
+}
+
+impl StreamingRestorer {
+    /// 构造. `map` 为空时所有 push 直接透传 (zero overhead).
+    pub fn new(map: RedactionMap) -> Self {
+        let max_mock_len = map.mock_to_real.keys().map(|m| m.len()).max().unwrap_or(0);
+        Self {
+            map,
+            hold: max_mock_len.saturating_sub(1),
+            buffer: String::new(),
+            last_kind: DeltaKind::Text,
+        }
+    }
+
+    /// 喂入一段 content delta (TextDelta / InputJsonDelta 的字符串部分).
+    ///
+    /// 返回可以安全 emit 的部分 (mock 已替换为 real).
+    /// 末尾 hold 字节保留在 buffer 等下一个 chunk 凑齐.
+    pub fn push(&mut self, content: String) -> String {
+        if self.map.is_empty() {
+            return content;
+        }
+        let mut combined = std::mem::take(&mut self.buffer);
+        combined.push_str(&content);
+        let safe_end = self.find_safe_end(&combined);
+        // split_off(safe_end) 把 combined 切成 [...safe_end) + [safe_end...).
+        // self.buffer 持有 tail, combined 持有 head; 避免 clone + truncate.
+        self.buffer = combined.split_off(safe_end);
+        restore_str_inplace(&mut combined, &self.map);
+        combined
+    }
+
+    /// 设置下次 flush 时使用的 delta kind (text / input_json).
+    /// 由 StreamTranslate 在每次 BlockDelta 时同步, 确保 flush 返回正确类型.
+    pub fn set_kind(&mut self, kind: DeltaKind) {
+        self.last_kind = kind;
+    }
+
+    /// Block 结束 (BlockStop) 时调用. 若上游异常未发 BlockStop,
+    /// 由 caller (StreamTranslate) 在 MessageStop / finish() 时主动调用以避免 mock 尾部泄漏.
+    /// 返回 (delta_kind, restored_content).
+    pub fn flush(&mut self) -> (DeltaKind, String) {
+        let kind = self.last_kind;
+        if self.buffer.is_empty() {
+            return (kind, String::new());
+        }
+        let mut remaining = std::mem::take(&mut self.buffer);
+        // buffer 非空蕴含 map 非空 (push 在 map 为空时直接返回 content, 从不写 buffer).
+        restore_str_inplace(&mut remaining, &self.map);
+        (kind, remaining)
+    }
+
+    /// 找出 combined 中可以安全 emit 的末尾 offset.
+    ///
+    /// 规则: max(最后一个 mock 末尾, len - hold).
+    /// 保证 mock 不会跨 emit / buffer 边界.
+    ///
+    /// 特殊: 当 len ≤ hold 时返回 0 (全部 hold), 避免短 chunk 提前 emit mock 前缀.
+    ///
+    /// UTF-8 安全: 返回值必然落在 char boundary 上 (回退到最近的 boundary).
+    /// buffer 不变式从 `≤ hold` 放宽到 `≤ hold + 3` (UTF-8 char 最多 4 字节).
+    fn find_safe_end(&self, combined: &str) -> usize {
+        let len = combined.len();
+        if self.hold == 0 {
+            return len;
+        }
+        if len <= self.hold {
+            return 0;
+        }
+        let mut max_mock_end = 0usize;
+        for mock in self.map.mock_to_real.keys() {
+            if mock.len() > len {
+                continue;
+            }
+            let mut start = 0usize;
+            while let Some(off) = combined[start..].find(mock) {
+                let abs = start + off;
+                let end = abs + mock.len();
+                if end > max_mock_end {
+                    max_mock_end = end;
+                }
+                start = abs + 1;
+            }
+        }
+        let safe_end_lower_by_hold = len - self.hold;
+        let mut safe_end = std::cmp::max(max_mock_end, safe_end_lower_by_hold);
+        // 回退到最近的 char boundary (mock 全是 ASCII, mock_end 必然在 boundary 上;
+        // len - hold 可能在多字节 char 中间, 回退最多 3 字节).
+        while safe_end > 0 && !combined.is_char_boundary(safe_end) {
+            safe_end -= 1;
+        }
+        safe_end
+    }
+}
+
+/// [`restore_str`] 的纯函数版本 (in-place), 复用同一段 find-and-replace 逻辑.
+pub(crate) fn restore_str_inplace(s: &mut String, map: &RedactionMap) {
+    if map.is_empty() || s.is_empty() {
         return;
     }
-    match ev {
-        IrStreamEvent::BlockDelta {
-            delta: IrDelta::TextDelta(s),
-            ..
-        } => restore_str(s, map),
-        IrStreamEvent::BlockDelta {
-            delta: IrDelta::InputJsonDelta(_),
-            ..
-        } => {
-            // MVP: 跳过. 见模块 doc 中的 TODO.
+    for (mock, real) in &map.mock_to_real {
+        if s.contains(mock) {
+            *s = s.replace(mock, real);
         }
-        IrStreamEvent::MessageDelta {
-            stop_sequence: Some(s),
-            ..
-        } => restore_str(s, map),
-        IrStreamEvent::Error(msg) => restore_str(msg, map),
-        _ => {}
     }
 }
 
@@ -468,14 +606,7 @@ fn replace_in_place(s: &mut String, from: &str, to: &str) {
 
 /// 在 s 中把所有 mock 替换为 real (反向 redact).
 fn restore_str(s: &mut String, map: &RedactionMap) {
-    if map.is_empty() || s.is_empty() {
-        return;
-    }
-    for (mock, real) in &map.mock_to_real {
-        if s.contains(mock) {
-            *s = s.replace(mock, real);
-        }
-    }
+    restore_str_inplace(s, map);
 }
 
 // ─── 测试工具 ──────────────────────────────────────────────────────────────
@@ -524,7 +655,7 @@ fn entry(value: &str) -> SecretEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::ir::{IrDelta, IrMessage, IrResponse, IrRole, IrStreamEvent};
+    use crate::codec::ir::{IrMessage, IrResponse, IrRole};
     use pretty_assertions::assert_eq;
 
     // ─── 契约单元测试 ──────────────────────────────────────────────────────
@@ -805,69 +936,122 @@ mod tests {
         }
     }
 
-    #[test]
-    fn restore_ir_stream_event_handles_text_delta() {
-        let mut ev = IrStreamEvent::BlockDelta {
-            index: 0,
-            delta: IrDelta::TextDelta("chunk sgm_XYZ987 end".to_string()),
-        };
-        let mut map = RedactionMap::default();
-        map.insert("real-token".to_string(), "sgm_XYZ987".to_string());
-        restore_ir_stream_event(&mut ev, &map);
-        match ev {
-            IrStreamEvent::BlockDelta {
-                delta: IrDelta::TextDelta(s),
-                ..
-            } => {
-                assert!(s.contains("real-token"));
-                assert!(!s.contains("sgm_XYZ987"));
-            }
-            _ => panic!("unexpected event"),
-        }
+    // ─── StreamingRestorer ───────────────────────────────────────────────
+
+    use super::StreamingRestorer;
+
+    fn map_with(real: &str, mock: &str) -> RedactionMap {
+        let mut m = RedactionMap::default();
+        m.insert(real.to_string(), mock.to_string());
+        m
     }
 
     #[test]
-    fn restore_ir_stream_event_skips_input_json_delta() {
-        // MVP: InputJsonDelta 不 restore (跨 chunk secret 处理留给 sliding window).
-        let mut ev = IrStreamEvent::BlockDelta {
-            index: 0,
-            delta: IrDelta::InputJsonDelta(r#"{"key":"sgm_XYZ987"}"#.to_string()),
-        };
-        let mut map = RedactionMap::default();
-        map.insert("real-token".to_string(), "sgm_XYZ987".to_string());
-        restore_ir_stream_event(&mut ev, &map);
-        match ev {
-            IrStreamEvent::BlockDelta {
-                delta: IrDelta::InputJsonDelta(s),
-                ..
-            } => {
-                // 没被 restore, 仍含 mock.
-                assert!(s.contains("sgm_XYZ987"));
-            }
-            _ => panic!("unexpected event"),
-        }
+    fn restorer_round_trip_on_single_chunk_with_full_mock() {
+        let mut r = StreamingRestorer::new(map_with("real-secret", "sgm_ABCDEFGHIJK"));
+        let content = "the secret is sgm_ABCDEFGHIJK padding-padding-padding".to_string();
+        let mut emitted = r.push(content.clone());
+        emitted.push_str(&r.flush().1);
+        assert_eq!(emitted, "the secret is real-secret padding-padding-padding");
     }
 
     #[test]
-    fn restore_ir_stream_event_empty_map_is_noop() {
-        let mut ev = IrStreamEvent::BlockDelta {
-            index: 0,
-            delta: IrDelta::TextDelta("hello".to_string()),
-        };
-        let map = RedactionMap::default();
-        restore_ir_stream_event(&mut ev, &map);
-        match ev {
-            IrStreamEvent::BlockDelta {
-                delta: IrDelta::TextDelta(s),
-                ..
-            } => assert_eq!(s, "hello"),
-            _ => panic!("unexpected event"),
-        }
+    fn restorer_round_trip_on_mock_split_across_chunks() {
+        // 核心 contract 的具体落地 (chunk 边界落在 mock 中间).
+        // 详细 byte-offset 推理由 prop_streaming_restorer_round_trip 覆盖所有 chunk_size.
+        let mut r = StreamingRestorer::new(map_with("real-secret", "sgm_ABCDEFGHIJK"));
+        let out1 = r.push("the secret is sgm_AB".to_string());
+        let out2 = r.push("CDEFGHIJK done".to_string());
+        let (_, tail) = r.flush();
+        assert_eq!(out1 + &out2 + &tail, "the secret is real-secret done");
+    }
+
+    #[test]
+    fn restorer_empty_map_is_passthrough() {
+        let mut r = StreamingRestorer::new(RedactionMap::default());
+        let out = r.push("anything".to_string());
+        assert_eq!(out, "anything");
+        let (_, tail) = r.flush();
+        assert_eq!(tail, "");
+    }
+
+    #[test]
+    fn restorer_preserves_delta_kind_on_flush() {
+        // input_json delta 也应正确 restore, flush 时保留 InputJson kind.
+        use super::DeltaKind;
+        let mut r = StreamingRestorer::new(map_with("real-token", "sgm_ABCDEFGHIJK"));
+        r.set_kind(DeltaKind::InputJson);
+        // 喂一段长度 ≤ hold 的不完整 mock, 全部进 buffer, push 返回空.
+        let out = r.push("sgm_A".to_string()); // 5 字节 < hold=14
+        assert!(
+            out.is_empty(),
+            "push should return empty when all held: {out}"
+        );
+        let (kind, tail) = r.flush();
+        // kind 正确包装为 InputJsonDelta.
+        let delta = kind.to_ir_delta(tail.clone());
+        assert!(
+            matches!(delta, crate::codec::ir::IrDelta::InputJsonDelta(_)),
+            "flush should wrap tail as InputJsonDelta"
+        );
+        // flush 时 best-effort restore, 因 mock 不完整, tail 仍含原始 mock 残段.
+        assert!(
+            tail.contains("sgm_A"),
+            "tail should contain raw mock remnant, got: {tail}"
+        );
+    }
+
+    #[test]
+    fn restorer_round_trip_on_multiple_mocks_in_one_chunk() {
+        let mut map = RedactionMap::default();
+        map.insert("r1".to_string(), "sgm_11111111111".to_string());
+        map.insert("r2".to_string(), "sgm_22222222222".to_string());
+        let mut r = StreamingRestorer::new(map);
+        let out = r.push("a sgm_11111111111 b sgm_22222222222 c".to_string());
+        let (_, tail) = r.flush();
+        assert_eq!(out + &tail, "a r1 b r2 c");
+    }
+
+    #[test]
+    fn restorer_caps_buffer_at_hold_when_no_mock_in_chunk() {
+        // 无 mock 时尾部仍 hold (防下个 chunk 携带 mock 前缀).
+        // buffer ≤ hold + 3 (UTF-8 char boundary 回退最多 3 字节, 见 find_safe_end).
+        let mut r = StreamingRestorer::new(map_with("r", "sgm_ABCDEFGHIJK")); // hold = 14
+        let chunk = "hello world, this is a long chunk";
+        let out = r.push(chunk.to_string());
+        let (_, tail) = r.flush();
+        assert_eq!(out + &tail, chunk);
+        assert!(tail.len() <= 14 + 3, "buffer ≤ hold+3: got {}", tail.len());
     }
 
     // ─── property-based 测试 (proptest) ─────────────────────────────────────
-
     use proptest::prelude::*;
+
+    /// 把 full 切成 chunk_size 字节片喂给 r, 返回 emit + flush 拼接结果.
+    /// boundary_align=true 时把 chunk 末尾对齐到 char boundary (UTF-8 测试用).
+    fn push_chunked(
+        r: &mut StreamingRestorer,
+        full: &str,
+        chunk_size: usize,
+        boundary_align: bool,
+    ) -> String {
+        let bytes = full.as_bytes();
+        let mut emitted = String::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            let mut end = (i + chunk_size).min(bytes.len());
+            if boundary_align {
+                while end < bytes.len() && !full.is_char_boundary(end) {
+                    end += 1;
+                }
+            }
+            let piece = std::str::from_utf8(&bytes[i..end]).unwrap().to_string();
+            emitted.push_str(&r.push(piece));
+            i = end;
+        }
+        emitted.push_str(&r.flush().1);
+        emitted
+    }
 
     proptest! {
         /// C3 + C4: 不同 secret 总产生不同 mock.
@@ -1020,6 +1204,72 @@ mod tests {
             let map = redact_ir(&mut ir, &secrets);
             let mocks: HashSet<_> = map.real_to_mock.values().collect();
             prop_assert_eq!(mocks.len(), n);
+        }
+
+        /// StreamingRestorer 核心 contract: 把含 mock 的文本切成任意 chunk_size, 拼接
+        /// emit + flush 必须严格等于 (prefix + real + suffix).
+        #[test]
+        fn prop_streaming_restorer_round_trip(
+            prefix in "[a-z ]{0,50}",
+            suffix in "[a-z ]{0,50}",
+            chunk_size in 1usize..30,
+        ) {
+            let real = "SECRETVALUE";
+            let mock = "sgm_ABCDEFGHIJK"; // 15 字节, 与 real 等价映射
+            let mut map = RedactionMap::default();
+            map.insert(real.to_string(), mock.to_string());
+
+            let full = format!("{prefix}{mock}{suffix}");
+            let mut r = StreamingRestorer::new(map);
+            let emitted = push_chunked(&mut r, &full, chunk_size, false);
+
+            let expected = format!("{prefix}{real}{suffix}");
+            prop_assert_eq!(emitted, expected);
+        }
+
+        /// UTF-8 safety: 多字节字符 (中文 / emoji) 不应在 char boundary 中间被切.
+        /// mock 仍是 ASCII, 但 prefix/suffix 含多字节 UTF-8.
+        #[test]
+        fn prop_streaming_restorer_round_trip_utf8(
+            prefix in "[\\x{4e00}-\\x{9fff}]{0,30}",  // 中文
+            suffix in "[\\x{4e00}-\\x{9fff}]{0,30}",
+            chunk_size in 1usize..=50,
+        ) {
+            let real = "SECRETVALUE";
+            let mock = "sgm_ABCDEFGHIJK";
+            let mut map = RedactionMap::default();
+            map.insert(real.to_string(), mock.to_string());
+
+            let full = format!("{prefix}{mock}{suffix}");
+            let mut r = StreamingRestorer::new(map);
+            let emitted = push_chunked(&mut r, &full, chunk_size, true);
+
+            let expected = format!("{prefix}{real}{suffix}");
+            prop_assert_eq!(emitted, expected);
+        }
+
+        /// Multi-mock 场景: 多个 mock 同时出现在 content 中, 任意 chunk 切分下都正确 round-trip.
+        /// 覆盖 mock self-overlap / nested mock 等边缘情况.
+        #[test]
+        fn prop_streaming_restorer_round_trip_multi_mock(
+            filler in "[a-z ]{0,30}",
+            chunk_size in 1usize..=50,
+        ) {
+            let real1 = "R1";
+            let real2 = "R2";
+            let mock1 = "sgm_11111111111"; // 15 字节
+            let mock2 = "sgm_22222222222";
+            let mut map = RedactionMap::default();
+            map.insert(real1.to_string(), mock1.to_string());
+            map.insert(real2.to_string(), mock2.to_string());
+
+            // full 含两个 mock + filler (可能相邻 / 嵌套 / 被 filler 分隔).
+            let full = format!("{filler}{mock1}{filler}{mock2}{filler}");
+            let mut r = StreamingRestorer::new(map);
+            let emitted = push_chunked(&mut r, &full, chunk_size, false);
+
+            let expected = format!("{filler}{real1}{filler}{real2}{filler}");
+            prop_assert_eq!(emitted, expected);
         }
     }
 }

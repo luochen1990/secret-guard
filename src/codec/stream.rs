@@ -15,6 +15,8 @@
 //! → ingress SSE bytes
 //! ```
 //!
+//! 同协议 + restore 模式下, BlockDelta 经 [`StreamingRestorer`] 处理跨 chunk mock 边界.
+//!
 //! # chunk-boundary
 //!
 //! 一个 SSE 帧 (`event: foo\n\ndata: {...}\n\n`) 可能被 TCP 切成多个 chunk,
@@ -31,7 +33,8 @@ use crate::codec::{
     ir::{IrStreamEvent, StreamDecodeState},
     Protocol, Reader, Writer,
 };
-use crate::redact::{restore_ir_stream_event, RedactionMap};
+use crate::redact::{restore_str_inplace, DeltaKind, RedactionMap, StreamingRestorer};
+use std::collections::HashMap;
 
 /// SSE 流终止符 sentinel (OpenAI 约定).
 pub const SSE_DONE_SENTINEL: &str = "[DONE]";
@@ -51,7 +54,8 @@ pub const MAX_BUF: usize = 16 * 1024 * 1024;
 /// - **跨协议翻译** ([`Self::new`]): ingress != egress, 把 egress SSE 翻译为 ingress SSE.
 ///   不做 redact restore (跨协议时 redact 在请求侧, response 直接翻译).
 /// - **同协议 restore** ([`Self::new_same_proto_restore`]): ingress == egress, SSE 字节
-///   解析为 IR 事件, restore mock→real, 再序列化回 SSE. 用于同协议 + redact + 流式场景.
+///   解析为 IR 事件, 经 [`StreamingRestorer`] 还原 mock→real (sliding window, 跨 chunk 安全),
+///   再序列化回 SSE. 用于同协议 + redact + 流式场景.
 pub struct StreamTranslate {
     ingress_writer: Box<dyn Writer>,
     egress_reader: Box<dyn Reader>,
@@ -69,9 +73,11 @@ pub struct StreamTranslate {
     start_usage: Option<crate::codec::IrUsage>,
     /// MessageStop 后是否再发 MessageDelta (post-stop guard).
     message_stopped: bool,
-    /// 同协议 restore 模式: per-event 调用 restore_ir_stream_event.
-    /// 跨协议模式: None (不做 restore).
+    /// 同协议 restore 模式: per-block sliding window restorer.
+    /// 跨协议模式: `restorers` 空 + `redaction_map` None (不做 restore).
     redaction_map: Option<RedactionMap>,
+    /// 每个 block index 对应一个独立 restorer (block 间 mock 边界互不干扰).
+    restorers: HashMap<usize, StreamingRestorer>,
 }
 
 impl StreamTranslate {
@@ -91,13 +97,15 @@ impl StreamTranslate {
             start_usage: None,
             message_stopped: false,
             redaction_map: None,
+            restorers: HashMap::new(),
         })
     }
 
     /// 构造同协议 + restore 模式翻译器. 用于同协议 + redact + 流式响应场景.
     ///
-    /// 工作流: egress SSE → parse IR events → restore_ir_stream_event → 序列化回 SSE.
-    /// 失去 byte-exact (因为 IR re-serialize), 但语义等价, 同时保留流式 UX.
+    /// 工作流: egress SSE → parse IR events → [`StreamingRestorer`] (跨 chunk restore)
+    /// → 序列化回 SSE. 失去 byte-exact (因为 IR re-serialize), 但语义等价,
+    /// 同时保留流式 UX + 跨 chunk mock restore.
     pub fn new_same_proto_restore(proto: Protocol, map: RedactionMap) -> Self {
         Self {
             ingress_writer: proto.writer(),
@@ -110,6 +118,7 @@ impl StreamTranslate {
             start_usage: None,
             message_stopped: false,
             redaction_map: if map.is_empty() { None } else { Some(map) },
+            restorers: HashMap::new(),
         }
     }
 
@@ -165,8 +174,12 @@ impl StreamTranslate {
     }
 
     /// 流终止. 返回末尾应追加的字节 (如 OpenAI ingress 的 `[DONE]`).
+    ///
+    /// 同时 flush 所有残留 restorers (上游异常未发 BlockStop 时, 某些 block 的 mock 尾部
+    /// 可能还在 buffer 中). flush 出来的内容包装为对应 kind 的 BlockDelta emit.
     pub fn finish(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
+        self.flush_all_restorers(&mut out);
         if self.aborted {
             // 流被异常中止: 发 ingress 协议的原生 error frame.
             let err = IrStreamEvent::Error("stream aborted: buffer overflow".into());
@@ -237,13 +250,98 @@ impl StreamTranslate {
                 self.message_stopped = true;
             }
 
-            // 同协议 restore 模式: per-event 把 mock 替换为 real.
-            // 跨协议模式 redaction_map 为 None, 不做 restore.
-            if let Some(map) = &self.redaction_map {
-                restore_ir_stream_event(&mut ev, map);
+            // 同协议 restore 模式 (redaction_map = Some):
+            //   - BlockStop: 先 flush 该 block 的尾部 buffer, emit 一个同 kind 的 BlockDelta.
+            //   - MessageStop: flush 所有残留 restorers (上游异常漏发 BlockStop 时的兜底).
+            //   - 其它: 走 restore_event_inplace (BlockDelta 内部走 sliding window).
+            // 跨协议模式 (redaction_map = None): 不做 restore, 直接 emit.
+            if self.redaction_map.is_some() {
+                if let IrStreamEvent::BlockStop { index } = &ev {
+                    if let Some(tail_ev) = self.flush_block_as_event(*index) {
+                        self.emit_ir_event(&tail_ev, out);
+                    }
+                }
+                if matches!(ev, IrStreamEvent::MessageStop) {
+                    // 上游异常漏发 BlockStop 时, 所有 restorers 残留 mock tail.
+                    self.flush_all_restorers(out);
+                }
+                self.restore_event_inplace(&mut ev);
+            }
+
+            // BlockDelta 经 restorer.push 后内容可能为空 (全部 hold 在 buffer), 跳过 emit.
+            if let IrStreamEvent::BlockDelta {
+                delta:
+                    crate::codec::ir::IrDelta::TextDelta(s)
+                    | crate::codec::ir::IrDelta::InputJsonDelta(s),
+                ..
+            } = &ev
+            {
+                if s.is_empty() {
+                    continue;
+                }
             }
 
             self.emit_ir_event(&ev, out);
+        }
+    }
+
+    /// 对单个 event 应用 restore 逻辑 (in-place, 不改变 event 类型).
+    /// BlockDelta 内容走 per-index sliding-window restorer.
+    fn restore_event_inplace(&mut self, ev: &mut IrStreamEvent) {
+        let Some(map) = &self.redaction_map else {
+            return;
+        };
+        match ev {
+            IrStreamEvent::BlockDelta { index, delta } => {
+                let (kind, s) = match delta {
+                    crate::codec::ir::IrDelta::TextDelta(s) => (DeltaKind::Text, s),
+                    crate::codec::ir::IrDelta::InputJsonDelta(s) => (DeltaKind::InputJson, s),
+                };
+                let restorer = self
+                    .restorers
+                    .entry(*index)
+                    .or_insert_with(|| StreamingRestorer::new(map.clone()));
+                restorer.set_kind(kind);
+                *s = restorer.push(std::mem::take(s));
+            }
+            IrStreamEvent::MessageDelta {
+                stop_sequence: Some(s),
+                ..
+            } => restore_str_inplace(s, map),
+            IrStreamEvent::Error(msg) => restore_str_inplace(msg, map),
+            _ => {}
+        }
+    }
+
+    /// BlockStop 时取出该 block 的 restorer 并 flush, 包装成一个 BlockDelta event.
+    /// 若 buffer 为空则返回 None.
+    fn flush_block_as_event(&mut self, index: usize) -> Option<IrStreamEvent> {
+        let mut restorer = self.restorers.remove(&index)?;
+        let (kind, tail) = restorer.flush();
+        if tail.is_empty() {
+            return None;
+        }
+        Some(IrStreamEvent::BlockDelta {
+            index,
+            delta: kind.to_ir_delta(tail),
+        })
+    }
+
+    /// flush 所有残留 restorers (MessageStop / finish 兜底).
+    ///
+    /// 按 block index 升序 emit, 避免违反客户端对 delta 时序的隐含假设
+    /// (eg OpenAI tool_call arguments partial JSON parser 假设按 index 顺序到达).
+    /// 触发场景: 上游异常漏发 BlockStop 时, 多个 block 同时残留 mock tail.
+    ///
+    /// **注意**: 此路径产生的 BlockDelta 在 Anthropic ingress 下可能缺少配对的
+    /// content_block_start/stop (上游异常时). 客户端通常宽容处理, 但严格来说是协议违例.
+    fn flush_all_restorers(&mut self, out: &mut Vec<u8>) {
+        let mut indices: Vec<_> = self.restorers.keys().copied().collect();
+        indices.sort_unstable();
+        for index in indices {
+            if let Some(tail_ev) = self.flush_block_as_event(index) {
+                self.emit_ir_event(&tail_ev, out);
+            }
         }
     }
 
@@ -574,7 +672,6 @@ mod tests {
         let events = reader.read_response_events("message_start", &data, &mut state);
         assert_eq!(events.len(), 1);
     }
-
     // ─── post-stop guard: usage 透传 / 重复 stop 抑制 ──────────────────
 
     #[test]
@@ -632,5 +729,56 @@ mod tests {
         // 客户端应该只看到一个 message_stop frame.
         let count = s.matches("event: message_stop").count();
         assert_eq!(count, 1, "duplicate message_stop must be dropped; got: {s}");
+    }
+
+    // ─── sliding window restore end-to-end ──────────────────────────────
+
+    #[test]
+    fn same_proto_restore_handles_mock_split_across_chunks() {
+        // 完整 mock 被切到两个 SSE chunk, sliding window 应正确 restore.
+        // 场景: LLM 在响应里 echo 了 mock, 但 mock 字符串恰好跨 TCP chunk 边界.
+        let real = "sk-real-test-12345";
+        let mock = crate::redact::mock_with_salt(real, 0);
+        // mock 在 content 中是连续的, 但被 chunk 边界切到中间.
+        // chunk1: "X" + mock 前半; chunk2: mock 后半 + "Y".
+        let mock_split = mock.len() / 2;
+        let chunk1_content = format!("X{}", &mock[..mock_split]);
+        let chunk2_content = format!("{}Y", &mock[mock_split..]);
+
+        let mut map = crate::redact::RedactionMap::default();
+        map.insert(real.to_string(), mock.clone());
+        let mut t = StreamTranslate::new_same_proto_restore(Protocol::OpenAI, map);
+
+        let sse1 = format!(
+            r#"data: {{"id":"x","created":0,"model":"gpt-4o","choices":[{{"index":0,"delta":{{"content":"{chunk1_content}"}},"finish_reason":null}}]}}
+
+"#,
+        );
+        let sse2 = format!(
+            r#"data: {{"id":"x","created":0,"model":"gpt-4o","choices":[{{"index":0,"delta":{{"content":"{chunk2_content}"}},"finish_reason":null}}]}}
+
+"#,
+        );
+        let sse_done = b"data: {\"id\":\"x\",\"created\":0,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+        let done = b"data: [DONE]\n\n";
+
+        let out1 = t.feed(sse1.as_bytes());
+        let out2 = t.feed(sse2.as_bytes());
+        let _ = t.feed(sse_done);
+        let _ = t.feed(done);
+        let finish = t.finish();
+
+        let combined_bytes = [out1, out2, finish].concat();
+        let combined = String::from_utf8_lossy(&combined_bytes);
+        eprintln!("mock = {mock:?} (len {})", mock.len());
+        eprintln!("combined client output:\n{combined}");
+        assert!(
+            combined.contains(real),
+            "client should see real_secret restored: got {combined:?}"
+        );
+        assert!(
+            !combined.contains(&mock),
+            "client should NOT see mock {mock}: got {combined:?}"
+        );
     }
 }

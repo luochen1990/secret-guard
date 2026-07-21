@@ -61,7 +61,7 @@ src/
 ├── secrets.rs     # SecretEntry / SecretCategory + DynamicEntry impl + EffectiveSecret + mask_value
 ├── record.rs      # ForwardRecord / RecordStore / ResponseUpdate
 ├── redact.rs      # mock_with_salt + RedactionMap + redact_ir + restore_ir_response
-│                  # + restore_ir_stream_event (流式 per-event restore)
+│                  # + StreamingRestorer (流式 sliding-window restore, per-block 独立)
 │                  # + IR traverse helpers (block_contains / value_replace_all 等)
 ├── codec/         # 跨协议 codec (OpenAI ⇄ Anthropic, 借鉴 Busbar IR 设计)
 │   ├── mod.rs     # Protocol enum + Reader/Writer trait + 共享 helpers
@@ -164,7 +164,7 @@ PATCH  /__sg/api/providers/{id}/decision
 redact 已升级为 **IR 变换** (基于 `src/codec/ir`), 与 codec 同层. 三个核心 API:
 - `redact_ir(&mut IrRequest, secrets) -> RedactionMap`: 扫描 IR 所有字符串字段, 把 secret 替换为 mock.
 - `restore_ir_response(&mut IrResponse, map)`: 非流式响应 restore.
-- `restore_ir_stream_event(&mut IrStreamEvent, map)`: 流式 per-event restore (跳过 InputJsonDelta, MVP 限制).
+- `StreamingRestorer::push/flush`: 流式响应 sliding-window restore (跨 chunk mock 边界安全, per-block 独立状态, UTF-8 char boundary 安全).
 
 **dispatch 路径选择** (`proxy.rs::dispatch`):
 - **同协议 + 无 redact** (SecretTable 空): `same_proto_passthrough` 字节透传 (零回归, 最热路径).
@@ -377,14 +377,13 @@ client = Anthropic(
 - DELETE dynamic override 后回到 static 基线
 - POST 与 static id 冲突返回 409
 - PATCH .../decision 对 dynamic-only id 返回 404
+- 同协议 + redact + 流式: 跨 SSE chunk 的 mock 也被 sliding-window restore
+- 同协议 + redact + 流式 + tool_use: InputJsonDelta 中的 mock 被 restore
 
 ## 已知限制 (MVP)
 
 - **跨协议 + 流式响应**: OpenAI ⇄ Anthropic 跨协议时, `stream=true` 返回 501
   (流式跨协议翻译尚未接入 dispatch; StreamTranslate 已实现但未集成).
-- **流式 tool_use input_json_delta 的 redact**: 流式响应中的 `IrDelta::InputJsonDelta`
-  (tool 调用参数片段) **不 restore** — 跨 chunk secret 会泄漏给客户端 (看到 mock 而非 real).
-  未来用 sliding window 缓冲尾部 N 字节解决. 见 `src/redact.rs` 文件头 TODO.
 - **C5 是概率性契约**: `mock_with_salt` 极大概率不含 real_secret ≥4 字符子串 (碰撞概率 ≈ 2^-32).
   全 base62 字母的 secret 风险更高, `proptest-regressions/redact.txt` 记录历史失败种子.
 - **同协议 + redact 失去 byte-exact**: reader → redact_ir → writer 重序列化, 字段顺序 / 空字符串
@@ -414,13 +413,11 @@ client = Anthropic(
   含 chunk-boundary 处理 + tool_calls/index 状态合成 + 同协议 restore 模式),
   但跨协议路径尚未接入 dispatch. 需要在 `cross_proto_forward` 检测 stream=true 时,
   接入 `StreamTranslate::new(ingress, egress)` 而非返回 501.
-- **流式 InputJsonDelta 的 sliding window restore**: 流式 tool 调用参数片段跨 chunk 时
-  secret 会泄漏给客户端 (看到 mock). 用 sliding window 缓冲尾部 N 字节解决.
-  见 `src/redact.rs` 文件头 TODO.
 - **更多协议**: Gemini / Ollama / Bedrock / Cohere / OpenAI Responses API.
   新增协议只需实现 Reader + Writer trait (~200 行), 不动 dispatch.
-- **redact 性能优化**: `redact_ir` 当前对每个 secret 都 traverse IR (K * n 复杂度).
-  高 secret 数 + 大 IR 场景可能成为热点. 长期用 Aho-Corasick (多模式匹配) 一次性扫所有 mock.
+- **redact 性能优化**: `redact_ir` 与 `StreamingRestorer::find_safe_end` 都对每个 secret
+  做全字符串扫描 (K * n 复杂度). 高 secret 数 + 大 IR / chunk 场景可能成为热点.
+  长期用 Aho-Corasick (多模式匹配) 一次性扫所有 mock.
 - **redact 测试基线**: 加 criterion bench 测典型场景 (10 secrets × 10KB IR, 100 × 100KB),
   留作回归基线.
 - mock_secret 的 category-aware 生成 (Password/ApiKey/Cookie 等格式感知).

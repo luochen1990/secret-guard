@@ -220,16 +220,9 @@ async fn same_proto_forward(
         .read_request(&req_body)
         .map_err(|e| AppError::BadBody(format!("{ingress} request parse failed: {}", e.message)))?;
 
-    // 3. MVP 限制: 流式 + redact 在 InputJsonDelta 上不 restore (跨 chunk secret 处理).
-    //    这里不阻断请求, 但若检测到流式 + redact + tools 同时存在, log warn.
-    if ir.stream && !ir.tools.is_empty() {
-        warn!(
-            "streaming + redact + tools: tool_use input_json_delta will NOT be redacted \
-             (cross-chunk secret leakage possible); see redact.rs TODO"
-        );
-    }
-
-    // 4. redact IR.
+    // 3. redact IR.
+    //    流式响应里的 TextDelta / InputJsonDelta 都会经 StreamingRestorer 做 sliding-window
+    //    restore (在 StreamTranslate::new_same_proto_restore 中), 不再需要 warn.
     let redaction_map = redact_ir(&mut ir, &secrets_snapshot);
     if !redaction_map.is_empty() {
         debug!(
@@ -238,13 +231,13 @@ async fn same_proto_forward(
         );
     }
 
-    // 5. IR → 请求 body (同协议 writer 重序列化).
+    // 4. IR → 请求 body (同协议 writer 重序列化).
     let new_body = writer.write_request(&ir);
     let req_bytes_to_send = serde_json::to_vec(&new_body)
         .map_err(|e| AppError::Internal(format!("serialize redacted body failed: {e}")))?;
     let req_text_for_record = utf8_view(&req_bytes_to_send);
 
-    // 6. 构造上游 URL.
+    // 5. 构造上游 URL.
     let query = parts
         .uri
         .query()
@@ -252,13 +245,13 @@ async fn same_proto_forward(
         .unwrap_or_default();
     let upstream_url = build_upstream_url(&provider.base_url, &format!("{}{query}", fp.rest));
 
-    // 7. 复制请求 headers + 应用 auth. 删除客户端的 content-type/length (重新计算).
+    // 6. 复制请求 headers + 应用 auth. 删除客户端的 content-type/length (重新计算).
     let mut fwd_headers = sanitize_request_headers(&parts.headers);
     fwd_headers.remove(axum::http::header::CONTENT_TYPE);
     fwd_headers.remove(axum::http::header::CONTENT_LENGTH);
     apply_provider_auth(&mut fwd_headers, &provider.effective_api_key(), ingress);
 
-    // 8. 记录请求快照 (LLM 视角的改写后版本).
+    // 7. 记录请求快照 (LLM 视角的改写后版本).
     let path_for_record = format!(
         "/{}/{}/{}",
         fp.proto,
@@ -275,7 +268,7 @@ async fn same_proto_forward(
 
     debug!(%record_id, method = %parts.method, url = %upstream_url, "forwarding redacted same-proto request");
 
-    // 9. 发送到上游.
+    // 8. 发送到上游.
     let upstream_resp = match state
         .upstream
         .request(parts.method, &upstream_url)
@@ -299,7 +292,7 @@ async fn same_proto_forward(
         }
     };
 
-    // 10. 收集响应元数据.
+    // 9. 收集响应元数据.
     let resp_status = upstream_resp.status();
     let resp_headers = upstream_resp.headers().clone();
     let content_type = resp_headers
@@ -311,7 +304,7 @@ async fn same_proto_forward(
 
     debug!(%record_id, status = %resp_status, streamed, "upstream responded");
 
-    // 11. 响应处理:
+    // 10. 响应处理:
     //     - 流式 + redact: StreamTranslate 同协议模式, per-event restore (恢复流式 UX).
     //     - 非流式 + redact: buffered + restore_ir_response.
     if streamed && resp_status.is_success() {
@@ -507,7 +500,7 @@ fn apply_provider_auth(headers: &mut HeaderMap, api_key: &str, ingress: Protocol
 /// - **强制非流式**: 上游 stream=false (即便客户端请求 stream=true). 客户端若 stream=true,
 ///   目前返回 501 (`streaming cross-protocol not yet supported`).
 /// - **应用 redact**: 跨协议 + redact 通过 [`redact_ir`] 在 IR 层做替换,
-///   不会与 codec 翻译冲突. 流式响应中 TextDelta 会 restore, InputJsonDelta 跳过.
+///   不会与 codec 翻译冲突. 跨协议路径响应直接翻译 (无 restore, mock 不在响应中出现).
 /// - 上游错误响应 (4xx/5xx) 也通过 codec 翻译为 ingress 协议的原生错误 envelope.
 #[allow(clippy::too_many_arguments)]
 async fn cross_proto_forward(

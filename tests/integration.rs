@@ -883,6 +883,187 @@ async fn same_proto_streaming_with_redact_preserves_include_usage_chunk() {
 }
 
 #[tokio::test]
+async fn streaming_redact_restores_mock_split_across_sse_chunks() {
+    // 跨 SSE chunk 的 mock 也应被 sliding-window restore.
+    // 场景: LLM 在响应里 echo 出 mock, mock 恰好被 TCP 切到两个 chunk 中间.
+    let real_secret = "sk-test-123";
+    let expected_mock = secret_guard::redact::mock_with_salt(real_secret, 0);
+    let mut upstream = spawn_mock_upstream().await;
+    // 把 mock 切成连续两半 (mock 本身在文本中是连续的, 只是跨了 chunk 边界):
+    //   chunk1 content = "leaked " + mock[..8]
+    //   chunk2 content = mock[8..] + " end"
+    let split = 8;
+    let mock_prefix = &expected_mock[..split];
+    let mock_suffix = &expected_mock[split..];
+    let sse_body = format!(
+        concat!(
+            "data: {{\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-4o\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\"}},\"finish_reason\":null}}]}}\n\n",
+            "data: {{\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-4o\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"leaked {mp}\"}},\"finish_reason\":null}}]}}\n\n",
+            "data: {{\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-4o\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{ms} end\"}},\"finish_reason\":null}}]}}\n\n",
+            "data: {{\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-4o\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":3,\"completion_tokens\":1,\"total_tokens\":4}}}}\n\n",
+            "data: [DONE]\n\n",
+        ),
+        mp = mock_prefix,
+        ms = mock_suffix,
+    );
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse_body)
+        .create_async()
+        .await;
+    let entries = vec![secret("api-key", real_secret)];
+    let secrets = test_secret_table_with(entries);
+    let upstream_client = reqwest::Client::new();
+    let records = RecordStore::new(64);
+    let provider = openai_provider("oa-main", &upstream.url());
+    let proxy_url = spawn_proxy_full(vec![provider], upstream_client, records, secrets).await;
+
+    let body = format!(
+        r#"{{"model":"gpt-4o","stream":true,"messages":[{{"role":"user","content":"use {real_secret} now"}}]}}"#
+    );
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/o/oa-main/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let text = resp.text().await.unwrap();
+    // 客户端应该看到完整的 real_secret (跨 chunk mock 被 sliding-window restore).
+    assert!(
+        text.contains(real_secret),
+        "client should see real_secret restored from cross-chunk mock; got: {text}"
+    );
+    // 客户端不应看到任何 mock 残段.
+    assert!(
+        !text.contains(mock_prefix),
+        "client should NOT see mock prefix {mock_prefix}; got: {text}"
+    );
+    assert!(
+        !text.contains(mock_suffix),
+        "client should NOT see mock suffix {mock_suffix}; got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn streaming_redact_restores_input_json_delta_in_tool_use() {
+    // 流式 tool_use 的 InputJsonDelta 中含 mock 也应被 restore.
+    // 上游 SSE 流里 arguments delta 含 mock, 客户端最终拼接应看到 real_secret.
+    let real_secret = "sk-test-123";
+    let expected_mock = secret_guard::redact::mock_with_salt(real_secret, 0);
+    let mut upstream = spawn_mock_upstream().await;
+    let sse_body = format!(
+        concat!(
+            // 第 1 chunk: assistant role + tool_call 开始.
+            "data: {{\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-4o\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"tool_calls\":[{{\"index\":0,\"id\":\"call_x\",\"type\":\"function\",\"function\":{{\"name\":\"run\",\"arguments\":\"\"}}}}]}},\"finish_reason\":null}}]}}\n\n",
+            // 第 2 chunk: arguments delta 含完整 mock.
+            "data: {{\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-4o\",\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"function\":{{\"arguments\":\"{{\\\"cmd\\\":\\\"echo {mock}\\\"}}\"}}}}]}},\"finish_reason\":null}}]}}\n\n",
+            // 第 3 chunk: finish.
+            "data: {{\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-4o\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}],\"usage\":{{\"prompt_tokens\":3,\"completion_tokens\":1,\"total_tokens\":4}}}}\n\n",
+            "data: [DONE]\n\n",
+        ),
+        mock = expected_mock,
+    );
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse_body)
+        .create_async()
+        .await;
+    let entries = vec![secret("api-key", real_secret)];
+    let secrets = test_secret_table_with(entries);
+    let upstream_client = reqwest::Client::new();
+    let records = RecordStore::new(64);
+    let provider = openai_provider("oa-main", &upstream.url());
+    let proxy_url = spawn_proxy_full(vec![provider], upstream_client, records, secrets).await;
+
+    let body = format!(
+        r#"{{"model":"gpt-4o","stream":true,"tools":[{{"type":"function","function":{{"name":"run","description":"x","parameters":{{"type":"object","properties":{{"cmd":{{"type":"string"}}}}}}}}}}],"messages":[{{"role":"user","content":"use {real_secret}"}}]}}"#
+    );
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/o/oa-main/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "status mismatch, body: {text}"
+    );
+    // 客户端应看到 real_secret 在 tool_call arguments 中.
+    assert!(
+        text.contains(real_secret),
+        "client should see real_secret in tool args; got: {text}"
+    );
+    assert!(
+        !text.contains(&expected_mock),
+        "client should NOT see mock in tool args; got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn streaming_redact_restores_when_upstream_skips_block_stop() {
+    // 上游协议异常: 漏发 content_block_stop / finish_reason chunk, 直接发 message_stop / [DONE].
+    // StreamTranslate 应在 MessageStop 时 flush_all_restorers, 把残留 mock tail 还原为 real.
+    let real_secret = "sk-test-123";
+    let expected_mock = secret_guard::redact::mock_with_salt(real_secret, 0);
+    let mut upstream = spawn_mock_upstream().await;
+    // 上游 SSE: 只发 role + 一个 content + message_stop, 没发 content_block_stop.
+    // OpenAI 风格: content chunk 后直接 data: [DONE], 跳过 finish_reason chunk.
+    let sse_body = format!(
+        concat!(
+            "data: {{\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-4o\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\"}},\"finish_reason\":null}}]}}\n\n",
+            "data: {{\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-4o\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"leaked {mock}\"}},\"finish_reason\":null}}]}}\n\n",
+            "data: [DONE]\n\n",
+        ),
+        mock = expected_mock,
+    );
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse_body)
+        .create_async()
+        .await;
+    let entries = vec![secret("api-key", real_secret)];
+    let secrets = test_secret_table_with(entries);
+    let upstream_client = reqwest::Client::new();
+    let records = RecordStore::new(64);
+    let provider = openai_provider("oa-main", &upstream.url());
+    let proxy_url = spawn_proxy_full(vec![provider], upstream_client, records, secrets).await;
+
+    let body = format!(
+        r#"{{"model":"gpt-4o","stream":true,"messages":[{{"role":"user","content":"use {real_secret}"}}]}}"#
+    );
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/o/oa-main/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let text = resp.text().await.unwrap();
+    // 即使上游漏发 finish_reason / BlockStop, 客户端也应看到 real_secret.
+    assert!(
+        text.contains(real_secret),
+        "client should see real_secret via finish() flush; got: {text}"
+    );
+    assert!(
+        !text.contains(&expected_mock),
+        "client should NOT see mock; got: {text}"
+    );
+}
+
+#[tokio::test]
 async fn cross_protocol_with_redact_round_trips_through_ir_translation() {
     // 跨协议 + redact + restore: 客户端发 OpenAI (含 secret) → codec 翻译为 Anthropic
     // (含 mock) → 上游响应含 mock → codec 翻译回 OpenAI + restore mock 为 real_secret.
