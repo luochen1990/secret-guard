@@ -401,6 +401,7 @@
       white-space: pre-wrap;
       font-size: 12.5px;
       line-height: 1.5;
+      position: relative;
     }
     .chat-bubble .bubble-role {
       display: block;
@@ -414,6 +415,38 @@
     .bubble-assistant  { background: #f0f0f0; margin-right: auto; }
     .bubble-system     { background: #fff8e0; margin: 0 auto 8px auto; max-width: 100%; border: 1px dashed #ec5; }
     .bubble-tool       { background: #f5f5f5; margin-right: auto; font-family: ui-monospace, monospace; font-size: 11.5px; }
+
+    /* collapsible bubbles: 默认折叠到 3 行, 超过部分溢出隐藏 + 渐隐 + 展开/收起按钮.
+       JS 在渲染后用 scrollHeight > clientHeight 判断是否需要折叠 (内容 ≤3 行不折叠). */
+    .chat-bubble.collapsed {
+      max-height: 4.5em;       /* 3 行 × line-height 1.5 */
+      overflow: hidden;
+    }
+    .chat-bubble.collapsed::after {
+      /* 渐隐遮罩, 提示 "下面还有内容". 覆盖在折叠气泡底部. */
+      content: '';
+      position: absolute;
+      left: 0; right: 0; bottom: 0;
+      height: 1.5em;
+      background: linear-gradient(transparent, currentColor);
+      pointer-events: none;
+      opacity: 0.08;
+    }
+    .bubble-toggle {
+      display: block;
+      margin-top: 4px;
+      font-size: 11px;
+      color: #4a6fa5;
+      cursor: pointer;
+      user-select: none;
+      border: none;
+      background: transparent;
+      padding: 0;
+      text-decoration: underline;
+      text-underline-offset: 2px;
+    }
+    /* 折叠态下隐藏 toggle 之外的内容 (渐隐遮罩压在 toggle 上), toggle 提到气泡底部之上.
+       展开 style: bubble.collapsed class 被移除, max-height 回到 none. */
 
     /* mock highlight: 标记命中的 redact mock 字符串 */
     mark.secret-hit {
@@ -991,6 +1024,7 @@
       }
       html += `</div>`;
       el.innerHTML = html;
+      applyBubbleCollapse();
     }
 
     // F5: 把 parsed_request (OpenAI / Anthropic canonical chat JSON) 渲染为 chat bubbles.
@@ -1077,6 +1111,35 @@
         <span class="bubble-role">${escapeHtml(roleDisplay)}</span>
         ${safeText}
       </div>`;
+    }
+
+    // 折叠超过 3 行的气泡: 渲染后检测 scrollHeight > clientHeight, 若溢出则
+    // 加 .collapsed + 注入 "展开/收起" 按钮. 点击 toggle 仅切换 class, 不重新渲染,
+    // 保留滚动位置与 mock 高亮状态.
+    function applyBubbleCollapse() {
+      const bubbles = document.querySelectorAll('#detail .chat-bubble');
+      bubbles.forEach(bubble => {
+        // 已处理过 (切换详情/重渲染时跳过).
+        if (bubble.dataset.collapseReady === '1') return;
+        // 先临时移除可能存在的 collapsed 以测量真实高度.
+        bubble.classList.remove('collapsed');
+        const overflowed = bubble.scrollHeight - bubble.clientHeight > 2;
+        if (!overflowed) {
+          bubble.dataset.collapseReady = '1';
+          return;
+        }
+        bubble.classList.add('collapsed');
+        const toggle = document.createElement('button');
+        toggle.className = 'bubble-toggle';
+        toggle.type = 'button';
+        toggle.textContent = 'expand ▾';
+        toggle.addEventListener('click', () => {
+          const collapsed = bubble.classList.toggle('collapsed');
+          toggle.textContent = collapsed ? 'expand ▾' : 'collapse ▴';
+        });
+        bubble.appendChild(toggle);
+        bubble.dataset.collapseReady = '1';
+      });
     }
 
     function bubbleClassForRole(role) {
