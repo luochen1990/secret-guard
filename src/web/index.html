@@ -474,13 +474,14 @@
               <th>Category</th>
               <th>Value (masked)</th>
               <th>Length</th>
+              <th>Mock Strategy</th>
               <th>Source</th>
               <th>Decision</th>
               <th class="actions">Actions</th>
             </tr>
           </thead>
           <tbody id="secrets-body">
-            <tr><td colspan="8" class="empty">No secrets configured</td></tr>
+            <tr><td colspan="9" class="empty">No secrets configured</td></tr>
           </tbody>
         </table>
       </div>
@@ -526,6 +527,46 @@
       <select id="f-category"></select>
       <label for="f-value">Value</label>
       <textarea id="f-value" placeholder="the real secret"></textarea>
+
+      <fieldset style="grid-column: 1 / -1; border: 1px solid #ddd; padding: 8px; margin: 4px 0;">
+        <legend>Mock Strategy</legend>
+        <div style="display: grid; grid-template-columns: auto 1fr; gap: 6px 10px; align-items: center;">
+          <label>Initial</label>
+          <div>
+            <label style="margin-right: 12px;"><input type="radio" name="f-ms-initial" value="auto" checked>Auto (generate)</label>
+            <label><input type="radio" name="f-ms-initial" value="fixed">Fixed:</label>
+            <input type="text" id="f-ms-fixed" placeholder="custom mock value" style="width: 60%; margin-left: 4px;">
+            <button type="button" class="btn" id="f-ms-generate" title="Generate a candidate from the gen spec below" style="margin-left: 4px;">Generate</button>
+          </div>
+
+          <label>Sticky</label>
+          <div>
+            <input type="checkbox" id="f-ms-sticky" checked>
+            <span class="hint" style="display: inline; margin-left: 4px;">candidate sequence stable (cache-friendly)</span>
+          </div>
+
+          <label>Prefix</label>
+          <input type="text" id="f-ms-prefix" placeholder="(empty = no prefix)">
+
+          <label>Charset</label>
+          <div>
+            <label style="margin-right: 8px;"><input type="checkbox" class="f-ms-charset" data-charclass="digits"> 0-9</label>
+            <label style="margin-right: 8px;"><input type="checkbox" class="f-ms-charset" data-charclass="lowercase"> a-z</label>
+            <label style="margin-right: 8px;"><input type="checkbox" class="f-ms-charset" data-charclass="uppercase"> A-Z</label>
+            <label style="margin-right: 8px;"><input type="checkbox" class="f-ms-charset" data-charclass="underscore"> _</label>
+            <label style="margin-right: 8px;"><input type="checkbox" class="f-ms-charset" data-charclass="hyphen"> -</label>
+            <label>other: <input type="text" id="f-ms-other" placeholder="!@#$" style="width: 80px;"></label>
+          </div>
+
+          <label>Length</label>
+          <div>
+            min <input type="number" id="f-ms-lenmin" min="1" style="width: 70px;">
+            max <input type="number" id="f-ms-lenmax" min="1" style="width: 70px;">
+            <button type="button" class="btn" id="f-ms-infer" title="Infer charset/length from the real value (if known)" style="margin-left: 4px;">Infer from value</button>
+          </div>
+        </div>
+      </fieldset>
+
       <div class="actions">
         <button class="btn" value="cancel">Cancel</button>
         <button class="btn" value="save" id="f-save">Save</button>
@@ -1128,7 +1169,7 @@
         statsId: 'secrets-stats',
         formDlgId: 'secret-form',
         formElId: 'secret-form-el',
-        colspan: 8,
+        colspan: 9,
         emptyText: 'No secrets configured',
         kindParam: 'secret', // decision endpoint URL 用
         refresh: () => refreshSecrets(),
@@ -1251,11 +1292,46 @@
           <td class="cell-short"><span class="pill ${escapeHtml(s.category)}">${escapeHtml(s.category)}</span></td>
           <td class="cell-long" title="${escapeHtml(s.value_masked || '')}"><span class="cell-ellipsis"><code>${escapeHtml(s.value_masked)}</code></span></td>
           <td class="cell-short">${escapeHtml(s.value_length)}</td>
+          <td class="cell-short" title="${escapeHtml(mockStrategyTooltip(s.mock_strategy))}"><span class="cell-ellipsis">${mockStrategyBadge(s.mock_strategy)}</span></td>
           <td>${srcBadge(s.source)}</td>
           <td>${decisionCell('secret', s.id, s.decision, !!s.static_version)}</td>
           <td class="actions">${rowActions(s)}</td>
         </tr>
       `;
+    }
+
+    // ─── mock strategy 渲染 (摘要 + tooltip) ──────────────────────────────
+    //
+    // 列表只显示简短摘要 (如 "auto·sticky", "fixed"); 详情悬停 tooltip.
+
+    function mockStrategyBadge(ms) {
+      if (!ms) return '<span class="pill">default</span>';
+      const initialTag = ms.initial && ms.initial.kind === 'fixed' ? 'fixed' : 'auto';
+      const stickyTag = ms.sticky ? 'sticky' : 'rand';
+      return `<span class="pill">${initialTag}·${stickyTag}</span>`;
+    }
+
+    function mockStrategyTooltip(ms) {
+      if (!ms) return 'default (auto + sticky + inferred gen spec)';
+      const parts = [];
+      parts.push(ms.initial && ms.initial.kind === 'fixed'
+        ? `fixed: ${ms.initial.value || '(empty)'}`
+        : 'auto');
+      parts.push(ms.sticky ? 'sticky' : 'non-sticky');
+      if (ms.gen) {
+        const cs = ms.gen.charset || {};
+        const csParts = [];
+        if (cs.digits) csParts.push('0-9');
+        if (cs.lowercase) csParts.push('a-z');
+        if (cs.uppercase) csParts.push('A-Z');
+        if (cs.underscore) csParts.push('_');
+        if (cs.hyphen) csParts.push('-');
+        if (cs.other && cs.other.length) csParts.push(cs.other.join(''));
+        parts.push(`prefix="${ms.gen.prefix || ''}"`);
+        parts.push(`charset=${csParts.join(',') || '(none)'}`);
+        parts.push(`len=[${ms.gen.length_range[0]},${ms.gen.length_range[1]}]`);
+      }
+      return parts.join(' | ');
     }
 
     function renderProviderRow(p) {
@@ -1306,12 +1382,151 @@
       document.getElementById('f-name').value = existing?.name || '';
       document.getElementById('f-category').value = existing?.category || secretCategories[0] || 'apikey';
       document.getElementById('f-value').value = ''; // 强制重输, 避免泄露.
+      // Mock strategy: 加载 existing 或默认值.
+      loadMockStrategyIntoForm(existing?.mock_strategy);
       title.textContent = existing ? `Edit secret ${existing.id}` : 'New secret';
       toggleOverrideBanner(dlg, existing);
       dlg.dataset.editId = existing ? existing.id : '';
       saveBtn.textContent = existing ? 'Update' : 'Create';
       dlg.showModal();
     }
+
+    // ─── mock strategy form helpers ──────────────────────────────────────
+    //
+    // 与后端 MockStrategy JSON shape 对齐. 省略 gen 字段让后端 infer (Auto + 无 gen).
+
+    function loadMockStrategyIntoForm(ms) {
+      const initial = (ms && ms.initial && ms.initial.kind) || 'auto';
+      document.querySelector(`input[name="f-ms-initial"][value="${initial}"]`).checked = true;
+      document.getElementById('f-ms-fixed').value = (ms && ms.initial && ms.initial.value) || '';
+      document.getElementById('f-ms-sticky').checked = ms ? !!ms.sticky : true;
+      const gen = ms && ms.gen;
+      document.getElementById('f-ms-prefix').value = gen?.prefix || '';
+      const cs = gen?.charset || {};
+      document.querySelectorAll('input.f-ms-charset').forEach(cb => {
+        cb.checked = !!cs[cb.dataset.charclass];
+      });
+      document.getElementById('f-ms-other').value = (cs.other || []).join('');
+      const lr = gen?.length_range || [0, 0];
+      document.getElementById('f-ms-lenmin').value = lr[0] || '';
+      document.getElementById('f-ms-lenmax').value = lr[1] || '';
+    }
+
+    function collectCharsetFromForm() {
+      // 从 DOM 收集 6 类 charset 开关 + other 自定义字符. 与后端 mock::Charset 对齐.
+      const otherStr = document.getElementById('f-ms-other').value;
+      return {
+        digits: document.querySelector('input.f-ms-charset[data-charclass="digits"]').checked,
+        lowercase: document.querySelector('input.f-ms-charset[data-charclass="lowercase"]').checked,
+        uppercase: document.querySelector('input.f-ms-charset[data-charclass="uppercase"]').checked,
+        underscore: document.querySelector('input.f-ms-charset[data-charclass="underscore"]').checked,
+        hyphen: document.querySelector('input.f-ms-charset[data-charclass="hyphen"]').checked,
+        // 用 spread 而非 split('') 以正确处理 astral Unicode (emoji 等) 的 codepoint 切分,
+        // 与后端 Vec<char> (Unicode scalar value) 语义一致. 空串返回 [] 而非 [""].
+        other: otherStr ? [...otherStr] : [],
+      };
+    }
+
+    function collectMockStrategyFromForm() {
+      // 从 DOM 收集表单值, 返回与后端 MockStrategy 对齐的 JS object.
+      // 若用户保持所有默认 (auto + sticky + 无任何 gen 配置), 返回 null 让后端用 default.
+      const initialKind = document.querySelector('input[name="f-ms-initial"]:checked').value;
+      const sticky = document.getElementById('f-ms-sticky').checked;
+      const prefix = document.getElementById('f-ms-prefix').value;
+      const charset = collectCharsetFromForm();
+      const lenmin = parseInt(document.getElementById('f-ms-lenmin').value) || 0;
+      const lenmax = parseInt(document.getElementById('f-ms-lenmax').value) || 0;
+
+      let initial;
+      if (initialKind === 'fixed') {
+        initial = { kind: 'fixed', value: document.getElementById('f-ms-fixed').value };
+      } else {
+        initial = { kind: 'auto' };
+      }
+
+      // 判断用户是否实际配置了 gen spec: 任一非空/非零/任一 charset 勾选才算配置.
+      // 全空时省略 gen 字段, 让后端 infer (Auto + resolve_against real value).
+      const anyCharsetChecked = charset.digits || charset.lowercase || charset.uppercase
+        || charset.underscore || charset.hyphen || charset.other.length;
+      const hasGenConfig = prefix !== '' || charset.other.length > 0 || lenmin > 0 || lenmax > 0
+        || anyCharsetChecked;
+      const gen = (initialKind === 'auto' && hasGenConfig) ? {
+        prefix,
+        charset,
+        length_range: [lenmin, lenmax],
+      } : null;
+
+      // 整体若全默认 (auto + sticky + 无 gen), 返回 null (后端 default).
+      const isAllDefault = initialKind === 'auto' && sticky && !gen;
+      return isAllDefault ? null : {
+        initial,
+        sticky,
+        ...(gen ? { gen } : {}),
+      };
+    }
+
+    function inferCharsetFromValue(value) {
+      // 前端 infer 逻辑 (与后端 mock::Charset::infer_from 对齐).
+      // 用于 "Infer from value" 按钮 (在用户填入 real value 后自动勾选 charset + length).
+      const cs = { digits: false, lowercase: false, uppercase: false, underscore: false, hyphen: false, other: [] };
+      for (const c of value) {
+        if (c >= '0' && c <= '9') cs.digits = true;
+        else if (c >= 'a' && c <= 'z') cs.lowercase = true;
+        else if (c >= 'A' && c <= 'Z') cs.uppercase = true;
+        else if (c === '_') cs.underscore = true;
+        else if (c === '-') cs.hyphen = true;
+        else if (!cs.other.includes(c)) cs.other.push(c);
+      }
+      return cs;
+    }
+
+    // 在 form 加载后绑定 "Infer" + "Generate" 按钮的事件.
+    document.addEventListener('DOMContentLoaded', () => {
+      const inferBtn = document.getElementById('f-ms-infer');
+      if (inferBtn) {
+        inferBtn.addEventListener('click', () => {
+          const value = document.getElementById('f-value').value;
+          if (!value) { alert('Please fill in the real value first.'); return; }
+          const cs = inferCharsetFromValue(value);
+          document.querySelectorAll('input.f-ms-charset').forEach(cb => {
+            cb.checked = !!cs[cb.dataset.charclass];
+          });
+          document.getElementById('f-ms-other').value = cs.other.join('');
+          // length_range 用 codepoint count ([...value].length) 而非 UTF-16 code unit count
+          // (value.length), 与后端 chars().count() 语义对齐 (eg emoji 不会被算成 2).
+          const charCount = [...value].length;
+          document.getElementById('f-ms-lenmin').value = charCount;
+          document.getElementById('f-ms-lenmax').value = charCount;
+        });
+      }
+      const genBtn = document.getElementById('f-ms-generate');
+      if (genBtn) {
+        genBtn.addEventListener('click', () => {
+          // Generate 用当前 form 中的 gen spec 生成一个候选 mock, 填入 Fixed input.
+          const value = document.getElementById('f-value').value || 'dummy';
+          const cs = collectCharsetFromForm();
+          const prefix = document.getElementById('f-ms-prefix').value;
+          let lenmin = parseInt(document.getElementById('f-ms-lenmin').value) || value.length;
+          let lenmax = parseInt(document.getElementById('f-ms-lenmax').value) || value.length;
+          if (lenmin > lenmax) [lenmin, lenmax] = [lenmax, lenmin];
+          const pool = [];
+          if (cs.digits) pool.push(...'0123456789');
+          if (cs.lowercase) pool.push(...'abcdefghijklmnopqrstuvwxyz');
+          if (cs.uppercase) pool.push(...'ABCDEFGHIJKLMNOPQRSTUVWXYZ');
+          if (cs.underscore) pool.push('_');
+          if (cs.hyphen) pool.push('-');
+          pool.push(...cs.other);
+          if (pool.length === 0) { alert('Charset is empty. Enable at least one character class.'); return; }
+          // 用 Math.random 生成候选 (前端只需一个示例, 不需确定).
+          const bodyLen = lenmin + Math.floor(Math.random() * (lenmax - lenmin + 1));
+          let body = '';
+          for (let i = 0; i < bodyLen; i++) body += pool[Math.floor(Math.random() * pool.length)];
+          document.getElementById('f-ms-fixed').value = prefix + body;
+          // 自动切换到 Fixed 模式, 让用户预览生成的候选.
+          document.querySelector('input[name="f-ms-initial"][value="fixed"]').checked = true;
+        });
+      }
+    });
 
     function openProviderForm(existing) {
       populateProtocolSelect();
@@ -1379,6 +1594,7 @@
       name: document.getElementById('f-name').value.trim() || null,
       category: document.getElementById('f-category').value,
       value: document.getElementById('f-value').value,
+      mock_strategy: collectMockStrategyFromForm(),
     }));
 
     bindFormSubmit('provider', 'provider-form-el', () => ({

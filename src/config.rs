@@ -907,6 +907,7 @@ mod table_tests {
             category: SecretCategory::ApiKey,
             value: value.into(),
             value_file: None,
+            mock_strategy: crate::mock::MockStrategy::default(),
         }
     }
 
@@ -1070,6 +1071,7 @@ mod table_tests {
             category: SecretCategory::ApiKey,
             value: "x".into(), // 太短 (< 3 字节) → validate_value 失败.
             value_file: None,
+            mock_strategy: crate::mock::MockStrategy::default(),
         };
         assert!(t.upsert_dynamic(bad).is_err());
     }

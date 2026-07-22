@@ -139,13 +139,29 @@ fn test_secret_table_with(entries: Vec<SecretEntry>) -> SecretTable {
 }
 
 fn secret(id: &str, value: &str) -> SecretEntry {
-    SecretEntry {
+    let mut e = SecretEntry {
         id: id.into(),
         name: Some(id.into()),
         category: SecretCategory::ApiKey,
         value: value.into(),
         value_file: None,
-    }
+        mock_strategy: secret_guard::mock::MockStrategy::default(),
+    };
+    // 模拟生产 validate_and_resolve 路径: 让 Auto 模式的 gen spec 被 infer.
+    e.mock_strategy.resolve_against(&e.value);
+    e
+}
+
+/// 预测 redact 对给定 real_secret 生成的首个 mock (counter=0).
+///
+/// 与生产 [`secret_guard::redact::redact_ir`] 路径一致:
+/// sticky=true (default) → [`secret_guard::mock::deterministic_seed`] + counter=0.
+/// 用于集成测试中 mockito 上游响应 fixture (需要预知 mock 值才能构造"LLM echo 了 mock"的场景).
+fn predict_mock(real: &str) -> String {
+    use secret_guard::mock::{deterministic_seed, gen_candidate};
+    let entry = secret("predict", real);
+    let seed = deterministic_seed(&entry.value, &entry.mock_strategy);
+    gen_candidate(&entry.value, &entry.mock_strategy, seed, 0)
 }
 
 async fn proxy_request(
@@ -751,7 +767,7 @@ async fn same_proto_streaming_with_redact_restores_mock_in_sse_chunks() {
     // 上游 SSE chunk 含 mock → 客户端拿到的是 real_secret (restore 生效).
     // 用 mock_with_salt(real, 0) 预测首次 mock (gen_mock_for_ir 在 allocated 为空时返回 salt=0 mock).
     let real_secret = "sk-test-123";
-    let expected_mock = secret_guard::redact::mock_with_salt(real_secret, 0);
+    let expected_mock = predict_mock(real_secret);
     let mut upstream = spawn_mock_upstream().await;
     let sse_body = format!(
         concat!(
@@ -888,7 +904,7 @@ async fn streaming_redact_restores_mock_split_across_sse_chunks() {
     // 跨 SSE chunk 的 mock 也应被 sliding-window restore.
     // 场景: LLM 在响应里 echo 出 mock, mock 恰好被 TCP 切到两个 chunk 中间.
     let real_secret = "sk-test-123";
-    let expected_mock = secret_guard::redact::mock_with_salt(real_secret, 0);
+    let expected_mock = predict_mock(real_secret);
     let mut upstream = spawn_mock_upstream().await;
     // 把 mock 切成连续两半 (mock 本身在文本中是连续的, 只是跨了 chunk 边界):
     //   chunk1 content = "leaked " + mock[..8]
@@ -954,7 +970,7 @@ async fn streaming_redact_restores_input_json_delta_in_tool_use() {
     // 流式 tool_use 的 InputJsonDelta 中含 mock 也应被 restore.
     // 上游 SSE 流里 arguments delta 含 mock, 客户端最终拼接应看到 real_secret.
     let real_secret = "sk-test-123";
-    let expected_mock = secret_guard::redact::mock_with_salt(real_secret, 0);
+    let expected_mock = predict_mock(real_secret);
     let mut upstream = spawn_mock_upstream().await;
     let sse_body = format!(
         concat!(
@@ -1015,7 +1031,7 @@ async fn streaming_redact_restores_when_upstream_skips_block_stop() {
     // 上游协议异常: 漏发 content_block_stop / finish_reason chunk, 直接发 message_stop / [DONE].
     // StreamTranslate 应在 MessageStop 时 flush_all_restorers, 把残留 mock tail 还原为 real.
     let real_secret = "sk-test-123";
-    let expected_mock = secret_guard::redact::mock_with_salt(real_secret, 0);
+    let expected_mock = predict_mock(real_secret);
     let mut upstream = spawn_mock_upstream().await;
     // 上游 SSE: 只发 role + 一个 content + message_stop, 没发 content_block_stop.
     // OpenAI 风格: content chunk 后直接 data: [DONE], 跳过 finish_reason chunk.
@@ -1069,7 +1085,7 @@ async fn cross_protocol_with_redact_round_trips_through_ir_translation() {
     // 跨协议 + redact + restore: 客户端发 OpenAI (含 secret) → codec 翻译为 Anthropic
     // (含 mock) → 上游响应含 mock → codec 翻译回 OpenAI + restore mock 为 real_secret.
     let real_secret = "sk-test-123";
-    let expected_mock = secret_guard::redact::mock_with_salt(real_secret, 0);
+    let expected_mock = predict_mock(real_secret);
     let mut upstream = spawn_mock_upstream().await;
     // 上游响应里含 mock (假设 LLM echo 了它在请求里看到的 mock).
     let upstream_body = format!(
@@ -1977,8 +1993,8 @@ async fn redact_populates_record_redactions_field() {
     );
     assert_eq!(r.redactions[0].1, "my-api-key", "secret id mismatch");
     assert!(
-        r.redactions[0].0.starts_with("sgm_"),
-        "mock should start with sgm_, got: {}",
+        !r.redactions[0].0.is_empty() && r.redactions[0].0 != "my-api-key-value",
+        "mock should be non-empty and differ from real, got: {}",
         r.redactions[0].0
     );
     // 关键: redactions 中绝不能出现真实 secret.
@@ -2039,7 +2055,7 @@ async fn restore_inserts_secret_back_for_client() {
     // IR-based redact round-trip: 请求里 secret → mock → LLM, 响应里 mock → secret → client.
     // 用 mock_with_salt(real, 0) 预测首次 mock, 让上游响应直接含 mock, 验证 restore 生效.
     let real_secret = "sk-test-123";
-    let expected_mock = secret_guard::redact::mock_with_salt(real_secret, 0);
+    let expected_mock = predict_mock(real_secret);
     let mut upstream = spawn_mock_upstream().await;
     let upstream_body = format!(
         r#"{{"id":"chatcmpl-x","object":"chat.completion","created":1700000000,"model":"gpt-4o","choices":[{{"index":0,"message":{{"role":"assistant","content":"echo {expected_mock}"}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}}}"#

@@ -8,22 +8,29 @@
 //! 历史上 redact 是字节级 find-and-replace. 现在升级为 **IR 变换** (基于 [`crate::codec::ir`]),
 //! 与 codec 模块同层, 两者能自然组合 (跨协议翻译 + redact 在同一层 pipeline).
 //!
-//! # 形式化契约 (mock_with_salt 算法)
+//! # 形式化契约 (mock 生成 + redact pipeline)
 //!
-//! [`mock_with_salt`] 满足:
+//! mock 生成由 [`crate::mock`] 模块负责 (三维度策略), 本模块负责 IR 扫描 + 替换 + restore.
+//! 核心契约:
 //!
-//! - **C1 非空性**: 返回的 mock 非空, 长度 = `MOCK_PREFIX.len() + MOCK_BODY_LEN`,
-//!   仅含 ASCII 字母数字 + 下划线.
+//! - **C1 非空性**: 每个 mock 非空, 满足其 [`crate::mock::GenSpec`] 的 prefix/charset/length.
 //! - **C2 上下文唯一性 (in-context uniqueness)**:
 //!   `gen_mock_for_ir(ir, secret, allocated)` 返回的 mock 一定**不在** `ir` 中出现
 //!   (traverse IR 检查) 且不在 `allocated` 集合中 (C4 保证).
-//! - **C3 确定性 (determinism)**: 同一 `(real, salt)` 对总返回同一 mock.
+//! - **C3 候选序列稳定性 (sticky=true 时)**: 同一 `(real, strategy)` 在 sticky 模式下
+//!   总产生同一候选序列 (counter=0,1,2,...). 多数请求命中首项 → 享受 LLM 前缀缓存;
+//!   冲突时稳定跳到后续项 → 后续项在多次"首项冲突"请求间也能共享缓存.
+//!   sticky=false 时每次 redact 换随机 seed, 序列不固定.
 //! - **C4 单射性**: 在一次 [`redact_ir`] 调用内, 不同 secret 总映射到不同 mock
 //!   (因为每次 gen_mock_for_ir 都检查 allocated 集合).
-//! - **C5 不含 real_secret 子串** (best-effort): mock 极大概率不含 real_secret 的 ≥4 字符
-//!   连续子串 (取决于 SipHash 输出, 碰撞概率 ≈ 2^-32 per secret).
-//!   `proptest-regressions/redact.txt` 记录历史失败种子 (real 全 base62 字母时风险更高).
-//!   前提: `SecretTable::upsert` 通过 `validate_value` 拒绝含 `MOCK_PREFIX` ("sgm_") 的 secret.
+//! - **C5 不含 real_secret 子串** (best-effort):
+//!   - Auto 模式: mock 由 hash 驱动, 极大概率不含 real_secret 的 ≥4 字符连续子串.
+//!     用户自定义 `gen.prefix` 在 [`crate::mock::MockStrategy::validate_against_real`]
+//!     中校验不与 real 重叠 (prefix 不出现在 real 中, 也不含 real 的 ≥4 字符子串).
+//!   - Fixed 模式: 由 [`crate::mock::MockStrategy::validate_against_real`] 在 upsert 时检查
+//!     (char-level windows, 正确处理 multibyte UTF-8 secret).
+//!     前提: `SecretTable::upsert` 通过 `validate_value` 拒绝含 `MOCK_PREFIX` ("sgm_") 的 secret.
+//!     `proptest-regressions/redact.txt` 记录历史失败种子 (real 全 base62 字母时风险更高).
 //! - **C6 可逆性 (restorability)**: round-trip identity —
 //!   `restore_ir_response(redact_ir(...).ir, map)` 后 IR 语义等价于原 IR.
 //! - **C7 流式可逆性 (streaming restorability)**:
@@ -136,24 +143,45 @@ pub fn mock_with_salt(real: &str, salt: u64) -> String {
     format!("{MOCK_PREFIX}{}", base62_fixed(hash64(&hash_input)))
 }
 
-/// 生成一个在当前 IR 中**未出现**且**未分配过**的 mock.
+/// 生成一个在当前 IR 中**未出现**且**未分配过**的 mock, 按 [`MockStrategy`] 配置生成.
+///
+/// probing 协议: counter=0 是首选候选; 若与 IR 或 allocated 冲突则递增 counter,
+/// 直到找到合格候选 (上限 2^20 次后 panic, 防止对抗性 IR 死循环).
+///
+/// - **sticky=true**: seed 由 [`crate::mock::deterministic_seed`] 决定 → 候选**序列**稳定.
+///   多数请求命中首项 (counter=0); 冲突时稳定跳到第二项 (counter=1), 第二项在"首项冲突"
+///   的多次请求间也能共享 LLM 前缀缓存. 见 [`crate::mock`] 模块 doc "sticky 的精确语义".
+/// - **sticky=false**: seed 由 [`crate::mock::random_seed`] 决定 → 每次请求候选序列不同.
 ///
 /// C2 (in-context uniqueness): traverse IR 检查候选 mock 是否出现.
 /// C4 (injectivity): 检查 `allocated` 集合避免重复分配.
-///
-/// probing 直到找到合格候选, 几乎总是 1 次 (hash 空间 2^64 远大于 IR 字符串数).
-fn gen_mock_for_ir(ir: &IrRequest, real: &str, allocated: &HashSet<String>) -> String {
-    let mut salt: u64 = 0;
+fn gen_mock_for_ir(ir: &IrRequest, secret: &SecretEntry, allocated: &HashSet<String>) -> String {
+    use crate::mock::{deterministic_seed, gen_candidate, random_seed};
+
+    // seed 在循环外一次性决定: sticky 用确定性 seed, non-sticky 用随机 seed.
+    // 这样 sticky=true 时, 同一 (real, strategy) 的候选序列在此函数内是确定的;
+    // sticky=false 时, 每次调用 gen_mock_for_ir (即每次 redact_ir) 都换 seed.
+    let seed = if secret.mock_strategy.sticky {
+        deterministic_seed(&secret.value, &secret.mock_strategy)
+    } else {
+        random_seed()
+    };
+
+    let mut counter: u32 = 0;
     loop {
-        let candidate = mock_with_salt(real, salt);
+        let candidate = gen_candidate(&secret.value, &secret.mock_strategy, seed, counter);
         if !ir_request_contains(ir, &candidate) && !allocated.contains(&candidate) {
             return candidate;
         }
-        salt += 1;
-        if salt > (1u64 << 32) {
+        counter += 1;
+        if counter > (1u32 << 20) {
+            // Fixed 模式 + 大量冲突的极端场景兜底. 阈值降到 2^20 (vs 原 2^32):
+            // Fixed 候选空间远小于 Auto (Auto 用 hash 空间 2^64, Fixed 只是 _N 后缀).
+            // 实际 2^20 已远超任何合理 IR 中可容纳的字符串数.
             panic!(
-                "mock probing exhausted after 2^32 attempts; \
-                 ir likely adversarial (real={real:?})"
+                "mock probing exhausted after 2^20 attempts; \
+                 ir likely adversarial (real={:?}, strategy={:?})",
+                secret.value, secret.mock_strategy
             );
         }
     }
@@ -177,25 +205,22 @@ pub fn redact_ir(ir: &mut IrRequest, secrets: &[SecretEntry]) -> RedactionMap {
         return map;
     }
 
-    // 按 value 长度倒序 + 去重 + 过滤空.
-    let mut sorted: Vec<&str> = secrets
-        .iter()
-        .map(|e| e.value.as_str())
-        .filter(|s| !s.is_empty())
-        .collect();
-    sorted.sort_by_key(|s| std::cmp::Reverse(s.len()));
-    sorted.dedup();
+    // 按 value 长度倒序 + 过滤空 value + 去重连续重复 value (保留首个 entry 的 mock_strategy).
+    // 不同 entry 共享同一 value 时只生成一个 mock (RedactionMap 按 value 去重的语义).
+    let mut sorted: Vec<&SecretEntry> = secrets.iter().filter(|e| !e.value.is_empty()).collect();
+    sorted.sort_by_key(|e| std::cmp::Reverse(e.value.len()));
+    sorted.dedup_by(|a, b| a.value == b.value);
 
     let mut allocated: HashSet<String> = HashSet::new();
 
     for secret in sorted {
-        if !ir_request_contains(ir, secret) {
+        if !ir_request_contains(ir, &secret.value) {
             continue;
         }
         let mock = gen_mock_for_ir(ir, secret, &allocated);
-        ir_request_replace_all(ir, secret, &mock);
+        ir_request_replace_all(ir, &secret.value, &mock);
         allocated.insert(mock.clone());
-        map.insert(secret.to_string(), mock);
+        map.insert(secret.value.clone(), mock);
     }
     map
 }
@@ -644,13 +669,18 @@ use crate::secrets::SecretCategory;
 
 #[cfg(test)]
 fn entry(value: &str) -> SecretEntry {
-    SecretEntry {
+    let mut e = SecretEntry {
         id: format!("id-{value}"),
         name: None,
         category: SecretCategory::ApiKey,
         value: value.into(),
         value_file: None,
-    }
+        mock_strategy: crate::mock::MockStrategy::default(),
+    };
+    // 测试 helper 模拟生产路径: validate_and_resolve 会调用 resolve_against,
+    // 让 Auto 模式的 gen spec 被 infer 出来 (否则 gen_candidate 会 panic).
+    e.mock_strategy.resolve_against(&e.value);
+    e
 }
 
 #[cfg(test)]
@@ -683,7 +713,8 @@ mod tests {
         // 构造 IR 里含一个 mock-shaped 字符串, gen 出的 mock 应该避开它.
         let ir = sample_ir_with_text("sgm_AAAAAAAAAAAAA");
         let allocated = HashSet::new();
-        let m = gen_mock_for_ir(&ir, "real-secret", &allocated);
+        let entry = entry("real-secret");
+        let m = gen_mock_for_ir(&ir, &entry, &allocated);
         assert!(
             !ir_request_contains(&ir, &m),
             "gen mock must avoid existing IR content; got {m}"
@@ -890,22 +921,13 @@ mod tests {
     #[test]
     fn redact_ir_dedupes_identical_values() {
         let mut ir = sample_ir_with_text("token: XYZ123");
-        let secrets = vec![
-            SecretEntry {
-                id: "id-1".into(),
-                name: None,
-                category: SecretCategory::ApiKey,
-                value: "XYZ123".into(),
-                value_file: None,
-            },
-            SecretEntry {
-                id: "id-2".into(),
-                name: None,
-                category: SecretCategory::ApiKey,
-                value: "XYZ123".into(),
-                value_file: None,
-            },
-        ];
+        // 两个 entry 共享同一 value "XYZ123" 但 id 不同. redact_ir 按 value 去重,
+        // 只生成一个 mock (与 map.real_to_mock 的 key 去重语义一致).
+        let mut e1 = entry("XYZ123");
+        e1.id = "id-1".into();
+        let mut e2 = entry("XYZ123");
+        e2.id = "id-2".into();
+        let secrets = vec![e1, e2];
         let map = redact_ir(&mut ir, &secrets);
         assert_eq!(map.real_to_mock.len(), 1);
     }
@@ -1083,7 +1105,8 @@ mod tests {
             let ir = sample_ir_with_text(&body);
             // gen_mock_for_ir 内部: 候选 mock 不在 ir 中.
             let allocated = HashSet::new();
-            let m = gen_mock_for_ir(&ir, &secret, &allocated);
+            let entry = entry(&secret);
+            let m = gen_mock_for_ir(&ir, &entry, &allocated);
             prop_assert!(!ir_request_contains(&ir, &m),
                 "mock must not appear in pre-redact IR: mock={}", m);
         }

@@ -59,12 +59,17 @@ src/
 │                  # + atomic_write / UpsertKind / DeleteOutcome
 ├── provider.rs    # Protocol / Provider + DynamicEntry impl + EffectiveProvider 合并视图
 ├── secrets.rs     # SecretEntry / SecretCategory + DynamicEntry impl + EffectiveSecret + mask_value
+│                  # (SecretEntry.mock_strategy: MockStrategy 字段, redact 路径消费)
+├── mock.rs        # MockStrategy / InitialValue / GenSpec / Charset (三维度正交)
+│                  # + infer_default_from_real + gen_candidate + deterministic/random seed
+│                  # 纯函数模块, 含完整单元测试 (覆盖 Auto/Fixed + sticky/non-sticky 分支)
 ├── record.rs      # ForwardRecord / RecordStore / ResponseUpdate
 │                  # (ForwardRecord.redactions: Vec<(mock, secret_id)> 从 RedactionMap SSOT 派生)
 │                  # (RecordStore::list_page: offset+limit 分页, WebUI 用)
-├── redact.rs      # mock_with_salt + RedactionMap + redact_ir + restore_ir_response
+├── redact.rs      # RedactionMap + redact_ir + restore_ir_response + mock_with_salt (legacy)
 │                  # + StreamingRestorer (流式 sliding-window restore, per-block 独立)
 │                  # + IR traverse helpers (block_contains / value_replace_all 等)
+│                  # redact 主路径已接入 MockStrategy (gen_mock_for_ir 消费 mock::gen_candidate)
 ├── codec/         # 跨协议 codec (OpenAI ⇄ Anthropic, 借鉴 Busbar IR 设计)
 │   ├── mod.rs     # Protocol enum + Reader/Writer trait + 共享 helpers
 │   ├── ir.rs      # 协议无关 IR (IrRequest/IrResponse/IrBlock/IrMessage/IrStreamEvent/IrUsage)
@@ -161,16 +166,34 @@ PATCH  /__sg/api/providers/{id}/decision
 
 ## 关键契约
 
-### mock_secret (`src/redact.rs`)
+### MockStrategy (`src/mock.rs`) — per-secret mock 生成策略
 
-`mock_with_salt(real_secret, salt) -> String` 是 redact 的纯算法核心, 满足 6 条形式化契约 (C1-C6),
-完整定义见 `src/redact.rs` 文件头 doc. 关键不变式:
+每个 secret 配置三维度正交的 mock 策略, redact 时按策略生成候选 mock:
 
-- **C5 (best-effort)**: mock 极大概率不含 real_secret 的 ≥4 字符连续子串 (碰撞概率 ≈ 2^-32 per secret).
-  前提: `SecretTable::upsert` 通过 `validate_value` 拒绝含 `MOCK_PREFIX` ("sgm_") 的 secret.
-  `proptest-regressions/redact.txt` 记录历史失败种子 (real 全 base62 字母时风险更高).
-- **C6**: `restore_ir_response(redact_ir(...).ir, map)` 后 IR 语义等价于原 IR (round-trip identity).
-  property-based 测试在 `src/redact.rs::tests::prop_*` 覆盖.
+- **维度一 (初始值 `InitialValue`)**: `Auto` (系统按 gen spec 生成) 或 `Fixed { value }` (用户固定值).
+- **维度二 (黏性 `sticky`, 默认 `true`)**: 候选**序列**是否稳定.
+  - `sticky=true` 不意味着 "redact 总是产出同一个 mock". redact 时仍需满足 C2
+    (in-context uniqueness): 若候选 mock 已出现在当前请求 IR 中, 系统 probing 到序列的下一个候选.
+  - sticky=true 保证的是候选**序列本身确定** — 同一 `(real, strategy)` 总产生相同的候选顺序 (counter=0,1,2,...).
+    因此多数请求命中首项 (完全享受 LLM 供应商前缀缓存); 首项冲突时**稳定地**跳到第二项
+    (第二项在"首项冲突"的多次请求间也能共享缓存).
+  - sticky=false 时每次请求用新随机种子 (uuid v4 → hash), 候选序列每次不同,
+    牺牲缓存友好性换取更高不可预测性.
+- **维度三 (生成策略 `GenSpec`)**: `prefix` + `charset` + `length_range`.
+  - `prefix`: 固定前缀, 默认空串.
+  - `charset`: 6 类正交开关 (digits / lowercase / uppercase / underscore / hyphen / other Vec<char>).
+    默认值由 `Charset::infer_from(real)` 自动推断 (real 中出现哪些字符类就勾选).
+  - `length_range`: `[min, max]` (char count), 默认 `min=max=len(real)` (与 real 等长).
+
+**向后兼容**: 未配置 `mock_strategy` 的旧 secret 在 `SecretEntry::validate_and_resolve`
+的 resolve 步骤后自动得到 `default_for(real_value)` (Auto + sticky + infer 自 real 的 gen spec).
+
+**核心 API**:
+- `MockStrategy::resolve_against(real)`: 用 real infer 默认 gen spec (若 gen=None + Auto 模式).
+- `MockStrategy::validate_against_real(real)`: Fixed 模式校验不等于 real 且不含 real ≥4 字符子串 (C5, char-level windows 正确处理 multibyte UTF-8); Auto 模式校验 gen.prefix 不含 real 子串.
+- `deterministic_seed(real, strategy)`: sticky=true 的 seed 源 (hash of real+strategy).
+- `random_seed()`: sticky=false 的 seed 源 (uuid v4 hash).
+- `gen_candidate(real, strategy, seed, counter)`: 生成单个候选 mock. redact 按 probing 协议消费.
 
 ### redact pipeline (`src/redact.rs` + `src/proxy.rs`)
 
@@ -458,10 +481,11 @@ client = Anthropic(
   归一化可能让 wire 字节略变, 但语义等价. 同协议 + 无 redact 路径仍 byte-exact.
 - **流式 + redact + 非 2xx 上游错误**: 走 `fan_out_buffered_ir`, 但 SSE 错误流不是单个 JSON,
   parse 失败时 fallback 原样返回 (无 restore). 客户端可能看到 mock.
-- mock_secret 用 SipHash (Rust `DefaultHasher`), 同 Rust 版本内确定, 但**不保证跨版本稳定**;
+- mock 生成用 SipHash (Rust `DefaultHasher`), 同 Rust 版本内确定, 但**不保证跨版本稳定**;
   RedactionMap 是 per-request 状态不持久化, 所以无实际影响.
-- mock 固定 15 字符 (`sgm_` + 11 char base62), 不模拟 real_secret 的格式/长度.
-  LLM 可能识别出"sgm_..." 的规律性 — 未来可考虑 category-aware 的 mock 生成器.
+- mock 默认与 real_secret 等长 (由 `MockStrategy::default_for` infer), charset 来自 real.
+  用户可通过 MockStrategy 三维度自定义 prefix / charset / length.
+  Fixed 模式下 mock 由用户提供, 系统校验不含 real ≥4 字符子串 (C5 best-effort).
 - static config (`secret-guard.toml`) 的 `[server]` 段当前仅在启动时读取一次,
   WebUI 改 host/port 不会生效 (需要重启).
 - WebUI 编辑 provider 时 api_key 始终要求重输 (无法保留旧值), 留空则覆盖为空字符串.
@@ -488,7 +512,8 @@ client = Anthropic(
   长期用 Aho-Corasick (多模式匹配) 一次性扫所有 mock.
 - **redact 测试基线**: 加 criterion bench 测典型场景 (10 secrets × 10KB IR, 100 × 100KB),
   留作回归基线.
-- mock_secret 的 category-aware 生成 (Password/ApiKey/Cookie 等格式感知).
+- mock_secret 的 category-aware 默认生成 (Password/ApiKey/Cookie 等格式感知;
+  当前 MockStrategy 已支持用户自定义 prefix/charset/length, 但默认仍由 real 推断).
 - 配置热加载 (目前 Web UI 改 config 后, 重启才影响 CLI 参数).
 - 测试覆盖率自动上报 + fuzzing (cargo-fuzz).
 - Web UI 编辑 provider 时保留 api_key (改用 `null` 表示不更新).

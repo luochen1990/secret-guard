@@ -4,6 +4,7 @@
 //! - [`cli`]      —— 命令行参数 schema (clap)
 //! - [`codec`]    —— 跨协议 codec (OpenAI ⇄ Anthropic, 借鉴 Busbar IR 设计)
 //! - [`config`]   —— TOML 配置文件 schema (serde)
+//! - [`mock`]     —— Per-secret mock 策略 (三维度: 初始值 / sticky / 生成策略)
 //! - [`provider`] —— Provider 注册表 + Protocol 类型 (ingress / egress 抽象)
 //! - [`proxy`]    —— 透明反向代理 handler (axum + reqwest)
 //! - [`record`]   —— 转发记录模型与内存存储 (供 Web UI 消费)
@@ -19,6 +20,7 @@
 pub mod cli;
 pub mod codec;
 pub mod config;
+pub mod mock;
 pub mod provider;
 pub mod proxy;
 pub mod record;

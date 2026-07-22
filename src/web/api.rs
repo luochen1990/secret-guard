@@ -415,6 +415,10 @@ pub struct CreateSecretRequest {
     /// 但保留字段以支持 "dynamic secret 引用 sops 解密路径" 的高级用例.
     #[serde(default)]
     pub value_file: Option<String>,
+    /// 可选: mock 策略. 省略时后端用 [`crate::mock::MockStrategy::default`]
+    /// (Auto + sticky + resolve 时 infer gen spec).
+    #[serde(default)]
+    pub mock_strategy: Option<crate::mock::MockStrategy>,
 }
 
 impl CreateSecretRequest {
@@ -432,6 +436,7 @@ impl CreateSecretRequest {
             category: self.category.unwrap_or_default(),
             value: self.value,
             value_file: self.value_file.map(std::path::PathBuf::from),
+            mock_strategy: self.mock_strategy.unwrap_or_default(),
         })
     }
 }
@@ -708,6 +713,7 @@ mod tests {
             category: None,
             value: String::new(),
             value_file: None,
+            mock_strategy: None,
         };
         assert!(req.into_entry().is_err());
     }
@@ -723,6 +729,7 @@ mod tests {
             category: None,
             value: "direct-value".into(),
             value_file: Some("/some/path".into()),
+            mock_strategy: None,
         };
         let entry = req.into_entry().expect("into_entry skips mutex check");
         // 但 SecretEntry::validate_and_resolve 必须拒绝此组合.

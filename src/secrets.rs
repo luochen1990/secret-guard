@@ -22,6 +22,7 @@ use crate::config::{
     classify_source, pick_effective, Decisions, DynamicEntry, DynamicState, DynamicTable,
     EffectiveSource, OverrideMode,
 };
+use crate::mock::MockStrategy;
 
 /// 单条 secret 注册项.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +64,16 @@ pub struct SecretEntry {
     /// 文件内容会被 `trim()` (容忍 sops / `echo | tee` 末尾换行符).
     #[serde(default)]
     pub value_file: Option<std::path::PathBuf>,
+
+    /// Mock 策略 (三维度: 初始值 / sticky / 生成策略).
+    ///
+    /// 未配置 (`#[serde(default)]`) → [`MockStrategy::default`] (Auto + sticky + 无 gen).
+    /// 在 [`SecretEntry::validate_and_resolve`] 的 resolve_value 步骤后, 若仍是 Auto + 无 gen,
+    /// 会调用 [`MockStrategy::resolve_against`] 用 real value infer 默认 gen spec.
+    ///
+    /// redact 路径 (见 [`crate::redact`]) 通过 [`crate::mock::gen_candidate`] 消费此策略.
+    #[serde(default)]
+    pub mock_strategy: MockStrategy,
 }
 
 impl SecretEntry {
@@ -110,11 +121,15 @@ impl SecretEntry {
     ///
     /// # 步骤设计动机
     ///
-    /// 1. **结构 validate** ([`DynamicEntry::validate`]): id 格式 + value 与 value_file 互斥.
-    ///    在 resolve 前跑, 能在 value 还空 (value_file 模式) 时识别结构错误.
+    /// 1. **结构 validate** ([`DynamicEntry::validate`]): id 格式 + value 与 value_file 互斥
+    ///    + mock_strategy 基础校验 (不依赖 real value 的部分, 如 Fixed 非空). 在 resolve 前跑, 能在 value 还空 (value_file 模式) 时识别结构错误.
     /// 2. **resolve_value**: 从 `value_file` 读文件写入 `value` (fail-fast: 读失败 → Err).
     /// 3. **内容 validate** ([`validate_value`]): resolve 后 value 是最终 redact 用的字节,
     ///    必须满足长度 / mock prefix / PUA 约束.
+    /// 4. **mock_strategy resolve + validate** ([`MockStrategy::resolve_against`] +
+    ///    [`MockStrategy::validate_against_real`]): 用 resolve 后的 real value infer
+    ///    gen spec (Auto 模式) 并校验 Fixed 不含 real 子串 (C5 best-effort). 必须在 value
+    ///    resolve 后跑, 因为 infer 与 C5 检查都依赖 real value.
     ///
     /// # 与 Provider 的差异
     ///
@@ -124,6 +139,8 @@ impl SecretEntry {
         self.validate()?;
         self.resolve_value()?;
         validate_value(&self.value)?;
+        self.mock_strategy.resolve_against(&self.value);
+        self.mock_strategy.validate_against_real(&self.value)?;
         Ok(())
     }
 }
@@ -264,6 +281,9 @@ impl DynamicEntry for SecretEntry {
         if !self.value.is_empty() {
             validate_value(&self.value)?;
         }
+        // mock_strategy 基础校验 (Fixed 非空 / Auto+gen 配置合法). 依赖 real value 的
+        // C5 检查由 validate_against_real 在 resolve 后执行, 不在这里 (兼容 value_file 模式).
+        self.mock_strategy.validate()?;
         Ok(())
     }
 
@@ -297,6 +317,7 @@ pub struct EffectiveSecret {
     pub category: SecretCategory,
     pub value_masked: String,
     pub value_length: usize,
+    pub mock_strategy: MockStrategy,
 
     pub source: EffectiveSource,
     pub decision: OverrideMode,
@@ -312,6 +333,7 @@ pub struct SecretMasked {
     pub category: SecretCategory,
     pub value_masked: String,
     pub value_length: usize,
+    pub mock_strategy: MockStrategy,
 }
 
 impl From<SecretEntry> for SecretMasked {
@@ -322,6 +344,7 @@ impl From<SecretEntry> for SecretMasked {
             id: e.id,
             name: e.name,
             category: e.category,
+            mock_strategy: e.mock_strategy,
         }
     }
 }
@@ -353,6 +376,7 @@ fn compute_effective_secret(
         id: raw.id,
         name: raw.name,
         category: raw.category,
+        mock_strategy: raw.mock_strategy,
         source,
         decision: mode,
         static_version: static_masked,
@@ -378,6 +402,7 @@ mod tests {
             category: SecretCategory::ApiKey,
             value: value.into(),
             value_file: None,
+            mock_strategy: MockStrategy::default(),
         }
     }
 
@@ -543,6 +568,7 @@ mod tests {
             category: SecretCategory::ApiKey,
             value: String::new(),
             value_file: Some(path),
+            mock_strategy: crate::mock::MockStrategy::default(),
         };
         assert!(e.resolve_value().is_ok());
         assert_eq!(e.value, "sk-test-secret-value"); // 末尾换行被 trim 掉.
@@ -558,6 +584,7 @@ mod tests {
             category: SecretCategory::ApiKey,
             value: "direct-value".into(),
             value_file: None,
+            mock_strategy: crate::mock::MockStrategy::default(),
         };
         assert!(e.resolve_value().is_ok());
         assert_eq!(e.value, "direct-value");
@@ -571,6 +598,7 @@ mod tests {
             category: SecretCategory::ApiKey,
             value: String::new(),
             value_file: Some(PathBuf::from("/nonexistent/secret-guard-test/no-such-file")),
+            mock_strategy: crate::mock::MockStrategy::default(),
         };
         let err = e.resolve_value().unwrap_err();
         // 错误信息含 id + path 便于排查.
@@ -593,6 +621,7 @@ mod tests {
             category: SecretCategory::ApiKey,
             value: "some-direct-value".into(),
             value_file: Some(PathBuf::from("/etc/passwd")),
+            mock_strategy: crate::mock::MockStrategy::default(),
         };
         let err = e.validate().unwrap_err();
         assert!(
@@ -610,6 +639,7 @@ mod tests {
             category: SecretCategory::ApiKey,
             value: String::new(),
             value_file: Some(PathBuf::from("/some/path")),
+            mock_strategy: crate::mock::MockStrategy::default(),
         };
         assert!(e.validate().is_ok());
     }
