@@ -1,0 +1,51 @@
+# secret-guard — Forgejo Actions CI
+#
+# runner label: vm-nix (microvm, 由 git.lambda.lc 管理员注册).
+# Rust 工具链直接装在 VM 里 (forgejo-runner-vm.mod.nix),
+# CI 不走 nix develop (每次评估 flake + 补 store 太慢). 工具链版本由 VM 的 nixpkgs 决定.
+#
+# 触发去重 (与 ~/ws/nixos 的 ci 一致):
+#   同一 commit 在 feature branch 上会同时触发 push + pull_request, 跑两次浪费 runner.
+#   PR 事件总是跑 (合并前检查, 主要场景); push 仅 master 跑 (合并后的 commit; feature
+#   branch 的 push 由 PR 覆盖). 另加 workflow_dispatch 供手动重试.
+#
+# workflow `name: ci` + job_id `check` 对齐 branch protection 规则 "ci / check (*)",
+# 通配符 (*) 同时覆盖 (push) 与 (pull_request) 两种事件后缀, 门禁不会因多事件分裂.
+#
+# checkout 直接用 git + SSH (不用 actions/checkout):
+#   forgejo 实例启用了 DISABLE_HTTP_GIT=true (禁止 git over HTTPS), 且内置 SSH server
+#   要求用户名 forgejo (不是 git) + 非标准端口 5522. actions/checkout@v4 硬编码 git@ 用户
+#   且 SCP-style URL 无法嵌端口, 对此环境完全不兼容. 直接 git 命令把用户名和端口写在
+#   ssh:// URL 里 (forgejo@git.lambda.lc:5522), 一步到位, 无黑盒.
+#   host key 用 ssh-keyscan 每次动态获取 (runner 在可信 MicroVM, LAN 可信, 首次即信任).
+#   依赖一个 repo-level secret: DEPLOY_KEY (ed25519 私钥; 公钥在 repo Deploy keys 注册).
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch: # 手动重试: forgejo UI → Actions → ci → Run workflow
+
+jobs:
+  check:
+    runs-on: vm-nix
+    # 去重: PR 事件总是跑; push 事件仅 master 跑 (feature branch 的 push 会被 pull_request 覆盖)
+    if: ${{ github.event_name != 'push' || github.ref == 'refs/heads/master' }}
+    timeout-minutes: 15
+    steps:
+      - name: Checkout via SSH
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+        run: |
+          set -eu
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p 5522 git.lambda.lc >> ~/.ssh/known_hosts
+          git init
+          git remote add origin "ssh://forgejo@git.lambda.lc:5522/${GITHUB_REPOSITORY}.git"
+          git fetch --depth 1 origin "$GITHUB_SHA"
+          git checkout FETCH_HEAD
+
+      # 直接 just check, 工具链由 VM 的 systemPackages 提供 (不走 nix develop 避免 flake 评估开销).
+      - run: just check

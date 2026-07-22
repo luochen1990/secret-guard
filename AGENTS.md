@@ -432,6 +432,24 @@ cargo run -- run --port 18787
 # OpenAI SDK 配置: base_url = http://127.0.0.1:18787/o/<provider-id>
 ```
 
+### CI (Forgejo Actions)
+
+CI 配置在 `.forgejo/workflows/ci.yml`, 触发条件: `push` + `pull_request` +
+`workflow_dispatch` (手动重试). 去重逻辑: PR 事件总是跑; push 仅 master 跑
+(feature branch 的 push 会被 PR 覆盖). Runner 标签为 `vm-nix` (microvm, 工具链
+直接装在 VM 的 `environment.systemPackages` 里), 直接跑 `just check` (不走 nix
+develop 避免 flake 评估开销; 完整 5 步: fmt → clippy → machete → nextest → doctest).
+
+**commit status context**: `ci / check (pull_request)` 或 `ci / check (push)` (workflow
+`name: ci` + job_id `check`; **禁止改 workflow name 或 job_id** —— 会改变 context 破坏门禁).
+branch protection 的 status check 规则 `ci / check (*)` 用通配符同时覆盖两种事件后缀.
+
+**checkout 直接用 git + SSH** (不用 `actions/checkout`): forgejo 实例禁用了 git over
+HTTPS (`DISABLE_HTTP_GIT=true`), 且内置 SSH 在非标准端口 5522. workflow 直接用 `ssh://` URL
+clone (端口写在 URL 里, 无需 `insteadOf` hack), host key 用 `ssh-keyscan` 动态获取 (runner 在
+可信 MicroVM, TOFU 可接受). 依赖一个 repo-level secret: `DEPLOY_KEY` (ed25519 私钥; 对应公钥
+在 repo Settings → Deploy keys 注册).
+
 ### 客户端使用示例
 
 OpenAI Python SDK:
