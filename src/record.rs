@@ -20,6 +20,21 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// 列表过滤维度. WebUI 的 All / Hits 两个 tab 各自独立分页,
+/// 服务端按此枚举过滤并返回该维度下的 total.
+///
+/// - `All`: 不过滤 (默认, 向后兼容).
+/// - `Hits`: 只保留 `redactions` 非空的记录 (本次请求实际发生了 redact).
+///
+/// 序列化为小写字符串, 直接作 query param 值: `?filter=all` / `?filter=hits`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecordFilter {
+    #[default]
+    All,
+    Hits,
+}
+
 /// 单条转发记录.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForwardRecord {
@@ -216,32 +231,69 @@ impl RecordStore {
         v
     }
 
-    /// 分页列出记录 (按时间倒序). 返回 `(当前页 records, 总数)`.
+    /// 分页列出记录 (按时间倒序). 返回 `(当前页 records, 该 filter 维度下的总数)`.
     ///
     /// - `offset`: 0-based, 从最新一条算起. 会 clamp 到 `[0, total]`.
     /// - `limit`: clamp 到 `[1, 200]`.
+    /// - `filter`: `All` 不过滤; `Hits` 只保留 `redactions` 非空的记录.
     /// - `offset >= total`: 返回空 vec + total.
     ///
     /// 用 `VecDeque` 的双向迭代做高效切片 (避免全量 clone + reverse).
     /// 适合偶尔翻页的 WebUI 场景; 若未来要做大量扫描/筛选, 再考虑加索引.
-    pub fn list_page(&self, offset: usize, limit: usize) -> (Vec<ForwardRecord>, usize) {
+    ///
+    /// `filter=Hits` 需要先扫一遍全量计数 + 过滤出命中索引, 再切片.
+    /// `VecDeque` ≤1024 条 + 每条只看 `redactions.is_empty()` (无 body 拷贝),
+    /// O(n) 扫描对 WebUI 偶发翻页场景完全无感知.
+    pub fn list_page(
+        &self,
+        offset: usize,
+        limit: usize,
+        filter: RecordFilter,
+    ) -> (Vec<ForwardRecord>, usize) {
         let g = self.inner.read();
-        let total = g.records.len();
         let limit = limit.clamp(1, 200);
+
+        // All 路径 (最常见): 直接在原 VecDeque 上倒序切片, total = records.len().
+        // 这是热路径, 保持零额外分配.
+        if filter == RecordFilter::All {
+            let total = g.records.len();
+            let offset = offset.min(total);
+            if offset >= total {
+                return (Vec::new(), total);
+            }
+            let take = limit.min(total - offset);
+            let out: Vec<ForwardRecord> = g
+                .records
+                .iter()
+                .rev()
+                .skip(offset)
+                .take(take)
+                .cloned()
+                .collect();
+            return (out, total);
+        }
+
+        // Hits 路径: 先倒序扫一遍, 过滤出命中记录的索引, 再切片.
+        // 不做 clone 直到确定要返回哪几条, 避免无谓的 body 拷贝.
+        let hit_indices: Vec<usize> = g
+            .records
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, r)| !r.redactions.is_empty())
+            .map(|(i, _)| i)
+            .collect();
+        let total = hit_indices.len();
         let offset = offset.min(total);
         if offset >= total {
             return (Vec::new(), total);
         }
-        // records 按插入顺序 (旧→新). 我们要按时间倒序取 offset..offset+limit.
-        // 从尾部倒推: 末尾是最新一条 → skip `offset` 条 → take `limit` 条.
         let take = limit.min(total - offset);
-        let out: Vec<ForwardRecord> = g
-            .records
+        let out: Vec<ForwardRecord> = hit_indices
             .iter()
-            .rev()
             .skip(offset)
             .take(take)
-            .cloned()
+            .map(|&i| g.records.get(i).cloned().unwrap())
             .collect();
         (out, total)
     }
@@ -368,8 +420,8 @@ mod tests {
         for i in 0..5 {
             let _ = store.push(fake_record("POST", &format!("/r{i}")));
         }
-        // list_page(0, 2) → 最新两条 (/r4, /r3) + total=5.
-        let (page, total) = store.list_page(0, 2);
+        // list_page(0, 2, All) → 最新两条 (/r4, /r3) + total=5.
+        let (page, total) = store.list_page(0, 2, RecordFilter::All);
         assert_eq!(total, 5);
         assert_eq!(page.len(), 2);
         assert_eq!(page[0].path, "/r4");
@@ -384,7 +436,7 @@ mod tests {
             let _ = store.push(fake_record("POST", &format!("/r{i}")));
         }
         // limit 给 10, 应被 clamp 到剩余 1.
-        let (page, total) = store.list_page(4, 10);
+        let (page, total) = store.list_page(4, 10, RecordFilter::All);
         assert_eq!(total, 5);
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].path, "/r0");
@@ -397,16 +449,72 @@ mod tests {
             let _ = store.push(fake_record("POST", &format!("/r{i}")));
         }
         // limit=0 → clamp 到 1.
-        let (page, total) = store.list_page(0, 0);
+        let (page, total) = store.list_page(0, 0, RecordFilter::All);
         assert_eq!(total, 5);
         assert_eq!(page.len(), 1);
         // limit 超大 → clamp 到 200, 但实际只有 5 条, 返回全部.
-        let (page, total) = store.list_page(0, 10_000);
+        let (page, total) = store.list_page(0, 10_000, RecordFilter::All);
         assert_eq!(total, 5);
         assert_eq!(page.len(), 5);
         // offset 超大 → 空页 + total.
-        let (page, total) = store.list_page(1_000, 10);
+        let (page, total) = store.list_page(1_000, 10, RecordFilter::All);
         assert_eq!(total, 5);
+        assert!(page.is_empty());
+    }
+
+    #[test]
+    fn list_page_hits_filter_returns_only_redacted_records() {
+        // 3 条带 redactions + 2 条不带 → Hits 维度 total=3, 顺序仍为 newest first.
+        let store = RecordStore::new(64);
+        let _ = store.push(fake_record("POST", "/plain0"));
+        let _ = store.push(
+            fake_record("POST", "/hit1").with_redactions(vec![("sgm_a".into(), "k1".into())]),
+        );
+        let _ = store.push(fake_record("POST", "/plain2"));
+        let _ = store.push(
+            fake_record("POST", "/hit3").with_redactions(vec![("sgm_b".into(), "k2".into())]),
+        );
+        let _ = store.push(
+            fake_record("POST", "/hit4").with_redactions(vec![("sgm_c".into(), "k3".into())]),
+        );
+        // 第一页 limit=2: 取最新两条 hits (/hit4, /hit3), total=3.
+        let (page, total) = store.list_page(0, 2, RecordFilter::Hits);
+        assert_eq!(total, 3);
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].path, "/hit4");
+        assert_eq!(page[1].path, "/hit3");
+        // 第二页 offset=2 limit=2: 只剩最旧一条 hit (/hit1).
+        let (page, total) = store.list_page(2, 2, RecordFilter::Hits);
+        assert_eq!(total, 3);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].path, "/hit1");
+    }
+
+    #[test]
+    fn list_page_hits_filter_empty_when_no_redactions() {
+        // 所有记录都无 redactions → Hits 维度 total=0, 空页.
+        let store = RecordStore::new(64);
+        for i in 0..3 {
+            let _ = store.push(fake_record("POST", &format!("/r{i}")));
+        }
+        let (page, total) = store.list_page(0, 10, RecordFilter::Hits);
+        assert_eq!(total, 0);
+        assert!(page.is_empty());
+    }
+
+    #[test]
+    fn list_page_hits_filter_clamps_inputs() {
+        // 与 All 路径对称: offset/limit clamp 行为应一致.
+        let store = RecordStore::new(64);
+        for i in 0..3 {
+            let _ = store.push(
+                fake_record("POST", &format!("/r{i}"))
+                    .with_redactions(vec![("sgm".into(), "k".into())]),
+            );
+        }
+        // offset 超大 → 空页 + total=3.
+        let (page, total) = store.list_page(1_000, 10, RecordFilter::Hits);
+        assert_eq!(total, 3);
         assert!(page.is_empty());
     }
 }

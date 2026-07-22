@@ -614,7 +614,6 @@
       static_preferred: 'static (forced)',
     };
 
-    let records = [];
     let selectedId = null;
     let secretsList = [];
     let secretCategories = [];
@@ -625,13 +624,23 @@
     let providerDecisions = [];
 
     // ─── records tab: pagination / filter / parsed-view 状态 ────────────────
+    //
+    // 双游标分页: All / Hits 各自独立的 offset 与 total, 切换 filter 不重置另一侧.
+    // 后端按 ?filter=all|hits 过滤并返回该维度下的 total, 前端不再做客户端筛选.
     const PAGE_SIZE = 50;
-    let loadedCount = 0;      // 当前已加载条数 (= records.length, 显式跟踪便于断言).
-    let totalCount = 0;       // 服务端已知总记录数 (来自 list API 的 total 字段).
-    let filterMode = 'all';   // 'all' | 'hits' (hits = redactions.length > 0).
+    // 每个维度各自缓存已加载的 records 与游标. 切换 tab 时直接用对应缓存渲染,
+    // 首次切到 Hits 才发请求 (lazy).
+    const cursors = {
+      all: { offset: 0, total: 0, records: [] },
+      hits: { offset: 0, total: 0, records: [] },
+    };
+    let filterMode = 'all';   // 'all' | 'hits'.
     let detailView = 'raw';   // 'raw' | 'parsed'.
     let parsedCache = new Map(); // id -> { record, parsed_request, parsed_response, parse_error }.
     let detailRecord = null;  // 当前详情面板渲染所用的 ForwardRecord (raw view 直接用).
+
+    // 当前 filter 维度的游标 (语法糖, 避免散落各处的 cursors[filterMode]).
+    function cur() { return cursors[filterMode]; }
 
     // ─── tabs ──────────────────────────────────────────────────────────────
     document.querySelectorAll('nav.tabs a.tab').forEach(tab => {
@@ -653,22 +662,22 @@
 
     // ─── records tab ──────────────────────────────────────────────────────
     //
-    // 分页 + 过滤语义:
-    // - 初始 / 手动 refresh(): 只拉第一页 (offset=0, limit=PAGE_SIZE), 完全替换 records.
-    // - loadMore(): 追加拉下一页 (offset=loadedCount), append 到 records.
-    // - 自动刷新 (setInterval): 也只拉第一页. 若用户已 loadMore 到第 3 页, 自动刷新会
-    //   把视图重置到第一页 — 对开发工具是可接受的 (新请求通常就是用户想看的).
-    //   这避免了 "每 3 秒重拉所有页" 的浪费.
+    // 双游标分页语义 (后端 ?filter=all|hits 已按维度返回独立 total):
+    // - refresh(): 拉当前 filter 的第一页 (offset=0, limit=PAGE_SIZE), 完全替换该维度 records.
+    //   只刷新当前维度, 另一维度保留已加载内容 (切回时即用).
+    // - loadMore(): 追加当前 filter 的下一页.
+    // - setFilter(mode): 切换 filterMode; 若目标维度尚未加载过 (records 空 + total=0),
+    //   触发一次 fetch; 否则直接用已有缓存渲染.
+    // - 自动刷新 (setInterval): 也只刷当前 filter 第一页. 对开发工具是可接受的.
     async function refresh() {
       try {
-        const r = await fetch(`${API_RECORDS}?offset=0&limit=${PAGE_SIZE}`, { cache: 'no-store' });
+        const c = cur();
+        const r = await fetch(`${API_RECORDS}?offset=0&limit=${PAGE_SIZE}&filter=${filterMode}`, { cache: 'no-store' });
         if (!r.ok) throw new Error('HTTP ' + r.status);
         const data = await r.json();
-        records = data.records || [];
-        totalCount = data.total || 0;
-        loadedCount = records.length;
-        // 切回第一页可能让之前加载的 parsed cache 对应的 record 不再存在; 简单起见不清 cache,
-        // LRU 自然淘汰.
+        c.records = data.records || [];
+        c.total = data.total || 0;
+        c.offset = c.records.length;
         updateCountDisplay();
         renderSidebar();
         if (selectedId) {
@@ -693,18 +702,19 @@
       }
     }
 
-    // F4: 追加加载下一页. 失败时静默 (status 提示), 不影响已加载内容.
+    // 追加加载当前 filter 的下一页. 失败时静默 (status 提示), 不影响已加载内容.
     async function loadMore() {
       const btn = document.getElementById('load-more-btn');
       if (btn) btn.disabled = true;
       try {
-        const r = await fetch(`${API_RECORDS}?offset=${loadedCount}&limit=${PAGE_SIZE}`, { cache: 'no-store' });
+        const c = cur();
+        const r = await fetch(`${API_RECORDS}?offset=${c.offset}&limit=${PAGE_SIZE}&filter=${filterMode}`, { cache: 'no-store' });
         if (!r.ok) throw new Error('HTTP ' + r.status);
         const data = await r.json();
         const more = data.records || [];
-        records = records.concat(more);
-        totalCount = data.total || totalCount;
-        loadedCount = records.length;
+        c.records = c.records.concat(more);
+        c.total = data.total || c.total;
+        c.offset = c.records.length;
         updateCountDisplay();
         renderSidebar();
       } catch (e) {
@@ -715,61 +725,65 @@
       }
     }
 
-    // F6: header count 显示 total (而非 loadedCount), label 视情况显示 "loaded/total".
+    // header count 显示当前 filter 维度的 total; label 标注 loaded/total.
     function updateCountDisplay() {
+      const c = cur();
       const cnt = document.getElementById('count');
       const lbl = document.getElementById('count-label');
-      cnt.textContent = totalCount;
-      if (loadedCount < totalCount) {
-        lbl.textContent = `records (loaded ${loadedCount}/${totalCount})`;
+      cnt.textContent = c.total;
+      if (c.offset < c.total) {
+        lbl.textContent = `records [${filterMode}] (loaded ${c.offset}/${c.total})`;
       } else {
-        lbl.textContent = `records`;
+        lbl.textContent = `records [${filterMode}]`;
       }
     }
 
-    // F3: 更新 All / Hits 两个按钮的计数.
+    // All / Hits 按钮各自显示该维度的 total (来自后端, 非客户端计数).
     function updateFilterCounts() {
-      const allCount = records.length;
-      const hitsCount = records.filter(r => (r.redactions || []).length > 0).length;
       const allEl = document.getElementById('filter-all-count');
       const hitsEl = document.getElementById('filter-hits-count');
-      if (allEl) allEl.textContent = allCount;
-      if (hitsEl) hitsEl.textContent = hitsCount;
+      if (allEl) allEl.textContent = cursors.all.total;
+      if (hitsEl) hitsEl.textContent = cursors.hits.total;
     }
 
-    // F3: filter 按钮回调.
-    function setFilter(mode) {
+    // filter 按钮回调. 切换维度; 首次切到某维度时 lazy fetch.
+    async function setFilter(mode) {
+      if (mode === filterMode) return;
       filterMode = mode;
       document.getElementById('filter-all').classList.toggle('active', mode === 'all');
       document.getElementById('filter-hits').classList.toggle('active', mode === 'hits');
-      renderSidebar();
+      // 目标维度未加载过 → 先 fetch 再渲染. 已加载则直接用缓存.
+      if (cursors[mode].offset === 0 && cursors[mode].records.length === 0) {
+        await refresh();
+      } else {
+        updateCountDisplay();
+        renderSidebar();
+      }
     }
 
-    // F2/F3: 渲染侧栏列表. 先按 filterMode 过滤, 再渲染紧凑单行.
+    // 渲染侧栏列表. 直接用当前 filter 维度的缓存 records (后端已过滤).
     function renderSidebar() {
       const listEl = document.getElementById('record-list');
       const loadMoreWrap = document.getElementById('load-more-wrap');
+      const c = cur();
 
-      // 始终先更新计数 + load-more 可见性, 即使列表为空.
+      // 始终先更新两个维度的计数 + load-more 可见性, 即使列表为空.
       updateFilterCounts();
       if (loadMoreWrap) {
-        loadMoreWrap.style.display = (loadedCount < totalCount) ? '' : 'none';
+        loadMoreWrap.style.display = (c.offset < c.total) ? '' : 'none';
         const btn = document.getElementById('load-more-btn');
         if (btn) {
-          const remaining = totalCount - loadedCount;
-          btn.textContent = `Load more (${remaining} remaining of ${totalCount})`;
+          const remaining = c.total - c.offset;
+          btn.textContent = `Load more (${remaining} remaining of ${c.total})`;
         }
       }
 
-      const filtered = (filterMode === 'hits')
-        ? records.filter(r => (r.redactions || []).length > 0)
-        : records;
-
-      if (filtered.length === 0) {
+      const list = c.records;
+      if (list.length === 0) {
         listEl.innerHTML = `<div class="empty">${filterMode === 'hits' ? 'No redacted records' : 'No records yet'}</div>`;
         return;
       }
-      listEl.innerHTML = filtered.map(r => {
+      listEl.innerHTML = list.map(r => {
         const pid = providerIdOf(r.path);
         const status = escapeHtml(statusText(r));
         const statusCls = statusClass(r);

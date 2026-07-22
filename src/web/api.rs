@@ -29,7 +29,7 @@ use uuid::Uuid;
 use crate::config::{DeleteOutcome, OverrideMode, UpsertKind};
 use crate::provider::{EffectiveProvider, Protocol, Provider};
 use crate::proxy::ProxyState;
-use crate::record::ForwardRecord;
+use crate::record::{ForwardRecord, RecordFilter};
 use crate::secrets::{EffectiveSecret, SecretCategory, SecretEntry};
 
 /// 共享的 `no-store` header 设置 (axum 的 `[(name, value); N]` 接受 `(&str, &str)`).
@@ -41,24 +41,29 @@ const NO_STORE: [(&str, &str); 1] = [("cache-control", "no-store, no-cache, must
 ///
 /// - `offset`: 0-based, 从最新一条算起 (与 [`RecordStore::list_page`] 一致). 默认 0.
 /// - `limit`:  clamp 到 `[1, 200]`. 默认 50.
+/// - `filter`: `all` (默认) 或 `hits` (只返回发生过 redact 的记录). 两个维度各自
+///   独立分页, 响应 `total` 是当前 filter 维度下的总数.
 ///
-/// 设计: 用 `Option<usize>` 让缺失字段走默认值, 避免 axum Query 反序列化整体拒绝
-/// (例如只传 `?offset=10` 时 limit 仍取默认).
+/// 设计: 用 `Option<T>` 让缺失字段走默认值, 避免 axum Query 反序列化整体拒绝
+/// (例如只传 `?offset=10` 时 limit 仍取默认). 非法 filter 值走 serde 默认 (None → All),
+/// 不返回 400 — 前端 bug 不应让页面变白.
 #[derive(Debug, Deserialize)]
 pub struct RecordsQuery {
     #[serde(default)]
     pub offset: Option<usize>,
     #[serde(default)]
     pub limit: Option<usize>,
+    #[serde(default)]
+    pub filter: Option<RecordFilter>,
 }
 
 impl RecordsQuery {
-    /// 解析为生效的 `(offset, limit)`. 单一事实来源: 默认值 + clamp 都在这里.
-    fn resolve(&self) -> (usize, usize) {
+    /// 解析为生效的 `(offset, limit, filter)`. 单一事实来源: 默认值 + clamp 都在这里.
+    fn resolve(&self) -> (usize, usize, RecordFilter) {
         let offset = self.offset.unwrap_or(0);
         // 默认 50: 足够 WebUI 首屏, 又不会一次拖太多 (单条 record body 可能很大).
         let limit = self.limit.unwrap_or(50);
-        (offset, limit.clamp(1, 200))
+        (offset, limit.clamp(1, 200), self.filter.unwrap_or_default())
     }
 }
 
@@ -66,8 +71,8 @@ pub async fn list_records(
     State(state): State<ProxyState>,
     Query(q): Query<RecordsQuery>,
 ) -> impl IntoResponse {
-    let (offset, limit) = q.resolve();
-    let (records, total) = state.records.list_page(offset, limit);
+    let (offset, limit, filter) = q.resolve();
+    let (records, total) = state.records.list_page(offset, limit, filter);
     (
         NO_STORE,
         Json(ListRecordsResponse {
@@ -75,6 +80,7 @@ pub async fn list_records(
             total,
             offset,
             limit,
+            filter,
         }),
     )
 }
@@ -229,12 +235,16 @@ fn build_parsed_response(record: ForwardRecord) -> GetRecordResponse {
 #[derive(Serialize)]
 pub struct ListRecordsResponse {
     pub records: Vec<ForwardRecord>,
-    /// 总记录数 (用于前端分页器).
+    /// 当前 filter 维度下的总数 (用于前端分页器).
+    ///
+    /// `filter=all` 时等于 records 总量; `filter=hits` 时等于发生过 redact 的记录总数.
     pub total: usize,
     /// 当前页 offset (0-based).
     pub offset: usize,
     /// 当前页 limit (clamp 后的实际生效值, 便于前端校验).
     pub limit: usize,
+    /// 当前生效的 filter (回显, 让前端无状态地确认).
+    pub filter: RecordFilter,
 }
 
 // ─── /secrets ──────────────────────────────────────────────────────────────
@@ -766,8 +776,9 @@ mod tests {
         let q = RecordsQuery {
             offset: None,
             limit: None,
+            filter: None,
         };
-        assert_eq!(q.resolve(), (0, 50));
+        assert_eq!(q.resolve(), (0, 50, RecordFilter::All));
     }
 
     #[test]
@@ -776,14 +787,27 @@ mod tests {
         let q = RecordsQuery {
             offset: None,
             limit: Some(0),
+            filter: None,
         };
-        assert_eq!(q.resolve(), (0, 1));
+        assert_eq!(q.resolve(), (0, 1, RecordFilter::All));
         // limit 超大 → clamp 到 200.
         let q = RecordsQuery {
             offset: None,
             limit: Some(10_000),
+            filter: None,
         };
-        assert_eq!(q.resolve(), (0, 200));
+        assert_eq!(q.resolve(), (0, 200, RecordFilter::All));
+    }
+
+    #[test]
+    fn records_query_passes_hits_filter_through() {
+        // 显式传 filter=hits 应原样透传.
+        let q = RecordsQuery {
+            offset: Some(10),
+            limit: Some(20),
+            filter: Some(RecordFilter::Hits),
+        };
+        assert_eq!(q.resolve(), (10, 20, RecordFilter::Hits));
     }
 
     // ─── build_parsed_response ────────────────────────────────────────────

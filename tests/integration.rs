@@ -1538,6 +1538,89 @@ async fn web_api_records_list_respects_offset_limit() {
 }
 
 #[tokio::test]
+async fn web_api_records_list_filter_hits_returns_only_redacted() {
+    // 构造混合场景: 2 条命中 secret (redactions 非空) + 2 条 passthrough (redactions 空).
+    // filter=hits 应只返回 2 条命中, total=2; filter=all 仍 total=4.
+    let real_secret = "sk-filter-test-789";
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    let entries = vec![secret("hit-key", real_secret)];
+    let secrets = test_secret_table_with(entries);
+    let upstream_client = reqwest::Client::new();
+    let records = RecordStore::new(64);
+    let provider = openai_provider("oa-main", &upstream.url());
+    let proxy_url = spawn_proxy_full(vec![provider], upstream_client, records, secrets).await;
+
+    let hit_body = format!(r#"{{"messages":[{{"content":"use {real_secret}"}}]}}"#);
+    let plain_body = r#"{"messages":[{"content":"plain"}]}"#;
+    // 交错发送: plain, hit, plain, hit. 顺序不重要 (list 倒序), 但要保证两类都有.
+    for body in [plain_body, &hit_body, plain_body, &hit_body] {
+        let _ = reqwest::Client::new()
+            .post(format!("{proxy_url}/o/oa-main/v1/chat/completions"))
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap();
+    }
+    let _ = wait_for_record_count(&format!("{proxy_url}/__sg/api/records"), 4).await;
+
+    // filter=all: total=4.
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{proxy_url}/__sg/api/records?filter=all"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["total"], 4, "filter=all should see all 4 records");
+    assert_eq!(body["filter"], "all");
+    assert_eq!(body["records"].as_array().unwrap().len(), 4);
+
+    // filter=hits: total=2, 只含带 redactions 的记录.
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{proxy_url}/__sg/api/records?filter=hits"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["total"], 2, "filter=hits should see only 2 redacted");
+    assert_eq!(body["filter"], "hits");
+    let recs = body["records"].as_array().unwrap();
+    assert_eq!(recs.len(), 2);
+    for r in recs {
+        let reds = r["redactions"].as_array().unwrap();
+        assert!(
+            !reds.is_empty(),
+            "hits filter must not return plain records"
+        );
+        assert_eq!(reds[0][1], "hit-key");
+    }
+
+    // 默认 (省略 filter) 应等价于 filter=all.
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{proxy_url}/__sg/api/records"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["total"], 4);
+    assert_eq!(body["filter"], "all");
+}
+
+#[tokio::test]
 async fn web_api_records_view_parsed_openai_returns_structured() {
     // view=parsed 应当用 OpenAI codec 把 req_body 解析成结构化 JSON.
     let mut upstream = spawn_mock_upstream().await;
