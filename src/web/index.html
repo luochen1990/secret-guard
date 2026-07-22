@@ -280,28 +280,81 @@
       vertical-align: middle;
     }
 
-    /* ─── F2: records sidebar compact single-line ─────────────────────────── */
+    /* ─── records sidebar: two-line dense layout ────────────────────────────
+       第一行: [provider-icon] [message-preview (主标题)] [hit-badge] [status]
+       第二行: [辅助信息: time · elapsed · path (淡色小字)] */
     .record-item {
-      display: flex;
-      justify-content: space-between;
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      grid-template-rows: auto auto;
+      grid-template-areas:
+        "icon line1 right"
+        "icon line2 right";
       align-items: center;
-      gap: 6px;
-      padding: 5px 12px;
-      line-height: 1.4;
+      gap: 1px 6px;
+      padding: 4px 10px;
+      line-height: 1.35;
+      cursor: pointer;
     }
-    .record-item .ri-left {
-      flex: 1 1 auto;
+    .record-item .ri-icon { grid-area: icon; }
+    .record-item .ri-right {
+      grid-area: right;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      align-self: center;
+    }
+    .record-item .ri-line1,
+    .record-item .ri-line2 {
       min-width: 0;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
     }
-    .record-item .ri-right {
-      flex: 0 0 auto;
+    .record-item .ri-line1 {
+      grid-area: line1;
+      font-size: 12.5px;
+      color: #222;
+    }
+    .record-item .ri-line2 {
+      grid-area: line2;
+      font-size: 10.5px;
+      color: #999;
+    }
+    .record-item.active .ri-line2 { color: #6a87b3; }
+
+    /* provider 复合图标: 圆形彩色背景 + 首字母 + 协议角标.
+       颜色由 provider id 哈希到固定调色板 (见 providerColor()).
+       角标用各家协议的简化 SVG (见 protocolBadgeSvg()). */
+    .pv-icon {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      color: #fff;
+      font-size: 11px;
+      font-weight: bold;
+      flex-shrink: 0;
+      text-transform: uppercase;
+    }
+    .pv-icon .pv-proto {
+      position: absolute;
+      right: -2px;
+      bottom: -2px;
+      width: 11px;
+      height: 11px;
+      border-radius: 50%;
+      background: #fff;
+      border: 1px solid #ccc;
       display: flex;
       align-items: center;
-      gap: 4px;
+      justify-content: center;
     }
+    .pv-icon .pv-proto svg { width: 7px; height: 7px; display: block; }
+
     .badge-hit {
       background: #f59e0b;
       color: #fff;
@@ -417,7 +470,8 @@
     .bubble-tool       { background: #f5f5f5; margin-right: auto; font-family: ui-monospace, monospace; font-size: 11.5px; }
 
     /* collapsible bubbles: 默认折叠到 3 行, 超过部分溢出隐藏 + 渐隐 + 展开/收起按钮.
-       JS 在渲染后用 scrollHeight > clientHeight 判断是否需要折叠 (内容 ≤3 行不折叠). */
+       JS (applyBubbleCollapse) 渲染后测量 scrollHeight 与 lineHeight*3 的像素阈值比较,
+       因为折叠前 max-height 是 none, clientHeight==scrollHeight 无法用"溢出"判断. */
     .chat-bubble.collapsed {
       max-height: 4.5em;       /* 3 行 × line-height 1.5 */
       overflow: hidden;
@@ -662,10 +716,12 @@
     // 后端按 ?filter=all|hits 过滤并返回该维度下的 total, 前端不再做客户端筛选.
     const PAGE_SIZE = 50;
     // 每个维度各自缓存已加载的 records 与游标. 切换 tab 时直接用对应缓存渲染,
-    // 首次切到 Hits 才发请求 (lazy).
+    // 首次切到 Hits 才发请求 (lazy). loaded 标志区分"空结果"与"从未加载" (M7).
+    // 注意: 自动 refresh 只拉第一页, 会重置 offset + records (与 loadMore 累积互斥).
+    // 这是开发工具的预期行为 — 新请求通常就是用户想看的, 不做无谓的全量重拉.
     const cursors = {
-      all: { offset: 0, total: 0, records: [] },
-      hits: { offset: 0, total: 0, records: [] },
+      all: { offset: 0, total: 0, records: [], loaded: false },
+      hits: { offset: 0, total: 0, records: [], loaded: false },
     };
     let filterMode = 'all';   // 'all' | 'hits'.
     let detailView = 'raw';   // 'raw' | 'parsed'.
@@ -697,20 +753,32 @@
     //
     // 双游标分页语义 (后端 ?filter=all|hits 已按维度返回独立 total):
     // - refresh(): 拉当前 filter 的第一页 (offset=0, limit=PAGE_SIZE), 完全替换该维度 records.
-    //   只刷新当前维度, 另一维度保留已加载内容 (切回时即用).
+    //   同时并发拉另一维度的 total (limit=1, 只为计数), 保证两个按钮数字始终准确.
+    //   另一维度已加载的 records 不被清空 (切回时即用).
     // - loadMore(): 追加当前 filter 的下一页.
     // - setFilter(mode): 切换 filterMode; 若目标维度尚未加载过 (records 空 + total=0),
-    //   触发一次 fetch; 否则直接用已有缓存渲染.
-    // - 自动刷新 (setInterval): 也只刷当前 filter 第一页. 对开发工具是可接受的.
+    //   触发一次完整 fetch; 否则直接用已有缓存渲染.
+    // - 自动刷新 (setInterval): 也只刷当前 filter 第一页 + 另一维度计数.
     async function refresh() {
       try {
         const c = cur();
-        const r = await fetch(`${API_RECORDS}?offset=0&limit=${PAGE_SIZE}&filter=${filterMode}`, { cache: 'no-store' });
-        if (!r.ok) throw new Error('HTTP ' + r.status);
-        const data = await r.json();
+        const otherMode = filterMode === 'all' ? 'hits' : 'all';
+        // 并发: 当前维度完整第一页 + 另一维度仅 total (limit=1 省带宽).
+        const [curResp, otherResp] = await Promise.all([
+          fetch(`${API_RECORDS}?offset=0&limit=${PAGE_SIZE}&filter=${filterMode}`, { cache: 'no-store' }),
+          fetch(`${API_RECORDS}?offset=0&limit=1&filter=${otherMode}`, { cache: 'no-store' }),
+        ]);
+        if (!curResp.ok) throw new Error('HTTP ' + curResp.status);
+        const data = await curResp.json();
         c.records = data.records || [];
         c.total = data.total || 0;
         c.offset = c.records.length;
+        c.loaded = true;
+        // 更新另一维度 total (不触碰其 records/offset).
+        if (otherResp.ok) {
+          const od = await otherResp.json();
+          cursors[otherMode].total = od.total || 0;
+        }
         updateCountDisplay();
         renderSidebar();
         if (selectedId) {
@@ -748,6 +816,7 @@
         c.records = c.records.concat(more);
         c.total = data.total || c.total;
         c.offset = c.records.length;
+        c.loaded = true;
         updateCountDisplay();
         renderSidebar();
       } catch (e) {
@@ -780,13 +849,14 @@
     }
 
     // filter 按钮回调. 切换维度; 首次切到某维度时 lazy fetch.
+    // 用 loaded 标志而非 "records 空" 判断, 因为该维度可能合法地返回 0 条.
     async function setFilter(mode) {
       if (mode === filterMode) return;
       filterMode = mode;
       document.getElementById('filter-all').classList.toggle('active', mode === 'all');
       document.getElementById('filter-hits').classList.toggle('active', mode === 'hits');
       // 目标维度未加载过 → 先 fetch 再渲染. 已加载则直接用缓存.
-      if (cursors[mode].offset === 0 && cursors[mode].records.length === 0) {
+      if (!cursors[mode].loaded) {
         await refresh();
       } else {
         updateCountDisplay();
@@ -795,6 +865,10 @@
     }
 
     // 渲染侧栏列表. 直接用当前 filter 维度的缓存 records (后端已过滤).
+    // 优化: 若 records 的 id 序列 + 关键展示字段 (status/elapsed/hitN/resp_complete)
+    // 与上次渲染完全一致, 跳过 innerHTML 重建, 避免自动刷新时的视觉抖动 + 重复 JSON.parse.
+    // selectedId 变化时仍需重渲染 (更新 active 高亮).
+    let lastSidebarFingerprint = '';
     function renderSidebar() {
       const listEl = document.getElementById('record-list');
       const loadMoreWrap = document.getElementById('load-more-wrap');
@@ -813,18 +887,32 @@
 
       const list = c.records;
       if (list.length === 0) {
+        lastSidebarFingerprint = '';
         listEl.innerHTML = `<div class="empty">${filterMode === 'hits' ? 'No redacted records' : 'No records yet'}</div>`;
         return;
       }
+      // 指纹: id + selectedId + status/elapsed/hitN (这些字段变化时需要重渲染).
+      // 时间不进指纹 (created_at 不变); preview 不进指纹 (挂在 record 上, 不变).
+      const fingerprint = filterMode + '|' + selectedId + '|' + list.map(r =>
+        `${r.id}:${r.resp_status}:${r.elapsed_ms}:${r.error || ''}:${(r.redactions||[]).length}`
+      ).join(',');
+      if (fingerprint === lastSidebarFingerprint) return;
+      lastSidebarFingerprint = fingerprint;
+
       listEl.innerHTML = list.map(r => {
-        const pid = providerIdOf(r.path);
+        const { proto, id: pid } = parsePath(r.path);
+        const preview = messagePreview(r);
         const status = escapeHtml(statusText(r));
         const statusCls = statusClass(r);
         const hitN = (r.redactions || []).length;
         const hitBadge = hitN > 0 ? `<span class="badge-hit" title="${hitN} redaction(s)">${hitN}</span>` : '';
-        // title: 完整多行信息 (浏览器原生 tooltip, \n 会按 plain text 渲染).
+        const iconHtml = providerIcon(pid, proto);
+        // 第二行辅助信息: time · elapsed · provider_id (淡色).
+        const line2 = `${escapeHtml(formatTime(r.created_at))} · ${r.elapsed_ms}ms · ${escapeHtml(pid)}`;
+        // title: 完整多行信息 (浏览器原生 tooltip).
         const title = [
           `${r.method} ${r.path}`,
+          `provider: ${pid} (${proto})`,
           `status: ${statusText(r)}`,
           `elapsed: ${r.elapsed_ms}ms`,
           `time: ${formatTime(r.created_at)}`,
@@ -832,11 +920,13 @@
         ].join('\n');
         return `
           <div class="record-item ${r.id === selectedId ? 'active' : ''}" data-id="${escapeHtml(r.id)}" title="${escapeHtml(title)}">
-            <span class="ri-left" title="${escapeHtml(r.path)}">${escapeHtml(pid)}</span>
+            ${iconHtml}
+            <span class="ri-line1" title="${escapeHtml(preview)}">${escapeHtml(preview)}</span>
             <span class="ri-right">
-              <span class="${statusCls}">${status}</span>
+              <span class="${statusCls}" title="${status}">${status}</span>
               ${hitBadge}
             </span>
+            <span class="ri-line2">${line2}</span>
           </div>
         `;
       }).join('');
@@ -845,11 +935,109 @@
       });
     }
 
-    // F2: 从 path 中提取 provider_id. 形如 "/o/<id>/...", split 后 index 2 是 id.
-    function providerIdOf(path) {
+    // ─── sidebar 渲染辅助 ──────────────────────────────────────────────────
+
+    // 从 path 中提取 {proto, id}. 形如 "/o/<id>/...", split 后 index 1 是协议短码,
+    // index 2 是 provider id. 合并一次 split, 避免每条 record 解析两次.
+    function parsePath(path) {
       const parts = String(path || '').split('/');
-      // ["", "o", "<id>", "..."] → index 2. 若缺失返回 <unknown>.
-      return parts[2] || '<unknown>';
+      return { proto: parts[1] || '?', id: parts[2] || '<unknown>' };
+    }
+
+    // 从 req_body 提取首个 user message 的文本作为侧栏主标题.
+    // 支持 OpenAI / Anthropic 两种 schema:
+    //   - {messages:[{role:"user", content:"..."}]}  (content 是 string 或 [{type:"text",text:"..."}])
+    //   - 顶层 system 不取 (太长且无辨识度), 只取 role=user.
+    // 解析失败 / 无 user message → fallback 到 method + path.
+    // 结果挂在 record 对象 _preview 上, 随 records 数组替换自然回收 (无独立缓存泄漏风险).
+    // 对超大 body (>64KB) 直接走 fallback, 避免 JSON.parse 阻塞主线程 (M2).
+    const PREVIEW_MAX = 48;
+    const PREVIEW_BODY_MAX = 65536;
+    function messagePreview(r) {
+      if (r._preview !== undefined) return r._preview;
+      let preview = '';
+      const body = r.req_body || '';
+      // 超大 body 不尝试 parse (避免阻塞); 空 body 直接 fallback.
+      if (body.length > 0 && body.length <= PREVIEW_BODY_MAX) {
+        try {
+          const j = JSON.parse(body);
+          const msgs = Array.isArray(j.messages) ? j.messages : [];
+          for (const m of msgs) {
+            if (String(m.role || '') !== 'user') continue;
+            const c = m.content;
+            let t = '';
+            if (typeof c === 'string') t = c;
+            else if (Array.isArray(c)) {
+              t = c
+                .filter(b => b && b.type === 'text' && typeof b.text === 'string')
+                .map(b => b.text)
+                .join(' ');
+            }
+            if (t) { preview = t; break; }
+          }
+        } catch (_) { /* 非 JSON, 走 fallback */ }
+      }
+      // 归一化: 去多余空白 + 截断.
+      preview = String(preview || '').replace(/\s+/g, ' ').trim();
+      if (!preview) {
+        preview = `${r.method} ${r.path}`;
+      }
+      if (preview.length > PREVIEW_MAX) {
+        preview = preview.slice(0, PREVIEW_MAX) + '…';
+      }
+      r._preview = preview;
+      return preview;
+    }
+
+    // provider 复合图标: 圆形彩色背景 + 首字母 + 协议角标.
+    // 颜色: provider id 哈希到固定调色板 (低饱和度, 保证文字可读).
+    // 角标: 协议对应的简化 SVG (见 protocolBadgeSvg).
+    // 注意: color 来自 providerColor() 的硬编码调色板, 必为 #xxxxxx 字面量 (SSOT),
+    // 因此直接拼进 style 属性是安全的. 若未来引入用户可控颜色, 需改用 setProperty.
+    function providerIcon(providerId, protoShort) {
+      const color = providerColor(providerId);
+      const letter = escapeHtml(String(providerId || '?').charAt(0));
+      const badge = protocolBadgeSvg(protoShort);
+      return `<span class="pv-icon" style="background:${color}" title="${escapeHtml(providerId)} (${escapeHtml(protoShort)})">${letter}<span class="pv-proto">${badge}</span></span>`;
+    }
+
+    // provider id 哈希到调色板. 用 FNV-1a (简单, 无需 crypto), 对 ASCII 字符稳定.
+    // 调色板: 8 个中等饱和度色, 白字可读.
+    const PROVIDER_PALETTE = [
+      '#4a6fa5', // 蓝
+      '#5b8c5a', // 绿
+      '#b5712a', // 橙
+      '#a0537a', // 紫红
+      '#3a7a8c', // 青
+      '#8c5a3a', // 棕
+      '#6b5b8c', // 紫
+      '#a04a4a', // 红
+    ];
+    function providerColor(id) {
+      let h = 2166136261 >>> 0;
+      for (let i = 0; i < id.length; i++) {
+        h ^= id.charCodeAt(i);
+        h = Math.imul(h, 16777619) >>> 0;
+      }
+      return PROVIDER_PALETTE[h % PROVIDER_PALETTE.length];
+    }
+
+    // 协议角标 SVG (简化几何符号, 7×7 viewport 内可辨识).
+    // 每个协议用固定的品牌色硬编码 (OpenAI 绿 / Anthropic 橙 / Gemini 蓝 / Ollama 灰).
+    // 未知协议 → 空角标 (仅白色圆 + 边框).
+    // 模块级常量, 避免每次渲染重建对象字面量.
+    const PROTO_BADGE_SVG = {
+      // OpenAI: 简化为 "六瓣花" 风格的圆环.
+      o: '<svg viewBox="0 0 10 10"><circle cx="5" cy="5" r="3" fill="none" stroke="#10a37f" stroke-width="1.5"/></svg>',
+      // Anthropic: 简化为放射状 (Claude 的太阳意象).
+      a: '<svg viewBox="0 0 10 10"><circle cx="5" cy="5" r="2" fill="#d97757"/><circle cx="5" cy="5" r="4" fill="none" stroke="#d97757" stroke-width="0.8" stroke-dasharray="1.5 1.5"/></svg>',
+      // Gemini: 简化为四芒星.
+      g: '<svg viewBox="0 0 10 10"><path d="M5 0 L6 4 L10 5 L6 6 L5 10 L4 6 L0 5 L4 4 Z" fill="#4285f4"/></svg>',
+      // Ollama: 简化为实心圆 (本地 llama).
+      l: '<svg viewBox="0 0 10 10"><circle cx="5" cy="5" r="3" fill="#888"/></svg>',
+    };
+    function protocolBadgeSvg(protoShort) {
+      return PROTO_BADGE_SVG[protoShort] || '';
     }
 
     function statusClass(r) {
@@ -1106,24 +1294,30 @@
     function renderBubble(cls, text, redactions, roleLabel) {
       const roleDisplay = roleLabel || cls;
       // applyMockHighlight 期望输入是已经 escapeHtml 过的字符串.
+      // 注意: bubble 用 white-space: pre-wrap 渲染, 文本前后的空白会被保留.
+      // 所以 safeText 必须紧跟 </span>, 中间不能有换行/缩进, 否则会渲染出空行.
       const safeText = applyMockHighlight(escapeHtml(text), redactions);
-      return `<div class="chat-bubble bubble-${cls}">
-        <span class="bubble-role">${escapeHtml(roleDisplay)}</span>
-        ${safeText}
-      </div>`;
+      return `<div class="chat-bubble bubble-${cls}"><span class="bubble-role">${escapeHtml(roleDisplay)}</span>${safeText}</div>`;
     }
 
-    // 折叠超过 3 行的气泡: 渲染后检测 scrollHeight > clientHeight, 若溢出则
-    // 加 .collapsed + 注入 "展开/收起" 按钮. 点击 toggle 仅切换 class, 不重新渲染,
+    // 折叠超过 3 行的气泡: 判断内容自然高度是否超过折叠阈值 (4.5em ≈ 67px @ 12.5px*1.5).
+    // 超过则加 .collapsed + 注入 "展开/收起" 按钮. 点击 toggle 仅切换 class, 不重新渲染,
     // 保留滚动位置与 mock 高亮状态.
+    //
+    // 测量策略: 折叠前 max-height 是 none, clientHeight == scrollHeight, 无法用
+    // "溢出" 判断. 改为直接比较 scrollHeight 与换算后的像素阈值.
     function applyBubbleCollapse() {
       const bubbles = document.querySelectorAll('#detail .chat-bubble');
+      // 3 行 × line-height 1.5 × font-size 12.5px = 56.25px. 留 2px 容差.
+      // 取 bubble 上生效的 font-size 计算, 而非硬编码 (bubble-tool 是 11.5px).
       bubbles.forEach(bubble => {
-        // 已处理过 (切换详情/重渲染时跳过).
         if (bubble.dataset.collapseReady === '1') return;
-        // 先临时移除可能存在的 collapsed 以测量真实高度.
         bubble.classList.remove('collapsed');
-        const overflowed = bubble.scrollHeight - bubble.clientHeight > 2;
+        const style = getComputedStyle(bubble);
+        const fontSize = parseFloat(style.fontSize) || 12.5;
+        const lineHeight = parseFloat(style.lineHeight) || (fontSize * 1.5);
+        const threshold = lineHeight * 3 + 2;
+        const overflowed = bubble.scrollHeight > threshold;
         if (!overflowed) {
           bubble.dataset.collapseReady = '1';
           return;
