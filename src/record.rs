@@ -50,8 +50,22 @@ pub struct ForwardRecord {
     pub resp_status: u16,
     /// 上游响应的所有 header.
     pub resp_headers: Vec<(String, String)>,
-    /// 上游响应 body (流式 SSE 也会被拼接保存).
+    /// 上游响应 body.
+    ///
+    /// - **非流式响应**: 原始 JSON body (与上游返回的字节一致, UTF-8 视图).
+    /// - **流式响应**: **不再保留原始 SSE 字节** (骨架开销大、可读性差).
+    ///   流式响应的语义内容通过 [`resp_parsed`](Self::resp_parsed) 累积.
+    ///   raw view 在流式场景下显示 "raw bytes not retained for streamed responses".
     pub resp_body: String,
+    /// 解析后的响应 (ingress 协议的 canonical chat JSON, chat-bubble 友好).
+    ///
+    /// - **非流式**: 在响应完成时由 codec reader → IR → writer 计算一次.
+    /// - **流式**: 在流过程中由 `StreamScan` 增量累积, 节流写入.
+    ///
+    /// `None` 表示尚未有解析结果 (流刚开始 / codec 不支持此协议 / 解析失败).
+    /// 对应 `GET /records/{id}?view=parsed` 的 `parsed_response` 字段.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resp_parsed: Option<serde_json::Value>,
     /// 端到端耗时 (毫秒).
     pub elapsed_ms: u64,
     /// 流式标记: true 表示响应是 chunked / SSE.
@@ -75,11 +89,14 @@ pub struct ForwardRecord {
 }
 
 /// 响应更新参数. 抽为结构体以避免 `update_response_full` 函数参数过多.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ResponseUpdate {
     pub resp_status: u16,
     pub resp_headers: Vec<(String, String)>,
     pub resp_body: String,
+    /// 解析后的响应 (非流式由 caller 计算后传入; 流式由 StreamScan 增量更新).
+    /// `None` 表示不更新此字段 (保留原值) — 用于流过程中的元数据更新 (status/headers).
+    pub resp_parsed: Option<serde_json::Value>,
     pub elapsed_ms: u64,
     pub streamed: bool,
     pub resp_complete: bool,
@@ -103,6 +120,7 @@ impl ForwardRecord {
             resp_status: 0,
             resp_headers: Vec::new(),
             resp_body: String::new(),
+            resp_parsed: None,
             elapsed_ms: 0,
             streamed: false,
             resp_complete: false,
@@ -171,30 +189,6 @@ impl RecordStore {
         id
     }
 
-    /// 按 id 更新已有记录的响应部分 (成功完成).
-    pub fn update_response(
-        &self,
-        id: Uuid,
-        resp_status: u16,
-        resp_headers: Vec<(String, String)>,
-        resp_body: String,
-        elapsed_ms: u64,
-        streamed: bool,
-    ) {
-        self.update_response_full(
-            id,
-            ResponseUpdate {
-                resp_status,
-                resp_headers,
-                resp_body,
-                elapsed_ms,
-                streamed,
-                resp_complete: true,
-                error: None,
-            },
-        );
-    }
-
     /// 按 id 更新记录, 允许标记 incomplete 与错误诊断 (用于上游错误 / 客户端断开).
     pub fn update_response_full(&self, id: Uuid, update: ResponseUpdate) {
         let mut g = self.inner.write();
@@ -209,10 +203,31 @@ impl RecordStore {
             r.resp_status = update.resp_status;
             r.resp_headers = update.resp_headers;
             r.resp_body = update.resp_body;
+            if let Some(parsed) = update.resp_parsed {
+                r.resp_parsed = Some(parsed);
+            }
             r.elapsed_ms = update.elapsed_ms;
             r.streamed = update.streamed;
             r.resp_complete = update.resp_complete;
             r.error = update.error;
+        }
+    }
+
+    /// 按 id 增量更新 parsed 响应 (流式场景专用).
+    ///
+    /// 只更新 `resp_parsed`, 不触碰 status / headers / body 等字段.
+    /// 用于 fan_out task 在流过程中节流地把 StreamScan 的 IrResponse 快照写入 record.
+    pub fn update_parsed_response(&self, id: Uuid, parsed: serde_json::Value) {
+        let mut g = self.inner.write();
+        let idx = match g.index.get(&id) {
+            Some(&i) => i,
+            None => {
+                tracing::warn!(%id, "record not found in update_parsed_response (evicted?)");
+                return;
+            }
+        };
+        if let Some(r) = g.records.get_mut(idx) {
+            r.resp_parsed = Some(parsed);
         }
     }
 
@@ -344,7 +359,15 @@ mod tests {
     fn update_response_persists() {
         let store = RecordStore::new(8);
         let id = store.push(fake_record("POST", "/x"));
-        store.update_response(id, 200, vec![], "hello".into(), 5, false);
+        store.update_response_full(
+            id,
+            ResponseUpdate {
+                resp_status: 200,
+                resp_body: "hello".into(),
+                resp_complete: true,
+                ..Default::default()
+            },
+        );
         let got = store.get(id).expect("record exists");
         assert_eq!(got.resp_status, 200);
         assert_eq!(got.resp_body, "hello");
@@ -362,6 +385,7 @@ mod tests {
                 resp_status: 200,
                 resp_headers: vec![],
                 resp_body: "partial".into(),
+                resp_parsed: None,
                 elapsed_ms: 5,
                 streamed: true,
                 resp_complete: false,
@@ -378,7 +402,15 @@ mod tests {
         let store = RecordStore::new(1);
         let a = store.push(fake_record("POST", "/a"));
         let _ = store.push(fake_record("POST", "/b")); // evicts a
-        store.update_response(a, 200, vec![], "late".into(), 1, false);
+        store.update_response_full(
+            a,
+            ResponseUpdate {
+                resp_status: 200,
+                resp_body: "late".into(),
+                resp_complete: true,
+                ..Default::default()
+            },
+        );
         // 不 panic 即可; 期望行为: warn + no-op.
     }
 

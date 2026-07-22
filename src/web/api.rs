@@ -73,10 +73,13 @@ pub async fn list_records(
 ) -> impl IntoResponse {
     let (offset, limit, filter) = q.resolve();
     let (records, total) = state.records.list_page(offset, limit, filter);
+    // list 只返回轻量 metadata, 不含 req_body / resp_body / resp_parsed.
+    // body 由 GET /records/{id}?view=... 按需拉取 (避免 list 传输大量字节).
+    let summaries: Vec<RecordSummary> = records.into_iter().map(RecordSummary::from).collect();
     (
         NO_STORE,
         Json(ListRecordsResponse {
-            records,
+            records: summaries,
             total,
             offset,
             limit,
@@ -91,9 +94,10 @@ pub async fn get_record(
     Query(q): Query<RecordQuery>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let record = state.records.get(id).ok_or(StatusCode::NOT_FOUND)?;
-    // 默认 view=raw → 直接返回原 record, 无解析开销.
-    // 注意: 我们**总是**返回 GetRecordResponse envelope, 让前端 shape 固定.
-    // raw view 下 parsed_*/parse_error 全为 None.
+    // 我们总是返回 GetRecordResponse envelope, 让前端 shape 固定.
+    // raw view: parsed_*/parse_error 全 None.
+    // parsed view: parsed_response 直接从 record.resp_parsed 读取 (流式/非流式统一);
+    //   parsed_request 仍需按需从 req_body 计算.
     let wants_parsed = q.view.as_deref() == Some("parsed");
     if !wants_parsed {
         return Ok((
@@ -106,7 +110,6 @@ pub async fn get_record(
             }),
         ));
     }
-    // parsed view: 用 codec 把 wire body parse → IR → 重新 serialize 给前端.
     let resp = build_parsed_response(record);
     Ok((NO_STORE, Json(resp)))
 }
@@ -114,8 +117,8 @@ pub async fn get_record(
 /// `GET /api/records/{id}?view=` 的查询参数.
 ///
 /// - `view=raw` (默认 / 省略): 仅返回 record 原文.
-/// - `view=parsed`: 尝试用 ingress 协议的 codec 把 req/resp body parse 成
-///   结构化 JSON (chat-like 视图). 失败时填 `parse_error`, 不影响 HTTP 200.
+/// - `view=parsed`: parsed_response 直接从 record.resp_parsed 读取;
+///   parsed_request 按需用 ingress codec 从 req_body 计算.
 #[derive(Debug, Deserialize)]
 pub struct RecordQuery {
     #[serde(default)]
@@ -125,8 +128,9 @@ pub struct RecordQuery {
 /// `GET /api/records/{id}` 的统一响应 envelope.
 ///
 /// - raw view: `record` 是原文, `parsed_*` 全 None.
-/// - parsed view: 若 codec 支持 + body 合法, `parsed_request`/`parsed_response`
-///   是 ingress writer 重序列化后的 JSON (chat-bubble 友好); 失败时填 `parse_error`.
+/// - parsed view: `parsed_response` 直接从 `record.resp_parsed` 读取
+///   (流式/非流式统一, 由 proxy 层的 StreamScan 累积或非流式路径一次性计算);
+///   `parsed_request` 按需用 codec 计算.
 ///
 /// 前端拿到固定 shape 后, 根据 `parse_error` 决定 fallback 到原文展示.
 #[derive(Serialize)]
@@ -137,24 +141,19 @@ pub struct GetRecordResponse {
     pub parse_error: Option<String>,
 }
 
-/// 解析 record 的 req/resp body 为结构化 JSON (ingress writer 投影).
+/// 解析 record 的 req body 为结构化 JSON (ingress writer 投影).
 ///
-/// 单一事实来源: 所有 "parsed view 不可用" 的原因都在这里分类:
+/// parsed_response 直接从 `record.resp_parsed` 读取 (proxy 层已计算).
+/// parsed_request 仍需按需从 `record.req_body` 计算:
 /// - protocol 短名未知 → `parsed view not available for protocol '<X>'`
 /// - codec 不支持此协议 (Gemini/Ollama) → 同上
 /// - body 不是合法 JSON → `invalid JSON: <err>`
 /// - codec reader 解析失败 → `<reader error message>`
-///
-/// 返回的 `parsed_request` / `parsed_response` 来自 ingress writer 的
-/// `write_request` / `write_response` — 这是协议 canonical JSON 投影,
-/// 前端可以按 chat-bubble 风格渲染.
-///
-/// MVP 限制: **流式响应不解析** (ForwardRecord.resp_body 是拼接后的 SSE chunk,
-/// 不是单个 JSON). 若 `record.streamed`, 跳过 response 解析.
 fn build_parsed_response(record: ForwardRecord) -> GetRecordResponse {
-    // 1. 从 record.path 的首段提取 ingress protocol short (e.g. "/o/x/..." → "o").
-    //    cross-proto 路径形如 "/o/x/...  [openai → anthropic]", 首段仍是 ingress.
-    //    先 clone 出 short, 避免后续 move record 时 borrow 冲突.
+    // parsed_response 直接取 record 内的累积结果.
+    let parsed_response = record.resp_parsed.clone();
+
+    // parsed_request: 从 req_body 计算.
     let proto_short = record
         .path
         .trim_start_matches('/')
@@ -166,7 +165,7 @@ fn build_parsed_response(record: ForwardRecord) -> GetRecordResponse {
         return GetRecordResponse {
             record,
             parsed_request: None,
-            parsed_response: None,
+            parsed_response,
             parse_error: Some(format!(
                 "parsed view not available for protocol '{proto_short}'"
             )),
@@ -176,7 +175,7 @@ fn build_parsed_response(record: ForwardRecord) -> GetRecordResponse {
         return GetRecordResponse {
             record,
             parsed_request: None,
-            parsed_response: None,
+            parsed_response,
             parse_error: Some(format!(
                 "parsed view not available for protocol '{}'",
                 native.name()
@@ -187,7 +186,6 @@ fn build_parsed_response(record: ForwardRecord) -> GetRecordResponse {
     let reader = codec_proto.reader();
     let writer = codec_proto.writer();
 
-    // 2. parsed_request: 总是尝试 (req_body 永远是单 JSON, 即便是 streaming 请求).
     let mut parsed_request = None;
     let mut parse_error: Option<String> = None;
     match serde_json::from_str::<serde_json::Value>(&record.req_body) {
@@ -198,32 +196,6 @@ fn build_parsed_response(record: ForwardRecord) -> GetRecordResponse {
         Err(e) => parse_error = Some(format!("invalid JSON in req_body: {e}")),
     }
 
-    // 3. parsed_response: 仅在非流式 + 2xx + 非空时尝试.
-    //    流式响应的 resp_body 是 SSE 拼接, 不是单个 JSON, 解析必失败 → 直接跳过.
-    let mut parsed_response = None;
-    if !record.streamed
-        && record.resp_status >= 200
-        && record.resp_status < 300
-        && !record.resp_body.is_empty()
-    {
-        match serde_json::from_str::<serde_json::Value>(&record.resp_body) {
-            Ok(v) => match reader.read_response(&v) {
-                Ok(ir) => parsed_response = Some(writer.write_response(&ir)),
-                // response parse 失败: 不覆盖 request 的 parse_error (request 更重要).
-                Err(e) => {
-                    if parse_error.is_none() {
-                        parse_error = Some(format!("resp_body parse failed: {}", e.message));
-                    }
-                }
-            },
-            Err(e) => {
-                if parse_error.is_none() {
-                    parse_error = Some(format!("invalid JSON in resp_body: {e}"));
-                }
-            }
-        }
-    }
-
     GetRecordResponse {
         record,
         parsed_request,
@@ -232,9 +204,46 @@ fn build_parsed_response(record: ForwardRecord) -> GetRecordResponse {
     }
 }
 
+/// list_records 返回的轻量 record 摘要 (不含 body 字段).
+///
+/// req_body / resp_body / resp_parsed 可能很大 (流式响应累积内容 / 大 prompt),
+/// list 场景不需要它们 — 前端 sidebar 只显示 id/path/status/hitN 等元数据,
+/// body 由 GET /records/{id}?view=... 按需拉取.
+#[derive(Serialize)]
+pub struct RecordSummary {
+    pub id: Uuid,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub method: String,
+    pub path: String,
+    pub resp_status: u16,
+    pub elapsed_ms: u64,
+    pub streamed: bool,
+    pub resp_complete: bool,
+    pub error: Option<String>,
+    #[serde(default)]
+    pub redactions: Vec<(String, String)>,
+}
+
+impl From<ForwardRecord> for RecordSummary {
+    fn from(r: ForwardRecord) -> Self {
+        Self {
+            id: r.id,
+            created_at: r.created_at,
+            method: r.method,
+            path: r.path,
+            resp_status: r.resp_status,
+            elapsed_ms: r.elapsed_ms,
+            streamed: r.streamed,
+            resp_complete: r.resp_complete,
+            error: r.error,
+            redactions: r.redactions,
+        }
+    }
+}
+
 #[derive(Serialize)]
 pub struct ListRecordsResponse {
-    pub records: Vec<ForwardRecord>,
+    pub records: Vec<RecordSummary>,
     /// 当前 filter 维度下的总数 (用于前端分页器).
     ///
     /// `filter=all` 时等于 records 总量; `filter=hits` 时等于发生过 redact 的记录总数.
@@ -893,25 +902,29 @@ mod tests {
     }
 
     #[test]
-    fn parsed_view_streamed_response_not_parsed() {
-        // 即使 resp_body 是合法 JSON, streamed=true 也应跳过 response 解析
-        // (因为实际 resp_body 是 SSE 拼接, 不是单个 JSON).
+    fn parsed_view_streamed_response_uses_resp_parsed() {
+        // streamed record 的 parsed_response 直接来自 record.resp_parsed
+        // (由 proxy 层的 StreamScan 累积), 不再从 resp_body fold.
         let req_body = r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#;
-        let resp_body = r#"{"id":"x","choices":[]}"#;
-        let record =
-            parsed_test_record("/o/oa-main/v1/chat/completions", req_body, resp_body, true);
+        let mut record = parsed_test_record("/o/oa-main/v1/chat/completions", req_body, "", true);
+        // 模拟 StreamScan 产出的 resp_parsed.
+        record.resp_parsed = Some(serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "hello"}}]
+        }));
         let resp = build_parsed_response(record);
         // request 仍应被解析.
         assert!(resp.parsed_request.is_some());
-        // response 不应被解析 (streamed).
-        assert!(resp.parsed_response.is_none());
-        // 不应有 error (request 成功了, response 是被显式跳过的).
+        // response 直接来自 resp_parsed.
+        let parsed_resp = resp
+            .parsed_response
+            .expect("resp_parsed should be returned");
+        assert!(parsed_resp.get("choices").is_some());
         assert!(resp.parse_error.is_none());
     }
 
     #[test]
-    fn parsed_view_non_2xx_response_not_parsed() {
-        // 非 2xx 响应通常是 error envelope, 不应被当作 chat response 解析.
+    fn parsed_view_non_2xx_response_no_resp_parsed() {
+        // 非 2xx 响应: proxy 层不会设置 resp_parsed (只处理 2xx 成功响应).
         let req_body = r#"{"model":"gpt-4","messages":[]}"#;
         let mut record =
             parsed_test_record("/o/oa-main/v1/chat/completions", req_body, "err", false);

@@ -76,6 +76,7 @@ src/
 │   ├── openai.rs  # OpenAI Chat Completions Reader/Writer (含流式 fan-out)
 │   ├── anthropic.rs # Anthropic Messages Reader/Writer (含 1:1 流映射)
 │   └── stream.rs  # StreamTranslate (SSE chunk-boundary + 跨协议翻译 + 同协议 restore 模式)
+│                  # + StreamScan (流式 SSE → IrResponse 累积器, 用于 WebUI parsed view)
 ├── proxy.rs       # ProxyState + forward/forward_no_rest + dispatch (路由分发)
 │                  # + same_proto_passthrough (无 redact 字节透传)
 │                  # + same_proto_forward (有 redact IR 路径)
@@ -156,9 +157,13 @@ PATCH  /__sg/api/providers/{id}/decision
 
 **Records 分页**: `offset` 0-based 从最新算起; `limit` clamp 到 `[1,200]`, 默认 50.
 
-**Records parsed view**: `?view=parsed` 用 ingress 协议的 codec 把 req/resp body 解析为
-结构化 chat JSON (供 WebUI 渲染对话气泡). Gemini/Ollama 无 codec → `parse_error` + fallback raw.
-流式响应的 `resp_body` 是 SSE 拼接, 非 JSON → 跳过 response 解析 (`parsed_response=null`).
+**Records parsed view**: `?view=parsed` 返回 `parsed_request` (从 `req_body` 按需用 ingress codec
+解析) + `parsed_response` (直接取自 `record.resp_parsed`, 由 proxy 层的 `StreamScan` 在流过程中
+增量累积, 非流式路径在响应完成时一次性计算). Gemini/Ollama 无 codec → `parse_error` + fallback raw.
+
+**Records list 轻量化**: `GET /records` 返回 `RecordSummary` (不含 `req_body` / `resp_body` /
+`resp_parsed`), body 字段由 `GET /records/{id}?view=...` 按需拉取. 流式响应的 `resp_body` 在
+record 完成后为空 (不保留原始 SSE 字节), parsed view 通过 `resp_parsed` 提供.
 
 **ForwardRecord.redactions**: `Vec<(mock, secret_id)>` — 从 `redact_ir` 产出的
 `RedactionMap` SSOT 派生 (见 `proxy.rs::derive_redactions`). WebUI 的 mock 高亮和 "命中"

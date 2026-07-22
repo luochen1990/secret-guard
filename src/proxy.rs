@@ -77,6 +77,10 @@ const MAX_REQ_BODY: usize = 16 * 1024 * 1024;
 /// 单条响应 body 累积记录的上限 (32 MiB).
 const MAX_RESP_BODY_RECORD: usize = 32 * 1024 * 1024;
 
+/// 流式 parsed view (StreamScan snapshot) 的节流写入间隔.
+/// 太短 → RecordStore 写锁竞争; 太长 → WebUI 看不到流式进度. 500ms 是 UX 与锁竞争的折中.
+const PARSED_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// 主 handler: 路径 `/{proto}/{name}/{*rest}`, 解析后透传到对应 provider.
 ///
 /// 路径段语义:
@@ -416,6 +420,7 @@ async fn same_proto_passthrough(
         resp_status,
         resp_headers,
         streamed,
+        crate::codec::Protocol::from_native(ingress),
     )
     .await
 }
@@ -460,12 +465,9 @@ fn record_upstream_failure(
         record_id,
         ResponseUpdate {
             resp_status: status,
-            resp_headers: vec![],
-            resp_body: String::new(),
             elapsed_ms: started.elapsed().as_millis() as u64,
-            streamed: false,
-            resp_complete: false,
             error: Some(error),
+            ..Default::default()
         },
     );
 }
@@ -716,11 +718,9 @@ async fn cross_proto_forward(
                 ResponseUpdate {
                     resp_status: resp_status.as_u16(),
                     resp_headers: redact_headers(&resp_headers),
-                    resp_body: String::new(),
                     elapsed_ms: elapsed,
-                    streamed: false,
-                    resp_complete: false,
                     error: Some(format!("upstream stream error: {e}")),
+                    ..Default::default()
                 },
             );
             return Err(AppError::Upstream(e));
@@ -732,14 +732,11 @@ async fn cross_proto_forward(
                 record_id,
                 ResponseUpdate {
                     resp_status: 502,
-                    resp_headers: vec![],
-                    resp_body: String::new(),
                     elapsed_ms: elapsed,
-                    streamed: false,
-                    resp_complete: false,
                     error: Some(format!(
                         "upstream response exceeded {MAX_RESP_BODY_RECORD} byte cap"
                     )),
+                    ..Default::default()
                 },
             );
             return Err(AppError::Upstream(format!(
@@ -752,10 +749,14 @@ async fn cross_proto_forward(
     // 14. 翻译响应: egress JSON → IR → (restore redact) → ingress JSON.
     let egress_reader = egress_codec.reader();
     let ingress_writer = ingress_codec.writer();
+    // parsed view: 记录 LLM 视角的 IR (restore 之前, 含 mock). 仅 2xx 成功响应.
+    let mut resp_parsed_for_record: Option<serde_json::Value> = None;
     let (resp_status_out, resp_body_out): (StatusCode, Vec<u8>) = if resp_status.is_success() {
         match serde_json::from_slice::<serde_json::Value>(&resp_bytes) {
             Ok(v) => match egress_reader.read_response(&v) {
                 Ok(mut ir_resp) => {
+                    // record 存 LLM 视角 (restore 之前, 含 mock) 的 parsed view.
+                    resp_parsed_for_record = Some(ingress_writer.write_response(&ir_resp));
                     // restore: mock → real (跨协议 + redact 时, 客户端看到的应该是真 secret).
                     restore_ir_response(&mut ir_resp, &redaction_map);
                     let translated = ingress_writer.write_response(&ir_resp);
@@ -798,6 +799,7 @@ async fn cross_proto_forward(
             resp_status: resp_status_out.as_u16(),
             resp_headers: redact_headers(&resp_headers),
             resp_body: utf8_view(&resp_body_out),
+            resp_parsed: resp_parsed_for_record,
             elapsed_ms: elapsed,
             streamed: false,
             resp_complete: true,
@@ -831,8 +833,55 @@ fn http_status_to_error_kind(status: u16) -> &'static str {
     }
 }
 
-/// 流式扇出: 一份给客户端 (流式), 一份累积给记录.
-/// 在未启用 redact 时使用, 保持最佳 UX.
+/// 流式 parsed view 累积器 + 节流写入 record 的小封装.
+///
+/// fan_out_streaming / fan_out_streaming_with_restore 共享同一套节流策略,
+/// 避免两处重复 StreamScan + writer + last_sync 的管理逻辑.
+struct ParsedSync {
+    scan: crate::codec::stream::StreamScan,
+    writer: Box<dyn crate::codec::Writer>,
+    records: RecordStore,
+    record_id: uuid::Uuid,
+    last_sync: Option<std::time::Instant>,
+}
+
+impl ParsedSync {
+    fn new(proto: crate::codec::Protocol, records: RecordStore, record_id: uuid::Uuid) -> Self {
+        Self {
+            scan: crate::codec::stream::StreamScan::new(proto),
+            writer: proto.writer(),
+            records,
+            record_id,
+            last_sync: None,
+        }
+    }
+
+    /// 喂入上游 chunk; 按节流间隔把 snapshot 写入 record.
+    fn feed(&mut self, b: &[u8]) {
+        self.scan.feed(b);
+        let due = self
+            .last_sync
+            .is_none_or(|t| t.elapsed() >= PARSED_SYNC_INTERVAL);
+        if due {
+            let parsed = self.scan.snapshot();
+            self.records
+                .update_parsed_response(self.record_id, self.writer.write_response(&parsed));
+            self.last_sync = Some(std::time::Instant::now());
+        }
+    }
+
+    /// 流结束时的最终快照.
+    fn finalize(self) -> serde_json::Value {
+        self.writer.write_response(&self.scan.snapshot())
+    }
+}
+
+/// 流式字节扇出: 把上游 SSE 流式转发给客户端, 同时 (若有 codec) 用 StreamScan
+/// 累积 parsed view 到 record. 无 redact, 保持 byte-exact + 流式 UX.
+///
+/// `codec_proto = None` 时 (Gemini/Ollama 无 codec) 跳过 StreamScan,
+/// parsed view 不可用 (前端 fallback raw).
+#[allow(clippy::too_many_arguments)]
 async fn fan_out_streaming(
     records: RecordStore,
     record_id: uuid::Uuid,
@@ -841,6 +890,7 @@ async fn fan_out_streaming(
     resp_status: StatusCode,
     resp_headers: HeaderMap,
     streamed: bool,
+    codec_proto: Option<crate::codec::Protocol>,
 ) -> Result<Response<Body>, AppError> {
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(32);
     let resp_headers_for_record = resp_headers.clone();
@@ -851,6 +901,14 @@ async fn fan_out_streaming(
         let mut acc: Vec<u8> = Vec::new();
         let mut overflow = false;
         let mut error_kind: Option<String> = None;
+        // ParsedSync: 仅对流式响应启用 (非流式是单个 JSON, 不是 SSE).
+        // 非流式响应的 resp_parsed 在流结束后一次性计算.
+        let mut parsed_sync = if streamed {
+            codec_proto.map(|cp| ParsedSync::new(cp, records.clone(), record_id))
+        } else {
+            None
+        };
+
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(b) => {
@@ -873,6 +931,12 @@ async fn fan_out_streaming(
                             overflow = true;
                         }
                     }
+                    // ParsedSync 累积 (未 overflow 时).
+                    if !overflow {
+                        if let Some(ps) = parsed_sync.as_mut() {
+                            ps.feed(&b);
+                        }
+                    }
                 }
                 Err(e) => {
                     warn!(%record_id, error = %e, "upstream stream error mid-flight");
@@ -884,9 +948,26 @@ async fn fan_out_streaming(
             }
         }
         let elapsed = started.elapsed().as_millis() as u64;
+        // 最终 parsed: 流式用 ParsedSync 快照; 非流式一次性 codec parse.
+        let final_parsed = if streamed {
+            parsed_sync.map(|ps| ps.finalize())
+        } else if let Some(cp) = codec_proto {
+            let reader = cp.reader();
+            let writer = cp.writer();
+            serde_json::from_slice::<serde_json::Value>(&acc)
+                .ok()
+                .and_then(|v| reader.read_response(&v).ok())
+                .map(|ir| writer.write_response(&ir))
+        } else {
+            None
+        };
         let body = if overflow {
             "<truncated: exceeded record cap>".to_string()
+        } else if streamed && (200..300).contains(&status_u16) {
+            // 2xx 流式成功响应: 不保留原始 SSE 字节 (骨架开销大, parsed view 已覆盖语义内容).
+            String::new()
         } else {
+            // 非流式响应保留原始 body (raw view 可用, 且 body 通常不大).
             utf8_view(&acc)
         };
         records.update_response_full(
@@ -895,6 +976,7 @@ async fn fan_out_streaming(
                 resp_status: status_u16,
                 resp_headers: redact_headers(&resp_headers_for_record),
                 resp_body: body,
+                resp_parsed: final_parsed,
                 elapsed_ms: elapsed,
                 streamed,
                 resp_complete: error_kind.is_none(),
@@ -958,9 +1040,12 @@ async fn fan_out_buffered_ir(
     // Parse 为 IR (失败则原样透传, 不 restore).
     let reader = codec_proto.reader();
     let writer = codec_proto.writer();
+    let mut resp_parsed_for_record: Option<serde_json::Value> = None;
     let client_bytes: Vec<u8> = match serde_json::from_slice::<serde_json::Value>(&acc) {
         Ok(v) => match reader.read_response(&v) {
             Ok(mut ir) => {
+                // record 存 LLM 视角 (restore 之前, 含 mock).
+                resp_parsed_for_record = Some(writer.write_response(&ir));
                 restore_ir_response(&mut ir, &redaction_map);
                 let restored = writer.write_response(&ir);
                 serde_json::to_vec(&restored).unwrap_or_else(|_| acc.clone())
@@ -978,6 +1063,7 @@ async fn fan_out_buffered_ir(
             resp_status: status_u16,
             resp_headers: redact_headers(&resp_headers_for_record),
             resp_body: acc_text,
+            resp_parsed: resp_parsed_for_record,
             elapsed_ms: elapsed,
             streamed,
             resp_complete: error_kind.is_none(),
@@ -1015,10 +1101,14 @@ async fn fan_out_streaming_with_restore(
     tokio::spawn(async move {
         // 同协议 + restore 模式: ingress == egress, 但 IR re-serialize 用于 restore.
         let mut translate = StreamTranslate::new_same_proto_restore(codec_proto, redaction_map);
+        // ParsedSync: 累积 parsed view (LLM 视角, 含 mock, 与 record 语义一致).
+        // 喂的是上游原始字节 (与 translate.feed 同一份 b), ParsedSync 内部用 codec reader 解析.
+        let mut parsed_sync = ParsedSync::new(codec_proto, records.clone(), record_id);
         let mut stream = upstream_resp.bytes_stream();
         let mut acc: Vec<u8> = Vec::new();
         let mut overflow = false;
         let mut error_kind: Option<String> = None;
+
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(b) => {
@@ -1040,6 +1130,10 @@ async fn fan_out_streaming_with_restore(
                             overflow = true;
                         }
                     }
+                    // ParsedSync 累积 (未 overflow 时).
+                    if !overflow {
+                        parsed_sync.feed(&b);
+                    }
                 }
                 Err(e) => {
                     warn!(%record_id, error = %e, "upstream stream error mid-flight");
@@ -1059,10 +1153,16 @@ async fn fan_out_streaming_with_restore(
         }
 
         let elapsed = started.elapsed().as_millis() as u64;
+        // 最终 parsed 快照. 即使 error_kind (client disconnect / upstream error),
+        // 也保留截至断流时的累积内容 — 用户能看到部分响应比看到空白更有价值.
+        // (overflow 时同理: 截至Overflow前的内容比 truncate banner 更有用.)
+        let final_parsed = parsed_sync.finalize();
         let body = if overflow {
             "<truncated: exceeded record cap>".to_string()
         } else {
-            utf8_view(&acc)
+            // 此路径仅用于 2xx 成功响应 (非 2xx 走 fan_out_buffered_ir).
+            // 2xx 流式成功响应不保留原始 SSE 字节 (parsed view 已覆盖语义内容).
+            String::new()
         };
         records.update_response_full(
             record_id,
@@ -1070,6 +1170,7 @@ async fn fan_out_streaming_with_restore(
                 resp_status: status_u16,
                 resp_headers: redact_headers(&resp_headers_for_record),
                 resp_body: body,
+                resp_parsed: Some(final_parsed),
                 elapsed_ms: elapsed,
                 streamed: true,
                 resp_complete: error_kind.is_none(),

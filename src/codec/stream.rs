@@ -30,7 +30,7 @@
 //! StreamTranslate 在 [`StreamTranslate::finish`] 时根据 ingress writer 决定是否追加 `[DONE]`.
 
 use crate::codec::{
-    ir::{IrStreamEvent, StreamDecodeState},
+    ir::{IrBlockMeta, IrStreamEvent, StreamDecodeState},
     Protocol, Reader, Writer,
 };
 use crate::redact::{restore_str_inplace, DeltaKind, RedactionMap, StreamingRestorer};
@@ -359,6 +359,254 @@ impl StreamTranslate {
         self.buf.clear();
         self.buf.shrink_to_fit();
         self.scanned = 0;
+    }
+}
+
+// ─── StreamScan: 流式 parsed view 累积器 ────────────────────────────────────
+//
+// 与 StreamTranslate 的关注点正交:
+//   StreamTranslate: egress SSE → ingress SSE (实时转换, 不保留完整内容)
+//   StreamScan:      egress SSE → IrResponse  (不转换协议, 只累积语义内容)
+//
+// 用法: fan_out task 在 chunk 循环里 feed 每个 raw chunk, 节流地把 snapshot() 写入
+// RecordStore. 流结束时 snapshot() 即最终完整 IrResponse.
+// 对输入的要求: fan_out task 喂的是**原始上游字节** (LLM 视角, 含 mock 或未 redact).
+// snapshot() 产出的 IrResponse 直接序列化给前端 parsed view, 不经 restore (与当前
+// record 语义一致: record 存 LLM 视角).
+
+/// 单个 block 的累积状态 (流过程中用于暂存增量, finish 时折叠为 IrBlock).
+#[derive(Debug, Default)]
+struct ScanBlock {
+    /// TextDelta 累积.
+    text: String,
+    /// InputJsonDelta 累积 (tool_use only).
+    json_input: String,
+    /// block 元信息 (BlockStart 时记录, 用于 finish 时构造 IrBlock).
+    meta: Option<IrBlockMeta>,
+}
+
+/// 流式 SSE → IrResponse 累积器.
+///
+/// 内部维护 reassembly buffer (跨 chunk 不完整帧) + reader 的 `StreamDecodeState`
+/// (OpenAI flat stream 的 block 边界合成). 调用者 feed 原始 SSE 字节, 累积器增量更新
+/// 内部 `IrResponse`; 通过 [`snapshot`](Self::snapshot) 读取当前累积结果 (O(1) clone).
+pub struct StreamScan {
+    reader: Box<dyn Reader>,
+    decode: StreamDecodeState,
+    /// 累积的响应元数据 (model/id/created/usage/stop_reason 等).
+    meta: IrResponseMeta,
+    /// block index → 累积状态. 流过程中按 index 暂存, finish 时折叠为 Vec<IrBlock>.
+    blocks: std::collections::BTreeMap<usize, ScanBlock>,
+    /// 块的最终顺序 (finish 时按此顺序折叠, 与到达顺序一致).
+    block_order: Vec<usize>,
+    /// SSE 帧 reassembly buffer (跨 chunk 不完整帧).
+    buf: Vec<u8>,
+    /// 已扫描位置 (O(n) 扫描, 避免重复搜前缀).
+    scanned: usize,
+    /// reassembly buffer 溢出标记. 达到 MAX_BUF 后置位, 停止累积 (防 OOM).
+    /// snapshot() 返回已累积的部分内容 (不发给客户端, 只给 WebUI, abort 不影响转发).
+    aborted: bool,
+}
+
+/// IrResponse 的元数据部分 (从 MessageStart / MessageDelta 提取).
+#[derive(Debug, Default, Clone)]
+struct IrResponseMeta {
+    model: Option<String>,
+    id: Option<String>,
+    created: Option<u64>,
+    usage: crate::codec::IrUsage,
+    stop_reason: Option<crate::codec::IrStopReason>,
+    stop_sequence: Option<String>,
+}
+
+impl StreamScan {
+    pub fn new(proto: Protocol) -> Self {
+        Self {
+            reader: proto.reader(),
+            decode: StreamDecodeState::default(),
+            meta: IrResponseMeta::default(),
+            blocks: std::collections::BTreeMap::new(),
+            block_order: Vec::new(),
+            buf: Vec::new(),
+            scanned: 0,
+            aborted: false,
+        }
+    }
+
+    /// 喂入一段 raw SSE 字节 (可能跨帧 / 含不完整尾帧).
+    /// 内部按帧边界解析, 把每个完整帧的 IR 事件增量累积.
+    /// 不完整尾帧留在 buffer 等下次 feed 补全.
+    ///
+    /// 与 StreamTranslate 不同: StreamScan **不** 应用 post-stop guard, 因为
+    /// OpenAI `stream_options.include_usage` 的 usage chunk 出现在 finish_reason
+    /// chunk (MessageStop) 之后, StreamScan 需要收集它.
+    pub fn feed(&mut self, chunk: &[u8]) {
+        if self.aborted {
+            return;
+        }
+        self.buf.extend_from_slice(chunk);
+        let mut consumed = 0usize;
+        loop {
+            let search_from = self
+                .scanned
+                .saturating_sub(3)
+                .max(consumed)
+                .min(self.buf.len());
+            let Some((rel, term_len)) = find_frame_terminator(&self.buf[search_from..]) else {
+                self.scanned = self.buf.len();
+                break;
+            };
+            let end = search_from + rel + term_len;
+            let frame = &self.buf[consumed..end];
+            consumed = end;
+            self.scanned = end;
+
+            let Some((event_type, data_str)) = parse_sse_frame(frame) else {
+                continue;
+            };
+            if data_str.is_empty() || data_str == SSE_DONE_SENTINEL {
+                continue;
+            }
+            let Ok(data) = serde_json::from_str::<serde_json::Value>(&data_str) else {
+                continue;
+            };
+            let events = self
+                .reader
+                .read_response_events(&event_type, &data, &mut self.decode);
+            for ev in events {
+                self.apply_event(&ev);
+            }
+        }
+        if consumed > 0 {
+            self.buf.drain(..consumed);
+            self.scanned = self.buf.len();
+        }
+        // reassembly buffer 溢出保护 (与 StreamTranslate::feed 一致).
+        // 恶意/异常上游发永不闭合的帧时, 防止 buf 无界增长 OOM.
+        if self.buf.len() > MAX_BUF {
+            self.aborted = true;
+            self.buf.clear();
+            self.buf.shrink_to_fit();
+            self.scanned = 0;
+        }
+    }
+
+    /// 把单个 IR 事件累积到 meta / blocks.
+    fn apply_event(&mut self, ev: &IrStreamEvent) {
+        match ev {
+            IrStreamEvent::MessageStart {
+                id,
+                created,
+                model,
+                usage,
+            } => {
+                if let Some(u) = usage {
+                    self.meta.usage.input_tokens = u.input_tokens;
+                    self.meta.usage.cache_creation_input_tokens = u.cache_creation_input_tokens;
+                    self.meta.usage.cache_read_input_tokens = u.cache_read_input_tokens;
+                }
+                self.meta.id = id.clone().or(self.meta.id.take());
+                self.meta.created = created.or(self.meta.created);
+                self.meta.model = model.clone().or(self.meta.model.take());
+            }
+            IrStreamEvent::BlockStart { index, block } => {
+                if !self.blocks.contains_key(index) {
+                    self.block_order.push(*index);
+                }
+                let entry = self.blocks.entry(*index).or_default();
+                entry.meta = Some(block.clone());
+            }
+            IrStreamEvent::BlockDelta { index, delta } => {
+                let entry = self.blocks.entry(*index).or_default();
+                match delta {
+                    crate::codec::ir::IrDelta::TextDelta(s) => entry.text.push_str(s),
+                    crate::codec::ir::IrDelta::InputJsonDelta(s) => entry.json_input.push_str(s),
+                }
+            }
+            IrStreamEvent::BlockStop { index: _ } => {
+                // 不删除 entry: finish 时按 block_order 折叠.
+                // 这里不删除是为了让 snapshot() 在流过程中也能产出已 Stop 的块.
+            }
+            IrStreamEvent::MessageDelta {
+                stop_reason,
+                stop_sequence,
+                usage,
+            } => {
+                if let Some(sr) = stop_reason {
+                    self.meta.stop_reason = Some(*sr);
+                }
+                if let Some(ss) = stop_sequence {
+                    self.meta.stop_sequence = Some(ss.clone());
+                }
+                if usage.output_tokens > 0 {
+                    self.meta.usage.output_tokens = usage.output_tokens;
+                }
+                // input usage (backfill): 若 terminal delta 携带了 input, 更新.
+                if usage.input_tokens > 0 {
+                    self.meta.usage.input_tokens = usage.input_tokens;
+                }
+                if usage.cache_read_input_tokens.is_some() {
+                    self.meta.usage.cache_read_input_tokens = usage.cache_read_input_tokens;
+                }
+                if usage.cache_creation_input_tokens.is_some() {
+                    self.meta.usage.cache_creation_input_tokens = usage.cache_creation_input_tokens;
+                }
+            }
+            IrStreamEvent::MessageStop => {
+                // 不应用 post-stop guard: StreamScan 需要收集 MessageStop 之后的
+                // usage chunk (OpenAI stream_options.include_usage 格式).
+            }
+            IrStreamEvent::Error(_) => {}
+        }
+    }
+
+    /// 当前累积的 IrResponse 快照 (O(blocks 总长) clone).
+    /// 流过程中调用 → 到目前为止的累积结果; 流结束后调用 → 最终完整结果.
+    pub fn snapshot(&self) -> crate::codec::IrResponse {
+        let content: Vec<crate::codec::IrBlock> = self
+            .block_order
+            .iter()
+            .filter_map(|idx| {
+                let b = self.blocks.get(idx)?;
+                fold_scan_block(b)
+            })
+            .collect();
+        crate::codec::IrResponse {
+            content,
+            stop_reason: self.meta.stop_reason,
+            stop_sequence: self.meta.stop_sequence.clone(),
+            usage: self.meta.usage.clone(),
+            model: self.meta.model.clone(),
+            id: self.meta.id.clone(),
+            created: self.meta.created,
+        }
+    }
+}
+
+/// 把 ScanBlock (累积状态) 折叠为最终 IrBlock.
+/// - meta=ToolUse → ToolUse block (input JSON parse, 失败则用空 object)
+/// - meta=Text 或缺失 (上游漏发 BlockStart) → Text block
+/// - 空内容 (text+json_input 均空) → None (不产出空气泡)
+fn fold_scan_block(b: &ScanBlock) -> Option<crate::codec::IrBlock> {
+    match &b.meta {
+        Some(IrBlockMeta::ToolUse { id, name }) => {
+            let input = serde_json::from_str(&b.json_input).unwrap_or_default();
+            Some(crate::codec::IrBlock::ToolUse {
+                id: id.clone(),
+                name: name.clone(),
+                input,
+            })
+        }
+        // Text block 或 meta 缺失 (上游漏发 BlockStart, 退化为 Text).
+        Some(IrBlockMeta::Text) | None => {
+            if b.text.is_empty() && b.json_input.is_empty() {
+                None
+            } else {
+                Some(crate::codec::IrBlock::Text {
+                    text: b.text.clone(),
+                })
+            }
+        }
     }
 }
 
@@ -780,5 +1028,174 @@ mod tests {
             !combined.contains(&mock),
             "client should NOT see mock {mock}: got {combined:?}"
         );
+    }
+
+    // ─── StreamScan ────────────────────────────────────────────────────
+
+    fn openai_text_chunk(content: &str, finish: Option<&str>) -> String {
+        let finish_json = match finish {
+            Some(fr) => format!(",\"finish_reason\":\"{fr}\""),
+            None => ",\"finish_reason\":null".to_string(),
+        };
+        format!(
+            r#"data: {{"id":"cmpl-1","created":100,"model":"gpt-4","choices":[{{"index":0,"delta":{{"content":"{content}"}}{finish_json}}}]}}"#,
+        )
+    }
+
+    #[test]
+    fn stream_scan_openai_text_accumulates_across_chunks() {
+        // 三个 OpenAI 文本 delta chunk, 按多次 feed 喂入 (模拟跨 chunk 到达).
+        // 每个 chunk 是一个完整的 SSE 帧 (data: ...\n\n).
+        let mut scan = StreamScan::new(Protocol::OpenAI);
+        let frame = |content: &str, finish: Option<&str>| -> String {
+            openai_text_chunk(content, finish) + "\n\n"
+        };
+        scan.feed(frame("两者", None).as_bytes());
+        scan.feed(frame("都可以", None).as_bytes());
+        // snapshot 在流中途应该只有前两个 delta.
+        let mid = scan.snapshot();
+        assert_eq!(mid.content.len(), 1);
+        match &mid.content[0] {
+            crate::codec::IrBlock::Text { text } => assert_eq!(text, "两者都可以"),
+            other => panic!("expected Text block, got {other:?}"),
+        }
+        // 流末尾: finish_reason + [DONE].
+        scan.feed(frame("工作", Some("stop")).as_bytes());
+        scan.feed(b"data: [DONE]\n\n");
+        let final_ir = scan.snapshot();
+        match &final_ir.content[0] {
+            crate::codec::IrBlock::Text { text } => assert_eq!(text, "两者都可以工作"),
+            other => panic!("expected Text block, got {other:?}"),
+        }
+        assert_eq!(final_ir.model.as_deref(), Some("gpt-4"));
+        assert_eq!(final_ir.id.as_deref(), Some("cmpl-1"));
+        assert_eq!(final_ir.created, Some(100));
+        assert_eq!(
+            final_ir.stop_reason,
+            Some(crate::codec::IrStopReason::EndTurn)
+        );
+    }
+
+    #[test]
+    fn stream_scan_openai_cross_chunk_frame_reassembly() {
+        // 一个 SSE 帧被 TCP 切成两半, 第二半补全后才能解析.
+        let mut scan = StreamScan::new(Protocol::OpenAI);
+        scan.feed(b"data: {\"id\":\"x\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hel");
+        // 不完整, snapshot 应该是空 content (帧没终止).
+        let mid = scan.snapshot();
+        assert!(
+            mid.content.is_empty(),
+            "partial frame should not yield content"
+        );
+        // 补全.
+        scan.feed(b"lo\"}}]}\n\n");
+        let ir = scan.snapshot();
+        match &ir.content[0] {
+            crate::codec::IrBlock::Text { text } => assert_eq!(text, "hello"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_scan_openai_tool_use_accumulates_partial_json() {
+        // 模拟 OpenAI 流式 tool_calls: 多个 chunk 累积 arguments JSON.
+        // 每个 chunk 是完整 SSE 帧 (以 \n\n 结尾).
+        let chunks = [
+            r#"data: {"id":"x","created":0,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]}}]}"#,
+            r#"data: {"id":"x","created":0,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":"}}]}}]}"#,
+            r#"data: {"id":"x","created":0,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"北京\"}"}}]}}]}"#,
+            r#"data: {"id":"x","created":0,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "data: [DONE]",
+        ];
+        let mut scan = StreamScan::new(Protocol::OpenAI);
+        for c in &chunks {
+            scan.feed(((*c).to_string() + "\n\n").as_bytes());
+        }
+        let ir = scan.snapshot();
+        assert_eq!(ir.content.len(), 1, "should have one tool_use block");
+        match &ir.content[0] {
+            crate::codec::IrBlock::ToolUse { id, name, input } => {
+                assert_eq!(id, "call_1");
+                assert_eq!(name, "get_weather");
+                assert_eq!(input.get("city").and_then(|v| v.as_str()), Some("北京"));
+            }
+            other => panic!("expected ToolUse, got {other:?}"),
+        }
+        assert_eq!(ir.stop_reason, Some(crate::codec::IrStopReason::ToolUse));
+    }
+
+    #[test]
+    fn stream_scan_anthropic_text_accumulates() {
+        // Anthropic 流: message_start → content_block_start → deltas → stop → message_delta → message_stop.
+        let mut scan = StreamScan::new(Protocol::Anthropic);
+        let frame =
+            |event: &str, data: &str| -> String { format!("event: {event}\ndata: {data}\n\n") };
+        scan.feed(frame("message_start", r#"{"type":"message_start","message":{"id":"msg_1","model":"claude-3","usage":{"input_tokens":10,"output_tokens":0}}}"#).as_bytes());
+        scan.feed(frame("content_block_start", r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#).as_bytes());
+        let mid = scan.snapshot();
+        // 只发了 BlockStart, 没 delta, snapshot 应该折叠为空 Text block 或无 block.
+        // 我们的实现: meta=Text 且 text 为空 → fold_scan_block 返回 None → content 空.
+        assert!(mid.content.is_empty(), "empty text block should not appear");
+        scan.feed(frame("content_block_delta", r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"你好"}}"#).as_bytes());
+        scan.feed(frame("content_block_delta", r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"世界"}}"#).as_bytes());
+        scan.feed(
+            frame(
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            )
+            .as_bytes(),
+        );
+        scan.feed(frame("message_delta", r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}"#).as_bytes());
+        scan.feed(frame("message_stop", r#"{"type":"message_stop"}"#).as_bytes());
+        let ir = scan.snapshot();
+        assert_eq!(ir.content.len(), 1);
+        match &ir.content[0] {
+            crate::codec::IrBlock::Text { text } => assert_eq!(text, "你好世界"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+        assert_eq!(ir.model.as_deref(), Some("claude-3"));
+        assert_eq!(ir.id.as_deref(), Some("msg_1"));
+        assert_eq!(ir.usage.input_tokens, 10);
+        assert_eq!(ir.usage.output_tokens, 5);
+        assert_eq!(ir.stop_reason, Some(crate::codec::IrStopReason::EndTurn));
+    }
+
+    #[test]
+    fn stream_scan_ignores_post_stop_noise() {
+        // 与 StreamTranslate 不同: StreamScan 不应用 post-stop guard.
+        // OpenAI include_usage chunk 在 finish_reason (MessageStop) 之后到达,
+        // StreamScan 必须收集它. 这里验证 MessageStop 后的 usage 被正确累积.
+        let mut scan = StreamScan::new(Protocol::OpenAI);
+        let frame = |content: &str, finish: Option<&str>| -> String {
+            openai_text_chunk(content, finish) + "\n\n"
+        };
+        scan.feed(frame("done", Some("stop")).as_bytes());
+        // MessageStop 已到达 (finish_reason=stop), 但 include_usage 还没到.
+        let ir1 = scan.snapshot();
+        assert_eq!(ir1.stop_reason, Some(crate::codec::IrStopReason::EndTurn));
+        assert_eq!(ir1.usage.output_tokens, 0, "no usage yet");
+        // post-stop include_usage chunk (OpenAI stream_options.include_usage 末尾格式).
+        let usage_chunk = r#"data: {"id":"x","created":0,"model":"gpt-4","choices":[],"usage":{"prompt_tokens":15,"completion_tokens":3,"total_tokens":18}}"#;
+        scan.feed((usage_chunk.to_string() + "\n\n").as_bytes());
+        scan.feed(b"data: [DONE]\n\n");
+        let ir2 = scan.snapshot();
+        assert_eq!(
+            ir2.usage.input_tokens, 15,
+            "post-stop usage should be collected"
+        );
+        assert_eq!(ir2.usage.output_tokens, 3);
+        // stop_reason 不应被 post-stop chunk 覆盖 (usage chunk 的 stop_reason=None).
+        assert_eq!(ir2.stop_reason, Some(crate::codec::IrStopReason::EndTurn));
+    }
+
+    #[test]
+    fn stream_scan_include_usage_chunk_updates_usage() {
+        // 更直接的测试: 单独发 include_usage chunk, 验证 input/output tokens 更新.
+        let usage_chunk = r#"data: {"id":"x","created":0,"model":"gpt-4","choices":[],"usage":{"prompt_tokens":15,"completion_tokens":3,"total_tokens":18}}"#;
+        let mut scan = StreamScan::new(Protocol::OpenAI);
+        scan.feed((usage_chunk.to_string() + "\n\n").as_bytes());
+        let ir = scan.snapshot();
+        assert_eq!(ir.usage.input_tokens, 15);
+        assert_eq!(ir.usage.output_tokens, 3);
     }
 }

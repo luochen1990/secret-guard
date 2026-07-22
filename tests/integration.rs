@@ -264,6 +264,72 @@ async fn forwards_streaming_sse() {
 }
 
 #[tokio::test]
+async fn streaming_parsed_view_accumulates_text() {
+    // 验证流式响应完成后, parsed view (resp_parsed) 包含累积的完整文本,
+    // 而非原始 SSE 字节. 这是本次改动的核心契约.
+    let mut upstream = spawn_mock_upstream().await;
+    let sse_body = concat!(
+        r#"data: {"id":"x","created":0,"model":"gpt-4","choices":[{"index":0,"delta":{"content":"两者"},"finish_reason":null}]}"#,
+        "\n\n",
+        r#"data: {"id":"x","created":0,"model":"gpt-4","choices":[{"index":0,"delta":{"content":"都可以"},"finish_reason":null}]}"#,
+        "\n\n",
+        r#"data: {"id":"x","created":0,"model":"gpt-4","choices":[{"index":0,"delta":{"content":"工作"},"finish_reason":"stop"}]}"#,
+        "\n\n",
+        "data: [DONE]\n\n",
+    );
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse_body)
+        .create_async()
+        .await;
+
+    let proxy_url = spawn_proxy(&upstream.url()).await;
+    let _ = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        r#"{"model":"gpt-4","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+        &[],
+    )
+    .await;
+
+    // 等 record 完成.
+    let records = wait_for_record_count(&format!("{proxy_url}/__sg/api/records"), 1).await;
+    assert!(records[0].streamed, "should be streamed");
+    assert!(records[0].resp_complete, "should be complete");
+
+    // 拉 parsed view, 验证累积文本.
+    let client = reqwest::Client::new();
+    let env: serde_json::Value = client
+        .get(format!(
+            "{proxy_url}/__sg/api/records/{}?view=parsed",
+            records[0].id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let parsed_resp = env["parsed_response"]
+        .as_object()
+        .expect("parsed_response should exist");
+    // OpenAI shape: choices[0].message.content
+    let choices = parsed_resp["choices"]
+        .as_array()
+        .expect("choices should be array");
+    let content = choices[0]["message"]["content"]
+        .as_str()
+        .expect("content should be string");
+    assert_eq!(
+        content, "两者都可以工作",
+        "parsed view should contain accumulated text, got: {content}"
+    );
+}
+
+#[tokio::test]
 async fn provider_api_key_overrides_client_auth() {
     let mut upstream = spawn_mock_upstream().await;
     let _m = upstream
@@ -2587,7 +2653,16 @@ async fn secret_decision_disabled_drops_from_redaction() {
 
     // 等记录写入, 验证 body 仍含 secret.
     let records = wait_for_record_count(&format!("{proxy_url}/__sg/api/records"), 1).await;
-    let body = &records[0].req_body;
+    // list 不返回 req_body, 需通过 detail API 拉取.
+    let detail: serde_json::Value = client
+        .get(format!("{proxy_url}/__sg/api/records/{}", records[0].id))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let body = detail["record"]["req_body"].as_str().unwrap_or("");
     assert!(
         body.contains(real_secret),
         "disabled secret 应当不被 redact, body={body}"
@@ -2595,10 +2670,24 @@ async fn secret_decision_disabled_drops_from_redaction() {
 }
 
 /// 辅助: 当测试未持有 RecordStore handle 时, 通过 records API 轮询直到出现 count 条记录.
-async fn wait_for_record_count(
-    url: &str,
-    count: usize,
-) -> Vec<secret_guard::record::ForwardRecord> {
+/// list API 返回的轻量 record 摘要 (不含 req_body / resp_body / resp_parsed).
+/// 测试只需检查 metadata 字段, body 由 GET /records/{id}?view=... 按需拉.
+#[derive(serde::Deserialize, Debug)]
+#[allow(dead_code)]
+struct RecordSummary {
+    id: uuid::Uuid,
+    method: String,
+    path: String,
+    resp_status: u16,
+    elapsed_ms: u64,
+    streamed: bool,
+    resp_complete: bool,
+    error: Option<String>,
+    #[serde(default)]
+    redactions: Vec<(String, String)>,
+}
+
+async fn wait_for_record_count(url: &str, count: usize) -> Vec<RecordSummary> {
     let client = reqwest::Client::new();
     for _ in 0..50 {
         let body: serde_json::Value = client.get(url).send().await.unwrap().json().await.unwrap();

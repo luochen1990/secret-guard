@@ -724,7 +724,7 @@
       hits: { offset: 0, total: 0, records: [], loaded: false },
     };
     let filterMode = 'all';   // 'all' | 'hits'.
-    let detailView = 'raw';   // 'raw' | 'parsed'.
+    let detailView = 'parsed'; // 'raw' | 'parsed'. parsed 是默认视图 (可读性更好).
     let parsedCache = new Map(); // id -> { record, parsed_request, parsed_response, parse_error }.
     let detailRecord = null;  // 当前详情面板渲染所用的 ForwardRecord (raw view 直接用).
 
@@ -782,10 +782,13 @@
         updateCountDisplay();
         renderSidebar();
         if (selectedId) {
-          const detail = await fetch(`${API_RECORDS}/${selectedId}`, { cache: 'no-store' });
+          // 自动刷新时拉 parsed view (一次请求同时更新 detailRecord 和 parsedCache,
+          // 让流式响应的 parsed view 随轮询逐步更新).
+          const detail = await fetch(`${API_RECORDS}/${selectedId}?view=parsed`, { cache: 'no-store' });
           if (detail.ok) {
             const env = await detail.json();
             detailRecord = env.record;
+            parsedCache.set(selectedId, env);
             renderDetail();
           } else if (detail.status === 404) {
             parsedCache.delete(selectedId);
@@ -944,20 +947,19 @@
       return { proto: parts[1] || '?', id: parts[2] || '<unknown>' };
     }
 
-    // 从 req_body 提取首个 user message 的文本作为侧栏主标题.
-    // 支持 OpenAI / Anthropic 两种 schema:
-    //   - {messages:[{role:"user", content:"..."}]}  (content 是 string 或 [{type:"text",text:"..."}])
-    //   - 顶层 system 不取 (太长且无辨识度), 只取 role=user.
-    // 解析失败 / 无 user message → fallback 到 method + path.
-    // 结果挂在 record 对象 _preview 上, 随 records 数组替换自然回收 (无独立缓存泄漏风险).
-    // 对超大 body (>64KB) 直接走 fallback, 避免 JSON.parse 阻塞主线程 (M2).
+    // 从 record 提取侧栏主标题.
+    //
+    // list API 不再返回 req_body (轻量化), 所以 sidebar 预览降级为 method + path.
+    // 完整的 message preview 由 detail fetch (GET /records/{id}?view=parsed) 后
+    // 在 detailRecord 上计算, 不影响 sidebar.
+    // 结果挂在 record 对象 _preview 上, 随 records 数组替换自然回收.
     const PREVIEW_MAX = 48;
     const PREVIEW_BODY_MAX = 65536;
     function messagePreview(r) {
       if (r._preview !== undefined) return r._preview;
       let preview = '';
+      // detailRecord (完整 ForwardRecord) 有 req_body, 尝试从中提取首条 user message.
       const body = r.req_body || '';
-      // 超大 body 不尝试 parse (避免阻塞); 空 body 直接 fallback.
       if (body.length > 0 && body.length <= PREVIEW_BODY_MAX) {
         try {
           const j = JSON.parse(body);
@@ -1064,15 +1066,18 @@
 
     async function selectRecord(id) {
       selectedId = id;
-      // 切换 record 时重置为 raw 视图: parsed 是 lazy-loaded, 切到新 record 时
-      // 缓存未命中需要 fetch, 与其显示空白或闪烁, 不如统一回到 raw.
-      detailView = 'raw';
+      // 切换 record 时默认使用 parsed 视图 (可读性更好).
+      // parsed view 直接从 record.resp_parsed 读取 (由后端 StreamScan 累积),
+      // 不需要额外 lazy load — selectRecord 本身会 fetch /records/{id}?view=parsed.
+      detailView = 'parsed';
       renderSidebar();
       try {
-        const r = await fetch(`${API_RECORDS}/${id}`, { cache: 'no-store' });
+        // 直接请求 parsed view (一次请求拿到 record + parsed_request + parsed_response).
+        const r = await fetch(`${API_RECORDS}/${id}?view=parsed`, { cache: 'no-store' });
         if (!r.ok) throw new Error('HTTP ' + r.status);
         const env = await r.json();
         detailRecord = env.record;
+        parsedCache.set(id, env);
         renderDetail();
       } catch (e) {
         console.error(e);
@@ -1162,7 +1167,9 @@
             · ${escapeHtml(r.elapsed_ms)}ms
           </div>
           <pre>${escapeHtml(formatHeaders(r.resp_headers))}</pre>
-          <pre>${escapeHtml(r.resp_body || '<empty>')}</pre>
+          ${r.streamed
+            ? '<div class="banner">Raw bytes are not retained for streamed responses. Use the parsed view to see accumulated content.</div>'
+            : `<pre>${escapeHtml(r.resp_body || '<empty>')}</pre>`}
         </div>
       `;
     }
@@ -1204,9 +1211,12 @@
       html += `<div>status: <span class="${statusClass(r)}">${r.resp_status === 0 ? '(pending)' : escapeHtml(r.resp_status)}</span> · ${escapeHtml(r.elapsed_ms)}ms</div>`;
       if (respJson) {
         html += renderChatResponse(respJson, redactions);
-      } else if (r.streamed) {
-        html += `<div class="banner">Streaming responses are not parsed (SSE chunks). Showing raw body below.</div>`;
-        html += `<pre>${escapeHtml(r.resp_body || '<empty>')}</pre>`;
+      } else if (r.streamed && !r.resp_complete) {
+        // 流式响应进行中, StreamScan 尚未产出第一个快照.
+        html += `<div class="banner">Streaming in progress…</div>`;
+      } else if (r.streamed && !r.resp_body) {
+        // 流式已完成但 parsed view 不可用 (Gemini/Ollama 无 codec) 且 raw body 未保留.
+        html += `<div class="banner">Parsed view not available for this streamed response (codec does not support this protocol). Raw bytes are not retained.</div>`;
       } else {
         html += `<pre>${escapeHtml(r.resp_body || '<empty>')}</pre>`;
       }
