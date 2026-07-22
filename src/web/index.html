@@ -42,7 +42,9 @@
       overflow-y: auto;
       background: #fafafa;
     }
-    article { flex: 1; padding: 12px; overflow-y: auto; }
+    article { flex: 1; padding: 0; overflow: hidden; }
+    /* detail 作为 IM 风格上下分栏容器: 内部 request-pane / response-pane 各自管滚动. */
+    #detail { display: flex; flex-direction: column; }
     .record-item {
       border-bottom: 1px solid #eee;
       cursor: pointer;
@@ -443,41 +445,65 @@
       border-color: #1a1a1a;
     }
 
-    /* chat bubbles (parsed view) */
-    .chat-bubbles { margin: 4px 0; }
+    /* chat bubbles (parsed view) ───────────────────────────────────────────
+       IM 风格气泡: 左侧 sender icon (颜色编码, hover 显示角色) + 右侧气泡主体.
+       三级展示: 折叠 (max 3 行) → 展开 (max ~15 行) → 弹框 (全文).
+       气泡内容区 min-height 保证至少 1 行, max-height 控制各级上限. */
+    .chat-bubbles { margin: 4px 0; display: flex; flex-direction: column; gap: 8px; }
+    .chat-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 6px;
+      max-width: 100%;
+    }
+    /* user 消息靠右 (IM 风格: 自己发的消息在右侧). */
+    .chat-row.row-user { flex-direction: row-reverse; }
+    /* sender icon: 圆形彩色背景, 单字母标识, 不占气泡内容行高. */
+    .sender-icon {
+      flex-shrink: 0;
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      color: #fff;
+      font-size: 10px;
+      font-weight: bold;
+      text-transform: uppercase;
+      cursor: help;
+      margin-top: 2px;
+    }
+    .sender-icon.s-user       { background: #5b8c5a; } /* 绿 */
+    .sender-icon.s-assistant  { background: #4a6fa5; } /* 蓝 */
+    .sender-icon.s-system     { background: #b5712a; } /* 橙 */
+    .sender-icon.s-tool       { background: #888;    } /* 灰 */
+    /* 气泡主体 */
     .chat-bubble {
       padding: 6px 10px;
       border-radius: 8px;
-      margin-bottom: 8px;
+      flex: 1;
+      min-width: 0;
+      min-height: 1.5em;       /* 1 行保底 */
       max-width: 88%;
       word-break: break-word;
       white-space: pre-wrap;
       font-size: 12.5px;
       line-height: 1.5;
       position: relative;
-    }
-    .chat-bubble .bubble-role {
-      display: block;
-      font-size: 10px;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      color: #888;
-      margin-bottom: 2px;
-    }
-    .bubble-user       { background: #e0e7ff; margin-left: auto;  text-align: left;  }
-    .bubble-assistant  { background: #f0f0f0; margin-right: auto; }
-    .bubble-system     { background: #fff8e0; margin: 0 auto 8px auto; max-width: 100%; border: 1px dashed #ec5; }
-    .bubble-tool       { background: #f5f5f5; margin-right: auto; font-family: ui-monospace, monospace; font-size: 11.5px; }
-
-    /* collapsible bubbles: 默认折叠到 3 行, 超过部分溢出隐藏 + 渐隐 + 展开/收起按钮.
-       JS (applyBubbleCollapse) 渲染后测量 scrollHeight 与 lineHeight*3 的像素阈值比较,
-       因为折叠前 max-height 是 none, clientHeight==scrollHeight 无法用"溢出"判断. */
-    .chat-bubble.collapsed {
-      max-height: 4.5em;       /* 3 行 × line-height 1.5 */
       overflow: hidden;
     }
+    .bubble-user       { background: #d4f1d4; }  /* 浅绿 */
+    .bubble-assistant  { background: #cfe8ff; }  /* 浅蓝 */
+    .bubble-tool       { background: #f0f0f0; font-family: ui-monospace, monospace; font-size: 11.5px; }
+    .bubble-system     { background: #fff8e0; border: 1px dashed #ec5; max-width: 100%; }
+
+    /* 三级展示的折叠 / 展开态.
+       折叠: max-height 4.5em (~3 行); 展开: max-height 22.5em (~15 行, 与 JS EXPAND_THRESHOLD_LINES 对齐).
+       超过阈值高度时在右下角浮 "view full" 按钮, 点击开 dialog. */
+    .chat-bubble.collapsed { max-height: 4.5em; }
+    .chat-bubble.expanded  { max-height: 22.5em; overflow: auto; }
     .chat-bubble.collapsed::after {
-      /* 渐隐遮罩, 提示 "下面还有内容". 覆盖在折叠气泡底部. */
       content: '';
       position: absolute;
       left: 0; right: 0; bottom: 0;
@@ -486,21 +512,117 @@
       pointer-events: none;
       opacity: 0.08;
     }
+    /* toggle: 展开/收起 文本按钮.
+       折叠态 (.collapsed): 用 position: absolute 浮在右下角, 不受 bubble 的 overflow:hidden 裁切.
+       展开态 (.expanded): 回到文档流末尾 (此时 bubble 可滚动, toggle 不需要 absolute). */
     .bubble-toggle {
-      display: block;
-      margin-top: 4px;
       font-size: 11px;
       color: #4a6fa5;
       cursor: pointer;
       user-select: none;
       border: none;
-      background: transparent;
-      padding: 0;
+      background: rgba(255,255,255,0.85);
+      padding: 0 4px;
       text-decoration: underline;
       text-underline-offset: 2px;
     }
-    /* 折叠态下隐藏 toggle 之外的内容 (渐隐遮罩压在 toggle 上), toggle 提到气泡底部之上.
-       展开 style: bubble.collapsed class 被移除, max-height 回到 none. */
+    .chat-bubble.collapsed .bubble-toggle {
+      position: absolute;
+      right: 8px;
+      bottom: 2px;
+    }
+    .chat-bubble.expanded .bubble-toggle {
+      display: block;
+      margin-top: 4px;
+    }
+    /* view-full: 浮在展开态右下角, 内容超过 expanded 阈值时出现. */
+    .view-full-btn {
+      position: absolute;
+      right: 8px;
+      bottom: 4px;
+      font-size: 11px;
+      color: #4a6fa5;
+      background: rgba(255,255,255,0.9);
+      border: 1px solid #aac;
+      border-radius: 3px;
+      padding: 1px 6px;
+      cursor: pointer;
+    }
+
+    /* 全文 dialog */
+    dialog.bubble-full {
+      max-width: 80vw;
+      max-height: 80vh;
+      width: 600px;
+      padding: 12px;
+      border: 1px solid #888;
+      border-radius: 6px;
+    }
+    dialog.bubble-full .full-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+      font-size: 12px;
+      color: #666;
+    }
+    dialog.bubble-full .full-body {
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: ui-monospace, monospace;
+      font-size: 12px;
+      max-height: 65vh;
+      overflow: auto;
+      background: #f5f5f5;
+      padding: 8px;
+      border-radius: 4px;
+    }
+    dialog.bubble-full mark.secret-hit { font-weight: 600; }
+
+    /* ─── IM 风格 detail 布局: 上下分栏 (request 上下文 + response 打字框) ─── */
+    /* detail 内部分 detail-header / request-pane / response-pane. */
+    .detail-header {
+      padding: 8px 12px 4px;
+      flex-shrink: 0;
+    }
+    /* request 上下文区: 滚动. */
+    .request-pane {
+      flex: 1;
+      overflow-y: auto;
+      padding: 4px 12px 8px;
+      min-height: 0;
+    }
+    /* response 打字框区: 固定在底部, 独立滚动条, 10 行高. */
+    .response-pane {
+      flex-shrink: 0;
+      height: calc(12.5px * 1.5 * 10 + 24px); /* 10 行 + padding */
+      border-top: 1px solid #ddd;
+      background: #fafafa;
+      display: flex;
+      flex-direction: column;
+    }
+    .response-pane .resp-header {
+      padding: 4px 12px;
+      font-size: 11px;
+      color: #666;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      border-bottom: 1px solid #eee;
+      flex-shrink: 0;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .response-pane .resp-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 8px 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12.5px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
 
     /* mock highlight: 标记命中的 redact mock 字符串 */
     mark.secret-hit {
@@ -895,27 +1017,31 @@
         return;
       }
       // 指纹: id + selectedId + status/elapsed/hitN (这些字段变化时需要重渲染).
-      // 时间不进指纹 (created_at 不变); preview 不进指纹 (挂在 record 上, 不变).
+      // preview 进指纹: 后端提取的 preview 可能从 None 变 Some (首次 list 后),
+      // 但同一条 record 的 preview 一旦提取就稳定, 所以进 fingerprint 让它更新一次.
       const fingerprint = filterMode + '|' + selectedId + '|' + list.map(r =>
-        `${r.id}:${r.resp_status}:${r.elapsed_ms}:${r.error || ''}:${(r.redactions||[]).length}`
+        `${r.id}:${r.resp_status}:${r.elapsed_ms}:${r.error || ''}:${(r.redactions||[]).length}:${r.preview || ''}:${r.model || ''}`
       ).join(',');
       if (fingerprint === lastSidebarFingerprint) return;
       lastSidebarFingerprint = fingerprint;
 
       listEl.innerHTML = list.map(r => {
         const { proto, id: pid } = parsePath(r.path);
-        const preview = messagePreview(r);
+        // 需求 6: 优先用后端返回的 preview (首条 user msg); None 时 fallback 到 method+path.
+        const preview = r.preview || `${r.method} ${r.path}`;
         const status = escapeHtml(statusText(r));
         const statusCls = statusClass(r);
         const hitN = (r.redactions || []).length;
         const hitBadge = hitN > 0 ? `<span class="badge-hit" title="${hitN} redaction(s)">${hitN}</span>` : '';
         const iconHtml = providerIcon(pid, proto);
-        // 第二行辅助信息: time · elapsed · provider_id (淡色).
-        const line2 = `${escapeHtml(formatTime(r.created_at))} · ${r.elapsed_ms}ms · ${escapeHtml(pid)}`;
-        // title: 完整多行信息 (浏览器原生 tooltip).
+        // 需求 7: 第二行显示 model 名 (若有) 取代 provider_id (provider_id 已在图标 title 中).
+        // 无 model 时 fallback 显示 provider_id (保持信息不丢).
+        const line2Model = r.model || pid;
+        const line2 = `${escapeHtml(formatTime(r.created_at))} · ${r.elapsed_ms}ms · ${escapeHtml(line2Model)}`;
         const title = [
           `${r.method} ${r.path}`,
           `provider: ${pid} (${proto})`,
+          `model: ${r.model || '(unknown)'}`,
           `status: ${statusText(r)}`,
           `elapsed: ${r.elapsed_ms}ms`,
           `time: ${formatTime(r.created_at)}`,
@@ -947,49 +1073,8 @@
       return { proto: parts[1] || '?', id: parts[2] || '<unknown>' };
     }
 
-    // 从 record 提取侧栏主标题.
-    //
-    // list API 不再返回 req_body (轻量化), 所以 sidebar 预览降级为 method + path.
-    // 完整的 message preview 由 detail fetch (GET /records/{id}?view=parsed) 后
-    // 在 detailRecord 上计算, 不影响 sidebar.
-    // 结果挂在 record 对象 _preview 上, 随 records 数组替换自然回收.
-    const PREVIEW_MAX = 48;
-    const PREVIEW_BODY_MAX = 65536;
-    function messagePreview(r) {
-      if (r._preview !== undefined) return r._preview;
-      let preview = '';
-      // detailRecord (完整 ForwardRecord) 有 req_body, 尝试从中提取首条 user message.
-      const body = r.req_body || '';
-      if (body.length > 0 && body.length <= PREVIEW_BODY_MAX) {
-        try {
-          const j = JSON.parse(body);
-          const msgs = Array.isArray(j.messages) ? j.messages : [];
-          for (const m of msgs) {
-            if (String(m.role || '') !== 'user') continue;
-            const c = m.content;
-            let t = '';
-            if (typeof c === 'string') t = c;
-            else if (Array.isArray(c)) {
-              t = c
-                .filter(b => b && b.type === 'text' && typeof b.text === 'string')
-                .map(b => b.text)
-                .join(' ');
-            }
-            if (t) { preview = t; break; }
-          }
-        } catch (_) { /* 非 JSON, 走 fallback */ }
-      }
-      // 归一化: 去多余空白 + 截断.
-      preview = String(preview || '').replace(/\s+/g, ' ').trim();
-      if (!preview) {
-        preview = `${r.method} ${r.path}`;
-      }
-      if (preview.length > PREVIEW_MAX) {
-        preview = preview.slice(0, PREVIEW_MAX) + '…';
-      }
-      r._preview = preview;
-      return preview;
-    }
+    // messagePreview 已删除: sidebar 改为直接读后端返回的 r.preview 字段 (需求 6).
+    // 后端 RecordSummary.preview 在 list 时一次性提取, 前端无需重复解析 req_body.
 
     // provider 复合图标: 圆形彩色背景 + 首字母 + 协议角标.
     // 颜色: provider id 哈希到固定调色板 (低饱和度, 保证文字可读).
@@ -1094,6 +1179,10 @@
       });
       if (mode === 'parsed' && selectedId && !parsedCache.has(selectedId)) {
         // 先渲染一个 loading 占位, 避免用户在 fetch 期间看到空白.
+        // 同时清指纹, 让 fetch 完成后 renderDetail 强制结构重建.
+        lastStructureFp = '';
+        lastRequestFp = '';
+        lastResponseFp = '';
         document.getElementById('detail').innerHTML =
           '<div class="empty">Loading parsed view…</div>';
         await fetchParsed(selectedId);
@@ -1124,74 +1213,184 @@
     }
 
     // 统一的 detail 渲染入口. 根据 detailView 选择 raw 或 parsed 子路径.
+    //
+    // 滚动保护 (需求 1) + 展开状态保留 (B1/B2 根治):
+    // 自动刷新期间 (尤其流式响应累积) 若每次都整树 innerHTML 重建, 会重置 request-pane
+    // 的 scrollTop 并丢失用户对气泡的展开状态. 根治策略是分离三部分更新:
+    //   1. 结构 (header + request-pane + response-pane 骨架): 只在 selectedId / view 切换时重建.
+    //   2. request 内容 (chat bubbles): 只在 parsed_request / parse_error / hitN 变化时重建.
+    //      流式期间 parsed_request 通常稳定 → request-pane 不重建 → 滚动/展开状态保留.
+    //   3. response 内容 (打字框): 每次 parsed_response 变化时增量更新 (仅替换 .resp-body
+    //      的 innerHTML, 不触碰 request-pane). 流式期间频繁更新, 但影响范围限于 response-pane.
+    //
+    // 三段式 fingerprint 分别对应三层; 哪段没变就跳过哪段.
+    let lastStructureFp = '';
+    let lastRequestFp = '';
+    let lastResponseFp = '';
+    let lastDetailSelectedId = null;
     function renderDetail() {
       if (!detailRecord) {
+        lastStructureFp = '';
+        lastRequestFp = '';
+        lastResponseFp = '';
+        lastDetailSelectedId = null;
         document.getElementById('detail').innerHTML =
           '<div class="empty">Select a record on the left</div>';
         return;
       }
       const r = detailRecord;
-      const toggle = `
-        <span class="view-toggle">
-          <button type="button" data-view="raw" class="${detailView === 'raw' ? 'active' : ''}" onclick="setDetailView('raw')">raw</button>
-          <button type="button" data-view="parsed" class="${detailView === 'parsed' ? 'active' : ''}" onclick="setDetailView('parsed')">parsed</button>
-        </span>
-      `;
-      if (detailView === 'parsed') {
-        renderDetailParsed(r, toggle);
-      } else {
-        renderDetailRaw(r, toggle);
+      const env = parsedCache.get(r.id) || {};
+
+      const selectedChanged = lastDetailSelectedId !== r.id;
+      // 结构 fingerprint: selectedId + view + method + path + hitN (这些决定 header / 骨架).
+      const structureFp = [r.id, detailView, r.method, r.path, (r.redactions || []).length].join('|');
+      // request fingerprint: parsed_request / parse_error / req_body 长度 (流式期间稳定).
+      const requestFp = [
+        env.parse_error || '',
+        env.parsed_request ? JSON.stringify(env.parsed_request) : 'no-req',
+        r.req_body.length,
+        (r.redactions || []).length, // hitN 变化时 mock 高亮需重绘
+      ].join('|');
+      // response fingerprint: parsed_response / resp_status / resp_body / resp_complete / error
+      // (流式期间 parsed_response 累积 → 每次变化都更新打字框).
+      const responseFp = [
+        r.resp_status,
+        r.elapsed_ms,
+        r.error || '',
+        r.resp_complete ? '1' : '0',
+        r.streamed ? '1' : '0',
+        env.parsed_response ? JSON.stringify(env.parsed_response) : 'no-resp',
+        r.resp_body.length,
+      ].join('|');
+
+      // 记录选中变化, 后面用于决定是否滚到底.
+      lastDetailSelectedId = r.id;
+
+      // 决定要更新哪几层.
+      const structureDirty = selectedChanged || structureFp !== lastStructureFp;
+      const requestDirty = structureDirty || requestFp !== lastRequestFp;
+      const responseDirty = structureDirty || responseFp !== lastResponseFp;
+
+      if (!structureDirty && !requestDirty && !responseDirty) {
+        // 三层都没变, 完全跳过 (最常见: 自动刷新时 record 静止).
+        return;
+      }
+
+      // 切换 record / view 时, 结构层重建一次 (含 request-pane / response-pane 骨架),
+      // 同时 request 和 response 内容都重新填充.
+      if (structureDirty) {
+        const toggle = `
+          <span class="view-toggle">
+            <button type="button" data-view="raw" class="${detailView === 'raw' ? 'active' : ''}" onclick="setDetailView('raw')">raw</button>
+            <button type="button" data-view="parsed" class="${detailView === 'parsed' ? 'active' : ''}" onclick="setDetailView('parsed')">parsed</button>
+          </span>
+        `;
+        // raw / parsed 共用同一结构骨架 (差异在 pane 内容).
+        renderDetailStructure(r, toggle);
+      }
+
+      // 仅在结构 / request 内容变化时重绘 request-pane (保留展开状态 / 滚动位置的反义词:
+      // 此时 DOM 被替换, 状态会丢失 — 但这只在 request 真正变化时发生, 不是自动刷新的常态).
+      if (requestDirty) {
+        if (detailView === 'parsed') {
+          updateParsedRequestPane(r, env);
+        } else {
+          updateRawRequestPane(r);
+        }
+      }
+
+      // response-pane: 只更新 .resp-body 和 .resp-header 内容, 不动 DOM 结构.
+      // 这样即便每 3s 都在更新, request-pane 也完全不受影响.
+      if (responseDirty) {
+        if (detailView === 'parsed') {
+          updateParsedResponsePane(r, env);
+        } else {
+          updateRawResponsePane(r);
+        }
+      }
+
+      lastStructureFp = structureFp;
+      lastRequestFp = requestFp;
+      lastResponseFp = responseFp;
+
+      // 需求 4: 用户主动切换 record (selectedChanged) 时, request-pane 初始滚到最下方
+      // (IM 风格: 最新消息在底部). 自动刷新 (selectedChanged=false) 保持当前位置.
+      // 仅在 parsed view 滚 (raw view 的 request 是 headers+body, 无 "最新消息" 语义).
+      if (selectedChanged && detailView === 'parsed') {
+        const pane = document.querySelector('#detail .request-pane');
+        if (pane) pane.scrollTop = pane.scrollHeight;
       }
     }
 
-    function renderDetailRaw(r, toggle) {
-      const el = document.getElementById('detail');
-      const badges = [
+    // ─── 结构层 (仅在 selectedId / view 变化时重建) ────────────────────────
+
+    function buildRespBadges(r) {
+      // m9: error message 截断, 避免长 error 撑破 header 布局.
+      const errText = r.error ? (r.error.length > 60 ? r.error.slice(0, 60) + '…' : r.error) : '';
+      return [
         r.streamed ? '<span class="badge badge-stream">streamed</span>' : '',
-        r.error ? '<span class="badge badge-err">' + escapeHtml(r.error) + '</span>' : '',
+        errText ? '<span class="badge badge-err">' + escapeHtml(errText) + '</span>' : '',
       ].join('');
+    }
+
+    // status 行模板 (SSOT): 被 renderDetailStructure 和 updateRespHeader 复用.
+    function renderStatusLine(r) {
+      return `status: <span class="${statusClass(r)}">${r.resp_status === 0 ? '(pending)' : escapeHtml(r.resp_status)}</span> · ${escapeHtml(r.elapsed_ms)}ms`;
+    }
+
+    // redactions 数组归一化: 后端返回 [[mock, secret_id], ...], 前端统一转为
+    // [{mock, secretId}], 过滤掉空 mock. 被 request / response 两处 pane 更新复用.
+    function normalizeRedactions(redactions) {
+      return (redactions || []).map(pair => ({
+        mock: String(pair[0] || ''),
+        secretId: String(pair[1] || ''),
+      })).filter(x => x.mock.length > 0);
+    }
+
+    function renderDetailHeader(r, toggle) {
       const hitN = (r.redactions || []).length;
       const hitBadge = hitN > 0 ? `<span class="badge-hit">${hitN} redacted</span>` : '';
+      return `<div class="detail-header">
+        <h3>Request ${toggle}</h3>
+        <div><b>${escapeHtml(r.method)}</b> ${escapeHtml(r.path)} ${hitBadge}</div>
+      </div>`;
+    }
+
+    // 结构层骨架 (raw / parsed 共用同一模板, 差异只在 request-pane / resp-body 内容).
+    function renderDetailStructure(r, toggle) {
+      const el = document.getElementById('detail');
+      const badges = buildRespBadges(r);
       el.innerHTML = `
-        <div class="section">
-          <h3>Request ${toggle}</h3>
-          <div><b>${escapeHtml(r.method)}</b> ${escapeHtml(r.path)} ${hitBadge}</div>
-          <pre>${escapeHtml(formatHeaders(r.req_headers))}</pre>
-          <pre>${escapeHtml(r.req_body || '<empty>')}</pre>
-        </div>
-        <div class="section">
-          <h3>Response ${badges}</h3>
-          <div>
-            status:
-            <span class="${statusClass(r)}">${r.resp_status === 0 ? '(pending)' : escapeHtml(r.resp_status)}</span>
-            · ${escapeHtml(r.elapsed_ms)}ms
+        ${renderDetailHeader(r, toggle)}
+        <div class="request-pane"></div>
+        <div class="response-pane">
+          <div class="resp-header">
+            <span>Response ${badges}</span>
+            <span class="resp-status">${renderStatusLine(r)}</span>
           </div>
-          <pre>${escapeHtml(formatHeaders(r.resp_headers))}</pre>
-          ${r.streamed
-            ? '<div class="banner">Raw bytes are not retained for streamed responses. Use the parsed view to see accumulated content.</div>'
-            : `<pre>${escapeHtml(r.resp_body || '<empty>')}</pre>`}
+          <div class="resp-body"></div>
         </div>
       `;
     }
 
-    // F5: parsed 视图. 先尝试 parsed chat bubbles; parse_error 或无数据时回退 raw + banner.
-    function renderDetailParsed(r, toggle) {
-      const el = document.getElementById('detail');
-      const env = parsedCache.get(r.id) || {};
+    // ─── request-pane 内容更新 ────────────────────────────────────────────
+
+    function updateRawRequestPane(r) {
+      const pane = document.querySelector('#detail .request-pane');
+      if (!pane) return;
+      pane.innerHTML = `
+        <pre>${escapeHtml(formatHeaders(r.req_headers))}</pre>
+        <pre>${escapeHtml(r.req_body || '<empty>')}</pre>
+      `;
+    }
+
+    function updateParsedRequestPane(r, env) {
+      const pane = document.querySelector('#detail .request-pane');
+      if (!pane) return;
       const parseError = env.parse_error || null;
       const reqJson = env.parsed_request || null;
-      const respJson = env.parsed_response || null;
-      const hitN = (r.redactions || []).length;
-      const hitBadge = hitN > 0 ? `<span class="badge-hit">${hitN} redacted</span>` : '';
-
-      // 获取 mock 列表 (每个 [mock, secret_id]). 用于在文本里高亮命中的 mock.
-      const redactions = (r.redactions || []).map(pair => ({
-        mock: String(pair[0] || ''),
-        secretId: String(pair[1] || ''),
-      })).filter(x => x.mock.length > 0);
-
-      let html = `<div class="section"><h3>Request ${toggle}</h3>`;
-      html += `<div><b>${escapeHtml(r.method)}</b> ${escapeHtml(r.path)} ${hitBadge}</div>`;
+      const redactions = normalizeRedactions(r.redactions);
+      let html = '';
       if (parseError) {
         html += `<div class="banner">Parsed view unavailable: ${escapeHtml(parseError)}. Falling back to raw body below.</div>`;
       }
@@ -1200,29 +1399,85 @@
       } else {
         html += `<pre>${escapeHtml(r.req_body || '<empty>')}</pre>`;
       }
-      html += `</div>`;
-
-      // Response 段.
-      const respBadges = [
-        r.streamed ? '<span class="badge badge-stream">streamed</span>' : '',
-        r.error ? '<span class="badge badge-err">' + escapeHtml(r.error) + '</span>' : '',
-      ].join('');
-      html += `<div class="section"><h3>Response ${respBadges}</h3>`;
-      html += `<div>status: <span class="${statusClass(r)}">${r.resp_status === 0 ? '(pending)' : escapeHtml(r.resp_status)}</span> · ${escapeHtml(r.elapsed_ms)}ms</div>`;
-      if (respJson) {
-        html += renderChatResponse(respJson, redactions);
-      } else if (r.streamed && !r.resp_complete) {
-        // 流式响应进行中, StreamScan 尚未产出第一个快照.
-        html += `<div class="banner">Streaming in progress…</div>`;
-      } else if (r.streamed && !r.resp_body) {
-        // 流式已完成但 parsed view 不可用 (Gemini/Ollama 无 codec) 且 raw body 未保留.
-        html += `<div class="banner">Parsed view not available for this streamed response (codec does not support this protocol). Raw bytes are not retained.</div>`;
-      } else {
-        html += `<pre>${escapeHtml(r.resp_body || '<empty>')}</pre>`;
-      }
-      html += `</div>`;
-      el.innerHTML = html;
+      pane.innerHTML = html;
       applyBubbleCollapse();
+    }
+
+    // ─── response-pane 内容更新 (只动 .resp-header 的 status 和 .resp-body) ──
+
+    // response header 的 status 行更新 (raw / parsed 共用, 流式响应状态变化时刷新).
+    function updateRespHeader(r) {
+      const headerStatus = document.querySelector('#detail .resp-header .resp-status');
+      if (headerStatus) headerStatus.innerHTML = renderStatusLine(r);
+    }
+
+    function updateRawResponsePane(r) {
+      updateRespHeader(r);
+      const body = document.querySelector('#detail .resp-body');
+      if (!body) return;
+      body.innerHTML = `${escapeHtml(formatHeaders(r.resp_headers))}\n${r.streamed
+        ? 'Raw bytes are not retained for streamed responses. Use the parsed view to see accumulated content.'
+        : escapeHtml(r.resp_body || '<empty>')}`;
+    }
+
+    function updateParsedResponsePane(r, env) {
+      updateRespHeader(r);
+      const body = document.querySelector('#detail .resp-body');
+      if (!body) return;
+      const respJson = env.parsed_response || null;
+      const redactions = normalizeRedactions(r.redactions);
+      if (respJson) {
+        body.innerHTML = renderResponseText(respJson, redactions);
+      } else if (r.streamed && !r.resp_complete) {
+        body.innerHTML = '<div class="banner">Streaming in progress…</div>';
+      } else if (r.streamed && !r.resp_body) {
+        body.innerHTML = '<div class="banner">Parsed view not available for this streamed response (codec does not support this protocol). Raw bytes are not retained.</div>';
+      } else {
+        body.innerHTML = escapeHtml(r.resp_body || '<empty>');
+      }
+    }
+
+    // 把 OpenAI / Anthropic 的 tool_call / tool_use 块格式化为可读文本.
+    // 在 request (assistant.tool_calls) 和 response (message.tool_calls / content[].tool_use)
+    // 两处复用, 保证 pretty-print 格式 SSOT.
+    function formatToolCall(tc) {
+      const fn = tc.function || {};
+      return `tool_call ${tc.id || ''}\nname: ${fn.name || ''}\narguments: ${fn.arguments || ''}`;
+    }
+    function formatToolUse(block) {
+      return `tool_use ${block.id || ''}\nname: ${block.name || ''}\ninput: ${safeJsonStringify(block.input)}`;
+    }
+
+    // 从 parsed_response (OpenAI / Anthropic chat JSON) 提取文本, 放入打字框.
+    // 不用气泡包裹 (response 区本身就是单个 "打字框", 只有一段 LLM 输出).
+    // 保留 tool_calls / tool_use 的渲染 (作为 response 的一部分).
+    function renderResponseText(respJson, redactions) {
+      const choice = respJson.choices && respJson.choices[0];
+      const openaiMsg = choice && choice.message;
+      if (openaiMsg) {
+        let parts = [];
+        const text = messageToText(openaiMsg);
+        if (text !== null) parts.push(applyMockHighlight(escapeHtml(text), redactions));
+        if (Array.isArray(openaiMsg.tool_calls)) {
+          for (const tc of openaiMsg.tool_calls) {
+            parts.push(applyMockHighlight(escapeHtml(formatToolCall(tc)), redactions));
+          }
+        }
+        return parts.length > 0 ? parts.join('\n\n') : '<empty>';
+      }
+      if (Array.isArray(respJson.content)) {
+        let parts = [];
+        for (const block of respJson.content) {
+          if (block && block.type === 'text' && typeof block.text === 'string') {
+            parts.push(applyMockHighlight(escapeHtml(block.text), redactions));
+          } else if (block && block.type === 'tool_use') {
+            parts.push(applyMockHighlight(escapeHtml(formatToolUse(block)), redactions));
+          }
+        }
+        return parts.length > 0 ? parts.join('\n\n') : '<empty>';
+      }
+      // 未知结构: pretty JSON.
+      return escapeHtml(safeJsonStringify(respJson));
     }
 
     // F5: 把 parsed_request (OpenAI / Anthropic canonical chat JSON) 渲染为 chat bubbles.
@@ -1249,16 +1504,14 @@
         }
         const text = messageToText(m);
         if (text !== null) {
-          // role=tool 也走这里: messageToText 归一化 content 为文本, bubbleClassForRole 返回 'tool'.
-          const cls = bubbleClassForRole(role);
+          // role=tool 也走这里: messageToText 归一化 content 为文本, senderMeta 返回 'tool' cls.
+          const cls = senderMeta(role).cls;
           html += renderBubble(cls, text, redactions, role);
         }
         // 处理 OpenAI 风格的 tool_calls (assistant 消息里).
         if (role === 'assistant' && Array.isArray(m.tool_calls)) {
           for (const tc of m.tool_calls) {
-            const fn = tc.function || {};
-            const pretty = `tool_call ${tc.id || ''}\nname: ${fn.name || ''}\narguments: ${fn.arguments || ''}`;
-            html += `<div class="chat-bubble bubble-tool"><span class="bubble-role">tool call</span>${applyMockHighlight(escapeHtml(pretty), redactions)}</div>`;
+            html += renderBubble('tool', formatToolCall(tc), redactions, 'tool_call');
           }
         }
       }
@@ -1266,92 +1519,142 @@
       return html;
     }
 
-    // F5: parsed_response 渲染. OpenAI: choices[0].message; Anthropic: 顶层 content[].
-    function renderChatResponse(respJson, redactions) {
-      let html = '<div class="chat-bubbles">';
-      // OpenAI shape.
-      const choice = respJson.choices && respJson.choices[0];
-      const openaiMsg = choice && choice.message;
-      if (openaiMsg) {
-        const text = messageToText(openaiMsg);
-        if (text !== null) html += renderBubble('assistant', text, redactions, 'assistant');
-        // tool_calls (OpenAI): 单独渲染为 tool bubble.
-        if (Array.isArray(openaiMsg.tool_calls)) {
-          for (const tc of openaiMsg.tool_calls) {
-            const fn = tc.function || {};
-            const pretty = `tool_call ${tc.id || ''}\nname: ${fn.name || ''}\narguments: ${fn.arguments || ''}`;
-            html += `<div class="chat-bubble bubble-tool"><span class="bubble-role">tool call</span>${applyMockHighlight(escapeHtml(pretty), redactions)}</div>`;
-          }
-        }
-      } else if (Array.isArray(respJson.content)) {
-        // Anthropic shape.
-        for (const block of respJson.content) {
-          if (block && block.type === 'text' && typeof block.text === 'string') {
-            html += renderBubble('assistant', block.text, redactions, 'assistant');
-          } else if (block && block.type === 'tool_use') {
-            const pretty = `tool_use ${block.id || ''}\nname: ${block.name || ''}\ninput: ${safeJsonStringify(block.input)}`;
-            html += `<div class="chat-bubble bubble-tool"><span class="bubble-role">tool use</span>${applyMockHighlight(escapeHtml(pretty), redactions)}</div>`;
-          }
-        }
-      } else {
-        // 未知结构: 退化为 pretty JSON.
-        html += `<pre>${escapeHtml(safeJsonStringify(respJson))}</pre>`;
-      }
-      html += '</div>';
-      return html;
+    // 把 sender 映射为 {cls (用于 .chat-row.row-<x> + .sender-icon.s-<x>),
+    // letter (icon 内字母), label (hover title)}.
+    // user 靠右 (IM 风格), 其他靠左.
+    function senderMeta(role) {
+      if (role === 'user') return { cls: 'user', letter: 'U', label: 'user' };
+      if (role === 'assistant') return { cls: 'assistant', letter: 'A', label: 'assistant' };
+      if (role === 'system') return { cls: 'system', letter: 'S', label: 'system' };
+      // tool / tool_call / tool_use 都归到 tool.
+      return { cls: 'tool', letter: 'T', label: role || 'tool' };
     }
 
     function renderBubble(cls, text, redactions, roleLabel) {
-      const roleDisplay = roleLabel || cls;
-      // applyMockHighlight 期望输入是已经 escapeHtml 过的字符串.
-      // 注意: bubble 用 white-space: pre-wrap 渲染, 文本前后的空白会被保留.
-      // 所以 safeText 必须紧跟 </span>, 中间不能有换行/缩进, 否则会渲染出空行.
+      const role = roleLabel || cls;
+      const meta = senderMeta(role);
       const safeText = applyMockHighlight(escapeHtml(text), redactions);
-      return `<div class="chat-bubble bubble-${cls}"><span class="bubble-role">${escapeHtml(roleDisplay)}</span>${safeText}</div>`;
+      // chat-row 包裹: sender-icon + bubble. user 靠右 (row-reverse).
+      return `
+        <div class="chat-row row-${meta.cls}">
+          <span class="sender-icon s-${meta.cls}" title="${escapeHtml(meta.label)}">${meta.letter}</span>
+          <div class="chat-bubble bubble-${cls}" data-role="${escapeHtml(role)}">${safeText}</div>
+        </div>
+      `;
     }
 
-    // 折叠超过 3 行的气泡: 判断内容自然高度是否超过折叠阈值 (4.5em ≈ 67px @ 12.5px*1.5).
-    // 超过则加 .collapsed + 注入 "展开/收起" 按钮. 点击 toggle 仅切换 class, 不重新渲染,
-    // 保留滚动位置与 mock 高亮状态.
+    // 三级展示气泡: 折叠 (3 行) → 展开 (阈值 ~15 行) → 弹框全文.
     //
-    // 测量策略: 折叠前 max-height 是 none, clientHeight == scrollHeight, 无法用
-    // "溢出" 判断. 改为直接比较 scrollHeight 与换算后的像素阈值.
+    // 测量策略: 渲染后立刻测量 scrollHeight (max-height: none 时 == 内容自然高度).
+    // - ≤ 3 行: 不加任何 class (自然展示).
+    // - 3 行 ~ 阈值: 加 .collapsed (3 行高 + 展开 toggle).
+    // - > 阈值: 加 .collapsed + 渲染后在 expanded 态再浮 "查看全文" 按钮.
+    //
+    // 用户操作:
+    // 1. 点击 "expand ▾": .collapsed → .expanded (阈值高度, 内部 overflow:auto).
+    //    若 expanded 态内容仍溢出 (scrollHeight > 阈值像素), 浮 "查看全文" 按钮.
+    // 2. 点击 "view full": 打开 <dialog> 全文.
+    // 3. 点击 "collapse ▴": .expanded → .collapsed.
+    //
+    // EXPAND_THRESHOLD_LINES: 展开态最大行数 (~15 行). 与 CSS .chat-bubble.expanded 的 max-height 对齐.
+    const EXPAND_THRESHOLD_LINES = 15;
+
     function applyBubbleCollapse() {
       const bubbles = document.querySelectorAll('#detail .chat-bubble');
-      // 3 行 × line-height 1.5 × font-size 12.5px = 56.25px. 留 2px 容差.
-      // 取 bubble 上生效的 font-size 计算, 而非硬编码 (bubble-tool 是 11.5px).
       bubbles.forEach(bubble => {
         if (bubble.dataset.collapseReady === '1') return;
-        bubble.classList.remove('collapsed');
+        // 先移除 collapsed / expanded 让自然高度可测 (max-height: none 时 == 内容自然高度).
+        bubble.classList.remove('collapsed', 'expanded');
         const style = getComputedStyle(bubble);
         const fontSize = parseFloat(style.fontSize) || 12.5;
         const lineHeight = parseFloat(style.lineHeight) || (fontSize * 1.5);
-        const threshold = lineHeight * 3 + 2;
-        const overflowed = bubble.scrollHeight > threshold;
-        if (!overflowed) {
+        const collapseThreshold = lineHeight * 3 + 2;       // 3 行
+        const expandThreshold = lineHeight * EXPAND_THRESHOLD_LINES; // 15 行
+        const naturalHeight = bubble.scrollHeight;
+        if (naturalHeight <= collapseThreshold) {
           bubble.dataset.collapseReady = '1';
           return;
         }
+        // 默认折叠.
         bubble.classList.add('collapsed');
+        // 折叠 toggle.
         const toggle = document.createElement('button');
         toggle.className = 'bubble-toggle';
         toggle.type = 'button';
         toggle.textContent = 'expand ▾';
-        toggle.addEventListener('click', () => {
-          const collapsed = bubble.classList.toggle('collapsed');
-          toggle.textContent = collapsed ? 'expand ▾' : 'collapse ▴';
-        });
+        toggle.addEventListener('click', () => onBubbleToggle(bubble, toggle, expandThreshold));
         bubble.appendChild(toggle);
+        // 若自然高度超过展开阈值, 标记以便展开时显示 "查看全文".
+        if (naturalHeight > expandThreshold) {
+          bubble.dataset.canViewFull = '1';
+        }
         bubble.dataset.collapseReady = '1';
       });
     }
 
-    function bubbleClassForRole(role) {
-      if (role === 'user') return 'user';
-      if (role === 'assistant') return 'assistant';
-      if (role === 'tool') return 'tool';
-      return 'assistant';
+    // toggle 点击: collapsed ↔ expanded. 进入 expanded 时按需浮 "查看全文".
+    function onBubbleToggle(bubble, toggle, expandThreshold) {
+      const isCollapsed = bubble.classList.contains('collapsed');
+      if (isCollapsed) {
+        // collapsed → expanded.
+        bubble.classList.remove('collapsed');
+        bubble.classList.add('expanded');
+        toggle.textContent = 'collapse ▴';
+        // 若标记了可查看全文, 注入浮动按钮 (只注入一次).
+        if (bubble.dataset.canViewFull === '1' && !bubble.querySelector('.view-full-btn')) {
+          const fullBtn = document.createElement('button');
+          fullBtn.className = 'view-full-btn';
+          fullBtn.type = 'button';
+          fullBtn.textContent = 'view full ▾';
+          fullBtn.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            openBubbleFullDialog(bubble);
+          });
+          bubble.appendChild(fullBtn);
+        }
+      } else {
+        // expanded → collapsed.
+        bubble.classList.remove('expanded');
+        bubble.classList.add('collapsed');
+        toggle.textContent = 'expand ▾';
+      }
     }
+
+    // 打开全文 dialog: 克隆 bubble 内容 (含 mock 高亮), 放进专用 dialog.
+    function openBubbleFullDialog(bubble) {
+      let dlg = document.getElementById('bubble-full-dialog');
+      if (!dlg) {
+        dlg = document.createElement('dialog');
+        dlg.id = 'bubble-full-dialog';
+        dlg.className = 'bubble-full';
+        dlg.innerHTML = `
+          <div class="full-header">
+            <span class="full-title"></span>
+            <button type="button" class="btn full-close">close</button>
+          </div>
+          <div class="full-body"></div>
+        `;
+        document.body.appendChild(dlg);
+        dlg.querySelector('.full-close').addEventListener('click', () => dlg.close());
+        // 点 dialog 外部关闭 (点 backdrop).
+        dlg.addEventListener('click', (ev) => {
+          if (ev.target === dlg) dlg.close();
+        });
+      }
+      const role = bubble.dataset.role || 'message';
+      dlg.querySelector('.full-title').textContent = role;
+      // 克隆内容 (保留 mark.secret-hit 高亮).
+      const clone = bubble.cloneNode(true);
+      // 移除 toggle / view-full 按钮 (dialog 有自己的 close).
+      clone.querySelectorAll('.bubble-toggle, .view-full-btn').forEach(el => el.remove());
+      clone.classList.remove('collapsed', 'expanded');
+      clone.style.maxHeight = 'none';
+      dlg.querySelector('.full-body').innerHTML = clone.innerHTML;
+      dlg.showModal();
+    }
+
+    // bubbleClassForRole 已合并到 senderMeta (单一映射, role → {cls, letter, label}).
+    // senderMeta 的默认分支返回 'tool' (覆盖 tool/tool_call/tool_use 等所有非标准 role).
 
     // 把 message.content (string | array) 归一化为纯文本. 返回 null 表示该消息没有可展示文本
     // (无 content / 纯 tool 块), 让调用方统一用 `if (text !== null)` 决定是否渲染.

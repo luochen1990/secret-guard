@@ -207,8 +207,11 @@ fn build_parsed_response(record: ForwardRecord) -> GetRecordResponse {
 /// list_records 返回的轻量 record 摘要 (不含 body 字段).
 ///
 /// req_body / resp_body / resp_parsed 可能很大 (流式响应累积内容 / 大 prompt),
-/// list 场景不需要它们 — 前端 sidebar 只显示 id/path/status/hitN 等元数据,
+/// list 场景不需要它们 — 前端 sidebar 只显示 preview / model / status / hitN 等元数据,
 /// body 由 GET /records/{id}?view=... 按需拉取.
+///
+/// `preview` 与 `model` 在 `From<ForwardRecord>` 时从 `req_body` 一次性提取后丢弃原文,
+/// 保证 list 响应始终轻量 (preview 截断到 [`PREVIEW_MAX`] chars).
 #[derive(Serialize)]
 pub struct RecordSummary {
     pub id: Uuid,
@@ -222,10 +225,28 @@ pub struct RecordSummary {
     pub error: Option<String>,
     #[serde(default)]
     pub redactions: Vec<(String, String)>,
+    /// 会话标题: 从 req_body 提取的首条 user message 文本 (截断).
+    /// 提取失败 (非 JSON / 无 user message) 时为 None, 前端 fallback 到 method+path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+    /// 模型名: 从 req_body 顶层 `model` 字段提取 (OpenAI / Anthropic 共有).
+    /// 非 chat 协议或缺失时为 None.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
+
+/// preview 截断上限 (char count). 后端唯一截断点, 前端直接渲染.
+const PREVIEW_MAX: usize = 48;
+/// 超过此大小的 req_body 跳过 preview 提取 (避免大 body 无谓 JSON parse).
+/// 1 MiB 足以覆盖绝大多数 LLM 请求 (system prompt + 多轮对话); 超出此大小的请求
+/// preview 留空, sidebar fallback 到 method+path.
+const PREVIEW_BODY_MAX: usize = 1024 * 1024;
 
 impl From<ForwardRecord> for RecordSummary {
     fn from(r: ForwardRecord) -> Self {
+        // 一次性从 req_body 提取 preview + model, 提取后 record 整体 move 进 summary
+        // 并被 drop (summary 不持有 req_body 字段), 内存自然释放.
+        let (preview, model) = extract_preview_and_model(&r.req_body);
         Self {
             id: r.id,
             created_at: r.created_at,
@@ -237,8 +258,83 @@ impl From<ForwardRecord> for RecordSummary {
             resp_complete: r.resp_complete,
             error: r.error,
             redactions: r.redactions,
+            preview,
+            model,
         }
     }
+}
+
+/// 从 chat request body 中提取 (首条 user message preview, model 名).
+///
+/// 协议无关的字节级提取 (不依赖 codec reader): OpenAI 和 Anthropic 都把 `model`
+/// 放在顶层, `messages[]` 也共享 `{role, content}` 形状. content 支持 string 和
+/// `[{type:"text", text}]` 两种形态 (OpenAI / Anthropic 一致).
+///
+/// 设计权衡:
+/// - 不复用 codec reader: reader 会做更重的协议归一化 (tool_calls / system 顶层等),
+///   list 路径只需 preview + model, 用轻量 serde_json::Value 提取即可, 避免把
+///   codec 模块耦合进 web/api.
+/// - 失败容错: 非 JSON / 字段缺失 / 类型不匹配一律返回 (None, None), 不影响 list 响应.
+///   前端按 None fallback 到 method+path (与旧行为一致).
+fn extract_preview_and_model(req_body: &str) -> (Option<String>, Option<String>) {
+    // 跳过明显非 JSON 的 body (快速路径, 避免大 body 无谓 try_parse).
+    if req_body.is_empty() || req_body.len() > PREVIEW_BODY_MAX || !req_body.starts_with('{') {
+        return (None, None);
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(req_body) else {
+        return (None, None);
+    };
+    let model = v
+        .get("model")
+        .and_then(|m| m.as_str())
+        .map(|s| s.to_string());
+    let preview = v
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .and_then(|msgs| {
+            msgs.iter().find_map(|m| {
+                if m.get("role").and_then(|r| r.as_str()) != Some("user") {
+                    return None;
+                }
+                let content = m.get("content")?;
+                // string content: 直接取.
+                if let Some(s) = content.as_str() {
+                    return Some(s.to_string());
+                }
+                // array content: 拼接所有 type=text 的 text 字段.
+                if let Some(arr) = content.as_array() {
+                    let texts: Vec<&str> = arr
+                        .iter()
+                        .filter_map(|b| {
+                            if b.get("type").and_then(|t| t.as_str()) != Some("text") {
+                                return None;
+                            }
+                            b.get("text").and_then(|t| t.as_str())
+                        })
+                        .collect();
+                    if texts.is_empty() {
+                        return None;
+                    }
+                    return Some(texts.join(" "));
+                }
+                None
+            })
+        })
+        .map(|s| {
+            // 归一化空白 + 截断 (与前端 messagePreview 逻辑一致, SSOT 在此).
+            let normalized = s.split_whitespace().collect::<Vec<_>>().join(" ");
+            if normalized.chars().count() > PREVIEW_MAX {
+                let end = normalized
+                    .char_indices()
+                    .nth(PREVIEW_MAX)
+                    .map(|(i, _)| i)
+                    .unwrap_or(normalized.len());
+                format!("{}…", &normalized[..end])
+            } else {
+                normalized
+            }
+        });
+    (preview, model)
 }
 
 #[derive(Serialize)]
@@ -817,6 +913,145 @@ mod tests {
             filter: Some(RecordFilter::Hits),
         };
         assert_eq!(q.resolve(), (10, 20, RecordFilter::Hits));
+    }
+
+    // ─── extract_preview_and_model ────────────────────────────────────────
+
+    #[test]
+    fn extract_preview_model_openai_string_content() {
+        let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hello world"}]}"#;
+        let (preview, model) = extract_preview_and_model(body);
+        assert_eq!(model.as_deref(), Some("gpt-4o"));
+        assert_eq!(preview.as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn extract_preview_model_anthropic_array_content() {
+        let body = r#"{"model":"claude-3","messages":[{"role":"user","content":[{"type":"text","text":"hi there"}]}]}"#;
+        let (preview, model) = extract_preview_and_model(body);
+        assert_eq!(model.as_deref(), Some("claude-3"));
+        assert_eq!(preview.as_deref(), Some("hi there"));
+    }
+
+    #[test]
+    fn extract_preview_picks_first_user_message() {
+        // 多个 user message: 取第一个.
+        let body = r#"{"model":"x","messages":[{"role":"assistant","content":"noop"},{"role":"user","content":"first user"},{"role":"user","content":"second"}]}"#;
+        let (preview, _) = extract_preview_and_model(body);
+        assert_eq!(preview.as_deref(), Some("first user"));
+    }
+
+    #[test]
+    fn extract_preview_truncates_long_text() {
+        let long = "a".repeat(100);
+        let body = format!(r#"{{"model":"x","messages":[{{"role":"user","content":"{long}"}}]}}"#);
+        let (preview, _) = extract_preview_and_model(&body);
+        let p = preview.expect("preview should be set");
+        assert_eq!(p.chars().count(), PREVIEW_MAX + 1); // 48 chars + '…'
+        assert!(p.ends_with('…'));
+    }
+
+    #[test]
+    fn extract_preview_normalizes_whitespace() {
+        let body = r#"{"model":"x","messages":[{"role":"user","content":"  hello\n\n  world  "}]}"#;
+        let (preview, _) = extract_preview_and_model(body);
+        assert_eq!(preview.as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn extract_preview_no_user_message_returns_none() {
+        let body = r#"{"model":"x","messages":[{"role":"system","content":"sys"}]}"#;
+        let (preview, model) = extract_preview_and_model(body);
+        assert_eq!(model.as_deref(), Some("x"));
+        assert!(preview.is_none());
+    }
+
+    #[test]
+    fn extract_preview_non_json_returns_none() {
+        let (preview, model) = extract_preview_and_model("not json{");
+        assert!(preview.is_none());
+        assert!(model.is_none());
+    }
+
+    #[test]
+    fn extract_preview_empty_body_returns_none() {
+        let (preview, model) = extract_preview_and_model("");
+        assert!(preview.is_none());
+        assert!(model.is_none());
+    }
+
+    #[test]
+    fn extract_preview_oversized_body_returns_none() {
+        // > PREVIEW_BODY_MAX (1 MiB) 的 body 直接跳过 (快速路径).
+        let big = "x".repeat(PREVIEW_BODY_MAX + 1);
+        let body = format!(r#"{{"model":"x","messages":[{{"role":"user","content":"{big}"}}]}}"#);
+        let (preview, model) = extract_preview_and_model(&body);
+        assert!(preview.is_none());
+        assert!(model.is_none());
+    }
+
+    #[test]
+    fn extract_preview_large_but_under_threshold_is_extracted() {
+        // 接近 1 MiB 的合法 chat body 仍应正常提取 (覆盖典型 LLM 长 prompt 场景).
+        // content 用 100 KiB 文本, 整个 body 约 100 KiB, 远低于阈值.
+        let big_content = "a".repeat(100 * 1024);
+        let body = format!(
+            r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"{big_content}"}}]}}"#
+        );
+        let (preview, model) = extract_preview_and_model(&body);
+        assert_eq!(model.as_deref(), Some("gpt-4o"));
+        // content 被截断到 PREVIEW_MAX chars + '…'.
+        let p = preview.expect("preview should be set");
+        assert!(p.ends_with('…'));
+        assert_eq!(p.chars().count(), PREVIEW_MAX + 1);
+    }
+
+    #[test]
+    fn extract_preview_not_starting_with_brace_returns_none() {
+        // 快速路径: 不以 { 开头直接跳过 (catches GET / DELETE 等无 body 场景).
+        let (preview, model) = extract_preview_and_model("plain text");
+        assert!(preview.is_none());
+        assert!(model.is_none());
+    }
+
+    #[test]
+    fn extract_preview_multibyte_truncation_safe() {
+        // 截断在 UTF-8 char boundary 安全 (用 char_indices).
+        let body = r#"{"model":"x","messages":[{"role":"user","content":"你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界你好世界"}]}"#;
+        let (preview, _) = extract_preview_and_model(body);
+        let p = preview.unwrap();
+        // 截断点在 48 chars 处, 末尾加 '…', UTF-8 不应 panic.
+        assert!(p.ends_with('…'));
+        assert_eq!(p.chars().count(), PREVIEW_MAX + 1);
+    }
+
+    #[test]
+    fn record_summary_from_extracts_preview_and_model() {
+        // 端到端: ForwardRecord -> RecordSummary 应当带上 preview + model.
+        let mut r = crate::record::ForwardRecord::new(
+            "POST".into(),
+            "/o/oa-main/v1/chat/completions".into(),
+            vec![],
+            r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#.into(),
+        );
+        r.resp_status = 200;
+        let s = RecordSummary::from(r);
+        assert_eq!(s.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(s.preview.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn record_summary_from_empty_body_yields_none_fields() {
+        // 空请求 body (如 GET) -> preview/model 都 None.
+        let r = crate::record::ForwardRecord::new(
+            "GET".into(),
+            "/o/oa-main/v1/models".into(),
+            vec![],
+            String::new(),
+        );
+        let s = RecordSummary::from(r);
+        assert!(s.preview.is_none());
+        assert!(s.model.is_none());
     }
 
     // ─── build_parsed_response ────────────────────────────────────────────

@@ -88,7 +88,7 @@ src/
     └── web/
         ├── mod.rs     # /__sg 子 router + / 根入口 + slash_redirect + not_found
         ├── api.rs     # JSON endpoints (records + secrets/providers CRUD + PATCH .../decision)
-        └── index.html # 单页 UI (内嵌 CSS + vanilla JS, 零外部依赖)
+        └── index.html # 单页 UI (IM 风格: 内嵌 CSS + vanilla JS, 零外部依赖)
 ```
 
 > `ProviderTable` 与 `SecretTable` 是 [`DynamicTable<T>`](src/config.rs) 的类型别名,
@@ -161,9 +161,14 @@ PATCH  /__sg/api/providers/{id}/decision
 解析) + `parsed_response` (直接取自 `record.resp_parsed`, 由 proxy 层的 `StreamScan` 在流过程中
 增量累积, 非流式路径在响应完成时一次性计算). Gemini/Ollama 无 codec → `parse_error` + fallback raw.
 
-**Records list 轻量化**: `GET /records` 返回 `RecordSummary` (不含 `req_body` / `resp_body` /
-`resp_parsed`), body 字段由 `GET /records/{id}?view=...` 按需拉取. 流式响应的 `resp_body` 在
-record 完成后为空 (不保留原始 SSE 字节), parsed view 通过 `resp_parsed` 提供.
+**Records list 轻量化 + 预览提取**: `GET /records` 返回 `RecordSummary` (不含 `req_body` /
+`resp_body` / `resp_parsed`), body 字段由 `GET /records/{id}?view=...` 按需拉取. 流式响应的
+`resp_body` 在 record 完成后为空 (不保留原始 SSE 字节), parsed view 通过 `resp_parsed` 提供.
+
+`RecordSummary` 同时携带两个从 `req_body` 一次性提取的轻量字段 (提取后丢弃 body):
+- `preview`: 首条 user message 文本 (截断到 48 chars), sidebar 主标题. 提取失败 fallback 到 method+path.
+- `model`: 顶层 `model` 字段 (OpenAI / Anthropic 共有), sidebar 副标题第二行.
+提取逻辑在 `web::api::extract_preview_and_model` (协议无关字节级, 不依赖 codec reader).
 
 **ForwardRecord.redactions**: `Vec<(mock, secret_id)>` — 从 `redact_ir` 产出的
 `RedactionMap` SSOT 派生 (见 `proxy.rs::derive_redactions`). WebUI 的 mock 高亮和 "命中"
@@ -454,8 +459,29 @@ client = Anthropic(
 | 单元 (纯函数) | `#[test]` | `provider::tests::protocol_short_roundtrip` |
 | Property-based | `proptest` | `redact::tests::prop_round_trip_identity` |
 | 集成 (端到端) | `mockito` + `axum::serve` | `tests/integration.rs::forwards_streaming_sse` |
+| WebUI 回归 | Playwright (TypeScript) | `tests/webui/im-ui.spec.ts` |
 
 `mockito::Matcher` 在 1.x 没有 `String` 变体, 用 `Exact` 或 `Json` / `PartialJson`.
+
+### WebUI 回归测试 (`tests/webui/`)
+
+TypeScript + Playwright 端到端测试, 覆盖前端 JS 逻辑 (无法用 cargo 测试覆盖).
+通过 `playwright.config.ts` 的 `webServer` 配置自动管理 mock upstream + secret-guard
+的启停, 测试完全自包含, 无需外部脚本.
+
+依赖: `playwright-test` (由 devShell 提供, nixpkgs 打包, 自带 `@playwright/test` + 浏览器).
+devShell 的 `shellHook` 自动把 `@playwright/test` 的 node_modules symlink 到
+`tests/webui/node_modules`, 让 TS 源码的 `import "@playwright/test"` 能解析
+(ESM resolver 不读 NODE_PATH).
+
+关键场景:
+- 三段式 fingerprint: 自动刷新期间 request-pane 滚动位置 + bubble 展开状态保持
+- 三级展示气泡 (折叠 → 展开 → 弹框全文)
+- response 打字框布局 (固定底部, 独立滚动)
+- sidebar preview + model 字段显示
+- 气泡颜色 + sender icon 分类
+
+运行 (在 devShell 内): `just check-webui`.
 
 集成测试覆盖的关键场景:
 - 同协议 identity passthrough (OpenAI / Anthropic / Gemini / Ollama)

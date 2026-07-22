@@ -2685,6 +2685,10 @@ struct RecordSummary {
     error: Option<String>,
     #[serde(default)]
     redactions: Vec<(String, String)>,
+    #[serde(default)]
+    preview: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
 }
 
 async fn wait_for_record_count(url: &str, count: usize) -> Vec<RecordSummary> {
