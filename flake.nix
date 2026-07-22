@@ -55,7 +55,21 @@
           rust-analyzer
           pkg-config
           openssl
+          # WebUI 回归测试 (tests/webui/): playwright-test 自带 @playwright/test + 浏览器.
+          # shellHook 把它的 node_modules symlink 到 tests/webui/node_modules,
+          # 让 TS 源码的 `import "@playwright/test"` 能解析 (ESM resolver 不读 NODE_PATH).
+          nodejs
+          playwright-test
         ];
+        # shellHook: 进入 devShell 时自动 symlink playwright-test 的 node_modules 到 tests/webui.
+        # 用相对路径 (shellHook 在用户 shell 中执行, cwd 通常 = 项目根), 不用 ${self}
+        # (${self} 在 git+file 工作树模式下指向只读 nix store 副本, mkdir 会失败).
+        shellHook = ''
+          mkdir -p tests/webui/node_modules/@playwright
+          ln -sfn ${pkgs.playwright-test}/lib/node_modules/@playwright/test tests/webui/node_modules/@playwright/test
+          ln -sfn ${pkgs.playwright-test}/lib/node_modules/playwright tests/webui/node_modules/playwright
+          ln -sfn ${pkgs.playwright-test}/lib/node_modules/playwright-core tests/webui/node_modules/playwright-core
+        '';
         RUST_SRC_PATH = "${pkgs.rust.packages.stable.rustPlatform.rustLibSrc}";
       };
     });

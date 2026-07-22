@@ -28,6 +28,15 @@ check:
     cargo nextest run --no-fail-fast
     cargo test --doc
 
+# WebUI 回归测试 (Playwright 端到端).
+# 需要 devShell (nix develop) 提供 playwright-test 包; shellHook 自动 symlink node_modules.
+check-webui:
+    cd tests/webui && playwright test
+
+# check + check-webui (完整验证, devShell 内).
+check-all: check
+    cd tests/webui && playwright test
+
 # 仅 fmt.
 fmt:
     cargo fmt
