@@ -20,12 +20,19 @@ run *ARGS:
 dev:
     cargo watch -x 'run -- run'
 
-# 一次跑完: fmt + clippy + machete (unused deps) + test.
-check:
+# 一次跑完: fmt + clippy + machete + test.
+# --coverage: 测试阶段改用插桩编译 (cargo llvm-cov nextest), 产出覆盖率数据到
+# target/llvm-cov-target/, 后续 just coverage-gate / coverage-html 直接消费, 无需重跑测试.
+# 默认不带 (本地开发追求快速反馈, 无需插桩开销).
+check *ARGS:
     cargo fmt -- --check
     cargo clippy --all-targets -- -D warnings
     cargo machete
-    cargo nextest run --no-fail-fast
+    @if echo "{{ARGS}}" | grep -q -- "--coverage"; then \
+        cargo llvm-cov nextest --no-fail-fast --no-report; \
+    else \
+        cargo nextest run --no-fail-fast; \
+    fi
     cargo test --doc
 
 # WebUI 回归测试 (Playwright 端到端).
@@ -52,12 +59,27 @@ test:
 # ─── coverage ─────────────────────────────────────────────────────────────
 # 基于 LLVM source-based coverage (cargo-llvm-cov). 工具链与 LLVM_COV/LLVM_PROFDATA
 # 环境变量由 nix devShell 注入 (见 flake.nix), 因此以下命令需在 `nix develop` 内执行.
+# CI 里 ci.yml 用 job 级 env 写死绝对路径注入 (runner VM 不进 devShell).
 # 产物默认写到 target/llvm-cov-target/ + coverage/ (已 .gitignore).
+#
+# 门禁基线 (SSOT): 覆盖率百分比下限 + 未覆盖行数上限. 提升 coverage 后手动 bump.
+# 当前实测约 ~89% / ~850 uncovered, 阈值留缓冲.
+COVERAGE_MIN_LINES := "85"
+COVERAGE_MAX_UNCOVERED := "1000"
 
 # 覆盖率摘要 (终端表格).
 coverage:
     cargo llvm-cov nextest --no-fail-fast --no-report
     cargo llvm-cov report --summary-only
+
+# 覆盖率门禁 (CI 用): 双阈值, 任一不满足则非零退出.
+# 前置: check --coverage 已产出 profdata 到 target/llvm-cov-target/. 本 recipe 只做 report.
+#   --fail-under-lines:     总行覆盖率下限 (防整体下降)
+#   --fail-uncovered-lines: 未覆盖行数上限 (防未覆盖绝对值增长)
+coverage-gate:
+    cargo llvm-cov report --summary-only \
+      --fail-under-lines {{COVERAGE_MIN_LINES}} \
+      --fail-uncovered-lines {{COVERAGE_MAX_UNCOVERED}}
 
 # HTML 报告 (浏览器打开 coverage/html/index.html).
 coverage-html:

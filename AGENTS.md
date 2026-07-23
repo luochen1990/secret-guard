@@ -441,8 +441,17 @@ cargo run -- run --port 18787
 CI 配置在 `.forgejo/workflows/ci.yml`, 触发条件: `push` + `pull_request` +
 `workflow_dispatch` (手动重试). 去重逻辑: PR 事件总是跑; push 仅 master 跑
 (feature branch 的 push 会被 PR 覆盖). Runner 标签为 `vm-nix` (microvm, 工具链
-直接装在 VM 的 `environment.systemPackages` 里), 直接跑 `just check` (不走 nix
-develop 避免 flake 评估开销; 完整 5 步: fmt → clippy → machete → nextest → doctest).
+直接装在 VM 的 `environment.systemPackages` 里), 不走 nix develop 避免 flake
+评估开销.
+
+CI 流程 (测试集只跑一次):
+1. **Check + coverage data**: `just check --coverage` — fmt + clippy + machete +
+   测试 (用 `cargo llvm-cov nextest` 插桩编译, 产出 profdata 到 `target/llvm-cov-target/`).
+2. **Coverage gate**: `just coverage-gate` — 只做 report (读上一步 profdata), 不重跑测试.
+
+cargo-llvm-cov 依赖的 `llvm-cov`/`llvm-profdata` (rust toolchain 不含) 由 runner VM
+的 `rust.mod.nix` 提供 (见 ~/ws/nixos), ci.yml job 级 `env` 注入绝对路径.
+门禁阈值细节见下方"覆盖率工具"段.
 
 **commit status context**: `ci / check (pull_request)` 或 `ci / check (push)` (workflow
 `name: ci` + job_id `check`; **禁止改 workflow name 或 job_id** —— 会改变 context 破坏门禁).
@@ -492,11 +501,13 @@ client = Anthropic(
 (nix rust toolchain 不带 llvm-tools-preview 组件, 见 `flake.nix`). 所有 coverage 命令需在 `nix develop` 内执行.
 
 - `just coverage`: 终端摘要表格 (快速查看整体覆盖率).
+- `just coverage-gate`: 覆盖率门禁 (CI 用, 双阈值, 任一不满足则非零退出).
 - `just coverage-html`: HTML 报告 → `coverage/html/index.html` (行级着色, 定位未覆盖代码).
 - `just coverage-lcov`: LCOV 报告 → `coverage/lcov.info` (CI / IDE 集成).
 
 产物默认写到 `target/llvm-cov-target/` (已被 `/target` 覆盖) 与 `coverage/` (已 .gitignore).
 当前基线 (全量 nextest, 327 tests): 整体 ~89%, `server.rs` 较低 (main 启动路径).
+门禁阈值见 justfile (`COVERAGE_MIN_LINES` / `COVERAGE_MAX_UNCOVERED`).
 
 ### WebUI 回归测试 (`tests/webui/`)
 

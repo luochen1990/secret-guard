@@ -31,7 +31,12 @@ jobs:
     runs-on: vm-nix
     # 去重: PR 事件总是跑; push 事件仅 master 跑 (feature branch 的 push 会被 pull_request 覆盖)
     if: ${{ github.event_name != 'push' || github.ref == 'refs/heads/master' }}
-    timeout-minutes: 15
+    timeout-minutes: 20
+    # cargo-llvm-cov 依赖 llvm-cov / llvm-profdata (rust toolchain 不含). VM 的 systemPackages
+    # 落 /run/current-system/sw/bin (NixOS 约定), job 级 env 让两个 step 共享, 无需各自 export.
+    env:
+      LLVM_COV: /run/current-system/sw/bin/llvm-cov
+      LLVM_PROFDATA: /run/current-system/sw/bin/llvm-profdata
     steps:
       - name: Checkout via SSH
         env:
@@ -47,5 +52,12 @@ jobs:
           git fetch --depth 1 origin "$GITHUB_SHA"
           git checkout FETCH_HEAD
 
-      # 直接 just check, 工具链由 VM 的 systemPackages 提供 (不走 nix develop 避免 flake 评估开销).
-      - run: just check
+      # just check --coverage: fmt + clippy + machete + 测试 (插桩编译, 产出 profdata 供 coverage-gate 消费).
+      # 测试集只跑这一次 (而非 check 跑一次 + coverage-gate 再跑一次).
+      - name: Check + coverage data
+        run: just check --coverage
+
+      # 覆盖率门禁: 双阈值 (line% 下限 + 未覆盖行数上限), 阈值 SSOT 在 justfile.
+      # 只做 report (读上一步的 profdata), 不重跑测试.
+      - name: Coverage gate
+        run: just coverage-gate
