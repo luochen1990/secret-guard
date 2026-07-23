@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::config::{DeleteOutcome, OverrideMode, UpsertKind};
+use crate::dag::{NodeDetail, NodeView, ResponseData};
 use crate::provider::{EffectiveProvider, Protocol, Provider};
 use crate::proxy::ProxyState;
 use crate::record::{ForwardRecord, RecordFilter};
@@ -39,7 +40,7 @@ const NO_STORE: [(&str, &str); 1] = [("cache-control", "no-store, no-cache, must
 
 /// `GET /api/records` 查询参数.
 ///
-/// - `offset`: 0-based, 从最新一条算起 (与 [`RecordStore::list_page`] 一致). 默认 0.
+/// - `offset`: 0-based, 从最新一条算起. 默认 0.
 /// - `limit`:  clamp 到 `[1, 200]`. 默认 50.
 /// - `filter`: `all` (默认) 或 `hits` (只返回发生过 redact 的记录). 两个维度各自
 ///   独立分页, 响应 `total` 是当前 filter 维度下的总数.
@@ -72,10 +73,9 @@ pub async fn list_records(
     Query(q): Query<RecordsQuery>,
 ) -> impl IntoResponse {
     let (offset, limit, filter) = q.resolve();
-    let (records, total) = state.records.list_page(offset, limit, filter);
-    // list 只返回轻量 metadata, 不含 req_body / resp_body / resp_parsed.
-    // body 由 GET /records/{id}?view=... 按需拉取 (避免 list 传输大量字节).
-    let summaries: Vec<RecordSummary> = records.into_iter().map(RecordSummary::from).collect();
+    let hits_only = matches!(filter, RecordFilter::Hits);
+    let (views, total) = state.dag.list_page(offset, limit, hits_only);
+    let summaries: Vec<RecordSummary> = views.into_iter().map(RecordSummary::from).collect();
     (
         NO_STORE,
         Json(ListRecordsResponse {
@@ -93,7 +93,11 @@ pub async fn get_record(
     Path(id): Path<Uuid>,
     Query(q): Query<RecordQuery>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let record = state.records.get(id).ok_or(StatusCode::NOT_FOUND)?;
+    // 从 DAG 派生 ForwardRecord DTO.
+    let view = state.dag.get_node(id).ok_or(StatusCode::NOT_FOUND)?;
+    let detail = state.dag.get_node_detail(id).ok_or(StatusCode::NOT_FOUND)?;
+    let resp = state.dag.get_response(id);
+    let record = build_forward_record(view, detail, resp);
     // 我们总是返回 GetRecordResponse envelope, 让前端 shape 固定.
     // raw view: parsed_*/parse_error 全 None.
     // parsed view: parsed_response 直接从 record.resp_parsed 读取 (流式/非流式统一);
@@ -112,6 +116,40 @@ pub async fn get_record(
     }
     let resp = build_parsed_response(record);
     Ok((NO_STORE, Json(resp)))
+}
+
+/// 从 DAG 视图构造 [`ForwardRecord`] DTO (Web API 的 record 字段).
+///
+/// 拼接 NodeView (元数据) + NodeDetail (req_headers / req_body_raw) + ResponseData (响应字段).
+/// ResponseData 缺失时 (上游错误 / 尚未响应), 响应字段填默认空值 (resp_status=0 等).
+fn build_forward_record(
+    view: NodeView,
+    detail: NodeDetail,
+    resp: Option<ResponseData>,
+) -> ForwardRecord {
+    ForwardRecord {
+        id: view.id,
+        created_at: view.created_at,
+        method: view.method,
+        path: view.path,
+        req_headers: detail.req_headers,
+        req_body: detail.req_body_raw,
+        resp_status: view.resp_status,
+        resp_headers: resp
+            .as_ref()
+            .map(|r| r.resp_headers.clone())
+            .unwrap_or_default(),
+        resp_body: resp
+            .as_ref()
+            .map(|r| r.raw_resp_body.clone())
+            .unwrap_or_default(),
+        resp_parsed: resp.as_ref().and_then(|r| r.parsed.clone()),
+        elapsed_ms: view.elapsed_ms,
+        streamed: view.streamed,
+        resp_complete: view.resp_complete,
+        error: view.error,
+        redactions: view.redactions,
+    }
 }
 
 /// `GET /api/records/{id}?view=` 的查询参数.
@@ -210,8 +248,8 @@ fn build_parsed_response(record: ForwardRecord) -> GetRecordResponse {
 /// list 场景不需要它们 — 前端 sidebar 只显示 preview / model / status / hitN 等元数据,
 /// body 由 GET /records/{id}?view=... 按需拉取.
 ///
-/// `preview` 与 `model` 在 `From<ForwardRecord>` 时从 `req_body` 一次性提取后丢弃原文,
-/// 保证 list 响应始终轻量 (preview 截断到 [`PREVIEW_MAX`] chars).
+/// `preview` 与 `model` 由 push 时一次性从 req_body 提取 (存 CallEvent),
+/// list 响应直接读 NodeView, 保证始终轻量 (preview 截断到 [`PREVIEW_MAX`] chars).
 #[derive(Serialize)]
 pub struct RecordSummary {
     pub id: Uuid,
@@ -242,24 +280,22 @@ const PREVIEW_MAX: usize = 48;
 /// preview 留空, sidebar fallback 到 method+path.
 const PREVIEW_BODY_MAX: usize = 1024 * 1024;
 
-impl From<ForwardRecord> for RecordSummary {
-    fn from(r: ForwardRecord) -> Self {
-        // 一次性从 req_body 提取 preview + model, 提取后 record 整体 move 进 summary
-        // 并被 drop (summary 不持有 req_body 字段), 内存自然释放.
-        let (preview, model) = extract_preview_and_model(&r.req_body);
+impl From<NodeView> for RecordSummary {
+    fn from(v: NodeView) -> Self {
+        // preview / model 已在 push 时预计算并存在 CallEvent 里 (NodeView 直接携带).
         Self {
-            id: r.id,
-            created_at: r.created_at,
-            method: r.method,
-            path: r.path,
-            resp_status: r.resp_status,
-            elapsed_ms: r.elapsed_ms,
-            streamed: r.streamed,
-            resp_complete: r.resp_complete,
-            error: r.error,
-            redactions: r.redactions,
-            preview,
-            model,
+            id: v.id,
+            created_at: v.created_at,
+            method: v.method,
+            path: v.path,
+            resp_status: v.resp_status,
+            elapsed_ms: v.elapsed_ms,
+            streamed: v.streamed,
+            resp_complete: v.resp_complete,
+            error: v.error,
+            redactions: v.redactions,
+            preview: v.preview,
+            model: v.model,
         }
     }
 }
@@ -276,7 +312,7 @@ impl From<ForwardRecord> for RecordSummary {
 ///   codec 模块耦合进 web/api.
 /// - 失败容错: 非 JSON / 字段缺失 / 类型不匹配一律返回 (None, None), 不影响 list 响应.
 ///   前端按 None fallback 到 method+path (与旧行为一致).
-fn extract_preview_and_model(req_body: &str) -> (Option<String>, Option<String>) {
+pub(crate) fn extract_preview_and_model(req_body: &str) -> (Option<String>, Option<String>) {
     // 跳过明显非 JSON 的 body (快速路径, 避免大 body 无谓 try_parse).
     if req_body.is_empty() || req_body.len() > PREVIEW_BODY_MAX || !req_body.starts_with('{') {
         return (None, None);
@@ -1027,29 +1063,53 @@ mod tests {
 
     #[test]
     fn record_summary_from_extracts_preview_and_model() {
-        // 端到端: ForwardRecord -> RecordSummary 应当带上 preview + model.
-        let mut r = crate::record::ForwardRecord::new(
-            "POST".into(),
-            "/o/oa-main/v1/chat/completions".into(),
-            vec![],
-            r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#.into(),
-        );
-        r.resp_status = 200;
-        let s = RecordSummary::from(r);
+        // 端到端: NodeView -> RecordSummary 应当带上 preview + model.
+        // (preview/model 在 push 时预计算, NodeView 直接携带.)
+        let v = crate::dag::NodeView {
+            id: Uuid::nil(),
+            parent: None,
+            req_delta_count: 0,
+            has_response: false,
+            created_at: chrono::Utc::now(),
+            elapsed_ms: 0,
+            method: "POST".into(),
+            path: "/o/oa-main/v1/chat/completions".into(),
+            resp_status: 200,
+            redact_seed: 0,
+            preview: Some("hi".into()),
+            model: Some("gpt-4o".into()),
+            streamed: false,
+            resp_complete: false,
+            error: None,
+            redactions: vec![],
+        };
+        let s = RecordSummary::from(v);
         assert_eq!(s.model.as_deref(), Some("gpt-4o"));
         assert_eq!(s.preview.as_deref(), Some("hi"));
     }
 
     #[test]
     fn record_summary_from_empty_body_yields_none_fields() {
-        // 空请求 body (如 GET) -> preview/model 都 None.
-        let r = crate::record::ForwardRecord::new(
-            "GET".into(),
-            "/o/oa-main/v1/models".into(),
-            vec![],
-            String::new(),
-        );
-        let s = RecordSummary::from(r);
+        // 空请求 body (如 GET) -> preview/model 都 None (push 时 extract 返回 None).
+        let v = crate::dag::NodeView {
+            id: Uuid::nil(),
+            parent: None,
+            req_delta_count: 0,
+            has_response: false,
+            created_at: chrono::Utc::now(),
+            elapsed_ms: 0,
+            method: "GET".into(),
+            path: "/o/oa-main/v1/models".into(),
+            resp_status: 0,
+            redact_seed: 0,
+            preview: None,
+            model: None,
+            streamed: false,
+            resp_complete: false,
+            error: None,
+            redactions: vec![],
+        };
+        let s = RecordSummary::from(v);
         assert!(s.preview.is_none());
         assert!(s.model.is_none());
     }

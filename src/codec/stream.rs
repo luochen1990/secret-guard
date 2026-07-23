@@ -369,7 +369,7 @@ impl StreamTranslate {
 //   StreamScan:      egress SSE → IrResponse  (不转换协议, 只累积语义内容)
 //
 // 用法: fan_out task 在 chunk 循环里 feed 每个 raw chunk, 节流地把 snapshot() 写入
-// RecordStore. 流结束时 snapshot() 即最终完整 IrResponse.
+// DAG node 的 parsed 字段. 流结束时 snapshot() 即最终完整 IrResponse.
 // 对输入的要求: fan_out task 喂的是**原始上游字节** (LLM 视角, 含 mock 或未 redact).
 // snapshot() 产出的 IrResponse 直接序列化给前端 parsed view, 不经 restore (与当前
 // record 语义一致: record 存 LLM 视角).

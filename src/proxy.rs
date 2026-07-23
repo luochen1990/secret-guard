@@ -4,7 +4,7 @@
 //! 1. **协议无关**: 任意 HTTP 方法 / 路径透传, body 视为字节流.
 //! 2. **零字段损失**: 上游响应的所有 header / 状态码 / body 原样回传 (除 hop-by-hop).
 //! 3. **流式友好**: 上游若返回 SSE / chunked, 也以流式方式回传给客户端.
-//! 4. **可观测**: 每次请求都生成 [`ForwardRecord`], 包括错误路径下的 incomplete 标记.
+//! 4. **可观测**: 每次请求都生成 DAG node, 包括错误路径下的 incomplete 标记.
 //! 5. **可插拔**: 后续 secret 改写只需在 "请求 body 收集后" 与 "响应 chunk 流出前" 两处插入 hook.
 //!
 //! # 路由策略
@@ -34,8 +34,8 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, warn};
 
+use crate::dag::{CallEvent, ConversationDag, PolicySnapshot, ResponseData};
 use crate::provider::{Protocol, ProviderTable};
-use crate::record::{ForwardRecord, RecordStore, ResponseUpdate};
 use crate::redact::{redact_ir, restore_ir_response, RedactionMap};
 use crate::secrets::SecretTable;
 
@@ -44,7 +44,7 @@ use crate::secrets::SecretTable;
 pub struct ProxyState {
     pub upstream: reqwest::Client,
     pub providers: ProviderTable,
-    pub records: RecordStore,
+    pub dag: ConversationDag,
     pub secrets: SecretTable,
 }
 
@@ -78,7 +78,7 @@ const MAX_REQ_BODY: usize = 16 * 1024 * 1024;
 const MAX_RESP_BODY_RECORD: usize = 32 * 1024 * 1024;
 
 /// 流式 parsed view (StreamScan snapshot) 的节流写入间隔.
-/// 太短 → RecordStore 写锁竞争; 太长 → WebUI 看不到流式进度. 500ms 是 UX 与锁竞争的折中.
+/// 太短 → DAG 写锁竞争; 太长 → WebUI 看不到流式进度. 500ms 是 UX 与锁竞争的折中.
 const PARSED_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// 主 handler: 路径 `/{proto}/{name}/{*rest}`, 解析后透传到对应 provider.
@@ -224,24 +224,30 @@ async fn same_proto_forward(
         .read_request(&req_body)
         .map_err(|e| AppError::BadBody(format!("{ingress} request parse failed: {}", e.message)))?;
 
-    // 3. redact IR.
+    // 3. 快照真实 messages (redact 前) 给 DAG (DAG 存 OriginRecord 视角的真实内容,
+    //    WebUI 查询时 lazy apply redactMap).
+    let real_messages = ir.messages.clone();
+
+    // 4. redact IR.
     //    流式响应里的 TextDelta / InputJsonDelta 都会经 StreamingRestorer 做 sliding-window
     //    restore (在 StreamTranslate::new_same_proto_restore 中), 不再需要 warn.
-    let redaction_map = redact_ir(&mut ir, &secrets_snapshot);
+    let (redaction_map, redact_seed) = redact_ir(&mut ir, &secrets_snapshot);
     if !redaction_map.is_empty() {
         debug!(
             redactions = redaction_map.real_to_mock.len(),
             "redacted secrets in IR request"
         );
     }
+    // redactions 是请求侧属性 (本次请求命中了哪些 secret), 在 push 时存入 CallEvent.
+    let redactions = derive_redactions(&redaction_map, &secrets_snapshot);
 
-    // 4. IR → 请求 body (同协议 writer 重序列化).
+    // 5. IR → 请求 body (同协议 writer 重序列化).
     let new_body = writer.write_request(&ir);
     let req_bytes_to_send = serde_json::to_vec(&new_body)
         .map_err(|e| AppError::Internal(format!("serialize redacted body failed: {e}")))?;
     let req_text_for_record = utf8_view(&req_bytes_to_send);
 
-    // 5. 构造上游 URL.
+    // 6. 构造上游 URL.
     let query = parts
         .uri
         .query()
@@ -249,33 +255,34 @@ async fn same_proto_forward(
         .unwrap_or_default();
     let upstream_url = build_upstream_url(&provider.base_url, &format!("{}{query}", fp.rest));
 
-    // 6. 复制请求 headers + 应用 auth. 删除客户端的 content-type/length (重新计算).
+    // 7. 复制请求 headers + 应用 auth. 删除客户端的 content-type/length (重新计算).
     let mut fwd_headers = sanitize_request_headers(&parts.headers);
     fwd_headers.remove(axum::http::header::CONTENT_TYPE);
     fwd_headers.remove(axum::http::header::CONTENT_LENGTH);
     apply_provider_auth(&mut fwd_headers, &provider.effective_api_key(), ingress);
 
-    // 7. 记录请求快照 (LLM 视角的改写后版本).
+    // 8. push 到 DAG (真实 messages + CallEvent 元数据).
     let path_for_record = format!(
         "/{}/{}/{}",
         fp.proto,
         fp.name,
         fp.rest.trim_start_matches('/')
     );
-    // 投影 redaction_map → (mock, secret_id) 列表 (不携带真实 secret).
-    let redactions = derive_redactions(&redaction_map, &secrets_snapshot);
-    let req_snapshot = ForwardRecord::new(
-        parts.method.as_str().to_string(),
-        path_for_record,
-        redact_headers(&fwd_headers),
-        req_text_for_record,
-    )
-    .with_redactions(redactions);
-    let record_id = state.records.push(req_snapshot);
+    let event = build_call_event(
+        &parts,
+        &path_for_record,
+        &fwd_headers,
+        &req_text_for_record,
+        Some(codec_proto),
+        redact_seed,
+        Some(&secrets_snapshot),
+        redactions,
+    );
+    let record_id = state.dag.push_messages(real_messages, event);
 
     debug!(%record_id, method = %parts.method, url = %upstream_url, "forwarding redacted same-proto request");
 
-    // 8. 发送到上游.
+    // 9. 发送到上游.
     let upstream_resp = match state
         .upstream
         .request(parts.method, &upstream_url)
@@ -289,7 +296,7 @@ async fn same_proto_forward(
         Ok(r) => r,
         Err(e) => {
             record_upstream_failure(
-                &state.records,
+                &state.dag,
                 record_id,
                 started,
                 502,
@@ -299,7 +306,7 @@ async fn same_proto_forward(
         }
     };
 
-    // 9. 收集响应元数据.
+    // 10. 收集响应元数据.
     let resp_status = upstream_resp.status();
     let resp_headers = upstream_resp.headers().clone();
     let content_type = resp_headers
@@ -311,12 +318,12 @@ async fn same_proto_forward(
 
     debug!(%record_id, status = %resp_status, streamed, "upstream responded");
 
-    // 10. 响应处理:
+    // 11. 响应处理:
     //     - 流式 + redact: StreamTranslate 同协议模式, per-event restore (恢复流式 UX).
     //     - 非流式 + redact: buffered + restore_ir_response.
     if streamed && resp_status.is_success() {
         fan_out_streaming_with_restore(
-            state.records.clone(),
+            state.dag.clone(),
             record_id,
             started,
             upstream_resp,
@@ -328,7 +335,7 @@ async fn same_proto_forward(
         .await
     } else {
         fan_out_buffered_ir(
-            state.records.clone(),
+            state.dag.clone(),
             record_id,
             started,
             upstream_resp,
@@ -370,13 +377,20 @@ async fn same_proto_passthrough(
         fp.name,
         fp.rest.trim_start_matches('/')
     );
-    let req_snapshot = ForwardRecord::new(
-        parts.method.as_str().to_string(),
-        path_for_record,
-        redact_headers(&fwd_headers),
-        req_text_for_record,
+    // passthrough 路径无 IR 解析 (字节透传). DAG node 存空 messages (孤立节点) +
+    // req_body_raw (原始字节) 作为 WebUI req_body 权威来源. Gemini/Ollama 无 codec
+    // 协议也走此路径 (parsed view 不可用, 与旧行为一致).
+    let event = build_call_event(
+        &parts,
+        &path_for_record,
+        &fwd_headers,
+        &req_text_for_record,
+        crate::codec::Protocol::from_native(ingress),
+        0,
+        None,
+        vec![],
     );
-    let record_id = state.records.push(req_snapshot);
+    let record_id = state.dag.push_messages(vec![], event);
 
     debug!(%record_id, method = %parts.method, url = %upstream_url, "forwarding (passthrough)");
 
@@ -391,7 +405,7 @@ async fn same_proto_passthrough(
         Ok(r) => r,
         Err(e) => {
             record_upstream_failure(
-                &state.records,
+                &state.dag,
                 record_id,
                 started,
                 502,
@@ -413,7 +427,7 @@ async fn same_proto_passthrough(
     debug!(%record_id, status = %resp_status, streamed, "upstream responded");
 
     fan_out_streaming(
-        state.records.clone(),
+        state.dag.clone(),
         record_id,
         started,
         upstream_resp,
@@ -427,7 +441,7 @@ async fn same_proto_passthrough(
 
 /// 投影 `RedactionMap` + `secrets_snapshot` → `(mock_value, secret_id)` 列表.
 ///
-/// 这是 [`ForwardRecord::redactions`] 的唯一派生入口. 输出**永不**包含真实 secret 值,
+/// 这是 [`crate::dag::CallEvent::redactions`] 的唯一派生入口. 输出**永不**包含真实 secret 值.
 /// 可以直接序列化到 GET API 响应中给 WebUI.
 ///
 /// 匹配规则: `redaction_map.real_to_mock` 的 key (真实 secret) 与 `secrets_snapshot`
@@ -455,21 +469,69 @@ fn derive_redactions(
 
 /// 写一条 "上游请求失败" 记录 (错误路径专用 helper).
 fn record_upstream_failure(
-    records: &RecordStore,
+    dag: &ConversationDag,
     record_id: uuid::Uuid,
     started: Instant,
     status: u16,
     error: String,
 ) {
-    records.update_response_full(
+    dag.attach_response(
         record_id,
-        ResponseUpdate {
+        ResponseData {
             resp_status: status,
+            resp_headers: vec![],
             elapsed_ms: started.elapsed().as_millis() as u64,
             error: Some(error),
             ..Default::default()
         },
     );
+}
+
+/// 构造 [`CallEvent`] (3 个 push 点共用).
+///
+/// `secrets_snapshot = None` 表示 passthrough 路径 (无机密命中), 用空 policy + seed=0.
+/// `secrets_snapshot = Some(s)` 表示 codec 路径, policy 持有真实 secret 列表 (COW Arc).
+///
+/// `req_text` 是已 redact 的请求 body 快照 (LLM 视角), 将作为 WebUI req_body 权威来源.
+/// preview/model 从中一次性提取.
+#[allow(clippy::too_many_arguments)]
+fn build_call_event(
+    parts: &axum::http::request::Parts,
+    path: &str,
+    fwd_headers: &HeaderMap,
+    req_text: &str,
+    ingress_protocol: Option<crate::codec::Protocol>,
+    redact_seed: u64,
+    secrets_snapshot: Option<&[crate::secrets::SecretEntry]>,
+    redactions: Vec<(String, String)>,
+) -> CallEvent {
+    let (preview, model) = crate::web::api::extract_preview_and_model(req_text);
+    let policy = match secrets_snapshot {
+        Some(s) => std::sync::Arc::new(PolicySnapshot {
+            secrets: std::sync::Arc::from(s.to_vec()),
+        }),
+        None => std::sync::Arc::new(PolicySnapshot::default()),
+    };
+    CallEvent {
+        created_at: chrono::Utc::now(),
+        elapsed_ms: 0,
+        method: parts.method.as_str().to_string(),
+        path: path.to_string(),
+        req_headers: redact_headers(fwd_headers),
+        resp_status: 0,
+        resp_headers: vec![],
+        // req_envelope 当前仅作占位 (Web DTO 用 req_body_raw 而非 envelope 重建).
+        // 未来若 WebUI 需展示 system/tools 等字段, 可改为 ingress writer 投影后
+        // 移除 messages/system key 的 JSON value.
+        req_envelope: serde_json::json!({}),
+        ingress_protocol,
+        redact_seed,
+        policy,
+        req_body_raw: req_text.to_string(),
+        preview,
+        model,
+        redactions,
+    }
 }
 
 /// 若 provider 配置了 api_key, 注入对应的 auth header.
@@ -592,24 +654,28 @@ async fn cross_proto_forward(
     // 6. 清空 extra (跨协议时 extra 字段会泄漏 ingress-only 的内容, 必须丢弃).
     ir.extra.clear();
 
-    // 7. redact IR (跨协议 + redact 在同层).
-    let redaction_map = redact_ir(&mut ir, &secrets_snapshot);
+    // 7. 快照真实 messages (redact 前) 给 DAG.
+    let real_messages = ir.messages.clone();
+
+    // 8. redact IR (跨协议 + redact 在同层).
+    let (redaction_map, redact_seed) = redact_ir(&mut ir, &secrets_snapshot);
     if !redaction_map.is_empty() {
         debug!(
             redactions = redaction_map.real_to_mock.len(),
             "redacted secrets in cross-proto IR"
         );
     }
+    let redactions = derive_redactions(&redaction_map, &secrets_snapshot);
 
-    // 8. IR → egress body.
+    // 9. IR → egress body.
     let egress_body_value = egress_writer.write_request(&ir);
     let egress_bytes = serde_json::to_vec(&egress_body_value)
         .map_err(|e| AppError::Internal(format!("serialize egress body failed: {e}")))?;
 
-    // 9. 构造上游 URL (egress writer 的固定 path).
+    // 10. 构造上游 URL (egress writer 的固定 path).
     let upstream_url = format!("{}{}", provider.base_url, egress_writer.upstream_path());
 
-    // 10. 复制请求 headers + 应用 egress 协议的 auth.
+    // 11. 复制请求 headers + 应用 egress 协议的 auth.
     let mut fwd_headers = sanitize_request_headers(&parts.headers);
     fwd_headers.remove(axum::http::header::CONTENT_TYPE);
     fwd_headers.remove(axum::http::header::CONTENT_LENGTH);
@@ -626,7 +692,7 @@ async fn cross_proto_forward(
             .or_insert_with(|| HeaderValue::from_static("2023-06-01"));
     }
 
-    // 11. 记录请求快照.
+    // 12. push 到 DAG.
     let path_for_record = format!(
         "/{}/{}/{}  [{} → {}]",
         fp.proto,
@@ -643,16 +709,17 @@ async fn cross_proto_forward(
     let req_view_bytes = serde_json::to_vec(&req_view_value)
         .map_err(|e| AppError::Internal(format!("serialize ingress view body failed: {e}")))?;
     let req_text_for_record = utf8_view(&req_view_bytes);
-    // 投影 redaction_map → (mock, secret_id) 列表 (不携带真实 secret).
-    let redactions = derive_redactions(&redaction_map, &secrets_snapshot);
-    let req_snapshot = ForwardRecord::new(
-        parts.method.as_str().to_string(),
-        path_for_record,
-        redact_headers(&fwd_headers),
-        req_text_for_record,
-    )
-    .with_redactions(redactions);
-    let record_id = state.records.push(req_snapshot);
+    let event = build_call_event(
+        &parts,
+        &path_for_record,
+        &fwd_headers,
+        &req_text_for_record,
+        Some(ingress_codec),
+        redact_seed,
+        Some(&secrets_snapshot),
+        redactions,
+    );
+    let record_id = state.dag.push_messages(real_messages, event);
 
     debug!(
         %record_id,
@@ -663,7 +730,7 @@ async fn cross_proto_forward(
         "cross-proto forwarding"
     );
 
-    // 12. 发送到上游.
+    // 13. 发送到上游.
     let upstream_resp = match state
         .upstream
         .request(parts.method, &upstream_url)
@@ -677,7 +744,7 @@ async fn cross_proto_forward(
         Ok(r) => r,
         Err(e) => {
             record_upstream_failure(
-                &state.records,
+                &state.dag,
                 record_id,
                 started,
                 502,
@@ -687,7 +754,7 @@ async fn cross_proto_forward(
         }
     };
 
-    // 13. 完整 buffer 上游响应 (跨协议 MVP 不支持流式). 受 MAX_RESP_BODY_RECORD 上限保护.
+    // 14. 完整 buffer 上游响应 (跨协议 MVP 不支持流式). 受 MAX_RESP_BODY_RECORD 上限保护.
     let resp_status = upstream_resp.status();
     let resp_headers = upstream_resp.headers().clone();
     let resp_bytes: Bytes = {
@@ -713,13 +780,15 @@ async fn cross_proto_forward(
         if let Some(e) = stream_err {
             let elapsed = started.elapsed().as_millis() as u64;
             warn!(%record_id, error = %e, "cross-proto upstream stream error mid-flight");
-            state.records.update_response_full(
+            state.dag.attach_response(
                 record_id,
-                ResponseUpdate {
+                ResponseData {
                     resp_status: resp_status.as_u16(),
                     resp_headers: redact_headers(&resp_headers),
                     elapsed_ms: elapsed,
                     error: Some(format!("upstream stream error: {e}")),
+                    resp_complete: false,
+                    streamed: false,
                     ..Default::default()
                 },
             );
@@ -728,14 +797,16 @@ async fn cross_proto_forward(
         if exceeded {
             let elapsed = started.elapsed().as_millis() as u64;
             warn!(%record_id, cap = MAX_RESP_BODY_RECORD, "cross-proto upstream response exceeded cap; aborting");
-            state.records.update_response_full(
+            state.dag.attach_response(
                 record_id,
-                ResponseUpdate {
+                ResponseData {
                     resp_status: 502,
                     elapsed_ms: elapsed,
                     error: Some(format!(
                         "upstream response exceeded {MAX_RESP_BODY_RECORD} byte cap"
                     )),
+                    resp_complete: false,
+                    streamed: false,
                     ..Default::default()
                 },
             );
@@ -746,7 +817,7 @@ async fn cross_proto_forward(
         Bytes::from(acc)
     };
 
-    // 14. 翻译响应: egress JSON → IR → (restore redact) → ingress JSON.
+    // 15. 翻译响应: egress JSON → IR → (restore redact) → ingress JSON.
     let egress_reader = egress_codec.reader();
     let ingress_writer = ingress_codec.writer();
     // parsed view: 记录 LLM 视角的 IR (restore 之前, 含 mock). 仅 2xx 成功响应.
@@ -791,23 +862,23 @@ async fn cross_proto_forward(
         (resp_status, body)
     };
 
-    // 15. 记录响应.
+    // 16. attach 响应到 DAG.
     let elapsed = started.elapsed().as_millis() as u64;
-    state.records.update_response_full(
+    state.dag.attach_response(
         record_id,
-        ResponseUpdate {
+        ResponseData {
             resp_status: resp_status_out.as_u16(),
             resp_headers: redact_headers(&resp_headers),
-            resp_body: utf8_view(&resp_body_out),
-            resp_parsed: resp_parsed_for_record,
+            raw_resp_body: utf8_view(&resp_body_out),
+            parsed: resp_parsed_for_record,
             elapsed_ms: elapsed,
             streamed: false,
             resp_complete: true,
-            error: None,
+            ..Default::default()
         },
     );
 
-    // 16. 构造响应.
+    // 17. 构造响应.
     let mut resp = Response::new(Body::from(resp_body_out));
     *resp.status_mut() = resp_status_out;
     let mut out_headers = build_response_headers(&resp_headers);
@@ -833,30 +904,30 @@ fn http_status_to_error_kind(status: u16) -> &'static str {
     }
 }
 
-/// 流式 parsed view 累积器 + 节流写入 record 的小封装.
+/// 流式 parsed view 累积器 + 节流写入 DAG 的小封装.
 ///
 /// fan_out_streaming / fan_out_streaming_with_restore 共享同一套节流策略,
 /// 避免两处重复 StreamScan + writer + last_sync 的管理逻辑.
 struct ParsedSync {
     scan: crate::codec::stream::StreamScan,
     writer: Box<dyn crate::codec::Writer>,
-    records: RecordStore,
+    dag: ConversationDag,
     record_id: uuid::Uuid,
     last_sync: Option<std::time::Instant>,
 }
 
 impl ParsedSync {
-    fn new(proto: crate::codec::Protocol, records: RecordStore, record_id: uuid::Uuid) -> Self {
+    fn new(proto: crate::codec::Protocol, dag: ConversationDag, record_id: uuid::Uuid) -> Self {
         Self {
             scan: crate::codec::stream::StreamScan::new(proto),
             writer: proto.writer(),
-            records,
+            dag,
             record_id,
             last_sync: None,
         }
     }
 
-    /// 喂入上游 chunk; 按节流间隔把 snapshot 写入 record.
+    /// 喂入上游 chunk; 按节流间隔把 snapshot 写入 DAG node 的 parsed 字段.
     fn feed(&mut self, b: &[u8]) {
         self.scan.feed(b);
         let due = self
@@ -864,7 +935,7 @@ impl ParsedSync {
             .is_none_or(|t| t.elapsed() >= PARSED_SYNC_INTERVAL);
         if due {
             let parsed = self.scan.snapshot();
-            self.records
+            self.dag
                 .update_parsed_response(self.record_id, self.writer.write_response(&parsed));
             self.last_sync = Some(std::time::Instant::now());
         }
@@ -877,13 +948,13 @@ impl ParsedSync {
 }
 
 /// 流式字节扇出: 把上游 SSE 流式转发给客户端, 同时 (若有 codec) 用 StreamScan
-/// 累积 parsed view 到 record. 无 redact, 保持 byte-exact + 流式 UX.
+/// 累积 parsed view 到 DAG. 无 redact, 保持 byte-exact + 流式 UX.
 ///
 /// `codec_proto = None` 时 (Gemini/Ollama 无 codec) 跳过 StreamScan,
 /// parsed view 不可用 (前端 fallback raw).
 #[allow(clippy::too_many_arguments)]
 async fn fan_out_streaming(
-    records: RecordStore,
+    dag: ConversationDag,
     record_id: uuid::Uuid,
     started: Instant,
     upstream_resp: reqwest::Response,
@@ -902,9 +973,9 @@ async fn fan_out_streaming(
         let mut overflow = false;
         let mut error_kind: Option<String> = None;
         // ParsedSync: 仅对流式响应启用 (非流式是单个 JSON, 不是 SSE).
-        // 非流式响应的 resp_parsed 在流结束后一次性计算.
+        // 非流式响应的 parsed 在流结束后一次性计算.
         let mut parsed_sync = if streamed {
-            codec_proto.map(|cp| ParsedSync::new(cp, records.clone(), record_id))
+            codec_proto.map(|cp| ParsedSync::new(cp, dag.clone(), record_id))
         } else {
             None
         };
@@ -970,17 +1041,18 @@ async fn fan_out_streaming(
             // 非流式响应保留原始 body (raw view 可用, 且 body 通常不大).
             utf8_view(&acc)
         };
-        records.update_response_full(
+        dag.attach_response(
             record_id,
-            ResponseUpdate {
+            ResponseData {
                 resp_status: status_u16,
                 resp_headers: redact_headers(&resp_headers_for_record),
-                resp_body: body,
-                resp_parsed: final_parsed,
+                raw_resp_body: body,
+                parsed: final_parsed,
                 elapsed_ms: elapsed,
                 streamed,
                 resp_complete: error_kind.is_none(),
                 error: error_kind,
+                ..Default::default()
             },
         );
     });
@@ -998,7 +1070,7 @@ async fn fan_out_streaming(
 /// 用于: 同协议 + redact + 非流式响应; 同协议 + redact + 流式响应但上游出错 (非 2xx).
 #[allow(clippy::too_many_arguments)]
 async fn fan_out_buffered_ir(
-    records: RecordStore,
+    dag: ConversationDag,
     record_id: uuid::Uuid,
     started: Instant,
     upstream_resp: reqwest::Response,
@@ -1057,17 +1129,18 @@ async fn fan_out_buffered_ir(
 
     // record 存储的是 LLM 视角 (含 mock) 的版本.
     let acc_text = utf8_view(&acc);
-    records.update_response_full(
+    dag.attach_response(
         record_id,
-        ResponseUpdate {
+        ResponseData {
             resp_status: status_u16,
             resp_headers: redact_headers(&resp_headers_for_record),
-            resp_body: acc_text,
-            resp_parsed: resp_parsed_for_record,
+            raw_resp_body: acc_text,
+            parsed: resp_parsed_for_record,
             elapsed_ms: elapsed,
             streamed,
             resp_complete: error_kind.is_none(),
             error: error_kind,
+            ..Default::default()
         },
     );
 
@@ -1083,7 +1156,7 @@ async fn fan_out_buffered_ir(
 /// 用于: 同协议 + redact + 流式响应.
 #[allow(clippy::too_many_arguments)]
 async fn fan_out_streaming_with_restore(
-    records: RecordStore,
+    dag: ConversationDag,
     record_id: uuid::Uuid,
     started: Instant,
     upstream_resp: reqwest::Response,
@@ -1103,7 +1176,7 @@ async fn fan_out_streaming_with_restore(
         let mut translate = StreamTranslate::new_same_proto_restore(codec_proto, redaction_map);
         // ParsedSync: 累积 parsed view (LLM 视角, 含 mock, 与 record 语义一致).
         // 喂的是上游原始字节 (与 translate.feed 同一份 b), ParsedSync 内部用 codec reader 解析.
-        let mut parsed_sync = ParsedSync::new(codec_proto, records.clone(), record_id);
+        let mut parsed_sync = ParsedSync::new(codec_proto, dag.clone(), record_id);
         let mut stream = upstream_resp.bytes_stream();
         let mut acc: Vec<u8> = Vec::new();
         let mut overflow = false;
@@ -1164,17 +1237,18 @@ async fn fan_out_streaming_with_restore(
             // 2xx 流式成功响应不保留原始 SSE 字节 (parsed view 已覆盖语义内容).
             String::new()
         };
-        records.update_response_full(
+        dag.attach_response(
             record_id,
-            ResponseUpdate {
+            ResponseData {
                 resp_status: status_u16,
                 resp_headers: redact_headers(&resp_headers_for_record),
-                resp_body: body,
-                resp_parsed: Some(final_parsed),
+                raw_resp_body: body,
+                parsed: Some(final_parsed),
                 elapsed_ms: elapsed,
                 streamed: true,
                 resp_complete: error_kind.is_none(),
                 error: error_kind,
+                ..Default::default()
             },
         );
     });

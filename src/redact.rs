@@ -18,9 +18,14 @@
 //!   `gen_mock_for_ir(ir, secret, allocated)` 返回的 mock 一定**不在** `ir` 中出现
 //!   (traverse IR 检查) 且不在 `allocated` 集合中 (C4 保证).
 //! - **C3 前缀缓存友好性**: redact 不应无必要地改变 request body 的字节内容, 避免破坏
-//!   LLM Provider 侧的前缀缓存命中. 实现手段: [`crate::mock::deterministic_seed`] 保证
-//!   同一 `(real, strategy)` 总产生同一候选序列 (counter=0,1,2,...), 故同一 secret 在
-//!   会话全程 mock 保持稳定. 多数请求命中首项候选; 冲突时稳定跳到后续项.
+//!   LLM Provider 侧的前缀缓存命中. 实现手段: per-request seed (单一标量) 驱动整个
+//!   redactMap 的 mock 生成. 同一 policy + 同一 messages 上下文 → 同一 seed → 同一
+//!   redactMap → mock 在会话全程稳定 (见 [`redact_ir`] 的 seed 语义).
+//!
+//!   **权衡**: policy 变动 (添加/删除/编辑任一 secret) 会改变 init_seed → 所有 secret 的
+//!   mock 全部变化 → 整个会话的前缀缓存失效. 这是 per-request seed 模型 (vs 旧 per-secret
+//!   seed) 的代价, 换取了 lazy redact 重建的极简 (node 只存单标量 seed). secret 编辑是
+//!   罕见操作, 不在多轮对话热路径上, 实际影响可忽略.
 //! - **C4 单射性**: 在一次 [`redact_ir`] 调用内, 不同 secret 总映射到不同 mock
 //!   (因为每次 gen_mock_for_ir 都检查 allocated 集合).
 //! - **C5 不含 real_secret 子串** (best-effort):
@@ -32,7 +37,9 @@
 //!     前提: `SecretTable::upsert` 通过 `validate_value` 拒绝含 `MOCK_PREFIX` ("sgm_") 的 secret.
 //!     `proptest-regressions/redact.txt` 记录历史失败种子 (real 全 base62 字母时风险更高).
 //! - **C6 可逆性 (restorability)**: round-trip identity —
-//!   `restore_ir_response(redact_ir(...).ir, map)` 后 IR 语义等价于原 IR.
+//!   `restore_ir_response(&mut <redacted IrResponse>, &redact_ir(&mut <IrRequest>, secrets).0)`
+//!   后 IR 语义等价于原 IR. (`redact_ir` 原地变异 IrRequest, 返回 `(RedactionMap, seed)`,
+//!   `.0` 取 RedactionMap.)
 //! - **C7 流式可逆性 (streaming restorability)**:
 //!   [`StreamingRestorer`] 在任意 chunk 切分下保证 round-trip identity —
 //!   `concat(push(c_1), push(c_2), ..., push(c_n), flush().1)` 严格等于
@@ -143,35 +150,49 @@ pub fn mock_with_salt(real: &str, salt: u64) -> String {
     format!("{MOCK_PREFIX}{}", base62_fixed(hash64(&hash_input)))
 }
 
-/// 生成一个在当前 IR 中**未出现**且**未分配过**的 mock, 按 [`MockStrategy`] 配置生成.
+/// 计算 policy 的 init seed (per-request seed 链的起点).
 ///
-/// probing 协议: counter=0 是首选候选; 若与 IR 或 allocated 冲突则递增 counter,
-/// 直到找到合格候选 (上限 2^20 次后 panic, 防止对抗性 IR 死循环).
-///
-/// seed 由 [`crate::mock::deterministic_seed`] 决定 → 候选**序列**稳定 (C3 前缀缓存友好性).
-/// 多数请求命中首项 (counter=0); 冲突时稳定跳到第二项 (counter=1), 第二项在"首项冲突"
-/// 的多次请求间也能共享 LLM 前缀缓存.
-///
-/// C2 (in-context uniqueness): traverse IR 检查候选 mock 是否出现.
-/// C4 (injectivity): 检查 `allocated` 集合避免重复分配.
-fn gen_mock_for_ir(ir: &IrRequest, secret: &SecretEntry, allocated: &HashSet<String>) -> String {
-    use crate::mock::{deterministic_seed, gen_candidate};
+/// 对同一 policy (相同 secrets 集合 + 策略) 总产生同一 init seed →
+/// 同一候选序列起点 (C3 前缀缓存友好性的根基).
+pub fn init_seed(secrets: &[SecretEntry]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for s in secrets {
+        s.value.hash(&mut h);
+        s.mock_strategy.hash(&mut h);
+    }
+    if h.finish() == 0 {
+        // 避免与 passthrough sentinel (0) 冲突.
+        1
+    } else {
+        h.finish()
+    }
+}
 
-    // seed 由 deterministic_seed 决定 (C3 前缀缓存友好性的根基):
-    // 同一 (real, strategy) 的候选序列在此函数内确定.
-    let seed = deterministic_seed(&secret.value, &secret.mock_strategy);
+/// 在给定 per-request `seed` 下, 为单个 secret 生成候选 mock (不做唯一性检查).
+///
+/// counter 是 per-secret 的 probing 计数器: 0 是首选, 冲突时递增.
+fn candidate_for(secret: &SecretEntry, seed: u64, counter: u32) -> String {
+    crate::mock::gen_candidate(&secret.value, &secret.mock_strategy, seed, counter)
+}
 
+/// 生成一个在当前 IR 中**未出现**且**未分配过**的 mock.
+///
+/// per-request seed 模型: 所有 secret 共享同一 seed. counter 是 per-secret 的 probing.
+fn gen_mock_for_ir(
+    ir: &IrRequest,
+    secret: &SecretEntry,
+    seed: u64,
+    allocated: &HashSet<String>,
+) -> String {
     let mut counter: u32 = 0;
     loop {
-        let candidate = gen_candidate(&secret.value, &secret.mock_strategy, seed, counter);
+        let candidate = candidate_for(secret, seed, counter);
         if !ir_request_contains(ir, &candidate) && !allocated.contains(&candidate) {
             return candidate;
         }
         counter += 1;
         if counter > (1u32 << 20) {
-            // Fixed 模式 + 大量冲突的极端场景兜底. 阈值降到 2^20 (vs 原 2^32):
-            // Fixed 候选空间远小于 Auto (Auto 用 hash 空间 2^64, Fixed 只是 _N 后缀).
-            // 实际 2^20 已远超任何合理 IR 中可容纳的字符串数.
             panic!(
                 "mock probing exhausted after 2^20 attempts; \
                  ir likely adversarial (real={:?}, strategy={:?})",
@@ -185,38 +206,40 @@ fn gen_mock_for_ir(ir: &IrRequest, secret: &SecretEntry, allocated: &HashSet<Str
 
 /// 在 [`IrRequest`] 中查找所有 secret 并替换为 mock.
 ///
-/// 实现:
-/// 1. 按 secret 长度倒序排序, 先替换长的 (避免短的先替换导致长的部分被破坏).
-/// 2. 对每个在 IR 中出现的 secret, 生成不冲突的 mock (内部 traverse IR 检查唯一性).
-/// 3. 替换 IR 中所有字符串字段里的 secret 出现.
+/// per-request seed 模型: 所有 secret 共享一个 seed (整个 redactMap 的候选序列起点)。
+/// counter 是 per-secret 的 probing 计数器。返回 `(RedactionMap, seed)`:
+/// - seed = 0 表示无 secret 命中 (passthrough), DAG node 存 0.
+/// - seed ≠ 0 = init_seed(secrets), DAG node 存它用于 lazy 重建.
 ///
-/// 返回 [`RedactionMap`] 用于响应 restore.
-///
-/// 复杂度: O(secrets × ir_size). MVP 阶段 secrets 数量 <100, IR 字符串总量 <1 MiB, 可接受.
-pub fn redact_ir(ir: &mut IrRequest, secrets: &[SecretEntry]) -> RedactionMap {
+/// C2 (in-context uniqueness): gen_mock_for_ir 检查 pre-replace IR.
+/// C4 (injectivity): allocated 集合保证 mock 互不冲突.
+pub fn redact_ir(ir: &mut IrRequest, secrets: &[SecretEntry]) -> (RedactionMap, u64) {
     let mut map = RedactionMap::default();
     if secrets.is_empty() {
-        return map;
+        return (map, 0);
     }
 
-    // 按 value 长度倒序 + 过滤空 value + 去重连续重复 value (保留首个 entry 的 mock_strategy).
-    // 不同 entry 共享同一 value 时只生成一个 mock (RedactionMap 按 value 去重的语义).
     let mut sorted: Vec<&SecretEntry> = secrets.iter().filter(|e| !e.value.is_empty()).collect();
     sorted.sort_by_key(|e| std::cmp::Reverse(e.value.len()));
     sorted.dedup_by(|a, b| a.value == b.value);
 
     let mut allocated: HashSet<String> = HashSet::new();
+    let seed = init_seed(secrets);
+    let mut hit_any = false;
 
     for secret in sorted {
         if !ir_request_contains(ir, &secret.value) {
             continue;
         }
-        let mock = gen_mock_for_ir(ir, secret, &allocated);
+        hit_any = true;
+        let mock = gen_mock_for_ir(ir, secret, seed, &allocated);
         ir_request_replace_all(ir, &secret.value, &mock);
         allocated.insert(mock.clone());
         map.insert(secret.value.clone(), mock);
     }
-    map
+
+    let final_seed = if hit_any { seed } else { 0 };
+    (map, final_seed)
 }
 
 /// 在 [`IrResponse`] 中反向替换 mock 为真实 secret.
@@ -708,7 +731,8 @@ mod tests {
         let ir = sample_ir_with_text("sgm_AAAAAAAAAAAAA");
         let allocated = HashSet::new();
         let entry = entry("real-secret");
-        let m = gen_mock_for_ir(&ir, &entry, &allocated);
+        let seed = init_seed(std::slice::from_ref(&entry));
+        let m = gen_mock_for_ir(&ir, &entry, seed, &allocated);
         assert!(
             !ir_request_contains(&ir, &m),
             "gen mock must avoid existing IR content; got {m}"
@@ -737,7 +761,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         let mut ir = sample_ir_with_text(&body_text);
-        let map = redact_ir(&mut ir, &secrets);
+        let (map, _) = redact_ir(&mut ir, &secrets);
         let mocks: HashSet<_> = map.real_to_mock.values().cloned().collect();
         assert_eq!(mocks.len(), 100, "all 100 mocks must be distinct");
     }
@@ -769,7 +793,7 @@ mod tests {
         let text = "auth=sk-test-123; user=alice; token=ABCDEF-1234567890";
         let secrets = vec![entry("sk-test-123"), entry("ABCDEF-1234567890")];
         let mut ir = sample_ir_with_text(text);
-        let map = redact_ir(&mut ir, &secrets);
+        let (map, _) = redact_ir(&mut ir, &secrets);
         // 验证 redact 确实替换了.
         let redacted_text = match &ir.messages[0].content[0] {
             IrBlock::Text { text } => text.clone(),
@@ -809,7 +833,7 @@ mod tests {
     fn redact_ir_replaces_secret_in_text_block() {
         let mut ir = sample_ir_with_text("my key is sk-test-123 ok");
         let secrets = vec![entry("sk-test-123")];
-        let map = redact_ir(&mut ir, &secrets);
+        let (map, _) = redact_ir(&mut ir, &secrets);
         assert_eq!(map.real_to_mock.len(), 1);
         let mock = map.mock_for("sk-test-123").unwrap();
         let redacted_text = match &ir.messages[0].content[0] {
@@ -834,7 +858,7 @@ mod tests {
             }],
             ..sample_ir_with_text("")
         };
-        let map = redact_ir(&mut ir, &[entry("sk-secret-value")]);
+        let (map, _) = redact_ir(&mut ir, &[entry("sk-secret-value")]);
         assert_eq!(map.real_to_mock.len(), 1);
         // input 里的 secret 应被替换.
         match &ir.messages[0].content[0] {
@@ -862,7 +886,7 @@ mod tests {
             }],
             ..sample_ir_with_text("")
         };
-        let map = redact_ir(&mut ir, &[entry("sk-secret")]);
+        let (map, _) = redact_ir(&mut ir, &[entry("sk-secret")]);
         assert_eq!(map.real_to_mock.len(), 1);
         match &ir.messages[0].content[0] {
             IrBlock::ToolResult { content, .. } => match &content[0] {
@@ -895,7 +919,7 @@ mod tests {
         // AAA 在剩余 IR 中找不到, 不进 map.
         let mut ir = sample_ir_with_text("found AAAAA in body");
         let secrets = vec![entry("AAA"), entry("AAAAA")];
-        let map = redact_ir(&mut ir, &secrets);
+        let (map, _) = redact_ir(&mut ir, &secrets);
         assert!(
             !map.real_to_mock.contains_key("AAA"),
             "AAA should not be in map; map = {:?}",
@@ -908,7 +932,7 @@ mod tests {
     fn redact_ir_skips_secret_not_in_ir() {
         let mut ir = sample_ir_with_text("hello world");
         let secrets = vec![entry("not-present")];
-        let map = redact_ir(&mut ir, &secrets);
+        let (map, _) = redact_ir(&mut ir, &secrets);
         assert!(map.is_empty());
     }
 
@@ -922,14 +946,14 @@ mod tests {
         let mut e2 = entry("XYZ123");
         e2.id = "id-2".into();
         let secrets = vec![e1, e2];
-        let map = redact_ir(&mut ir, &secrets);
+        let (map, _) = redact_ir(&mut ir, &secrets);
         assert_eq!(map.real_to_mock.len(), 1);
     }
 
     #[test]
     fn redact_ir_no_secrets_returns_empty_map() {
         let mut ir = sample_ir_with_text("hello");
-        let map = redact_ir(&mut ir, &[]);
+        let (map, _) = redact_ir(&mut ir, &[]);
         assert!(map.is_empty());
     }
 
@@ -1082,7 +1106,7 @@ mod tests {
             prop_assume!(s1 != s2);
             // 在同一个空 IR 上, 两个 secret 应映射到不同 mock.
             let mut ir = sample_ir_with_text(&format!("{s1} {s2}"));
-            let map = redact_ir(&mut ir, &[entry(&s1), entry(&s2)]);
+            let (map, _) = redact_ir(&mut ir, &[entry(&s1), entry(&s2)]);
             let m1 = map.mock_for(&s1).unwrap();
             let m2 = map.mock_for(&s2).unwrap();
             prop_assert!(m1 != m2, "mocks for distinct secrets collided: {} == {}", m1, m2);
@@ -1100,7 +1124,8 @@ mod tests {
             // gen_mock_for_ir 内部: 候选 mock 不在 ir 中.
             let allocated = HashSet::new();
             let entry = entry(&secret);
-            let m = gen_mock_for_ir(&ir, &entry, &allocated);
+            let seed = init_seed(std::slice::from_ref(&entry));
+            let m = gen_mock_for_ir(&ir, &entry, seed, &allocated);
             prop_assert!(!ir_request_contains(&ir, &m),
                 "mock must not appear in pre-redact IR: mock={}", m);
         }
@@ -1115,7 +1140,7 @@ mod tests {
             let body = format!("{body_prefix}{secret}{body_suffix}");
             let mut ir = sample_ir_with_text(&body);
             let original_text = body.clone();
-            let map = redact_ir(&mut ir, &[entry(&secret)]);
+            let (map, _) = redact_ir(&mut ir, &[entry(&secret)]);
             // 取 redact 后的 text.
             let redacted_text = match &ir.messages[0].content[0] {
                 IrBlock::Text { text } => text.clone(),
@@ -1173,7 +1198,7 @@ mod tests {
             );
             let mut ir = sample_ir_with_text(&body);
             let original = body.clone();
-            let map = redact_ir(&mut ir, &secrets);
+            let (map, _) = redact_ir(&mut ir, &secrets);
             let mut redacted_text = match &ir.messages[0].content[0] {
                 IrBlock::Text { text } => text.clone(),
                 _ => panic!("expected Text"),
@@ -1198,7 +1223,7 @@ mod tests {
                 .join(&filler);
             let mut ir = sample_ir_with_text(&body);
             let original = body.clone();
-            let map = redact_ir(&mut ir, &[entry(&secret)]);
+            let (map, _) = redact_ir(&mut ir, &[entry(&secret)]);
             let mut redacted_text = match &ir.messages[0].content[0] {
                 IrBlock::Text { text } => text.clone(),
                 _ => panic!("expected Text"),
@@ -1221,7 +1246,7 @@ mod tests {
                 .collect();
             let body = secrets.iter().map(|e| e.value.clone()).collect::<Vec<_>>().join(" ");
             let mut ir = sample_ir_with_text(&body);
-            let map = redact_ir(&mut ir, &secrets);
+            let (map, _) = redact_ir(&mut ir, &secrets);
             let mocks: HashSet<_> = map.real_to_mock.values().collect();
             prop_assert_eq!(mocks.len(), n);
         }

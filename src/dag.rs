@@ -2,7 +2,8 @@
 //!
 //! # 设计目标
 //!
-//! 把扁平的 `VecDeque<ForwardRecord>` 升级为内容寻址的对话 DAG, 解决两个问题:
+//! 取代旧的扁平 `VecDeque<ForwardRecord>` (`RecordStore`, 已删除), 升级为内容寻址的
+//! 对话 DAG, 解决两个问题:
 //! 1. **存储冗余**: 同一会话的 N 条请求 messages 高度重叠 (每次带完整历史).
 //!    内容寻址让相同 IrBlock 跨节点只存一份.
 //! 2. **会话识别**: 通过 Merkle prefix hash 自动识别前缀关系, 让 WebUI 折叠同会话记录.
@@ -25,7 +26,6 @@ use uuid::Uuid;
 
 use crate::codec::ir::{IrBlock, IrImageSource, IrMessage, IrRole, IrStopReason, IrUsage};
 use crate::codec::Protocol as CodecProtocol;
-use crate::redact::RedactionMap;
 
 // ─── BlockHash ──────────────────────────────────────────────────────────────
 
@@ -276,12 +276,33 @@ pub struct CallEvent {
     /// redact 时使用的 policy 快照 (Arc COW 共享).
     /// redact_seed=0 时此字段可为 default (空 secrets).
     pub policy: Arc<PolicySnapshot>,
+    /// 请求 body 快照 (LLM 视角, 已 redact, UTF-8 视图).
+    ///
+    /// 这是 WebUI 的 `req_body` 字段权威来源:
+    /// - **codec 路径** (same-proto + redact / cross-proto): redact 后的 IR 经 ingress
+    ///   writer 重序列化为 wire JSON 字符串. 与原始请求字节不同 (redact + 重序列化).
+    /// - **passthrough 路径** (same-proto 无 redact): 客户端原始请求字节 (未 redact,
+    ///   因为无机密命中). Gemini/Ollama 等无 codec 协议也走此路径.
+    ///
+    /// 设计权衡: 虽然 DAG 的 `req_delta` (真实消息) + `req_envelope` 理论上足以在查询时
+    /// 重建 redact 后的请求体, 但那需要在 Web 查询路径上跑 redact + codec writer,
+    /// 对偶尔翻页的 WebUI 场景性价比低. 直接存快照 (一次写, 多次读) 是更经济的选择.
+    /// `req_delta` 仍用于内容寻址去重 (DAG 核心价值) + 未来 lazy redact 功能.
+    pub req_body_raw: String,
+    /// WebUI sidebar 标题 (首条 user message 截断). push 时一次性从 req_body_raw 提取.
+    pub preview: Option<String>,
+    /// 请求 body 顶层 model 字段 (OpenAI / Anthropic 共有). push 时一次性提取.
+    pub model: Option<String>,
+    /// 本次请求中实际发生的 redact 结果 (权威投影, 供 WebUI 渲染).
+    /// 每个 tuple = `(mock_value, secret_id)`. **永不**包含真实 secret 值.
+    /// 在 push 时设置 (redactions 是请求侧属性, 不依赖 response).
+    pub redactions: Vec<(String, String)>,
 }
 
 /// LLM 返回的 response 数据 (message content + 元数据).
 ///
 /// 存储的是 LLM 原始返回 (含 mock, restore 前).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ResponseData {
     /// response 的 assistant message (LLM 原始返回, 含 mock, **未 restore**).
     /// 通常是一条 IrMessage (role=assistant), 但错误响应时可能为空.
@@ -297,9 +318,16 @@ pub struct ResponseData {
     pub streamed: bool,
     pub resp_complete: bool,
     pub error: Option<String>,
-    /// (mock, secret_id) 投影, WebUI 渲染 hit badge 用.
-    /// 永不含真实 secret value.
-    pub redactions: Vec<(String, String)>,
+    /// parsed view (ingress codec writer 序列化的 IrResponse, LLM 视角含 mock).
+    /// 流式响应由 StreamScan 增量累积; 非流式在响应完成时一次性计算.
+    /// `None` 表示尚未有解析结果 (流刚开始 / codec 不支持此协议 / 解析失败).
+    pub parsed: Option<serde_json::Value>,
+    /// 上游响应状态码 (attach 时填入; 也镜像到 CallEvent 供 NodeView).
+    pub resp_status: u16,
+    /// 上游响应 headers (敏感 header 已脱敏).
+    pub resp_headers: Vec<(String, String)>,
+    /// 端到端耗时 (毫秒).
+    pub elapsed_ms: u64,
 }
 
 // ─── ConversationDag ───────────────────────────────────────────────────────
@@ -311,7 +339,7 @@ pub struct ResponseData {
 /// - `prefix_index`: Merkle prefix hash → nodes (fork 场景可能多个).
 /// - `order`: FIFO push 顺序, 用于淘汰.
 /// - `blocks`: 全局 block 池.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ConversationDag {
     inner: Arc<RwLock<DagInner>>,
 }
@@ -545,20 +573,7 @@ impl ConversationDag {
     /// 用于 list / 元数据查询.
     pub fn get_node(&self, node_id: Uuid) -> Option<NodeView> {
         let g = self.inner.read();
-        let node = g.nodes.get(&node_id)?;
-        let has_response = node.response.read().is_some();
-        Some(NodeView {
-            id: node.id,
-            parent: node.parent,
-            req_delta_count: node.req_delta.len(),
-            has_response,
-            created_at: node.event.created_at,
-            elapsed_ms: node.event.elapsed_ms,
-            method: node.event.method.clone(),
-            path: node.event.path.clone(),
-            resp_status: node.event.resp_status,
-            redact_seed: node.event.redact_seed,
-        })
+        self.node_view(&g, node_id)
     }
 
     /// 取 node 的 response 数据 (clone).
@@ -569,17 +584,52 @@ impl ConversationDag {
         resp
     }
 
+    /// 取 node 的请求侧详情 (req_headers + req_body_raw) for GET /records/{id}.
+    ///
+    /// list 路径 ([`get_node`]) 不返回 req_body_raw (太大), 这个方法用于按需拉取.
+    pub fn get_node_detail(&self, node_id: Uuid) -> Option<NodeDetail> {
+        let g = self.inner.read();
+        let node = g.nodes.get(&node_id)?;
+        Some(NodeDetail {
+            req_headers: node.event.req_headers.clone(),
+            req_body_raw: node.event.req_body_raw.clone(),
+        })
+    }
+
     /// attach response 到 node.
     ///
+    /// 同时更新 [`CallEvent`] 的 `resp_status` / `resp_headers` / `elapsed_ms`,
+    /// 让 [`get_node`] 的 [`NodeView`] 反映最终响应元数据 (用于 list 场景).
+    ///
     /// TODO(perf): 当前持有全局 write lock 更新单个 node, 高并发下可能成为瓶颈.
-    /// 后续接入时可改为 read lock + node.response.write() 两级锁.
+    /// perf: 后续可优化为 read lock + node.response.write() 两级锁.
     pub fn attach_response(&self, node_id: Uuid, response: ResponseData) {
         let mut g = self.inner.write();
         let Some(node) = g.nodes.get_mut(&node_id) else {
             tracing::warn!(%node_id, "attach_response: node not found (evicted?)");
             return;
         };
+        // 同步 event 的响应元数据 (resp_status / resp_headers / elapsed_ms),
+        // 让 NodeView (list 路径) 无需读 response 也能拿到最终值.
+        node.event.resp_status = response.resp_status;
+        node.event.resp_headers = response.resp_headers.clone();
+        node.event.elapsed_ms = response.elapsed_ms;
         *node.response.write() = Some(response);
+    }
+
+    /// 增量更新 node 的 parsed view (流式节流写入专用).
+    ///
+    /// 若 node 尚无 ResponseData (流过程中尚未 attach), 自动创建一个 default 占位
+    /// (resp_complete=false), 仅写 parsed 字段; 最终的 [`attach_response`] 会整体替换.
+    pub fn update_parsed_response(&self, node_id: Uuid, parsed: serde_json::Value) {
+        let mut g = self.inner.write();
+        let Some(node) = g.nodes.get_mut(&node_id) else {
+            tracing::warn!(%node_id, "update_parsed_response: node not found (evicted?)");
+            return;
+        };
+        let mut resp_lock = node.response.write();
+        let resp = resp_lock.get_or_insert_with(ResponseData::default);
+        resp.parsed = Some(parsed);
     }
 
     /// 按 FIFO 顺序的倒序列出 node id (newest first), 供 WebUI list.
@@ -593,11 +643,88 @@ impl ConversationDag {
         let g = self.inner.read();
         g.nodes.len()
     }
+
+    /// 分页列出 NodeView (newest first), 支持 filter + offset/limit.
+    ///
+    /// filter=All: 只 clone 当前页的 NodeView (跳过非页节点, 避免 O(n) 全量 clone).
+    /// filter=Hits: 需要扫描全部节点的 redactions 判断命中 (无法避免 O(n) 扫描),
+    /// 但仍只 clone 当前页的 NodeView.
+    pub fn list_page(
+        &self,
+        offset: usize,
+        limit: usize,
+        hits_only: bool,
+    ) -> (Vec<NodeView>, usize) {
+        let g = self.inner.read();
+        let limit = limit.clamp(1, 200);
+        // Hits 路径需 collect 过滤结果算 total; All 路径惰性分页避免 O(n) 全量 clone.
+        if hits_only {
+            let hit_ids: Vec<Uuid> = g
+                .order
+                .iter()
+                .rev()
+                .copied()
+                .filter(|id| {
+                    g.nodes
+                        .get(id)
+                        .is_some_and(|n| !n.event.redactions.is_empty())
+                })
+                .collect();
+            let total = hit_ids.len();
+            let offset = offset.min(total);
+            let views = hit_ids
+                .iter()
+                .copied()
+                .skip(offset)
+                .take(limit)
+                .filter_map(|id| self.node_view(&g, id))
+                .collect();
+            (views, total)
+        } else {
+            let total = g.order.len();
+            let offset = offset.min(total);
+            let views = g
+                .order
+                .iter()
+                .rev()
+                .copied()
+                .skip(offset)
+                .take(limit)
+                .filter_map(|id| self.node_view(&g, id))
+                .collect();
+            (views, total)
+        }
+    }
+
+    /// 从 inner 中构造 NodeView (内部 helper, 需要调用方持读锁).
+    fn node_view(&self, inner: &DagInner, node_id: Uuid) -> Option<NodeView> {
+        let node = inner.nodes.get(&node_id)?;
+        let resp = node.response.read();
+        Some(NodeView {
+            id: node.id,
+            parent: node.parent,
+            req_delta_count: node.req_delta.len(),
+            has_response: resp.is_some(),
+            created_at: node.event.created_at,
+            elapsed_ms: node.event.elapsed_ms,
+            method: node.event.method.clone(),
+            path: node.event.path.clone(),
+            resp_status: node.event.resp_status,
+            redact_seed: node.event.redact_seed,
+            preview: node.event.preview.clone(),
+            model: node.event.model.clone(),
+            streamed: resp.as_ref().map(|r| r.streamed).unwrap_or(false),
+            resp_complete: resp.as_ref().map(|r| r.resp_complete).unwrap_or(false),
+            error: resp.as_ref().and_then(|r| r.error.clone()),
+            redactions: node.event.redactions.clone(),
+        })
+    }
 }
 
 /// Node 的轻量只读视图 (供 list / 元数据查询).
 ///
-/// 不含 messages body (避免 clone 大量数据).
+/// 不含 messages body 与 resp_body / req_body_raw (避免 clone 大量数据);
+/// 含 list 场景需要的所有元数据 (preview / model / redactions / 响应状态等).
 #[derive(Debug, Clone)]
 pub struct NodeView {
     pub id: Uuid,
@@ -610,44 +737,28 @@ pub struct NodeView {
     pub path: String,
     pub resp_status: u16,
     pub redact_seed: u64,
+    /// WebUI sidebar 标题 (首条 user message 截断).
+    pub preview: Option<String>,
+    /// 请求 body 顶层 model 字段.
+    pub model: Option<String>,
+    /// 是否流式响应.
+    pub streamed: bool,
+    /// 响应是否完整 (上游错误 / 客户端断开 → false).
+    pub resp_complete: bool,
+    /// 错误诊断.
+    pub error: Option<String>,
+    /// (mock, secret_id) 投影. 永不含真实 secret value.
+    pub redactions: Vec<(String, String)>,
+}
+
+/// Node 的请求侧详情 (GET /records/{id} 按需拉取).
+#[derive(Debug, Clone)]
+pub struct NodeDetail {
+    pub req_headers: Vec<(String, String)>,
+    pub req_body_raw: String,
 }
 
 // ─── redactMap 派生 ────────────────────────────────────────────────────────
-
-/// 给定 (policy, OriginRecord messages, seed), 派生 redactMap.
-///
-/// 这是 lazy redact 的核心纯函数: node 不存 redactMap, 只存 seed;
-/// 读取时调用此函数重建.
-///
-/// seed=0 表示 passthrough, 返回空 map.
-///
-/// # 安全警示 (后续接入时必须处理)
-///
-/// 此函数当前只把 `origin_messages` 填入临时 IrRequest 的 `messages` 字段,
-/// **不扫描** `system` / `tools` / `stop` / `user` / `extra` 字段. 但 [`crate::redact::redact_ir`]
-/// 的扫描范围包括这些字段.
-///
-/// **风险**: 若某个 secret 只出现在 system prompt 或 tools 定义中 (不在 messages 中),
-/// 此函数重建的 redactMap 不含该 secret 的映射. 用这个 redactMap apply 到 OriginRecord 时,
-/// system/tools 中的真实 secret 不会被替换为 mock → 泄漏到 WebUI.
-///
-/// 后续 PR 接入 WebUI 展示时, 必须从 `CallEvent.req_envelope` 重建完整 IrRequest
-/// (含 system/tools/envelope), 确保 redact 扫描范围与原始 push 时一致.
-pub fn derive_redact_map(
-    policy: &PolicySnapshot,
-    origin_messages: &[IrMessage],
-    seed: u64,
-) -> RedactionMap {
-    if seed == 0 || policy.secrets.is_empty() {
-        return RedactionMap::default();
-    }
-    // 构造临时 IrRequest 跑 redact_ir. 当前只填 messages (见上方安全警示).
-    let mut ir = crate::codec::ir::IrRequest {
-        messages: origin_messages.to_vec(),
-        ..Default::default()
-    };
-    crate::redact::redact_ir(&mut ir, &policy.secrets)
-}
 
 #[cfg(test)]
 mod tests {
@@ -676,6 +787,10 @@ mod tests {
             ingress_protocol: None,
             redact_seed: 0,
             policy: Arc::new(PolicySnapshot::default()),
+            req_body_raw: String::new(),
+            preview: None,
+            model: None,
+            redactions: vec![],
         }
     }
 
@@ -1025,5 +1140,328 @@ mod tests {
         assert_eq!(dag.get_node(id_a).unwrap().req_delta_count, 2); // [sys, u1]
         assert_eq!(dag.get_node(id_b).unwrap().req_delta_count, 2); // [a1, t1]
         assert_eq!(dag.get_node(id_c).unwrap().req_delta_count, 2); // [a2, t2]
+    }
+
+    // ─── attach_response / update_parsed_response / get_node_detail ──────
+
+    /// 构造一个带 preview/model/req_body_raw 的 CallEvent (覆盖 list/get 视图字段).
+    fn event_with_body(path: &str, req_body: &str) -> CallEvent {
+        let (preview, model) = (Some("hi".to_string()), Some("gpt-x".to_string()));
+        CallEvent {
+            created_at: Utc::now(),
+            elapsed_ms: 0,
+            method: "POST".to_string(),
+            path: path.to_string(),
+            req_headers: vec![("authorization".into(), "<redacted>".into())],
+            resp_status: 0,
+            resp_headers: vec![],
+            req_envelope: serde_json::json!({}),
+            ingress_protocol: None,
+            redact_seed: 0,
+            policy: Arc::new(PolicySnapshot::default()),
+            req_body_raw: req_body.to_string(),
+            preview,
+            model,
+            redactions: vec![],
+        }
+    }
+
+    #[test]
+    fn attach_response_populates_nodeview_and_response() {
+        // push 后 attach_response, NodeView 应反映最终 resp_status / elapsed_ms,
+        // get_response 应返回完整 ResponseData.
+        let dag = ConversationDag::new(8);
+        let id = dag.push_messages(vec![text_msg(IrRole::User, "u")], dummy_event());
+
+        // attach 前: NodeView 的 resp_status / streamed 等是默认值.
+        let v0 = dag.get_node(id).expect("node exists");
+        assert_eq!(v0.resp_status, 0);
+        assert!(!v0.streamed);
+        assert!(!v0.resp_complete);
+        assert!(v0.error.is_none());
+        assert!(v0.redactions.is_empty());
+        assert!(dag.get_response(id).is_none());
+
+        dag.attach_response(
+            id,
+            ResponseData {
+                resp_status: 200,
+                resp_headers: vec![("content-type".into(), "application/json".into())],
+                raw_resp_body: "{\"ok\":true}".into(),
+                elapsed_ms: 42,
+                streamed: false,
+                resp_complete: true,
+                error: None,
+                ..Default::default()
+            },
+        );
+
+        // attach 后: NodeView 反映新值 (redactions 从 CallEvent 派生, 不在 response 上).
+        let v1 = dag.get_node(id).expect("node exists");
+        assert_eq!(v1.resp_status, 200);
+        assert_eq!(v1.elapsed_ms, 42);
+        assert!(v1.resp_complete);
+        assert!(v1.redactions.is_empty(), "dummy_event has empty redactions");
+
+        // get_response 返回完整 ResponseData (无 redactions 字段).
+        let r = dag.get_response(id).expect("response attached");
+        assert_eq!(r.resp_status, 200);
+        assert_eq!(r.raw_resp_body, "{\"ok\":true}");
+    }
+
+    #[test]
+    fn attach_response_on_evicted_node_warns_not_panics() {
+        // max=1, 第二次 push 淘汰 A; 对 A attach_response 应 warn + no-op.
+        let dag = ConversationDag::new(1);
+        let id_a = dag.push_messages(vec![text_msg(IrRole::User, "a")], dummy_event());
+        let _id_b = dag.push_messages(vec![text_msg(IrRole::User, "b")], dummy_event());
+        // id_a 已被淘汰, attach 应不 panic.
+        dag.attach_response(
+            id_a,
+            ResponseData {
+                resp_status: 200,
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    fn update_parsed_response_creates_partial_when_absent() {
+        // 节点尚未 attach_response 时, update_parsed_response 应自动创建一个 default
+        // ResponseData (resp_complete=false) 并只填 parsed 字段.
+        let dag = ConversationDag::new(8);
+        let id = dag.push_messages(vec![text_msg(IrRole::User, "u")], dummy_event());
+        dag.update_parsed_response(id, serde_json::json!({"partial": true}));
+
+        let r = dag.get_response(id).expect("partial response auto-created");
+        assert_eq!(r.parsed, Some(serde_json::json!({"partial": true})));
+        assert!(
+            !r.resp_complete,
+            "auto-created partial should be incomplete"
+        );
+        assert_eq!(r.resp_status, 0);
+    }
+
+    #[test]
+    fn update_parsed_response_overwrites_existing_parsed() {
+        // 已 attach 完整 ResponseData 后, update_parsed_response 只改 parsed, 保留其他字段.
+        let dag = ConversationDag::new(8);
+        let id = dag.push_messages(vec![text_msg(IrRole::User, "u")], dummy_event());
+        dag.attach_response(
+            id,
+            ResponseData {
+                resp_status: 200,
+                resp_complete: true,
+                raw_resp_body: "body".into(),
+                ..Default::default()
+            },
+        );
+        dag.update_parsed_response(id, serde_json::json!({"v": 2}));
+        let r = dag.get_response(id).expect("response exists");
+        assert_eq!(r.resp_status, 200, "other fields preserved");
+        assert!(r.resp_complete);
+        assert_eq!(r.parsed, Some(serde_json::json!({"v": 2})));
+    }
+
+    #[test]
+    fn update_parsed_response_on_evicted_node_warns_not_panics() {
+        let dag = ConversationDag::new(1);
+        let id_a = dag.push_messages(vec![text_msg(IrRole::User, "a")], dummy_event());
+        let _id_b = dag.push_messages(vec![text_msg(IrRole::User, "b")], dummy_event());
+        dag.update_parsed_response(id_a, serde_json::json!({}));
+    }
+
+    #[test]
+    fn get_node_detail_returns_req_headers_and_body() {
+        // get_node_detail 提供 GET /records/{id} 所需的 req_headers + req_body_raw.
+        let dag = ConversationDag::new(8);
+        let id = dag.push_messages(
+            vec![],
+            event_with_body("/o/x/v1/chat", "{\"model\":\"gpt-x\"}"),
+        );
+        let d = dag.get_node_detail(id).expect("detail exists");
+        assert_eq!(d.req_body_raw, "{\"model\":\"gpt-x\"}");
+        assert_eq!(d.req_headers.len(), 1);
+        assert_eq!(d.req_headers[0].0, "authorization");
+    }
+
+    #[test]
+    fn nodeview_carries_preview_model_and_response_fields() {
+        // NodeView 应携带 list 路径所需的所有字段 (preview/model/streamed/redactions/...).
+        let dag = ConversationDag::new(8);
+        let mut ev = event_with_body("/o/x/v1/chat", "{}");
+        ev.redactions = vec![("sgm_x".into(), "k".into())];
+        let id = dag.push_messages(vec![], ev);
+        dag.attach_response(
+            id,
+            ResponseData {
+                resp_status: 500,
+                elapsed_ms: 99,
+                streamed: true,
+                resp_complete: false,
+                error: Some("upstream error".into()),
+                ..Default::default()
+            },
+        );
+        let v = dag.get_node(id).expect("node exists");
+        assert_eq!(v.preview.as_deref(), Some("hi"));
+        assert_eq!(v.model.as_deref(), Some("gpt-x"));
+        assert_eq!(v.resp_status, 500);
+        assert_eq!(v.elapsed_ms, 99);
+        assert!(v.streamed);
+        assert!(!v.resp_complete);
+        assert_eq!(v.error.as_deref(), Some("upstream error"));
+        assert_eq!(v.redactions.len(), 1, "redactions from CallEvent");
+    }
+
+    #[test]
+    fn nodeview_defaults_when_no_response_attached() {
+        // 节点尚未 attach_response: NodeView 的响应字段应为默认值 (false / 空).
+        let dag = ConversationDag::new(8);
+        let id = dag.push_messages(vec![], dummy_event());
+        let v = dag.get_node(id).expect("node exists");
+        assert!(!v.has_response);
+        assert!(!v.streamed);
+        assert!(!v.resp_complete);
+        assert!(v.error.is_none());
+        assert!(v.redactions.is_empty());
+        assert_eq!(v.resp_status, 0);
+    }
+
+    #[test]
+    fn attach_response_parsed_field_preserved() {
+        // attach_response 时设置的 parsed 字段应能通过 get_response 取回.
+        let dag = ConversationDag::new(8);
+        let id = dag.push_messages(vec![text_msg(IrRole::User, "u")], dummy_event());
+        let parsed_value = serde_json::json!({"choices": [{"message": {"content": "hi"}}]});
+        dag.attach_response(
+            id,
+            ResponseData {
+                resp_status: 200,
+                parsed: Some(parsed_value.clone()),
+                resp_complete: true,
+                ..Default::default()
+            },
+        );
+        let r = dag.get_response(id).expect("response attached");
+        assert_eq!(r.parsed, Some(parsed_value));
+    }
+
+    #[test]
+    fn list_node_ids_reflects_fifo_order_after_attach() {
+        // attach_response 不改变 FIFO 顺序 (顺序由 push 决定).
+        let dag = ConversationDag::new(8);
+        let id_a = dag.push_messages(vec![text_msg(IrRole::User, "a")], dummy_event());
+        let id_b = dag.push_messages(vec![text_msg(IrRole::User, "b")], dummy_event());
+        let id_c = dag.push_messages(vec![text_msg(IrRole::User, "c")], dummy_event());
+        // 中间 attach 不影响顺序.
+        dag.attach_response(
+            id_b,
+            ResponseData {
+                resp_status: 200,
+                ..Default::default()
+            },
+        );
+        let ids = dag.list_node_ids_newest_first();
+        assert_eq!(ids, vec![id_c, id_b, id_a]);
+    }
+
+    #[test]
+    fn nodeview_preview_model_passthrough_when_uncomputed() {
+        // 当 CallEvent 的 preview/model 为 None (eg passthrough GET 请求), NodeView 透传 None.
+        let dag = ConversationDag::new(8);
+        let id = dag.push_messages(vec![], dummy_event());
+        let v = dag.get_node(id).expect("node exists");
+        assert!(v.preview.is_none());
+        assert!(v.model.is_none());
+    }
+
+    #[test]
+    fn get_node_detail_on_evicted_returns_none() {
+        // 节点被 FIFO 淘汰后, get_node_detail 应返回 None (不 panic).
+        let dag = ConversationDag::new(1);
+        let id_a = dag.push_messages(vec![text_msg(IrRole::User, "a")], dummy_event());
+        let _id_b = dag.push_messages(vec![text_msg(IrRole::User, "b")], dummy_event());
+        assert!(dag.get_node_detail(id_a).is_none());
+        assert!(dag.get_node(id_a).is_none());
+        assert!(dag.get_response(id_a).is_none());
+    }
+
+    #[test]
+    fn response_data_default_is_empty_state() {
+        // ResponseData::default() 应所有字段为空/默认 (用于 partial 占位场景的语义校验).
+        let r = ResponseData::default();
+        assert!(r.message.is_none());
+        assert!(r.usage.is_zero());
+        assert!(r.stop_reason.is_none());
+        assert!(r.id.is_none());
+        assert!(r.model.is_none());
+        assert!(r.raw_resp_body.is_empty());
+        assert!(!r.streamed);
+        assert!(!r.resp_complete);
+        assert!(r.error.is_none());
+        assert!(r.parsed.is_none());
+        assert_eq!(r.resp_status, 0);
+        assert!(r.resp_headers.is_empty());
+        assert_eq!(r.elapsed_ms, 0);
+    }
+
+    #[test]
+    fn attach_response_can_be_called_twice_overwrites() {
+        // 二次 attach_response 应整体替换 (不合并), 这是 proxy 流式路径先 partial 后
+        // 完整 attach 的契约. 最后一次写入胜出.
+        let dag = ConversationDag::new(8);
+        let id = dag.push_messages(vec![text_msg(IrRole::User, "u")], dummy_event());
+        dag.attach_response(
+            id,
+            ResponseData {
+                resp_status: 200,
+                resp_complete: false,
+                raw_resp_body: "partial".into(),
+                ..Default::default()
+            },
+        );
+        // 中间 update_parsed 不影响后续整体 attach.
+        dag.update_parsed_response(id, serde_json::json!({"partial": true}));
+        // 最终 attach 覆盖一切.
+        dag.attach_response(
+            id,
+            ResponseData {
+                resp_status: 200,
+                resp_complete: true,
+                raw_resp_body: "final".into(),
+                ..Default::default()
+            },
+        );
+        let r = dag.get_response(id).expect("response attached");
+        assert_eq!(r.raw_resp_body, "final");
+        assert!(r.resp_complete);
+        // parsed 被 final attach 覆盖为 None (final 未设置 parsed).
+        assert!(r.parsed.is_none());
+    }
+
+    #[test]
+    fn update_parsed_response_preserves_already_attached_response_fields() {
+        // 已 attach 完整 ResponseData 后, update_parsed_response 只覆盖 parsed,
+        // 不应清空 resp_status / raw_resp_body 等字段.
+        let dag = ConversationDag::new(8);
+        let id = dag.push_messages(vec![text_msg(IrRole::User, "u")], dummy_event());
+        dag.attach_response(
+            id,
+            ResponseData {
+                resp_status: 201,
+                raw_resp_body: "kept-body".into(),
+                elapsed_ms: 7,
+                resp_complete: true,
+                ..Default::default()
+            },
+        );
+        dag.update_parsed_response(id, serde_json::json!({"v": 1}));
+        let r = dag.get_response(id).expect("response exists");
+        assert_eq!(r.resp_status, 201, "resp_status preserved");
+        assert_eq!(r.raw_resp_body, "kept-body", "raw_resp_body preserved");
+        assert_eq!(r.elapsed_ms, 7, "elapsed_ms preserved");
+        assert!(r.resp_complete, "resp_complete preserved");
+        assert_eq!(r.parsed, Some(serde_json::json!({"v": 1})));
     }
 }

@@ -14,7 +14,7 @@
 //! 注意: axum 0.8 的 `nest("/__sg", ...)` 默认匹配不带尾斜杠的 `/__sg`, 而不是 `/__sg/`.
 //! server.rs 中显式注册了 `/__sg/` -> `/__sg` 的 redirect (307, 临时), 保证两种 URL 都可用.
 
-mod api;
+pub(crate) mod api;
 
 use axum::{
     http::StatusCode,

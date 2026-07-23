@@ -34,9 +34,9 @@ use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
+use crate::dag::ConversationDag;
 use crate::provider::{Provider, ProviderTable};
 use crate::proxy::{forward, forward_no_rest, ProxyState};
-use crate::record::RecordStore;
 use crate::secrets::{SecretEntry, SecretTable};
 use crate::web;
 
@@ -82,7 +82,7 @@ pub async fn serve(
     state_path: PathBuf,
 ) -> anyhow::Result<()> {
     let upstream = build_upstream_client()?;
-    let records = RecordStore::new(records_capacity);
+    let dag = ConversationDag::new(records_capacity);
 
     // 跨表共享: persist_lock 串行整个 RMW, decisions 是同一份 mutable map.
     let persist_lock = Arc::new(Mutex::new(()));
@@ -106,7 +106,7 @@ pub async fn serve(
     let proxy = ProxyState {
         upstream,
         providers: provider_table,
-        records,
+        dag,
         secrets: secret_table,
     };
     let app = build_router(proxy);
