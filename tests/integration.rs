@@ -23,6 +23,15 @@ use secret_guard::{
 };
 use tokio::net::TcpListener;
 
+/// 生成唯一的 state.toml 临时路径, 并确保父目录存在
+/// (atomic_write 不创建目录, 集成测试的 CRUD 会触发持久化).
+fn tmp_state_path(label: &str) -> std::path::PathBuf {
+    let id = uuid::Uuid::new_v4().to_string();
+    let path = std::path::PathBuf::from(format!("/tmp/opencode/tmp/test-{label}-{id}.toml"));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    path
+}
+
 async fn spawn_mock_upstream() -> mockito::ServerGuard {
     mockito::Server::new_async().await
 }
@@ -89,9 +98,7 @@ async fn spawn_proxy_static_dynamic(
 ) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let id = uuid::Uuid::new_v4().to_string();
-    let state_path = std::path::PathBuf::from(format!("/tmp/opencode/tmp/test-sg-state-{id}.toml"));
-    let _ = std::fs::remove_file(&state_path);
+    let state_path = tmp_state_path("sg-state");
 
     // 共享 decisions + persist_lock, 模拟生产环境的双表协同.
     let decisions = std::sync::Arc::new(parking_lot::RwLock::new(
@@ -128,9 +135,7 @@ fn test_secret_table() -> SecretTable {
 }
 
 fn test_secret_table_with(entries: Vec<SecretEntry>) -> SecretTable {
-    let id = uuid::Uuid::new_v4().to_string();
-    let path = std::path::PathBuf::from(format!("/tmp/opencode/tmp/test-secret-table-{id}.toml"));
-    let _ = std::fs::remove_file(&path);
+    let path = tmp_state_path("secret-table");
     let decisions = std::sync::Arc::new(parking_lot::RwLock::new(
         secret_guard::config::Decisions::default(),
     ));
@@ -2614,11 +2619,7 @@ async fn secret_decision_disabled_drops_from_redaction() {
     let decisions = std::sync::Arc::new(parking_lot::RwLock::new(
         secret_guard::config::Decisions::default(),
     ));
-    let secret_path = std::path::PathBuf::from(format!(
-        "/tmp/opencode/tmp/test-static-secret-{}.toml",
-        uuid::Uuid::new_v4()
-    ));
-    let _ = std::fs::remove_file(&secret_path);
+    let secret_path = tmp_state_path("static-secret");
     let static_secrets = vec![secret("static-s", real_secret)];
     let secrets = SecretTable::new(static_secrets, vec![], decisions, secret_path);
 
@@ -2790,10 +2791,7 @@ async fn cross_table_shared_state_no_lost_update() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let id = uuid::Uuid::new_v4().to_string();
-    let state_path =
-        std::path::PathBuf::from(format!("/tmp/opencode/tmp/test-shared-state-{id}.toml"));
-    let _ = std::fs::remove_file(&state_path);
+    let state_path = tmp_state_path("shared-state");
 
     let decisions = std::sync::Arc::new(parking_lot::RwLock::new(Decisions::default()));
     let persist_lock = std::sync::Arc::new(parking_lot::Mutex::new(()));

@@ -357,7 +357,9 @@ mod tests {
     fn tempfile_path() -> PathBuf {
         let id = uuid::Uuid::new_v4().to_string();
         let path = PathBuf::from(format!("/tmp/opencode/tmp/test-providers-{id}.toml"));
-        let _ = std::fs::remove_file(&path);
+        // 确保父目录存在, 否则 atomic_write 的 File::create 会因 ENOENT 失败
+        // (测试不应依赖外部预先创建的目录).
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         path
     }
 

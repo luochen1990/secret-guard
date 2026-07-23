@@ -918,7 +918,9 @@ mod table_tests {
     fn tempfile_path(prefix: &str) -> PathBuf {
         let id = uuid::Uuid::new_v4().to_string();
         let path = PathBuf::from(format!("/tmp/opencode/tmp/test-{prefix}-{id}.toml"));
-        let _ = std::fs::remove_file(&path);
+        // 确保父目录存在, 否则 atomic_write 的 File::create 会因 ENOENT 失败
+        // (测试不应依赖外部预先创建的目录).
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         path
     }
 
@@ -1095,10 +1097,7 @@ mod table_tests {
 
     #[test]
     fn atomic_write_roundtrip() {
-        let tmp = PathBuf::from(format!(
-            "/tmp/opencode/tmp/test-atomic-{}.toml",
-            uuid::Uuid::new_v4()
-        ));
+        let tmp = tempfile_path("atomic");
         atomic_write(&tmp, "hello").unwrap();
         assert_eq!(std::fs::read_to_string(&tmp).unwrap(), "hello");
         let _ = std::fs::remove_file(&tmp);
