@@ -18,6 +18,7 @@
 - **双层配置**: 声明式 `secret-guard.toml` (static, 只读) + 动态 `secret-guard.state.toml`
   (dynamic, WebUI 写回). 见下方"配置模型".
 - **测试**: cargo-nextest + proptest (property-based) + mockito (集成测试)
+- **覆盖率**: cargo-llvm-cov (LLVM source-based, 行级精度). 细节见"测试策略 → 覆盖率工具".
 
 ## 路由策略 (核心契约)
 
@@ -421,6 +422,9 @@ nix develop --impure      # 进入 devShell
 # 一键 check (fmt + clippy + machete + nextest + doctest)
 just check
 
+# 覆盖率报告 (HTML 写到 coverage/html/, 浏览器打开 coverage/html/index.html; 需在 devShell 内)
+just coverage-html
+
 # 开发热加载
 just dev                  # cargo watch -x run
 
@@ -478,8 +482,21 @@ client = Anthropic(
 | Property-based | `proptest` | `redact::tests::prop_round_trip_identity` |
 | 集成 (端到端) | `mockito` + `axum::serve` | `tests/integration.rs::forwards_streaming_sse` |
 | WebUI 回归 | Playwright (TypeScript) | `tests/webui/im-ui.spec.ts` |
+| 覆盖率 | cargo-llvm-cov (LLVM source-based) | `just coverage-html` |
 
 `mockito::Matcher` 在 1.x 没有 `String` 变体, 用 `Exact` 或 `Json` / `PartialJson`.
+
+### 覆盖率工具 (`cargo-llvm-cov`)
+
+集成 cargo-nextest. 工具链与 `LLVM_COV` / `LLVM_PROFDATA` 环境变量由 devShell 注入
+(nix rust toolchain 不带 llvm-tools-preview 组件, 见 `flake.nix`). 所有 coverage 命令需在 `nix develop` 内执行.
+
+- `just coverage`: 终端摘要表格 (快速查看整体覆盖率).
+- `just coverage-html`: HTML 报告 → `coverage/html/index.html` (行级着色, 定位未覆盖代码).
+- `just coverage-lcov`: LCOV 报告 → `coverage/lcov.info` (CI / IDE 集成).
+
+产物默认写到 `target/llvm-cov-target/` (已被 `/target` 覆盖) 与 `coverage/` (已 .gitignore).
+当前基线 (全量 nextest, 327 tests): 整体 ~89%, `server.rs` 较低 (main 启动路径).
 
 ### WebUI 回归测试 (`tests/webui/`)
 

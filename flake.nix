@@ -40,6 +40,9 @@
     # ─── devShells ───────────────────────────────────────────────────────────
     devShells = forAllSystems (system: let
       pkgs = nixpkgsFor system;
+      # cargo-llvm-cov 需要 llvm-cov / llvm-profdata, nix rust toolchain 不含 llvm-tools-preview.
+      # 用 llvmPackages 提供: profraw 格式跨 LLVM 主版本兼容, 不要求与 rustc 内嵌 LLVM 精确对齐.
+      llvmBins = "${pkgs.llvmPackages.llvm}/bin";
     in {
       default = pkgs.mkShell {
         packages = with pkgs; [
@@ -52,6 +55,7 @@
           cargo-nextest
           cargo-machete
           cargo-audit
+          cargo-llvm-cov
           rust-analyzer
           pkg-config
           openssl
@@ -70,6 +74,9 @@
           ln -sfn ${pkgs.playwright-test}/lib/node_modules/playwright tests/webui/node_modules/playwright
           ln -sfn ${pkgs.playwright-test}/lib/node_modules/playwright-core tests/webui/node_modules/playwright-core
         '';
+        # cargo-llvm-cov 需要的 LLVM 工具路径 (经 env 注入, 交互式与非交互式 nix develop 都生效).
+        LLVM_COV = "${llvmBins}/llvm-cov";
+        LLVM_PROFDATA = "${llvmBins}/llvm-profdata";
         RUST_SRC_PATH = "${pkgs.rust.packages.stable.rustPlatform.rustLibSrc}";
       };
     });

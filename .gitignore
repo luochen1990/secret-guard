@@ -19,3 +19,6 @@ secret-guard.state.toml
 /tests/webui/test-results/
 /tests/webui/playwright-report/
 
+# cargo-llvm-cov 产物 (target/llvm-cov-target/ 已被 /target 覆盖).
+/coverage/
+
