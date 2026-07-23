@@ -300,11 +300,18 @@ impl From<NodeView> for RecordSummary {
     }
 }
 
-/// 从 chat request body 中提取 (首条 user message preview, model 名).
+/// 从 chat request body 中提取 (sidebar 标题 preview, model 名).
 ///
 /// 协议无关的字节级提取 (不依赖 codec reader): OpenAI 和 Anthropic 都把 `model`
 /// 放在顶层, `messages[]` 也共享 `{role, content}` 形状. content 支持 string 和
 /// `[{type:"text", text}]` 两种形态 (OpenAI / Anthropic 一致).
+///
+/// 标题选择策略 (issue #23 子项 1):
+/// 1. 默认取首条 user message 文本.
+/// 2. 若首条 user message 是 `"What did we do so far?"` (opencode 自动压缩会话时
+///    注入的固定模板, 紧随其后的 assistant 消息才是真正的压缩摘要), 改取首条
+///    assistant message 文本作为标题. 压缩摘要通常以 `"## 目标 ..."` 之类开头,
+///    本身就有辨识度, 不需要额外视觉标记.
 ///
 /// 设计权衡:
 /// - 不复用 codec reader: reader 会做更重的协议归一化 (tool_calls / system 顶层等),
@@ -324,53 +331,70 @@ pub(crate) fn extract_preview_and_model(req_body: &str) -> (Option<String>, Opti
         .get("model")
         .and_then(|m| m.as_str())
         .map(|s| s.to_string());
-    let preview = v
-        .get("messages")
-        .and_then(|m| m.as_array())
-        .and_then(|msgs| {
-            msgs.iter().find_map(|m| {
-                if m.get("role").and_then(|r| r.as_str()) != Some("user") {
-                    return None;
-                }
-                let content = m.get("content")?;
-                // string content: 直接取.
-                if let Some(s) = content.as_str() {
-                    return Some(s.to_string());
-                }
-                // array content: 拼接所有 type=text 的 text 字段.
-                if let Some(arr) = content.as_array() {
-                    let texts: Vec<&str> = arr
-                        .iter()
-                        .filter_map(|b| {
-                            if b.get("type").and_then(|t| t.as_str()) != Some("text") {
-                                return None;
-                            }
-                            b.get("text").and_then(|t| t.as_str())
-                        })
-                        .collect();
-                    if texts.is_empty() {
+
+    // opencode 压缩会话注入的固定 user message (opencode 源码:
+    // packages/opencode/src/session/message-v2.ts:231). 命中时优先取首条 assistant 摘要,
+    // 若无 assistant 消息则 fallback 回 marker 本身 (总比 None 强).
+    // 精确匹配依赖 opencode 内部实现, 若 opencode 改变 marker 或附加其他 text part,
+    // 匹配失败会优雅降级到正常取首条 user 的路径 (有测试覆盖该降级路径).
+    const COMPRESSED_MARKER: &str = "What did we do so far?";
+    let messages = v.get("messages").and_then(|m| m.as_array());
+    let first_user = messages.and_then(|msgs| first_message_text_by_role(msgs, "user"));
+    let raw = match first_user.as_deref() {
+        Some(COMPRESSED_MARKER) => messages
+            .and_then(|msgs| first_message_text_by_role(msgs, "assistant"))
+            .or(first_user),
+        _ => first_user, // 正常会话或无消息: 保持原取首条 user 的行为.
+    };
+    let preview = raw.map(|s| {
+        // 归一化空白 + 截断 (与前端 messagePreview 逻辑一致, SSOT 在此).
+        let normalized = s.split_whitespace().collect::<Vec<_>>().join(" ");
+        if normalized.chars().count() > PREVIEW_MAX {
+            let end = normalized
+                .char_indices()
+                .nth(PREVIEW_MAX)
+                .map(|(i, _)| i)
+                .unwrap_or(normalized.len());
+            format!("{}…", &normalized[..end])
+        } else {
+            normalized
+        }
+    });
+    (preview, model)
+}
+
+/// 从 messages 数组中提取指定 role 的首条 message 文本.
+///
+/// content 兼容 string 与 `[{type:"text", text}]` 两种形态 (OpenAI / Anthropic 一致).
+/// 返回原始文本 (未归一化 / 未截断), 由调用方决定后处理.
+fn first_message_text_by_role(messages: &[serde_json::Value], role: &str) -> Option<String> {
+    messages.iter().find_map(|m| {
+        if m.get("role").and_then(|r| r.as_str()) != Some(role) {
+            return None;
+        }
+        let content = m.get("content")?;
+        // string content: 直接取.
+        if let Some(s) = content.as_str() {
+            return Some(s.to_string());
+        }
+        // array content: 拼接所有 type=text 的 text 字段.
+        if let Some(arr) = content.as_array() {
+            let texts: Vec<&str> = arr
+                .iter()
+                .filter_map(|b| {
+                    if b.get("type").and_then(|t| t.as_str()) != Some("text") {
                         return None;
                     }
-                    return Some(texts.join(" "));
-                }
-                None
-            })
-        })
-        .map(|s| {
-            // 归一化空白 + 截断 (与前端 messagePreview 逻辑一致, SSOT 在此).
-            let normalized = s.split_whitespace().collect::<Vec<_>>().join(" ");
-            if normalized.chars().count() > PREVIEW_MAX {
-                let end = normalized
-                    .char_indices()
-                    .nth(PREVIEW_MAX)
-                    .map(|(i, _)| i)
-                    .unwrap_or(normalized.len());
-                format!("{}…", &normalized[..end])
-            } else {
-                normalized
+                    b.get("text").and_then(|t| t.as_str())
+                })
+                .collect();
+            if texts.is_empty() {
+                return None;
             }
-        });
-    (preview, model)
+            return Some(texts.join(" "));
+        }
+        None
+    })
 }
 
 #[derive(Serialize)]
@@ -1049,6 +1073,58 @@ mod tests {
         let body = r#"{"model":"x","messages":[{"role":"assistant","content":"noop"},{"role":"user","content":"first user"},{"role":"user","content":"second"}]}"#;
         let (preview, _) = extract_preview_and_model(body);
         assert_eq!(preview.as_deref(), Some("first user"));
+    }
+
+    #[test]
+    fn extract_preview_compressed_session_falls_back_to_first_assistant() {
+        // opencode 压缩会话: 首条 user = "What did we do so far?" → 改取首条 assistant 摘要.
+        // 用 r###"..."### 因 content 含 "##" (markdown heading), 而 "## 正好是 r##"..."## 的
+        // 终止符, 必须升级到 3 个井号.
+        let body = r###"{"model":"x","messages":[
+            {"role":"user","content":"What did we do so far?"},
+            {"role":"assistant","content":"## 目标\n实现 secret-guard WebUI 标题优化"}
+        ]}"###;
+        let (preview, _) = extract_preview_and_model(body);
+        // 归一化空白: JSON 的 \n 解析为换行, split_whitespace 视为空白压缩为单空格.
+        assert_eq!(
+            preview.as_deref(),
+            Some("## 目标 实现 secret-guard WebUI 标题优化")
+        );
+    }
+
+    #[test]
+    fn extract_preview_compressed_session_array_content_assistant() {
+        // 同上但 assistant 用 array content (Anthropic 风格).
+        let body = r###"{"model":"claude-3","messages":[
+            {"role":"user","content":"What did we do so far?"},
+            {"role":"assistant","content":[{"type":"text","text":"## 目标 重构 preview 提取"}]}
+        ]}"###;
+        let (preview, _) = extract_preview_and_model(body);
+        assert_eq!(preview.as_deref(), Some("## 目标 重构 preview 提取"));
+    }
+
+    #[test]
+    fn extract_preview_compressed_marker_not_normalized_still_normal_path() {
+        // marker 比对用原始文本 (未归一化空白). 非精确匹配 (如本例多一个单词) 走正常路径,
+        // 不触发 assistant fallback — 此用例锁定该行为, 防止未来改成 normalized 比对时静默改变语义.
+        let body = r#"{"model":"x","messages":[
+            {"role":"user","content":"What did we do so far? extra"},
+            {"role":"assistant","content":"should-not-be-used"}
+        ]}"#;
+        let (preview, _) = extract_preview_and_model(body);
+        // 不是精确 marker → 取首条 user (归一化后).
+        assert_eq!(preview.as_deref(), Some("What did we do so far? extra"));
+    }
+
+    #[test]
+    fn extract_preview_compressed_session_no_assistant_falls_back_to_marker() {
+        // 压缩 marker 命中但无 assistant 消息 → first_assistant 返回 None.
+        // 这时 marker 本身就是 preview (总比 None 强, fallback 到 method+path 之前).
+        let body = r#"{"model":"x","messages":[
+            {"role":"user","content":"What did we do so far?"}
+        ]}"#;
+        let (preview, _) = extract_preview_and_model(body);
+        assert_eq!(preview.as_deref(), Some("What did we do so far?"));
     }
 
     #[test]

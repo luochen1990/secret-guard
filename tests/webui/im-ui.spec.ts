@@ -150,6 +150,14 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     const collapsedH = await sysBubble.evaluate((el) => el.clientHeight);
     expect(collapsedH).toBeLessThan(100);
 
+    // 折叠态 .bubble-content 必须 overflow:hidden (issue #23 子项 2):
+    // 旧版只设 max-height 未设 overflow, 第 4 行会穿过 content 盒冒头到 bubble padding 区.
+    // content 层裁切保证第 4 行完全不渲染 (而非依赖外层 bubble 兜底).
+    const contentOverflow = await sysBubble
+      .locator(".bubble-content")
+      .evaluate((el) => getComputedStyle(el).overflow);
+    expect(contentOverflow).toBe("hidden");
+
     // 阶段 2: 点击 toggle 展开.
     await sysBubble.locator(".bubble-toggle").click();
     await page.waitForTimeout(300);

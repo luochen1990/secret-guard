@@ -173,7 +173,9 @@ PATCH  /__sg/api/providers/{id}/decision
 `resp_body` 在 record 完成后为空 (不保留原始 SSE 字节), parsed view 通过 `resp_parsed` 提供.
 
 `RecordSummary` 同时携带两个从 `req_body` 一次性提取的轻量字段 (提取后丢弃 body):
-- `preview`: 首条 user message 文本 (截断到 48 chars), sidebar 主标题. 提取失败 fallback 到 method+path.
+- `preview`: sidebar 主标题 (截断到 48 chars). 默认取首条 user message 文本;
+  若首条 user 是 opencode 压缩 marker ("What did we do so far?") 则改取首条 assistant 摘要
+  (压缩摘要形如 "## 目标 ...", 本身有辨识度). 提取失败 fallback 到 method+path.
 - `model`: 顶层 `model` 字段 (OpenAI / Anthropic 共有), sidebar 副标题第二行.
 提取逻辑在 `web::api::extract_preview_and_model` (协议无关字节级, 不依赖 codec reader).
 

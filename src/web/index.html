@@ -36,13 +36,20 @@
     nav.tabs a.active { background: #444; color: #fff; }
     nav.tabs a:hover { background: #3a3a3a; }
     main { display: flex; height: calc(100vh - 70px); }
+    /* sidebar 宽度按比例缩放 (issue #23 子项 3): 旧版固定 340px, 缩窄窗口时
+       只缩右侧 article, 左侧 sidebar "过于霸道". 改为百分比 + min/max 钳位:
+       大屏 (≥1133px) 时 30% ≈ 340px 触顶 max-width, 与旧值持平 (视觉无突变);
+       小屏时随窗口等比缩, 下限 220px 保证 preview 仍可读 (测试用例 sidebar 内容
+       在 220px 下不溢出). 与 article { flex: 1; min-width: 0 } 配合, 两栏一起缩放. */
     aside {
-      width: 340px;
+      width: 30%;
+      min-width: 220px;
+      max-width: 340px;
       border-right: 1px solid #ddd;
       overflow-y: auto;
       background: #fafafa;
     }
-    article { flex: 1; padding: 0; overflow: hidden; }
+    article { flex: 1; padding: 0; overflow: hidden; min-width: 0; }
     /* detail 作为 IM 风格上下分栏容器: 内部 request-pane / response-pane 各自管滚动. */
     #detail { display: flex; flex-direction: column; }
     .record-item {
@@ -53,6 +60,9 @@
     .record-item.active { background: #d0e7ff; }
     .status-ok { color: #0a0; font-weight: bold; }
     .status-err { color: #a00; font-weight: bold; }
+    /* status-aborted: 客户端中断 (正常使用路径, 不加粗不用红色, 避免误认为服务故障).
+       issue #23 子项 4: 旧版 client disconnect 也用 status-err (红粗 ERR), 过重. */
+    .status-aborted { color: #888; }
     .status-pending { color: #888; }
     .meta { color: #888; }
     .section { margin-bottom: 18px; }
@@ -482,9 +492,13 @@
        用户在同一坐标点两次即可 collapsed → expanded → collapsed 回到初始状态.
 
        折叠: .bubble-content max-height 4.5em (恰好 3 行: 3 × 1.5em line-height, 无 padding 损耗,
-             因为 padding 在 .chat-bubble 上). 展开: .bubble-content max-height 22.5em (~15 行,
-             与 JS EXPAND_THRESHOLD_LINES 对齐) + overflow:auto. */
-    .chat-bubble.collapsed .bubble-content { max-height: 4.5em; }
+             因为 padding 在 .chat-bubble 上) + overflow:hidden 精确裁切到 3 行.
+             旧版只设 max-height 不设 overflow, content 溢出的第 4 行会穿过 content 盒
+             渲染到外层 bubble 的 padding-bottom 区 (bubble 的 overflow:hidden 在
+             padding 外边缘才裁切), 导致第 4 行"冒头"几像素 (issue #23 子项 2).
+             overflow 在 content 层裁切 = 在 3 行边界精确切断, 根治冒头.
+       展开: .bubble-content max-height 22.5em (~15 行, 与 JS EXPAND_THRESHOLD_LINES 对齐) + overflow:auto. */
+    .chat-bubble.collapsed .bubble-content { max-height: 4.5em; overflow: hidden; }
     .chat-bubble.expanded  .bubble-content { max-height: 22.5em; overflow: auto; }
     /* 折叠态底部渐变遮罩: 相对 .chat-bubble 定位 (content 层溢出被 bubble 的 overflow:hidden 裁切). */
     .chat-bubble.collapsed::after {
@@ -1290,14 +1304,15 @@
       el.classList.add('highlight');
     }
 
-    // session 摘要的 status 辅助 (与 record 的 statusText/statusClass 类似但字段不同).
+    // session 摘要的 status 辅助 (与 record 的 statusText/statusClass 类似但字段不同:
+    // 这里读 latest_error / latest_resp_status). 中断/错误区分逻辑见 isClientDisconnect.
     function sessionStatusText(s) {
-      if (s.latest_error) return 'ERR';
+      if (s.latest_error) return isClientDisconnect(s.latest_error) ? 'ABRT' : 'ERR';
       if (s.latest_resp_status === 0) return '...';
       return String(s.latest_resp_status);
     }
     function sessionStatusClass(s) {
-      if (s.latest_error) return 'status-err';
+      if (s.latest_error) return isClientDisconnect(s.latest_error) ? 'status-aborted' : 'status-err';
       if (s.latest_resp_status === 0) return 'status-pending';
       if (s.latest_resp_status >= 200 && s.latest_resp_status < 300) return 'status-ok';
       if (s.latest_resp_status >= 400) return 'status-err';
@@ -1357,15 +1372,22 @@
       return PROTO_BADGE_SVG[protoShort] || '';
     }
 
+    // 判断 error 字符串是否表示客户端中断 (proxy.rs 注入的固定标记).
+    // 与真实上游错误区分: 客户端中断是正常使用路径, 不应渲染为红色 ERR.
+    // SSOT: proxy.rs fan_out_* 的 error_kind = "client disconnected".
+    function isClientDisconnect(errorStr) {
+      return errorStr === 'client disconnected';
+    }
+
     function statusClass(r) {
-      if (r.error) return 'status-err';
+      if (r.error) return isClientDisconnect(r.error) ? 'status-aborted' : 'status-err';
       if (r.resp_status === 0) return 'status-pending';
       if (r.resp_status >= 200 && r.resp_status < 300) return 'status-ok';
       if (r.resp_status >= 400) return 'status-err';
       return 'status-pending';
     }
     function statusText(r) {
-      if (r.error) return 'ERR';
+      if (r.error) return isClientDisconnect(r.error) ? 'ABRT' : 'ERR';
       if (r.resp_status === 0) return '...';
       return String(r.resp_status);
     }
