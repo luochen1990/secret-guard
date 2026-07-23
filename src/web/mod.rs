@@ -39,6 +39,8 @@ pub fn router() -> Router<ProxyState> {
         .route("/", get(index_handler))
         .route("/api/records", get(api::list_records))
         .route("/api/records/{id}", get(api::get_record))
+        .route("/api/sessions", get(api::list_sessions))
+        .route("/api/nodes/{id}/timeline", get(api::get_timeline))
         .route(
             "/api/secrets",
             get(api::list_secrets).post(api::create_secret),

@@ -92,8 +92,8 @@ src/
 └── server.rs      # build_router + serve (装配 persist_lock + 共享 decisions)
     └── web/
         ├── mod.rs     # /__sg 子 router + / 根入口 + slash_redirect + not_found
-        ├── api.rs     # JSON endpoints (records + secrets/providers CRUD + PATCH .../decision)
-        └── index.html # 单页 UI (IM 风格: 内嵌 CSS + vanilla JS, 零外部依赖)
+        ├── api.rs     # JSON endpoints (records + sessions + nodes/timeline + secrets/providers CRUD + PATCH .../decision)
+        └── index.html # 单页 UI (IM 风格: 会话折叠 sidebar + timeline 对话流, 内嵌 CSS + vanilla JS, 零外部依赖)
 ```
 
 > `ProviderTable` 与 `SecretTable` 是 [`DynamicTable<T>`](src/config.rs) 的类型别名,
@@ -147,6 +147,8 @@ Disabled 项不进入 effective view (UI 看不到, 路由层也拿不到).
 ```
 GET    /__sg/api/records[?offset=N&limit=M]   → {records, total, offset, limit}
 GET    /__sg/api/records/{id}[?view=parsed]   → {record, parsed_request?, parsed_response?, parse_error?}
+GET    /__sg/api/sessions                     → {sessions, total}  (叶子节点, latest-first)
+GET    /__sg/api/nodes/{id}/timeline[?limit=N]→ {records}  (沿 parent 链向上 N 个祖先, oldest-first)
 GET    /__sg/api/secrets
 POST   /__sg/api/secrets
 PUT    /__sg/api/secrets/{id}
@@ -174,6 +176,11 @@ PATCH  /__sg/api/providers/{id}/decision
 - `preview`: 首条 user message 文本 (截断到 48 chars), sidebar 主标题. 提取失败 fallback 到 method+path.
 - `model`: 顶层 `model` 字段 (OpenAI / Anthropic 共有), sidebar 副标题第二行.
 提取逻辑在 `web::api::extract_preview_and_model` (协议无关字节级, 不依赖 codec reader).
+
+**Sessions / Timeline (会话折叠 WebUI)**: sidebar 一级 (会话) 来自 `GET /api/sessions`
+(返回叶子节点 + record_count + latest 字段); 二级 (轮次列表) 与右侧 timeline 对话流来自
+`GET /api/nodes/{id}/timeline?limit=N` (沿 parent 链向上取 N 个祖先, oldest-first).
+timeline 惰性加载: 滚到顶时以最老 node 的 parent 为新起点 prepend 更早 N 轮 (保持滚动锚点).
 
 **ForwardRecord.redactions**: `Vec<(mock, secret_id)>` — 从 `redact_ir` 产出的
 `RedactionMap` SSOT 派生 (见 `proxy.rs::derive_redactions`). WebUI 的 mock 高亮和 "命中"
@@ -581,8 +588,10 @@ devShell 的 `shellHook` 自动把 `@playwright/test` 的 node_modules symlink �
   用户可通过 MockStrategy 两维度 (初始值 + 生成策略) 自定义 prefix / charset / length.
   Fixed 模式下 mock 由用户提供, 系统校验不含 real ≥4 字符子串 (C5 best-effort).
 - **ConversationDAG 已接入**: `src/dag.rs` 作为 proxy/web 的存储后端, 替代扁平 RecordStore.
-  ForwardRecord 保留为 web 层 DTO (从 DAG node 派生). lazy redact 的完整 WebUI 重建
-  (derive_redact_map 含 system/tools) 是后续工作, 当前 WebUI 用 push 时预存的 req_body_raw.
+  ForwardRecord 保留为 web 层 DTO (从 DAG node 派生). WebUI sidebar 改为两级树
+  (会话 → 轮次, 基于 DAG leaves + parent 链), 右侧 timeline 对话流支持惰性加载
+  (滚到顶 prepend 更早轮次, 保持滚动锚点). lazy redact 的完整 WebUI 重建
+  (derive_redact_map 含 system/tools) 是后续工作, 当前 timeline 用 push 时预存的 req_body_raw.
 - static config (`secret-guard.toml`) 的 `[server]` 段当前仅在启动时读取一次,
   WebUI 改 host/port 不会生效 (需要重启).
 - WebUI 编辑 provider 时 api_key 始终要求重输 (无法保留旧值), 留空则覆盖为空字符串.

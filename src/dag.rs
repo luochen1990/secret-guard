@@ -355,6 +355,10 @@ struct DagInner {
     max: usize,
     /// 全局 block 池 (内容寻址 + refcount).
     blocks: BlockPool,
+    /// 叶子节点集合 (入度为 0 = 没有更小的 child 指向自己).
+    /// push 时: 新 node 入叶子集; 若新 node 有 parent, parent 从叶子集移除.
+    /// 代表各会话的"最新一轮", sidebar 会话列表用.
+    leaves: Vec<Uuid>,
 }
 
 /// push 时计算出的 node 定位结果.
@@ -381,6 +385,7 @@ impl ConversationDag {
                 order: VecDeque::with_capacity(max.min(128)),
                 max,
                 blocks: BlockPool::default(),
+                leaves: Vec::new(),
             })),
         }
     }
@@ -440,6 +445,10 @@ impl ConversationDag {
         g.nodes.insert(node_id, node);
         g.prefix_index.entry(prefix_hash).or_default().push(node_id);
         g.order.push_back(node_id);
+        // 维护叶子集: 新 node 是叶子; parent 不再是叶子.
+        g.leaves
+            .retain(|&id| id != lookup.parent.unwrap_or_default());
+        g.leaves.push(node_id);
 
         // 7. FIFO 淘汰.
         while g.order.len() > g.max {
@@ -533,9 +542,14 @@ impl ConversationDag {
                 inner.prefix_index.remove(&node.prefix_hash);
             }
         }
-        // 注意: 若有其他 node 的 parent == node_id (fork 场景), 它们的 parent 指针会悬空.
-        // MVP 不处理 fork tombstone; 当前业务模式是线性链, 淘汰顺序天然安全
-        // (引用者永远先于被引用者被淘汰).
+        // 从 leaves 移除. 若该 node 的 parent 仍存在且不在 leaves 中, 把 parent 加回
+        // (parent 变回了叶子). fork tombstone 场景 (parent 已被淘汰) 不处理.
+        inner.leaves.retain(|&id| id != node_id);
+        if let Some(parent_id) = node.parent {
+            if inner.nodes.contains_key(&parent_id) && !inner.leaves.contains(&parent_id) {
+                inner.leaves.push(parent_id);
+            }
+        }
     }
 
     // ─── 读取 API ──────────────────────────────────────────────────────────
@@ -719,6 +733,99 @@ impl ConversationDag {
             redactions: node.event.redactions.clone(),
         })
     }
+
+    // ─── 会话级 API (sidebar 两级树 + timeline 惰性加载) ──────────────────
+
+    /// 列出会话 (叶子节点), 按 latest_at (会话内最新轮次时间) 倒序.
+    /// 分页由 web 层控制.
+    pub fn list_sessions(&self) -> Vec<SessionView> {
+        let g = self.inner.read();
+        g.leaves
+            .iter()
+            .rev()
+            .filter_map(|&id| self.session_view(&g, id))
+            .collect()
+    }
+
+    /// 构造一个 SessionView (走 parent 链统计轮次数等).
+    fn session_view(&self, inner: &DagInner, leaf_id: Uuid) -> Option<SessionView> {
+        let leaf = inner.nodes.get(&leaf_id)?;
+        // 沿 parent 链走, 统计轮次数 + 找根.
+        let mut count = 1usize;
+        let mut root_id = leaf_id;
+        let mut cursor = leaf_id;
+        while let Some(node) = inner.nodes.get(&cursor) {
+            match node.parent {
+                Some(p) if inner.nodes.contains_key(&p) => {
+                    count += 1;
+                    root_id = p;
+                    cursor = p;
+                }
+                _ => break, // parent=None 或 parent 已被 evict.
+            }
+        }
+        let resp = leaf.response.read();
+        Some(SessionView {
+            leaf_id,
+            root_id,
+            record_count: count,
+            created_at: inner.nodes.get(&root_id)?.event.created_at,
+            latest_at: leaf.event.created_at,
+            preview: leaf.event.preview.clone(),
+            model: leaf.event.model.clone(),
+            latest_resp_status: leaf.event.resp_status,
+            latest_error: resp.as_ref().and_then(|r| r.error.clone()),
+            redactions: leaf.event.redactions.clone(),
+        })
+    }
+
+    /// 从 `node_id` 沿 parent 链向上取 `limit` 个祖先 (含 node_id 自身),
+    /// oldest-first 返回. 用于右侧 timeline 惰性加载.
+    /// 返回的第一个元素是最老的 (链中最接近根的), 最后一个是 node_id 自身.
+    pub fn timeline(&self, node_id: Uuid, limit: usize) -> Vec<NodeView> {
+        let g = self.inner.read();
+        let limit = limit.max(1);
+        let mut chain: Vec<Uuid> = Vec::with_capacity(limit);
+        let mut cursor = Some(node_id);
+        while let Some(id) = cursor {
+            if chain.len() >= limit {
+                break;
+            }
+            chain.push(id);
+            cursor = g.nodes.get(&id).and_then(|n| n.parent);
+        }
+        // oldest-first: chain 是 newest→oldest, 反转.
+        chain.reverse();
+        chain
+            .into_iter()
+            .filter_map(|id| self.node_view(&g, id))
+            .collect()
+    }
+}
+
+/// 会话视图 (sidebar 一级树).
+#[derive(Debug, Clone)]
+pub struct SessionView {
+    /// 叶子节点 id (会话最新一轮). 用作会话标识 + timeline 起点.
+    pub leaf_id: Uuid,
+    /// 根节点 id (会话第一轮).
+    pub root_id: Uuid,
+    /// 会话内轮次数.
+    pub record_count: usize,
+    /// 会话开始时间 (根节点 created_at).
+    pub created_at: DateTime<Utc>,
+    /// 最新活动时间 (叶子节点 created_at).
+    pub latest_at: DateTime<Utc>,
+    /// preview (叶子节点的首条 user msg).
+    pub preview: Option<String>,
+    /// model (叶子节点).
+    pub model: Option<String>,
+    /// 最新轮次的上游响应状态.
+    pub latest_resp_status: u16,
+    /// 最新轮次的错误 (若有).
+    pub latest_error: Option<String>,
+    /// 最新轮次的 redactions.
+    pub redactions: Vec<(String, String)>,
 }
 
 /// Node 的轻量只读视图 (供 list / 元数据查询).
@@ -1463,5 +1570,122 @@ mod tests {
         assert_eq!(r.elapsed_ms, 7, "elapsed_ms preserved");
         assert!(r.resp_complete, "resp_complete preserved");
         assert_eq!(r.parsed, Some(serde_json::json!({"v": 1})));
+    }
+
+    // ─── sessions / leaves / timeline ────────────────────────────────────
+
+    #[test]
+    fn leaves_tracks_session_tips() {
+        // A (root) → B → C (leaf). leaves = [C].
+        let dag = ConversationDag::new(64);
+        let _a = dag.push_messages(vec![text_msg(IrRole::User, "a")], dummy_event());
+        let _b = dag.push_messages(
+            vec![
+                text_msg(IrRole::User, "a"),
+                text_msg(IrRole::Assistant, "b"),
+            ],
+            dummy_event(),
+        );
+        let c = dag.push_messages(
+            vec![
+                text_msg(IrRole::User, "a"),
+                text_msg(IrRole::Assistant, "b"),
+                text_msg(IrRole::User, "c"),
+            ],
+            dummy_event(),
+        );
+        let sessions = dag.list_sessions();
+        assert_eq!(sessions.len(), 1, "one session");
+        assert_eq!(sessions[0].leaf_id, c, "leaf is C");
+        assert_eq!(sessions[0].root_id, _a, "root is A");
+        assert_eq!(sessions[0].record_count, 3, "3 rounds");
+    }
+
+    #[test]
+    fn leaves_multiple_independent_sessions() {
+        let dag = ConversationDag::new(64);
+        let a = dag.push_messages(vec![text_msg(IrRole::User, "a")], dummy_event());
+        let b = dag.push_messages(vec![text_msg(IrRole::User, "b")], dummy_event());
+        let sessions = dag.list_sessions();
+        assert_eq!(sessions.len(), 2, "two independent sessions");
+        // 倒序 (latest first).
+        assert_eq!(sessions[0].leaf_id, b);
+        assert_eq!(sessions[1].leaf_id, a);
+    }
+
+    #[test]
+    fn leaves_eviction_restores_parent_as_leaf() {
+        // max=2: push A, B(A child), C triggers FIFO evict A.
+        // B was leaf, C becomes leaf (B no longer leaf). Evicting A doesn't affect leaves
+        // (A was never a leaf once B existed). But evicting B (if max=1) would restore A.
+        let dag = ConversationDag::new(1);
+        let _a = dag.push_messages(vec![text_msg(IrRole::User, "a")], dummy_event());
+        let b = dag.push_messages(
+            vec![
+                text_msg(IrRole::User, "a"),
+                text_msg(IrRole::Assistant, "b"),
+            ],
+            dummy_event(),
+        );
+        // A evicted, B is leaf.
+        let sessions = dag.list_sessions();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].leaf_id, b);
+        // record_count walks parent chain: B's parent A is evicted → count=1 (only B).
+        assert_eq!(
+            sessions[0].record_count, 1,
+            "evicted parent truncates count"
+        );
+    }
+
+    #[test]
+    fn timeline_returns_oldest_first() {
+        let dag = ConversationDag::new(64);
+        let a = dag.push_messages(vec![text_msg(IrRole::User, "a")], dummy_event());
+        let _b = dag.push_messages(
+            vec![
+                text_msg(IrRole::User, "a"),
+                text_msg(IrRole::Assistant, "b"),
+            ],
+            dummy_event(),
+        );
+        let c = dag.push_messages(
+            vec![
+                text_msg(IrRole::User, "a"),
+                text_msg(IrRole::Assistant, "b"),
+                text_msg(IrRole::User, "c"),
+            ],
+            dummy_event(),
+        );
+        // timeline(c, 10) → [A, B, C] oldest-first.
+        let tl = dag.timeline(c, 10);
+        assert_eq!(tl.len(), 3);
+        assert_eq!(tl[0].id, a, "oldest first");
+        assert_eq!(tl[2].id, c, "newest last");
+    }
+
+    #[test]
+    fn timeline_limit_truncates() {
+        let dag = ConversationDag::new(64);
+        let _a = dag.push_messages(vec![text_msg(IrRole::User, "a")], dummy_event());
+        let _b = dag.push_messages(
+            vec![
+                text_msg(IrRole::User, "a"),
+                text_msg(IrRole::Assistant, "b"),
+            ],
+            dummy_event(),
+        );
+        let c = dag.push_messages(
+            vec![
+                text_msg(IrRole::User, "a"),
+                text_msg(IrRole::Assistant, "b"),
+                text_msg(IrRole::User, "c"),
+            ],
+            dummy_event(),
+        );
+        // timeline(c, 2) → [B, C] (最近 2 轮, oldest-first).
+        let tl = dag.timeline(c, 2);
+        assert_eq!(tl.len(), 2);
+        assert_eq!(tl[1].id, c, "includes the requested node");
     }
 }

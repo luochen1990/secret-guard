@@ -397,29 +397,6 @@
     }
     .filter-bar button:hover:not(.active) { background: #eee; }
 
-    /* ─── F4: load-more button ────────────────────────────────────────────── */
-    .load-more-wrap {
-      padding: 10px;
-      text-align: center;
-      border-top: 1px solid #eee;
-    }
-    button.load-more {
-      width: 100%;
-      padding: 6px;
-      font: inherit;
-      font-size: 12px;
-      cursor: pointer;
-      background: #fff;
-      border: 1px solid #888;
-      border-radius: 3px;
-    }
-    button.load-more:hover { background: #eee; }
-    button.load-more[disabled] {
-      color: #aaa;
-      border-color: #ccc;
-      cursor: not-allowed;
-      background: #f5f5f5;
-    }
 
     /* ─── F5: detail view toggle (raw / parsed) ───────────────────────────── */
     .view-toggle {
@@ -636,13 +613,196 @@
       cursor: help;
       font-weight: 600;
     }
+
+    /* ─── 会话折叠树 (sidebar 两级) ─────────────────────────────────────────
+       .session-item 是会话头 (一级), 展开后内部含 .round-list 包着若干 .round-item (二级).
+       复用 record-item 的 grid 布局 (icon + line1 + line2 + right), 保证视觉一致. */
+    .session-item {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      grid-template-rows: auto auto;
+      grid-template-areas:
+        "icon line1 right"
+        "icon line2 right";
+      align-items: center;
+      gap: 1px 6px;
+      padding: 4px 10px;
+      line-height: 1.35;
+      cursor: pointer;
+      border-bottom: 1px solid #eee;
+      background: #fafafa;
+    }
+    .session-item:hover { background: #f0f0f0; }
+    .session-item.active { background: #d0e7ff; }
+    .session-item .ri-icon { grid-area: icon; }
+    .session-item .ri-right {
+      grid-area: right;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      align-self: center;
+    }
+    .session-item .ri-line1,
+    .session-item .ri-line2 {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .session-item .ri-line1 {
+      grid-area: line1;
+      font-size: 12.5px;
+      color: #222;
+      font-weight: 500;
+    }
+    .session-item .ri-line2 {
+      grid-area: line2;
+      font-size: 10.5px;
+      color: #999;
+    }
+    .session-item.active .ri-line2 { color: #6a87b3; }
+    /* 展开三角形: 用边框模拟, 旋转表示展开态. */
+    .session-item .caret {
+      display: inline-block;
+      width: 0; height: 0;
+      border-left: 4px solid #888;
+      border-top: 3px solid transparent;
+      border-bottom: 3px solid transparent;
+      margin-right: 4px;
+      transition: transform 0.15s ease;
+      flex-shrink: 0;
+    }
+    .session-item.expanded .caret { transform: rotate(90deg); }
+    /* 会话内轮次数徽标 (count>1 时显示). */
+    .badge-count {
+      background: #e0e7ff;
+      color: #336;
+      font-weight: bold;
+      padding: 0 5px;
+      border-radius: 8px;
+      font-size: 10px;
+      min-width: 16px;
+      text-align: center;
+    }
+
+    /* 二级轮次列表: 缩进, 默认隐藏 (会话折叠时). */
+    .round-list { display: none; }
+    .round-list.expanded { display: block; }
+    .round-item {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 10px 3px 38px;  /* 左缩进对齐会话头 line1 起始位置 */
+      line-height: 1.3;
+      cursor: pointer;
+      border-bottom: 1px solid #f5f5f5;
+      font-size: 11.5px;
+      color: #555;
+    }
+    .round-item:hover { background: #f0f0f0; }
+    .round-item.active { background: #d0e7ff; color: #222; }
+    .round-item .ri-line1 {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .round-item .ri-right {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 10px;
+      color: #999;
+    }
+
+    /* ─── timeline 顶/底悬浮按钮 ─────────────────────────────────────────── */
+    .scroll-nav {
+      position: absolute;
+      right: 16px;
+      bottom: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      z-index: 10;
+    }
+    .scroll-nav button {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      border: 1px solid #888;
+      background: #fff;
+      color: #444;
+      cursor: pointer;
+      font-size: 16px;
+      line-height: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.15);
+    }
+    .scroll-nav button:hover { background: #eee; }
+    .scroll-nav button[hidden] { display: none; }
+
+    /* ─── timeline: 每轮分隔 (轮次边界标识) ──────────────────────────────── */
+    /* timeline 内每轮 (.tl-round) 之间用细分隔线, 每轮 header 显示时间/状态/轮次序号. */
+    .tl-round {
+      border-bottom: 1px dashed #e0e0e0;
+      padding-bottom: 4px;
+    }
+    .tl-round:last-child { border-bottom: none; }
+    .tl-round-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 4px 0 2px;
+      font-size: 10.5px;
+      color: #999;
+      border-top: 1px solid #eee;
+      margin-top: 4px;
+    }
+    .tl-round-header .tl-meta { display: flex; gap: 8px; align-items: center; }
+    .tl-round.highlight {
+      animation: tl-flash 1.2s ease-out;
+    }
+    @keyframes tl-flash {
+      0%   { background: #ffe08a; }
+      100% { background: transparent; }
+    }
+
+    /* ─── timeline 多轮布局: 覆盖旧的单 record flex 布局 ────────────────────
+       旧布局: #detail { display: flex; flex-direction: column; } + request-pane { flex:1; overflow-y: auto }
+       新布局 (timeline): #detail 整体可滚动 (块级), 每个 .tl-round 自然排列,
+       .tl-round 内的 .request-pane 不滚动 (自然高度), .response-pane 保持固定高度 + 独立滚动.
+       通过 .tl-round 作用域覆盖旧规则, 不破坏单 record 的旧 CSS (虽然不再用到). */
+    #detail { display: block; overflow-y: auto; }
+    .tl-round .request-pane {
+      flex: none;
+      overflow: visible;
+      padding: 4px 12px 4px;
+      max-height: none;
+    }
+    /* response-pane 在 timeline 内仍固定高度 + 独立滚动 (IM 打字框语义). */
+    .tl-round .response-pane {
+      margin: 0 12px 8px;
+      border-radius: 4px;
+      border: 1px solid #e0e0e0;
+    }
+    /* detail-header 在 timeline 顶部 sticky, 滚动时仍可见标题 + view toggle. */
+    #detail > .detail-header {
+      position: sticky;
+      top: 0;
+      background: #fff;
+      z-index: 5;
+      border-bottom: 1px solid #eee;
+    }
   </style>
 </head>
 <body>
   <header>
     <span class="brand">secret-guard</span>
     <span class="toolbar">
-      <span><span id="count">0</span> <span id="count-label">records</span></span>
+      <span><span id="count">0</span> <span id="count-label">sessions</span></span>
       <span id="status"></span>
       <label><input type="checkbox" id="auto" checked> auto-refresh (3s)</label>
       <button class="refresh" onclick="refresh()">refresh</button>
@@ -660,12 +820,9 @@
           <button id="filter-all" class="active" type="button" onclick="setFilter('all')">All (<span id="filter-all-count">0</span>)</button>
           <button id="filter-hits" type="button" onclick="setFilter('hits')">Hits (<span id="filter-hits-count">0</span>)</button>
         </div>
-        <div id="record-list"><div class="empty">No records yet</div></div>
-        <div id="load-more-wrap" class="load-more-wrap" style="display:none;">
-          <button class="load-more" id="load-more-btn" type="button" onclick="loadMore()">Load more</button>
-        </div>
+        <div id="record-list"><div class="empty">No sessions yet</div></div>
       </aside>
-      <article id="detail"><div class="empty">Select a record on the left</div></article>
+      <article id="detail" style="position: relative;"><div class="empty">Select a session on the left</div></article>
     </section>
     <section id="tab-secrets" class="tab-content">
       <div class="secrets-main">
@@ -806,6 +963,8 @@
   <script>
     // 集中管理 API URL.
     const API_RECORDS = '/__sg/api/records';
+    const API_SESSIONS = '/__sg/api/sessions';
+    const API_NODES = '/__sg/api/nodes';
     const API_SECRETS = '/__sg/api/secrets';
     const API_PROVIDERS = '/__sg/api/providers';
     const DECISION_LABELS = {
@@ -820,7 +979,6 @@
       static_preferred: 'static (forced)',
     };
 
-    let selectedId = null;
     let secretsList = [];
     let secretCategories = [];
     let secretDecisions = [];
@@ -829,26 +987,43 @@
     let providerShorts = [];
     let providerDecisions = [];
 
-    // ─── records tab: pagination / filter / parsed-view 状态 ────────────────
+    // ─── records tab: 两级树 (会话 → 轮次) + timeline 惰性加载 ─────────────
     //
-    // 双游标分页: All / Hits 各自独立的 offset 与 total, 切换 filter 不重置另一侧.
-    // 后端按 ?filter=all|hits 过滤并返回该维度下的 total, 前端不再做客户端筛选.
-    const PAGE_SIZE = 50;
-    // 每个维度各自缓存已加载的 records 与游标. 切换 tab 时直接用对应缓存渲染,
-    // 首次切到 Hits 才发请求 (lazy). loaded 标志区分"空结果"与"从未加载" (M7).
-    // 注意: 自动 refresh 只拉第一页, 会重置 offset + records (与 loadMore 累积互斥).
-    // 这是开发工具的预期行为 — 新请求通常就是用户想看的, 不做无谓的全量重拉.
-    const cursors = {
-      all: { offset: 0, total: 0, records: [], loaded: false },
-      hits: { offset: 0, total: 0, records: [], loaded: false },
-    };
-    let filterMode = 'all';   // 'all' | 'hits'.
-    let detailView = 'parsed'; // 'raw' | 'parsed'. parsed 是默认视图 (可读性更好).
-    let parsedCache = new Map(); // id -> { record, parsed_request, parsed_response, parse_error }.
-    let detailRecord = null;  // 当前详情面板渲染所用的 ForwardRecord (raw view 直接用).
-
-    // 当前 filter 维度的游标 (语法糖, 避免散落各处的 cursors[filterMode]).
-    function cur() { return cursors[filterMode]; }
+    // sidebar 改为两级树:
+    //   一级 (会话头): 来自 /api/sessions (叶子节点, latest-first), 默认折叠.
+    //   二级 (轮次列表): 展开会话时拉 /api/nodes/{leaf_id}/timeline?limit=50.
+    // 右侧主区域: 选中会话时拉 timeline 最近 10 轮渲染连续对话流, 滚到顶惰性加载更早的轮次.
+    //
+    // 状态变量:
+    //   sessionsList     — 当前 filter 维度的会话数组 (sidebar 一级).
+    //   sessionsTotal    — 当前维度的会话总数 (header count 显示).
+    //   hitsTotal        — hits 维度的会话总数 (用于 filter 按钮).
+    //   expandedSessions — Set<leaf_id>: 展开的会话 (持久到下次 renderSidebar).
+    //   sessionRounds    — Map<leaf_id, RecordSummary[]>: 展开会话内的轮次列表缓存.
+    //   selectedLeaf     — 当前选中会话的 leaf_id (null = 未选中).
+    //   selectedRound    — 当前选中/高亮的轮次 node_id (null = 未定位到具体轮次).
+    //   timelineRecords  — 当前右侧 timeline 渲染的轮次数组 (oldest-first).
+    //   timelineEnvelopes— Map<node_id, envelope>: timeline 各轮的 parsed envelope 缓存.
+    //   timelineOldest   — timeline 中最老 node 的 id (用于惰性加载判断 "是否到顶").
+    //   timelineReachedTop — 已加载到会话根 (无法再向上 load), 显示 "已经到顶了".
+    //   detailView       — 'raw' | 'parsed' (保留).
+    //   loadingOlder     — 正在加载更早的轮次 (防重复触发).
+    let sessionsList = [];
+    let sessionsTotal = 0;
+    let hitsTotal = 0;
+    const expandedSessions = new Set();
+    const sessionRounds = new Map();
+    let selectedLeaf = null;
+    let selectedRound = null;
+    let timelineRecords = [];
+    const timelineEnvelopes = new Map();
+    let timelineOldest = null;
+    let timelineReachedTop = false;
+    let detailView = 'parsed';
+    let loadingOlder = false;
+    let filterMode = 'all';   // 'all' | 'hits'. 客户端过滤 (后端 /api/sessions 不过滤).
+    const TIMELINE_PAGE = 10;   // 惰性加载每页轮次数.
+    const ROUNDS_PAGE = 50;     // 展开会话时一次拉取的轮次数 (覆盖绝大多数会话).
 
     // ─── tabs ──────────────────────────────────────────────────────────────
     document.querySelectorAll('nav.tabs a.tab').forEach(tab => {
@@ -868,55 +1043,38 @@
       el.className = cls || '';
     }
 
-    // ─── records tab ──────────────────────────────────────────────────────
+    // ─── records tab: 会话两级树 + timeline 惰性加载 ──────────────────────
     //
-    // 双游标分页语义 (后端 ?filter=all|hits 已按维度返回独立 total):
-    // - refresh(): 拉当前 filter 的第一页 (offset=0, limit=PAGE_SIZE), 完全替换该维度 records.
-    //   同时并发拉另一维度的 total (limit=1, 只为计数), 保证两个按钮数字始终准确.
-    //   另一维度已加载的 records 不被清空 (切回时即用).
-    // - loadMore(): 追加当前 filter 的下一页.
-    // - setFilter(mode): 切换 filterMode; 若目标维度尚未加载过 (records 空 + total=0),
-    //   触发一次完整 fetch; 否则直接用已有缓存渲染.
-    // - 自动刷新 (setInterval): 也只刷当前 filter 第一页 + 另一维度计数.
+    // 数据流:
+    // - refresh(): 拉 /api/sessions, 替换 sessionsList + 更新 totals. 客户端按
+    //   filterMode (all|hits) 过滤 hits = redactions.length > 0. 若 selectedLeaf 仍
+    //   存在, 顺带刷新 timeline 最近 N 轮的 parsed envelope (流式响应渐进更新).
+    // - setFilter(mode): 纯客户端切换 (无需重拉); 重渲染 sidebar.
+    // - selectSession(leafId): 展开/折叠会话头; 展开时拉 timeline(limit=ROUNDS_PAGE)
+    //   填充 sessionRounds, 同时 selectRound(leafId) 在右侧渲染 timeline.
+    // - selectRound(nodeId): 在已渲染的 timeline 中定位 + 高亮 (滚动到该轮); 若该轮
+    //   不在当前 timeline 视窗内, 重新以该轮为锚拉 timeline(TIMELINE_PAGE).
+    // - loadOlder(): 滚到 timeline 顶部时, 以 timelineOldest 的 parent 为起点拉更早
+    //   TIMELINE_PAGE 轮, prepend 到 timeline (保持滚动锚点).
+
     async function refresh() {
       try {
-        const c = cur();
-        const otherMode = filterMode === 'all' ? 'hits' : 'all';
-        // 并发: 当前维度完整第一页 + 另一维度仅 total (limit=1 省带宽).
-        const [curResp, otherResp] = await Promise.all([
-          fetch(`${API_RECORDS}?offset=0&limit=${PAGE_SIZE}&filter=${filterMode}`, { cache: 'no-store' }),
-          fetch(`${API_RECORDS}?offset=0&limit=1&filter=${otherMode}`, { cache: 'no-store' }),
-        ]);
-        if (!curResp.ok) throw new Error('HTTP ' + curResp.status);
-        const data = await curResp.json();
-        c.records = data.records || [];
-        c.total = data.total || 0;
-        c.offset = c.records.length;
-        c.loaded = true;
-        // 更新另一维度 total (不触碰其 records/offset).
-        if (otherResp.ok) {
-          const od = await otherResp.json();
-          cursors[otherMode].total = od.total || 0;
-        }
+        const resp = await fetch(API_SESSIONS, { cache: 'no-store' });
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const data = await resp.json();
+        sessionsList = data.sessions || [];
+        sessionsTotal = data.total || sessionsList.length;
+        // 客户端统计 hits 维度 (redactions.length > 0 的会话数).
+        hitsTotal = sessionsList.filter(s => (s.redactions || []).length > 0).length;
         updateCountDisplay();
         renderSidebar();
-        if (selectedId) {
-          // 自动刷新时拉 parsed view (一次请求同时更新 detailRecord 和 parsedCache,
-          // 让流式响应的 parsed view 随轮询逐步更新).
-          const detail = await fetch(`${API_RECORDS}/${selectedId}?view=parsed`, { cache: 'no-store' });
-          if (detail.ok) {
-            const env = await detail.json();
-            detailRecord = env.record;
-            parsedCache.set(selectedId, env);
-            renderDetail();
-          } else if (detail.status === 404) {
-            parsedCache.delete(selectedId);
-            selectedId = null;
-            detailRecord = null;
-            renderSidebar();
-            document.getElementById('detail').innerHTML =
-              '<div class="empty">Selected record no longer exists</div>';
-          }
+        // 选中会话仍存在 → 刷新 timeline 最近几轮的 parsed envelope (流式渐进更新).
+        if (selectedLeaf && sessionsList.some(s => s.leaf_id === selectedLeaf)) {
+          await refreshTimelineTail();
+        } else if (selectedLeaf) {
+          // 选中会话被淘汰 → 清空右侧.
+          clearTimeline();
+          renderSidebar();
         }
         setStatus('');
       } catch (e) {
@@ -925,153 +1083,228 @@
       }
     }
 
-    // 追加加载当前 filter 的下一页. 失败时静默 (status 提示), 不影响已加载内容.
-    async function loadMore() {
-      const btn = document.getElementById('load-more-btn');
-      if (btn) btn.disabled = true;
-      try {
-        const c = cur();
-        const r = await fetch(`${API_RECORDS}?offset=${c.offset}&limit=${PAGE_SIZE}&filter=${filterMode}`, { cache: 'no-store' });
-        if (!r.ok) throw new Error('HTTP ' + r.status);
-        const data = await r.json();
-        const more = data.records || [];
-        c.records = c.records.concat(more);
-        c.total = data.total || c.total;
-        c.offset = c.records.length;
-        c.loaded = true;
-        updateCountDisplay();
-        renderSidebar();
-      } catch (e) {
-        console.error(e);
-        setStatus('load more failed', 'status-err');
-      } finally {
-        if (btn) btn.disabled = false;
-      }
+    // 刷新当前 timeline 最近 N 轮的 parsed envelope, 让流式响应渐进显示.
+    // 只刷新 timeline 中最末几轮 (最近的活动), 不动已加载的历史.
+    async function refreshTimelineTail() {
+      if (timelineRecords.length === 0) return;
+      // 从 timeline 最末轮 (最新) 往前取 min(TIMELINE_PAGE, len) 轮重新拉 envelope.
+      const tailStart = Math.max(0, timelineRecords.length - TIMELINE_PAGE);
+      const tailIds = timelineRecords.slice(tailStart).map(r => r.id);
+      await Promise.all(tailIds.map(id => fetchTimelineEnvelope(id)));
+      renderTimeline();
     }
 
-    // header count 显示当前 filter 维度的 total; label 标注 loaded/total.
+    // header count: 显示当前 filter 维度的会话总数.
     function updateCountDisplay() {
-      const c = cur();
       const cnt = document.getElementById('count');
       const lbl = document.getElementById('count-label');
-      cnt.textContent = c.total;
-      if (c.offset < c.total) {
-        lbl.textContent = `records [${filterMode}] (loaded ${c.offset}/${c.total})`;
-      } else {
-        lbl.textContent = `records [${filterMode}]`;
-      }
+      const total = filterMode === 'hits' ? hitsTotal : sessionsTotal;
+      cnt.textContent = total;
+      lbl.textContent = `sessions [${filterMode}]`;
     }
 
-    // All / Hits 按钮各自显示该维度的 total (来自后端, 非客户端计数).
     function updateFilterCounts() {
       const allEl = document.getElementById('filter-all-count');
       const hitsEl = document.getElementById('filter-hits-count');
-      if (allEl) allEl.textContent = cursors.all.total;
-      if (hitsEl) hitsEl.textContent = cursors.hits.total;
+      if (allEl) allEl.textContent = sessionsTotal;
+      if (hitsEl) hitsEl.textContent = hitsTotal;
     }
 
-    // filter 按钮回调. 切换维度; 首次切到某维度时 lazy fetch.
-    // 用 loaded 标志而非 "records 空" 判断, 因为该维度可能合法地返回 0 条.
-    async function setFilter(mode) {
+    // filter 切换: 纯客户端 (sessionsList 已含全部, 按 redactions 过滤).
+    function setFilter(mode) {
       if (mode === filterMode) return;
       filterMode = mode;
       document.getElementById('filter-all').classList.toggle('active', mode === 'all');
       document.getElementById('filter-hits').classList.toggle('active', mode === 'hits');
-      // 目标维度未加载过 → 先 fetch 再渲染. 已加载则直接用缓存.
-      if (!cursors[mode].loaded) {
-        await refresh();
-      } else {
-        updateCountDisplay();
-        renderSidebar();
-      }
+      updateCountDisplay();
+      renderSidebar();
     }
 
-    // 渲染侧栏列表. 直接用当前 filter 维度的缓存 records (后端已过滤).
-    // 优化: 若 records 的 id 序列 + 关键展示字段 (status/elapsed/hitN/resp_complete)
-    // 与上次渲染完全一致, 跳过 innerHTML 重建, 避免自动刷新时的视觉抖动 + 重复 JSON.parse.
-    // selectedId 变化时仍需重渲染 (更新 active 高亮).
+    // 当前 filter 维度过滤后的会话列表.
+    function filteredSessions() {
+      if (filterMode === 'hits') {
+        return sessionsList.filter(s => (s.redactions || []).length > 0);
+      }
+      return sessionsList;
+    }
+
+    // 渲染侧栏: 两级树 (会话头 + 展开后的轮次列表).
+    // 指纹优化: 会话 id 序列 + 关键字段 + selectedLeaf + expandedSessions 一致时跳过重建.
     let lastSidebarFingerprint = '';
     function renderSidebar() {
       const listEl = document.getElementById('record-list');
-      const loadMoreWrap = document.getElementById('load-more-wrap');
-      const c = cur();
-
-      // 始终先更新两个维度的计数 + load-more 可见性, 即使列表为空.
       updateFilterCounts();
-      if (loadMoreWrap) {
-        loadMoreWrap.style.display = (c.offset < c.total) ? '' : 'none';
-        const btn = document.getElementById('load-more-btn');
-        if (btn) {
-          const remaining = c.total - c.offset;
-          btn.textContent = `Load more (${remaining} remaining of ${c.total})`;
-        }
-      }
 
-      const list = c.records;
+      const list = filteredSessions();
       if (list.length === 0) {
         lastSidebarFingerprint = '';
-        listEl.innerHTML = `<div class="empty">${filterMode === 'hits' ? 'No redacted records' : 'No records yet'}</div>`;
+        listEl.innerHTML = `<div class="empty">${filterMode === 'hits' ? 'No sessions with redactions' : 'No sessions yet'}</div>`;
         return;
       }
-      // 指纹: id + selectedId + status/elapsed/hitN (这些字段变化时需要重渲染).
-      // preview 进指纹: 后端提取的 preview 可能从 None 变 Some (首次 list 后),
-      // 但同一条 record 的 preview 一旦提取就稳定, 所以进 fingerprint 让它更新一次.
-      const fingerprint = filterMode + '|' + selectedId + '|' + list.map(r =>
-        `${r.id}:${r.resp_status}:${r.elapsed_ms}:${r.error || ''}:${(r.redactions||[]).length}:${r.preview || ''}:${r.model || ''}`
+      // 指纹: leaf_id + record_count + preview + status + selectedLeaf + expandedSessions.
+      const expandedKey = [...expandedSessions].sort().join(',');
+      const fingerprint = filterMode + '|' + selectedLeaf + '|' + selectedRound + '|' + expandedKey + '|' + list.map(s =>
+        `${s.leaf_id}:${s.record_count}:${s.latest_resp_status}:${s.latest_error || ''}:${(s.redactions||[]).length}:${s.preview || ''}:${s.model || ''}:${s.latest_at}`
       ).join(',');
       if (fingerprint === lastSidebarFingerprint) return;
       lastSidebarFingerprint = fingerprint;
 
-      listEl.innerHTML = list.map(r => {
-        const { proto, id: pid } = parsePath(r.path);
-        // 需求 6: 优先用后端返回的 preview (首条 user msg); None 时 fallback 到 method+path.
-        const preview = r.preview || `${r.method} ${r.path}`;
-        const status = escapeHtml(statusText(r));
-        const statusCls = statusClass(r);
-        const hitN = (r.redactions || []).length;
+      listEl.innerHTML = list.map(s => {
+        // 会话无 path 字段, 用 leaf_id 作为 provider id 的代理 (保证图标颜色稳定);
+        // 协议角标留空 (provider 信息在叶子轮次的 path 里, SessionSummary 未暴露).
+        const iconHtml = providerIcon(s.leaf_id, '');
+        const preview = s.preview || '(no preview)';
+        const status = escapeHtml(sessionStatusText(s));
+        const statusCls = sessionStatusClass(s);
+        const hitN = (s.redactions || []).length;
         const hitBadge = hitN > 0 ? `<span class="badge-hit" title="${hitN} redaction(s)">${hitN}</span>` : '';
-        const iconHtml = providerIcon(pid, proto);
-        // 需求 7: 第二行显示 model 名 (若有) 取代 provider_id (provider_id 已在图标 title 中).
-        // 无 model 时 fallback 显示 provider_id (保持信息不丢).
-        const line2Model = r.model || pid;
-        const line2 = `${escapeHtml(formatTime(r.created_at))} · ${r.elapsed_ms}ms · ${escapeHtml(line2Model)}`;
+        const countBadge = s.record_count > 1 ? `<span class="badge-count" title="${s.record_count} rounds">${s.record_count}</span>` : '';
+        const isExpanded = expandedSessions.has(s.leaf_id);
+        const isActive = s.leaf_id === selectedLeaf;
+        const line2Model = s.model || s.leaf_id;
+        const line2 = `${escapeHtml(formatTime(s.latest_at))} · ${escapeHtml(line2Model)}`;
         const title = [
-          `${r.method} ${r.path}`,
-          `provider: ${pid} (${proto})`,
-          `model: ${r.model || '(unknown)'}`,
-          `status: ${statusText(r)}`,
-          `elapsed: ${r.elapsed_ms}ms`,
-          `time: ${formatTime(r.created_at)}`,
-          `redactions: ${hitN}`,
+          `session leaf: ${s.leaf_id}`,
+          `rounds: ${s.record_count}`,
+          `model: ${s.model || '(unknown)'}`,
+          `status: ${sessionStatusText(s)}`,
+          `latest: ${formatTime(s.latest_at)}`,
+          `started: ${formatTime(s.created_at)}`,
         ].join('\n');
         return `
-          <div class="record-item ${r.id === selectedId ? 'active' : ''}" data-id="${escapeHtml(r.id)}" title="${escapeHtml(title)}">
-            ${iconHtml}
+          <div class="session-item ${isActive ? 'active' : ''} ${isExpanded ? 'expanded' : ''}" data-leaf="${escapeHtml(s.leaf_id)}" title="${escapeHtml(title)}">
+            <span class="caret"></span>
             <span class="ri-line1" title="${escapeHtml(preview)}">${escapeHtml(preview)}</span>
             <span class="ri-right">
+              ${countBadge}
               <span class="${statusCls}" title="${status}">${status}</span>
               ${hitBadge}
             </span>
             <span class="ri-line2">${line2}</span>
           </div>
+          <div class="round-list ${isExpanded ? 'expanded' : ''}" data-leaf="${escapeHtml(s.leaf_id)}"></div>
         `;
       }).join('');
-      listEl.querySelectorAll('.record-item').forEach(node => {
-        node.addEventListener('click', () => selectRecord(node.dataset.id));
+      // 绑定会话头点击.
+      listEl.querySelectorAll('.session-item').forEach(node => {
+        node.addEventListener('click', () => toggleSession(node.dataset.leaf));
+      });
+      // 异步填充已展开会话的轮次列表 (从 sessionRounds 缓存).
+      for (const leaf of expandedSessions) {
+        renderRounds(leaf);
+      }
+    }
+
+    // 展开后的二级轮次列表渲染 (从 sessionRounds 缓存, 若无则触发 fetch).
+    function renderRounds(leafId) {
+      const wrap = document.querySelector(`.round-list[data-leaf="${CSS.escape(leafId)}"]`);
+      if (!wrap) return;
+      const rounds = sessionRounds.get(leafId);
+      if (!rounds) {
+        // 缓存未就绪 (仍在 fetch), 显示 loading.
+        wrap.innerHTML = '<div class="empty" style="padding:8px;font-size:11px;">Loading rounds…</div>';
+        return;
+      }
+      if (rounds.length === 0) {
+        wrap.innerHTML = '<div class="empty" style="padding:8px;font-size:11px;">(empty)</div>';
+        return;
+      }
+      wrap.innerHTML = rounds.map((r, idx) => {
+        const preview = r.preview || `${r.method} ${r.path}`;
+        const status = escapeHtml(statusText(r));
+        const isActive = r.id === selectedRound;
+        const num = idx + 1;
+        return `
+          <div class="round-item ${isActive ? 'active' : ''}" data-leaf="${escapeHtml(leafId)}" data-rid="${escapeHtml(r.id)}">
+            <span class="ri-line1" title="${escapeHtml(preview)}">#${num} ${escapeHtml(preview)}</span>
+            <span class="ri-right">
+              <span class="meta">${escapeHtml(formatTime(r.created_at))}</span>
+              <span class="${statusClass(r)}">${status}</span>
+            </span>
+          </div>
+        `;
+      }).join('');
+      wrap.querySelectorAll('.round-item').forEach(node => {
+        node.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          selectRound(node.dataset.rid);
+        });
       });
     }
 
-    // ─── sidebar 渲染辅助 ──────────────────────────────────────────────────
-
-    // 从 path 中提取 {proto, id}. 形如 "/o/<id>/...", split 后 index 1 是协议短码,
-    // index 2 是 provider id. 合并一次 split, 避免每条 record 解析两次.
-    function parsePath(path) {
-      const parts = String(path || '').split('/');
-      return { proto: parts[1] || '?', id: parts[2] || '<unknown>' };
+    // 会话头点击: 展开/折叠 + 选中.
+    async function toggleSession(leafId) {
+      if (expandedSessions.has(leafId)) {
+        // 折叠.
+        expandedSessions.delete(leafId);
+        renderSidebar();
+        return;
+      }
+      // 展开 + 选中: 先标记展开, 再 fetch rounds (若缓存未命中), 最后选中叶子轮次.
+      expandedSessions.add(leafId);
+      selectedLeaf = leafId;
+      if (!sessionRounds.has(leafId)) {
+        renderSidebar(); // 立即显示 expanded 态 (round-list 显示 loading).
+        try {
+          const r = await fetch(`${API_NODES}/${leafId}/timeline?limit=${ROUNDS_PAGE}`, { cache: 'no-store' });
+          if (r.ok) {
+            const data = await r.json();
+            sessionRounds.set(leafId, data.records || []);
+          } else {
+            sessionRounds.set(leafId, []);
+          }
+        } catch (e) {
+          console.error(e);
+          sessionRounds.set(leafId, []);
+        }
+      }
+      renderSidebar();
+      // 选中叶子轮次 (在右侧渲染 timeline).
+      await selectRound(leafId);
     }
 
-    // messagePreview 已删除: sidebar 改为直接读后端返回的 r.preview 字段 (需求 6).
-    // 后端 RecordSummary.preview 在 list 时一次性提取, 前端无需重复解析 req_body.
+    // 选中某一轮: 在右侧 timeline 中定位 + 高亮.
+    // 若该轮已在当前 timeline 视窗 → 滚动 + 高亮 (不重新渲染).
+    // 否则 → 以该轮为锚重新拉 timeline(TIMELINE_PAGE) 渲染.
+    async function selectRound(nodeId) {
+      selectedRound = nodeId;
+      renderSidebar();
+      // 若该轮已在当前 timeline 中, 直接滚动 + 高亮.
+      const existing = timelineRecords.find(r => r.id === nodeId);
+      if (existing && selectedLeaf) {
+        highlightRound(nodeId);
+        return;
+      }
+      // 否则重新拉 timeline (以该轮为最末).
+      await loadTimeline(nodeId);
+    }
+
+    // 高亮 timeline 中某轮 (滚动 + 闪烁动画).
+    function highlightRound(nodeId) {
+      const el = document.querySelector(`#detail .tl-round[data-rid="${CSS.escape(nodeId)}"]`);
+      if (!el) return;
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      el.classList.remove('highlight');
+      // 强制 reflow 以重新触发动画.
+      void el.offsetWidth;
+      el.classList.add('highlight');
+    }
+
+    // session 摘要的 status 辅助 (与 record 的 statusText/statusClass 类似但字段不同).
+    function sessionStatusText(s) {
+      if (s.latest_error) return 'ERR';
+      if (s.latest_resp_status === 0) return '...';
+      return String(s.latest_resp_status);
+    }
+    function sessionStatusClass(s) {
+      if (s.latest_error) return 'status-err';
+      if (s.latest_resp_status === 0) return 'status-pending';
+      if (s.latest_resp_status >= 200 && s.latest_resp_status < 300) return 'status-ok';
+      if (s.latest_resp_status >= 400) return 'status-err';
+      return 'status-pending';
+    }
+
+    // ─── sidebar 渲染辅助 ──────────────────────────────────────────────────
 
     // provider 复合图标: 圆形彩色背景 + 首字母 + 协议角标.
     // 颜色: provider id 哈希到固定调色板 (低饱和度, 保证文字可读).
@@ -1146,61 +1379,67 @@
       })[c]);
     }
 
-    async function selectRecord(id) {
-      selectedId = id;
-      // 切换 record 时默认使用 parsed 视图 (可读性更好).
-      // parsed view 直接从 record.resp_parsed 读取 (由后端 StreamScan 累积),
-      // 不需要额外 lazy load — selectRecord 本身会 fetch /records/{id}?view=parsed.
-      detailView = 'parsed';
-      renderSidebar();
+    // ─── timeline 渲染 (右侧主区域) ──────────────────────────────────────
+    //
+    // timeline 是一组连续的轮次 (oldest-first), 每轮 = 该轮的 request bubbles + response.
+    // 用户选中会话叶子时, 拉 timeline(leaf, limit=TIMELINE_PAGE) 取最近 N 轮.
+    // 向上滚到顶时, 以 timelineOldest 的 parent 为起点 prepend 更早 N 轮 (保持滚动锚点).
+    //
+    // 渲染策略 (复用旧的 "结构 + 内容分离" 思路, 但作用于整个 timeline):
+    //   1. 整体重建: timeline 的 node id 序列变化 (选中新会话 / loadOlder / 切换 view) 时
+    //      全量重建 #detail DOM (含每轮的 .tl-round + request-pane + response-pane 骨架).
+    //   2. 增量更新: 自动刷新时若 node 序列不变, 仅更新各轮 response-pane 的 .resp-body
+    //      (流式渐进), 不触碰 request-pane (保留滚动 + 气泡展开状态).
+    //
+    // envelope 缓存: timelineEnvelopes (Map<node_id, envelope>) 按需填充 (首次渲染某轮时拉).
+    // 自动刷新只刷新 timeline 末尾几轮的 envelope.
+
+    let lastTimelineFingerprint = '';
+
+    // 以 nodeId 为最末轮, 拉 timeline(limit=TIMELINE_PAGE) 并全量渲染.
+    // 用于: 选中会话叶子 / 点击不在视窗内的轮次.
+    async function loadTimeline(nodeId) {
       try {
-        // 直接请求 parsed view (一次请求拿到 record + parsed_request + parsed_response).
-        const r = await fetch(`${API_RECORDS}/${id}?view=parsed`, { cache: 'no-store' });
-        if (!r.ok) throw new Error('HTTP ' + r.status);
-        const env = await r.json();
-        detailRecord = env.record;
-        parsedCache.set(id, env);
-        renderDetail();
+        const r = await fetch(`${API_NODES}/${nodeId}/timeline?limit=${TIMELINE_PAGE}`, { cache: 'no-store' });
+        if (!r.ok) {
+          if (r.status === 404) {
+            clearTimeline();
+            document.getElementById('detail').innerHTML =
+              '<div class="empty">Session no longer exists</div>';
+          }
+          return;
+        }
+        const data = await r.json();
+        timelineRecords = data.records || [];
+        timelineOldest = timelineRecords.length > 0 ? timelineRecords[0].id : null;
+        // reachedTop 可从响应长度直接推导: 返回 < limit 说明 parent 链已耗尽 (无更早轮次).
+        timelineReachedTop = timelineRecords.length < TIMELINE_PAGE;
+        // 清空 envelope 缓存并预拉所有轮次的 envelope.
+        timelineEnvelopes.clear();
+        await Promise.all(timelineRecords.map(rec => fetchTimelineEnvelope(rec.id)));
+        detailView = 'parsed';
+        renderTimeline(true);
+        // 选中会话叶子 → 滚到最末轮 (最新, IM 风格).
+        scrollTimelineToBottomForce();
       } catch (e) {
         console.error(e);
         document.getElementById('detail').innerHTML =
-          `<div class="empty status-err">Failed to load record: ${escapeHtml(e.message)}</div>`;
+          `<div class="empty status-err">Failed to load timeline: ${escapeHtml(e.message)}</div>`;
       }
     }
 
-    // F5: 切换详情视图 (raw / parsed). 切到 parsed 时按需懒加载.
-    async function setDetailView(mode) {
-      detailView = mode;
-      document.querySelectorAll('.view-toggle button').forEach(b => {
-        b.classList.toggle('active', b.dataset.view === mode);
-      });
-      if (mode === 'parsed' && selectedId && !parsedCache.has(selectedId)) {
-        // 先渲染一个 loading 占位, 避免用户在 fetch 期间看到空白.
-        // 同时清指纹, 让 fetch 完成后 renderDetail 强制结构重建.
-        lastStructureFp = '';
-        lastRequestFp = '';
-        lastResponseFp = '';
-        document.getElementById('detail').innerHTML =
-          '<div class="empty">Loading parsed view…</div>';
-        await fetchParsed(selectedId);
-      }
-      renderDetail();
-    }
-
-    async function fetchParsed(id) {
+    // 拉单条 record 的 parsed envelope, 缓存到 timelineEnvelopes.
+    async function fetchTimelineEnvelope(nodeId) {
       try {
-        const r = await fetch(`${API_RECORDS}/${id}?view=parsed`, { cache: 'no-store' });
+        const r = await fetch(`${API_RECORDS}/${nodeId}?view=parsed`, { cache: 'no-store' });
         if (!r.ok) throw new Error('HTTP ' + r.status);
         const env = await r.json();
-        parsedCache.set(id, env);
-        // 用 envelope 里的 record 同步 detailRecord, 保证 mock 列表来自权威后端.
-        if (env.record) detailRecord = env.record;
+        timelineEnvelopes.set(nodeId, env);
         return env;
       } catch (e) {
         console.error(e);
-        // 缓存一个 error envelope 让后续切换不再重试.
-        parsedCache.set(id, {
-          record: detailRecord,
+        timelineEnvelopes.set(nodeId, {
+          record: null,
           parsed_request: null,
           parsed_response: null,
           parse_error: String(e.message || e),
@@ -1209,134 +1448,268 @@
       }
     }
 
-    // 统一的 detail 渲染入口. 根据 detailView 选择 raw 或 parsed 子路径.
-    //
-    // 滚动保护 (需求 1) + 展开状态保留 (B1/B2 根治):
-    // 自动刷新期间 (尤其流式响应累积) 若每次都整树 innerHTML 重建, 会重置 request-pane
-    // 的 scrollTop 并丢失用户对气泡的展开状态. 根治策略是分离三部分更新:
-    //   1. 结构 (header + request-pane + response-pane 骨架): 只在 selectedId / view 切换时重建.
-    //   2. request 内容 (chat bubbles): 只在 parsed_request / parse_error / hitN 变化时重建.
-    //      流式期间 parsed_request 通常稳定 → request-pane 不重建 → 滚动/展开状态保留.
-    //   3. response 内容 (打字框): 每次 parsed_response 变化时增量更新 (仅替换 .resp-body
-    //      的 innerHTML, 不触碰 request-pane). 流式期间频繁更新, 但影响范围限于 response-pane.
-    //
-    // 三段式 fingerprint 分别对应三层; 哪段没变就跳过哪段.
-    let lastStructureFp = '';
-    let lastRequestFp = '';
-    let lastResponseFp = '';
-    let lastDetailSelectedId = null;
-    function renderDetail() {
-      if (!detailRecord) {
-        lastStructureFp = '';
-        lastRequestFp = '';
-        lastResponseFp = '';
-        lastDetailSelectedId = null;
-        document.getElementById('detail').innerHTML =
-          '<div class="empty">Select a record on the left</div>';
-        return;
-      }
-      const r = detailRecord;
-      const env = parsedCache.get(r.id) || {};
+    function clearTimeline() {
+      timelineRecords = [];
+      timelineEnvelopes.clear();
+      timelineOldest = null;
+      timelineReachedTop = false;
+      selectedLeaf = null;
+      selectedRound = null;
+      lastTimelineFingerprint = '';
+      document.getElementById('detail').innerHTML =
+        '<div class="empty">Select a session on the left</div>';
+    }
 
-      const selectedChanged = lastDetailSelectedId !== r.id;
-      // 结构 fingerprint: selectedId + view + method + path + hitN (这些决定 header / 骨架).
-      const structureFp = [r.id, detailView, r.method, r.path, (r.redactions || []).length].join('|');
-      // request fingerprint: parsed_request / parse_error / req_body 长度 (流式期间稳定).
-      const requestFp = [
-        env.parse_error || '',
-        env.parsed_request ? JSON.stringify(env.parsed_request) : 'no-req',
-        r.req_body.length,
-        (r.redactions || []).length, // hitN 变化时 mock 高亮需重绘
-      ].join('|');
-      // response fingerprint: parsed_response / resp_status / resp_body / resp_complete / error
-      // (流式期间 parsed_response 累积 → 每次变化都更新打字框).
-      const responseFp = [
-        r.resp_status,
-        r.elapsed_ms,
-        r.error || '',
-        r.resp_complete ? '1' : '0',
-        r.streamed ? '1' : '0',
-        env.parsed_response ? JSON.stringify(env.parsed_response) : 'no-resp',
-        r.resp_body.length,
-      ].join('|');
-
-      // 记录选中变化, 后面用于决定是否滚到底.
-      lastDetailSelectedId = r.id;
-
-      // 决定要更新哪几层.
-      const structureDirty = selectedChanged || structureFp !== lastStructureFp;
-      const requestDirty = structureDirty || requestFp !== lastRequestFp;
-      const responseDirty = structureDirty || responseFp !== lastResponseFp;
-
-      if (!structureDirty && !requestDirty && !responseDirty) {
-        // 三层都没变, 完全跳过 (最常见: 自动刷新时 record 静止).
-        return;
-      }
-
-      // 切换 record / view 时, 结构层重建一次 (含 request-pane / response-pane 骨架),
-      // 同时 request 和 response 内容都重新填充.
-      if (structureDirty) {
-        const toggle = `
-          <span class="view-toggle">
-            <button type="button" data-view="raw" class="${detailView === 'raw' ? 'active' : ''}" onclick="setDetailView('raw')">raw</button>
-            <button type="button" data-view="parsed" class="${detailView === 'parsed' ? 'active' : ''}" onclick="setDetailView('parsed')">parsed</button>
-          </span>
-        `;
-        // raw / parsed 共用同一结构骨架 (差异在 pane 内容).
-        renderDetailStructure(r, toggle);
-      }
-
-      // 仅在结构 / request 内容变化时重绘 request-pane (保留展开状态 / 滚动位置的反义词:
-      // 此时 DOM 被替换, 状态会丢失 — 但这只在 request 真正变化时发生, 不是自动刷新的常态).
-      if (requestDirty) {
-        if (detailView === 'parsed') {
-          updateParsedRequestPane(r, env);
-        } else {
-          updateRawRequestPane(r);
+    // 惰性加载: 向上滚到顶时 prepend 更早的轮次. 保持滚动锚点.
+    async function loadOlder() {
+      if (loadingOlder || timelineReachedTop || !timelineOldest) return;
+      loadingOlder = true;
+      const pane = document.querySelector('#detail');
+      const oldScrollHeight = pane ? pane.scrollHeight : 0;
+      const oldScrollTop = pane ? pane.scrollTop : 0;
+      try {
+        // 以 timelineOldest 为最末, 拉 TIMELINE_PAGE 轮. 返回 oldest-first, 最后一个是当前 oldest.
+        // 我们要 prepend 排除当前 oldest 的前 (limit-1) 条.
+        const r = await fetch(`${API_NODES}/${timelineOldest}/timeline?limit=${TIMELINE_PAGE + 1}`, { cache: 'no-store' });
+        if (!r.ok) {
+          timelineReachedTop = true;
+          updateReachedTopHint();
+          return;
         }
-      }
-
-      // response-pane: 只更新 .resp-body 和 .resp-header 内容, 不动 DOM 结构.
-      // 这样即便每 3s 都在更新, request-pane 也完全不受影响.
-      if (responseDirty) {
-        if (detailView === 'parsed') {
-          updateParsedResponsePane(r, env);
-        } else {
-          updateRawResponsePane(r);
+        const data = await r.json();
+        const all = data.records || [];
+        // 去掉最后一个 (== 当前 timelineOldest, 已在视窗内), 保留前面的作为 prepend.
+        const older = all.slice(0, Math.max(0, all.length - 1));
+        // reachedTop 从响应长度推导: 请求 limit+1 条但返回 ≤ limit 条 → parent 链已耗尽.
+        // (注意即使 older 为空, 也用 all.length <= TIMELINE_PAGE 判断, 避免 limit=1 的边界).
+        timelineReachedTop = all.length <= TIMELINE_PAGE;
+        if (older.length === 0) {
+          updateReachedTopHint();
+          return;
         }
-      }
-
-      lastStructureFp = structureFp;
-      lastRequestFp = requestFp;
-      lastResponseFp = responseFp;
-
-      // 需求 4: 用户主动切换 record (selectedChanged) 时, request-pane 初始滚到最下方
-      // (IM 风格: 最新消息在底部). 自动刷新 (selectedChanged=false) 保持当前位置.
-      // 仅在 parsed view 滚 (raw view 的 request 是 headers+body, 无 "最新消息" 语义).
-      if (selectedChanged && detailView === 'parsed') {
-        const pane = document.querySelector('#detail .request-pane');
-        if (pane) pane.scrollTop = pane.scrollHeight;
+        // 预拉 older 的 envelope.
+        await Promise.all(older.map(rec => fetchTimelineEnvelope(rec.id)));
+        // prepend: 把 older 放到 timelineRecords 前面.
+        timelineRecords = older.concat(timelineRecords);
+        timelineOldest = older[0].id;
+        renderTimeline(true);
+        // 保持滚动锚点: 加载后把 scrollTop 加上新增的高度差.
+        const newPane = document.querySelector('#detail');
+        if (newPane) {
+          const delta = newPane.scrollHeight - oldScrollHeight;
+          newPane.scrollTop = oldScrollTop + delta;
+        }
+      } catch (e) {
+        console.error(e);
+        setStatus('load older failed', 'status-err');
+      } finally {
+        loadingOlder = false;
       }
     }
 
-    // ─── 结构层 (仅在 selectedId / view 变化时重建) ────────────────────────
-
-    function buildRespBadges(r) {
-      // m9: error message 截断, 避免长 error 撑破 header 布局.
-      const errText = r.error ? (r.error.length > 60 ? r.error.slice(0, 60) + '…' : r.error) : '';
-      return [
-        r.streamed ? '<span class="badge badge-stream">streamed</span>' : '',
-        errText ? '<span class="badge badge-err">' + escapeHtml(errText) + '</span>' : '',
-      ].join('');
+    // 渲染 timeline. force=true 时强制重建结构 (选中新会话 / loadOlder / view 切换).
+    // 自动刷新时 force=false, 走增量更新 (若 node 序列一致, 只刷 response body).
+    function renderTimeline(force) {
+      const el = document.getElementById('detail');
+      if (timelineRecords.length === 0) {
+        lastTimelineFingerprint = '';
+        el.innerHTML = '<div class="empty">No rounds in this session</div>';
+        return;
+      }
+      // 指纹: node id 序列 + view + selectedRound + reachedTop.
+      const fp = detailView + '|' + selectedRound + '|' + timelineReachedTop + '|' +
+        timelineRecords.map(r => r.id).join(',');
+      if (!force && fp === lastTimelineFingerprint) {
+        // 增量更新各轮 response body (流式渐进), 不动 DOM 结构 → scrollTop 保持.
+        updateTimelineResponses();
+        return;
+      }
+      lastTimelineFingerprint = fp;
+      // 全量重建 (结构变化: 新会话 / loadOlder / view 切换).
+      el.innerHTML = renderTimelineHtml();
+      bindTimelineScroll();
+      applyBubbleCollapse();
+      // 滚动由调用方决定 (loadTimeline 滚到底, loadOlder 保持锚点, setDetailView 保持位置).
+      // 这里仅在首次渲染 (selectedRound 在末尾) 时作为保底滚到底.
     }
 
-    // status 行模板 (SSOT): 被 renderDetailStructure 和 updateRespHeader 复用.
+    // 显式滚到 timeline 底部 (最新一轮). loadTimeline 完成后调用.
+    function scrollTimelineToBottomForce() {
+      const el = document.getElementById('detail');
+      if (el) el.scrollTop = el.scrollHeight;
+    }
+
+    // 渲染整个 timeline 的 HTML (每轮 = request bubbles + response 打字框).
+    function renderTimelineHtml() {
+      const toggle = `
+        <span class="view-toggle">
+          <button type="button" data-view="raw" class="${detailView === 'raw' ? 'active' : ''}" onclick="setDetailView('raw')">raw</button>
+          <button type="button" data-view="parsed" class="${detailView === 'parsed' ? 'active' : ''}" onclick="setDetailView('parsed')">parsed</button>
+        </span>
+      `;
+      let html = `<div class="detail-header">
+        <h3>Timeline ${toggle} <span class="meta" style="font-weight:normal;">(${timelineRecords.length} rounds)</span></h3>`;
+      if (timelineReachedTop) {
+        html += `<div class="tl-top-hint" style="font-size:11px;">已经到顶了</div>`;
+      } else {
+        html += `<div class="tl-top-hint" style="font-size:11px;">向上滚动加载更早的轮次</div>`;
+      }
+      html += `</div>`;
+      // 每轮.
+      html += timelineRecords.map((r, idx) => renderTimelineRound(r, idx)).join('');
+      // 悬浮导航按钮.
+      html += `
+        <div class="scroll-nav">
+          <button type="button" id="scroll-top-btn" title="回到顶部" onclick="scrollTimelineToTop()">↑</button>
+          <button type="button" id="scroll-bottom-btn" title="回到底部" onclick="scrollTimelineToBottom()">↓</button>
+        </div>
+      `;
+      return html;
+    }
+
+    // 渲染单轮 (request bubbles + response 打字框).
+    function renderTimelineRound(r, idx) {
+      const env = timelineEnvelopes.get(r.id) || {};
+      const num = idx + 1;
+      const roundCls = (r.id === selectedRound) ? 'tl-round highlight' : 'tl-round';
+      let inner = '';
+      // header.
+      inner += `<div class="tl-round-header">
+        <span class="tl-meta">
+          <span>#${num}</span>
+          <span>${escapeHtml(formatTime(r.created_at))}</span>
+          <span class="${statusClass(r)}">${escapeHtml(statusText(r))}</span>
+          <span class="meta">${r.elapsed_ms}ms</span>
+          ${r.streamed ? '<span class="badge badge-stream">streamed</span>' : ''}
+        </span>
+      </div>`;
+      // request-pane (chat bubbles).
+      inner += `<div class="request-pane" data-rid="${escapeHtml(r.id)}">`;
+      if (detailView === 'parsed') {
+        const reqJson = env.parsed_request || null;
+        const redactions = normalizeRedactions(r.redactions);
+        if (env.parse_error) {
+          inner += `<div class="banner">Parsed view unavailable: ${escapeHtml(env.parse_error)}. Falling back to raw body.</div>`;
+        }
+        if (reqJson) {
+          inner += renderChatRequest(reqJson, redactions);
+        } else if (env.record) {
+          inner += `<pre>${escapeHtml(env.record.req_body || '<empty>')}</pre>`;
+        }
+      } else if (env.record) {
+        inner += `<pre>${escapeHtml(formatHeaders(env.record.req_headers))}</pre>`;
+        inner += `<pre>${escapeHtml(env.record.req_body || '<empty>')}</pre>`;
+      }
+      inner += `</div>`;
+      // response-pane (打字框).
+      inner += `<div class="response-pane" data-rid="${escapeHtml(r.id)}">`;
+      inner += `<div class="resp-header"><span>Response</span><span class="resp-status">${renderStatusLine(r)}</span></div>`;
+      inner += `<div class="resp-body">${renderTimelineResponseBody(r, env)}</div>`;
+      inner += `</div>`;
+      return `<div class="${roundCls}" data-rid="${escapeHtml(r.id)}">${inner}</div>`;
+    }
+
+    // 渲染单轮 response body (parsed / raw).
+    function renderTimelineResponseBody(r, env) {
+      if (detailView === 'parsed') {
+        const respJson = env.parsed_response || null;
+        const redactions = normalizeRedactions(r.redactions);
+        if (respJson) {
+          return renderResponseText(respJson, redactions);
+        } else if (r.streamed && !r.resp_complete) {
+          return '<div class="banner">Streaming in progress…</div>';
+        } else if (r.streamed && (!env.record || !env.record.resp_body)) {
+          return '<div class="banner">Parsed view not available for this streamed response.</div>';
+        } else if (env.record) {
+          return escapeHtml(env.record.resp_body || '<empty>');
+        }
+        return '<empty>';
+      }
+      // raw.
+      if (env.record) {
+        const headers = formatHeaders(env.record.resp_headers);
+        const body = r.streamed
+          ? 'Raw bytes are not retained for streamed responses.'
+          : (env.record.resp_body || '<empty>');
+        return `${escapeHtml(headers)}\n${escapeHtml(body)}`;
+      }
+      return '<empty>';
+    }
+
+    // 增量更新各轮 response body (自动刷新, node 序列不变时).
+    function updateTimelineResponses() {
+      for (const r of timelineRecords) {
+        const env = timelineEnvelopes.get(r.id);
+        if (!env) continue;
+        const bodyEl = document.querySelector(`#detail .response-pane[data-rid="${CSS.escape(r.id)}"] .resp-body`);
+        if (bodyEl) {
+          const newBody = renderTimelineResponseBody(r, env);
+          if (bodyEl.innerHTML !== newBody) bodyEl.innerHTML = newBody;
+        }
+        const statusEl = document.querySelector(`#detail .response-pane[data-rid="${CSS.escape(r.id)}"] .resp-status`);
+        if (statusEl) statusEl.innerHTML = renderStatusLine(r);
+      }
+      updateScrollNavVisibility();
+    }
+
+    // 更新 "已经到顶了" 提示 (loadOlder 后调用).
+    function updateReachedTopHint() {
+      const hint = document.querySelector('#detail .tl-top-hint');
+      if (hint) {
+        hint.textContent = timelineReachedTop ? '已经到顶了' : '向上滚动加载更早的轮次';
+      }
+    }
+
+    // 绑定 timeline 容器的滚动事件 (检测到顶 → loadOlder; 更新悬浮按钮可见性).
+    // 只绑定一次: flag 防止每次 renderTimeline(true) 累加新 listener.
+    let scrollBound = false;
+    function bindTimelineScroll() {
+      const el = document.getElementById('detail');
+      if (!el || scrollBound) return;
+      scrollBound = true;
+      el.addEventListener('scroll', () => {
+        // 到顶触发 loadOlder.
+        if (el.scrollTop < 10 && !timelineReachedTop && !loadingOlder) {
+          loadOlder();
+        }
+        updateScrollNavVisibility();
+      });
+      updateScrollNavVisibility();
+    }
+
+    function updateScrollNavVisibility() {
+      const el = document.getElementById('detail');
+      const topBtn = document.getElementById('scroll-top-btn');
+      const bottomBtn = document.getElementById('scroll-bottom-btn');
+      if (!el) return;
+      if (topBtn) topBtn.hidden = el.scrollTop < 20;
+      if (bottomBtn) bottomBtn.hidden = (el.scrollHeight - el.scrollTop - el.clientHeight) < 20;
+    }
+
+    function scrollTimelineToTop() {
+      const el = document.getElementById('detail');
+      if (el) el.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+    function scrollTimelineToBottom() {
+      const el = document.getElementById('detail');
+      if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+    }
+
+    // F5: 切换 raw / parsed 视图. 切换时全量重建 timeline.
+    function setDetailView(mode) {
+      detailView = mode;
+      renderTimeline(true);
+    }
+
+    // ─── detail 渲染辅助 (被 timeline 复用) ────────────────────────────────
+
+    // status 行模板 (SSOT).
     function renderStatusLine(r) {
       return `status: <span class="${statusClass(r)}">${r.resp_status === 0 ? '(pending)' : escapeHtml(r.resp_status)}</span> · ${escapeHtml(r.elapsed_ms)}ms`;
     }
 
     // redactions 数组归一化: 后端返回 [[mock, secret_id], ...], 前端统一转为
-    // [{mock, secretId}], 过滤掉空 mock. 被 request / response 两处 pane 更新复用.
+    // [{mock, secretId}], 过滤掉空 mock.
     function normalizeRedactions(redactions) {
       return (redactions || []).map(pair => ({
         mock: String(pair[0] || ''),
@@ -1344,94 +1717,9 @@
       })).filter(x => x.mock.length > 0);
     }
 
-    function renderDetailHeader(r, toggle) {
-      const hitN = (r.redactions || []).length;
-      const hitBadge = hitN > 0 ? `<span class="badge-hit">${hitN} redacted</span>` : '';
-      return `<div class="detail-header">
-        <h3>Request ${toggle}</h3>
-        <div><b>${escapeHtml(r.method)}</b> ${escapeHtml(r.path)} ${hitBadge}</div>
-      </div>`;
-    }
-
-    // 结构层骨架 (raw / parsed 共用同一模板, 差异只在 request-pane / resp-body 内容).
-    function renderDetailStructure(r, toggle) {
-      const el = document.getElementById('detail');
-      const badges = buildRespBadges(r);
-      el.innerHTML = `
-        ${renderDetailHeader(r, toggle)}
-        <div class="request-pane"></div>
-        <div class="response-pane">
-          <div class="resp-header">
-            <span>Response ${badges}</span>
-            <span class="resp-status">${renderStatusLine(r)}</span>
-          </div>
-          <div class="resp-body"></div>
-        </div>
-      `;
-    }
-
-    // ─── request-pane 内容更新 ────────────────────────────────────────────
-
-    function updateRawRequestPane(r) {
-      const pane = document.querySelector('#detail .request-pane');
-      if (!pane) return;
-      pane.innerHTML = `
-        <pre>${escapeHtml(formatHeaders(r.req_headers))}</pre>
-        <pre>${escapeHtml(r.req_body || '<empty>')}</pre>
-      `;
-    }
-
-    function updateParsedRequestPane(r, env) {
-      const pane = document.querySelector('#detail .request-pane');
-      if (!pane) return;
-      const parseError = env.parse_error || null;
-      const reqJson = env.parsed_request || null;
-      const redactions = normalizeRedactions(r.redactions);
-      let html = '';
-      if (parseError) {
-        html += `<div class="banner">Parsed view unavailable: ${escapeHtml(parseError)}. Falling back to raw body below.</div>`;
-      }
-      if (reqJson) {
-        html += renderChatRequest(reqJson, redactions);
-      } else {
-        html += `<pre>${escapeHtml(r.req_body || '<empty>')}</pre>`;
-      }
-      pane.innerHTML = html;
-      applyBubbleCollapse();
-    }
-
-    // ─── response-pane 内容更新 (只动 .resp-header 的 status 和 .resp-body) ──
-
-    // response header 的 status 行更新 (raw / parsed 共用, 流式响应状态变化时刷新).
-    function updateRespHeader(r) {
-      const headerStatus = document.querySelector('#detail .resp-header .resp-status');
-      if (headerStatus) headerStatus.innerHTML = renderStatusLine(r);
-    }
-
-    function updateRawResponsePane(r) {
-      updateRespHeader(r);
-      const body = document.querySelector('#detail .resp-body');
-      if (!body) return;
-      body.innerHTML = `${escapeHtml(formatHeaders(r.resp_headers))}\n${r.streamed
-        ? 'Raw bytes are not retained for streamed responses. Use the parsed view to see accumulated content.'
-        : escapeHtml(r.resp_body || '<empty>')}`;
-    }
-
-    function updateParsedResponsePane(r, env) {
-      updateRespHeader(r);
-      const body = document.querySelector('#detail .resp-body');
-      if (!body) return;
-      const respJson = env.parsed_response || null;
-      const redactions = normalizeRedactions(r.redactions);
-      if (respJson) {
-        body.innerHTML = renderResponseText(respJson, redactions);
-      } else if (r.streamed && !r.resp_complete) {
-        body.innerHTML = '<div class="banner">Streaming in progress…</div>';
-      } else if (r.streamed && !r.resp_body) {
-        body.innerHTML = '<div class="banner">Parsed view not available for this streamed response (codec does not support this protocol). Raw bytes are not retained.</div>';
-      } else {
-        body.innerHTML = escapeHtml(r.resp_body || '<empty>');
-      }
+    function formatHeaders(hs) {
+      if (!hs || hs.length === 0) return '(no headers)';
+      return hs.map(([k, v]) => k + ': ' + v).join('\n');
     }
 
     // 把 OpenAI / Anthropic 的 tool_call / tool_use 块格式化为可读文本.
@@ -1703,11 +1991,6 @@
         text = text.split(escapedMock).join(mark);
       }
       return text;
-    }
-
-    function formatHeaders(hs) {
-      if (!hs || hs.length === 0) return '(no headers)';
-      return hs.map(([k, v]) => k + ': ' + v).join('\n');
     }
 
     // ─── shared: stats + source badge ─────────────────────────────────────

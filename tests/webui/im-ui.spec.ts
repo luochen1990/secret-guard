@@ -1,13 +1,16 @@
 /**
- * IM 风格 WebUI 回归测试 for secret-guard.
+ * IM 风格 WebUI 回归测试 for secret-guard (会话折叠 + timeline 版本).
  *
- * 覆盖 PR #12 的 7 项需求, 每项至少一个断言:
- *   1. 滚动重置修复 (三段式 fingerprint): 自动刷新期间 scrollTop + bubble 展开状态保持.
+ * 适配会话两级树 sidebar (session-item → round-item) + timeline 右侧对话流.
+ * 每条 sendChat 创建一个独立的单轮次会话 (无父上下文 → 各自成为 root+leaf).
+ *
+ * 覆盖原始 7 项需求 (在新的会话/timeline 结构下):
+ *   1. 滚动重置修复: 自动刷新期间 timeline 内 scrollTop + bubble 展开状态保持.
  *   2. 三级展示气泡: 折叠 → 展开 → 弹框全文.
  *   3. response 打字框: 固定底部 + 独立滚动 + 不参与 request 滚动.
- *   4. request 初始滚到底: 切换 record 时 request-pane 自动滚到底.
+ *   4. timeline 选中轮次时 request-pane 初始滚到底.
  *   5. 气泡颜色 + sender icon 分类.
- *   6. sidebar preview 提取 (首条 user msg).
+ *   6. sidebar (session-item) preview 提取 (首条 user msg).
  *   7. sidebar model 字段显示.
  *
  * 所有测试共享一个 browser context, 按声明顺序执行 (workers=1).
@@ -37,22 +40,26 @@ async function sendChat(
 }
 
 /**
- * 等待 sidebar 出现包含指定 preview 子串的 record, 返回其 id.
+ * 等待 sidebar 出现包含指定 preview 子串的会话 (session-item), 返回其 leaf_id.
  *
  * 用 Playwright locator 的 auto-retrying polling (不 reload 全页),
- * 依赖 WebUI 自身的 3s 自动刷新拉到新 record. 单测间状态隔离:
- * 每个测试用唯一 marker 子串, 不依赖其他测试创建的 record.
+ * 依赖 WebUI 自身的 3s 自动刷新拉到新会话. 单测间状态隔离:
+ * 每个测试用唯一 marker 子串, 不依赖其他测试创建的会话.
  */
-async function findRecordIdByPreview(page: Page, previewSubstr: string): Promise<string> {
-  const item = page.locator(".record-item", { hasText: previewSubstr }).first();
+async function findSessionLeafByPreview(page: Page, previewSubstr: string): Promise<string> {
+  const item = page.locator(".session-item", { hasText: previewSubstr }).first();
   await item.waitFor({ state: "visible", timeout: 5000 });
-  const rid = await item.getAttribute("data-id");
-  if (!rid) throw new Error(`record with preview '${previewSubstr}' has no data-id`);
-  return rid;
+  const leaf = await item.getAttribute("data-leaf");
+  if (!leaf) throw new Error(`session with preview '${previewSubstr}' has no data-leaf`);
+  return leaf;
 }
 
-async function clickRecordById(page: Page, rid: string): Promise<void> {
-  await page.locator(`.record-item[data-id="${rid}"]`).click();
+/**
+ * 点击会话展开 + 加载 timeline (单轮次会话: 点击会话即选中该轮次).
+ * 等待右侧 timeline 的 request-pane 出现.
+ */
+async function clickSessionByLeaf(page: Page, leaf: string): Promise<void> {
+  await page.locator(`.session-item[data-leaf="${leaf}"]`).click();
   await page.waitForSelector("#detail .request-pane", { timeout: 3000 });
 }
 
@@ -75,29 +82,26 @@ async function expectBubbleClass(
 
 // ─── 测试用例 ────────────────────────────────────────────────────────────
 
-test.describe("IM 风格 WebUI 回归", () => {
+test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
   test.beforeEach(async ({ page }) => {
     await page.goto("/");
     await page.waitForLoadState("networkidle");
     await page.waitForTimeout(500);
   });
 
-  test("需求 6+7: sidebar 显示首条 user msg 作为 preview, model 名在 line2", async ({
+  test("需求 6+7: sidebar 会话显示首条 user msg 作为 preview, model 名在 line2", async ({
     page,
   }) => {
     await sendChat(page, [
       { role: "system", content: "system prompt" },
       { role: "user", content: "Hello unique-preview-text-12345" },
     ]);
-    // locator 自动 polling 直到 sidebar 出现该 record (依赖 WebUI 3s 自动刷新).
-    const previews = await page
-      .locator(".record-item .ri-line1")
-      .evaluateAll((els) => els.map((e) => e.textContent ?? ""));
-    // 注: evaluateAll 不 auto-retry, 用 findRecordIdByPreview 确保 record 已落 sidebar.
-    const rid = await findRecordIdByPreview(page, "Hello unique-preview-text-12345");
-    expect(rid).toBeTruthy();
+    // locator 自动 polling 直到 sidebar 出现该会话 (依赖 WebUI 3s 自动刷新).
+    const leaf = await findSessionLeafByPreview(page, "Hello unique-preview-text-12345");
+    expect(leaf).toBeTruthy();
 
-    const metas = await page.locator(".record-item .ri-line2").allTextContents();
+    // session-item line2 应包含 model 名.
+    const metas = await page.locator(".session-item .ri-line2").allTextContents();
     expect(metas.some((m) => m.includes("test-model-abc"))).toBe(true);
   });
 
@@ -107,11 +111,11 @@ test.describe("IM 风格 WebUI 回归", () => {
       { role: "user", content: "sender-icon-marker" },
     ]);
 
-    const rid = await findRecordIdByPreview(page, "sender-icon-marker");
-    await clickRecordById(page, rid);
+    const leaf = await findSessionLeafByPreview(page, "sender-icon-marker");
+    await clickSessionByLeaf(page, leaf);
     await page.waitForTimeout(500);
 
-    // sender icons.
+    // sender icons (timeline 内).
     const senderClasses = await page
       .locator("#detail .sender-icon")
       .evaluateAll((els) => els.map((e) => e.className.replace("sender-icon ", "")));
@@ -134,8 +138,8 @@ test.describe("IM 风格 WebUI 回归", () => {
       { role: "user", content: "three-tier-test-marker" },
     ]);
 
-    const rid = await findRecordIdByPreview(page, "three-tier-test-marker");
-    await clickRecordById(page, rid);
+    const leaf = await findSessionLeafByPreview(page, "three-tier-test-marker");
+    await clickSessionByLeaf(page, leaf);
     // 等 applyBubbleCollapse 异步测量 + 注入 collapsed.
     await page.waitForTimeout(800);
 
@@ -171,11 +175,11 @@ test.describe("IM 风格 WebUI 回归", () => {
   test("需求 3: response 打字框固定底部 + 独立滚动", async ({ page }) => {
     await sendChat(page, [{ role: "user", content: "give me a long response" }]);
 
-    const rid = await findRecordIdByPreview(page, "give me a long response");
-    await clickRecordById(page, rid);
+    const leaf = await findSessionLeafByPreview(page, "give me a long response");
+    await clickSessionByLeaf(page, leaf);
     await page.waitForTimeout(500);
 
-    // 两个 pane 都应存在.
+    // timeline 每轮都有 request-pane + response-pane.
     await expect(page.locator("#detail .request-pane")).toHaveCount(1);
     await expect(page.locator("#detail .response-pane")).toHaveCount(1);
 
@@ -190,9 +194,9 @@ test.describe("IM 风格 WebUI 回归", () => {
     const respText = await page.locator("#detail .resp-body").textContent();
     expect(respText!.length).toBeGreaterThan(10);
 
-    // 滚动 request-pane 不应该影响 response-pane 的 scrollTop.
+    // 滚动 #detail (timeline 容器) 不应该影响 response-pane 的 scrollTop.
     await page
-      .locator("#detail .request-pane")
+      .locator("#detail")
       .evaluate((el) => (el.scrollTop = 50));
     await page.waitForTimeout(200);
     const respScroll = await page
@@ -204,7 +208,7 @@ test.describe("IM 风格 WebUI 回归", () => {
   test("需求 1 (B1/B2 根治): 自动刷新期间 scrollTop + bubble 展开状态保持", async ({
     page,
   }) => {
-    // 多轮对话 + 长 system, 让 request-pane 有足够滚动空间.
+    // 多轮对话 + 长 system, 让 timeline 有足够滚动空间.
     const longSys = "You are a coding assistant. ".repeat(15);
     await sendChat(page, [
       { role: "system", content: longSys },
@@ -215,8 +219,8 @@ test.describe("IM 风格 WebUI 回归", () => {
       { role: "user", content: "Thanks" },
     ]);
 
-    const rid = await findRecordIdByPreview(page, "What is 1+1");
-    await clickRecordById(page, rid);
+    const leaf = await findSessionLeafByPreview(page, "What is 1+1");
+    await clickSessionByLeaf(page, leaf);
     await page.waitForTimeout(500);
 
     // 1. 展开 system bubble.
@@ -225,16 +229,16 @@ test.describe("IM 风格 WebUI 回归", () => {
     if ((await toggle.count()) > 0) await toggle.click();
     await page.waitForTimeout(300);
 
-    // 2. 设置 request-pane scrollTop 到中间.
+    // 2. 设置 #detail (timeline 容器) scrollTop 到中间.
     const canScroll = await page
-      .locator("#detail .request-pane")
+      .locator("#detail")
       .evaluate((el) => el.scrollHeight > el.clientHeight);
     if (!canScroll) {
       test.skip(true, "content fits viewport");
       return; // test.skip 会抛, 这行仅为 type-check 之后的 narrowing.
     }
 
-    const expected = await page.locator("#detail .request-pane").evaluate(
+    const expected = await page.locator("#detail").evaluate(
       (el) => {
         el.scrollTop = Math.floor((el.scrollHeight - el.clientHeight) / 2);
         return el.scrollTop;
@@ -247,7 +251,7 @@ test.describe("IM 风格 WebUI 回归", () => {
 
     // 4. 验证 scrollTop 保持.
     const actual = await page
-      .locator("#detail .request-pane")
+      .locator("#detail")
       .evaluate((el) => el.scrollTop);
     expect(Math.abs(actual - expected)).toBeLessThan(10);
 
@@ -256,13 +260,14 @@ test.describe("IM 风格 WebUI 回归", () => {
     expect(classes).toContain("expanded");
   });
 
-  test("需求 4: 切换 record 时 request-pane 初始滚到底", async ({ page }) => {
-    // 复用上一个测试创建的多轮对话 record.
-    const rid = await findRecordIdByPreview(page, "What is 1+1");
-    await clickRecordById(page, rid);
+  test("需求 4: 选中会话时 timeline 初始滚到底", async ({ page }) => {
+    // 复用上一个测试创建的多轮对话会话.
+    const leaf = await findSessionLeafByPreview(page, "What is 1+1");
+    // 重新点击会话 (先折叠再展开) 触发 timeline 重新加载 + 初始滚到底.
+    await clickSessionByLeaf(page, leaf);
     await page.waitForTimeout(500);
 
-    const scrollInfo = await page.locator("#detail .request-pane").evaluate(
+    const scrollInfo = await page.locator("#detail").evaluate(
       (el) => ({
         scrollTop: el.scrollTop,
         scrollHeight: el.scrollHeight,

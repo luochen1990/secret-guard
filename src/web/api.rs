@@ -388,6 +388,80 @@ pub struct ListRecordsResponse {
     pub filter: RecordFilter,
 }
 
+// ─── /sessions ─────────────────────────────────────────────────────────────
+
+/// 会话列表 (叶子节点), sidebar 两级树的一级项.
+#[derive(Serialize)]
+pub struct SessionSummary {
+    pub leaf_id: Uuid,
+    pub root_id: Uuid,
+    pub record_count: usize,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub latest_at: chrono::DateTime<chrono::Utc>,
+    pub preview: Option<String>,
+    pub model: Option<String>,
+    pub latest_resp_status: u16,
+    pub latest_error: Option<String>,
+    pub redactions: Vec<(String, String)>,
+}
+
+impl From<crate::dag::SessionView> for SessionSummary {
+    fn from(s: crate::dag::SessionView) -> Self {
+        Self {
+            leaf_id: s.leaf_id,
+            root_id: s.root_id,
+            record_count: s.record_count,
+            created_at: s.created_at,
+            latest_at: s.latest_at,
+            preview: s.preview,
+            model: s.model,
+            latest_resp_status: s.latest_resp_status,
+            latest_error: s.latest_error,
+            redactions: s.redactions,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ListSessionsResponse {
+    sessions: Vec<SessionSummary>,
+    total: usize,
+}
+
+pub async fn list_sessions(State(state): State<ProxyState>) -> impl IntoResponse {
+    let sessions: Vec<SessionSummary> = state
+        .dag
+        .list_sessions()
+        .into_iter()
+        .map(SessionSummary::from)
+        .collect();
+    let total = sessions.len();
+    (NO_STORE, Json(ListSessionsResponse { sessions, total }))
+}
+
+// ─── /nodes/{id}/timeline ──────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct TimelineQuery {
+    /// 取多少个祖先 (含 node 自身). 默认 10.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+pub async fn get_timeline(
+    State(state): State<ProxyState>,
+    Path(id): Path<Uuid>,
+    Query(q): Query<TimelineQuery>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let limit = q.limit.unwrap_or(10).clamp(1, 200);
+    let views = state.dag.timeline(id, limit);
+    if views.is_empty() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let summaries: Vec<RecordSummary> = views.into_iter().map(RecordSummary::from).collect();
+    Ok((NO_STORE, Json(serde_json::json!({ "records": summaries }))))
+}
+
 // ─── /secrets ──────────────────────────────────────────────────────────────
 
 pub async fn list_secrets(State(state): State<ProxyState>) -> impl IntoResponse {
