@@ -531,7 +531,7 @@ pub struct CreateSecretRequest {
     #[serde(default)]
     pub value_file: Option<String>,
     /// 可选: mock 策略. 省略时后端用 [`crate::mock::MockStrategy::default`]
-    /// (Auto + sticky + resolve 时 infer gen spec).
+    /// (Auto + resolve 时 infer gen spec).
     #[serde(default)]
     pub mock_strategy: Option<crate::mock::MockStrategy>,
 }

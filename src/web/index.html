@@ -751,12 +751,6 @@
             <button type="button" class="btn" id="f-ms-generate" title="Generate a candidate from the gen spec below" style="margin-left: 4px;">Generate</button>
           </div>
 
-          <label>Sticky</label>
-          <div>
-            <input type="checkbox" id="f-ms-sticky" checked>
-            <span class="hint" style="display: inline; margin-left: 4px;">candidate sequence stable (cache-friendly)</span>
-          </div>
-
           <label>Prefix</label>
           <input type="text" id="f-ms-prefix" placeholder="(empty = no prefix)">
 
@@ -1892,22 +1886,20 @@
 
     // ─── mock strategy 渲染 (摘要 + tooltip) ──────────────────────────────
     //
-    // 列表只显示简短摘要 (如 "auto·sticky", "fixed"); 详情悬停 tooltip.
+    // 列表只显示简短摘要 (如 "auto", "fixed"); 详情悬停 tooltip.
 
     function mockStrategyBadge(ms) {
       if (!ms) return '<span class="pill">default</span>';
       const initialTag = ms.initial && ms.initial.kind === 'fixed' ? 'fixed' : 'auto';
-      const stickyTag = ms.sticky ? 'sticky' : 'rand';
-      return `<span class="pill">${initialTag}·${stickyTag}</span>`;
+      return `<span class="pill">${initialTag}</span>`;
     }
 
     function mockStrategyTooltip(ms) {
-      if (!ms) return 'default (auto + sticky + inferred gen spec)';
+      if (!ms) return 'default (auto + inferred gen spec)';
       const parts = [];
       parts.push(ms.initial && ms.initial.kind === 'fixed'
         ? `fixed: ${ms.initial.value || '(empty)'}`
         : 'auto');
-      parts.push(ms.sticky ? 'sticky' : 'non-sticky');
       if (ms.gen) {
         const cs = ms.gen.charset || {};
         const csParts = [];
@@ -1989,7 +1981,6 @@
       const initial = (ms && ms.initial && ms.initial.kind) || 'auto';
       document.querySelector(`input[name="f-ms-initial"][value="${initial}"]`).checked = true;
       document.getElementById('f-ms-fixed').value = (ms && ms.initial && ms.initial.value) || '';
-      document.getElementById('f-ms-sticky').checked = ms ? !!ms.sticky : true;
       const gen = ms && ms.gen;
       document.getElementById('f-ms-prefix').value = gen?.prefix || '';
       const cs = gen?.charset || {};
@@ -2019,9 +2010,8 @@
 
     function collectMockStrategyFromForm() {
       // 从 DOM 收集表单值, 返回与后端 MockStrategy 对齐的 JS object.
-      // 若用户保持所有默认 (auto + sticky + 无任何 gen 配置), 返回 null 让后端用 default.
+      // 若用户保持所有默认 (auto + 无任何 gen 配置), 返回 null 让后端用 default.
       const initialKind = document.querySelector('input[name="f-ms-initial"]:checked').value;
-      const sticky = document.getElementById('f-ms-sticky').checked;
       const prefix = document.getElementById('f-ms-prefix').value;
       const charset = collectCharsetFromForm();
       const lenmin = parseInt(document.getElementById('f-ms-lenmin').value) || 0;
@@ -2046,11 +2036,10 @@
         length_range: [lenmin, lenmax],
       } : null;
 
-      // 整体若全默认 (auto + sticky + 无 gen), 返回 null (后端 default).
-      const isAllDefault = initialKind === 'auto' && sticky && !gen;
+      // 整体若全默认 (auto + 无 gen), 返回 null (后端 default).
+      const isAllDefault = initialKind === 'auto' && !gen;
       return isAllDefault ? null : {
         initial,
-        sticky,
         ...(gen ? { gen } : {}),
       };
     }

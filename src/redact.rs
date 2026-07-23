@@ -17,10 +17,10 @@
 //! - **C2 上下文唯一性 (in-context uniqueness)**:
 //!   `gen_mock_for_ir(ir, secret, allocated)` 返回的 mock 一定**不在** `ir` 中出现
 //!   (traverse IR 检查) 且不在 `allocated` 集合中 (C4 保证).
-//! - **C3 候选序列稳定性 (sticky=true 时)**: 同一 `(real, strategy)` 在 sticky 模式下
-//!   总产生同一候选序列 (counter=0,1,2,...). 多数请求命中首项 → 享受 LLM 前缀缓存;
-//!   冲突时稳定跳到后续项 → 后续项在多次"首项冲突"请求间也能共享缓存.
-//!   sticky=false 时每次 redact 换随机 seed, 序列不固定.
+//! - **C3 前缀缓存友好性**: redact 不应无必要地改变 request body 的字节内容, 避免破坏
+//!   LLM Provider 侧的前缀缓存命中. 实现手段: [`crate::mock::deterministic_seed`] 保证
+//!   同一 `(real, strategy)` 总产生同一候选序列 (counter=0,1,2,...), 故同一 secret 在
+//!   会话全程 mock 保持稳定. 多数请求命中首项候选; 冲突时稳定跳到后续项.
 //! - **C4 单射性**: 在一次 [`redact_ir`] 调用内, 不同 secret 总映射到不同 mock
 //!   (因为每次 gen_mock_for_ir 都检查 allocated 集合).
 //! - **C5 不含 real_secret 子串** (best-effort):
@@ -148,24 +148,18 @@ pub fn mock_with_salt(real: &str, salt: u64) -> String {
 /// probing 协议: counter=0 是首选候选; 若与 IR 或 allocated 冲突则递增 counter,
 /// 直到找到合格候选 (上限 2^20 次后 panic, 防止对抗性 IR 死循环).
 ///
-/// - **sticky=true**: seed 由 [`crate::mock::deterministic_seed`] 决定 → 候选**序列**稳定.
-///   多数请求命中首项 (counter=0); 冲突时稳定跳到第二项 (counter=1), 第二项在"首项冲突"
-///   的多次请求间也能共享 LLM 前缀缓存. 见 [`crate::mock`] 模块 doc "sticky 的精确语义".
-/// - **sticky=false**: seed 由 [`crate::mock::random_seed`] 决定 → 每次请求候选序列不同.
+/// seed 由 [`crate::mock::deterministic_seed`] 决定 → 候选**序列**稳定 (C3 前缀缓存友好性).
+/// 多数请求命中首项 (counter=0); 冲突时稳定跳到第二项 (counter=1), 第二项在"首项冲突"
+/// 的多次请求间也能共享 LLM 前缀缓存.
 ///
 /// C2 (in-context uniqueness): traverse IR 检查候选 mock 是否出现.
 /// C4 (injectivity): 检查 `allocated` 集合避免重复分配.
 fn gen_mock_for_ir(ir: &IrRequest, secret: &SecretEntry, allocated: &HashSet<String>) -> String {
-    use crate::mock::{deterministic_seed, gen_candidate, random_seed};
+    use crate::mock::{deterministic_seed, gen_candidate};
 
-    // seed 在循环外一次性决定: sticky 用确定性 seed, non-sticky 用随机 seed.
-    // 这样 sticky=true 时, 同一 (real, strategy) 的候选序列在此函数内是确定的;
-    // sticky=false 时, 每次调用 gen_mock_for_ir (即每次 redact_ir) 都换 seed.
-    let seed = if secret.mock_strategy.sticky {
-        deterministic_seed(&secret.value, &secret.mock_strategy)
-    } else {
-        random_seed()
-    };
+    // seed 由 deterministic_seed 决定 (C3 前缀缓存友好性的根基):
+    // 同一 (real, strategy) 的候选序列在此函数内确定.
+    let seed = deterministic_seed(&secret.value, &secret.mock_strategy);
 
     let mut counter: u32 = 0;
     loop {

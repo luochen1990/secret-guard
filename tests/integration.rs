@@ -160,7 +160,7 @@ fn secret(id: &str, value: &str) -> SecretEntry {
 /// 预测 redact 对给定 real_secret 生成的首个 mock (counter=0).
 ///
 /// 与生产 [`secret_guard::redact::redact_ir`] 路径一致:
-/// sticky=true (default) → [`secret_guard::mock::deterministic_seed`] + counter=0.
+/// [`secret_guard::mock::deterministic_seed`] + counter=0.
 /// 用于集成测试中 mockito 上游响应 fixture (需要预知 mock 值才能构造"LLM echo 了 mock"的场景).
 fn predict_mock(real: &str) -> String {
     use secret_guard::mock::{deterministic_seed, gen_candidate};

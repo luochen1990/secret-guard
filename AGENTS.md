@@ -61,9 +61,14 @@ src/
 ├── provider.rs    # Protocol / Provider + DynamicEntry impl + EffectiveProvider 合并视图
 ├── secrets.rs     # SecretEntry / SecretCategory + DynamicEntry impl + EffectiveSecret + mask_value
 │                  # (SecretEntry.mock_strategy: MockStrategy 字段, redact 路径消费)
-├── mock.rs        # MockStrategy / InitialValue / GenSpec / Charset (三维度正交)
-│                  # + infer_default_from_real + gen_candidate + deterministic/random seed
-│                  # 纯函数模块, 含完整单元测试 (覆盖 Auto/Fixed + sticky/non-sticky 分支)
+├── mock.rs        # MockStrategy / InitialValue / GenSpec / Charset (两维度正交)
+│                  # + infer_default_from_real + gen_candidate + deterministic seed (C3 根基)
+│                  # 纯函数模块, 含完整单元测试 (覆盖 Auto/Fixed 分支)
+├── dag.rs         # ConversationDAG: 内容寻址的对话历史存储 (规划中, 尚未接入 proxy/record)
+│                  # BlockPool (IrBlock 内容寻址池 + refcount GC) + Node + MessageRef
+│                  # + Merkle prefix hash (O(N) parent 查找) + FIFO 淘汰
+│                  # + derive_redact_map (lazy redact 纯函数, node 存 seed 不存 map)
+│                  # 设计文档 SSOT: docs/design/conversation-dag.md
 ├── record.rs      # ForwardRecord / RecordStore / ResponseUpdate
 │                  # (ForwardRecord.redactions: Vec<(mock, secret_id)> 从 RedactionMap SSOT 派生)
 │                  # (RecordStore::list_page: offset+limit 分页, WebUI 用)
@@ -179,31 +184,35 @@ PATCH  /__sg/api/providers/{id}/decision
 
 ### MockStrategy (`src/mock.rs`) — per-secret mock 生成策略
 
-每个 secret 配置三维度正交的 mock 策略, redact 时按策略生成候选 mock:
+每个 secret 配置两维度正交的 mock 策略, redact 时按策略生成候选 mock:
 
 - **维度一 (初始值 `InitialValue`)**: `Auto` (系统按 gen spec 生成) 或 `Fixed { value }` (用户固定值).
-- **维度二 (黏性 `sticky`, 默认 `true`)**: 候选**序列**是否稳定.
-  - `sticky=true` 不意味着 "redact 总是产出同一个 mock". redact 时仍需满足 C2
-    (in-context uniqueness): 若候选 mock 已出现在当前请求 IR 中, 系统 probing 到序列的下一个候选.
-  - sticky=true 保证的是候选**序列本身确定** — 同一 `(real, strategy)` 总产生相同的候选顺序 (counter=0,1,2,...).
-    因此多数请求命中首项 (完全享受 LLM 供应商前缀缓存); 首项冲突时**稳定地**跳到第二项
-    (第二项在"首项冲突"的多次请求间也能共享缓存).
-  - sticky=false 时每次请求用新随机种子 (uuid v4 → hash), 候选序列每次不同,
-    牺牲缓存友好性换取更高不可预测性.
-- **维度三 (生成策略 `GenSpec`)**: `prefix` + `charset` + `length_range`.
+- **维度二 (生成策略 `GenSpec`)**: `prefix` + `charset` + `length_range`.
   - `prefix`: 固定前缀, 默认空串.
   - `charset`: 6 类正交开关 (digits / lowercase / uppercase / underscore / hyphen / other Vec<char>).
     默认值由 `Charset::infer_from(real)` 自动推断 (real 中出现哪些字符类就勾选).
   - `length_range`: `[min, max]` (char count), 默认 `min=max=len(real)` (与 real 等长).
 
+**C3 前缀缓存友好性** (经济性契约): redact 不应无必要地改变 request body 的字节内容,
+避免破坏 LLM Provider 侧的前缀缓存命中, 进而增加用户的 token 费用负担. 前缀缓存是 byte-exact
+的, 若历史 message 中的 mock 字节变化, 从该 message 起的整个前缀缓存失效. 因此 mock 的稳定性
+(同一 secret 在会话中保持同一 mock) 直接保护缓存命中.
+
+实现手段: `deterministic_seed` 保证同一 `(real, strategy)` 总产生同一候选序列 (counter=0,1,2,...).
+这是 C3 的根基. 多数请求命中首项候选 (完全享受前缀缓存); 首项冲突时稳定跳到第二项
+(第二项在"首项冲突"的多次请求间也能共享缓存).
+
+> 历史: 曾有 `sticky=false` 维度 (每次请求随机 seed), 但它直接违反 C3 (每轮 mock 都变, 前缀缓存
+> 完全失效), 且其声称的收益 (防 LLM 关联多次请求) 不在 secret-guard 的威胁模型内 (MVP 防的是
+> secret 泄漏, 不是关联), 因此已删除.
+
 **向后兼容**: 未配置 `mock_strategy` 的旧 secret 在 `SecretEntry::validate_and_resolve`
-的 resolve 步骤后自动得到 `default_for(real_value)` (Auto + sticky + infer 自 real 的 gen spec).
+的 resolve 步骤后自动得到 `default_for(real_value)` (Auto + infer 自 real 的 gen spec).
 
 **核心 API**:
 - `MockStrategy::resolve_against(real)`: 用 real infer 默认 gen spec (若 gen=None + Auto 模式).
 - `MockStrategy::validate_against_real(real)`: Fixed 模式校验不等于 real 且不含 real ≥4 字符子串 (C5, char-level windows 正确处理 multibyte UTF-8); Auto 模式校验 gen.prefix 不含 real 子串.
-- `deterministic_seed(real, strategy)`: sticky=true 的 seed 源 (hash of real+strategy).
-- `random_seed()`: sticky=false 的 seed 源 (uuid v4 hash).
+- `deterministic_seed(real, strategy)`: seed 源 (hash of real+strategy), C3 的根基.
 - `gen_candidate(real, strategy, seed, counter)`: 生成单个候选 mock. redact 按 probing 协议消费.
 
 ### redact pipeline (`src/redact.rs` + `src/proxy.rs`)
@@ -561,8 +570,12 @@ devShell 的 `shellHook` 自动把 `@playwright/test` 的 node_modules symlink �
 - mock 生成用 SipHash (Rust `DefaultHasher`), 同 Rust 版本内确定, 但**不保证跨版本稳定**;
   RedactionMap 是 per-request 状态不持久化, 所以无实际影响.
 - mock 默认与 real_secret 等长 (由 `MockStrategy::default_for` infer), charset 来自 real.
-  用户可通过 MockStrategy 三维度自定义 prefix / charset / length.
+  用户可通过 MockStrategy 两维度 (初始值 + 生成策略) 自定义 prefix / charset / length.
   Fixed 模式下 mock 由用户提供, 系统校验不含 real ≥4 字符子串 (C5 best-effort).
+- **ConversationDAG 尚未接入**: `src/dag.rs` 已实现核心数据结构 (BlockPool + Node +
+  Merkle prefix + FIFO GC + derive_redact_map), 但 proxy/record/web/stream 仍用扁平
+  `RecordStore`. 完整接入 (lazy redact + 内容寻址存储 + 会话折叠) 是后续工作,
+  设计见 `docs/design/conversation-dag.md`.
 - static config (`secret-guard.toml`) 的 `[server]` 段当前仅在启动时读取一次,
   WebUI 改 host/port 不会生效 (需要重启).
 - WebUI 编辑 provider 时 api_key 始终要求重输 (无法保留旧值), 留空则覆盖为空字符串.

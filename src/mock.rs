@@ -1,25 +1,21 @@
-//! Mock 策略: 为每个 secret 配置 redact 用的 mock 生成方式 (三维度正交).
+//! Mock 策略: 为每个 secret 配置 redact 用的 mock 生成方式 (两维度正交).
 //!
-//! # 三维度
+//! # 两维度
 //!
 //! 1. **初始值** ([`InitialValue`]): `Auto` (系统按 gen spec 生成) 或
 //!    `Fixed { value }` (用户固定值; 冲突时加 `_1`/`_2`... 后缀 probing).
-//! 2. **黏性** (`sticky`): 候选**序列**是否稳定. 默认 `true`.
-//! 3. **生成策略** ([`GenSpec`]): `prefix` + `charset` + `length_range`.
+//! 2. **生成策略** ([`GenSpec`]): `prefix` + `charset` + `length_range`.
 //!
-//! # sticky 的精确语义 (重要)
+//! # 确定性 (C3 前缀缓存友好性)
 //!
-//! sticky **不**意味着 "redact 总是产出同一个 mock". redact 时仍需满足 C2
-//! (in-context uniqueness, 见 [`crate::redact`]): 若候选 mock 已出现在当前请求
-//! IR 中, 系统 probing 到序列的下一个候选.
+//! 候选序列由 [`deterministic_seed`] 驱动 — 同一 `(real, strategy)` 总产生同一候选序列
+//! (counter=0,1,2,...). 这是 C3 的根基: 多轮对话中同一 secret 的 mock 保持稳定,
+//! 不破坏 LLM provider 的前缀缓存命中. 见 [`crate::redact`] 模块的 C3 契约.
 //!
-//! sticky=true 保证的是 **候选序列本身确定** — 同一 `(real, strategy)` 总产生
-//! 相同的候选顺序 (counter=0,1,2,...). 因此:
-//! - 多数请求 (上下文不冲突) 总命中首项候选 → 完全享受 LLM 供应商前缀缓存.
-//! - 首项冲突时**稳定地**跳到第二项 → 第二项在"首项冲突"的多次请求间也能共享缓存.
-//!
-//! sticky=false 时, 每次请求用新随机种子, 候选序列每次不同. 牺牲缓存友好性
-//! 换取更高不可预测性 (每次用不同 mock, LLM 更难关联).
+//! 候选序列稳定**不**意味着 "redact 总是产出同一个 mock". redact 时仍需满足 C2
+//! (in-context uniqueness): 若候选 mock 已出现在当前请求 IR 中, 系统 probing 到序列的
+//! 下一个候选 (counter 递增). 多数请求命中首项候选; 冲突时稳定跳到后续项, 后续项在多次
+//! "首项冲突"的请求间也能共享前缀缓存.
 //!
 //! # 与 redact pipeline 的分工
 //!
@@ -30,7 +26,7 @@
 //! # 向后兼容
 //!
 //! 未配置 `mock_strategy` 的旧 secret ([`crate::secrets::SecretEntry`]) 在 resolve 时
-//! 自动得到 [`MockStrategy::default_for`] (Auto + sticky + infer 自 real 的 gen spec).
+//! 自动得到 [`MockStrategy::default_for`] (Auto + infer 自 real 的 gen spec).
 //! 行为尽可能接近原固定算法 (用 hash 生成等长 mock, charset 来自 real).
 
 use serde::{Deserialize, Serialize};
@@ -193,42 +189,18 @@ pub enum InitialValue {
 
 // ─── MockStrategy ──────────────────────────────────────────────────────────
 
-fn default_true() -> bool {
-    true
-}
-
-/// Mock 策略: 三维度正交组合.
-///
-/// 注意: 不使用 `#[derive(Default)]`, 因为它不会调用 serde 的 `default = "default_true"`,
-/// 会让 `sticky` 默认为 `false` 而非 `true`. 手写 impl 显式设 sticky=true.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+/// Mock 策略: 两维度正交组合.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 pub struct MockStrategy {
     /// 维度一: 初始值模式. 默认 `Auto`.
     #[serde(default)]
     pub initial: InitialValue,
 
-    /// 维度二: 候选序列是否稳定. 默认 `true`.
-    ///
-    /// 见模块 doc "sticky 的精确语义": sticky 保证候选**序列**确定, 但 redact
-    /// 仍可能因 C2 (in-context uniqueness) 跳到序列的后续项.
-    #[serde(default = "default_true")]
-    pub sticky: bool,
-
-    /// 维度三: 生成策略. `None` = 未配置 (resolve 时 infer); `Some` = 用户显式设置.
+    /// 维度二: 生成策略. `None` = 未配置 (resolve 时 infer); `Some` = 用户显式设置.
     ///
     /// 仅 `initial = Auto` 时生效; `Fixed` 模式忽略此字段.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gen: Option<GenSpec>,
-}
-
-impl Default for MockStrategy {
-    fn default() -> Self {
-        Self {
-            initial: InitialValue::default(),
-            sticky: true,
-            gen: None,
-        }
-    }
 }
 
 impl MockStrategy {
@@ -303,23 +275,14 @@ fn contains_4char_substring(haystack: &str, needle: &str) -> bool {
 
 // ─── 候选生成器 ────────────────────────────────────────────────────────────
 
-/// 计算 sticky 模式的确定性 seed.
+/// 计算确定性 seed (C3 前缀缓存友好性的根基).
 ///
 /// 同一 `(real, strategy)` 总产生同一 seed → 同一候选序列 (counter=0,1,2,...).
-/// sticky=true 时由 redact 调用; sticky=false 时 redact 用随机 seed.
+/// redact 调用此函数获得 seed, 保证同一 secret 在会话全程 mock 稳定.
 pub fn deterministic_seed(real: &str, strategy: &MockStrategy) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     real.hash(&mut h);
     strategy.hash(&mut h);
-    h.finish()
-}
-
-/// 生成 per-request 随机 seed (用于 non-sticky secrets).
-///
-/// 用 uuid v4 (内部 CSPRNG) 作为熵源, 无需额外依赖. 每次 redact 调用一次.
-pub fn random_seed() -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    uuid::Uuid::new_v4().hash(&mut h);
     h.finish()
 }
 
@@ -558,10 +521,9 @@ mod tests {
     // ─── MockStrategy ─────────────────────────────────────────────────────
 
     #[test]
-    fn mock_strategy_default_is_auto_sticky_no_gen() {
+    fn mock_strategy_default_is_auto_no_gen() {
         let s = MockStrategy::default();
         assert!(matches!(s.initial, InitialValue::Auto));
-        assert!(s.sticky);
         assert!(s.gen.is_none());
     }
 
@@ -586,7 +548,6 @@ mod tests {
         };
         let mut s = MockStrategy {
             initial: InitialValue::Auto,
-            sticky: true,
             gen: Some(user_gen.clone()),
         };
         s.resolve_against("sk-Abc123");
@@ -601,7 +562,6 @@ mod tests {
             initial: InitialValue::Fixed {
                 value: "my-mock".into(),
             },
-            sticky: true,
             gen: None,
         };
         s.resolve_against("sk-Abc123");
@@ -613,7 +573,6 @@ mod tests {
     fn mock_strategy_validate_fixed_empty_rejected() {
         let s = MockStrategy {
             initial: InitialValue::Fixed { value: "".into() },
-            sticky: true,
             gen: None,
         };
         assert!(s.validate().is_err());
@@ -623,7 +582,6 @@ mod tests {
     fn mock_strategy_validate_auto_with_bad_gen_rejected() {
         let s = MockStrategy {
             initial: InitialValue::Auto,
-            sticky: true,
             gen: Some(GenSpec {
                 prefix: "".into(),
                 charset: Charset::default(), // 空 charset.
@@ -639,7 +597,6 @@ mod tests {
             initial: InitialValue::Fixed {
                 value: "secret123".into(),
             },
-            sticky: true,
             gen: None,
         };
         let err = s.validate_against_real("secret123").unwrap_err();
@@ -655,7 +612,6 @@ mod tests {
             initial: InitialValue::Fixed {
                 value: "ask-tzzz".into(),
             },
-            sticky: true,
             gen: None,
         };
         let err = s.validate_against_real(real).unwrap_err();
@@ -668,7 +624,6 @@ mod tests {
             initial: InitialValue::Fixed {
                 value: "completely-different".into(),
             },
-            sticky: true,
             gen: None,
         };
         assert!(s.validate_against_real("sk-test-123456").is_ok());
@@ -684,7 +639,6 @@ mod tests {
             initial: InitialValue::Fixed {
                 value: "prefix-你好世界-suffix".into(),
             },
-            sticky: true,
             gen: None,
         };
         let err = s.validate_against_real(real).unwrap_err();
@@ -697,7 +651,6 @@ mod tests {
         let real = "sk-test-secret-value";
         let s = MockStrategy {
             initial: InitialValue::Auto,
-            sticky: true,
             gen: Some(GenSpec {
                 prefix: "sk-test".into(), // 出现在 real 中.
                 charset: Charset {
@@ -708,10 +661,7 @@ mod tests {
             }),
         };
         let err = s.validate_against_real(real).unwrap_err();
-        assert!(
-            err.contains("prefix appears in real") || err.contains("C5 violation"),
-            "{err}"
-        );
+        assert!(err.contains("C5 violation"), "{err}");
     }
 
     #[test]
@@ -719,7 +669,6 @@ mod tests {
         // Auto 模式: gen.prefix 不出现在 real 中 → OK.
         let s = MockStrategy {
             initial: InitialValue::Auto,
-            sticky: true,
             gen: Some(GenSpec {
                 prefix: "MOCK-".into(),
                 charset: Charset {
@@ -734,11 +683,10 @@ mod tests {
 
     // ─── gen_candidate (Auto 模式) ────────────────────────────────────────
 
-    /// 构造一个 Auto + sticky 策略 (测试 helper).
+    /// 构造一个 Auto 策略 (测试 helper).
     fn auto_strategy(prefix: &str, charset: Charset, length: usize) -> MockStrategy {
         MockStrategy {
             initial: InitialValue::Auto,
-            sticky: true,
             gen: Some(GenSpec {
                 prefix: prefix.into(),
                 charset,
@@ -814,7 +762,6 @@ mod tests {
         // length_range = (5, 10): 不同 seed 可能产生 5-10 长度.
         let s = MockStrategy {
             initial: InitialValue::Auto,
-            sticky: true,
             gen: Some(GenSpec {
                 prefix: "".into(),
                 charset: Charset {
@@ -852,10 +799,10 @@ mod tests {
         }
     }
 
-    // ─── gen_candidate (sticky 确定性) ────────────────────────────────────
+    // ─── gen_candidate (确定性) ────────────────────────────────────────────
 
     #[test]
-    fn gen_candidate_sticky_is_deterministic() {
+    fn gen_candidate_is_deterministic() {
         // 同一 (real, strategy, seed, counter) → 同一 mock.
         let s = auto_strategy(
             "",
@@ -870,13 +817,13 @@ mod tests {
         let seed = deterministic_seed(real, &s);
         let m1 = gen_candidate(real, &s, seed, 0);
         let m2 = gen_candidate(real, &s, seed, 0);
-        assert_eq!(m1, m2, "sticky must be deterministic for same input");
+        assert_eq!(m1, m2, "must be deterministic for same input");
     }
 
     #[test]
-    fn gen_candidate_sticky_candidate_sequence_stable() {
-        // sticky=true: counter=0,1,2,... 产生稳定的候选序列.
-        // 相同 strategy 多次调用, 序列相同 (这是"候选序列稳定"的核心).
+    fn gen_candidate_candidate_sequence_stable() {
+        // counter=0,1,2,... 产生稳定的候选序列.
+        // 相同 strategy 多次调用, 序列相同 (这是"候选序列稳定"的核心, C3 的根基).
         let s = auto_strategy(
             "",
             Charset {
@@ -919,24 +866,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn gen_candidate_non_sticky_different_seed_different_result() {
-        // sticky=false: 不同 seed (每次请求) → 不同候选 (高概率).
-        let s = auto_strategy(
-            "",
-            Charset {
-                digits: true,
-                lowercase: true,
-                ..Default::default()
-            },
-            15,
-        );
-        let m1 = gen_candidate("real", &s, random_seed(), 0);
-        let m2 = gen_candidate("real", &s, random_seed(), 0);
-        // 极高概率不同 (15 chars × 36 charset → 碰撞概率 ≈ 0).
-        assert_ne!(m1, m2, "non-sticky should produce different results");
-    }
-
     // ─── gen_candidate (Fixed 模式) ──────────────────────────────────────
 
     #[test]
@@ -945,7 +874,6 @@ mod tests {
             initial: InitialValue::Fixed {
                 value: "my-mock-value".into(),
             },
-            sticky: true,
             gen: None,
         };
         assert_eq!(gen_candidate("real", &s, 42, 0), "my-mock-value");
@@ -957,7 +885,6 @@ mod tests {
             initial: InitialValue::Fixed {
                 value: "my-mock".into(),
             },
-            sticky: true,
             gen: None,
         };
         assert_eq!(gen_candidate("real", &s, 42, 1), "my-mock_1");
@@ -972,7 +899,6 @@ mod tests {
             initial: InitialValue::Fixed {
                 value: "fixed-val".into(),
             },
-            sticky: true,
             gen: None,
         };
         assert_eq!(gen_candidate("real", &s, 0, 0), "fixed-val");
@@ -1040,7 +966,6 @@ mod tests {
     fn mock_strategy_serde_roundtrip_auto() {
         let s = MockStrategy {
             initial: InitialValue::Auto,
-            sticky: false,
             gen: Some(GenSpec {
                 prefix: "sk-".into(),
                 charset: Charset {
@@ -1063,7 +988,6 @@ mod tests {
             initial: InitialValue::Fixed {
                 value: "my-fixed-mock".into(),
             },
-            sticky: true,
             gen: None,
         };
         let json = serde_json::to_string(&s).unwrap();
@@ -1076,7 +1000,6 @@ mod tests {
         // gen=None 时不应出现在 JSON 中 (skip_serializing_if = "Option::is_none").
         let s = MockStrategy {
             initial: InitialValue::Auto,
-            sticky: true,
             gen: None,
         };
         let json = serde_json::to_string(&s).unwrap();
@@ -1088,7 +1011,6 @@ mod tests {
         // 空对象 {} 应反序列化为 Default (向后兼容旧配置无此字段).
         let back: MockStrategy = serde_json::from_str("{}").unwrap();
         assert!(matches!(back.initial, InitialValue::Auto));
-        assert!(back.sticky);
         assert!(back.gen.is_none());
     }
 
@@ -1110,7 +1032,6 @@ mod tests {
         // 验证 TOML 序列化 (config 文件用 TOML).
         let s = MockStrategy {
             initial: InitialValue::Auto,
-            sticky: false,
             gen: Some(GenSpec {
                 prefix: "sk-".into(),
                 charset: Charset {

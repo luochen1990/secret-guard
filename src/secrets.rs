@@ -65,9 +65,9 @@ pub struct SecretEntry {
     #[serde(default)]
     pub value_file: Option<std::path::PathBuf>,
 
-    /// Mock 策略 (三维度: 初始值 / sticky / 生成策略).
+    /// Mock 策略 (两维度: 初始值 / 生成策略).
     ///
-    /// 未配置 (`#[serde(default)]`) → [`MockStrategy::default`] (Auto + sticky + 无 gen).
+    /// 未配置 (`#[serde(default)]`) → [`MockStrategy::default`] (Auto + 无 gen).
     /// 在 [`SecretEntry::validate_and_resolve`] 的 resolve_value 步骤后, 若仍是 Auto + 无 gen,
     /// 会调用 [`MockStrategy::resolve_against`] 用 real value infer 默认 gen spec.
     ///
