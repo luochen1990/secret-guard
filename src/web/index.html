@@ -499,10 +499,17 @@
     .bubble-system     { background: #fff8e0; border: 1px dashed #ec5; max-width: 100%; }
 
     /* 三级展示的折叠 / 展开态.
-       折叠: max-height 4.5em (~3 行); 展开: max-height 22.5em (~15 行, 与 JS EXPAND_THRESHOLD_LINES 对齐).
-       超过阈值高度时在右下角浮 "view full" 按钮, 点击开 dialog. */
-    .chat-bubble.collapsed { max-height: 4.5em; }
-    .chat-bubble.expanded  { max-height: 22.5em; overflow: auto; }
+       DOM 结构: .chat-bubble (定位上下文 + 溢出裁切) > .bubble-content (实际文本 + 滚动)
+       + .bubble-actions (浮层, toggle / view-full 按钮, 不随 content 滚动).
+       三按钮 (折叠 toggle / 展开 toggle / view-full) 始终在气泡右下角同一位置:
+       用户在同一坐标点两次即可 collapsed → expanded → collapsed 回到初始状态.
+
+       折叠: .bubble-content max-height 4.5em (恰好 3 行: 3 × 1.5em line-height, 无 padding 损耗,
+             因为 padding 在 .chat-bubble 上). 展开: .bubble-content max-height 22.5em (~15 行,
+             与 JS EXPAND_THRESHOLD_LINES 对齐) + overflow:auto. */
+    .chat-bubble.collapsed .bubble-content { max-height: 4.5em; }
+    .chat-bubble.expanded  .bubble-content { max-height: 22.5em; overflow: auto; }
+    /* 折叠态底部渐变遮罩: 相对 .chat-bubble 定位 (content 层溢出被 bubble 的 overflow:hidden 裁切). */
     .chat-bubble.collapsed::after {
       content: '';
       position: absolute;
@@ -512,9 +519,18 @@
       pointer-events: none;
       opacity: 0.08;
     }
-    /* toggle: 展开/收起 文本按钮.
-       折叠态 (.collapsed): 用 position: absolute 浮在右下角, 不受 bubble 的 overflow:hidden 裁切.
-       展开态 (.expanded): 回到文档流末尾 (此时 bubble 可滚动, toggle 不需要 absolute). */
+    /* 按钮浮层: 绝对定位气泡右下角, 不随 content 滚动.
+       折叠态: 只显示 toggle. 展开态: toggle + view-full (并排).
+       定位基准是 .chat-bubble (position: relative), 因此不受 content 层的滚动影响. */
+    .bubble-actions {
+      position: absolute;
+      right: 6px;
+      bottom: 3px;
+      display: flex;
+      gap: 4px;
+      align-items: center;
+      z-index: 1;
+    }
     .bubble-toggle {
       font-size: 11px;
       color: #4a6fa5;
@@ -526,20 +542,7 @@
       text-decoration: underline;
       text-underline-offset: 2px;
     }
-    .chat-bubble.collapsed .bubble-toggle {
-      position: absolute;
-      right: 8px;
-      bottom: 2px;
-    }
-    .chat-bubble.expanded .bubble-toggle {
-      display: block;
-      margin-top: 4px;
-    }
-    /* view-full: 浮在展开态右下角, 内容超过 expanded 阈值时出现. */
     .view-full-btn {
-      position: absolute;
-      right: 8px;
-      bottom: 4px;
       font-size: 11px;
       color: #4a6fa5;
       background: rgba(255,255,255,0.9);
@@ -1535,10 +1538,11 @@
       const meta = senderMeta(role);
       const safeText = applyMockHighlight(escapeHtml(text), redactions);
       // chat-row 包裹: sender-icon + bubble. user 靠右 (row-reverse).
+      // bubble 内套 .bubble-content (实际文本, 可滚动), 按钮由 JS 注入 .bubble-actions 浮层 (不随滚动).
       return `
         <div class="chat-row row-${meta.cls}">
           <span class="sender-icon s-${meta.cls}" title="${escapeHtml(meta.label)}">${meta.letter}</span>
-          <div class="chat-bubble bubble-${cls}" data-role="${escapeHtml(role)}">${safeText}</div>
+          <div class="chat-bubble bubble-${cls}" data-role="${escapeHtml(role)}"><div class="bubble-content">${safeText}</div></div>
         </div>
       `;
     }
@@ -1565,25 +1569,32 @@
         if (bubble.dataset.collapseReady === '1') return;
         // 先移除 collapsed / expanded 让自然高度可测 (max-height: none 时 == 内容自然高度).
         bubble.classList.remove('collapsed', 'expanded');
+        const content = bubble.querySelector('.bubble-content');
+        if (!content) { bubble.dataset.collapseReady = '1'; return; } // 防御: 非气泡结构.
         const style = getComputedStyle(bubble);
         const fontSize = parseFloat(style.fontSize) || 12.5;
         const lineHeight = parseFloat(style.lineHeight) || (fontSize * 1.5);
         const collapseThreshold = lineHeight * 3 + 2;       // 3 行
         const expandThreshold = lineHeight * EXPAND_THRESHOLD_LINES; // 15 行
-        const naturalHeight = bubble.scrollHeight;
+        // 测量内容层的自然高度 (不是外层 bubble, 因为 bubble 的 padding 会膨胀测量值).
+        const naturalHeight = content.scrollHeight;
         if (naturalHeight <= collapseThreshold) {
           bubble.dataset.collapseReady = '1';
           return;
         }
         // 默认折叠.
         bubble.classList.add('collapsed');
+        // 按钮浮层 (固定气泡右下角, 不随 content 滚动).
+        const actions = document.createElement('div');
+        actions.className = 'bubble-actions';
         // 折叠 toggle.
         const toggle = document.createElement('button');
         toggle.className = 'bubble-toggle';
         toggle.type = 'button';
         toggle.textContent = 'expand ▾';
         toggle.addEventListener('click', () => onBubbleToggle(bubble, toggle, expandThreshold));
-        bubble.appendChild(toggle);
+        actions.appendChild(toggle);
+        bubble.appendChild(actions);
         // 若自然高度超过展开阈值, 标记以便展开时显示 "查看全文".
         if (naturalHeight > expandThreshold) {
           bubble.dataset.canViewFull = '1';
@@ -1600,8 +1611,9 @@
         bubble.classList.remove('collapsed');
         bubble.classList.add('expanded');
         toggle.textContent = 'collapse ▴';
-        // 若标记了可查看全文, 注入浮动按钮 (只注入一次).
-        if (bubble.dataset.canViewFull === '1' && !bubble.querySelector('.view-full-btn')) {
+        // 若标记了可查看全文, 注入浮动按钮到 .bubble-actions (只注入一次).
+        const actions = bubble.querySelector('.bubble-actions');
+        if (bubble.dataset.canViewFull === '1' && actions && !actions.querySelector('.view-full-btn')) {
           const fullBtn = document.createElement('button');
           fullBtn.className = 'view-full-btn';
           fullBtn.type = 'button';
@@ -1610,7 +1622,7 @@
             ev.stopPropagation();
             openBubbleFullDialog(bubble);
           });
-          bubble.appendChild(fullBtn);
+          actions.appendChild(fullBtn);
         }
       } else {
         // expanded → collapsed.
@@ -1643,13 +1655,9 @@
       }
       const role = bubble.dataset.role || 'message';
       dlg.querySelector('.full-title').textContent = role;
-      // 克隆内容 (保留 mark.secret-hit 高亮).
-      const clone = bubble.cloneNode(true);
-      // 移除 toggle / view-full 按钮 (dialog 有自己的 close).
-      clone.querySelectorAll('.bubble-toggle, .view-full-btn').forEach(el => el.remove());
-      clone.classList.remove('collapsed', 'expanded');
-      clone.style.maxHeight = 'none';
-      dlg.querySelector('.full-body').innerHTML = clone.innerHTML;
+      // 取内容层 (.bubble-content, 纯文本 + mock 高亮, 不含按钮), 直接复用 innerHTML.
+      const content = bubble.querySelector('.bubble-content');
+      dlg.querySelector('.full-body').innerHTML = content ? content.innerHTML : '';
       dlg.showModal();
     }
 
