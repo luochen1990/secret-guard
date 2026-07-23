@@ -1584,7 +1584,7 @@
         }
         // 默认折叠.
         bubble.classList.add('collapsed');
-        // 按钮浮层 (固定气泡右下角, 不随 content 滚动).
+        // 按钮浮层.
         const actions = document.createElement('div');
         actions.className = 'bubble-actions';
         // 折叠 toggle.
@@ -1608,8 +1608,7 @@
       const isCollapsed = bubble.classList.contains('collapsed');
       if (isCollapsed) {
         // collapsed → expanded.
-        bubble.classList.remove('collapsed');
-        bubble.classList.add('expanded');
+        bubble.classList.replace('collapsed', 'expanded');
         toggle.textContent = 'collapse ▴';
         // 若标记了可查看全文, 注入浮动按钮到 .bubble-actions (只注入一次).
         const actions = bubble.querySelector('.bubble-actions');
@@ -1626,8 +1625,7 @@
         }
       } else {
         // expanded → collapsed.
-        bubble.classList.remove('expanded');
-        bubble.classList.add('collapsed');
+        bubble.classList.replace('expanded', 'collapsed');
         toggle.textContent = 'expand ▾';
       }
     }
