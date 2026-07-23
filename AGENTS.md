@@ -64,14 +64,13 @@ src/
 ├── mock.rs        # MockStrategy / InitialValue / GenSpec / Charset (两维度正交)
 │                  # + infer_default_from_real + gen_candidate + deterministic seed (C3 根基)
 │                  # 纯函数模块, 含完整单元测试 (覆盖 Auto/Fixed 分支)
-├── dag.rs         # ConversationDAG: 内容寻址的对话历史存储 (规划中, 尚未接入 proxy/record)
+├── dag.rs         # ConversationDAG: 内容寻址的对话历史存储 (已接入 proxy/web)
 │                  # BlockPool (IrBlock 内容寻址池 + refcount GC) + Node + MessageRef
 │                  # + Merkle prefix hash (O(N) parent 查找) + FIFO 淘汰
 │                  # + derive_redact_map (lazy redact 纯函数, node 存 seed 不存 map)
 │                  # 设计文档 SSOT: docs/design/conversation-dag.md
-├── record.rs      # ForwardRecord / RecordStore / ResponseUpdate
+├── record.rs      # ForwardRecord / RecordFilter (web 层 DTO, 从 DAG node 派生)
 │                  # (ForwardRecord.redactions: Vec<(mock, secret_id)> 从 RedactionMap SSOT 派生)
-│                  # (RecordStore::list_page: offset+limit 分页, WebUI 用)
 ├── redact.rs      # RedactionMap + redact_ir + restore_ir_response + mock_with_salt (legacy)
 │                  # + StreamingRestorer (流式 sliding-window restore, per-block 独立)
 │                  # + IR traverse helpers (block_contains / value_replace_all 等)
@@ -218,7 +217,8 @@ PATCH  /__sg/api/providers/{id}/decision
 ### redact pipeline (`src/redact.rs` + `src/proxy.rs`)
 
 redact 已升级为 **IR 变换** (基于 `src/codec/ir`), 与 codec 同层. 三个核心 API:
-- `redact_ir(&mut IrRequest, secrets) -> RedactionMap`: 扫描 IR 所有字符串字段, 把 secret 替换为 mock.
+- `redact_ir(&mut IrRequest, secrets) -> (RedactionMap, u64 seed)`: 扫描 IR 所有字符串字段,
+  把 secret 替换为 mock. 返回 per-request seed (0=passthrough, DAG node 存它用于 lazy 重建).
 - `restore_ir_response(&mut IrResponse, map)`: 非流式响应 restore.
 - `StreamingRestorer::push/flush`: 流式响应 sliding-window restore (跨 chunk mock 边界安全, per-block 独立状态, UTF-8 char boundary 安全).
 
@@ -580,10 +580,9 @@ devShell 的 `shellHook` 自动把 `@playwright/test` 的 node_modules symlink �
 - mock 默认与 real_secret 等长 (由 `MockStrategy::default_for` infer), charset 来自 real.
   用户可通过 MockStrategy 两维度 (初始值 + 生成策略) 自定义 prefix / charset / length.
   Fixed 模式下 mock 由用户提供, 系统校验不含 real ≥4 字符子串 (C5 best-effort).
-- **ConversationDAG 尚未接入**: `src/dag.rs` 已实现核心数据结构 (BlockPool + Node +
-  Merkle prefix + FIFO GC + derive_redact_map), 但 proxy/record/web/stream 仍用扁平
-  `RecordStore`. 完整接入 (lazy redact + 内容寻址存储 + 会话折叠) 是后续工作,
-  设计见 `docs/design/conversation-dag.md`.
+- **ConversationDAG 已接入**: `src/dag.rs` 作为 proxy/web 的存储后端, 替代扁平 RecordStore.
+  ForwardRecord 保留为 web 层 DTO (从 DAG node 派生). lazy redact 的完整 WebUI 重建
+  (derive_redact_map 含 system/tools) 是后续工作, 当前 WebUI 用 push 时预存的 req_body_raw.
 - static config (`secret-guard.toml`) 的 `[server]` 段当前仅在启动时读取一次,
   WebUI 改 host/port 不会生效 (需要重启).
 - WebUI 编辑 provider 时 api_key 始终要求重输 (无法保留旧值), 留空则覆盖为空字符串.
