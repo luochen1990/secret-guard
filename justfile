@@ -24,16 +24,24 @@ dev:
 # --coverage: 测试阶段改用插桩编译 (cargo llvm-cov nextest), 产出覆盖率数据到
 # target/llvm-cov-target/, 后续 just coverage-gate / coverage-html 直接消费, 无需重跑测试.
 # 默认不带 (本地开发追求快速反馈, 无需插桩开销).
+#
+# 磁盘峰值控制 (CI): clippy/doctest/nextest 共用 target/debug (~3GB), 与 coverage 插桩产物
+# target/llvm-cov-target (~1.6GB) 是两份独立编译, 互不复用. CI runner (forgejo-runner-vm)
+# 根文件系统是 tmpfs (实测 ~3.9GB, 即 VM mem 的一半), 两份并存会触发 "No space left on device".
+# 故: (1) doctest 提前到分支前, 复用 clippy 的 target/debug; (2) coverage 分支 clean 释放
+# target/debug 后再跑 llvm-cov, 实测峰值降到 ~1.4GB, 零时间损失 (coverage 本就要全量重编译).
+# 本地要 coverage 产物但不想 clean 可用 just coverage / just coverage-html (不走 check 流程).
 check *ARGS:
     cargo fmt -- --check
     cargo clippy --all-targets -- -D warnings
     cargo machete
+    cargo test --doc
     @if echo "{{ARGS}}" | grep -q -- "--coverage"; then \
+        cargo clean; \
         cargo llvm-cov nextest --no-fail-fast --no-report; \
     else \
         cargo nextest run --no-fail-fast; \
     fi
-    cargo test --doc
 
 # WebUI 回归测试 (Playwright 端到端).
 # 需要 devShell (nix develop) 提供 playwright-test 包; shellHook 自动 symlink node_modules.

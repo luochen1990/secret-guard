@@ -455,8 +455,16 @@ CI 配置在 `.forgejo/workflows/ci.yml`, 触发条件: `push` + `pull_request` 
 
 CI 流程 (测试集只跑一次):
 1. **Check + coverage data**: `just check --coverage` — fmt + clippy + machete +
-   测试 (用 `cargo llvm-cov nextest` 插桩编译, 产出 profdata 到 `target/llvm-cov-target/`).
+   doctest + 测试 (用 `cargo llvm-cov nextest` 插桩编译, 产出 profdata 到 `target/llvm-cov-target/`).
 2. **Coverage gate**: `just coverage-gate` — 只做 report (读上一步 profdata), 不重跑测试.
+
+**磁盘峰值控制 (CI)**: forgejo-runner-vm 的根文件系统是 tmpfs, 实测 ~3.9GB
+(默认 size = 50% RAM; VM `mem=8192`, tmpfs 用一半). clippy/doctest 共用的
+`target/debug` (~3GB) 与 coverage 插桩产物 `target/llvm-cov-target` (~1.6GB) 是两份独立编译,
+互不复用, 并存逼近 3.9GB 会触发 "No space left on device".
+`just check --coverage` 在 coverage 编译前 `cargo clean` 释放 `target/debug`,
+实测峰值降到 ~1.4GB, 零时间损失 (coverage 本就要全量重编译).
+本地要 coverage 产物但不想 clean 可用 `just coverage` / `just coverage-html` (不走 check 流程).
 
 cargo-llvm-cov 依赖的 `llvm-cov`/`llvm-profdata` (rust toolchain 不含) 由 runner VM
 的 `rust.mod.nix` 提供 (见 ~/ws/nixos), ci.yml job 级 `env` 注入绝对路径.
