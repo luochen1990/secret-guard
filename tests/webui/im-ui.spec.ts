@@ -489,4 +489,64 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     const hint = page.locator(".tl-top-hint");
     await expect(hint).toHaveText(/向上滚动加载更早的轮次/);
   });
+
+  // ─── Raw view 恢复 + Info icon + Response 单气泡 ──────────────────────────
+  //
+  // 验证三个功能:
+  //   1. 每轮 header 有 info (ℹ) + raw 按钮.
+  //   2. info 按钮弹出传输层元数据 (method/path/status, 无需网络请求).
+  //   3. raw 按钮弹出原始 req_body / resp_body (按需懒拉 /records/{id}).
+  //   4. response 窗口内只有一个 assistant 气泡 (不再因 tool_calls 拆分多个).
+
+  test("info icon + raw 按钮: 弹窗展示传输层信息和原始 body", async ({ page }) => {
+    await sendChat(page, [{ role: "user", content: "info-raw-marker" }]);
+    const sid = await findSessionLeafByPreview(page, "info-raw-marker");
+    await clickSessionByLeaf(page, sid);
+    await page.waitForTimeout(500);
+
+    // 每轮 header 应有 info + raw 按钮.
+    await expect(page.locator("#detail .tl-actions button[data-action='info']")).toHaveCount(1);
+    await expect(page.locator("#detail .tl-actions button[data-action='raw']")).toHaveCount(1);
+
+    // 点击 info → 弹窗含传输层元数据 (method=POST, path 含 provider).
+    await page.locator("#detail .tl-actions button[data-action='info']").click();
+    await page.waitForTimeout(300);
+    const infoDialog = page.locator("dialog.round-dialog");
+    await expect(infoDialog).toBeVisible();
+    const infoText = await infoDialog.textContent();
+    expect(infoText).toContain("POST");
+    expect(infoText).toContain("Path");
+    expect(infoText).toContain("Status");
+    expect(infoText).toContain("Elapsed");
+    // 关闭.
+    await page.locator("dialog.round-dialog .dialog-close").click();
+
+    // 点击 raw → 弹窗含 req_body / resp_body (按需懒拉).
+    await page.locator("#detail .tl-actions button[data-action='raw']").click();
+    await page.waitForTimeout(500);  // 等待 fetch.
+    const rawDialog = page.locator("dialog.round-dialog");
+    await expect(rawDialog).toBeVisible();
+    const rawText = await rawDialog.textContent();
+    expect(rawText).toContain("Request Body");
+    expect(rawText).toContain("Response Body");
+    expect(rawText).toContain("Request Headers");
+    // req_body 应含发送的 marker.
+    expect(rawText).toContain("info-raw-marker");
+    // 关闭.
+    await page.locator("dialog.round-dialog .dialog-close").click();
+  });
+
+  test("response 单气泡: text + tool_calls 合并为一个 assistant 气泡", async ({ page }) => {
+    // 模拟 LLM 返回 text + tool_calls 的混合 response.
+    // 通过 mockito 的默认 mock upstream, response 是固定的.
+    // 这里验证: response-pane 内只有 1 个 assistant 气泡.
+    await sendChat(page, [{ role: "user", content: "single-bubble-marker" }]);
+    const sid = await findSessionLeafByPreview(page, "single-bubble-marker");
+    await clickSessionByLeaf(page, sid);
+    await page.waitForTimeout(500);
+
+    // response-pane 内应只有 1 个 chat-bubble (assistant).
+    const respBubbles = page.locator("#detail .response-pane .chat-bubble");
+    await expect(respBubbles).toHaveCount(1);
+  });
 });

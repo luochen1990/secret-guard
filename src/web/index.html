@@ -556,6 +556,70 @@
     }
     dialog.bubble-full mark.secret-hit { font-weight: 600; }
 
+    /* 轮次弹窗 (info / raw): 传输层元数据 + 原始 body. */
+    dialog.round-dialog {
+      max-width: 80vw;
+      max-height: 85vh;
+      width: 700px;
+      padding: 12px;
+      border: 1px solid #888;
+      border-radius: 6px;
+    }
+    dialog.round-dialog .dialog-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      color: #333;
+    }
+    dialog.round-dialog .dialog-body {
+      max-height: 72vh;
+      overflow-y: auto;
+      font-size: 12px;
+    }
+    /* info 表格 */
+    dialog.round-dialog .info-table { border-collapse: collapse; width: 100%; }
+    dialog.round-dialog .info-table td {
+      padding: 3px 8px;
+      border-bottom: 1px solid #f0f0f0;
+      vertical-align: top;
+    }
+    dialog.round-dialog .info-key {
+      color: #999;
+      white-space: nowrap;
+      width: 110px;
+    }
+    dialog.round-dialog .info-val {
+      color: #333;
+      word-break: break-all;
+      font-family: ui-monospace, monospace;
+      font-size: 11.5px;
+    }
+    /* raw 区块 */
+    dialog.round-dialog .raw-section { margin-bottom: 12px; }
+    dialog.round-dialog .raw-label {
+      font-size: 11px;
+      color: #888;
+      margin-bottom: 2px;
+      font-weight: 600;
+    }
+    dialog.round-dialog .raw-note { color: #b88; font-weight: 400; }
+    dialog.round-dialog .raw-pre {
+      background: #f5f5f5;
+      padding: 6px 8px;
+      border-radius: 4px;
+      font-family: ui-monospace, monospace;
+      font-size: 11px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 300px;
+      overflow-y: auto;
+      margin: 0;
+    }
+    dialog.round-dialog .raw-loading { padding: 20px; text-align: center; color: #999; }
+
     /* ─── IM 风格 detail 布局: 上下分栏 (request 上下文 + response 打字框) ─── */
     /* detail 内部分 detail-header / request-pane / response-pane. */
     .detail-header {
@@ -782,6 +846,19 @@
       margin-top: 4px;
     }
     .tl-round-header .tl-meta { display: flex; gap: 8px; align-items: center; }
+    /* 每轮操作按钮 (info / raw) — 无边框, 灰色, hover 加深. */
+    .tl-round-header .tl-actions { display: flex; gap: 2px; }
+    .tl-round-header .tl-actions button {
+      border: none;
+      background: transparent;
+      color: #aaa;
+      cursor: pointer;
+      font-size: 11px;
+      padding: 2px 5px;
+      border-radius: 3px;
+      line-height: 1;
+    }
+    .tl-round-header .tl-actions button:hover { background: #e0e0e0; color: #555; }
     .tl-round.highlight {
       animation: tl-flash 1.2s ease-out;
     }
@@ -1490,6 +1567,7 @@
     // 以 nodeId 为最末轮, 拉 timeline(limit=TIMELINE_PAGE) 并全量渲染.
     // 用于: 选中会话叶子 / 点击不在视窗内的轮次.
     async function loadTimeline(nodeId) {
+      recordDetailCache.clear();  // 切换轮次时清空 (避免无界增长 + 旧数据残留)
       try {
         const r = await fetch(`${API_NODES}/${nodeId}/timeline?limit=${TIMELINE_PAGE}`, { cache: 'no-store' });
         if (!r.ok) {
@@ -1594,6 +1672,7 @@
       // 全量重建 (结构变化: 新会话 / loadOlder).
       el.innerHTML = renderTimelineHtml();
       bindTimelineScroll();
+      bindRoundActions();
       applyBubbleCollapse();
       // 滚动由调用方决定 (loadTimeline 滚到底, loadOlder 保持锚点).
       // 这里仅在首次渲染 (selectedRound 在末尾) 时作为保底滚到底.
@@ -1603,6 +1682,120 @@
     function scrollTimelineToBottomForce() {
       const el = document.getElementById('detail');
       if (el) el.scrollTop = el.scrollHeight;
+    }
+
+    // 绑定每轮的 info / raw 按钮的事件委托 (挂在稳定的 #detail 上, 全量重建后无需重绑).
+    function bindRoundActions() {
+      const detail = document.getElementById('detail');
+      if (!detail || detail.dataset.roundActionsBound) return;
+      detail.dataset.roundActionsBound = '1';
+      detail.addEventListener('click', (ev) => {
+        const btn = ev.target.closest('.tl-actions button[data-action]');
+        if (!btn) return;
+        ev.stopPropagation();
+        const { action, rid } = btn.dataset;
+        if (action === 'info') openRoundInfo(rid);
+        else if (action === 'raw') openRoundRaw(rid);
+      });
+    }
+
+    // 在 timelineRecords 中按 id 查找轮次摘要.
+    function findRound(id) {
+      return timelineRecords.find(r => r.id === id) || null;
+    }
+
+    // 按 id 拉取完整 ForwardRecord (含 req_body / resp_body / headers).
+    // 用于 raw view + info 弹窗的 headers 展示. 失败返回 null.
+    const recordDetailCache = new Map();  // id → ForwardRecord (会话内复用)
+    async function fetchRecordDetail(id) {
+      if (recordDetailCache.has(id)) return recordDetailCache.get(id);
+      try {
+        const r = await fetch(`${API_RECORDS}/${id}`, { cache: 'no-store' });
+        if (!r.ok) return null;
+        const data = await r.json();
+        const rec = data.record || null;
+        if (rec) recordDetailCache.set(id, rec);
+        return rec;
+      } catch (e) {
+        console.error('fetchRecordDetail failed:', e);
+        return null;
+      }
+    }
+
+    // 打开 info 弹窗: 传输层元数据 (RecordSummary 字段, 无需网络请求).
+    function openRoundInfo(id) {
+      const r = findRound(id);
+      if (!r) return;
+      const redactionN = (r.redactions || []).length;
+      const rows = [
+        ['Round ID', r.id],
+        ['Session', r.session_id || '(unknown)'],
+        ['Time', r.created_at],
+        ['Method', r.method],
+        ['Path', r.path],
+        ['Status', r.resp_status === 0 ? '(pending)' : String(r.resp_status)],
+        ['Elapsed', r.elapsed_ms != null ? `${r.elapsed_ms} ms` : '(pending)'],
+        ['Streamed', r.streamed ? 'yes' : 'no'],
+        ['Complete', r.resp_complete ? 'yes' : 'no'],
+        ['Model', r.model || '(unknown)'],
+        ['Error', r.error || '(none)'],
+        ['Redactions', redactionN > 0 ? `${redactionN} hit(s)` : 'none'],
+      ];
+      const bodyHtml = `<table class="info-table">${rows.map(([k, v]) =>
+        `<tr><td class="info-key">${escapeHtml(k)}</td><td class="info-val">${escapeHtml(v)}</td></tr>`
+      ).join('')}</table>`;
+      openRoundDialog('传输层信息', bodyHtml, id);
+    }
+
+    // 打开 raw view 弹窗: 按需懒拉 ForwardRecord, 展示 req_body / resp_body / headers.
+    async function openRoundRaw(id) {
+      openRoundDialog('Raw data', '<div class="raw-loading">Loading…</div>', id);
+      const rec = await fetchRecordDetail(id);
+      const dlg = document.getElementById('round-dialog');
+      if (!dlg || dlg.dataset.rid !== id) return;  // 用户已切换/关闭
+      if (!rec) {
+        dlg.querySelector('.dialog-body').innerHTML = '<div class="raw-loading">Failed to load record.</div>';
+        return;
+      }
+      const respBodyNote = rec.streamed
+        ? '(streamed response — raw SSE bytes not retained)'
+        : '';
+      const sections = [
+        ['Request Headers', '', formatHeaders(rec.req_headers)],
+        ['Request Body', '(LLM view, secrets redacted)', rec.req_body || '(empty)'],
+        ['Response Headers', '', formatHeaders(rec.resp_headers)],
+        ['Response Body', respBodyNote, rec.resp_body || (rec.streamed ? '' : '(empty)')],
+      ];
+      const bodyHtml = sections.map(([label, note, body]) => `
+        <div class="raw-section">
+          <div class="raw-label">${escapeHtml(label)}${note ? `<span class="raw-note"> ${escapeHtml(note)}</span>` : ''}</div>
+          <pre class="raw-pre">${escapeHtml(body)}</pre>
+        </div>`).join('');
+      dlg.querySelector('.dialog-body').innerHTML = bodyHtml;
+    }
+
+    // 通用轮次弹窗 (info / raw 共用). 内容由 bodyHtml 决定.
+    function openRoundDialog(title, bodyHtml, rid) {
+      let dlg = document.getElementById('round-dialog');
+      if (!dlg) {
+        dlg = document.createElement('dialog');
+        dlg.id = 'round-dialog';
+        dlg.className = 'round-dialog';
+        dlg.innerHTML = `
+          <div class="dialog-header">
+            <span class="dialog-title"></span>
+            <button type="button" class="btn dialog-close">close</button>
+          </div>
+          <div class="dialog-body"></div>
+        `;
+        document.body.appendChild(dlg);
+        dlg.querySelector('.dialog-close').addEventListener('click', () => dlg.close());
+        dlg.addEventListener('click', (ev) => { if (ev.target === dlg) dlg.close(); });
+      }
+      dlg.dataset.rid = rid;
+      dlg.querySelector('.dialog-title').textContent = title;
+      dlg.querySelector('.dialog-body').innerHTML = bodyHtml;
+      dlg.showModal();
     }
 
     // 渲染整个 timeline 的 HTML (每轮 = request bubble + response 打字框).
@@ -1645,6 +1838,10 @@
           <span class="meta">${r.elapsed_ms}ms</span>
           ${r.streamed ? '<span class="badge badge-stream">streamed</span>' : ''}
         </span>
+        <span class="tl-actions">
+          <button type="button" data-action="info" data-rid="${escapeHtml(r.id)}" title="传输层信息">ℹ</button>
+          <button type="button" data-action="raw" data-rid="${escapeHtml(r.id)}" title="原始数据">raw</button>
+        </span>
       </div>`;
       // request-pane: 渲染本轮完整 delta (含 assistant 作为无源气泡).
       inner += `<div class="request-pane" data-rid="${escapeHtml(r.id)}">`;
@@ -1666,7 +1863,7 @@
     // 有源气泡 (非 assistant): 本轮首次引入的 message (system / user / tool_result),
     //   持有 node 上下文, 可被 selectRound 定位 + 展示富信息.
     // 无源气泡 (assistant): 前序轮 response 的历史副本, 纯展示.
-    //   含 text → 文本气泡; 含 tool_calls → 各自 tool_call 气泡 (与 response 侧对称).
+    //   text + tool_calls 合并为单个 assistant 气泡 (与 response 侧一致).
     //
     // fallback: 若 req_delta_messages 为空, 用 preview 渲染单个 user 气泡.
     function renderRequestDelta(r, redactions) {
@@ -1786,44 +1983,60 @@
       return `tool_use ${block.id || ''}\nname: ${block.name || ''}\ninput: ${safeJsonStringify(block.input)}`;
     }
 
-    // 把一条 OpenAI 风格的 message (text content + tool_calls) 渲染为气泡序列.
-    // delta 中的 assistant 和 response 中的 message 共用此逻辑 (DRY, issue #28 review).
-    function renderMessageBubbles(msg, redactions) {
-      const role = msg.role || 'unknown';
-      let parts = [];
-      const text = messageToText(msg);
-      if (text !== null) {
-        parts.push(renderBubble(role, text, redactions, role));
-      }
-      if (role === 'assistant' && Array.isArray(msg.tool_calls)) {
-        for (const tc of msg.tool_calls) {
-          parts.push(renderBubble('assistant', formatToolCall(tc), redactions, 'assistant'));
-        }
-      }
-      return parts.join('');
+    // 把若干文本片段合并为单个 assistant 气泡; parts 为空时返回 empty fallback.
+    // assistant 气泡始终合并 (text + tool_calls/tool_use 不拆分), 因为一个 session
+    // 只有一个 active response → 一个气泡.
+    function renderAssistantBubble(parts, redactions, empty) {
+      return parts.length > 0
+        ? renderBubble('assistant', parts.join('\n\n'), redactions, 'assistant')
+        : (empty || '');
     }
 
-    // 从 parsed_response (OpenAI / Anthropic chat JSON) 提取内容, 渲染为分项气泡.
-    // 每个内容块 (text / tool_call / tool_use) 独立气泡, 不混在一个纯文本块里.
-    // redactions 高亮应用到每个气泡.
+    // 把一条 message 渲染为气泡.
+    // assistant: text + tool_calls 合并为单个 assistant 气泡.
+    // 其他 role (system/user/tool): 独立气泡 (有源 vs 无源区分).
+    function renderMessageBubbles(msg, redactions) {
+      const role = msg.role || 'unknown';
+      if (role === 'assistant') {
+        const parts = [];
+        const text = messageToText(msg);
+        if (text !== null) parts.push(text);
+        if (Array.isArray(msg.tool_calls)) {
+          for (const tc of msg.tool_calls) parts.push(formatToolCall(tc));
+        }
+        return renderAssistantBubble(parts, redactions);
+      }
+      // 非 assistant: 纯文本气泡.
+      const text = messageToText(msg);
+      return text !== null ? renderBubble(role, text, redactions, role) : '';
+    }
+
+    // 从 parsed_response (OpenAI / Anthropic chat JSON) 提取内容, 渲染为单个 assistant 气泡.
+    // redactions 高亮应用到气泡内容.
     function renderResponseText(respJson, redactions) {
       const choice = respJson.choices && respJson.choices[0];
       const openaiMsg = choice && choice.message;
       if (openaiMsg) {
-        // OpenAI: message 含 text content + tool_calls.
-        const html = renderMessageBubbles({ ...openaiMsg, role: 'assistant' }, redactions);
-        return html || '<empty>';
+        // OpenAI: message 含 text content + tool_calls → 合并为单气泡文本.
+        const parts = [];
+        const text = messageToText({ ...openaiMsg, role: 'assistant' });
+        if (text !== null) parts.push(text);
+        if (Array.isArray(openaiMsg.tool_calls)) {
+          for (const tc of openaiMsg.tool_calls) parts.push(formatToolCall(tc));
+        }
+        return renderAssistantBubble(parts, redactions, '<empty>');
       }
       if (Array.isArray(respJson.content)) {
-        let parts = [];
+        // Anthropic: content array (text + tool_use blocks) → 合并为单气泡文本.
+        const parts = [];
         for (const block of respJson.content) {
           if (block && block.type === 'text' && typeof block.text === 'string') {
-            parts.push(renderBubble('assistant', block.text, redactions, 'assistant'));
+            parts.push(block.text);
           } else if (block && block.type === 'tool_use') {
-            parts.push(renderBubble('assistant', formatToolUse(block), redactions, 'assistant'));
+            parts.push(formatToolUse(block));
           }
         }
-        return parts.length > 0 ? parts.join('') : '<empty>';
+        return renderAssistantBubble(parts, redactions, '<empty>');
       }
       // 未知结构: pretty JSON (无气泡包裹, 纯文本 fallback).
       return escapeHtml(safeJsonStringify(respJson));

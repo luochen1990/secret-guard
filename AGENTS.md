@@ -227,6 +227,16 @@ req_delta 含 `role=user`) 显示 preview 文本 + 时间. 紧随其后的工具
 横向排列在组首下方. 圆点颜色 = tool name 哈希 (FNV-1a 调色板, 与 provider 图标复用),
 tooltip 显示 tool name + 时间. 点击圆点 = `selectRound` (同二级条目).
 
+**每轮操作按钮 (info + raw)**: timeline 每轮 header 含两个按钮:
+- `ℹ` info: 弹窗展示传输层元数据 (method/path/status/elapsed/streamed/model/error/redactions
+  等, 全部来自 RecordSummary, 无需网络请求).
+- `raw`: 弹窗展示原始 req_body / resp_body / req_headers / resp_headers (按需懒拉
+  `GET /api/records/{id}`). body 是 LLM 视角 (已 redact, 安全展示); headers 已脱敏
+  (auth/cookie 等 = `<redacted>`). 流式响应的 resp_body 为空 (不保留 SSE 字节), 显示提示.
+
+**Response 单气泡**: 一个 session 只有一个 active response → response-pane 内只渲染
+一个 assistant 气泡 (text + tool_calls 合并展示, 不拆分为多个分项气泡).
+
 **ForwardRecord.redactions**: `Vec<(mock, secret_id)>` — 从 `redact_ir` 产出的
 `RedactionMap` SSOT 派生 (见 `proxy.rs::derive_redactions`). WebUI 的 mock 高亮和 "命中"
 筛选都基于此字段, **永不**在前端重新计算, 避免前后端漂移. 不含真实 secret value, 可安全暴露.
@@ -598,6 +608,9 @@ devShell 的 `shellHook` 自动把 `@playwright/test` 的 node_modules symlink �
 - 三级小圆点: 工具调用轮次折叠为横向彩色圆点 (tool name 哈希着色)
 - 短会话首屏不显示 "已经到顶了" (reachedTop 仅在 loadOlder 探测后置位)
 - 气泡间微小间距 (margin-bottom, 避免视觉粘连)
+- 每轮 info ℹ 按钮: 弹窗展示传输层元数据 (无网络请求)
+- 每轮 raw 按钮: 弹窗展示原始 body + headers (按需懒拉 /records/{id})
+- response 单气泡 (text + tool_calls 合并, 不拆分)
 
 运行 (在 devShell 内): `just check-webui`.
 

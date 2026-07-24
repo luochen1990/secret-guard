@@ -28,6 +28,28 @@ def _build_reply(user_msg: str) -> str:
     return "Hello! This is a mock response."
 
 
+def _build_message(user_msg: str) -> dict:
+    """Build the assistant message for the response.
+
+    For 'single-bubble' marker, returns a message with both text content AND
+    tool_calls — used to verify that text + tool_calls merge into ONE bubble
+    (not split into multiple) in the response pane.
+    """
+    if "single-bubble" in user_msg.lower():
+        return {
+            "role": "assistant",
+            "content": "Let me check that for you.",
+            "tool_calls": [
+                {
+                    "id": "tc_sb1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"},
+                }
+            ],
+        }
+    return {"role": "assistant", "content": _build_reply(user_msg)}
+
+
 def _handle_non_stream(req_body: dict) -> bytes:
     """Build a non-streaming OpenAI Chat Completions response."""
     user_msg = ""
@@ -43,12 +65,14 @@ def _handle_non_stream(req_body: dict) -> bytes:
             break
 
     reply = _build_reply(user_msg)
+    message = _build_message(user_msg)
+    finish_reason = "tool_calls" if message.get("tool_calls") else "stop"
     return json.dumps(
         {
             "choices": [
                 {
-                    "message": {"role": "assistant", "content": reply},
-                    "finish_reason": "stop",
+                    "message": message,
+                    "finish_reason": finish_reason,
                     "index": 0,
                 }
             ],
