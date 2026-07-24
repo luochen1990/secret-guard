@@ -292,7 +292,9 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     await clickSessionByLeaf(page, sid);
     await page.waitForTimeout(500);
 
-    await expect(page.locator(".round-item")).toHaveCount(3);
+    // 分组渲染: 用户轮次 (round1) 作为组首, 后续工具调用轮次 (round2/3) 折叠为小圆点.
+    await expect(page.locator(".round-item")).toHaveCount(1);
+    await expect(page.locator(".sub-dot")).toHaveCount(2);
     // delta 内容验证: tool_result 气泡 + assistant tool_call 气泡应存在.
     expect(await page.locator("#detail .chat-bubble[data-role='tool']").count()).toBeGreaterThan(0);
     expect(await page.locator("#detail .chat-bubble.bubble-assistant").count()).toBeGreaterThan(0);
@@ -337,6 +339,14 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     if (toolCount > 0) {
       const toolText = await toolBubbles.first().textContent();
       expect(toolText).toContain("Sunny");
+    }
+
+    // 3. tool_result 气泡的 chat-row 应靠右 (客户端发送: user + tool_result 都在右侧;
+    //    assistant 在左侧). 检查 flex-direction 为 row-reverse.
+    const toolRow = page.locator("#detail .chat-row.row-tool").first();
+    if (await toolRow.count() > 0) {
+      const fd = await toolRow.evaluate((el) => getComputedStyle(el).flexDirection);
+      expect(fd, "tool_result (客户端发送) 应靠右 row-reverse").toBe("row-reverse");
     }
   });
 
@@ -410,5 +420,73 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
       const asstText = await assistantBubbles.first().textContent();
       expect(asstText).toContain("phaseA-assistant-round1");
     }
+  });
+
+  // ─── 三级条目小圆点: 工具调用轮次折叠为横向圆点 ──────────────────────────
+  //
+  // 验证 sidebar 分组渲染:
+  //   - 用户轮次作为组首 (.round-item, 显示 preview).
+  //   - 紧随的纯工具调用轮次折叠为 .sub-dot (横向排列, 颜色 = tool name hash).
+  //   - 不同 tool name 产生不同颜色.
+  test("三级圆点: 工具调用轮次折叠为彩色小圆点", async ({ page }) => {
+    // 轮1: 用户提问 → LLM 返回 tool_call(ls).
+    await sendChat(page, [
+      { role: "user", content: "dots-user-question-marker" },
+    ]);
+    // 轮2: agent tool_call(ls) + tool_result → LLM 返回 tool_call(cat).
+    await sendChat(page, [
+      { role: "user", content: "dots-user-question-marker" },
+      { role: "assistant", content: null, tool_calls: [{ id: "d1", type: "function", function: { name: "ls", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "d1", content: "file_a" },
+    ]);
+    // 轮3: agent tool_call(cat) + tool_result → LLM 返回最终文本.
+    await sendChat(page, [
+      { role: "user", content: "dots-user-question-marker" },
+      { role: "assistant", content: null, tool_calls: [{ id: "d1", type: "function", function: { name: "ls", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "d1", content: "file_a" },
+      { role: "assistant", content: null, tool_calls: [{ id: "d2", type: "function", function: { name: "cat", arguments: '{"f":"a"}' } }] },
+      { role: "tool", tool_call_id: "d2", content: "content_a" },
+    ]);
+
+    const sid = await findSessionLeafByPreview(page, "dots-user-question-marker");
+    await clickSessionByLeaf(page, sid);
+    await page.waitForTimeout(500);
+
+    // 1 个组首 (.round-item = 用户轮次), 2 个小圆点 (.sub-dot = 工具调用轮次).
+    await expect(page.locator(".round-item")).toHaveCount(1);
+    await expect(page.locator(".sub-dot")).toHaveCount(2);
+
+    // 两个圆点颜色不同 (tool name "ls" vs "cat" 哈希不同).
+    const dots = page.locator(".sub-dot");
+    const bg1 = await dots.nth(0).evaluate((el) => getComputedStyle(el).backgroundColor);
+    const bg2 = await dots.nth(1).evaluate((el) => getComputedStyle(el).backgroundColor);
+    expect(bg1, "不同 tool name 应产生不同颜色").not.toBe(bg2);
+
+    // 圆点 tooltip 应含 tool name.
+    const title1 = await dots.nth(0).getAttribute("title") || "";
+    expect(title1).toContain("ls");
+    const title2 = await dots.nth(1).getAttribute("title") || "";
+    expect(title2).toContain("cat");
+
+    // 点击圆点应选中对应轮次 (右侧 timeline 高亮).
+    await dots.nth(1).click();
+    await page.waitForTimeout(500);
+    await expect(page.locator(".sub-dot.active")).toHaveCount(1);
+  });
+
+  // ─── "已经到顶了" 提示: 短会话首次加载不应显示 ──────────────────────────────
+  //
+  // 验证 Bug 修复: 之前 loadTimeline 在 records.length < limit 时直接置
+  // timelineReachedTop=true, 导致短会话 (< 10 轮) 首屏即显示 "已经到顶了".
+  // 修复后: 只有用户实际滚顶触发 loadOlder 探测后才可能置 true.
+  test("短会话首屏不显示 \"已经到顶了\"", async ({ page }) => {
+    // 单轮会话.
+    await sendChat(page, [{ role: "user", content: "top-hint-single-marker" }]);
+    const sid = await findSessionLeafByPreview(page, "top-hint-single-marker");
+    await clickSessionByLeaf(page, sid);
+    await page.waitForTimeout(500);
+
+    const hint = page.locator(".tl-top-hint");
+    await expect(hint).toHaveText(/向上滚动加载更早的轮次/);
   });
 });

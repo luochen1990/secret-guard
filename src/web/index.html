@@ -419,9 +419,15 @@
       align-items: flex-start;
       gap: 6px;
       max-width: 100%;
+      margin-bottom: 6px;   /* 气泡间微小间距, 避免视觉粘连 (Bug: 重叠) */
     }
+    .chat-row:last-child { margin-bottom: 0; }
     /* user 消息靠右 (IM 风格: 自己发的消息在右侧). */
     .chat-row.row-user { flex-direction: row-reverse; }
+    /* tool_result 也靠右: 它是 agent 把工具执行结果发给 LLM 的, 属于客户端发送.
+       左右归属原则: 右 = 客户端发送 (user, tool_result), 左 = 服务端返回 (assistant,
+       含 assistant 发起的 tool_calls / response 的 tool_use). */
+    .chat-row.row-tool { flex-direction: row-reverse; }
     /* sender icon: 圆形彩色背景, 单字母标识, 不占气泡内容行高. */
     .sender-icon {
       flex-shrink: 0;
@@ -679,15 +685,17 @@
     /* 二级轮次列表: 缩进, 默认隐藏 (会话折叠时). */
     .round-list { display: none; }
     .round-list.expanded { display: block; }
+    /* round-group: 一个用户轮次 (组首) + 紧随其后的工具调用子轮次 (圆点行). */
+    .round-group { border-bottom: 1px solid #f5f5f5; }
+    .round-group:last-child { border-bottom: none; }
     .round-item {
       display: grid;
-      grid-template-columns: auto 1fr auto;
+      grid-template-columns: 1fr auto;
       align-items: center;
       gap: 4px;
-      padding: 3px 10px 3px 38px;  /* 左缩进对齐会话头 line1 起始位置 */
+      padding: 3px 10px 3px 20px;  /* 左缩进 20px (不再对齐 line1, 紧凑利用空间) */
       line-height: 1.3;
       cursor: pointer;
-      border-bottom: 1px solid #f5f5f5;
       font-size: 11.5px;
       color: #555;
     }
@@ -706,6 +714,27 @@
       font-size: 10px;
       color: #999;
     }
+
+    /* 三级条目: 工具调用子轮次 = 横向排列的可点击小圆点.
+       颜色由 tool name 哈希得到 (providerColor 复用). 仅在组首下方出现. */
+    .sub-rounds {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      padding: 1px 10px 4px 20px;
+    }
+    .sub-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      display: inline-block;
+      cursor: pointer;
+      vertical-align: middle;
+      transition: transform 0.1s ease;
+    }
+    .sub-dot:hover { transform: scale(1.4); }
+    /* active 用 outline (不参与布局流, 切换时无尺寸抖动). */
+    .sub-dot.active { outline: 1.5px solid #4a6fa5; outline-offset: 1px; }
 
     /* ─── timeline 顶/底悬浮按钮 ─────────────────────────────────────────── */
     .scroll-nav {
@@ -998,7 +1027,9 @@
     //   selectedRound    — 当前选中/高亮的轮次 node_id (null = 未定位到具体轮次).
     //   timelineRecords  — 当前右侧 timeline 渲染的轮次数组 (oldest-first).
     //   timelineOldest   — timeline 中最老 node 的 id (用于惰性加载判断 "是否到顶").
-    //   timelineReachedTop — 已加载到会话根 (无法再向上 load), 显示 "已经到顶了".
+    //   timelineReachedTop  — 已确认到顶 (loadOlder 探测返回 ≤ limit 条).
+    //                         初始 false; 仅在用户实际滚顶触发 loadOlder 后才可能置 true.
+    //                         避免短会话首次加载即显示 "已经到顶了" (Bug: 无条件显示).
     //   loadingOlder     — 正在加载更早的轮次 (防重复触发).
     let sessionsList = [];
     let sessionsTotal = 0;
@@ -1194,7 +1225,33 @@
       }
     }
 
+    // 判断一个轮次是否是 "用户轮次" (req_delta 含 role=user 的 message).
+    // 用户轮次作为二级条目 (组首); 纯工具调用轮次 (assistant+tool_result, 无 user)
+    // 作为三级小圆点挂在最近一个组首下方.
+    function isUserRound(r) {
+      return (r.req_delta_messages || []).some(m => m.role === 'user');
+    }
+
+    // 从工具调用轮次的 delta 中提取首个 tool name (用于圆点颜色 + tooltip).
+    // 来源: assistant.tool_calls[].function.name. 任一未命中则返回 '?'
+    // (tool message 本身不带 tool name, 不作来源).
+    function toolNameOfRound(r) {
+      for (const m of (r.req_delta_messages || [])) {
+        if (m.role === 'assistant' && Array.isArray(m.tool_calls)) {
+          for (const tc of m.tool_calls) {
+            const name = tc && tc.function && tc.function.name;
+            if (name) return name;
+          }
+        }
+      }
+      return '?';
+    }
+
     // 展开后的二级轮次列表渲染 (从 sessionRounds 缓存, 若无则触发 fetch).
+    //
+    // 分组渲染: 用户轮次 (req_delta 含 user message) 作为组首 (.round-item),
+    // 紧随其后的工具调用轮次 (无 user, 只有 assistant+tool_result) 折叠为横向小圆点
+    // (.sub-rounds > .sub-dot), 颜色 = tool name 哈希. 圆点点击 = selectRound.
     function renderRounds(sessionId) {
       const wrap = document.querySelector(`.round-list[data-sid="${CSS.escape(sessionId)}"]`);
       if (!wrap) return;
@@ -1208,22 +1265,41 @@
         wrap.innerHTML = '<div class="empty" style="padding:8px;font-size:11px;">(empty)</div>';
         return;
       }
-      wrap.innerHTML = rounds.map((r, idx) => {
+      // 分组: 每个组 = [headRound, [toolRound...]]. headRound 是用户轮次 (或首个无 user
+      // 的孤儿轮次, 作为隐式组首). 工具轮次紧跟组首, 直到下一个用户轮次开启新组.
+      const groups = [];
+      for (const r of rounds) {
+        if (groups.length === 0 || isUserRound(r)) {
+          groups.push({ head: r, tools: [] });
+        } else {
+          groups[groups.length - 1].tools.push(r);
+        }
+      }
+      wrap.innerHTML = groups.map(g => {
+        const r = g.head;
         const preview = r.preview || `${r.method} ${r.path}`;
         const status = escapeHtml(statusText(r));
         const isActive = r.id === selectedRound;
-        const num = idx + 1;
-        return `
+        const headHtml = `
           <div class="round-item ${isActive ? 'active' : ''}" data-sid="${escapeHtml(sessionId)}" data-rid="${escapeHtml(r.id)}">
-            <span class="ri-line1" title="${escapeHtml(preview)}">#${num} ${escapeHtml(preview)}</span>
+            <span class="ri-line1" title="${escapeHtml(preview)}">${escapeHtml(preview)}</span>
             <span class="ri-right">
               <span class="meta">${escapeHtml(formatTime(r.created_at))}</span>
               <span class="${statusClass(r)}">${status}</span>
             </span>
-          </div>
-        `;
+          </div>`;
+        const dotsHtml = g.tools.length > 0
+          ? `<div class="sub-rounds">${g.tools.map(t => {
+              const name = toolNameOfRound(t);
+              const color = providerColor(name);
+              const dotActive = t.id === selectedRound ? ' active' : '';
+              return `<span class="sub-dot${dotActive}" style="background:${color}" data-sid="${escapeHtml(sessionId)}" data-rid="${escapeHtml(t.id)}" title="${escapeHtml(name)} · ${escapeHtml(formatTime(t.created_at))}"></span>`;
+            }).join('')}</div>`
+          : '';
+        return `<div class="round-group">${headHtml}${dotsHtml}</div>`;
       }).join('');
-      wrap.querySelectorAll('.round-item').forEach(node => {
+      // 绑定组首 + 圆点点击 (两者都是带 data-rid 的可点击条目 → selectRound).
+      wrap.querySelectorAll('.round-item, .sub-dot').forEach(node => {
         node.addEventListener('click', (ev) => {
           ev.stopPropagation();
           selectRound(node.dataset.rid);
@@ -1427,8 +1503,10 @@
         const data = await r.json();
         timelineRecords = data.records || [];
         timelineOldest = timelineRecords.length > 0 ? timelineRecords[0].id : null;
-        // reachedTop 可从响应长度直接推导: 返回 < limit 说明 parent 链已耗尽 (无更早轮次).
-        timelineReachedTop = timelineRecords.length < TIMELINE_PAGE;
+        // 不在初次加载时推断 reachedTop: reachedTop 的语义是 "用户滚顶探测后确认到顶",
+        // 不是 "当前窗口少于 limit". 短会话首屏即显示 "已经到顶了" 是误导 (Bug).
+        // 只有 loadOlder 实际探测 parent 链耗尽后才置 true.
+        timelineReachedTop = false;
         renderTimeline(true);
         // 选中会话叶子 → 滚到最末轮 (最新, IM 风格).
         scrollTimelineToBottomForce();

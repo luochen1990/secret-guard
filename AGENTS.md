@@ -20,6 +20,26 @@
 - **测试**: cargo-nextest + proptest (property-based) + mockito (集成测试)
 - **覆盖率**: cargo-llvm-cov (LLVM source-based, 行级精度). 细节见"测试策略 → 覆盖率工具".
 
+## 关键不变式与鲁棒性原则
+
+> secret-guard 的核心职责 (转发 + redact) 必须对任意字节流零失败.
+> 围绕核心职责之外、**基于对 LLM 应用层行为模式强假设** 的附加功能
+> (preview 提取 / delta 切片 / WebUI 分组渲染 / tool name 推断等) 是"尽力而为"增强,
+> 绝不能因假设不成立而让请求失败或进程崩溃.
+
+对这类"尝试性解析"功能, 必须同时满足:
+
+1. **鲁棒性处理 (best-effort, 永不 panic)**: 解析路径用 `Option`/`Result` 传播失败,
+   缺字段 / 类型不符 / 空数组 / 越界都返回 `None` 或空, 由调用方走 fallback
+   (如 preview fallback 到 `method + path`, delta 切片 fallback 到空 `Vec`,
+   tool name fallback 到 `'?'`). Rust 侧用 `?` 短路; 前端用 `|| []` / `|| '?'` 兜底.
+2. **假设声明注释**: 每个解析点必须在注释中显式写出它对输入的假设
+   (如 "假设 messages 数组中 user 在 assistant 之前", "假设 tool_calls 含 function.name"),
+   以及假设不成立时的降级行为. 这样后续维护者能立刻识别哪些是脆弱假设.
+
+已实践此原则的典型位置: `web::api::extract_preview_and_model` (preview 提取),
+`dag::extract_delta_messages` (delta 切片), `index.html::toolNameOfRound` (tool name 推断).
+
 ## 路由策略 (核心契约)
 
 URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标 provider,
@@ -198,6 +218,14 @@ PATCH  /__sg/api/providers/{id}/decision
 (返回叶子节点 + record_count + latest 字段); 二级 (轮次列表) 与右侧 timeline 对话流来自
 `GET /api/nodes/{id}/timeline?limit=N` (沿 parent 链向上取 N 个祖先, oldest-first).
 timeline 惰性加载: 滚到顶时以最老 node 的 parent 为新起点 prepend 更早 N 轮 (保持滚动锚点).
+`timelineReachedTop` 仅在用户实际滚顶触发 `loadOlder` 探测后置位 (而非初次加载时从
+records.length < limit 推断), 避免短会话首屏即显示 "已经到顶了".
+
+**Sidebar 分组渲染 (二级 + 三级小圆点)**: 二级条目 (`.round-item` = 用户轮次,
+req_delta 含 `role=user`) 显示 preview 文本 + 时间. 紧随其后的工具调用轮次
+(req_delta 无 user, 仅 assistant+tool_result) 折叠为三级小圆点 (`.sub-dot`),
+横向排列在组首下方. 圆点颜色 = tool name 哈希 (FNV-1a 调色板, 与 provider 图标复用),
+tooltip 显示 tool name + 时间. 点击圆点 = `selectRound` (同二级条目).
 
 **ForwardRecord.redactions**: `Vec<(mock, secret_id)>` — 从 `redact_ir` 产出的
 `RedactionMap` SSOT 派生 (见 `proxy.rs::derive_redactions`). WebUI 的 mock 高亮和 "命中"
@@ -567,6 +595,9 @@ devShell 的 `shellHook` 自动把 `@playwright/test` 的 node_modules symlink �
 - response 打字框布局 (固定底部, 独立滚动)
 - sidebar preview + model 字段显示
 - 气泡颜色 + sender icon 分类
+- 三级小圆点: 工具调用轮次折叠为横向彩色圆点 (tool name 哈希着色)
+- 短会话首屏不显示 "已经到顶了" (reachedTop 仅在 loadOlder 探测后置位)
+- 气泡间微小间距 (margin-bottom, 避免视觉粘连)
 
 运行 (在 devShell 内): `just check-webui`.
 
