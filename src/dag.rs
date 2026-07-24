@@ -451,24 +451,21 @@ struct ParentLookup {
 /// 把 DAG 中所有 node id 按 (created_at desc, id desc) 排序后返回.
 ///
 /// SSOT for "newest-first" 排序: [`ConversationDag::list_node_ids_newest_first`]
-/// 与 [`ConversationDag::list_page`] 共享同一排序闭包, 避免 12 行重复逻辑分叉.
+/// 与 [`ConversationDag::list_page`] 共享同一排序实现, 避免 12 行重复逻辑分叉.
 /// tie 时按 id 排序保证确定性 (HashMap keys 迭代顺序非确定).
+///
+/// 性能优化 (perf): 预提取 `(created_at, id)` tuple 一次再 sort, 避免比较闭包内
+/// 对每次比较重复 `nodes.get()` 查找 (N log N 次 get → N 次预提取).
 fn sort_node_ids_newest_first(inner: &DagInner) -> Vec<Uuid> {
-    let mut ids: Vec<Uuid> = inner.nodes.keys().copied().collect();
-    ids.sort_by(|a, b| {
-        let ta = inner
-            .nodes
-            .get(a)
-            .map(|n| n.event.created_at)
-            .unwrap_or_default();
-        let tb = inner
-            .nodes
-            .get(b)
-            .map(|n| n.event.created_at)
-            .unwrap_or_default();
-        tb.cmp(&ta).then_with(|| b.cmp(a))
-    });
-    ids
+    let mut keyed: Vec<(DateTime<Utc>, Uuid)> = inner
+        .nodes
+        .iter()
+        .map(|(id, n)| (n.event.created_at, *id))
+        .collect();
+    // 稳定倒序: 先正序排序再 reverse, 等价于 (created_at desc, id desc).
+    keyed.sort_unstable();
+    keyed.reverse();
+    keyed.into_iter().map(|(_, id)| id).collect()
 }
 
 impl Default for ConversationDag {
@@ -881,6 +878,9 @@ impl ConversationDag {
 
     /// 按 created_at 倒序列出 node id (newest first).
     /// tie 时按 id 排序保证确定性 (HashMap keys 迭代顺序非确定).
+    ///
+    /// 实现预提取 `(created_at, id)` tuple 再 sort, 避免比较闭包内对每个比较
+    /// 重复 `nodes.get()` 查找 (N log N 次比较 → N 次预提取).
     pub fn list_node_ids_newest_first(&self) -> Vec<Uuid> {
         let g = self.inner.read();
         sort_node_ids_newest_first(&g)
