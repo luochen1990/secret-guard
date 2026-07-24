@@ -1363,4 +1363,112 @@ mod tests {
         let events = reader().read_response_events("ping", &data, &mut state);
         assert!(events.is_empty());
     }
+
+    // ─── Image block: 多模态唯一通路 (read + write) ─────────────────────
+    //
+    // Anthropic 用 `{"type":"image","source":{"type":"base64"|"url",...}}` 表达图片,
+    // 与 OpenAI 的 `image_url.url` 字段格式不同. 这里覆盖 base64 和 url 两种 source.
+
+    #[test]
+    fn read_block_image_base64() {
+        // Anthropic image source.type=base64 → IR Image{Base64}.
+        let body = json!({
+            "model": "claude",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "iVBORw0KGgo=",
+                    },
+                }],
+            }],
+            "max_tokens": 10,
+        });
+        let ir = reader().read_request(&body).unwrap();
+        match &ir.messages[0].content[0] {
+            IrBlock::Image { source } => match source {
+                IrImageSource::Base64 { media_type, data } => {
+                    assert_eq!(media_type, "image/png");
+                    assert_eq!(data, "iVBORw0KGgo=");
+                }
+                other => panic!("expected Base64, got {other:?}"),
+            },
+            other => panic!("expected Image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_block_image_url() {
+        // Anthropic image source.type=url → IR Image{Url}.
+        let body = json!({
+            "model": "claude",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "image",
+                    "source": {"type": "url", "url": "https://example.com/dog.jpg"},
+                }],
+            }],
+            "max_tokens": 10,
+        });
+        let ir = reader().read_request(&body).unwrap();
+        match &ir.messages[0].content[0] {
+            IrBlock::Image { source } => {
+                assert_eq!(
+                    source,
+                    &IrImageSource::Url("https://example.com/dog.jpg".into())
+                );
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_block_image_base64() {
+        // IR Image{Base64} → Anthropic image source.type=base64.
+        let ir = IrRequest {
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![IrBlock::Image {
+                    source: IrImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data: "abc==".into(),
+                    },
+                }],
+            }],
+            model: "claude".into(),
+            max_tokens: Some(50),
+            ..Default::default()
+        };
+        let v = writer().write_request(&ir);
+        let content = v["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "image");
+        let src = &content[0]["source"];
+        assert_eq!(src["type"], "base64");
+        assert_eq!(src["media_type"], "image/png");
+        assert_eq!(src["data"], "abc==");
+    }
+
+    #[test]
+    fn write_block_image_url() {
+        // IR Image{Url} → Anthropic image source.type=url.
+        let ir = IrRequest {
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![IrBlock::Image {
+                    source: IrImageSource::Url("https://example.com/img.png".into()),
+                }],
+            }],
+            model: "claude".into(),
+            max_tokens: Some(50),
+            ..Default::default()
+        };
+        let v = writer().write_request(&ir);
+        let src = &v["messages"][0]["content"][0]["source"];
+        assert_eq!(src["type"], "url");
+        assert_eq!(src["url"], "https://example.com/img.png");
+    }
 }

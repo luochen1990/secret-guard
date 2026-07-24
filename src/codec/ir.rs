@@ -379,4 +379,67 @@ mod tests {
             IrToolChoice::Tool { name: "y".into() }
         );
     }
+
+    // ─── IrUsage::is_zero ──────────────────────────────────────────────
+    //
+    // is_zero 是多个决策点的 SSOT (openai_writer 决定是否附 usage、StreamTranslate
+    // post-stop guard 决定是否放行 MessageDelta). 任何字段非零都应返回 false.
+    // 新增字段时只需更新 is_zero 方法本身, 这些测试自动覆盖回归.
+
+    #[test]
+    fn ir_usage_is_zero_when_all_fields_zero() {
+        // 全零 (含 None cache 字段) → true.
+        assert!(IrUsage::zero().is_zero());
+        assert!(IrUsage::default().is_zero());
+    }
+
+    #[test]
+    fn ir_usage_is_zero_when_cache_fields_are_none() {
+        // 显式 None 的 cache 字段也算零.
+        assert!(
+            IrUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            }
+            .is_zero()
+        );
+    }
+
+    #[test]
+    fn ir_usage_is_nonzero_when_input_tokens_nonzero() {
+        let u = IrUsage {
+            input_tokens: 1,
+            ..Default::default()
+        };
+        assert!(!u.is_zero());
+    }
+
+    #[test]
+    fn ir_usage_is_nonzero_when_output_tokens_nonzero() {
+        let u = IrUsage {
+            output_tokens: 1,
+            ..Default::default()
+        };
+        assert!(!u.is_zero());
+    }
+
+    #[test]
+    fn ir_usage_is_nonzero_when_cache_read_input_tokens_nonzero() {
+        let u = IrUsage {
+            cache_read_input_tokens: Some(1),
+            ..Default::default()
+        };
+        assert!(!u.is_zero());
+    }
+
+    #[test]
+    fn ir_usage_is_nonzero_when_cache_creation_input_tokens_nonzero() {
+        let u = IrUsage {
+            cache_creation_input_tokens: Some(1),
+            ..Default::default()
+        };
+        assert!(!u.is_zero());
+    }
 }

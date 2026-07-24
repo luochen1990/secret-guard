@@ -1394,6 +1394,214 @@ mod tests {
         assert_eq!(ir1.stop, vec!["END".to_string()]);
     }
 
+    // ─── 跨协议 round-trip: OpenAI → IR → Anthropic → IR → OpenAI ───────
+    //
+    // 背景: AGENTS.md 把 OpenAI ⇄ Anthropic 双向翻译列为核心职责, 但之前只有同协议
+    // round-trip. 这里补 `openai_reader → anthropic_writer → anthropic_reader → openai_writer`
+    // 的全链路 round-trip, 验证语义关键字段 (role/text/tool name+input/tool_result) 保真.
+    //
+    // 跨协议不可能 byte-exact (字段语义差异), 我们断言**语义关键字段**相等, 并用注释说明
+    // 哪些字段在跨协议中会丢失/转换:
+    //   - OpenAI `max_tokens` 可选 / Anthropic 必填 (writer 缺失时注入 DEFAULT_MAX_TOKENS).
+    //   - OpenAI temperature 无上限 / Anthropic 必须 [0,1] (writer clamp).
+    //   - OpenAI tool 消息是独立 role:"tool" / Anthropic 是 user 消息内的 tool_result 块.
+    //   - OpenAI `extra` 字段在跨协议时被清空 (防源协议独有字段泄漏).
+
+    /// 跨协议 round-trip 辅助: 提取语义关键字段做相等断言 (不比较 max_tokens/temperature
+    /// 等协议特定归一化字段, 也不比较 extra).
+    fn assert_cross_proto_semantic_eq(a: &IrRequest, b: &IrRequest, ctx: &str) {
+        assert_eq!(a.messages.len(), b.messages.len(), "{ctx}: message count");
+        for (i, (am, bm)) in a.messages.iter().zip(b.messages.iter()).enumerate() {
+            assert_eq!(am.role, bm.role, "{ctx}: msg[{i}].role");
+            assert_eq!(
+                am.content.len(),
+                bm.content.len(),
+                "{ctx}: msg[{i}].content.len()"
+            );
+            for (j, (ab, bb)) in am.content.iter().zip(bm.content.iter()).enumerate() {
+                match (ab, bb) {
+                    (IrBlock::Text { text: at }, IrBlock::Text { text: bt }) => {
+                        assert_eq!(at, bt, "{ctx}: msg[{i}].block[{j}] text");
+                    }
+                    (
+                        IrBlock::ToolUse {
+                            id: aid,
+                            name: an,
+                            input: ain,
+                        },
+                        IrBlock::ToolUse {
+                            id: bid,
+                            name: bn,
+                            input: bin,
+                        },
+                    ) => {
+                        assert_eq!(aid, bid, "{ctx}: msg[{i}].block[{j}] tool id");
+                        assert_eq!(an, bn, "{ctx}: msg[{i}].block[{j}] tool name");
+                        assert_eq!(ain, bin, "{ctx}: msg[{i}].block[{j}] tool input");
+                    }
+                    (
+                        IrBlock::ToolResult {
+                            tool_use_id: aid,
+                            content: ac,
+                            is_error: ae,
+                        },
+                        IrBlock::ToolResult {
+                            tool_use_id: bid,
+                            content: bc,
+                            is_error: be,
+                        },
+                    ) => {
+                        assert_eq!(aid, bid, "{ctx}: msg[{i}].block[{j}] tool_use_id");
+                        assert_eq!(ae, be, "{ctx}: msg[{i}].block[{j}] is_error");
+                        assert_eq!(
+                            ac.len(),
+                            bc.len(),
+                            "{ctx}: msg[{i}].block[{j}] tool_result content.len()"
+                        );
+                    }
+                    (left, right) => {
+                        panic!(
+                            "{ctx}: msg[{i}].block[{j}] block type mismatch: {left:?} vs {right:?}"
+                        );
+                    }
+                }
+            }
+        }
+        // system 内容 (纯文本) 跨协议保真.
+        assert_eq!(a.system.len(), b.system.len(), "{ctx}: system.len()");
+    }
+
+    #[test]
+    fn cross_proto_round_trip_text_only_messages() {
+        // 纯文本 user/assistant 消息往返: OpenAI → Anthropic → OpenAI.
+        use crate::codec::anthropic::{AnthropicReader, AnthropicWriter};
+        let original = json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi there!"},
+                {"role": "user", "content": "Bye"},
+            ],
+        });
+        // 1. OpenAI → IR.
+        let ir1 = reader().read_request(&original).unwrap();
+        // 2. IR → Anthropic wire.
+        let anth_wire = AnthropicWriter.write_request(&ir1);
+        // 3. Anthropic wire → IR.
+        let ir2 = AnthropicReader.read_request(&anth_wire).unwrap();
+        // 4. IR → OpenAI wire.
+        let oai_wire = writer().write_request(&ir2);
+        // 5. OpenAI wire → IR.
+        let ir3 = reader().read_request(&oai_wire).unwrap();
+        // 关键语义字段 (role + text content) 跨协议保真.
+        assert_cross_proto_semantic_eq(&ir1, &ir2, "OpenAI→Anthropic");
+        assert_cross_proto_semantic_eq(&ir2, &ir3, "Anthropic→OpenAI");
+    }
+
+    #[test]
+    fn cross_proto_round_trip_system_prompt() {
+        // system message 的跨协议转换:
+        //   OpenAI messages[0]=system → IR.system → Anthropic 顶层 system 字段 → IR.system.
+        use crate::codec::anthropic::{AnthropicReader, AnthropicWriter};
+        let original = json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "Hi"},
+            ],
+        });
+        let ir1 = reader().read_request(&original).unwrap();
+        // 关键: OpenAI reader 把 system message 提升到 ir.system, messages 里只剩 user.
+        assert_eq!(ir1.system.len(), 1, "OpenAI reader should promote system");
+        assert_eq!(ir1.messages.len(), 1);
+        let anth_wire = AnthropicWriter.write_request(&ir1);
+        // 关键: Anthropic writer 把 ir.system 写成顶层 system 字段 (string 形式).
+        assert_eq!(
+            anth_wire["system"], "You are a helpful assistant.",
+            "system should be top-level string in Anthropic wire"
+        );
+        let ir2 = AnthropicReader.read_request(&anth_wire).unwrap();
+        // Anthropic reader 把顶层 system 读回 ir.system.
+        assert_eq!(ir2.system.len(), 1);
+        assert_eq!(ir2.messages.len(), 1);
+        // 写回 OpenAI: system 又变回 messages[0].
+        let oai_wire = writer().write_request(&ir2);
+        let messages = oai_wire["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "You are a helpful assistant.");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages.len(), 2, "system + 1 user message");
+        // 语义等价 (system text 保真).
+        assert_cross_proto_semantic_eq(&ir1, &ir2, "system: OpenAI→Anthropic");
+    }
+
+    #[test]
+    fn cross_proto_round_trip_tool_use_and_tool_result() {
+        // 工具调用往返: assistant 的 ToolUse + user 的 ToolResult 跨协议保真.
+        //
+        // 关键差异 (语义等价但 wire 不同):
+        //   OpenAI: assistant.tool_calls[] + 独立 role:"tool" 消息
+        //   Anthropic: assistant 的 tool_use 块 + user 消息内的 tool_result 块
+        use crate::codec::anthropic::{AnthropicReader, AnthropicWriter};
+        let original = json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "user", "content": "weather?"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_42", "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\":\"SF\"}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_42", "content": "Sunny, 20C"},
+            ],
+        });
+        // OpenAI → IR.
+        let ir1 = reader().read_request(&original).unwrap();
+        // IR 里 assistant 消息含 ToolUse 块, tool 消息变成 user 角色的 ToolResult 块.
+        assert_eq!(
+            ir1.messages.len(),
+            3,
+            "user, assistant(tool_use), user(tool_result)"
+        );
+        // 第 3 条是 user + ToolResult (OpenAI tool → Anthropic user 角色).
+        assert_eq!(ir1.messages[2].role, IrRole::User);
+
+        // IR → Anthropic wire → IR → OpenAI wire → IR.
+        let anth_wire = AnthropicWriter.write_request(&ir1);
+        let ir2 = AnthropicReader.read_request(&anth_wire).unwrap();
+        let oai_wire = writer().write_request(&ir2);
+        let ir3 = reader().read_request(&oai_wire).unwrap();
+
+        // 语义关键字段保真: tool id / name / input / tool_result content.
+        assert_cross_proto_semantic_eq(&ir1, &ir2, "tool: OpenAI→Anthropic");
+        assert_cross_proto_semantic_eq(&ir2, &ir3, "tool: Anthropic→OpenAI");
+        // 专门验证 ToolUse id 透传 (断裂会导致 tool_result 关联失败).
+        let asst_ir3 = &ir3.messages[1];
+        match &asst_ir3.content[0] {
+            IrBlock::ToolUse { id, name, input } => {
+                assert_eq!(id, "call_42", "tool_use id must be verbatim preserved");
+                assert_eq!(name, "get_weather");
+                assert_eq!(input, &json!({"city": "SF"}));
+            }
+            other => panic!("expected ToolUse after round-trip, got {other:?}"),
+        }
+        // tool_result content text 保真 (作为 ToolResult 块内的 Text 块).
+        match &ir3.messages[2].content[0] {
+            IrBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => {
+                assert_eq!(tool_use_id, "call_42");
+                assert_eq!(content.len(), 1);
+                match &content[0] {
+                    IrBlock::Text { text } => assert_eq!(text, "Sunny, 20C"),
+                    other => panic!("expected Text in tool_result content, got {other:?}"),
+                }
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
     // ─── stream fan-out ────────────────────────────────────────────────
 
     #[test]
@@ -1547,5 +1755,116 @@ mod tests {
             usage: IrUsage::default(),
         };
         assert!(writer().write_response_event(&ev).is_none());
+    }
+
+    // ─── Image block: 多模态唯一通路 (read + write) ─────────────────────
+    //
+    // 两个协议的 read+write Image block 全无测试, 这里覆盖 base64 data URI 和 https URL
+    // 两种 source. OpenAI 用 `image_url.url` 字段统一承载两种 source.
+
+    #[test]
+    fn read_content_part_image_url_https() {
+        // OpenAI image_url (https URL 形式) → IR Image{Url}.
+        let body = json!({
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is this?"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
+                ],
+            }],
+        });
+        let ir = reader().read_request(&body).unwrap();
+        assert_eq!(ir.messages[0].content.len(), 2);
+        match &ir.messages[0].content[1] {
+            IrBlock::Image { source } => {
+                assert_eq!(
+                    source,
+                    &IrImageSource::Url("https://example.com/cat.png".into())
+                );
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_content_part_image_url_base64_data_uri() {
+        // OpenAI image_url (data:<mime>;base64,<payload> URI) → IR Image{Base64}.
+        let body = json!({
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="},
+                }],
+            }],
+        });
+        let ir = reader().read_request(&body).unwrap();
+        match &ir.messages[0].content[0] {
+            IrBlock::Image { source } => match source {
+                IrImageSource::Base64 { media_type, data } => {
+                    assert_eq!(media_type, "image/png");
+                    assert_eq!(data, "iVBORw0KGgo=");
+                }
+                other => panic!("expected Base64, got {other:?}"),
+            },
+            other => panic!("expected Image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_user_block_image_url_https() {
+        // IR Image{Url} → OpenAI image_url.url = https://...
+        let ir = IrRequest {
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![
+                    IrBlock::Text {
+                        text: "what is this?".into(),
+                    },
+                    IrBlock::Image {
+                        source: IrImageSource::Url("https://example.com/cat.png".into()),
+                    },
+                ],
+            }],
+            model: "gpt-4o".into(),
+            ..Default::default()
+        };
+        let v = writer().write_request(&ir);
+        let msg = &v["messages"][0];
+        assert_eq!(msg["role"], "user");
+        let content = msg["content"].as_array().unwrap();
+        // 文本 + 图片 = 2 parts.
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            "https://example.com/cat.png"
+        );
+    }
+
+    #[test]
+    fn write_user_block_image_base64_data_uri() {
+        // IR Image{Base64} → OpenAI image_url.url = "data:<mime>;base64,<payload>"
+        let ir = IrRequest {
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![IrBlock::Image {
+                    source: IrImageSource::Base64 {
+                        media_type: "image/jpeg".into(),
+                        data: "abc123".into(),
+                    },
+                }],
+            }],
+            model: "gpt-4o".into(),
+            ..Default::default()
+        };
+        let v = writer().write_request(&ir);
+        let msg = &v["messages"][0];
+        // 单 image block → array content (因为非单一 Text block).
+        let url = msg["content"][0]["image_url"]["url"].as_str().unwrap();
+        assert_eq!(url, "data:image/jpeg;base64,abc123");
     }
 }

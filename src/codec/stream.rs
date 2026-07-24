@@ -682,6 +682,7 @@ pub fn reframe_sse(event_type: &str, data: &serde_json::Value) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::codec::{Protocol, anthropic::AnthropicReader, openai::OpenAiReader};
+    use proptest::prelude::*;
 
     // ─── find_frame_terminator ─────────────────────────────────────────
 
@@ -1197,5 +1198,196 @@ mod tests {
         let ir = scan.snapshot();
         assert_eq!(ir.usage.input_tokens, 15);
         assert_eq!(ir.usage.output_tokens, 3);
+    }
+
+    // ─── proptest: 任意切分点序列的 chunk-boundary 等价性 ──────────────────
+    //
+    // 契约反复强调 "一个 SSE 帧可能被 TCP 切成多个 chunk", 之前只覆盖切两半的固定案例.
+    // 这里用 proptest 穷举任意切分点序列, 验证核心不变式:
+    //
+    //   对任意合法 SSE 字节流做任意切分, 多次 feed 的累积 snapshot()
+    //     == 一次性 feed 整段的 snapshot()
+    //
+    // 守护 StreamScan 的 reassembly buffer 逻辑 (drain/scan_from/consumed) 对任意
+    // chunk 边界都正确, 不依赖特定的切分位置.
+
+    /// 构造一个覆盖多种事件类型的 OpenAI SSE 字节流 (含 text delta / tool_use /
+    /// finish_reason / include_usage / DONE), 用来做任意切分等价性测试.
+    fn sample_openai_sse_stream() -> Vec<u8> {
+        let chunks = [
+            // 帧 1: text delta "Hello" (fan-out 为 MessageStart + BlockStart + BlockDelta).
+            r#"data: {"id":"cmpl-x","created":1700000000,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}"#,
+            // 帧 2: text delta " world".
+            r#"data: {"id":"cmpl-x","created":1700000000,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":" world"},"finish_reason":null}]}"#,
+            // 帧 3: tool_call 开始 (tool_calls 数组里 tool_call index=0, id+name).
+            r#"data: {"id":"cmpl-x","created":1700000000,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]},"finish_reason":null}]}"#,
+            // 帧 4: tool_call 参数 delta (partial JSON).
+            r#"data: {"id":"cmpl-x","created":1700000000,"model":"gpt-4o","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":\"SF\"}"}}]},"finish_reason":null}]}"#,
+            // 帧 5: finish_reason=tool_calls (关闭 block + MessageDelta + MessageStop).
+            r#"data: {"id":"cmpl-x","created":1700000000,"model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+            // 帧 6: include_usage 末尾 chunk (choices=[], usage).
+            r#"data: {"id":"cmpl-x","created":1700000000,"model":"gpt-4o","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}}"#,
+            // 帧 7: [DONE] 终止符.
+            "data: [DONE]",
+        ];
+        let mut s = String::new();
+        for c in &chunks {
+            s.push_str(c);
+            s.push_str("\n\n");
+        }
+        s.into_bytes()
+    }
+
+    /// 把字节流按给定的切分点序列切成多个 chunk 喂入 StreamScan, 返回最终 snapshot().
+    /// 切分点序列语义: split_points 把 [0, len) 区间切成 |splits|+1 段.
+    fn scan_chunked(splits: &[usize], full: &[u8]) -> crate::codec::IrResponse {
+        let mut scan = StreamScan::new(Protocol::OpenAI);
+        let mut prev = 0usize;
+        for &sp in splits {
+            // clamp 到合法范围并保证单调不减 (防 proptest 生成乱序/越界值).
+            let sp = sp.min(full.len()).max(prev);
+            if sp > prev {
+                scan.feed(&full[prev..sp]);
+            }
+            prev = sp;
+        }
+        if prev < full.len() {
+            scan.feed(&full[prev..]);
+        }
+        scan.snapshot()
+    }
+
+    proptest! {
+        /// 核心不变式: 任意切分点序列 feed 的 snapshot == 一次性 feed 的 snapshot.
+        ///
+        /// proptest 生成任意数量的切分点 (1..=16 个, 位置范围覆盖整个流长度).
+        /// 无论 TCP 把流切成什么样的 chunk 序列, reassembly buffer 必须重组出相同语义.
+        /// scan_chunked 内部对切分点做 clamp + 单调化, 容忍 proptest 生成的乱序/越界值.
+        #[test]
+        fn prop_arbitrary_chunk_split_equivalence(
+            // 1..=16 个切分点, 位置范围 [0, 2048) 覆盖整个流长度 (~998 字节).
+            splits in proptest::collection::vec(0usize..2048, 1..=16)
+        ) {
+            let full = sample_openai_sse_stream();
+            // 一次性 feed 的 baseline.
+            let mut whole = StreamScan::new(Protocol::OpenAI);
+            whole.feed(&full);
+            let baseline = whole.snapshot();
+            // 任意切分点 feed.
+            let chunked = scan_chunked(&splits, &full);
+            // IrResponse 是确定性的 (id/model 来自上游 chatcmpl-x / gpt-4o, 无合成随机),
+            // 所以可以用 assert_eq 严格比较.
+            prop_assert_eq!(
+                baseline, chunked,
+                "chunk-boundary violation: baseline != chunked for splits {:?}",
+                splits
+            );
+        }
+
+        /// StreamTranslate (同协议 restore 模式) 的 chunk-boundary 等价性.
+        ///
+        /// 与 StreamScan 走的是两份独立的 reassembly buffer 实现 (feed 方法各自维护),
+        /// 这里专门守护 StreamTranslate 的路径: 任意切分 feed 的累积 SSE 输出
+        ///   == 一次性 feed 的 SSE 输出.
+        ///
+        /// 使用空 RedactionMap 的 same_proto_restore 模式 (redaction_map=None 短路 restore,
+        /// 仅运行 reassembly + re-serialize 路径). StreamTranslate 的 translate_event 会
+        /// 把 MessageStart.id 剥离 (跨协议身份剥离), 由 ingress writer 合成新的
+        /// chatcmpl-<random> id, 因此输出含随机 id. 比较前用 normalize_id 把
+        /// `"id":"chatcmpl-..."` 统一替换为 `"id":"<normalized>"`, 消除随机性后做字节比较.
+        #[test]
+        fn prop_stream_translate_chunk_split_equivalence(
+            splits in proptest::collection::vec(0usize..2048, 1..=16)
+        ) {
+            use crate::redact::RedactionMap;
+            let full = sample_openai_sse_stream();
+
+            // 一次性 feed baseline.
+            let mut whole = StreamTranslate::new_same_proto_restore(
+                Protocol::OpenAI,
+                RedactionMap::default(),
+            );
+            let baseline: Vec<u8> = whole.feed(&full);
+
+            // 任意切分点 feed.
+            let mut chunked_t = StreamTranslate::new_same_proto_restore(
+                Protocol::OpenAI,
+                RedactionMap::default(),
+            );
+            let mut chunked: Vec<u8> = Vec::new();
+            let mut prev = 0usize;
+            for &sp in &splits {
+                let sp = sp.min(full.len()).max(prev);
+                if sp > prev {
+                    chunked.extend_from_slice(&chunked_t.feed(&full[prev..sp]));
+                }
+                prev = sp;
+            }
+            if prev < full.len() {
+                chunked.extend_from_slice(&chunked_t.feed(&full[prev..]));
+            }
+            // 两者都未调用 finish (baseline 也没调用), 仅比较 feed 期间的累积输出.
+            // 消除随机 id 后字节级比较.
+            let baseline_str = String::from_utf8_lossy(&baseline);
+            let chunked_str = String::from_utf8_lossy(&chunked);
+            let baseline_norm = normalize_sse_id(&baseline_str);
+            let chunked_norm = normalize_sse_id(&chunked_str);
+            prop_assert_eq!(
+                &baseline_norm, &chunked_norm,
+                "StreamTranslate chunk-boundary violation for splits {:?}\n\
+                 baseline(norm): {}\n\
+                 chunked(norm):  {}",
+                splits, baseline_norm, chunked_norm,
+            );
+        }
+    }
+
+    /// 极端切分: 每个字节单独成一个 chunk (1-byte splits).
+    /// 覆盖 StreamScan reassembly buffer 的退化情形 (每个 feed 只推进 1 字节).
+    ///
+    /// 输入是确定性的 byte-by-byte 切分 (不依赖 proptest 生成), 作为独立 #[test] 放在
+    /// proptest! 块外, 避免引入无用 strategy 参数.
+    #[test]
+    fn stream_scan_byte_by_byte_split_equivalence() {
+        let full = sample_openai_sse_stream();
+        let mut whole = StreamScan::new(Protocol::OpenAI);
+        whole.feed(&full);
+        let baseline = whole.snapshot();
+        // 构造每 1 字节一个切分点 (0,1,2,...,len-1).
+        let splits: Vec<usize> = (0..full.len()).collect();
+        let chunked = scan_chunked(&splits, &full);
+        assert_eq!(baseline, chunked);
+    }
+
+    /// 把 SSE 输出里的 `"id":"chatcmpl-<base62>"` 统一替换为 `"id":"<n>"`,
+    /// 消除 StreamTranslate translate_event 合成的随机 id, 使输出可做字节级比较.
+    ///
+    /// 仅替换 chatcmpl- 前缀的 id (OpenAI writer 合成路径); 其他字段 (含可能的 UTF-8
+    /// content) 原样保留. 用 str::find + 切片操作, 避免逐字节 as char 破坏 UTF-8.
+    fn normalize_sse_id(input: &str) -> String {
+        const PREFIX: &str = "\"id\":\"chatcmpl-";
+        let mut out = String::with_capacity(input.len());
+        let mut rest = input;
+        while let Some(start) = rest.find(PREFIX) {
+            // 推入 PREFIX 之前的部分 + 归一化的前缀.
+            out.push_str(&rest[..start]);
+            out.push_str("\"id\":\"<n>");
+            // 跳过 PREFIX, 跳过 base62 部分直到下一个 '"'.
+            let after_prefix = &rest[start + PREFIX.len()..];
+            match after_prefix.find('"') {
+                Some(end) => {
+                    // end 是闭合 '"' 的位置, 保留它 (下一轮循环处理).
+                    rest = &after_prefix[end..];
+                }
+                None => {
+                    // 异常: 没有闭合 '"' (截断的 JSON), 直接追加剩余.
+                    out.push_str(after_prefix);
+                    rest = "";
+                    break;
+                }
+            }
+        }
+        out.push_str(rest);
+        out
     }
 }
