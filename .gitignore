@@ -25,3 +25,6 @@ secret-guard.state.toml
 # cargo-llvm-cov 产物 (target/llvm-cov-target/ 已被 /target 覆盖).
 /coverage/
 
+# Task Master (任务规划/状态, agent 本地维护, 不入库)
+.taskmaster/
+
