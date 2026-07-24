@@ -1193,6 +1193,25 @@ mod tests {
             }
         }
 
+        /// C5 multibyte: secret 含中文 / emoji / 多字节 UTF-8.
+        /// mock 不应含 real 的 ≥4 char 子串 (在 char boundary 上切片, 非 byte).
+        /// 已有 `prop_no_real_substring` 只覆盖 ASCII, 此测试补 multibyte secret.
+        #[test]
+        fn prop_no_real_substring_multibyte(
+            secret in "[\\x{4e00}-\\x{9fff}\\x{1f300}-\\x{1f6ff}a-zA-Z0-9]{8,20}"
+        ) {
+            let m = predict_mock(&secret);
+            // char-based windows: 多字节 UTF-8 在 byte 边界切片会 panic, 必须按 char.
+            let chars: Vec<char> = secret.chars().collect();
+            for window in 4..=chars.len() {
+                for sub_chars in chars.windows(window) {
+                    let sub_str: String = sub_chars.iter().collect();
+                    prop_assert!(!m.contains(&sub_str),
+                        "mock contains multibyte substring from secret: mock={}, sub={}", m, sub_str);
+                }
+            }
+        }
+
         /// C6 多 secret round-trip: N 个 secret 同时出现在 IR, restore 后严格等于原 IR.
         #[test]
         fn prop_multi_secret_round_trip(
