@@ -36,7 +36,7 @@ use anyhow::Context;
 use axum::middleware;
 use axum::{
     Router,
-    routing::{any, get, post},
+    routing::{any, get, patch, post},
 };
 use parking_lot::{Mutex, RwLock};
 use tokio::net::TcpListener;
@@ -141,6 +141,10 @@ fn build_router_with_auth_layers(
         .route(
             "/api/api-keys/{id}",
             axum::routing::delete(crate::web::api::delete_api_key),
+        )
+        .route(
+            "/api/api-keys/{id}/toggle",
+            patch(crate::web::api::toggle_api_key),
         );
 
     // 转发路由: 应用 API key middleware.
@@ -191,6 +195,7 @@ pub async fn serve(
     static_secrets: Vec<SecretEntry>,
     dyn_state: crate::config::DynamicState,
     state_path: PathBuf,
+    config_path: PathBuf,
     auth_config: AuthConfig,
     global_mock_prefix: String,
 ) -> anyhow::Result<()> {
@@ -265,8 +270,14 @@ pub async fn serve(
         .await
         .map_err(|e| anyhow::anyhow!("OIDC initialization failed: {e}"))?;
 
-        let api_keys =
-            ApiKeyStore::new(dyn_state.api_keys.clone(), state_path.clone(), persist_lock);
+        let api_keys = ApiKeyStore::new(
+            &auth_config.api_keys,
+            &config_path,
+            dyn_state.api_keys.clone(),
+            dyn_state.api_keys_disabled.clone(),
+            state_path.clone(),
+            persist_lock,
+        );
 
         // 注入 api_keys 到 ProxyState (让 WebUI handler 能访问).
         let proxy = ProxyState {

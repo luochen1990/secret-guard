@@ -207,6 +207,10 @@ pub struct DynamicState {
     /// WebUI 签发的 API keys (用于 SDK 转发路径认证). 存 hash, 不存明文.
     #[serde(default)]
     pub api_keys: Vec<crate::auth::ApiKeyEntry>,
+
+    /// 静态 API key 中被用户 disable 的 label 集合 (持久化跨重启).
+    #[serde(default)]
+    pub api_keys_disabled: std::collections::HashSet<String>,
 }
 
 impl DynamicState {

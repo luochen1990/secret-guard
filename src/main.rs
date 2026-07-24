@@ -61,6 +61,7 @@ async fn main() -> Result<()> {
         static_cfg.secrets.entries,
         dyn_state,
         state_path,
+        args.config.clone(),
         static_cfg.auth,
         global_mock_prefix,
     )

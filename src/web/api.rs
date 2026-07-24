@@ -1518,31 +1518,29 @@ mod tests {
 //
 // 仅在 auth.enabled = true 时挂载 (由 server.rs 条件化装配).
 // 这些 handler 需要 OIDC 登录 (通过 login_required guard 保护).
-// handler 从 AuthSession 取当前用户 sub 作为 tenant_id + created_by.
 
 use axum_login::AuthSession;
 
-/// `POST /api/api-keys` 请求体.
 #[derive(Debug, Deserialize)]
 pub struct CreateApiKeyRequest {
-    /// 人类可读标签.
     #[serde(default)]
     pub label: String,
 }
 
-/// 当前已登录用户信息 (从 AuthSession 提取).
-/// 用于 API key 签发时绑定 tenant_id + created_by.
-fn current_user_sub(auth_session: &AuthSession<crate::auth::OidcBackend>) -> Option<String> {
-    auth_session.user.as_ref().map(|u| u.sub.clone())
+#[derive(Debug, Deserialize)]
+pub struct ToggleApiKeyRequest {
+    pub disabled: bool,
 }
 
-/// 同时校验登录态 + API key store 可用性, 返回 (user_sub, store).
-/// 消除 3 个 handler 的重复样板.
+/// 校验登录态 + 拿到 store. 返回 (user_sub, store).
 fn require_user_and_store<'a>(
     state: &'a ProxyState,
     auth_session: &AuthSession<crate::auth::OidcBackend>,
 ) -> Result<(String, &'a crate::auth::ApiKeyStore), ApiError> {
-    let user_sub = current_user_sub(auth_session)
+    let user_sub = auth_session
+        .user
+        .as_ref()
+        .map(|u| u.sub.clone())
         .ok_or_else(|| ApiError::unauthorized("not authenticated"))?;
     let api_keys = state
         .api_keys
@@ -1551,24 +1549,20 @@ fn require_user_and_store<'a>(
     Ok((user_sub, api_keys))
 }
 
-/// 列出当前用户的所有 API key 摘要.
-///
-/// 从所有 keys 中过滤出 tenant_id == 当前用户 sub 的条目.
-/// (M1 中 tenant_id = OIDC sub, 每个用户只能看到自己的 key.)
+/// 列出: 用户自己的动态 key + 所有静态 key.
 pub async fn list_api_keys(
     State(state): State<ProxyState>,
     auth_session: AuthSession<crate::auth::OidcBackend>,
 ) -> Result<impl IntoResponse, ApiError> {
     let (user_sub, api_keys) = require_user_and_store(&state, &auth_session)?;
-    let all_keys = api_keys.list();
-    let user_keys: Vec<_> = all_keys
+    let keys: Vec<_> = api_keys
+        .list()
         .into_iter()
-        .filter(|k| k.tenant_id == user_sub)
+        .filter(|k| k.source == "static" || k.tenant_id == user_sub)
         .collect();
-    Ok((NO_STORE, Json(serde_json::json!({ "keys": user_keys }))))
+    Ok((NO_STORE, Json(serde_json::json!({ "keys": keys }))))
 }
 
-/// 签发新的 API key. 返回明文 (仅此一次).
 pub async fn create_api_key(
     State(state): State<ProxyState>,
     auth_session: AuthSession<crate::auth::OidcBackend>,
@@ -1581,26 +1575,54 @@ pub async fn create_api_key(
     Ok((StatusCode::CREATED, NO_STORE, Json(issued)))
 }
 
-/// 撤销 API key (按 id).
+/// 删除 (仅动态 key, 且只能删自己的). 静态 key 返回 403.
 pub async fn delete_api_key(
     State(state): State<ProxyState>,
     auth_session: AuthSession<crate::auth::OidcBackend>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let (user_sub, api_keys) = require_user_and_store(&state, &auth_session)?;
-    // 只能撤销自己的 key (tenant_id == user_sub).
-    // 先查是否属于当前用户, 不属于则 404 (避免泄漏 key 是否存在).
-    let belongs_to_user = api_keys
+    if crate::auth::apikey::is_static(&id) {
+        return Err(ApiError::conflict(
+            "static API key cannot be deleted; use disable instead",
+        ));
+    }
+    let owns = api_keys
         .list()
         .into_iter()
         .any(|k| k.id == id && k.tenant_id == user_sub);
-    if !belongs_to_user {
+    if !owns {
         return Err(ApiError::not_found(format!("API key {id} not found")));
     }
-    let deleted = api_keys.revoke(&id).map_err(ApiError::from_any)?;
-    if deleted {
-        Ok((StatusCode::NO_CONTENT, NO_STORE, ""))
-    } else {
-        Err(ApiError::not_found(format!("API key {id} not found")))
+    api_keys.revoke(&id).map_err(ApiError::from_any)?;
+    Ok((StatusCode::NO_CONTENT, NO_STORE, ""))
+}
+
+/// 切换 disabled 状态. 静态 key 任何人可 toggle; 动态 key 只能 toggle 自己的.
+pub async fn toggle_api_key(
+    State(state): State<ProxyState>,
+    auth_session: AuthSession<crate::auth::OidcBackend>,
+    Path(id): Path<String>,
+    Json(payload): Json<ToggleApiKeyRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let (user_sub, api_keys) = require_user_and_store(&state, &auth_session)?;
+    let is_static = crate::auth::apikey::is_static(&id);
+    if !is_static {
+        // 动态 key: 只能 toggle 自己的.
+        let owns = api_keys
+            .list()
+            .into_iter()
+            .any(|k| k.id == id && k.tenant_id == user_sub);
+        if !owns {
+            return Err(ApiError::not_found(format!("API key {id} not found")));
+        }
     }
+    api_keys
+        .set_disabled(&id, payload.disabled)
+        .map_err(ApiError::from_any)?
+        .ok_or_else(|| ApiError::not_found(format!("API key {id} not found")))?;
+    Ok((
+        NO_STORE,
+        Json(serde_json::json!({ "id": id, "disabled": payload.disabled })),
+    ))
 }

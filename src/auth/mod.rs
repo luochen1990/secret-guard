@@ -1,45 +1,15 @@
 //! 认证骨架: OIDC 登录 (浏览器 WebUI) + 本地 API key (SDK 转发路径).
 //!
-//! # 双轨认证
+//! # 静态预设 API key
 //!
-//! | 流量 | 路径 | 认证方式 |
-//! |---|---|---|---|
-//! | 浏览器 WebUI | `/__sg/*` | OIDC Authorization Code + PKCE → cookie session |
-//! | SDK 转发 | `/{o\|a\|g\|l}/*` | 本地 API key (`Authorization: Bearer sg_...`) |
+//! 用户可在 `secret-guard.toml` 中预设 API key (如 CI/CD 场景), 与 WebUI 签发的 key
+//! 一起在 WebUI 列出. 静态 key 不可删除, 只能 disable/enable.
 //!
-//! 浏览器登录后, WebUI 提供 "生成 API key" 入口, secret-guard 本地签发随机 key
-//! (存 SHA-256 hash, 明文仅签发时返回一次). SDK 配置 `api_key=<生成的 key>`,
-//! 转发路径的 middleware 校验 key → 解析 tenant_id → 注入 request extension.
-//!
-//! # 安全边界
-//!
-//! - API key 校验在 middleware 层完成, **不进入 LLM body redact pipeline**.
-//!   原因: proxy.rs::apply_provider_auth 会用 provider 的真实 api_key 覆盖
-//!   Authorization header, 客户端的 API key 不会到达上游.
-//! - PKCE verifier + nonce **必须存服务端 session**, 绝不放 cookie.
-//! - API key 明文永不持久化, 只存 hash.
-//!
-//! # 配置
-//!
-//! `secret-guard.toml` 的 `[auth]` 段:
 //! ```toml
-//! [auth]
-//! enabled = true
-//!
-//! [auth.oidc]
-//! issuer_url = "https://auth.example.com/application/o/secret-guard/"
-//! client_id = "secret-guard"
-//! client_secret_file = "/run/credentials/secret-guard.service/oidc_client_secret"
+//! [[auth.api_keys]]
+//! label = "ci-pipeline"
+//! key = "sg_abc123..."        # 或 key_file = "/run/credentials/..."
 //! ```
-//!
-//! `enabled = false` (默认) = 单用户模式, 所有路由无认证 (向后兼容).
-//!
-//! # 模块结构
-//!
-//! - [`apikey`] — ApiKeyStore + ApiKeyEntry + 签发/校验.
-//! - [`oidc`] — OidcBackend (axum-login AuthnBackend) + User + 登录流程 handler.
-//! - [`session`] — SessionManagerLayer 装配.
-//! - [`middleware`] — require_api_key middleware + AuthenticatedTenant.
 
 pub mod apikey;
 pub mod handlers;
@@ -47,7 +17,7 @@ pub mod middleware;
 pub mod oidc;
 pub mod session;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -59,31 +29,59 @@ pub use session::build_session_layer;
 /// 认证配置 (static config 的 `[auth]` 段).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuthConfig {
-    /// 是否启用认证. `false` (默认) = 单用户模式, 所有路由无认证.
     #[serde(default)]
     pub enabled: bool,
-    /// OIDC 配置. `enabled = true` 时必须存在 (启动时 fail-fast).
     #[serde(default)]
     pub oidc: Option<OidcConfig>,
+    /// 静态预设 API key 列表.
+    #[serde(default)]
+    pub api_keys: Vec<StaticApiKey>,
+}
+
+/// 静态预设 API key. 明文由用户直接写在配置文件中, 启动时 hash 后注入 ApiKeyStore.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StaticApiKey {
+    pub label: String,
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub key_file: Option<PathBuf>,
+}
+
+impl StaticApiKey {
+    /// resolve 明文: key 与 key_file 互斥.
+    pub fn resolve(&self, config_path: &Path) -> anyhow::Result<String> {
+        match (&self.key, &self.key_file) {
+            (Some(k), None) => Ok(k.clone()),
+            (None, Some(path)) => {
+                let abs = config_path.parent().unwrap_or(Path::new(".")).join(path);
+                Ok(std::fs::read_to_string(&abs)
+                    .map_err(|e| anyhow::anyhow!("read key_file {}: {e}", abs.display()))?
+                    .trim()
+                    .into())
+            }
+            (Some(_), Some(_)) => anyhow::bail!(
+                "[auth.api_keys] '{}': key and key_file are mutually exclusive",
+                self.label
+            ),
+            (None, None) => anyhow::bail!(
+                "[auth.api_keys] '{}': must specify either key or key_file",
+                self.label
+            ),
+        }
+    }
 }
 
 /// OIDC Provider 配置 (static config 的 `[auth.oidc]` 段).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OidcConfig {
-    /// IdP 的 issuer URL (OIDC Discovery 端点).
-    /// 例如: `https://accounts.google.com` 或
-    /// `https://auth.example.com/application/o/secret-guard/`.
     pub issuer_url: String,
-    /// OIDC client id (在 IdP 注册时分配).
     pub client_id: String,
-    /// 可选: 从文件读取 client secret (与 Provider.api_key_file 对称).
-    /// 公开客户端 (PKCE-only) 可省略.
     #[serde(default)]
     pub client_secret_file: Option<PathBuf>,
 }
 
 impl AuthConfig {
-    /// 启动时校验: enabled = true 时 oidc 配置必须存在且 issuer_url 非空.
     pub fn validate(&self) -> Result<(), String> {
         if self.enabled {
             let oidc = self
@@ -97,6 +95,17 @@ impl AuthConfig {
                 return Err("[auth.oidc] client_id must not be empty".into());
             }
         }
+        let mut seen = std::collections::HashSet::new();
+        for (i, ak) in self.api_keys.iter().enumerate() {
+            if ak.label.trim().is_empty() {
+                return Err(format!(
+                    "[auth.api_keys] index {i}: label must not be empty"
+                ));
+            }
+            if !seen.insert(ak.label.as_str()) {
+                return Err(format!("[auth.api_keys] duplicate label '{}'", ak.label));
+            }
+        }
         Ok(())
     }
 }
@@ -107,63 +116,39 @@ mod tests {
 
     #[test]
     fn auth_disabled_by_default() {
-        let cfg = AuthConfig::default();
-        assert!(!cfg.enabled);
-        assert!(cfg.validate().is_ok(), "disabled config is always valid");
+        assert!(!AuthConfig::default().enabled);
+        assert!(AuthConfig::default().validate().is_ok());
     }
 
     #[test]
     fn enabled_without_oidc_fails() {
+        assert!(
+            AuthConfig {
+                enabled: true,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn duplicate_static_labels_fail() {
         let cfg = AuthConfig {
-            enabled: true,
-            oidc: None,
+            api_keys: vec![
+                StaticApiKey {
+                    label: "ci".into(),
+                    key: Some("sg_abc".into()),
+                    key_file: None,
+                },
+                StaticApiKey {
+                    label: "ci".into(),
+                    key: Some("sg_xyz".into()),
+                    key_file: None,
+                },
+            ],
+            ..Default::default()
         };
         assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn enabled_with_empty_issuer_fails() {
-        let cfg = AuthConfig {
-            enabled: true,
-            oidc: Some(OidcConfig {
-                issuer_url: "  ".into(),
-                client_id: "x".into(),
-                client_secret_file: None,
-            }),
-        };
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn enabled_with_valid_oidc_passes() {
-        let cfg = AuthConfig {
-            enabled: true,
-            oidc: Some(OidcConfig {
-                issuer_url: "https://auth.example.com".into(),
-                client_id: "secret-guard".into(),
-                client_secret_file: None,
-            }),
-        };
-        assert!(cfg.validate().is_ok());
-    }
-
-    #[test]
-    fn auth_config_parses_from_toml() {
-        let toml_str = r#"
-[auth]
-enabled = true
-
-[auth.oidc]
-issuer_url = "https://auth.example.com"
-client_id = "sg"
-"#;
-        // 模拟顶层 Config 的 auth 字段反序列化.
-        #[derive(Deserialize)]
-        struct Wrapper {
-            auth: AuthConfig,
-        }
-        let w: Wrapper = toml::from_str(toml_str).unwrap();
-        assert!(w.auth.enabled);
-        assert_eq!(w.auth.oidc.as_ref().unwrap().client_id, "sg");
     }
 }

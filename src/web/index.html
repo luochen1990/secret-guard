@@ -1005,6 +1005,7 @@
     <a class="tab active" data-tab="records">Records</a>
     <a class="tab" data-tab="secrets">Secrets</a>
     <a class="tab" data-tab="providers">Providers</a>
+    <a class="tab" data-tab="apikeys">API Keys</a>
   </nav>
   <main>
     <section id="tab-records" class="tab-content active">
@@ -1082,6 +1083,34 @@
           </thead>
           <tbody id="providers-body">
             <tr><td colspan="9" class="empty">No providers configured</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+    <section id="tab-apikeys" class="tab-content">
+      <div class="secrets-main">
+        <div class="secrets-toolbar">
+          <div class="stats" id="apikeys-stats"></div>
+          <button class="btn" onclick="openApiKeyForm()">+ new API key</button>
+        </div>
+        <div class="hint" style="margin-bottom: 8px;">
+          API keys authenticate SDK forwarding requests (<code>Authorization: Bearer sg_...</code>).
+          Static keys come from <code>secret-guard.toml</code>; dynamic keys are issued via WebUI.
+          Only compliant keys can be enabled.
+        </div>
+        <table class="secrets">
+          <thead>
+            <tr>
+              <th>Label</th>
+              <th>Key Prefix</th>
+              <th>Source</th>
+              <th>Status</th>
+              <th>Created</th>
+              <th class="actions">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="apikeys-body">
+            <tr><td colspan="6" class="empty">No API keys configured</td></tr>
           </tbody>
         </table>
       </div>
@@ -1164,6 +1193,32 @@
     </form>
   </dialog>
 
+  <dialog id="apikey-form">
+    <form method="dialog" id="apikey-form-el">
+      <h3 style="grid-column: 1 / -1; margin: 0 0 8px 0;">New API Key</h3>
+      <label for="ak-label">Label</label>
+      <input type="text" id="ak-label" placeholder="e.g. ci-pipeline">
+      <div class="actions">
+        <button class="btn" value="cancel">Cancel</button>
+        <button class="btn" value="save" id="ak-save">Create</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="apikey-reveal">
+    <div style="min-width: 400px;">
+      <h3 style="margin: 0 0 8px 0;">API Key Created</h3>
+      <div class="hint" style="margin-bottom: 8px;">
+        Copy this key now — it will not be shown again.
+      </div>
+      <textarea id="apikey-reveal-value" readonly style="width: 100%; font-family: monospace; font-size: 13px; padding: 8px; word-break: break-all;" rows="3"></textarea>
+      <div class="actions" style="margin-top: 8px;">
+        <button class="btn" onclick="copyRevealedApiKey()">Copy</button>
+        <button class="btn" value="close" id="apikey-reveal-close">Close</button>
+      </div>
+    </div>
+  </dialog>
+
   <script>
     // 集中管理 API URL.
     const API_RECORDS = '/__sg/api/records';
@@ -1171,6 +1226,7 @@
     const API_NODES = '/__sg/api/nodes';
     const API_SECRETS = '/__sg/api/secrets';
     const API_PROVIDERS = '/__sg/api/providers';
+    const API_API_KEYS = '/__sg/api/api-keys';
     const DECISION_LABELS = {
       default: 'Default (dynamic wins)',
       prefer_static: 'Prefer static',
@@ -1190,6 +1246,7 @@
     let providerProtocols = [];
     let providerShorts = [];
     let providerDecisions = [];
+    let apiKeysList = [];
 
     // ─── records tab: 两级树 (会话 → 轮次) + timeline 惰性加载 ─────────────
     //
@@ -1239,6 +1296,7 @@
         document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
         if (tab.dataset.tab === 'secrets') refreshSecrets();
         if (tab.dataset.tab === 'providers') refreshProviders();
+        if (tab.dataset.tab === 'apikeys') refreshApiKeys();
       });
     });
 
@@ -2665,6 +2723,152 @@
     async function refreshSecrets() { await refreshKind('secret'); }
     async function refreshProviders() { await refreshKind('provider'); }
 
+    // ─── API keys tab ─────────────────────────────────────────────────────
+
+    async function refreshApiKeys() {
+      try {
+        const r = await fetch(API_API_KEYS, { cache: 'no-store' });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const data = await r.json();
+        apiKeysList = data.keys || [];
+        renderApiKeys();
+      } catch (e) {
+        // auth disabled → 401/404; 显示空状态不报错.
+        console.error(e);
+        apiKeysList = [];
+        renderApiKeys();
+      }
+    }
+
+    function renderApiKeys() {
+      const statsEl = document.getElementById('apikeys-stats');
+      const body = document.getElementById('apikeys-body');
+      const total = apiKeysList.length;
+      const enabled = apiKeysList.filter(k => !k.disabled).length;
+      const staticCount = apiKeysList.filter(k => k.source === 'static').length;
+      statsEl.innerHTML = `
+        <span><strong>${total}</strong> total</span>
+        <span><strong>${enabled}</strong> enabled</span>
+        <span><strong>${staticCount}</strong> static</span>
+      `;
+      if (total === 0) {
+        body.innerHTML = `<tr><td colspan="6" class="empty">No API keys configured</td></tr>`;
+        return;
+      }
+      body.innerHTML = apiKeysList.map(k => {
+        const srcBadge = `<span class="src-badge src-${escapeHtml(k.source)}">${escapeHtml(k.source)}</span>`;
+        const statusBadge = k.disabled
+          ? '<span class="badge badge-err">disabled</span>'
+          : '<span class="badge badge-stream">enabled</span>';
+        const toggleLabel = k.disabled ? 'Enable' : 'Disable';
+        const toggleTarget = k.disabled ? 'false' : 'true';
+        const canDelete = k.source === 'dynamic';
+        const created = k.source === 'static'
+          ? '<span class="meta">(static)</span>'
+          : escapeHtml(new Date(k.created_at).toLocaleString());
+        const actions = [
+          `<button class="btn" data-action="toggle" data-id="${escapeHtml(k.id)}" data-target="${toggleTarget}">${escapeHtml(toggleLabel)}</button>`,
+          canDelete ? `<button class="btn btn-danger" data-action="delete" data-id="${escapeHtml(k.id)}">Delete</button>` : '',
+        ].join('');
+        return `
+          <tr class="${k.disabled ? 'row-disabled' : ''}" data-id="${escapeHtml(k.id)}">
+            <td title="${escapeHtml(k.label)}"><span class="cell-ellipsis">${escapeHtml(k.label)}</span></td>
+            <td><code>${escapeHtml(k.key_prefix)}…</code></td>
+            <td>${srcBadge}</td>
+            <td>${statusBadge}</td>
+            <td class="cell-short">${created}</td>
+            <td class="actions">${actions}</td>
+          </tr>
+        `;
+      }).join('');
+      bindApiKeyActions(body);
+    }
+
+    // 事件委托: 绑定到 tbody, 避免 onclick 内联 (XSS 加固, 参照 secrets/providers 模式).
+    function bindApiKeyActions(body) {
+      if (body._sgBound) return;
+      body._sgBound = true;
+      body.addEventListener('click', (e) => {
+        const btn = e.target.closest('button[data-action]');
+        if (!btn) return;
+        const action = btn.dataset.action;
+        const id = btn.dataset.id;
+        if (action === 'toggle') {
+          toggleApiKey(id, btn.dataset.target === 'true');
+        } else if (action === 'delete') {
+          deleteApiKey(id);
+        }
+      });
+    }
+
+    function openApiKeyForm() {
+      document.getElementById('ak-label').value = '';
+      document.getElementById('apikey-form').showModal();
+    }
+
+    document.getElementById('apikey-form-el').addEventListener('submit', async (e) => {
+      // submitter value = 'save' or 'cancel'.
+      const btn = e.submitter;
+      if (!btn || btn.value !== 'save') return;
+      e.preventDefault();
+      const label = document.getElementById('ak-label').value.trim();
+      if (!label) { alert('Label is required'); return; }
+      try {
+        const r = await fetch(API_API_KEYS, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ label }),
+        });
+        if (!r.ok) {
+          const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+          alert('Failed: ' + (err.error || r.status));
+          return;
+        }
+        const issued = await r.json();
+        document.getElementById('apikey-form').close();
+        // 显示明文 key (仅此一次).
+        document.getElementById('apikey-reveal-value').value = issued.key;
+        document.getElementById('apikey-reveal').showModal();
+        await refreshApiKeys();
+      } catch (e) {
+        alert('Error: ' + e.message);
+      }
+    });
+
+    function copyRevealedApiKey() {
+      const val = document.getElementById('apikey-reveal-value').value;
+      navigator.clipboard.writeText(val).then(() => {
+        setStatus('API key copied to clipboard');
+      }).catch(() => {
+        alert('Copy failed — select the text manually.');
+      });
+    }
+
+    async function toggleApiKey(id, disabled) {
+      const r = await fetch(`${API_API_KEYS}/${encodeURIComponent(id)}/toggle`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ disabled }),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+        alert('Failed: ' + (err.error || r.status));
+        return;
+      }
+      await refreshApiKeys();
+    }
+
+    async function deleteApiKey(id) {
+      if (!confirm(`Delete API key ${id}?`)) return;
+      const r = await fetch(`${API_API_KEYS}/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+        alert('Failed: ' + (err.error || r.status));
+        return;
+      }
+      await refreshApiKeys();
+    }
+
     function renderSecretRow(s) {
       const rowCls = rowClass(s.source);
       // F1: 每个可溢出单元格的内容用 .cell-ellipsis 包裹, 并给外层 td 设置 title (浏览器原生 tooltip).
@@ -3012,6 +3216,7 @@
         const active = document.querySelector('.tab-content.active')?.id;
         if (active === 'tab-secrets') refreshSecrets();
         else if (active === 'tab-providers') refreshProviders();
+        else if (active === 'tab-apikeys') refreshApiKeys();
         else refresh();
       }
     }, 3000);
