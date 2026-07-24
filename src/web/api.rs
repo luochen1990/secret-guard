@@ -212,7 +212,9 @@ fn build_forward_record(
         streamed: view.streamed,
         resp_complete: view.resp_complete,
         error: view.error,
-        redactions: view.redactions,
+        // ForwardRecord 持有 Vec (需 Deserialize); 此处从 NodeView 的 Arc 切片
+        // 实化一次. build_forward_record 仅用于 GET /records/{id} 详情路径 (非高频).
+        redactions: view.redactions.to_vec(),
     }
 }
 
@@ -328,15 +330,16 @@ pub struct RecordSummary {
     pub resp_complete: bool,
     pub error: Option<String>,
     #[serde(default)]
-    pub redactions: Vec<(String, String)>,
+    pub redactions: std::sync::Arc<[(String, String)]>,
     /// 会话标题: 从 req_body 提取的最后一条 user message 文本 (截断).
     /// 提取失败 (非 JSON / 无 user message) 时为 None, 前端 fallback 到 method+path.
+    /// `Arc<str>`: 从 NodeView 透传, list/timeline (3s 轮询) 路径零拷贝.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub preview: Option<String>,
+    pub preview: Option<std::sync::Arc<str>>,
     /// 模型名: 从 req_body 顶层 `model` 字段提取 (OpenAI / Anthropic 共有).
-    /// 非 chat 协议或缺失时为 None.
+    /// 非 chat 协议或缺失时为 None. `Arc<str>` 同上.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
+    pub model: Option<std::sync::Arc<str>>,
     /// parsed view (ingress codec writer 序列化的 IrResponse).
     /// timeline 路径直接消费, 前端不再 N+1 拉 /records/{id}?view=parsed.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -541,11 +544,14 @@ pub struct SessionSummary {
     pub record_count: usize,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub latest_at: chrono::DateTime<chrono::Utc>,
-    pub preview: Option<String>,
-    pub model: Option<String>,
+    /// `Arc<str>`: 从 SessionView 透传, list_sessions (3s 轮询) 路径零拷贝.
+    /// serde 透明序列化为 string, 前端无感知.
+    pub preview: Option<std::sync::Arc<str>>,
+    pub model: Option<std::sync::Arc<str>>,
     pub latest_resp_status: u16,
     pub latest_error: Option<String>,
-    pub redactions: Vec<(String, String)>,
+    /// `Arc<[(String,String)]>`: 从 SessionView 透传, 零拷贝.
+    pub redactions: std::sync::Arc<[(String, String)]>,
     /// 叶子节点 HTTP path (前端 provider icon 解析 proto 角标 + provider id).
     pub path: String,
 }
@@ -1356,12 +1362,12 @@ mod tests {
             path: "/o/oa-main/v1/chat/completions".into(),
             resp_status: 200,
             redact_seed: 0,
-            preview: Some("hi".into()),
-            model: Some("gpt-4o".into()),
+            preview: Some(std::sync::Arc::from("hi")),
+            model: Some(std::sync::Arc::from("gpt-4o")),
             streamed: false,
             resp_complete: false,
             error: None,
-            redactions: vec![],
+            redactions: std::sync::Arc::from([]),
             parsed_response: None,
             req_delta_messages: vec![],
         };
@@ -1390,7 +1396,7 @@ mod tests {
             streamed: false,
             resp_complete: false,
             error: None,
-            redactions: vec![],
+            redactions: std::sync::Arc::from([]),
             parsed_response: None,
             req_delta_messages: vec![],
         };

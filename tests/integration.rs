@@ -261,7 +261,7 @@ fn dag_list_forward_records(dag: &ConversationDag) -> Vec<ForwardRecord> {
                 streamed: view.streamed,
                 resp_complete: view.resp_complete,
                 error: view.error,
-                redactions: view.redactions,
+                redactions: view.redactions.to_vec(),
             })
         })
         .collect()

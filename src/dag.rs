@@ -262,7 +262,9 @@ struct Session {
     latest_at: DateTime<Utc>,
     /// 会话标题 (sidebar 主文本). 仅在 session 创建时从根 node 的 preview 提取,
     /// 之后不再更新 (即便有新 round 加入). 见上方类型注释.
-    title: Option<String>,
+    ///
+    /// `Arc<str>`: 直接共享根 node 的 preview, list_sessions 路径只增引用计数.
+    title: Option<Arc<str>>,
 }
 
 // ─── Node + CallEvent + ResponseMeta ───────────────────────────────────────
@@ -345,13 +347,19 @@ pub struct CallEvent {
     /// `req_delta` 仍用于内容寻址去重 (DAG 核心价值) + 未来 lazy redact 功能.
     pub req_body_raw: String,
     /// WebUI sidebar 标题 (首条 user message 截断). push 时一次性从 req_body_raw 提取.
-    pub preview: Option<String>,
+    ///
+    /// `Arc<str>` 让 list/session 路径只增引用计数, 不复制字符串 (3s 轮询场景).
+    pub preview: Option<Arc<str>>,
     /// 请求 body 顶层 model 字段 (OpenAI / Anthropic 共有). push 时一次性提取.
-    pub model: Option<String>,
+    /// `Arc<str>` 同上 (list 路径免 clone).
+    pub model: Option<Arc<str>>,
     /// 本次请求中实际发生的 redact 结果 (权威投影, 供 WebUI 渲染).
     /// 每个 tuple = `(mock_value, secret_id)`. **永不**包含真实 secret 值.
     /// 在 push 时设置 (redactions 是请求侧属性, 不依赖 response).
-    pub redactions: Vec<(String, String)>,
+    ///
+    /// `Arc<[(String,String)]>` 让 list/session 路径共享切片而非 clone Vec
+    /// (clone 成本随命中 secret 数线性增长).
+    pub redactions: Arc<[(String, String)]>,
 }
 
 /// LLM 返回的 response 数据 (message content + 元数据).
@@ -619,9 +627,15 @@ impl ConversationDag {
     /// 用于 session 创建时计算 title (issue #36: 取最早 round 的首条 user msg).
     /// fork 场景下 parent 链可能跨越多个 node, 需走到链首.
     /// 无 parent (新根) 时用本 node (node_id) 的 preview.
-    fn find_root_title(inner: &DagInner, parent: Option<Uuid>, node_id: Uuid) -> Option<String> {
+    ///
+    /// 返回 `Arc<str>` 直接共享根 node 的 preview, 不复制字符串.
+    fn find_root_title(
+        inner: &DagInner,
+        parent: Option<Uuid>,
+        node_id: Uuid,
+    ) -> Option<Arc<str>> {
         // walk parent 链到链首, 暂存每个 node 的 preview, 循环结束保留最旧的.
-        let mut title = None;
+        let mut title: Option<Arc<str>> = None;
         let mut cursor = parent;
         // 安全限位: parent 链长度不会超过 nodes 总数 (DAG 无环).
         while let Some(pid) = cursor {
@@ -946,7 +960,7 @@ impl ConversationDag {
             streamed: resp.as_ref().map(|r| r.streamed).unwrap_or(false),
             resp_complete: resp.as_ref().map(|r| r.resp_complete).unwrap_or(false),
             error: resp.as_ref().and_then(|r| r.error.clone()),
-            redactions: node.event.redactions.clone(),
+            redactions: Arc::clone(&node.event.redactions),
             parsed_response: resp.as_ref().and_then(|r| r.parsed.clone()),
             // list_page 路径不填 (避免 O(n) 全量 resolve); timeline 路径单独填.
             req_delta_messages: Vec::new(),
@@ -987,7 +1001,7 @@ impl ConversationDag {
             model: leaf.event.model.clone(),
             latest_resp_status: leaf.event.resp_status,
             latest_error: resp.as_ref().and_then(|r| r.error.clone()),
-            redactions: leaf.event.redactions.clone(),
+            redactions: Arc::clone(&leaf.event.redactions),
             path: leaf.event.path.clone(),
         })
     }
@@ -1119,15 +1133,18 @@ pub struct SessionView {
     /// 最新活动时间 (叶子节点 created_at, LRU 淘汰用).
     pub latest_at: DateTime<Utc>,
     /// preview (叶子节点的最后一条 user msg 截断).
-    pub preview: Option<String>,
-    /// model (叶子节点).
-    pub model: Option<String>,
+    ///
+    /// `Arc<str>`: list_sessions (3s 轮询) 路径共享切片而非 clone 字符串.
+    /// serde 透明序列化为 string, 前端无感知.
+    pub preview: Option<Arc<str>>,
+    /// model (叶子节点). `Arc<str>` 同上.
+    pub model: Option<Arc<str>>,
     /// 最新轮次的上游响应状态.
     pub latest_resp_status: u16,
     /// 最新轮次的错误 (若有).
     pub latest_error: Option<String>,
-    /// 最新轮次的 redactions.
-    pub redactions: Vec<(String, String)>,
+    /// 最新轮次的 redactions. `Arc<[(String,String)]>`: 共享切片而非 clone Vec.
+    pub redactions: Arc<[(String, String)]>,
     /// 叶子节点 HTTP path (形如 "/o/<provider_id>/..."), 前端 provider icon 据此解析
     /// protocol 角标 + provider id. 取最近一轮的 provider, 跨 provider 重试场景下
     /// 可能不代表整条会话的 provider.
@@ -1156,9 +1173,10 @@ pub struct NodeView {
     pub resp_status: u16,
     pub redact_seed: u64,
     /// WebUI sidebar 标题 (最后一条 user message 截断).
-    pub preview: Option<String>,
-    /// 请求 body 顶层 model 字段.
-    pub model: Option<String>,
+    /// `Arc<str>`: list/timeline 路径共享切片而非 clone (serde 透明序列化).
+    pub preview: Option<Arc<str>>,
+    /// 请求 body 顶层 model 字段. `Arc<str>` 同上.
+    pub model: Option<Arc<str>>,
     /// 是否流式响应.
     pub streamed: bool,
     /// 响应是否完整 (上游错误 / 客户端断开 → false).
@@ -1166,7 +1184,8 @@ pub struct NodeView {
     /// 错误诊断.
     pub error: Option<String>,
     /// (mock, secret_id) 投影. 永不含真实 secret value.
-    pub redactions: Vec<(String, String)>,
+    /// `Arc<[(String,String)]>`: 共享切片而非 clone Vec.
+    pub redactions: Arc<[(String, String)]>,
     /// parsed view (ingress codec writer 序列化的 IrResponse, LLM 视角含 mock).
     /// timeline 路径直接消费, 前端不再 N+1 拉 /records/{id}?view=parsed.
     pub parsed_response: Option<serde_json::Value>,
@@ -1220,7 +1239,7 @@ mod tests {
             req_body_raw: String::new(),
             preview: None,
             model: None,
-            redactions: vec![],
+            redactions: Arc::from([]),
         }
     }
 
@@ -1880,9 +1899,9 @@ mod tests {
             redact_seed: 0,
             policy: Arc::new(PolicySnapshot::default()),
             req_body_raw: req_body.to_string(),
-            preview,
-            model,
-            redactions: vec![],
+            preview: preview.map(Arc::<str>::from),
+            model: model.map(Arc::<str>::from),
+            redactions: Arc::from([]),
         }
     }
 
@@ -2010,7 +2029,7 @@ mod tests {
         // NodeView 应携带 list 路径所需的所有字段 (preview/model/streamed/redactions/...).
         let dag = ConversationDag::new(8, 500, 1);
         let mut ev = event_with_body("/o/x/v1/chat", "{}");
-        ev.redactions = vec![("MOCKx".into(), "k".into())];
+        ev.redactions = Arc::from([("MOCKx".into(), "k".into())]);
         let id = dag.push_messages(vec![], ev);
         dag.attach_response(
             id,

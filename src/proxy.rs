@@ -609,9 +609,9 @@ fn build_call_event(
         redact_seed,
         policy,
         req_body_raw: req_text.to_string(),
-        preview,
-        model,
-        redactions,
+        preview: preview.map(std::sync::Arc::<str>::from),
+        model: model.map(std::sync::Arc::<str>::from),
+        redactions: std::sync::Arc::from(redactions),
     }
 }
 
