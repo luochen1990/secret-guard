@@ -13,3 +13,42 @@ Secret Guard
 4. 它会在生成 Mock Secret 时, 确保它在会话中的唯一性, 以使得它完全不可能跟其他内容出现同名撞车, 不用担心响应中的内容被错误地替换.
 5. 它会精心生成像模像样的 Mock Secret , 以使得从 LLM 的视角看, 它几乎就是一个真 Secret, 不会被 LLM 质疑这个 Secret 的合法性 (比如 LLM 不会因发现 Mock Secret 很假而错误地提示你 "它的长度太短" 之类的问题, 而引入 LLM 响应噪音)
 
+## 快速开始
+
+### 路由约定
+
+URL 形如 `/{proto_short}/{provider_id}/*rest`, 同时编码 **入站协议** 与 **目标 Provider**:
+
+| proto_short | Protocol | SDK 示例 (`base_url`) |
+|---|---|---|
+| `o` | OpenAI    | `http://127.0.0.1:18787/o/<provider-id>` |
+| `a` | Anthropic | `http://127.0.0.1:18787/a/<provider-id>` |
+| `g` | Gemini    | `http://127.0.0.1:18787/g/<provider-id>` |
+| `l` | oLLama    | `http://127.0.0.1:18787/l/<provider-id>` |
+
+`proto_short` 简写映射来自 `Protocol::ALL`, 详细路由错误语义见 `AGENTS.md`.
+
+### WebUI 入口
+
+浏览器访问根路径 `http://127.0.0.1:18787/` 即可打开 WebUI:
+- **Records**: 会话 / 轮次时间线, 查看每次转发的请求与响应 (LLM 视角, 含 Mock Secret).
+- **Secrets**: 管理 Secret 注册表.
+- **Providers**: 管理 Provider 注册表.
+
+(向后兼容入口 `/__sg` 仍保留.)
+
+### 双层配置
+
+secret-guard 采用双层配置, 同一份实体可同时有 static 与 dynamic 来源, WebUI 编辑结果落盘到 dynamic 文件:
+
+| 文件 | 角色 | 谁写 | 进 git? |
+|---|---|---|---|
+| `secret-guard.toml`       | **声明式 (static)**: providers / secrets / server / redact / auth. 进程内只读. | 用户手写 | 推荐 |
+| `secret-guard.state.toml` | **动态 (dynamic)**: WebUI 编辑结果 + 对 static 项的 decision. 删除即可重置. | 程序自动 | 推荐 .gitignore |
+
+合并语义 (`OverrideMode`: Default / PreferStatic / Disabled) 与各字段详情见 `AGENTS.md` 与 `src/config.rs` 头部注释.
+
+---
+
+更详尽的开发 / 部署 / 测试流程见 `AGENTS.md`.
+
