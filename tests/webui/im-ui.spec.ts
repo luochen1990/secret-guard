@@ -113,9 +113,11 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     expect(bubbleClasses.some((c) => c.includes("bubble-user"))).toBe(true);
   });
 
-  test("需求 2 (IM 风格): 每轮只渲染本轮最后一条 user msg, 不重复历史", async ({ page }) => {
+  test("需求 2 (IM 风格): 每轮渲染本轮 delta, 不重复历史", async ({ page }) => {
     // 多轮对话 (累积 messages 数组): 旧版会每轮重复显示前序历史气泡.
-    // IM 风格: 每轮 request-pane 只渲染本轮的 "最后一条 user msg" = 单个 user 气泡.
+    // 修复后 (issue #27): 每轮 request-pane 渲染本轮 req_delta 的所有非 assistant messages.
+    //   - 根节点: system + user (2 个气泡, system 可见)
+    //   - 非根节点: 只渲染本轮新增 (user / tool_result 等), 不回显完整历史
     const longSys = "You are a helpful assistant designed to test the secret-guard webui. ".repeat(50);
     await sendChat(page, [
       { role: "system", content: longSys },
@@ -126,10 +128,9 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     await clickSessionByLeaf(page, leaf);
     await page.waitForTimeout(500);
 
-    // IM 风格: request-pane 只有一个 user 气泡 (本轮新增).
+    // 根节点: 1 个 user 气泡 + 1 个 system 气泡 (system prompt 现在可见).
     await expect(page.locator("#detail .request-pane .chat-bubble.bubble-user")).toHaveCount(1);
-    // 不应该出现 system 气泡 (不再回显完整历史).
-    await expect(page.locator("#detail .request-pane .chat-bubble.bubble-system")).toHaveCount(0);
+    await expect(page.locator("#detail .request-pane .chat-bubble.bubble-system")).toHaveCount(1);
     // user 气泡应包含 preview 文本.
     const userText = await page.locator("#detail .chat-bubble.bubble-user").textContent();
     expect(userText).toContain("three-tier-test-marker");
@@ -246,5 +247,168 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     const distanceToBottom =
       scrollInfo.scrollHeight - scrollInfo.scrollTop - scrollInfo.clientHeight;
     expect(distanceToBottom).toBeLessThan(20);
+  });
+
+  // ─── Bug 复现测试 (PR26 引入的渲染问题) ────────────────────────────────────
+  //
+  // 以下测试复现用户报告的 3 个 bug, 用 "先写测试" 方式锁定期望行为:
+  //   Bug 1: tool-call 循环中 user msg 气泡重复 (同一气泡出现多次).
+  //   Bug 2: Tool Call (response) 和 Tool Result (下一轮 req) 混在一个气泡.
+  //   Bug 3: 压缩后的会话看不到 system prompt / 完整上下文.
+  //
+  // 复现策略: 通过 sendChat 模拟多轮累积请求, 触发真实渲染路径.
+
+  /**
+   * 模拟 agent tool-call 循环: 用户问一次, agent 多轮 tool_call + tool_result.
+   *
+   * 三轮请求 (累积 messages 数组, DAG 通过 prefix hash 链成同一会话):
+   *   轮1: [sys, u1] → LLM 返回 tool_call(ls)
+   *   轮2: [sys, u1, a1(tool_call), tool1(result)] → LLM 返回 tool_call(cat)
+   *   轮3: [sys, u1, a1(tc), tool1, a2(tc), tool2] → LLM 返回最终文本
+   */
+  test("Bug 1 验证: tool-call 循环 delta 内容不同 (preview 可同)", async ({
+    page,
+  }) => {
+    await sendChat(page, [
+      { role: "system", content: "sys-bug1-test" },
+      { role: "user", content: "bug1-list-files-marker" },
+    ]);
+    await sendChat(page, [
+      { role: "system", content: "sys-bug1-test" },
+      { role: "user", content: "bug1-list-files-marker" },
+      { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "ls", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "c1", content: "file1\nfile2" },
+    ]);
+    await sendChat(page, [
+      { role: "system", content: "sys-bug1-test" },
+      { role: "user", content: "bug1-list-files-marker" },
+      { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "ls", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "c1", content: "file1\nfile2" },
+      { role: "assistant", content: null, tool_calls: [{ id: "c2", type: "function", function: { name: "cat", arguments: '{"f":"file1"}' } }] },
+      { role: "tool", tool_call_id: "c2", content: "hello world" },
+    ]);
+
+    const sid = await findSessionLeafByPreview(page, "bug1-list-files-marker");
+    await clickSessionByLeaf(page, sid);
+    await page.waitForTimeout(500);
+
+    await expect(page.locator(".round-item")).toHaveCount(3);
+    // delta 内容验证: tool_result 气泡 + assistant tool_call 气泡应存在.
+    expect(await page.locator("#detail .chat-bubble[data-role='tool']").count()).toBeGreaterThan(0);
+    expect(await page.locator("#detail .chat-bubble.bubble-assistant").count()).toBeGreaterThan(0);
+  });
+
+  test("Bug 2 复现: response 的 tool_call 与 req 的 tool_result 应分开渲染", async ({
+    page,
+  }) => {
+    // 单轮 tool-call 场景: 请求含 tool_result, response 返回文本.
+    await sendChat(page, [
+      { role: "system", content: "sys-bug2" },
+      { role: "user", content: "bug2-weather-marker" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: "w1",
+            type: "function",
+            function: { name: "get_weather", arguments: '{"city":"SF"}' },
+          },
+        ],
+      },
+      { role: "tool", tool_call_id: "w1", content: "Sunny, 72F" },
+    ]);
+
+    // preview = 最后一条 user (优先 user).
+    const sid = await findSessionLeafByPreview(page, "bug2-weather-marker");
+    await clickSessionByLeaf(page, sid);
+    await page.waitForTimeout(500);
+
+    // 期望 (修复后): request-pane 应显示 tool_result 气泡 (role=tool),
+    // response-pane 应显示 LLM 文本回复.
+    // 当前 bug: request-pane 只渲染 user preview, tool_result 完全不显示.
+
+    // 1. 应有 tool 气泡 (tool_result 在 request 侧).
+    const toolBubbles = page.locator("#detail .chat-bubble.bubble-tool, #detail .chat-bubble[data-role='tool']");
+    const toolCount = await toolBubbles.count();
+    expect(toolCount, "tool_result 应渲染为独立气泡").toBeGreaterThan(0);
+
+    // 2. tool 气泡应包含 "Sunny" (tool_result 的内容).
+    if (toolCount > 0) {
+      const toolText = await toolBubbles.first().textContent();
+      expect(toolText).toContain("Sunny");
+    }
+  });
+
+  test("Bug 3 复现: 压缩后应能看到 system prompt + 完整上下文", async ({ page }) => {
+    // 模拟 opencode 压缩: 最后一条 user = "What did we do so far?".
+    // 修复后: 应能看到 system prompt 气泡 + 压缩摘要气泡.
+    await sendChat(page, [
+      { role: "system", content: "sys-compress-bug3-marker You are a helpful coding assistant." },
+      { role: "user", content: "earlier question" },
+      { role: "assistant", content: "earlier answer" },
+      { role: "user", content: "What did we do so far?" },
+      { role: "assistant", content: "## 目标\n实现 secret-guard" },
+    ]);
+
+    // preview = last assistant (压缩 marker fallback).
+    const sid = await findSessionLeafByPreview(page, "secret-guard");
+    await clickSessionByLeaf(page, sid);
+    await page.waitForTimeout(500);
+
+    // 期望 (修复后): timeline 应显示 system 气泡.
+    // 当前 bug: 只渲染 preview (48 chars 截断), system prompt 完全不展示.
+    const systemBubbles = page.locator("#detail .chat-bubble.bubble-system, #detail .chat-bubble[data-role='system']");
+    const systemCount = await systemBubbles.count();
+    expect(systemCount, "system prompt 应渲染为气泡").toBeGreaterThan(0);
+
+    // system 气泡内容应包含 marker 文本.
+    if (systemCount > 0) {
+      const sysText = await systemBubbles.first().textContent();
+      expect(sysText).toContain("sys-compress-bug3-marker");
+    }
+  });
+
+  // ─── Phase A: response 传输优化 + delta 含 assistant ──────────────────────
+  //
+  // 验证 issue #28 Phase A 的核心不变量:
+  //   1. 多轮 timeline 中, 只有末轮有 response-pane (非末轮 response 已在 delta 中).
+  //   2. delta 里的 assistant message 渲染为无源气泡 (不再跳过).
+  test("Phase A: 多轮 timeline 只有末轮有 response, delta 含 assistant 气泡", async ({
+    page,
+  }) => {
+    // 两轮对话 (累积 messages, DAG prefix hash 链成同一会话).
+    await sendChat(page, [
+      { role: "user", content: "phaseA-round1-marker" },
+    ]);
+    await sendChat(page, [
+      { role: "user", content: "phaseA-round1-marker" },
+      { role: "assistant", content: "phaseA-assistant-round1" },
+      { role: "user", content: "phaseA-round2-marker" },
+    ]);
+
+    // 找到该会话 (preview = 最后一条 = round2 user).
+    const sid = await findSessionLeafByPreview(page, "phaseA-round2-marker");
+    await clickSessionByLeaf(page, sid);
+    await page.waitForTimeout(500);
+
+    // 应有 2 个 tl-round.
+    await expect(page.locator("#detail .tl-round")).toHaveCount(2);
+
+    // 只有 1 个 response-pane (末轮).
+    await expect(page.locator("#detail .response-pane")).toHaveCount(1);
+
+    // delta 里的 assistant 气泡 (轮1的 response 被轮2 delta 引用).
+    const assistantBubbles = page.locator(
+      "#detail .request-pane .chat-bubble.bubble-assistant"
+    );
+    const asstCount = await assistantBubbles.count();
+    expect(asstCount, "delta 应含 assistant 气泡").toBeGreaterThan(0);
+
+    // assistant 气泡应包含轮1的 response 内容.
+    if (asstCount > 0) {
+      const asstText = await assistantBubbles.first().textContent();
+      expect(asstText).toContain("phaseA-assistant-round1");
+    }
   });
 });

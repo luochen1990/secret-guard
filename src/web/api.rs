@@ -277,6 +277,11 @@ pub struct RecordSummary {
     /// timeline 路径直接消费, 前端不再 N+1 拉 /records/{id}?view=parsed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parsed_response: Option<serde_json::Value>,
+    /// 本轮 request delta (wire JSON messages, 从 req_body_raw 末尾截取).
+    /// 只在 timeline 路径非空; list 路径留空.
+    /// 前端按 role 渲染气泡 (system/user/tool), 与 preview 互补 (issue #27).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub req_delta_messages: Vec<serde_json::Value>,
 }
 
 /// preview 截断上限 (char count). 后端唯一截断点, 前端直接渲染.
@@ -304,6 +309,7 @@ impl From<NodeView> for RecordSummary {
             preview: v.preview,
             model: v.model,
             parsed_response: v.parsed_response,
+            req_delta_messages: v.req_delta_messages,
         }
     }
 }
@@ -314,14 +320,15 @@ impl From<NodeView> for RecordSummary {
 /// 放在顶层, `messages[]` 也共享 `{role, content}` 形状. content 支持 string 和
 /// `[{type:"text", text}]` 两种形态 (OpenAI / Anthropic 一致).
 ///
-/// 标题选择策略 (issue #23 子项 1, #25 修订):
-/// 1. 默认取**最后一条** user message 文本 (本轮问题, 让累积数组的每轮有独立标题).
-/// 2. 若最后一条 user 是 `"What did we do so far?"` (opencode 压缩 marker), 说明本轮是
-///    "请求生成压缩摘要", 改取最后一条 assistant 消息 (即压缩摘要本身, 形如 "## 目标 ...").
+/// 标题选择策略 (issue #27):
+/// 取 messages 数组中**最后一条有文本内容的 message**, 不限 role.
+/// 这让 tool-call 循环的每一轮有不同 preview:
+///   轮1: [sys, u1] → preview = u1 (用户问题)
+///   轮2: [sys, u1, a1(tc), tool1] → preview = tool1 内容 (不同于 u1!)
+///   轮3: [sys, u1, a1(tc), tool1, a2(tc), tool2] → preview = tool2 内容 (不同于 tool1!)
 ///
-/// 背景: OpenAI / Anthropic chat API 的 messages 数组是**累积**的 — 每轮请求都包含
-/// 完整历史. 若取首条 user, 同一会话的所有轮次标题都相同 (都是第一条 user),
-/// 二级菜单无法区分. 取最后一条 user 才能反映 "这一轮问了什么".
+/// 压缩 marker 特殊处理: 若最后一条恰好是 "What did we do so far?" (opencode 压缩
+/// marker), 改取最后一条 assistant (即压缩摘要).
 ///
 /// 设计权衡:
 /// - 不复用 codec reader: reader 会做更重的协议归一化 (tool_calls / system 顶层等),
@@ -345,15 +352,23 @@ pub(crate) fn extract_preview_and_model(req_body: &str) -> (Option<String>, Opti
     // opencode 压缩会话注入的固定 user message (opencode 源码:
     // packages/opencode/src/session/message-v2.ts:231). 命中时优先取最后一条 assistant 摘要.
     // 精确匹配依赖 opencode 内部实现; 若 opencode 改变 marker, 匹配失败会优雅降级到
-    // 正常的 "最后一条 user" 路径 (有测试覆盖该降级).
+    // 正常的 "最后一条有文本的 message" 路径 (有测试覆盖该降级).
     const COMPRESSED_MARKER: &str = "What did we do so far?";
     let messages = v.get("messages").and_then(|m| m.as_array());
+    // preview 优先级 (issue #27):
+    // 1. 最后一条 user message (人类可读, 反映本轮问题)
+    // 2. 最后一条有文本的 message (不限 role, 覆盖纯 tool-call 轮次)
+    // 3. 压缩 marker 命中时 → 最后一条 assistant 摘要
     let last_user = messages.and_then(|msgs| last_message_text_by_role(msgs, "user"));
+    let last_any = messages.and_then(|msgs| last_message_text(msgs));
     let raw = match last_user.as_deref() {
         Some(COMPRESSED_MARKER) => messages
             .and_then(|msgs| last_message_text_by_role(msgs, "assistant"))
             .or(last_user),
-        _ => last_user, // 正常会话或无消息: 最后一条 user.
+        // 有 user message → 优先用 (可读性好, 不暴露 tool_result 结构化数据).
+        Some(_) => last_user,
+        // 无 user message → 回退到最后一条有文本的 message (tool_result / assistant).
+        None => last_any,
     };
     let preview = raw.map(|s| {
         // 归一化空白 + 截断 (与前端 messagePreview 逻辑一致, SSOT 在此).
@@ -384,29 +399,55 @@ fn last_message_text_by_role(messages: &[serde_json::Value], role: &str) -> Opti
         if m.get("role").and_then(|r| r.as_str()) != Some(role) {
             return None;
         }
-        let content = m.get("content")?;
-        // string content: 直接取.
-        if let Some(s) = content.as_str() {
-            return Some(s.to_string());
-        }
-        // array content: 拼接所有 type=text 的 text 字段.
-        if let Some(arr) = content.as_array() {
-            let texts: Vec<&str> = arr
-                .iter()
-                .filter_map(|b| {
-                    if b.get("type").and_then(|t| t.as_str()) != Some("text") {
-                        return None;
-                    }
-                    b.get("text").and_then(|t| t.as_str())
-                })
-                .collect();
-            if texts.is_empty() {
+        message_text(m)
+    })
+}
+
+/// 从 messages 数组中提取**最后一条有可展示文本的 message** (不限 role).
+///
+/// 用于 preview: tool-call 循环中最后一条可能是 tool_result (role=tool),
+/// 让每轮 preview 反映本轮的实际增量, 而非永远是同一条 user message (issue #27).
+/// 跳过 tool_call (assistant 无 content / 只有 tool_calls) 和其他无文本 message.
+fn last_message_text(messages: &[serde_json::Value]) -> Option<String> {
+    messages.iter().rev().find_map(message_text)
+}
+
+/// 从单条 message 中提取可展示文本 (content string 或 array of text blocks).
+/// 跳过无文本的 message (tool_call only / null content / 空串).
+pub(crate) fn message_text(m: &serde_json::Value) -> Option<String> {
+    let content = m.get("content")?;
+    // string content: 直接取 (空串视为无文本).
+    if let Some(s) = content.as_str() {
+        return if s.is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        };
+    }
+    // array content: 拼接所有 type=text 的 text 字段.
+    if let Some(arr) = content.as_array() {
+        return extract_text_blocks(arr).map(|t| t.join(" "));
+    }
+    None
+}
+
+/// 从 content blocks 数组中收集所有 text 块的文本.
+/// 用于 message.content (array 形态) 和 Anthropic system (array 形态).
+/// 返回原始文本片段 (未 join), 调用方决定分隔符 (message 用 space, system 用 newline).
+pub(crate) fn extract_text_blocks(arr: &[serde_json::Value]) -> Option<Vec<String>> {
+    let texts: Vec<String> = arr
+        .iter()
+        .filter_map(|b| {
+            if b.get("type").and_then(|t| t.as_str()) != Some("text") {
                 return None;
             }
-            return Some(texts.join(" "));
-        }
-        None
-    })
+            b.get("text")
+                .and_then(|t| t.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        })
+        .collect();
+    if texts.is_empty() { None } else { Some(texts) }
 }
 
 #[derive(Serialize)]
@@ -492,7 +533,9 @@ pub async fn get_timeline(
     Path(id): Path<Uuid>,
     Query(q): Query<TimelineQuery>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let limit = q.limit.unwrap_or(10).clamp(1, 200);
+    // limit 上限 50 (而非 list 的 200): timeline 路径对每个 node 都 parse req_body_raw
+    // 提取 delta messages, 大 body + 高 limit 会造成延迟尖峰 (issue #27 review #1).
+    let limit = q.limit.unwrap_or(10).clamp(1, 50);
     let views = state.dag.timeline(id, limit);
     if views.is_empty() {
         return Err(StatusCode::NOT_FOUND);
@@ -1101,6 +1144,52 @@ mod tests {
         assert_eq!(extract_preview_and_model(r3).0.as_deref(), Some("Q3"));
     }
 
+    // ─── PR26 bug #1 修复验证: tool-call 循环 preview 策略 ──────────────────
+    //
+    // agent tool-call 循环: 用户问一次, agent 多轮 tool_call + tool_result.
+    // preview 优先取最后一条 user (可读性好); 无 user 时回退到最后一条有文本的 message.
+    // tool-call 循环中 user 不变 (都是初始问题), 但二级菜单靠轮次序号 + 时间戳区分.
+    #[test]
+    fn extract_preview_tool_call_cycle_prefers_user() {
+        // 轮1: 用户问 "list files"
+        let r1 = r#"{"model":"x","messages":[
+            {"role":"system","content":"sys"},
+            {"role":"user","content":"list files"}
+        ]}"#;
+        // 轮2: agent 调 tool, tool 返回结果.
+        let r2 = r#"{"model":"x","messages":[
+            {"role":"system","content":"sys"},
+            {"role":"user","content":"list files"},
+            {"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"ls","arguments":"{}"}}]},
+            {"role":"tool","tool_call_id":"c1","content":"file1\nfile2"}
+        ]}"#;
+        let p1 = extract_preview_and_model(r1).0;
+        let p2 = extract_preview_and_model(r2).0;
+        // 优先取 user message (可读性好, 不暴露 tool_result 结构化数据).
+        assert_eq!(p1.as_deref(), Some("list files"));
+        assert_eq!(
+            p2.as_deref(),
+            Some("list files"),
+            "优先取 user 而非 tool_result"
+        );
+    }
+
+    #[test]
+    fn extract_preview_no_user_falls_back_to_tool_result() {
+        // 无 user message 时, 回退到最后一条有文本的 message (tool_result / assistant).
+        let body = r#"{"model":"x","messages":[
+            {"role":"system","content":"sys"},
+            {"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"ls","arguments":"{}"}}]},
+            {"role":"tool","tool_call_id":"c1","content":"result data"}
+        ]}"#;
+        let (preview, _) = extract_preview_and_model(body);
+        assert_eq!(
+            preview.as_deref(),
+            Some("result data"),
+            "无 user → 回退到 tool_result"
+        );
+    }
+
     #[test]
     fn extract_preview_compressed_session_falls_back_to_last_assistant() {
         // opencode 压缩会话: 最后一条 user = "What did we do so far?" → 改取最后一条 assistant 摘要.
@@ -1168,11 +1257,13 @@ mod tests {
     }
 
     #[test]
-    fn extract_preview_no_user_message_returns_none() {
-        let body = r#"{"model":"x","messages":[{"role":"system","content":"sys"}]}"#;
+    fn extract_preview_system_only_returns_system_text() {
+        // 只有 system message (无 user): 修复后取最后一条有文本的 message = system.
+        // (旧行为: 只找 user → 返回 None; 新行为: 不限 role → 返回 system 文本)
+        let body = r#"{"model":"x","messages":[{"role":"system","content":"sys text"}]}"#;
         let (preview, model) = extract_preview_and_model(body);
         assert_eq!(model.as_deref(), Some("x"));
-        assert!(preview.is_none());
+        assert_eq!(preview.as_deref(), Some("sys text"));
     }
 
     #[test]
@@ -1257,6 +1348,7 @@ mod tests {
             error: None,
             redactions: vec![],
             parsed_response: None,
+            req_delta_messages: vec![],
         };
         let s = RecordSummary::from(v);
         assert_eq!(s.model.as_deref(), Some("gpt-4o"));
@@ -1285,6 +1377,7 @@ mod tests {
             error: None,
             redactions: vec![],
             parsed_response: None,
+            req_delta_messages: vec![],
         };
         let s = RecordSummary::from(v);
         assert!(s.preview.is_none());

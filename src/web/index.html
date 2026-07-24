@@ -1538,7 +1538,7 @@
       }
       html += `</div>`;
       // 每轮.
-      html += timelineRecords.map((r, idx) => renderTimelineRound(r, idx)).join('');
+      html += timelineRecords.map((r, idx) => renderTimelineRound(r, idx, idx === timelineRecords.length - 1)).join('');
       // 悬浮导航按钮.
       html += `
         <div class="scroll-nav">
@@ -1549,12 +1549,12 @@
       return html;
     }
 
-    // 渲染单轮 (request bubbles + response 打字框).
+    // 渲染单轮 (request delta bubbles + 末轮 response).
     //
-    // IM 风格 (issue #25): 每轮的 request-pane 只渲染 "本轮新增" = 最后一条 user message,
-    // 不再回显完整 messages 历史 (避免每轮重复显示前序轮次内容).
-    // 后端 RecordSummary.preview 已经是 last_user 文本, 直接消费.
-    function renderTimelineRound(r, idx) {
+    // 每轮渲染完整 delta (含 assistant, 作为无源气泡).
+    // 只有 timeline 最末轮才渲染 response-pane: 非末轮的 response 内容已被下一轮
+    // delta 的 assistant message 包含, 传输是冗余 (issue #28 Phase A).
+    function renderTimelineRound(r, idx, isLast) {
       const num = idx + 1;
       const roundCls = (r.id === selectedRound) ? 'tl-round highlight' : 'tl-round';
       let inner = '';
@@ -1568,24 +1568,38 @@
           ${r.streamed ? '<span class="badge badge-stream">streamed</span>' : ''}
         </span>
       </div>`;
-      // request-pane: 只渲染本轮新增 (最后一条 user message).
+      // request-pane: 渲染本轮完整 delta (含 assistant 作为无源气泡).
       inner += `<div class="request-pane" data-rid="${escapeHtml(r.id)}">`;
       const redactions = normalizeRedactions(r.redactions);
-      inner += renderRoundPreview(r, redactions);
+      inner += renderRequestDelta(r, redactions);
       inner += `</div>`;
-      // response-pane (打字框).
-      inner += `<div class="response-pane" data-rid="${escapeHtml(r.id)}">`;
-      inner += `<div class="resp-header"><span>Response</span><span class="resp-status">${renderStatusLine(r)}</span></div>`;
-      inner += `<div class="resp-body">${renderTimelineResponseBody(r)}</div>`;
-      inner += `</div>`;
+      // response-pane: 只有末轮渲染 (非末轮 response 已在下一轮 delta 中).
+      if (isLast) {
+        inner += `<div class="response-pane" data-rid="${escapeHtml(r.id)}">`;
+        inner += `<div class="resp-header"><span>Response</span><span class="resp-status">${renderStatusLine(r)}</span></div>`;
+        inner += `<div class="resp-body">${renderTimelineResponseBody(r)}</div>`;
+        inner += `</div>`;
+      }
       return `<div class="${roundCls}" data-rid="${escapeHtml(r.id)}">${inner}</div>`;
     }
 
-    // 渲染单轮 request 的 "本轮新增" = 最后一条 user message (单个 user bubble).
-    // 后端 preview 已是 last_user 截断文本, 直接渲染. 失败时 fallback 到 method+path.
-    function renderRoundPreview(r, redactions) {
-      const preview = r.preview || `${r.method} ${r.path}`;
-      return renderBubble('user', preview, redactions, 'user');
+    // 渲染本轮 request delta 的所有 messages 为独立气泡 (含 assistant).
+    //
+    // 有源气泡 (非 assistant): 本轮首次引入的 message (system / user / tool_result),
+    //   持有 node 上下文, 可被 selectRound 定位 + 展示富信息.
+    // 无源气泡 (assistant): 前序轮 response 的历史副本, 纯展示.
+    //   含 text → 文本气泡; 含 tool_calls → 各自 tool_call 气泡 (与 response 侧对称).
+    //
+    // fallback: 若 req_delta_messages 为空, 用 preview 渲染单个 user 气泡.
+    function renderRequestDelta(r, redactions) {
+      const deltas = r.req_delta_messages || [];
+      const fallback = () => renderBubble('user', r.preview || `${r.method} ${r.path}`, redactions, 'user');
+      if (deltas.length === 0) return fallback();
+      let html = '';
+      for (const msg of deltas) {
+        html += renderMessageBubbles(msg, redactions);
+      }
+      return html || fallback();
     }
 
     // 渲染单轮 response body (parsed view).
@@ -1603,16 +1617,18 @@
       return '<empty>';
     }
 
-    // 增量更新各轮 response body (自动刷新, node 序列不变时).
+    // 增量更新末轮 response body (自动刷新, node 序列不变时).
+    // 只有末轮有 response-pane (非末轮 response 已在 delta 中).
     function updateTimelineResponses() {
-      for (const r of timelineRecords) {
-        const bodyEl = document.querySelector(`#detail .response-pane[data-rid="${CSS.escape(r.id)}"] .resp-body`);
+      const last = timelineRecords[timelineRecords.length - 1];
+      if (last) {
+        const bodyEl = document.querySelector(`#detail .response-pane[data-rid="${CSS.escape(last.id)}"] .resp-body`);
         if (bodyEl) {
-          const newBody = renderTimelineResponseBody(r);
+          const newBody = renderTimelineResponseBody(last);
           if (bodyEl.innerHTML !== newBody) bodyEl.innerHTML = newBody;
         }
-        const statusEl = document.querySelector(`#detail .response-pane[data-rid="${CSS.escape(r.id)}"] .resp-status`);
-        if (statusEl) statusEl.innerHTML = renderStatusLine(r);
+        const statusEl = document.querySelector(`#detail .response-pane[data-rid="${CSS.escape(last.id)}"] .resp-status`);
+        if (statusEl) statusEl.innerHTML = renderStatusLine(last);
       }
       updateScrollNavVisibility();
     }
@@ -1692,35 +1708,46 @@
       return `tool_use ${block.id || ''}\nname: ${block.name || ''}\ninput: ${safeJsonStringify(block.input)}`;
     }
 
-    // 从 parsed_response (OpenAI / Anthropic chat JSON) 提取文本, 放入打字框.
-    // 不用气泡包裹 (response 区本身就是单个 "打字框", 只有一段 LLM 输出).
-    // 保留 tool_calls / tool_use 的渲染 (作为 response 的一部分).
+    // 把一条 OpenAI 风格的 message (text content + tool_calls) 渲染为气泡序列.
+    // delta 中的 assistant 和 response 中的 message 共用此逻辑 (DRY, issue #28 review).
+    function renderMessageBubbles(msg, redactions) {
+      const role = msg.role || 'unknown';
+      let parts = [];
+      const text = messageToText(msg);
+      if (text !== null) {
+        parts.push(renderBubble(role, text, redactions, role));
+      }
+      if (role === 'assistant' && Array.isArray(msg.tool_calls)) {
+        for (const tc of msg.tool_calls) {
+          parts.push(renderBubble('assistant', formatToolCall(tc), redactions, 'assistant'));
+        }
+      }
+      return parts.join('');
+    }
+
+    // 从 parsed_response (OpenAI / Anthropic chat JSON) 提取内容, 渲染为分项气泡.
+    // 每个内容块 (text / tool_call / tool_use) 独立气泡, 不混在一个纯文本块里.
+    // redactions 高亮应用到每个气泡.
     function renderResponseText(respJson, redactions) {
       const choice = respJson.choices && respJson.choices[0];
       const openaiMsg = choice && choice.message;
       if (openaiMsg) {
-        let parts = [];
-        const text = messageToText(openaiMsg);
-        if (text !== null) parts.push(applyMockHighlight(escapeHtml(text), redactions));
-        if (Array.isArray(openaiMsg.tool_calls)) {
-          for (const tc of openaiMsg.tool_calls) {
-            parts.push(applyMockHighlight(escapeHtml(formatToolCall(tc)), redactions));
-          }
-        }
-        return parts.length > 0 ? parts.join('\n\n') : '<empty>';
+        // OpenAI: message 含 text content + tool_calls.
+        const html = renderMessageBubbles({ ...openaiMsg, role: 'assistant' }, redactions);
+        return html || '<empty>';
       }
       if (Array.isArray(respJson.content)) {
         let parts = [];
         for (const block of respJson.content) {
           if (block && block.type === 'text' && typeof block.text === 'string') {
-            parts.push(applyMockHighlight(escapeHtml(block.text), redactions));
+            parts.push(renderBubble('assistant', block.text, redactions, 'assistant'));
           } else if (block && block.type === 'tool_use') {
-            parts.push(applyMockHighlight(escapeHtml(formatToolUse(block)), redactions));
+            parts.push(renderBubble('assistant', formatToolUse(block), redactions, 'assistant'));
           }
         }
-        return parts.length > 0 ? parts.join('\n\n') : '<empty>';
+        return parts.length > 0 ? parts.join('') : '<empty>';
       }
-      // 未知结构: pretty JSON.
+      // 未知结构: pretty JSON (无气泡包裹, 纯文本 fallback).
       return escapeHtml(safeJsonStringify(respJson));
     }
 
@@ -1872,6 +1899,7 @@
       if (typeof c === 'string') return c || null;
       if (Array.isArray(c)) {
         // 收集 text 块; tool_use / tool_result 单独处理 (见调用处).
+        // join 用 \n (保留段落分隔, 用于渲染); Rust 侧 message_text 用 space (preview 归一化).
         const texts = c
           .filter(b => b && b.type === 'text' && typeof b.text === 'string')
           .map(b => b.text);

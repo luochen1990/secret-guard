@@ -912,6 +912,8 @@ impl ConversationDag {
             error: resp.as_ref().and_then(|r| r.error.clone()),
             redactions: node.event.redactions.clone(),
             parsed_response: resp.as_ref().and_then(|r| r.parsed.clone()),
+            // list_page 路径不填 (避免 O(n) 全量 resolve); timeline 路径单独填.
+            req_delta_messages: Vec::new(),
         })
     }
 
@@ -954,6 +956,15 @@ impl ConversationDag {
     /// 从 `node_id` 沿 parent 链向上取 `limit` 个祖先 (含 node_id 自身),
     /// oldest-first 返回. 用于右侧 timeline 惰性加载.
     /// 返回的第一个元素是最老的 (链中最接近根的), 最后一个是 node_id 自身.
+    ///
+    /// 与 list_page 不同: timeline 路径额外填充 `req_delta_messages` —
+    /// 从 `req_body_raw` 末尾截取 `req_delta_count` 条 messages (wire JSON),
+    /// 让前端能渲染本轮新增的所有气泡 (issue #27).
+    ///
+    /// `parsed_response` 只在末轮 (最后一个节点) 保留; 非末轮的设为 None.
+    /// 理由: 非 leaf 的 response 内容已被下一轮 delta 的 assistant message 包含,
+    /// 传输冗余. 前端从 delta 渲染完整对话流, 末轮 response 才是 timeline 尚未
+    /// 被 delta 消费的部分 (issue #28 Phase A).
     pub fn timeline(&self, node_id: Uuid, limit: usize) -> Vec<NodeView> {
         let g = self.inner.read();
         let limit = limit.max(1);
@@ -968,11 +979,89 @@ impl ConversationDag {
         }
         // oldest-first: chain 是 newest→oldest, 反转.
         chain.reverse();
+        let last_idx = chain.len().saturating_sub(1);
         chain
             .into_iter()
-            .filter_map(|id| self.node_view(&g, id))
+            .enumerate()
+            .filter_map(|(i, id)| {
+                let mut view = self.node_view(&g, id)?;
+                // 填充 req_delta_messages: 从 req_body_raw 末尾截取 req_delta_count 条.
+                if view.req_delta_count > 0 {
+                    view.req_delta_messages =
+                        extract_delta_messages(view.req_delta_count, &g, id).unwrap_or_default();
+                }
+                // 非末轮: 清除 parsed_response (已被下一轮 delta 的 assistant 包含).
+                if i != last_idx {
+                    view.parsed_response = None;
+                }
+                Some(view)
+            })
             .collect()
     }
+}
+
+/// 从 node 的 req_body_raw 末尾截取 req_delta_count 条 messages (wire JSON),
+/// 并在根节点时额外提取 system prompt.
+///
+/// 用于 timeline 路径填充 NodeView.req_delta_messages.
+/// req_body_raw 是完整请求 wire JSON (已 redact, LLM 视角),
+/// messages 数组按 prefix 共享, 末尾 req_delta_count 条是本轮增量.
+///
+/// system 处理: OpenAI reader 把 role=system 提升到 IrRequest.system (不在 messages 里),
+/// writer 再写回 messages[0]. 但 DAG 的 req_delta_count 不含 system (基于 IR messages).
+/// 因此根节点 (parent=None) 时, 从 req_body_raw 顶层提取 system 字段 (Anthropic 风格)
+/// 或 messages[0] (OpenAI 风格 role=system), 作为 delta 的首条 synthetic message.
+///
+/// 失败容错: 解析失败 / messages 不是数组 / 数量不足 → None (前端 fallback 到 preview).
+fn extract_delta_messages(
+    count: usize,
+    inner: &DagInner,
+    node_id: Uuid,
+) -> Option<Vec<serde_json::Value>> {
+    let node = inner.nodes.get(&node_id)?;
+    let req_body: serde_json::Value = serde_json::from_str(&node.event.req_body_raw).ok()?;
+    let messages = req_body.get("messages")?.as_array()?;
+    if messages.len() < count {
+        return None;
+    }
+    let start = messages.len() - count;
+    let mut result: Vec<serde_json::Value> = messages[start..].to_vec();
+
+    // 根节点: 若有顶层 system (Anthropic 风格) 或 messages[0] 是 system (OpenAI),
+    // 且未被 req_delta 覆盖 (start > 0 说明 system 在 messages[start] 之前),
+    // 则把 system 作为 delta 的首条 synthetic message 注入.
+    // 这让根节点的 system prompt 在 timeline 可见 (issue #27 bug 3).
+    if node.parent.is_none() && start > 0 {
+        // Anthropic 风格: 顶层 system 字段 (string 或 array).
+        if let Some(sys) = req_body.get("system") {
+            let sys_text = if let Some(s) = sys.as_str() {
+                (!s.is_empty()).then(|| s.to_string())
+            } else if let Some(arr) = sys.as_array() {
+                crate::web::api::extract_text_blocks(arr).map(|t| t.join("\n"))
+            } else {
+                None
+            };
+            if let Some(text) = sys_text {
+                result.insert(0, serde_json::json!({"role": "system", "content": text}));
+            }
+        }
+        // OpenAI 风格: messages[0] 是 role=system (writer 写回).
+        // 若 start > 0 且 messages[0].role == system, 注入到 delta 首位
+        // (额外 guard result.first 非 system, 防御 messages 含多条 system 的畸形输入).
+        else if messages
+            .first()
+            .and_then(|m| m.get("role").and_then(|r| r.as_str()))
+            == Some("system")
+            && result
+                .first()
+                .and_then(|m| m.get("role").and_then(|r| r.as_str()))
+                != Some("system")
+        {
+            result.insert(0, messages[0].clone());
+        }
+    }
+
+    Some(result)
 }
 
 /// 会话视图 (sidebar 一级树).
@@ -1038,6 +1127,15 @@ pub struct NodeView {
     /// parsed view (ingress codec writer 序列化的 IrResponse, LLM 视角含 mock).
     /// timeline 路径直接消费, 前端不再 N+1 拉 /records/{id}?view=parsed.
     pub parsed_response: Option<serde_json::Value>,
+    /// 本轮 request delta (相对 parent 的增量 messages, 协议无关 wire JSON).
+    ///
+    /// 只在 timeline 路径填充 (list_page 路径留空, 避免 O(n) 全量 resolve).
+    /// 前端用于渲染本轮新增的气泡 (system / user / tool_result 等),
+    /// 实现每轮 preview + 完整 delta 展示 (issue #27).
+    ///
+    /// 每个元素是 message 的 wire JSON (OpenAI / Anthropic 原生格式),
+    /// 前端按 role 分发气泡样式, 与 response 气泡区分.
+    pub req_delta_messages: Vec<serde_json::Value>,
 }
 
 /// Node 的请求侧详情 (GET /records/{id} 按需拉取).
@@ -1435,7 +1533,7 @@ mod tests {
 
     /// 构造一个带 preview/model/req_body_raw 的 CallEvent (覆盖 list/get 视图字段).
     fn event_with_body(path: &str, req_body: &str) -> CallEvent {
-        let (preview, model) = (Some("hi".to_string()), Some("gpt-x".to_string()));
+        let (preview, model) = crate::web::api::extract_preview_and_model(req_body);
         CallEvent {
             created_at: Utc::now(),
             elapsed_ms: 0,
@@ -1593,8 +1691,8 @@ mod tests {
             },
         );
         let v = dag.get_node(id).expect("node exists");
-        assert_eq!(v.preview.as_deref(), Some("hi"));
-        assert_eq!(v.model.as_deref(), Some("gpt-x"));
+        assert!(v.preview.is_none(), "body 无 messages → preview=None");
+        assert!(v.model.is_none(), "body 无 model 字段 → model=None");
         assert_eq!(v.resp_status, 500);
         assert_eq!(v.elapsed_ms, 99);
         assert!(v.streamed);
@@ -1927,5 +2025,218 @@ mod tests {
         let tl = dag.timeline(c, 2);
         assert_eq!(tl.len(), 2);
         assert_eq!(tl[1].id, c, "includes the requested node");
+    }
+
+    // ─── extract_delta_messages (timeline 路径填充) 单元测试 ──────────────
+    //
+    // 通过 push 带 req_body_raw 的 node, 再 timeline 取回, 验证 req_delta_messages
+    // 的提取逻辑 (含 system 注入 + fallback).
+
+    #[test]
+    fn timeline_delta_openai_root_start_zero_includes_system_in_slice() {
+        // OpenAI 风格根节点: messages = [sys, u1].
+        // push 2 条 IrMessage → req_delta_count=2.
+        // req_body_raw messages 有 2 条, start = 2-2 = 0 → 无需注入 (已在切片内).
+        let dag = ConversationDag::new(64, 500, 1);
+        let body = r#"{"model":"x","messages":[{"role":"system","content":"sys-prompt"},{"role":"user","content":"u1"}]}"#;
+        let msgs = vec![
+            text_msg(IrRole::System, "sys-prompt"),
+            text_msg(IrRole::User, "u1"),
+        ];
+        let id = dag.push_messages(msgs, event_with_body("/o/oa/v1/chat", body));
+        let tl = dag.timeline(id, 10);
+        assert_eq!(tl.len(), 1);
+        let delta = &tl[0].req_delta_messages;
+        assert_eq!(delta.len(), 2, "delta = [sys, u1] (都在切片内)");
+        assert_eq!(
+            delta[0].get("role").and_then(|r| r.as_str()),
+            Some("system")
+        );
+    }
+
+    #[test]
+    fn timeline_delta_openai_root_injects_system_when_wire_has_more_messages() {
+        // 跨协议 writer 拆分场景 (AGENTS.md 已知限制): OpenAI writer 把 Anthropic 风格的
+        // 混合 Text+ToolResult user 消息拆成多条 wire messages.
+        // 这里模拟: push 1 条 IrMessage (User), 但 req_body_raw 有 3 条 messages
+        // (模拟 writer 拆分后 system + user_text + tool_result).
+        // 根节点: start = 3-1 = 2 > 0, messages[0] 是 system → 注入到 delta 首位.
+        let dag = ConversationDag::new(64, 500, 1);
+        let body = r#"{"model":"x","messages":[{"role":"system","content":"sys-x"},{"role":"user","content":"question"},{"role":"tool","tool_call_id":"c1","content":"result"}]}"#;
+        // 只 push 1 条 IrMessage → req_delta_count=1.
+        let id = dag.push_messages(
+            vec![text_msg(IrRole::User, "question")],
+            event_with_body("/o/oa/v1/chat", body),
+        );
+        let tl = dag.timeline(id, 10);
+        assert_eq!(tl.len(), 1);
+        let delta = &tl[0].req_delta_messages;
+        // 注入后: system + 切片 messages[2..] = [system, tool_result].
+        assert_eq!(delta.len(), 2, "注入 system + 切片 [tool_result]");
+        assert_eq!(
+            delta[0].get("role").and_then(|r| r.as_str()),
+            Some("system"),
+            "首位应是注入的 system"
+        );
+        assert_eq!(
+            delta[1].get("role").and_then(|r| r.as_str()),
+            Some("tool"),
+            "第二位是切片的 tool_result"
+        );
+    }
+
+    #[test]
+    fn timeline_delta_non_root_does_not_inject_system() {
+        // 子节点: req_delta_count=1, messages.len()=3, start=2.
+        // 但子节点不注入 system (只有根节点注入).
+        let dag = ConversationDag::new(64, 500, 1);
+        let body_a = r#"{"model":"x","messages":[{"role":"system","content":"sys-prompt"},{"role":"user","content":"u1"}]}"#;
+        let msgs_a = vec![
+            text_msg(IrRole::System, "sys-prompt"),
+            text_msg(IrRole::User, "u1"),
+        ];
+        let _id_a = dag.push_messages(msgs_a, event_with_body("/o/oa/v1/chat", body_a));
+        let body_b = r#"{"model":"x","messages":[{"role":"system","content":"sys-prompt"},{"role":"user","content":"u1"},{"role":"assistant","content":"a1"}]}"#;
+        let msgs_b = vec![
+            text_msg(IrRole::System, "sys-prompt"),
+            text_msg(IrRole::User, "u1"),
+            text_msg(IrRole::Assistant, "a1"),
+        ];
+        let id_b = dag.push_messages(msgs_b, event_with_body("/o/oa/v1/chat", body_b));
+        let tl = dag.timeline(id_b, 10);
+        assert_eq!(tl.len(), 2);
+        // 子节点 B: 不注入 system. delta = messages[2..] = [a1].
+        let delta_b = &tl[1].req_delta_messages;
+        assert_eq!(delta_b.len(), 1, "子节点 delta = [a1] (不含 system)");
+        assert_eq!(
+            delta_b[0].get("role").and_then(|r| r.as_str()),
+            Some("assistant")
+        );
+    }
+
+    #[test]
+    fn timeline_delta_non_json_body_returns_empty() {
+        // 非 JSON req_body_raw → extract 返回 None → req_delta_messages 为空.
+        let dag = ConversationDag::new(64, 500, 1);
+        let id = dag.push_messages(
+            vec![text_msg(IrRole::User, "u")],
+            event_with_body("/o/oa/v1/chat", "not json"),
+        );
+        let tl = dag.timeline(id, 10);
+        assert_eq!(tl.len(), 1);
+        assert!(
+            tl[0].req_delta_messages.is_empty(),
+            "非 JSON body → 空 delta"
+        );
+    }
+
+    #[test]
+    fn timeline_delta_fewer_messages_than_count_returns_empty() {
+        // req_body_raw 的 messages 数量 < req_delta_count → guard 触发, 返回空.
+        let dag = ConversationDag::new(64, 500, 1);
+        // push 2 条 IrMessage → req_delta_count=2.
+        // 但 req_body_raw 只有 1 条 messages → guard 触发.
+        let body = r#"{"model":"x","messages":[{"role":"user","content":"only-one"}]}"#;
+        let id = dag.push_messages(
+            vec![text_msg(IrRole::User, "a"), text_msg(IrRole::User, "b")],
+            event_with_body("/o/oa/v1/chat", body),
+        );
+        let tl = dag.timeline(id, 10);
+        assert_eq!(tl.len(), 1);
+        assert!(
+            tl[0].req_delta_messages.is_empty(),
+            "messages < count → 空 delta"
+        );
+    }
+
+    #[test]
+    fn timeline_delta_no_messages_key_returns_empty() {
+        // req_body_raw 合法 JSON 但无 messages key → extract 返回 None.
+        let dag = ConversationDag::new(64, 500, 1);
+        let body = r#"{"model":"x","other":"value"}"#;
+        let id = dag.push_messages(
+            vec![text_msg(IrRole::User, "u")],
+            event_with_body("/o/oa/v1/chat", body),
+        );
+        let tl = dag.timeline(id, 10);
+        assert_eq!(tl.len(), 1);
+        assert!(tl[0].req_delta_messages.is_empty());
+    }
+
+    // ─── Phase A: parsed_response 只在 timeline 末轮保留 ────────────────────
+
+    #[test]
+    fn timeline_parsed_response_only_on_last_node() {
+        // 3 轮链: A → B → C. timeline(C, 10) 返回 [A, B, C].
+        // Phase A: 只有 C (末轮) 保留 parsed_response; A 和 B 的设为 None.
+        // 理由: 非 leaf 节点的 response 内容已被下一轮 delta 的 assistant message 包含,
+        // 传输是冗余. assert 通过后可安全省略 (issue #28 Phase A).
+        let dag = ConversationDag::new(64, 500, 1);
+        let a = dag.push_messages(vec![text_msg(IrRole::User, "u1")], dummy_event());
+        dag.attach_response(
+            a,
+            ResponseData {
+                parsed: Some(serde_json::json!({"resp": "a1"})),
+                resp_status: 200,
+                ..Default::default()
+            },
+        );
+        let b = dag.push_messages(
+            vec![
+                text_msg(IrRole::User, "u1"),
+                text_msg(IrRole::Assistant, "a1"),
+                text_msg(IrRole::User, "u2"),
+            ],
+            dummy_event(),
+        );
+        dag.attach_response(
+            b,
+            ResponseData {
+                parsed: Some(serde_json::json!({"resp": "a2"})),
+                resp_status: 200,
+                ..Default::default()
+            },
+        );
+        let c = dag.push_messages(
+            vec![
+                text_msg(IrRole::User, "u1"),
+                text_msg(IrRole::Assistant, "a1"),
+                text_msg(IrRole::User, "u2"),
+                text_msg(IrRole::Assistant, "a2"),
+                text_msg(IrRole::User, "u3"),
+            ],
+            dummy_event(),
+        );
+        dag.attach_response(
+            c,
+            ResponseData {
+                parsed: Some(serde_json::json!({"resp": "a3"})),
+                resp_status: 200,
+                ..Default::default()
+            },
+        );
+
+        let tl = dag.timeline(c, 10);
+        assert_eq!(tl.len(), 3);
+        // A, B (非末轮): parsed_response 应为 None.
+        assert!(
+            tl[0].parsed_response.is_none(),
+            "非末轮 A 的 parsed_response 应为 None"
+        );
+        assert!(
+            tl[1].parsed_response.is_none(),
+            "非末轮 B 的 parsed_response 应为 None"
+        );
+        // C (末轮): parsed_response 保留.
+        assert_eq!(
+            tl[2]
+                .parsed_response
+                .as_ref()
+                .unwrap()
+                .get("resp")
+                .and_then(|r| r.as_str()),
+            Some("a3"),
+            "末轮 C 的 parsed_response 应保留"
+        );
     }
 }

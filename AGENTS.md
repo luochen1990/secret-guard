@@ -173,11 +173,26 @@ PATCH  /__sg/api/providers/{id}/decision
 `resp_body` 在 record 完成后为空 (不保留原始 SSE 字节), parsed view 通过 `resp_parsed` 提供.
 
 `RecordSummary` 同时携带两个从 `req_body` 一次性提取的轻量字段 (提取后丢弃 body):
-- `preview`: sidebar 主标题 (截断到 48 chars). 默认取首条 user message 文本;
-  若首条 user 是 opencode 压缩 marker ("What did we do so far?") 则改取首条 assistant 摘要
+- `preview`: sidebar 主标题 (截断到 48 chars). 优先取最后一条 user message
+  (可读性好); 无 user 时回退到最后一条有文本的 message (tool_result / assistant).
+  压缩 marker ("What did we do so far?") 命中时 fallback 到最后一条 assistant 摘要.
   (压缩摘要形如 "## 目标 ...", 本身有辨识度). 提取失败 fallback 到 method+path.
 - `model`: 顶层 `model` 字段 (OpenAI / Anthropic 共有), sidebar 副标题第二行.
 提取逻辑在 `web::api::extract_preview_and_model` (协议无关字节级, 不依赖 codec reader).
+
+**Timeline delta messages** (issue #27): timeline 路径的 `RecordSummary` 额外携带
+`req_delta_messages` (本轮新增 messages 的 wire JSON, 从 `req_body_raw` 末尾截取).
+前端按 role 渲染独立气泡 (system / user / tool_result / assistant), assistant 作为
+无源气泡 (前序 response 的历史副本). 根节点额外注入 system prompt (OpenAI reader
+提升 system 到 `IrRequest.system`, writer 写回 messages[0]; 截取逻辑在根节点 start>0
+时补回). list 路径 (`GET /records`) 不填此字段 (避免 O(n) 全量 resolve).
+
+**Timeline response 传输优化** (issue #28 Phase A): timeline 返回的 N 个节点中, 只有
+最末节点 (timeline anchor) 保留 `parsed_response`; 非末轮的设为 None. 理由: 非 leaf
+的 response 内容已被下一轮 delta 的 assistant message 完整包含, 传输是冗余. 前端从
+完整 delta 渲染连续对话流 (含 assistant 气泡), 只有末轮额外渲染 response-pane
+(尚未被任何 delta 消费的部分). 后续 Phase B 将进一步在 push 时删除 parent.response
+(瞬态存储), 用 `consistency-check` feature flag 的 assertion 保证 delta↔response 一致.
 
 **Sessions / Timeline (会话折叠 WebUI)**: sidebar 一级 (会话) 来自 `GET /api/sessions`
 (返回叶子节点 + record_count + latest 字段); 二级 (轮次列表) 与右侧 timeline 对话流来自
@@ -597,6 +612,12 @@ devShell 的 `shellHook` 自动把 `@playwright/test` 的 node_modules symlink �
 - static config (`secret-guard.toml`) 的 `[server]` 段当前仅在启动时读取一次,
   WebUI 改 host/port 不会生效 (需要重启).
 - WebUI 编辑 provider 时 api_key 始终要求重输 (无法保留旧值), 留空则覆盖为空字符串.
+- **跨协议 ingress 的 timeline delta 切片可能错位**: OpenAI writer 会把 Anthropic 风格的
+  混合 Text+ToolResult user 消息拆成 (1+N) 条 wire messages, 导致 `req_body_raw` 的
+  messages 数 > IR messages 数. `extract_delta_messages` 用 `messages.len() - req_delta_count`
+  切片时, 跨协议路径的 start 偏小, delta 可能包含前序轮消息. 同协议路径不受影响
+  (wire 与 IR 1:1). 后续可改为从 `req_delta` (IR MessageRef) resolve + ingress writer
+  重新序列化 (与 redact 路径一致).
 
 ## 路径约定
 
