@@ -595,12 +595,9 @@ fn build_call_event(
     };
     CallEvent {
         created_at: chrono::Utc::now(),
-        elapsed_ms: 0,
         method: parts.method.as_str().to_string(),
         path: path.to_string(),
         req_headers: redact_headers(fwd_headers),
-        resp_status: 0,
-        resp_headers: vec![],
         // req_envelope 当前仅作占位 (Web DTO 用 req_body_raw 而非 envelope 重建).
         // 未来若 WebUI 需展示 system/tools 等字段, 可改为 ingress writer 投影后
         // 移除 messages/system key 的 JSON value.

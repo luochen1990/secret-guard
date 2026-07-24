@@ -314,15 +314,19 @@ pub struct Node {
 }
 
 /// 一次 API 调用的事件元数据.
+///
+/// 响应侧元数据 (`resp_status` / `resp_headers` / `elapsed_ms`) **不在此处** —
+/// 它们只存在于 [`Node::response`] (`ResponseData`) 的 RwLock 内, 让
+/// [`ConversationDag::attach_response`] 能在外层 read lock 下通过 node-level 锁
+/// 更新单节点, 不阻塞并发 push / 其他节点的 attach (perf: 两级锁).
+/// [`ConversationDag::node_view`] / [`ConversationDag::session_view`] 从
+/// `node.response.read()` 取这些字段.
 #[derive(Debug)]
 pub struct CallEvent {
     pub created_at: DateTime<Utc>,
-    pub elapsed_ms: u64,
     pub method: String,
     pub path: String,
     pub req_headers: Vec<(String, String)>,
-    pub resp_status: u16,
-    pub resp_headers: Vec<(String, String)>,
     /// 请求侧非 message 字段 (model / temperature / tools / system 等).
     pub req_envelope: serde_json::Value,
     pub ingress_protocol: Option<CodecProtocol>,
@@ -626,11 +630,7 @@ impl ConversationDag {
     /// 无 parent (新根) 时用本 node (node_id) 的 preview.
     ///
     /// 返回 `Arc<str>` 直接共享根 node 的 preview, 不复制字符串.
-    fn find_root_title(
-        inner: &DagInner,
-        parent: Option<Uuid>,
-        node_id: Uuid,
-    ) -> Option<Arc<str>> {
+    fn find_root_title(inner: &DagInner, parent: Option<Uuid>, node_id: Uuid) -> Option<Arc<str>> {
         // walk parent 链到链首, 暂存每个 node 的 preview, 循环结束保留最旧的.
         let mut title: Option<Arc<str>> = None;
         let mut cursor = parent;
@@ -842,22 +842,18 @@ impl ConversationDag {
 
     /// attach response 到 node.
     ///
-    /// 同时更新 [`CallEvent`] 的 `resp_status` / `resp_headers` / `elapsed_ms`,
-    /// 让 [`get_node`] 的 [`NodeView`] 反映最终响应元数据 (用于 list 场景).
+    /// 两级锁 (perf): 外层 `inner.read()` + 内层 `node.response.write()`,
+    /// 让并发 push / 其他节点的 attach / update_parsed_response 不再串行化在
+    /// 全局 write lock 上. 流式场景多路并发 attach 时尤其受益.
     ///
-    /// TODO(perf): 当前持有全局 write lock 更新单个 node, 高并发下可能成为瓶颈.
-    /// perf: 后续可优化为 read lock + node.response.write() 两级锁.
+    /// 响应元数据 (`resp_status` / `resp_headers` / `elapsed_ms`) 只写
+    /// `node.response`, [`NodeView`] / [`SessionView`] 读它们时也走 response 锁.
     pub fn attach_response(&self, node_id: Uuid, response: ResponseData) {
-        let mut g = self.inner.write();
-        let Some(node) = g.nodes.get_mut(&node_id) else {
+        let g = self.inner.read();
+        let Some(node) = g.nodes.get(&node_id) else {
             tracing::warn!(%node_id, "attach_response: node not found (evicted?)");
             return;
         };
-        // 同步 event 的响应元数据 (resp_status / resp_headers / elapsed_ms),
-        // 让 NodeView (list 路径) 无需读 response 也能拿到最终值.
-        node.event.resp_status = response.resp_status;
-        node.event.resp_headers = response.resp_headers.clone();
-        node.event.elapsed_ms = response.elapsed_ms;
         *node.response.write() = Some(response);
     }
 
@@ -865,9 +861,12 @@ impl ConversationDag {
     ///
     /// 若 node 尚无 ResponseData (流过程中尚未 attach), 自动创建一个 default 占位
     /// (resp_complete=false), 仅写 parsed 字段; 最终的 [`attach_response`] 会整体替换.
+    ///
+    /// 两级锁 (perf): 与 [`attach_response`] 同. 这是高频路径 (流式 ~500ms 一次),
+    /// 改 read lock + node.response.write() 后并发多路流式不再串行化在全局锁.
     pub fn update_parsed_response(&self, node_id: Uuid, parsed: serde_json::Value) {
-        let mut g = self.inner.write();
-        let Some(node) = g.nodes.get_mut(&node_id) else {
+        let g = self.inner.read();
+        let Some(node) = g.nodes.get(&node_id) else {
             tracing::warn!(%node_id, "update_parsed_response: node not found (evicted?)");
             return;
         };
@@ -950,10 +949,12 @@ impl ConversationDag {
             req_delta_count: node.req_delta.len(),
             has_response: resp.is_some(),
             created_at: node.event.created_at,
-            elapsed_ms: node.event.elapsed_ms,
+            // elapsed_ms / resp_status 从 response 锁读取 (perf: 响应字段集中在
+            // node.response, attach_response 无需写 event → 两级锁可行).
+            elapsed_ms: resp.as_ref().map(|r| r.elapsed_ms).unwrap_or(0),
             method: node.event.method.clone(),
             path: node.event.path.clone(),
-            resp_status: node.event.resp_status,
+            resp_status: resp.as_ref().map(|r| r.resp_status).unwrap_or(0),
             redact_seed: node.event.redact_seed,
             preview: node.event.preview.clone(),
             model: node.event.model.clone(),
@@ -999,7 +1000,7 @@ impl ConversationDag {
             // 见 issue #36: 多轮对话中标题应稳定 = 最早 round 的首条 user msg.
             preview: s.title.clone(),
             model: leaf.event.model.clone(),
-            latest_resp_status: leaf.event.resp_status,
+            latest_resp_status: resp.as_ref().map(|r| r.resp_status).unwrap_or(0),
             latest_error: resp.as_ref().and_then(|r| r.error.clone()),
             redactions: Arc::clone(&leaf.event.redactions),
             path: leaf.event.path.clone(),
@@ -1226,12 +1227,9 @@ mod tests {
     fn dummy_event() -> CallEvent {
         CallEvent {
             created_at: Utc::now(),
-            elapsed_ms: 0,
             method: "POST".to_string(),
             path: "/o/test/v1/chat".to_string(),
             req_headers: vec![],
-            resp_status: 0,
-            resp_headers: vec![],
             req_envelope: serde_json::json!({}),
             ingress_protocol: None,
             redact_seed: 0,
@@ -1888,12 +1886,9 @@ mod tests {
         let (preview, model) = crate::web::api::extract_preview_and_model(req_body);
         CallEvent {
             created_at: Utc::now(),
-            elapsed_ms: 0,
             method: "POST".to_string(),
             path: path.to_string(),
             req_headers: vec![("authorization".into(), "<redacted>".into())],
-            resp_status: 0,
-            resp_headers: vec![],
             req_envelope: serde_json::json!({}),
             ingress_protocol: None,
             redact_seed: 0,
@@ -2974,5 +2969,160 @@ mod tests {
             let r2 = pool.resolve_message(&ref2).expect("resolve 2");
             prop_assert_eq!(r1.content, r2.content);
         }
+    }
+
+    // ─── 两级锁并发回归 (perf: attach / update_parsed 不应阻塞全局) ───────
+    //
+    // 这组测试守卫两级锁改动的线程安全: 8 writer 并发 attach_response +
+    // update_parsed_response, 4 reader 并发 list_page / get_node / get_response.
+    // 在数据竞争 / 覆盖场景下, 至少能被 ThreadSanitizer 或 logic assert 抓住.
+
+    #[test]
+    fn concurrent_attach_and_list_do_not_corrupt_or_deadlock() {
+        // 预先 push N 个 node (在单线程下), 然后并发 attach_response 给它们.
+        // reader 并发 list_page + get_node 读 NodeView, 验证 resp_status 一致性:
+        // attach 后 NodeView.resp_status 应等于该 response 的 status (或 attach 前 0).
+        let dag = Arc::new(ConversationDag::new(64, 500, 1));
+        let n = 32;
+        let ids: Vec<Uuid> = (0..n)
+            .map(|i| {
+                dag.push_messages(
+                    vec![text_msg(IrRole::User, &format!("u{i}"))],
+                    dummy_event(),
+                )
+            })
+            .collect();
+
+        // 8 writer: 每个 writer 负责若干 node, 先 update_parsed_response 几次 (流式
+        // 节流), 再 attach_response 最终值. 高频 update_parsed 是重点压测的两级锁路径.
+        let writers: Vec<std::thread::JoinHandle<()>> = (0..8)
+            .map(|w| {
+                let dag = Arc::clone(&dag);
+                let ids = ids.clone();
+                std::thread::spawn(move || {
+                    for (i, &id) in ids.iter().enumerate() {
+                        if i % 8 != w {
+                            continue;
+                        }
+                        // 模拟流式 parsed 节流更新 (高频, 两级锁核心目标).
+                        for j in 0..3 {
+                            dag.update_parsed_response(
+                                id,
+                                serde_json::json!({"partial": w, "step": j}),
+                            );
+                        }
+                        // 最终 attach (低频, 两级锁次要目标).
+                        dag.attach_response(
+                            id,
+                            ResponseData {
+                                resp_status: 200,
+                                elapsed_ms: (w as u64) * 10,
+                                parsed: Some(serde_json::json!({"resp": format!("w{w}")})),
+                                resp_complete: true,
+                                ..Default::default()
+                            },
+                        );
+                    }
+                })
+            })
+            .collect();
+
+        // 4 reader: 并发 list_page + get_node + get_response, 读 NodeView 验证
+        // 字段一致性 (resp_status ∈ {0=attach前, 200=attach后}; elapsed_ms 与 status 一致).
+        let readers: Vec<std::thread::JoinHandle<()>> = (0..4)
+            .map(|r| {
+                let dag = Arc::clone(&dag);
+                let ids = ids.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        // list_page 不 panic, 且总数 == n.
+                        let (views, total) = dag.list_page(0, 200, false);
+                        assert_eq!(total, n, "reader {r}: list_page total");
+                        assert!(views.len() <= n);
+                        // list_sessions 不 panic.
+                        let _sessions = dag.list_sessions();
+                        // 抽样读 NodeView / ResponseData, 验证 resp_status ∈ {0,200}.
+                        for &id in ids.iter().step_by(4 + r) {
+                            if let Some(v) = dag.get_node(id) {
+                                assert!(
+                                    v.resp_status == 0 || v.resp_status == 200,
+                                    "reader {r}: node {id} resp_status={} (应为 0 或 200)",
+                                    v.resp_status
+                                );
+                                // attach 前 elapsed_ms=0; attach 后 = w*10.
+                                let valid_elapsed = v.elapsed_ms == 0 || v.elapsed_ms % 10 == 0;
+                                assert!(
+                                    valid_elapsed,
+                                    "reader {r}: node {id} elapsed_ms={} 不合规",
+                                    v.elapsed_ms
+                                );
+                            }
+                            if let Some(resp) = dag.get_response(id) {
+                                assert!(
+                                    resp.resp_status == 0 || resp.resp_status == 200,
+                                    "reader {r}: response {id} status 不合规"
+                                );
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        // join: 任何 panic (含 assert 失败) 都会让 join 返回 Err, 测试失败.
+        // 死锁会让 join 阻塞直到 nextest 超时 (默认无, 测试层会 hang → 手动发现).
+        for w in writers {
+            w.join().expect("writer thread panicked / deadlocked");
+        }
+        for r in readers {
+            r.join().expect("reader thread panicked / deadlocked");
+        }
+
+        // 最终一致性: 所有 node 都应被 attach (resp_status=200).
+        for &id in &ids {
+            let v = dag.get_node(id).expect("node exists");
+            assert_eq!(
+                v.resp_status, 200,
+                "attach 后 node {id} resp_status 应为 200"
+            );
+            assert!(v.has_response, "attach 后 node {id} 应有 response");
+        }
+    }
+
+    #[test]
+    fn concurrent_update_parsed_response_multi_writer_last_value_wins() {
+        // 验证 update_parsed_response 两级锁在并发下不破坏 ResponseData: 多个 writer
+        // 并发写同一 node 的 parsed, 最终 get_response 能取到一个合法的 JSON
+        // (无 torn write). 最后一次写获胜 (无确定性要求, 仅要求结构完整).
+        let dag = Arc::new(ConversationDag::new(16, 100, 1));
+        let id = dag.push_messages(vec![text_msg(IrRole::User, "u")], dummy_event());
+
+        let writers: Vec<std::thread::JoinHandle<()>> = (0..16)
+            .map(|w| {
+                let dag = Arc::clone(&dag);
+                std::thread::spawn(move || {
+                    for j in 0..20 {
+                        dag.update_parsed_response(
+                            id,
+                            serde_json::json!({"writer": w, "step": j, "payload": "x".repeat(64)}),
+                        );
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().expect("writer panicked");
+        }
+
+        let resp = dag.get_response(id).expect("response exists");
+        let parsed = resp.parsed.expect("parsed exists");
+        // 结构完整: 含 writer / step / payload 字段且类型正确.
+        assert!(parsed.get("writer").and_then(|v| v.as_u64()).is_some());
+        assert!(parsed.get("step").and_then(|v| v.as_u64()).is_some());
+        assert_eq!(
+            parsed.get("payload").and_then(|v| v.as_str()).map(str::len),
+            Some(64),
+            "并发写后 payload 字段应完整 (无 torn write)"
+        );
     }
 }
