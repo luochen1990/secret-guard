@@ -66,7 +66,7 @@ src/
 │                  # 纯函数模块, 含完整单元测试 (覆盖 Auto/Fixed 分支)
 ├── dag.rs         # ConversationDAG: 内容寻址的对话历史存储 (已接入 proxy/web)
 │                  # BlockPool (IrBlock 内容寻址池 + refcount GC) + Node + MessageRef
-│                  # + Merkle prefix hash (O(N) parent 查找) + FIFO 淘汰
+│                  # + Merkle prefix hash (O(N) parent 查找) + LRU session 淘汰 + child_count GC
 │                  # + derive_redact_map (lazy redact 纯函数, node 存 seed 不存 map)
 │                  # 设计文档 SSOT: docs/design/conversation-dag.md
 ├── record.rs      # ForwardRecord / RecordFilter (web 层 DTO, 从 DAG node 派生)
@@ -591,7 +591,7 @@ devShell 的 `shellHook` 自动把 `@playwright/test` 的 node_modules symlink �
   Fixed 模式下 mock 由用户提供, 系统校验不含 real ≥4 字符子串 (C5 best-effort).
 - **ConversationDAG 已接入**: `src/dag.rs` 作为 proxy/web 的存储后端, 替代扁平 RecordStore.
   ForwardRecord 保留为 web 层 DTO (从 DAG node 派生). WebUI sidebar 改为两级树
-  (会话 → 轮次, 基于 DAG leaves + parent 链), 右侧 timeline 对话流支持惰性加载
+  (会话 → 轮次, 基于 sessions map + parent 链), 右侧 timeline 对话流支持惰性加载
   (滚到顶 prepend 更早轮次, 保持滚动锚点). lazy redact 的完整 WebUI 重建
   (derive_redact_map 含 system/tools) 是后续工作, 当前 timeline 用 push 时预存的 req_body_raw.
 - static config (`secret-guard.toml`) 的 `[server]` 段当前仅在启动时读取一次,

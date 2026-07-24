@@ -42,7 +42,7 @@ async fn spawn_proxy_with_provider(provider: Provider) -> String {
     spawn_proxy_full(
         vec![provider],
         reqwest::Client::new(),
-        ConversationDag::new(64),
+        ConversationDag::new(64, 500, 1),
         test_secret_table(),
     )
     .await
@@ -541,7 +541,7 @@ async fn records_request_and_response_snapshots() {
         .await;
 
     let upstream_client = reqwest::Client::new();
-    let records = ConversationDag::new(64);
+    let records = ConversationDag::new(64, 500, 1);
     let records_handle = records.clone();
     let provider = openai_provider("oa-main", &upstream.url());
     let proxy_url = spawn_proxy_full(
@@ -610,7 +610,7 @@ async fn upstream_unreachable_returns_502_and_marks_record_incomplete() {
     drop(dummy_listener);
 
     let upstream_client = reqwest::Client::new();
-    let records = ConversationDag::new(64);
+    let records = ConversationDag::new(64, 500, 1);
     let records_handle = records.clone();
     let provider = openai_provider("oa-main", &format!("http://{bad_addr}"));
     let proxy_url = spawn_proxy_full(
@@ -899,7 +899,7 @@ async fn same_proto_streaming_with_redact_restores_mock_in_sse_chunks() {
     let entries = vec![secret("api-key", real_secret)];
     let secrets = test_secret_table_with(entries);
     let upstream_client = reqwest::Client::new();
-    let records = ConversationDag::new(64);
+    let records = ConversationDag::new(64, 500, 1);
     let records_handle = records.clone();
     let provider = openai_provider("oa-main", &upstream.url());
     let proxy_url = spawn_proxy_full(vec![provider], upstream_client, records, secrets).await;
@@ -986,7 +986,7 @@ async fn same_proto_streaming_with_redact_preserves_include_usage_chunk() {
     let entries = vec![secret("api-key", real_secret)];
     let secrets = test_secret_table_with(entries);
     let upstream_client = reqwest::Client::new();
-    let records = ConversationDag::new(64);
+    let records = ConversationDag::new(64, 500, 1);
     let provider = openai_provider("oa-main", &upstream.url());
     let proxy_url = spawn_proxy_full(vec![provider], upstream_client, records, secrets).await;
 
@@ -1044,7 +1044,7 @@ async fn streaming_redact_restores_mock_split_across_sse_chunks() {
     let entries = vec![secret("api-key", real_secret)];
     let secrets = test_secret_table_with(entries);
     let upstream_client = reqwest::Client::new();
-    let records = ConversationDag::new(64);
+    let records = ConversationDag::new(64, 500, 1);
     let provider = openai_provider("oa-main", &upstream.url());
     let proxy_url = spawn_proxy_full(vec![provider], upstream_client, records, secrets).await;
 
@@ -1105,7 +1105,7 @@ async fn streaming_redact_restores_input_json_delta_in_tool_use() {
     let entries = vec![secret("api-key", real_secret)];
     let secrets = test_secret_table_with(entries);
     let upstream_client = reqwest::Client::new();
-    let records = ConversationDag::new(64);
+    let records = ConversationDag::new(64, 500, 1);
     let provider = openai_provider("oa-main", &upstream.url());
     let proxy_url = spawn_proxy_full(vec![provider], upstream_client, records, secrets).await;
 
@@ -1164,7 +1164,7 @@ async fn streaming_redact_restores_when_upstream_skips_block_stop() {
     let entries = vec![secret("api-key", real_secret)];
     let secrets = test_secret_table_with(entries);
     let upstream_client = reqwest::Client::new();
-    let records = ConversationDag::new(64);
+    let records = ConversationDag::new(64, 500, 1);
     let provider = openai_provider("oa-main", &upstream.url());
     let proxy_url = spawn_proxy_full(vec![provider], upstream_client, records, secrets).await;
 
@@ -1212,7 +1212,7 @@ async fn cross_protocol_with_redact_round_trips_through_ir_translation() {
     let entries = vec![secret("api-key", real_secret)];
     let secrets = test_secret_table_with(entries);
     let upstream_client = reqwest::Client::new();
-    let records = ConversationDag::new(64);
+    let records = ConversationDag::new(64, 500, 1);
     let records_handle = records.clone();
     let provider = provider_with("an-main", Protocol::Anthropic, &upstream.url());
     let proxy_url = spawn_proxy_full(vec![provider], upstream_client, records, secrets).await;
@@ -1453,7 +1453,7 @@ async fn web_api_lists_records() {
         .await;
 
     let upstream_client = reqwest::Client::new();
-    let records = ConversationDag::new(64);
+    let records = ConversationDag::new(64, 500, 1);
     let records_handle = records.clone();
     let provider = openai_provider("oa-main", &upstream.url());
     let proxy_url = spawn_proxy_full(
@@ -1504,7 +1504,7 @@ async fn web_api_returns_record_by_id() {
         .await;
 
     let upstream_client = reqwest::Client::new();
-    let records = ConversationDag::new(64);
+    let records = ConversationDag::new(64, 500, 1);
     let records_handle = records.clone();
     let provider = openai_provider("oa-main", &upstream.url());
     let proxy_url = spawn_proxy_full(
@@ -1665,7 +1665,7 @@ async fn web_api_records_list_filter_hits_returns_only_redacted() {
     let entries = vec![secret("hit-key", real_secret)];
     let secrets = test_secret_table_with(entries);
     let upstream_client = reqwest::Client::new();
-    let records = ConversationDag::new(64);
+    let records = ConversationDag::new(64, 500, 1);
     let provider = openai_provider("oa-main", &upstream.url());
     let proxy_url = spawn_proxy_full(vec![provider], upstream_client, records, secrets).await;
 
@@ -1746,7 +1746,7 @@ async fn web_api_records_view_parsed_openai_returns_structured() {
         .await;
 
     let upstream_client = reqwest::Client::new();
-    let records = ConversationDag::new(64);
+    let records = ConversationDag::new(64, 500, 1);
     let records_handle = records.clone();
     let provider = openai_provider("oa-main", &upstream.url());
     let proxy_url = spawn_proxy_full(
@@ -2105,7 +2105,7 @@ async fn redact_strips_secret_from_upstream_request() {
     let entries = vec![secret("api-key", real_secret)];
     let secrets = test_secret_table_with(entries);
     let upstream_client = reqwest::Client::new();
-    let records = ConversationDag::new(64);
+    let records = ConversationDag::new(64, 500, 1);
     let records_handle = records.clone();
     let provider = openai_provider("oa-main", &upstream.url());
     let proxy_url = spawn_proxy_full(vec![provider], upstream_client, records, secrets).await;
@@ -2156,7 +2156,7 @@ async fn redact_populates_record_redactions_field() {
     let entries = vec![secret("my-api-key", real_secret)];
     let secrets = test_secret_table_with(entries);
     let upstream_client = reqwest::Client::new();
-    let records = ConversationDag::new(64);
+    let records = ConversationDag::new(64, 500, 1);
     let records_handle = records.clone();
     let provider = openai_provider("oa-main", &upstream.url());
     let proxy_url = spawn_proxy_full(vec![provider], upstream_client, records, secrets).await;
@@ -2211,7 +2211,7 @@ async fn passthrough_path_leaves_redactions_empty() {
         .create_async()
         .await;
     let upstream_client = reqwest::Client::new();
-    let records = ConversationDag::new(64);
+    let records = ConversationDag::new(64, 500, 1);
     let records_handle = records.clone();
     let provider = openai_provider("oa-main", &upstream.url());
     let proxy_url = spawn_proxy_full(
@@ -2265,7 +2265,7 @@ async fn restore_inserts_secret_back_for_client() {
     let entries = vec![secret("api-key", real_secret)];
     let secrets = test_secret_table_with(entries);
     let upstream_client = reqwest::Client::new();
-    let records = ConversationDag::new(64);
+    let records = ConversationDag::new(64, 500, 1);
     let records_handle = records.clone();
     let provider = openai_provider("oa-main", &upstream.url());
     let proxy_url = spawn_proxy_full(vec![provider], upstream_client, records, secrets).await;
@@ -2337,7 +2337,7 @@ async fn spawn_with_static_and_dynamic(
         static_providers,
         dynamic_providers,
         reqwest::Client::new(),
-        ConversationDag::new(64),
+        ConversationDag::new(64, 500, 1),
         test_secret_table(),
     )
     .await
@@ -2667,7 +2667,7 @@ async fn secret_decision_disabled_drops_from_redaction() {
         vec![provider],
         vec![],
         reqwest::Client::new(),
-        ConversationDag::new(64),
+        ConversationDag::new(64, 500, 1),
         secrets,
     )
     .await;
@@ -2848,7 +2848,7 @@ async fn cross_table_shared_state_no_lost_update() {
     let proxy = ProxyState {
         upstream: reqwest::Client::new(),
         providers: provider_table,
-        dag: ConversationDag::new(64),
+        dag: ConversationDag::new(64, 500, 1),
         secrets: secret_table,
     };
     let app = server::build_router(proxy);

@@ -82,7 +82,7 @@ pub async fn serve(
     state_path: PathBuf,
 ) -> anyhow::Result<()> {
     let upstream = build_upstream_client()?;
-    let dag = ConversationDag::new(records_capacity);
+    let dag = ConversationDag::new(records_capacity, 500, 1);
 
     // 跨表共享: persist_lock 串行整个 RMW, decisions 是同一份 mutable map.
     let persist_lock = Arc::new(Mutex::new(()));

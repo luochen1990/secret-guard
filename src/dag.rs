@@ -17,7 +17,7 @@
 //!
 //! # 详尽设计见 `docs/design/conversation-dag.md`
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -216,6 +216,47 @@ pub struct PolicySnapshot {
     pub secrets: Arc<[crate::secrets::SecretEntry]>,
 }
 
+// ─── SessionId + Session ───────────────────────────────────────────────────
+
+/// 会话的稳定标识 (运行时生成, 生命周期同 DAG 内存实例).
+///
+/// 与 leaf_id (游标, 随新请求变化) 和 root_id (fork 时不唯一) 不同,
+/// session_id 在会话整个存活期内不变: push 延续时复用, fork / 新根时生成新 id.
+/// 前端用它做选中 / 展开标识, 刷新后仍能匹配.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    Default,
+)]
+pub struct SessionId(pub Uuid);
+
+impl SessionId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+/// 一个会话的元数据 (sidebar 一级树).
+///
+/// leaf_id 是游标 (最新轮次), 随新请求前移. root_id 是会话根 (parent=None 的那个).
+/// node_count 由 push/evict 增量维护, 避免每次 list 都走 parent 链.
+#[derive(Debug, Clone)]
+struct Session {
+    leaf_id: Uuid,
+    root_id: Uuid,
+    node_count: usize,
+    created_at: DateTime<Utc>,
+    latest_at: DateTime<Utc>,
+}
+
 // ─── Node + CallEvent + ResponseMeta ───────────────────────────────────────
 
 /// DAG 节点 = 一次 API 调用.
@@ -224,6 +265,12 @@ pub struct Node {
     pub id: Uuid,
     /// 父节点 (前缀关系). None = 会话根或孤立节点 (无 messages 的请求).
     pub parent: Option<Uuid>,
+    /// 所属会话的稳定标识 (push 时确定, 生命周期同 DAG 内存实例).
+    /// fork 场景: 新 node 的 parent 不是其 session 的当前 leaf → fork → 新 SessionId.
+    pub session_id: SessionId,
+    /// 引用计数: 有多少 node 把本 node 作为 parent. leaf 的 child_count=0.
+    /// evict 时从 leaf 级联 GC: child_count=0 可删, 删后递减 parent, 若也变 0 则级联.
+    pub child_count: usize,
     /// 客户端发出的 request 中, 相对 parent 的增量.
     ///
     /// 存储的是**真实内容** (含真实 secret, 即 OriginRecord 视角).
@@ -335,10 +382,26 @@ pub struct ResponseData {
 /// 内容寻址的对话 DAG.
 ///
 /// 内部维护:
-/// - `nodes`: id → Node 的 HashMap.
+/// - `nodes`: id → Node 的 HashMap. 每个 Node 内嵌 `session_id` + `child_count`.
+/// - `sessions`: SessionId → Session (sidebar 会话列表的数据源).
 /// - `prefix_index`: Merkle prefix hash → nodes (fork 场景可能多个).
-/// - `order`: FIFO push 顺序, 用于淘汰.
-/// - `blocks`: 全局 block 池.
+/// - `blocks`: 全局内容寻址的 IrBlock 池 (自带 refcount GC).
+///
+/// # 容量与淘汰
+///
+/// 两个限制条件, 任意一个超标都触发淘汰: `nodes.len() > max_nodes` (主限制)
+/// 或 `sessions.len() > max_sessions` (安全阀, 防 fork 爆炸).
+/// 淘汰策略: LRU — 按 session.latest_at (最后活动时间) 淘汰最旧的会话,
+/// 持续活跃的会话 latest_at 不断刷新, 不会被淘汰.
+/// 保底: `sessions.len() <= min_sessions` 时不淘汰 (避免界面清空).
+///
+/// # GC 语义
+///
+/// evict 整个 session: 从 leaf 开始 gc_cascade. child_count=0 的 node 删后
+/// 递减 parent.child_count, 若也变 0 则级联删 — fork 共享的 node 天然受保护
+/// (另一分支仍引用它, child_count > 0).
+///
+/// # 详尽设计见 `docs/design/conversation-dag.md`
 #[derive(Debug, Clone)]
 pub struct ConversationDag {
     inner: Arc<RwLock<DagInner>>,
@@ -349,16 +412,16 @@ struct DagInner {
     nodes: HashMap<Uuid, Node>,
     /// Merkle prefix hash → nodes (按 push 顺序, 末尾是最新的).
     prefix_index: HashMap<u64, Vec<Uuid>>,
-    /// FIFO push 顺序, 用于淘汰最老节点.
-    order: VecDeque<Uuid>,
-    /// 最大节点数.
-    max: usize,
     /// 全局 block 池 (内容寻址 + refcount).
     blocks: BlockPool,
-    /// 叶子节点集合 (入度为 0 = 没有更小的 child 指向自己).
-    /// push 时: 新 node 入叶子集; 若新 node 有 parent, parent 从叶子集移除.
-    /// 代表各会话的"最新一轮", sidebar 会话列表用.
-    leaves: Vec<Uuid>,
+    /// 会话表: SessionId → Session. 每个 session 的 leaf 即 sidebar 一级条目.
+    sessions: HashMap<SessionId, Session>,
+    /// node 数量上限 (主限制).
+    max_nodes: usize,
+    /// 会话数量上限 (安全阀, 防极端 fork 爆炸).
+    max_sessions: usize,
+    /// 会话数量下限 (保底, 避免 UI 清空).
+    min_sessions: usize,
 }
 
 /// push 时计算出的 node 定位结果.
@@ -371,21 +434,28 @@ struct ParentLookup {
 
 impl Default for ConversationDag {
     fn default() -> Self {
-        Self::new(1024)
+        Self::new(1024, 500, 1)
     }
 }
 
 impl ConversationDag {
-    pub fn new(max: usize) -> Self {
-        let max = max.max(1);
+    /// 构造 DAG.
+    ///
+    /// - `max_nodes`: node 数量上限 (主淘汰限制). 超标触发 LRU session 淘汰.
+    /// - `max_sessions`: 会话数量上限 (安全阀). 正常不会触发; 极端 fork 场景防止
+    ///   session 数失控.
+    /// - `min_sessions`: 保底. 即使 nodes 超 max_nodes, 只要 sessions 数 ≤ min_sessions
+    ///   就不淘汰 (避免活跃会话被清空, 导致界面空白).
+    pub fn new(max_nodes: usize, max_sessions: usize, min_sessions: usize) -> Self {
         Self {
             inner: Arc::new(RwLock::new(DagInner {
                 nodes: HashMap::new(),
                 prefix_index: HashMap::new(),
-                order: VecDeque::with_capacity(max.min(128)),
-                max,
                 blocks: BlockPool::default(),
-                leaves: Vec::new(),
+                sessions: HashMap::new(),
+                max_nodes: max_nodes.max(1),
+                max_sessions: max_sessions.max(1),
+                min_sessions: min_sessions.max(1),
             })),
         }
     }
@@ -396,8 +466,10 @@ impl ConversationDag {
     /// 1. intern 所有 block (refcount++).
     /// 2. 计算 Merkle prefix hash 序列, 找到最深匹配的 parent.
     /// 3. 提取 delta (相对 parent 的增量).
-    /// 4. 创建 node, 入 HashMap + prefix_index + order.
-    /// 5. FIFO 淘汰 (若超 max).
+    /// 4. 确定会话归属: parent 是某 session 的当前 leaf → 延续; 否则 (新根 / fork) → 新 session.
+    /// 5. 创建 node, 入 HashMap + prefix_index.
+    /// 6. 维护 parent.child_count + session.latest_at.
+    /// 7. LRU session 淘汰 (若超 max_nodes / max_sessions, 保底 min_sessions).
     ///
     /// 返回新 node 的 id.
     ///
@@ -429,11 +501,30 @@ impl ConversationDag {
         let own_hash = Self::accumulate_hash(0, &delta_refs);
         let prefix_hash = Self::accumulate_hash(parent_base, &delta_refs);
 
-        // 5. 创建 node (response 初始 None).
+        // 5. 确定会话归属 (O(1)): parent 是某 session 的当前 leaf → 延续; 否则 fork/新根.
+        let sid = match lookup.parent {
+            Some(pid) => {
+                let parent_node = g.nodes.get(&pid).expect("parent exists");
+                let parent_sid = parent_node.session_id;
+                match g.sessions.get(&parent_sid) {
+                    // parent 是其 session 的当前 leaf → 延续同一 session.
+                    Some(s) if s.leaf_id == pid => parent_sid,
+                    // parent 已被后续轮次取代 (不是 leaf) → fork → 新 session.
+                    // 或 parent 所属 session 已被 evict (孤儿) → 新 session.
+                    _ => SessionId::new(),
+                }
+            }
+            None => SessionId::new(),
+        };
+
+        // 6. 创建 node.
         let node_id = Uuid::new_v4();
+        let now = event.created_at;
         let node = Node {
             id: node_id,
             parent: lookup.parent,
+            session_id: sid,
+            child_count: 0,
             req_delta: delta_refs,
             own_hash,
             prefix_hash,
@@ -441,21 +532,50 @@ impl ConversationDag {
             response: RwLock::new(None),
         };
 
-        // 6. 入 DAG 结构.
+        // 7. 入 DAG 结构 + 更新 session + child_count.
         g.nodes.insert(node_id, node);
         g.prefix_index.entry(prefix_hash).or_default().push(node_id);
-        g.order.push_back(node_id);
-        // 维护叶子集: 新 node 是叶子; parent 不再是叶子.
-        g.leaves
-            .retain(|&id| id != lookup.parent.unwrap_or_default());
-        g.leaves.push(node_id);
-
-        // 7. FIFO 淘汰.
-        while g.order.len() > g.max {
-            if let Some(evicted_id) = g.order.pop_front() {
-                Self::evict_node(&mut g, evicted_id);
+        // session 更新: 延续则前移 leaf + 增计数; 新建则插入.
+        match g.sessions.get_mut(&sid) {
+            Some(s) => {
+                s.leaf_id = node_id;
+                s.node_count += 1;
+                if now > s.latest_at {
+                    s.latest_at = now;
+                }
+            }
+            None => {
+                // 新 session: root = 本 node (fork 时 root 可能不是真正的对话根,
+                // 但语义上"这个分支的起点"就是 root, 对 sidebar 足够).
+                let root_id = lookup.parent.unwrap_or(node_id);
+                // fork 场景: root_id 是 fork 点, 但它的 session_id 是原 session 的.
+                // 对新 session 而言, root_id 仅用于 created_at 查找, 不要求归属一致.
+                let created_at = g
+                    .nodes
+                    .get(&root_id)
+                    .map(|n| n.event.created_at)
+                    .unwrap_or(now);
+                g.sessions.insert(
+                    sid,
+                    Session {
+                        leaf_id: node_id,
+                        root_id,
+                        node_count: 1,
+                        created_at,
+                        latest_at: now,
+                    },
+                );
             }
         }
+        // parent.child_count += 1.
+        if let Some(pid) = lookup.parent {
+            if let Some(pn) = g.nodes.get_mut(&pid) {
+                pn.child_count += 1;
+            }
+        }
+
+        // 8. LRU session 淘汰 (两个条件, min 保底).
+        Self::evict_if_needed(&mut g);
 
         node_id
     }
@@ -519,8 +639,43 @@ impl ConversationDag {
         h.finish()
     }
 
-    /// FIFO 淘汰一个 node: 释放 block refcount, 从结构中移除.
-    fn evict_node(inner: &mut DagInner, node_id: Uuid) {
+    /// 容量检查 + LRU 会话淘汰 (两个条件, min 保底).
+    ///
+    /// 触发条件: `nodes > max_nodes` (主) 或 `sessions > max_sessions` (安全阀).
+    /// 保底: `sessions ≤ min_sessions` 时不淘汰 (避免 UI 清空).
+    /// 策略: 找 `latest_at` 最旧的 session 整体 gc_cascade.
+    /// 持续活跃的会话 latest_at 不断刷新, 不会被淘汰.
+    fn evict_if_needed(inner: &mut DagInner) {
+        loop {
+            let over_nodes = inner.nodes.len() > inner.max_nodes;
+            let over_sessions = inner.sessions.len() > inner.max_sessions;
+            if (!over_nodes && !over_sessions) || inner.sessions.len() <= inner.min_sessions {
+                break;
+            }
+            // 找 latest_at 最旧的 session (LRU).
+            let victim_sid = match inner
+                .sessions
+                .iter()
+                .min_by_key(|(_, s)| s.latest_at)
+                .map(|(sid, _)| *sid)
+            {
+                Some(sid) => sid,
+                None => break,
+            };
+            // 取出 session, 从 sessions map 移除, 然后 gc_cascade 从 leaf 开始级联清理.
+            let session = match inner.sessions.remove(&victim_sid) {
+                Some(s) => s,
+                None => break,
+            };
+            Self::gc_cascade(inner, session.leaf_id);
+        }
+    }
+
+    /// 从 leaf 开始级联 GC: 删除 node, 递减 parent.child_count, 若 parent 也变 0 则递归.
+    ///
+    /// child_count 是引用计数: 只有 child_count=0 的 node (无 child 依赖) 才被删除.
+    /// fork 共享的 node 天然受保护 (另一分支的 child 仍引用它, child_count > 0).
+    fn gc_cascade(inner: &mut DagInner, node_id: Uuid) {
         let node = match inner.nodes.remove(&node_id) {
             Some(n) => n,
             None => return,
@@ -542,12 +697,13 @@ impl ConversationDag {
                 inner.prefix_index.remove(&node.prefix_hash);
             }
         }
-        // 从 leaves 移除. 若该 node 的 parent 仍存在且不在 leaves 中, 把 parent 加回
-        // (parent 变回了叶子). fork tombstone 场景 (parent 已被淘汰) 不处理.
-        inner.leaves.retain(|&id| id != node_id);
+        // 级联: 递减 parent.child_count, 若也变 0 则递归删 parent.
         if let Some(parent_id) = node.parent {
-            if inner.nodes.contains_key(&parent_id) && !inner.leaves.contains(&parent_id) {
-                inner.leaves.push(parent_id);
+            if let Some(pn) = inner.nodes.get_mut(&parent_id) {
+                pn.child_count = pn.child_count.saturating_sub(1);
+                if pn.child_count == 0 {
+                    Self::gc_cascade(inner, parent_id);
+                }
             }
         }
     }
@@ -646,10 +802,25 @@ impl ConversationDag {
         resp.parsed = Some(parsed);
     }
 
-    /// 按 FIFO 顺序的倒序列出 node id (newest first), 供 WebUI list.
+    /// 按 created_at 倒序列出 node id (newest first).
+    /// tie 时按 id 排序保证确定性 (HashMap keys 迭代顺序非确定).
     pub fn list_node_ids_newest_first(&self) -> Vec<Uuid> {
         let g = self.inner.read();
-        g.order.iter().rev().copied().collect()
+        let mut ids: Vec<Uuid> = g.nodes.keys().copied().collect();
+        ids.sort_by(|a, b| {
+            let ta = g
+                .nodes
+                .get(a)
+                .map(|n| n.event.created_at)
+                .unwrap_or_default();
+            let tb = g
+                .nodes
+                .get(b)
+                .map(|n| n.event.created_at)
+                .unwrap_or_default();
+            tb.cmp(&ta).then_with(|| b.cmp(a))
+        });
+        ids
     }
 
     /// 当前 node 总数.
@@ -671,13 +842,24 @@ impl ConversationDag {
     ) -> (Vec<NodeView>, usize) {
         let g = self.inner.read();
         let limit = limit.clamp(1, 200);
-        // Hits 路径需 collect 过滤结果算 total; All 路径惰性分页避免 O(n) 全量 clone.
+        // 收集所有 node id, 按 (created_at desc, id desc) 排序保证确定性.
+        let mut all_ids: Vec<Uuid> = g.nodes.keys().copied().collect();
+        all_ids.sort_by(|a, b| {
+            let ta = g
+                .nodes
+                .get(a)
+                .map(|n| n.event.created_at)
+                .unwrap_or_default();
+            let tb = g
+                .nodes
+                .get(b)
+                .map(|n| n.event.created_at)
+                .unwrap_or_default();
+            tb.cmp(&ta).then_with(|| b.cmp(a))
+        });
         if hits_only {
-            let hit_ids: Vec<Uuid> = g
-                .order
-                .iter()
-                .rev()
-                .copied()
+            let hit_ids: Vec<Uuid> = all_ids
+                .into_iter()
                 .filter(|id| {
                     g.nodes
                         .get(id)
@@ -695,13 +877,10 @@ impl ConversationDag {
                 .collect();
             (views, total)
         } else {
-            let total = g.order.len();
+            let total = all_ids.len();
             let offset = offset.min(total);
-            let views = g
-                .order
-                .iter()
-                .rev()
-                .copied()
+            let views = all_ids
+                .into_iter()
                 .skip(offset)
                 .take(limit)
                 .filter_map(|id| self.node_view(&g, id))
@@ -717,6 +896,7 @@ impl ConversationDag {
         Some(NodeView {
             id: node.id,
             parent: node.parent,
+            session_id: node.session_id,
             req_delta_count: node.req_delta.len(),
             has_response: resp.is_some(),
             created_at: node.event.created_at,
@@ -731,46 +911,38 @@ impl ConversationDag {
             resp_complete: resp.as_ref().map(|r| r.resp_complete).unwrap_or(false),
             error: resp.as_ref().and_then(|r| r.error.clone()),
             redactions: node.event.redactions.clone(),
+            parsed_response: resp.as_ref().and_then(|r| r.parsed.clone()),
         })
     }
 
     // ─── 会话级 API (sidebar 两级树 + timeline 惰性加载) ──────────────────
 
-    /// 列出会话 (叶子节点), 按 latest_at (会话内最新轮次时间) 倒序.
-    /// 分页由 web 层控制.
+    /// 列出会话, 按 latest_at (会话内最新轮次时间) 倒序.
+    /// 直接从 sessions map 派生, 无需走 parent 链 (node_count 已增量维护).
     pub fn list_sessions(&self) -> Vec<SessionView> {
         let g = self.inner.read();
-        g.leaves
+        let mut views: Vec<SessionView> = g
+            .sessions
             .iter()
-            .rev()
-            .filter_map(|&id| self.session_view(&g, id))
-            .collect()
+            .filter_map(|(&sid, s)| self.session_view(&g, sid, s))
+            .collect();
+        // latest_at 倒序 (最近活动的在前); tie 时按 session_id 保证确定性.
+        views.sort_by_key(|v| std::cmp::Reverse((v.latest_at, v.session_id)));
+        views
     }
 
-    /// 构造一个 SessionView (走 parent 链统计轮次数等).
-    fn session_view(&self, inner: &DagInner, leaf_id: Uuid) -> Option<SessionView> {
-        let leaf = inner.nodes.get(&leaf_id)?;
-        // 沿 parent 链走, 统计轮次数 + 找根.
-        let mut count = 1usize;
-        let mut root_id = leaf_id;
-        let mut cursor = leaf_id;
-        while let Some(node) = inner.nodes.get(&cursor) {
-            match node.parent {
-                Some(p) if inner.nodes.contains_key(&p) => {
-                    count += 1;
-                    root_id = p;
-                    cursor = p;
-                }
-                _ => break, // parent=None 或 parent 已被 evict.
-            }
-        }
+    /// 构造一个 SessionView (从 sessions map 中的 Session 派生).
+    /// 不走 parent 链 — node_count / root_id 在 push 时增量维护.
+    fn session_view(&self, inner: &DagInner, sid: SessionId, s: &Session) -> Option<SessionView> {
+        let leaf = inner.nodes.get(&s.leaf_id)?;
         let resp = leaf.response.read();
         Some(SessionView {
-            leaf_id,
-            root_id,
-            record_count: count,
-            created_at: inner.nodes.get(&root_id)?.event.created_at,
-            latest_at: leaf.event.created_at,
+            session_id: sid,
+            leaf_id: s.leaf_id,
+            root_id: s.root_id,
+            record_count: s.node_count,
+            created_at: s.created_at,
+            latest_at: s.latest_at,
             preview: leaf.event.preview.clone(),
             model: leaf.event.model.clone(),
             latest_resp_status: leaf.event.resp_status,
@@ -806,17 +978,19 @@ impl ConversationDag {
 /// 会话视图 (sidebar 一级树).
 #[derive(Debug, Clone)]
 pub struct SessionView {
-    /// 叶子节点 id (会话最新一轮). 用作会话标识 + timeline 起点.
+    /// 会话稳定标识 (前端选中/展开用, 刷新后不变).
+    pub session_id: SessionId,
+    /// 叶子节点 id (会话最新一轮). timeline 请求起点.
     pub leaf_id: Uuid,
-    /// 根节点 id (会话第一轮).
+    /// 根节点 id (会话第一轮 或 fork 点).
     pub root_id: Uuid,
-    /// 会话内轮次数.
+    /// 会话内轮次数 (push 时增量维护, 无需走 parent 链).
     pub record_count: usize,
     /// 会话开始时间 (根节点 created_at).
     pub created_at: DateTime<Utc>,
-    /// 最新活动时间 (叶子节点 created_at).
+    /// 最新活动时间 (叶子节点 created_at, LRU 淘汰用).
     pub latest_at: DateTime<Utc>,
-    /// preview (叶子节点的首条 user msg).
+    /// preview (叶子节点的最后一条 user msg 截断).
     pub preview: Option<String>,
     /// model (叶子节点).
     pub model: Option<String>,
@@ -832,10 +1006,15 @@ pub struct SessionView {
 ///
 /// 不含 messages body 与 resp_body / req_body_raw (避免 clone 大量数据);
 /// 含 list 场景需要的所有元数据 (preview / model / redactions / 响应状态等).
+///
+/// `parsed_response`: timeline 路径用 (前端不再 N+1 拉 /records/{id}?view=parsed).
+/// 从 node.response.parsed clone (仅在有解析结果时), 避免前端再发请求.
 #[derive(Debug, Clone)]
 pub struct NodeView {
     pub id: Uuid,
     pub parent: Option<Uuid>,
+    /// 所属会话的稳定标识 (push 时确定).
+    pub session_id: SessionId,
     pub req_delta_count: usize,
     pub has_response: bool,
     pub created_at: DateTime<Utc>,
@@ -844,7 +1023,7 @@ pub struct NodeView {
     pub path: String,
     pub resp_status: u16,
     pub redact_seed: u64,
-    /// WebUI sidebar 标题 (首条 user message 截断).
+    /// WebUI sidebar 标题 (最后一条 user message 截断).
     pub preview: Option<String>,
     /// 请求 body 顶层 model 字段.
     pub model: Option<String>,
@@ -856,6 +1035,9 @@ pub struct NodeView {
     pub error: Option<String>,
     /// (mock, secret_id) 投影. 永不含真实 secret value.
     pub redactions: Vec<(String, String)>,
+    /// parsed view (ingress codec writer 序列化的 IrResponse, LLM 视角含 mock).
+    /// timeline 路径直接消费, 前端不再 N+1 拉 /records/{id}?view=parsed.
+    pub parsed_response: Option<serde_json::Value>,
 }
 
 /// Node 的请求侧详情 (GET /records/{id} 按需拉取).
@@ -980,7 +1162,7 @@ mod tests {
 
     #[test]
     fn dag_push_single_node_no_parent() {
-        let dag = ConversationDag::new(64);
+        let dag = ConversationDag::new(64, 500, 1);
         let msgs = vec![
             text_msg(IrRole::System, "sys"),
             text_msg(IrRole::User, "hello"),
@@ -993,7 +1175,7 @@ mod tests {
 
     #[test]
     fn dag_push_linear_extension_finds_parent() {
-        let dag = ConversationDag::new(64);
+        let dag = ConversationDag::new(64, 500, 1);
 
         // 第 1 次请求: [sys, u1] (request messages, 不含 response)
         let msgs_a = vec![
@@ -1019,7 +1201,7 @@ mod tests {
 
     #[test]
     fn dag_push_unrelated_messages_creates_new_root() {
-        let dag = ConversationDag::new(64);
+        let dag = ConversationDag::new(64, 500, 1);
 
         let msgs_a = vec![
             text_msg(IrRole::System, "sys A"),
@@ -1040,7 +1222,7 @@ mod tests {
 
     #[test]
     fn dag_full_request_messages_walks_parent_chain() {
-        let dag = ConversationDag::new(64);
+        let dag = ConversationDag::new(64, 500, 1);
 
         let msgs_a = vec![
             text_msg(IrRole::System, "sys"),
@@ -1078,7 +1260,7 @@ mod tests {
 
     #[test]
     fn dag_fifo_eviction_drops_oldest() {
-        let dag = ConversationDag::new(2);
+        let dag = ConversationDag::new(2, 500, 1);
 
         let id_a = dag.push_messages(vec![text_msg(IrRole::User, "a")], dummy_event());
         let _id_b = dag.push_messages(vec![text_msg(IrRole::User, "b")], dummy_event());
@@ -1093,7 +1275,7 @@ mod tests {
     fn dag_fifo_eviction_releases_blocks() {
         // 淘汰 node 时, 它持有的 block refcount 应递减.
         // 用一个不被其他 node 引用的 unique block 验证.
-        let dag = ConversationDag::new(1);
+        let dag = ConversationDag::new(1, 500, 1);
 
         let unique_text = "unique_block_for_eviction_test";
         let _id = dag.push_messages(vec![text_msg(IrRole::User, unique_text)], dummy_event());
@@ -1124,7 +1306,7 @@ mod tests {
         // B 的前 2 条与 A 相同 → B 的 parent=A, delta=[a1, t1].
         // 修复后: 前缀部分 (sys, u1) 的 refcount 不由 B 持有 (由 parent A 持有),
         // 所以 sys/u1 refcount=1 (只 A), a1/t1 refcount=1 (只 B).
-        let dag = ConversationDag::new(64);
+        let dag = ConversationDag::new(64, 500, 1);
 
         let sys_msg = text_msg(IrRole::System, "shared system prompt");
         let msgs_a = vec![sys_msg.clone(), text_msg(IrRole::User, "u1")];
@@ -1156,7 +1338,7 @@ mod tests {
     fn dag_prefix_block_refcount_no_leak_after_evict() {
         // 回归测试 (review B1): 淘汰 parent 后, 前缀 block 应被正确 GC.
         // 修复前: push 时前缀 refcount 未释放, 淘汰 parent 后 block 仍残留 (泄漏).
-        let dag = ConversationDag::new(2); // max=2, 第 3 次 push 会淘汰 A.
+        let dag = ConversationDag::new(2, 500, 1); // max=2, 第 3 次 push 会淘汰 A.
 
         let sys_msg = text_msg(IrRole::System, "sys");
         let _id_a = dag.push_messages(vec![sys_msg.clone()], dummy_event());
@@ -1178,7 +1360,7 @@ mod tests {
 
     #[test]
     fn dag_list_newest_first() {
-        let dag = ConversationDag::new(64);
+        let dag = ConversationDag::new(64, 500, 1);
         let id_a = dag.push_messages(vec![text_msg(IrRole::User, "a")], dummy_event());
         let id_b = dag.push_messages(vec![text_msg(IrRole::User, "b")], dummy_event());
         let ids = dag.list_node_ids_newest_first();
@@ -1188,7 +1370,7 @@ mod tests {
     #[test]
     fn dag_empty_messages_creates_orphan_node() {
         // 无 messages 的请求 (GET /v1/models 等) 应创建孤立节点.
-        let dag = ConversationDag::new(64);
+        let dag = ConversationDag::new(64, 500, 1);
         let id = dag.push_messages(vec![], dummy_event());
         let node = dag.get_node(id).expect("node exists");
         assert!(node.parent.is_none(), "orphan node has no parent");
@@ -1199,7 +1381,7 @@ mod tests {
     fn dag_multi_hop_parent_chain() {
         // 模拟 opencode 的 3 步链: A → B → C.
         // request messages 含 agent 复制进来的 assistant (OriginRecord 视角).
-        let dag = ConversationDag::new(64);
+        let dag = ConversationDag::new(64, 500, 1);
 
         // A req: [sys, u1] (首次请求只有 system + user)
         let id_a = dag.push_messages(
@@ -1277,7 +1459,7 @@ mod tests {
     fn attach_response_populates_nodeview_and_response() {
         // push 后 attach_response, NodeView 应反映最终 resp_status / elapsed_ms,
         // get_response 应返回完整 ResponseData.
-        let dag = ConversationDag::new(8);
+        let dag = ConversationDag::new(8, 500, 1);
         let id = dag.push_messages(vec![text_msg(IrRole::User, "u")], dummy_event());
 
         // attach 前: NodeView 的 resp_status / streamed 等是默认值.
@@ -1319,7 +1501,7 @@ mod tests {
     #[test]
     fn attach_response_on_evicted_node_warns_not_panics() {
         // max=1, 第二次 push 淘汰 A; 对 A attach_response 应 warn + no-op.
-        let dag = ConversationDag::new(1);
+        let dag = ConversationDag::new(1, 500, 1);
         let id_a = dag.push_messages(vec![text_msg(IrRole::User, "a")], dummy_event());
         let _id_b = dag.push_messages(vec![text_msg(IrRole::User, "b")], dummy_event());
         // id_a 已被淘汰, attach 应不 panic.
@@ -1336,7 +1518,7 @@ mod tests {
     fn update_parsed_response_creates_partial_when_absent() {
         // 节点尚未 attach_response 时, update_parsed_response 应自动创建一个 default
         // ResponseData (resp_complete=false) 并只填 parsed 字段.
-        let dag = ConversationDag::new(8);
+        let dag = ConversationDag::new(8, 500, 1);
         let id = dag.push_messages(vec![text_msg(IrRole::User, "u")], dummy_event());
         dag.update_parsed_response(id, serde_json::json!({"partial": true}));
 
@@ -1352,7 +1534,7 @@ mod tests {
     #[test]
     fn update_parsed_response_overwrites_existing_parsed() {
         // 已 attach 完整 ResponseData 后, update_parsed_response 只改 parsed, 保留其他字段.
-        let dag = ConversationDag::new(8);
+        let dag = ConversationDag::new(8, 500, 1);
         let id = dag.push_messages(vec![text_msg(IrRole::User, "u")], dummy_event());
         dag.attach_response(
             id,
@@ -1372,7 +1554,7 @@ mod tests {
 
     #[test]
     fn update_parsed_response_on_evicted_node_warns_not_panics() {
-        let dag = ConversationDag::new(1);
+        let dag = ConversationDag::new(1, 500, 1);
         let id_a = dag.push_messages(vec![text_msg(IrRole::User, "a")], dummy_event());
         let _id_b = dag.push_messages(vec![text_msg(IrRole::User, "b")], dummy_event());
         dag.update_parsed_response(id_a, serde_json::json!({}));
@@ -1381,7 +1563,7 @@ mod tests {
     #[test]
     fn get_node_detail_returns_req_headers_and_body() {
         // get_node_detail 提供 GET /records/{id} 所需的 req_headers + req_body_raw.
-        let dag = ConversationDag::new(8);
+        let dag = ConversationDag::new(8, 500, 1);
         let id = dag.push_messages(
             vec![],
             event_with_body("/o/x/v1/chat", "{\"model\":\"gpt-x\"}"),
@@ -1395,7 +1577,7 @@ mod tests {
     #[test]
     fn nodeview_carries_preview_model_and_response_fields() {
         // NodeView 应携带 list 路径所需的所有字段 (preview/model/streamed/redactions/...).
-        let dag = ConversationDag::new(8);
+        let dag = ConversationDag::new(8, 500, 1);
         let mut ev = event_with_body("/o/x/v1/chat", "{}");
         ev.redactions = vec![("sgm_x".into(), "k".into())];
         let id = dag.push_messages(vec![], ev);
@@ -1424,7 +1606,7 @@ mod tests {
     #[test]
     fn nodeview_defaults_when_no_response_attached() {
         // 节点尚未 attach_response: NodeView 的响应字段应为默认值 (false / 空).
-        let dag = ConversationDag::new(8);
+        let dag = ConversationDag::new(8, 500, 1);
         let id = dag.push_messages(vec![], dummy_event());
         let v = dag.get_node(id).expect("node exists");
         assert!(!v.has_response);
@@ -1438,7 +1620,7 @@ mod tests {
     #[test]
     fn attach_response_parsed_field_preserved() {
         // attach_response 时设置的 parsed 字段应能通过 get_response 取回.
-        let dag = ConversationDag::new(8);
+        let dag = ConversationDag::new(8, 500, 1);
         let id = dag.push_messages(vec![text_msg(IrRole::User, "u")], dummy_event());
         let parsed_value = serde_json::json!({"choices": [{"message": {"content": "hi"}}]});
         dag.attach_response(
@@ -1457,7 +1639,7 @@ mod tests {
     #[test]
     fn list_node_ids_reflects_fifo_order_after_attach() {
         // attach_response 不改变 FIFO 顺序 (顺序由 push 决定).
-        let dag = ConversationDag::new(8);
+        let dag = ConversationDag::new(8, 500, 1);
         let id_a = dag.push_messages(vec![text_msg(IrRole::User, "a")], dummy_event());
         let id_b = dag.push_messages(vec![text_msg(IrRole::User, "b")], dummy_event());
         let id_c = dag.push_messages(vec![text_msg(IrRole::User, "c")], dummy_event());
@@ -1476,7 +1658,7 @@ mod tests {
     #[test]
     fn nodeview_preview_model_passthrough_when_uncomputed() {
         // 当 CallEvent 的 preview/model 为 None (eg passthrough GET 请求), NodeView 透传 None.
-        let dag = ConversationDag::new(8);
+        let dag = ConversationDag::new(8, 500, 1);
         let id = dag.push_messages(vec![], dummy_event());
         let v = dag.get_node(id).expect("node exists");
         assert!(v.preview.is_none());
@@ -1486,7 +1668,7 @@ mod tests {
     #[test]
     fn get_node_detail_on_evicted_returns_none() {
         // 节点被 FIFO 淘汰后, get_node_detail 应返回 None (不 panic).
-        let dag = ConversationDag::new(1);
+        let dag = ConversationDag::new(1, 500, 1);
         let id_a = dag.push_messages(vec![text_msg(IrRole::User, "a")], dummy_event());
         let _id_b = dag.push_messages(vec![text_msg(IrRole::User, "b")], dummy_event());
         assert!(dag.get_node_detail(id_a).is_none());
@@ -1517,7 +1699,7 @@ mod tests {
     fn attach_response_can_be_called_twice_overwrites() {
         // 二次 attach_response 应整体替换 (不合并), 这是 proxy 流式路径先 partial 后
         // 完整 attach 的契约. 最后一次写入胜出.
-        let dag = ConversationDag::new(8);
+        let dag = ConversationDag::new(8, 500, 1);
         let id = dag.push_messages(vec![text_msg(IrRole::User, "u")], dummy_event());
         dag.attach_response(
             id,
@@ -1551,7 +1733,7 @@ mod tests {
     fn update_parsed_response_preserves_already_attached_response_fields() {
         // 已 attach 完整 ResponseData 后, update_parsed_response 只覆盖 parsed,
         // 不应清空 resp_status / raw_resp_body 等字段.
-        let dag = ConversationDag::new(8);
+        let dag = ConversationDag::new(8, 500, 1);
         let id = dag.push_messages(vec![text_msg(IrRole::User, "u")], dummy_event());
         dag.attach_response(
             id,
@@ -1577,7 +1759,7 @@ mod tests {
     #[test]
     fn leaves_tracks_session_tips() {
         // A (root) → B → C (leaf). leaves = [C].
-        let dag = ConversationDag::new(64);
+        let dag = ConversationDag::new(64, 500, 1);
         let _a = dag.push_messages(vec![text_msg(IrRole::User, "a")], dummy_event());
         let _b = dag.push_messages(
             vec![
@@ -1603,7 +1785,7 @@ mod tests {
 
     #[test]
     fn leaves_multiple_independent_sessions() {
-        let dag = ConversationDag::new(64);
+        let dag = ConversationDag::new(64, 500, 1);
         let a = dag.push_messages(vec![text_msg(IrRole::User, "a")], dummy_event());
         let b = dag.push_messages(vec![text_msg(IrRole::User, "b")], dummy_event());
         let sessions = dag.list_sessions();
@@ -1614,12 +1796,10 @@ mod tests {
     }
 
     #[test]
-    fn leaves_eviction_restores_parent_as_leaf() {
-        // max=2: push A, B(A child), C triggers FIFO evict A.
-        // B was leaf, C becomes leaf (B no longer leaf). Evicting A doesn't affect leaves
-        // (A was never a leaf once B existed). But evicting B (if max=1) would restore A.
-        let dag = ConversationDag::new(1);
-        let _a = dag.push_messages(vec![text_msg(IrRole::User, "a")], dummy_event());
+    fn session_lru_evict_keeps_min_sessions_floor() {
+        // max_nodes=1 但 min_sessions=1: 即使 nodes 数超标, 只剩 1 个 session 时不淘汰.
+        let dag = ConversationDag::new(1, 500, 1);
+        let a = dag.push_messages(vec![text_msg(IrRole::User, "a")], dummy_event());
         let b = dag.push_messages(
             vec![
                 text_msg(IrRole::User, "a"),
@@ -1627,20 +1807,80 @@ mod tests {
             ],
             dummy_event(),
         );
-        // A evicted, B is leaf.
+        // nodes=2 > max_nodes=1, 但 sessions=1 = min_sessions=1 → 保底, 不淘汰.
         let sessions = dag.list_sessions();
-        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions.len(), 1, "min_sessions floor prevents eviction");
         assert_eq!(sessions[0].leaf_id, b);
-        // record_count walks parent chain: B's parent A is evicted → count=1 (only B).
-        assert_eq!(
-            sessions[0].record_count, 1,
-            "evicted parent truncates count"
+        assert_eq!(sessions[0].record_count, 2, "both A and B kept");
+        // A 仍在内存.
+        assert!(dag.get_node(a).is_some(), "A not evicted (min floor)");
+    }
+
+    #[test]
+    fn session_lru_evict_drops_oldest_session() {
+        // 两个独立会话, max_nodes=1 → 第一个会话被整体淘汰.
+        let dag = ConversationDag::new(1, 500, 1);
+        let a = dag.push_messages(vec![text_msg(IrRole::User, "a")], dummy_event());
+        let b = dag.push_messages(vec![text_msg(IrRole::User, "b")], dummy_event());
+        // nodes=2 > max_nodes=1, sessions=2 > min_sessions=1 → 淘汰 LRU (会话 A).
+        assert!(dag.get_node(a).is_none(), "oldest session A evicted");
+        assert!(dag.get_node(b).is_some(), "newest session B kept");
+        let sessions = dag.list_sessions();
+        assert_eq!(sessions.len(), 1, "only session B remains");
+    }
+
+    #[test]
+    fn session_gc_cascade_protects_fork_shared_parent() {
+        // fork 场景: A → B → C (s1), A → B → C' (s2 fork at B).
+        // evict s1 不应删除 B (s2 仍引用它, child_count > 0).
+        let dag = ConversationDag::new(8, 500, 1);
+        // A = [u1]
+        let _a = dag.push_messages(vec![text_msg(IrRole::User, "u1")], dummy_event());
+        // B extends A: [u1, a1]
+        let b = dag.push_messages(
+            vec![
+                text_msg(IrRole::User, "u1"),
+                text_msg(IrRole::Assistant, "a1"),
+            ],
+            dummy_event(),
         );
+        // C extends B: [u1, a1, u2]
+        let c = dag.push_messages(
+            vec![
+                text_msg(IrRole::User, "u1"),
+                text_msg(IrRole::Assistant, "a1"),
+                text_msg(IrRole::User, "u2"),
+            ],
+            dummy_event(),
+        );
+        // C' forks from B (same prefix up to [u1, a1], then diverges): [u1, a1, u3]
+        let c_prime = dag.push_messages(
+            vec![
+                text_msg(IrRole::User, "u1"),
+                text_msg(IrRole::Assistant, "a1"),
+                text_msg(IrRole::User, "u3"),
+            ],
+            dummy_event(),
+        );
+        // 2 sessions: s1 (leaf=C), s2 (leaf=C'). B 是共享 (child_count=2).
+        let sessions = dag.list_sessions();
+        assert_eq!(sessions.len(), 2, "fork creates 2 sessions");
+        // 直接 gc_cascade s1 (从 leaf=C 开始): 删 C → B.child_count 2→1 → 停 (B 保留).
+        {
+            let mut g = dag.inner.write();
+            let s1 = sessions.iter().find(|s| s.leaf_id == c).expect("s1 exists");
+            ConversationDag::gc_cascade(&mut g, s1.leaf_id);
+            g.sessions.remove(&s1.session_id);
+        }
+        // C 已删, B 仍在 (s2 引用), C' 仍在, A 仍在.
+        assert!(dag.get_node(c).is_none(), "C (s1 leaf) evicted");
+        assert!(dag.get_node(b).is_some(), "B shared, not evicted");
+        assert!(dag.get_node(c_prime).is_some(), "C' (s2 leaf) kept");
     }
 
     #[test]
     fn timeline_returns_oldest_first() {
-        let dag = ConversationDag::new(64);
+        let dag = ConversationDag::new(64, 500, 1);
         let a = dag.push_messages(vec![text_msg(IrRole::User, "a")], dummy_event());
         let _b = dag.push_messages(
             vec![
@@ -1666,7 +1906,7 @@ mod tests {
 
     #[test]
     fn timeline_limit_truncates() {
-        let dag = ConversationDag::new(64);
+        let dag = ConversationDag::new(64, 500, 1);
         let _a = dag.push_messages(vec![text_msg(IrRole::User, "a")], dummy_event());
         let _b = dag.push_messages(
             vec![

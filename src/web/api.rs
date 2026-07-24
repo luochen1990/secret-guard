@@ -253,6 +253,8 @@ fn build_parsed_response(record: ForwardRecord) -> GetRecordResponse {
 #[derive(Serialize)]
 pub struct RecordSummary {
     pub id: Uuid,
+    /// 所属会话的稳定标识 (前端 sidebar 二级菜单归属).
+    pub session_id: crate::dag::SessionId,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub method: String,
     pub path: String,
@@ -263,7 +265,7 @@ pub struct RecordSummary {
     pub error: Option<String>,
     #[serde(default)]
     pub redactions: Vec<(String, String)>,
-    /// 会话标题: 从 req_body 提取的首条 user message 文本 (截断).
+    /// 会话标题: 从 req_body 提取的最后一条 user message 文本 (截断).
     /// 提取失败 (非 JSON / 无 user message) 时为 None, 前端 fallback 到 method+path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
@@ -271,6 +273,10 @@ pub struct RecordSummary {
     /// 非 chat 协议或缺失时为 None.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// parsed view (ingress codec writer 序列化的 IrResponse).
+    /// timeline 路径直接消费, 前端不再 N+1 拉 /records/{id}?view=parsed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parsed_response: Option<serde_json::Value>,
 }
 
 /// preview 截断上限 (char count). 后端唯一截断点, 前端直接渲染.
@@ -285,6 +291,7 @@ impl From<NodeView> for RecordSummary {
         // preview / model 已在 push 时预计算并存在 CallEvent 里 (NodeView 直接携带).
         Self {
             id: v.id,
+            session_id: v.session_id,
             created_at: v.created_at,
             method: v.method,
             path: v.path,
@@ -296,6 +303,7 @@ impl From<NodeView> for RecordSummary {
             redactions: v.redactions,
             preview: v.preview,
             model: v.model,
+            parsed_response: v.parsed_response,
         }
     }
 }
@@ -306,12 +314,14 @@ impl From<NodeView> for RecordSummary {
 /// 放在顶层, `messages[]` 也共享 `{role, content}` 形状. content 支持 string 和
 /// `[{type:"text", text}]` 两种形态 (OpenAI / Anthropic 一致).
 ///
-/// 标题选择策略 (issue #23 子项 1):
-/// 1. 默认取首条 user message 文本.
-/// 2. 若首条 user message 是 `"What did we do so far?"` (opencode 自动压缩会话时
-///    注入的固定模板, 紧随其后的 assistant 消息才是真正的压缩摘要), 改取首条
-///    assistant message 文本作为标题. 压缩摘要通常以 `"## 目标 ..."` 之类开头,
-///    本身就有辨识度, 不需要额外视觉标记.
+/// 标题选择策略 (issue #23 子项 1, #25 修订):
+/// 1. 默认取**最后一条** user message 文本 (本轮问题, 让累积数组的每轮有独立标题).
+/// 2. 若最后一条 user 是 `"What did we do so far?"` (opencode 压缩 marker), 说明本轮是
+///    "请求生成压缩摘要", 改取最后一条 assistant 消息 (即压缩摘要本身, 形如 "## 目标 ...").
+///
+/// 背景: OpenAI / Anthropic chat API 的 messages 数组是**累积**的 — 每轮请求都包含
+/// 完整历史. 若取首条 user, 同一会话的所有轮次标题都相同 (都是第一条 user),
+/// 二级菜单无法区分. 取最后一条 user 才能反映 "这一轮问了什么".
 ///
 /// 设计权衡:
 /// - 不复用 codec reader: reader 会做更重的协议归一化 (tool_calls / system 顶层等),
@@ -333,18 +343,17 @@ pub(crate) fn extract_preview_and_model(req_body: &str) -> (Option<String>, Opti
         .map(|s| s.to_string());
 
     // opencode 压缩会话注入的固定 user message (opencode 源码:
-    // packages/opencode/src/session/message-v2.ts:231). 命中时优先取首条 assistant 摘要,
-    // 若无 assistant 消息则 fallback 回 marker 本身 (总比 None 强).
-    // 精确匹配依赖 opencode 内部实现, 若 opencode 改变 marker 或附加其他 text part,
-    // 匹配失败会优雅降级到正常取首条 user 的路径 (有测试覆盖该降级路径).
+    // packages/opencode/src/session/message-v2.ts:231). 命中时优先取最后一条 assistant 摘要.
+    // 精确匹配依赖 opencode 内部实现; 若 opencode 改变 marker, 匹配失败会优雅降级到
+    // 正常的 "最后一条 user" 路径 (有测试覆盖该降级).
     const COMPRESSED_MARKER: &str = "What did we do so far?";
     let messages = v.get("messages").and_then(|m| m.as_array());
-    let first_user = messages.and_then(|msgs| first_message_text_by_role(msgs, "user"));
-    let raw = match first_user.as_deref() {
+    let last_user = messages.and_then(|msgs| last_message_text_by_role(msgs, "user"));
+    let raw = match last_user.as_deref() {
         Some(COMPRESSED_MARKER) => messages
-            .and_then(|msgs| first_message_text_by_role(msgs, "assistant"))
-            .or(first_user),
-        _ => first_user, // 正常会话或无消息: 保持原取首条 user 的行为.
+            .and_then(|msgs| last_message_text_by_role(msgs, "assistant"))
+            .or(last_user),
+        _ => last_user, // 正常会话或无消息: 最后一条 user.
     };
     let preview = raw.map(|s| {
         // 归一化空白 + 截断 (与前端 messagePreview 逻辑一致, SSOT 在此).
@@ -363,12 +372,15 @@ pub(crate) fn extract_preview_and_model(req_body: &str) -> (Option<String>, Opti
     (preview, model)
 }
 
-/// 从 messages 数组中提取指定 role 的首条 message 文本.
+/// 从 messages 数组中提取指定 role 的**最后一条** message 文本.
 ///
 /// content 兼容 string 与 `[{type:"text", text}]` 两种形态 (OpenAI / Anthropic 一致).
 /// 返回原始文本 (未归一化 / 未截断), 由调用方决定后处理.
-fn first_message_text_by_role(messages: &[serde_json::Value], role: &str) -> Option<String> {
-    messages.iter().find_map(|m| {
+///
+/// 取 "最后一条" 而非 "首条": chat API 的 messages 数组是累积的, 每轮请求都含完整历史.
+/// 最后一条才反映 "这一轮的实际内容" (issue #25).
+fn last_message_text_by_role(messages: &[serde_json::Value], role: &str) -> Option<String> {
+    messages.iter().rev().find_map(|m| {
         if m.get("role").and_then(|r| r.as_str()) != Some(role) {
             return None;
         }
@@ -417,6 +429,8 @@ pub struct ListRecordsResponse {
 /// 会话列表 (叶子节点), sidebar 两级树的一级项.
 #[derive(Serialize)]
 pub struct SessionSummary {
+    /// 会话稳定标识 (前端选中/展开用, 刷新后不变).
+    pub session_id: crate::dag::SessionId,
     pub leaf_id: Uuid,
     pub root_id: Uuid,
     pub record_count: usize,
@@ -432,6 +446,7 @@ pub struct SessionSummary {
 impl From<crate::dag::SessionView> for SessionSummary {
     fn from(s: crate::dag::SessionView) -> Self {
         Self {
+            session_id: s.session_id,
             leaf_id: s.leaf_id,
             root_id: s.root_id,
             record_count: s.record_count,
@@ -1068,24 +1083,35 @@ mod tests {
     }
 
     #[test]
-    fn extract_preview_picks_first_user_message() {
-        // 多个 user message: 取第一个.
-        let body = r#"{"model":"x","messages":[{"role":"assistant","content":"noop"},{"role":"user","content":"first user"},{"role":"user","content":"second"}]}"#;
+    fn extract_preview_picks_last_user_message() {
+        // 累积数组: 多条 user message → 取最后一条 (本轮问题, issue #25).
+        let body = r#"{"model":"x","messages":[{"role":"user","content":"first user"},{"role":"assistant","content":"noop"},{"role":"user","content":"second user"}]}"#;
         let (preview, _) = extract_preview_and_model(body);
-        assert_eq!(preview.as_deref(), Some("first user"));
+        assert_eq!(preview.as_deref(), Some("second user"));
     }
 
     #[test]
-    fn extract_preview_compressed_session_falls_back_to_first_assistant() {
-        // opencode 压缩会话: 首条 user = "What did we do so far?" → 改取首条 assistant 摘要.
-        // 用 r###"..."### 因 content 含 "##" (markdown heading), 而 "## 正好是 r##"..."## 的
-        // 终止符, 必须升级到 3 个井号.
+    fn extract_preview_accumulated_history_each_round_unique() {
+        // 模拟同一会话的 3 轮累积请求 (OpenAI 风格 messages 数组逐轮增长):
+        // 三轮的 preview 应分别为 Q1/Q2/Q3 (而非全都是 Q1).
+        let r1 = r#"{"model":"x","messages":[{"role":"user","content":"Q1"}]}"#;
+        let r2 = r#"{"model":"x","messages":[{"role":"user","content":"Q1"},{"role":"assistant","content":"A1"},{"role":"user","content":"Q2"}]}"#;
+        let r3 = r#"{"model":"x","messages":[{"role":"user","content":"Q1"},{"role":"assistant","content":"A1"},{"role":"user","content":"Q2"},{"role":"assistant","content":"A2"},{"role":"user","content":"Q3"}]}"#;
+        assert_eq!(extract_preview_and_model(r1).0.as_deref(), Some("Q1"));
+        assert_eq!(extract_preview_and_model(r2).0.as_deref(), Some("Q2"));
+        assert_eq!(extract_preview_and_model(r3).0.as_deref(), Some("Q3"));
+    }
+
+    #[test]
+    fn extract_preview_compressed_session_falls_back_to_last_assistant() {
+        // opencode 压缩会话: 最后一条 user = "What did we do so far?" → 改取最后一条 assistant 摘要.
         let body = r###"{"model":"x","messages":[
+            {"role":"user","content":"earlier question"},
+            {"role":"assistant","content":"earlier answer"},
             {"role":"user","content":"What did we do so far?"},
             {"role":"assistant","content":"## 目标\n实现 secret-guard WebUI 标题优化"}
         ]}"###;
         let (preview, _) = extract_preview_and_model(body);
-        // 归一化空白: JSON 的 \n 解析为换行, split_whitespace 视为空白压缩为单空格.
         assert_eq!(
             preview.as_deref(),
             Some("## 目标 实现 secret-guard WebUI 标题优化")
@@ -1106,20 +1132,18 @@ mod tests {
     #[test]
     fn extract_preview_compressed_marker_not_normalized_still_normal_path() {
         // marker 比对用原始文本 (未归一化空白). 非精确匹配 (如本例多一个单词) 走正常路径,
-        // 不触发 assistant fallback — 此用例锁定该行为, 防止未来改成 normalized 比对时静默改变语义.
+        // 不触发 assistant fallback.
         let body = r#"{"model":"x","messages":[
-            {"role":"user","content":"What did we do so far? extra"},
-            {"role":"assistant","content":"should-not-be-used"}
+            {"role":"user","content":"What did we do so far? extra"}
         ]}"#;
         let (preview, _) = extract_preview_and_model(body);
-        // 不是精确 marker → 取首条 user (归一化后).
         assert_eq!(preview.as_deref(), Some("What did we do so far? extra"));
     }
 
     #[test]
     fn extract_preview_compressed_session_no_assistant_falls_back_to_marker() {
-        // 压缩 marker 命中但无 assistant 消息 → first_assistant 返回 None.
-        // 这时 marker 本身就是 preview (总比 None 强, fallback 到 method+path 之前).
+        // 压缩 marker 命中但无 assistant 消息 → last_assistant 返回 None.
+        // marker 本身作为 preview (总比 None 强).
         let body = r#"{"model":"x","messages":[
             {"role":"user","content":"What did we do so far?"}
         ]}"#;
@@ -1218,6 +1242,7 @@ mod tests {
         let v = crate::dag::NodeView {
             id: Uuid::nil(),
             parent: None,
+            session_id: crate::dag::SessionId::new(),
             req_delta_count: 0,
             has_response: false,
             created_at: chrono::Utc::now(),
@@ -1232,6 +1257,7 @@ mod tests {
             resp_complete: false,
             error: None,
             redactions: vec![],
+            parsed_response: None,
         };
         let s = RecordSummary::from(v);
         assert_eq!(s.model.as_deref(), Some("gpt-4o"));
@@ -1244,6 +1270,7 @@ mod tests {
         let v = crate::dag::NodeView {
             id: Uuid::nil(),
             parent: None,
+            session_id: crate::dag::SessionId::new(),
             req_delta_count: 0,
             has_response: false,
             created_at: chrono::Utc::now(),
@@ -1258,6 +1285,7 @@ mod tests {
             resp_complete: false,
             error: None,
             redactions: vec![],
+            parsed_response: None,
         };
         let s = RecordSummary::from(v);
         assert!(s.preview.is_none());

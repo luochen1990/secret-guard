@@ -40,7 +40,7 @@ async function sendChat(
 }
 
 /**
- * 等待 sidebar 出现包含指定 preview 子串的会话 (session-item), 返回其 leaf_id.
+ * 等待 sidebar 出现包含指定 preview 子串的会话 (session-item), 返回其 session_id.
  *
  * 用 Playwright locator 的 auto-retrying polling (不 reload 全页),
  * 依赖 WebUI 自身的 3s 自动刷新拉到新会话. 单测间状态隔离:
@@ -49,35 +49,18 @@ async function sendChat(
 async function findSessionLeafByPreview(page: Page, previewSubstr: string): Promise<string> {
   const item = page.locator(".session-item", { hasText: previewSubstr }).first();
   await item.waitFor({ state: "visible", timeout: 5000 });
-  const leaf = await item.getAttribute("data-leaf");
-  if (!leaf) throw new Error(`session with preview '${previewSubstr}' has no data-leaf`);
-  return leaf;
+  const sid = await item.getAttribute("data-sid");
+  if (!sid) throw new Error(`session with preview '${previewSubstr}' has no data-sid`);
+  return sid;
 }
 
 /**
  * 点击会话展开 + 加载 timeline (单轮次会话: 点击会话即选中该轮次).
  * 等待右侧 timeline 的 request-pane 出现.
  */
-async function clickSessionByLeaf(page: Page, leaf: string): Promise<void> {
-  await page.locator(`.session-item[data-leaf="${leaf}"]`).click();
+async function clickSessionByLeaf(page: Page, sid: string): Promise<void> {
+  await page.locator(`.session-item[data-sid="${sid}"]`).click();
   await page.waitForSelector("#detail .request-pane", { timeout: 3000 });
-}
-
-/** 等待 bubble 加上指定 class (applyBubbleCollapse 异步测量后注入). */
-async function expectBubbleClass(
-  page: Page,
-  selector: string,
-  cls: string,
-  timeout = 3000
-): Promise<void> {
-  await page.waitForFunction(
-    ([sel, c]) => {
-      const el = document.querySelector(sel);
-      return el?.classList.contains(c) ?? false;
-    },
-    [selector, cls],
-    { timeout }
-  );
 }
 
 // ─── 测试用例 ────────────────────────────────────────────────────────────
@@ -106,6 +89,8 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
   });
 
   test("需求 2+5: sender icon 分类 + 气泡颜色", async ({ page }) => {
+    // IM 风格: 每轮 request-pane 只渲染本轮的 user bubble (最后一条 user msg).
+    // 不再回显完整 messages 历史, 因此 timeline 内只有 user 气泡.
     await sendChat(page, [
       { role: "system", content: "sys" },
       { role: "user", content: "sender-icon-marker" },
@@ -115,23 +100,22 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     await clickSessionByLeaf(page, leaf);
     await page.waitForTimeout(500);
 
-    // sender icons (timeline 内).
+    // sender icons (timeline 内): 单 user 气泡.
     const senderClasses = await page
       .locator("#detail .sender-icon")
       .evaluateAll((els) => els.map((e) => e.className.replace("sender-icon ", "")));
-    expect(senderClasses).toContain("s-system");
     expect(senderClasses).toContain("s-user");
 
     // bubble 颜色 class.
     const bubbleClasses = await page
       .locator("#detail .chat-bubble")
       .evaluateAll((els) => els.map((e) => e.className));
-    expect(bubbleClasses.some((c) => c.includes("bubble-system"))).toBe(true);
     expect(bubbleClasses.some((c) => c.includes("bubble-user"))).toBe(true);
   });
 
-  test("需求 2: 三级展示气泡 (折叠 → 展开 → 弹框全文)", async ({ page }) => {
-    // 超长 system prompt: 足够在任何 viewport 宽度下超过 15 行.
+  test("需求 2 (IM 风格): 每轮只渲染本轮最后一条 user msg, 不重复历史", async ({ page }) => {
+    // 多轮对话 (累积 messages 数组): 旧版会每轮重复显示前序历史气泡.
+    // IM 风格: 每轮 request-pane 只渲染本轮的 "最后一条 user msg" = 单个 user 气泡.
     const longSys = "You are a helpful assistant designed to test the secret-guard webui. ".repeat(50);
     await sendChat(page, [
       { role: "system", content: longSys },
@@ -140,44 +124,15 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
 
     const leaf = await findSessionLeafByPreview(page, "three-tier-test-marker");
     await clickSessionByLeaf(page, leaf);
-    // 等 applyBubbleCollapse 异步测量 + 注入 collapsed.
-    await page.waitForTimeout(800);
+    await page.waitForTimeout(500);
 
-    // 阶段 1: 折叠态.
-    const sysBubble = page.locator("#detail .chat-bubble.bubble-system").first();
-    await expectBubbleClass(page, "#detail .chat-bubble.bubble-system", "collapsed");
-
-    const collapsedH = await sysBubble.evaluate((el) => el.clientHeight);
-    expect(collapsedH).toBeLessThan(100);
-
-    // 折叠态 .bubble-content 必须 overflow:hidden (issue #23 子项 2):
-    // 旧版只设 max-height 未设 overflow, 第 4 行会穿过 content 盒冒头到 bubble padding 区.
-    // content 层裁切保证第 4 行完全不渲染 (而非依赖外层 bubble 兜底).
-    const contentOverflow = await sysBubble
-      .locator(".bubble-content")
-      .evaluate((el) => getComputedStyle(el).overflow);
-    expect(contentOverflow).toBe("hidden");
-
-    // 阶段 2: 点击 toggle 展开.
-    await sysBubble.locator(".bubble-toggle").click();
-    await page.waitForTimeout(300);
-    await expectBubbleClass(page, "#detail .chat-bubble.bubble-system", "expanded");
-    const expandedH = await sysBubble.evaluate((el) => el.clientHeight);
-    expect(expandedH).toBeGreaterThan(collapsedH);
-
-    // 阶段 3: 展开后超阈值应该出现 view-full 按钮.
-    const viewFull = sysBubble.locator(".view-full-btn");
-    await expect(viewFull).toBeVisible();
-
-    // 点击 view-full 打开 dialog.
-    await viewFull.click();
-    await page.waitForTimeout(300);
-    const dialog = page.locator("dialog#bubble-full-dialog");
-    expect(await dialog.evaluate((el) => el.hasAttribute("open"))).toBe(true);
-
-    // dialog 应包含完整文本.
-    const bodyText = await dialog.locator(".full-body").innerText();
-    expect(bodyText).toContain("helpful assistant");
+    // IM 风格: request-pane 只有一个 user 气泡 (本轮新增).
+    await expect(page.locator("#detail .request-pane .chat-bubble.bubble-user")).toHaveCount(1);
+    // 不应该出现 system 气泡 (不再回显完整历史).
+    await expect(page.locator("#detail .request-pane .chat-bubble.bubble-system")).toHaveCount(0);
+    // user 气泡应包含 preview 文本.
+    const userText = await page.locator("#detail .chat-bubble.bubble-user").textContent();
+    expect(userText).toContain("three-tier-test-marker");
   });
 
   test("需求 3: response 打字框固定底部 + 独立滚动", async ({ page }) => {
@@ -213,31 +168,35 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     expect(respScroll).toBe(0);
   });
 
-  test("需求 1 (B1/B2 根治): 自动刷新期间 scrollTop + bubble 展开状态保持", async ({
+  test("需求 1 (B1/B2 根治): 自动刷新期间 scrollTop 保持 (IM 风格)", async ({
     page,
   }) => {
-    // 多轮对话 + 长 system, 让 timeline 有足够滚动空间.
+    // 多轮对话: 累积 messages 数组 (DAG 通过 prefix-hash 自动把连续请求链成同一会话).
+    // IM 风格: 每轮 request-pane 只渲染本轮的 preview (单 user 气泡),
+    // 但 response-pane 渲染完整 assistant 回复. 多轮累积 → timeline 可滚动.
     const longSys = "You are a coding assistant. ".repeat(15);
+    // 轮 1: [sys, user1] → 助手回复. mock 看 *首条* user msg: user1 含 "long response" → 长回复.
     await sendChat(page, [
       { role: "system", content: longSys },
-      { role: "user", content: "What is 1+1?" },
+      { role: "user", content: "first long response question" },
+      { role: "assistant", content: "1+1 equals 2." },
+    ]);
+    // 轮 2: [sys, user1, asst1, user2] → prefix 匹配轮 1 的 [sys,user1] → 成为轮 1 的 child.
+    await sendChat(page, [
+      { role: "system", content: longSys },
+      { role: "user", content: "first long response question" },
       { role: "assistant", content: "1+1 equals 2." },
       { role: "user", content: "What about 2+2?" },
       { role: "assistant", content: "2+2 equals 4. ".repeat(10) },
-      { role: "user", content: "Thanks" },
+      { role: "user", content: "final-long-response-marker" },
     ]);
 
-    const leaf = await findSessionLeafByPreview(page, "What is 1+1");
+    // preview = 最后一条 user msg.
+    const leaf = await findSessionLeafByPreview(page, "final-long-response-marker");
     await clickSessionByLeaf(page, leaf);
     await page.waitForTimeout(500);
 
-    // 1. 展开 system bubble.
-    const sysBubble = page.locator("#detail .chat-bubble.bubble-system").first();
-    const toggle = sysBubble.locator(".bubble-toggle");
-    if ((await toggle.count()) > 0) await toggle.click();
-    await page.waitForTimeout(300);
-
-    // 2. 设置 #detail (timeline 容器) scrollTop 到中间.
+    // 设置 #detail (timeline 容器) scrollTop 到中间.
     const canScroll = await page
       .locator("#detail")
       .evaluate((el) => el.scrollHeight > el.clientHeight);
@@ -254,23 +213,19 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     );
     expect(expected).toBeGreaterThan(0);
 
-    // 3. 等 2 轮自动刷新 (间隔 3s).
+    // 等 2 轮自动刷新 (间隔 3s).
     await page.waitForTimeout(7000);
 
-    // 4. 验证 scrollTop 保持.
+    // 验证 scrollTop 保持.
     const actual = await page
       .locator("#detail")
       .evaluate((el) => el.scrollTop);
     expect(Math.abs(actual - expected)).toBeLessThan(10);
-
-    // 5. 验证 bubble 仍 expanded.
-    const classes = (await sysBubble.getAttribute("class")) ?? "";
-    expect(classes).toContain("expanded");
   });
 
   test("需求 4: 选中会话时 timeline 初始滚到底", async ({ page }) => {
-    // 复用上一个测试创建的多轮对话会话.
-    const leaf = await findSessionLeafByPreview(page, "What is 1+1");
+    // 复用上一个测试创建的多轮对话会话 (preview = 最后一条 user msg).
+    const leaf = await findSessionLeafByPreview(page, "final-long-response-marker");
     // 重新点击会话 (先折叠再展开) 触发 timeline 重新加载 + 初始滚到底.
     await clickSessionByLeaf(page, leaf);
     await page.waitForTimeout(500);
