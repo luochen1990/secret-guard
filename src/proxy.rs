@@ -545,7 +545,57 @@ fn redact_and_derive(
         );
     }
     let redactions = derive_redactions(&redaction_map, secrets_snapshot);
+    // 视图正确性守卫: redactions 是 RedactionMap (SSOT) 的派生视图, 每次派生都断言不变式.
+    // 集中在 helper 内部确保 same_proto / cross_proto 两条路径都覆盖.
+    #[cfg(feature = "consistency-check")]
+    assert_redactions_match_map(&redactions, &redaction_map, secrets_snapshot);
     (redaction_map, redact_seed, redactions)
+}
+
+/// 视图正确性守卫 (CI 用, 需 `--features consistency-check`).
+///
+/// `redactions` 字段是 `RedactionMap` (SSOT) 的派生视图. 本函数断言派生保持
+/// RedactionMap 的关键不变式, 防止未来重构破坏派生一致性. 详见 AGENTS.md
+/// "视图正确性确保机制" — "redactions 字段从 RedactionMap 派生" 是该机制的已实践位置.
+///
+/// 不变式:
+/// 1. 派生结果的条目数 == RedactionMap 中命中 secrets_snapshot 的 real 数.
+/// 2. 派生结果中每个 mock 都能在 RedactionMap 中反向查到同一 real (双向索引自洽).
+/// 3. 派生结果中 mock 唯一 (RedactionMap 按 value 去重, 派生也应去重).
+#[cfg(feature = "consistency-check")]
+fn assert_redactions_match_map(
+    derived: &[(String, String)],
+    redaction_map: &RedactionMap,
+    secrets_snapshot: &[crate::secrets::SecretEntry],
+) {
+    // (1) 条目数: 派生结果应 == real_to_mock 中命中 snapshot 的 real 数.
+    let expected = redaction_map
+        .real_to_mock
+        .keys()
+        .filter(|real| secrets_snapshot.iter().any(|s| &s.value == *real))
+        .count();
+    debug_assert_eq!(
+        derived.len(),
+        expected,
+        "derived redactions count drift from RedactionMap SSOT"
+    );
+    // (2) 双向索引自洽: 每个 mock 反查 real, 且该 real 命中 snapshot.
+    for (mock, _id) in derived {
+        let real = redaction_map.mock_to_real.get(mock);
+        debug_assert!(
+            real.is_some_and(|r| secrets_snapshot.iter().any(|s| s.value == *r)),
+            "derived mock {mock:?} not round-tripping through RedactionMap"
+        );
+    }
+    // (3) mock 唯一 (RedactionMap 按 value 去重).
+    let mut mocks: Vec<&String> = derived.iter().map(|(m, _)| m).collect();
+    mocks.sort();
+    mocks.dedup();
+    debug_assert_eq!(
+        mocks.len(),
+        derived.len(),
+        "derived redactions have duplicate mocks"
+    );
 }
 
 /// 写一条 "上游请求失败" 记录 (错误路径专用 helper).
@@ -729,7 +779,7 @@ async fn cross_proto_forward(
     // 7. 快照真实 messages (redact 前) 给 DAG.
     let real_messages = ir.messages.clone();
 
-    // 8. redact IR + derive redactions (共享 helper).
+    // 8. redact IR + derive redactions (共享 helper, 内含 consistency-check 守卫).
     let (redaction_map, redact_seed, redactions) =
         redact_and_derive(&mut ir, &secrets_snapshot, "cross-proto");
 

@@ -56,6 +56,13 @@ jobs:
           git fetch --depth 1 origin "$GITHUB_SHA"
           git checkout FETCH_HEAD
 
+      # consistency-check feature 守卫: clippy + nextest 带 feature flag 跑一次.
+      # 该 feature 是默认关闭的 CI 守卫 (视图正确性断言, 详见 AGENTS.md "视图正确性确保机制"),
+      # 必须显式启用才能让断言执行. 单独成步, 复用 checkout; 在 coverage 步骤的 cargo clean 前,
+      # 不影响磁盘峰值控制 (target/debug 与 coverage 的 target/llvm-cov-target 互不复用).
+      - name: consistency-check feature guard
+        run: just check-features
+
       # just check --coverage: fmt + clippy + machete + 测试 (插桩编译, 产出 profdata 供 coverage-gate 消费).
       # 测试集只跑这一次 (而非 check 跑一次 + coverage-gate 再跑一次).
       - name: Check + coverage data

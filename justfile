@@ -34,6 +34,11 @@ dev:
 #
 # doctest 暂时禁用: 当前唯一的 doctest (auth::middleware) 被标为 ```ignore, 测试价值为零.
 # 需要时取消下行注释即可恢复 (增量开销 <1s, 复用 clippy 的 debug/ 产物).
+#
+# consistency-check feature 守卫 (CI 用): 默认关闭的视图正确性断言. 非覆盖率分支末尾
+# 调用 just check-features 增量编译该 feature 跑 clippy + nextest, 确保守卫断言持续可用
+# 且不漂移. CI workflow 单独成步运行 check-features (在 coverage 的 cargo clean 前),
+# 复用同一 target/debug, 不影响上面的磁盘峰值控制.
 check *ARGS:
     cargo fmt -- --check
     cargo clippy --all-targets -- -D warnings
@@ -44,7 +49,15 @@ check *ARGS:
         cargo llvm-cov nextest --no-fail-fast --no-report; \
     else \
         cargo nextest run --no-fail-fast; \
+        just check-features; \
     fi
+
+# consistency-check feature 守卫 (CI 用): clippy + nextest 带 feature flag.
+# 该 feature 默认关闭, 包含视图正确性断言 (proxy.rs::assert_redactions_match_map).
+# 详见 AGENTS.md "视图正确性确保机制". CI workflow 单独成步运行本目标.
+check-features:
+    cargo clippy --all-targets --features consistency-check -- -D warnings
+    cargo nextest run --no-fail-fast --features consistency-check
 
 # WebUI 回归测试 (Playwright 端到端).
 # 需要 devShell (nix develop) 提供 playwright-test 包; shellHook 自动 symlink node_modules.

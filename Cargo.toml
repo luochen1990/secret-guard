@@ -9,6 +9,12 @@ license = "MIT"
 name = "secret-guard"
 path = "src/main.rs"
 
+[features]
+default = []
+# 视图正确性热路径断言 (CI 守卫, 默认关闭避免生产开销).
+# 详见 AGENTS.md "视图正确性确保机制".
+consistency-check = []
+
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
