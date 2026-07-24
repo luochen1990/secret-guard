@@ -238,11 +238,12 @@ async fn same_proto_forward(
     // IR 路径 (启用 redact).
     use crate::codec::Protocol as CodecProtocol;
     let Some(codec_proto) = CodecProtocol::from_native(ingress) else {
-        // codec 不支持此协议 (eg Gemini/Ollama), 但同协议需要 IR 处理.
-        // 降级到字节透传 + warn (不应用 redact).
+        // codec 不支持此协议 (Gemini/Ollama), 但同协议 + SecretTable 非空时本应做 redact.
+        // 降级到字节透传: secret 原样转发到上游 (静默失效风险). 用 warn 让运维注意到.
+        // 安全: 只记 protocol + provider id, 永不记 secret 值.
         warn!(
-            "secrets configured for {} provider '{}', but codec doesn't support {}; \
-             falling back to byte-level passthrough without redact",
+            "secrets configured for {} provider '{}', but codec does not cover {}; \
+             secrets will be forwarded unredacted to upstream",
             ingress.name(),
             provider.id,
             ingress.name()
