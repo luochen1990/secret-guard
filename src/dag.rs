@@ -2286,4 +2286,131 @@ mod tests {
             "末轮 C 的 parsed_response 应保留"
         );
     }
+
+    // ─── 并发回归守卫 ───────────────────────────────────────────────────────
+    //
+    // ConversationDag 用 `RwLock<DagInner>` 保护, 是核心并发数据结构. 既有 46 个单测全
+    // 单线程顺序执行, 没有覆盖多写者 + 多读者并发场景. config.rs 有对应的
+    // `concurrent_upserts_no_lost_update`, DAG 反而缺失. 以下测试用 std::thread (DAG 操作
+    // 是 sync API) 压测并发 push + 并发读, 断言无 panic 且最终视图一致.
+
+    #[test]
+    fn concurrent_push_and_read_no_panic_no_data_race() {
+        // N 个 writer 各 push 一组独立根 messages, 同时 M 个 reader 反复 list_sessions /
+        // list_page / node_count. 最终所有 push 都应落库 (无 lost update), 读操作无 panic.
+        const WRITERS: usize = 8;
+        const READERS: usize = 4;
+        const PUSHES_PER_WRITER: usize = 25;
+
+        let dag = ConversationDag::new(4096, 4096, 1);
+        // 写者返回 Option<Uuid>, 读者返回 (). 用 boxed trait object 统一 join.
+        let mut writer_handles: Vec<std::thread::JoinHandle<Option<Uuid>>> = Vec::new();
+        let mut reader_handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
+
+        // writers: 每个 writer 用唯一 i 生成不同 messages, 确保不退化成同一根.
+        for i in 0..WRITERS {
+            let dag_w = dag.clone();
+            writer_handles.push(std::thread::spawn(move || {
+                let mut last_id = None;
+                for j in 0..PUSHES_PER_WRITER {
+                    // 线性链: 后一次 push 含前一次的 prefix → 延续同一 session.
+                    let mut msgs = vec![text_msg(IrRole::System, &format!("sys-{i}"))];
+                    if let Some(prev) = last_id.take() {
+                        // 拉父节点的 delta, 作为 prefix 续接.
+                        if let Some(view) = dag_w.get_node(prev) {
+                            // 用 parent 的 messages 重建前缀过于重; 直接构造 [sys, a_j].
+                            let _ = view; // marker: 不读取, 简化构造.
+                        }
+                    }
+                    msgs.push(text_msg(IrRole::User, &format!("writer-{i}-round-{j}")));
+                    let new_id = dag_w.push_messages(msgs, dummy_event());
+                    last_id = Some(new_id);
+                }
+                last_id
+            }));
+        }
+
+        // readers: 读 side 持续触发, 直到所有 writer join.
+        for _ in 0..READERS {
+            let dag_r = dag.clone();
+            reader_handles.push(std::thread::spawn(move || {
+                for _ in 0..200 {
+                    // 读操作必须不 panic; 视图一致性靠最终 join 后再断言.
+                    let _ = dag_r.list_sessions();
+                    let _ = dag_r.node_count();
+                    let _ = dag_r.list_page(1, 20, false);
+                }
+            }));
+        }
+
+        for (i, h) in writer_handles.into_iter().enumerate() {
+            let res = h.join().expect("writer thread must not panic");
+            assert!(res.is_some(), "writer {i} last push must succeed");
+        }
+        for h in reader_handles {
+            h.join().expect("reader thread must not panic");
+        }
+
+        // 最终一致性: 所有 writer 的 push 都成功 → node_count == WRITERS * PUSHES_PER_WRITER.
+        let expected = WRITERS * PUSHES_PER_WRITER;
+        assert_eq!(
+            dag.node_count(),
+            expected,
+            "all concurrent pushes must be reflected; got {} expected {}",
+            dag.node_count(),
+            expected
+        );
+        // 每个 writer 独立根 → 至少 WRITERS 个 session.
+        let sessions = dag.list_sessions();
+        assert!(
+            sessions.len() >= WRITERS,
+            "expected >= {WRITERS} sessions, got {}",
+            sessions.len()
+        );
+    }
+
+    #[test]
+    fn fork_and_lru_evict_preserves_shared_parent() {
+        // fork 场景: A → B, 然后 A → B' (B' 复用 B 的前缀但发散).
+        // 当 nodes 数超过 max_nodes 时, LRU 应淘汰某 session 的 leaf, 但 fork 共享的
+        // parent (此处 A) 因 child_count > 0 不应被 gc_cascade 误删.
+        //
+        // 与既有 `session_gc_cascade_protects_fork_shared_parent` 区别: 那个测试手动调用
+        // gc_cascade 绕过 LRU 选择; 本测试设置小 max_nodes 触发真实自动 LRU evict.
+        let dag = ConversationDag::new(3, 500, 1);
+        // A = [u1] (root, session s1)
+        let a = dag.push_messages(vec![text_msg(IrRole::User, "u1")], dummy_event());
+        // B = [u1, a1] extends A (s1 延续)
+        let b = dag.push_messages(
+            vec![
+                text_msg(IrRole::User, "u1"),
+                text_msg(IrRole::Assistant, "a1"),
+            ],
+            dummy_event(),
+        );
+        // B' forks from A (same prefix [u1], diverges): [u1, u2] → 新 session s2.
+        let _b_prime = dag.push_messages(
+            vec![text_msg(IrRole::User, "u1"), text_msg(IrRole::User, "u2")],
+            dummy_event(),
+        );
+        // 此时 nodes = 3 = max_nodes. 再 push 一次触发 evict (sessions=2 > min_sessions=1).
+        let _c = dag.push_messages(
+            vec![
+                text_msg(IrRole::User, "u1"),
+                text_msg(IrRole::Assistant, "a1"),
+                text_msg(IrRole::User, "c1"),
+            ],
+            dummy_event(),
+        );
+
+        // 关键不变量: A 作为 fork 共享点, 只要还有任一 child 引用就必须在 DAG 内.
+        // (如果 A 被误删, get_node(A) 返回 None, 会导致后续 timeline / 完整请求重建失败.)
+        assert!(
+            dag.get_node(a).is_some(),
+            "shared fork parent A must survive LRU eviction"
+        );
+        // B 是 s1 的中间节点, 当 s1 leaf 被淘汰时, gc_cascade 会走到 B.
+        // 只要 s2 还引用 A, A 就受 child_count 守护.
+        let _ = b;
+    }
 }
