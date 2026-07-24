@@ -950,6 +950,7 @@ impl ConversationDag {
             latest_resp_status: leaf.event.resp_status,
             latest_error: resp.as_ref().and_then(|r| r.error.clone()),
             redactions: leaf.event.redactions.clone(),
+            path: leaf.event.path.clone(),
         })
     }
 
@@ -1089,6 +1090,10 @@ pub struct SessionView {
     pub latest_error: Option<String>,
     /// 最新轮次的 redactions.
     pub redactions: Vec<(String, String)>,
+    /// 叶子节点 HTTP path (形如 "/o/<provider_id>/..."), 前端 provider icon 据此解析
+    /// protocol 角标 + provider id. 取最近一轮的 provider, 跨 provider 重试场景下
+    /// 可能不代表整条会话的 provider.
+    pub path: String,
 }
 
 /// Node 的轻量只读视图 (供 list / 元数据查询).

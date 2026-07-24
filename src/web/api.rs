@@ -482,6 +482,8 @@ pub struct SessionSummary {
     pub latest_resp_status: u16,
     pub latest_error: Option<String>,
     pub redactions: Vec<(String, String)>,
+    /// 叶子节点 HTTP path (前端 provider icon 解析 proto 角标 + provider id).
+    pub path: String,
 }
 
 impl From<crate::dag::SessionView> for SessionSummary {
@@ -498,6 +500,7 @@ impl From<crate::dag::SessionView> for SessionSummary {
             latest_resp_status: s.latest_resp_status,
             latest_error: s.latest_error,
             redactions: s.redactions,
+            path: s.path,
         }
     }
 }

@@ -1292,9 +1292,8 @@
       lastSidebarFingerprint = fingerprint;
 
       listEl.innerHTML = list.map(s => {
-        // 会话无 path 字段, 用 session_id 作为 provider id 的代理 (保证图标颜色稳定);
-        // 协议角标留空 (provider 信息在叶子轮次的 path 里, SessionSummary 未暴露).
-        const iconHtml = providerIcon(s.session_id, '');
+        const { proto, id: pid } = parsePath(s.path);
+        const iconHtml = providerIcon(pid, proto);
         const preview = s.preview || '(no preview)';
         const status = escapeHtml(sessionStatusText(s));
         const statusCls = sessionStatusClass(s);
@@ -1501,6 +1500,13 @@
     }
 
     // ─── sidebar 渲染辅助 ──────────────────────────────────────────────────
+
+    // 从 path 中提取 {proto, id}. 形如 "/o/<id>/...", split 后 index 1 是协议短码,
+    // index 2 是 provider id.
+    function parsePath(path) {
+      const parts = String(path || '').split('/');
+      return { proto: parts[1] || '?', id: parts[2] || '<unknown>' };
+    }
 
     // provider 复合图标: 圆形彩色背景 + 首字母 + 协议角标.
     // 颜色: provider id 哈希到固定调色板 (低饱和度, 保证文字可读).

@@ -88,6 +88,25 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     expect(metas.some((m) => m.includes("test-model-abc"))).toBe(true);
   });
 
+  test("sidebar 会话 provider icon: 含协议角标 SVG + provider id 首字母", async ({
+    page,
+  }) => {
+    // 回归守卫: 会话折叠重构曾丢失协议角标 + provider id (退化为 session_id 哈希随机色 + 空角标).
+    // mock-openai provider 的 path 前缀是 /o/mock-openai, 首字母应为 'm', 角标应为 OpenAI 六瓣花.
+    await sendChat(page, [{ role: "user", content: "provider-icon-marker" }]);
+    const item = page
+      .locator(".session-item", { hasText: "provider-icon-marker" })
+      .first();
+    await item.waitFor({ state: "visible", timeout: 5000 });
+
+    const icon = item.locator(".pv-icon").first();
+    // 首字母 = provider id 的首字母.
+    const letter = ((await icon.textContent()) ?? "").trim().charAt(0);
+    expect(letter).toBe("m");
+    // 协议角标 SVG 必须存在 (空角标 = bug).
+    await expect(icon.locator("svg")).toHaveCount(1);
+  });
+
   test("需求 2+5: sender icon 分类 + 气泡颜色", async ({ page }) => {
     // IM 风格: 每轮 request-pane 只渲染本轮的 user bubble (最后一条 user msg).
     // 不再回显完整 messages 历史, 因此 timeline 内只有 user 气泡.
