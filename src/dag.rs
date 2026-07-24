@@ -10,8 +10,9 @@
 //!
 //! # 核心概念
 //!
-//! - **Node**: 一次 API 调用, 持有该次调用产出的 messages (request delta + response).
-//!   `msgs` 最后一条恒为 response (assistant role), 其余是相对 parent 的 request 增量.
+//! - **Node**: 一次 API 调用, 持有 `req_delta` (相对 parent 的 request 增量, 真实内容)
+//!   与 `response` (LLM 返回, 独立 RwLock 存储). 两者分离存储, 忠实于原始数据, 不合并为
+//!   单一 `msgs` 字段 (详见下方 [`Node`] 结构与第 4 章"关键不变式").
 //! - **BlockPool**: 全局内容寻址的 IrBlock 池, 引用计数管理.
 //! - **Merkle prefix hash**: 从根到本 node 的累积 hash, 用于 push 时 O(N) 找 parent.
 //!
