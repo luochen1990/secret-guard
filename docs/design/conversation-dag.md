@@ -189,17 +189,23 @@ struct ResponseData {
 
 struct CallEvent {
     created_at: DateTime<Utc>,
-    elapsed_ms: u64,
     method: String,
     path: String,
     req_headers: Vec<(String, String)>,
-    resp_headers: Vec<(String, String)>,
-    resp_status: u16,
     redact_seed: u64,               // 重建 redactMap 用 (0 = passthrough)
     policy: Arc<PolicySnapshot>,    // 重建 redactMap 用
     req_envelope: serde_json::Value, // 请求侧非 message 字段
     ingress_protocol: Option<codec::Protocol>,
+    req_body_raw: String,           // LLM 视角的请求 body 快照 (WebUI 权威来源)
+    preview: Option<Arc<str>>,      // 首条 user msg 截断, list 路径 Arc::clone 免拷贝
+    model: Option<Arc<str>>,        // 顶层 model 字段, list 路径 Arc::clone 免拷贝
+    redactions: Arc<[(String, String)]>, // (mock, secret_id) 投影, list 路径免拷贝
 }
+
+// 注: 响应侧元数据 (resp_status / resp_headers / elapsed_ms) 只存于 ResponseData 的
+// RwLock 内 — 这是两级锁 (perf) 的前提: attach_response / update_parsed_response
+// 持外层 inner.read() + 内层 node.response.write(), 不再串行化在全局 write lock 上.
+// 旧 CallEvent 的这 3 个镜像字段已删除 (SSOT).
 
 struct ConversationDag {
     nodes: HashMap<Uuid, Node>,

@@ -1729,12 +1729,9 @@ mod tests {
         }];
         let event = CallEvent {
             created_at: chrono::Utc::now(),
-            elapsed_ms: 0,
             method: "POST".to_string(),
             path: "/o/test/big".to_string(),
             req_headers: vec![],
-            resp_status: 0,
-            resp_headers: vec![],
             req_envelope: serde_json::json!({}),
             ingress_protocol: None,
             redact_seed: 0,
@@ -1742,7 +1739,7 @@ mod tests {
             req_body_raw: String::new(),
             preview: None,
             model: None,
-            redactions: vec![],
+            redactions: Arc::from(Vec::new()),
         };
         let record_id = dag.push_messages(msgs, event);
 
