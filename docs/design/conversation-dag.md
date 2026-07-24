@@ -3,6 +3,21 @@
 > Status: **已对齐, 实施中** (2026-07-23)
 > Scope: RecordStore → ConversationDag 重构 + lazy redact pipeline
 
+> ## ⚠️ 实施期演进说明 (2026-07-24 增补)
+>
+> 本文档是**设计决策的历史快照**, 写于重构启动时. 实施过程中若干细节已演进,
+> 与下方描述存在偏差. 阅读时以代码 (`src/dag.rs`) 为准; 下表列出关键偏差:
+>
+> | 主题 | 文档描述 | 实际实施 |
+> |---|---|---|
+> | API 名 | `push_from_ir` (第 5 节受影响面 / 第 6 节步骤 6) | 命名为 `push_messages` |
+> | 数据结构 | `struct ConversationDag { nodes, prefix_index, order, max, blocks }` (第 3 节) | 外层包 `Arc<RwLock<DagInner>>`, 新增 `sessions` 表 + `max_sessions` + `min_sessions`; **`order` 字段移除**, 改用 `sessions.leaf_id` + LRU |
+> | 淘汰策略 | FIFO (第 7 节, 假设单会话线性) | 进化为 **LRU session 淘汰 + child_count 级联 GC** (leaf 先删, 递减 parent, 级联到 child_count=0) |
+> | 实施进度 | "步骤 5-10 是后续 PR 范围" (第 6 节) | 核心已全量落地 (步骤 1-9 完成, proxy/web/codec 全部接入), 仅 "完整 lazy redact 重建" (步骤 5 的 derive_redact_map 含 system/tools) 待定 |
+> | migration 提示 | "config schema ... 需 migration 提示" (第 5 节) | **未实现** TODO: sticky 字段删除未提供运行时 migration 提示, 静默忽略未知字段 |
+>
+> 下文保留原始设计叙述 (历史价值). 上述偏差点在正文中以 `📌` 内联标注.
+
 ## 1. 动机
 
 当前 RecordStore 是扁平的 `VecDeque<ForwardRecord>`, 每条 record 完整存储 req_body /
@@ -206,7 +221,9 @@ struct CallEvent {
 // RwLock 内 — 这是两级锁 (perf) 的前提: attach_response / update_parsed_response
 // 持外层 inner.read() + 内层 node.response.write(), 不再串行化在全局 write lock 上.
 // 旧 CallEvent 的这 3 个镜像字段已删除 (SSOT).
-
+// 📌 实施演进: 实际为 ConversationDag { inner: Arc<RwLock<DagInner>> },
+//    DagInner 含 nodes/prefix_index/blocks/sessions/max_nodes/max_sessions/min_sessions,
+//    无 `order` 字段 (改用 sessions.leaf_id + LRU). 见顶部"实施期演进说明".
 struct ConversationDag {
     nodes: HashMap<Uuid, Node>,
     prefix_index: HashMap<u64, Vec<Uuid>>,
@@ -235,8 +252,8 @@ struct ConversationDag {
 | redact.rs | redact_ir 演化为返回 seed; 保留 restore 路径; RedactionMap 仍存在但临时; C3 契约重述为前缀缓存友好性 |
 | mock.rs | **删除 sticky 字段** (sticky=false 违反 C3); 只保留 deterministic 路径 |
 | secrets.rs | SecretEntry 删除 mock_strategy.sticky 相关字段 + resolve 逻辑 |
-| config schema | toml 中 mock_strategy 不再支持 sticky 字段 (向后不兼容, 需 migration 提示) |
-| proxy.rs | push_from_ir / attach_response 取代 push/update |
+| config schema | toml 中 mock_strategy 不再支持 sticky 字段 (向后不兼容, 需 migration 提示) 📌 |
+| proxy.rs | push_from_ir / attach_response 取代 push/update 📌 实际命名为 `push_messages` |
 | codec/stream.rs | StreamScan snapshot → attach 到 node |
 | web/api.rs | list 派生 RecordSummary (walk DAG); get_record 按需重建 |
 | web/index.html | secret 编辑表单删除 sticky 选项 |
@@ -258,8 +275,15 @@ struct ConversationDag {
 
 > 步骤 1-4 在 PR #15 完成 (DAG 核心模块 + sticky 删除 + C3 重述).
 > 步骤 5-10 是后续 PR 范围 (完整 DAG 接入).
+>
+> 📌 实施演进 (2026-07-24): 步骤 6-9 已全量落地 (proxy/web/codec 全部接入 DAG),
+> 仅步骤 5 "完整 lazy redact 重建" 待定. 当前 timeline 用 push 时预存 req_body_raw
+> 截取 delta (非 lazy redact).
 
 ## 7. 已知限制: 孤儿节点 (FIFO 淘汰 parent)
+
+> 📌 实施演进: 本节描述的 FIFO 策略已被 **LRU session 淘汰 + child_count 级联 GC**
+> 取代, 多会话交替 push 的孤儿风险已缓解. 本节保留作历史背景. 见顶部"实施期演进说明".
 
 当前 FIFO 淘汰策略假设单会话线性使用: 引用者 (child) 永远后于被引用者 (parent) 被 push,
 所以 FIFO 淘汰顺序天然安全 (parent 先于 child 被淘汰).
