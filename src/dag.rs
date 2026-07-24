@@ -440,6 +440,29 @@ struct ParentLookup {
     split_at: usize,
 }
 
+/// 把 DAG 中所有 node id 按 (created_at desc, id desc) 排序后返回.
+///
+/// SSOT for "newest-first" 排序: [`ConversationDag::list_node_ids_newest_first`]
+/// 与 [`ConversationDag::list_page`] 共享同一排序闭包, 避免 12 行重复逻辑分叉.
+/// tie 时按 id 排序保证确定性 (HashMap keys 迭代顺序非确定).
+fn sort_node_ids_newest_first(inner: &DagInner) -> Vec<Uuid> {
+    let mut ids: Vec<Uuid> = inner.nodes.keys().copied().collect();
+    ids.sort_by(|a, b| {
+        let ta = inner
+            .nodes
+            .get(a)
+            .map(|n| n.event.created_at)
+            .unwrap_or_default();
+        let tb = inner
+            .nodes
+            .get(b)
+            .map(|n| n.event.created_at)
+            .unwrap_or_default();
+        tb.cmp(&ta).then_with(|| b.cmp(a))
+    });
+    ids
+}
+
 impl Default for ConversationDag {
     fn default() -> Self {
         Self::new(1024, 500, 1)
@@ -846,21 +869,7 @@ impl ConversationDag {
     /// tie 时按 id 排序保证确定性 (HashMap keys 迭代顺序非确定).
     pub fn list_node_ids_newest_first(&self) -> Vec<Uuid> {
         let g = self.inner.read();
-        let mut ids: Vec<Uuid> = g.nodes.keys().copied().collect();
-        ids.sort_by(|a, b| {
-            let ta = g
-                .nodes
-                .get(a)
-                .map(|n| n.event.created_at)
-                .unwrap_or_default();
-            let tb = g
-                .nodes
-                .get(b)
-                .map(|n| n.event.created_at)
-                .unwrap_or_default();
-            tb.cmp(&ta).then_with(|| b.cmp(a))
-        });
-        ids
+        sort_node_ids_newest_first(&g)
     }
 
     /// 当前 node 总数.
@@ -883,20 +892,7 @@ impl ConversationDag {
         let g = self.inner.read();
         let limit = limit.clamp(1, 200);
         // 收集所有 node id, 按 (created_at desc, id desc) 排序保证确定性.
-        let mut all_ids: Vec<Uuid> = g.nodes.keys().copied().collect();
-        all_ids.sort_by(|a, b| {
-            let ta = g
-                .nodes
-                .get(a)
-                .map(|n| n.event.created_at)
-                .unwrap_or_default();
-            let tb = g
-                .nodes
-                .get(b)
-                .map(|n| n.event.created_at)
-                .unwrap_or_default();
-            tb.cmp(&ta).then_with(|| b.cmp(a))
-        });
+        let all_ids = sort_node_ids_newest_first(&g);
         if hits_only {
             let hit_ids: Vec<Uuid> = all_ids
                 .into_iter()
