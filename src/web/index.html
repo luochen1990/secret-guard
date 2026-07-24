@@ -896,7 +896,7 @@
     }
     .tl-round-header .tl-actions button:hover { background: #e0e0e0; color: #555; }
     /* 选中态高亮: 持续的背景色 (不是一闪而过的动画). 见 issue #36 "当前选中的 Round".
-       .tl-round.selected = 当前选中轮次 (来自 selectedRound 状态); 持续高亮.
+       .tl-round.selected = 当前选中轮次 (来自 state.selectedRound 状态); 持续高亮.
        .tl-round.flash = 选中瞬间的闪烁动画 (selectRound / 点击圆点时叠加一次). */
     .tl-round.selected {
       background: #fff8d6;
@@ -1252,14 +1252,46 @@
       static_preferred: 'static (forced)',
     };
 
-    let secretsList = [];
-    let secretCategories = [];
-    let secretDecisions = [];
-    let providersList = [];
-    let providerProtocols = [];
-    let providerShorts = [];
-    let providerDecisions = [];
-    let apiKeysList = [];
+    // ─── 全局可变状态 (集中收敛) ────────────────────────────────────────────
+    //
+    // 历史教训: 此前是 19 个散落的模块级 `let X = ...`, 任何函数都能改任何变量, 状态
+    // 流转无法静态追踪. 统一收到 `state` 对象后, "谁能改状态" 在代码层面可 grep
+    // (`state.xxx =` 而非散落的 `let xxx =`), 降低 3000+ 行单文件的维护心智.
+    //
+    // 不变性: 函数 (refresh / loadTimeline / openSecretForm 等) 仍是全局可见
+    // (供内联 onclick= 绑定调用), 不用 IIFE 包裹. 仅状态变量集中, 不破坏单文件契约.
+    const state = {
+      // secrets tab
+      secretsList: [],
+      secretCategories: [],
+      secretDecisions: [],
+      // providers tab
+      providersList: [],
+      providerProtocols: [],
+      providerShorts: [],
+      providerDecisions: [],
+      // auth tab (static preset API keys)
+      apiKeysList: [],
+      // records tab — sidebar
+      sessionsList: [],
+      sessionsTotal: 0,
+      hitsTotal: 0,
+      selectedSession: null,
+      selectedRound: null,
+      filterMode: 'all',   // 'all' | 'hits'. 客户端过滤 (后端 /api/sessions 不过滤).
+      // records tab — timeline
+      timelineRecords: [],
+      timelineOldest: null,
+      timelineReachedTop: false,
+      loadingOlder: false,
+      // 指纹缓存 (跳过重建 DOM 的优化).
+      lastSidebarFingerprint: '',
+      lastTimelineFingerprint: '',
+      // 杂项 flag + RAF 句柄.
+      scrollBound: false,
+      scrollRaf: 0,
+      resizeRaf: 0,
+    };
 
     // ─── records tab: 两级树 (会话 → 轮次) + timeline 惰性加载 ─────────────
     //
@@ -1268,35 +1300,26 @@
     //   二级 (轮次列表): 展开会话时拉 /api/nodes/{leaf_id}/timeline?limit=50.
     // 右侧主区域: 选中会话时拉 timeline 最近 10 轮渲染连续对话流, 滚到顶惰性加载更早的轮次.
     //
-    // 选中标识: session_id (稳定, 刷新不变). timeline 请求时从 sessionsList
+    // 选中标识: session_id (稳定, 刷新不变). timeline 请求时从 state.sessionsList
     // 取该 session 的 leaf_id (timeline 请求起点, 可能随 fork 而变).
     //
     // 状态变量:
-    //   sessionsList     — 当前 filter 维度的会话数组 (sidebar 一级).
-    //   sessionsTotal    — 当前维度的会话总数 (header count 显示).
-    //   hitsTotal        — hits 维度的会话总数 (用于 filter 按钮).
+    //   state.sessionsList     — 当前 filter 维度的会话数组 (sidebar 一级).
+    //   state.sessionsTotal    — 当前维度的会话总数 (header count 显示).
+    //   state.hitsTotal        — hits 维度的会话总数 (用于 filter 按钮).
     //   expandedSessions — Set<session_id>: 展开的会话 (持久到下次 renderSidebar).
     //   sessionRounds    — Map<session_id, RecordSummary[]>: 展开会话内的轮次列表缓存.
-    //   selectedSession  — 当前选中会话的 session_id (null = 未选中).
-    //   selectedRound    — 当前选中/高亮的轮次 node_id (null = 未定位到具体轮次).
-    //   timelineRecords  — 当前右侧 timeline 渲染的轮次数组 (oldest-first).
-    //   timelineOldest   — timeline 中最老 node 的 id (用于惰性加载判断 "是否到顶").
-    //   timelineReachedTop  — 已确认到顶 (loadOlder 探测返回 ≤ limit 条).
+    //   state.selectedSession  — 当前选中会话的 session_id (null = 未选中).
+    //   state.selectedRound    — 当前选中/高亮的轮次 node_id (null = 未定位到具体轮次).
+    //   state.timelineRecords  — 当前右侧 timeline 渲染的轮次数组 (oldest-first).
+    //   state.timelineOldest   — timeline 中最老 node 的 id (用于惰性加载判断 "是否到顶").
+    //   state.timelineReachedTop  — 已确认到顶 (loadOlder 探测返回 ≤ limit 条).
     //                         初始 false; 仅在用户实际滚顶触发 loadOlder 后才可能置 true.
     //                         避免短会话首次加载即显示 "已经到顶了" (Bug: 无条件显示).
-    //   loadingOlder     — 正在加载更早的轮次 (防重复触发).
-    let sessionsList = [];
-    let sessionsTotal = 0;
-    let hitsTotal = 0;
+    //   state.loadingOlder     — 正在加载更早的轮次 (防重复触发).
+    // 上述状态变量已统一收敛到顶层 `state` 对象 (见文件顶部), 此处仅保留不可变常量.
     const expandedSessions = new Set();
     const sessionRounds = new Map();
-    let selectedSession = null;
-    let selectedRound = null;
-    let timelineRecords = [];
-    let timelineOldest = null;
-    let timelineReachedTop = false;
-    let loadingOlder = false;
-    let filterMode = 'all';   // 'all' | 'hits'. 客户端过滤 (后端 /api/sessions 不过滤).
     const TIMELINE_PAGE = 10;   // 惰性加载每页轮次数.
     const ROUNDS_PAGE = 50;     // 展开会话时一次拉取的轮次数 (覆盖绝大多数会话).
 
@@ -1322,15 +1345,15 @@
     // ─── records tab: 会话两级树 + timeline 惰性加载 ──────────────────────
     //
     // 数据流:
-    // - refresh(): 拉 /api/sessions, 替换 sessionsList + 更新 totals. 客户端按
-    //   filterMode (all|hits) 过滤 hits = redactions.length > 0. 若 selectedSession
+    // - refresh(): 拉 /api/sessions, 替换 state.sessionsList + 更新 totals. 客户端按
+    //   state.filterMode (all|hits) 过滤 hits = redactions.length > 0. 若 state.selectedSession
     //   仍存在, 顺带刷新 timeline 最近 N 轮 (流式响应渐进更新).
     // - setFilter(mode): 纯客户端切换 (无需重拉); 重渲染 sidebar.
     // - selectSession(sessionId): 展开/折叠会话头; 展开时拉 timeline(limit=ROUNDS_PAGE)
     //   填充 sessionRounds, 同时 selectRound(leaf_id) 在右侧渲染 timeline.
     // - selectRound(nodeId): 在已渲染的 timeline 中定位 + 高亮 (滚动到该轮); 若该轮
     //   不在当前 timeline 视窗内, 重新以该轮为锚拉 timeline(TIMELINE_PAGE).
-    // - loadOlder(): 滚到 timeline 顶部时, 以 timelineOldest 的 parent 为起点拉更早
+    // - loadOlder(): 滚到 timeline 顶部时, 以 state.timelineOldest 的 parent 为起点拉更早
     //   TIMELINE_PAGE 轮, prepend 到 timeline (保持滚动锚点).
 
     async function refresh() {
@@ -1338,16 +1361,16 @@
         const resp = await fetch(API_SESSIONS, { cache: 'no-store' });
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
         const data = await resp.json();
-        sessionsList = data.sessions || [];
-        sessionsTotal = data.total || sessionsList.length;
+        state.sessionsList = data.sessions || [];
+        state.sessionsTotal = data.total || state.sessionsList.length;
         // 客户端统计 hits 维度 (redactions.length > 0 的会话数).
-        hitsTotal = sessionsList.filter(s => (s.redactions || []).length > 0).length;
+        state.hitsTotal = state.sessionsList.filter(s => (s.redactions || []).length > 0).length;
         updateCountDisplay();
         renderSidebar();
         // 选中会话仍存在 → 刷新 timeline 最近几轮 (流式渐进更新).
-        if (selectedSession && sessionsList.some(s => s.session_id === selectedSession)) {
+        if (state.selectedSession && state.sessionsList.some(s => s.session_id === state.selectedSession)) {
           await refreshTimelineTail();
-        } else if (selectedSession) {
+        } else if (state.selectedSession) {
           // 选中会话被淘汰 → 清空右侧.
           clearTimeline();
           renderSidebar();
@@ -1363,8 +1386,8 @@
     // 单次 fetch (limit=ROUNDS_PAGE) 同时服务 timeline tail 和 sessionRounds,
     // 避免重复请求 (S2 fix).
     async function refreshTimelineTail() {
-      if (timelineRecords.length === 0) return;
-      const sess = sessionsList.find(s => s.session_id === selectedSession);
+      if (state.timelineRecords.length === 0) return;
+      const sess = state.sessionsList.find(s => s.session_id === state.selectedSession);
       if (!sess) return;
       const r = await fetch(`${API_NODES}/${sess.leaf_id}/timeline?limit=${ROUNDS_PAGE}`, { cache: 'no-store' });
       if (!r.ok) return;
@@ -1374,14 +1397,14 @@
       // timeline tail: 用最近 TIMELINE_PAGE 条替换 (保持已加载的历史).
       const tailRecords = allRounds.slice(-TIMELINE_PAGE);
       const tailIds = new Set(tailRecords.map(x => x.id));
-      const kept = timelineRecords.filter(r => !tailIds.has(r.id));
-      timelineRecords = kept.concat(tailRecords);
-      timelineOldest = timelineRecords.length > 0 ? timelineRecords[0].id : null;
+      const kept = state.timelineRecords.filter(r => !tailIds.has(r.id));
+      state.timelineRecords = kept.concat(tailRecords);
+      state.timelineOldest = state.timelineRecords.length > 0 ? state.timelineRecords[0].id : null;
       renderTimeline();
       // sidebar: 用完整轮次列表更新 sessionRounds (仅展开时).
-      if (expandedSessions.has(selectedSession)) {
-        sessionRounds.set(selectedSession, allRounds);
-        renderRounds(selectedSession);
+      if (expandedSessions.has(state.selectedSession)) {
+        sessionRounds.set(state.selectedSession, allRounds);
+        renderRounds(state.selectedSession);
       }
     }
 
@@ -1389,22 +1412,22 @@
     function updateCountDisplay() {
       const cnt = document.getElementById('count');
       const lbl = document.getElementById('count-label');
-      const total = filterMode === 'hits' ? hitsTotal : sessionsTotal;
+      const total = state.filterMode === 'hits' ? state.hitsTotal : state.sessionsTotal;
       cnt.textContent = total;
-      lbl.textContent = `sessions [${filterMode}]`;
+      lbl.textContent = `sessions [${state.filterMode}]`;
     }
 
     function updateFilterCounts() {
       const allEl = document.getElementById('filter-all-count');
       const hitsEl = document.getElementById('filter-hits-count');
-      if (allEl) allEl.textContent = sessionsTotal;
-      if (hitsEl) hitsEl.textContent = hitsTotal;
+      if (allEl) allEl.textContent = state.sessionsTotal;
+      if (hitsEl) hitsEl.textContent = state.hitsTotal;
     }
 
-    // filter 切换: 纯客户端 (sessionsList 已含全部, 按 redactions 过滤).
+    // filter 切换: 纯客户端 (state.sessionsList 已含全部, 按 redactions 过滤).
     function setFilter(mode) {
-      if (mode === filterMode) return;
-      filterMode = mode;
+      if (mode === state.filterMode) return;
+      state.filterMode = mode;
       document.getElementById('filter-all').classList.toggle('active', mode === 'all');
       document.getElementById('filter-hits').classList.toggle('active', mode === 'hits');
       updateCountDisplay();
@@ -1413,32 +1436,31 @@
 
     // 当前 filter 维度过滤后的会话列表.
     function filteredSessions() {
-      if (filterMode === 'hits') {
-        return sessionsList.filter(s => (s.redactions || []).length > 0);
+      if (state.filterMode === 'hits') {
+        return state.sessionsList.filter(s => (s.redactions || []).length > 0);
       }
-      return sessionsList;
+      return state.sessionsList;
     }
 
     // 渲染侧栏: 两级树 (会话头 + 展开后的轮次列表).
-    // 指纹优化: 会话 id 序列 + 关键字段 + selectedSession + expandedSessions 一致时跳过重建.
-    let lastSidebarFingerprint = '';
+    // 指纹优化: 会话 id 序列 + 关键字段 + state.selectedSession + expandedSessions 一致时跳过重建.
     function renderSidebar() {
       const listEl = document.getElementById('record-list');
       updateFilterCounts();
 
       const list = filteredSessions();
       if (list.length === 0) {
-        lastSidebarFingerprint = '';
-        listEl.innerHTML = `<div class="empty">${filterMode === 'hits' ? 'No sessions with redactions' : 'No sessions yet'}</div>`;
+        state.lastSidebarFingerprint = '';
+        listEl.innerHTML = `<div class="empty">${state.filterMode === 'hits' ? 'No sessions with redactions' : 'No sessions yet'}</div>`;
         return;
       }
-      // 指纹: session_id + record_count + preview + status + selectedSession + expandedSessions.
+      // 指纹: session_id + record_count + preview + status + state.selectedSession + expandedSessions.
       const expandedKey = [...expandedSessions].sort().join(',');
-      const fingerprint = filterMode + '|' + selectedSession + '|' + selectedRound + '|' + expandedKey + '|' + list.map(s =>
+      const fingerprint = state.filterMode + '|' + state.selectedSession + '|' + state.selectedRound + '|' + expandedKey + '|' + list.map(s =>
         `${s.session_id}:${s.record_count}:${s.latest_resp_status}:${s.latest_error || ''}:${(s.redactions||[]).length}:${s.preview || ''}:${s.model || ''}:${s.latest_at}`
       ).join(',');
-      if (fingerprint === lastSidebarFingerprint) return;
-      lastSidebarFingerprint = fingerprint;
+      if (fingerprint === state.lastSidebarFingerprint) return;
+      state.lastSidebarFingerprint = fingerprint;
 
       listEl.innerHTML = list.map(s => {
         const { proto, id: pid } = parsePath(s.path);
@@ -1450,7 +1472,7 @@
         const hitBadge = hitN > 0 ? `<span class="badge-hit" title="${hitN} redaction(s)">${hitN}</span>` : '';
         const countBadge = s.record_count > 1 ? `<span class="badge-count" title="${s.record_count} rounds">${s.record_count}</span>` : '';
         const isExpanded = expandedSessions.has(s.session_id);
-        const isActive = s.session_id === selectedSession;
+        const isActive = s.session_id === state.selectedSession;
         const line2Model = s.model || s.session_id.slice(0, 8);
         const line2 = `${escapeHtml(formatTime(s.latest_at))} · ${escapeHtml(line2Model)}`;
         const title = [
@@ -1539,7 +1561,7 @@
         const r = g.head;
         const preview = r.preview || `${r.method} ${r.path}`;
         const status = escapeHtml(statusText(r));
-        const isActive = r.id === selectedRound;
+        const isActive = r.id === state.selectedRound;
         const headHtml = `
           <div class="round-item ${isActive ? 'active' : ''}" data-sid="${escapeHtml(sessionId)}" data-rid="${escapeHtml(r.id)}">
             <span class="ri-line1" title="${escapeHtml(preview)}">${escapeHtml(preview)}</span>
@@ -1552,7 +1574,7 @@
           ? `<div class="sub-rounds">${g.tools.map(t => {
               const name = toolNameOfRound(t);
               const color = providerColor(name);
-              const dotActive = t.id === selectedRound ? ' active' : '';
+              const dotActive = t.id === state.selectedRound ? ' active' : '';
               return `<span class="sub-dot${dotActive}" style="background:${color}" data-sid="${escapeHtml(sessionId)}" data-rid="${escapeHtml(t.id)}" title="${escapeHtml(name)} · ${escapeHtml(formatTime(t.created_at))}"></span>`;
             }).join('')}</div>`
           : '';
@@ -1577,9 +1599,9 @@
       }
       // 展开 + 选中: 先标记展开, 再 fetch rounds (若缓存未命中), 最后选中叶子轮次.
       expandedSessions.add(sessionId);
-      selectedSession = sessionId;
-      // 当前 leaf_id (timeline 请求起点): 从 sessionsList 取该 session 的最新 leaf_id.
-      const sess = sessionsList.find(s => s.session_id === sessionId);
+      state.selectedSession = sessionId;
+      // 当前 leaf_id (timeline 请求起点): 从 state.sessionsList 取该 session 的最新 leaf_id.
+      const sess = state.sessionsList.find(s => s.session_id === sessionId);
       const leafId = sess ? sess.leaf_id : null;
       if (!leafId) {
         // session 已不在 list (极端时序), 回退.
@@ -1612,20 +1634,20 @@
     //   2. 该轮在 sessionRounds 缓存中 → 从缓存填充 timelineRecords + reconcile (无网络).
     //   3. 都不在 → 以该轮为锚重新拉 timeline (网络请求), reconcile 复用公共节点.
     async function selectRound(nodeId) {
-      selectedRound = nodeId;
+      state.selectedRound = nodeId;
       renderSidebar();
       // 1. 已在当前 timeline 中 → 直接滚动 + 高亮.
-      if (selectedSession && timelineRecords.some(r => r.id === nodeId)) {
+      if (state.selectedSession && state.timelineRecords.some(r => r.id === nodeId)) {
         highlightRound(nodeId);
         return;
       }
       // 2. 在 sessionRounds 缓存中 → 从缓存填充 (避免网络请求).
-      if (selectedSession && sessionRounds.has(selectedSession)) {
-        const rounds = sessionRounds.get(selectedSession);
+      if (state.selectedSession && sessionRounds.has(state.selectedSession)) {
+        const rounds = sessionRounds.get(state.selectedSession);
         if (rounds.some(r => r.id === nodeId)) {
-          timelineRecords = rounds;
-          timelineOldest = rounds.length > 0 ? rounds[0].id : null;
-          timelineReachedTop = false;
+          state.timelineRecords = rounds;
+          state.timelineOldest = rounds.length > 0 ? rounds[0].id : null;
+          state.timelineReachedTop = false;
           renderTimeline();
           highlightRound(nodeId);
           return;
@@ -1636,7 +1658,7 @@
     }
 
     // 高亮 timeline 中某轮 (滚动到位 + 叠加一次闪烁动画).
-    // 持续高亮由 .selected 类 (renderTimelineRound 根据 selectedRound 渲染) 提供;
+    // 持续高亮由 .selected 类 (renderTimelineRound 根据 state.selectedRound 渲染) 提供;
     // 这里只负责把视窗滚到该轮, 并附加一闪而过的 .flash 动画作为选中瞬间反馈.
     // 同时刷新 Response 抽屉内容 (选中轮改变 → response 跟着变) (issue #36).
     //
@@ -1782,7 +1804,7 @@
     //
     // timeline 是一组连续的轮次 (oldest-first), 每轮 = 该轮的 request bubbles + response.
     // 用户选中会话叶子时, 拉 timeline(leaf, limit=TIMELINE_PAGE) 取最近 N 轮.
-    // 向上滚到顶时, 以 timelineOldest 的 parent 为起点 prepend 更早 N 轮 (保持滚动锚点).
+    // 向上滚到顶时, 以 state.timelineOldest 的 parent 为起点 prepend 更早 N 轮 (保持滚动锚点).
     //
     // 性能: RecordSummary 直接携带 parsed_response (由后端从 NodeView 派生),
     //   timeline 路径无需 N+1 拉 /api/records/{id}?view=parsed. 单次 timeline 请求即可.
@@ -1792,8 +1814,6 @@
     //      全量重建 #detail DOM (含每轮的 .tl-round + request-pane + response-pane 骨架).
     //   2. 增量更新: 自动刷新时若 node 序列不变, 仅更新各轮 response-pane 的 .resp-body
     //      (流式渐进), 不触碰 request-pane (保留滚动 + 气泡展开状态).
-
-    let lastTimelineFingerprint = '';
 
     // 以 nodeId 为最末轮, 拉 timeline(limit=TIMELINE_PAGE) 并全量渲染.
     // 用于: 选中会话叶子 / 点击不在视窗内的轮次.
@@ -1810,12 +1830,12 @@
           return;
         }
         const data = await r.json();
-        timelineRecords = data.records || [];
-        timelineOldest = timelineRecords.length > 0 ? timelineRecords[0].id : null;
+        state.timelineRecords = data.records || [];
+        state.timelineOldest = state.timelineRecords.length > 0 ? state.timelineRecords[0].id : null;
         // 不在初次加载时推断 reachedTop: reachedTop 的语义是 "用户滚顶探测后确认到顶",
         // 不是 "当前窗口少于 limit". 短会话首屏即显示 "已经到顶了" 是误导 (Bug).
         // 只有 loadOlder 实际探测 parent 链耗尽后才置 true.
-        timelineReachedTop = false;
+        state.timelineReachedTop = false;
         renderTimeline();
         // 选中会话叶子 → 滚到最末轮 (最新, IM 风格).
         scrollTimelineToBottomForce();
@@ -1829,12 +1849,12 @@
     }
 
     function clearTimeline() {
-      timelineRecords = [];
-      timelineOldest = null;
-      timelineReachedTop = false;
-      selectedSession = null;
-      selectedRound = null;
-      lastTimelineFingerprint = '';
+      state.timelineRecords = [];
+      state.timelineOldest = null;
+      state.timelineReachedTop = false;
+      state.selectedSession = null;
+      state.selectedRound = null;
+      state.lastTimelineFingerprint = '';
       document.getElementById('detail').innerHTML =
         '<div class="empty">Select a session on the left</div>';
       // 清空时隐藏悬浮导航按钮 + Response 抽屉.
@@ -1846,32 +1866,32 @@
 
     // 惰性加载: 向上滚到顶时 prepend 更早的轮次. 保持滚动锚点.
     async function loadOlder() {
-      if (loadingOlder || timelineReachedTop || !timelineOldest) return;
-      loadingOlder = true;
+      if (state.loadingOlder || state.timelineReachedTop || !state.timelineOldest) return;
+      state.loadingOlder = true;
       const pane = document.querySelector('#detail');
       const oldScrollHeight = pane ? pane.scrollHeight : 0;
       const oldScrollTop = pane ? pane.scrollTop : 0;
       try {
-        // 以 timelineOldest 为最末, 拉 TIMELINE_PAGE 轮. 返回 oldest-first, 最后一个是当前 oldest.
+        // 以 state.timelineOldest 为最末, 拉 TIMELINE_PAGE 轮. 返回 oldest-first, 最后一个是当前 oldest.
         // 我们要 prepend 排除当前 oldest 的前 (limit-1) 条.
-        const r = await fetch(`${API_NODES}/${timelineOldest}/timeline?limit=${TIMELINE_PAGE + 1}`, { cache: 'no-store' });
+        const r = await fetch(`${API_NODES}/${state.timelineOldest}/timeline?limit=${TIMELINE_PAGE + 1}`, { cache: 'no-store' });
         if (!r.ok) {
-          timelineReachedTop = true;
+          state.timelineReachedTop = true;
           return;
         }
         const data = await r.json();
         const all = data.records || [];
-        // 去掉最后一个 (== 当前 timelineOldest, 已在视窗内), 保留前面的作为 prepend.
+        // 去掉最后一个 (== 当前 state.timelineOldest, 已在视窗内), 保留前面的作为 prepend.
         const older = all.slice(0, Math.max(0, all.length - 1));
         // reachedTop 从响应长度推导: 请求 limit+1 条但返回 ≤ limit 条 → parent 链已耗尽.
         // (注意即使 older 为空, 也用 all.length <= TIMELINE_PAGE 判断, 避免 limit=1 的边界).
-        timelineReachedTop = all.length <= TIMELINE_PAGE;
+        state.timelineReachedTop = all.length <= TIMELINE_PAGE;
         if (older.length === 0) {
           return;
         }
-        // prepend: 把 older 放到 timelineRecords 前面.
-        timelineRecords = older.concat(timelineRecords);
-        timelineOldest = older[0].id;
+        // prepend: 把 older 放到 state.timelineRecords 前面.
+        state.timelineRecords = older.concat(state.timelineRecords);
+        state.timelineOldest = older[0].id;
         renderTimeline();
         // 保持滚动锚点: 加载后把 scrollTop 加上新增的高度差.
         const newPane = document.querySelector('#detail');
@@ -1883,7 +1903,7 @@
         console.error(e);
         setStatus('load older failed', 'status-err');
       } finally {
-        loadingOlder = false;
+        state.loadingOlder = false;
       }
     }
 
@@ -1903,20 +1923,20 @@
     //   末轮 response 在独立的 .response-drawer 中, 不在 .tl-round 内.
     function renderTimeline() {
       const el = document.getElementById('detail');
-      if (timelineRecords.length === 0) {
-        lastTimelineFingerprint = '';
+      if (state.timelineRecords.length === 0) {
+        state.lastTimelineFingerprint = '';
         el.innerHTML = '<div class="empty">No rounds in this session</div>';
         return;
       }
-      // 指纹: node id 序列 + selectedRound + reachedTop.
-      const fp = selectedRound + '|' + timelineReachedTop + '|' +
-        timelineRecords.map(r => r.id).join(',');
-      if (fp === lastTimelineFingerprint) {
+      // 指纹: node id 序列 + state.selectedRound + reachedTop.
+      const fp = state.selectedRound + '|' + state.timelineReachedTop + '|' +
+        state.timelineRecords.map(r => r.id).join(',');
+      if (fp === state.lastTimelineFingerprint) {
         // 策略 1: fingerprint 一致 → 只刷 response body (流式渐进).
         updateTimelineResponses();
         return;
       }
-      lastTimelineFingerprint = fp;
+      state.lastTimelineFingerprint = fp;
 
       // 策略 2: keyed reconciliation.
       reconcileTimelineRounds(el);
@@ -1967,8 +1987,8 @@
       // 插入锚点: 新节点依次插入到 anchor 之前, anchor 初始为 placeholder.
       let anchor = placeholder;
 
-      for (let i = 0; i < timelineRecords.length; i++) {
-        const r = timelineRecords[i];
+      for (let i = 0; i < state.timelineRecords.length; i++) {
+        const r = state.timelineRecords[i];
         let roundEl = existingRounds.get(r.id);
         if (roundEl) {
           // 复用已有节点.
@@ -1995,8 +2015,8 @@
       }
 
       // header 更新 (round count + user count).
-      const userCount = timelineRecords.filter(isUserRound).length;
-      header.textContent = `Timeline (${timelineRecords.length} rounds${userCount > 0 ? `, ${userCount} user` : ''})`;
+      const userCount = state.timelineRecords.filter(isUserRound).length;
+      header.textContent = `Timeline (${state.timelineRecords.length} rounds${userCount > 0 ? `, ${userCount} user` : ''})`;
       // placeholder 高度由 updateResponseDrawerLayout 设置.
     }
 
@@ -2073,9 +2093,9 @@
       });
     }
 
-    // 在 timelineRecords 中按 id 查找轮次摘要.
+    // 在 state.timelineRecords 中按 id 查找轮次摘要.
     function findRound(id) {
-      return timelineRecords.find(r => r.id === id) || null;
+      return state.timelineRecords.find(r => r.id === id) || null;
     }
 
     // 按 id 拉取完整 ForwardRecord (含 req_body / resp_body / headers).
@@ -2176,12 +2196,12 @@
     // 注意: 悬浮导航按钮 (.scroll-nav) 不在此处渲染 — 它是 #detail-wrap 的固定子元素
     // (article 的直接子, #detail 的兄弟), 不随 #detail 内容滚动 (issue #36).
     function renderTimelineHtml() {
-      const userCount = timelineRecords.filter(isUserRound).length;
+      const userCount = state.timelineRecords.filter(isUserRound).length;
       let html = `<div class="detail-header">
-        Timeline (${timelineRecords.length} rounds${userCount > 0 ? `, ${userCount} user` : ''})
+        Timeline (${state.timelineRecords.length} rounds${userCount > 0 ? `, ${userCount} user` : ''})
       </div>`;
       // 每轮.
-      html += timelineRecords.map((r, idx) => renderTimelineRound(r, idx)).join('');
+      html += state.timelineRecords.map((r, idx) => renderTimelineRound(r, idx)).join('');
       // placeholder: 提供 phase 2 的滚动空间 (被 drawer overlay 遮挡, 用户不会看到空白).
       html += `<div class="drawer-placeholder"></div>`;
       return html;
@@ -2195,7 +2215,7 @@
     function renderTimelineRound(r, idx) {
       const num = idx + 1;
       // 选中态用 .selected (持续高亮); 闪烁动画 .flash 由 highlightRound() 在选中瞬间叠加.
-      const roundCls = (r.id === selectedRound) ? 'tl-round selected' : 'tl-round';
+      const roundCls = (r.id === state.selectedRound) ? 'tl-round selected' : 'tl-round';
       let inner = '';
       // header. status / elapsed / streamed 是 response 到达后才确定的字段,
       // 用 data-hdr 标记, 供 updateRoundHeaders() 在增量更新时定点刷新 (非全量重建).
@@ -2226,7 +2246,7 @@
     function updateRoundHeaders() {
       const rounds = document.querySelectorAll('#detail > .tl-round');
       rounds.forEach(el => {
-        const r = timelineRecords.find(x => x.id === el.dataset.rid);
+        const r = state.timelineRecords.find(x => x.id === el.dataset.rid);
         if (!r) return;
         const status = el.querySelector('[data-hdr="status"]');
         if (status) {
@@ -2298,9 +2318,9 @@
     // 返回选中轮最后一条气泡下边缘的视口 y; 无选中轮 / 不在 DOM / 无气泡时返回 null.
     // (highlightRound 和 updateResponseDrawerLayout 共用, 保证两处位置判断一致.)
     function selectedBubbleBottomVp() {
-      if (!selectedRound) return null;
+      if (!state.selectedRound) return null;
       const round = document.querySelector(
-        `#detail .tl-round[data-rid="${CSS.escape(selectedRound)}"]`);
+        `#detail .tl-round[data-rid="${CSS.escape(state.selectedRound)}"]`);
       if (!round) return null;
       const bubbles = round.querySelectorAll('.request-pane .chat-bubble');
       return bubbles.length ? bubbles[bubbles.length - 1].getBoundingClientRect().bottom : null;
@@ -2313,11 +2333,11 @@
     function updateResponseDrawerContent() {
       const drawer = document.getElementById('response-drawer');
       if (!drawer) return;
-      if (timelineRecords.length === 0) {
+      if (state.timelineRecords.length === 0) {
         drawer.hidden = true;
         return;
       }
-      const target = timelineRecords[timelineRecords.length - 1];
+      const target = state.timelineRecords[state.timelineRecords.length - 1];
       drawer.hidden = false;
       drawer.dataset.rid = target.id;
       const bodyEl = drawer.querySelector('.resp-body');
@@ -2391,9 +2411,9 @@
         // contentEnd = 末轮底部的 content offset (固定, 不随滚动变, 不含 placeholder).
         // 找不到末轮 DOM 时 (瞬时不一致) 用 scrollHeight fallback → phase4Start ≈ maxScroll → 落在 phase 3 (maxH).
         let contentEnd = detail.scrollHeight;
-        if (timelineRecords.length > 0) {
+        if (state.timelineRecords.length > 0) {
           const lastRound = detail.querySelector(
-            `:scope > .tl-round[data-rid="${CSS.escape(timelineRecords[timelineRecords.length - 1].id)}"]`);
+            `:scope > .tl-round[data-rid="${CSS.escape(state.timelineRecords[state.timelineRecords.length - 1].id)}"]`);
           if (lastRound) {
             contentEnd = lastRound.offsetTop + lastRound.offsetHeight;
           }
@@ -2441,21 +2461,20 @@
     // 若每个 scroll 事件都同步执行, 快速滚动时会连续触发 forced reflow → jank.
     // 用 RAF 合并: 一帧内多次 scroll 事件只执行一次 layout 计算.
     // loadOlder 的到顶检测保留同步 (响应性优先, 且只是简单的 scrollTop 读取).
-    let scrollBound = false;
-    let scrollRaf = 0;
+    // flag (state.scrollBound) + RAF 句柄 (state.scrollRaf) 已收敛到顶层 state 对象.
     function bindTimelineScroll() {
       const el = document.getElementById('detail');
-      if (!el || scrollBound) return;
-      scrollBound = true;
+      if (!el || state.scrollBound) return;
+      state.scrollBound = true;
       el.addEventListener('scroll', () => {
         // 到顶触发 loadOlder (同步, 保证响应性).
-        if (el.scrollTop < 10 && !timelineReachedTop && !loadingOlder) {
+        if (el.scrollTop < 10 && !state.timelineReachedTop && !state.loadingOlder) {
           loadOlder();
         }
         // 抽屉布局 + 悬浮按钮: RAF 合并, 避免快速滚动时连续 forced reflow.
-        if (scrollRaf) return;
-        scrollRaf = requestAnimationFrame(() => {
-          scrollRaf = 0;
+        if (state.scrollRaf) return;
+        state.scrollRaf = requestAnimationFrame(() => {
+          state.scrollRaf = 0;
           updateResponseDrawerLayout();
           updateScrollNavVisibility();
         });
@@ -2471,7 +2490,7 @@
       const bottomBtn = document.getElementById('scroll-bottom-btn');
       if (!el) return;
       // 无 timeline 内容时隐藏整个导航.
-      const hasContent = timelineRecords.length > 0;
+      const hasContent = state.timelineRecords.length > 0;
       if (nav) nav.hidden = !hasContent;
       // 各按钮: 在对应方向无可滚动空间时隐藏.
       if (topBtn) topBtn.hidden = el.scrollTop < 20;
@@ -2772,8 +2791,8 @@
     const KINDS = {
       secret: {
         api: API_SECRETS,
-        list: () => secretsList,
-        setList: (d) => { secretsList = d.secrets || []; secretCategories = d.categories || []; secretDecisions = d.decisions || []; },
+        list: () => state.secretsList,
+        setList: (d) => { state.secretsList = d.secrets || []; state.secretCategories = d.categories || []; state.secretDecisions = d.decisions || []; },
         bodyId: 'secrets-body',
         statsId: 'secrets-stats',
         formDlgId: 'secret-form',
@@ -2788,8 +2807,8 @@
       },
       provider: {
         api: API_PROVIDERS,
-        list: () => providersList,
-        setList: (d) => { providersList = d.providers || []; providerProtocols = d.protocols || []; providerShorts = d.shorts || []; providerDecisions = d.decisions || []; },
+        list: () => state.providersList,
+        setList: (d) => { state.providersList = d.providers || []; state.providerProtocols = d.protocols || []; state.providerShorts = d.shorts || []; state.providerDecisions = d.decisions || []; },
         bodyId: 'providers-body',
         statsId: 'providers-stats',
         formDlgId: 'provider-form',
@@ -2897,12 +2916,12 @@
         const r = await fetch(API_API_KEYS, { cache: 'no-store' });
         if (!r.ok) throw new Error('HTTP ' + r.status);
         const data = await r.json();
-        apiKeysList = data.keys || [];
+        state.apiKeysList = data.keys || [];
         renderApiKeys();
       } catch (e) {
         // auth disabled → 401/404; 显示空状态不报错.
         console.error(e);
-        apiKeysList = [];
+        state.apiKeysList = [];
         renderApiKeys();
       }
     }
@@ -2910,9 +2929,9 @@
     function renderApiKeys() {
       const statsEl = document.getElementById('apikeys-stats');
       const body = document.getElementById('apikeys-body');
-      const total = apiKeysList.length;
-      const enabled = apiKeysList.filter(k => !k.disabled).length;
-      const staticCount = apiKeysList.filter(k => k.source === 'static').length;
+      const total = state.apiKeysList.length;
+      const enabled = state.apiKeysList.filter(k => !k.disabled).length;
+      const staticCount = state.apiKeysList.filter(k => k.source === 'static').length;
       statsEl.innerHTML = `
         <span><strong>${total}</strong> total</span>
         <span><strong>${enabled}</strong> enabled</span>
@@ -2922,7 +2941,7 @@
         body.innerHTML = `<tr><td colspan="6" class="empty">No API keys configured</td></tr>`;
         return;
       }
-      body.innerHTML = apiKeysList.map(k => {
+      body.innerHTML = state.apiKeysList.map(k => {
         const srcBadge = `<span class="src-badge src-${escapeHtml(k.source)}">${escapeHtml(k.source)}</span>`;
         const statusBadge = k.disabled
           ? '<span class="badge badge-err">disabled</span>'
@@ -3115,12 +3134,12 @@
 
     function populateCategorySelect() {
       const sel = document.getElementById('f-category');
-      sel.innerHTML = secretCategories.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
+      sel.innerHTML = state.secretCategories.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
     }
 
     function populateProtocolSelect() {
       const sel = document.getElementById('p-protocol');
-      sel.innerHTML = providerProtocols.map(p => `<option value="${escapeHtml(p)}">${escapeHtml(p)}</option>`).join('');
+      sel.innerHTML = state.providerProtocols.map(p => `<option value="${escapeHtml(p)}">${escapeHtml(p)}</option>`).join('');
     }
 
     function openSecretForm(existing) {
@@ -3133,7 +3152,7 @@
       // 编辑模式下 ID 不可改 (PUT 路径以 URL 中的 id 为准).
       idInput.disabled = !!existing;
       document.getElementById('f-name').value = existing?.name || '';
-      document.getElementById('f-category').value = existing?.category || secretCategories[0] || 'apikey';
+      document.getElementById('f-category').value = existing?.category || state.secretCategories[0] || 'apikey';
       document.getElementById('f-value').value = ''; // 强制重输, 避免泄露.
       // Mock strategy: 加载 existing 或默认值.
       loadMockStrategyIntoForm(existing?.mock_strategy);
@@ -3287,7 +3306,7 @@
       idInput.value = existing?.id || '';
       idInput.disabled = !!existing;
       document.getElementById('p-name').value = existing?.name || '';
-      document.getElementById('p-protocol').value = existing?.protocol || providerProtocols[0] || 'openai';
+      document.getElementById('p-protocol').value = existing?.protocol || state.providerProtocols[0] || 'openai';
       document.getElementById('p-base-url').value = existing?.base_url || '';
       document.getElementById('p-api-key').value = ''; // 强制重输; 留空则覆盖为空字符串.
       document.getElementById('p-enabled').checked = existing ? existing.enabled : true;
@@ -3388,12 +3407,12 @@
       }
     }, 3000);
     // 窗口尺寸变化时重算 Response 抽屉布局 (高度依赖视口尺寸) (issue #36).
-    // 用 requestAnimationFrame 节流, 避免 resize 高频触发 getBoundingClientRect (强制 layout).
-    let resizeRaf = 0;
+    // 用 requestAnimationFrame 节流 (state.resizeRaf 跟踪 raf 句柄), 避免 resize 高频
+    // 触发 getBoundingClientRect (强制 layout).
     window.addEventListener('resize', () => {
-      if (resizeRaf) return;
-      resizeRaf = requestAnimationFrame(() => {
-        resizeRaf = 0;
+      if (state.resizeRaf) return;
+      state.resizeRaf = requestAnimationFrame(() => {
+        state.resizeRaf = 0;
         updateResponseDrawerLayout();
       });
     });
