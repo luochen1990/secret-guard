@@ -199,8 +199,11 @@ pub struct MockStrategy {
     /// 维度二: 生成策略. `None` = 未配置 (resolve 时 infer); `Some` = 用户显式设置.
     ///
     /// 仅 `initial = Auto` 时生效; `Fixed` 模式忽略此字段.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gen: Option<GenSpec>,
+    ///
+    /// 字段名 `gen_spec` 避免 `gen` (Rust 2024 保留关键字); serde rename 保 toml/json
+    /// wire 兼容 (用户配置仍写 `gen = ...`).
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "gen")]
+    pub gen_spec: Option<GenSpec>,
 }
 
 impl MockStrategy {
@@ -208,8 +211,8 @@ impl MockStrategy {
     /// 若 `gen=None` 且 `initial=Auto`, 用 real infer 默认 gen spec.
     /// Fixed 模式不需要 gen, 保持 None.
     pub fn resolve_against(&mut self, real: &str) {
-        if self.gen.is_none() && matches!(self.initial, InitialValue::Auto) {
-            self.gen = Some(GenSpec::infer_default_for(real));
+        if self.gen_spec.is_none() && matches!(self.initial, InitialValue::Auto) {
+            self.gen_spec = Some(GenSpec::infer_default_for(real));
         }
     }
 
@@ -223,8 +226,8 @@ impl MockStrategy {
             }
             InitialValue::Auto => {
                 // gen=None 时由 resolve_against 填充, 这里不校验 (兼容 value_file 模式).
-                if let Some(gen) = &self.gen {
-                    gen.validate()?;
+                if let Some(gen_spec) = &self.gen_spec {
+                    gen_spec.validate()?;
                 }
             }
         }
@@ -251,8 +254,8 @@ impl MockStrategy {
         // Auto 模式: 若用户设置了 gen.prefix, 校验 prefix 不含 real 的 ≥4 字符子串
         // (否则 mock 开头部分会暴露 real 子串, 违反 C5). prefix == real 的场景也被覆盖
         // (real 是自身的 ≥4 字符子串的前提, contains_4char_substring 会返回 true).
-        if let Some(gen) = &self.gen {
-            if !gen.prefix.is_empty() && contains_4char_substring(&gen.prefix, real) {
+        if let Some(gen_spec) = &self.gen_spec {
+            if !gen_spec.prefix.is_empty() && contains_4char_substring(&gen_spec.prefix, real) {
                 return Err(
                     "gen prefix contains a ≥4 char substring of the real secret (C5 violation)"
                         .into(),
@@ -292,7 +295,7 @@ pub fn deterministic_seed(real: &str, strategy: &MockStrategy) -> u64 {
 /// - counter=0: 首选候选.
 /// - counter>0: 前序候选与 IR / allocated 冲突时的后备.
 ///
-/// **Auto 模式**要求 `strategy.gen` 为 `Some` (由 [`MockStrategy::resolve_against`] 填充).
+/// **Auto 模式**要求 `strategy.gen_spec` 为 `Some` (由 [`MockStrategy::resolve_against`] 填充).
 /// **Fixed 模式**: counter=0 返回 `value`, counter>0 返回 `{value}_{counter}`.
 pub fn gen_candidate(_real: &str, strategy: &MockStrategy, seed: u64, counter: u32) -> String {
     match &strategy.initial {
@@ -304,17 +307,17 @@ pub fn gen_candidate(_real: &str, strategy: &MockStrategy, seed: u64, counter: u
             }
         }
         InitialValue::Auto => {
-            let gen = strategy
-                .gen
+            let gen_spec = strategy
+                .gen_spec
                 .as_ref()
                 .expect("Auto mode requires gen spec; call MockStrategy::resolve_against first");
-            let pool: Vec<char> = gen.charset.enabled_chars();
+            let pool: Vec<char> = gen_spec.charset.enabled_chars();
             // validate 应已拒绝空 charset; 这里 defense-in-depth.
             if pool.is_empty() {
-                return gen.prefix.clone();
+                return gen_spec.prefix.clone();
             }
-            let (min, max) = gen.length_range;
-            let prefix_len = gen.prefix.chars().count();
+            let (min, max) = gen_spec.length_range;
+            let prefix_len = gen_spec.prefix.chars().count();
             let body_min = min.saturating_sub(prefix_len);
             let body_max = max.saturating_sub(prefix_len);
 
@@ -327,7 +330,7 @@ pub fn gen_candidate(_real: &str, strategy: &MockStrategy, seed: u64, counter: u
             };
 
             let mut buf = String::with_capacity(prefix_len + body_len);
-            buf.push_str(&gen.prefix);
+            buf.push_str(&gen_spec.prefix);
             for i in 0..body_len {
                 let h = hash64(&format!("{seed}{counter}{i}"));
                 let idx = (h % pool.len() as u64) as usize;
@@ -437,25 +440,25 @@ mod tests {
 
     #[test]
     fn genspec_infer_default_for_real() {
-        let gen = GenSpec::infer_default_for("sk-Abc123");
-        assert_eq!(gen.prefix, "");
-        assert!(gen.charset.lowercase);
-        assert!(gen.charset.uppercase);
-        assert!(gen.charset.digits);
-        assert!(gen.charset.hyphen);
-        assert_eq!(gen.length_range, (9, 9)); // "sk-Abc123" = 9 chars.
+        let gen_spec = GenSpec::infer_default_for("sk-Abc123");
+        assert_eq!(gen_spec.prefix, "");
+        assert!(gen_spec.charset.lowercase);
+        assert!(gen_spec.charset.uppercase);
+        assert!(gen_spec.charset.digits);
+        assert!(gen_spec.charset.hyphen);
+        assert_eq!(gen_spec.length_range, (9, 9)); // "sk-Abc123" = 9 chars.
     }
 
     #[test]
     fn genspec_infer_default_empty_real() {
-        let gen = GenSpec::infer_default_for("");
-        assert_eq!(gen.length_range, (0, 0));
-        assert!(gen.charset.is_empty());
+        let gen_spec = GenSpec::infer_default_for("");
+        assert_eq!(gen_spec.length_range, (0, 0));
+        assert!(gen_spec.charset.is_empty());
     }
 
     #[test]
     fn genspec_validate_rejects_zero_length() {
-        let gen = GenSpec {
+        let gen_spec = GenSpec {
             prefix: "".into(),
             charset: Charset {
                 digits: true,
@@ -463,12 +466,12 @@ mod tests {
             },
             length_range: (0, 0),
         };
-        assert!(gen.validate().is_err());
+        assert!(gen_spec.validate().is_err());
     }
 
     #[test]
     fn genspec_validate_rejects_min_gt_max() {
-        let gen = GenSpec {
+        let gen_spec = GenSpec {
             prefix: "".into(),
             charset: Charset {
                 digits: true,
@@ -476,12 +479,12 @@ mod tests {
             },
             length_range: (10, 5),
         };
-        assert!(gen.validate().is_err());
+        assert!(gen_spec.validate().is_err());
     }
 
     #[test]
     fn genspec_validate_rejects_prefix_longer_than_min() {
-        let gen = GenSpec {
+        let gen_spec = GenSpec {
             prefix: "longprefix".into(),
             charset: Charset {
                 digits: true,
@@ -489,24 +492,24 @@ mod tests {
             },
             length_range: (5, 10), // min=5 < prefix=10.
         };
-        let err = gen.validate().unwrap_err();
+        let err = gen_spec.validate().unwrap_err();
         assert!(err.contains("prefix length"), "{err}");
     }
 
     #[test]
     fn genspec_validate_rejects_empty_charset() {
-        let gen = GenSpec {
+        let gen_spec = GenSpec {
             prefix: "".into(),
             charset: Charset::default(),
             length_range: (10, 10),
         };
-        let err = gen.validate().unwrap_err();
+        let err = gen_spec.validate().unwrap_err();
         assert!(err.contains("charset is empty"), "{err}");
     }
 
     #[test]
     fn genspec_validate_accepts_valid() {
-        let gen = GenSpec {
+        let gen_spec = GenSpec {
             prefix: "sk-".into(),
             charset: Charset {
                 digits: true,
@@ -515,7 +518,7 @@ mod tests {
             },
             length_range: (10, 20),
         };
-        assert!(gen.validate().is_ok());
+        assert!(gen_spec.validate().is_ok());
     }
 
     // ─── MockStrategy ─────────────────────────────────────────────────────
@@ -524,16 +527,16 @@ mod tests {
     fn mock_strategy_default_is_auto_no_gen() {
         let s = MockStrategy::default();
         assert!(matches!(s.initial, InitialValue::Auto));
-        assert!(s.gen.is_none());
+        assert!(s.gen_spec.is_none());
     }
 
     #[test]
     fn mock_strategy_resolve_infers_gen_for_auto() {
         let mut s = MockStrategy::default();
         s.resolve_against("sk-Abc123");
-        let gen = s.gen.expect("gen should be inferred");
-        assert_eq!(gen.length_range, (9, 9));
-        assert!(gen.charset.lowercase);
+        let gen_spec = s.gen_spec.expect("gen should be inferred");
+        assert_eq!(gen_spec.length_range, (9, 9));
+        assert!(gen_spec.charset.lowercase);
     }
 
     #[test]
@@ -548,11 +551,11 @@ mod tests {
         };
         let mut s = MockStrategy {
             initial: InitialValue::Auto,
-            gen: Some(user_gen.clone()),
+            gen_spec: Some(user_gen.clone()),
         };
         s.resolve_against("sk-Abc123");
         // 用户设置的 gen 不被覆盖.
-        assert_eq!(s.gen.as_ref().unwrap(), &user_gen);
+        assert_eq!(s.gen_spec.as_ref().unwrap(), &user_gen);
     }
 
     #[test]
@@ -562,18 +565,18 @@ mod tests {
             initial: InitialValue::Fixed {
                 value: "my-mock".into(),
             },
-            gen: None,
+            gen_spec: None,
         };
         s.resolve_against("sk-Abc123");
         // Fixed 模式 gen 保持 None.
-        assert!(s.gen.is_none());
+        assert!(s.gen_spec.is_none());
     }
 
     #[test]
     fn mock_strategy_validate_fixed_empty_rejected() {
         let s = MockStrategy {
             initial: InitialValue::Fixed { value: "".into() },
-            gen: None,
+            gen_spec: None,
         };
         assert!(s.validate().is_err());
     }
@@ -582,7 +585,7 @@ mod tests {
     fn mock_strategy_validate_auto_with_bad_gen_rejected() {
         let s = MockStrategy {
             initial: InitialValue::Auto,
-            gen: Some(GenSpec {
+            gen_spec: Some(GenSpec {
                 prefix: "".into(),
                 charset: Charset::default(), // 空 charset.
                 length_range: (10, 10),
@@ -597,7 +600,7 @@ mod tests {
             initial: InitialValue::Fixed {
                 value: "secret123".into(),
             },
-            gen: None,
+            gen_spec: None,
         };
         let err = s.validate_against_real("secret123").unwrap_err();
         assert!(err.contains("must not equal"), "{err}");
@@ -612,7 +615,7 @@ mod tests {
             initial: InitialValue::Fixed {
                 value: "ask-tzzz".into(),
             },
-            gen: None,
+            gen_spec: None,
         };
         let err = s.validate_against_real(real).unwrap_err();
         assert!(err.contains("≥4 char substring"), "{err}");
@@ -624,7 +627,7 @@ mod tests {
             initial: InitialValue::Fixed {
                 value: "completely-different".into(),
             },
-            gen: None,
+            gen_spec: None,
         };
         assert!(s.validate_against_real("sk-test-123456").is_ok());
     }
@@ -639,7 +642,7 @@ mod tests {
             initial: InitialValue::Fixed {
                 value: "prefix-你好世界-suffix".into(),
             },
-            gen: None,
+            gen_spec: None,
         };
         let err = s.validate_against_real(real).unwrap_err();
         assert!(err.contains("≥4 char substring"), "{err}");
@@ -651,7 +654,7 @@ mod tests {
         let real = "sk-test-secret-value";
         let s = MockStrategy {
             initial: InitialValue::Auto,
-            gen: Some(GenSpec {
+            gen_spec: Some(GenSpec {
                 prefix: "sk-test".into(), // 出现在 real 中.
                 charset: Charset {
                     digits: true,
@@ -669,7 +672,7 @@ mod tests {
         // Auto 模式: gen.prefix 不出现在 real 中 → OK.
         let s = MockStrategy {
             initial: InitialValue::Auto,
-            gen: Some(GenSpec {
+            gen_spec: Some(GenSpec {
                 prefix: "MOCK-".into(),
                 charset: Charset {
                     digits: true,
@@ -687,7 +690,7 @@ mod tests {
     fn auto_strategy(prefix: &str, charset: Charset, length: usize) -> MockStrategy {
         MockStrategy {
             initial: InitialValue::Auto,
-            gen: Some(GenSpec {
+            gen_spec: Some(GenSpec {
                 prefix: prefix.into(),
                 charset,
                 length_range: (length, length),
@@ -762,7 +765,7 @@ mod tests {
         // length_range = (5, 10): 不同 seed 可能产生 5-10 长度.
         let s = MockStrategy {
             initial: InitialValue::Auto,
-            gen: Some(GenSpec {
+            gen_spec: Some(GenSpec {
                 prefix: "".into(),
                 charset: Charset {
                     digits: true,
@@ -874,7 +877,7 @@ mod tests {
             initial: InitialValue::Fixed {
                 value: "my-mock-value".into(),
             },
-            gen: None,
+            gen_spec: None,
         };
         assert_eq!(gen_candidate("real", &s, 42, 0), "my-mock-value");
     }
@@ -885,7 +888,7 @@ mod tests {
             initial: InitialValue::Fixed {
                 value: "my-mock".into(),
             },
-            gen: None,
+            gen_spec: None,
         };
         assert_eq!(gen_candidate("real", &s, 42, 1), "my-mock_1");
         assert_eq!(gen_candidate("real", &s, 42, 2), "my-mock_2");
@@ -899,7 +902,7 @@ mod tests {
             initial: InitialValue::Fixed {
                 value: "fixed-val".into(),
             },
-            gen: None,
+            gen_spec: None,
         };
         assert_eq!(gen_candidate("real", &s, 0, 0), "fixed-val");
         assert_eq!(gen_candidate("real", &s, 99999, 0), "fixed-val");
@@ -953,10 +956,10 @@ mod tests {
         let mock_cs = Charset::infer_from(&mock);
         // mock 用到的每个字符类都应在 real 的字符集中出现.
         if mock_cs.digits {
-            assert!(s.gen.as_ref().unwrap().charset.digits);
+            assert!(s.gen_spec.as_ref().unwrap().charset.digits);
         }
         if mock_cs.uppercase {
-            assert!(s.gen.as_ref().unwrap().charset.uppercase);
+            assert!(s.gen_spec.as_ref().unwrap().charset.uppercase);
         }
     }
 
@@ -966,7 +969,7 @@ mod tests {
     fn mock_strategy_serde_roundtrip_auto() {
         let s = MockStrategy {
             initial: InitialValue::Auto,
-            gen: Some(GenSpec {
+            gen_spec: Some(GenSpec {
                 prefix: "sk-".into(),
                 charset: Charset {
                     digits: true,
@@ -988,7 +991,7 @@ mod tests {
             initial: InitialValue::Fixed {
                 value: "my-fixed-mock".into(),
             },
-            gen: None,
+            gen_spec: None,
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: MockStrategy = serde_json::from_str(&json).unwrap();
@@ -1000,7 +1003,7 @@ mod tests {
         // gen=None 时不应出现在 JSON 中 (skip_serializing_if = "Option::is_none").
         let s = MockStrategy {
             initial: InitialValue::Auto,
-            gen: None,
+            gen_spec: None,
         };
         let json = serde_json::to_string(&s).unwrap();
         assert!(!json.contains("gen"), "None gen should be omitted: {json}");
@@ -1011,7 +1014,7 @@ mod tests {
         // 空对象 {} 应反序列化为 Default (向后兼容旧配置无此字段).
         let back: MockStrategy = serde_json::from_str("{}").unwrap();
         assert!(matches!(back.initial, InitialValue::Auto));
-        assert!(back.gen.is_none());
+        assert!(back.gen_spec.is_none());
     }
 
     #[test]
@@ -1032,7 +1035,7 @@ mod tests {
         // 验证 TOML 序列化 (config 文件用 TOML).
         let s = MockStrategy {
             initial: InitialValue::Auto,
-            gen: Some(GenSpec {
+            gen_spec: Some(GenSpec {
                 prefix: "sk-".into(),
                 charset: Charset {
                     digits: true,
