@@ -31,6 +31,7 @@ pub mod record;
 pub mod redact;
 pub mod secrets;
 pub mod server;
+pub mod util;
 pub mod web;
 
 pub use cli::{Cli, Command, RunArgs};

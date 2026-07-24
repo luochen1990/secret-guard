@@ -59,7 +59,6 @@
 //! [`crate::redact`] 模块头部 C5 段) 只指针引用, 不重述.
 
 use serde::{Deserialize, Serialize};
-use std::hash::{Hash, Hasher};
 
 // ─── Charset ───────────────────────────────────────────────────────────────
 
@@ -348,10 +347,7 @@ pub(crate) fn assert_no_c5_substring(mock: &str, real: &str) {
 /// 同一 `(real, strategy)` 总产生同一 seed → 同一候选序列 (counter=0,1,2,...).
 /// redact 调用此函数获得 seed, 保证同一 secret 在会话全程 mock 稳定.
 pub fn deterministic_seed(real: &str, strategy: &MockStrategy) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    real.hash(&mut h);
-    strategy.hash(&mut h);
-    h.finish()
+    crate::util::hash64(&(real, strategy))
 }
 
 /// 在给定 `seed + counter` 下生成单个候选 mock.
@@ -430,25 +426,20 @@ fn gen_one_auto_body(
     let body_len = if body_min == body_max {
         body_min
     } else {
-        let h = hash64(&format!("{seed}{counter}{retry}len"));
+        let h = crate::util::hash64(&format!("{seed}{counter}{retry}len"));
         body_min + (h % (body_max - body_min + 1) as u64) as usize
     };
 
     let mut buf = String::with_capacity(prefix_len + body_len);
     buf.push_str(&gen_spec.prefix);
     for i in 0..body_len {
-        let h = hash64(&format!("{seed}{counter}{retry}{i}"));
+        let h = crate::util::hash64(&format!("{seed}{counter}{retry}{i}"));
         let idx = (h % pool.len() as u64) as usize;
         buf.push(pool[idx]);
     }
     buf
 }
 
-fn hash64(s: &str) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut h);
-    h.finish()
-}
 
 // ─── tests ─────────────────────────────────────────────────────────────────
 

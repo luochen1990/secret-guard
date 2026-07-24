@@ -39,6 +39,12 @@ pub type BlockHash = u64;
 /// 计算单个 IrBlock 的内容 hash.
 ///
 /// 不依赖 IrBlock 的 PartialEq (那需要 Clone 比较), 而是递归 hash 所有字段.
+///
+/// 此处保留直接增量 hasher (未走 [`crate::util::hash64`]), 因为:
+/// - 需先 hash `mem::discriminant` (variant tag) 再按 variant 分支;
+/// - `serde_json::Value` 不 impl `Hash`, 需 canonical JSON string 中转.
+///
+/// 语义上仍是 SipHash (DefaultHasher), 算法不变, 只是入口分散在此.
 fn hash_block(block: &IrBlock) -> BlockHash {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -97,13 +103,8 @@ impl MessageRef {
     ///
     /// 用于 Merkle prefix hash 的累积计算.
     fn hash(&self) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        self.role.hash(&mut h);
-        for b in &self.blocks {
-            b.hash(&mut h);
-        }
-        h.finish()
+        // tuple Hash: 先 role 再走 [BlockHash] 的 Hash (len + 每个元素), 与原增量实现等价.
+        crate::util::hash64(&(&self.role, &self.blocks))
     }
 }
 
@@ -707,11 +708,7 @@ impl ConversationDag {
 
     /// 组合两个 hash (Merkle 风格).
     fn combine_hash(parent: u64, own: u64) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        parent.hash(&mut h);
-        own.hash(&mut h);
-        h.finish()
+        crate::util::hash64(&(parent, own))
     }
 
     /// 容量检查 + LRU 会话淘汰 (两个条件, min 保底).

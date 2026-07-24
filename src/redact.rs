@@ -153,6 +153,9 @@ impl RedactionMap {
 /// 对同一 policy (相同 secrets 集合 + 策略) 总产生同一 init seed →
 /// 同一候选序列起点 (C3 前缀缓存友好性的根基).
 pub fn init_seed(secrets: &[SecretEntry]) -> u64 {
+    // 此处保留直接增量 hasher (未走 crate::util::hash64): 原实现逐元素 hash
+    // (value, mock_strategy) 不带长度前缀; 若改用 hash64(&Vec) 会引入 len 字节,
+    // 改变历史 seed 值 (违反"保持算法不变"). 语义上仍是 SipHash.
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     for s in secrets {
