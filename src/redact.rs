@@ -285,18 +285,13 @@ pub fn redact_ir(ir: &mut IrRequest, secrets: &[SecretEntry]) -> (RedactionMap, 
 
 /// 在 [`IrResponse`] 中反向替换 mock 为真实 secret.
 ///
-/// 非流式响应的 restore 路径.
+/// 非流式响应的 restore 路径. 遍历结构由 [`StringLeafOps for IrResponse`] 提供,
+/// 与 `ir_request_contains` / `ir_request_replace_all` 自动对齐 (新增 IrBlock variant 只改一处).
 pub fn restore_ir_response(ir: &mut IrResponse, map: &RedactionMap) {
     if map.is_empty() {
         return;
     }
-    // stop_sequence 可能含 secret (虽然罕见).
-    if let Some(s) = &mut ir.stop_sequence {
-        restore_str(s, map);
-    }
-    for block in &mut ir.content {
-        restore_block(block, map);
-    }
+    ir.for_each_str_leaf_mut(&mut |s| restore_str(s, map));
 }
 
 // ─── StreamingRestorer: sliding window restore ──────────────────────────────
@@ -469,7 +464,220 @@ pub(crate) fn restore_str_inplace(s: &mut String, map: &RedactionMap) {
     }
 }
 
-// ─── IR traverse helpers ───────────────────────────────────────────────────
+// ─── IR traverse helpers (StringLeafOps trait) ──────────────────────────────
+//
+// 三类操作 (contains / replace / restore) 对 IR 的遍历结构完全相同, 仅叶子上的动作不同.
+// 历史上用三套平行的 block_* / tool_* / value_* / image_source_* 函数复制, 新增 IrBlock
+// variant 需同步改 9+ 处. 这里用 StringLeafOps trait 把遍历结构与叶子动作解耦:
+// 新增 variant 只需在 impl StringLeafOps for IrBlock 改一处, 三类操作自动对齐.
+
+/// 把"遍历 IR 所有可含 secret 的字符串叶子"这一结构抽象为 trait,
+/// 让 contains / replace / restore 三类操作复用同一份遍历代码.
+///
+/// 叶子定义 (与原 block_contains / value_contains 扫描范围严格一致):
+/// - `IrBlock::Text.text`
+/// - `IrBlock::ToolUse.{id, name}` + `input` 的 JSON 字符串叶子
+/// - `IrBlock::ToolResult.tool_use_id` + `content[]` 递归
+/// - `IrBlock::Image.source` (仅 Url 变体)
+/// - `IrTool.{name, description?}` + `input_schema` 的 JSON 字符串叶子
+/// - `IrRequest.{stop[], user?, extra 字符串叶子}`
+/// - `IrResponse.{stop_sequence?, content[]}`
+///
+/// 设计: 两方法 (不可变 / 可变), 叶子回调为 `FnMut` 允许捕获外部状态 (found 标志 / map).
+trait StringLeafOps {
+    /// 遍历所有字符串叶子 (不可变借用).
+    fn for_each_str_leaf(&self, f: &mut impl FnMut(&str));
+    /// 遍历所有字符串叶子 (可变借用, 用于 replace / restore).
+    fn for_each_str_leaf_mut(&mut self, f: &mut impl FnMut(&mut String));
+}
+
+impl StringLeafOps for serde_json::Value {
+    fn for_each_str_leaf(&self, f: &mut impl FnMut(&str)) {
+        match self {
+            serde_json::Value::String(s) => f(s),
+            serde_json::Value::Array(arr) => {
+                for e in arr {
+                    e.for_each_str_leaf(f);
+                }
+            }
+            serde_json::Value::Object(obj) => {
+                for e in obj.values() {
+                    e.for_each_str_leaf(f);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn for_each_str_leaf_mut(&mut self, f: &mut impl FnMut(&mut String)) {
+        match self {
+            serde_json::Value::String(s) => f(s),
+            serde_json::Value::Array(arr) => {
+                for e in arr.iter_mut() {
+                    e.for_each_str_leaf_mut(f);
+                }
+            }
+            serde_json::Value::Object(obj) => {
+                for e in obj.values_mut() {
+                    e.for_each_str_leaf_mut(f);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl StringLeafOps for IrBlock {
+    fn for_each_str_leaf(&self, f: &mut impl FnMut(&str)) {
+        match self {
+            IrBlock::Text { text } => f(text),
+            IrBlock::ToolUse { id, name, input } => {
+                f(id);
+                f(name);
+                input.for_each_str_leaf(f);
+            }
+            IrBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => {
+                f(tool_use_id);
+                for c in content {
+                    c.for_each_str_leaf(f);
+                }
+            }
+            IrBlock::Image { source } => {
+                if let crate::codec::ir::IrImageSource::Url(u) = source {
+                    f(u);
+                }
+            }
+        }
+    }
+
+    fn for_each_str_leaf_mut(&mut self, f: &mut impl FnMut(&mut String)) {
+        match self {
+            IrBlock::Text { text } => f(text),
+            IrBlock::ToolUse { id, name, input } => {
+                f(id);
+                f(name);
+                input.for_each_str_leaf_mut(f);
+            }
+            IrBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => {
+                f(tool_use_id);
+                for c in content.iter_mut() {
+                    c.for_each_str_leaf_mut(f);
+                }
+            }
+            IrBlock::Image { source } => {
+                if let crate::codec::ir::IrImageSource::Url(u) = source {
+                    f(u);
+                }
+            }
+        }
+    }
+}
+
+impl StringLeafOps for IrTool {
+    fn for_each_str_leaf(&self, f: &mut impl FnMut(&str)) {
+        let IrTool {
+            name,
+            description,
+            input_schema,
+        } = self;
+        f(name);
+        if let Some(d) = description {
+            f(d);
+        }
+        input_schema.for_each_str_leaf(f);
+    }
+
+    fn for_each_str_leaf_mut(&mut self, f: &mut impl FnMut(&mut String)) {
+        let IrTool {
+            name,
+            description,
+            input_schema,
+        } = self;
+        f(name);
+        if let Some(d) = description {
+            f(d);
+        }
+        input_schema.for_each_str_leaf_mut(f);
+    }
+}
+
+impl StringLeafOps for IrRequest {
+    fn for_each_str_leaf(&self, f: &mut impl FnMut(&str)) {
+        for block in &self.system {
+            block.for_each_str_leaf(f);
+        }
+        for msg in &self.messages {
+            for block in &msg.content {
+                block.for_each_str_leaf(f);
+            }
+        }
+        for tool in &self.tools {
+            tool.for_each_str_leaf(f);
+        }
+        for s in &self.stop {
+            f(s);
+        }
+        if let Some(u) = &self.user {
+            f(u);
+        }
+        // extra 是 Map<String, Value>, 遍历所有 Value 的字符串叶子
+        // (与原 value_contains(&Value::Object(extra.clone())) 等价, 避免 clone).
+        for v in self.extra.values() {
+            v.for_each_str_leaf(f);
+        }
+    }
+
+    fn for_each_str_leaf_mut(&mut self, f: &mut impl FnMut(&mut String)) {
+        for block in &mut self.system {
+            block.for_each_str_leaf_mut(f);
+        }
+        for msg in &mut self.messages {
+            for block in &mut msg.content {
+                block.for_each_str_leaf_mut(f);
+            }
+        }
+        for tool in &mut self.tools {
+            tool.for_each_str_leaf_mut(f);
+        }
+        for s in &mut self.stop {
+            f(s);
+        }
+        if let Some(u) = &mut self.user {
+            f(u);
+        }
+        for v in self.extra.values_mut() {
+            v.for_each_str_leaf_mut(f);
+        }
+    }
+}
+
+impl StringLeafOps for IrResponse {
+    fn for_each_str_leaf(&self, f: &mut impl FnMut(&str)) {
+        if let Some(s) = &self.stop_sequence {
+            f(s);
+        }
+        for block in &self.content {
+            block.for_each_str_leaf(f);
+        }
+    }
+
+    fn for_each_str_leaf_mut(&mut self, f: &mut impl FnMut(&mut String)) {
+        if let Some(s) = &mut self.stop_sequence {
+            f(s);
+        }
+        for block in &mut self.content {
+            block.for_each_str_leaf_mut(f);
+        }
+    }
+}
 
 /// IR 中是否出现 needle (在字符串字段中).
 ///
@@ -480,26 +688,13 @@ fn ir_request_contains(ir: &IrRequest, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
     }
-    for block in &ir.system {
-        if block_contains(block, needle) {
-            return true;
+    let mut found = false;
+    ir.for_each_str_leaf(&mut |s| {
+        if s.contains(needle) {
+            found = true;
         }
-    }
-    for msg in &ir.messages {
-        for block in &msg.content {
-            if block_contains(block, needle) {
-                return true;
-            }
-        }
-    }
-    for tool in &ir.tools {
-        if tool_contains(tool, needle) {
-            return true;
-        }
-    }
-    ir.stop.iter().any(|s| s.contains(needle))
-        || ir.user.as_ref().is_some_and(|u| u.contains(needle))
-        || value_contains(&serde_json::Value::Object(ir.extra.clone()), needle)
+    });
+    found
 }
 
 /// IR 中所有字符串字段把 `from` 全部替换为 `to`.
@@ -507,176 +702,7 @@ fn ir_request_replace_all(ir: &mut IrRequest, from: &str, to: &str) {
     if from.is_empty() {
         return;
     }
-    for block in &mut ir.system {
-        block_replace_all(block, from, to);
-    }
-    for msg in &mut ir.messages {
-        for block in &mut msg.content {
-            block_replace_all(block, from, to);
-        }
-    }
-    for tool in &mut ir.tools {
-        tool_replace_all(tool, from, to);
-    }
-    for s in &mut ir.stop {
-        replace_in_place(s, from, to);
-    }
-    if let Some(u) = &mut ir.user {
-        replace_in_place(u, from, to);
-    }
-    // extra 是 Map<String, Value>, 遍历所有 Value 的字符串叶子.
-    for v in ir.extra.values_mut() {
-        value_replace_all(v, from, to);
-    }
-}
-
-/// IrBlock 是否含 needle.
-fn block_contains(b: &IrBlock, needle: &str) -> bool {
-    match b {
-        IrBlock::Text { text } => text.contains(needle),
-        IrBlock::ToolUse { id, name, input } => {
-            id.contains(needle) || name.contains(needle) || value_contains(input, needle)
-        }
-        IrBlock::ToolResult {
-            tool_use_id,
-            content,
-            ..
-        } => tool_use_id.contains(needle) || content.iter().any(|c| block_contains(c, needle)),
-        IrBlock::Image { source } => image_source_contains(source, needle),
-    }
-}
-
-/// IrBlock 字符串字段替换.
-fn block_replace_all(b: &mut IrBlock, from: &str, to: &str) {
-    match b {
-        IrBlock::Text { text } => replace_in_place(text, from, to),
-        IrBlock::ToolUse { id, name, input } => {
-            replace_in_place(id, from, to);
-            replace_in_place(name, from, to);
-            value_replace_all(input, from, to);
-        }
-        IrBlock::ToolResult {
-            tool_use_id,
-            content,
-            ..
-        } => {
-            replace_in_place(tool_use_id, from, to);
-            for c in content.iter_mut() {
-                block_replace_all(c, from, to);
-            }
-        }
-        IrBlock::Image { source } => image_source_replace(source, from, to),
-    }
-}
-
-/// IrBlock 字符串字段 restore (反向 redact).
-fn restore_block(b: &mut IrBlock, map: &RedactionMap) {
-    match b {
-        IrBlock::Text { text } => restore_str(text, map),
-        IrBlock::ToolUse { id, name, input } => {
-            restore_str(id, map);
-            restore_str(name, map);
-            value_restore(input, map);
-        }
-        IrBlock::ToolResult {
-            tool_use_id,
-            content,
-            ..
-        } => {
-            restore_str(tool_use_id, map);
-            for c in content.iter_mut() {
-                restore_block(c, map);
-            }
-        }
-        IrBlock::Image { source } => image_source_restore(source, map),
-    }
-}
-
-/// IrTool 是否含 needle (name / description / input_schema 字符串叶子).
-fn tool_contains(tool: &IrTool, needle: &str) -> bool {
-    tool.name.contains(needle)
-        || tool
-            .description
-            .as_ref()
-            .is_some_and(|d| d.contains(needle))
-        || value_contains(&tool.input_schema, needle)
-}
-
-/// IrTool 字符串字段替换.
-fn tool_replace_all(tool: &mut IrTool, from: &str, to: &str) {
-    replace_in_place(&mut tool.name, from, to);
-    if let Some(desc) = &mut tool.description {
-        replace_in_place(desc, from, to);
-    }
-    value_replace_all(&mut tool.input_schema, from, to);
-}
-
-/// IrImageSource 是否含 needle (仅 URL 形式可能含 ASCII secret; base64 一般不含).
-fn image_source_contains(src: &crate::codec::ir::IrImageSource, needle: &str) -> bool {
-    match src {
-        crate::codec::ir::IrImageSource::Url(u) => u.contains(needle),
-        _ => false,
-    }
-}
-
-/// IrImageSource 字符串字段替换.
-fn image_source_replace(src: &mut crate::codec::ir::IrImageSource, from: &str, to: &str) {
-    if let crate::codec::ir::IrImageSource::Url(u) = src {
-        replace_in_place(u, from, to);
-    }
-}
-
-/// IrImageSource 字符串字段 restore.
-fn image_source_restore(src: &mut crate::codec::ir::IrImageSource, map: &RedactionMap) {
-    if let crate::codec::ir::IrImageSource::Url(u) = src {
-        restore_str(u, map);
-    }
-}
-
-/// JSON Value 是否含 needle (仅检查字符串叶子).
-fn value_contains(v: &serde_json::Value, needle: &str) -> bool {
-    match v {
-        serde_json::Value::String(s) => s.contains(needle),
-        serde_json::Value::Array(arr) => arr.iter().any(|e| value_contains(e, needle)),
-        serde_json::Value::Object(obj) => obj.values().any(|e| value_contains(e, needle)),
-        _ => false,
-    }
-}
-
-/// JSON Value 字符串叶子替换.
-fn value_replace_all(v: &mut serde_json::Value, from: &str, to: &str) {
-    match v {
-        serde_json::Value::String(s) => replace_in_place(s, from, to),
-        serde_json::Value::Array(arr) => {
-            for e in arr.iter_mut() {
-                value_replace_all(e, from, to);
-            }
-        }
-        serde_json::Value::Object(obj) => {
-            for e in obj.values_mut() {
-                value_replace_all(e, from, to);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// JSON Value 字符串叶子 restore.
-fn value_restore(v: &mut serde_json::Value, map: &RedactionMap) {
-    match v {
-        serde_json::Value::String(s) => restore_str(s, map),
-        serde_json::Value::Array(arr) => {
-            for e in arr.iter_mut() {
-                value_restore(e, map);
-            }
-        }
-        serde_json::Value::Object(obj) => {
-            for e in obj.values_mut() {
-                value_restore(e, map);
-            }
-        }
-        _ => {}
-    }
+    ir.for_each_str_leaf_mut(&mut |s| replace_in_place(s, from, to));
 }
 
 /// 在 s 中替换所有 from 出现为 to.
@@ -904,6 +930,73 @@ mod tests {
             _ => panic!("expected Text"),
         };
         assert_eq!(restored_text, text, "round-trip must restore original text");
+    }
+
+    /// 结构性回归守卫: 每种 IrBlock variant 的字符串叶子都必须被 StringLeafOps 覆盖.
+    ///
+    /// 这是 StringLeafOps trait 重构的配套测试: 新增 IrBlock variant 时, 若忘记在
+    /// `for_each_str_leaf` / `for_each_str_leaf_mut` 的 match 中处理, 此测试会失败.
+    /// 每种 variant 构造一个含 marker 的实例, 验证 contains 能找到, replace 能改掉.
+    #[test]
+    fn string_leaf_ops_covers_all_ir_block_variants() {
+        use crate::codec::ir::{IrBlock, IrImageSource};
+        use serde_json::json;
+
+        // marker 作为 "secret", 注入到每种 variant 的至少一个字符串叶子.
+        let marker = "LEAFMARKER";
+        let blocks: Vec<IrBlock> = vec![
+            IrBlock::Text {
+                text: format!("prefix-{marker}-suffix"),
+            },
+            IrBlock::ToolUse {
+                id: format!("call-{marker}"),
+                name: "tool".into(),
+                input: json!({"key": format!("val-{marker}")}),
+            },
+            IrBlock::ToolResult {
+                tool_use_id: format!("call-{marker}"),
+                content: vec![IrBlock::Text {
+                    text: format!("nested-{marker}"),
+                }],
+                is_error: false,
+            },
+            IrBlock::Image {
+                source: IrImageSource::Url(format!("https://example.com/{marker}.png")),
+            },
+            // Base64 image source: 不含 secret (与非 Url 变体的扫描语义一致), 跳过 marker 注入.
+            IrBlock::Image {
+                source: IrImageSource::Base64 {
+                    media_type: "image/png".into(),
+                    data: "iVBOR".into(),
+                },
+            },
+        ];
+
+        for (i, block) in blocks.iter().take(4).enumerate() {
+            // 不可变遍历: marker 必须被发现 (前 4 个 block 含 marker).
+            let mut found = false;
+            block.for_each_str_leaf(&mut |s| {
+                if s.contains(marker) {
+                    found = true;
+                }
+            });
+            assert!(found, "block #{i} leaf not visited by for_each_str_leaf");
+
+            // 可变遍历: replace marker → REPLACED.
+            let mut b = block.clone();
+            b.for_each_str_leaf_mut(&mut |s| {
+                if s.contains(marker) {
+                    *s = s.replace(marker, "REPLACED");
+                }
+            });
+            let mut still_has = false;
+            b.for_each_str_leaf(&mut |s| {
+                if s.contains(marker) {
+                    still_has = true;
+                }
+            });
+            assert!(!still_has, "block #{i} still contains marker after replace");
+        }
     }
 
     // ─── 行为测试 ──────────────────────────────────────────────────────────
