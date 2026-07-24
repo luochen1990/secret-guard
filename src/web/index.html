@@ -3,7 +3,7 @@
   secret-guard 单页 WebUI (IM 风格: 会话折叠 sidebar + timeline 对话流).
   内嵌 CSS + vanilla JS, 零外部依赖.
 
-  渲染契约 (sidebar 分组 / 三级小圆点 / info+raw 按钮 / response 单气泡 / 三段式 fingerprint 等)
+  渲染契约 (sidebar 分组 / 三级小圆点 / info+raw 按钮 / response 单气泡含子区域 / 三段式 fingerprint 等)
   与前端不变量 I1/I2 见 src/web/AGENTS.md 与根目录 AGENTS.md.
   回归守卫: tests/webui/im-ui.spec.ts.
 -->
@@ -476,6 +476,23 @@
     .bubble-tool       { background: #f0f0f0; font-family: ui-monospace, monospace; font-size: 11.5px; }
     .bubble-system     { background: #fff8e0; border: 1px dashed #ec5; max-width: 100%; }
 
+    /* assistant 气泡内的 tool_call 子区域: 一条 response 的 message 可能同时含
+       content 文本和 tool_calls 数组 (OpenAI) 或 content 数组中的 tool_use block
+       (Anthropic). 数据模型上它们是同一条 message, 所以渲染在同一个气泡里,
+       但 tool_call/tool_use 段用子区域做视觉区分 (边框 + 缩进 + monospace). */
+    .bubble-tool-call {
+      margin-top: 6px;
+      padding: 4px 6px;
+      border: 1px solid #b0c8e8;
+      border-radius: 4px;
+      background: rgba(255,255,255,0.5);
+      font-family: ui-monospace, monospace;
+      font-size: 11px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .bubble-tool-call:first-child { margin-top: 0; }
+
     /* 三级展示的折叠 / 展开态.
        DOM 结构: .chat-bubble (定位上下文 + 溢出裁切) > .bubble-content (实际文本 + 滚动)
        + .bubble-actions (浮层, toggle / view-full 按钮, 不随 content 滚动).
@@ -703,7 +720,7 @@
     }
     .session-item:hover { background: #f0f0f0; }
     .session-item.active { background: #d0e7ff; }
-    .session-item .ri-icon { grid-area: icon; }
+    .session-item .ri-icon { grid-area: icon; display: flex; align-items: center; gap: 3px; }
     .session-item .ri-right {
       grid-area: right;
       display: flex;
@@ -887,11 +904,15 @@
       padding: 4px 12px 4px;
       max-height: none;
     }
-    /* response-pane 在 timeline 内仍固定高度 + 独立滚动 (IM 打字框语义). */
+    /* response-pane 在 timeline 内固定底部 (sticky), 模拟 IM 打字框. */
     .tl-round .response-pane {
-      margin: 0 12px 8px;
+      position: sticky;
+      bottom: 0;
+      margin: 0 12px;
       border-radius: 4px;
       border: 1px solid #e0e0e0;
+      background: #fafafa;
+      z-index: 5;
     }
     /* detail-header 在 timeline 顶部 sticky, 滚动时仍可见标题 + view toggle. */
     #detail > .detail-header {
@@ -1189,24 +1210,30 @@
       }
     }
 
-    // 刷新当前 timeline 最近 N 轮 (parsed_response 由 timeline API 直接携带,
-    // 无需 N+1 拉 /records/{id}). 只刷新 timeline 中最末几轮 (最近的活动), 不动已加载的历史.
+    // 刷新当前 timeline 最近 N 轮 + 同步 sidebar 轮次缓存 (三级圆点实时更新).
+    // 单次 fetch (limit=ROUNDS_PAGE) 同时服务 timeline tail 和 sessionRounds,
+    // 避免重复请求 (S2 fix).
     async function refreshTimelineTail() {
       if (timelineRecords.length === 0) return;
-      // 通过 selectedSession 找到当前 leaf_id (可能因 fork 而变).
       const sess = sessionsList.find(s => s.session_id === selectedSession);
       if (!sess) return;
-      const r = await fetch(`${API_NODES}/${sess.leaf_id}/timeline?limit=${TIMELINE_PAGE}`, { cache: 'no-store' });
+      const r = await fetch(`${API_NODES}/${sess.leaf_id}/timeline?limit=${ROUNDS_PAGE}`, { cache: 'no-store' });
       if (!r.ok) return;
       const data = await r.json();
-      const tailRecords = data.records || [];
-      if (tailRecords.length === 0) return;
-      // 用最新拉的 tailRecords 替换 timeline 中最末 TIMELINE_PAGE 轮 (id 匹配).
+      const allRounds = data.records || [];
+      if (allRounds.length === 0) return;
+      // timeline tail: 用最近 TIMELINE_PAGE 条替换 (保持已加载的历史).
+      const tailRecords = allRounds.slice(-TIMELINE_PAGE);
       const tailIds = new Set(tailRecords.map(x => x.id));
       const kept = timelineRecords.filter(r => !tailIds.has(r.id));
       timelineRecords = kept.concat(tailRecords);
       timelineOldest = timelineRecords.length > 0 ? timelineRecords[0].id : null;
       renderTimeline();
+      // sidebar: 用完整轮次列表更新 sessionRounds (仅展开时).
+      if (expandedSessions.has(selectedSession)) {
+        sessionRounds.set(selectedSession, allRounds);
+        renderRounds(selectedSession);
+      }
     }
 
     // header count: 显示当前 filter 维度的会话总数.
@@ -1288,7 +1315,7 @@
         ].join('\n');
         return `
           <div class="session-item ${isActive ? 'active' : ''} ${isExpanded ? 'expanded' : ''}" data-sid="${escapeHtml(s.session_id)}" title="${escapeHtml(title)}">
-            <span class="caret"></span>
+            <span class="ri-icon">${iconHtml}<span class="caret"></span></span>
             <span class="ri-line1" title="${escapeHtml(preview)}">${escapeHtml(preview)}</span>
             <span class="ri-right">
               ${countBadge}
@@ -1871,7 +1898,7 @@
     // 有源气泡 (非 assistant): 本轮首次引入的 message (system / user / tool_result),
     //   持有 node 上下文, 可被 selectRound 定位 + 展示富信息.
     // 无源气泡 (assistant): 前序轮 response 的历史副本, 纯展示.
-    //   text + tool_calls 合并为单个 assistant 气泡 (与 response 侧一致).
+    //   text 一个气泡 + 每个 tool_call 各自气泡 (tool_call 是独立语义动作).
     //
     // fallback: 若 req_delta_messages 为空, 用 preview 渲染单个 user 气泡.
     function renderRequestDelta(r, redactions) {
@@ -1991,60 +2018,62 @@
       return `tool_use ${block.id || ''}\nname: ${block.name || ''}\ninput: ${safeJsonStringify(block.input)}`;
     }
 
-    // 把若干文本片段合并为单个 assistant 气泡; parts 为空时返回 empty fallback.
-    // assistant 气泡始终合并 (text + tool_calls/tool_use 不拆分), 因为一个 session
-    // 只有一个 active response → 一个气泡.
-    function renderAssistantBubble(parts, redactions, empty) {
-      return parts.length > 0
-        ? renderBubble('assistant', parts.join('\n\n'), redactions, 'assistant')
-        : (empty || '');
-    }
-
     // 把一条 message 渲染为气泡.
-    // assistant: text + tool_calls 合并为单个 assistant 气泡.
-    // 其他 role (system/user/tool): 独立气泡 (有源 vs 无源区分).
+    // 数据模型: 一条 message 在 messages 数组中是一项. 进入下一轮时仍是 messages 中的一项.
+    // 渲染策略: 尊重数据模型 — assistant 气泡合并 (text + tool_calls 在同一个气泡里),
+    //   tool_call 段用 .bubble-tool-call 子区域做视觉区分.
+    // 其他 role (system/user/tool): 纯文本一个气泡.
     function renderMessageBubbles(msg, redactions) {
       const role = msg.role || 'unknown';
       if (role === 'assistant') {
-        const parts = [];
-        const text = messageToText(msg);
-        if (text !== null) parts.push(text);
-        if (Array.isArray(msg.tool_calls)) {
-          for (const tc of msg.tool_calls) parts.push(formatToolCall(tc));
-        }
-        return renderAssistantBubble(parts, redactions);
+        const html = assistantBubbleHtml(msg, redactions);
+        return html ? renderBubbleHtml('assistant', html, 'assistant') : '';
       }
       // 非 assistant: 纯文本气泡.
       const text = messageToText(msg);
       return text !== null ? renderBubble(role, text, redactions, role) : '';
     }
 
+    // 构建 assistant 气泡的内部 HTML: text 段 + 每个 tool_call/tool_use 子区域.
+    // 一条 assistant message 可能同时含 content 文本和 tool_calls (OpenAI) 或
+    // content 数组中的 tool_use block (Anthropic). 合并在同一气泡内.
+    function assistantBubbleHtml(msg, redactions) {
+      const segments = [];
+      const text = messageToText(msg);
+      if (text !== null) {
+        segments.push(applyMockHighlight(escapeHtml(text), redactions));
+      }
+      if (Array.isArray(msg.tool_calls)) {
+        for (const tc of msg.tool_calls) {
+          segments.push(`<div class="bubble-tool-call">${applyMockHighlight(escapeHtml(formatToolCall(tc)), redactions)}</div>`);
+        }
+      }
+      return segments.join('');
+    }
+
     // 从 parsed_response (OpenAI / Anthropic chat JSON) 提取内容, 渲染为单个 assistant 气泡.
+    // 一条 response = 一条 assistant message, 合并在同一气泡内 (text + tool_calls 子区域).
     // redactions 高亮应用到气泡内容.
     function renderResponseText(respJson, redactions) {
       const choice = respJson.choices && respJson.choices[0];
       const openaiMsg = choice && choice.message;
       if (openaiMsg) {
-        // OpenAI: message 含 text content + tool_calls → 合并为单气泡文本.
-        const parts = [];
-        const text = messageToText({ ...openaiMsg, role: 'assistant' });
-        if (text !== null) parts.push(text);
-        if (Array.isArray(openaiMsg.tool_calls)) {
-          for (const tc of openaiMsg.tool_calls) parts.push(formatToolCall(tc));
-        }
-        return renderAssistantBubble(parts, redactions, '<empty>');
+        // OpenAI: message 含 content + tool_calls → 单气泡 + 子区域.
+        const html = assistantBubbleHtml({ ...openaiMsg, role: 'assistant' }, redactions);
+        return html ? renderBubbleHtml('assistant', html, 'assistant') : '<empty>';
       }
       if (Array.isArray(respJson.content)) {
-        // Anthropic: content array (text + tool_use blocks) → 合并为单气泡文本.
-        const parts = [];
+        // Anthropic: content 数组 (text block + tool_use block) → 单气泡 + 子区域.
+        const segments = [];
         for (const block of respJson.content) {
           if (block && block.type === 'text' && typeof block.text === 'string') {
-            parts.push(block.text);
+            segments.push(applyMockHighlight(escapeHtml(block.text), redactions));
           } else if (block && block.type === 'tool_use') {
-            parts.push(formatToolUse(block));
+            segments.push(`<div class="bubble-tool-call">${applyMockHighlight(escapeHtml(formatToolUse(block)), redactions)}</div>`);
           }
         }
-        return renderAssistantBubble(parts, redactions, '<empty>');
+        const html = segments.join('');
+        return html ? renderBubbleHtml('assistant', html, 'assistant') : '<empty>';
       }
       // 未知结构: pretty JSON (无气泡包裹, 纯文本 fallback).
       return escapeHtml(safeJsonStringify(respJson));
@@ -2061,16 +2090,21 @@
       return { cls: 'tool', letter: 'T', label: role || 'tool' };
     }
 
+    // renderBubble: 纯文本内容 (自动 escape + mock 高亮).
     function renderBubble(cls, text, redactions, roleLabel) {
+      const safeText = applyMockHighlight(escapeHtml(text), redactions);
+      return renderBubbleHtml(cls, safeText, roleLabel);
+    }
+
+    // renderBubbleHtml: 预构建 HTML 内容 (调用方负责 escape).
+    // 用于 assistant 气泡内部含 .bubble-tool-call 子区域的场景.
+    function renderBubbleHtml(cls, contentHtml, roleLabel) {
       const role = roleLabel || cls;
       const meta = senderMeta(role);
-      const safeText = applyMockHighlight(escapeHtml(text), redactions);
-      // chat-row 包裹: sender-icon + bubble. user 靠右 (row-reverse).
-      // bubble 内套 .bubble-content (实际文本, 可滚动), 按钮由 JS 注入 .bubble-actions 浮层 (不随滚动).
       return `
         <div class="chat-row row-${meta.cls}">
           <span class="sender-icon s-${meta.cls}" title="${escapeHtml(meta.label)}">${meta.letter}</span>
-          <div class="chat-bubble bubble-${cls}" data-role="${escapeHtml(role)}"><div class="bubble-content">${safeText}</div></div>
+          <div class="chat-bubble bubble-${cls}" data-role="${escapeHtml(role)}"><div class="bubble-content">${contentHtml}</div></div>
         </div>
       `;
     }

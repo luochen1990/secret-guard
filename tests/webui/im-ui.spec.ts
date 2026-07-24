@@ -536,17 +536,29 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     await page.locator("dialog.round-dialog .dialog-close").click();
   });
 
-  test("response 单气泡: text + tool_calls 合并为一个 assistant 气泡", async ({ page }) => {
-    // 模拟 LLM 返回 text + tool_calls 的混合 response.
-    // 通过 mockito 的默认 mock upstream, response 是固定的.
-    // 这里验证: response-pane 内只有 1 个 assistant 气泡.
+  test("response 单气泡: text + tool_calls 在同一气泡内 (子区域区分)", async ({ page }) => {
+    // mock upstream 对 "single-bubble" marker 返回 text + tool_calls 混合 response.
+    // 验证: text 和 tool_call 在同一个气泡里 (.bubble-tool-call 子区域), 不拆分为多个气泡.
     await sendChat(page, [{ role: "user", content: "single-bubble-marker" }]);
     const sid = await findSessionLeafByPreview(page, "single-bubble-marker");
     await clickSessionByLeaf(page, sid);
     await page.waitForTimeout(500);
 
-    // response-pane 内应只有 1 个 chat-bubble (assistant).
+    // response-pane 内应只有 1 个 assistant 气泡 (text + tool_call 合并).
     const respBubbles = page.locator("#detail .response-pane .chat-bubble");
     await expect(respBubbles).toHaveCount(1);
+
+    // 气泡内应有 .bubble-tool-call 子区域 (tool_call 装饰).
+    const toolCallAreas = respBubbles.locator(".bubble-tool-call");
+    await expect(toolCallAreas).toHaveCount(1);
+
+    // 子区域应含 tool_call 格式化文本.
+    const toolCallText = await toolCallAreas.textContent();
+    expect(toolCallText).toContain("lookup");
+
+    // 气泡整体应同时含 text 和 tool_call 内容.
+    const fullText = await respBubbles.textContent();
+    expect(fullText).toContain("Let me check");
+    expect(fullText).toContain("tool_call");
   });
 });

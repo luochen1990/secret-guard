@@ -135,10 +135,12 @@ timeline 每轮 header 含两个按钮:
   `GET /api/records/{id}`). body 是 LLM 视角 (已 redact, 安全展示); headers 已脱敏
   (auth/cookie 等 = `<redacted>`). 流式响应的 resp_body 为空 (不保留 SSE 字节), 显示提示.
 
-### Response 单气泡
+### Response 气泡渲染
 
-一个 session 只有一个 active response → response-pane 内只渲染一个 assistant 气泡
-(text + tool_calls 合并展示, 不拆分为多个分项气泡).
+一条 response 在数据模型上 = messages 数组中的 **一条 assistant message**. 进入下一轮时
+它仍是 messages 中的一项 (不拆分). 前端尊重这个数据模型: text 和 tool_calls/tool_use
+渲染在**同一个气泡**内, tool_call/tool_use 段用 `.bubble-tool-call` 子区域做视觉区分
+(边框 + 缩进 + monospace). 不拆分为多个独立气泡.
 
 ### 其它渲染细节
 
