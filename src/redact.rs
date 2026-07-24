@@ -177,9 +177,20 @@ fn candidate_for(secret: &SecretEntry, seed: u64, counter: u32) -> String {
 
 /// 生成一个在当前 IR 中**未出现**且**未分配过**的 mock.
 ///
+/// 探测上限: 超过此 counter 即判定 IR 对抗性, 返回 Err (降级跳过).
+///
+/// 生产用 2^20 (~1M): 对任何合法 charset/length 都有充裕候选空间, 真实命中耗尽
+/// 极不可能. 测试用更小的值 (512) 以便 `redact_ir_skips_secret_*` 耗尽测试能在毫秒级
+/// 触发 (而非真的循环 1M 次, 覆盖率插桩下会放大数百倍拖垮 CI). 512 对合法多 secret
+/// 场景 (如 c4_injectivity 的 100 secret) 仍有充裕探测空间, 不会误触发降级.
+#[cfg(not(test))]
+const MOCK_PROBE_LIMIT: u32 = 1 << 20;
+#[cfg(test)]
+const MOCK_PROBE_LIMIT: u32 = 512;
+
 /// per-request seed 模型: 所有 secret 共享同一 seed. counter 是 per-secret 的 probing.
 ///
-/// 返回 `Err(RedactError)` 当探测耗尽 (2^20 次仍未找到唯一 mock). 旧实现用 `panic!`,
+/// 返回 `Err(RedactError)` 当探测耗尽 (`MOCK_PROBE_LIMIT` 次仍未找到唯一 mock). 旧实现用 `panic!`,
 /// 消息含 `secret.value` (真实 secret 明文) 与 `secret.mock_strategy`, 可被弱配置 +
 /// 对抗性 IR 触发, 既 DoS 又泄密. 改为 `Result` 后由 [`redact_ir`] 决策降级策略.
 fn gen_mock_for_ir(
@@ -195,7 +206,7 @@ fn gen_mock_for_ir(
             return Ok(candidate);
         }
         counter += 1;
-        if counter > (1u32 << 20) {
+        if counter > MOCK_PROBE_LIMIT {
             return Err(RedactError {
                 secret_id: secret.id.clone(),
                 reason: RedactReason::ProbingExhausted,

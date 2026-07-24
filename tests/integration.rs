@@ -3417,3 +3417,110 @@ async fn concurrent_forward_requests_all_recorded() {
         list.len()
     );
 }
+
+// ─── 安全回归测试 (PR: fix secret leakage in panic/log paths) ──────────────
+
+#[tokio::test]
+async fn streaming_redact_non_2xx_upstream_error_falls_back_gracefully() {
+    // 锁定已知限制 (AGENTS.md "已知限制"):
+    //   "流式 + Redact + 非 2xx 上游错误: SSE 错误流不是单个 JSON, parse 失败时 fallback
+    //    原样返回 (无 restore), 客户端可能看到 mock."
+    // 该路径是唯一会让 mock 泄露给客户端的场景. 此测试锁定当前行为 (不崩溃 + 行为可预测),
+    // 让未来改动 (eg 接入 StreamTranslate 跨协议错误翻译) 有人发现.
+    //
+    // 不修复 mock 泄露 (那是已知限制, 需更大重构), 只确保:
+    //   (a) 客户端不 panic;
+    //   (b) 客户端收到上游 500 状态 + body (含 mock, 文档化的降级行为).
+    let real_secret = "sk-test-123";
+    let expected_mock = predict_mock(real_secret);
+    let mut upstream = spawn_mock_upstream().await;
+    // 上游返回 500 + SSE 错误流 (不是单个 JSON). body 含 mock (模拟 LLM echo 了 mock).
+    let sse_body = format!(
+        concat!(
+            "data: {{\"error\":{{\"message\":\"internal failure, saw {mock}\"}}}}\n\n",
+            "data: [DONE]\n\n",
+        ),
+        mock = expected_mock,
+    );
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(500)
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse_body)
+        .create_async()
+        .await;
+    let entries = vec![secret("api-key", real_secret)];
+    let secrets = test_secret_table_with(entries);
+    let upstream_client = reqwest::Client::new();
+    let records = ConversationDag::new(64, 500, 1);
+    let provider = openai_provider("oa-main", &upstream.url());
+    let proxy_url = spawn_proxy_full(vec![provider], upstream_client, records, secrets).await;
+
+    let body = format!(
+        r#"{{"model":"gpt-4o","stream":true,"messages":[{{"role":"user","content":"use {real_secret}"}}]}}"#
+    );
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/o/oa-main/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    // (a) 不 panic (resp 成功拿到). 状态透传上游 500.
+    assert_eq!(resp.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+    let text = resp.text().await.unwrap();
+    // (b) 文档化降级行为: parse 失败 → 原样返回上游字节 (含 mock). 这是已知限制, 不是 bug.
+    //     断言 mock 出现在客户端响应 (锁定当前行为); 未来若修复了 restore, 此断言需更新.
+    assert!(
+        text.contains(&expected_mock),
+        "known limitation: client sees mock on non-2xx SSE fallback; got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn gemini_provider_with_secrets_forwards_unredacted() {
+    // 锁定已知限制 (AGENTS.md "已知限制" + "后续工作"):
+    //   Gemini/Ollama 协议 codec 未覆盖, same_proto_passthrough 字节透传, 不做 redact.
+    // 用户为 Gemini provider 配置了 secret 时, secret 原样转发到上游 (静默失效风险).
+    // 此测试用 match_body 严格锁定: 上游 mock 收到的请求 body 含**原始 secret**.
+    //
+    // 未来接入 Gemini codec 后, secret 会被 redact 成 mock, 此 mock (匹配原始 secret) 不再命中,
+    // 测试会失败 — 提醒维护者更新断言为 "上游收到 mock". 这是预期的演化路径.
+    let real_secret = "sk-gemini-secret-DO-NOT-LEAK";
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", mockito::Matcher::Any)
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "contents": [{"parts": [{"text": format!("use {real_secret} now")}]}]
+        })))
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+    let entries = vec![secret("api-key", real_secret)];
+    let secrets = test_secret_table_with(entries);
+    let upstream_client = reqwest::Client::new();
+    let records = ConversationDag::new(64, 500, 1);
+    let provider = provider_with("gem-main", Protocol::Gemini, &upstream.url());
+    let proxy_url = spawn_proxy_full(vec![provider], upstream_client, records, secrets).await;
+
+    // Gemini 风格请求 body 含 secret.
+    let body = format!(r#"{{"contents":[{{"parts":[{{"text":"use {real_secret} now"}}]}}]}}"#);
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "{proxy_url}/g/gem-main/v1beta/models/gemini-pro:generateContent"
+        ))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    // proxy 不崩溃 + 上游 mock 命中 (证明 body 含原始 secret, 未被 redact).
+    // 若 mock 未命中, mockito 返回 5xx, 此断言失败.
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "Gemini passthrough must hit upstream mock (body contains real secret)"
+    );
+    let _ = resp.text().await.unwrap();
+}
