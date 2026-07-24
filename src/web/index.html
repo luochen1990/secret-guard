@@ -942,11 +942,12 @@
 
     /* ─── Response 抽屉 (issue #36): 跟随选中气泡的动态高度窗口 ──────────────
        抽屉是 #detail-wrap 的 column-flex 子元素 (#detail 的兄弟, 下方分栏).
-       高度 (height) 由 JS 根据选中气泡在视口中的位置动态计算:
-         - 选中气泡下边缘在视口中部 → 抽屉占 30% (默认).
-         - 气泡往上滚出视口 → 抽屉收缩, 最小 10%.
-         - 气泡往下进入视口 → 抽屉扩大, 最大 40%.
-         - 滚到最底 (最近 round 下端高于抽屉上端) → 抽屉持续打开, 最大 80%.
+       高度 (height) 由 JS 根据选中气泡在 wrap 坐标系中的位置动态计算 (详尽逻辑见
+       updateResponseDrawerLayout 头部注释):
+         - 选中瞬间: 气泡下边缘对齐 30% 抽屉上边缘.
+         - 往上滚 (气泡下移) → 抽屉收缩, 最小 10%.
+         - 往下滚 (气泡上移) → 抽屉扩大, 最大 40%.
+         - 滚到最底 → 抽屉扩展到 80%.
        上下分栏 (flex column) 让抽屉不遮挡对话内容. */
     .response-drawer {
       flex: none;  /* 高度由 JS 设置, 不参与 flex 分配 */
@@ -1554,17 +1555,38 @@
     // 持续高亮由 .selected 类 (renderTimelineRound 根据 selectedRound 渲染) 提供;
     // 这里只负责把视窗滚到该轮, 并附加一闪而过的 .flash 动画作为选中瞬间反馈.
     // 同时刷新 Response 抽屉内容 (选中轮改变 → response 跟着变) (issue #36).
+    //
+    // 滚动定位 (issue #36 规则1): 选中后气泡下边缘对齐 30% 抽屉的上边缘 (= wrapH * 0.7).
+    // 不用 scrollIntoView (它的 block:center/end 基于当前 detail 可视区, 而 detail 可视区
+    // 高度依赖 drawerH, 不可靠). 手动算 scrollTop 使气泡下边缘落在 wrapH * 0.7 处.
+    //
+    // 假设: #detail 紧贴 #detail-wrap 顶端 (wrap 无 padding, detail 是首子 → detail.top == wrap.top).
+    // 若未来 wrap 内加入顶部元素, 需改用 detail.top - wrap.top 偏移修正.
     function highlightRound(nodeId) {
       const el = document.querySelector(`#detail .tl-round[data-rid="${CSS.escape(nodeId)}"]`);
       if (!el) return;
-      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      // 先刷新抽屉内容 (选中轮改变 → response 跟着变).
+      updateResponseDrawerContent();
+      // 计算目标 scrollTop: 气泡下边缘对齐 30% 抽屉上边缘 (= wrapH - defaultH - GAP).
+      // (减 GAP 与 updateResponseDrawerLayout 阶段1 公式一致, 避免落定后微调抖动.)
+      const detail = document.getElementById('detail');
+      const wrap = document.getElementById('detail-wrap');
+      if (detail && wrap) {
+        const bottomVp = selectedBubbleBottomVp();
+        if (bottomVp !== null) {
+          // 气泡下边缘在 #detail 内容坐标系中的 y (= 视口 y - detail 视口 top + scrollTop).
+          const bubbleBottomInContent = bottomVp - detail.getBoundingClientRect().top + detail.scrollTop;
+          const targetBubbleBottomInWrap = wrap.clientHeight - wrap.clientHeight * DRAWER_DEFAULT_RATIO - DRAWER_GAP;
+          const targetScrollTop = bubbleBottomInContent - targetBubbleBottomInWrap;
+          detail.scrollTo({ top: Math.max(0, targetScrollTop), behavior: 'smooth' });
+        }
+      }
       // 清除所有已存在的 .flash, 再给目标轮次加上 (重新触发动画).
       document.querySelectorAll('#detail .tl-round.flash').forEach(n => n.classList.remove('flash'));
       // 强制 reflow 以重新触发动画.
       void el.offsetWidth;
       el.classList.add('flash');
-      // 刷新抽屉内容 + 布局 (scrollIntoView 的平滑滚动过程中 scroll 事件会持续更新布局).
-      updateResponseDrawerContent();
+      // 平滑滚动过程中 scroll 事件会持续更新抽屉布局; 这里立即刷一次作为初始状态.
       updateResponseDrawerLayout();
     }
 
@@ -2022,14 +2044,25 @@
 
     // ─── Response 抽屉 (issue #36) ──────────────────────────────────────────
     //
-    // 抽屉展示「当前选中轮次」的 response. 其上边缘对齐选中气泡的下边缘,
-    // 高度随选中气泡在视口中的位置 + 滚动状态动态调整 (10%~80%).
+    // 抽屉展示「当前选中轮次」的 response. 其上边缘跟随选中气泡的下边缘,
+    // 高度随选中气泡在 wrap 坐标系中的位置 + 滚动状态动态调整 (10%~80%).
     //
     // 逻辑分两步:
     //   1. updateResponseDrawerContent(): 填充抽屉内容 (选中轮次的 response).
-    //   2. updateResponseDrawerLayout():  计算抽屉的 top + height (跟随选中气泡).
+    //   2. updateResponseDrawerLayout():  计算抽屉的 height (跟随选中气泡).
     //
     // 触发时机: renderTimeline (全量重建) / scroll / selectRound / window resize.
+
+    // 返回选中轮最后一条气泡下边缘的视口 y; 无选中轮 / 不在 DOM / 无气泡时返回 null.
+    // (highlightRound 和 updateResponseDrawerLayout 共用, 保证两处位置判断一致.)
+    function selectedBubbleBottomVp() {
+      if (!selectedRound) return null;
+      const round = document.querySelector(
+        `#detail .tl-round[data-rid="${CSS.escape(selectedRound)}"]`);
+      if (!round) return null;
+      const bubbles = round.querySelectorAll('.request-pane .chat-bubble');
+      return bubbles.length ? bubbles[bubbles.length - 1].getBoundingClientRect().bottom : null;
+    }
 
     // 填充抽屉内容: 展示末轮的 response.
     // 后端 timeline 只在末轮保留 parsed_response (issue #28 Phase A: 非末轮 response
@@ -2052,18 +2085,31 @@
       if (statusEl) statusEl.innerHTML = renderStatusLine(target);
     }
 
-    // 计算抽屉的 height, 使其上边缘对齐选中气泡的下边缘.
+    // 计算抽屉的 height, 使其上边缘跟随选中气泡的下边缘.
     //
-    // 抽屉与 #detail 上下分栏 (flex column). 抽屉高度基于 #detail-wrap (article) 总高度.
-    // 目标: 选中气泡的下边缘 ≈ #detail 底部 ≈ 抽屉上边缘.
-    // 即: #detail 高度 = 选中气泡下边缘在视口中的 y 坐标, 抽屉高度 = wrapH - 该 y.
+    // 布局: #detail-wrap (wrapH, 固定) 内 column-flex 分两栏:
+    //   #detail (flex:1, height = wrapH - drawerH, 滚动容器)
+    //   .response-drawer (flex:none, height = drawerH)
     //
-    // 边界规则 (issue #36), 抽屉高度 clamp 到 [wrapH 的 10%, 80%]:
-    //   - 选中气泡下边缘在 #detail 可视区下方 (未滚入) → 抽屉 = 默认 30%.
-    //   - 选中气泡下边缘在 #detail 可视区上方 (已滚出) → 抽屉 = 最小 10%.
-    //   - 选中气泡下边缘在 #detail 可视区内 → 抽屉 = wrapH - 气泡下边缘 y, clamp [10%, 40%].
-    //   - 内容可滚动 + 已滚到底, 最近 round 下端高于抽屉上端 → 抽屉扩大, 最大 80%.
+    // 循环依赖陷阱 (本修复的核心问题):
+    //   drawerH 影响 detailH (= wrapH - drawerH), detailH 又被旧代码用于判断气泡是否
+    //   在可视区 → 形成反馈循环 (drawer 变→detailH 变→判断结果变→drawer 变→...).
+    //   修复: 所有位置判断都用 wrap 坐标系 (固定参考), 不依赖 detailH.
+    //
+    // wrap 坐标系 (0 = wrap 顶部, wrapH = wrap 底部, 不随 drawerH 变化):
+    //   bubbleBottomY = 选中气泡下边缘在 wrap 中的 y (随 #detail 的 scrollTop 单调变化)
+    //   drawerTop     = wrapH - drawerH (抽屉上边缘在 wrap 中的 y)
+    //
+    // issue #36 规则 (用 bubbleBottomY 表达):
+    //   1. 选中瞬间: bubbleBottomY ≈ 0.7 * wrapH (气泡贴底, 下边缘对齐 30% 抽屉的上边缘).
+    //   2. 往上滚 (scrollTop↓, bubbleBottomY↑, 气泡下移): 抽屉随之收缩, 最小 10%.
+    //   3. 往下滚 (scrollTop↑, bubbleBottomY↓, 气泡上移): 抽屉随之扩大, 最大 40%.
+    //      → drawerH = wrapH - bubbleBottomY - GAP, clamp [minH, maxH].
+    //   4. 滚到最底: 抽屉直接扩展到 80% (下方无更多内容, 空间让给 response).
+    //
+    // 边界 clamp 值 (全部相对 wrapH):
     const DRAWER_GAP = 8;       // 气泡下边缘与抽屉上边缘的间距 (px).
+    const DRAWER_SCROLL_TOLERANCE = 2; // 阶段2 atBottom 判断的 scrollTop 容差 (px).
     const DRAWER_MIN_RATIO = 0.10;
     const DRAWER_DEFAULT_RATIO = 0.30;
     const DRAWER_MAX_RATIO = 0.40;
@@ -2076,56 +2122,41 @@
       if (!wrap || !detail || !drawer || drawer.hidden) return;
       const wrapH = wrap.clientHeight;
       if (wrapH === 0) return;
+      const wrapTop = wrap.getBoundingClientRect().top;
       const minH = wrapH * DRAWER_MIN_RATIO;
       const defaultH = wrapH * DRAWER_DEFAULT_RATIO;
       const maxH = wrapH * DRAWER_MAX_RATIO;
       const extremeMaxH = wrapH * DRAWER_EXTREME_MAX_RATIO;
 
-      // 找选中气泡 (选中轮的最后一个气泡 = request-pane 的最后一个 chat-bubble).
-      const selRound = document.querySelector(`#detail .tl-round[data-rid="${CSS.escape(selectedRound || '')}"]`);
-      let bubbleBottomInViewport = null; // 气泡下边缘相对 #detail 可视区的 y (0 = #detail 顶部).
-      if (selRound) {
-        const bubbles = selRound.querySelectorAll('.request-pane .chat-bubble');
-        if (bubbles.length > 0) {
-          const lastBubble = bubbles[bubbles.length - 1];
-          bubbleBottomInViewport = lastBubble.getBoundingClientRect().bottom - detail.getBoundingClientRect().top;
-        }
-      }
+      // 选中气泡下边缘在 wrap 坐标系中的 y.
+      const bottomVp = selectedBubbleBottomVp();
+      const bubbleBottomY = bottomVp === null ? null : bottomVp - wrapTop;
 
-      const detailH = detail.clientHeight;
-      let drawerHeight;
-      if (bubbleBottomInViewport === null) {
-        // 选中轮不在当前 timeline (极端), 默认.
-        drawerHeight = defaultH;
-      } else if (bubbleBottomInViewport >= detailH) {
-        // 气泡在 #detail 可视区下方 (未滚入) → 默认高度.
-        drawerHeight = defaultH;
-      } else if (bubbleBottomInViewport <= 0) {
-        // 气泡已滚出 #detail 可视区顶部 → 最小高度.
-        drawerHeight = minH;
-      } else {
-        // 气泡在 #detail 可视区内 → 抽屉 = wrapH - (气泡 y + gap), clamp [minH, maxH].
-        // 注意: 这里基于 wrapH 而非 detailH, 因为抽屉高度是相对整个窗口的.
-        drawerHeight = Math.max(minH, Math.min(maxH, wrapH - bubbleBottomInViewport - DRAWER_GAP));
-      }
+      // 阶段 1: 基础高度 (跟随选中气泡, 不考虑极端扩展).
+      // bubbleBottomY 为 null (选中轮不在 timeline) → 默认; 否则 wrapH - y - GAP, clamp [minH, maxH].
+      //   - y 大 (气泡靠下/往下滚出) → wrapH - y 小 → 抽屉收缩 (规则 2).
+      //   - y 小 (气泡靠上/往上滚出) → wrapH - y 大 → 抽屉扩大, 但 clamp 到 maxH (规则 3).
+      let drawerHeight = bubbleBottomY === null
+        ? defaultH
+        : Math.max(minH, Math.min(maxH, wrapH - bubbleBottomY - DRAWER_GAP));
 
-      // 极端情况: 内容可滚动 且 已滚到最底端, 最近 round (末轮) 下端在 #detail 可视区
-      // 高于抽屉上端 (y 更小) → 抽屉可继续向下打开, 最大 80%.
-      const contentScrollable = detail.scrollHeight > detail.clientHeight + 2;
-      const atBottom = contentScrollable && detail.scrollTop + detail.clientHeight >= detail.scrollHeight - 2;
-      if (atBottom) {
-        const lastRound = timelineRecords.length > 0
-          ? document.querySelector(`#detail .tl-round[data-rid="${CSS.escape(timelineRecords[timelineRecords.length - 1].id)}"]`)
-          : null;
-        if (lastRound) {
-          const lastBottomInViewport = lastRound.getBoundingClientRect().bottom - detail.getBoundingClientRect().top;
-          const drawerTopInViewport = detailH - drawerHeight; // 抽屉上端在 detail 坐标系中的 y (近似).
-          // 最近 round 下端高于 (y 更小) 抽屉上端 → 随最近 round 下端持续向上打开.
-          if (lastBottomInViewport < drawerTopInViewport) {
-            const gap = drawerTopInViewport - lastBottomInViewport;
-            drawerHeight = Math.min(extremeMaxH, drawerHeight + gap);
-          }
-        }
+      // 阶段 2: 极端扩展 (规则 4).
+      // 条件: 已滚到最底端 → 抽屉扩展到 extremeMaxH (80%).
+      //
+      // 循环依赖规避: atBottom 判断 (scrollTop + clientHeight >= scrollHeight) 中,
+      // clientHeight 随 drawerH 变化 (drawerH 大 → clientHeight 小 → 更容易 atBottom).
+      // 直接用会导致振荡 (扩展→clientHeight 变小→atBottom→扩展→...). 规避方法:
+      // 用"基准 detailH" (= wrapH - maxH, 即抽屉 40% 时的 detail 高度) 计算 maxScroll,
+      // 使 atBottom 判断不受当前 drawerH 影响.
+      //
+      // 多帧收敛 (scrollbar 瞬移场景): 若用户直接把 scrollbar 拖到底 (drawerH 此时可能还是
+      // 10%), 实际 scrollTop 被 clamp 到 10% 时的 maxScroll (< refMaxScroll) → phase 2 不触发.
+      // 但 phase 1 会把 drawerH 拉到 40% → detailH 缩 → maxScroll 增大 → 浏览器重发 scroll 事件
+      // → scrollTop 到达 refMaxScroll → phase 2 触发. 整个过程 2~3 帧内收敛.
+      const refMaxScroll = detail.scrollHeight - (wrapH - maxH);
+      if (detail.scrollHeight > wrapH - maxH + DRAWER_SCROLL_TOLERANCE &&
+          detail.scrollTop >= refMaxScroll - DRAWER_SCROLL_TOLERANCE) {
+        drawerHeight = extremeMaxH;
       }
 
       drawer.style.height = drawerHeight + 'px';
@@ -2140,20 +2171,30 @@
 
     // 绑定 timeline 容器的滚动事件 (检测到顶 → loadOlder; 更新悬浮按钮可见性).
     // 只绑定一次: flag 防止每次 renderTimeline(true) 累加新 listener.
+    //
+    // 性能: updateResponseDrawerLayout 内有多次 getBoundingClientRect (强制 layout),
+    // 若每个 scroll 事件都同步执行, 快速滚动时会连续触发 forced reflow → jank.
+    // 用 RAF 合并: 一帧内多次 scroll 事件只执行一次 layout 计算.
+    // loadOlder 的到顶检测保留同步 (响应性优先, 且只是简单的 scrollTop 读取).
     let scrollBound = false;
+    let scrollRaf = 0;
     function bindTimelineScroll() {
       const el = document.getElementById('detail');
       if (!el || scrollBound) return;
       scrollBound = true;
       el.addEventListener('scroll', () => {
-        // 到顶触发 loadOlder.
+        // 到顶触发 loadOlder (同步, 保证响应性).
         if (el.scrollTop < 10 && !timelineReachedTop && !loadingOlder) {
           loadOlder();
         }
-        // 滚动时抽屉跟随选中气泡重新计算布局 (issue #36).
-        updateResponseDrawerLayout();
-        updateScrollNavVisibility();
-      });
+        // 抽屉布局 + 悬浮按钮: RAF 合并, 避免快速滚动时连续 forced reflow.
+        if (scrollRaf) return;
+        scrollRaf = requestAnimationFrame(() => {
+          scrollRaf = 0;
+          updateResponseDrawerLayout();
+          updateScrollNavVisibility();
+        });
+      }, { passive: true });
       updateResponseDrawerLayout();
       updateScrollNavVisibility();
     }
