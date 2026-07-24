@@ -155,36 +155,33 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     expect(userText).toContain("three-tier-test-marker");
   });
 
-  test("需求 3: response 打字框固定底部 + 独立滚动", async ({ page }) => {
+  test("需求 3: response 抽屉固定底部 + 独立滚动", async ({ page }) => {
     await sendChat(page, [{ role: "user", content: "give me a long response" }]);
 
     const leaf = await findSessionLeafByPreview(page, "give me a long response");
     await clickSessionByLeaf(page, leaf);
     await page.waitForTimeout(500);
 
-    // timeline 每轮都有 request-pane + response-pane.
+    // timeline 有 request-pane; response 在独立抽屉 (.response-drawer, issue #36).
     await expect(page.locator("#detail .request-pane")).toHaveCount(1);
-    await expect(page.locator("#detail .response-pane")).toHaveCount(1);
+    const drawer = page.locator("#detail-wrap .response-drawer");
+    await expect(drawer).toHaveCount(1);
+    await expect(drawer).not.toHaveAttribute("hidden", "");
 
-    // response-pane 应该是固定高度 (~10 行 ≈ 200px).
-    const respH = await page
-      .locator("#detail .response-pane")
-      .evaluate((el) => el.clientHeight);
-    expect(respH).toBeGreaterThan(150);
-    expect(respH).toBeLessThan(280);
+    // 抽屉应该有可见高度 (相对窗口 10%~80%).
+    const respH = await drawer.evaluate((el) => el.clientHeight);
+    expect(respH).toBeGreaterThan(100);
 
     // response 内容应该非空.
-    const respText = await page.locator("#detail .resp-body").textContent();
+    const respText = await drawer.locator(".resp-body").textContent();
     expect(respText!.length).toBeGreaterThan(10);
 
-    // 滚动 #detail (timeline 容器) 不应该影响 response-pane 的 scrollTop.
+    // 滚动 #detail (timeline 容器) 不应该影响抽屉的 scrollTop (抽屉是兄弟元素, 独立滚动).
     await page
       .locator("#detail")
       .evaluate((el) => (el.scrollTop = 50));
     await page.waitForTimeout(200);
-    const respScroll = await page
-      .locator("#detail .response-pane")
-      .evaluate((el) => el.scrollTop);
+    const respScroll = await drawer.locator(".resp-body").evaluate((el) => el.scrollTop);
     expect(respScroll).toBe(0);
   });
 
@@ -211,8 +208,8 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
       { role: "user", content: "final-long-response-marker" },
     ]);
 
-    // preview = 最后一条 user msg.
-    const leaf = await findSessionLeafByPreview(page, "final-long-response-marker");
+    // session title = 第一轮的首条 user msg (issue #36: 取最早 round, 非 leaf).
+    const leaf = await findSessionLeafByPreview(page, "first long response question");
     await clickSessionByLeaf(page, leaf);
     await page.waitForTimeout(500);
 
@@ -244,8 +241,8 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
   });
 
   test("需求 4: 选中会话时 timeline 初始滚到底", async ({ page }) => {
-    // 复用上一个测试创建的多轮对话会话 (preview = 最后一条 user msg).
-    const leaf = await findSessionLeafByPreview(page, "final-long-response-marker");
+    // 复用上一个测试创建的多轮对话会话 (title = 第一轮首条 user msg, issue #36).
+    const leaf = await findSessionLeafByPreview(page, "first long response question");
     // 重新点击会话 (先折叠再展开) 触发 timeline 重新加载 + 初始滚到底.
     await clickSessionByLeaf(page, leaf);
     await page.waitForTimeout(500);
@@ -416,16 +413,17 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
       { role: "user", content: "phaseA-round2-marker" },
     ]);
 
-    // 找到该会话 (preview = 最后一条 = round2 user).
-    const sid = await findSessionLeafByPreview(page, "phaseA-round2-marker");
+    // 找到该会话 (session title = 第一轮首条 user msg, issue #36).
+    const sid = await findSessionLeafByPreview(page, "phaseA-round1-marker");
     await clickSessionByLeaf(page, sid);
     await page.waitForTimeout(500);
 
     // 应有 2 个 tl-round.
     await expect(page.locator("#detail .tl-round")).toHaveCount(2);
 
-    // 只有 1 个 response-pane (末轮).
-    await expect(page.locator("#detail .response-pane")).toHaveCount(1);
+    // response 在独立抽屉里 (issue #36), 不再内嵌轮次. 抽屉恰好 1 个.
+    await expect(page.locator("#detail .response-pane")).toHaveCount(0);
+    await expect(page.locator("#detail-wrap .response-drawer")).toHaveCount(1);
 
     // delta 里的 assistant 气泡 (轮1的 response 被轮2 delta 引用).
     const assistantBubbles = page.locator(
@@ -493,20 +491,17 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     await expect(page.locator(".sub-dot.active")).toHaveCount(1);
   });
 
-  // ─── "已经到顶了" 提示: 短会话首次加载不应显示 ──────────────────────────────
+  // ─── "已经到顶了" 提示已移除 (issue #36) ──────────────────────────────────
   //
-  // 验证 Bug 修复: 之前 loadTimeline 在 records.length < limit 时直接置
-  // timelineReachedTop=true, 导致短会话 (< 10 轮) 首屏即显示 "已经到顶了".
-  // 修复后: 只有用户实际滚顶触发 loadOlder 探测后才可能置 true.
-  test("短会话首屏不显示 \"已经到顶了\"", async ({ page }) => {
-    // 单轮会话.
-    await sendChat(page, [{ role: "user", content: "top-hint-single-marker" }]);
-    const sid = await findSessionLeafByPreview(page, "top-hint-single-marker");
+  // 验证: 该提示始终无法正确判断显示条件, 直接去掉. 现在页面不应有任何 tl-top-hint 元素.
+  test("issue #36: \"已经到顶了\" 提示已移除", async ({ page }) => {
+    await sendChat(page, [{ role: "user", content: "top-hint-removed-marker" }]);
+    const sid = await findSessionLeafByPreview(page, "top-hint-removed-marker");
     await clickSessionByLeaf(page, sid);
     await page.waitForTimeout(500);
 
-    const hint = page.locator(".tl-top-hint");
-    await expect(hint).toHaveText(/向上滚动加载更早的轮次/);
+    // 不应有任何 tl-top-hint 元素 (提示已完全移除).
+    await expect(page.locator(".tl-top-hint")).toHaveCount(0);
   });
 
   // ─── Raw view 恢复 + Info icon + Response 单气泡 ──────────────────────────
@@ -563,8 +558,8 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     await clickSessionByLeaf(page, sid);
     await page.waitForTimeout(500);
 
-    // response-pane 内应只有 1 个 assistant 气泡 (text + tool_call 合并).
-    const respBubbles = page.locator("#detail .response-pane .chat-bubble");
+    // response 抽屉内应只有 1 个 assistant 气泡 (text + tool_call 合并). (issue #36: 抽屉在 #detail-wrap)
+    const respBubbles = page.locator("#detail-wrap .response-drawer .chat-bubble");
     await expect(respBubbles).toHaveCount(1);
 
     // 气泡内应有 .bubble-tool-call 子区域 (tool_call 装饰).

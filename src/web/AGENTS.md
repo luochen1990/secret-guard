@@ -95,11 +95,13 @@ timeline 返回的 N 个节点中, 只有最末节点 (timeline anchor) 保留 `
 ### Sessions / Timeline (会话折叠 WebUI)
 
 - sidebar 一级 (会话) 来自 `GET /api/sessions` (返回叶子节点 + record_count + latest 字段).
+  **session title** (preview 字段) 取自**会话最早 round (根 node) 的首条 user msg**
+  (push 时一次性从根 node 的 preview 提取, 存 Session.title; 之后 leaf 前移不更新).
+  见 issue #36: 旧实现取 leaf.event.preview (最新轮), 多轮对话中标题随每轮新问题漂移.
 - 二级 (轮次列表) 与右侧 timeline 对话流来自 `GET /api/nodes/{id}/timeline?limit=N`
   (沿 parent 链向上取 N 个祖先, oldest-first).
 - timeline 惰性加载: 滚到顶时以最老 node 的 parent 为新起点 prepend 更早 N 轮 (保持滚动锚点).
-- `timelineReachedTop` 仅在用户实际滚顶触发 `loadOlder` 探测后置位 (而非初次加载时从
-  `records.length < limit` 推断), 避免短会话首屏即显示 "已经到顶了".
+- **"已经到顶了" 提示已移除** (issue #36): 该提示的显示条件始终无法正确判断, 直接去掉.
 
 ### ForwardRecord.redactions
 
@@ -142,11 +144,27 @@ timeline 每轮 header 含两个按钮:
 渲染在**同一个气泡**内, tool_call/tool_use 段用 `.bubble-tool-call` 子区域做视觉区分
 (边框 + 缩进 + monospace). 不拆分为多个独立气泡.
 
+### Response 抽屉 (issue #36)
+
+Response 不再内嵌在轮次内, 而是独立的 `.response-drawer` (位于 `#detail-wrap` 的
+flex column 子元素, 与 `#detail` 上下分栏). 抽屉始终展示末轮的 response (尚未被任何
+delta 消费的部分). 其高度由 JS 根据选中气泡在视口中的位置动态计算:
+- 选中气泡下边缘在视口中部 → 抽屉占窗口 30% (默认).
+- 气泡往上滚出视口 → 抽屉收缩, 最小 10%.
+- 气泡往下进入视口 → 抽屉扩大, 最大 40%.
+- 内容可滚动 + 已滚到底 → 抽屉持续打开, 最大 80%.
+抽屉与 `#detail` 分栏不遮挡对话内容.
+
+### 选中态高亮 (issue #36)
+
+选中轮次 (来自 sidebar 点击或 timeline header 点击) 持续高亮 (`.tl-round.selected`,
+背景色 + 左侧色条), 不是一闪而过的动画. 选中瞬间叠加一次 `.flash` 闪烁动画作为反馈.
+
 ### 其它渲染细节
 
 - 三段式 fingerprint: 自动刷新期间 request-pane 滚动位置 + bubble 展开状态保持.
 - 三级展示气泡 (折叠 → 展开 → 弹框全文).
-- response 打字框布局 (固定底部, 独立滚动).
+- 悬浮导航按钮 (回到顶部/底部): 固定在对话框窗口右侧, 不随内容滚动 (issue #36).
 - 气泡颜色 + sender icon 分类.
 - 气泡间微小间距 (margin-bottom, 避免视觉粘连).
 - tool name 推断: `toolNameOfRound` (假设 tool_calls 含 function.name; 降级 fallback 到 `'?'`).

@@ -826,13 +826,20 @@
     .sub-dot.active { outline: 1.5px solid #4a6fa5; outline-offset: 1px; }
 
     /* ─── timeline 顶/底悬浮按钮 ─────────────────────────────────────────── */
+    /* 按钮固定在对话框窗口 (article 可视区) 右侧, 不随 #detail 内容滚动.
+       实现方式: .scroll-nav 是 article 的直接子元素 (#detail 的兄弟, 不在滚动容器内),
+       用 position: absolute 相对 article (position: relative) 定位.
+       issue #36: 旧实现把 .scroll-nav 放在 #detail 内部 + position: absolute,
+       导致它跟随 #detail 内容滚动, 滚动后按钮消失. */
     .scroll-nav {
       position: absolute;
       right: 16px;
+      top: 12px;
       bottom: 16px;
       display: flex;
       flex-direction: column;
-      gap: 6px;
+      justify-content: space-between;
+      pointer-events: none;
       z-index: 10;
     }
     .scroll-nav button {
@@ -849,6 +856,7 @@
       align-items: center;
       justify-content: center;
       box-shadow: 0 1px 4px rgba(0,0,0,0.15);
+      pointer-events: auto;
     }
     .scroll-nav button:hover { background: #eee; }
     .scroll-nav button[hidden] { display: none; }
@@ -884,7 +892,15 @@
       line-height: 1;
     }
     .tl-round-header .tl-actions button:hover { background: #e0e0e0; color: #555; }
-    .tl-round.highlight {
+    /* 选中态高亮: 持续的背景色 (不是一闪而过的动画). 见 issue #36 "当前选中的 Round".
+       .tl-round.selected = 当前选中轮次 (来自 selectedRound 状态); 持续高亮.
+       .tl-round.flash = 选中瞬间的闪烁动画 (selectRound / 点击圆点时叠加一次). */
+    .tl-round.selected {
+      background: #fff8d6;
+      /* 左侧细色条强化选中态 (与 sidebar active 视觉呼应). */
+      box-shadow: inset 3px 0 0 #d4a017;
+    }
+    .tl-round.flash {
       animation: tl-flash 1.2s ease-out;
     }
     @keyframes tl-flash {
@@ -896,7 +912,16 @@
        旧布局: #detail { display: flex; flex-direction: column; } + request-pane { flex:1; overflow-y: auto }
        新布局 (timeline): #detail 整体可滚动 (块级), 每个 .tl-round 自然排列,
        .tl-round 内的 .request-pane 不滚动 (自然高度), .response-pane 保持固定高度 + 独立滚动.
-       通过 .tl-round 作用域覆盖旧规则, 不破坏单 record 的旧 CSS (虽然不再用到). */
+       通过 .tl-round 作用域覆盖旧规则, 不破坏单 record 的旧 CSS (虽然不再用到).
+
+       DOM 层级 (issue #36): article#detail-wrap (flex:1, position:relative 作为
+       .scroll-nav 的定位上下文) 内部 column-flex 分栏:
+         #detail (flex:1, 滚动容器, 上方对话区)
+         .response-drawer (flex:none, 下方 response 抽屉, 高度由 JS 动态设置)
+         .scroll-nav (absolute, 不随 #detail 内容滚动)
+       上下分栏让抽屉不遮挡对话内容. */
+    #detail-wrap { display: flex; flex-direction: column; min-height: 0; position: relative; }
+    #detail-wrap > #detail { flex: 1; min-width: 0; min-height: 0; }
     #detail { display: block; overflow-y: auto; }
     .tl-round .request-pane {
       flex: none;
@@ -913,6 +938,47 @@
       border: 1px solid #e0e0e0;
       background: #fafafa;
       z-index: 5;
+    }
+
+    /* ─── Response 抽屉 (issue #36): 跟随选中气泡的动态高度窗口 ──────────────
+       抽屉是 #detail-wrap 的 column-flex 子元素 (#detail 的兄弟, 下方分栏).
+       高度 (height) 由 JS 根据选中气泡在视口中的位置动态计算:
+         - 选中气泡下边缘在视口中部 → 抽屉占 30% (默认).
+         - 气泡往上滚出视口 → 抽屉收缩, 最小 10%.
+         - 气泡往下进入视口 → 抽屉扩大, 最大 40%.
+         - 滚到最底 (最近 round 下端高于抽屉上端) → 抽屉持续打开, 最大 80%.
+       上下分栏 (flex column) 让抽屉不遮挡对话内容. */
+    .response-drawer {
+      flex: none;  /* 高度由 JS 设置, 不参与 flex 分配 */
+      background: #fafafa;
+      border-top: 1px solid #ddd;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      overflow: hidden;
+    }
+    .response-drawer .resp-header {
+      padding: 4px 12px;
+      font-size: 11px;
+      color: #666;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      border-bottom: 1px solid #eee;
+      flex-shrink: 0;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .response-drawer .resp-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 8px 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12.5px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+      min-height: 0;
     }
     /* detail-header 在 timeline 顶部 sticky, 滚动时仍可见标题 + view toggle. */
     #detail > .detail-header {
@@ -948,7 +1014,18 @@
         </div>
         <div id="record-list"><div class="empty">No sessions yet</div></div>
       </aside>
-      <article id="detail" style="position: relative;"><div class="empty">Select a session on the left</div></article>
+      <article id="detail-wrap" style="position: relative;">
+        <div id="detail"><div class="empty">Select a session on the left</div></div>
+        <!-- Response 抽屉 + 悬浮导航: 都是 detail 的兄弟元素, 不随 #detail 内容滚动 (issue #36). -->
+        <div class="response-drawer" id="response-drawer" hidden>
+          <div class="resp-header"><span class="resp-title">Response</span><span class="resp-status"></span></div>
+          <div class="resp-body"></div>
+        </div>
+        <div class="scroll-nav" id="scroll-nav" hidden>
+          <button type="button" id="scroll-top-btn" title="回到顶部" onclick="scrollTimelineToTop()">↑</button>
+          <button type="button" id="scroll-bottom-btn" title="回到底部" onclick="scrollTimelineToBottom()">↓</button>
+        </div>
+      </article>
     </section>
     <section id="tab-secrets" class="tab-content">
       <div class="secrets-main">
@@ -1473,15 +1550,22 @@
       await loadTimeline(nodeId);
     }
 
-    // 高亮 timeline 中某轮 (滚动 + 闪烁动画).
+    // 高亮 timeline 中某轮 (滚动到位 + 叠加一次闪烁动画).
+    // 持续高亮由 .selected 类 (renderTimelineRound 根据 selectedRound 渲染) 提供;
+    // 这里只负责把视窗滚到该轮, 并附加一闪而过的 .flash 动画作为选中瞬间反馈.
+    // 同时刷新 Response 抽屉内容 (选中轮改变 → response 跟着变) (issue #36).
     function highlightRound(nodeId) {
       const el = document.querySelector(`#detail .tl-round[data-rid="${CSS.escape(nodeId)}"]`);
       if (!el) return;
       el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      el.classList.remove('highlight');
+      // 清除所有已存在的 .flash, 再给目标轮次加上 (重新触发动画).
+      document.querySelectorAll('#detail .tl-round.flash').forEach(n => n.classList.remove('flash'));
       // 强制 reflow 以重新触发动画.
       void el.offsetWidth;
-      el.classList.add('highlight');
+      el.classList.add('flash');
+      // 刷新抽屉内容 + 布局 (scrollIntoView 的平滑滚动过程中 scroll 事件会持续更新布局).
+      updateResponseDrawerContent();
+      updateResponseDrawerLayout();
     }
 
     // session 摘要的 status 辅助 (与 record 的 statusText/statusClass 类似但字段不同:
@@ -1631,6 +1715,8 @@
         scrollTimelineToBottomForce();
       } catch (e) {
         console.error(e);
+        // 错误时也清理抽屉/导航 (避免残留旧会话内容).
+        clearTimeline();
         document.getElementById('detail').innerHTML =
           `<div class="empty status-err">Failed to load timeline: ${escapeHtml(e.message)}</div>`;
       }
@@ -1645,6 +1731,11 @@
       lastTimelineFingerprint = '';
       document.getElementById('detail').innerHTML =
         '<div class="empty">Select a session on the left</div>';
+      // 清空时隐藏悬浮导航按钮 + Response 抽屉.
+      const nav = document.getElementById('scroll-nav');
+      if (nav) nav.hidden = true;
+      const drawer = document.getElementById('response-drawer');
+      if (drawer) drawer.hidden = true;
     }
 
     // 惰性加载: 向上滚到顶时 prepend 更早的轮次. 保持滚动锚点.
@@ -1660,7 +1751,6 @@
         const r = await fetch(`${API_NODES}/${timelineOldest}/timeline?limit=${TIMELINE_PAGE + 1}`, { cache: 'no-store' });
         if (!r.ok) {
           timelineReachedTop = true;
-          updateReachedTopHint();
           return;
         }
         const data = await r.json();
@@ -1671,7 +1761,6 @@
         // (注意即使 older 为空, 也用 all.length <= TIMELINE_PAGE 判断, 避免 limit=1 的边界).
         timelineReachedTop = all.length <= TIMELINE_PAGE;
         if (older.length === 0) {
-          updateReachedTopHint();
           return;
         }
         // prepend: 把 older 放到 timelineRecords 前面.
@@ -1715,6 +1804,9 @@
       bindTimelineScroll();
       bindRoundActions();
       applyBubbleCollapse();
+      // 填充 Response 抽屉内容 + 计算布局 (issue #36).
+      updateResponseDrawerContent();
+      updateResponseDrawerLayout();
       // 滚动由调用方决定 (loadTimeline 滚到底, loadOlder 保持锚点).
       // 这里仅在首次渲染 (selectedRound 在末尾) 时作为保底滚到底.
     }
@@ -1725,18 +1817,29 @@
       if (el) el.scrollTop = el.scrollHeight;
     }
 
-    // 绑定每轮的 info / raw 按钮的事件委托 (挂在稳定的 #detail 上, 全量重建后无需重绑).
+    // 绑定每轮的 info / raw 按钮 + 轮次选中 的事件委托 (挂在稳定的 #detail 上, 全量重建后无需重绑).
     function bindRoundActions() {
       const detail = document.getElementById('detail');
       if (!detail || detail.dataset.roundActionsBound) return;
       detail.dataset.roundActionsBound = '1';
       detail.addEventListener('click', (ev) => {
+        // 1. info / raw 按钮 (优先处理, 阻止冒泡).
         const btn = ev.target.closest('.tl-actions button[data-action]');
-        if (!btn) return;
-        ev.stopPropagation();
-        const { action, rid } = btn.dataset;
-        if (action === 'info') openRoundInfo(rid);
-        else if (action === 'raw') openRoundRaw(rid);
+        if (btn) {
+          ev.stopPropagation();
+          const { action, rid } = btn.dataset;
+          if (action === 'info') openRoundInfo(rid);
+          else if (action === 'raw') openRoundRaw(rid);
+          return;
+        }
+        // 2. 点击轮次 header 区域 → 选中该轮 (issue #36: 选中气泡/轮次设置全局高亮状态).
+        //    不在气泡内容上触发 (避免与气泡折叠/展开/全文冲突), 仅 header 区域可选.
+        const header = ev.target.closest('.tl-round-header');
+        if (header) {
+          const round = header.closest('.tl-round');
+          const rid = round?.dataset.rid;
+          if (rid) selectRound(rid);
+        }
       });
     }
 
@@ -1840,35 +1943,26 @@
     }
 
     // 渲染整个 timeline 的 HTML (每轮 = request bubble + response 打字框).
+    // 注意: 悬浮导航按钮 (.scroll-nav) 不在此处渲染 — 它是 #detail-wrap 的固定子元素
+    // (article 的直接子, #detail 的兄弟), 不随 #detail 内容滚动 (issue #36).
     function renderTimelineHtml() {
       let html = `<div class="detail-header">
-        <h3>Timeline <span class="meta" style="font-weight:normal;">(${timelineRecords.length} rounds)</span></h3>`;
-      if (timelineReachedTop) {
-        html += `<div class="tl-top-hint" style="font-size:11px;">已经到顶了</div>`;
-      } else {
-        html += `<div class="tl-top-hint" style="font-size:11px;">向上滚动加载更早的轮次</div>`;
-      }
-      html += `</div>`;
+        <h3>Timeline <span class="meta" style="font-weight:normal;">(${timelineRecords.length} rounds)</span></h3>
+      </div>`;
       // 每轮.
       html += timelineRecords.map((r, idx) => renderTimelineRound(r, idx, idx === timelineRecords.length - 1)).join('');
-      // 悬浮导航按钮.
-      html += `
-        <div class="scroll-nav">
-          <button type="button" id="scroll-top-btn" title="回到顶部" onclick="scrollTimelineToTop()">↑</button>
-          <button type="button" id="scroll-bottom-btn" title="回到底部" onclick="scrollTimelineToBottom()">↓</button>
-        </div>
-      `;
       return html;
     }
 
-    // 渲染单轮 (request delta bubbles + 末轮 response).
+    // 渲染单轮 (request delta bubbles).
     //
     // 每轮渲染完整 delta (含 assistant, 作为无源气泡).
-    // 只有 timeline 最末轮才渲染 response-pane: 非末轮的 response 内容已被下一轮
-    // delta 的 assistant message 包含, 传输是冗余 (issue #28 Phase A).
+    // Response 不再内嵌在轮次里 — 它由独立的 .response-drawer (issue #36) 展示,
+    // 抽屉跟随选中气泡动态调整高度. 见 updateResponseDrawer().
     function renderTimelineRound(r, idx, isLast) {
       const num = idx + 1;
-      const roundCls = (r.id === selectedRound) ? 'tl-round highlight' : 'tl-round';
+      // 选中态用 .selected (持续高亮); 闪烁动画 .flash 由 highlightRound() 在选中瞬间叠加.
+      const roundCls = (r.id === selectedRound) ? 'tl-round selected' : 'tl-round';
       let inner = '';
       // header.
       inner += `<div class="tl-round-header">
@@ -1889,13 +1983,6 @@
       const redactions = normalizeRedactions(r.redactions);
       inner += renderRequestDelta(r, redactions);
       inner += `</div>`;
-      // response-pane: 只有末轮渲染 (非末轮 response 已在下一轮 delta 中).
-      if (isLast) {
-        inner += `<div class="response-pane" data-rid="${escapeHtml(r.id)}">`;
-        inner += `<div class="resp-header"><span>Response</span><span class="resp-status">${renderStatusLine(r)}</span></div>`;
-        inner += `<div class="resp-body">${renderTimelineResponseBody(r)}</div>`;
-        inner += `</div>`;
-      }
       return `<div class="${roundCls}" data-rid="${escapeHtml(r.id)}">${inner}</div>`;
     }
 
@@ -1933,28 +2020,122 @@
       return '<empty>';
     }
 
-    // 增量更新末轮 response body (自动刷新, node 序列不变时).
-    // 只有末轮有 response-pane (非末轮 response 已在 delta 中).
-    function updateTimelineResponses() {
-      const last = timelineRecords[timelineRecords.length - 1];
-      if (last) {
-        const bodyEl = document.querySelector(`#detail .response-pane[data-rid="${CSS.escape(last.id)}"] .resp-body`);
-        if (bodyEl) {
-          const newBody = renderTimelineResponseBody(last);
-          if (bodyEl.innerHTML !== newBody) bodyEl.innerHTML = newBody;
-        }
-        const statusEl = document.querySelector(`#detail .response-pane[data-rid="${CSS.escape(last.id)}"] .resp-status`);
-        if (statusEl) statusEl.innerHTML = renderStatusLine(last);
+    // ─── Response 抽屉 (issue #36) ──────────────────────────────────────────
+    //
+    // 抽屉展示「当前选中轮次」的 response. 其上边缘对齐选中气泡的下边缘,
+    // 高度随选中气泡在视口中的位置 + 滚动状态动态调整 (10%~80%).
+    //
+    // 逻辑分两步:
+    //   1. updateResponseDrawerContent(): 填充抽屉内容 (选中轮次的 response).
+    //   2. updateResponseDrawerLayout():  计算抽屉的 top + height (跟随选中气泡).
+    //
+    // 触发时机: renderTimeline (全量重建) / scroll / selectRound / window resize.
+
+    // 填充抽屉内容: 展示末轮的 response.
+    // 后端 timeline 只在末轮保留 parsed_response (issue #28 Phase A: 非末轮 response
+    // 已被下一轮 delta 的 assistant message 包含, 传输冗余). 因此抽屉始终展示末轮
+    // (尚未被任何 delta 消费的部分). 选中轮用于高亮 + 布局跟随, 不改变抽屉内容来源.
+    function updateResponseDrawerContent() {
+      const drawer = document.getElementById('response-drawer');
+      if (!drawer) return;
+      if (timelineRecords.length === 0) {
+        drawer.hidden = true;
+        return;
       }
-      updateScrollNavVisibility();
+      const target = timelineRecords[timelineRecords.length - 1];
+      drawer.hidden = false;
+      drawer.dataset.rid = target.id;
+      const bodyEl = drawer.querySelector('.resp-body');
+      const newBody = renderTimelineResponseBody(target);
+      if (bodyEl && bodyEl.innerHTML !== newBody) bodyEl.innerHTML = newBody;
+      const statusEl = drawer.querySelector('.resp-status');
+      if (statusEl) statusEl.innerHTML = renderStatusLine(target);
     }
 
-    // 更新 "已经到顶了" 提示 (loadOlder 后调用).
-    function updateReachedTopHint() {
-      const hint = document.querySelector('#detail .tl-top-hint');
-      if (hint) {
-        hint.textContent = timelineReachedTop ? '已经到顶了' : '向上滚动加载更早的轮次';
+    // 计算抽屉的 height, 使其上边缘对齐选中气泡的下边缘.
+    //
+    // 抽屉与 #detail 上下分栏 (flex column). 抽屉高度基于 #detail-wrap (article) 总高度.
+    // 目标: 选中气泡的下边缘 ≈ #detail 底部 ≈ 抽屉上边缘.
+    // 即: #detail 高度 = 选中气泡下边缘在视口中的 y 坐标, 抽屉高度 = wrapH - 该 y.
+    //
+    // 边界规则 (issue #36), 抽屉高度 clamp 到 [wrapH 的 10%, 80%]:
+    //   - 选中气泡下边缘在 #detail 可视区下方 (未滚入) → 抽屉 = 默认 30%.
+    //   - 选中气泡下边缘在 #detail 可视区上方 (已滚出) → 抽屉 = 最小 10%.
+    //   - 选中气泡下边缘在 #detail 可视区内 → 抽屉 = wrapH - 气泡下边缘 y, clamp [10%, 40%].
+    //   - 内容可滚动 + 已滚到底, 最近 round 下端高于抽屉上端 → 抽屉扩大, 最大 80%.
+    const DRAWER_GAP = 8;       // 气泡下边缘与抽屉上边缘的间距 (px).
+    const DRAWER_MIN_RATIO = 0.10;
+    const DRAWER_DEFAULT_RATIO = 0.30;
+    const DRAWER_MAX_RATIO = 0.40;
+    const DRAWER_EXTREME_MAX_RATIO = 0.80;
+
+    function updateResponseDrawerLayout() {
+      const wrap = document.getElementById('detail-wrap');
+      const detail = document.getElementById('detail');
+      const drawer = document.getElementById('response-drawer');
+      if (!wrap || !detail || !drawer || drawer.hidden) return;
+      const wrapH = wrap.clientHeight;
+      if (wrapH === 0) return;
+      const minH = wrapH * DRAWER_MIN_RATIO;
+      const defaultH = wrapH * DRAWER_DEFAULT_RATIO;
+      const maxH = wrapH * DRAWER_MAX_RATIO;
+      const extremeMaxH = wrapH * DRAWER_EXTREME_MAX_RATIO;
+
+      // 找选中气泡 (选中轮的最后一个气泡 = request-pane 的最后一个 chat-bubble).
+      const selRound = document.querySelector(`#detail .tl-round[data-rid="${CSS.escape(selectedRound || '')}"]`);
+      let bubbleBottomInViewport = null; // 气泡下边缘相对 #detail 可视区的 y (0 = #detail 顶部).
+      if (selRound) {
+        const bubbles = selRound.querySelectorAll('.request-pane .chat-bubble');
+        if (bubbles.length > 0) {
+          const lastBubble = bubbles[bubbles.length - 1];
+          bubbleBottomInViewport = lastBubble.getBoundingClientRect().bottom - detail.getBoundingClientRect().top;
+        }
       }
+
+      const detailH = detail.clientHeight;
+      let drawerHeight;
+      if (bubbleBottomInViewport === null) {
+        // 选中轮不在当前 timeline (极端), 默认.
+        drawerHeight = defaultH;
+      } else if (bubbleBottomInViewport >= detailH) {
+        // 气泡在 #detail 可视区下方 (未滚入) → 默认高度.
+        drawerHeight = defaultH;
+      } else if (bubbleBottomInViewport <= 0) {
+        // 气泡已滚出 #detail 可视区顶部 → 最小高度.
+        drawerHeight = minH;
+      } else {
+        // 气泡在 #detail 可视区内 → 抽屉 = wrapH - (气泡 y + gap), clamp [minH, maxH].
+        // 注意: 这里基于 wrapH 而非 detailH, 因为抽屉高度是相对整个窗口的.
+        drawerHeight = Math.max(minH, Math.min(maxH, wrapH - bubbleBottomInViewport - DRAWER_GAP));
+      }
+
+      // 极端情况: 内容可滚动 且 已滚到最底端, 最近 round (末轮) 下端在 #detail 可视区
+      // 高于抽屉上端 (y 更小) → 抽屉可继续向下打开, 最大 80%.
+      const contentScrollable = detail.scrollHeight > detail.clientHeight + 2;
+      const atBottom = contentScrollable && detail.scrollTop + detail.clientHeight >= detail.scrollHeight - 2;
+      if (atBottom) {
+        const lastRound = timelineRecords.length > 0
+          ? document.querySelector(`#detail .tl-round[data-rid="${CSS.escape(timelineRecords[timelineRecords.length - 1].id)}"]`)
+          : null;
+        if (lastRound) {
+          const lastBottomInViewport = lastRound.getBoundingClientRect().bottom - detail.getBoundingClientRect().top;
+          const drawerTopInViewport = detailH - drawerHeight; // 抽屉上端在 detail 坐标系中的 y (近似).
+          // 最近 round 下端高于 (y 更小) 抽屉上端 → 随最近 round 下端持续向上打开.
+          if (lastBottomInViewport < drawerTopInViewport) {
+            const gap = drawerTopInViewport - lastBottomInViewport;
+            drawerHeight = Math.min(extremeMaxH, drawerHeight + gap);
+          }
+        }
+      }
+
+      drawer.style.height = drawerHeight + 'px';
+    }
+
+    // 增量更新: 自动刷新时若 node 序列不变, 只刷抽屉内容 (流式渐进) + 重新计算布局.
+    function updateTimelineResponses() {
+      updateResponseDrawerContent();
+      updateResponseDrawerLayout();
+      updateScrollNavVisibility();
     }
 
     // 绑定 timeline 容器的滚动事件 (检测到顶 → loadOlder; 更新悬浮按钮可见性).
@@ -1969,16 +2150,24 @@
         if (el.scrollTop < 10 && !timelineReachedTop && !loadingOlder) {
           loadOlder();
         }
+        // 滚动时抽屉跟随选中气泡重新计算布局 (issue #36).
+        updateResponseDrawerLayout();
         updateScrollNavVisibility();
       });
+      updateResponseDrawerLayout();
       updateScrollNavVisibility();
     }
 
     function updateScrollNavVisibility() {
       const el = document.getElementById('detail');
+      const nav = document.getElementById('scroll-nav');
       const topBtn = document.getElementById('scroll-top-btn');
       const bottomBtn = document.getElementById('scroll-bottom-btn');
       if (!el) return;
+      // 无 timeline 内容时隐藏整个导航.
+      const hasContent = timelineRecords.length > 0;
+      if (nav) nav.hidden = !hasContent;
+      // 各按钮: 在对应方向无可滚动空间时隐藏.
       if (topBtn) topBtn.hidden = el.scrollTop < 20;
       if (bottomBtn) bottomBtn.hidden = (el.scrollHeight - el.scrollTop - el.clientHeight) < 20;
     }
@@ -2785,6 +2974,16 @@
         else refresh();
       }
     }, 3000);
+    // 窗口尺寸变化时重算 Response 抽屉布局 (高度依赖视口尺寸) (issue #36).
+    // 用 requestAnimationFrame 节流, 避免 resize 高频触发 getBoundingClientRect (强制 layout).
+    let resizeRaf = 0;
+    window.addEventListener('resize', () => {
+      if (resizeRaf) return;
+      resizeRaf = requestAnimationFrame(() => {
+        resizeRaf = 0;
+        updateResponseDrawerLayout();
+      });
+    });
   </script>
 </body>
 </html>

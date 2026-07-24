@@ -248,6 +248,11 @@ impl SessionId {
 ///
 /// leaf_id 是游标 (最新轮次), 随新请求前移. root_id 是会话根 (parent=None 的那个).
 /// node_count 由 push/evict 增量维护, 避免每次 list 都走 parent 链.
+///
+/// title 是会话标题 (sidebar 主文本): 取自**会话最早 round 的第一条 user msg**
+/// (push 时一次性从根 node 的 preview 提取), 之后不再随 leaf 前移而更新.
+/// 见 issue #36: 旧实现取 leaf.event.preview (最新轮), 多轮对话中标题随用户每轮
+/// 新问题而漂移, 体验差. 现在写入 session map 的 value, 仅在 session 创建时计算一次.
 #[derive(Debug, Clone)]
 struct Session {
     leaf_id: Uuid,
@@ -255,6 +260,9 @@ struct Session {
     node_count: usize,
     created_at: DateTime<Utc>,
     latest_at: DateTime<Utc>,
+    /// 会话标题 (sidebar 主文本). 仅在 session 创建时从根 node 的 preview 提取,
+    /// 之后不再更新 (即便有新 round 加入). 见上方类型注释.
+    title: Option<String>,
 }
 
 // ─── Node + CallEvent + ResponseMeta ───────────────────────────────────────
@@ -550,11 +558,14 @@ impl ConversationDag {
                 let root_id = lookup.parent.unwrap_or(node_id);
                 // fork 场景: root_id 是 fork 点, 但它的 session_id 是原 session 的.
                 // 对新 session 而言, root_id 仅用于 created_at 查找, 不要求归属一致.
-                let created_at = g
-                    .nodes
-                    .get(&root_id)
-                    .map(|n| n.event.created_at)
-                    .unwrap_or(now);
+                let root_node = g.nodes.get(&root_id);
+                let created_at = root_node.map(|n| n.event.created_at).unwrap_or(now);
+                // 会话标题: 沿 parent 链回溯到真正根 (parent=None 的 node), 取其 preview.
+                // 真正根 = 会话最早的 round, 其 preview = 首条 user msg 截断.
+                // 仅在此处 (session 创建时) 计算一次, 之后 leaf 前移不更新.
+                // 见 Session.title 注释 + issue #36. fork 场景下 root_id (fork 点)
+                // 不等于真正根, 必须 walk 到链首才能拿到正确的首条 user msg.
+                let title = Self::find_root_title(&g, lookup.parent, node_id);
                 g.sessions.insert(
                     sid,
                     Session {
@@ -563,6 +574,7 @@ impl ConversationDag {
                         node_count: 1,
                         created_at,
                         latest_at: now,
+                        title,
                     },
                 );
             }
@@ -578,6 +590,34 @@ impl ConversationDag {
         Self::evict_if_needed(&mut g);
 
         node_id
+    }
+
+    /// 沿 parent 链回溯到真正根 (parent=None 的 node), 返回其 preview 作为会话标题.
+    /// 用于 session 创建时计算 title (issue #36: 取最早 round 的首条 user msg).
+    /// fork 场景下 parent 链可能跨越多个 node, 需走到链首.
+    /// 无 parent (新根) 时用本 node (node_id) 的 preview.
+    fn find_root_title(inner: &DagInner, parent: Option<Uuid>, node_id: Uuid) -> Option<String> {
+        // walk parent 链到链首, 暂存每个 node 的 preview, 循环结束保留最旧的.
+        let mut title = None;
+        let mut cursor = parent;
+        // 安全限位: parent 链长度不会超过 nodes 总数 (DAG 无环).
+        while let Some(pid) = cursor {
+            match inner.nodes.get(&pid) {
+                Some(n) => {
+                    title = n.event.preview.clone();
+                    cursor = n.parent;
+                }
+                None => break,
+            }
+        }
+        // 无 parent (新根, cursor 一次都没进) → 用本 node 的 preview.
+        if title.is_none() {
+            title = inner
+                .nodes
+                .get(&node_id)
+                .and_then(|n| n.event.preview.clone());
+        }
+        title
     }
 
     /// 计算 messages 序列的 Merkle prefix hash 序列, 找到最深匹配的 parent.
@@ -934,7 +974,7 @@ impl ConversationDag {
     }
 
     /// 构造一个 SessionView (从 sessions map 中的 Session 派生).
-    /// 不走 parent 链 — node_count / root_id 在 push 时增量维护.
+    /// 不走 parent 链 — node_count / root_id / title 在 push 时增量维护.
     fn session_view(&self, inner: &DagInner, sid: SessionId, s: &Session) -> Option<SessionView> {
         let leaf = inner.nodes.get(&s.leaf_id)?;
         let resp = leaf.response.read();
@@ -945,7 +985,9 @@ impl ConversationDag {
             record_count: s.node_count,
             created_at: s.created_at,
             latest_at: s.latest_at,
-            preview: leaf.event.preview.clone(),
+            // title 来自 session map (创建时计算, 之后不变), 不再读 leaf.event.preview.
+            // 见 issue #36: 多轮对话中标题应稳定 = 最早 round 的首条 user msg.
+            preview: s.title.clone(),
             model: leaf.event.model.clone(),
             latest_resp_status: leaf.event.resp_status,
             latest_error: resp.as_ref().and_then(|r| r.error.clone()),
