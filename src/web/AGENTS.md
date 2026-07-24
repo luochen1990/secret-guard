@@ -101,6 +101,15 @@ timeline 返回的 N 个节点中, 只有最末节点 (timeline anchor) 保留 `
 - 二级 (轮次列表) 与右侧 timeline 对话流来自 `GET /api/nodes/{id}/timeline?limit=N`
   (沿 parent 链向上取 N 个祖先, oldest-first).
 - timeline 惰性加载: 滚到顶时以最老 node 的 parent 为新起点 prepend 更早 N 轮 (保持滚动锚点).
+- **Timeline 三级渲染策略** (保护 scrollTop + DOM 局部状态):
+  1. fingerprint 一致 (node id 序列不变) → 只刷 response body + header 字段 (流式渐进).
+  2. append-only (旧序列是新序列的前缀) → 只 `insertAdjacentHTML` 追加新轮次 DOM.
+     已有轮次 DOM 不碰, scrollTop + 气泡展开状态自然保留.
+  3. 其它 (force=true / 中间插入删除) → 全量重建 innerHTML, scrollTop 由调用方恢复.
+  > **不变量**: `.tl-round` 的 request-pane 内容 (req_delta_messages / redactions) 在 push 时
+  > 确定后不可变 (见 `dag.rs`). append-only 策略依赖此不变量 — 已有轮次的 request-pane 无需更新.
+  > header 里 response 相关字段 (status/elapsed/streamed) 可变, 由 `updateRoundHeaders()` 定点刷新.
+  > 末轮 response 在独立的 `.response-drawer` 中, 不在 `.tl-round` 内.
 - **"已经到顶了" 提示已移除** (issue #36): 该提示的显示条件始终无法正确判断, 直接去掉.
 
 ### ForwardRecord.redactions

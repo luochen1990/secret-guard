@@ -1861,8 +1861,26 @@
       }
     }
 
-    // 渲染 timeline. force=true 时强制重建结构 (选中新会话 / loadOlder).
-    // 自动刷新时 force=false, 走增量更新 (若 node 序列一致, 只刷 response body).
+    // 渲染 timeline.
+    //
+    // 三级策略 (优先用最小改动, 保护 scrollTop + DOM 局部状态):
+    //   1. fingerprint 一致 (node id 序列 + selectedRound + reachedTop 不变):
+    //      只刷 response body (流式渐进). DOM 结构不动, scrollTop 自然保持.
+    //   2. fingerprint 不一致但满足 append-only 条件 (旧序列是新序列的前缀):
+    //      只 insertAdjacentHTML 追加新轮次的 DOM. 已有轮次不碰, scrollTop + 气泡
+    //      展开/折叠状态全部保留. 这是本策略的核心 (issue: 自动刷新新轮次到来时
+    //      不再全量重建 → 不跳 scrollTop).
+    //   3. 不满足 append-only (序列中间插入/删除, 或 force=true): 全量重建 innerHTML.
+    //      scrollTop 由调用方恢复 (loadTimeline 滚到底, loadOlder 锚点补偿).
+    //
+    // force=true: 用于 loadTimeline (新会话) / loadOlder (prepend 历史), 直接全量重建.
+    // force=false (默认): 自动刷新路径, 依次尝试 1→2→3.
+    //
+    // 为什么 append-only 安全 (不更新已有轮次的 request-pane DOM):
+    //   .tl-round 的 request-pane 内容 (req_delta_messages / redactions 等) 在 push 时
+    //   确定后不可变. header 里的 response 相关字段 (status/elapsed/streamed) 可变
+    //   (push 时为初始值, response 到达后更新), 由 updateRoundHeaders() 定点刷新.
+    //   末轮 response 在独立的 .response-drawer 中, 不在 .tl-round 内.
     function renderTimeline(force) {
       const el = document.getElementById('detail');
       if (timelineRecords.length === 0) {
@@ -1874,12 +1892,22 @@
       const fp = selectedRound + '|' + timelineReachedTop + '|' +
         timelineRecords.map(r => r.id).join(',');
       if (!force && fp === lastTimelineFingerprint) {
-        // 增量更新各轮 response body (流式渐进), 不动 DOM 结构 → scrollTop 保持.
+        // 策略 1: fingerprint 一致 → 只刷 response body (流式渐进).
         updateTimelineResponses();
         return;
       }
       lastTimelineFingerprint = fp;
-      // 全量重建 (结构变化: 新会话 / loadOlder).
+
+      // 策略 2: append-only 增量 (仅 force=false 时尝试).
+      if (!force && tryAppendNewRounds(el)) {
+        updateRoundHeaders();
+        updateResponseDrawerContent();
+        updateResponseDrawerLayout();
+        updateScrollNavVisibility();
+        return;
+      }
+
+      // 策略 3: 全量重建 (force=true 或 append-only 条件不满足).
       el.innerHTML = renderTimelineHtml();
       bindTimelineScroll();
       bindRoundActions();
@@ -1889,6 +1917,85 @@
       updateResponseDrawerLayout();
       // 滚动由调用方决定 (loadTimeline 滚到底, loadOlder 保持锚点).
       // 这里仅在首次渲染 (selectedRound 在末尾) 时作为保底滚到底.
+    }
+
+    // append-only 增量: 检查 DOM 中已有的 .tl-round 序列是否是 timelineRecords 的前缀.
+    // 若是, 只追加新增的轮次; 若不是 (中间有删除/替换), 返回 false 让调用方走全量重建.
+    // 成功追加返回 true, 不满足条件返回 false.
+    function tryAppendNewRounds(container) {
+      const existing = container.querySelectorAll(':scope > .tl-round');
+      if (existing.length === 0) return false; // 无已有轮次 (首次渲染或全空), 走全量.
+      // 已有轮次的 data-rid 序列.
+      const existingIds = Array.from(existing).map(el => el.dataset.rid);
+      // timelineRecords 的 id 序列.
+      const newIds = timelineRecords.map(r => r.id);
+      // append-only 条件: existingIds 是 newIds 的严格前缀 (newIds 比 existingIds 长).
+      if (existingIds.length >= newIds.length) return false;
+      for (let i = 0; i < existingIds.length; i++) {
+        if (existingIds[i] !== newIds[i]) return false; // 中间有不一致, 非纯追加.
+      }
+      // 条件满足: 追加 newIds[existingIds.length .. end].
+      const appendStart = existingIds.length;
+      const html = timelineRecords
+        .slice(appendStart)
+        .map((r, i) => renderTimelineRound(r, appendStart + i))
+        .join('');
+      container.insertAdjacentHTML('beforeend', html);
+      // 只对新追加的轮次绑定折叠 (已有轮次的折叠状态不受影响).
+      const allRounds = container.querySelectorAll(':scope > .tl-round');
+      for (let i = appendStart; i < allRounds.length; i++) {
+        applyBubbleCollapseTo(allRounds[i]);
+      }
+      // 更新 header 的 round count.
+      updateDetailHeader();
+      return true;
+    }
+
+    // 更新 detail-header 的 round count (增量更新时 DOM 结构不变, 只需改文本).
+    function updateDetailHeader() {
+      const header = document.querySelector('#detail > .detail-header .meta');
+      if (header) header.textContent = `(${timelineRecords.length} rounds)`;
+    }
+
+    // applyBubbleCollapse 的单元素版本 (用于增量追加的新轮次).
+    function applyBubbleCollapseTo(scope) {
+      const bubbles = scope.querySelectorAll('.chat-bubble');
+      bubbles.forEach(bubble => {
+        if (bubble.dataset.collapseReady === '1') return;
+        // 先移除 collapsed / expanded 让自然高度可测 (max-height: none 时 == 内容自然高度).
+        bubble.classList.remove('collapsed', 'expanded');
+        const content = bubble.querySelector('.bubble-content');
+        if (!content) { bubble.dataset.collapseReady = '1'; return; } // 防御: 非气泡结构.
+        const style = getComputedStyle(bubble);
+        const fontSize = parseFloat(style.fontSize) || 12.5;
+        const lineHeight = parseFloat(style.lineHeight) || (fontSize * 1.5);
+        const collapseThreshold = lineHeight * 3 + 2;       // 3 行
+        const expandThreshold = lineHeight * EXPAND_THRESHOLD_LINES; // 15 行
+        // 测量内容层的自然高度 (不是外层 bubble, 因为 bubble 的 padding 会膨胀测量值).
+        const naturalHeight = content.scrollHeight;
+        if (naturalHeight <= collapseThreshold) {
+          bubble.dataset.collapseReady = '1';
+          return;
+        }
+        // 默认折叠.
+        bubble.classList.add('collapsed');
+        // 按钮浮层.
+        const actions = document.createElement('div');
+        actions.className = 'bubble-actions';
+        // 折叠 toggle.
+        const toggle = document.createElement('button');
+        toggle.className = 'bubble-toggle';
+        toggle.type = 'button';
+        toggle.textContent = 'expand ▾';
+        toggle.addEventListener('click', () => onBubbleToggle(bubble, toggle, expandThreshold));
+        actions.appendChild(toggle);
+        bubble.appendChild(actions);
+        // 若自然高度超过展开阈值, 标记以便展开时显示 "查看全文".
+        if (naturalHeight > expandThreshold) {
+          bubble.dataset.canViewFull = '1';
+        }
+        bubble.dataset.collapseReady = '1';
+      });
     }
 
     // 显式滚到 timeline 底部 (最新一轮). loadTimeline 完成后调用.
@@ -2030,7 +2137,7 @@
         <h3>Timeline <span class="meta" style="font-weight:normal;">(${timelineRecords.length} rounds)</span></h3>
       </div>`;
       // 每轮.
-      html += timelineRecords.map((r, idx) => renderTimelineRound(r, idx, idx === timelineRecords.length - 1)).join('');
+      html += timelineRecords.map((r, idx) => renderTimelineRound(r, idx)).join('');
       return html;
     }
 
@@ -2039,19 +2146,20 @@
     // 每轮渲染完整 delta (含 assistant, 作为无源气泡).
     // Response 不再内嵌在轮次里 — 它由独立的 .response-drawer (issue #36) 展示,
     // 抽屉跟随选中气泡动态调整高度. 见 updateResponseDrawer().
-    function renderTimelineRound(r, idx, isLast) {
+    function renderTimelineRound(r, idx) {
       const num = idx + 1;
       // 选中态用 .selected (持续高亮); 闪烁动画 .flash 由 highlightRound() 在选中瞬间叠加.
       const roundCls = (r.id === selectedRound) ? 'tl-round selected' : 'tl-round';
       let inner = '';
-      // header.
+      // header. status / elapsed / streamed 是 response 到达后才确定的字段,
+      // 用 data-hdr 标记, 供 updateRoundHeaders() 在增量更新时定点刷新 (非全量重建).
       inner += `<div class="tl-round-header">
         <span class="tl-meta">
           <span>#${num}</span>
           <span>${escapeHtml(formatTime(r.created_at))}</span>
-          <span class="${statusClass(r)}">${escapeHtml(statusText(r))}</span>
-          <span class="meta">${r.elapsed_ms}ms</span>
-          ${r.streamed ? '<span class="badge badge-stream">streamed</span>' : ''}
+          <span class="${statusClass(r)}" data-hdr="status">${escapeHtml(statusText(r))}</span>
+          <span class="meta" data-hdr="elapsed">${r.elapsed_ms}ms</span>
+          ${r.streamed ? '<span class="badge badge-stream" data-hdr="streamed">streamed</span>' : '<span data-hdr="streamed"></span>'}
         </span>
         <span class="tl-actions">
           <button type="button" data-action="info" data-rid="${escapeHtml(r.id)}" title="传输层信息">ℹ</button>
@@ -2064,6 +2172,36 @@
       inner += renderRequestDelta(r, redactions);
       inner += `</div>`;
       return `<div class="${roundCls}" data-rid="${escapeHtml(r.id)}">${inner}</div>`;
+    }
+
+    // 增量更新所有 .tl-round 的 header 中 response 相关字段 (status / elapsed / streamed).
+    // 这些字段 push 时为初始值 (resp_status=0, elapsed_ms=0, streamed=false), response 到达后才更新.
+    // 全量重建时 renderTimelineRound 自然刷新; 增量路径 (策略1/2) 不重建 DOM, 需此函数定点刷新.
+    function updateRoundHeaders() {
+      const rounds = document.querySelectorAll('#detail > .tl-round');
+      rounds.forEach(el => {
+        const r = timelineRecords.find(x => x.id === el.dataset.rid);
+        if (!r) return;
+        const status = el.querySelector('[data-hdr="status"]');
+        if (status) {
+          status.className = statusClass(r);
+          status.textContent = statusText(r);
+        }
+        const elapsed = el.querySelector('[data-hdr="elapsed"]');
+        if (elapsed) elapsed.textContent = `${r.elapsed_ms}ms`;
+        const streamed = el.querySelector('[data-hdr="streamed"]');
+        if (streamed) {
+          const shouldHave = r.streamed;
+          const hasBadge = streamed.classList.contains('badge-stream');
+          if (shouldHave && !hasBadge) {
+            streamed.className = 'badge badge-stream';
+            streamed.textContent = 'streamed';
+          } else if (!shouldHave && hasBadge) {
+            streamed.className = '';
+            streamed.textContent = '';
+          }
+        }
+      });
     }
 
     // 渲染本轮 request delta 的所有 messages 为独立气泡 (含 assistant).
@@ -2221,7 +2359,9 @@
     }
 
     // 增量更新: 自动刷新时若 node 序列不变, 只刷抽屉内容 (流式渐进) + 重新计算布局.
+    // 同时刷新所有轮次 header 的 response 相关字段 (status/elapsed/streamed).
     function updateTimelineResponses() {
+      updateRoundHeaders();
       updateResponseDrawerContent();
       updateResponseDrawerLayout();
       updateScrollNavVisibility();
@@ -2420,43 +2560,7 @@
     const EXPAND_THRESHOLD_LINES = 15;
 
     function applyBubbleCollapse() {
-      const bubbles = document.querySelectorAll('#detail .chat-bubble');
-      bubbles.forEach(bubble => {
-        if (bubble.dataset.collapseReady === '1') return;
-        // 先移除 collapsed / expanded 让自然高度可测 (max-height: none 时 == 内容自然高度).
-        bubble.classList.remove('collapsed', 'expanded');
-        const content = bubble.querySelector('.bubble-content');
-        if (!content) { bubble.dataset.collapseReady = '1'; return; } // 防御: 非气泡结构.
-        const style = getComputedStyle(bubble);
-        const fontSize = parseFloat(style.fontSize) || 12.5;
-        const lineHeight = parseFloat(style.lineHeight) || (fontSize * 1.5);
-        const collapseThreshold = lineHeight * 3 + 2;       // 3 行
-        const expandThreshold = lineHeight * EXPAND_THRESHOLD_LINES; // 15 行
-        // 测量内容层的自然高度 (不是外层 bubble, 因为 bubble 的 padding 会膨胀测量值).
-        const naturalHeight = content.scrollHeight;
-        if (naturalHeight <= collapseThreshold) {
-          bubble.dataset.collapseReady = '1';
-          return;
-        }
-        // 默认折叠.
-        bubble.classList.add('collapsed');
-        // 按钮浮层.
-        const actions = document.createElement('div');
-        actions.className = 'bubble-actions';
-        // 折叠 toggle.
-        const toggle = document.createElement('button');
-        toggle.className = 'bubble-toggle';
-        toggle.type = 'button';
-        toggle.textContent = 'expand ▾';
-        toggle.addEventListener('click', () => onBubbleToggle(bubble, toggle, expandThreshold));
-        actions.appendChild(toggle);
-        bubble.appendChild(actions);
-        // 若自然高度超过展开阈值, 标记以便展开时显示 "查看全文".
-        if (naturalHeight > expandThreshold) {
-          bubble.dataset.canViewFull = '1';
-        }
-        bubble.dataset.collapseReady = '1';
-      });
+      applyBubbleCollapseTo(document.getElementById('detail'));
     }
 
     // toggle 点击: collapsed ↔ expanded. 进入 expanded 时按需浮 "查看全文".
