@@ -23,7 +23,7 @@
 use std::time::Instant;
 
 use axum::{
-    body::{to_bytes, Body},
+    body::{Body, to_bytes},
     extract::{Path, Request, State},
     http::{HeaderMap, HeaderValue, Response, StatusCode},
     response::IntoResponse,
@@ -36,7 +36,7 @@ use tracing::{debug, error, warn};
 
 use crate::dag::{CallEvent, ConversationDag, PolicySnapshot, ResponseData};
 use crate::provider::{Protocol, ProviderTable};
-use crate::redact::{redact_ir, restore_ir_response, RedactionMap};
+use crate::redact::{RedactionMap, redact_ir, restore_ir_response};
 use crate::secrets::SecretTable;
 
 /// 进程级共享状态, 在 router 与 handler 间共享.
@@ -1003,10 +1003,8 @@ async fn fan_out_streaming(
                         }
                     }
                     // ParsedSync 累积 (未 overflow 时).
-                    if !overflow {
-                        if let Some(ps) = parsed_sync.as_mut() {
-                            ps.feed(&b);
-                        }
+                    if !overflow && let Some(ps) = parsed_sync.as_mut() {
+                        ps.feed(&b);
                     }
                 }
                 Err(e) => {

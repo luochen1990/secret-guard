@@ -24,8 +24,8 @@ use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use uuid::Uuid;
 
-use crate::codec::ir::{IrBlock, IrImageSource, IrMessage, IrRole, IrStopReason, IrUsage};
 use crate::codec::Protocol as CodecProtocol;
+use crate::codec::ir::{IrBlock, IrImageSource, IrMessage, IrRole, IrStopReason, IrUsage};
 
 // ─── BlockHash ──────────────────────────────────────────────────────────────
 
@@ -568,10 +568,10 @@ impl ConversationDag {
             }
         }
         // parent.child_count += 1.
-        if let Some(pid) = lookup.parent {
-            if let Some(pn) = g.nodes.get_mut(&pid) {
-                pn.child_count += 1;
-            }
+        if let Some(pid) = lookup.parent
+            && let Some(pn) = g.nodes.get_mut(&pid)
+        {
+            pn.child_count += 1;
         }
 
         // 8. LRU session 淘汰 (两个条件, min 保底).
@@ -685,10 +685,10 @@ impl ConversationDag {
             inner.blocks.release_message(r);
         }
         // 释放 response 的 block refcount (若有).
-        if let Some(resp) = node.response.read().as_ref() {
-            if let Some(msg) = &resp.message {
-                inner.blocks.release_message(msg);
-            }
+        if let Some(resp) = node.response.read().as_ref()
+            && let Some(msg) = &resp.message
+        {
+            inner.blocks.release_message(msg);
         }
         // 从 prefix_index 移除.
         if let Some(ids) = inner.prefix_index.get_mut(&node.prefix_hash) {
@@ -698,12 +698,12 @@ impl ConversationDag {
             }
         }
         // 级联: 递减 parent.child_count, 若也变 0 则递归删 parent.
-        if let Some(parent_id) = node.parent {
-            if let Some(pn) = inner.nodes.get_mut(&parent_id) {
-                pn.child_count = pn.child_count.saturating_sub(1);
-                if pn.child_count == 0 {
-                    Self::gc_cascade(inner, parent_id);
-                }
+        if let Some(parent_id) = node.parent
+            && let Some(pn) = inner.nodes.get_mut(&parent_id)
+        {
+            pn.child_count = pn.child_count.saturating_sub(1);
+            if pn.child_count == 0 {
+                Self::gc_cascade(inner, parent_id);
             }
         }
     }
@@ -750,8 +750,8 @@ impl ConversationDag {
     pub fn get_response(&self, node_id: Uuid) -> Option<ResponseData> {
         let g = self.inner.read();
         let node = g.nodes.get(&node_id)?;
-        let resp = node.response.read().clone();
-        resp
+
+        node.response.read().clone()
     }
 
     /// 取 node 的请求侧详情 (req_headers + req_body_raw) for GET /records/{id}.

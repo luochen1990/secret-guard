@@ -17,10 +17,10 @@
 pub(crate) mod api;
 
 use axum::{
+    Router,
     http::StatusCode,
     response::Html,
     routing::{get, patch},
-    Router,
 };
 
 use crate::proxy::ProxyState;

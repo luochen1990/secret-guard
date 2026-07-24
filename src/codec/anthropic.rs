@@ -14,12 +14,12 @@
 //! - `temperature` 必须 clamp 到 [0, 1] (writer 侧若超出, log warn 并 clamp).
 //! - 流式 1:1 映射到 IR 事件 (`message_start` / `content_block_*` / `message_delta` / `message_stop`).
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use super::{
-    collect_extra, ir::StreamDecodeState, random_base62, IrBlock, IrBlockMeta, IrDelta, IrError,
-    IrImageSource, IrMessage, IrRequest, IrResponse, IrRole, IrStopReason, IrStreamEvent, IrTool,
-    IrToolChoice, IrUsage, Reader, Writer, DEFAULT_MAX_TOKENS,
+    DEFAULT_MAX_TOKENS, IrBlock, IrBlockMeta, IrDelta, IrError, IrImageSource, IrMessage,
+    IrRequest, IrResponse, IrRole, IrStopReason, IrStreamEvent, IrTool, IrToolChoice, IrUsage,
+    Reader, Writer, collect_extra, ir::StreamDecodeState, random_base62,
 };
 
 // ─── Reader ────────────────────────────────────────────────────────────────
@@ -389,13 +389,13 @@ impl Writer for AnthropicWriter {
         if !req.tools.is_empty() {
             if let Some(tc) = &req.tool_choice {
                 let mut tc_obj = write_tool_choice(tc);
-                if let Some(parallel) = req.parallel_tool_calls {
-                    if let Some(obj) = tc_obj.as_object_mut() {
-                        obj.insert(
-                            "disable_parallel_tool_use".to_string(),
-                            json!(!parallel), // 注意取反
-                        );
-                    }
+                if let Some(parallel) = req.parallel_tool_calls
+                    && let Some(obj) = tc_obj.as_object_mut()
+                {
+                    obj.insert(
+                        "disable_parallel_tool_use".to_string(),
+                        json!(!parallel), // 注意取反
+                    );
                 }
                 out.insert("tool_choice".to_string(), tc_obj);
             } else if let Some(parallel) = req.parallel_tool_calls {

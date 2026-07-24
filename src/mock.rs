@@ -254,13 +254,13 @@ impl MockStrategy {
         // Auto 模式: 若用户设置了 gen.prefix, 校验 prefix 不含 real 的 ≥4 字符子串
         // (否则 mock 开头部分会暴露 real 子串, 违反 C5). prefix == real 的场景也被覆盖
         // (real 是自身的 ≥4 字符子串的前提, contains_4char_substring 会返回 true).
-        if let Some(gen_spec) = &self.gen_spec {
-            if !gen_spec.prefix.is_empty() && contains_4char_substring(&gen_spec.prefix, real) {
-                return Err(
-                    "gen prefix contains a ≥4 char substring of the real secret (C5 violation)"
-                        .into(),
-                );
-            }
+        if let Some(gen_spec) = &self.gen_spec
+            && !gen_spec.prefix.is_empty()
+            && contains_4char_substring(&gen_spec.prefix, real)
+        {
+            return Err(
+                "gen prefix contains a ≥4 char substring of the real secret (C5 violation)".into(),
+            );
         }
         Ok(())
     }
@@ -429,11 +429,13 @@ mod tests {
     #[test]
     fn charset_is_empty() {
         assert!(Charset::default().is_empty());
-        assert!(!Charset {
-            digits: true,
-            ..Default::default()
-        }
-        .is_empty());
+        assert!(
+            !Charset {
+                digits: true,
+                ..Default::default()
+            }
+            .is_empty()
+        );
     }
 
     // ─── GenSpec ──────────────────────────────────────────────────────────
@@ -637,7 +639,7 @@ mod tests {
         // C5 检查必须用 char-level windows (而非 byte-level), 否则 multibyte UTF-8
         // (如中文, 每字符 3 字节) 会让所有 4-byte windows 跨 char boundary → 全部漏检.
         let real = "你好世界 Secret"; // 4 个中文字符 + 空格 + 6 ASCII = 11 chars
-                                      // Fixed value 含 real 的 4 字符子串 "你好世界".
+        // Fixed value 含 real 的 4 字符子串 "你好世界".
         let s = MockStrategy {
             initial: InitialValue::Fixed {
                 value: "prefix-你好世界-suffix".into(),

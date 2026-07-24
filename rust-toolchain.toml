@@ -1,7 +1,9 @@
 # rust-toolchain.toml is honored by rustup; under Nix devShell we use the
-# nixpkgs-provided rustc/cargo directly (version matches the channel pinned
-# in flake.nix). This file is kept for non-Nix contributors.
+# nixpkgs-provided rustc/cargo directly (version follows the channel pinned
+# in flake.nix, currently 1.96). This file is kept for non-Nix contributors.
+# Use "stable" so rustup tracks the latest stable release; the exact nixpkgs
+# version may drift slightly but both paths stay on a recent stable rustc.
 [toolchain]
-channel = "1.91.0"
+channel = "stable"
 components = ["rustfmt", "clippy"]
 profile = "minimal"

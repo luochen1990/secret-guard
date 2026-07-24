@@ -30,10 +30,10 @@
 //! StreamTranslate 在 [`StreamTranslate::finish`] 时根据 ingress writer 决定是否追加 `[DONE]`.
 
 use crate::codec::{
-    ir::{IrBlockMeta, IrStreamEvent, StreamDecodeState},
     Protocol, Reader, Writer,
+    ir::{IrBlockMeta, IrStreamEvent, StreamDecodeState},
 };
-use crate::redact::{restore_str_inplace, DeltaKind, RedactionMap, StreamingRestorer};
+use crate::redact::{DeltaKind, RedactionMap, StreamingRestorer, restore_str_inplace};
 use std::collections::HashMap;
 
 /// SSE 流终止符 sentinel (OpenAI 约定).
@@ -211,17 +211,17 @@ impl StreamTranslate {
             }
 
             // terminal usage backfill: 若 terminal delta 的 input_tokens==0, 用 start_usage 填回.
-            if let IrStreamEvent::MessageDelta { usage, .. } = &mut ev {
-                if let Some(start) = &self.start_usage.clone() {
-                    if usage.input_tokens == 0 {
-                        usage.input_tokens = start.input_tokens;
-                    }
-                    if usage.cache_read_input_tokens.is_none() {
-                        usage.cache_read_input_tokens = start.cache_read_input_tokens;
-                    }
-                    if usage.cache_creation_input_tokens.is_none() {
-                        usage.cache_creation_input_tokens = start.cache_creation_input_tokens;
-                    }
+            if let IrStreamEvent::MessageDelta { usage, .. } = &mut ev
+                && let Some(start) = &self.start_usage.clone()
+            {
+                if usage.input_tokens == 0 {
+                    usage.input_tokens = start.input_tokens;
+                }
+                if usage.cache_read_input_tokens.is_none() {
+                    usage.cache_read_input_tokens = start.cache_read_input_tokens;
+                }
+                if usage.cache_creation_input_tokens.is_none() {
+                    usage.cache_creation_input_tokens = start.cache_creation_input_tokens;
                 }
             }
 
@@ -256,10 +256,10 @@ impl StreamTranslate {
             //   - 其它: 走 restore_event_inplace (BlockDelta 内部走 sliding window).
             // 跨协议模式 (redaction_map = None): 不做 restore, 直接 emit.
             if self.redaction_map.is_some() {
-                if let IrStreamEvent::BlockStop { index } = &ev {
-                    if let Some(tail_ev) = self.flush_block_as_event(*index) {
-                        self.emit_ir_event(&tail_ev, out);
-                    }
+                if let IrStreamEvent::BlockStop { index } = &ev
+                    && let Some(tail_ev) = self.flush_block_as_event(*index)
+                {
+                    self.emit_ir_event(&tail_ev, out);
                 }
                 if matches!(ev, IrStreamEvent::MessageStop) {
                     // 上游异常漏发 BlockStop 时, 所有 restorers 残留 mock tail.
@@ -275,10 +275,9 @@ impl StreamTranslate {
                     | crate::codec::ir::IrDelta::InputJsonDelta(s),
                 ..
             } = &ev
+                && s.is_empty()
             {
-                if s.is_empty() {
-                    continue;
-                }
+                continue;
             }
 
             self.emit_ir_event(&ev, out);
@@ -682,7 +681,7 @@ pub fn reframe_sse(event_type: &str, data: &serde_json::Value) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::{anthropic::AnthropicReader, openai::OpenAiReader, Protocol};
+    use crate::codec::{Protocol, anthropic::AnthropicReader, openai::OpenAiReader};
 
     // ─── find_frame_terminator ─────────────────────────────────────────
 
@@ -886,8 +885,8 @@ mod tests {
 
     #[test]
     fn openai_fan_out_first_chunk_yields_message_start_and_block_start() {
-        use crate::codec::ir::StreamDecodeState;
         use crate::codec::Reader;
+        use crate::codec::ir::StreamDecodeState;
         let reader = OpenAiReader;
         let chunk = serde_json::json!({
             "id": "x", "created": 0, "model": "gpt-4o",
@@ -903,8 +902,8 @@ mod tests {
 
     #[test]
     fn anthropic_reader_message_start_1to1() {
-        use crate::codec::ir::StreamDecodeState;
         use crate::codec::Reader;
+        use crate::codec::ir::StreamDecodeState;
         let reader = AnthropicReader;
         let data = serde_json::json!({
             "type": "message_start",

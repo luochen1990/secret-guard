@@ -965,17 +965,16 @@ async fn same_proto_streaming_with_redact_preserves_include_usage_chunk() {
     let mut upstream = spawn_mock_upstream().await;
     // 上游 SSE: 1) role chunk  2) text delta  3) finish_reason chunk (无 usage)
     //           4) 独立 usage chunk (choices=[], 顶层 usage)  5) [DONE]
-    let sse_body =
-        format!(
-            concat!(
-                "data: {{\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-4o\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\"}},\"finish_reason\":null}}]}}\n\n",
-                "data: {{\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-4o\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"uses {real_secret}\"}},\"finish_reason\":null}}]}}\n\n",
-                "data: {{\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-4o\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\n",
-                "data: {{\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-4o\",\"choices\":[],\"usage\":{{\"prompt_tokens\":42,\"completion_tokens\":7,\"total_tokens\":49}}}}\n\n",
-                "data: [DONE]\n\n",
-            ),
-            real_secret = real_secret,
-        );
+    let sse_body = format!(
+        concat!(
+            "data: {{\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-4o\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\"}},\"finish_reason\":null}}]}}\n\n",
+            "data: {{\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-4o\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"uses {real_secret}\"}},\"finish_reason\":null}}]}}\n\n",
+            "data: {{\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-4o\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\n",
+            "data: {{\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-4o\",\"choices\":[],\"usage\":{{\"prompt_tokens\":42,\"completion_tokens\":7,\"total_tokens\":49}}}}\n\n",
+            "data: [DONE]\n\n",
+        ),
+        real_secret = real_secret,
+    );
     let _m = upstream
         .mock("POST", "/v1/chat/completions")
         .with_status(200)

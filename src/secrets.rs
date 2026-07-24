@@ -19,8 +19,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    classify_source, pick_effective, Decisions, DynamicEntry, DynamicState, DynamicTable,
-    EffectiveSource, OverrideMode,
+    Decisions, DynamicEntry, DynamicState, DynamicTable, EffectiveSource, OverrideMode,
+    classify_source, pick_effective,
 };
 use crate::mock::MockStrategy;
 
@@ -458,7 +458,7 @@ mod tests {
         assert_eq!(mask_value("short"), "*****"); // ≤8 → 全 *
         assert_eq!(mask_value("12345678"), "********");
         assert_eq!(mask_value("123456789"), "1*******9"); // >8 → 首尾各 1
-                                                          // 任意 >8 长度: head + (n-2) stars + tail.
+        // 任意 >8 长度: head + (n-2) stars + tail.
         let secret = "sk-1234567890abcdef";
         let masked = mask_value(secret);
         assert_eq!(masked.len(), secret.chars().count());

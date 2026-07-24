@@ -878,12 +878,11 @@ pub struct UpsertProviderRequest {
 
 impl UpsertProviderRequest {
     fn into_provider(self) -> Result<Provider, ApiError> {
-        if let Some(id) = &self.id {
-            if !id.is_empty() {
-                if let Err(e) = crate::secrets::validate_id(id) {
-                    return Err(ApiError::validation(e));
-                }
-            }
+        if let Some(id) = &self.id
+            && !id.is_empty()
+            && let Err(e) = crate::secrets::validate_id(id)
+        {
+            return Err(ApiError::validation(e));
         }
         if let Err(e) = crate::provider::validate_base_url(&self.base_url) {
             return Err(ApiError::validation(e));

@@ -13,12 +13,12 @@
 //! - `max_tokens` 和 `max_completion_tokens` 都映射到 [`IrRequest::max_tokens`] (后者是 o1/o3 reasoning 模型用).
 //! - 流式 chunk `choices[0].delta` 是 flat 的 (text / tool_calls / reasoning_content 同时可能出现), 需要 [`StreamDecodeState`] 合成 block 边界.
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use super::{
-    collect_extra, ir::StreamDecodeState, random_base62, IrBlock, IrBlockMeta, IrDelta, IrError,
-    IrImageSource, IrMessage, IrRequest, IrResponse, IrRole, IrStopReason, IrStreamEvent, IrTool,
-    IrToolChoice, IrUsage, Reader, Writer,
+    IrBlock, IrBlockMeta, IrDelta, IrError, IrImageSource, IrMessage, IrRequest, IrResponse,
+    IrRole, IrStopReason, IrStreamEvent, IrTool, IrToolChoice, IrUsage, Reader, Writer,
+    collect_extra, ir::StreamDecodeState, random_base62,
 };
 
 // ─── Reader ────────────────────────────────────────────────────────────────
@@ -667,15 +667,15 @@ fn read_tool_def(tool: &Value) -> Option<IrTool> {
 /// OpenAI `image_url` 字符串 → [`IrImageSource`].
 /// 支持 `data:<mime>;base64,<payload>` URI 和 https:// URL.
 fn parse_image_url(url: &str) -> IrImageSource {
-    if let Some(rest) = url.strip_prefix("data:") {
-        if let Some((meta, payload)) = rest.split_once(',') {
-            let media_type = meta.split(';').next().unwrap_or("").to_string();
-            if meta.contains("base64") && !media_type.is_empty() {
-                return IrImageSource::Base64 {
-                    media_type,
-                    data: payload.to_string(),
-                };
-            }
+    if let Some(rest) = url.strip_prefix("data:")
+        && let Some((meta, payload)) = rest.split_once(',')
+    {
+        let media_type = meta.split(';').next().unwrap_or("").to_string();
+        if meta.contains("base64") && !media_type.is_empty() {
+            return IrImageSource::Base64 {
+                media_type,
+                data: payload.to_string(),
+            };
         }
     }
     IrImageSource::Url(url.to_string())
@@ -783,26 +783,26 @@ fn read_openai_stream_chunk(data: &Value, state: &mut StreamDecodeState) -> Vec<
     // 2) 处理 delta 内容.
     if let Some(delta) = delta {
         // 文本 delta.
-        if let Some(content) = delta.get("content").and_then(Value::as_str) {
-            if !content.is_empty() {
-                // 用 next_free_index 分配 (避免与已开 tool 的 index 冲突, 无论顺序).
-                let index = if !state.text_block_open {
-                    let new_idx = next_free_block_index(state);
-                    events.push(IrStreamEvent::BlockStart {
-                        index: new_idx,
-                        block: IrBlockMeta::Text,
-                    });
-                    state.text_block_open = true;
-                    state.text_index = Some(new_idx);
-                    new_idx
-                } else {
-                    state.text_index.unwrap_or(0)
-                };
-                events.push(IrStreamEvent::BlockDelta {
-                    index,
-                    delta: IrDelta::TextDelta(content.to_string()),
+        if let Some(content) = delta.get("content").and_then(Value::as_str)
+            && !content.is_empty()
+        {
+            // 用 next_free_index 分配 (避免与已开 tool 的 index 冲突, 无论顺序).
+            let index = if !state.text_block_open {
+                let new_idx = next_free_block_index(state);
+                events.push(IrStreamEvent::BlockStart {
+                    index: new_idx,
+                    block: IrBlockMeta::Text,
                 });
-            }
+                state.text_block_open = true;
+                state.text_index = Some(new_idx);
+                new_idx
+            } else {
+                state.text_index.unwrap_or(0)
+            };
+            events.push(IrStreamEvent::BlockDelta {
+                index,
+                delta: IrDelta::TextDelta(content.to_string()),
+            });
         }
         // 工具调用 delta (可能有多个并发).
         if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
@@ -895,15 +895,13 @@ fn process_tool_call_delta(
     if let Some(args) = function
         .and_then(|f| f.get("arguments"))
         .and_then(Value::as_str)
+        && !args.is_empty()
+        && let Some(&ir_idx) = state.tool_ir_index.get(&oai_idx)
     {
-        if !args.is_empty() {
-            if let Some(&ir_idx) = state.tool_ir_index.get(&oai_idx) {
-                events.push(IrStreamEvent::BlockDelta {
-                    index: ir_idx,
-                    delta: IrDelta::InputJsonDelta(args.to_string()),
-                });
-            }
-        }
+        events.push(IrStreamEvent::BlockDelta {
+            index: ir_idx,
+            delta: IrDelta::InputJsonDelta(args.to_string()),
+        });
     }
 }
 
@@ -933,10 +931,10 @@ fn write_message(msg: &IrMessage) -> Value {
         IrRole::User => {
             // OpenAI 约定: 单文本 content 用裸 string; 多模态 / 多块用 array.
             // 这里检测是否只有单一 Text block, 用 string 形式 (更原生).
-            if msg.content.len() == 1 {
-                if let IrBlock::Text { text } = &msg.content[0] {
-                    return json!({"role": "user", "content": text});
-                }
+            if msg.content.len() == 1
+                && let IrBlock::Text { text } = &msg.content[0]
+            {
+                return json!({"role": "user", "content": text});
             }
             let parts: Vec<Value> = msg.content.iter().filter_map(write_user_block).collect();
             let content = match parts.len() {

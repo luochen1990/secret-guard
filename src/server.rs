@@ -26,8 +26,8 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use axum::{
-    routing::{any, get},
     Router,
+    routing::{any, get},
 };
 use parking_lot::{Mutex, RwLock};
 use tokio::net::TcpListener;
@@ -36,7 +36,7 @@ use tracing::info;
 
 use crate::dag::ConversationDag;
 use crate::provider::{Provider, ProviderTable};
-use crate::proxy::{forward, forward_no_rest, ProxyState};
+use crate::proxy::{ProxyState, forward, forward_no_rest};
 use crate::secrets::{SecretEntry, SecretTable};
 use crate::web;
 

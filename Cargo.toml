@@ -1,7 +1,7 @@
 [package]
 name = "secret-guard"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "A lightweight LLM gateway that prevents accidental secret leakage"
 license = "MIT"
 
@@ -14,7 +14,7 @@ axum = { version = "0.8", features = ["macros"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
-tower-http = { version = "0.6", features = ["trace"] }
+tower-http = { version = "0.7", features = ["trace"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bytes = "1"
@@ -24,7 +24,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 thiserror = "2"
 clap = { version = "4", features = ["derive", "env"] }
-toml = "0.8"
+toml = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 parking_lot = "0.12"
