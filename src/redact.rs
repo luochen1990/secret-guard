@@ -117,7 +117,8 @@ impl RedactionMap {
 
 // ─── 内部算法 ──────────────────────────────────────────────────────────────
 
-/// 64-bit hash (Rust 默认 SipHash 1-2-3, 同 Rust 版本内确定).
+/// 64-bit hash (Rust 默认 SipHash 1-2-3, 同 Rust 版本内确定; 不保证跨版本稳定,
+/// 但 RedactionMap 是 per-request 状态不持久化, 所以无实际影响).
 fn hash64(s: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     s.hash(&mut h);

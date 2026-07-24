@@ -15,6 +15,19 @@
 //! # 并发与持久化
 //!
 //! 见 [`crate::config::DynamicTable`] 的文档.
+//!
+//! # api_key 的两种来源 (`effective_api_key`)
+//!
+//! `Provider` 同时支持两种 api_key 配置方式 (互斥, 同时设置会在 `validate()` 报错):
+//!
+//! | 字段 | 类型 | 适用场景 |
+//! |---|---|---|
+//! | `api_key` | `String` (直接值) | 本地 dev / 简单部署 |
+//! | `api_key_file` | `Option<PathBuf>` (从文件读取) | 生产部署 / sops-nix / systemd LoadCredential |
+//!
+//! 优先级: 直接值 > 文件 > 空. **运行时每次请求读文件** (热路径), 读不到 → warn + 空字符串 fallback
+//! (单 provider 配置错误不拖垮进程, 因为 provider 失败只影响转发, 不影响安全性).
+//! 文件内容会被 `trim()` (容忍 sops / `echo | tee` 末尾换行符). 部署示例见 `docs/deployment-nixos.md`.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;

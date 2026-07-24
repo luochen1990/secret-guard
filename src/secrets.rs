@@ -15,6 +15,26 @@
 //! # 持久化与并发
 //!
 //! 见 [`crate::config::DynamicTable`] 的文档.
+//!
+//! # secret value 的两种来源 (`resolve_value`)
+//!
+//! 与 [`crate::provider::Provider`] 的 `api_key` / `api_key_file` 对称, `SecretEntry` 也支持
+//! 两种 value 配置方式 (互斥, 同时设置会在 `validate()` 报错):
+//!
+//! | 字段 | 类型 | 适用场景 |
+//! |---|---|---|
+//! | `value` | `String` (直接值) | 本地 dev / 简单部署 |
+//! | `value_file` | `Option<PathBuf>` | 生产部署 / sops-nix / systemd LoadCredential |
+//!
+//! **与 Provider 的关键差异 (生命周期)**:
+//! - Provider 的 `api_key_file` 是**运行时每次请求读文件** (热路径, 读不到 → warn + 空字符串 fallback).
+//!   因为 provider 失败只影响转发, 不影响安全性.
+//! - Secret 的 `value_file` 是**启动时一次性 resolve** (config 加载阶段读一次, 内容写入 `value`
+//!   字段, 清空 `value_file`). 读不到 → **fail-fast 启动失败**. 因为 secret 缺失会让 Redact
+//!   静默失效, 进而导致真实 Secret 泄漏到 LLM provider — 这正是 secret-guard 要防止的事故.
+//!
+//! resolve 后 Redact 核心逻辑零改动 (按 `value` 字段做字节匹配, 无额外 IO).
+//! 部署示例 (批量注入) 见 `docs/deployment-nixos.md`.
 
 use serde::{Deserialize, Serialize};
 

@@ -1,6 +1,7 @@
 # secret-guard — Agent 工作指南
 
-> 本文件面向 AI 代码助手 (opencode / claude-code 等), 描述本项目的关键约定与开发流程.
+> 本文件面向 AI 代码助手 (opencode / claude-code 等), 描述本项目的**项目级**约定与开发流程.
+> 模块级实现契约见各模块目录的 `AGENTS.md` 或源文件头部 `//!` 注释 (指针见"模块概览").
 > 用户级文档见 `README.md`.
 
 ## 项目定位
@@ -9,41 +10,108 @@
 防止 agent 不经意把 secret 泄露到 LLM Provider. 响应回传时反向替换, 让本地工具仍能用真 secret.
 支持多 provider 配置 (OpenAI / Anthropic / Gemini / Ollama), 通过 URL 路径前缀选择目标.
 
+## 术语表
+
+> 本表是**消除歧义的权威**. 当用户使用"常见异名"列中的口语时, 回应时必须替换为"规范术语"
+> 并紧临括注对应关系, 例如: 用户说"把 AI 发的消息居左" → "明白, 我把 role 为 Assistant
+> (AI 发的) 的 Bubble 居左". 不要反问"你说的 X 是不是指 Y"——直接纠正, 避免漂移.
+
+| 规范术语 | 定义 | 常见异名 | 归属层 |
+|---|---|---|---|
+| **Secret** | 需要从 LLM 视野中隐藏的真实敏感值 (API key / token / 密码等) | 密钥、敏感信息、真实值、真值 | 全局 |
+| **Redact** | 把 request body 中的 Secret 替换为 Mock 的正向操作 | 脱敏、过滤、打码、替换 | 全局 |
+| **Restore** | 把 response body 中的 Mock 还原为 Secret 的反向操作 | 还原、反替换、恢复 | 全局 |
+| **Mock** | Redact 时替代 Secret 的占位值 (per-secret 稳定, 不含真 secret 子串) | 假值、替身、占位符 | 全局 |
+| **Provider** | 一个上游 LLM 服务端点 (id + protocol + base_url + api_key) | 上游、后端、模型、服务商 | 全局 |
+| **Protocol** | LLM API 的协议族 (OpenAI / Anthropic / Gemini / Ollama) | 协议、格式 | 全局 |
+| **IR** | 协议无关的中间表示 (IrRequest / IrResponse / IrBlock) | 中间表示 | codec |
+| **RedactionMap** | 一次 Redact 产出的 Secret↔Mock 双向映射表 (per-request, 不持久化) | 映射表、redact map | redact |
+| **MockStrategy** | 每个 Secret 的 Mock 生成策略 (初始值 + 生成策略两维度) | mock 策略、生成策略 | mock/redact |
+| **ForwardRecord** | 一次 HTTP 转发的完整记录 (web 层 DTO, 从 DAG Node 派生) | 请求记录、record、转发记录 | web |
+| **Node** | ConversationDAG 中的一个节点 = 一次 API 调用 | 轮次、round、节点 | dag/web |
+| **Session** | 由 Merkle 前缀哈希聚类的一组 Node 链 | 会话、对话、conversation | dag/web |
+| **req_delta** | 一个 Node 相对其 parent 新增的 messages | 增量、本轮新增、delta | dag/web |
+| **resp_parsed** | 流式响应经 StreamScan 累积的 IR 视图 | 解析结果、响应解析 | web |
+| **Ingress / Egress** | 请求进入 / 响应离开 secret-guard 时用的协议 | 入站/出站协议 | proxy/codec |
+| **Effective view** | 合并 static + dynamic + decision 后的生效配置 | 生效配置、最终配置、合并视图 | config |
+| **Bubble** | 前端 timeline 中渲染的单条消息气泡 (= 1 个 IR message) | 气泡、消息块、消息项 | web/index.html |
+
 ## 关键技术决策 (SSOT)
 
 - **语言**: Rust 2024 edition (toolchain 1.96, via nixos-unstable, 与 ~/ws/nixos 共享 nixpkgs)
 - **Web 框架**: axum 0.8 (不使用 rig.rs / pingora 等高级抽象)
 - **HTTP client**: reqwest 0.12 with rustls
-- **协议无关**: body 在字节层面流动, 不解析 LLM 协议; secret 改写在字节层面
+- **协议无关**: body 在字节层面流动, secret 改写在 IR 层 (基于 `src/codec/ir`)
 - **双层配置**: 声明式 `secret-guard.toml` (static, 只读) + 动态 `secret-guard.state.toml`
-  (dynamic, WebUI 写回). 见下方"配置模型".
-- **测试**: cargo-nextest + proptest (property-based) + mockito (集成测试)
-- **覆盖率**: cargo-llvm-cov (LLVM source-based, 行级精度). 细节见"测试策略 → 覆盖率工具".
+  (dynamic, WebUI 写回). 详尽语义见 `src/config.rs` 头部.
+- **测试**: cargo-nextest + proptest (property-based) + mockito (集成测试) + Playwright (WebUI)
+- **覆盖率**: cargo-llvm-cov (LLVM source-based, 行级精度). 细节见"测试策略".
 
-## 关键不变式与鲁棒性原则
+## 关键不变式与工程纪律
 
-> secret-guard 的核心职责 (转发 + redact) 必须对任意字节流零失败.
+> secret-guard 的核心职责 (转发 + Redact) 必须对任意字节流零失败.
 > 围绕核心职责之外、**基于对 LLM 应用层行为模式强假设** 的附加功能
 > (preview 提取 / delta 切片 / WebUI 分组渲染 / tool name 推断等) 是"尽力而为"增强,
 > 绝不能因假设不成立而让请求失败或进程崩溃.
 
-对这类"尝试性解析"功能, 必须同时满足:
+### 鲁棒性原则 (best-effort, 永不 panic)
 
-1. **鲁棒性处理 (best-effort, 永不 panic)**: 解析路径用 `Option`/`Result` 传播失败,
-   缺字段 / 类型不符 / 空数组 / 越界都返回 `None` 或空, 由调用方走 fallback
-   (如 preview fallback 到 `method + path`, delta 切片 fallback 到空 `Vec`,
-   tool name fallback 到 `'?'`). Rust 侧用 `?` 短路; 前端用 `|| []` / `|| '?'` 兜底.
+对"尝试性解析"功能, 必须同时满足:
+
+1. **鲁棒性处理**: 解析路径用 `Option`/`Result` 传播失败, 缺字段 / 类型不符 / 空数组 / 越界
+   都返回 `None` 或空, 由调用方走 fallback (如 preview fallback 到 `method + path`,
+   delta 切片 fallback 到空 `Vec`, tool name fallback 到 `'?'`).
+   Rust 侧用 `?` 短路; 前端用 `|| []` / `|| '?'` 兜底.
 2. **假设声明注释**: 每个解析点必须在注释中显式写出它对输入的假设
-   (如 "假设 messages 数组中 user 在 assistant 之前", "假设 tool_calls 含 function.name"),
-   以及假设不成立时的降级行为. 这样后续维护者能立刻识别哪些是脆弱假设.
+   (如 "假设 messages 数组中 user 在 assistant 之前"), 以及假设不成立时的降级行为.
 
-已实践此原则的典型位置: `web::api::extract_preview_and_model` (preview 提取),
+已实践位置: `web::api::extract_preview_and_model` (preview 提取),
 `dag::extract_delta_messages` (delta 切片), `index.html::toolNameOfRound` (tool name 推断).
+
+### 视图正确性确保机制 (View-Correctness Discipline)
+
+当用视图 / 引用 / 派生字段替代原始数据存储 (典型场景: 内存优化、去重、lazy 派生) 时:
+
+1. **先断言后删除**: 删除原始数据前, 必须用 `assert_eq!(derived_view, original_data)` 断言两者
+   相等 (或写专项测试覆盖). **禁止**仅凭"视图逻辑应该对"就删除原始数据.
+2. **断言需有 feature flag 守护**: 对热路径断言用 `#[cfg(feature = "consistency-check")]`
+   包裹, 避免生产开销但保留 CI 守卫 (项目已有此 feature 先例).
+3. **原始数据是核心功能的真相**: secret-guard 的核心职责是转发 + Redact 的字节准确性.
+   任何"派生视图更优雅"的诱惑都不能凌驾于数据准确性之上.
+
+已实践位置: `redactions` 字段从 RedactionMap 派生 (`web/api.rs`)、
+`resp_parsed` 从 StreamScan 累积 (`proxy.rs`). 后续 Phase B 删除 parent.response 时
+必须走此流程.
+
+### C3 前缀缓存友好性 (经济性契约)
+
+Redact 不应无必要地改变 request body 的字节内容, 避免破坏 LLM Provider 侧的前缀缓存命中
+(前缀缓存是 byte-exact 的, 历史 message 中 mock 字节变化会导致从该 message 起的整个前缀
+缓存失效, 增加用户的 token 费用负担). 实现: per-request seed 驱动整个 RedactionMap,
+保证同一 policy + 同一上下文 → 同一 mock. 详尽契约 (C1-C6) 见 `src/redact.rs` 头部
+与 `src/mock.rs` 头部.
+
+## 前端不变量 (UI Invariants)
+
+> 这两条是**跨 web/dag/index.html 的强不变量**, 任何渲染优化或内存重构不得违反.
+
+### I1 — 气泡数 == 上下文数组长度
+
+会话详情页 (timeline) 渲染的 Bubble 数量, 必须等于该 Node 对应 HTTP 请求的 IR messages
+数组长度. 任何渲染优化 (折叠、合并、视图派生) 不得改变此等式.
+
+### I2 — sidebar 条目数 == HTTP 请求数
+
+左边栏每个一级条目 (Session) 下, 二级 + 三级条目总数, 必须等于归属该 Session 的 HTTP 请求
+数 (即 DAG 中以该 Session 叶子为终点的链上 Node 数).
+
+**回归守卫**: 这两条不变量由 `tests/webui/im-ui.spec.ts` 守卫. 改前端渲染逻辑或后端
+delta 切片时, 必须同步跑 `just check-webui`.
 
 ## 路由策略 (核心契约)
 
 URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标 provider,
-为未来跨协议转换预留钩子 (MVP 仅支持 ingress == egress 的 identity passthrough).
+为未来跨协议转换预留钩子.
 
 | 路径 | 含义 |
 |---|---|
@@ -54,435 +122,53 @@ URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标
 | 其他 | 404 (不再 catch-all 透传) |
 
 `proto_short` 简写映射 (单一事实来源: `Protocol::ALL`):
-
-- `o` = OpenAI
-- `a` = Anthropic
-- `g` = Gemini
-- `l` = oLLama
+- `o` = OpenAI, `a` = Anthropic, `g` = Gemini, `l` = oLLama
 
 错误语义:
 - 未知 protocol 简写 → 404 `not_found`
 - 未知 provider id → 404 `not_found`
 - 禁用 provider (`enabled = false`) → 503 `unavailable`
-- 同协议 (ingress == egress): 字节透传 (无 redact) 或 IR 路径 (有 redact).
-- 跨协议 OpenAI ⇄ Anthropic: 通过 `src/codec` 翻译 (IR 中介 + redact + restore);
-  跨协议 + `stream=true` → 501 (流式翻译尚未支持); Gemini/Ollama 跨协议 → 501 (codec 未覆盖).
+- 跨协议 + `stream=true` → 501 (流式跨协议翻译尚未接入 dispatch)
+- Gemini/Ollama 跨协议 → 501 (codec 未覆盖)
+
+详尽的 dispatch 路径选择 (同协议透传 / IR 路径 / 跨协议翻译) 与 fan_out 三路径见
+`src/proxy.rs` 头部.
 
 ## 模块概览
 
-```
-src/
-├── main.rs        # 二进制入口: 解析 CLI, 加载 static + dynamic, 启动 server
-├── lib.rs         # 库入口
-├── cli.rs         # clap 参数 schema (--config / --state / --host / --port)
-├── config.rs      # Config (static) / DynamicState / OverrideMode / Decisions
-│                  # + DynamicEntry trait + DynamicTable<T> 泛型 (provider / secret 共用)
-│                  # + atomic_write / UpsertKind / DeleteOutcome
-├── provider.rs    # Protocol / Provider + DynamicEntry impl + EffectiveProvider 合并视图
-├── secrets.rs     # SecretEntry / SecretCategory + DynamicEntry impl + EffectiveSecret + mask_value
-│                  # (SecretEntry.mock_strategy: MockStrategy 字段, redact 路径消费)
-├── mock.rs        # MockStrategy / InitialValue / GenSpec / Charset (两维度正交)
-│                  # + infer_default_from_real + gen_candidate + deterministic seed (C3 根基)
-│                  # 纯函数模块, 含完整单元测试 (覆盖 Auto/Fixed 分支)
-├── dag.rs         # ConversationDAG: 内容寻址的对话历史存储 (已接入 proxy/web)
-│                  # BlockPool (IrBlock 内容寻址池 + refcount GC) + Node + MessageRef
-│                  # + Merkle prefix hash (O(N) parent 查找) + LRU session 淘汰 + child_count GC
-│                  # + derive_redact_map (lazy redact 纯函数, node 存 seed 不存 map)
-│                  # 设计文档 SSOT: docs/design/conversation-dag.md
-├── record.rs      # ForwardRecord / RecordFilter (web 层 DTO, 从 DAG node 派生)
-│                  # (ForwardRecord.redactions: Vec<(mock, secret_id)> 从 RedactionMap SSOT 派生)
-├── redact.rs      # RedactionMap + redact_ir + restore_ir_response + mock_with_salt (legacy)
-│                  # + StreamingRestorer (流式 sliding-window restore, per-block 独立)
-│                  # + IR traverse helpers (block_contains / value_replace_all 等)
-│                  # redact 主路径已接入 MockStrategy (gen_mock_for_ir 消费 mock::gen_candidate)
-├── codec/         # 跨协议 codec (OpenAI ⇄ Anthropic, 借鉴 Busbar IR 设计)
-│   ├── mod.rs     # Protocol enum + Reader/Writer trait + 共享 helpers
-│   ├── ir.rs      # 协议无关 IR (IrRequest/IrResponse/IrBlock/IrMessage/IrStreamEvent/IrUsage)
-│   ├── openai.rs  # OpenAI Chat Completions Reader/Writer (含流式 fan-out)
-│   ├── anthropic.rs # Anthropic Messages Reader/Writer (含 1:1 流映射)
-│   └── stream.rs  # StreamTranslate (SSE chunk-boundary + 跨协议翻译 + 同协议 restore 模式)
-│                  # + StreamScan (流式 SSE → IrResponse 累积器, 用于 WebUI parsed view)
-├── proxy.rs       # ProxyState + forward/forward_no_rest + dispatch (路由分发)
-│                  # + same_proto_passthrough (无 redact 字节透传)
-│                  # + same_proto_forward (有 redact IR 路径)
-│                  # + cross_proto_forward (跨协议 IR 翻译 + redact)
-│                  # + fan_out_streaming (流式透传)
-│                  # + fan_out_streaming_with_restore (流式 + IR restore)
-│                  # + fan_out_buffered_ir (非流式 IR restore)
-└── server.rs      # build_router + serve (装配 persist_lock + 共享 decisions)
-    └── web/
-        ├── mod.rs     # /__sg 子 router + / 根入口 + slash_redirect + not_found
-        ├── api.rs     # JSON endpoints (records + sessions + nodes/timeline + secrets/providers CRUD + PATCH .../decision)
-        └── index.html # 单页 UI (IM 风格: 会话折叠 sidebar + timeline 对话流, 内嵌 CSS + vanilla JS, 零外部依赖)
-```
+> 每个模块的**详尽契约**在对应位置. 这里只给一句话职责 + 指针.
 
-> `ProviderTable` 与 `SecretTable` 是 [`DynamicTable<T>`](src/config.rs) 的类型别名,
+| 模块 | 职责 (一句话) | 详尽契约位置 |
+|---|---|---|
+| `main.rs` / `cli.rs` / `lib.rs` | 二进制入口 + CLI 参数 schema | 文件头部 `//!` |
+| `config.rs` | 双层配置 schema + `DynamicTable<T>` 泛型 + 持久化 | 文件头部 `//!` (覆盖 OverrideMode / CRUD / Effective source / 跨表并发) |
+| `provider.rs` | Provider 实体 + Effective view + api_key 两来源 | 文件头部 `//!` |
+| `secrets.rs` | SecretEntry 实体 + Effective view + value 两来源 | 文件头部 `//!` |
+| `mock.rs` | MockStrategy 两维度 (初始值 + 生成策略) + 确定性 seed | 文件头部 `//!` (C3 根基) |
+| `dag.rs` | ConversationDAG 内容寻址存储 (BlockPool + Node + Merkle) | 文件头部 `//!` + `docs/design/conversation-dag.md` |
+| `record.rs` | ForwardRecord (web 层 DTO, 从 DAG Node 派生) | 文件头部 `//!` |
+| `redact.rs` | RedactionMap + redact/restore pipeline + 形式化契约 C1-C6 | 文件头部 `//!` |
+| `codec/` | 跨协议 IR + Reader/Writer trait + StreamTranslate | **`src/codec/AGENTS.md`** |
+| `proxy.rs` | dispatch 路径选择 + fan_out 三路径 + Provider 鉴权 | 文件头部 `//!` |
+| `web/` | JSON API + 单页 WebUI | **`src/web/AGENTS.md`** |
+| `server.rs` | router 装配 + 双层状态注入 + graceful shutdown | 文件头部 `//!` |
+
+> `ProviderTable` 与 `SecretTable` 是 `DynamicTable<T>` (`src/config.rs`) 的类型别名,
 > 通用合并 / CRUD / 持久化算法都在 config.rs; 各模块只补充类型特定的 EffectiveView
 > 映射与 validate 钩子.
 
-## 配置模型 (双层: Static + Dynamic)
-
-secret-guard 把配置拆成两个独立文件, 各自承担不同职责:
+## 配置模型 (双层: Static + Dynamic) — 概览
 
 | 文件 | 角色 | 谁写 | 进入 git? |
 |---|---|---|---|
-| `secret-guard.toml`        | **声明式 (static)** 配置: providers / secrets / server. | 用户手写 | ✅ 推荐 |
-| `secret-guard.state.toml`  | **动态 (dynamic)** 状态: WebUI 编辑结果 + 对 static 项的 decision. | 程序自动 | ❌ 推荐 .gitignore |
+| `secret-guard.toml` | **声明式 (static)** 配置: providers / secrets / server. 进程内只读. | 用户手写 | ✅ 推荐 |
+| `secret-guard.state.toml` | **动态 (dynamic)** 状态: WebUI 编辑结果 + 对 static 项的 decision. 删除即可重置. | 程序自动 | ❌ 推荐 .gitignore |
 
-- static 配置在进程内**只读**; WebUI 永不修改它.
-- 用户删除 `secret-guard.state.toml` 即可"重置"所有 WebUI 变更, 回到声明式基线.
-- 启动时 state 文件不存在是正常情况 (返回空 state).
+合并语义 (OverrideMode: Default / PreferStatic / Disabled)、Effective source 4 种、
+CRUD 操作语义、DynamicTable 持久化策略、跨表并发安全的详尽描述见 `src/config.rs` 头部.
 
-### 合并语义 (`OverrideMode`)
-
-对每个 static id, WebUI 可设置 per-item 决策 (`decisions` 段持久化到 state.toml):
-
-- `Default` (默认): 若 dynamic 中有同 id override 则用 dynamic, 否则用 static.
-- `PreferStatic`: 强制使用 static 原值, 忽略 dynamic override.
-- `Disabled`: 从 effective view 中完全排除, 既不用 static 也不用 dynamic.
-
-dynamic-only 的 id (即 static 中不存在的) 总是直接生效, 不受 decision 影响.
-
-### Effective source (4 种, 供 UI 区分)
-
-| `source` 字段 | 含义 |
-|---|---|
-| `static` | 仅 static 有此 id, 用 static. |
-| `dynamic` | 仅 dynamic 有此 id (WebUI 创建的). |
-| `dynamic_override` | static + dynamic 都有, decision=Default → 用 dynamic. |
-| `static_preferred` | static + dynamic 都有, decision=PreferStatic → 用 static. |
-
-Disabled 项不进入 effective view (UI 看不到, 路由层也拿不到).
-
-### CRUD 操作语义
-
-- **POST** 创建 dynamic-only item. 若 id 与 static 冲突 → 409 (要用 PUT 走 fork 流程).
-- **PUT** 编辑: 若 id 在 static 中, 服务端自动 fork 出一份 dynamic override (git-style 心智模型).
-- **DELETE** 仅作用于 dynamic: 若有 dynamic 删除之 (override 关系下保留 static + 重置 decision);
-  若 id 仅在 static 中 → 409 (提示用 PATCH .../decision + mode=disabled).
-- **PATCH `/{id}/decision`** 切换对 static id 的决策. 返回 `{id, resource, decision}` ack.
-
-### API endpoints (WebUI)
-
-```
-GET    /__sg/api/records[?offset=N&limit=M]   → {records, total, offset, limit}
-GET    /__sg/api/records/{id}[?view=parsed]   → {record, parsed_request?, parsed_response?, parse_error?}
-GET    /__sg/api/sessions                     → {sessions, total}  (叶子节点, latest-first)
-GET    /__sg/api/nodes/{id}/timeline[?limit=N]→ {records}  (沿 parent 链向上 N 个祖先, oldest-first)
-GET    /__sg/api/secrets
-POST   /__sg/api/secrets
-PUT    /__sg/api/secrets/{id}
-DELETE /__sg/api/secrets/{id}
-PATCH  /__sg/api/secrets/{id}/decision     body: {"mode": "default|prefer_static|disabled"}
-
-GET    /__sg/api/providers
-POST   /__sg/api/providers
-PUT    /__sg/api/providers/{id}
-DELETE /__sg/api/providers/{id}
-PATCH  /__sg/api/providers/{id}/decision
-```
-
-**Records 分页**: `offset` 0-based 从最新算起; `limit` clamp 到 `[1,200]`, 默认 50.
-
-**Records parsed view**: `?view=parsed` 返回 `parsed_request` (从 `req_body` 按需用 ingress codec
-解析) + `parsed_response` (直接取自 `record.resp_parsed`, 由 proxy 层的 `StreamScan` 在流过程中
-增量累积, 非流式路径在响应完成时一次性计算). Gemini/Ollama 无 codec → `parse_error` + fallback raw.
-
-**Records list 轻量化 + 预览提取**: `GET /records` 返回 `RecordSummary` (不含 `req_body` /
-`resp_body` / `resp_parsed`), body 字段由 `GET /records/{id}?view=...` 按需拉取. 流式响应的
-`resp_body` 在 record 完成后为空 (不保留原始 SSE 字节), parsed view 通过 `resp_parsed` 提供.
-
-`RecordSummary` 同时携带两个从 `req_body` 一次性提取的轻量字段 (提取后丢弃 body):
-- `preview`: sidebar 主标题 (截断到 48 chars). 优先取最后一条 user message
-  (可读性好); 无 user 时回退到最后一条有文本的 message (tool_result / assistant).
-  压缩 marker ("What did we do so far?") 命中时 fallback 到最后一条 assistant 摘要.
-  (压缩摘要形如 "## 目标 ...", 本身有辨识度). 提取失败 fallback 到 method+path.
-- `model`: 顶层 `model` 字段 (OpenAI / Anthropic 共有), sidebar 副标题第二行.
-提取逻辑在 `web::api::extract_preview_and_model` (协议无关字节级, 不依赖 codec reader).
-
-**Timeline delta messages** (issue #27): timeline 路径的 `RecordSummary` 额外携带
-`req_delta_messages` (本轮新增 messages 的 wire JSON, 从 `req_body_raw` 末尾截取).
-前端按 role 渲染独立气泡 (system / user / tool_result / assistant), assistant 作为
-无源气泡 (前序 response 的历史副本). 根节点额外注入 system prompt (OpenAI reader
-提升 system 到 `IrRequest.system`, writer 写回 messages[0]; 截取逻辑在根节点 start>0
-时补回). list 路径 (`GET /records`) 不填此字段 (避免 O(n) 全量 resolve).
-
-**Timeline response 传输优化** (issue #28 Phase A): timeline 返回的 N 个节点中, 只有
-最末节点 (timeline anchor) 保留 `parsed_response`; 非末轮的设为 None. 理由: 非 leaf
-的 response 内容已被下一轮 delta 的 assistant message 完整包含, 传输是冗余. 前端从
-完整 delta 渲染连续对话流 (含 assistant 气泡), 只有末轮额外渲染 response-pane
-(尚未被任何 delta 消费的部分). 后续 Phase B 将进一步在 push 时删除 parent.response
-(瞬态存储), 用 `consistency-check` feature flag 的 assertion 保证 delta↔response 一致.
-
-**Sessions / Timeline (会话折叠 WebUI)**: sidebar 一级 (会话) 来自 `GET /api/sessions`
-(返回叶子节点 + record_count + latest 字段); 二级 (轮次列表) 与右侧 timeline 对话流来自
-`GET /api/nodes/{id}/timeline?limit=N` (沿 parent 链向上取 N 个祖先, oldest-first).
-timeline 惰性加载: 滚到顶时以最老 node 的 parent 为新起点 prepend 更早 N 轮 (保持滚动锚点).
-`timelineReachedTop` 仅在用户实际滚顶触发 `loadOlder` 探测后置位 (而非初次加载时从
-records.length < limit 推断), 避免短会话首屏即显示 "已经到顶了".
-
-**Sidebar 分组渲染 (二级 + 三级小圆点)**: 二级条目 (`.round-item` = 用户轮次,
-req_delta 含 `role=user`) 显示 preview 文本 + 时间. 紧随其后的工具调用轮次
-(req_delta 无 user, 仅 assistant+tool_result) 折叠为三级小圆点 (`.sub-dot`),
-横向排列在组首下方. 圆点颜色 = tool name 哈希 (FNV-1a 调色板, 与 provider 图标复用),
-tooltip 显示 tool name + 时间. 点击圆点 = `selectRound` (同二级条目).
-
-**每轮操作按钮 (info + raw)**: timeline 每轮 header 含两个按钮:
-- `ℹ` info: 弹窗展示传输层元数据 (method/path/status/elapsed/streamed/model/error/redactions
-  等, 全部来自 RecordSummary, 无需网络请求).
-- `raw`: 弹窗展示原始 req_body / resp_body / req_headers / resp_headers (按需懒拉
-  `GET /api/records/{id}`). body 是 LLM 视角 (已 redact, 安全展示); headers 已脱敏
-  (auth/cookie 等 = `<redacted>`). 流式响应的 resp_body 为空 (不保留 SSE 字节), 显示提示.
-
-**Response 单气泡**: 一个 session 只有一个 active response → response-pane 内只渲染
-一个 assistant 气泡 (text + tool_calls 合并展示, 不拆分为多个分项气泡).
-
-**ForwardRecord.redactions**: `Vec<(mock, secret_id)>` — 从 `redact_ir` 产出的
-`RedactionMap` SSOT 派生 (见 `proxy.rs::derive_redactions`). WebUI 的 mock 高亮和 "命中"
-筛选都基于此字段, **永不**在前端重新计算, 避免前后端漂移. 不含真实 secret value, 可安全暴露.
-
-## 关键契约
-
-### MockStrategy (`src/mock.rs`) — per-secret mock 生成策略
-
-每个 secret 配置两维度正交的 mock 策略, redact 时按策略生成候选 mock:
-
-- **维度一 (初始值 `InitialValue`)**: `Auto` (系统按 gen spec 生成) 或 `Fixed { value }` (用户固定值).
-- **维度二 (生成策略 `GenSpec`)**: `prefix` + `charset` + `length_range`.
-  - `prefix`: 固定前缀, 默认空串.
-  - `charset`: 6 类正交开关 (digits / lowercase / uppercase / underscore / hyphen / other Vec<char>).
-    默认值由 `Charset::infer_from(real)` 自动推断 (real 中出现哪些字符类就勾选).
-  - `length_range`: `[min, max]` (char count), 默认 `min=max=len(real)` (与 real 等长).
-
-**C3 前缀缓存友好性** (经济性契约): redact 不应无必要地改变 request body 的字节内容,
-避免破坏 LLM Provider 侧的前缀缓存命中, 进而增加用户的 token 费用负担. 前缀缓存是 byte-exact
-的, 若历史 message 中的 mock 字节变化, 从该 message 起的整个前缀缓存失效. 因此 mock 的稳定性
-(同一 secret 在会话中保持同一 mock) 直接保护缓存命中.
-
-实现手段: `deterministic_seed` 保证同一 `(real, strategy)` 总产生同一候选序列 (counter=0,1,2,...).
-这是 C3 的根基. 多数请求命中首项候选 (完全享受前缀缓存); 首项冲突时稳定跳到第二项
-(第二项在"首项冲突"的多次请求间也能共享缓存).
-
-> 历史: 曾有 `sticky=false` 维度 (每次请求随机 seed), 但它直接违反 C3 (每轮 mock 都变, 前缀缓存
-> 完全失效), 且其声称的收益 (防 LLM 关联多次请求) 不在 secret-guard 的威胁模型内 (MVP 防的是
-> secret 泄漏, 不是关联), 因此已删除.
-
-**向后兼容**: 未配置 `mock_strategy` 的旧 secret 在 `SecretEntry::validate_and_resolve`
-的 resolve 步骤后自动得到 `default_for(real_value)` (Auto + infer 自 real 的 gen spec).
-
-**核心 API**:
-- `MockStrategy::resolve_against(real)`: 用 real infer 默认 gen spec (若 gen=None + Auto 模式).
-- `MockStrategy::validate_against_real(real)`: Fixed 模式校验不等于 real 且不含 real ≥4 字符子串 (C5, char-level windows 正确处理 multibyte UTF-8); Auto 模式校验 gen.prefix 不含 real 子串.
-- `deterministic_seed(real, strategy)`: seed 源 (hash of real+strategy), C3 的根基.
-- `gen_candidate(real, strategy, seed, counter)`: 生成单个候选 mock. redact 按 probing 协议消费.
-
-### redact pipeline (`src/redact.rs` + `src/proxy.rs`)
-
-redact 已升级为 **IR 变换** (基于 `src/codec/ir`), 与 codec 同层. 三个核心 API:
-- `redact_ir(&mut IrRequest, secrets) -> (RedactionMap, u64 seed)`: 扫描 IR 所有字符串字段,
-  把 secret 替换为 mock. 返回 per-request seed (0=passthrough, DAG node 存它用于 lazy 重建).
-- `restore_ir_response(&mut IrResponse, map)`: 非流式响应 restore.
-- `StreamingRestorer::push/flush`: 流式响应 sliding-window restore (跨 chunk mock 边界安全, per-block 独立状态, UTF-8 char boundary 安全).
-
-**dispatch 路径选择** (`proxy.rs::dispatch`):
-- **同协议 + 无 redact** (SecretTable 空): `same_proto_passthrough` 字节透传 (零回归, 最热路径).
-- **同协议 + redact**: `same_proto_forward` 走 IR (reader → redact_ir → writer).
-  - 流式响应: `fan_out_streaming_with_restore` 用 StreamTranslate 同协议 restore 模式 (恢复流式 UX).
-  - 非流式响应: `fan_out_buffered_ir` 累积 + restore_ir_response.
-- **跨协议**: `cross_proto_forward` 走 IR (reader → redact_ir → extra.clear → writer).
-  - 响应: egress reader → IR → restore_ir_response → ingress writer.
-  - 流式仍返回 501 (StreamTranslate 跨协议模式尚未接入 dispatch).
-
-### fan_out 三路径 (`src/proxy.rs`)
-
-- `fan_out_streaming`: 字节流式透传, 用于 same-proto + 无 redact. 客户端响应 = 上游字节.
-- `fan_out_streaming_with_restore`: 流式 + IR restore, 用于 same-proto + redact + 流式响应.
-  用 StreamTranslate 同协议 restore 模式 (egress SSE → IR event → restore → ingress SSE).
-  失去 byte-exact (IR re-serialize), 但保留流式 UX.
-- `fan_out_buffered_ir`: 非流式 + IR restore, 用于 same-proto + redact + 非流式 / cross-proto.
-  完整累积响应, restore, 一次性返回.
-- **客户端响应永远无大小上限**; 只有 record 累积受 `MAX_RESP_BODY_RECORD` (32 MiB) 约束.
-
-### Provider 路由 (`src/proxy.rs`)
-
-`forward` 接收 `Path<ForwardPath> { proto, name, rest }`, 按 URL 解析 ingress 与 provider:
-1. `Protocol::from_short(proto)` → ingress 协议 (o/a/g/l)
-2. `ProviderTable::get_effective(name)` → 目标 provider (合并 static + dynamic + decision 后的生效值)
-3. 协议匹配检查:
-   - 同协议 + 无 redact: 字节透传 (`same_proto_passthrough`, 不进入 codec)
-   - 同协议 + redact: IR 路径 (`same_proto_forward`, reader → redact_ir → writer)
-   - 跨协议: IR 路径 (`cross_proto_forward`, reader → redact_ir → writer, response 反向翻译 + restore)
-4. `apply_provider_auth` 用 `provider.effective_api_key()` 注入对应协议的 auth header:
-   - OpenAI / Ollama → `Authorization: Bearer <key>`
-   - Anthropic → `x-api-key: <key>`
-   - Gemini → `x-goog-api-key: <key>`
-   同时剥离竞争 header (避免客户端误传的对手协议 auth 干扰上游), provider 配置优先于客户端.
-
-#### api_key 的两种来源 (`Provider::effective_api_key`)
-
-`Provider` 同时支持两种 api_key 配置方式 (互斥, 同时设置会在 `validate()` 报错):
-
-| 字段 | 类型 | 适用场景 |
-|---|---|---|
-| `api_key` | `String` (直接值) | 本地 dev / 简单部署 / 不在乎 toml 含敏感数据 |
-| `api_key_file` | `Option<PathBuf>` (从文件读取) | 生产部署 / sops-nix / systemd LoadCredential / k8s secrets |
-
-优先级: 直接值 > 文件 > 空. 文件内容会被 `trim()` (容忍 sops / `echo | tee` 末尾换行符).
-读不到文件返回空字符串 — 让 `apply_provider_auth` 跳过 auth 注入, 单 provider 配置错误不会拖垮整个进程.
-
-`api_key_file` 让 secret-guard.toml 本身可以不含敏感数据 — toml 可以直接进 git 或 nix store,
-secret 由 sops-nix 解密到 `/run/secrets/...`, secret-guard 在请求时读取.
-这极大简化了上游 nixos module 的配置 (不用 `sops.templates` 渲染整个 toml).
-
-#### secret value 的两种来源 (`SecretEntry::resolve_value`)
-
-与 `Provider.api_key` / `api_key_file` 对称, `SecretEntry` 也支持两种 value 配置方式
-(互斥, 同时设置会在 `validate()` 报错):
-
-| 字段 | 类型 | 适用场景 |
-|---|---|---|
-| `value` | `String` (直接值) | 本地 dev / 简单部署 / 不在乎 toml 含敏感数据 |
-| `value_file` | `Option<PathBuf>` (启动时一次性读取) | 生产部署 / sops-nix / systemd LoadCredential / k8s secrets |
-
-**生命周期与 Provider 的关键差异**:
-
-- Provider 的 `api_key_file` 是**运行时每次请求读文件** (热路径, 读不到 → warn + 空字符串 fallback,
-  单 provider 配置错误不拖垮进程). 因为 provider 失败只影响转发, 不影响安全性.
-- Secret 的 `value_file` 是**启动时一次性 resolve** (config 加载阶段读一次, 内容写入 `value` 字段,
-  清空 `value_file`). 读不到 → **fail-fast 启动失败**. 因为 secret 缺失会让 redact 静默失效,
-  进而导致真实 secret 泄漏到 LLM provider — 这正是 secret-guard 要防止的事故.
-
-resolve 后 redact 核心逻辑零改动 (按 `value` 字段做字节匹配, 无额外 IO). 文件内容会被 `trim()`
-(容忍 sops / `echo | tee` 末尾换行符).
-
-### 跨协议 codec (`src/codec/`)
-
-借鉴 Busbar (`GetBusbar/busbar`, Apache-2.0) 的 superset IR + Reader/Writer trait 设计,
-但大幅精简以匹配 secret-guard 的 MVP 范围.
-
-**支持矩阵**:
-- OpenAI Chat Completions ⇄ Anthropic Messages 双向 (非流式 + 流式 SSE).
-- 不在 MVP: Bedrock / Gemini / Cohere, reasoning/thinking, citations, logprobs, prompt caching.
-
-**核心抽象**:
-- `IrRequest` / `IrResponse`: 协议无关的中间表示 (chat completion 范围).
-- `Reader` trait: wire JSON/Bytes → IR; 包含 `read_request` / `read_response` / `read_response_events`.
-- `Writer` trait: IR → wire; 包含 `write_request` / `write_response` / `write_response_event` /
-  `requires_max_tokens` / `emits_sse_done_terminator` / `write_error`.
-- `StreamTranslate`: egress SSE → IR 事件流 → ingress SSE. 处理 chunk-boundary (TCP 切片),
-  CRLF/LF 双兼容, MAX_BUF 溢出 abort. 支持两种模式: 跨协议翻译 + 同协议 restore.
-
-**关键不变式**:
-- 同协议 + 无 redact 不进入 codec (字节透传), 零回归.
-- 同协议 + redact: reader → redact_ir → writer 重序列化, 失去 byte-exact 但语义等价, 恢复流式 UX.
-- 跨协议时 IR 的 `extra` 字段强制清空, 防止源协议独有字段泄漏到对端.
-- 跨协议路径响应大小受 `MAX_RESP_BODY_RECORD` (32 MiB) 保护, 防止恶意上游 OOM.
-- 错误响应翻译为 ingress 协议的原生 envelope, message 截断到 4 KiB 并优先解析上游 `error.message`.
-
-
-### 跨表并发安全 (`src/server.rs` + `src/config.rs`)
-
-`SecretTable` 与 `ProviderTable` (都是 `DynamicTable<T>` 别名) 共享两份同步原语
-(server 启动时构造并注入):
-
-- **`Arc<Mutex<()>> persist_lock`**: 串行整个 RMW, 避免两表并发写 state.toml 互相覆盖.
-- **`Arc<RwLock<Decisions>> decisions`**: 同一份 per-id 决策 (因为 `[decisions]` 段同时含
-  providers + secrets 两个子表, 任何一方修改都要触发 state.toml 重写, 共享同一份内存).
-
-### DynamicTable 持久化 (`src/config.rs`)
-
-- 内存层: `Arc<RwLock<Vec<T>>>` × 2 (static_entries 只读 + dynamic_entries 可变).
-- 持久化策略: 先写 state.toml (atomic + fsync), 再更新内存 (失败自动回滚).
-- `tmp` 文件名带 UUID, 避免并发 atomic_write 互相覆盖.
-- 每次写 dynamic 时 `DynamicState::load_or_empty(state_path)` → 改对应段 → `to_toml` → atomic_write.
-  共享 persist_lock 保证读-改-写串行化, 不会丢失 decisions 段.
-- 类型钩子: `DynamicEntry` trait 让泛型表知道如何把 entry 写入 state 的对应字段
-  (`set_state_field`) 与读写 decisions 的对应子表 (`get_decision` / `set_decision`).
-  新增第三种 entry 类型只需 impl 该 trait (~25 行) 即可获得完整 CRUD / 持久化 / decision 通道.
-
-
-## 部署示例 (NixOS + sops-nix)
-
-`api_key_file` 字段让 secret-guard.toml 可以完全脱敏 — 直接进 nix store, secret
-由 sops-nix 解密到独立路径. 推荐两种姿势 (任选其一, 都不需要改 NixOS module):
-
-### 姿势 1: sops.secrets + systemd LoadCredential (推荐, 不修改 sops.secrets owner)
-
-适合 secret 被多个模块共享的场景 (例如 claude-code 模块也用同一个 api_key, 已经
-设了 `owner = "lc"`). LoadCredential 让 systemd 在服务启动时把 secret mount 到
-`/run/credentials/<service>/<id>`, 自动设 mode=0400 owner=<service User>, 不需要
-修改 sops.secrets owner 避免与其他模块冲突.
-
-```nix
-systemd.services.secret-guard.serviceConfig.LoadCredential = [
-  "zai_key:${config.sops.secrets."llm__zai_coding_plan_api_key".path}"
-];
-
-services.secret-guard.configFile = (pkgs.writeText "secret-guard.toml" ''
-  [[providers]]
-  id = "zai-coding-plan"
-  protocol = "openai"
-  base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
-  api_key_file = "/run/credentials/secret-guard.service/zai_key"
-  enabled = true
-'');
-```
-
-### 姿势 2: sops.secrets + 直接路径 (需要 owner = "secret-guard")
-
-适合 secret 只给 secret-guard 用的场景. 与姿势 1 的唯一差异是 `api_key_file` 直接
-指向 sops 解密路径, 而不是经 LoadCredential 转手:
-
-```nix
-sops.secrets."zai_api_key" = { owner = "secret-guard"; };
-
-services.secret-guard.configFile = (pkgs.writeText "secret-guard.toml" ''
-  [[providers]]
-  id = "zai-coding-plan"
-  protocol = "openai"
-  base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
-  api_key_file = "${config.sops.secrets."zai_api_key".path}"
-  enabled = true
-'');
-```
-
-**不推荐**: `sops.templates` 渲染整个 toml 把 api_key 嵌入明文 — toml 无法进 nix
-store, 调试不便, 与 nixos 生态主流模式 (hermes-agent / bazarr) 不一致.
-
-### secret entries 的批量注入 (value_file + LoadCredential)
-
-`SecretEntry` 同样支持 `value_file` (启动时一次性 resolve, fail-fast), 所以
-**redact 用的 secrets 列表** 也能完全脱敏地注入. 姿势与 provider 的 `api_key_file`
-完全对称: LoadCredential + toml `value_file` 引用.
-
-适合场景: 把一批符合命名模式的 sops secrets (如 `*_api_key` / `*_api_token` / `*_secret`)
-批量注入 secret-guard 做 redact, 防止 agent 不经意把它们写入 LLM prompt.
-
-```nix
-let
-  # 从 config.sops.secrets 中按模式筛选要 redact 的 key (SSOT: 只列一次).
-  redactKeys = lib.filter (k:
-    lib.hasSuffix "_api_key" k ||
-    lib.hasSuffix "_api_token" k ||
-    lib.hasSuffix "_secret" k
-  ) (builtins.attrNames config.sops.secrets);
-in {
-  # LoadCredential 与 toml entries 都从 redactKeys 派生, 永远同步.
-  systemd.services.secret-guard.serviceConfig.LoadCredential = map (k:
-    "${k}:${config.sops.secrets.${k}.path}"
-  ) redactKeys;
-
-  services.secret-guard.configFile = (pkgs.writeText "secret-guard.toml" ''
-    ${...providers 段...}
-    ${lib.concatStrings (map (k: ''
-      [[secrets.entries]]
-      id = "${k}"
-      value_file = "/run/credentials/secret-guard.service/${k}"
-    '') redactKeys)}
-  '');
-}
-```
-
+Secret / Provider 的两种 value 来源 (`value`/`value_file`、`api_key`/`api_key_file`)
+及其 fail-fast vs 热路径差异, 见 `src/secrets.rs` 与 `src/provider.rs` 头部.
 
 ## 开发流程
 
@@ -493,8 +179,14 @@ nix develop --impure      # 进入 devShell
 # 一键 check (fmt + clippy + machete + nextest + doctest)
 just check
 
-# 覆盖率报告 (HTML 写到 coverage/html/, 浏览器打开 coverage/html/index.html; 需在 devShell 内)
+# 一键 check 含覆盖率插桩 (CI 用, 会先 cargo clean target/debug 控制磁盘峰值)
+just check --coverage
+
+# 覆盖率报告 (HTML 写到 coverage/html/, 需在 devShell 内)
 just coverage-html
+
+# WebUI 回归测试 (Playwright)
+just check-webui
 
 # 开发热加载
 just dev                  # cargo watch -x run
@@ -502,45 +194,30 @@ just dev                  # cargo watch -x run
 # 手动测试 — 启动 server (需要先在 secret-guard.toml 配置 [[providers]])
 cargo run -- run --port 18787
 # state.toml 路径默认从 config 派生: secret-guard.toml → secret-guard.state.toml
-# 也可显式指定: cargo run -- run --state /tmp/my-state.toml
-# 浏览器: http://127.0.0.1:18787/  (或旧版 /__sg)
+# 浏览器: http://127.0.0.1:18787/
 # OpenAI SDK 配置: base_url = http://127.0.0.1:18787/o/<provider-id>
 ```
 
 ### CI (Forgejo Actions)
 
 CI 配置在 `.forgejo/workflows/ci.yml`, 触发条件: `push` + `pull_request` +
-`workflow_dispatch` (手动重试). 去重逻辑: PR 事件总是跑; push 仅 master 跑
-(feature branch 的 push 会被 PR 覆盖). Runner 标签为 `vm-nix` (microvm, 工具链
-直接装在 VM 的 `environment.systemPackages` 里), 不走 nix develop 避免 flake
-评估开销.
+`workflow_dispatch`. 去重逻辑: PR 事件总是跑; push 仅 master 跑.
 
 CI 流程 (测试集只跑一次):
-1. **Check + coverage data**: `just check --coverage` — fmt + clippy + machete +
-   doctest + 测试 (用 `cargo llvm-cov nextest` 插桩编译, 产出 profdata 到 `target/llvm-cov-target/`).
-2. **Coverage gate**: `just coverage-gate` — 只做 report (读上一步 profdata), 不重跑测试.
+1. **Check + coverage data**: `just check --coverage` (fmt + clippy + machete + doctest + 测试,
+   用 `cargo llvm-cov nextest` 插桩).
+2. **Coverage gate**: `just coverage-gate` (只做 report, 读上一步 profdata, 不重跑测试).
 
-**磁盘峰值控制 (CI)**: forgejo-runner-vm 的根文件系统是 tmpfs, 实测 ~3.9GB
-(默认 size = 50% RAM; VM `mem=8192`, tmpfs 用一半). clippy/doctest 共用的
-`target/debug` (~3GB) 与 coverage 插桩产物 `target/llvm-cov-target` (~1.6GB) 是两份独立编译,
-互不复用, 并存逼近 3.9GB 会触发 "No space left on device".
-`just check --coverage` 在 coverage 编译前 `cargo clean` 释放 `target/debug`,
-实测峰值降到 ~1.4GB, 零时间损失 (coverage 本就要全量重编译).
-本地要 coverage 产物但不想 clean 可用 `just coverage` / `just coverage-html` (不走 check 流程).
+**磁盘峰值控制**: forgejo-runner-vm 根文件系统是 tmpfs (~3.9GB). `just check --coverage`
+在 coverage 编译前 `cargo clean` 释放 `target/debug`, 实测峰值降到 ~1.4GB.
 
-cargo-llvm-cov 依赖的 `llvm-cov`/`llvm-profdata` (rust toolchain 不含) 由 runner VM
-的 `rust.mod.nix` 提供 (见 ~/ws/nixos), ci.yml job 级 `env` 注入绝对路径.
-门禁阈值细节见下方"覆盖率工具"段.
+**commit status context**: `ci / check (pull_request)` 或 `ci / check (push)`
+(workflow `name: ci` + job_id `check`; **禁止改 workflow name 或 job_id** — 会改变
+context 破坏门禁). branch protection status check 规则 `ci / check (*)` 用通配符覆盖两种事件.
 
-**commit status context**: `ci / check (pull_request)` 或 `ci / check (push)` (workflow
-`name: ci` + job_id `check`; **禁止改 workflow name 或 job_id** —— 会改变 context 破坏门禁).
-branch protection 的 status check 规则 `ci / check (*)` 用通配符同时覆盖两种事件后缀.
-
-**checkout 直接用 git + SSH** (不用 `actions/checkout`): forgejo 实例禁用了 git over
-HTTPS (`DISABLE_HTTP_GIT=true`), 且内置 SSH 在非标准端口 5522. workflow 直接用 `ssh://` URL
-clone (端口写在 URL 里, 无需 `insteadOf` hack), host key 用 `ssh-keyscan` 动态获取 (runner 在
-可信 MicroVM, TOFU 可接受). 依赖一个 repo-level secret: `DEPLOY_KEY` (ed25519 私钥; 对应公钥
-在 repo Settings → Deploy keys 注册).
+**checkout 直接用 git + SSH** (不用 `actions/checkout`): forgejo 禁用 git over HTTPS,
+内置 SSH 在端口 5522. workflow 用 `ssh://` URL clone, host key 用 `ssh-keyscan` 动态获取.
+依赖 repo-level secret `DEPLOY_KEY`.
 
 ### 客户端使用示例
 
@@ -569,7 +246,7 @@ client = Anthropic(
 | 单元 (纯函数) | `#[test]` | `provider::tests::protocol_short_roundtrip` |
 | Property-based | `proptest` | `redact::tests::prop_round_trip_identity` |
 | 集成 (端到端) | `mockito` + `axum::serve` | `tests/integration.rs::forwards_streaming_sse` |
-| WebUI 回归 | Playwright (TypeScript) | `tests/webui/im-ui.spec.ts` |
+| WebUI 回归 | Playwright (TypeScript) | `tests/webui/im-ui.spec.ts` (守卫前端不变量 I1/I2) |
 | 覆盖率 | cargo-llvm-cov (LLVM source-based) | `just coverage-html` |
 
 `mockito::Matcher` 在 1.x 没有 `String` 变体, 用 `Exact` 或 `Json` / `PartialJson`.
@@ -577,116 +254,51 @@ client = Anthropic(
 ### 覆盖率工具 (`cargo-llvm-cov`)
 
 集成 cargo-nextest. 工具链与 `LLVM_COV` / `LLVM_PROFDATA` 环境变量由 devShell 注入
-(nix rust toolchain 不带 llvm-tools-preview 组件, 见 `flake.nix`). 所有 coverage 命令需在 `nix develop` 内执行.
+(nix rust toolchain 不带 llvm-tools-preview 组件, 见 `flake.nix`). 所有 coverage 命令
+需在 `nix develop` 内执行.
 
-- `just coverage`: 终端摘要表格 (快速查看整体覆盖率).
-- `just coverage-gate`: 覆盖率门禁 (CI 用, 双阈值, 任一不满足则非零退出).
-- `just coverage-html`: HTML 报告 → `coverage/html/index.html` (行级着色, 定位未覆盖代码).
-- `just coverage-lcov`: LCOV 报告 → `coverage/lcov.info` (CI / IDE 集成).
+- `just coverage`: 终端摘要表格.
+- `just coverage-gate`: 覆盖率门禁 (CI 用, 双阈值).
+- `just coverage-html`: HTML 报告 → `coverage/html/index.html`.
+- `just coverage-lcov`: LCOV 报告 → `coverage/lcov.info`.
 
-产物默认写到 `target/llvm-cov-target/` (已被 `/target` 覆盖) 与 `coverage/` (已 .gitignore).
-当前基线 (全量 nextest, 327 tests): 整体 ~89%, `server.rs` 较低 (main 启动路径).
+产物默认写到 `target/llvm-cov-target/` 与 `coverage/` (均已 .gitignore).
 门禁阈值见 justfile (`COVERAGE_MIN_LINES` / `COVERAGE_MAX_UNCOVERED`).
 
-### WebUI 回归测试 (`tests/webui/`)
+## 部署
 
-TypeScript + Playwright 端到端测试, 覆盖前端 JS 逻辑 (无法用 cargo 测试覆盖).
-通过 `playwright.config.ts` 的 `webServer` 配置自动管理 mock upstream + secret-guard
-的启停, 测试完全自包含, 无需外部脚本.
+NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 批量注入方案,
+见 **`docs/deployment-nixos.md`**.
 
-依赖: `playwright-test` (由 devShell 提供, nixpkgs 打包, 自带 `@playwright/test` + 浏览器).
-devShell 的 `shellHook` 自动把 `@playwright/test` 的 node_modules symlink 到
-`tests/webui/node_modules`, 让 TS 源码的 `import "@playwright/test"` 能解析
-(ESM resolver 不读 NODE_PATH).
-
-关键场景:
-- 三段式 fingerprint: 自动刷新期间 request-pane 滚动位置 + bubble 展开状态保持
-- 三级展示气泡 (折叠 → 展开 → 弹框全文)
-- response 打字框布局 (固定底部, 独立滚动)
-- sidebar preview + model 字段显示
-- 气泡颜色 + sender icon 分类
-- 三级小圆点: 工具调用轮次折叠为横向彩色圆点 (tool name 哈希着色)
-- 短会话首屏不显示 "已经到顶了" (reachedTop 仅在 loadOlder 探测后置位)
-- 气泡间微小间距 (margin-bottom, 避免视觉粘连)
-- 每轮 info ℹ 按钮: 弹窗展示传输层元数据 (无网络请求)
-- 每轮 raw 按钮: 弹窗展示原始 body + headers (按需懒拉 /records/{id})
-- response 单气泡 (text + tool_calls 合并, 不拆分)
-
-运行 (在 devShell 内): `just check-webui`.
-
-集成测试覆盖的关键场景:
-- 同协议 identity passthrough (OpenAI / Anthropic / Gemini / Ollama)
-- 跨协议请求返回 501 `not_implemented`
-- 未知 protocol / provider 返回 404
-- 禁用 provider 返回 503
-- provider api_key 覆盖客户端 auth header
-- root `/` 提供 Web UI
-- static provider 在 effective view 与路由中生效
-- dynamic override 替换 static 路由目标
-- decision=disabled 从 effective view 移除 + 路由 404
-- decision=prefer_static 强制使用 static
-- PUT 静态 provider 自动 fork dynamic override
-- DELETE 静态 provider 返回 409 (必须走 decision 通道)
-- DELETE dynamic override 后回到 static 基线
-- POST 与 static id 冲突返回 409
-- PATCH .../decision 对 dynamic-only id 返回 404
-- 同协议 + redact + 流式: 跨 SSE chunk 的 mock 也被 sliding-window restore
-- 同协议 + redact + 流式 + tool_use: InputJsonDelta 中的 mock 被 restore
+> 路径约定见上方"路由策略"表格; `/__sg` 子路由细节 (slash redirect / 未匹配 404 no-forward)
+> 见 `src/web/AGENTS.md`.
 
 ## 已知限制 (MVP)
 
-- **跨协议 + 流式响应**: OpenAI ⇄ Anthropic 跨协议时, `stream=true` 返回 501
-  (流式跨协议翻译尚未接入 dispatch; StreamTranslate 已实现但未集成).
-- **C5 是概率性契约**: `mock_with_salt` 极大概率不含 real_secret ≥4 字符子串 (碰撞概率 ≈ 2^-32).
-  全 base62 字母的 secret 风险更高, `proptest-regressions/redact.txt` 记录历史失败种子.
-- **同协议 + redact 失去 byte-exact**: reader → redact_ir → writer 重序列化, 字段顺序 / 空字符串
-  归一化可能让 wire 字节略变, 但语义等价. 同协议 + 无 redact 路径仍 byte-exact.
-- **流式 + redact + 非 2xx 上游错误**: 走 `fan_out_buffered_ir`, 但 SSE 错误流不是单个 JSON,
-  parse 失败时 fallback 原样返回 (无 restore). 客户端可能看到 mock.
-- mock 生成用 SipHash (Rust `DefaultHasher`), 同 Rust 版本内确定, 但**不保证跨版本稳定**;
-  RedactionMap 是 per-request 状态不持久化, 所以无实际影响.
-- mock 默认与 real_secret 等长 (由 `MockStrategy::default_for` infer), charset 来自 real.
-  用户可通过 MockStrategy 两维度 (初始值 + 生成策略) 自定义 prefix / charset / length.
-  Fixed 模式下 mock 由用户提供, 系统校验不含 real ≥4 字符子串 (C5 best-effort).
-- **ConversationDAG 已接入**: `src/dag.rs` 作为 proxy/web 的存储后端, 替代扁平 RecordStore.
-  ForwardRecord 保留为 web 层 DTO (从 DAG node 派生). WebUI sidebar 改为两级树
-  (会话 → 轮次, 基于 sessions map + parent 链), 右侧 timeline 对话流支持惰性加载
-  (滚到顶 prepend 更早轮次, 保持滚动锚点). lazy redact 的完整 WebUI 重建
-  (derive_redact_map 含 system/tools) 是后续工作, 当前 timeline 用 push 时预存的 req_body_raw.
-- static config (`secret-guard.toml`) 的 `[server]` 段当前仅在启动时读取一次,
-  WebUI 改 host/port 不会生效 (需要重启).
-- WebUI 编辑 provider 时 api_key 始终要求重输 (无法保留旧值), 留空则覆盖为空字符串.
+- **跨协议 + 流式响应**: OpenAI ⇄ Anthropic 跨协议时 `stream=true` 返回 501
+  (StreamTranslate 已实现跨协议翻译, 但尚未接入 dispatch).
+- **C5 是概率性契约**: Auto 模式 mock 极大概率不含 real_secret ≥4 字符子串
+  (碰撞概率 ≈ 2^-32). `proptest-regressions/redact.txt` 记录历史失败种子.
+- **同协议 + Redact 失去 byte-exact**: reader → redact_ir → writer 重序列化, 字段顺序 /
+  空字符串归一化可能让 wire 字节略变, 但语义等价. 同协议 + 无 Redact 路径仍 byte-exact.
+- **流式 + Redact + 非 2xx 上游错误**: SSE 错误流不是单个 JSON, parse 失败时 fallback
+  原样返回 (无 restore), 客户端可能看到 mock.
 - **跨协议 ingress 的 timeline delta 切片可能错位**: OpenAI writer 会把 Anthropic 风格的
   混合 Text+ToolResult user 消息拆成 (1+N) 条 wire messages, 导致 `req_body_raw` 的
-  messages 数 > IR messages 数. `extract_delta_messages` 用 `messages.len() - req_delta_count`
-  切片时, 跨协议路径的 start 偏小, delta 可能包含前序轮消息. 同协议路径不受影响
-  (wire 与 IR 1:1). 后续可改为从 `req_delta` (IR MessageRef) resolve + ingress writer
-  重新序列化 (与 redact 路径一致).
-
-## 路径约定
-
-- `/` 命名空间: Web UI 主入口 (新).
-- `/__sg` 命名空间: Web UI / API (向后兼容旧入口).
-- `/__sg/` (带尾斜杠): 307 redirect 到 `/__sg`.
-- `/__sg/{*rest}` 未匹配路径: 返回 404, **绝不**进入 forward (否则会泄漏内部 URL 到上游).
-- `/{o|a|g|l}/{id}/*`: 转发到对应 provider.
-- 其他所有路径: 404.
+  messages 数 > IR messages 数. `extract_delta_messages` 切片时跨协议路径的 start 偏小,
+  delta 可能包含前序轮消息. 同协议路径不受影响. 详见 `src/web/AGENTS.md`.
+- static config 的 `[server]` 段仅在启动时读取一次, WebUI 改 host/port 不会生效.
+- WebUI 编辑 provider 时 api_key 始终要求重输 (无法保留旧值).
 
 ## 后续工作 (非 MVP 范围)
 
-- **跨协议流式响应翻译**: StreamTranslate 已实现 (egress SSE → IR 事件 → ingress SSE,
-  含 chunk-boundary 处理 + tool_calls/index 状态合成 + 同协议 restore 模式),
-  但跨协议路径尚未接入 dispatch. 需要在 `cross_proto_forward` 检测 stream=true 时,
-  接入 `StreamTranslate::new(ingress, egress)` 而非返回 501.
+- **跨协议流式响应翻译**: 在 `cross_proto_forward` 检测 stream=true 时接入
+  `StreamTranslate::new(ingress, egress)` 而非返回 501.
 - **更多协议**: Gemini / Ollama / Bedrock / Cohere / OpenAI Responses API.
   新增协议只需实现 Reader + Writer trait (~200 行), 不动 dispatch.
-- **redact 性能优化**: `redact_ir` 与 `StreamingRestorer::find_safe_end` 都对每个 secret
-  做全字符串扫描 (K * n 复杂度). 高 secret 数 + 大 IR / chunk 场景可能成为热点.
-  长期用 Aho-Corasick (多模式匹配) 一次性扫所有 mock.
-- **redact 测试基线**: 加 criterion bench 测典型场景 (10 secrets × 10KB IR, 100 × 100KB),
-  留作回归基线.
-- mock_secret 的 category-aware 默认生成 (Password/ApiKey/Cookie 等格式感知;
-  当前 MockStrategy 已支持用户自定义 prefix/charset/length, 但默认仍由 real 推断).
-- 配置热加载 (目前 Web UI 改 config 后, 重启才影响 CLI 参数).
-- 测试覆盖率自动上报 + fuzzing (cargo-fuzz).
+- **redact 性能优化**: `redact_ir` 与 `StreamingRestorer::find_safe_end` 对每个 secret
+  做全字符串扫描 (K * n 复杂度). 长期用 Aho-Corasick 多模式匹配.
+- **redact 测试基线**: criterion bench 测典型场景, 留作回归基线.
+- mock_secret 的 category-aware 默认生成 (Password/ApiKey/Cookie 等格式感知).
+- 配置热加载; 测试覆盖率自动上报 + fuzzing (cargo-fuzz).
 - Web UI 编辑 provider 时保留 api_key (改用 `null` 表示不更新).

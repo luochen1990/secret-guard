@@ -32,6 +32,44 @@
 //! 返回 `EffectiveProvider` / `EffectiveSecret`) 在各自模块以
 //! `impl DynamicTable<Provider>` / `impl DynamicTable<SecretEntry>` 的形式补充
 //! (Rust 允许对泛型具体实例添加 inherent impl, 前提是泛型本身在本地 crate).
+//!
+//! # 持久化策略 (`DynamicTable::upsert` / `delete`)
+//!
+//! - 内存层: `Arc<RwLock<Vec<T>>>` × 2 (static_entries 只读 + dynamic_entries 可变).
+//! - 持久化顺序: **先写 state.toml (atomic + fsync), 再更新内存** (失败自动回滚).
+//! - `tmp` 文件名带 UUID, 避免并发 `atomic_write` 互相覆盖.
+//! - 每次写 dynamic 时 `DynamicState::load_or_empty(state_path)` → 改对应段 → `to_toml` → `atomic_write`.
+//!
+//! # 跨表并发安全 (由 `server.rs` 装配)
+//!
+//! `SecretTable` 与 `ProviderTable` (都是 `DynamicTable<T>` 别名) 共享两份同步原语
+//! (server 启动时构造并注入):
+//! - **`Arc<Mutex<()>> persist_lock`**: 串行整个 RMW, 避免两表并发写 state.toml 互相覆盖.
+//! - **`Arc<RwLock<Decisions>>` decisions**: 同一份 per-id 决策 (因为 `[decisions]` 段同时含
+//!   providers + secrets 两个子表, 任何一方修改都要触发 state.toml 重写, 共享同一份内存).
+//!
+//! # Effective source (4 种, 供 UI 区分)
+//!
+//! | `source` 字段 | 含义 |
+//! |---|---|
+//! | `static` | 仅 static 有此 id, 用 static. |
+//! | `dynamic` | 仅 dynamic 有此 id (WebUI 创建的). |
+//! | `dynamic_override` | static + dynamic 都有, decision=Default → 用 dynamic. |
+//! | `static_preferred` | static + dynamic 都有, decision=PreferStatic → 用 static. |
+//!
+//! Disabled 项不进入 effective view (UI 看不到, 路由层也拿不到).
+//!
+//! # CRUD 操作语义
+//!
+//! - **POST** 创建 dynamic-only item. 若 id 与 static 冲突 → 409 (要用 PUT 走 fork 流程).
+//! - **PUT** 编辑: 若 id 在 static 中, 服务端自动 fork 出一份 dynamic override (git-style 心智模型).
+//! - **DELETE** 仅作用于 dynamic: 若有 dynamic 删除之 (override 关系下保留 static + 重置 decision);
+//!   若 id 仅在 static 中 → 409 (提示用 PATCH .../decision + mode=disabled).
+//! - **PATCH `/{id}/decision`** 切换对 static id 的决策. 返回 `{id, resource, decision}` ack.
+//!
+//! 类型钩子: `DynamicEntry` trait 让泛型表知道如何把 entry 写入 state 的对应字段
+//! (`set_state_field`) 与读写 decisions 的对应子表 (`get_decision` / `set_decision`).
+//! 新增第三种 entry 类型只需 impl 该 trait (~25 行) 即可获得完整 CRUD / 持久化 / decision 通道.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
