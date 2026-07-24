@@ -27,7 +27,9 @@
 //!   seed) 的代价, 换取了 lazy redact 重建的极简 (node 只存单标量 seed). secret 编辑是
 //!   罕见操作, 不在多轮对话热路径上, 实际影响可忽略.
 //! - **C4 单射性**: 在一次 [`redact_ir`] 调用内, 不同 secret 总映射到不同 mock
-//!   (因为每次 gen_mock_for_ir 都检查 allocated 集合).
+//!   (因为每次 gen_mock_for_ir 都检查 allocated 集合). 极端弱配置下探测可能耗尽,
+//!   此时 [`redact_ir`] **跳过该 secret** (原样发往上游) 而非 panic, 优先保进程存活.
+//!   [`RedactionMap::insert`] 的 C4 违反 (defense-in-depth) 同样降级跳过, 永不 panic.
 //! - **C5 不含 real_secret 子串** (best-effort):
 //!   - Auto 模式: mock 由 hash 驱动, 极大概率不含 real_secret 的 ≥4 字符连续子串.
 //!     `gen.prefix` (用户自定义或 `[redact] global_mock_prefix` 注入的) 在
@@ -70,9 +72,37 @@
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::codec::ir::{IrBlock, IrDelta, IrRequest, IrResponse, IrTool};
 use crate::secrets::SecretEntry;
+
+/// redact pipeline 内部错误. **永不**携带真实 secret 明文, 只记 secret id 与可诊断元数据.
+///
+/// # 设计动机
+///
+/// redact 是 secret-guard 的核心安全路径. 弱配置 (eg Auto 模式, charset 仅 digits,
+/// length_range=(1,1), 仅 10 个候选值) 加上对抗性 IR 可能耗尽 mock 候选. 历史上以
+/// `panic!` 报错, 消息含真实 secret 明文 (`secret.value`), 既能被恶意请求触发 DoS
+/// 又把 secret 泄露到 stderr/日志. 改为 `Result` 后, 调用方 ([`redact_ir`]) 在 Err 时
+/// 用 `warn!` (只记 secret id) 并**跳过该 secret 的本轮 redact** (该 secret 原样发往
+/// 上游), 显著优于崩溃整个进程 (崩溃会让所有在途请求失败).
+#[derive(Debug)]
+pub struct RedactError {
+    /// 触发错误的 secret id (来自 [`SecretEntry::id`]), 不含 value.
+    pub secret_id: String,
+    /// 可读的失败原因 (不含 secret 值).
+    pub reason: RedactReason,
+}
+
+/// redact 失败的具体原因 (不含敏感数据).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedactReason {
+    /// mock probing 耗尽 (eg 配置的 charset/length 仅产生极少候选, 全部已在 IR 或 allocated 中).
+    ProbingExhausted,
+    /// 内部一致性错误 (C4 单射性违反, 仅在防御性检查触发).
+    MockCollision,
+}
 
 /// 改写映射: real ↔ mock 双向索引.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -88,17 +118,24 @@ impl RedactionMap {
         self.real_to_mock.is_empty()
     }
 
-    /// 插入映射. 若 mock 已存在但 real 不同 (碰撞), panic.
-    /// C4 保证 collision 实际不可能发生 (probing 挽救); 这里是 defense-in-depth.
-    pub fn insert(&mut self, real: String, mock: String) {
-        if let Some(existing) = self.mock_to_real.get(&mock) {
-            assert!(
-                existing == &real,
-                "mock collision: mock={mock:?} already maps to {existing:?}, attempted {real:?}"
-            );
+    /// 插入映射. 若 mock 已映射到**不同** real (C4 单射性违反), 返回 `RedactError`
+    /// (defense-in-depth; C4 保证正常路径不会触发).
+    ///
+    /// **安全**: `RedactError` 只携带 `reason` (不含 mock 值也不含 real 明文).
+    /// 旧实现用 `assert!` 把 `{existing:?}` 与 `{real:?}` (真实 secret 明文) 写入 panic
+    /// 消息, 既是 DoS 面又是泄密面.
+    pub fn insert(&mut self, real: String, mock: String) -> Result<(), RedactError> {
+        if let Some(existing) = self.mock_to_real.get(&mock)
+            && existing != &real
+        {
+            return Err(RedactError {
+                secret_id: String::new(),
+                reason: RedactReason::MockCollision,
+            });
         }
         self.mock_to_real.insert(mock.clone(), real.clone());
         self.real_to_mock.insert(real, mock);
+        Ok(())
     }
 
     pub fn mock_for(&self, real: &str) -> Option<&str> {
@@ -141,25 +178,28 @@ fn candidate_for(secret: &SecretEntry, seed: u64, counter: u32) -> String {
 /// 生成一个在当前 IR 中**未出现**且**未分配过**的 mock.
 ///
 /// per-request seed 模型: 所有 secret 共享同一 seed. counter 是 per-secret 的 probing.
+///
+/// 返回 `Err(RedactError)` 当探测耗尽 (2^20 次仍未找到唯一 mock). 旧实现用 `panic!`,
+/// 消息含 `secret.value` (真实 secret 明文) 与 `secret.mock_strategy`, 可被弱配置 +
+/// 对抗性 IR 触发, 既 DoS 又泄密. 改为 `Result` 后由 [`redact_ir`] 决策降级策略.
 fn gen_mock_for_ir(
     ir: &IrRequest,
     secret: &SecretEntry,
     seed: u64,
     allocated: &HashSet<String>,
-) -> String {
+) -> Result<String, RedactError> {
     let mut counter: u32 = 0;
     loop {
         let candidate = candidate_for(secret, seed, counter);
         if !ir_request_contains(ir, &candidate) && !allocated.contains(&candidate) {
-            return candidate;
+            return Ok(candidate);
         }
         counter += 1;
         if counter > (1u32 << 20) {
-            panic!(
-                "mock probing exhausted after 2^20 attempts; \
-                 ir likely adversarial (real={:?}, strategy={:?})",
-                secret.value, secret.mock_strategy
-            );
+            return Err(RedactError {
+                secret_id: secret.id.clone(),
+                reason: RedactReason::ProbingExhausted,
+            });
         }
     }
 }
@@ -194,10 +234,38 @@ pub fn redact_ir(ir: &mut IrRequest, secrets: &[SecretEntry]) -> (RedactionMap, 
             continue;
         }
         hit_any = true;
-        let mock = gen_mock_for_ir(ir, secret, seed, &allocated);
-        ir_request_replace_all(ir, &secret.value, &mock);
-        allocated.insert(mock.clone());
-        map.insert(secret.value.clone(), mock);
+        match gen_mock_for_ir(ir, secret, seed, &allocated) {
+            Ok(mock) => {
+                // 先 insert 到 map (防御性 C4 检查); 成功后再改写 IR + allocated,
+                // 确保 map 与 IR 状态一致 (避免改写了 IR 但 map 缺失映射, 导致 restore 失败).
+                match map.insert(secret.value.clone(), mock.clone()) {
+                    Ok(()) => {
+                        ir_request_replace_all(ir, &secret.value, &mock);
+                        allocated.insert(mock);
+                    }
+                    Err(e) => {
+                        // insert 的 collision 在防御性检查中触发时, 同样降级跳过 (不 panic).
+                        // 不改写 IR: secret 原样发往上游 (与探测耗尽的降级语义一致).
+                        warn!(
+                            secret_id = %e.secret_id,
+                            reason = ?e.reason,
+                            "redact insert failed; skipping this secret (forwarded unredacted)"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                // 探测耗尽: 弱配置 (eg charset/length 仅产生极少候选) + 对抗性 IR.
+                // 降级: 跳过该 secret (原样发往上游), 不替换. 优于崩溃整个进程.
+                // 安全: 只记 secret id 与 reason, 永不记 secret value.
+                warn!(
+                    secret_id = %e.secret_id,
+                    reason = ?e.reason,
+                    "mock probing exhausted; skipping this secret (forwarded unredacted). \
+                     consider widening charset or length_range for this secret"
+                );
+            }
+        }
     }
 
     let final_seed = if hit_any { seed } else { 0 };
@@ -702,7 +770,7 @@ mod tests {
         let allocated = HashSet::new();
         let entry = entry("real-secret");
         let seed = init_seed(std::slice::from_ref(&entry));
-        let m = gen_mock_for_ir(&ir, &entry, seed, &allocated);
+        let m = gen_mock_for_ir(&ir, &entry, seed, &allocated).expect("probing must succeed");
         assert!(
             !ir_request_contains(&ir, &m),
             "gen mock must avoid existing IR content; got {m}"
@@ -840,6 +908,79 @@ mod tests {
                 "mock '{m}' length must equal real '{real}' (no global prefix)"
             );
         }
+    }
+
+    #[test]
+    fn redact_ir_skips_secret_when_probing_exhausted_instead_of_panicking() {
+        // 弱配置回归: Auto 模式 + charset.digits + length_range=(1,1) 仅产生 10 个候选 ("0".."9").
+        // 旧实现在 IR 已含全部 10 个候选时会 panic, 消息含真实 secret 明文 (DoS + 泄密).
+        // 现在应降级跳过该 secret (原样保留 real), 不 panic.
+        use crate::mock::{Charset, GenSpec, InitialValue, MockStrategy};
+
+        let weak_strategy = MockStrategy {
+            initial: InitialValue::Auto,
+            gen_spec: Some(GenSpec {
+                prefix: String::new(),
+                charset: Charset {
+                    digits: true,
+                    lowercase: false,
+                    uppercase: false,
+                    underscore: false,
+                    hyphen: false,
+                    other: vec![],
+                },
+                length_range: (1, 1), // 仅 10 个可能值
+            }),
+        };
+        let real_secret = "super-secret-value-DO-NOT-LEAK";
+        let mut weak_entry = SecretEntry {
+            id: "weak-secret".into(),
+            name: None,
+            category: SecretCategory::ApiKey,
+            value: real_secret.into(),
+            value_file: None,
+            mock_strategy: weak_strategy,
+        };
+        weak_entry.mock_strategy.resolve_against(real_secret, "");
+
+        // IR 含全部 10 个数字候选 → gen_mock_for_ir 必然耗尽.
+        let ir_text = "0 1 2 3 4 5 6 7 8 9 also contains super-secret-value-DO-NOT-LEAK";
+        let mut ir = sample_ir_with_text(ir_text);
+        let (map, _) = redact_ir(&mut ir, std::slice::from_ref(&weak_entry));
+
+        // 不 panic 即通过. 进一步断言: 该 secret 被跳过 (map 为空, real 原样保留).
+        assert!(
+            map.is_empty(),
+            "exhausted secret should be skipped, not mapped; got map with {} entries",
+            map.real_to_mock.len()
+        );
+        let redacted_text = match &ir.messages[0].content[0] {
+            IrBlock::Text { text } => text.as_str(),
+            _ => panic!("expected Text block"),
+        };
+        assert!(
+            redacted_text.contains(real_secret),
+            "real secret must be preserved verbatim when probing exhausts (skip, not crash)"
+        );
+    }
+
+    #[test]
+    fn redaction_map_insert_collision_returns_err_without_leaking_secret() {
+        // C4 违反 (defense-in-depth) 应返回 Err 而非 panic, 且 Err 不含 real secret 明文.
+        let mut map = RedactionMap::default();
+        let real_a = "secret-AAAAAAA";
+        let real_b = "secret-BBBBBBB";
+        let same_mock = "MOCK-COLLISION";
+        map.insert(real_a.to_string(), same_mock.to_string())
+            .unwrap();
+        let err = map
+            .insert(real_b.to_string(), same_mock.to_string())
+            .expect_err("collision must return Err");
+        // Err 的 Debug / Display 不得含任一 real secret 明文.
+        let err_dbg = format!("{err:?}");
+        assert!(!err_dbg.contains(real_a), "Err leaks real_a: {err_dbg}");
+        assert!(!err_dbg.contains(real_b), "Err leaks real_b: {err_dbg}");
+        assert_eq!(err.reason, RedactReason::MockCollision);
     }
 
     #[test]
@@ -981,7 +1122,8 @@ mod tests {
             ..Default::default()
         };
         let mut map = RedactionMap::default();
-        map.insert("sk-real-secret".to_string(), "MOCKABCDEF12345".to_string());
+        map.insert("sk-real-secret".to_string(), "MOCKABCDEF12345".to_string())
+            .unwrap();
         restore_ir_response(&mut ir, &map);
         match &ir.content[0] {
             IrBlock::Text { text } => {
@@ -998,7 +1140,7 @@ mod tests {
 
     fn map_with(real: &str, mock: &str) -> RedactionMap {
         let mut m = RedactionMap::default();
-        m.insert(real.to_string(), mock.to_string());
+        m.insert(real.to_string(), mock.to_string()).unwrap();
         m
     }
 
@@ -1060,8 +1202,10 @@ mod tests {
     #[test]
     fn restorer_round_trip_on_multiple_mocks_in_one_chunk() {
         let mut map = RedactionMap::default();
-        map.insert("r1".to_string(), "MOCK11111111111".to_string());
-        map.insert("r2".to_string(), "MOCK22222222222".to_string());
+        map.insert("r1".to_string(), "MOCK11111111111".to_string())
+            .unwrap();
+        map.insert("r2".to_string(), "MOCK22222222222".to_string())
+            .unwrap();
         let mut r = StreamingRestorer::new(map);
         let out = r.push("a MOCK11111111111 b MOCK22222222222 c".to_string());
         let (_, tail) = r.flush();
@@ -1138,7 +1282,7 @@ mod tests {
             let allocated = HashSet::new();
             let entry = entry(&secret);
             let seed = init_seed(std::slice::from_ref(&entry));
-            let m = gen_mock_for_ir(&ir, &entry, seed, &allocated);
+            let m = gen_mock_for_ir(&ir, &entry, seed, &allocated).expect("probing must succeed");
             prop_assert!(!ir_request_contains(&ir, &m),
                 "mock must not appear in pre-redact IR: mock={}", m);
         }
@@ -1292,7 +1436,7 @@ mod tests {
             let real = "SECRETVALUE";
             let mock = "MOCKABCDEFGHIJK"; // 15 字节, 与 real 等价映射
             let mut map = RedactionMap::default();
-            map.insert(real.to_string(), mock.to_string());
+            map.insert(real.to_string(), mock.to_string()).unwrap();
 
             let full = format!("{prefix}{mock}{suffix}");
             let mut r = StreamingRestorer::new(map);
@@ -1313,7 +1457,7 @@ mod tests {
             let real = "SECRETVALUE";
             let mock = "MOCKABCDEFGHIJK";
             let mut map = RedactionMap::default();
-            map.insert(real.to_string(), mock.to_string());
+            map.insert(real.to_string(), mock.to_string()).unwrap();
 
             let full = format!("{prefix}{mock}{suffix}");
             let mut r = StreamingRestorer::new(map);
@@ -1335,8 +1479,8 @@ mod tests {
             let mock1 = "MOCK11111111111"; // 15 字节
             let mock2 = "MOCK22222222222";
             let mut map = RedactionMap::default();
-            map.insert(real1.to_string(), mock1.to_string());
-            map.insert(real2.to_string(), mock2.to_string());
+            map.insert(real1.to_string(), mock1.to_string()).unwrap();
+            map.insert(real2.to_string(), mock2.to_string()).unwrap();
 
             // full 含两个 mock + filler (可能相邻 / 嵌套 / 被 filler 分隔).
             let full = format!("{filler}{mock1}{filler}{mock2}{filler}");
