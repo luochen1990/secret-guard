@@ -2951,3 +2951,107 @@ async fn validate_value_rejects_mock_prefix() {
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 }
+
+// ─── 回归守卫: 同协议 byte-exact + 跨协议 5xx 错误翻译 ──────────────────────
+
+/// 同协议 + 无 secret (passthrough 路径) 必须保持字节级 byte-exact.
+///
+/// AGENTS.md 路由策略声明: same-proto + 无 redact 路径仍 byte-exact. 既有
+/// `forwards_non_streaming_json` 只断言 body.contains 子串, 未做逐字节相等.
+/// 本测试用包含特定空格 / 换行 / 字段顺序 / Unicode 的固定 body, 断言客户端收到的
+/// 字节与上游 body 完全相等 (任何 reader → writer 重序列化路径都会破坏此不变式).
+#[tokio::test]
+async fn same_proto_passthrough_is_byte_exact() {
+    let mut upstream = spawn_mock_upstream().await;
+    // 故意使用: 字段顺序非字母序、嵌套空格、Unicode (中文/emoji)、特定换行风格.
+    // 注: mockito with_body 接受 &str, 不做任何规范化.
+    let upstream_body = concat!(
+        "{\n",
+        "  \"id\":\"chatcmpl-byte-exact\",\n",
+        "  \"object\":\"chat.completion\",\n",
+        "  \"created\":1700000000,\n",
+        "  \"model\":\"gpt-4-byte\",\n",
+        "  \"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",",
+        "\"content\":\"你好 🌍 byte-exact payload with  trailing space\"},",
+        "\"finish_reason\":\"stop\"}],\n",
+        "  \"usage\":{\"prompt_tokens\":7,\"completion_tokens\":11,\"total_tokens\":18}\n",
+        "}"
+    );
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(upstream_body)
+        .create_async()
+        .await;
+
+    // 无 secret 配置 → 走 same_proto_passthrough (字节透传) 路径.
+    let proxy_url = spawn_proxy(&upstream.url()).await;
+    let (status, body, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        r#"{"model":"gpt-4"}"#,
+        &[],
+    )
+    .await;
+
+    assert_eq!(status, reqwest::StatusCode::OK);
+    // 核心 byte-exact 断言: 客户端收到的字节必须与上游 body 逐字节相等.
+    assert_eq!(
+        body.as_bytes(),
+        upstream_body.as_bytes(),
+        "same-proto passthrough must be byte-exact; got body: {body}"
+    );
+}
+
+/// 跨协议上游错误翻译矩阵: 500 / 502 / 504.
+///
+/// 既有 `cross_protocol_translates_upstream_error_to_ingress_envelope` 只测 429.
+/// 本测试用 test_case 参数化覆盖 5xx (上游宕机 / 网关错误 / 超时), 断言错误被翻译为
+/// ingress 协议 (OpenAI) 原生 envelope, 状态码透传.
+#[tokio::test]
+async fn cross_protocol_translates_upstream_5xx_errors() {
+    for (upstream_status, expected_status) in [
+        (500u16, reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+        (502, reqwest::StatusCode::BAD_GATEWAY),
+        (504, reqwest::StatusCode::GATEWAY_TIMEOUT),
+    ] {
+        let mut upstream = spawn_mock_upstream().await;
+        let _m = upstream
+            .mock("POST", "/v1/messages")
+            .with_status(upstream_status as usize)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"error":{{"type":"server_error","message":"upstream returned {upstream_status}"}}}}"#
+            ))
+            .create_async()
+            .await;
+        let provider = provider_with("an-main", Protocol::Anthropic, &upstream.url());
+        let proxy_url = spawn_proxy_with_provider(provider).await;
+        // OpenAI ingress → Anthropic upstream (跨协议路径).
+        let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"}]}"#;
+        let (status, resp_body, _) = proxy_request(
+            &proxy_url,
+            "POST",
+            "/o/an-main/v1/chat/completions",
+            body,
+            &[],
+        )
+        .await;
+        assert_eq!(
+            status, expected_status,
+            "status code should pass through for upstream {upstream_status}"
+        );
+        // 翻译为 OpenAI 风格 envelope (content-type json + 含 error.message).
+        assert!(
+            resp_body.contains("upstream returned"),
+            "ingress envelope should contain upstream error message; got: {resp_body}"
+        );
+        // 不应泄漏 Anthropic 风格字段 (如顶层 "type" 而非嵌套 error.type 是 anthropic shape).
+        assert!(
+            resp_body.contains("\"error\""),
+            "OpenAI ingress envelope must have top-level error object; got: {resp_body}"
+        );
+    }
+}
