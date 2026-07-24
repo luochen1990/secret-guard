@@ -352,6 +352,10 @@ pub struct RecordSummary {
 }
 
 /// preview 截断上限 (char count). 后端唯一截断点, 前端直接渲染.
+///
+/// 决策依据: sidebar 单条目宽度约 ~20em, 48 个 char (含中英文混合) 在单行省略号下
+/// 既保留足够辨识度 (用户问题前半句), 又不撑爆紧凑布局. 调小 → 同质性升高难辨识;
+/// 调大 → 多条目挤压. 48 是实测权衡值.
 const PREVIEW_MAX: usize = 48;
 /// 超过此大小的 req_body 跳过 preview 提取 (避免大 body 无谓 JSON parse).
 /// 1 MiB 足以覆盖绝大多数 LLM 请求 (system prompt + 多轮对话); 超出此大小的请求

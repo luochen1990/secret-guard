@@ -111,9 +111,17 @@ const HOP_BY_HOP: &[&str] = &[
 ];
 
 /// 请求 body 在内存中收集的上限 (16 MiB).
+///
+/// 决策依据: 实测覆盖 99% LLM 请求 (system prompt + 多轮对话 + tools schema).
+/// 超过此值的请求往往是误传 (如整库代码上传), 失败比 OOM 更可恢复.
+/// 客户端错误信息会提示 "request body too large".
 const MAX_REQ_BODY: usize = 16 * 1024 * 1024;
 
 /// 单条响应 body 累积记录的上限 (32 MiB).
+///
+/// 决策依据: LLM 长输出 (如 100k token 代码生成) 经 SSE 累积可达 ~10 MiB JSON;
+/// 32 MiB 留 3x 余量覆盖极端长输出 + tool_use input 嵌套场景.
+/// 注意: 此上限**只影响 DAG 记录**, 客户端响应**不受限** (流式透传, 不全量 buffer).
 const MAX_RESP_BODY_RECORD: usize = 32 * 1024 * 1024;
 
 /// 流式 parsed view (StreamScan snapshot) 的节流写入间隔.
@@ -134,6 +142,11 @@ const ERR_RESP_CAP_EXCEEDED: &str = "response exceeds record cap";
 /// overflow 时写入 raw_resp_body 的占位 banner (供前端展示).
 const TRUNCATED_BANNER: &str = "<truncated: exceeded record cap>";
 
+/// 错误响应回放给客户端时的 message 字段截断上限 (字节).
+///
+/// 决策依据: 上游错误 body 可能含整段 stack trace / HTML 错误页, 全量回放会污染
+/// 客户端错误日志. 4 KiB 足以保留 "error.message" 主信息 + 一段上下文.
+const MAX_ERROR_MSG_LEN: usize = 4096;
 /// 主 handler: 路径 `/{proto}/{name}/{*rest}`, 解析后透传到对应 provider.
 ///
 /// 路径段语义:
@@ -969,7 +982,7 @@ async fn cross_proto_forward(
             })
             .unwrap_or_else(|| {
                 let raw = std::str::from_utf8(&resp_bytes).unwrap_or("");
-                let cap = raw.len().min(4096);
+                let cap = raw.len().min(MAX_ERROR_MSG_LEN);
                 raw[..cap].to_string()
             });
         let kind = http_status_to_error_kind(resp_status.as_u16());
