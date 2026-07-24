@@ -36,6 +36,70 @@ use crate::secrets::{EffectiveSecret, SecretCategory, SecretEntry};
 /// 共享的 `no-store` header 设置 (axum 的 `[(name, value); N]` 接受 `(&str, &str)`).
 pub const NO_STORE: [(&str, &str); 1] = [("cache-control", "no-store, no-cache, must-revalidate")];
 
+// ─── CRUD 通用 helper (secret / provider 共享) ──────────────────────────────
+//
+// secrets 与 providers 的 8 个 CRUD handler 结构高度对称 (effective 查重 / upsert /
+// delete 分支分类), 仅 entry 类型与 validate 调用不同. 这里抽两条最明显的重复:
+// (1) delete 的 DeleteOutcome 分支分类 (4 行 match × 2 = 8 行压到 1 个泛型函数).
+// (2) effective 视图中按 id 查找 (闭包 .any(|x| x.id==id) / .find(|x| x.id==saved.id) × 4).
+
+/// EffectiveItem: 让 EffectiveSecret / EffectiveProvider 共享 "按 id 查" 的泛型 helper.
+/// 仅需 id 访问器, 不引入 sealed trait 的复杂度.
+trait EffectiveItem {
+    fn effective_id(&self) -> &str;
+}
+
+impl EffectiveItem for EffectiveSecret {
+    fn effective_id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl EffectiveItem for EffectiveProvider {
+    fn effective_id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// effective 视图中是否存在指定 id.
+fn effective_contains_id(items: &[impl EffectiveItem], id: &str) -> bool {
+    items.iter().any(|x| x.effective_id() == id)
+}
+
+/// upsert 后从 effective 视图按 id 查回最新状态 (upsert_dynamic 不返回 effective 视图,
+/// 需重新查一次给前端). 找不到时 panic (刚 upsert, 不应发生).
+fn effective_find_by_id<I: EffectiveItem>(items: Vec<I>, id: &str) -> I {
+    items
+        .into_iter()
+        .find(|x| x.effective_id() == id)
+        .expect("just upserted; effective view must contain it")
+}
+
+/// delete_dynamic 的 DeleteOutcome 分类: Deleted → 204; NotFound → 区分 static-only
+/// (409 conflict, 提示用 disabled decision) vs 真不存在 (404).
+///
+/// `kind_label` = "secret" | "provider", 用于错误消息.
+fn classify_delete_outcome(
+    outcome: DeleteOutcome,
+    has_static: bool,
+    kind_label: &str,
+    id: &str,
+) -> Result<&'static str, ApiError> {
+    match outcome {
+        DeleteOutcome::Deleted => Ok(""), // 204 No Content 的空 body.
+        DeleteOutcome::NotFound => {
+            if has_static {
+                Err(ApiError::conflict(format!(
+                    "cannot delete a static {kind_label}; use PATCH .../decision with \
+                     {{\"mode\":\"disabled\"}} to disable it"
+                )))
+            } else {
+                Err(ApiError::not_found(format!("{kind_label} {id} not found")))
+            }
+        }
+    }
+}
+
 // ─── /records ──────────────────────────────────────────────────────────────
 
 /// `GET /api/records` 查询参数.
@@ -579,12 +643,7 @@ pub async fn create_secret(
         .validate_and_resolve(&state.global_mock_prefix)
         .map_err(ApiError::validation)?;
     // 检查 effective view 中是否已存在 (含 static 来源). 不允许覆盖 static 创建同 id.
-    if state
-        .secrets
-        .effective_snapshot()
-        .iter()
-        .any(|s| s.id == entry.id)
-    {
+    if effective_contains_id(&state.secrets.effective_snapshot(), &entry.id) {
         return Err(ApiError::conflict(format!(
             "secret with id '{}' already exists (in static or dynamic); use PUT to override",
             entry.id
@@ -601,12 +660,7 @@ pub async fn create_secret(
         ));
     }
     // upsert_dynamic 不返回 effective 视图, 这里再查一次给前端 (低成本, 创建场景罕见).
-    let ev = state
-        .secrets
-        .effective_snapshot()
-        .into_iter()
-        .find(|s| s.id == saved.id)
-        .expect("just upserted");
+    let ev = effective_find_by_id(state.secrets.effective_snapshot(), &saved.id);
     Ok((StatusCode::CREATED, NO_STORE, Json(ev)))
 }
 
@@ -617,12 +671,7 @@ pub async fn update_secret(
 ) -> Result<impl IntoResponse, ApiError> {
     // 允许编辑 static-only id: 服务端自动 fork 出 dynamic override.
     // 但若 id 完全不存在 (effective 中查不到), 返回 404.
-    let exists = state
-        .secrets
-        .effective_snapshot()
-        .iter()
-        .any(|s| s.id == id);
-    if !exists {
+    if !effective_contains_id(&state.secrets.effective_snapshot(), &id) {
         return Err(ApiError::not_found(format!("secret {id} not found")));
     }
     let mut entry = payload.into_entry()?;
@@ -635,12 +684,7 @@ pub async fn update_secret(
         .secrets
         .upsert_dynamic(entry)
         .map_err(ApiError::from_any)?;
-    let ev = state
-        .secrets
-        .effective_snapshot()
-        .into_iter()
-        .find(|s| s.id == saved.id)
-        .expect("just upserted");
+    let ev = effective_find_by_id(state.secrets.effective_snapshot(), &saved.id);
     Ok((StatusCode::OK, NO_STORE, Json(ev)))
 }
 
@@ -651,23 +695,12 @@ pub async fn delete_secret(
     // 若 dynamic 有此 id, 删除 (覆盖关系下仅移除 override, static 保留).
     // 若 dynamic 无此 id 但 static 有, 拒绝删除 (static 永不可写; 提示用 disabled decision).
     // 用 has_static 直接查 static 层, 不受 decision 影响 (disabled 的 id 也能正确报 409).
-    match state
+    let outcome = state
         .secrets
         .delete_dynamic(&id)
-        .map_err(ApiError::from_any)?
-    {
-        DeleteOutcome::Deleted => Ok((StatusCode::NO_CONTENT, NO_STORE, "")),
-        DeleteOutcome::NotFound => {
-            if state.secrets.has_static(&id) {
-                Err(ApiError::conflict(
-                    "cannot delete a static secret; use PATCH .../decision with \
-                     {\"mode\":\"disabled\"} to disable it",
-                ))
-            } else {
-                Err(ApiError::not_found(format!("secret {id} not found")))
-            }
-        }
-    }
+        .map_err(ApiError::from_any)?;
+    let body = classify_delete_outcome(outcome, state.secrets.has_static(&id), "secret", &id)?;
+    Ok((StatusCode::NO_CONTENT, NO_STORE, body))
 }
 
 /// 切换对 static id 的 per-item 决策. body: `{"mode": "default|prefer_static|disabled"}`.
@@ -782,12 +815,7 @@ pub async fn create_provider(
         entry.id = Uuid::new_v4().to_string();
     }
     // 不允许创建与 static id 冲突的新 provider (要 override 必须走 PUT 走 fork 流程).
-    if state
-        .providers
-        .effective_snapshot()
-        .iter()
-        .any(|p| p.id == entry.id)
-    {
+    if effective_contains_id(&state.providers.effective_snapshot(), &entry.id) {
         return Err(ApiError::conflict(format!(
             "provider with id '{}' already exists (in static or dynamic); use PUT to override",
             entry.id
@@ -802,12 +830,7 @@ pub async fn create_provider(
             "provider was concurrently created; please retry",
         ));
     }
-    let ev = state
-        .providers
-        .effective_snapshot()
-        .into_iter()
-        .find(|p| p.id == saved.id)
-        .expect("just upserted");
+    let ev = effective_find_by_id(state.providers.effective_snapshot(), &saved.id);
     Ok((StatusCode::CREATED, NO_STORE, Json(ev)))
 }
 
@@ -817,12 +840,7 @@ pub async fn update_provider(
     Json(payload): Json<UpsertProviderRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     // 允许编辑 static-only id: 服务端自动 fork.
-    let exists = state
-        .providers
-        .effective_snapshot()
-        .iter()
-        .any(|p| p.id == id);
-    if !exists {
+    if !effective_contains_id(&state.providers.effective_snapshot(), &id) {
         return Err(ApiError::not_found(format!("provider {id} not found")));
     }
     let mut entry = payload.into_provider()?;
@@ -831,12 +849,7 @@ pub async fn update_provider(
         .providers
         .upsert_dynamic(entry)
         .map_err(ApiError::from_any)?;
-    let ev = state
-        .providers
-        .effective_snapshot()
-        .into_iter()
-        .find(|p| p.id == saved.id)
-        .expect("just upserted");
+    let ev = effective_find_by_id(state.providers.effective_snapshot(), &saved.id);
     Ok((StatusCode::OK, NO_STORE, Json(ev)))
 }
 
@@ -844,23 +857,12 @@ pub async fn delete_provider(
     State(state): State<ProxyState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    match state
+    let outcome = state
         .providers
         .delete_dynamic(&id)
-        .map_err(ApiError::from_any)?
-    {
-        DeleteOutcome::Deleted => Ok((StatusCode::NO_CONTENT, NO_STORE, "")),
-        DeleteOutcome::NotFound => {
-            if state.providers.has_static(&id) {
-                Err(ApiError::conflict(
-                    "cannot delete a static provider; use PATCH .../decision with \
-                     {\"mode\":\"disabled\"} to disable it",
-                ))
-            } else {
-                Err(ApiError::not_found(format!("provider {id} not found")))
-            }
-        }
-    }
+        .map_err(ApiError::from_any)?;
+    let body = classify_delete_outcome(outcome, state.providers.has_static(&id), "provider", &id)?;
+    Ok((StatusCode::NO_CONTENT, NO_STORE, body))
 }
 
 /// 切换对 static id 的 per-item 决策. 同 [`set_secret_decision`].
