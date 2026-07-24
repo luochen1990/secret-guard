@@ -20,6 +20,40 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 DEFAULT_PORT = 19999
 STREAM_CHUNK_DELAY = 0.3  # seconds between SSE chunks
 
+# Error-trigger markers → (status_code, error_type).
+# Presence of the marker substring in the user message triggers that error response.
+# Used by WebUI regression tests for error-state rendering (issue: 错误状态覆盖).
+ERROR_TRIGGERS = {
+    "trigger-500": (500, "internal_server_error"),
+    "trigger-502": (502, "bad_gateway"),
+    "trigger-429": (429, "rate_limit_exceeded"),
+}
+
+
+def _match_error_trigger(user_msg: str):
+    """Return (status, error_type) if user_msg contains an error marker, else None."""
+    lower = user_msg.lower()
+    for marker, (status, etype) in ERROR_TRIGGERS.items():
+        if marker in lower:
+            return status, etype
+    return None
+
+
+def _extract_first_user_msg(req_body: dict) -> str:
+    """Extract the first user message's string content (for marker matching)."""
+    for m in req_body.get("messages", []):
+        if m.get("role") != "user":
+            continue
+        content = m.get("content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            # Multimodal content array: join text blocks.
+            return " ".join(
+                b.get("text", "") for b in content if b.get("type") == "text"
+            )
+    return ""
+
 
 def _build_reply(user_msg: str) -> str:
     """Build a reply of appropriate length based on the user message."""
@@ -52,18 +86,7 @@ def _build_message(user_msg: str) -> dict:
 
 def _handle_non_stream(req_body: dict) -> bytes:
     """Build a non-streaming OpenAI Chat Completions response."""
-    user_msg = ""
-    for m in req_body.get("messages", []):
-        if m.get("role") == "user":
-            content = m.get("content", "")
-            if isinstance(content, str):
-                user_msg = content
-            elif isinstance(content, list):
-                user_msg = " ".join(
-                    b.get("text", "") for b in content if b.get("type") == "text"
-                )
-            break
-
+    user_msg = _extract_first_user_msg(req_body)
     reply = _build_reply(user_msg)
     message = _build_message(user_msg)
     finish_reason = "tool_calls" if message.get("tool_calls") else "stop"
@@ -107,6 +130,23 @@ class Handler(BaseHTTPRequestHandler):
             req_body = json.loads(raw)
         except json.JSONDecodeError:
             req_body = {}
+
+        # Extract first user message content (string only) for marker-driven behavior.
+        user_msg = _extract_first_user_msg(req_body)
+
+        # Error-trigger markers take precedence over all other behavior
+        # (including stream=true): error responses are always non-streaming JSON
+        # so the proxy records a terminal resp_status + resp_complete.
+        err = _match_error_trigger(user_msg)
+        if err is not None:
+            status, etype = err
+            body = json.dumps({"error": {"type": etype, "message": f"mock {status}"}}).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
 
         if req_body.get("stream") is True:
             self.send_response(200)

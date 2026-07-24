@@ -13,6 +13,12 @@
  *   6. sidebar (session-item) preview 提取 (首条 user msg).
  *   7. sidebar model 字段显示.
  *
+ * 显式不变量守卫 (AGENTS.md "前端不变量"):
+ *   I1: timeline 气泡数 == 该 Node 的 IR messages 数组长度 (参数化 N=1/3/5).
+ *   I2: sidebar (round-item + sub-dot) 总数 == 该 Session 的 HTTP 请求数 (M=3).
+ *
+ * 错误状态渲染: 上游 502/429 时 WebUI 不崩溃 + record 显示错误状态.
+ *
  * 所有测试共享一个 browser context, 按声明顺序执行 (workers=1).
  */
 import { test, expect, type Page } from "@playwright/test";
@@ -574,5 +580,160 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     const fullText = await respBubbles.textContent();
     expect(fullText).toContain("Let me check");
     expect(fullText).toContain("tool_call");
+  });
+
+  // ─── I1 显式不变量守卫: timeline 气泡数 == 该轮 IR messages 数 ─────────────
+  //
+  // AGENTS.md 前端不变量 I1:
+  //   "会话详情页 (timeline) 渲染的 Bubble 数量, 必须等于该 Node 对应 HTTP 请求的
+  //    IR messages 数组长度."
+  //
+  // 策略: 发送 N 条 messages (无 system, 避免根节点 system 注入的边界) 作为根节点单轮
+  // 会话. 根节点 req_delta = 完整 messages (start=0, 无 system 注入), 故 timeline
+  // request-pane 内 bubble 数应严格等于 N. 失败信息直接指向 "I1 违反".
+  //
+  // 参数化 N ∈ {1, 3, 5}:
+  //   N=1: 单 user message (最常见路径).
+  //   N=3: user + assistant + user (含 assistant 无源气泡, 验证 assistant 也算 1 个气泡).
+  //   N=5: 更长上下文 (确保不是凑巧 1 个).
+  for (const N of [1, 3, 5]) {
+    test(`I1 守卫: timeline 气泡数 == messages 数组长度 (N=${N})`, async ({ page }) => {
+      // 构造 N 条 messages: 交替 user/assistant.
+      // 不使用 system 角色 (system 会在根节点被特殊注入, 干扰纯计数语义).
+      // N 取奇数 {1,3,5} → 末条天然是 user.
+      // marker 放在**末条** user:
+      //   node event.preview = 最后一条 user msg (issue #27),
+      //   session 标题 = 根 node 的 preview (issue #36),
+      //   故 sidebar 会话条目显示的文本 = 末条 user = marker → 可定位会话.
+      const marker = `i1-guard-n${N}-marker`;
+      const messages: Array<Record<string, unknown>> = [];
+      for (let i = 0; i < N; i++) {
+        const role = i % 2 === 0 ? "user" : "assistant";
+        // 末条 user 用 marker; 其它条目用 role+index 文本避免与 marker 冲突.
+        const content = i === N - 1 ? marker : `${role}-msg-${i}`;
+        messages.push({ role, content });
+      }
+
+      await sendChat(page, messages);
+
+      const sid = await findSessionLeafByPreview(page, marker);
+      await clickSessionByLeaf(page, sid);
+
+      // I1 断言: request-pane 内气泡数 == messages 数组长度.
+      // (assistant tool_calls 合并进单气泡; 这里 assistant 仅含 content, 1:1 映射.)
+      // 用 expect.toHaveCount 做条件等待 (替代固定 sleep): 气泡 DOM 在 timeline 渲染时
+      // 已全部创建, toHaveCount 会 auto-retry 到达到 N 个或超时.
+      await expect(
+        page.locator("#detail .request-pane .chat-bubble"),
+        `I1 违反: 发送 ${N} 条 messages, 期望 ${N} 个气泡`
+      ).toHaveCount(N);
+    });
+  }
+
+  // ─── I2 显式不变量守卫: sidebar (round-item + sub-dot) 总数 == HTTP 请求数 ──
+  //
+  // AGENTS.md 前端不变量 I2:
+  //   "左边栏每个一级条目 (Session) 下, 二级 + 三级条目总数, 必须等于归属该 Session 的
+  //    HTTP 请求数 (即 DAG 中以该 Session 叶子为终点的链上 Node 数)."
+  //
+  // 策略: 单会话多轮 (M 次 HTTP 请求链成同一 Session). 每轮 req_delta 含 user → 全部
+  // 作为二级条目 (.round-item), 无三级 (.sub-dot). 故 round-item 数 == M == HTTP 请求数.
+  test("I2 守卫: sidebar round-item + sub-dot 总数 == HTTP 请求数 (M=3)", async ({
+    page,
+  }) => {
+    // 三次累积请求 (prefix hash 链成同一会话):
+    //   轮1: [u1]                          → delta=[u1],            user round
+    //   轮2: [u1, a1, u2]                  → delta=[a1, u2],        user round (含 u2)
+    //   轮3: [u1, a1, u2, a2, u3]          → delta=[a2, u3],        user round (含 u3)
+    const M = 3;
+    const u1 = "i2-guard-root-marker";
+    await sendChat(page, [{ role: "user", content: u1 }]);
+    await sendChat(page, [
+      { role: "user", content: u1 },
+      { role: "assistant", content: "i2-reply-1" },
+      { role: "user", content: "i2-guard-round2" },
+    ]);
+    await sendChat(page, [
+      { role: "user", content: u1 },
+      { role: "assistant", content: "i2-reply-1" },
+      { role: "user", content: "i2-guard-round2" },
+      { role: "assistant", content: "i2-reply-2" },
+      { role: "user", content: "i2-guard-round3" },
+    ]);
+
+    // session-item preview = 根 node 的 preview (issue #36) = 根轮最后一条 user msg
+    // (issue #27). 轮1 只有 [u1], 首末 user 都是 u1 → preview = u1 → 可定位会话.
+    const sid = await findSessionLeafByPreview(page, u1);
+    await clickSessionByLeaf(page, sid);
+
+    // 该 session 的 round-list 内 round-item + sub-dot 总数应 == HTTP 请求数 M.
+    // sid 是 uuid 字符集 [-0-9a-f], 全部为 CSS 标识符安全字符, 无需 CSS.escape 转义.
+    // 先用 expect.toHaveCount 做条件等待 (替代固定 sleep): renderRounds 异步填充 round-list,
+    // 每轮都含 user → 全部是 round-item (无 sub-dot). 等 round-item 数稳定到 M.
+    const roundList = page.locator(`.round-list[data-sid="${sid}"]`);
+    await expect(
+      roundList.locator(".round-item"),
+      `I2: round-list 未渲染出 ${M} 个 round-item`
+    ).toHaveCount(M);
+
+    // I2 总数断言 (round-item + sub-dot == HTTP 请求数 M).
+    const roundItems = await roundList.locator(".round-item").count();
+    const subDots = await roundList.locator(".sub-dot").count();
+    const total = roundItems + subDots;
+    expect(
+      total,
+      `I2 违反: 发送 ${M} 次 HTTP 请求, 但 sidebar round-item(${roundItems}) + sub-dot(${subDots}) = ${total}`
+    ).toBe(M);
+  });
+
+  // ─── 错误状态渲染: 上游 502/429 时 WebUI 不崩溃 + record 可见 ──────────────
+  //
+  // mock_upstream.py 对 "trigger-502" / "trigger-429" marker 返回相应错误码.
+  // 验证: (a) WebUI 不崩溃, record 出现在 sidebar 且 status 文本为错误码 (status-err class);
+  //       (b) 选中会话后 timeline 轮次 header 也有错误状态标记;
+  //       (c) 错误后页面仍可交互 — 再发一个正常请求, 正常 record 能渲染.
+  test("错误状态渲染: 上游 502 时 sidebar 显示 502 状态 + 页面不崩溃", async ({
+    page,
+  }) => {
+    // 发送触发 502 的请求 (sendChat 不检查响应状态, 返回 response 对象).
+    await sendChat(page, [{ role: "user", content: "err-502-guard-marker trigger-502" }]);
+
+    // sidebar 会话应出现, 且 status 文本为 "502" (sessionStatusText: latest_resp_status>=400 → 该数字).
+    const item = page
+      .locator(".session-item", { hasText: "err-502-guard-marker" })
+      .first();
+    await item.waitFor({ state: "visible", timeout: 5000 });
+    // session 状态 span (class status-err) 应含 "502".
+    const statusSpan = item.locator(".status-err").first();
+    await expect(statusSpan).toHaveText("502");
+
+    // 选中会话 → timeline 加载, 页面不崩溃 (request-pane 出现).
+    const sid = await item.getAttribute("data-sid");
+    expect(sid).toBeTruthy();
+    await page.locator(`.session-item[data-sid="${sid}"]`).click();
+    await page.waitForSelector("#detail .request-pane", { timeout: 3000 });
+
+    // timeline 轮次 header 的 status 也应是 502 (statusClass: resp_status>=400 → status-err).
+    // 用 expect.toHaveText 做条件等待 (替代固定 sleep): 等渲染完成.
+    const roundStatus = page.locator("#detail .tl-round .status-err").first();
+    await expect(roundStatus).toHaveText("502");
+
+    // 页面仍可交互: 再发一个正常请求, 验证新 record 正常渲染.
+    await sendChat(page, [{ role: "user", content: "err-502-recovery-marker" }]);
+    const recoveryItem = page
+      .locator(".session-item", { hasText: "err-502-recovery-marker" })
+      .first();
+    await recoveryItem.waitFor({ state: "visible", timeout: 5000 });
+    // 正常请求的 status 应是 200 (status-ok).
+    await expect(recoveryItem.locator(".status-ok").first()).toHaveText("200");
+  });
+
+  test("错误状态渲染: 上游 429 时 sidebar 显示 429 状态", async ({ page }) => {
+    await sendChat(page, [{ role: "user", content: "err-429-guard-marker trigger-429" }]);
+    const item = page
+      .locator(".session-item", { hasText: "err-429-guard-marker" })
+      .first();
+    await item.waitFor({ state: "visible", timeout: 5000 });
+    await expect(item.locator(".status-err").first()).toHaveText("429");
   });
 });
