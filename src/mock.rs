@@ -892,6 +892,75 @@ mod tests {
         );
     }
 
+    // ─── gen_candidate (Auto): C5 不含 real ≥4 字符子串 (property-based) ──────
+    //
+    // 这是整个项目安全契约 (C5) 的核心防线, 却长期缺直接测试:
+    //   - validate_against_real 只校验用户可控的 prefix (mock 开头),
+    //     而 Auto 模式生成的 body 字符由 hash 驱动从 charset 选取, 完全未测.
+    //   - redact.rs 的 prop_no_real_substring 走 predict_mock (init_seed + gen_candidate)
+    //     间接覆盖, 但定位在 redact 模块, 不便单独定位 gen_candidate 的 C5 行为.
+    // 本测试直接对 gen_candidate 做 property-based 覆盖, 锁死 "body 不含 real 子串".
+    //
+    // 输入: real ∈ [A-Za-z0-9]{4,32} (高基数, 典型 secret 形态), seed ∈ u64.
+    // 策略: 复现生产 resolve 路径 (MockStrategy::default + resolve_against → infer charset),
+    //   与 SecretEntry::validate_and_resolve 在空 global_prefix 下的行为一致.
+    //
+    // C5 是 best-effort 概率性契约 (见模块头部 + redact.rs C5 说明): Auto 模式 mock 由
+    // hash 驱动, body 不含 real 的 ≥4 字符连续子串的概率极接近 1. 实测在高基数
+    // [A-Za-z0-9] 输入下碰撞率 ≈ 0 (deterministic_seed 吸收完整 strategy 上下文,
+    // DefaultHasher 分布良好). 极低基数 real (如仅 2 个不同字符) 是已知 C5 边界,
+    // 不在本测试输入域内 (历史 regression: proptest-regressions/redact.txt).
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn prop_c5_gen_candidate_auto_body_no_real_substring(
+            real in "[A-Za-z0-9]{4,32}",
+            seed in any::<u64>(),
+        ) {
+            let mut strategy = MockStrategy::default();
+            strategy.resolve_against(&real, "");
+            let mock = gen_candidate(&real, &strategy, seed, 0);
+
+            // char-level windows (与 mock.rs::contains_4char_substring 同口径,
+            // 正确处理 multibyte UTF-8; 此处虽全 ASCII 仍保持一致风格).
+            let needle_chars: Vec<char> = real.chars().collect();
+            for w in needle_chars.windows(4) {
+                let sub: String = w.iter().collect();
+                prop_assert!(
+                    !mock.contains(&sub),
+                    "mock {:?} contains real ≥4-char substring {:?} (real={:?}, seed={})",
+                    mock, sub, real, seed
+                );
+            }
+        }
+
+        /// C5 在 probing 路径下也必须成立: counter>0 候选 (首项与 IR 冲突时的后备)
+        /// 同样不应含 real 的 ≥4 字符子串. 这条路径在生产 redact_ir 中由 gen_mock_for_ir
+        /// 触发, 本测试直接对 gen_candidate 的多个 counter 取值覆盖.
+        #[test]
+        fn prop_c5_gen_candidate_probing_no_real_substring(
+            real in "[A-Za-z0-9]{8,32}",
+            seed in any::<u64>(),
+        ) {
+            let mut strategy = MockStrategy::default();
+            strategy.resolve_against(&real, "");
+            let needle_chars: Vec<char> = real.chars().collect();
+            for counter in 0u32..8 {
+                let mock = gen_candidate(&real, &strategy, seed, counter);
+                for w in needle_chars.windows(4) {
+                    let sub: String = w.iter().collect();
+                    prop_assert!(
+                        !mock.contains(&sub),
+                        "mock {:?} (counter={counter}) contains real ≥4-char substring {:?} \
+                         (real={:?}, seed={})",
+                        mock, sub, real, seed
+                    );
+                }
+            }
+        }
+    }
+
     // ─── gen_candidate (Fixed 模式) ──────────────────────────────────────
 
     #[test]

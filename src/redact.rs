@@ -75,7 +75,7 @@ use crate::codec::ir::{IrBlock, IrDelta, IrRequest, IrResponse, IrTool};
 use crate::secrets::SecretEntry;
 
 /// 改写映射: real ↔ mock 双向索引.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RedactionMap {
     /// real_secret → mock_secret.
     pub real_to_mock: HashMap<String, String>,
@@ -720,6 +720,55 @@ mod tests {
         }
     }
 
+    // C3 端到端幂等性.
+    //
+    // 现有 c3_determinism 只覆盖纯函数层 (predict_mock = init_seed + gen_candidate),
+    // 未覆盖生产入口 redact_ir. C3 的本质是 "同一 policy + 同一 IR 上下文 → 同一
+    // RedactionMap" (前缀缓存友好性的根基, 见模块头部 C3 契约). redact_ir 内部走
+    // candidate_for → mock::gen_candidate (生产路径, 非 legacy), 还涉及 sorted 排序 +
+    // allocated probing, 这些环节任一引入非确定性都会破坏 C3. 本测试用端到端双调用 +
+    // 全 map 比对锁死该不变量.
+    //
+    // 场景: 2 个 secret, 分别命中 system prompt 与 user text block (覆盖多条扫描路径),
+    // 断言两次 redact_ir 的 (RedactionMap, seed) 完全相等.
+    #[test]
+    fn c3_redact_ir_end_to_end_idempotent() {
+        use crate::codec::ir::IrRequest;
+        // 构造一个含 system + user text 的 IR, 让两个 secret 各命中一条扫描路径.
+        let build_ir = || IrRequest {
+            system: vec![IrBlock::Text {
+                text: "system context mentions sk-sys-secret here".to_string(),
+            }],
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![IrBlock::Text {
+                    text: "user msg embeds sk-user-secret-xyz".to_string(),
+                }],
+            }],
+            ..sample_ir_with_text("")
+        };
+        let secrets = vec![entry("sk-sys-secret"), entry("sk-user-secret-xyz")];
+
+        let (map1, seed1) = redact_ir(&mut build_ir(), &secrets);
+        let (map2, seed2) = redact_ir(&mut build_ir(), &secrets);
+
+        // seed 必须相等 (per-request seed 链起点稳定, C3 根基).
+        assert_eq!(seed1, seed2, "init_seed must be stable for same policy");
+        // 整个 RedactionMap 必须相等: real→mock 与 mock→real 双向索引逐条一致.
+        // 这要求 sorted 顺序 + probing counter 序列 + gen_candidate 全部可复现.
+        assert_eq!(
+            map1, map2,
+            "redact_ir must produce identical RedactionMap for identical (ir, secrets)"
+        );
+        // 确保测试确实命中了两个 secret (否则 map 为空会让等式平凡成立).
+        assert_eq!(
+            map1.real_to_mock.len(),
+            2,
+            "test setup must hit both secrets; got map {:?}",
+            map1.real_to_mock
+        );
+    }
+
     #[test]
     fn c4_injectivity_within_redact() {
         // 100 个不同 secret, 在同一 redact_ir 内应映射到 100 个不同 mock.
@@ -1277,6 +1326,60 @@ mod tests {
 
             let expected = format!("{filler}{real1}{filler}{real2}{filler}");
             prop_assert_eq!(emitted, expected);
+        }
+
+        /// C3 端到端幂等性 (property 版): 对任意 (prefix, suffix, secret) 组合,
+        /// 同一 IR + 同一 policy 的两次 redact_ir 调用必须产出逐字段相等的
+        /// RedactionMap 与相等的 seed. 现有 c3_determinism 只覆盖纯函数层
+        /// (predict_mock), prop_distinct_secrets_distinct_mocks 只比对 mock 是否两两
+        /// 不同, 两者都未锁死 "整张 map 可复现" 这一 C3 核心不变量.
+        #[test]
+        fn prop_c3_redact_ir_idempotent(
+            secret in "[A-Za-z0-9]{4,16}",
+            filler in "[a-z0-9 ]{0,60}",
+        ) {
+            let body = format!("{filler} {secret} {filler}");
+            let secrets = vec![entry(&secret)];
+            // 两次独立 redact_ir: 重建 IR 以避免前一次原地变异影响.
+            let (map1, seed1) = redact_ir(&mut sample_ir_with_text(&body), &secrets);
+            let (map2, seed2) = redact_ir(&mut sample_ir_with_text(&body), &secrets);
+            prop_assert_eq!(seed1, seed2, "init_seed must be stable");
+            // 防平凡: secret 必须命中进 map (在全 map 比对前检查, 避免 prop_assert_eq! 消费 map1).
+            prop_assert!(map1.mock_for(&secret).is_some(), "secret must be redacted");
+            prop_assert_eq!(
+                map1, map2,
+                "redact_ir must produce identical RedactionMap for identical (ir, secrets)"
+            );
+        }
+
+        /// C5 生产路径 (property 版, 端到端): redact_ir 产出的 mock 不含 real 的任何
+        /// ≥4 字符连续子串. 现有 prop_no_real_substring 用 predict_mock (纯函数) 验证,
+        /// 但生产路径在 mock 已出现在 IR 时会 probing 到 counter>0 候选, 该路径下的 C5
+        /// 行为未被覆盖. 本测试走完整 redact_ir, 覆盖 probing 路径.
+        ///
+        /// 注: 这是 best-effort 概率性契约 (见模块头部 C5 + mock.rs 头部).
+        /// 输入限定为高基数字母表 [A-Za-z0-9] (典型 secret 形态), 实测碰撞率 ≈ 0.
+        /// 极低基数 real (如仅 2 个不同字符) 是已知 C5 边界, 不在本测试范围
+        /// (历史 regression 见 proptest-regressions/redact.txt).
+        #[test]
+        fn prop_c5_redact_mock_no_real_substring_end_to_end(
+            secret in "[A-Za-z0-9]{8,20}",
+            filler in "[a-z0-9 ]{0,40}",
+        ) {
+            let body = format!("{filler} {secret} {filler}");
+            let mut ir = sample_ir_with_text(&body);
+            let (map, _) = redact_ir(&mut ir, &[entry(&secret)]);
+            let mock = map.mock_for(&secret).expect("secret must be redacted");
+            // char-level windows (正确处理 multibyte; 此处虽全 ASCII 仍保持一致风格).
+            let needle_chars: Vec<char> = secret.chars().collect();
+            for w in needle_chars.windows(4) {
+                let sub: String = w.iter().collect();
+                prop_assert!(
+                    !mock.contains(&sub),
+                    "mock {:?} contains real ≥4-char substring {:?} (secret={:?})",
+                    mock, sub, secret
+                );
+            }
         }
     }
 }
