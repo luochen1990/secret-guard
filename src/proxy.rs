@@ -661,10 +661,6 @@ fn build_call_event(
         method: parts.method.as_str().to_string(),
         path: path.to_string(),
         req_headers: redact_headers(fwd_headers),
-        // req_envelope 当前仅作占位 (Web DTO 用 req_body_raw 而非 envelope 重建).
-        // 未来若 WebUI 需展示 system/tools 等字段, 可改为 ingress writer 投影后
-        // 移除 messages/system key 的 JSON value.
-        req_envelope: serde_json::json!({}),
         ingress_protocol,
         redact_seed,
         policy,
@@ -1795,7 +1791,6 @@ mod tests {
             method: "POST".to_string(),
             path: "/o/test/big".to_string(),
             req_headers: vec![],
-            req_envelope: serde_json::json!({}),
             ingress_protocol: None,
             redact_seed: 0,
             policy: std::sync::Arc::new(PolicySnapshot::default()),

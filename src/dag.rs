@@ -329,8 +329,9 @@ pub struct CallEvent {
     pub method: String,
     pub path: String,
     pub req_headers: Vec<(String, String)>,
-    /// 请求侧非 message 字段 (model / temperature / tools / system 等).
-    pub req_envelope: serde_json::Value,
+    // 历史曾保留 `req_envelope` (请求侧非 message 字段: model / temperature / tools /
+    // system 等) 用于"未来 WebUI 展示 system/tools", 但从未读取, 2026-07 删除 (YAGNI).
+    // 需要时通过 git log 找回: commit 删除 req_envelope.
     pub ingress_protocol: Option<CodecProtocol>,
     /// redact 的随机性来源 (probe 后的最终值).
     /// - 0 = passthrough (无 secret 命中 / SecretTable 为空).
@@ -347,9 +348,9 @@ pub struct CallEvent {
     /// - **passthrough 路径** (same-proto 无 redact): 客户端原始请求字节 (未 redact,
     ///   因为无机密命中). Gemini/Ollama 等无 codec 协议也走此路径.
     ///
-    /// 设计权衡: 虽然 DAG 的 `req_delta` (真实消息) + `req_envelope` 理论上足以在查询时
-    /// 重建 redact 后的请求体, 但那需要在 Web 查询路径上跑 redact + codec writer,
-    /// 对偶尔翻页的 WebUI 场景性价比低. 直接存快照 (一次写, 多次读) 是更经济的选择.
+    /// 设计权衡: 虽然 DAG 的 `req_delta` (真实消息) 理论上足以在查询时重建 redact 后
+    /// 的请求体, 但那需要在 Web 查询路径上跑 redact + codec writer, 对偶尔翻页的 WebUI
+    /// 场景性价比低. 直接存快照 (一次写, 多次读) 是更经济的选择.
     /// `req_delta` 仍用于内容寻址去重 (DAG 核心价值) + 未来 lazy redact 功能.
     pub req_body_raw: String,
     /// WebUI sidebar 标题 (首条 user message 截断). push 时一次性从 req_body_raw 提取.
@@ -1228,7 +1229,6 @@ mod tests {
             method: "POST".to_string(),
             path: "/o/test/v1/chat".to_string(),
             req_headers: vec![],
-            req_envelope: serde_json::json!({}),
             ingress_protocol: None,
             redact_seed: 0,
             policy: Arc::new(PolicySnapshot::default()),
@@ -1887,7 +1887,6 @@ mod tests {
             method: "POST".to_string(),
             path: path.to_string(),
             req_headers: vec![("authorization".into(), "<redacted>".into())],
-            req_envelope: serde_json::json!({}),
             ingress_protocol: None,
             redact_seed: 0,
             policy: Arc::new(PolicySnapshot::default()),
