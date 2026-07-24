@@ -148,6 +148,7 @@ URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标
 | `dag.rs` | ConversationDAG 内容寻址存储 (BlockPool + Node + Merkle) | 文件头部 `//!` + `docs/design/conversation-dag.md` |
 | `record.rs` | ForwardRecord (web 层 DTO, 从 DAG Node 派生) | 文件头部 `//!` |
 | `redact.rs` | RedactionMap + redact/restore pipeline + 形式化契约 C1-C6 | 文件头部 `//!` |
+| `util.rs` | 集中的哈希工具 (`hash64` SipHash 单值入口) | 文件头部 `//!` |
 | `codec/` | 跨协议 IR + Reader/Writer trait + StreamTranslate | **`src/codec/AGENTS.md`** |
 | `proxy.rs` | dispatch 路径选择 + fan_out 三路径 + Provider 鉴权 | 文件头部 `//!` |
 | `web/` | JSON API + 单页 WebUI | **`src/web/AGENTS.md`** |
