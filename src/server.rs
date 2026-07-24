@@ -180,6 +180,8 @@ pub fn build_upstream_client() -> anyhow::Result<reqwest::Client> {
 /// - `dyn_state`: 来自 `secret-guard.state.toml`, 拆为 dynamic 列表 + decisions.
 /// - `state_path`: state.toml 的写回路径.
 /// - `auth_config`: 认证配置 (来自 static config 的 `[auth]` 段).
+/// - `global_mock_prefix`: 来自 static config 的 `[redact] global_mock_prefix`,
+///   存入 ProxyState 供 WebUI handler 在 secret upsert 时校验 + resolve.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve(
     host: &str,
@@ -190,6 +192,7 @@ pub async fn serve(
     dyn_state: crate::config::DynamicState,
     state_path: PathBuf,
     auth_config: AuthConfig,
+    global_mock_prefix: String,
 ) -> anyhow::Result<()> {
     auth_config.validate().map_err(|e| anyhow::anyhow!(e))?;
 
@@ -221,6 +224,7 @@ pub async fn serve(
         dag,
         secrets: secret_table,
         api_keys: None, // 默认 None; 启用认证时在下方覆盖.
+        global_mock_prefix: Arc::from(global_mock_prefix),
     };
 
     // 条件化: 启用认证时构造 AuthStack, 否则 None.

@@ -51,6 +51,7 @@
 //! 同时剥离竞争 header (避免客户端误传的对手协议 auth 干扰上游), provider 配置优先于客户端.
 //! api_key 的两种来源 (`api_key` 直接值 / `api_key_file` 运行时读文件) 见 `src/provider.rs` 头部.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
@@ -81,6 +82,9 @@ pub struct ProxyState {
     /// 单用户模式 (auth.enabled = false) 下为 None, handler 不消费此字段.
     #[allow(unused)]
     pub api_keys: Option<crate::auth::ApiKeyStore>,
+    /// 来自 `[redact] global_mock_prefix` (默认空串). WebUI secret upsert 时
+    /// 透传给 validate_and_resolve, 用于校验 value 不含此 prefix + 注入 Auto gen_spec.prefix.
+    pub global_mock_prefix: Arc<str>,
 }
 
 /// axum 路径参数: `/{proto}/{name}/{*rest}`.

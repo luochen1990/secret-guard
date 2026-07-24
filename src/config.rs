@@ -6,7 +6,7 @@
 //!
 //! | 文件 | 角色 | 谁写 | 进入 git? |
 //! |---|---|---|---|
-//! | `secret-guard.toml`        | **声明式 (static)** 配置: providers / secrets / server. | 用户手写 | ✅ 推荐 |
+//! | `secret-guard.toml`        | **声明式 (static)** 配置: providers / secrets / server / redact / auth. | 用户手写 | ✅ 推荐 |
 //! | `secret-guard.state.toml`  | **动态 (dynamic)** 状态: WebUI 编辑结果 + 对 static 项的 decision. | 程序自动 | ❌ 推荐 .gitignore |
 //!
 //! 两者由 [`Config`] (static) 与 [`DynamicState`] (dynamic) 分别建模.
@@ -38,7 +38,8 @@
 //! - 内存层: `Arc<RwLock<Vec<T>>>` × 2 (static_entries 只读 + dynamic_entries 可变).
 //! - 持久化顺序: **先写 state.toml (atomic + fsync), 再更新内存** (失败自动回滚).
 //! - `tmp` 文件名带 UUID, 避免并发 `atomic_write` 互相覆盖.
-//! - 每次写 dynamic 时 `DynamicState::load_or_empty(state_path)` → 改对应段 → `to_toml` → `atomic_write`.
+//! - 每次写 dynamic 时 `DynamicState::load_or_empty(state_path, "")` → 改对应段 → `to_toml` → `atomic_write`.
+//!   (持久化路径用空 prefix 跳过 re-validate, 因为 secret 早已 validate 过.)
 //!
 //! # 跨表并发安全 (由 `server.rs` 装配)
 //!
@@ -97,10 +98,27 @@ pub struct Config {
     #[serde(default)]
     pub secrets: SecretsConfig,
 
+    /// Redact 行为配置 (global mock prefix 等). 进程内只读.
+    #[serde(default)]
+    pub redact: RedactConfig,
+
     /// 认证配置 (OIDC + API key 开关). `enabled = false` (默认) = 单用户模式,
     /// 所有路由无认证 (向后兼容本地部署).
     #[serde(default)]
     pub auth: crate::auth::AuthConfig,
+}
+
+/// Redact 相关配置 (静态, 仅 `[redact]` 段).
+///
+/// `global_mock_prefix` 控制 Auto 模式生成的 mock 的统一前缀.
+/// 默认空串 = mock 无前缀 (纯 hash body). 设置后 (如 `"sgm_"`) 让 mock 在
+/// 日志 / WebUI timeline 中视觉可辨识. 详见 `redact.rs` 的 C5 契约.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RedactConfig {
+    /// Auto 模式 mock 的统一前缀, 在 secret resolve 阶段注入到每个 secret 的
+    /// `gen_spec.prefix` (per-secret prefix 仍可覆盖). 默认空串.
+    pub global_mock_prefix: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,7 +169,11 @@ impl Config {
             .map_err(|e| anyhow::anyhow!("read config {}: {e}", path.display()))?;
         let mut cfg: Self = toml::from_str(&text)
             .map_err(|e| anyhow::anyhow!("parse config {}: {e}", path.display()))?;
-        validate_and_resolve_secrets(path, &mut cfg.secrets.entries)?;
+        validate_and_resolve_secrets(
+            path,
+            &mut cfg.secrets.entries,
+            &cfg.redact.global_mock_prefix,
+        )?;
         validate_providers(path, &cfg.providers)?;
         Ok(cfg)
     }
@@ -192,7 +214,11 @@ impl DynamicState {
     ///
     /// 与 [`Config::load_or_default`] 一样, 加载后会跑 validate + resolve + 内容校验 —
     /// 用户手编 state.toml 时也应当尽早暴露契约违反.
-    pub fn load_or_empty(path: &Path) -> anyhow::Result<Self> {
+    ///
+    /// `global_mock_prefix` 来自 static config (`[redact]` 段), 用于校验 dynamic secrets
+    /// 的 value 不含该 prefix, 以及 resolve Auto 模式的 gen_spec.prefix. 调用方应在
+    /// 加载完 static config 后将其传入.
+    pub fn load_or_empty(path: &Path, global_mock_prefix: &str) -> anyhow::Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }
@@ -200,7 +226,7 @@ impl DynamicState {
             .map_err(|e| anyhow::anyhow!("read state {}: {e}", path.display()))?;
         let mut state: Self = toml::from_str(&text)
             .map_err(|e| anyhow::anyhow!("parse state {}: {e}", path.display()))?;
-        validate_and_resolve_secrets(path, &mut state.secrets)?;
+        validate_and_resolve_secrets(path, &mut state.secrets, global_mock_prefix)?;
         validate_providers(path, &state.providers)?;
         Ok(state)
     }
@@ -217,10 +243,16 @@ impl DynamicState {
 /// resolve_value → 内容 validate_value) 的契约定义在 `SecretEntry` 上 (SSOT),
 /// 本函数只负责错误消息的 path/id 包装.
 ///
+/// `global_mock_prefix` 透传给每个 entry 的 validate_and_resolve.
+///
 /// Provider 不需要此序列 — 见 [`SecretEntry::validate_and_resolve`] 的"与 Provider 的差异"段.
-fn validate_and_resolve_secrets(path: &Path, secrets: &mut [SecretEntry]) -> anyhow::Result<()> {
+fn validate_and_resolve_secrets(
+    path: &Path,
+    secrets: &mut [SecretEntry],
+    global_mock_prefix: &str,
+) -> anyhow::Result<()> {
     for s in secrets.iter_mut() {
-        s.validate_and_resolve().map_err(|e| {
+        s.validate_and_resolve(global_mock_prefix).map_err(|e| {
             anyhow::anyhow!("config {}: invalid secret {}: {e}", path.display(), s.id)
         })?;
     }
@@ -661,7 +693,8 @@ impl<T: DynamicEntry> DynamicTable<T> {
             T::set_decision(&mut next, id, mode);
             next
         };
-        let mut state = DynamicState::load_or_empty(&self.state_path)?;
+        // 持久化 RMW: 只为合并字段后写回, secret 早已 validate 过, 用空 prefix 跳过 re-validate.
+        let mut state = DynamicState::load_or_empty(&self.state_path, "")?;
         state.decisions = new_decisions.clone();
         let text = state.to_toml()?;
         atomic_write(&self.state_path, &text)?;
@@ -673,7 +706,8 @@ impl<T: DynamicEntry> DynamicTable<T> {
 
     /// 重写 state.toml 中本表对应的段 (provider / secret). 调用方必须持有 persist_lock.
     fn persist_dynamic(&self, new_dynamic: &[T]) -> anyhow::Result<()> {
-        let mut state = DynamicState::load_or_empty(&self.state_path)?;
+        // 持久化 RMW: 同 set_decision, 用空 prefix 跳过 re-validate.
+        let mut state = DynamicState::load_or_empty(&self.state_path, "")?;
         T::set_state_field(&mut state, new_dynamic.to_vec());
         let text = state.to_toml()?;
         atomic_write(&self.state_path, &text)
@@ -767,7 +801,9 @@ mod tests {
             enabled = true
             "#,
         );
-        let err = DynamicState::load_or_empty(&path).unwrap_err().to_string();
+        let err = DynamicState::load_or_empty(&path, "")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("invalid provider"), "got: {err}");
         assert!(
             err.contains("bad"),
@@ -1049,7 +1085,7 @@ mod table_tests {
         );
         assert_eq!(t.delete_dynamic("a").unwrap(), DeleteOutcome::Deleted);
         assert_eq!(t.effective_raw().len(), 1);
-        let state = DynamicState::load_or_empty(&tmp).unwrap();
+        let state = DynamicState::load_or_empty(&tmp, "").unwrap();
         assert_eq!(state.secrets.len(), 1);
         assert_eq!(state.secrets[0].id, "b");
     }
@@ -1089,7 +1125,7 @@ mod table_tests {
         assert!(t.get_effective("a").is_none());
 
         // 重启 (重新加载 state) 后 decision 应持久化.
-        let state = DynamicState::load_or_empty(&tmp).unwrap();
+        let state = DynamicState::load_or_empty(&tmp, "").unwrap();
         assert_eq!(state.decisions.secret("a"), OverrideMode::Disabled);
 
         // 切回 Default 后再验证 effective.

@@ -124,6 +124,41 @@ async fn spawn_proxy_static_dynamic(
         dag: records,
         secrets,
         api_keys: None,
+        global_mock_prefix: std::sync::Arc::from(""),
+    };
+    let app = server::build_router(proxy);
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}")
+}
+
+/// 启动 secret-guard, 可配置 global_mock_prefix (用于测试 prefix 拒绝等场景).
+async fn spawn_proxy_with_prefix(global_mock_prefix: &str) -> String {
+    let upstream = spawn_mock_upstream().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state_path = tmp_state_path("sg-state-prefix");
+    let decisions = std::sync::Arc::new(parking_lot::RwLock::new(
+        secret_guard::config::Decisions::default(),
+    ));
+    let persist_lock = std::sync::Arc::new(parking_lot::Mutex::new(()));
+    let provider_table = ProviderTable::with_persist_lock(
+        vec![openai_provider("oa-main", &upstream.url())],
+        vec![],
+        decisions.clone(),
+        state_path.clone(),
+        persist_lock.clone(),
+    );
+    let secrets = test_secret_table();
+    let _ = (decisions, persist_lock, state_path);
+    let proxy = ProxyState {
+        upstream: reqwest::Client::new(),
+        providers: provider_table,
+        dag: ConversationDag::new(64, 500, 1),
+        secrets,
+        api_keys: None,
+        global_mock_prefix: std::sync::Arc::from(global_mock_prefix),
     };
     let app = server::build_router(proxy);
     tokio::spawn(async move {
@@ -155,7 +190,8 @@ fn secret(id: &str, value: &str) -> SecretEntry {
         mock_strategy: secret_guard::mock::MockStrategy::default(),
     };
     // 模拟生产 validate_and_resolve 路径: 让 Auto 模式的 gen spec 被 infer.
-    e.mock_strategy.resolve_against(&e.value);
+    // 测试用空 global_prefix (与原固定无前缀语义对齐).
+    e.mock_strategy.resolve_against(&e.value, "");
     e
 }
 
@@ -877,7 +913,7 @@ async fn cross_protocol_translates_upstream_error_to_ingress_envelope() {
 async fn same_proto_streaming_with_redact_restores_mock_in_sse_chunks() {
     // 同协议 + redact + 流式响应: 用 StreamTranslate restore 模式.
     // 上游 SSE chunk 含 mock → 客户端拿到的是 real_secret (restore 生效).
-    // 用 mock_with_salt(real, 0) 预测首次 mock (gen_mock_for_ir 在 allocated 为空时返回 salt=0 mock).
+    // 用 predict_mock(real) 预测首次 mock (gen_mock_for_ir 在 allocated 为空时返回 counter=0 mock).
     let real_secret = "sk-test-123";
     let expected_mock = predict_mock(real_secret);
     let mut upstream = spawn_mock_upstream().await;
@@ -2247,7 +2283,7 @@ async fn passthrough_path_leaves_redactions_empty() {
 #[tokio::test]
 async fn restore_inserts_secret_back_for_client() {
     // IR-based redact round-trip: 请求里 secret → mock → LLM, 响应里 mock → secret → client.
-    // 用 mock_with_salt(real, 0) 预测首次 mock, 让上游响应直接含 mock, 验证 restore 生效.
+    // 用 predict_mock(real) 预测首次 mock, 让上游响应直接含 mock, 验证 restore 生效.
     let real_secret = "sk-test-123";
     let expected_mock = predict_mock(real_secret);
     let mut upstream = spawn_mock_upstream().await;
@@ -2851,6 +2887,7 @@ async fn cross_table_shared_state_no_lost_update() {
         dag: ConversationDag::new(64, 500, 1),
         secrets: secret_table,
         api_keys: None,
+        global_mock_prefix: std::sync::Arc::from(""),
     };
     let app = server::build_router(proxy);
     tokio::spawn(async move {
@@ -2892,7 +2929,7 @@ async fn cross_table_shared_state_no_lost_update() {
     assert_eq!(r2.status(), reqwest::StatusCode::CREATED);
 
     // state.toml 应当同时包含新 provider 和新 secret.
-    let state = secret_guard::config::DynamicState::load_or_empty(&state_path).unwrap();
+    let state = secret_guard::config::DynamicState::load_or_empty(&state_path, "").unwrap();
     assert_eq!(state.providers.len(), 1);
     assert_eq!(state.secrets.len(), 1);
     assert_eq!(state.providers[0].id, "p-concurrent");
@@ -2901,9 +2938,8 @@ async fn cross_table_shared_state_no_lost_update() {
 
 #[tokio::test]
 async fn validate_value_rejects_mock_prefix() {
-    // 集成层验证 C5 前提: 含 sgm_ 的 secret 应被拒绝.
-    let upstream = spawn_mock_upstream().await;
-    let proxy_url = spawn_proxy(&upstream.url()).await;
+    // 集成层验证 C5 前提: 配置 global_mock_prefix 后, 含该 prefix 的 secret 应被拒绝.
+    let proxy_url = spawn_proxy_with_prefix("sgm_").await;
     let resp = reqwest::Client::new()
         .post(format!("{proxy_url}/__sg/api/secrets"))
         .json(&serde_json::json!({

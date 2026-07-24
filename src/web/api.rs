@@ -575,7 +575,9 @@ pub async fn create_secret(
     // 完整 validate+resolve 序列 (互斥 / 文件可读 / value 内容合法).
     // 必须在 upsert 前跑: 否则内存中 value 为空 (value_file 模式), 当次 redact 不识别此 secret.
     // 也是 WebUI 路径上互斥校验的执行点 (见 into_entry 的注释 — 那里只做基础字段校验).
-    entry.validate_and_resolve().map_err(ApiError::validation)?;
+    entry
+        .validate_and_resolve(&state.global_mock_prefix)
+        .map_err(ApiError::validation)?;
     // 检查 effective view 中是否已存在 (含 static 来源). 不允许覆盖 static 创建同 id.
     if state
         .secrets
@@ -626,7 +628,9 @@ pub async fn update_secret(
     let mut entry = payload.into_entry()?;
     entry.id = id.clone();
     // 完整 validate+resolve 序列, 与 create_secret 一致 (见那里的注释).
-    entry.validate_and_resolve().map_err(ApiError::validation)?;
+    entry
+        .validate_and_resolve(&state.global_mock_prefix)
+        .map_err(ApiError::validation)?;
     let (saved, _kind) = state
         .secrets
         .upsert_dynamic(entry)
@@ -1049,7 +1053,7 @@ mod tests {
         let entry = req.into_entry().expect("into_entry skips mutex check");
         // 但 SecretEntry::validate_and_resolve 必须拒绝此组合.
         let mut entry = entry;
-        let err = entry.validate_and_resolve().unwrap_err();
+        let err = entry.validate_and_resolve("").unwrap_err();
         assert!(
             err.contains("both value and value_file"),
             "validate_and_resolve should reject mutex violation: {err}"

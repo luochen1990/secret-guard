@@ -202,7 +202,8 @@ impl ApiKeyStore {
     /// 持久化到 state.toml + 原子更新内存 (entries + hash_index).
     /// 调用方必须已持有 persist_lock.
     fn persist_and_rebuild(&self, new_entries: &[ApiKeyEntry]) -> anyhow::Result<()> {
-        let mut state = DynamicState::load_or_empty(&self.state_path)?;
+        // 持久化 RMW: 用空 prefix 跳过 secret re-validate (与 DynamicTable 持久化路径一致).
+        let mut state = DynamicState::load_or_empty(&self.state_path, "")?;
         state.api_keys = new_entries.to_vec();
         let text = state.to_toml()?;
         atomic_write(&self.state_path, &text)?;
@@ -335,7 +336,7 @@ mod tests {
             store.issue("user-1", "user-1", "persisted").unwrap();
         }
         // 从同一 state.toml 重新加载.
-        let state = DynamicState::load_or_empty(&path).unwrap();
+        let state = DynamicState::load_or_empty(&path, "").unwrap();
         let store2 = ApiKeyStore::new(state.api_keys, path, lock);
         assert_eq!(store2.entries.read().len(), 1);
         assert_eq!(store2.entries.read()[0].label, "persisted");

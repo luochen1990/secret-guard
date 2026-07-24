@@ -139,6 +139,9 @@ impl SecretEntry {
     /// 都应通过此方法, 保证 "互斥 + 文件可读 + value 内容合法" 三条契约一致执行,
     /// 避免分散在三处的 ad-hoc 调用序列漂移.
     ///
+    /// `global_mock_prefix` 来自 `[redact] global_mock_prefix`, 透传给 validate_value
+    /// (拒绝 real 含 prefix) 与 resolve_against (注入到 Auto 模式的 gen_spec.prefix).
+    ///
     /// # 步骤设计动机
     ///
     /// 1. **结构 validate** ([`DynamicEntry::validate`]): id 格式 + value 与 value_file 互斥
@@ -155,11 +158,12 @@ impl SecretEntry {
     ///
     /// Provider 不需要此序列 — 它的 `api_key` 允许空 (Ollama 等场景), 且 `effective_api_key`
     /// 是运行时每次请求读文件. 见 [`crate::provider::Provider::effective_api_key`].
-    pub fn validate_and_resolve(&mut self) -> Result<(), String> {
+    pub fn validate_and_resolve(&mut self, global_mock_prefix: &str) -> Result<(), String> {
         self.validate()?;
         self.resolve_value()?;
-        validate_value(&self.value)?;
-        self.mock_strategy.resolve_against(&self.value);
+        validate_value(&self.value, global_mock_prefix)?;
+        self.mock_strategy
+            .resolve_against(&self.value, global_mock_prefix);
         self.mock_strategy.validate_against_real(&self.value)?;
         Ok(())
     }
@@ -231,20 +235,20 @@ pub fn validate_id(id: &str) -> Result<(), String> {
 /// 校验 secret value. 防止用户误配短 / 结构性 / 含 PUA / 与 mock prefix 冲突的 secret
 /// (避免 redact 时破坏整个请求 body 或 round-trip identity).
 ///
-/// 特别拒绝 [`crate::redact::MOCK_PREFIX`] (`sgm_`): 该 prefix 与 mock_secret 输出
-/// 共享, 若 real secret 也含此 prefix, mock 可能与 real 共享 ≥4 字符子串, 违反 C5.
-pub fn validate_value(value: &str) -> Result<(), String> {
+/// `global_mock_prefix` 来自 `[redact] global_mock_prefix` (默认空串). 若非空且 real
+/// secret 含此 prefix, 则 mock 可能与 real 共享 ≥4 字符子串违反 C5, 故拒绝.
+/// 空串时此检查跳过 (空 prefix 不产生冲突).
+pub fn validate_value(value: &str, global_mock_prefix: &str) -> Result<(), String> {
     if value.len() < 3 {
         return Err(format!(
             "secret value too short (min 3 bytes), got {}",
             value.len()
         ));
     }
-    // 含 mock prefix → 与 redact 输出冲突, 拒绝.
-    if value.contains(crate::redact::MOCK_PREFIX) {
+    // 含 mock prefix → 与 redact 输出冲突, 拒绝. 空 prefix 跳过 ("" 是任意串子串).
+    if !global_mock_prefix.is_empty() && value.contains(global_mock_prefix) {
         return Err(format!(
-            "secret value must not contain the mock prefix '{}' (reserved for redaction)",
-            crate::redact::MOCK_PREFIX
+            "secret value must not contain the mock prefix '{global_mock_prefix}' (reserved for redaction)"
         ));
     }
     // PUA 字符与 mock 输出冲突, 拒绝.
@@ -294,12 +298,15 @@ impl DynamicEntry for SecretEntry {
                 self.id
             ));
         }
-        // value 内容校验 (长度 / mock prefix / PUA) 只在 value 非空时跑 —
-        // value_file 模式下 value 要等 resolve_value 才有内容, 那时再由调用方
-        // (config.rs::resolve_secret_values) 跑 validate_value 做最终内容校验.
+        // value 内容校验 (长度 / PUA) 只在 value 非空时跑 —
+        // value_file 模式下 value 要等 resolve_value 才有内容, 那时再由
+        // validate_and_resolve 跑完整 validate_value (含 global_mock_prefix 检查).
         // 这与 Provider::validate 不校验 api_key 内容 (允许空) 的模式对称.
+        //
+        // prefix 检查不在 validate() 做 (它需要 global_mock_prefix 配置, 属 resolve 阶段职责),
+        // 由 validate_and_resolve 统一执行 (SSOT).
         if !self.value.is_empty() {
-            validate_value(&self.value)?;
+            validate_value(&self.value, "")?;
         }
         // mock_strategy 基础校验 (Fixed 非空 / Auto+gen 配置合法). 依赖 real value 的
         // C5 检查由 validate_against_real 在 resolve 后执行, 不在这里 (兼容 value_file 模式).
@@ -461,15 +468,17 @@ mod tests {
     }
 
     #[test]
-    fn validate_value_rejects_short_and_mock_prefix() {
+    fn validate_value_rejects_short_pua_and_mock_prefix() {
         // 太短.
-        assert!(validate_value("ab").is_err());
-        // 含 mock prefix.
-        assert!(validate_value("contains sgm_ in middle").is_err());
+        assert!(validate_value("ab", "").is_err());
         // 含 PUA 字符.
-        assert!(validate_value("ok\u{E000}value").is_err());
-        // 合法.
-        assert!(validate_value("normal-secret-value").is_ok());
+        assert!(validate_value("ok\u{E000}value", "").is_err());
+        // 合法 (空 global_prefix → 不检查 prefix).
+        assert!(validate_value("normal-secret-value", "").is_ok());
+        // 配置了 global_prefix 后, 含该 prefix 的 value 被拒绝.
+        assert!(validate_value("contains sgm_ in middle", "sgm_").is_err());
+        // 不含 prefix 的合法值.
+        assert!(validate_value("normal-secret-value", "sgm_").is_ok());
     }
 
     #[test]

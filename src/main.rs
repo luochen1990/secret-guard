@@ -32,7 +32,9 @@ async fn main() -> Result<()> {
         .state
         .clone()
         .unwrap_or_else(|| default_state_path(&args.config));
-    let dyn_state = DynamicState::load_or_empty(&state_path)?;
+    // dynamic state 的 secret 校验用 static config 的 global_mock_prefix.
+    let global_mock_prefix = static_cfg.redact.global_mock_prefix.clone();
+    let dyn_state = DynamicState::load_or_empty(&state_path, &global_mock_prefix)?;
 
     let host = args.host.unwrap_or_else(|| static_cfg.server.host.clone());
     let port = args.port.unwrap_or(static_cfg.server.port);
@@ -60,6 +62,7 @@ async fn main() -> Result<()> {
         dyn_state,
         state_path,
         static_cfg.auth,
+        global_mock_prefix,
     )
     .await
 }

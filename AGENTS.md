@@ -144,7 +144,7 @@ URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标
 | `config.rs` | 双层配置 schema + `DynamicTable<T>` 泛型 + 持久化 | 文件头部 `//!` (覆盖 OverrideMode / CRUD / Effective source / 跨表并发) |
 | `provider.rs` | Provider 实体 + Effective view + api_key 两来源 | 文件头部 `//!` |
 | `secrets.rs` | SecretEntry 实体 + Effective view + value 两来源 | 文件头部 `//!` |
-| `mock.rs` | MockStrategy 两维度 (初始值 + 生成策略) + 确定性 seed | 文件头部 `//!` (C3 根基) |
+| `mock.rs` | MockStrategy 两维度 (初始值 + 生成策略) + 确定性 seed + `[redact] global_mock_prefix` 注入 | 文件头部 `//!` (C3 根基) |
 | `dag.rs` | ConversationDAG 内容寻址存储 (BlockPool + Node + Merkle) | 文件头部 `//!` + `docs/design/conversation-dag.md` |
 | `record.rs` | ForwardRecord (web 层 DTO, 从 DAG Node 派生) | 文件头部 `//!` |
 | `redact.rs` | RedactionMap + redact/restore pipeline + 形式化契约 C1-C6 | 文件头部 `//!` |
@@ -161,7 +161,7 @@ URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标
 
 | 文件 | 角色 | 谁写 | 进入 git? |
 |---|---|---|---|
-| `secret-guard.toml` | **声明式 (static)** 配置: providers / secrets / server. 进程内只读. | 用户手写 | ✅ 推荐 |
+| `secret-guard.toml` | **声明式 (static)** 配置: providers / secrets / server / redact / auth. 进程内只读. | 用户手写 | ✅ 推荐 |
 | `secret-guard.state.toml` | **动态 (dynamic)** 状态: WebUI 编辑结果 + 对 static 项的 decision. 删除即可重置. | 程序自动 | ❌ 推荐 .gitignore |
 
 合并语义 (OverrideMode: Default / PreferStatic / Disabled)、Effective source 4 种、
@@ -287,7 +287,7 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
   混合 Text+ToolResult user 消息拆成 (1+N) 条 wire messages, 导致 `req_body_raw` 的
   messages 数 > IR messages 数. `extract_delta_messages` 切片时跨协议路径的 start 偏小,
   delta 可能包含前序轮消息. 同协议路径不受影响. 详见 `src/web/AGENTS.md`.
-- static config 的 `[server]` 段仅在启动时读取一次, WebUI 改 host/port 不会生效.
+- static config 的 `[server]` / `[redact]` 段仅在启动时读取一次, WebUI 改 host/port/global_mock_prefix 不会生效.
 - WebUI 编辑 provider 时 api_key 始终要求重输 (无法保留旧值).
 
 ## 后续工作 (非 MVP 范围)

@@ -985,7 +985,8 @@ mod tests {
         // 完整 mock 被切到两个 SSE chunk, sliding window 应正确 restore.
         // 场景: LLM 在响应里 echo 了 mock, 但 mock 字符串恰好跨 TCP chunk 边界.
         let real = "sk-real-test-12345";
-        let mock = crate::redact::mock_with_salt(real, 0);
+        // 手造一个 mock 字符串 (测试 restore 的 chunk 边界处理, 与 prefix 无关).
+        let mock = "MOCKABCDEFGHIJ";
         // mock 在 content 中是连续的, 但被 chunk 边界切到中间.
         // chunk1: "X" + mock 前半; chunk2: mock 后半 + "Y".
         let mock_split = mock.len() / 2;
@@ -993,7 +994,7 @@ mod tests {
         let chunk2_content = format!("{}Y", &mock[mock_split..]);
 
         let mut map = crate::redact::RedactionMap::default();
-        map.insert(real.to_string(), mock.clone());
+        map.insert(real.to_string(), mock.to_string());
         let mut t = StreamTranslate::new_same_proto_restore(Protocol::OpenAI, map);
 
         let sse1 = format!(
@@ -1024,7 +1025,7 @@ mod tests {
             "client should see real_secret restored: got {combined:?}"
         );
         assert!(
-            !combined.contains(&mock),
+            !combined.contains(mock),
             "client should NOT see mock {mock}: got {combined:?}"
         );
     }

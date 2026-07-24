@@ -1682,7 +1682,7 @@ mod tests {
         // NodeView 应携带 list 路径所需的所有字段 (preview/model/streamed/redactions/...).
         let dag = ConversationDag::new(8, 500, 1);
         let mut ev = event_with_body("/o/x/v1/chat", "{}");
-        ev.redactions = vec![("sgm_x".into(), "k".into())];
+        ev.redactions = vec![("MOCKx".into(), "k".into())];
         let id = dag.push_messages(vec![], ev);
         dag.attach_response(
             id,

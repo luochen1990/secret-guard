@@ -30,11 +30,13 @@
 //!   (因为每次 gen_mock_for_ir 都检查 allocated 集合).
 //! - **C5 不含 real_secret 子串** (best-effort):
 //!   - Auto 模式: mock 由 hash 驱动, 极大概率不含 real_secret 的 ≥4 字符连续子串.
-//!     用户自定义 `gen.prefix` 在 [`crate::mock::MockStrategy::validate_against_real`]
-//!     中校验不与 real 重叠 (prefix 不出现在 real 中, 也不含 real 的 ≥4 字符子串).
+//!     `gen.prefix` (用户自定义或 `[redact] global_mock_prefix` 注入的) 在
+//!     [`crate::mock::MockStrategy::validate_against_real`] 中校验不与 real 重叠
+//!     (prefix 不出现在 real 中, 也不含 real 的 ≥4 字符子串).
 //!   - Fixed 模式: 由 [`crate::mock::MockStrategy::validate_against_real`] 在 upsert 时检查
 //!     (char-level windows, 正确处理 multibyte UTF-8 secret).
-//!     前提: `SecretTable::upsert` 通过 `validate_value` 拒绝含 `MOCK_PREFIX` ("sgm_") 的 secret.
+//!     前提: `SecretTable::upsert` 通过 `validate_value` 拒绝含 `global_mock_prefix` 的 secret
+//!     (见 [`crate::secrets::validate_value`]; prefix 为空时此检查跳过).
 //!     `proptest-regressions/redact.txt` 记录历史失败种子 (real 全 base62 字母时风险更高).
 //! - **C6 可逆性 (restorability)**: round-trip identity —
 //!   `restore_ir_response(&mut <redacted IrResponse>, &redact_ir(&mut <IrRequest>, secrets).0)`
@@ -66,18 +68,11 @@
 //!   per-block 独立状态, 跨 block 互不干扰.
 
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
 
 use crate::codec::ir::{IrBlock, IrDelta, IrRequest, IrResponse, IrTool};
 use crate::secrets::SecretEntry;
-
-/// mock 的固定 prefix. 与 real_secret 无关, 是 C5 (no-real-substring) 的关键.
-pub const MOCK_PREFIX: &str = "sgm_";
-
-/// mock 的 body 长度 (base62 编码 u64 的固定长度, 范围 ~10^19 ≈ 2^63).
-pub const MOCK_BODY_LEN: usize = 11;
 
 /// 改写映射: real ↔ mock 双向索引.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -116,40 +111,6 @@ impl RedactionMap {
 }
 
 // ─── 内部算法 ──────────────────────────────────────────────────────────────
-
-/// 64-bit hash (Rust 默认 SipHash 1-2-3, 同 Rust 版本内确定; 不保证跨版本稳定,
-/// 但 RedactionMap 是 per-request 状态不持久化, 所以无实际影响).
-fn hash64(s: &str) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut h);
-    h.finish()
-}
-
-/// base62 编码 u64 → 固定长度字符串.
-fn base62_fixed(n: u64) -> String {
-    const CHARS: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-    debug_assert_eq!(CHARS.len(), 62);
-    let mut buf = [b'0'; MOCK_BODY_LEN];
-    let mut n = n;
-    for i in (0..MOCK_BODY_LEN).rev() {
-        buf[i] = CHARS[(n % 62) as usize];
-        n /= 62;
-    }
-    String::from_utf8(buf.to_vec()).expect("base62 output is ASCII")
-}
-
-/// 给 real + salt 生成一个 mock 候选 (不做唯一性检查).
-/// salt = 0 是默认 hash; salt > 0 用于 collision probing.
-///
-/// 公开 (`pub`) 让集成测试可以预测预期 mock 值; 生产代码不应直接调用.
-pub fn mock_with_salt(real: &str, salt: u64) -> String {
-    let hash_input = if salt == 0 {
-        real.to_string()
-    } else {
-        format!("{real}{salt}")
-    };
-    format!("{MOCK_PREFIX}{}", base62_fixed(hash64(&hash_input)))
-}
 
 /// 计算 policy 的 init seed (per-request seed 链的起点).
 ///
@@ -284,9 +245,9 @@ impl DeltaKind {
 ///
 /// # 为什么需要 sliding window
 ///
-/// 流式响应里 mock (如 `sgm_ABC123`) 可能跨多个 chunk:
+/// 流式响应里 mock (如 `MOCKABC123`) 可能跨多个 chunk:
 /// ```text
-/// event 1 TextDelta: "the secret is sgm_AB"
+/// event 1 TextDelta: "the secret is MOCKAB"
 /// event 2 TextDelta: "C123 end"
 /// ```
 /// 单 event 不含完整 mock, 直接 [`restore_str_inplace`] 找不到匹配.
@@ -697,8 +658,20 @@ fn entry(value: &str) -> SecretEntry {
     };
     // 测试 helper 模拟生产路径: validate_and_resolve 会调用 resolve_against,
     // 让 Auto 模式的 gen spec 被 infer 出来 (否则 gen_candidate 会 panic).
-    e.mock_strategy.resolve_against(&e.value);
+    // 测试默认场景: 空 global_prefix (Auto 模式 mock 无前缀).
+    e.mock_strategy.resolve_against(&e.value, "");
     e
+}
+
+/// 预测 redact 对给定 real_secret 生成的首个 mock (counter=0).
+///
+/// 复用 entry() helper (空 global_prefix) + init_seed + gen_candidate,
+/// 与生产 [`redact_ir`] 路径的首次候选一致. 集中"如何预测 mock"知识, 供多个测试复用.
+#[cfg(test)]
+fn predict_mock(real: &str) -> String {
+    let e = entry(real);
+    let seed = init_seed(std::slice::from_ref(&e));
+    crate::mock::gen_candidate(real, &e.mock_strategy, seed, 0)
 }
 
 #[cfg(test)]
@@ -711,25 +684,21 @@ mod tests {
 
     #[test]
     fn c1_non_empty() {
+        // Auto 模式 (空 global_prefix) 生成的 mock 非空, 仅含 infer 自 real 的字符集.
         let ir = sample_ir_with_text("ctx");
         let mut ir_mut = ir.clone();
         let _ = redact_ir(&mut ir_mut, &[entry("sk-test-123")]);
-        // mock 形式由 gen_mock_for_ir 保证; 直接验证 mock_with_salt 的形式.
-        let m = mock_with_salt("sk-test-123", 0);
+        let m = predict_mock("sk-test-123");
         assert!(!m.is_empty());
-        assert!(m.starts_with(MOCK_PREFIX));
-        assert!(
-            m.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
-            "mock '{m}' must be ASCII alphanumeric + underscore"
-        );
-        assert_eq!(m.len(), MOCK_PREFIX.len() + MOCK_BODY_LEN);
+        // 空 prefix + real "sk-test-123" → mock 与 real 等长 (11 chars), charset 来自 real.
+        assert_eq!(m.chars().count(), 11);
     }
 
     #[test]
     fn c2_in_context_uniqueness() {
         // gen_mock_for_ir 生成的 mock 必须不出现在当前 IR 中.
-        // 构造 IR 里含一个 mock-shaped 字符串, gen 出的 mock 应该避开它.
-        let ir = sample_ir_with_text("sgm_AAAAAAAAAAAAA");
+        // 构造 IR 里含一个占位字符串, gen 出的 mock 应该避开它.
+        let ir = sample_ir_with_text("placeholder-string-that-must-be-avoided");
         let allocated = HashSet::new();
         let entry = entry("real-secret");
         let seed = init_seed(std::slice::from_ref(&entry));
@@ -738,14 +707,15 @@ mod tests {
             !ir_request_contains(&ir, &m),
             "gen mock must avoid existing IR content; got {m}"
         );
-        assert_ne!(m, "sgm_AAAAAAAAAAAAA");
+        assert_ne!(m, "placeholder-string-that-must-be-avoided");
     }
 
     #[test]
     fn c3_determinism() {
+        // gen_candidate 在同一 (real, strategy, seed, counter) 下确定.
         for secret in ["short", "sk-test-123", "a-much-longer-secret-value-XYZ"] {
-            let m1 = mock_with_salt(secret, 0);
-            let m2 = mock_with_salt(secret, 0);
+            let m1 = predict_mock(secret);
+            let m2 = predict_mock(secret);
             assert_eq!(m1, m2, "same input must produce same mock for '{secret}'");
         }
     }
@@ -769,14 +739,10 @@ mod tests {
 
     #[test]
     fn c5_no_substring_of_real_secret() {
-        // mock 不应含 real_secret 的任何 ≥4 字符连续子串.
-        // 前提: real_secret 不含 MOCK_PREFIX (validate_value 已强制).
+        // mock 不应含 real_secret 的任何 ≥4 字符连续子串 (概率性契约, 见 mock.rs 注释).
+        // 空 global_prefix 下, mock 由 hash 驱动, 极小概率碰撞.
         for real in ["sk-test-123", "super-secret-xyz", "ABCDEFGH", "abcdefgh"] {
-            assert!(
-                !real.contains(MOCK_PREFIX),
-                "test fixture '{real}' should be rejected by validate_value"
-            );
-            let m = mock_with_salt(real, 0);
+            let m = predict_mock(real);
             for window in 4..=real.len() {
                 for sub in real.as_bytes().windows(window) {
                     let sub_str = std::str::from_utf8(sub).unwrap();
@@ -815,17 +781,14 @@ mod tests {
     // ─── 行为测试 ──────────────────────────────────────────────────────────
 
     #[test]
-    fn mock_has_fixed_prefix_and_length() {
+    fn mock_length_matches_real_when_no_prefix() {
+        // 空 global_prefix 下, infer 的 mock 长度 == real 长度 (见 GenSpec::infer_default_for).
         for real in ["abcd", "sk-test", "-leading-dash", "longer-secret-value"] {
-            let m = mock_with_salt(real, 0);
-            assert!(
-                m.starts_with(MOCK_PREFIX),
-                "mock '{m}' must start with '{MOCK_PREFIX}'"
-            );
+            let m = predict_mock(real);
             assert_eq!(
-                m.len(),
-                MOCK_PREFIX.len() + MOCK_BODY_LEN,
-                "mock '{m}' must have fixed length"
+                m.chars().count(),
+                real.chars().count(),
+                "mock '{m}' length must equal real '{real}' (no global prefix)"
             );
         }
     }
@@ -964,17 +927,17 @@ mod tests {
     fn restore_ir_response_swaps_mock_back_to_real() {
         let mut ir = IrResponse {
             content: vec![IrBlock::Text {
-                text: "result sgm_ABCDEF12345 end".to_string(),
+                text: "result MOCKABCDEF12345 end".to_string(),
             }],
             ..Default::default()
         };
         let mut map = RedactionMap::default();
-        map.insert("sk-real-secret".to_string(), "sgm_ABCDEF12345".to_string());
+        map.insert("sk-real-secret".to_string(), "MOCKABCDEF12345".to_string());
         restore_ir_response(&mut ir, &map);
         match &ir.content[0] {
             IrBlock::Text { text } => {
                 assert!(text.contains("sk-real-secret"));
-                assert!(!text.contains("sgm_ABCDEF12345"));
+                assert!(!text.contains("MOCKABCDEF12345"));
             }
             _ => panic!("expected Text"),
         }
@@ -992,8 +955,8 @@ mod tests {
 
     #[test]
     fn restorer_round_trip_on_single_chunk_with_full_mock() {
-        let mut r = StreamingRestorer::new(map_with("real-secret", "sgm_ABCDEFGHIJK"));
-        let content = "the secret is sgm_ABCDEFGHIJK padding-padding-padding".to_string();
+        let mut r = StreamingRestorer::new(map_with("real-secret", "MOCKABCDEFGHIJK"));
+        let content = "the secret is MOCKABCDEFGHIJK padding-padding-padding".to_string();
         let mut emitted = r.push(content.clone());
         emitted.push_str(&r.flush().1);
         assert_eq!(emitted, "the secret is real-secret padding-padding-padding");
@@ -1003,8 +966,8 @@ mod tests {
     fn restorer_round_trip_on_mock_split_across_chunks() {
         // 核心 contract 的具体落地 (chunk 边界落在 mock 中间).
         // 详细 byte-offset 推理由 prop_streaming_restorer_round_trip 覆盖所有 chunk_size.
-        let mut r = StreamingRestorer::new(map_with("real-secret", "sgm_ABCDEFGHIJK"));
-        let out1 = r.push("the secret is sgm_AB".to_string());
+        let mut r = StreamingRestorer::new(map_with("real-secret", "MOCKABCDEFGHIJK"));
+        let out1 = r.push("the secret is MOCKAB".to_string());
         let out2 = r.push("CDEFGHIJK done".to_string());
         let (_, tail) = r.flush();
         assert_eq!(out1 + &out2 + &tail, "the secret is real-secret done");
@@ -1023,10 +986,10 @@ mod tests {
     fn restorer_preserves_delta_kind_on_flush() {
         // input_json delta 也应正确 restore, flush 时保留 InputJson kind.
         use super::DeltaKind;
-        let mut r = StreamingRestorer::new(map_with("real-token", "sgm_ABCDEFGHIJK"));
+        let mut r = StreamingRestorer::new(map_with("real-token", "MOCKABCDEFGHIJK"));
         r.set_kind(DeltaKind::InputJson);
         // 喂一段长度 ≤ hold 的不完整 mock, 全部进 buffer, push 返回空.
-        let out = r.push("sgm_A".to_string()); // 5 字节 < hold=14
+        let out = r.push("MOCKA".to_string()); // 5 字节 < hold=14
         assert!(
             out.is_empty(),
             "push should return empty when all held: {out}"
@@ -1040,7 +1003,7 @@ mod tests {
         );
         // flush 时 best-effort restore, 因 mock 不完整, tail 仍含原始 mock 残段.
         assert!(
-            tail.contains("sgm_A"),
+            tail.contains("MOCKA"),
             "tail should contain raw mock remnant, got: {tail}"
         );
     }
@@ -1048,10 +1011,10 @@ mod tests {
     #[test]
     fn restorer_round_trip_on_multiple_mocks_in_one_chunk() {
         let mut map = RedactionMap::default();
-        map.insert("r1".to_string(), "sgm_11111111111".to_string());
-        map.insert("r2".to_string(), "sgm_22222222222".to_string());
+        map.insert("r1".to_string(), "MOCK11111111111".to_string());
+        map.insert("r2".to_string(), "MOCK22222222222".to_string());
         let mut r = StreamingRestorer::new(map);
-        let out = r.push("a sgm_11111111111 b sgm_22222222222 c".to_string());
+        let out = r.push("a MOCK11111111111 b MOCK22222222222 c".to_string());
         let (_, tail) = r.flush();
         assert_eq!(out + &tail, "a r1 b r2 c");
     }
@@ -1060,7 +1023,7 @@ mod tests {
     fn restorer_caps_buffer_at_hold_when_no_mock_in_chunk() {
         // 无 mock 时尾部仍 hold (防下个 chunk 携带 mock 前缀).
         // buffer ≤ hold + 3 (UTF-8 char boundary 回退最多 3 字节, 见 find_safe_end).
-        let mut r = StreamingRestorer::new(map_with("r", "sgm_ABCDEFGHIJK")); // hold = 14
+        let mut r = StreamingRestorer::new(map_with("r", "MOCKABCDEFGHIJK")); // hold = 14
         let chunk = "hello world, this is a long chunk";
         let out = r.push(chunk.to_string());
         let (_, tail) = r.flush();
@@ -1157,23 +1120,21 @@ mod tests {
             prop_assert_eq!(restored, original_text);
         }
 
-        /// C1: mock 非空且仅含 ASCII 字母数字 + 下划线.
+        /// C1: mock 非空. 字符集由 infer 自 real (此处含字母数字与连字符).
         #[test]
-        fn prop_mock_alphanumeric(
+        fn prop_mock_non_empty(
             secret in "[A-Za-z0-9-]{4,20}"
         ) {
-            let m = mock_with_salt(&secret, 0);
+            let m = predict_mock(&secret);
             prop_assert!(!m.is_empty());
-            prop_assert!(m.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
         }
 
-        /// C5: mock 不含 real_secret 的 ≥4 字符子串.
+        /// C5: mock 不含 real_secret 的 ≥4 字符子串 (概率性契约).
         #[test]
         fn prop_no_real_substring(
             secret in "[A-Za-z0-9]{8,20}"
         ) {
-            prop_assume!(!secret.contains(MOCK_PREFIX));
-            let m = mock_with_salt(&secret, 0);
+            let m = predict_mock(&secret);
             for window in 4..=secret.len() {
                 for sub in secret.as_bytes().windows(window) {
                     let sub_str = std::str::from_utf8(sub).unwrap();
@@ -1261,7 +1222,7 @@ mod tests {
             chunk_size in 1usize..30,
         ) {
             let real = "SECRETVALUE";
-            let mock = "sgm_ABCDEFGHIJK"; // 15 字节, 与 real 等价映射
+            let mock = "MOCKABCDEFGHIJK"; // 15 字节, 与 real 等价映射
             let mut map = RedactionMap::default();
             map.insert(real.to_string(), mock.to_string());
 
@@ -1282,7 +1243,7 @@ mod tests {
             chunk_size in 1usize..=50,
         ) {
             let real = "SECRETVALUE";
-            let mock = "sgm_ABCDEFGHIJK";
+            let mock = "MOCKABCDEFGHIJK";
             let mut map = RedactionMap::default();
             map.insert(real.to_string(), mock.to_string());
 
@@ -1303,8 +1264,8 @@ mod tests {
         ) {
             let real1 = "R1";
             let real2 = "R2";
-            let mock1 = "sgm_11111111111"; // 15 字节
-            let mock2 = "sgm_22222222222";
+            let mock1 = "MOCK11111111111"; // 15 字节
+            let mock2 = "MOCK22222222222";
             let mut map = RedactionMap::default();
             map.insert(real1.to_string(), mock1.to_string());
             map.insert(real2.to_string(), mock2.to_string());

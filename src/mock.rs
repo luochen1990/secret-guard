@@ -23,11 +23,15 @@
 //! C2 (不在 IR 中) 与 C4 (单射性) 的检查仍由 [`crate::redact::redact_ir`] 完成 —
 //! 调用方按 probing 协议 (counter 递增) 消费本模块的候选, 直到找到合格的.
 //!
-//! # 向后兼容
+//! # 向后兼容 + global_mock_prefix
 //!
 //! 未配置 `mock_strategy` 的旧 secret ([`crate::secrets::SecretEntry`]) 在 resolve 时
 //! 自动得到 [`MockStrategy::default_for`] (Auto + infer 自 real 的 gen spec).
 //! 行为尽可能接近原固定算法 (用 hash 生成等长 mock, charset 来自 real).
+//!
+//! `[redact] global_mock_prefix` (默认空串) 在 resolve 阶段注入到每个 secret 的
+//! `gen_spec.prefix`, 让 Auto 模式生成的 mock 带统一可辨识前缀 (如 `"sgm_"`).
+//! 空 prefix = mock 无前缀 (纯 hash body). 见 [`GenSpec::infer_default_for`].
 
 use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
@@ -139,13 +143,18 @@ pub struct GenSpec {
 
 impl GenSpec {
     /// 从 real secret 推断默认 gen spec:
-    /// `prefix=""`, `charset=infer_from(real)`, `length_range=(n, n)` (与 real 等长).
-    pub fn infer_default_for(real: &str) -> Self {
+    /// `prefix=global_prefix`, `charset=infer_from(real)`,
+    /// `length_range=(global_prefix.chars + n, ...)` (mock 总长 = global_prefix + real 等长 body).
+    ///
+    /// `global_prefix` 来自 `[redact] global_mock_prefix` 配置 (默认空串).
+    /// 让 Auto 模式生成的 mock 带可配置的统一前缀, 便于在日志 / WebUI 中视觉辨识.
+    pub fn infer_default_for(real: &str, global_prefix: &str) -> Self {
         let n = real.chars().count();
+        let prefix_len = global_prefix.chars().count();
         Self {
-            prefix: String::new(),
+            prefix: global_prefix.to_string(),
             charset: Charset::infer_from(real),
-            length_range: (n, n),
+            length_range: (prefix_len + n, prefix_len + n),
         }
     }
 
@@ -208,11 +217,14 @@ pub struct MockStrategy {
 
 impl MockStrategy {
     /// 在 resolve 拿到 real value 后调用:
-    /// 若 `gen=None` 且 `initial=Auto`, 用 real infer 默认 gen spec.
+    /// 若 `gen=None` 且 `initial=Auto`, 用 real + `global_prefix` infer 默认 gen spec.
     /// Fixed 模式不需要 gen, 保持 None.
-    pub fn resolve_against(&mut self, real: &str) {
+    ///
+    /// `global_prefix` 来自 `[redact] global_mock_prefix` (默认空串), 透传给
+    /// [`GenSpec::infer_default_for`] 作为 infer 出的 gen_spec.prefix.
+    pub fn resolve_against(&mut self, real: &str, global_prefix: &str) {
         if self.gen_spec.is_none() && matches!(self.initial, InitialValue::Auto) {
-            self.gen_spec = Some(GenSpec::infer_default_for(real));
+            self.gen_spec = Some(GenSpec::infer_default_for(real, global_prefix));
         }
     }
 
@@ -442,7 +454,8 @@ mod tests {
 
     #[test]
     fn genspec_infer_default_for_real() {
-        let gen_spec = GenSpec::infer_default_for("sk-Abc123");
+        // 默认 (空 global_prefix): prefix 空, length == real 长度.
+        let gen_spec = GenSpec::infer_default_for("sk-Abc123", "");
         assert_eq!(gen_spec.prefix, "");
         assert!(gen_spec.charset.lowercase);
         assert!(gen_spec.charset.uppercase);
@@ -452,8 +465,16 @@ mod tests {
     }
 
     #[test]
+    fn genspec_infer_default_with_global_prefix() {
+        // 配置 global_prefix="sgm_": mock 总长 = prefix(4) + real(9) = 13.
+        let gen_spec = GenSpec::infer_default_for("sk-Abc123", "sgm_");
+        assert_eq!(gen_spec.prefix, "sgm_");
+        assert_eq!(gen_spec.length_range, (13, 13));
+    }
+
+    #[test]
     fn genspec_infer_default_empty_real() {
-        let gen_spec = GenSpec::infer_default_for("");
+        let gen_spec = GenSpec::infer_default_for("", "");
         assert_eq!(gen_spec.length_range, (0, 0));
         assert!(gen_spec.charset.is_empty());
     }
@@ -535,7 +556,7 @@ mod tests {
     #[test]
     fn mock_strategy_resolve_infers_gen_for_auto() {
         let mut s = MockStrategy::default();
-        s.resolve_against("sk-Abc123");
+        s.resolve_against("sk-Abc123", "");
         let gen_spec = s.gen_spec.expect("gen should be inferred");
         assert_eq!(gen_spec.length_range, (9, 9));
         assert!(gen_spec.charset.lowercase);
@@ -555,7 +576,7 @@ mod tests {
             initial: InitialValue::Auto,
             gen_spec: Some(user_gen.clone()),
         };
-        s.resolve_against("sk-Abc123");
+        s.resolve_against("sk-Abc123", "");
         // 用户设置的 gen 不被覆盖.
         assert_eq!(s.gen_spec.as_ref().unwrap(), &user_gen);
     }
@@ -569,7 +590,7 @@ mod tests {
             },
             gen_spec: None,
         };
-        s.resolve_against("sk-Abc123");
+        s.resolve_against("sk-Abc123", "");
         // Fixed 模式 gen 保持 None.
         assert!(s.gen_spec.is_none());
     }
@@ -950,7 +971,7 @@ mod tests {
         // 从 real infer 策略 → resolve → gen_candidate 生成的 mock 长度 == real 长度.
         let real = "sk-Abc123_XY!";
         let mut s = MockStrategy::default();
-        s.resolve_against(real);
+        s.resolve_against(real, "");
         let seed = deterministic_seed(real, &s);
         let mock = gen_candidate(real, &s, seed, 0);
         assert_eq!(mock.chars().count(), real.chars().count());
