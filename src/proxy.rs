@@ -77,6 +77,10 @@ pub struct ProxyState {
     pub providers: ProviderTable,
     pub dag: ConversationDag,
     pub secrets: SecretTable,
+    /// API key 存储 (仅 auth.enabled = true 时存在).
+    /// 单用户模式 (auth.enabled = false) 下为 None, handler 不消费此字段.
+    #[allow(unused)]
+    pub api_keys: Option<crate::auth::ApiKeyStore>,
 }
 
 /// axum 路径参数: `/{proto}/{name}/{*rest}`.
@@ -1307,6 +1311,8 @@ pub enum AppError {
     Unavailable(String),
     #[error("not implemented: {0}")]
     NotImplemented(String),
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
     #[error("internal: {0}")]
     Internal(String),
 }
@@ -1339,6 +1345,7 @@ impl IntoResponse for AppError {
                 "not_implemented",
                 Some(m.clone()),
             ),
+            AppError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "unauthorized", None),
             AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal", None),
         };
         error!(error = %self, kind, "proxy error");

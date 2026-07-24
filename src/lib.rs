@@ -17,6 +17,7 @@
 //! 路由 `/{proto_short}/{provider_id}/*path` 同时编码 ingress protocol 与 provider.
 //! 同协议走字节透传; 跨协议通过 [`codec`] 模块的 IR 翻译.
 
+pub mod auth;
 pub mod cli;
 pub mod codec;
 pub mod config;

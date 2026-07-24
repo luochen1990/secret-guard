@@ -34,7 +34,7 @@ use crate::record::{ForwardRecord, RecordFilter};
 use crate::secrets::{EffectiveSecret, SecretCategory, SecretEntry};
 
 /// 共享的 `no-store` header 设置 (axum 的 `[(name, value); N]` 接受 `(&str, &str)`).
-const NO_STORE: [(&str, &str); 1] = [("cache-control", "no-store, no-cache, must-revalidate")];
+pub const NO_STORE: [(&str, &str); 1] = [("cache-control", "no-store, no-cache, must-revalidate")];
 
 // ─── /records ──────────────────────────────────────────────────────────────
 
@@ -996,6 +996,12 @@ impl ApiError {
             message: msg.into(),
         }
     }
+    pub fn unauthorized(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: msg.into(),
+        }
+    }
     pub fn from_any(e: anyhow::Error) -> Self {
         // 详细信息进 tracing, 不回客户端.
         tracing::error!(error = ?e, "api internal error");
@@ -1501,5 +1507,96 @@ mod tests {
         assert!(resp.parsed_request.is_some());
         assert!(resp.parsed_response.is_none());
         assert!(resp.parse_error.is_none());
+    }
+}
+
+// ─── /api-keys ──────────────────────────────────────────────────────────────
+//
+// 仅在 auth.enabled = true 时挂载 (由 server.rs 条件化装配).
+// 这些 handler 需要 OIDC 登录 (通过 login_required guard 保护).
+// handler 从 AuthSession 取当前用户 sub 作为 tenant_id + created_by.
+
+use axum_login::AuthSession;
+
+/// `POST /api/api-keys` 请求体.
+#[derive(Debug, Deserialize)]
+pub struct CreateApiKeyRequest {
+    /// 人类可读标签.
+    #[serde(default)]
+    pub label: String,
+}
+
+/// 当前已登录用户信息 (从 AuthSession 提取).
+/// 用于 API key 签发时绑定 tenant_id + created_by.
+fn current_user_sub(auth_session: &AuthSession<crate::auth::OidcBackend>) -> Option<String> {
+    auth_session.user.as_ref().map(|u| u.sub.clone())
+}
+
+/// 同时校验登录态 + API key store 可用性, 返回 (user_sub, store).
+/// 消除 3 个 handler 的重复样板.
+fn require_user_and_store<'a>(
+    state: &'a ProxyState,
+    auth_session: &AuthSession<crate::auth::OidcBackend>,
+) -> Result<(String, &'a crate::auth::ApiKeyStore), ApiError> {
+    let user_sub = current_user_sub(auth_session)
+        .ok_or_else(|| ApiError::unauthorized("not authenticated"))?;
+    let api_keys = state
+        .api_keys
+        .as_ref()
+        .ok_or_else(|| ApiError::internal("API key store not configured (auth disabled?)"))?;
+    Ok((user_sub, api_keys))
+}
+
+/// 列出当前用户的所有 API key 摘要.
+///
+/// 从所有 keys 中过滤出 tenant_id == 当前用户 sub 的条目.
+/// (M1 中 tenant_id = OIDC sub, 每个用户只能看到自己的 key.)
+pub async fn list_api_keys(
+    State(state): State<ProxyState>,
+    auth_session: AuthSession<crate::auth::OidcBackend>,
+) -> Result<impl IntoResponse, ApiError> {
+    let (user_sub, api_keys) = require_user_and_store(&state, &auth_session)?;
+    let all_keys = api_keys.list();
+    let user_keys: Vec<_> = all_keys
+        .into_iter()
+        .filter(|k| k.tenant_id == user_sub)
+        .collect();
+    Ok((NO_STORE, Json(serde_json::json!({ "keys": user_keys }))))
+}
+
+/// 签发新的 API key. 返回明文 (仅此一次).
+pub async fn create_api_key(
+    State(state): State<ProxyState>,
+    auth_session: AuthSession<crate::auth::OidcBackend>,
+    Json(payload): Json<CreateApiKeyRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let (user_sub, api_keys) = require_user_and_store(&state, &auth_session)?;
+    let issued = api_keys
+        .issue(&user_sub, &user_sub, &payload.label)
+        .map_err(ApiError::from_any)?;
+    Ok((StatusCode::CREATED, NO_STORE, Json(issued)))
+}
+
+/// 撤销 API key (按 id).
+pub async fn delete_api_key(
+    State(state): State<ProxyState>,
+    auth_session: AuthSession<crate::auth::OidcBackend>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let (user_sub, api_keys) = require_user_and_store(&state, &auth_session)?;
+    // 只能撤销自己的 key (tenant_id == user_sub).
+    // 先查是否属于当前用户, 不属于则 404 (避免泄漏 key 是否存在).
+    let belongs_to_user = api_keys
+        .list()
+        .into_iter()
+        .any(|k| k.id == id && k.tenant_id == user_sub);
+    if !belongs_to_user {
+        return Err(ApiError::not_found(format!("API key {id} not found")));
+    }
+    let deleted = api_keys.revoke(&id).map_err(ApiError::from_any)?;
+    if deleted {
+        Ok((StatusCode::NO_CONTENT, NO_STORE, ""))
+    } else {
+        Err(ApiError::not_found(format!("API key {id} not found")))
     }
 }

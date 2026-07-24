@@ -123,6 +123,7 @@ async fn spawn_proxy_static_dynamic(
         providers: provider_table,
         dag: records,
         secrets,
+        api_keys: None,
     };
     let app = server::build_router(proxy);
     tokio::spawn(async move {
@@ -2849,6 +2850,7 @@ async fn cross_table_shared_state_no_lost_update() {
         providers: provider_table,
         dag: ConversationDag::new(64, 500, 1),
         secrets: secret_table,
+        api_keys: None,
     };
     let app = server::build_router(proxy);
     tokio::spawn(async move {

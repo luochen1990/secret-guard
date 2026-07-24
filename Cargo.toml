@@ -28,6 +28,15 @@ toml = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 parking_lot = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+
+# 认证: OIDC (浏览器 WebUI) + 本地 API key (SDK 转发路径).
+# axum-login re-export tower-sessions core, 但 MemoryStore 需要 memory-store feature.
+tower-sessions = { version = "0.14", features = ["memory-store"] }
+axum-login = "0.18"
+openidconnect = { version = "4", default-features = false, features = ["reqwest", "rustls-tls"] }
+time = "0.3"
 
 [dev-dependencies]
 tokio-test = "0.4"
@@ -40,3 +49,7 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# cargo-machete 误报: time 被 tower_sessions::cookie::time::Duration 间接使用.
+[package.metadata.cargo-machete]
+ignored = ["time"]

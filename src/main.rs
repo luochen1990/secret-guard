@@ -59,6 +59,7 @@ async fn main() -> Result<()> {
         static_cfg.secrets.entries,
         dyn_state,
         state_path,
+        static_cfg.auth,
     )
     .await
 }

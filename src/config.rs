@@ -96,6 +96,11 @@ pub struct Config {
     /// 静态 secret 列表. WebUI 不能改写, 只能 disable 或 override.
     #[serde(default)]
     pub secrets: SecretsConfig,
+
+    /// 认证配置 (OIDC + API key 开关). `enabled = false` (默认) = 单用户模式,
+    /// 所有路由无认证 (向后兼容本地部署).
+    #[serde(default)]
+    pub auth: crate::auth::AuthConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,6 +181,10 @@ pub struct DynamicState {
     /// 对 static id 的 per-item 决策.
     #[serde(default)]
     pub decisions: Decisions,
+
+    /// WebUI 签发的 API keys (用于 SDK 转发路径认证). 存 hash, 不存明文.
+    #[serde(default)]
+    pub api_keys: Vec<crate::auth::ApiKeyEntry>,
 }
 
 impl DynamicState {

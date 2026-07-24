@@ -7,6 +7,13 @@
 //! - `/{proto}/{name}/{*rest}`—— forward (含 sub-path).
 //! - 其他 —— 404 (不再 catch-all 透传, 避免误转发 + 明确契约).
 //!
+//! # 认证 (可选, 由 `[auth] enabled` 控制)
+//!
+//! `auth.enabled = false` (默认): 单用户模式, 所有路由无认证 (向后兼容).
+//! `auth.enabled = true`: 双轨认证 —
+//! - 浏览器 WebUI (`/__sg/*`): OIDC Authorization Code + PKCE → cookie session.
+//! - SDK 转发 (`/{o|a|g|l}/*`): 本地 API key (`Authorization: Bearer sg_...`).
+//!
 //! # 协议简写
 //! `o`=OpenAI, `a`=Anthropic, `g`=Gemini, `l`=oLLama. 见 [`crate::provider::Protocol`].
 //!
@@ -16,7 +23,8 @@
 //!
 //! # 双层状态装配
 //! [`serve`] 接收 static + dynamic 两份配置, 在内部:
-//! 1. 共享一把 `persist_lock` 给 ProviderTable / SecretTable (避免并发 RMW 互相覆盖).
+//! 1. 共享一把 `persist_lock` 给 ProviderTable / SecretTable / ApiKeyStore
+//!    (避免并发 RMW 互相覆盖 state.toml).
 //! 2. 共享同一份 `Decisions` 给两个表 (因为 decisions 同时含 provider / secret 决策,
 //!    任何一方修改都要触发 state.toml 重写).
 
@@ -25,36 +33,136 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
+use axum::middleware;
 use axum::{
     Router,
-    routing::{any, get},
+    routing::{any, get, post},
 };
 use parking_lot::{Mutex, RwLock};
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
+use crate::auth::{ApiKeyStore, AuthConfig, OidcBackend};
 use crate::dag::ConversationDag;
 use crate::provider::{Provider, ProviderTable};
 use crate::proxy::{ProxyState, forward, forward_no_rest};
 use crate::secrets::{SecretEntry, SecretTable};
 use crate::web;
 
-/// 构建 axum Router.
+/// 构建 axum Router (单用户模式, 无认证).
+///
+/// 这是 `auth.enabled = false` 时的入口, 与旧版完全兼容.
 pub fn build_router(state: ProxyState) -> Router {
-    Router::new()
-        // 根路径: Web UI (主入口, 替代旧版默认转发到上游).
-        .route("/", get(web::index_handler))
-        // Web UI / API 命名空间 (保留旧入口).
-        .nest("/__sg", web::router())
-        .route("/__sg/", get(web::slash_redirect))
-        // `/__sg/*` 中未匹配的子路径必须返回 404, 避免被 catch-all 吞掉并转发到上游
-        // (否则用户配错 URL 时会泄漏 secret-guard 的内部 URL 给 LLM provider).
-        .route("/__sg/{*rest}", get(web::not_found))
-        // Forward: `/{proto}/{name}/{*rest}` 同时编码 ingress 协议与目标 provider.
+    build_router_inner(state, None)
+}
+
+/// 构建 axum Router (带认证).
+///
+/// `auth_stack` 由 [`serve`] 在启用认证时构造.
+pub fn build_router_with_auth(state: ProxyState, auth_stack: AuthStack) -> Router {
+    build_router_inner(state, Some(auth_stack))
+}
+
+/// 内部: 根据 auth_stack 是否存在, 条件化装配认证 layer.
+fn build_router_inner(state: ProxyState, auth_stack: Option<AuthStack>) -> Router {
+    // Forward router: 使用 ProxyState, 在 merge 前不调用 with_state.
+    let forward_router: Router<ProxyState> = Router::new()
         .route("/{proto}/{name}", any(forward_no_rest))
-        .route("/{proto}/{name}/{*rest}", any(forward))
+        .route("/{proto}/{name}/{*rest}", any(forward));
+
+    match auth_stack {
+        None => {
+            // 单用户模式: 所有路由无认证.
+            Router::new()
+                .route("/", get(web::index_handler))
+                .nest("/__sg", web::router())
+                .route("/__sg/", get(web::slash_redirect))
+                .route("/__sg/{*rest}", get(web::not_found))
+                .merge(forward_router)
+                .with_state(state)
+                .layer(TraceLayer::new_for_http())
+        }
+        Some(auth) => build_router_with_auth_layers(state, auth, forward_router),
+    }
+}
+
+/// 认证层的完整装配状态 (启用认证时由 serve 构造).
+pub struct AuthStack {
+    pub backend: OidcBackend,
+    pub api_keys: ApiKeyStore,
+}
+
+/// 构建带认证的 router.
+///
+/// - WebUI 路由: OIDC session guard (login_required).
+/// - 转发路由: API key middleware (require_api_key).
+/// - 登录路由 (/login, /callback, /logout): 公开 (不需要认证).
+fn build_router_with_auth_layers(
+    state: ProxyState,
+    auth: AuthStack,
+    forward_router: Router<ProxyState>,
+) -> Router {
+    use axum_login::AuthManagerLayerBuilder;
+
+    let AuthStack { backend, api_keys } = auth;
+    let auth_state = crate::auth::handlers::AuthState {
+        backend: backend.clone(),
+        api_keys: api_keys.clone(),
+    };
+
+    // 公开路由 (login/callback/logout/me): 不挂 login_required guard.
+    // AuthState 通过 Extension 注入 (与 ProxyState 的 State 槽位正交).
+    // me handler 不需要 AuthState, 只需要 AuthSession.
+    let webui_public: Router<ProxyState> = Router::new()
+        .route(
+            "/login",
+            get(crate::auth::handlers::login_start).post(crate::auth::handlers::login_start),
+        )
+        .route(
+            "/oauth2/callback",
+            get(crate::auth::handlers::oauth_callback),
+        )
+        .route("/logout", post(crate::auth::handlers::logout))
+        .route("/api/me", get(crate::auth::handlers::me))
+        .layer(axum::Extension(auth_state));
+
+    // 受保护路由: WebUI + API key CRUD, 需要 login_required guard + ProxyState.
+    let webui_protected: Router<ProxyState> = web::router()
+        .route_layer(axum_login::login_required!(
+            OidcBackend,
+            login_url = "/__sg/login"
+        ))
+        // API key CRUD (只有登录用户能签发 key).
+        .route(
+            "/api/api-keys",
+            get(crate::web::api::list_api_keys).post(crate::web::api::create_api_key),
+        )
+        .route(
+            "/api/api-keys/{id}",
+            axum::routing::delete(crate::web::api::delete_api_key),
+        );
+
+    // 转发路由: 应用 API key middleware.
+    // from_fn_with_state 在 layer 层注入 ApiKeyStore, 不改变 Router 的 state 类型.
+    let forward_protected = forward_router.route_layer(middleware::from_fn_with_state(
+        api_keys,
+        crate::auth::require_api_key,
+    ));
+
+    // session + auth layer (应用于整个 app).
+    let session_layer = crate::auth::build_session_layer();
+    let auth_layer = AuthManagerLayerBuilder::new(backend, session_layer).build();
+
+    Router::new()
+        // auth 模式下根路径重定向到 /__sg (受 login_required 保护).
+        .route("/", get(|| async { axum::response::Redirect::to("/__sg") }))
+        .nest("/__sg", webui_public.merge(webui_protected))
+        .route("/__sg/", get(web::slash_redirect))
+        .route("/__sg/{*rest}", get(web::not_found))
+        .merge(forward_protected)
         .with_state(state)
+        .layer(auth_layer)
         .layer(TraceLayer::new_for_http())
 }
 
@@ -71,6 +179,7 @@ pub fn build_upstream_client() -> anyhow::Result<reqwest::Client> {
 /// - `static_providers` / `static_secrets`: 来自 `secret-guard.toml`, 进程内只读.
 /// - `dyn_state`: 来自 `secret-guard.state.toml`, 拆为 dynamic 列表 + decisions.
 /// - `state_path`: state.toml 的写回路径.
+/// - `auth_config`: 认证配置 (来自 static config 的 `[auth]` 段).
 #[allow(clippy::too_many_arguments)]
 pub async fn serve(
     host: &str,
@@ -80,7 +189,10 @@ pub async fn serve(
     static_secrets: Vec<SecretEntry>,
     dyn_state: crate::config::DynamicState,
     state_path: PathBuf,
+    auth_config: AuthConfig,
 ) -> anyhow::Result<()> {
+    auth_config.validate().map_err(|e| anyhow::anyhow!(e))?;
+
     let upstream = build_upstream_client()?;
     let dag = ConversationDag::new(records_capacity, 500, 1);
 
@@ -100,7 +212,7 @@ pub async fn serve(
         dyn_state.providers,
         decisions,
         state_path.clone(),
-        persist_lock,
+        persist_lock.clone(),
     );
 
     let proxy = ProxyState {
@@ -108,8 +220,61 @@ pub async fn serve(
         providers: provider_table,
         dag,
         secrets: secret_table,
+        api_keys: None, // 默认 None; 启用认证时在下方覆盖.
     };
-    let app = build_router(proxy);
+
+    // 条件化: 启用认证时构造 AuthStack, 否则 None.
+    let app = if auth_config.enabled {
+        let oidc_cfg = auth_config
+            .oidc
+            .as_ref()
+            .expect("validated: enabled=true implies oidc exists");
+
+        // 读取 client_secret (若配了 client_secret_file).
+        let client_secret = match &oidc_cfg.client_secret_file {
+            Some(path) => Some(
+                std::fs::read_to_string(path)
+                    .map_err(|e| {
+                        anyhow::anyhow!("read client_secret_file {}: {e}", path.display())
+                    })?
+                    .trim()
+                    .to_string(),
+            ),
+            None => None,
+        };
+
+        // redirect_url 由 host + port 推导.
+        let redirect_url = format!("http://{host}:{port}/__sg/oauth2/callback");
+
+        info!(
+            issuer = %oidc_cfg.issuer_url,
+            client_id = %oidc_cfg.client_id,
+            "OIDC auth enabled, discovering IdP metadata..."
+        );
+
+        let backend = OidcBackend::discover(
+            &oidc_cfg.issuer_url,
+            &oidc_cfg.client_id,
+            client_secret,
+            &redirect_url,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("OIDC initialization failed: {e}"))?;
+
+        let api_keys =
+            ApiKeyStore::new(dyn_state.api_keys.clone(), state_path.clone(), persist_lock);
+
+        // 注入 api_keys 到 ProxyState (让 WebUI handler 能访问).
+        let proxy = ProxyState {
+            api_keys: Some(api_keys.clone()),
+            ..proxy
+        };
+
+        let auth_stack = AuthStack { backend, api_keys };
+        build_router_with_auth(proxy, auth_stack)
+    } else {
+        build_router(proxy)
+    };
 
     let addr: SocketAddr = format!("{host}:{port}")
         .parse()
@@ -117,7 +282,12 @@ pub async fn serve(
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind {addr} failed: is another secret-guard already running?"))?;
-    info!(%addr, ?state_path, "secret-guard listening (Ctrl-C to stop)");
+    let auth_mode = if auth_config.enabled {
+        "OIDC"
+    } else {
+        "single-user"
+    };
+    info!(%addr, %auth_mode, ?state_path, "secret-guard listening (Ctrl-C to stop)");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
