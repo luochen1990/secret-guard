@@ -546,6 +546,90 @@ mod tests {
         assert_eq!(p.effective_api_key(), "");
     }
 
+    // ─── effective_api_key warn-once 恢复契约 ────────────────────────────────
+    //
+    // 核心契约 (provider.rs 头部): "首次失败 warn 一次, 恢复后清除记录, 再次失败再 warn".
+    // WARNED_API_KEY_FILE 在文件可读时清除该 provider 的记录, 让后续失败能再次 warn.
+    //
+    // 日志次数难直接断言 (tracing 全局 subscriber), 这里测可观测的行为契约:
+    //   1. 文件不存在 → 返回空 + WARNED 记录被插入 (insert 返回 true).
+    //   2. 文件恢复 (重新创建) → 返回文件内容 + WARNED 记录被清除.
+    //   3. 文件再次消失 → 仍能正确返回空 (warn-once 状态机正确重置, 不会卡死).
+    //
+    // 这条路径是"运维改了配置后能看到新 warn"的关键, 一旦回归会导致 provider
+    // 永久静默 (api_key_file 修复后下次失败也不再 warn), 排障极痛苦.
+
+    #[test]
+    fn effective_api_key_file_recovers_after_recreate() {
+        let unique = uuid::Uuid::new_v4().to_string();
+        let tmp = PathBuf::from(format!(
+            "/tmp/opencode/tmp/test-api-key-recover-{unique}.txt"
+        ));
+        std::fs::create_dir_all(tmp.parent().unwrap()).unwrap();
+
+        // 用唯一 provider id 隔离全局 WARNED_API_KEY_FILE 状态 (并行测试安全).
+        let pid = format!("recover-test-{unique}");
+        let make_provider = || Provider {
+            id: pid.clone(),
+            protocol: Protocol::OpenAI,
+            base_url: "https://x".into(),
+            api_key: String::new(),
+            api_key_file: Some(tmp.clone()),
+            enabled: true,
+            name: None,
+        };
+
+        // 1. 文件不存在 → 空 + WARNED 被插入 (首次失败).
+        assert_eq!(make_provider().effective_api_key(), "");
+        assert!(
+            WARNED_API_KEY_FILE.lock().contains(&pid),
+            "first failure must record provider in WARNED set"
+        );
+
+        // 2. 创建文件 → 读到内容 + WARNED 被清除 (恢复路径).
+        std::fs::write(&tmp, "sk-recovered\n").unwrap();
+        assert_eq!(make_provider().effective_api_key(), "sk-recovered");
+        assert!(
+            WARNED_API_KEY_FILE.lock().get(&pid).is_none(),
+            "recovery must clear WARNED record so next failure re-warns"
+        );
+
+        // 3. 再次删除文件 → 仍能正确返回空 + 重新插入 WARNED (状态机可循环).
+        std::fs::remove_file(&tmp).unwrap();
+        assert_eq!(make_provider().effective_api_key(), "");
+        assert!(
+            WARNED_API_KEY_FILE.lock().contains(&pid),
+            "failure after recovery must re-record (warn-once state machine resets)"
+        );
+
+        // 清理全局状态, 避免污染其他测试.
+        WARNED_API_KEY_FILE.lock().remove(&pid);
+    }
+
+    #[test]
+    fn effective_api_key_missing_file_sets_warned_state() {
+        // 补强: 单独验证 "首次失败必定插入 WARNED" 这个可观测副作用.
+        // (上面 recover 测试串了三步, 这里独立断言第一步, 让回归定位更精确.)
+        let unique = uuid::Uuid::new_v4().to_string();
+        let pid = format!("warn-once-{unique}");
+        let p = Provider {
+            id: pid.clone(),
+            protocol: Protocol::OpenAI,
+            base_url: "https://x".into(),
+            api_key: String::new(),
+            api_key_file: Some(PathBuf::from("/nonexistent/warn-once-test")),
+            enabled: true,
+            name: None,
+        };
+        assert_eq!(p.effective_api_key(), "");
+        assert!(
+            WARNED_API_KEY_FILE.lock().contains(&pid),
+            "missing file must populate WARNED set for warn-once dedup"
+        );
+        // 清理.
+        WARNED_API_KEY_FILE.lock().remove(&pid);
+    }
+
     #[test]
     fn effective_api_key_neither_set_returns_empty() {
         let p = Provider {

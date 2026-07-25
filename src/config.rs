@@ -1189,4 +1189,184 @@ mod table_tests {
         assert_eq!(std::fs::read_to_string(&tmp).unwrap(), "hello");
         let _ = std::fs::remove_file(&tmp);
     }
+
+    // ─── 持久化失败内存回滚契约 (核心并发安全保证) ──────────────────────────
+    //
+    // 头部契约 (config.rs//!): "先持久化, 再更新内存, 失败自动回滚" 和
+    // "不会出现内存已切到 disabled 但磁盘还是 default 的漂移".
+    //
+    // 这两条是双层配置的核心并发安全保证. 若 atomic_write 失败时内存被部分更新,
+    // 会导致: 重启后内存与磁盘不一致 (drift), 或并发场景下读到中间态.
+    //
+    // 触发方式: 把 state.toml 放到一个只读目录, atomic_write 的 File::create(tmp)
+    // 会因 EACCES 失败. 验证 upsert_dynamic / set_decision 返回 Err 且内存 map 未变.
+
+    /// 构造一个只读目录 + 其中的 state.toml 路径.
+    /// 返回 (dir, state_path). 调用方需在测试结束时恢复权限以便清理 (drop guard).
+    struct ReadOnlyDir {
+        dir: PathBuf,
+    }
+
+    impl ReadOnlyDir {
+        fn new(prefix: &str) -> Self {
+            let id = uuid::Uuid::new_v4().to_string();
+            let dir = PathBuf::from(format!("/tmp/opencode/tmp/test-ro-{prefix}-{id}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self { dir }
+        }
+
+        /// 切换到只读. 之后 atomic_write 写新文件会 EACCES.
+        fn make_readonly(&self) {
+            // 0o500 = r-x for owner: 允许进入目录但禁止创建/删除文件.
+            std::fs::set_permissions(
+                &self.dir,
+                std::os::unix::fs::PermissionsExt::from_mode(0o500),
+            )
+            .unwrap();
+        }
+
+        fn state_path(&self) -> PathBuf {
+            self.dir.join("state.toml")
+        }
+    }
+
+    impl Drop for ReadOnlyDir {
+        fn drop(&mut self) {
+            // 必须先恢复可写权限才能删除目录.
+            let _ = std::fs::set_permissions(
+                &self.dir,
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            );
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn upsert_dynamic_rolls_back_memory_on_persist_failure() {
+        // 契约: atomic_write 失败时, dynamic_entries 内存保持旧值 (不能出现
+        // "调用方以为 upsert 成功但磁盘没写" 的漂移).
+        let ro = ReadOnlyDir::new("upsert-rollback");
+        let state_path = ro.state_path();
+        // 先写一个合法的初始 state, 让 load_or_empty 能成功读到.
+        atomic_write(&state_path, "").unwrap();
+
+        let t = SecretTable::new(vec![], vec![], empty_decisions(), state_path.clone());
+
+        // 初始: 空.
+        assert!(t.effective_raw().is_empty());
+
+        // 切只读, 然后 upsert — persist_dynamic 的 atomic_write 必须失败.
+        ro.make_readonly();
+        let err = t
+            .upsert_dynamic(entry("new", "value-new"))
+            .expect_err("upsert into read-only dir must fail");
+        assert!(
+            err.to_string().contains("create tmp") || err.to_string().contains("failed"),
+            "error should be from atomic_write failure, got: {err}"
+        );
+
+        // 核心断言: 内存未变 (回滚生效). 若内存被部分更新, effective_raw 会含 "new".
+        assert!(
+            t.effective_raw().is_empty(),
+            "memory must roll back on persist failure; got non-empty effective_raw"
+        );
+        // decisions 也未受影响.
+        assert!(t.decisions.read().secret("new") == OverrideMode::Default);
+
+        // 恢复权限后 (Drop guard 会做, 但这里显式做以验证后续可写).
+        std::fs::set_permissions(&ro.dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        // 同一 table 恢复后应能正常 upsert (状态未被半破坏).
+        t.upsert_dynamic(entry("new", "value-new"))
+            .expect("upsert must succeed after permissions restored");
+        assert_eq!(t.effective_raw().len(), 1);
+    }
+
+    #[test]
+    fn set_decision_rolls_back_memory_on_persist_failure() {
+        // 契约 (set_decision 文档): "若 atomic_write 失败, 内存 decisions 保持旧值
+        // (不会出现内存已切到 disabled 但磁盘还是 default 的漂移)".
+        let ro = ReadOnlyDir::new("decision-rollback");
+        let state_path = ro.state_path();
+        atomic_write(&state_path, "").unwrap();
+
+        let t = SecretTable::new(
+            vec![entry("a", "secret-a")],
+            vec![],
+            empty_decisions(),
+            state_path.clone(),
+        );
+
+        // 初始 decision = Default, effective 包含 "a".
+        assert_eq!(t.decisions.read().secret("a"), OverrideMode::Default);
+        assert!(t.get_effective("a").is_some());
+
+        // 切只读, set_decision(Disabled) 的 atomic_write 必须失败.
+        ro.make_readonly();
+        let err = t
+            .set_decision("a", OverrideMode::Disabled)
+            .expect_err("set_decision into read-only dir must fail");
+        assert!(
+            err.to_string().contains("create tmp") || err.to_string().contains("failed"),
+            "error should be from atomic_write failure, got: {err}"
+        );
+
+        // 核心断言: 内存 decisions 未变 (仍是 Default, 而非 Disabled).
+        // 这正是契约要防的 "内存 disabled 但磁盘 default" 漂移.
+        assert_eq!(
+            t.decisions.read().secret("a"),
+            OverrideMode::Default,
+            "decisions memory must roll back; must NOT be Disabled"
+        );
+        // effective view 也仍包含 "a" (因为 decision 没切).
+        assert!(
+            t.get_effective("a").is_some(),
+            "effective must reflect rolled-back decision (still visible)"
+        );
+
+        // 磁盘上的 decisions 段也未被写入 (load 出来应仍是 default).
+        let disk_state = DynamicState::load_or_empty(&state_path, "").unwrap();
+        assert_eq!(disk_state.decisions.secret("a"), OverrideMode::Default);
+    }
+
+    #[test]
+    fn delete_dynamic_rolls_back_memory_on_persist_failure() {
+        // delete_dynamic 同样遵循 "先持久化再更新内存" 契约. 验证删除路径的回滚.
+        let ro = ReadOnlyDir::new("delete-rollback");
+        let state_path = ro.state_path();
+        // 预置一个 dynamic entry 并持久化到磁盘 (保持内存与磁盘初始一致).
+        let existing = entry("existing", "v-existing");
+        let initial = DynamicState {
+            secrets: vec![existing.clone()],
+            ..Default::default()
+        };
+        atomic_write(&state_path, &initial.to_toml().unwrap()).unwrap();
+
+        // 内存 dynamic_entries 也带同一 entry (new() 不从磁盘加载, 需显式传入).
+        let t = SecretTable::new(
+            vec![],
+            vec![existing],
+            empty_decisions(),
+            state_path.clone(),
+        );
+        // 确认初始状态: 有一个 entry.
+        assert_eq!(t.effective_raw().len(), 1);
+
+        ro.make_readonly();
+        let err = t
+            .delete_dynamic("existing")
+            .expect_err("delete into read-only dir must fail");
+        assert!(
+            err.to_string().contains("create tmp") || err.to_string().contains("failed"),
+            "error should be from atomic_write failure, got: {err}"
+        );
+
+        // 核心断言: 内存未回滚, entry 仍在 (删除未生效).
+        assert_eq!(
+            t.effective_raw().len(),
+            1,
+            "memory must roll back on delete persist failure"
+        );
+        assert!(t.get_effective("existing").is_some());
+    }
 }

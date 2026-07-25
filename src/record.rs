@@ -111,3 +111,152 @@ impl ForwardRecord {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 构造一个最小合法 ForwardRecord JSON, 缺省字段 (resp_parsed / redactions) 模拟旧版序列化.
+    /// 注入点: 调用方按需往 JSON 里塞老格式数据, 验证反序列化的向后兼容契约.
+    fn legacy_record_json(extras: &str) -> String {
+        format!(
+            r#"{{
+                "id": "00000000-0000-0000-0000-000000000000",
+                "created_at": "2024-01-01T00:00:00Z",
+                "method": "POST",
+                "path": "/o/p1/v1/chat",
+                "req_headers": [],
+                "req_body": "hello",
+                "resp_status": 200,
+                "resp_headers": [],
+                "resp_body": "world",
+                "elapsed_ms": 5,
+                "streamed": false,
+                "resp_complete": true{extras}
+            }}"#
+        )
+    }
+
+    // ─── redactions 字段向后兼容 (核心契约: 旧版数据无此字段仍能反序列化) ──────
+    //
+    // `#[serde(default)]` 的契约注释明确要求: 让旧版序列化数据 (无 redactions 字段)
+    // 仍能反序列化为空 vec. 这是 Web API DTO 的核心向后兼容保证, 一旦回归会让前端
+    // timeline 渲染在解析旧版缓存时崩溃.
+
+    #[test]
+    fn legacy_json_without_redactions_deserializes_to_empty_vec() {
+        // 旧版 JSON: 完全没有 redactions 字段.
+        let json = legacy_record_json("");
+        let rec: ForwardRecord = serde_json::from_str(&json).expect("legacy JSON must parse");
+        assert!(
+            rec.redactions.is_empty(),
+            "missing redactions field must default to empty vec"
+        );
+        // 其他字段仍正确填充.
+        assert_eq!(rec.method, "POST");
+        assert_eq!(rec.resp_body, "world");
+        assert!(rec.resp_complete);
+    }
+
+    #[test]
+    fn json_with_redactions_deserializes_correctly() {
+        // 当前版本 JSON: 带 redactions, 验证正常 round-trip.
+        let json = legacy_record_json(
+            r#",
+                "redactions": [["sgm_abc", "secret-id-1"]]"#,
+        );
+        let rec: ForwardRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            rec.redactions,
+            vec![("sgm_abc".into(), "secret-id-1".into())]
+        );
+    }
+
+    // ─── ForwardRecord::new 默认值契约 (11 个默认字段) ──────────────────────
+    //
+    // new() 是构造一条"请求已收到, 响应未到"的占位记录的标准入口, 其默认值
+    // 必须与 DAG Node 的初始状态语义对齐 (resp_status=0, resp_complete=false 等).
+    // 任一默认值漂移会让 web 层误判请求状态.
+
+    #[test]
+    fn new_sets_expected_defaults_for_pending_response() {
+        let rec = ForwardRecord::new(
+            "POST".into(),
+            "/o/p1/v1/chat".into(),
+            vec![("content-type".into(), "application/json".into())],
+            "hello".into(),
+        );
+        // 显式传入的字段.
+        assert_eq!(rec.method, "POST");
+        assert_eq!(rec.path, "/o/p1/v1/chat");
+        assert_eq!(
+            rec.req_headers,
+            vec![("content-type".into(), "application/json".into())]
+        );
+        assert_eq!(rec.req_body, "hello");
+        // 11 个默认字段: 必须逐一 pin 住, 任一变化都会让前端状态判断出错.
+        assert_eq!(rec.id, Uuid::nil(), "new record id must be nil placeholder");
+        assert_eq!(rec.resp_status, 0, "pending response must have status 0");
+        assert!(rec.resp_headers.is_empty(), "no response headers yet");
+        assert!(rec.resp_body.is_empty(), "no response body yet");
+        assert!(rec.resp_parsed.is_none(), "no parsed view until response");
+        assert_eq!(rec.elapsed_ms, 0, "elapsed not measured until response");
+        assert!(!rec.streamed, "streamed flag set after response");
+        assert!(
+            !rec.resp_complete,
+            "pending record must be marked incomplete"
+        );
+        assert!(rec.error.is_none(), "no error until one occurs");
+        assert!(rec.redactions.is_empty(), "no redactions until redact runs");
+    }
+
+    // ─── resp_parsed 字段 skip_serializing_if = Option::is_none ─────────────
+    //
+    // `#[serde(skip_serializing_if = "Option::is_none")]` 让 None 字段不出现在 JSON 中,
+    // 保持响应 payload 精简. 这个测试 pin 住该行为, 防止未来误改成 default + 不 skip
+    // 导致前端收到额外的 "resp_parsed": null 字段.
+
+    #[test]
+    fn none_resp_parsed_is_omitted_from_json() {
+        let rec = ForwardRecord::new("POST".into(), "/p".into(), vec![], "body".into());
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(
+            !json.contains("resp_parsed"),
+            "None resp_parsed must be omitted from JSON, got: {json}"
+        );
+    }
+
+    #[test]
+    fn some_resp_parsed_is_included_in_json() {
+        let mut rec = ForwardRecord::new("POST".into(), "/p".into(), vec![], "body".into());
+        rec.resp_parsed = Some(serde_json::json!({"role": "assistant"}));
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(
+            json.contains("resp_parsed"),
+            "Some resp_parsed must be present in JSON, got: {json}"
+        );
+    }
+
+    // ─── RecordFilter 序列化为小写字符串 (query param 契约) ──────────────────
+    //
+    // RecordFilter 直接做 ?filter= 的 query param 值, 必须序列化为小写.
+    // 与 OverrideMode::as_str 风格一致 (SSOT: rename_all = "lowercase").
+
+    #[test]
+    fn record_filter_serializes_to_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&RecordFilter::All).unwrap(),
+            "\"all\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RecordFilter::Hits).unwrap(),
+            "\"hits\""
+        );
+        // round-trip.
+        assert_eq!(
+            serde_json::from_str::<RecordFilter>("\"hits\"").unwrap(),
+            RecordFilter::Hits
+        );
+        assert_eq!(RecordFilter::default(), RecordFilter::All);
+    }
+}

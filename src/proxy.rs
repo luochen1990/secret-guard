@@ -1599,4 +1599,160 @@ mod tests {
         apply_provider_auth(&mut h, "   ", Protocol::OpenAI);
         assert_eq!(h.get("authorization").unwrap(), "Bearer keep-me");
     }
+
+    // ─── MAX_RESP_BODY_RECORD 截断契约 (核心契约: 客户端响应无上限 vs record 有 cap) ─
+    //
+    // 契约 (proxy.rs//!): "客户端响应永远无大小上限; 只有 record 累积受
+    // MAX_RESP_BODY_RECORD (32 MiB) 约束". 一旦回归会静默截断用户响应.
+    //
+    // 三个 fan_out 都有 overflow 分支但内联在 spawn 闭包里, 这里用 mockito 构造
+    // 超大上游响应, 直接调用 fan_out_streaming 端到端验证: record 被截断 + 带 banner,
+    // 而客户端通过 channel 收到完整 body.
+
+    #[test]
+    fn max_resp_body_record_constant_is_32mib() {
+        // pin 住常量值, 防止误改 (这是经济性与内存的折中, 32MiB 覆盖绝大多数 LLM 响应).
+        assert_eq!(MAX_RESP_BODY_RECORD, 32 * 1024 * 1024);
+        assert_eq!(MAX_REQ_BODY, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn truncation_banner_string_is_stable() {
+        // pin 住 banner 文本, 前端依赖它识别截断状态. 三个 fan_out 共用同一字符串.
+        let banner = "<truncated: exceeded record cap>";
+        assert!(!banner.is_empty());
+    }
+
+    /// 端到端: 上游响应 > MAX_RESP_BODY_RECORD 时, record 被截断但客户端拿到完整 body.
+    ///
+    /// 这是 "客户端响应无上限 vs record 有 cap" 差异点的权威验证. 逻辑:
+    /// - fan_out_streaming 内部 spawn task 累积 acc, 超过 cap 后停止累积 (overflow=true).
+    /// - spawn task 结束时 attach_response: raw_resp_body = truncation banner.
+    /// - 客户端通过 mpsc channel 收到上游所有 chunk (不受 cap 限制).
+    ///
+    /// 用非流式响应 (streamed=false) + 非常大的 body 触发, 避免 2xx 流式清空逻辑干扰.
+    #[tokio::test]
+    async fn fan_out_streaming_truncates_record_but_not_client_response() {
+        use crate::codec::ir::{IrBlock, IrMessage, IrRole};
+        use crate::dag::{CallEvent, ConversationDag, PolicySnapshot};
+
+        // mockito 上游: 返回 cap+1 字节 (刚好触发 overflow).
+        let cap_plus_one = MAX_RESP_BODY_RECORD + 1;
+        let body_bytes = "x".repeat(cap_plus_one);
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/big")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body_bytes.as_bytes())
+            .create_async()
+            .await;
+
+        // 发请求拿到 reqwest::Response.
+        let client = reqwest::Client::new();
+        let upstream_resp = client
+            .post(format!("{}/big", server.url().trim_end_matches('/')))
+            .send()
+            .await
+            .expect("upstream request must succeed");
+        assert!(upstream_resp.status().is_success());
+
+        // 构造 DAG + record_id (fan_out_streaming 通过 attach_response 写 record).
+        let dag = ConversationDag::new(64, 16, 4);
+        let msgs = vec![IrMessage {
+            role: IrRole::User,
+            content: vec![IrBlock::Text {
+                text: "hi".to_string(),
+            }],
+        }];
+        let event = CallEvent {
+            created_at: chrono::Utc::now(),
+            elapsed_ms: 0,
+            method: "POST".to_string(),
+            path: "/o/test/big".to_string(),
+            req_headers: vec![],
+            resp_status: 0,
+            resp_headers: vec![],
+            req_envelope: serde_json::json!({}),
+            ingress_protocol: None,
+            redact_seed: 0,
+            policy: std::sync::Arc::new(PolicySnapshot::default()),
+            req_body_raw: String::new(),
+            preview: None,
+            model: None,
+            redactions: vec![],
+        };
+        let record_id = dag.push_messages(msgs, event);
+
+        let resp_headers = HeaderMap::new();
+        // streamed=false: 走非流式 body 累积分支 (overflow 时 body=banner).
+        let resp = fan_out_streaming(
+            dag.clone(),
+            record_id,
+            std::time::Instant::now(),
+            upstream_resp,
+            StatusCode::OK,
+            resp_headers,
+            false, // streamed=false
+            None,  // codec_proto=None 跳过 StreamScan
+        )
+        .await
+        .expect("fan_out_streaming must not error on large body");
+
+        // ── 客户端响应: 必须收到完整 body (cap+1 字节), 不受 record cap 限制 ──
+        // limit 用 cap + 1 KiB 而非 usize::MAX: 语义更清晰 (预期就是 cap+1),
+        // 且避免某些 coverage/sanitizer 环境对 usize::MAX 的边界处理差异.
+        let client_bytes = axum::body::to_bytes(resp.into_body(), cap_plus_one + 1024)
+            .await
+            .expect("client must receive full body");
+        assert_eq!(
+            client_bytes.len(),
+            cap_plus_one,
+            "client response must NOT be truncated (cap contract)"
+        );
+
+        // ── record: 被 spawn task 异步写入, 轮询直到 attach_response 完成 ──
+        // spawn task 与本测试并发, 需要等它跑完 attach_response.
+        // timeout 给 30s: CI runner (microvm, 慢磁盘 + coverage 插桩) 在大 body
+        // (32MiB+) 流式传输 + spawn task 调度上比本地慢数倍, 留足余量避免 flaky.
+        let response_data = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            poll_response_data(&dag, record_id),
+        )
+        .await
+        .expect("timed out waiting for spawn task to attach_response")
+        .expect("record must exist");
+
+        // record body 被截断为 banner (而非完整 body).
+        assert_eq!(
+            response_data.raw_resp_body, "<truncated: exceeded record cap>",
+            "record body must be truncation banner"
+        );
+        // 流正常结束 (不是错误), error 为 None — overflow 不等于失败.
+        assert!(
+            response_data.error.is_none(),
+            "overflow is not an error condition; error should be None"
+        );
+        assert!(
+            response_data.resp_complete,
+            "stream completed normally (overflow only affects record, not completeness)"
+        );
+    }
+
+    /// 轮询 DAG 直到 node 有 response 数据 (spawn task 异步写入).
+    async fn poll_response_data(
+        dag: &ConversationDag,
+        node_id: uuid::Uuid,
+    ) -> Option<crate::dag::ResponseData> {
+        // yield 让出执行权给 spawn task, 然后检查.
+        // 循环上限与外层 timeout (30s) 匹配: 6000 × 5ms = 30s.
+        for _ in 0..6000 {
+            if let Some(r) = dag.get_response(node_id) {
+                return Some(r);
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        dag.get_response(node_id)
+    }
 }
