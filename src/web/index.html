@@ -1639,7 +1639,7 @@
       // 先刷新抽屉内容 (选中轮改变 → response 跟着变).
       updateResponseDrawerContent();
       // 计算目标 scrollTop: 气泡下边缘对齐 30% 抽屉上边缘 (= wrapH - defaultH - GAP).
-      // (减 GAP 与 updateResponseDrawerLayout 阶段1 公式一致, 避免落定后微调抖动.)
+      // 落点 bubbleBottomY ≈ 0.7·wrapH 落在 Phase 2, 其 clamp 输出 = defaultH, 与目标一致.
       const detail = document.getElementById('detail');
       const wrap = document.getElementById('detail-wrap');
       if (detail && wrap) {
@@ -2318,12 +2318,13 @@
     // drawerH = f(scrollTop) 是纯函数, 无循环, 无死锁.
     //
     // 四阶段 (随 scrollTop 增大, 内容上移):
-    //   1. 选中气泡在视口下方 (bubbleBottomY > wrapH) → drawerH = defaultH (30%).
-    //   2. 气泡在视口内 (0 < bubbleBottomY <= wrapH) → drawerH = wrapH - bubbleBottomY - GAP,
+    //   1. 选中气泡在视口下方 (bubbleBottomY >= wrapH) → drawerH = minH (10%).
+    //      用户往上滚远了, 气泡已离开视口底部, 抽屉收缩到最小.
+    //   2. 气泡在视口内 (0 < bubbleBottomY < wrapH) → drawerH = wrapH - bubbleBottomY - GAP,
     //      clamp [minH, maxH]. 气泡上移 → drawerH 扩大.
-    //   3. 气泡滚出顶部, 内容仍填满视口 → drawerH = maxH (40%).
-    //   4. 滚入 placeholder (scrollTop 超过 contentEnd - wrapH) → drawerH 从 maxH 渐进扩展到
-    //      extremeMaxH (80%). progress 由 scrollTop 在 placeholder 区域中的比例决定.
+    //   3. 气泡滚出顶部 (bubbleBottomY <= 0), 末轮底部仍未进入抽屉区域 → drawerH = maxH (40%).
+    //   4. 末轮底部进入抽屉区域 (scrollTop > contentEnd - wrapH + maxH) → drawerH 从 maxH
+    //      渐进扩展到 extremeMaxH (80%). placeholder 提供滚动空间, 被 overlay 遮挡.
     //
     // 边界 clamp 值 (全部相对 wrapH):
     const DRAWER_GAP = 8;       // 气泡下边缘与抽屉上边缘的间距 (px).
@@ -2341,7 +2342,7 @@
       if (wrapH === 0) return;
       const wrapTop = wrap.getBoundingClientRect().top;
       const minH = wrapH * DRAWER_MIN_RATIO;
-      const defaultH = wrapH * DRAWER_DEFAULT_RATIO;
+      const defaultH = wrapH * DRAWER_DEFAULT_RATIO; // 仅用于无选中气泡时的初始高度
       const maxH = wrapH * DRAWER_MAX_RATIO;
       const extremeMaxH = wrapH * DRAWER_EXTREME_MAX_RATIO;
 
@@ -2358,35 +2359,42 @@
       if (bubbleBottomY === null) {
         drawerHeight = defaultH;
       } else if (bubbleBottomY >= wrapH) {
-        // Phase 1: 气泡在视口下方 → 默认高度.
-        drawerHeight = defaultH;
+        // Phase 1: 气泡在视口下方 → 最小高度 (用户往上滚远了, 气泡已离开视口底部).
+        drawerHeight = minH;
       } else if (bubbleBottomY > 0) {
         // Phase 2: 气泡在视口内 → drawerH = wrapH - bubbleBottomY - GAP, clamp [minH, maxH].
         drawerHeight = Math.max(minH, Math.min(maxH, wrapH - bubbleBottomY - DRAWER_GAP));
       } else {
         // bubbleBottomY <= 0: 气泡滚出顶部. 进入 phase 3 或 4.
-        // 计算 phase 3/4 边界: contentEnd = 末轮底部的 content offset (固定, 不随滚动变).
-        //   phase3ScrollEnd = contentEnd - wrapH (末轮底部贴视口底部时的 scrollTop).
-        //   scrollTop > phase3ScrollEnd → 用户开始滚入 placeholder → phase 4.
-        let contentEnd = detail.scrollHeight; // 含 placeholder
+        // contentEnd = 末轮底部的 content offset (固定, 不随滚动变, 不含 placeholder).
+        // 找不到末轮 DOM 时 (瞬时不一致) 用 scrollHeight fallback → phase4Start ≈ maxScroll → 落在 phase 3 (maxH).
+        let contentEnd = detail.scrollHeight;
         if (timelineRecords.length > 0) {
-          // 精确: 末轮底部 offset (不含 placeholder).
           const lastRound = detail.querySelector(
             `:scope > .tl-round[data-rid="${CSS.escape(timelineRecords[timelineRecords.length - 1].id)}"]`);
           if (lastRound) {
             contentEnd = lastRound.offsetTop + lastRound.offsetHeight;
           }
         }
-        const phase3ScrollEnd = contentEnd - wrapH;
-        if (detail.scrollTop <= phase3ScrollEnd) {
-          // Phase 3: 内容仍填满视口 → 保持 maxH.
+        // phase 4 仅在内容比视口长时触发 (contentEnd > wrapH). 短内容时所有 rounds
+        // 始终可见, phase 3 保持 maxH, 用户滚入 placeholder 只是纯滚动 (无视觉变化).
+        if (contentEnd <= wrapH) {
+          // Phase 3 (短内容): 保持 maxH.
           drawerHeight = maxH;
         } else {
-          // Phase 4: 滚入 placeholder → drawerH 从 maxH 渐进扩展到 extremeMaxH.
-          // placeholder 提供 extremeMaxH 的滚动空间. progress 按比例线性插值.
-          const phase4Range = extremeMaxH;
-          const progress = Math.min(1, (detail.scrollTop - phase3ScrollEnd) / phase4Range);
-          drawerHeight = maxH + (extremeMaxH - maxH) * progress;
+          // phase 3 持续到末轮底部进入抽屉遮挡区域 (drawer top at maxH = wrapH - maxH).
+          //   phase4Start = contentEnd - wrapH + maxH
+          //   phase4Range = extremeMaxH - maxH (placeholder 滚动空间减去 phase 3 已覆盖部分)
+          const phase4Start = contentEnd - wrapH + maxH;
+          if (detail.scrollTop <= phase4Start) {
+            // Phase 3: 末轮底部仍在抽屉上边缘以下 (未被遮挡) → 保持 maxH.
+            drawerHeight = maxH;
+          } else {
+            // Phase 4: 末轮底部进入抽屉区域 → 渐进扩展 [maxH, extremeMaxH].
+            const phase4Range = extremeMaxH - maxH;
+            const progress = Math.min(1, (detail.scrollTop - phase4Start) / phase4Range);
+            drawerHeight = maxH + phase4Range * progress;
+          }
         }
       }
 

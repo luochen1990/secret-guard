@@ -736,4 +736,100 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     await item.waitFor({ state: "visible", timeout: 5000 });
     await expect(item.locator(".status-err").first()).toHaveText("429");
   });
+
+  // ─── Drawer 相位回归 (bug: phase 4 过早触发 + phase 1 跳变) ──────────────
+
+  test("drawer phase 3 holds maxH before content enters drawer zone", async ({ page }) => {
+    // bug #1 回归: 向下滚, 气泡滚出顶部后 drawer 应保持 maxH (40%),
+    // 直到末轮底部真正进入抽屉遮挡区域才开始 phase 4 渐进扩展.
+    const reply = "This is a long response for testing the typing box. ".repeat(15);
+    const sys = "You are a coding assistant. ".repeat(5);
+    // 3 轮长内容会话
+    await sendChat(page, [{ role: "system", content: sys }, { role: "user", content: "phase3-hold-marker" }, { role: "assistant", content: reply }]);
+    await sendChat(page, [{ role: "system", content: sys }, { role: "user", content: "phase3-hold-marker" }, { role: "assistant", content: reply }, { role: "user", content: "second" }, { role: "assistant", content: reply }]);
+    await sendChat(page, [{ role: "system", content: sys }, { role: "user", content: "phase3-hold-marker" }, { role: "assistant", content: reply }, { role: "user", content: "second" }, { role: "assistant", content: reply }, { role: "user", content: "third" }, { role: "assistant", content: reply }]);
+    const leaf = await findSessionLeafByPreview(page, "phase3-hold-marker");
+    await clickSessionByLeaf(page, leaf);
+    await page.waitForTimeout(500);
+    // 选中 round 1 (最靠上, 向下滚能把它推出视口)
+    const round1 = page.locator("#detail .tl-round").first();
+    await round1.locator(".tl-round-header").click();
+    await page.waitForTimeout(1200);
+
+    // 持续向下滚, 在气泡离开视口后检查 drawer 是否保持 ≤ maxH + 2px 容差
+    const detail = page.locator("#detail");
+    let breached = false;
+    for (let i = 0; i < 40; i++) {
+      await page.mouse.wheel(0, 20);
+      await page.waitForTimeout(60);
+      const m = await page.evaluate(() => {
+        const d = document.getElementById('detail')!;
+        const w = document.getElementById('detail-wrap')!;
+        const wrapTop = w.getBoundingClientRect().top;
+        const selRound = document.querySelector('#detail .tl-round.selected');
+        let bby: number | null = null;
+        if (selRound) {
+          const bubbles = selRound.querySelectorAll('.request-pane .chat-bubble');
+          if (bubbles.length > 0) bby = bubbles[bubbles.length - 1].getBoundingClientRect().bottom - wrapTop;
+        }
+        return {
+          scrollTop: d.scrollTop,
+          drawerPct: document.getElementById('response-drawer')!.offsetHeight / w.clientHeight,
+          bubbleBottomY: bby,
+        };
+      });
+      // 气泡已离开视口 (bby <= 0) 且 scrollTop 还在 phase 3 区间 → drawer 应 ≤ 42% (maxH + 2px)
+      if (m.bubbleBottomY !== null && m.bubbleBottomY <= 0 && m.drawerPct > 0.42) {
+        breached = true;
+        break;
+      }
+    }
+    expect(breached).toBe(false);
+  });
+
+  test("drawer phase 1 stays at minH (no jump to defaultH)", async ({ page }) => {
+    // bug #2 回归: 向上滚到选中气泡离开视口底部后, drawer 应保持 minH (10%),
+    // 不跳回 defaultH (30%).
+    const reply = "This is a long response for testing the typing box. ".repeat(15);
+    const sys = "You are a coding assistant. ".repeat(5);
+    await sendChat(page, [{ role: "system", content: sys }, { role: "user", content: "phase1-jump-marker" }, { role: "assistant", content: reply }]);
+    await sendChat(page, [{ role: "system", content: sys }, { role: "user", content: "phase1-jump-marker" }, { role: "assistant", content: reply }, { role: "user", content: "second" }, { role: "assistant", content: reply }]);
+    await sendChat(page, [{ role: "system", content: sys }, { role: "user", content: "phase1-jump-marker" }, { role: "assistant", content: reply }, { role: "user", content: "second" }, { role: "assistant", content: reply }, { role: "user", content: "third" }, { role: "assistant", content: reply }]);
+    const leaf = await findSessionLeafByPreview(page, "phase1-jump-marker");
+    await clickSessionByLeaf(page, leaf);
+    await page.waitForTimeout(500);
+    // 选中 round 2 (中间, 向上滚到顶能把它推出视口底部)
+    const round2 = page.locator("#detail .tl-round").nth(1);
+    await round2.locator(".tl-round-header").click();
+    await page.waitForTimeout(1200);
+
+    // 向上滚到顶
+    for (let i = 0; i < 30; i++) {
+      await page.mouse.wheel(0, -30);
+      await page.waitForTimeout(50);
+    }
+    await page.waitForTimeout(300);
+
+    const m = await page.evaluate(() => {
+      const w = document.getElementById('detail-wrap')!;
+      const wrapTop = w.getBoundingClientRect().top;
+      const wrapH = w.clientHeight;
+      const selRound = document.querySelector('#detail .tl-round.selected');
+      let bby: number | null = null;
+      if (selRound) {
+        const bubbles = selRound.querySelectorAll('.request-pane .chat-bubble');
+        if (bubbles.length > 0) bby = bubbles[bubbles.length - 1].getBoundingClientRect().bottom - wrapTop;
+      }
+      return {
+        drawerPct: document.getElementById('response-drawer')!.offsetHeight / wrapH,
+        bubbleBottomY: bby,
+        wrapH,
+      };
+    });
+
+    // 气泡在视口下方 (phase 1) → drawer 应 ≈ minH (10%), 不跳回 defaultH (30%)
+    if (m.bubbleBottomY !== null && m.bubbleBottomY >= m.wrapH) {
+      expect(m.drawerPct).toBeLessThanOrEqual(0.12);
+    }
+  });
 });
