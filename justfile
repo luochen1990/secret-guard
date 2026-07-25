@@ -26,7 +26,11 @@ dev:
 # 默认不带 (本地开发追求快速反馈, 无需插桩开销).
 #
 # CARGO_TARGET_DIR 若设置, 产物落其下 debug/ (clippy/nextest) 与 llvm-cov-target/ (coverage) 子目录.
-# profraw 清理: cargo llvm-cov clean --profraw-only 清理上轮 profraw, 保留插桩二进制供增量编译.
+# 清理策略: cargo llvm-cov clean --workspace 精准清 workspace member 的插桩 artifacts
+# (含历史 build hash 的孤儿 binary), 保留依赖插桩缓存. 比 --profraw-only 更彻底 (后者只清 profraw,
+# 留下孤儿 binary 会被 report 当成 0% 覆盖统计, 虚降总覆盖率); 比无 flag 的 clean 更精准 (后者
+# 连依赖插桩缓存也删, 实测编译时间慢 ~2.4x). report.rs 的 pkg_hash_re 只收集 workspace member
+# 的 object, 所以保留依赖插桩缓存不会污染报告 — 这是该方案能 "既保速度又准报告" 的根因.
 #
 # doctest 暂时禁用: 当前唯一的 doctest (auth::middleware) 被标为 ```ignore, 测试价值为零.
 # 需要时取消下行注释即可恢复 (增量开销 <1s, 复用 clippy 的 debug/ 产物).
@@ -36,7 +40,7 @@ check *ARGS:
     cargo machete
     # cargo test --doc
     @if echo "{{ARGS}}" | grep -q -- "--coverage"; then \
-        cargo llvm-cov clean --profraw-only; \
+        cargo llvm-cov clean --workspace; \
         cargo llvm-cov nextest --no-fail-fast --no-report; \
     else \
         cargo nextest run --no-fail-fast; \
