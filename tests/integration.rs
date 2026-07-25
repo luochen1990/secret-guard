@@ -3055,3 +3055,365 @@ async fn cross_protocol_translates_upstream_5xx_errors() {
         );
     }
 }
+
+// ─── 已知限制回归 / 契约补强 ───────────────────────────────────────────────
+//
+// 本节针对 AGENTS.md "已知限制 (MVP)" 章节中明确登记的降级行为,
+// 以及关键契约 (response header / 路由完整性) 补强回归测试,
+// 防止后续重构无意中让降级进一步恶化为真实 secret 泄漏.
+
+/// 已知限制回归: 流式 + Redact + 上游非 2xx 错误时, secret-guard 走 fallback 原样返回路径
+/// (无 restore), 客户端可能看到 mock.
+///
+/// 详见 AGENTS.md "已知限制":
+///   "流式 + Redact + 非 2xx 上游错误: SSE 错误流不是单个 JSON, parse 失败时 fallback
+///    原样返回 (无 restore), 客户端可能看到 mock."
+///
+/// 触发路径 (`src/proxy.rs::same_proto_forward`):
+///   1. 客户端发 `stream:true` 请求, body 含 real_secret.
+///   2. redact 把 real_secret 替换为 mock, 上游收到的 body 只含 mock.
+///   3. 上游返回 `Content-Type: text/event-stream` + 非 2xx (这里用 500),
+///      body 是 SSE 错误事件 (不是单个 JSON), 内含上游"看到"的 mock.
+///   4. `same_proto_forward` 判断 `streamed && resp_status.is_success()` 为 false →
+///      进入 `fan_out_buffered_ir`.
+///   5. `fan_out_buffered_ir` 用 `serde_json::from_slice` 解析 SSE body 失败 →
+///      fallback 到原样透传 (无 restore).
+///
+/// **本测试锁定的核心不变量**: 即使在 fallback 降级路径, real_secret 也绝不能流出
+/// (因为请求侧已 redact, 上游从未收到 real_secret, 自然无法在响应里 echo 它).
+/// mock 出现在客户端是已知降级 (改善 restore 覆盖后, 应把 mock 断言换成 real_secret 断言).
+#[tokio::test]
+async fn streaming_redact_upstream_error_known_limitation_locked() {
+    let real_secret = "sk-test-123";
+    let expected_mock = predict_mock(real_secret);
+    let mut upstream = spawn_mock_upstream().await;
+    // 上游返回 SSE 风格的错误事件 (OpenAI 真实上游在流内出错时的常见形态),
+    // 状态码 500, body 不是单个 JSON.
+    let sse_error_body = format!(
+        concat!(
+            "data: {{\"error\":{{\"message\":\"internal error, saw {mock} in prompt\",\"type\":\"server_error\"}}}}\n\n",
+            "data: [DONE]\n\n"
+        ),
+        mock = expected_mock,
+    );
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(500)
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse_error_body)
+        .create_async()
+        .await;
+
+    let entries = vec![secret("api-key", real_secret)];
+    let secrets = test_secret_table_with(entries);
+    let upstream_client = reqwest::Client::new();
+    let records = ConversationDag::new(64, 500, 1);
+    let records_handle = records.clone();
+    let provider = openai_provider("oa-main", &upstream.url());
+    let proxy_url = spawn_proxy_full(vec![provider], upstream_client, records, secrets).await;
+
+    let body = format!(
+        r#"{{"model":"gpt-4o","stream":true,"messages":[{{"role":"user","content":"use {real_secret} now"}}]}}"#
+    );
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/o/oa-main/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+
+    // 状态码应透传 (500).
+    assert_eq!(
+        status,
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        "non-2xx status should pass through; body: {text}"
+    );
+
+    // ★ 关键不变量: real_secret 绝不能出现在客户端响应.
+    //    上游从未收到 real_secret (已被 redact), 故即便 fallback 原样返回,
+    //    响应里也不应出现 real_secret. 若此断言失败, 说明 redact 链路某处
+    //    让 real_secret 流到了上游 → 这是严重 bug, 需立即修复 (而非已知限制).
+    assert!(
+        !text.contains(real_secret),
+        "REGRESSION: real_secret leaked to client in upstream-error fallback path! got: {text}"
+    );
+
+    // 已知限制: 客户端可能看到 mock (fallback 无 restore).
+    // 改善方向: 让 fan_out_buffered_ir 在 SSE body 上也能 sliding-window restore,
+    // 或在 streaming + 非 2xx 路径走 StreamingRestorer. 改善后把下面断言换成
+    // `assert!(text.contains(real_secret))` + `assert!(!text.contains(&expected_mock))`.
+    assert!(
+        text.contains(&expected_mock),
+        "known limitation: mock should be visible in fallback (no restore); \
+         if this fails, restore may have been improved — update this assertion to \
+         require real_secret instead. got: {text}"
+    );
+
+    // 记录侧契约: req_body 必须已被 redact (LLM 视角, 不含 real_secret).
+    let list = wait_until_or_timeout(
+        &records_handle,
+        |l| l.first().map(|r| r.resp_complete).unwrap_or(false),
+        Duration::from_secs(2),
+    )
+    .await;
+    let r = &list[0];
+    assert!(
+        !r.req_body.contains(real_secret),
+        "record req_body must not contain real_secret; got: {}",
+        r.req_body
+    );
+}
+
+/// 已知限制回归 (变体): 流式 + Redact + 上游 4xx (eg 400 bad request) 时,
+/// 上游在响应 body 里 echo 了 mock. 与 500 + SSE 场景同样的降级路径, real_secret 不泄漏.
+///
+/// 实现细节: 即便上游返回单个 JSON (可被 serde_json::from_slice 解析),
+/// `fan_out_buffered_ir` 仍会 fallback 到原样返回 — 因为 codec reader 只能解析
+/// 成功响应 shape (eg OpenAI `{"choices":[...]}`), 无法把 `{"error":{...}}`
+/// 解析成 IrResponse, 故 `reader.read_response` 返回 Err → 原样返回.
+///
+/// 这条变体把 known-limitation 的覆盖从 "SSE body" 扩展到 "非 2xx body (任意 shape)",
+/// 进一步锁定: **只要上游返回非 2xx, restore 就走不通**, real_secret 仍不泄漏.
+#[tokio::test]
+async fn streaming_redact_upstream_4xx_json_also_falls_back_without_restore() {
+    let real_secret = "sk-test-123";
+    let expected_mock = predict_mock(real_secret);
+    let mut upstream = spawn_mock_upstream().await;
+    // 上游 400 + 单个 JSON (OpenAI 错误响应标准形态), body 含 mock.
+    let err_body = format!(
+        r#"{{"error":{{"message":"invalid prompt containing {mock}","type":"invalid_request_error"}}}}"#,
+        mock = expected_mock,
+    );
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(400)
+        .with_header("content-type", "application/json")
+        .with_body(err_body)
+        .create_async()
+        .await;
+
+    let entries = vec![secret("api-key", real_secret)];
+    let secrets = test_secret_table_with(entries);
+    let upstream_client = reqwest::Client::new();
+    let records = ConversationDag::new(64, 500, 1);
+    let provider = openai_provider("oa-main", &upstream.url());
+    let proxy_url = spawn_proxy_full(vec![provider], upstream_client, records, secrets).await;
+
+    let body = format!(
+        r#"{{"model":"gpt-4o","stream":true,"messages":[{{"role":"user","content":"use {real_secret}"}}]}}"#
+    );
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/o/oa-main/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    // ★ 关键不变量: real_secret 绝不泄漏 (与 SSE 500 变体一致).
+    assert!(
+        !text.contains(real_secret),
+        "REGRESSION: real_secret leaked to client in 4xx fallback path! got: {text}"
+    );
+    // 已知限制: 4xx + JSON 同样走 fallback (codec reader 无法把 error 解析成 IrResponse),
+    // 客户端看到 mock. 改善后此断言应换成 real_secret.
+    assert!(
+        text.contains(&expected_mock),
+        "known limitation: 4xx response should fall back to verbatim (mock visible); got: {text}"
+    );
+}
+
+// ─── Cache-Control: no-store 契约 ──────────────────────────────────────────
+//
+// web/api.rs 文件头声明: "所有响应都带 Cache-Control: no-store, 避免浏览器对自动刷新
+// 返回缓存内容." 该契约在 Web API + auth handler 路径上由 `NO_STORE` 常量统一注入.
+// Proxy 转发路径 (`/{o|a|g|l}/{name}/*`) 当前 *不* 注入此 header (透传上游 header),
+// 这是当前实现的事实行为 — 本测试分别覆盖两条路径, 锁定各自契约.
+
+/// Web API 路径 (`/__sg/api/*`) 必须带 `Cache-Control: no-store` (防浏览器缓存).
+#[tokio::test]
+async fn web_api_responses_include_cache_control_no_store_header() {
+    let upstream = spawn_mock_upstream().await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
+    let resp = reqwest::Client::new()
+        .get(format!("{proxy_url}/__sg/api/records"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let cc = resp
+        .headers()
+        .get(reqwest::header::CACHE_CONTROL)
+        .expect("Web API response must have Cache-Control header")
+        .to_str()
+        .unwrap();
+    assert!(
+        cc.contains("no-store"),
+        "Cache-Control should contain 'no-store', got: {cc}"
+    );
+}
+
+/// 多个 Web API 端点都注入 no-store (回归 sample, 不是只 records 端点).
+#[tokio::test]
+async fn web_api_cache_control_no_store_header_on_multiple_endpoints() {
+    let upstream = spawn_mock_upstream().await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
+    let client = reqwest::Client::new();
+
+    for path in ["/__sg/api/providers", "/__sg/api/secrets"] {
+        let resp = client
+            .get(format!("{proxy_url}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK, "path: {path}");
+        let cc = resp
+            .headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .unwrap_or_else(|| panic!("missing Cache-Control on {path}"))
+            .to_str()
+            .unwrap();
+        assert!(
+            cc.contains("no-store"),
+            "path {path} Cache-Control should contain 'no-store', got: {cc}"
+        );
+    }
+}
+
+// ─── Gemini / Ollama 同协议透传 placeholder ─────────────────────────────────
+//
+// AGENTS.md 路由表声明 `g`=Gemini, `l`=oLLama 是一等公民, 但 codec 层尚未实现
+// Reader/Writer. 当前同协议 + 无 secret 走字节透传 (`same_proto_passthrough`),
+// 同协议 + 有 secret 因 codec 缺失会 fallback 到字节透传 (warn, 不 redact).
+//
+// 这两个 placeholder 测试用 `#[ignore]` 标注, 待 Gemini/Ollama codec 实现后取消 ignore
+// 即可有正向透传守护. 当前它们以"无 secret 字节透传"形态运行, 验证 g/l 路由可达.
+
+/// Gemini 同协议透传 (字节级). 待 Gemini codec 实现后, 此测试应扩展为
+/// IR 路径 + redact round-trip (取消 ignore 并补强断言).
+#[tokio::test]
+#[ignore = "待 Gemini codec 实现: 当前仅验证 g/ 路由可达, codec 接入后补 redact 断言"]
+async fn gemini_same_proto_passthrough() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1beta/models/gemini-pro:generateContent")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"candidates":[{"content":{"parts":[{"text":"hi"}]}}]}"#)
+        .create_async()
+        .await;
+
+    let provider = provider_with("gem-main", Protocol::Gemini, &upstream.url());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+
+    let (status, body, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/g/gem-main/v1beta/models/gemini-pro:generateContent",
+        r#"{"contents":[{"parts":[{"text":"hello"}]}]}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {body}");
+    assert!(
+        body.contains("hi"),
+        "Gemini passthrough body mismatch: {body}"
+    );
+}
+
+/// Ollama 同协议透传 (字节级). 待 Ollama codec 实现后扩展为 IR 路径.
+#[tokio::test]
+#[ignore = "待 Ollama codec 实现: 当前仅验证 l/ 路由可达, codec 接入后补 redact 断言"]
+async fn ollama_same_proto_passthrough() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/api/chat")
+        .with_status(200)
+        .with_header("content-type", "application/x-ndjson")
+        .with_body(
+            "{\"model\":\"llama3\",\"created_at\":\"\",\"message\":{\"role\":\"assistant\",\"content\":\"hi\"},\"done\":false}\n{\"done\":true}\n",
+        )
+        .create_async()
+        .await;
+
+    let provider = provider_with("ollama-main", Protocol::Ollama, &upstream.url());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+
+    let (status, body, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/l/ollama-main/api/chat",
+        r#"{"model":"llama3","messages":[{"role":"user","content":"hello"}]}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {body}");
+    assert!(
+        body.contains("\"role\":\"assistant\""),
+        "Ollama passthrough body mismatch: {body}"
+    );
+}
+
+// ─── 并发转发请求 (DAG 写入并发) ─────────────────────────────────────────────
+//
+// 现有 `cross_table_shared_state_no_lost_update` 只测配置写入并发 (POST provider + POST secret).
+// 本节补一条转发请求并发测试: 多个 HTTP 转发同时写入 DAG, 验证 record 数 == 请求数
+// (DAG 的内部锁不会丢节点).
+
+/// 并发发起 10 个转发请求, 验证 DAG 最终累积 10 条完整 record.
+#[tokio::test]
+async fn concurrent_forward_requests_all_recorded() {
+    let mut upstream = spawn_mock_upstream().await;
+    // mockito 同一 path 的多次匹配默认串行匹配; 用 Matcher::Any 接住所有 POST.
+    let _m = upstream
+        .mock("POST", mockito::Matcher::Any)
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    let upstream_client = reqwest::Client::new();
+    let records = ConversationDag::new(64, 500, 1);
+    let provider = openai_provider("oa-main", &upstream.url());
+    let proxy_url = spawn_proxy_full(
+        vec![provider],
+        upstream_client,
+        records,
+        test_secret_table(),
+    )
+    .await;
+
+    let client = reqwest::Client::new();
+    let url = format!("{proxy_url}/o/oa-main/v1/chat/completions");
+
+    // 并发发起 10 个请求.
+    let mut handles = Vec::new();
+    for i in 0..10 {
+        let c = client.clone();
+        let u = url.clone();
+        handles.push(tokio::spawn(async move {
+            let body = format!(r#"{{"i":{i}}}"#);
+            let resp = c.post(&u).body(body).send().await.unwrap();
+            assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    // 等 DAG 累积 10 条 record (每条都 resp_complete).
+    let list = wait_for_record_count(&format!("{proxy_url}/__sg/api/records"), 10).await;
+    assert_eq!(
+        list.len(),
+        10,
+        "concurrent forwards should all be recorded; got {}",
+        list.len()
+    );
+}
