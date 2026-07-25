@@ -1303,6 +1303,296 @@ mod tests {
         );
     }
 
+    // ─── hash_block 非 Text variant + 跨 variant 不碰撞 (P1) ──────────────
+    //
+    // 背景: 现有 6 个 BlockPool 测试只覆盖 IrBlock::Text. 真实 tool-use 场景必经
+    // ToolUse / ToolResult / Image variant 的 intern→resolve 路径. 若 canonical JSON
+    // 序列化假设破坏 (如 serde_json 启用 preserve_order) 会静默错配 BlockHash.
+    // 这里覆盖每个 variant 的 round-trip + 跨 variant 不碰撞.
+
+    #[test]
+    fn dag_block_tooluse_intern_resolve_roundtrip() {
+        // ToolUse 含 id/name/input, 走 serde_json canonical 序列化路径做 hash.
+        // 验证 intern 后 resolve 回来字段严格相等.
+        let mut pool = BlockPool::default();
+        let block = IrBlock::ToolUse {
+            id: "call_001".to_string(),
+            name: "get_weather".to_string(),
+            input: serde_json::json!({
+                "location": "Beijing",
+                "units": "celsius",
+                "nested": {"a": [1, 2, 3], "b": true}
+            }),
+        };
+        let h = pool.intern(block.clone());
+        let resolved = pool.get(h).expect("block should be interned");
+        assert_eq!(*resolved, block, "ToolUse round-trip 严格相等");
+        assert_eq!(pool.len(), 1, "1 个 unique ToolUse block");
+    }
+
+    #[test]
+    fn dag_block_tooluse_dedupes_identical_input() {
+        // 相同 id/name/input 的 ToolUse 应 hash 命中 (dedupe).
+        let mut pool = BlockPool::default();
+        let input = serde_json::json!({"q": "rust async", "limit": 10});
+        let b1 = IrBlock::ToolUse {
+            id: "call_42".into(),
+            name: "search".into(),
+            input: input.clone(),
+        };
+        let b2 = IrBlock::ToolUse {
+            id: "call_42".into(),
+            name: "search".into(),
+            input: input.clone(),
+        };
+        let h1 = pool.intern(b1);
+        let h2 = pool.intern(b2);
+        assert_eq!(h1, h2, "相同 ToolUse 应 hash 命中");
+        assert_eq!(*pool.refcount.get(&h1).unwrap(), 2);
+    }
+
+    #[test]
+    fn dag_block_tooluse_canonical_json_key_order_invariant() {
+        // C3/契约: serde_json 默认 BTreeMap → key 按字母排序 → canonical.
+        // 不同 key 顺序 (但同集合) 的 input JSON 应 hash 到同一 BlockHash.
+        // 假设不成立时 (如启用 preserve_order): 此测试会失败, 提醒开发者改 hash 路径.
+        let mut pool = BlockPool::default();
+        let b1 = IrBlock::ToolUse {
+            id: "x".into(),
+            name: "fn".into(),
+            input: serde_json::from_str(r#"{"a":1,"b":2,"c":3}"#).unwrap(),
+        };
+        let b2 = IrBlock::ToolUse {
+            id: "x".into(),
+            name: "fn".into(),
+            input: serde_json::from_str(r#"{"c":3,"a":1,"b":2}"#).unwrap(),
+        };
+        let h1 = pool.intern(b1);
+        let h2 = pool.intern(b2);
+        assert_eq!(
+            h1, h2,
+            "相同 key 集合不同顺序应 hash 一致 (canonical JSON 假设)"
+        );
+    }
+
+    #[test]
+    fn dag_block_tooluse_distinct_input_distinct_hash() {
+        // 不同 input (即使只差一个字符) 应 hash 不同.
+        let mut pool = BlockPool::default();
+        let b1 = IrBlock::ToolUse {
+            id: "x".into(),
+            name: "fn".into(),
+            input: serde_json::json!({"a": 1}),
+        };
+        let b2 = IrBlock::ToolUse {
+            id: "x".into(),
+            name: "fn".into(),
+            input: serde_json::json!({"a": 2}),
+        };
+        let h1 = pool.intern(b1);
+        let h2 = pool.intern(b2);
+        assert_ne!(h1, h2, "不同 input 应 hash 不同");
+        assert_eq!(pool.len(), 2);
+    }
+
+    #[test]
+    fn dag_block_toolresult_flat_intern_resolve() {
+        // ToolResult 含 tool_use_id + content (Vec<IrBlock>) + is_error.
+        // 先测 content 仅含 Text 的扁平情况.
+        let mut pool = BlockPool::default();
+        let block = IrBlock::ToolResult {
+            tool_use_id: "call_001".to_string(),
+            content: vec![
+                IrBlock::Text {
+                    text: "tool output line 1".to_string(),
+                },
+                IrBlock::Text {
+                    text: "tool output line 2".to_string(),
+                },
+            ],
+            is_error: false,
+        };
+        let h = pool.intern(block.clone());
+        let resolved = pool.get(h).expect("interned");
+        assert_eq!(*resolved, block, "ToolResult round-trip 严格相等");
+    }
+
+    #[test]
+    fn dag_block_toolresult_nested_tooluse_in_content() {
+        // 嵌套递归 hash: ToolResult.content 中含 ToolUse 子 block.
+        // 验证 hash_block 的递归路径正确 (for c in content { hash_block(c) }).
+        let mut pool = BlockPool::default();
+        let nested = IrBlock::ToolResult {
+            tool_use_id: "parent_call".to_string(),
+            content: vec![IrBlock::ToolUse {
+                id: "child_call".to_string(),
+                name: "parse".to_string(),
+                input: serde_json::json!({"raw": "data"}),
+            }],
+            is_error: false,
+        };
+        let h = pool.intern(nested.clone());
+        let resolved = pool.get(h).expect("interned");
+        assert_eq!(*resolved, nested, "嵌套 ToolResult round-trip 严格相等");
+    }
+
+    #[test]
+    fn dag_block_toolresult_is_error_affects_hash() {
+        // is_error 不同 → hash 不同 (作为字段被 hash).
+        let mut pool = BlockPool::default();
+        let ok = IrBlock::ToolResult {
+            tool_use_id: "c1".into(),
+            content: vec![IrBlock::Text { text: "ok".into() }],
+            is_error: false,
+        };
+        let err = IrBlock::ToolResult {
+            tool_use_id: "c1".into(),
+            content: vec![IrBlock::Text { text: "ok".into() }],
+            is_error: true,
+        };
+        let h_ok = pool.intern(ok);
+        let h_err = pool.intern(err);
+        assert_ne!(h_ok, h_err, "is_error 不同 → hash 不同");
+    }
+
+    #[test]
+    fn dag_block_toolresult_recursion_seen_in_pool() {
+        // 嵌套 content 中的子 block 也应被 intern 到池中 (供跨 node 共享).
+        // 注意: 当前 intern() 只把顶层 block 入池, 嵌套子 block 不单独 intern.
+        // 此测试固化该行为: 池中只有 1 个 block (整个 ToolResult), 子 Text 不单独入池.
+        let mut pool = BlockPool::default();
+        let child = IrBlock::Text {
+            text: "child".into(),
+        };
+        let parent = IrBlock::ToolResult {
+            tool_use_id: "c1".into(),
+            content: vec![child],
+            is_error: false,
+        };
+        let _h = pool.intern(parent);
+        assert_eq!(pool.len(), 1, "嵌套子 block 不单独入池 (顶层原子单元)");
+    }
+
+    #[test]
+    fn dag_block_image_base64_intern_resolve() {
+        // Image source = Base64 { media_type, data }.
+        let mut pool = BlockPool::default();
+        let block = IrBlock::Image {
+            source: IrImageSource::Base64 {
+                media_type: "image/png".to_string(),
+                data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB".to_string(),
+            },
+        };
+        let h = pool.intern(block.clone());
+        let resolved = pool.get(h).expect("interned");
+        assert_eq!(*resolved, block, "Image Base64 round-trip 严格相等");
+    }
+
+    #[test]
+    fn dag_block_image_url_intern_resolve() {
+        // Image source = Url(String).
+        let mut pool = BlockPool::default();
+        let block = IrBlock::Image {
+            source: IrImageSource::Url("https://example.com/img.png".to_string()),
+        };
+        let h = pool.intern(block.clone());
+        let resolved = pool.get(h).expect("interned");
+        assert_eq!(*resolved, block, "Image Url round-trip 严格相等");
+    }
+
+    #[test]
+    fn dag_block_image_base64_distinct_from_url_hash() {
+        // 即使 data 字符串与 url 字符串相同, Base64 与 Url 两 source 应 hash 不同
+        // (discriminant 参与 hash).
+        let mut pool = BlockPool::default();
+        let payload = "same_string_payload".to_string();
+        let b64 = IrBlock::Image {
+            source: IrImageSource::Base64 {
+                media_type: "image/png".into(),
+                data: payload.clone(),
+            },
+        };
+        let url = IrBlock::Image {
+            source: IrImageSource::Url(payload),
+        };
+        let h_b64 = pool.intern(b64);
+        let h_url = pool.intern(url);
+        assert_ne!(h_b64, h_url, "Base64 vs Url 即使字符串相同, hash 应不同");
+    }
+
+    #[test]
+    fn dag_block_cross_variant_no_collision() {
+        // 跨 variant 不碰撞: Text("hello") vs ToolUse {name="hello", ...} 的 hash 必须不同.
+        // discriminant 参与 hash, 即便部分字段相同, 不同 variant 应得不同 BlockHash.
+        let mut pool = BlockPool::default();
+        let text = IrBlock::Text {
+            text: "hello".into(),
+        };
+        let tooluse_with_same_string = IrBlock::ToolUse {
+            id: "hello".into(),
+            name: "hello".into(),
+            input: serde_json::json!("hello"),
+        };
+        let toolresult_with_same_string = IrBlock::ToolResult {
+            tool_use_id: "hello".into(),
+            content: vec![IrBlock::Text {
+                text: "hello".into(),
+            }],
+            is_error: false,
+        };
+        let h_text = pool.intern(text);
+        let h_tooluse = pool.intern(tooluse_with_same_string);
+        let h_toolresult = pool.intern(toolresult_with_same_string);
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(h_text);
+        assert!(
+            seen.insert(h_tooluse),
+            "Text 与 ToolUse 不应碰撞 (discriminant)"
+        );
+        assert!(
+            seen.insert(h_toolresult),
+            "Text 与 ToolResult 不应碰撞 (discriminant)"
+        );
+        assert_eq!(pool.len(), 3, "3 个不同 variant 各占 1 槽");
+    }
+
+    #[test]
+    fn dag_block_message_with_mixed_variants_roundtrips() {
+        // 端到端: 一条含 4 种 variant 的 IrMessage, intern_message 后 resolve_message
+        // 应回到完全相等的 IrMessage. 这是 tool-use 真实场景的 round-trip 守卫.
+        let mut pool = BlockPool::default();
+        let msg = IrMessage {
+            role: IrRole::User,
+            content: vec![
+                IrBlock::Text {
+                    text: "please use the tool".to_string(),
+                },
+                IrBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "search".to_string(),
+                    input: serde_json::json!({"q": "rust"}),
+                },
+                IrBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: vec![IrBlock::Text {
+                        text: "result here".to_string(),
+                    }],
+                    is_error: false,
+                },
+                IrBlock::Image {
+                    source: IrImageSource::Url("https://x/y.png".to_string()),
+                },
+            ],
+        };
+        let msg_ref = pool.intern_message(&msg);
+        let resolved = pool.resolve_message(&msg_ref).expect("should resolve");
+        assert_eq!(resolved.role, msg.role);
+        assert_eq!(
+            resolved.content, msg.content,
+            "混合 variant message round-trip"
+        );
+    }
+
     // ─── ConversationDag push + parent lookup tests ──────────────────────
 
     #[test]
@@ -2412,5 +2702,262 @@ mod tests {
         // B 是 s1 的中间节点, 当 s1 leaf 被淘汰时, gc_cascade 会走到 B.
         // 只要 s2 还引用 A, A 就受 child_count 守护.
         let _ = b;
+    }
+
+    // ─── fork 分支取最新 (P2): find_parent ids.last() 选择 ──────────────────
+
+    #[test]
+    fn dag_fork_creates_distinct_sessions_with_correct_parents() {
+        // 直接覆盖 find_parent 中 "同 prefix_hash 多 entry 时取 ids.last()" 的关键选择.
+        // 场景: A → B (session s1), 然后两个分叉 C1 / C2 都从 B 延伸 (B 已不是 leaf → fork).
+        // 验证: C1 / C2 各自的 session_id 不同, parent 都正确指向 B, prefix_hash 链正确.
+        let dag = ConversationDag::new(64, 500, 1);
+
+        // A = [u1] (新 session)
+        let _a = dag.push_messages(vec![text_msg(IrRole::User, "u1")], dummy_event());
+
+        // B extends A: [u1, a1] → 延续 A 的 session (A 仍是 leaf 时 push B).
+        let b = dag.push_messages(
+            vec![
+                text_msg(IrRole::User, "u1"),
+                text_msg(IrRole::Assistant, "a1"),
+            ],
+            dummy_event(),
+        );
+
+        // C1 extends B: [u1, a1, u2] → B 仍是 s1 的 leaf → 延续 s1.
+        let c1 = dag.push_messages(
+            vec![
+                text_msg(IrRole::User, "u1"),
+                text_msg(IrRole::Assistant, "a1"),
+                text_msg(IrRole::User, "u2"),
+            ],
+            dummy_event(),
+        );
+
+        // C2 forks from B: [u1, a1, u3] → B 不再是 s1 的 leaf (C1 是) → fork → 新 session.
+        // find_parent 会再次命中 B 的 prefix_hash (cum[u1,a1] 对应的 entry),
+        // 但因 B 已不是 leaf → fork 路径. 同时验证 ids.last() 取的是 B 而非其他共享前缀节点.
+        let c2 = dag.push_messages(
+            vec![
+                text_msg(IrRole::User, "u1"),
+                text_msg(IrRole::Assistant, "a1"),
+                text_msg(IrRole::User, "u3"),
+            ],
+            dummy_event(),
+        );
+
+        // 验证 fork 结构.
+        let node_c1 = dag.get_node(c1).expect("c1 exists");
+        let node_c2 = dag.get_node(c2).expect("c2 exists");
+        assert_eq!(node_c1.parent, Some(b), "C1 parent = B");
+        assert_eq!(node_c2.parent, Some(b), "C2 parent = B (fork from B)");
+        assert_ne!(
+            node_c1.session_id, node_c2.session_id,
+            "C1 / C2 fork 应分属不同 session"
+        );
+
+        // 验证 sessions 列表: 应有 2 个 (s1 含 A→B→C1, s2 含 fork→C2).
+        let sessions = dag.list_sessions();
+        assert_eq!(sessions.len(), 2, "fork 产生 2 个 session");
+
+        // 验证各 session 的 leaf 正确 (s1 leaf=C1, s2 leaf=C2).
+        let s1 = sessions
+            .iter()
+            .find(|s| s.session_id == node_c1.session_id)
+            .expect("s1 exists");
+        let s2 = sessions
+            .iter()
+            .find(|s| s.session_id == node_c2.session_id)
+            .expect("s2 exists");
+        assert_eq!(s1.leaf_id, c1, "s1 leaf = C1");
+        assert_eq!(s2.leaf_id, c2, "s2 leaf = C2");
+        assert_eq!(s1.record_count, 3, "s1: A, B, C1");
+        assert_eq!(s2.record_count, 1, "s2: 只有 C2 (fork 的新分支起点)");
+
+        // B 是 fork 共享点, child_count 应为 2 (C1 + C2 都引用 B).
+        let node_b = dag.get_node(b).expect("b exists");
+        assert_eq!(
+            node_b.parent, // 通过 inner 检查 child_count 需要白盒, 这里改为间接验证:
+            Some(_a),
+            "B parent = A (sanity)"
+        );
+
+        // 间接验证 B 的 child_count=2: gc_cascade s1 (C1) 后 B 仍存活 (s2 引用).
+        // 若 B 的 child_count 错为 1, 删 C1 会级联删 B, 让 C2 变孤儿.
+        {
+            let mut g = dag.inner.write();
+            ConversationDag::gc_cascade(&mut g, c1);
+            g.sessions.remove(&node_c1.session_id);
+        }
+        assert!(dag.get_node(c1).is_none(), "C1 删除");
+        assert!(
+            dag.get_node(b).is_some(),
+            "B 仍存活 (C2 引用, child_count>0)"
+        );
+        assert!(
+            dag.get_node(c2).is_some(),
+            "C2 仍存活 (fork 分支不受 s1 GC 影响)"
+        );
+    }
+
+    // ─── property-based 测试 (proptest, A5) ─────────────────────────────────
+    //
+    // DAG 是天然适合属性测试的结构. 项目已依赖 proptest 但 dag.rs 之前完全未用.
+    // 这里覆盖 DAG 的两个核心代数性质:
+    // 1. round-trip identity: push → full_request_messages == 原始 messages
+    // 2. refcount 非负: 任意 push/evict 序列后, 所有 block 的 refcount ≥ 0
+    //
+    // 用 ProptestConfig::with_cases(64) 控制 case 数, 避免默认 256 case 拖慢 CI.
+
+    use proptest::prelude::*;
+
+    /// 生成随机 IrRole. IrRole 未实现 Arbitrary, 这里手写 4 选 1 策略.
+    fn arb_role() -> impl Strategy<Value = IrRole> {
+        prop_oneof![
+            Just(IrRole::System),
+            Just(IrRole::User),
+            Just(IrRole::Assistant),
+            Just(IrRole::Tool),
+        ]
+    }
+
+    /// 生成简单 Text message (role + text 都随机).
+    /// 仅用 Text variant 已足够覆盖 round-trip 性质 (intern/resolve 路径对所有 variant 一致,
+    /// variant-specific 的 round-trip 由前述 dag_block_* 系列单元测试覆盖).
+    fn arb_text_message() -> impl Strategy<Value = IrMessage> {
+        (arb_role(), "[a-z0-9 ]{0,20}").prop_map(|(role, text)| IrMessage {
+            role,
+            content: vec![IrBlock::Text { text }],
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// 性质 1 (round-trip identity):
+        /// 任意 messages 序列 push 到 DAG, 取 leaf 调 full_request_messages walk 出来,
+        /// 应严格等于原始 messages. 这是 DAG 核心 (BlockPool intern/resolve + Merkle walk)
+        /// 的代数恒等式 — 任何环节出错 (hash 冲突 / resolve 顺序 / GC 错删) 都会破坏它.
+        #[test]
+        fn prop_dag_round_trip_identity(messages in prop::collection::vec(arb_text_message(), 1..10)) {
+            let dag = ConversationDag::new(1024, 500, 1);
+            let leaf = dag.push_messages(messages.clone(), dummy_event());
+
+            let walked = dag.full_request_messages(leaf)
+                .expect("leaf 存在且 parent 链完整");
+
+            // walk 出的 messages 数量应等于 push 的数量 (单 node, 全部是 delta).
+            prop_assert_eq!(
+                walked.len(),
+                messages.len(),
+                "walked count == pushed count"
+            );
+            // 逐条对比 role + content (用引用避免 move).
+            for (i, (got, want)) in walked.iter().zip(messages.iter()).enumerate() {
+                prop_assert_eq!(got.role, want.role, "msg[{}] role mismatch", i);
+                prop_assert_eq!(
+                    &got.content, &want.content,
+                    "msg[{}] content mismatch", i
+                );
+            }
+        }
+
+        /// 性质 1 变体 (多 node 链 round-trip):
+        /// 模拟真实多轮: A=[m1], B=[m1, m2], C=[m1, m2, m3].
+        /// 取 C 的 full_request_messages 应得 [m1, m2, m3], 与 push C 时给的 messages 一致.
+        /// 这覆盖了 parent 共享前缀 → delta 提取 → walk 重组 的完整路径.
+        #[test]
+        fn prop_dag_multi_hop_chain_round_trip(
+            m1 in arb_text_message(),
+            m2 in arb_text_message(),
+            m3 in arb_text_message()
+        ) {
+            // prop_assume: 三条 message 的 (role, content) 各不相同, 防止 hash 退化.
+            // (若两条完全相同, intern 会 dedupe, BlockPool.len < 3, 但 round-trip 仍应成立.)
+            let dag = ConversationDag::new(64, 500, 1);
+            let _a = dag.push_messages(vec![m1.clone()], dummy_event());
+            let _b = dag.push_messages(vec![m1.clone(), m2.clone()], dummy_event());
+            let c = dag.push_messages(
+                vec![m1.clone(), m2.clone(), m3.clone()],
+                dummy_event(),
+            );
+
+            let walked = dag.full_request_messages(c)
+                .expect("leaf C 存在, parent 链 A→B→C 完整");
+            prop_assert_eq!(walked.len(), 3, "3 轮累积");
+            prop_assert_eq!(&walked[0].content, &m1.content, "msg[0] = m1");
+            prop_assert_eq!(&walked[1].content, &m2.content, "msg[1] = m2");
+            prop_assert_eq!(&walked[2].content, &m3.content, "msg[2] = m3");
+        }
+
+        /// 性质 2 (refcount 非负 + 操作序列不 panic):
+        /// 任意 push N 次 + 触发淘汰的序列, 不应 panic, 且最终所有 block 的 refcount > 0
+        /// (refcount=0 的 block 应已被 GC 移除). 用小 max_nodes 强制淘汰, 覆盖 GC 路径.
+        ///
+        /// 白盒访问 inner.blocks.refcount 验证不变式 (saturating_sub 保证非负, 但写测试固化契约).
+        #[test]
+        fn prop_dag_refcount_positive_after_push_sequence(
+            ops in prop::collection::vec(
+                (arb_role(), "[a-z]{1,8}"),
+                1..20
+            )
+        ) {
+            // max_nodes=3: 第 4 次 push 触发淘汰, 覆盖 GC 路径.
+            let dag = ConversationDag::new(3, 500, 1);
+            let mut last_leaf = None;
+
+            for (role, text) in &ops {
+                let msg = IrMessage {
+                    role: *role,
+                    content: vec![IrBlock::Text { text: text.clone() }],
+                };
+                // 不 panic 即通过 (push 内含淘汰 + GC cascade).
+                last_leaf = Some(dag.push_messages(vec![msg], dummy_event()));
+            }
+
+            // 白盒检查: 所有存活 block 的 refcount 必须为正.
+            // 不变式: refcount=0 的 block 应在 release 时被立即移除 (不残留).
+            let g = dag.inner.read();
+            for (&_hash, &count) in g.blocks.refcount.iter() {
+                prop_assert!(
+                    count > 0,
+                    "live block refcount 必须为正 (refcount=0 的应已被 GC): got {}",
+                    count
+                );
+            }
+            // min_sessions=1 保底: 至少 1 个 session 存活, 它的 leaf 应可访问.
+            let sessions = dag.list_sessions();
+            prop_assert!(!sessions.is_empty(), "至少 min_sessions 个 session 存活");
+            if let Some(leaf) = last_leaf {
+                // leaf 可能已被淘汰 (FIFO); 若仍存活, full_request_messages 应不 panic.
+                if dag.get_node(leaf).is_some() {
+                    let _ = dag.full_request_messages(leaf);
+                }
+            }
+        }
+
+        /// 性质 (intern idempotent): 同一 block 重复 intern, hash 必须相同.
+        /// 这是内容寻址的根基 (BlockPool 用 HashMap<BlockHash, _>).
+        #[test]
+        fn prop_block_intern_idempotent_hash(
+            text in "[a-zA-Z0-9 ,.!?]{0,50}",
+            role in arb_role()
+        ) {
+            let mut pool = BlockPool::default();
+            let msg = IrMessage {
+                role,
+                content: vec![IrBlock::Text { text: text.clone() }],
+            };
+            // 同一 message intern 两次 → 同一 MessageRef (role + 相同 blocks hash).
+            let ref1 = pool.intern_message(&msg);
+            let ref2 = pool.intern_message(&msg);
+            prop_assert_eq!(ref1.role, ref2.role);
+            prop_assert_eq!(&ref1.blocks, &ref2.blocks, "相同内容应 hash 一致");
+            // resolve 出来也应相等.
+            let r1 = pool.resolve_message(&ref1).expect("resolve 1");
+            let r2 = pool.resolve_message(&ref2).expect("resolve 2");
+            prop_assert_eq!(r1.content, r2.content);
+        }
     }
 }
