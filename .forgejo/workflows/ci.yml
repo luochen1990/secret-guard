@@ -32,8 +32,12 @@ jobs:
     # 去重: PR 事件总是跑; push 事件仅 master 跑 (feature branch 的 push 会被 pull_request 覆盖)
     if: ${{ github.event_name != 'push' || github.ref == 'refs/heads/master' }}
     timeout-minutes: 20
-    # cargo-llvm-cov 依赖 llvm-cov / llvm-profdata (rust toolchain 不含). VM 的 systemPackages
-    # 落 /run/current-system/sw/bin (NixOS 约定), job 级 env 让两个 step 共享, 无需各自 export.
+    # 评论 PR 需要 write 权限 (仅 PR 事件下的 diff 报告 step 用). Forgejo Actions 自动注入
+    # GITHUB_TOKEN 默认有此权限, 显式声明遵循最小权限原则.
+    permissions:
+      pull-requests: write
+    # cargo-llvm-cov 依赖 llvm-cov / llvm-profdata (rust 工具链不含). VM 的 systemPackages
+    # 落 /run/current-system/sw/bin (NixOS 约定), job 级 env 让所有 step 共享, 无需各自 export.
     #
     # CARGO_TARGET_DIR 指向 runner VM 的持久卷, 跨 job 复用编译产物.
     # 完整机制 (卷生命周期 / 子目录隔离 / 串行保证) 见 AGENTS.md "CI" 段.
@@ -42,9 +46,13 @@ jobs:
       LLVM_PROFDATA: /run/current-system/sw/bin/llvm-profdata
       CARGO_TARGET_DIR: /var/lib/forgejo-runner/cache/cargo-target
     steps:
+      # PR 事件需要 fetch base+head 以支持三点 diff (origin/<base>...HEAD);
+      # 其他事件 (push master / workflow_dispatch) 无 diff 需求, 保持浅克隆 --depth 1 省时.
       - name: Checkout via SSH
+        id: checkout
         env:
           DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
           set -eu
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
@@ -53,8 +61,77 @@ jobs:
           ssh-keyscan -p 5522 git.lambda.lc >> ~/.ssh/known_hosts
           git init
           git remote add origin "ssh://forgejo@git.lambda.lc:5522/${GITHUB_REPOSITORY}.git"
-          git fetch --depth 1 origin "$GITHUB_SHA"
-          git checkout FETCH_HEAD
+          if [ -n "$BASE_REF" ]; then
+            git fetch --no-tags origin "$BASE_REF"
+            git fetch --no-tags origin "$GITHUB_SHA"
+          else
+            git fetch --depth 1 origin "$GITHUB_SHA"
+          fi
+          git checkout "$GITHUB_SHA"
+
+      # ─── PR diff 拆解 (仅 PR 事件, 附加功能, 真正非阻塞) ──────────────────
+      # 放在 check 之前: 让 review 时尽早看到 prod/test 膨胀分析, 不必等编译+测试跑完.
+      # 工具 rust-diff-analyzer 由 runner VM 的 systemPackages 提供 (见 nixos 仓库
+      # rust.mod.nix), 不需要 install step.
+      #
+      # 真正非阻塞 (continue-on-error: true): 即使这些 step 失败 (网络/工具/API 抽风),
+      # 也不影响 check job 状态, 不阻塞合并 —— 遵循"附加功能不影响核心职责"的鲁棒性原则.
+      # if 条件四重与:
+      #   always()                          — 即使 check/coverage 失败也跑 (review 时仍想看膨胀)
+      #   github.event_name == 'pull_request' — 非 PR 事件无 diff 可分析
+      #   steps.checkout.outcome == 'success' — checkout 挂了没代码可分析, 不进入 (避免发空评论)
+      - name: Generate diff breakdown report
+        id: report
+        if: always() && github.event_name == 'pull_request' && steps.checkout.outcome == 'success'
+        continue-on-error: true
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          # --format comment: 输出 markdown, 适合 PR 评论.
+          # --no-fail: 工具自身不因检测到膨胀而退出非零.
+          {
+            echo "body<<EOF"
+            git diff "origin/$BASE_REF...HEAD" | rust-diff-analyzer --format comment --no-fail
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # 评论用纯 curl + Forgejo API (不引入 JS action — vm-nix 无 node).
+      # upsert 语义: 用 HTML marker 标记评论, 找到则 PATCH 更新 (PR 多次 push 不刷屏),
+      # 找不到则 POST 新建. 额外守卫 steps.report.outcome == 'success': 报告没生成就不发空评论.
+      - name: Upsert PR comment
+        if: always() && github.event_name == 'pull_request' && steps.report.outcome == 'success'
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BODY: ${{ steps.report.outputs.body }}
+        run: |
+          set -eu
+          MARKER='<!-- rust-diff-analyzer -->'
+          FULL_BODY="$MARKER"$'\n'"$BODY"
+          API="https://git.lambda.lc/api/v1/repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments"
+
+          # 1. 查找已有评论 (按 marker 识别).
+          EXISTING_ID=$(curl -fsSL -H "Authorization: token $GITHUB_TOKEN" "$API" \
+            | jq --arg m "$MARKER" '.[] | select(.body | contains($m)) | .id' | head -1)
+
+          # 2. upsert: 找到 → PATCH 更新; 没找到 → POST 新建.
+          PAYLOAD=$(jq -n --arg b "$FULL_BODY" '{body: $b}')
+          if [ -n "$EXISTING_ID" ]; then
+            curl -fsSL -X PATCH \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$PAYLOAD" \
+              "$API/$EXISTING_ID" >/dev/null
+            echo "Updated comment $EXISTING_ID"
+          else
+            curl -fsSL -X POST \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$PAYLOAD" \
+              "$API" >/dev/null
+            echo "Created new comment"
+          fi
 
       # consistency-check feature 守卫: clippy + nextest 带 feature flag 跑一次.
       # 该 feature 是默认关闭的 CI 守卫 (视图正确性断言, 详见 AGENTS.md "视图正确性确保机制"),

@@ -125,3 +125,35 @@ mock-upstream:
 # 检查依赖漏洞.
 audit:
     cargo audit
+
+# ─── PR diff 拆解 ──────────────────────────────────────────────────────────
+# 区分 diff 中的 prod 代码 vs test 代码, 用于 review 时判断真实膨胀.
+# 场景: 测试代码增加不是真膨胀, prod 代码大量增加才需警惕.
+# 工具: rust-diff-analyzer (syn AST 解析, 自动识别 #[cfg(test)] / #[test] / tests/ 目录).
+# 默认对比当前分支与 master (origin/master 优先, 回退本地 master).
+# 默认 --format human + --no-fail (报告完就退); 透传额外 ARGS, 例:
+#   just diff-loc                    # human 报告
+#   just diff-loc --format json      # JSON (脚本消费)
+#   just diff-loc --format=json      # 等价 (等号形式也识别)
+#   just diff-loc --max-units 50     # 加阈值 (但 --no-fail 不阻塞)
+#
+# 注意: rust-diff-analyzer 的 --format 不允许重复传 (clap 拒绝), 故下方用
+# 字符串匹配检测 ARGS 是否已含 --format, 没有才补默认值.
+#
+# 需要 devShell (nix develop) 提供 rust-diff-analyzer.
+diff-loc *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if git rev-parse --verify --quiet origin/master >/dev/null; then
+        BASE="origin/master"
+    else
+        BASE="master"
+    fi
+    echo "# diff: $BASE...HEAD"
+    # --no-fail 始终补; --format 仅在用户未传时补默认 human.
+    # 同时识别 --format X 和 --format=X (clap 拒绝 --format 重复出现).
+    FORMAT=()
+    if [[ " {{ARGS}} " != *" --format "* && " {{ARGS}} " != *" --format="* ]]; then
+        FORMAT=(--format human)
+    fi
+    git diff "$BASE...HEAD" | rust-diff-analyzer "${FORMAT[@]}" --no-fail {{ARGS}}

@@ -209,6 +209,14 @@ CI 流程 (测试集只跑一次):
 1. **Check + coverage data**: `just check --coverage` (fmt + clippy + machete + 测试,
    用 `cargo llvm-cov nextest` 插桩).
 2. **Coverage gate**: `just coverage-gate` (只做 report, 读上一步 profdata, 不重跑测试).
+3. **PR diff 拆解** (仅 `pull_request` 事件, 放在 check 之前, `continue-on-error` 真正非阻塞):
+   用 runner VM systemPackages 已提供的 `rust-diff-analyzer` (见 nixos 仓库 `rust.mod.nix`),
+   对 `origin/<PR-base>...HEAD` 跑 diff 拆解, **以 PR 评论形式贴出** (用 marker 实现同一 PR
+   多次 push 的 upsert, 不刷屏). 即使工具/网络/API 失败也不影响合并.
+
+评论写回用纯 `curl` + Forgejo API (`POST/PATCH /issues/{n}/comments`), 不引入 JS action
+(vm-nix 无 node). upsert 语义: 用 HTML 注释 marker 标记评论, 找到则 PATCH 更新, 找不到
+则 POST 新建.
 
 **跨 job target 复用**: CI job 设 `CARGO_TARGET_DIR=/var/lib/forgejo-runner/cache/cargo-target`,
 指向 runner VM 的持久 tmpfs 卷 (宿主侧 10G tmpfs + virtiofs 共享, 见 nixos 仓库
@@ -269,6 +277,18 @@ client = Anthropic(
 
 产物默认写到 `target/llvm-cov-target/` 与 `coverage/` (均已 .gitignore).
 门禁阈值见 justfile (`COVERAGE_MIN_LINES` / `COVERAGE_MAX_UNCOVERED`).
+
+### PR diff 拆解 (`rust-diff-analyzer`)
+
+区分 diff 中的 prod 代码 vs test 代码, 用于 review 时判断真实膨胀 (测试代码增加不是膨胀,
+prod 代码大量增加才需警惕). 工具用 syn AST 解析, 自动识别 `#[cfg(test)]` / `#[test]` /
+`tests/` 目录, 不依赖命名约定. 不在 nixpkgs, devShell 用 lazy `cargo install` wrapper
+封装 (首次 `just diff-loc` 编译到 `${XDG_CACHE_HOME:-~/.cache}/secret-guard-tools/`, 后续命中).
+
+- `just diff-loc`: 对 `master...HEAD` 跑 human 格式报告 (本地终端用).
+- CI: `check` job 内 3 个 step (仅 PR 事件触发), `continue-on-error: true` 真正非阻塞 —
+  即使工具/网络/API 失败也不影响合并. 报告用 `--format comment` 输出 markdown, 经
+  curl + Forgejo API upsert 到 PR 评论 (marker 标记, 多次 push 不刷屏).
 
 ## 部署
 

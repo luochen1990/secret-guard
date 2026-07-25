@@ -43,6 +43,27 @@
       # cargo-llvm-cov 需要 llvm-cov / llvm-profdata, nix rust toolchain 不含 llvm-tools-preview.
       # 用 llvmPackages 提供: profraw 格式跨 LLVM 主版本兼容, 不要求与 rustc 内嵌 LLVM 精确对齐.
       llvmBins = "${pkgs.llvmPackages.llvm}/bin";
+
+      # rust-diff-analyzer (PR diff 区分 prod/test 代码, 用于 review 时判断真实膨胀).
+      # 未进 nixpkgs, 用 lazy cargo install wrapper 包一层: 首次调用编译到 ~/.cache, 后续命中.
+      # 用 pin 版本避免上游新版本引入未预期行为.
+      # 注意: 不用 --locked — 该 crate 是低 star 个人项目, lockfile 维护未必及时,
+      # 上游某个依赖被 yank 时 --locked 会硬失败. --version pin 工具版本已足够.
+      rust-diff-analyzer = pkgs.writeShellScriptBin "rust-diff-analyzer" ''
+        set -eu
+        VERSION="2.0.1"
+        CACHE_DIR="''${XDG_CACHE_HOME:-$HOME/.cache}/secret-guard-tools"
+        BIN="$CACHE_DIR/rust-diff-analyzer-$VERSION"
+        if [ ! -x "$BIN" ]; then
+          mkdir -p "$CACHE_DIR"
+          # cargo install 中间产物 ~50MB, 用临时目录隔离避免污染 cache 命名空间.
+          tmp=$(mktemp -d)
+          cargo install rust-diff-analyzer --version "$VERSION" --root "$tmp"
+          install -m 755 "$tmp/bin/rust-diff-analyzer" "$BIN"
+          rm -rf "$tmp"
+        fi
+        exec "$BIN" "$@"
+      '';
     in {
       default = pkgs.mkShell {
         packages = with pkgs; [
@@ -64,6 +85,8 @@
           # 让 TS 源码的 `import "@playwright/test"` 能解析 (ESM resolver 不读 NODE_PATH).
           nodejs
           playwright-test
+          # PR diff 拆解: review 时区分 prod 代码 vs test 代码膨胀 (just diff-loc).
+          rust-diff-analyzer
         ];
         # shellHook: 进入 devShell 时自动 symlink playwright-test 的 node_modules 到 tests/webui.
         # 用相对路径 (shellHook 在用户 shell 中执行, cwd 通常 = 项目根), 不用 ${self}
