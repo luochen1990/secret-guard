@@ -648,8 +648,10 @@
     /* ─── IM 风格 detail 布局: 上下分栏 (request 上下文 + response 打字框) ─── */
     /* detail 内部分 detail-header / request-pane / response-pane. */
     .detail-header {
-      padding: 8px 12px 4px;
+      padding: 3px 12px 2px;
       flex-shrink: 0;
+      font-size: 11px;
+      color: #888;
     }
     /* request 上下文区: 滚动. */
     .request-pane {
@@ -826,22 +828,23 @@
     .sub-dot.active { outline: 1.5px solid #4a6fa5; outline-offset: 1px; }
 
     /* ─── timeline 顶/底悬浮按钮 ─────────────────────────────────────────── */
-    /* 按钮固定在对话框窗口 (article 可视区) 右侧, 不随 #detail 内容滚动.
-       实现方式: .scroll-nav 是 article 的直接子元素 (#detail 的兄弟, 不在滚动容器内),
-       用 position: absolute 相对 article (position: relative) 定位.
-       issue #36: 旧实现把 .scroll-nav 放在 #detail 内部 + position: absolute,
-       导致它跟随 #detail 内容滚动, 滚动后按钮消失. */
+    /* 按钮固定在滚动区域 (#detail) 右侧的顶部/底部 (即滚动条位置), 不随内容滚动.
+       实现方式: .scroll-nav 是 #detail-wrap 的子元素, position: absolute.
+       top 锚定 #detail 顶部; bottom 由 JS 设为当前 drawerH (= #detail 底部可见区 =
+       drawer overlay 上边缘), 使底部按钮贴合滚动区域底端而非整个窗口底端. */
     .scroll-nav {
       position: absolute;
       right: 16px;
       top: 12px;
-      bottom: 16px;
+      bottom: var(--drawer-h, 16px); /* 由 JS 设置为抽屉高度 */
       display: flex;
       flex-direction: column;
-      justify-content: space-between;
       pointer-events: none;
       z-index: 10;
     }
+    /* 底部按钮用 margin-top:auto 推到底部 (而非 justify-content:space-between),
+       避免顶部按钮 hidden 时底部按钮错位到顶部. */
+    #scroll-bottom-btn { margin-top: auto; }
     .scroll-nav button {
       width: 32px;
       height: 32px;
@@ -908,21 +911,24 @@
       100% { background: transparent; }
     }
 
-    /* ─── timeline 多轮布局: 覆盖旧的单 record flex 布局 ────────────────────
-       旧布局: #detail { display: flex; flex-direction: column; } + request-pane { flex:1; overflow-y: auto }
-       新布局 (timeline): #detail 整体可滚动 (块级), 每个 .tl-round 自然排列,
-       .tl-round 内的 .request-pane 不滚动 (自然高度), .response-pane 保持固定高度 + 独立滚动.
-       通过 .tl-round 作用域覆盖旧规则, 不破坏单 record 的旧 CSS (虽然不再用到).
+    /* ─── timeline 多轮布局: overlay drawer 架构 ────────────────────────────
+       旧架构 (flex column 分栏): #detail (flex:1) + .response-drawer (flex:none).
+       drawerH 影响 detailH → maxScroll → 循环依赖.
 
-       DOM 层级 (issue #36): article#detail-wrap (flex:1, position:relative 作为
-       .scroll-nav 的定位上下文) 内部 column-flex 分栏:
-         #detail (flex:1, 滚动容器, 上方对话区)
-         .response-drawer (flex:none, 下方 response 抽屉, 高度由 JS 动态设置)
-         .scroll-nav (absolute, 不随 #detail 内容滚动)
-       上下分栏让抽屉不遮挡对话内容. */
-    #detail-wrap { display: flex; flex-direction: column; min-height: 0; position: relative; }
-    #detail-wrap > #detail { flex: 1; min-width: 0; min-height: 0; }
-    #detail { display: block; overflow-y: auto; }
+       新架构 (overlay): #detail 占满 wrap (height:100%), drawer 悬浮在 #detail 之上
+       (position:absolute). detailH 固定 = wrapH → maxScroll 不依赖 drawerH → 循环依赖
+       彻底消除. drawerH = f(scrollTop) 是纯函数.
+
+       DOM:
+         #detail-wrap (position:relative, height=wrapH)
+           #detail (height:100%, overflow-y:auto)
+             .detail-header (sticky)
+             .tl-round × N
+             .drawer-placeholder (提供 phase 2 滚动空间, 被 drawer overlay 遮挡)
+           .response-drawer (position:absolute, bottom:0, height=drawerH, overlay)
+           .scroll-nav (position:absolute, bottom=drawerH) */
+    #detail-wrap { position: relative; min-height: 0; display: flex; flex-direction: column; }
+    #detail-wrap > #detail { flex: 1; min-width: 0; min-height: 0; overflow-y: auto; }
     .tl-round .request-pane {
       flex: none;
       overflow: visible;
@@ -940,23 +946,30 @@
       z-index: 5;
     }
 
-    /* ─── Response 抽屉 (issue #36): 跟随选中气泡的动态高度窗口 ──────────────
-       抽屉是 #detail-wrap 的 column-flex 子元素 (#detail 的兄弟, 下方分栏).
-       高度 (height) 由 JS 根据选中气泡在 wrap 坐标系中的位置动态计算 (详尽逻辑见
-       updateResponseDrawerLayout 头部注释):
+    /* ─── Response 抽屉 (overlay): 悬浮在 #detail 之上的动态高度窗口 ────────
+       height 由 JS 根据 scrollTop 纯函数计算 (详尽逻辑见 updateResponseDrawerLayout):
          - 选中瞬间: 气泡下边缘对齐 30% 抽屉上边缘.
          - 往上滚 (气泡下移) → 抽屉收缩, 最小 10%.
          - 往下滚 (气泡上移) → 抽屉扩大, 最大 40%.
-         - 滚到最底 → 抽屉扩展到 80%.
-       上下分栏 (flex column) 让抽屉不遮挡对话内容. */
+         - 滚到末轮底部以下 (placeholder 区域) → 渐进扩展到 80%.
+       overlay 不影响 #detail 的滚动高度, 循环依赖从架构上消除. */
     .response-drawer {
-      flex: none;  /* 高度由 JS 设置, 不参与 flex 分配 */
+      position: absolute;
+      left: 0; right: 0; bottom: 0;
       background: #fafafa;
       border-top: 1px solid #ddd;
       display: flex;
       flex-direction: column;
       min-height: 0;
       overflow: hidden;
+      z-index: 8;
+      box-shadow: 0 -2px 8px rgba(0,0,0,0.08);
+    }
+    /* placeholder: 提供 phase 2 的滚动空间. 用户滚入此区域时 drawer 已扩大遮挡它.
+       高度 = extremeMaxH (80% wrapH), 由 JS 设置. */
+    .drawer-placeholder {
+      height: var(--drawer-extreme-max, 0px);
+      flex-shrink: 0;
     }
     .response-drawer .resp-header {
       padding: 4px 12px;
@@ -1934,13 +1947,18 @@
       for (let i = 0; i < existingIds.length; i++) {
         if (existingIds[i] !== newIds[i]) return false; // 中间有不一致, 非纯追加.
       }
-      // 条件满足: 追加 newIds[existingIds.length .. end].
+      // 条件满足: 在 placeholder 前插入新轮次 (placeholder 必须始终在末尾).
+      const placeholder = container.querySelector(':scope > .drawer-placeholder');
       const appendStart = existingIds.length;
       const html = timelineRecords
         .slice(appendStart)
         .map((r, i) => renderTimelineRound(r, appendStart + i))
         .join('');
-      container.insertAdjacentHTML('beforeend', html);
+      if (placeholder) {
+        placeholder.insertAdjacentHTML('beforebegin', html);
+      } else {
+        container.insertAdjacentHTML('beforeend', html);
+      }
       // 只对新追加的轮次绑定折叠 (已有轮次的折叠状态不受影响).
       const allRounds = container.querySelectorAll(':scope > .tl-round');
       for (let i = appendStart; i < allRounds.length; i++) {
@@ -1948,13 +1966,16 @@
       }
       // 更新 header 的 round count.
       updateDetailHeader();
+      // overlay 架构下 #detail 高度固定, scrollTop 不需调整 — 用户视野自然保持.
       return true;
     }
 
-    // 更新 detail-header 的 round count (增量更新时 DOM 结构不变, 只需改文本).
+    // 更新 detail-header 的文本 (增量更新时 DOM 结构不变, 只需改文本).
     function updateDetailHeader() {
-      const header = document.querySelector('#detail > .detail-header .meta');
-      if (header) header.textContent = `(${timelineRecords.length} rounds)`;
+      const header = document.querySelector('#detail > .detail-header');
+      if (!header) return;
+      const userCount = timelineRecords.filter(isUserRound).length;
+      header.textContent = `Timeline (${timelineRecords.length} rounds${userCount > 0 ? `, ${userCount} user` : ''})`;
     }
 
     // applyBubbleCollapse 的单元素版本 (用于增量追加的新轮次).
@@ -2133,11 +2154,14 @@
     // 注意: 悬浮导航按钮 (.scroll-nav) 不在此处渲染 — 它是 #detail-wrap 的固定子元素
     // (article 的直接子, #detail 的兄弟), 不随 #detail 内容滚动 (issue #36).
     function renderTimelineHtml() {
+      const userCount = timelineRecords.filter(isUserRound).length;
       let html = `<div class="detail-header">
-        <h3>Timeline <span class="meta" style="font-weight:normal;">(${timelineRecords.length} rounds)</span></h3>
+        Timeline (${timelineRecords.length} rounds${userCount > 0 ? `, ${userCount} user` : ''})
       </div>`;
       // 每轮.
       html += timelineRecords.map((r, idx) => renderTimelineRound(r, idx)).join('');
+      // placeholder: 提供 phase 2 的滚动空间 (被 drawer overlay 遮挡, 用户不会看到空白).
+      html += `<div class="drawer-placeholder"></div>`;
       return html;
     }
 
@@ -2281,31 +2305,28 @@
       if (statusEl) statusEl.innerHTML = renderStatusLine(target);
     }
 
-    // 计算抽屉的 height, 使其上边缘跟随选中气泡的下边缘.
+    // 计算抽屉的 height (overlay 架构).
     //
-    // 布局: #detail-wrap (wrapH, 固定) 内 column-flex 分两栏:
-    //   #detail (flex:1, height = wrapH - drawerH, 滚动容器)
-    //   .response-drawer (flex:none, height = drawerH)
+    // 架构 (消除循环依赖):
+    //   #detail (height:100%=wrapH, 滚动容器) — 高度固定, 不依赖 drawerH.
+    //   .response-drawer (position:absolute, overlay) — 悬浮在 #detail 之上, 不影响 #detail 高度.
+    //   .drawer-placeholder (#detail 内末尾, height=extremeMaxH) — 提供 phase 4 滚动空间.
     //
-    // 循环依赖陷阱 (本修复的核心问题):
-    //   drawerH 影响 detailH (= wrapH - drawerH), detailH 又被旧代码用于判断气泡是否
-    //   在可视区 → 形成反馈循环 (drawer 变→detailH 变→判断结果变→drawer 变→...).
-    //   修复: 所有位置判断都用 wrap 坐标系 (固定参考), 不依赖 detailH.
+    // 因 detailH 固定 = wrapH, 所有元素位置是 scrollTop 的纯函数:
+    //   elementViewportY = elementOffsetTop - scrollTop
+    //   maxScroll = scrollHeight - wrapH (不依赖 drawerH)
+    // drawerH = f(scrollTop) 是纯函数, 无循环, 无死锁.
     //
-    // wrap 坐标系 (0 = wrap 顶部, wrapH = wrap 底部, 不随 drawerH 变化):
-    //   bubbleBottomY = 选中气泡下边缘在 wrap 中的 y (随 #detail 的 scrollTop 单调变化)
-    //   drawerTop     = wrapH - drawerH (抽屉上边缘在 wrap 中的 y)
-    //
-    // issue #36 规则 (用 bubbleBottomY 表达):
-    //   1. 选中瞬间: bubbleBottomY ≈ 0.7 * wrapH (气泡贴底, 下边缘对齐 30% 抽屉的上边缘).
-    //   2. 往上滚 (scrollTop↓, bubbleBottomY↑, 气泡下移): 抽屉随之收缩, 最小 10%.
-    //   3. 往下滚 (scrollTop↑, bubbleBottomY↓, 气泡上移): 抽屉随之扩大, 最大 40%.
-    //      → drawerH = wrapH - bubbleBottomY - GAP, clamp [minH, maxH].
-    //   4. 滚到最底: 抽屉直接扩展到 80% (下方无更多内容, 空间让给 response).
+    // 四阶段 (随 scrollTop 增大, 内容上移):
+    //   1. 选中气泡在视口下方 (bubbleBottomY > wrapH) → drawerH = defaultH (30%).
+    //   2. 气泡在视口内 (0 < bubbleBottomY <= wrapH) → drawerH = wrapH - bubbleBottomY - GAP,
+    //      clamp [minH, maxH]. 气泡上移 → drawerH 扩大.
+    //   3. 气泡滚出顶部, 内容仍填满视口 → drawerH = maxH (40%).
+    //   4. 滚入 placeholder (scrollTop 超过 contentEnd - wrapH) → drawerH 从 maxH 渐进扩展到
+    //      extremeMaxH (80%). progress 由 scrollTop 在 placeholder 区域中的比例决定.
     //
     // 边界 clamp 值 (全部相对 wrapH):
     const DRAWER_GAP = 8;       // 气泡下边缘与抽屉上边缘的间距 (px).
-    const DRAWER_SCROLL_TOLERANCE = 2; // 阶段2 atBottom 判断的 scrollTop 容差 (px).
     const DRAWER_MIN_RATIO = 0.10;
     const DRAWER_DEFAULT_RATIO = 0.30;
     const DRAWER_MAX_RATIO = 0.40;
@@ -2324,38 +2345,54 @@
       const maxH = wrapH * DRAWER_MAX_RATIO;
       const extremeMaxH = wrapH * DRAWER_EXTREME_MAX_RATIO;
 
-      // 选中气泡下边缘在 wrap 坐标系中的 y.
+      // 设置 placeholder 高度 (= extremeMaxH), 提供 phase 4 滚动空间.
+      const placeholder = detail.querySelector('.drawer-placeholder');
+      if (placeholder) placeholder.style.height = extremeMaxH + 'px';
+
+      // 选中气泡下边缘在 wrap 坐标系中的 y (随 scrollTop 单调变化).
       const bottomVp = selectedBubbleBottomVp();
       const bubbleBottomY = bottomVp === null ? null : bottomVp - wrapTop;
 
-      // 阶段 1: 基础高度 (跟随选中气泡, 不考虑极端扩展).
-      // bubbleBottomY 为 null (选中轮不在 timeline) → 默认; 否则 wrapH - y - GAP, clamp [minH, maxH].
-      //   - y 大 (气泡靠下/往下滚出) → wrapH - y 小 → 抽屉收缩 (规则 2).
-      //   - y 小 (气泡靠上/往上滚出) → wrapH - y 大 → 抽屉扩大, 但 clamp 到 maxH (规则 3).
-      let drawerHeight = bubbleBottomY === null
-        ? defaultH
-        : Math.max(minH, Math.min(maxH, wrapH - bubbleBottomY - DRAWER_GAP));
-
-      // 阶段 2: 极端扩展 (规则 4).
-      // 条件: 已滚到最底端 → 抽屉扩展到 extremeMaxH (80%).
-      //
-      // 循环依赖规避: atBottom 判断 (scrollTop + clientHeight >= scrollHeight) 中,
-      // clientHeight 随 drawerH 变化 (drawerH 大 → clientHeight 小 → 更容易 atBottom).
-      // 直接用会导致振荡 (扩展→clientHeight 变小→atBottom→扩展→...). 规避方法:
-      // 用"基准 detailH" (= wrapH - maxH, 即抽屉 40% 时的 detail 高度) 计算 maxScroll,
-      // 使 atBottom 判断不受当前 drawerH 影响.
-      //
-      // 多帧收敛 (scrollbar 瞬移场景): 若用户直接把 scrollbar 拖到底 (drawerH 此时可能还是
-      // 10%), 实际 scrollTop 被 clamp 到 10% 时的 maxScroll (< refMaxScroll) → phase 2 不触发.
-      // 但 phase 1 会把 drawerH 拉到 40% → detailH 缩 → maxScroll 增大 → 浏览器重发 scroll 事件
-      // → scrollTop 到达 refMaxScroll → phase 2 触发. 整个过程 2~3 帧内收敛.
-      const refMaxScroll = detail.scrollHeight - (wrapH - maxH);
-      if (detail.scrollHeight > wrapH - maxH + DRAWER_SCROLL_TOLERANCE &&
-          detail.scrollTop >= refMaxScroll - DRAWER_SCROLL_TOLERANCE) {
-        drawerHeight = extremeMaxH;
+      // Phase 1-2: 跟踪选中气泡.
+      let drawerHeight;
+      if (bubbleBottomY === null) {
+        drawerHeight = defaultH;
+      } else if (bubbleBottomY >= wrapH) {
+        // Phase 1: 气泡在视口下方 → 默认高度.
+        drawerHeight = defaultH;
+      } else if (bubbleBottomY > 0) {
+        // Phase 2: 气泡在视口内 → drawerH = wrapH - bubbleBottomY - GAP, clamp [minH, maxH].
+        drawerHeight = Math.max(minH, Math.min(maxH, wrapH - bubbleBottomY - DRAWER_GAP));
+      } else {
+        // bubbleBottomY <= 0: 气泡滚出顶部. 进入 phase 3 或 4.
+        // 计算 phase 3/4 边界: contentEnd = 末轮底部的 content offset (固定, 不随滚动变).
+        //   phase3ScrollEnd = contentEnd - wrapH (末轮底部贴视口底部时的 scrollTop).
+        //   scrollTop > phase3ScrollEnd → 用户开始滚入 placeholder → phase 4.
+        let contentEnd = detail.scrollHeight; // 含 placeholder
+        if (timelineRecords.length > 0) {
+          // 精确: 末轮底部 offset (不含 placeholder).
+          const lastRound = detail.querySelector(
+            `:scope > .tl-round[data-rid="${CSS.escape(timelineRecords[timelineRecords.length - 1].id)}"]`);
+          if (lastRound) {
+            contentEnd = lastRound.offsetTop + lastRound.offsetHeight;
+          }
+        }
+        const phase3ScrollEnd = contentEnd - wrapH;
+        if (detail.scrollTop <= phase3ScrollEnd) {
+          // Phase 3: 内容仍填满视口 → 保持 maxH.
+          drawerHeight = maxH;
+        } else {
+          // Phase 4: 滚入 placeholder → drawerH 从 maxH 渐进扩展到 extremeMaxH.
+          // placeholder 提供 extremeMaxH 的滚动空间. progress 按比例线性插值.
+          const phase4Range = extremeMaxH;
+          const progress = Math.min(1, (detail.scrollTop - phase3ScrollEnd) / phase4Range);
+          drawerHeight = maxH + (extremeMaxH - maxH) * progress;
+        }
       }
 
       drawer.style.height = drawerHeight + 'px';
+      // scroll-nav 的 bottom 同步到抽屉高度, 使底部按钮贴合滚动区域底端.
+      wrap.style.setProperty('--drawer-h', drawerHeight + 'px');
     }
 
     // 增量更新: 自动刷新时若 node 序列不变, 只刷抽屉内容 (流式渐进) + 重新计算布局.

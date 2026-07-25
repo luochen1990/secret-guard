@@ -153,22 +153,33 @@ timeline 每轮 header 含两个按钮:
 渲染在**同一个气泡**内, tool_call/tool_use 段用 `.bubble-tool-call` 子区域做视觉区分
 (边框 + 缩进 + monospace). 不拆分为多个独立气泡.
 
-### Response 抽屉 (issue #36)
+### Response 抽屉 (overlay 架构)
 
-Response 不再内嵌在轮次内, 而是独立的 `.response-drawer` (位于 `#detail-wrap` 的
-flex column 子元素, 与 `#detail` 上下分栏). 抽屉始终展示末轮的 response (尚未被任何
-delta 消费的部分). 其高度由 JS 根据**选中气泡在 wrap 坐标系 (固定参考) 中的位置**动态计算
-(不依赖 detailH, 避免循环依赖):
-- 选中瞬间: 气泡下边缘对齐 30% 抽屉上边缘 (wrapH * 0.7 处).
-- 往上滚 (气泡下移) → 抽屉收缩, 最小 10%.
-- 往下滚 (气泡上移) → 抽屉扩大, 最大 40%.
-- 滚到最底 → 抽屉扩展到 80% (下方无更多内容, 空间让给 response).
-抽屉与 `#detail` 分栏不遮挡对话内容. 详尽的循环依赖规避见
-`updateResponseDrawerLayout` 头部注释.
+Response 是独立的 `.response-drawer`, **悬浮**在 `#detail` 之上 (position:absolute overlay),
+而非 flex column 分栏. 抽屉始终展示末轮的 response (尚未被任何 delta 消费的部分).
 
-> **不变量**: `updateResponseDrawerLayout` 内的所有位置判断必须基于 wrap 坐标系
-> (`#detail-wrap`), **禁止**重新引入对 `#detail.clientHeight` 的依赖 — 它随 drawerH
-> 变化, 会重建循环依赖导致抽屉高度振荡.
+**架构核心** (消除循环依赖): `#detail` 高度固定 (= wrapH, 不依赖 drawerH).
+drawer overlay 不影响 #detail 的滚动空间. 因此:
+- `maxScroll = scrollHeight - wrapH` (不依赖 drawerH)
+- 所有元素位置 = `offsetTop - scrollTop` 的纯函数
+- `drawerH = f(scrollTop)` 是纯函数, 无循环, 无死锁
+
+**四阶段高度** (随 scrollTop 增大):
+1. 选中气泡在视口下方 → drawerH = 30% (默认).
+2. 气泡在视口内 → drawerH = wrapH - bubbleBottomY - GAP, clamp [10%, 40%].
+3. 气泡滚出顶部, 内容仍填满视口 → drawerH = 40% (maxH).
+4. 滚入 placeholder (末轮底部滚出视口) → drawerH 从 40% 渐进扩展到 80%.
+
+**placeholder**: `#detail` 末尾的 `.drawer-placeholder` (height = extremeMaxH = 80% wrapH)
+提供 phase 4 的滚动空间. 用户滚入时 drawer 已扩大遮挡它, 不暴露空白.
+
+**新 round 到来**: append-only 追加新轮次, `#detail` 高度不变, scrollTop 不变 →
+drawerH 不变 → 分配比例保持 (用户视野不受内容变化干扰).
+
+scroll-nav 的 bottom 同步到 drawerH, 使底部按钮贴合滚动区域底端.
+
+> **不变量**: `#detail` 高度必须固定 (= wrapH), **禁止**改为 `height: wrapH - drawerH`
+> 或引入 flex 分栏 — 那会重建循环依赖 (drawerH 影响 detailH 影响 maxScroll 影响 drawerH).
 
 ### 选中态高亮 (issue #36)
 
