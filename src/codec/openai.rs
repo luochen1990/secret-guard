@@ -428,7 +428,7 @@ impl Writer for OpenAiWriter {
                     }],
                 })
             }
-            IrStreamEvent::BlockStart { block, .. } => match block {
+            IrStreamEvent::BlockStart { index, block } => match block {
                 IrBlockMeta::Text => {
                     // OpenAI 流的 text block start 是隐式的: 第一个 text delta chunk 自带 content.
                     // 这里返回 None 避免发出空 chunk (与 BlockStop 同样跳过).
@@ -439,7 +439,8 @@ impl Writer for OpenAiWriter {
                         "index": 0,
                         "delta": {
                             "tool_calls": [{
-                                "index": 0,
+                                // 用 IR block index 作为 oai tool_call index (非硬编码 0, 否则并行 call 会被客户端聚合).
+                                "index": index,
                                 "id": id,
                                 "type": "function",
                                 "function": {"name": name, "arguments": ""},
@@ -449,7 +450,7 @@ impl Writer for OpenAiWriter {
                     }]
                 }),
             },
-            IrStreamEvent::BlockDelta { delta, .. } => match delta {
+            IrStreamEvent::BlockDelta { index, delta } => match delta {
                 IrDelta::TextDelta(text) => json!({
                     "choices": [{
                         "index": 0,
@@ -462,7 +463,7 @@ impl Writer for OpenAiWriter {
                         "index": 0,
                         "delta": {
                             "tool_calls": [{
-                                "index": 0,
+                                "index": index,
                                 "function": {"arguments": args},
                             }]
                         },
@@ -1755,6 +1756,163 @@ mod tests {
             usage: IrUsage::default(),
         };
         assert!(writer().write_response_event(&ev).is_none());
+    }
+
+    // ─── 多 tool_call 流式: index 唯一性 (回归测试) ──────────────────────
+    //
+    // 历史 bug: writer 硬编码 tool_calls[].index=0, 多个并行 tool_call 的 delta
+    // 被客户端按 index 聚合成 1 个. 修复后用 IR block index 区分.
+
+    #[test]
+    fn stream_two_tool_calls_must_have_distinct_oai_indices() {
+        // 构造 IR 事件序列: 两个独立的 ToolUse block (ir_idx 1 和 2),
+        // 模拟 reader 解析上游 "并行 2 个 tool_call" 的场景.
+        let events = vec![
+            IrStreamEvent::MessageStart {
+                usage: None,
+                id: Some("chatcmpl-x".into()),
+                created: Some(1),
+                model: Some("gpt-test".into()),
+            },
+            IrStreamEvent::BlockStart {
+                index: 1,
+                block: IrBlockMeta::ToolUse {
+                    id: "call_a".into(),
+                    name: "get_weather".into(),
+                },
+            },
+            IrStreamEvent::BlockStart {
+                index: 2,
+                block: IrBlockMeta::ToolUse {
+                    id: "call_b".into(),
+                    name: "get_time".into(),
+                },
+            },
+            IrStreamEvent::BlockDelta {
+                index: 1,
+                delta: IrDelta::InputJsonDelta("{\"city\":\"SF\"}".into()),
+            },
+            IrStreamEvent::BlockDelta {
+                index: 2,
+                delta: IrDelta::InputJsonDelta("{}".into()),
+            },
+        ];
+
+        // 收集所有 chunk 里 tool_calls[].index (直接用 BTreeSet 去重).
+        let mut seen_indices = std::collections::BTreeSet::new();
+        for ev in &events {
+            if let Some((_, chunk)) = writer().write_response_event(ev)
+                && let Some(choices) = chunk.get("choices").and_then(Value::as_array)
+            {
+                for ch in choices {
+                    if let Some(tcs) = ch
+                        .get("delta")
+                        .and_then(|d| d.get("tool_calls"))
+                        .and_then(Value::as_array)
+                    {
+                        for tc in tcs {
+                            if let Some(idx) = tc.get("index").and_then(Value::as_u64) {
+                                seen_indices.insert(idx);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            seen_indices.len() >= 2,
+            "multiple tool_calls must have distinct oai indices, got: {seen_indices:?}"
+        );
+    }
+
+    #[test]
+    fn stream_text_plus_two_tool_calls_ir_idx_not_starting_from_zero() {
+        // 混合场景: 先 text block (ir_idx=1) 再两个 tool blocks (ir_idx=2,3).
+        // 验证: 即使 oai tool_call index 不从 0 起始 (这里是 2 和 3),
+        // 客户端仍能按 index 正确关联 BlockStart 与 BlockDelta.
+        // (OpenAI 协议未规定 index 必须从 0 起始或连续, index 是关联 key 而非位置序号.)
+        let events = vec![
+            IrStreamEvent::BlockStart {
+                index: 1,
+                block: IrBlockMeta::Text,
+            },
+            IrStreamEvent::BlockDelta {
+                index: 1,
+                delta: IrDelta::TextDelta("thinking...".into()),
+            },
+            IrStreamEvent::BlockStart {
+                index: 2,
+                block: IrBlockMeta::ToolUse {
+                    id: "call_a".into(),
+                    name: "task".into(),
+                },
+            },
+            IrStreamEvent::BlockStart {
+                index: 3,
+                block: IrBlockMeta::ToolUse {
+                    id: "call_b".into(),
+                    name: "task".into(),
+                },
+            },
+            IrStreamEvent::BlockDelta {
+                index: 2,
+                delta: IrDelta::InputJsonDelta("{\"d\":\"A\"}".into()),
+            },
+            IrStreamEvent::BlockDelta {
+                index: 3,
+                delta: IrDelta::InputJsonDelta("{\"d\":\"B\"}".into()),
+            },
+        ];
+
+        // 按 oai index 收集每个 tool_call 的 arguments delta, 验证 index→args 映射正确.
+        let mut args_by_index: std::collections::BTreeMap<u64, String> = Default::default();
+        for ev in &events {
+            if let Some((_, chunk)) = writer().write_response_event(ev)
+                && let Some(choices) = chunk.get("choices").and_then(Value::as_array)
+            {
+                for ch in choices {
+                    if let Some(tcs) = ch
+                        .get("delta")
+                        .and_then(|d| d.get("tool_calls"))
+                        .and_then(Value::as_array)
+                    {
+                        for tc in tcs {
+                            let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0);
+                            if let Some(args) = tc
+                                .get("function")
+                                .and_then(|f| f.get("arguments"))
+                                .and_then(Value::as_str)
+                            {
+                                args_by_index.entry(idx).or_default().push_str(args);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 两个不同的 tool index, 且各自 arguments 正确归属.
+        assert_eq!(
+            args_by_index.len(),
+            2,
+            "expected 2 distinct tool_call indices, got: {args_by_index:?}"
+        );
+        // ir_idx=2 → args A; ir_idx=3 → args B (证明 index 关联正确, 未被混到一起).
+        let (idx_a, idx_b) = {
+            let mut keys: Vec<_> = args_by_index.keys().copied().collect();
+            keys.sort();
+            (keys[0], keys[1])
+        };
+        assert!(
+            args_by_index[&idx_a].contains('A'),
+            "idx {idx_a} should have args A"
+        );
+        assert!(
+            args_by_index[&idx_b].contains('B'),
+            "idx {idx_b} should have args B"
+        );
+        assert!(idx_a != idx_b);
     }
 
     // ─── Image block: 多模态唯一通路 (read + write) ─────────────────────

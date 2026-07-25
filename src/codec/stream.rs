@@ -681,8 +681,11 @@ pub fn reframe_sse(event_type: &str, data: &serde_json::Value) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::{Protocol, anthropic::AnthropicReader, openai::OpenAiReader};
+    use crate::codec::{
+        Protocol, anthropic::AnthropicReader, openai::OpenAiReader, openai::OpenAiWriter,
+    };
     use proptest::prelude::*;
+    use serde_json::Value;
 
     // ─── find_frame_terminator ─────────────────────────────────────────
 
@@ -898,6 +901,81 @@ mod tests {
         assert!(
             events.len() >= 2,
             "should have at least MessageStart + BlockStart + BlockDelta"
+        );
+    }
+
+    /// 回归测试: OpenAI 同协议 reader→writer 端到端, 多个并行 tool_call 的 oai
+    /// index 必须保持唯一 (历史 bug: writer 硬编码 index=0 导致 N 个 tool_call
+    /// 被客户端聚合成 1 个).
+    #[test]
+    fn openai_same_proto_multi_tool_call_preserves_distinct_indices() {
+        use crate::codec::Reader;
+        use crate::codec::Writer;
+        use crate::codec::ir::StreamDecodeState;
+
+        let reader = OpenAiReader;
+        let writer = OpenAiWriter;
+        let mut state = StreamDecodeState::default();
+
+        // chunk 1: 开始两个 tool_call (index 0 和 1)
+        let chunk1 = serde_json::json!({
+            "id": "chatcmpl-x", "created": 0, "model": "glm-5.2",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [
+                        {"index": 0, "id": "call_a", "type": "function",
+                         "function": {"name": "get_weather", "arguments": ""}},
+                        {"index": 1, "id": "call_b", "type": "function",
+                         "function": {"name": "get_time", "arguments": ""}}
+                    ]
+                },
+                "finish_reason": null
+            }]
+        });
+        // chunk 2: 两个 tool_call 各自的 arguments delta
+        let chunk2 = serde_json::json!({
+            "id": "chatcmpl-x", "created": 0, "model": "glm-5.2",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [
+                        {"index": 0, "function": {"arguments": "{\"city\":\"SF\"}"}},
+                        {"index": 1, "function": {"arguments": "{}"}}
+                    ]
+                },
+                "finish_reason": null
+            }]
+        });
+
+        // reader → events → writer → chunks
+        let mut seen_oai_indices = std::collections::BTreeSet::new();
+        for chunk in [&chunk1, &chunk2] {
+            let events = reader.read_response_events("", chunk, &mut state);
+            for ev in &events {
+                if let Some((_, out)) = writer.write_response_event(ev)
+                    && let Some(choices) = out.get("choices").and_then(Value::as_array)
+                {
+                    for ch in choices {
+                        if let Some(tcs) = ch
+                            .get("delta")
+                            .and_then(|d| d.get("tool_calls"))
+                            .and_then(Value::as_array)
+                        {
+                            for tc in tcs {
+                                if let Some(idx) = tc.get("index").and_then(Value::as_u64) {
+                                    seen_oai_indices.insert(idx);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            seen_oai_indices.len() >= 2,
+            "端到端: 两个并行 tool_call 经 reader→writer 后必须有 ≥2 个不同的 oai index, 实际: {seen_oai_indices:?}"
         );
     }
 
@@ -1292,9 +1370,10 @@ mod tests {
         ///
         /// 使用空 RedactionMap 的 same_proto_restore 模式 (redaction_map=None 短路 restore,
         /// 仅运行 reassembly + re-serialize 路径). StreamTranslate 的 translate_event 会
-        /// 把 MessageStart.id 剥离 (跨协议身份剥离), 由 ingress writer 合成新的
-        /// chatcmpl-<random> id, 因此输出含随机 id. 比较前用 normalize_id 把
-        /// `"id":"chatcmpl-..."` 统一替换为 `"id":"<normalized>"`, 消除随机性后做字节比较.
+        /// 把 MessageStart.id/created 剥离 (跨协议身份剥离), 由 ingress writer 合成新的
+        /// chatcmpl-<random> id 和当前 epoch (current_epoch, 取自 SystemTime::now()).
+        /// 因此输出含随机 id 和时敏 created. 比较前用 normalize_sse_volatile_fields 把
+        /// 这两类字段归一化 (详见函数注释), 消除差异后做字节比较.
         #[test]
         fn prop_stream_translate_chunk_split_equivalence(
             splits in proptest::collection::vec(0usize..2048, 1..=16)
@@ -1327,11 +1406,11 @@ mod tests {
                 chunked.extend_from_slice(&chunked_t.feed(&full[prev..]));
             }
             // 两者都未调用 finish (baseline 也没调用), 仅比较 feed 期间的累积输出.
-            // 消除随机 id 后字节级比较.
+            // 消除随机 id 和时敏 created 后字节级比较.
             let baseline_str = String::from_utf8_lossy(&baseline);
             let chunked_str = String::from_utf8_lossy(&chunked);
-            let baseline_norm = normalize_sse_id(&baseline_str);
-            let chunked_norm = normalize_sse_id(&chunked_str);
+            let baseline_norm = normalize_sse_volatile_fields(&baseline_str);
+            let chunked_norm = normalize_sse_volatile_fields(&chunked_str);
             prop_assert_eq!(
                 &baseline_norm, &chunked_norm,
                 "StreamTranslate chunk-boundary violation for splits {:?}\n\
@@ -1359,35 +1438,57 @@ mod tests {
         assert_eq!(baseline, chunked);
     }
 
-    /// 把 SSE 输出里的 `"id":"chatcmpl-<base62>"` 统一替换为 `"id":"<n>"`,
-    /// 消除 StreamTranslate translate_event 合成的随机 id, 使输出可做字节级比较.
+    /// 把 SSE 输出里两类 writer 合成的时敏/随机字段归一化, 使输出可做字节级比较:
     ///
-    /// 仅替换 chatcmpl- 前缀的 id (OpenAI writer 合成路径); 其他字段 (含可能的 UTF-8
-    /// content) 原样保留. 用 str::find + 切片操作, 避免逐字节 as char 破坏 UTF-8.
-    fn normalize_sse_id(input: &str) -> String {
-        const PREFIX: &str = "\"id\":\"chatcmpl-";
+    /// - `"id":"chatcmpl-<base62>"` → `"id":"<n>`  (OpenAI writer `synth_id` 每次随机)
+    /// - `"created":<digits>`       → `"created":<n>` (writer `current_epoch` 取自
+    ///   `SystemTime::now()`, baseline 与 chunked 两次 `.feed()` 间可能跨整秒边界)
+    ///
+    /// 两个前缀互不为子串, 不会在同一偏移同时命中, 因此分两趟独立 find-replace 语义等价且更清晰.
+    /// 仅替换 writer 合成路径产出的字段: chatcmpl- 前缀用于识别合成 id, 区分上游透传的业务 id
+    /// (如 fixture 的 `cmpl-x`); 其他字段 (含可能的 UTF-8 content) 原样保留.
+    /// 用 str::find + 切片, 避免逐字节 as char 破坏 UTF-8.
+    fn normalize_sse_volatile_fields(input: &str) -> String {
+        // Pass 1: `"id":"chatcmpl-<base62>"` → `"id":"<n>`.
+        // 假设: writer 用 synth_id 合成, base62 payload 不含 `"`.
+        // 不成立时 (截断 JSON 无闭合 `"`) 直接追加剩余, 不报错.
+        const ID_PREFIX: &str = "\"id\":\"chatcmpl-";
         let mut out = String::with_capacity(input.len());
         let mut rest = input;
-        while let Some(start) = rest.find(PREFIX) {
-            // 推入 PREFIX 之前的部分 + 归一化的前缀.
+        while let Some(start) = rest.find(ID_PREFIX) {
             out.push_str(&rest[..start]);
             out.push_str("\"id\":\"<n>");
-            // 跳过 PREFIX, 跳过 base62 部分直到下一个 '"'.
-            let after_prefix = &rest[start + PREFIX.len()..];
-            match after_prefix.find('"') {
-                Some(end) => {
-                    // end 是闭合 '"' 的位置, 保留它 (下一轮循环处理).
-                    rest = &after_prefix[end..];
-                }
+            let after = &rest[start + ID_PREFIX.len()..];
+            match after.find('"') {
+                // end 是闭合 '"' 的位置, 保留它交由下一轮处理.
+                Some(end) => rest = &after[end..],
                 None => {
-                    // 异常: 没有闭合 '"' (截断的 JSON), 直接追加剩余.
-                    out.push_str(after_prefix);
+                    out.push_str(after);
                     rest = "";
                     break;
                 }
             }
         }
         out.push_str(rest);
-        out
+
+        // Pass 2: `"created":<digits>` → `"created":<n>`.
+        // 假设: writer 序列化为 compact ASCII 数字 (json!(u64)), 不带空格.
+        // writer 契约保证 created 后必有 ≥1 数字, 此处 position 返回 Some(0) 不会发生;
+        // 即便发生, end=0 会让 rest 不推进 → 死循环. unwrap_or 兜底到 after.len() 避免之.
+        const CREATED_PREFIX: &str = "\"created\":";
+        let mut out2 = String::with_capacity(out.len());
+        let mut rest = out.as_str();
+        while let Some(start) = rest.find(CREATED_PREFIX) {
+            out2.push_str(&rest[..start]);
+            out2.push_str("\"created\":<n>");
+            let after = &rest[start + CREATED_PREFIX.len()..];
+            let end = after
+                .bytes()
+                .position(|b| !b.is_ascii_digit())
+                .unwrap_or(after.len());
+            rest = &after[end..];
+        }
+        out2.push_str(rest);
+        out2
     }
 }
