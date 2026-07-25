@@ -1607,18 +1607,31 @@
     }
 
     // 选中某一轮: 在右侧 timeline 中定位 + 高亮.
-    // 若该轮已在当前 timeline 视窗 → 滚动 + 高亮 (不重新渲染).
-    // 否则 → 以该轮为锚重新拉 timeline(TIMELINE_PAGE) 渲染.
+    // 三级优先 (避免不必要的网络请求):
+    //   1. 该轮已在当前 timeline → 直接滚动 + 高亮 (零开销).
+    //   2. 该轮在 sessionRounds 缓存中 → 从缓存填充 timelineRecords + reconcile (无网络).
+    //   3. 都不在 → 以该轮为锚重新拉 timeline (网络请求), reconcile 复用公共节点.
     async function selectRound(nodeId) {
       selectedRound = nodeId;
       renderSidebar();
-      // 若该轮已在当前 timeline 中, 直接滚动 + 高亮.
-      const existing = timelineRecords.find(r => r.id === nodeId);
-      if (existing && selectedSession) {
+      // 1. 已在当前 timeline 中 → 直接滚动 + 高亮.
+      if (selectedSession && timelineRecords.some(r => r.id === nodeId)) {
         highlightRound(nodeId);
         return;
       }
-      // 否则重新拉 timeline (以该轮为最末).
+      // 2. 在 sessionRounds 缓存中 → 从缓存填充 (避免网络请求).
+      if (selectedSession && sessionRounds.has(selectedSession)) {
+        const rounds = sessionRounds.get(selectedSession);
+        if (rounds.some(r => r.id === nodeId)) {
+          timelineRecords = rounds;
+          timelineOldest = rounds.length > 0 ? rounds[0].id : null;
+          timelineReachedTop = false;
+          renderTimeline();
+          highlightRound(nodeId);
+          return;
+        }
+      }
+      // 3. 都不在 → 重新拉 timeline (reconcile 会复用公共节点, 不全量刷新).
       await loadTimeline(nodeId);
     }
 
@@ -1803,7 +1816,7 @@
         // 不是 "当前窗口少于 limit". 短会话首屏即显示 "已经到顶了" 是误导 (Bug).
         // 只有 loadOlder 实际探测 parent 链耗尽后才置 true.
         timelineReachedTop = false;
-        renderTimeline(true);
+        renderTimeline();
         // 选中会话叶子 → 滚到最末轮 (最新, IM 风格).
         scrollTimelineToBottomForce();
       } catch (e) {
@@ -1859,7 +1872,7 @@
         // prepend: 把 older 放到 timelineRecords 前面.
         timelineRecords = older.concat(timelineRecords);
         timelineOldest = older[0].id;
-        renderTimeline(true);
+        renderTimeline();
         // 保持滚动锚点: 加载后把 scrollTop 加上新增的高度差.
         const newPane = document.querySelector('#detail');
         if (newPane) {
@@ -1876,25 +1889,19 @@
 
     // 渲染 timeline.
     //
-    // 三级策略 (优先用最小改动, 保护 scrollTop + DOM 局部状态):
+    // 两级策略 (优先用最小改动, 保护 scrollTop + DOM 局部状态):
     //   1. fingerprint 一致 (node id 序列 + selectedRound + reachedTop 不变):
     //      只刷 response body (流式渐进). DOM 结构不动, scrollTop 自然保持.
-    //   2. fingerprint 不一致但满足 append-only 条件 (旧序列是新序列的前缀):
-    //      只 insertAdjacentHTML 追加新轮次的 DOM. 已有轮次不碰, scrollTop + 气泡
-    //      展开/折叠状态全部保留. 这是本策略的核心 (issue: 自动刷新新轮次到来时
-    //      不再全量重建 → 不跳 scrollTop).
-    //   3. 不满足 append-only (序列中间插入/删除, 或 force=true): 全量重建 innerHTML.
-    //      scrollTop 由调用方恢复 (loadTimeline 滚到底, loadOlder 锚点补偿).
+    //   2. fingerprint 不一致: keyed reconciliation (按 data-rid 匹配新旧节点).
+    //      公共节点的 DOM 完全保留 (scrollTop + 气泡展开状态); 新节点插入;
+    //      消失的节点删除. 对所有变动模式 (append/prepend/replace/完全不同) 通用.
     //
-    // force=true: 用于 loadTimeline (新会话) / loadOlder (prepend 历史), 直接全量重建.
-    // force=false (默认): 自动刷新路径, 依次尝试 1→2→3.
-    //
-    // 为什么 append-only 安全 (不更新已有轮次的 request-pane DOM):
+    // 为什么 keyed reconciliation 安全 (不更新已有轮次的 request-pane DOM):
     //   .tl-round 的 request-pane 内容 (req_delta_messages / redactions 等) 在 push 时
     //   确定后不可变. header 里的 response 相关字段 (status/elapsed/streamed) 可变
     //   (push 时为初始值, response 到达后更新), 由 updateRoundHeaders() 定点刷新.
     //   末轮 response 在独立的 .response-drawer 中, 不在 .tl-round 内.
-    function renderTimeline(force) {
+    function renderTimeline() {
       const el = document.getElementById('detail');
       if (timelineRecords.length === 0) {
         lastTimelineFingerprint = '';
@@ -1904,78 +1911,94 @@
       // 指纹: node id 序列 + selectedRound + reachedTop.
       const fp = selectedRound + '|' + timelineReachedTop + '|' +
         timelineRecords.map(r => r.id).join(',');
-      if (!force && fp === lastTimelineFingerprint) {
+      if (fp === lastTimelineFingerprint) {
         // 策略 1: fingerprint 一致 → 只刷 response body (流式渐进).
         updateTimelineResponses();
         return;
       }
       lastTimelineFingerprint = fp;
 
-      // 策略 2: append-only 增量 (仅 force=false 时尝试).
-      if (!force && tryAppendNewRounds(el)) {
-        updateRoundHeaders();
-        updateResponseDrawerContent();
-        updateResponseDrawerLayout();
-        updateScrollNavVisibility();
-        return;
-      }
-
-      // 策略 3: 全量重建 (force=true 或 append-only 条件不满足).
-      el.innerHTML = renderTimelineHtml();
+      // 策略 2: keyed reconciliation.
+      reconcileTimelineRounds(el);
       bindTimelineScroll();
       bindRoundActions();
-      applyBubbleCollapse();
-      // 填充 Response 抽屉内容 + 计算布局 (issue #36).
+      updateDetailHeader();
+      // 填充 Response 抽屉内容 + 计算布局.
       updateResponseDrawerContent();
       updateResponseDrawerLayout();
-      // 滚动由调用方决定 (loadTimeline 滚到底, loadOlder 保持锚点).
-      // 这里仅在首次渲染 (selectedRound 在末尾) 时作为保底滚到底.
+      updateScrollNavVisibility();
     }
 
-    // append-only 增量: 检查 DOM 中已有的 .tl-round 序列是否是 timelineRecords 的前缀.
-    // 若是, 只追加新增的轮次; 若不是 (中间有删除/替换), 返回 false 让调用方走全量重建.
-    // 成功追加返回 true, 不满足条件返回 false.
-    function tryAppendNewRounds(container) {
-      const existing = container.querySelectorAll(':scope > .tl-round');
-      if (existing.length === 0) return false; // 无已有轮次 (首次渲染或全空), 走全量.
-      // 已有轮次的 data-rid 序列.
-      const existingIds = Array.from(existing).map(el => el.dataset.rid);
-      // timelineRecords 的 id 序列.
-      const newIds = timelineRecords.map(r => r.id);
-      // append-only 条件: existingIds 是 newIds 的严格前缀 (newIds 比 existingIds 长).
-      if (existingIds.length >= newIds.length) return false;
-      for (let i = 0; i < existingIds.length; i++) {
-        if (existingIds[i] !== newIds[i]) return false; // 中间有不一致, 非纯追加.
+    // keyed reconciliation: 按 data-rid 匹配新旧 .tl-round, 最小化 DOM 操作.
+    //
+    // 算法 (O(n+m), n=旧节点数, m=新记录数):
+    //   1. 收集 DOM 中已有的 .tl-round, 按 data-rid 索引.
+    //   2. 遍历 timelineRecords, 按 id 查找已有节点:
+    //      - 找到 → 复用 (保留 DOM + 局部状态), 插入到正确位置 (若需移动).
+    //      - 未找到 → 创建新节点, applyBubbleCollapseTo.
+    //   3. 遍历结束后, DOM 中未被复用的旧节点全部删除.
+    //   4. 确保 detail-header 在最前, drawer-placeholder 在最后.
+    //
+    // 对完全不同的会话 (零公共节点): 所有旧节点删、新节点建 ≈ 全量重建, 无额外开销.
+    // 对纯追加 (append): 旧节点全部复用, 末尾插入新节点, 等价于 append-only.
+    function reconcileTimelineRounds(container) {
+      // 确保 detail-header 存在.
+      let header = container.querySelector(':scope > .detail-header');
+      if (!header) {
+        header = document.createElement('div');
+        header.className = 'detail-header';
+        container.insertBefore(header, container.firstChild);
       }
-      // 条件满足: 在 placeholder 前插入新轮次 (placeholder 必须始终在末尾).
-      const placeholder = container.querySelector(':scope > .drawer-placeholder');
-      const appendStart = existingIds.length;
-      const html = timelineRecords
-        .slice(appendStart)
-        .map((r, i) => renderTimelineRound(r, appendStart + i))
-        .join('');
-      if (placeholder) {
-        placeholder.insertAdjacentHTML('beforebegin', html);
-      } else {
-        container.insertAdjacentHTML('beforeend', html);
+      // 确保 placeholder 存在.
+      let placeholder = container.querySelector(':scope > .drawer-placeholder');
+      if (!placeholder) {
+        placeholder = document.createElement('div');
+        placeholder.className = 'drawer-placeholder';
+        container.appendChild(placeholder);
       }
-      // 只对新追加的轮次绑定折叠 (已有轮次的折叠状态不受影响).
-      const allRounds = container.querySelectorAll(':scope > .tl-round');
-      for (let i = appendStart; i < allRounds.length; i++) {
-        applyBubbleCollapseTo(allRounds[i]);
-      }
-      // 更新 header 的 round count.
-      updateDetailHeader();
-      // overlay 架构下 #detail 高度固定, scrollTop 不需调整 — 用户视野自然保持.
-      return true;
-    }
 
-    // 更新 detail-header 的文本 (增量更新时 DOM 结构不变, 只需改文本).
-    function updateDetailHeader() {
-      const header = document.querySelector('#detail > .detail-header');
-      if (!header) return;
+      // 收集已有的 .tl-round (排除 header 和 placeholder).
+      const existingRounds = new Map();
+      container.querySelectorAll(':scope > .tl-round').forEach(el => {
+        existingRounds.set(el.dataset.rid, el);
+      });
+
+      // 用于追踪哪些旧节点被复用了 (未复用的将在最后删除).
+      const reused = new Set();
+      // 插入锚点: 新节点依次插入到 anchor 之前, anchor 初始为 placeholder.
+      let anchor = placeholder;
+
+      for (let i = 0; i < timelineRecords.length; i++) {
+        const r = timelineRecords[i];
+        let roundEl = existingRounds.get(r.id);
+        if (roundEl) {
+          // 复用已有节点.
+          reused.add(r.id);
+          // 若位置不对 (前面有其他节点), 移动到 anchor 前.
+          if (roundEl.nextElementSibling !== anchor && roundEl !== anchor.previousElementSibling) {
+            container.insertBefore(roundEl, anchor);
+          }
+          anchor = roundEl;
+        } else {
+          // 创建新节点.
+          const wrapper = document.createElement('div');
+          wrapper.innerHTML = renderTimelineRound(r, i);
+          roundEl = wrapper.firstElementChild;
+          container.insertBefore(roundEl, anchor);
+          applyBubbleCollapseTo(roundEl);
+          anchor = roundEl;
+        }
+      }
+
+      // 删除未被复用的旧节点.
+      for (const [rid, el] of existingRounds) {
+        if (!reused.has(rid)) el.remove();
+      }
+
+      // header 更新 (round count + user count).
       const userCount = timelineRecords.filter(isUserRound).length;
       header.textContent = `Timeline (${timelineRecords.length} rounds${userCount > 0 ? `, ${userCount} user` : ''})`;
+      // placeholder 高度由 updateResponseDrawerLayout 设置.
     }
 
     // applyBubbleCollapse 的单元素版本 (用于增量追加的新轮次).
@@ -2413,7 +2436,7 @@
     }
 
     // 绑定 timeline 容器的滚动事件 (检测到顶 → loadOlder; 更新悬浮按钮可见性).
-    // 只绑定一次: flag 防止每次 renderTimeline(true) 累加新 listener.
+    // 只绑定一次: flag 防止每次 renderTimeline() 累加新 listener.
     //
     // 性能: updateResponseDrawerLayout 内有多次 getBoundingClientRect (强制 layout),
     // 若每个 scroll 事件都同步执行, 快速滚动时会连续触发 forced reflow → jank.
@@ -2603,10 +2626,6 @@
     //
     // EXPAND_THRESHOLD_LINES: 展开态最大行数 (~15 行). 与 CSS .chat-bubble.expanded 的 max-height 对齐.
     const EXPAND_THRESHOLD_LINES = 15;
-
-    function applyBubbleCollapse() {
-      applyBubbleCollapseTo(document.getElementById('detail'));
-    }
 
     // toggle 点击: collapsed ↔ expanded. 进入 expanded 时按需浮 "查看全文".
     function onBubbleToggle(bubble, toggle, expandThreshold) {
