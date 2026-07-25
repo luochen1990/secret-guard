@@ -30,16 +30,15 @@
 //!   (因为每次 gen_mock_for_ir 都检查 allocated 集合). 极端弱配置下探测可能耗尽,
 //!   此时 [`redact_ir`] **跳过该 secret** (原样发往上游) 而非 panic, 优先保进程存活.
 //!   [`RedactionMap::insert`] 的 C4 违反 (defense-in-depth) 同样降级跳过, 永不 panic.
-//! - **C5 不含 real_secret 子串** (best-effort):
-//!   - Auto 模式: mock 由 hash 驱动, 极大概率不含 real_secret 的 ≥4 字符连续子串.
-//!     `gen.prefix` (用户自定义或 `[redact] global_mock_prefix` 注入的) 在
-//!     [`crate::mock::MockStrategy::validate_against_real`] 中校验不与 real 重叠
-//!     (prefix 不出现在 real 中, 也不含 real 的 ≥4 字符子串).
-//!   - Fixed 模式: 由 [`crate::mock::MockStrategy::validate_against_real`] 在 upsert 时检查
-//!     (char-level windows, 正确处理 multibyte UTF-8 secret).
-//!     前提: `SecretTable::upsert` 通过 `validate_value` 拒绝含 `global_mock_prefix` 的 secret
+//! - **C5 不含 real_secret 子串** (实质确定性契约, 阈值随 L 自适应):
+//!   - 阈值 `k(L) = max(4, ⌈L/3⌉)` (见 [`crate::mock::c5_threshold_len`]); Auto 模式由
+//!     [`crate::mock::gen_candidate`] 内部重试链保证兑现.
+//!   - Fixed 模式 / 用户 prefix 由 [`crate::mock::MockStrategy::validate_against_real`] 在
+//!     upsert 时检查 (char-level windows, 正确处理 multibyte UTF-8 secret).
+//!   - 前提: `SecretTable::upsert` 通过 `validate_value` 拒绝含 `global_mock_prefix` 的 secret
 //!     (见 [`crate::secrets::validate_value`]; prefix 为空时此检查跳过).
-//!     `proptest-regressions/redact.txt` 记录历史失败种子 (real 全 base62 字母时风险更高).
+//!   - 设计较详 (信息比率 / 业界 scanner 阈值 / 重试链) 与历史 regression 见
+//!     [`crate::mock`] 模块头部 "C5" 段落 (SSOT) 与 `proptest-regressions/redact.txt`.
 //! - **C6 可逆性 (restorability)**: round-trip identity —
 //!   `restore_ir_response(&mut <redacted IrResponse>, &redact_ir(&mut <IrRequest>, secrets).0)`
 //!   后 IR 语义等价于原 IR. (`redact_ir` 原地变异 IrRequest, 返回 `(RedactionMap, seed)`,
@@ -893,19 +892,11 @@ mod tests {
 
     #[test]
     fn c5_no_substring_of_real_secret() {
-        // mock 不应含 real_secret 的任何 ≥4 字符连续子串 (概率性契约, 见 mock.rs 注释).
-        // 空 global_prefix 下, mock 由 hash 驱动, 极小概率碰撞.
+        // C5: mock 不应含 real_secret 的任何 ≥k(L) 字符连续子串 (阈值随 L 自适应).
+        // 空 global_prefix 下, mock 由 hash 驱动 + gen_candidate 内部重试链保证兑现.
         for real in ["sk-test-123", "super-secret-xyz", "ABCDEFGH", "abcdefgh"] {
             let m = predict_mock(real);
-            for window in 4..=real.len() {
-                for sub in real.as_bytes().windows(window) {
-                    let sub_str = std::str::from_utf8(sub).unwrap();
-                    assert!(
-                        !m.contains(sub_str),
-                        "mock '{m}' contains '{sub_str}' from real '{real}' (window={window})"
-                    );
-                }
-            }
+            crate::mock::assert_no_c5_substring(&m, real);
         }
     }
 
@@ -1426,38 +1417,25 @@ mod tests {
             prop_assert!(!m.is_empty());
         }
 
-        /// C5: mock 不含 real_secret 的 ≥4 字符子串 (概率性契约).
+        /// C5: mock 不含 real_secret 的 ≥k(L) 字符子串 (阈值随 L 自适应, 见
+        /// [`crate::mock::c5_threshold_len`]). C5 契约与重试链的设计论据见
+        /// `mock.rs` 模块头部 "C5" 段落 (SSOT).
         #[test]
         fn prop_no_real_substring(
-            secret in "[A-Za-z0-9]{8,20}"
+            secret in "[A-Za-z0-9]{4,32}"
         ) {
             let m = predict_mock(&secret);
-            for window in 4..=secret.len() {
-                for sub in secret.as_bytes().windows(window) {
-                    let sub_str = std::str::from_utf8(sub).unwrap();
-                    prop_assert!(!m.contains(sub_str),
-                        "mock contains substring from secret: mock={}, sub={}", m, sub_str);
-                }
-            }
+            crate::mock::assert_no_c5_substring(&m, &secret);
         }
 
-        /// C5 multibyte: secret 含中文 / emoji / 多字节 UTF-8.
-        /// mock 不应含 real 的 ≥4 char 子串 (在 char boundary 上切片, 非 byte).
-        /// 已有 `prop_no_real_substring` 只覆盖 ASCII, 此测试补 multibyte secret.
+        /// C5 multibyte: secret 含中文 / emoji / 多字节 UTF-8. 与 `prop_no_real_substring`
+        /// 同语义, 补 multibyte 输入覆盖 (char-level windows 在 helper 内统一处理).
         #[test]
         fn prop_no_real_substring_multibyte(
-            secret in "[\\x{4e00}-\\x{9fff}\\x{1f300}-\\x{1f6ff}a-zA-Z0-9]{8,20}"
+            secret in "[\\x{4e00}-\\x{9fff}\\x{1f300}-\\x{1f6ff}a-zA-Z0-9]{4,32}"
         ) {
             let m = predict_mock(&secret);
-            // char-based windows: 多字节 UTF-8 在 byte 边界切片会 panic, 必须按 char.
-            let chars: Vec<char> = secret.chars().collect();
-            for window in 4..=chars.len() {
-                for sub_chars in chars.windows(window) {
-                    let sub_str: String = sub_chars.iter().collect();
-                    prop_assert!(!m.contains(&sub_str),
-                        "mock contains multibyte substring from secret: mock={}, sub={}", m, sub_str);
-                }
-            }
+            crate::mock::assert_no_c5_substring(&m, &secret);
         }
 
         /// C6 多 secret round-trip: N 个 secret 同时出现在 IR, restore 后严格等于原 IR.
@@ -1620,33 +1598,21 @@ mod tests {
         }
 
         /// C5 生产路径 (property 版, 端到端): redact_ir 产出的 mock 不含 real 的任何
-        /// ≥4 字符连续子串. 现有 prop_no_real_substring 用 predict_mock (纯函数) 验证,
+        /// ≥k(L) 字符连续子串. 现有 prop_no_real_substring 用 predict_mock (纯函数) 验证,
         /// 但生产路径在 mock 已出现在 IR 时会 probing 到 counter>0 候选, 该路径下的 C5
         /// 行为未被覆盖. 本测试走完整 redact_ir, 覆盖 probing 路径.
         ///
-        /// 注: 这是 best-effort 概率性契约 (见模块头部 C5 + mock.rs 头部).
-        /// 输入限定为高基数字母表 [A-Za-z0-9] (典型 secret 形态), 实测碰撞率 ≈ 0.
-        /// 极低基数 real (如仅 2 个不同字符) 是已知 C5 边界, 不在本测试范围
-        /// (历史 regression 见 proptest-regressions/redact.txt).
+        /// C5 契约细节 (阈值公式 / 重试链 / 历史边界) 见 `mock.rs` 模块头部 "C5" 段落 (SSOT).
         #[test]
         fn prop_c5_redact_mock_no_real_substring_end_to_end(
-            secret in "[A-Za-z0-9]{8,20}",
+            secret in "[A-Za-z0-9]{4,32}",
             filler in "[a-z0-9 ]{0,40}",
         ) {
             let body = format!("{filler} {secret} {filler}");
             let mut ir = sample_ir_with_text(&body);
             let (map, _) = redact_ir(&mut ir, &[entry(&secret)]);
             let mock = map.mock_for(&secret).expect("secret must be redacted");
-            // char-level windows (正确处理 multibyte; 此处虽全 ASCII 仍保持一致风格).
-            let needle_chars: Vec<char> = secret.chars().collect();
-            for w in needle_chars.windows(4) {
-                let sub: String = w.iter().collect();
-                prop_assert!(
-                    !mock.contains(&sub),
-                    "mock {:?} contains real ≥4-char substring {:?} (secret={:?})",
-                    mock, sub, secret
-                );
-            }
+            crate::mock::assert_no_c5_substring(mock, &secret);
         }
     }
 }

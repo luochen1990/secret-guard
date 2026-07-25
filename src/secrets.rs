@@ -236,8 +236,8 @@ pub fn validate_id(id: &str) -> Result<(), String> {
 /// (避免 redact 时破坏整个请求 body 或 round-trip identity).
 ///
 /// `global_mock_prefix` 来自 `[redact] global_mock_prefix` (默认空串). 若非空且 real
-/// secret 含此 prefix, 则 mock 可能与 real 共享 ≥4 字符子串违反 C5, 故拒绝.
-/// 空串时此检查跳过 (空 prefix 不产生冲突).
+/// secret 含此 prefix, 则 mock 可能与 real 共享 ≥`k(L)` 字符子串违反 C5, 故拒绝
+/// (k(L) 见 [`crate::mock::c5_threshold_len`]). 空串时此检查跳过 (空 prefix 不产生冲突).
 pub fn validate_value(value: &str, global_mock_prefix: &str) -> Result<(), String> {
     if value.len() < 3 {
         return Err(format!(

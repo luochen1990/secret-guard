@@ -281,8 +281,13 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
 
 - **跨协议 + 流式响应**: OpenAI ⇄ Anthropic 跨协议时 `stream=true` 返回 501
   (StreamTranslate 已实现跨协议翻译, 但尚未接入 dispatch).
-- **C5 是概率性契约**: Auto 模式 mock 极大概率不含 real_secret ≥4 字符子串
-  (碰撞概率 ≈ 2^-32). `proptest-regressions/redact.txt` 记录历史失败种子.
+- **C5 是实质确定性契约**: Auto 模式 mock 不含 real_secret ≥`k(L)` 字符子串
+  (`k(L) = max(4, ⌈L/3⌉)`, 随 secret 长度自适应 — 短 secret 强保护, 长 secret 弱保护,
+  信息泄露率上界 ~36%). gen_candidate 内置 10000 次确定性内部重试链
+  (`C5_INTERNAL_RETRIES = 10_000`, safety bound), `(1e-5)^10000 = 1e-50000` 远超宇宙原子数,
+  因此 C5 在 Auto 模式下实质等价于确定性契约.
+  设计论据 (信息论 + 业界 secret scanner 阈值) 见 `src/mock.rs` 头部 "C5" 段落 (SSOT).
+  `proptest-regressions/redact.txt` 记录历史失败种子.
 - **同协议 + Redact 失去 byte-exact**: reader → redact_ir → writer 重序列化, 字段顺序 /
   空字符串归一化可能让 wire 字节略变, 但语义等价. 同协议 + 无 Redact 路径仍 byte-exact.
 - **流式 + Redact + 非 2xx 上游错误**: SSE 错误流不是单个 JSON, parse 失败时 fallback

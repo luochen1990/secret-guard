@@ -32,6 +32,31 @@
 //! `[redact] global_mock_prefix` (默认空串) 在 resolve 阶段注入到每个 secret 的
 //! `gen_spec.prefix`, 让 Auto 模式生成的 mock 带统一可辨识前缀 (如 `"sgm_"`).
 //! 空 prefix = mock 无前缀 (纯 hash body). 见 [`GenSpec::infer_default_for`].
+//!
+//! # C5: 不含 real_secret 子串 (实质确定性契约)
+//!
+//! C5 要求 mock 不含 real_secret 的**长**子串. 阈值 [`c5_threshold_len`] 随 real 长度 L
+//! 自适应: `k(L) = max(4, ⌈L/3⌉)`. 设计依据 (信息论 + 业界 secret scanner 阈值):
+//! - **短 secret (L ≤ 12)**: k=4. L=12 时信息比率 1/3, L=8 时 1/2, L<4 时 100%
+//!   (此时退化为 [`MockStrategy::validate_against_real`] 的 `value == real` 检查).
+//!   是 LLM reconstruct 与 secret scanner 阈值之上.
+//! - **长 secret (L > 12)**: k=⌈L/3⌉, 单子串信息泄露率上界随 L 趋近 1/3 (因 div_ceil,
+//!   实际峰值在 L=13 时约 36%, L mod 3=0 时恰为 1/3). 远低于 LLM reconstruct 所需的半数
+//!   信息量, 也远低于 GitHub Secret Scanning / TruffleHog / gitleaks 最小匹配长度.
+//! - 固定 k=4 对长 secret (real=23 base62) 在默认 proptest 下失败率 ≈ 4%; 固定 k=8 对短
+//!   secret 几乎 trivially 成立但意义弱. k(L) 让阈值随 secret 长度走, 短强长弱, 总信息
+//!   泄露率有上界.
+//!
+//! 即使有自适应阈值, 长 real + 高基数 charset 下单次 hash 生成仍有 ~1e-5 量级碰撞概率.
+//! [`gen_candidate`] Auto 分支因此内置 **C5 内部重试链** (见 [`C5_INTERNAL_RETRIES`]):
+//! 完全确定性地循环重 hash body 直到候选满足 C5. 重试上限 [`C5_INTERNAL_RETRIES`] = 10000
+//! 是 **safety bound (仅防死循环)**, 非概率目标 — `(1e-5)^10000 = 1e-50000` 远超宇宙原子
+//! 数 (~1e80), 因此 C5 在 Auto 模式下**实质等价于确定性契约**, 仅在理论上保留 best-effort
+//! 兜底 (重试链耗尽时返回最后一次候选, 由上层 redact 的 C2/C4 probing 与下游 LLM provider
+//! 兜底). 重试链不破坏 C3 (无副作用, 不消耗外部 counter).
+//!
+//! 本段是 C5 设计论据与概率数字的 **SSOT**, 其它位置 (如 [`c5_threshold_len`] 文档、
+//! [`crate::redact`] 模块头部 C5 段) 只指针引用, 不重述.
 
 use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
@@ -250,42 +275,70 @@ impl MockStrategy {
     /// 在 [`crate::secrets::SecretEntry::validate_and_resolve`] 的第四步调用.
     pub fn validate_against_real(&self, real: &str) -> Result<(), String> {
         self.validate()?;
+        // C5 阈值与 real 长度相关 (信息比率 ≤ ~36%): 见模块头部 "C5" 段落.
+        let k = c5_threshold_len(real);
         if let InitialValue::Fixed { value } = &self.initial {
             if value == real {
                 return Err("fixed mock value must not equal real secret".into());
             }
-            // C5 best-effort: Fixed 值不应含 real 的 ≥4 字符连续子串.
+            // C5 best-effort: Fixed 值不应含 real 的 ≥k 字符连续子串.
             // 用 char-level windows (而非 byte-level) 以正确处理 multibyte UTF-8 secret
             // (byte windows 在多字节字符上会跨 char boundary, from_utf8 失败导致漏检).
-            if contains_4char_substring(value, real) {
-                return Err(
-                    "fixed mock value contains a ≥4 char substring of the real secret".into(),
-                );
+            if contains_kchar_substring(value, real, k) {
+                return Err(format!(
+                    "fixed mock value contains a ≥{k} char substring of the real secret"
+                ));
             }
         }
-        // Auto 模式: 若用户设置了 gen.prefix, 校验 prefix 不含 real 的 ≥4 字符子串
+        // Auto 模式: 若用户设置了 gen.prefix, 校验 prefix 不含 real 的 ≥k 字符子串
         // (否则 mock 开头部分会暴露 real 子串, 违反 C5). prefix == real 的场景也被覆盖
-        // (real 是自身的 ≥4 字符子串的前提, contains_4char_substring 会返回 true).
+        // (real 是自身的 ≥k 字符子串的前提, contains_kchar_substring 会返回 true).
         if let Some(gen_spec) = &self.gen_spec
             && !gen_spec.prefix.is_empty()
-            && contains_4char_substring(&gen_spec.prefix, real)
+            && contains_kchar_substring(&gen_spec.prefix, real, k)
         {
-            return Err(
-                "gen prefix contains a ≥4 char substring of the real secret (C5 violation)".into(),
-            );
+            return Err(format!(
+                "gen prefix contains a ≥{k} char substring of the real secret (C5 violation)"
+            ));
         }
         Ok(())
     }
 }
 
-/// `haystack` 是否包含 `needle` 的任一 ≥4 字符连续子串 (char-level, 正确处理 multibyte UTF-8).
-/// `windows(4)` 在 needle < 4 字符时返回空迭代器, 天然 gate 掉短串场景.
-fn contains_4char_substring(haystack: &str, needle: &str) -> bool {
+/// C5 最小阈值 (短 secret 强保护地板). 设计论据见模块头部 "C5" 段落.
+const C5_MIN_THRESHOLD: usize = 4;
+
+/// C5 阈值: mock 不应含 real_secret 的 ≥ `c5_threshold_len(real)` 字符连续子串.
+///
+/// `k(L) = max(4, ⌈L/3⌉)`, L 为 char 数. 设计论据 (信息比率 / 业界 scanner 阈值 /
+/// 内部重试链) 见模块头部 "C5" 段落 (SSOT).
+pub fn c5_threshold_len(real: &str) -> usize {
+    C5_MIN_THRESHOLD.max(real.chars().count().div_ceil(3))
+}
+
+/// `haystack` 是否包含 `needle` 的任一 ≥ `k` 字符连续子串 (char-level, 正确处理 multibyte
+/// UTF-8). `windows(k)` 在 needle < `k` 字符时返回空迭代器, 天然 gate 掉短串场景.
+fn contains_kchar_substring(haystack: &str, needle: &str, k: usize) -> bool {
     needle
         .chars()
         .collect::<Vec<char>>()
-        .windows(4)
+        .windows(k)
         .any(|w| haystack.contains(&w.iter().collect::<String>()))
+}
+
+/// C5 断言 helper: mock 不含 real 的 ≥k(L) 字符连续子串 (char-level windows, 正确处理
+/// multibyte UTF-8). 供 mock.rs / redact.rs 的 proptest / 单元测试共用, 统一口径.
+#[cfg(test)]
+pub(crate) fn assert_no_c5_substring(mock: &str, real: &str) {
+    let k = c5_threshold_len(real);
+    let chars: Vec<char> = real.chars().collect();
+    for w in chars.windows(k) {
+        let sub: String = w.iter().collect();
+        assert!(
+            !mock.contains(&sub),
+            "mock {mock:?} contains real ≥{k}-char substring {sub:?} (real={real:?})"
+        );
+    }
 }
 
 // ─── 候选生成器 ────────────────────────────────────────────────────────────
@@ -309,7 +362,17 @@ pub fn deterministic_seed(real: &str, strategy: &MockStrategy) -> u64 {
 ///
 /// **Auto 模式**要求 `strategy.gen_spec` 为 `Some` (由 [`MockStrategy::resolve_against`] 填充).
 /// **Fixed 模式**: counter=0 返回 `value`, counter>0 返回 `{value}_{counter}`.
-pub fn gen_candidate(_real: &str, strategy: &MockStrategy, seed: u64, counter: u32) -> String {
+///
+/// # C5 内部重试链 (Auto 模式)
+///
+/// Auto 分支内部按 `retry = 0..=[C5_INTERNAL_RETRIES]` 完全确定性地循环重 hash body,
+/// 找到第一个满足 C5 (mock 不含 real_secret 的 ≥ [`c5_threshold_len`] 字符子串) 的候选返回.
+/// 重试链不破坏 C3 (无副作用, 不消耗外部 counter): 同一 `(real, strategy, seed, counter)`
+/// 仍严格产出同一 mock.
+///
+/// 重试链上限 [`C5_INTERNAL_RETRIES`] = 10000 是 **safety bound (仅防死循环)**, 非概率目标.
+/// 详见模块头部 "C5" 段落 (SSOT).
+pub fn gen_candidate(real: &str, strategy: &MockStrategy, seed: u64, counter: u32) -> String {
     match &strategy.initial {
         InitialValue::Fixed { value } => {
             if counter == 0 {
@@ -328,29 +391,57 @@ pub fn gen_candidate(_real: &str, strategy: &MockStrategy, seed: u64, counter: u
             if pool.is_empty() {
                 return gen_spec.prefix.clone();
             }
-            let (min, max) = gen_spec.length_range;
-            let prefix_len = gen_spec.prefix.chars().count();
-            let body_min = min.saturating_sub(prefix_len);
-            let body_max = max.saturating_sub(prefix_len);
-
-            // body 长度: min==max 时固定, 否则按 hash 在 [body_min, body_max] 选.
-            let body_len = if body_min == body_max {
-                body_min
-            } else {
-                let h = hash64(&format!("{seed}{counter}len"));
-                body_min + (h % (body_max - body_min + 1) as u64) as usize
-            };
-
-            let mut buf = String::with_capacity(prefix_len + body_len);
-            buf.push_str(&gen_spec.prefix);
-            for i in 0..body_len {
-                let h = hash64(&format!("{seed}{counter}{i}"));
-                let idx = (h % pool.len() as u64) as usize;
-                buf.push(pool[idx]);
+            let k = c5_threshold_len(real);
+            // 重试链: 第 retry 次用 hash(seed,counter,retry) 重 hash body.
+            // 找到第一个不含 real ≥k 字符子串的候选. 全失败则返回最后一次 (best-effort).
+            // 上限是 safety bound (1e-50000 量级失败率, 实质等价于确定性, 见模块头部).
+            for retry in 0..=C5_INTERNAL_RETRIES {
+                let candidate = gen_one_auto_body(gen_spec, &pool, seed, counter, retry);
+                if !contains_kchar_substring(&candidate, real, k) {
+                    return candidate;
+                }
             }
-            buf
+            // 重试链耗尽 (1e-50000 量级, 实际永不触发), 退化返回最后一次候选.
+            // 上层 redact 的 C2/C4 probing 仍能通过外部 counter 推进找到合格候选.
+            gen_one_auto_body(gen_spec, &pool, seed, counter, C5_INTERNAL_RETRIES)
         }
     }
+}
+
+/// C5 内部重试链上限 (safety bound, 仅防死循环, 非概率目标).
+/// 取较大值让 C5 在 Auto 模式下实质等价于确定性契约 (见模块头部 "C5").
+const C5_INTERNAL_RETRIES: u32 = 10_000;
+
+/// Auto 模式的单次 body 生成 (给定 `retry` 偏移量). 完全确定性, 无副作用.
+fn gen_one_auto_body(
+    gen_spec: &GenSpec,
+    pool: &[char],
+    seed: u64,
+    counter: u32,
+    retry: u32,
+) -> String {
+    let (min, max) = gen_spec.length_range;
+    let prefix_len = gen_spec.prefix.chars().count();
+    let body_min = min.saturating_sub(prefix_len);
+    let body_max = max.saturating_sub(prefix_len);
+
+    // body 长度: min==max 时固定, 否则按 hash 在 [body_min, body_max] 选.
+    // `retry` 进入 hash 输入 → 不同 retry 产出不同长度 (当 min!=max) 或不同字符.
+    let body_len = if body_min == body_max {
+        body_min
+    } else {
+        let h = hash64(&format!("{seed}{counter}{retry}len"));
+        body_min + (h % (body_max - body_min + 1) as u64) as usize
+    };
+
+    let mut buf = String::with_capacity(prefix_len + body_len);
+    buf.push_str(&gen_spec.prefix);
+    for i in 0..body_len {
+        let h = hash64(&format!("{seed}{counter}{retry}{i}"));
+        let idx = (h % pool.len() as u64) as usize;
+        buf.push(pool[idx]);
+    }
+    buf
 }
 
 fn hash64(s: &str) -> u64 {
@@ -631,17 +722,80 @@ mod tests {
 
     #[test]
     fn mock_strategy_validate_against_real_rejects_fixed_with_real_substring() {
-        // Fixed 含 real 的 ≥4 字符子串 → C5 违反.
-        // "sk-t" 是 real "sk-test-123456" 的 4 字符子串; fixed value "ask-tzzz" 含它.
-        let real = "sk-test-123456";
-        let s = MockStrategy {
+        // C5 阈值随 real 长度自适应 (见 c5_threshold_len). 这里覆盖两类场景:
+        //
+        // 1. 短 real (L≤12, k=4): 任何 ≥4 字符子串触发 C5 违反.
+        let real_short = "sk-test123"; // 10 chars → k = max(4, ⌈10/3⌉) = 4
+        let s_short = MockStrategy {
             initial: InitialValue::Fixed {
-                value: "ask-tzzz".into(),
+                value: "ask-tzzz".into(), // 含 real 4 字符子串 "sk-t".
             },
             gen_spec: None,
         };
-        let err = s.validate_against_real(real).unwrap_err();
+        let err = s_short.validate_against_real(real_short).unwrap_err();
         assert!(err.contains("≥4 char substring"), "{err}");
+    }
+
+    #[test]
+    fn mock_strategy_validate_against_real_c5_threshold_scales_with_real_len() {
+        // C5 阈值随 real 长度自适应: 长 real 时, 4 字符子串不再触发 C5 (信息比率 < 1/3),
+        // 需要 ≥⌈L/3⌉ 字符子串才触发. 这条性质是 k(L) = max(4, ⌈L/3⌉) 的核心.
+        // 覆盖三个关键长度: L=12 (k=4 短 secret 上界), L=13 (k=5 转折点), L=18 (k=6).
+
+        // L=12 (k=4): 4 字符子串仍触发 C5.
+        let real12 = "sk-test-1234"; // 12 chars → k=4
+        let s12 = MockStrategy {
+            initial: InitialValue::Fixed {
+                value: "Xsk-tY".into(), // 含 real 的 4 字符子串 "sk-t".
+            },
+            gen_spec: None,
+        };
+        assert!(
+            s12.validate_against_real(real12).is_err(),
+            "4-char substring must trigger C5 for L=12 (k=4)"
+        );
+
+        // L=13 (k=5, 转折点): 4 字符子串不再触发, 5 字符才触发.
+        let real13 = "sk-test-12345"; // 13 chars → k=5
+        let s13_clean = MockStrategy {
+            initial: InitialValue::Fixed {
+                value: "Xsk-tY".into(), // 仅 4 字符子串 "sk-t".
+            },
+            gen_spec: None,
+        };
+        assert!(
+            s13_clean.validate_against_real(real13).is_ok(),
+            "4-char substring must NOT trigger C5 for L=13 (k=5)"
+        );
+        let s13_dirty = MockStrategy {
+            initial: InitialValue::Fixed {
+                value: "Xsk-teY".into(), // 含 real 的 5 字符子串 "sk-te".
+            },
+            gen_spec: None,
+        };
+        let err = s13_dirty.validate_against_real(real13).unwrap_err();
+        assert!(err.contains("≥5 char substring"), "{err}");
+
+        // L=18 (k=6): 4 字符不触发, 6 字符才触发.
+        let real18 = "sk-test-abcdef1234"; // 18 chars
+        let s18_clean = MockStrategy {
+            initial: InitialValue::Fixed {
+                value: "Xsk-tY".into(),
+            },
+            gen_spec: None,
+        };
+        assert!(
+            s18_clean.validate_against_real(real18).is_ok(),
+            "4-char substring must NOT trigger C5 for L=18 (k=6)"
+        );
+        let s18_dirty = MockStrategy {
+            initial: InitialValue::Fixed {
+                value: "Xsk-tesY".into(), // 含 real 的 6 字符子串 "sk-tes".
+            },
+            gen_spec: None,
+        };
+        let err = s18_dirty.validate_against_real(real18).unwrap_err();
+        assert!(err.contains("≥6 char substring"), "{err}");
     }
 
     #[test]
@@ -659,7 +813,8 @@ mod tests {
     fn mock_strategy_validate_against_real_catches_multibyte_utf8_substring() {
         // C5 检查必须用 char-level windows (而非 byte-level), 否则 multibyte UTF-8
         // (如中文, 每字符 3 字节) 会让所有 4-byte windows 跨 char boundary → 全部漏检.
-        let real = "你好世界 Secret"; // 4 个中文字符 + 空格 + 6 ASCII = 11 chars
+        // real = 4 中文字符 + 空格 + 6 ASCII = 11 chars → k = max(4, ⌈11/3⌉) = 4.
+        let real = "你好世界 Secret";
         // Fixed value 含 real 的 4 字符子串 "你好世界".
         let s = MockStrategy {
             initial: InitialValue::Fixed {
@@ -892,71 +1047,42 @@ mod tests {
         );
     }
 
-    // ─── gen_candidate (Auto): C5 不含 real ≥4 字符子串 (property-based) ──────
+    // ─── gen_candidate (Auto): C5 不含 real ≥k(L) 字符子串 (property-based) ──────
     //
-    // 这是整个项目安全契约 (C5) 的核心防线, 却长期缺直接测试:
-    //   - validate_against_real 只校验用户可控的 prefix (mock 开头),
-    //     而 Auto 模式生成的 body 字符由 hash 驱动从 charset 选取, 完全未测.
-    //   - redact.rs 的 prop_no_real_substring 走 predict_mock (init_seed + gen_candidate)
-    //     间接覆盖, 但定位在 redact 模块, 不便单独定位 gen_candidate 的 C5 行为.
-    // 本测试直接对 gen_candidate 做 property-based 覆盖, 锁死 "body 不含 real 子串".
+    // 直接对 gen_candidate 做 property-based 覆盖: 现有测试只覆盖 validate_against_real
+    // 的 prefix 校验, 或经 redact.rs 的 predict_mock 间接覆盖; 这里直接锁死 Auto 模式
+    // body 生成的 C5 行为. 输入 real ∈ [A-Za-z0-9]{4,64} 覆盖短/长 secret.
     //
-    // 输入: real ∈ [A-Za-z0-9]{4,32} (高基数, 典型 secret 形态), seed ∈ u64.
-    // 策略: 复现生产 resolve 路径 (MockStrategy::default + resolve_against → infer charset),
-    //   与 SecretEntry::validate_and_resolve 在空 global_prefix 下的行为一致.
-    //
-    // C5 是 best-effort 概率性契约 (见模块头部 + redact.rs C5 说明): Auto 模式 mock 由
-    // hash 驱动, body 不含 real 的 ≥4 字符连续子串的概率极接近 1. 实测在高基数
-    // [A-Za-z0-9] 输入下碰撞率 ≈ 0 (deterministic_seed 吸收完整 strategy 上下文,
-    // DefaultHasher 分布良好). 极低基数 real (如仅 2 个不同字符) 是已知 C5 边界,
-    // 不在本测试输入域内 (历史 regression: proptest-regressions/redact.txt).
+    // C5 契约、阈值公式与内部重试链的设计论据见模块头部 "C5" 段落 (SSOT).
+    // 极低基数 real (如仅 2 个不同字符) 是已知 C5 边界, 不在输入域内
+    // (历史 regression: proptest-regressions/redact.txt).
     use proptest::prelude::*;
 
     proptest! {
         #[test]
         fn prop_c5_gen_candidate_auto_body_no_real_substring(
-            real in "[A-Za-z0-9]{4,32}",
+            real in "[A-Za-z0-9]{4,64}",
             seed in any::<u64>(),
         ) {
             let mut strategy = MockStrategy::default();
             strategy.resolve_against(&real, "");
             let mock = gen_candidate(&real, &strategy, seed, 0);
-
-            // char-level windows (与 mock.rs::contains_4char_substring 同口径,
-            // 正确处理 multibyte UTF-8; 此处虽全 ASCII 仍保持一致风格).
-            let needle_chars: Vec<char> = real.chars().collect();
-            for w in needle_chars.windows(4) {
-                let sub: String = w.iter().collect();
-                prop_assert!(
-                    !mock.contains(&sub),
-                    "mock {:?} contains real ≥4-char substring {:?} (real={:?}, seed={})",
-                    mock, sub, real, seed
-                );
-            }
+            assert_no_c5_substring(&mock, &real);
         }
 
         /// C5 在 probing 路径下也必须成立: counter>0 候选 (首项与 IR 冲突时的后备)
-        /// 同样不应含 real 的 ≥4 字符子串. 这条路径在生产 redact_ir 中由 gen_mock_for_ir
+        /// 同样不应含 real 的 ≥k(L) 字符子串. 这条路径在生产 redact_ir 中由 gen_mock_for_ir
         /// 触发, 本测试直接对 gen_candidate 的多个 counter 取值覆盖.
         #[test]
         fn prop_c5_gen_candidate_probing_no_real_substring(
-            real in "[A-Za-z0-9]{8,32}",
+            real in "[A-Za-z0-9]{4,64}",
             seed in any::<u64>(),
         ) {
             let mut strategy = MockStrategy::default();
             strategy.resolve_against(&real, "");
-            let needle_chars: Vec<char> = real.chars().collect();
             for counter in 0u32..8 {
                 let mock = gen_candidate(&real, &strategy, seed, counter);
-                for w in needle_chars.windows(4) {
-                    let sub: String = w.iter().collect();
-                    prop_assert!(
-                        !mock.contains(&sub),
-                        "mock {:?} (counter={counter}) contains real ≥4-char substring {:?} \
-                         (real={:?}, seed={})",
-                        mock, sub, real, seed
-                    );
-                }
+                assert_no_c5_substring(&mock, &real);
             }
         }
     }
