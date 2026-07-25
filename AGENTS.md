@@ -176,10 +176,11 @@ Secret / Provider 的两种 value 来源 (`value`/`value_file`、`api_key`/`api_
 # 一次性环境
 nix develop --impure      # 进入 devShell
 
-# 一键 check (fmt + clippy + machete + nextest + doctest)
+# 一键 check (fmt + clippy + machete + nextest)
+# 注: doctest 当前禁用 (唯一 doctest 被 ignored), 需要时在 justfile 取消注释.
 just check
 
-# 一键 check 含覆盖率插桩 (CI 用, 会先 cargo clean target/debug 控制磁盘峰值)
+# 一键 check 含覆盖率插桩 (CI 用)
 just check --coverage
 
 # 覆盖率报告 (HTML 写到 coverage/html/, 需在 devShell 内)
@@ -204,12 +205,15 @@ CI 配置在 `.forgejo/workflows/ci.yml`, 触发条件: `push` + `pull_request` 
 `workflow_dispatch`. 去重逻辑: PR 事件总是跑; push 仅 master 跑.
 
 CI 流程 (测试集只跑一次):
-1. **Check + coverage data**: `just check --coverage` (fmt + clippy + machete + doctest + 测试,
+1. **Check + coverage data**: `just check --coverage` (fmt + clippy + machete + 测试,
    用 `cargo llvm-cov nextest` 插桩).
 2. **Coverage gate**: `just coverage-gate` (只做 report, 读上一步 profdata, 不重跑测试).
 
-**磁盘峰值控制**: forgejo-runner-vm 根文件系统是 tmpfs (~3.9GB). `just check --coverage`
-在 coverage 编译前 `cargo clean` 释放 `target/debug`, 实测峰值降到 ~1.4GB.
+**跨 job target 复用**: CI job 设 `CARGO_TARGET_DIR=/var/lib/forgejo-runner/cache/cargo-target`,
+指向 runner VM 的持久 tmpfs 卷 (宿主侧 10G tmpfs + virtiofs 共享, 见 nixos 仓库
+`forgejo-runner-vm.mod.nix`). 跨 job 复用 cargo 编译产物: 依赖 crate 只编一次, 后续 job
+增量编译 (秒级). clippy/nextest 用 `debug/` 子目录, coverage 用 `llvm-cov-target/` 子目录,
+物理隔离无需 `cargo clean`. 卷生命周期 = 主机启动期间 (tmpfs, 主机重启才丢).
 
 **commit status context**: `ci / check (pull_request)` 或 `ci / check (push)`
 (workflow `name: ci` + job_id `check`; **禁止改 workflow name 或 job_id** — 会改变

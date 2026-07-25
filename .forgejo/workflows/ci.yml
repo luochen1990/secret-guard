@@ -34,9 +34,13 @@ jobs:
     timeout-minutes: 20
     # cargo-llvm-cov 依赖 llvm-cov / llvm-profdata (rust toolchain 不含). VM 的 systemPackages
     # 落 /run/current-system/sw/bin (NixOS 约定), job 级 env 让两个 step 共享, 无需各自 export.
+    #
+    # CARGO_TARGET_DIR 指向 runner VM 的持久卷, 跨 job 复用编译产物.
+    # 完整机制 (卷生命周期 / 子目录隔离 / 串行保证) 见 AGENTS.md "CI" 段.
     env:
       LLVM_COV: /run/current-system/sw/bin/llvm-cov
       LLVM_PROFDATA: /run/current-system/sw/bin/llvm-profdata
+      CARGO_TARGET_DIR: /var/lib/forgejo-runner/cache/cargo-target
     steps:
       - name: Checkout via SSH
         env:
