@@ -107,6 +107,11 @@
 已实践位置: `web::api::extract_preview_and_model` (preview 提取),
 `dag::extract_delta_messages` (delta 切片), `index.html::toolNameOfRound` (tool name 推断).
 
+> **例外 — DAG 核心数据结构不用 best-effort**: `dag::BlockPool::intern` 的 collision check
+> 用 `assert!` (非 `debug_assert!`), release 也 panic. 理由: collision 属哈希函数 bug,
+> 静默覆盖会让两个不同 block 共享 hash 引发难定位的数据损坏, panic 是更优选择. 详见
+> **CDAG-6** 契约 (`docs/design/contracts.md` §6).
+
 ### 视图正确性确保机制 (View-Correctness Discipline) → VIEW-* 契约
 
 当用视图 / 引用 / 派生字段替代原始数据存储 (典型场景: 内存优化、去重、lazy 派生) 时:
@@ -118,9 +123,12 @@
 3. **原始数据是核心功能的真相**: secret-guard 的核心职责是转发 + Redact 的字节准确性.
    任何"派生视图更优雅"的诱惑都不能凌驾于数据准确性之上.
 
-已实践位置: `redactions` 字段从 RedactionMap 派生 (`web/api.rs`)、
-`resp_parsed` 从 StreamScan 累积 (`proxy.rs`). 后续 Phase B 删除 parent.response 时
-必须走此流程.
+已实践位置: `redactions` 字段从 RedactionMap 派生 (`proxy.rs::assert_redactions_match_map`)、
+`preview`/`model` 从 `req_body_raw` 派生 (`proxy.rs::assert_preview_model_match_source`)、
+`resp_parsed` (非流式) 从上游响应字节经 codec reader 派生 (`proxy.rs::assert_resp_parsed_matches_source_nonstream`)、
+`session.title` 从 root node preview 派生 (`dag.rs::assert_session_title_matches_root_preview`)、
+`resp_parsed` (流式) 从 StreamScan 累积 (`proxy.rs`, Phase A 已删除原始 SSE 字节, 派生与源物理分离, 暂不守卫).
+后续 Phase B 删除 parent.response 时必须走此流程.
 
 ### C3 前缀缓存友好性 (经济性契约) → RED-3 契约
 
@@ -186,6 +194,7 @@ URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标
 | 模块 | 职责 (一句话) | 详尽契约位置 |
 |---|---|---|
 | `main.rs` / `cli.rs` / `lib.rs` | 二进制入口 + CLI 参数 schema | 文件头部 `//!` |
+| `auth/` | OIDC 登录 (WebUI) + 本地 API key (SDK 转发) + session | `auth/mod.rs` 头部 `//!` |
 | `config.rs` | 双层配置 schema + `DynamicTable<T>` 泛型 + 持久化 | 文件头部 `//!` (覆盖 OverrideMode / CRUD / Effective source / 跨表并发) |
 | `provider.rs` | Provider 实体 + Effective view + api_key 两来源 | 文件头部 `//!` |
 | `secrets.rs` | SecretEntry 实体 + Effective view + value 两来源 | 文件头部 `//!` |
@@ -305,6 +314,7 @@ client = Anthropic(
 | Property-based | `proptest` | `redact::tests::prop_round_trip_identity` |
 | 集成 (端到端) | `mockito` + `axum::serve` | `tests/integration.rs::forwards_streaming_sse` |
 | WebUI 回归 | Playwright (TypeScript) | `tests/webui/im-ui.spec.ts` (守卫前端不变量 I1/I2) |
+| 性能基线 | criterion | `benches/redact.rs` (redact_ir / StreamingRestorer 3 场景) |
 | 覆盖率 | cargo-llvm-cov (LLVM source-based) | `just coverage-html` |
 
 `mockito::Matcher` 在 1.x 没有 `String` 变体, 用 `Exact` 或 `Json` / `PartialJson`.
@@ -375,8 +385,11 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
 - **更多协议**: Gemini / Ollama / Bedrock / Cohere / OpenAI Responses API.
   新增协议只需实现 Reader + Writer trait (~200 行), 不动 dispatch.
 - **redact 性能优化**: `redact_ir` 与 `StreamingRestorer::find_safe_end` 对每个 secret
-  做全字符串扫描 (K * n 复杂度). 长期用 Aho-Corasick 多模式匹配.
-- **redact 测试基线**: criterion bench 测典型场景, 留作回归基线.
+  做全字符串扫描 (K * n 复杂度). 长期用 Aho-Corasick 多模式匹配. 性能基线见
+  `just bench` (criterion, 3 场景 × 2 目标, 详尽设计见 `benches/redact.rs` 头部).
 - mock_secret 的 category-aware 默认生成 (Password/ApiKey/Cookie 等格式感知).
 - 配置热加载; 测试覆盖率自动上报 + fuzzing (cargo-fuzz).
 - Web UI 编辑 provider 时保留 api_key (改用 `null` 表示不更新).
+- **依赖升级** (滞后是稳态, 非风险; Cargo.lock 锁定保证可复现构建; 触发条件满足时再升):
+  rand 0.8→0.9 / sha2 0.10→0.11 / tower-sessions 0.14→0.15 / reqwest 0.12→0.13,
+  触发条件 = CVE / 解 duplicate / 需要 feature.

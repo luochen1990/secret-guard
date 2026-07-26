@@ -149,3 +149,31 @@ jobs:
       # 只做 report (读上一步的 profdata), 不重跑测试.
       - name: Coverage gate
         run: just coverage-gate
+
+      # 文件长度门禁: 防止单文件失控膨胀 (拆分 ROI 为负时的早期预警).
+      # 轻量 (find + wc), 不依赖编译产物, 放最后作为补充守卫.
+      - name: File size gate
+        run: just check-file-size
+
+      # WebUI 回归测试 (Playwright 端到端).
+      # webServer 自动启动 mock upstream + secret-guard, 复用上一步编译的 debug binary
+      # (CARGO_TARGET_DIR 指向持久卷, playwright.config.ts 读此环境变量).
+      #
+      # 初期 continue-on-error: true — Playwright 在 CI 环境 (无 GPU / chromium 渲染稳定性)
+      # 可能有 flake, 不阻塞合并. 稳定后改为阻塞.
+      #
+      # 前置 (forgejo-runner-vm.mod.nix 的 VM systemPackages 已含 playwright-test nodejs python3):
+      # 见 ~/ws/nixos/private/pubserv/forgejo-runner-vm.mod.nix (此 PR 不改 nixos 仓库,
+      # 假设 VM 已含所需工具 — 如果 VM 缺工具, 此 step 会失败但 continue-on-error 不阻塞).
+      - name: WebUI regression (Playwright)
+        continue-on-error: true
+        run: just check-webui
+
+      # cargo audit: 监控依赖 CVE (项目处理 API key/token/密码, 安全敏感).
+      # 工具: cargo-audit (devShell 已含; VM 通过 host-sw-bin fallback 提供).
+      #
+      # continue-on-error: true: 新 CVE 出现时不应阻塞正在进行的 PR (由维护者单独处理).
+      # 数据库 advisory DB 拉取可能因网络抖动失败, 也不应阻塞.
+      - name: cargo audit (CVE scan)
+        continue-on-error: true
+        run: just audit

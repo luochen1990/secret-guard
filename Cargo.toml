@@ -49,6 +49,12 @@ tokio-test = "0.4"
 mockito = "1"
 pretty_assertions = "1"
 proptest = "1"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# redact 性能基线 bench. 详尽设计见 benches/redact.rs 头部.
+[[bench]]
+name = "redact"
+harness = false
 
 [profile.release]
 opt-level = 3

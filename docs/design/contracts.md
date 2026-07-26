@@ -382,10 +382,10 @@
 
 **陈述**: BlockPool hash collision (概率 ~2^-64) 必须被检测且不静默覆盖. 检测方式可以是 panic (debug) / log+skip (release) / runtime Result, 但**绝不能**静默覆盖导致数据损坏.
 
-> **理想 vs 现状**: 当前实现仅 `debug_assert` 检查, release 静默覆盖. 需升级.
+> **实现**: `BlockPool::intern` 用 `assert!` (非 `debug_assert!`) 比对 hash 命中时的 block 内容, 不一致即 panic. 选择 panic 而非 log+skip: collision 属哈希函数 bug, 一旦真发生宁可暴露也不要静默继续 (静默会让两个不同 block 共享 hash, 引发难定位的数据损坏).
 
 **Properties**:
-- `prop_collision_detected_in_release`: release build 下 hash collision 也被检测 (不静默覆盖).
+- `prop_collision_detected_in_release`: release build 下 hash collision 也被检测 (不静默覆盖). ✅ `assert!` 在 release 也运行.
 
 ### CDAG-7 孤儿节点可识别
 
@@ -646,12 +646,12 @@
 
 | 派生字段 | 来源 | 守卫状态 |
 |---|---|---|
-| `redactions` | RedactionMap | ✅ 已守卫 |
-| `resp_parsed` (流式) | StreamScan snapshot | 待补 |
-| `resp_parsed` (非流式) | reader.read_response | 待补 |
-| `preview` / `model` | extract_preview_and_model | 待补 |
+| `redactions` | RedactionMap | ✅ `proxy.rs::assert_redactions_match_map` |
+| `preview` / `model` | extract_preview_and_model | ✅ `proxy.rs::assert_preview_model_match_source` |
+| `resp_parsed` (非流式) | reader.read_response | ✅ `proxy.rs::assert_resp_parsed_matches_source_nonstream` |
+| `resp_parsed` (流式) | StreamScan snapshot | ⏳ Phase A 已删除原始 SSE 字节, 派生与源物理分离, 暂无法守卫 |
 | `req_delta_messages` | extract_delta_messages | (每次 timeline 请求重算, 无 drift 风险) |
-| `session.title` | find_root_title | 待补 |
+| `session.title` | find_root_title | ✅ `dag.rs::assert_session_title_matches_root_preview` |
 
 **Properties**:
 - `prop_each_derived_field_has_consistency_check`: 上表中每个"待补"字段最终都有 consistency-check 断言.
@@ -695,17 +695,17 @@
 **陈述**: 自动刷新触发 timeline 更新时, 公共节点的 DOM 完全保留 (scrollTop + 气泡展开状态), 仅新节点插入 / 消失节点删除.
 
 **Properties**:
-- `prop_reconcile_preserves_scrolltop`: 自动刷新前后 scrollTop Δ < 10px.
-- `prop_reconcile_preserves_bubble_expand_state`: 已展开的气泡在 reconcile 后仍展开.
-- `prop_reconcile_correct_for_all_change_modes`: keyed reconciliation 对 append/prepend/replace/完全不同 四种变动模式都正确.
+- `prop_reconcile_preserves_scrolltop`: 自动刷新前后 scrollTop Δ < 10px. ✅ `im-ui.spec.ts` "需求 1 (B1/B2 根治)".
+- `prop_reconcile_preserves_bubble_expand_state`: 已展开的气泡在 reconcile 后仍展开. ⏳ 测试待补.
+- `prop_reconcile_correct_for_all_change_modes`: keyed reconciliation 对 append/prepend/replace/完全不同 四种变动模式都正确. ⏳ 仅 append (I3 守卫) + replace (切换会话) 覆盖, prepend/完全不同 待补.
 
 ### UI-5 末轮 response 独立 drawer
 
 **陈述**: response 渲染为独立的 `.response-drawer` (overlay 架构), 不在 `.tl-round` 内. `#detail` 高度必须固定 (= wrapH), 禁止改为 `height: wrapH - drawerH` 或引入 flex 分栏.
 
 **Properties**:
-- `prop_detail_height_fixed`: `#detail` height == wrapH, 不依赖 drawerH.
-- `prop_drawer_overlay_not_in_round`: response drawer DOM 不在 `.tl-round` 子树内.
+- `prop_detail_height_fixed`: `#detail` height == wrapH, 不依赖 drawerH. ⏳ 测试待补 (现有 drawer phase 测试间接覆盖, 但未直接断言 height 不变).
+- `prop_drawer_overlay_not_in_round`: response drawer DOM 不在 `.tl-round` 子树内. ✅ `im-ui.spec.ts` "需求 3: response 抽屉固定底部" 间接覆盖.
 
 ---
 

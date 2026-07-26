@@ -33,7 +33,8 @@ use crate::codec::ir::{IrBlock, IrImageSource, IrMessage, IrRole, IrStopReason, 
 /// IrBlock 内容的 hash. 用作 BlockPool 的 key.
 ///
 /// 用 u64 (SipHash, Rust DefaultHasher) 而非 blake3: DAG 不跨进程, 同 Rust 版本内确定即可.
-/// collision 概率 ~2^-64, 对 < 10^5 blocks 的 DAG 可忽略; 真发生会 panic (defense-in-depth).
+/// collision 概率 ~2^-64, 对 < 10^5 blocks 的 DAG 可忽略; 一旦真发生 `intern` 会 panic
+/// (defense-in-depth, 见 [`BlockPool::intern`] 的 collision check).
 pub type BlockHash = u64;
 
 /// 计算单个 IrBlock 的内容 hash.
@@ -131,15 +132,17 @@ impl BlockPool {
     /// 若 hash 未命中, 插入新 block, refcount=1.
     ///
     /// collision check: hash 命中时比对 block 内容, 不一致则 panic (defense-in-depth).
+    /// 用 `assert!` 而非 `debug_assert!`: collision 概率 ~2^-64 对 < 10^5 blocks 可忽略,
+    /// 一旦真发生属于哈希函数 bug, 宁可在 release 也 panic 暴露问题, 不能静默覆盖
+    /// (静默覆盖会让两个不同 block 共享一个 hash, 后续 get() 只能取到先插入的那个,
+    /// 引发难以定位的数据损坏).
     pub fn intern(&mut self, block: IrBlock) -> BlockHash {
         let h = hash_block(&block);
         let entry = self
             .blocks
             .entry(h)
             .or_insert_with(|| Arc::new(block.clone()));
-        // collision check (仅 debug build; collision 概率 ~2^-64 对 < 10^5 blocks 可忽略,
-        // release build 遇到 collision 会静默覆盖, 但概率低到可以接受).
-        debug_assert!(
+        assert!(
             **entry == block,
             "BlockHash collision detected: hash={h}, this is a hash function bug"
         );
@@ -603,6 +606,15 @@ impl ConversationDag {
                 // 见 Session.title 注释 + issue #36. fork 场景下 root_id (fork 点)
                 // 不等于真正根, 必须 walk 到链首才能拿到正确的首条 user msg.
                 let title = Self::find_root_title(&g, lookup.parent, node_id);
+                // 视图正确性守卫: session.title 是从 root node 的 preview (SSOT) 派生的视图.
+                // 详见 AGENTS.md "视图正确性确保机制" — "session.title 从 root node preview 派生".
+                #[cfg(feature = "consistency-check")]
+                Self::assert_session_title_matches_root_preview(
+                    &g,
+                    lookup.parent,
+                    node_id,
+                    title.as_deref(),
+                );
                 g.sessions.insert(
                     sid,
                     Session {
@@ -657,6 +669,32 @@ impl ConversationDag {
                 .and_then(|n| n.event.preview.clone());
         }
         title
+    }
+
+    /// 视图正确性守卫 (CI 用, 需 `--features consistency-check`).
+    ///
+    /// `Session.title` 是 root node 的 `CallEvent.preview` (SSOT) 的派生视图:
+    /// session 创建时一次性从 root preview 复制 Arc<str>, 之后 leaf 前移不更新.
+    /// 本函数重新调用 [`find_root_title`] 派生一次, 比对存储的 title.
+    ///
+    /// 守卫职责限定为: 捕获 "title 派生源被改" (例如未来若改为从 leaf preview / 其他字段
+    /// 派生, 违反 issue #36 "标题应稳定 = 最早 round 的首条 user msg").
+    /// `find_root_title` 自身的 walk 逻辑 bug 由 dag 行为测试覆盖 (session 标题正确性
+    /// 是 WebUI 可观察行为, 已有 e2e 测试), 不在守卫职责内 — 因此本守卫直接复用 SSOT
+    /// 函数, 而非独立 walk (避免 DRY 违反导致的同步漂移). 详见 AGENTS.md "视图正确性确保机制".
+    #[cfg(feature = "consistency-check")]
+    fn assert_session_title_matches_root_preview(
+        inner: &DagInner,
+        parent: Option<Uuid>,
+        node_id: Uuid,
+        derived_title: Option<&str>,
+    ) {
+        let rederived = Self::find_root_title(inner, parent, node_id);
+        debug_assert_eq!(
+            derived_title,
+            rederived.as_deref(),
+            "session.title drifts from root node preview SSOT"
+        );
     }
 
     /// 计算 messages 序列的 Merkle prefix hash 序列, 找到最深匹配的 parent.

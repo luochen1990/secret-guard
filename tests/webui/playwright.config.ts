@@ -22,8 +22,11 @@ const MOCK_PORT = 19999;
 const SG_PORT = 18790;
 const SG_URL = `http://127.0.0.1:${SG_PORT}/`;
 // secret-guard 二进制: 优先 release, 其次 debug.
-const releaseBin = path.join(ROOT, "target", "release", "secret-guard");
-const debugBin = path.join(ROOT, "target", "debug", "secret-guard");
+// CARGO_TARGET_DIR 支持: CI 用持久卷 (/var/lib/forgejo-runner/cache/cargo-target),
+// 本地开发默认 target/. 优先 release (CI 跑过 --coverage 用 debug 子目录).
+const CARGO_TARGET_DIR = process.env.CARGO_TARGET_DIR || path.join(ROOT, "target");
+const releaseBin = path.join(CARGO_TARGET_DIR, "release", "secret-guard");
+const debugBin = path.join(CARGO_TARGET_DIR, "debug", "secret-guard");
 const SG_BIN = fs.existsSync(releaseBin) ? releaseBin : debugBin;
 
 if (!fs.existsSync(SG_BIN)) {

@@ -611,6 +611,89 @@ fn assert_redactions_match_map(
     );
 }
 
+/// 视图正确性守卫 (CI 用, 需 `--features consistency-check`).
+///
+/// `CallEvent.preview` / `CallEvent.model` 是 `req_body_raw` (SSOT) 的派生视图:
+/// 一次性从 req_body_raw 提取并缓存, 之后 sidebar / list 路径零拷贝读 Arc<str>.
+/// 本函数断言派生保持一致 — 从 req_body_raw 重新调用
+/// [`crate::web::api::extract_preview_and_model`] 应得到相同结果.
+///
+/// 捕获的 drift 类型: 未来若把 preview/model 改为从其他来源 (如 IR / 原始 client body
+/// 而非 redact 后的 req_body_raw) 提取, 此守卫会立刻失败. 详见 AGENTS.md
+/// "视图正确性确保机制" — "preview/model 从 req_body_raw 派生" 是该机制的已实践位置.
+#[cfg(feature = "consistency-check")]
+fn assert_preview_model_match_source(event: &CallEvent) {
+    let (rederived_preview, rederived_model) =
+        crate::web::api::extract_preview_and_model(&event.req_body_raw);
+    debug_assert_eq!(
+        event.model.as_deref(),
+        rederived_model.as_deref(),
+        "stored model drifts from req_body_raw SSOT"
+    );
+    debug_assert_eq!(
+        event.preview.as_deref(),
+        rederived_preview.as_deref(),
+        "stored preview drifts from req_body_raw SSOT"
+    );
+}
+
+/// 视图正确性守卫 (CI 用, 需 `--features consistency-check`).
+///
+/// `ResponseData.parsed` (非流式) 是上游响应字节的派生视图:
+/// 用 codec reader 把 resp_bytes 解析为 [`crate::codec::ir::IrResponse`], 再用 codec writer
+/// 序列化为 wire JSON 缓存. 本函数断言派生保持一致 — 重新用 reader 解析 source bytes,
+/// 与派生时使用的 IR snapshot 比对.
+///
+/// 捕获的 drift 类型: 未来若 parsed 改为从其他来源 (如 restore 后的 IR / 客户端响应)
+/// 派生, 此守卫会立刻失败. 仅在派生成功路径 (reader 解析成功 + 2xx 成功响应) 触发;
+/// fallback 路径 (parse 失败原样透传 / 非 2xx 错误响应) 时 parsed_for_record 为 None,
+/// 由调用方负责传入 expected = None 跳过断言. 详见 AGENTS.md "视图正确性确保机制".
+#[cfg(feature = "consistency-check")]
+fn assert_resp_parsed_matches_source_nonstream(
+    parsed_for_record: Option<&serde_json::Value>,
+    source_bytes: &[u8],
+    reader: &dyn crate::codec::Reader,
+) {
+    // 预期: source_bytes 解析失败 → parsed_for_record 应为 None (fallback 路径, 不比对).
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(source_bytes) else {
+        debug_assert!(
+            parsed_for_record.is_none(),
+            "parsed_for_record set but source bytes are not valid JSON"
+        );
+        return;
+    };
+    // reader 解析失败 → parsed_for_record 也应为 None.
+    let Ok(ir) = reader.read_response(&v) else {
+        debug_assert!(
+            parsed_for_record.is_none(),
+            "parsed_for_record set but reader fails to parse source bytes"
+        );
+        return;
+    };
+    // 成功路径: parsed_for_record 必为 Some. (调用方负责保证仅在派生会生成 parsed 的
+    // 路径调用本守卫 — 即 2xx 成功响应. 非 2xx 错误响应即便 reader 能解析, 也不派生 parsed.)
+    let Some(parsed) = parsed_for_record else {
+        debug_assert!(
+            false,
+            "source parses successfully but parsed_for_record is None"
+        );
+        return;
+    };
+    // model 字段 (字符串) 直接比对 — 这是 IrResponse 中最稳定、最易 drift 的字段.
+    // 容许 codec 不对称: 部分 writer 把 None model 写成空串 "" (如 OpenAI writer),
+    // 部分 reader 又把 "" 读回 Some(""). 双侧都 normalize 为 None 等价, 避免已知 codec
+    // 行为被误报为 drift.
+    let parsed_model_norm: Option<&str> = parsed
+        .get("model")
+        .and_then(|m| m.as_str())
+        .filter(|s| !s.is_empty());
+    let ir_model_norm: Option<&str> = ir.model.as_deref().filter(|s| !s.is_empty());
+    debug_assert_eq!(
+        parsed_model_norm, ir_model_norm,
+        "parsed.model drifts from IrResponse SSOT (after normalizing None == empty string)"
+    );
+}
+
 /// 写一条 "上游请求失败" 记录 (错误路径专用 helper).
 fn record_upstream_failure(
     dag: &ConversationDag,
@@ -656,7 +739,7 @@ fn build_call_event(
         }),
         None => std::sync::Arc::new(PolicySnapshot::default()),
     };
-    CallEvent {
+    let event = CallEvent {
         created_at: chrono::Utc::now(),
         method: parts.method.as_str().to_string(),
         path: path.to_string(),
@@ -668,7 +751,13 @@ fn build_call_event(
         preview: preview.map(std::sync::Arc::<str>::from),
         model: model.map(std::sync::Arc::<str>::from),
         redactions: std::sync::Arc::from(redactions),
-    }
+    };
+    // 视图正确性守卫: preview/model 是 req_body_raw (SSOT) 的派生视图, 每次派生都断言不变式.
+    // 集中在 build_call_event 内部确保 same_proto / cross_proto / passthrough 三条路径都覆盖
+    // (三路径都通过 build_call_event 构造 CallEvent).
+    #[cfg(feature = "consistency-check")]
+    assert_preview_model_match_source(&event);
+    event
 }
 
 /// 若 provider 配置了 api_key, 注入对应的 auth header.
@@ -992,6 +1081,17 @@ async fn cross_proto_forward(
 
     // 16. attach 响应到 DAG.
     let elapsed = started.elapsed().as_millis() as u64;
+    // 视图正确性守卫: resp_parsed (非流式) 是 resp_bytes (SSOT) 经 egress reader 的派生视图.
+    // 仅在 2xx 成功响应时触发 — 非 2xx 错误响应即便 reader 能解析也不派生 parsed
+    // (走 envelope 翻译路径), 守卫对 None 比对会误报.
+    #[cfg(feature = "consistency-check")]
+    if resp_status.is_success() {
+        assert_resp_parsed_matches_source_nonstream(
+            resp_parsed_for_record.as_ref(),
+            &resp_bytes,
+            egress_reader.as_ref(),
+        );
+    }
     state.dag.attach_response(
         record_id,
         ResponseData {
@@ -1195,10 +1295,20 @@ async fn fan_out_streaming(
         } else if let Some(cp) = codec_proto {
             let reader = cp.reader();
             let writer = cp.writer();
-            serde_json::from_slice::<serde_json::Value>(&recorder.acc)
+            let parsed = serde_json::from_slice::<serde_json::Value>(&recorder.acc)
                 .ok()
                 .and_then(|v| reader.read_response(&v).ok())
-                .map(|ir| writer.write_response(&ir))
+                .map(|ir| writer.write_response(&ir));
+            // 视图正确性守卫 (同协议 fan_out 路径): parsed 派生与 SSOT 在同一作用域内,
+            // 派生源 drift 风险低; 此处主要抽查 codec writer→reader 的 model 字段对称性
+            // (reader/writer 来自同一 codec, 守卫等价于 codec 内部 round-trip 测试的运行时抽查).
+            #[cfg(feature = "consistency-check")]
+            assert_resp_parsed_matches_source_nonstream(
+                parsed.as_ref(),
+                &recorder.acc,
+                reader.as_ref(),
+            );
+            parsed
         } else {
             None
         };
@@ -1302,6 +1412,15 @@ async fn fan_out_buffered_ir(
     // 注: buffered_ir 在 overflow 时保留部分累积 (而非 truncated banner),
     // 因为 client_bytes 也是从同一 acc 派生 — 保持一致.
     let acc_text = utf8_view(&recorder.acc);
+    // 视图正确性守卫 (同协议 buffered_ir 路径): parsed 派生与 SSOT 在同一作用域内,
+    // 派生源 drift 风险低; 此处主要抽查 codec writer→reader 的 model 字段对称性.
+    // 守卫内部按 reader 解析结果比对 (失败时 expected=None, 与 fallback 路径一致).
+    #[cfg(feature = "consistency-check")]
+    assert_resp_parsed_matches_source_nonstream(
+        resp_parsed_for_record.as_ref(),
+        &recorder.acc,
+        reader.as_ref(),
+    );
     dag.attach_response(
         record_id,
         ResponseData {

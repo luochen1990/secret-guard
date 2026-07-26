@@ -126,6 +126,33 @@ mock-upstream:
 audit:
     cargo audit
 
+# redact 性能基线 (criterion bench).
+# 详尽设计 (3 场景 + 2 目标 + 为什么手动构造 map) 见 benches/redact.rs 头部.
+# 默认 100 samples 较慢, 调试可用 `cargo bench --bench redact -- --quick`.
+bench:
+    cargo bench --bench redact
+
+# ─── 文件长度门禁 ──────────────────────────────────────────────────────────
+# 防止单文件失控膨胀. 阈值留 ~10% 余量 over 当前最大 (dag.rs ~3139 行 → 3500).
+# 超阈值的文件应拆分 (按 section / 职责), 而非调高阈值.
+FILE_MAX_LINES := "3500"
+
+check-file-size:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # 只扫 src/ 下的 .rs (含子目录). 排除非源码 (生成代码 / 测试 fixture).
+    # wc -l 末行是 "total" 汇总 (多文件时), 用 $2 ~ /\.rs$/ 过滤掉 (total 行第二字段是字面 "total").
+    # xargs -r (--no-run-if-empty): src/ 为空时 find 不产生输出, 避免某些 xargs 版本默认对空输入 exit 1.
+    offenders=$(find src -name '*.rs' -print0 \
+      | xargs -0 -r wc -l \
+      | awk -v max="{{FILE_MAX_LINES}}" '$2 ~ /\.rs$/ && $1>max {print $1": "$2}' || true)
+    if [ -n "$offenders" ]; then
+      echo "Files exceeding {{FILE_MAX_LINES}} lines (split needed):"
+      echo "$offenders"
+      exit 1
+    fi
+    echo "All source files within {{FILE_MAX_LINES}} line limit."
+
 # ─── PR diff 拆解 ──────────────────────────────────────────────────────────
 # 区分 diff 中的 prod 代码 vs test 代码, 用于 review 时判断真实膨胀.
 # 场景: 测试代码增加不是真膨胀, prod 代码大量增加才需警惕.
