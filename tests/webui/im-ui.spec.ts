@@ -70,6 +70,44 @@ async function clickSessionByLeaf(page: Page, sid: string): Promise<void> {
   await page.waitForSelector("#detail .request-pane", { timeout: 3000 });
 }
 
+/**
+ * 辅助: 构造 3 轮长内容会话, 用于 drawer 回归测试 (bug #3 系列).
+ *
+ * 每轮首条 user 含 marker (供 findSessionLeafByPreview 匹配) + 超长内容 (3000 'x'),
+ * 触发 placeholder 渲染 (placeholderH = extremeMaxH = 80% wrapH). 3 轮累积让 timeline
+ * 总内容超过 wrapH, 提供足够的滚动空间观察 phase 切换.
+ *
+ * @param roundIdx 选中轮次索引 (0=最老/最顶, 2=最新/最底). 末轮紧邻 placeholder,
+ *                 中间轮/首轮能滚出视口顶部. 不同选择覆盖不同 phase 路径.
+ */
+async function setupLongChatSelectRound(page: Page, marker: string, roundIdx: number): Promise<void> {
+  const longUser = "x".repeat(3000);
+  const reply = "r".repeat(2000);
+  await sendChat(page, [
+    { role: "user", content: `${marker} ${longUser}` },
+    { role: "assistant", content: reply },
+  ]);
+  await sendChat(page, [
+    { role: "user", content: `${marker} ${longUser}` },
+    { role: "assistant", content: reply },
+    { role: "user", content: `${longUser} second` },
+    { role: "assistant", content: reply },
+  ]);
+  await sendChat(page, [
+    { role: "user", content: `${marker} ${longUser}` },
+    { role: "assistant", content: reply },
+    { role: "user", content: `${longUser} second` },
+    { role: "assistant", content: reply },
+    { role: "user", content: `${longUser} third` },
+    { role: "assistant", content: reply },
+  ]);
+  const leaf = await findSessionLeafByPreview(page, marker);
+  await clickSessionByLeaf(page, leaf);
+  await page.waitForTimeout(500);
+  await page.locator("#detail .tl-round").nth(roundIdx).locator(".tl-round-header").click();
+  await page.waitForTimeout(1000);
+}
+
 // ─── 测试用例 ────────────────────────────────────────────────────────────
 
 test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
@@ -255,8 +293,9 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     // 历史回归: DOM 倒序 bug 期间此契约被 highlightRound 的副作用巧合满足; 顺序修正后
     // 暴露了 selectRound 对已缓存会话只 highlight 不滚到底的不一致, 现由 scroll:'bottom' 修复.
     await clickSessionByLeaf(page, leaf);
-    // 等 toggleSession 的 selectRound 完成 + 浏览器 layout 稳定 (placeholder 高度计算).
-    await page.locator("#detail .drawer-placeholder").waitFor({ state: "visible", timeout: 3000 });
+    // 等 selectRound 完成 + 浏览器 layout 稳定 (updateResponseDrawerLayout 同步触发).
+    // 不依赖 placeholder visible: 短内容时 placeholder height = 0 (不进入视口), 视为 hidden.
+    await page.waitForSelector("#detail .tl-round.selected", { timeout: 3000 });
     await page.waitForTimeout(300);
 
     const scrollInfo = await page.locator("#detail").evaluate(
@@ -901,5 +940,114 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     if (m.bubbleBottomY !== null && m.bubbleBottomY >= m.wrapH) {
       expect(m.drawerPct).toBeLessThanOrEqual(0.12);
     }
+  });
+
+  test("drawer covers placeholder when scrolling to bottom (last round selected)", async ({
+    page,
+  }) => {
+    // bug #3 回归: 末轮选中时 bubbleBottomY 永远 > 0 (末轮紧邻 placeholder,
+    // maxScroll 不足以让末轮气泡滚出顶部), 旧 phase 4 门槛 (bby<=0) 永远不满足,
+    // drawer 被 phase 2 的 clamp 封顶在 maxH (40%), placeholder 大片空白被露出.
+    //
+    // 修复: phase 4 改用 placeholderExposed (placeholder DOM 在视口内的可见高度)
+    // 作为驱动, 与 bubbleBottomY 解耦. 滚到底时 drawer 必须扩展到 ≥ placeholder
+    // 露出高度, 完全遮挡 placeholder.
+    await setupLongChatSelectRound(page, "bug3-marker", 2 /* 末轮 */);
+
+    // 滚到最底 (maxScroll), 等待 scroll 事件的 RAF 回调触发 layout 更新, 再采样
+    const m = await page.evaluate(async () => {
+      const d = document.getElementById("detail")!;
+      const w = document.getElementById("detail-wrap")!;
+      const wrapH = w.clientHeight;
+      const drawer = document.getElementById("response-drawer")!;
+      const ph = document.querySelector("#detail > .drawer-placeholder") as HTMLElement;
+      // 滚到底
+      d.scrollTop = d.scrollHeight - d.clientHeight;
+      // 等待 scroll 事件 + RAF 触发 updateResponseDrawerLayout (异步); 双 RAF 确保 layout 已应用
+      const nextFrame = () => new Promise<void>((r) => requestAnimationFrame(() => r()));
+      await nextFrame();
+      await nextFrame();
+      // placeholder DOM 在视口内的可见高度
+      const phTop = ph?.offsetTop ?? 0;
+      const phH = ph?.offsetHeight ?? 0;
+      const viewportBottom = d.scrollTop + wrapH;
+      const placeholderExposed = Math.max(0, Math.min(phH, viewportBottom - phTop));
+      return {
+        wrapH,
+        scrollTop: d.scrollTop,
+        maxScroll: d.scrollHeight - d.clientHeight,
+        drawerH: drawer.offsetHeight,
+        drawerPct: drawer.offsetHeight / wrapH,
+        placeholderH: phH,
+        placeholderExposed,
+      };
+    });
+
+    // 必须能滚 (内容足够长, placeholder 存在)
+    expect(m.placeholderH).toBeGreaterThan(0);
+    expect(m.maxScroll).toBeGreaterThan(100);
+    // 核心: drawer 必须完全遮挡露出的 placeholder (容差 4px, 防亚像素)
+    expect(m.drawerH).toBeGreaterThanOrEqual(m.placeholderExposed - 4);
+    // 滚到底时 drawer 应接近 extremeMaxH (80%), 而非被封顶在 maxH (40%)
+    expect(m.drawerPct).toBeGreaterThan(0.7);
+  });
+
+  test("drawer phase 4 transitions smoothly (no sudden jump 40% → 80%)", async ({
+    page,
+  }) => {
+    // bug #3 伴生回归 (中间轮场景): 选中**非末轮**时, 旧 phase 4 门槛 (bby<=0) 能被
+    // 满足 (中间轮气泡可滚出顶部), 但 phase4Start = contentEnd - wrapH + maxH 比对应
+    // placeholder 实际露出的 scrollTop 晚 maxH 距离. 这导致:
+    //   - placeholder 已开始露出, drawer 仍 = maxH (phase 3 平台)
+    //   - 到 phase4Start 时 drawer 才开始扩大, 但用户感知是 "滞后 + 突然加速"
+    //   - 极端情况下若 phase4Range 很小, 视觉上就是 "40% → 80% 跳变"
+    //
+    // 修复后: placeholderExposed 从 0 开始线性增长, drawer 立即跟随, 无滞后无跳变.
+    //
+    // 选中间轮 (roundIdx=1) 让旧 phase 4 路径真正可触发, 测试才有区分性
+    // (末轮场景旧 phase 4 根本进不去, 无法检验 "平滑过渡").
+    await setupLongChatSelectRound(page, "bug3-smooth-marker", 1 /* 中间轮 */);
+
+    // 以固定步长采样整条曲线, 双 RAF 确保每次采样前 layout 已应用
+    const samples = await page.evaluate(async () => {
+      const d = document.getElementById("detail")!;
+      const w = document.getElementById("detail-wrap")!;
+      const wrapH = w.clientHeight;
+      const drawer = document.getElementById("response-drawer")!;
+      const maxScroll = d.scrollHeight - d.clientHeight;
+      const out: Array<{ st: number; drawerPct: number }> = [];
+      const nextFrame = () =>
+        new Promise<void>((r) => requestAnimationFrame(() => r()));
+      for (let st = 0; st <= maxScroll; st += 20) {
+        d.scrollTop = st;
+        await nextFrame();
+        await nextFrame();
+        out.push({ st, drawerPct: drawer.offsetHeight / wrapH });
+      }
+      return out;
+    });
+
+    expect(samples.length).toBeGreaterThan(5);
+    // 相邻样本 (20px scrollTop 步长) 的 drawerPct 跳变应 ≤ 8%.
+    // 修复前的滞后 + 突变会在某一步出现大跳变 (远超 8%), 修复后全程平滑.
+    // 注: 阈值留足余量 — phase 2 clamp 段斜率约 3.8% (20px / 530px), 加测量噪声.
+    let maxJump = 0;
+    let maxJumpAt = -1;
+    for (let i = 1; i < samples.length; i++) {
+      const jump = Math.abs(samples[i].drawerPct - samples[i - 1].drawerPct);
+      if (jump > maxJump) {
+        maxJump = jump;
+        maxJumpAt = i;
+      }
+    }
+    // 诊断信息: 失败时打印最大跳变位置, 便于定位 phase 边界
+    if (maxJump >= 0.08) {
+      const prev = samples[maxJumpAt - 1];
+      const curr = samples[maxJumpAt];
+      console.error(
+        `max jump ${maxJump.toFixed(3)} at sample ${maxJumpAt}: st=${prev.st}→${curr.st}, drawer ${(prev.drawerPct * 100).toFixed(1)}%→${(curr.drawerPct * 100).toFixed(1)}%`
+      );
+    }
+    expect(maxJump).toBeLessThan(0.08);
   });
 });

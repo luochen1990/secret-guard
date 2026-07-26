@@ -169,14 +169,25 @@ drawer overlay 不影响 #detail 的滚动空间. 因此:
 - 所有元素位置 = `offsetTop - scrollTop` 的纯函数
 - `drawerH = f(scrollTop)` 是纯函数, 无循环, 无死锁
 
-**四阶段高度** (随 scrollTop 增大):
-1. 选中气泡在视口下方 → drawerH = 30% (默认).
-2. 气泡在视口内 → drawerH = wrapH - bubbleBottomY - GAP, clamp [10%, 40%].
-3. 气泡滚出顶部, 内容仍填满视口 → drawerH = 40% (maxH).
-4. 滚入 placeholder (末轮底部滚出视口) → drawerH 从 40% 渐进扩展到 80%.
+**两段式高度** (`drawerH = max(段A, 段B)`, 上界 extremeMaxH):
+- **段 A — 跟踪选中气泡** (phase 1/2):
+  - 气泡在视口下方 → minH (10%).
+  - 气泡在视口内 → `wrapH - bubbleBottomY - GAP`, clamp [minH, maxH].
+  - 气泡滚出顶部 → clamp 到 maxH (40%).
+- **段 B — 遮挡露出的 placeholder** (phase 3/4):
+  - `placeholderExposed` = placeholder DOM 在视口内的可见高度.
+  - 未露出 (= 0) → 不影响段 A (phase 3 等价).
+  - 露出 → 主导, drawer 扩展以遮挡 (phase 4), 平滑到 extremeMaxH (80%).
 
-**placeholder**: `#detail` 末尾的 `.drawer-placeholder` (height = extremeMaxH = 80% wrapH)
-提供 phase 4 的滚动空间. 用户滚入时 drawer 已扩大遮挡它, 不暴露空白.
+> **关键不变量**: drawer 必须遮挡所有露出的 placeholder, 否则用户看到空白.
+> 历史 bug: 旧 phase 4 用 `bubbleBottomY <= 0` 作门槛, 末轮选中时 bby 永远 > 0
+> (因为末轮紧邻 placeholder, maxScroll 不足以让它滚出顶部) → phase 2 clamp 封顶在 maxH,
+> placeholder 空白被露出. 修复: 改用 `placeholderExposed` (基于 placeholder 实际露出量)
+> 作为段 B 驱动, 与段 A 解耦.
+
+**placeholder**: `#detail` 末尾的 `.drawer-placeholder`.
+- 长内容 (contentEnd > wrapH): height = extremeMaxH (80% wrapH), 提供 phase 4 滚动空间.
+- 短内容 (contentEnd ≤ wrapH): height = 0, 不进入初始视口, 也不需要 phase 4.
 
 **新 round 到来**: keyed reconciliation 追加新轮次, `#detail` 高度不变, scrollTop 不变 →
 drawerH 不变 → 分配比例保持 (用户视野不受内容变化干扰).
