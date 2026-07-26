@@ -47,6 +47,45 @@
 - **测试**: cargo-nextest + proptest (property-based) + mockito (集成测试) + Playwright (WebUI)
 - **覆盖率**: cargo-llvm-cov (LLVM source-based, 行级精度). 细节见"测试策略".
 
+## 数据流契约 (总览)
+
+> **本节是 normative (尺子), 不是 descriptive (描述现状)**. 定义 secret-guard 数据正确性的理想目标.
+> 完整契约 (10 个属性域, ~100 条可测 property) 见 **`docs/design/contracts.md`**.
+
+数据流分三个信任域, 域间有单向承诺:
+
+```
+域 A (转发链: client ↔ upstream)  ──字节正确性是根基──►  域 B (派生链: DAG/webapi)
+                                                         │
+                                                         ▼
+                                                  域 C (渲染层: WebUI DOM)
+```
+
+**最强契约 FWD-1 (透明中继 byte-exact)**: secret-guard 是客户端与上游之间的字节级透明中继 — **对 wire 的唯一合法修改是 real↔mock 替换**, 除此之外的任何字节差异都是 bug. 两个半段 (请求侧 / 响应侧) 经 normalize (canonical JSON) 后 byte-exact. 这条契约把"难以测的语义等价"转换为"可机械验证的字节相等".
+
+**契约编号速查** (段前缀 → 域, 详见 `docs/design/contracts.md` §0.2):
+
+| 前缀 | 域 | 收纳现有契约 | 一句话职责 |
+|---|---|---|---|
+| `FWD-*` | A | codec INV-1/2/5, proxy DoD | 透明中继 byte-exact + codec round-trip + HTTP 透传 + 路由 + 鉴权 |
+| `RED-*` | A | **C1-C7** (redact/mock) | Redact/Restore 可逆双射 + 不泄漏 + 前缀缓存友好 |
+| `STR-*` | A | codec INV-4 + 新增 | 流式 SSE 边界 + 累积 + 错误降级 + reader 多 tool_call 索引 |
+| `CDAG-*` | B | **DAG INV-1..5** + 新增 | 内容寻址 + Merkle + refcount + 孤儿节点 + session 稳定 |
+| `DTO-*` | B | 新增 | WebUI DTO 派生 (redactions / resp_parsed / preview / delta / title) |
+| `CFG-*` | B | 新增 | 双层配置合并 / CRUD / 持久化 / 并发 |
+| `SEC-*` | 跨 | 新增 | GET 不泄漏 / panic 不泄漏 / headers 脱敏 / 本地监听 |
+| `ROB-*` | 跨 | 鲁棒性原则 | best-effort 永不 panic + 假设声明注释必备 |
+| `VIEW-*` | 跨 | 视图正确性机制 | 先断言后删除 + 派生字段 consistency-check 覆盖 |
+| `UI-*` | C | **I1-I3** + 新增 | 气泡数 / sidebar 条目数 / DOM 顺序 / reconciliation / drawer |
+
+**核心纪律** (详见 `docs/design/contracts.md` §0.3 Property 设计原则 + §0.4 冗余覆盖原则 + §0.5 漂移处理流程):
+- Property 描述**外部可观察行为**, 不依赖内部实现 (避免过拟合).
+- 优先 **byte-exact (normalize 后)** 而非语义等价 (可机械验证, 无需 case-by-case 定义"语义").
+- **proptest 生成器覆盖度也作为契约要求** (历史 bug 多次出现 property 存在但生成器太窄致漏测).
+- **端到端契约 (FWD-1) 与其分解契约 (FWD-2 / RED-6/7) 必须分别独立形式化、独立可测** (测试原则是不信任其他代码).
+- 契约编号一经分配永不变更 (删除作废不重用).
+- 代码与契约冲突时, 二选一修复, **禁止长期不一致**.
+
 ## 关键不变式与工程纪律
 
 > secret-guard 的核心职责 (转发 + Redact) 必须对任意字节流零失败.
@@ -54,7 +93,7 @@
 > (preview 提取 / delta 切片 / WebUI 分组渲染 / tool name 推断等) 是"尽力而为"增强,
 > 绝不能因假设不成立而让请求失败或进程崩溃.
 
-### 鲁棒性原则 (best-effort, 永不 panic)
+### 鲁棒性原则 (best-effort, 永不 panic) → ROB-* 契约
 
 对"尝试性解析"功能, 必须同时满足:
 
@@ -68,7 +107,7 @@
 已实践位置: `web::api::extract_preview_and_model` (preview 提取),
 `dag::extract_delta_messages` (delta 切片), `index.html::toolNameOfRound` (tool name 推断).
 
-### 视图正确性确保机制 (View-Correctness Discipline)
+### 视图正确性确保机制 (View-Correctness Discipline) → VIEW-* 契约
 
 当用视图 / 引用 / 派生字段替代原始数据存储 (典型场景: 内存优化、去重、lazy 派生) 时:
 
@@ -83,7 +122,7 @@
 `resp_parsed` 从 StreamScan 累积 (`proxy.rs`). 后续 Phase B 删除 parent.response 时
 必须走此流程.
 
-### C3 前缀缓存友好性 (经济性契约)
+### C3 前缀缓存友好性 (经济性契约) → RED-3 契约
 
 Redact 不应无必要地改变 request body 的字节内容, 避免破坏 LLM Provider 侧的前缀缓存命中
 (前缀缓存是 byte-exact 的, 历史 message 中 mock 字节变化会导致从该 message 起的整个前缀
@@ -91,7 +130,7 @@ Redact 不应无必要地改变 request body 的字节内容, 避免破坏 LLM P
 保证同一 policy + 同一上下文 → 同一 mock. 详尽契约 (C1-C6) 见 `src/redact.rs` 头部
 与 `src/mock.rs` 头部.
 
-## 前端不变量 (UI Invariants)
+## 前端不变量 (UI Invariants) → UI-1/UI-2/UI-3 契约
 
 > 这两条是**跨 web/dag/index.html 的强不变量**, 任何渲染优化或内存重构不得违反.
 
@@ -138,7 +177,7 @@ URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标
 - Gemini/Ollama 跨协议 → 501 (codec 未覆盖)
 
 详尽的 dispatch 路径选择 (同协议透传 / IR 路径 / 跨协议翻译) 与 fan_out 三路径见
-`src/proxy.rs` 头部.
+`src/proxy.rs` 头部; 路由相关的可测 property 见 `docs/design/contracts.md` **FWD-5**.
 
 ## 模块概览
 
