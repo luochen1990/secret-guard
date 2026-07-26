@@ -486,7 +486,11 @@ pub(crate) fn restore_str_inplace(s: &mut String, map: &RedactionMap) {
 /// - `IrResponse.{stop_sequence?, content[]}`
 ///
 /// 设计: 两方法 (不可变 / 可变), 叶子回调为 `FnMut` 允许捕获外部状态 (found 标志 / map).
-trait StringLeafOps {
+/// 字符串叶子遍历/替换 trait (crate 内可见, 供 codec test 复用).
+///
+/// redact 在 IR 字符串叶子做 real↔mock 替换; 该 trait 抽象"找到所有字符串叶子"的逻辑,
+/// 让 IrRequest / IrBlock / Value 等不同容器共享同一套遍历代码.
+pub(crate) trait StringLeafOps {
     /// 遍历所有字符串叶子 (不可变借用).
     fn for_each_str_leaf(&self, f: &mut impl FnMut(&str));
     /// 遍历所有字符串叶子 (可变借用, 用于 replace / restore).
