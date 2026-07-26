@@ -24,6 +24,10 @@ pub struct IrRequest {
     pub messages: Vec<IrMessage>,
     /// 工具定义.
     pub tools: Vec<IrTool>,
+    /// wire 形态元数据: 原始 wire 是否含 tools 字段 (即便为空数组).
+    /// 同协议 round-trip 时填充, 跨协议翻译前清空.
+    /// 区分 "tools: []" (显式空) 与缺失 tools 字段.
+    pub tools_present: bool,
     /// 最大输出 token 数. OpenAI 可选, Anthropic 必填.
     pub max_tokens: Option<u32>,
     /// 采样温度. JSON 数字是 f64, 用 f64 避免 0.7→0.699999988 的精度损失.
@@ -32,8 +36,16 @@ pub struct IrRequest {
     pub top_p: Option<f64>,
     /// top-k sampling 截止. **仅 Anthropic 有**; OpenAI writer drop.
     pub top_k: Option<u32>,
-    /// 停止序列 (归一化为 `Vec<String>`). 空数组表示省略.
+    /// 停止序列 (归一化为 `Vec<String>`). 空数组表示无 stop 序列 (但仍可能原始 wire 显式存在).
     pub stop: Vec<String>,
+    /// wire 形态元数据: 原始 wire 中 `stop` 字段是否存在及其形态.
+    /// - `None`: 缺失 / 跨协议路径 (writer 不输出 stop 字段)
+    /// - `Some(StopForm::String)`: 原始是单字符串 (writer 输出 `"stop":"..."`)
+    /// - `Some(StopForm::Array)`: 原始是数组 (writer 输出 `"stop":[...]`, 即便空数组也输出)
+    ///
+    /// 仅同协议 round-trip 时填充, 用于 wire 形态保真 (L7).
+    /// 跨协议翻译前由 caller 清空.
+    pub stop_form: Option<StopForm>,
     /// 工具选择策略.
     pub tool_choice: Option<IrToolChoice>,
     /// 终端用户标识. OpenAI: 顶层 `user`; Anthropic: `metadata.user_id`.
@@ -50,18 +62,92 @@ pub struct IrRequest {
     pub extra: serde_json::Map<String, Value>,
 }
 
+impl IrRequest {
+    /// 清空所有 wire_fidelity 元数据 (跨协议翻译前调用, SSOT).
+    ///
+    /// wire_fidelity 字段记录的是 **ingress 协议的 wire 形态** (如字段是 string 还是 array),
+    /// 跨协议翻译时 ingress 形态对 egress 协议无意义, 必须清空, 否则会污染 egress wire.
+    /// 集中在此避免新增字段时漏清.
+    pub fn clear_wire_fidelity(&mut self) {
+        self.stop_form = None;
+        self.tools_present = false;
+        for m in &mut self.messages {
+            m.content_form = None;
+            for b in &mut m.content {
+                if let IrBlock::ToolResult { content_form, .. } = b {
+                    *content_form = None;
+                }
+            }
+        }
+    }
+}
+
 /// 单条对话消息.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct IrMessage {
     pub role: IrRole,
     pub content: Vec<IrBlock>,
+    /// wire 形态元数据: 原始 wire 中 `content` 是 string 还是 array 还是 null.
+    /// - `None`: 跨协议路径 / 内部构造 (writer 用协议默认形态)
+    /// - `Some(ContentForm::String)`: 原始是裸 string (Anthropic 单文本消息常见)
+    /// - `Some(ContentForm::Array)`: 原始是 array of blocks
+    /// - `Some(ContentForm::Null)`: 原始是 null (assistant 调用工具时)
+    ///
+    /// 仅同协议 round-trip 时填充, 用于 wire 形态保真 (L1).
+    /// 跨协议翻译前由 caller 清空.
+    pub content_form: Option<ContentForm>,
+}
+
+/// wire 中 message content 的原始形态. 用于同协议 round-trip 时保留 wire 形态.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentForm {
+    /// 裸字符串: `"content": "hello"`
+    String,
+    /// 数组: `"content": [{"type":"text","text":"hello"}]`
+    Array,
+    /// null: `"content": null (assistant 调用工具时)
+    Null,
+}
+
+impl ContentForm {
+    /// 从 wire 字段值推断 content 形态. 缺失 / 非预期类型 → None (writer 用协议默认).
+    /// 用于 reader 在解析 message content / tool_result content 时记录原始形态 (L1 保真).
+    pub fn classify(value: Option<&Value>) -> Option<Self> {
+        match value {
+            Some(Value::String(_)) => Some(Self::String),
+            Some(Value::Array(_)) => Some(Self::Array),
+            Some(Value::Null) => Some(Self::Null),
+            _ => None,
+        }
+    }
+}
+
+/// wire 中 stop 字段的原始形态. 用于同协议 round-trip 时保留 wire 形态.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopForm {
+    /// 单字符串: `"stop": "abc"`
+    String,
+    /// 数组: `"stop": ["abc"]`
+    Array,
+}
+
+impl StopForm {
+    /// 从 wire `stop` 字段值推断形态. 缺失 / 非预期类型 → None.
+    pub fn classify(value: Option<&Value>) -> Option<Self> {
+        match value {
+            Some(Value::String(_)) => Some(Self::String),
+            Some(Value::Array(_)) => Some(Self::Array),
+            _ => None,
+        }
+    }
 }
 
 /// 消息角色. 注意: `System` 角色的消息虽然出现在 [`IrMessage`] 里时,
 /// reader 会**提升**到 [`IrRequest::system`], 但 IrMessage 仍可承载 (内部一致性).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum IrRole {
     System,
+    #[default]
     User,
     Assistant,
     Tool,
@@ -85,6 +171,10 @@ pub enum IrBlock {
         tool_use_id: String,
         content: Vec<IrBlock>,
         is_error: bool,
+        /// wire 形态元数据: Anthropic tool_result.content 可能是 string 或 array.
+        /// OpenAI 的 tool message content 永远是 string, 此字段 None.
+        /// 同协议 round-trip 时填充, 跨协议翻译前清空.
+        content_form: Option<ContentForm>,
     },
     /// 图片块. 跨协议唯一无歧义形式是 Base64; URL 引用也保留.
     Image { source: IrImageSource },

@@ -26,8 +26,12 @@
 
 pub mod anthropic;
 pub mod ir;
+pub mod normalize;
 pub mod openai;
 pub mod stream;
+
+#[cfg(test)]
+mod fwd_property;
 
 use serde_json::Value;
 

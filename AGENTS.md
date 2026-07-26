@@ -354,8 +354,11 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
   因此 C5 在 Auto 模式下实质等价于确定性契约.
   设计论据 (信息论 + 业界 secret scanner 阈值) 见 `src/mock.rs` 头部 "C5" 段落 (SSOT).
   `proptest-regressions/redact.txt` 记录历史失败种子.
-- **同协议 + Redact 失去 byte-exact**: reader → redact_ir → writer 重序列化, 字段顺序 /
-  空字符串归一化可能让 wire 字节略变, 但语义等价. 同协议 + 无 Redact 路径仍 byte-exact.
+- **同协议 + Redact: normalize_json 相等, 非 byte-exact**: reader → redact_ir → writer 重序列化,
+  字段顺序 / 空白等无语义差异由 `normalize_json` 吸收, 语义信息通过 wire 形态元数据保留
+  (见 `src/codec/AGENTS.md` "wire fidelity"). 已知搁置: 多 system messages 合并 / message-level
+  extra / block-level 未知 part / response 侧 usage 字段位置 (详见 codec/AGENTS.md).
+  同协议 + 无 Redact 路径仍 byte-exact.
 - **流式 + Redact + 非 2xx 上游错误**: SSE 错误流不是单个 JSON, parse 失败时 fallback
   原样返回 (无 restore), 客户端可能看到 mock.
 - **跨协议 ingress 的 timeline delta 切片可能错位**: OpenAI writer 会把 Anthropic 风格的

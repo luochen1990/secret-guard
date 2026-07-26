@@ -732,6 +732,7 @@ fn sample_ir_with_text(text: &str) -> IrRequest {
             content: vec![IrBlock::Text {
                 text: text.to_string(),
             }],
+            ..Default::default()
         }],
         tools: vec![],
         max_tokens: Some(100),
@@ -851,6 +852,7 @@ mod tests {
                 content: vec![IrBlock::Text {
                     text: "user msg embeds sk-user-secret-xyz".to_string(),
                 }],
+                ..Default::default()
             }],
             ..sample_ir_with_text("")
         };
@@ -953,6 +955,7 @@ mod tests {
                     text: format!("nested-{marker}"),
                 }],
                 is_error: false,
+                content_form: None,
             },
             IrBlock::Image {
                 source: IrImageSource::Url(format!("https://example.com/{marker}.png")),
@@ -1107,6 +1110,7 @@ mod tests {
                     name: "search".to_string(),
                     input: json!({"api_key": "sk-secret-value", "other": "text"}),
                 }],
+                ..Default::default()
             }],
             ..sample_ir_with_text("")
         };
@@ -1134,7 +1138,9 @@ mod tests {
                         text: "result with sk-secret".to_string(),
                     }],
                     is_error: false,
+                    content_form: None,
                 }],
+                ..Default::default()
             }],
             ..sample_ir_with_text("")
         };

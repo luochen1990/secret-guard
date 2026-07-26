@@ -15,6 +15,7 @@
 
 use serde_json::{Map, Value, json};
 
+use super::ir::{ContentForm, StopForm};
 use super::{
     IrBlock, IrBlockMeta, IrDelta, IrError, IrImageSource, IrMessage, IrRequest, IrResponse,
     IrRole, IrStopReason, IrStreamEvent, IrTool, IrToolChoice, IrUsage, Reader, Writer,
@@ -86,15 +87,20 @@ impl Reader for OpenAiReader {
                             tool_use_id,
                             content: blocks,
                             is_error: false,
+                            content_form: None, // OpenAI tool message content 总是 string
                         }],
+                        ..Default::default()
                     });
                 }
                 continue;
             }
 
+            // L1 保真: 记录 content 原始形态 (string / array / null).
+            let content_form = ContentForm::classify(msg.get("content"));
             let message = IrMessage {
                 role,
                 content: blocks,
+                content_form,
             };
             if role == IrRole::System {
                 // 提升到 system.
@@ -114,6 +120,8 @@ impl Reader for OpenAiReader {
             .and_then(|n| u32::try_from(n).ok())
             .filter(|&n| n > 0);
         let stop = super::ir::read_stop_sequences(obj.get("stop"));
+        // L7 保真: 记录 stop 原始形态 (string / array). 区分 "stop":"" / "stop":[] 与缺失.
+        let stop_form = StopForm::classify(obj.get("stop"));
         let user = obj.get("user").and_then(Value::as_str).map(String::from);
         let parallel_tool_calls = obj.get("parallel_tool_calls").and_then(Value::as_bool);
         let stream = obj.get("stream").and_then(Value::as_bool).unwrap_or(false);
@@ -124,6 +132,8 @@ impl Reader for OpenAiReader {
             .and_then(Value::as_array)
             .map(|arr| arr.iter().filter_map(read_tool_def).collect())
             .unwrap_or_default();
+        // wire 保真: 仅当 tools 是数组时才算"显式存在" (区分 "tools":[] 与缺失 / null).
+        let tools_present = obj.get("tools").and_then(Value::as_array).is_some();
 
         // extra: 透传未建模字段 (同协议有效, 跨协议会清空).
         let extra = collect_extra(
@@ -149,11 +159,13 @@ impl Reader for OpenAiReader {
             system,
             messages: ir_messages,
             tools,
+            tools_present,
             max_tokens,
             temperature,
             top_p,
             top_k: None, // OpenAI 没有 top_k
             stop,
+            stop_form,
             tool_choice,
             user,
             parallel_tool_calls,
@@ -269,6 +281,7 @@ impl Writer for OpenAiWriter {
                     messages.push(write_message(&IrMessage {
                         role: IrRole::User,
                         content: non_tool.into_iter().cloned().collect(),
+                        ..Default::default()
                     }));
                 }
                 for b in tool_results {
@@ -276,6 +289,7 @@ impl Writer for OpenAiWriter {
                         tool_use_id,
                         content,
                         is_error,
+                        content_form: _,
                     } = b
                     {
                         let text = if *is_error {
@@ -308,11 +322,14 @@ impl Writer for OpenAiWriter {
         if let Some(p) = req.top_p {
             out.insert("top_p".to_string(), json!(p));
         }
-        if !req.stop.is_empty() {
-            out.insert(
-                "stop".to_string(),
-                Value::Array(req.stop.iter().map(|s| Value::String(s.clone())).collect()),
-            );
+        // L7 保真: stop_form.is_some() 时即便 stop 为空也输出 (区分 "stop":"" / "stop":[] 与缺失).
+        if !req.stop.is_empty() || req.stop_form.is_some() {
+            let stop_value = match req.stop_form {
+                Some(StopForm::String) if req.stop.len() == 1 => Value::String(req.stop[0].clone()),
+                Some(StopForm::String) => Value::String(String::new()), // 空 string 形态
+                _ => Value::Array(req.stop.iter().map(|s| Value::String(s.clone())).collect()),
+            };
+            out.insert("stop".to_string(), stop_value);
         }
         if req.stream {
             out.insert("stream".to_string(), Value::Bool(true));
@@ -321,6 +338,7 @@ impl Writer for OpenAiWriter {
             out.insert("user".to_string(), Value::String(u.clone()));
         }
         // OpenAI 在 tools 为空时, parallel_tool_calls 会触发 400, 必须 gate.
+        // 但若 wire 原始含 "tools":[] (显式空), 保真输出空数组.
         if !req.tools.is_empty() {
             out.insert(
                 "tools".to_string(),
@@ -332,6 +350,9 @@ impl Writer for OpenAiWriter {
             if let Some(tc) = &req.tool_choice {
                 out.insert("tool_choice".to_string(), write_tool_choice(tc));
             }
+        } else if req.tools_present {
+            // wire 保真: 原始 wire 显式含 "tools":[], 即便 IR tools 为空也输出.
+            out.insert("tools".to_string(), Value::Array(vec![]));
         }
         // top_k OpenAI 不支持, 静默 drop (lossy-by-target).
         // extra 同协议时透传 (跨协议在调用前清空).
@@ -554,8 +575,24 @@ fn read_openai_content(content: Option<&Value>) -> Vec<IrBlock> {
     }
 }
 
-/// 解析 content array 中的一个 part (`{type:"text"|"image_url", ...}`).
+/// 解析 content array 中的一个 part.
+///
+/// OpenAI 协议中 content array 元素可能是:
+/// - `{type:"text",text:"..."}` 对象 (user 消息的标准形态)
+/// - `{type:"image_url",...}` 对象 (多模态)
+/// - 裸 string `"..."` (assistant 消息的多段文本, 非标准但 OpenAI 接受)
+///
+/// 未知类型 (audio 等) 静默 drop (L5 待修: 应保留为 IrBlock::Unknown).
 fn read_content_part(part: &Value) -> Option<IrBlock> {
+    // 裸 string 元素 (assistant content array 的非标准形态)
+    if let Some(s) = part.as_str() {
+        if s.is_empty() {
+            return None;
+        }
+        return Some(IrBlock::Text {
+            text: s.to_string(),
+        });
+    }
     let part = part.as_object()?;
     let ty = part.get("type").and_then(Value::as_str)?;
     match ty {
@@ -930,17 +967,35 @@ fn write_message(msg: &IrMessage) -> Value {
             json!({"role": "system", "content": text})
         }
         IrRole::User => {
-            // OpenAI 约定: 单文本 content 用裸 string; 多模态 / 多块用 array.
-            // 这里检测是否只有单一 Text block, 用 string 形式 (更原生).
-            if msg.content.len() == 1
-                && let IrBlock::Text { text } = &msg.content[0]
-            {
+            // L1 保真: 按 wire 原始形态输出 content.
+            //   - String + 单 Text block → 裸 string (OpenAI 约定)
+            //   - Null + 空 content       → null
+            //   - Array / 其他            → array
+            //   - None (内部构造 / 跨协议) → 按默认约定 (单文本 string, 多块 array)
+            let single_text: Option<&String> = match msg.content.as_slice() {
+                [IrBlock::Text { text }] => Some(text),
+                _ => None,
+            };
+
+            // use_string_form: 当形态要求 string 或默认走 string 约定时, 且确实只有单个 Text.
+            let want_string = !matches!(
+                msg.content_form,
+                Some(ContentForm::Array) | Some(ContentForm::Null)
+            );
+            if want_string && let Some(text) = single_text {
                 return json!({"role": "user", "content": text});
             }
+            if matches!(msg.content_form, Some(ContentForm::Null)) && msg.content.is_empty() {
+                return json!({"role": "user", "content": Value::Null});
+            }
+
             let parts: Vec<Value> = msg.content.iter().filter_map(write_user_block).collect();
-            let content = match parts.len() {
-                0 => Value::String(String::new()),
-                _ => Value::Array(parts),
+            // 空数组: 按 wire 形态决定 (Array → [], 默认 → "").
+            let content = match (msg.content_form, parts.is_empty()) {
+                (Some(ContentForm::Array), _) => Value::Array(parts),
+                (Some(ContentForm::Null), true) => Value::Null,
+                (_, false) => Value::Array(parts),
+                (_, true) => Value::String(String::new()), // 默认 / String + 空 → ""
             };
             json!({"role": "user", "content": content})
         }
@@ -967,10 +1022,15 @@ fn write_message(msg: &IrMessage) -> Value {
                     _ => {}
                 }
             }
-            let content = match content_parts.len() {
-                0 => Value::Null,
-                1 => content_parts.into_iter().next().unwrap(),
-                _ => Value::Array(content_parts),
+            // L1 保真: content_form 决定 wire 形态 (Array / Null 强制; 其余按默认约定).
+            let content = match (msg.content_form, content_parts.len()) {
+                (Some(ContentForm::Array), _) => Value::Array(content_parts),
+                (Some(ContentForm::Null), 0) => Value::Null,
+                _ => match content_parts.len() {
+                    0 => Value::Null,
+                    1 => content_parts.into_iter().next().unwrap(),
+                    _ => Value::Array(content_parts),
+                },
             };
             let mut obj = Map::new();
             obj.insert("role".to_string(), json!("assistant"));
@@ -1029,6 +1089,7 @@ fn write_user_block(b: &IrBlock) -> Option<Value> {
             tool_use_id,
             content,
             is_error,
+            content_form: _,
         } => {
             // OpenAI 的 tool 消息必须独立成一条, 但 caller 可能把它放在 user 消息内
             // (跨协议从 Anthropic 来的). 这里退化为 text 内容, 配合 write_message 的 Tool 分支
@@ -1048,12 +1109,16 @@ fn write_user_block(b: &IrBlock) -> Option<Value> {
 }
 
 /// IR ToolUse 的 input Value → OpenAI function.arguments 字符串.
+///
+/// OpenAI 的 arguments 字段是 **JSON 字符串** (而非裸 JSON 值), writer 必须序列化.
+/// - Value::Null → "null" (之前 bug: 返回空字符串, 破坏 round-trip)
+/// - Value::String(s) → 序列化为 JSON string literal (含引号 + 转义)
+///
+/// 注: 这与 reader 不对称 — reader 把 arguments 当 JSON 字符串解析为 Value,
+///     writer 应反向把 Value 序列化为 JSON 字符串. 之前的 String(s.clone()) 是 bug:
+///     它假设 input 已是去引号的字符串, 但 reader 实际把 input 解析成了 Value.
 fn input_to_string(input: &Value) -> String {
-    match input {
-        Value::String(s) => s.clone(),
-        Value::Null => String::new(),
-        _ => serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string()),
-    }
+    serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string())
 }
 
 /// 写 tool 定义.
@@ -1285,6 +1350,7 @@ mod tests {
             messages: vec![IrMessage {
                 role: IrRole::User,
                 content: vec![IrBlock::Text { text: "Hi".into() }],
+                ..Default::default()
             }],
             model: "gpt-4o".into(),
             max_tokens: Some(50),
@@ -1304,6 +1370,7 @@ mod tests {
             messages: vec![IrMessage {
                 role: IrRole::User,
                 content: vec![IrBlock::Text { text: "x".into() }],
+                ..Default::default()
             }],
             model: "gpt-4o".into(),
             parallel_tool_calls: Some(true),
@@ -1445,11 +1512,13 @@ mod tests {
                             tool_use_id: aid,
                             content: ac,
                             is_error: ae,
+                            ..
                         },
                         IrBlock::ToolResult {
                             tool_use_id: bid,
                             content: bc,
                             is_error: be,
+                            ..
                         },
                     ) => {
                         assert_eq!(aid, bid, "{ctx}: msg[{i}].block[{j}] tool_use_id");
@@ -1986,6 +2055,7 @@ mod tests {
                         source: IrImageSource::Url("https://example.com/cat.png".into()),
                     },
                 ],
+                ..Default::default()
             }],
             model: "gpt-4o".into(),
             ..Default::default()
@@ -2015,6 +2085,7 @@ mod tests {
                         data: "abc123".into(),
                     },
                 }],
+                ..Default::default()
             }],
             model: "gpt-4o".into(),
             ..Default::default()

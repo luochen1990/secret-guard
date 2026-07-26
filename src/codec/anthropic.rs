@@ -16,6 +16,7 @@
 
 use serde_json::{Map, Value, json};
 
+use super::ir::ContentForm;
 use super::{
     DEFAULT_MAX_TOKENS, IrBlock, IrBlockMeta, IrDelta, IrError, IrImageSource, IrMessage,
     IrRequest, IrResponse, IrRole, IrStopReason, IrStreamEvent, IrTool, IrToolChoice, IrUsage,
@@ -117,6 +118,7 @@ impl Reader for AnthropicReader {
             stream,
             model,
             extra,
+            ..Default::default()
         })
     }
 
@@ -595,18 +597,20 @@ fn read_message(msg: &Value) -> Option<IrMessage> {
         "assistant" => IrRole::Assistant,
         _ => IrRole::User, // "user" 或未知
     };
-    let content = match obj.get("content") {
-        Some(Value::String(s)) => {
-            if s.is_empty() {
-                Vec::new()
-            } else {
-                vec![IrBlock::Text { text: s.clone() }]
-            }
-        }
+    // L1 保真: 记录 content 原始形态 (string / array / null). 形态由 classify 统一判定,
+    // blocks 提取依赖具体值, 在下面按形态分支.
+    let raw = obj.get("content");
+    let content_form = ContentForm::classify(raw);
+    let content = match raw {
+        Some(Value::String(s)) if !s.is_empty() => vec![IrBlock::Text { text: s.clone() }],
         Some(Value::Array(arr)) => arr.iter().filter_map(read_block).collect(),
         _ => Vec::new(),
     };
-    Some(IrMessage { role, content })
+    Some(IrMessage {
+        role,
+        content,
+        content_form,
+    })
 }
 
 /// 解析 Anthropic content block → [`IrBlock`].
@@ -656,13 +660,12 @@ fn read_block(b: &Value) -> Option<IrBlock> {
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             // content 可能是 string 或 array of blocks.
-            let content = match obj.get("content") {
-                Some(Value::String(s)) => {
-                    if s.is_empty() {
-                        Vec::new()
-                    } else {
-                        vec![IrBlock::Text { text: s.clone() }]
-                    }
+            // L1 保真: 记录原始形态 (string / array).
+            let raw = obj.get("content");
+            let content_form = ContentForm::classify(raw);
+            let content = match raw {
+                Some(Value::String(s)) if !s.is_empty() => {
+                    vec![IrBlock::Text { text: s.clone() }]
                 }
                 Some(Value::Array(arr)) => arr.iter().filter_map(read_block).collect(),
                 _ => Vec::new(),
@@ -671,6 +674,7 @@ fn read_block(b: &Value) -> Option<IrBlock> {
                 tool_use_id,
                 content,
                 is_error,
+                content_form,
             })
         }
         "image" => {
@@ -803,7 +807,29 @@ fn write_message(msg: &IrMessage) -> Value {
         IrRole::Tool => "user", // tool 消息在 Anthropic 中也是 user
     };
     let blocks: Vec<Value> = msg.content.iter().filter_map(write_block).collect();
-    json!({"role": role_str, "content": blocks})
+
+    // L1 保真: 按 wire 原始形态输出 content (string / array / null).
+    let content_value = serialize_content_with_form(blocks, msg.content_form);
+    json!({"role": role_str, "content": content_value})
+}
+
+/// 按 [`ContentForm`] 把已序列化的 wire content blocks 折叠回 wire 形态 (L1 保真).
+///
+/// - `String` 形态: 0 block → `""`; 1 个 Text → 裸 string; 其他 → 回退 array.
+/// - `Null` 形态 + 0 block → `null`.
+/// - `Array` / `None` / 其他 → 始终 array.
+fn serialize_content_with_form(blocks: Vec<Value>, form: Option<ContentForm>) -> Value {
+    match form {
+        Some(ContentForm::String) => match blocks.as_slice() {
+            [] => Value::String(String::new()),
+            [single] if single.get("text").is_some() => {
+                Value::String(single["text"].as_str().unwrap_or("").to_string())
+            }
+            _ => Value::Array(blocks),
+        },
+        Some(ContentForm::Null) if blocks.is_empty() => Value::Null,
+        _ => Value::Array(blocks),
+    }
 }
 
 /// IR block → Anthropic content block (用于 message 数组内).
@@ -820,8 +846,9 @@ fn write_block(b: &IrBlock) -> Option<Value> {
             tool_use_id,
             content,
             is_error,
+            content_form,
         } => {
-            // tool_result 内的 content 是 array of blocks.
+            // tool_result 内的 content. L1 保真: 按 wire 原始形态输出 (string / array).
             let inner: Vec<Value> = content.iter().filter_map(write_block).collect();
             let mut obj = Map::new();
             obj.insert("type".to_string(), json!("tool_result"));
@@ -829,8 +856,14 @@ fn write_block(b: &IrBlock) -> Option<Value> {
                 "tool_use_id".to_string(),
                 Value::String(tool_use_id.clone()),
             );
-            if !inner.is_empty() {
-                obj.insert("content".to_string(), Value::Array(inner));
+            // content 字段: 按 content_form 决定形态 (含空字符串/空数组的保留).
+            // 仅当 wire 原始存在 content 字段 (content_form.is_some()) 或 inner 非空时输出,
+            // 避免原始缺失 content 字段的 tool_result 凭空多出 content.
+            let content_value = serialize_content_with_form(inner, *content_form);
+            let should_emit = content_form.is_some()
+                || !matches!(&content_value, Value::Array(a) if a.is_empty());
+            if should_emit {
+                obj.insert("content".to_string(), content_value);
             }
             if *is_error {
                 obj.insert("is_error".to_string(), json!(true));
@@ -1013,6 +1046,7 @@ mod tests {
                 tool_use_id,
                 content,
                 is_error,
+                content_form: _,
             } => {
                 assert_eq!(tool_use_id, "toolu_abc");
                 assert_eq!(*is_error, false);
@@ -1093,6 +1127,7 @@ mod tests {
             messages: vec![IrMessage {
                 role: IrRole::User,
                 content: vec![IrBlock::Text { text: "Hi".into() }],
+                ..Default::default()
             }],
             model: "claude".into(),
             max_tokens: Some(50),
@@ -1112,6 +1147,7 @@ mod tests {
             messages: vec![IrMessage {
                 role: IrRole::User,
                 content: vec![IrBlock::Text { text: "x".into() }],
+                ..Default::default()
             }],
             model: "claude".into(),
             max_tokens: None,
@@ -1127,6 +1163,7 @@ mod tests {
             messages: vec![IrMessage {
                 role: IrRole::User,
                 content: vec![IrBlock::Text { text: "x".into() }],
+                ..Default::default()
             }],
             model: "claude".into(),
             temperature: Some(1.5),
@@ -1143,6 +1180,7 @@ mod tests {
             messages: vec![IrMessage {
                 role: IrRole::User,
                 content: vec![IrBlock::Text { text: "x".into() }],
+                ..Default::default()
             }],
             model: "claude".into(),
             max_tokens: Some(50),
@@ -1168,6 +1206,7 @@ mod tests {
             messages: vec![IrMessage {
                 role: IrRole::User,
                 content: vec![IrBlock::Text { text: "x".into() }],
+                ..Default::default()
             }],
             model: "claude".into(),
             max_tokens: Some(50),
@@ -1438,6 +1477,7 @@ mod tests {
                         data: "abc==".into(),
                     },
                 }],
+                ..Default::default()
             }],
             model: "claude".into(),
             max_tokens: Some(50),
@@ -1461,6 +1501,7 @@ mod tests {
                 content: vec![IrBlock::Image {
                     source: IrImageSource::Url("https://example.com/img.png".into()),
                 }],
+                ..Default::default()
             }],
             model: "claude".into(),
             max_tokens: Some(50),

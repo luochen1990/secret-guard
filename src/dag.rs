@@ -66,6 +66,7 @@ fn hash_block(block: &IrBlock) -> BlockHash {
             tool_use_id,
             content,
             is_error,
+            content_form: _,
         } => {
             tool_use_id.hash(&mut h);
             is_error.hash(&mut h);
@@ -183,6 +184,7 @@ impl BlockPool {
         Some(IrMessage {
             role: msg_ref.role,
             content: blocks,
+            ..Default::default()
         })
     }
 
@@ -1220,6 +1222,7 @@ mod tests {
             content: vec![IrBlock::Text {
                 text: text.to_string(),
             }],
+            ..Default::default()
         }
     }
 
@@ -1422,6 +1425,7 @@ mod tests {
                 },
             ],
             is_error: false,
+            content_form: None,
         };
         let h = pool.intern(block.clone());
         let resolved = pool.get(h).expect("interned");
@@ -1441,6 +1445,7 @@ mod tests {
                 input: serde_json::json!({"raw": "data"}),
             }],
             is_error: false,
+            content_form: None,
         };
         let h = pool.intern(nested.clone());
         let resolved = pool.get(h).expect("interned");
@@ -1455,11 +1460,13 @@ mod tests {
             tool_use_id: "c1".into(),
             content: vec![IrBlock::Text { text: "ok".into() }],
             is_error: false,
+            content_form: None,
         };
         let err = IrBlock::ToolResult {
             tool_use_id: "c1".into(),
             content: vec![IrBlock::Text { text: "ok".into() }],
             is_error: true,
+            content_form: None,
         };
         let h_ok = pool.intern(ok);
         let h_err = pool.intern(err);
@@ -1479,6 +1486,7 @@ mod tests {
             tool_use_id: "c1".into(),
             content: vec![child],
             is_error: false,
+            content_form: None,
         };
         let _h = pool.intern(parent);
         assert_eq!(pool.len(), 1, "嵌套子 block 不单独入池 (顶层原子单元)");
@@ -1550,6 +1558,7 @@ mod tests {
                 text: "hello".into(),
             }],
             is_error: false,
+            content_form: None,
         };
         let h_text = pool.intern(text);
         let h_tooluse = pool.intern(tooluse_with_same_string);
@@ -1589,11 +1598,13 @@ mod tests {
                         text: "result here".to_string(),
                     }],
                     is_error: false,
+                    content_form: None,
                 },
                 IrBlock::Image {
                     source: IrImageSource::Url("https://x/y.png".to_string()),
                 },
             ],
+            ..Default::default()
         };
         let msg_ref = pool.intern_message(&msg);
         let resolved = pool.resolve_message(&msg_ref).expect("should resolve");
@@ -2836,6 +2847,7 @@ mod tests {
         (arb_role(), "[a-z0-9 ]{0,20}").prop_map(|(role, text)| IrMessage {
             role,
             content: vec![IrBlock::Text { text }],
+            ..Default::default()
         })
     }
 
@@ -2918,6 +2930,7 @@ mod tests {
                 let msg = IrMessage {
                     role: *role,
                     content: vec![IrBlock::Text { text: text.clone() }],
+                    ..Default::default()
                 };
                 // 不 panic 即通过 (push 内含淘汰 + GC cascade).
                 last_leaf = Some(dag.push_messages(vec![msg], dummy_event()));
@@ -2955,6 +2968,7 @@ mod tests {
             let msg = IrMessage {
                 role,
                 content: vec![IrBlock::Text { text: text.clone() }],
+                ..Default::default()
             };
             // 同一 message intern 两次 → 同一 MessageRef (role + 相同 blocks hash).
             let ref1 = pool.intern_message(&msg);

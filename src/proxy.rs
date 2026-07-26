@@ -782,8 +782,11 @@ async fn cross_proto_forward(
         ir.max_tokens = Some(crate::codec::DEFAULT_MAX_TOKENS);
     }
 
-    // 6. 清空 extra (跨协议时 extra 字段会泄漏 ingress-only 的内容, 必须丢弃).
+    // 6. 清空 ingress-only 元数据:
+    //    - extra: ingress-only 字段会泄漏到 egress
+    //    - wire_fidelity (stop_form / content_form / tools_present): ingress wire 形态
     ir.extra.clear();
+    ir.clear_wire_fidelity();
 
     // 7. 快照真实 messages (redact 前) 给 DAG.
     let real_messages = ir.messages.clone();
@@ -1785,6 +1788,7 @@ mod tests {
             content: vec![IrBlock::Text {
                 text: "hi".to_string(),
             }],
+            ..Default::default()
         }];
         let event = CallEvent {
             created_at: chrono::Utc::now(),
