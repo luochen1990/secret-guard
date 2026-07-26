@@ -1624,8 +1624,9 @@
         }
       }
       renderSidebar();
-      // 选中叶子轮次 (在右侧渲染 timeline).
-      await selectRound(leafId);
+      // 选中叶子轮次 (在右侧渲染 timeline). scroll:'bottom' — 点会话条目的语义是
+      // "看最新消息" (IM 风格 → 滚到底), 由 tests/webui/im-ui.spec.ts "需求 4" 守卫.
+      await selectRound(leafId, { scroll: 'bottom' });
     }
 
     // 选中某一轮: 在右侧 timeline 中定位 + 高亮.
@@ -1633,12 +1634,21 @@
     //   1. 该轮已在当前 timeline → 直接滚动 + 高亮 (零开销).
     //   2. 该轮在 sessionRounds 缓存中 → 从缓存填充 timelineRecords + reconcile (无网络).
     //   3. 都不在 → 以该轮为锚重新拉 timeline (网络请求), reconcile 复用公共节点.
-    async function selectRound(nodeId) {
+    //
+    // opts.scroll 滚动策略 (调用方语义决定):
+    //   'highlight' (默认): highlightRound — 选中气泡下边缘对齐视口 70% (issue #36 规则1),
+    //                       用于点击具体轮次 (round-item / sub-dot / timeline 内 round).
+    //   'bottom':           scrollTimelineToBottomForce — 滚到最新一轮 (IM 风格),
+    //                       用于点击会话条目 (toggleSession).
+    // 'bottom' 用 scrollTo({behavior:'auto'}) 取消 highlightRound 可能启动的 smooth 动画,
+    // 细节见 scrollTimelineToBottomForce 注释.
+    async function selectRound(nodeId, { scroll: scrollMode = 'highlight' } = {}) {
       state.selectedRound = nodeId;
       renderSidebar();
       // 1. 已在当前 timeline 中 → 直接滚动 + 高亮.
       if (state.selectedSession && state.timelineRecords.some(r => r.id === nodeId)) {
-        highlightRound(nodeId);
+        if (scrollMode === 'bottom') scrollTimelineToBottomForce();
+        else highlightRound(nodeId);
         return;
       }
       // 2. 在 sessionRounds 缓存中 → 从缓存填充 (避免网络请求).
@@ -1649,11 +1659,14 @@
           state.timelineOldest = rounds.length > 0 ? rounds[0].id : null;
           state.timelineReachedTop = false;
           renderTimeline();
-          highlightRound(nodeId);
+          if (scrollMode === 'bottom') scrollTimelineToBottomForce();
+          else highlightRound(nodeId);
           return;
         }
       }
       // 3. 都不在 → 重新拉 timeline (reconcile 会复用公共节点, 不全量刷新).
+      // loadTimeline 内部已调 scrollTimelineToBottomForce (与 scrollMode='bottom' 一致),
+      // 故此处无需再处理 scrollMode='highlight' 的特殊覆盖.
       await loadTimeline(nodeId);
     }
 
@@ -1950,16 +1963,23 @@
 
     // keyed reconciliation: 按 data-rid 匹配新旧 .tl-round, 最小化 DOM 操作.
     //
+    // ─── 不变量 I3 (timeline 顺序) ───────────────────────────────────────
+    // DOM 中 .tl-round 的顺序必须与 state.timelineRecords 完全一致 (oldest-first,
+    // 即顶部最老, 底部最新). 历史回归 bug: 早期 anchor 从 placeholder (DOM 末尾) 起,
+    // 每个新节点 insertBefore(anchor) 导致 DOM 变成 newest-first 的倒序. 守卫:
+    // tests/webui/im-ui.spec.ts 的 "I3 守卫: timeline 轮次 DOM 顺序 == 数据顺序".
+    //
     // 算法 (O(n+m), n=旧节点数, m=新记录数):
     //   1. 收集 DOM 中已有的 .tl-round, 按 data-rid 索引.
-    //   2. 遍历 timelineRecords, 按 id 查找已有节点:
-    //      - 找到 → 复用 (保留 DOM + 局部状态), 插入到正确位置 (若需移动).
-    //      - 未找到 → 创建新节点, applyBubbleCollapseTo.
+    //   2. 遍历 timelineRecords (oldest-first), 按 id 查找已有节点:
+    //      - 找到 → 复用 (保留 DOM + 局部状态), 若位置不对则移动到 anchor 之后.
+    //      - 未找到 → 创建新节点, applyBubbleCollapseTo, 插到 anchor 之后.
+    //      anchor 随遍历前进, 始终指向 "上一次处理的节点".
     //   3. 遍历结束后, DOM 中未被复用的旧节点全部删除.
     //   4. 确保 detail-header 在最前, drawer-placeholder 在最后.
     //
-    // 对完全不同的会话 (零公共节点): 所有旧节点删、新节点建 ≈ 全量重建, 无额外开销.
-    // 对纯追加 (append): 旧节点全部复用, 末尾插入新节点, 等价于 append-only.
+    // anchor 从 detail-header (DOM 最前) 起步, 配合 insertAfter 语义, 保证按数据
+    // 顺序追加 → DOM 与数据同序. 对 append/prepend/middle-insert/replace 通用.
     function reconcileTimelineRounds(container) {
       // 确保 detail-header 存在.
       let header = container.querySelector(':scope > .detail-header');
@@ -1984,8 +2004,9 @@
 
       // 用于追踪哪些旧节点被复用了 (未复用的将在最后删除).
       const reused = new Set();
-      // 插入锚点: 新节点依次插入到 anchor 之前, anchor 初始为 placeholder.
-      let anchor = placeholder;
+      // 插入锚点: 新节点依次插到 anchor 之后, anchor 从 header (DOM 最前) 起步.
+      // 这样按数据 oldest-first 顺序追加, DOM 自然保持 oldest-first (不变量 I3).
+      let anchor = header;
 
       for (let i = 0; i < state.timelineRecords.length; i++) {
         const r = state.timelineRecords[i];
@@ -1993,17 +2014,18 @@
         if (roundEl) {
           // 复用已有节点.
           reused.add(r.id);
-          // 若位置不对 (前面有其他节点), 移动到 anchor 前.
-          if (roundEl.nextElementSibling !== anchor && roundEl !== anchor.previousElementSibling) {
-            container.insertBefore(roundEl, anchor);
+          // 若位置不对 (不是 anchor 的直接后继), 移动到 anchor 之后.
+          // anchor.nextSibling 在 append 路径下是 placeholder 或后续轮次, 语义正确.
+          if (roundEl.previousElementSibling !== anchor) {
+            container.insertBefore(roundEl, anchor.nextSibling);
           }
           anchor = roundEl;
         } else {
-          // 创建新节点.
+          // 创建新节点, 插到 anchor 之后.
           const wrapper = document.createElement('div');
           wrapper.innerHTML = renderTimelineRound(r, i);
           roundEl = wrapper.firstElementChild;
-          container.insertBefore(roundEl, anchor);
+          container.insertBefore(roundEl, anchor.nextSibling);
           applyBubbleCollapseTo(roundEl);
           anchor = roundEl;
         }
@@ -2061,10 +2083,15 @@
       });
     }
 
-    // 显式滚到 timeline 底部 (最新一轮). loadTimeline 完成后调用.
+    // 显式滚到 timeline 底部 (最新一轮). loadTimeline / selectRound(scroll:'bottom') 调用.
+    // 用 scrollTo({behavior:'auto'}) 而非 scrollTop= 赋值: behavior:'auto' 是显式滚动操作,
+    // CSSOM View 规范要求它 abort 同一元素上正在进行的 smooth 滚动动画 (来自 highlightRound).
+    // scrollTop 赋值在部分浏览器实现里不保证 abort, 实测时序上 smooth 动画会继续把 scrollTop
+    // 拉回其目标, 导致最终位置不确定 (这是 "需求 4: 选中会话滚到底" 失败的独立根因,
+    // 与 timeline 倒序 bug 独立 — 倒序修复后才暴露此竞争).
     function scrollTimelineToBottomForce() {
       const el = document.getElementById('detail');
-      if (el) el.scrollTop = el.scrollHeight;
+      if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'auto' });
     }
 
     // 绑定每轮的 info / raw 按钮 + 轮次选中 的事件委托 (挂在稳定的 #detail 上, 全量重建后无需重绑).

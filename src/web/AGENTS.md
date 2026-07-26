@@ -1,7 +1,7 @@
 # web 模块 — JSON API + 单页 WebUI 契约
 
 > 本文件是 `src/web/` 目录的导航与契约汇总. 源文件 (`api.rs` / `mod.rs`) 头部有更细节的注释.
-> 项目级原则 (鲁棒性、视图正确性、前端不变量 I1/I2、术语) 见根目录 `AGENTS.md`.
+> 项目级原则 (鲁棒性、视图正确性、前端不变量 I1/I2/I3、术语) 见根目录 `AGENTS.md`.
 
 ## 职责
 
@@ -110,6 +110,10 @@ timeline 返回的 N 个节点中, 只有最末节点 (timeline anchor) 保留 `
   > 确定后不可变 (见 `dag.rs`). keyed reconciliation 依赖此不变量 — 已有轮次的 DOM 无需更新.
   > header 里 response 相关字段 (status/elapsed/streamed) 可变, 由 `updateRoundHeaders()` 定点刷新.
   > 末轮 response 在独立的 `.response-drawer` 中, 不在 `.tl-round` 内.
+  >
+  > **不变量 I3** (timeline 顺序): DOM 中 `.tl-round` 的顺序必须与 `state.timelineRecords`
+  > 一致 (oldest-first). `reconcileTimelineRounds` 的实现陷阱 (anchor 起步位置) 见函数头部
+  > 注释; 守卫见 `im-ui.spec.ts` I3.
 - **"已经到顶了" 提示已移除** (issue #36): 该提示的显示条件始终无法正确判断, 直接去掉.
 
 ### ForwardRecord.redactions
@@ -126,7 +130,8 @@ timeline 返回的 N 个节点中, 只有最末节点 (timeline anchor) 保留 `
 
 ## WebUI 渲染契约 (`index.html`)
 
-> 前端不变量 I1 (气泡数 == IR messages 长度) 与 I2 (sidebar 条目数 == HTTP 请求数) 见根目录 AGENTS.md.
+> 前端不变量 I1 (气泡数 == IR messages 长度) / I2 (sidebar 条目数 == HTTP 请求数) /
+> I3 (timeline 轮次 DOM 顺序 == 数据顺序 oldest-first) 见根目录 AGENTS.md.
 > 回归守卫: `tests/webui/im-ui.spec.ts`.
 
 ### Sidebar 分组渲染 (二级 + 三级小圆点)

@@ -16,6 +16,7 @@
  * 显式不变量守卫 (AGENTS.md "前端不变量"):
  *   I1: timeline 气泡数 == 该 Node 的 IR messages 数组长度 (参数化 N=1/3/5).
  *   I2: sidebar (round-item + sub-dot) 总数 == 该 Session 的 HTTP 请求数 (M=3).
+ *   I3: timeline 轮次 DOM 顺序 == state.timelineRecords (oldest-first, M=3).
  *
  * 错误状态渲染: 上游 502/429 时 WebUI 不崩溃 + record 显示错误状态.
  *
@@ -249,9 +250,14 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
   test("需求 4: 选中会话时 timeline 初始滚到底", async ({ page }) => {
     // 复用上一个测试创建的多轮对话会话 (title = 第一轮首条 user msg, issue #36).
     const leaf = await findSessionLeafByPreview(page, "first long response question");
-    // 重新点击会话 (先折叠再展开) 触发 timeline 重新加载 + 初始滚到底.
+    // 点击会话条目 → toggleSession → selectRound(leaf, {scroll:'bottom'}).
+    // 契约: "用户点会话条目" = IM 风格看最新消息, 应滚到底 (非 highlightRound 的 70% 定位).
+    // 历史回归: DOM 倒序 bug 期间此契约被 highlightRound 的副作用巧合满足; 顺序修正后
+    // 暴露了 selectRound 对已缓存会话只 highlight 不滚到底的不一致, 现由 scroll:'bottom' 修复.
     await clickSessionByLeaf(page, leaf);
-    await page.waitForTimeout(500);
+    // 等 toggleSession 的 selectRound 完成 + 浏览器 layout 稳定 (placeholder 高度计算).
+    await page.locator("#detail .drawer-placeholder").waitFor({ state: "visible", timeout: 3000 });
+    await page.waitForTimeout(300);
 
     const scrollInfo = await page.locator("#detail").evaluate(
       (el) => ({
@@ -265,7 +271,7 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
       return;
     }
 
-    // 距底部应该 < 20px.
+    // 距底部应该 < 20px (选中会话 = IM 风格滚到最新一轮).
     const distanceToBottom =
       scrollInfo.scrollHeight - scrollInfo.scrollTop - scrollInfo.clientHeight;
     expect(distanceToBottom).toBeLessThan(20);
@@ -684,6 +690,70 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
       total,
       `I2 违反: 发送 ${M} 次 HTTP 请求, 但 sidebar round-item(${roundItems}) + sub-dot(${subDots}) = ${total}`
     ).toBe(M);
+  });
+
+  // ─── I3 显式不变量守卫: timeline 轮次 DOM 顺序 == 数据顺序 (oldest-first) ──
+  //
+  // AGENTS.md 前端不变量 I3:
+  //   "DOM 中 .tl-round 的顺序必须与 state.timelineRecords 完全一致 (oldest-first,
+  //    顶部最老, 底部最新)."
+  //
+  // 策略: 单会话 3 轮 (同 I2 的累积上下文模式, 每轮 delta 含独特 user marker).
+  //   - 每轮的 user marker 出现在该轮的 request-pane 内 (assistant 气泡来自前轮 response).
+  //   - 验证 #detail > .tl-round 序列里, 各轮 user marker 按 [r1, r2, r3] 的发送顺序出现.
+  // 覆盖: 初次 loadTimeline → renderTimeline → reconcile (append 路径).
+  //   未覆盖 prepend (loadOlder) / replace (会话切换) / 乱序自愈 — 留作后续.
+  test("I3 守卫: timeline 轮次 DOM 顺序 == 数据顺序 (oldest-first)", async ({ page }) => {
+    const u1 = "i3-guard-root-marker";
+    // 轮1: [u1]
+    await sendChat(page, [{ role: "user", content: u1 }]);
+    // 轮2: delta=[a1, u2], user marker = u2
+    await sendChat(page, [
+      { role: "user", content: u1 },
+      { role: "assistant", content: "i3-reply-1" },
+      { role: "user", content: "i3-round2-marker" },
+    ]);
+    // 轮3: delta=[a2, u3], user marker = u3
+    await sendChat(page, [
+      { role: "user", content: u1 },
+      { role: "assistant", content: "i3-reply-1" },
+      { role: "user", content: "i3-round2-marker" },
+      { role: "assistant", content: "i3-reply-2" },
+      { role: "user", content: "i3-round3-marker" },
+    ]);
+
+    const sid = await findSessionLeafByPreview(page, u1);
+    await clickSessionByLeaf(page, sid);
+
+    // 等 timeline 渲染出 3 轮 (条件等待, 替代固定 sleep).
+    await expect(page.locator("#detail > .tl-round")).toHaveCount(3);
+
+    // 收集每轮的 user 文本 (按 DOM 顺序).
+    // 每轮 request-pane 内的 user 气泡 (bubble-user) 含该轮的 user marker.
+    // 注意: 轮1 的 user 气泡 = u1 (会话标题 marker), 轮2 = i3-round2-marker, 轮3 = i3-round3-marker.
+    const roundEls = await page.locator("#detail > .tl-round").all();
+    expect(roundEls.length, "应有 3 个 .tl-round").toBe(3);
+
+    const domOrderUsers: string[] = [];
+    for (const el of roundEls) {
+      // 每轮取最后一条 user 气泡的文本 (本轮新增的 user, 历史轮次的 user 也可能在 delta 里,
+      // 但本测试每轮 delta 只新增最后一条 user — 见上面累积构造).
+      const userBubbles = el.locator(".request-pane .bubble-user");
+      const count = await userBubbles.count();
+      if (count === 0) {
+        domOrderUsers.push("<no-user>");
+        continue;
+      }
+      const lastUserText = await userBubbles.last().textContent();
+      domOrderUsers.push((lastUserText || "").trim());
+    }
+
+    // I3 断言: DOM 顺序应与发送顺序一致 [u1, round2-marker, round3-marker].
+    const expected = [u1, "i3-round2-marker", "i3-round3-marker"];
+    expect(
+      domOrderUsers,
+      `I3 违反: timeline DOM 轮次顺序错乱. 期望 (oldest-first) ${JSON.stringify(expected)}, 实际 ${JSON.stringify(domOrderUsers)}`
+    ).toEqual(expected);
   });
 
   // ─── 错误状态渲染: 上游 502/429 时 WebUI 不崩溃 + record 可见 ──────────────
