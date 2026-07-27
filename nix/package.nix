@@ -19,15 +19,18 @@ rustPlatform.buildRustPackage {
     filter = path: type: let
       baseName = baseNameOf path;
       relPath = lib.removePrefix (toString ../. + "/") path;
-      # 只保留 Cargo + src + tests + README, 排除 target/ .git/ nix/ 等无关目录.
+      # 只保留 Cargo + src + tests + benches + README, 排除 target/ .git/ nix/ 等无关目录.
       # tests/ 当前不在 nix build 范围内 (doCheck=false), 但保留以便未来开启 doCheck 时直接 work.
+      # benches/ 必须保留: Cargo.toml 的 [[bench]] 声明要求 bench 文件在 src 中存在,
+      # 否则 buildRustPackage 解析 manifest 时报 "can't find bench".
       isCargoFile = baseName == "Cargo.toml" || baseName == "Cargo.lock";
       isRustSrc = lib.hasPrefix "src/" relPath;
       isTestsSrc = lib.hasPrefix "tests/" relPath;
+      isBenchesSrc = lib.hasPrefix "benches/" relPath;
       isAsset = baseName == "README.md";
-      isAllowedDir = type == "directory" && (baseName == "src" || baseName == "tests");
+      isAllowedDir = type == "directory" && (baseName == "src" || baseName == "tests" || baseName == "benches");
     in
-      isCargoFile || isRustSrc || isTestsSrc || isAsset || isAllowedDir;
+      isCargoFile || isRustSrc || isTestsSrc || isBenchesSrc || isAsset || isAllowedDir;
   };
 
   cargoLock = {
