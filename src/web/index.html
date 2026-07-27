@@ -1646,6 +1646,9 @@
     async function selectRound(nodeId, { scroll: scrollMode = 'highlight' } = {}) {
       state.selectedRound = nodeId;
       renderSidebar();
+      // path 1 (已在 timeline) 不重建 DOM, 故在此显式同步 .selected (SSOT).
+      // 放顶部覆盖所有 path, 避免 path 2/3 重复写 (对它们冗余但 µs 级, 无害).
+      updateSelectedRoundClass();
       // 1. 已在当前 timeline 中 → 直接滚动 + 高亮.
       if (state.selectedSession && state.timelineRecords.some(r => r.id === nodeId)) {
         if (scrollMode === 'bottom') scrollTimelineToBottomForce();
@@ -1669,6 +1672,20 @@
       // loadTimeline 内部已调 scrollTimelineToBottomForce (与 scrollMode='bottom' 一致),
       // 故此处无需再处理 scrollMode='highlight' 的特殊覆盖.
       await loadTimeline(nodeId);
+    }
+
+    // 同步 timeline 的 .selected 类到 state.selectedRound (SSOT).
+    // 必要性: highlightRound 只叠 .flash, 不维护 .selected; reconcileTimelineRounds
+    // 复用旧节点时也不刷新 class — 故切换选中需在此显式同步.
+    //
+    // 契约: state.selectedRound 的赋值仅发生在 selectRound 入口 (除 clearTimeline 置 null).
+    // 若未来在别处修改 state.selectedRound, 必须在 renderTimeline 前调本函数,
+    // 否则 reconcile 复用的旧节点会保留旧 .selected, 出现两个 .selected 共存.
+    function updateSelectedRoundClass() {
+      const target = state.selectedRound;
+      document.querySelectorAll('#detail > .tl-round').forEach(el => {
+        el.classList.toggle('selected', el.dataset.rid === target);
+      });
     }
 
     // 高亮 timeline 中某轮 (滚动到位 + 叠加一次闪烁动画).

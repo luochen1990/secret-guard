@@ -158,7 +158,16 @@ Redact 不应无必要地改变 request body 的字节内容, 避免破坏 LLM P
 完全一致 — 即 oldest-first (顶部最老, 底部最新, 与对话流时间线方向一致). 实现层面的陷阱
 (anchor 从 DOM 末尾 vs 最前起步) 见 `reconcileTimelineRounds` 函数头部注释 (历史教训).
 
-**回归守卫**: 这三条不变量由 `tests/webui/im-ui.spec.ts` 守卫. 改前端渲染逻辑或后端
+### I4 — `.tl-round.selected` 类 == `state.selectedRound` SSOT
+
+timeline 中带 `.selected` 类的 `.tl-round` 集合, 必须严格等于 `{state.selectedRound}`
+(恰好一个 rid 匹配, 其余均不带; `state.selectedRound = null` 时全无). 该一致性由
+`updateSelectedRoundClass` 在 `selectRound` 入口显式同步. 历史 bug: 点击 dot/round-item
+时只调 `highlightRound` (负责 `.flash` 闪烁动画), 不重建 DOM, 而
+`reconcileTimelineRounds` 复用已有节点时也不更新 class, 导致 `.selected` 滞留在旧轮次
+与 `.flash` 错位.
+
+**回归守卫**: 这四条不变量由 `tests/webui/im-ui.spec.ts` 守卫. 改前端渲染逻辑或后端
 delta 切片时, 必须同步跑 `just check-webui`.
 
 ## 路由策略 (核心契约)

@@ -536,10 +536,38 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     const title2 = await dots.nth(1).getAttribute("title") || "";
     expect(title2).toContain("cat");
 
-    // 点击圆点应选中对应轮次 (右侧 timeline 高亮).
+    // 点击圆点应选中对应轮次: sidebar 圆点 active + timeline 轮次 selected 必须一致.
+    // 历史 bug: 点击 dot 后 .flash 动画到了新轮, 但 .selected 滞留在旧轮 (闪烁与高亮错位).
+    // 这里覆盖到 timeline 侧的 .selected, 修复前会失败.
+    const dot1Rid = await dots.nth(1).getAttribute("data-rid");
+    expect(dot1Rid).toBeTruthy();
     await dots.nth(1).click();
     await page.waitForTimeout(500);
     await expect(page.locator(".sub-dot.active")).toHaveCount(1);
+    await expect(page.locator(`.sub-dot.active[data-rid="${dot1Rid}"]`)).toHaveCount(1);
+    // timeline 侧: 仅一个 .selected, 且 data-rid 与所点击的 dot 一致.
+    await expect(page.locator("#detail .tl-round.selected")).toHaveCount(1);
+    await expect(page.locator(`#detail .tl-round.selected[data-rid="${dot1Rid}"]`)).toHaveCount(1);
+
+    // 再点另一个 dot, .selected 必须迁移到新轮次 (不留旧选中).
+    const dot0Rid = await dots.nth(0).getAttribute("data-rid");
+    expect(dot0Rid).toBeTruthy();
+    await dots.nth(0).click();
+    await page.waitForTimeout(500);
+    await expect(page.locator(".sub-dot.active")).toHaveCount(1);
+    await expect(page.locator(`.sub-dot.active[data-rid="${dot0Rid}"]`)).toHaveCount(1);
+    await expect(page.locator("#detail .tl-round.selected")).toHaveCount(1);
+    await expect(page.locator(`#detail .tl-round.selected[data-rid="${dot0Rid}"]`)).toHaveCount(1);
+
+    // 同样验证点击二级条目 (.round-item = 组首用户轮次) 也同步迁移 .selected.
+    // (调用点同样是 selectRound, 但作为独立入口应单独覆盖, 防止未来 short-circuit 绕过.)
+    const headItem = page.locator(".round-item").first();
+    const headRid = await headItem.getAttribute("data-rid");
+    expect(headRid).toBeTruthy();
+    await headItem.click();
+    await page.waitForTimeout(500);
+    await expect(page.locator("#detail .tl-round.selected")).toHaveCount(1);
+    await expect(page.locator(`#detail .tl-round.selected[data-rid="${headRid}"]`)).toHaveCount(1);
   });
 
   // ─── "已经到顶了" 提示已移除 (issue #36) ──────────────────────────────────
