@@ -9,29 +9,36 @@
 {
   lib,
   rustPlatform,
+  nix-gitignore,
 }:
 rustPlatform.buildRustPackage {
   pname = "secret-guard";
   version = "0.1.0";
 
-  src = lib.cleanSourceWith {
-    src = ../.;
-    filter = path: type: let
-      baseName = baseNameOf path;
-      relPath = lib.removePrefix (toString ../. + "/") path;
-      # 只保留 Cargo + src + tests + benches + README, 排除 target/ .git/ nix/ 等无关目录.
-      # tests/ 当前不在 nix build 范围内 (doCheck=false), 但保留以便未来开启 doCheck 时直接 work.
-      # benches/ 必须保留: Cargo.toml 的 [[bench]] 声明要求 bench 文件在 src 中存在,
-      # 否则 buildRustPackage 解析 manifest 时报 "can't find bench".
-      isCargoFile = baseName == "Cargo.toml" || baseName == "Cargo.lock";
-      isRustSrc = lib.hasPrefix "src/" relPath;
-      isTestsSrc = lib.hasPrefix "tests/" relPath;
-      isBenchesSrc = lib.hasPrefix "benches/" relPath;
-      isAsset = baseName == "README.md";
-      isAllowedDir = type == "directory" && (baseName == "src" || baseName == "tests" || baseName == "benches");
-    in
-      isCargoFile || isRustSrc || isTestsSrc || isBenchesSrc || isAsset || isAllowedDir;
-  };
+  # src 过滤策略: nix-gitignore 的 .gitignore 基线 + 显式黑名单叠加.
+  #   - .gitignore 基线: 自动排除 git-untracked 项 (敏感数据 / 构建产物等), 单一事实来源.
+  #   - 显式黑名单: 排除 git-tracked 但不属于构建输入的顶层文件 (docs/ flake.nix 等).
+  #   - 净效果: 默认放行 + 显式排除 (与 .gitignore 心智模型一致).
+  #     新增顶层源码目录 (如未来 examples/) 自动进 src, 无需回头改本文件
+  #     (PR #69 漏 benches/ 的同类回归正是此策略要根治的).
+  #
+  # ⚠️ 前导 `/` 必须保留: gitignore 语义里 `name` 匹配任意层级同名文件,
+  # `/name` 才锚定到根目录. 已实测: 去 `/` 会误排 src/codec/AGENTS.md +
+  # src/web/AGENTS.md, 破坏 buildRustPackage 的 manifest 解析.
+  src = nix-gitignore.gitignoreSource [
+    "/.cargo"
+    "/.envrc"
+    "/.forgejo"
+    "/.gitignore"
+    "/AGENTS.md"
+    "/docs"
+    "/flake.lock"
+    "/flake.nix"
+    "/justfile"
+    "/nix"
+    "/proptest-regressions"
+    "/rust-toolchain.toml"
+  ] ../.;
 
   cargoLock = {
     lockFile = ../Cargo.lock;

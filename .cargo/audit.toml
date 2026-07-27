@@ -1,0 +1,27 @@
+# cargo-audit 配置: 项目级显式忽略 + 维护策略.
+#
+# 关于 [advisories.ignore] 项的规则 (项目纪律):
+#   - 每项必须有同级注释, 写明: (1) 漏洞技术描述 (2) 为什么不影响本项目 (3) 上游跟踪链接.
+#   - 仅在"无修复版本可用 + 经评估确实不在攻击面"时才忽略; 否则应优先升级.
+#   - 每半年走查一次: 上游若已修复, 移除忽略项 + 升级依赖.
+#
+# 文档: https://github.com/rustsec/rustsec/blob/main/cargo-audit/audit.toml.example
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 (rsa 0.9.10, CVSS 5.9 medium): Marvin Attack —
+    # modpow 实现非 constant-time, 私钥持有者可能被 timing 推出私钥.
+    #
+    # 不影响本项目: secret-guard 是 OIDC 客户端, 只走 rsa 的公钥验证路径
+    # (openidconnect::verify_rsa_signature 验证 IdP 用 RSA 签的 ID token),
+    # 不持有 RSA 私钥 (源码确认: 未使用 openidconnect::CoreRsaPrivateSigningKey).
+    # Marvin Attack 攻击的是私钥持有者, 公钥验证侧不受影响.
+    #
+    # 路径: openidconnect 4.0.1 (硬依赖 rsa ^0.9.2) → rsa 0.9.10.
+    # 升级路径全堵死: openidconnect 4.0.1 是最新稳定版, 无更高版本;
+    # rsa 0.10.x (rc) 仍未修复; axum-oidc 等 wrapper 也走同一依赖链.
+    #
+    # 跟踪上游: https://github.com/RustCrypto/RSA/issues/19 (2019 至今未关)
+    #            https://github.com/RustCrypto/RSA/pull/394 (迁 crypto-bigint, 合并但未完工)
+    "RUSTSEC-2023-0071",
+]

@@ -345,6 +345,16 @@ prod 代码大量增加才需警惕). 工具用 syn AST 解析, 自动识别 `#[
   即使工具/网络/API 失败也不影响合并. 报告用 `--format comment` 输出 markdown, 经
   curl + Forgejo API upsert 到 PR 评论 (marker 标记, 多次 push 不刷屏).
 
+### cargo-audit (CVE 监控)
+
+依赖 CVE 扫描 (`cargo audit`). 项目级配置在 `.cargo/audit.toml`, 当前显式忽略项:
+
+- **RUSTSEC-2023-0071** (rsa Marvin Attack): secret-guard 是 OIDC 客户端, 仅走 rsa 公钥
+  验证路径, 不持有 RSA 私钥, 不在攻击面. 上游无修复版本. 详尽论证见 `.cargo/audit.toml`.
+
+**走查纪律**: `.cargo/audit.toml` 的 ignore 项每半年走查一次; 上游若已修复, 立即移除忽略项
+并升级依赖. 走查触发 = `just audit` 时人工核对 (CI 每 PR 跑, 但 ignore 项不报错, 易遗忘).
+
 ## 部署
 
 NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 批量注入方案,
