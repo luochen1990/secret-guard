@@ -696,15 +696,15 @@
 
 **Properties**:
 - `prop_reconcile_preserves_scrolltop`: 自动刷新前后 scrollTop Δ < 10px. ✅ `im-ui.spec.ts` "需求 1 (B1/B2 根治)".
-- `prop_reconcile_preserves_bubble_expand_state`: 已展开的气泡在 reconcile 后仍展开. ⏳ 测试待补.
-- `prop_reconcile_correct_for_all_change_modes`: keyed reconciliation 对 append/prepend/replace/完全不同 四种变动模式都正确. ⏳ 仅 append (I3 守卫) + replace (切换会话) 覆盖, prepend/完全不同 待补.
+- `prop_reconcile_preserves_bubble_expand_state`: 已展开的气泡在 reconcile 后仍展开. ✅ `im-ui.spec.ts` "UI-4 prop_reconcile_preserves_bubble_expand_state".
+- `prop_reconcile_correct_for_all_change_modes`: keyed reconciliation 对 append/prepend/replace/完全不同 四种变动模式都正确. ✅ append (I3 守卫) + replace (切换会话, "需求 4") + 完全不同 ("UI-4 prop_reconcile_correct_for_all_change_modes"); prepend (滚到顶 lazy load) 待补.
 
 ### UI-5 末轮 response 独立 drawer
 
 **陈述**: response 渲染为独立的 `.response-drawer` (overlay 架构), 不在 `.tl-round` 内. `#detail` 高度必须固定 (= wrapH), 禁止改为 `height: wrapH - drawerH` 或引入 flex 分栏.
 
 **Properties**:
-- `prop_detail_height_fixed`: `#detail` height == wrapH, 不依赖 drawerH. ⏳ 测试待补 (现有 drawer phase 测试间接覆盖, 但未直接断言 height 不变).
+- `prop_detail_height_fixed`: `#detail` height == wrapH, 不依赖 drawerH. ✅ `im-ui.spec.ts` "UI-5 prop_detail_height_fixed".
 - `prop_drawer_overlay_not_in_round`: response drawer DOM 不在 `.tl-round` 子树内. ✅ `im-ui.spec.ts` "需求 3: response 抽屉固定底部" 间接覆盖.
 
 ---

@@ -3343,7 +3343,12 @@
       document.getElementById('p-name').value = existing?.name || '';
       document.getElementById('p-protocol').value = existing?.protocol || state.providerProtocols[0] || 'openai';
       document.getElementById('p-base-url').value = existing?.base_url || '';
-      document.getElementById('p-api-key').value = ''; // 强制重输; 留空则覆盖为空字符串.
+      const apiKeyInput = document.getElementById('p-api-key');
+      apiKeyInput.value = '';
+      // 编辑模式下用 masked 旧值做 placeholder, 提示"留空将保留"; 创建模式保持原提示.
+      apiKeyInput.placeholder = existing?.api_key_masked
+        ? `unchanged (${existing.api_key_masked}) — leave blank to keep`
+        : '(optional for local providers like Ollama)';
       document.getElementById('p-enabled').checked = existing ? existing.enabled : true;
       title.textContent = existing ? `Edit provider ${existing.id}` : 'New provider';
       toggleOverrideBanner(dlg, existing);
@@ -3401,14 +3406,20 @@
       mock_strategy: collectMockStrategyFromForm(),
     }));
 
-    bindFormSubmit('provider', 'provider-form-el', () => ({
-      id: document.getElementById('p-id').value.trim() || null,
-      name: document.getElementById('p-name').value.trim() || null,
-      protocol: document.getElementById('p-protocol').value,
-      base_url: document.getElementById('p-base-url').value.trim(),
-      enabled: document.getElementById('p-enabled').checked,
-      api_key: document.getElementById('p-api-key').value,
-    }));
+    bindFormSubmit('provider', 'provider-form-el', () => {
+      // 编辑模式 (PUT): api_key 留空 → 发 null, 后端保留旧值 (见 update_provider handler).
+      // 创建模式 (POST): api_key 始终发字符串 (空串 = 不设置, 适用 Ollama).
+      const isUpdate = !!document.getElementById('provider-form').dataset.editId;
+      const apiKeyInput = document.getElementById('p-api-key').value;
+      return {
+        id: document.getElementById('p-id').value.trim() || null,
+        name: document.getElementById('p-name').value.trim() || null,
+        protocol: document.getElementById('p-protocol').value,
+        base_url: document.getElementById('p-base-url').value.trim(),
+        enabled: document.getElementById('p-enabled').checked,
+        api_key: isUpdate && apiKeyInput === '' ? null : apiKeyInput,
+      };
+    });
 
     // ─── decision PATCH ──────────────────────────────────────────────────
     async function patchDecision(kind, id, mode) {

@@ -2107,6 +2107,109 @@ async fn providers_api_create_update_delete() {
     assert_eq!(providers.len(), 1);
 }
 
+/// PUT provider 请求, 物理省略 api_key 字段.
+///
+/// 用 raw JSON body 而非 `serde_json::json!` 确保 `api_key` 被物理省略
+/// (json! 的 null 序列化为 `"api_key":null`, 而非字段缺失).
+/// `#[serde(default)]` 把字段缺失反序列化为 None, 把显式 null 也反序列化为 None,
+/// 但 raw body 测试更严格地模拟了 WebUI 实际发的请求形态.
+async fn put_provider_omit_api_key(
+    client: &reqwest::Client,
+    proxy_url: &str,
+    id: &str,
+    base_url: &str,
+) -> reqwest::Response {
+    client
+        .put(format!("{proxy_url}/__sg/api/providers/{id}"))
+        .header("Content-Type", "application/json")
+        .body(format!(
+            r#"{{"protocol":"openai","base_url":"{base_url}"}}"#
+        ))
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn providers_api_update_preserves_api_key_when_omitted() {
+    let upstream = spawn_mock_upstream().await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
+    let client = reqwest::Client::new();
+
+    // 创建带 api_key 的 provider.
+    let resp = client
+        .post(format!("{proxy_url}/__sg/api/providers"))
+        .json(&serde_json::json!({
+            "id": "oa-pres",
+            "name": "OpenAI Preserve",
+            "protocol": "openai",
+            "base_url": upstream.url(),
+            "api_key": "sk-original-XYZ",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+
+    // PUT 不带 api_key 字段 (JSON 省略 → 后端 None): 应保留旧值.
+    let resp =
+        put_provider_omit_api_key(&client, &proxy_url, "oa-pres", "https://example.com/v2").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let updated: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(updated["base_url"], "https://example.com/v2");
+    assert_eq!(updated["api_key_length"], 15); // "sk-original-XYZ" 保留
+    assert!(updated["api_key_masked"].as_str().unwrap().contains('*'));
+
+    // PUT 显式发空串 api_key: 应清空.
+    let resp = client
+        .put(format!("{proxy_url}/__sg/api/providers/oa-pres"))
+        .json(&serde_json::json!({
+            "protocol": "openai",
+            "base_url": "https://example.com/v3",
+            "api_key": "",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let cleared: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(cleared["api_key_length"], 0);
+}
+
+#[tokio::test]
+async fn providers_api_update_preserves_api_key_on_static_fork() {
+    // 编辑 static-only provider 时, api_key 省略应从 static baseline 保留.
+    let upstream = spawn_mock_upstream().await;
+    let static_provider = Provider {
+        id: "oa-static".into(),
+        protocol: Protocol::OpenAI,
+        base_url: upstream.url(),
+        api_key: "sk-static-key".into(),
+        api_key_file: None,
+        enabled: true,
+        name: Some("Static".into()),
+    };
+    let proxy_url = spawn_proxy_static_dynamic(
+        vec![static_provider],
+        vec![],
+        reqwest::Client::new(),
+        ConversationDag::new(64, 500, 1),
+        test_secret_table(),
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    // PUT 编辑 static-only id (不传 api_key) → 触发 fork, api_key 应来自 static.
+    let resp =
+        put_provider_omit_api_key(&client, &proxy_url, "oa-static", "https://new.example.com")
+            .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let forked: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(forked["base_url"], "https://new.example.com");
+    assert_eq!(forked["api_key_length"], 13); // "sk-static-key" 保留
+    assert_eq!(forked["source"], "dynamic_override");
+}
+
 #[tokio::test]
 async fn providers_api_rejects_bad_base_url() {
     let upstream = spawn_mock_upstream().await;

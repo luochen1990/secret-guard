@@ -386,7 +386,6 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
   messages 数 > IR messages 数. `extract_delta_messages` 切片时跨协议路径的 start 偏小,
   delta 可能包含前序轮消息. 同协议路径不受影响. 详见 `src/web/AGENTS.md`.
 - static config 的 `[server]` / `[redact]` 段仅在启动时读取一次, WebUI 改 host/port/global_mock_prefix 不会生效.
-- WebUI 编辑 provider 时 api_key 始终要求重输 (无法保留旧值).
 
 ## 后续工作 (非 MVP 范围)
 
@@ -394,12 +393,14 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
   `StreamTranslate::new(ingress, egress)` 而非返回 501.
 - **更多协议**: Gemini / Ollama / Bedrock / Cohere / OpenAI Responses API.
   新增协议只需实现 Reader + Writer trait (~200 行), 不动 dispatch.
-- **redact 性能优化**: `redact_ir` 与 `StreamingRestorer::find_safe_end` 对每个 secret
-  做全字符串扫描 (K * n 复杂度). 长期用 Aho-Corasick 多模式匹配. 性能基线见
-  `just bench` (criterion, 3 场景 × 2 目标, 详尽设计见 `benches/redact.rs` 头部).
 - mock_secret 的 category-aware 默认生成 (Password/ApiKey/Cookie 等格式感知).
 - 配置热加载; 测试覆盖率自动上报 + fuzzing (cargo-fuzz).
-- Web UI 编辑 provider 时保留 api_key (改用 `null` 表示不更新).
 - **依赖升级** (滞后是稳态, 非风险; Cargo.lock 锁定保证可复现构建; 触发条件满足时再升):
   rand 0.8→0.9 / sha2 0.10→0.11 / tower-sessions 0.14→0.15 / reqwest 0.12→0.13,
   触发条件 = CVE / 解 duplicate / 需要 feature.
+
+### 已知搁置 (有意识的不做)
+
+- **redact 性能优化 (Aho-Corasick)**: `redact_ir` 与 `StreamingRestorer::find_safe_end`
+  对每个 secret 做全字符串扫描 (K * n 复杂度). 性能基线已建立 (`just bench`),
+  当前不是瓶颈, 等真有性能问题再做. 详尽设计见 `benches/redact.rs` 头部.

@@ -1050,4 +1050,138 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     }
     expect(maxJump).toBeLessThan(0.08);
   });
+
+  // ─── UI-4 / UI-5 property 补全 ───────────────────────────────────────
+  //
+  // 守卫 contracts.md 中标 ⏳ 的 property, 补齐 keyed reconciliation + drawer 的不变量.
+
+  test("UI-5 prop_detail_height_fixed: #detail height 不随 drawerH 变化", async ({
+    page,
+  }) => {
+    // #detail-wrap 占满 wrap (height=100%), #detail flex:1. drawer 是 overlay
+    // (position:absolute), 不影响 #detail 高度. 滚动 #detail 到不同位置,
+    // drawer 高度会变 (phase 切换), 但 #detail height 应恒等于 wrapH.
+    await setupLongChatSelectRound(page, "ui5-height-marker", 2 /* 末轮 */);
+
+    const measurements = await page.evaluate(async () => {
+      const d = document.getElementById("detail")!;
+      const w = document.getElementById("detail-wrap")!;
+      const drawer = document.getElementById("response-drawer")!;
+      const wrapH = w.clientHeight;
+      const maxScroll = d.scrollHeight - d.clientHeight;
+      const out: Array<{ st: number; detailH: number; drawerH: number }> = [];
+      const nextFrame = () =>
+        new Promise<void>((r) => requestAnimationFrame(() => r()));
+      // 采样: 顶 / 中 / 底 三处 (drawer 处于不同 phase).
+      for (const ratio of [0, 0.5, 1]) {
+        d.scrollTop = Math.floor(ratio * maxScroll);
+        await nextFrame();
+        await nextFrame();
+        out.push({
+          st: d.scrollTop,
+          detailH: d.clientHeight,
+          drawerH: drawer.offsetHeight,
+        });
+      }
+      return { wrapH, out };
+    });
+
+    // 核心断言: detailH 恒等于 wrapH, 不随 drawerH 变化.
+    for (const m of measurements.out) {
+      expect(m.detailH).toBe(measurements.wrapH);
+    }
+    // 同时验证 drawerH 确实在变 (否则上面断言无区分性, 假绿).
+    const drawerHeights = measurements.out.map((m) => m.drawerH);
+    const drawerRange = Math.max(...drawerHeights) - Math.min(...drawerHeights);
+    expect(drawerRange).toBeGreaterThan(10);
+  });
+
+  test("UI-4 prop_reconcile_preserves_bubble_expand_state: 展开气泡跨刷新保留", async ({
+    page,
+  }) => {
+    // 自动刷新 (3s 间隔) 触发 reconcileTimelineRounds. keyed reconciliation
+    // 按 data-rid 匹配新旧 .tl-round, 公共节点的 DOM 完全保留, 包括 .expanded class.
+    //
+    // 触发链: 选中末轮 → 气泡默认 collapsed → 手动点 toggle 进 expanded →
+    // 等一次自动刷新 → 断言 .expanded class 仍在.
+    await setupLongChatSelectRound(page, "ui4-expand-marker", 2 /* 末轮 */);
+
+    // 找一个 .chat-bubble.collapsed (长内容才会被折叠, setupLongChatSelectRound 的
+    // 3000 字符 'x' 内容足够触发). 切到 expanded.
+    // 用 .chat-bubble 作 selector (无 collapsed 限定), 后续操作不会因 class 切换而失联.
+    const bubble = page.locator("#detail .chat-bubble").first();
+    await bubble.waitFor({ state: "visible", timeout: 3000 });
+    // 先确认它初始是 collapsed (即长内容, 有 toggle 按钮).
+    await expect(bubble).toHaveClass(/collapsed/);
+    // 直接改 class (不点击): 测试目标是 reconcile 保留 expanded, 而非 toggle 点击 UX.
+    await bubble.evaluate((el) => {
+      el.classList.replace("collapsed", "expanded");
+    });
+    await expect(bubble).toHaveClass(/expanded/);
+
+    // 等 2 轮自动刷新 (间隔 3s, 保守等 7s).
+    await page.waitForTimeout(7000);
+
+    // 断言: 气泡仍是 expanded (reconcile 没把它打回 collapsed).
+    await expect(bubble).toHaveClass(/expanded/);
+  });
+
+  test("UI-4 prop_reconcile_correct_for_all_change_modes: 切换会话 (完全不同) 后再切回 (replace) 保持 DOM", async ({
+    page,
+  }) => {
+    // 覆盖 keyed reconciliation 的 "完全不同" 变动模式:
+    // 切到另一个会话 → timelineRecords 完全替换 → 旧 .tl-round 全部移除, 新的全部插入.
+    // 再切回原会话 → 又一次完全替换. 这两步都应正确渲染, 不残留旧 DOM.
+    //
+    // append 模式已由 I3 守卫, replace 模式已由 "需求 4" 间接覆盖, 这里补 "完全不同".
+    //
+    // 准备两个独立会话 (各自单轮, prefix hash 不同 → 不同 session).
+    const markerA = "reconcile-abort-A-9f3c7e1d";
+    const markerB = "reconcile-abort-B-2a8b4c6f";
+    await sendChat(page, [
+      { role: "user", content: markerA },
+      { role: "assistant", content: "reply from session A" },
+    ]);
+    await sendChat(page, [
+      { role: "user", content: markerB },
+      { role: "assistant", content: "reply from session B" },
+    ]);
+
+    const sidA = await findSessionLeafByPreview(page, markerA);
+    const sidB = await findSessionLeafByPreview(page, markerB);
+
+    // 切到 A, 验证内容正确.
+    await clickSessionByLeaf(page, sidA);
+    await expect(page.locator("#detail .request-pane")).toContainText(markerA);
+    const roundsInA = await page.locator("#detail .tl-round").count();
+
+    // 切到 B (完全不同模式): A 的 DOM 应全部被替换为 B 的.
+    // 注: clickSessionByLeaf 等待条件是 .request-pane 出现, 但切前 A 也有 request-pane,
+    // 故等待会立即返回. 用 expect.poll 轮询直到 B 的 marker 真正出现.
+    await clickSessionByLeaf(page, sidB);
+    await expect
+      .poll(async () => {
+        const text = await page.locator("#detail .request-pane").textContent();
+        return text ?? "";
+      })
+      .toContain(markerB);
+    // A 的 marker 不应残留.
+    await expect(page.locator("#detail")).not.toContainText(markerA);
+
+    // 切回 A (再次完全不同): B 应被清掉, A 重新渲染.
+    // toggleSession 对已展开 session 会折叠而非重新选中, 故改点 A 内部的 round-item
+    // (data-rid) 触发 selectRound, 直接定位轮次并 reload timeline.
+    const roundItemA = page.locator(`.round-item[data-sid="${sidA}"]`).first();
+    await roundItemA.click();
+    await expect
+      .poll(async () => {
+        const text = await page.locator("#detail .request-pane").textContent();
+        return text ?? "";
+      })
+      .toContain(markerA);
+    await expect(page.locator("#detail")).not.toContainText(markerB);
+    // 轮次数应与首次切到 A 时一致.
+    const roundsInAAgain = await page.locator("#detail .tl-round").count();
+    expect(roundsInAAgain).toBe(roundsInA);
+  });
 });
