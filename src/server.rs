@@ -14,6 +14,11 @@
 //! - 浏览器 WebUI (`/__sg/*`): OIDC Authorization Code + PKCE → cookie session.
 //! - SDK 转发 (`/{o|a|g|l}/*`): 本地 API key (`Authorization: Bearer sg_...`).
 //!
+//! ApiKeyStore 总是构造 (与 `auth.enabled` 无关), 让 WebUI 在单用户模式下也能
+//! 管理和预配置 key. `/api/api-keys` CRUD 路由在 `web::router()` 里无条件挂载
+//! (不隔离, 见 `src/web/api.rs`); `require_api_key` middleware 仅在 auth 启用时挂载
+//! 到 forwarding 路径.
+//!
 //! # 协议简写
 //! `o`=OpenAI, `a`=Anthropic, `g`=Gemini, `l`=oLLama. 见 [`crate::provider::Protocol`].
 //!
@@ -36,7 +41,7 @@ use anyhow::Context;
 use axum::middleware;
 use axum::{
     Router,
-    routing::{any, get, patch, post},
+    routing::{any, get, post},
 };
 use parking_lot::{Mutex, RwLock};
 use tokio::net::TcpListener;
@@ -127,25 +132,11 @@ fn build_router_with_auth_layers(
         .route("/api/me", get(crate::auth::handlers::me))
         .layer(axum::Extension(auth_state));
 
-    // 受保护路由: WebUI + API key CRUD, 需要 login_required guard + ProxyState.
-    let webui_protected: Router<ProxyState> = web::router()
-        .route_layer(axum_login::login_required!(
-            OidcBackend,
-            login_url = "/__sg/login"
-        ))
-        // API key CRUD (只有登录用户能签发 key).
-        .route(
-            "/api/api-keys",
-            get(crate::web::api::list_api_keys).post(crate::web::api::create_api_key),
-        )
-        .route(
-            "/api/api-keys/{id}",
-            axum::routing::delete(crate::web::api::delete_api_key),
-        )
-        .route(
-            "/api/api-keys/{id}/toggle",
-            patch(crate::web::api::toggle_api_key),
-        );
+    // 受保护路由: WebUI, 需要 login_required guard + ProxyState.
+    // 注: /api/api-keys CRUD 不在此处挂载 — 见 `web::router()` (无条件挂载, 不隔离用户).
+    let webui_protected: Router<ProxyState> = web::router().route_layer(
+        axum_login::login_required!(OidcBackend, login_url = "/__sg/login"),
+    );
 
     // 转发路由: 应用 API key middleware.
     // from_fn_with_state 在 layer 层注入 ApiKeyStore, 不改变 Router 的 state 类型.
@@ -215,6 +206,20 @@ pub async fn serve(
         state_path.clone(),
         persist_lock.clone(),
     );
+
+    // API key store: 总是构造, 不依赖 auth.enabled.
+    // 设计: /api/api-keys CRUD 无条件挂载 (不隔离, 只认证); 见 web::router().
+    // - auth 关闭 (单用户模式): store 用于 WebUI 管理 key (签发的 key 暂时无消费方,
+    //   因为 forwarding 路径的 require_api_key middleware 不挂载, 但数据可预先配置好).
+    // - auth 启用: store 同时服务于 WebUI 管理 + forwarding middleware 鉴权.
+    let api_keys = ApiKeyStore::new(
+        &auth_config.api_keys,
+        &config_path,
+        dyn_state.api_keys.clone(),
+        dyn_state.api_keys_disabled.clone(),
+        state_path.clone(),
+        persist_lock.clone(),
+    );
     let provider_table = ProviderTable::with_persist_lock(
         static_providers,
         dyn_state.providers,
@@ -228,11 +233,11 @@ pub async fn serve(
         providers: provider_table,
         dag,
         secrets: secret_table,
-        api_keys: None, // 默认 None; 启用认证时在下方覆盖.
+        api_keys: Some(api_keys.clone()),
         global_mock_prefix: Arc::from(global_mock_prefix),
     };
 
-    // 条件化: 启用认证时构造 AuthStack, 否则 None.
+    // 条件化: 启用认证时构造 AuthStack, 否则单用户模式.
     let app = if auth_config.enabled {
         let oidc_cfg = auth_config
             .oidc
@@ -270,21 +275,7 @@ pub async fn serve(
         .await
         .map_err(|e| anyhow::anyhow!("OIDC initialization failed: {e}"))?;
 
-        let api_keys = ApiKeyStore::new(
-            &auth_config.api_keys,
-            &config_path,
-            dyn_state.api_keys.clone(),
-            dyn_state.api_keys_disabled.clone(),
-            state_path.clone(),
-            persist_lock,
-        );
-
-        // 注入 api_keys 到 ProxyState (让 WebUI handler 能访问).
-        let proxy = ProxyState {
-            api_keys: Some(api_keys.clone()),
-            ..proxy
-        };
-
+        // api_keys 已在 auth 分支外构造 (与 ProxyState 共享同一份).
         let auth_stack = AuthStack { backend, api_keys };
         build_router_with_auth(proxy, auth_stack)
     } else {

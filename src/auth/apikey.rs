@@ -447,6 +447,47 @@ mod tests {
         assert!(s.disabled);
     }
 
+    /// 跨模式守卫: auth 关闭时签发的 key (tenant_id="admin") 持久化后,
+    /// 重新加载 (例如启用 auth 重启) 仍能被 lookup() 命中.
+    ///
+    /// 这是 "只认证, 不隔离" 哲学的核心契约: lookup 不读 tenant_id,
+    /// 单用户模式下预配置的 key 启用 auth 后立即可用于 forwarding 鉴权.
+    /// 历史 bug 风险: 若未来误加 tenant_id 过滤到 lookup, 此测试会立即失败.
+    #[test]
+    fn admin_tenant_key_lookup_survives_reload() {
+        let path = tmp_path("cross-mode");
+        let lock = Arc::new(Mutex::new(()));
+        let issued_key;
+        {
+            let store = ApiKeyStore::new(
+                &[],
+                std::path::Path::new("."),
+                vec![],
+                HashSet::new(),
+                path.clone(),
+                lock.clone(),
+            );
+            // 模拟 auth 关闭时 handler 调用: tenant_id/created_by = "admin".
+            let issued = store.issue("admin", "admin", "pre-config").unwrap();
+            issued_key = issued.key;
+        }
+        // 重新加载 (模拟启用 auth 后重启进程).
+        let state = DynamicState::load_or_empty(&path, "").unwrap();
+        let store2 = ApiKeyStore::new(
+            &[],
+            std::path::Path::new("."),
+            state.api_keys,
+            state.api_keys_disabled,
+            path,
+            lock,
+        );
+        // lookup 必须命中, 且 entry 的 tenant_id 字段仍是 "admin".
+        let entry = store2
+            .lookup(&issued_key)
+            .expect("admin-tenant key must remain lookupable across reload");
+        assert_eq!(entry.tenant_id, "admin");
+    }
+
     #[test]
     fn list_shows_source() {
         let sk = vec![StaticApiKey {

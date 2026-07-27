@@ -10,6 +10,7 @@
 //! - `DELETE /__sg/api/secrets/{id}`           —— 删除 (仅 dynamic).
 //! - `PATCH /__sg/api/secrets/{id}/decision`   —— 切换 OverrideMode.
 //! - `GET/POST/PUT/DELETE/PATCH /__sg/api/providers[/{id}[/decision]]` —— 同上.
+//! - `GET/POST/DELETE/PATCH /__sg/api/api-keys[/{id}[/toggle]]` —— API key CRUD (无条件挂载, 见 api.rs).
 //!
 //! 注意: axum 0.8 的 `nest("/__sg", ...)` 默认匹配不带尾斜杠的 `/__sg`, 而不是 `/__sg/`.
 //! server.rs 中显式注册了 `/__sg/` -> `/__sg` 的 redirect (307, 临时), 保证两种 URL 都可用.
@@ -65,6 +66,21 @@ pub fn router() -> Router<ProxyState> {
             "/api/providers/{id}/decision",
             patch(api::set_provider_decision),
         )
+        // API key CRUD: 无条件挂载 (不依赖 auth.enabled), 不做用户隔离.
+        // 设计哲学: 只认证, 不隔离 — 见 src/web/api.rs 中 /api-keys 段注释.
+        //
+        // 安全契约: auth 启用时, 整个 web::router() (含本段) 都被上层
+        // login_required guard 守卫 (server.rs build_router_with_auth_layers).
+        // auth 关闭时, 单用户模式默认本地监听 (127.0.0.1) + 同源策略兜底.
+        .route(
+            "/api/api-keys",
+            get(api::list_api_keys).post(api::create_api_key),
+        )
+        .route(
+            "/api/api-keys/{id}",
+            axum::routing::delete(api::delete_api_key),
+        )
+        .route("/api/api-keys/{id}/toggle", patch(api::toggle_api_key))
 }
 
 /// `/__sg/` -> `/__sg` 的 trailing-slash redirect.

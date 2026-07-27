@@ -1035,12 +1035,6 @@ impl ApiError {
             message: msg.into(),
         }
     }
-    pub fn unauthorized(msg: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::UNAUTHORIZED,
-            message: msg.into(),
-        }
-    }
     pub fn from_any(e: anyhow::Error) -> Self {
         // 详细信息进 tracing, 不回客户端.
         tracing::error!(error = ?e, "api internal error");
@@ -1551,10 +1545,21 @@ mod tests {
 
 // ─── /api-keys ──────────────────────────────────────────────────────────────
 //
-// 仅在 auth.enabled = true 时挂载 (由 server.rs 条件化装配).
-// 这些 handler 需要 OIDC 登录 (通过 login_required guard 保护).
-
-use axum_login::AuthSession;
+// API key CRUD: 无条件挂载 (在 web::router() 里, 不依赖 auth.enabled),
+// 不做用户隔离 — "只认证, 不隔离" 哲学.
+//
+// 设计权衡: 即便 `auth.enabled = false` (单用户模式) 也允许签发和管理 key,
+// 用户可以提前配置好 key, 等启用 auth 后即可使用. 因为 forwarding 路径的
+// `require_api_key` middleware 在 auth 关闭时不挂载, 这些 key 此时无消费方,
+// 但数据持久化在 state.toml, 不会丢失.
+//
+// 隔离的代价 vs 收益: per-user tenant_id 隔离在多用户共享一个 secret-guard 实例的场景
+// 才有价值. secret-guard 的部署形态主要是个人本地网关, 多用户场景下用户之间本身就是
+// 高度互信 (同一团队/家庭), 引入 tenant_id 隔离反而让"用户 A 签发的 key 用户 B 看不到"
+// 这种割裂体验成为常态. 移除后, 所有 (登录的) 用户共享同一份 key 池.
+//
+// tenant_id / created_by 字段保留 (兼容已有持久化数据), 但统一填 "admin" 占位值.
+// 这些字段当前不影响任何业务逻辑 (lookup 不读 tenant_id).
 
 #[derive(Debug, Deserialize)]
 pub struct CreateApiKeyRequest {
@@ -1567,97 +1572,70 @@ pub struct ToggleApiKeyRequest {
     pub disabled: bool,
 }
 
-/// 校验登录态 + 拿到 store. 返回 (user_sub, store).
-fn require_user_and_store<'a>(
-    state: &'a ProxyState,
-    auth_session: &AuthSession<crate::auth::OidcBackend>,
-) -> Result<(String, &'a crate::auth::ApiKeyStore), ApiError> {
-    let user_sub = auth_session
-        .user
-        .as_ref()
-        .map(|u| u.sub.clone())
-        .ok_or_else(|| ApiError::unauthorized("not authenticated"))?;
-    let api_keys = state
+/// 拿到 ApiKeyStore. 不存在说明内部装配错误 (server.rs 应总是注入), 返回 500.
+fn require_store(state: &ProxyState) -> Result<&crate::auth::ApiKeyStore, ApiError> {
+    state
         .api_keys
         .as_ref()
-        .ok_or_else(|| ApiError::internal("API key store not configured (auth disabled?)"))?;
-    Ok((user_sub, api_keys))
+        .ok_or_else(|| ApiError::internal("ApiKeyStore missing in ProxyState (server misassembly)"))
 }
 
-/// 列出: 用户自己的动态 key + 所有静态 key.
-pub async fn list_api_keys(
-    State(state): State<ProxyState>,
-    auth_session: AuthSession<crate::auth::OidcBackend>,
-) -> Result<impl IntoResponse, ApiError> {
-    let (user_sub, api_keys) = require_user_and_store(&state, &auth_session)?;
-    let keys: Vec<_> = api_keys
-        .list()
-        .into_iter()
-        .filter(|k| k.source == "static" || k.tenant_id == user_sub)
-        .collect();
+/// 列出所有 key (静态 + 动态), 不按用户过滤.
+pub async fn list_api_keys(State(state): State<ProxyState>) -> Result<impl IntoResponse, ApiError> {
+    let api_keys = require_store(&state)?;
+    let keys: Vec<_> = api_keys.list().into_iter().collect();
     Ok((NO_STORE, Json(serde_json::json!({ "keys": keys }))))
 }
 
 pub async fn create_api_key(
     State(state): State<ProxyState>,
-    auth_session: AuthSession<crate::auth::OidcBackend>,
     Json(payload): Json<CreateApiKeyRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let (user_sub, api_keys) = require_user_and_store(&state, &auth_session)?;
+    let api_keys = require_store(&state)?;
+    // tenant_id / created_by 用 "admin" 占位 — 不隔离, 字段仅作展示和审计保留.
     let issued = api_keys
-        .issue(&user_sub, &user_sub, &payload.label)
+        .issue("admin", "admin", &payload.label)
         .map_err(ApiError::from_any)?;
     Ok((StatusCode::CREATED, NO_STORE, Json(issued)))
 }
 
-/// 删除 (仅动态 key, 且只能删自己的). 静态 key 返回 403.
+/// 删除 (仅动态 key). 静态 key 返回 409 Conflict; 不存在返回 404 (与 toggle 对齐).
 pub async fn delete_api_key(
     State(state): State<ProxyState>,
-    auth_session: AuthSession<crate::auth::OidcBackend>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let (user_sub, api_keys) = require_user_and_store(&state, &auth_session)?;
+    let api_keys = require_store(&state)?;
+    // 提前检查 static: 把 revoke 内部的 anyhow::bail! 映射为 409 conflict
+    // (否则 from_any 会把它当作 500 internal error).
     if crate::auth::apikey::is_static(&id) {
         return Err(ApiError::conflict(
             "static API key cannot be deleted; use disable instead",
         ));
     }
-    let owns = api_keys
-        .list()
-        .into_iter()
-        .any(|k| k.id == id && k.tenant_id == user_sub);
-    if !owns {
+    let deleted = api_keys.revoke(&id).map_err(ApiError::from_any)?;
+    if !deleted {
         return Err(ApiError::not_found(format!("API key {id} not found")));
     }
-    api_keys.revoke(&id).map_err(ApiError::from_any)?;
     Ok((StatusCode::NO_CONTENT, NO_STORE, ""))
 }
 
-/// 切换 disabled 状态. 静态 key 任何人可 toggle; 动态 key 只能 toggle 自己的.
+/// 切换 disabled 状态.
+///
+/// 静态 / 动态 key 均可 toggle (与 delete 不同 — delete 对 static 短路返回 409).
+/// 原因: set_disabled 对 static / dynamic 一视同仁, 不会 bail!.
 pub async fn toggle_api_key(
     State(state): State<ProxyState>,
-    auth_session: AuthSession<crate::auth::OidcBackend>,
     Path(id): Path<String>,
     Json(payload): Json<ToggleApiKeyRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let (user_sub, api_keys) = require_user_and_store(&state, &auth_session)?;
-    let is_static = crate::auth::apikey::is_static(&id);
-    if !is_static {
-        // 动态 key: 只能 toggle 自己的.
-        let owns = api_keys
-            .list()
-            .into_iter()
-            .any(|k| k.id == id && k.tenant_id == user_sub);
-        if !owns {
-            return Err(ApiError::not_found(format!("API key {id} not found")));
-        }
-    }
-    api_keys
+    let api_keys = require_store(&state)?;
+    // 用 store 实际落库的值响应 (严格反映服务端状态, 而非回声请求).
+    let disabled = api_keys
         .set_disabled(&id, payload.disabled)
         .map_err(ApiError::from_any)?
         .ok_or_else(|| ApiError::not_found(format!("API key {id} not found")))?;
     Ok((
         NO_STORE,
-        Json(serde_json::json!({ "id": id, "disabled": payload.disabled })),
+        Json(serde_json::json!({ "id": id, "disabled": disabled })),
     ))
 }

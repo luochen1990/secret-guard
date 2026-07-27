@@ -78,8 +78,9 @@ pub struct ProxyState {
     pub providers: ProviderTable,
     pub dag: ConversationDag,
     pub secrets: SecretTable,
-    /// API key 存储 (仅 auth.enabled = true 时存在).
-    /// 单用户模式 (auth.enabled = false) 下为 None, handler 不消费此字段.
+    /// API key 存储 (总是 Some; server.rs 无条件构造, 与 auth.enabled 无关).
+    /// 字段类型保留 Option 仅为兼容 tests/integration.rs 的简化构造 (None 写法),
+    /// handler 通过 require_store() 解包. 见 src/web/api.rs 中 /api-keys 段.
     #[allow(unused)]
     pub api_keys: Option<crate::auth::ApiKeyStore>,
     /// 来自 `[redact] global_mock_prefix` (默认空串). WebUI secret upsert 时

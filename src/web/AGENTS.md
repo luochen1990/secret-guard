@@ -36,6 +36,11 @@ POST   /__sg/api/providers
 PUT    /__sg/api/providers/{id}
 DELETE /__sg/api/providers/{id}
 PATCH  /__sg/api/providers/{id}/decision
+
+GET    /__sg/api/api-keys
+POST   /__sg/api/api-keys
+DELETE /__sg/api/api-keys/{id}
+PATCH  /__sg/api/api-keys/{id}/toggle
 ```
 
 所有响应带 `Cache-Control: no-store`, 避免浏览器对自动刷新返回缓存内容.
@@ -127,6 +132,21 @@ timeline 返回的 N 个节点中, 只有最末节点 (timeline anchor) 保留 `
 - GET 永不返回 secret 的 `value` / provider 的 `api_key` 真实值 (用 `mask_value` 占位).
 - 写操作通过同源策略 + 本地监听 (默认 127.0.0.1) 保护.
 - 内部错误细节不通过响应体返回, 仅进 tracing.
+
+### API keys (无 auth 依赖)
+
+API key CRUD **无条件挂载** (在 `web::router()`, 不依赖 `auth.enabled`),
+遵循"**只认证, 不隔离**"哲学:
+
+- `auth.enabled = false` (单用户模式): store 仍然构造, WebUI 可签发/管理 key.
+  数据持久化在 state.toml, 用户可"预先配置好", 等启用 auth 后即可使用.
+  注: 此时 forwarding 路径的 `require_api_key` middleware 不挂载, 这些 key
+  暂无消费方, 但不影响数据生命周期.
+- `auth.enabled = true`: store 同时服务 WebUI 管理 + forwarding middleware 鉴权.
+- **不做用户隔离**: 移除 `tenant_id == user_sub` 过滤 — 所有 (登录的) 用户共享
+  同一份 key 池. 设计理由见 `src/web/api.rs` 的 `/api-keys` 段注释.
+- `tenant_id` / `created_by` 字段保留 (兼容已有持久化数据), 统一填 `"admin"` 占位,
+  不影响业务逻辑 (lookup 不读 tenant_id).
 
 ## WebUI 渲染契约 (`index.html`)
 

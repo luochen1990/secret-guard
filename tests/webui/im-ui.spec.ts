@@ -1494,4 +1494,61 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     // 无 unread badge (follow 状态 + 0 未读).
     await expect(page.locator("#unread-badge")).toBeHidden();
   });
+
+  // ─── API key CRUD 回归 (auth 关闭场景) ────────────────────────────────────
+  //
+  // 历史 bug: /api/api-keys CRUD 路由仅在 auth.enabled = true 时挂载, 导致
+  // 单用户模式下点 "+ new API key" → POST 返回 405, alert "Failed: HTTP 405".
+  // 修复: 路由无条件挂载 (web::router), 移除 OIDC guard + tenant_id 隔离.
+  //
+  // 守卫: 在 playwright config 的默认 (auth 关闭) 配置下, 完整跑一遍
+  // create → reveal → list → toggle → delete, 验证无 4xx 错误.
+  test("API key CRUD: auth 关闭场景下可签发/列表/切换/删除", async ({ page, request }) => {
+    // 用唯一 marker, 测试间隔离 (即使前次失败残留也能区分).
+    const label = `crud-test-${Date.now()}`;
+
+    // 1. 签发: POST /api/api-keys, 期望 201 + 返回明文 key (仅此一次).
+    const createRes = await request.post(`${SG_API}/api-keys`, {
+      data: { label },
+    });
+    expect(createRes.status(), "POST 应返回 201, 非 405 (历史 bug)").toBe(201);
+    const issued = await createRes.json();
+    expect(issued.key).toMatch(/^sg_/);
+    expect(issued.id).toBeTruthy();
+
+    // 2. 列表: GET /api/api-keys 应包含刚签发的 key (动态, source=dynamic, enabled).
+    const listRes = await request.get(`${SG_API}/api-keys`);
+    expect(listRes.status()).toBe(200);
+    const listed = (await listRes.json()).keys as Array<Record<string, unknown>>;
+    const found = listed.find((k) => k.id === issued.id);
+    expect(found, "新建 key 应出现在列表中").toBeTruthy();
+    expect(found!.disabled).toBe(false);
+    expect(found!.source).toBe("dynamic");
+
+    // 3. UI 侧也验证 (覆盖前端 renderApiKeys + dialog 流程).
+    // 切到 API Keys tab, 验证列表渲染出新 key 的 label.
+    await page.locator('a.tab[data-tab="apikeys"]').click();
+    await expect(
+      page.locator("#apikeys-body"),
+      "UI 列表应渲染新建 key 的 label"
+    ).toContainText(label);
+
+    // 4. 切换 disabled: PATCH, 期望返回 disabled=true.
+    const toggleRes = await request.patch(
+      `${SG_API}/api-keys/${issued.id}/toggle`,
+      { data: { disabled: true } }
+    );
+    expect(toggleRes.status()).toBe(200);
+    const toggled = await toggleRes.json();
+    expect(toggled.disabled).toBe(true);
+
+    // 5. 删除: DELETE, 期望 204.
+    const delRes = await request.delete(`${SG_API}/api-keys/${issued.id}`);
+    expect(delRes.status(), "DELETE 应返回 204").toBe(204);
+
+    // 6. 再次列表, 验证 key 已消失 (自清理, 不污染其他测试).
+    const listRes2 = await request.get(`${SG_API}/api-keys`);
+    const listed2 = (await listRes2.json()).keys as Array<Record<string, unknown>>;
+    expect(listed2.find((k) => k.id === issued.id)).toBeUndefined();
+  });
 });

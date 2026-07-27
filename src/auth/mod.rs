@@ -1,5 +1,13 @@
 //! 认证骨架: OIDC 登录 (浏览器 WebUI) + 本地 API key (SDK 转发路径).
 //!
+//! # "只认证, 不隔离" 哲学
+//!
+//! ApiKeyStore 在 server.rs 中**无条件构造** (与 `auth.enabled` 无关), 让 WebUI
+//! 在单用户模式下也能管理和预配置 key (用户可先配好, 等启用 auth 后即可使用).
+//! `/api/api-keys` CRUD 路由无条件挂载 (在 `web::router()`), handler 不做用户隔离 —
+//! 所有 (登录的) 用户共享同一份 key 池. 设计理由见 `src/web/api.rs` 中 `/api-keys` 段.
+//! `require_api_key` middleware 仅在 auth 启用时挂载到 forwarding 路径.
+//!
 //! # 静态预设 API key
 //!
 //! 用户可在 `secret-guard.toml` 中预设 API key (如 CI/CD 场景), 与 WebUI 签发的 key

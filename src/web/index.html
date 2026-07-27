@@ -3096,10 +3096,10 @@
         state.apiKeysList = data.keys || [];
         renderApiKeys();
       } catch (e) {
-        // auth disabled → 401/404; 显示空状态不报错.
+        // /api/api-keys 路由无条件挂载 (不依赖 auth.enabled), 失败 = 真 bug, 不静默.
+        // 保留上次列表 (与 refreshKind 一致, 避免 transient 错误让 UI 突然空白).
         console.error(e);
-        state.apiKeysList = [];
-        renderApiKeys();
+        setStatus('apikey refresh failed', 'status-err');
       }
     }
 
