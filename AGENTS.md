@@ -138,10 +138,9 @@ Redact 不应无必要地改变 request body 的字节内容, 避免破坏 LLM P
 保证同一 policy + 同一上下文 → 同一 mock. 详尽契约 (C1-C6) 见 `src/redact.rs` 头部
 与 `src/mock.rs` 头部.
 
-## 前端不变量 (UI Invariants) → UI-1/UI-2/UI-3 契约
+## 前端不变量 (UI Invariants) → UI-1..UI-6 契约 (I1..I5)
 
-> 这两条是**跨 web/dag/index.html 的强不变量**, 任何渲染优化或内存重构不得违反.
-
+> 以下五条是**跨 web/dag/index.html 的强不变量**, 任何渲染优化或内存重构不得违反.
 ### I1 — 气泡数 == 上下文数组长度
 
 会话详情页 (timeline) 渲染的 Bubble 数量, 必须等于该 Node 对应 HTTP 请求的 IR messages
@@ -167,7 +166,24 @@ timeline 中带 `.selected` 类的 `.tl-round` 集合, 必须严格等于 `{stat
 `reconcileTimelineRounds` 复用已有节点时也不更新 class, 导致 `.selected` 滞留在旧轮次
 与 `.flash` 错位.
 
-**回归守卫**: 这四条不变量由 `tests/webui/im-ui.spec.ts` 守卫. 改前端渲染逻辑或后端
+### I5 — timeline 滚动状态机: followMode 是视口位置的纯派生 (↔ UI-6)
+
+timeline 的 follow/pinned 状态由 **视口距底部距离** 机械推导 (SSOT), 不由 "最近点了什么"
+显式动作决定. 形式化: `state.timelineFollow == isNearBottom()`, 在每次 scroll 事件
+(RAF 合并) + 每次新内容追加后由 `syncFollowMode()` 重算.
+
+- **follow** (距底 ≤ `NEAR_BOTTOM_PX` ≈ 100px): 新 round 到达 → `scrollTimelineToBottomForce`
+  锁定视口; `unreadCount` 清零.
+- **pinned** (距底 > `NEAR_BOTTOM_PX`): 新 round 到达 → 不滚动, `unreadCount` 累加,
+  `#unread-badge` 浮出显示 "↓ N".
+
+**`selectedRound` 与 followMode 解耦 (方案 X)**: `selectedRound` 是 "用户最后显式关注的轮次",
+**不随 follow 自动推进** (避免 Response 抽屉布局抖动 + `.flash` 反复触发). 仅在 "进入 follow 的显式动作"
+(点 Session / 点 unread badge / 初次 `loadTimeline`) 时重置 selected 到最新轮 (`.selected` 持续
+高亮, 不触发 `.flash` — 因为这些动作用 `scroll:'bottom'` 滚到底, 与 `highlightRound` 的 70% 定位
+冲突). follow 期间新消息到达: selected 不变.
+
+**回归守卫**: 这五条不变量由 `tests/webui/im-ui.spec.ts` 守卫. 改前端渲染逻辑或后端
 delta 切片时, 必须同步跑 `just check-webui`.
 
 ## 路由策略 (核心契约)

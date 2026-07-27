@@ -202,6 +202,30 @@ scroll-nav 的 bottom 同步到 drawerH, 使底部按钮贴合滚动区域底端
 选中轮次 (来自 sidebar 点击或 timeline header 点击) 持续高亮 (`.tl-round.selected`,
 背景色 + 左侧色条), 不是一闪而过的动画. 选中瞬间叠加一次 `.flash` 闪烁动画作为反馈.
 
+### timeline 滚动状态机: follow / pinned (I5 ↔ UI-6)
+
+timeline 有两种滚动状态, 由 **视口距底部距离** 机械推导 (SSOT), 不由 "最近点了什么" 决定:
+
+- **follow** (距底 ≤ `NEAR_BOTTOM_PX` ≈ 100px): 新 round 到达 → 自动滚到底 (`scrollTimelineToBottomForce`).
+- **pinned** (距底 > `NEAR_BOTTOM_PX`): 新 round 到达 → 不滚动, 浮出 `#unread-badge` 显示 "↓ N".
+
+**关键解耦 (方案 X)**: `selectedRound` 与 `timelineFollow` 解耦. `selectedRound` 是
+"用户最后显式关注的轮次", **不随 follow 自动推进** (避免 Response 抽屉布局连续重算 +
+`.flash` 反复触发). 仅 "进入 follow 的显式动作" (点 Session / 点 unread badge / 初次
+loadTimeline) 才重置 selected 到最新轮 (`.selected` 持续高亮; 不触发 `.flash` — 因
+这些动作用 `scroll:'bottom'` 滚到底, 与 `highlightRound` 的 70% 定位冲突).
+
+**状态机入口**:
+- `syncFollowMode()`: 唯一改 `state.timelineFollow` 的入口, 在 scroll 事件 (RAF 合并) +
+  新内容追加后调用. pinned → follow 时清零 `unreadCount`.
+- `refreshTimelineTail()`: 新 round 到达时按 follow/pinned 分支处理 (follow 滚底 / pinned 累加未读).
+- `jumpToLatest()`: unread badge 点击 = 进入 follow + 重置 selected 到最新轮.
+
+**"↓ 回到底部" vs "跳到最新" (unread badge) 的语义区别**:
+- `scrollTimelineToBottom()` (↓ 按钮): 仅滚动视口到最新轮, **不重置** selectedRound.
+  进入 follow 由后续 scroll 事件的 syncFollowMode 自然完成.
+- `jumpToLatest()` (unread badge): 滚动 + **重置** selectedRound 到最新轮 (`.selected` 持续高亮, 无 flash).
+
 ### 其它渲染细节
 
 - 三段式 fingerprint: 自动刷新期间 request-pane 滚动位置 + bubble 展开状态保持.

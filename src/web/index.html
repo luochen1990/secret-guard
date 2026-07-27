@@ -845,6 +845,27 @@
     /* 底部按钮用 margin-top:auto 推到底部 (而非 justify-content:space-between),
        避免顶部按钮 hidden 时底部按钮错位到顶部. */
     #scroll-bottom-btn { margin-top: auto; }
+    /* unread badge: pinned 期间有未读时浮在底部按钮之上 (而非用 margin-auto 推到底),
+       与 scroll-bottom-btn 留 8px 间距. 强调色 (蓝) 区别于灰色的方向按钮. */
+    #unread-badge {
+      margin-bottom: 8px;
+      width: auto;
+      min-width: 40px;
+      height: 32px;
+      padding: 0 10px;
+      border-radius: 16px;          /* 胶囊 */
+      background: #4a6fa5;
+      color: #fff;
+      font-size: 12px;
+      font-weight: 600;
+      border-color: #4a6fa5;
+      animation: badge-pop 0.18s ease-out;
+    }
+    #unread-badge:hover { background: #3a5a8a; border-color: #3a5a8a; }
+    @keyframes badge-pop {
+      from { transform: scale(0.7); opacity: 0; }
+      to   { transform: scale(1);   opacity: 1; }
+    }
     .scroll-nav button {
       width: 32px;
       height: 32px;
@@ -1039,6 +1060,8 @@
         </div>
         <div class="scroll-nav" id="scroll-nav" hidden>
           <button type="button" id="scroll-top-btn" title="回到顶部" onclick="scrollTimelineToTop()">↑</button>
+          <!-- unread badge: pinned 期间累积未读时浮出, 点击 = 跳到最新 (重置 selected + 进入 follow). -->
+          <button type="button" id="unread-badge" hidden title="跳到最新"></button>
           <button type="button" id="scroll-bottom-btn" title="回到底部" onclick="scrollTimelineToBottom()">↓</button>
         </div>
       </article>
@@ -1292,6 +1315,11 @@
       scrollBound: false,
       scrollRaf: 0,
       resizeRaf: 0,
+      // timeline 滚动状态机 (UI-6): followMode 是距底部距离的纯派生, 不由 "最近点了什么" 决定.
+      //   - syncFollowMode() 是唯一改此字段的入口, 由 scroll 事件 (RAF) + 新内容追加后调用.
+      //   - selectedRound 始终是 "用户最后显式关注的轮次", 不随 follow 自动推进 (方案 X).
+      timelineFollow: true,     // 初始: 点 Session 后由 loadTimeline 的 scrollToBottom 收敛为 true.
+      unreadCount: 0,           // pinned 期间累积的未读新 round 数; 进入 follow 清零.
     };
 
     // ─── records tab: 两级树 (会话 → 轮次) + timeline 惰性加载 ─────────────
@@ -1399,9 +1427,29 @@
       const tailRecords = allRounds.slice(-TIMELINE_PAGE);
       const tailIds = new Set(tailRecords.map(x => x.id));
       const kept = state.timelineRecords.filter(r => !tailIds.has(r.id));
+      // 追加前已有 id 集合 (用于识别真正新增的 round, 区别于流式增量更新).
+      const oldIds = new Set(state.timelineRecords.map(r => r.id));
+      // UI-6 状态机: 在 render 之前读取 follow 状态 (render 会改变 scrollHeight).
+      const wasFollow = state.timelineFollow;
       state.timelineRecords = kept.concat(tailRecords);
       state.timelineOldest = state.timelineRecords.length > 0 ? state.timelineRecords[0].id : null;
       renderTimeline();
+      // 新 round 数: tailRecords 中 id 不在 oldIds 的 (追加到末尾的新轮次).
+      // 仅真正新 round 才走 follow/pinned 分支; 流式增量更新 (无新 id) 不动 scrollTop.
+      const newCount = tailRecords.filter(r => !oldIds.has(r.id)).length;
+      if (newCount > 0) {
+        if (wasFollow) {
+          // follow: 锁定底部 (滚动补偿). force 而非 smooth — 流式追加会连续触发,
+          // smooth 动画会与下一次追加竞争.
+          scrollTimelineToBottomForce();
+          state.unreadCount = 0;
+          updateUnreadBadge();
+        } else {
+          // pinned: 累加未读, 不滚动.
+          state.unreadCount += newCount;
+          updateUnreadBadge();
+        }
+      }
       // sidebar: 用完整轮次列表更新 sessionRounds (仅展开时).
       if (expandedSessions.has(state.selectedSession)) {
         sessionRounds.set(state.selectedSession, allRounds);
@@ -1651,8 +1699,7 @@
       updateSelectedRoundClass();
       // 1. 已在当前 timeline 中 → 直接滚动 + 高亮.
       if (state.selectedSession && state.timelineRecords.some(r => r.id === nodeId)) {
-        if (scrollMode === 'bottom') scrollTimelineToBottomForce();
-        else highlightRound(nodeId);
+        applyScrollMode(scrollMode, nodeId);
         return;
       }
       // 2. 在 sessionRounds 缓存中 → 从缓存填充 (避免网络请求).
@@ -1663,8 +1710,7 @@
           state.timelineOldest = rounds.length > 0 ? rounds[0].id : null;
           state.timelineReachedTop = false;
           renderTimeline();
-          if (scrollMode === 'bottom') scrollTimelineToBottomForce();
-          else highlightRound(nodeId);
+          applyScrollMode(scrollMode, nodeId);
           return;
         }
       }
@@ -1672,6 +1718,17 @@
       // loadTimeline 内部已调 scrollTimelineToBottomForce (与 scrollMode='bottom' 一致),
       // 故此处无需再处理 scrollMode='highlight' 的特殊覆盖.
       await loadTimeline(nodeId);
+    }
+
+    // 应用 selectRound 的 scroll mode: bottom 路径强制进入 follow (清零 unread),
+    // highlight 路径滚动到目标轮并触发 flash.
+    function applyScrollMode(scrollMode, nodeId) {
+      if (scrollMode === 'bottom') {
+        scrollTimelineToBottomForce();
+        syncFollowMode();
+      } else {
+        highlightRound(nodeId);
+      }
     }
 
     // 同步 timeline 的 .selected 类到 state.selectedRound (SSOT).
@@ -1868,8 +1925,10 @@
         // 只有 loadOlder 实际探测 parent 链耗尽后才置 true.
         state.timelineReachedTop = false;
         renderTimeline();
-        // 选中会话叶子 → 滚到最末轮 (最新, IM 风格).
+        // 选中会话叶子 → 滚到最末轮 (最新, IM 风格) + 进入 follow (UI-6).
+        // 注: selectRound 入口已把 selectedRound 设为 leafId (= 最新轮), 此处不重置.
         scrollTimelineToBottomForce();
+        syncFollowMode();
       } catch (e) {
         console.error(e);
         // 错误时也清理抽屉/导航 (避免残留旧会话内容).
@@ -1886,6 +1945,9 @@
       state.selectedSession = null;
       state.selectedRound = null;
       state.lastTimelineFingerprint = '';
+      // UI-6: 重置 follow 状态机 (初始视为 follow, 等下次 loadTimeline 的 scrollToBottom 收敛).
+      state.timelineFollow = true;
+      state.unreadCount = 0;
       document.getElementById('detail').innerHTML =
         '<div class="empty">Select a session on the left</div>';
       // 清空时隐藏悬浮导航按钮 + Response 抽屉.
@@ -1893,6 +1955,8 @@
       if (nav) nav.hidden = true;
       const drawer = document.getElementById('response-drawer');
       if (drawer) drawer.hidden = true;
+      const badge = document.getElementById('unread-badge');
+      if (badge) badge.hidden = true;
     }
 
     // 惰性加载: 向上滚到顶时 prepend 更早的轮次. 保持滚动锚点.
@@ -1929,6 +1993,9 @@
         if (newPane) {
           const delta = newPane.scrollHeight - oldScrollHeight;
           newPane.scrollTop = oldScrollTop + delta;
+          // UI-6: prepend 后距底必然增大 (内容变长, 视口位置不变) → 应判为 pinned.
+          // 显式重算, 避免依赖 programmatic scrollTop 触发 scroll event 的时序窗口.
+          syncFollowMode();
         }
       } catch (e) {
         console.error(e);
@@ -2110,6 +2177,46 @@
     function scrollTimelineToBottomForce() {
       const el = document.getElementById('detail');
       if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'auto' });
+    }
+
+    // ─── timeline 滚动状态机 (UI-6 follow/pinned) ──────────────────────────
+    // 契约与阈值理由见 NEAR_BOTTOM_PX 上方注释. 这里只列实现 SSOT:
+    //   syncFollowMode() 是唯一改 state.timelineFollow 的入口, 同时刷新 unread badge.
+    //   selectedRound 与 followMode 解耦 (方案 X): 不随 follow 自动推进, 仅显式动作
+    //   (点 Session / 点 unread badge / loadTimeline 初次) 时重置到最新轮.
+    //   注: 这些显式动作用 scroll:'bottom' (滚到底), 不触发 highlightRound 的 .flash
+    //   (highlightRound 滚到气泡 70% 位置, 与 "滚到底" 冲突). .selected 持续高亮已足够反馈.
+
+    function isNearBottom() {
+      const el = document.getElementById('detail');
+      if (!el) return true;
+      return el.scrollHeight - el.scrollTop - el.clientHeight <= NEAR_BOTTOM_PX;
+    }
+
+    // 唯一改 state.timelineFollow 的入口. 调用时机: scroll 事件 (RAF 合并后) + 新内容追加后.
+    function syncFollowMode() {
+      const now = isNearBottom();
+      const was = state.timelineFollow;
+      state.timelineFollow = now;
+      // pinned → follow: 清零未读 (用户视口已到底, 旧未读不再有意义).
+      if (now && !was) state.unreadCount = 0;
+      updateUnreadBadge();
+    }
+
+    // pinned 期间有未读 → 显示胶囊 "↓ N"; 否则隐藏.
+    function updateUnreadBadge() {
+      const badge = document.getElementById('unread-badge');
+      const show = !state.timelineFollow && state.unreadCount > 0;
+      badge.hidden = !show;
+      if (show) badge.textContent = `↓ ${state.unreadCount}`;
+    }
+
+    // unread badge 点击: 进入 follow + 重置 selected 到最新轮 (方案 X 的唯一联动入口).
+    async function jumpToLatest() {
+      const records = state.timelineRecords;
+      if (records.length === 0) return;
+      // selectRound(scroll:'bottom') 内部会 scrollTimelineToBottomForce + syncFollowMode.
+      await selectRound(records[records.length - 1].id, { scroll: 'bottom' });
     }
 
     // 绑定每轮的 info / raw 按钮 + 轮次选中 的事件委托 (挂在稳定的 #detail 上, 全量重建后无需重绑).
@@ -2429,6 +2536,17 @@
     const DRAWER_MAX_RATIO = 0.40;
     const DRAWER_EXTREME_MAX_RATIO = 0.80;
 
+    // ─── timeline 滚动状态机 (follow / pinned) ─────────────────────────────
+    // 契约 UI-6: followMode 是 "视口距底部距离" 的纯派生 (SSOT), 由 syncFollowMode 在
+    // scroll 事件 + 新内容追加后机械判定, 任何改 scrollTop 的代码路径结束后必须重算.
+    //   follow (距底 ≤ NEAR_BOTTOM_PX): 新内容到达 → 主动滚到底.
+    //   pinned (距底 >  NEAR_BOTTOM_PX): 新内容到达 → 不滚动, 浮出 unread badge.
+    //
+    // NEAR_BOTTOM_PX 取 ~1 个平均 Bubble 高度 (≈ 100px):
+    //   - 太小: 流式追加时单 Bubble 增长即把视口 "推离" 底部, follow↔pinned 抖动.
+    //   - 太大: 用户实际在看历史也被判为 follow, 新消息打断阅读.
+    const NEAR_BOTTOM_PX = 100;
+
     function updateResponseDrawerLayout() {
       const wrap = document.getElementById('detail-wrap');
       const detail = document.getElementById('detail');
@@ -2523,16 +2641,20 @@
         if (el.scrollTop < 10 && !state.timelineReachedTop && !state.loadingOlder) {
           loadOlder();
         }
-        // 抽屉布局 + 悬浮按钮: RAF 合并, 避免快速滚动时连续 forced reflow.
+        // 抽屉布局 + 悬浮按钮 + follow 状态: RAF 合并, 避免快速滚动时连续 forced reflow.
+        // syncFollowMode 跟随同一 RAF 批次, 它内部读 scrollHeight/clientHeight 与上面两个
+        // 函数共享 layout 值 (浏览器合并 getBoundingClientRect / scrollTop 读取).
         if (state.scrollRaf) return;
         state.scrollRaf = requestAnimationFrame(() => {
           state.scrollRaf = 0;
           updateResponseDrawerLayout();
           updateScrollNavVisibility();
+          syncFollowMode();
         });
       }, { passive: true });
       updateResponseDrawerLayout();
       updateScrollNavVisibility();
+      syncFollowMode();
     }
 
     function updateScrollNavVisibility() {
@@ -2553,6 +2675,9 @@
       const el = document.getElementById('detail');
       if (el) el.scrollTo({ top: 0, behavior: 'smooth' });
     }
+    // "↓ 回到底部" 浮按钮: 仅滚动视口到最新轮, 不重置 selectedRound (方案 X).
+    // 进入 follow 由后续 scroll 事件的 syncFollowMode 自然完成 (smooth 动画结束后).
+    // 与 unread badge (jumpToLatest) 的区别: 后者额外重置 selectedRound 到最新轮 + flash.
     function scrollTimelineToBottom() {
       const el = document.getElementById('detail');
       if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
@@ -3303,6 +3428,9 @@
 
     // 在 form 加载后绑定 "Infer" + "Generate" 按钮的事件.
     document.addEventListener('DOMContentLoaded', () => {
+      // unread badge 点击: 跳到最新 (进入 follow + 重置 selected 到最新轮).
+      const unreadBadge = document.getElementById('unread-badge');
+      if (unreadBadge) unreadBadge.addEventListener('click', jumpToLatest);
       const inferBtn = document.getElementById('f-ms-infer');
       if (inferBtn) {
         inferBtn.addEventListener('click', () => {

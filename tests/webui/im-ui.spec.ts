@@ -1212,4 +1212,286 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     const roundsInAAgain = await page.locator("#detail .tl-round").count();
     expect(roundsInAAgain).toBe(roundsInA);
   });
+
+  // ─── UI-6: timeline 滚动状态机 (follow / pinned) ──────────────────────────
+  //
+  // AGENTS.md 前端不变量 UI-6:
+  //   followMode 是 "视口距底部距离" 的纯派生 (SSOT), 不由 "最近点了什么" 决定.
+  //   - follow (距底 ≤ NEAR_BOTTOM_PX): 新 round 到达 → 主动滚到底.
+  //   - pinned (距底 >  NEAR_BOTTOM_PX): 新 round 到达 → 不滚动, 浮出 unread badge.
+  //
+  //   selectedRound 与 followMode 解耦 (方案 X):
+  //   - selectedRound 始终是 "用户最后显式关注的轮次", 不随 follow 自动推进.
+  //   - 仅 "进入 follow 的显式动作" (点 Session / 点 unread badge) 才重置 selected 到最新轮.
+
+  // UI-6 测试共享的长内容模板 (确保 timeline 总高度 > 视口, follow/pinned 有意义).
+  const LONG_SYS = "You are a coding assistant with detailed context. ".repeat(20);
+  const LONG_USER = (s: string) => `${s} ${"x".repeat(1500)}`;
+  const REPLY = "r".repeat(1500);
+
+  /**
+   * 构造累积 N 轮的长内容会话, 返回 session_id (用于 clickSessionByLeaf).
+   * 每轮发送完整的累积上下文 (DAG prefix hash 链成同一会话), 第 i 轮的 user 标记为 `round{i}`.
+   * marker 作为根轮首条 user msg, 决定 session 标题.
+   */
+  async function setupLongMultiroundSession(page: Page, marker: string, rounds = 3): Promise<string> {
+    for (let i = 1; i <= rounds; i++) {
+      const messages: Array<Record<string, unknown>> = [
+        { role: "system", content: LONG_SYS },
+        { role: "user", content: LONG_USER(marker) },
+        { role: "assistant", content: REPLY },
+      ];
+      for (let j = 2; j <= i; j++) {
+        messages.push({ role: "user", content: LONG_USER(`round${j}`) });
+        messages.push({ role: "assistant", content: REPLY });
+      }
+      await sendChat(page, messages);
+    }
+    return findSessionLeafByPreview(page, marker);
+  }
+
+  /** 向已存在的累积会话追加第 N 轮 (N > 当前轮数). */
+  async function appendRound(page: Page, marker: string, n: number): Promise<void> {
+    const messages: Array<Record<string, unknown>> = [
+      { role: "system", content: LONG_SYS },
+      { role: "user", content: LONG_USER(marker) },
+      { role: "assistant", content: REPLY },
+    ];
+    for (let j = 2; j <= n; j++) {
+      messages.push({ role: "user", content: LONG_USER(`round${j}`) });
+      messages.push({ role: "assistant", content: REPLY });
+    }
+    await sendChat(page, messages);
+  }
+
+  /** 等待 timeline 渲染出 N 轮 .tl-round (条件等待). */
+  async function waitForRounds(page: Page, n: number): Promise<void> {
+    await expect(page.locator("#detail > .tl-round")).toHaveCount(n, { timeout: 5000 });
+  }
+
+  /** 进入指定 session 的 timeline 并等到 N 轮渲染完成. */
+  async function openTimeline(page: Page, sid: string, rounds: number): Promise<void> {
+    await clickSessionByLeaf(page, sid);
+    await waitForRounds(page, rounds);
+    await page.waitForTimeout(500);
+  }
+
+  /** 计算当前 #detail 视口距底部的距离 (px). */
+  function distFromBottom(page: Page): Promise<number> {
+    return page.locator("#detail").evaluate(
+      (el) => el.scrollHeight - el.scrollTop - el.clientHeight
+    );
+  }
+
+  test("UI-6: 点 Session → follow + selected 在最新轮", async ({ page }) => {
+    const sid = await setupLongMultiroundSession(page, "ui5-follow-init-marker");
+    await openTimeline(page, sid, 3);
+
+    // selected 应在最新轮 (DOM 末尾的 .tl-round).
+    const selectedRid = await page
+      .locator("#detail .tl-round.selected")
+      .getAttribute("data-rid");
+    const lastRid = await page
+      .locator("#detail > .tl-round")
+      .last()
+      .getAttribute("data-rid");
+    expect(selectedRid, "selected 应在最新轮").toBe(lastRid);
+
+    // follow 状态: 距底 < NEAR_BOTTOM_PX (100px).
+    expect(await distFromBottom(page), "初始进入应在底部附近 (follow)").toBeLessThan(100);
+
+    // 无 unread badge (follow 状态 + 0 未读).
+    await expect(page.locator("#unread-badge")).toBeHidden();
+  });
+
+  test("UI-6: 手动向上滚 → pinned (距底部 > NEAR_BOTTOM_PX)", async ({ page }) => {
+    const sid = await setupLongMultiroundSession(page, "ui5-scroll-up-marker");
+    await openTimeline(page, sid, 3);
+
+    // 向上滚 (滚到中部, 距底 > 100px).
+    await page.locator("#detail").evaluate((el) => {
+      el.scrollTop = Math.floor((el.scrollHeight - el.clientHeight) / 2);
+    });
+    // 等 scroll 事件 + RAF 触发 syncFollowMode.
+    await page.waitForTimeout(300);
+
+    expect(await distFromBottom(page), "向上滚后应距底 > 100px (pinned)").toBeGreaterThan(100);
+
+    // unread badge 仍隐藏 (无新消息, unreadCount=0).
+    await expect(page.locator("#unread-badge")).toBeHidden();
+  });
+
+  test("UI-6: pinned 状态下新 round 到达 → unread badge 显示 + selected 不变", async ({ page }) => {
+    const marker = "ui5-pinned-new-round-marker";
+    const sid = await setupLongMultiroundSession(page, marker);
+    await openTimeline(page, sid, 3);
+
+    // 向上滚到中部 (pinned), 记录 scrollTop.
+    const pinnedScrollTop = await page.locator("#detail").evaluate((el) => {
+      el.scrollTop = Math.floor((el.scrollHeight - el.clientHeight) / 2);
+      return el.scrollTop;
+    });
+    await page.waitForTimeout(300);
+
+    // 记录当前 selected (应为最新轮, 即将发送第 4 轮前的最新).
+    const selectedBefore = await page
+      .locator("#detail .tl-round.selected")
+      .getAttribute("data-rid");
+
+    // 发起第 4 轮 (累积上下文, 同一 session).
+    await appendRound(page, marker, 4);
+
+    // 等待自动刷新拉到新 round (3s 间隔 + 余量). 用条件等待替代固定 sleep.
+    await waitForRounds(page, 4);
+
+    // pinned 状态: scrollTop 应基本不变 (用户没被推走).
+    const scrollTopAfter = await page.locator("#detail").evaluate((el) => el.scrollTop);
+    expect(
+      Math.abs(scrollTopAfter - pinnedScrollTop),
+      "pinned 状态下新 round 不应推动 scrollTop"
+    ).toBeLessThan(30);
+
+    // unread badge 应显示, 文本含 "1".
+    const badge = page.locator("#unread-badge");
+    await expect(badge).toBeVisible();
+    await expect(badge).toHaveText("↓ 1");
+
+    // selected 不变 (selectedBefore 仍是 DOM 中存在的 .selected).
+    const selectedAfter = await page
+      .locator("#detail .tl-round.selected")
+      .getAttribute("data-rid");
+    expect(selectedAfter, "pinned 期间新 round 到达, selected 不应变").toBe(selectedBefore);
+  });
+
+  test("UI-6: 点 unread badge → follow + selected 重置到最新轮 + badge 消失", async ({ page }) => {
+    const marker = "ui5-badge-click-marker";
+    const sid = await setupLongMultiroundSession(page, marker);
+    await openTimeline(page, sid, 3);
+
+    // 向上滚到 pinned.
+    await page.locator("#detail").evaluate((el) => {
+      el.scrollTop = Math.floor((el.scrollHeight - el.clientHeight) / 2);
+    });
+    await page.waitForTimeout(300);
+
+    // 发第 4 轮触发 unread.
+    await appendRound(page, marker, 4);
+    await waitForRounds(page, 4);
+    const badge = page.locator("#unread-badge");
+    await expect(badge).toBeVisible();
+
+    // 点 badge → jumpToLatest.
+    await badge.click();
+    await page.waitForTimeout(500);
+
+    // follow 状态: 距底 < 100px.
+    expect(await distFromBottom(page), "点 badge 后应在底部附近 (follow)").toBeLessThan(100);
+
+    // selected 应在最新轮 (第 4 轮 = DOM 末尾).
+    const selectedRid = await page
+      .locator("#detail .tl-round.selected")
+      .getAttribute("data-rid");
+    const lastRid = await page
+      .locator("#detail > .tl-round")
+      .last()
+      .getAttribute("data-rid");
+    expect(selectedRid, "点 badge 后 selected 重置到最新轮").toBe(lastRid);
+
+    // badge 应隐藏 (unread 清零).
+    await expect(badge).toBeHidden();
+  });
+
+  test("UI-6: follow 状态下新 round 到达 → 自动滚到底, 无 badge", async ({ page }) => {
+    const marker = "ui5-follow-new-round-marker";
+    const sid = await setupLongMultiroundSession(page, marker);
+    await openTimeline(page, sid, 3);
+
+    // 确认初始在 follow (距底 < 100).
+    expect(await distFromBottom(page), "初始应 follow").toBeLessThan(100);
+
+    // 发第 4 轮 (follow 状态).
+    await appendRound(page, marker, 4);
+    await waitForRounds(page, 4);
+    // waitForRounds 已确保 refreshTimelineTail 运行 (= scrollTimelineToBottomForce 已调用).
+    // 仅等 RAF + layout 稳定, 不需等下一个自动刷新周期.
+    await page.waitForTimeout(500);
+
+    // follow 状态: 仍在底部附近.
+    expect(await distFromBottom(page), "follow 期间新 round 到达, 应自动滚到底").toBeLessThan(100);
+
+    // 无 badge.
+    await expect(page.locator("#unread-badge")).toBeHidden();
+  });
+
+  test("UI-6: pinned 期间点历史轮 → selected 停在该轮; 新 round 到达时 selected 不变", async ({ page }) => {
+    const marker = "ui5-selected-stable-marker";
+    const sid = await setupLongMultiroundSession(page, marker);
+    await openTimeline(page, sid, 3);
+
+    // 点第 1 轮 (历史轮, 最老). 这会触发 selectRound(scroll:'highlight') → pinned.
+    const round1 = page.locator("#detail > .tl-round").first();
+    const round1Rid = await round1.getAttribute("data-rid");
+    expect(round1Rid).toBeTruthy();
+    await round1.locator(".tl-round-header").click();
+    await page.waitForTimeout(1200); // 等 highlightRound smooth 动画完成.
+
+    // selected 应在第 1 轮.
+    await expect(page.locator(`#detail .tl-round.selected[data-rid="${round1Rid}"]`)).toHaveCount(1);
+
+    // 发第 4 轮 (新 round 到达).
+    await appendRound(page, marker, 4);
+    await waitForRounds(page, 4);
+
+    // selected 仍在第 1 轮 (不随新 round 跑).
+    await expect(
+      page.locator(`#detail .tl-round.selected[data-rid="${round1Rid}"]`),
+      "新 round 到达后, selected 应仍在第 1 轮 (方案 X 解耦)"
+    ).toHaveCount(1);
+    // 最新轮 (第 4) 不带 selected.
+    const lastRid = await page
+      .locator("#detail > .tl-round")
+      .last()
+      .getAttribute("data-rid");
+    expect(lastRid, "最新轮应有 data-rid").toBeTruthy();
+    expect(lastRid, "最新轮不应是第 1 轮").not.toBe(round1Rid);
+    await expect(
+      page.locator(`#detail .tl-round.selected[data-rid="${lastRid}"]`)
+    ).toHaveCount(0);
+  });
+
+  test("UI-6: 点 ↓ 回到底部 → follow 但 selected 不重置 (区别于 unread badge)", async ({
+    page,
+  }) => {
+    // 方案 X 的核心区别: scrollTimelineToBottom (↓ 按钮) 仅滚视口, 不重置 selected;
+    // jumpToLatest (unread badge) 才重置 selected 到最新轮. 本测试守卫此区别.
+    const marker = "ui6-scroll-bottom-no-reset-marker";
+    const sid = await setupLongMultiroundSession(page, marker);
+    await openTimeline(page, sid, 3);
+
+    // 点第 1 轮 (历史轮). selected = round1, 视口滚到该轮 (pinned).
+    const round1 = page.locator("#detail > .tl-round").first();
+    const round1Rid = await round1.getAttribute("data-rid");
+    expect(round1Rid).toBeTruthy();
+    await round1.locator(".tl-round-header").click();
+    await page.waitForTimeout(1200); // 等 highlightRound smooth 动画完成.
+    await expect(page.locator(`#detail .tl-round.selected[data-rid="${round1Rid}"]`)).toHaveCount(1);
+
+    // 点 ↓ 按钮 (scrollTimelineToBottom, smooth 滚到底, 非 jumpToLatest).
+    await page.locator("#scroll-bottom-btn").click();
+    await page.waitForTimeout(800); // 等 smooth 动画 + RAF.
+
+    // follow: 距底 < 100.
+    expect(await distFromBottom(page), "点 ↓ 后应在底部附近 (follow)").toBeLessThan(100);
+    // selected 仍在 round1 (方案 X: ↓ 不重置 selected).
+    await expect(
+      page.locator(`#detail .tl-round.selected[data-rid="${round1Rid}"]`),
+      "点 ↓ 后 selected 应仍在 round1 (不重置)"
+    ).toHaveCount(1);
+    // 最新轮 (第 3) 不带 selected (与 jumpToLatest 的语义区别).
+    const lastRid = await page.locator("#detail > .tl-round").last().getAttribute("data-rid");
+    expect(lastRid).not.toBe(round1Rid);
+    await expect(page.locator(`#detail .tl-round.selected[data-rid="${lastRid}"]`)).toHaveCount(0);
+    // 无 unread badge (follow 状态 + 0 未读).
+    await expect(page.locator("#unread-badge")).toBeHidden();
+  });
 });

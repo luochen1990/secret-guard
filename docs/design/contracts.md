@@ -707,6 +707,20 @@
 - `prop_detail_height_fixed`: `#detail` height == wrapH, 不依赖 drawerH. ✅ `im-ui.spec.ts` "UI-5 prop_detail_height_fixed".
 - `prop_drawer_overlay_not_in_round`: response drawer DOM 不在 `.tl-round` 子树内. ✅ `im-ui.spec.ts` "需求 3: response 抽屉固定底部" 间接覆盖.
 
+### UI-6 timeline 滚动状态机: followMode 是视口位置的纯派生 (↔ AGENTS.md I5)
+
+**陈述**: timeline 的 follow/pinned 状态由 "视口距底部距离" 机械推导 (SSOT), 不由 "最近点了什么" 显式动作决定. `selectedRound` 与 followMode 解耦 (方案 X): selected 不随 follow 自动推进, 仅 "进入 follow 的显式动作" (点 Session / 点 unread badge / 初次 loadTimeline) 才重置.
+
+**核心不变量**: `state.timelineFollow == isNearBottom()`, 即 `scrollHeight - scrollTop - clientHeight <= NEAR_BOTTOM_PX` (≈ 100px). 此判定在每次 scroll 事件 (RAF 合并) + 每次新 round 追加后由 `syncFollowMode()` 重算.
+
+**Properties**:
+- `prop_follow_initial_on_session_click`: 点 Session → follow + selected 在最新轮. ✅ `im-ui.spec.ts` "UI-6: 点 Session → follow + selected 在最新轮".
+- `prop_pinned_on_manual_scroll_up`: follow 状态下手动向上滚 → pinned. ✅ `im-ui.spec.ts` "UI-6: 手动向上滚 → pinned".
+- `prop_pinned_new_round_no_scroll`: pinned 期间新 round 到达 → scrollTop 不变 + unread badge 显示. ✅ `im-ui.spec.ts` "UI-6: pinned 状态下新 round 到达".
+- `prop_unread_badge_resets_selected`: 点 unread badge → follow + selected 重置到最新轮 + badge 消失. ✅ `im-ui.spec.ts` "UI-6: 点 unread badge".
+- `prop_follow_new_round_auto_scroll`: follow 期间新 round 到达 → 自动滚到底, 无 badge. ✅ `im-ui.spec.ts` "UI-6: follow 状态下新 round 到达".
+- `prop_selected_stable_during_pinned`: pinned 期间点历史轮, 新 round 到达时 selected 不变. ✅ `im-ui.spec.ts` "UI-6: pinned 期间点历史轮".
+
 ---
 
 ## 99. 变更日志
