@@ -27,12 +27,13 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::config::{DeleteOutcome, OverrideMode, UpsertKind};
-use crate::dag::{NodeDetail, NodeView, ResponseData};
+use crate::dag::ResponseData;
 use crate::provider::{EffectiveProvider, Protocol, Provider};
 use crate::proxy::ProxyState;
 use crate::record::ForwardRecord;
 use crate::secrets::{EffectiveSecret, SecretCategory, SecretEntry};
 use crate::web::NO_STORE;
+use crate::web::dto::{NodeDetail, NodeView};
 
 // ─── CRUD 通用 helper (secret / provider 共享) ──────────────────────────────
 //
@@ -292,8 +293,8 @@ pub struct SessionSummary {
     pub path: String,
 }
 
-impl From<crate::dag::SessionView> for SessionSummary {
-    fn from(s: crate::dag::SessionView) -> Self {
+impl From<crate::web::dto::SessionView> for SessionSummary {
+    fn from(s: crate::web::dto::SessionView) -> Self {
         Self {
             session_id: s.session_id,
             leaf_id: s.leaf_id,
@@ -406,15 +407,16 @@ pub struct SelectedCursor {
 
 /// POST /api/sync 响应体.
 ///
-/// 字段直接透传 DAG 层的 [`crate::dag::SyncSnapshot`] (`Vec<SessionView>` +
+/// 字段直接透传 [`crate::dag::ConversationDag::sync_snapshot`] 产出的
+/// [`crate::web::dto::SyncSnapshot`] (`Vec<SessionView>` +
 /// `HashMap<SessionId, Vec<RoundBrief>>` + `Option<TimelineDiffData>`).
 /// `timeline = None` 表示无 diff (前端游标已是最新, 等价 304).
 #[derive(Serialize)]
 pub struct SyncResponse {
     pub sessions: Vec<SessionSummary>,
-    pub rounds: std::collections::HashMap<crate::dag::SessionId, Vec<crate::dag::RoundBrief>>,
+    pub rounds: std::collections::HashMap<crate::dag::SessionId, Vec<crate::web::dto::RoundBrief>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub timeline: Option<crate::dag::TimelineDiffData>,
+    pub timeline: Option<crate::web::dto::TimelineDiffData>,
 }
 
 /// POST /api/sync handler.

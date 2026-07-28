@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 /// 单条转发记录 (Web DTO).
 ///
-/// 字段从 [`crate::dag::NodeView`] / [`crate::dag::NodeDetail`] / [`crate::dag::ResponseData`]
+/// 字段从 `crate::web::dto::NodeView` / `crate::web::dto::NodeDetail` / `crate::dag::ResponseData`
 /// 派生, 由 `crate::web::api` 构造. 不再是存储后端 (那是 DAG 的职责).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForwardRecord {
