@@ -1020,6 +1020,7 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn create_request_validates_empty_value() {
@@ -1446,6 +1447,107 @@ mod tests {
         assert!(resp.parsed_request.is_some());
         assert!(resp.parsed_response.is_none());
         assert!(resp.parse_error.is_none());
+    }
+
+    // ─── property-based (ROB-1 永不 panic) ──────────────────────────────────
+    //
+    // 契约: docs/design/contracts.md §8 ROB-1 — extract_preview_and_model 对任意字节
+    // 输入 (含非 JSON / 空 / 损坏 / 超长 / UTF-8 边界) 必须不 panic, 返回 (None, None)
+    // 或合法的 (preview, model). 这是 best-effort 永不 panic 原则的直接 property:
+    // 该函数接收用户可控的 HTTP body (任意字节), 任何 panic 都能让单个恶意请求崩溃
+    // 整个进程 (DoS).
+    //
+    // 用 catch_unwind 跨 panic 边界守卫, 而非依赖 proptest 的 panic-as-fail 语义 —
+    // 这样在 release build (无 panic = abort) 之外也能定位是哪个输入触发的.
+
+    /// 辅助: 在 catch_unwind 内运行 extract_preview_and_model(body), 返回是否 panic.
+    /// ROB-1 只关心是否 panic, 不关心返回值 (返回值由其他 example 测试覆盖).
+    fn preview_panicked(body: &str) -> bool {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            extract_preview_and_model(body)
+        }))
+        .is_err()
+    }
+
+    /// 生成任意字节流 (大部分不是合法 JSON, 覆盖 guard 早退与 serde parse 失败路径).
+    fn arb_arbitrary_bytes() -> impl Strategy<Value = String> {
+        prop::collection::vec(any::<u8>(), 0..4096)
+            .prop_map(|b| String::from_utf8_lossy(&b).into_owned())
+    }
+
+    /// 生成合法 chat-request JSON body, 再随机扰动以触发 serde parse 成功后的下游
+    /// 分支 (messages 数组访问 / content string-or-array 处理 / 类型不符等).
+    ///
+    /// **必要性**: 纯 arb_arbitrary_bytes 几乎不会触达 `serde_json::from_str` 的 Ok
+    /// 分支 (随机字节构成合法 JSON 的概率≈0), 仅覆盖 guard 早退路径. 本生成器补合法
+    /// JSON 路径, 让 messages[start..] 切片、role/content 类型检查等真正进入测试视野.
+    fn arb_perturbed_chat_json() -> impl Strategy<Value = String> {
+        // messages: 0..8 条; 每条 role + content 都随机 (string / array / 非法类型混搭).
+        // 用 serde_json::json! 宏构造 content 片段, 保证拼出的 messages 数组永远是合法 JSON.
+        let msg = (
+            "[a-z]{1,10}", // role
+            prop::sample::select(vec![
+                // 各种 content 形态 — 覆盖 message_text 的所有返回路径.
+                serde_json::json!({"content": "text"}), // string → Some
+                serde_json::json!({"content": [{"type": "text", "text": "hi"}]}), // array → Some
+                serde_json::json!({"content": serde_json::Value::Null}), // null → None
+                serde_json::json!({"content": 42}),     // numeric → None
+                serde_json::json!({"content": true}),   // bool → None
+                serde_json::json!({}),                  // 无 content 字段 → None
+            ]),
+        );
+        let body = prop::collection::vec(msg, 0..8).prop_map(|msgs| {
+            let arr: Vec<serde_json::Value> = msgs
+                .into_iter()
+                .map(|(role, mut extra)| {
+                    // 把 role 注入 extra (extra 是 {content:...} 或 {}, 加 role 字段).
+                    if let Some(obj) = extra.as_object_mut() {
+                        obj.insert("role".to_string(), serde_json::json!(role));
+                    }
+                    extra
+                })
+                .collect();
+            serde_json::json!({"model": "m", "messages": arr}).to_string()
+        });
+        // 一半概率原样用 (合法 JSON → 触达下游分支), 一半概率随机截断 (模拟 wire 损坏 →
+        // 走 parse 失败路径, 与变体 A 覆盖互补).
+        prop_oneof![
+            body.clone(),
+            (body, 0usize..200).prop_map(|(b, cut)| {
+                let cut = cut.min(b.len());
+                let mut bytes = b.into_bytes();
+                bytes.truncate(cut);
+                String::from_utf8_lossy(&bytes).into_owned()
+            }),
+        ]
+    }
+
+    proptest! {
+        /// ROB-1 (变体 A): 任意字节输入 (含非 JSON / 空 / 超长 / UTF-8 损坏) 永不 panic.
+        /// 主要覆盖函数入口 guard (`is_empty / len > MAX / !starts_with('{')`) 与
+        /// serde_json::from_str 失败路径 — 这些是恶意输入最常触达的分支.
+        #[test]
+        fn prop_preview_never_panics_arbitrary_bytes(body in arb_arbitrary_bytes()) {
+            let panicked = preview_panicked(&body);
+            prop_assert!(
+                !panicked,
+                "ROB-1 violation: extract_preview_and_model panicked on arbitrary bytes (len={})",
+                body.len()
+            );
+        }
+
+        /// ROB-1 (变体 B): 合法 chat JSON + 随机扰动 永不 panic.
+        /// 覆盖 serde_json parse 成功后的下游分支 (messages 数组 / content 各种形态 /
+        /// 截断损坏). 与变体 A 互补, 确保 parse 成功后的逻辑也不 panic.
+        #[test]
+        fn prop_preview_never_panics_perturbed_json(body in arb_perturbed_chat_json()) {
+            let panicked = preview_panicked(&body);
+            prop_assert!(
+                !panicked,
+                "ROB-1 violation: extract_preview_and_model panicked on perturbed chat json (len={})",
+                body.len()
+            );
+        }
     }
 }
 

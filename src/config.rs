@@ -987,7 +987,8 @@ mod table_tests {
     use super::*;
     use crate::secrets::{SecretCategory, SecretEntry, SecretTable};
 
-    fn entry(id: &str, value: &str) -> SecretEntry {
+    // pub(super): 让兄弟测试 mod (proptests) 可复用, 避免 DRY 重复.
+    pub(super) fn entry(id: &str, value: &str) -> SecretEntry {
         SecretEntry {
             id: id.into(),
             name: Some(format!("name-{id}")),
@@ -998,7 +999,7 @@ mod table_tests {
         }
     }
 
-    fn empty_decisions() -> Arc<RwLock<Decisions>> {
+    pub(super) fn empty_decisions() -> Arc<RwLock<Decisions>> {
         Arc::new(RwLock::new(Decisions::default()))
     }
 
@@ -1368,5 +1369,477 @@ mod table_tests {
             "memory must roll back on delete persist failure"
         );
         assert!(t.get_effective("existing").is_some());
+    }
+}
+
+// ─── Property-based tests (CFG-1 / CFG-2 / CFG-5) ──────────────────────────
+//
+// 用 `proptest!` 覆盖双层配置的合并 / source 标签 / 跨表并发安全契约.
+// 契约 SSOT: `docs/design/contracts.md` §6 (CFG-1..CFG-5, 行 486-545).
+//
+// 与 `mod tests` (固定用例) / `mod table_tests` (canonical CRUD 场景) 平级,
+// 这里用随机生成器覆盖更大输入空间, 锁住"外部可观察行为"层面的不变量.
+// 用 `SecretEntry` 作为 canonical 测试类型 (与 table_tests 一致, provider 行为对称).
+#[cfg(test)]
+mod proptests {
+    use super::table_tests::{empty_decisions, entry};
+    use super::*;
+    use crate::secrets::SecretTable;
+    use proptest::prelude::*;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    // ─── 共享 helpers ─────────────────────────────────────────────────────
+    //
+    // `entry` / `empty_decisions` 复用 super::table_tests 内的定义 (pub(super)),
+    // 避免 DRY 重复. tempfile_path 与 table_tests 的版本返回类型不同
+    // (PathBuf vs TempPath), 此处独立保留 RAII 版本以自动清理 proptest tmp 文件.
+
+    /// 创建真实 tmp 文件路径 (upsert_dynamic 会写盘). 父目录预先创建, 避免 ENOENT.
+    ///
+    /// 返回 `TempPath` (Drop 时自动删除文件) — proptest 每个 case 产生一个 tmp 文件,
+    /// 若不清理会快速累积 (一次 nextest 产生数百个); 用 RAII guard 确保跨 panic 与
+    /// 测试失败也能清理.
+    fn tempfile_path(prefix: &str) -> TempPath {
+        let id = uuid::Uuid::new_v4().to_string();
+        let path = PathBuf::from(format!("/tmp/opencode/tmp/test-prop-{prefix}-{id}.toml"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        TempPath(path)
+    }
+
+    /// RAII guard: 持有 tmp 文件路径, Drop 时删除. 解引用为 `&PathBuf` 兼容现有调用.
+    /// `Debug` 不实现 (避免 ApiKey/Path 序列化场景误用), 仅作内部测试 fixture.
+    ///
+    /// 调用方约定: 通过 `tmp.clone()` (经 Deref 落到 `PathBuf::clone`, 返回 owned PathBuf)
+    /// 传给 `SecretTable::new` 等需要 owned PathBuf 的 API. TempPath 本身保留所有权直到
+    /// 函数返回, Drop 时清理文件.
+    struct TempPath(PathBuf);
+
+    impl std::ops::Deref for TempPath {
+        type Target = PathBuf;
+        fn deref(&self) -> &PathBuf {
+            &self.0
+        }
+    }
+
+    impl Drop for TempPath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    // ─── 生成器 ───────────────────────────────────────────────────────────
+    //
+    // id 必须满足 validate_id: 1..=64 字符, 首字符 alphanumeric, 余字符 [A-Za-z0-9_-].
+    // value 必须满足 validate_value: ≥3 字节, 无 PUA (U+E000..U+F8FF), 无 mock prefix (测试用空).
+    //
+    // 生成器覆盖度本身作为契约要求 (AGENTS.md §0.3): 关键陷阱是 "id 冲突".
+    // 简单生成两个独立 HashMap<id, value> 几乎不会产生重叠 id (id 空间远大于 8 项),
+    // 会让"测 conflict 行为"的 property 退化为"测 static-only". 故显式用 ConfigScenario
+    // 把 id 分桶: static_only / dynamic_only / both (冲突), **每桶 ≥1 项**确保三种语义
+    // (conflict / static-only / dynamic-only) 都被每条 property 触达, 不依赖概率.
+
+    /// 合法 secret value 生成器: `[a-z0-9]{4,16}` (≥3 字节, 纯 ASCII, 无 PUA).
+    fn arb_value() -> impl Strategy<Value = String> {
+        "[a-z0-9]{4,16}"
+    }
+
+    /// 一份"分桶"配置场景: 把 id 分到三个互不相交的 bucket.
+    /// - `static_only`: 仅出现在 static 的 (id, value).
+    /// - `dynamic_only`: 仅出现在 dynamic 的 (id, value).
+    /// - `both`: 同时在 static + dynamic 的 id, 含两份不同的 value (保证冲突可观测).
+    ///
+    /// 用 `both` 桶恒含 ≥1 项保证 conflict 路径被覆盖, 避免独立生成两个 HashMap 时
+    /// id 碰撞概率极低导致 property 退化 (见上方"生成器覆盖度"注释). 三桶均 ≥1 项,
+    /// 让依赖特定桶非空的 property (如 prop_default_static_fallback 依赖 static_only)
+    /// 不再需要 prop_assume 跳过 (历史跳过率 ~25%, 浪费 case 数).
+    #[derive(Debug, Clone)]
+    struct ConfigScenario {
+        static_only: Vec<(String, String)>,
+        dynamic_only: Vec<(String, String)>,
+        both: Vec<(String, String, String)>, // (id, static_value, dynamic_value)
+    }
+
+    impl ConfigScenario {
+        fn static_entries(&self) -> Vec<SecretEntry> {
+            self.static_only
+                .iter()
+                .map(|(id, v)| entry(id, v))
+                .chain(self.both.iter().map(|(id, sv, _)| entry(id, sv)))
+                .collect()
+        }
+
+        fn dynamic_entries(&self) -> Vec<SecretEntry> {
+            self.dynamic_only
+                .iter()
+                .map(|(id, v)| entry(id, v))
+                .chain(self.both.iter().map(|(id, _, dv)| entry(id, dv)))
+                .collect()
+        }
+
+        /// 收集所有 static id (static_only + both).
+        fn static_ids(&self) -> Vec<String> {
+            self.static_only
+                .iter()
+                .map(|(id, _)| id.clone())
+                .chain(self.both.iter().map(|(id, _, _)| id.clone()))
+                .collect()
+        }
+    }
+
+    /// 生成 ConfigScenario. static_only / dynamic_only / both 桶各 1..4 项 (总 id ≤ 12),
+    /// 三桶均 ≥1 项以避免依赖特定桶的 property 因桶空而退化 (历史跳过率 ~25%).
+    /// 三桶 id 用不同前缀 (`s`/`d`/`b`) 保证**互不相交** (避免桶间污染, 例如同一 id
+    /// 既进 static_only 又进 both 会破坏 bucket 语义). 桶内 id 用 HashMap 去重.
+    fn arb_scenario() -> impl Strategy<Value = ConfigScenario> {
+        (
+            prop::collection::vec(("[a-z][a-z0-9]{0,3}", arb_value()), 1..4),
+            prop::collection::vec(("[a-z][a-z0-9]{0,3}", arb_value()), 1..4),
+            prop::collection::vec(("[a-z][a-z0-9]{0,3}", arb_value(), arb_value()), 1..4),
+        )
+            .prop_map(|(static_only, dynamic_only, both)| {
+                let static_only: Vec<(String, String)> = static_only
+                    .into_iter()
+                    .map(|(id, v)| (format!("s{id}"), v))
+                    .collect::<HashMap<_, _>>()
+                    .into_iter()
+                    .collect();
+                let dynamic_only: Vec<(String, String)> = dynamic_only
+                    .into_iter()
+                    .map(|(id, v)| (format!("d{id}"), v))
+                    .collect::<HashMap<_, _>>()
+                    .into_iter()
+                    .collect();
+                // both 桶: 去重 id, 且保证 static_value ≠ dynamic_value (避免平凡相等
+                // 掩盖 "Default 选 dynamic 但两者相等" 这种伪通过).
+                let mut both_map: HashMap<String, (String, String)> = HashMap::new();
+                for (id, sv, dv) in both {
+                    both_map.insert(format!("b{id}"), (sv, dv));
+                }
+                let both: Vec<(String, String, String)> = both_map
+                    .into_iter()
+                    .map(|(id, (sv, dv))| {
+                        // 若相等, 加前缀让 dynamic ≠ static (保证 conflict 可观测).
+                        let dv = if sv == dv { format!("dyn-{dv}") } else { dv };
+                        (id, sv, dv)
+                    })
+                    .collect();
+                ConfigScenario {
+                    static_only,
+                    dynamic_only,
+                    both,
+                }
+            })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        // ─── CFG-1: OverrideMode 合并语义 ──────────────────────────────
+
+        /// CFG-1: Default 模式下, conflict id (both 桶) 的 effective 取 dynamic 值,
+        /// static_only id 取 static 值, dynamic_only id 取 dynamic 值.
+        ///
+        /// 用 `arb_scenario` 的 `both` 桶**强制**保证 conflict 路径被覆盖
+        /// (独立生成两个 HashMap 时 id 碰撞概率极低, 会让本 property 退化为 static_fallback).
+        #[test]
+        fn prop_default_dynamic_wins(scenario in arb_scenario()) {
+            let t = SecretTable::new(
+                scenario.static_entries(),
+                scenario.dynamic_entries(),
+                empty_decisions(),
+                PathBuf::from("/tmp/x.toml"), // 不写盘 (无 upsert)
+            );
+
+            // both 桶: effective == dynamic value (Default 让 dynamic 胜出).
+            for (id, _sv, dv) in &scenario.both {
+                let eff = t.get_effective(id).expect("conflict id must be effective");
+                prop_assert_eq!(
+                    &eff.value, dv,
+                    "Default mode: conflict id '{}' must take dynamic value", id
+                );
+            }
+            // static_only 桶: effective == static value.
+            for (id, sv) in &scenario.static_only {
+                let eff = t.get_effective(id).expect("static-only id must be effective");
+                prop_assert_eq!(&eff.value, sv, "static-only id stays static");
+            }
+            // dynamic_only 桶: effective == dynamic value.
+            for (id, dv) in &scenario.dynamic_only {
+                let eff = t.get_effective(id).expect("dynamic-only id must be effective");
+                prop_assert_eq!(&eff.value, dv, "dynamic-only id uses dynamic");
+            }
+        }
+
+        /// CFG-1: Default 模式下, 仅 static 有此 id → effective 取 static 值 (无 dynamic override).
+        ///
+        /// 这是 `prop_default_dynamic_wins` 的退化子集, 单独保留以明确覆盖 "无 dynamic" 边界
+        /// (该 property 不依赖 both 桶, 排除 dynamic 路径的干扰).
+        #[test]
+        fn prop_default_static_fallback(scenario in arb_scenario()) {
+            // arb_scenario 保证 static_only ≥1 项 (历史 prop_assume 已不再需要).
+            // 只放 static_only 桶, 不放 dynamic / both.
+            let t = SecretTable::new(
+                scenario.static_only.iter()
+                    .map(|(id, v)| entry(id, v))
+                    .collect::<Vec<_>>(),
+                vec![],
+                empty_decisions(),
+                PathBuf::from("/tmp/x.toml"),
+            );
+
+            // 全部 static_only id 在 effective view 中, 值等于 static.
+            let effective = t.effective_raw();
+            prop_assert_eq!(effective.len(), scenario.static_only.len());
+            for e in &effective {
+                let want = &scenario.static_only.iter()
+                    .find(|(id, _)| id == &e.id)
+                    .map(|(_, v)| v.clone())
+                    .expect("effective id must be in static_only");
+                prop_assert_eq!(&e.value, want, "static-only effective value must equal static");
+            }
+        }
+
+        /// CFG-1: PreferStatic 模式下, conflict id (both 桶) 的 effective 强制取 static 原值,
+        /// 忽略 dynamic override. decision 仅对 static id 有意义, 故仅对 static id (static_only
+        /// + both) 设置 PreferStatic.
+        #[test]
+        fn prop_prefer_static_ignores_dynamic(scenario in arb_scenario()) {
+            // arb_scenario 保证 both ≥1 项 (历史 prop_assume 已不再需要).
+            let tmp = tempfile_path("prefer-static");
+            let t = SecretTable::new(
+                scenario.static_entries(),
+                scenario.dynamic_entries(),
+                empty_decisions(),
+                tmp.clone(),
+            );
+            // 对所有 static id (static_only + both) 设置 PreferStatic.
+            for id in scenario.static_ids() {
+                t.set_decision(&id, OverrideMode::PreferStatic).unwrap();
+            }
+
+            // both 桶: PreferStatic 强制 static value (而非 dynamic).
+            for (id, sv, _dv) in &scenario.both {
+                let eff = t.get_effective(id).expect("PreferStatic keeps conflict id effective");
+                prop_assert_eq!(
+                    &eff.value, sv,
+                    "PreferStatic must force static value for conflict id '{}'", id
+                );
+            }
+            // static_only 桶: PreferStatic 对 static-only 无副作用, 仍取 static value.
+            for (id, sv) in &scenario.static_only {
+                let eff = t.get_effective(id).expect("PreferStatic keeps static-only effective");
+                prop_assert_eq!(&eff.value, sv, "static-only stays static under PreferStatic");
+            }
+            // dynamic_only 桶: PreferStatic 不适用 (无 static), 仍取 dynamic value.
+            for (id, dv) in &scenario.dynamic_only {
+                let eff = t.get_effective(id).expect("dynamic-only still effective");
+                prop_assert_eq!(&eff.value, dv, "dynamic-only unaffected by PreferStatic");
+            }
+        }
+
+        /// CFG-1: Disabled 模式下, static id (static_only + both) 从 effective view 中完全排除
+        /// (get_effective → None, effective_raw 不含). 仅对 static id 设置 Disabled
+        /// (契约: decision 仅对 static id 有意义).
+        #[test]
+        fn prop_disabled_excluded(scenario in arb_scenario()) {
+            // arb_scenario 保证 static_only ≥1 项, 故 static_ids() 必非空 (历史 prop_assume 已不再需要).
+            let tmp = tempfile_path("disabled");
+            let t = SecretTable::new(
+                scenario.static_entries(),
+                scenario.dynamic_entries(),
+                empty_decisions(),
+                tmp.clone(),
+            );
+            // 全部 static id 设 Disabled.
+            for id in scenario.static_ids() {
+                t.set_decision(&id, OverrideMode::Disabled).unwrap();
+            }
+
+            // static id (static_only + both): get_effective 必须返回 None.
+            for id in scenario.static_ids() {
+                prop_assert!(
+                    t.get_effective(&id).is_none(),
+                    "Disabled static id '{}' must not be effective", id
+                );
+                // has_static 不受 decision 影响 (仍能识别为 static 来源).
+                prop_assert!(t.has_static(&id), "has_static must be decision-invariant");
+            }
+            // both 桶: 即使有 dynamic override, Disabled 也排除 (契约: Disabled 优先于 override).
+            // (上面 static_ids() 已含 both 的 id, 此处不重复断言.)
+
+            // dynamic_only 桶不受 Disabled 影响 (decision 仅对 static id 有意义).
+            for (id, dv) in &scenario.dynamic_only {
+                let eff = t.get_effective(id).expect("dynamic-only unaffected by static Disabled");
+                prop_assert_eq!(&eff.value, dv, "dynamic-only stays effective");
+            }
+        }
+
+        // ─── CFG-2: EffectiveSource 4 种标签正确 ──────────────────────
+
+        /// CFG-2: 对每个 effective item 的 (has_static, has_dynamic, mode) 三元组,
+        /// classify_source 返回的标签必须严格匹配契约表:
+        ///   - 仅 static 有 (无 dynamic)              → Static
+        ///   - 仅 dynamic 有 (无 static), mode=Default → Dynamic
+        ///   - static + dynamic, mode=Default          → DynamicOverride
+        ///   - static + dynamic, mode=PreferStatic     → StaticPreferred
+        /// (Disabled / 全空 / dynamic-only+PreferStatic 不进 effective_triples, 由对偶性保证.)
+        ///
+        /// 用 `arb_scenario` 的三桶 + 对部分 both 桶 id 随机设置 PreferStatic,
+        /// 保证四种 source 标签都有机会被触发. 用 effective_triples() 间接验证
+        /// (effective_snapshot 在 secrets.rs 不在 config.rs).
+        #[test]
+        fn prop_source_label_matches_actual_origin(
+            scenario in arb_scenario(),
+            prefer_static_flags in prop::collection::vec(any::<bool>(), 0..16)
+        ) {
+            let tmp = tempfile_path("source-label");
+            let t = SecretTable::new(
+                scenario.static_entries(),
+                scenario.dynamic_entries(),
+                empty_decisions(),
+                tmp.clone(),
+            );
+            // 对 both 桶的部分 id 设置 PreferStatic (用 prefer_static_flags 控制每个).
+            for (i, (id, _, _)) in scenario.both.iter().enumerate() {
+                if prefer_static_flags.get(i).copied().unwrap_or(false) {
+                    t.set_decision(id, OverrideMode::PreferStatic).unwrap();
+                }
+            }
+
+            for (s, d, m) in t.effective_triples() {
+                let has_s = s.is_some();
+                let has_d = d.is_some();
+                let src = classify_source(has_s, has_d, m)
+                    .expect("effective triple must classify to Some");
+                let expected = match (has_s, has_d, m) {
+                    (true, false, _) => EffectiveSource::Static,
+                    (false, true, OverrideMode::Default) => EffectiveSource::Dynamic,
+                    (true, true, OverrideMode::Default) => EffectiveSource::DynamicOverride,
+                    (true, true, OverrideMode::PreferStatic) => EffectiveSource::StaticPreferred,
+                    // 其他组合经 pick_effective 判定为 None, 不会出现在 effective_triples 中.
+                    _ => panic!(
+                        "unexpected effective triple: has_s={has_s} has_d={has_d} mode={m:?}"
+                    ),
+                };
+                prop_assert_eq!(src, expected);
+            }
+        }
+
+        /// CFG-2 (source 与生效值一致性 property): 对每个 effective item, pick_effective 选中的
+        /// 值必须与 classify_source 标签语义一致:
+        ///   - Static          → 值来自 static_ver
+        ///   - Dynamic         → 值来自 dynamic_ver
+        ///   - DynamicOverride → 值来自 dynamic_ver (Default 下 dynamic 胜出)
+        ///   - StaticPreferred → 值来自 static_ver (PreferStatic 强制 static)
+        /// 即 source 标签不能"说谎": 标 Static 就不能返回 dynamic 的字节.
+        ///
+        /// 这条 property 锁住 compute_effective_secret (secrets.rs) 内的 `.expect` 假设
+        /// "pick_effective Some ⇒ classify_source Some 且方向一致".
+        ///
+        /// 命名说明: 此处 "runtime assert" 指 property 形式的运行时一致性检查, 不是
+        /// `#[cfg(feature = "consistency-check")]` 的 feature flag 守卫 (后者用于热路径
+        /// 派生字段断言, 见 AGENTS.md "视图正确性确保机制").
+        #[test]
+        fn prop_runtime_assert_effective_value_matches_source(
+            scenario in arb_scenario(),
+            prefer_static_flags in prop::collection::vec(any::<bool>(), 0..16),
+            disabled_flags in prop::collection::vec(any::<bool>(), 0..16)
+        ) {
+            let tmp = tempfile_path("src-value-match");
+            let t = SecretTable::new(
+                scenario.static_entries(),
+                scenario.dynamic_entries(),
+                empty_decisions(),
+                tmp.clone(),
+            );
+            // 对 both 桶 id 随机设置 PreferStatic / Disabled.
+            for (i, (id, _, _)) in scenario.both.iter().enumerate() {
+                if disabled_flags.get(i).copied().unwrap_or(false) {
+                    t.set_decision(id, OverrideMode::Disabled).unwrap();
+                } else if prefer_static_flags.get(i).copied().unwrap_or(false) {
+                    t.set_decision(id, OverrideMode::PreferStatic).unwrap();
+                }
+            }
+            for (i, (id, _)) in scenario.static_only.iter().enumerate() {
+                if disabled_flags.get(i).copied().unwrap_or(false) {
+                    t.set_decision(id, OverrideMode::Disabled).unwrap();
+                }
+            }
+
+            for (s, d, m) in t.effective_triples() {
+                let has_s = s.is_some();
+                let has_d = d.is_some();
+                let src = classify_source(has_s, has_d, m)
+                    .expect("effective triple ⇒ classify Some");
+                let eff = pick_effective(s.clone(), d.clone(), m)
+                    .expect("effective triple ⇒ pick_effective Some");
+
+                match src {
+                    EffectiveSource::Static => {
+                        let s = s.expect("Static ⇒ static_ver present");
+                        prop_assert_eq!(eff.value, s.value, "Static source must return static bytes");
+                    }
+                    EffectiveSource::Dynamic | EffectiveSource::DynamicOverride => {
+                        let d = d.expect("Dynamic(Override) ⇒ dynamic_ver present");
+                        prop_assert_eq!(eff.value, d.value, "Dynamic(Override) must return dynamic bytes");
+                    }
+                    EffectiveSource::StaticPreferred => {
+                        let s = s.expect("StaticPreferred ⇒ static_ver present");
+                        prop_assert_eq!(eff.value, s.value, "StaticPreferred must return static bytes");
+                    }
+                }
+            }
+        }
+    }
+
+    // ─── CFG-5: 跨表并发安全 (单独 block, case 数压到 16 避免拖慢 CI) ────────
+    //
+    // 并发测试涉及真实线程 + 真实写盘, case 数与纯函数 property 区别对待.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(16))]
+
+        /// CFG-5: N (2..=8) 个线程并发 upsert 不同 id 到同一 SecretTable, 最终 effective 必须
+        /// 包含全部 N 个 id (无 lost update). persist_lock 串行整个 RMW, 保证并发写不丢.
+        ///
+        /// 既有固定用例 `table_tests::concurrent_upserts_no_lost_update` (2 线程 × 2 entry)
+        /// 不构成 property; 本测试把 N 扩到随机 2..=8 锁住"任意并发度都不丢"的不变量.
+        #[test]
+        fn prop_concurrent_upserts_no_lost_update(
+            n in 2usize..=8,
+            value_seed in "[a-z0-9]{4,12}"
+        ) {
+            let tmp = tempfile_path("concurrent");
+            let t = SecretTable::new(vec![], vec![], empty_decisions(), tmp.clone());
+
+            // N 个线程, 每个 upsert 一个独立 id (id-{i}).
+            let handles: Vec<_> = (0..n)
+                .map(|i| {
+                    let t = t.clone();
+                    let v = format!("{value_seed}{i}"); // 每线程值不同, 但都合法.
+                    std::thread::spawn(move || {
+                        t.upsert_dynamic(entry(&format!("id-{i}"), &v))
+                            .expect("upsert must succeed");
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().expect("worker must not panic");
+            }
+
+            // 核心断言: N 个 id 全部出现在 effective.
+            let ids: std::collections::HashSet<String> =
+                t.effective_raw().into_iter().map(|e| e.id).collect();
+            for i in 0..n {
+                let want = format!("id-{i}");
+                prop_assert!(
+                    ids.contains(&want),
+                    "lost update: id '{}' missing from effective (got {:?})",
+                    want, ids
+                );
+            }
+            // 顺便验证 count == n (无重复 / 无多余).
+            prop_assert_eq!(ids.len(), n, "effective count must equal number of upserts");
+        }
     }
 }

@@ -2004,4 +2004,59 @@ mod tests {
         }
         dag.get_response(node_id)
     }
+
+    // ─── SEC-4: 含关键词的 header 必须被脱敏 ─────────────────────────────
+    //
+    // 契约 (docs/design/contracts.md §7 SEC-4): record 存储的 HTTP headers 中,
+    // 含 "token" / "key" / "secret" 关键词的自定义 header 必须被脱敏为 `<redacted>`.
+    //
+    // ⚠️ 契约/实现 divergence (2026-07 QA 走查发现): is_sensitive_header 的关键词
+    // 匹配仅覆盖 "token" / "secret", **未含 "key"** (常见含 key 的 header 如
+    // `api-key` / `x-api-key` / `x-goog-api-key` 已被显式黑名单覆盖, 但纯自定义如
+    // `x-app-key` 不会被脱敏). 修改 prod 或修改契约需经人工授权, 此处不擅自处理 —
+    // 本 property 仅验证已实现的关键词 (token/secret), `key` 关键词的覆盖留作
+    // 后续 issue. 详见 PR 描述.
+
+    use axum::http::HeaderName;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// SEC-4: 任意含 "token" / "secret" 关键词的 header 名, redact_headers 输出值为
+        /// `<redacted>`.
+        ///
+        /// `is_sensitive_header` 用 `name.contains("token") || name.contains("secret")`
+        /// 做关键词匹配 (case-insensitive, 因为 redact_headers 在调用前会 to_lowercase).
+        /// 本 property 随机化 prefix / suffix / keyword 三个维度, 覆盖任意位置含关键词
+        /// 的自定义 header (如 `x-my-token`, `token-foo`, `x-secret-bar`).
+        ///
+        /// **范围说明**: 仅测试已实现的关键词 (见上方 mod 级注释的 divergence 说明);
+        /// `key` 关键词的契约对齐留作后续.
+        ///
+        /// 字符集 [a-z0-9-]: HTTP header name 合法字符 (token 字符), 且避免大写干扰
+        /// contains 匹配 (redact_headers 已 lowercase, 但 prop 中我们也用 lowercase
+        /// 生成, 保证一致性).
+        #[test]
+        fn prop_custom_token_headers_redacted(
+            prefix in "[a-z]{0,8}",
+            keyword in prop::sample::select(vec!["token", "secret"]),
+            suffix in "[a-z0-9-]{0,8}",
+            value in "[A-Za-z0-9]{1,32}"
+        ) {
+            let header_name = format!("{prefix}{keyword}{suffix}");
+            let mut src = HeaderMap::new();
+            src.insert(
+                HeaderName::from_bytes(header_name.as_bytes())
+                    .expect("header name bytes must be valid"),
+                value.parse().expect("value must be valid HeaderValue"),
+            );
+            let redacted = redact_headers(&src);
+            prop_assert_eq!(redacted.len(), 1, "exactly one header expected");
+            // redact_headers 把 name to_lowercase, value 替换为 <redacted> (若是敏感 header).
+            prop_assert_eq!(
+                &redacted[0].1, "<redacted>",
+                "SEC-4 violation: header '{}' contains keyword '{}' but was not redacted",
+                header_name, keyword
+            );
+        }
+    }
 }

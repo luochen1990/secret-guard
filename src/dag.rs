@@ -3600,6 +3600,119 @@ mod tests {
         }
     }
 
+    // ─── property-based (ROB-1 永不 panic, derive 链派生层) ─────────────────
+    //
+    // 契约: docs/design/contracts.md §8 ROB-1 — extract_delta_messages_from_raw
+    // (timeline 的 req_delta 切片 fallback) 对任意 req_body_raw + 任意 req_delta.len()
+    // 组合 (含非 JSON / 空 / 损坏 / count 与 messages 数不匹配) 必须不 panic, 返回空 Vec
+    // 或合法切片. 该函数接收 HTTP body 派生数据, 任何 panic 都能让单个恶意请求崩溃进程.
+    //
+    // catch_unwind 守卫: 即便未来有人改函数时引入 panic 路径, 这个 property 也会显式 fail
+    // 并报告输入的 (count, body_len), 而非让测试进程崩溃 (release build panic=abort 时
+    // proptest 自身的 panic-as-fail 机制无法生效).
+
+    /// 构造一个最小化 Node, 用作 extract_delta_messages_from_raw 的 fixture.
+    /// `count` 决定 `req_delta.len()` (函数内部用此长度做切片); `req_body_raw` 是任意字节.
+    fn fixture_node(count: usize, req_body_raw: String) -> Node {
+        let mut event = dummy_event();
+        event.req_body_raw = req_body_raw;
+        // req_delta 用任意 MessageRef 填充到 count 长度 — 内容不重要, 只用 len().
+        let dummy_ref = MessageRef {
+            role: IrRole::User,
+            blocks: Vec::new(),
+        };
+        let req_delta: Arc<[MessageRef]> = if count == 0 {
+            Arc::from([])
+        } else {
+            Arc::from(vec![dummy_ref; count])
+        };
+        Node {
+            id: Uuid::new_v4(),
+            parent: None, // 根节点: 触发 system 注入分支
+            session_id: SessionId::new(),
+            child_count: 0,
+            req_delta,
+            own_hash: 0,
+            prefix_hash: 0,
+            event,
+            response: parking_lot::RwLock::new(None),
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(96))]
+
+        /// ROB-1 (变体 A): 任意字节 body + 任意 count, extract_delta_messages_from_raw 不 panic.
+        /// 主要覆盖 serde_json::from_str 失败路径 (messages 不可解析 → 早退返回空 Vec).
+        #[test]
+        fn prop_delta_never_panics_arbitrary(
+            count in 0usize..32,
+            bytes in prop::collection::vec(any::<u8>(), 0..2048)
+        ) {
+            let body = String::from_utf8_lossy(&bytes).into_owned();
+            let node = fixture_node(count, body.clone());
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                extract_delta_messages_from_raw(&node)
+            }));
+            prop_assert!(
+                result.is_ok(),
+                "ROB-1 violation: extract_delta_messages_from_raw panicked \
+                 (count={}, body_len={})",
+                count,
+                body.len()
+            );
+        }
+
+        /// ROB-1 (变体 B): 合法 chat JSON + count 在 messages.len() 边界附近不 panic.
+        ///
+        /// `messages[start..]` 切片 (start = messages.len() - count) 是 panic 高危区.
+        /// 本 property 构造合法 messages 数组 + 让 count 在 `[0 .. n+2]` 区间随机,
+        /// 覆盖 count < n (正常切片) / count == n (全取) / count > n (函数内早退返回空)
+        /// 三种语义. 配合 parent=None (根节点) 触发 system 注入分支, 覆盖完整函数路径.
+        #[test]
+        fn prop_delta_never_panics_chat_json_edge_slice(
+            n in 1usize..16,
+            count in 0usize..18,  // 故意让 count 能略大于 n, 触发 messages.len() < count 早退分支
+            seed in any::<u64>()
+        ) {
+            // n 条 messages + count 的依赖关系难以纯声明式表达 (count 需引用 n),
+            // 这里用确定性 seed 直接构造 body (role/content 随机但 n 固定).
+            let body = build_chat_body_with_n_messages(n, seed);
+            let node = fixture_node(count, body.clone());
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                extract_delta_messages_from_raw(&node)
+            }));
+            prop_assert!(
+                result.is_ok(),
+                "ROB-1 violation: extract_delta_messages_from_raw panicked on chat-json \
+                 (n={}, count={}, body_len={})",
+                n,
+                count,
+                body.len()
+            );
+        }
+    }
+
+    /// 用确定性 seed 生成含 n 条 messages 的合法 chat JSON.
+    /// role/content 从 (seed, i) 经 `crate::util::hash64` 派生 (项目 SSOT, 见 src/util.rs),
+    /// 每个 i 独立 hash, 保证可复现, 不依赖 proptest strategy API.
+    fn build_chat_body_with_n_messages(n: usize, seed: u64) -> String {
+        let msgs: Vec<String> = (0..n)
+            .map(|i| {
+                let h = crate::util::hash64(&(seed, i));
+                let role = match h % 4 {
+                    0 => "system",
+                    1 => "user",
+                    2 => "assistant",
+                    _ => "tool",
+                };
+                let content = format!("msg-{}", h % 1000);
+                format!("{{\"role\":\"{role}\",\"content\":\"{content}\"}}")
+            })
+            .collect();
+        format!("{{\"messages\":[{}]}}", msgs.join(","))
+    }
+
     // ─── 两级锁并发回归 (perf: attach / update_parsed 不应阻塞全局) ───────
     //
     // 这组测试守卫两级锁改动的线程安全: 8 writer 并发 attach_response +

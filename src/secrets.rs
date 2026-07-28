@@ -674,4 +674,65 @@ mod tests {
         };
         assert!(e.validate().is_ok());
     }
+
+    // ─── SEC-1: EffectiveSecret JSON 永不含真实 value ────────────────────
+    //
+    // 契约 (docs/design/contracts.md §7 SEC-1): GET /secrets 路径的核心安全保证 —
+    // EffectiveSecret (GET 响应 DTO) 序列化为 JSON 后不得包含真实 secret value 的任何
+    // 子串. 类型系统层依赖 EffectiveSecret / SecretMasked 用 `value_masked` (经
+    // mask_value 脱敏) 替代 `value`; property 层把 "JSON 字符串扫描" 作为防御性第二道
+    // 闸 (即便有人未来误加 value 字段, property 也会 fail).
+    //
+    // 既有 effective_snapshot_includes_provenance_and_masks_value 是固定输入的 example
+    // 测试, 不构成 property; 此处补随机化覆盖.
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// SEC-1: 任意 secret value, EffectiveSecret 序列化后的 JSON 字符串不含真实 value.
+        ///
+        /// 这是 GET /secrets 路径的核心安全保证 — 任何泄露都是 Critical bug.
+        /// 验证方式: 把 EffectiveSecret 整体序列化为 JSON, 然后在结果字符串里
+        /// 用 `contains` 搜真实 value. mask_value 对 >8 字符输入只保留首尾各 1 字符,
+        /// 中间用 `*` 填充, 因此正常情况下真实 value 的中间子串不可能出现在 JSON 里.
+        ///
+        /// 注意: 这里只校验 effective_snapshot()[0] 本身 (EffectiveSecret struct),
+        /// 不含 static_version / dynamic_version 字段 — 这两者已是 SecretMasked (也
+        /// 用 mask_value 脱敏). EffectiveSecret 序列化时这两个嵌套字段也会跟着序列化,
+        /// 全局扫一次 JSON 字符串即可覆盖.
+        #[test]
+        fn prop_effective_secret_json_excludes_real_value(
+            id in "[a-z][a-z0-9_]{0,8}",
+            // ≥4 字节以满足 validate_value 最小 3 字节要求; 同时避开 value_file 模式.
+            // 字符集限定为 ASCII 可见非特殊字符, 避免 JSON escape 干扰 contains 匹配
+            // (例如真实 value 含 `"` 或 `\` 时, JSON 里会被转义为 `\"` / `\\`,
+            // contains(real_value) 会假阴性 — 这里用纯字母数字+斜杠+等号, 这些字符
+            // 在 JSON 字符串值中不被转义).
+            value in "[A-Za-z0-9/+=]{4,32}"
+        ) {
+            let s = SecretEntry {
+                id: id.clone(),
+                name: Some(format!("name-{id}")),
+                category: SecretCategory::ApiKey,
+                value: value.clone(),
+                value_file: None,
+                mock_strategy: MockStrategy::default(),
+            };
+            let table = SecretTable::new(
+                vec![s],
+                vec![],
+                empty_decisions(),
+                PathBuf::from("/tmp/opencode/tmp/sec1-effective-state.toml"),
+            );
+            let snap = table.effective_snapshot();
+            prop_assert!(!snap.is_empty(), "static entry 应出现在 effective 中");
+            let json = serde_json::to_string(&snap[0]).expect("serialize EffectiveSecret");
+            // 核心: 真实 value 不得出现在 JSON 任何位置 (字段名 / 字段值都不行).
+            prop_assert!(
+                !json.contains(value.as_str()),
+                "SEC-1 violation: EffectiveSecret JSON contains real value. json={}",
+                json
+            );
+        }
+    }
 }

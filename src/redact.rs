@@ -1627,5 +1627,41 @@ mod tests {
             let mock = map.mock_for(&secret).expect("secret must be redacted");
             crate::mock::assert_no_c5_substring(mock, &secret);
         }
+
+        /// SEC-2: 任意触发 RedactError 的场景, error 的 Debug 输出 (`{:?}`) 不含 secret 明文.
+        ///
+        /// 契约 (docs/design/contracts.md §7 SEC-2): RedactError struct 类型系统级保证
+        /// 只携带 `secret_id` + `reason` (无 value 字段). 本 property 是防御性第二道闸 —
+        /// 即便未来有人误加 value 字段或 debug 实现泄露, property 也会 fail.
+        ///
+        /// 触发路径: 手动构造 MockCollision (C4 单射性违反的防御性分支). 既有
+        /// redaction_map_insert_collision_returns_err_without_leaking_secret 是固定输入
+        /// example 测试, 不构成 property.
+        ///
+        /// 字符集 [A-Z]{4,12}: 纯 ASCII 大写字母, 不含 JSON/Debug 转义字符,
+        /// 避免 `contains(secret)` 因 escape 序列假阴性.
+        #[test]
+        fn prop_redact_error_debug_no_secret_leak(
+            secret_a in "[A-Z]{4,12}",
+            secret_b in "[A-Z]{4,12}"
+        ) {
+            prop_assume!(secret_a != secret_b, "需要两个不同 secret 才能触发 collision");
+            // 手动构造 C4 单射性违反: 同一 mock 映射到两个不同 real.
+            let mut map = RedactionMap::default();
+            map.insert(secret_a.clone(), "mock-x".into())
+                .expect("首次插入应成功");
+            // 第二次插入同一 mock + 不同 real → MockCollision.
+            let err = map
+                .insert(secret_b.clone(), "mock-x".into())
+                .expect_err("collision must return Err (not panic)");
+            prop_assert_eq!(err.reason, RedactReason::MockCollision);
+            let debug = format!("{:?}", err);
+            // 核心: error debug 不得包含任一 secret 的明文.
+            prop_assert!(
+                !debug.contains(secret_a.as_str()) && !debug.contains(secret_b.as_str()),
+                "SEC-2 violation: RedactError Debug leaks secret. debug={}",
+                debug
+            );
+        }
     }
 }
