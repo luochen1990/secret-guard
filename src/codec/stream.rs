@@ -686,6 +686,7 @@ mod tests {
     };
     use proptest::prelude::*;
     use serde_json::Value;
+    use serde_json::json;
 
     // ─── find_frame_terminator ─────────────────────────────────────────
 
@@ -1417,6 +1418,425 @@ mod tests {
                  baseline(norm): {}\n\
                  chunked(norm):  {}",
                 splits, baseline_norm, chunked_norm,
+            );
+        }
+    }
+
+    // ─── STR-2 StreamScan 累积正确 (契约 §3 STR-2) ───────────────────────────
+    //
+    // 契约: docs/design/contracts.md L298-307.
+    // 流式 SSE 经 StreamScan 累积的 IrResponse 必须与"等价非流式语义"一致.
+    // StreamScan 是 WebUI resp_parsed 字段的真相来源 (DTO-3), 累积错位 → parsed view
+    // 与实际响应不一致.
+    //
+    // 策略 (按 §0.3 Property 设计原则):
+    // - 生成任意合法 OpenAI SSE 流 (text delta / tool_use input JSON 片段 / include_usage
+    //   chunk / post-stop noise), 参数化各段内容与是否存在.
+    // - snapshot 与预期 IrResponse 比较: content 文本拼接 / tool_use input JSON 拼接 /
+    //   stop_reason / usage / model / id / created 都由生成器确定 → 可严格 assert_eq.
+    // - 这避开了"StreamScan == reader.read_response(累积字节)"的字面形式 (SSE 字节本身
+    //   不是合法非流式 JSON), 而是验证两者的**语义等价** (都描述同一个 assistant 回复),
+    //   即契约陈述的"StreamScan 累积的 IrResponse 必须与非流式路径语义等价".
+
+    /// 生成器: 任意合法 OpenAI SSE 流.
+    ///
+    /// 返回 (sse_bytes, expected): expected 是与该 SSE 语义等价的 IrResponse (确定性,
+    /// 由生成器同步构造). 各段参数化: text content / tool name / tool_call id / partial JSON
+    /// 片段 / 是否有 include_usage chunk / post-stop noise 内容.
+    ///
+    /// 流形态覆盖 (契约 STR-2 生成器覆盖要求):
+    /// - text delta (可多 chunk, 拼接成完整文本)
+    /// - tool_use 开始 (BlockStart) + InputJsonDelta 片段 (partial JSON, 跨 chunk 拼接)
+    /// - finish_reason chunk (MessageStop 前置)
+    /// - include_usage chunk (terminal usage, choices=[]) — **可选**, 由 has_usage 控制
+    /// - [DONE] 终止符
+    /// - post-stop noise (finish 后的噪声 chunk) — **可选**, 由 noise 控制
+    fn arb_openai_sse_with_expected() -> impl Strategy<Value = (Vec<u8>, crate::codec::IrResponse)>
+    {
+        use crate::codec::ir::{IrBlock, IrStopReason, IrUsage};
+        (
+            "[a-z]{2,8}",                // text segment 1
+            "[a-z]{2,8}",                // text segment 2 (跨 chunk 累积)
+            "[a-z]{3,8}",                // tool name
+            "call_[a-z0-9]{3,8}",        // tool_call id
+            "[a-z]{2,6}",                // partial JSON 字段名
+            "[a-z0-9]{2,8}",             // partial JSON 字段值
+            any::<bool>(),               // 是否有 include_usage chunk
+            any::<bool>(),               // 是否在 finish 后追加噪声 chunk
+        )
+            .prop_map(
+                |(t1, t2, tool_name, tc_id, field, value, has_usage, has_noise)| {
+                    let id = "chatcmpl-test".to_string();
+                    let created: u64 = 1700000000;
+                    let model = "gpt-4o".to_string();
+                    let full_text = format!("{t1} {t2}");
+
+                    let mut frames: Vec<String> = Vec::new();
+
+                    // 帧 1: 首个 text delta (fan-out: MessageStart + BlockStart{Text} + BlockDelta).
+                    frames.push(oai_chunk(&json!({
+                        "id":id,"object":"chat.completion.chunk","created":created,"model":model,
+                        "choices":[{"index":0,"delta":{"role":"assistant","content":t1},"finish_reason":Value::Null}]
+                    })));
+                    // 帧 2: 第二个 text delta (跨 chunk 累积).
+                    frames.push(oai_chunk(&json!({
+                        "id":id,"object":"chat.completion.chunk","created":created,"model":model,
+                        "choices":[{"index":0,"delta":{"content":format!(" {t2}")},"finish_reason":Value::Null}]
+                    })));
+                    // 帧 3: tool_call 开始 (index=0, id+name, BlockStart{ToolUse}).
+                    // 用 oai tool_calls[].index=0 (与 text 的 IR index 不同: text index 由
+                    // next_free_block_index 分配, 这里 text 先到 → text=1, tool=2).
+                    frames.push(oai_chunk(&json!({
+                        "id":id,"object":"chat.completion.chunk","created":created,"model":model,
+                        "choices":[{"index":0,"delta":{
+                            "role":"assistant","content":Value::Null,
+                            "tool_calls":[{"index":0,"id":tc_id,"type":"function",
+                                "function":{"name":tool_name,"arguments":""}}]
+                        },"finish_reason":Value::Null}]
+                    })));
+                    // 帧 4: tool_call arguments delta (partial JSON 片段, 跨 chunk 累积).
+                    let partial = format!(r#"{{"{field}":"{value}"}}"#);
+                    frames.push(oai_chunk(&json!({
+                        "id":id,"object":"chat.completion.chunk","created":created,"model":model,
+                        "choices":[{"index":0,"delta":{
+                            "tool_calls":[{"index":0,"function":{"arguments":partial}}]
+                        },"finish_reason":Value::Null}]
+                    })));
+                    // 帧 5: finish_reason chunk (MessageDelta{stop} + MessageStop).
+                    frames.push(oai_chunk(&json!({
+                        "id":id,"object":"chat.completion.chunk","created":created,"model":model,
+                        "choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]
+                    })));
+
+                    // 预期 usage: include_usage chunk 携带的值 (若无则全 0).
+                    let usage_input: u64 = if has_usage { 15 } else { 0 };
+                    let usage_output: u64 = if has_usage { 7 } else { 0 };
+
+                    // 帧 6 (可选): include_usage chunk (terminal usage, choices=[]).
+                    if has_usage {
+                        frames.push(oai_chunk(&json!({
+                            "id":id,"object":"chat.completion.chunk","created":created,"model":model,
+                            "choices":[],
+                            "usage":{"prompt_tokens":usage_input,"completion_tokens":usage_output,
+                                     "total_tokens":usage_input+usage_output}
+                        })));
+                    }
+
+                    // 帧 7: [DONE] 终止符.
+                    frames.push("data: [DONE]\n\n".to_string());
+
+                    // 帧 8 (可选): post-stop noise.
+                    // 噪声 = [DONE] 之后到达的、不携带有效 IR 事件的帧 (空 delta / 无 choices).
+                    // StreamScan 应忽略此类帧 (reader 产 0 events). 注意: 带实际 content
+                    // delta 的帧不是"噪声"——StreamScan 刻意不 guard post-stop content
+                    // (apply_event 的 MessageStop 分支注释: 为支持 include_usage chunk).
+                    // 因此契约 STR-2 "stop 后噪声被忽略" 的精确语义是: 无效/空帧被忽略,
+                    // 而非"任何 stop 后的帧都被 guard".
+                    if has_noise {
+                        frames.push(oai_chunk(&json!({
+                            "id":id,"object":"chat.completion.chunk","created":created,"model":model,
+                            "choices":[{"index":0,"delta":{},"finish_reason":Value::Null}]
+                        })));
+                    }
+
+                    // 构造预期 IrResponse (确定性, 与 SSE 语义等价).
+                    let tool_input: Value = serde_json::from_str(&partial)
+                        .unwrap_or_else(|_| json!({}));
+                    let expected = crate::codec::IrResponse {
+                        content: vec![
+                            IrBlock::Text { text: full_text },
+                            IrBlock::ToolUse {
+                                id: tc_id,
+                                name: tool_name,
+                                input: tool_input,
+                            },
+                        ],
+                        stop_reason: Some(IrStopReason::ToolUse),
+                        stop_sequence: None,
+                        usage: IrUsage {
+                            input_tokens: usage_input,
+                            output_tokens: usage_output,
+                            ..Default::default()
+                        },
+                        model: Some(model),
+                        id: Some(id),
+                        created: Some(created),
+                    };
+
+                    let sse: String = frames.concat();
+                    (sse.into_bytes(), expected)
+                },
+            )
+    }
+
+    /// OpenAI SSE chunk 帧 helper: `data: {json}\n\n`.
+    fn oai_chunk(data: &Value) -> String {
+        format!("data: {data}\n\n")
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// STR-2 `prop_stream_scan_equals_non_streaming_parse`:
+        /// 对任意合法 OpenAI SSE 流 (text + tool_use + include_usage + post-stop noise),
+        /// StreamScan 累积的 snapshot == 预期 IrResponse (语义等价).
+        ///
+        /// 生成器覆盖 (契约 §0.3 第 3 条): text 跨 chunk 累积 / tool_use input JSON 片段 /
+        /// include_usage chunk / post-stop noise. 单协议 OpenAI (StreamScan 目前仅 OpenAI
+        /// 风格 chunk 解析路径完整, Anthropic 由 reader read_response_events 同样支持但
+        /// snapshot 路径以 OpenAI flat stream 为主战场).
+        #[test]
+        fn prop_stream_scan_equals_non_streaming_parse(
+            case in arb_openai_sse_with_expected()
+        ) {
+            let (sse, expected) = case;
+            let mut scan = StreamScan::new(Protocol::OpenAI);
+            scan.feed(&sse);
+            let got = scan.snapshot();
+            prop_assert_eq!(
+                &got, &expected,
+                "STR-2: StreamScan snapshot != 预期 IrResponse (语义等价违反)"
+            );
+        }
+
+        /// STR-2 `prop_stream_scan_accumulates_text`:
+        /// text token 跨多 chunk 累积正确 (snapshot 的 Text block == 全部 text delta 拼接).
+        /// 由 arb_openai_sse_with_expected 的两段 text 覆盖; 这里单独断言 Text block.
+        #[test]
+        fn prop_stream_scan_accumulates_text(
+            case in arb_openai_sse_with_expected()
+        ) {
+            let (sse, expected) = case;
+            let mut scan = StreamScan::new(Protocol::OpenAI);
+            scan.feed(&sse);
+            let got = scan.snapshot();
+            // 第一个 block 是 Text, 内容 == 预期 Text block (两段拼接).
+            let got_text = got.content.first().and_then(|b| match b {
+                crate::codec::IrBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            });
+            let want_text = expected.content.first().and_then(|b| match b {
+                crate::codec::IrBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            });
+            prop_assert_eq!(got_text, want_text, "STR-2 text accumulation 违反");
+        }
+
+        /// STR-2 `prop_stream_scan_accumulates_tool_use`:
+        /// tool_use input JSON 部分片段跨 chunk 累积正确 (snapshot 的 ToolUse block.input
+        /// == 全部 InputJsonDelta 拼接后 parse 的 JSON).
+        #[test]
+        fn prop_stream_scan_accumulates_tool_use(
+            case in arb_openai_sse_with_expected()
+        ) {
+            let (sse, expected) = case;
+            let mut scan = StreamScan::new(Protocol::OpenAI);
+            scan.feed(&sse);
+            let got = scan.snapshot();
+            // 第二个 block 是 ToolUse.
+            let got_tu = got.content.get(1).and_then(|b| match b {
+                crate::codec::IrBlock::ToolUse { id, name, input } => {
+                    Some((id.clone(), name.clone(), input.clone()))
+                }
+                _ => None,
+            });
+            let want_tu = expected.content.get(1).and_then(|b| match b {
+                crate::codec::IrBlock::ToolUse { id, name, input } => {
+                    Some((id.clone(), name.clone(), input.clone()))
+                }
+                _ => None,
+            });
+            prop_assert_eq!(got_tu, want_tu, "STR-2 tool_use accumulation 违反");
+        }
+
+        /// STR-2 `prop_stream_scan_include_usage_chunk`:
+        /// include_usage chunk (choices=[], terminal usage) 正确更新 usage.
+        /// has_usage=true 时 snapshot.usage 必须含 input/output; has_usage=false 时全 0.
+        #[test]
+        fn prop_stream_scan_include_usage_chunk(
+            case in arb_openai_sse_with_expected()
+        ) {
+            let (sse, expected) = case;
+            let mut scan = StreamScan::new(Protocol::OpenAI);
+            scan.feed(&sse);
+            let got = scan.snapshot();
+            prop_assert_eq!(
+                got.usage, expected.usage,
+                "STR-2 include_usage chunk accumulation 违反"
+            );
+        }
+
+        /// STR-2 `prop_stream_scan_ignores_post_stop_noise`:
+        /// [DONE] 之后的噪声帧 (不携带有效 IR 事件的帧) 不影响 snapshot.
+        ///
+        /// "噪声"的精确语义 (见生成器注释): 空 delta / 无 choices 的帧, reader 产 0 events,
+        /// StreamScan 不累积. 注意 StreamScan 刻意不 guard 带实际 content 的 post-stop
+        /// 帧 (为支持 include_usage chunk), 因此本 property 只守卫"无效/空帧被忽略".
+        /// 断言: snapshot == 预期 (无论 has_noise 是否追加空帧).
+        #[test]
+        fn prop_stream_scan_ignores_post_stop_noise(
+            case in arb_openai_sse_with_expected()
+        ) {
+            let (sse, expected) = case;
+            let mut scan = StreamScan::new(Protocol::OpenAI);
+            scan.feed(&sse);
+            let got = scan.snapshot();
+            prop_assert_eq!(
+                &got, &expected,
+                "STR-2 post-stop noise (空帧) 被错误累积进 snapshot"
+            );
+        }
+    }
+
+    // ─── STR-5 流式 reader 多 tool_call 索引分配 (契约 §3 STR-5) ──────────────
+    //
+    // 契约: docs/design/contracts.md L327-335.
+    // OpenAI 流式响应中 N (≥2) 个并行 tool_call 经 reader 解析后, 每个在 IR 中有独立
+    // block index (用于 writer 透传到 wire 的 tool_calls[].index, 保证客户端按 index
+    // 聚合时不合并).
+    //
+    // 历史 bug 9712c52: writer 硬编码 index=0 → N 个 tool_call 被聚合成 1 个.
+    // 当前固定测试只测 N=2, 这里用 proptest 覆盖 N=2..=5, 守护 reader 侧 index 分配
+    // (next_free_block_index + tool_ir_index 持久化).
+
+    /// 收集一组 IR 事件中所有 BlockStart{ToolUse} 的 IR block index.
+    /// 用于断言 N 个 tool_call 各自拿到独立 index.
+    fn collect_tool_use_block_indices(
+        events: &[crate::codec::ir::IrStreamEvent],
+    ) -> Vec<(usize, String)> {
+        use crate::codec::ir::IrStreamEvent;
+        let mut out = Vec::new();
+        for ev in events {
+            if let IrStreamEvent::BlockStart {
+                index,
+                block: crate::codec::ir::IrBlockMeta::ToolUse { id, .. },
+            } = ev
+            {
+                out.push((*index, id.clone()));
+            }
+        }
+        out
+    }
+
+    /// 构造一个含 N 个并行 tool_call 的首个 chunk (delta.tool_calls 数组长度 = N).
+    /// 每个 tool_call 有不同 oai index (0..N) 与不同 id, 模拟 OpenAI 并行 tool_call 流.
+    fn openai_multi_tool_call_start_chunk(n: usize, ids: &[String], names: &[String]) -> Value {
+        let tool_calls: Vec<Value> = (0..n)
+            .map(|i| {
+                json!({
+                    "index": i,
+                    "id": ids[i],
+                    "type": "function",
+                    "function": {"name": names[i], "arguments": ""}
+                })
+            })
+            .collect();
+        json!({
+            "id":"chatcmpl-multi","object":"chat.completion.chunk","created":1700000000,
+            "model":"gpt-4o",
+            "choices":[{"index":0,"delta":{
+                "role":"assistant","content":Value::Null,
+                "tool_calls":tool_calls
+            },"finish_reason":Value::Null}]
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// STR-5 `prop_stream_reader_assigns_distinct_block_index`:
+        /// N (≥2) 个并行 tool_call 经 OpenAI reader 解析后, 每个在 IR 中有独立 block index.
+        ///
+        /// 生成器: N ∈ [2, 5], 每个 tool_call 有独立 id + name. reader 一次 feed 首个 chunk,
+        /// 收集所有 BlockStart{ToolUse} 的 IR index, 断言:
+        /// 1. 数量 == N (每个 tool_call 都开了 BlockStart)
+        /// 2. IR index 互不相同 (distinct)
+        #[test]
+        fn prop_stream_reader_assigns_distinct_block_index(
+            n in 2usize..=5,
+        ) {
+            use crate::codec::Reader;
+            use crate::codec::ir::StreamDecodeState;
+            let reader = OpenAiReader;
+            let mut state = StreamDecodeState::default();
+
+            let ids: Vec<String> = (0..n).map(|i| format!("call_{i}")).collect();
+            let names: Vec<String> = (0..n).map(|i| format!("tool_{i}")).collect();
+            let chunk = openai_multi_tool_call_start_chunk(n, &ids, &names);
+
+            let events = reader.read_response_events("", &chunk, &mut state);
+            let indices = collect_tool_use_block_indices(&events);
+
+            prop_assert_eq!(
+                indices.len(), n,
+                "STR-5: 应有 N 个 BlockStart{{ToolUse}}, 实际 {}",
+                indices.len(),
+            );
+            let ir_idxs: Vec<usize> = indices.iter().map(|(i, _)| *i).collect();
+            let unique: std::collections::BTreeSet<usize> = ir_idxs.iter().copied().collect();
+            prop_assert_eq!(
+                unique.len(), n,
+                "STR-5: N 个 tool_call 的 IR index 必须互不相同, 实际 {:?}",
+                ir_idxs,
+            );
+            // id 也必须对应 (每个 BlockStart 的 id 与 wire tool_calls[i].id 一致).
+            let got_ids: std::collections::BTreeSet<String> =
+                indices.iter().map(|(_, id)| id.clone()).collect();
+            let want_ids: std::collections::BTreeSet<String> = ids.iter().cloned().collect();
+            prop_assert_eq!(got_ids, want_ids, "STR-5: tool_call id 丢失或不匹配");
+        }
+
+        /// STR-5 `prop_stream_reader_mixed_text_and_tool_call_indices_correct`:
+        /// 文本 + 多 tool_call 混合流的 IR block index 不冲突.
+        ///
+        /// 构造: chunk1 含 text delta (开 Text block); chunk2 含 N 个 tool_call (开 N 个
+        /// ToolUse block). 断言 text index 不与任何 tool index 相同.
+        /// 覆盖历史 bug 模式: text 先到 → text=1, tools=2..N+1 (next_free_block_index).
+        #[test]
+        fn prop_stream_reader_mixed_text_and_tool_call_indices_correct(
+            text in "[a-z]{1,10}",
+            n in 2usize..=4,
+        ) {
+            use crate::codec::Reader;
+            use crate::codec::ir::StreamDecodeState;
+            let reader = OpenAiReader;
+            let mut state = StreamDecodeState::default();
+
+            // chunk1: text delta (开 Text block).
+            let chunk1 = json!({
+                "id":"chatcmpl-mix","object":"chat.completion.chunk","created":1700000000,
+                "model":"gpt-4o",
+                "choices":[{"index":0,"delta":{"role":"assistant","content":text},"finish_reason":Value::Null}]
+            });
+            let _ = reader.read_response_events("", &chunk1, &mut state);
+
+            // chunk2: N 个并行 tool_call.
+            let ids: Vec<String> = (0..n).map(|i| format!("call_mix_{i}")).collect();
+            let names: Vec<String> = (0..n).map(|i| format!("mix_tool_{i}")).collect();
+            let chunk2 = openai_multi_tool_call_start_chunk(n, &ids, &names);
+            let events2 = reader.read_response_events("", &chunk2, &mut state);
+
+            // text index (首次 text delta 时分配).
+            let text_idx = state.text_index;
+            // tool IR indices.
+            let tool_indices = collect_tool_use_block_indices(&events2);
+            prop_assert_eq!(tool_indices.len(), n, "STR-5 混合: N 个 tool_call BlockStart");
+            let tool_ir_idxs: Vec<usize> = tool_indices.iter().map(|(i, _)| *i).collect();
+
+            // text index 与所有 tool index 互不相同.
+            if let Some(tidx) = text_idx {
+                prop_assert!(
+                    !tool_ir_idxs.contains(&tidx),
+                    "STR-5 混合: text index {tidx} 与 tool index {:?} 冲突",
+                    tool_ir_idxs,
+                );
+            }
+            // tool index 之间也互不相同 (与 distinct property 一致, 这里在混合场景再守卫一次).
+            let unique: std::collections::BTreeSet<usize> = tool_ir_idxs.iter().copied().collect();
+            prop_assert_eq!(
+                unique.len(), n,
+                "STR-5 混合: N 个 tool_call IR index 互不相同, 实际 {:?}",
+                tool_ir_idxs,
             );
         }
     }
