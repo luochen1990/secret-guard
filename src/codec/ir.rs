@@ -96,6 +96,30 @@ pub struct IrMessage {
     /// 仅同协议 round-trip 时填充, 用于 wire 形态保真 (L1).
     /// 跨协议翻译前由 caller 清空.
     pub content_form: Option<ContentForm>,
+    /// 这条消息是否代表用户的**主动文本输入** (而非工具结果的隐式 user 角色).
+    ///
+    /// 背景: IR 把 OpenAI `role:"tool"` 和 Anthropic `role:"user"+tool_result` 都归一化
+    /// 为 `IrRole::User`, 导致无法从 `role` 单一维度区分 "用户真在说话" vs "工具结果
+    /// 借 user 角色承载". 此字段补充丢失的维度, 由 reader 入口 (同时看到原始 wire role
+    /// 和解析后的 content blocks) 集中判定:
+    ///   - `role == User` 且 content 含非空 Text block → true
+    ///   - 其他 (tool_result-only user / assistant / system) → false
+    ///
+    /// 用途: DAG 的 round_role 判定 (sidebar 分组: 用户轮 vs 工具轮).
+    /// 不参与 wire 序列化 (writer 忽略此字段).
+    ///
+    /// 注意: 此字段在 `MessageRef`/`resolve_message` 中**不保留** (MessageRef 只存 role +
+    /// block hash). round_role 在 push_messages 时一次性消耗原始 msgs 的此字段, 之后
+    /// resolve_message 重建的 IrMessage 此字段会 reset 为 false (Default).
+    pub contains_user_text: bool,
+}
+
+/// content blocks 是否含非空 Text block.
+/// 用于 reader 入口判定 `contains_user_text`.
+pub fn blocks_has_text(blocks: &[IrBlock]) -> bool {
+    blocks
+        .iter()
+        .any(|b| matches!(b, IrBlock::Text { text } if !text.is_empty()))
 }
 
 /// wire 中 message content 的原始形态. 用于同协议 round-trip 时保留 wire 形态.

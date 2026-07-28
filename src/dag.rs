@@ -358,10 +358,14 @@ pub struct CallEvent {
     /// 场景性价比低. 直接存快照 (一次写, 多次读) 是更经济的选择.
     /// `req_delta` 仍用于内容寻址去重 (DAG 核心价值) + 未来 lazy redact 功能.
     pub req_body_raw: String,
-    /// 本轮的主导角色 = req_delta 最后一条 message 的 role.
-    /// 语义: "由于谁发了最后一条消息而触发了这次 HTTP 请求".
-    /// push 时一次性从 delta_refs.last().role 预计算, O(0) 查询.
-    /// WebUI 用它决定 sidebar 条目样式 (user → round-item, 其他 → sub-dot).
+    /// 本轮的主导角色 = "用户是否主动输入了新内容".
+    /// 语义: round_role == User 表示这一轮有用户的新提问 (sidebar 显示为 round-item 组首);
+    ///       round_role == Tool 表示这一轮是工具调用循环 (sidebar 折叠为 sub-dot).
+    /// push 时一次性预计算, O(0) 查询.
+    ///
+    /// 判定基于 `IrMessage::contains_user_text` (reader 入口预计算, 标记 "真用户文本输入"
+    /// 而非 "工具结果借 user 角色承载"). delta 任一条 contains_user_text → User.
+    /// 不依赖 `IrMessage.role`: codec 归一化把 tool 消息也映射为 IrRole::User.
     pub round_role: IrRole,
     /// WebUI sidebar / timeline preview 文本 (push 时从 req_body_raw 提取, 截断 48 chars).
     ///
@@ -550,12 +554,28 @@ impl ConversationDag {
         }
         let delta_refs: Arc<[MessageRef]> = msg_refs[lookup.split_at..].iter().cloned().collect();
 
-        // 3.5 修正 round_role = req_delta 最后一条 message 的 role.
+        // 3.5 修正 round_role = req_delta 的"语义主导角色".
         // 调用方 (proxy) 无法在构造 CallEvent 时知道 split_at (它依赖 DAG 内部 prefix 匹配),
         // 所以 round_role 的权威值在此处计算. delta 为空 (空 body 请求) 时保留调用方传入的值.
+        //
+        // 不直接用最后一条 message 的 role: codec 把 tool 消息归一化为 user (OpenAI tool→user
+        // / Anthropic tool_result 本就在 user message 内), 无法区分"真用户输入"与"工具结果".
+        // 用 contains_user_text 字段 (reader 入口预计算) 准确判定:
+        //   delta 任一条 message contains_user_text → User (用户主动输入, sidebar 组首)
+        //   否则                                    → Tool (工具循环, sidebar sub-dot)
         let mut event = event;
-        if let Some(last) = delta_refs.last() {
-            event.round_role = last.role;
+        let delta_has_user_text = msgs
+            .iter()
+            .skip(lookup.split_at)
+            .any(|m| m.contains_user_text);
+        // guard 基于 delta 非空 (split_at < msgs.len()), 而非 msgs 非空:
+        // 全前缀重复请求 (split_at == msgs.len(), delta 实际为空) 时保留调用方传入的值.
+        if lookup.split_at < msgs.len() {
+            event.round_role = if delta_has_user_text {
+                IrRole::User
+            } else {
+                IrRole::Tool
+            };
         }
 
         // 4. 计算 own_hash + prefix_hash (只基于 req_delta, response 不参与).
@@ -1638,6 +1658,7 @@ mod tests {
 
     fn text_msg(role: IrRole, text: &str) -> IrMessage {
         IrMessage {
+            contains_user_text: role == IrRole::User && !text.is_empty(),
             role,
             content: vec![IrBlock::Text {
                 text: text.to_string(),
@@ -2823,6 +2844,98 @@ mod tests {
         // 不存在的 sid → 空 Vec (不 panic).
         let rounds = dag.session_rounds(SessionId::new());
         assert!(rounds.is_empty());
+    }
+
+    /// 构造 IR 归一化后的 tool_result user 消息 (role=User 但 content 仅含 ToolResult block).
+    /// 模拟 codec reader 把 OpenAI `role:"tool"` / Anthropic tool_result block 读入后的形态.
+    fn tool_result_msg() -> IrMessage {
+        IrMessage {
+            role: IrRole::User,
+            content: vec![IrBlock::ToolResult {
+                tool_use_id: "call_1".to_string(),
+                content: vec![IrBlock::Text {
+                    text: "tool output".to_string(),
+                }],
+                is_error: false,
+                content_form: None,
+            }],
+            // 关键: tool_result 借 user 角色但不是用户的主动文本输入.
+            contains_user_text: false,
+            ..Default::default()
+        }
+    }
+
+    /// round_role 判定基于 contains_user_text, 而非 IrMessage.role.
+    /// tool-call 循环 (assistant tool_use + user tool_result) 的 round_role 必须是 Tool,
+    /// 否则 sidebar 会把它们全部平铺为 round-item (bug #1).
+    #[test]
+    fn round_role_distinguishes_user_text_from_tool_result() {
+        let dag = ConversationDag::new(64, 500, 1);
+        // 轮1: 用户提问 (delta=[user:"list files"]).
+        let _ = dag.push_messages(vec![text_msg(IrRole::User, "list files")], dummy_event());
+        // 轮2: tool-call 循环 (delta=[assistant:tool_use, user(tool_result)]).
+        //   IR 归一化后两条 message 的 role 分别是 Assistant 和 User,
+        //   但最后一条 user 的 contains_user_text=false (纯 tool_result).
+        let id2 = dag.push_messages(
+            vec![
+                IrMessage {
+                    role: IrRole::Assistant,
+                    content: vec![IrBlock::ToolUse {
+                        id: "call_1".to_string(),
+                        name: "ls".to_string(),
+                        input: serde_json::Value::Object(serde_json::Map::new()),
+                    }],
+                    ..Default::default()
+                },
+                tool_result_msg(),
+            ],
+            dummy_event(),
+        );
+        let node2 = dag.get_node(id2).unwrap();
+        assert_eq!(
+            node2.round_role,
+            IrRole::Tool,
+            "tool-call 循环 round_role 应为 Tool (delta 无用户文本)"
+        );
+    }
+
+    /// Anthropic 混合消息 (user 同含 Text + ToolResult) 的 round_role 应为 User.
+    /// 用户在工具结果旁附加了新文本输入 → 仍是用户主导的轮次.
+    #[test]
+    fn round_role_mixed_text_and_tool_result_is_user() {
+        let dag = ConversationDag::new(64, 500, 1);
+        let _ = dag.push_messages(vec![text_msg(IrRole::User, "topic")], dummy_event());
+        let id2 = dag.push_messages(
+            vec![
+                text_msg(IrRole::User, "topic"),
+                text_msg(IrRole::Assistant, "reply"),
+                IrMessage {
+                    role: IrRole::User,
+                    content: vec![
+                        IrBlock::Text {
+                            text: "查完后帮我总结".to_string(),
+                        },
+                        IrBlock::ToolResult {
+                            tool_use_id: "call_1".to_string(),
+                            content: vec![IrBlock::Text {
+                                text: "result".to_string(),
+                            }],
+                            is_error: false,
+                            content_form: None,
+                        },
+                    ],
+                    contains_user_text: true, // reader 入口已正确标记
+                    ..Default::default()
+                },
+            ],
+            dummy_event(),
+        );
+        let node2 = dag.get_node(id2).unwrap();
+        assert_eq!(
+            node2.round_role,
+            IrRole::User,
+            "混合 Text+ToolResult 的 user 消息仍是用户主导轮"
+        );
     }
 
     #[test]

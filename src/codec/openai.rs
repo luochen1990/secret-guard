@@ -98,6 +98,8 @@ impl Reader for OpenAiReader {
             // L1 保真: 记录 content 原始形态 (string / array / null).
             let content_form = ContentForm::classify(msg.get("content"));
             let message = IrMessage {
+                // role==User 且 content 含非空 Text block (排除纯 tool_result user / assistant tool_call).
+                contains_user_text: role == IrRole::User && super::ir::blocks_has_text(&blocks),
                 role,
                 content: blocks,
                 content_form,
@@ -1634,6 +1636,13 @@ mod tests {
         );
         // 第 3 条是 user + ToolResult (OpenAI tool → Anthropic user 角色).
         assert_eq!(ir1.messages[2].role, IrRole::User);
+        // contains_user_text: 第 1 条 (真用户输入) = true; 第 3 条 (tool_result 借 user
+        // 角色) = false. 此字段是 round_role 判定的依据 (sidebar 折叠工具循环为 sub-dot).
+        assert!(ir1.messages[0].contains_user_text, "真 user 文本");
+        assert!(
+            !ir1.messages[2].contains_user_text,
+            "tool_result 借 user 角色"
+        );
 
         // IR → Anthropic wire → IR → OpenAI wire → IR.
         let anth_wire = AnthropicWriter.write_request(&ir1);

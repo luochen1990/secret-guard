@@ -1700,12 +1700,10 @@
 
     // 选中某一轮: 在右侧 timeline 中定位 + 高亮.
     //
-    // 三级优先 (避免不必要的网络请求):
+    // 两级优先 (避免不必要的网络请求):
     //   1. 该轮已在当前 timeline → 直接滚动 + 高亮 (零开销).
-    //   2. 该轮在 sessionRounds 缓存中 (sidebar 三级展开) → 从缓存切片填充 timelineRecords
-    //      (RoundBrief 不含 req_delta_messages, 故仅作为定位锚; 仍需后续 sync 全量回填).
-    //   3. 都不在 → 重新加载整个 timeline (GET /sessions/{sid}/timeline, 取最近 N 条),
-    //      然后 highlightRound 定位.
+    //   2. 不在 timeline → 重新加载该会话最近 N 条 (GET /sessions/{sid}/timeline),
+    //      然后 highlight 定位 (scroll='highlight', 不强拉到底 — 避免进入 phase 4).
     //
     // opts.scroll 滚动策略 (调用方语义决定):
     //   'highlight' (默认): highlightRound — 选中气泡下边缘对齐视口 70% (issue #36 规则1),
@@ -1730,12 +1728,10 @@
       // (需要后端加 anchor 参数). 当前用 "最近 N 条" 的近似方案: 功能正确 (能定位到该轮),
       // 但若该轮不在最近 N 条内 (历史久远), 会 fallback 到最近 N 条的末轮.
       // TODO: 后端加 anchor 参数后可精确化 (GET /sessions/{sid}/timeline?anchor=X).
+      // scroll='highlight' 让 loadTimeline 滚到 selectedRound 而非末轮 (避免被强拉到底
+      // 进入 phase 4 / drawer 扩展到 80%, 见 loadTimeline 头部注释).
       if (state.selectedSession) {
-        await loadTimeline(state.selectedSession);
-      }
-      // loadTimeline 滚到底; 若调用方要 highlight 某具体轮 (非末轮), 再补一次 highlight.
-      if (scrollMode === 'highlight' && state.timelineRecords.some(r => r.id === nodeId)) {
-        highlightRound(nodeId);
+        await loadTimeline(state.selectedSession, { scroll: scrollMode });
       }
     }
 
@@ -1929,7 +1925,12 @@
     //
     // 新 API: GET /sessions/{sid}/timeline?limit=N (before 省略 = 从最新轮 leaf 起取 N 条).
     // 返回 { rounds: TimelineRound[], tail: TimelineTail, has_more }.
-    async function loadTimeline(sid) {
+    //
+    // opts.scroll 滚动策略 (调用方语义决定):
+    //   'bottom' (默认): 滚到最新一轮 (IM 风格), 用于 toggleSession.
+    //   'highlight':     滚到 selectedRound 的 70% 定位, 用于 selectRound path 2
+    //                    (点具体轮次, 不应被强拉到底).
+    async function loadTimeline(sid, { scroll: scrollMode = 'bottom' } = {}) {
       recordDetailCache.clear();  // 切换轮次时清空 (避免无界增长 + 旧数据残留)
       try {
         const r = await fetch(`${API_SESSIONS}/${sid}/timeline?limit=${TIMELINE_PAGE}`, { cache: 'no-store' });
@@ -1950,9 +1951,12 @@
         state.timelineReachedTop = !data.has_more;
         renderTimeline();
         renderDrawer();
-        // 选中会话叶子 → 滚到最末轮 (最新, IM 风格) + 进入 follow (UI-6).
-        // 注: selectRound 入口已把 selectedRound 设为目标 id; loadTimeline 不重置它.
-        scrollTimelineToBottomForce();
+        // 按调用方语义滚动 (见函数头 opts.scroll 注释).
+        if (scrollMode === 'highlight' && state.selectedRound) {
+          highlightRound(state.selectedRound);
+        } else {
+          scrollTimelineToBottomForce();
+        }
         syncFollowMode();
       } catch (e) {
         console.error(e);

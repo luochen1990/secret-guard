@@ -13,8 +13,8 @@
  *   - toggleSession 不再设置 state.selectedRound; 仅点击 round-item / sub-dot / timeline
  *     header 才会显式 selectRound. 故依赖 ".tl-round.selected" 的测试需先显式选一轮.
  *   - sidebar 三级菜单用 round_role (后端预计算) 判定: 'user' → round-item, 其他 → sub-dot.
- *     注: OpenAI 把 role:"tool" 在 IR 层归一化为 IrRole::User (ToolResult 块), 故 OpenAI
- *     tool-call 循环的每一轮 round_role 都是 'user' → 全部 round-item (无 sub-dot).
+ *     round_role 基于 IrMessage.contains_user_text 字段 (而非 IR 归一化后的 role):
+ *     tool-call 循环 (delta 无用户文本输入) 的 round_role=Tool → 折叠为 sub-dot.
  *   - timeline round 的 resp_status / elapsed_ms 等字段移到 TimelineTail, 由
  *     updateLastRoundHeader() 从 state.tail 填充末轮 header.
  *
@@ -419,11 +419,12 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     await page.waitForTimeout(500);
 
     // 分组渲染 (session-aware sync API + IR round_role):
-    //   注: OpenAI ingress 把 role:"tool" 在 IR 层归一化为 IrRole::User (ToolResult 块),
-    //   故 tool-call 循环每一轮的 round_role 都是 'user' → 全部作为 .round-item (无 .sub-dot).
-    //   3 次 HTTP 请求 → 3 个 .round-item, 0 个 .sub-dot.
-    await expect(page.locator(".round-item")).toHaveCount(3);
-    await expect(page.locator(".sub-dot")).toHaveCount(0);
+    //   注: round_role 基于 contains_user_text 字段判定 (而非 IR 归一化后的 role),
+    //   tool-call 循环轮次 (delta 仅含 assistant tool_call + tool result, 无 user 文本)
+    //   round_role=Tool → 折叠为 sub-dot.
+    //   3 次 HTTP 请求 → 1 个 .round-item (用户首轮), 2 个 .sub-dot (后续 tool 循环).
+    await expect(page.locator(".round-item")).toHaveCount(1);
+    await expect(page.locator(".sub-dot")).toHaveCount(2);
     // delta 内容验证: tool_result 气泡 + assistant tool_call 气泡应存在.
     expect(await page.locator("#detail .chat-bubble[data-role='tool']").count()).toBeGreaterThan(0);
     expect(await page.locator("#detail .chat-bubble.bubble-assistant").count()).toBeGreaterThan(0);
@@ -561,8 +562,8 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
   // 每一轮的 round_role 都是 'user' → 全部 .round-item (无 .sub-dot).
   //
   // .sub-dot 仅在 round_role !== 'user' 时出现 (如纯 system/assistant 结尾的轮次, 极罕见),
-  // 故本测试改为: 验证 round-item 渲染 (3 轮全为 round-item) + 点击 round-item 的选中态迁移.
-  test("sidebar round-item: tool-call 循环 3 轮全为 round-item + 点击迁移 .selected", async ({
+  // 故本测试改为: 验证 sub-dot 渲染 (1 round-item + 2 sub-dot) + 点击迁移 .selected.
+  test("sidebar: tool-call 循环折叠为 sub-dot + 点击迁移 .selected", async ({
     page,
   }) => {
     // 轮1: 用户提问 → LLM 返回 tool_call(ls).
@@ -588,44 +589,36 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     await clickSessionByLeaf(page, sid);
     await page.waitForTimeout(500);
 
-    // 3 个 .round-item (OpenAI tool result 在 IR 归一化为 User → round_role='user'),
-    // 0 个 .sub-dot (无 round_role!=='user' 的轮次).
-    await expect(page.locator(".round-item")).toHaveCount(3);
-    await expect(page.locator(".sub-dot")).toHaveCount(0);
+    // round_role 基于 contains_user_text (而非 IR 归一化 role):
+    //   轮1 delta=[user] → round_role=User → round-item.
+    //   轮2/轮3 delta=[assistant tool_call, tool result] → round_role=Tool → sub-dot.
+    // 1 个 .round-item (用户首轮), 2 个 .sub-dot (后续 tool 循环).
+    await expect(page.locator(".round-item")).toHaveCount(1);
+    await expect(page.locator(".sub-dot")).toHaveCount(2);
 
-    // 点击 round-item 应选中对应轮次: sidebar active + timeline .selected 必须一致.
+    // 点击 sub-dot 应选中对应轮次: sidebar active + timeline .selected 必须一致.
     // 历史 bug (UI-4): 点击后 .flash 动画到了新轮, 但 .selected 滞留在旧轮 (闪烁与高亮错位).
     // 这里覆盖到 timeline 侧的 .selected, 修复前会失败.
     const roundList = page.locator(`.round-list[data-sid="${sid}"]`);
-    const item1Rid = await roundList.locator(".round-item").nth(1).getAttribute("data-rid");
-    expect(item1Rid).toBeTruthy();
-    await roundList.locator(".round-item").nth(1).click();
+    const dot1Rid = await roundList.locator(".sub-dot").nth(1).getAttribute("data-rid");
+    expect(dot1Rid).toBeTruthy();
+    await roundList.locator(".sub-dot").nth(1).click();
     await page.waitForTimeout(500);
-    await expect(page.locator(".round-item.active")).toHaveCount(1);
-    await expect(page.locator(`.round-item.active[data-rid="${item1Rid}"]`)).toHaveCount(1);
-    // timeline 侧: 仅一个 .selected, 且 data-rid 与所点击的 round-item 一致.
+    await expect(page.locator(".sub-dot.active")).toHaveCount(1);
+    await expect(page.locator(`.sub-dot.active[data-rid="${dot1Rid}"]`)).toHaveCount(1);
+    // timeline 侧: 仅一个 .selected, 且 data-rid 与所点击的 sub-dot 一致.
     await expect(page.locator("#detail .tl-round.selected")).toHaveCount(1);
-    await expect(page.locator(`#detail .tl-round.selected[data-rid="${item1Rid}"]`)).toHaveCount(1);
+    await expect(page.locator(`#detail .tl-round.selected[data-rid="${dot1Rid}"]`)).toHaveCount(1);
 
-    // 再点另一个 round-item, .selected 必须迁移到新轮次 (不留旧选中).
-    const item0Rid = await roundList.locator(".round-item").nth(0).getAttribute("data-rid");
-    expect(item0Rid).toBeTruthy();
-    await roundList.locator(".round-item").nth(0).click();
+    // 再点另一个 sub-dot, .selected 必须迁移到新轮次 (不留旧选中).
+    const dot0Rid = await roundList.locator(".sub-dot").nth(0).getAttribute("data-rid");
+    expect(dot0Rid).toBeTruthy();
+    await roundList.locator(".sub-dot").nth(0).click();
     await page.waitForTimeout(500);
-    await expect(page.locator(".round-item.active")).toHaveCount(1);
-    await expect(page.locator(`.round-item.active[data-rid="${item0Rid}"]`)).toHaveCount(1);
+    await expect(page.locator(".sub-dot.active")).toHaveCount(1);
+    await expect(page.locator(`.sub-dot.active[data-rid="${dot0Rid}"]`)).toHaveCount(1);
     await expect(page.locator("#detail .tl-round.selected")).toHaveCount(1);
-    await expect(page.locator(`#detail .tl-round.selected[data-rid="${item0Rid}"]`)).toHaveCount(1);
-
-    // 再点第三个 round-item (末轮), .selected 再次迁移.
-    const item2Rid = await roundList.locator(".round-item").nth(2).getAttribute("data-rid");
-    expect(item2Rid).toBeTruthy();
-    await roundList.locator(".round-item").nth(2).click();
-    await page.waitForTimeout(500);
-    await expect(page.locator(".round-item.active")).toHaveCount(1);
-    await expect(page.locator(`.round-item.active[data-rid="${item2Rid}"]`)).toHaveCount(1);
-    await expect(page.locator("#detail .tl-round.selected")).toHaveCount(1);
-    await expect(page.locator(`#detail .tl-round.selected[data-rid="${item2Rid}"]`)).toHaveCount(1);
+    await expect(page.locator(`#detail .tl-round.selected[data-rid="${dot0Rid}"]`)).toHaveCount(1);
   });
 
   // ─── "已经到顶了" 提示已移除 (issue #36) ──────────────────────────────────

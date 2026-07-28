@@ -756,7 +756,7 @@ fn build_call_event(
         req_body_raw: req_text.to_string(),
         preview: preview.map(std::sync::Arc::<str>::from),
         model: model.map(std::sync::Arc::<str>::from),
-        // round_role 占位值 (User); DAG push_messages 内部会根据实际 delta 最后一条 message 的 role 修正.
+        // round_role 占位值 (User); DAG push_messages 内部会根据 delta 的 contains_user_text 修正.
         round_role: crate::codec::ir::IrRole::User,
         redactions: std::sync::Arc::from(redactions),
     };

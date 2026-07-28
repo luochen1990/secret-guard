@@ -608,6 +608,7 @@ fn read_message(msg: &Value) -> Option<IrMessage> {
     };
     Some(IrMessage {
         role,
+        contains_user_text: role == IrRole::User && super::ir::blocks_has_text(&content),
         content,
         content_form,
     })
@@ -1071,6 +1072,49 @@ mod tests {
     }
 
     // ─── read_response ─────────────────────────────────────────────────
+
+    #[test]
+    fn read_message_contains_user_text() {
+        // contains_user_text 用于 round_role 判定: 区分 "真用户文本输入" 与 "工具结果借 user 角色".
+        // 关键场景: Anthropic 的 tool_result 在 user 消息内 (可能混合 Text + ToolResult block).
+
+        // 纯文本 user 消息 → true.
+        let body = json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 1
+        });
+        let ir = reader().read_request(&body).unwrap();
+        assert!(ir.messages[0].contains_user_text, "纯文本 user");
+
+        // 纯 tool_result user 消息 → false (工具结果, 非用户主动输入).
+        let body = json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "c1", "content": "result"}
+            ]}],
+            "max_tokens": 1
+        });
+        let ir = reader().read_request(&body).unwrap();
+        assert!(!ir.messages[0].contains_user_text, "纯 tool_result user");
+
+        // 混合 Text + ToolResult user 消息 → true (用户在工具结果旁附加了新文本).
+        let body = json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "查完后帮我总结"},
+                {"type": "tool_result", "tool_use_id": "c1", "content": "result"}
+            ]}],
+            "max_tokens": 1
+        });
+        let ir = reader().read_request(&body).unwrap();
+        assert!(ir.messages[0].contains_user_text, "混合 Text + ToolResult");
+
+        // assistant 消息 → false (非 user 角色).
+        let body = json!({
+            "messages": [{"role": "assistant", "content": [{"type": "text", "text": "reply"}]}],
+            "max_tokens": 1
+        });
+        let ir = reader().read_request(&body).unwrap();
+        assert!(!ir.messages[0].contains_user_text, "assistant 消息");
+    }
 
     #[test]
     fn read_response_basic() {
