@@ -224,4 +224,78 @@ mod tests {
             "Some resp_parsed must be present in JSON, got: {json}"
         );
     }
+
+    // ─── SEC-5: PolicySnapshot 不进 WebUI DTO ────────────────────────────
+    //
+    // 契约 (docs/design/contracts.md §7 SEC-5): DAG Node 持有的 PolicySnapshot (含
+    // secret value) 仅后端用, 永不序列化进 WebUI DTO. ForwardRecord 是 GET /records/{id}
+    // 响应的 DTO, 由 web::api::build_forward_record 从 DAG 视图派生; 它的字段集合
+    // (见 struct 定义) 不含 policy. 本 property 是防御性第二道闸 — 即便未来有人误加
+    // policy 字段或字段值被污染, 序列化扫描会 fail.
+    //
+    // 类型系统层: ForwardRecord 的字段集合不含 PolicySnapshot / Arc<PolicySnapshot>
+    // (见 struct 定义, 每个字段都是 String / Vec / Option<serde_json::Value> 等基础类型).
+    // property 层: 用包含可识别 marker 的字段构造 ForwardRecord, 序列化后扫描 JSON.
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// SEC-5: ForwardRecord 序列化后的 JSON 不含 PolicySnapshot 字段.
+        ///
+        /// 验证两层:
+        /// 1. JSON 不含字段名 "policy" (PolicySnapshot 若被误加为字段, serde 默认用
+        ///    字段名 "policy" 序列化).
+        /// 2. JSON 不含类型名 "PolicySnapshot" (即便用 rename, 类型名也不会自然出现).
+        ///
+        /// 生成器: 用任意可识别 marker 填充 ForwardRecord 的字符串字段 (method / path /
+        /// req_body / resp_body / error), 确保扫描覆盖所有字符串字段. marker 字符集
+        /// [a-z] 避免与 "policy"/"PolicySnapshot" 子串意外重叠.
+        #[test]
+        fn prop_policy_snapshot_not_in_forward_record(
+            method_marker in "[a-z]{3,8}",
+            path_marker in "[a-z]{3,8}",
+            body_marker in "[a-z]{3,8}",
+            error_marker in "[a-z]{3,8}",
+        ) {
+            // 假设 marker 不含 "policy" 子串 (字符集 [a-z] 理论上可能拼出 "policy",
+            // 但概率极低; 此 assume 确保断言不被假阳性干扰).
+            prop_assume!(
+                !method_marker.contains("policy") && !path_marker.contains("policy")
+                    && !body_marker.contains("policy") && !error_marker.contains("policy"),
+                "marker must not contain 'policy' substring"
+            );
+            let mut rec = ForwardRecord::new(
+                format!("POST-{method_marker}"),
+                format!("/o/{path_marker}/v1/chat"),
+                vec![],
+                format!("body-{body_marker}"),
+            );
+            rec.error = Some(format!("err-{error_marker}"));
+            rec.resp_parsed = Some(serde_json::json!({"k": "v"}));
+            rec.redactions = vec![("mock-x".into(), "secret-id-1".into())];
+
+            let json = serde_json::to_string(&rec).expect("serialize ForwardRecord");
+            // 核心: JSON 不得含字段名 "policy" 或类型名 "PolicySnapshot".
+            prop_assert!(
+                !json.contains("\"policy\"") && !json.contains("PolicySnapshot"),
+                "SEC-5 violation: ForwardRecord JSON contains PolicySnapshot. json={}",
+                json
+            );
+        }
+    }
+
+    /// SEC-5 扫描器灵敏度守卫: 验证 `json.contains("\"policy\"")` 在 JSON 真含该字段时
+    /// 返回 true. 若 serde_json 改变序列化格式 (如字段名加引号方式变化) 导致扫描器永远
+    /// false, 上方 proptest 会退化为空洞断言 (恒真), 静默放过 PolicySnapshot 泄漏.
+    /// 本 sanity test 把这条隐患显式化为编译期断言.
+    #[test]
+    fn sec5_scanner_detects_policy_field_when_present() {
+        let json_with_policy = serde_json::json!({"policy": "secret-value"});
+        let serialized = serde_json::to_string(&json_with_policy).unwrap();
+        assert!(
+            serialized.contains("\"policy\""),
+            "SEC-5 scanner broken: json.contains(\"\\\"policy\\\"\") is false even when field \
+             present. sec5 proptest would pass vacuously. json={serialized}"
+        );
+    }
 }

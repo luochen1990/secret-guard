@@ -594,7 +594,9 @@
 **Properties**:
 - `prop_auth_headers_redacted_in_record`: Authorization / x-api-key / x-goog-api-key / cookie 类 header 在 record 中为 `<redacted>`.
 - `prop_set_cookie_redacted`: 上游 Set-Cookie header 在 record 中脱敏.
-- `prop_custom_token_headers_redacted`: 含 "token" / "key" / "secret" 关键词的自定义 header 也脱敏.
+- `prop_custom_token_headers_redacted`: 含 "token" / "secret" 关键词的自定义 header 也脱敏.
+
+  注: "key" 关键词过于宽泛 (会误伤 `x-request-key-hash` 等正常 header), 故不纳入关键词匹配; 已知 key 类 header (如 `x-api-key` / `x-goog-api-key` / `api-key` / `x-anthropic-api-key`) 由 `prop_auth_headers_redacted_in_record` 的显式黑名单覆盖.
 
 ### SEC-5 PolicySnapshot 不进 WebUI DTO
 

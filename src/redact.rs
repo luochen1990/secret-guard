@@ -792,6 +792,39 @@ mod tests {
     use crate::codec::ir::{IrMessage, IrResponse, IrRole};
     use pretty_assertions::assert_eq;
 
+    /// 构造一个"探测必耗尽"的 SecretEntry: Auto + digits-only + length_range=(1,1)
+    /// → 仅 10 个候选 "0".."9". 配合 [`EXHAUSTING_IR_TEXT_TEMPLATE`] (含全部 10 个候选)
+    /// 即可稳定触发 gen_mock_for_ir 的耗尽降级路径 (warn, 不 panic).
+    ///
+    /// 用于两条 SEC-3 测试: 行为回归 (不 panic) + proptest (warn 日志不泄漏 secret).
+    fn exhausted_secret_entry(secret: &str) -> SecretEntry {
+        use crate::mock::{Charset, GenSpec, InitialValue, MockStrategy};
+        let mut e = SecretEntry {
+            id: "weak-secret".into(),
+            name: None,
+            category: SecretCategory::ApiKey,
+            value: secret.into(),
+            value_file: None,
+            mock_strategy: MockStrategy {
+                initial: InitialValue::Auto,
+                gen_spec: Some(GenSpec {
+                    prefix: String::new(),
+                    charset: Charset {
+                        digits: true,
+                        ..Default::default()
+                    },
+                    length_range: (1, 1), // 仅 10 个可能值
+                }),
+            },
+        };
+        e.mock_strategy.resolve_against(secret, "");
+        e
+    }
+
+    /// 含全部 10 个数字候选 ("0".."9") 的 IR 文本模板. 用 `format!("{secret}")`
+    /// 在末尾追加真实 secret, 确保 redact_ir 实际尝试生成 mock (而非因 IR 无命中而跳过).
+    const EXHAUSTING_IR_TEXT_TEMPLATE: &str = "0 1 2 3 4 5 6 7 8 9 filler ";
+
     // ─── 契约单元测试 ──────────────────────────────────────────────────────
 
     #[test]
@@ -1020,37 +1053,12 @@ mod tests {
         // 弱配置回归: Auto 模式 + charset.digits + length_range=(1,1) 仅产生 10 个候选 ("0".."9").
         // 旧实现在 IR 已含全部 10 个候选时会 panic, 消息含真实 secret 明文 (DoS + 泄密).
         // 现在应降级跳过该 secret (原样保留 real), 不 panic.
-        use crate::mock::{Charset, GenSpec, InitialValue, MockStrategy};
-
-        let weak_strategy = MockStrategy {
-            initial: InitialValue::Auto,
-            gen_spec: Some(GenSpec {
-                prefix: String::new(),
-                charset: Charset {
-                    digits: true,
-                    lowercase: false,
-                    uppercase: false,
-                    underscore: false,
-                    hyphen: false,
-                    other: vec![],
-                },
-                length_range: (1, 1), // 仅 10 个可能值
-            }),
-        };
         let real_secret = "super-secret-value-DO-NOT-LEAK";
-        let mut weak_entry = SecretEntry {
-            id: "weak-secret".into(),
-            name: None,
-            category: SecretCategory::ApiKey,
-            value: real_secret.into(),
-            value_file: None,
-            mock_strategy: weak_strategy,
-        };
-        weak_entry.mock_strategy.resolve_against(real_secret, "");
+        let weak_entry = exhausted_secret_entry(real_secret);
 
         // IR 含全部 10 个数字候选 → gen_mock_for_ir 必然耗尽.
-        let ir_text = "0 1 2 3 4 5 6 7 8 9 also contains super-secret-value-DO-NOT-LEAK";
-        let mut ir = sample_ir_with_text(ir_text);
+        let ir_text = format!("{EXHAUSTING_IR_TEXT_TEMPLATE}also contains {real_secret}");
+        let mut ir = sample_ir_with_text(&ir_text);
         let (map, _) = redact_ir(&mut ir, std::slice::from_ref(&weak_entry));
 
         // 不 panic 即通过. 进一步断言: 该 secret 被跳过 (map 为空, real 原样保留).
@@ -1661,6 +1669,117 @@ mod tests {
                 !debug.contains(secret_a.as_str()) && !debug.contains(secret_b.as_str()),
                 "SEC-2 violation: RedactError Debug leaks secret. debug={}",
                 debug
+            );
+        }
+    } // end proptest! block (C3/C4/C2/C5/SEC-2)
+
+    // ─── SEC-3: tracing log 不输出 secret 明文 ──────────────────────────
+    //
+    // 契约 (docs/design/contracts.md §7 SEC-3): 任何 tracing log 消息不得包含
+    // secret 明文. redact_ir 在探测耗尽 (gen_mock_for_ir 返回 Err) 时降级跳过该
+    // secret 并 `warn!(secret_id, reason, ...)`. 该 warn 的字段只用 secret_id +
+    // reason, 永不内联 secret value. 本 property 触发该 warn 路径, 捕获 tracing
+    // 输出, 断言不含 secret value.
+    //
+    // 捕获方式: 用 tracing::dispatcher::with_default 安装一个线程局部的 fmt
+    // subscriber, 其 MakeWriter 写入 Mutex<Vec<u8>> sink. 不引入新 dev-dependency
+    // (tracing + tracing-subscriber 已在 Cargo.toml).
+
+    /// 可观察的 MakeWriter: 把所有 tracing 事件 fmt 输出收集到共享的 Mutex<Vec<u8>>.
+    ///
+    /// 设计: 用 Arc<Mutex<Vec<u8>>> 作为 sink, MakeWriter clone Arc 后返回 Writer
+    /// (持有 Arc 的 clone + 写入 sink). fmt layer 会对每个事件调用 make_writer.
+    struct CapturingMakeWriter {
+        sink: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingMakeWriter {
+        type Writer = CapturingWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturingWriter {
+                sink: self.sink.clone(),
+            }
+        }
+    }
+
+    struct CapturingWriter {
+        sink: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl std::io::Write for CapturingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.sink.lock().expect("sink poisoned").write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// 触发探测耗尽路径 (redact_ir 发出 warn), 捕获 tracing 输出.
+    ///
+    /// 弱配置 (Auto + digits-only + length_range=(1,1)) 仅产生 10 个候选 ("0".."9"),
+    /// 当 IR 已含全部 10 个候选时 gen_mock_for_ir 必然耗尽 → warn! 路径.
+    ///
+    /// **时间戳关闭 (SEC-3 测试正确性根基)**: 默认 fmt subscriber 会在每行注入 RFC3339
+    /// 时间戳 (含 6 位微秒数字 run, 如 `...373719Z`). 这与纯数字 secret 生成器
+    /// `[0-9]{6,24}` 冲突 — 当 6 位 secret 恰好等于当前微秒值时, `log.contains(secret)`
+    /// 假阳性 fail. 用 `.with_timer(())` 关闭时间戳注入, 使捕获的 log 不含任何数字 run,
+    /// 让本测试只断言我们控制的字段 (secret_id / reason) 而非 wall-clock 噪声.
+    fn captured_log_with_exhausted_secret(secret: &str) -> String {
+        let weak_entry = exhausted_secret_entry(secret);
+
+        // IR 含全部 10 个数字候选 → gen_mock_for_ir 必然耗尽.
+        let ir_text = format!("{EXHAUSTING_IR_TEXT_TEMPLATE}{secret}");
+        let mut ir = sample_ir_with_text(&ir_text);
+
+        // 共享 sink: subscriber 写入, 测试读取.
+        let sink: std::sync::Arc<std::sync::Mutex<Vec<u8>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // with_default 设置线程局部 dispatcher, 闭包内的 redact_ir 发出的 warn 被
+        // 我们的 capturing subscriber 捕获 (与全局 subscriber 隔离, 不污染其他测试).
+        // with_timer(()) 关闭默认时间戳 (见函数级注释).
+        tracing::dispatcher::with_default(
+            &tracing::dispatcher::Dispatch::new(
+                tracing_subscriber::fmt()
+                    .with_env_filter(tracing_subscriber::EnvFilter::new("warn"))
+                    .with_writer(CapturingMakeWriter { sink: sink.clone() })
+                    .with_timer(())
+                    .with_ansi(false)
+                    .finish(),
+            ),
+            || {
+                let _ = redact_ir(&mut ir, std::slice::from_ref(&weak_entry));
+            },
+        );
+        let buf = sink.lock().expect("sink poisoned").clone();
+        String::from_utf8(buf).expect("captured tracing output must be valid UTF-8")
+    }
+
+    proptest! {
+        /// SEC-3: 探测耗尽路径触发的 tracing warn 输出不含 secret value.
+        ///
+        /// 字符集 `[a-zA-Z0-9_\-]{6,40}`: 覆盖真实 secret 形态 (sk-abc / ghp_xxx /
+        /// 混合大小写). 时间戳已由 `captured_log_with_exhausted_secret` 内的
+        /// `.with_timer(())` 关闭, 故 log 中无 wall-clock 数字 run; warn 消息字段
+        /// (secret_id "weak-secret" + reason + 固定句式) 不含随机长字符串,
+        /// 英文单词子串假阳性概率可忽略. 若引入会内联随机值的 warn 字段, 需重评估.
+        #[test]
+        fn prop_log_messages_no_secret(secret in "[a-zA-Z0-9_\\-]{6,40}") {
+            let log = captured_log_with_exhausted_secret(&secret);
+            // sanity: warn 必须实际触发 (log 非空), 否则本 property 退化为空洞断言.
+            // 探测耗尽路径已由 ir_text 含全部 10 个数字候选保证触发, log 应含 warn 行.
+            prop_assert!(
+                !log.is_empty(),
+                "sanity: warn must fire (probing exhausted path); empty log means path not hit. \
+                 this would make the SEC-3 property vacuously true."
+            );
+            // 核心: 即便 warn 触发 (log 非空), 也不得包含 secret 明文.
+            // warn 字段只有 secret_id ("weak-secret") + reason, 永不内联 value.
+            prop_assert!(
+                !log.contains(secret.as_str()),
+                "SEC-3 violation: tracing log leaks secret. log={}",
+                log
             );
         }
     }

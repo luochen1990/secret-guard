@@ -877,6 +877,7 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn create_request_validates_empty_value() {
@@ -1086,6 +1087,70 @@ mod tests {
         assert!(resp.parsed_request.is_some());
         assert!(resp.parsed_response.is_none());
         assert!(resp.parse_error.is_none());
+    }
+
+    // ─── property-based (SEC-5: SessionSummary 不含 PolicySnapshot) ──────────
+
+    proptest! {
+        /// SEC-5: SessionSummary 序列化后的 JSON 不含 PolicySnapshot 字段.
+        ///
+        /// 契约 (docs/design/contracts.md §7 SEC-5): SessionSummary (GET /sessions 响应
+        /// 元素) 字段集合不含 PolicySnapshot. 类型系统层: SessionSummary 的字段都是
+        /// 基础类型 (SessionId / Uuid / usize / DateTime / Arc<str> / String) — 见 struct
+        /// 定义. 本 property 是防御性第二道闸 — 序列化扫描 JSON.
+        ///
+        /// 生成器: 用可识别 marker 填充字符串字段 (path / latest_error), marker 字符集
+        /// [a-z] 避免 "policy" 子串意外重叠 (assume 守卫).
+        #[test]
+        fn prop_policy_snapshot_not_in_session_summary(
+            path_marker in "[a-z]{3,8}",
+            err_marker in "[a-z]{3,8}",
+            preview_marker in "[a-z]{3,8}",
+        ) {
+            prop_assume!(
+                !path_marker.contains("policy") && !err_marker.contains("policy")
+                    && !preview_marker.contains("policy"),
+                "marker must not contain 'policy' substring"
+            );
+            let summary = SessionSummary {
+                session_id: crate::dag::SessionId::new(),
+                leaf_id: Uuid::new_v4(),
+                root_id: Uuid::new_v4(),
+                record_count: 1,
+                created_at: chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+                latest_at: chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+                preview: Some(std::sync::Arc::from(preview_marker.as_str())),
+                model: Some(std::sync::Arc::from("gpt-test")),
+                latest_resp_status: 200,
+                latest_error: Some(format!("err-{err_marker}")),
+                redactions: std::sync::Arc::from([(String::from("mock-x"), String::from("sid"))]),
+                path: format!("/o/{path_marker}/v1/chat"),
+            };
+            let json = serde_json::to_string(&summary).expect("serialize SessionSummary");
+            prop_assert!(
+                !json.contains("\"policy\"") && !json.contains("PolicySnapshot"),
+                "SEC-5 violation: SessionSummary JSON contains PolicySnapshot. json={}",
+                json
+            );
+        }
+    }
+
+    /// SEC-5 扫描器灵敏度守卫 (SessionSummary): 验证 `json.contains("\"policy\"")` 在
+    /// JSON 真含该字段时返回 true, 防止上方 proptest 因扫描器失效而空洞通过. 详见
+    /// record.rs 同名 sanity test 的设计依据.
+    #[test]
+    fn sec5_scanner_detects_policy_field_in_session_summary() {
+        let json_with_policy = serde_json::json!({"policy": "secret-value"});
+        let serialized = serde_json::to_string(&json_with_policy).unwrap();
+        assert!(
+            serialized.contains("\"policy\""),
+            "SEC-5 scanner broken: json.contains(\"\\\"policy\\\"\") is false even when field \
+             present. sec5 proptest would pass vacuously. json={serialized}"
+        );
     }
 }
 

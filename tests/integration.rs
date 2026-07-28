@@ -3956,3 +3956,94 @@ mod cfg3_proptests {
         }
     }
 }
+
+// ─── SEC-6: 内部 URL 不外泄 (/__sg/* 未匹配 → 404, 不转发) ───────────────
+//
+// 契约 (docs/design/contracts.md §7 SEC-6): `/__sg/*` 未匹配的子路径返回 404,
+// 绝不进入 forward. 这是安全不变量 — 防止 `/__sg/unknown` 这类内部路径被误当成
+// provider 转发到上游 (泄露请求细节 / 触发意外上游调用).
+//
+// 用 proptest 参数化 unknown 子路径的变体 (单段 / 多段 / 带 query string),
+// 确保所有未匹配的 `/__sg/*` 形态都走 404 + 不转发.
+
+mod sec6_proptests {
+    use proptest::prelude::*;
+
+    /// 发起一次 GET 请求, 返回 (status, body).
+    async fn get(proxy_url: &str, path: &str) -> (reqwest::StatusCode, String) {
+        let resp = reqwest::Client::new()
+            .get(format!("{proxy_url}{path}"))
+            .send()
+            .await
+            .expect("request must complete");
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        (status, body)
+    }
+
+    proptest! {
+        /// SEC-6: 任意 `/__sg/<unknown>` 子路径 → 404, 且上游收到 0 个请求.
+        ///
+        /// 生成器: 随机化 unknown 段 (1-3 段, 字符集 [a-z0-9]) + 可选 query string,
+        /// 覆盖单段 (`/__sg/foo`) / 多段 (`/__sg/foo/bar`) / 带 query (`/__sg/foo?x=1`)
+        /// 三种形态. 关键: 即便上游 mock 配置成接受 ANY method/ANY path, 也不应被命中.
+        ///
+        /// **范围限定**: 所有已知 `/__sg` 子路由都在 `/__sg/api/*` 下 (records /
+        /// sessions / sync / secrets / providers / api-keys). 用 prop_assume 跳过
+        /// seg1 == "api" 的 case (这些路径会命中已注册 handler, 不是 404 场景).
+        /// 跳过率 ~0.002% (1/36³), 可忽略.
+        ///
+        /// 异步 + proptest 协作: async 块返回 Result<(), TestCaseError>, prop_assert_eq!
+        /// 用 `return Err(...)` 短路; block_on 的结果 expect 把 TestCaseError 转为 panic
+        /// (proptest 捕获 panic 视为 case 失败).
+        #[test]
+        fn prop_internal_url_404_no_forward(
+            seg1 in "[a-z0-9]{1,8}",
+            extra_segs in prop::collection::vec("[a-z0-9]{1,6}", 0..3),
+            with_query in any::<bool>(),
+        ) {
+            // 跳过会命中已注册 /__sg/api/* handler 的路径 (那些不是 404 场景).
+            prop_assume!(seg1 != "api", "seg1='api' would hit a registered /__sg/api/* route");
+            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+            let result: Result<(), proptest::test_runner::TestCaseError> = rt.block_on(async {
+                let mut upstream = super::spawn_mock_upstream().await;
+                // 上游 mock: 匹配 ANY method/ANY path, expect(0) 表示期望零命中
+                // (命中即说明转发发生了 = 违约). 用 .expect(0) + .assert_async() 守卫.
+                let mock = upstream
+                    .mock(reqwest::Method::GET.as_str(), mockito::Matcher::Any)
+                    .expect(0)
+                    .with_status(200)
+                    .with_body("{}")
+                    .create_async()
+                    .await;
+
+                let proxy_url = super::spawn_proxy(&upstream.url()).await;
+
+                // 构造 unknown 路径: /__sg/<seg1>[/seg2/...][?query]
+                let mut path = format!("/__sg/{seg1}");
+                for s in &extra_segs {
+                    path.push('/');
+                    path.push_str(s);
+                }
+                if with_query {
+                    path.push_str("?x=1");
+                }
+
+                let (status, _body) = get(&proxy_url, &path).await;
+                prop_assert_eq!(
+                    status,
+                    reqwest::StatusCode::NOT_FOUND,
+                    "SEC-6 violation: /__sg/* unknown subpath must return 404, got {} for path {}",
+                    status, path
+                );
+
+                // 核心: 上游 mock 不应被命中 (未转发). expect(0) + assert_async 验证零命中.
+                // assert_async 在命中数 ≠ 0 时 panic (非 TestCaseError, 但违约即 panic 合理).
+                mock.assert_async().await;
+                Ok(())
+            });
+            // 把 async 块返回的 TestCaseError 转为 panic (proptest 捕获 = case 失败).
+            result.expect("SEC-6 proptest case failed");
+        }
+    }
+}

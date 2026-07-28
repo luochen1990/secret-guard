@@ -1945,14 +1945,11 @@ mod tests {
     // ─── SEC-4: 含关键词的 header 必须被脱敏 ─────────────────────────────
     //
     // 契约 (docs/design/contracts.md §7 SEC-4): record 存储的 HTTP headers 中,
-    // 含 "token" / "key" / "secret" 关键词的自定义 header 必须被脱敏为 `<redacted>`.
+    // 含 "token" / "secret" 关键词的自定义 header 必须被脱敏为 `<redacted>`.
     //
-    // ⚠️ 契约/实现 divergence (2026-07 QA 走查发现): is_sensitive_header 的关键词
-    // 匹配仅覆盖 "token" / "secret", **未含 "key"** (常见含 key 的 header 如
-    // `api-key` / `x-api-key` / `x-goog-api-key` 已被显式黑名单覆盖, 但纯自定义如
-    // `x-app-key` 不会被脱敏). 修改 prod 或修改契约需经人工授权, 此处不擅自处理 —
-    // 本 property 仅验证已实现的关键词 (token/secret), `key` 关键词的覆盖留作
-    // 后续 issue. 详见 PR 描述.
+    // "key" 关键词不纳入匹配 (契约 §7 SEC-4 注): 过于宽泛会误伤 `x-request-key-hash`
+    // 等正常 header. 已知 key 类敏感 header (`api-key` / `x-api-key` / `x-goog-api-key` /
+    // `x-anthropic-api-key`) 由显式黑名单覆盖 (见 is_sensitive_header).
 
     use axum::http::HeaderName;
     use proptest::prelude::*;
@@ -1966,8 +1963,8 @@ mod tests {
         /// 本 property 随机化 prefix / suffix / keyword 三个维度, 覆盖任意位置含关键词
         /// 的自定义 header (如 `x-my-token`, `token-foo`, `x-secret-bar`).
         ///
-        /// **范围说明**: 仅测试已实现的关键词 (见上方 mod 级注释的 divergence 说明);
-        /// `key` 关键词的契约对齐留作后续.
+        /// "key" 关键词不在匹配范围 (契约 §7 SEC-4 注: 过宽误伤正常 header), 已知 key
+        /// 类敏感 header 由显式黑名单覆盖 (见 mod 级注释).
         ///
         /// 字符集 [a-z0-9-]: HTTP header name 合法字符 (token 字符), 且避免大写干扰
         /// contains 匹配 (redact_headers 已 lowercase, 但 prop 中我们也用 lowercase
@@ -1993,6 +1990,78 @@ mod tests {
                 &redacted[0].1, "<redacted>",
                 "SEC-4 violation: header '{}' contains keyword '{}' but was not redacted",
                 header_name, keyword
+            );
+        }
+    }
+
+    // ─── SEC-3: assert/panic 消息不泄漏 secret ───────────────────────────
+    //
+    // 契约 (docs/design/contracts.md §7 SEC-3): 任何 assert / panic 消息不得包含
+    // secret 明文. 视图正确性守卫 (assert_redactions_match_map 等) 在 CI 下用
+    // `debug_assert!` 守卫派生视图与 SSOT 的一致性; 这些 assert 的诊断消息由派生数据
+    // 构成 (mock / id 等), 不应直接内联 secret value. 本 property 故意制造不一致触发
+    // assert, 用 catch_unwind 捕获 panic payload, 断言其字符串表示不含 secret value.
+    //
+    // 仅在 consistency-check feature 下运行 (assert 函数仅在该 feature 编译).
+    #[cfg(feature = "consistency-check")]
+    proptest! {
+        /// SEC-3: assert_redactions_match_map 触发 panic 时, 消息不含 secret.value.
+        ///
+        /// 触发方式: 构造一个"派生 redactions 条目数 > RedactionMap 命中数"的不一致
+        /// (derived 含一条 mock, 但 redaction_map 为空 + snapshot 含 secret), 让断言 (1)
+        /// `debug_assert_eq!(derived.len(), expected)` 失败. panic 消息由
+        /// `derived.len()` / `expected` (1 位数字) + 固定字面量构成, 不含 secret value.
+        ///
+        /// 字符集 `[a-zA-Z0-9_\-]{6,40}`: 覆盖真实 secret 形态 (sk-abc / ghp_xxx /
+        /// 混合大小写). panic 消息的数字 run 极短 (left=1/right=0, 各 1 位), 固定句式
+        /// ("derived redactions count drift ...") 不含随机长字符串, 英文单词子串假阳性
+        /// 概率可忽略. 若未来断言消息内联随机值 (如 mock/id), 需重评估字符集.
+        #[test]
+        fn prop_assert_messages_no_secret(secret in "[a-zA-Z0-9_\\-]{6,40}") {
+            use crate::redact::RedactionMap;
+            use crate::secrets::{SecretCategory, SecretEntry};
+
+            // 派生 redactions 含一条"假命中" (mock / id 都用固定值, 不内联 secret —
+            // 模拟生产派生层只含 mock + secret_id, 永不内联 secret value).
+            let derived = vec![(String::from("mock-fake"), String::from("sid-fake"))];
+
+            // 空 RedactionMap + snapshot 含真实 secret: expected = 0 (map 空), 但
+            // derived.len() = 1 → 断言 (1) `debug_assert_eq!(derived.len(), expected)` 失败.
+            // snapshot 含 secret 模拟生产 (policy 持有 secret value), 但派生层不应泄漏.
+            // id 用固定字面量 (不内联 secret), 避免人为把 secret 塞进 snapshot 数据结构.
+            let map = RedactionMap::default();
+            let snapshot = vec![SecretEntry {
+                id: String::from("sid-fake"),
+                name: None,
+                category: SecretCategory::ApiKey,
+                value: secret.clone(),
+                value_file: None,
+                mock_strategy: crate::mock::MockStrategy::default(),
+            }];
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                assert_redactions_match_map(&derived, &map, &snapshot);
+            }));
+            let payload = result.expect_err(
+                "inconsistent derived/map must trigger debug_assert panic under consistency-check"
+            );
+            // panic payload 通常是 &'static str 或 String; 取其字符串表示.
+            // 若 payload 是非字符串类型 (如未来某个 panic!(some_struct)), 拒绝 fallback
+            // 到固定字面量 — 那会让断言恒真 (字面量不含 secret), 使 SEC-3 property 空洞
+            // 通过, 静默放过安全漏洞. 必须 fail-loud 暴露 payload 类型不可检视的问题.
+            let msg = payload
+                .downcast_ref::<String>()
+                .map(|s| s.as_str())
+                .or_else(|| payload.downcast_ref::<&'static str>().copied())
+                .unwrap_or_else(|| panic!(
+                    "SEC-3 cannot inspect non-string panic payload (type id: {:?}); \
+                     refusing to pass vacuously — this would silently hide secret leakage",
+                    (*payload).type_id()
+                ));
+            prop_assert!(
+                !msg.contains(secret.as_str()),
+                "SEC-3 violation: assert panic message leaks secret. msg={}",
+                msg
             );
         }
     }

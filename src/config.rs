@@ -2048,4 +2048,25 @@ mod proptests {
             );
         }
     }
+
+    // ─── SEC-6: 默认监听 127.0.0.1 ────────────────────────────────────
+    //
+    // 契约 (docs/design/contracts.md §7 SEC-6): 默认 host=127.0.0.1.
+    // 单用户本地网关的安全姿态 — 不意外暴露到外网. ServerConfig::default 是
+    // 启动时的 fail-safe 默认, 用户未显式配置 [server] host 时生效.
+
+    /// SEC-6: ServerConfig::default().host == "127.0.0.1".
+    ///
+    /// 这是 fail-safe 默认: 即便用户忘配 [server] host, 进程也只绑回环地址,
+    /// 不会把 secret 网关暴露到 LAN/WAN. 固定值断言 (无随机输入, 故用 #[test]
+    /// 而非 proptest! — 契约登记 + 文档化价值).
+    #[test]
+    fn prop_default_host_localhost() {
+        let cfg = ServerConfig::default();
+        assert_eq!(
+            cfg.host, "127.0.0.1",
+            "SEC-6 violation: default host must be 127.0.0.1 (loopback only), got '{}'",
+            cfg.host
+        );
+    }
 }
