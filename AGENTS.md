@@ -358,15 +358,18 @@ client = Anthropic(
 产物默认写到 `target/llvm-cov-target/` 与 `coverage/` (均已 .gitignore).
 门禁阈值见 justfile (`COVERAGE_MIN_LINES` / `COVERAGE_MAX_UNCOVERED`).
 
-### PR diff 拆解 (`rust-diff-analyzer`)
+### `rust-diff-analyzer` (PR diff 拆解 + 文件长度门禁)
 
 区分 diff 中的 prod 代码 vs test 代码, 用于 review 时判断真实膨胀 (测试代码增加不是膨胀,
 prod 代码大量增加才需警惕). 工具用 syn AST 解析, 自动识别 `#[cfg(test)]` / `#[test]` /
 `tests/` 目录, 不依赖命名约定. 不在 nixpkgs, devShell 用 lazy `cargo install` wrapper
 封装 (首次 `just diff-loc` 编译到 `${XDG_CACHE_HOME:-~/.cache}/secret-guard-tools/`, 后续命中).
 
+两处复用 (SSOT):
 - `just diff-loc`: 对 `master...HEAD` 跑 human 格式报告 (本地终端用).
-- CI: `check` job 内 3 个 step (仅 PR 事件触发), `continue-on-error: true` 真正非阻塞 —
+- `just check-file-size`: 对每个 .rs 做完整 AST 分类, 只统计 prod 行数 (排除 test),
+  双阈值门禁 (WARN 500 软提醒 / MAX 1600 硬阻断). fail-closed: 工具失败时 exit 1 不放行.
+- CI: diff-loc 在 `check` job 内 3 个 step (仅 PR 事件触发), `continue-on-error: true` 真正非阻塞 —
   即使工具/网络/API 失败也不影响合并. 报告用 `--format comment` 输出 markdown, 经
   curl + Forgejo API upsert 到 PR 评论 (marker 标记, 多次 push 不刷屏).
 

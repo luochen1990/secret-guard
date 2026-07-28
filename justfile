@@ -132,26 +132,67 @@ audit:
 bench:
     cargo bench --bench redact
 
-# ─── 文件长度门禁 ──────────────────────────────────────────────────────────
-# 防止单文件失控膨胀. 阈值留 ~10% 余量 over 当前最大 (dag.rs ~3139 行 → 3500).
-# 超阈值的文件应拆分 (按 section / 职责), 而非调高阈值.
-FILE_MAX_LINES := "3500"
+# ─── 文件长度门禁 (按 prod 行数) ───────────────────────────────────────────
+# 防止单文件 prod 代码失控膨胀. 用 rust-diff-analyzer 对每个 .rs 做完整 AST 分类
+# (把整个文件当"全新增" diff 喂给工具), 只统计 prod_lines, 排除 #[cfg(test)] 块.
+# 这样 test 代码增长不触发门禁 — 测试膨胀本就不该用文件大小卡, 而该用 PR diff
+# 拆解 (just diff-loc) 在 review 时判断.
+#
+# 为什么不复用 awk 行号猜 #[cfg(test)] 起始位置: 不是 AST 语义分类, 识别不了
+# inline #[test] 函数; 且维护第二份分类规则违反 SSOT (与 diff-loc 共用同一工具).
+#
+# 双阈值 (对齐 coverage-gate 风格):
+#   FILE_WARN_PROD_LINES: 软提醒阈值. 超过则 echo warning, 不阻断 (开发时感知).
+#   FILE_MAX_PROD_LINES:  硬门禁阈值. 超过则 exit 1 (CI 阻断).
+# 当前 prod 最大是 proxy.rs=1584, MAX 1600 留极小余量强制警觉; WARN 500 让任何
+# 模块膨胀到该规模时尽早引起注意 (拆分 ROI 评估的早期信号).
+FILE_WARN_PROD_LINES := "500"
+FILE_MAX_PROD_LINES := "1600"
 
 check-file-size:
     #!/usr/bin/env bash
     set -euo pipefail
-    # 只扫 src/ 下的 .rs (含子目录). 排除非源码 (生成代码 / 测试 fixture).
-    # wc -l 末行是 "total" 汇总 (多文件时), 用 $2 ~ /\.rs$/ 过滤掉 (total 行第二字段是字面 "total").
-    # xargs -r (--no-run-if-empty): src/ 为空时 find 不产生输出, 避免某些 xargs 版本默认对空输入 exit 1.
-    offenders=$(find src -name '*.rs' -print0 \
-      | xargs -0 -r wc -l \
-      | awk -v max="{{FILE_MAX_LINES}}" '$2 ~ /\.rs$/ && $1>max {print $1": "$2}' || true)
-    if [ -n "$offenders" ]; then
-      echo "Files exceeding {{FILE_MAX_LINES}} lines (split needed):"
-      echo "$offenders"
+    # git diff --no-index /dev/null <file>: 生成"全新增" diff 让 rust-diff-analyzer
+    #   对单文件做完整 AST 分类.
+    # rust-diff-analyzer: 同步按 syn AST 区分 prod/test 单元 (复用 diff-loc 的工具).
+    #   --format json + jq 取 .summary.prod_lines_added; --no-fail 让工具不因自身阈值
+    #   退出非零 (本 recipe 用自己的 FILE_*_PROD_LINES 阈值).
+    # 性能: 全仓 ~28 个 .rs, 总耗时 ~0.4s.
+    warnings=""
+    errors=""
+    while IFS= read -r -d '' f; do
+      # || true 在管道末尾, 作用于整条管道的最终退出码 (|| 优先级低于 |).
+      # git diff --no-index 有差异时 exit 1, 必须吸收否则 set -e + pipefail 会终止脚本.
+      # 3 个 2>/dev/null: 分别吞 git diff (二进制文件告警) / rda (parse 噪音) / jq
+      #   (parse error); 失败已由下方 =~ ^[0-9]+$ 兜底捕获并 fail-closed, stderr 噪音无用.
+      prod=$(git diff --no-index /dev/null "$f" 2>/dev/null \
+        | rust-diff-analyzer --format json --no-fail 2>/dev/null \
+        | jq -r '.summary.prod_lines_added // 0' 2>/dev/null || true)
+      # fail-closed: 工具失败 (输出空或非数字) 时必须报错, 不能静默放行.
+      # 否则门禁形同虚设 — [ "" -gt N ] 退出码 2 被 if 视为 false, 文件被误判合规.
+      if ! [[ "$prod" =~ ^[0-9]+$ ]]; then
+        echo "::error file=$f::rust-diff-analyzer failed (output not a number: '$prod')"
+        errors="${errors}TOOL-FAIL $f"$'\n'
+        continue
+      fi
+      if [ "$prod" -gt {{FILE_MAX_PROD_LINES}} ]; then
+        errors="$errors$prod $f"$'\n'
+      elif [ "$prod" -gt {{FILE_WARN_PROD_LINES}} ]; then
+        warnings="$warnings$prod $f"$'\n'
+      fi
+    done < <(find src -name '*.rs' -print0)
+    # 按行数降序输出 (最该拆的排第一). sort -rn: 数字逆序.
+    # grep -v '^$': 过滤 printf 末尾换行产生的空行, 避免 sed 缩进成纯空格行.
+    if [ -n "$warnings" ]; then
+      echo "::warning::Files exceeding {{FILE_WARN_PROD_LINES}} prod lines (consider splitting; test code excluded):"
+      printf '%s\n' "$warnings" | grep -v '^$' | sort -rn | sed 's|^|  |'
+    fi
+    if [ -n "$errors" ]; then
+      echo "::error::Files blocked by gate (exceeding {{FILE_MAX_PROD_LINES}} prod lines or tool failure; test code excluded):"
+      printf '%s\n' "$errors" | grep -v '^$' | sort -rn | sed 's|^|  |'
       exit 1
     fi
-    echo "All source files within {{FILE_MAX_LINES}} line limit."
+    echo "All source files within {{FILE_MAX_PROD_LINES}} prod-line limit (test code excluded)."
 
 # ─── PR diff 拆解 ──────────────────────────────────────────────────────────
 # 区分 diff 中的 prod 代码 vs test 代码, 用于 review 时判断真实膨胀.

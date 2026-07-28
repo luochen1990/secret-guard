@@ -150,8 +150,11 @@ jobs:
       - name: Coverage gate
         run: just coverage-gate
 
-      # 文件长度门禁: 防止单文件失控膨胀 (拆分 ROI 为负时的早期预警).
-      # 轻量 (find + wc), 不依赖编译产物, 放最后作为补充守卫.
+      # 文件长度门禁: 防止单文件 prod 代码失控膨胀 (拆分 ROI 为负时的早期预警).
+      # 用 rust-diff-analyzer 对每个 .rs 做 AST 分类, 只统计 prod 行数 (排除 test).
+      # 依赖 rust-diff-analyzer (runner VM systemPackages 提供, 同 diff-loc 步).
+      # 双阈值: 超 FILE_WARN_PROD_LINES (500) 报 warning 不阻断; 超 FILE_MAX_PROD_LINES
+      # (1600) 则 exit 1 阻断. 不依赖编译产物, 放最后作为补充守卫.
       - name: File size gate
         run: just check-file-size
 
