@@ -124,6 +124,7 @@ async fn spawn_proxy_static_dynamic(
         dag: records,
         secrets,
         api_keys: None,
+        auth_enabled: false,
         global_mock_prefix: std::sync::Arc::from(""),
     };
     let app = server::build_router(proxy);
@@ -158,6 +159,7 @@ async fn spawn_proxy_with_prefix(global_mock_prefix: &str) -> String {
         dag: ConversationDag::new(64, 500, 1),
         secrets,
         api_keys: None,
+        auth_enabled: false,
         global_mock_prefix: std::sync::Arc::from(global_mock_prefix),
     };
     let app = server::build_router(proxy);
@@ -2926,6 +2928,7 @@ async fn cross_table_shared_state_no_lost_update() {
         dag: ConversationDag::new(64, 500, 1),
         secrets: secret_table,
         api_keys: None,
+        auth_enabled: false,
         global_mock_prefix: std::sync::Arc::from(""),
     };
     let app = server::build_router(proxy);

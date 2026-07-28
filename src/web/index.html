@@ -117,6 +117,10 @@
     }
     .badge-stream { background: #cfe; color: #060; }
     .badge-err { background: #fcc; color: #a00; }
+    /* inactive: 服务端认证未启用, key 形同虚设 (灰色, 区别于 enabled/disabled). */
+    .badge-inactive { background: #eee; color: #888; }
+    /* hint 内嵌的警告 (服务端认证未启用提示). 配色与 .badge-err 一致 (#a00). */
+    .hint-warn { color: #a00; }
     .tab-content { display: none; }
     .tab-content.active { display: flex; flex: 1; min-height: 0; }
 
@@ -1133,7 +1137,12 @@
         <div class="hint" style="margin-bottom: 8px;">
           API keys authenticate SDK forwarding requests (<code>Authorization: Bearer sg_...</code>).
           Static keys come from <code>secret-guard.toml</code>; dynamic keys are issued via WebUI.
-          Only compliant keys can be enabled.
+          <div id="apikeys-auth-warn" hidden style="margin-top: 6px;">
+            <strong class="hint-warn">Server authentication is disabled</strong> — all forwarding
+            requests are accepted without a key, so listed keys are <em>inactive</em>. To activate
+            them, set <code>[auth] enabled = true</code> (with an <code>[auth.oidc]</code> section)
+            in <code>secret-guard.toml</code> and restart.
+          </div>
         </div>
         <table class="secrets">
           <thead>
@@ -1243,17 +1252,19 @@
   </dialog>
 
   <dialog id="apikey-reveal">
-    <div style="min-width: 400px;">
-      <h3 style="margin: 0 0 8px 0;">API Key Created</h3>
-      <div class="hint" style="margin-bottom: 8px;">
-        Copy this key now — it will not be shown again.
+    <form method="dialog">
+      <div style="min-width: 400px;">
+        <h3 style="margin: 0 0 8px 0;">API Key Created</h3>
+        <div class="hint" style="margin-bottom: 8px;">
+          Copy this key now — it will not be shown again.
+        </div>
+        <textarea id="apikey-reveal-value" readonly style="width: 100%; font-family: monospace; font-size: 13px; padding: 8px; word-break: break-all;" rows="3"></textarea>
+        <div class="actions" style="margin-top: 8px;">
+          <button class="btn" type="button" onclick="copyRevealedApiKey()">Copy</button>
+          <button class="btn" value="close">Close</button>
+        </div>
       </div>
-      <textarea id="apikey-reveal-value" readonly style="width: 100%; font-family: monospace; font-size: 13px; padding: 8px; word-break: break-all;" rows="3"></textarea>
-      <div class="actions" style="margin-top: 8px;">
-        <button class="btn" onclick="copyRevealedApiKey()">Copy</button>
-        <button class="btn" value="close" id="apikey-reveal-close">Close</button>
-      </div>
-    </div>
+    </form>
   </dialog>
 
   <script>
@@ -1299,6 +1310,7 @@
       providerDecisions: [],
       // auth tab (static preset API keys)
       apiKeysList: [],
+      authEnabled: false,
       // records tab — sidebar
       sessionsList: [],
       sessionsTotal: 0,
@@ -3178,12 +3190,24 @@
 
     // ─── API keys tab ─────────────────────────────────────────────────────
 
+    // 三态 badge 渲染: auth on/off 与 disabled 字段的笛卡尔积映射到 3 个视觉态.
+    //   enabled  — auth on + !disabled (绿色, 实际生效)
+    //   disabled — auth on + disabled   (红色, 用户主动禁用)
+    //   inactive — auth off             (灰色, 服务端未启用认证, key 无消费方)
+    // 三态定义的 SSOT 在 src/web/api.rs 段注释; 此函数仅负责视觉映射.
+    function apiKeyStatusBadge(authEnabled, disabled) {
+      if (!authEnabled) return '<span class="badge badge-inactive" title="Server authentication is disabled — all requests are accepted without a key. Enable [auth] in secret-guard.toml to activate.">inactive</span>';
+      if (disabled) return '<span class="badge badge-err">disabled</span>';
+      return '<span class="badge badge-stream">enabled</span>';
+    }
+
     async function refreshApiKeys() {
       try {
         const r = await fetch(API_API_KEYS, { cache: 'no-store' });
         if (!r.ok) throw new Error('HTTP ' + r.status);
         const data = await r.json();
         state.apiKeysList = data.keys || [];
+        state.authEnabled = !!data.auth_enabled;
         renderApiKeys();
       } catch (e) {
         // /api/api-keys 路由无条件挂载 (不依赖 auth.enabled), 失败 = 真 bug, 不静默.
@@ -3195,36 +3219,46 @@
 
     function renderApiKeys() {
       const statsEl = document.getElementById('apikeys-stats');
+      const warnEl = document.getElementById('apikeys-auth-warn');
       const body = document.getElementById('apikeys-body');
       const total = state.apiKeysList.length;
       const enabled = state.apiKeysList.filter(k => !k.disabled).length;
       const staticCount = state.apiKeysList.filter(k => k.source === 'static').length;
+      const enabledStat = state.authEnabled
+        ? `<span><strong>${enabled}</strong> enabled</span>`
+        : `<span class="meta">auth off — keys inactive</span>`;
       statsEl.innerHTML = `
         <span><strong>${total}</strong> total</span>
-        <span><strong>${enabled}</strong> enabled</span>
+        ${enabledStat}
         <span><strong>${staticCount}</strong> static</span>
       `;
+      warnEl.hidden = state.authEnabled;
       if (total === 0) {
         body.innerHTML = `<tr><td colspan="6" class="empty">No API keys configured</td></tr>`;
         return;
       }
       body.innerHTML = state.apiKeysList.map(k => {
         const srcBadge = `<span class="src-badge src-${escapeHtml(k.source)}">${escapeHtml(k.source)}</span>`;
-        const statusBadge = k.disabled
-          ? '<span class="badge badge-err">disabled</span>'
-          : '<span class="badge badge-stream">enabled</span>';
+        const statusBadge = apiKeyStatusBadge(state.authEnabled, k.disabled);
+        // auth 关闭时 toggle 无实际效果 (请求被无条件接受), 按钮禁用以免误导.
+        const toggleDisabled = !state.authEnabled;
         const toggleLabel = k.disabled ? 'Enable' : 'Disable';
         const toggleTarget = k.disabled ? 'false' : 'true';
         const canDelete = k.source === 'dynamic';
         const created = k.source === 'static'
           ? '<span class="meta">(static)</span>'
           : escapeHtml(new Date(k.created_at).toLocaleString());
+        const toggleBtn = toggleDisabled
+          ? `<button class="btn" disabled title="Enable server auth first">${escapeHtml(toggleLabel)}</button>`
+          : `<button class="btn" data-action="toggle" data-id="${escapeHtml(k.id)}" data-target="${toggleTarget}">${escapeHtml(toggleLabel)}</button>`;
         const actions = [
-          `<button class="btn" data-action="toggle" data-id="${escapeHtml(k.id)}" data-target="${toggleTarget}">${escapeHtml(toggleLabel)}</button>`,
+          toggleBtn,
           canDelete ? `<button class="btn btn-danger" data-action="delete" data-id="${escapeHtml(k.id)}">Delete</button>` : '',
         ].join('');
+        // auth 关闭时 row-disabled 视觉与 inactive 冲突, 不挂该类.
+        const rowClass = !state.authEnabled ? '' : (k.disabled ? 'row-disabled' : '');
         return `
-          <tr class="${k.disabled ? 'row-disabled' : ''}" data-id="${escapeHtml(k.id)}">
+          <tr class="${rowClass}" data-id="${escapeHtml(k.id)}">
             <td title="${escapeHtml(k.label)}"><span class="cell-ellipsis">${escapeHtml(k.label)}</span></td>
             <td><code>${escapeHtml(k.key_prefix)}…</code></td>
             <td>${srcBadge}</td>

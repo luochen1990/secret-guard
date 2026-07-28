@@ -1466,6 +1466,16 @@ mod tests {
 //
 // tenant_id / created_by 字段保留 (兼容已有持久化数据), 但统一填 "admin" 占位值.
 // 这些字段当前不影响任何业务逻辑 (lookup 不读 tenant_id).
+//
+// # auth_enabled 与 key 三态
+//
+// `list_api_keys` 响应附带 `auth_enabled` (见 `ListApiKeysResponse`). 前端据此把
+// key 渲染为三态:
+//   - auth_enabled = true  + disabled = false → "enabled"  (启用中, 实际生效)
+//   - auth_enabled = true  + disabled = true  → "disabled" (用户主动禁用)
+//   - auth_enabled = false (不论 disabled)    → "inactive" (认证未启用, 无消费方)
+// 第三态存在的理由: auth 关闭时 forwarding 路径根本不挂 require_api_key middleware,
+// 此时即便 key.disabled = false, 所有请求也都会被无条件接受, key 形同虚设.
 
 #[derive(Debug, Deserialize)]
 pub struct CreateApiKeyRequest {
@@ -1478,6 +1488,15 @@ pub struct ToggleApiKeyRequest {
     pub disabled: bool,
 }
 
+/// `/api/api-keys` 列表响应. 与 `ListSecretsResponse` / `ListProvidersResponse` 同风格.
+#[derive(Serialize)]
+pub struct ListApiKeysResponse {
+    pub keys: Vec<crate::auth::apikey::ApiKeySummary>,
+    /// 来自 static config `[auth] enabled`. false = forwarding 路径未挂 require_api_key
+    /// middleware, 前端据此把所有 key 渲染为 inactive 第三态.
+    pub auth_enabled: bool,
+}
+
 /// 拿到 ApiKeyStore. 不存在说明内部装配错误 (server.rs 应总是注入), 返回 500.
 fn require_store(state: &ProxyState) -> Result<&crate::auth::ApiKeyStore, ApiError> {
     state
@@ -1486,11 +1505,16 @@ fn require_store(state: &ProxyState) -> Result<&crate::auth::ApiKeyStore, ApiErr
         .ok_or_else(|| ApiError::internal("ApiKeyStore missing in ProxyState (server misassembly)"))
 }
 
-/// 列出所有 key (静态 + 动态), 不按用户过滤.
+/// 列出所有 key (静态 + 动态), 不按用户过滤. 响应附带 `auth_enabled` (见 struct 注释).
 pub async fn list_api_keys(State(state): State<ProxyState>) -> Result<impl IntoResponse, ApiError> {
     let api_keys = require_store(&state)?;
-    let keys: Vec<_> = api_keys.list().into_iter().collect();
-    Ok((NO_STORE, Json(serde_json::json!({ "keys": keys }))))
+    Ok((
+        NO_STORE,
+        Json(ListApiKeysResponse {
+            keys: api_keys.list(),
+            auth_enabled: state.auth_enabled,
+        }),
+    ))
 }
 
 pub async fn create_api_key(

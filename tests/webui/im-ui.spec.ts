@@ -1572,9 +1572,12 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     expect(issued.id).toBeTruthy();
 
     // 2. 列表: GET /api/api-keys 应包含刚签发的 key (动态, source=dynamic, enabled).
+    //    同时验证响应携带 auth_enabled=false (本测试运行在 auth 关闭场景).
     const listRes = await request.get(`${SG_API}/api-keys`);
     expect(listRes.status()).toBe(200);
-    const listed = (await listRes.json()).keys as Array<Record<string, unknown>>;
+    const listJson = await listRes.json();
+    expect(listJson.auth_enabled, "auth 关闭场景下 auth_enabled 应为 false").toBe(false);
+    const listed = listJson.keys as Array<Record<string, unknown>>;
     const found = listed.find((k) => k.id === issued.id);
     expect(found, "新建 key 应出现在列表中").toBeTruthy();
     expect(found!.disabled).toBe(false);
@@ -1587,6 +1590,16 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
       page.locator("#apikeys-body"),
       "UI 列表应渲染新建 key 的 label"
     ).toContainText(label);
+    // auth 关闭场景: 所有 key 都应显示 inactive badge (第三态), 而非 enabled.
+    await expect(
+      page.locator("#apikeys-body .badge-inactive").first(),
+      "auth 关闭时 key 应显示 inactive 徽章"
+    ).toBeVisible();
+    // 同时验证 auth-disabled 提示文本可见.
+    await expect(
+      page.locator("#apikeys-auth-warn"),
+      "auth 关闭时 warning 提示应可见"
+    ).toBeVisible();
 
     // 4. 切换 disabled: PATCH, 期望返回 disabled=true.
     const toggleRes = await request.patch(
