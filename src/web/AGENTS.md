@@ -6,7 +6,7 @@
 ## 职责
 
 - `mod.rs`: `/__sg` 子 router + `/` 根入口 + slash redirect + not_found.
-- `api.rs`: `/__sg/api/*` JSON endpoints (records + sessions + nodes/timeline + secrets/providers CRUD).
+- `api.rs`: `/__sg/api/*` JSON endpoints (records 单条 view + sessions + sync + sessions/timeline + secrets/providers CRUD).
 - `index.html`: 单页 UI (IM 风格: 会话折叠 sidebar + timeline 对话流, 内嵌 CSS + vanilla JS, 零外部依赖).
 
 ## 路由
@@ -21,10 +21,14 @@
 ## API endpoints
 
 ```
-GET    /__sg/api/records[?offset=N&limit=M]   → {records, total, offset, limit}
 GET    /__sg/api/records/{id}[?view=parsed]   → {record, parsed_request?, parsed_response?, parse_error?}
+                                                (单条 raw + parsed view, WebUI 弹窗按需拉)
 GET    /__sg/api/sessions                     → {sessions, total}  (叶子节点, latest-first)
-GET    /__sg/api/nodes/{id}/timeline[?limit=N]→ {records}  (沿 parent 链向上 N 个祖先, oldest-first)
+GET    /__sg/api/sessions/{sid}/timeline[?before=UUID&limit=N]
+                                              → TimelinePage {rounds, tail, has_more}
+                                                (session-aware timeline 分页, oldest-first)
+POST   /__sg/api/sync   body: {selected?, expanded[]}  → {sessions, rounds, timeline?}
+                                                (WebUI 3s 轮询统一入口: sidebar + timeline diff 一次采集)
 GET    /__sg/api/secrets
 POST   /__sg/api/secrets
 PUT    /__sg/api/secrets/{id}
@@ -45,81 +49,61 @@ PATCH  /__sg/api/api-keys/{id}/toggle
 
 所有响应带 `Cache-Control: no-store`, 避免浏览器对自动刷新返回缓存内容.
 
-### Records 分页
+> 注: 旧的 `GET /api/records` (扁平分页) + `GET /api/nodes/{id}/timeline` (基于 node_id)
+> 已删除, 由 session-aware sync API 替代. 详见 `dag.rs` 的 session_rounds /
+> timeline_view / timeline_diff / sync_snapshot.
 
-`offset` 0-based 从最新算起; `limit` clamp 到 `[1,200]`, 默认 50.
-
-### Records parsed view
+### Records parsed view (单条按需拉取)
 
 `?view=parsed` 返回 `parsed_request` (从 `req_body` 按需用 ingress codec 解析) +
 `parsed_response` (直接取自 `record.resp_parsed`, 由 proxy 层的 `StreamScan` 在流过程中
 增量累积, 非流式路径在响应完成时一次性计算). Gemini/Ollama 无 codec → `parse_error` + fallback raw.
 
-### Records list 轻量化 + 预览提取
+### Record preview / model 提取 (push 时一次性)
 
-`GET /records` 返回 `RecordSummary` (不含 `req_body` / `resp_body` / `resp_parsed`),
-body 字段由 `GET /records/{id}?view=...` 按需拉取. 流式响应的 `resp_body` 在 record 完成后
-为空 (不保留原始 SSE 字节), parsed view 通过 `resp_parsed` 提供.
-
-`RecordSummary` 同时携带两个从 `req_body` 一次性提取的轻量字段 (提取后丢弃 body):
+`extract_preview_and_model` (协议无关字节级, 不依赖 codec reader) 在 push 时从 `req_body`
+一次性提取两个轻量字段 (提取后丢弃 body):
 - `preview`: sidebar 主标题 (截断到 48 chars). 优先取最后一条 user message (可读性好);
   无 user 时回退到最后一条有文本的 message (tool_result / assistant).
   压缩 marker ("What did we do so far?") 命中时 fallback 到最后一条 assistant 摘要.
   提取失败 fallback 到 method+path.
 - `model`: 顶层 `model` 字段 (OpenAI / Anthropic 共有), sidebar 副标题第二行.
 
-提取逻辑在 `web::api::extract_preview_and_model` (协议无关字节级, 不依赖 codec reader).
 **假设声明**: 假设 messages 数组中 user 在 assistant 之前; 假设压缩 marker 是固定字符串.
 **降级**: 任一假设不成立 → fallback (method+path / 空 model), **永不 panic**.
 
-### Timeline delta messages (issue #27)
+### session-aware timeline (TimelineRound / TimelineTail / TimelineDiffData)
 
-> **当前实现**: timeline 用 push 时预存的 `req_body_raw` 截取 delta (非 lazy redact).
-> 完整 lazy redact 重建 (derive_redact_map 含 system/tools) 是后续工作, 见 `src/dag.rs` 头部.
+新模型基于 SessionId (替代旧的基于 node_id 的 timeline). 三条查询路径在 `dag.rs`:
 
-timeline 路径的 `RecordSummary` 额外携带 `req_delta_messages` (本轮新增 messages 的 wire JSON,
-从 `req_body_raw` 末尾截取). 前端按 role 渲染独立气泡 (system / user / tool_result / assistant),
-assistant 作为无源气泡 (前序 response 的历史副本). 根节点额外注入 system prompt (OpenAI reader
-提升 system 到 `IrRequest.system`, writer 写回 messages[0]; 截取逻辑在根节点 start>0 时补回).
-list 路径 (`GET /records`) 不填此字段 (避免 O(n) 全量 resolve).
+- `session_rounds(sid)`: sidebar 三级菜单的轻量 round 摘要 (RoundBrief, 不含 delta messages).
+- `timeline_view(sid, before, limit)`: timeline 初始加载 + lazy load (向前翻更老).
+  返回 `TimelinePage { rounds: Vec<TimelineRound>, tail: TimelineTail, has_more }`.
+- `timeline_diff(sid, after, tail_length)`: sync 轮询的 diff.
+  返回 `Option<TimelineDiffData { new_rounds, tail }>`, None = 无变化 (304 等价).
 
-**已知限制 (跨协议)**: OpenAI writer 会把 Anthropic 风格的混合 Text+ToolResult user 消息拆成
-(1+N) 条 wire messages, 导致 `req_body_raw` 的 messages 数 > IR messages 数.
-`extract_delta_messages` 用 `messages.len() - req_delta_count` 切片时, 跨协议路径的 start 偏小,
-delta 可能包含前序轮消息. 同协议路径不受影响 (wire 与 IR 1:1). 后续可改为从 `req_delta`
-(IR MessageRef) resolve + ingress writer 重新序列化 (与 redact 路径一致).
+**req_delta_messages 实现**: 当前从 `req_body_raw` 末尾切片 (已 redact, LLM 视角, 安全).
+不走 BlockPool + codec writer 路径 (会泄露真实 secret, 需在 web 层重建 redactMap — TODO).
+已知限制: 跨协议 writer 拆分场景切片 start 偏小, delta 可能含前序轮消息 (同协议不受影响).
+详见 `dag.rs::extract_delta_messages_from_raw`.
 
-### Timeline response 传输优化 (issue #28 Phase A)
+**tail (response 抽屉)**: 末轮 (链中最新) 的 response 内容. `length` = parsed 序列化字节数
+(parsed=None 时 fallback 到 raw_resp_body.len()). 前端用它判定是否需要更新抽屉.
+非末轮的 response 内容已被下一轮 delta 的 assistant message 包含 (Phase A 决策), 故 tail
+只代表"最新尚未被 delta 消费的 response".
 
-timeline 返回的 N 个节点中, 只有最末节点 (timeline anchor) 保留 `parsed_response`; 非末轮的设为 None.
-理由: 非 leaf 的 response 内容已被下一轮 delta 的 assistant message 完整包含, 传输是冗余.
-前端从完整 delta 渲染连续对话流 (含 assistant 气泡), 只有末轮额外渲染 response-pane
-(尚未被任何 delta 消费的部分). 后续 Phase B 将进一步在 push 时删除 parent.response (瞬态存储),
-用 `consistency-check` feature flag 的 assertion 保证 delta↔response 一致 (见根目录"视图正确性确保机制").
+### sync API (POST /api/sync, WebUI 3s 轮询统一入口)
 
-### Sessions / Timeline (会话折叠 WebUI)
+`sync_snapshot(expanded, selected)` 在 DAG 层单个 `inner.read()` 锁内一次性采集三部分
+(避免新 push 在两次锁之间漂移):
 
-- sidebar 一级 (会话) 来自 `GET /api/sessions` (返回叶子节点 + record_count + latest 字段).
-  **session title** (preview 字段) 取自**会话最早 round (根 node) 的首条 user msg**
-  (push 时一次性从根 node 的 preview 提取, 存 Session.title; 之后 leaf 前移不更新).
-  见 issue #36: 旧实现取 leaf.event.preview (最新轮), 多轮对话中标题随每轮新问题漂移.
-- 二级 (轮次列表) 与右侧 timeline 对话流来自 `GET /api/nodes/{id}/timeline?limit=N`
-  (沿 parent 链向上取 N 个祖先, oldest-first).
-- timeline 惰性加载: 滚到顶时以最老 node 的 parent 为新起点 prepend 更早 N 轮 (保持滚动锚点).
-- **Timeline 渲染策略** (两级, 保护 scrollTop + DOM 局部状态):
-  1. fingerprint 一致 (node id 序列不变) → 只刷 response body + header 字段 (流式渐进).
-  2. fingerprint 不一致 → keyed reconciliation (按 data-rid 匹配新旧节点). 公共节点
-     DOM 完全保留 (scrollTop + 气泡展开状态); 新节点插入; 消失节点删除.
-     对所有变动模式通用 (append/prepend/replace/完全不同), 无全量 innerHTML 重建.
-  > **不变量**: `.tl-round` 的 request-pane 内容 (req_delta_messages / redactions) 在 push 时
-  > 确定后不可变 (见 `dag.rs`). keyed reconciliation 依赖此不变量 — 已有轮次的 DOM 无需更新.
-  > header 里 response 相关字段 (status/elapsed/streamed) 可变, 由 `updateRoundHeaders()` 定点刷新.
-  > 末轮 response 在独立的 `.response-drawer` 中, 不在 `.tl-round` 内.
-  >
-  > **不变量 I3** (timeline 顺序): DOM 中 `.tl-round` 的顺序必须与 `state.timelineRecords`
-  > 一致 (oldest-first). `reconcileTimelineRounds` 的实现陷阱 (anchor 起步位置) 见函数头部
-  > 注释; 守卫见 `im-ui.spec.ts` I3.
-- **"已经到顶了" 提示已移除** (issue #36): 该提示的显示条件始终无法正确判断, 直接去掉.
+- `sessions: Vec<SessionView>`: 全量会话列表 (sidebar 一级树).
+- `rounds: HashMap<SessionId, Vec<RoundBrief>>`: 仅 expanded session 的 round 详情 (sidebar 三级菜单).
+- `timeline: Option<TimelineDiffData>`: 仅 selected session 的 diff (None = 无选中 / 无变化).
+
+selected 游标 = `(session_id, latest_round, response_length)`:
+- `latest_round`: 前端持有的最后一条 round id (不属于本 session 时视为初始加载, 返回全部).
+- `response_length`: 前端持有的末轮 tail 长度 (与当前 tail.length 比对, 不一致则返回新 tail).
 
 ### ForwardRecord.redactions
 
@@ -166,7 +150,7 @@ API key CRUD **无条件挂载** (在 `web::router()`, 不依赖 `auth.enabled`)
 
 timeline 每轮 header 含两个按钮:
 - `ℹ` info: 弹窗展示传输层元数据 (method/path/status/elapsed/streamed/model/error/redactions 等,
-  全部来自 RecordSummary, 无需网络请求).
+  全部来自 TimelineRound / TimelineTail, 无需网络请求).
 - `raw`: 弹窗展示原始 req_body / resp_body / req_headers / resp_headers (按需懒拉
   `GET /api/records/{id}`). body 是 LLM 视角 (已 redact, 安全展示); headers 已脱敏
   (auth/cookie 等 = `<redacted>`). 流式响应的 resp_body 为空 (不保留 SSE 字节), 显示提示.

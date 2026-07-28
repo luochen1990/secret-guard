@@ -30,7 +30,7 @@ use crate::config::{DeleteOutcome, OverrideMode, UpsertKind};
 use crate::dag::{NodeDetail, NodeView, ResponseData};
 use crate::provider::{EffectiveProvider, Protocol, Provider};
 use crate::proxy::ProxyState;
-use crate::record::{ForwardRecord, RecordFilter};
+use crate::record::ForwardRecord;
 use crate::secrets::{EffectiveSecret, SecretCategory, SecretEntry};
 
 /// 共享的 `no-store` header 设置 (axum 的 `[(name, value); N]` 接受 `(&str, &str)`).
@@ -100,57 +100,15 @@ fn classify_delete_outcome(
     }
 }
 
-// ─── /records ──────────────────────────────────────────────────────────────
-
-/// `GET /api/records` 查询参数.
-///
-/// - `offset`: 0-based, 从最新一条算起. 默认 0.
-/// - `limit`:  clamp 到 `[1, 200]`. 默认 50.
-/// - `filter`: `all` (默认) 或 `hits` (只返回发生过 redact 的记录). 两个维度各自
-///   独立分页, 响应 `total` 是当前 filter 维度下的总数.
-///
-/// 设计: 用 `Option<T>` 让缺失字段走默认值, 避免 axum Query 反序列化整体拒绝
-/// (例如只传 `?offset=10` 时 limit 仍取默认). 非法 filter 值走 serde 默认 (None → All),
-/// 不返回 400 — 前端 bug 不应让页面变白.
-#[derive(Debug, Deserialize)]
-pub struct RecordsQuery {
-    #[serde(default)]
-    pub offset: Option<usize>,
-    #[serde(default)]
-    pub limit: Option<usize>,
-    #[serde(default)]
-    pub filter: Option<RecordFilter>,
-}
-
-impl RecordsQuery {
-    /// 解析为生效的 `(offset, limit, filter)`. 单一事实来源: 默认值 + clamp 都在这里.
-    fn resolve(&self) -> (usize, usize, RecordFilter) {
-        let offset = self.offset.unwrap_or(0);
-        // 默认 50: 足够 WebUI 首屏, 又不会一次拖太多 (单条 record body 可能很大).
-        let limit = self.limit.unwrap_or(50);
-        (offset, limit.clamp(1, 200), self.filter.unwrap_or_default())
-    }
-}
-
-pub async fn list_records(
-    State(state): State<ProxyState>,
-    Query(q): Query<RecordsQuery>,
-) -> impl IntoResponse {
-    let (offset, limit, filter) = q.resolve();
-    let hits_only = matches!(filter, RecordFilter::Hits);
-    let (views, total) = state.dag.list_page(offset, limit, hits_only);
-    let summaries: Vec<RecordSummary> = views.into_iter().map(RecordSummary::from).collect();
-    (
-        NO_STORE,
-        Json(ListRecordsResponse {
-            records: summaries,
-            total,
-            offset,
-            limit,
-            filter,
-        }),
-    )
-}
+// ─── /records/{id} (raw + parsed view, 单条按需拉取) ──────────────────────
+//
+// 注: 旧的 `GET /api/records` (扁平分页) + `GET /api/nodes/{id}/timeline` (基于 node_id
+// 的 timeline) 已删除, 由 session-aware sync API 替代 (POST /api/sync + GET
+// /api/sessions/{sid}/timeline). 详见 dag.rs 的 session_rounds / timeline_view /
+// timeline_diff / sync_snapshot.
+//
+// `get_record` 保留: 单条 record 的 raw + parsed view, WebUI 弹窗 (传输层元数据 +
+// 原始 body) 按需拉取, 不依赖 list/timeline 路径.
 
 pub async fn get_record(
     State(state): State<ProxyState>,
@@ -308,49 +266,6 @@ fn build_parsed_response(record: ForwardRecord) -> GetRecordResponse {
     }
 }
 
-/// list_records 返回的轻量 record 摘要 (不含 body 字段).
-///
-/// req_body / resp_body / resp_parsed 可能很大 (流式响应累积内容 / 大 prompt),
-/// list 场景不需要它们 — 前端 sidebar 只显示 preview / model / status / hitN 等元数据,
-/// body 由 GET /records/{id}?view=... 按需拉取.
-///
-/// `preview` 与 `model` 由 push 时一次性从 req_body 提取 (存 CallEvent),
-/// list 响应直接读 NodeView, 保证始终轻量 (preview 截断到 [`PREVIEW_MAX`] chars).
-#[derive(Serialize)]
-pub struct RecordSummary {
-    pub id: Uuid,
-    /// 所属会话的稳定标识 (前端 sidebar 二级菜单归属).
-    pub session_id: crate::dag::SessionId,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub method: String,
-    pub path: String,
-    pub resp_status: u16,
-    pub elapsed_ms: u64,
-    pub streamed: bool,
-    pub resp_complete: bool,
-    pub error: Option<String>,
-    #[serde(default)]
-    pub redactions: std::sync::Arc<[(String, String)]>,
-    /// 会话标题: 从 req_body 提取的最后一条 user message 文本 (截断).
-    /// 提取失败 (非 JSON / 无 user message) 时为 None, 前端 fallback 到 method+path.
-    /// `Arc<str>`: 从 NodeView 透传, list/timeline (3s 轮询) 路径零拷贝.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub preview: Option<std::sync::Arc<str>>,
-    /// 模型名: 从 req_body 顶层 `model` 字段提取 (OpenAI / Anthropic 共有).
-    /// 非 chat 协议或缺失时为 None. `Arc<str>` 同上.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<std::sync::Arc<str>>,
-    /// parsed view (ingress codec writer 序列化的 IrResponse).
-    /// timeline 路径直接消费, 前端不再 N+1 拉 /records/{id}?view=parsed.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parsed_response: Option<serde_json::Value>,
-    /// 本轮 request delta (wire JSON messages, 从 req_body_raw 末尾截取).
-    /// 只在 timeline 路径非空; list 路径留空.
-    /// 前端按 role 渲染气泡 (system/user/tool), 与 preview 互补 (issue #27).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub req_delta_messages: Vec<serde_json::Value>,
-}
-
 /// preview 截断上限 (char count). 后端唯一截断点, 前端直接渲染.
 ///
 /// 决策依据: sidebar 单条目宽度约 ~20em, 48 个 char (含中英文混合) 在单行省略号下
@@ -361,29 +276,6 @@ const PREVIEW_MAX: usize = 48;
 /// 1 MiB 足以覆盖绝大多数 LLM 请求 (system prompt + 多轮对话); 超出此大小的请求
 /// preview 留空, sidebar fallback 到 method+path.
 const PREVIEW_BODY_MAX: usize = 1024 * 1024;
-
-impl From<NodeView> for RecordSummary {
-    fn from(v: NodeView) -> Self {
-        // preview / model 已在 push 时预计算并存在 CallEvent 里 (NodeView 直接携带).
-        Self {
-            id: v.id,
-            session_id: v.session_id,
-            created_at: v.created_at,
-            method: v.method,
-            path: v.path,
-            resp_status: v.resp_status,
-            elapsed_ms: v.elapsed_ms,
-            streamed: v.streamed,
-            resp_complete: v.resp_complete,
-            error: v.error,
-            redactions: v.redactions,
-            preview: v.preview,
-            model: v.model,
-            parsed_response: v.parsed_response,
-            req_delta_messages: v.req_delta_messages,
-        }
-    }
-}
 
 /// 从 chat request body 中提取 (sidebar 标题 preview, model 名).
 ///
@@ -521,21 +413,6 @@ pub(crate) fn extract_text_blocks(arr: &[serde_json::Value]) -> Option<Vec<Strin
     if texts.is_empty() { None } else { Some(texts) }
 }
 
-#[derive(Serialize)]
-pub struct ListRecordsResponse {
-    pub records: Vec<RecordSummary>,
-    /// 当前 filter 维度下的总数 (用于前端分页器).
-    ///
-    /// `filter=all` 时等于 records 总量; `filter=hits` 时等于发生过 redact 的记录总数.
-    pub total: usize,
-    /// 当前页 offset (0-based).
-    pub offset: usize,
-    /// 当前页 limit (clamp 后的实际生效值, 便于前端校验).
-    pub limit: usize,
-    /// 当前生效的 filter (回显, 让前端无状态地确认).
-    pub filter: RecordFilter,
-}
-
 // ─── /sessions ─────────────────────────────────────────────────────────────
 
 /// 会话列表 (叶子节点), sidebar 两级树的一级项.
@@ -596,29 +473,120 @@ pub async fn list_sessions(State(state): State<ProxyState>) -> impl IntoResponse
     (NO_STORE, Json(ListSessionsResponse { sessions, total }))
 }
 
-// ─── /nodes/{id}/timeline ──────────────────────────────────────────────────
+// ─── /sessions/{sid}/timeline + /sync (session-aware timeline API) ──────────
+//
+// 替代旧的 GET /api/nodes/{id}/timeline (基于 node_id). 新 API 基于 SessionId:
+// - GET /api/sessions/{sid}/timeline?before=&limit=: 初始加载 + lazy load (向前翻更老).
+// - POST /api/sync: sidebar (sessions + expanded rounds) + timeline diff 一次性采集.
+//
+// 详见 dag.rs 的 session_rounds / timeline_view / timeline_diff / sync_snapshot.
 
-#[derive(Deserialize)]
+/// `GET /api/sessions/{sid}/timeline` 查询参数.
+///
+/// - `before`: 游标 (某轮的 id). 省略 = 从最新轮 (leaf) 起取 limit 条;
+///   传 id = 取该 id **之前** (更老) 的 limit 条 (不含 id 自身), 用于向上 lazy load.
+/// - `limit`: 默认 10, clamp [1, 50]. 上限 50 (而非旧 list 的 200): timeline 路径对每个
+///   node 都 resolve block + 序列化 wire JSON, 高 limit 会造成延迟尖峰.
+#[derive(Debug, Deserialize)]
 pub struct TimelineQuery {
-    /// 取多少个祖先 (含 node 自身). 默认 10.
+    #[serde(default)]
+    pub before: Option<Uuid>,
     #[serde(default)]
     pub limit: Option<usize>,
 }
 
-pub async fn get_timeline(
+impl TimelineQuery {
+    /// 解析为生效的 `(before, limit)`. 单一事实来源: 默认值 + clamp 都在这里.
+    fn resolve(&self) -> (Option<Uuid>, usize) {
+        let limit = self.limit.unwrap_or(10).clamp(1, 50);
+        (self.before, limit)
+    }
+}
+
+/// GET /api/sessions/{sid}/timeline handler.
+///
+/// 返回 timeline 分页 (oldest-first) + 末轮 tail + has_more.
+/// session 不存在 / leaf 无法定位 → 404.
+pub async fn session_timeline(
     State(state): State<ProxyState>,
-    Path(id): Path<Uuid>,
+    Path(sid): Path<crate::dag::SessionId>,
     Query(q): Query<TimelineQuery>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    // limit 上限 50 (而非 list 的 200): timeline 路径对每个 node 都 parse req_body_raw
-    // 提取 delta messages, 大 body + 高 limit 会造成延迟尖峰 (issue #27 review #1).
-    let limit = q.limit.unwrap_or(10).clamp(1, 50);
-    let views = state.dag.timeline(id, limit);
-    if views.is_empty() {
-        return Err(StatusCode::NOT_FOUND);
-    }
-    let summaries: Vec<RecordSummary> = views.into_iter().map(RecordSummary::from).collect();
-    Ok((NO_STORE, Json(serde_json::json!({ "records": summaries }))))
+    let (before, limit) = q.resolve();
+    let page = state
+        .dag
+        .timeline_view(sid, before, limit)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok((NO_STORE, Json(page)))
+}
+
+// ─── POST /api/sync ─────────────────────────────────────────────────────────
+//
+// WebUI 3s 轮询的统一入口: 一次请求拿到 sidebar (sessions + expanded rounds) +
+// timeline diff (仅 selected session). DAG 层在单个 read lock 内采集, 保证三部分
+// 数据来自同一快照 (避免新 push 在两次锁之间漂移).
+
+/// POST /api/sync 请求体.
+///
+/// - `selected`: 当前选中的 session + 游标 (用于 timeline diff). None = 无选中 / 首次加载.
+/// - `expanded`: 展开的 session id 列表 (需要回传 round 详情的那些).
+#[derive(Debug, Deserialize)]
+pub struct SyncRequest {
+    #[serde(default)]
+    pub selected: Option<SelectedCursor>,
+    #[serde(default)]
+    pub expanded: Vec<crate::dag::SessionId>,
+}
+
+/// selected session 的游标 (前端持有的最后一条 round + tail 长度).
+#[derive(Debug, Deserialize)]
+pub struct SelectedCursor {
+    pub session_id: crate::dag::SessionId,
+    /// 前端持有的最后一条 round id (timeline 已渲染到的最新一条).
+    /// None = 前端刚进入会话但 timeline 尚未加载 (首次 sync).
+    pub latest_round: Option<Uuid>,
+    /// 前端持有的末轮 response 内容长度 (用于 tail 变更检测, 与 TimelineTail.length 比对).
+    pub response_length: usize,
+}
+
+/// POST /api/sync 响应体.
+///
+/// 字段直接透传 DAG 层的 [`crate::dag::SyncSnapshot`] (Vec<SessionView> +
+/// HashMap<SessionId, Vec<RoundBrief>> + Option<TimelineDiffData>).
+/// `timeline = None` 表示无 diff (前端游标已是最新, 等价 304).
+#[derive(Serialize)]
+pub struct SyncResponse {
+    pub sessions: Vec<SessionSummary>,
+    pub rounds: std::collections::HashMap<crate::dag::SessionId, Vec<crate::dag::RoundBrief>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeline: Option<crate::dag::TimelineDiffData>,
+}
+
+/// POST /api/sync handler.
+///
+/// 在 DAG 层单个 read lock 内采集 sessions + expanded rounds + timeline diff,
+/// 映射 SessionView → SessionSummary 后返回. 无选中时 timeline 为 None.
+pub async fn sync(
+    State(state): State<ProxyState>,
+    Json(req): Json<SyncRequest>,
+) -> impl IntoResponse {
+    let selected = req
+        .selected
+        .map(|c| (c.session_id, c.latest_round, c.response_length));
+    let snap = state.dag.sync_snapshot(&req.expanded, selected);
+    let sessions: Vec<SessionSummary> = snap
+        .sessions
+        .into_iter()
+        .map(SessionSummary::from)
+        .collect();
+    (
+        NO_STORE,
+        Json(SyncResponse {
+            sessions,
+            rounds: snap.rounds,
+            timeline: snap.timeline,
+        }),
+    )
 }
 
 // ─── /secrets ──────────────────────────────────────────────────────────────
@@ -1107,45 +1075,42 @@ mod tests {
         assert!(req.into_mode().is_err());
     }
 
-    // ─── RecordsQuery ──────────────────────────────────────────────────────
+    // ─── TimelineQuery (session-aware timeline 分页参数) ───────────────────
 
     #[test]
-    fn records_query_defaults_offset_zero_limit_fifty() {
-        let q = RecordsQuery {
-            offset: None,
+    fn timeline_query_defaults_before_none_limit_ten() {
+        let q = TimelineQuery {
+            before: None,
             limit: None,
-            filter: None,
         };
-        assert_eq!(q.resolve(), (0, 50, RecordFilter::All));
+        assert_eq!(q.resolve(), (None, 10));
     }
 
     #[test]
-    fn records_query_clamps_limit_to_range() {
+    fn timeline_query_clamps_limit_to_range() {
         // limit = 0 → clamp 到 1.
-        let q = RecordsQuery {
-            offset: None,
+        let q = TimelineQuery {
+            before: None,
             limit: Some(0),
-            filter: None,
         };
-        assert_eq!(q.resolve(), (0, 1, RecordFilter::All));
-        // limit 超大 → clamp 到 200.
-        let q = RecordsQuery {
-            offset: None,
+        assert_eq!(q.resolve(), (None, 1));
+        // limit 超大 → clamp 到 50.
+        let q = TimelineQuery {
+            before: None,
             limit: Some(10_000),
-            filter: None,
         };
-        assert_eq!(q.resolve(), (0, 200, RecordFilter::All));
+        assert_eq!(q.resolve(), (None, 50));
     }
 
     #[test]
-    fn records_query_passes_hits_filter_through() {
-        // 显式传 filter=hits 应原样透传.
-        let q = RecordsQuery {
-            offset: Some(10),
+    fn timeline_query_passes_before_cursor_through() {
+        // 显式传 before 游标应原样透传.
+        let id = Uuid::new_v4();
+        let q = TimelineQuery {
+            before: Some(id),
             limit: Some(20),
-            filter: Some(RecordFilter::Hits),
         };
-        assert_eq!(q.resolve(), (10, 20, RecordFilter::Hits));
+        assert_eq!(q.resolve(), (Some(id), 20));
     }
 
     // ─── extract_preview_and_model ────────────────────────────────────────
@@ -1365,65 +1330,6 @@ mod tests {
         // 截断点在 48 chars 处, 末尾加 '…', UTF-8 不应 panic.
         assert!(p.ends_with('…'));
         assert_eq!(p.chars().count(), PREVIEW_MAX + 1);
-    }
-
-    #[test]
-    fn record_summary_from_extracts_preview_and_model() {
-        // 端到端: NodeView -> RecordSummary 应当带上 preview + model.
-        // (preview/model 在 push 时预计算, NodeView 直接携带.)
-        let v = crate::dag::NodeView {
-            id: Uuid::nil(),
-            parent: None,
-            session_id: crate::dag::SessionId::new(),
-            req_delta_count: 0,
-            has_response: false,
-            created_at: chrono::Utc::now(),
-            elapsed_ms: 0,
-            method: "POST".into(),
-            path: "/o/oa-main/v1/chat/completions".into(),
-            resp_status: 200,
-            redact_seed: 0,
-            preview: Some(std::sync::Arc::from("hi")),
-            model: Some(std::sync::Arc::from("gpt-4o")),
-            streamed: false,
-            resp_complete: false,
-            error: None,
-            redactions: std::sync::Arc::from([]),
-            parsed_response: None,
-            req_delta_messages: vec![],
-        };
-        let s = RecordSummary::from(v);
-        assert_eq!(s.model.as_deref(), Some("gpt-4o"));
-        assert_eq!(s.preview.as_deref(), Some("hi"));
-    }
-
-    #[test]
-    fn record_summary_from_empty_body_yields_none_fields() {
-        // 空请求 body (如 GET) -> preview/model 都 None (push 时 extract 返回 None).
-        let v = crate::dag::NodeView {
-            id: Uuid::nil(),
-            parent: None,
-            session_id: crate::dag::SessionId::new(),
-            req_delta_count: 0,
-            has_response: false,
-            created_at: chrono::Utc::now(),
-            elapsed_ms: 0,
-            method: "GET".into(),
-            path: "/o/oa-main/v1/models".into(),
-            resp_status: 0,
-            redact_seed: 0,
-            preview: None,
-            model: None,
-            streamed: false,
-            resp_complete: false,
-            error: None,
-            redactions: std::sync::Arc::from([]),
-            parsed_response: None,
-            req_delta_messages: vec![],
-        };
-        let s = RecordSummary::from(v);
-        assert!(s.preview.is_none());
-        assert!(s.model.is_none());
     }
 
     // ─── build_parsed_response ────────────────────────────────────────────

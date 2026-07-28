@@ -144,7 +144,10 @@ impl StopForm {
 
 /// 消息角色. 注意: `System` 角色的消息虽然出现在 [`IrMessage`] 里时,
 /// reader 会**提升**到 [`IrRequest::system`], 但 IrMessage 仍可承载 (内部一致性).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum IrRole {
     System,
     #[default]

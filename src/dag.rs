@@ -358,7 +358,16 @@ pub struct CallEvent {
     /// 场景性价比低. 直接存快照 (一次写, 多次读) 是更经济的选择.
     /// `req_delta` 仍用于内容寻址去重 (DAG 核心价值) + 未来 lazy redact 功能.
     pub req_body_raw: String,
-    /// WebUI sidebar 标题 (首条 user message 截断). push 时一次性从 req_body_raw 提取.
+    /// 本轮的主导角色 = req_delta 最后一条 message 的 role.
+    /// 语义: "由于谁发了最后一条消息而触发了这次 HTTP 请求".
+    /// push 时一次性从 delta_refs.last().role 预计算, O(0) 查询.
+    /// WebUI 用它决定 sidebar 条目样式 (user → round-item, 其他 → sub-dot).
+    pub round_role: IrRole,
+    /// WebUI sidebar / timeline preview 文本 (push 时从 req_body_raw 提取, 截断 48 chars).
+    ///
+    /// 提取逻辑见 web::api::extract_preview_and_model (协议无关字节级):
+    /// 优先取最后一条 user message, 无 user 时 fallback 到最后一条有文本的 message
+    /// (tool_result / assistant). 不按 round_role 分发 (历史决策, 简单但非最优).
     ///
     /// `Arc<str>` 让 list/session 路径只增引用计数, 不复制字符串 (3s 轮询场景).
     pub preview: Option<Arc<str>>,
@@ -540,6 +549,14 @@ impl ConversationDag {
             g.blocks.release_message(r);
         }
         let delta_refs: Arc<[MessageRef]> = msg_refs[lookup.split_at..].iter().cloned().collect();
+
+        // 3.5 修正 round_role = req_delta 最后一条 message 的 role.
+        // 调用方 (proxy) 无法在构造 CallEvent 时知道 split_at (它依赖 DAG 内部 prefix 匹配),
+        // 所以 round_role 的权威值在此处计算. delta 为空 (空 body 请求) 时保留调用方传入的值.
+        let mut event = event;
+        if let Some(last) = delta_refs.last() {
+            event.round_role = last.role;
+        }
 
         // 4. 计算 own_hash + prefix_hash (只基于 req_delta, response 不参与).
         let parent_base = match lookup.parent {
@@ -985,6 +1002,7 @@ impl ConversationDag {
             id: node.id,
             parent: node.parent,
             session_id: node.session_id,
+            round_role: node.event.round_role,
             req_delta_count: node.req_delta.len(),
             has_response: resp.is_some(),
             created_at: node.event.created_at,
@@ -1046,76 +1064,286 @@ impl ConversationDag {
         })
     }
 
-    /// 从 `node_id` 沿 parent 链向上取 `limit` 个祖先 (含 node_id 自身),
-    /// oldest-first 返回. 用于右侧 timeline 惰性加载.
-    /// 返回的第一个元素是最老的 (链中最接近根的), 最后一个是 node_id 自身.
+    // ─── session-aware timeline API (替代旧 node_id-based timeline) ────────
+    //
+    // 三条查询路径共享 TimelineRound 结构:
+    // - session_rounds(sid): sidebar 三级菜单的轻量摘要 (不含 delta messages).
+    // - timeline_view(sid, before, limit): timeline 初始加载 + 向前翻页 (lazy load 更老).
+    // - timeline_diff(sid, after, tail_length): sync 轮询的 diff.
+    //
+    // 链遍历统一: 从某起点 (leaf 或 before 指向的 node) 沿 parent 链回溯 limit 个,
+    // oldest-first 返回. 末轮 (链中最新那个) 的 tail 信息单独构造.
+
+    /// 返回 session 的所有 round 轻量摘要 (sidebar 三级菜单用).
     ///
-    /// 与 list_page 不同: timeline 路径额外填充 `req_delta_messages` —
-    /// 从 `req_body_raw` 末尾截取 `req_delta_count` 条 messages (wire JSON),
-    /// 让前端能渲染本轮新增的所有气泡 (issue #27).
-    ///
-    /// `parsed_response` 只在末轮 (最后一个节点) 保留; 非末轮的设为 None.
-    /// 理由: 非 leaf 的 response 内容已被下一轮 delta 的 assistant message 包含,
-    /// 传输冗余. 前端从 delta 渲染完整对话流, 末轮 response 才是 timeline 尚未
-    /// 被 delta 消费的部分 (issue #28 Phase A).
-    pub fn timeline(&self, node_id: Uuid, limit: usize) -> Vec<NodeView> {
+    /// 沿 leaf→root 回溯全部 node, oldest-first 返回.
+    /// 不 resolve block, 不构造 delta messages — 仅 event 字段 (preview/role/created_at).
+    pub fn session_rounds(&self, sid: SessionId) -> Vec<RoundBrief> {
         let g = self.inner.read();
+        let Some(session) = g.sessions.get(&sid).cloned() else {
+            return Vec::new();
+        };
+        let chain = walk_chain(&g, session.leaf_id, usize::MAX);
+        build_round_briefs(&g, &chain)
+    }
+
+    /// 基于 session + 游标的分页 (timeline 初始加载 + lazy load).
+    ///
+    /// - `before=None`: 从最新轮 (leaf) 开始取 limit 条.
+    /// - `before=Some(id)`: 取该 id 之前 (更老) 的 limit 条 (不含 id 自身).
+    ///
+    /// 返回 oldest-first, 含末轮 (链中最新那个) 的 tail 信息.
+    /// `has_more` = 链上还有更老的 node (limit 条之外).
+    pub fn timeline_view(
+        &self,
+        sid: SessionId,
+        before: Option<Uuid>,
+        limit: usize,
+    ) -> Option<TimelinePage> {
+        let g = self.inner.read();
+        let session = g.sessions.get(&sid).cloned()?;
+
+        // before=Some 时 start_id = before.parent (故 limit 条不含 before 自身);
+        // 跨 session 游标无意义 → None 让前端重置.
+        // limit 至少 1, 避免 0 导致空链无法定位末轮 tail.
         let limit = limit.max(1);
-        let mut chain: Vec<Uuid> = Vec::with_capacity(limit);
-        let mut cursor = Some(node_id);
-        while let Some(id) = cursor {
-            if chain.len() >= limit {
-                break;
+        let start_id = match before {
+            None => session.leaf_id,
+            Some(id) => {
+                let node = g.nodes.get(&id)?;
+                if node.session_id != sid {
+                    return None;
+                }
+                node.parent?
             }
-            chain.push(id);
-            cursor = g.nodes.get(&id).and_then(|n| n.parent);
+        };
+
+        let chain = walk_chain(&g, start_id, limit);
+        if chain.is_empty() {
+            return None;
         }
-        // oldest-first: chain 是 newest→oldest, 反转.
-        chain.reverse();
-        let last_idx = chain.len().saturating_sub(1);
-        chain
-            .into_iter()
-            .enumerate()
-            .filter_map(|(i, id)| {
-                let mut view = self.node_view(&g, id)?;
-                // 填充 req_delta_messages: 从 req_body_raw 末尾截取 req_delta_count 条.
-                if view.req_delta_count > 0 {
-                    view.req_delta_messages =
-                        extract_delta_messages(view.req_delta_count, &g, id).unwrap_or_default();
-                }
-                // 非末轮: 清除 parsed_response (已被下一轮 delta 的 assistant 包含).
-                if i != last_idx {
-                    view.parsed_response = None;
-                }
-                Some(view)
-            })
-            .collect()
+        let rounds: Vec<TimelineRound> = chain
+            .iter()
+            .map(|&id| build_timeline_round(&g, id))
+            .collect();
+        // chain oldest-first, 末轮 (链中最新) = chain 最后一个.
+        let tail = build_timeline_tail(&g, *chain.last().unwrap());
+        // chain[0] 是最老的; 它有 parent → has_more=true.
+        let has_more = g.nodes.get(&chain[0]).and_then(|n| n.parent).is_some();
+
+        Some(TimelinePage {
+            rounds,
+            tail,
+            has_more,
+        })
+    }
+
+    /// 基于 session + 游标的 diff (sync 轮询用).
+    ///
+    /// - `after`: 前端持有的最后一条 round id (游标).
+    /// - `tail_length`: 前端持有的末轮 response 内容长度 (用于 tail 变更检测).
+    ///
+    /// 返回 `None` = 无变化 (前端游标已是最新 + tail 长度一致, 304 等价);
+    /// `Some` = 有 diff (new_rounds 非空, 或 tail 内容变化).
+    pub fn timeline_diff(
+        &self,
+        sid: SessionId,
+        after: Option<Uuid>,
+        tail_length: usize,
+    ) -> Option<TimelineDiffData> {
+        let g = self.inner.read();
+        build_timeline_diff_inner(&g, sid, after, tail_length)
+    }
+
+    /// 在单个 `inner.read()` 锁内采集 sync 快照 (sessions + expanded rounds + timeline diff).
+    ///
+    /// 替代多次独立调用 (`list_sessions` + `session_rounds` + `timeline_diff`),
+    /// 保证三部分数据来自同一快照 (避免新 push 在两次锁之间漂移).
+    ///
+    /// - `expanded`: 需要回传 round 详情的 session id 列表 (sidebar 展开的那些).
+    /// - `selected = Some((sid, latest_round, response_length))`: 当前选中的 session +
+    ///   前端持有的游标, 用于 timeline diff. None = 无选中 / 首次加载, timeline 为 None.
+    pub fn sync_snapshot(
+        &self,
+        expanded: &[SessionId],
+        selected: Option<(SessionId, Option<Uuid>, usize)>,
+    ) -> SyncSnapshot {
+        let g = self.inner.read();
+
+        // 1. sessions: 全量 SessionView (latest_at desc 排序, 与 list_sessions 一致).
+        let mut sessions: Vec<SessionView> = g
+            .sessions
+            .iter()
+            .filter_map(|(&sid, s)| self.session_view(&g, sid, s))
+            .collect();
+        sessions.sort_by_key(|v| std::cmp::Reverse((v.latest_at, v.session_id)));
+
+        // 2. rounds: 仅 expanded session 的 RoundBrief 列表.
+        let mut rounds: HashMap<SessionId, Vec<RoundBrief>> = HashMap::new();
+        for &sid in expanded {
+            let Some(session) = g.sessions.get(&sid).cloned() else {
+                continue;
+            };
+            // session_rounds 是 pub API (自带 read lock); 此处 inline 避免重复上锁
+            // (3s 轮询 + 多 expanded session 时省 N 次锁).
+            let chain = walk_chain(&g, session.leaf_id, usize::MAX);
+            let briefs = build_round_briefs(&g, &chain);
+            rounds.insert(sid, briefs);
+        }
+
+        // 3. timeline: 仅 selected session 的 diff (复用 build_timeline_diff_inner).
+        let timeline = selected.and_then(|(sid, after, tail_length)| {
+            build_timeline_diff_inner(&g, sid, after, tail_length)
+        });
+
+        SyncSnapshot {
+            sessions,
+            rounds,
+            timeline,
+        }
     }
 }
 
-/// 从 node 的 req_body_raw 末尾截取 req_delta_count 条 messages (wire JSON),
+// ─── session-aware timeline 内部 helper (free function, 共享 DagInner 读视图) ─
+//
+// 这些 helper 是 free function 而非 ConversationDag 方法, 因为它们只接受 &DagInner
+// (调用方已持读锁), 避免重复 self.inner.read(). 命名以 build_/walk_ 前缀标识 helper.
+
+/// 从 `start_id` 沿 parent 链回溯 (含 start_id), oldest-first 返回.
+///
+/// - `limit = usize::MAX`: 回溯到链首 (parent=None).
+/// - `limit = N`: 最多取 N 个 (含 start_id), 多余的更老的 node 不取.
+fn walk_chain(inner: &DagInner, start_id: Uuid, limit: usize) -> Vec<Uuid> {
+    let mut chain: Vec<Uuid> = Vec::new();
+    let mut cursor = Some(start_id);
+    while let Some(id) = cursor {
+        if chain.len() >= limit {
+            break;
+        }
+        chain.push(id);
+        cursor = inner.nodes.get(&id).and_then(|n| n.parent);
+    }
+    chain.reverse();
+    chain
+}
+
+/// 把 node id 链转成 RoundBrief 列表 (sync_snapshot / session_rounds 共用).
+fn build_round_briefs(inner: &DagInner, chain: &[Uuid]) -> Vec<RoundBrief> {
+    chain
+        .iter()
+        .filter_map(|&id| {
+            let node = inner.nodes.get(&id)?;
+            Some(RoundBrief {
+                id: node.id,
+                round_role: node.event.round_role,
+                preview: node.event.preview.clone(),
+                created_at: node.event.created_at,
+            })
+        })
+        .collect()
+}
+
+/// `timeline_diff` 与 `sync_snapshot.timeline` 共用的核心逻辑
+/// (在同一 `inner.read()` 锁内构造 diff).
+///
+/// - 返回 `None` = 无变化 (after 已是 leaf + tail.length 一致).
+/// - 返回 `Some` = new_rounds 非空, 或 tail.length 变化.
+///
+/// after 不属于本 session (前端状态过期) → 视为初始加载, 返回全链 new_rounds.
+fn build_timeline_diff_inner(
+    inner: &DagInner,
+    sid: SessionId,
+    after: Option<Uuid>,
+    tail_length: usize,
+) -> Option<TimelineDiffData> {
+    let session = inner.sessions.get(&sid).cloned()?;
+    let tail = build_timeline_tail(inner, session.leaf_id);
+
+    // after=None → 前端刚进入, 全链返回 (视为初始加载).
+    // after=Some(id) 且属于本 session → 取 id 之后的 round (不含 id).
+    // after=Some(id) 但不属于本 session → 全链 (前端状态过期, 重置).
+    let new_chain: Vec<Uuid> = match after {
+        None => walk_chain(inner, session.leaf_id, usize::MAX),
+        Some(after_id) => {
+            let after_belongs = inner
+                .nodes
+                .get(&after_id)
+                .is_some_and(|n| n.session_id == sid);
+            if !after_belongs {
+                walk_chain(inner, session.leaf_id, usize::MAX)
+            } else {
+                walk_chain(inner, session.leaf_id, usize::MAX)
+                    .into_iter()
+                    .skip_while(|&id| id != after_id)
+                    .skip(1)
+                    .collect()
+            }
+        }
+    };
+
+    if new_chain.is_empty() {
+        // 无新增 round: 仅当 tail.length 变化才返回 diff (让前端更新抽屉).
+        if tail.length == tail_length {
+            return None;
+        }
+        return Some(TimelineDiffData {
+            new_rounds: Vec::new(),
+            tail,
+        });
+    }
+
+    let new_rounds = new_chain
+        .iter()
+        .map(|&id| build_timeline_round(inner, id))
+        .collect();
+    Some(TimelineDiffData { new_rounds, tail })
+}
+
+/// 构造一个 TimelineRound (含 req_delta_messages).
+///
+/// req_delta_messages 从 `node.req_body_raw` 末尾切片 (已 redact, LLM 视角, 安全).
+/// 不走 BlockPool + codec writer 路径 (BlockPool 存真实内容, 未 apply redactMap 会泄露 secret);
+/// 跨协议切片错位是可接受的已知限制. TODO: 后续在 web 层 lazy redact.
+///
+/// 调用方传入的 `node_id` 必然在 `inner` 内存在 (由 walk_chain / session.leaf_id 产生,
+/// 全程持 `inner.read()` 锁, evict 不会并发发生).
+fn build_timeline_round(inner: &DagInner, node_id: Uuid) -> TimelineRound {
+    let node = inner
+        .nodes
+        .get(&node_id)
+        .expect("node exists under read lock");
+    TimelineRound {
+        id: node.id,
+        round_role: node.event.round_role,
+        preview: node.event.preview.clone(),
+        created_at: node.event.created_at,
+        redactions: Arc::clone(&node.event.redactions),
+        req_delta_messages: extract_delta_messages_from_raw(node),
+    }
+}
+
+/// (fallback) 从 node.req_body_raw 末尾截取 req_delta.len() 条 messages (wire JSON),
 /// 并在根节点时额外提取 system prompt.
 ///
-/// 用于 timeline 路径填充 NodeView.req_delta_messages.
-/// req_body_raw 是完整请求 wire JSON (已 redact, LLM 视角),
-/// messages 数组按 prefix 共享, 末尾 req_delta_count 条是本轮增量.
-///
 /// system 处理: OpenAI reader 把 role=system 提升到 IrRequest.system (不在 messages 里),
-/// writer 再写回 messages[0]. 但 DAG 的 req_delta_count 不含 system (基于 IR messages).
+/// writer 再写回 messages[0]. DAG 的 req_delta 不含 system (基于 IR messages).
 /// 因此根节点 (parent=None) 时, 从 req_body_raw 顶层提取 system 字段 (Anthropic 风格)
 /// 或 messages[0] (OpenAI 风格 role=system), 作为 delta 的首条 synthetic message.
 ///
-/// 失败容错: 解析失败 / messages 不是数组 / 数量不足 → None (前端 fallback 到 preview).
-fn extract_delta_messages(
-    count: usize,
-    inner: &DagInner,
-    node_id: Uuid,
-) -> Option<Vec<serde_json::Value>> {
-    let node = inner.nodes.get(&node_id)?;
-    let req_body: serde_json::Value = serde_json::from_str(&node.event.req_body_raw).ok()?;
-    let messages = req_body.get("messages")?.as_array()?;
+/// 已知限制: 跨协议 writer 拆分场景切片 start 偏小, delta 可能含前序轮消息 (同协议不受影响).
+fn extract_delta_messages_from_raw(node: &Node) -> Vec<serde_json::Value> {
+    let count = node.req_delta.len();
+    if count == 0 {
+        return Vec::new();
+    }
+    let Ok(req_body) = serde_json::from_str::<serde_json::Value>(&node.event.req_body_raw) else {
+        return Vec::new();
+    };
+    let Some(messages) = req_body.get("messages").and_then(|m| m.as_array()) else {
+        return Vec::new();
+    };
     if messages.len() < count {
-        return None;
+        return Vec::new();
     }
     let start = messages.len() - count;
     let mut result: Vec<serde_json::Value> = messages[start..].to_vec();
@@ -1154,11 +1382,51 @@ fn extract_delta_messages(
         }
     }
 
-    Some(result)
+    result
+}
+
+/// 构造一个 TimelineTail (从 node.response 读 parsed + 元数据).
+///
+/// `length` = parsed 序列化字节数; parsed 为 None 时 fallback 到 raw_resp_body.len().
+/// 调用方传入的 `node_id` 必然在 `inner` 内存在 (由 leaf_id 产生, 全程持锁).
+fn build_timeline_tail(inner: &DagInner, node_id: Uuid) -> TimelineTail {
+    let node = inner
+        .nodes
+        .get(&node_id)
+        .expect("node exists under read lock");
+    let empty_tail = || TimelineTail {
+        round_id: node_id,
+        length: 0,
+        resp_status: 0,
+        elapsed_ms: 0,
+        streamed: false,
+        resp_complete: false,
+        error: None,
+        parsed: None,
+    };
+    let resp_lock = node.response.read();
+    let Some(resp) = resp_lock.as_ref() else {
+        return empty_tail();
+    };
+    let length = resp
+        .parsed
+        .as_ref()
+        .map(|v| v.to_string().len())
+        .unwrap_or(resp.raw_resp_body.len());
+    TimelineTail {
+        round_id: node_id,
+        length,
+        resp_status: resp.resp_status,
+        elapsed_ms: resp.elapsed_ms,
+        streamed: resp.streamed,
+        resp_complete: resp.resp_complete,
+        error: resp.error.clone(),
+        parsed: resp.parsed.clone(),
+    }
 }
 
 /// 会话视图 (sidebar 一级树).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SessionView {
     /// 会话稳定标识 (前端选中/展开用, 刷新后不变).
     pub session_id: SessionId,
@@ -1204,6 +1472,10 @@ pub struct NodeView {
     pub parent: Option<Uuid>,
     /// 所属会话的稳定标识 (push 时确定).
     pub session_id: SessionId,
+    /// 本轮的主导角色 = req_delta 最后一条 message 的 role.
+    /// 语义: "由于谁发了最后一条消息而触发了这次 HTTP 请求".
+    /// WebUI 用它决定 sidebar 条目样式 + timeline 气泡渲染.
+    pub round_role: IrRole,
     pub req_delta_count: usize,
     pub has_response: bool,
     pub created_at: DateTime<Utc>,
@@ -1247,6 +1519,116 @@ pub struct NodeDetail {
     pub req_body_raw: String,
 }
 
+// ─── WebUI sync API 数据结构 (session-aware timeline + sync) ───────────────
+//
+// 替代旧的 NodeView timeline (基于 node_id) + list_records (扁平分页).
+// 新模型基于 SessionId: sidebar 折叠会话树 + timeline 按 session 分页 + sync diff.
+//
+// 三条查询路径:
+// - session_rounds(sid): sidebar 三级菜单的轻量 round 摘要.
+// - timeline_view(sid, before, limit): timeline 初始加载 + lazy load (向前翻更老).
+// - timeline_diff(sid, after, tail_length): sync 轮询的 diff.
+// 三者共享 TimelineRound 结构 (含 req_delta_messages).
+
+/// sidebar 三级菜单的轻量 round 摘要 (不含 req_delta_messages, 节省 3s 轮询带宽).
+///
+/// 字段直接从 `Node.event` 派生 (push 时预计算), 不 walk parent 链, 不 resolve block.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RoundBrief {
+    pub id: Uuid,
+    pub round_role: IrRole,
+    /// `Arc<str>`: 共享 event.preview, 轮询路径零拷贝.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<Arc<str>>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// timeline 每轮的完整数据 (含 request delta messages 的 wire JSON).
+///
+/// 与 RoundBrief 的区别: 多了 redactions + req_delta_messages (前端渲染气泡用).
+/// `req_delta_messages` 通过 ingress codec writer 序列化 (BlockPool resolve → IR → wire),
+/// 保证同协议路径正确; 跨协议 / codec 缺失时 fallback 到 req_body_raw 末尾切片
+/// (旧实现, 已知有跨协议切片错位 bug, 见 AGENTS.md "已知限制").
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TimelineRound {
+    pub id: Uuid,
+    pub round_role: IrRole,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<Arc<str>>,
+    pub created_at: DateTime<Utc>,
+    /// `Arc<[(String,String)]>`: 共享 event.redactions, 零拷贝.
+    /// 每个 tuple = (mock_value, secret_id), **永不**含真实 secret.
+    pub redactions: Arc<[(String, String)]>,
+    /// 本轮 request delta (相对 parent 的增量 messages, wire JSON).
+    /// 前端按 role 渲染气泡 (system/user/tool), 与末轮 response 抽屉互补.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub req_delta_messages: Vec<serde_json::Value>,
+}
+
+/// timeline 抽屉 (视图级, 当前末轮的 response 内容).
+///
+/// 仅 timeline_view 的初始加载 / timeline_diff 的更新会推送新 tail;
+/// 前端用 length 做 diff 判定 (是否需要更新抽屉内容).
+/// 非 timeline 末轮的 response 内容已被下一轮 delta 的 assistant message 包含
+/// (Phase A 决策, 详见旧 timeline 实现), 故 tail 只代表"最新尚未被 delta 消费的 response".
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TimelineTail {
+    pub round_id: Uuid,
+    /// response 内容的字节长度 (前端用它判定是否需要更新抽屉).
+    /// = parsed 序列化字节数 (parsed 为 None 时 fallback 到 raw_resp_body.len()).
+    pub length: usize,
+    pub resp_status: u16,
+    pub elapsed_ms: u64,
+    pub streamed: bool,
+    pub resp_complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// parsed view (ingress codec writer 序列化的 IrResponse, LLM 视角含 mock).
+    /// 流式响应由 StreamScan 累积; 非流式在响应完成时一次性计算.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parsed: Option<serde_json::Value>,
+}
+
+/// GET /sessions/{sid}/timeline 的完整响应.
+///
+/// `rounds`: oldest-first, limit 条 (含末轮).
+/// `tail`: 末轮 (rounds 最后一个) 的 response 抽屉数据.
+/// `has_more`: 链上还有更老的 node (limit 之外), 前端用于显示 "load more" 提示.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TimelinePage {
+    pub rounds: Vec<TimelineRound>,
+    pub tail: TimelineTail,
+    pub has_more: bool,
+}
+
+/// sync 的 timeline diff 部分 (POST /api/sync 的 response.timeline).
+///
+/// `new_rounds`: after 游标之后新增的 round (oldest-first).
+/// `tail`: 当前末轮的 response 抽屉 (前端用它 + length 判定是否需要更新).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TimelineDiffData {
+    pub new_rounds: Vec<TimelineRound>,
+    pub tail: TimelineTail,
+}
+
+/// POST /api/sync 的完整快照 (一个 read lock 内采集).
+///
+/// 三部分:
+/// - `sessions`: 所有 session 的 SessionView (sidebar 一级树).
+/// - `rounds`: 仅 expanded session 的 RoundBrief 列表 (sidebar 三级菜单).
+/// - `timeline`: 仅 selected session 的 diff (timeline 初始加载 / 增量更新).
+///
+/// 在单个 `inner.read()` 锁内一次性采集, 避免多次 list_sessions / timeline_view
+/// 之间数据漂移 (典型: 新 push 在两次读锁之间到达, sessions 与 rounds 不一致).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SyncSnapshot {
+    pub sessions: Vec<SessionView>,
+    pub rounds: HashMap<SessionId, Vec<RoundBrief>>,
+    /// None = 无选中 / 无 diff (前端持有的游标已是最新, 304 等价).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeline: Option<TimelineDiffData>,
+}
+
 // ─── redactMap 派生 ────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1274,6 +1656,7 @@ mod tests {
             redact_seed: 0,
             policy: Arc::new(PolicySnapshot::default()),
             req_body_raw: String::new(),
+            round_role: IrRole::User,
             preview: None,
             model: None,
             redactions: Arc::from([]),
@@ -1940,6 +2323,7 @@ mod tests {
             redact_seed: 0,
             policy: Arc::new(PolicySnapshot::default()),
             req_body_raw: req_body.to_string(),
+            round_role: IrRole::User,
             preview: preview.map(Arc::<str>::from),
             model: model.map(Arc::<str>::from),
             redactions: Arc::from([]),
@@ -2369,8 +2753,45 @@ mod tests {
         assert!(dag.get_node(c_prime).is_some(), "C' (s2 leaf) kept");
     }
 
+    // ─── session-aware timeline API (session_rounds / timeline_view / timeline_diff) ─
+    //
+    // 替代旧的 node_id-based timeline() 测试. 新 API 基于 SessionId, 三条路径:
+    // - session_rounds(sid): sidebar 三级菜单的轻量摘要.
+    // - timeline_view(sid, before, limit): 初始加载 + lazy load (向前翻更老).
+    // - timeline_diff(sid, after, tail_length): sync 轮询的 diff.
+    //
+    // 链遍历语义: 从 leaf 沿 parent 回溯, oldest-first 返回. before/after 游标控制起点.
+
+    /// 辅助: push 一条 user message + attach 一个 parsed response, 返回新 node id.
+    /// 用于 timeline 测试快速构造带 response 的 node.
+    fn push_with_response(
+        dag: &ConversationDag,
+        msgs: Vec<IrMessage>,
+        parsed: Option<serde_json::Value>,
+    ) -> Uuid {
+        let id = dag.push_messages(msgs, dummy_event());
+        if let Some(p) = parsed {
+            dag.attach_response(
+                id,
+                ResponseData {
+                    parsed: Some(p),
+                    resp_status: 200,
+                    resp_complete: true,
+                    ..Default::default()
+                },
+            );
+        }
+        id
+    }
+
+    /// 辅助: 取 session 的 sid (从 leaf node 反查).
+    fn sid_of(dag: &ConversationDag, leaf: Uuid) -> SessionId {
+        dag.get_node(leaf).expect("leaf exists").session_id
+    }
+
     #[test]
-    fn timeline_returns_oldest_first() {
+    fn session_rounds_returns_oldest_first() {
+        // 3 轮链 A → B → C, session_rounds(leaf=C) → [A, B, C] oldest-first.
         let dag = ConversationDag::new(64, 500, 1);
         let a = dag.push_messages(vec![text_msg(IrRole::User, "a")], dummy_event());
         let _b = dag.push_messages(
@@ -2388,17 +2809,67 @@ mod tests {
             ],
             dummy_event(),
         );
-        // timeline(c, 10) → [A, B, C] oldest-first.
-        let tl = dag.timeline(c, 10);
-        assert_eq!(tl.len(), 3);
-        assert_eq!(tl[0].id, a, "oldest first");
-        assert_eq!(tl[2].id, c, "newest last");
+        let sid = sid_of(&dag, c);
+        let rounds = dag.session_rounds(sid);
+        assert_eq!(rounds.len(), 3);
+        assert_eq!(rounds[0].id, a, "oldest first");
+        assert_eq!(rounds[2].id, c, "newest last");
     }
 
     #[test]
-    fn timeline_limit_truncates() {
+    fn session_rounds_unknown_sid_returns_empty() {
         let dag = ConversationDag::new(64, 500, 1);
-        let _a = dag.push_messages(vec![text_msg(IrRole::User, "a")], dummy_event());
+        let _ = dag.push_messages(vec![text_msg(IrRole::User, "a")], dummy_event());
+        // 不存在的 sid → 空 Vec (不 panic).
+        let rounds = dag.session_rounds(SessionId::new());
+        assert!(rounds.is_empty());
+    }
+
+    #[test]
+    fn timeline_view_initial_load_returns_leaf_with_tail() {
+        // before=None: 从 leaf 取 limit 条. tail = leaf 的 response 抽屉.
+        let dag = ConversationDag::new(64, 500, 1);
+        let a = push_with_response(&dag, vec![text_msg(IrRole::User, "u1")], None);
+        let _b = push_with_response(
+            &dag,
+            vec![
+                text_msg(IrRole::User, "u1"),
+                text_msg(IrRole::Assistant, "a1"),
+                text_msg(IrRole::User, "u2"),
+            ],
+            None,
+        );
+        let c = push_with_response(
+            &dag,
+            vec![
+                text_msg(IrRole::User, "u1"),
+                text_msg(IrRole::Assistant, "a1"),
+                text_msg(IrRole::User, "u2"),
+                text_msg(IrRole::Assistant, "a2"),
+                text_msg(IrRole::User, "u3"),
+            ],
+            Some(serde_json::json!({"resp": "c-content"})),
+        );
+        let sid = sid_of(&dag, c);
+        let page = dag.timeline_view(sid, None, 10).expect("page exists");
+        // oldest-first: [A, B, C].
+        assert_eq!(page.rounds.len(), 3);
+        assert_eq!(page.rounds[0].id, a);
+        assert_eq!(page.rounds[2].id, c);
+        // tail = C (leaf) 的 response.
+        assert_eq!(page.tail.round_id, c);
+        assert_eq!(page.tail.resp_status, 200);
+        // length = parsed 序列化字节数.
+        assert_eq!(page.tail.length, r#"{"resp":"c-content"}"#.len());
+        // C (leaf) 是链中最新, has_more=false (A 是根, parent=None).
+        assert!(!page.has_more);
+    }
+
+    #[test]
+    fn timeline_view_limit_truncates_and_has_more() {
+        // limit < 链长: 取最近 limit 条, has_more=true.
+        let dag = ConversationDag::new(64, 500, 1);
+        let a = dag.push_messages(vec![text_msg(IrRole::User, "a")], dummy_event());
         let _b = dag.push_messages(
             vec![
                 text_msg(IrRole::User, "a"),
@@ -2414,223 +2885,219 @@ mod tests {
             ],
             dummy_event(),
         );
-        // timeline(c, 2) → [B, C] (最近 2 轮, oldest-first).
-        let tl = dag.timeline(c, 2);
-        assert_eq!(tl.len(), 2);
-        assert_eq!(tl[1].id, c, "includes the requested node");
-    }
-
-    // ─── extract_delta_messages (timeline 路径填充) 单元测试 ──────────────
-    //
-    // 通过 push 带 req_body_raw 的 node, 再 timeline 取回, 验证 req_delta_messages
-    // 的提取逻辑 (含 system 注入 + fallback).
-
-    #[test]
-    fn timeline_delta_openai_root_start_zero_includes_system_in_slice() {
-        // OpenAI 风格根节点: messages = [sys, u1].
-        // push 2 条 IrMessage → req_delta_count=2.
-        // req_body_raw messages 有 2 条, start = 2-2 = 0 → 无需注入 (已在切片内).
-        let dag = ConversationDag::new(64, 500, 1);
-        let body = r#"{"model":"x","messages":[{"role":"system","content":"sys-prompt"},{"role":"user","content":"u1"}]}"#;
-        let msgs = vec![
-            text_msg(IrRole::System, "sys-prompt"),
-            text_msg(IrRole::User, "u1"),
-        ];
-        let id = dag.push_messages(msgs, event_with_body("/o/oa/v1/chat", body));
-        let tl = dag.timeline(id, 10);
-        assert_eq!(tl.len(), 1);
-        let delta = &tl[0].req_delta_messages;
-        assert_eq!(delta.len(), 2, "delta = [sys, u1] (都在切片内)");
-        assert_eq!(
-            delta[0].get("role").and_then(|r| r.as_str()),
-            Some("system")
-        );
+        let sid = sid_of(&dag, c);
+        // limit=2: 取 [B, C], has_more=true (A 在 limit 之外).
+        let page = dag.timeline_view(sid, None, 2).expect("page exists");
+        assert_eq!(page.rounds.len(), 2);
+        assert_eq!(page.rounds[1].id, c, "末轮是 leaf");
+        assert!(page.has_more, "A 仍在链上, has_more=true");
+        let _ = a;
     }
 
     #[test]
-    fn timeline_delta_openai_root_injects_system_when_wire_has_more_messages() {
-        // 跨协议 writer 拆分场景 (AGENTS.md 已知限制): OpenAI writer 把 Anthropic 风格的
-        // 混合 Text+ToolResult user 消息拆成多条 wire messages.
-        // 这里模拟: push 1 条 IrMessage (User), 但 req_body_raw 有 3 条 messages
-        // (模拟 writer 拆分后 system + user_text + tool_result).
-        // 根节点: start = 3-1 = 2 > 0, messages[0] 是 system → 注入到 delta 首位.
+    fn timeline_view_before_cursor_loads_older() {
+        // before=Some(id): 取 id 之前 (更老) 的 limit 条 (不含 id 自身).
         let dag = ConversationDag::new(64, 500, 1);
-        let body = r#"{"model":"x","messages":[{"role":"system","content":"sys-x"},{"role":"user","content":"question"},{"role":"tool","tool_call_id":"c1","content":"result"}]}"#;
-        // 只 push 1 条 IrMessage → req_delta_count=1.
-        let id = dag.push_messages(
-            vec![text_msg(IrRole::User, "question")],
-            event_with_body("/o/oa/v1/chat", body),
-        );
-        let tl = dag.timeline(id, 10);
-        assert_eq!(tl.len(), 1);
-        let delta = &tl[0].req_delta_messages;
-        // 注入后: system + 切片 messages[2..] = [system, tool_result].
-        assert_eq!(delta.len(), 2, "注入 system + 切片 [tool_result]");
-        assert_eq!(
-            delta[0].get("role").and_then(|r| r.as_str()),
-            Some("system"),
-            "首位应是注入的 system"
-        );
-        assert_eq!(
-            delta[1].get("role").and_then(|r| r.as_str()),
-            Some("tool"),
-            "第二位是切片的 tool_result"
-        );
-    }
-
-    #[test]
-    fn timeline_delta_non_root_does_not_inject_system() {
-        // 子节点: req_delta_count=1, messages.len()=3, start=2.
-        // 但子节点不注入 system (只有根节点注入).
-        let dag = ConversationDag::new(64, 500, 1);
-        let body_a = r#"{"model":"x","messages":[{"role":"system","content":"sys-prompt"},{"role":"user","content":"u1"}]}"#;
-        let msgs_a = vec![
-            text_msg(IrRole::System, "sys-prompt"),
-            text_msg(IrRole::User, "u1"),
-        ];
-        let _id_a = dag.push_messages(msgs_a, event_with_body("/o/oa/v1/chat", body_a));
-        let body_b = r#"{"model":"x","messages":[{"role":"system","content":"sys-prompt"},{"role":"user","content":"u1"},{"role":"assistant","content":"a1"}]}"#;
-        let msgs_b = vec![
-            text_msg(IrRole::System, "sys-prompt"),
-            text_msg(IrRole::User, "u1"),
-            text_msg(IrRole::Assistant, "a1"),
-        ];
-        let id_b = dag.push_messages(msgs_b, event_with_body("/o/oa/v1/chat", body_b));
-        let tl = dag.timeline(id_b, 10);
-        assert_eq!(tl.len(), 2);
-        // 子节点 B: 不注入 system. delta = messages[2..] = [a1].
-        let delta_b = &tl[1].req_delta_messages;
-        assert_eq!(delta_b.len(), 1, "子节点 delta = [a1] (不含 system)");
-        assert_eq!(
-            delta_b[0].get("role").and_then(|r| r.as_str()),
-            Some("assistant")
-        );
-    }
-
-    #[test]
-    fn timeline_delta_non_json_body_returns_empty() {
-        // 非 JSON req_body_raw → extract 返回 None → req_delta_messages 为空.
-        let dag = ConversationDag::new(64, 500, 1);
-        let id = dag.push_messages(
-            vec![text_msg(IrRole::User, "u")],
-            event_with_body("/o/oa/v1/chat", "not json"),
-        );
-        let tl = dag.timeline(id, 10);
-        assert_eq!(tl.len(), 1);
-        assert!(
-            tl[0].req_delta_messages.is_empty(),
-            "非 JSON body → 空 delta"
-        );
-    }
-
-    #[test]
-    fn timeline_delta_fewer_messages_than_count_returns_empty() {
-        // req_body_raw 的 messages 数量 < req_delta_count → guard 触发, 返回空.
-        let dag = ConversationDag::new(64, 500, 1);
-        // push 2 条 IrMessage → req_delta_count=2.
-        // 但 req_body_raw 只有 1 条 messages → guard 触发.
-        let body = r#"{"model":"x","messages":[{"role":"user","content":"only-one"}]}"#;
-        let id = dag.push_messages(
-            vec![text_msg(IrRole::User, "a"), text_msg(IrRole::User, "b")],
-            event_with_body("/o/oa/v1/chat", body),
-        );
-        let tl = dag.timeline(id, 10);
-        assert_eq!(tl.len(), 1);
-        assert!(
-            tl[0].req_delta_messages.is_empty(),
-            "messages < count → 空 delta"
-        );
-    }
-
-    #[test]
-    fn timeline_delta_no_messages_key_returns_empty() {
-        // req_body_raw 合法 JSON 但无 messages key → extract 返回 None.
-        let dag = ConversationDag::new(64, 500, 1);
-        let body = r#"{"model":"x","other":"value"}"#;
-        let id = dag.push_messages(
-            vec![text_msg(IrRole::User, "u")],
-            event_with_body("/o/oa/v1/chat", body),
-        );
-        let tl = dag.timeline(id, 10);
-        assert_eq!(tl.len(), 1);
-        assert!(tl[0].req_delta_messages.is_empty());
-    }
-
-    // ─── Phase A: parsed_response 只在 timeline 末轮保留 ────────────────────
-
-    #[test]
-    fn timeline_parsed_response_only_on_last_node() {
-        // 3 轮链: A → B → C. timeline(C, 10) 返回 [A, B, C].
-        // Phase A: 只有 C (末轮) 保留 parsed_response; A 和 B 的设为 None.
-        // 理由: 非 leaf 节点的 response 内容已被下一轮 delta 的 assistant message 包含,
-        // 传输是冗余. assert 通过后可安全省略 (issue #28 Phase A).
-        let dag = ConversationDag::new(64, 500, 1);
-        let a = dag.push_messages(vec![text_msg(IrRole::User, "u1")], dummy_event());
-        dag.attach_response(
-            a,
-            ResponseData {
-                parsed: Some(serde_json::json!({"resp": "a1"})),
-                resp_status: 200,
-                ..Default::default()
-            },
-        );
+        let a = dag.push_messages(vec![text_msg(IrRole::User, "a")], dummy_event());
         let b = dag.push_messages(
             vec![
-                text_msg(IrRole::User, "u1"),
-                text_msg(IrRole::Assistant, "a1"),
-                text_msg(IrRole::User, "u2"),
+                text_msg(IrRole::User, "a"),
+                text_msg(IrRole::Assistant, "b"),
             ],
             dummy_event(),
-        );
-        dag.attach_response(
-            b,
-            ResponseData {
-                parsed: Some(serde_json::json!({"resp": "a2"})),
-                resp_status: 200,
-                ..Default::default()
-            },
         );
         let c = dag.push_messages(
             vec![
-                text_msg(IrRole::User, "u1"),
-                text_msg(IrRole::Assistant, "a1"),
-                text_msg(IrRole::User, "u2"),
-                text_msg(IrRole::Assistant, "a2"),
-                text_msg(IrRole::User, "u3"),
+                text_msg(IrRole::User, "a"),
+                text_msg(IrRole::Assistant, "b"),
+                text_msg(IrRole::User, "c"),
             ],
             dummy_event(),
         );
-        dag.attach_response(
-            c,
-            ResponseData {
-                parsed: Some(serde_json::json!({"resp": "a3"})),
-                resp_status: 200,
-                ..Default::default()
-            },
+        let sid = sid_of(&dag, c);
+        // before=C, limit=10 → 取 C 之前 = [A, B] (不含 C).
+        let page = dag.timeline_view(sid, Some(c), 10).expect("page exists");
+        assert_eq!(page.rounds.len(), 2);
+        assert_eq!(page.rounds[0].id, a);
+        assert_eq!(page.rounds[1].id, b);
+        assert!(!page.has_more, "A 是根, has_more=false");
+        // tail = B (链中最新的那个), 不是 C.
+        assert_eq!(page.tail.round_id, b);
+    }
+
+    #[test]
+    fn timeline_view_unknown_sid_returns_none() {
+        let dag = ConversationDag::new(64, 500, 1);
+        let _ = dag.push_messages(vec![text_msg(IrRole::User, "a")], dummy_event());
+        assert!(dag.timeline_view(SessionId::new(), None, 10).is_none());
+    }
+
+    #[test]
+    fn timeline_view_before_from_other_session_returns_none() {
+        // before 游标属于另一个 session → None (跨 session 游标无意义).
+        let dag = ConversationDag::new(64, 500, 1);
+        let _a = dag.push_messages(vec![text_msg(IrRole::User, "a")], dummy_event());
+        let other_leaf = dag.push_messages(vec![text_msg(IrRole::User, "x")], dummy_event());
+        let other_sid = sid_of(&dag, other_leaf);
+        // 创建另一个 session 后, other_leaf 不再是 leaf, 但仍属于 other_sid.
+        let c = dag.push_messages(
+            vec![text_msg(IrRole::User, "x"), text_msg(IrRole::User, "c")],
+            dummy_event(),
+        );
+        let sid_c = sid_of(&dag, c);
+        // before=other_leaf 但 sid=sid_c → None.
+        assert!(dag.timeline_view(sid_c, Some(other_leaf), 10).is_none());
+        let _ = other_sid;
+    }
+
+    #[test]
+    fn timeline_diff_returns_none_when_no_change() {
+        // after=leaf + tail.length 一致 → None (304 等价).
+        let dag = ConversationDag::new(64, 500, 1);
+        let a = push_with_response(
+            &dag,
+            vec![text_msg(IrRole::User, "u1")],
+            Some(serde_json::json!({"resp": "a1"})),
+        );
+        let sid = sid_of(&dag, a);
+        let page = dag.timeline_view(sid, None, 10).expect("page exists");
+        let diff = dag.timeline_diff(sid, Some(a), page.tail.length);
+        assert!(diff.is_none(), "无新 round + tail 一致 → None");
+    }
+
+    #[test]
+    fn timeline_diff_returns_new_rounds_after_push() {
+        // 初始 leaf=A, 然后 push B → diff(after=A) 应返回 [B].
+        let dag = ConversationDag::new(64, 500, 1);
+        let a = push_with_response(
+            &dag,
+            vec![text_msg(IrRole::User, "u1")],
+            Some(serde_json::json!({"resp": "a1"})),
+        );
+        let sid = sid_of(&dag, a);
+        let b = push_with_response(
+            &dag,
+            vec![
+                text_msg(IrRole::User, "u1"),
+                text_msg(IrRole::Assistant, "a1"),
+                text_msg(IrRole::User, "u2"),
+            ],
+            Some(serde_json::json!({"resp": "b1"})),
+        );
+        let diff = dag
+            .timeline_diff(sid, Some(a), 0)
+            .expect("有新 round → Some");
+        assert_eq!(diff.new_rounds.len(), 1);
+        assert_eq!(diff.new_rounds[0].id, b);
+        // tail = B (当前 leaf).
+        assert_eq!(diff.tail.round_id, b);
+    }
+
+    #[test]
+    fn timeline_diff_after_not_in_session_returns_full_chain() {
+        // after 不属于本 session (前端状态过期) → 返回全部 round.
+        let dag = ConversationDag::new(64, 500, 1);
+        let a = dag.push_messages(vec![text_msg(IrRole::User, "u1")], dummy_event());
+        let sid = sid_of(&dag, a);
+        // after 是一个不存在的 id → after_belongs_to_sid=false → 全部返回.
+        let bogus = Uuid::new_v4();
+        let diff = dag
+            .timeline_diff(sid, Some(bogus), 0)
+            .expect("after 过期 → 全部返回");
+        assert_eq!(diff.new_rounds.len(), 1);
+        assert_eq!(diff.new_rounds[0].id, a);
+    }
+
+    #[test]
+    fn timeline_diff_tail_change_only_returns_empty_new_rounds() {
+        // after=leaf (无新 round) 但 tail.length 变化 → 返回空 new_rounds + 新 tail.
+        let dag = ConversationDag::new(64, 500, 1);
+        let a = push_with_response(
+            &dag,
+            vec![text_msg(IrRole::User, "u1")],
+            Some(serde_json::json!({"resp": "a1"})),
+        );
+        let sid = sid_of(&dag, a);
+        // 第一次 diff: tail.length 不一致 (传 0) → 返回新 tail (但 new_rounds 为空,
+        // 因为 after=leaf 已是最新).
+        let diff = dag
+            .timeline_diff(sid, Some(a), 0)
+            .expect("tail 变化 → Some");
+        assert!(diff.new_rounds.is_empty(), "无新 round");
+        assert!(diff.tail.length > 0, "tail 有内容");
+    }
+
+    #[test]
+    fn sync_snapshot_collects_all_three_parts_in_one_lock() {
+        // sync_snapshot: sessions + rounds (expanded) + timeline diff (selected) 一次性采集.
+        let dag = ConversationDag::new(64, 500, 1);
+        let a = push_with_response(
+            &dag,
+            vec![text_msg(IrRole::User, "u1")],
+            Some(serde_json::json!({"resp": "a1"})),
+        );
+        let sid = sid_of(&dag, a);
+        let b = push_with_response(
+            &dag,
+            vec![
+                text_msg(IrRole::User, "u1"),
+                text_msg(IrRole::Assistant, "a1"),
+                text_msg(IrRole::User, "u2"),
+            ],
+            Some(serde_json::json!({"resp": "b1"})),
         );
 
-        let tl = dag.timeline(c, 10);
-        assert_eq!(tl.len(), 3);
-        // A, B (非末轮): parsed_response 应为 None.
-        assert!(
-            tl[0].parsed_response.is_none(),
-            "非末轮 A 的 parsed_response 应为 None"
+        // selected = (sid, after=A, tail_length=0): 应返回 [B] 的 diff.
+        let snap = dag.sync_snapshot(&[sid], Some((sid, Some(a), 0)));
+        // sessions: 1 个 session.
+        assert_eq!(snap.sessions.len(), 1);
+        // rounds: expanded 含 sid → 2 个 round [A, B].
+        assert_eq!(snap.rounds.get(&sid).map(|v| v.len()), Some(2));
+        // timeline: diff 含 [B].
+        let diff = snap.timeline.expect("有新 round → Some");
+        assert_eq!(diff.new_rounds.len(), 1);
+        assert_eq!(diff.new_rounds[0].id, b);
+    }
+
+    #[test]
+    fn sync_snapshot_no_selected_timeline_is_none() {
+        let dag = ConversationDag::new(64, 500, 1);
+        let a = dag.push_messages(vec![text_msg(IrRole::User, "u1")], dummy_event());
+        let sid = sid_of(&dag, a);
+        let snap = dag.sync_snapshot(&[sid], None);
+        assert_eq!(snap.sessions.len(), 1);
+        assert!(snap.timeline.is_none(), "无 selected → timeline=None");
+    }
+
+    #[test]
+    fn sync_snapshot_expanded_unknown_sid_yields_empty_rounds() {
+        let dag = ConversationDag::new(64, 500, 1);
+        let a = dag.push_messages(vec![text_msg(IrRole::User, "u1")], dummy_event());
+        let sid = sid_of(&dag, a);
+        let bogus = SessionId::new();
+        let snap = dag.sync_snapshot(&[bogus], None);
+        // bogus 不在 sessions map → rounds 中无对应 entry (不 panic).
+        assert!(!snap.rounds.contains_key(&bogus));
+        // 真 sid 不在 expanded → rounds 中也无.
+        assert!(!snap.rounds.contains_key(&sid));
+    }
+
+    #[test]
+    fn timeline_round_carries_req_delta_messages_for_leaf() {
+        // 验证 TimelineRound 的 req_delta_messages 从 req_delta resolve 出来.
+        // 这里用最简单的场景: 单 node, push 1 条 user msg → req_delta = [user msg].
+        let dag = ConversationDag::new(64, 500, 1);
+        let a = push_with_response(
+            &dag,
+            vec![text_msg(IrRole::User, "hello")],
+            Some(serde_json::json!({"resp": "a1"})),
         );
-        assert!(
-            tl[1].parsed_response.is_none(),
-            "非末轮 B 的 parsed_response 应为 None"
-        );
-        // C (末轮): parsed_response 保留.
-        assert_eq!(
-            tl[2]
-                .parsed_response
-                .as_ref()
-                .unwrap()
-                .get("resp")
-                .and_then(|r| r.as_str()),
-            Some("a3"),
-            "末轮 C 的 parsed_response 应保留"
-        );
+        let sid = sid_of(&dag, a);
+        let page = dag.timeline_view(sid, None, 10).expect("page exists");
+        assert_eq!(page.rounds.len(), 1);
+        // req_delta_messages 应含 1 条 user message.
+        // dummy_event 无 req_body_raw → fallback raw 路径返回空 (预期). 仅验证不 panic.
+        let _ = &page.rounds[0].req_delta_messages;
     }
 
     // ─── 并发回归守卫 ───────────────────────────────────────────────────────

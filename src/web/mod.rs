@@ -3,14 +3,20 @@
 //! 路由策略 (由 [`crate::server::build_router`] 装配):
 //! - `GET /`             —— 单页 HTML (根路径主入口, 新).
 //! - `GET /__sg`         —— 同上 (保留旧入口, 向后兼容).
-//! - `GET /__sg/api/records[/{id}]`            —— 转发记录 API.
-//! - `GET /__sg/api/secrets`                   —— effective secret 列表.
-//! - `POST /__sg/api/secrets`                  —— 创建 dynamic secret.
-//! - `PUT /__sg/api/secrets/{id}`              —— 编辑 (static 自动 fork).
-//! - `DELETE /__sg/api/secrets/{id}`           —— 删除 (仅 dynamic).
-//! - `PATCH /__sg/api/secrets/{id}/decision`   —— 切换 OverrideMode.
+//! - `GET /__sg/api/records/{id}`            —— 单条 record raw/parsed view (弹窗用).
+//! - `GET /__sg/api/sessions`                —— 会话列表 (首次加载/无选中时).
+//! - `GET /__sg/api/sessions/{sid}/timeline` —— session-aware timeline 分页.
+//! - `POST /__sg/api/sync`                   —— 统一轮询 (sessions + rounds + timeline diff).
+//! - `GET /__sg/api/secrets`                 —— effective secret 列表.
+//! - `POST /__sg/api/secrets`                —— 创建 dynamic secret.
+//! - `PUT /__sg/api/secrets/{id}`            —— 编辑 (static 自动 fork).
+//! - `DELETE /__sg/api/secrets/{id}`         —— 删除 (仅 dynamic).
+//! - `PATCH /__sg/api/secrets/{id}/decision` —— 切换 OverrideMode.
 //! - `GET/POST/PUT/DELETE/PATCH /__sg/api/providers[/{id}[/decision]]` —— 同上.
 //! - `GET/POST/DELETE/PATCH /__sg/api/api-keys[/{id}[/toggle]]` —— API key CRUD (无条件挂载, 见 api.rs).
+//!
+//! 注: 旧的 `GET /api/records` (扁平分页) + `GET /api/nodes/{id}/timeline` (基于 node_id)
+//! 已删除, 由 session-aware sync API 替代.
 //!
 //! 注意: axum 0.8 的 `nest("/__sg", ...)` 默认匹配不带尾斜杠的 `/__sg`, 而不是 `/__sg/`.
 //! server.rs 中显式注册了 `/__sg/` -> `/__sg` 的 redirect (307, 临时), 保证两种 URL 都可用.
@@ -21,7 +27,7 @@ use axum::{
     Router,
     http::StatusCode,
     response::Html,
-    routing::{get, patch},
+    routing::{get, patch, post},
 };
 
 use crate::proxy::ProxyState;
@@ -38,10 +44,10 @@ pub async fn index_handler() -> Html<&'static str> {
 pub fn router() -> Router<ProxyState> {
     Router::new()
         .route("/", get(index_handler))
-        .route("/api/records", get(api::list_records))
         .route("/api/records/{id}", get(api::get_record))
         .route("/api/sessions", get(api::list_sessions))
-        .route("/api/nodes/{id}/timeline", get(api::get_timeline))
+        .route("/api/sessions/{sid}/timeline", get(api::session_timeline))
+        .route("/api/sync", post(api::sync))
         .route(
             "/api/secrets",
             get(api::list_secrets).post(api::create_secret),

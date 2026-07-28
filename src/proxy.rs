@@ -751,6 +751,8 @@ fn build_call_event(
         req_body_raw: req_text.to_string(),
         preview: preview.map(std::sync::Arc::<str>::from),
         model: model.map(std::sync::Arc::<str>::from),
+        // round_role 占位值 (User); DAG push_messages 内部会根据实际 delta 最后一条 message 的 role 修正.
+        round_role: crate::codec::ir::IrRole::User,
         redactions: std::sync::Arc::from(redactions),
     };
     // 视图正确性守卫: preview/model 是 req_body_raw (SSOT) 的派生视图, 每次派生都断言不变式.
@@ -1921,6 +1923,7 @@ mod tests {
             req_body_raw: String::new(),
             preview: None,
             model: None,
+            round_role: IrRole::User,
             redactions: Arc::from(Vec::new()),
         };
         let record_id = dag.push_messages(msgs, event);

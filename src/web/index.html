@@ -1033,7 +1033,7 @@
       <span><span id="count">0</span> <span id="count-label">sessions</span></span>
       <span id="status"></span>
       <label><input type="checkbox" id="auto" checked> auto-refresh (3s)</label>
-      <button class="refresh" onclick="refresh()">refresh</button>
+      <button class="refresh" onclick="sync()">refresh</button>
     </span>
   </header>
   <nav class="tabs">
@@ -1258,9 +1258,12 @@
 
   <script>
     // 集中管理 API URL.
-    const API_RECORDS = '/__sg/api/records';
-    const API_SESSIONS = '/__sg/api/sessions';
-    const API_NODES = '/__sg/api/nodes';
+    // 注: 旧的 GET /api/records (扁平分页) + GET /api/nodes/{id}/timeline 已删除,
+    // 由 session-aware 的 POST /api/sync + GET /api/sessions/{sid}/timeline 替代.
+    // /api/records/{id} 保留 (raw view 弹窗按需拉). /api/sessions 保留 (首次加载 sidebar).
+    const API_RECORDS = '/__sg/api/records';        // + '/{id}' 详情 (raw view 弹窗用)
+    const API_SESSIONS = '/__sg/api/sessions';      // + '/{sid}/timeline' 分页 + 列表
+    const API_SYNC = '/__sg/api/sync';              // POST 统一轮询 (sidebar + timeline diff)
     const API_SECRETS = '/__sg/api/secrets';
     const API_PROVIDERS = '/__sg/api/providers';
     const API_API_KEYS = '/__sg/api/api-keys';
@@ -1308,7 +1311,13 @@
       timelineOldest: null,
       timelineReachedTop: false,
       loadingOlder: false,
-      // 指纹缓存 (跳过重建 DOM 的优化).
+      // tail: 当前末轮的 response 抽屉数据 (视图级, 由 GET /sessions/{sid}/timeline
+      // 初始加载 + POST /api/sync 增量推送). 替代旧 RecordSummary 内嵌的 response 字段.
+      // 后端契约: 非末轮 response 已被下一轮 delta 的 assistant message 消费,
+      // 故 tail 只代表 "最新尚未被 delta 消费的 response".
+      tail: null,
+      // 指纹缓存 (跳过重建 DOM 的优化). timeline 仍用 fingerprint 做双重保险,
+      // 即便 sync 的 diff 协议已保证只有真变化才触发 renderTimeline.
       lastSidebarFingerprint: '',
       lastTimelineFingerprint: '',
       // 杂项 flag + RAF 句柄.
@@ -1337,7 +1346,8 @@
     //   state.sessionsTotal    — 当前维度的会话总数 (header count 显示).
     //   state.hitsTotal        — hits 维度的会话总数 (用于 filter 按钮).
     //   expandedSessions — Set<session_id>: 展开的会话 (持久到下次 renderSidebar).
-    //   sessionRounds    — Map<session_id, RecordSummary[]>: 展开会话内的轮次列表缓存.
+    //   sessionRounds    — Map<session_id, RoundBrief[]>: 展开会话内的轮次列表缓存
+    //                      (轻量: id / round_role / preview / created_at, 来自 POST /api/sync).
     //   state.selectedSession  — 当前选中会话的 session_id (null = 未选中).
     //   state.selectedRound    — 当前选中/高亮的轮次 node_id (null = 未定位到具体轮次).
     //   state.timelineRecords  — 当前右侧 timeline 渲染的轮次数组 (oldest-first).
@@ -1349,8 +1359,9 @@
     // 上述状态变量已统一收敛到顶层 `state` 对象 (见文件顶部), 此处仅保留不可变常量.
     const expandedSessions = new Set();
     const sessionRounds = new Map();
-    const TIMELINE_PAGE = 10;   // 惰性加载每页轮次数.
-    const ROUNDS_PAGE = 50;     // 展开会话时一次拉取的轮次数 (覆盖绝大多数会话).
+    const TIMELINE_PAGE = 10;   // 惰性加载每页轮次数 (loadTimeline + loadOlder).
+    // 注: 旧的 ROUNDS_PAGE (展开会话时一次拉取的轮次数) 已删除 — 新 sync API 的
+    // expanded rounds 由后端按 session 完整返回 (session_rounds 回溯全链), 无需前端分页.
 
     // ─── tabs ──────────────────────────────────────────────────────────────
     document.querySelectorAll('nav.tabs a.tab').forEach(tab => {
@@ -1373,87 +1384,118 @@
 
     // ─── records tab: 会话两级树 + timeline 惰性加载 ──────────────────────
     //
-    // 数据流:
-    // - refresh(): 拉 /api/sessions, 替换 state.sessionsList + 更新 totals. 客户端按
-    //   state.filterMode (all|hits) 过滤 hits = redactions.length > 0. 若 state.selectedSession
-    //   仍存在, 顺带刷新 timeline 最近 N 轮 (流式响应渐进更新).
+    // 数据流 (session-aware 新 API):
+    // - sync(): POST /api/sync, 一次请求拿到 sidebar (sessions + expanded rounds)
+    //   + timeline diff (仅 selected session). 替代旧的 refresh + refreshTimelineTail 双请求.
+    //   sidebar 一级 (sessions) + 三级 (expanded rounds) 全量替换; timeline 增量更新
+    //   (new_rounds 追加 + tail 替换).
     // - setFilter(mode): 纯客户端切换 (无需重拉); 重渲染 sidebar.
-    // - selectSession(sessionId): 展开/折叠会话头; 展开时拉 timeline(limit=ROUNDS_PAGE)
-    //   填充 sessionRounds, 同时 selectRound(leaf_id) 在右侧渲染 timeline.
+    // - toggleSession(sessionId): 展开/折叠会话头; 展开时全量加载 timeline
+    //   (GET /sessions/{sid}/timeline?limit=TIMELINE_PAGE), 同时该 sid 进入 expanded
+    //   列表, 下次 sync 自动回传其 round 详情.
     // - selectRound(nodeId): 在已渲染的 timeline 中定位 + 高亮 (滚动到该轮); 若该轮
-    //   不在当前 timeline 视窗内, 重新以该轮为锚拉 timeline(TIMELINE_PAGE).
-    // - loadOlder(): 滚到 timeline 顶部时, 以 state.timelineOldest 的 parent 为起点拉更早
-    //   TIMELINE_PAGE 轮, prepend 到 timeline (保持滚动锚点).
+    //   不在当前 timeline 视窗内, 重新以该会话最近 N 轮拉 timeline, 然后 highlight.
+    // - loadOlder(): 滚到 timeline 顶部时, 以 state.timelineOldest 为 before 游标
+    //   拉 GET /sessions/{sid}/timeline?before=X&limit=N, prepend 到 timeline (保持滚动锚点).
 
-    async function refresh() {
+    // 统一轮询: POST /api/sync 一次请求拿到 sidebar + timeline diff.
+    //
+    // 请求体: { selected: {session_id, latest_round, response_length} | null,
+    //          expanded: [sid, ...] }
+    // 响应体: { sessions: [...], rounds: {sid: [RoundBrief]}, timeline: {new_rounds, tail} | null }
+    //
+    // - sidebar 一级 (sessions) + 三级 (rounds) 全量替换.
+    // - timeline diff (仅 selected session): new_rounds 追加到末尾 + tail 始终替换
+    //   (后端按 length 判断是否变化, 前端直接更新抽屉即可).
+    // - selected = null (无选中) 时 timeline 为 null, 仅更新 sidebar.
+    async function sync() {
       try {
-        const resp = await fetch(API_SESSIONS, { cache: 'no-store' });
+        // 构造请求: selected 游标 + expanded 列表.
+        const body = {
+          selected: state.selectedSession ? {
+            session_id: state.selectedSession,
+            latest_round: state.timelineRecords.length > 0
+              ? state.timelineRecords[state.timelineRecords.length - 1].id
+              : null,
+            response_length: state.tail ? state.tail.length : 0,
+          } : null,
+          expanded: [...expandedSessions],
+        };
+        const resp = await fetch(API_SYNC, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          cache: 'no-store',
+        });
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
         const data = await resp.json();
+
+        // 1. sidebar 一级 (全量替换).
         state.sessionsList = data.sessions || [];
-        state.sessionsTotal = data.total || state.sessionsList.length;
+        state.sessionsTotal = state.sessionsList.length;
         // 客户端统计 hits 维度 (redactions.length > 0 的会话数).
         state.hitsTotal = state.sessionsList.filter(s => (s.redactions || []).length > 0).length;
         updateCountDisplay();
+
+        // 2. sidebar 三级 (全量替换每个 expanded 会话的 round 缓存).
+        const roundsChanged = [];
+        if (data.rounds) {
+          for (const [sid, rounds] of Object.entries(data.rounds)) {
+            sessionRounds.set(sid, rounds);
+            roundsChanged.push(sid);
+          }
+        }
         renderSidebar();
-        // 选中会话仍存在 → 刷新 timeline 最近几轮 (流式渐进更新).
-        if (state.selectedSession && state.sessionsList.some(s => s.session_id === state.selectedSession)) {
-          await refreshTimelineTail();
-        } else if (state.selectedSession) {
-          // 选中会话被淘汰 → 清空右侧.
+        // renderSidebar 有指纹短路 (sessions 字段未变时不重建 DOM, 也不触发 renderRounds).
+        // 故 rounds 更新后显式刷新每个 expanded 会话的三级菜单, 覆盖 "Loading rounds…" 占位.
+        for (const sid of roundsChanged) {
+          renderRounds(sid);
+        }
+
+        // 3. timeline diff (增量, 仅 selected session).
+        if (data.timeline) {
+          // 先更新 tail (renderTimeline 内部的 drawer layout 会读 state.tail).
+          state.tail = data.timeline.tail;
+          // new_rounds: latest_round 之后的新 round (可空). 追加 + reconcile.
+          let newCount = 0;
+          const wasFollow = state.timelineFollow;
+          if (data.timeline.new_rounds && data.timeline.new_rounds.length > 0) {
+            state.timelineRecords.push(...data.timeline.new_rounds);
+            newCount = data.timeline.new_rounds.length;
+            renderTimeline();  // reconcile 会 append 新 round + 刷 drawer (用已更新的 tail).
+            handleNewRounds(newCount, wasFollow);
+          } else {
+            // 仅 tail 变化 (response 增量): 刷抽屉内容 + 末轮 header.
+            renderDrawer();
+            updateLastRoundHeader();
+          }
+        }
+
+        // 选中会话被淘汰 (sessions 中已不存在) → 清空右侧 timeline.
+        if (state.selectedSession && !state.sessionsList.some(s => s.session_id === state.selectedSession)) {
           clearTimeline();
           renderSidebar();
         }
         setStatus('');
       } catch (e) {
         console.error(e);
-        setStatus('refresh failed', 'status-err');
+        setStatus('sync failed', 'status-err');
       }
     }
 
-    // 刷新当前 timeline 最近 N 轮 + 同步 sidebar 轮次缓存 (三级圆点实时更新).
-    // 单次 fetch (limit=ROUNDS_PAGE) 同时服务 timeline tail 和 sessionRounds,
-    // 避免重复请求 (S2 fix).
-    async function refreshTimelineTail() {
-      if (state.timelineRecords.length === 0) return;
-      const sess = state.sessionsList.find(s => s.session_id === state.selectedSession);
-      if (!sess) return;
-      const r = await fetch(`${API_NODES}/${sess.leaf_id}/timeline?limit=${ROUNDS_PAGE}`, { cache: 'no-store' });
-      if (!r.ok) return;
-      const data = await r.json();
-      const allRounds = data.records || [];
-      if (allRounds.length === 0) return;
-      // timeline tail: 用最近 TIMELINE_PAGE 条替换 (保持已加载的历史).
-      const tailRecords = allRounds.slice(-TIMELINE_PAGE);
-      const tailIds = new Set(tailRecords.map(x => x.id));
-      const kept = state.timelineRecords.filter(r => !tailIds.has(r.id));
-      // 追加前已有 id 集合 (用于识别真正新增的 round, 区别于流式增量更新).
-      const oldIds = new Set(state.timelineRecords.map(r => r.id));
-      // UI-6 状态机: 在 render 之前读取 follow 状态 (render 会改变 scrollHeight).
-      const wasFollow = state.timelineFollow;
-      state.timelineRecords = kept.concat(tailRecords);
-      state.timelineOldest = state.timelineRecords.length > 0 ? state.timelineRecords[0].id : null;
-      renderTimeline();
-      // 新 round 数: tailRecords 中 id 不在 oldIds 的 (追加到末尾的新轮次).
-      // 仅真正新 round 才走 follow/pinned 分支; 流式增量更新 (无新 id) 不动 scrollTop.
-      const newCount = tailRecords.filter(r => !oldIds.has(r.id)).length;
-      if (newCount > 0) {
-        if (wasFollow) {
-          // follow: 锁定底部 (滚动补偿). force 而非 smooth — 流式追加会连续触发,
-          // smooth 动画会与下一次追加竞争.
-          scrollTimelineToBottomForce();
-          state.unreadCount = 0;
-          updateUnreadBadge();
-        } else {
-          // pinned: 累加未读, 不滚动.
-          state.unreadCount += newCount;
-          updateUnreadBadge();
-        }
-      }
-      // sidebar: 用完整轮次列表更新 sessionRounds (仅展开时).
-      if (expandedSessions.has(state.selectedSession)) {
-        sessionRounds.set(state.selectedSession, allRounds);
-        renderRounds(state.selectedSession);
+    // follow/pinned 状态机的统一入口: 新 round 到达后, 按 followMode 分支处理.
+    // 替代旧 refreshTimelineTail 内联的 follow/pinned 逻辑 (语义不变).
+    //   - follow: 锁定底部 (force 滚动, smooth 会与下一次追加竞争) + 清零未读.
+    //   - pinned: 累加未读, 不滚动.
+    function handleNewRounds(count, wasFollow) {
+      if (count <= 0) return;
+      if (wasFollow) {
+        scrollTimelineToBottomForce();
+        state.unreadCount = 0;
+        updateUnreadBadge();
+      } else {
+        state.unreadCount += count;
+        updateUnreadBadge();
       }
     }
 
@@ -1556,39 +1598,22 @@
       }
     }
 
-    // 判断一个轮次是否是 "用户轮次" (req_delta 含 role=user 的 message).
-    // 用户轮次作为二级条目 (组首); 纯工具调用轮次 (assistant+tool_result, 无 user)
-    // 作为三级小圆点挂在最近一个组首下方.
-    function isUserRound(r) {
-      return (r.req_delta_messages || []).some(m => m.role === 'user');
-    }
+    // 注: 旧的 isUserRound() + toolNameOfRound() 已删除. 后端在 push 时预计算
+    // round_role (本轮最后一条 message 的 role) + preview (按 role 提取: user round
+    // = 最后一条 user msg 文本, tool round = tool name). 前端直接消费这两个字段,
+    // 不再在 req_delta_messages 上做 best-effort 推断 (单一职责 + DRY).
 
-    // 从工具调用轮次的 delta 中提取首个 tool name (用于圆点颜色 + tooltip).
-    // 来源: assistant.tool_calls[].function.name. 任一未命中则返回 '?'
-    // (tool message 本身不带 tool name, 不作来源).
-    function toolNameOfRound(r) {
-      for (const m of (r.req_delta_messages || [])) {
-        if (m.role === 'assistant' && Array.isArray(m.tool_calls)) {
-          for (const tc of m.tool_calls) {
-            const name = tc && tc.function && tc.function.name;
-            if (name) return name;
-          }
-        }
-      }
-      return '?';
-    }
-
-    // 展开后的二级轮次列表渲染 (从 sessionRounds 缓存, 若无则触发 fetch).
+    // 展开后的二级轮次列表渲染 (从 sessionRounds 缓存, 由 sync 填充).
     //
-    // 分组渲染: 用户轮次 (req_delta 含 user message) 作为组首 (.round-item),
-    // 紧随其后的工具调用轮次 (无 user, 只有 assistant+tool_result) 折叠为横向小圆点
-    // (.sub-rounds > .sub-dot), 颜色 = tool name 哈希. 圆点点击 = selectRound.
+    // 分组渲染: 用户轮次 (round_role === 'user') 作为组首 (.round-item),
+    // 紧随其后的工具调用轮次 (round_role !== 'user') 折叠为横向小圆点
+    // (.sub-rounds > .sub-dot), 颜色 = preview (tool name) 哈希. 圆点点击 = selectRound.
     function renderRounds(sessionId) {
       const wrap = document.querySelector(`.round-list[data-sid="${CSS.escape(sessionId)}"]`);
       if (!wrap) return;
       const rounds = sessionRounds.get(sessionId);
       if (!rounds) {
-        // 缓存未就绪 (仍在 fetch), 显示 loading.
+        // 缓存未就绪 (仍在 sync), 显示 loading.
         wrap.innerHTML = '<div class="empty" style="padding:8px;font-size:11px;">Loading rounds…</div>';
         return;
       }
@@ -1596,11 +1621,11 @@
         wrap.innerHTML = '<div class="empty" style="padding:8px;font-size:11px;">(empty)</div>';
         return;
       }
-      // 分组: 每个组 = [headRound, [toolRound...]]. headRound 是用户轮次 (或首个无 user
-      // 的孤儿轮次, 作为隐式组首). 工具轮次紧跟组首, 直到下一个用户轮次开启新组.
+      // 分组: 每个组 = [headRound, [toolRound...]]. headRound 是用户轮次 (或首个非 user
+      // 的孤儿轮次, 作为隐式组首). 非 user 轮次紧跟组首, 直到下一个 user 轮次开启新组.
       const groups = [];
       for (const r of rounds) {
-        if (groups.length === 0 || isUserRound(r)) {
+        if (groups.length === 0 || r.round_role === 'user') {
           groups.push({ head: r, tools: [] });
         } else {
           groups[groups.length - 1].tools.push(r);
@@ -1608,20 +1633,20 @@
       }
       wrap.innerHTML = groups.map(g => {
         const r = g.head;
-        const preview = r.preview || `${r.method} ${r.path}`;
-        const status = escapeHtml(statusText(r));
+        // RoundBrief 不含 method/path; fallback 到 '(no preview)'.
+        const preview = r.preview || '(no preview)';
         const isActive = r.id === state.selectedRound;
         const headHtml = `
           <div class="round-item ${isActive ? 'active' : ''}" data-sid="${escapeHtml(sessionId)}" data-rid="${escapeHtml(r.id)}">
             <span class="ri-line1" title="${escapeHtml(preview)}">${escapeHtml(preview)}</span>
             <span class="ri-right">
               <span class="meta">${escapeHtml(formatTime(r.created_at))}</span>
-              <span class="${statusClass(r)}">${status}</span>
             </span>
           </div>`;
         const dotsHtml = g.tools.length > 0
           ? `<div class="sub-rounds">${g.tools.map(t => {
-              const name = toolNameOfRound(t);
+              // preview 已按 role 预计算: 非 user round 的 preview = tool name.
+              const name = t.preview || '?';
               const color = providerColor(name);
               const dotActive = t.id === state.selectedRound ? ' active' : '';
               return `<span class="sub-dot${dotActive}" style="background:${color}" data-sid="${escapeHtml(sessionId)}" data-rid="${escapeHtml(t.id)}" title="${escapeHtml(name)} · ${escapeHtml(formatTime(t.created_at))}"></span>`;
@@ -1639,50 +1664,36 @@
     }
 
     // 会话头点击: 展开/折叠 + 选中.
+    //
+    // 展开 + 选中: 标记 expanded (下次 sync 自动回传该 sid 的 round 详情到 sidebar 三级),
+    // 然后全量加载 timeline (GET /sessions/{sid}/timeline?limit=TIMELINE_PAGE) 并滚到底.
+    // 不再先拉 sessionRounds 再 selectRound — sync 的 expanded rounds 会异步填充,
+    // timeline 全量加载是进入会话的主路径.
     async function toggleSession(sessionId) {
       if (expandedSessions.has(sessionId)) {
         // 折叠.
         expandedSessions.delete(sessionId);
+        sessionRounds.delete(sessionId);
         renderSidebar();
         return;
       }
-      // 展开 + 选中: 先标记展开, 再 fetch rounds (若缓存未命中), 最后选中叶子轮次.
+      // 展开 + 选中.
       expandedSessions.add(sessionId);
       state.selectedSession = sessionId;
-      // 当前 leaf_id (timeline 请求起点): 从 state.sessionsList 取该 session 的最新 leaf_id.
-      const sess = state.sessionsList.find(s => s.session_id === sessionId);
-      const leafId = sess ? sess.leaf_id : null;
-      if (!leafId) {
-        // session 已不在 list (极端时序), 回退.
-        renderSidebar();
-        return;
-      }
-      if (!sessionRounds.has(sessionId)) {
-        renderSidebar(); // 立即显示 expanded 态 (round-list 显示 loading).
-        try {
-          const r = await fetch(`${API_NODES}/${leafId}/timeline?limit=${ROUNDS_PAGE}`, { cache: 'no-store' });
-          if (r.ok) {
-            const data = await r.json();
-            sessionRounds.set(sessionId, data.records || []);
-          } else {
-            sessionRounds.set(sessionId, []);
-          }
-        } catch (e) {
-          console.error(e);
-          sessionRounds.set(sessionId, []);
-        }
-      }
-      renderSidebar();
-      // 选中叶子轮次 (在右侧渲染 timeline). scroll:'bottom' — 点会话条目的语义是
-      // "看最新消息" (IM 风格 → 滚到底), 由 tests/webui/im-ui.spec.ts "需求 4" 守卫.
-      await selectRound(leafId, { scroll: 'bottom' });
+      renderSidebar(); // 立即显示 expanded 状态 (round-list 显示 loading 直到 sync 回填).
+      // 首次进入: 全量加载 timeline. loadTimeline 内部会滚到底 (IM 风格) + 进入 follow.
+      // scroll:'bottom' 由 loadTimeline 末尾的 scrollTimelineToBottomForce 提供.
+      await loadTimeline(sessionId);
     }
 
     // 选中某一轮: 在右侧 timeline 中定位 + 高亮.
+    //
     // 三级优先 (避免不必要的网络请求):
     //   1. 该轮已在当前 timeline → 直接滚动 + 高亮 (零开销).
-    //   2. 该轮在 sessionRounds 缓存中 → 从缓存填充 timelineRecords + reconcile (无网络).
-    //   3. 都不在 → 以该轮为锚重新拉 timeline (网络请求), reconcile 复用公共节点.
+    //   2. 该轮在 sessionRounds 缓存中 (sidebar 三级展开) → 从缓存切片填充 timelineRecords
+    //      (RoundBrief 不含 req_delta_messages, 故仅作为定位锚; 仍需后续 sync 全量回填).
+    //   3. 都不在 → 重新加载整个 timeline (GET /sessions/{sid}/timeline, 取最近 N 条),
+    //      然后 highlightRound 定位.
     //
     // opts.scroll 滚动策略 (调用方语义决定):
     //   'highlight' (默认): highlightRound — 选中气泡下边缘对齐视口 70% (issue #36 规则1),
@@ -1702,22 +1713,18 @@
         applyScrollMode(scrollMode, nodeId);
         return;
       }
-      // 2. 在 sessionRounds 缓存中 → 从缓存填充 (避免网络请求).
-      if (state.selectedSession && sessionRounds.has(state.selectedSession)) {
-        const rounds = sessionRounds.get(state.selectedSession);
-        if (rounds.some(r => r.id === nodeId)) {
-          state.timelineRecords = rounds;
-          state.timelineOldest = rounds.length > 0 ? rounds[0].id : null;
-          state.timelineReachedTop = false;
-          renderTimeline();
-          applyScrollMode(scrollMode, nodeId);
-          return;
-        }
+      // 2./3. 不在 timeline → 重新加载该会话最近 N 条 (含末轮 tail), 然后 highlight.
+      // 注: 新 API 按 session + before 游标分页, 不支持 "以任意 round 为末轮" 的精确窗口
+      // (需要后端加 anchor 参数). 当前用 "最近 N 条" 的近似方案: 功能正确 (能定位到该轮),
+      // 但若该轮不在最近 N 条内 (历史久远), 会 fallback 到最近 N 条的末轮.
+      // TODO: 后端加 anchor 参数后可精确化 (GET /sessions/{sid}/timeline?anchor=X).
+      if (state.selectedSession) {
+        await loadTimeline(state.selectedSession);
       }
-      // 3. 都不在 → 重新拉 timeline (reconcile 会复用公共节点, 不全量刷新).
-      // loadTimeline 内部已调 scrollTimelineToBottomForce (与 scrollMode='bottom' 一致),
-      // 故此处无需再处理 scrollMode='highlight' 的特殊覆盖.
-      await loadTimeline(nodeId);
+      // loadTimeline 滚到底; 若调用方要 highlight 某具体轮 (非末轮), 再补一次 highlight.
+      if (scrollMode === 'highlight' && state.timelineRecords.some(r => r.id === nodeId)) {
+        highlightRound(nodeId);
+      }
     }
 
     // 应用 selectRound 的 scroll mode: bottom 路径强制进入 follow (清零 unread),
@@ -1760,7 +1767,9 @@
       const el = document.querySelector(`#detail .tl-round[data-rid="${CSS.escape(nodeId)}"]`);
       if (!el) return;
       // 先刷新抽屉内容 (选中轮改变 → response 跟着变).
-      updateResponseDrawerContent();
+      // 注: 抽屉始终展示末轮 (Phase A 决策); highlightRound 不改变抽屉内容来源,
+      // 仅触发一次渲染确保与当前 state.tail 同步.
+      renderDrawer();
       // 计算目标 scrollTop: 气泡下边缘对齐 30% 抽屉上边缘 (= wrapH - defaultH - GAP).
       // 落点 bubbleBottomY ≈ 0.7·wrapH 落在 Phase 2, 其 clamp 输出 = defaultH, 与目标一致.
       const detail = document.getElementById('detail');
@@ -1784,19 +1793,27 @@
       updateResponseDrawerLayout();
     }
 
-    // session 摘要的 status 辅助 (与 record 的 statusText/statusClass 类似但字段不同:
-    // 这里读 latest_error / latest_resp_status). 中断/错误区分逻辑见 isClientDisconnect.
+    // status → {text, class} 共用映射 (SessionView.latest_* 与 TimelineTail.* 共用).
+    // 调用方传 (resp_status, error); SessionView 把 latest_* 投影进来.
+    function statusTextOf(resp_status, error) {
+      if (error) return isClientDisconnect(error) ? 'ABRT' : 'ERR';
+      if (resp_status === 0) return '...';
+      return String(resp_status);
+    }
+    function statusClassOf(resp_status, error) {
+      if (error) return isClientDisconnect(error) ? 'status-aborted' : 'status-err';
+      if (resp_status === 0) return 'status-pending';
+      if (resp_status >= 200 && resp_status < 300) return 'status-ok';
+      if (resp_status >= 400) return 'status-err';
+      return 'status-pending';
+    }
+
+    // session 摘要 status (投影 latest_resp_status / latest_error 到共用映射).
     function sessionStatusText(s) {
-      if (s.latest_error) return isClientDisconnect(s.latest_error) ? 'ABRT' : 'ERR';
-      if (s.latest_resp_status === 0) return '...';
-      return String(s.latest_resp_status);
+      return statusTextOf(s.latest_resp_status, s.latest_error);
     }
     function sessionStatusClass(s) {
-      if (s.latest_error) return isClientDisconnect(s.latest_error) ? 'status-aborted' : 'status-err';
-      if (s.latest_resp_status === 0) return 'status-pending';
-      if (s.latest_resp_status >= 200 && s.latest_resp_status < 300) return 'status-ok';
-      if (s.latest_resp_status >= 400) return 'status-err';
-      return 'status-pending';
+      return statusClassOf(s.latest_resp_status, s.latest_error);
     }
 
     // ─── sidebar 渲染辅助 ──────────────────────────────────────────────────
@@ -1866,18 +1883,10 @@
       return errorStr === 'client disconnected';
     }
 
-    function statusClass(r) {
-      if (r.error) return isClientDisconnect(r.error) ? 'status-aborted' : 'status-err';
-      if (r.resp_status === 0) return 'status-pending';
-      if (r.resp_status >= 200 && r.resp_status < 300) return 'status-ok';
-      if (r.resp_status >= 400) return 'status-err';
-      return 'status-pending';
-    }
-    function statusText(r) {
-      if (r.error) return isClientDisconnect(r.error) ? 'ABRT' : 'ERR';
-      if (r.resp_status === 0) return '...';
-      return String(r.resp_status);
-    }
+    // 注: 旧的 statusClass(r) / statusText(r) (接收 RecordSummary) 已删除.
+    // 新 API 字段拆分: 末轮 status 从 TimelineTail 渲染 (tailStatusClass/tailStatusText),
+    // 会话级 status 从 SessionView 渲染 (sessionStatusClass/sessionStatusText).
+    // TimelineRound 不含 response 字段 (Phase A: 非末轮 response 已被下一轮 delta 消费).
     function formatTime(s) {
       return new Date(s).toLocaleTimeString();
     }
@@ -1903,12 +1912,15 @@
     //   2. 增量更新: 自动刷新时若 node 序列不变, 仅更新各轮 response-pane 的 .resp-body
     //      (流式渐进), 不触碰 request-pane (保留滚动 + 气泡展开状态).
 
-    // 以 nodeId 为最末轮, 拉 timeline(limit=TIMELINE_PAGE) 并全量渲染.
-    // 用于: 选中会话叶子 / 点击不在视窗内的轮次.
-    async function loadTimeline(nodeId) {
+    // 加载某会话的最近 N 条 timeline (全量渲染, oldest-first) + 末轮 tail.
+    // 用于: 首次进入会话 (toggleSession) / 选中不在视窗的轮次 (selectRound path 2/3).
+    //
+    // 新 API: GET /sessions/{sid}/timeline?limit=N (before 省略 = 从最新轮 leaf 起取 N 条).
+    // 返回 { rounds: TimelineRound[], tail: TimelineTail, has_more }.
+    async function loadTimeline(sid) {
       recordDetailCache.clear();  // 切换轮次时清空 (避免无界增长 + 旧数据残留)
       try {
-        const r = await fetch(`${API_NODES}/${nodeId}/timeline?limit=${TIMELINE_PAGE}`, { cache: 'no-store' });
+        const r = await fetch(`${API_SESSIONS}/${sid}/timeline?limit=${TIMELINE_PAGE}`, { cache: 'no-store' });
         if (!r.ok) {
           if (r.status === 404) {
             clearTimeline();
@@ -1918,15 +1930,16 @@
           return;
         }
         const data = await r.json();
-        state.timelineRecords = data.records || [];
+        state.timelineRecords = data.rounds || [];
+        state.tail = data.tail || null;
         state.timelineOldest = state.timelineRecords.length > 0 ? state.timelineRecords[0].id : null;
-        // 不在初次加载时推断 reachedTop: reachedTop 的语义是 "用户滚顶探测后确认到顶",
-        // 不是 "当前窗口少于 limit". 短会话首屏即显示 "已经到顶了" 是误导 (Bug).
-        // 只有 loadOlder 实际探测 parent 链耗尽后才置 true.
-        state.timelineReachedTop = false;
+        // has_more=false → 已到顶; has_more=true → 可能还有更老的 (loadOlder 时探测).
+        // 注: 仅在用户实际滚顶触发 loadOlder 后才确认到顶, 避免短会话首屏误导.
+        state.timelineReachedTop = !data.has_more;
         renderTimeline();
+        renderDrawer();
         // 选中会话叶子 → 滚到最末轮 (最新, IM 风格) + 进入 follow (UI-6).
-        // 注: selectRound 入口已把 selectedRound 设为 leafId (= 最新轮), 此处不重置.
+        // 注: selectRound 入口已把 selectedRound 设为目标 id; loadTimeline 不重置它.
         scrollTimelineToBottomForce();
         syncFollowMode();
       } catch (e) {
@@ -1944,6 +1957,7 @@
       state.timelineReachedTop = false;
       state.selectedSession = null;
       state.selectedRound = null;
+      state.tail = null;
       state.lastTimelineFingerprint = '';
       // UI-6: 重置 follow 状态机 (初始视为 follow, 等下次 loadTimeline 的 scrollToBottom 收敛).
       state.timelineFollow = true;
@@ -1960,6 +1974,7 @@
     }
 
     // 惰性加载: 向上滚到顶时 prepend 更早的轮次. 保持滚动锚点.
+    // 新 API: GET /sessions/{sid}/timeline?before=X&limit=N (取 X 之前更老的 N 条, 不含 X).
     async function loadOlder() {
       if (state.loadingOlder || state.timelineReachedTop || !state.timelineOldest) return;
       state.loadingOlder = true;
@@ -1967,20 +1982,18 @@
       const oldScrollHeight = pane ? pane.scrollHeight : 0;
       const oldScrollTop = pane ? pane.scrollTop : 0;
       try {
-        // 以 state.timelineOldest 为最末, 拉 TIMELINE_PAGE 轮. 返回 oldest-first, 最后一个是当前 oldest.
-        // 我们要 prepend 排除当前 oldest 的前 (limit-1) 条.
-        const r = await fetch(`${API_NODES}/${state.timelineOldest}/timeline?limit=${TIMELINE_PAGE + 1}`, { cache: 'no-store' });
+        const sid = state.selectedSession;
+        const r = await fetch(
+          `${API_SESSIONS}/${sid}/timeline?before=${state.timelineOldest}&limit=${TIMELINE_PAGE}`,
+          { cache: 'no-store' },
+        );
         if (!r.ok) {
           state.timelineReachedTop = true;
           return;
         }
         const data = await r.json();
-        const all = data.records || [];
-        // 去掉最后一个 (== 当前 state.timelineOldest, 已在视窗内), 保留前面的作为 prepend.
-        const older = all.slice(0, Math.max(0, all.length - 1));
-        // reachedTop 从响应长度推导: 请求 limit+1 条但返回 ≤ limit 条 → parent 链已耗尽.
-        // (注意即使 older 为空, 也用 all.length <= TIMELINE_PAGE 判断, 避免 limit=1 的边界).
-        state.timelineReachedTop = all.length <= TIMELINE_PAGE;
+        state.timelineReachedTop = !data.has_more;
+        const older = data.rounds || [];
         if (older.length === 0) {
           return;
         }
@@ -2017,7 +2030,8 @@
     // 为什么 keyed reconciliation 安全 (不更新已有轮次的 request-pane DOM):
     //   .tl-round 的 request-pane 内容 (req_delta_messages / redactions 等) 在 push 时
     //   确定后不可变. header 里的 response 相关字段 (status/elapsed/streamed) 可变
-    //   (push 时为初始值, response 到达后更新), 由 updateRoundHeaders() 定点刷新.
+    //   (末轮从 state.tail 渲染), 由 updateLastRoundHeader() 定点刷新末轮.
+    //   非末轮 header 的这些字段保持空 (TimelineRound 不含 response 字段).
     //   末轮 response 在独立的 .response-drawer 中, 不在 .tl-round 内.
     function renderTimeline() {
       const el = document.getElementById('detail');
@@ -2030,7 +2044,7 @@
       const fp = state.selectedRound + '|' + state.timelineReachedTop + '|' +
         state.timelineRecords.map(r => r.id).join(',');
       if (fp === state.lastTimelineFingerprint) {
-        // 策略 1: fingerprint 一致 → 只刷 response body (流式渐进).
+        // 策略 1: fingerprint 一致 → 只刷 response body (流式渐进) + 末轮 header.
         updateTimelineResponses();
         return;
       }
@@ -2040,8 +2054,9 @@
       reconcileTimelineRounds(el);
       bindTimelineScroll();
       bindRoundActions();
-      // 填充 Response 抽屉内容 + 计算布局.
-      updateResponseDrawerContent();
+      // 填充 Response 抽屉内容 + 末轮 header + 计算布局.
+      renderDrawer();
+      updateLastRoundHeader();
       updateResponseDrawerLayout();
       updateScrollNavVisibility();
     }
@@ -2121,8 +2136,8 @@
         if (!reused.has(rid)) el.remove();
       }
 
-      // header 更新 (round count + user count).
-      const userCount = state.timelineRecords.filter(isUserRound).length;
+      // header 更新 (round count + user count). user count 用 round_role 判定 (后端预计算).
+      const userCount = state.timelineRecords.filter(r => r.round_role === 'user').length;
       header.textContent = `Timeline (${state.timelineRecords.length} rounds${userCount > 0 ? `, ${userCount} user` : ''})`;
       // placeholder 高度由 updateResponseDrawerLayout 设置.
     }
@@ -2268,29 +2283,52 @@
       }
     }
 
-    // 打开 info 弹窗: 传输层元数据 (RecordSummary 字段, 无需网络请求).
-    function openRoundInfo(id) {
+    // 打开 info 弹窗: 传输层元数据.
+    //
+    // 字段来源:
+    // - TimelineRound (本地): id / round_role / created_at / redactions.
+    // - state.tail (末轮视图, 仅当该 round 是末轮时可用): resp_status / elapsed_ms /
+    //   streamed / resp_complete / error. 非末轮显示 "(history round)" — Phase A 决策:
+    //   history round 的 response 已被下一轮 delta 消费, 不显示 ForwardRecord 的值避免误导.
+    // - GET /api/records/{id} (异步懒拉): method / path / model.
+    //
+    // 即时渲染本地字段 → 异步拉 detail 补全 (renderRows upsert by label).
+    async function openRoundInfo(id) {
       const r = findRound(id);
       if (!r) return;
       const redactionN = (r.redactions || []).length;
-      const rows = [
-        ['Round ID', r.id],
-        ['Session', r.session_id || '(unknown)'],
-        ['Time', r.created_at],
-        ['Method', r.method],
-        ['Path', r.path],
-        ['Status', r.resp_status === 0 ? '(pending)' : String(r.resp_status)],
-        ['Elapsed', r.elapsed_ms != null ? `${r.elapsed_ms} ms` : '(pending)'],
-        ['Streamed', r.streamed ? 'yes' : 'no'],
-        ['Complete', r.resp_complete ? 'yes' : 'no'],
-        ['Model', r.model || '(unknown)'],
-        ['Error', r.error || '(none)'],
-        ['Redactions', redactionN > 0 ? `${redactionN} hit(s)` : 'none'],
-      ];
-      const bodyHtml = `<table class="info-table">${rows.map(([k, v]) =>
+      // 末轮 tail 字段: 仅当 id 是末轮时取 state.tail (round_id 匹配).
+      const isLastRound = state.timelineRecords.length > 0
+        && state.timelineRecords[state.timelineRecords.length - 1].id === id;
+      const t = isLastRound ? state.tail : null;
+      const HIST = '(history round)';
+      let rows = {
+        'Round ID': r.id,
+        'Role': r.round_role || '(unknown)',
+        'Time': r.created_at,
+        'Method': '(loading…)',
+        'Path': '(loading…)',
+        'Status': t ? (t.resp_status === 0 ? '(pending)' : String(t.resp_status)) : HIST,
+        'Elapsed': t ? `${t.elapsed_ms} ms` : HIST,
+        'Streamed': t ? (t.streamed ? 'yes' : 'no') : HIST,
+        'Complete': t ? (t.resp_complete ? 'yes' : 'no') : HIST,
+        'Model': '(loading…)',
+        'Error': t?.error || '(none)',
+        'Redactions': redactionN > 0 ? `${redactionN} hit(s)` : 'none',
+      };
+      const renderRows = () => `<table class="info-table">${Object.entries(rows).map(([k, v]) =>
         `<tr><td class="info-key">${escapeHtml(k)}</td><td class="info-val">${escapeHtml(v)}</td></tr>`
       ).join('')}</table>`;
-      openRoundDialog('传输层信息', bodyHtml, id);
+      openRoundDialog('传输层信息', renderRows(), id);
+      // 异步补全 method/path/model (ForwardRecord 字段, 不在 TimelineRound 中).
+      const rec = await fetchRecordDetail(id);
+      const dlg = document.getElementById('round-dialog');
+      if (!dlg || dlg.dataset.rid !== id) return;  // 用户已切换/关闭.
+      if (!rec) return;  // 加载失败保留现有信息.
+      rows['Method'] = rec.method || '(unknown)';
+      rows['Path'] = rec.path || '(unknown)';
+      rows['Model'] = rec.model || '(unknown)';
+      dlg.querySelector('.dialog-body').innerHTML = renderRows();
     }
 
     // 打开 raw view 弹窗: 按需懒拉 ForwardRecord, 展示 req_body / resp_body / headers.
@@ -2348,7 +2386,7 @@
     // 注意: 悬浮导航按钮 (.scroll-nav) 不在此处渲染 — 它是 #detail-wrap 的固定子元素
     // (article 的直接子, #detail 的兄弟), 不随 #detail 内容滚动 (issue #36).
     function renderTimelineHtml() {
-      const userCount = state.timelineRecords.filter(isUserRound).length;
+      const userCount = state.timelineRecords.filter(r => r.round_role === 'user').length;
       let html = `<div class="detail-header">
         Timeline (${state.timelineRecords.length} rounds${userCount > 0 ? `, ${userCount} user` : ''})
       </div>`;
@@ -2363,21 +2401,29 @@
     //
     // 每轮渲染完整 delta (含 assistant, 作为无源气泡).
     // Response 不再内嵌在轮次里 — 它由独立的 .response-drawer (issue #36) 展示,
-    // 抽屉跟随选中气泡动态调整高度. 见 updateResponseDrawer().
+    // 抽屉跟随选中气泡动态调整高度. 见 renderDrawer().
+    //
+    // 字段来源 (新 API):
+    // - TimelineRound: id / round_role / preview / created_at / redactions / req_delta_messages.
+    // - status / elapsed / streamed 等 response 字段**不在** TimelineRound 中
+    //   (后端 Phase A 决策: 非末轮 response 已被下一轮 delta 消费, 无需重复传输).
+    //   这些字段仅末轮从 state.tail (TimelineTail) 渲染, 由 updateLastRoundHeader()
+    //   定点刷新末轮 header 的 [data-hdr] span. 非末轮 header 的这些 span 保持占位
+    //   (空文本), 反映 "数据不可用" 的事实.
     function renderTimelineRound(r, idx) {
       const num = idx + 1;
       // 选中态用 .selected (持续高亮); 闪烁动画 .flash 由 highlightRound() 在选中瞬间叠加.
       const roundCls = (r.id === state.selectedRound) ? 'tl-round selected' : 'tl-round';
       let inner = '';
-      // header. status / elapsed / streamed 是 response 到达后才确定的字段,
-      // 用 data-hdr 标记, 供 updateRoundHeaders() 在增量更新时定点刷新 (非全量重建).
+      // header. 占位的 status/elapsed/streamed span 用 data-hdr 标记,
+      // 供 updateLastRoundHeader() 在末轮从 state.tail 定点刷新.
       inner += `<div class="tl-round-header">
         <span class="tl-meta">
           <span>#${num}</span>
           <span>${escapeHtml(formatTime(r.created_at))}</span>
-          <span class="${statusClass(r)}" data-hdr="status">${escapeHtml(statusText(r))}</span>
-          <span class="meta" data-hdr="elapsed">${r.elapsed_ms}ms</span>
-          ${r.streamed ? '<span class="badge badge-stream" data-hdr="streamed">streamed</span>' : '<span data-hdr="streamed"></span>'}
+          <span data-hdr="status"></span>
+          <span class="meta" data-hdr="elapsed"></span>
+          <span data-hdr="streamed"></span>
         </span>
         <span class="tl-actions">
           <button type="button" data-action="info" data-rid="${escapeHtml(r.id)}" title="传输层信息">ℹ</button>
@@ -2392,34 +2438,62 @@
       return `<div class="${roundCls}" data-rid="${escapeHtml(r.id)}">${inner}</div>`;
     }
 
-    // 增量更新所有 .tl-round 的 header 中 response 相关字段 (status / elapsed / streamed).
-    // 这些字段 push 时为初始值 (resp_status=0, elapsed_ms=0, streamed=false), response 到达后才更新.
-    // 全量重建时 renderTimelineRound 自然刷新; 增量路径 (策略1/2) 不重建 DOM, 需此函数定点刷新.
-    function updateRoundHeaders() {
-      const rounds = document.querySelectorAll('#detail > .tl-round');
-      rounds.forEach(el => {
-        const r = state.timelineRecords.find(x => x.id === el.dataset.rid);
-        if (!r) return;
+    // 增量更新末轮 header 中 response 相关字段 (status / elapsed / streamed),
+    // 同时清空非末轮 header 的这些字段 (避免历史轮次残留旧 tail 的 "streaming" 文本).
+    //
+    // 新 API 字段来源: response 字段仅末轮从 state.tail (TimelineTail) 渲染.
+    // 非末轮 header 的 [data-hdr] span 保持空 (TimelineRound 不含 response 字段,
+    // 后端 Phase A 决策: 非末轮 response 已被下一轮 delta 消费).
+    //
+    // 全量重建时 renderTimelineRound 渲染空占位 span; sync 的 tail 更新到达后,
+    // 此函数从 state.tail 定点刷新末轮 header.
+    function updateLastRoundHeader() {
+      const allRounds = document.querySelectorAll('#detail > .tl-round');
+      const lastRound = state.timelineRecords[state.timelineRecords.length - 1];
+      const lastId = lastRound?.id || null;
+      // 先清空所有轮次的 header 字段 (消除 "曾经的末轮" 残留).
+      allRounds.forEach(el => {
+        if (el.dataset.rid === lastId) return;  // 末轮单独处理.
         const status = el.querySelector('[data-hdr="status"]');
-        if (status) {
-          status.className = statusClass(r);
-          status.textContent = statusText(r);
-        }
+        if (status) { status.className = ''; status.textContent = ''; }
         const elapsed = el.querySelector('[data-hdr="elapsed"]');
-        if (elapsed) elapsed.textContent = `${r.elapsed_ms}ms`;
+        if (elapsed) elapsed.textContent = '';
         const streamed = el.querySelector('[data-hdr="streamed"]');
-        if (streamed) {
-          const shouldHave = r.streamed;
-          const hasBadge = streamed.classList.contains('badge-stream');
-          if (shouldHave && !hasBadge) {
-            streamed.className = 'badge badge-stream';
-            streamed.textContent = 'streamed';
-          } else if (!shouldHave && hasBadge) {
-            streamed.className = '';
-            streamed.textContent = '';
-          }
-        }
+        if (streamed) { streamed.className = ''; streamed.textContent = ''; }
       });
+      if (!state.tail || !lastRound) return;
+      // tail.round_id 应与末轮 id 一致 (同一快照采集); 不一致时跳过 (状态漂移, 下次 sync 修正).
+      if (state.tail.round_id !== lastRound.id) return;
+      const el = document.querySelector(`#detail .tl-round[data-rid="${CSS.escape(lastRound.id)}"]`);
+      if (!el) return;
+      const status = el.querySelector('[data-hdr="status"]');
+      if (status) {
+        status.className = tailStatusClass(state.tail);
+        status.textContent = tailStatusText(state.tail);
+      }
+      const elapsed = el.querySelector('[data-hdr="elapsed"]');
+      if (elapsed) elapsed.textContent = `${state.tail.elapsed_ms}ms`;
+      const streamed = el.querySelector('[data-hdr="streamed"]');
+      if (streamed) {
+        const shouldHave = state.tail.streamed;
+        const hasBadge = streamed.classList.contains('badge-stream');
+        if (shouldHave && !hasBadge) {
+          streamed.className = 'badge badge-stream';
+          streamed.textContent = 'streamed';
+        } else if (!shouldHave && hasBadge) {
+          streamed.className = '';
+          streamed.textContent = '';
+        }
+      }
+    }
+
+    // tail status 辅助: TimelineTail 直接复用 statusClassOf/statusTextOf
+    // (与 SessionView.latest_* 同源, 字段名不同但语义一致).
+    function tailStatusClass(t) {
+      return t ? statusClassOf(t.resp_status, t.error) : '';
+    }
+    function tailStatusText(t) {
+      return t ? statusTextOf(t.resp_status, t.error) : '';
     }
 
     // 渲染本轮 request delta 的所有 messages 为独立气泡 (含 assistant).
@@ -2430,9 +2504,10 @@
     //   text 一个气泡 + 每个 tool_call 各自气泡 (tool_call 是独立语义动作).
     //
     // fallback: 若 req_delta_messages 为空, 用 preview 渲染单个 user 气泡.
+    // (新 API: TimelineRound 不含 method/path, fallback 仅用 preview.)
     function renderRequestDelta(r, redactions) {
       const deltas = r.req_delta_messages || [];
-      const fallback = () => renderBubble('user', r.preview || `${r.method} ${r.path}`, redactions, 'user');
+      const fallback = () => renderBubble('user', r.preview || '(no content)', redactions, 'user');
       if (deltas.length === 0) return fallback();
       let html = '';
       for (const msg of deltas) {
@@ -2441,16 +2516,26 @@
       return html || fallback();
     }
 
-    // 渲染单轮 response body (parsed view).
-    // RecordSummary 直接携带 parsed_response (NodeView 派生), 无需 envelope.
-    function renderTimelineResponseBody(r) {
-      const respJson = r.parsed_response || null;
-      const redactions = normalizeRedactions(r.redactions);
+    // 渲染末轮 response body (parsed view), 从 state.tail (TimelineTail) 取数据.
+    // 替代旧 renderTimelineResponseBody (从 RecordSummary 取).
+    //
+    // 新 API: tail.parsed = 末轮 response 的 parsed view (LLM 视角, 含 mock).
+    // tail.streamed / resp_complete / error 决定 banner 提示.
+    // redactions 取末轮 TimelineRound 的 redactions (tail 不重复携带).
+    function renderTailBody() {
+      const t = state.tail;
+      if (!t) return '<empty>';
+      // 末轮 redactions (mock 高亮用): 从 timelineRecords 末轮取.
+      const lastRound = state.timelineRecords[state.timelineRecords.length - 1];
+      const redactions = lastRound ? normalizeRedactions(lastRound.redactions) : [];
+      const respJson = t.parsed || null;
       if (respJson) {
         return renderResponseText(respJson, redactions);
-      } else if (r.streamed && !r.resp_complete) {
+      } else if (t.error) {
+        return `<div class="banner status-err">Error: ${escapeHtml(t.error)}</div>`;
+      } else if (t.streamed && !t.resp_complete) {
         return '<div class="banner">Streaming in progress…</div>';
-      } else if (r.streamed) {
+      } else if (t.streamed) {
         return '<div class="banner">Parsed view not available for this streamed response.</div>';
       }
       return '<empty>';
@@ -2458,14 +2543,15 @@
 
     // ─── Response 抽屉 (issue #36) ──────────────────────────────────────────
     //
-    // 抽屉展示「当前选中轮次」的 response. 其上边缘跟随选中气泡的下边缘,
+    // 抽屉展示「末轮的 response」(Phase A 决策: 非末轮 response 已被下一轮 delta 消费,
+    // 故抽屉始终展示最新尚未被消费的 response). 其上边缘跟随选中气泡的下边缘,
     // 高度随选中气泡在 wrap 坐标系中的位置 + 滚动状态动态调整 (10%~80%).
     //
     // 逻辑分两步:
-    //   1. updateResponseDrawerContent(): 填充抽屉内容 (选中轮次的 response).
+    //   1. renderDrawer(): 填充抽屉内容 (末轮的 response, 从 state.tail 渲染).
     //   2. updateResponseDrawerLayout():  计算抽屉的 height (跟随选中气泡).
     //
-    // 触发时机: renderTimeline (全量重建) / scroll / selectRound / window resize.
+    // 触发时机: renderTimeline (全量重建) / sync (tail 更新) / scroll / selectRound / window resize.
 
     // 返回选中轮最后一条气泡下边缘的视口 y; 无选中轮 / 不在 DOM / 无气泡时返回 null.
     // (highlightRound 和 updateResponseDrawerLayout 共用, 保证两处位置判断一致.)
@@ -2478,25 +2564,25 @@
       return bubbles.length ? bubbles[bubbles.length - 1].getBoundingClientRect().bottom : null;
     }
 
-    // 填充抽屉内容: 展示末轮的 response.
-    // 后端 timeline 只在末轮保留 parsed_response (issue #28 Phase A: 非末轮 response
-    // 已被下一轮 delta 的 assistant message 包含, 传输冗余). 因此抽屉始终展示末轮
-    // (尚未被任何 delta 消费的部分). 选中轮用于高亮 + 布局跟随, 不改变抽屉内容来源.
-    function updateResponseDrawerContent() {
+    // 填充抽屉内容: 展示末轮的 response (从 state.tail 渲染).
+    //
+    // 后端 tail 只代表 "最新尚未被任何 delta 消费的 response" (Phase A 决策).
+    // 非末轮 response 已被下一轮 delta 的 assistant message 包含, 在 request-pane 渲染.
+    // 抽屉始终展示末轮; 选中轮用于高亮 + 布局跟随, 不改变抽屉内容来源.
+    function renderDrawer() {
       const drawer = document.getElementById('response-drawer');
       if (!drawer) return;
-      if (state.timelineRecords.length === 0) {
+      if (!state.tail || state.timelineRecords.length === 0) {
         drawer.hidden = true;
         return;
       }
-      const target = state.timelineRecords[state.timelineRecords.length - 1];
       drawer.hidden = false;
-      drawer.dataset.rid = target.id;
+      drawer.dataset.rid = state.tail.round_id;
       const bodyEl = drawer.querySelector('.resp-body');
-      const newBody = renderTimelineResponseBody(target);
+      const newBody = renderTailBody();
       if (bodyEl && bodyEl.innerHTML !== newBody) bodyEl.innerHTML = newBody;
       const statusEl = drawer.querySelector('.resp-status');
-      if (statusEl) statusEl.innerHTML = renderStatusLine(target);
+      if (statusEl) statusEl.innerHTML = renderTailStatusLine(state.tail);
     }
 
     // 计算抽屉的 height (overlay 架构).
@@ -2616,10 +2702,10 @@
     }
 
     // 增量更新: 自动刷新时若 node 序列不变, 只刷抽屉内容 (流式渐进) + 重新计算布局.
-    // 同时刷新所有轮次 header 的 response 相关字段 (status/elapsed/streamed).
+    // 同时刷新末轮 header 的 response 相关字段 (status/elapsed/streamed, 从 state.tail).
     function updateTimelineResponses() {
-      updateRoundHeaders();
-      updateResponseDrawerContent();
+      updateLastRoundHeader();
+      renderDrawer();
       updateResponseDrawerLayout();
       updateScrollNavVisibility();
     }
@@ -2685,9 +2771,13 @@
 
     // ─── detail 渲染辅助 (被 timeline 复用) ────────────────────────────────
 
-    // status 行模板 (SSOT).
-    function renderStatusLine(r) {
-      return `status: <span class="${statusClass(r)}">${r.resp_status === 0 ? '(pending)' : escapeHtml(r.resp_status)}</span> · ${escapeHtml(r.elapsed_ms)}ms`;
+    // tail status 行模板 (抽屉用, SSOT).
+    // 替代旧 renderStatusLine (接收 RecordSummary); 新 API 抽屉从 TimelineTail 渲染.
+    function renderTailStatusLine(t) {
+      if (!t) return '';
+      const cls = tailStatusClass(t);
+      const txt = t.resp_status === 0 ? '(pending)' : escapeHtml(t.resp_status);
+      return `status: <span class="${cls}">${txt}</span> · ${escapeHtml(t.elapsed_ms)}ms`;
     }
 
     // redactions 数组归一化: 后端返回 [[mock, secret_id], ...], 前端统一转为
@@ -3587,14 +3677,15 @@
     }
 
     // ─── bootstrap ────────────────────────────────────────────────────────
-    refresh();
+    // 初始加载: 首次 sync 拉 sidebar (无 selected → timeline 为 null).
+    sync();
     setInterval(() => {
       if (document.getElementById('auto').checked) {
         const active = document.querySelector('.tab-content.active')?.id;
         if (active === 'tab-secrets') refreshSecrets();
         else if (active === 'tab-providers') refreshProviders();
         else if (active === 'tab-apikeys') refreshApiKeys();
-        else refresh();
+        else sync();
       }
     }, 3000);
     // 窗口尺寸变化时重算 Response 抽屉布局 (高度依赖视口尺寸) (issue #36).

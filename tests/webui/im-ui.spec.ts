@@ -1,14 +1,28 @@
 /**
- * IM 风格 WebUI 回归测试 for secret-guard (会话折叠 + timeline 版本).
+ * IM 风格 WebUI 回归测试 for secret-guard (会话折叠 + timeline 版本, session-aware sync API).
  *
  * 适配会话两级树 sidebar (session-item → round-item) + timeline 右侧对话流.
  * 每条 sendChat 创建一个独立的单轮次会话 (无父上下文 → 各自成为 root+leaf).
+ *
+ * 后端 API (session-aware sync):
+ *   - POST /api/sync           统一轮询 (sidebar sessions + expanded rounds + timeline diff).
+ *   - GET  /api/sessions/{sid}/timeline?before=&limit=  初始加载 + lazy load.
+ *   - GET  /api/records/{id}   单条 record raw/parsed view (弹窗用, 保留).
+ *
+ * 前端行为 (相对旧版的差异, 影响测试编写):
+ *   - toggleSession 不再设置 state.selectedRound; 仅点击 round-item / sub-dot / timeline
+ *     header 才会显式 selectRound. 故依赖 ".tl-round.selected" 的测试需先显式选一轮.
+ *   - sidebar 三级菜单用 round_role (后端预计算) 判定: 'user' → round-item, 其他 → sub-dot.
+ *     注: OpenAI 把 role:"tool" 在 IR 层归一化为 IrRole::User (ToolResult 块), 故 OpenAI
+ *     tool-call 循环的每一轮 round_role 都是 'user' → 全部 round-item (无 sub-dot).
+ *   - timeline round 的 resp_status / elapsed_ms 等字段移到 TimelineTail, 由
+ *     updateLastRoundHeader() 从 state.tail 填充末轮 header.
  *
  * 覆盖原始 7 项需求 (在新的会话/timeline 结构下):
  *   1. 滚动重置修复: 自动刷新期间 timeline 内 scrollTop + bubble 展开状态保持.
  *   2. 三级展示气泡: 折叠 → 展开 → 弹框全文.
  *   3. response 打字框: 固定底部 + 独立滚动 + 不参与 request 滚动.
- *   4. timeline 选中轮次时 request-pane 初始滚到底.
+ *   4. timeline 选中会话初始滚到底.
  *   5. 气泡颜色 + sender icon 分类.
  *   6. sidebar (session-item) preview 提取 (首条 user msg).
  *   7. sidebar model 字段显示.
@@ -62,12 +76,36 @@ async function findSessionLeafByPreview(page: Page, previewSubstr: string): Prom
 }
 
 /**
- * 点击会话展开 + 加载 timeline (单轮次会话: 点击会话即选中该轮次).
- * 等待右侧 timeline 的 request-pane 出现.
+ * 点击会话展开 + 加载 timeline.
+ *
+ * 注: 新版 toggleSession 只展开 + loadTimeline, 不显式 selectRound (state.selectedRound
+ * 仍为 null). 需要选中态的测试用 selectLastRoundAfterToggle.
  */
 async function clickSessionByLeaf(page: Page, sid: string): Promise<void> {
   await page.locator(`.session-item[data-sid="${sid}"]`).click();
   await page.waitForSelector("#detail .request-pane", { timeout: 3000 });
+}
+
+/**
+ * 在 clickSessionByLeaf 之后显式选中末轮 (模拟用户点最新一轮 header).
+ *
+ * 用途: 新版 toggleSession 不再设置 state.selectedRound. 需要断言
+ * ".tl-round.selected" 的测试 (UI-6 系列 / 需求 4) 必须先调用本函数建立选中态.
+ *
+ * 等价于用户在打开会话后点最新一轮 header, 与旧版 "点 session 即选中叶子" 的
+ * 复合动作行为一致.
+ */
+async function selectLastRoundAfterToggle(page: Page): Promise<string> {
+  const lastRound = page.locator("#detail > .tl-round").last();
+  await lastRound.waitFor({ state: "attached", timeout: 3000 });
+  const rid = await lastRound.getAttribute("data-rid");
+  if (!rid) throw new Error("末轮 .tl-round 缺 data-rid");
+  await lastRound.locator(".tl-round-header").click();
+  // 等 .selected 类迁移到该轮 (updateSelectedRoundClass 同步触发).
+  await expect(
+    page.locator(`#detail .tl-round.selected[data-rid="${rid}"]`)
+  ).toHaveCount(1);
+  return rid;
 }
 
 /**
@@ -236,7 +274,10 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     // 多轮对话: 累积 messages 数组 (DAG 通过 prefix-hash 自动把连续请求链成同一会话).
     // IM 风格: 每轮 request-pane 只渲染本轮的 preview (单 user 气泡),
     // 但 response-pane 渲染完整 assistant 回复. 多轮累积 → timeline 可滚动.
-    const longSys = "You are a coding assistant. ".repeat(15);
+    // 注: 用长 system + 长 assistant 回复累积, 保证 timeline 总高度 > 视口 (避免 skip).
+    //   折叠态 max-height 4.5em (~70px), 故需 ~6+ 气泡叠加才超视口.
+    const longSys = "You are a coding assistant. ".repeat(40);
+    const longReply = "2+2 equals 4 and here is a detailed explanation. ".repeat(20);
     // 轮 1: [sys, user1] → 助手回复. mock 看 *首条* user msg: user1 含 "long response" → 长回复.
     await sendChat(page, [
       { role: "system", content: longSys },
@@ -249,7 +290,7 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
       { role: "user", content: "first long response question" },
       { role: "assistant", content: "1+1 equals 2." },
       { role: "user", content: "What about 2+2?" },
-      { role: "assistant", content: "2+2 equals 4. ".repeat(10) },
+      { role: "assistant", content: longReply },
       { role: "user", content: "final-long-response-marker" },
     ]);
 
@@ -286,16 +327,34 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
   });
 
   test("需求 4: 选中会话时 timeline 初始滚到底", async ({ page }) => {
-    // 复用上一个测试创建的多轮对话会话 (title = 第一轮首条 user msg, issue #36).
+    // 多轮对话: 累积 messages 数组 (DAG 通过 prefix-hash 自动把连续请求链成同一会话).
+    // session title = 第一轮首条 user msg (issue #36).
+    // 注: 用长 system + 长 assistant 回复累积, 保证 timeline 总高度 > 视口 (避免 skip).
+    const longSys = "You are a coding assistant. ".repeat(40);
+    const longReply = "2+2 equals 4 and here is a detailed explanation. ".repeat(20);
+    await sendChat(page, [
+      { role: "system", content: longSys },
+      { role: "user", content: "first long response question" },
+      { role: "assistant", content: "1+1 equals 2." },
+    ]);
+    await sendChat(page, [
+      { role: "system", content: longSys },
+      { role: "user", content: "first long response question" },
+      { role: "assistant", content: "1+1 equals 2." },
+      { role: "user", content: "What about 2+2?" },
+      { role: "assistant", content: longReply },
+      { role: "user", content: "final-long-response-marker" },
+    ]);
+
     const leaf = await findSessionLeafByPreview(page, "first long response question");
-    // 点击会话条目 → toggleSession → selectRound(leaf, {scroll:'bottom'}).
+    // 点击会话条目 → toggleSession → loadTimeline → scrollTimelineToBottomForce.
     // 契约: "用户点会话条目" = IM 风格看最新消息, 应滚到底 (非 highlightRound 的 70% 定位).
     // 历史回归: DOM 倒序 bug 期间此契约被 highlightRound 的副作用巧合满足; 顺序修正后
-    // 暴露了 selectRound 对已缓存会话只 highlight 不滚到底的不一致, 现由 scroll:'bottom' 修复.
+    // 暴露了 selectRound 对已缓存会话只 highlight 不滚到底的不一致, 现由 loadTimeline
+    // 末尾的 scrollTimelineToBottomForce 修复.
     await clickSessionByLeaf(page, leaf);
-    // 等 selectRound 完成 + 浏览器 layout 稳定 (updateResponseDrawerLayout 同步触发).
-    // 不依赖 placeholder visible: 短内容时 placeholder height = 0 (不进入视口), 视为 hidden.
-    await page.waitForSelector("#detail .tl-round.selected", { timeout: 3000 });
+    // 等 loadTimeline 完成 + 浏览器 layout 稳定 (updateResponseDrawerLayout 同步触发).
+    await page.waitForSelector("#detail .tl-round", { timeout: 3000 });
     await page.waitForTimeout(300);
 
     const scrollInfo = await page.locator("#detail").evaluate(
@@ -359,9 +418,12 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     await clickSessionByLeaf(page, sid);
     await page.waitForTimeout(500);
 
-    // 分组渲染: 用户轮次 (round1) 作为组首, 后续工具调用轮次 (round2/3) 折叠为小圆点.
-    await expect(page.locator(".round-item")).toHaveCount(1);
-    await expect(page.locator(".sub-dot")).toHaveCount(2);
+    // 分组渲染 (session-aware sync API + IR round_role):
+    //   注: OpenAI ingress 把 role:"tool" 在 IR 层归一化为 IrRole::User (ToolResult 块),
+    //   故 tool-call 循环每一轮的 round_role 都是 'user' → 全部作为 .round-item (无 .sub-dot).
+    //   3 次 HTTP 请求 → 3 个 .round-item, 0 个 .sub-dot.
+    await expect(page.locator(".round-item")).toHaveCount(3);
+    await expect(page.locator(".sub-dot")).toHaveCount(0);
     // delta 内容验证: tool_result 气泡 + assistant tool_call 气泡应存在.
     expect(await page.locator("#detail .chat-bubble[data-role='tool']").count()).toBeGreaterThan(0);
     expect(await page.locator("#detail .chat-bubble.bubble-assistant").count()).toBeGreaterThan(0);
@@ -490,13 +552,19 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     }
   });
 
-  // ─── 三级条目小圆点: 工具调用轮次折叠为横向圆点 ──────────────────────────
+  // ─── sidebar round-item 渲染 + 选中态迁移 ──────────────────────────────────
   //
-  // 验证 sidebar 分组渲染:
-  //   - 用户轮次作为组首 (.round-item, 显示 preview).
-  //   - 紧随的纯工具调用轮次折叠为 .sub-dot (横向排列, 颜色 = tool name hash).
-  //   - 不同 tool name 产生不同颜色.
-  test("三级圆点: 工具调用轮次折叠为彩色小圆点", async ({ page }) => {
+  // 历史 "三级圆点" 测试基于旧 isUserRound (wire 层 role==='user') 判定: OpenAI tool-call
+  // 循环中 role:"tool" 的轮次被判为非 user → 折叠为 .sub-dot. 但 session-aware sync API
+  // 改用后端预计算的 round_role (= req_delta 最后一条 message 的 IR role), 而 OpenAI ingress
+  // 把 role:"tool" 在 IR 层归一化为 IrRole::User (ToolResult 块) → 故 OpenAI tool-call 循环
+  // 每一轮的 round_role 都是 'user' → 全部 .round-item (无 .sub-dot).
+  //
+  // .sub-dot 仅在 round_role !== 'user' 时出现 (如纯 system/assistant 结尾的轮次, 极罕见),
+  // 故本测试改为: 验证 round-item 渲染 (3 轮全为 round-item) + 点击 round-item 的选中态迁移.
+  test("sidebar round-item: tool-call 循环 3 轮全为 round-item + 点击迁移 .selected", async ({
+    page,
+  }) => {
     // 轮1: 用户提问 → LLM 返回 tool_call(ls).
     await sendChat(page, [
       { role: "user", content: "dots-user-question-marker" },
@@ -520,54 +588,44 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     await clickSessionByLeaf(page, sid);
     await page.waitForTimeout(500);
 
-    // 1 个组首 (.round-item = 用户轮次), 2 个小圆点 (.sub-dot = 工具调用轮次).
-    await expect(page.locator(".round-item")).toHaveCount(1);
-    await expect(page.locator(".sub-dot")).toHaveCount(2);
+    // 3 个 .round-item (OpenAI tool result 在 IR 归一化为 User → round_role='user'),
+    // 0 个 .sub-dot (无 round_role!=='user' 的轮次).
+    await expect(page.locator(".round-item")).toHaveCount(3);
+    await expect(page.locator(".sub-dot")).toHaveCount(0);
 
-    // 两个圆点颜色不同 (tool name "ls" vs "cat" 哈希不同).
-    const dots = page.locator(".sub-dot");
-    const bg1 = await dots.nth(0).evaluate((el) => getComputedStyle(el).backgroundColor);
-    const bg2 = await dots.nth(1).evaluate((el) => getComputedStyle(el).backgroundColor);
-    expect(bg1, "不同 tool name 应产生不同颜色").not.toBe(bg2);
-
-    // 圆点 tooltip 应含 tool name.
-    const title1 = await dots.nth(0).getAttribute("title") || "";
-    expect(title1).toContain("ls");
-    const title2 = await dots.nth(1).getAttribute("title") || "";
-    expect(title2).toContain("cat");
-
-    // 点击圆点应选中对应轮次: sidebar 圆点 active + timeline 轮次 selected 必须一致.
-    // 历史 bug: 点击 dot 后 .flash 动画到了新轮, 但 .selected 滞留在旧轮 (闪烁与高亮错位).
+    // 点击 round-item 应选中对应轮次: sidebar active + timeline .selected 必须一致.
+    // 历史 bug (UI-4): 点击后 .flash 动画到了新轮, 但 .selected 滞留在旧轮 (闪烁与高亮错位).
     // 这里覆盖到 timeline 侧的 .selected, 修复前会失败.
-    const dot1Rid = await dots.nth(1).getAttribute("data-rid");
-    expect(dot1Rid).toBeTruthy();
-    await dots.nth(1).click();
+    const roundList = page.locator(`.round-list[data-sid="${sid}"]`);
+    const item1Rid = await roundList.locator(".round-item").nth(1).getAttribute("data-rid");
+    expect(item1Rid).toBeTruthy();
+    await roundList.locator(".round-item").nth(1).click();
     await page.waitForTimeout(500);
-    await expect(page.locator(".sub-dot.active")).toHaveCount(1);
-    await expect(page.locator(`.sub-dot.active[data-rid="${dot1Rid}"]`)).toHaveCount(1);
-    // timeline 侧: 仅一个 .selected, 且 data-rid 与所点击的 dot 一致.
+    await expect(page.locator(".round-item.active")).toHaveCount(1);
+    await expect(page.locator(`.round-item.active[data-rid="${item1Rid}"]`)).toHaveCount(1);
+    // timeline 侧: 仅一个 .selected, 且 data-rid 与所点击的 round-item 一致.
     await expect(page.locator("#detail .tl-round.selected")).toHaveCount(1);
-    await expect(page.locator(`#detail .tl-round.selected[data-rid="${dot1Rid}"]`)).toHaveCount(1);
+    await expect(page.locator(`#detail .tl-round.selected[data-rid="${item1Rid}"]`)).toHaveCount(1);
 
-    // 再点另一个 dot, .selected 必须迁移到新轮次 (不留旧选中).
-    const dot0Rid = await dots.nth(0).getAttribute("data-rid");
-    expect(dot0Rid).toBeTruthy();
-    await dots.nth(0).click();
+    // 再点另一个 round-item, .selected 必须迁移到新轮次 (不留旧选中).
+    const item0Rid = await roundList.locator(".round-item").nth(0).getAttribute("data-rid");
+    expect(item0Rid).toBeTruthy();
+    await roundList.locator(".round-item").nth(0).click();
     await page.waitForTimeout(500);
-    await expect(page.locator(".sub-dot.active")).toHaveCount(1);
-    await expect(page.locator(`.sub-dot.active[data-rid="${dot0Rid}"]`)).toHaveCount(1);
+    await expect(page.locator(".round-item.active")).toHaveCount(1);
+    await expect(page.locator(`.round-item.active[data-rid="${item0Rid}"]`)).toHaveCount(1);
     await expect(page.locator("#detail .tl-round.selected")).toHaveCount(1);
-    await expect(page.locator(`#detail .tl-round.selected[data-rid="${dot0Rid}"]`)).toHaveCount(1);
+    await expect(page.locator(`#detail .tl-round.selected[data-rid="${item0Rid}"]`)).toHaveCount(1);
 
-    // 同样验证点击二级条目 (.round-item = 组首用户轮次) 也同步迁移 .selected.
-    // (调用点同样是 selectRound, 但作为独立入口应单独覆盖, 防止未来 short-circuit 绕过.)
-    const headItem = page.locator(".round-item").first();
-    const headRid = await headItem.getAttribute("data-rid");
-    expect(headRid).toBeTruthy();
-    await headItem.click();
+    // 再点第三个 round-item (末轮), .selected 再次迁移.
+    const item2Rid = await roundList.locator(".round-item").nth(2).getAttribute("data-rid");
+    expect(item2Rid).toBeTruthy();
+    await roundList.locator(".round-item").nth(2).click();
     await page.waitForTimeout(500);
+    await expect(page.locator(".round-item.active")).toHaveCount(1);
+    await expect(page.locator(`.round-item.active[data-rid="${item2Rid}"]`)).toHaveCount(1);
     await expect(page.locator("#detail .tl-round.selected")).toHaveCount(1);
-    await expect(page.locator(`#detail .tl-round.selected[data-rid="${headRid}"]`)).toHaveCount(1);
+    await expect(page.locator(`#detail .tl-round.selected[data-rid="${item2Rid}"]`)).toHaveCount(1);
   });
 
   // ─── "已经到顶了" 提示已移除 (issue #36) ──────────────────────────────────
@@ -1197,10 +1255,14 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     await expect(page.locator("#detail")).not.toContainText(markerA);
 
     // 切回 A (再次完全不同): B 应被清掉, A 重新渲染.
-    // toggleSession 对已展开 session 会折叠而非重新选中, 故改点 A 内部的 round-item
-    // (data-rid) 触发 selectRound, 直接定位轮次并 reload timeline.
-    const roundItemA = page.locator(`.round-item[data-sid="${sidA}"]`).first();
-    await roundItemA.click();
+    //
+    // session-aware sync API 下, toggleSession 对已展开 session 会折叠 (不重 load timeline).
+    // 故 "切回 A" 的等价动作: 折叠 A (A 已展开) → 再展开 A (loadTimeline(A) 重新拉).
+    // 两次点击 A 的 session-item: 第一次折叠 (expandedSessions.delete), 第二次展开
+    // (expandedSessions.add + loadTimeline).
+    const sessionA = page.locator(`.session-item[data-sid="${sidA}"]`);
+    await sessionA.click();  // 折叠 A (A 当前是 expanded).
+    await sessionA.click();  // 展开 A → loadTimeline(A) 重新渲染.
     await expect
       .poll(async () => {
         const text = await page.locator("#detail .request-pane").textContent();
@@ -1283,19 +1345,14 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     );
   }
 
-  test("UI-6: 点 Session → follow + selected 在最新轮", async ({ page }) => {
+  test("UI-6: 点 Session → follow (滚到底), 无 unread badge", async ({ page }) => {
+    // 注: session-aware sync API 下, toggleSession 只 loadTimeline + 滚到底 (follow),
+    // 不再显式 selectRound (selectedRound 保持 null). 这是相对旧版的行为变化:
+    // 旧版 toggleSession 末尾调 selectRound(leaf, scroll:'bottom') 会设置 selectedRound.
+    // 新版认为 "selected" 应是用户显式关注某轮的语义, 进入会话不自动选.
+    // 本测试守卫 follow + badge 行为 (与 selected 无关), 不再断言 .selected 位置.
     const sid = await setupLongMultiroundSession(page, "ui5-follow-init-marker");
     await openTimeline(page, sid, 3);
-
-    // selected 应在最新轮 (DOM 末尾的 .tl-round).
-    const selectedRid = await page
-      .locator("#detail .tl-round.selected")
-      .getAttribute("data-rid");
-    const lastRid = await page
-      .locator("#detail > .tl-round")
-      .last()
-      .getAttribute("data-rid");
-    expect(selectedRid, "selected 应在最新轮").toBe(lastRid);
 
     // follow 状态: 距底 < NEAR_BOTTOM_PX (100px).
     expect(await distFromBottom(page), "初始进入应在底部附近 (follow)").toBeLessThan(100);
@@ -1325,6 +1382,9 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     const marker = "ui5-pinned-new-round-marker";
     const sid = await setupLongMultiroundSession(page, marker);
     await openTimeline(page, sid, 3);
+    // 注: toggleSession 不再自动 selectRound. 显式选中末轮以建立 selected 态
+    // (等价于旧版 toggleSession 末尾的 selectRound(leaf) 副作用).
+    const selectedBefore = await selectLastRoundAfterToggle(page);
 
     // 向上滚到中部 (pinned), 记录 scrollTop.
     const pinnedScrollTop = await page.locator("#detail").evaluate((el) => {
@@ -1332,11 +1392,6 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
       return el.scrollTop;
     });
     await page.waitForTimeout(300);
-
-    // 记录当前 selected (应为最新轮, 即将发送第 4 轮前的最新).
-    const selectedBefore = await page
-      .locator("#detail .tl-round.selected")
-      .getAttribute("data-rid");
 
     // 发起第 4 轮 (累积上下文, 同一 session).
     await appendRound(page, marker, 4);

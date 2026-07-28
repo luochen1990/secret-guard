@@ -367,7 +367,17 @@ async fn streaming_parsed_view_accumulates_text() {
         .create_async()
         .await;
 
-    let proxy_url = spawn_proxy(&upstream.url()).await;
+    let upstream_client = reqwest::Client::new();
+    let records = ConversationDag::new(64, 500, 1);
+    let records_handle = records.clone();
+    let provider = openai_provider("oa-main", &upstream.url());
+    let proxy_url = spawn_proxy_full(
+        vec![provider],
+        upstream_client,
+        records,
+        test_secret_table(),
+    )
+    .await;
     let _ = proxy_request(
         &proxy_url,
         "POST",
@@ -378,17 +388,20 @@ async fn streaming_parsed_view_accumulates_text() {
     .await;
 
     // 等 record 完成.
-    let records = wait_for_record_count(&format!("{proxy_url}/__sg/api/records"), 1).await;
-    assert!(records[0].streamed, "should be streamed");
-    assert!(records[0].resp_complete, "should be complete");
+    let list = wait_until_or_timeout(
+        &records_handle,
+        |l| l.first().map(|r| r.resp_complete).unwrap_or(false),
+        Duration::from_secs(2),
+    )
+    .await;
+    assert!(list[0].streamed, "should be streamed");
+    assert!(list[0].resp_complete, "should be complete");
+    let id = list[0].id;
 
     // 拉 parsed view, 验证累积文本.
     let client = reqwest::Client::new();
     let env: serde_json::Value = client
-        .get(format!(
-            "{proxy_url}/__sg/api/records/{}?view=parsed",
-            records[0].id
-        ))
+        .get(format!("{proxy_url}/__sg/api/records/{id}?view=parsed"))
         .send()
         .await
         .unwrap()
@@ -1479,7 +1492,9 @@ async fn web_ui_legacy_path_still_works() {
 }
 
 #[tokio::test]
-async fn web_api_lists_records() {
+async fn web_api_sync_returns_sessions_after_forward() {
+    // 验证 POST /api/sync 返回 sessions (替代旧的 GET /api/records 扁平分页).
+    // 转发一次请求后, sync 应返回 1 个 session, 含 1 条 round.
     let mut upstream = spawn_mock_upstream().await;
     let _m = upstream
         .mock("POST", "/v1/chat/completions")
@@ -1516,17 +1531,21 @@ async fn web_api_lists_records() {
     )
     .await;
 
+    // POST /api/sync 应返回 1 个 session (record_count=1).
     let resp = reqwest::Client::new()
-        .get(format!("{proxy_url}/__sg/api/records"))
+        .post(format!("{proxy_url}/__sg/api/sync"))
+        .json(&serde_json::json!({"expanded": [], "selected": null}))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body: serde_json::Value = resp.json().await.unwrap();
-    let recs = body.get("records").and_then(|v| v.as_array()).unwrap();
-    assert_eq!(recs.len(), 1);
-    assert_eq!(recs[0]["method"], "POST");
-    assert_eq!(recs[0]["path"], "/o/oa-main/v1/chat/completions");
+    let sessions = body.get("sessions").and_then(|v| v.as_array()).unwrap();
+    assert_eq!(sessions.len(), 1, "1 个转发 → 1 个 session");
+    assert_eq!(sessions[0]["record_count"], 1);
+    // 注: 同步未展开该 session, rounds 字段应为空 object.
+    let rounds = body.get("rounds").and_then(|v| v.as_object()).unwrap();
+    assert!(rounds.is_empty(), "expanded 为空 → rounds 为空");
 }
 
 #[tokio::test]
@@ -1597,175 +1616,9 @@ async fn web_api_404_for_unknown_record() {
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
 }
 
-#[tokio::test]
-async fn web_api_records_list_has_pagination_envelope() {
-    // 验证新 ListRecordsResponse shape: {records, total, offset, limit}.
-    // 默认 limit=50, offset=0.
-    let mut upstream = spawn_mock_upstream().await;
-    let _m = upstream
-        .mock("POST", "/v1/chat/completions")
-        .with_status(200)
-        .with_body("{}")
-        .create_async()
-        .await;
-    let proxy_url = spawn_proxy(&upstream.url()).await;
-    let _ = proxy_request(
-        &proxy_url,
-        "POST",
-        "/o/oa-main/v1/chat/completions",
-        r#"{"q":"hi"}"#,
-        &[],
-    )
-    .await;
-    // 等 1 条记录.
-    let _ = wait_for_record_count(&format!("{proxy_url}/__sg/api/records"), 1).await;
-
-    let body: serde_json::Value = reqwest::Client::new()
-        .get(format!("{proxy_url}/__sg/api/records"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(body["total"], 1);
-    assert_eq!(body["offset"], 0);
-    assert_eq!(body["limit"], 50);
-    assert_eq!(body["records"].as_array().unwrap().len(), 1);
-}
-
-#[tokio::test]
-async fn web_api_records_list_respects_offset_limit() {
-    let mut upstream = spawn_mock_upstream().await;
-    let _m = upstream
-        .mock("POST", mockito::Matcher::Any)
-        .with_status(200)
-        .with_body("{}")
-        .create_async()
-        .await;
-    let proxy_url = spawn_proxy(&upstream.url()).await;
-    // 发 3 条请求 → 3 条记录.
-    for _ in 0..3 {
-        let _ = proxy_request(
-            &proxy_url,
-            "POST",
-            "/o/oa-main/v1/chat/completions",
-            r#"{"q":"hi"}"#,
-            &[],
-        )
-        .await;
-    }
-    let _ = wait_for_record_count(&format!("{proxy_url}/__sg/api/records"), 3).await;
-
-    // 取第一页 (offset=0, limit=2): total=3, len=2.
-    let body: serde_json::Value = reqwest::Client::new()
-        .get(format!("{proxy_url}/__sg/api/records?offset=0&limit=2"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(body["total"], 3);
-    assert_eq!(body["offset"], 0);
-    assert_eq!(body["limit"], 2);
-    assert_eq!(body["records"].as_array().unwrap().len(), 2);
-
-    // 取第二页 (offset=2, limit=2): 只剩 1 条.
-    let body: serde_json::Value = reqwest::Client::new()
-        .get(format!("{proxy_url}/__sg/api/records?offset=2&limit=2"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(body["total"], 3);
-    assert_eq!(body["records"].as_array().unwrap().len(), 1);
-}
-
-#[tokio::test]
-async fn web_api_records_list_filter_hits_returns_only_redacted() {
-    // 构造混合场景: 2 条命中 secret (redactions 非空) + 2 条 passthrough (redactions 空).
-    // filter=hits 应只返回 2 条命中, total=2; filter=all 仍 total=4.
-    let real_secret = "sk-filter-test-789";
-    let mut upstream = spawn_mock_upstream().await;
-    let _m = upstream
-        .mock("POST", "/v1/chat/completions")
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body("{}")
-        .create_async()
-        .await;
-
-    let entries = vec![secret("hit-key", real_secret)];
-    let secrets = test_secret_table_with(entries);
-    let upstream_client = reqwest::Client::new();
-    let records = ConversationDag::new(64, 500, 1);
-    let provider = openai_provider("oa-main", &upstream.url());
-    let proxy_url = spawn_proxy_full(vec![provider], upstream_client, records, secrets).await;
-
-    let hit_body = format!(r#"{{"messages":[{{"content":"use {real_secret}"}}]}}"#);
-    let plain_body = r#"{"messages":[{"content":"plain"}]}"#;
-    // 交错发送: plain, hit, plain, hit. 顺序不重要 (list 倒序), 但要保证两类都有.
-    for body in [plain_body, &hit_body, plain_body, &hit_body] {
-        let _ = reqwest::Client::new()
-            .post(format!("{proxy_url}/o/oa-main/v1/chat/completions"))
-            .header("content-type", "application/json")
-            .body(body.to_string())
-            .send()
-            .await
-            .unwrap();
-    }
-    let _ = wait_for_record_count(&format!("{proxy_url}/__sg/api/records"), 4).await;
-
-    // filter=all: total=4.
-    let body: serde_json::Value = reqwest::Client::new()
-        .get(format!("{proxy_url}/__sg/api/records?filter=all"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(body["total"], 4, "filter=all should see all 4 records");
-    assert_eq!(body["filter"], "all");
-    assert_eq!(body["records"].as_array().unwrap().len(), 4);
-
-    // filter=hits: total=2, 只含带 redactions 的记录.
-    let body: serde_json::Value = reqwest::Client::new()
-        .get(format!("{proxy_url}/__sg/api/records?filter=hits"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(body["total"], 2, "filter=hits should see only 2 redacted");
-    assert_eq!(body["filter"], "hits");
-    let recs = body["records"].as_array().unwrap();
-    assert_eq!(recs.len(), 2);
-    for r in recs {
-        let reds = r["redactions"].as_array().unwrap();
-        assert!(
-            !reds.is_empty(),
-            "hits filter must not return plain records"
-        );
-        assert_eq!(reds[0][1], "hit-key");
-    }
-
-    // 默认 (省略 filter) 应等价于 filter=all.
-    let body: serde_json::Value = reqwest::Client::new()
-        .get(format!("{proxy_url}/__sg/api/records"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(body["total"], 4);
-    assert_eq!(body["filter"], "all");
-}
+// ─── /records/{id}?view=parsed (单条 raw + parsed view) ────────────────
+// 注: 旧的 GET /api/records (扁平分页, list_records handler) 已删除, 由 session-aware
+// sync API 替代. 以下测试覆盖保留下来的 GET /api/records/{id}?view=parsed 路径.
 
 #[tokio::test]
 async fn web_api_records_view_parsed_openai_returns_structured() {
@@ -1858,7 +1711,7 @@ async fn web_api_records_view_parsed_gemini_returns_error() {
         &[],
     )
     .await;
-    let records = wait_for_record_count(&format!("{proxy_url}/__sg/api/records"), 1).await;
+    let records = wait_for_record_count(&proxy_url, 1).await;
     let id = records[0].id;
 
     let body: serde_json::Value = reqwest::Client::new()
@@ -2832,7 +2685,7 @@ async fn secret_decision_disabled_drops_from_redaction() {
     .await;
 
     // 等记录写入, 验证 body 仍含 secret.
-    let records = wait_for_record_count(&format!("{proxy_url}/__sg/api/records"), 1).await;
+    let records = wait_for_record_count(&proxy_url, 1).await;
     // list 不返回 req_body, 需通过 detail API 拉取.
     let detail: serde_json::Value = client
         .get(format!("{proxy_url}/__sg/api/records/{}", records[0].id))
@@ -2849,19 +2702,32 @@ async fn secret_decision_disabled_drops_from_redaction() {
     );
 }
 
-/// 辅助: 当测试未持有 ConversationDag handle 时, 通过 records API 轮询直到出现 count 条记录.
-/// list API 返回的轻量 record 摘要 (不含 req_body / resp_body / resp_parsed).
-/// 测试只需检查 metadata 字段, body 由 GET /records/{id}?view=... 按需拉.
-#[derive(serde::Deserialize, Debug)]
+/// 辅助: 当测试未持有 ConversationDag handle 时, 通过 sync + timeline API 轮询直到
+/// 出现 count 条记录 (跨所有 session 累计).
+///
+/// 注: 旧的实现用 `GET /api/records` (扁平分页, 已删除). 新实现走 session-aware 路径:
+/// 1. 轮询 `POST /api/sync` (无 selected), 累加 sessions[*].record_count 直到 >= count.
+/// 2. 对每个 session 拉 timeline, 收集 round id 作为 "record" 的代理.
+///
+/// 返回的 RecordSummary 仅填充 id (测试调用方主要用 id 拉详情; 其他字段留默认).
+/// 需要 streamed/resp_complete 等字段的测试应改用 `wait_until_or_timeout` (持 DAG handle).
+#[derive(serde::Deserialize, Debug, Default)]
 #[allow(dead_code)]
 struct RecordSummary {
     id: uuid::Uuid,
+    #[serde(default)]
     method: String,
+    #[serde(default)]
     path: String,
+    #[serde(default)]
     resp_status: u16,
+    #[serde(default)]
     elapsed_ms: u64,
+    #[serde(default)]
     streamed: bool,
+    #[serde(default)]
     resp_complete: bool,
+    #[serde(default)]
     error: Option<String>,
     #[serde(default)]
     redactions: Vec<(String, String)>,
@@ -2871,20 +2737,90 @@ struct RecordSummary {
     model: Option<String>,
 }
 
-async fn wait_for_record_count(url: &str, count: usize) -> Vec<RecordSummary> {
+/// sync 响应中 session 的简化 shape (只取 record_count + session_id).
+#[derive(serde::Deserialize, Debug)]
+struct SyncSessionBrief {
+    /// SessionId 序列化为 UUID (内层 newtype 透明序列化).
+    session_id: serde_json::Value,
+    record_count: usize,
+}
+
+/// sync 响应 shape (仅取 sessions 字段做轮询判定).
+#[derive(serde::Deserialize, Debug)]
+struct SyncResponseBrief {
+    sessions: Vec<SyncSessionBrief>,
+}
+
+/// timeline page 中 round 的简化 shape (只取 id).
+#[derive(serde::Deserialize, Debug)]
+struct TimelineRoundBrief {
+    id: uuid::Uuid,
+}
+
+/// timeline page shape (仅取 rounds 字段收集 id).
+#[derive(serde::Deserialize, Debug)]
+struct TimelinePageBrief {
+    rounds: Vec<TimelineRoundBrief>,
+}
+
+async fn wait_for_record_count(proxy_url: &str, count: usize) -> Vec<RecordSummary> {
     let client = reqwest::Client::new();
-    for _ in 0..50 {
-        let body: serde_json::Value = client.get(url).send().await.unwrap().json().await.unwrap();
-        let arr = body.get("records").unwrap().as_array().unwrap();
-        if arr.len() >= count {
-            return arr
-                .iter()
-                .map(|v| serde_json::from_value(v.clone()).unwrap())
-                .collect();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        // 1. POST /api/sync 拿 sessions (含 record_count).
+        let sync_url = format!("{proxy_url}/__sg/api/sync");
+        let sync_resp: SyncResponseBrief = client
+            .post(&sync_url)
+            .json(&serde_json::json!({"expanded": [], "selected": null}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let total: usize = sync_resp.sessions.iter().map(|s| s.record_count).sum();
+        if total >= count {
+            // 2. 对每个 session 拉 timeline, 收集 round id.
+            let mut summaries: Vec<RecordSummary> = Vec::new();
+            for s in &sync_resp.sessions {
+                // session_id 可能是 UUID string 或 {"SessionId": uuid} (取决于序列化);
+                // SessionId 派生了 Serialize 作为 newtype, 透明序列化为内层 UUID string.
+                let sid_str = match &s.session_id {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Object(map) => map
+                        .values()
+                        .next()
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    _ => continue,
+                };
+                let tl_url = format!("{proxy_url}/__sg/api/sessions/{sid_str}/timeline");
+                let resp = client.get(&tl_url).send().await.unwrap();
+                if !resp.status().is_success() {
+                    continue;
+                }
+                let page: TimelinePageBrief = resp
+                    .json()
+                    .await
+                    .unwrap_or(TimelinePageBrief { rounds: Vec::new() });
+                for r in page.rounds {
+                    summaries.push(RecordSummary {
+                        id: r.id,
+                        ..Default::default()
+                    });
+                }
+            }
+            // timeline 路径默认 limit=10, 长 session 可能截断. 总数已由 sync 确认 >= count,
+            // 这里只取前 count 条 (测试调用方一般只关心 records[0]).
+            summaries.truncate(count);
+            return summaries;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        if tokio::time::Instant::now() >= deadline {
+            panic!("timeout waiting for {count} records; current sync: {sync_resp:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    panic!("timeout waiting for {count} records at {url}");
 }
 
 // ─── 额外覆盖 (针对 Code Review C1 / M2 / M4 的回归) ─────────────────────
@@ -3344,8 +3280,9 @@ async fn streaming_redact_upstream_4xx_json_also_falls_back_without_restore() {
 async fn web_api_responses_include_cache_control_no_store_header() {
     let upstream = spawn_mock_upstream().await;
     let proxy_url = spawn_proxy(&upstream.url()).await;
+    // 用 /api/sessions 端点 (旧的 /api/records 扁平分页已删除, 由 sync API 替代).
     let resp = reqwest::Client::new()
-        .get(format!("{proxy_url}/__sg/api/records"))
+        .get(format!("{proxy_url}/__sg/api/sessions"))
         .send()
         .await
         .unwrap();
@@ -3512,7 +3449,7 @@ async fn concurrent_forward_requests_all_recorded() {
     }
 
     // 等 DAG 累积 10 条 record (每条都 resp_complete).
-    let list = wait_for_record_count(&format!("{proxy_url}/__sg/api/records"), 10).await;
+    let list = wait_for_record_count(&proxy_url, 10).await;
     assert_eq!(
         list.len(),
         10,

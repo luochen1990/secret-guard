@@ -1,8 +1,11 @@
 //! 转发记录 DTO (web 层响应序列化用).
 //!
 //! 历史上这里是 RecordStore (扁平 VecDeque 存储), 现已迁移到 [`crate::dag::ConversationDag`]
-//! (内容寻址 + Merkle prefix + FIFO 淘汰). 本文件仅保留 [`ForwardRecord`] 与
-//! [`RecordFilter`] 两个 DTO, 作为 Web API 响应的 JSON shape (供 [`crate::web::api`] 构造).
+//! (内容寻址 + Merkle prefix + FIFO 淘汰). 本文件仅保留 [`ForwardRecord`] DTO,
+//! 作为 Web API GET /records/{id} 响应的 JSON shape (供 [`crate::web::api`] 构造).
+//!
+//! 注: 旧的 `RecordFilter` enum + `GET /api/records` 扁平分页已删除 (由 session-aware
+//! sync API 替代), 故本文件不再含 RecordFilter.
 //!
 //! DTO 字段从 [`crate::dag`] 的 NodeView / NodeDetail / ResponseData 派生, 由
 //! [`crate::web::api`] 在查询时填充. 保留这个独立 DTO (而非直接 serialize DAG 内部类型)
@@ -13,21 +16,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-
-/// 列表过滤维度. WebUI 的 All / Hits 两个 tab 各自独立分页,
-/// 服务端按此枚举过滤并返回该维度下的 total.
-///
-/// - `All`: 不过滤 (默认, 向后兼容).
-/// - `Hits`: 只保留 `redactions` 非空的记录 (本次请求实际发生了 redact).
-///
-/// 序列化为小写字符串, 直接作 query param 值: `?filter=all` / `?filter=hits`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum RecordFilter {
-    #[default]
-    All,
-    Hits,
-}
 
 /// 单条转发记录 (Web DTO).
 ///
@@ -235,28 +223,5 @@ mod tests {
             json.contains("resp_parsed"),
             "Some resp_parsed must be present in JSON, got: {json}"
         );
-    }
-
-    // ─── RecordFilter 序列化为小写字符串 (query param 契约) ──────────────────
-    //
-    // RecordFilter 直接做 ?filter= 的 query param 值, 必须序列化为小写.
-    // 与 OverrideMode::as_str 风格一致 (SSOT: rename_all = "lowercase").
-
-    #[test]
-    fn record_filter_serializes_to_lowercase() {
-        assert_eq!(
-            serde_json::to_string(&RecordFilter::All).unwrap(),
-            "\"all\""
-        );
-        assert_eq!(
-            serde_json::to_string(&RecordFilter::Hits).unwrap(),
-            "\"hits\""
-        );
-        // round-trip.
-        assert_eq!(
-            serde_json::from_str::<RecordFilter>("\"hits\"").unwrap(),
-            RecordFilter::Hits
-        );
-        assert_eq!(RecordFilter::default(), RecordFilter::All);
     }
 }
