@@ -31,7 +31,11 @@ pub mod openai;
 pub mod stream;
 
 #[cfg(test)]
+mod fwd_cross_proto_property;
+#[cfg(test)]
 mod fwd_property;
+#[cfg(test)]
+mod fwd_streaming_property;
 
 use serde_json::Value;
 
