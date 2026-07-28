@@ -3567,3 +3567,392 @@ async fn gemini_provider_with_secrets_forwards_unredacted() {
     );
     let _ = resp.text().await.unwrap();
 }
+
+// ─── CFG-3: CRUD 操作语义 (HTTP 集成测试, property-based) ──────────────────
+//
+// 契约 SSOT: `docs/design/contracts.md` §6 CFG-3 (L515-527).
+// 这些 property 本质是 HTTP 语义, 必须通过真实 router 验证 (axum::serve 启动完整 app).
+// 选用 secrets endpoint (更核心); providers 行为对称 (都用 DynamicTable), 不重复.
+//
+// 复用既有 helper: `spawn_proxy_static_dynamic` (接受 static/dynamic providers + 自定义
+// SecretTable). secrets 的 static/dynamic 两层通过 `SecretTable::new` 显式构造传入.
+
+/// 启动 secret-guard, 接受任意 static + dynamic secrets (providers 为空, 不影响 secrets API).
+///
+/// 与 `spawn_with_static_and_dynamic` 对称: 后者装配 static/dynamic providers + 空 secrets;
+/// 本 helper 装配 static/dynamic secrets + 空 providers, 用于 CFG-3 的 secrets API property.
+async fn spawn_with_secrets(
+    static_secrets: Vec<SecretEntry>,
+    dynamic_secrets: Vec<SecretEntry>,
+) -> String {
+    let secret_path = tmp_state_path("cfg3-secrets");
+    let decisions = std::sync::Arc::new(parking_lot::RwLock::new(
+        secret_guard::config::Decisions::default(),
+    ));
+    let secrets = SecretTable::new(static_secrets, dynamic_secrets, decisions, secret_path);
+    spawn_proxy_static_dynamic(
+        vec![],
+        vec![],
+        reqwest::Client::new(),
+        ConversationDag::new(64, 500, 1),
+        secrets,
+    )
+    .await
+}
+
+/// 拉取 effective secrets 列表, 返回 (id → EffectiveSecret JSON) 映射, 便于断言.
+async fn fetch_effective_secrets(
+    client: &reqwest::Client,
+    proxy_url: &str,
+) -> std::collections::HashMap<String, serde_json::Value> {
+    let body: serde_json::Value = client
+        .get(format!("{proxy_url}/__sg/api/secrets"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    body.get("secrets")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| (v["id"].as_str().unwrap().to_string(), v.clone()))
+        .collect()
+}
+
+mod cfg3_proptests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::collections::HashMap;
+
+    // ─── 生成器 (对称复制自 src/config.rs::proptests::ConfigScenario) ─────────
+    //
+    // 注意: 这是 `src/config.rs::proptests` 的 ConfigScenario + arb_scenario 的**逐字对称
+    // 复制** (非 use 复用), 因为该 mod 标记为 `#[cfg(test)]` 无法跨 crate (integration test)
+    // 引用. 字段名 / 方法名 / 桶前缀 (`s`/`d`/`b`) / HashMap 去重逻辑全相同. **若改动其中一处,
+    // 必须同步另一处以保持一致** (隐性重复已升级为显式约定).
+    //
+    // 三桶分桶 (static_only / dynamic_only / both) 保证三种语义 (conflict / static-only /
+    // dynamic-only) 都被每条 property 触达, 不依赖 id 碰撞概率. 桶前缀 `s`/`d`/`b` 互斥.
+    //
+    // value 用 `[a-z0-9]{4,16}`: ≥3 字节 (过 validate_value), 纯 ASCII (无 PUA),
+    // 无 mock prefix (集成测试 global_mock_prefix 为空). id 用 `[a-z][a-z0-9]{0,3}` (过 validate_id).
+
+    fn arb_value() -> impl Strategy<Value = String> {
+        "[a-z0-9]{4,16}"
+    }
+
+    #[derive(Debug, Clone)]
+    struct Scenario {
+        static_only: Vec<(String, String)>,
+        dynamic_only: Vec<(String, String)>,
+        // both: (id, static_value, dynamic_value) — static_value ≠ dynamic_value 保证 conflict 可观测.
+        both: Vec<(String, String, String)>,
+    }
+
+    impl Scenario {
+        fn static_entries(&self) -> Vec<SecretEntry> {
+            self.static_only
+                .iter()
+                .map(|(id, v)| secret(id, v))
+                .chain(self.both.iter().map(|(id, sv, _)| secret(id, sv)))
+                .collect()
+        }
+        fn dynamic_entries(&self) -> Vec<SecretEntry> {
+            self.dynamic_only
+                .iter()
+                .map(|(id, v)| secret(id, v))
+                .chain(self.both.iter().map(|(id, _, dv)| secret(id, dv)))
+                .collect()
+        }
+        /// 所有 static id (static_only + both), 供 property 挑冲突目标.
+        fn static_ids(&self) -> Vec<String> {
+            self.static_only
+                .iter()
+                .map(|(id, _)| id.clone())
+                .chain(self.both.iter().map(|(id, _, _)| id.clone()))
+                .collect()
+        }
+    }
+
+    fn arb_scenario() -> impl Strategy<Value = Scenario> {
+        (
+            prop::collection::vec(("[a-z][a-z0-9]{0,3}", arb_value()), 1..4),
+            prop::collection::vec(("[a-z][a-z0-9]{0,3}", arb_value()), 1..4),
+            prop::collection::vec(("[a-z][a-z0-9]{0,3}", arb_value(), arb_value()), 1..4),
+        )
+            .prop_map(|(static_only, dynamic_only, both)| {
+                let static_only: Vec<(String, String)> = static_only
+                    .into_iter()
+                    .map(|(id, v)| (format!("s{id}"), v))
+                    .collect::<HashMap<_, _>>()
+                    .into_iter()
+                    .collect();
+                let dynamic_only: Vec<(String, String)> = dynamic_only
+                    .into_iter()
+                    .map(|(id, v)| (format!("d{id}"), v))
+                    .collect::<HashMap<_, _>>()
+                    .into_iter()
+                    .collect();
+                let mut both_map: HashMap<String, (String, String)> = HashMap::new();
+                for (id, sv, dv) in both {
+                    both_map.insert(format!("b{id}"), (sv, dv));
+                }
+                let both: Vec<(String, String, String)> = both_map
+                    .into_iter()
+                    .map(|(id, (sv, dv))| {
+                        let dv = if sv == dv { format!("dyn-{dv}") } else { dv };
+                        (id, sv, dv)
+                    })
+                    .collect();
+                Scenario {
+                    static_only,
+                    dynamic_only,
+                    both,
+                }
+            })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(16))]
+
+        /// CFG-3: POST 创建与 static 冲突的 id → 409.
+        ///
+        /// 任挑一个 static id (static_only 或 both 桶), POST 同 id 创建 → 必须返回 409
+        /// (契约: "id 与 static 冲突 → 409", 提示用 PUT 走 fork 流程).
+        /// scenario 保证 static_ids() 非空 (两桶均 ≥1), 无需 prop_assume.
+        ///
+        /// proptest! 生成同步 fn, 内部用 block_on 驱动 async HTTP 调用.
+        #[test]
+        fn prop_post_conflict_with_static_returns_409(
+            scenario in arb_scenario(),
+            // 额外的 dynamic-only id 用作 negative control: POST 一个全新 id 应当成功 (201).
+            fresh_id in "[a-z][a-z0-9]{3,6}"
+        ) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let proxy_url = spawn_with_secrets(
+                    scenario.static_entries(),
+                    scenario.dynamic_entries(),
+                ).await;
+                let client = reqwest::Client::new();
+
+                // ── 正向: POST 任一 static id → 409 ──
+                // arb_scenario 保证 static_ids() ≥1 (两桶均 ≥1).
+                for sid in scenario.static_ids() {
+                    let resp = client
+                        .post(format!("{proxy_url}/__sg/api/secrets"))
+                        .json(&serde_json::json!({
+                            "id": sid,
+                            "value": format!("attempt-{sid}"),
+                        }))
+                        .send().await.unwrap();
+                    prop_assert_eq!(
+                        resp.status(), reqwest::StatusCode::CONFLICT,
+                        "POST with static-conflicting id '{}' must return 409", sid
+                    );
+                }
+
+                // ── negative control: POST 全新 dynamic-only id → 201 (验证 409 不是误报) ──
+                // fresh_id 前缀 `f` 避开三桶 (`s`/`d`/`b`) 前缀, 保证不冲突.
+                let fresh = format!("f{fresh_id}");
+                let resp = client
+                    .post(format!("{proxy_url}/__sg/api/secrets"))
+                    .json(&serde_json::json!({
+                        "id": &fresh,
+                        "value": "fresh-new-value",
+                    }))
+                    .send().await.unwrap();
+                prop_assert_eq!(
+                    resp.status(), reqwest::StatusCode::CREATED,
+                    "POST with non-conflicting id must succeed (201), got {}",
+                    resp.status()
+                );
+                Ok(())
+            })?
+        }
+
+        /// CFG-3: PUT 编辑 static id → 创建 dynamic override (git-style fork).
+        ///
+        /// 任挑一个 static-only id (无 dynamic), PUT 新 value → 必须返回 200, 且:
+        /// 1) effective 中该 id 的 source 变为 `dynamic_override`;
+        /// 2) value_length 反映新值 (旧 static 被 override).
+        /// scenario 保证 static_only 桶 ≥1.
+        ///
+        /// **对称性说明**: 本测试只挑 static_only 桶的**首个** id 验证 fork 行为, 但 PUT-on-static
+        /// 的 fork 语义对**所有** static id (含 both 桶里 static 已被 dynamic override 的) 对称成立
+        /// (handler 无 per-id 特判, 任一 static id PUT 都走同一 upsert_dynamic 路径). 故测首个即
+        /// 代表 static id 集合的行为正确性, 不重复枚举 (case 数有限时聚焦 representative case).
+        #[test]
+        fn prop_put_forks_dynamic_when_id_in_static(scenario in arb_scenario()) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let proxy_url = spawn_with_secrets(scenario.static_only.iter()
+                    .map(|(id, v)| secret(id, v)).collect(), vec![]).await;
+                let client = reqwest::Client::new();
+
+                // arb_scenario 保证 static_only ≥1 项.
+                let (target_id, old_value) = scenario.static_only.first().unwrap().clone();
+                let new_value = format!("forked-{old_value}-new");
+                let new_len = new_value.chars().count();
+
+                let resp = client
+                    .put(format!("{proxy_url}/__sg/api/secrets/{target_id}"))
+                    .json(&serde_json::json!({
+                        "value": &new_value,
+                    }))
+                    .send().await.unwrap();
+                prop_assert_eq!(resp.status(), reqwest::StatusCode::OK,
+                    "PUT on static id must succeed (fork dynamic override)");
+
+                let updated: serde_json::Value = resp.json().await.unwrap();
+                prop_assert_eq!(&updated["source"], &"dynamic_override",
+                    "forked id source must be dynamic_override");
+                prop_assert_eq!(&updated["value_length"], &new_len,
+                    "forked value_length must reflect new (overridden) value");
+
+                // 列表中也应反映 fork.
+                let eff = fetch_effective_secrets(&client, &proxy_url).await;
+                let forked = eff.get(&target_id).expect("forked id must remain in effective");
+                prop_assert_eq!(&forked["source"], &"dynamic_override");
+                prop_assert_eq!(&forked["value_length"], &new_len);
+                Ok(())
+            })?
+        }
+
+        /// CFG-3: DELETE 仅作用于 dynamic, static id → 409.
+        ///
+        /// scenario 提供三类 id:
+        /// 1) static-only id (无 dynamic): DELETE 必须返回 409 (契约: "static id → 409",
+        ///    提示用 PATCH .../decision + mode=disabled).
+        /// 2) dynamic-only id (无 static): DELETE 必须返回 204, 且从 effective 消失.
+        /// 3) both id (static + dynamic override): DELETE 必须返回 204, 移除 dynamic override
+        ///    但保留 static 基线 (effective 中该 id 仍在, source 回落到 static).
+        /// scenario 保证三桶均 ≥1.
+        #[test]
+        fn prop_delete_dynamic_only_succeeds(scenario in arb_scenario()) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let proxy_url = spawn_with_secrets(
+                    scenario.static_entries(),
+                    scenario.dynamic_entries(),
+                ).await;
+                let client = reqwest::Client::new();
+
+                // ── static-only id → 409 ──
+                // arb_scenario 保证 static_only ≥1.
+                let static_id = scenario.static_only.first().unwrap().0.clone();
+                let resp = client
+                    .delete(format!("{proxy_url}/__sg/api/secrets/{static_id}"))
+                    .send().await.unwrap();
+                prop_assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT,
+                    "DELETE on static-only id must return 409");
+
+                // ── dynamic-only id → 204 + 从 effective 消失 ──
+                // arb_scenario 保证 dynamic_only ≥1.
+                let dyn_id = scenario.dynamic_only.first().unwrap().0.clone();
+                let resp = client
+                    .delete(format!("{proxy_url}/__sg/api/secrets/{dyn_id}"))
+                    .send().await.unwrap();
+                prop_assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT,
+                    "DELETE on dynamic-only id must return 204");
+                let eff = fetch_effective_secrets(&client, &proxy_url).await;
+                prop_assert!(!eff.contains_key(&dyn_id),
+                    "deleted dynamic-only id must disappear from effective");
+
+                // ── both id (static + dynamic override) → 204 + 保留 static 基线 ──
+                // arb_scenario 保证 both ≥1 (static + dynamic override 都存在).
+                let (both_id, sv, _dv) = scenario.both.first().unwrap().clone();
+                let sv_len = sv.chars().count();
+                let resp = client
+                    .delete(format!("{proxy_url}/__sg/api/secrets/{both_id}"))
+                    .send().await.unwrap();
+                prop_assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT,
+                    "DELETE on both id must return 204 (removes dynamic override, keeps static)");
+                let eff = fetch_effective_secrets(&client, &proxy_url).await;
+                let kept = eff.get(&both_id)
+                    .expect("both id must remain in effective (static baseline kept after dynamic delete)");
+                prop_assert_eq!(&kept["source"], &"static",
+                    "both id source must fall back to 'static' after dynamic override removed");
+                prop_assert_eq!(&kept["value_length"], &sv_len,
+                    "both id value_length must reflect static baseline after dynamic delete");
+                Ok(())
+            })?
+        }
+
+        /// CFG-3: PATCH decision 正确切换 OverrideMode.
+        ///
+        /// 对 conflict id (both 桶: static + dynamic 都有), PATCH 三种 mode 分别:
+        ///  - default       → effective 取 dynamic, source=dynamic_override, decision=default
+        ///  - prefer_static → effective 取 static,  source=static_preferred, decision=prefer_static
+        ///  - disabled      → effective 中消失 (但 has_static 仍 true, 切回 default 可恢复)
+        /// scenario 保证 both 桶 ≥1 (有 conflict id 可切换).
+        #[test]
+        fn prop_patch_decision_toggles_override_mode(scenario in arb_scenario()) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let proxy_url = spawn_with_secrets(
+                    scenario.static_entries(),
+                    scenario.dynamic_entries(),
+                ).await;
+                let client = reqwest::Client::new();
+
+                // arb_scenario 保证 both ≥1 (conflict id 可切换).
+                let (target_id, sv, dv) = scenario.both.first().unwrap().clone();
+                let sv_len = sv.chars().count();
+                let dv_len = dv.chars().count();
+
+                // ── default: dynamic 胜出 ──
+                let resp = client
+                    .patch(format!("{proxy_url}/__sg/api/secrets/{target_id}/decision"))
+                    .json(&serde_json::json!({"mode": "default"}))
+                    .send().await.unwrap();
+                prop_assert_eq!(resp.status(), reqwest::StatusCode::OK, "PATCH default must succeed");
+                let ack: serde_json::Value = resp.json().await.unwrap();
+                prop_assert_eq!(&ack["decision"], &"default");
+                let eff = fetch_effective_secrets(&client, &proxy_url).await;
+                let e = eff.get(&target_id).expect("default mode: id must be effective");
+                prop_assert_eq!(&e["source"], &"dynamic_override");
+                prop_assert_eq!(&e["decision"], &"default");
+                prop_assert_eq!(&e["value_length"], &dv_len, "default: dynamic value wins");
+
+                // ── prefer_static: static 强制 ──
+                let resp = client
+                    .patch(format!("{proxy_url}/__sg/api/secrets/{target_id}/decision"))
+                    .json(&serde_json::json!({"mode": "prefer_static"}))
+                    .send().await.unwrap();
+                prop_assert_eq!(resp.status(), reqwest::StatusCode::OK, "PATCH prefer_static must succeed");
+                let eff = fetch_effective_secrets(&client, &proxy_url).await;
+                let e = eff.get(&target_id).expect("prefer_static mode: id must be effective");
+                prop_assert_eq!(&e["source"], &"static_preferred");
+                prop_assert_eq!(&e["decision"], &"prefer_static");
+                prop_assert_eq!(&e["value_length"], &sv_len, "prefer_static: static value forced");
+
+                // ── disabled: 从 effective 消失 ──
+                let resp = client
+                    .patch(format!("{proxy_url}/__sg/api/secrets/{target_id}/decision"))
+                    .json(&serde_json::json!({"mode": "disabled"}))
+                    .send().await.unwrap();
+                prop_assert_eq!(resp.status(), reqwest::StatusCode::OK, "PATCH disabled must succeed");
+                let eff = fetch_effective_secrets(&client, &proxy_url).await;
+                prop_assert!(!eff.contains_key(&target_id),
+                    "disabled mode: id must disappear from effective");
+
+                // ── 切回 default: 必须能恢复 (回归守卫, 防 "disabled 永久锁死") ──
+                let resp = client
+                    .patch(format!("{proxy_url}/__sg/api/secrets/{target_id}/decision"))
+                    .json(&serde_json::json!({"mode": "default"}))
+                    .send().await.unwrap();
+                prop_assert_eq!(resp.status(), reqwest::StatusCode::OK,
+                    "PATCH back to default after disabled must succeed (no permanent lockout)");
+                let eff = fetch_effective_secrets(&client, &proxy_url).await;
+                let e = eff.get(&target_id).expect("default restore: id must reappear");
+                prop_assert_eq!(&e["source"], &"dynamic_override");
+                prop_assert_eq!(&e["value_length"], &dv_len, "restored default: dynamic value wins again");
+                Ok(())
+            })?
+        }
+    }
+}

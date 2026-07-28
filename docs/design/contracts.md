@@ -545,6 +545,8 @@
 - `prop_atomic_write_no_corrupt_file`: atomic_write 用 tmp + rename, 中途崩溃不留下损坏的 state.toml.
 - `prop_persist_failure_rollback_under_concurrency`: 跨表并发写时, 一表 persist 失败回滚不影响另一表 in-flight 写入.
 
+> **理想 vs 现状**: 本 property 的完整"跨表"覆盖 (装配 SecretTable + ProviderTable 共享 persist_lock + Decisions + 同一 state_path) 尚未实现; 当前测试降级为单表 N 线程并发, 覆盖 "persist_lock 串行 RMW + 失败回滚" 核心不变量, 但未触及跨表 state.toml 文件交互 (一表 atomic_write 留下损坏文件会让另一表 load_or_empty 读到错误状态) 与共享 Decisions Arc 的跨表隔离. 跨表完整覆盖作为后续工作. 成功路径的"并发不丢更新"由 CFG-5 `prop_concurrent_upserts_no_lost_update` 覆盖.
+
 ### CFG-5 跨表并发安全
 
 **陈述**: SecretTable 与 ProviderTable 共享 persist_lock (串行 RMW) 与 Decisions (同一份内存). 跨表并发写不丢更新.

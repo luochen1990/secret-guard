@@ -1204,12 +1204,14 @@ mod table_tests {
 
     /// 构造一个只读目录 + 其中的 state.toml 路径.
     /// 返回 (dir, state_path). 调用方需在测试结束时恢复权限以便清理 (drop guard).
-    struct ReadOnlyDir {
+    ///
+    /// `pub(super)`: 兄弟测试 mod (`proptests`) 复用以模拟 atomic_write 失败 (DRY).
+    pub(super) struct ReadOnlyDir {
         dir: PathBuf,
     }
 
     impl ReadOnlyDir {
-        fn new(prefix: &str) -> Self {
+        pub(super) fn new(prefix: &str) -> Self {
             let id = uuid::Uuid::new_v4().to_string();
             let dir = PathBuf::from(format!("/tmp/opencode/tmp/test-ro-{prefix}-{id}"));
             std::fs::create_dir_all(&dir).unwrap();
@@ -1217,7 +1219,7 @@ mod table_tests {
         }
 
         /// 切换到只读. 之后 atomic_write 写新文件会 EACCES.
-        fn make_readonly(&self) {
+        pub(super) fn make_readonly(&self) {
             // 0o500 = r-x for owner: 允许进入目录但禁止创建/删除文件.
             std::fs::set_permissions(
                 &self.dir,
@@ -1226,7 +1228,7 @@ mod table_tests {
             .unwrap();
         }
 
-        fn state_path(&self) -> PathBuf {
+        pub(super) fn state_path(&self) -> PathBuf {
             self.dir.join("state.toml")
         }
     }
@@ -1382,7 +1384,7 @@ mod table_tests {
 // 用 `SecretEntry` 作为 canonical 测试类型 (与 table_tests 一致, provider 行为对称).
 #[cfg(test)]
 mod proptests {
-    use super::table_tests::{empty_decisions, entry};
+    use super::table_tests::{ReadOnlyDir, empty_decisions, entry};
     use super::*;
     use crate::secrets::SecretTable;
     use proptest::prelude::*;
@@ -1840,6 +1842,210 @@ mod proptests {
             }
             // 顺便验证 count == n (无重复 / 无多余).
             prop_assert_eq!(ids.len(), n, "effective count must equal number of upserts");
+        }
+    }
+
+    // ─── CFG-4: 持久化原子性 (case 数压到 16, 涉及真实写盘 + chmod) ──────────
+    //
+    // 契约 (config.rs//! "持久化策略"): "先写 state.toml (atomic + fsync), 再更新内存,
+    // 失败自动回滚". 既有 table_tests 的 3 个 ReadOnlyDir 固定用例 (upsert/set_decision/
+    // delete 各一) 覆盖回滚机制, 本 block 把它们 property 化: 参数化操作种类 / 初始内存
+    // 状态 / 失败时机, 锁住 "任意写操作在 persist 失败时内存都不漂移" 的不变量.
+    //
+    // ReadOnlyDir / TempPath 复用自 super::table_tests / 本 mod (DRY).
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(16))]
+
+        /// CFG-4: state.toml 写失败时, 内存层不留下半提交状态.
+        ///
+        /// 参数化: 初始 dynamic 数 (0..3) + 操作种类 (upsert_new / upsert_update_existing /
+        /// delete_existing / set_decision). 对每个组合, 切只读目录后执行操作 → 必须返回 Err,
+        /// 且内存 dynamic_entries / decisions 与操作前完全一致 (没漂移).
+        #[test]
+        fn prop_persist_failure_rolls_back_memory(
+            initial_dyn in prop::collection::vec(("[a-z][a-z0-9]{0,3}", arb_value()), 0..3),
+            // 操作种类: 0 = upsert 新 id, 1 = upsert 已有 id (若非空), 2 = delete 已有 id (若非空),
+            // 3 = set_decision.
+            op_kind in 0u8..4,
+        ) {
+            // 去重初始 dynamic entries (用 HashMap 保证 id 唯一, 与 arb_scenario 风格一致).
+            let initial: Vec<SecretEntry> = initial_dyn.into_iter()
+                .collect::<HashMap<_, _>>()
+                .into_iter()
+                .map(|(id, v)| entry(&format!("d{id}"), &v))
+                .collect();
+            let initial_ids: HashSet<String> = initial.iter().map(|e| e.id().to_string()).collect();
+
+            // 只读目录: 预写一个合法的初始 state, 让 load_or_empty 能读到.
+            let ro = ReadOnlyDir::new("prop-rollback");
+            let state_path = ro.state_path();
+            let init_state = DynamicState {
+                secrets: initial.clone(),
+                ..Default::default()
+            };
+            atomic_write(&state_path, &init_state.to_toml().unwrap()).unwrap();
+
+            let t = SecretTable::new(
+                vec![entry("s-base", "static-base-value")],
+                initial.clone(),
+                empty_decisions(),
+                state_path.clone(),
+            );
+            // 快照操作前的内存状态 (用作回滚基准).
+            let mem_before: Vec<(String, String)> = t.effective_raw().into_iter()
+                .map(|e| (e.id, e.value)).collect();
+            let dec_before = t.decisions.read().clone();
+
+            // 切只读, 任何写操作都会在 persist_dynamic / set_decision 的 atomic_write 失败.
+            ro.make_readonly();
+
+            let res = match op_kind {
+                0 => t.upsert_dynamic(entry("brand-new", "brand-new-value"))
+                    .map(|_| ()),
+                1 => {
+                    // 编辑已有 dynamic id (若存在), 否则 fallback 到编辑 s-base (static fork).
+                    let target = initial.first().map(|e| e.id().to_string())
+                        .unwrap_or_else(|| "s-base".into());
+                    t.upsert_dynamic(entry(&target, "edited-value")).map(|_| ())
+                }
+                2 => {
+                    // 删除已有 dynamic id. 注意: delete_dynamic 仅当 id 在 dynamic 中才触发
+                    // persist; 若 initial 为空, target fallback 到 s-base (不在 dynamic),
+                    // delete_dynamic 返回 Ok(NotFound) 不触发 persist — 此组合无 persist 失败
+                    // 可测, 由 `expect_persist_failure` 标志区分断言.
+                    let target = initial.first().map(|e| e.id().to_string())
+                        .unwrap_or_else(|| "s-base".into());
+                    t.delete_dynamic(&target).map(|_| ())
+                }
+                _ => t.set_decision("s-base", OverrideMode::Disabled),
+            };
+            // 是否期望本次操作触发 persist (从而在只读目录下必失败)?
+            // op_kind 0/1/3 总触发 persist (upsert / set_decision 无条件持久化);
+            // op_kind 2 (delete) 仅当 initial 非空 (即 target 是真实存在的 dynamic id) 才触发.
+            let expect_persist_failure = op_kind != 2 || !initial.is_empty();
+            if expect_persist_failure {
+                // 契约: persist 失败 → 操作返回 Err (调用方能感知失败).
+                prop_assert!(res.is_err(), "write into read-only dir must fail");
+            }
+            // op_kind 2 且 initial 空: delete_dynamic(s-base) 返回 Ok(NotFound), 无 persist 无失败,
+            // 此分支 res.is_ok() 是正确的 (delete 不存在的 dynamic id 本就该返回 NotFound).
+
+            // 核心断言: 内存 dynamic_entries / decisions 完全回滚到操作前.
+            let mem_after: Vec<(String, String)> = t.effective_raw().into_iter()
+                .map(|e| (e.id, e.value)).collect();
+            prop_assert_eq!(
+                mem_after, mem_before,
+                "memory must roll back on persist failure (no half-committed state)"
+            );
+            // decisions 也未变 (set_decision 失败时尤其重要, 防 "内存 disabled 但磁盘 default").
+            prop_assert_eq!(
+                t.decisions.read().clone(), dec_before,
+                "decisions memory must roll back on persist failure"
+            );
+            // 初始 dynamic id 仍全部在内存 (新增 id 不应混入).
+            let after_ids: HashSet<String> = t.effective_raw().into_iter()
+                .map(|e| e.id).collect();
+            for id in &initial_ids {
+                prop_assert!(after_ids.contains(id), "initial dynamic id '{id}' must survive");
+            }
+            prop_assert!(!after_ids.contains("brand-new"),
+                "newly-attempted id must NOT leak into memory on persist failure");
+        }
+
+        /// CFG-4: atomic_write 用 tmp + rename, 不留下损坏的 state.toml.
+        ///
+        /// 两个不变量分场景验证:
+        ///  - **成功路径**: atomic_write 成功后, state.toml 内容 == 期望 toml (字节级);
+        ///    且目录中无残留 `.tmp` 文件 (rename 已消费 tmp).
+        ///  - **失败路径** (只读目录): atomic_write 失败时, 原 state.toml 内容**完全不变**
+        ///    (字节级), 也无残留 `.tmp` 文件 (原子性: 要么全成功, 要么全无, 无中间态).
+        ///
+        /// 不直接模拟进程崩溃 (需 kill 进程), 而是用 "失败时文件不变 + 无 tmp 残留" 锁住
+        /// atomic_write 的可观察契约 — 这正是 tmp + rename 模式对调用方的核心保证.
+        #[test]
+        fn prop_atomic_write_no_corrupt_file(content in "[a-z0-9 \\n]{1,64}") {
+            // ── 成功路径 ──
+            let ok = ReadOnlyDir::new("atomic-ok");
+            let ok_path = ok.state_path();
+            atomic_write(&ok_path, &content).expect("writable dir: atomic_write must succeed");
+            // 文件内容字节级相等.
+            let on_disk = std::fs::read_to_string(&ok_path).unwrap();
+            prop_assert_eq!(&on_disk, &content, "successful write: disk == content (no corruption)");
+            // 无残留 tmp 文件 (rename 已消费).
+            let tmp_leftover = std::fs::read_dir(ok.state_path().parent().unwrap()).unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+                .count();
+            prop_assert_eq!(tmp_leftover, 0, "success path: no leftover .tmp file");
+
+            // ── 失败路径 ──
+            let ro = ReadOnlyDir::new("atomic-fail");
+            let ro_path = ro.state_path();
+            // 预置一个旧内容 (非空), 模拟 "已有合法 state.toml".
+            let old_content = "old-preserved-content";
+            atomic_write(&ro_path, old_content).unwrap();
+            // 切只读, 再尝试写新内容 — 必须失败.
+            ro.make_readonly();
+            let res = atomic_write(&ro_path, &content);
+            prop_assert!(res.is_err(), "read-only dir: atomic_write must fail");
+            // 核心断言: 原文件内容字节级不变 (没撕裂, 没部分覆盖).
+            let still_on_disk = std::fs::read_to_string(&ro_path).unwrap();
+            prop_assert_eq!(
+                still_on_disk, old_content,
+                "failed write: original file must be byte-identical (atomic: no partial write)"
+            );
+            // 失败时也无残留 tmp (File::create 失败前不应创建, rename 失败前应清理).
+            let tmp_leftover = std::fs::read_dir(ro.state_path().parent().unwrap()).unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+                .count();
+            prop_assert_eq!(tmp_leftover, 0, "failure path: no leftover .tmp file (atomic cleanup)");
+        }
+
+        /// CFG-4: 并发写时, persist 失败回滚不影响其他 in-flight 写入.
+        ///
+        /// **降级说明 (契约 CFG-4 诚实标注)**: 契约原文要求"**跨表**并发写时, **一表** persist
+        /// 失败回滚**不影响另一表** in-flight 写入". 真正的"跨表"覆盖需要装配 SecretTable +
+        /// ProviderTable 共享 persist_lock + Decisions + 同一 state_path, 复杂度高. 本测试
+        /// **降级为单表** (同一 SecretTable) N 线程并发, 覆盖"persist_lock 串行 RMW + 失败回滚"
+        /// 这一核心不变量, 但**未触及**跨表 state.toml 文件交互 (一表 atomic_write 损坏文件
+        /// 影响另一表 load_or_empty) 与共享 Decisions Arc 的跨表隔离. 跨表完整覆盖作为后续工作.
+        ///
+        /// N (2..=6) 线程并发对只读目录上的 SecretTable 写, 断言所有写入都失败且内存不留半提交.
+        /// 成功路径 (并发不丢更新) 由 CFG-5 的 `prop_concurrent_upserts_no_lost_update` 覆盖,
+        /// 本测试纯粹聚焦失败路径, 避免与 CFG-5 重叠.
+        #[test]
+        fn prop_persist_failure_rollback_under_concurrency(
+            n in 2usize..=6,
+            value_seed in "[a-z0-9]{4,12}",
+        ) {
+            let ro = ReadOnlyDir::new("prop-conc-fail");
+            let state_path = ro.state_path();
+            atomic_write(&state_path, "").unwrap();
+            let t = SecretTable::new(vec![], vec![], empty_decisions(), state_path.clone());
+            ro.make_readonly();
+
+            let handles: Vec<_> = (0..n).map(|i| {
+                let t = t.clone();
+                let v = format!("{value_seed}{i}");
+                std::thread::spawn(move || {
+                    // 故意忽略 Err: 测试关心的是 "失败的并发写不留半提交".
+                    let _ = t.upsert_dynamic(entry(&format!("id-{i}"), &v));
+                })
+            }).collect();
+            for h in handles { h.join().unwrap(); }
+
+            // 核心: 所有写入都失败, 内存 effective 完全空 (无半提交).
+            prop_assert!(
+                t.effective_raw().is_empty(),
+                "concurrent failed writes must leave NO half-committed entries in memory"
+            );
+            // state.toml 仍是空 (字节级, 无撕裂).
+            let disk = std::fs::read_to_string(&state_path).unwrap();
+            prop_assert!(
+                disk.is_empty() || !disk.contains("id-"),
+                "concurrent failed writes: state.toml must not contain any new id"
+            );
         }
     }
 }
