@@ -276,7 +276,13 @@ just coverage-html
 just check-webui
 
 # 开发热加载
-just dev                  # cargo watch -x run
+just dev                  # cargo watch -x run (重启进程)
+just dev-test             # cargo watch -x nextest run (TDD 红绿循环)
+
+# 依赖审查 (devShell 内)
+just audit                # cargo audit (RUSTSec CVE)
+just deny                 # cargo deny (license + bans + advisory 二次审查)
+just typos                # typos-cli (拼写检查)
 
 # 手动测试 — 启动 server (需要先在 secret-guard.toml 配置 [[providers]])
 cargo run -- run --port 18787
@@ -298,6 +304,14 @@ CI 流程 (测试集只跑一次):
    用 runner VM systemPackages 已提供的 `rust-diff-analyzer` (见 nixos 仓库 `rust.mod.nix`),
    对 `origin/<PR-base>...HEAD` 跑 diff 拆解, **以 PR 评论形式贴出** (用 marker 实现同一 PR
    多次 push 的 upsert, 不刷屏). 即使工具/网络/API 失败也不影响合并.
+4. **cargo audit** (CVE 扫描, `continue-on-error` 非阻塞): 结果 upsert 到 PR 评论.
+5. **cargo-deny** (license + bans + advisory 二次审查, `continue-on-error` 非阻塞起步).
+6. **typos** (拼写检查, `continue-on-error` 非阻塞起步).
+
+非阻塞检查 (cargo audit / cargo-deny / typos) 的升级路径: 全绿观察期后由维护者移除
+`continue-on-error`. license 合规 (cargo-deny) 与 CVE (cargo audit) 性质不同 — license
+违规是真问题 (污染下游), 升级为阻塞的优先级更高; CVE 受 advisory DB 拉取网络抖动影响,
+保持非阻塞更稳.
 
 评论写回用纯 `curl` + Forgejo API (`POST/PATCH /issues/{n}/comments`), 不引入 JS action
 (vm-nix 无 node). upsert 语义: 用 HTML 注释 marker 标记评论, 找到则 PATCH 更新, 找不到
@@ -308,6 +322,12 @@ CI 流程 (测试集只跑一次):
 `forgejo-runner-vm.mod.nix`). 跨 job 复用 cargo 编译产物: 依赖 crate 只编一次, 后续 job
 增量编译 (秒级). clippy/nextest 用 `debug/` 子目录, coverage 用 `llvm-cov-target/` 子目录,
 物理隔离无需 `cargo clean`. 卷生命周期 = 主机启动期间 (tmpfs, 主机重启才丢).
+
+**并发互斥假设**: 该复用机制假设 runner vm-nix 同一时刻只跑一个 job (runner 注册时
+concurrency=1 或 single-job mode, 配置在 nixos 仓库 `forgejo-runner-vm.mod.nix`, 本仓库不可见).
+若该假设被打破 (runner 允许并发 job), 两 job 同时写同一 `CARGO_TARGET_DIR` 会触发 cargo
+file lock (慢) 或产物污染. 应对预案见 ci.yml `env` 段注释 (加 `concurrency` 串行化, 或按
+run_id 隔离 target 目录).
 
 **commit status context**: `ci / check (pull_request)` 或 `ci / check (push)`
 (workflow `name: ci` + job_id `check`; **禁止改 workflow name 或 job_id** — 会改变
@@ -421,6 +441,24 @@ prod 代码大量增加才需警惕). 工具用 syn AST 解析, 自动识别 `#[
 
 **走查纪律**: `.cargo/audit.toml` 的 ignore 项每半年走查一次; 上游若已修复, 立即移除忽略项
 并升级依赖. 走查触发 = `just audit` 时人工核对 (CI 每 PR 跑, 但 ignore 项不报错, 易遗忘).
+
+### cargo-deny (license + bans + advisory 二次审查)
+
+`cargo audit` 只覆盖 RUSTSec CVE; `cargo-deny` 额外覆盖 license 不兼容 / 重复 crate 多版本 /
+禁止依赖 / git 源审计. 项目声明 MIT 且发布到 nixpkgs overlay, license 合规是硬约束 (引入
+GPL/AGPL 等 copyleft 会污染下游). 配置在 `deny.toml`, 与 `.cargo/audit.toml` 的 `[advisories.ignore]`
+保持同步 (互为冗余兜底).
+
+- **license allow**: MIT / Apache-2.0 / BSD-* / ISC / Zlib / Unicode-* / MPL-2.0 (file-level
+  copyleft, 不污染链接产物) / CC0-1.0 / CDLA-Permissive-2.0 (webpki-roots 的 CA 根证书数据协议).
+  copyleft (GPL/AGPL/LGPL) 与不明 license 被 deny.
+- **multiple-versions = warn**: 重复 crate 只警告不阻断. Rust 生态 duplicate 多为传递依赖
+  暂态 (当前 base64/getrandom/syn/thiserror/tower-http/windows-sys 各有 2-3 版本, 已在
+  "后续工作" 记录升级计划), 强制 deny 会频繁阻塞.
+- **sources**: 只允许 crates.io + 本地 path 源, 禁止私有 registry / git 直链 (难审计).
+
+CI 非阻塞起步 (`continue-on-error: true`): 当前 `deny.toml` allow 列表已实测覆盖全部依赖
+license (本地全绿), 但升级依赖可能引入新 license 导致意外红灯. 全绿观察期后由维护者升级为阻塞.
 
 ## 部署
 

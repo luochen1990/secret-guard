@@ -20,6 +20,17 @@ run *ARGS:
 dev:
     cargo watch -x 'run -- run'
 
+# 开发模式 (仅重启进程, 现有 dev 行为的显式别名): 改代码后自动重新运行 secret-guard.
+# 与 dev 等价; 单独命名是为了与 dev-test 形成对称的 "run / test" 开发命令对.
+dev-run:
+    cargo watch -x 'run -- run'
+
+# 开发模式 test watcher (TDD 红绿循环): 改代码后自动跑 nextest.
+# 不用 `cargo watch -x 'run' -x 'nextest run'` 组合 (watch 支持多 -x 串行), 因为 run
+# 会阻塞 (server 常驻), 后续 nextest 永远轮不到; 拆成独立 recipe 让用户按需选其一.
+dev-test:
+    cargo watch -x 'nextest run'
+
 # 一次跑完: fmt + clippy + machete + test.
 # --coverage: 测试阶段改用插桩编译 (cargo llvm-cov nextest), 产出覆盖率数据到
 # ${CARGO_TARGET_DIR}/llvm-cov-target/, 后续 just coverage-gate / coverage-html 直接消费, 无需重跑测试.
@@ -72,6 +83,10 @@ check-webui:
     cd tests/webui && playwright test
 
 # check + check-webui (完整验证, devShell 内).
+# 行为差异提醒: 本地 check-all 让 Playwright 阻塞 (失败即 exit 1), 但 CI 的 WebUI step
+# 用 continue-on-error (非阻塞, 见 .forgejo/workflows/ci.yml WebUI regression step 注释).
+# 即 "本地全绿 → push" 不代表 CI 必绿 — CI flake 不会阻断合并, 维护者需人工关注 CI log.
+# 这是有意设计 (WebUI 在 CI 环境 flake 率高), 详见 ci.yml 注释与 AGENTS.md "CI" 段.
 check-all: check
     cd tests/webui && playwright test
 
@@ -138,6 +153,22 @@ mock-upstream:
 # 检查依赖漏洞.
 audit:
     cargo audit
+
+# license 合规 + 依赖 bans + advisory 二次审查 (cargo-deny).
+# 与 audit 的分工: audit 专注 RUSTSec CVE; deny 额外覆盖 license 不兼容 / 重复 crate
+# 多版本 / 禁止依赖. 项目声明 MIT 且发布到 nixpkgs overlay, license 合规是硬约束
+# (引入 GPL/AGPL 等 copyleft 会污染下游). 配置见 deny.toml.
+#
+# 重复 crate (multiple-versions) 在 deny.toml 配为 warn 不阻断 — Rust 生态 duplicate
+# 多为传递依赖暂态, 强制 deny 会频繁阻塞. 跑本命令看完整列表, 维护者主动评估能否 dedupe.
+deny:
+    cargo deny check --hide-inclusion-graph
+
+# 拼写检查 (typos-cli). 项目大量英文术语与中文注释混排, 拼写错误难人工抓.
+# 默认不限制退出码语义: 发现 typo 即 exit 1. CI 里用 continue-on-error 非阻塞起步.
+# 白名单 (合法标识符 / test fixture 误报) 见 _typos.toml, 每项需注释说明为何是误报.
+typos:
+    typos
 
 # redact 性能基线 (criterion bench).
 # 详尽设计 (3 场景 + 2 目标 + 为什么手动构造 map) 见 benches/redact.rs 头部.

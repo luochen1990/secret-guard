@@ -1,0 +1,22 @@
+# typos-cli 配置: 拼写检查白名单.
+#
+# 项目大量英文术语与中文注释混排, 默认词表对合法标识符 / test fixture 会误报.
+# 本文件只收录经人工确认为合法的误报 (identifier / fixture), 不放真 typo.
+#
+# 字段语义:
+#   [default.extend-identifiers]: 只在 "作为 identifier 出现" 时忽略 (大小写敏感全词匹配).
+#                                 适合变量名 / 类型名 (不会误放过字符串里的同名子串).
+#   [default.extend-words]:       作为单词出现就忽略 (不纠正). 适合 test fixture 字符串片段.
+#   [default.extend-ignore-words-re]: 正则忽略, 更宽泛, 谨慎用.
+#
+# 维护纪律: 每项必须有注释说明为什么是误报 (合法标识符含义 / fixture 用途).
+
+[default.extend-identifiers]
+# pn = parent node (DAG 父节点变量, dag.rs 内部约定).
+pn = "pn"
+
+[default.extend-words]
+# hel / abd = SSE 流式测试 fixture 的字符串片段 (codec/stream.rs / auth/apikey.rs),
+# 非 English 单词, 是构造畸形输入验证 parser 鲁棒性的字面量, 不应被纠正.
+hel = "hel"
+abd = "abd"

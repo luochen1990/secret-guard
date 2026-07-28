@@ -41,6 +41,14 @@ jobs:
     #
     # CARGO_TARGET_DIR 指向 runner VM 的持久卷, 跨 job 复用编译产物.
     # 完整机制 (卷生命周期 / 子目录隔离 / 串行保证) 见 AGENTS.md "CI" 段.
+    #
+    # 并发互斥假设 (issue #86 子项 #4): 本 workflow 假设 runner vm-nix 同一时刻只跑一个 job
+    # (即 runner 注册时 concurrency 设为 1, 或 forgejo-runner 配置 single-job mode).
+    # 若该假设不成立 (runner 允许并发 job), 两个 job 同时写同一 CARGO_TARGET_DIR 会触发
+    # cargo `Blocking waiting for file lock` (慢) 或产物交错污染. 该假设的确认在 nixos 仓库
+    # forgejo-runner-vm.mod.nix (本仓库不可见); 若未来 runner 改为多并发, 需在此加
+    # `concurrency: { group: ci-vm-nix, cancel-in-progress: false }` 串行化所有 CI run,
+    # 或改 CARGO_TARGET_DIR 按 run_id 隔离 (但会丢跨 job 缓存复用, 编译变慢).
     env:
       LLVM_COV: /run/current-system/sw/bin/llvm-cov
       LLVM_PROFDATA: /run/current-system/sw/bin/llvm-profdata
@@ -165,6 +173,11 @@ jobs:
       # 初期 continue-on-error: true — Playwright 在 CI 环境 (无 GPU / chromium 渲染稳定性)
       # 可能有 flake, 不阻塞合并. 稳定后改为阻塞.
       #
+      # 退出条件 (issue #86 子项 #2): 当连续 N=20 次 master 分支 (push 事件) 本 step 跑绿,
+      # 移除 continue-on-error 升级为阻塞. 判定方式: 翻 Actions 历史, 筛 master + WebUI step,
+      # 取最近 20 次全绿即达标. 升级前先在本 PR 评论记录达标证据 (20 次 run 链接).
+      # 未达标前, 维护者合并 PR 时需人工核对 CI log 中 WebUI step 是否非绿 (CI 不阻断).
+      #
       # 前置 (forgejo-runner-vm.mod.nix 的 VM systemPackages 已含 playwright-test nodejs python3):
       # 见 ~/ws/nixos/private/pubserv/forgejo-runner-vm.mod.nix (此 PR 不改 nixos 仓库,
       # 假设 VM 已含所需工具 — 如果 VM 缺工具, 此 step 会失败但 continue-on-error 不阻塞).
@@ -241,6 +254,32 @@ jobs:
               "$API" >/dev/null
             echo "Created new audit comment"
           fi
+
+      # cargo-deny: license 合规 + 依赖 bans + advisory 二次审查 (issue #86 子项 #1).
+      # 与 cargo audit 的分工: audit 专注 RUSTSec CVE; deny 额外覆盖 license 不兼容 /
+      # 重复 crate 多版本 / 禁止依赖. 项目声明 MIT 且发布到 nixpkgs overlay, license 合规
+      # 是硬约束 (引入 copyleft 会污染下游). 配置见 deny.toml.
+      #
+      # 非阻塞起步 (continue-on-error: true): 当前 deny.toml 的 allow 列表已实测覆盖全部
+      # 依赖 license (本地全绿), 但升级依赖时可能引入新 license 导致意外红灯. 全绿观察期后
+      # (建议与本 PR 合并后观察 N 次 master run 全绿), 由维护者移除 continue-on-error 升级
+      # 为阻塞门禁. multiple-versions 在 deny.toml 配为 warn 不阻断 (传递依赖暂态).
+      #
+      # 工具: cargo-deny. devShell 已含 (flake.nix); VM 通过 host-sw-bin fallback 提供
+      # (若缺, 此 step 失败但 continue-on-error 不阻塞).
+      - name: cargo-deny (license + bans + advisory)
+        continue-on-error: true
+        run: just deny
+
+      # typos-cli: 拼写检查 (issue #86 子项 #6, 可选).
+      # 项目大量英文术语与中文注释混排, 拼写错误难人工抓. typos-cli 是 Rust 项目标配.
+      #
+      # 非阻塞起步 (continue-on-error: true): 默认词表可能对项目专有术语误报, 白名单
+      # (_typos.toml) 需逐步沉淀. 当前白名单已覆盖已知误报 (pn / hel / abd), 本地全绿.
+      # 升级依赖或新增代码可能引入新误报, 全绿观察期后由维护者决定是否升级为阻塞.
+      - name: typos (spell check)
+        continue-on-error: true
+        run: just typos
 
       # bench 编译验证: 已移除.
       # 原因: cargo bench --no-run 走 release profile (lto=thin + codegen-units=1),

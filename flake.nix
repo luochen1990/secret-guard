@@ -76,7 +76,9 @@
           cargo-nextest
           cargo-machete
           cargo-audit
+          cargo-deny
           cargo-llvm-cov
+          typos
           rust-analyzer
           pkg-config
           openssl
