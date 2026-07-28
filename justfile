@@ -14,7 +14,7 @@ build:
 
 # 编译并运行.
 run *ARGS:
-    cargo run -- {{ARGS}}
+    cargo run -- {{ ARGS }}
 
 # 开发模式: 自动重编译 (cargo-watch).
 dev:
@@ -50,7 +50,7 @@ check *ARGS:
     cargo clippy --all-targets -- -D warnings
     cargo machete
     # cargo test --doc
-    @if echo "{{ARGS}}" | grep -q -- "--coverage"; then \
+    @if echo "{{ ARGS }}" | grep -q -- "--coverage"; then \
         cargo llvm-cov clean --workspace; \
         cargo llvm-cov nextest --no-fail-fast --no-report; \
     else \
@@ -107,11 +107,11 @@ coverage:
 # 覆盖率门禁 (CI 用): 双阈值, 任一不满足则非零退出.
 # 前置: check --coverage 已产出 profdata 到 target/llvm-cov-target/. 本 recipe 只做 report.
 #   --fail-under-lines:     总行覆盖率下限 (防整体下降)
-#   --fail-uncovered-lines: 未覆盖行数上限 (防未覆盖绝对值增长)
+# --fail-uncovered-lines: 未覆盖行数上限 (防未覆盖绝对值增长)
 coverage-gate:
     cargo llvm-cov report --summary-only \
-      --fail-under-lines {{COVERAGE_MIN_LINES}} \
-      --fail-uncovered-lines {{COVERAGE_MAX_UNCOVERED}}
+      --fail-under-lines {{ COVERAGE_MIN_LINES }} \
+      --fail-uncovered-lines {{ COVERAGE_MAX_UNCOVERED }}
 
 # HTML 报告 (浏览器打开 coverage/html/index.html).
 coverage-html:
@@ -191,24 +191,24 @@ check-file-size:
         errors="${errors}TOOL-FAIL $f"$'\n'
         continue
       fi
-      if [ "$prod" -gt {{FILE_MAX_PROD_LINES}} ]; then
+      if [ "$prod" -gt {{ FILE_MAX_PROD_LINES }} ]; then
         errors="$errors$prod $f"$'\n'
-      elif [ "$prod" -gt {{FILE_WARN_PROD_LINES}} ]; then
+      elif [ "$prod" -gt {{ FILE_WARN_PROD_LINES }} ]; then
         warnings="$warnings$prod $f"$'\n'
       fi
     done < <(find src -name '*.rs' -print0)
     # 按行数降序输出 (最该拆的排第一). sort -rn: 数字逆序.
     # grep -v '^$': 过滤 printf 末尾换行产生的空行, 避免 sed 缩进成纯空格行.
     if [ -n "$warnings" ]; then
-      echo "::warning::Files exceeding {{FILE_WARN_PROD_LINES}} prod lines (consider splitting; test code excluded):"
+      echo "::warning::Files exceeding {{ FILE_WARN_PROD_LINES }} prod lines (consider splitting; test code excluded):"
       printf '%s\n' "$warnings" | grep -v '^$' | sort -rn | sed 's|^|  |'
     fi
     if [ -n "$errors" ]; then
-      echo "::error::Files blocked by gate (exceeding {{FILE_MAX_PROD_LINES}} prod lines or tool failure; test code excluded):"
+      echo "::error::Files blocked by gate (exceeding {{ FILE_MAX_PROD_LINES }} prod lines or tool failure; test code excluded):"
       printf '%s\n' "$errors" | grep -v '^$' | sort -rn | sed 's|^|  |'
       exit 1
     fi
-    echo "All source files within {{FILE_MAX_PROD_LINES}} prod-line limit (test code excluded)."
+    echo "All source files within {{ FILE_MAX_PROD_LINES }} prod-line limit (test code excluded)."
 
 # ─── PR diff 拆解 ──────────────────────────────────────────────────────────
 # 区分 diff 中的 prod 代码 vs test 代码, 用于 review 时判断真实膨胀.
@@ -237,7 +237,7 @@ diff-loc *ARGS:
     # --no-fail 始终补; --format 仅在用户未传时补默认 human.
     # 同时识别 --format X 和 --format=X (clap 拒绝 --format 重复出现).
     FORMAT=()
-    if [[ " {{ARGS}} " != *" --format "* && " {{ARGS}} " != *" --format="* ]]; then
+    if [[ " {{ ARGS }} " != *" --format "* && " {{ ARGS }} " != *" --format="* ]]; then
         FORMAT=(--format human)
     fi
-    git diff "$BASE...HEAD" | rust-diff-analyzer "${FORMAT[@]}" --no-fail {{ARGS}}
+    git diff "$BASE...HEAD" | rust-diff-analyzer "${FORMAT[@]}" --no-fail {{ ARGS }}
