@@ -3523,6 +3523,183 @@ mod tests {
         format!("{{\"messages\":[{}]}}", msgs.join(","))
     }
 
+    // ─── CDAG-5 redact_seed 可重现 (契约 §4 CDAG-5) ───────────────────────────
+    //
+    // 契约: docs/design/contracts.md L374-379.
+    // 给定 (req_delta, policy, seed) 三元组, RedactionMap 完全确定. seed=0 表示
+    // passthrough (无 redact). 实现: redact_ir 是纯函数 (除修改 IR 外无副作用), 对同一
+    // (IrRequest 副本, secrets 切片) 两次调用产同一 (RedactionMap, seed).
+    //
+    // 这是 lazy redact 重建的根基 (DAG node 存 redact_seed, 未来可从 (req_delta, policy,
+    // seed) 重建 RedactionMap 而不必存 map 本身).
+
+    /// 测试用 secret 构造器 (复用 redact.rs::entry 的 resolve 语义).
+    /// 返回 resolve 后的 SecretEntry (Auto 模式 mock_strategy 被 infer).
+    fn make_secret_entry(id: &str, value: &str) -> crate::secrets::SecretEntry {
+        use crate::mock::MockStrategy;
+        use crate::secrets::SecretCategory;
+        let mut e = crate::secrets::SecretEntry {
+            id: id.to_string(),
+            name: None,
+            category: SecretCategory::ApiKey,
+            value: value.to_string(),
+            value_file: None,
+            mock_strategy: MockStrategy::default(),
+        };
+        e.mock_strategy.resolve_against(&e.value, "");
+        e
+    }
+
+    /// 构造含 1..N 个 secret 的 IrRequest (system + messages, secret 注入到 text 叶子).
+    /// 用于 CDAG-5 redact_ir 可重现 property.
+    fn arb_ir_with_secrets() -> impl Strategy<
+        Value = (
+            crate::codec::ir::IrRequest,
+            Vec<crate::secrets::SecretEntry>,
+        ),
+    > {
+        (
+            "[a-z]{3,10}",    // text 前缀
+            "[a-z0-9]{4,10}", // secret value
+            1usize..=4,       // secret 数量
+        )
+            .prop_map(|(prefix, secret_val, n_secrets)| {
+                use crate::codec::ir::{IrBlock, IrMessage, IrRequest, IrRole};
+                let secrets: Vec<crate::secrets::SecretEntry> = (0..n_secrets)
+                    .map(|i| make_secret_entry(&format!("sec_{i}"), &format!("{secret_val}_{i}")))
+                    .collect();
+                // 构造 text: prefix + 每个 secret 依次出现 (确保 ir_request_contains 命中).
+                let mut text = prefix.to_string();
+                for s in &secrets {
+                    text.push(' ');
+                    text.push_str(&s.value);
+                }
+                let ir = IrRequest {
+                    system: vec![],
+                    messages: vec![IrMessage {
+                        role: IrRole::User,
+                        content: vec![IrBlock::Text { text }],
+                        ..Default::default()
+                    }],
+                    model: "test-model".to_string(),
+                    ..Default::default()
+                };
+                (ir, secrets)
+            })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// CDAG-5 `prop_redact_map_reproducible_from_seed`:
+        /// 给定 (IrRequest, secrets) 三元组 (seed 由 secrets 确定 = init_seed(secrets)),
+        /// 两次 redact_ir 产出同一 (RedactionMap, seed).
+        ///
+        /// redact_ir 修改 IR, 故两次调用需独立 IR 副本. 比较返回的 (RedactionMap, seed):
+        /// - RedactionMap impl PartialEq/Eq → 可直接 assert_eq.
+        /// - seed 是 u64 → assert_eq.
+        ///
+        /// 生成器覆盖 (§0.3 第 3 条): 1..4 个 secret (覆盖多 secret 场景), secret 注入到
+        /// text 叶子 (确保命中). secret 互不相同 (后缀 _i).
+        #[test]
+        fn prop_redact_map_reproducible_from_seed(
+            case in arb_ir_with_secrets()
+        ) {
+            use crate::redact::redact_ir;
+            let (ir1, secrets) = case;
+            // 两份独立 IR 副本 (redact_ir 消耗 IR, 第二次调用需未改写的 IR).
+            let (mut ir_a, mut ir_b) = (ir1.clone(), ir1.clone());
+
+            let (map1, seed1) = redact_ir(&mut ir_a, &secrets);
+            let (map2, seed2) = redact_ir(&mut ir_b, &secrets);
+
+            prop_assert_eq!(
+                &map1, &map2,
+                "CDAG-5: 同一 (req_delta, policy, seed) 产出不同 RedactionMap"
+            );
+            prop_assert_eq!(
+                seed1, seed2,
+                "CDAG-5: 同一 policy 产出不同 seed"
+            );
+            // seed 一致性也等价于 init_seed(secrets) (redact_ir 内部用 init_seed).
+            let expected_seed = crate::redact::init_seed(&secrets);
+            // seed 可能是 0 (无 secret 命中) 或 init_seed (命中). 这里 secret 注入到 text
+            // 必然命中, 故 seed 应 == init_seed (非 0).
+            prop_assert_eq!(
+                seed1, expected_seed,
+                "CDAG-5: seed 应等于 init_seed(secrets) (secret 命中时)"
+            );
+        }
+    }
+
+    // ─── CDAG-8 session 聚类稳定 (契约 §4 CDAG-8) ─────────────────────────────
+    //
+    // 契约: docs/design/contracts.md L400-406.
+    // Session id 由根 node 的 prefix_hash 决定 (稳定标识). 同一会话 N 轮请求的 leaf node
+    // 前移时 session id 不变. fork (前缀相同但后续不同, 且 parent 不是当前 leaf) 创建新 session.
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        /// CDAG-8 `prop_session_id_stable_across_rounds`:
+        /// 同一会话 N (≥3) 轮 push (每轮是前一轮的超集, parent 是当前 leaf → 延续同一 session),
+        /// 所有返回的 session_id 恒等.
+        ///
+        /// 模型: push [m1] → A (root, session S); push [m1, m2] → B (parent=A, 延续 S);
+        /// push [m1, m2, m3] → C (parent=B, 延续 S). 三轮 session_id 全等.
+        #[test]
+        fn prop_session_id_stable_across_rounds(
+            m1 in arb_text_message(),
+            m2 in arb_text_message(),
+            m3 in arb_text_message(),
+            m4 in arb_text_message(),
+        ) {
+            let dag = ConversationDag::new(64, 500, 1);
+            // 累积 push: 每轮是前一轮 messages 的超集 (delta = 新增的最后一条).
+            let id_a = dag.push_messages(vec![m1.clone()], dummy_event());
+            let id_b = dag.push_messages(vec![m1.clone(), m2.clone()], dummy_event());
+            let id_c = dag.push_messages(vec![m1.clone(), m2.clone(), m3.clone()], dummy_event());
+            let id_d = dag.push_messages(vec![m1, m2, m3, m4], dummy_event());
+
+            let sid_a = dag.get_node(id_a).expect("A exists").session_id;
+            let sid_b = dag.get_node(id_b).expect("B exists").session_id;
+            let sid_c = dag.get_node(id_c).expect("C exists").session_id;
+            let sid_d = dag.get_node(id_d).expect("D exists").session_id;
+
+            // 四轮 session_id 全等 (parent 都是当前 leaf → 延续同一 session).
+            prop_assert_eq!(sid_a, sid_b, "B 应延续 A 的 session");
+            prop_assert_eq!(sid_b, sid_c, "C 应延续 B 的 session");
+            prop_assert_eq!(sid_c, sid_d, "D 应延续 C 的 session");
+        }
+
+        /// CDAG-8 `prop_session_fork_creates_new_session`:
+        /// fork (前缀相同但后续不同, 且 parent 已被后续轮次取代 → 不是当前 leaf) 创建新 session.
+        ///
+        /// 模型: push [m1] → A; push [m1, m2] → B (B 取代 A 成为 leaf).
+        /// 再 push [m1, m3] → C (parent=A, 但 A 不是当前 leaf → fork → 新 session).
+        /// 断言: C 的 session_id != B 的 session_id.
+        #[test]
+        fn prop_session_fork_creates_new_session(
+            m1 in arb_text_message(),
+            m2 in arb_text_message(),
+            m3 in arb_text_message(),
+        ) {
+            let dag = ConversationDag::new(64, 500, 1);
+            let _id_a = dag.push_messages(vec![m1.clone()], dummy_event());
+            let id_b = dag.push_messages(vec![m1.clone(), m2], dummy_event());
+            // C: parent=A (前缀 [m1] 命中), 但 A 不是当前 leaf (B 是) → fork.
+            let id_c = dag.push_messages(vec![m1, m3], dummy_event());
+
+            let sid_b = dag.get_node(id_b).expect("B exists").session_id;
+            let sid_c = dag.get_node(id_c).expect("C exists").session_id;
+
+            prop_assert_ne!(
+                sid_b, sid_c,
+                "CDAG-8 fork: C (parent=A, A 非 leaf) 应创建新 session, 与 B 不同"
+            );
+        }
+    }
+
     // ─── 两级锁并发回归 (perf: attach / update_parsed 不应阻塞全局) ───────
     //
     // 这组测试守卫两级锁改动的线程安全: 8 writer 并发 attach_response +
