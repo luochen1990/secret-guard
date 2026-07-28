@@ -47,8 +47,10 @@ confidence-threshold = 0.8
 unused-allowed-license = "allow"
 
 # ─── bans ──────────────────────────────────────────────────────────────────
-# 默认配置: 不强制 deny 多版本 (由 licenses.multiple-versions = "warn" 统一管控),
-# 不设 deny list (当前无明确禁止的 crate). 主要价值是 multiple-versions 报告.
+# multiple-versions = "warn": 重复 crate 只警告不阻断 (Rust 生态 duplicate 多为传递
+#   依赖暂态, 强制 deny 会频繁阻塞). 跑 `just deny` 看完整列表, 维护者主动评估能否 dedupe.
+# wildcards = "warn": crate 名含通配符 (如 `*`) 时警告, 防意外引入宽匹配依赖.
+# 不设 deny list (当前无明确禁止的 crate).
 [bans]
 multiple-versions = "warn"
 wildcards = "warn"

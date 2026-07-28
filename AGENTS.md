@@ -106,6 +106,8 @@
 
 已实践位置: `web::api::extract_preview_and_model` (preview 提取),
 `dag::extract_delta_messages_from_raw` (delta 切片).
+(注: 前端 `toolNameOfRound` 已删除, tool name 推断迁移到后端 `extract_preview_and_model`,
+由 `prop_preview_never_panics` 统一守卫, 详见 `docs/design/contracts.md` §8 ROB-1.)
 
 > **例外 — DAG 核心数据结构不用 best-effort**: `dag::BlockPool::intern` 的 collision check
 > 用 `assert!` (非 `debug_assert!`), release 也 panic. 理由: collision 属哈希函数 bug,
