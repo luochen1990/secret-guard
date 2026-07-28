@@ -14,7 +14,7 @@
 //!
 //! # 安全姿态
 //!
-//! - GET 永不返回 secret 的 `value` / provider 的 `api_key` 真实值 (用 [`mask_value`] 占位).
+//! - GET 永不返回 secret 的 `value` / provider 的 `api_key` 真实值 (用 [`crate::secrets::mask_value`] 占位).
 //! - 写操作通过同源策略 + 本地监听 (默认 127.0.0.1) 保护.
 //! - 内部错误细节不通过响应体返回, 仅进 tracing.
 
@@ -551,8 +551,8 @@ pub struct SelectedCursor {
 
 /// POST /api/sync 响应体.
 ///
-/// 字段直接透传 DAG 层的 [`crate::dag::SyncSnapshot`] (Vec<SessionView> +
-/// HashMap<SessionId, Vec<RoundBrief>> + Option<TimelineDiffData>).
+/// 字段直接透传 DAG 层的 [`crate::dag::SyncSnapshot`] (`Vec<SessionView>` +
+/// `HashMap<SessionId, Vec<RoundBrief>>` + `Option<TimelineDiffData>`).
 /// `timeline = None` 表示无 diff (前端游标已是最新, 等价 304).
 #[derive(Serialize)]
 pub struct SyncResponse {

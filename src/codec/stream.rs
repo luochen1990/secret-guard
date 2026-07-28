@@ -394,7 +394,7 @@ pub struct StreamScan {
     decode: StreamDecodeState,
     /// 累积的响应元数据 (model/id/created/usage/stop_reason 等).
     meta: IrResponseMeta,
-    /// block index → 累积状态. 流过程中按 index 暂存, finish 时折叠为 Vec<IrBlock>.
+    /// block index → 累积状态. 流过程中按 index 暂存, finish 时折叠为 `Vec<IrBlock>`.
     blocks: std::collections::BTreeMap<usize, ScanBlock>,
     /// 块的最终顺序 (finish 时按此顺序折叠, 与到达顺序一致).
     block_order: Vec<usize>,

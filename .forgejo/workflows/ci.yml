@@ -177,6 +177,77 @@ jobs:
       #
       # continue-on-error: true: 新 CVE 出现时不应阻塞正在进行的 PR (由维护者单独处理).
       # 数据库 advisory DB 拉取可能因网络抖动失败, 也不应阻塞.
+      #
+      # 输出捕获: tee 到 audit.txt 供下一步 upsert 到 PR 评论 (复用 diff-loc 的 marker 机制,
+      # 让 CVE 不只埋在 job log, 维护者能在 PR 评审时直接看到).
       - name: cargo audit (CVE scan)
+        id: audit
         continue-on-error: true
-        run: just audit
+        run: |
+          set +e  # 即使 audit 报告 CVE 也继续捕获输出 (cargo audit 发现漏洞会 exit 1)
+          just audit 2>&1 | tee audit.txt
+          EXIT=${PIPESTATUS[0]}
+          echo "exit_code=$EXIT" >> "$GITHUB_OUTPUT"
+          # 把报告归档到 step output 供下一步消费 (无 CVE 时也贴, 便于维护者确认 audit 真的跑了)
+          {
+            echo "report<<EOF"
+            cat audit.txt
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          exit 0  # continue-on-error 已兜底, 这里永远成功
+
+      # audit 结果 upsert 到 PR 评论 (仅 PR 事件): 复用 diff-loc 的 marker 机制.
+      # 真正非阻塞 (continue-on-error: true): API/网络失败不影响合并.
+      # 动机见上方 audit step 的"输出捕获"注释 — 让非阻塞的 CVE 不只埋在 job log.
+      - name: Upsert cargo audit report to PR
+        if: always() && github.event_name == 'pull_request' && steps.audit.outputs.exit_code != ''
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EXIT_CODE: ${{ steps.audit.outputs.exit_code }}
+          REPORT: ${{ steps.audit.outputs.report }}
+        run: |
+          set -eu
+          MARKER='<!-- cargo-audit -->'
+          if [ "$EXIT_CODE" = "0" ]; then
+            BODY="✅ **cargo audit**: no vulnerabilities (excluding ignored advisories)."
+          else
+            BODY="⚠️ **cargo audit**: vulnerabilities found (exit $EXIT_CODE). Ignored advisories 见 \`.cargo/audit.toml\`."
+          fi
+          # 仅在有漏洞时贴完整报告 (无漏洞时一行摘要即可, 减少噪音)
+          if [ "$EXIT_CODE" != "0" ]; then
+            BODY="$BODY"$'\n\n```\n'"$REPORT"$'\n```'
+          fi
+          FULL_BODY="$MARKER"$'\n'"$BODY"
+          API="https://git.lambda.lc/api/v1/repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments"
+
+          EXISTING_ID=$(curl -fsSL -H "Authorization: token $GITHUB_TOKEN" "$API" \
+            | jq --arg m "$MARKER" '.[] | select(.body | contains($m)) | .id' | head -1)
+
+          PAYLOAD=$(jq -n --arg b "$FULL_BODY" '{body: $b}')
+          if [ -n "$EXISTING_ID" ]; then
+            curl -fsSL -X PATCH \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$PAYLOAD" \
+              "$API/$EXISTING_ID" >/dev/null
+            echo "Updated audit comment $EXISTING_ID"
+          else
+            curl -fsSL -X POST \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$PAYLOAD" \
+              "$API" >/dev/null
+            echo "Created new audit comment"
+          fi
+
+      # bench 编译验证: 确保 benches/redact.rs 至少能通过编译 (不跑采样, 零样本, 防止
+      # bench 代码逻辑错误 / runtime panic 长期不被发现). 真正非阻塞: bench 仅是性能基线,
+      # 编译失败不阻塞合并.
+      #
+      # 注: 这里只验证 --no-run, 不做 baseline 保存/比较 (那需要在 master 维护一份基线产物,
+      # 复杂度高, 见 AGENTS.md 后续工作). 当前阶段先把"bench 代码可编译"这个最低门槛守住.
+      - name: Bench compile check
+        continue-on-error: true
+        run: just check-benches

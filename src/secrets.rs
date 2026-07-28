@@ -10,7 +10,7 @@
 //!
 //! 合并 / CRUD / 持久化等所有通用逻辑都在 [`crate::config::DynamicTable`] 中实现,
 //! 本模块只补充 Secret 类型特定的小部分: [`DynamicEntry`] impl + effective 视图
-//! 的 masked 映射 ([`compute_effective_secret`]) + secret 校验工具.
+//! 的 masked 映射 (`compute_effective_secret`) + secret 校验工具.
 //!
 //! # 持久化与并发
 //!
@@ -352,7 +352,7 @@ pub struct EffectiveSecret {
     pub dynamic_version: Option<SecretMasked>,
 }
 
-/// 对外返回时屏蔽真实 value. 见 [`mask_value`] 的脱敏规则.
+/// 对外返回时屏蔽真实 value. 见 `mask_value` 的脱敏规则.
 #[derive(Debug, Clone, Serialize)]
 pub struct SecretMasked {
     pub id: String,

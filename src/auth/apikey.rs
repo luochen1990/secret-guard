@@ -2,7 +2,7 @@
 //!
 //! - 独立的 `Arc<RwLock<Vec<ApiKeyEntry>>>` (不复用 DynamicTable — API key 是纯动态的,
 //!   没有 static 基线 / decision override, 套用 DynamicTable 是过度设计).
-//! - 持久化复用 [`crate::config::atomic_write`], 与 provider/secret 共享 `persist_lock`.
+//! - 持久化复用 `crate::config::atomic_write`, 与 provider/secret 共享 `persist_lock`.
 //! - key 明文永不持久化, 只存 SHA-256 hash. 校验时对请求中的 key 做 hash 比对.
 //!
 //! # 静态 key

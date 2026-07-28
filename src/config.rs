@@ -153,7 +153,7 @@ impl Config {
     /// 加载序列 (启动 fail-fast):
     /// 1. [`DynamicEntry::validate`] — 结构校验 (id 格式 / value 与 value_file 互斥).
     /// 2. [`SecretEntry::resolve_value`] — 若设置了 `value_file`, 从文件读取写入 `value`.
-    /// 3. [`validate_value`] — resolve 后跑最终内容校验 (长度 / mock prefix / PUA),
+    /// 3. `validate_value` — resolve 后跑最终内容校验 (长度 / mock prefix / PUA),
     ///    因为 trim 后的 value 才是 redact 实际使用的字节.
     ///
     /// 任一步失败都返回 `Err`, 让误配在启动时就暴露, 而不是被运行时代码路径静默吞掉.
@@ -312,7 +312,7 @@ pub fn pick_effective<T>(
 
 /// 由 (has_static, has_dynamic, mode) 推导 EffectiveSource. 与 [`pick_effective`] 严格对偶:
 /// `pick_effective` 返回 None 的输入 (Disabled / 全空 / dynamic-only+PreferStatic),
-/// 本函数也返回 None. 这样 [`compute_effective_*`] 中的 `.expect` 不会在生产 panic.
+/// 本函数也返回 None. 这样 `compute_effective_*` 中的 `.expect` 不会在生产 panic.
 pub fn classify_source(
     has_static: bool,
     has_dynamic: bool,

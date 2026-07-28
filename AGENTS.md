@@ -105,12 +105,12 @@
    (如 "假设 messages 数组中 user 在 assistant 之前"), 以及假设不成立时的降级行为.
 
 已实践位置: `web::api::extract_preview_and_model` (preview 提取),
-`dag::extract_delta_messages` (delta 切片), `index.html::toolNameOfRound` (tool name 推断).
+`dag::extract_delta_messages_from_raw` (delta 切片), `index.html::toolNameOfRound` (tool name 推断).
 
 > **例外 — DAG 核心数据结构不用 best-effort**: `dag::BlockPool::intern` 的 collision check
 > 用 `assert!` (非 `debug_assert!`), release 也 panic. 理由: collision 属哈希函数 bug,
 > 静默覆盖会让两个不同 block 共享 hash 引发难定位的数据损坏, panic 是更优选择. 详见
-> **CDAG-6** 契约 (`docs/design/contracts.md` §6).
+> **CDAG-6** 契约 (`docs/design/contracts.md` §4).
 
 ### 视图正确性确保机制 (View-Correctness Discipline) → VIEW-* 契约
 
@@ -138,9 +138,13 @@ Redact 不应无必要地改变 request body 的字节内容, 避免破坏 LLM P
 保证同一 policy + 同一上下文 → 同一 mock. 详尽契约 (C1-C6) 见 `src/redact.rs` 头部
 与 `src/mock.rs` 头部.
 
-## 前端不变量 (UI Invariants) → UI-1..UI-6 契约 (I1..I5)
+## 前端不变量 (UI Invariants) → UI-1..UI-6 契约
 
-> 以下五条是**跨 web/dag/index.html 的强不变量**, 任何渲染优化或内存重构不得违反.
+> 以下条目是**跨 web/dag/index.html 的强不变量**, 任何渲染优化或内存重构不得违反.
+>
+> **编号映射**: AGENTS.md 的 `I*` 是 contracts.md `UI-*` 的前身 (历史编号).
+> `I1=UI-1`, `I2=UI-2`, `I3=UI-3`, `I4=UI-6 的 selectedRound 子属性`, `I5=UI-6`.
+> contracts.md 收录并扩展为 UI-1..UI-6, 以 contracts.md 为 SSOT; 此处保留 I* 编号便于历史 grep.
 ### I1 — 气泡数 == 上下文数组长度
 
 会话详情页 (timeline) 渲染的 Bubble 数量, 必须等于该 Node 对应 HTTP 请求的 IR messages
@@ -338,7 +342,7 @@ client = Anthropic(
 | 单元 (纯函数) | `#[test]` | `provider::tests::protocol_short_roundtrip` |
 | Property-based | `proptest` | `redact::tests::prop_round_trip_identity` |
 | 集成 (端到端) | `mockito` + `axum::serve` | `tests/integration.rs::forwards_streaming_sse` |
-| WebUI 回归 | Playwright (TypeScript) | `tests/webui/im-ui.spec.ts` (守卫前端不变量 I1/I2) |
+| WebUI 回归 | Playwright (TypeScript) | `tests/webui/im-ui.spec.ts` (守卫前端不变量 UI-1..UI-6) |
 | 性能基线 | criterion | `benches/redact.rs` (redact_ir / StreamingRestorer 3 场景) |
 | 覆盖率 | cargo-llvm-cov (LLVM source-based) | `just coverage-html` |
 
@@ -394,7 +398,7 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
 ## 已知限制 (MVP)
 
 - **跨协议 + 流式响应**: OpenAI ⇄ Anthropic 跨协议时 `stream=true` 返回 501
-  (StreamTranslate 已实现跨协议翻译, 但尚未接入 dispatch).
+  (StreamTranslate 已实现跨协议翻译, 但尚未接入 dispatch; 迁移计划见 "后续工作").
 - **C5 是实质确定性契约**: Auto 模式 mock 不含 real_secret ≥`k(L)` 字符子串
   (`k(L) = max(4, ⌈L/3⌉)`, 随 secret 长度自适应 — 短 secret 强保护, 长 secret 弱保护,
   信息泄露率上界 ~36%). gen_candidate 内置 10000 次确定性内部重试链
@@ -411,9 +415,11 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
   原样返回 (无 restore), 客户端可能看到 mock.
 - **跨协议 ingress 的 timeline delta 切片可能错位**: OpenAI writer 会把 Anthropic 风格的
   混合 Text+ToolResult user 消息拆成 (1+N) 条 wire messages, 导致 `req_body_raw` 的
-  messages 数 > IR messages 数. `extract_delta_messages` 切片时跨协议路径的 start 偏小,
+  messages 数 > IR messages 数. `extract_delta_messages_from_raw` 切片时跨协议路径的 start 偏小,
   delta 可能包含前序轮消息. 同协议路径不受影响. 详见 `src/web/AGENTS.md`.
 - static config 的 `[server]` / `[redact]` 段仅在启动时读取一次, WebUI 改 host/port/global_mock_prefix 不会生效.
+- **DAG 孤儿节点降级**: parent 被 LRU 淘汰后, child 的 `full_request_messages` 返回 None
+  (timeline 降级展示, 不 panic). 显式孤儿标记 (CDAG-7) 尚未实现.
 
 ## 后续工作 (非 MVP 范围)
 
@@ -423,9 +429,24 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
   新增协议只需实现 Reader + Writer trait (~200 行), 不动 dispatch.
 - mock_secret 的 category-aware 默认生成 (Password/ApiKey/Cookie 等格式感知).
 - 配置热加载; 测试覆盖率自动上报 + fuzzing (cargo-fuzz).
-- **依赖升级** (滞后是稳态, 非风险; Cargo.lock 锁定保证可复现构建; 触发条件满足时再升):
-  rand 0.8→0.9 / sha2 0.10→0.11 / tower-sessions 0.14→0.15 / reqwest 0.12→0.13,
-  触发条件 = CVE / 解 duplicate / 需要 feature.
+- **依赖升级** (滞后是稳态, 非风险; Cargo.lock 锁定保证可复现构建; 触发条件满足时再升,
+  默认触发条件 = CVE / 解 duplicate / 需要 feature, 各子项仅标注例外):
+  - rand 0.8 → latest (0.10): 0.9/0.10 API 有 breaking (`thread_rng()` → `rng()`,
+    `Rng::gen()` → `random()`), 升级时 `src/auth/apikey.rs` 需改 API
+    (rand 唯一使用点; mock.rs/redact.rs 用确定性 SipHash 不调 RNG).
+  - sha2 0.10 → 0.11: 注意 openidconnect 4.0.1 硬依赖 `sha2 ^0.10` (经 oauth2),
+    **升级主依赖也无法解 duplicate**, 直到 openidconnect 上游升级.
+  - tower-sessions 0.14 → 0.15: **需与 axum-login 同步升级**
+    (axum-login 0.18 当前硬依赖 tower-sessions 0.14, 单独升会 duplicate).
+  - reqwest 0.12 → 0.13: 0.13 breaking 较多 (`rustls-tls` feature 改名 `rustls`,
+    rustls roots 改用 `rustls-platform-verifier`, 需验证行为);
+    升级可解 tower-http 0.6.11 + 0.7 duplicate (reqwest 0.12 传递依赖 0.6).
+  - criterion 0.5 → 0.8: 触发条件 = 需要新统计特性 / bench 大改时. 跨 3 个主版本 (0.6/0.7/0.8),
+    若升级成本高, 评估迁移到 divan (更轻量, 编译更快). 当前 `benches/redact.rs` 仅一个 bench,
+    升级 ROI 低, 暂稳态.
+  - parking_lot 0.12.5 (当前最新): 当前最新稳定版. 长期可评估迁移到 `std::sync::Mutex/RwLock`
+    (Rust 1.62+ 后 std 锁性能已接近 parking_lot, 可减少一个依赖). 触发条件 = 解 duplicate /
+    减少依赖数.
 
 ### 已知搁置 (有意识的不做)
 

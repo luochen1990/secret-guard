@@ -10,7 +10,7 @@
 //!
 //! 合并 / CRUD / 持久化等所有通用逻辑都在 [`crate::config::DynamicTable`] 中实现,
 //! 本模块只补充 Provider 类型特定的小部分: [`DynamicEntry`] impl + effective 视图
-//! 的 masked 映射 ([`compute_effective_provider`]).
+//! 的 masked 映射 (`compute_effective_provider`).
 //!
 //! # 并发与持久化
 //!
@@ -127,10 +127,8 @@ pub struct Provider {
     /// docker secrets / k8s secrets) 解密到独立路径, secret-guard 在请求时读取.
     ///
     /// 文件内容会被 `trim()` (容忍末尾换行符, 这是 sops / `echo | tee` 的常见副作用).
-    /// 文件读不到时按空 key 处理 (与 `api_key` 为空时一致), 由 [`apply_provider_auth`]
-    /// 决定是否跳过 auth header 注入.
-    ///
-    /// [`apply_provider_auth`]: crate::proxy::apply_provider_auth
+    /// 文件读不到时按空 key 处理 (与 `api_key` 为空时一致), 由 `apply_provider_auth`
+    /// (在 `crate::proxy`) 决定是否跳过 auth header 注入.
     #[serde(default)]
     pub api_key_file: Option<std::path::PathBuf>,
     /// 是否启用. `false` 时转发到该 provider 返回 503.
@@ -145,13 +143,11 @@ impl Provider {
     /// 返回生效的 api_key: 优先 [`Provider::api_key`] 直接值, 否则从
     /// [`Provider::api_key_file`] 读取 (trim 后). 两者都未配置 → 返回空字符串.
     ///
-    /// 不报告错误: 上层 ([`apply_provider_auth`]) 会基于空 key 决定是否跳过 auth 注入,
+    /// 不报告错误: 上层 (`apply_provider_auth` 在 `crate::proxy`) 会基于空 key 决定是否跳过 auth 注入,
     /// 单个 provider 配置错误不应拖垮整个进程.
     ///
     /// 但会 `warn!` 一次让运维可观测 — 文件读不到时, 仅从上游 401/403 反推原因很痛苦.
     /// 与项目其他错误路径 (`proxy.rs` 中 `warn!` 各种 IO/header 错误) 风格一致.
-    ///
-    /// [`apply_provider_auth`]: crate::proxy::apply_provider_auth
     pub fn effective_api_key(&self) -> String {
         if !self.api_key.is_empty() {
             return self.api_key.clone();

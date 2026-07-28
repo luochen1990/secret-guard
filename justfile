@@ -39,6 +39,12 @@ dev:
 # 调用 just check-features 增量编译该 feature 跑 clippy + nextest, 确保守卫断言持续可用
 # 且不漂移. CI workflow 单独成步运行 check-features (在 coverage 的 cargo clean 前),
 # 复用同一 target/debug, 不影响上面的磁盘峰值控制.
+#
+# doc 检查: cargo doc --no-deps -D warnings 验证 rustdoc 能编译 (含跨文件 doc 链接).
+# 项目大量使用 //! 头部文档 + contracts.md 链接, doc 链接写错 (路径错/跨 crate 错) 在 CI 不会
+# 被 clippy 发现, 只有手跑 cargo doc 才暴露.
+# 不带 --document-private-items: 项目内部 doc 链接指向 private item 是合理的 (维护者文档),
+# --document-private-items 会把这些当警告. 只查 public doc 的链接完整性即可守住门禁初衷.
 check *ARGS:
     cargo fmt -- --check
     cargo clippy --all-targets -- -D warnings
@@ -50,6 +56,7 @@ check *ARGS:
     else \
         cargo nextest run --no-fail-fast; \
         just check-features; \
+        RUSTDOCFLAGS="-D warnings" cargo doc --no-deps; \
     fi
 
 # consistency-check feature 守卫 (CI 用): clippy + nextest 带 feature flag.
@@ -131,6 +138,12 @@ audit:
 # 默认 100 samples 较慢, 调试可用 `cargo bench --bench redact -- --quick`.
 bench:
     cargo bench --bench redact
+
+# bench 编译验证 (CI 用, --no-run 零样本): 防止 bench 代码逻辑错误 / runtime panic
+# 长期不被发现 (criterion 从不运行时这类 bug 无声潜伏).
+# 未来若引入 baseline 保存/比较, 可在此扩展跑采样.
+check-benches:
+    cargo bench --no-run
 
 # ─── 文件长度门禁 (按 prod 行数) ───────────────────────────────────────────
 # 防止单文件 prod 代码失控膨胀. 用 rust-diff-analyzer 对每个 .rs 做完整 AST 分类

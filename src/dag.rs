@@ -293,7 +293,7 @@ pub struct Node {
     /// 存储的是**真实内容** (含真实 secret, 即 OriginRecord 视角).
     /// 输出给 LLM / WebUI 时 apply redactMap 转为 SecureRecord (含 mock).
     ///
-    /// **不含** LLM 返回的 response — response 独立存在 [`response`] 字段,
+    /// **不含** LLM 返回的 response — response 独立存在 `response` 字段,
     /// 且存储语义不同 (response 存 LLM 视角的 mock 版本, req_delta 存客户端视角的 real 版本).
     ///
     /// 冗余通过 BlockPool 内容寻址自然消化 (相同 block 物理共享).
@@ -326,7 +326,7 @@ pub struct Node {
 /// 它们只存在于 [`Node::response`] (`ResponseData`) 的 RwLock 内, 让
 /// [`ConversationDag::attach_response`] 能在外层 read lock 下通过 node-level 锁
 /// 更新单节点, 不阻塞并发 push / 其他节点的 attach (perf: 两级锁).
-/// [`ConversationDag::node_view`] / [`ConversationDag::session_view`] 从
+/// `ConversationDag::node_view` / `ConversationDag::session_view` 从
 /// `node.response.read()` 取这些字段.
 #[derive(Debug)]
 pub struct CallEvent {
@@ -863,7 +863,7 @@ impl ConversationDag {
     /// walk parent 链, 收集完整的 request messages (从根到本 node).
     ///
     /// 只含 req_delta (客户端发出的 messages), 不含 response.
-    /// response 是独立数据源, 用 [`get_response`] 单独获取.
+    /// response 是独立数据源, 用 `get_response` 单独获取.
     ///
     /// **不 apply redact**: 返回的是 OriginRecord (真实内容).
     /// 调用方需要 SecureRecord 时, 自行 derive redactMap 并 apply.
@@ -906,7 +906,7 @@ impl ConversationDag {
 
     /// 取 node 的请求侧详情 (req_headers + req_body_raw) for GET /records/{id}.
     ///
-    /// list 路径 ([`get_node`]) 不返回 req_body_raw (太大), 这个方法用于按需拉取.
+    /// list 路径 (`get_node`) 不返回 req_body_raw (太大), 这个方法用于按需拉取.
     pub fn get_node_detail(&self, node_id: Uuid) -> Option<NodeDetail> {
         let g = self.inner.read();
         let node = g.nodes.get(&node_id)?;
@@ -936,9 +936,9 @@ impl ConversationDag {
     /// 增量更新 node 的 parsed view (流式节流写入专用).
     ///
     /// 若 node 尚无 ResponseData (流过程中尚未 attach), 自动创建一个 default 占位
-    /// (resp_complete=false), 仅写 parsed 字段; 最终的 [`attach_response`] 会整体替换.
+    /// (resp_complete=false), 仅写 parsed 字段; 最终的 `attach_response` 会整体替换.
     ///
-    /// 两级锁 (perf): 与 [`attach_response`] 同. 这是高频路径 (流式 ~500ms 一次),
+    /// 两级锁 (perf): 与 `attach_response` 同. 这是高频路径 (流式 ~500ms 一次),
     /// 改 read lock + node.response.write() 后并发多路流式不再串行化在全局锁.
     pub fn update_parsed_response(&self, node_id: Uuid, parsed: serde_json::Value) {
         let g = self.inner.read();

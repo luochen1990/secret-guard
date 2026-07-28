@@ -738,7 +738,7 @@ fn read_tool_def(tool: &Value) -> Option<IrTool> {
     })
 }
 
-/// 解析 Anthropic tool_choice → (IrToolChoice, Option<bool> parallel_tool_calls).
+/// 解析 Anthropic tool_choice → (`IrToolChoice`, `Option<bool>` parallel_tool_calls).
 /// 注意 disable_parallel_tool_use 的取反.
 fn read_tool_choice(obj: &Map<String, Value>) -> (Option<IrToolChoice>, Option<bool>) {
     let ty = obj.get("type").and_then(Value::as_str).unwrap_or("");

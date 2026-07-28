@@ -317,7 +317,7 @@ impl DeltaKind {
     }
 }
 
-/// Sliding-window mock→real restorer for streaming [`IrStreamEvent`]s.
+/// Sliding-window mock→real restorer for streaming `IrStreamEvent`s.
 ///
 /// # 为什么需要 sliding window
 ///
@@ -326,7 +326,7 @@ impl DeltaKind {
 /// event 1 TextDelta: "the secret is MOCKAB"
 /// event 2 TextDelta: "C123 end"
 /// ```
-/// 单 event 不含完整 mock, 直接 [`restore_str_inplace`] 找不到匹配.
+/// 单 event 不含完整 mock, 直接 `restore_str_inplace` 找不到匹配.
 /// [`StreamingRestorer`] 在尾部缓冲一定字节, 凑齐完整 mock 再 emit, 保证 round-trip identity.
 ///
 /// # 算法
@@ -347,8 +347,8 @@ impl DeltaKind {
 /// # Scope / Out of scope
 ///
 /// - 处理 [`IrDelta::TextDelta`] 和 [`IrDelta::InputJsonDelta`] (内容字节流).
-/// - 不处理 [`IrStreamEvent::MessageDelta::stop_sequence`] / [`IrStreamEvent::Error`]
-///   (单 event 完整, 直接 [`restore_str_inplace`]).
+/// - 不处理 `MessageDelta.stop_sequence` / `IrStreamEvent::Error`
+///   (单 event 完整, 直接 `restore_str_inplace`).
 #[derive(Debug)]
 pub struct StreamingRestorer {
     map: RedactionMap,

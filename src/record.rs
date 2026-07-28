@@ -2,13 +2,13 @@
 //!
 //! 历史上这里是 RecordStore (扁平 VecDeque 存储), 现已迁移到 [`crate::dag::ConversationDag`]
 //! (内容寻址 + Merkle prefix + FIFO 淘汰). 本文件仅保留 [`ForwardRecord`] DTO,
-//! 作为 Web API GET /records/{id} 响应的 JSON shape (供 [`crate::web::api`] 构造).
+//! 作为 Web API GET /records/{id} 响应的 JSON shape (供 `crate::web::api` 构造).
 //!
 //! 注: 旧的 `RecordFilter` enum + `GET /api/records` 扁平分页已删除 (由 session-aware
 //! sync API 替代), 故本文件不再含 RecordFilter.
 //!
 //! DTO 字段从 [`crate::dag`] 的 NodeView / NodeDetail / ResponseData 派生, 由
-//! [`crate::web::api`] 在查询时填充. 保留这个独立 DTO (而非直接 serialize DAG 内部类型)
+//! `crate::web::api` 在查询时填充. 保留这个独立 DTO (而非直接 serialize DAG 内部类型)
 //! 是为了:
 //! - 维持 Web API JSON shape 稳定 (不随 DAG 内部结构变化而漂移);
 //! - 集中"暴露哪些字段给前端"的决策 (eg `redactions` 不含真实 secret value).
@@ -20,7 +20,7 @@ use uuid::Uuid;
 /// 单条转发记录 (Web DTO).
 ///
 /// 字段从 [`crate::dag::NodeView`] / [`crate::dag::NodeDetail`] / [`crate::dag::ResponseData`]
-/// 派生, 由 [`crate::web::api`] 构造. 不再是存储后端 (那是 DAG 的职责).
+/// 派生, 由 `crate::web::api` 构造. 不再是存储后端 (那是 DAG 的职责).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForwardRecord {
     pub id: Uuid,

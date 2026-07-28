@@ -25,8 +25,8 @@
 //!
 //! # 向后兼容 + global_mock_prefix
 //!
-//! 未配置 `mock_strategy` 的旧 secret ([`crate::secrets::SecretEntry`]) 在 resolve 时
-//! 自动得到 [`MockStrategy::default_for`] (Auto + infer 自 real 的 gen spec).
+//! 未配置 `mock_strategy` 的旧 secret (`crate::secrets::SecretEntry`) 在 resolve 时
+//! 自动得到 `MockStrategy::default_for` (Auto + infer 自 real 的 gen spec).
 //! 行为尽可能接近原固定算法 (用 hash 生成等长 mock, charset 来自 real).
 //!
 //! `[redact] global_mock_prefix` (默认空串) 在 resolve 阶段注入到每个 secret 的
@@ -48,8 +48,8 @@
 //!   泄露率有上界.
 //!
 //! 即使有自适应阈值, 长 real + 高基数 charset 下单次 hash 生成仍有 ~1e-5 量级碰撞概率.
-//! [`gen_candidate`] Auto 分支因此内置 **C5 内部重试链** (见 [`C5_INTERNAL_RETRIES`]):
-//! 完全确定性地循环重 hash body 直到候选满足 C5. 重试上限 [`C5_INTERNAL_RETRIES`] = 10000
+//! `gen_candidate` Auto 分支因此内置 **C5 内部重试链** (见 `C5_INTERNAL_RETRIES`):
+//! 完全确定性地循环重 hash body 直到候选满足 C5. 重试上限 `C5_INTERNAL_RETRIES` = 10000
 //! 是 **safety bound (仅防死循环)**, 非概率目标 — `(1e-5)^10000 = 1e-50000` 远超宇宙原子
 //! 数 (~1e80), 因此 C5 在 Auto 模式下**实质等价于确定性契约**, 仅在理论上保留 best-effort
 //! 兜底 (重试链耗尽时返回最后一次候选, 由上层 redact 的 C2/C4 probing 与下游 LLM provider
@@ -252,7 +252,7 @@ impl MockStrategy {
         }
     }
 
-    /// 基础校验 (不依赖 real value). 在 [`crate::secrets::SecretEntry::validate`] 中调用.
+    /// 基础校验 (不依赖 real value). 在 `crate::secrets::SecretEntry::validate` 中调用.
     pub fn validate(&self) -> Result<(), String> {
         match &self.initial {
             InitialValue::Fixed { value } => {
@@ -366,7 +366,7 @@ pub fn deterministic_seed(real: &str, strategy: &MockStrategy) -> u64 {
 /// 重试链不破坏 C3 (无副作用, 不消耗外部 counter): 同一 `(real, strategy, seed, counter)`
 /// 仍严格产出同一 mock.
 ///
-/// 重试链上限 [`C5_INTERNAL_RETRIES`] = 10000 是 **safety bound (仅防死循环)**, 非概率目标.
+/// 重试链上限 `C5_INTERNAL_RETRIES` = 10000 是 **safety bound (仅防死循环)**, 非概率目标.
 /// 详见模块头部 "C5" 段落 (SSOT).
 pub fn gen_candidate(real: &str, strategy: &MockStrategy, seed: u64, counter: u32) -> String {
     match &strategy.initial {

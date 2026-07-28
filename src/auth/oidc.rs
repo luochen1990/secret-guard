@@ -19,7 +19,7 @@
 //!
 //! `from_provider_metadata().set_redirect_uri()` 返回的 CoreClient 带 typestate:
 //! `HasAuthUrl = EndpointSet`, `HasTokenUrl = EndpointMaybeSet` (token URL 来自 discovery,
-//! 可能缺失). 为避免把完整泛型签名写到字段类型里, 本模块用 [`OidcClient`] 类型别名固定.
+//! 可能缺失). 为避免把完整泛型签名写到字段类型里, 本模块用 `OidcClient` 类型别名固定.
 
 use std::collections::HashMap;
 use std::future::Future;

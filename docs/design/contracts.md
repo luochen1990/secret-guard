@@ -612,7 +612,7 @@
 
 **Properties**:
 - `prop_preview_never_panics`: extract_preview_and_model 对任意字节输入 (含非 JSON / 空 / 损坏) 不 panic.
-- `prop_delta_never_panics`: extract_delta_messages 同上.
+- `prop_delta_never_panics`: extract_delta_messages_from_raw 同上.
 - `prop_tool_name_never_panics`: toolNameOfRound 对任意输入返回合法字符串 (含 '?').
 
 ### ROB-2 假设声明注释必备
@@ -622,7 +622,7 @@
 2. 假设不成立时的降级行为.
 
 **Properties** (人工审查项):
-- `prop_extract_delta_messages_has_assumption_comment`: extract_delta_messages 函数级注释含假设声明.
+- `prop_extract_delta_messages_has_assumption_comment`: extract_delta_messages_from_raw 函数级注释含假设声明.
 - `prop_extract_preview_has_assumption_comment`: 同上.
 - `prop_tool_name_has_assumption_comment`: 同上.
 
@@ -650,7 +650,7 @@
 | `preview` / `model` | extract_preview_and_model | ✅ `proxy.rs::assert_preview_model_match_source` |
 | `resp_parsed` (非流式) | reader.read_response | ✅ `proxy.rs::assert_resp_parsed_matches_source_nonstream` |
 | `resp_parsed` (流式) | StreamScan snapshot | ⏳ Phase A 已删除原始 SSE 字节, 派生与源物理分离, 暂无法守卫 |
-| `req_delta_messages` | extract_delta_messages | (每次 timeline 请求重算, 无 drift 风险) |
+| `req_delta_messages` | extract_delta_messages_from_raw | (每次 timeline 请求重算, 无 drift 风险) |
 | `session.title` | find_root_title | ✅ `dag.rs::assert_session_title_matches_root_preview` |
 
 **Properties**:
@@ -737,3 +737,5 @@
 | 2026-07-26 | RED-6/7 | 保持独立形式化, 不因被 FWD-1 覆盖而省略 | 测试原则是"不信任其他代码", 端到端测试通过不代表单步正确; 端到端失败时需单步契约定位根因 |
 | 2026-07-26 | STR-5 | 描述收窄为"流式 reader 端 index 分配" (writer 侧由 FWD-1/FWD-2 byte-exact 守卫) | 讨论中意识到原 STR-5 与 9712c52 bug 的 reader/writer 侧职责混淆 |
 | 2026-07-26 | §0.5 | 强化漂移处理流程: 契约不能擅自修改, 必须经过人工授权 | 契约是 normative 尺子, 不能让被测物自己定义尺子的弯曲方向 |
+| 2026-07-28 | CDAG-6/7/8 | 新增 CDAG-6 hash collision 处置 + CDAG-7 孤儿节点可识别 + CDAG-8 session 聚类稳定 | DAG 落地后细化内容寻址存储的边界契约 (collision/eviction/session 稳定性) |
+| 2026-07-28 | UI-4/5/6 | 新增 UI-4 keyed reconciliation + UI-5 末轮 response 独立 drawer + UI-6 timeline 滚动状态机 | 前端不变量从 AGENTS.md I1-I3 扩展为 UI-1..UI-6, 完整收录 keyed reconciliation / drawer overlay / followMode 状态机 |

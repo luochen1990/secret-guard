@@ -1,6 +1,6 @@
 # Conversation DAG 设计文档
 
-> Status: **已对齐, 实施中** (2026-07-23)
+> Status: **已落地** (核心步骤 1-9 完成, 2026-07-24; 见下方"实施期演进说明")
 > Scope: RecordStore → ConversationDag 重构 + lazy redact pipeline
 
 > ## ⚠️ 实施期演进说明 (2026-07-24 增补)
