@@ -615,16 +615,8 @@
 - `prop_delta_never_panics`: extract_delta_messages_from_raw 同上.
 - `prop_tool_name_never_panics`: toolNameOfRound 对任意输入返回合法字符串 (含 '?').
 
-> **描述性漂移修正 (2026-07-28)**: `toolNameOfRound` (前端 JS) 已在
-> commit `d4533db` (refactor session-aware sync API) 删除. tool name 推断从前端
-> best-effort 迁移到后端 push 时预计算 (归入 `extract_preview_and_model` 的消息遍历路径,
-> 含 tool_call/tool_result message), 由 `prop_preview_never_panics` 统一守卫
-> (PR #91 的 `prop_preview_never_panics_arbitrary_bytes` +
-> `prop_preview_never_panics_perturbed_json`). 前端改为直接消费后端预计算的
-> `round_role` + `preview` 字段 (单一职责 + DRY). 故 `prop_tool_name_never_panics`
-> (以及下方 ROB-2 的 `prop_tool_name_has_assumption_comment`) 的目标函数已不存在,
-> 其鲁棒性承诺由 `prop_preview_never_panics` 覆盖. 原始 property 文本保留以维持编号稳定
-> (契约编号一经分配永不变更, 见 §0.5).
+> **理想 vs 现状**: tool name 推断由后端 `extract_preview_and_model` 承担,
+> 其永不 panic 由 `prop_preview_never_panics` 守卫. 原 property 文本保留以维持编号稳定 (§0.5).
 
 ### ROB-2 假设声明注释必备
 
@@ -636,6 +628,9 @@
 - `prop_extract_delta_messages_has_assumption_comment`: extract_delta_messages_from_raw 函数级注释含假设声明.
 - `prop_extract_preview_has_assumption_comment`: 同上.
 - `prop_tool_name_has_assumption_comment`: 同上.
+
+> **理想 vs 现状**: 假设声明载体是 `extract_preview_and_model` 的函数级注释,
+> 由 `prop_extract_preview_has_assumption_comment` 覆盖. 原 property 文本保留以维持编号稳定 (§0.5).
 
 ---
 
