@@ -3700,7 +3700,156 @@ mod tests {
         }
     }
 
-    // ─── 两级锁并发回归 (perf: attach / update_parsed 不应阻塞全局) ───────
+    // ─── DTO-5 req_delta_messages 切片正确 (契约 §5 DTO-5) ───────────────────
+    //
+    // 契约: docs/design/contracts.md L450-458.
+    // timeline 路径的 req_delta_messages 必须是本轮新增的 messages (从 req_body_raw 末尾
+    // 截取), 同协议路径下与 IR req_delta 一致.
+    //
+    // 已知限制: 跨协议路径切片错位 (DTO-6), 本组 property 只守卫同协议路径.
+    //
+    // extract_delta_messages_from_raw 接收 &Node, 故测试用 fixture_node 构造可控输入
+    // (count = req_delta.len(), req_body_raw = 字符串). 函数是 best-effort 永不 panic
+    // (ROB-1), 故 catch_unwind 守卫 (与 prop_delta_never_panics_* 一致).
+
+    /// 构造合法 chat JSON, messages 数 = n, 第 i 条 content = format!("{i}").
+    /// 用确定性的 messages (而非 hash 派生) 让 slice 正确性可逐条断言.
+    fn build_chat_body_indexed(n: usize) -> String {
+        let msgs: Vec<String> = (0..n)
+            .map(|i| format!("{{\"role\":\"user\",\"content\":\"msg-{i}\"}}"))
+            .collect();
+        format!("{{\"messages\":[{}]}}", msgs.join(","))
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// DTO-5 `prop_delta_slice_correct_same_proto`:
+        /// 同协议路径下, req_delta_messages == req_body_raw 末尾 count 条 messages.
+        ///
+        /// 构造: n 条 messages (n ∈ [2, 12]), count ∈ [1, n] (保证 messages.len() >= count).
+        /// 断言: result.len() == count, 且 result == messages[start..] (start = n - count),
+        /// content 逐条相等.
+        ///
+        /// 注: 根节点 (parent=None) 且 start > 0 时函数会注入 system (若无 system 字段则
+        /// OpenAI 风格 messages[0]=system). 这里 messages[0] 是 role=user, start>0 时
+        /// messages[0].role != system → 不注入 → result 严格 == messages[start..].
+        /// 为隔离 system 注入逻辑 (DTO-5 prop_delta_includes_system_at_root 单独守卫),
+        /// 本 property 用 parent=None 且 count == n (start=0, 不触发 system 注入) +
+        /// count < n 但 messages[0].role=user 两种 case:
+        /// - count == n: start=0, 无 system 注入, result == messages[0..].
+        /// - count < n: start>0, messages[0].role=user (非 system) → 不注入, result == messages[start..].
+        #[test]
+        fn prop_delta_slice_correct_same_proto(
+            n in 2usize..=12,
+            count in 1usize..=12, // 由 prop_assume 约束 ≤ n
+        ) {
+            prop_assume!(count <= n, "count must be ≤ n for slice semantics");
+            let body = build_chat_body_indexed(n);
+            let node = fixture_node(count, body.clone());
+            let result = extract_delta_messages_from_raw(&node);
+
+            let start = n - count;
+            prop_assert_eq!(
+                result.len(),
+                count,
+                "DTO-5: result.len() 应 == count, 实际 {}",
+                result.len(),
+            );
+            // 逐条比对 content (messages[start..]).
+            for (i, got) in result.iter().enumerate() {
+                let want_idx = start + i;
+                let want_content = format!("msg-{want_idx}");
+                let got_content = got
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<missing>");
+                prop_assert_eq!(
+                    got_content, &want_content,
+                    "DTO-5: result[i] content 不匹配 (want messages[want_idx])"
+                );
+            }
+        }
+
+        /// DTO-5 `prop_delta_includes_system_at_root`:
+        /// 根节点 (parent=None) 的 delta 在 start > 0 时补回 system prompt.
+        ///
+        /// 构造: OpenAI 风格 body, messages[0] = role=system, 后续 n-1 条 user.
+        /// count < n → start > 0, messages[0].role == system → 注入到 result 首位.
+        /// 断言: result[0].role == "system" (注入的 system message).
+        #[test]
+        fn prop_delta_includes_system_at_root(
+            n_sys in 3usize..=8,    // 含 1 条 system + (n_sys-1) 条 user
+            count in 1usize..=8,
+        ) {
+            prop_assume!(count < n_sys, "count < n_sys 才触发 system 注入 (start > 0)");
+            // body: messages[0]=system, messages[1..]=user.
+            let mut msgs = vec![r#"{"role":"system","content":"SYS-PROMPT"}"#.to_string()];
+            for i in 1..n_sys {
+                msgs.push(format!("{{\"role\":\"user\",\"content\":\"u-{i}\"}}"));
+            }
+            let body = format!("{{\"messages\":[{}]}}", msgs.join(","));
+            let node = fixture_node(count, body);
+            let result = extract_delta_messages_from_raw(&node);
+
+            // 注入的 system 在 result 首位.
+            prop_assert!(
+                !result.is_empty(),
+                "DTO-5 system 注入: result 不应为空 (count={count})"
+            );
+            let first_role = result[0]
+                .get("role")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<missing>");
+            prop_assert_eq!(
+                first_role, "system",
+                "DTO-5 system 注入: result[0].role 应为 system (根节点 start>0 时注入)"
+            );
+        }
+
+        /// DTO-5 `prop_delta_handles_non_json_body`:
+        /// 非 JSON body 时返回空 vec (不 panic).
+        ///
+        /// 构造: req_body_raw = 任意字节 (非 JSON), count > 0.
+        /// 断言: result.is_empty() (serde_json::from_str 失败早退).
+        #[test]
+        fn prop_delta_handles_non_json_body(
+            count in 1usize..=8,
+            body in "[^{}\\[\\]]{0,64}", // 非 JSON-ish 字节
+        ) {
+            // prop_assume: body 不应意外是合法 JSON object/array (生成器已排除 {} []).
+            prop_assume!(!body.trim_start().starts_with('{'), "body 非合法 JSON object");
+            let node = fixture_node(count, body.clone());
+            let result = extract_delta_messages_from_raw(&node);
+            prop_assert!(
+                result.is_empty(),
+                "DTO-5: 非 JSON body 应返回空 vec (body={:?}, count={count})",
+                body,
+            );
+        }
+
+        /// DTO-5 `prop_delta_handles_count_mismatch`:
+        /// messages 数 < req_delta_count 时返回空 vec.
+        ///
+        /// 构造: n 条 messages, count > n (函数内 messages.len() < count 早退).
+        /// 断言: result.is_empty().
+        #[test]
+        fn prop_delta_handles_count_mismatch(
+            n in 1usize..=8,
+            extra in 1usize..=5, // count = n + extra > n
+        ) {
+            let count = n + extra;
+            let body = build_chat_body_indexed(n);
+            let node = fixture_node(count, body.clone());
+            let result = extract_delta_messages_from_raw(&node);
+            prop_assert!(
+                result.is_empty(),
+                "DTO-5: messages 数 ({n}) < count ({count}) 应返回空 vec",
+            );
+        }
+    }
+
+    // ─── 两级锁并发回归 (perf: attach / update_parsed 不应阻塞全局) ───────────
     //
     // 这组测试守卫两级锁改动的线程安全: 8 writer 并发 attach_response +
     // update_parsed_response, 4 reader 并发 list_page / get_node / get_response.
