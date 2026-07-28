@@ -139,11 +139,14 @@ audit:
 bench:
     cargo bench --bench redact
 
-# bench 编译验证 (CI 用, --no-run 零样本): 防止 bench 代码逻辑错误 / runtime panic
+# bench 编译验证 (--no-run 零样本): 防止 bench 代码逻辑错误 / runtime panic
 # 长期不被发现 (criterion 从不运行时这类 bug 无声潜伏).
+# 用 dev profile (而非 bench 默认的 release): release profile 的 lto=thin + codegen-units=1
+# 会导致全量编译 5-8min; dev profile 复用 debug/ 缓存只需 ~30s, 且 --no-run 只验证可编译性,
+# 不跑 criterion 统计, 无需 release 优化. CI 暂不跑此命令 (见 ci.yml 末尾注释), 供本地手动验证.
 # 未来若引入 baseline 保存/比较, 可在此扩展跑采样.
 check-benches:
-    cargo bench --no-run
+    cargo bench --no-run --profile dev
 
 # ─── 文件长度门禁 (按 prod 行数) ───────────────────────────────────────────
 # 防止单文件 prod 代码失控膨胀. 用 rust-diff-analyzer 对每个 .rs 做完整 AST 分类

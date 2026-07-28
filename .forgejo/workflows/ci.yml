@@ -242,12 +242,18 @@ jobs:
             echo "Created new audit comment"
           fi
 
-      # bench 编译验证: 确保 benches/redact.rs 至少能通过编译 (不跑采样, 零样本, 防止
-      # bench 代码逻辑错误 / runtime panic 长期不被发现). 真正非阻塞: bench 仅是性能基线,
-      # 编译失败不阻塞合并.
+      # bench 编译验证: 已移除.
+      # 原因: cargo bench --no-run 走 release profile (lto=thin + codegen-units=1),
+      # CI 的持久卷 (CARGO_TARGET_DIR) 只缓存 debug/ 和 llvm-cov-target/, 无 release/ 缓存,
+      # 每次 CI 都从零全量编译 release, 实测耗时 5-8min, 占总 CI 时间一半以上, 严重阻碍开发.
       #
-      # 注: 这里只验证 --no-run, 不做 baseline 保存/比较 (那需要在 master 维护一份基线产物,
-      # 复杂度高, 见 AGENTS.md 后续工作). 当前阶段先把"bench 代码可编译"这个最低门槛守住.
-      - name: Bench compile check
-        continue-on-error: true
-        run: just check-benches
+      # bench 编译验证的初衷是"确保 benches/redact.rs 代码不烂 (runtime panic / setup 失败)",
+      # 但 cargo clippy --all-targets 已覆盖 bench crate 的编译期检查, 额外的 --no-run
+      # 只多验证了 criterion harness 的 setup 代码, ROI 极低. 本地 `just check-benches`
+      # (改用 dev profile, 复用 debug 缓存, ~30s) 仍可供手动验证.
+      #
+      # 若未来需要 bench 编译验证回归 CI, 选项: ① just check-benches 加 --profile dev;
+      # ② 为 release/ 单独建缓存目录 (但 tmpfs 预算紧张); ③ 接入 baseline 保存/比较时再评估.
+      # - name: Bench compile check
+      #   continue-on-error: true
+      #   run: just check-benches
