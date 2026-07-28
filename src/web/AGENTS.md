@@ -237,4 +237,4 @@ loadTimeline) 才重置 selected 到最新轮 (`.selected` 持续高亮; 不触�
 - 悬浮导航按钮 (回到顶部/底部): 固定在对话框窗口右侧, 不随内容滚动 (issue #36).
 - 气泡颜色 + sender icon 分类.
 - 气泡间微小间距 (margin-bottom, 避免视觉粘连).
-- tool name 推断: `toolNameOfRound` (假设 tool_calls 含 function.name; 降级 fallback 到 `'?'`).
+- tool round 预览: 前端不再做 best-effort 推断 (旧的 `toolNameOfRound` 已删除). 后端在 push 时预计算 `round_role` + `preview` 字段 (由 `web::api::extract_preview_and_model` 提取, 含 tool_call/tool_result 消息), 前端直接消费.
