@@ -622,7 +622,7 @@ fn assert_redactions_match_map(
 /// `CallEvent.preview` / `CallEvent.model` 是 `req_body_raw` (SSOT) 的派生视图:
 /// 一次性从 req_body_raw 提取并缓存, 之后 sidebar / list 路径零拷贝读 Arc<str>.
 /// 本函数断言派生保持一致 — 从 req_body_raw 重新调用
-/// [`crate::web::api::extract_preview_and_model`] 应得到相同结果.
+/// [`crate::derive::extract_preview_and_model`] 应得到相同结果.
 ///
 /// 捕获的 drift 类型: 未来若把 preview/model 改为从其他来源 (如 IR / 原始 client body
 /// 而非 redact 后的 req_body_raw) 提取, 此守卫会立刻失败. 详见 AGENTS.md
@@ -630,7 +630,7 @@ fn assert_redactions_match_map(
 #[cfg(feature = "consistency-check")]
 fn assert_preview_model_match_source(event: &CallEvent) {
     let (rederived_preview, rederived_model) =
-        crate::web::api::extract_preview_and_model(&event.req_body_raw);
+        crate::derive::extract_preview_and_model(&event.req_body_raw);
     debug_assert_eq!(
         event.model.as_deref(),
         rederived_model.as_deref(),
@@ -738,7 +738,7 @@ fn build_call_event(
     secrets_snapshot: Option<&[crate::secrets::SecretEntry]>,
     redactions: Vec<(String, String)>,
 ) -> CallEvent {
-    let (preview, model) = crate::web::api::extract_preview_and_model(req_text);
+    let (preview, model) = crate::derive::extract_preview_and_model(req_text);
     let policy = match secrets_snapshot {
         Some(s) => std::sync::Arc::new(PolicySnapshot {
             secrets: std::sync::Arc::from(s.to_vec()),

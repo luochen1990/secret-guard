@@ -61,8 +61,8 @@ PATCH  /__sg/api/api-keys/{id}/toggle
 
 ### Record preview / model 提取 (push 时一次性)
 
-`extract_preview_and_model` (协议无关字节级, 不依赖 codec reader) 在 push 时从 `req_body`
-一次性提取两个轻量字段 (提取后丢弃 body):
+`extract_preview_and_model` (定义在 `crate::derive`, 协议无关字节级, 不依赖 codec reader)
+在 push 时从 `req_body` 一次性提取两个轻量字段 (提取后丢弃 body):
 - `preview`: sidebar 主标题 (截断到 48 chars). 优先取最后一条 user message (可读性好);
   无 user 时回退到最后一条有文本的 message (tool_result / assistant).
   压缩 marker ("What did we do so far?") 命中时 fallback 到最后一条 assistant 摘要.

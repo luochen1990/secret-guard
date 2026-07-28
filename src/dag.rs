@@ -369,7 +369,7 @@ pub struct CallEvent {
     pub round_role: IrRole,
     /// WebUI sidebar / timeline preview 文本 (push 时从 req_body_raw 提取, 截断 48 chars).
     ///
-    /// 提取逻辑见 web::api::extract_preview_and_model (协议无关字节级):
+    /// 提取逻辑见 derive::extract_preview_and_model (协议无关字节级):
     /// 优先取最后一条 user message, 无 user 时 fallback 到最后一条有文本的 message
     /// (tool_result / assistant). 不按 round_role 分发 (历史决策, 简单但非最优).
     ///
@@ -1378,7 +1378,7 @@ fn extract_delta_messages_from_raw(node: &Node) -> Vec<serde_json::Value> {
             let sys_text = if let Some(s) = sys.as_str() {
                 (!s.is_empty()).then(|| s.to_string())
             } else if let Some(arr) = sys.as_array() {
-                crate::web::api::extract_text_blocks(arr).map(|t| t.join("\n"))
+                crate::derive::extract_text_blocks(arr).map(|t| t.join("\n"))
             } else {
                 None
             };
@@ -2334,7 +2334,7 @@ mod tests {
 
     /// 构造一个带 preview/model/req_body_raw 的 CallEvent (覆盖 list/get 视图字段).
     fn event_with_body(path: &str, req_body: &str) -> CallEvent {
-        let (preview, model) = crate::web::api::extract_preview_and_model(req_body);
+        let (preview, model) = crate::derive::extract_preview_and_model(req_body);
         CallEvent {
             created_at: Utc::now(),
             method: "POST".to_string(),
