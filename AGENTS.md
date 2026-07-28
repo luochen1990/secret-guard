@@ -229,6 +229,7 @@ URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标
 | `secrets.rs` | SecretEntry 实体 + Effective view + value 两来源 | 文件头部 `//!` |
 | `mock.rs` | MockStrategy 两维度 (初始值 + 生成策略) + 确定性 seed + `[redact] global_mock_prefix` 注入 | 文件头部 `//!` (C3 根基) |
 | `dag.rs` | ConversationDAG 内容寻址存储 (BlockPool + Node + Merkle) | 文件头部 `//!` + `docs/design/conversation-dag.md` |
+| `error.rs` | 统一应用错误类型 `AppError` (转发链 + 鉴权层共用, 不反向依赖) | 文件头部 `//!` (含与 `web::api::ApiError` 分工) |
 | `record.rs` | ForwardRecord (web 层 DTO, 从 DAG Node 派生) | 文件头部 `//!` |
 | `redact.rs` | RedactionMap + redact/restore pipeline + 形式化契约 C1-C6 | 文件头部 `//!` |
 | `util.rs` | 集中的哈希工具 (`hash64` SipHash 单值入口) | 文件头部 `//!` |

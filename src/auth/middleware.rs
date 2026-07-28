@@ -20,7 +20,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 
 use crate::auth::ApiKeyStore;
-use crate::proxy::AppError;
+use crate::error::AppError;
 
 /// 已认证的租户身份. 注入 request extension, 供下游 handler 用.
 /// M1 不做隔离 (所有 tenant 共享数据), M2 起作为 scope key.
