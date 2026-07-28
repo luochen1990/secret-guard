@@ -121,6 +121,17 @@
     .badge-inactive { background: #eee; color: #888; }
     /* hint 内嵌的警告 (服务端认证未启用提示). 配色与 .badge-err 一致 (#a00). */
     .hint-warn { color: #a00; }
+    /* provider endpoints 弹窗内的 URL 列表表格. */
+    .ep-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .ep-table td { padding: 4px 8px 4px 0; vertical-align: top; }
+    .ep-table td:last-child { padding-right: 0; white-space: nowrap; }
+    .ep-table td.label { white-space: nowrap; }
+    .ep-table td.unsupported { color: #aaa; }
+    .ep-table td.url code { word-break: break-all; }
+    dialog#provider-endpoints { padding: 16px; width: 480px; }
+    dialog#provider-endpoints .actions {
+      display: flex; gap: 8px; justify-content: flex-end; margin-top: 8px;
+    }
     .tab-content { display: none; }
     .tab-content.active { display: flex; flex: 1; min-height: 0; }
 
@@ -1105,7 +1116,7 @@
       <div class="secrets-main">
         <div class="secrets-toolbar">
           <div class="stats" id="providers-stats"></div>
-          <span class="hint">URL pattern: <code>/{proto-short}/{provider-id}/*</code> · o=OpenAI, a=Anthropic, g=Gemini, l=oLLama</span>
+          <span class="hint">URL pattern: <code>/{proto-short}/{provider-id}/*</code> · click <strong>endpoints</strong> in a row for details</span>
           <button class="btn" onclick="openProviderForm()">+ new dynamic provider</button>
         </div>
         <table class="secrets">
@@ -1247,6 +1258,20 @@
       <div class="actions">
         <button class="btn" value="cancel">Cancel</button>
         <button class="btn" value="save" id="ak-save">Create</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="provider-endpoints">
+    <form method="dialog">
+      <h3 style="margin: 0 0 8px 0;">Endpoints</h3>
+      <div class="hint" style="margin-bottom: 8px;">
+        URL pattern: <code>/{proto-short}/{provider-id}/*</code>. Same-protocol = direct,
+        OpenAI⇄Anthropic = cross-protocol translation (non-streaming only), others = not supported.
+      </div>
+      <div id="provider-endpoints-body"></div>
+      <div class="actions">
+        <button class="btn" value="close">Close</button>
       </div>
     </form>
   </dialog>
@@ -3070,6 +3095,15 @@
     //
     // 设计思路: 把两种资源的 CRUD / 表格渲染 / form 提交差异收进 KINDS 表,
     // 主流程只写一次. 新增资源类型时只需在 KINDS 加一项.
+    //
+    // cfg 字段契约:
+    //   api / list / setList / bodyId / statsId / formDlgId / formElId / colspan /
+    //   emptyText / kindParam / refresh / renderRow / populateSelects / openForm —
+    //     见各 cfg 项, 含义自明.
+    //   extraActions?: Record<actionName, (id: string) => void> — 可选.
+    //     kind 特定的额外按钮动作 (如 provider 的 endpoints), 由 bindTableEvents 的
+    //     click 委托在通用 edit/delete/revert 之外分派. 仅在该 kind 的行渲染了对应
+    //     data-action 按钮时才会触发.
 
     const KINDS = {
       secret: {
@@ -3103,6 +3137,7 @@
         renderRow: renderProviderRow,
         populateSelects: populateProtocolSelect,
         openForm: openProviderForm,
+        extraActions: { endpoints: openProviderEndpoints },
       },
     };
 
@@ -3137,6 +3172,7 @@
         if (action === 'edit') cfg.openForm(cfg.list().find(x => x.id === id));
         else if (action === 'delete') deleteItem(kind, id, false);
         else if (action === 'revert') deleteItem(kind, id, true);
+        else if (cfg.extraActions && cfg.extraActions[action]) cfg.extraActions[action](id);
       });
       body.addEventListener('change', async (e) => {
         const sel = e.target.closest('select.decision-select');
@@ -3423,7 +3459,10 @@
           <td class="cell-short">${p.enabled ? '✓' : '<span class="status-err">✗</span>'}</td>
           <td>${srcBadge(p.source)}</td>
           <td>${decisionCell('provider', p.id, p.decision, !!p.static_version)}</td>
-          <td class="actions">${rowActions(p)}</td>
+          <td class="actions">
+            <button class="btn" data-action="endpoints" data-id="${escapeHtml(p.id)}" title="View endpoint URLs for each protocol">endpoints</button>
+            ${rowActions(p)}
+          </td>
         </tr>
       `;
     }
@@ -3604,6 +3643,63 @@
         });
       }
     });
+
+    // ─── provider endpoints 弹窗 ──────────────────────────────────────────
+    //
+    // 展示某个 provider 在 4 种 ingress 协议下的入口 URL 和支持状态.
+    // 判定 SSOT: 与后端 `proxy.rs::dispatch` 一致 —
+    //   ingress == egress → direct (同协议透传/IR redact);
+    //   ingress != egress 且两者 codec 都支持 (openai/anthropic) → cross-protocol 转译
+    //     (注: 仅非流式, stream=true 时后端返回 501, 见 cross_proto_forward);
+    //   任一协议 codec 不支持 (gemini/ollama) → 不支持.
+    //
+    // codec 支持矩阵与 `codec::Protocol::from_native` 一致 (仅 openai/anthropic).
+    // 这是 codec 内部性质, 后端无 API 暴露, 硬编码在渲染层作为派生真相; 若未来后端
+    // 暴露 codec 支持信息, 应改为 fetch 派生以消除此 SSOT 漂移点.
+    const CODEC_SUPPORTED = new Set(['openai', 'anthropic']);
+
+    function ingressMode(ingress, egress) {
+      if (ingress === egress) return 'direct';
+      if (CODEC_SUPPORTED.has(ingress) && CODEC_SUPPORTED.has(egress)) return 'translate';
+      return 'unsupported';
+    }
+
+    function openProviderEndpoints(id) {
+      const p = state.providersList.find(x => x.id === id);
+      if (!p) {
+        console.warn(`openProviderEndpoints: provider "${id}" not found in state`);
+        return;
+      }
+      const dlg = document.getElementById('provider-endpoints');
+      const body = document.getElementById('provider-endpoints-body');
+      // 关闭时清理, 避免内容残留 (SEC-* 精神: 数据不残留).
+      dlg.addEventListener('close', () => { body.innerHTML = ''; }, { once: true });
+      const origin = window.location.origin;
+      const rows = state.providerShorts.map((short, i) => {
+        const proto = state.providerProtocols[i];
+        const mode = ingressMode(proto, p.protocol);
+        // encodeURIComponent 是 defense-in-depth: 后端 validate_id 限制 [A-Za-z0-9_-].
+        const url = `${origin}/${short}/${encodeURIComponent(p.id)}/`;
+        return endpointRow(proto, short, mode, url);
+      }).join('');
+      body.innerHTML = `<table class="ep-table">${rows}</table>`;
+      dlg.showModal();
+    }
+
+    // 单行渲染. 三态分支拆为两个独立派生 (url 单元格 + badge 单元格),
+    // 避免嵌套三元: badge 走 mode→string 查表, url 用单层三元.
+    function endpointRow(proto, short, mode, url) {
+      const label = escapeHtml(`${proto} (/${short}/)`);
+      const urlCell = mode === 'unsupported'
+        ? '<td class="unsupported">not supported</td>'
+        : `<td class="url"><code>${escapeHtml(url)}</code></td>`;
+      const badgeCell = {
+        direct:      '<td><span class="badge badge-stream">direct</span></td>',
+        translate:   '<td><span class="badge" title="Non-streaming only — stream=true returns 501">translate</span></td>',
+        unsupported: '<td><span class="badge badge-inactive">n/a</span></td>',
+      }[mode];
+      return `<tr><td class="label">${label}</td>${urlCell}${badgeCell}</tr>`;
+    }
 
     function openProviderForm(existing) {
       populateProtocolSelect();
