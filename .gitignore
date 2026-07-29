@@ -27,4 +27,5 @@ secret-guard.state.toml
 
 # Task Master (任务规划/状态, agent 本地维护, 不入库)
 .taskmaster/
+.codegraph
 
