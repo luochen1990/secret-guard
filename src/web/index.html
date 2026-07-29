@@ -1593,7 +1593,7 @@
       listEl.innerHTML = list.map(s => {
         const { proto, id: pid } = parsePath(s.path);
         const iconHtml = providerIcon(pid, proto);
-        const preview = s.preview || '(no preview)';
+        const preview = s.preview || s.path || '(no preview)';
         const status = escapeHtml(sessionStatusText(s));
         const statusCls = sessionStatusClass(s);
         const hitN = (s.redactions || []).length;
@@ -1748,17 +1748,44 @@
         applyScrollMode(scrollMode, nodeId);
         return;
       }
-      // 2./3. 不在 timeline → 重新加载该会话最近 N 条 (含末轮 tail), 然后 highlight.
-      // 注: 新 API 按 session + before 游标分页, 不支持 "以任意 round 为末轮" 的精确窗口
-      // (需要后端加 anchor 参数). 当前用 "最近 N 条" 的近似方案: 功能正确 (能定位到该轮),
-      // 但若该轮不在最近 N 条内 (历史久远), 会 fallback 到最近 N 条的末轮.
-      // TODO: 后端加 anchor 参数后可精确化 (GET /sessions/{sid}/timeline?anchor=X).
-      // scroll='highlight' 让 loadTimeline 滚到 selectedRound 而非末轮 (避免被强拉到底
-      // 进入 phase 4 / drawer 扩展到 80%, 见 loadTimeline 头部注释).
+      // 2. 不在 timeline → 向前连续扩展 (循环 loadOlder) 直到包含该轮.
+      // 连续性是 timeline 的核心性质: [begin, end] 区间内所有 round 必须连续加载,
+      // 避免断点影响用户对数据的理解 (否则得设计专门的交互提示 "这里断开了").
+      // selectRound 是 async, loadUntilRound 内部循环 fetch + prepend, 完成后 highlight.
       if (state.selectedSession) {
-        await loadTimeline(state.selectedSession, { scroll: scrollMode });
+        await loadUntilRound(state.selectedSession, nodeId, scrollMode);
       }
     }
+
+    // 向前连续加载 timeline 直到包含目标 round (保持 [begin, end] 区间连续性).
+    //
+    // 实现: 循环调 loadOlder (before=当前 oldest, prepend 新页), 直到:
+    //   - 目标 round 出现在 timelineRecords → 成功, highlight 定位.
+    //   - 到顶 (timelineReachedTop) 且目标仍不在 → 目标已被淘汰/不存在, fallback 高亮末轮.
+    //
+    // 性能: 每页 TIMELINE_PAGE 条, N 轮之外的 round 需 ceil(N/TIMELINE_PAGE) 次请求.
+    // 极端情况 (选中第一个 round, 整个会话全量加载) 请求次数 = ceil(total/TIMELINE_PAGE),
+    // 但 timeline 连续性要求下这是必要的 (用户明确要求看到早期 round).
+    async function loadUntilRound(sid, targetId, scrollMode) {
+      // 先确保 timeline 有初始数据 (selectRound 从 sidebar 三级菜单触发时可能尚未加载).
+      if (state.timelineRecords.length === 0 || state.selectedSession !== sid) {
+        state.selectedSession = sid;
+        await loadTimeline(sid, { scroll: 'highlight' });
+      }
+      // 循环向前加载直到包含目标 round 或到顶.
+      let safety = 0;
+      while (!state.timelineRecords.some(r => r.id === targetId) && !state.timelineReachedTop) {
+        if (++safety > 100) break; // 安全限位 (防异常死循环).
+        await loadOlder();
+      }
+      if (state.timelineRecords.some(r => r.id === targetId)) {
+        // 目标 round 已在 timeline → highlight 定位.
+        applyScrollMode(scrollMode, targetId);
+      } else if (state.timelineRecords.length > 0) {
+        // 目标未找到 (已淘汰) → fallback 高亮末轮.
+        const lastId = state.timelineRecords[state.timelineRecords.length - 1].id;
+        applyScrollMode(scrollMode, lastId);
+      }
 
     // 应用 selectRound 的 scroll mode: bottom 路径强制进入 follow (清零 unread),
     // highlight 路径滚动到目标轮并触发 flash.
@@ -2224,7 +2251,26 @@
       });
     }
 
-    // 显式滚到 timeline 底部 (最新一轮). loadTimeline / selectRound(scroll:'bottom') 调用.
+    // 末轮 .tl-round 的底部坐标 (offsetTop + offsetHeight), 不含 .drawer-placeholder.
+    // 依据 UI-3 (DOM 中 .tl-round 顺序 == timelineRecords, oldest-first), DOM 末元素即末轮.
+    // 测不到 (空 timeline / DOM 未 reconcile) 时 fallback 到 scrollHeight (ROB-1 永不 panic).
+    function contentEndY(detailEl) {
+      const rounds = detailEl.querySelectorAll(':scope > .tl-round');
+      if (rounds.length === 0) return detailEl.scrollHeight;
+      const last = rounds[rounds.length - 1];
+      return last.offsetTop + last.offsetHeight;
+    }
+
+    // 显式滚到 timeline 末轮底部 (最新一轮的 request 内容底, 不含 drawer-placeholder).
+    // loadTimeline / selectRound(scroll:'bottom') 调用.
+    //
+    // 为何不滚到 scrollHeight: #detail 末尾有 .drawer-placeholder (长内容时高度 =
+    // extremeMaxH = 80% wrapH), 它的作用是给**用户手动滚动**提供 phase 4 空间 (drawer
+    // 扩展遮挡 placeholder). 若 follow 自动滚动滚到 scrollHeight (含 placeholder),
+    // placeholder 进入视口 → drawer 段 B 主导扩展到 extremeMaxH (80%), 遮挡末轮 request
+    // 气泡 (bug: 新 round 到达后被抽屉遮挡). 故 follow 自动滚动只滚到末轮底部 (contentEnd),
+    // 让末轮紧贴视口底, placeholder 留在视口下不可见, drawer 保持 defaultH (30%).
+    //
     // 用 scrollTo({behavior:'auto'}) 而非 scrollTop= 赋值: behavior:'auto' 是显式滚动操作,
     // CSSOM View 规范要求它 abort 同一元素上正在进行的 smooth 滚动动画 (来自 highlightRound).
     // scrollTop 赋值在部分浏览器实现里不保证 abort, 实测时序上 smooth 动画会继续把 scrollTop
@@ -2232,7 +2278,11 @@
     // 与 timeline 倒序 bug 独立 — 倒序修复后才暴露此竞争).
     function scrollTimelineToBottomForce() {
       const el = document.getElementById('detail');
-      if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'auto' });
+      if (!el) return;
+      // 短内容 (contentEnd < wrapH): 滚到 0 (内容顶部, 已全在视口内).
+      // 长内容: 滚到 contentEnd - wrapH (末轮底部贴视口底).
+      const target = Math.max(0, contentEndY(el) - el.clientHeight);
+      el.scrollTo({ top: target, behavior: 'auto' });
     }
 
     // ─── timeline 滚动状态机 (UI-6 follow/pinned) ──────────────────────────
@@ -2243,10 +2293,21 @@
     //   注: 这些显式动作用 scroll:'bottom' (滚到底), 不触发 highlightRound 的 .flash
     //   (highlightRound 滚到气泡 70% 位置, 与 "滚到底" 冲突). .selected 持续高亮已足够反馈.
 
+    // 判定视口是否 "在底部" (follow 状态).
+    //
+    // 基于 "末轮底部 (contentEndY)" 而非 scrollHeight: #detail 末尾有 .drawer-placeholder
+    // (长内容时高度 = extremeMaxH), 它是给手动滚动 phase 4 用的, 不应参与 follow 判定.
+    // 若用 scrollHeight 判定: scrollTimelineToBottomForce 滚到 contentEnd 后, 距 scrollHeight
+    // = placeholderH (= 0.8·wrapH) 远超 NEAR_BOTTOM_PX → 误判为 pinned → follow 丢失.
+    //
+    // placeholder 区 (scrollTop > contentEnd - wrapH, 即滚过末轮底部) 也算 "在底部":
+    // distToBottom 为负 → <= NEAR_BOTTOM_PX 成立. 用户主动滚下去看 response 抽屉的延伸,
+    // 新 round 到达仍应自动滚回.
     function isNearBottom() {
       const el = document.getElementById('detail');
       if (!el) return true;
-      return el.scrollHeight - el.scrollTop - el.clientHeight <= NEAR_BOTTOM_PX;
+      const distToBottom = contentEndY(el) - (el.scrollTop + el.clientHeight);
+      return distToBottom <= NEAR_BOTTOM_PX;
     }
 
     // 唯一改 state.timelineFollow 的入口. 调用时机: scroll 事件 (RAF 合并后) + 新内容追加后.
@@ -2802,12 +2863,16 @@
       const el = document.getElementById('detail');
       if (el) el.scrollTo({ top: 0, behavior: 'smooth' });
     }
-    // "↓ 回到底部" 浮按钮: 仅滚动视口到最新轮, 不重置 selectedRound (方案 X).
+    // "↓ 回到底部" 浮按钮: 仅滚动视口到最新轮 (末轮底部, 不含 placeholder), 不重置 selectedRound (方案 X).
     // 进入 follow 由后续 scroll 事件的 syncFollowMode 自然完成 (smooth 动画结束后).
     // 与 unread badge (jumpToLatest) 的区别: 后者额外重置 selectedRound 到最新轮 + flash.
+    // 同 scrollTimelineToBottomForce 一样滚到 contentEnd (不滚入 placeholder, 见其注释),
+    // 仅 behavior 不同 (smooth 给用户手动点击的视觉过渡).
     function scrollTimelineToBottom() {
       const el = document.getElementById('detail');
-      if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+      if (!el) return;
+      const target = Math.max(0, contentEndY(el) - el.clientHeight);
+      el.scrollTo({ top: target, behavior: 'smooth' });
     }
 
     // ─── detail 渲染辅助 (被 timeline 复用) ────────────────────────────────

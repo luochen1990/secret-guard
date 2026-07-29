@@ -197,6 +197,12 @@ drawer overlay 不影响 #detail 的滚动空间. 因此:
 **新 round 到来**: keyed reconciliation 追加新轮次, `#detail` 高度不变, scrollTop 不变 →
 drawerH 不变 → 分配比例保持 (用户视野不受内容变化干扰).
 
+> **follow 自动滚动不滚入 placeholder** (WebUI bug #3): `scrollTimelineToBottomForce`
+> 滚到 **contentEnd** (末轮底部) 而非 scrollHeight (含 placeholder). 否则 placeholder
+> 进入视口 → drawer 段 B 扩展到 extremeMaxH (80%) 遮挡末轮 request. placeholder 仅
+> 服务**用户手动滚动** (phase 4 看 response 抽屉). `isNearBottom` 同步基于 contentEnd
+> (placeholder 区视为 "在底部", 新 round 到达仍自动滚回).
+
 scroll-nav 的 bottom 同步到 drawerH, 使底部按钮贴合滚动区域底端.
 
 > **不变量**: `#detail` 高度必须固定 (= wrapH), **禁止**改为 `height: wrapH - drawerH`
@@ -211,7 +217,7 @@ scroll-nav 的 bottom 同步到 drawerH, 使底部按钮贴合滚动区域底端
 
 timeline 有两种滚动状态, 由 **视口距底部距离** 机械推导 (SSOT), 不由 "最近点了什么" 决定:
 
-- **follow** (距底 ≤ `NEAR_BOTTOM_PX` ≈ 100px): 新 round 到达 → 自动滚到底 (`scrollTimelineToBottomForce`).
+- **follow** (距末轮底部 ≤ `NEAR_BOTTOM_PX` ≈ 100px): 新 round 到达 → 自动滚到末轮底部 (`scrollTimelineToBottomForce`, 滚到 contentEnd 不含 placeholder).
 - **pinned** (距底 > `NEAR_BOTTOM_PX`): 新 round 到达 → 不滚动, 浮出 `#unread-badge` 显示 "↓ N".
 
 **关键解耦 (方案 X)**: `selectedRound` 与 `timelineFollow` 解耦. `selectedRound` 是
@@ -223,7 +229,7 @@ loadTimeline) 才重置 selected 到最新轮 (`.selected` 持续高亮; 不触�
 **状态机入口**:
 - `syncFollowMode()`: 唯一改 `state.timelineFollow` 的入口, 在 scroll 事件 (RAF 合并) +
   新内容追加后调用. pinned → follow 时清零 `unreadCount`.
-- `refreshTimelineTail()`: 新 round 到达时按 follow/pinned 分支处理 (follow 滚底 / pinned 累加未读).
+- `handleNewRounds()`: 新 round 到达时按 follow/pinned 分支处理 (follow 滚底 / pinned 累加未读).
 - `jumpToLatest()`: unread badge 点击 = 进入 follow + 重置 selected 到最新轮.
 
 **"↓ 回到底部" vs "跳到最新" (unread badge) 的语义区别**:

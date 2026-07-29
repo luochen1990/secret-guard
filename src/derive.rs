@@ -2,9 +2,9 @@
 //!
 //! # 职责边界
 //!
-//! 本模块提供协议无关的字节级派生函数, 从 request body (`{model, messages[...]}` 形态)
-//! 提取 sidebar 标题 preview + model 名 + message 文本片段. 这些派生属于 **域 B (派生链)**:
-//! 从原始字节 (域 A 透明中继产出的 `req_body_raw`) 派生 WebUI 需要的轻量视图.
+//! 本模块提供协议无关的派生函数, 从 request body 提取 sidebar 标题 preview + model 名 +
+//! message 文本片段. 这些派生属于 **域 B (派生链)**: 从原始字节 (域 A 透明中继产出的
+//! `req_body_raw`) 或已解析的 IR 派生 WebUI 需要的轻量视图.
 //!
 //! # 为什么不在 `web::api`
 //!
@@ -16,6 +16,14 @@
 //!
 //! 让 `proxy` / `dag` (域 A/B) 反向依赖 `web::api` (域 C 展示层) 违反单向承诺
 //! (域 A → 域 B → 域 C, 禁止反向). 故下沉到本独立模块, 让三层各自从 `crate::derive` 取用.
+//!
+//! # 两个入口 (IR + 字符串)
+//!
+//! - `extract_preview_and_model_from_ir`: codec 路径 (same_proto + redact / cross_proto)
+//!   已 parse 出 IR, 直接从 IR 提取, **零重复 JSON parse**.
+//! - `extract_preview_and_model`: passthrough 路径 (无 redact) 不 parse IR (保持 byte-exact),
+//!   从原始 body 字符串提取. 此路径不限制 body 大小 (opencode 的 system prompt + MCP 工具
+//!   schema 常超 1 MiB; 旧版 PREVIEW_BODY_MAX=1MiB 导致全部 round preview=None 是历史 bug).
 //!
 //! # 鲁棒性 (best-effort, 永不 panic) → ROB-1 契约
 //!
@@ -30,36 +38,121 @@
 /// 既保留足够辨识度 (用户问题前半句), 又不撑爆紧凑布局. 调小 → 同质性升高难辨识;
 /// 调大 → 多条目挤压. 48 是实测权衡值.
 const PREVIEW_MAX: usize = 48;
-/// 超过此大小的 req_body 跳过 preview 提取 (避免大 body 无谓 JSON parse).
-/// 1 MiB 足以覆盖绝大多数 LLM 请求 (system prompt + 多轮对话); 超出此大小的请求
-/// preview 留空, sidebar fallback 到 method+path.
-const PREVIEW_BODY_MAX: usize = 1024 * 1024;
 
-/// 从 chat request body 中提取 (sidebar 标题 preview, model 名).
+/// opencode 压缩会话注入的固定 user message (opencode 源码:
+/// packages/opencode/src/session/message-v2.ts:231). 命中时优先取最后一条 assistant 摘要.
+/// 精确匹配依赖 opencode 内部实现; 若 opencode 改变 marker, 匹配失败会优雅降级到
+/// 正常的 "最后一条有文本的 message" 路径 (有测试覆盖该降级).
+const COMPRESSED_MARKER: &str = "What did we do so far?";
+
+// ─── preview 核心逻辑 (协议无关, 输入候选文本列表) ──────────────────────────
+
+/// preview 选择 + 归一化 + 截断 (纯函数, 不依赖 JSON / IR).
 ///
-/// 协议无关的字节级提取 (不依赖 codec reader): OpenAI 和 Anthropic 都把 `model`
-/// 放在顶层, `messages[]` 也共享 `{role, content}` 形状. content 支持 string 和
-/// `[{type:"text", text}]` 两种形态 (OpenAI / Anthropic 一致).
+/// 输入: 按 messages 数组顺序 (oldest-first) 排列的 (role, 文本) 候选对.
+/// 选择策略 (issue #27):
+/// 1. 最后一条 role=user 的文本 (人类可读, 反映本轮问题)
+/// 2. 无 user → 最后一条有文本的 message (不限 role, 覆盖纯 tool-call 轮次)
+/// 3. 压缩 marker 命中时 → 最后一条 assistant 摘要
+fn select_and_truncate_preview(candidates: &[(&str, &str)]) -> Option<String> {
+    // 最后一条 role=user 的文本.
+    let last_user = candidates
+        .iter()
+        .rev()
+        .find_map(|(role, text)| (*role == "user").then_some(*text));
+    // 最后一条有文本的 message (不限 role).
+    let last_any = candidates.last().map(|(_, text)| *text);
+    // 最后一条 role=assistant 的文本 (压缩 marker fallback 用).
+    let last_assistant = candidates
+        .iter()
+        .rev()
+        .find_map(|(role, text)| (*role == "assistant").then_some(*text));
+
+    let raw = match last_user {
+        Some(COMPRESSED_MARKER) => last_assistant.or(last_user),
+        Some(_) => last_user,
+        None => last_any,
+    };
+    raw.map(truncate_preview)
+}
+
+/// 归一化空白 + 截断到 PREVIEW_MAX chars (SSOT, 前后端一致).
+fn truncate_preview(s: &str) -> String {
+    let normalized = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() > PREVIEW_MAX {
+        let end = normalized
+            .char_indices()
+            .nth(PREVIEW_MAX)
+            .map(|(i, _)| i)
+            .unwrap_or(normalized.len());
+        format!("{}…", &normalized[..end])
+    } else {
+        normalized
+    }
+}
+
+// ─── IR 入口 (codec 路径, 零重复 parse) ─────────────────────────────────────
+
+/// 从已解析的 IR 提取 (sidebar 标题 preview, model 名).
 ///
-/// 标题选择策略 (issue #27):
-/// 取 messages 数组中**最后一条有文本内容的 message**, 不限 role.
-/// 这让 tool-call 循环的每一轮有不同 preview:
-///   轮1: [sys, u1] → preview = u1 (用户问题)
-///   轮2: [sys, u1, a1(tc), tool1] → preview = tool1 内容 (不同于 u1!)
-///   轮3: [sys, u1, a1(tc), tool1, a2(tc), tool2] → preview = tool2 内容 (不同于 tool1!)
+/// codec 路径 (same_proto + redact / cross_proto) 已将请求 body parse 成 IR, 此函数
+/// 直接从 IR 的 messages 提取, **零额外 JSON parse**. 替代旧的从 `req_body_raw` 字符串
+/// 重新 parse 的方式 (重复 parse 浪费, 且大 body 时 preview 被 PREVIEW_BODY_MAX 跳过).
 ///
-/// 压缩 marker 特殊处理: 若最后一条恰好是 "What did we do so far?" (opencode 压缩
-/// marker), 改取最后一条 assistant (即压缩摘要).
+/// model 直接取 `ir.model` (顶层字段, reader 已解析).
+/// preview 选择策略与 `extract_preview_and_model` 完全一致 (共用 `select_and_truncate_preview`).
+pub(crate) fn extract_preview_and_model_from_ir(
+    ir: &crate::codec::ir::IrRequest,
+) -> (Option<String>, Option<String>) {
+    // model: IR 的 model 字段 (reader 已解析顶层 model, 永远非空).
+    let model = if ir.model.is_empty() {
+        None
+    } else {
+        Some(ir.model.clone())
+    };
+
+    // 收集候选: 遍历 messages, 提取每条的 (role, 首个文本块文本).
+    // IrMessage.content 是 Vec<IrBlock>, 文本块是 IrBlock::Text { text }.
+    let candidates: Vec<(&str, &str)> = ir
+        .messages
+        .iter()
+        .filter_map(|m| {
+            let text = m.content.iter().find_map(|b| match b {
+                crate::codec::ir::IrBlock::Text { text } if !text.is_empty() => Some(text.as_str()),
+                _ => None,
+            })?;
+            // IrRole → 字符串 (与 wire JSON 的 role 值一致: lowercase).
+            let role = match m.role {
+                crate::codec::ir::IrRole::System => "system",
+                crate::codec::ir::IrRole::User => "user",
+                crate::codec::ir::IrRole::Assistant => "assistant",
+                crate::codec::ir::IrRole::Tool => "tool",
+            };
+            Some((role, text))
+        })
+        .collect();
+
+    let preview = select_and_truncate_preview(&candidates);
+    (preview, model)
+}
+
+// ─── 字符串入口 (passthrough 路径) ──────────────────────────────────────────
+
+/// 从 chat request body 字符串提取 (sidebar 标题 preview, model 名).
 ///
-/// 设计权衡:
-/// - 不复用 codec reader: reader 会做更重的协议归一化 (tool_calls / system 顶层等),
-///   list 路径只需 preview + model, 用轻量 serde_json::Value 提取即可, 避免把
-///   codec 模块耦合进派生路径.
-/// - 失败容错: 非 JSON / 字段缺失 / 类型不匹配一律返回 (None, None), 不影响 list 响应.
-///   前端按 None fallback 到 method+path (与旧行为一致).
+/// passthrough 路径 (无 redact) 不 parse IR (保持 byte-exact), 从原始 body 字符串提取.
+/// codec 路径应优先用 `extract_preview_and_model_from_ir` (零重复 parse).
+///
+/// **不限制 body 大小**: opencode (含大量 MCP 工具 schema 的 system prompt) 请求 body 常超
+/// 1 MiB, 旧版 PREVIEW_BODY_MAX=1MiB 导致全部 round preview=None (sidebar "no preview").
+/// push 路径每请求只调一次, serde_json parse 5 MiB ≈ 50ms (LLM 请求本身要数秒), 开销可接受.
+/// 仅保留非空 + 非 `{` 开头的快速路径 guard (过滤 GET/DELETE 等无 body 场景).
+///
+/// 失败容错: 非 JSON / 字段缺失 / 类型不匹配一律返回 (None, None), 不影响 list 响应.
+/// 前端按 None fallback 到 method+path (与旧行为一致).
 pub(crate) fn extract_preview_and_model(req_body: &str) -> (Option<String>, Option<String>) {
-    // 跳过明显非 JSON 的 body (快速路径, 避免大 body 无谓 try_parse).
-    if req_body.is_empty() || req_body.len() > PREVIEW_BODY_MAX || !req_body.starts_with('{') {
+    // 快速路径: 空 body 或明显非 JSON (不以 '{' 开头 = GET/DELETE 等无 body 场景).
+    if req_body.is_empty() || !req_body.starts_with('{') {
         return (None, None);
     }
     let Ok(v) = serde_json::from_str::<serde_json::Value>(req_body) else {
@@ -68,73 +161,31 @@ pub(crate) fn extract_preview_and_model(req_body: &str) -> (Option<String>, Opti
     let model = v
         .get("model")
         .and_then(|m| m.as_str())
+        .filter(|s| !s.is_empty()) // 空 model 名 = None (与 IR 入口语义一致).
         .map(|s| s.to_string());
 
-    // opencode 压缩会话注入的固定 user message (opencode 源码:
-    // packages/opencode/src/session/message-v2.ts:231). 命中时优先取最后一条 assistant 摘要.
-    // 精确匹配依赖 opencode 内部实现; 若 opencode 改变 marker, 匹配失败会优雅降级到
-    // 正常的 "最后一条有文本的 message" 路径 (有测试覆盖该降级).
-    const COMPRESSED_MARKER: &str = "What did we do so far?";
     let messages = v.get("messages").and_then(|m| m.as_array());
-    // preview 优先级 (issue #27):
-    // 1. 最后一条 user message (人类可读, 反映本轮问题)
-    // 2. 最后一条有文本的 message (不限 role, 覆盖纯 tool-call 轮次)
-    // 3. 压缩 marker 命中时 → 最后一条 assistant 摘要
-    let last_user = messages.and_then(|msgs| last_message_text_by_role(msgs, "user"));
-    let last_any = messages.and_then(|msgs| last_message_text(msgs));
-    let raw = match last_user.as_deref() {
-        Some(COMPRESSED_MARKER) => messages
-            .and_then(|msgs| last_message_text_by_role(msgs, "assistant"))
-            .or(last_user),
-        // 有 user message → 优先用 (可读性好, 不暴露 tool_result 结构化数据).
-        Some(_) => last_user,
-        // 无 user message → 回退到最后一条有文本的 message (tool_result / assistant).
-        None => last_any,
+    // 收集候选 (role, 文本), 复用 IR 路径的 select_and_truncate_preview.
+    let candidates: Vec<(&str, String)> = match messages {
+        Some(msgs) => msgs
+            .iter()
+            .filter_map(|m| {
+                let role = m.get("role").and_then(|r| r.as_str())?;
+                let text = message_text(m)?;
+                Some((role, text))
+            })
+            .collect(),
+        None => Vec::new(),
     };
-    let preview = raw.map(|s| {
-        // 归一化空白 + 截断 (与前端 messagePreview 逻辑一致, SSOT 在此).
-        let normalized = s.split_whitespace().collect::<Vec<_>>().join(" ");
-        if normalized.chars().count() > PREVIEW_MAX {
-            let end = normalized
-                .char_indices()
-                .nth(PREVIEW_MAX)
-                .map(|(i, _)| i)
-                .unwrap_or(normalized.len());
-            format!("{}…", &normalized[..end])
-        } else {
-            normalized
-        }
-    });
+    let candidates_ref: Vec<(&str, &str)> =
+        candidates.iter().map(|(r, t)| (*r, t.as_str())).collect();
+    let preview = select_and_truncate_preview(&candidates_ref);
     (preview, model)
 }
 
-/// 从 messages 数组中提取指定 role 的**最后一条** message 文本.
-///
-/// content 兼容 string 与 `[{type:"text", text}]` 两种形态 (OpenAI / Anthropic 一致).
-/// 返回原始文本 (未归一化 / 未截断), 由调用方决定后处理.
-///
-/// 取 "最后一条" 而非 "首条": chat API 的 messages 数组是累积的, 每轮请求都含完整历史.
-/// 最后一条才反映 "这一轮的实际内容" (issue #25).
-fn last_message_text_by_role(messages: &[serde_json::Value], role: &str) -> Option<String> {
-    messages.iter().rev().find_map(|m| {
-        if m.get("role").and_then(|r| r.as_str()) != Some(role) {
-            return None;
-        }
-        message_text(m)
-    })
-}
-
-/// 从 messages 数组中提取**最后一条有可展示文本的 message** (不限 role).
-///
-/// 用于 preview: tool-call 循环中最后一条可能是 tool_result (role=tool),
-/// 让每轮 preview 反映本轮的实际增量, 而非永远是同一条 user message (issue #27).
-/// 跳过 tool_call (assistant 无 content / 只有 tool_calls) 和其他无文本 message.
-fn last_message_text(messages: &[serde_json::Value]) -> Option<String> {
-    messages.iter().rev().find_map(message_text)
-}
-
-/// 从单条 message 中提取可展示文本 (content string 或 array of text blocks).
+/// 从单条 wire message 中提取可展示文本 (content string 或 array of text blocks).
 /// 跳过无文本的 message (tool_call only / null content / 空串).
+/// 仅 passthrough 路径 (字符串入口) 使用; codec 路径直接从 IR 的 IrBlock::Text 提取.
 fn message_text(m: &serde_json::Value) -> Option<String> {
     let content = m.get("content")?;
     // string content: 直接取 (空串视为无文本).
@@ -349,29 +400,79 @@ mod tests {
     }
 
     #[test]
-    fn extract_preview_oversized_body_returns_none() {
-        // > PREVIEW_BODY_MAX (1 MiB) 的 body 直接跳过 (快速路径).
-        let big = "x".repeat(PREVIEW_BODY_MAX + 1);
-        let body = format!(r#"{{"model":"x","messages":[{{"role":"user","content":"{big}"}}]}}"#);
+    fn extract_preview_large_body_over_1mib_still_extracted() {
+        // Bug 1 根因修复: opencode 的 system prompt + MCP 工具定义常超 1 MiB,
+        // 旧版 PREVIEW_BODY_MAX=1MiB 导致全部 round preview=None (sidebar "no preview").
+        // 移除大小限制后, 大 body 也应正常提取 preview + model.
+        // 构造: 1.2 MiB system prompt + 短 user message (模拟 opencode 典型请求).
+        let big_system = "x".repeat(1_200_000);
+        let body = format!(
+            r#"{{"model":"claude-sonnet-4","system":"{big_system}","messages":[{{"role":"user","content":"How do I fix this bug?"}}]}}"#
+        );
+        assert!(body.len() > 1_048_576, "body 应超过 1 MiB");
         let (preview, model) = extract_preview_and_model(&body);
-        assert!(preview.is_none());
-        assert!(model.is_none());
+        assert_eq!(model.as_deref(), Some("claude-sonnet-4"));
+        assert_eq!(
+            preview.as_deref(),
+            Some("How do I fix this bug?"),
+            "大 body 也应提取 preview (Bug 1 修复)"
+        );
+    }
+
+    // ─── IR 入口测试 (codec 路径, 零重复 parse) ──────────────────────────────
+
+    /// 辅助: 用 OpenAI reader 把 wire JSON 解析成 IR (测试 extract_preview_and_model_from_ir).
+    fn parse_ir(body: &str) -> crate::codec::ir::IrRequest {
+        let proto = crate::codec::Protocol::OpenAI;
+        let reader = proto.reader();
+        let v: serde_json::Value = serde_json::from_str(body).expect("parse json");
+        reader
+            .read_request(&v)
+            .expect("read_request should succeed")
     }
 
     #[test]
-    fn extract_preview_large_but_under_threshold_is_extracted() {
-        // 接近 1 MiB 的合法 chat body 仍应正常提取 (覆盖典型 LLM 长 prompt 场景).
-        // content 用 100 KiB 文本, 整个 body 约 100 KiB, 远低于阈值.
-        let big_content = "a".repeat(100 * 1024);
+    fn ir_entry_extracts_preview_and_model() {
+        // IR 入口: 从已 parse 的 IR 提取, 结果应与字符串入口一致.
+        let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hello world"}]}"#;
+        let ir = parse_ir(body);
+        let (preview_ir, model_ir) = extract_preview_and_model_from_ir(&ir);
+        let (preview_str, model_str) = extract_preview_and_model(body);
+        assert_eq!(model_ir.as_deref(), model_str.as_deref());
+        assert_eq!(preview_ir.as_deref(), preview_str.as_deref());
+        assert_eq!(model_ir.as_deref(), Some("gpt-4o"));
+        assert_eq!(preview_ir.as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn ir_entry_and_string_entry_consistent_for_tool_call_cycle() {
+        // tool-call 循环: IR 入口和字符串入口应给出相同 preview (压缩 marker 降级也覆盖).
+        let body = r#"{"model":"x","messages":[
+            {"role":"user","content":"list files"},
+            {"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"ls","arguments":"{}"}}]},
+            {"role":"tool","tool_call_id":"c1","content":"file1\nfile2"}
+        ]}"#;
+        let ir = parse_ir(body);
+        let (preview_ir, _) = extract_preview_and_model_from_ir(&ir);
+        let (preview_str, _) = extract_preview_and_model(body);
+        // 优先取 user message ("list files"), 两入口一致.
+        assert_eq!(preview_ir.as_deref(), Some("list files"));
+        assert_eq!(preview_ir.as_deref(), preview_str.as_deref());
+    }
+
+    #[test]
+    fn ir_entry_large_body_zero_reparse() {
+        // Bug 1 核心: codec 路径从 IR 提取, 零重复 JSON parse.
+        // 大 body (1.2 MiB system prompt) 经 reader parse 成 IR 后, IR 入口直接提取 preview.
+        // 对比: 字符串入口需重新 parse 整个 body (但也能提取, 见上测试).
+        let big_system = "x".repeat(1_200_000);
         let body = format!(
-            r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"{big_content}"}}]}}"#
+            r#"{{"model":"gpt-4o","messages":[{{"role":"system","content":"{big_system}"}},{{"role":"user","content":"Fix the bug"}}]}}"#
         );
-        let (preview, model) = extract_preview_and_model(&body);
+        let ir = parse_ir(&body);
+        let (preview, model) = extract_preview_and_model_from_ir(&ir);
         assert_eq!(model.as_deref(), Some("gpt-4o"));
-        // content 被截断到 PREVIEW_MAX chars + '…'.
-        let p = preview.expect("preview should be set");
-        assert!(p.ends_with('…'));
-        assert_eq!(p.chars().count(), PREVIEW_MAX + 1);
+        assert_eq!(preview.as_deref(), Some("Fix the bug"));
     }
 
     #[test]

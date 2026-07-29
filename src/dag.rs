@@ -1118,7 +1118,7 @@ impl ConversationDag {
     /// 基于 session + 游标的分页 (timeline 初始加载 + lazy load).
     ///
     /// - `before=None`: 从最新轮 (leaf) 开始取 limit 条.
-    /// - `before=Some(id)`: 取该 id 之前 (更老) 的 limit 条 (不含 id 自身).
+    /// - `before=Some(id)`: 取该 id 之前 (更老) 的 limit 条 (不含 id 自身), 用于向上翻页.
     ///
     /// 返回 oldest-first, 含末轮 (链中最新那个) 的 tail 信息.
     /// `has_more` = 链上还有更老的 node (limit 条之外).

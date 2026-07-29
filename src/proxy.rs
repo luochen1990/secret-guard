@@ -333,6 +333,7 @@ async fn same_proto_forward(
         &path_for_record,
         &fwd_headers,
         &req_text_for_record,
+        Some(&ir),
         Some(codec_proto),
         redact_seed,
         Some(&secrets_snapshot),
@@ -445,6 +446,7 @@ async fn same_proto_passthrough(
         &path_for_record,
         &fwd_headers,
         &req_text_for_record,
+        None,
         crate::codec::Protocol::from_native(ingress),
         0,
         None,
@@ -619,14 +621,16 @@ fn assert_redactions_match_map(
 
 /// 视图正确性守卫 (CI 用, 需 `--features consistency-check`).
 ///
-/// `CallEvent.preview` / `CallEvent.model` 是 `req_body_raw` (SSOT) 的派生视图:
-/// 一次性从 req_body_raw 提取并缓存, 之后 sidebar / list 路径零拷贝读 Arc<str>.
-/// 本函数断言派生保持一致 — 从 req_body_raw 重新调用
-/// [`crate::derive::extract_preview_and_model`] 应得到相同结果.
+/// `CallEvent.preview` / `CallEvent.model` 的两种提取路径:
+/// - codec 路径: 从 IR 提取 (`extract_preview_and_model_from_ir`), req_body_raw 是 IR 的
+///   writer 序列化结果.
+/// - passthrough 路径: 从 req_body_raw 字符串提取 (`extract_preview_and_model`).
 ///
-/// 捕获的 drift 类型: 未来若把 preview/model 改为从其他来源 (如 IR / 原始 client body
-/// 而非 redact 后的 req_body_raw) 提取, 此守卫会立刻失败. 详见 AGENTS.md
-/// "视图正确性确保机制" — "preview/model 从 req_body_raw 派生" 是该机制的已实践位置.
+/// 本守卫从 req_body_raw 字符串重新提取, 比对存储的 preview/model. 对 passthrough 天然
+/// 一致; 对 codec 路径, 它验证 "IR 提取 == 字符串提取" (writer 忠实序列化 messages).
+///
+/// 捕获的 drift: writer 改变了 messages 顺序/结构导致 IR 提取与字符串提取不一致.
+/// 详见 AGENTS.md "视图正确性确保机制".
 #[cfg(feature = "consistency-check")]
 fn assert_preview_model_match_source(event: &CallEvent) {
     let (rederived_preview, rederived_model) =
@@ -726,19 +730,24 @@ fn record_upstream_failure(
 /// `secrets_snapshot = Some(s)` 表示 codec 路径, policy 持有真实 secret 列表 (COW Arc).
 ///
 /// `req_text` 是已 redact 的请求 body 快照 (LLM 视角), 将作为 WebUI req_body 权威来源.
-/// preview/model 从中一次性提取.
+/// `ir = Some(&ir)` (codec 路径): preview/model 从已 parse 的 IR 提取 (零重复 JSON parse).
+/// `ir = None` (passthrough 路径): 从 req_text 字符串提取 (passthrough 不 parse IR 保持 byte-exact).
 #[allow(clippy::too_many_arguments)]
 fn build_call_event(
     parts: &axum::http::request::Parts,
     path: &str,
     fwd_headers: &HeaderMap,
     req_text: &str,
+    ir: Option<&crate::codec::ir::IrRequest>,
     ingress_protocol: Option<crate::codec::Protocol>,
     redact_seed: u64,
     secrets_snapshot: Option<&[crate::secrets::SecretEntry]>,
     redactions: Vec<(String, String)>,
 ) -> CallEvent {
-    let (preview, model) = crate::derive::extract_preview_and_model(req_text);
+    let (preview, model) = match ir {
+        Some(ir) => crate::derive::extract_preview_and_model_from_ir(ir),
+        None => crate::derive::extract_preview_and_model(req_text),
+    };
     let policy = match secrets_snapshot {
         Some(s) => std::sync::Arc::new(PolicySnapshot {
             secrets: std::sync::Arc::from(s.to_vec()),
@@ -760,9 +769,9 @@ fn build_call_event(
         round_role: crate::codec::ir::IrRole::User,
         redactions: std::sync::Arc::from(redactions),
     };
-    // 视图正确性守卫: preview/model 是 req_body_raw (SSOT) 的派生视图, 每次派生都断言不变式.
-    // 集中在 build_call_event 内部确保 same_proto / cross_proto / passthrough 三条路径都覆盖
-    // (三路径都通过 build_call_event 构造 CallEvent).
+    // 视图正确性守卫: preview/model 应与 req_body_raw (SSOT) 的字符串提取一致.
+    // codec 路径从 IR 提取, req_body_raw 是 IR 的 writer 序列化 — 两者应等价 (writer 忠实
+    // 序列化 messages). passthrough 路径直接从 req_body_raw 提取, 天然一致.
     #[cfg(feature = "consistency-check")]
     assert_preview_model_match_source(&event);
     event
@@ -939,6 +948,7 @@ async fn cross_proto_forward(
         &path_for_record,
         &fwd_headers,
         &req_text_for_record,
+        Some(&ir),
         Some(ingress_codec),
         redact_seed,
         Some(&secrets_snapshot),
