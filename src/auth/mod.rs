@@ -87,6 +87,18 @@ pub struct OidcConfig {
     pub client_id: String,
     #[serde(default)]
     pub client_secret_file: Option<PathBuf>,
+    /// 可选: OIDC 回调 URL (覆盖由 host+port 派生的默认值).
+    ///
+    /// 需显式配置的场景: 监听地址非浏览器可达时 (如 `0.0.0.0` 或经反向代理以独立域名暴露),
+    /// 因为默认回退值含监听地址, IdP 会拒绝.
+    ///
+    /// **path 必须是 `/__sg/oauth2/callback`** (与内部 axum 路由一致, 见 `server.rs`);
+    /// 只能换 scheme/host/port, 换 path 会导致 IdP 回跳后 404.
+    ///
+    /// 留空 (默认) 时, server.rs 回退为 `http://{host}:{port}/__sg/oauth2/callback`,
+    /// 与历史行为一致.
+    #[serde(default)]
+    pub redirect_url: Option<String>,
 }
 
 impl AuthConfig {
@@ -101,6 +113,26 @@ impl AuthConfig {
             }
             if oidc.client_id.trim().is_empty() {
                 return Err("[auth.oidc] client_id must not be empty".into());
+            }
+            // redirect_url 校验前置到启动时 (集中式预处理), 避免错误延迟到 OIDC
+            // Discovery 阶段才暴露. 不引入 url crate 作直接依赖, 只做最小校验:
+            // 必须是 http/https scheme + path 必须是 /__sg/oauth2/callback (与 axum 路由一致).
+            if let Some(ru) = oidc.redirect_url.as_ref() {
+                let trimmed = ru.trim();
+                if trimmed.is_empty() {
+                    return Err("[auth.oidc] redirect_url must not be empty".into());
+                }
+                if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+                    return Err(format!(
+                        "[auth.oidc] redirect_url '{trimmed}' must start with http:// or https://"
+                    ));
+                }
+                if !trimmed.ends_with("/__sg/oauth2/callback") {
+                    return Err(format!(
+                        "[auth.oidc] redirect_url '{trimmed}' must end with /__sg/oauth2/callback \
+                         (axum callback route, only scheme/host/port can vary)"
+                    ));
+                }
             }
         }
         let mut seen = std::collections::HashSet::new();
@@ -158,5 +190,105 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.validate().is_err());
+    }
+
+    // ─── OidcConfig: redirect_url 字段 serde 行为 ────────────────────────────
+    // pin 住 serde 默认行为, 防止未来重构 (改成必填 / 改名) 静默破坏既有配置文件.
+
+    #[test]
+    fn oidc_config_redirect_url_defaults_to_none() {
+        // 老格式 (无 redirect_url 字段) 必须仍能解析为 None.
+        let toml_text = r#"
+            issuer_url = "https://idp.example.com"
+            client_id = "sg"
+        "#;
+        let oidc: OidcConfig = toml::from_str(toml_text).expect("toml parse");
+        assert_eq!(oidc.issuer_url, "https://idp.example.com");
+        assert_eq!(oidc.client_id, "sg");
+        assert!(oidc.redirect_url.is_none());
+        assert!(oidc.client_secret_file.is_none());
+    }
+
+    #[test]
+    fn oidc_config_redirect_url_parses_when_set() {
+        // 新格式 (显式配置 redirect_url) 必须正确解析.
+        let toml_text = r#"
+            issuer_url = "https://idp.example.com"
+            client_id = "sg"
+            redirect_url = "https://sg.example.com/__sg/oauth2/callback"
+        "#;
+        let oidc: OidcConfig = toml::from_str(toml_text).expect("toml parse");
+        assert_eq!(
+            oidc.redirect_url.as_deref(),
+            Some("https://sg.example.com/__sg/oauth2/callback")
+        );
+    }
+
+    // ─── validate: redirect_url 前置校验 (仅 enabled=true 时触发) ─────────────
+    //
+    // 与 issuer_url/client_id 对齐: 把"明显误配"在启动时 fail-fast, 而非延迟到
+    // OIDC Discovery 阶段才暴露. 校验两条契约: (1) http/https scheme;
+    // (2) path 结尾 /__sg/oauth2/callback (与 axum callback 路由一致).
+
+    /// 辅助: 构造一个 enabled=true 的 AuthConfig, oidc 必填字段已填合法值,
+    /// 只留 redirect_url 给调用方覆盖.
+    fn auth_enabled_cfg(redirect_url: Option<&str>) -> AuthConfig {
+        AuthConfig {
+            enabled: true,
+            oidc: Some(OidcConfig {
+                issuer_url: "https://idp.example.com".into(),
+                client_id: "sg".into(),
+                client_secret_file: None,
+                redirect_url: redirect_url.map(str::to_string),
+            }),
+            api_keys: vec![],
+        }
+    }
+
+    #[test]
+    fn validate_redirect_url_none_passes() {
+        // enabled=true 且 redirect_url 留空: 与历史行为兼容, 必须 ok.
+        assert!(auth_enabled_cfg(None).validate().is_ok());
+    }
+
+    #[test]
+    fn validate_redirect_url_valid_https_passes() {
+        // 合法 https + 正确 path: ok.
+        assert!(
+            auth_enabled_cfg(Some("https://sg.example.com/__sg/oauth2/callback"))
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_redirect_url_rejects_empty() {
+        let err = auth_enabled_cfg(Some("   ")).validate().unwrap_err();
+        assert!(err.contains("redirect_url must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_redirect_url_rejects_non_http_scheme() {
+        let err = auth_enabled_cfg(Some("ftp://sg.example.com/__sg/oauth2/callback"))
+            .validate()
+            .unwrap_err();
+        assert!(err.contains("must start with http"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_redirect_url_rejects_wrong_path() {
+        // scheme 对但 path 不是 /__sg/oauth2/callback → 会被 IdP 回跳后 404, 前置拒绝.
+        let err = auth_enabled_cfg(Some("https://sg.example.com/oauth2/callback"))
+            .validate()
+            .unwrap_err();
+        assert!(err.contains("/__sg/oauth2/callback"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_redirect_url_skipped_when_auth_disabled() {
+        // enabled=false 时 redirect_url 校验必须跳过 (与 issuer_url/client_id 行为一致).
+        let mut cfg = auth_enabled_cfg(Some("not-a-url"));
+        cfg.enabled = false;
+        assert!(cfg.validate().is_ok());
     }
 }

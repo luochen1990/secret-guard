@@ -258,8 +258,11 @@ pub async fn serve(
             None => None,
         };
 
-        // redirect_url 由 host + port 推导.
-        let redirect_url = format!("http://{host}:{port}/__sg/oauth2/callback");
+        // redirect_url: 显式配置优先, 否则由 host+port 派生 (历史行为).
+        let redirect_url = oidc_cfg
+            .redirect_url
+            .clone()
+            .unwrap_or_else(|| format!("http://{host}:{port}/__sg/oauth2/callback"));
 
         info!(
             issuer = %oidc_cfg.issuer_url,
