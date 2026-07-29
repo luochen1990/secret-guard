@@ -296,7 +296,11 @@ cargo run -- run --port 18787
 ### CI (Forgejo Actions)
 
 CI 配置在 `.forgejo/workflows/ci.yml`, 触发条件: `push` + `pull_request` +
-`workflow_dispatch`. 去重逻辑: PR 事件总是跑; push 仅 master 跑.
+`workflow_dispatch`. 双重去重:
+- **事件去重**: PR 事件总是跑; push 仅 master 跑 (feature branch 的 push 由 PR 覆盖).
+- **内容去重 (skip-if-passed)**: ff-merge 后 commit SHA 不变, master push 会重复触发
+  已跑过的 CI. `pre` job 查 Forgejo API (`head_sha`+`status=success`), 命中则 `check`
+  job 跳过 (连 checkout 都不执行). `workflow_dispatch` 直通不查 skip (手动重跑需无条件执行).
 
 CI 流程 (测试集只跑一次):
 1. **Check + coverage data**: `just check --coverage` (fmt + clippy + machete + 测试,

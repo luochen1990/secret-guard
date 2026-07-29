@@ -9,8 +9,15 @@
 #   PR 事件总是跑 (合并前检查, 主要场景); push 仅 master 跑 (合并后的 commit; feature
 #   branch 的 push 由 PR 覆盖). 另加 workflow_dispatch 供手动重试.
 #
+# 内容去重 (skip-if-passed): ff-merge 后 commit SHA 不变, master 的 push 会重复触发
+#   已跑过的 CI. pre job 查 Forgejo API 历史 run, 命中则 check job 跳过 (连 checkout 都不执行).
+#   (与 ~/ws/nixos 同源经验; 逻辑等价的 composite action 见 lc-studio/forgejo-actions,
+#   但本实例 DISABLE_HTTP_GIT + runner 零凭据无法跨仓库 clone action, 故内联)
+#
 # workflow `name: ci` + job_id `check` 对齐 branch protection 规则 "ci / check (*)",
 # 通配符 (*) 同时覆盖 (push) 与 (pull_request) 两种事件后缀, 门禁不会因多事件分裂.
+# `pre` job 产生 `ci / pre (*)` check, 但因 step continue-on-error 兜底,
+# 该 check 对 PR 事件恒为 success, 不影响 branch protection (无需加入 required list).
 #
 # checkout 直接用 git + SSH (不用 actions/checkout):
 #   forgejo 实例启用了 DISABLE_HTTP_GIT=true (禁止 git over HTTPS), 且内置 SSH server
@@ -27,10 +34,42 @@ on:
   workflow_dispatch: # 手动重试: forgejo UI → Actions → ci → Run workflow
 
 jobs:
-  check:
+  pre:
     runs-on: vm-nix
-    # 去重: PR 事件总是跑; push 事件仅 master 跑 (feature branch 的 push 会被 pull_request 覆盖)
-    if: ${{ github.event_name != 'push' || github.ref == 'refs/heads/master' }}
+    # workflow_dispatch 不查 skip (手动重跑应无条件执行); push 仅 master 才查
+    if: ${{ github.event_name != 'workflow_dispatch' && (github.event_name != 'push' || github.ref == 'refs/heads/master') }}
+    permissions:
+      actions: read # 查 workflow runs API 需要
+    outputs:
+      should_skip: ${{ steps.s.outputs.should_skip }}
+    steps:
+      - id: s
+        # 查当前 commit 是否已有成功的 workflow run; 失败退化为不跳过 (不阻断 CI)
+        continue-on-error: true
+        env:
+          TOKEN: ${{ github.token }}
+          API: ${{ github.api_url }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          count=$(curl -sf -H "Authorization: token $TOKEN" \
+            "$API/repos/$REPO/actions/runs?head_sha=$SHA&status=success&limit=50" \
+            | jq '[.workflow_runs[] | select(.workflow_id == "ci.yml")] | length')
+          if [ "$count" -gt 0 ] 2>/dev/null; then
+            echo "should_skip=true" >> "$GITHUB_OUTPUT"
+            echo "✓ 跳过: commit ${SHA:0:8} 已有成功的 ci workflow run 记录"
+          else
+            echo "should_skip=false" >> "$GITHUB_OUTPUT"
+            echo "→ 不跳过: commit ${SHA:0:8} 无成功记录, 正常执行"
+          fi
+
+  check:
+    needs: pre
+    runs-on: vm-nix
+    # 双重去重: 事件去重 (push 仅 master) + 内容去重 (已有成功记录则跳过);
+    # workflow_dispatch 直通 (pre 被 skip 时 should_skip 为空, != 'true' 仍跑)
+    if: ${{ (github.event_name != 'push' || github.ref == 'refs/heads/master') && needs.pre.outputs.should_skip != 'true' }}
     timeout-minutes: 20
     # 评论 PR 需要 write 权限 (仅 PR 事件下的 diff 报告 step 用). Forgejo Actions 自动注入
     # GITHUB_TOKEN 默认有此权限, 显式声明遵循最小权限原则.
