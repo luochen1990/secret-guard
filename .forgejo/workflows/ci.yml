@@ -103,7 +103,7 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      # 评论用纯 curl + Forgejo API (不引入 JS action — vm-nix 无 node).
+      # 评论用纯 curl + Forgejo API (curl 是零依赖的 shell 命令, 比 JS action 更轻量).
       # upsert 语义: 用 HTML marker 标记评论, 找到则 PATCH 更新 (PR 多次 push 不刷屏),
       # 找不到则 POST 新建. 额外守卫 steps.report.outcome == 'success': 报告没生成就不发空评论.
       - name: Upsert PR comment
@@ -178,12 +178,30 @@ jobs:
       # 取最近 20 次全绿即达标. 升级前先在本 PR 评论记录达标证据 (20 次 run 链接).
       # 未达标前, 维护者合并 PR 时需人工核对 CI log 中 WebUI step 是否非绿 (CI 不阻断).
       #
-      # 前置 (forgejo-runner-vm.mod.nix 的 VM systemPackages 已含 playwright-test nodejs python3):
-      # 见 ~/ws/nixos/private/pubserv/forgejo-runner-vm.mod.nix (此 PR 不改 nixos 仓库,
-      # 假设 VM 已含所需工具 — 如果 VM 缺工具, 此 step 会失败但 continue-on-error 不阻塞).
+      # 前置 (forgejo-runner-vm.mod.nix 的 VM PATH 已含 playwright-test nodejs python3):
+      # 见 ~/ws/nixos/private/pubserv/forgejo-runner-vm.mod.nix.
       - name: WebUI regression (Playwright)
+        id: playwright
         continue-on-error: true
         run: just check-webui
+
+      # WebUI 测试失败时上传 Playwright 产物 (截图/trace/html 报告) 供事后排查 (issue #86 子项 #2).
+      # 仅在 Playwright step 失败时上传 (成功时不产生 artifact, 省存储).
+      # 用 Forgejo 官方 fork: GitHub 官方 actions/upload-artifact@v4 会检测非 GitHub 环境直接报错.
+      # node20 是 action API 级别声明 (>=20 即可), VM 的 nodejs 24 满足 (act 执行 JS action
+      # 只需 node 在 PATH, forgejo-runner-vm.mod.nix 已配).
+      # artifact 存 Forgejo server 端 (默认本地 FS, retention 90 天), 无需 server 侧配置.
+      - name: Upload Playwright artifacts on failure
+        if: always() && steps.playwright.outcome == 'failure'
+        continue-on-error: true
+        uses: https://data.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: playwright-failure
+          # just check-webui 在 repo 根执行, Playwright 默认产物路径 (见 .gitignore):
+          path: |
+            tests/webui/test-results/
+            tests/webui/playwright-report/
+          retention-days: 14
 
       # cargo audit: 监控依赖 CVE (项目处理 API key/token/密码, 安全敏感).
       # 工具: cargo-audit (devShell 已含; VM 通过 host-sw-bin fallback 提供).
@@ -260,25 +278,20 @@ jobs:
       # 重复 crate 多版本 / 禁止依赖. 项目声明 MIT 且发布到 nixpkgs overlay, license 合规
       # 是硬约束 (引入 copyleft 会污染下游). 配置见 deny.toml.
       #
-      # 非阻塞起步 (continue-on-error: true): 当前 deny.toml 的 allow 列表已实测覆盖全部
-      # 依赖 license (本地全绿), 但升级依赖时可能引入新 license 导致意外红灯. 全绿观察期后
-      # (建议与本 PR 合并后观察 N 次 master run 全绿), 由维护者移除 continue-on-error 升级
-      # 为阻塞门禁. multiple-versions 在 deny.toml 配为 warn 不阻断 (传递依赖暂态).
+      # 阻塞门禁: 本地实测全绿 (deny.toml allow 列表覆盖全部依赖 license), 升级为阻塞
+      # (用户决策: 当前能通过的测试直接加门禁, 不设观察期). multiple-versions 在 deny.toml
+      # 配为 warn 不阻断 (传递依赖暂态).
       #
-      # 工具: cargo-deny. devShell 已含 (flake.nix); VM 通过 host-sw-bin fallback 提供
-      # (若缺, 此 step 失败但 continue-on-error 不阻塞).
+      # 工具: cargo-deny. devShell 已含 (flake.nix); VM 通过 host-sw-bin fallback 提供.
       - name: cargo-deny (license + bans + advisory)
-        continue-on-error: true
         run: just deny
 
-      # typos-cli: 拼写检查 (issue #86 子项 #6, 可选).
+      # typos-cli: 拼写检查 (issue #86 子项 #6).
       # 项目大量英文术语与中文注释混排, 拼写错误难人工抓. typos-cli 是 Rust 项目标配.
       #
-      # 非阻塞起步 (continue-on-error: true): 默认词表可能对项目专有术语误报, 白名单
-      # (_typos.toml) 需逐步沉淀. 当前白名单已覆盖已知误报 (pn / hel / abd), 本地全绿.
-      # 升级依赖或新增代码可能引入新误报, 全绿观察期后由维护者决定是否升级为阻塞.
+      # 阻塞门禁: 白名单 (_typos.toml) 已覆盖已知误报 (pn / hel / abd), 本地全绿 (用户决策:
+      # 当前能通过的测试直接加门禁). 新误报出现时更新 _typos.toml 即可 (属正常维护).
       - name: typos (spell check)
-        continue-on-error: true
         run: just typos
 
       # bench 编译验证: 已移除.
