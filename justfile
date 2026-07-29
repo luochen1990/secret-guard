@@ -87,6 +87,12 @@ clippy:
 test:
     cargo nextest run --no-fail-fast
 
+# 仅运行 ignored 测试 (TDD 红灯循环用, 详见 AGENTS.md "TDD 与可选测试").
+# 子串按测试名过滤 (非 ignore reason): just test-ignored gemini
+# --no-tests=warn: 无匹配不报错 (查询型语义).
+test-ignored *ARGS:
+    cargo nextest run --run-ignored=only --no-tests=warn {{ ARGS }}
+
 # ─── coverage ─────────────────────────────────────────────────────────────
 # 基于 LLVM source-based coverage (cargo-llvm-cov). 工具链与 LLVM_COV/LLVM_PROFDATA
 # 环境变量由 nix devShell 注入 (见 flake.nix), 因此以下命令需在 `nix develop` 内执行.

@@ -350,6 +350,39 @@ client = Anthropic(
 
 `mockito::Matcher` 在 1.x 没有 `String` 变体, 用 `Exact` 或 `Json` / `PartialJson`.
 
+### TDD 与可选测试 (ignored tests)
+
+> 为"先写测试、后写实现"的 TDD 流程提供不阻塞 CI 的机制. 关键事实: **`#[ignore]` 是
+> libtest 的运行期属性, rustc 编译器不认识它** — 因此 ignored 测试**默认就参与每次
+> `cargo build --tests` / `cargo nextest run` 的编译**, 编译漂移已被 `just check` 的
+> clippy + nextest 编译阶段守住, 无需额外 CI step.
+
+**ignore reason 命名规范** (两种合法形态):
+1. `<标识符>: <一句话说明>` — 标识符为可追踪引用 (契约编号 `L8` / `RED-X` / issue 号 `#42`).
+2. `待 <功能> ...` — 长期搁置项, 无契约/issue 编号, 必须在 "## 已知限制" 或
+   "## 后续工作" 有对应条目.
+现有先例: `L8: usage ...` (形态1)、`待 Gemini codec 实现 ...` (形态2).
+
+**按"被测代码是否已存在"选型**:
+
+| 场景 | 机制 | 适用条件 |
+|---|---|---|
+| **A: 被测函数已存在, 行为还没对** | `#[ignore = "..."]` | 最常见. 例: `redact_ir` 已实现但某 property 未满足. |
+| **B: 被测函数尚未存在** | stub (`todo!()`) + `#[ignore]` | 真正的"测试先行". |
+| **B 例外: 涉及新依赖/新模块** | `#[cfg(feature = "todo-X")]` + `[features] todo-X` | stub 若引用未实现的依赖, 会迫使该依赖提前进 Cargo.toml 拖慢默认编译; feature gate 彻底隔离. |
+
+**TDD 循环** (场景 B 为例):
+1. 写 stub 函数 (`todo!()`) + 测试, 测试标 `#[ignore = "L8: 待实现 ..."]`
+2. `just check` → 绿 (编译通过即可, 运行跳过)
+3. 实现真函数, 替换 stub
+4. `just test-ignored <测试名子串>` → 看红灯变绿 (如 `just test-ignored openai_response`)
+5. 删除 `#[ignore]` 行 + stub → 测试进入常驻集
+
+**日常巡检**: ignored 测试应随对应功能实现而"转正" (删除 `#[ignore]`). 长期未转正的
+ignored 测试是"计划但搁置"的信号, 应在 `## 已知限制` 或 `## 后续工作` 中有对应条目.
+ignored 测试默认不运行故不计入覆盖率, 转正后自动纳入.
+用 `cargo nextest list --run-ignored=only` 列出当前所有 ignored 测试做走查.
+
 ### 覆盖率工具 (`cargo-llvm-cov`)
 
 集成 cargo-nextest. 工具链与 `LLVM_COV` / `LLVM_PROFDATA` 环境变量由 devShell 注入
