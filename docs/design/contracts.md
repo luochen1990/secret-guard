@@ -128,6 +128,16 @@
 - `prop_request_half_byte_exact` (非流式, 请求侧): 对任意合法请求 wire 含 real secret, `normalize(secret-guard 发往上游的 wire) == normalize(原始 wire).replace(real, mock)`.
 - `prop_response_half_byte_exact` (非流式, 响应侧): 对任意合法响应 wire 含 mock, `normalize(secret-guard 返回客户端的 wire) == normalize(上游 wire).replace(mock, real)`.
 - `prop_streaming_response_half_byte_exact` (流式, 响应侧): 流式响应的 restore, 经任意 chunk 切分, 同上.
+
+> **理想 vs 现状**: `prop_streaming_response_half_byte_exact` 的字面形式 (byte-exact) 在
+> `StreamTranslate::new_same_proto_restore` 路径下**不成立** — 该路径显式放弃 byte-exact 走
+> IR re-serialize (见 `src/codec/stream.rs` 头部注释 "失去 byte-exact, 但语义等价"). 已知结构
+> 差异 (除 mock→real 替换外): ① id/created 重新生成 (writer 合成); ② chunk 重组 (StreamingRestorer
+> sliding window 在 mock 边界拆/并 chunk); ③ usage input_tokens backfill (terminal delta 填回
+> MessageStart 锁定值); ④ 元数据字段去重 (OpenAI writer 仅 MessageStart chunk 输出 id/created/model).
+> 当前 property (`fwd_streaming_property.rs`) 守卫**语义等价弱化形式**: no mock leak + content
+> fidelity + tool input fidelity + usage output fidelity. 完整 byte-exact 需重新设计
+> same_proto_restore 为字节级扫描替换 (避免 IR re-serialize), 作为独立架构改动.
 - `prop_proptest_generator_covers_edge_cases`: wire 生成器必须覆盖:
   - 多个并行 tool_call (≥2)        [9712c52: writer 硬编码 index=0 致 N→1 合并]
   - 空 choices 数组                 [229b2cb: 3 处独立 bug 联合丢失 usage]
@@ -745,3 +755,4 @@
 | 2026-07-26 | §0.5 | 强化漂移处理流程: 契约不能擅自修改, 必须经过人工授权 | 契约是 normative 尺子, 不能让被测物自己定义尺子的弯曲方向 |
 | 2026-07-28 | CDAG-6/7/8 | 新增 CDAG-6 hash collision 处置 + CDAG-7 孤儿节点可识别 + CDAG-8 session 聚类稳定 | DAG 落地后细化内容寻址存储的边界契约 (collision/eviction/session 稳定性) |
 | 2026-07-28 | UI-4/5/6 | 新增 UI-4 keyed reconciliation + UI-5 末轮 response 独立 drawer + UI-6 timeline 滚动状态机 | 前端不变量从 AGENTS.md I1-I3 扩展为 UI-1..UI-6, 完整收录 keyed reconciliation / drawer overlay / followMode 状态机 |
+| 2026-07-29 | FWD-1 | FWD-1 流式响应半段式 (`prop_streaming_response_half_byte_exact`) 追加 "理想 vs 现状" 注记: 字面 byte-exact 在 `same_proto_restore` 路径不成立, 当前守卫语义等价弱化形式 | 按 §0.5 漂移处理流程存档; 完整 byte-exact 需独立架构改动 (字节级扫描替换) |
