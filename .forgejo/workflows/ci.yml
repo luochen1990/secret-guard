@@ -194,7 +194,7 @@ jobs:
       - name: Upload Playwright artifacts on failure
         if: always() && steps.playwright.outcome == 'failure'
         continue-on-error: true
-        uses: https://data.forgejo.org/forgejo/upload-artifact@v4
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
         with:
           name: playwright-failure
           # just check-webui 在 repo 根执行, Playwright 默认产物路径 (见 .gitignore):
