@@ -461,6 +461,22 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
 - static config 的 `[server]` / `[redact]` 段仅在启动时读取一次, WebUI 改 host/port/global_mock_prefix 不会生效.
 - **DAG 孤儿节点降级**: parent 被 LRU 淘汰后, child 的 `full_request_messages` 返回 None
   (timeline 降级展示, 不 panic). 显式孤儿标记 (CDAG-7) 尚未实现.
+- **auth 模块测试覆盖率 (OIDC 登录流程依赖 mock IdP)**: auth 模块的纯逻辑已覆盖
+  (`apikey.rs` 100% / `middleware.rs` ~99% / `session.rs` ~98% / `mod.rs` ~99%), 含
+  require_api_key 的 Authorization 剥离断言 (SEC 红线) 与 build_session_layer 的
+  cookie 配置 (sg.sid + HttpOnly). 但以下部分**整体 0%**, 因强依赖外部 OIDC IdP
+  (token exchange / discovery), 强行 mock 会脆弱:
+  - `oidc.rs` (0%): `OidcBackend::discover` (Discovery 网络请求) / `exchange_and_verify`
+    (token exchange + ID token 验证) / `authorize_url` (PKCE/nonce 生成).
+    构造 `OidcBackend` 必须经过真实 Discovery, 无法用纯单测覆盖.
+  - `handlers.rs` 的 OIDC 流程 (~36% 整体): `login_start` / `oauth_callback` /
+    `logout` / `me` 需要 `AuthState` (含 `OidcBackend`) 或 `AuthSession` extractor,
+    均经 axum-login 层 + session, 无法在不起 IdP 的前提下构造.
+    (已覆盖的纯逻辑: `sanitize_next_url` 防 open-redirect + CRLF 注入, `error_response`
+    JSON envelope + no-store 契约.)
+  需引入 mock IdP 集成测试 (起本地 OIDC server 模拟 discovery + token endpoint + JWKS)
+  才能覆盖, 当前留作后续工作. `COVERAGE_MIN_LINES` 门禁不受影响 (auth 纯逻辑提升已使
+  总覆盖率上升).
 
 ## 后续工作 (非 MVP 范围)
 
@@ -470,6 +486,10 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
   新增协议只需实现 Reader + Writer trait (~200 行), 不动 dispatch.
 - mock_secret 的 category-aware 默认生成 (Password/ApiKey/Cookie 等格式感知).
 - 配置热加载; 测试覆盖率自动上报 + fuzzing (cargo-fuzz).
+- **auth/oidc.rs + handlers OIDC 流程的集成测试**: 起本地 mock OIDC IdP server
+  (模拟 discovery + token endpoint + JWKS 签名), 覆盖 `OidcBackend::discover` /
+  `exchange_and_verify` / `handlers::login_start`+`oauth_callback`+`logout`+`me`
+  的完整登录流程. 当前覆盖率见 "已知限制" 对应条目.
 - **依赖升级** (滞后是稳态, 非风险; Cargo.lock 锁定保证可复现构建; 触发条件满足时再升,
   默认触发条件 = CVE / 解 duplicate / 需要 feature, 各子项仅标注例外):
   - rand 0.8 → latest (0.10): 0.9/0.10 API 有 breaking (`thread_rng()` → `rng()`,

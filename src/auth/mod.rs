@@ -291,4 +291,87 @@ mod tests {
         cfg.enabled = false;
         assert!(cfg.validate().is_ok());
     }
+
+    // ─── StaticApiKey::resolve: 三条纯逻辑分支 ──────────────────────────────
+    //
+    // resolve 是启动期 fail-fast 校验的核心: key 与 key_file 互斥, 缺一不可.
+    // 守卫: (1) key 直取, (2) key_file 读取+trim, (3) 互斥违反, (4) 都缺失.
+
+    #[test]
+    fn resolve_key_directly() {
+        let sk = StaticApiKey {
+            label: "ci".into(),
+            key: Some("sg_direct_123".into()),
+            key_file: None,
+        };
+        assert_eq!(
+            sk.resolve(std::path::Path::new(".")).unwrap(),
+            "sg_direct_123"
+        );
+    }
+
+    #[test]
+    fn resolve_key_file_trims_whitespace() {
+        // key_file 内容会被 trim (防文件末尾换行污染 key). 写临时文件验证.
+        // 临时文件放在 /tmp/opencode/ (放行目录); uuid 防并发冲突; 残留依赖 CI tmpfs 周期重置.
+        let dir = std::path::PathBuf::from("/tmp/opencode");
+        std::fs::create_dir_all(&dir).unwrap();
+        let kf = dir.join(format!("sg-resolve-{}.txt", uuid::Uuid::new_v4()));
+        std::fs::write(&kf, "  sg_from_file_456  \n").unwrap();
+        let sk = StaticApiKey {
+            label: "ci".into(),
+            key: None,
+            key_file: Some(kf),
+        };
+        assert_eq!(
+            sk.resolve(&dir).unwrap(),
+            "sg_from_file_456",
+            "key_file content must be trimmed"
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_both_key_and_key_file() {
+        let dir = std::path::PathBuf::from("/tmp/opencode");
+        std::fs::create_dir_all(&dir).unwrap();
+        // 文件内容无关紧要 — 仅需文件存在以触发互斥校验.
+        let kf = dir.join(format!("sg-both-{}.txt", uuid::Uuid::new_v4()));
+        std::fs::write(&kf, "placeholder").unwrap();
+        let sk = StaticApiKey {
+            label: "ci".into(),
+            key: Some("sg_a".into()),
+            key_file: Some(kf),
+        };
+        let err = sk.resolve(std::path::Path::new(".")).unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_rejects_neither_key_nor_key_file() {
+        let sk = StaticApiKey {
+            label: "ci".into(),
+            key: None,
+            key_file: None,
+        };
+        let err = sk.resolve(std::path::Path::new(".")).unwrap_err();
+        assert!(
+            err.to_string().contains("must specify either"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_empty_static_label() {
+        // validate 的空 label 错误分支 (CRUD 前置校验, 防止空 label key 进 store).
+        let cfg = AuthConfig {
+            api_keys: vec![StaticApiKey {
+                label: "   ".into(),
+                key: Some("sg_x".into()),
+                key_file: None,
+            }],
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("label must not be empty"), "got: {err}");
+    }
 }

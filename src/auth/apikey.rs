@@ -518,4 +518,53 @@ mod tests {
         assert_eq!(hash_key("sg_abc"), hash_key("sg_abc"));
         assert_ne!(hash_key("sg_abc"), hash_key("sg_abd"));
     }
+
+    // ─── 剩余纯逻辑分支覆盖 ────────────────────────────────────────────────
+
+    #[test]
+    fn debug_impl_reports_count_and_path() {
+        // Debug 实现展示 entry 数量 + state_path, WebUI / 日志排查依赖它不 panic
+        // 且包含关键字段. 守卫: 格式化时不访问明文 (只读 count, 安全姿态).
+        let store = make_store();
+        store.issue("u1", "u1", "dbg").unwrap();
+        let s = format!("{:?}", store);
+        assert!(s.contains("count"), "Debug output: {s}");
+        assert!(s.contains("state_path"), "Debug output: {s}");
+        assert!(!s.contains("sg_"), "Debug must not leak plaintext key: {s}");
+    }
+
+    #[test]
+    fn malformed_static_key_is_skipped_with_warn() {
+        // 静态 key resolve 失败 (key 与 key_file 互斥违反) → 走 tracing::warn 分支
+        // 跳过该 key, 不 panic, 不污染 store. 守卫启动期 fail-soft 语义:
+        // 单条静态 key 坏不影响其他 key / 不阻塞进程启动.
+        let bad_static = vec![StaticApiKey {
+            label: "bad".into(),
+            key: Some("sg_x".into()),
+            key_file: Some(PathBuf::from("/nonexistent")),
+        }];
+        let store = ApiKeyStore::new(
+            &bad_static,
+            std::path::Path::new("."),
+            vec![],
+            HashSet::new(),
+            tmp_path("bad-static"),
+            Arc::new(Mutex::new(())),
+        );
+        // 坏 key 不应进入 store.
+        assert!(
+            store.list().is_empty(),
+            "malformed static key must be skipped"
+        );
+        assert!(store.lookup("sg_x").is_none());
+    }
+
+    #[test]
+    fn set_disabled_on_unknown_id_returns_none() {
+        // 守卫 set_disabled 契约: id 不存在 → Ok(None) (非 Err, 非 panic).
+        // 这是 CRUD handler 区分 "404 id 不存在" vs "500 内部错误" 的依据.
+        let store = make_store();
+        let ret = store.set_disabled("ak_nonexistent_xyz", true).unwrap();
+        assert_eq!(ret, None);
+    }
 }

@@ -247,4 +247,34 @@ mod tests {
         assert_eq!(sanitize_next_url("/\nevil"), None);
         assert_eq!(sanitize_next_url("/\revil"), None);
     }
+
+    // ─── error_response: 统一 JSON envelope + no-store (纯 helper) ──────────
+    //
+    // error_response 不依赖 OIDC IdP (纯 StatusCode + Display → Response),
+    // 但被 login/callback/logout 复用. 守卫三条契约:
+    //   1. 状态码透传 (401 / 500 都正确).
+    //   2. body 是 { "error": "<msg>" } JSON envelope.
+    //   3. Cache-Control: no-store (鉴权错误响应绝不缓存, SEC 契约).
+
+    #[tokio::test]
+    async fn error_response_envelope_status_and_no_store() {
+        let resp = error_response(StatusCode::UNAUTHORIZED, "bad token");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // no-store header 必须存在.
+        let cc = resp
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .expect("Cache-Control header must be set");
+        assert!(cc.to_str().unwrap().contains("no-store"));
+        // body 是 { "error": "bad token" }.
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"], "bad token");
+    }
+
+    #[tokio::test]
+    async fn error_response_preserves_internal_server_error_status() {
+        let resp = error_response(StatusCode::INTERNAL_SERVER_ERROR, "boom");
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }
