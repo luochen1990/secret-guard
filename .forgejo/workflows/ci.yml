@@ -197,6 +197,30 @@ jobs:
       - name: Coverage gate
         run: just coverage-gate
 
+      # Performance benchmark --quick (非阻塞): 运行 redact bench (10 samples), 守卫 runtime panic + 性能趋势.
+      #
+      # 为什么跑 bench 而非 --no-run compile check:
+      #   - --no-run (dev profile ~4s) 只验证可编译性, 收益极低 (clippy --all-targets 已覆盖编译期检查).
+      #   - 跑 bench 覆盖 criterion harness setup + runtime panic + 产出性能统计 (6 场景).
+      #
+      # 为什么用 --quick 而非默认 100 samples:
+      #   - --quick 把 sample 数从 100 降到 10, criterion 运行时间从 ~65s 压缩到 ~3s.
+      #   - 统计精度下降但仍产出置信区间, 足以发现 runtime panic / setup 失败 / 量级级退化.
+      #   - 实测 CI 增量: 热缓存 (release/ 命中) ~3s, 冷编译 (release/ 全量) ~1m20s (仅卷重建后首次).
+      #
+      # release 缓存复用: CARGO_TARGET_DIR 持久卷下 release/ 子目录跨 job 缓存,
+      # 与 debug/ / llvm-cov-target/ 物理隔离. 冷编译仅在 tmpfs 卷重建后出现.
+      #
+      # continue-on-error: true: 非阻塞起步. 升级路径 (与 WebUI regression 同策略):
+      #   连续 N=20 次 master 分支 (push 事件) 本 step 跑绿后, 移除 continue-on-error
+      #   升级为阻塞. 升级前先在 PR 评论记录达标证据 (20 次 run 链接).
+      #
+      # 未来增强: 接入 criterion baseline 保存/比较 (--save-baseline / --baseline),
+      # 让性能退化超阈值时 exit 1 (当前只产出统计, 不自动判定回归).
+      - name: Performance benchmark (redact, --quick)
+        continue-on-error: true
+        run: just bench --quick
+
       # 文件长度门禁: 防止单文件 prod 代码失控膨胀 (拆分 ROI 为负时的早期预警).
       # 用 rust-diff-analyzer 对每个 .rs 做 AST 分类, 只统计 prod 行数 (排除 test).
       # 依赖 rust-diff-analyzer (runner VM systemPackages 提供, 同 diff-loc 步).
@@ -333,18 +357,8 @@ jobs:
       - name: typos (spell check)
         run: just typos
 
-      # bench 编译验证: 已移除.
-      # 原因: cargo bench --no-run 走 release profile (lto=thin + codegen-units=1),
-      # CI 的持久卷 (CARGO_TARGET_DIR) 只缓存 debug/ 和 llvm-cov-target/, 无 release/ 缓存,
-      # 每次 CI 都从零全量编译 release, 实测耗时 5-8min, 占总 CI 时间一半以上, 严重阻碍开发.
-      #
-      # bench 编译验证的初衷是"确保 benches/redact.rs 代码不烂 (runtime panic / setup 失败)",
-      # 但 cargo clippy --all-targets 已覆盖 bench crate 的编译期检查, 额外的 --no-run
-      # 只多验证了 criterion harness 的 setup 代码, ROI 极低. 本地 `just check-benches`
-      # (改用 dev profile, 复用 debug 缓存, ~30s) 仍可供手动验证.
-      #
-      # 若未来需要 bench 编译验证回归 CI, 选项: ① just check-benches 加 --profile dev;
-      # ② 为 release/ 单独建缓存目录 (但 tmpfs 预算紧张); ③ 接入 baseline 保存/比较时再评估.
-      # - name: Bench compile check
+      # 历史: 早期曾用 "Bench compile check (release, --no-run)" 方案, 因 release 全量编译慢而移除;
+      # 后改为 "dev profile --no-run" (上方已进一步升级为完整 bench 运行). 此处保留备选记录.
+      # - name: Bench compile check (release --no-run)
       #   continue-on-error: true
       #   run: just check-benches

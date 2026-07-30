@@ -198,16 +198,16 @@ typos:
 
 # redact 性能基线 (criterion bench).
 # 详尽设计 (3 场景 + 2 目标 + 为什么手动构造 map) 见 benches/redact.rs 头部.
-# 默认 100 samples 较慢, 调试可用 `cargo bench --bench redact -- --quick`.
-bench:
-    cargo bench --bench redact
+# 默认 100 samples 较慢; CI 用 --quick (10 samples) 兼顾覆盖与速度, 本地完整跑用 `just bench`.
+# 透传 criterion 参数: just bench --quick / just bench -- --quick.
+#
+# CI 调用: 被 ci.yml "Performance benchmark (redact, --quick)" step 调用 (非阻塞).
+# release 缓存复用 CARGO_TARGET_DIR/release/ (与 debug/ 物理隔离).
+bench *ARGS:
+    cargo bench --bench redact -- {{ ARGS }}
 
-# bench 编译验证 (--no-run 零样本): 防止 bench 代码逻辑错误 / runtime panic
-# 长期不被发现 (criterion 从不运行时这类 bug 无声潜伏).
-# 用 dev profile (而非 bench 默认的 release): release profile 的 lto=thin + codegen-units=1
-# 会导致全量编译 5-8min; dev profile 复用 debug/ 缓存只需 ~30s, 且 --no-run 只验证可编译性,
-# 不跑 criterion 统计, 无需 release 优化. CI 暂不跑此命令 (见 ci.yml 末尾注释), 供本地手动验证.
-# 未来若引入 baseline 保存/比较, 可在此扩展跑采样.
+# bench 编译验证 (--no-run 零样本, dev profile): 快速验证 bench 可编译.
+# CI 不再调用 (CI 跑完整 bench); 仅供本地秒级验证 (复用 debug 缓存).
 check-benches:
     cargo bench --no-run --profile dev
 

@@ -300,6 +300,7 @@ CI 配置在 `.forgejo/workflows/ci.yml`, 触发条件 `push` + `pull_request` +
 (skip-if-passed, ff-merge 后同 SHA 不重跑). `check` job 测试集只跑一次, 顺序为
 checkout → diff 报告 (PR, 非阻塞) → consistency-check → check+coverage → coverage-gate →
 file-size → WebUI (非阻塞) → cargo audit (非阻塞) → cargo-deny → typos.
+(checkout 策略 / 缓存复用 / 并发假设 / 评论写回 / 各 step 升级路径见 docs/ci.md.)
 
 > CI 实现细节 (checkout 策略 / 缓存复用 / 并发假设 / 评论写回 / 各 step 升级路径) 见
 > **docs/ci.md**.
