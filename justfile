@@ -60,6 +60,7 @@ check *ARGS:
     cargo fmt -- --check
     cargo clippy --all-targets -- -D warnings
     cargo machete
+    just check-webui-syntax
     # cargo test --doc
     @if echo "{{ ARGS }}" | grep -q -- "--coverage"; then \
         cargo llvm-cov clean --workspace; \
@@ -76,6 +77,31 @@ check *ARGS:
 check-features:
     cargo clippy --all-targets --features consistency-check -- -D warnings
     cargo nextest run --no-fail-fast --features consistency-check
+
+# 内嵌 JS 语法检查 (秒级, 阻塞式).
+# 从 src/web/index.html 提取 <script>...</script> 块, 用 node --check 验证语法.
+# 这类低级语法错误 (未闭合括号/函数嵌套错位) 无法被 cargo 工具链发现; check-webui
+# (Playwright) 虽能间接捕获 (页面白屏) 但重 (3 分钟) 且 CI 中非阻塞 (continue-on-error).
+# 本 step 作为 check 的一部分, 让语法错误在秒级被阻断. devShell 已提供 node (无新依赖).
+# 历史教训: f1a89c0 的 loadUntilRound 漏闭合 } 导致 SyntaxError: Unexpected end of input.
+check-webui-syntax:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    script="$tmp/script.js"
+    # 提取所有 <script>...</script> 块拼接. 兼容带属性的开标签 (如 <script type="...">).
+    awk '/<script[[:space:]>]/{f=1;next} /<\/script>/{f=0} f' src/web/index.html > "$script"
+    # fail-closed: 提取为空 = index.html 结构变了 (script 块改名/消失), 此时必须报错而非静默放行,
+    # 否则本检查会被无声绕过 (保护装置自身失效). 历史教训见 recipe 头部注释.
+    lines=$(wc -l < "$script")
+    if [ "$lines" -eq 0 ]; then
+        echo "check-webui-syntax: 未从 src/web/index.html 提取到 <script> 内容;" >&2
+        echo "  检查 script 标签是否仍存在 / 是否被拆分到外部 .js 文件 (需调整本 recipe)." >&2
+        exit 1
+    fi
+    node --check "$script"
+    echo "webui-syntax: OK ($lines lines)"
 
 # WebUI 回归测试 (Playwright 端到端).
 # 需要 devShell (nix develop) 提供 playwright-test 包; shellHook 自动 symlink node_modules.
