@@ -28,8 +28,8 @@ use std::sync::Arc;
 use axum_login::{AuthUser, AuthnBackend, UserId};
 use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata};
 use openidconnect::{
-    AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointMaybeSet, EndpointSet, IssuerUrl,
-    Nonce, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, TokenResponse,
+    AuthType, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointMaybeSet, EndpointSet,
+    IssuerUrl, Nonce, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, TokenResponse,
 };
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -179,7 +179,13 @@ impl OidcBackend {
             client_secret.map(ClientSecret::new),
         )
         .set_token_uri(token_endpoint)
-        .set_redirect_uri(redirect);
+        .set_redirect_uri(redirect)
+        // 用 RequestBody 传 client credentials 而非默认的 BasicAuth.
+        //
+        // oauth2 的 BasicAuth 按 RFC 6749 §2.3.1 url-encode secret, 但 kanidm (1.10) 取字面值
+        // 不 url-decode, 导致 base64 secret 末尾 `=` → `%3D` 与存储不等 → 401. RequestBody 把
+        // secret 放进 form body, kanidm 解 form 时还原原字符. 其他主流 IdP 两种都接受, 故更稳.
+        .set_auth_type(AuthType::RequestBody);
 
         Ok(Self {
             client,
