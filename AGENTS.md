@@ -295,53 +295,14 @@ cargo run -- run --port 18787
 
 ### CI (Forgejo Actions)
 
-CI 配置在 `.forgejo/workflows/ci.yml`, 触发条件: `push` + `pull_request` +
-`workflow_dispatch`. 双重去重:
-- **事件去重**: PR 事件总是跑; push 仅 master 跑 (feature branch 的 push 由 PR 覆盖).
-- **内容去重 (skip-if-passed)**: ff-merge 后 commit SHA 不变, master push 会重复触发
-  已跑过的 CI. `pre` job 查 Forgejo API (`head_sha`+`status=success`), 命中则 `check`
-  job 跳过 (连 checkout 都不执行). `workflow_dispatch` 直通不查 skip (手动重跑需无条件执行).
+CI 配置在 `.forgejo/workflows/ci.yml`, 触发条件 `push` + `pull_request` +
+`workflow_dispatch`. 双重去重: 事件去重 (push 仅 master, PR 总是跑) + 内容去重
+(skip-if-passed, ff-merge 后同 SHA 不重跑). `check` job 测试集只跑一次, 顺序为
+checkout → diff 报告 (PR, 非阻塞) → consistency-check → check+coverage → coverage-gate →
+file-size → WebUI (非阻塞) → cargo audit (非阻塞) → cargo-deny → typos.
 
-CI 流程 (测试集只跑一次):
-1. **Check + coverage data**: `just check --coverage` (fmt + clippy + machete + 测试,
-   用 `cargo llvm-cov nextest` 插桩).
-2. **Coverage gate**: `just coverage-gate` (只做 report, 读上一步 profdata, 不重跑测试).
-3. **PR diff 拆解** (仅 `pull_request` 事件, 放在 check 之前, `continue-on-error` 真正非阻塞):
-   用 runner VM systemPackages 已提供的 `rust-diff-analyzer` (见 nixos 仓库 `rust.mod.nix`),
-   对 `origin/<PR-base>...HEAD` 跑 diff 拆解, **以 PR 评论形式贴出** (用 marker 实现同一 PR
-   多次 push 的 upsert, 不刷屏). 即使工具/网络/API 失败也不影响合并.
-4. **cargo audit** (CVE 扫描, `continue-on-error` 非阻塞): 结果 upsert 到 PR 评论.
-5. **cargo-deny** (license + bans + advisory 二次审查, `continue-on-error` 非阻塞起步).
-6. **typos** (拼写检查, `continue-on-error` 非阻塞起步).
-
-非阻塞检查 (cargo audit / cargo-deny / typos) 的升级路径: 全绿观察期后由维护者移除
-`continue-on-error`. license 合规 (cargo-deny) 与 CVE (cargo audit) 性质不同 — license
-违规是真问题 (污染下游), 升级为阻塞的优先级更高; CVE 受 advisory DB 拉取网络抖动影响,
-保持非阻塞更稳.
-
-评论写回用纯 `curl` + Forgejo API (`POST/PATCH /issues/{n}/comments`), 不引入 JS action
-(vm-nix 无 node). upsert 语义: 用 HTML 注释 marker 标记评论, 找到则 PATCH 更新, 找不到
-则 POST 新建.
-
-**跨 job target 复用**: CI job 设 `CARGO_TARGET_DIR=/var/lib/forgejo-runner/cache/cargo-target`,
-指向 runner VM 的持久 tmpfs 卷 (宿主侧 10G tmpfs + virtiofs 共享, 见 nixos 仓库
-`forgejo-runner-vm.mod.nix`). 跨 job 复用 cargo 编译产物: 依赖 crate 只编一次, 后续 job
-增量编译 (秒级). clippy/nextest 用 `debug/` 子目录, coverage 用 `llvm-cov-target/` 子目录,
-物理隔离无需 `cargo clean`. 卷生命周期 = 主机启动期间 (tmpfs, 主机重启才丢).
-
-**并发互斥假设**: 该复用机制假设 runner vm-nix 同一时刻只跑一个 job (runner 注册时
-concurrency=1 或 single-job mode, 配置在 nixos 仓库 `forgejo-runner-vm.mod.nix`, 本仓库不可见).
-若该假设被打破 (runner 允许并发 job), 两 job 同时写同一 `CARGO_TARGET_DIR` 会触发 cargo
-file lock (慢) 或产物污染. 应对预案见 ci.yml `env` 段注释 (加 `concurrency` 串行化, 或按
-run_id 隔离 target 目录).
-
-**commit status context**: `ci / check (pull_request)` 或 `ci / check (push)`
-(workflow `name: ci` + job_id `check`; **禁止改 workflow name 或 job_id** — 会改变
-context 破坏门禁). branch protection status check 规则 `ci / check (*)` 用通配符覆盖两种事件.
-
-**checkout 直接用 git + SSH** (不用 `actions/checkout`): forgejo 禁用 git over HTTPS,
-内置 SSH 在端口 5522. workflow 用 `ssh://` URL clone, host key 用 `ssh-keyscan` 动态获取.
-依赖 repo-level secret `DEPLOY_KEY`.
+> CI 实现细节 (checkout 策略 / 缓存复用 / 并发假设 / 评论写回 / 各 step 升级路径) 见
+> **docs/ci.md**.
 
 ### 客户端使用示例
 
@@ -434,9 +395,8 @@ prod 代码大量增加才需警惕). 工具用 syn AST 解析, 自动识别 `#[
 - `just diff-loc`: 对 `master...HEAD` 跑 human 格式报告 (本地终端用).
 - `just check-file-size`: 对每个 .rs 做完整 AST 分类, 只统计 prod 行数 (排除 test),
   双阈值门禁 (WARN 500 软提醒 / MAX 1600 硬阻断). fail-closed: 工具失败时 exit 1 不放行.
-- CI: diff-loc 在 `check` job 内 3 个 step (仅 PR 事件触发), `continue-on-error: true` 真正非阻塞 —
-  即使工具/网络/API 失败也不影响合并. 报告用 `--format comment` 输出 markdown, 经
-  curl + Forgejo API upsert 到 PR 评论 (marker 标记, 多次 push 不刷屏).
+- CI: PR 事件的 diff 拆解 + 文件长度门禁都复用此工具 (diff 步 `continue-on-error: true`
+  真正非阻塞), 详见 **docs/ci.md**.
 
 ### cargo-audit (CVE 监控)
 
@@ -463,8 +423,8 @@ GPL/AGPL 等 copyleft 会污染下游). 配置在 `deny.toml`, 与 `.cargo/audit
   "后续工作" 记录升级计划), 强制 deny 会频繁阻塞.
 - **sources**: 只允许 crates.io + 本地 path 源, 禁止私有 registry / git 直链 (难审计).
 
-CI 非阻塞起步 (`continue-on-error: true`): 当前 `deny.toml` allow 列表已实测覆盖全部依赖
-license (本地全绿), 但升级依赖可能引入新 license 导致意外红灯. 全绿观察期后由维护者升级为阻塞.
+CI 已升级为阻塞门禁: 当前 `deny.toml` allow 列表已实测覆盖全部依赖 license (本地全绿),
+用户决策直接加门禁不设观察期. 新 license 误报出现时更新 `deny.toml` 即可 (属正常维护).
 
 ## 部署
 
