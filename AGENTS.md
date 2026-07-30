@@ -125,11 +125,11 @@
 3. **原始数据是核心功能的真相**: secret-guard 的核心职责是转发 + Redact 的字节准确性.
    任何"派生视图更优雅"的诱惑都不能凌驾于数据准确性之上.
 
-已实践位置: `redactions` 字段从 RedactionMap 派生 (`proxy.rs::assert_redactions_match_map`)、
-`preview`/`model` 从 `req_body_raw` 派生 (`proxy.rs::assert_preview_model_match_source`)、
-`resp_parsed` (非流式) 从上游响应字节经 codec reader 派生 (`proxy.rs::assert_resp_parsed_matches_source_nonstream`)、
+已实践位置: `redactions` 字段从 RedactionMap 派生 (`proxy/record.rs::assert_redactions_match_map`)、
+`preview`/`model` 从 `req_body_raw` 派生 (`proxy/record.rs::assert_preview_model_match_source`)、
+`resp_parsed` (非流式) 从上游响应字节经 codec reader 派生 (`proxy/record.rs::assert_resp_parsed_matches_source_nonstream`)、
 `session.title` 从 root node preview 派生 (`dag.rs::assert_session_title_matches_root_preview`)、
-`resp_parsed` (流式) 从 StreamScan 累积 (`proxy.rs`, Phase A 已删除原始 SSE 字节, 派生与源物理分离, 暂不守卫).
+`resp_parsed` (流式) 从 StreamScan 累积 (`proxy/fan_out.rs`, Phase A 已删除原始 SSE 字节, 派生与源物理分离, 暂不守卫).
 后续 Phase B 删除 parent.response 时必须走此流程.
 
 ### C3 前缀缓存友好性 (经济性契约) → RED-3 契约
@@ -216,7 +216,8 @@ URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标
 - Gemini/Ollama 跨协议 → 501 (codec 未覆盖)
 
 详尽的 dispatch 路径选择 (同协议透传 / IR 路径 / 跨协议翻译) 与 fan_out 三路径见
-`src/proxy.rs` 头部; 路由相关的可测 property 见 `docs/design/contracts.md` **FWD-5**.
+`src/proxy/mod.rs` 头部 (拆分为模块目录, 各子路径实现在 `same_proto.rs` / `cross_proto.rs` /
+`fan_out.rs`); 路由相关的可测 property 见 `docs/design/contracts.md` **FWD-5**.
 
 ## 模块概览
 
@@ -237,7 +238,7 @@ URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标
 | `redact.rs` | RedactionMap + redact/restore pipeline + 形式化契约 C1-C6 | 文件头部 `//!` |
 | `util.rs` | 集中的哈希工具 (`hash64` SipHash 单值入口) | 文件头部 `//!` |
 | `codec/` | 跨协议 IR + Reader/Writer trait + StreamTranslate | **`src/codec/AGENTS.md`** |
-| `proxy.rs` | dispatch 路径选择 + fan_out 三路径 + Provider 鉴权 | 文件头部 `//!` |
+| `proxy/` | dispatch 路径选择 + fan_out 三路径 + Provider 鉴权 (拆分为 mod/helpers/auth/record/same_proto/cross_proto/fan_out 子模块) | `src/proxy/mod.rs` 头部 `//!` |
 | `web/` | JSON API (`api.rs`) + 响应 DTO (`dto.rs`: SessionView/NodeView/.../SyncSnapshot) + 单页 WebUI | **`src/web/AGENTS.md`** |
 | `server.rs` | router 装配 + 双层状态注入 + graceful shutdown | 文件头部 `//!` |
 

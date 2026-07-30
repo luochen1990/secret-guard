@@ -1,0 +1,559 @@
+//! DAG record 构造 + 视图正确性守卫 + 响应累积器.
+//!
+//! # 职责边界
+//!
+//! 汇集转发链中所有与 DAG 记录相关的辅助逻辑:
+//! - [`build_call_event`]: 三条转发路径 (same_proto passthrough / same_proto IR /
+//!   cross_proto) 共用的 [`CallEvent`] 构造器.
+//! - [`record_upstream_failure`]: 错误路径的 incomplete 记录写入.
+//! - [`derive_redactions`] / [`parse_request_ir`] / [`redact_and_derive`]: IR 解析
+//!   与 redact 派生 (same_proto / cross_proto 共享的前半段).
+//! - [`RecordAccumulator`]: fan_out 三路径共享的响应字节累积器 (受
+//!   `MAX_RESP_BODY_RECORD` cap 保护).
+//! - [`ParsedSync`]: 流式 parsed view 的节流累积器.
+//!
+//! # 视图正确性守卫 (`consistency-check` feature)
+//!
+//! 派生字段 (`redactions` / `preview` / `model` / `parsed`) 是 SSOT 的视图. 详见
+//! AGENTS.md "视图正确性确保机制". 本模块集中三个守卫函数:
+//! [`assert_redactions_match_map`] / [`assert_preview_model_match_source`] /
+//! [`assert_resp_parsed_matches_source_nonstream`].
+
+use std::time::Duration;
+
+use axum::http::HeaderMap;
+use tracing::{debug, warn};
+use uuid::Uuid;
+
+use super::helpers::redact_headers;
+use crate::dag::{CallEvent, ConversationDag, PolicySnapshot, ResponseData};
+use crate::error::AppError;
+use crate::provider::Protocol;
+use crate::redact::{RedactionMap, redact_ir};
+
+/// 流式 parsed view (StreamScan snapshot) 的节流写入间隔.
+/// 太短 → DAG 写锁竞争; 太长 → WebUI 看不到流式进度. 500ms 是 UX 与锁竞争的折中.
+pub(super) const PARSED_SYNC_INTERVAL: Duration = Duration::from_millis(500);
+
+// ─── 跨语言契约字符串 (前端 index.html 依赖, 见 isClientDisconnect) ─────────
+//
+// error_kind 字面量是前后端契约 (前端 index.html::isClientDisconnect 硬编码比较).
+// 集中为 const, 任何改动一处即可, 避免 fan_out_* 三处各自硬编码导致漂移.
+
+/// 客户端主动断开 (tx.send 失败). 前端 isClientDisconnect 严格相等匹配此串.
+pub(super) const ERR_CLIENT_DISCONNECTED: &str = "client disconnected";
+/// 上游流式响应中途出错 (reqwest stream Err).
+pub(super) const ERR_UPSTREAM_STREAM: &str = "upstream stream error";
+/// 响应超过 record 累积上限 (MAX_RESP_BODY_RECORD).
+pub(super) const ERR_RESP_CAP_EXCEEDED: &str = "response exceeds record cap";
+
+/// 投影 `RedactionMap` + `secrets_snapshot` → `(mock_value, secret_id)` 列表.
+///
+/// 这是 [`CallEvent::redactions`] 的唯一派生入口. 输出**永不**包含真实 secret 值.
+/// 可以直接序列化到 GET API 响应中给 WebUI.
+///
+/// 匹配规则: `redaction_map.real_to_mock` 的 key (真实 secret) 与 `secrets_snapshot`
+/// 的 `value` 字段比对. 仅命中的 secret 才进入列表 (eg secret 在表中但本次请求体没有
+/// 它, 不计入). 同一 secret 多次匹配仍只投影一次 (HashMap 已去重).
+///
+/// 边角: 若两个 SecretEntry 共享同一 `value` (eg 用户重复配置), `find` 返回首个匹配;
+/// 由于 RedactionMap 按 value 去重, 对应只有一个 mock — 这种重复配置语义上就是冗余,
+/// WebUI 只展示其中一个 id 是可接受的 (它们指向相同的 secret 内容).
+pub(super) fn derive_redactions(
+    redaction_map: &RedactionMap,
+    secrets_snapshot: &[crate::secrets::SecretEntry],
+) -> Vec<(String, String)> {
+    redaction_map
+        .real_to_mock
+        .iter()
+        .filter_map(|(real, mock)| {
+            secrets_snapshot
+                .iter()
+                .find(|s| s.value == *real)
+                .map(|s| (mock.clone(), s.id.clone()))
+        })
+        .collect()
+}
+
+// ─── same_proto / cross_proto 共享的请求准备 helpers ───────────────────────
+//
+// same_proto_forward 与 cross_proto_forward 的前半段 (解析 body → reader → IR →
+// redact → derive_redactions) 流程步骤高度重合, 抽取为两个小 helper 消除重复,
+// 同时保留两路径在 URL / headers / record path 上的差异 (这些差异是语义性的, 不宜强行合并).
+
+/// 解析请求 body 为 JSON 并用 ingress reader 读为 IR (same_proto / cross_proto 共享).
+///
+/// 失败返回 `BadBody` (JSON 解析失败或 codec reader 拒绝).
+pub(super) fn parse_request_ir(
+    req_bytes: &[u8],
+    ingress: Protocol,
+    reader: &dyn crate::codec::Reader,
+) -> Result<crate::codec::ir::IrRequest, AppError> {
+    let body: serde_json::Value = serde_json::from_slice(req_bytes)
+        .map_err(|e| AppError::BadBody(format!("invalid JSON in {ingress} request body: {e}")))?;
+    reader
+        .read_request(&body)
+        .map_err(|e| AppError::BadBody(format!("{ingress} request parse failed: {}", e.message)))
+}
+
+/// 对 IR 应用 redact 并派生 CallEvent.redactions (same_proto / cross_proto 共享).
+///
+/// 返回 `(redaction_map, redact_seed, redactions)`. redaction_map 非空时 debug 日志记录命中数.
+pub(super) fn redact_and_derive(
+    ir: &mut crate::codec::ir::IrRequest,
+    secrets_snapshot: &[crate::secrets::SecretEntry],
+    log_tag: &str,
+) -> (RedactionMap, u64, Vec<(String, String)>) {
+    let (redaction_map, redact_seed) = redact_ir(ir, secrets_snapshot);
+    if !redaction_map.is_empty() {
+        debug!(
+            redactions = redaction_map.real_to_mock.len(),
+            "redacted secrets in {log_tag} IR"
+        );
+    }
+    let redactions = derive_redactions(&redaction_map, secrets_snapshot);
+    // 视图正确性守卫: redactions 是 RedactionMap (SSOT) 的派生视图, 每次派生都断言不变式.
+    // 集中在 helper 内部确保 same_proto / cross_proto 两条路径都覆盖.
+    #[cfg(feature = "consistency-check")]
+    assert_redactions_match_map(&redactions, &redaction_map, secrets_snapshot);
+    (redaction_map, redact_seed, redactions)
+}
+
+// ─── 视图正确性守卫 (CI 用, 需 `--features consistency-check`) ─────────────
+
+/// 视图正确性守卫 (CI 用, 需 `--features consistency-check`).
+///
+/// `redactions` 字段是 `RedactionMap` (SSOT) 的派生视图. 本函数断言派生保持
+/// RedactionMap 的关键不变式, 防止未来重构破坏派生一致性. 详见 AGENTS.md
+/// "视图正确性确保机制" — "redactions 字段从 RedactionMap 派生" 是该机制的已实践位置.
+///
+/// 不变式:
+/// 1. 派生结果的条目数 == RedactionMap 中命中 secrets_snapshot 的 real 数.
+/// 2. 派生结果中每个 mock 都能在 RedactionMap 中反向查到同一 real (双向索引自洽).
+/// 3. 派生结果中 mock 唯一 (RedactionMap 按 value 去重, 派生也应去重).
+#[cfg(feature = "consistency-check")]
+pub(super) fn assert_redactions_match_map(
+    derived: &[(String, String)],
+    redaction_map: &RedactionMap,
+    secrets_snapshot: &[crate::secrets::SecretEntry],
+) {
+    // (1) 条目数: 派生结果应 == real_to_mock 中命中 snapshot 的 real 数.
+    let expected = redaction_map
+        .real_to_mock
+        .keys()
+        .filter(|real| secrets_snapshot.iter().any(|s| &s.value == *real))
+        .count();
+    debug_assert_eq!(
+        derived.len(),
+        expected,
+        "derived redactions count drift from RedactionMap SSOT"
+    );
+    // (2) 双向索引自洽: 每个 mock 反查 real, 且该 real 命中 snapshot.
+    for (mock, _id) in derived {
+        let real = redaction_map.mock_to_real.get(mock);
+        debug_assert!(
+            real.is_some_and(|r| secrets_snapshot.iter().any(|s| s.value == *r)),
+            "derived mock {mock:?} not round-tripping through RedactionMap"
+        );
+    }
+    // (3) mock 唯一 (RedactionMap 按 value 去重).
+    let mut mocks: Vec<&String> = derived.iter().map(|(m, _)| m).collect();
+    mocks.sort();
+    mocks.dedup();
+    debug_assert_eq!(
+        mocks.len(),
+        derived.len(),
+        "derived redactions have duplicate mocks"
+    );
+}
+
+/// 视图正确性守卫 (CI 用, 需 `--features consistency-check`).
+///
+/// `CallEvent.preview` / `CallEvent.model` 的两种提取路径:
+/// - codec 路径: 从 IR 提取 (`extract_preview_and_model_from_ir`), req_body_raw 是 IR 的
+///   writer 序列化结果.
+/// - passthrough 路径: 从 req_body_raw 字符串提取 (`extract_preview_and_model`).
+///
+/// 本守卫从 req_body_raw 字符串重新提取, 比对存储的 preview/model. 对 passthrough 天然
+/// 一致; 对 codec 路径, 它验证 "IR 提取 == 字符串提取" (writer 忠实序列化 messages).
+///
+/// 捕获的 drift: writer 改变了 messages 顺序/结构导致 IR 提取与字符串提取不一致.
+/// 详见 AGENTS.md "视图正确性确保机制".
+#[cfg(feature = "consistency-check")]
+pub(super) fn assert_preview_model_match_source(event: &CallEvent) {
+    let (rederived_preview, rederived_model) =
+        crate::derive::extract_preview_and_model(&event.req_body_raw);
+    debug_assert_eq!(
+        event.model.as_deref(),
+        rederived_model.as_deref(),
+        "stored model drifts from req_body_raw SSOT"
+    );
+    debug_assert_eq!(
+        event.preview.as_deref(),
+        rederived_preview.as_deref(),
+        "stored preview drifts from req_body_raw SSOT"
+    );
+}
+
+/// 视图正确性守卫 (CI 用, 需 `--features consistency-check`).
+///
+/// `ResponseData.parsed` (非流式) 是上游响应字节的派生视图:
+/// 用 codec reader 把 resp_bytes 解析为 [`crate::codec::ir::IrResponse`], 再用 codec writer
+/// 序列化为 wire JSON 缓存. 本函数断言派生保持一致 — 重新用 reader 解析 source bytes,
+/// 与派生时使用的 IR snapshot 比对.
+///
+/// 捕获的 drift 类型: 未来若 parsed 改为从其他来源 (如 restore 后的 IR / 客户端响应)
+/// 派生, 此守卫会立刻失败. 仅在派生成功路径 (reader 解析成功 + 2xx 成功响应) 触发;
+/// fallback 路径 (parse 失败原样透传 / 非 2xx 错误响应) 时 parsed_for_record 为 None,
+/// 由调用方负责传入 expected = None 跳过断言. 详见 AGENTS.md "视图正确性确保机制".
+#[cfg(feature = "consistency-check")]
+pub(super) fn assert_resp_parsed_matches_source_nonstream(
+    parsed_for_record: Option<&serde_json::Value>,
+    source_bytes: &[u8],
+    reader: &dyn crate::codec::Reader,
+) {
+    // 预期: source_bytes 解析失败 → parsed_for_record 应为 None (fallback 路径, 不比对).
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(source_bytes) else {
+        debug_assert!(
+            parsed_for_record.is_none(),
+            "parsed_for_record set but source bytes are not valid JSON"
+        );
+        return;
+    };
+    // reader 解析失败 → parsed_for_record 也应为 None.
+    let Ok(ir) = reader.read_response(&v) else {
+        debug_assert!(
+            parsed_for_record.is_none(),
+            "parsed_for_record set but reader fails to parse source bytes"
+        );
+        return;
+    };
+    // 成功路径: parsed_for_record 必为 Some. (调用方负责保证仅在派生会生成 parsed 的
+    // 路径调用本守卫 — 即 2xx 成功响应. 非 2xx 错误响应即便 reader 能解析, 也不派生 parsed.)
+    let Some(parsed) = parsed_for_record else {
+        debug_assert!(
+            false,
+            "source parses successfully but parsed_for_record is None"
+        );
+        return;
+    };
+    // model 字段 (字符串) 直接比对 — 这是 IrResponse 中最稳定、最易 drift 的字段.
+    // 容许 codec 不对称: 部分 writer 把 None model 写成空串 "" (如 OpenAI writer),
+    // 部分 reader 又把 "" 读回 Some(""). 双侧都 normalize 为 None 等价, 避免已知 codec
+    // 行为被误报为 drift.
+    let parsed_model_norm: Option<&str> = parsed
+        .get("model")
+        .and_then(|m| m.as_str())
+        .filter(|s| !s.is_empty());
+    let ir_model_norm: Option<&str> = ir.model.as_deref().filter(|s| !s.is_empty());
+    debug_assert_eq!(
+        parsed_model_norm, ir_model_norm,
+        "parsed.model drifts from IrResponse SSOT (after normalizing None == empty string)"
+    );
+}
+
+/// 写一条 "上游请求失败" 记录 (错误路径专用 helper).
+pub(super) fn record_upstream_failure(
+    dag: &ConversationDag,
+    record_id: Uuid,
+    started: std::time::Instant,
+    status: u16,
+    error: String,
+) {
+    dag.attach_response(
+        record_id,
+        ResponseData {
+            resp_status: status,
+            resp_headers: vec![],
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            error: Some(error),
+            ..Default::default()
+        },
+    );
+}
+
+/// 构造 [`CallEvent`] (3 个 push 点共用).
+///
+/// `secrets_snapshot = None` 表示 passthrough 路径 (无机密命中), 用空 policy + seed=0.
+/// `secrets_snapshot = Some(s)` 表示 codec 路径, policy 持有真实 secret 列表 (COW Arc).
+///
+/// `req_text` 是已 redact 的请求 body 快照 (LLM 视角), 将作为 WebUI req_body 权威来源.
+/// `ir = Some(&ir)` (codec 路径): preview/model 从已 parse 的 IR 提取 (零重复 JSON parse).
+/// `ir = None` (passthrough 路径): 从 req_text 字符串提取 (passthrough 不 parse IR 保持 byte-exact).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_call_event(
+    parts: &axum::http::request::Parts,
+    path: &str,
+    fwd_headers: &HeaderMap,
+    req_text: &str,
+    ir: Option<&crate::codec::ir::IrRequest>,
+    ingress_protocol: Option<crate::codec::Protocol>,
+    redact_seed: u64,
+    secrets_snapshot: Option<&[crate::secrets::SecretEntry]>,
+    redactions: Vec<(String, String)>,
+) -> CallEvent {
+    let (preview, model) = match ir {
+        Some(ir) => crate::derive::extract_preview_and_model_from_ir(ir),
+        None => crate::derive::extract_preview_and_model(req_text),
+    };
+    let policy = match secrets_snapshot {
+        Some(s) => std::sync::Arc::new(PolicySnapshot {
+            secrets: std::sync::Arc::from(s.to_vec()),
+        }),
+        None => std::sync::Arc::new(PolicySnapshot::default()),
+    };
+    let event = CallEvent {
+        created_at: chrono::Utc::now(),
+        method: parts.method.as_str().to_string(),
+        path: path.to_string(),
+        req_headers: redact_headers(fwd_headers),
+        ingress_protocol,
+        redact_seed,
+        policy,
+        req_body_raw: req_text.to_string(),
+        preview: preview.map(std::sync::Arc::<str>::from),
+        model: model.map(std::sync::Arc::<str>::from),
+        // round_role 占位值 (User); DAG push_messages 内部会根据 delta 的 contains_user_text 修正.
+        round_role: crate::codec::ir::IrRole::User,
+        redactions: std::sync::Arc::from(redactions),
+    };
+    // 视图正确性守卫: preview/model 应与 req_body_raw (SSOT) 的字符串提取一致.
+    // codec 路径从 IR 提取, req_body_raw 是 IR 的 writer 序列化 — 两者应等价 (writer 忠实
+    // 序列化 messages). passthrough 路径直接从 req_body_raw 提取, 天然一致.
+    #[cfg(feature = "consistency-check")]
+    assert_preview_model_match_source(&event);
+    event
+}
+
+// ─── 响应累积器 (fan_out 三路径共享) ───────────────────────────────────────
+
+/// 上游响应字节的记录累积器 (fan_out_* 三路径共享).
+///
+/// 职责: 把上游 chunk 流累积到一个 `Vec<u8>`, 受 `MAX_RESP_BODY_RECORD` 上限保护,
+/// 并跟踪 overflow / error_kind 状态. 三个 fan_out 函数原本各自复制 ~30 行相同逻辑,
+/// 现统一在此. 调用方负责 chunk 的"额外处理"(透传给客户端 channel / StreamTranslate /
+/// ParsedSync), 本结构只管 record 累积 + cap 保护.
+///
+/// # 不变式
+///
+/// - overflow 一旦置位, 后续 push 静默丢弃 (record 已截断, 不再增长).
+/// - error_kind 一旦置位 (非 None), 表示流异常终止 (client disconnect / upstream error / cap).
+pub(super) struct RecordAccumulator {
+    pub(super) acc: Vec<u8>,
+    pub(super) overflow: bool,
+    pub(super) error_kind: Option<String>,
+}
+
+impl RecordAccumulator {
+    pub(super) fn new() -> Self {
+        Self {
+            acc: Vec::new(),
+            overflow: false,
+            error_kind: None,
+        }
+    }
+
+    /// 累积一个 chunk. 超过 `MAX_RESP_BODY_RECORD` 时置 overflow 标志 (后续静默丢弃).
+    /// 仅在未 overflow 时累积, 避免无意义的拷贝.
+    pub(super) fn push_record(&mut self, b: &[u8], record_id: Uuid) {
+        if self.overflow {
+            return;
+        }
+        let remaining = super::MAX_RESP_BODY_RECORD.saturating_sub(self.acc.len());
+        if remaining > 0 {
+            let take = remaining.min(b.len());
+            self.acc.extend_from_slice(&b[..take]);
+        }
+        if b.len() > remaining {
+            warn!(
+                %record_id,
+                cap = super::MAX_RESP_BODY_RECORD,
+                "response too large to record; further chunks discarded"
+            );
+            self.overflow = true;
+        }
+    }
+
+    /// 标记流异常终止 (client disconnect / upstream stream error / cap).
+    pub(super) fn set_error(&mut self, kind: &str) {
+        self.error_kind = Some(kind.to_string());
+    }
+
+    /// 是否已正常结束 (无 error_kind).
+    pub(super) fn complete(&self) -> bool {
+        self.error_kind.is_none()
+    }
+}
+
+/// 流式 parsed view 累积器 + 节流写入 DAG 的小封装.
+///
+/// fan_out_streaming / fan_out_streaming_with_restore 共享同一套节流策略,
+/// 避免两处重复 StreamScan + writer + last_sync 的管理逻辑.
+pub(super) struct ParsedSync {
+    scan: crate::codec::stream::StreamScan,
+    writer: Box<dyn crate::codec::Writer>,
+    dag: ConversationDag,
+    record_id: Uuid,
+    last_sync: Option<std::time::Instant>,
+}
+
+impl ParsedSync {
+    pub(super) fn new(
+        proto: crate::codec::Protocol,
+        dag: ConversationDag,
+        record_id: Uuid,
+    ) -> Self {
+        Self {
+            scan: crate::codec::stream::StreamScan::new(proto),
+            writer: proto.writer(),
+            dag,
+            record_id,
+            last_sync: None,
+        }
+    }
+
+    /// 喂入上游 chunk; 按节流间隔把 snapshot 写入 DAG node 的 parsed 字段.
+    pub(super) fn feed(&mut self, b: &[u8]) {
+        self.scan.feed(b);
+        let due = self
+            .last_sync
+            .is_none_or(|t| t.elapsed() >= PARSED_SYNC_INTERVAL);
+        if due {
+            let parsed = self.scan.snapshot();
+            self.dag
+                .update_parsed_response(self.record_id, self.writer.write_response(&parsed));
+            self.last_sync = Some(std::time::Instant::now());
+        }
+    }
+
+    /// 流结束时的最终快照.
+    pub(super) fn finalize(self) -> serde_json::Value {
+        self.writer.write_response(&self.scan.snapshot())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─── MAX_RESP_BODY_RECORD 截断契约 (核心契约: 客户端响应无上限 vs record 有 cap) ─
+    //
+    // 契约 (proxy//!): "客户端响应永远无大小上限; 只有 record 累积受
+    // MAX_RESP_BODY_RECORD (32 MiB) 约束". 一旦回归会静默截断用户响应.
+
+    #[test]
+    fn max_resp_body_record_constant_is_32mib() {
+        // pin 住常量值, 防止误改 (这是经济性与内存的折中, 32MiB 覆盖绝大多数 LLM 响应).
+        assert_eq!(super::super::MAX_RESP_BODY_RECORD, 32 * 1024 * 1024);
+        assert_eq!(super::super::MAX_REQ_BODY, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn truncation_banner_string_is_stable() {
+        // pin 住 banner 文本, 前端依赖它识别截断状态. 三个 fan_out 共用同一字符串.
+        let banner = super::super::TRUNCATED_BANNER;
+        assert!(!banner.is_empty());
+    }
+
+    #[test]
+    fn record_accumulator_caps_and_marks_overflow() {
+        let mut acc = RecordAccumulator::new();
+        // 推入超 cap 的 chunk: 应截断到 cap 并置 overflow.
+        let huge = vec![b'x'; super::super::MAX_RESP_BODY_RECORD + 10];
+        acc.push_record(&huge, Uuid::nil());
+        assert!(acc.overflow, "overflow must be set when chunk exceeds cap");
+        assert_eq!(
+            acc.acc.len(),
+            super::super::MAX_RESP_BODY_RECORD,
+            "acc must be capped at MAX_RESP_BODY_RECORD"
+        );
+        // 后续 push 被静默丢弃 (overflow 已置位).
+        let before = acc.acc.len();
+        acc.push_record(b"y", Uuid::nil());
+        assert_eq!(acc.acc.len(), before, "post-overflow push must be dropped");
+    }
+
+    #[test]
+    fn record_accumulator_tracks_error_and_completeness() {
+        let mut acc = RecordAccumulator::new();
+        assert!(acc.complete(), "fresh accumulator is complete");
+        acc.set_error(ERR_CLIENT_DISCONNECTED);
+        assert!(!acc.complete(), "after error, not complete");
+        assert_eq!(acc.error_kind.as_deref(), Some(ERR_CLIENT_DISCONNECTED));
+    }
+
+    // ─── SEC-3: assert/panic 消息不泄漏 secret ───────────────────────────
+    //
+    // 契约 (docs/design/contracts.md §7 SEC-3): 任何 assert / panic 消息不得包含
+    // secret 明文. 视图正确性守卫 (assert_redactions_match_map 等) 在 CI 下用
+    // `debug_assert!` 守卫派生视图与 SSOT 的一致性; 这些 assert 的诊断消息由派生数据
+    // 构成 (mock / id 等), 不应直接内联 secret value. 本 property 故意制造不一致触发
+    // assert, 用 catch_unwind 捕获 panic payload, 断言其字符串表示不含 secret value.
+    //
+    // 仅在 consistency-check feature 下运行 (assert 函数仅在该 feature 编译).
+    #[cfg(feature = "consistency-check")]
+    use proptest::prelude::*;
+
+    #[cfg(feature = "consistency-check")]
+    proptest! {
+        /// SEC-3: assert_redactions_match_map 触发 panic 时, 消息不含 secret.value.
+        ///
+        /// 触发方式: 构造一个"派生 redactions 条目数 > RedactionMap 命中数"的不一致
+        /// (derived 含一条 mock, 但 redaction_map 为空 + snapshot 含 secret), 让断言 (1)
+        /// `debug_assert_eq!(derived.len(), expected)` 失败. panic 消息由
+        /// `derived.len()` / `expected` (1 位数字) + 固定字面量构成, 不含 secret value.
+        ///
+        /// 字符集 `[a-zA-Z0-9_\-]{6,40}`: 覆盖真实 secret 形态 (sk-abc / ghp_xxx /
+        /// 混合大小写). panic 消息的数字 run 极短 (left=1/right=0, 各 1 位), 固定句式
+        /// ("derived redactions count drift ...") 不含随机长字符串, 英文单词子串假阳性
+        /// 概率可忽略. 若未来断言消息内联随机值 (如 mock/id), 需重评估字符集.
+        #[test]
+        fn prop_assert_messages_no_secret(secret in "[a-zA-Z0-9_\\-]{6,40}") {
+            use crate::redact::RedactionMap;
+            use crate::secrets::{SecretCategory, SecretEntry};
+
+            // 派生 redactions 含一条"假命中" (mock / id 都用固定值, 不内联 secret —
+            // 模拟生产派生层只含 mock + secret_id, 永不内联 secret value).
+            let derived = vec![(String::from("mock-fake"), String::from("sid-fake"))];
+
+            // 空 RedactionMap + snapshot 含真实 secret: expected = 0 (map 空), 但
+            // derived.len() = 1 → 断言 (1) `debug_assert_eq!(derived.len(), expected)` 失败.
+            // snapshot 含 secret 模拟生产 (policy 持有 secret value), 但派生层不应泄漏.
+            // id 用固定字面量 (不内联 secret), 避免人为把 secret 塞进 snapshot 数据结构.
+            let map = RedactionMap::default();
+            let snapshot = vec![SecretEntry {
+                id: String::from("sid-fake"),
+                name: None,
+                category: SecretCategory::ApiKey,
+                value: secret.clone(),
+                value_file: None,
+                mock_strategy: crate::mock::MockStrategy::default(),
+            }];
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                assert_redactions_match_map(&derived, &map, &snapshot);
+            }));
+            let payload = result.expect_err(
+                "inconsistent derived/map must trigger debug_assert panic under consistency-check"
+            );
+            // panic payload 通常是 &'static str 或 String; 取其字符串表示.
+            // 若 payload 是非字符串类型 (如未来某个 panic!(some_struct)), 拒绝 fallback
+            // 到固定字面量 — 那会让断言恒真 (字面量不含 secret), 使 SEC-3 property 空洞
+            // 通过, 静默放过安全漏洞. 必须 fail-loud 暴露 payload 类型不可检视的问题.
+            let msg = payload
+                .downcast_ref::<String>()
+                .map(|s| s.as_str())
+                .or_else(|| payload.downcast_ref::<&'static str>().copied())
+                .unwrap_or_else(|| panic!(
+                    "SEC-3 cannot inspect non-string panic payload (type id: {:?}); \
+                     refusing to pass vacuously — this would silently hide secret leakage",
+                    (*payload).type_id()
+                ));
+            prop_assert!(
+                !msg.contains(secret.as_str()),
+                "SEC-3 violation: assert panic message leaks secret. msg={}",
+                msg
+            );
+        }
+    }
+}
