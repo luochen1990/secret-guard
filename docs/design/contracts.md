@@ -552,8 +552,11 @@
 **陈述**: SecretTable 与 ProviderTable 共享 persist_lock (串行 RMW) 与 Decisions (同一份内存). 跨表并发写不丢更新.
 
 **Properties**:
-- `prop_concurrent_upserts_no_lost_update`: 跨表并发 upsert 不丢更新.
-- `prop_concurrent_writes_serialized_via_persist_lock`: persist_lock 串行所有 RMW, state.toml 不出现撕裂.
+- `prop_concurrent_upserts_no_lost_update`: 单表 N 线程并发 upsert 不丢更新 (persist_lock 串行 RMW 基线).
+- `prop_concurrent_writes_serialized_via_persist_lock`: 跨表 (SecretTable + ProviderTable 共享 persist_lock + 同一 state_path + 同一 Decisions Arc, 与 server.rs 启动装配一致) 并发 upsert — 两表 effective 各含全部项 (跨表不丢更新) + 从磁盘 `load_or_empty` 重载得到的 DynamicState 同时含两表 dynamic 段 (persist_lock 串行 RMW, state.toml 不撕裂, 无跨表段覆盖).
+- `prop_cross_table_shared_decisions_isolation`: 共享 Decisions Arc 的跨表并发 `set_decision` (各改自己子表) 互不串扰 — secret id 的 decision 不误写到 providers 子表, 反之亦然; 合并后 state.toml 同时保留两子表 decision.
+
+> **覆盖现状**: CFG-5 的两个 property (`prop_concurrent_writes_serialized_via_persist_lock` + `prop_cross_table_shared_decisions_isolation`) 已实现跨表完整覆盖 — 装配方式与 `server.rs` 生产路径一致 (共享 `Arc<Mutex<()>>` persist_lock + 共享 `Arc<RwLock<Decisions>>` + 同一 state_path). 上方 CFG-4 "理想 vs 现状" 注记中提到的 "跨表 state.toml 文件交互" 与 "共享 Decisions Arc 的跨表隔离" 现由本节两个 property 覆盖; CFG-4 自身的跨表失败回滚 (`prop_persist_failure_rollback_under_concurrency`) 仍作为后续工作.
 
 ---
 

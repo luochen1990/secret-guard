@@ -1386,9 +1386,10 @@ mod table_tests {
 mod proptests {
     use super::table_tests::{ReadOnlyDir, empty_decisions, entry};
     use super::*;
+    use crate::provider::{Protocol, Provider, ProviderTable};
     use crate::secrets::SecretTable;
     use proptest::prelude::*;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
 
     // ─── 共享 helpers ─────────────────────────────────────────────────────
@@ -1427,6 +1428,33 @@ mod proptests {
     impl Drop for TempPath {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    // ─── 跨表 (CFG-5) fixture: 合法 Provider 构造 ──────────────────────────
+    //
+    // 与 entry() 对称的 Provider 构造器: 跨表并发测试需要 ProviderTable 与
+    // SecretTable 同时 upsert 合法项. base_url 必须通过 validate_base_url
+    // (http(s) + 不带末尾 '/'), id 通过 validate_id.
+    fn provider(id: &str, base_url: &str) -> Provider {
+        Provider {
+            id: id.into(),
+            protocol: Protocol::OpenAI,
+            base_url: base_url.into(),
+            api_key: format!("k-{id}"),
+            api_key_file: None,
+            enabled: true,
+            name: Some(format!("name-{id}")),
+        }
+    }
+
+    /// u8 → OverrideMode 的测试 strategy 映射 (0..3), 供跨表 decision 测试参数化用.
+    /// DRY: secret 表与 provider 表的 mode 映射逻辑相同, 提取后单点维护.
+    fn mode_of(m: u8) -> OverrideMode {
+        match m {
+            0 => OverrideMode::Default,
+            1 => OverrideMode::PreferStatic,
+            _ => OverrideMode::Disabled,
         }
     }
 
@@ -1842,6 +1870,187 @@ mod proptests {
             }
             // 顺便验证 count == n (无重复 / 无多余).
             prop_assert_eq!(ids.len(), n, "effective count must equal number of upserts");
+        }
+
+        /// 守卫 CFG-5 跨表并发安全 (contracts.md §6 CFG-5).
+        ///
+        /// 跨表场景: SecretTable 与 ProviderTable 共享同一 `persist_lock` + 同一 `state_path`
+        /// + 同一 `Decisions` Arc (与 server 启动装配方式一致, 见 server.rs). N (=2*half,
+        /// half∈2..=4) 个线程对半拆分: 前一半 upsert SecretTable, 后一半 upsert
+        /// ProviderTable, 并发执行后 join 等待 (确定性屏障, 无 sleep).
+        ///
+        /// 核心断言 (覆盖 contracts.md CFG-5 两个 property):
+        /// (a) 两表 effective 视图各自含全部 upsert 的项 — 跨表并发不丢更新
+        ///     (`prop_concurrent_upserts_no_lost_update` 的单表版本在此扩展为双表).
+        /// (b) persist_lock 串行所有 RMW, state.toml 不出现撕裂 — 从磁盘 `load_or_empty`
+        ///     重新加载, 得到的 DynamicState 同时含全部 dynamic providers 与 secrets.
+        #[test]
+        fn prop_concurrent_writes_serialized_via_persist_lock(
+            half in 2usize..=4,               // 每表线程数 (两表共 2*half 个线程并发).
+            value_seed in "[a-z0-9]{4,12}"
+        ) {
+            let n = half * 2;
+            let tmp = tempfile_path("cross-table");
+            let shared_lock = Arc::new(Mutex::new(()));
+            let shared_decisions = empty_decisions();
+            let state_path = tmp.clone();
+
+            let secrets = SecretTable::with_persist_lock(
+                vec![], vec![], shared_decisions.clone(), state_path.clone(),
+                shared_lock.clone(),
+            );
+            let providers = ProviderTable::with_persist_lock(
+                vec![], vec![], shared_decisions.clone(), state_path.clone(),
+                shared_lock.clone(),
+            );
+
+            let handles: Vec<_> = (0..n)
+                .map(|i| {
+                    if i < half {
+                        // 前半写 SecretTable: id-s{0..half}.
+                        let t = secrets.clone();
+                        let v = format!("{value_seed}-s{i}");
+                        std::thread::spawn(move || {
+                            t.upsert_dynamic(entry(&format!("id-s{i}"), &v))
+                                .expect("secret upsert must succeed");
+                        })
+                    } else {
+                        // 后半写 ProviderTable: id-p{0..half}.
+                        let j = i - half;
+                        let t = providers.clone();
+                        let base = format!("https://up-{value_seed}-{j}.example.com");
+                        std::thread::spawn(move || {
+                            t.upsert_dynamic(provider(&format!("id-p{j}"), base.as_str()))
+                                .expect("provider upsert must succeed");
+                        })
+                    }
+                })
+                .collect();
+            for h in handles {
+                h.join().expect("worker must not panic");
+            }
+
+            // (a) 跨表并发不丢更新: 两表 effective 各含 half 项.
+            let secret_ids: HashSet<String> =
+                secrets.effective_raw().into_iter().map(|e| e.id).collect();
+            let provider_ids: HashSet<String> =
+                providers.effective_raw().into_iter().map(|e| e.id).collect();
+            for i in 0..half {
+                let want_s = format!("id-s{i}");
+                prop_assert!(
+                    secret_ids.contains(&want_s),
+                    "lost secret update: '{}' missing (got {:?})", want_s, secret_ids
+                );
+                let want_p = format!("id-p{i}");
+                prop_assert!(
+                    provider_ids.contains(&want_p),
+                    "lost provider update: '{}' missing (got {:?})", want_p, provider_ids
+                );
+            }
+            prop_assert_eq!(secret_ids.len(), half, "secret effective count");
+            prop_assert_eq!(provider_ids.len(), half, "provider effective count");
+
+            // (b) state.toml 不撕裂: persist_lock 串行 RMW 保证 atomic_write 不交错,
+            // 重新 load 必须成功且同时含两表的 dynamic 段 (验证跨表 RMW 没让一表覆盖另一表段).
+            // 用空 global_mock_prefix 跳过 secret re-validate (persist_dynamic 同款约定).
+            let reloaded = DynamicState::load_or_empty(&state_path, "")
+                .expect("state.toml must be loadable (no torn write across tables)");
+            let loaded_secret_ids: HashSet<String> =
+                reloaded.secrets.iter().map(|e| e.id.clone()).collect();
+            let loaded_provider_ids: HashSet<String> =
+                reloaded.providers.iter().map(|e| e.id.clone()).collect();
+            prop_assert_eq!(
+                loaded_secret_ids, secret_ids,
+                "state.toml secrets segment must match effective (no cross-table overwrite)"
+            );
+            prop_assert_eq!(
+                loaded_provider_ids, provider_ids,
+                "state.toml providers segment must match effective (no cross-table overwrite)"
+            );
+        }
+
+        /// 守卫 CFG-5 跨表并发安全 (contracts.md §6 CFG-5) — 共享 Decisions 跨表隔离.
+        ///
+        /// SecretTable 与 ProviderTable 共享同一 `Decisions` Arc. 跨表并发 `set_decision`
+        /// (各改自己子表: secret 表改 secrets 子表, provider 表改 providers 子表) 必须互不
+        /// 串扰 — 即 secret 表的 decision 不影响 provider 表的 decision, 反之亦然, 且
+        /// 合并后的 state.toml 同时保留两子表的 decision.
+        ///
+        /// 这是共享 Decisions Arc 的正确性证明: 若实现误用同一 HashMap (而非
+        /// Decisions 内分 providers/secrets 两子表), 跨表并发会互相覆盖.
+        #[test]
+        fn prop_cross_table_shared_decisions_isolation(
+            secret_mode in 0u8..3,
+            provider_mode in 0u8..3,
+        ) {
+            let tmp = tempfile_path("cross-decisions");
+            let shared_lock = Arc::new(Mutex::new(()));
+            let shared_decisions = empty_decisions();
+            let state_path = tmp.clone();
+
+            // 各表带 1 个 static entry (id 互不相同), 让 set_decision 有作用对象.
+            let secrets = SecretTable::with_persist_lock(
+                vec![entry("s-static", "seed-secret-value")], vec![],
+                shared_decisions.clone(), state_path.clone(), shared_lock.clone(),
+            );
+            let providers = ProviderTable::with_persist_lock(
+                vec![provider("p-static", "https://up.example.com")], vec![],
+                shared_decisions.clone(), state_path.clone(), shared_lock.clone(),
+            );
+
+            let sm = mode_of(secret_mode);
+            let pm = mode_of(provider_mode);
+
+            // 两线程并发, 各改自己子表; join 后确定性检查.
+            let ts = {
+                let t = secrets.clone();
+                std::thread::spawn(move || {
+                    t.set_decision("s-static", sm)
+                        .expect("secret set_decision must succeed");
+                })
+            };
+            let tp = {
+                let t = providers.clone();
+                std::thread::spawn(move || {
+                    t.set_decision("p-static", pm)
+                        .expect("provider set_decision must succeed");
+                })
+            };
+            ts.join().expect("secret worker must not panic");
+            tp.join().expect("provider worker must not panic");
+
+            // (a) 共享 Decisions 跨表隔离: 两子表各自记录正确 mode, 互不串扰.
+            let decisions = shared_decisions.read().clone();
+            prop_assert_eq!(
+                decisions.secret("s-static"), sm,
+                "secret decision must survive cross-table concurrent set_decision"
+            );
+            prop_assert_eq!(
+                decisions.provider("p-static"), pm,
+                "provider decision must survive cross-table concurrent set_decision"
+            );
+            // 跨子表不串: secret 表的 decision 没误写到 providers 子表, 反之亦然.
+            prop_assert_eq!(
+                decisions.provider("s-static"), OverrideMode::Default,
+                "secret decision must not leak into providers sub-table"
+            );
+            prop_assert_eq!(
+                decisions.secret("p-static"), OverrideMode::Default,
+                "provider decision must not leak into secrets sub-table"
+            );
+
+            // (b) 合并后 state.toml 同时保留两子表 decision (persist_lock 串行 RMW,
+            // 一表的 set_decision load-modify-write 不会丢另一表刚写的 decision 段).
+            let reloaded = DynamicState::load_or_empty(&state_path, "")
+                .expect("state.toml must be loadable after cross-table set_decision");
+            prop_assert_eq!(
+                reloaded.decisions.secret("s-static"), sm,
+                "persisted secret decision must survive"
+            );
+            prop_assert_eq!(
+                reloaded.decisions.provider("p-static"), pm,
+                "persisted provider decision must survive"
+            );
         }
     }
 
