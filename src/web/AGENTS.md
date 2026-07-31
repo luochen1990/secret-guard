@@ -182,13 +182,15 @@ drawer overlay 不影响 #detail 的滚动空间. 因此:
 - **段 B — 遮挡露出的 placeholder** (phase 3/4):
   - `placeholderExposed` = placeholder DOM 在视口内的可见高度.
   - 未露出 (= 0) → 不影响段 A (phase 3 等价).
-  - 露出 → 主导, drawer 扩展以遮挡 (phase 4), 平滑到 extremeMaxH (80%).
+  - 露出 → drawer 至少覆盖 `placeholderExposed - GAP` (顶部让出 GAP 作呼吸空间),
+    平滑到 extremeMaxH (80%).
 
-> **关键不变量**: drawer 必须遮挡所有露出的 placeholder, 否则用户看到空白.
-> 历史 bug: 旧 phase 4 用 `bubbleBottomY <= 0` 作门槛, 末轮选中时 bby 永远 > 0
-> (因为末轮紧邻 placeholder, maxScroll 不足以让它滚出顶部) → phase 2 clamp 封顶在 maxH,
-> placeholder 空白被露出. 修复: 改用 `placeholderExposed` (基于 placeholder 实际露出量)
-> 作为段 B 驱动, 与段 A 解耦.
+> **关键不变量**: drawer 遮挡露出的 placeholder 时顶部让出 `DRAWER_GAP` (≈28px) 作呼吸空间
+> (WebUI 反馈3: 末轮 request 与 drawer 上边缘的视觉间距). 残余 GAP 截是白底 placeholder 顶部,
+> 作为呼吸空间可见 (可接受, 非空白泄漏). 历史 bug: 旧 phase 4 用 `bubbleBottomY <= 0` 作
+> 门槛, 末轮选中时 bby 永远 > 0 (因为末轮紧邻 placeholder, maxScroll 不足以让它滚出顶部)
+> → phase 2 clamp 封顶在 maxH, placeholder 空白被露出. 修复: 改用 `placeholderExposed`
+> (基于 placeholder 实际露出量) 作为段 B 驱动, 与段 A 解耦.
 
 **placeholder**: `#detail` 末尾的 `.drawer-placeholder`.
 - 长内容 (contentEnd > wrapH): height = extremeMaxH (80% wrapH), 提供 phase 4 滚动空间.
@@ -197,11 +199,15 @@ drawer overlay 不影响 #detail 的滚动空间. 因此:
 **新 round 到来**: keyed reconciliation 追加新轮次, `#detail` 高度不变, scrollTop 不变 →
 drawerH 不变 → 分配比例保持 (用户视野不受内容变化干扰).
 
-> **follow 自动滚动不滚入 placeholder** (WebUI bug #3): `scrollTimelineToBottomForce`
-> 滚到 **contentEnd** (末轮底部) 而非 scrollHeight (含 placeholder). 否则 placeholder
-> 进入视口 → drawer 段 B 扩展到 extremeMaxH (80%) 遮挡末轮 request. placeholder 仅
-> 服务**用户手动滚动** (phase 4 看 response 抽屉). `isNearBottom` 同步基于 contentEnd
-> (placeholder 区视为 "在底部", 新 round 到达仍自动滚回).
+> **follow 自动滚动预留 drawer 空间** (WebUI 反馈2/3): `scrollTimelineToBottomForce`
+> 的滚动目标是 `contentEnd - wrapH + drawerH + GAP`, 让末轮 request 底部出现在
+> **当前 drawer 上边缘之上 GAP 处** (而非贴视口底被 drawer 遮挡). drawerH 取滚动前的
+> 当前值 (保留用户当前的 response 视图, 避免跳变). 段 B (`placeholderCover =
+> placeholderExposed - GAP`) 与此自洽: 多滚的 drawerH+GAP 进入 placeholder 区时,
+> drawer 至少覆盖 drawerH (顶部 GAP 截留作呼吸空间), 高度稳定不暴涨. placeholder 顶部
+> 的 GAP 截是白底, 作为末轮 request 与 drawer 之间的呼吸间距可见 (可接受, 非空白泄漏).
+> placeholder 仅服务**用户手动滚动** (phase 4 看 response 抽屉). `isNearBottom` 基于
+> contentEnd (placeholder 区视为 "在底部", 新 round 到达仍自动滚回).
 
 scroll-nav 的 bottom 同步到 drawerH, 使底部按钮贴合滚动区域底端.
 
@@ -217,8 +223,14 @@ scroll-nav 的 bottom 同步到 drawerH, 使底部按钮贴合滚动区域底端
 
 timeline 有两种滚动状态, 由 **视口距底部距离** 机械推导 (SSOT), 不由 "最近点了什么" 决定:
 
-- **follow** (距末轮底部 ≤ `NEAR_BOTTOM_PX` ≈ 100px): 新 round 到达 → 自动滚到末轮底部 (`scrollTimelineToBottomForce`, 滚到 contentEnd 不含 placeholder).
+- **follow** (距末轮底部 ≤ `NEAR_BOTTOM_PX` ≈ 100px): 新 round 到达 → 自动滚到末轮底部
+  (`scrollTimelineToBottomForce`, 预留 drawerH+GAP 让末轮 request 完整可见).
 - **pinned** (距底 > `NEAR_BOTTOM_PX`): 新 round 到达 → 不滚动, 浮出 `#unread-badge` 显示 "↓ N".
+
+**follow/pinned 视觉指示 (WebUI 反馈1)**: drawer 顶部边缘颜色随状态切换 — follow 时淡灰
+近不可见 (1px `#ddd`), pinned 时蓝色细条 (3px `#4a6fa5` + 轻微上浮阴影). `.pinned` 类由
+`updateResponseDrawerLayout` 在每渲染/滚动周期同步 (与 drawer 高度同一周期, 覆盖抽屉从
+隐藏切到可见等边界). 配色与 unread badge 一致.
 
 **关键解耦 (方案 X)**: `selectedRound` 与 `timelineFollow` 解耦. `selectedRound` 是
 "用户最后显式关注的轮次", **不随 follow 自动推进** (避免 Response 抽屉布局连续重算 +

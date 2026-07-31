@@ -179,9 +179,12 @@ timeline 的 follow/pinned 状态由 **视口距底部距离** 机械推导 (SSO
 (RAF 合并) + 每次新内容追加后由 `syncFollowMode()` 重算.
 
 - **follow** (距底 ≤ `NEAR_BOTTOM_PX` ≈ 100px): 新 round 到达 → `scrollTimelineToBottomForce`
-  锁定视口; `unreadCount` 清零.
+  锁定视口 (预留 drawerH+GAP, 末轮 request 完整可见, 不被 drawer 遮挡); `unreadCount` 清零.
 - **pinned** (距底 > `NEAR_BOTTOM_PX`): 新 round 到达 → 不滚动, `unreadCount` 累加,
   `#unread-badge` 浮出显示 "↓ N".
+
+**follow/pinned 视觉指示 (WebUI 反馈1)**: drawer 顶部边缘颜色随状态切换 — follow 淡灰近不可见,
+pinned 蓝色细条 (`.pinned` 类, 配色与 unread badge 一致), 用户可一眼区分当前状态.
 
 **`selectedRound` 与 followMode 解耦 (方案 X)**: `selectedRound` 是 "用户最后显式关注的轮次",
 **不随 follow 自动推进** (避免 Response 抽屉布局抖动 + `.flash` 反复触发). 仅在 "进入 follow 的显式动作"

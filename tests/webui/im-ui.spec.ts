@@ -935,6 +935,10 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
   });
 
   // ─── Drawer 相位回归 (bug: phase 4 过早触发 + phase 1 跳变) ──────────────
+  //
+  // DRAWER_GAP 与 src/web/index.html 生产常量同值, 此处为测试内部 SSOT (供 drawer 相位 +
+  // UI-6 follow/pinned 测试共用, 避免散落多 test 各声明).
+  const DRAWER_GAP = 28;
 
   test("drawer phase 3 holds maxH before content enters drawer zone", async ({ page }) => {
     // bug #1 回归: 向下滚, 气泡滚出顶部后 drawer 应保持 maxH (40%),
@@ -1074,8 +1078,10 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     // 必须能滚 (内容足够长, placeholder 存在)
     expect(m.placeholderH).toBeGreaterThan(0);
     expect(m.maxScroll).toBeGreaterThan(100);
-    // 核心: drawer 必须完全遮挡露出的 placeholder (容差 4px, 防亚像素)
-    expect(m.drawerH).toBeGreaterThanOrEqual(m.placeholderExposed - 4);
+    // drawer 覆盖 placeholder, 但顶部让出 DRAWER_GAP (~28px) 作呼吸空间 (WebUI 反馈3:
+    // 末轮 request 与 drawer 上边缘的视觉间距). 即 drawerH >= placeholderExposed - GAP - 容差(4px).
+    // 残余 GAP 截是白底 placeholder 顶部, 作为呼吸空间可见 (可接受, 非空白泄漏).
+    expect(m.drawerH).toBeGreaterThanOrEqual(m.placeholderExposed - DRAWER_GAP - 4);
     // 滚到底时 drawer 应接近 extremeMaxH (80%), 而非被封顶在 maxH (40%)
     expect(m.drawerPct).toBeGreaterThan(0.7);
   });
@@ -1605,6 +1611,67 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     await expect(page.locator(`#detail .tl-round.selected[data-rid="${lastRid}"]`)).toHaveCount(0);
     // 无 unread badge (follow 状态 + 0 未读).
     await expect(page.locator("#unread-badge")).toBeHidden();
+  });
+
+  // ─── UI-6 后续修复: follow 下末轮 request 完整可见 + pinned 视觉指示 ──────
+  //
+  // WebUI 反馈 1/2/3:
+  //   反馈2: follow 时 scrollTimelineToBottomForce 预留 drawerH+GAP, 末轮 request
+  //          气泡底部出现在 drawer 上边缘之上 GAP 处 (完整可见, 不被遮挡).
+  //   反馈3: DRAWER_GAP 8→28px, 末轮 request 与 drawer 之间留呼吸空间.
+  //   反馈1: pinned 时 drawer 上边缘露蓝细边 (.pinned 类); follow 时淡灰近不可见.
+  test("UI-6: follow 时末轮 request 完整可见 (不被 drawer 遮挡)", async ({ page }) => {
+    const marker = "ui6-follow-visible-marker";
+    const sid = await setupLongMultiroundSession(page, marker, 3);
+    await openTimeline(page, sid, 3);
+
+    // 末轮 .tl-round 的底部应 ≤ drawer 上边缘 (末轮 request 完整可见, 不被遮挡).
+    // 即: lastRoundBottom <= drawerTop (在 wrap 坐标系).
+    const visible = await page.evaluate(() => {
+      const rounds = document.querySelectorAll("#detail > .tl-round");
+      const last = rounds[rounds.length - 1] as HTMLElement;
+      const drawer = document.getElementById("response-drawer")!;
+      const wrap = document.getElementById("detail-wrap")!;
+      const wrapRect = wrap.getBoundingClientRect();
+      const lastRect = last.getBoundingClientRect();
+      const drawerRect = drawer.getBoundingClientRect();
+      return {
+        lastRoundBottom: lastRect.bottom - wrapRect.top,
+        drawerTop: drawerRect.top - wrapRect.top,
+        gap: (drawerRect.top - wrapRect.top) - (lastRect.bottom - wrapRect.top),
+      };
+    });
+    // 末轮底部 ≤ drawer 上边缘 (完整可见).
+    expect(visible.lastRoundBottom, "末轮 request 底部应在 drawer 上边缘之上").toBeLessThanOrEqual(visible.drawerTop);
+    // GAP ≥ DRAWER_GAP - 容差(4px 亚像素): follow 预留 ~28px 呼吸空间 (WebUI 反馈3).
+    // 弱断言 (>=0) 无法守卫 bottomScrollTarget 的 drawerH+GAP 预留逻辑, 故用接近 GAP 的下界.
+    expect(visible.gap, "末轮底部到 drawer 上边缘应有 ~DRAWER_GAP 呼吸间距").toBeGreaterThanOrEqual(DRAWER_GAP - 4);
+  });
+
+  test("UI-6: pinned 时 drawer 有 .pinned 类, follow 时无 (视觉区分)", async ({ page }) => {
+    const marker = "ui6-pinned-class-marker";
+    const sid = await setupLongMultiroundSession(page, marker, 3);
+    await openTimeline(page, sid, 3);
+
+    const scrollRange = await contentScrollRange(page);
+    test.skip(scrollRange <= 200, "content too short to test pinned");
+
+    // follow 时 drawer 无 .pinned 类 (淡灰近不可见).
+    await expect(page.locator("#response-drawer")).not.toHaveClass(/pinned/);
+
+    // 向上滚到内容中部 (pinned).
+    await scrollToContentMiddle(page);
+    await page.waitForTimeout(300); // 等 RAF 合并的 syncFollowMode.
+
+    // pinned 时 drawer 有 .pinned 类 (蓝细边).
+    await expect(page.locator("#response-drawer"), "pinned 时 drawer 应有 .pinned 类").toHaveClass(/pinned/);
+
+    // 点 ↓ 回到 follow.
+    await page.locator("#scroll-bottom-btn").click();
+    await page.waitForTimeout(600); // 等 smooth + RAF.
+
+    // follow 时 .pinned 类移除.
+    await expect(page.locator("#response-drawer"), "回到 follow 时 .pinned 应移除").not.toHaveClass(/pinned/);
   });
 
   // Bug #2 (选中历史 round 连续扩展) 的前端路径 selectRound path 2 (loadUntilRound

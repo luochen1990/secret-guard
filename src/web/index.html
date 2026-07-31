@@ -988,7 +988,10 @@
          - 往上滚 (气泡下移) → 抽屉收缩, 最小 10%.
          - 往下滚 (气泡上移) → 抽屉扩大, 最大 40%.
          - 滚到末轮底部以下 (placeholder 区域) → 渐进扩展到 80%.
-       overlay 不影响 #detail 的滚动高度, 循环依赖从架构上消除. */
+       overlay 不影响 #detail 的滚动高度, 循环依赖从架构上消除.
+       顶部边缘 (border-top): follow 时淡灰近不可见; pinned 时蓝色细条 (WebUI 反馈1:
+       让用户能区分 follow/pinned 状态). .pinned 类由 updateResponseDrawerLayout 同步
+       (与 drawer 高度同一渲染周期, 覆盖抽屉从隐藏切到可见等边界). */
     .response-drawer {
       position: absolute;
       left: 0; right: 0; bottom: 0;
@@ -1000,6 +1003,12 @@
       overflow: hidden;
       z-index: 8;
       box-shadow: 0 -2px 8px rgba(0,0,0,0.08);
+      transition: border-top-color 0.15s ease, box-shadow 0.15s ease;
+    }
+    /* pinned: 蓝色细条 + 轻微上浮阴影, 明显区别于 follow 的淡灰. 配色与 unread badge 一致. */
+    .response-drawer.pinned {
+      border-top: 3px solid #4a6fa5;
+      box-shadow: 0 -3px 12px rgba(74, 111, 165, 0.25);
     }
     /* placeholder: 提供段 B (遮挡 placeholder) 的滚动空间. 用户滚入此区域时 drawer
        已扩大遮挡它, 不暴露空白. 高度由 JS 设置: 长内容 = extremeMaxH (80% wrapH),
@@ -2265,25 +2274,44 @@
     // 显式滚到 timeline 末轮底部 (最新一轮的 request 内容底, 不含 drawer-placeholder).
     // loadTimeline / selectRound(scroll:'bottom') 调用.
     //
-    // 为何不滚到 scrollHeight: #detail 末尾有 .drawer-placeholder (长内容时高度 =
-    // extremeMaxH = 80% wrapH), 它的作用是给**用户手动滚动**提供 phase 4 空间 (drawer
-    // 扩展遮挡 placeholder). 若 follow 自动滚动滚到 scrollHeight (含 placeholder),
-    // placeholder 进入视口 → drawer 段 B 主导扩展到 extremeMaxH (80%), 遮挡末轮 request
-    // 气泡 (bug: 新 round 到达后被抽屉遮挡). 故 follow 自动滚动只滚到末轮底部 (contentEnd),
-    // 让末轮紧贴视口底, placeholder 留在视口下不可见, drawer 保持 defaultH (30%).
+    // 【follow 预留 drawer 空间 (WebUI 反馈2)】: 滚动目标不是把末轮底部贴到视口底
+    // (那样末轮 request 会被 drawer overlay 遮挡), 而是让末轮底部出现在 **当前 drawer
+    // 上边缘之上 DRAWER_GAP 处**. 即:
+    //   target = contentEnd - wrapH + drawerH + GAP
+    //   → 末轮底部 viewport y = wrapH - drawerH - GAP (drawer 上方 GAP 处).
+    //
+    // drawerH 取 **滚动前的当前值** (而非滚动后重算): 因为段 A Phase 2 公式
+    // (drawerH = wrapH - bubbleBottomY - GAP) 在末轮选中时是恒等式 (任何 drawerH 都平衡),
+    // 取当前值可保留用户当前的 response 视图, 避免滚动瞬间 drawer 高度跳变. 无选中时
+    // drawerH = defaultH (固定不随滚动变), 同样稳定.
+    //
+    // 段 B (placeholderCover = placeholderExposed - GAP) 与此自洽: follow 多滚 drawerH+GAP
+    // 进入 placeholder 区 (placeholderExposed = drawerH+GAP) → drawer 至少覆盖 drawerH
+    // (顶部 GAP 截留作呼吸空间) → drawer 高度 = drawerH, 不暴涨不漂移.
     //
     // 用 scrollTo({behavior:'auto'}) 而非 scrollTop= 赋值: behavior:'auto' 是显式滚动操作,
     // CSSOM View 规范要求它 abort 同一元素上正在进行的 smooth 滚动动画 (来自 highlightRound).
     // scrollTop 赋值在部分浏览器实现里不保证 abort, 实测时序上 smooth 动画会继续把 scrollTop
     // 拉回其目标, 导致最终位置不确定 (这是 "需求 4: 选中会话滚到底" 失败的独立根因,
     // 与 timeline 倒序 bug 独立 — 倒序修复后才暴露此竞争).
+    // 接收已查得的 #detail el (调用方已守卫 null), 避免重复 getElementById.
+    function bottomScrollTarget(el) {
+      const drawer = document.getElementById('response-drawer');
+      // drawerH: 滚动前当前高度 (用户当前的 response 视图). drawer 隐藏时为 0.
+      const drawerH = (drawer && !drawer.hidden) ? drawer.offsetHeight : 0;
+      // contentEnd - wrapH = 末轮底部贴视口底的 scrollTop;
+      // + drawerH + GAP = 把末轮抬到 drawer 上边缘之上 GAP 处.
+      const target = contentEndY(el) - el.clientHeight + drawerH + DRAWER_GAP;
+      // clamp: 短内容 (contentEnd < wrapH) 时 target < drawerH+GAP, 但 scrollTop 最小 0;
+      //        超过 maxScroll 时 clamp 到 maxScroll (末轮已是链尾, 无法再滚).
+      const maxScroll = el.scrollHeight - el.clientHeight;
+      return Math.max(0, Math.min(target, maxScroll));
+    }
+
     function scrollTimelineToBottomForce() {
       const el = document.getElementById('detail');
       if (!el) return;
-      // 短内容 (contentEnd < wrapH): 滚到 0 (内容顶部, 已全在视口内).
-      // 长内容: 滚到 contentEnd - wrapH (末轮底部贴视口底).
-      const target = Math.max(0, contentEndY(el) - el.clientHeight);
-      el.scrollTo({ top: target, behavior: 'auto' });
+      el.scrollTo({ top: bottomScrollTarget(el), behavior: 'auto' });
     }
 
     // ─── timeline 滚动状态机 (UI-6 follow/pinned) ──────────────────────────
@@ -2298,12 +2326,12 @@
     //
     // 基于 "末轮底部 (contentEndY)" 而非 scrollHeight: #detail 末尾有 .drawer-placeholder
     // (长内容时高度 = extremeMaxH), 它是给手动滚动 phase 4 用的, 不应参与 follow 判定.
-    // 若用 scrollHeight 判定: scrollTimelineToBottomForce 滚到 contentEnd 后, 距 scrollHeight
-    // = placeholderH (= 0.8·wrapH) 远超 NEAR_BOTTOM_PX → 误判为 pinned → follow 丢失.
+    // 若用 scrollHeight 判定: scrollTimelineToBottomForce 预留 drawerH+GAP 后, 距 scrollHeight
+    // = placeholderH - drawerH 远超 NEAR_BOTTOM_PX → 误判为 pinned → follow 丢失.
     //
     // placeholder 区 (scrollTop > contentEnd - wrapH, 即滚过末轮底部) 也算 "在底部":
     // distToBottom 为负 → <= NEAR_BOTTOM_PX 成立. 用户主动滚下去看 response 抽屉的延伸,
-    // 新 round 到达仍应自动滚回.
+    // 以及 follow 预留 drawerH+GAP 进入 placeholder 区时, 均视为 "在底部", 新 round 到达仍自动滚回.
     function isNearBottom() {
       const el = document.getElementById('detail');
       if (!el) return true;
@@ -2319,6 +2347,8 @@
       // pinned → follow: 清零未读 (用户视口已到底, 旧未读不再有意义).
       if (now && !was) state.unreadCount = 0;
       updateUnreadBadge();
+      // .pinned 视觉类由 updateResponseDrawerLayout 同步 (每渲染/滚动周期都刷新,
+      // 覆盖抽屉从隐藏切到可见等边界场景, 无需在 syncFollowMode 重复).
     }
 
     // pinned 期间有未读 → 显示胶囊 "↓ N"; 否则隐藏.
@@ -2706,20 +2736,28 @@
     //      - 气泡在视口内 → wrapH - bubbleBottomY - GAP, clamp [minH, maxH].
     //      - 气泡滚出顶部 (bubbleBottomY <= 0) → clamp 到 maxH (40%).
     //   B. 遮挡露出的 placeholder (phase 3/4):
-    //      drawerH = max(A, placeholderExposed), 上界 extremeMaxH.
+    //      drawerH = max(A, placeholderExposed - GAP), 上界 extremeMaxH.
     //      placeholderExposed = placeholder DOM 在视口内的可见高度.
     //      - placeholder 未露出 → placeholderExposed = 0, drawer 不变 (phase 3 等价).
-    //      - placeholder 露出 → drawer 扩展以遮挡 (phase 4), 平滑过渡到 extremeMaxH.
+    //      - placeholder 露出 → drawer 扩展以遮挡, 但顶部让出 GAP 一截作呼吸空间
+    //        (残余 GAP 截是白底 placeholder 顶部, 作为末轮 request 与 drawer 之间的
+    //        视觉间距可见, 平滑过渡到 extremeMaxH).
     //
-    // 关键不变量: drawer 必须遮挡所有露出的 placeholder, 否则用户看到空白 (历史 bug:
-    // 原 phase 4 用 bubbleBottomY<=0 作门槛, 末轮选中时 bby 永远 > 0 → phase 2 clamp 封顶在 maxH,
-    // placeholder 空白被露出).
+    // 关键不变量: drawer 遮挡露出的 placeholder 时顶部让出 DRAWER_GAP 作呼吸空间 (WebUI
+    // 反馈3). 历史 bug: 原 phase 4 用 bubbleBottomY<=0 作门槛, 末轮选中时 bby 永远 > 0
+    // → phase 2 clamp 封顶在 maxH, placeholder 空白被露出. 修复: 改用 placeholderExposed
+    // 作段 B 驱动; 后续又加 -GAP 让出呼吸空间 (残余白底截可接受, 非空白泄漏).
     //
     // 短内容 (contentEnd <= wrapH): placeholder 高度 = 0 (不提供 phase 4 滚动空间,
     // 也不进入初始视口). 所有 rounds 在视口内, drawer 完全由 A 段决定.
     //
     // 边界 clamp 值 (全部相对 wrapH):
-    const DRAWER_GAP = 8;       // 气泡下边缘与抽屉上边缘的间距 (px).
+    // DRAWER_GAP = 气泡下边缘与抽屉上边缘的呼吸间距. 取 ~2 行文字高度 (~28px):
+    //   - follow 时末轮 request 底部距 drawer 上边缘 = GAP (WebUI 反馈3: 收束感 + 不粘连).
+    //   - 段 A Phase 2 公式 wrapH - bubbleBottomY - GAP 天然让 GAP 生效.
+    //   - 段 B placeholderExposed 让出 GAP (drawer 不遮 placeholder 顶部 GAP 一截),
+    //     该截白底成为末轮与 drawer 间的呼吸空间, follow/phase4 视觉一致.
+    const DRAWER_GAP = 28;
     const DRAWER_MIN_RATIO = 0.10;
     const DRAWER_DEFAULT_RATIO = 0.30;
     const DRAWER_MAX_RATIO = 0.40;
@@ -2793,15 +2831,23 @@
         drawerHeight = Math.max(minH, Math.min(maxH, wrapH - bubbleBottomY - DRAWER_GAP));
       }
 
-      // B. 遮挡露出的 placeholder (phase 3/4): drawer 至少覆盖 placeholderExposed.
-      // 与 A 段取 max: placeholder 未露出时 (placeholderExposed=0) 不影响 A 段结果;
-      // placeholder 露出时主导, 平滑扩展到 extremeMaxH.
-      drawerHeight = Math.max(drawerHeight, placeholderExposed);
+      // B. 遮挡露出的 placeholder (phase 3/4): drawer 覆盖 placeholderExposed, 但顶部
+      // 让出 DRAWER_GAP 一截作为呼吸空间 (白底 placeholder 顶部成为末轮 request 与 drawer
+      // 之间的视觉间距, 与段 A Phase 2 的 GAP 语义一致).
+      //   - placeholder 未露出 (placeholderExposed=0) → 0-GAP<0 不影响 A 段结果.
+      //   - placeholder 露出 ≤ GAP → 0-GAP 后为负, drawer 不为它增长 (露出区 < 呼吸空间, 视觉为白底, 可接受).
+      //   - placeholder 露出 > GAP → drawer 至少覆盖 (placeholderExposed - GAP), 顶部 GAP 截留作呼吸空间.
+      const placeholderCover = Math.max(0, placeholderExposed - DRAWER_GAP);
+      drawerHeight = Math.max(drawerHeight, placeholderCover);
       drawerHeight = Math.min(drawerHeight, extremeMaxH);
 
       drawer.style.height = drawerHeight + 'px';
       // scroll-nav 的 bottom 同步到抽屉高度, 使底部按钮贴合滚动区域底端.
       wrap.style.setProperty('--drawer-h', drawerHeight + 'px');
+      // 顶部边缘 follow/pinned 视觉指示 (WebUI 反馈1): pinned → .pinned 类 (蓝细边),
+      // follow → 移除 (淡灰). 与 drawer 高度同一周期同步, 覆盖抽屉从隐藏切到可见等边界.
+      // isNearBottom 读 scrollTop/contentEnd, 本函数已读同值, 无额外 layout 开销.
+      drawer.classList.toggle('pinned', !isNearBottom());
     }
 
     // 增量更新: 自动刷新时若 node 序列不变, 只刷抽屉内容 (流式渐进) + 重新计算布局.
@@ -2867,13 +2913,12 @@
     // "↓ 回到底部" 浮按钮: 仅滚动视口到最新轮 (末轮底部, 不含 placeholder), 不重置 selectedRound (方案 X).
     // 进入 follow 由后续 scroll 事件的 syncFollowMode 自然完成 (smooth 动画结束后).
     // 与 unread badge (jumpToLatest) 的区别: 后者额外重置 selectedRound 到最新轮 + flash.
-    // 同 scrollTimelineToBottomForce 一样滚到 contentEnd (不滚入 placeholder, 见其注释),
-    // 仅 behavior 不同 (smooth 给用户手动点击的视觉过渡).
+    // 同 scrollTimelineToBottomForce 共用 bottomScrollTarget (见其注释), 仅 behavior 不同
+    // (smooth 给用户手动点击的视觉过渡).
     function scrollTimelineToBottom() {
       const el = document.getElementById('detail');
       if (!el) return;
-      const target = Math.max(0, contentEndY(el) - el.clientHeight);
-      el.scrollTo({ top: target, behavior: 'smooth' });
+      el.scrollTo({ top: bottomScrollTarget(el), behavior: 'smooth' });
     }
 
     // ─── detail 渲染辅助 (被 timeline 复用) ────────────────────────────────
