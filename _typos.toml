@@ -14,6 +14,8 @@
 [default.extend-identifiers]
 # pn = parent node (DAG 父节点变量, dag.rs 内部约定).
 pn = "pn"
+# thr = threshold (awk 局部变量, justfile bench-ci 解析 criterion 输出用, awk 惯用短名).
+thr = "thr"
 
 [default.extend-words]
 # hel / abd = SSE 流式测试 fixture 的字符串片段 (codec/stream.rs / auth/apikey.rs),

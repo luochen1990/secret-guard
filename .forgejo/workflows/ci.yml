@@ -197,29 +197,86 @@ jobs:
       - name: Coverage gate
         run: just coverage-gate
 
-      # Performance benchmark --quick (非阻塞): 运行 redact bench (10 samples), 守卫 runtime panic + 性能趋势.
-      #
-      # 为什么跑 bench 而非 --no-run compile check:
-      #   - --no-run (dev profile ~4s) 只验证可编译性, 收益极低 (clippy --all-targets 已覆盖编译期检查).
-      #   - 跑 bench 覆盖 criterion harness setup + runtime panic + 产出性能统计 (6 场景).
-      #
-      # 为什么用 --quick 而非默认 100 samples:
-      #   - --quick 把 sample 数从 100 降到 10, criterion 运行时间从 ~65s 压缩到 ~3s.
-      #   - 统计精度下降但仍产出置信区间, 足以发现 runtime panic / setup 失败 / 量级级退化.
-      #   - 实测 CI 增量: 热缓存 (release/ 命中) ~3s, 冷编译 (release/ 全量) ~1m20s (仅卷重建后首次).
-      #
-      # release 缓存复用: CARGO_TARGET_DIR 持久卷下 release/ 子目录跨 job 缓存,
-      # 与 debug/ / llvm-cov-target/ 物理隔离. 冷编译仅在 tmpfs 卷重建后出现.
-      #
-      # continue-on-error: true: 非阻塞起步. 升级路径 (与 WebUI regression 同策略):
-      #   连续 N=20 次 master 分支 (push 事件) 本 step 跑绿后, 移除 continue-on-error
-      #   升级为阻塞. 升级前先在 PR 评论记录达标证据 (20 次 run 链接).
-      #
-      # 未来增强: 接入 criterion baseline 保存/比较 (--save-baseline / --baseline),
-      # 让性能退化超阈值时 exit 1 (当前只产出统计, 不自动判定回归).
-      - name: Performance benchmark (redact, --quick)
+      # Performance benchmark (criterion baseline 回归检测, 非阻塞).
+      # 机制实现 + 阈值/输出契约/退出码 SSOT 在 justfile bench-ci; 此处只记 CI 层决策:
+      #   - 双事件分流 (复用本 job 的事件判定): master push → bench-ci save (滚动基线),
+      #     PR → bench-ci compare (只对比). 基线冷启动自动 fallback (见 justfile bench-ci).
+      #   - continue-on-error: 与 WebUI regression 同策略, 退化不阻断合并 (防 --quick
+      #     噪声 flake 误伤). 退化信号 upsert 到 PR 评论供人工判断. 升级路径: 连续
+      #     N=20 次 master push 无误报后可移除 PR 的 continue-on-error.
+      #   - 缓存: CARGO_TARGET_DIR/{release,criterion}/ 跨 job 复用 (master 建立的基线
+      #     PR 直接对比), 冷启动仅在持久卷重建后出现.
+      - name: Performance benchmark (criterion baseline)
+        id: bench
         continue-on-error: true
-        run: just bench --quick
+        run: |
+          set +e  # 捕获 bench-ci 的退化退出码 (exit 1) 供下一步判定, 不被 set -e 提前终止
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            just bench-ci compare 2>&1 | tee bench.txt
+          else
+            just bench-ci save 2>&1 | tee bench.txt
+          fi
+          EXIT=${PIPESTATUS[0]}
+          echo "exit_code=$EXIT" >> "$GITHUB_OUTPUT"
+          # 归档输出供评论 step 消费 (无论成败都贴, 便于维护者确认 bench 跑了 + 看趋势)
+          {
+            echo "report<<EOF"
+            cat bench.txt
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          exit 0  # continue-on-error 已兜底, 这里永远成功
+
+      # bench 结果 upsert 到 PR 评论 (仅 PR 事件): 复用 diff-loc/audit 的 marker 机制.
+      # 真正非阻塞 (continue-on-error: true): API/网络失败不影响合并.
+      # 仅 PR compare 模式且有输出时贴评论 (master save 模式无回归判定, 不需要评论).
+      - name: Upsert benchmark report to PR
+        if: always() && github.event_name == 'pull_request' && steps.bench.outputs.exit_code != ''
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EXIT_CODE: ${{ steps.bench.outputs.exit_code }}
+          REPORT: ${{ steps.bench.outputs.report }}
+        run: |
+          set -eu
+          MARKER='<!-- bench-regression -->'
+          if [ "$EXIT_CODE" = "1" ]; then
+            ICON="⚠️"
+            VERDICT="检测到性能退化 (中位数 > 阈值, 见 justfile bench-ci)"
+          elif [ "$EXIT_CODE" = "2" ]; then
+            ICON="❌"
+            VERDICT="bench 运行失败 (编译/运行错误, 非退化)"
+          else
+            ICON="✅"
+            VERDICT="无场景退化超阈值"
+          fi
+          # 提取 change 摘要行 (compact, 避免贴整段输出):
+          # 抓 bench id 行 (泛匹配 ^[a-z], 与 justfile awk 对齐, 新增 bench 场景自动覆盖)
+          # + change 百分比行 (含 %). 完整 report 在 CI log 里可查, 评论只放关键趋势.
+          SUMMARY=$(echo "$REPORT" | grep -E '^[a-z]|^[[:space:]]+time:[[:space:]]+\[[^]]*%' | tail -40)
+          BODY="$ICON **benchmark**: $VERDICT."$'\n\n```\n'"$SUMMARY"$'\n```'
+          FULL_BODY="$MARKER"$'\n'"$BODY"
+          API="https://git.lambda.lc/api/v1/repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments"
+
+          EXISTING_ID=$(curl -fsSL -H "Authorization: token $GITHUB_TOKEN" "$API" \
+            | jq --arg m "$MARKER" '.[] | select(.body | contains($m)) | .id' | head -1)
+
+          PAYLOAD=$(jq -n --arg b "$FULL_BODY" '{body: $b}')
+          if [ -n "$EXISTING_ID" ]; then
+            curl -fsSL -X PATCH \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$PAYLOAD" \
+              "$API/$EXISTING_ID" >/dev/null
+            echo "Updated bench comment $EXISTING_ID"
+          else
+            curl -fsSL -X POST \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$PAYLOAD" \
+              "$API" >/dev/null
+            echo "Created new bench comment"
+          fi
 
       # 文件长度门禁: 防止单文件 prod 代码失控膨胀 (拆分 ROI 为负时的早期预警).
       # 用 rust-diff-analyzer 对每个 .rs 做 AST 分类, 只统计 prod 行数 (排除 test).

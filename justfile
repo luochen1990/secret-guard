@@ -201,10 +201,117 @@ typos:
 # 默认 100 samples 较慢; CI 用 --quick (10 samples) 兼顾覆盖与速度, 本地完整跑用 `just bench`.
 # 透传 criterion 参数: just bench --quick / just bench -- --quick.
 #
-# CI 调用: 被 ci.yml "Performance benchmark (redact, --quick)" step 调用 (非阻塞).
+# CI 调用: 被 ci.yml "Performance benchmark" step 调用 (非阻塞, 走 bench-ci 做基线对比).
 # release 缓存复用 CARGO_TARGET_DIR/release/ (与 debug/ 物理隔离).
 bench *ARGS:
     cargo bench --bench redact -- {{ ARGS }}
+
+# CI 性能回归检测 (criterion baseline 机制).
+#
+# 机制 (基于实测, 纠正 "criterion 退化会 exit 非零" 的常见误解):
+#   criterion 即使检测到显著退化也永远 exit 0 (仅基线缺失时 panic exit 101).
+#   因此本 recipe 自行解析输出, 按中位数变化率判定回归, 超阈值则 exit 1.
+#
+# 两阶段设计 (与 ci.yml 的 master/PR 双事件配合):
+#   - mode=save  (master push):  `--save-baseline ci` — 先对比再覆盖基线, 让基线
+#     持续滚动更新 (master 永远是最新基准).
+#   - mode=compare (PR):          `--baseline ci`      — 只对比不覆盖. 基线缺失
+#     (冷启动) 时 criterion panic, 本 recipe 先检测基线目录是否存在, 缺失则
+#     fallback 到 save 模式建立首基线 (PR 第一次跑无历史可对比, 属正常).
+#
+# 退化判定逻辑 (解析 criterion stdout):
+#   每个场景输出 `change: time:   [lo% med% hi%]` 行. 取 med (中位数):
+#     - med > +REGRESSION_THRESHOLD (默认 20%): 标记回归, 收集进报告, 最终 exit 1.
+#     - 否则: 视为正常波动 (--quick 10 samples 下 p>0.05 是常态, 统计显著性弱,
+#       只能做量级级粗筛, 防 2x+ 退化).
+#
+# 输出契约 (供 CI 消费):
+#   - stdout:  criterion 原始输出 + 末尾的回归判定摘要 (如有).
+#   - exit 0:  无回归 (或基线冷启动).
+#   - exit 1:  至少一个场景中位数退化超阈值.
+#   - exit 2:  bench 本身失败 (编译/运行错误, 非退化).
+#
+# 阈值 SSOT: REGRESSION_THRESHOLD (百分比, 不带 %). 20% 的依据: --quick 噪声大
+# (实测同机器同负载波动可达 ±15%), 20% 留缓冲只卡量级级退化; 升级到 100 samples
+# 后可收紧到 10%.
+REGRESSION_THRESHOLD := "20"
+
+bench-ci mode *extra:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    THRESHOLD={{ REGRESSION_THRESHOLD }}
+    BASELINE_NAME="ci"
+    # criterion 基线落 CARGO_TARGET_DIR/criterion/<group>/<bench>/<baseline_name>/.
+    # 基线存在性判定: 任一场景目录存在即视为基线已建立 (6 场景要么都有要么都无).
+    # 假设破裂条件: 新增 bench 场景后, 老 场景基线仍在但新场景无基线, compare 模式会让
+    # criterion 对新场景 panic (exit 101) → 误报 bench 失败. 此时需先让 master 跑一次
+    # save 建立完整基线, 再开 PR.
+    CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}"
+    BENCH_DIR="$CARGO_TARGET_DIR/criterion"
+    baseline_exists() {
+        [ -d "$BENCH_DIR/redact_ir/small/$BASELINE_NAME" ]
+    }
+
+    # 选择 criterion flag.
+    ACTION="{{ mode }}"
+    if [ "$ACTION" = "save" ]; then
+        BENCH_FLAG="--save-baseline $BASELINE_NAME"
+    elif [ "$ACTION" = "compare" ]; then
+        if baseline_exists; then
+            BENCH_FLAG="--baseline $BASELINE_NAME"
+        else
+            # 冷启动: PR 第一次跑无基线可对比, fallback 建立. 不算回归.
+            echo "bench-ci: 基线 '$BASELINE_NAME' 不存在 (冷启动), 本次仅建立基线不判定回归." >&2
+            BENCH_FLAG="--save-baseline $BASELINE_NAME"
+            ACTION="save"
+        fi
+    else
+        echo "bench-ci: 未知 mode '$ACTION' (应为 save 或 compare)" >&2
+        exit 2
+    fi
+
+    # 跑 bench, 捕获输出. set +e: cargo bench 退化时仍 exit 0, 但编译/运行错误
+    # 会 exit 非 101, 需捕获区分 (退化 vs 真失败).
+    OUTPUT=$(cargo bench --bench redact -- --quick $BENCH_FLAG {{ extra }} 2>&1)
+    BENCH_EXIT=$?
+    echo "$OUTPUT"
+    if [ "$BENCH_EXIT" -ne 0 ]; then
+        echo "bench-ci: cargo bench 失败 (exit $BENCH_EXIT), 非退化判定范畴." >&2
+        exit 2
+    fi
+
+    # save 模式 (含冷启动 fallback) 不判定回归, 只更新基线.
+    if [ "$ACTION" = "save" ]; then
+        echo "bench-ci: 基线 '$BASELINE_NAME' 已更新."
+        exit 0
+    fi
+
+    # compare 模式: 解析每个场景的 change 中位数, 判定回归.
+    # criterion 输出格式 (实测): 每个场景有绝对 time 行 [lo med hi] (无 %), change 区段
+    # 紧跟一个 time: [lo% med% hi%] 行 (含 %; 与绝对 time 行的区别是带 %). "含 % 的 time
+    # 行 = change 行" 是单行特征, 无需跨行状态机. 用 POSIX ERE ([[:space:]] 而非 \s) +
+    # match()+RSTART/RLENGTH (避免 gawk 专有的 match(s,re,arr) 三参数形式), 跨 runner 可移植.
+    regressions=$(echo "$OUTPUT" | awk -v thr="$THRESHOLD" '
+        # bench id 行: 形如 redact_ir/small / streaming_restorer/large (可跨行)
+        /^[a-z]/ { bench = $1 }
+        # change time 行: 含 % 即相对基线 (绝对 time 行与 thrpt 行均无 %)
+        /time:[[:space:]]*\[.*%/ && bench != "" {
+            if (match($0, /\[[^]]*\]/)) {
+                split(substr($0, RSTART+1, RLENGTH-2), v, /[%[:space:]]+/)
+                med = v[2] + 0
+                if (med > thr) printf "%s: +%d%%\n", bench, med
+            }
+        }
+    ')
+
+    if [ -n "$regressions" ]; then
+        echo "" >&2
+        echo "bench-ci: ⚠️ 检测到性能退化 (中位数 > ${THRESHOLD}%):" >&2
+        echo "$regressions" | sed 's/^/  /' >&2
+        exit 1
+    fi
+    echo "bench-ci: ✓ 无场景退化超 ${THRESHOLD}% 阈值."
+    exit 0
 
 # bench 编译验证 (--no-run 零样本, dev profile): 快速验证 bench 可编译.
 # CI 不再调用 (CI 跑完整 bench); 仅供本地秒级验证 (复用 debug 缓存).

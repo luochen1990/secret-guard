@@ -39,32 +39,43 @@ CI 配置 `.forgejo/workflows/ci.yml`, 触发: `push` + `pull_request` + `workfl
    用 `cargo llvm-cov nextest` 插桩, 产出 profdata 供下一步消费. **测试集只跑这一次**.
 6. **Coverage gate** (`just coverage-gate`): 双阈值 (line% 下限 + 未覆盖行数上限, 阈值
    SSOT 在 justfile), 只做 report 读上一步 profdata, 不重跑测试.
-7. **File size gate** (`just check-file-size`): `rust-diff-analyzer` 对每个 .rs 做 AST 分类,
+7. **Performance benchmark** (`just bench-ci`, `continue-on-error` 非阻塞): criterion
+   baseline 回归检测. master push → `bench-ci save` (滚动更新基线 `ci`); PR →
+   `bench-ci compare` (只对比不覆盖, 冷启动自动 fallback 建 首基线). 退化判定 (解析
+   criterion 输出的 change 中位数, 默认 20% 阈值) + 退出码契约 (0 正常 / 1 退化 / 2 失败)
+   的 SSOT 在 justfile `bench-ci` recipe. criterion 基线落 `CARGO_TARGET_DIR/criterion/`
+   跨 job 复用.
+8. **Upsert benchmark report to PR** (仅 PR 事件, `continue-on-error`): bench 结果 upsert
+   到 PR 评论, 复用 marker 机制让退化信号不只埋在 job log.
+9. **File size gate** (`just check-file-size`): `rust-diff-analyzer` 对每个 .rs 做 AST 分类,
    只统计 prod 行数 (排除 test), 双阈值 (WARN 500 软提醒 / MAX 1600 硬阻断, fail-closed).
-8. **WebUI regression (Playwright)** (`just check-webui`, `continue-on-error` 初期非阻塞):
-   webServer 自动启动 mock upstream + secret-guard, 复用上一步编译的 debug binary
-   (CARGO_TARGET_DIR 指向持久卷, playwright.config.ts 读此环境变量).
-9. **Upload Playwright artifacts on failure** (仅 Playwright 失败时, `continue-on-error`):
-   上传截图/trace/html 报告. 用 Forgejo 官方 fork `forgejo/upload-artifact@v4`
-   (GitHub 官方版会检测非 GitHub 环境报错), retention 14 天.
-10. **cargo audit** (`just audit`, `continue-on-error` 非阻塞): CVE 扫描, 输出 tee 到
+10. **WebUI regression (Playwright)** (`just check-webui`, `continue-on-error` 初期非阻塞):
+    webServer 自动启动 mock upstream + secret-guard, 复用上一步编译的 debug binary
+    (CARGO_TARGET_DIR 指向持久卷, playwright.config.ts 读此环境变量).
+11. **Upload Playwright artifacts on failure** (仅 Playwright 失败时, `continue-on-error`):
+    上传截图/trace/html 报告. 用 Forgejo 官方 fork `forgejo/upload-artifact@v4`
+    (GitHub 官方版会检测非 GitHub 环境报错), retention 14 天.
+12. **cargo audit** (`just audit`, `continue-on-error` 非阻塞): CVE 扫描, 输出 tee 到
     audit.txt 供下一步 upsert 到 PR 评论. 非阻塞理由: 新 CVE 不应阻塞正在进行的 PR;
     advisory DB 拉取可能因网络抖动失败. 忽略项配置 `.cargo/audit.toml`, 详见根 AGENTS.md
     "cargo-audit (CVE 监控)" 段.
-11. **Upsert cargo audit report to PR** (仅 PR 事件, `continue-on-error`): audit 结果 upsert
+13. **Upsert cargo audit report to PR** (仅 PR 事件, `continue-on-error`): audit 结果 upsert
     到 PR 评论, 复用 diff-loc 的 marker 机制让非阻塞的 CVE 不只埋在 job log.
-12. **cargo-deny** (`just deny`, **阻塞**): license 合规 + 依赖 bans + advisory 二次审查.
+14. **cargo-deny** (`just deny`, **阻塞**): license 合规 + 依赖 bans + advisory 二次审查.
     配置 `deny.toml`, 详见根 AGENTS.md "cargo-deny" 段.
-13. **typos** (`just typos`, **阻塞**): 拼写检查, 白名单 `_typos.toml`.
+15. **typos** (`just typos`, **阻塞**): 拼写检查, 白名单 `_typos.toml`.
 
-> **流程顺序原则**: 真正非阻塞的附加检查 (diff 报告 / WebUI / audit) 用 `continue-on-error`
+> **流程顺序原则**: 真正非阻塞的附加检查 (diff 报告 / bench / WebUI / audit) 用 `continue-on-error`
 > 兜底, 即使抽风也不影响 `check` job 状态; 阻塞门禁 (consistency-check / check /
 > coverage-gate / file-size / cargo-deny / typos) 失败则 job 失败.
 
 ## 非阻塞检查的升级路径
 
-- **cargo audit**: 保持 `continue-on-error` 非阻塞 (非阻塞理由见上 step 10). 结果已 upsert
+- **cargo audit**: 保持 `continue-on-error` 非阻塞 (非阻塞理由见上 step 12). 结果已 upsert
   到 PR 评论供 review 时看到, 无需进 job log 翻找.
+- **Performance benchmark**: `continue-on-error` 非阻塞 (`--quick` 10 samples 噪声大, p>0.05
+  常态, 退化判定只做量级级粗筛防 2x+ 退化, 避免误伤 PR). 退化信号已 upsert 到 PR 评论供
+  人工判断. **退出条件**: 连续 N=20 次 master push 无误报后, 可移除 PR 的 `continue-on-error`.
 - **WebUI regression (Playwright)**: 初期 `continue-on-error` (CI 环境无 GPU / chromium 渲染
   可能有 flake). **退出条件**: 连续 N=20 次 master 分支 (push 事件) 本 step 跑绿后, 移除
   `continue-on-error` 升级为阻塞. 判定: 翻 Actions 历史筛 master + WebUI step 取最近 20 次
@@ -83,10 +94,11 @@ CI 用纯 `curl` + Forgejo API (`POST/PATCH /repos/{owner}/{repo}/issues/{n}/com
 把报告贴到 PR, 不引入 JS action (runner vm-nix 无 node, 零依赖 shell 更轻量).
 
 **upsert 语义**: 用 HTML 注释 marker 标记评论, 找到则 PATCH 更新 (PR 多次 push 不刷屏),
-找不到则 POST 新建. 当前两个 marker:
+找不到则 POST 新建. 当前三个 marker:
 
 - `<!-- rust-diff-analyzer -->` — diff 拆解报告 (步骤 2/3).
-- `<!-- cargo-audit -->` — CVE 扫描结果 (步骤 10/11).
+- `<!-- bench-regression -->` — 性能回归检测结果 (步骤 7/8).
+- `<!-- cargo-audit -->` — CVE 扫描结果 (步骤 12/13).
 
 写回步骤都配 `continue-on-error: true`: API/网络失败不影响合并 (附加功能不影响核心职责,
 遵循鲁棒性原则). 额外守卫 `steps.report.outcome == 'success'`: 报告没生成就不发空评论.
@@ -99,10 +111,12 @@ CI 用纯 `curl` + Forgejo API (`POST/PATCH /repos/{owner}/{repo}/issues/{n}/com
 增量编译 (秒级).
 
 - **子目录隔离**: clippy/nextest 用 `debug/` 子目录, coverage 用 `llvm-cov-target/` 子目录,
-  物理隔离无需全量 `cargo clean`. (注: `just check --coverage` 内部跑
-  `cargo llvm-cov clean --workspace` 精准清插桩 artifacts, 不影响 debug/ 缓存.)
-- **卷生命周期**: 主机启动期间 (tmpfs, 主机重启才丢).
-- **Playwright 复用**: webServer 复用 debug binary (机制见 step 8).
+  bench 用 `release/` 子目录, criterion 基线用 `criterion/` 子目录, 物理隔离无需全量
+  `cargo clean`. (注: `just check --coverage` 内部跑 `cargo llvm-cov clean --workspace`
+  精准清插桩 artifacts, 不影响 debug/ 缓存; criterion 基线跨 job 持久, master 建立后 PR 直接对比.)
+- **卷生命周期**: 主机启动期间 (tmpfs, 主机重启才丢; 重启后 criterion 基线冷启动, bench-ci
+  自动 fallback 重建).
+- **Playwright 复用**: webServer 复用 debug binary (机制见 step 10).
 
 ## 并发互斥假设 (runner single-job mode)
 
