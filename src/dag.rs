@@ -3282,6 +3282,8 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
 
+        /// 结构性回归守卫: 内容寻址 round-trip identity (BlockPool intern/resolve + Merkle
+        /// walk 的代数恒等式 — CDAG-2/3/4 的共同前置条件, 无单一契约 ID).
         /// 性质 1 (round-trip identity):
         /// 任意 messages 序列 push 到 DAG, 取 leaf 调 full_request_messages walk 出来,
         /// 应严格等于原始 messages. 这是 DAG 核心 (BlockPool intern/resolve + Merkle walk)
@@ -3310,6 +3312,7 @@ mod tests {
             }
         }
 
+        /// 守卫 CDAG-2: 多 node 链 round-trip (parent 共享前缀 + Merkle prefix hash 找 parent).
         /// 性质 1 变体 (多 node 链 round-trip):
         /// 模拟真实多轮: A=[m1], B=[m1, m2], C=[m1, m2, m3].
         /// 取 C 的 full_request_messages 应得 [m1, m2, m3], 与 push C 时给的 messages 一致.
@@ -3338,6 +3341,7 @@ mod tests {
             prop_assert_eq!(&walked[2].content, &m3.content, "msg[2] = m3");
         }
 
+        /// 守卫 CDAG-3: 任意 push + 淘汰序列后所有存活 block refcount > 0.
         /// 性质 2 (refcount 非负 + 操作序列不 panic):
         /// 任意 push N 次 + 触发淘汰的序列, 不应 panic, 且最终所有 block 的 refcount > 0
         /// (refcount=0 的 block 应已被 GC 移除). 用小 max_nodes 强制淘汰, 覆盖 GC 路径.
@@ -3385,7 +3389,8 @@ mod tests {
             }
         }
 
-        /// 性质 (intern idempotent): 同一 block 重复 intern, hash 必须相同.
+        /// 结构性回归守卫: intern idempotent hash (内容寻址根基, CDAG-2/6 的共同前置条件,
+        /// 无单一契约 ID). 同一 block 重复 intern, hash 必须相同.
         /// 这是内容寻址的根基 (BlockPool 用 HashMap<BlockHash, _>).
         #[test]
         fn prop_block_intern_idempotent_hash(

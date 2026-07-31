@@ -1370,7 +1370,7 @@ mod tests {
     }
 
     proptest! {
-        /// C3 + C4: 不同 secret 总产生不同 mock.
+        /// 守卫 RED-4: 不同 secret → 不同 mock (单射性, contracts.md §2).
         #[test]
         fn prop_distinct_secrets_distinct_mocks(
             s1 in "[a-z]{4,12}",
@@ -1385,7 +1385,7 @@ mod tests {
             prop_assert!(m1 != m2, "mocks for distinct secrets collided: {} == {}", m1, m2);
         }
 
-        /// C2: mock 不在 IR 中 (redact 后的 IR 不含 mock 作为子串 — wait, 它含, 因为替换进去了).
+        /// 守卫 RED-2: gen 出的 mock 不在 pre-replace IR 中 (上下文唯一性, contracts.md §2).
         /// 真正的 C2: gen_mock_for_ir 生成的 mock 在生成那一刻不在 IR 中.
         #[test]
         fn prop_mock_not_in_pre_redact_ir(
@@ -1403,7 +1403,7 @@ mod tests {
                 "mock must not appear in pre-redact IR: mock={}", m);
         }
 
-        /// C6: round-trip 是 identity (redact + restore).
+        /// 守卫 RED-6: text block 中 secret 的 redact+restore round-trip identity (可逆双射, contracts.md §2).
         #[test]
         fn prop_round_trip_identity(
             body_prefix in "[a-z0-9 ,.!?'\"\n]{0,100}",
@@ -1429,7 +1429,7 @@ mod tests {
             prop_assert_eq!(restored, original_text);
         }
 
-        /// C1: mock 非空. 字符集由 infer 自 real (此处含字母数字与连字符).
+        /// 守卫 RED-1: mock 非空 (mock 非空性, contracts.md §2).
         #[test]
         fn prop_mock_non_empty(
             secret in "[A-Za-z0-9-]{4,20}"
@@ -1438,8 +1438,8 @@ mod tests {
             prop_assert!(!m.is_empty());
         }
 
-        /// C5: mock 不含 real_secret 的 ≥k(L) 字符子串 (阈值随 L 自适应, 见
-        /// [`crate::mock::c5_threshold_len`]). C5 契约与重试链的设计论据见
+        /// 守卫 RED-5: mock 不含 real_secret 的 ≥k(L) 字符子串 (实质确定性, contracts.md §2).
+        /// C5 契约与重试链的设计论据见
         /// `mock.rs` 模块头部 "C5" 段落 (SSOT).
         #[test]
         fn prop_no_real_substring(
@@ -1449,8 +1449,8 @@ mod tests {
             crate::mock::assert_no_c5_substring(&m, &secret);
         }
 
-        /// C5 multibyte: secret 含中文 / emoji / 多字节 UTF-8. 与 `prop_no_real_substring`
-        /// 同语义, 补 multibyte 输入覆盖 (char-level windows 在 helper 内统一处理).
+        /// 守卫 RED-5: multibyte secret (中文/emoji) 同 C5 约束, char-level windows.
+        /// 与 `prop_no_real_substring` 同语义, 补 multibyte 输入覆盖 (helper 内统一处理).
         #[test]
         fn prop_no_real_substring_multibyte(
             secret in "[\\x{4e00}-\\x{9fff}\\x{1f300}-\\x{1f6ff}a-zA-Z0-9]{4,32}"
@@ -1459,7 +1459,7 @@ mod tests {
             crate::mock::assert_no_c5_substring(&m, &secret);
         }
 
-        /// C6 多 secret round-trip: N 个 secret 同时出现在 IR, restore 后严格等于原 IR.
+        /// 守卫 RED-6: 多 secret (1..10) 同时出现的 round-trip identity (可逆双射).
         #[test]
         fn prop_multi_secret_round_trip(
             n in 1usize..10,
@@ -1488,7 +1488,7 @@ mod tests {
             prop_assert_eq!(redacted_text, original);
         }
 
-        /// C6 同一 secret 多次出现: round-trip 仍为 identity.
+        /// 守卫 RED-6: 同一 secret 多次出现, round-trip 仍为 identity.
         #[test]
         fn prop_repeated_secret_round_trip(
             secret in "[A-Z]{4,8}",
@@ -1513,7 +1513,7 @@ mod tests {
             prop_assert_eq!(redacted_text, original);
         }
 
-        /// C4 加强版: N 个不同 secret → N 个不同 mock.
+        /// 守卫 RED-4: N 个不同 secret → N 个不同 mock (单射性加强版).
         #[test]
         fn prop_redact_produces_distinct_mocks(
             n in 2usize..20
@@ -1528,8 +1528,9 @@ mod tests {
             prop_assert_eq!(mocks.len(), n);
         }
 
-        /// StreamingRestorer 核心 contract: 把含 mock 的文本切成任意 chunk_size, 拼接
-        /// emit + flush 必须严格等于 (prefix + real + suffix).
+        /// 守卫 RED-7: StreamingRestorer 任意 chunk_size 切分下 round-trip identity (流式可逆性, contracts.md §2).
+        /// 把含 mock 的文本切成任意 chunk_size, 拼接 emit + flush 必须严格等于
+        /// (prefix + real + suffix).
         #[test]
         fn prop_streaming_restorer_round_trip(
             prefix in "[a-z ]{0,50}",
@@ -1549,7 +1550,7 @@ mod tests {
             prop_assert_eq!(emitted, expected);
         }
 
-        /// UTF-8 safety: 多字节字符 (中文 / emoji) 不应在 char boundary 中间被切.
+        /// 守卫 RED-7: 多字节 UTF-8 字符不在 char boundary 中间切 (流式可逆性 round-trip).
         /// mock 仍是 ASCII, 但 prefix/suffix 含多字节 UTF-8.
         #[test]
         fn prop_streaming_restorer_round_trip_utf8(
@@ -1570,7 +1571,7 @@ mod tests {
             prop_assert_eq!(emitted, expected);
         }
 
-        /// Multi-mock 场景: 多个 mock 同时出现在 content 中, 任意 chunk 切分下都正确 round-trip.
+        /// 守卫 RED-7: 多 mock 同段文本的 round-trip identity (per-block isolated).
         /// 覆盖 mock self-overlap / nested mock 等边缘情况.
         #[test]
         fn prop_streaming_restorer_round_trip_multi_mock(
@@ -1594,7 +1595,8 @@ mod tests {
             prop_assert_eq!(emitted, expected);
         }
 
-        /// C3 端到端幂等性 (property 版): 对任意 (prefix, suffix, secret) 组合,
+        /// 守卫 RED-3: redact_ir 幂等 (同一 IR+policy → 同一 RedactionMap, 确定性, contracts.md §2).
+        /// property 版: 对任意 (prefix, suffix, secret) 组合,
         /// 同一 IR + 同一 policy 的两次 redact_ir 调用必须产出逐字段相等的
         /// RedactionMap 与相等的 seed. 现有 c3_determinism 只覆盖纯函数层
         /// (predict_mock), prop_distinct_secrets_distinct_mocks 只比对 mock 是否两两
@@ -1618,7 +1620,8 @@ mod tests {
             );
         }
 
-        /// C5 生产路径 (property 版, 端到端): redact_ir 产出的 mock 不含 real 的任何
+        /// 守卫 RED-5: redact_ir 生产路径产出的 mock 不含 real 子串 (端到端 probing 路径).
+        /// property 版, 端到端: redact_ir 产出的 mock 不含 real 的任何
         /// ≥k(L) 字符连续子串. 现有 prop_no_real_substring 用 predict_mock (纯函数) 验证,
         /// 但生产路径在 mock 已出现在 IR 时会 probing 到 counter>0 候选, 该路径下的 C5
         /// 行为未被覆盖. 本测试走完整 redact_ir, 覆盖 probing 路径.

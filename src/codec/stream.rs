@@ -1337,6 +1337,8 @@ mod tests {
     }
 
     proptest! {
+        /// 守卫 STR-1: StreamScan chunk 边界透明 (任意切分 == 一次性 feed).
+        ///
         /// 核心不变式: 任意切分点序列 feed 的 snapshot == 一次性 feed 的 snapshot.
         ///
         /// proptest 生成任意数量的切分点 (1..=16 个, 位置范围覆盖整个流长度).
@@ -1363,6 +1365,8 @@ mod tests {
             );
         }
 
+        /// 守卫 STR-1: StreamTranslate (同协议 restore) chunk 边界透明.
+        ///
         /// StreamTranslate (同协议 restore 模式) 的 chunk-boundary 等价性.
         ///
         /// 与 StreamScan 走的是两份独立的 reassembly buffer 实现 (feed 方法各自维护),

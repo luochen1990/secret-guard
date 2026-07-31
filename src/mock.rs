@@ -1049,6 +1049,7 @@ mod tests {
     use proptest::prelude::*;
 
     proptest! {
+        /// 守卫 RED-5: gen_candidate (Auto) body 不含 real ≥k(L) 字符子串 (contracts.md §2).
         #[test]
         fn prop_c5_gen_candidate_auto_body_no_real_substring(
             real in "[A-Za-z0-9]{4,64}",
@@ -1060,7 +1061,8 @@ mod tests {
             assert_no_c5_substring(&mock, &real);
         }
 
-        /// C5 在 probing 路径下也必须成立: counter>0 候选 (首项与 IR 冲突时的后备)
+        /// 守卫 RED-5: probing 路径 (counter>0 候选) 同样不含 real ≥k(L) 字符子串.
+        /// 同 C5 约束, counter>0 候选 (首项与 IR 冲突时的后备)
         /// 同样不应含 real 的 ≥k(L) 字符子串. 这条路径在生产 redact_ir 中由 gen_mock_for_ir
         /// 触发, 本测试直接对 gen_candidate 的多个 counter 取值覆盖.
         #[test]
