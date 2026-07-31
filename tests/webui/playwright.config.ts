@@ -21,19 +21,38 @@ const ROOT = path.resolve(process.cwd(), "..", ".."); // 项目根 (tests/webui 
 const MOCK_PORT = 19999;
 const SG_PORT = 18790;
 const SG_URL = `http://127.0.0.1:${SG_PORT}/`;
-// secret-guard 二进制: 优先 release, 其次 debug.
-// CARGO_TARGET_DIR 支持: CI 用持久卷 (/var/lib/forgejo-runner/cache/cargo-target),
-// 本地开发默认 target/. 优先 release (CI 跑过 --coverage 用 debug 子目录).
+// secret-guard 二进制检索 (按优先级): release > debug > llvm-cov-target/debug.
+//   - release: 非插桩、最快, WebUI server 响应最稳 (本地 cargo build --release).
+//   - debug:   本地开发常态 (cargo build / nextest run).
+//   - llvm-cov-target/debug: CI 兜底 — `just check --coverage` 走 cargo llvm-cov nextest,
+//     产物只落此子目录; CI 在本 step 之前无 release/debug 编译, 故此候选必须存在
+//     (历史 bug: 只查 release/debug 两处, CI 永远找不到 binary).
+// CARGO_TARGET_DIR: CI 用持久卷 (/var/lib/forgejo-runner/cache/cargo-target), 本地默认 target/.
 const CARGO_TARGET_DIR = process.env.CARGO_TARGET_DIR || path.join(ROOT, "target");
-const releaseBin = path.join(CARGO_TARGET_DIR, "release", "secret-guard");
-const debugBin = path.join(CARGO_TARGET_DIR, "debug", "secret-guard");
-const SG_BIN = fs.existsSync(releaseBin) ? releaseBin : debugBin;
 
-if (!fs.existsSync(SG_BIN)) {
+/**
+ * 返回第一个存在的 secret-guard binary 路径; 都不存在则抛错列出所有候选.
+ */
+function resolveSgBin(): string {
+  const candidates = [
+    path.join(CARGO_TARGET_DIR, "release", "secret-guard"),
+    path.join(CARGO_TARGET_DIR, "debug", "secret-guard"),
+    path.join(CARGO_TARGET_DIR, "llvm-cov-target", "debug", "secret-guard"),
+  ];
+  const found = candidates.find((p) => fs.existsSync(p));
+  if (found) return found;
   throw new Error(
-    `secret-guard binary not found at ${releaseBin} or ${debugBin}. Run 'cargo build --release' first.`
+    `secret-guard binary not found in any candidate:\n${candidates.map((p) => `  - ${p}`).join("\n")}\n` +
+      `Run 'cargo build' or 'cargo llvm-cov nextest' first.`
   );
 }
+
+const SG_BIN = resolveSgBin();
+// 打印命中路径到 stderr, 让 CI log 直接可见命中了哪个候选.
+// 动机: WebUI step 的 continue-on-error 会静默吞错, 若解析到非预期产物 (如陈旧 binary)
+// 未来复现, 维护者翻 CI log 第一行即可定位, 而非反推. console.error 走 stderr,
+// Playwright 不解析 config 加载期的输出, 无副作用.
+console.error(`[playwright.config] secret-guard binary: ${SG_BIN}`);
 
 // 临时配置文件路径 (绝对路径, webServer 的 cwd 是 testDir).
 const SG_CONFIG = "/tmp/sg-ui-test.toml";
