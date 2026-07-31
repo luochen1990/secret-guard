@@ -3271,8 +3271,11 @@ mod tests {
     /// 生成简单 Text message (role + text 都随机).
     /// 仅用 Text variant 已足够覆盖 round-trip 性质 (intern/resolve 路径对所有 variant 一致,
     /// variant-specific 的 round-trip 由前述 dag_block_* 系列单元测试覆盖).
+    ///
+    /// 文本非空 (`{1,20}`): 空消息是退化场景, 实际 LLM client 几乎不发.
+    /// (CDAG-8 fork 测试对 m2==m3 的过滤由该测试自身的 prop_filter 兜底, 见 issue #113.)
     fn arb_text_message() -> impl Strategy<Value = IrMessage> {
-        (arb_role(), "[a-z0-9 ]{0,20}").prop_map(|(role, text)| IrMessage {
+        (arb_role(), "[a-z0-9 ]{1,20}").prop_map(|(role, text)| IrMessage {
             role,
             content: vec![IrBlock::Text { text }],
             ..Default::default()
@@ -3323,8 +3326,8 @@ mod tests {
             m2 in arb_text_message(),
             m3 in arb_text_message()
         ) {
-            // prop_assume: 三条 message 的 (role, content) 各不相同, 防止 hash 退化.
-            // (若两条完全相同, intern 会 dedupe, BlockPool.len < 3, 但 round-trip 仍应成立.)
+            // 不约束三条 message 各不相同: 若两条完全相同, intern 会 dedupe
+            // (BlockPool.len < 3), 但 round-trip 恒等式仍应成立.
             let dag = ConversationDag::new(64, 500, 1);
             let _a = dag.push_messages(vec![m1.clone()], dummy_event());
             let _b = dag.push_messages(vec![m1.clone(), m2.clone()], dummy_event());
@@ -3683,11 +3686,21 @@ mod tests {
         /// 模型: push [m1] → A; push [m1, m2] → B (B 取代 A 成为 leaf).
         /// 再 push [m1, m3] → C (parent=A, 但 A 不是当前 leaf → fork → 新 session).
         /// 断言: C 的 session_id != B 的 session_id.
+        ///
+        /// 生成器约束 (`prop_filter`): 契约 CDAG-8 fork 的前提是 "前缀相同但**后续不同**"
+        /// (contracts.md §4 CDAG-8). 当 m2 == m3 时, [m1, m3] 相对 [m1, m2] 并非 "后续不同",
+        /// 而是 B 的一个 delta 为空的孩子 — find_parent 倒序最长前缀匹配会命中 B (当前 leaf)
+        /// 而非 A, C 延续同一 session. 这是契约前提不满足的退化输入, 必须过滤掉, 非被测逻辑
+        /// bug. 见 issue #113. (proptest! 宏的参数间无法相互引用, 故把 (m2, m3) 合并成 tuple
+        /// 整体生成并在此 filter.)
         #[test]
         fn prop_session_fork_creates_new_session(
             m1 in arb_text_message(),
-            m2 in arb_text_message(),
-            m3 in arb_text_message(),
+            (m2, m3) in (arb_text_message(), arb_text_message())
+                .prop_filter(
+                    "CDAG-8 fork: m3 (新分支) 必须与 m2 (主干) 不同",
+                    |(m2, m3)| m2 != m3,
+                ),
         ) {
             let dag = ConversationDag::new(64, 500, 1);
             let _id_a = dag.push_messages(vec![m1.clone()], dummy_event());
