@@ -1209,6 +1209,83 @@ mod tests {
         assert_eq!(ir.top_p, None);
     }
 
+    // ─── read_tool_choice: 纯函数全分支覆盖 ─────────────────────────────────
+    //
+    // read_tool_choice 把 OpenAI wire 的 tool_choice 字段映射为 IR 枚举.
+    // 现有 read_request 测试不传 tool_choice, 4 个 string 分支 + 2 个 object 分支 +
+    // fallthrough 均未覆盖. 这里构造 JSON Value 直接调用, 覆盖全部分支.
+
+    #[test]
+    fn read_tool_choice_covers_all_branches() {
+        use crate::codec::ir::IrToolChoice;
+
+        // String 分支.
+        assert_eq!(read_tool_choice(&json!("auto")), Some(IrToolChoice::Auto));
+        assert_eq!(read_tool_choice(&json!("none")), Some(IrToolChoice::None));
+        assert_eq!(
+            read_tool_choice(&json!("required")),
+            Some(IrToolChoice::Required)
+        );
+        // 未知 string → 默认 Auto.
+        assert_eq!(
+            read_tool_choice(&json!("weird-value")),
+            Some(IrToolChoice::Auto)
+        );
+
+        // Object 分支: type=function + 有 name.
+        assert_eq!(
+            read_tool_choice(&json!({"type":"function","function":{"name":"ls"}})),
+            Some(IrToolChoice::Tool {
+                name: "ls".to_string()
+            })
+        );
+        // Object 分支: type=function 但 name 空/缺失 → Required.
+        assert_eq!(
+            read_tool_choice(&json!({"type":"function","function":{}})),
+            Some(IrToolChoice::Required)
+        );
+        // Object 分支: type 非 function → Auto.
+        assert_eq!(
+            read_tool_choice(&json!({"type":"other"})),
+            Some(IrToolChoice::Auto)
+        );
+
+        // 非 string 非 object → None.
+        assert_eq!(read_tool_choice(&json!(42)), None);
+        assert_eq!(read_tool_choice(&json!(null)), None);
+    }
+
+    // ─── read_tool_def: 纯函数边界覆盖 ───────────────────────────────────────
+
+    #[test]
+    fn read_tool_def_returns_none_for_missing_name() {
+        // name 缺失/空 → None (覆盖 689-690 的早退).
+        assert_eq!(read_tool_def(&json!({"function":{}})), None);
+        assert_eq!(read_tool_def(&json!({"function":{"name":""}})), None);
+        // 无 function key → None (683 行 ? 早退).
+        assert_eq!(read_tool_def(&json!({"not_function":{}})), None);
+    }
+
+    #[test]
+    fn read_tool_def_parses_full_definition() {
+        let tool = read_tool_def(&json!({
+            "function": {
+                "name": "search",
+                "description": "Search the web",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        }));
+        let tool = tool.expect("valid tool def");
+        assert_eq!(tool.name, "search");
+        assert_eq!(tool.description.as_deref(), Some("Search the web"));
+    }
+
+    #[test]
+    fn reader_name_is_openai() {
+        // 覆盖 name() 纯函数 (30-32), 守卫 protocol 标识符稳定.
+        assert_eq!(reader().name(), "openai");
+    }
+
     #[test]
     fn read_request_system_promotion_from_any_position() {
         let body = json!({

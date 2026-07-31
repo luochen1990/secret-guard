@@ -1535,6 +1535,28 @@ mod tests {
     }
 
     #[test]
+    fn block_pool_is_empty_and_default() {
+        // 覆盖 is_empty (214-216) + Default impl (505-507).
+        let pool = BlockPool::default();
+        assert!(pool.is_empty(), "default pool should be empty");
+        assert_eq!(pool.len(), 0);
+        let mut pool = pool;
+        pool.intern(IrBlock::Text {
+            text: "y".to_string(),
+        });
+        assert!(!pool.is_empty(), "pool with 1 block not empty");
+    }
+
+    #[test]
+    fn conversation_dag_default_is_empty() {
+        // 覆盖 ConversationDag::default (505-507), 守卫默认构造可用.
+        let dag = ConversationDag::default();
+        let (views, total) = dag.list_page(0, 10, false);
+        assert!(views.is_empty());
+        assert_eq!(total, 0);
+    }
+
+    #[test]
     fn block_pool_intern_message_creates_refs() {
         let mut pool = BlockPool::default();
         let msg = text_msg(IrRole::User, "test message");
@@ -3865,6 +3887,153 @@ mod tests {
                 "DTO-5: messages 数 ({n}) < count ({count}) 应返回空 vec",
             );
         }
+    }
+
+    // ─── DTO-5 补充: Anthropic 顶层 system 注入 (固定用例) ───────────────────
+    //
+    // prop_delta_includes_system_at_root 只覆盖 OpenAI 风格 (messages[0].role==system),
+    // Anthropic 风格 (顶层 "system" 字段, string 或 array) 走的是另一个分支 (1385-1396),
+    // proptest 生成器不产生顶层 system 字段, 故用固定用例补全覆盖.
+
+    /// 构造 Anthropic 风格 body: 顶层 system 字段 + 固定 3 条 messages (u1/a1/u2).
+    /// 5 个 system 注入测试共享此骨架, 只变 system 字段值.
+    fn body_with_anthropic_system(system_field: &str) -> String {
+        format!(
+            r#"{{"system":{system_field},"messages":[
+                {{"role":"user","content":"u1"}},
+                {{"role":"assistant","content":"a1"}},
+                {{"role":"user","content":"u2"}}
+            ]}}"#
+        )
+    }
+
+    #[test]
+    fn delta_includes_anthropic_top_level_system_string() {
+        // Anthropic 风格: 顶层 "system" 是 string. 根节点 + start>0 → 注入 system.
+        // count=1 → start=2>0, 注入顶层 system 到 delta 首位.
+        let node = fixture_node(1, body_with_anthropic_system(r#""ANTHROPIC-SYS""#));
+        let result = extract_delta_messages_from_raw(&node);
+        // result[0] 应为注入的 system, result[1] 为切出的 user.
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result[0].get("role").and_then(|v| v.as_str()),
+            Some("system")
+        );
+        assert_eq!(
+            result[0].get("content").and_then(|v| v.as_str()),
+            Some("ANTHROPIC-SYS")
+        );
+        assert_eq!(
+            result[1].get("content").and_then(|v| v.as_str()),
+            Some("u2")
+        );
+    }
+
+    #[test]
+    fn delta_includes_anthropic_top_level_system_array() {
+        // Anthropic 风格: 顶层 "system" 是 array of {type:text,text:...}.
+        // 覆盖 extract_text_blocks 路径 (1388-1389).
+        let node = fixture_node(
+            1,
+            body_with_anthropic_system(
+                r#"[{"type":"text","text":"SYS-A"},{"type":"text","text":"SYS-B"}]"#,
+            ),
+        );
+        let result = extract_delta_messages_from_raw(&node);
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result[0].get("role").and_then(|v| v.as_str()),
+            Some("system")
+        );
+        // array 的多个 text block 用 \n join.
+        assert_eq!(
+            result[0].get("content").and_then(|v| v.as_str()),
+            Some("SYS-A\nSYS-B")
+        );
+    }
+
+    #[test]
+    fn delta_skips_empty_anthropic_system_string() {
+        // 边界: 顶层 system 是空字符串 → (!is_empty).then 为 None → 不注入.
+        // 覆盖 1387 行的空字符串 guard.
+        let node = fixture_node(1, body_with_anthropic_system(r#""""#));
+        let result = extract_delta_messages_from_raw(&node);
+        // 空 system 不注入, result 只有切出的 user.
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].get("content").and_then(|v| v.as_str()),
+            Some("u2")
+        );
+    }
+
+    #[test]
+    fn delta_skips_non_string_non_array_anthropic_system() {
+        // 边界: 顶层 system 是 number (非 string 非 array) → None → 不注入.
+        // 覆盖 1390-1391 的 else None 分支.
+        let node = fixture_node(1, body_with_anthropic_system("42"));
+        let result = extract_delta_messages_from_raw(&node);
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].get("content").and_then(|v| v.as_str()),
+            Some("u2")
+        );
+    }
+
+    #[test]
+    fn delta_does_not_inject_system_for_non_root_node() {
+        // 非根节点 (parent=Some) 即使有顶层 system + start>0 也不注入.
+        // 覆盖 1383 行的 parent.is_none() guard.
+        let mut node = fixture_node(1, body_with_anthropic_system(r#""SYS""#));
+        node.parent = Some(Uuid::new_v4()); // 改为非根节点
+        let result = extract_delta_messages_from_raw(&node);
+        // 非根节点不注入 system, result 只有切出的 user.
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].get("content").and_then(|v| v.as_str()),
+            Some("u2")
+        );
+    }
+
+    // ─── list_page hits_only 过滤 (覆盖 993-1011 分支) ──────────────────────
+    //
+    // hits_only=true 时只返回 redactions 非空的 node. 现有测试都用空 redactions,
+    // 走不到 hits_only 过滤分支. 这里 push 一个带 redactions 的 node 触发之.
+
+    #[test]
+    fn list_page_hits_only_filters_nodes_without_redactions() {
+        let dag = ConversationDag::default();
+        // node A: 无 redactions (dummy_event 默认空).
+        let _id_a = dag.push_messages(vec![text_msg(IrRole::User, "no-hit")], dummy_event());
+        // node B: 有 redactions (模拟 secret 命中).
+        let mut event_with_hit = dummy_event();
+        event_with_hit.redactions =
+            Arc::from([("mock-value".to_string(), "secret-id".to_string())]);
+        let id_b = dag.push_messages(vec![text_msg(IrRole::User, "has-hit")], event_with_hit);
+
+        // hits_only=true: 只返回 B.
+        let (hits, total) = dag.list_page(0, 100, true);
+        assert_eq!(total, 1, "only 1 node has redactions");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, id_b);
+
+        // hits_only=false: 返回全部.
+        let (all, total_all) = dag.list_page(0, 100, false);
+        assert_eq!(total_all, 2);
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn list_page_hits_only_with_offset_clamps() {
+        // offset > total 时 clamp 到 total (覆盖 1003 行 offset.min(total)).
+        let dag = ConversationDag::default();
+        let mut event = dummy_event();
+        event.redactions = Arc::from([("m".to_string(), "s".to_string())]);
+        let _id = dag.push_messages(vec![text_msg(IrRole::User, "x")], event);
+
+        // offset=10 远超 total=1 → clamp 到 1 → 返回空页但 total=1.
+        let (views, total) = dag.list_page(10, 100, true);
+        assert_eq!(total, 1);
+        assert!(views.is_empty(), "offset clamped, page empty");
     }
 
     // ─── 两级锁并发回归 (perf: attach / update_parsed 不应阻塞全局) ───────────

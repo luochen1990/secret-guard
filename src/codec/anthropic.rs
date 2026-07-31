@@ -964,6 +964,76 @@ mod tests {
         AnthropicWriter
     }
 
+    // ─── read_tool_choice / read_stop_reason: 纯函数全分支覆盖 ──────────────
+
+    #[test]
+    fn read_tool_choice_covers_all_branches() {
+        use crate::codec::ir::IrToolChoice;
+        use serde_json::Map;
+
+        fn obj(s: &str) -> Map<String, Value> {
+            let v: Value = serde_json::from_str(s).unwrap();
+            v.as_object().unwrap().clone()
+        }
+
+        // auto.
+        let (tc, _) = read_tool_choice(&obj(r#"{"type":"auto"}"#));
+        assert_eq!(tc, Some(IrToolChoice::Auto));
+        // none.
+        let (tc, _) = read_tool_choice(&obj(r#"{"type":"none"}"#));
+        assert_eq!(tc, Some(IrToolChoice::None));
+        // any → Required.
+        let (tc, _) = read_tool_choice(&obj(r#"{"type":"any"}"#));
+        assert_eq!(tc, Some(IrToolChoice::Required));
+        // tool + name.
+        let (tc, _) = read_tool_choice(&obj(r#"{"type":"tool","name":"calc"}"#));
+        assert_eq!(
+            tc,
+            Some(IrToolChoice::Tool {
+                name: "calc".to_string()
+            })
+        );
+        // tool 但 name 空 → Required.
+        let (tc, _) = read_tool_choice(&obj(r#"{"type":"tool"}"#));
+        assert_eq!(tc, Some(IrToolChoice::Required));
+        // 未知 type → Auto.
+        let (tc, _) = read_tool_choice(&obj(r#"{"type":"weird"}"#));
+        assert_eq!(tc, Some(IrToolChoice::Auto));
+
+        // disable_parallel_tool_use 取反: false → parallel=true.
+        let (_, parallel) =
+            read_tool_choice(&obj(r#"{"type":"auto","disable_parallel_tool_use":false}"#));
+        assert_eq!(parallel, Some(true));
+        // disable_parallel_tool_use=true → parallel=false.
+        let (_, parallel) =
+            read_tool_choice(&obj(r#"{"type":"auto","disable_parallel_tool_use":true}"#));
+        assert_eq!(parallel, Some(false));
+        // 缺失 → None.
+        let (_, parallel) = read_tool_choice(&obj(r#"{"type":"auto"}"#));
+        assert_eq!(parallel, None);
+    }
+
+    #[test]
+    fn read_stop_reason_covers_all_variants() {
+        use crate::codec::ir::IrStopReason;
+        assert_eq!(read_stop_reason("end_turn"), IrStopReason::EndTurn);
+        assert_eq!(read_stop_reason("max_tokens"), IrStopReason::MaxTokens);
+        assert_eq!(
+            read_stop_reason("stop_sequence"),
+            IrStopReason::StopSequence
+        );
+        assert_eq!(read_stop_reason("tool_use"), IrStopReason::ToolUse);
+        assert_eq!(read_stop_reason("refusal"), IrStopReason::Refusal);
+        // 未知 → Other (fallback, 覆盖 default 分支).
+        assert_eq!(read_stop_reason("unknown_xyz"), IrStopReason::Other);
+    }
+
+    #[test]
+    fn reader_name_is_anthropic() {
+        // 覆盖 name() 纯函数 (31-33).
+        assert_eq!(reader().name(), "anthropic");
+    }
+
     // ─── read_request ──────────────────────────────────────────────────
 
     #[test]

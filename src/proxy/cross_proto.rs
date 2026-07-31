@@ -354,3 +354,35 @@ fn http_status_to_error_kind(status: u16) -> &'static str {
         _ => "internal_error",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::http_status_to_error_kind;
+
+    /// 覆盖所有 match 分支, 确保 status → kind 映射完整且稳定.
+    /// (错误 kind 字符串暴露给客户端 envelope, 改动属契约性变更, 测试守卫之.)
+    #[test]
+    fn http_status_to_error_kind_covers_all_branches() {
+        let cases: &[(u16, &str)] = &[
+            (400, "invalid_request_error"),
+            (401, "authentication_error"),
+            (403, "permission_denied"),
+            (404, "not_found_error"),
+            (429, "rate_limit_error"),
+            (500, "api_error"),
+            (502, "api_error"),
+            (599, "api_error"),
+            // fallthrough 分支: 未在表中列出的 status 统一归为 internal_error.
+            (200, "internal_error"),
+            (302, "internal_error"),
+            (600, "internal_error"),
+        ];
+        for (status, expected) in cases {
+            assert_eq!(
+                http_status_to_error_kind(*status),
+                *expected,
+                "status {status}"
+            );
+        }
+    }
+}

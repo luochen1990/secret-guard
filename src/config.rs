@@ -974,6 +974,69 @@ mod tests {
             }
         }
     }
+
+    // ─── DynamicTable Debug impl (覆盖手动 impl, 不泄漏内部锁) ──────────────
+
+    #[test]
+    fn dynamic_table_debug_shows_counts_not_internals() {
+        // Debug impl 手写 (非 derive), 只暴露 entry_type / static_count / dynamic_count /
+        // state_path, 避免把 RwLock<HashMap> 的内部结构 dump 出来 (噪音 + 可能泄漏 value).
+        // 本测试守卫: Debug 输出含关键字段且不含 entry 明文.
+        // 注: mod proptests 有类似的 provider(id, base_url) helper, 但跨 mod 不可见,
+        // 此处为 local copy (api_key 空串适配 Debug 测试, 不关心鉴权字段).
+        use crate::provider::Protocol;
+        use crate::provider::{Provider, ProviderTable};
+
+        fn make_provider(id: &str) -> Provider {
+            Provider {
+                id: id.to_string(),
+                name: Some(format!("name-{id}")),
+                protocol: Protocol::OpenAI,
+                base_url: "http://up".to_string(),
+                api_key: String::new(),
+                api_key_file: None,
+                enabled: true,
+            }
+        }
+
+        let decisions = Arc::new(RwLock::new(Decisions::default()));
+        let table: ProviderTable = DynamicTable::new(
+            vec![make_provider("s1")],
+            vec![make_provider("d1")],
+            decisions,
+            PathBuf::from("/tmp/test-state.toml"),
+        );
+        let s = format!("{table:?}");
+        // 关键字段出现.
+        assert!(s.contains("Provider"), "missing entry_type: {s}");
+        assert!(s.contains("static_count"), "missing static_count: {s}");
+        assert!(s.contains("dynamic_count"), "missing dynamic_count: {s}");
+        // 明文 entry id 不应出现在 Debug 输出中 (只有 count).
+        assert!(!s.contains("s1"), "Debug leaked static entry id: {s}");
+        assert!(!s.contains("d1"), "Debug leaked dynamic entry id: {s}");
+    }
+
+    // ─── Config::to_toml / load_or_default 辅助路径 ─────────────────────────
+
+    #[test]
+    fn config_to_toml_serializes_default_without_error() {
+        // to_toml 对默认配置应成功 (覆盖 to_toml 的 Ok 路径).
+        // 不做完整 round-trip 断言 (默认 Config 字段多, 逐字段比对脆弱),
+        // 只验证序列化不报错 + 输出非空.
+        let cfg = Config::default();
+        let toml = cfg.to_toml().expect("default config serializes");
+        assert!(!toml.is_empty(), "serialized config should be non-empty");
+    }
+
+    #[test]
+    fn load_or_default_returns_default_when_file_missing() {
+        // 文件不存在 → warn + 返回默认 Config (覆盖 161-166 的早退分支).
+        // 用不存在的路径触发; 断言返回的是默认配置 (providers/secrets 为空).
+        let path = PathBuf::from("/tmp/opencode/nonexistent-config-does-not-exist.toml");
+        let cfg = Config::load_or_default(&path).expect("missing file → default, not error");
+        assert!(cfg.providers.is_empty(), "default has no providers");
+        assert!(cfg.secrets.entries.is_empty(), "default has no secrets");
+    }
 }
 
 // ─── DynamicTable<T> 通用行为测试 ──────────────────────────────────────────

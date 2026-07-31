@@ -870,6 +870,50 @@ mod tests {
     }
 
     #[test]
+    fn feed_skips_frames_without_data_line() {
+        // SSE 帧无 data: 行 (event-only / 注释) → parse_sse_frame 返回 None → continue.
+        // 覆盖 152-153 分支. 混入一个有效帧确认 continue 后仍正常处理后续帧.
+        let mut t = StreamTranslate::new(Protocol::Anthropic, Protocol::OpenAI).unwrap();
+        let input = b"event: ping\n\ndata: {\"id\":\"x\",\"created\":0,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"},\"finish_reason\":null}]}\n\n";
+        let out = t.feed(input);
+        let s = String::from_utf8_lossy(&out);
+        // event-only 帧被跳过, 有效帧产出 text_delta.
+        assert!(
+            s.contains("text_delta"),
+            "valid frame after skipped frame: {s}"
+        );
+    }
+
+    #[test]
+    fn feed_skips_done_sentinel_and_empty_data() {
+        // data: [DONE] 和空 data → continue (不携带 IR).
+        // 覆盖 155-156 分支.
+        let mut t = StreamTranslate::new(Protocol::Anthropic, Protocol::OpenAI).unwrap();
+        let valid = b"data: {\"id\":\"x\",\"created\":0,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"},\"finish_reason\":null}]}\n\n";
+        let input = b"data: [DONE]\n\ndata: \n\n";
+        // 先喂有效帧建立 translator 状态, 再喂 [DONE] + 空 data (应被跳过, 不报错).
+        let _ = t.feed(valid);
+        let out = t.feed(input);
+        // [DONE] 和空 data 不产出任何 SSE (跳过), out 应为空.
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            !s.contains("text_delta") && !s.contains("error"),
+            "[DONE] / empty data should be silently skipped: {s}"
+        );
+    }
+
+    #[test]
+    fn feed_skips_non_json_data() {
+        // data: 非 JSON 内容 → serde_json::from_str 失败 → continue.
+        // 覆盖 158-159 分支 (恶意/损坏 SSE).
+        let mut t = StreamTranslate::new(Protocol::Anthropic, Protocol::OpenAI).unwrap();
+        let input = b"data: this is not json\n\ndata: {also not json}\n\n";
+        let out = t.feed(input);
+        // 非 JSON 被跳过, 不产出 SSE, 不 panic.
+        assert!(out.is_empty(), "non-JSON data should be skipped: {:?}", out);
+    }
+
+    #[test]
     fn translate_handles_crlf_sse_frames() {
         // CRLF 风格的 SSE (部分 CDN 用).
         let mut t = StreamTranslate::new(Protocol::Anthropic, Protocol::OpenAI).unwrap();

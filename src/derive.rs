@@ -476,6 +476,50 @@ mod tests {
     }
 
     #[test]
+    fn ir_entry_covers_system_role_branch() {
+        // extract_preview_and_model_from_ir 的 match m.role 的 System 分支 (126 行).
+        // OpenAI reader 把 role=system 提升到 IrRequest.system (不在 ir.messages), 故从
+        // wire parse 的 IR 走不到 System role 分支. 手工构造 IR 直接覆盖.
+        //
+        // 单独构造只有 System+Text 的 IR (无 user/tool), preview 回退到最后一条有文本的
+        // message = System, 从而独立守卫 System 候选的收集 + 字符串映射.
+        use crate::codec::ir::{IrBlock, IrMessage, IrRequest, IrRole};
+        let ir = IrRequest {
+            model: "m".to_string(),
+            messages: vec![IrMessage {
+                role: IrRole::System,
+                content: vec![IrBlock::Text {
+                    text: "sys-only-msg".to_string(),
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let (preview, _) = extract_preview_and_model_from_ir(&ir);
+        assert_eq!(preview.as_deref(), Some("sys-only-msg"));
+    }
+
+    #[test]
+    fn ir_entry_covers_tool_role_branch() {
+        // Tool role 分支 (129 行). 同理手工构造 IR (wire parse 的 tool content 变成
+        // ToolResult block 非 Text). 单独构造 Tool+Text, 守卫 Tool 候选收集.
+        use crate::codec::ir::{IrBlock, IrMessage, IrRequest, IrRole};
+        let ir = IrRequest {
+            model: "m".to_string(),
+            messages: vec![IrMessage {
+                role: IrRole::Tool,
+                content: vec![IrBlock::Text {
+                    text: "tool-only-msg".to_string(),
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let (preview, _) = extract_preview_and_model_from_ir(&ir);
+        assert_eq!(preview.as_deref(), Some("tool-only-msg"));
+    }
+
+    #[test]
     fn extract_preview_not_starting_with_brace_returns_none() {
         // 快速路径: 不以 { 开头直接跳过 (catches GET / DELETE 等无 body 场景).
         let (preview, model) = extract_preview_and_model("plain text");

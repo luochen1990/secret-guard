@@ -1112,6 +1112,26 @@ mod tests {
     }
 
     #[test]
+    fn redaction_map_lookup_misses_return_none() {
+        // mock_for / real_for 的 miss 路径 (key 不存在 → None). 现有测试都用 .unwrap(),
+        // 未覆盖 None 分支. 这两个是 pub 查询接口, miss 必须返回 None 而非 panic.
+        let mut ir = sample_ir_with_text("my key is sk-test-123 ok");
+        let secrets = vec![entry("sk-test-123")];
+        let (map, _) = redact_ir(&mut ir, &secrets);
+        // 命中.
+        assert!(map.mock_for("sk-test-123").is_some());
+        // miss: 未 redact 过的 real.
+        assert!(map.mock_for("never-redacted").is_none());
+        // miss: 空字符串.
+        assert!(map.mock_for("").is_none());
+        // real_for miss: 任意非 mock 字符串.
+        let real_mock = map.mock_for("sk-test-123").unwrap();
+        assert!(map.real_for(real_mock).is_some());
+        assert!(map.real_for("not-a-mock-value").is_none());
+        assert!(map.real_for("").is_none());
+    }
+
+    #[test]
     fn redact_ir_replaces_secret_in_tool_use_input() {
         use serde_json::json;
         let mut ir = IrRequest {
