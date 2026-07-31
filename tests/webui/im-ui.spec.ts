@@ -357,21 +357,30 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     await page.waitForSelector("#detail .tl-round", { timeout: 3000 });
     await page.waitForTimeout(300);
 
-    const scrollInfo = await page.locator("#detail").evaluate(
-      (el) => ({
-        scrollTop: el.scrollTop,
-        scrollHeight: el.scrollHeight,
-        clientHeight: el.clientHeight,
-      })
-    );
-    if (scrollInfo.scrollHeight <= scrollInfo.clientHeight) {
+    // 距 "内容底部" (末轮 .tl-round 底部) 的距离. 用 contentEnd 而非 scrollHeight:
+    // #detail 末尾的 .drawer-placeholder 是给手动滚动 phase 4 的缓冲区 (长内容时高 =
+    // extremeMaxH = 80% wrapH), 不计入 "内容". scrollTimelineToBottomForce 的契约是滚到
+    // contentEnd (末轮紧贴视口底), 不滚入 placeholder (否则 placeholder 进入视口 → drawer
+    // 段 B 扩展到 80% 遮挡末轮, WebUI bug #3). 与实现 isNearBottom / UI-6 系列测试的
+    // distFromBottom 基准一致 (见下文 UI-6 describe 块内同名 helper).
+    const { contentEnd, scrollTop, clientHeight } = await page
+      .locator("#detail")
+      .evaluate((el) => {
+        const rounds = el.querySelectorAll(":scope > .tl-round");
+        let end = el.scrollHeight; // fallback: 无 round 时用 scrollHeight.
+        if (rounds.length > 0) {
+          const last = rounds[rounds.length - 1] as HTMLElement;
+          end = last.offsetTop + last.offsetHeight;
+        }
+        return { contentEnd: end, scrollTop: el.scrollTop, clientHeight: el.clientHeight };
+      });
+    if (contentEnd <= clientHeight) {
       test.skip(true, "content fits viewport");
       return;
     }
 
-    // 距底部应该 < 20px (选中会话 = IM 风格滚到最新一轮).
-    const distanceToBottom =
-      scrollInfo.scrollHeight - scrollInfo.scrollTop - scrollInfo.clientHeight;
+    // 距末轮底部应该 < 20px (选中会话 = IM 风格滚到最新一轮, 不滚入 placeholder 缓冲).
+    const distanceToBottom = contentEnd - scrollTop - clientHeight;
     expect(distanceToBottom).toBeLessThan(20);
   });
 
