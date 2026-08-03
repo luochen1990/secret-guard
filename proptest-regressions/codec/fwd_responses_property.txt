@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e61b74063458666a4e2ff31c8146f347ca0140c55230904d877c6ebd600a8b34 # shrinks to v = Object {"input": Array [Object {"content": Array [Object {"text": String(""), "type": String("input_text")}], "role": String("assistant"), "type": String("message")}], "model": String("gpt-4o")}
+cc 1c113617d6aa17505464183c783c71e8588c83c100d0ed3c81f2ff4f659e96f3 # shrinks to v = Object {"input": Array [Object {"content": Array [Object {"text": String("0"), "type": String("output_text")}, Object {"text": String("a"), "type": String("output_text")}], "role": String("assistant"), "type": String("message")}], "model": String("gpt-4o")}
+cc efe661148c7eac65304ffcf175189beaf46b5e91d069ea781e09767e09ece7c3 # shrinks to v = Object {"input": Array [Object {"content": Array [Object {"text": String("0"), "type": String("input_text")}], "role": String("user"), "type": String("message")}], "model": String("gpt-4o"), "tool_choice": String("auto")}

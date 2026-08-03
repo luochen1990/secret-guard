@@ -12,8 +12,12 @@
 ## 支持矩阵
 
 - ✅ OpenAI Chat Completions ⇄ Anthropic Messages 双向 (非流式 + 流式 SSE).
-- ❌ 不在 MVP: Bedrock / Gemini / Cohere, reasoning/thinking, citations, logprobs,
-  prompt caching, Bedrock eventstream 二进制流.
+- ✅ OpenAI Responses API 同协议透传 + Redact (非流式; 流式 + Redact 返回 501).
+- ✅ OpenAI Responses ⇄ OpenAI Chat Completions 跨协议翻译 (非流式).
+- ❌ Responses ⇄ Anthropic 跨协议: 未实现 (返回 501).
+- ❌ Responses 流式 SSE 事件翻译 (`read_response_events` / `write_response_event` 返回空/None).
+- ❌ 不在 MVP: Bedrock / Gemini / Cohere, reasoning `encrypted_content` (provider-specific opaque),
+  Anthropic `thinking` blocks, citations, logprobs, prompt caching, Bedrock eventstream 二进制流.
 
 ## 核心抽象
 
@@ -24,7 +28,7 @@
 | `Writer` trait | `mod.rs` | IR → wire (`write_request` / `write_response` / `write_response_event` / `requires_max_tokens` / `emits_sse_done_terminator` / `write_error`) |
 | `StreamTranslate` | `stream.rs` | egress SSE → IR 事件流 → ingress SSE (chunk-boundary 处理 + 跨协议翻译 + 同协议 restore 两种模式) |
 | `StreamScan` | `stream.rs` | 流式 SSE → IrResponse 累积器 (供 WebUI parsed view) |
-| `Protocol` enum | `mod.rs` | codec 当前支持的协议子集 (OpenAI/Anthropic); `from_native` 是 Gemini/Ollama → None 的单一接入点 |
+| `Protocol` enum | `mod.rs` | codec 当前支持的协议子集 (OpenAI/Anthropic/Responses); `from_native` 是 Gemini/Ollama → None 的单一接入点 |
 
 ## 子模块
 
@@ -36,6 +40,7 @@
 - `openai.rs` — OpenAI Chat Completions 的 Reader/Writer (含流式 fan-out,
   flat stream 一个 chunk 可能产生 0..n 个 IR 事件, 需 state 合成).
 - `anthropic.rs` — Anthropic Messages 的 Reader/Writer (流式 1:1 映射).
+- `responses.rs` — OpenAI Responses API 的 Reader/Writer (非流式; 流式 SSE 事件翻译未实现).
 - `stream.rs` — SSE chunk-boundary 处理 (TCP 切片兼容, CRLF/LF 双兼容, MAX_BUF 溢出 abort).
 
 ## wire fidelity (wire 形态元数据)

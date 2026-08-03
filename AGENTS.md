@@ -207,18 +207,19 @@ URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标
 |---|---|
 | `/` | Web UI (主入口) |
 | `/__sg`, `/__sg/*` | Web UI + JSON API (向后兼容旧入口) |
-| `/{o\|a\|g\|l}/{name}` | forward, rest = "/" |
-| `/{o\|a\|g\|l}/{name}/{*rest}` | forward, rest 含前导 `/` |
+| `/{o\|a\|g\|l\|r}/{name}` | forward, rest = "/" |
+| `/{o\|a\|g\|l\|r}/{name}/{*rest}` | forward, rest 含前导 `/` |
 | 其他 | 404 (不再 catch-all 透传) |
 
 `proto_short` 简写映射 (单一事实来源: `Protocol::ALL`):
-- `o` = OpenAI, `a` = Anthropic, `g` = Gemini, `l` = oLLama
+- `o` = OpenAI (Chat Completions), `a` = Anthropic, `g` = Gemini, `l` = oLLama, `r` = Responses (OpenAI Responses API)
 
 错误语义:
 - 未知 protocol 简写 → 404 `not_found`
 - 未知 provider id → 404 `not_found`
 - 禁用 provider (`enabled = false`) → 503 `unavailable`
 - 跨协议 + `stream=true` → 501 (流式跨协议翻译尚未接入 dispatch)
+- **Responses + Redact + `stream=true`** → 501 (Responses 流式 SSE 事件翻译未实现; 见 "已知限制")
 - Gemini/Ollama 跨协议 → 501 (codec 未覆盖)
 
 详尽的 dispatch 路径选择 (同协议透传 / IR 路径 / 跨协议翻译) 与 fan_out 三路径见
@@ -243,7 +244,7 @@ URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标
 | `record.rs` | ForwardRecord (web 层 DTO, GET /records/{id} 响应 shape) | 文件头部 `//!` |
 | `redact.rs` | RedactionMap + redact/restore pipeline + 形式化契约 C1-C6 | 文件头部 `//!` |
 | `util.rs` | 集中的哈希工具 (`hash64` SipHash 单值入口) | 文件头部 `//!` |
-| `codec/` | 跨协议 IR + Reader/Writer trait + StreamTranslate | **`src/codec/AGENTS.md`** |
+| `codec/` | 跨协议 IR + Reader/Writer trait + StreamTranslate (OpenAI / Anthropic / Responses) | **`src/codec/AGENTS.md`** |
 | `proxy/` | dispatch 路径选择 + fan_out 三路径 + Provider 鉴权 (拆分为 mod/helpers/auth/record/same_proto/cross_proto/fan_out 子模块) | `src/proxy/mod.rs` 头部 `//!` |
 | `web/` | JSON API (`api.rs`) + 响应 DTO (`dto.rs`: SessionView/NodeView/.../SyncSnapshot) + 单页 WebUI | **`src/web/AGENTS.md`** |
 | `server.rs` | router 装配 + 双层状态注入 + graceful shutdown | 文件头部 `//!` |
@@ -444,6 +445,16 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
 
 ## 已知限制 (MVP)
 
+- **OpenAI Responses API 支持范围**: Responses 协议 (`/r/` proto_short) 已接入 codec,
+  支持 Responses ⇄ Chat Completions 跨协议翻译 (非流式) + Responses 同协议透传 + Redact (非流式).
+  **不支持**: Responses 流式 SSE 事件翻译 (Responses + Redact + `stream=true` 返回 501;
+  无 Redact 的同协议流式透传正常工作); Responses ⇄ Anthropic 跨协议 (返回 501);
+  hosted tools (web_search/file_search/computer_use/mcp → 静默丢弃); namespace tools
+  flattening; `previous_response_id` 服务端状态 (secret-guard 是 stateless 代理);
+  reasoning items 的 `encrypted_content` (同协议 round-trip 也会丢失, 会破坏 reasoning chain).
+- **Responses 协议的 timeline delta 为空**: Responses ingress 的 `req_body_raw` 用 `input[]`
+  (而非 `messages[]`), `extract_delta_messages_from_raw` 找不到 messages 字段, 返回空 Vec.
+  WebUI timeline 仍能显示 preview / role, 但不渲染增量气泡 (与跨协议 ingress 的 delta 限制一致).
 - **跨协议 + 流式响应**: OpenAI ⇄ Anthropic 跨协议时 `stream=true` 返回 501
   (StreamTranslate 已实现跨协议翻译, 但尚未接入 dispatch; 迁移计划见 "后续工作").
 - **C5 是实质确定性契约**: Auto 模式 mock 不含 real_secret ≥`k(L)` 字符子串

@@ -59,6 +59,13 @@ pub enum Protocol {
     Anthropic,
     Gemini,
     Ollama,
+    /// OpenAI Responses API (`POST /v1/responses`).
+    ///
+    /// 与 [`Self::OpenAI`] (Chat Completions) 是同一供应商的两套不同 wire 协议,
+    /// 字段结构差异显著 (input/instructions vs messages, output items vs choices,
+    /// typed SSE events vs flat chunks), 故独立为一个 protocol 变体.
+    /// proto_short = `r` (Responses).
+    OpenAIResponses,
 }
 
 impl std::fmt::Display for Protocol {
@@ -69,12 +76,13 @@ impl std::fmt::Display for Protocol {
 
 impl Protocol {
     /// 所有变体 + 完整名 (serde 名) + URL 单字母简写. 单一事实来源.
-    /// 简写映射: o=OpenAI, a=Anthropic, g=Gemini, l=oLLama.
-    pub const ALL: [(Self, &'static str, &'static str); 4] = [
+    /// 简写映射: o=OpenAI, a=Anthropic, g=Gemini, l=oLLama, r=Responses.
+    pub const ALL: [(Self, &'static str, &'static str); 5] = [
         (Self::OpenAI, "openai", "o"),
         (Self::Anthropic, "anthropic", "a"),
         (Self::Gemini, "gemini", "g"),
         (Self::Ollama, "ollama", "l"),
+        (Self::OpenAIResponses, "openairesponses", "r"),
     ];
 
     pub fn short(self) -> &'static str {

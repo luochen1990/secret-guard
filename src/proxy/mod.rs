@@ -193,7 +193,7 @@ async fn dispatch(
     // 1. 解析 ingress 协议.
     let ingress = Protocol::from_short(&fp.proto).ok_or_else(|| {
         AppError::NotFound(format!(
-            "unknown protocol '/{}' (expected one of: o/a/g/l)",
+            "unknown protocol '/{}' (expected one of: o/a/g/l/r)",
             fp.proto
         ))
     })?;

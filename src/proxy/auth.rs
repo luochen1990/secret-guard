@@ -31,7 +31,7 @@ pub(super) fn apply_provider_auth(headers: &mut HeaderMap, api_key: &str, ingres
     // 目标 header 名 + 客户端可能误传的竞争 header 名 (统一剥离) + value 构造.
     // OpenAI/Ollama 用 `Bearer <key>` 格式; Anthropic/Gemini 用裸 key.
     let (target, competitors, value_str): (&'static str, &[&'static str], String) = match ingress {
-        Protocol::OpenAI | Protocol::Ollama => (
+        Protocol::OpenAI | Protocol::Ollama | Protocol::OpenAIResponses => (
             "authorization",
             &["x-api-key", "x-goog-api-key"][..],
             format!("Bearer {key}"),

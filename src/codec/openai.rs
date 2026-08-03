@@ -19,7 +19,8 @@ use super::ir::{ContentForm, StopForm};
 use super::{
     IrBlock, IrBlockMeta, IrDelta, IrError, IrImageSource, IrMessage, IrRequest, IrResponse,
     IrRole, IrStopReason, IrStreamEvent, IrTool, IrToolChoice, IrUsage, Reader, Writer,
-    collect_extra, ir::StreamDecodeState, random_base62,
+    blocks_to_text, collect_extra, current_epoch, input_to_string, ir::StreamDecodeState,
+    random_base62,
 };
 
 // ─── Reader ────────────────────────────────────────────────────────────────
@@ -391,6 +392,10 @@ impl Writer for OpenAiWriter {
                 }
                 IrBlock::Image { .. } => {
                     // assistant 一般不发图片, 跳过 (lossy-by-target).
+                }
+                IrBlock::Reasoning { .. } => {
+                    // OpenAI Chat 协议无 reasoning item 的标准对应 (有非标 reasoning_content, 但结构不同).
+                    // 跨协议翻译时静默丢弃 (lossy-by-target); 同协议路径不会到达 Chat writer.
                 }
             }
         }
@@ -947,20 +952,6 @@ fn process_tool_call_delta(
 
 // ─── Helpers: write ────────────────────────────────────────────────────────
 
-/// 把 blocks 折叠成单个文本 string (用于 system 消息, OpenAI 不支持 array 形式的 system).
-fn blocks_to_text(blocks: &[IrBlock]) -> String {
-    let mut s = String::new();
-    for b in blocks {
-        if let IrBlock::Text { text } = b {
-            if !s.is_empty() {
-                s.push('\n');
-            }
-            s.push_str(text);
-        }
-    }
-    s
-}
-
 /// IR 消息 → OpenAI wire 消息 (含 tool 消息的特殊处理).
 fn write_message(msg: &IrMessage) -> Value {
     match msg.role {
@@ -1107,20 +1098,8 @@ fn write_user_block(b: &IrBlock) -> Option<Value> {
             }))
         }
         IrBlock::ToolUse { .. } => None, // user 消息里通常没有 ToolUse
+        IrBlock::Reasoning { .. } => None, // user 消息里通常没有 Reasoning
     }
-}
-
-/// IR ToolUse 的 input Value → OpenAI function.arguments 字符串.
-///
-/// OpenAI 的 arguments 字段是 **JSON 字符串** (而非裸 JSON 值), writer 必须序列化.
-/// - Value::Null → "null" (之前 bug: 返回空字符串, 破坏 round-trip)
-/// - Value::String(s) → 序列化为 JSON string literal (含引号 + 转义)
-///
-/// 注: 这与 reader 不对称 — reader 把 arguments 当 JSON 字符串解析为 Value,
-///     writer 应反向把 Value 序列化为 JSON 字符串. 之前的 String(s.clone()) 是 bug:
-///     它假设 input 已是去引号的字符串, 但 reader 实际把 input 解析成了 Value.
-fn input_to_string(input: &Value) -> String {
-    serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string())
 }
 
 /// 写 tool 定义.
@@ -1163,14 +1142,6 @@ fn write_stop_reason(reason: Option<IrStopReason>) -> Value {
 /// 合成 OpenAI 格式的 id (若上游没有携带).
 fn synth_id() -> String {
     format!("chatcmpl-{}", random_base62(24))
-}
-
-/// 当前 Unix epoch seconds.
-fn current_epoch() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────────

@@ -92,6 +92,11 @@ fn hash_block(block: &IrBlock) -> BlockHash {
                 url.hash(&mut h);
             }
         },
+        IrBlock::Reasoning { summary } => {
+            for s in summary {
+                s.hash(&mut h);
+            }
+        }
     }
     h.finish()
 }

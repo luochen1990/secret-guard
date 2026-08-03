@@ -1,12 +1,13 @@
-//! 跨协议 codec: 在 OpenAI Chat Completions 与 Anthropic Messages 之间双向翻译.
+//! 跨协议 codec: 在 OpenAI Chat Completions / Anthropic Messages / OpenAI Responses 之间双向翻译.
 //!
 //! # 设计哲学
 //!
 //! 借鉴 Busbar (`GetBusbar/busbar` Apache-2.0) 的 superset IR + Reader/Writer trait 设计,
 //! 但大幅精简以匹配 secret-guard 的 MVP 范围:
-//! - 只覆盖 **OpenAI ⇄ Anthropic** 两个 protocol (无 Bedrock/Gemini/Cohere).
-//! - 只覆盖 **chat completion** 操作 (无 embeddings/moderation/rerank).
-//! - **不做** reasoning/thinking 转换 (Anthropic thinking / OpenAI reasoning_content).
+//! - 覆盖 **OpenAI ⇄ Anthropic** 双向 (chat completion 范围).
+//! - 覆盖 **OpenAI Responses ⇄ OpenAI Chat** 单向 (request 方向, 响应方向也翻译).
+//! - **Responses ⇄ Anthropic** 跨协议翻译: 未实现 (返回 501).
+//! - 不覆盖 embeddings/moderation/rerank.
 //! - **不做** prompt caching / citations / logprobs.
 //! - **不做** Bedrock eventstream 二进制流.
 //!
@@ -22,18 +23,22 @@
 //! - [`ir`]         —— 协议无关 IR 类型 (IrRequest / IrResponse / IrStreamEvent 等)
 //! - [`openai`]     —— OpenAI Chat Completions 的 Reader / Writer
 //! - [`anthropic`]  —— Anthropic Messages 的 Reader / Writer
+//! - [`responses`]  —— OpenAI Responses API 的 Reader / Writer
 //! - [`stream`]     —— SSE 流式响应的 chunk-boundary 处理 (StreamTranslate)
 
 pub mod anthropic;
 pub mod ir;
 pub mod normalize;
 pub mod openai;
+pub mod responses;
 pub mod stream;
 
 #[cfg(test)]
 mod fwd_cross_proto_property;
 #[cfg(test)]
 mod fwd_property;
+#[cfg(test)]
+mod fwd_responses_property;
 #[cfg(test)]
 mod fwd_streaming_property;
 
@@ -55,6 +60,8 @@ pub use ir::{
 pub enum Protocol {
     OpenAI,
     Anthropic,
+    /// OpenAI Responses API. 与 [`Self::OpenAI`] (Chat Completions) 字段结构差异显著.
+    OpenAIResponses,
 }
 
 impl Protocol {
@@ -64,6 +71,7 @@ impl Protocol {
         match p {
             NativeProtocol::OpenAI => Some(Self::OpenAI),
             NativeProtocol::Anthropic => Some(Self::Anthropic),
+            NativeProtocol::OpenAIResponses => Some(Self::OpenAIResponses),
             _ => None,
         }
     }
@@ -73,6 +81,7 @@ impl Protocol {
         match self {
             Self::OpenAI => Box::new(openai::OpenAiReader),
             Self::Anthropic => Box::new(anthropic::AnthropicReader),
+            Self::OpenAIResponses => Box::new(responses::ResponsesReader),
         }
     }
 
@@ -81,6 +90,7 @@ impl Protocol {
         match self {
             Self::OpenAI => Box::new(openai::OpenAiWriter),
             Self::Anthropic => Box::new(anthropic::AnthropicWriter),
+            Self::OpenAIResponses => Box::new(responses::ResponsesWriter),
         }
     }
 }
@@ -170,7 +180,7 @@ pub(super) fn collect_extra(
 }
 
 /// 生成 n 字符的 base62 随机串 (LCG, 非密码学安全).
-/// 仅用于合成 id (chatcmpl-... / msg_01...), 不需要密码学强度.
+/// 仅用于合成 id (chatcmpl-... / msg_01... / resp_...), 不需要密码学强度.
 pub(super) fn random_base62(n: usize) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     const CHARS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -186,4 +196,41 @@ pub(super) fn random_base62(n: usize) -> String {
         buf.push(CHARS[((seed >> 32) % 62) as usize] as char);
     }
     buf
+}
+
+/// 当前 Unix epoch seconds (用于 OpenAI/Responses wire 的 created / created_at 字段).
+/// 共享 helper, 避免 openai.rs / responses.rs 各定义一份.
+pub(super) fn current_epoch() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 把 blocks 中的 Text 块用 '\n' join 成单个字符串 (用于 system prompt 折叠).
+/// 共享 helper, 避免 openai.rs / responses.rs 各定义一份.
+pub(super) fn blocks_to_text(blocks: &[ir::IrBlock]) -> String {
+    blocks
+        .iter()
+        .filter_map(|b| match b {
+            ir::IrBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// IR ToolUse 的 input Value → function.arguments 字符串.
+///
+/// OpenAI Chat 与 Responses 的 arguments 字段都是 **JSON 字符串** (而非裸 JSON 值),
+/// writer 必须序列化:
+/// - `Value::Null` → `"null"` (历史 bug: 返回空字符串, 破坏 round-trip)
+/// - `Value::String(s)` → JSON string literal `"\"s\""` (含引号 + 转义)
+///
+/// 注: 这与 reader 不对称 — reader 把 arguments 当 JSON 字符串 parse 为 Value,
+///     writer 反向把 Value 序列化为 JSON 字符串. 之前的 `String(s.clone())` 是 bug
+///     (假设 input 已是去引号字符串). 见 commit ccb8769 (IR wire fidelity).
+pub(super) fn input_to_string(input: &Value) -> String {
+    serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string())
 }

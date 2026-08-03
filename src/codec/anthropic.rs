@@ -885,6 +885,11 @@ fn write_block(b: &IrBlock) -> Option<Value> {
             };
             Some(json!({"type": "image", "source": src}))
         }
+        IrBlock::Reasoning { .. } => {
+            // Anthropic Messages 协议无 reasoning item 的直接对应 (有 thinking blocks, 但结构不同).
+            // 跨协议翻译时静默丢弃 (lossy-by-target); 同协议路径不会到达 Anthropic writer.
+            None
+        }
     }
 }
 

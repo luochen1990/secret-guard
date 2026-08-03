@@ -75,6 +75,18 @@ pub(crate) async fn same_proto_forward(
     // 1-2. 解析请求 body → IR (共享 helper).
     let mut ir = parse_request_ir(&req_bytes, ingress, reader.as_ref())?;
 
+    // Responses 协议 + Redact + 流式: 当前 codec 的 read_response_events 未实现
+    // (Responses 流式 SSE 事件翻译是 MVP 范围外). 若放行会静默产生空流.
+    // 显式返回 501, 与跨协议流式一致.
+    if ir.stream && ingress == Protocol::OpenAIResponses {
+        return Err(AppError::NotImplemented(format!(
+            "streaming + redact for {} protocol is not yet supported (Responses SSE event \
+             translation unimplemented); either disable stream=true in the client request \
+             or remove secrets from this provider's config",
+            ingress.name()
+        )));
+    }
+
     // 3. 快照真实 messages (redact 前) 给 DAG (DAG 存 OriginRecord 视角真实内容,
     //    WebUI 查询时 lazy apply redactMap).
     let real_messages = ir.messages.clone();

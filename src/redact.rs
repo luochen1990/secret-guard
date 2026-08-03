@@ -557,6 +557,11 @@ impl StringLeafOps for IrBlock {
                     f(u);
                 }
             }
+            IrBlock::Reasoning { summary } => {
+                for s in summary {
+                    f(s);
+                }
+            }
         }
     }
 
@@ -581,6 +586,11 @@ impl StringLeafOps for IrBlock {
             IrBlock::Image { source } => {
                 if let crate::codec::ir::IrImageSource::Url(u) = source {
                     f(u);
+                }
+            }
+            IrBlock::Reasoning { summary } => {
+                for s in summary {
+                    f(s);
                 }
             }
         }

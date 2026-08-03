@@ -205,6 +205,13 @@ pub enum IrBlock {
     },
     /// 图片块. 跨协议唯一无歧义形式是 Base64; URL 引用也保留.
     Image { source: IrImageSource },
+    /// 推理块 (Responses API 的 `reasoning` output item).
+    ///
+    /// 仅承载 `summary` 文本数组 (可被 Redact 扫描是否有 secret 子串).
+    /// `encrypted_content` 是 provider-specific opaque blob, **当前实现不保留**
+    /// (同协议 round-trip 也会丢失); 这会破坏依赖 reasoning chain 的链式调用
+    /// (如 `previous_response_id` + reasoning context compression). 这是已知限制.
+    Reasoning { summary: Vec<String> },
 }
 
 /// 图片来源 (跨协议中立的图片表达).
