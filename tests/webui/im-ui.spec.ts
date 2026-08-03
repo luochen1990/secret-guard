@@ -943,6 +943,10 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
   test("drawer phase 3 holds maxH before content enters drawer zone", async ({ page }) => {
     // bug #1 回归: 向下滚, 气泡滚出顶部后 drawer 应保持 maxH (40%),
     // 直到末轮底部真正进入抽屉遮挡区域才开始 phase 4 渐进扩展.
+    //
+    // 注: 本测试只对长内容有意义 (contentEnd > wrapH 才能真正滚出顶). UI-6 闭合不变量
+    // 修复后, 短内容场景的 placeholder 行为有变化 (follow 路径撑 placeholder), 故显式
+    // skip 短内容 (与 UI-6 其它 pinned 测试一致用 contentScrollRange 作 skip 条件).
     const reply = "This is a long response for testing the typing box. ".repeat(15);
     const sys = "You are a coding assistant. ".repeat(5);
     // 3 轮长内容会话
@@ -952,6 +956,9 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     const leaf = await findSessionLeafByPreview(page, "phase3-hold-marker");
     await clickSessionByLeaf(page, leaf);
     await page.waitForTimeout(500);
+    // 短内容 (bubble 折叠后 contentEnd ≤ wrapH) 跳过: phase 3 的 drawer 行为只在长内容下有意义.
+    const scrollRange = await contentScrollRange(page);
+    test.skip(scrollRange <= 200, "content too short (bubble collapsed) to test phase 3");
     // 选中 round 1 (最靠上, 向下滚能把它推出视口)
     const round1 = page.locator("#detail .tl-round").first();
     await round1.locator(".tl-round-header").click();
@@ -1672,6 +1679,143 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
 
     // follow 时 .pinned 类移除.
     await expect(page.locator("#response-drawer"), "回到 follow 时 .pinned 应移除").not.toHaveClass(/pinned/);
+  });
+
+  // ─── UI-6 follow 闭合不变量 (prop_follow_invariant_under_new_round) ──
+  // 守卫 follow 状态在新 round 插入下不被翻转 + 末轮不被 drawer 遮挡.
+  // 与 prop_follow_new_round_auto_scroll 互补: 后者只断言长内容稳态结果,
+  // 本组覆盖短内容历史 bug 路径 (placeholder=0 → maxScroll clamp → 末轮被遮挡).
+  // 契约详尽定义 + 多维断言语义见 contracts.md UI-6.
+
+  /** 采集 follow 闭合不变量的多维状态. 返回 wrap 坐标系的几何 + 视觉类.
+   * `distFromContentEnd`: 视口底相对 contentEnd 的距离 (contentEnd - scrollTop - clientHeight).
+   *   负值 = 视口底已越过 contentEnd (仍 ≤ NEAR_BOTTOM_PX 视为 follow); 与 isNearBottom 一致. */
+  async function followClosureState(page: Page): Promise<{
+    lastRoundBottom: number; // 末轮底部在 wrap 坐标系的 y
+    drawerTop: number;       // drawer 顶部在 wrap 坐标系的 y
+    drawerHasPinned: boolean;
+    distFromContentEnd: number;
+  }> {
+    return page.evaluate(() => {
+      const detail = document.getElementById("detail")!;
+      const wrap = document.getElementById("detail-wrap")!;
+      const drawer = document.getElementById("response-drawer")!;
+      const wrapRect = wrap.getBoundingClientRect();
+      const rounds = detail.querySelectorAll(":scope > .tl-round");
+      let contentEnd = 0;
+      let lastRoundBottom = 0;
+      if (rounds.length > 0) {
+        const last = rounds[rounds.length - 1] as HTMLElement;
+        contentEnd = last.offsetTop + last.offsetHeight;
+        lastRoundBottom = last.getBoundingClientRect().bottom - wrapRect.top;
+      }
+      const drawerTop = drawer.getBoundingClientRect().top - wrapRect.top;
+      return {
+        lastRoundBottom,
+        drawerTop,
+        drawerHasPinned: drawer.classList.contains("pinned"),
+        distFromContentEnd: contentEnd - detail.scrollTop - detail.clientHeight,
+      };
+    });
+  }
+
+  test("UI-6: follow 状态在新 round 插入下不变 (短内容 + drawer 遮挡 → 压缩 drawer)", async ({ page }) => {
+    // 复现路径: 第 1 轮短内容 (contentEnd 远 < wrapH), 追加第 2 轮让 contentEnd 落在
+    // [wrapH - GAP - minH, wrapH - 0.05*wrapH] 区间 (Case A: drawer 压缩后末轮完整可见).
+    // 历史 bug: placeholder=0 不提供滚动空间, maxScroll=0, target 被 clamp 到 0,
+    // 末轮被 drawer 遮挡. 修复: follow + 短内容时 updateResponseDrawerLayout 压缩 drawer.
+    const marker = "ui6-follow-invariant-cross-marker";
+    await page.goto("/");
+    // 锁定视口 (避免 CI runner 字体渲染差异让 contentEnd 漂移到失效区间 B2).
+    // wrapH=530, 失效区间为 contentEnd > wrapH - GAP - minH = 530 - 28 - 53 = 449.
+    // 目标 contentEnd 区间: [310, 449] (Case A, drawer 压缩到 reserveH ≥ minH).
+    await page.setViewportSize({ width: 1280, height: 600 });
+
+    // 第 1 轮: 短 (1 user + 1 assistant), follow.
+    await sendChat(page, [
+      { role: "user", content: `${marker} first` },
+      { role: "assistant", content: "ok1" },
+    ]);
+    const sid = await findSessionLeafByPreview(page, marker);
+    await openTimeline(page, sid, 1);
+    expect(await distFromBottom(page), "初始应 follow").toBeLessThan(100);
+
+    // 第 2 轮: 8 条 messages (含 r2 的 6 条), 折叠后 contentEnd 落在目标区间.
+    await sendChat(page, [
+      { role: "user", content: `${marker} first` },
+      { role: "assistant", content: "ok1" },
+      { role: "user", content: "r2-q1" },
+      { role: "assistant", content: "r2-a1" },
+      { role: "user", content: "r2-q2" },
+      { role: "assistant", content: "r2-a2" },
+      { role: "user", content: "r2-q3" },
+      { role: "assistant", content: "r2-a3" },
+    ]);
+    await waitForRounds(page, 2);
+    await page.waitForTimeout(800); // 等 syncFollowMode + RAF
+
+    // 先 probe 几何状态, 确认走了压缩路径 (drawerH < defaultH) 且未落入失效区间.
+    const probe = await page.evaluate(() => {
+      const detail = document.getElementById("detail")!;
+      const wrap = document.getElementById("detail-wrap")!;
+      const drawer = document.getElementById("response-drawer")!;
+      const rounds = detail.querySelectorAll(":scope > .tl-round");
+      const last = rounds[rounds.length - 1] as HTMLElement;
+      return {
+        wrapH: wrap.clientHeight,
+        contentEnd: last.offsetTop + last.offsetHeight,
+        drawerH: drawer.hidden ? 0 : drawer.offsetHeight,
+        defaultH: wrap.clientHeight * 0.30,
+        minH: wrap.clientHeight * 0.10,
+      };
+    });
+    // 确认走了压缩路径: 短内容 + drawerH < defaultH (30% wrapH) ⇒ 修复生效.
+    expect(probe.contentEnd, "场景应为短内容").toBeLessThanOrEqual(probe.wrapH);
+    expect(probe.drawerH, "follow + 短内容应触发 drawer 压缩 (< defaultH)").toBeLessThan(probe.defaultH);
+
+    const s = await followClosureState(page);
+
+    // 多维断言: 末轮不被遮挡.
+    expect(
+      s.lastRoundBottom,
+      "follow 下末轮 request 底部应在 drawer 上边缘之上 (不被遮挡)"
+    ).toBeLessThanOrEqual(s.drawerTop);
+
+    // 状态机视觉指示: follow 时 drawer 不带 .pinned 类.
+    expect(
+      s.drawerHasPinned,
+      "follow 状态下 drawer 不应有 .pinned 类 (状态机未被翻转)"
+    ).toBe(false);
+
+    // 结果一致性: 距 contentEnd ≤ NEAR_BOTTOM_PX.
+    expect(
+      s.distFromContentEnd,
+      "follow 下视口距 contentEnd 应 ≤ NEAR_BOTTOM_PX"
+    ).toBeLessThanOrEqual(100);
+  });
+
+  test("UI-6: follow 状态在新 round 插入下不变 (长内容稳态对照)", async ({ page }) => {
+    // 对照组: 长内容稳态 (3→4 轮), 守卫修复不破坏既有路径.
+    // 与 prop_follow_new_round_auto_scroll 的区别: 多了"末轮不被遮挡" + ".pinned 类"
+    // 两个机制闭合维度的断言.
+    const marker = "ui6-follow-invariant-steady-marker";
+    const sid = await setupLongMultiroundSession(page, marker, 3);
+    await openTimeline(page, sid, 3);
+
+    expect(await distFromBottom(page), "初始应 follow").toBeLessThan(100);
+
+    await appendRound(page, marker, 4);
+    await waitForRounds(page, 4);
+    await page.waitForTimeout(500);
+
+    const s = await followClosureState(page);
+
+    expect(
+      s.lastRoundBottom,
+      "follow 下末轮 request 底部应在 drawer 上边缘之上 (不被遮挡)"
+    ).toBeLessThanOrEqual(s.drawerTop);
+    expect(s.drawerHasPinned, "follow 状态下 drawer 不应有 .pinned 类").toBe(false);
+    expect(s.distFromContentEnd, "follow 下视口距 contentEnd 应 ≤ NEAR_BOTTOM_PX").toBeLessThanOrEqual(100);
   });
 
   // Bug #2 (选中历史 round 连续扩展) 的前端路径 selectRound path 2 (loadUntilRound

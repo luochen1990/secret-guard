@@ -180,6 +180,9 @@ timeline 的 follow/pinned 状态由 **视口距底部距离** 机械推导 (SSO
 
 - **follow** (距底 ≤ `NEAR_BOTTOM_PX` ≈ 100px): 新 round 到达 → `scrollTimelineToBottomForce`
   锁定视口 (预留 drawerH+GAP, 末轮 request 完整可见, 不被 drawer 遮挡); `unreadCount` 清零.
+  **follow 闭合不变量**: follow 状态在新 round 插入下必须保持 (不被翻转, 末轮 request 不被
+  drawer 遮挡). 短内容场景下 `updateResponseDrawerLayout` 自动压缩 drawer 保障此不变量;
+  几何失效区间 + 实现细节见 contracts.md UI-6 与 src/web/AGENTS.md.
 - **pinned** (距底 > `NEAR_BOTTOM_PX`): 新 round 到达 → 不滚动, `unreadCount` 累加,
   `#unread-badge` 浮出显示 "↓ N".
 

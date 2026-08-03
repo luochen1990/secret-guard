@@ -736,6 +736,10 @@
 
 **核心不变量**: `state.timelineFollow == isNearBottom()`, 即 `scrollHeight - scrollTop - clientHeight <= NEAR_BOTTOM_PX` (≈ 100px). 此判定在每次 scroll 事件 (RAF 合并) + 每次新 round 追加后由 `syncFollowMode()` 重算.
 
+**follow 闭合不变量** (UI-6 强化): follow 状态在新 round 插入下必须保持. 形式化: 若插入前 `state.timelineFollow == true`, 则 `scrollTimelineToBottomForce()` 执行 + RAF 合并的 `syncFollowMode()` 重算后, `state.timelineFollow` 仍为 `true`. 这要求 `bottomScrollTarget` 的计算结果必须把末轮真正送到视口底附近 (`isNearBottom()` 成立), 而不是被 clamp / drawerH 错误时序带回 pinned 区. 进一步, 末轮 request 底部必须出现在 drawer 上边缘之上 (不被遮挡), 让用户能看见刚插入的 round.
+
+**已知限制 (几何失效区间)**: `contentEnd > wrapH - DRAWER_GAP - DRAWER_MIN_RATIO * wrapH` (短内容 + drawer 已显示) 时, drawer 压到 `minH` 仍遮挡末轮 ≤ `minH + GAP` (≈81px) — 几何上 contentEnd + minH + GAP > wrapH 不可兼得. 由 ROB-* best-effort 兜底, drawer 仍压到 minH 让遮挡最小化.
+
 **Properties**:
 - `prop_follow_initial_on_session_click`: 点 Session → follow + selected 在最新轮. ✅ `im-ui.spec.ts` "UI-6: 点 Session → follow + selected 在最新轮".
 - `prop_pinned_on_manual_scroll_up`: follow 状态下手动向上滚 → pinned. ✅ `im-ui.spec.ts` "UI-6: 手动向上滚 → pinned".
@@ -743,6 +747,7 @@
 - `prop_unread_badge_resets_selected`: 点 unread badge → follow + selected 重置到最新轮 + badge 消失. ✅ `im-ui.spec.ts` "UI-6: 点 unread badge".
 - `prop_follow_new_round_auto_scroll`: follow 期间新 round 到达 → 自动滚到底, 无 badge. ✅ `im-ui.spec.ts` "UI-6: follow 状态下新 round 到达".
 - `prop_selected_stable_during_pinned`: pinned 期间点历史轮, 新 round 到达时 selected 不变. ✅ `im-ui.spec.ts` "UI-6: pinned 期间点历史轮".
+- `prop_follow_invariant_under_new_round`: follow 状态在任意新 round 插入后必须保持 (不被翻转、末轮 request 不被 drawer 遮挡). ✅ `im-ui.spec.ts` "UI-6: follow 状态在新 round 插入下不变". 区别于 `prop_follow_new_round_auto_scroll`: 后者只在"长内容稳态"下断言结果 (距底 < 100), 本 property 守卫**机制本身**不被破坏, 且生成器须覆盖短→长跨越边界 (placeholder 高度 0→extremeMaxH 跳变) 这一历史 bug 路径.
 
 ---
 
@@ -763,3 +768,4 @@
 | 2026-07-28 | CDAG-6/7/8 | 新增 CDAG-6 hash collision 处置 + CDAG-7 孤儿节点可识别 + CDAG-8 session 聚类稳定 | DAG 落地后细化内容寻址存储的边界契约 (collision/eviction/session 稳定性) |
 | 2026-07-28 | UI-4/5/6 | 新增 UI-4 keyed reconciliation + UI-5 末轮 response 独立 drawer + UI-6 timeline 滚动状态机 | 前端不变量从 AGENTS.md I1-I3 扩展为 UI-1..UI-6, 完整收录 keyed reconciliation / drawer overlay / followMode 状态机 |
 | 2026-07-29 | FWD-1 | FWD-1 流式响应半段式 (`prop_streaming_response_half_byte_exact`) 追加 "理想 vs 现状" 注记: 字面 byte-exact 在 `same_proto_restore` 路径不成立, 当前守卫语义等价弱化形式 | 按 §0.5 漂移处理流程存档; 完整 byte-exact 需独立架构改动 (字节级扫描替换) |
+| 2026-08-02 | UI-6 | 新增 `prop_follow_invariant_under_new_round` (follow 闭合不变量): follow 状态在任意新 round 插入下不被翻转 + 末轮 request 不被 drawer 遮挡 (几何允许区间内); 声明 `contentEnd > wrapH - GAP - minH` 区间豁免 | 现有 `prop_follow_new_round_auto_scroll` 只在"长内容稳态"断言结果 (距底 < 100), 不守卫机制本身; 历史 bug: 短内容 (`contentEnd ≤ wrapH`) + drawer 已显示时, placeholder=0 不提供滚动空间, `bottomScrollTarget` 想预留 `drawerH+GAP` 但被 `maxScroll=0` clamp, 末轮被 drawer 遮挡; 修复方案: `updateResponseDrawerLayout` 在 follow + 短内容 + drawer 遮挡时压缩 drawer 到 `wrapH - contentEnd - GAP` (派生属性, 无外部 state) |

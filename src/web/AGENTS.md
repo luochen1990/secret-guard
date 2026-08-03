@@ -225,6 +225,9 @@ timeline 有两种滚动状态, 由 **视口距底部距离** 机械推导 (SSOT
 
 - **follow** (距末轮底部 ≤ `NEAR_BOTTOM_PX` ≈ 100px): 新 round 到达 → 自动滚到末轮底部
   (`scrollTimelineToBottomForce`, 预留 drawerH+GAP 让末轮 request 完整可见).
+  **follow 闭合不变量 (UI-6)**: follow + 短内容 (contentEnd ≤ wrapH) 时,
+  `updateResponseDrawerLayout` 自动压缩 drawer 到 `wrapH - contentEnd - GAP` (派生属性,
+  让末轮完整可见). 契约 + 失效区间豁免见 contracts.md `prop_follow_invariant_under_new_round`.
 - **pinned** (距底 > `NEAR_BOTTOM_PX`): 新 round 到达 → 不滚动, 浮出 `#unread-badge` 显示 "↓ N".
 
 **follow/pinned 视觉指示 (WebUI 反馈1)**: drawer 顶部边缘颜色随状态切换 — follow 时淡灰

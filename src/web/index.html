@@ -2810,7 +2810,6 @@
       // placeholderExposed = placeholder DOM 在视口内的可见高度.
       // placeholder 紧跟末轮 (offsetTop = contentEnd), 高度 = placeholderH.
       // 可见部分 = clamp(scrollTop + wrapH - contentEnd, 0, placeholderH).
-      // 短内容时 placeholderH = 0 → placeholderExposed 永远 = 0 (drawer 不被它驱动).
       const placeholderExposed = Math.max(0, Math.min(placeholderH, detail.scrollTop + wrapH - contentEnd));
 
       // 选中气泡下边缘在 wrap 坐标系中的 y (随 scrollTop 单调变化).
@@ -2840,6 +2839,15 @@
       const placeholderCover = Math.max(0, placeholderExposed - DRAWER_GAP);
       drawerHeight = Math.max(drawerHeight, placeholderCover);
       drawerHeight = Math.min(drawerHeight, extremeMaxH);
+
+      // UI-6 follow 闭合不变量: follow + 短内容 (contentEnd ≤ wrapH) 时 maxScroll=0,
+      // 无法靠滚动让末轮完整可见. 压缩 drawer 到 reserveH = wrapH - contentEnd - GAP
+      // (末轮 + GAP + drawer 恰好填满视口), 下限 minH (失效区间豁免见 contracts.md UI-6).
+      // 派生属性, 仅 follow 生效 (pinned 时用户主动滚离, drawer 恢复正常).
+      if (state.timelineFollow && contentEnd <= wrapH && contentEnd > 0) {
+        const reserveH = wrapH - contentEnd - DRAWER_GAP;
+        drawerHeight = Math.max(minH, Math.min(drawerHeight, reserveH));
+      }
 
       drawer.style.height = drawerHeight + 'px';
       // scroll-nav 的 bottom 同步到抽屉高度, 使底部按钮贴合滚动区域底端.
