@@ -482,22 +482,21 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
 - static config 的 `[server]` / `[redact]` 段仅在启动时读取一次, WebUI 改 host/port/global_mock_prefix 不会生效.
 - **DAG 孤儿节点降级**: parent 被 LRU 淘汰后, child 的 `full_request_messages` 返回 None
   (timeline 降级展示, 不 panic). 显式孤儿标记 (CDAG-7) 尚未实现.
-- **auth 模块测试覆盖率 (OIDC 登录流程依赖 mock IdP)**: auth 模块的纯逻辑已覆盖
+- **auth 模块测试覆盖率 (OIDC 登录流程)**: auth 模块的纯逻辑已覆盖
   (`apikey.rs` 100% / `middleware.rs` ~99% / `session.rs` ~98% / `mod.rs` ~99%), 含
   require_api_key 的 Authorization 剥离断言 (SEC 红线) 与 build_session_layer 的
-  cookie 配置 (sg.sid + HttpOnly). 但以下部分**整体 0%**, 因强依赖外部 OIDC IdP
-  (token exchange / discovery), 强行 mock 会脆弱:
-  - `oidc.rs` (0%): `OidcBackend::discover` (Discovery 网络请求) / `exchange_and_verify`
-    (token exchange + ID token 验证) / `authorize_url` (PKCE/nonce 生成).
-    构造 `OidcBackend` 必须经过真实 Discovery, 无法用纯单测覆盖.
-  - `handlers.rs` 的 OIDC 流程 (~36% 整体): `login_start` / `oauth_callback` /
-    `logout` / `me` 需要 `AuthState` (含 `OidcBackend`) 或 `AuthSession` extractor,
-    均经 axum-login 层 + session, 无法在不起 IdP 的前提下构造.
-    (已覆盖的纯逻辑: `sanitize_next_url` 防 open-redirect + CRLF 注入, `error_response`
-    JSON envelope + no-store 契约.)
-  需引入 mock IdP 集成测试 (起本地 OIDC server 模拟 discovery + token endpoint + JWKS)
-  才能覆盖, 当前留作后续工作. `COVERAGE_MIN_LINES` 门禁不受影响 (auth 纯逻辑提升已使
-  总覆盖率上升).
+  cookie 配置 (sg.sid + HttpOnly).
+  OIDC 流程的集成测试 (`tests/auth_oidc.rs`) 已通过本地 mock IdP server 覆盖
+  (起 axum server 模拟 discovery + token + jwks + RS256 签 id_token), 覆盖率:
+  - `oidc.rs` ~86%: `OidcBackend::discover` (含 issuer 字符串校验 / JWKS 拉取) /
+    `exchange_and_verify` happy + 5 个错误路径 (CSRF mismatch / token HTTP 4xx /
+    NoIdToken / WrongSignature / WrongNonce) / `authorize_url` PKCE verifier round-trip.
+  - `handlers.rs` ~64%: `login_start` (重定向 + session 写入 + sanitize_next_url) /
+    `oauth_callback` 错误路径 (IdP error 参数 / 缺 session 凭证) / `logout` / `me`.
+  **仍未覆盖** (~36% handlers + ~14% oidc 残留): `oauth_callback` happy path 的
+  PKCE verifier + nonce 完整端到端 round-trip — nonce 是 client-only 凭证存 server-side
+  session, 外部 HTTP 测试无法读取; 这部分核心逻辑由 `exchange_and_verify_happy` 间接
+  覆盖, 完整端到端需 mocking AuthSession (axum-login extractor), 留作后续工作.
 
 ## 后续工作 (非 MVP 范围)
 
@@ -507,10 +506,14 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
   新增协议只需实现 Reader + Writer trait (~200 行), 不动 dispatch.
 - mock_secret 的 category-aware 默认生成 (Password/ApiKey/Cookie 等格式感知).
 - 配置热加载; 测试覆盖率自动上报 + fuzzing (cargo-fuzz).
-- **auth/oidc.rs + handlers OIDC 流程的集成测试**: 起本地 mock OIDC IdP server
-  (模拟 discovery + token endpoint + JWKS 签名), 覆盖 `OidcBackend::discover` /
-  `exchange_and_verify` / `handlers::login_start`+`oauth_callback`+`logout`+`me`
-  的完整登录流程. 当前覆盖率见 "已知限制" 对应条目.
+- **auth/oidc.rs + handlers OIDC 流程的集成测试 (已完成 happy + 错误路径)**:
+  `tests/auth_oidc.rs` 起本地 mock OIDC IdP server (axum, 模拟 discovery + token +
+  jwks + RS256 签 id_token), 覆盖 `OidcBackend::discover` / `exchange_and_verify` /
+  `handlers::login_start` + `oauth_callback` (错误路径) + `logout` + `me`.
+  详见 "已知限制" 对应条目的当前覆盖率数字.
+  **Followup (未完成)**: `oauth_callback` happy path 的 PKCE verifier + nonce 完整
+  端到端 round-trip — 需 mocking AuthSession (axum-login extractor) 或在 server 端
+  加 testing-only nonce 注入钩子 (生产代码改动).
 - **依赖升级** (滞后是稳态, 非风险; Cargo.lock 锁定保证可复现构建; 触发条件满足时再升,
   默认触发条件 = CVE / 解 duplicate / 需要 feature, 各子项仅标注例外):
   - rand 0.8 → latest (0.10): 0.9/0.10 API 有 breaking (`thread_rng()` → `rng()`,

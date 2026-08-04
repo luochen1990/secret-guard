@@ -50,6 +50,13 @@ mockito = "1"
 pretty_assertions = "1"
 proptest = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
+# OIDC mock IdP 集成测试 (tests/auth_oidc.rs):
+# 这些 crate 都已在依赖树中 (经 openidconnect / rustls 传递), 此处仅显式化以便测试
+# 直接用于生成 RSA 密钥对 + 手签 RS256 id_token. 不引入新传递依赖.
+# license 全部已在 deny.toml allow 列表.
+rsa = "0.9"
+sha2 = "0.10"
+base64 = "0.22"
 
 # redact 性能基线 bench. 详尽设计见 benches/redact.rs 头部.
 [[bench]]
