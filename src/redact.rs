@@ -1373,6 +1373,76 @@ mod tests {
     // ─── property-based 测试 (proptest) ─────────────────────────────────────
     use proptest::prelude::*;
 
+    // ─── RED-6/7 响应侧测试辅助 (response-side redact/restore fixtures) ─────
+    //
+    // 背景: `redact_ir` 只接受 `IrRequest` (请求侧 redact), 响应侧只有 `restore_ir_response`.
+    // 因此响应侧 round-trip 的测试模型是:
+    //   1. 在一个含 real secret 文本的 IrRequest 上 `redact_ir` → 得到 RedactionMap.
+    //   2. 构造一个"含 mock 文本的 IrResponse" (模拟上游 LLM 回响 redacted request).
+    //   3. `restore_ir_response(&mut resp, &map)` → 还原为含 real 的 response.
+    //   4. 断言 restore 后的 response 字符串叶子 == 含 real 的预期 response.
+    //
+    // 这里集中"把一组 secrets 变成 (map, real↔mock 对)"的知识, 供多个 response 侧 property 复用.
+    // 复用 [`sample_ir_with_text`] (含 real secret 文本) 触发 `redact_ir` 命中, 保证 map 非空.
+
+    /// 对给定的 secrets 列表, 跑一次 `redact_ir` (在含 real secret 文本的 IrRequest 上),
+    /// 返回 `(RedactionMap, real↔mock 对列表)`. pairs 仅含成功映射到 mock 的 secret (跳过降级的).
+    ///
+    /// # 假设
+    /// - `secrets` 中任两个互不为子串 (否则 redact 时先替换较长者可能让较短者的文本消失,
+    ///   导致 `pairs.len() < secrets.len()`). 调用方需保证 (测试用 `SECRET_{:03}` /
+    ///   `[A-Z]{4,12}` 等模板均满足).
+    fn redact_secrets_for_response(
+        secrets: &[SecretEntry],
+    ) -> (RedactionMap, Vec<(String, String)>) {
+        // 构造含 real secret 的请求文本 (用空格分隔的 filler, 确保 ir_request_contains 命中每个 secret).
+        let body = secrets
+            .iter()
+            .map(|s| s.value.as_str())
+            .collect::<Vec<_>>()
+            .join(" prefix ");
+        let mut ir = sample_ir_with_text(&body);
+        let (map, _) = redact_ir(&mut ir, secrets);
+        let pairs: Vec<(String, String)> = secrets
+            .iter()
+            .filter_map(|s| {
+                map.mock_for(&s.value)
+                    .map(|m| (s.value.clone(), m.to_string()))
+            })
+            .collect();
+        (map, pairs)
+    }
+
+    /// 构造一个含 mock 文本的 IrResponse (Text block), 模拟上游对 redacted request 的回响.
+    fn mock_response_with_text(text: &str) -> IrResponse {
+        IrResponse {
+            content: vec![IrBlock::Text {
+                text: text.to_string(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// 构造一个含 ToolUse 的 IrResponse, 其 input JSON 含 mock 文本.
+    /// 模拟上游 LLM 决定调用工具, 把 redacted request 中的 mock 原样回传到 tool input.
+    fn mock_response_with_tool_use(id: &str, name: &str, input_mock: &str) -> IrResponse {
+        IrResponse {
+            content: vec![IrBlock::ToolUse {
+                id: id.to_string(),
+                name: name.to_string(),
+                input: serde_json::json!({ "token": input_mock }),
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// 收集 IrResponse 所有字符串叶子 (用于断言 "restore 后无 real 子串" 等).
+    fn collect_response_str_leaves(resp: &IrResponse) -> Vec<String> {
+        let mut leaves = Vec::new();
+        resp.for_each_str_leaf(&mut |s: &str| leaves.push(s.to_string()));
+        leaves
+    }
+
     /// 把 full 切成 chunk_size 字节片喂给 r, 返回 emit + flush 拼接结果.
     /// boundary_align=true 时把 chunk 末尾对齐到 char boundary (UTF-8 测试用).
     fn push_chunked(
@@ -1769,7 +1839,166 @@ mod tests {
                 debug
             );
         }
-    } // end proptest! block (C3/C4/C2/C5/SEC-2)
+
+        // ─── 响应侧 RED-6/7 property (C6/C7 响应半边) ───────────────────────
+        //
+        // 契约 (docs/design/contracts.md §2 RED-6/7): redact 在请求侧, restore 在响应侧.
+        // 此前 proptest 只覆盖请求侧 round-trip, 响应侧仅 1 个固定样例
+        // (`restore_ir_response_swaps_mock_back_to_real`). 以下 property 补齐响应侧
+        // 的可逆性 / 不泄漏 / 工具调用 input / C4 单射性等覆盖盲区.
+
+        /// 守卫 RED-6 响应半边: IrResponse 中含 mock 的 Text, 经 restore_ir_response 后
+        /// 必须等价于"含 real secret 的原始 response". 这里直接断言叶子文本相等
+        /// (响应侧 round-trip 不经过 reader/writer 重序列化, 无需 normalize_json).
+        #[test]
+        fn prop_response_round_trip_identity(
+            body_prefix in "[a-z0-9 ,.!?'\"\n]{0,80}",
+            secret in "[A-Z]{4,12}",
+            body_suffix in "[a-z0-9 ,.!?'\"\n]{0,80}",
+            tail in "[a-z0-9 ,.!?'\"\n]{0,30}",
+        ) {
+            let (map, pairs) = redact_secrets_for_response(&[entry(&secret)]);
+            prop_assert!(!pairs.is_empty(), "secret 必须被 redact 映射");
+            let (real, mock) = &pairs[0];
+            // 构造"上游回响": response 文本含 mock (模拟 LLM 看到 redacted request 后原样回传).
+            let redacted_text = format!("{body_prefix}{mock}{body_suffix}");
+            let mut resp = mock_response_with_text(&format!("{redacted_text}{tail}"));
+            let expected = format!("{body_prefix}{real}{body_suffix}{tail}");
+            restore_ir_response(&mut resp, &map);
+            // 比对唯一 Text 叶子.
+            let restored_text = match &resp.content[0] {
+                IrBlock::Text { text } => text.clone(),
+                _ => panic!("expected Text"),
+            };
+            prop_assert_eq!(restored_text, expected);
+        }
+
+        /// 守卫 RED-6 响应半边 (round-trip 完整性): restore 后的 IrResponse 任何字符串叶子
+        /// 不应残留 mock (restore 把 mock 全部替换为 real, 这是 round-trip identity 的必要条件).
+        /// 与 C5 (mock 不含 real 子串, request 侧 redact 时的不变量) 无关 — 本 property
+        /// 验证的是 restore 行为本身, 而非 mock 生成质量.
+        #[test]
+        fn prop_response_no_mock_residual_after_restore(
+            secret in "[A-Za-z0-9]{4,32}",
+            filler in "[a-z0-9 ]{0,60}",
+        ) {
+            let (map, pairs) = redact_secrets_for_response(&[entry(&secret)]);
+            prop_assert!(!pairs.is_empty(), "secret 必须被 redact 映射");
+            let (_real, mock) = &pairs[0];
+            let redacted_text = format!("{filler} {mock} {filler}");
+            let mut resp = mock_response_with_text(&redacted_text);
+            restore_ir_response(&mut resp, &map);
+            // restore 后, 任何叶子不应再含 mock (mock 已全部被替换为 real).
+            let leaves = collect_response_str_leaves(&resp);
+            for leaf in &leaves {
+                prop_assert!(
+                    !leaf.contains(mock.as_str()),
+                    "restore 后仍残留 mock='{}' 在叶子 '{}'",
+                    mock, leaf
+                );
+            }
+        }
+
+        /// 守卫 RED-6 多 secret 响应半边: 多个 secret 同时出现时, response 的 round-trip
+        /// 仍为 identity (多 mock 互不干扰, restore 全部命中).
+        #[test]
+        fn prop_response_multi_secret_round_trip(
+            n in 1usize..=5,
+            prefix in "[a-z]{0,20}",
+            suffix in "[a-z]{0,20}",
+        ) {
+            let secrets: Vec<SecretEntry> = (0..n).map(|i| entry(&format!("SECRET_{:03}", i))).collect();
+            let (map, pairs) = redact_secrets_for_response(&secrets);
+            prop_assert_eq!(pairs.len(), n, "全部 secret 应被映射");
+            // 构造含所有 mock 的响应文本 (用分隔符确保 mock 不互相粘连导致 replace 歧义).
+            let mocks_joined = pairs
+                .iter()
+                .map(|(_, m)| m.as_str())
+                .collect::<Vec<_>>()
+                .join(" /// ");
+            let redacted_text = format!("{prefix}{mocks_joined}{suffix}");
+            let mut resp = mock_response_with_text(&redacted_text);
+            let reals_joined = pairs
+                .iter()
+                .map(|(r, _)| r.as_str())
+                .collect::<Vec<_>>()
+                .join(" /// ");
+            let expected = format!("{prefix}{reals_joined}{suffix}");
+            restore_ir_response(&mut resp, &map);
+            let restored_text = match &resp.content[0] {
+                IrBlock::Text { text } => text.clone(),
+                _ => panic!("expected Text"),
+            };
+            prop_assert_eq!(restored_text, expected);
+        }
+
+        /// 守卫 RED-6 工具调用半边: ToolUse.input 的 JSON 字符串叶子含 mock 时,
+        /// restore_ir_response 必须把 mock 还原为 real (AGENTS.md 强调的工具调用场景).
+        /// 这是响应侧最关键的 property — LLM 调用工具时会把 redacted request 中的 mock
+        /// 复制到 tool input, restore 必须正确还原, 否则本地工具拿不到真 secret.
+        #[test]
+        fn prop_response_tool_use_input_restored(
+            secret in "[A-Z]{4,12}",
+            tool_name in "[a-z_]{3,12}",
+        ) {
+            let (map, pairs) = redact_secrets_for_response(&[entry(&secret)]);
+            prop_assert!(!pairs.is_empty(), "secret 必须被 redact 映射");
+            let (real, mock) = &pairs[0];
+            // 构造含 mock 的 ToolUse 响应 (模拟 LLM 把 mock 复制进 tool input).
+            let mut resp = mock_response_with_tool_use("call_1", &tool_name, mock);
+            restore_ir_response(&mut resp, &map);
+            // 验证 ToolUse.input.token 已还原为 real.
+            match &resp.content[0] {
+                IrBlock::ToolUse { id, name, input } => {
+                    prop_assert_eq!(id, "call_1");
+                    prop_assert_eq!(name, &tool_name);
+                    let token = input
+                        .get("token")
+                        .and_then(|v| v.as_str())
+                        .expect("input.token 应为 string");
+                    prop_assert_eq!(token, real, "ToolUse.input.token 必须 restore 回 real");
+                    prop_assert!(
+                        !token.contains(mock.as_str()),
+                        "restore 后 tool input 不应残留 mock"
+                    );
+                }
+                _ => panic!("expected ToolUse"),
+            }
+        }
+
+        /// 守卫 RED-4 (C4 单射) 响应半边: 含全部 mock 的响应 restore 后, 每个 mock 都被
+        /// 还原为对应的 real (mock↔real 双射成立). 严格断言: 把 restored 文本按与构造时
+        /// 相同的分隔符 split, 与预期 real 列表逐位 prop_assert_eq!, 避免弱 `contains` 检查
+        /// 在 real 互为子串时的假阳性.
+        #[test]
+        fn prop_response_mock_never_in_real(
+            n in 2usize..=6,
+        ) {
+            let secrets: Vec<SecretEntry> = (0..n).map(|i| entry(&format!("REAL_{:03}", i))).collect();
+            let (map, pairs) = redact_secrets_for_response(&secrets);
+            prop_assert_eq!(pairs.len(), n, "全部 secret 应被映射");
+            let mocks: HashSet<&String> = pairs.iter().map(|(_, m)| m).collect();
+            prop_assert_eq!(mocks.len(), n, "C4 单射违反: 不同 real 映射到相同 mock");
+            // 构造含全部 mock 的响应, 用 " | " 分隔 (确保 mock 之间互不粘连).
+            let sep = " | ";
+            let mocks_text = pairs
+                .iter()
+                .map(|(_, m)| m.as_str())
+                .collect::<Vec<_>>()
+                .join(sep);
+            let mut resp = mock_response_with_text(&mocks_text);
+            restore_ir_response(&mut resp, &map);
+            let restored = match &resp.content[0] {
+                IrBlock::Text { text } => text.clone(),
+                _ => panic!("expected Text"),
+            };
+            // 严格双射断言: split restored, 与预期 real 列表逐位相等.
+            // (弱 contains 检查在 real 互为子串时会假阳性, split 逐位比对才真正验证双射.)
+            let expected_reals: Vec<&str> = pairs.iter().map(|(r, _)| r.as_str()).collect();
+            let actual: Vec<&str> = restored.split(sep).collect();
+            prop_assert_eq!(actual, expected_reals, "restore 后 real 顺序/内容与预期不符");
+        }
+    } // end proptest! block (C3/C4/C2/C5/SEC-2 + RED-6/7 response-side)
 
     // ─── SEC-3: tracing log 不输出 secret 明文 ──────────────────────────
     //
