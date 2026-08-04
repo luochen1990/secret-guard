@@ -26,10 +26,11 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use super::helpers::redact_headers;
+use crate::config::OnProbeExhausted;
 use crate::dag::{CallEvent, ConversationDag, PolicySnapshot, ResponseData};
 use crate::error::AppError;
 use crate::provider::Protocol;
-use crate::redact::{RedactionMap, redact_ir};
+use crate::redact::{RedactError, RedactionMap, redact_ir_checked};
 
 /// 流式 parsed view (StreamScan snapshot) 的节流写入间隔.
 /// 太短 → DAG 写锁竞争; 太长 → WebUI 看不到流式进度. 500ms 是 UX 与锁竞争的折中.
@@ -96,15 +97,25 @@ pub(super) fn parse_request_ir(
         .map_err(|e| AppError::BadBody(format!("{ingress} request parse failed: {}", e.message)))
 }
 
+/// `redact_and_derive` 的返回类型别名 (避免 clippy::type_complexity 误报).
+///
+/// 三元组语义: `(redaction_map, redact_seed, redactions)`.
+type RedactOutcome = Result<(RedactionMap, u64, Vec<(String, String)>), RedactError>;
+
 /// 对 IR 应用 redact 并派生 CallEvent.redactions (same_proto / cross_proto 共享).
+///
+/// `mode` 控制 probing 耗尽时的策略:
+/// - [`OnProbeExhausted::FailOpen`] (默认): 耗尽时 warn+skip (向后兼容, 永不 Err).
+/// - [`OnProbeExhausted::FailClosed`]: 耗尽时返回 `Err(RedactError)`, 让调用方拒绝转发.
 ///
 /// 返回 `(redaction_map, redact_seed, redactions)`. redaction_map 非空时 debug 日志记录命中数.
 pub(super) fn redact_and_derive(
     ir: &mut crate::codec::ir::IrRequest,
     secrets_snapshot: &[crate::secrets::SecretEntry],
+    mode: OnProbeExhausted,
     log_tag: &str,
-) -> (RedactionMap, u64, Vec<(String, String)>) {
-    let (redaction_map, redact_seed) = redact_ir(ir, secrets_snapshot);
+) -> RedactOutcome {
+    let (redaction_map, redact_seed) = redact_ir_checked(ir, secrets_snapshot, mode)?;
     if !redaction_map.is_empty() {
         debug!(
             redactions = redaction_map.real_to_mock.len(),
@@ -116,7 +127,7 @@ pub(super) fn redact_and_derive(
     // 集中在 helper 内部确保 same_proto / cross_proto 两条路径都覆盖.
     #[cfg(feature = "consistency-check")]
     assert_redactions_match_map(&redactions, &redaction_map, secrets_snapshot);
-    (redaction_map, redact_seed, redactions)
+    Ok((redaction_map, redact_seed, redactions))
 }
 
 // ─── 视图正确性守卫 (CI 用, 需 `--features consistency-check`) ─────────────

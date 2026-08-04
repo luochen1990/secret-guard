@@ -266,6 +266,23 @@ CRUD 操作语义、DynamicTable 持久化策略、跨表并发安全的详尽�
 Secret / Provider 的两种 value 来源 (`value`/`value_file`、`api_key`/`api_key_file`)
 及其 fail-fast vs 热路径差异, 见 `src/secrets.rs` 与 `src/provider.rs` 头部.
 
+### `[redact]` 段字段 (static, 启动时读取一次)
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `global_mock_prefix` | string | `""` | Auto 模式 mock 的统一前缀 (注入到每个 secret 的 `gen_spec.prefix`). 详见 `src/redact.rs` C5 契约. |
+| `on_probe_exhausted` | `"fail_open"` \| `"fail_closed"` | `"fail_open"` | Mock probing 耗尽时 (弱配置 + 对抗性 IR 无法生成唯一 mock) 的策略. `fail_open` (向后兼容) 跳过该 secret 原样转发; `fail_closed` 拒绝转发整个请求 (返回 503), 防止 secret 泄露. 详见 `src/redact.rs::redact_ir_checked` 与 `src/config.rs::OnProbeExhausted`. |
+
+配置示例 (`secret-guard.toml`):
+```toml
+[redact]
+global_mock_prefix = "sgm_"
+on_probe_exhausted = "fail_closed"
+```
+
+> 注: `[redact]` 段与 `[server]` 段一样仅在启动时读取一次, WebUI 修改不生效
+> (restart 才生效). 这是为了保持 redact 核心路径的零运行时配置开销.
+
 ## 开发流程
 
 ```bash
@@ -457,6 +474,13 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
   WebUI timeline 仍能显示 preview / role, 但不渲染增量气泡 (与跨协议 ingress 的 delta 限制一致).
 - **跨协议 + 流式响应**: OpenAI ⇄ Anthropic 跨协议时 `stream=true` 返回 501
   (StreamTranslate 已实现跨协议翻译, 但尚未接入 dispatch; 迁移计划见 "后续工作").
+- **Mock probing 耗尽可配置 fail-open / fail-closed**: 弱配置 (charset/length 仅产生
+  极少候选) + 对抗性 IR 可能让 `redact_ir` 的 mock probing 耗尽 (`MOCK_PROBE_LIMIT`).
+  历史行为是 **fail-open** (warn + 跳过该 secret, 原样转发到上游, 见 `redact_ir`).
+  新增 `[redact] on_probe_exhausted = "fail_closed"` 让 proxy 在这种情况下**拒绝转发**
+  (返回 503), 防止 secret 泄露到 LLM provider (见 `redact_ir_checked`). 默认仍
+  `fail_open` 以保持升级兼容. 注意 fail_closed 拒绝时返回的 503 body 不含 secret 明文
+  (只含 secret id slug + reason 枚举).
 - **C5 是实质确定性契约**: Auto 模式 mock 不含 real_secret ≥`k(L)` 字符子串
   (`k(L) = max(4, ⌈L/3⌉)`, 随 secret 长度自适应 — 短 secret 强保护, 长 secret 弱保护,
   信息泄露率上界 ~36%). gen_candidate 内置 10000 次确定性内部重试链

@@ -113,12 +113,45 @@ pub struct Config {
 /// `global_mock_prefix` 控制 Auto 模式生成的 mock 的统一前缀.
 /// 默认空串 = mock 无前缀 (纯 hash body). 设置后 (如 `"sgm_"`) 让 mock 在
 /// 日志 / WebUI timeline 中视觉可辨识. 详见 `redact.rs` 的 C5 契约.
+///
+/// `on_probe_exhausted` 控制 redact probing 耗尽 (弱配置 + 对抗性 IR) 时的策略:
+/// `FailOpen` (默认, 向后兼容) 跳过该 secret 原样转发; `FailClosed` 拒绝转发
+/// (返回 503). 详见 `redact.rs` 的 redact_ir_checked.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RedactConfig {
     /// Auto 模式 mock 的统一前缀, 在 secret resolve 阶段注入到每个 secret 的
     /// `gen_spec.prefix` (per-secret prefix 仍可覆盖). 默认空串.
     pub global_mock_prefix: String,
+    /// Mock probing 耗尽时的策略 (默认 `FailOpen` 向后兼容).
+    pub on_probe_exhausted: OnProbeExhausted,
+}
+
+/// Mock probing 耗尽时 (弱配置 + 对抗性 IR 无法生成唯一 mock) 的处理策略.
+///
+/// - `FailOpen`: 跳过该 secret 原样转发到上游 (历史行为, 向后兼容).
+/// - `FailClosed`: 拒绝转发整个请求 (返回 503), 防止 secret 泄露到 LLM provider.
+///
+/// 配置示例 (`secret-guard.toml`):
+/// ```toml
+/// [redact]
+/// on_probe_exhausted = "fail_closed"
+/// ```
+///
+/// # 设计动机
+///
+/// `FailOpen` 优先保进程存活, 但与 secret-guard 的核心使命 (防 secret 泄露) 相悖:
+/// 对抗性请求可构造让 mock probing 必然耗尽的 IR, 从而把 secret 原样发往上游.
+/// `FailClosed` 让运维在敏感场景显式拒绝这种降级, 即便付出请求失败的代价.
+/// 默认仍 `FailOpen` 以避免升级时破坏现有部署.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnProbeExhausted {
+    /// 跳过该 secret 原样转发 (warn 日志, 历史行为, 向后兼容).
+    #[default]
+    FailOpen,
+    /// 拒绝转发整个请求 (返回 503, 防止 secret 泄露).
+    FailClosed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -737,6 +770,61 @@ mod tests {
         let d = Decisions::default();
         assert_eq!(d.provider("any"), OverrideMode::Default);
         assert_eq!(d.secret("any"), OverrideMode::Default);
+    }
+
+    // ─── OnProbeExhausted serde + Default ─────────────────────────────────
+
+    #[test]
+    fn on_probe_exhausted_default_is_fail_open() {
+        assert_eq!(OnProbeExhausted::default(), OnProbeExhausted::FailOpen);
+        // RedactConfig::default() 也必须是 FailOpen (向后兼容旧配置无此字段).
+        assert_eq!(
+            RedactConfig::default().on_probe_exhausted,
+            OnProbeExhausted::FailOpen
+        );
+    }
+
+    #[test]
+    fn on_probe_exhausted_serde_snake_case_roundtrip() {
+        // serde rename_all = "snake_case": fail_open / fail_closed.
+        for (variant, name) in [
+            (OnProbeExhausted::FailOpen, "fail_open"),
+            (OnProbeExhausted::FailClosed, "fail_closed"),
+        ] {
+            let s = serde_json::to_string(&variant).unwrap();
+            assert_eq!(s, format!("\"{name}\""));
+            let back: OnProbeExhausted = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, variant);
+        }
+    }
+
+    #[test]
+    fn on_probe_exhausted_serde_rejects_unknown_variant() {
+        // 未知字符串应反序列化失败 (fail-closed on config typos, 避免静默回退到默认).
+        let err = serde_json::from_str::<OnProbeExhausted>("\"fail-closed\"");
+        assert!(err.is_err(), "hyphenated form must be rejected");
+        let err = serde_json::from_str::<OnProbeExhausted>("\"unknown\"");
+        assert!(err.is_err(), "unknown variant must be rejected");
+    }
+
+    #[test]
+    fn redact_config_toml_default_omits_on_probe_exhausted_field() {
+        // 空 [redact] 段应解析为默认 (FailOpen + 空 prefix), 向后兼容.
+        let cfg: Config = toml::from_str("[redact]\n").unwrap();
+        assert_eq!(cfg.redact.global_mock_prefix, "");
+        assert_eq!(cfg.redact.on_probe_exhausted, OnProbeExhausted::FailOpen);
+    }
+
+    #[test]
+    fn redact_config_toml_parses_fail_closed() {
+        let text = r#"
+[redact]
+global_mock_prefix = "sgm_"
+on_probe_exhausted = "fail_closed"
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        assert_eq!(cfg.redact.global_mock_prefix, "sgm_");
+        assert_eq!(cfg.redact.on_probe_exhausted, OnProbeExhausted::FailClosed);
     }
 
     // ─── Config::load_or_default: 启动时校验 ──────────────────────────────

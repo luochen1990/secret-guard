@@ -103,6 +103,9 @@ pub struct ProxyState {
     /// 来自 `[redact] global_mock_prefix` (默认空串). WebUI secret upsert 时
     /// 透传给 validate_and_resolve, 用于校验 value 不含此 prefix + 注入 Auto gen_spec.prefix.
     pub global_mock_prefix: Arc<str>,
+    /// 来自 `[redact] on_probe_exhausted` (默认 FailOpen). 控制 redact probing 耗尽时
+    /// 是 fail-open (skip + 原样转发) 还是 fail-closed (返回 503 拒绝转发).
+    pub on_probe_exhausted: crate::config::OnProbeExhausted,
 }
 
 /// axum 路径参数: `/{proto}/{name}/{*rest}`.

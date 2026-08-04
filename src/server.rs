@@ -177,6 +177,8 @@ pub fn build_upstream_client() -> anyhow::Result<reqwest::Client> {
 /// - `auth_config`: 认证配置 (来自 static config 的 `[auth]` 段).
 /// - `global_mock_prefix`: 来自 static config 的 `[redact] global_mock_prefix`,
 ///   存入 ProxyState 供 WebUI handler 在 secret upsert 时校验 + resolve.
+/// - `on_probe_exhausted`: 来自 static config 的 `[redact] on_probe_exhausted`,
+///   存入 ProxyState 供 forwarding 路径决定 probing 耗尽时 fail-open / fail-closed.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve(
     host: &str,
@@ -189,6 +191,7 @@ pub async fn serve(
     config_path: PathBuf,
     auth_config: AuthConfig,
     global_mock_prefix: String,
+    on_probe_exhausted: crate::config::OnProbeExhausted,
 ) -> anyhow::Result<()> {
     auth_config.validate().map_err(|e| anyhow::anyhow!(e))?;
 
@@ -236,6 +239,7 @@ pub async fn serve(
         api_keys: Some(api_keys.clone()),
         auth_enabled: auth_config.enabled,
         global_mock_prefix: Arc::from(global_mock_prefix),
+        on_probe_exhausted,
     };
 
     // 条件化: 启用认证时构造 AuthStack, 否则单用户模式.

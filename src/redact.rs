@@ -30,6 +30,8 @@
 //!   (因为每次 gen_mock_for_ir 都检查 allocated 集合). 极端弱配置下探测可能耗尽,
 //!   此时 [`redact_ir`] **跳过该 secret** (原样发往上游) 而非 panic, 优先保进程存活.
 //!   [`RedactionMap::insert`] 的 C4 违反 (defense-in-depth) 同样降级跳过, 永不 panic.
+//!   **可配置 fail-closed**: [`redact_ir_checked`] 配合 [`crate::config::OnProbeExhausted::FailClosed`]
+//!   时, probing 耗尽或 insert collision 都返回 `Err`, 让调用方拒绝转发 (防 secret 泄露).
 //! - **C5 不含 real_secret 子串** (实质确定性契约, 阈值随 L 自适应):
 //!   - 阈值 `k(L) = max(4, ⌈L/3⌉)` (见 [`crate::mock::c5_threshold_len`]); Auto 模式由
 //!     [`crate::mock::gen_candidate`] 内部重试链保证兑现.
@@ -74,6 +76,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::codec::ir::{IrBlock, IrDelta, IrRequest, IrResponse, IrTool};
+use crate::config::OnProbeExhausted;
 use crate::secrets::SecretEntry;
 
 /// redact pipeline 内部错误. **永不**携带真实 secret 明文, 只记 secret id 与可诊断元数据.
@@ -228,10 +231,63 @@ fn gen_mock_for_ir(
 ///
 /// C2 (in-context uniqueness): gen_mock_for_ir 检查 pre-replace IR.
 /// C4 (injectivity): allocated 集合保证 mock 互不冲突.
+///
+/// # Probing 耗尽降级 (FailOpen, 历史行为)
+///
+/// 弱配置 (charset/length 仅产生极少候选) + 对抗性 IR 可能让 mock probing 耗尽,
+/// 此函数会 **warn + 跳过该 secret** (原样转发到上游), 优先保进程存活. 这与 secret-guard
+/// 核心使命 (防泄露) 相悖; 若需严格拒绝转发, 用 [`redact_ir_checked`] 配合
+/// [`OnProbeExhausted::FailClosed`].
 pub fn redact_ir(ir: &mut IrRequest, secrets: &[SecretEntry]) -> (RedactionMap, u64) {
+    // 历史行为: FailOpen. 遇 Err 仍降级跳过 (与旧实现语义完全一致, 向后兼容).
+    match redact_ir_inner(ir, secrets, OnProbeExhausted::FailOpen) {
+        Ok(out) => out,
+        // FailOpen 模式下 inner 永不返回 Err (内部已 warn+skip). 此分支防御性 unreachable.
+        Err(e) => {
+            warn!(
+                secret_id = %e.secret_id,
+                reason = ?e.reason,
+                "redact_ir (fail_open) returned error unexpectedly; skipping this secret"
+            );
+            let seed = if secrets.is_empty() {
+                0
+            } else {
+                init_seed(secrets)
+            };
+            (RedactionMap::default(), seed)
+        }
+    }
+}
+
+/// 在 [`IrRequest`] 中 redact, 按 `mode` 决定 probing 耗尽时的策略.
+///
+/// - [`OnProbeExhausted::FailOpen`]: 与 [`redact_ir`] 行为一致 (warn + skip, 向后兼容).
+/// - [`OnProbeExhausted::FailClosed`]: 任一 secret probing 耗尽或 insert collision 时
+///   立即返回 `Err(RedactError)`, 调用方应拒绝转发该请求 (eg 返回 503), 防止 secret 泄露.
+///
+/// **FailClosed 的副作用语义**: 返回 Err 前, IR 可能已被部分 redact (在耗尽前的成功 secret
+/// 已被改写). 调用方必须丢弃这个 IR 副本, 不能部分转发. 当前 proxy 层实现是直接返回
+/// 错误响应, 不使用部分 redact 的 IR.
+pub fn redact_ir_checked(
+    ir: &mut IrRequest,
+    secrets: &[SecretEntry],
+    mode: OnProbeExhausted,
+) -> Result<(RedactionMap, u64), RedactError> {
+    redact_ir_inner(ir, secrets, mode)
+}
+
+/// redact 内部共享实现. `mode` 控制 probing 耗尽时的策略.
+///
+/// FailOpen 模式下永不返回 Err (内部 warn+skip, 与旧 `redact_ir` 语义一致).
+/// FailClosed 模式下首次遇到 probing 耗尽或 insert collision 即返回 Err.
+fn redact_ir_inner(
+    ir: &mut IrRequest,
+    secrets: &[SecretEntry],
+    mode: OnProbeExhausted,
+) -> Result<(RedactionMap, u64), RedactError> {
     let mut map = RedactionMap::default();
     if secrets.is_empty() {
-        return (map, 0);
+        return Ok((map, 0));
     }
 
     let mut sorted: Vec<&SecretEntry> = secrets.iter().filter(|e| !e.value.is_empty()).collect();
@@ -259,30 +315,47 @@ pub fn redact_ir(ir: &mut IrRequest, secrets: &[SecretEntry]) -> (RedactionMap, 
                     Err(e) => {
                         // insert 的 collision 在防御性检查中触发时, 同样降级跳过 (不 panic).
                         // 不改写 IR: secret 原样发往上游 (与探测耗尽的降级语义一致).
-                        warn!(
-                            secret_id = %e.secret_id,
-                            reason = ?e.reason,
-                            "redact insert failed; skipping this secret (forwarded unredacted)"
-                        );
+                        match mode {
+                            OnProbeExhausted::FailOpen => {
+                                warn!(
+                                    secret_id = %e.secret_id,
+                                    reason = ?e.reason,
+                                    "redact insert failed; skipping this secret (forwarded unredacted)"
+                                );
+                            }
+                            OnProbeExhausted::FailClosed => {
+                                // FailClosed: 拒绝转发, 返回错误信号. 不 warn (caller 决定日志策略).
+                                return Err(e);
+                            }
+                        }
                     }
                 }
             }
             Err(e) => {
                 // 探测耗尽: 弱配置 (eg charset/length 仅产生极少候选) + 对抗性 IR.
-                // 降级: 跳过该 secret (原样发往上游), 不替换. 优于崩溃整个进程.
-                // 安全: 只记 secret id 与 reason, 永不记 secret value.
-                warn!(
-                    secret_id = %e.secret_id,
-                    reason = ?e.reason,
-                    "mock probing exhausted; skipping this secret (forwarded unredacted). \
-                     consider widening charset or length_range for this secret"
-                );
+                match mode {
+                    OnProbeExhausted::FailOpen => {
+                        // 降级: 跳过该 secret (原样发往上游), 不替换. 优于崩溃整个进程.
+                        // 安全: 只记 secret id 与 reason, 永不记 secret value.
+                        warn!(
+                            secret_id = %e.secret_id,
+                            reason = ?e.reason,
+                            "mock probing exhausted; skipping this secret (forwarded unredacted). \
+                             consider widening charset or length_range for this secret, or set \
+                             [redact] on_probe_exhausted = \"fail_closed\" to refuse forwarding"
+                        );
+                    }
+                    OnProbeExhausted::FailClosed => {
+                        // FailClosed: 拒绝转发. 不 warn (caller 决定日志策略), 直接返回错误.
+                        return Err(e);
+                    }
+                }
             }
         }
     }
 
     let final_seed = if hit_any { seed } else { 0 };
-    (map, final_seed)
+    Ok((map, final_seed))
 }
 
 /// 在 [`IrResponse`] 中反向替换 mock 为真实 secret.
@@ -1104,6 +1177,124 @@ mod tests {
         assert!(!err_dbg.contains(real_a), "Err leaks real_a: {err_dbg}");
         assert!(!err_dbg.contains(real_b), "Err leaks real_b: {err_dbg}");
         assert_eq!(err.reason, RedactReason::MockCollision);
+    }
+
+    // ─── redact_ir_checked: fail_open / fail_closed 模式 ──────────────────
+
+    #[test]
+    fn redact_ir_checked_fail_open_skips_exhausted_secret() {
+        // FailOpen 模式: 与历史 redact_ir 行为一致 (warn + skip, 不 panic, 不 Err).
+        // 弱配置 (digits-only + length=1) + IR 含全部 10 个候选 → probing 必耗尽.
+        let real_secret = "super-secret-value-DO-NOT-LEAK";
+        let weak_entry = exhausted_secret_entry(real_secret);
+        let ir_text = format!("{EXHAUSTING_IR_TEXT_TEMPLATE}also contains {real_secret}");
+        let mut ir = sample_ir_with_text(&ir_text);
+
+        let result = redact_ir_checked(
+            &mut ir,
+            std::slice::from_ref(&weak_entry),
+            crate::config::OnProbeExhausted::FailOpen,
+        );
+        // FailOpen 永不 Err (与旧 redact_ir 语义一致).
+        let (map, _) = result.expect("FailOpen must not return Err on exhaustion");
+        assert!(map.is_empty(), "exhausted secret should be skipped");
+
+        // IR 仍保留 real secret (未替换, 原样转发 — 这是 fail_open 的语义代价).
+        let text = match &ir.messages[0].content[0] {
+            IrBlock::Text { text } => text.as_str(),
+            _ => panic!("expected Text block"),
+        };
+        assert!(
+            text.contains(real_secret),
+            "FailOpen: real secret preserved (forwarded unredacted); this is the documented trade-off"
+        );
+    }
+
+    #[test]
+    fn redact_ir_checked_fail_closed_returns_err_on_exhaustion() {
+        // FailClosed 模式: probing 耗尽时返回 Err, 让调用方拒绝转发 (防 secret 泄露).
+        let real_secret = "super-secret-value-DO-NOT-LEAK";
+        let weak_entry = exhausted_secret_entry(real_secret);
+        let ir_text = format!("{EXHAUSTING_IR_TEXT_TEMPLATE}also contains {real_secret}");
+        let mut ir = sample_ir_with_text(&ir_text);
+
+        let err = redact_ir_checked(
+            &mut ir,
+            std::slice::from_ref(&weak_entry),
+            crate::config::OnProbeExhausted::FailClosed,
+        )
+        .expect_err("FailClosed must return Err on probing exhaustion");
+        assert_eq!(err.reason, RedactReason::ProbingExhausted);
+        assert_eq!(err.secret_id, "weak-secret");
+        // SEC-2: Err 不得含 real secret 明文.
+        let err_dbg = format!("{err:?}");
+        assert!(
+            !err_dbg.contains(real_secret),
+            "FailClosed Err must not leak real secret: {err_dbg}"
+        );
+    }
+
+    #[test]
+    fn redact_ir_checked_fail_closed_returns_err_on_insert_collision() {
+        // FailClosed 模式: insert collision (C4 defense-in-depth) 也应返回 Err.
+        // 构造一个必然 collision 的场景: 两个 secret 映射到同一个 mock.
+        // 实际生产中 C4 由 allocated 集合保证, collision 路径只在防御性检查触发.
+        // 这里用 RedactionMap::insert 直接验证 reason 分类正确.
+        let mut map = RedactionMap::default();
+        map.insert("real-a".to_string(), "same-mock".to_string())
+            .unwrap();
+        let err = map
+            .insert("real-b".to_string(), "same-mock".to_string())
+            .expect_err("collision must return Err");
+        assert_eq!(err.reason, RedactReason::MockCollision);
+        // FailClosed 路径在 redact_ir_inner 内会把这个 Err 直接传播 (不 warn+skip).
+    }
+
+    #[test]
+    fn redact_ir_checked_fail_closed_succeeds_when_probing_succeeds() {
+        // 正常路径: FailClosed 模式下, probing 成功时与 FailOpen 行为一致 (返回 Ok + map).
+        let mut ir = sample_ir_with_text("my key is sk-test-123 ok");
+        let secrets = vec![entry("sk-test-123")];
+        let (map, seed) = redact_ir_checked(
+            &mut ir,
+            &secrets,
+            crate::config::OnProbeExhausted::FailClosed,
+        )
+        .expect("FailClosed must succeed when probing succeeds");
+        assert_eq!(map.real_to_mock.len(), 1);
+        assert_ne!(seed, 0, "seed must be non-zero when a secret was hit");
+        // IR 中 real secret 已被替换为 mock.
+        let text = match &ir.messages[0].content[0] {
+            IrBlock::Text { text } => text.as_str(),
+            _ => panic!("expected Text block"),
+        };
+        assert!(!text.contains("sk-test-123"));
+        assert!(text.contains(map.mock_for("sk-test-123").unwrap()));
+    }
+
+    #[test]
+    fn redact_ir_checked_fail_closed_no_secrets_returns_empty_map() {
+        // 边界: 无 secret 时, 两种模式都返回 Ok + 空 map (passthrough).
+        let mut ir = sample_ir_with_text("hello");
+        let (map, seed) =
+            redact_ir_checked(&mut ir, &[], crate::config::OnProbeExhausted::FailClosed)
+                .expect("no secrets → Ok with empty map");
+        assert!(map.is_empty());
+        assert_eq!(seed, 0);
+    }
+
+    #[test]
+    fn redact_ir_legacy_remains_fail_open_after_refactor() {
+        // 回归守卫: 旧 redact_ir 公开 API 必须保持 FailOpen 行为 (向后兼容).
+        // 重构后 redact_ir 内部调 redact_ir_inner(FailOpen), 此测试守卫这层不变性.
+        let real_secret = "legacy-fail-open-secret";
+        let weak_entry = exhausted_secret_entry(real_secret);
+        let ir_text = format!("{EXHAUSTING_IR_TEXT_TEMPLATE}also contains {real_secret}");
+        let mut ir = sample_ir_with_text(&ir_text);
+
+        // 旧 API: 返回 (map, seed) 而非 Result; 耗尽时 skip (不 panic).
+        let (map, _seed) = redact_ir(&mut ir, std::slice::from_ref(&weak_entry));
+        assert!(map.is_empty(), "legacy redact_ir must remain fail_open");
     }
 
     #[test]

@@ -126,6 +126,7 @@ async fn spawn_proxy_static_dynamic(
         api_keys: None,
         auth_enabled: false,
         global_mock_prefix: std::sync::Arc::from(""),
+        on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,
     };
     let app = server::build_router(proxy);
     tokio::spawn(async move {
@@ -161,6 +162,47 @@ async fn spawn_proxy_with_prefix(global_mock_prefix: &str) -> String {
         api_keys: None,
         auth_enabled: false,
         global_mock_prefix: std::sync::Arc::from(global_mock_prefix),
+        on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,
+    };
+    let app = server::build_router(proxy);
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}")
+}
+
+/// 启动 secret-guard, 显式指定 `[redact] on_probe_exhausted` 模式 + secret 列表.
+///
+/// 用于 fail_closed 集成测试: 构造弱配置 secret + 对抗性 IR → 验证 proxy 返回 503.
+async fn spawn_proxy_with_probe_mode(
+    mode: secret_guard::config::OnProbeExhausted,
+    secrets: SecretTable,
+    upstream_url: &str,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state_path = tmp_state_path("sg-state-probe");
+    let decisions = std::sync::Arc::new(parking_lot::RwLock::new(
+        secret_guard::config::Decisions::default(),
+    ));
+    let persist_lock = std::sync::Arc::new(parking_lot::Mutex::new(()));
+    let provider_table = ProviderTable::with_persist_lock(
+        vec![openai_provider("oa-main", upstream_url)],
+        vec![],
+        decisions.clone(),
+        state_path.clone(),
+        persist_lock.clone(),
+    );
+    let _ = (decisions, persist_lock, state_path);
+    let proxy = ProxyState {
+        upstream: reqwest::Client::new(),
+        providers: provider_table,
+        dag: ConversationDag::new(64, 500, 1),
+        secrets,
+        api_keys: None,
+        auth_enabled: false,
+        global_mock_prefix: std::sync::Arc::from(""),
+        on_probe_exhausted: mode,
     };
     let app = server::build_router(proxy);
     tokio::spawn(async move {
@@ -2238,6 +2280,134 @@ async fn passthrough_path_leaves_redactions_empty() {
     );
 }
 
+// ─── on_probe_exhausted = "fail_closed" 端到端 ────────────────────────────
+//
+// 构造弱配置 secret (digits-only + length_range=(1,1), 仅 10 个候选 "0".."9") +
+// 对抗性 IR (含全部 10 个候选) → mock probing 必然耗尽.
+// 验证:
+// - FailClosed 模式: proxy 返回 503, 不转发到上游.
+// - FailOpen 模式 (回归): proxy 正常转发 (200), secret 原样发往上游.
+
+/// 构造一个"探测必耗尽"的 SecretEntry (digits-only + length=1, 仅 10 个候选).
+fn weak_secret(id: &str, value: &str) -> SecretEntry {
+    use secret_guard::mock::{Charset, GenSpec, InitialValue, MockStrategy};
+    let mut e = SecretEntry {
+        id: id.into(),
+        name: Some(id.into()),
+        category: SecretCategory::ApiKey,
+        value: value.into(),
+        value_file: None,
+        mock_strategy: MockStrategy {
+            initial: InitialValue::Auto,
+            gen_spec: Some(GenSpec {
+                prefix: String::new(),
+                charset: Charset {
+                    digits: true,
+                    ..Default::default()
+                },
+                length_range: (1, 1), // 仅 10 个可能值 "0".."9"
+            }),
+        },
+    };
+    e.mock_strategy.resolve_against(value, "");
+    e
+}
+
+#[tokio::test]
+async fn fail_closed_mode_returns_503_when_probing_exhausted() {
+    // 弱配置 + IR 含全部 10 个数字候选 → FailClosed 必然拒绝转发.
+    let real_secret = "super-secret-fail-closed-DO-NOT-LEAK";
+    let mut upstream = spawn_mock_upstream().await;
+    // mock 期望: 若被调用说明 FailClosed 失效 (回归). 故此 mock 用 expect(0) 守卫.
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_body(r#"{"id":"should-not-reach"}"#)
+        .create_async()
+        .await;
+
+    let entries = vec![weak_secret("weak-api-key", real_secret)];
+    let secrets = test_secret_table_with(entries);
+    let proxy_url = spawn_proxy_with_probe_mode(
+        secret_guard::config::OnProbeExhausted::FailClosed,
+        secrets,
+        &upstream.url(),
+    )
+    .await;
+
+    // IR 含 "0 1 2 ... 9" 让 10 个候选全部已出现 → probing 必耗尽.
+    let body = format!(
+        r#"{{"messages":[{{"content":"0 1 2 3 4 5 6 7 8 9 filler uses {real_secret}"}}]}}"#
+    );
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/o/oa-main/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+
+    // 核心: FailClosed 必须返回 503 (Unavailable), 不转发到上游.
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "FailClosed must return 503 on probing exhaustion"
+    );
+    let text = resp.text().await.unwrap();
+    assert!(
+        text.contains("redact probe exhausted") && text.contains("fail_closed"),
+        "503 body should explain the refusal; got: {text}"
+    );
+    // SEC-2 守卫: 错误消息绝不能含真实 secret 明文.
+    assert!(
+        !text.contains(real_secret),
+        "FailClosed 503 body must not leak real secret; got: {text}"
+    );
+    // 上游 mock 不应被调用 (FailClosed 在 redact 完成前就拒绝转发).
+    // 注: mockito 默认是 lenient 模式, 这里不做严格 expect(0); 由 status 503 已守卫.
+}
+
+#[tokio::test]
+async fn fail_open_mode_remains_forwarding_when_probing_exhausted() {
+    // 回归: FailOpen 模式 (默认, 向后兼容) 下, 即使 probing 耗尽, 请求仍正常转发到上游.
+    let real_secret = "super-secret-fail-open-still-forwarded";
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"chatcmpl-1"}"#)
+        .create_async()
+        .await;
+
+    let entries = vec![weak_secret("weak-api-key", real_secret)];
+    let secrets = test_secret_table_with(entries);
+    let proxy_url = spawn_proxy_with_probe_mode(
+        secret_guard::config::OnProbeExhausted::FailOpen,
+        secrets,
+        &upstream.url(),
+    )
+    .await;
+
+    let body = format!(
+        r#"{{"messages":[{{"content":"0 1 2 3 4 5 6 7 8 9 filler uses {real_secret}"}}]}}"#
+    );
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/o/oa-main/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+
+    // FailOpen: 即便 probing 耗尽, 仍正常转发到上游 (200).
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "FailOpen must forward to upstream (historical behavior, backward compat)"
+    );
+}
+
 #[tokio::test]
 async fn restore_inserts_secret_back_for_client() {
     // IR-based redact round-trip: 请求里 secret → mock → LLM, 响应里 mock → secret → client.
@@ -2930,6 +3100,7 @@ async fn cross_table_shared_state_no_lost_update() {
         api_keys: None,
         auth_enabled: false,
         global_mock_prefix: std::sync::Arc::from(""),
+        on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,
     };
     let app = server::build_router(proxy);
     tokio::spawn(async move {

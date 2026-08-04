@@ -94,8 +94,28 @@ pub(crate) async fn same_proto_forward(
     // 4. redact IR + derive redactions (共享 helper).
     //    流式响应里的 TextDelta / InputJsonDelta 都会经 StreamingRestorer 做 sliding-window
     //    restore (在 StreamTranslate::new_same_proto_restore 中), 不再需要 warn.
-    let (redaction_map, redact_seed, redactions) =
-        redact_and_derive(&mut ir, &secrets_snapshot, "same-proto");
+    //    FailClosed 模式下 probing 耗尽 → 直接 503 拒绝转发 (防 secret 泄露).
+    let (redaction_map, redact_seed, redactions) = match redact_and_derive(
+        &mut ir,
+        &secrets_snapshot,
+        state.on_probe_exhausted,
+        "same-proto",
+    ) {
+        Ok(out) => out,
+        Err(e) => {
+            warn!(
+                secret_id = %e.secret_id,
+                reason = ?e.reason,
+                "redact probe exhausted in same-proto path; refusing to forward (fail_closed)"
+            );
+            return Err(AppError::Unavailable(format!(
+                "redact probe exhausted, secret forwarding refused by policy \
+                     (on_probe_exhausted=fail_closed); check secret mock_strategy config \
+                     (secret_id hint: {}, reason: {:?})",
+                e.secret_id, e.reason
+            )));
+        }
+    };
 
     // 5. IR → 请求 body (同协议 writer 重序列化).
     let new_body = writer.write_request(&ir);

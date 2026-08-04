@@ -101,8 +101,28 @@ pub(crate) async fn cross_proto_forward(
     let real_messages = ir.messages.clone();
 
     // 8. redact IR + derive redactions (共享 helper, 内含 consistency-check 守卫).
-    let (redaction_map, redact_seed, redactions) =
-        redact_and_derive(&mut ir, &secrets_snapshot, "cross-proto");
+    //    FailClosed 模式下 probing 耗尽 → 直接 503 拒绝转发 (防 secret 泄露).
+    let (redaction_map, redact_seed, redactions) = match redact_and_derive(
+        &mut ir,
+        &secrets_snapshot,
+        state.on_probe_exhausted,
+        "cross-proto",
+    ) {
+        Ok(out) => out,
+        Err(e) => {
+            warn!(
+                secret_id = %e.secret_id,
+                reason = ?e.reason,
+                "redact probe exhausted in cross-proto path; refusing to forward (fail_closed)"
+            );
+            return Err(AppError::Unavailable(format!(
+                "redact probe exhausted, secret forwarding refused by policy \
+                     (on_probe_exhausted=fail_closed); check secret mock_strategy config \
+                     (secret_id hint: {}, reason: {:?})",
+                e.secret_id, e.reason
+            )));
+        }
+    };
 
     // 9. IR → egress body.
     let egress_body_value = egress_writer.write_request(&ir);

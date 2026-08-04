@@ -34,6 +34,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| default_state_path(&args.config));
     // dynamic state 的 secret 校验用 static config 的 global_mock_prefix.
     let global_mock_prefix = static_cfg.redact.global_mock_prefix.clone();
+    let on_probe_exhausted = static_cfg.redact.on_probe_exhausted;
     let dyn_state = DynamicState::load_or_empty(&state_path, &global_mock_prefix)?;
 
     let host = args.host.unwrap_or_else(|| static_cfg.server.host.clone());
@@ -50,6 +51,7 @@ async fn main() -> Result<()> {
         dynamic_providers = dyn_state.providers.len(),
         dynamic_secrets = dyn_state.secrets.len(),
         decisions = dyn_state.decisions.providers.len() + dyn_state.decisions.secrets.len(),
+        on_probe_exhausted = ?on_probe_exhausted,
         "starting secret-guard"
     );
 
@@ -64,6 +66,7 @@ async fn main() -> Result<()> {
         args.config.clone(),
         static_cfg.auth,
         global_mock_prefix,
+        on_probe_exhausted,
     )
     .await
 }
