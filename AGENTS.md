@@ -559,6 +559,12 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
 
 ### 已知搁置 (有意识的不做)
 
-- **redact 性能优化 (Aho-Corasick)**: `redact_ir` 与 `StreamingRestorer::find_safe_end`
-  对每个 secret 做全字符串扫描 (K * n 复杂度). 性能基线已建立 (`just bench`),
-  当前不是瓶颈, 等真有性能问题再做. 详尽设计见 `benches/redact.rs` 头部.
+- **redact 性能优化 (Aho-Corasick 多模式匹配)**: `redact_ir` 的 `gen_mock_for_ir` 已
+  做 P2-1 优化 (hybrid 延迟预拼接 IR 叶子缓存, 消除 P×L 因子, 详见 `src/redact.rs`
+  `gen_mock_for_ir` 头部); `StreamingRestorer::find_safe_end` + `restore_str_inplace`
+  仍对每个 mock 朴素 find+replace (K 次扫描). P2-2 曾尝试合并两者扫描 (缓存命中 mock
+  列表 + restore 复用), 实测因 `restore_str_inplace` 的 `if s.contains(mock)` 预检查
+  已避免无命中 mock 的 replace 开销, 而缓存命中列表需重新扫描 head (与 contains 等价)
+  或 clone pair (分配开销), 净收益为负, 已回退. 真正的合并优化需要 Aho-Corasick 单次
+  多模式扫描 (消除 K 因子), 当前不是瓶颈, 性能基线已建立 (`just bench`), 等真有性能
+  问题再做. 详尽设计见 `benches/redact.rs` 头部.

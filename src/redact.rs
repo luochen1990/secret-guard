@@ -198,6 +198,12 @@ const MOCK_PROBE_LIMIT: u32 = 512;
 /// 返回 `Err(RedactError)` 当探测耗尽 (`MOCK_PROBE_LIMIT` 次仍未找到唯一 mock). 旧实现用 `panic!`,
 /// 消息含 `secret.value` (真实 secret 明文) 与 `secret.mock_strategy`, 可被弱配置 +
 /// 对抗性 IR 触发, 既 DoS 又泄密. 改为 `Result` 后由 [`redact_ir`] 决策降级策略.
+///
+/// **性能 (hybrid 延迟缓存)**: counter=0 走零拷贝遍历 ([`ir_request_contains`]); 首次后续
+/// probing (counter=1) 时构造叶子缓存 ([`collect_ir_str_leaves`], 一次性收集 IR 字符串
+/// 叶子引用, counter≥2 复用同一实例). 这把历史 O(K×P×L×n) (每次 probing 递归 match
+/// IrBlock 结构) 在 P≥2 场景降为 O(K×(L+P×n)) —— 结构遍历 L 只发生 1 次. secret 不跨
+/// 叶子边界, 缓存按叶子独立 contains 即正确. 详细 benchmark 见 `benches/redact.rs`.
 fn gen_mock_for_ir(
     ir: &IrRequest,
     secret: &SecretEntry,
@@ -205,9 +211,26 @@ fn gen_mock_for_ir(
     allocated: &HashSet<String>,
 ) -> Result<String, RedactError> {
     let mut counter: u32 = 0;
+    // 延迟预拼接缓存: 首次 probing 冲突 (counter≥1) 时才构造, 避免常见 P=1 场景的开销.
+    let mut ir_leaves_cache: Option<Vec<&str>> = None;
     loop {
         let candidate = candidate_for(secret, seed, counter);
-        if !ir_request_contains(ir, &candidate) && !allocated.contains(&candidate) {
+        // 空候选必须短路: ir_request_contains 内部对空 needle 返回 false (对齐),
+        // 但缓存路径 `leaf.contains("")` 返回 true (Rust std 行为); 弱配置 (eg 空
+        // global_mock_prefix + pool.is_empty() 时 gen_candidate 返回空 prefix) 会触发.
+        let in_ir = if candidate.is_empty() {
+            false
+        } else if counter == 0 {
+            // 首次 probing: 零拷贝遍历 IR 结构.
+            ir_request_contains(ir, &candidate)
+        } else {
+            // 后续 probing: 复用预拼接缓存 (首次后续构造).
+            ir_leaves_cache
+                .get_or_insert_with(|| collect_ir_str_leaves(ir))
+                .iter()
+                .any(|leaf| leaf.contains(&candidate))
+        };
+        if !in_ir && !allocated.contains(&candidate) {
             return Ok(candidate);
         }
         counter += 1;
@@ -563,6 +586,11 @@ pub(crate) fn restore_str_inplace(s: &mut String, map: &RedactionMap) {
 ///
 /// redact 在 IR 字符串叶子做 real↔mock 替换; 该 trait 抽象"找到所有字符串叶子"的逻辑,
 /// 让 IrRequest / IrBlock / Value 等不同容器共享同一套遍历代码.
+///
+/// **走查责任 (SSOT 并行实现)**: [`collect_ir_str_leaves`] / [`collect_block_leaves`] /
+/// [`collect_value_leaves`] (P2-1 性能优化缓存构造器) 因 trait `&str` 生命周期不可外提
+/// 而内联了相同遍历逻辑. 新增 IrBlock variant / IrTool 字段时, 本 trait impl 与这三
+/// 函数两处都要改; 一致性由 `tests::collect_leaves_matches_for_each_str_leaf` 守卫.
 pub(crate) trait StringLeafOps {
     /// 遍历所有字符串叶子 (不可变借用).
     fn for_each_str_leaf(&self, f: &mut impl FnMut(&str));
@@ -768,11 +796,110 @@ impl StringLeafOps for IrResponse {
     }
 }
 
+/// 一次性收集 IR 所有字符串叶子为 `Vec<&str>` (零拷贝, 只持有叶子引用).
+///
+/// **用途 (P2-1)**: [`gen_mock_for_ir`] 在首次 probing 冲突 (P≥2) 时构造此缓存,
+/// 后续 probing 复用, 避免每次都递归 match IrBlock 结构.
+///
+/// **零拷贝**: 返回叶子引用而非拼接 String, 避免 K=1 P=1 场景下大 body 的拷贝退化.
+///
+/// **为何不复用 `for_each_str_leaf`**: trait 签名 `fn for_each_str_leaf(&self, f: &mut
+/// impl FnMut(&str))` 的 `&str` 生命周期省略绑 `&self`, 但把 `&str` 收集到外部 `Vec`
+/// 时编译器无法传播该生命周期 (E0521). 故此处内联遍历逻辑.
+///
+/// **SSOT 警告**: 此函数 + [`collect_block_leaves`] + [`collect_value_leaves`] 与
+/// [`StringLeafOps`] (for IrRequest/IrBlock/Value) 是**并行实现**, 叶子集合必须完全
+/// 一致 (漏收一个叶子 = secret 泄漏, 多收一个 = 性能退化). 新增 IrBlock variant /
+/// IrTool 字段时, `impl StringLeafOps` 与这三个 collect 函数两处都要改. 一致性由
+/// `tests::collect_leaves_matches_for_each_str_leaf` 测试机械守卫.
+fn collect_ir_str_leaves(ir: &IrRequest) -> Vec<&str> {
+    let mut leaves: Vec<&str> = Vec::new();
+    for block in &ir.system {
+        collect_block_leaves(block, &mut leaves);
+    }
+    for msg in &ir.messages {
+        for block in &msg.content {
+            collect_block_leaves(block, &mut leaves);
+        }
+    }
+    for tool in &ir.tools {
+        leaves.push(&tool.name);
+        if let Some(d) = &tool.description {
+            leaves.push(d);
+        }
+        collect_value_leaves(&tool.input_schema, &mut leaves);
+    }
+    for s in &ir.stop {
+        leaves.push(s);
+    }
+    if let Some(u) = &ir.user {
+        leaves.push(u);
+    }
+    for v in ir.extra.values() {
+        collect_value_leaves(v, &mut leaves);
+    }
+    leaves
+}
+
+/// [`collect_ir_str_leaves`] 的 IrBlock 递归辅助.
+fn collect_block_leaves<'a>(block: &'a IrBlock, leaves: &mut Vec<&'a str>) {
+    match block {
+        IrBlock::Text { text } => leaves.push(text),
+        IrBlock::ToolUse { id, name, input } => {
+            leaves.push(id);
+            leaves.push(name);
+            collect_value_leaves(input, leaves);
+        }
+        IrBlock::ToolResult {
+            tool_use_id,
+            content,
+            ..
+        } => {
+            leaves.push(tool_use_id);
+            for c in content {
+                collect_block_leaves(c, leaves);
+            }
+        }
+        IrBlock::Image { source } => {
+            if let crate::codec::ir::IrImageSource::Url(u) = source {
+                leaves.push(u);
+            }
+        }
+        IrBlock::Reasoning { summary } => {
+            for s in summary {
+                leaves.push(s);
+            }
+        }
+    }
+}
+
+/// [`collect_ir_str_leaves`] 的 serde_json::Value 递归辅助.
+fn collect_value_leaves<'a>(value: &'a serde_json::Value, leaves: &mut Vec<&'a str>) {
+    match value {
+        serde_json::Value::String(s) => leaves.push(s),
+        serde_json::Value::Array(arr) => {
+            for e in arr {
+                collect_value_leaves(e, leaves);
+            }
+        }
+        serde_json::Value::Object(obj) => {
+            for e in obj.values() {
+                collect_value_leaves(e, leaves);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// IR 中是否出现 needle (在字符串字段中).
 ///
 /// 扫描范围: system blocks / messages.blocks / tools (name+description+input_schema) /
 /// IrBlock::ToolUse.{id, name, input} / IrBlock::ToolResult.content (递归) /
 /// stop sequences / user / extra (JSON 字符串叶子).
+///
+/// **性能角色 (P2-1)**: [`redact_ir`] 入口的 secret 命中检查 + [`gen_mock_for_ir`]
+/// 首次 probing (counter=0) 均用此函数 (零拷贝遍历). 仅当首次 probing 冲突 (P≥2) 时,
+/// `gen_mock_for_ir` 才切换到 [`collect_ir_str_leaves`] 缓存路径.
 fn ir_request_contains(ir: &IrRequest, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
@@ -936,6 +1063,80 @@ mod tests {
             "gen mock must avoid existing IR content; got {m}"
         );
         assert_ne!(m, "placeholder-string-that-must-be-avoided");
+    }
+
+    /// 守卫 collect_ir_str_leaves 与 StringLeafOps::for_each_str_leaf 收集相同叶子集合.
+    ///
+    /// P2-1 优化引入了 collect_ir_str_leaves (+ collect_block_leaves + collect_value_leaves)
+    /// 作为 StringLeafOps 的并行实现 (因 trait &str 生命周期不可外提). 漏收一个叶子会
+    /// 导致 secret 泄漏 (redact 跳过该叶子中的 secret), 多收会导致性能退化. 本测试构造
+    /// 覆盖全部 IrBlock variant + IrTool + IrRequest 各字段的 IR, 断言两份遍历产出相同
+    /// 叶子序列, 把 SSOT 一致性从文档纪律升级为机械保证.
+    #[test]
+    fn collect_leaves_matches_for_each_str_leaf() {
+        use crate::codec::ir::{IrImageSource, IrTool};
+        let ir = IrRequest {
+            system: vec![IrBlock::Text {
+                text: "system-prompt".to_string(),
+            }],
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![
+                    IrBlock::Text {
+                        text: "msg-text".to_string(),
+                    },
+                    IrBlock::ToolUse {
+                        id: "tu-id".to_string(),
+                        name: "tu-name".to_string(),
+                        input: serde_json::json!({"key": "tu-input-val", "n": 42}),
+                    },
+                    IrBlock::ToolResult {
+                        tool_use_id: "tr-id".to_string(),
+                        content: vec![IrBlock::Text {
+                            text: "tr-content".to_string(),
+                        }],
+                        is_error: false,
+                        content_form: None,
+                    },
+                    IrBlock::Image {
+                        source: IrImageSource::Url("img-url".to_string()),
+                    },
+                    IrBlock::Reasoning {
+                        summary: vec!["reasoning-summary".to_string()],
+                    },
+                ],
+                ..Default::default()
+            }],
+            tools: vec![IrTool {
+                name: "tool-name".to_string(),
+                description: Some("tool-desc".to_string()),
+                input_schema: serde_json::json!({"type": "object", "title": "schema-title"}),
+            }],
+            stop: vec!["stop1".to_string()],
+            user: Some("user-id".to_string()),
+            extra: {
+                let mut m = serde_json::Map::new();
+                m.insert(
+                    "extra-key".to_string(),
+                    serde_json::Value::String("extra-val".to_string()),
+                );
+                m
+            },
+            ..Default::default()
+        };
+        // for_each_str_leaf 收集 (用 String 避免 &str 生命周期外提问题, E0521).
+        let mut for_each_leaves: Vec<String> = Vec::new();
+        ir.for_each_str_leaf(&mut |s| for_each_leaves.push(s.to_string()));
+        // collect_ir_str_leaves 收集.
+        let collect_leaves: Vec<String> = collect_ir_str_leaves(&ir)
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            for_each_leaves, collect_leaves,
+            "collect_ir_str_leaves must gather exactly the same leaves as for_each_str_leaf; \
+             divergence means a secret in the missed leaf would leak unredacted"
+        );
     }
 
     #[test]
