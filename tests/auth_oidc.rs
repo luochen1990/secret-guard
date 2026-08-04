@@ -379,6 +379,12 @@ fn token_response_no_id_token() -> Response {
 ///
 /// 与 `server.rs::build_router_with_auth_layers` 的差异: 不挂 ProxyState /
 /// forwarding 路由, 只保留 OIDC session + handlers, 让测试聚焦 auth 行为.
+///
+/// # 端口隔离
+///
+/// 每次 `build_test_router` 都 `TcpListener::bind("127.0.0.1:0")` 让 OS 分配
+/// 空闲端口, 多个测试并行跑不会冲突. ApiKeyStore 的 state_path 也用 UUID 唯一化
+/// (避免跨测试 state 持久化文件污染).
 async fn build_test_router(backend: OidcBackend) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
