@@ -25,6 +25,7 @@ URL 形如 `/{proto_short}/{provider_id}/*rest`, 同时编码 **入站协议** �
 | `a` | Anthropic | `http://127.0.0.1:18787/a/<provider-id>` |
 | `g` | Gemini    | `http://127.0.0.1:18787/g/<provider-id>` |
 | `l` | oLLama    | `http://127.0.0.1:18787/l/<provider-id>` |
+| `r` | Responses (OpenAI Responses API) | `http://127.0.0.1:18787/r/<provider-id>` |
 
 `proto_short` 简写映射来自 `Protocol::ALL`, 详细路由错误语义见 `AGENTS.md`.
 
