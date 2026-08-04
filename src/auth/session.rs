@@ -11,6 +11,9 @@ use tower_sessions::{
 /// 构造 SessionManagerLayer (MemoryStore).
 ///
 /// - `with_secure(false)`: 本地 HTTP dev 必须 false, 否则浏览器不回传 cookie.
+///   **生产注意**: 经反向代理暴露 HTTPS 时此设置会让 session cookie 不带 Secure flag,
+///   详见 `docs/deployment-nixos.md` "HTTPS 反向代理" 段. 根治 (配置开关 / X-Forwarded-Proto
+///   推断) 是后续工作.
 /// - `with_same_site(Lax)`: OIDC callback 跨站重定向需要 Lax (Strict 会阻断).
 /// - `with_http_only(true)`: 防 XSS 读取 cookie (默认, 不要改).
 /// - `with_expiry(OnInactivity 1 day)`: 1 天不活动后过期.

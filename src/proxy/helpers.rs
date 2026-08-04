@@ -93,6 +93,16 @@ pub(super) fn utf8_view(b: &[u8]) -> String {
 ///
 /// 返回 `(lowercase_name, value_or_redacted)` 列表. 敏感 header 的 value 替换为
 /// `<redacted>`, 非法 ASCII value 替换为 `<binary>`, 其余原样保留.
+///
+/// # 名单边界 (用户自定义 auth header)
+///
+/// 脱敏名单是**硬编码黑名单** (见 [`is_sensitive_header`]): 主流 LLM provider 的
+/// 标准 auth header (**显式枚举, 非 glob 前缀匹配**) 加上含 `token` /
+/// `secret` 子串的关键词匹配. 完整名单以 [`is_sensitive_header`] 为 SSOT.
+///
+/// **未在名单内的 header 会原样记录到 WebUI DAG record**. 用户若使用自定义 auth header
+/// (如 `x-my-service-key`), 需在 [`is_sensitive_header`] 追加 (后续工作: 暴露为
+/// `[redact] redacted_headers` 配置项; 当前硬编码, 见 AGENTS.md "已知限制").
 pub(super) fn redact_headers(src: &HeaderMap) -> Vec<(String, String)> {
     src.iter()
         .map(|(name, value)| {

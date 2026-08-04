@@ -104,7 +104,7 @@
 2. **假设声明注释**: 每个解析点必须在注释中显式写出它对输入的假设
    (如 "假设 messages 数组中 user 在 assistant 之前"), 以及假设不成立时的降级行为.
 
-已实践位置: `web::api::extract_preview_and_model` (preview 提取),
+已实践位置: `derive::extract_preview_and_model` (preview 提取),
 `derive::extract_delta_messages_from_raw` (delta 切片).
 (注: 前端 `toolNameOfRound` 已删除, tool name 推断迁移到后端 `extract_preview_and_model`,
 由 `prop_preview_never_panics` 统一守卫, 详见 `docs/design/contracts.md` §8 ROB-1.)
@@ -504,6 +504,16 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
   messages 数 > IR messages 数. `extract_delta_messages_from_raw` 切片时跨协议路径的 start 偏小,
   delta 可能包含前序轮消息. 同协议路径不受影响. 详见 `src/web/AGENTS.md`.
 - static config 的 `[server]` / `[redact]` 段仅在启动时读取一次, WebUI 改 host/port/global_mock_prefix 不会生效.
+- **redact_headers 名单硬编码 (SEC-4)**: `proxy/helpers.rs::redact_headers` 的敏感 header
+  脱敏名单是硬编码黑名单 (显式枚举主流 provider auth header + 含 "token" / "secret"
+  子串匹配, 完整名单以 `is_sensitive_header` 为 SSOT). 未在名单内的 header 会原样
+  记录到 WebUI DAG record. 用户若使用自定义 auth header (如 `x-my-service-key`),
+  当前无法在不改代码的情况下追加. 后续工作: 暴露为 `[redact] redacted_headers = [...]`
+  配置项.
+- **session cookie Secure flag 硬编码 false**: `auth/session.rs::build_session_layer`
+  硬编码 `with_secure(false)` (本地 HTTP dev 必须). 经反向代理暴露 HTTPS 时 cookie 不带
+  Secure flag, 详见 `docs/deployment-nixos.md` "HTTPS 反向代理" 段. 根治方案 (配置开关 /
+  X-Forwarded-Proto 推断) 是后续工作.
 - **DAG 孤儿节点降级**: parent 被 LRU 淘汰后, child 的 `full_request_messages` 返回 None
   (timeline 降级展示, 不 panic). 显式孤儿标记 (CDAG-7) 尚未实现.
 - **auth 模块测试覆盖率 (OIDC 登录流程)**: auth 模块的纯逻辑已覆盖
@@ -528,6 +538,12 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
   `StreamTranslate::new(ingress, egress)` 而非返回 501.
 - **更多协议**: Gemini / Ollama / Bedrock / Cohere / OpenAI Responses API.
   新增协议只需实现 Reader + Writer trait (~200 行), 不动 dispatch.
+- **redact_headers 名单可配置**: 加 `[redact] redacted_headers = [...]` 配置项,
+  默认值是现有硬编码名单, 用户可扩展自定义 auth header. 当前硬编码黑名单见
+  `proxy/helpers.rs::is_sensitive_header` (SEC-4 已知限制).
+- **session cookie Secure flag 可配置**: 给 `build_session_layer` 加配置开关
+  (`[auth] secure_cookie = true`) 或从 `X-Forwarded-Proto` header 动态推断.
+  当前硬编码 false (本地 HTTP dev 必须), 见 `docs/deployment-nixos.md` "HTTPS 反向代理" 段.
 - mock_secret 的 category-aware 默认生成 (Password/ApiKey/Cookie 等格式感知).
 - 配置热加载; 测试覆盖率自动上报 + fuzzing (cargo-fuzz).
 - **auth/oidc.rs + handlers OIDC 流程的集成测试 (已完成 happy + 错误路径)**:

@@ -47,6 +47,25 @@ services.secret-guard.configFile = (pkgs.writeText "secret-guard.toml" ''
 **不推荐**: `sops.templates` 渲染整个 toml 把 api_key 嵌入明文 — toml 无法进 nix
 store, 调试不便, 与 nixos 生态主流模式 (hermes-agent / bazarr) 不一致.
 
+## HTTPS 反向代理: session cookie 的 Secure flag
+
+`secret-guard` 当前在 `src/auth/session.rs::build_session_layer` 中**硬编码
+`with_secure(false)`**. 这是本地 HTTP 开发模式必须的设置 — `Secure` flag 会让浏览器
+拒绝在 HTTP 连接上回传 cookie, 导致 OIDC 流程在 `localhost` 调试时无法登录.
+
+**生产部署的隐患**: 若把 `secret-guard` 暴露在公网并通过反向代理 (nginx / Caddy /
+Traefik) 终止 TLS, 浏览器与反代之间虽然是 HTTPS, 但 `secret-guard` 本身仍监听 HTTP,
+发出的 session cookie 不带 `Secure` flag. 此时 cookie 在浏览器与反代之间的 HTTPS 段
+是安全的, 但浏览器若误用 HTTP 访问相同 origin (如用户手输 URL 漏 `https://`), cookie
+会被明文发送, 构成 MITM 风险.
+
+**当前缓解**: 反向代理配置 HTTP→HTTPS 301 重定向 (nginx `return 301 https://$host$request_uri`),
+让浏览器无法通过 HTTP 访问 origin.
+
+**根治方案 (后续工作)**: 给 `build_session_layer` 加配置开关 (例如 `[auth] secure_cookie = true`),
+或从 `X-Forwarded-Proto` header 动态推断. 当前硬编码 `false` 是 MVP 的简化, 见
+`src/auth/session.rs::build_session_layer` 头部注释.
+
 ## secret entries 的批量注入 (value_file + LoadCredential)
 
 `SecretEntry` 同样支持 `value_file` (启动时一次性 resolve, fail-fast), 所以
