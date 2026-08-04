@@ -180,6 +180,24 @@ jobs:
             echo "Created new comment"
           fi
 
+      # 持久 cache 卷 (10G tmpfs) 防满清理: profraw 文件每次 CI 累积 ~45MB, ~110 次后触顶
+      # 导致 ENOSPC, 所有 cargo 编译步骤立即失败. 本步在任何 cargo 命令前先释放空间.
+      # 保留 debug/ 与 llvm-cov-target/debug/ (增量编译复用), 仅清累积性中间产物.
+      # rm -f 对不存在文件不报错; find ... -delete 更稳健 (处理子目录嵌套). continue-on-error
+      # 兜底防万一 (清理失败仍让后续步骤尝试, ENOSPC 报错更明确).
+      - name: Reclaim cache volume (profraw/profdata accumulation)
+        continue-on-error: true
+        run: |
+          echo "=== CARGO_TARGET_DIR 磁盘占用 (清理前) ==="
+          df -h "${CARGO_TARGET_DIR}" || true
+          du -sh "${CARGO_TARGET_DIR}" 2>/dev/null | head -5 || true
+          # profraw 是 cargo-llvm-cov 测试运行时逐进程写的原始覆盖率数据, 量大且用完即弃.
+          find "${CARGO_TARGET_DIR}" -name '*.profraw' -delete 2>/dev/null || true
+          # profdata 是 profraw 合并产物 (coverage-gate 消费后即废弃).
+          find "${CARGO_TARGET_DIR}" -name '*.profdata' -delete 2>/dev/null || true
+          echo "=== CARGO_TARGET_DIR 磁盘占用 (清理后) ==="
+          df -h "${CARGO_TARGET_DIR}" || true
+
       # consistency-check feature 守卫: clippy + nextest 带 feature flag 跑一次.
       # 该 feature 是默认关闭的 CI 守卫 (视图正确性断言, 详见 AGENTS.md "视图正确性确保机制"),
       # 必须显式启用才能让断言执行. 单独成步, 复用 checkout; 在 coverage 步骤的 cargo clean 前,
