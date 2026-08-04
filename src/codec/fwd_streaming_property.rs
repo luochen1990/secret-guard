@@ -187,7 +187,7 @@ fn feed_split_translator(t: &mut StreamTranslate, upstream: &[u8], splits: &[usi
 /// 直接指定 mock 值, 让测试对 mock 字符串完全可控 (生成器可以任意选 mock).
 fn build_redaction_map(real: &str, mock: &str) -> RedactionMap {
     let mut map = RedactionMap::default();
-    map.insert(real.to_string(), mock.to_string())
+    map.insert(real.to_string(), mock.to_string(), "id-test")
         .expect("单个 mock 不冲突");
     map
 }

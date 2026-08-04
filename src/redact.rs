@@ -123,15 +123,22 @@ impl RedactionMap {
     /// 插入映射. 若 mock 已映射到**不同** real (C4 单射性违反), 返回 `RedactError`
     /// (defense-in-depth; C4 保证正常路径不会触发).
     ///
-    /// **安全**: `RedactError` 只携带 `reason` (不含 mock 值也不含 real 明文).
+    /// **安全**: `RedactError` 只携带 `secret_id` 与 `reason` (不含 mock 值也不含 real 明文).
     /// 旧实现用 `assert!` 把 `{existing:?}` 与 `{real:?}` (真实 secret 明文) 写入 panic
-    /// 消息, 既是 DoS 面又是泄密面.
-    pub fn insert(&mut self, real: String, mock: String) -> Result<(), RedactError> {
+    /// 消息, 既是 DoS 面又是泄密面. collision 路径的 `secret_id` 由调用方传入, 让
+    /// `redact_ir` 的降级 `warn!` 日志能定位到具体 secret (旧实现在 collision 时填空串,
+    /// 仅探测耗尽路径有 secret_id, 两者不对称).
+    pub fn insert(
+        &mut self,
+        real: String,
+        mock: String,
+        secret_id: &str,
+    ) -> Result<(), RedactError> {
         if let Some(existing) = self.mock_to_real.get(&mock)
             && existing != &real
         {
             return Err(RedactError {
-                secret_id: String::new(),
+                secret_id: secret_id.to_string(),
                 reason: RedactReason::MockCollision,
             });
         }
@@ -330,7 +337,7 @@ fn redact_ir_inner(
             Ok(mock) => {
                 // 先 insert 到 map (防御性 C4 检查); 成功后再改写 IR + allocated,
                 // 确保 map 与 IR 状态一致 (避免改写了 IR 但 map 缺失映射, 导致 restore 失败).
-                match map.insert(secret.value.clone(), mock.clone()) {
+                match map.insert(secret.value.clone(), mock.clone(), &secret.id) {
                     Ok(()) => {
                         ir_request_replace_all(ir, &secret.value, &mock);
                         allocated.insert(mock);
@@ -1368,16 +1375,18 @@ mod tests {
         let real_a = "secret-AAAAAAA";
         let real_b = "secret-BBBBBBB";
         let same_mock = "MOCK-COLLISION";
-        map.insert(real_a.to_string(), same_mock.to_string())
+        map.insert(real_a.to_string(), same_mock.to_string(), "id-a")
             .unwrap();
         let err = map
-            .insert(real_b.to_string(), same_mock.to_string())
+            .insert(real_b.to_string(), same_mock.to_string(), "id-b")
             .expect_err("collision must return Err");
         // Err 的 Debug / Display 不得含任一 real secret 明文.
         let err_dbg = format!("{err:?}");
         assert!(!err_dbg.contains(real_a), "Err leaks real_a: {err_dbg}");
         assert!(!err_dbg.contains(real_b), "Err leaks real_b: {err_dbg}");
         assert_eq!(err.reason, RedactReason::MockCollision);
+        // collision 路径的 secret_id 由调用方传入 (旧实现填空串).
+        assert_eq!(err.secret_id, "id-b");
     }
 
     // ─── redact_ir_checked: fail_open / fail_closed 模式 ──────────────────
@@ -1442,10 +1451,10 @@ mod tests {
         // 实际生产中 C4 由 allocated 集合保证, collision 路径只在防御性检查触发.
         // 这里用 RedactionMap::insert 直接验证 reason 分类正确.
         let mut map = RedactionMap::default();
-        map.insert("real-a".to_string(), "same-mock".to_string())
+        map.insert("real-a".to_string(), "same-mock".to_string(), "id-a")
             .unwrap();
         let err = map
-            .insert("real-b".to_string(), "same-mock".to_string())
+            .insert("real-b".to_string(), "same-mock".to_string(), "id-b")
             .expect_err("collision must return Err");
         assert_eq!(err.reason, RedactReason::MockCollision);
         // FailClosed 路径在 redact_ir_inner 内会把这个 Err 直接传播 (不 warn+skip).
@@ -1660,8 +1669,12 @@ mod tests {
             ..Default::default()
         };
         let mut map = RedactionMap::default();
-        map.insert("sk-real-secret".to_string(), "MOCKABCDEF12345".to_string())
-            .unwrap();
+        map.insert(
+            "sk-real-secret".to_string(),
+            "MOCKABCDEF12345".to_string(),
+            "id-test",
+        )
+        .unwrap();
         restore_ir_response(&mut ir, &map);
         match &ir.content[0] {
             IrBlock::Text { text } => {
@@ -1678,7 +1691,8 @@ mod tests {
 
     fn map_with(real: &str, mock: &str) -> RedactionMap {
         let mut m = RedactionMap::default();
-        m.insert(real.to_string(), mock.to_string()).unwrap();
+        m.insert(real.to_string(), mock.to_string(), "id-test")
+            .unwrap();
         m
     }
 
@@ -1740,9 +1754,9 @@ mod tests {
     #[test]
     fn restorer_round_trip_on_multiple_mocks_in_one_chunk() {
         let mut map = RedactionMap::default();
-        map.insert("r1".to_string(), "MOCK11111111111".to_string())
+        map.insert("r1".to_string(), "MOCK11111111111".to_string(), "id-r1")
             .unwrap();
-        map.insert("r2".to_string(), "MOCK22222222222".to_string())
+        map.insert("r2".to_string(), "MOCK22222222222".to_string(), "id-r2")
             .unwrap();
         let mut r = StreamingRestorer::new(map);
         let out = r.push("a MOCK11111111111 b MOCK22222222222 c".to_string());
@@ -2092,8 +2106,7 @@ mod tests {
         ) {
             let real = "SECRETVALUE";
             let mock = "MOCKABCDEFGHIJK"; // 15 字节, 与 real 等价映射
-            let mut map = RedactionMap::default();
-            map.insert(real.to_string(), mock.to_string()).unwrap();
+            let map = map_with(real, mock);
 
             let full = format!("{prefix}{mock}{suffix}");
             let mut r = StreamingRestorer::new(map);
@@ -2113,8 +2126,7 @@ mod tests {
         ) {
             let real = "SECRETVALUE";
             let mock = "MOCKABCDEFGHIJK";
-            let mut map = RedactionMap::default();
-            map.insert(real.to_string(), mock.to_string()).unwrap();
+            let map = map_with(real, mock);
 
             let full = format!("{prefix}{mock}{suffix}");
             let mut r = StreamingRestorer::new(map);
@@ -2136,8 +2148,10 @@ mod tests {
             let mock1 = "MOCK11111111111"; // 15 字节
             let mock2 = "MOCK22222222222";
             let mut map = RedactionMap::default();
-            map.insert(real1.to_string(), mock1.to_string()).unwrap();
-            map.insert(real2.to_string(), mock2.to_string()).unwrap();
+            map.insert(real1.to_string(), mock1.to_string(), "id-r1")
+                .unwrap();
+            map.insert(real2.to_string(), mock2.to_string(), "id-r2")
+                .unwrap();
 
             // full 含两个 mock + filler (可能相邻 / 嵌套 / 被 filler 分隔).
             let full = format!("{filler}{mock1}{filler}{mock2}{filler}");
@@ -2215,12 +2229,13 @@ mod tests {
         ) {
             prop_assume!(secret_a != secret_b, "需要两个不同 secret 才能触发 collision");
             // 手动构造 C4 单射性违反: 同一 mock 映射到两个不同 real.
+            // secret_id 用占位 "id-a" / "id-b" (与生产路径语义一致: 由调用方传入).
             let mut map = RedactionMap::default();
-            map.insert(secret_a.clone(), "mock-x".into())
+            map.insert(secret_a.clone(), "mock-x".into(), "id-a")
                 .expect("首次插入应成功");
             // 第二次插入同一 mock + 不同 real → MockCollision.
             let err = map
-                .insert(secret_b.clone(), "mock-x".into())
+                .insert(secret_b.clone(), "mock-x".into(), "id-b")
                 .expect_err("collision must return Err (not panic)");
             prop_assert_eq!(err.reason, RedactReason::MockCollision);
             let debug = format!("{:?}", err);

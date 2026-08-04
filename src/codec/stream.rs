@@ -1189,7 +1189,8 @@ mod tests {
         let chunk2_content = format!("{}Y", &mock[mock_split..]);
 
         let mut map = crate::redact::RedactionMap::default();
-        map.insert(real.to_string(), mock.to_string()).unwrap();
+        map.insert(real.to_string(), mock.to_string(), "id-test")
+            .unwrap();
         let mut t = StreamTranslate::new_same_proto_restore(Protocol::OpenAI, map);
 
         let sse1 = format!(

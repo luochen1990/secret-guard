@@ -162,7 +162,7 @@ fn make_redaction_map(secrets: &[SecretEntry]) -> (RedactionMap, Vec<String>) {
     let mut mocks = Vec::with_capacity(secrets.len());
     for (i, e) in secrets.iter().enumerate() {
         let mock = format!("MOCK-{:015}", i);
-        map.insert(e.value.clone(), mock.clone()).unwrap();
+        map.insert(e.value.clone(), mock.clone(), &e.id).unwrap();
         mocks.push(mock);
     }
     (map, mocks)
