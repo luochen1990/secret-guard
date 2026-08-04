@@ -341,7 +341,7 @@ impl DeltaKind {
 /// # Invariant
 ///
 /// - `buffer.len() ≤ hold + 3` (push 后必然 trim; +3 是 UTF-8 char boundary 回退上限).
-/// - `max_mock_len` 在构造时锁定 (proxy.rs 保证 redact snapshot 期间 RedactionMap 不变).
+/// - `max_mock_len` 在构造时锁定 (proxy/ 保证 redact snapshot 期间 RedactionMap 不变).
 /// - 一个 restorer 对应单个 block index, 期间 delta kind 不变 (text 或 input_json 二选一).
 ///
 /// # Scope / Out of scope

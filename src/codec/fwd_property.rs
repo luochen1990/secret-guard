@@ -502,7 +502,7 @@ fn arb_anthropic_stop_reason() -> impl Strategy<Value = Value> {
 /// FWD-1 半段式断言 (OpenAI / Anthropic 共享): 同协议 + redact 路径下,
 /// secret-guard 对 wire 的唯一合法修改是 real→mock.
 ///
-/// 步骤 (与生产 `proxy.rs::same_proto_forward` 完全一致):
+/// 步骤 (与生产 `proxy/same_proto.rs::same_proto_forward` 完全一致):
 /// 1. `reader.read_request(wire)` → IR
 /// 2. `redact_ir(&mut IR, [secret])` → 替换 IR 字符串叶子 real→mock
 /// 3. `writer.write_request(IR)` → wire_out

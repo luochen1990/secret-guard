@@ -66,7 +66,7 @@ normalize(v) == normalize(Writer(Reader(v)))
 | `IrBlock::ToolResult.content_form: Option<ContentForm>` | ir.rs | tool_result 内 content 形态 (Anthropic 特有) |
 
 **清空 SSOT**: `IrRequest::clear_wire_fidelity()` 集中清空所有 wire_fidelity 字段
-(含嵌套 ToolResult), 跨协议路径 (`proxy.rs::cross_proto_forward`) 调用之.
+(含嵌套 ToolResult), 跨协议路径 (`proxy/cross_proto.rs::cross_proto_forward`) 调用之.
 新增 wire_fidelity 字段时只需改这一处.
 
 **当前覆盖与搁置**:
@@ -79,7 +79,7 @@ response 路径的 2 个 property 标了 `#[ignore]`, 实现 L8 后启用.
 
 ## 关键不变式
 
-1. **同协议 + 无 Redact 不进入 codec** (字节透传), 零回归. 见 `proxy.rs::dispatch`.
+1. **同协议 + 无 Redact 不进入 codec** (字节透传), 零回归. 见 `proxy/mod.rs::dispatch`.
 2. **同协议 + Redact**: reader → `redact_ir` → writer 重序列化, **normalize_json 相等**
    (wire 形态元数据保留, 语义信息无损; 字段顺序 / 空白等无语义差异由 normalize 吸收).
    恢复流式 UX.
@@ -90,8 +90,8 @@ response 路径的 2 个 property 标了 `#[ignore]`, 实现 L8 后启用.
 
 ## 与其它模块的协作
 
-- **`proxy.rs`**: `dispatch` 根据 ingress/egress 协议是否一致 + 是否有 Redact,
-  选择字节透传 / IR 路径 / 跨协议翻译. 详见 `src/proxy.rs` 头部.
+- **`proxy/`**: `dispatch` 根据 ingress/egress 协议是否一致 + 是否有 Redact,
+  选择字节透传 / IR 路径 / 跨协议翻译. 详见 `src/proxy/mod.rs` 头部.
 - **`redact.rs`**: Redact/Restore 在 IR 层操作, 与 codec 同层, 两者自然组合
   (跨协议翻译 + Redact 在同一 pipeline).
 - **`dag.rs`**: DAG 节点存储 IrBlock, codec 的 IR 类型是 DAG 的内容寻址单元.

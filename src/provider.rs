@@ -155,7 +155,7 @@ impl Provider {
     /// 单个 provider 配置错误不应拖垮整个进程.
     ///
     /// 但会 `warn!` 一次让运维可观测 — 文件读不到时, 仅从上游 401/403 反推原因很痛苦.
-    /// 与项目其他错误路径 (`proxy.rs` 中 `warn!` 各种 IO/header 错误) 风格一致.
+    /// 与项目其他错误路径 (`proxy/` 中 `warn!` 各种 IO/header 错误) 风格一致.
     pub fn effective_api_key(&self) -> String {
         if !self.api_key.is_empty() {
             return self.api_key.clone();

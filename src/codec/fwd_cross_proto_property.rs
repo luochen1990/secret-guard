@@ -50,7 +50,7 @@ proptest! {
     /// FWD-3 `prop_cross_proto_extra_cleared`: 跨协议路径下, ingress IR 的 extra 字段
     /// 必须清空, 不允许源协议独有字段泄漏到 egress.
     ///
-    /// 步骤 (与生产 `proxy.rs::cross_proto_forward` 一致):
+    /// 步骤 (与生产 `proxy/cross_proto.rs::cross_proto_forward` 一致):
     /// 1. ingress_reader.read_request(wire_with_extra) → ir (extra 非空)
     /// 2. ir.extra.clear() + ir.clear_wire_fidelity()
     /// 3. egress_writer.write_request(ir) → egress_wire

@@ -2145,9 +2145,9 @@
       return PROTO_BADGE_SVG[protoShort] || '';
     }
 
-    // 判断 error 字符串是否表示客户端中断 (proxy.rs 注入的固定标记).
+    // 判断 error 字符串是否表示客户端中断 (proxy 注入的固定标记).
     // 与真实上游错误区分: 客户端中断是正常使用路径, 不应渲染为红色 ERR.
-    // SSOT: proxy.rs fan_out_* 的 error_kind = "client disconnected".
+    // SSOT: proxy/record.rs::ERR_CLIENT_DISCONNECTED = "client disconnected".
     function isClientDisconnect(errorStr) {
       return errorStr === 'client disconnected';
     }
@@ -3965,7 +3965,7 @@
     // ─── provider endpoints 弹窗 ──────────────────────────────────────────
     //
     // 展示某个 provider 在 4 种 ingress 协议下的入口 URL 和支持状态.
-    // 判定 SSOT: 与后端 `proxy.rs::dispatch` 一致 —
+    // 判定 SSOT: 与后端 `proxy/mod.rs::dispatch` 一致 —
     //   ingress == egress → direct (同协议透传/IR redact);
     //   ingress != egress 且两者 codec 都支持 (openai/anthropic) → cross-protocol 转译
     //     (注: 仅非流式, stream=true 时后端返回 501, 见 cross_proto_forward);
