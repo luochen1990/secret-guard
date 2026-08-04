@@ -42,6 +42,19 @@ pub type BlockHash = u64;
 /// - `serde_json::Value` 不 impl `Hash`, 需 canonical JSON string 中转.
 ///
 /// 语义上仍是 SipHash (DefaultHasher), 算法不变, 只是入口分散在此.
+///
+/// # 性能 — 未做 memoize 的原因
+///
+/// `push_messages → intern_message → intern` 路径中, `hash_block` 在 `intern` 入口
+/// 无条件调用 (即使 block 已在池中), 因为必须先 hash 才能查 HashMap; BlockPool 去重
+/// 消除的是 `Arc::new(block.clone())`, 不消除 hash 本身. 历史 message 的 block 在每次
+/// `push_messages` 都被重新 intern, 是真实重复开销来源.
+///
+/// 未做 memoize 因 `IrBlock` 是核心数据结构 (enum, derive PartialEq/Clone), 加
+/// `OnceCell<BlockHash>` 会破坏派生 + 跨 clone 不共享缓存 + blast radius 过大.
+/// `MessageRef::hash` 已直接 hash `Vec<BlockHash>` (u64) 而非重调本函数, Merkle
+/// 累积路径 (`find_parent` / `accumulate_hash`) 不重复 walk block 内容.
+/// profiling 与 follow-up 选项见 AGENTS.md "已知搁置".
 pub(super) fn hash_block(block: &IrBlock) -> BlockHash {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();

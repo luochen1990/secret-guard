@@ -631,12 +631,18 @@ impl<T: DynamicEntry> DynamicTable<T> {
 
         let mut out: Vec<(Option<T>, Option<T>, OverrideMode)> =
             Vec::with_capacity(statics.len() + dynamics.len());
-        let mut seen: HashSet<String> = HashSet::new();
+        // seen 借 statics/dynamics 的 id 切片 (read guard 全程持有), 无需 String 分配.
+        let mut seen: HashSet<&str> = HashSet::new();
+
+        // 预构建 dynamic id → entry 索引: O(S×D) → O(S+D).
+        // 假设 dynamics 内 id 唯一 (由 upsert_dynamic 保证); 反序列化路径同样需保证,
+        // 否则 HashMap last-wins 与原 find first-wins 取舍不同.
+        let dyn_map: HashMap<&str, &T> = dynamics.iter().map(|d| (d.id(), d)).collect();
 
         // 1. 遍历 static ids, 按 decision 决定 effective.
         for s in statics.iter() {
-            seen.insert(s.id().to_string());
-            let dyn_opt = dynamics.iter().find(|d| d.id() == s.id()).cloned();
+            seen.insert(s.id());
+            let dyn_opt = dyn_map.get(s.id()).copied().cloned();
             let mode = T::get_decision(&decisions, s.id());
             if pick_effective(Some(s.clone()), dyn_opt.clone(), mode).is_some() {
                 out.push((Some(s.clone()), dyn_opt, mode));
@@ -644,10 +650,9 @@ impl<T: DynamicEntry> DynamicTable<T> {
         }
         // 2. dynamic-only ids: decision 不适用, 直接生效.
         for d in dynamics.iter() {
-            if seen.contains(d.id()) {
+            if !seen.insert(d.id()) {
                 continue;
             }
-            seen.insert(d.id().to_string());
             out.push((None, Some(d.clone()), OverrideMode::Default));
         }
         out

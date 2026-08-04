@@ -584,3 +584,8 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
   或 clone pair (分配开销), 净收益为负, 已回退. 真正的合并优化需要 Aho-Corasick 单次
   多模式扫描 (消除 K 因子), 当前不是瓶颈, 性能基线已建立 (`just bench`), 等真有性能
   问题再做. 详尽设计见 `benches/redact.rs` 头部.
+- **`hash_block` memoize (DAG)**: `serde_json::to_string` 在 `intern` 入口每 ToolUse
+  block 重算一次 (历史 message 的 block 在每次 `push_messages` 都被重新 intern).
+  未 memoize 因 `IrBlock` 加 `OnceCell<BlockHash>` 破坏 derive + 跨 clone 不共享缓存
+  + blast radius 大. 若 profiling 显示为瓶颈, 选项: (1) 手写 `Value` walk+hash 省
+  String 分配; (2) `OnceCell` 局部缓存 + 手写 PartialEq. 见 `src/dag/pool.rs::hash_block`.
