@@ -32,6 +32,30 @@
 //!    (避免并发 RMW 互相覆盖 state.toml).
 //! 2. 共享同一份 `Decisions` 给两个表 (因为 decisions 同时含 provider / secret 决策,
 //!    任何一方修改都要触发 state.toml 重写).
+//!
+//! # 内存模型 (SSOT — 缓冲 / 容量上限汇总)
+//!
+//! secret-guard 的内存上界由以下常量 + 并发度决定. 新增 / 调整任意一项时,
+//! 同步更新此表 (SSOT). 每项在自身定义点保留行内注释, 此处提供交叉引用 + 上界贡献分析.
+//!
+//! | 常量 | 值 | 位置 | 作用 | 上界贡献 |
+//! |---|---|---|---|---|
+//! | `MAX_REQ_BODY` | 16 MiB | `proxy/mod.rs` | 单请求 body 收集上限 (字节透传前的 `to_bytes` cap) | 16 MiB × 并发请求数 |
+//! | `MAX_RESP_BODY_RECORD` | 32 MiB | `proxy/mod.rs` | 单响应 record 累积上限 (**仅 DAG record, 客户端响应无上限**) | 32 MiB × 并发请求数 |
+//! | `MAX_BUF` | 16 MiB | `codec/stream.rs` | SSE reassembly 缓冲 (跨协议翻译 / 同协议 restore 路径) | 16 MiB × 并发流 |
+//! | `MAX_ERROR_MSG_LEN` | 4 KiB | `proxy/mod.rs` | 错误响应回放 message 截断 | 4 KiB × 失败请求数 (常量小) |
+//! | `C5_INTERNAL_RETRIES` | 10_000 | `mock.rs` | mock 候选生成内部重试链 (safety bound, 防 C5 退化为概率) | CPU 限界, 不占内存 |
+//! | `MOCK_PROBE_LIMIT` | 2^20 (prod) / 512 (test) | `redact.rs` | gen_mock_for_ir 的 probing 上限 | CPU 限界, 不占内存 |
+//! | `PARSED_SYNC_INTERVAL` | 500 ms | `proxy/record.rs` | 流式 parsed view 节流写入间隔 (UX 与锁竞争折中) | 时间常量, 不占内存 |
+//! | `records_capacity` (ServerConfig) | 1024 (默认, 用户可配) | `config.rs::ServerConfig` → `main.rs` → `serve()` → `ConversationDag::new(max_nodes, ...)` | DAG node 总数上限 (FIFO 淘汰) | ~每 node 几 KB (request/response body + metadata) × records_capacity |
+//! | `max_sessions` (硬编码 500) | 500 | `server.rs::serve()` → `ConversationDag::new(_, 500, _)` → `dag::DagInner::max_sessions` | session 总数上限 (安全阀, 防 fork 爆炸) | session 元数据 × 500 (常量小) |
+//! | `min_sessions` (硬编码 1) | 1 | 同上 → `dag::DagInner::min_sessions` | session 数下限 (保底, 避免界面清空) | 下限, 非上界 |
+//!
+//! **最坏情况估算**: 在 N 个并发请求下, 主要内存上界 =
+//! N × (16 MiB request + 32 MiB response record + 16 MiB SSE reassembly) ≈ N × 64 MiB
+//! + DAG 持有量 (records_capacity × ~10 KB) ≈ 10 MiB (默认 1024). 1000 并发时 ≈ 64 GiB,
+//!   远超典型单机内存 — 实践中 LLM 请求远小于 16 MiB cap, 真实占用由 RPS × 平均 body size 决定,
+//!   cap 是防御恶意 / 误传大 body 的 safety bound, 不是稳态运行预算.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -54,6 +78,39 @@ use crate::provider::{Provider, ProviderTable};
 use crate::proxy::{ProxyState, forward, forward_no_rest};
 use crate::secrets::{SecretEntry, SecretTable};
 use crate::web;
+
+/// 构建 [`TraceLayer`] (SEC-3 加固: 显式限定 span 字段, 不记录 headers).
+///
+/// **为什么用宏而非函数**: `TraceLayer::new_for_http().make_span_with(closure)` 返回
+/// `TraceLayer<DefaultClass, RequestBody, DefaultMakeSpan, ...>` 的复合泛型类型, 显式
+/// 写出签名既冗长又脆弱 (随 tower-http 版本变). 宏在调用点展开, 让 `.layer(trace_layer!())`
+/// 保持简洁且类型自动推断. 这是 Rust 生态对 "返回复杂泛型 layer" 的惯用取舍.
+///
+/// **为什么需要显式 `make_span_with`**:
+/// `tower_http::trace::TraceLayer::new_for_http()` 的默认 `MakeSpan` 在不同版本间
+/// 行为不一致 (0.6 默认不记 headers, 但未来升级可能改变). Authorization / x-api-key /
+/// cookie 等 header 一旦进入 tracing span, 会通过 tracing subscriber 落到日志,
+/// 构成 SEC 红线 (与 [`crate::proxy::helpers::redact_headers`] 在 record 侧的脱敏职责对应,
+/// 本宏守护 span 侧, 同属 SEC-3 "assert/panic/log 不泄漏 secret" 的实现 — 防止敏感
+/// header 经 tracing span 泄露到日志). 显式 `make_span_with` 把 "只记 method/uri/version"
+/// 这条不变量固化在代码里, 升级 tower-http 时无需复核默认行为是否变更.
+///
+/// 不在此处记录的字段:
+/// - **headers** (含 Authorization / x-api-key / x-goog-api-key / cookie / set-cookie)
+/// - **request body** / **response body** (不会进 span)
+macro_rules! trace_layer {
+    () => {
+        TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
+            // SEC-3: 字段白名单 — 见宏 doc (不在此处记 headers/body).
+            tracing::info_span!(
+                "http.request",
+                method = %request.method(),
+                uri = %request.uri(),
+                version = ?request.version(),
+            )
+        })
+    };
+}
 
 /// 构建 axum Router (单用户模式, 无认证).
 ///
@@ -86,7 +143,7 @@ fn build_router_inner(state: ProxyState, auth_stack: Option<AuthStack>) -> Route
                 .route("/__sg/{*rest}", get(web::not_found))
                 .merge(forward_router)
                 .with_state(state)
-                .layer(TraceLayer::new_for_http())
+                .layer(trace_layer!())
         }
         Some(auth) => build_router_with_auth_layers(state, auth, forward_router),
     }
@@ -158,7 +215,7 @@ fn build_router_with_auth_layers(
         .merge(forward_protected)
         .with_state(state)
         .layer(auth_layer)
-        .layer(TraceLayer::new_for_http())
+        .layer(trace_layer!())
 }
 
 /// 构造 reqwest 客户端 (与上游连接复用).
