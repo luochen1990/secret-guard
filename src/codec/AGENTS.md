@@ -38,7 +38,8 @@
 - `normalize.rs` — canonical JSON 序列化 (`normalize_json`), 用于 FWD-2 property test
   的字节级断言. 仅测试用, 不进生产路径.
 - `openai.rs` — OpenAI Chat Completions 的 Reader/Writer (含流式 fan-out,
-  flat stream 一个 chunk 可能产生 0..n 个 IR 事件, 需 state 合成).
+  flat stream 一个 chunk 可能产生 0..n 个 IR 事件, 需 state 合成;
+  流式 state 机实现细节见文件头部 `//!` 与各 helper doc).
 - `anthropic.rs` — Anthropic Messages 的 Reader/Writer (流式 1:1 映射).
 - `responses.rs` — OpenAI Responses API 的 Reader/Writer (非流式; 流式 SSE 事件翻译未实现).
 - `stream.rs` — SSE chunk-boundary 处理 (TCP 切片兼容, CRLF/LF 双兼容, MAX_BUF 溢出 abort). 核心 de-frame 逻辑抽出共享骨架 `SseReassembler`, 由 `StreamTranslate` / `StreamScan` 各持一个实例, 避免 reassembly 循环重复 + 行为漂移.

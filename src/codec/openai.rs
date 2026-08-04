@@ -23,6 +23,18 @@ use super::{
     random_base62,
 };
 
+/// OpenAI Chat Completions stream 的 `tool_calls[].index` 字段实际上界.
+///
+/// OpenAI flat stream 把多个并行 tool_call 平铺到 `delta.tool_calls[]`, 用 `index` 字段
+/// 区分 (与 Anthropic 的 `content_block_start.index` 同义). reader 用 [`StreamDecodeState`]
+/// 跨 chunk 跟踪每个 oai_idx → ir_idx 的映射, oai_idx 作为 `BTreeSet<usize>` / `BTreeMap`
+/// 的 key 必须有上界, 防御 u64::MAX 等 wire 异常值导致内存爆炸.
+///
+/// 取值依据: 实测上界 (OpenAI 官方文档未明示 index 上限, 但 wire 历史上从未观测到 > 127;
+/// 远超此值几乎肯定是上游/中间件 bug). 超过此值的 index 被 clamp 到此值, 行为上是
+/// "合并到同一个 tool_call", 优于 panic.
+const MAX_OPENAI_TOOL_INDEX: usize = 127;
+
 // ─── Reader ────────────────────────────────────────────────────────────────
 
 pub struct OpenAiReader;
@@ -857,32 +869,10 @@ fn read_openai_stream_chunk(data: &Value, state: &mut StreamDecodeState) -> Vec<
         }
     }
 
-    // 3) 处理 finish_reason: 关闭所有开着的 block + MessageDelta + MessageStop.
+    // 3) 处理 finish_reason: 关闭所有开着的 block + MessageDelta + MessageStop;
+    //    否则若有中间 usage chunk, 防御性 emit MessageDelta(usage).
     if let Some(reason) = finish_reason {
-        let stop_reason = read_stop_reason(reason);
-        // 关闭 text block.
-        if state.text_block_open {
-            if let Some(idx) = state.text_index {
-                events.push(IrStreamEvent::BlockStop { index: idx });
-            }
-            state.text_block_open = false;
-        }
-        // 关闭所有 open tools.
-        let open_indices: Vec<usize> = state.open_tools.iter().copied().collect();
-        for oai_idx in open_indices {
-            if let Some(&ir_idx) = state.tool_ir_index.get(&oai_idx) {
-                events.push(IrStreamEvent::BlockStop { index: ir_idx });
-            }
-        }
-        state.open_tools.clear();
-        state.tool_ir_index.clear();
-
-        events.push(IrStreamEvent::MessageDelta {
-            stop_reason: Some(stop_reason),
-            stop_sequence: None,
-            usage: chunk_usage.unwrap_or_default(),
-        });
-        events.push(IrStreamEvent::MessageStop);
+        finish_stream(state, &mut events, read_stop_reason(reason), chunk_usage);
     } else if let Some(u) = chunk_usage {
         // 中间的 usage chunk (理论上 OpenAI 不会有, 防御性处理).
         events.push(IrStreamEvent::MessageDelta {
@@ -895,6 +885,54 @@ fn read_openai_stream_chunk(data: &Value, state: &mut StreamDecodeState) -> Vec<
     events
 }
 
+/// 流末尾的"关闭一切"操作: 依次关闭所有开着的 block (text + 全部 open tool), 然后
+/// emit `MessageDelta(stop_reason, usage)` 与 `MessageStop`.
+///
+/// **顺序契约**: 先关 text block (若开着), 再按 oai_idx 升序关所有 open tool
+/// (`open_tools` 是 `BTreeSet`, 升序迭代), 最后 MessageDelta / MessageStop.
+/// 此顺序与单测 + STR-5 proptest 锁定的 wire 顺序一致, 不得调整 (Anthropic writer
+/// 把 BlockStop 翻译为 `content_block_stop`, 顺序错位会破坏客户端的 block 聚合).
+fn finish_stream(
+    state: &mut StreamDecodeState,
+    events: &mut Vec<IrStreamEvent>,
+    stop_reason: IrStopReason,
+    usage: Option<IrUsage>,
+) {
+    close_open_blocks(state, events);
+    events.push(IrStreamEvent::MessageDelta {
+        stop_reason: Some(stop_reason),
+        stop_sequence: None,
+        usage: usage.unwrap_or_default(),
+    });
+    events.push(IrStreamEvent::MessageStop);
+}
+
+/// 关闭所有当前开着的 block: 先 text block (若开着), 再所有 open tool.
+///
+/// 关闭后清空 `text_block_open` / `open_tools` / `tool_ir_index`.
+/// "关 text + 关全部 tool" 是两个状态机的统一收尾动作, 集中此处避免散落两处.
+///
+/// **行为等价**: `open_tools` (BTreeSet, 升序) 作为"哪些 oai_idx 开着"的真相源,
+/// `tool_ir_index` 仅查 ir_idx (不假设两集合 key 同步).
+fn close_open_blocks(state: &mut StreamDecodeState, events: &mut Vec<IrStreamEvent>) {
+    // 关闭 text block.
+    if state.text_block_open {
+        if let Some(idx) = state.text_index {
+            events.push(IrStreamEvent::BlockStop { index: idx });
+        }
+        state.text_block_open = false;
+    }
+    // 关闭所有 open tools.
+    let open_indices: Vec<usize> = state.open_tools.iter().copied().collect();
+    for oai_idx in open_indices {
+        if let Some(&ir_idx) = state.tool_ir_index.get(&oai_idx) {
+            events.push(IrStreamEvent::BlockStop { index: ir_idx });
+        }
+    }
+    state.open_tools.clear();
+    state.tool_ir_index.clear();
+}
+
 /// 处理 OpenAI 流 chunk 的单个 `tool_calls[i]` delta.
 fn process_tool_call_delta(
     tc: &Value,
@@ -904,7 +942,7 @@ fn process_tool_call_delta(
     let oai_idx = tc
         .get("index")
         .and_then(Value::as_u64)
-        .map(|n| (n as usize).min(127)) // clamp 防 u64::MAX panic
+        .map(|n| (n as usize).min(MAX_OPENAI_TOOL_INDEX)) // clamp 防 u64::MAX panic
         .unwrap_or(0);
 
     let function = tc.get("function");
