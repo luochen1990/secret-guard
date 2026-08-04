@@ -20,9 +20,9 @@
 //! # chunk-boundary
 //!
 //! 一个 SSE 帧 (`event: foo\n\ndata: {...}\n\n`) 可能被 TCP 切成多个 chunk,
-//! 也会出现一个 chunk 包含多个帧的情况. [`StreamTranslate::feed`] 维护 reassembly 缓冲,
-//! 在内存中按帧边界分割. 扫描位置 (`scanned`) 持续推进以保持 O(n) 性能
-//! (避免每次 feed 都重新扫描已搜索过的前缀).
+//! 也会出现一个 chunk 包含多个帧的情况. 帧重组由共享骨架 `SseReassembler` 负责
+//! (StreamTranslate / StreamScan 各持有一个实例, 通过 `feed` 委托). 扫描位置
+//! (`scanned`) 持续推进以保持 O(n) 性能 (避免每次 feed 都重新扫描已搜索过的前缀).
 //!
 //! # 终止符
 //!
@@ -46,92 +46,41 @@ pub const SSE_DONE_FRAME: &[u8] = b"data: [DONE]\n\n";
 /// 16 MiB 远大于任何合法的 chat completion SSE 帧.
 pub const MAX_BUF: usize = 16 * 1024 * 1024;
 
-/// 跨协议 SSE 翻译器. 由 [`feed`](Self::feed) 喂入 egress 字节,
-/// 由 [`finish`](Self::finish) 闭合流.
+// ─── SseReassembler: StreamTranslate / StreamScan 共享的帧重组骨架 ──────────
+//
+// on_frame 回调接收已通过 de-frame + parse + JSON 反序列化的 (event_name, Value);
+// keepalive / [DONE] / 非 JSON 噪声过滤逻辑对两者一致, 故下沉到骨架.
+
+/// SSE 帧重组骨架. 把任意 chunk 边界切割的字节流切成完整的 SSE frame.
 ///
-/// # 两种模式
-///
-/// - **跨协议翻译** ([`Self::new`]): ingress != egress, 把 egress SSE 翻译为 ingress SSE.
-///   不做 redact restore (跨协议时 redact 在请求侧, response 直接翻译).
-/// - **同协议 restore** ([`Self::new_same_proto_restore`]): ingress == egress, SSE 字节
-///   解析为 IR 事件, 经 [`StreamingRestorer`] 还原 mock→real (sliding window, 跨 chunk 安全),
-///   再序列化回 SSE. 用于同协议 + redact + 流式场景.
-pub struct StreamTranslate {
-    ingress_writer: Box<dyn Writer>,
-    egress_reader: Box<dyn Reader>,
-    decode: StreamDecodeState,
-    /// 帧字节 reassembly 缓冲.
+/// 持有 reassembly buffer (`buf`) + 扫描游标 (`scanned`) + 溢出标记 (`aborted`).
+/// 调用者通过 [`feed`](Self::feed) 喂入 chunk, 传入 `on_frame` 回调处理每个完整帧;
+/// abort / MAX_BUF 溢出保护由骨架统一负责.
+struct SseReassembler {
     buf: Vec<u8>,
-    /// 已扫描位置 (避免每次 feed 重新扫描整个前缀).
     scanned: usize,
-    /// 缓冲溢出 / 异常终止标记. 一旦置位, 后续 feed 直接返回空.
     aborted: bool,
-    /// 是否需要在 finish() 时追加 `[DONE]` (ingress 是 OpenAI 风格时为 true).
-    emit_done: bool,
-    /// 锁定的 message_start usage (Anthropic input_tokens; OpenAI None).
-    /// 用于 terminal delta 的 input_tokens=0 时 backfill.
-    start_usage: Option<crate::codec::IrUsage>,
-    /// MessageStop 后是否再发 MessageDelta (post-stop guard).
-    message_stopped: bool,
-    /// 同协议 restore 模式: per-block sliding window restorer.
-    /// 跨协议模式: `restorers` 空 + `redaction_map` None (不做 restore).
-    redaction_map: Option<RedactionMap>,
-    /// 每个 block index 对应一个独立 restorer (block 间 mock 边界互不干扰).
-    restorers: HashMap<usize, StreamingRestorer>,
 }
 
-impl StreamTranslate {
-    /// 构造跨协议翻译器. `None` 表示 `ingress == egress` (caller 应走字节透传或 restore 模式).
-    pub fn new(ingress: Protocol, egress: Protocol) -> Option<Self> {
-        if ingress == egress {
-            return None;
-        }
-        Some(Self {
-            ingress_writer: ingress.writer(),
-            egress_reader: egress.reader(),
-            decode: StreamDecodeState::default(),
-            buf: Vec::new(),
-            scanned: 0,
-            aborted: false,
-            emit_done: ingress.writer().emits_sse_done_terminator(),
-            start_usage: None,
-            message_stopped: false,
-            redaction_map: None,
-            restorers: HashMap::new(),
-        })
-    }
-
-    /// 构造同协议 + restore 模式翻译器. 用于同协议 + redact + 流式响应场景.
-    ///
-    /// 工作流: egress SSE → parse IR events → [`StreamingRestorer`] (跨 chunk restore)
-    /// → 序列化回 SSE. 失去 byte-exact (因为 IR re-serialize), 但语义等价,
-    /// 同时保留流式 UX + 跨 chunk mock restore.
-    pub fn new_same_proto_restore(proto: Protocol, map: RedactionMap) -> Self {
+impl SseReassembler {
+    fn new() -> Self {
         Self {
-            ingress_writer: proto.writer(),
-            egress_reader: proto.reader(),
-            decode: StreamDecodeState::default(),
             buf: Vec::new(),
             scanned: 0,
             aborted: false,
-            emit_done: proto.writer().emits_sse_done_terminator(),
-            start_usage: None,
-            message_stopped: false,
-            redaction_map: if map.is_empty() { None } else { Some(map) },
-            restorers: HashMap::new(),
         }
     }
 
-    /// 喂入一段 egress SSE 字节, 返回翻译后的 ingress SSE 字节
-    /// (可能为空, 表示当前 chunk 还不足以构成完整帧).
-    pub fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
+    /// 喂入一个 chunk. 对每个完整 SSE 帧 (parse + JSON 反序列化成功后) 调用 `on_frame(event_name, data)`.
+    ///
+    /// 回调约束: 调用者不应在 `on_frame` 内拿 `&mut self` (骨架已占用), 应把 frame
+    /// 累积到外部集合再循环处理.
+    fn feed<F: FnMut(&str, &serde_json::Value)>(&mut self, chunk: &[u8], mut on_frame: F) {
         if self.aborted {
-            return Vec::new();
+            return;
         }
         self.buf.extend_from_slice(chunk);
-        let mut out: Vec<u8> = Vec::new();
         let mut consumed = 0usize;
-
         loop {
             // 从 scanned (回退 3 字节防 CRLF 跨 chunk 边界) 开始找下一个帧终止符.
             let search_from = self
@@ -159,7 +108,7 @@ impl StreamTranslate {
                 continue; // 非 JSON, 跳过 (恶意 / 损坏)
             };
 
-            self.translate_event(&event_type, &data, &mut out);
+            on_frame(&event_type, &data);
         }
 
         // 回收已消费前缀 (单次 shift, 线性而非 O(n^2)).
@@ -169,6 +118,104 @@ impl StreamTranslate {
         }
         if self.buf.len() > MAX_BUF {
             self.abort();
+        }
+    }
+
+    /// 标记 aborted 并释放 reassembly buffer. 后续 [`feed`](Self::feed) 直接返回.
+    fn abort(&mut self) {
+        self.aborted = true;
+        self.buf.clear();
+        self.buf.shrink_to_fit();
+        self.scanned = 0;
+    }
+
+    fn is_aborted(&self) -> bool {
+        self.aborted
+    }
+}
+
+/// 跨协议 SSE 翻译器. 由 [`feed`](Self::feed) 喂入 egress 字节,
+/// 由 [`finish`](Self::finish) 闭合流.
+///
+/// # 两种模式
+///
+/// - **跨协议翻译** ([`Self::new`]): ingress != egress, 把 egress SSE 翻译为 ingress SSE.
+///   不做 redact restore (跨协议时 redact 在请求侧, response 直接翻译).
+/// - **同协议 restore** ([`Self::new_same_proto_restore`]): ingress == egress, SSE 字节
+///   解析为 IR 事件, 经 [`StreamingRestorer`] 还原 mock→real (sliding window, 跨 chunk 安全),
+///   再序列化回 SSE. 用于同协议 + redact + 流式场景.
+pub struct StreamTranslate {
+    ingress_writer: Box<dyn Writer>,
+    egress_reader: Box<dyn Reader>,
+    decode: StreamDecodeState,
+    /// SSE 帧 reassembly 骨架.
+    reassembler: SseReassembler,
+    /// 是否需要在 finish() 时追加 `[DONE]` (ingress 是 OpenAI 风格时为 true).
+    emit_done: bool,
+    /// 锁定的 message_start usage (Anthropic input_tokens; OpenAI None).
+    /// 用于 terminal delta 的 input_tokens=0 时 backfill.
+    start_usage: Option<crate::codec::IrUsage>,
+    /// MessageStop 后是否再发 MessageDelta (post-stop guard).
+    message_stopped: bool,
+    /// 同协议 restore 模式: per-block sliding window restorer.
+    /// 跨协议模式: `restorers` 空 + `redaction_map` None (不做 restore).
+    redaction_map: Option<RedactionMap>,
+    /// 每个 block index 对应一个独立 restorer (block 间 mock 边界互不干扰).
+    restorers: HashMap<usize, StreamingRestorer>,
+}
+
+impl StreamTranslate {
+    /// 构造跨协议翻译器. `None` 表示 `ingress == egress` (caller 应走字节透传或 restore 模式).
+    pub fn new(ingress: Protocol, egress: Protocol) -> Option<Self> {
+        if ingress == egress {
+            return None;
+        }
+        Some(Self {
+            ingress_writer: ingress.writer(),
+            egress_reader: egress.reader(),
+            decode: StreamDecodeState::default(),
+            reassembler: SseReassembler::new(),
+            emit_done: ingress.writer().emits_sse_done_terminator(),
+            start_usage: None,
+            message_stopped: false,
+            redaction_map: None,
+            restorers: HashMap::new(),
+        })
+    }
+
+    /// 构造同协议 + restore 模式翻译器. 用于同协议 + redact + 流式响应场景.
+    ///
+    /// 工作流: egress SSE → parse IR events → [`StreamingRestorer`] (跨 chunk restore)
+    /// → 序列化回 SSE. 失去 byte-exact (因为 IR re-serialize), 但语义等价,
+    /// 同时保留流式 UX + 跨 chunk mock restore.
+    pub fn new_same_proto_restore(proto: Protocol, map: RedactionMap) -> Self {
+        Self {
+            ingress_writer: proto.writer(),
+            egress_reader: proto.reader(),
+            decode: StreamDecodeState::default(),
+            reassembler: SseReassembler::new(),
+            emit_done: proto.writer().emits_sse_done_terminator(),
+            start_usage: None,
+            message_stopped: false,
+            redaction_map: if map.is_empty() { None } else { Some(map) },
+            restorers: HashMap::new(),
+        }
+    }
+
+    /// 喂入一段 egress SSE 字节, 返回翻译后的 ingress SSE 字节
+    /// (可能为空, 表示当前 chunk 还不足以构成完整帧).
+    pub fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
+        // 共享 SSE 帧 reassembly (de-frame + parse + JSON), 把完整帧收集到局部 Vec,
+        // 再循环调用 translate_event 处理. 借用隔离: 回调内不能拿 &mut self (reassembler
+        // 已占用 &mut self), 所以采用"先收集后处理"模式.
+        let mut frames: Vec<(String, serde_json::Value)> = Vec::new();
+        self.reassembler.feed(chunk, |event_type, data| {
+            frames.push((event_type.to_string(), data.clone()));
+        });
+
+        let mut out = Vec::new();
+        for (event_type, data) in &frames {
+            self.translate_event(event_type, data, &mut out);
         }
         out
     }
@@ -180,7 +227,7 @@ impl StreamTranslate {
     pub fn finish(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
         self.flush_all_restorers(&mut out);
-        if self.aborted {
+        if self.reassembler.is_aborted() {
             // 流被异常中止: 发 ingress 协议的原生 error frame.
             let err = IrStreamEvent::Error("stream aborted: buffer overflow".into());
             self.emit_ir_event(&err, &mut out);
@@ -351,14 +398,6 @@ impl StreamTranslate {
         };
         out.extend_from_slice(&reframe_sse(&event_type, &data));
     }
-
-    /// 标记流为 aborted, 释放缓冲. 后续 feed 直接返回空.
-    fn abort(&mut self) {
-        self.aborted = true;
-        self.buf.clear();
-        self.buf.shrink_to_fit();
-        self.scanned = 0;
-    }
 }
 
 // ─── StreamScan: 流式 parsed view 累积器 ────────────────────────────────────
@@ -398,13 +437,9 @@ pub struct StreamScan {
     blocks: std::collections::BTreeMap<usize, ScanBlock>,
     /// 块的最终顺序 (finish 时按此顺序折叠, 与到达顺序一致).
     block_order: Vec<usize>,
-    /// SSE 帧 reassembly buffer (跨 chunk 不完整帧).
-    buf: Vec<u8>,
-    /// 已扫描位置 (O(n) 扫描, 避免重复搜前缀).
-    scanned: usize,
-    /// reassembly buffer 溢出标记. 达到 MAX_BUF 后置位, 停止累积 (防 OOM).
-    /// snapshot() 返回已累积的部分内容 (不发给客户端, 只给 WebUI, abort 不影响转发).
-    aborted: bool,
+    /// SSE 帧 reassembly 骨架.
+    /// snapshot() 返回已累积的部分内容 (abort 不影响转发, 仅 WebUI 可见).
+    reassembler: SseReassembler,
 }
 
 /// IrResponse 的元数据部分 (从 MessageStart / MessageDelta 提取).
@@ -426,9 +461,7 @@ impl StreamScan {
             meta: IrResponseMeta::default(),
             blocks: std::collections::BTreeMap::new(),
             block_order: Vec::new(),
-            buf: Vec::new(),
-            scanned: 0,
-            aborted: false,
+            reassembler: SseReassembler::new(),
         }
     }
 
@@ -439,54 +472,22 @@ impl StreamScan {
     /// 与 StreamTranslate 不同: StreamScan **不** 应用 post-stop guard, 因为
     /// OpenAI `stream_options.include_usage` 的 usage chunk 出现在 finish_reason
     /// chunk (MessageStop) 之后, StreamScan 需要收集它.
+    ///
+    /// 帧 reassembly (de-frame + parse + JSON + MAX_BUF abort) 委托给共享骨架
+    /// `SseReassembler`, 本方法只负责把每个完整帧的 IR 事件累积到 meta / blocks.
     pub fn feed(&mut self, chunk: &[u8]) {
-        if self.aborted {
-            return;
-        }
-        self.buf.extend_from_slice(chunk);
-        let mut consumed = 0usize;
-        loop {
-            let search_from = self
-                .scanned
-                .saturating_sub(3)
-                .max(consumed)
-                .min(self.buf.len());
-            let Some((rel, term_len)) = find_frame_terminator(&self.buf[search_from..]) else {
-                self.scanned = self.buf.len();
-                break;
-            };
-            let end = search_from + rel + term_len;
-            let frame = &self.buf[consumed..end];
-            consumed = end;
-            self.scanned = end;
+        let mut frames: Vec<(String, serde_json::Value)> = Vec::new();
+        self.reassembler.feed(chunk, |event_type, data| {
+            frames.push((event_type.to_string(), data.clone()));
+        });
 
-            let Some((event_type, data_str)) = parse_sse_frame(frame) else {
-                continue;
-            };
-            if data_str.is_empty() || data_str == SSE_DONE_SENTINEL {
-                continue;
-            }
-            let Ok(data) = serde_json::from_str::<serde_json::Value>(&data_str) else {
-                continue;
-            };
+        for (event_type, data) in &frames {
             let events = self
                 .reader
-                .read_response_events(&event_type, &data, &mut self.decode);
+                .read_response_events(event_type, data, &mut self.decode);
             for ev in events {
                 self.apply_event(&ev);
             }
-        }
-        if consumed > 0 {
-            self.buf.drain(..consumed);
-            self.scanned = self.buf.len();
-        }
-        // reassembly buffer 溢出保护 (与 StreamTranslate::feed 一致).
-        // 恶意/异常上游发永不闭合的帧时, 防止 buf 无界增长 OOM.
-        if self.buf.len() > MAX_BUF {
-            self.aborted = true;
-            self.buf.clear();
-            self.buf.shrink_to_fit();
-            self.scanned = 0;
         }
     }
 
@@ -930,6 +931,76 @@ mod tests {
         assert!(StreamTranslate::new(Protocol::Anthropic, Protocol::Anthropic).is_none());
     }
 
+    // ─── SseReassembler: 共享骨架的单元测试 ────────────────────────────
+
+    #[test]
+    fn sse_reassembler_abort_sets_flag_and_releases_buf() {
+        // 喂入大 chunk 触发 MAX_BUF 溢出 → abort. 验证 aborted 标志 + buf capacity 收缩.
+        let mut r = SseReassembler::new();
+        assert!(!r.is_aborted(), "fresh reassembler must not be aborted");
+        let huge = vec![b'a'; MAX_BUF + 1];
+        let mut seen: Vec<(String, Value)> = Vec::new();
+        r.feed(&huge, |et, d| seen.push((et.to_string(), d.clone())));
+        assert!(r.is_aborted(), "should abort after >MAX_BUF unparsable buf");
+        // 无帧终止符 → 不应误触发任何 on_frame 回调.
+        assert!(seen.is_empty(), "no frame terminator, no callbacks");
+        // shrink_to_fit 后 capacity 为 0.
+        assert_eq!(
+            r.buf.capacity(),
+            0,
+            "abort should shrink_tofit buf to 0 capacity, got {}",
+            r.buf.capacity()
+        );
+        // 后续 feed 应是 no-op (aborted).
+        let mut count = 0;
+        r.feed(b"data: {\"x\":1}\n\n", |_et, _d| count += 1);
+        assert_eq!(count, 0, "aborted reassembler should drop subsequent feed");
+    }
+
+    #[test]
+    fn sse_reassembler_abort_explicit_marks_aborted() {
+        // 直接调用 abort (非溢出路径), 验证 aborted 标志 + 后续 feed no-op.
+        let mut r = SseReassembler::new();
+        r.abort();
+        assert!(r.is_aborted());
+        let mut count = 0;
+        r.feed(b"data: {\"x\":1}\n\n", |_et, _d| count += 1);
+        assert_eq!(count, 0, "aborted reassembler should drop feed");
+    }
+
+    #[test]
+    fn sse_reassembler_invokes_callback_for_each_complete_frame() {
+        // 一个 chunk 含两个完整帧 + 一个不完整尾帧.
+        let mut r = SseReassembler::new();
+        let chunk = b"data: {\"a\":1}\n\ndata: {\"b\":2}\n\ndata: {\"c\":";
+        let mut got: Vec<Value> = Vec::new();
+        r.feed(chunk, |_et, d| got.push(d.clone()));
+        // 两个完整帧触发回调, 不完整尾帧留在 buffer.
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0], json!({"a":1}));
+        assert_eq!(got[1], json!({"b":2}));
+        // 补全尾帧, 应触发第三个回调.
+        got.clear();
+        r.feed(b"3}\n\n", |_et, d| got.push(d.clone()));
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0], json!({"c":3}));
+    }
+
+    #[test]
+    fn sse_reassembler_skips_keepalive_and_done_and_nonjson() {
+        // keepalive (空 data) / [DONE] / 非 JSON 都应被跳过, 只回调有效 JSON 帧.
+        let mut r = SseReassembler::new();
+        let chunk = b"data: \n\ndata: [DONE]\n\ndata: not json\n\ndata: {\"ok\":true}\n\n";
+        let mut got: Vec<Value> = Vec::new();
+        r.feed(chunk, |_et, d| got.push(d.clone()));
+        assert_eq!(
+            got.len(),
+            1,
+            "only the valid JSON frame should be delivered"
+        );
+        assert_eq!(got[0], json!({"ok":true}));
+    }
+
     // ─── 验证 fan-out: 一个 OpenAI chunk → 多个 IR events ──────────────
 
     #[test]
@@ -1321,6 +1392,27 @@ mod tests {
         let ir = scan.snapshot();
         assert_eq!(ir.usage.input_tokens, 15);
         assert_eq!(ir.usage.output_tokens, 3);
+    }
+
+    #[test]
+    fn stream_scan_aborts_on_unbounded_buffer() {
+        // 喂入 MAX_BUF+1 字节无终止符数据 → aborted, 后续 feed no-op,
+        // snapshot 返回已累积的空内容.
+        let mut scan = StreamScan::new(Protocol::OpenAI);
+        let huge = vec![b'a'; MAX_BUF + 1];
+        scan.feed(&huge);
+        // 下一次 feed 应该是 no-op (aborted).
+        scan.feed(b"data: {\"id\":\"x\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"late\"}}]}\n\n");
+        let ir = scan.snapshot();
+        assert!(
+            ir.content.is_empty(),
+            "aborted scan should drop post-overflow feed, got content len {}",
+            ir.content.len()
+        );
+        assert!(
+            scan.reassembler.is_aborted(),
+            "StreamScan should mark reassembler aborted on buffer overflow"
+        );
     }
 
     // ─── proptest: 任意切分点序列的 chunk-boundary 等价性 ──────────────────
