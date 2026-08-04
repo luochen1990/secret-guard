@@ -11,38 +11,109 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>secret-guard</title>
+  <!-- favicon: 盾牌 + 挂锁 (主题色 mauve 底 + 深色锁芯), 两种浏览器标签底色下均可读.
+       内联 data-URI 保持单文件零外部依赖 (与 index.html 现有契约一致). -->
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSI+CiAgPHBhdGggZD0iTTEyIDIgTDIwIDUgVjExIEMyMCAxNiAxNi41IDIwIDEyIDIyIEM3LjUgMjAgNCAxNiA0IDExIFY1IFoiIGZpbGw9IiNjYmE2ZjciLz4KICA8cGF0aCBkPSJNMTIgNy41IEMxMC42IDcuNSA5LjUgOC42IDkuNSAxMCBWMTEuMiBIOSBBMSAxIDAgMCAwIDggMTIuMiBWMTUuOCBBMSAxIDAgMCAwIDkgMTYuOCBIMTUgQTEgMSAwIDAgMCAxNiAxNS44IFYxMi4yIEExIDEgMCAwIDAgMTUgMTEuMiBIMTQuNSBWMTAgQzE0LjUgOC42IDEzLjQgNy41IDEyIDcuNSBaIE0xMiA4LjcgQzEyLjcgOC43IDEzLjMgOS4zIDEzLjMgMTAgVjExLjIgSDEwLjcgVjEwIEMxMC43IDkuMyAxMS4zIDguNyAxMiA4LjcgWiIgZmlsbD0iIzFlMWUyZSIvPgo8L3N2Zz4K">
+  <title>Secret Guard</title>
   <style>
+    /* 双主题 (Catppuccin Latte 亮 + Mocha 暗) + 自动跟随系统.
+       ----------------------------------------------------------
+       实现策略:
+       1. <html data-theme="auto|light|dark"> 由 header 切换按钮控制
+          (localStorage 持久化); auto 模式跟随 prefers-color-scheme.
+       2. :root.color-scheme = light|dark 是唯一开关. 由 ThemeResolver
+          (脚本在 <head>, 最早执行) 根据 data-theme + OS 偏好设置.
+       3. 每个 CSS 变量用 light-dark(亮值, 暗值), 自动随 color-scheme 切换.
+       4. 语义别名 (--fg / --fg-muted / --fg-faint / --border / --panel) 隔离
+          "用途" 与 "色相": 改色相只动调色板, 调对比度只动语义映射.
+
+       对比度: --fg / --fg-muted 均达 WCAG AA (≥4.5:1) on 对应底色;
+       --fg-faint 用于 placeholder/disabled/占位 (非阅读重点, 可低于 AA). */
+    :root {
+      color-scheme: light dark;
+      /* 语义层: 这是组件实际引用的变量. = light-dark(亮, 暗). */
+      --fg:        light-dark(#4c4f69, #cdd6f4);   /* 主文字 (AA) */
+      --fg-muted:  light-dark(#5c5f77, #bac2de);   /* 次要文字 (AA): 时间戳/路径/副标题 */
+      --fg-faint:  light-dark(#9ca0b5, #7f849c);   /* 占位/禁用/非阅读重点 */
+      --link:      light-dark(#209fb5, #74c7ec);
+      --accent:    light-dark(#8839ef, #cba6f7);   /* mauve */
+      /* 饱和 accent 底上的文字 (pill/badge/active-tab/unread-badge/hit/sender-icon 字母):
+         两主题都用深色 — Latte accent 是中等亮度 (需深字), Mocha accent 是浅亮 (也需深字).
+         --bg-deep 在亮主题是浅色, 用于此处会让橙/绿/蓝底上的浅字低于 WCAG AA. */
+      --on-accent: #1e1e2e;
+      --ok:        light-dark(#40a02b, #a6e3a1);
+      --err:       light-dark(#d20f39, #f38ba8);
+      --warn:      light-dark(#df8e1d, #fab387);
+      --info:      light-dark(#1e66f2, #89b4fa);
+      /* 表面分层 (亮: 由浅到深; 暗: 由深到浅). 用于底色/边框. */
+      --bg:        light-dark(#eff1f5, #1e1e2e);   /* body 最底层 */
+      --bg-sunken: light-dark(#e6e9ef, #181825);   /* 比 bg 更深一档 (sidebar/抽屉) */
+      --bg-deep:   light-dark(#dce0e8, #11111b);   /* 最深 (代码块/header) */
+      --panel:     light-dark(#ffffff, #313244);   /* 卡片/弹窗/选中态底 */
+      --panel-hi:  light-dark(#ccd0da, #45475a);   /* hover/嵌套面板 */
+      --border:    light-dark(#bcc0cc, #45475a);   /* 1px 分隔线/边框 */
+      --border-faint: light-dark(#dce0e8, #313244);/* 更淡的边框 */
+      /* mock 命中高亮底色 (醒目); 文字复用 --on-accent (深字 on 橙/黄均 ≥8:1). */
+      --hit-bg:    light-dark(#df8e1d, #f9e2af);
+      /* 半透明底色: 用于 system 气泡 / 选中轮次的轻量高亮 (不抢眼, 区别于 accent).
+         light-dark 不支持 alpha 通道切换, 故分别给两个主题的合适透明度. */
+      --tint-system:  light-dark(rgba(223, 142, 29, 0.12), rgba(249, 226, 175, 0.10));
+      --tint-selected:light-dark(rgba(223, 142, 29, 0.16), rgba(249, 226, 175, 0.12));
+      --tint-flash:   light-dark(rgba(223, 142, 29, 0.40), rgba(249, 226, 175, 0.45));
+      --tint-override:light-dark(rgba(223, 142, 29, 0.10), rgba(250, 179, 135, 0.12));
+      --tint-preferred:light-dark(rgba(136, 57, 239, 0.10), rgba(203, 166, 247, 0.14));
+      /* 气泡内悬浮按钮的遮罩底色 (需要在气泡底上可读). */
+      --bubble-overlay: light-dark(rgba(255, 255, 255, 0.85), rgba(30, 30, 46, 0.85));
+      /* sender icon / 气泡左边框的语义色 (Mocha 端与 Latte 端对齐色相) */
+      --role-user: light-dark(#40a02b, #a6e3a1);
+      --role-asst: light-dark(#1e66f2, #89b4fa);
+      --role-sys:  light-dark(#df8e1d, #fab387);
+      --role-tool: light-dark(#6c6f85, #9399b2);
+    }
+    /* data-theme 显式覆盖 (auto 时不写, 让 color-scheme 跟随 OS). */
+    html[data-theme="light"] { color-scheme: light; }
+    html[data-theme="dark"]  { color-scheme: dark; }
+
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
-      font-size: 13px;
-      color: #222;
+      /* 字体改 sans-serif (对齐 webui-installer); 仅代码/原始字节区保留 monospace. */
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+      background: var(--bg);
+      color: var(--fg);
+    }
+    /* 代码 / 原始字节区统一用等宽 (语义需要, 非全局风格). 集中声明, 避免下方重复. */
+    pre, code, .raw-pre, .resp-body, .bubble-tool, .bubble-tool-call,
+    .full-body, .info-val, dialog#secret-form form textarea, textarea#apikey-reveal-value {
+      font-family: "SF Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
     }
     header {
       padding: 8px 16px;
-      background: #1a1a1a;
-      color: #eee;
+      background: var(--bg-deep);
+      color: var(--fg);
       display: flex;
       justify-content: space-between;
       align-items: center;
       gap: 12px;
       flex-wrap: wrap;
     }
-    header .brand { font-weight: bold; }
+    header .brand { font-weight: 600; color: var(--fg); display: inline-flex; align-items: center; gap: 6px; }
+    header .brand .brand-logo { vertical-align: middle; flex-shrink: 0; }
     header .toolbar { display: flex; gap: 10px; align-items: center; }
+    header .toolbar label { color: var(--fg-muted); }
     header #status { min-width: 80px; }
-    nav.tabs { display: flex; gap: 4px; padding: 4px 16px; background: #2a2a2a; }
+    nav.tabs { display: flex; gap: 4px; padding: 4px 16px; background: var(--bg-sunken); }
     nav.tabs a {
       padding: 4px 12px;
-      color: #ccc;
+      color: var(--fg-muted);
       cursor: pointer;
-      border-radius: 3px;
+      border-radius: 6px;
       font-size: 12px;
     }
-    nav.tabs a.active { background: #444; color: #fff; }
-    nav.tabs a:hover { background: #3a3a3a; }
+    nav.tabs a.active { background: var(--accent); color: var(--on-accent); font-weight: 600; }
+    nav.tabs a:hover:not(.active) { background: var(--panel); }
     main { display: flex; height: calc(100vh - 70px); }
     /* sidebar 宽度按比例缩放 (issue #23 子项 3): 旧版固定 340px, 缩窄窗口时
        只缩右侧 article, 左侧 sidebar "过于霸道". 改为百分比 + min/max 钳位:
@@ -53,38 +124,40 @@
       width: 30%;
       min-width: 220px;
       max-width: 340px;
-      border-right: 1px solid #ddd;
+      border-right: 1px solid var(--panel);
       overflow-y: auto;
-      background: #fafafa;
+      background: var(--bg-sunken);
     }
     article { flex: 1; padding: 0; overflow: hidden; min-width: 0; }
     /* detail 作为 IM 风格上下分栏容器: 内部 request-pane / response-pane 各自管滚动. */
     #detail { display: flex; flex-direction: column; }
     .record-item {
-      border-bottom: 1px solid #eee;
+      border-bottom: 1px solid var(--panel);
       cursor: pointer;
     }
-    .record-item:hover { background: #f0f0f0; }
-    .record-item.active { background: #d0e7ff; }
-    .status-ok { color: #0a0; font-weight: bold; }
-    .status-err { color: #a00; font-weight: bold; }
+    .record-item:hover { background: var(--panel); }
+    .record-item.active { background: var(--panel-hi); box-shadow: inset 3px 0 0 var(--accent); }
+    .status-ok { color: var(--ok); font-weight: bold; }
+    .status-err { color: var(--err); font-weight: bold; }
     /* status-aborted: 客户端中断 (正常使用路径, 不加粗不用红色, 避免误认为服务故障).
-       issue #23 子项 4: 旧版 client disconnect 也用 status-err (红粗 ERR), 过重. */
-    .status-aborted { color: #888; }
-    .status-pending { color: #888; }
-    .meta { color: #888; }
+        issue #23 子项 4: 旧版 client disconnect 也用 status-err (红粗 ERR), 过重. */
+    .status-aborted { color: var(--fg-muted); }
+    .status-pending { color: var(--fg-muted); }
+    .meta { color: var(--fg-muted); }
     .section { margin-bottom: 18px; }
     .section h3 {
       margin: 0 0 6px 0;
       font-size: 12px;
-      color: #666;
+      color: var(--fg-muted);
       text-transform: uppercase;
       letter-spacing: 0.05em;
     }
     pre {
-      background: #f5f5f5;
+      background: var(--bg-deep);
+      color: var(--fg-muted);
       padding: 8px;
-      border-radius: 4px;
+      border-radius: 6px;
+      border: 1px solid var(--panel);
       overflow-x: auto;
       max-height: 380px;
       white-space: pre-wrap;
@@ -94,39 +167,40 @@
     .empty {
       padding: 40px;
       text-align: center;
-      color: #888;
+      color: var(--fg-faint);
     }
     button.refresh {
       background: transparent;
-      border: 1px solid #555;
-      color: #eee;
+      border: 1px solid var(--border);
+      color: var(--fg-muted);
       padding: 2px 8px;
       cursor: pointer;
-      border-radius: 3px;
+      border-radius: 6px;
       font: inherit;
     }
-    button.refresh:hover { background: #333; }
+    button.refresh:hover { background: var(--panel); }
     label { cursor: pointer; user-select: none; }
     .badge {
       display: inline-block;
       padding: 1px 5px;
-      background: #ddd;
-      border-radius: 3px;
+      background: var(--border);
+      color: var(--fg-muted);
+      border-radius: 4px;
       font-size: 11px;
       margin-left: 4px;
     }
-    .badge-stream { background: #cfe; color: #060; }
-    .badge-err { background: #fcc; color: #a00; }
+    .badge-stream { background: var(--info); color: var(--on-accent); }
+    .badge-err { background: var(--err); color: var(--on-accent); }
     /* inactive: 服务端认证未启用, key 形同虚设 (灰色, 区别于 enabled/disabled). */
-    .badge-inactive { background: #eee; color: #888; }
-    /* hint 内嵌的警告 (服务端认证未启用提示). 配色与 .badge-err 一致 (#a00). */
-    .hint-warn { color: #a00; }
+    .badge-inactive { background: var(--border); color: var(--fg-muted); }
+    /* hint 内嵌的警告 (服务端认证未启用提示). 配色与 .badge-err 一致 (red). */
+    .hint-warn { color: var(--err); }
     /* provider endpoints 弹窗内的 URL 列表表格. */
     .ep-table { width: 100%; border-collapse: collapse; font-size: 12px; }
     .ep-table td { padding: 4px 8px 4px 0; vertical-align: top; }
     .ep-table td:last-child { padding-right: 0; white-space: nowrap; }
     .ep-table td.label { white-space: nowrap; }
-    .ep-table td.unsupported { color: #aaa; }
+    .ep-table td.unsupported { color: var(--fg-faint); }
     .ep-table td.url code { word-break: break-all; }
     dialog#provider-endpoints { padding: 16px; width: 480px; }
     dialog#provider-endpoints .actions {
@@ -134,6 +208,32 @@
     }
     .tab-content { display: none; }
     .tab-content.active { display: flex; flex: 1; min-height: 0; }
+
+    /* 原生 dialog + 表单控件暗色化 (dialog 默认白底, 强制覆盖; color-scheme 让
+       native scrollbar / checkbox 取暗色变体). */
+    dialog {
+      background: var(--panel);
+      color: var(--fg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+    }
+    dialog::backdrop { background: rgba(0, 0, 0, 0.6); }
+    /* 原生表单控件 (input/select/button) 的 color-scheme 不在此硬编码;
+       它们继承自 :root (由 <html data-theme> 驱动 light/dark), light-dark()
+       函数因此能正确随主题切换. 显式写死会破坏 light-dark() 解析. */
+    input[type="text"], input[type="password"], input[type="number"],
+    input[type="checkbox"], select, textarea {
+      background: var(--bg);
+      color: var(--fg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+    }
+    input[type="checkbox"] { accent-color: var(--accent); }
+    input::placeholder, textarea::placeholder { color: var(--fg-faint); }
+    /* select 展开后的 <option> 列表是原生 shadow-DOM 弹层, color-scheme 在部分平台
+       不够; 显式上色避免 option 配色与主题不符. */
+    option { background: var(--panel); color: var(--fg); }
+    option:checked { background: var(--border); color: var(--fg); }
 
     /* secrets / providers table (shared) */
     .secrets-main {
@@ -148,68 +248,72 @@
     table.secrets th, table.secrets td {
       padding: 6px 8px;
       text-align: left;
-      border-bottom: 1px solid #eee;
+      border-bottom: 1px solid var(--panel);
       vertical-align: middle;
     }
     table.secrets th {
-      background: #f0f0f0;
+      background: var(--bg-sunken);
       font-size: 12px;
       text-transform: uppercase;
-      color: #555;
+      color: var(--fg-muted);
     }
     table.secrets td.actions { white-space: nowrap; }
-    table.secrets tr.row-disabled td { color: #aaa; text-decoration: line-through; }
-    table.secrets tr.row-override { background: #fff8e0; }
-    table.secrets tr.row-preferred { background: #f0e8ff; }
+    table.secrets tr.row-disabled td { color: var(--fg-faint); text-decoration: line-through; }
+    /* 行级背景提示用半透明 accent 色 (Catppuccin 色在深底上需降饱和以免刺眼). */
+    table.secrets tr.row-override { background: var(--tint-override); }
+    table.secrets tr.row-preferred { background: var(--tint-preferred); }
+    table.secrets tr:hover:not(.row-override):not(.row-preferred) td { background: var(--panel); }
     .pill {
       display: inline-block;
       padding: 1px 6px;
       border-radius: 10px;
       font-size: 11px;
-      background: #e0e7ff;
-      color: #336;
+      background: var(--accent);
+      color: var(--on-accent);
     }
-    .pill.password { background: #fee; color: #600; }
-    .pill.apikey { background: #fed; color: #630; }
-    .pill.token { background: #efe; color: #363; }
-    .pill.cookie { background: #eef; color: #336; }
-    .pill.privatekey { background: #fee; color: #600; font-weight: bold; }
-    .pill.other { background: #eee; color: #555; }
+    .pill.password { background: var(--err); color: var(--on-accent); }
+    .pill.apikey { background: var(--warn); color: var(--on-accent); }
+    .pill.token { background: var(--ok); color: var(--on-accent); }
+    .pill.cookie { background: var(--info); color: var(--on-accent); }
+    .pill.privatekey { background: var(--err); color: var(--on-accent); font-weight: bold; }
+    .pill.other { background: var(--border); color: var(--fg-muted); }
 
     /* source badge — 区分 static / dynamic / override / preferred */
     .src-badge {
       display: inline-block;
       padding: 1px 6px;
-      border-radius: 3px;
+      border-radius: 4px;
       font-size: 11px;
       font-weight: bold;
       margin-right: 4px;
     }
-    .src-static { background: #cde; color: #036; }
-    .src-dynamic { background: #dfe; color: #063; }
-    .src-dynamic_override { background: #fed; color: #630; }
-    .src-static_preferred { background: #edf; color: #436; }
+    .src-static { background: var(--link); color: var(--on-accent); }
+    .src-dynamic { background: var(--ok); color: var(--on-accent); }
+    .src-dynamic_override { background: var(--warn); color: var(--on-accent); }
+    .src-static_preferred { background: var(--accent); color: var(--on-accent); }
 
     /* decision 下拉 (仅 static id 显示) */
     select.decision-select {
       font: inherit;
       padding: 1px 4px;
-      border: 1px solid #aaa;
-      border-radius: 3px;
-      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background: var(--bg);
+      color: var(--fg);
     }
     button.btn {
-      padding: 3px 8px;
+      padding: 4px 10px;
       cursor: pointer;
-      border: 1px solid #888;
-      background: #fff;
-      border-radius: 3px;
+      border: 1px solid var(--border);
+      background: var(--panel-hi);
+      color: var(--fg);
+      border-radius: 6px;
       font: inherit;
     }
-    button.btn-danger { color: #a00; border-color: #a00; }
-    button.btn:hover { background: #eee; }
-    button.btn-danger:hover { background: #fee; }
-    button.btn[disabled] { color: #aaa; border-color: #ccc; cursor: not-allowed; background: #f5f5f5; }
+    button.btn-danger { color: var(--err); border-color: var(--err); }
+    button.btn:hover:not([disabled]) { background: var(--border); }
+    button.btn-danger:hover { background: rgba(243, 139, 168, 0.18); }
+    button.btn[disabled] { color: var(--fg-faint); border-color: var(--panel-hi); cursor: not-allowed; background: var(--panel); }
     .secrets-toolbar {
       margin: 8px 0;
       display: flex;
@@ -218,11 +322,11 @@
       gap: 12px;
       flex-wrap: wrap;
     }
-    .stats { display: flex; gap: 12px; font-size: 12px; color: #555; }
-    .stats span strong { color: #222; }
+    .stats { display: flex; gap: 12px; font-size: 12px; color: var(--fg-muted); }
+    .stats span strong { color: var(--fg); }
     dialog#secret-form {
-      border: 1px solid #888;
-      border-radius: 6px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
       padding: 16px;
       width: 480px;
     }
@@ -237,11 +341,10 @@
       width: 100%;
       font: inherit;
       padding: 4px 6px;
-      border: 1px solid #aaa;
-      border-radius: 3px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
     }
     dialog#secret-form form textarea {
-      font-family: ui-monospace, monospace;
       min-height: 80px;
     }
     dialog#secret-form .actions {
@@ -267,8 +370,8 @@
       width: 100%;
       font: inherit;
       padding: 4px 6px;
-      border: 1px solid #aaa;
-      border-radius: 3px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
     }
     dialog#provider-form .actions {
       grid-column: 2;
@@ -278,20 +381,22 @@
       margin-top: 8px;
     }
     .hint {
-      color: #777;
+      color: var(--fg-muted);
       font-size: 11px;
       flex: 1;
     }
     .hint code {
-      background: #eee;
+      background: var(--panel);
+      color: var(--ok);
       padding: 1px 4px;
-      border-radius: 2px;
+      border-radius: 3px;
     }
     .banner {
-      background: #fff8e0;
-      border: 1px solid #ec5;
+      background: var(--tint-system);
+      border: 1px solid var(--warn);
+      color: var(--fg-muted);
       padding: 6px 10px;
-      border-radius: 4px;
+      border-radius: 6px;
       margin: 8px 0;
       font-size: 12px;
     }
@@ -349,14 +454,14 @@
     .record-item .ri-line1 {
       grid-area: line1;
       font-size: 12.5px;
-      color: #222;
+      color: var(--fg);
     }
     .record-item .ri-line2 {
       grid-area: line2;
       font-size: 10.5px;
-      color: #999;
+      color: var(--fg-muted);
     }
-    .record-item.active .ri-line2 { color: #6a87b3; }
+    .record-item.active .ri-line2 { color: var(--accent); }
 
     /* provider 复合图标: 圆形彩色背景 + 首字母 + 协议角标.
        颜色由 provider id 哈希到固定调色板 (见 providerColor()).
@@ -369,7 +474,9 @@
       width: 22px;
       height: 22px;
       border-radius: 50%;
-      color: #fff;
+      /* 字母色 = 底色反相: 亮主题调色板深 → 白字; 暗主题调色板浅 → 深字.
+         (providerColor() 在 JS 端按主题选对应调色板) */
+      color: var(--bg);
       font-size: 11px;
       font-weight: bold;
       flex-shrink: 0;
@@ -382,8 +489,8 @@
       width: 11px;
       height: 11px;
       border-radius: 50%;
-      background: #fff;
-      border: 1px solid #ccc;
+      background: var(--bg-sunken);
+      border: 1px solid var(--border);
       display: flex;
       align-items: center;
       justify-content: center;
@@ -391,8 +498,8 @@
     .pv-icon .pv-proto svg { width: 7px; height: 7px; display: block; }
 
     .badge-hit {
-      background: #f59e0b;
-      color: #fff;
+      background: var(--hit-bg);
+      color: var(--on-accent);
       font-weight: bold;
       padding: 0 5px;
       border-radius: 8px;
@@ -406,8 +513,8 @@
       display: flex;
       gap: 4px;
       padding: 6px 8px;
-      border-bottom: 1px solid #ddd;
-      background: #f0f0f0;
+      border-bottom: 1px solid var(--panel);
+      background: var(--bg-sunken);
       position: sticky;
       top: 0;
       z-index: 1;
@@ -418,17 +525,18 @@
       font: inherit;
       font-size: 12px;
       cursor: pointer;
-      background: #fff;
-      border: 1px solid #bbb;
-      border-radius: 3px;
-      color: #333;
+      background: var(--panel);
+      border: 1px solid var(--panel-hi);
+      border-radius: 6px;
+      color: var(--fg-muted);
     }
     .filter-bar button.active {
-      background: #1a1a1a;
-      color: #fff;
-      border-color: #1a1a1a;
+      background: var(--accent);
+      color: var(--on-accent);
+      border-color: var(--accent);
+      font-weight: 600;
     }
-    .filter-bar button:hover:not(.active) { background: #eee; }
+    .filter-bar button:hover:not(.active) { background: var(--panel-hi); }
 
 
 
@@ -460,21 +568,21 @@
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      color: #fff;
+      color: var(--on-accent);
       font-size: 10px;
       font-weight: bold;
       text-transform: uppercase;
       cursor: help;
       margin-top: 2px;
     }
-    .sender-icon.s-user       { background: #5b8c5a; } /* 绿 */
-    .sender-icon.s-assistant  { background: #4a6fa5; } /* 蓝 */
-    .sender-icon.s-system     { background: #b5712a; } /* 橙 */
-    .sender-icon.s-tool       { background: #888;    } /* 灰 */
+    .sender-icon.s-user       { background: var(--role-user); }
+    .sender-icon.s-assistant  { background: var(--role-asst); }
+    .sender-icon.s-system     { background: var(--role-sys); }
+    .sender-icon.s-tool       { background: var(--role-tool); }
     /* 气泡主体 */
     .chat-bubble {
       padding: 6px 10px;
-      border-radius: 8px;
+      border-radius: 10px;
       flex: 1;
       min-width: 0;
       min-height: 1.5em;       /* 1 行保底 */
@@ -486,10 +594,10 @@
       position: relative;
       overflow: hidden;
     }
-    .bubble-user       { background: #d4f1d4; }  /* 浅绿 */
-    .bubble-assistant  { background: #cfe8ff; }  /* 浅蓝 */
-    .bubble-tool       { background: #f0f0f0; font-family: ui-monospace, monospace; font-size: 11.5px; }
-    .bubble-system     { background: #fff8e0; border: 1px dashed #ec5; max-width: 100%; }
+    .bubble-user       { background: var(--panel); color: var(--fg-muted); border-left: 3px solid var(--role-user); }
+    .bubble-assistant  { background: var(--panel); color: var(--fg-muted); border-left: 3px solid var(--role-asst); }
+    .bubble-tool       { background: var(--bg-sunken); color: var(--fg-muted); font-size: 11.5px; border-left: 3px solid var(--role-tool); }
+    .bubble-system     { background: var(--tint-system); color: var(--fg-muted); border: 1px dashed var(--warn); max-width: 100%; }
 
     /* assistant 气泡内的 tool_call 子区域: 一条 response 的 message 可能同时含
        content 文本和 tool_calls 数组 (OpenAI) 或 content 数组中的 tool_use block
@@ -498,10 +606,9 @@
     .bubble-tool-call {
       margin-top: 6px;
       padding: 4px 6px;
-      border: 1px solid #b0c8e8;
+      border: 1px solid var(--border);
       border-radius: 4px;
-      background: rgba(255,255,255,0.5);
-      font-family: ui-monospace, monospace;
+      background: var(--bg-deep);
       font-size: 11px;
       white-space: pre-wrap;
       word-break: break-word;
@@ -523,7 +630,8 @@
        展开: .bubble-content max-height 22.5em (~15 行, 与 JS EXPAND_THRESHOLD_LINES 对齐) + overflow:auto. */
     .chat-bubble.collapsed .bubble-content { max-height: 4.5em; overflow: hidden; }
     .chat-bubble.expanded  .bubble-content { max-height: 22.5em; overflow: auto; }
-    /* 折叠态底部渐变遮罩: 相对 .chat-bubble 定位 (content 层溢出被 bubble 的 overflow:hidden 裁切). */
+    /* 折叠态底部渐变遮罩: 相对 .chat-bubble 定位 (content 层溢出被 bubble 的 overflow:hidden 裁切).
+       currentColor = 气泡文本色 (深底下为浅色), 渐变到该色作淡出. */
     .chat-bubble.collapsed::after {
       content: '';
       position: absolute;
@@ -531,7 +639,7 @@
       height: 1.5em;
       background: linear-gradient(transparent, currentColor);
       pointer-events: none;
-      opacity: 0.08;
+      opacity: 0.15;
     }
     /* 按钮浮层: 绝对定位气泡右下角, 不随 content 滚动.
        折叠态: 只显示 toggle. 展开态: toggle + view-full (并排).
@@ -547,21 +655,22 @@
     }
     .bubble-toggle {
       font-size: 11px;
-      color: #4a6fa5;
+      color: var(--link);
       cursor: pointer;
       user-select: none;
       border: none;
-      background: rgba(255,255,255,0.85);
+      background: var(--bubble-overlay);
       padding: 0 4px;
       text-decoration: underline;
       text-underline-offset: 2px;
+      border-radius: 4px;
     }
     .view-full-btn {
       font-size: 11px;
-      color: #4a6fa5;
-      background: rgba(255,255,255,0.9);
-      border: 1px solid #aac;
-      border-radius: 3px;
+      color: var(--link);
+      background: var(--bubble-overlay);
+      border: 1px solid var(--border);
+      border-radius: 4px;
       padding: 1px 6px;
       cursor: pointer;
     }
@@ -572,8 +681,8 @@
       max-height: 80vh;
       width: 600px;
       padding: 12px;
-      border: 1px solid #888;
-      border-radius: 6px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
     }
     dialog.bubble-full .full-header {
       display: flex;
@@ -581,16 +690,16 @@
       align-items: center;
       margin-bottom: 8px;
       font-size: 12px;
-      color: #666;
+      color: var(--fg-muted);
     }
     dialog.bubble-full .full-body {
       white-space: pre-wrap;
       word-break: break-word;
-      font-family: ui-monospace, monospace;
       font-size: 12px;
       max-height: 65vh;
       overflow: auto;
-      background: #f5f5f5;
+      background: var(--bg-deep);
+      color: var(--fg-muted);
       padding: 8px;
       border-radius: 4px;
     }
@@ -602,8 +711,8 @@
       max-height: 85vh;
       width: 700px;
       padding: 12px;
-      border: 1px solid #888;
-      border-radius: 6px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
     }
     dialog.round-dialog .dialog-header {
       display: flex;
@@ -612,7 +721,7 @@
       margin-bottom: 8px;
       font-size: 13px;
       font-weight: 600;
-      color: #333;
+      color: var(--fg);
     }
     dialog.round-dialog .dialog-body {
       max-height: 72vh;
@@ -623,34 +732,34 @@
     dialog.round-dialog .info-table { border-collapse: collapse; width: 100%; }
     dialog.round-dialog .info-table td {
       padding: 3px 8px;
-      border-bottom: 1px solid #f0f0f0;
+      border-bottom: 1px solid var(--panel);
       vertical-align: top;
     }
     dialog.round-dialog .info-key {
-      color: #999;
+      color: var(--fg-muted);
       white-space: nowrap;
       width: 110px;
     }
     dialog.round-dialog .info-val {
-      color: #333;
+      color: var(--fg);
       word-break: break-all;
-      font-family: ui-monospace, monospace;
       font-size: 11.5px;
     }
     /* raw 区块 */
     dialog.round-dialog .raw-section { margin-bottom: 12px; }
     dialog.round-dialog .raw-label {
       font-size: 11px;
-      color: #888;
+      color: var(--fg-muted);
       margin-bottom: 2px;
       font-weight: 600;
     }
-    dialog.round-dialog .raw-note { color: #b88; font-weight: 400; }
+    dialog.round-dialog .raw-note { color: var(--warn); font-weight: 400; }
     dialog.round-dialog .raw-pre {
-      background: #f5f5f5;
+      background: var(--bg-deep);
+      color: var(--fg-muted);
       padding: 6px 8px;
-      border-radius: 4px;
-      font-family: ui-monospace, monospace;
+      border: 1px solid var(--panel);
+      border-radius: 6px;
       font-size: 11px;
       white-space: pre-wrap;
       word-break: break-word;
@@ -658,7 +767,7 @@
       overflow-y: auto;
       margin: 0;
     }
-    dialog.round-dialog .raw-loading { padding: 20px; text-align: center; color: #999; }
+    dialog.round-dialog .raw-loading { padding: 20px; text-align: center; color: var(--fg-faint); }
 
     /* ─── IM 风格 detail 布局: 上下分栏 (request 上下文 + response 打字框) ─── */
     /* detail 内部分 detail-header / request-pane / response-pane. */
@@ -666,7 +775,7 @@
       padding: 3px 12px 2px;
       flex-shrink: 0;
       font-size: 11px;
-      color: #888;
+      color: var(--fg-muted);
     }
     /* request 上下文区: 滚动. */
     .request-pane {
@@ -679,18 +788,18 @@
     .response-pane {
       flex-shrink: 0;
       height: calc(12.5px * 1.5 * 10 + 24px); /* 10 行 + padding */
-      border-top: 1px solid #ddd;
-      background: #fafafa;
+      border-top: 1px solid var(--panel);
+      background: var(--bg-sunken);
       display: flex;
       flex-direction: column;
     }
     .response-pane .resp-header {
       padding: 4px 12px;
       font-size: 11px;
-      color: #666;
+      color: var(--fg-muted);
       text-transform: uppercase;
       letter-spacing: 0.05em;
-      border-bottom: 1px solid #eee;
+      border-bottom: 1px solid var(--panel);
       flex-shrink: 0;
       display: flex;
       justify-content: space-between;
@@ -700,17 +809,17 @@
       flex: 1;
       overflow-y: auto;
       padding: 8px 12px;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       font-size: 12.5px;
       line-height: 1.5;
       white-space: pre-wrap;
       word-break: break-word;
     }
 
-    /* mock highlight: 标记命中的 redact mock 字符串 */
+    /* mock highlight: 标记命中的 redact mock 字符串.
+       文字复用 --on-accent (深字), 与 .badge-hit 同源; 在橙/黄底上均 ≥8:1. */
     mark.secret-hit {
-      background: #ffe08a;
-      color: #6b3d00;
+      background: var(--hit-bg);
+      color: var(--on-accent);
       padding: 0 2px;
       border-radius: 2px;
       cursor: help;
@@ -732,11 +841,11 @@
       padding: 4px 10px;
       line-height: 1.35;
       cursor: pointer;
-      border-bottom: 1px solid #eee;
-      background: #fafafa;
+      border-bottom: 1px solid var(--panel);
+      background: var(--bg-sunken);
     }
-    .session-item:hover { background: #f0f0f0; }
-    .session-item.active { background: #d0e7ff; }
+    .session-item:hover { background: var(--panel); }
+    .session-item.active { background: var(--panel-hi); box-shadow: inset 3px 0 0 var(--accent); }
     .session-item .ri-icon { grid-area: icon; display: flex; align-items: center; gap: 3px; }
     .session-item .ri-right {
       grid-area: right;
@@ -755,20 +864,20 @@
     .session-item .ri-line1 {
       grid-area: line1;
       font-size: 12.5px;
-      color: #222;
+      color: var(--fg);
       font-weight: 500;
     }
     .session-item .ri-line2 {
       grid-area: line2;
       font-size: 10.5px;
-      color: #999;
+      color: var(--fg-muted);
     }
-    .session-item.active .ri-line2 { color: #6a87b3; }
+    .session-item.active .ri-line2 { color: var(--accent); }
     /* 展开三角形: 用边框模拟, 旋转表示展开态. */
     .session-item .caret {
       display: inline-block;
       width: 0; height: 0;
-      border-left: 4px solid #888;
+      border-left: 4px solid var(--fg-muted);
       border-top: 3px solid transparent;
       border-bottom: 3px solid transparent;
       margin-right: 4px;
@@ -778,8 +887,8 @@
     .session-item.expanded .caret { transform: rotate(90deg); }
     /* 会话内轮次数徽标 (count>1 时显示). */
     .badge-count {
-      background: #e0e7ff;
-      color: #336;
+      background: var(--accent);
+      color: var(--on-accent);
       font-weight: bold;
       padding: 0 5px;
       border-radius: 8px;
@@ -792,7 +901,7 @@
     .round-list { display: none; }
     .round-list.expanded { display: block; }
     /* round-group: 一个用户轮次 (组首) + 紧随其后的工具调用子轮次 (圆点行). */
-    .round-group { border-bottom: 1px solid #f5f5f5; }
+    .round-group { border-bottom: 1px solid var(--panel); }
     .round-group:last-child { border-bottom: none; }
     .round-item {
       display: grid;
@@ -803,10 +912,10 @@
       line-height: 1.3;
       cursor: pointer;
       font-size: 11.5px;
-      color: #555;
+      color: var(--fg-muted);
     }
-    .round-item:hover { background: #f0f0f0; }
-    .round-item.active { background: #d0e7ff; color: #222; }
+    .round-item:hover { background: var(--panel); }
+    .round-item.active { background: var(--panel-hi); color: var(--fg); box-shadow: inset 3px 0 0 var(--accent); }
     .round-item .ri-line1 {
       min-width: 0;
       overflow: hidden;
@@ -818,7 +927,7 @@
       align-items: center;
       gap: 4px;
       font-size: 10px;
-      color: #999;
+      color: var(--fg-muted);
     }
 
     /* 三级条目: 工具调用子轮次 = 横向排列的可点击小圆点.
@@ -840,7 +949,7 @@
     }
     .sub-dot:hover { transform: scale(1.4); }
     /* active 用 outline (不参与布局流, 切换时无尺寸抖动). */
-    .sub-dot.active { outline: 1.5px solid #4a6fa5; outline-offset: 1px; }
+    .sub-dot.active { outline: 1.5px solid var(--accent); outline-offset: 1px; }
 
     /* ─── timeline 顶/底悬浮按钮 ─────────────────────────────────────────── */
     /* 按钮固定在滚动区域 (#detail) 右侧的顶部/底部 (即滚动条位置), 不随内容滚动.
@@ -861,7 +970,7 @@
        避免顶部按钮 hidden 时底部按钮错位到顶部. */
     #scroll-bottom-btn { margin-top: auto; }
     /* unread badge: pinned 期间有未读时浮在底部按钮之上 (而非用 margin-auto 推到底),
-       与 scroll-bottom-btn 留 8px 间距. 强调色 (蓝) 区别于灰色的方向按钮. */
+       与 scroll-bottom-btn 留 8px 间距. 强调色 (accent) 区别于灰色的方向按钮. */
     #unread-badge {
       margin-bottom: 8px;
       width: auto;
@@ -869,14 +978,14 @@
       height: 32px;
       padding: 0 10px;
       border-radius: 16px;          /* 胶囊 */
-      background: #4a6fa5;
-      color: #fff;
+      background: var(--accent);
+      color: var(--on-accent);
       font-size: 12px;
       font-weight: 600;
-      border-color: #4a6fa5;
+      border: 1px solid var(--accent);
       animation: badge-pop 0.18s ease-out;
     }
-    #unread-badge:hover { background: #3a5a8a; border-color: #3a5a8a; }
+    #unread-badge:hover { background: var(--accent); border-color: var(--accent); }
     @keyframes badge-pop {
       from { transform: scale(0.7); opacity: 0; }
       to   { transform: scale(1);   opacity: 1; }
@@ -885,25 +994,25 @@
       width: 32px;
       height: 32px;
       border-radius: 50%;
-      border: 1px solid #888;
-      background: #fff;
-      color: #444;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--fg-muted);
       cursor: pointer;
       font-size: 16px;
       line-height: 1;
       display: flex;
       align-items: center;
       justify-content: center;
-      box-shadow: 0 1px 4px rgba(0,0,0,0.15);
+      box-shadow: 0 1px 4px rgba(0,0,0,0.4);
       pointer-events: auto;
     }
-    .scroll-nav button:hover { background: #eee; }
+    .scroll-nav button:hover { background: var(--panel-hi); }
     .scroll-nav button[hidden] { display: none; }
 
     /* ─── timeline: 每轮分隔 (轮次边界标识) ──────────────────────────────── */
     /* timeline 内每轮 (.tl-round) 之间用细分隔线, 每轮 header 显示时间/状态/轮次序号. */
     .tl-round {
-      border-bottom: 1px dashed #e0e0e0;
+      border-bottom: 1px dashed var(--panel-hi);
       padding-bottom: 4px;
     }
     .tl-round:last-child { border-bottom: none; }
@@ -913,8 +1022,8 @@
       align-items: center;
       padding: 4px 0 2px;
       font-size: 10.5px;
-      color: #999;
-      border-top: 1px solid #eee;
+      color: var(--fg-muted);
+      border-top: 1px solid var(--panel);
       margin-top: 4px;
     }
     .tl-round-header .tl-meta { display: flex; gap: 8px; align-items: center; }
@@ -923,27 +1032,28 @@
     .tl-round-header .tl-actions button {
       border: none;
       background: transparent;
-      color: #aaa;
+      color: var(--fg-faint);
       cursor: pointer;
       font-size: 11px;
       padding: 2px 5px;
-      border-radius: 3px;
+      border-radius: 4px;
       line-height: 1;
     }
-    .tl-round-header .tl-actions button:hover { background: #e0e0e0; color: #555; }
+    .tl-round-header .tl-actions button:hover { background: var(--panel-hi); color: var(--fg-muted); }
     /* 选中态高亮: 持续的背景色 (不是一闪而过的动画). 见 issue #36 "当前选中的 Round".
+       选中色用 yellow (区别于 accent mauve 的 hover/active 态), 形成层次.
        .tl-round.selected = 当前选中轮次 (来自 state.selectedRound 状态); 持续高亮.
        .tl-round.flash = 选中瞬间的闪烁动画 (selectRound / 点击圆点时叠加一次). */
     .tl-round.selected {
-      background: #fff8d6;
+      background: var(--tint-selected);
       /* 左侧细色条强化选中态 (与 sidebar active 视觉呼应). */
-      box-shadow: inset 3px 0 0 #d4a017;
+      box-shadow: inset 3px 0 0 var(--warn);
     }
     .tl-round.flash {
       animation: tl-flash 1.2s ease-out;
     }
     @keyframes tl-flash {
-      0%   { background: #ffe08a; }
+      0%   { background: var(--tint-flash); }
       100% { background: transparent; }
     }
 
@@ -976,9 +1086,9 @@
       position: sticky;
       bottom: 0;
       margin: 0 12px;
-      border-radius: 4px;
-      border: 1px solid #e0e0e0;
-      background: #fafafa;
+      border-radius: 6px;
+      border: 1px solid var(--panel-hi);
+      background: var(--bg-sunken);
       z-index: 5;
     }
 
@@ -989,26 +1099,26 @@
          - 往下滚 (气泡上移) → 抽屉扩大, 最大 40%.
          - 滚到末轮底部以下 (placeholder 区域) → 渐进扩展到 80%.
        overlay 不影响 #detail 的滚动高度, 循环依赖从架构上消除.
-       顶部边缘 (border-top): follow 时淡灰近不可见; pinned 时蓝色细条 (WebUI 反馈1:
+       顶部边缘 (border-top): follow 时淡灰近不可见; pinned 时 accent 细条 (WebUI 反馈1:
        让用户能区分 follow/pinned 状态). .pinned 类由 updateResponseDrawerLayout 同步
        (与 drawer 高度同一渲染周期, 覆盖抽屉从隐藏切到可见等边界). */
     .response-drawer {
       position: absolute;
       left: 0; right: 0; bottom: 0;
-      background: #fafafa;
-      border-top: 1px solid #ddd;
+      background: var(--bg-sunken);
+      border-top: 1px solid var(--panel-hi);
       display: flex;
       flex-direction: column;
       min-height: 0;
       overflow: hidden;
       z-index: 8;
-      box-shadow: 0 -2px 8px rgba(0,0,0,0.08);
+      box-shadow: 0 -2px 8px rgba(0,0,0,0.4);
       transition: border-top-color 0.15s ease, box-shadow 0.15s ease;
     }
-    /* pinned: 蓝色细条 + 轻微上浮阴影, 明显区别于 follow 的淡灰. 配色与 unread badge 一致. */
+    /* pinned: accent 细条 + 轻微上浮阴影, 明显区别于 follow 的淡灰. 配色与 unread badge 一致. */
     .response-drawer.pinned {
-      border-top: 3px solid #4a6fa5;
-      box-shadow: 0 -3px 12px rgba(74, 111, 165, 0.25);
+      border-top: 3px solid var(--accent);
+      box-shadow: 0 -3px 12px rgba(203, 166, 247, 0.25);
     }
     /* placeholder: 提供段 B (遮挡 placeholder) 的滚动空间. 用户滚入此区域时 drawer
        已扩大遮挡它, 不暴露空白. 高度由 JS 设置: 长内容 = extremeMaxH (80% wrapH),
@@ -1020,10 +1130,10 @@
     .response-drawer .resp-header {
       padding: 4px 12px;
       font-size: 11px;
-      color: #666;
+      color: var(--fg-muted);
       text-transform: uppercase;
       letter-spacing: 0.05em;
-      border-bottom: 1px solid #eee;
+      border-bottom: 1px solid var(--panel);
       flex-shrink: 0;
       display: flex;
       justify-content: space-between;
@@ -1033,7 +1143,6 @@
       flex: 1;
       overflow-y: auto;
       padding: 8px 12px;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       font-size: 12.5px;
       line-height: 1.5;
       white-space: pre-wrap;
@@ -1044,18 +1153,100 @@
     #detail > .detail-header {
       position: sticky;
       top: 0;
-      background: #fff;
+      background: var(--bg);
       z-index: 5;
-      border-bottom: 1px solid #eee;
+      border-bottom: 1px solid var(--panel);
     }
+
+    /* ─── 主题切换按钮 (三态: auto / light / dark) ─────────────────────────
+       三段式 segmented control, 紧凑嵌入 header 工具栏.
+       data-theme 存 localStorage (sg-theme); auto 模式跟随 OS 偏好. */
+    .theme-switch {
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      overflow: hidden;
+      background: var(--bg);
+    }
+    .theme-switch button {
+      border: 0;
+      background: transparent;
+      color: var(--fg-muted);
+      cursor: pointer;
+      padding: 3px 7px;
+      font-size: 13px;
+      line-height: 1.4;
+      font-family: inherit;
+    }
+    .theme-switch button + button { border-left: 1px solid var(--border-faint); }
+    .theme-switch button.active {
+      background: var(--accent);
+      color: var(--on-accent);
+      font-weight: 600;
+    }
+    .theme-switch button:hover:not(.active) { background: var(--panel-hi); }
   </style>
+  <script>
+    /* ThemeResolver: 最早执行 (阻塞, 在 body 渲染前), 避免主题闪烁 (FOUC).
+       职责: 读 localStorage['sg-theme'] → 写 <html data-theme> + data-effective-theme>.
+       - data-theme: 用户显式选择 (auto/light/dark), 驱动 :root color-scheme.
+       - data-effective-theme: 解析后的实际生效主题 (auto 已展开为 light/dark),
+         供 JS (providerColor 等 inline-style 场景) 读取.
+       auto 模式下监听 OS prefers-color-scheme 变化, 实时更新 effective-theme. */
+    (function () {
+      const STORAGE_KEY = 'sg-theme';
+      const VALID = ['auto', 'light', 'dark'];
+      const saved = VALID.includes(localStorage.getItem(STORAGE_KEY)) ? localStorage.getItem(STORAGE_KEY) : 'auto';
+      const root = document.documentElement;
+      function resolveEffective(theme) {
+        // auto → OS 偏好; 显式 light/dark → 自身.
+        if (theme !== 'auto') return theme;
+        return matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+      }
+      function applyTheme(theme) {
+        root.dataset.theme = theme;
+        root.dataset.effectiveTheme = resolveEffective(theme);
+      }
+      applyTheme(saved);
+      // OS 偏好变化时, 若用户选 auto, 重算 effective-theme 并触发重渲染 (provider icon 配色).
+      matchMedia('(prefers-color-scheme: light)').addEventListener('change', () => {
+        if (root.dataset.theme === 'auto') {
+          const prev = root.dataset.effectiveTheme;
+          applyTheme('auto');
+          if (prev !== root.dataset.effectiveTheme && typeof window.__onThemeChange === 'function') {
+            window.__onThemeChange();
+          }
+        }
+      });
+      // 暴露给主脚本: 切换主题 + 注册变化回调.
+      window.setTheme = function (theme) {
+        if (!VALID.includes(theme)) return;
+        localStorage.setItem(STORAGE_KEY, theme);
+        applyTheme(theme);
+        if (typeof window.__onThemeChange === 'function') window.__onThemeChange();
+      };
+      window.getTheme = function () { return root.dataset.theme || 'auto'; };
+    })();
+  </script>
 </head>
 <body>
-  <header>
-    <span class="brand">secret-guard</span>
+   <header>
+    <span class="brand">
+      <svg class="brand-logo" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+        <path d="M12 2 L20 5 V11 C20 16 16.5 20 12 22 C7.5 20 4 16 4 11 V5 Z" fill="var(--accent)"/>
+        <path d="M12 7.5 C10.6 7.5 9.5 8.6 9.5 10 V11.2 H9 A1 1 0 0 0 8 12.2 V15.8 A1 1 0 0 0 9 16.8 H15 A1 1 0 0 0 16 15.8 V12.2 A1 1 0 0 0 15 11.2 H14.5 V10 C14.5 8.6 13.4 7.5 12 7.5 Z M12 8.7 C12.7 8.7 13.3 9.3 13.3 10 V11.2 H10.7 V10 C10.7 9.3 11.3 8.7 12 8.7 Z" fill="var(--bg)"/>
+      </svg>
+      Secret Guard
+    </span>
     <span class="toolbar">
       <span><span id="count">0</span> <span id="count-label">sessions</span></span>
       <span id="status"></span>
+      <div class="theme-switch" id="theme-switch" role="group" aria-label="主题">
+        <button type="button" data-theme-val="auto" title="跟随系统主题">🌓</button>
+        <button type="button" data-theme-val="light" title="亮色">☀</button>
+        <button type="button" data-theme-val="dark" title="暗色">☾</button>
+      </div>
       <label><input type="checkbox" id="auto" checked> auto-refresh (3s)</label>
       <button class="refresh" onclick="sync()">refresh</button>
     </span>
@@ -1196,7 +1387,7 @@
       <label for="f-value">Value</label>
       <textarea id="f-value" placeholder="the real secret"></textarea>
 
-      <fieldset style="grid-column: 1 / -1; border: 1px solid #ddd; padding: 8px; margin: 4px 0;">
+      <fieldset style="grid-column: 1 / -1; border: 1px solid var(--border); padding: 8px; margin: 4px 0;">
         <legend>Mock Strategy</legend>
         <div style="display: grid; grid-template-columns: auto 1fr; gap: 6px 10px; align-items: center;">
           <label>Initial</label>
@@ -1292,7 +1483,7 @@
         <div class="hint" style="margin-bottom: 8px;">
           Copy this key now — it will not be shown again.
         </div>
-        <textarea id="apikey-reveal-value" readonly style="width: 100%; font-family: monospace; font-size: 13px; padding: 8px; word-break: break-all;" rows="3"></textarea>
+        <textarea id="apikey-reveal-value" readonly style="width: 100%; font-size: 13px; padding: 8px; word-break: break-all;" rows="3"></textarea>
         <div class="actions" style="margin-top: 8px;">
           <button class="btn" type="button" onclick="copyRevealedApiKey()">Copy</button>
           <button class="btn" value="close">Close</button>
@@ -1908,24 +2099,32 @@
     }
 
     // provider id 哈希到调色板. 用 FNV-1a (简单, 无需 crypto), 对 ASCII 字符稳定.
-    // 调色板: 8 个中等饱和度色, 白字可读.
+    // 每项 {light, dark} 成对: 亮用 Latte 深饱和色 (白字可读), 暗用 Mocha 浅饱和色
+    // (深字可读). 成对结构保证亮/暗长度恒一致 (加色只改一处, 不会漂移).
+    // 字面量是 SSOT (拼进 style 属性, 必须 #xxxxxx; 见 providerIcon 注释).
     const PROVIDER_PALETTE = [
-      '#4a6fa5', // 蓝
-      '#5b8c5a', // 绿
-      '#b5712a', // 橙
-      '#a0537a', // 紫红
-      '#3a7a8c', // 青
-      '#8c5a3a', // 棕
-      '#6b5b8c', // 紫
-      '#a04a4a', // 红
+      { light: '#1e66f2', dark: '#89b4fa' }, // blue
+      { light: '#40a02b', dark: '#a6e3a1' }, // green
+      { light: '#df8e1d', dark: '#fab387' }, // orange
+      { light: '#ea76cb', dark: '#f5c2e7' }, // pink
+      { light: '#179299', dark: '#94e2d5' }, // teal
+      { light: '#dc8a78', dark: '#f9e2af' }, // maroon / yellow (原 brown 槽: 暗主题用 yellow 醒目)
+      { light: '#8839ef', dark: '#cba6f7' }, // purple
+      { light: '#d20f39', dark: '#f38ba8' }, // red
     ];
+    // 返回当前生效 (auto 已解析) 的 color-scheme: 'light' | 'dark'.
+    // 由 ThemeResolver 在主题切换时同步设置 <html data-effective-theme>.
+    function currentColorScheme() {
+      return document.documentElement.dataset.effectiveTheme || 'dark';
+    }
     function providerColor(id) {
       let h = 2166136261 >>> 0;
       for (let i = 0; i < id.length; i++) {
         h ^= id.charCodeAt(i);
         h = Math.imul(h, 16777619) >>> 0;
       }
-      return PROVIDER_PALETTE[h % PROVIDER_PALETTE.length];
+      const entry = PROVIDER_PALETTE[h % PROVIDER_PALETTE.length];
+      return currentColorScheme() === 'light' ? entry.light : entry.dark;
     }
 
     // 协议角标 SVG (简化几何符号, 7×7 viewport 内可辨识).
@@ -3951,6 +4150,31 @@
         updateResponseDrawerLayout();
       });
     });
+
+    // ─── 主题切换按钮 (三态) ────────────────────────────────────────────────
+    // 与 ThemeResolver (head 内联脚本) 配合: 这里只管 UI 态同步 + 触发重渲染.
+    // 重渲染必要性: provider 图标颜色由 JS 拼 inline-style (无法用 CSS var 跟随主题),
+    // 主题切换后需重画 sidebar 让 providerColor() 取新调色板. 非 inline-style 的元素
+    // 由 CSS light-dark() 自动切换, 无需 JS 介入.
+    (function initThemeSwitch() {
+      const buttons = document.querySelectorAll('#theme-switch button');
+      const syncActive = () => {
+        const cur = window.getTheme();
+        buttons.forEach(b => b.classList.toggle('active', b.dataset.themeVal === cur));
+      };
+      buttons.forEach(b => b.addEventListener('click', () => window.setTheme(b.dataset.themeVal)));
+      syncActive();
+      // 主题变化时 (用户切换 / OS 偏好转动): 同步按钮态 + 重画 sidebar.
+      // 关键: 必须失效 sidebar fingerprint 并直接重画 (不能只调 sync()) —
+      // renderSidebar() 会用 lastSidebarFingerprint 短路, 而 fingerprint 只含后端
+      // 数据不含主题, 主题切换时后端无变化 → 短路 → provider icon 不重画 → bug.
+      // 主题切换是纯客户端变化, 无需 refetch.
+      window.__onThemeChange = () => {
+        syncActive();
+        state.lastSidebarFingerprint = '';
+        renderSidebar();
+      };
+    })();
   </script>
 </body>
 </html>

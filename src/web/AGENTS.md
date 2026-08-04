@@ -231,7 +231,7 @@ timeline 有两种滚动状态, 由 **视口距底部距离** 机械推导 (SSOT
 - **pinned** (距底 > `NEAR_BOTTOM_PX`): 新 round 到达 → 不滚动, 浮出 `#unread-badge` 显示 "↓ N".
 
 **follow/pinned 视觉指示 (WebUI 反馈1)**: drawer 顶部边缘颜色随状态切换 — follow 时淡灰
-近不可见 (1px `#ddd`), pinned 时蓝色细条 (3px `#4a6fa5` + 轻微上浮阴影). `.pinned` 类由
+近不可见 (1px `--surface1`), pinned 时 accent 细条 (3px `--accent` = mauve, + 轻微上浮阴影). `.pinned` 类由
 `updateResponseDrawerLayout` 在每渲染/滚动周期同步 (与 drawer 高度同一周期, 覆盖抽屉从
 隐藏切到可见等边界). 配色与 unread badge 一致.
 
@@ -260,3 +260,13 @@ loadTimeline) 才重置 selected 到最新轮 (`.selected` 持续高亮; 不触�
 - 气泡颜色 + sender icon 分类.
 - 气泡间微小间距 (margin-bottom, 避免视觉粘连).
 - tool round 预览: 直接消费后端预计算的 `round_role` + `preview` 字段 (前端不做 best-effort 推断).
+
+### 主题系统 (双主题 + 自动跟随系统)
+
+视觉风格 = **Catppuccin** (亮: Latte, 暗: Mocha). 三态切换: auto (跟随 OS `prefers-color-scheme`) / light / dark, 由 header 工具栏的 `.theme-switch` 三按钮控制, 选择持久化在 `localStorage['sg-theme']`.
+
+- **ThemeResolver** (`<head>` 内联阻塞脚本, 最早执行避免 FOUC): 读 localStorage → 写 `<html data-theme="auto|light|dark">` + `data-effective-theme` (auto 已解析为 light/dark). 监听 OS 偏好变化, auto 模式下实时更新.
+- **CSS**: `:root` 声明全部语义变量为 `light-dark(亮值, 暗值)`, 自动随 `color-scheme` 切换. **禁止**在 `input/button/select` 上硬编码 `color-scheme: dark` (会破坏 `light-dark()` 解析, 历史教训); 让它们继承 `:root` 的 color-scheme.
+- **语义层 vs 调色板层**: 组件只引用语义变量 (`--fg/--fg-muted/--fg-faint/--panel/--border/--accent` 等), 不直接引用色相名. 改色相只动 `:root`, 调对比度只动语义映射.
+- **对比度**: `--fg` / `--fg-muted` 在对应底色上达 WCAG AA (≥4.5:1); `--fg-faint` 用于 placeholder / disabled / 占位提示 (非阅读重点, 可低于 AA).
+- **JS inline-style 例外**: `PROVIDER_PALETTE` 拼进 `style` 属性, 无法用 CSS var 跟随主题, 故 JS 端用单个 2D 数组 `[{light, dark}, ...]` (成对结构防亮/暗漂移), 由 `currentColorScheme()` (读 `data-effective-theme`) 选对应半边. 主题切换时主脚本注册的 `window.__onThemeChange` 回调失效 sidebar fingerprint 后直接 `renderSidebar()` 重画 (因 renderSidebar 的 fingerprint 不含主题, 不失效会短路 → icon 不更新).
