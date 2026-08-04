@@ -65,7 +65,7 @@
 | `FWD-*` | 转发忠实性 (域 A) | codec INV-1/2/5 → FWD-1/2/5; proxy DoD → FWD-4/6 | `src/proxy/mod.rs` 头部 + `src/codec/AGENTS.md` |
 | `RED-*` | Redact/Restore (域 A) | C1→RED-1, C2→RED-2, C3→RED-3, C4→RED-4, C5→RED-5, C6→RED-6, C7→RED-7 | `src/redact.rs` + `src/mock.rs` 头部 |
 | `STR-*` | 流式 SSE (域 A) | codec INV-4 → STR-5 | `src/codec/stream.rs` + `src/codec/AGENTS.md` |
-| `CDAG-*` | Conversation DAG (域 B) | INV-1→CDAG-1, INV-2→CDAG-2, INV-3→CDAG-3, INV-4→CDAG-4, INV-5→CDAG-5 | `src/dag.rs` 头部 + `docs/design/conversation-dag.md` |
+| `CDAG-*` | Conversation DAG (域 B) | INV-1→CDAG-1, INV-2→CDAG-2, INV-3→CDAG-3, INV-4→CDAG-4, INV-5→CDAG-5 | `src/dag/mod.rs` 头部 + `docs/design/conversation-dag.md` |
 | `DTO-*` | WebUI DTO 派生 (域 B) | (新增) | `src/web/AGENTS.md` + `src/record.rs` 头部 |
 | `CFG-*` | 双层配置 (域 B) | (新增) | `src/config.rs` 头部 |
 | `SEC-*` | 安全姿态 (跨域) | (新增) | `src/web/AGENTS.md` + `src/secrets.rs` + `src/provider.rs` |
@@ -673,8 +673,8 @@
 | `preview` / `model` | extract_preview_and_model | ✅ `proxy/record.rs::assert_preview_model_match_source` |
 | `resp_parsed` (非流式) | reader.read_response | ✅ `proxy/record.rs::assert_resp_parsed_matches_source_nonstream` |
 | `resp_parsed` (流式) | StreamScan snapshot | ⏳ Phase A 已删除原始 SSE 字节, 派生与源物理分离, 暂无法守卫 |
-| `req_delta_messages` | extract_delta_messages_from_raw | (每次 timeline 请求重算, 无 drift 风险) |
-| `session.title` | find_root_title | ✅ `dag.rs::assert_session_title_matches_root_preview` |
+| `req_delta_messages` | extract_delta_messages_from_raw (derive.rs) | (每次 timeline 请求重算, 无 drift 风险) |
+| `session.title` | find_root_title | ✅ `dag/mod.rs::assert_session_title_matches_root_preview` |
 
 **Properties**:
 - `prop_each_derived_field_has_consistency_check`: 上表中每个"待补"字段最终都有 consistency-check 断言.

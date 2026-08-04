@@ -7,7 +7,7 @@
 
 - `mod.rs`: `/__sg` 子 router + `/` 根入口 + slash redirect + not_found + `NO_STORE` 共享常量.
 - `api.rs`: `/__sg/api/*` JSON endpoints (records 单条 view + sessions + sync + sessions/timeline + secrets/providers CRUD).
-- `dto.rs`: WebUI 响应序列化 DTO (SessionView / NodeView / RoundBrief / TimelineRound / TimelineTail / TimelinePage / TimelineDiffData / SyncSnapshot). 构造逻辑留 dag.rs (持读锁访问私有字段).
+- `dto.rs`: WebUI 响应序列化 DTO (SessionView / NodeView / RoundBrief / TimelineRound / TimelineTail / TimelinePage / TimelineDiffData / SyncSnapshot). 构造逻辑留 dag 模块 (持读锁访问私有字段).
 - `index.html`: 单页 UI (IM 风格: 会话折叠 sidebar + timeline 对话流, 内嵌 CSS + vanilla JS, 零外部依赖).
 
 ## 路由
@@ -51,7 +51,7 @@ PATCH  /__sg/api/api-keys/{id}/toggle
 所有响应带 `Cache-Control: no-store`, 避免浏览器对自动刷新返回缓存内容.
 
 > 注: 旧的 `GET /api/records` (扁平分页) + `GET /api/nodes/{id}/timeline` (基于 node_id)
-> 已删除, 由 session-aware sync API 替代. 详见 `dag.rs` 的 session_rounds /
+> 已删除, 由 session-aware sync API 替代. 详见 `dag` 模块的 session_rounds /
 > timeline_view / timeline_diff / sync_snapshot.
 
 ### Records parsed view (单条按需拉取)
@@ -75,7 +75,8 @@ PATCH  /__sg/api/api-keys/{id}/toggle
 
 ### session-aware timeline (TimelineRound / TimelineTail / TimelineDiffData)
 
-新模型基于 SessionId (替代旧的基于 node_id 的 timeline). 三条查询路径在 `dag.rs`:
+新模型基于 SessionId (替代旧的基于 node_id 的 timeline). 三条查询路径在 `dag` 模块
+(`dag/timeline.rs`):
 
 - `session_rounds(sid)`: sidebar 三级菜单的轻量 round 摘要 (RoundBrief, 不含 delta messages).
 - `timeline_view(sid, before, limit)`: timeline 初始加载 + lazy load (向前翻更老).
@@ -86,7 +87,7 @@ PATCH  /__sg/api/api-keys/{id}/toggle
 **req_delta_messages 实现**: 当前从 `req_body_raw` 末尾切片 (已 redact, LLM 视角, 安全).
 不走 BlockPool + codec writer 路径 (会泄露真实 secret, 需在 web 层重建 redactMap — TODO).
 已知限制: 跨协议 writer 拆分场景切片 start 偏小, delta 可能含前序轮消息 (同协议不受影响).
-详见 `dag.rs::extract_delta_messages_from_raw`.
+详见 `derive.rs::extract_delta_messages_from_raw`.
 
 **tail (response 抽屉)**: 末轮 (链中最新) 的 response 内容. `length` = parsed 序列化字节数
 (parsed=None 时 fallback 到 raw_resp_body.len()). 前端用它判定是否需要更新抽屉.

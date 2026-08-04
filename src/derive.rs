@@ -2,9 +2,14 @@
 //!
 //! # 职责边界
 //!
-//! 本模块提供协议无关的派生函数, 从 request body 提取 sidebar 标题 preview + model 名 +
-//! message 文本片段. 这些派生属于 **域 B (派生链)**: 从原始字节 (域 A 透明中继产出的
-//! `req_body_raw`) 或已解析的 IR 派生 WebUI 需要的轻量视图.
+//! 本模块提供协议无关的派生函数, 从 request body 提取:
+//! - sidebar 标题 preview + model 名 + message 文本片段 (`extract_preview_and_model` /
+//!   `extract_preview_and_model_from_ir` / `extract_text_blocks`).
+//! - timeline delta messages 切片 (`extract_delta_messages_from_raw`): 从 req_body_raw
+//!   末尾截取 req_delta.len() 条 messages, 含根节点 system prompt 注入.
+//!
+//! 这些派生属于 **域 B (派生链)**: 从原始字节 (域 A 透明中继产出的 `req_body_raw`)
+//! 或已解析的 IR 派生 WebUI 需要的轻量视图.
 //!
 //! # 为什么不在 `web::api`
 //!
@@ -220,6 +225,79 @@ pub(crate) fn extract_text_blocks(arr: &[serde_json::Value]) -> Option<Vec<Strin
         })
         .collect();
     if texts.is_empty() { None } else { Some(texts) }
+}
+
+/// (fallback) 从 node.req_body_raw 末尾截取 req_delta.len() 条 messages (wire JSON),
+/// 用于 timeline 渲染本轮新增气泡. 属于域 B 派生链 (从 req_body_raw 字节派生 WebUI 视图).
+///
+/// # system 处理
+///
+/// OpenAI reader 把 role=system 提升到 IrRequest.system (不在 messages 里),
+/// writer 再写回 messages[0]. DAG 的 req_delta 不含 system (基于 IR messages).
+/// 因此根节点 (parent=None) 时, 从 req_body_raw 顶层提取 system 字段 (Anthropic 风格)
+/// 或 messages[0] (OpenAI 风格 role=system), 作为 delta 的首条 synthetic message.
+///
+/// # 已知限制
+///
+/// 跨协议 writer 拆分场景切片 start 偏小, delta 可能含前序轮消息 (同协议不受影响).
+/// 详见 AGENTS.md "已知限制" + src/web/AGENTS.md.
+///
+/// # 鲁棒性 (ROB-1 契约)
+///
+/// 接收 HTTP body 派生数据, 任何 panic 都能让单个恶意请求崩溃进程. 对非 JSON /
+/// 字段缺失 / count 与 messages 数不匹配一律返回空 Vec, 不 panic.
+pub(crate) fn extract_delta_messages_from_raw(node: &crate::dag::Node) -> Vec<serde_json::Value> {
+    let count = node.req_delta.len();
+    if count == 0 {
+        return Vec::new();
+    }
+    let Ok(req_body) = serde_json::from_str::<serde_json::Value>(&node.event.req_body_raw) else {
+        return Vec::new();
+    };
+    let Some(messages) = req_body.get("messages").and_then(|m| m.as_array()) else {
+        return Vec::new();
+    };
+    if messages.len() < count {
+        return Vec::new();
+    }
+    let start = messages.len() - count;
+    let mut result: Vec<serde_json::Value> = messages[start..].to_vec();
+
+    // 根节点: 若有顶层 system (Anthropic 风格) 或 messages[0] 是 system (OpenAI),
+    // 且未被 req_delta 覆盖 (start > 0 说明 system 在 messages[start] 之前),
+    // 则把 system 作为 delta 的首条 synthetic message 注入.
+    // 这让根节点的 system prompt 在 timeline 可见 (issue #27 bug 3).
+    if node.parent.is_none() && start > 0 {
+        // Anthropic 风格: 顶层 system 字段 (string 或 array).
+        if let Some(sys) = req_body.get("system") {
+            let sys_text = if let Some(s) = sys.as_str() {
+                (!s.is_empty()).then(|| s.to_string())
+            } else if let Some(arr) = sys.as_array() {
+                extract_text_blocks(arr).map(|t| t.join("\n"))
+            } else {
+                None
+            };
+            if let Some(text) = sys_text {
+                result.insert(0, serde_json::json!({"role": "system", "content": text}));
+            }
+        }
+        // OpenAI 风格: messages[0] 是 role=system (writer 写回).
+        // 若 start > 0 且 messages[0].role == system, 注入到 delta 首位
+        // (额外 guard result.first 非 system, 防御 messages 含多条 system 的畸形输入).
+        else if messages
+            .first()
+            .and_then(|m| m.get("role").and_then(|r| r.as_str()))
+            == Some("system")
+            && result
+                .first()
+                .and_then(|m| m.get("role").and_then(|r| r.as_str()))
+                != Some("system")
+        {
+            result.insert(0, messages[0].clone());
+        }
+    }
+
+    result
 }
 
 #[cfg(test)]
@@ -637,5 +715,384 @@ mod tests {
                 body.len()
             );
         }
+    }
+
+    // ─── extract_delta_messages_from_raw (ROB-1 + system 注入) ──────────────
+    //
+    // 契约: docs/design/contracts.md §8 ROB-1 — extract_delta_messages_from_raw
+    // (timeline 的 req_delta 切片 fallback) 对任意 req_body_raw + 任意 req_delta.len()
+    // 组合 (含非 JSON / 空 / 损坏 / count 与 messages 数不匹配) 必须不 panic, 返回空 Vec
+    // 或合法切片.
+    //
+    // catch_unwind 守卫: 即便未来有人改函数时引入 panic 路径, 这个 property 也会显式 fail
+    // 并报告输入的 (count, body_len), 而非让测试进程崩溃 (release build panic=abort 时
+    // proptest 自身的 panic-as-fail 机制无法生效).
+
+    use crate::codec::ir::IrRole;
+    use crate::dag::{CallEvent, Node, PolicySnapshot, SessionId};
+    use parking_lot::RwLock;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    /// 构造一个最小化 Node, 用作 extract_delta_messages_from_raw 的 fixture.
+    /// `count` 决定 `req_delta.len()` (函数内部用此长度做切片); `req_body_raw` 是任意字节.
+    fn fixture_node(count: usize, req_body_raw: String) -> Node {
+        let event = CallEvent {
+            created_at: chrono::Utc::now(),
+            method: "POST".to_string(),
+            path: "/o/test/v1/chat".to_string(),
+            req_headers: vec![],
+            ingress_protocol: None,
+            redact_seed: 0,
+            policy: Arc::new(PolicySnapshot::default()),
+            req_body_raw,
+            round_role: IrRole::User,
+            preview: None,
+            model: None,
+            redactions: Arc::from([]),
+        };
+        // req_delta 用任意 MessageRef 填充到 count 长度 — 内容不重要, 只用 len().
+        let dummy_ref = crate::dag::MessageRef {
+            role: IrRole::User,
+            blocks: Vec::new(),
+        };
+        let req_delta: Arc<[crate::dag::MessageRef]> = if count == 0 {
+            Arc::from([])
+        } else {
+            Arc::from(vec![dummy_ref; count])
+        };
+        Node {
+            id: Uuid::new_v4(),
+            parent: None, // 根节点: 触发 system 注入分支
+            session_id: SessionId::new(),
+            child_count: 0,
+            req_delta,
+            own_hash: 0,
+            prefix_hash: 0,
+            event,
+            response: RwLock::new(None),
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(96))]
+
+        /// ROB-1 (变体 A): 任意字节 body + 任意 count, extract_delta_messages_from_raw 不 panic.
+        /// 主要覆盖 serde_json::from_str 失败路径 (messages 不可解析 → 早退返回空 Vec).
+        #[test]
+        fn prop_delta_never_panics_arbitrary(
+            count in 0usize..32,
+            bytes in prop::collection::vec(any::<u8>(), 0..2048)
+        ) {
+            let body = String::from_utf8_lossy(&bytes).into_owned();
+            let node = fixture_node(count, body.clone());
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                extract_delta_messages_from_raw(&node)
+            }));
+            prop_assert!(
+                result.is_ok(),
+                "ROB-1 violation: extract_delta_messages_from_raw panicked \
+                 (count={}, body_len={})",
+                count,
+                body.len()
+            );
+        }
+
+        /// ROB-1 (变体 B): 合法 chat JSON + count 在 messages.len() 边界附近不 panic.
+        ///
+        /// `messages[start..]` 切片 (start = messages.len() - count) 是 panic 高危区.
+        /// 本 property 构造合法 messages 数组 + 让 count 在 `[0 .. n+2]` 区间随机,
+        /// 覆盖 count < n (正常切片) / count == n (全取) / count > n (函数内早退返回空)
+        /// 三种语义. 配合 parent=None (根节点) 触发 system 注入分支, 覆盖完整函数路径.
+        #[test]
+        fn prop_delta_never_panics_chat_json_edge_slice(
+            n in 1usize..16,
+            count in 0usize..18,  // 故意让 count 能略大于 n, 触发 messages.len() < count 早退分支
+            seed in any::<u64>()
+        ) {
+            // n 条 messages + count 的依赖关系难以纯声明式表达 (count 需引用 n),
+            // 这里用确定性 seed 直接构造 body (role/content 随机但 n 固定).
+            let body = build_chat_body_with_n_messages(n, seed);
+            let node = fixture_node(count, body.clone());
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                extract_delta_messages_from_raw(&node)
+            }));
+            prop_assert!(
+                result.is_ok(),
+                "ROB-1 violation: extract_delta_messages_from_raw panicked on chat-json \
+                 (n={}, count={}, body_len={})",
+                n,
+                count,
+                body.len()
+            );
+        }
+    }
+
+    /// 用确定性 seed 生成含 n 条 messages 的合法 chat JSON.
+    /// role/content 从 (seed, i) 经 `crate::util::hash64` 派生 (项目 SSOT, 见 src/util.rs),
+    /// 每个 i 独立 hash, 保证可复现, 不依赖 proptest strategy API.
+    fn build_chat_body_with_n_messages(n: usize, seed: u64) -> String {
+        let msgs: Vec<String> = (0..n)
+            .map(|i| {
+                let h = crate::util::hash64(&(seed, i));
+                let role = match h % 4 {
+                    0 => "system",
+                    1 => "user",
+                    2 => "assistant",
+                    _ => "tool",
+                };
+                let content = format!("msg-{}", h % 1000);
+                format!("{{\"role\":\"{role}\",\"content\":\"{content}\"}}")
+            })
+            .collect();
+        format!("{{\"messages\":[{}]}}", msgs.join(","))
+    }
+
+    // ─── DTO-5 切片正确性 (契约 §3 DTO-5) ──────────────────────────────────
+    //
+    // 契约: docs/design/contracts.md §3 DTO-5 — timeline 路径的 req_delta_messages
+    // 必须是本轮新增的 messages (同协议路径 = req_body_raw 末尾 count 条). 这是正确性契约,
+    // 不同于 ROB-1 (鲁棒性, 不 panic). 用确定性 content 让逐条断言可行.
+
+    /// 构造合法 chat JSON, messages 数 = n, 第 i 条 content = format!("{i}").
+    /// 用确定性的 messages (而非 hash 派生) 让 slice 正确性可逐条断言.
+    fn build_chat_body_indexed(n: usize) -> String {
+        let msgs: Vec<String> = (0..n)
+            .map(|i| format!("{{\"role\":\"user\",\"content\":\"msg-{i}\"}}"))
+            .collect();
+        format!("{{\"messages\":[{}]}}", msgs.join(","))
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// DTO-5 `prop_delta_slice_correct_same_proto`:
+        /// 同协议路径下, req_delta_messages == req_body_raw 末尾 count 条 messages.
+        ///
+        /// 构造: n 条 messages (n ∈ [2, 12]), count ∈ [1, n] (保证 messages.len() >= count).
+        /// 断言: result.len() == count, 且 result == messages[start..] (start = n - count),
+        /// content 逐条相等.
+        ///
+        /// 注: 根节点 (parent=None) 且 start > 0 时函数会注入 system (若无 system 字段则
+        /// OpenAI 风格 messages[0]=system). 这里 messages[0] 是 role=user, start>0 时
+        /// messages[0].role != system → 不注入 → result 严格 == messages[start..].
+        /// 为隔离 system 注入逻辑 (DTO-5 prop_delta_includes_system_at_root 单独守卫),
+        /// 本 property 用 parent=None 且 count == n (start=0, 不触发 system 注入) +
+        /// count < n 但 messages[0].role=user 两种 case:
+        /// - count == n: start=0, 无 system 注入, result == messages[0..].
+        /// - count < n: start>0, messages[0].role=user (非 system) → 不注入, result == messages[start..].
+        #[test]
+        fn prop_delta_slice_correct_same_proto(
+            n in 2usize..=12,
+            count in 1usize..=12, // 由 prop_assume 约束 ≤ n
+        ) {
+            prop_assume!(count <= n, "count must be ≤ n for slice semantics");
+            let body = build_chat_body_indexed(n);
+            let node = fixture_node(count, body.clone());
+            let result = extract_delta_messages_from_raw(&node);
+
+            let start = n - count;
+            prop_assert_eq!(
+                result.len(),
+                count,
+                "DTO-5: result.len() 应 == count, 实际 {}",
+                result.len(),
+            );
+            // 逐条比对 content (messages[start..]).
+            for (i, got) in result.iter().enumerate() {
+                let want_idx = start + i;
+                let want_content = format!("msg-{want_idx}");
+                let got_content = got
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<missing>");
+                prop_assert_eq!(
+                    got_content, &want_content,
+                    "DTO-5: result[i] content 不匹配 (want messages[want_idx])"
+                );
+            }
+        }
+
+        /// DTO-5 `prop_delta_includes_system_at_root`:
+        /// 根节点 (parent=None) 的 delta 在 start > 0 时补回 system prompt.
+        ///
+        /// 构造: OpenAI 风格 body, messages[0] = role=system, 后续 n-1 条 user.
+        /// count < n → start > 0, messages[0].role == system → 注入到 result 首位.
+        /// 断言: result[0].role == "system" (注入的 system message).
+        #[test]
+        fn prop_delta_includes_system_at_root(
+            n_sys in 3usize..=8,    // 含 1 条 system + (n_sys-1) 条 user
+            count in 1usize..=8,
+        ) {
+            prop_assume!(count < n_sys, "count < n_sys 才触发 system 注入 (start > 0)");
+            // body: messages[0]=system, messages[1..]=user.
+            let mut msgs = vec![r#"{"role":"system","content":"SYS-PROMPT"}"#.to_string()];
+            for i in 1..n_sys {
+                msgs.push(format!("{{\"role\":\"user\",\"content\":\"u-{i}\"}}"));
+            }
+            let body = format!("{{\"messages\":[{}]}}", msgs.join(","));
+            let node = fixture_node(count, body);
+            let result = extract_delta_messages_from_raw(&node);
+
+            // 注入的 system 在 result 首位.
+            prop_assert!(
+                !result.is_empty(),
+                "DTO-5 system 注入: result 不应为空 (count={count})"
+            );
+            let first_role = result[0]
+                .get("role")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<missing>");
+            prop_assert_eq!(
+                first_role, "system",
+                "DTO-5 system 注入: result[0].role 应为 system (根节点 start>0 时注入)"
+            );
+        }
+
+        /// DTO-5 `prop_delta_handles_non_json_body`:
+        /// 非 JSON body 时返回空 vec (不 panic).
+        ///
+        /// 构造: req_body_raw = 任意字节 (非 JSON), count > 0.
+        /// 断言: result.is_empty() (serde_json::from_str 失败早退).
+        #[test]
+        fn prop_delta_handles_non_json_body(
+            count in 1usize..=8,
+            body in "[^{}\\[\\]]{0,64}", // 非 JSON-ish 字节
+        ) {
+            // prop_assume: body 不应意外是合法 JSON object/array (生成器已排除 {} []).
+            prop_assume!(!body.trim_start().starts_with('{'), "body 非合法 JSON object");
+            let node = fixture_node(count, body.clone());
+            let result = extract_delta_messages_from_raw(&node);
+            prop_assert!(
+                result.is_empty(),
+                "DTO-5: 非 JSON body 应返回空 vec (body={:?}, count={count})",
+                body,
+            );
+        }
+
+        /// DTO-5 `prop_delta_handles_count_mismatch`:
+        /// messages 数 < req_delta_count 时返回空 vec.
+        ///
+        /// 构造: n 条 messages, count > n (函数内 messages.len() < count 早退).
+        /// 断言: result.is_empty().
+        #[test]
+        fn prop_delta_handles_count_mismatch(
+            n in 1usize..=8,
+            extra in 1usize..=5, // count = n + extra > n
+        ) {
+            let count = n + extra;
+            let body = build_chat_body_indexed(n);
+            let node = fixture_node(count, body.clone());
+            let result = extract_delta_messages_from_raw(&node);
+            prop_assert!(
+                result.is_empty(),
+                "DTO-5: messages 数 ({n}) < count ({count}) 应返回空 vec",
+            );
+        }
+    }
+
+    // ─── system 注入 (Anthropic 风格顶层 system / OpenAI 风格 messages[0]) ────
+    //
+    // 覆盖 extract_delta_messages_from_raw 的根节点 system 注入分支.
+    // OpenAI reader 把 role=system 提升到 IrRequest.system (不在 messages 里),
+    // writer 再写回 messages[0]. 故根节点 delta 切片可能不含 system, 需注入.
+    //
+    // Anthropic 风格 (顶层 "system" 字段, string 或 array) 走的是另一个分支,
+    // proptest 生成器不产生顶层 system 字段, 故用固定用例补全覆盖.
+
+    /// 构造 Anthropic 风格 body: 顶层 system 字段 + 固定 3 条 messages (u1/a1/u2).
+    /// 5 个 system 注入测试共享此骨架, 只变 system 字段值.
+    fn body_with_anthropic_system(system_field: &str) -> String {
+        format!(
+            r#"{{"system":{system_field},"messages":[
+                {{"role":"user","content":"u1"}},
+                {{"role":"assistant","content":"a1"}},
+                {{"role":"user","content":"u2"}}
+            ]}}"#
+        )
+    }
+
+    #[test]
+    fn delta_includes_anthropic_top_level_system_string() {
+        // Anthropic 风格: 顶层 "system" 是 string. 根节点 + start>0 → 注入 system.
+        // count=1 → start=2>0, 注入顶层 system 到 delta 首位.
+        let node = fixture_node(1, body_with_anthropic_system(r#""ANTHROPIC-SYS""#));
+        let result = extract_delta_messages_from_raw(&node);
+        // result[0] 应为注入的 system, result[1] 为切出的 user.
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result[0].get("role").and_then(|v| v.as_str()),
+            Some("system")
+        );
+        assert_eq!(
+            result[0].get("content").and_then(|v| v.as_str()),
+            Some("ANTHROPIC-SYS")
+        );
+        assert_eq!(
+            result[1].get("content").and_then(|v| v.as_str()),
+            Some("u2")
+        );
+    }
+
+    #[test]
+    fn delta_includes_anthropic_top_level_system_array() {
+        // Anthropic 风格: 顶层 "system" 是 array of {type:text,text:...}.
+        // 覆盖 extract_text_blocks 路径.
+        let node = fixture_node(
+            1,
+            body_with_anthropic_system(
+                r#"[{"type":"text","text":"SYS-A"},{"type":"text","text":"SYS-B"}]"#,
+            ),
+        );
+        let result = extract_delta_messages_from_raw(&node);
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result[0].get("role").and_then(|v| v.as_str()),
+            Some("system")
+        );
+        // array 的多个 text block 用 \n join.
+        assert_eq!(
+            result[0].get("content").and_then(|v| v.as_str()),
+            Some("SYS-A\nSYS-B")
+        );
+    }
+
+    #[test]
+    fn delta_skips_empty_anthropic_system_string() {
+        // 边界: 顶层 system 是空字符串 → (!is_empty).then 为 None → 不注入.
+        let node = fixture_node(1, body_with_anthropic_system(r#""""#));
+        let result = extract_delta_messages_from_raw(&node);
+        // 空 system 不注入, result 只有切出的 user.
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].get("content").and_then(|v| v.as_str()),
+            Some("u2")
+        );
+    }
+
+    #[test]
+    fn delta_skips_non_string_non_array_anthropic_system() {
+        // 边界: 顶层 system 是 number (非 string 非 array) → None → 不注入.
+        let node = fixture_node(1, body_with_anthropic_system("42"));
+        let result = extract_delta_messages_from_raw(&node);
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].get("content").and_then(|v| v.as_str()),
+            Some("u2")
+        );
+    }
+
+    #[test]
+    fn delta_does_not_inject_system_for_non_root_node() {
+        // 非根节点 (parent=Some) 即使有顶层 system + start>0 也不注入.
+        let mut node = fixture_node(1, body_with_anthropic_system(r#""SYS""#));
+        node.parent = Some(Uuid::new_v4()); // 改为非根节点
+        let result = extract_delta_messages_from_raw(&node);
+        // 非根节点不注入 system, result 只有切出的 user.
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].get("content").and_then(|v| v.as_str()),
+            Some("u2")
+        );
     }
 }

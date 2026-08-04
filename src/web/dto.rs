@@ -6,19 +6,19 @@
 //! `POST /api/sync`) 的 JSON 形态. 这些类型是 **域 B (派生链) → 域 C (渲染层)** 的
 //! wire shape: 从 DAG 读取数据后构造, 序列化为前端消费的 JSON.
 //!
-//! # 为什么不在 `dag.rs`
+//! # 为什么不在 `dag` 模块
 //!
 //! 历史上这些 DTO 定义在 [`crate::dag`], 但 [`crate::dag`] 是纯内存的内容寻址存储
-//! (BlockPool + Node + Merkle), 不关心也不应该关心序列化形态. 让 `dag.rs` derive
+//! (BlockPool + Node + Merkle), 不关心也不应该关心序列化形态. 让 `dag` 模块 derive
 //! `Serialize` 把存储层与 wire shape 耦合, 违反单一职责. 故把 DTO 定义下沉到本模块
-//! (web 层), 让 dag.rs 只保留核心数据结构 (BlockPool / Node / Session / ConversationDAG).
+//! (web 层), 让 dag 只保留核心数据结构 (BlockPool / Node / Session / ConversationDAG).
 //!
-//! # 构造方法留 dag.rs (不在本模块)
+//! # 构造方法留 dag 模块 (不在本模块)
 //!
-//! 这些 DTO 的**构造逻辑** (从 DAG 内部字段填充) 仍保留在 `dag.rs` 的方法 / free
+//! 这些 DTO 的**构造逻辑** (从 DAG 内部字段填充) 仍保留在 `dag` 模块的方法 / free
 //! function 中 (`node_view` / `session_view` / `build_timeline_round` 等), 因为它们需
 //! 持 `DagInner` 读锁访问私有字段 (`Node.event` / `Node.response` / `Session` 等).
-//! 移到 web 层会要求暴露 DAG 内部结构, 代价超过收益. dag.rs 依赖 web::dto (本模块)
+//! 移到 web 层会要求暴露 DAG 内部结构, 代价超过收益. dag 依赖 web::dto (本模块)
 //! 的类型定义是可接受的域内依赖 (web::dto 是哑数据载体, 非 web::api 展示层 handler).
 //!
 //! # 与 `record::ForwardRecord` 的分工

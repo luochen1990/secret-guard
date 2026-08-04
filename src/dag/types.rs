@@ -1,0 +1,234 @@
+//! DAG 实体类型: Node / CallEvent / ResponseData / Session / SessionId / PolicySnapshot.
+//!
+//! # 职责边界
+//!
+//! 本模块是纯数据定义 (struct / enum), 不含任何业务逻辑 (无 impl 块, 除 SessionId::new).
+//! 这些类型被 [`super`] (mod.rs mutator + reader) 和 [`super::view`] / [`super::timeline`]
+//! (视图构造) 共同使用.
+//!
+//! # 可见性
+//!
+//! 公开 API 类型 (Node / CallEvent / ResponseData / SessionId / PolicySnapshot) 标 `pub`,
+//! 通过 `crate::dag::*` 路径对外暴露 (mod.rs 用 `pub use types::*` re-export).
+//! Session 是 dag 模块内部类型 (不在外部 API), 标 `pub(super)` 让视图层访问.
+
+use std::sync::Arc;
+
+use chrono::{DateTime, Utc};
+use parking_lot::RwLock;
+use uuid::Uuid;
+
+use crate::codec::Protocol as CodecProtocol;
+use crate::codec::ir::{IrRole, IrStopReason, IrUsage};
+
+use super::pool::MessageRef;
+
+// ─── PolicySnapshot ────────────────────────────────────────────────────────
+
+/// SecretTable 的 effective view 快照 (COW 共享).
+///
+/// push node 时取一个 Arc 引用存 node, 用于日后重建 redactMap.
+/// 用户编辑 secret 时, SecretTable 替换内部 Arc 指向新版本 (COW), 老版本仍被历史 node 引用.
+///
+/// 注意: 这里持有的是 SecretEntry (含真实 value), **永不通过 WebUI API 暴露**.
+/// 它只在后端内部用于 redactMap 重建.
+#[derive(Debug, Default)]
+pub struct PolicySnapshot {
+    /// 命中的 secret 列表 (已 resolve value 的 SecretEntry).
+    pub secrets: Arc<[crate::secrets::SecretEntry]>,
+}
+
+// ─── SessionId + Session ───────────────────────────────────────────────────
+
+/// 会话的稳定标识 (运行时生成, 生命周期同 DAG 内存实例).
+///
+/// 与 leaf_id (游标, 随新请求变化) 和 root_id (fork 时不唯一) 不同,
+/// session_id 在会话整个存活期内不变: push 延续时复用, fork / 新根时生成新 id.
+/// 前端用它做选中 / 展开标识, 刷新后仍能匹配.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    Default,
+)]
+pub struct SessionId(pub Uuid);
+
+impl SessionId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+/// 一个会话的元数据 (sidebar 一级树).
+///
+/// leaf_id 是游标 (最新轮次), 随新请求前移. root_id 是会话根 (parent=None 的那个).
+/// node_count 由 push/evict 增量维护, 避免每次 list 都走 parent 链.
+///
+/// title 是会话标题 (sidebar 主文本): 取自**会话最早 round 的第一条 user msg**
+/// (push 时一次性从根 node 的 preview 提取), 之后不再随 leaf 前移而更新.
+/// 见 issue #36: 旧实现取 leaf.event.preview (最新轮), 多轮对话中标题随用户每轮
+/// 新问题而漂移, 体验差. 现在写入 session map 的 value, 仅在 session 创建时计算一次.
+#[derive(Debug, Clone)]
+pub(crate) struct Session {
+    pub(super) leaf_id: Uuid,
+    pub(super) root_id: Uuid,
+    pub(super) node_count: usize,
+    pub(super) created_at: DateTime<Utc>,
+    pub(super) latest_at: DateTime<Utc>,
+    /// 会话标题 (sidebar 主文本). 仅在 session 创建时从根 node 的 preview 提取,
+    /// 之后不再更新 (即便有新 round 加入). 见上方类型注释.
+    ///
+    /// `Arc<str>`: 直接共享根 node 的 preview, list_sessions 路径只增引用计数.
+    pub(super) title: Option<Arc<str>>,
+}
+
+// ─── Node + CallEvent + ResponseMeta ───────────────────────────────────────
+
+/// DAG 节点 = 一次 API 调用.
+#[derive(Debug)]
+pub struct Node {
+    pub id: Uuid,
+    /// 父节点 (前缀关系). None = 会话根或孤立节点 (无 messages 的请求).
+    pub parent: Option<Uuid>,
+    /// 所属会话的稳定标识 (push 时确定, 生命周期同 DAG 内存实例).
+    /// fork 场景: 新 node 的 parent 不是其 session 的当前 leaf → fork → 新 SessionId.
+    pub session_id: SessionId,
+    /// 引用计数: 有多少 node 把本 node 作为 parent. leaf 的 child_count=0.
+    /// evict 时从 leaf 级联 GC: child_count=0 可删, 删后递减 parent, 若也变 0 则级联.
+    pub child_count: usize,
+    /// 客户端发出的 request 中, 相对 parent 的增量.
+    ///
+    /// 存储的是**真实内容** (含真实 secret, 即 OriginRecord 视角).
+    /// 输出给 LLM / WebUI 时 apply redactMap 转为 SecureRecord (含 mock).
+    ///
+    /// **不含** LLM 返回的 response — response 独立存在 `response` 字段,
+    /// 且存储语义不同 (response 存 LLM 视角的 mock 版本, req_delta 存客户端视角的 real 版本).
+    ///
+    /// 冗余通过 BlockPool 内容寻址自然消化 (相同 block 物理共享).
+    pub req_delta: Arc<[MessageRef]>,
+    /// 本 node 自身 req_delta 的 hash (不含祖先).
+    pub own_hash: u64,
+    /// 从根到本 node 的累积 hash: 逐条 req_delta message 累积.
+    /// 用于新请求到达时 O(N) 比对前缀.
+    pub prefix_hash: u64,
+    pub event: CallEvent,
+    /// LLM 返回的 response (独立存储). 初始 None, 上游响应到达时填入.
+    ///
+    /// 存储的是 **LLM 原始返回** (含 mock secret, 即 SecureRecord 视角).
+    /// 这是"忠实于原始数据"的体现: LLM 返回什么就存什么, 不提前 restore.
+    ///
+    /// restore (mock → real) 是 lazy 的, 只在构造发给客户端的响应时触发,
+    /// **restore 不发生在 DAG 存储路径上** (只在 proxy → client 实时转发路径上做).
+    ///
+    /// WebUI 读取 response 时原样展示 (LLM 视角, 含 mock).
+    /// WebUI 读取 req_delta 时 apply redactMap 转 mock (LLM 视角).
+    /// 两边都是 LLM 视角, 审计语义一致 ("LLM 实际看到了什么").
+    ///
+    /// response 的 message content 也通过 BlockPool intern (享受跨节点 dedup).
+    pub response: RwLock<Option<ResponseData>>,
+}
+
+/// 一次 API 调用的事件元数据.
+///
+/// 响应侧元数据 (`resp_status` / `resp_headers` / `elapsed_ms`) **不在此处** —
+/// 它们只存在于 [`Node::response`] (`ResponseData`) 的 RwLock 内, 让
+/// [`super::ConversationDag::attach_response`] 能在外层 read lock 下通过 node-level 锁
+/// 更新单节点, 不阻塞并发 push / 其他节点的 attach (perf: 两级锁).
+/// `ConversationDag::node_view` / `ConversationDag::session_view` 从
+/// `node.response.read()` 取这些字段.
+#[derive(Debug)]
+pub struct CallEvent {
+    pub created_at: DateTime<Utc>,
+    pub method: String,
+    pub path: String,
+    pub req_headers: Vec<(String, String)>,
+    // 历史曾保留 `req_envelope` (请求侧非 message 字段: model / temperature / tools /
+    // system 等) 用于"未来 WebUI 展示 system/tools", 但从未读取, 2026-07 删除 (YAGNI).
+    // 需要时通过 git log 找回: commit 删除 req_envelope.
+    pub ingress_protocol: Option<CodecProtocol>,
+    /// redact 的随机性来源 (probe 后的最终值).
+    /// - 0 = passthrough (无 secret 命中 / SecretTable 为空).
+    /// - 非 0 = derive(policy, OriginRecord, seed) 可重建 redactMap.
+    pub redact_seed: u64,
+    /// redact 时使用的 policy 快照 (Arc COW 共享).
+    /// redact_seed=0 时此字段可为 default (空 secrets).
+    pub policy: Arc<PolicySnapshot>,
+    /// 请求 body 快照 (LLM 视角, 已 redact, UTF-8 视图).
+    ///
+    /// 这是 WebUI 的 `req_body` 字段权威来源:
+    /// - **codec 路径** (same-proto + redact / cross-proto): redact 后的 IR 经 ingress
+    ///   writer 重序列化为 wire JSON 字符串. 与原始请求字节不同 (redact + 重序列化).
+    /// - **passthrough 路径** (same-proto 无 redact): 客户端原始请求字节 (未 redact,
+    ///   因为无机密命中). Gemini/Ollama 等无 codec 协议也走此路径.
+    ///
+    /// 设计权衡: 虽然 DAG 的 `req_delta` (真实消息) 理论上足以在查询时重建 redact 后
+    /// 的请求体, 但那需要在 Web 查询路径上跑 redact + codec writer, 对偶尔翻页的 WebUI
+    /// 场景性价比低. 直接存快照 (一次写, 多次读) 是更经济的选择.
+    /// `req_delta` 仍用于内容寻址去重 (DAG 核心价值) + 未来 lazy redact 功能.
+    pub req_body_raw: String,
+    /// 本轮的主导角色 = "用户是否主动输入了新内容".
+    /// 语义: round_role == User 表示这一轮有用户的新提问 (sidebar 显示为 round-item 组首);
+    ///       round_role == Tool 表示这一轮是工具调用循环 (sidebar 折叠为 sub-dot).
+    /// push 时一次性预计算, O(0) 查询.
+    ///
+    /// 判定基于 `IrMessage::contains_user_text` (reader 入口预计算, 标记 "真用户文本输入"
+    /// 而非 "工具结果借 user 角色承载"). delta 任一条 contains_user_text → User.
+    /// 不依赖 `IrMessage.role`: codec 归一化把 tool 消息也映射为 IrRole::User.
+    pub round_role: IrRole,
+    /// WebUI sidebar / timeline preview 文本 (push 时从 req_body_raw 提取, 截断 48 chars).
+    ///
+    /// 提取逻辑见 derive::extract_preview_and_model (协议无关字节级):
+    /// 优先取最后一条 user message, 无 user 时 fallback 到最后一条有文本的 message
+    /// (tool_result / assistant). 不按 round_role 分发 (历史决策, 简单但非最优).
+    ///
+    /// `Arc<str>` 让 list/session 路径只增引用计数, 不复制字符串 (3s 轮询场景).
+    pub preview: Option<Arc<str>>,
+    /// 请求 body 顶层 model 字段 (OpenAI / Anthropic 共有). push 时一次性提取.
+    /// `Arc<str>` 同上 (list 路径免 clone).
+    pub model: Option<Arc<str>>,
+    /// 本次请求中实际发生的 redact 结果 (权威投影, 供 WebUI 渲染).
+    /// 每个 tuple = `(mock_value, secret_id)`. **永不**包含真实 secret 值.
+    /// 在 push 时设置 (redactions 是请求侧属性, 不依赖 response).
+    ///
+    /// `Arc<[(String,String)]>` 让 list/session 路径共享切片而非 clone Vec
+    /// (clone 成本随命中 secret 数线性增长).
+    pub redactions: Arc<[(String, String)]>,
+}
+
+/// LLM 返回的 response 数据 (message content + 元数据).
+///
+/// 存储的是 LLM 原始返回 (含 mock, restore 前).
+#[derive(Debug, Clone, Default)]
+pub struct ResponseData {
+    /// response 的 assistant message (LLM 原始返回, 含 mock, **未 restore**).
+    /// 通常是一条 IrMessage (role=assistant), 但错误响应时可能为空.
+    pub message: Option<MessageRef>,
+    pub usage: IrUsage,
+    pub stop_reason: Option<IrStopReason>,
+    pub stop_sequence: Option<String>,
+    pub id: Option<String>,
+    pub created: Option<u64>,
+    pub model: Option<String>,
+    /// 原始上游 response wire bytes (审计/调试).
+    pub raw_resp_body: String,
+    pub streamed: bool,
+    pub resp_complete: bool,
+    pub error: Option<String>,
+    /// parsed view (ingress codec writer 序列化的 IrResponse, LLM 视角含 mock).
+    /// 流式响应由 StreamScan 增量累积; 非流式在响应完成时一次性计算.
+    /// `None` 表示尚未有解析结果 (流刚开始 / codec 不支持此协议 / 解析失败).
+    pub parsed: Option<serde_json::Value>,
+    /// 上游响应状态码 (attach 时填入; 也镜像到 CallEvent 供 NodeView).
+    pub resp_status: u16,
+    /// 上游响应 headers (敏感 header 已脱敏).
+    pub resp_headers: Vec<(String, String)>,
+    /// 端到端耗时 (毫秒).
+    pub elapsed_ms: u64,
+}

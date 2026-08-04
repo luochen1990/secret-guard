@@ -103,7 +103,7 @@ fn classify_delete_outcome(
 //
 // 注: 旧的 `GET /api/records` (扁平分页) + `GET /api/nodes/{id}/timeline` (基于 node_id
 // 的 timeline) 已删除, 由 session-aware sync API 替代 (POST /api/sync + GET
-// /api/sessions/{sid}/timeline). 详见 dag.rs 的 session_rounds / timeline_view /
+// /api/sessions/{sid}/timeline). 详见 dag 模块的 session_rounds / timeline_view /
 // timeline_diff / sync_snapshot.
 //
 // `get_record` 保留: 单条 record 的 raw + parsed view, WebUI 弹窗 (传输层元数据 +
@@ -335,7 +335,7 @@ pub async fn list_sessions(State(state): State<ProxyState>) -> impl IntoResponse
 // - GET /api/sessions/{sid}/timeline?before=&limit=: 初始加载 + lazy load (向前翻更老).
 // - POST /api/sync: sidebar (sessions + expanded rounds) + timeline diff 一次性采集.
 //
-// 详见 dag.rs 的 session_rounds / timeline_view / timeline_diff / sync_snapshot.
+// 详见 dag 模块的 session_rounds / timeline_view / timeline_diff / sync_snapshot.
 
 /// `GET /api/sessions/{sid}/timeline` 查询参数.
 ///

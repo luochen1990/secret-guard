@@ -105,7 +105,7 @@
    (如 "假设 messages 数组中 user 在 assistant 之前"), 以及假设不成立时的降级行为.
 
 已实践位置: `web::api::extract_preview_and_model` (preview 提取),
-`dag::extract_delta_messages_from_raw` (delta 切片).
+`derive::extract_delta_messages_from_raw` (delta 切片).
 (注: 前端 `toolNameOfRound` 已删除, tool name 推断迁移到后端 `extract_preview_and_model`,
 由 `prop_preview_never_panics` 统一守卫, 详见 `docs/design/contracts.md` §8 ROB-1.)
 
@@ -128,7 +128,7 @@
 已实践位置: `redactions` 字段从 RedactionMap 派生 (`proxy/record.rs::assert_redactions_match_map`)、
 `preview`/`model` 从 `req_body_raw` 派生 (`proxy/record.rs::assert_preview_model_match_source`)、
 `resp_parsed` (非流式) 从上游响应字节经 codec reader 派生 (`proxy/record.rs::assert_resp_parsed_matches_source_nonstream`)、
-`session.title` 从 root node preview 派生 (`dag.rs::assert_session_title_matches_root_preview`)、
+`session.title` 从 root node preview 派生 (`dag/mod.rs::assert_session_title_matches_root_preview`)、
 `resp_parsed` (流式) 从 StreamScan 累积 (`proxy/fan_out.rs`, Phase A 已删除原始 SSE 字节, 派生与源物理分离, 暂不守卫).
 后续 Phase B 删除 parent.response 时必须走此流程.
 
@@ -238,8 +238,8 @@ URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标
 | `provider.rs` | Provider 实体 + Effective view + api_key 两来源 | 文件头部 `//!` |
 | `secrets.rs` | SecretEntry 实体 + Effective view + value 两来源 | 文件头部 `//!` |
 | `mock.rs` | MockStrategy 两维度 (初始值 + 生成策略) + 确定性 seed + `[redact] global_mock_prefix` 注入 | 文件头部 `//!` (C3 根基) |
-| `dag.rs` | ConversationDAG 内容寻址存储 (BlockPool + Node + Merkle) | 文件头部 `//!` + `docs/design/conversation-dag.md` |
-| `derive.rs` | 从 request body 派生 preview/model/text 的字节级提取 (域 B 派生链, ROB-1 永不 panic) | 文件头部 `//!` (含 "为什么不在 web::api" 归属论证) |
+| `dag/` (模块目录: mod/pool/types/view/timeline) | ConversationDAG 内容寻址存储 (BlockPool + Node + Merkle) | `src/dag/mod.rs` 头部 `//!` + `docs/design/conversation-dag.md` |
+| `derive.rs` | 从 request body 派生 preview/model/text 的字节级提取 + delta messages 切片 (域 B 派生链, ROB-1 永不 panic) | 文件头部 `//!` (含 "为什么不在 web::api" 归属论证) |
 | `error.rs` | 统一应用错误类型 `AppError` (转发链 + 鉴权层共用, 不反向依赖) | 文件头部 `//!` (含与 `web::api::ApiError` 分工) |
 | `record.rs` | ForwardRecord (web 层 DTO, GET /records/{id} 响应 shape) | 文件头部 `//!` |
 | `redact.rs` | RedactionMap + redact/restore pipeline + 形式化契约 C1-C7 | 文件头部 `//!` |
