@@ -14,6 +14,7 @@
 import { defineConfig } from "@playwright/test";
 import * as path from "path";
 import * as fs from "fs";
+import * as os from "os";
 
 // Playwright 加载 config 时 cwd = config 所在目录 (tests/webui).
 // 不用 import.meta.url (在 CJS 模式下不可用, 在 ESM 模式下又要求 package.json type:module).
@@ -54,9 +55,24 @@ const SG_BIN = resolveSgBin();
 // Playwright 不解析 config 加载期的输出, 无副作用.
 console.error(`[playwright.config] secret-guard binary: ${SG_BIN}`);
 
-// 临时配置文件路径 (绝对路径, webServer 的 cwd 是 testDir).
-const SG_CONFIG = "/tmp/sg-ui-test.toml";
-const SG_STATE = "/tmp/sg-ui-test.state.toml";
+// 每次跑测试用 mkdtempSync 唯一临时目录存放 config/state, 彻底隔离.
+//
+// 历史 bug: 固定 state 路径 (/tmp/sg-ui-test.state.toml) 导致同一 worktree 反复跑测试时
+// state 持久累积, 旧 session 用相同 marker 被测试 `.first()` 误匹配 (I1 守卫期望 1 气泡
+// 却收到 N 个). 改为唯一目录后, 正常流程 (playwright 杀 webServer 子进程 → 下次新进程)
+// 每次都是干净 state. (reuseExistingServer 的权衡见 webServer 段.)
+const TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "sg-webui-"));
+const SG_CONFIG = path.join(TMP_DIR, "sg.toml");
+const SG_STATE = path.join(TMP_DIR, "sg.state.toml");
+
+// 进程退出时清理临时目录 (best-effort: 仅正常退出生效; 异常信号由系统 tmp 清理兜底).
+process.on("exit", () => {
+  try {
+    fs.rmSync(TMP_DIR, { recursive: true, force: true });
+  } catch {
+    // best-effort, 不阻塞退出.
+  }
+});
 
 // 测试前的 setup: 用 Node fs 直接写配置 (避免 shell heredoc 的两层 quoting 歧义).
 // 模块加载时执行一次, webServer 启动时配置文件已就绪.
@@ -94,8 +110,9 @@ export default defineConfig({
     trace: "retain-on-failure",
   },
 
-  // webServer: Playwright 自动启动并等待就绪.
-  // reuseExistingServer: true 允许复用外部已起的 server (本地开发友好).
+  // webServer: Playwright 自动管理生命周期 (启动→等待就绪→测试后清理).
+  // reuseExistingServer:true 容忍 CI runner VM 上残留孤儿进程占用端口 (false 会直接失败);
+  // 正常路径下每次用新 TMP_DIR (见上) 隔离 state, 仅孤儿复用 (罕见) 可能读到旧 state.
   webServer: [
     {
       // 1. 启动 mock upstream (零依赖 Python 脚本, 配置文件已由 fs.writeFileSync 生成).
