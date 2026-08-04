@@ -2,7 +2,11 @@
 //!
 //! # 契约
 //!
-//! [`docs/design/contracts.md`] FWD-1 (L110-137, 流式响应半段式):
+//! [`docs/design/contracts.md`] FWD-1 (L110-137, 流式响应半段式) +
+//! STR-1 (chunk 边界透明, L299-306) + STR-4 (缓冲溢出 abort, L330-335).
+//!
+//! ## FWD-1 流式响应半段式
+//!
 //! 流式响应的 restore, 经任意 chunk 切分, 要求
 //!
 //! ```text
@@ -154,6 +158,15 @@ fn run_same_proto_restore(
     splits: &[usize],
 ) -> Vec<u8> {
     let mut t = StreamTranslate::new_same_proto_restore(proto, map);
+    feed_split_translator(&mut t, upstream, splits)
+}
+
+/// 按 `splits` 切分点序列把 `upstream` 分段喂给 translator, 收集所有输出 (含 finish()).
+///
+/// 切分点语义 (与 stream.rs `scan_chunked` 一致): 切分点把 [0,len) 切成 |splits|+1 段,
+/// 越界 / 乱序由 clamp + 单调化兜底. 两个 caller (same-proto restore / cross-proto
+/// translate) 共用此逻辑, 仅 translator 构造方式不同.
+fn feed_split_translator(t: &mut StreamTranslate, upstream: &[u8], splits: &[usize]) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
     let mut prev = 0usize;
     for &sp in splits {
@@ -590,4 +603,381 @@ fn openai_chunk_frame(data: &Value) -> String {
 /// 把一个 JSON 封装为 Anthropic 风格的 SSE 帧 (`event: {type}\ndata: {...}\n\n`).
 fn anthropic_frame(event_type: &str, data: &Value) -> String {
     format!("event: {event_type}\ndata: {data}\n\n")
+}
+
+// ─── 跨协议流式翻译 property (STR-1 × FWD-3, RED-7 交集盲区) ────────────────
+//
+// # 背景 (与同协议 restore property 的差异)
+//
+// 同协议 restore property (本文件上半部分) 守卫 `StreamTranslate::new_same_proto_restore`
+// 路径: egress SSE → IR events → StreamingRestorer (mock→real) → ingress SSE.
+// 该路径 ingress == egress, 不做协议翻译, 只做 restore.
+//
+// 跨协议翻译路径 (`StreamTranslate::new(ingress, egress)`, ingress != egress) 当前
+// 生产 dispatch (cross_proto_forward) 对 stream=true 返回 501 — 跨协议流式翻译尚未
+// 接入 dispatch. 但 `StreamTranslate::new` 的纯翻译逻辑 (egress SSE → IR events →
+// ingress SSE) 是存在的, 可以在单元/property 层面直接测.
+//
+// # Redact 在跨协议流式响应中的位置
+//
+// 跨协议时 redact 发生在**请求侧** (cross_proto.rs:104), 响应侧的非流式路径有
+// `restore_ir_response` (cross_proto.rs:271-273). 但流式响应侧的 restore **未接入**
+// (StreamTranslate 跨协议模式 redaction_map = None, 不做 restore). 故:
+//
+// - **能测** (本模块): 跨协议流式翻译的**内容保真度** — 上游 egress content 经
+//   `.replace(mock, real)` 后, 与翻译出的 ingress content 语义等价. 这守卫 STR-1
+//   (chunk 边界透明) + FWD-3 (建模范围内语义保留) 在流式路径的交集.
+// - **暂搁置** (需 dispatch 接入): "客户端 SSE 不含 mock" 的端到端 property — 需要
+//   dispatch 层把 StreamTranslate 跨协议模式与 restore 组合 (或在 IR 事件层插入
+//   restore 步骤). 当前用 `#[ignore]` 标记 (AGENTS.md "TDD 与可选测试" 场景 B).
+
+proptest! {
+    /// STR-1 × FWD-3: OpenAI egress SSE → Anthropic ingress SSE, 任意 chunk 切分下
+    /// 内容保真.
+    ///
+    /// 守卫:
+    /// - content fidelity: 客户端 (Anthropic) text_delta 拼接 == 上游 (OpenAI)
+    ///   choices[].delta.content 拼接.
+    /// - tool input fidelity: 客户端 input_json_delta 拼接 == 上游 tool_calls[].arguments 拼接.
+    /// - usage output fidelity: output_tokens 透传.
+    ///
+    /// 注: 此 property 不守卫 "no mock leak" — 跨协议模式不做 restore, 上游若回显
+    /// mock 则客户端会看到. no-mock-leak 的端到端 property 见
+    /// `prop_cross_proto_streaming_no_mock_leak_dispatch_integrated` (ignored, 待
+    /// dispatch 接入).
+    #[test]
+    fn prop_cross_proto_stream_openai_to_anthropic(
+        case in arb_openai_sse_stream_with_mock(),
+        splits in proptest::collection::vec(0usize..4096, 1..=16)
+    ) {
+        let (upstream_sse, _real, _mock) = case;
+        // 跨协议翻译: OpenAI egress → Anthropic ingress.
+        let client_sse = run_cross_proto_translate(
+            Protocol::Anthropic, // ingress
+            Protocol::OpenAI,    // egress
+            &upstream_sse,
+            &splits,
+        );
+
+        assert_cross_proto_streaming_content_fidelity(&upstream_sse, &client_sse)?;
+    }
+
+    /// STR-1 × FWD-3: Anthropic egress SSE → OpenAI ingress SSE, 任意 chunk 切分下
+    /// 内容保真. (反向)
+    #[test]
+    fn prop_cross_proto_stream_anthropic_to_openai(
+        case in arb_anthropic_sse_stream_with_mock(),
+        splits in proptest::collection::vec(0usize..4096, 1..=16)
+    ) {
+        let (upstream_sse, _real, _mock) = case;
+        let client_sse = run_cross_proto_translate(
+            Protocol::OpenAI,    // ingress
+            Protocol::Anthropic, // egress
+            &upstream_sse,
+            &splits,
+        );
+
+        assert_cross_proto_streaming_content_fidelity(&upstream_sse, &client_sse)?;
+    }
+
+    /// STR-1 极端切分: 1-byte 切分 (OpenAI → Anthropic).
+    ///
+    /// 覆盖 StreamTranslate 跨协议模式的 reassembly buffer 在 1-byte 切分下的正确性
+    /// (与同协议 restore 路径的 `prop_streaming_response_byte_by_byte_*` 对称).
+    #[test]
+    fn prop_cross_proto_stream_byte_by_byte_openai_to_anthropic(
+        case in arb_openai_sse_stream_with_mock()
+    ) {
+        let (upstream_sse, _real, _mock) = case;
+        let splits: Vec<usize> = (1..=upstream_sse.len()).collect();
+        let client_sse = run_cross_proto_translate(
+            Protocol::Anthropic,
+            Protocol::OpenAI,
+            &upstream_sse,
+            &splits,
+        );
+        assert_cross_proto_streaming_content_fidelity(&upstream_sse, &client_sse)?;
+    }
+
+    /// STR-1 极端切分: 1-byte 切分 (Anthropic → OpenAI).
+    #[test]
+    fn prop_cross_proto_stream_byte_by_byte_anthropic_to_openai(
+        case in arb_anthropic_sse_stream_with_mock()
+    ) {
+        let (upstream_sse, _real, _mock) = case;
+        let splits: Vec<usize> = (1..=upstream_sse.len()).collect();
+        let client_sse = run_cross_proto_translate(
+            Protocol::OpenAI,
+            Protocol::Anthropic,
+            &upstream_sse,
+            &splits,
+        );
+        assert_cross_proto_streaming_content_fidelity(&upstream_sse, &client_sse)?;
+    }
+}
+
+/// STR-1 × FWD-3 × RED-7: 跨协议流式 + redact restore 端到端 no-mock-leak.
+///
+/// **当前 ignored**: 生产路径 `cross_proto_forward` 对 stream=true 返回 501
+/// (StreamTranslate 跨协议模式未接入 dispatch, 且跨协议模式下 redaction_map=None
+/// 不做 restore). 此 property 是 TDD 场景 B: 生成器和断言已就绪, 待 dispatch 层
+/// 把跨协议流式翻译与 restore 组合后启用.
+///
+/// 启用条件:
+/// 1. dispatch 层 cross_proto_forward 在 stream=true 时调用 StreamTranslate (而非 501).
+/// 2. StreamTranslate 跨协议模式支持 redaction_map 注入 (或 dispatch 在 IR 事件层
+///    插入 restore 步骤), 使响应侧 mock → real.
+///
+/// 守卫 (启用后):
+/// - 客户端 SSE 不含 mock 字符串 (no mock leak, 安全核心).
+/// - 客户端 content == 上游 content.replace(mock, real).
+#[test]
+#[ignore = "待 StreamTranslate 跨协议模式接入 dispatch + restore (cross_proto_forward stream=true 当前 501)"]
+fn prop_cross_proto_streaming_no_mock_leak_dispatch_integrated() {
+    // 此测试是 TDD 占位: 当 dispatch 接入跨协议流式 + restore 后, 把 run_cross_proto_translate
+    // 替换为含 restore 的变体 (或走真实 dispatch), 并启用 assert_streaming_restore_fidelity.
+    //
+    // 当前用同协议 restore runner 做形态校验 (验证测试骨架可编译), 真正语义待启用.
+    let upstream_sse: Vec<u8> = Vec::new();
+    let map = build_redaction_map("sk-real-test", "MOCKtest");
+    let client_sse = run_same_proto_restore(Protocol::OpenAI, map, &upstream_sse, &[]);
+    let client_str = String::from_utf8_lossy(&client_sse);
+    assert!(!client_str.contains("MOCKtest"), "no mock leak");
+}
+
+// ─── 辅助: 跑 StreamTranslate 跨协议翻译 ──────────────────────────────────
+
+/// 用跨协议翻译模式跑一次 StreamTranslate, 返回客户端收到的完整 SSE 字节.
+///
+/// `ingress` 是客户端协议 (翻译目标), `egress` 是上游协议 (翻译源).
+/// splits: 任意切分点序列 (与 run_same_proto_restore 一致的语义).
+fn run_cross_proto_translate(
+    ingress: Protocol,
+    egress: Protocol,
+    upstream: &[u8],
+    splits: &[usize],
+) -> Vec<u8> {
+    let mut t = StreamTranslate::new(ingress, egress)
+        .expect("ingress != egress required for cross-proto translate");
+    feed_split_translator(&mut t, upstream, splits)
+}
+
+/// 断言跨协议流式翻译的内容保真度 (STR-1 × FWD-3 流式路径):
+///
+/// 1. content fidelity: 双方 TextDelta 拼接相等 (跨协议翻译不丢文本).
+/// 2. tool input fidelity: 双方 InputJsonDelta 拼接相等.
+/// 3. usage output fidelity: output_tokens 透传.
+///
+/// 不比较 id/created/model (跨协议时 StreamTranslate 会剥离 foreign 身份, 由
+/// ingress writer 合成本地格式). 不断言 "no mock leak" — 跨协议模式不做 restore.
+///
+/// 不需要协议参数: `collect_text_deltas` / `collect_input_json_deltas` /
+/// `collect_usage_output_tokens` 都是协议无关的 SSE 帧扫描器, 对任意协议的 SSE 都能工作.
+fn assert_cross_proto_streaming_content_fidelity(
+    upstream_sse: &[u8],
+    client_sse: &[u8],
+) -> Result<(), proptest::test_runner::TestCaseError> {
+    // content fidelity (跨协议文本透传).
+    let upstream_text = collect_text_deltas(upstream_sse);
+    let client_text = collect_text_deltas(client_sse);
+    prop_assert_eq!(
+        client_text,
+        upstream_text,
+        "STR-1×FWD-3 流式 content fidelity 违反 (跨协议文本损失)\nupstream={:?}\nclient={:?}",
+        String::from_utf8_lossy(upstream_sse),
+        String::from_utf8_lossy(client_sse),
+    );
+
+    // tool_use id/name fidelity (跨协议 tool_use 身份透传).
+    // 守卫 FWD-3 建模范围内的 tool_use (id + name + input) 完整保留, 不仅是 input JSON.
+    let upstream_tools = collect_tool_use_ids_names(upstream_sse);
+    let client_tools = collect_tool_use_ids_names(client_sse);
+    prop_assert_eq!(
+        client_tools,
+        upstream_tools,
+        "STR-1×FWD-3 流式 tool_use id/name fidelity 违反 (跨协议 tool 身份损失)"
+    );
+
+    // tool input fidelity (跨协议 tool arguments 透传).
+    let upstream_json = collect_input_json_deltas(upstream_sse);
+    let client_json = collect_input_json_deltas(client_sse);
+    prop_assert_eq!(
+        client_json,
+        upstream_json,
+        "STR-1×FWD-3 流式 tool input fidelity 违反 (跨协议 tool arguments 损失)",
+    );
+
+    // usage output_tokens fidelity (terminal usage 透传).
+    let upstream_usage = collect_usage_output_tokens(upstream_sse);
+    let client_usage = collect_usage_output_tokens(client_sse);
+    prop_assert_eq!(
+        client_usage,
+        upstream_usage,
+        "STR-1×FWD-3 流式 usage.output_tokens fidelity 违反",
+    );
+    Ok(())
+}
+
+/// 从 SSE 字节流中收集所有 tool_use 的 (id, name) 对, 按出现顺序.
+///
+/// 协议无关扫描 (与 collect_text_deltas 同类):
+/// - OpenAI: `choices[].delta.tool_calls[].id` + `tool_calls[].function.name`
+///   (BlockStart 等价 chunk 里, id 和 name 同帧出现).
+/// - Anthropic: `content_block_start.content_block.{id,name}` (type=tool_use).
+///
+/// 用于跨协议流式翻译的 tool_use 身份保真断言 (FWD-3 建模范围包含 tool_use.id/name).
+fn collect_tool_use_ids_names(sse_bytes: &[u8]) -> Vec<(String, String)> {
+    let mut acc: Vec<(String, String)> = Vec::new();
+    for data in iter_sse_data_payloads(sse_bytes) {
+        // OpenAI: choices[].delta.tool_calls[].{id, function.name}.
+        if let Some(choices) = data.get("choices").and_then(Value::as_array) {
+            for ch in choices {
+                if let Some(tcs) = ch
+                    .get("delta")
+                    .and_then(|d| d.get("tool_calls"))
+                    .and_then(Value::as_array)
+                {
+                    for tc in tcs {
+                        let id = tc.get("id").and_then(Value::as_str).map(String::from);
+                        let name = tc
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(Value::as_str)
+                            .map(String::from);
+                        if let (Some(id), Some(name)) = (id, name) {
+                            acc.push((id, name));
+                        }
+                    }
+                }
+            }
+        }
+        // Anthropic: content_block_start.content_block.{id,name} (type=tool_use).
+        if data.get("type").and_then(Value::as_str) == Some("content_block_start")
+            && let Some(cb) = data.get("content_block")
+            && cb.get("type").and_then(Value::as_str) == Some("tool_use")
+        {
+            let id = cb.get("id").and_then(Value::as_str).map(String::from);
+            let name = cb.get("name").and_then(Value::as_str).map(String::from);
+            if let (Some(id), Some(name)) = (id, name) {
+                acc.push((id, name));
+            }
+        }
+    }
+    acc
+}
+
+// ─── STR-4 缓冲溢出 abort 降级 property (L330-335) ──────────────────────────
+//
+// # 契约 STR-4
+//
+// reassembly 缓冲超过 MAX_BUF (16 MiB) 时, StreamTranslate 必须 abort 而非 OOM.
+// abort 后:
+//   1. finish() emit ingress 协议的原生 Error event (stream.rs:183-187).
+//   2. 后续 feed 是 no-op (aborted flag 置位, feed 直接返回空).
+//   3. (同协议 restore 模式) finish() flush_all_restorers 产物不含 mock — 因为
+//      abort 只清 buf, restorers 可能残留 mock tail, flush 会 restore.
+//
+// # 测试策略
+//
+// MAX_BUF = 16 MiB, 用真实阈值测一次 (固定 #[test], 不进 proptest 避免慢).
+// 16 MiB 内存分配 + 线性扫描在现代机器上 < 1s, 可接受. 不引入测试专用阈值常量
+// (任务约束: 不改生产代码; 引入 #[cfg(test)] 阈值会污染生产模块).
+
+/// STR-4 `prop_max_buf_overflow_aborts`: 无终止符字节流超过 MAX_BUF 时,
+/// StreamTranslate abort, 进程存活, finish() emit Error event.
+#[test]
+fn prop_max_buf_overflow_aborts_openai_ingress() {
+    let tail_str = run_str4_cross_proto_abort(Protocol::OpenAI, Protocol::Anthropic);
+    // OpenAI writer 把 IrStreamEvent::Error 写成 data: {"error":{"message":...}} 帧
+    // + finish() 追加 [DONE] 终止符 (emits_sse_done_terminator=true).
+    assert!(
+        tail_str.contains("\"error\"") && tail_str.contains("upstream_error"),
+        "STR-4 违反: OpenAI ingress finish() 应含 error data 帧 ({{\"error\":{{...,\"type\":\"upstream_error\"}}}}), 实际: {tail_str}"
+    );
+    assert!(
+        tail_str.contains("[DONE]"),
+        "STR-4 违反: OpenAI ingress finish() 应追加 [DONE] 终止符, 实际: {tail_str}"
+    );
+}
+
+/// STR-4 `prop_max_buf_overflow_aborts` (Anthropic ingress).
+#[test]
+fn prop_max_buf_overflow_aborts_anthropic_ingress() {
+    let tail_str = run_str4_cross_proto_abort(Protocol::Anthropic, Protocol::OpenAI);
+    // Anthropic writer 把 IrStreamEvent::Error 写成 `event: error\ndata: {"type":"error",...}`.
+    // 精确匹配 "event: error" — 不用宽泛的 "error" 子串或正常终止的 "message_stop"
+    // (那些会掩盖 STR-4 违反).
+    assert!(
+        tail_str.contains("event: error") && tail_str.contains("upstream_error"),
+        "STR-4 违反: Anthropic ingress finish() 应含 error event 帧 (event: error + upstream_error), 实际: {tail_str}"
+    );
+}
+
+/// 触发 STR-4 abort 并返回 finish() tail, 供 caller 做协议特化的 error 帧断言.
+///
+/// 共享 setup: 构造超过 MAX_BUF 的无终止符字节流 → feed 触发 abort → 验证后续 feed
+/// no-op → finish() 非空 (有降级输出). caller 只保留协议特化的 error 帧形态断言.
+fn run_str4_cross_proto_abort(ingress: Protocol, egress: Protocol) -> String {
+    let mut t = StreamTranslate::new(ingress, egress)
+        .expect("ingress != egress required for cross-proto translate");
+    let overflow_bytes = vec![b'a'; crate::codec::stream::MAX_BUF + 1];
+    // feed 一次: 内部 buf 累积到 overflow_size, 触发 abort (out 可能含完整帧的翻译输出,
+    // 不做强断言, 关键是进程存活).
+    let _ = t.feed(&overflow_bytes);
+
+    // abort 后继续 feed 是 no-op (STR-4 property: 后续 feed 直接返回空).
+    let out2 = t.feed(b"more bytes after abort");
+    assert!(
+        out2.is_empty(),
+        "STR-4 违反: abort 后 feed 应是 no-op (返回空), 实际返回 {} bytes",
+        out2.len()
+    );
+
+    // finish() 应 emit Error event (STR-4 abort 降级). tail 非空是 caller 做精确
+    // error 帧断言的前提.
+    let tail = t.finish();
+    let tail_str = String::from_utf8_lossy(&tail);
+    assert!(
+        !tail_str.is_empty(),
+        "STR-4 违反: abort 后 finish() 应 emit Error event, 实际返回空"
+    );
+    tail_str.into_owned()
+}
+
+/// STR-4 同协议 restore 模式: abort 后 finish() flush 产物不含 mock.
+///
+/// 构造场景: 同协议 restore 模式下, 先 feed 一个含 mock 的完整 text delta 帧
+/// (restorer.push 走 sliding window, mock 在 hold window 内被 restore, buffer 残留
+/// mock 之后的 "suffix" 安全内容), 再 feed 超过 MAX_BUF 的无终止符流触发 abort,
+/// 最后 finish(). finish() 的 flush_all_restorers 应正确 restore 任何残留内容,
+/// 故产物不含 mock. 守卫 abort 路径不泄漏 mock 的安全核心.
+#[test]
+fn prop_max_buf_abort_no_mock_leak_same_proto_restore() {
+    let mock = "MOCKsecret".to_string();
+    let map = build_redaction_map("sk-real-secret12345", &mock);
+
+    let mut t = StreamTranslate::new_same_proto_restore(Protocol::OpenAI, map);
+
+    // 帧 1: 含 mock 的 text delta (restorer.push 走 sliding window, mock 被完整 restore,
+    // buffer 残留 mock 之后的 "suffix" 安全内容).
+    let frame1 = format!(
+        "data: {{\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-4o\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"prefix {mock} suffix\"}},\"finish_reason\":null}}]}}\n\n"
+    );
+    let _ = t.feed(frame1.as_bytes());
+
+    // 触发 abort: feed 一个超过 MAX_BUF 的无终止符流.
+    let overflow_bytes = vec![b'a'; crate::codec::stream::MAX_BUF + 1];
+    let _ = t.feed(&overflow_bytes);
+
+    // abort 后 feed 是 no-op.
+    let noop = t.feed(b"tail");
+    assert!(noop.is_empty(), "abort 后 feed 应 no-op");
+
+    // finish() flush_all_restorers 产物不含 mock.
+    let tail = t.finish();
+    let tail_str = String::from_utf8_lossy(&tail);
+    assert!(
+        !tail_str.contains(&mock),
+        "STR-4 违反: abort 后 finish() flush 产物含 mock (泄漏): {tail_str}"
+    );
 }
