@@ -1399,6 +1399,67 @@ mod tests {
         emitted
     }
 
+    // ─── C5 wide secret generator (PR-D) ────────────────────────────────────
+    //
+    // 背景: prop_c5_redact_mock_no_real_substring_end_to_end 历史用
+    // `"[A-Za-z0-9]{4,32}"` 单一 ASCII 字符集. AGENTS.md "Property 设计原则"
+    // 明确要求 "proptest 生成器覆盖度也作为契约要求" (历史 bug 多次出现 property 存在
+    // 但生成器太窄致漏测). 这里把 secret 与 filler 维度同时扩宽, 守卫 redact_ir 在
+    // 多字节 / 含 ASCII 转义字符 / 长 secret 等真实场景下的 C5 行为.
+
+    /// C5 property 用的宽字符 secret 生成器.
+    ///
+    /// 4 个分支权重均衡, 每个分支确保: (a) charset 基数足够高避免 trivially 成立,
+    /// (b) 含 mock generator 会在 charset 内取样的字符 (Charset::infer_from 把 real
+    /// 中出现的字符收集到 mock pool 的 other[], 从而有概率偶发命中 real 子串).
+    ///
+    /// 覆盖维度:
+    ///   1. ASCII alphanumeric (baseline, 含历史 regression "AaaaaAaA" 低基数边界).
+    ///   2. ASCII 转义字符 (`"` / `\` / `\n` / `\t`): 拓宽 mock pool 字符集到含
+    ///      控制字符, 守卫 byte-level substring scan 与 c5_threshold_len 在
+    ///      非 alphanumeric 字符下的正确性.
+    ///   3. CJK / emoji / 混合 unicode: 多字节 UTF-8, 考验 char-level windows 的
+    ///      C5 检查 (byte-level 会跨 char boundary 漏检).
+    ///   4. 长 secret (60-200 chars): 模拟长 API key / cookie. 长 secret 下
+    ///      k(L)=⌈L/3⌉ 变大 (L=200 → k=67), 高基数 charset 下 C5 子串匹配概率
+    ///      仍极低 ((1/62)^67 ≈ 10^-120, retry chain 永远 retry=0 成功), 但 k(L)
+    ///      阈值本身随 L 上升是独立的覆盖维度 (短 secret k=4 与长 secret k=67 的
+    ///      windows 数与子串分布形态完全不同).
+    ///
+    /// 边界约束:
+    ///   - 长 secret 上限 200 chars: 已覆盖 k(L)=67 阈值场景 (k(L) at L=500 仅升至
+    ///     167, 不增加 C5 行为覆盖维度, 徒增 proptest case 预算). reviewer 数学验证:
+    ///     62^67 ≈ 10^-120, L=200 时 retry chain 实际永远 retry=0, 无 noise 风险.
+    ///   - 不生成与 global_mock_prefix 直接重叠的 secret: 生产路径必经
+    ///     `validate_against_real` 拦截, 该路径由 mock.rs 单元测试覆盖, 不在端到端
+    ///     redact_ir property 范围内. unicode 混合已能覆盖 mock-charset 内含 real
+    ///     字符的相似性场景.
+    fn arb_secret_for_c5() -> BoxedStrategy<String> {
+        prop_oneof![
+            // 1. ASCII alphanumeric baseline (与历史生成器兼容, 但扩宽长度上界到 64).
+            "[A-Za-z0-9]{4,64}",
+            // 2. ASCII 转义字符 + alphanumeric: `"` / `\` / `\n` / `\t`.
+            //    拓宽 mock pool (Charset::infer_from 把这些纳入 other[]),
+            //    长度 4-32, 避免过长 secret 拖慢 proptest.
+            "[A-Za-z0-9\"\\\\\\n\\t]{4,32}",
+            // 3. CJK + emoji + ASCII 混合: 多字节 UTF-8 考验 char-level C5 检查.
+            //    CJK 区 [\x{4e00}-\x{9fff}] + emoji [\x{1f300}-\x{1f6ff}] + ASCII.
+            "[A-Za-z0-9\\x{4e00}-\\x{9fff}\\x{1f300}-\\x{1f6ff}]{4,32}",
+            // 4. 长 secret: 高基数 ASCII alphanumeric, 长度 60-200.
+            //    触发 k(L) = ⌈L/3⌉ 大阈值场景 (L=200 → k=67).
+            "[A-Za-z0-9]{60,200}",
+        ]
+        .boxed()
+    }
+
+    /// C5 property 用的宽字符 filler 生成器.
+    ///
+    /// 与 secret 维度相近的字符集 (ASCII + CJK), 让 filler 可能在 IR 中引入额外
+    /// 相似子串, 考验 ir_request_contains 的 byte-level scan 在多字节上下文中的正确性.
+    fn arb_filler_for_c5() -> BoxedStrategy<String> {
+        prop_oneof!["[a-z0-9 ]{0,40}", "[A-Za-z0-9 \\x{4e00}-\\x{9fff}]{0,40}",].boxed()
+    }
+
     proptest! {
         /// 守卫 RED-4: 不同 secret → 不同 mock (单射性, contracts.md §2).
         #[test]
@@ -1656,11 +1717,15 @@ mod tests {
         /// 但生产路径在 mock 已出现在 IR 时会 probing 到 counter>0 候选, 该路径下的 C5
         /// 行为未被覆盖. 本测试走完整 redact_ir, 覆盖 probing 路径.
         ///
+        /// 生成器覆盖度 (PR-D 扩宽, 详见 `arb_secret_for_c5` / `arb_filler_for_c5` 头注释):
+        /// secret 维度覆盖 ASCII alphanumeric / JSON 元字符 / CJK+emoji 混合 / 长 secret,
+        /// 不再仅是历史 `"[A-Za-z0-9]{4,32}"` 的窄覆盖.
+        ///
         /// C5 契约细节 (阈值公式 / 重试链 / 历史边界) 见 `mock.rs` 模块头部 "C5" 段落 (SSOT).
         #[test]
         fn prop_c5_redact_mock_no_real_substring_end_to_end(
-            secret in "[A-Za-z0-9]{4,32}",
-            filler in "[a-z0-9 ]{0,40}",
+            secret in arb_secret_for_c5(),
+            filler in arb_filler_for_c5(),
         ) {
             let body = format!("{filler} {secret} {filler}");
             let mut ir = sample_ir_with_text(&body);
