@@ -189,6 +189,7 @@ jobs:
       # 如果清理后空间仍不足 (卷被其他大文件占满), 兜底全清 cargo-target (放弃增量复用,
       # 下次 CI 冷启动 ~15min 编译, 但保证能跑通).
       - name: Reclaim cache volume (profraw/profdata accumulation)
+        id: reclaim
         continue-on-error: true
         run: |
           set +e
@@ -214,16 +215,19 @@ jobs:
       # 必须显式启用才能让断言执行. 单独成步, 复用 checkout; 在 coverage 步骤的 cargo clean 前,
       # 不影响磁盘峰值控制 (target/debug 与 coverage 的 target/llvm-cov-target 互不复用).
       - name: consistency-check feature guard
+        id: consistency
         run: just check-features
 
       # just check --coverage: fmt + clippy + machete + 测试 (插桩编译, 产出 profdata 供 coverage-gate 消费).
       # 测试集只跑这一次 (而非 check 跑一次 + coverage-gate 再跑一次).
       - name: Check + coverage data
+        id: coverage
         run: just check --coverage
 
       # 覆盖率门禁: 双阈值 (line% 下限 + 未覆盖行数上限), 阈值 SSOT 在 justfile.
       # 只做 report (读上一步的 profdata), 不重跑测试.
       - name: Coverage gate
+        id: coverage_gate
         run: just coverage-gate
 
       # Performance benchmark (criterion baseline 回归检测, 非阻塞).
@@ -313,6 +317,7 @@ jobs:
       # 双阈值: 超 FILE_WARN_PROD_LINES (500) 报 warning 不阻断; 超 FILE_MAX_PROD_LINES
       # (1600) 则 exit 1 阻断. 不依赖编译产物, 放最后作为补充守卫.
       - name: File size gate
+        id: filesize
         run: just check-file-size
 
       # WebUI 回归测试 (Playwright 端到端).
@@ -433,6 +438,7 @@ jobs:
       #
       # 工具: cargo-deny. devShell 已含 (flake.nix); VM 通过 host-sw-bin fallback 提供.
       - name: cargo-deny (license + bans + advisory)
+        id: deny
         run: just deny
 
       # typos-cli: 拼写检查 (issue #86 子项 #6).
@@ -441,7 +447,48 @@ jobs:
       # 阻塞门禁: 白名单 (_typos.toml) 已覆盖已知误报 (pn / hel / abd), 本地全绿 (用户决策:
       # 当前能通过的测试直接加门禁). 新误报出现时更新 _typos.toml 即可 (属正常维护).
       - name: typos (spell check)
+        id: typos
         run: just typos
+
+      # 诊断 step: job 失败时把所有阻塞 step 的 outcome 汇总贴到 PR 评论,
+      # 帮助无 admin 权限的 contributor 定位失败 step (无日志访问权限时的 fallback).
+      # 仅 PR 事件 + job 失败时触发. continue-on-error 兜底 (评论失败不影响 job 状态).
+      - name: Diagnose failure (post step outcomes to PR)
+        if: always() && failure() && github.event_name == 'pull_request'
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -eu
+          {
+            echo "## 🔍 CI 诊断报告 (step outcomes)"
+            echo ""
+            echo "| Step | id | Outcome |"
+            echo "|------|----|---------|"
+            echo "| Reclaim cache | reclaim | ${{ steps.reclaim.outcome }} |"
+            echo "| consistency-check | consistency | ${{ steps.consistency.outcome }} |"
+            echo "| Check+coverage | coverage | ${{ steps.coverage.outcome }} |"
+            echo "| Coverage gate | coverage_gate | ${{ steps.coverage_gate.outcome }} |"
+            echo "| File size | filesize | ${{ steps.filesize.outcome }} |"
+            echo "| cargo-deny | deny | ${{ steps.deny.outcome }} |"
+            echo "| typos | typos | ${{ steps.typos.outcome }} |"
+            echo ""
+            echo "(非阻塞 step 如 bench/playwright/audit 有 continue-on-error, 不列.)"
+            echo ""
+            echo "**Job status**: ${{ job.status }}"
+            echo "**Run**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > /tmp/diag.md
+          MARKER='<!-- ci-diagnose -->'
+          BODY="$(cat /tmp/diag.md)"
+          FULL_BODY="$MARKER"$'\n'"$BODY"
+          API="https://git.lambda.lc/api/v1/repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments"
+          PAYLOAD=$(jq -n --arg b "$FULL_BODY" '{body: $b}')
+          curl -fsSL -X POST \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "$API" >/dev/null && echo "Diag comment posted" || echo "POST diag comment failed (non-fatal)"
 
       # 历史: 早期曾用 "Bench compile check (release, --no-run)" 方案, 因 release 全量编译慢而移除;
       # 后改为 "dev profile --no-run" (上方已进一步升级为完整 bench 运行). 此处保留备选记录.
