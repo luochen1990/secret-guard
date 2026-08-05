@@ -125,6 +125,8 @@ pub(crate) async fn fan_out_streaming(
             super::TRUNCATED_BANNER.to_string()
         } else if streamed && (200..300).contains(&status_u16) {
             // 2xx 流式成功响应: 不保留原始 SSE 字节 (骨架开销大, parsed view 已覆盖语义内容).
+            // 注: recorder.acc 仍累积了原始字节 (最大 32 MiB) 但此处丢弃. 见
+            // RecordAccumulator 文档 "内存开销" 段 (followup: 分片存储优化).
             String::new()
         } else {
             // 非流式响应保留原始 body (raw view 可用, 且 body 通常不大).

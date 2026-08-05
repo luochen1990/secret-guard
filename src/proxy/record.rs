@@ -345,6 +345,17 @@ pub(super) fn build_call_event(
 /// 现统一在此. 调用方负责 chunk 的"额外处理"(透传给客户端 channel / StreamTranslate /
 /// ParsedSync), 本结构只管 record 累积 + cap 保护.
 ///
+/// # 内存开销 (followup: 改 Vec<Bytes> 分片)
+///
+/// `acc` 用连续 `Vec<u8>` 而非 `Vec<Bytes>` 分片, 因为 `fan_out_buffered_ir` 路径
+/// 必须连续字节做 `serde_json::from_slice` 解析. 副作用: `fan_out_streaming` 的
+/// streamed=true && 2xx 路径里, `acc` 只写不读 (body 用 `String::new()`, parsed 来自
+/// ParsedSync), 理论上最大 `MAX_RESP_BODY_RECORD` (32 MiB) 是纯浪费. 不改的原因:
+/// streamed=true && 非 2xx 路径需读 acc (utf8_view 错误回显); overflow 标志控制
+/// ParsedSync 停止 (改结构需联动); consistency-check 守卫 + 多处测试直接访问 acc.len
+/// (fan_out.rs ~12 处 + record.rs test ~3 处). blast radius 较大 (~15-20 处), 当前留作
+/// followup. 32MiB 在大响应场景才触发, 非热路径.
+///
 /// # 不变式
 ///
 /// - overflow 一旦置位, 后续 push 静默丢弃 (record 已截断, 不再增长).
