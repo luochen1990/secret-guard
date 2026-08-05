@@ -26,8 +26,8 @@
 | `IrRequest` / `IrResponse` / `IrBlock` / `IrStreamEvent` | `ir.rs` | 协议无关的中间表示 (chat completion 范围) |
 | `Reader` trait | `mod.rs` | wire JSON/Bytes → IR (`read_request` / `read_response` / `read_response_events`) |
 | `Writer` trait | `mod.rs` | IR → wire (`write_request` / `write_response` / `write_response_event` / `requires_max_tokens` / `emits_sse_done_terminator` / `write_error`) |
-| `StreamTranslate` | `stream.rs` | egress SSE → IR 事件流 → ingress SSE (chunk-boundary 处理 + 跨协议翻译 + 同协议 restore 两种模式) |
-| `StreamScan` | `stream.rs` | 流式 SSE → IrResponse 累积器 (供 WebUI parsed view) |
+| `StreamTranslate` | `stream/translate.rs` | egress SSE → IR 事件流 → ingress SSE (chunk-boundary 处理 + 跨协议翻译 + 同协议 restore 两种模式) |
+| `StreamScan` | `stream/scan.rs` | 流式 SSE → IrResponse 累积器 (供 WebUI parsed view) |
 | `Protocol` enum | `mod.rs` | codec 当前支持的协议子集 (OpenAI/Anthropic/Responses); `from_native` 是 Gemini/Ollama → None 的单一接入点 |
 
 ## 子模块
@@ -42,7 +42,12 @@
   流式 state 机实现细节见文件头部 `//!` 与各 helper doc).
 - `anthropic.rs` — Anthropic Messages 的 Reader/Writer (流式 1:1 映射).
 - `responses.rs` — OpenAI Responses API 的 Reader/Writer (非流式; 流式 SSE 事件翻译未实现).
-- `stream.rs` — SSE chunk-boundary 处理 (TCP 切片兼容, CRLF/LF 双兼容, MAX_BUF 溢出 abort). 核心 de-frame 逻辑抽出共享骨架 `SseReassembler`, 由 `StreamTranslate` / `StreamScan` 各持一个实例, 避免 reassembly 循环重复 + 行为漂移.
+- `stream/` (目录, 4 子模块) — SSE chunk-boundary 处理 (TCP 切片兼容, CRLF/LF 双兼容, MAX_BUF 溢出 abort). 子模块:
+  - `mod.rs` — 共享 SSE utils (`find_frame_terminator` / `parse_sse_frame` / `reframe_sse`) + 常量 + 集中测试.
+  - `reassembler.rs` — `SseReassembler` (StreamTranslate / StreamScan 共享的帧重组骨架, 私有).
+  - `translate.rs` — `StreamTranslate` (egress SSE → ingress SSE, 跨协议翻译 + 同协议 restore).
+  - `scan.rs` — `StreamScan` (egress SSE → IrResponse 累积器, 供 WebUI parsed view).
+  核心 de-frame 逻辑抽出共享骨架 `SseReassembler`, 由 `StreamTranslate` / `StreamScan` 各持一个实例, 避免 reassembly 循环重复 + 行为漂移.
 
 ## wire fidelity (wire 形态元数据)
 

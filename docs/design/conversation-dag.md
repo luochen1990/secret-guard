@@ -254,7 +254,7 @@ struct ConversationDag {
 | secrets.rs | SecretEntry 删除 mock_strategy.sticky 相关字段 + resolve 逻辑 |
 | config schema | toml 中 mock_strategy 不再支持 sticky 字段 (向后不兼容, 需 migration 提示) 📌 |
 | proxy.rs | push_from_ir / attach_response 取代 push/update 📌 实际命名为 `push_messages` |
-| codec/stream.rs | StreamScan snapshot → attach 到 node |
+| codec/stream (现 `stream/scan.rs`) | StreamScan snapshot → attach 到 node |
 | web/api.rs | list 派生 RecordSummary (walk DAG); get_record 按需重建 |
 | web/index.html | secret 编辑表单删除 sticky 选项 |
 | config.rs | **不动** (records 纯内存, 不持久化) |

@@ -64,7 +64,7 @@
 |---|---|---|---|
 | `FWD-*` | 转发忠实性 (域 A) | codec INV-1/2/5 → FWD-1/2/5; proxy DoD → FWD-4/6 | `src/proxy/mod.rs` 头部 + `src/codec/AGENTS.md` |
 | `RED-*` | Redact/Restore (域 A) | C1→RED-1, C2→RED-2, C3→RED-3, C4→RED-4, C5→RED-5, C6→RED-6, C7→RED-7 | `src/redact.rs` + `src/mock.rs` 头部 |
-| `STR-*` | 流式 SSE (域 A) | codec INV-4 → STR-5 | `src/codec/stream.rs` + `src/codec/AGENTS.md` |
+| `STR-*` | 流式 SSE (域 A) | codec INV-4 → STR-5 | `src/codec/stream/` (目录, 拆分见 `src/codec/AGENTS.md`) |
 | `CDAG-*` | Conversation DAG (域 B) | INV-1→CDAG-1, INV-2→CDAG-2, INV-3→CDAG-3, INV-4→CDAG-4, INV-5→CDAG-5 | `src/dag/mod.rs` 头部 + `docs/design/conversation-dag.md` |
 | `DTO-*` | WebUI DTO 派生 (域 B) | (新增) | `src/web/AGENTS.md` + `src/record.rs` 头部 |
 | `CFG-*` | 双层配置 (域 B) | (新增) | `src/config.rs` 头部 |
@@ -131,7 +131,7 @@
 
 > **理想 vs 现状**: `prop_streaming_response_half_byte_exact` 的字面形式 (byte-exact) 在
 > `StreamTranslate::new_same_proto_restore` 路径下**不成立** — 该路径显式放弃 byte-exact 走
-> IR re-serialize (见 `src/codec/stream.rs` 头部注释 "失去 byte-exact, 但语义等价"). 已知结构
+> IR re-serialize (见 `src/codec/stream/translate.rs` 头部注释 "失去 byte-exact, 但语义等价"). 已知结构
 > 差异 (除 mock→real 替换外): ① id/created 重新生成 (writer 合成); ② chunk 重组 (StreamingRestorer
 > sliding window 在 mock 边界拆/并 chunk); ③ usage input_tokens backfill (terminal delta 填回
 > MessageStart 锁定值); ④ 元数据字段去重 (OpenAI writer 仅 MessageStart chunk 输出 id/created/model).

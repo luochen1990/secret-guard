@@ -19,7 +19,7 @@
 //!
 //! `StreamTranslate::new_same_proto_restore` 的实现 (生产路径
 //! [`crate::proxy::fan_out_streaming_with_restore`]) **显式放弃 byte-exact**, 见
-//! `stream.rs` 头部注释:
+//! `stream/translate.rs` 头部注释:
 //!
 //! > 工作流: egress SSE → parse IR events → StreamingRestorer (跨 chunk restore)
 //! > → 序列化回 SSE. **失去 byte-exact (因为 IR re-serialize), 但语义等价**.
@@ -116,7 +116,7 @@ proptest! {
     /// FWD-1 极端切分: 1-byte 切分 (退化情形, 每个 feed 只推进 1 字节).
     ///
     /// 覆盖 StreamingRestorer 的 sliding window 在每个 chunk 只有 1 字节时的正确性.
-    /// 与 stream.rs 里的 `stream_scan_byte_by_byte_split_equivalence` 同类, 但
+    /// 与 stream/mod.rs 里的 `stream_scan_byte_by_byte_split_equivalence` 同类, 但
     /// 那个测 StreamScan, 这里测 StreamTranslate restore 路径.
     #[test]
     fn prop_streaming_response_byte_by_byte_openai(
@@ -149,7 +149,7 @@ proptest! {
 
 /// 用 same_proto_restore 模式跑一次 StreamTranslate, 返回客户端收到的完整 SSE 字节.
 ///
-/// splits: 任意切分点序列 (与 stream.rs `scan_chunked` 一致: 切分点把 [0,len) 切成
+/// splits: 任意切分点序列 (与 stream/mod.rs `scan_chunked` 一致: 切分点把 [0,len) 切成
 /// |splits|+1 段, 越界 / 乱序由 clamp + 单调化兜底).
 fn run_same_proto_restore(
     proto: Protocol,
@@ -163,7 +163,7 @@ fn run_same_proto_restore(
 
 /// 按 `splits` 切分点序列把 `upstream` 分段喂给 translator, 收集所有输出 (含 finish()).
 ///
-/// 切分点语义 (与 stream.rs `scan_chunked` 一致): 切分点把 [0,len) 切成 |splits|+1 段,
+/// 切分点语义 (与 stream/mod.rs `scan_chunked` 一致): 切分点把 [0,len) 切成 |splits|+1 段,
 /// 越界 / 乱序由 clamp + 单调化兜底. 两个 caller (same-proto restore / cross-proto
 /// translate) 共用此逻辑, 仅 translator 构造方式不同.
 fn feed_split_translator(t: &mut StreamTranslate, upstream: &[u8], splits: &[usize]) -> Vec<u8> {
@@ -872,7 +872,7 @@ fn collect_tool_use_ids_names(sse_bytes: &[u8]) -> Vec<(String, String)> {
 //
 // reassembly 缓冲超过 MAX_BUF (16 MiB) 时, StreamTranslate 必须 abort 而非 OOM.
 // abort 后:
-//   1. finish() emit ingress 协议的原生 Error event (stream.rs:183-187).
+//   1. finish() emit ingress 协议的原生 Error event (见 stream/translate.rs 的 finish 实现).
 //   2. 后续 feed 是 no-op (aborted flag 置位, feed 直接返回空).
 //   3. (同协议 restore 模式) finish() flush_all_restorers 产物不含 mock — 因为
 //      abort 只清 buf, restorers 可能残留 mock tail, flush 会 restore.
