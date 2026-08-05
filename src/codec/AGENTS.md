@@ -83,6 +83,11 @@ normalize(v) == normalize(Writer(Reader(v)))
 搁置项对应的 proptest 生成器分支已用 `// NOTE` 标注, 实现后恢复即可.
 response 路径的 2 个 property 标了 `#[ignore]`, 实现 L8 后启用.
 
+> **IR 字段建模路线图**: `extra` 字段的职责边界 (first-class vs extra 的机械化判定准则)、
+> 字段全景分类 (类别 A 应提升 / B 归 extra / 已 first-class)、以及 5 批实施路线图
+> 见 **`docs/design/ir-fields-roadmap.md`**. 任何修改 `IrRequest`/`IrResponse` 字段、
+> 或考虑"某字段该不该进 extra"的改动, 必须先查路线图的判定准则.
+
 ## 关键不变式
 
 1. **同协议 + 无 Redact 不进入 codec** (字节透传), 零回归. 见 `proxy/mod.rs::dispatch`.

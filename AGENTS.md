@@ -244,7 +244,7 @@ URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标
 | `record.rs` | ForwardRecord (web 层 DTO, GET /records/{id} 响应 shape) | 文件头部 `//!` |
 | `redact.rs` | RedactionMap + redact/restore pipeline + 形式化契约 C1-C7 | 文件头部 `//!` |
 | `util.rs` | 集中的哈希工具 (`hash64` SipHash 单值入口) | 文件头部 `//!` |
-| `codec/` | 跨协议 IR + Reader/Writer trait + StreamTranslate (OpenAI / Anthropic / Responses) | **`src/codec/AGENTS.md`** |
+| `codec/` | 跨协议 IR + Reader/Writer trait + StreamTranslate (OpenAI / Anthropic / Responses) | **`src/codec/AGENTS.md`** + `docs/design/ir-fields-roadmap.md` (IR 字段建模路线图: extra 边界 + 字段提升判定准则 + 实施批次) |
 | `proxy/` | dispatch 路径选择 + fan_out 三路径 + Provider 鉴权 (拆分为 mod/helpers/auth/record/same_proto/cross_proto/fan_out 子模块) | `src/proxy/mod.rs` 头部 `//!` |
 | `web/` | JSON API (`api.rs`) + 响应 DTO (`dto.rs`: SessionView/NodeView/.../SyncSnapshot) + 单页 WebUI | **`src/web/AGENTS.md`** |
 | `server.rs` | router 装配 + 双层状态注入 + graceful shutdown | 文件头部 `//!` |

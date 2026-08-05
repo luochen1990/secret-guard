@@ -8,9 +8,10 @@
 
 ## 0. 文档定位与读者
 
-- **读者**: codec 模块维护者 (实施字段提升)、架构决策者 (排定优先级)、PR reviewer (核对字段变更是否符合本路线图).
-- **不是读者**: 终端用户 (用户文档在 README); WebUI 开发者 (本文件不涉及展示层).
-- **与其它文档的关系**: 本文件是 `src/codec/AGENTS.md` "wire fidelity" 段的**前置依赖** — AGENTS.md 讲当前 IR 的契约, 本文件讲 IR 的演进路线.
+- **读者 scope**: 任何修改 `IrRequest` / `IrResponse` / `IrBlock` 字段的人、考虑"某字段该进 first-class 还是 extra"的人、排定 codec 工作优先级的人。
+- **不是读者**: 终端用户 (用户文档在 README); WebUI 开发者 (本文件不涉及展示层); 只读 codec 现有契约的人 (去 `src/codec/AGENTS.md`)。
+- **与其它文档的关系**: 本文件是 `src/codec/AGENTS.md` "wire fidelity" 段的**前置依赖** — AGENTS.md 讲当前 IR 的契约, 本文件讲 IR 的演进路线与字段归属判定。
+- **可发现性 hook**: 根 `AGENTS.md` 模块概览表的 `codec/` 行 + `src/codec/AGENTS.md` "当前覆盖与搁置"段。改 codec IR 时, 这两处会把你导向本文件。
 
 ## 1. 问题陈述
 
