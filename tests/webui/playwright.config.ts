@@ -55,12 +55,24 @@ const SG_BIN = resolveSgBin();
 // Playwright 不解析 config 加载期的输出, 无副作用.
 console.error(`[playwright.config] secret-guard binary: ${SG_BIN}`);
 
+// 孤儿进程清理不在本文件做 (Playwright 多次 require config + globalSetup 在 webServer
+// 之后执行, 时机都不对). 改由 justfile _kill-orphans recipe 在 `playwright test` 之前
+// 清理 — 详见 justfile check-webui recipe.
+
 // 每次跑测试用 mkdtempSync 唯一临时目录存放 config/state, 彻底隔离.
 //
-// 历史 bug: 固定 state 路径 (/tmp/sg-ui-test.state.toml) 导致同一 worktree 反复跑测试时
-// state 持久累积, 旧 session 用相同 marker 被测试 `.first()` 误匹配 (I1 守卫期望 1 气泡
-// 却收到 N 个). 改为唯一目录后, 正常流程 (playwright 杀 webServer 子进程 → 下次新进程)
-// 每次都是干净 state. (reuseExistingServer 的权衡见 webServer 段.)
+// 历史 bug (commit 68a5468): 固定 state 路径 (/tmp/sg-ui-test.state.toml) 导致同一
+// worktree 反复跑测试时 state 持久累积, 旧 session 用相同 marker 被测试 `.first()`
+// 误匹配 (I1 守卫期望 1 气泡却收到 N 个). 改为唯一目录后, 正常流程 (playwright 杀
+// webServer 子进程 → 下次新进程) 每次都是干净 state.
+//
+// 三道防线 (缺一不可):
+//   1. mkdtempSync 唯一 state 路径 (本段) — state 文件隔离
+//   2. justfile _kill-orphans recipe 在 playwright test 之前清孤儿 (见 justfile) — 端口可用
+//   3. reuseExistingServer:false (见 webServer 段) — 强制自起新进程, 不复用孤儿
+// 早期方案缺第二、第三道, 用 reuseExistingServer:true 容忍孤儿但被孤儿持有的旧 state 污染.
+// 注: 直接 `cd tests/webui && playwright test` 跳过 justfile 时第二道失效, 端口被占会 fail,
+// 这是设计取舍 (justfile 是项目 SSOT 调用入口).
 const TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "sg-webui-"));
 const SG_CONFIG = path.join(TMP_DIR, "sg.toml");
 const SG_STATE = path.join(TMP_DIR, "sg.state.toml");
@@ -111,15 +123,14 @@ export default defineConfig({
   },
 
   // webServer: Playwright 自动管理生命周期 (启动→等待就绪→测试后清理).
-  // reuseExistingServer:true 容忍 CI runner VM 上残留孤儿进程占用端口 (false 会直接失败);
-  // 正常路径下每次用新 TMP_DIR (见上) 隔离 state, 仅孤儿复用 (罕见) 可能读到旧 state.
+  // reuseExistingServer:false 强制自起新进程 — 三道防线之 #3, 详见上方 mkdtempSync 段.
   webServer: [
     {
       // 1. 启动 mock upstream (零依赖 Python 脚本, 配置文件已由 fs.writeFileSync 生成).
       command: `python3 ${path.join(ROOT, "tests", "webui", "mock_upstream.py")}`,
       port: MOCK_PORT,
       timeout: 10_000,
-      reuseExistingServer: true,
+      reuseExistingServer: false,
       env: { MOCK_PORT: String(MOCK_PORT) },
     },
     {
@@ -127,7 +138,7 @@ export default defineConfig({
       command: `${SG_BIN} run --config ${SG_CONFIG} --state ${SG_STATE} --port ${SG_PORT}`,
       url: `${SG_URL}__sg/api/providers`,
       timeout: 15_000,
-      reuseExistingServer: true,
+      reuseExistingServer: false,
     },
   ],
 });

@@ -103,17 +103,55 @@ check-webui-syntax:
     node --check "$script"
     echo "webui-syntax: OK ($lines lines)"
 
-# WebUI 回归测试 (Playwright 端到端).
-# 需要 devShell (nix develop) 提供 playwright-test 包; shellHook 自动 symlink node_modules.
-check-webui:
+# WebUI 回归测试 (Playwright 端到端). 需 devShell (nix develop).
+#
+# 三道防线 (缺一不可) 详见 tests/webui/playwright.config.ts 头部注释;
+# 本 recipe 实现防线 #2: 在 playwright test 之前清掉端口 18790/19999 上的孤儿.
+#
+# 为什么用 lsof + kill 而非 pkill -f 'secret-guard run --port ...':
+# pkill -f 会匹配 justfile 自己 / 父 shell / nix develop 进程 (它们的命令行也含该字串),
+# 自杀卡死. lsof 按 listening socket 反查 PID, 不误伤. (CI runner microvm 不主动 kill
+# job 子进程, 上次 run 异常退出留下的孤儿会持续 listening, 触发 EADDRINUSE.)
+check-webui: _kill-orphans
     cd tests/webui && playwright test
+
+# 清理占用 18790/19999 端口的孤儿进程 (Playwright webServer 残留).
+# 私有 recipe (`_` 前缀约定: 不出现在 `just --list`), 供 check-webui / check-all 复用.
+#
+# 失败语义: recipe body 自身 fail-safe (lsof 缺失 → exit 0; kill 失败 → || true),
+# 故清不到孤儿不阻塞, 让 playwright 自己 fail 时报 EADDRINUSE, 比这里硬失败更可诊断.
+#
+# 非并发安全: 两个并发 `just check-webui` 会互相 kill 对方 webServer. 实际开发中 WebUI
+# 测试很少并发跑, 不加 flock 锁 (over-engineering), 仅在此声明边界.
+#
+# shebang recipe: 多行脚本由 bash 直接执行, $ 按 bash 语义解释.
+# (注意: just 普通 recipe 的 $$ 不是转义 — 它会字面进入 sh 被解释为 PID, 是常见陷阱.
+# 用 shebang 形式彻底避开这个坑.)
+_kill-orphans:
+    #!/usr/bin/env bash
+    if ! command -v lsof >/dev/null 2>&1; then
+        echo "check-webui: lsof not in PATH, skip orphan cleanup" >&2
+        exit 0
+    fi
+    for port in 18790 19999; do
+        for pid in $(lsof -iTCP:$port -sTCP:LISTEN -t 2>/dev/null); do
+            # 排除 PID=1 (init/systemd, 误杀会重启容器/VM, 致命).
+            if [ "$pid" = "1" ]; then
+                continue
+            fi
+            echo "killing PID $pid on port $port"
+            kill "$pid" 2>/dev/null || true
+        done
+    done
+    # 等 SIGTERM 后端口释放 (孤儿无活跃连接故 0.2s 足够, 非 graceful shutdown 完整等待).
+    sleep 0.2
 
 # check + check-webui (完整验证, devShell 内).
 # 行为差异提醒: 本地 check-all 让 Playwright 阻塞 (失败即 exit 1), 但 CI 的 WebUI step
 # 用 continue-on-error (非阻塞, 见 .forgejo/workflows/ci.yml WebUI regression step 注释).
 # 即 "本地全绿 → push" 不代表 CI 必绿 — CI flake 不会阻断合并, 维护者需人工关注 CI log.
 # 这是有意设计 (WebUI 在 CI 环境 flake 率高), 详见 ci.yml 注释与 AGENTS.md "CI" 段.
-check-all: check
+check-all: check _kill-orphans
     cd tests/webui && playwright test
 
 # 仅 fmt.

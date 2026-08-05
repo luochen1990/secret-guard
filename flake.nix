@@ -87,6 +87,10 @@
           # 让 TS 源码的 `import "@playwright/test"` 能解析 (ESM resolver 不读 NODE_PATH).
           nodejs
           playwright-test
+          # WebUI 孤儿进程清理 (just check-webui 的 lsof+kill 依赖).
+          # CI runner VM 也通过 host-sw-bin fallback 提供 lsof (见 forgejo-runner-vm.mod.nix),
+          # 本地 devShell 显式声明避免对宿主 fallback 的隐式依赖.
+          lsof
           # PR diff 拆解: review 时区分 prod 代码 vs test 代码膨胀 (just diff-loc).
           rust-diff-analyzer
         ];
