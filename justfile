@@ -140,11 +140,15 @@ test-ignored *ARGS:
 # CI 里 ci.yml 用 job 级 env 写死绝对路径注入 (runner VM 不进 devShell).
 # 产物默认写到 target/llvm-cov-target/ + coverage/ (已 .gitignore).
 #
-# 门禁基线 (SSOT): 覆盖率百分比下限 + 未覆盖行数上限. 提升 coverage 后手动 bump.
+# 门禁基线 (SSOT): 双阈值互补.
+#   - COVERAGE_MIN_LINES (主防线, 百分比): 天然随代码增长自适应, 是防回归的核心.
+#   - COVERAGE_MAX_UNCOVERED (辅助, 绝对行数): 防一次性大量未覆盖代码涌入 (如新模块
+#     不写测试). 绝对值会随代码增长失效, 故阈值为当前实测 + ~7% 缓冲, 需每季度走查
+#     (走查触发: `just coverage` 后人工核对 summary 的 uncovered 行数).
 # 当前实测约 ~86% / ~1350 uncovered (auth 模块的 OIDC/handler/middleware 路径
-# 需 mock IdP 集成测试, 留作后续). 阈值留缓冲.
+# 需 mock IdP 集成测试, 留作后续).
 COVERAGE_MIN_LINES := "84"
-COVERAGE_MAX_UNCOVERED := "1500"
+COVERAGE_MAX_UNCOVERED := "1450"
 
 # 覆盖率摘要 (终端表格).
 coverage:
@@ -153,8 +157,7 @@ coverage:
 
 # 覆盖率门禁 (CI 用): 双阈值, 任一不满足则非零退出.
 # 前置: check --coverage 已产出 profdata 到 target/llvm-cov-target/. 本 recipe 只做 report.
-#   --fail-under-lines:     总行覆盖率下限 (防整体下降)
-# --fail-uncovered-lines: 未覆盖行数上限 (防未覆盖绝对值增长)
+# 阈值语义见上方 COVERAGE_MIN_LINES / COVERAGE_MAX_UNCOVERED 注释.
 coverage-gate:
     cargo llvm-cov report --summary-only \
       --fail-under-lines {{ COVERAGE_MIN_LINES }} \
