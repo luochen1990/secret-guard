@@ -1734,6 +1734,121 @@ async fn web_api_records_view_parsed_openai_returns_structured() {
     );
 }
 
+// ─── gzip 压缩响应解压 (FWD-1 透明中继: 上游 content-encoding: gzip) ──────────
+//
+// FWD-1 在"压缩编码"维度的回归守卫: 上游返回 gzip 压缩响应时, secret-guard
+// 必须先解压再进入 record + codec parse 路径 (reqwest 的 gzip feature 负责).
+
+/// 用 flate2 把字节 gzip 压缩 (模拟上游 LLM provider 的压缩响应).
+fn gzip_bytes(raw: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(raw).unwrap();
+    encoder.finish().unwrap()
+}
+
+#[tokio::test]
+async fn gzip_compressed_upstream_response_is_decompressed_for_record() {
+    let raw_json = r#"{"id":"chatcmpl-gz","choices":[{"message":{"role":"assistant","content":"compressed hello"}}]}"#;
+    let gz_body = gzip_bytes(raw_json.as_bytes());
+
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_header("content-encoding", "gzip")
+        .with_body(gz_body)
+        .create_async()
+        .await;
+
+    // 用生产环境的 client 构造路径 (build_upstream_client), 与 server::serve 一致.
+    // reqwest 启用 gzip feature 后, 默认 builder 即自动解压, 无需 .gzip(true).
+    let upstream_client = server::build_upstream_client().unwrap();
+    let records = ConversationDag::new(64, 500, 1);
+    let records_handle = records.clone();
+    let provider = openai_provider("oa-main", &upstream.url());
+    let proxy_url = spawn_proxy_full(
+        vec![provider],
+        upstream_client,
+        records,
+        test_secret_table(),
+    )
+    .await;
+
+    let (status, client_body, client_headers) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#,
+        &[],
+    )
+    .await;
+
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert!(
+        client_body.contains("chatcmpl-gz"),
+        "client should see decompressed body, got: {client_body}"
+    );
+    assert!(
+        client_headers.get("content-encoding").is_none(),
+        "content-encoding header must be stripped after decompression"
+    );
+
+    let list = wait_until_or_timeout(
+        &records_handle,
+        |l| l.first().map(|r| r.resp_complete).unwrap_or(false),
+        Duration::from_secs(2),
+    )
+    .await;
+    let id = list[0].id;
+
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{proxy_url}/__sg/api/records/{id}?view=parsed"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // record.resp_body 应是可读 JSON.
+    let resp_body = body["record"]["resp_body"].as_str().unwrap_or("");
+    assert!(
+        resp_body.contains("chatcmpl-gz"),
+        "record.resp_body should be decompressed JSON, got: {resp_body}"
+    );
+
+    // record.resp_headers 也不应含 content-encoding (reqwest 已剥除).
+    let resp_headers = body["record"]["resp_headers"]
+        .as_array()
+        .expect("resp_headers should be an array");
+    let has_content_encoding = resp_headers.iter().any(|h| {
+        h.get(0)
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.eq_ignore_ascii_case("content-encoding"))
+    });
+    assert!(
+        !has_content_encoding,
+        "record.resp_headers should not contain content-encoding after decompression"
+    );
+
+    assert!(
+        body["parse_error"].is_null(),
+        "unexpected parse_error: {}",
+        body["parse_error"]
+    );
+    let parsed_resp = &body["parsed_response"];
+    assert!(
+        !parsed_resp.is_null(),
+        "parsed_response must not be null (gzip decompression enabled codec parse)"
+    );
+    assert!(
+        parsed_resp.get("choices").is_some(),
+        "parsed_response should have choices"
+    );
+}
+
 #[tokio::test]
 async fn web_api_records_view_parsed_gemini_returns_error() {
     // Gemini 不在 codec 支持范围, view=parsed 应当返回 parse_error.

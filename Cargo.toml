@@ -17,7 +17,9 @@ consistency-check = []
 
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+# gzip/brotli/deflate: 启用 reqwest 的自动解压 (上游 LLM provider 普遍支持压缩响应,
+# 不启用会导致 secret-guard 拿到压缩字节 → record.resp_body 乱码 + parsed view 失败).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "gzip", "brotli", "deflate"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 tower-http = { version = "0.7", features = ["trace"] }
@@ -57,6 +59,8 @@ criterion = { version = "0.5", features = ["html_reports"] }
 rsa = "0.9"
 sha2 = "0.10"
 base64 = "0.22"
+# 集成测试构造 gzip 压缩上游响应 (验证 secret-guard 的 reqwest client 正确解压).
+flate2 = "1"
 
 # redact 性能基线 bench. 详尽设计见 benches/redact.rs 头部.
 [[bench]]

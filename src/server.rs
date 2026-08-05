@@ -219,6 +219,10 @@ fn build_router_with_auth_layers(
 }
 
 /// 构造 reqwest 客户端 (与上游连接复用).
+///
+/// gzip/brotli/deflate 自动解压由 Cargo.toml 的 reqwest features 控制 —
+/// 启用 feature 后 reqwest 自动解压并剥除 content-encoding header,
+/// 无需在 builder 上调 `.gzip(true)` (调了反而是冗余).
 pub fn build_upstream_client() -> anyhow::Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(concat!("secret-guard/", env!("CARGO_PKG_VERSION")))
