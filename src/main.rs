@@ -40,6 +40,7 @@ async fn main() -> Result<()> {
     let host = args.host.unwrap_or_else(|| static_cfg.server.host.clone());
     let port = args.port.unwrap_or(static_cfg.server.port);
     let records_capacity = static_cfg.server.records_capacity;
+    let upstream_timeouts = secret_guard::config::UpstreamTimeouts::from(&static_cfg.server);
 
     tracing::info!(
         listen = format!("{host}:{port}"),
@@ -67,6 +68,7 @@ async fn main() -> Result<()> {
         static_cfg.auth,
         global_mock_prefix,
         on_probe_exhausted,
+        upstream_timeouts,
     )
     .await
 }

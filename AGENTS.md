@@ -266,6 +266,20 @@ CRUD 操作语义、DynamicTable 持久化策略、跨表并发安全的详尽�
 Secret / Provider 的两种 value 来源 (`value`/`value_file`、`api_key`/`api_key_file`)
 及其 fail-fast vs 热路径差异, 见 `src/secrets.rs` 与 `src/provider.rs` 头部.
 
+### `[server]` 段字段 (static, 启动时读取一次)
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `host` | string | `"127.0.0.1"` | 监听地址. SEC-6: 默认回环, 防意外暴露到 LAN/WAN. |
+| `port` | u16 | `8787` | 监听端口. |
+| `records_capacity` | usize | `1024` | 内存中保留的转发记录条数上限 (FIFO 淘汰). |
+| `upstream_connect_timeout_secs` | u64 | `15` | 上游 TCP+TLS 握手超时 (秒). `0` = 无限 (向后兼容, 不建议). 覆盖 reqwest `connect_timeout`. |
+| `upstream_response_header_timeout_secs` | u64 | `60` | 上游响应头到达超时 (秒). `0` = 无限. 超时记 504 record (防 `send().await` 永久阻塞). |
+| `upstream_stream_idle_timeout_secs` | u64 | `120` | 流式 chunk 空闲超时 (秒). `0` = 无限. 防上游发完响应头后 body 卡住. |
+
+> 注: `[server]` / `[redact]` 段仅在启动时读取一次, WebUI 修改不生效 (restart 才生效).
+> 这是为了保持转发核心路径的零运行时配置开销.
+
 ### `[redact]` 段字段 (static, 启动时读取一次)
 
 | 字段 | 类型 | 默认 | 说明 |
@@ -279,9 +293,6 @@ Secret / Provider 的两种 value 来源 (`value`/`value_file`、`api_key`/`api_
 global_mock_prefix = "sgm_"
 on_probe_exhausted = "fail_closed"
 ```
-
-> 注: `[redact]` 段与 `[server]` 段一样仅在启动时读取一次, WebUI 修改不生效
-> (restart 才生效). 这是为了保持 redact 核心路径的零运行时配置开销.
 
 ## 开发流程
 
@@ -503,7 +514,7 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
   混合 Text+ToolResult user 消息拆成 (1+N) 条 wire messages, 导致 `req_body_raw` 的
   messages 数 > IR messages 数. `extract_delta_messages_from_raw` 切片时跨协议路径的 start 偏小,
   delta 可能包含前序轮消息. 同协议路径不受影响. 详见 `src/web/AGENTS.md`.
-- static config 的 `[server]` / `[redact]` 段仅在启动时读取一次, WebUI 改 host/port/global_mock_prefix 不会生效.
+- static config 的 `[server]` (含 `upstream_*_timeout_secs`) / `[redact]` 段仅在启动时读取一次, WebUI 改不生效 (restart 才生效).
 - **redact_headers 名单硬编码 (SEC-4)**: `proxy/helpers.rs::redact_headers` 的敏感 header
   脱敏名单是硬编码黑名单 (显式枚举主流 provider auth header + 含 "token" / "secret"
   子串匹配, 完整名单以 `is_sensitive_header` 为 SSOT). 未在名单内的 header 会原样

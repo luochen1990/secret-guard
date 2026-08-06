@@ -75,6 +75,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
@@ -161,6 +162,50 @@ pub struct ServerConfig {
     pub port: u16,
     /// 内存中保留的转发记录条数上限 (FIFO 淘汰).
     pub records_capacity: usize,
+    /// 上游 TCP+TLS 握手超时 (秒). 0 = 无限 (向后兼容, 不建议).
+    ///
+    /// 覆盖 `reqwest::ClientBuilder::connect_timeout`. DNS + TCP + TLS 握手
+    /// 正常 < 3s, 异常 (上游不可达 / 网络黑洞) 时这个超时让 secret-guard 快速失败
+    /// 而非永久 hang. 0 等价于 reqwest 默认行为 (无 connect 超时, 仅依赖 OS TCP 超时).
+    pub upstream_connect_timeout_secs: u64,
+    /// 上游响应头到达超时 (秒). 0 = 无限 (向后兼容, 不建议).
+    ///
+    /// 覆盖 secret-guard → 上游的 `reqwest::send().await` 等待. reqwest 的 send 完成语义
+    /// 是"收到响应头", response body 由后续 `bytes_stream()` 读. 这个超时只约束
+    /// "响应头到达", 不影响流式 body 的总时长 (流式可能持续几分钟, 是正常的).
+    ///
+    /// 历史 bug: 上游网络异常时 send().await 永久阻塞 → record 永远 pending.
+    pub upstream_response_header_timeout_secs: u64,
+    /// 上游流式响应 chunk 空闲超时 (秒). 0 = 无限 (向后兼容).
+    ///
+    /// 流式响应两个 chunk 之间的最大间隔. LLM 正常流式 chunk 间隔 < 1s;
+    /// reasoning model "思考"阶段会有较长静默但通常有心跳 chunk. 超过此间隔
+    /// 视为上游 hang, 标记 record 为 incomplete + 返回客户端错误.
+    pub upstream_stream_idle_timeout_secs: u64,
+}
+
+/// 从 ServerConfig 派生的、已解析为 `Duration` (或 None) 的超时集合.
+///
+/// 便于在 ProxyState / fan_out 等处直接消费 (避免每处都做 secs→Duration→Option 转换).
+/// 0 secs → `None` (等价于"无限", 向后兼容旧配置).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UpstreamTimeouts {
+    pub connect: Option<Duration>,
+    pub response_header: Option<Duration>,
+    pub stream_idle: Option<Duration>,
+}
+
+impl From<&ServerConfig> for UpstreamTimeouts {
+    fn from(cfg: &ServerConfig) -> Self {
+        fn secs(s: u64) -> Option<Duration> {
+            (s > 0).then(|| Duration::from_secs(s))
+        }
+        Self {
+            connect: secs(cfg.upstream_connect_timeout_secs),
+            response_header: secs(cfg.upstream_response_header_timeout_secs),
+            stream_idle: secs(cfg.upstream_stream_idle_timeout_secs),
+        }
+    }
 }
 
 impl Default for ServerConfig {
@@ -169,6 +214,13 @@ impl Default for ServerConfig {
             host: "127.0.0.1".to_string(),
             port: 8787,
             records_capacity: 1024,
+            // 15s: DNS+TCP+TLS 握手正常 < 3s, 15s 是宽松兜底.
+            upstream_connect_timeout_secs: 15,
+            // 60s: 无论流式/非流式, LLM provider 应在 60s 内开始返回响应头.
+            // reasoning model 的"长思考"发生在 body 流, 不影响响应头到达.
+            upstream_response_header_timeout_secs: 60,
+            // 120s: 流式 chunk 空闲. 正常 < 1s, reasoning 静默可能较长, 120s 宽松.
+            upstream_stream_idle_timeout_secs: 120,
         }
     }
 }

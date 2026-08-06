@@ -127,6 +127,7 @@ async fn spawn_proxy_static_dynamic(
         auth_enabled: false,
         global_mock_prefix: std::sync::Arc::from(""),
         on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,
+        upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
     };
     let app = server::build_router(proxy);
     tokio::spawn(async move {
@@ -163,6 +164,7 @@ async fn spawn_proxy_with_prefix(global_mock_prefix: &str) -> String {
         auth_enabled: false,
         global_mock_prefix: std::sync::Arc::from(global_mock_prefix),
         on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,
+        upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
     };
     let app = server::build_router(proxy);
     tokio::spawn(async move {
@@ -203,6 +205,7 @@ async fn spawn_proxy_with_probe_mode(
         auth_enabled: false,
         global_mock_prefix: std::sync::Arc::from(""),
         on_probe_exhausted: mode,
+        upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
     };
     let app = server::build_router(proxy);
     tokio::spawn(async move {
@@ -1764,7 +1767,7 @@ async fn gzip_compressed_upstream_response_is_decompressed_for_record() {
 
     // 用生产环境的 client 构造路径 (build_upstream_client), 与 server::serve 一致.
     // reqwest 启用 gzip feature 后, 默认 builder 即自动解压, 无需 .gzip(true).
-    let upstream_client = server::build_upstream_client().unwrap();
+    let upstream_client = server::build_upstream_client(None).unwrap();
     let records = ConversationDag::new(64, 500, 1);
     let records_handle = records.clone();
     let provider = openai_provider("oa-main", &upstream.url());
@@ -1847,6 +1850,120 @@ async fn gzip_compressed_upstream_response_is_decompressed_for_record() {
         parsed_resp.get("choices").is_some(),
         "parsed_response should have choices"
     );
+}
+
+// ─── 上游响应头超时 (防永久 pending 的回归守卫) ─────────────────────────────
+//
+// 验证 `[server] upstream_response_header_timeout_secs` 生效: 上游响应头 hang 时,
+// secret-guard 在配置的超时后返回 504 + record 标记 error (而非永久 pending).
+
+#[tokio::test]
+async fn upstream_response_header_timeout_marks_record_504() {
+    // 起一个自定义上游 axum server, handler sleep 5s 后才返回响应头.
+    // secret-guard 配置 response_header_timeout = 1s → 应在 1s 后超时.
+    use axum::{Router, routing::post};
+    async fn slow_handler() -> axum::response::Json<serde_json::Value> {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        axum::response::Json(serde_json::json!({"choices":[]}))
+    }
+    let upstream_app = Router::new().route("/v1/chat/completions", post(slow_handler));
+    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    let upstream_url = format!("http://{upstream_addr}");
+    tokio::spawn(async move {
+        let _ = axum::serve(upstream_listener, upstream_app).await;
+    });
+
+    // 构造 ProxyState, response_header_timeout = 1s (远小于上游的 5s sleep).
+    let upstream_timeouts = secret_guard::config::UpstreamTimeouts {
+        connect: None,
+        response_header: Some(std::time::Duration::from_secs(1)),
+        stream_idle: None,
+    };
+
+    // 用显式传 UpstreamTimeouts 的 helper (默认 ProxyState 无超时保护).
+    let (proxy_url, records_handle) =
+        spawn_proxy_with_timeouts(&upstream_url, upstream_timeouts).await;
+
+    // 客户端发请求, 应在 ~1s 内收到 504 (而非永久 hang).
+    let start = std::time::Instant::now();
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/o/oa-main/v1/chat/completions"))
+        .body(r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!(resp.status(), reqwest::StatusCode::GATEWAY_TIMEOUT);
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "should fail fast (~1s timeout), not hang 5s; got {:?}",
+        elapsed
+    );
+
+    // record 应被标记为 504 + error (而非永久 pending).
+    // 注: resp_complete=false 是正确的 (上游响应确实未完成),
+    // 关键是 resp_status=504 + error 有 timeout 说明 (而非默认 0 + None).
+    let list = wait_until_or_timeout(
+        &records_handle,
+        |l| l.first().is_some_and(|r| r.resp_status == 504),
+        Duration::from_secs(2),
+    )
+    .await;
+    let r = &list[0];
+    assert_eq!(r.resp_status, 504, "record should be marked 504");
+    assert!(
+        r.error
+            .as_deref()
+            .is_some_and(|e| e.contains("not received") || e.contains("timeout")),
+        "record.error should mention timeout/not-received, got: {:?}",
+        r.error
+    );
+    assert!(
+        r.elapsed_ms >= 900 && r.elapsed_ms < 2000,
+        "elapsed should be ~1s (the timeout), got {}ms",
+        r.elapsed_ms
+    );
+}
+
+/// 启动 secret-guard, 显式指定 UpstreamTimeouts (超时回归测试专用).
+async fn spawn_proxy_with_timeouts(
+    upstream_url: &str,
+    upstream_timeouts: secret_guard::config::UpstreamTimeouts,
+) -> (String, ConversationDag) {
+    let provider = openai_provider("oa-main", upstream_url);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state_path = tmp_state_path("sg-state-timeout");
+    let decisions = std::sync::Arc::new(parking_lot::RwLock::new(
+        secret_guard::config::Decisions::default(),
+    ));
+    let persist_lock = std::sync::Arc::new(parking_lot::Mutex::new(()));
+    let provider_table = ProviderTable::with_persist_lock(
+        vec![provider],
+        vec![],
+        decisions.clone(),
+        state_path.clone(),
+        persist_lock.clone(),
+    );
+    let _ = (decisions, persist_lock, state_path);
+    let dag = ConversationDag::new(64, 500, 1);
+    let proxy = ProxyState {
+        upstream: server::build_upstream_client(upstream_timeouts.connect).unwrap(),
+        providers: provider_table,
+        dag: dag.clone(),
+        secrets: test_secret_table(),
+        api_keys: None,
+        auth_enabled: false,
+        global_mock_prefix: std::sync::Arc::from(""),
+        on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,
+        upstream_timeouts,
+    };
+    let app = server::build_router(proxy);
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}"), dag)
 }
 
 #[tokio::test]
@@ -3216,6 +3333,7 @@ async fn cross_table_shared_state_no_lost_update() {
         auth_enabled: false,
         global_mock_prefix: std::sync::Arc::from(""),
         on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,
+        upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
     };
     let app = server::build_router(proxy);
     tokio::spawn(async move {

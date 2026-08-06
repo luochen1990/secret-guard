@@ -40,6 +40,12 @@ pub enum AppError {
     BadBody(String),
     #[error("upstream error: {0}")]
     Upstream(String),
+    /// 上游响应头 / chunk 空闲超时. 与 [`Self::Upstream`] 区分:
+    /// Upstream = 连接失败 / reqwest 错误 (502 Bad Gateway);
+    /// UpstreamTimeout = 上游响应慢/hang (504 Gateway Timeout).
+    /// 客户端可据此区分 "上游不可达" vs "上游慢", 决定是否重试.
+    #[error("upstream timeout: {0}")]
+    UpstreamTimeout(String),
     #[error("not found: {0}")]
     NotFound(String),
     #[error("service unavailable: {0}")]
@@ -70,6 +76,7 @@ impl IntoResponse for AppError {
         let (status, kind, message) = match &self {
             AppError::BadBody(_) => (StatusCode::BAD_REQUEST, "bad_request", None),
             AppError::Upstream(_) => (StatusCode::BAD_GATEWAY, "upstream_error", None),
+            AppError::UpstreamTimeout(_) => (StatusCode::GATEWAY_TIMEOUT, "upstream_timeout", None),
             AppError::NotFound(m) => (StatusCode::NOT_FOUND, "not_found", Some(m.clone())),
             AppError::Unavailable(m) => (
                 StatusCode::SERVICE_UNAVAILABLE,

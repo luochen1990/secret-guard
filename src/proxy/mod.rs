@@ -106,6 +106,9 @@ pub struct ProxyState {
     /// 来自 `[redact] on_probe_exhausted` (默认 FailOpen). 控制 redact probing 耗尽时
     /// 是 fail-open (skip + 原样转发) 还是 fail-closed (返回 503 拒绝转发).
     pub on_probe_exhausted: crate::config::OnProbeExhausted,
+    /// 来自 `[server] upstream_*_timeout_secs` 的上游超时配置.
+    /// forward 路径用它给 send().await / stream chunk 加超时保护.
+    pub upstream_timeouts: crate::config::UpstreamTimeouts,
 }
 
 /// axum 路径参数: `/{proto}/{name}/{*rest}`.

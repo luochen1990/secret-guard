@@ -18,7 +18,6 @@ use std::time::Instant;
 use axum::body::Body;
 use axum::http::{HeaderValue, Response, StatusCode};
 use bytes::Bytes;
-use futures::StreamExt;
 use tracing::{debug, warn};
 
 use crate::dag::ResponseData;
@@ -29,9 +28,7 @@ use super::auth::apply_provider_auth;
 use super::helpers::{build_response_headers, redact_headers, sanitize_request_headers, utf8_view};
 #[cfg(feature = "consistency-check")]
 use super::record::assert_resp_parsed_matches_source_nonstream;
-use super::record::{
-    build_call_event, parse_request_ir, record_upstream_failure, redact_and_derive,
-};
+use super::record::{build_call_event, parse_request_ir, redact_and_derive};
 
 /// 跨协议转发: ingress 协议 → IR → egress 协议, 上游响应反向翻译.
 ///
@@ -189,27 +186,23 @@ pub(crate) async fn cross_proto_forward(
     );
 
     // 13. 发送到上游.
-    let upstream_resp = match state
-        .upstream
-        .request(parts.method, &upstream_url)
-        .headers(fwd_headers)
-        .header(axum::http::header::CONTENT_TYPE, "application/json")
-        .header(axum::http::header::CONTENT_LENGTH, egress_bytes.len())
-        .body(egress_bytes)
-        .send()
-        .await
+    let upstream_resp = match super::record::send_upstream_or_fail(
+        &state.dag,
+        record_id,
+        started,
+        state
+            .upstream
+            .request(parts.method, &upstream_url)
+            .headers(fwd_headers)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .header(axum::http::header::CONTENT_LENGTH, egress_bytes.len())
+            .body(egress_bytes),
+        state.upstream_timeouts.response_header,
+    )
+    .await
     {
         Ok(r) => r,
-        Err(e) => {
-            record_upstream_failure(
-                &state.dag,
-                record_id,
-                started,
-                502,
-                format!("upstream send error: {e}"),
-            );
-            return Err(AppError::Upstream(e.to_string()));
-        }
+        Err(e) => return Err(e),
     };
 
     // 14. 完整 buffer 上游响应 (跨协议 MVP 不支持流式). 受 MAX_RESP_BODY_RECORD 上限保护.
@@ -219,8 +212,11 @@ pub(crate) async fn cross_proto_forward(
         let mut acc: Vec<u8> = Vec::new();
         let mut stream = upstream_resp.bytes_stream();
         let mut exceeded = false;
-        let mut stream_err: Option<String> = None;
-        while let Some(chunk) = stream.next().await {
+        let mut stream_err: Option<std::io::Error> = None;
+        while let Some(chunk) =
+            super::record::next_chunk(&mut stream, state.upstream_timeouts.stream_idle, &record_id)
+                .await
+        {
             match chunk {
                 Ok(b) => {
                     if acc.len() + b.len() > super::MAX_RESP_BODY_RECORD {
@@ -230,27 +226,34 @@ pub(crate) async fn cross_proto_forward(
                     acc.extend_from_slice(&b);
                 }
                 Err(e) => {
-                    stream_err = Some(e.to_string());
+                    stream_err = Some(e);
                     break;
                 }
             }
         }
         if let Some(e) = stream_err {
+            let err_label = super::record::stream_err_label(&e);
             let elapsed = started.elapsed().as_millis() as u64;
-            warn!(%record_id, error = %e, "cross-proto upstream stream error mid-flight");
+            warn!(%record_id, error = %e, err = err_label, "cross-proto upstream stream error mid-flight");
             state.dag.attach_response(
                 record_id,
                 ResponseData {
                     resp_status: resp_status.as_u16(),
                     resp_headers: redact_headers(&resp_headers),
                     elapsed_ms: elapsed,
-                    error: Some(format!("upstream stream error: {e}")),
+                    error: Some(err_label.to_string()),
                     resp_complete: false,
                     streamed: false,
                     ..Default::default()
                 },
             );
-            return Err(AppError::Upstream(e));
+            // 区分 idle timeout (504) 与其他 stream error (502), 与同协议路径一致.
+            // 复用已算出的 err_label (stream_err_label 是 timeout 判定的 SSOT).
+            return Err(if err_label == super::record::ERR_STREAM_IDLE_TIMEOUT {
+                AppError::UpstreamTimeout(e.to_string())
+            } else {
+                AppError::Upstream(e.to_string())
+            });
         }
         if exceeded {
             let elapsed = started.elapsed().as_millis() as u64;

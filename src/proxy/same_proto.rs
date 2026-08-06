@@ -25,9 +25,7 @@ use crate::provider::{Protocol, Provider};
 
 use super::auth::apply_provider_auth;
 use super::helpers::{build_upstream_url, is_streaming, sanitize_request_headers, utf8_view};
-use super::record::{
-    build_call_event, parse_request_ir, record_upstream_failure, redact_and_derive,
-};
+use super::record::{build_call_event, parse_request_ir, redact_and_derive};
 
 /// 同协议转发: 字节透传 (无 redact) 或 IR 路径 (启用 redact).
 ///
@@ -160,27 +158,23 @@ pub(crate) async fn same_proto_forward(
     debug!(%record_id, method = %parts.method, url = %upstream_url, "forwarding redacted same-proto request");
 
     // 9. 发送到上游.
-    let upstream_resp = match state
-        .upstream
-        .request(parts.method, &upstream_url)
-        .headers(fwd_headers)
-        .header(axum::http::header::CONTENT_TYPE, "application/json")
-        .header(axum::http::header::CONTENT_LENGTH, req_bytes_to_send.len())
-        .body(req_bytes_to_send)
-        .send()
-        .await
+    let upstream_resp = match super::record::send_upstream_or_fail(
+        &state.dag,
+        record_id,
+        started,
+        state
+            .upstream
+            .request(parts.method, &upstream_url)
+            .headers(fwd_headers)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .header(axum::http::header::CONTENT_LENGTH, req_bytes_to_send.len())
+            .body(req_bytes_to_send),
+        state.upstream_timeouts.response_header,
+    )
+    .await
     {
         Ok(r) => r,
-        Err(e) => {
-            record_upstream_failure(
-                &state.dag,
-                record_id,
-                started,
-                502,
-                format!("upstream send error: {e}"),
-            );
-            return Err(AppError::Upstream(e.to_string()));
-        }
+        Err(e) => return Err(e),
     };
 
     // 10. 收集响应元数据.
@@ -208,6 +202,7 @@ pub(crate) async fn same_proto_forward(
             resp_headers,
             codec_proto,
             redaction_map,
+            state.upstream_timeouts.stream_idle,
         )
         .await
     } else {
@@ -221,6 +216,7 @@ pub(crate) async fn same_proto_forward(
             streamed,
             codec_proto,
             redaction_map,
+            state.upstream_timeouts.stream_idle,
         )
         .await
     }
@@ -273,25 +269,21 @@ async fn same_proto_passthrough(
 
     debug!(%record_id, method = %parts.method, url = %upstream_url, "forwarding (passthrough)");
 
-    let upstream_resp = match state
-        .upstream
-        .request(parts.method, &upstream_url)
-        .headers(fwd_headers)
-        .body(req_bytes)
-        .send()
-        .await
+    let upstream_resp = match super::record::send_upstream_or_fail(
+        &state.dag,
+        record_id,
+        started,
+        state
+            .upstream
+            .request(parts.method, &upstream_url)
+            .headers(fwd_headers)
+            .body(req_bytes),
+        state.upstream_timeouts.response_header,
+    )
+    .await
     {
         Ok(r) => r,
-        Err(e) => {
-            record_upstream_failure(
-                &state.dag,
-                record_id,
-                started,
-                502,
-                format!("upstream send error: {e}"),
-            );
-            return Err(AppError::Upstream(e.to_string()));
-        }
+        Err(e) => return Err(e),
     };
 
     let resp_status = upstream_resp.status();
@@ -314,6 +306,7 @@ async fn same_proto_passthrough(
         resp_headers,
         streamed,
         crate::codec::Protocol::from_native(ingress),
+        state.upstream_timeouts.stream_idle,
     )
     .await
 }

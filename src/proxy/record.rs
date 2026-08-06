@@ -22,6 +22,7 @@
 use std::time::Duration;
 
 use axum::http::HeaderMap;
+use futures::StreamExt;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -45,6 +46,8 @@ pub(super) const PARSED_SYNC_INTERVAL: Duration = Duration::from_millis(500);
 pub(super) const ERR_CLIENT_DISCONNECTED: &str = "client disconnected";
 /// 上游流式响应中途出错 (reqwest stream Err).
 pub(super) const ERR_UPSTREAM_STREAM: &str = "upstream stream error";
+/// 上游流式响应 chunk 空闲超时 (chunk 间隔超过配置的 stream_idle_timeout).
+pub(super) const ERR_STREAM_IDLE_TIMEOUT: &str = "upstream stream idle timeout";
 /// 响应超过 record 累积上限 (MAX_RESP_BODY_RECORD).
 pub(super) const ERR_RESP_CAP_EXCEEDED: &str = "response exceeds record cap";
 
@@ -281,6 +284,110 @@ pub(super) fn record_upstream_failure(
             ..Default::default()
         },
     );
+}
+
+/// 发送上游请求, 可选地对"响应头到达"加超时保护. 失败时记录到 DAG 并返回 AppError.
+///
+/// `header_timeout = None` 时退化为普通 `send().await` (向后兼容 / 测试场景).
+/// `Some(d)` 时用 `tokio::time::timeout` 包裹 send, 超时记 504 record.
+///
+/// 错误映射: reqwest 网络错误 → 502 (BAD_GATEWAY); 响应头超时 → 504 (GATEWAY_TIMEOUT).
+/// 504 让 WebUI 区分 "上游不可达" vs "上游 hang" 两种运维场景.
+///
+/// 三个 forward 路径 (passthrough / same_proto / cross_proto) 共用此 helper.
+///
+/// 注: 这层超时**只约束响应头到达**, 不影响后续流式 body 的总时长
+/// (流式 body 的 chunk 空闲超时见 next_chunk 的 idle_timeout).
+pub(super) async fn send_upstream_or_fail(
+    dag: &ConversationDag,
+    record_id: Uuid,
+    started: std::time::Instant,
+    request_builder: reqwest::RequestBuilder,
+    header_timeout: Option<std::time::Duration>,
+) -> Result<reqwest::Response, crate::error::AppError> {
+    let send_fut = request_builder.send();
+    // Result<Response, Either<reqwest::Error, Elapsed>> — 用 nested Result 表达三态.
+    let raw: Result<reqwest::Response, Result<reqwest::Error, std::time::Duration>> =
+        match header_timeout {
+            None => send_fut.await.map_err(Ok),
+            Some(d) => match tokio::time::timeout(d, send_fut).await {
+                Ok(Ok(r)) => Ok(r),
+                Ok(Err(e)) => Err(Ok(e)),
+                Err(_elapsed) => Err(Err(d)),
+            },
+        };
+    match raw {
+        Ok(r) => Ok(r),
+        Err(Ok(e)) => {
+            // reqwest 网络错误 (连接拒绝 / DNS / TLS 等) → 502.
+            let msg = format!("upstream send error: {e}");
+            record_upstream_failure(dag, record_id, started, 502, msg.clone());
+            Err(crate::error::AppError::Upstream(e.to_string()))
+        }
+        Err(Err(d)) => {
+            // 响应头超时 → 504.
+            let msg = format!("upstream response headers not received within {:?}", d);
+            record_upstream_failure(dag, record_id, started, 504, msg);
+            Err(crate::error::AppError::UpstreamTimeout(format!(
+                "upstream timeout (no response headers within {:?})",
+                d
+            )))
+        }
+    }
+}
+
+/// 从上游 stream 取下一个 chunk, 可选地带空闲超时保护.
+///
+/// `idle_timeout = None`: 退化为 `stream.next().await` (向后兼容).
+/// `Some(d)`: 每个 chunk 等待最多 d, 超时则日志 warn 并返回 `Some(Err(TimedOut))`,
+/// 让 caller 走 upstream error 路径标记 record incomplete.
+///
+/// 返回 `None` = stream 正常结束; `Some(Ok(_))` / `Some(Err(_))` = 有数据或错误.
+/// 防御 "上游发了响应头但 body chunk 卡住" 的 hang 形态.
+pub(super) async fn next_chunk<S>(
+    stream: &mut S,
+    idle_timeout: Option<std::time::Duration>,
+    record_id: &uuid::Uuid,
+) -> Option<Result<bytes::Bytes, std::io::Error>>
+where
+    S: futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin,
+{
+    let fut = stream.next();
+    match idle_timeout {
+        None => fut.await.map(|r| r.map_err(io_err_from_reqwest)),
+        Some(d) => match tokio::time::timeout(d, fut).await {
+            Ok(inner) => inner.map(|r| r.map_err(io_err_from_reqwest)),
+            Err(_elapsed) => {
+                tracing::warn!(
+                    %record_id,
+                    timeout = ?d,
+                    "upstream stream chunk idle timeout"
+                );
+                Some(Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    ERR_STREAM_IDLE_TIMEOUT,
+                )))
+            }
+        },
+    }
+}
+
+/// reqwest::Error → std::io::Error 转换 (stream 循环统一用 io::Error 便于 mpsc 传递).
+pub(super) fn io_err_from_reqwest(e: reqwest::Error) -> std::io::Error {
+    std::io::Error::other(e.to_string())
+}
+
+/// io::Error → record error label (区分 idle timeout 与其他 stream error).
+///
+/// 三个 fan_out 路径共用此分类, 保证 client_status 推断 (504 vs 502) 一致.
+/// idle timeout (io::ErrorKind::TimedOut) → ERR_STREAM_IDLE_TIMEOUT → 504;
+/// 其他 stream error → ERR_UPSTREAM_STREAM → 502.
+pub(super) fn stream_err_label(e: &std::io::Error) -> &'static str {
+    if e.kind() == std::io::ErrorKind::TimedOut {
+        ERR_STREAM_IDLE_TIMEOUT
+    } else {
+        ERR_UPSTREAM_STREAM
+    }
 }
 
 /// 构造 [`CallEvent`] (3 个 push 点共用).

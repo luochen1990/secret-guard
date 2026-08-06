@@ -60,6 +60,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use axum::middleware;
@@ -223,11 +224,16 @@ fn build_router_with_auth_layers(
 /// gzip/brotli/deflate 自动解压由 Cargo.toml 的 reqwest features 控制 —
 /// 启用 feature 后 reqwest 自动解压并剥除 content-encoding header,
 /// 无需在 builder 上调 `.gzip(true)` (调了反而是冗余).
-pub fn build_upstream_client() -> anyhow::Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .user_agent(concat!("secret-guard/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("failed to build upstream client")
+///
+/// `connect_timeout`: DNS+TCP+TLS 握手超时. `None` = 无限 (向后兼容, 不建议;
+/// 上游网络异常时会永久 hang). 由 `[server] upstream_connect_timeout_secs` 配置.
+pub fn build_upstream_client(connect_timeout: Option<Duration>) -> anyhow::Result<reqwest::Client> {
+    let mut builder =
+        reqwest::Client::builder().user_agent(concat!("secret-guard/", env!("CARGO_PKG_VERSION")));
+    if let Some(t) = connect_timeout {
+        builder = builder.connect_timeout(t);
+    }
+    builder.build().context("failed to build upstream client")
 }
 
 /// 启动服务. 阻塞直到 shutdown 信号到达且 drain 完成.
@@ -240,6 +246,9 @@ pub fn build_upstream_client() -> anyhow::Result<reqwest::Client> {
 ///   存入 ProxyState 供 WebUI handler 在 secret upsert 时校验 + resolve.
 /// - `on_probe_exhausted`: 来自 static config 的 `[redact] on_probe_exhausted`,
 ///   存入 ProxyState 供 forwarding 路径决定 probing 耗尽时 fail-open / fail-closed.
+/// - `upstream_timeouts`: 来自 static config 的 `[server] upstream_*_timeout_secs`,
+///   存入 ProxyState 供 forward 路径给 send().await / stream chunk 加超时保护
+///   (防上游网络异常时 record 永久 pending).
 #[allow(clippy::too_many_arguments)]
 pub async fn serve(
     host: &str,
@@ -253,10 +262,11 @@ pub async fn serve(
     auth_config: AuthConfig,
     global_mock_prefix: String,
     on_probe_exhausted: crate::config::OnProbeExhausted,
+    upstream_timeouts: crate::config::UpstreamTimeouts,
 ) -> anyhow::Result<()> {
     auth_config.validate().map_err(|e| anyhow::anyhow!(e))?;
 
-    let upstream = build_upstream_client()?;
+    let upstream = build_upstream_client(upstream_timeouts.connect)?;
     let dag = ConversationDag::new(records_capacity, 500, 1);
 
     // 跨表共享: persist_lock 串行整个 RMW, decisions 是同一份 mutable map.
@@ -301,6 +311,7 @@ pub async fn serve(
         auth_enabled: auth_config.enabled,
         global_mock_prefix: Arc::from(global_mock_prefix),
         on_probe_exhausted,
+        upstream_timeouts,
     };
 
     // 条件化: 启用认证时构造 AuthStack, 否则单用户模式.

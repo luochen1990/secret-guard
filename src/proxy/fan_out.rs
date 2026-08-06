@@ -25,7 +25,6 @@ use std::time::Instant;
 use axum::body::Body;
 use axum::http::{HeaderMap, Response, StatusCode};
 use bytes::Bytes;
-use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::warn;
@@ -38,8 +37,8 @@ use super::helpers::{build_response_headers, redact_headers, utf8_view};
 #[cfg(feature = "consistency-check")]
 use super::record::assert_resp_parsed_matches_source_nonstream;
 use super::record::{
-    ERR_CLIENT_DISCONNECTED, ERR_RESP_CAP_EXCEEDED, ERR_UPSTREAM_STREAM, ParsedSync,
-    RecordAccumulator,
+    ERR_CLIENT_DISCONNECTED, ERR_RESP_CAP_EXCEEDED, ERR_STREAM_IDLE_TIMEOUT, ParsedSync,
+    RecordAccumulator, next_chunk,
 };
 
 /// 流式字节扇出: 把上游 SSE 流式转发给客户端, 同时 (若有 codec) 用 StreamScan
@@ -57,6 +56,7 @@ pub(crate) async fn fan_out_streaming(
     resp_headers: HeaderMap,
     streamed: bool,
     codec_proto: Option<crate::codec::Protocol>,
+    stream_idle_timeout: Option<std::time::Duration>,
 ) -> Result<Response<Body>, AppError> {
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(32);
     let resp_headers_for_record = resp_headers.clone();
@@ -73,7 +73,7 @@ pub(crate) async fn fan_out_streaming(
             None
         };
 
-        while let Some(chunk) = stream.next().await {
+        while let Some(chunk) = next_chunk(&mut stream, stream_idle_timeout, &record_id).await {
             match chunk {
                 Ok(b) => {
                     if tx.send(Ok(b.clone())).await.is_err() {
@@ -89,10 +89,10 @@ pub(crate) async fn fan_out_streaming(
                     }
                 }
                 Err(e) => {
-                    warn!(%record_id, error = %e, "upstream stream error mid-flight");
-                    let io_err = std::io::Error::other(e.to_string());
-                    let _ = tx.send(Err(io_err)).await;
-                    recorder.set_error(ERR_UPSTREAM_STREAM);
+                    let err_label = super::record::stream_err_label(&e);
+                    warn!(%record_id, error = %e, err = err_label, "upstream stream error mid-flight");
+                    let _ = tx.send(Err(e)).await;
+                    recorder.set_error(err_label);
                     break;
                 }
             }
@@ -170,13 +170,14 @@ pub(crate) async fn fan_out_buffered_ir(
     streamed: bool,
     codec_proto: crate::codec::Protocol,
     redaction_map: RedactionMap,
+    stream_idle_timeout: Option<std::time::Duration>,
 ) -> Result<Response<Body>, AppError> {
     let resp_headers_for_record = resp_headers.clone();
     let status_u16 = resp_status.as_u16();
 
     let mut stream = upstream_resp.bytes_stream();
     let mut recorder = RecordAccumulator::new();
-    while let Some(chunk) = stream.next().await {
+    while let Some(chunk) = next_chunk(&mut stream, stream_idle_timeout, &record_id).await {
         match chunk {
             Ok(b) => {
                 // buffered_ir 路径: 超过 cap 时记录 error_kind 并中断流
@@ -193,7 +194,7 @@ pub(crate) async fn fan_out_buffered_ir(
                 recorder.acc.extend_from_slice(&b);
             }
             Err(e) => {
-                recorder.set_error(&format!("upstream stream error: {e}"));
+                recorder.set_error(super::record::stream_err_label(&e));
                 break;
             }
         }
@@ -202,21 +203,29 @@ pub(crate) async fn fan_out_buffered_ir(
     let elapsed = started.elapsed().as_millis() as u64;
 
     // Parse 为 IR (失败则原样透传, 不 restore).
+    // 注: 若 stream 中途出错 (idle timeout / upstream error / cap exceeded),
+    // recorder.acc 是**截断**的字节, parse 大概率失败且即使"成功"也是不完整 JSON.
+    // 这种情况返回错误响应 (而非截断 JSON 的 200), 让客户端知道响应不完整.
     let reader = codec_proto.reader();
     let writer = codec_proto.writer();
     let mut resp_parsed_for_record: Option<serde_json::Value> = None;
-    let client_bytes: Vec<u8> = match serde_json::from_slice::<serde_json::Value>(&recorder.acc) {
-        Ok(v) => match reader.read_response(&v) {
-            Ok(mut ir) => {
-                // record 存 LLM 视角 (restore 之前, 含 mock).
-                resp_parsed_for_record = Some(writer.write_response(&ir));
-                crate::redact::restore_ir_response(&mut ir, &redaction_map);
-                let restored = writer.write_response(&ir);
-                serde_json::to_vec(&restored).unwrap_or_else(|_| recorder.acc.clone())
-            }
-            Err(_) => recorder.acc.clone(), // parse 失败: 原样返回 (无 restore).
-        },
-        Err(_) => recorder.acc.clone(), // 非 JSON: 原样返回.
+    let client_bytes: Vec<u8> = if recorder.error_kind.is_some() {
+        // stream 中途中断 → 不 parse, 返回空 body (状态码下方调整为 502/504).
+        Vec::new()
+    } else {
+        match serde_json::from_slice::<serde_json::Value>(&recorder.acc) {
+            Ok(v) => match reader.read_response(&v) {
+                Ok(mut ir) => {
+                    // record 存 LLM 视角 (restore 之前, 含 mock).
+                    resp_parsed_for_record = Some(writer.write_response(&ir));
+                    crate::redact::restore_ir_response(&mut ir, &redaction_map);
+                    let restored = writer.write_response(&ir);
+                    serde_json::to_vec(&restored).unwrap_or_else(|_| recorder.acc.clone())
+                }
+                Err(_) => recorder.acc.clone(), // parse 失败: 原样返回 (无 restore).
+            },
+            Err(_) => recorder.acc.clone(), // 非 JSON: 原样返回.
+        }
     };
 
     // record 存储的是 LLM 视角 (含 mock) 的版本.
@@ -232,6 +241,18 @@ pub(crate) async fn fan_out_buffered_ir(
         &recorder.acc,
         reader.as_ref(),
     );
+    // stream 中途中断时, 客户端响应用错误状态码 (而非原始 2xx),
+    // 避免给客户端返回"200 但 body 是截断/空"的误导性成功响应.
+    // 在 attach_response 之前计算 (error_kind 之后会被 move 到 ResponseData).
+    let client_status = if let Some(err) = recorder.error_kind.as_deref() {
+        if err == ERR_STREAM_IDLE_TIMEOUT {
+            StatusCode::GATEWAY_TIMEOUT
+        } else {
+            StatusCode::BAD_GATEWAY
+        }
+    } else {
+        resp_status
+    };
     dag.attach_response(
         record_id,
         ResponseData {
@@ -248,7 +269,7 @@ pub(crate) async fn fan_out_buffered_ir(
     );
 
     let mut resp = Response::new(Body::from(client_bytes));
-    *resp.status_mut() = resp_status;
+    *resp.status_mut() = client_status;
     *resp.headers_mut() = build_response_headers(&resp_headers);
     Ok(resp)
 }
@@ -267,6 +288,7 @@ pub(crate) async fn fan_out_streaming_with_restore(
     resp_headers: HeaderMap,
     codec_proto: crate::codec::Protocol,
     redaction_map: RedactionMap,
+    stream_idle_timeout: Option<std::time::Duration>,
 ) -> Result<Response<Body>, AppError> {
     use crate::codec::stream::StreamTranslate;
 
@@ -283,7 +305,7 @@ pub(crate) async fn fan_out_streaming_with_restore(
         let mut stream = upstream_resp.bytes_stream();
         let mut recorder = RecordAccumulator::new();
 
-        while let Some(chunk) = stream.next().await {
+        while let Some(chunk) = next_chunk(&mut stream, stream_idle_timeout, &record_id).await {
             match chunk {
                 Ok(b) => {
                     // 喂给 StreamTranslate, 得到 restore 后的字节.
@@ -300,10 +322,10 @@ pub(crate) async fn fan_out_streaming_with_restore(
                     }
                 }
                 Err(e) => {
-                    warn!(%record_id, error = %e, "upstream stream error mid-flight");
-                    let io_err = std::io::Error::other(e.to_string());
-                    let _ = tx.send(Err(io_err)).await;
-                    recorder.set_error(ERR_UPSTREAM_STREAM);
+                    let err_label = super::record::stream_err_label(&e);
+                    warn!(%record_id, error = %e, err = err_label, "upstream stream error mid-flight");
+                    let _ = tx.send(Err(e)).await;
+                    recorder.set_error(err_label);
                     break;
                 }
             }
@@ -440,6 +462,7 @@ mod tests {
             resp_headers,
             false, // streamed=false
             None,  // codec_proto=None 跳过 StreamScan
+            None,  // stream_idle_timeout=None (测试不禁用超时保护)
         )
         .await
         .expect("fan_out_streaming must not error on large body");
