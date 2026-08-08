@@ -188,11 +188,28 @@ impl ConversationDag {
         // guard 基于 delta 非空 (split_at < msgs.len()), 而非 msgs 非空:
         // 全前缀重复请求 (split_at == msgs.len(), delta 实际为空) 时保留调用方传入的值.
         if lookup.split_at < msgs.len() {
-            event.round_role = if delta_has_user_text {
-                IrRole::User
+            if delta_has_user_text {
+                event.round_role = IrRole::User;
             } else {
-                IrRole::Tool
-            };
+                event.round_role = IrRole::Tool;
+                // 工具轮次 (sub-dot): preview 覆盖为首个 ToolUse 的 tool name.
+                //
+                // 前端 index.html 三级菜单 (.sub-dot) 的 tooltip 文本 + providerColor 哈希
+                // 源都依赖 preview = tool name. 但 build_call_event 时 extract_preview 在
+                // 整个 req_body 上提取 (不知道 split_at), 对工具轮次会 fallback 到 "最后一条
+                // 有文本的 message" (可能是 tool_result 片段 / assistant thinking), 导致
+                // tooltip 显示杂乱文本 + 颜色哈希不稳定. 这里在 delta 切片上重新提取首个
+                // ToolUse name, 覆盖错误的 preview (与 round_role 同一位置修正, SSOT).
+                // 无 ToolUse (如纯 ToolResult 回复轮次) → 保留原 preview.
+                //
+                // 边界: 若本 node 是会话根 (parent=None), session.title 也会变成 tool name
+                // (find_root_title 取根 preview). 正常对话根总是用户文本轮次, 此场景仅在
+                // 自动化调用 / fork 边界出现, 属可接受的降级.
+                let delta_msgs = &msgs[lookup.split_at..];
+                if let Some(tool_name) = crate::derive::extract_tool_use_name(delta_msgs) {
+                    event.preview = Some(Arc::<str>::from(tool_name));
+                }
+            }
         }
 
         // 4. 计算 own_hash + prefix_hash (只基于 req_delta, response 不参与).
@@ -1191,6 +1208,77 @@ mod tests {
             v.round_role,
             IrRole::User,
             "mixed → User (任一条 user text)"
+        );
+    }
+
+    /// 构造含 ToolUse 的 assistant 消息 (contains_user_text = false).
+    fn tool_use_msg(name: &str) -> IrMessage {
+        IrMessage {
+            contains_user_text: false,
+            role: IrRole::Assistant,
+            content: vec![IrBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: name.to_string(),
+                input: serde_json::json!({}),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn tool_round_preview_is_tool_name() {
+        // 工具轮次 (assistant ToolUse + user ToolResult, 无 user text): round_role=Tool,
+        // preview 应被覆盖为首个 ToolUse 的 name.
+        let dag = ConversationDag::new(8, 500, 1);
+        let id = dag.push_messages(
+            vec![tool_use_msg("read_file"), tool_result_msg()],
+            dummy_event(),
+        );
+        let v = dag.get_node(id).expect("node exists");
+        assert_eq!(v.round_role, IrRole::Tool);
+        assert_eq!(
+            v.preview.as_deref(),
+            Some("read_file"),
+            "工具轮次 preview 应为 tool name"
+        );
+    }
+
+    #[test]
+    fn tool_round_without_tool_use_keeps_original_preview() {
+        // 纯 ToolResult 回复 (delta 无 user text 也无 ToolUse): round_role=Tool,
+        // 但无 ToolUse → 不覆盖 preview, 保留 extract_preview 的 fallback 结果.
+        // body 只有 tool message (无 user text), extract_preview fallback 到 "result data".
+        let body = r#"{"model":"x","messages":[{"role":"tool","tool_call_id":"c1","content":"result data"}]}"#;
+        let dag = ConversationDag::new(8, 500, 1);
+        let id = dag.push_messages(vec![tool_result_msg()], event_with_body("/o/x", body));
+        let v = dag.get_node(id).expect("node exists");
+        assert_eq!(v.round_role, IrRole::Tool);
+        // 无 ToolUse → 保留 extract_preview 的 fallback 结果, 不覆盖.
+        assert_eq!(
+            v.preview.as_deref(),
+            Some("result data"),
+            "无 ToolUse 时保留 extract_preview 的 fallback 结果"
+        );
+    }
+
+    #[test]
+    fn user_round_preview_unaffected_by_tool_name_override() {
+        // 用户轮次 (delta 含 user text) → round_role=User, preview 不受 tool name 覆盖影响.
+        // 即使 delta 恰好也含 ToolUse (混合轮次), preview 仍走 user text 路径.
+        let dag = ConversationDag::new(8, 500, 1);
+        let id = dag.push_messages(
+            vec![
+                tool_use_msg("some_tool"),
+                text_msg(IrRole::User, "my question"),
+            ],
+            dummy_event(),
+        );
+        let v = dag.get_node(id).expect("node exists");
+        assert_eq!(v.round_role, IrRole::User);
+        // dummy_event preview = None, 工具轮次覆盖逻辑不触发 (round_role != Tool).
+        assert!(
+            v.preview.is_none(),
+            "User round preview 应保持 None (dummy_event 无 body, 不被覆盖)"
         );
     }
 

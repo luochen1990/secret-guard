@@ -105,9 +105,11 @@
    (如 "假设 messages 数组中 user 在 assistant 之前"), 以及假设不成立时的降级行为.
 
 已实践位置: `derive::extract_preview_and_model` (preview 提取),
+`derive::extract_tool_use_name` (工具轮次 preview = tool name 提取),
 `derive::extract_delta_messages_from_raw` (delta 切片).
-(注: 前端 `toolNameOfRound` 已删除, tool name 推断迁移到后端 `extract_preview_and_model`,
-由 `prop_preview_never_panics` 统一守卫, 详见 `docs/design/contracts.md` §8 ROB-1.)
+(注: 前端 `toolNameOfRound` 已删除, tool name 提取在后端分两路 — sidebar 主标题由
+`extract_preview_and_model` 处理, 工具轮次的 sub-dot preview 由 `extract_tool_use_name`
+在 `dag::push_messages` 覆盖, 两者均由 `prop_preview_never_panics` 统一守卫 ROB-1.)
 
 > **例外 — DAG 核心数据结构不用 best-effort**: `dag::BlockPool::intern` 的 collision check
 > 用 `assert!` (非 `debug_assert!`), release 也 panic. 理由: collision 属哈希函数 bug,

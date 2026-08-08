@@ -5,6 +5,8 @@
 //! 本模块提供协议无关的派生函数, 从 request body 提取:
 //! - sidebar 标题 preview + model 名 + message 文本片段 (`extract_preview_and_model` /
 //!   `extract_preview_and_model_from_ir` / `extract_text_blocks`).
+//! - 工具轮次 preview = tool name (`extract_tool_use_name`): DAG push_messages 在
+//!   `round_role = Tool` 时调用, 覆盖 `extract_preview` 的 fallback 结果.
 //! - timeline delta messages 切片 (`extract_delta_messages_from_raw`): 从 req_body_raw
 //!   末尾截取 req_delta.len() 条 messages, 含根节点 system prompt 注入.
 //!
@@ -139,6 +141,29 @@ pub(crate) fn extract_preview_and_model_from_ir(
 
     let preview = select_and_truncate_preview(&candidates);
     (preview, model)
+}
+
+/// 从 messages 中提取首个 ToolUse 的 tool name (归一化 + 截断).
+///
+/// 用于 `round_role = Tool` 的轮次 (工具循环, sidebar 三级小圆点):
+/// 此类轮次的 preview 应是 tool name (前端 `index.html` 的 sub-dot tooltip +
+/// `providerColor` 哈希源都依赖 tool name, 详尽契约见 `dag::push_messages` 3.5 步).
+///
+/// `select_and_truncate_preview` (sidebar 主标题) 在无 user 时 fallback 到 "最后一条
+/// 有文本的 message" (可能是 tool_result 片段 / assistant thinking), 与 tool name 契约
+/// 不一致, 故工具轮次需要本函数单独覆盖 preview.
+///
+/// 找不到 ToolUse → None (调用方保留原 preview). 多个 ToolUse → 取首个 (oldest-first,
+/// 反映本轮首个工具调用, 多并发工具调用时首个最具代表性).
+///
+/// 截断复用 `truncate_preview` (SSOT, 48 chars), 保持与 user round preview 一致的视觉长度.
+pub(crate) fn extract_tool_use_name(msgs: &[crate::codec::ir::IrMessage]) -> Option<String> {
+    msgs.iter().find_map(|m| {
+        m.content.iter().find_map(|b| match b {
+            crate::codec::ir::IrBlock::ToolUse { name, .. } => Some(truncate_preview(name)),
+            _ => None,
+        })
+    })
 }
 
 // ─── 字符串入口 (passthrough 路径) ──────────────────────────────────────────
@@ -495,6 +520,68 @@ mod tests {
             Some("How do I fix this bug?"),
             "大 body 也应提取 preview (Bug 1 修复)"
         );
+    }
+
+    // ─── extract_tool_use_name (工具轮次 preview) ───────────────────────────
+
+    #[test]
+    fn extract_tool_use_name_finds_first() {
+        let msgs = vec![crate::codec::ir::IrMessage {
+            role: crate::codec::ir::IrRole::Assistant,
+            content: vec![
+                crate::codec::ir::IrBlock::ToolUse {
+                    id: "c1".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({}),
+                },
+                crate::codec::ir::IrBlock::ToolUse {
+                    id: "c2".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({}),
+                },
+            ],
+            ..Default::default()
+        }];
+        assert_eq!(
+            extract_tool_use_name(&msgs).as_deref(),
+            Some("read_file"),
+            "首个 ToolUse 的 name"
+        );
+    }
+
+    #[test]
+    fn extract_tool_use_name_empty_returns_none() {
+        assert!(extract_tool_use_name(&[]).is_none());
+    }
+
+    #[test]
+    fn extract_tool_use_name_no_tool_use_returns_none() {
+        // 只有 Text block, 无 ToolUse.
+        let msgs = vec![crate::codec::ir::IrMessage {
+            role: crate::codec::ir::IrRole::User,
+            content: vec![crate::codec::ir::IrBlock::Text {
+                text: "hello".into(),
+            }],
+            ..Default::default()
+        }];
+        assert!(extract_tool_use_name(&msgs).is_none());
+    }
+
+    #[test]
+    fn extract_tool_use_name_truncates_long_name() {
+        let long = "x".repeat(100);
+        let msgs = vec![crate::codec::ir::IrMessage {
+            role: crate::codec::ir::IrRole::Assistant,
+            content: vec![crate::codec::ir::IrBlock::ToolUse {
+                id: "c1".into(),
+                name: long,
+                input: serde_json::json!({}),
+            }],
+            ..Default::default()
+        }];
+        let name = extract_tool_use_name(&msgs).expect("Some");
+        assert!(name.ends_with('…'));
+        assert_eq!(name.chars().count(), PREVIEW_MAX + 1); // 48 + '…'
     }
 
     // ─── IR 入口测试 (codec 路径, 零重复 parse) ──────────────────────────────

@@ -455,7 +455,7 @@
 - `prop_preview_fallback_when_no_user`: 无 user 时回退到最后一条有文本的 message.
 - `prop_preview_fallback_compression_marker`: 压缩 marker ("What did we do so far?") 命中时回退到最后一条 assistant 摘要.
 - `prop_preview_fallback_method_path`: 提取失败回退到 method + path.
-- `prop_preview_push_time_snapshot_matches_reextract`: push 时存的 preview 与之后从 req_body_raw 重新提取的结果一致 (consistency-check 守卫).
+- `prop_preview_push_time_snapshot_matches_reextract`: push 时存的 preview 与之后从 req_body_raw 重新提取的结果一致 (consistency-check 守卫). 例外: `round_role = Tool` 的轮次, `push_messages` 会用 `extract_tool_use_name` 覆盖 preview 为 tool name, 覆盖后不再等于 req_body_raw 提取结果 — 此 drift 是预期的 (详见 VIEW-2 脚注 ¹).
 
 ### DTO-5 req_delta_messages 切片正确
 
@@ -670,11 +670,16 @@
 | 派生字段 | 来源 | 守卫状态 |
 |---|---|---|
 | `redactions` | RedactionMap | ✅ `proxy/record.rs::assert_redactions_match_map` |
-| `preview` / `model` | extract_preview_and_model | ✅ `proxy/record.rs::assert_preview_model_match_source` |
+| `preview` / `model` | extract_preview_and_model | ✅ `proxy/record.rs::assert_preview_model_match_source` ¹ |
 | `resp_parsed` (非流式) | reader.read_response | ✅ `proxy/record.rs::assert_resp_parsed_matches_source_nonstream` |
 | `resp_parsed` (流式) | StreamScan snapshot | ⏳ Phase A 已删除原始 SSE 字节, 派生与源物理分离, 暂无法守卫 |
 | `req_delta_messages` | extract_delta_messages_from_raw (derive.rs) | (每次 timeline 请求重算, 无 drift 风险) |
 | `session.title` | find_root_title | ✅ `dag/mod.rs::assert_session_title_matches_root_preview` |
+
+> ¹ `preview` 守卫只覆盖 `build_call_event` 阶段 (event 构造时). `push_messages` 在
+> `round_role = Tool` 时会用 `extract_tool_use_name` 覆盖 preview 为首个 ToolUse 的 name
+> (前端 sidebar 三级菜单 tooltip + 颜色哈希依赖 tool name). 覆盖后的 preview 不等于
+> `extract_preview_and_model(req_body_raw)` 的结果 — 此 drift 是预期的修正, 不属于守卫失败.
 
 **Properties**:
 - `prop_each_derived_field_has_consistency_check`: 上表中每个"待补"字段最终都有 consistency-check 断言.
