@@ -12,6 +12,11 @@
 //! - [`fan_out_buffered_ir`]: 非流式 + IR restore, 用于 same-proto + Redact + 非流式 / cross-proto.
 //!   完整累积响应, restore, 一次性返回.
 //!
+//! 两条流式路径的 spawn task 骨架 (chunk 循环 / 错误分支 / 记录累积 / attach_response)
+//! 逐行同构, 抽为共享的 [`fanout_stream_task`] + [`ChunkPipeline`] (chunk 变换策略),
+//! 仅 final parsed / body 计算作闭包注入 (差异是语义性的: 流式 vs 非流式 parse / body
+//! 保留策略). `fan_out_buffered_ir` 结构差异大, 不参与合并.
+//!
 //! **客户端响应永远无大小上限**; 只有 record 累积受 `MAX_RESP_BODY_RECORD` (32 MiB) 约束.
 //!
 //! # 流式响应处理
@@ -41,6 +46,155 @@ use super::recorder::{
     RecordAccumulator, next_chunk,
 };
 
+// ─── 流式 chunk 变换策略 (两条流式路径的差异点) ─────────────────────────────
+
+/// 流式扇出的 chunk 管道: [`fanout_stream_task`] 的 chunk 变换策略.
+///
+/// - [`PassthroughPipe`]: 字节透传 ([`fan_out_streaming`], 无 Redact).
+/// - [`RestorePipe`]: StreamTranslate 同协议 restore ([`fan_out_streaming_with_restore`]).
+trait ChunkPipeline {
+    /// 变换单个上游 chunk (identity clone / IR restore 翻译), 返回要发给客户端的字节.
+    /// `None` = 本 chunk 无输出 (restore 模式下 chunk 不足以构成完整 SSE 帧是常态;
+    /// 透传模式恒 `Some` — 即便空 chunk 也照发, 保持与历史行为逐字节一致).
+    fn transform(&mut self, chunk: &Bytes) -> Option<Bytes>;
+    /// 流结束后输出尾巴字节 (identity: 空; restore: flush 残留 + 终止符). 上游错误 /
+    /// 客户端断开也调用 — 严格的 OpenAI 客户端需要 [DONE] 终止符才不 hang.
+    fn finish_tail(&mut self) -> Bytes;
+}
+
+/// 字节透传管道 (无 Redact, byte-exact).
+struct PassthroughPipe;
+
+impl ChunkPipeline for PassthroughPipe {
+    fn transform(&mut self, chunk: &Bytes) -> Option<Bytes> {
+        Some(chunk.clone()) // Bytes clone 是 ref-count, 无拷贝.
+    }
+    fn finish_tail(&mut self) -> Bytes {
+        Bytes::new()
+    }
+}
+
+/// IR restore 管道: egress SSE → IR 事件 → restore (mock→real) → ingress SSE.
+struct RestorePipe {
+    translate: crate::codec::stream::StreamTranslate,
+}
+
+impl ChunkPipeline for RestorePipe {
+    fn transform(&mut self, chunk: &Bytes) -> Option<Bytes> {
+        let out = self.translate.feed(chunk);
+        (!out.is_empty()).then(|| Bytes::from(out))
+    }
+    fn finish_tail(&mut self) -> Bytes {
+        Bytes::from(self.translate.finish())
+    }
+}
+
+// ─── 流式扇出共享骨架 ────────────────────────────────────────────────────────
+
+/// 流式扇出骨架的固定上下文 (差异部分 — pipe / finalize 闭包 — 单独传).
+struct FanoutStreamCtx {
+    dag: ConversationDag,
+    record_id: uuid::Uuid,
+    started: Instant,
+    /// 供 record 用的响应 headers (已脱敏前 clone; 原始 headers 归客户端响应构造).
+    resp_headers_for_record: HeaderMap,
+    status_u16: u16,
+    /// record 的 streamed 标志 (restore 路径恒 true).
+    streamed: bool,
+    stream_idle_timeout: Option<std::time::Duration>,
+}
+
+/// 两条流式扇出路径的共享骨架: spawn task 内的 chunk 循环 + 记录 + 收尾.
+///
+/// 共享 (逐行同构, 历史 bug 修一处即两处生效):
+/// next_chunk 超时保护循环 → pipe.transform (空输出跳过) → tx.send (失败 =
+/// ERR_CLIENT_DISCONNECTED break) → recorder.push_record → parsed_sync.feed
+/// (未 overflow 时) → 错误分支 (ERR label + warn + send Err + break) →
+/// pipe.finish_tail 发送 → elapsed → finalize 闭包 → attach_response.
+///
+/// 差异 (闭包注入):
+/// - `pipe`: chunk 变换 (透传 / restore).
+/// - `finalize_parsed`: 最终 parsed view (流式 ParsedSync 快照 / 非流式一次性 parse).
+/// - `finalize_body`: record 的 raw_resp_body (banner / 空 / utf8_view 策略).
+async fn fanout_stream_task(
+    ctx: FanoutStreamCtx,
+    upstream_resp: reqwest::Response,
+    tx: mpsc::Sender<Result<Bytes, std::io::Error>>,
+    parsed_sync: Option<ParsedSync>,
+    mut pipe: impl ChunkPipeline + Send + 'static,
+    finalize_parsed: impl FnOnce(Option<ParsedSync>, &RecordAccumulator) -> Option<serde_json::Value>
+    + Send
+    + 'static,
+    finalize_body: impl FnOnce(&RecordAccumulator) -> String + Send + 'static,
+) {
+    let FanoutStreamCtx {
+        dag,
+        record_id,
+        started,
+        resp_headers_for_record,
+        status_u16,
+        streamed,
+        stream_idle_timeout,
+    } = ctx;
+
+    let mut stream = upstream_resp.bytes_stream();
+    let mut recorder = RecordAccumulator::new();
+    let mut parsed_sync = parsed_sync;
+
+    while let Some(chunk) = next_chunk(&mut stream, stream_idle_timeout, &record_id).await {
+        match chunk {
+            Ok(b) => {
+                // 先 send 后 acc: 让客户端反向压力尽早传到上游.
+                if let Some(out) = pipe.transform(&b)
+                    && tx.send(Ok(out)).await.is_err()
+                {
+                    recorder.set_error(ERR_CLIENT_DISCONNECTED);
+                    break;
+                }
+                // record 累积上游原始字节 (LLM 视角; restore 路径同 — 与 transform 喂同一份 b).
+                recorder.push_record(&b, record_id);
+                // ParsedSync 累积 (未 overflow 时).
+                if !recorder.overflow
+                    && let Some(ps) = parsed_sync.as_mut()
+                {
+                    ps.feed(&b);
+                }
+            }
+            Err(e) => {
+                let err_label = super::recorder::stream_err_label(&e);
+                warn!(%record_id, error = %e, err = err_label, "upstream stream error mid-flight");
+                let _ = tx.send(Err(e)).await;
+                recorder.set_error(err_label);
+                break;
+            }
+        }
+    }
+    // 流末尾: 管道尾巴 (restore 模式 = flush 残留 + 终止符; 即便 upstream error 也要发,
+    // 否则严格的 OpenAI 客户端会 hang). 仅 tx.send 失败 (client disconnect) 时由 `let _` 吞掉.
+    let tail = pipe.finish_tail();
+    if !tail.is_empty() {
+        let _ = tx.send(Ok(tail)).await;
+    }
+
+    let elapsed = started.elapsed().as_millis() as u64;
+    let final_parsed = finalize_parsed(parsed_sync, &recorder);
+    let body = finalize_body(&recorder);
+    dag.attach_response(
+        record_id,
+        ResponseData {
+            resp_status: status_u16,
+            resp_headers: redact_headers(&resp_headers_for_record),
+            raw_resp_body: body,
+            parsed: final_parsed,
+            elapsed_ms: elapsed,
+            streamed,
+            resp_complete: recorder.complete(),
+            error: recorder.error_kind,
+            ..Default::default()
+        },
+    );
+}
+
 /// 流式字节扇出: 把上游 SSE 流式转发给客户端, 同时 (若有 codec) 用 StreamScan
 /// 累积 parsed view 到 DAG. 无 redact, 保持 byte-exact + 流式 UX.
 ///
@@ -62,91 +216,67 @@ pub(crate) async fn fan_out_streaming(
     let resp_headers_for_record = resp_headers.clone();
     let status_u16 = resp_status.as_u16();
 
-    tokio::spawn(async move {
-        let mut stream = upstream_resp.bytes_stream();
-        let mut recorder = RecordAccumulator::new();
-        // ParsedSync: 仅对流式响应启用 (非流式是单个 JSON, 不是 SSE).
-        // 非流式响应的 parsed 在流结束后一次性计算.
-        let mut parsed_sync = if streamed {
-            codec_proto.map(|cp| ParsedSync::new(cp, dag.clone(), record_id))
-        } else {
-            None
-        };
+    // ParsedSync: 仅对流式响应启用 (非流式是单个 JSON, 不是 SSE).
+    // 非流式响应的 parsed 在流结束后一次性计算.
+    let parsed_sync = if streamed {
+        codec_proto.map(|cp| ParsedSync::new(cp, dag.clone(), record_id))
+    } else {
+        None
+    };
 
-        while let Some(chunk) = next_chunk(&mut stream, stream_idle_timeout, &record_id).await {
-            match chunk {
-                Ok(b) => {
-                    if tx.send(Ok(b.clone())).await.is_err() {
-                        recorder.set_error(ERR_CLIENT_DISCONNECTED);
-                        break;
-                    }
-                    recorder.push_record(&b, record_id);
-                    // ParsedSync 累积 (未 overflow 时).
-                    if !recorder.overflow
-                        && let Some(ps) = parsed_sync.as_mut()
-                    {
-                        ps.feed(&b);
-                    }
-                }
-                Err(e) => {
-                    let err_label = super::recorder::stream_err_label(&e);
-                    warn!(%record_id, error = %e, err = err_label, "upstream stream error mid-flight");
-                    let _ = tx.send(Err(e)).await;
-                    recorder.set_error(err_label);
-                    break;
-                }
-            }
-        }
-        let elapsed = started.elapsed().as_millis() as u64;
-        // 最终 parsed: 流式用 ParsedSync 快照; 非流式一次性 codec parse.
-        let final_parsed = if streamed {
-            parsed_sync.map(|ps| ps.finalize())
-        } else if let Some(cp) = codec_proto {
-            let reader = cp.reader();
-            let writer = cp.writer();
-            let parsed = serde_json::from_slice::<serde_json::Value>(&recorder.acc)
-                .ok()
-                .and_then(|v| reader.read_response(&v).ok())
-                .map(|ir| writer.write_response(&ir));
-            // 视图正确性守卫 (同协议 fan_out 路径): parsed 派生与 SSOT 在同一作用域内,
-            // 派生源 drift 风险低; 此处主要抽查 codec writer→reader 的 model 字段对称性
-            // (reader/writer 来自同一 codec, 守卫等价于 codec 内部 round-trip 测试的运行时抽查).
-            #[cfg(feature = "consistency-check")]
-            assert_resp_parsed_matches_source_nonstream(
-                parsed.as_ref(),
-                &recorder.acc,
-                reader.as_ref(),
-            );
-            parsed
-        } else {
-            None
-        };
-        let body = if recorder.overflow {
-            super::TRUNCATED_BANNER.to_string()
-        } else if streamed && (200..300).contains(&status_u16) {
-            // 2xx 流式成功响应: 不保留原始 SSE 字节 (骨架开销大, parsed view 已覆盖语义内容).
-            // 注: recorder.acc 仍累积了原始字节 (最大 32 MiB) 但此处丢弃. 见
-            // RecordAccumulator 文档 "内存开销" 段 (followup: 分片存储优化).
-            String::new()
-        } else {
-            // 非流式响应保留原始 body (raw view 可用, 且 body 通常不大).
-            utf8_view(&recorder.acc)
-        };
-        dag.attach_response(
+    tokio::spawn(fanout_stream_task(
+        FanoutStreamCtx {
+            dag,
             record_id,
-            ResponseData {
-                resp_status: status_u16,
-                resp_headers: redact_headers(&resp_headers_for_record),
-                raw_resp_body: body,
-                parsed: final_parsed,
-                elapsed_ms: elapsed,
-                streamed,
-                resp_complete: recorder.complete(),
-                error: recorder.error_kind,
-                ..Default::default()
-            },
-        );
-    });
+            started,
+            resp_headers_for_record,
+            status_u16,
+            streamed,
+            stream_idle_timeout,
+        },
+        upstream_resp,
+        tx,
+        parsed_sync,
+        PassthroughPipe,
+        move |parsed_sync, recorder| {
+            // 最终 parsed: 流式用 ParsedSync 快照; 非流式一次性 codec parse.
+            if streamed {
+                parsed_sync.map(|ps| ps.finalize())
+            } else if let Some(cp) = codec_proto {
+                let reader = cp.reader();
+                let writer = cp.writer();
+                let parsed = serde_json::from_slice::<serde_json::Value>(&recorder.acc)
+                    .ok()
+                    .and_then(|v| reader.read_response(&v).ok())
+                    .map(|ir| writer.write_response(&ir));
+                // 视图正确性守卫 (同协议 fan_out 路径): parsed 派生与 SSOT 在同一作用域内,
+                // 派生源 drift 风险低; 此处主要抽查 codec writer→reader 的 model 字段对称性
+                // (reader/writer 来自同一 codec, 守卫等价于 codec 内部 round-trip 测试的运行时抽查).
+                #[cfg(feature = "consistency-check")]
+                assert_resp_parsed_matches_source_nonstream(
+                    parsed.as_ref(),
+                    &recorder.acc,
+                    reader.as_ref(),
+                );
+                parsed
+            } else {
+                None
+            }
+        },
+        move |recorder| {
+            if recorder.overflow {
+                super::TRUNCATED_BANNER.to_string()
+            } else if streamed && (200..300).contains(&status_u16) {
+                // 2xx 流式成功响应: 不保留原始 SSE 字节 (骨架开销大, parsed view 已覆盖语义内容).
+                // 注: recorder.acc 仍累积了原始字节 (最大 32 MiB) 但此处丢弃. 见
+                // RecordAccumulator 文档 "内存开销" 段 (followup: 分片存储优化).
+                String::new()
+            } else {
+                // 非流式响应保留原始 body (raw view 可用, 且 body 通常不大).
+                utf8_view(&recorder.acc)
+            }
+        },
+    ));
 
     let body = Body::from_stream(ReceiverStream::new(rx));
     let mut resp = Response::new(body);
@@ -290,85 +420,50 @@ pub(crate) async fn fan_out_streaming_with_restore(
     redaction_map: RedactionMap,
     stream_idle_timeout: Option<std::time::Duration>,
 ) -> Result<Response<Body>, AppError> {
-    use crate::codec::stream::StreamTranslate;
-
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(32);
     let resp_headers_for_record = resp_headers.clone();
     let status_u16 = resp_status.as_u16();
 
-    tokio::spawn(async move {
-        // 同协议 + restore 模式: ingress == egress, 但 IR re-serialize 用于 restore.
-        // restore hook 由本层 (proxy) 注入 — codec::stream 不依赖 redact (解环 #145).
-        let mut translate = StreamTranslate::new_same_proto_restore(
-            codec_proto,
-            Box::new(crate::redact::StreamingRestorerSet::new(redaction_map)),
-        );
-        // ParsedSync: 累积 parsed view (LLM 视角, 含 mock, 与 record 语义一致).
-        // 喂的是上游原始字节 (与 translate.feed 同一份 b), ParsedSync 内部用 codec reader 解析.
-        let mut parsed_sync = ParsedSync::new(codec_proto, dag.clone(), record_id);
-        let mut stream = upstream_resp.bytes_stream();
-        let mut recorder = RecordAccumulator::new();
+    // 同协议 + restore 模式: ingress == egress, 但 IR re-serialize 用于 restore.
+    // restore hook 由本层 (proxy) 注入 — codec::stream 不依赖 redact (解环 #145).
+    let translate = crate::codec::stream::StreamTranslate::new_same_proto_restore(
+        codec_proto,
+        Box::new(crate::redact::StreamingRestorerSet::new(redaction_map)),
+    );
+    // ParsedSync: 累积 parsed view (LLM 视角, 含 mock, 与 record 语义一致).
+    // 喂的是上游原始字节 (与 pipe.transform 同一份 b), ParsedSync 内部用 codec reader 解析.
+    let parsed_sync = ParsedSync::new(codec_proto, dag.clone(), record_id);
 
-        while let Some(chunk) = next_chunk(&mut stream, stream_idle_timeout, &record_id).await {
-            match chunk {
-                Ok(b) => {
-                    // 喂给 StreamTranslate, 得到 restore 后的字节.
-                    let restored = translate.feed(&b);
-                    if !restored.is_empty() && tx.send(Ok(Bytes::from(restored))).await.is_err() {
-                        recorder.set_error(ERR_CLIENT_DISCONNECTED);
-                        break;
-                    }
-                    // record 累积上游原始字节 (LLM 视角, 含 mock).
-                    recorder.push_record(&b, record_id);
-                    // ParsedSync 累积 (未 overflow 时).
-                    if !recorder.overflow {
-                        parsed_sync.feed(&b);
-                    }
-                }
-                Err(e) => {
-                    let err_label = super::recorder::stream_err_label(&e);
-                    warn!(%record_id, error = %e, err = err_label, "upstream stream error mid-flight");
-                    let _ = tx.send(Err(e)).await;
-                    recorder.set_error(err_label);
-                    break;
-                }
-            }
-        }
-        // 流末尾: 让 StreamTranslate 输出剩余 buffered 字节 + 终止符.
-        // 即便 upstream error 也要发 (含 error event + [DONE]), 否则严格的 OpenAI 客户端会 hang.
-        // 仅 tx.send 失败 (client disconnect) 时跳过.
-        let tail = translate.finish();
-        if !tail.is_empty() {
-            let _ = tx.send(Ok(Bytes::from(tail))).await;
-        }
-
-        let elapsed = started.elapsed().as_millis() as u64;
-        // 最终 parsed 快照. 即使 error_kind (client disconnect / upstream error),
-        // 也保留截至断流时的累积内容 — 用户能看到部分响应比看到空白更有价值.
-        // (overflow 时同理: 截至Overflow前的内容比 truncate banner 更有用.)
-        let final_parsed = parsed_sync.finalize();
-        let body = if recorder.overflow {
-            super::TRUNCATED_BANNER.to_string()
-        } else {
-            // 此路径仅用于 2xx 成功响应 (非 2xx 走 fan_out_buffered_ir).
-            // 2xx 流式成功响应不保留原始 SSE 字节 (parsed view 已覆盖语义内容).
-            String::new()
-        };
-        dag.attach_response(
+    tokio::spawn(fanout_stream_task(
+        FanoutStreamCtx {
+            dag,
             record_id,
-            ResponseData {
-                resp_status: status_u16,
-                resp_headers: redact_headers(&resp_headers_for_record),
-                raw_resp_body: body,
-                parsed: Some(final_parsed),
-                elapsed_ms: elapsed,
-                streamed: true,
-                resp_complete: recorder.complete(),
-                error: recorder.error_kind,
-                ..Default::default()
-            },
-        );
-    });
+            started,
+            resp_headers_for_record,
+            status_u16,
+            streamed: true,
+            stream_idle_timeout,
+        },
+        upstream_resp,
+        tx,
+        Some(parsed_sync),
+        RestorePipe { translate },
+        move |parsed_sync, _recorder| {
+            // 最终 parsed 快照. 即使 error_kind (client disconnect / upstream error),
+            // 也保留截至断流时的累积内容 — 用户能看到部分响应比看到空白更有价值.
+            // (overflow 时同理: 截至 Overflow 前的内容比 truncate banner 更有用.)
+            Some(parsed_sync.expect("restore 路径恒有 ParsedSync").finalize())
+        },
+        move |recorder| {
+            if recorder.overflow {
+                super::TRUNCATED_BANNER.to_string()
+            } else {
+                // 此路径仅用于 2xx 成功响应 (非 2xx 走 fan_out_buffered_ir).
+                // 2xx 流式成功响应不保留原始 SSE 字节 (parsed view 已覆盖语义内容).
+                String::new()
+            }
+        },
+    ));
 
     let body = Body::from_stream(ReceiverStream::new(rx));
     let mut resp = Response::new(body);
