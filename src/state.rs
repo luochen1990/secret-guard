@@ -28,11 +28,9 @@ pub struct AppState {
     pub providers: ProviderTable,
     pub dag: ConversationDag,
     pub secrets: SecretTable,
-    /// API key 存储 (总是 Some; server.rs 无条件构造, 与 auth.enabled 无关).
-    /// 字段类型保留 Option 仅为兼容 tests/integration.rs 的简化构造 (None 写法),
-    /// handler 通过 require_store() 解包. 见 src/web/api/apikeys.rs 头部注释.
-    #[allow(unused)]
-    pub api_keys: Option<ApiKeyStore>,
+    /// API key 存储 (server.rs 无条件构造, 与 auth.enabled 无关 — 单用户模式下
+    /// WebUI 仍可签发/管理 key). 设计详见 `src/web/api/apikeys.rs` 头部注释.
+    pub api_keys: ApiKeyStore,
     /// 服务端认证是否启用 (来自 static config `[auth] enabled`). 与 ApiKeyStore
     /// 的"无条件构造"正交: store 总存在, 但 forwarding 路径的 require_api_key
     /// middleware 仅在 auth_enabled = true 时挂载. WebUI 用此标志区分 key 的

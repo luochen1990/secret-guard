@@ -309,7 +309,7 @@ pub async fn serve(
         providers: provider_table,
         dag,
         secrets: secret_table,
-        api_keys: Some(api_keys.clone()),
+        api_keys: api_keys.clone(),
         auth_enabled: auth_config.enabled,
         global_mock_prefix: Arc::from(global_mock_prefix),
         on_probe_exhausted,

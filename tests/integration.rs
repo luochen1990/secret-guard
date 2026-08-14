@@ -33,6 +33,19 @@ fn tmp_state_path(label: &str) -> std::path::PathBuf {
     path
 }
 
+/// 构造空 ApiKeyStore (与 server.rs::serve 的真实构造路径一致, 见 #146 顺带项 b:
+/// AppState.api_keys 改裸类型后, 测试不再走 `None` 简化写法).
+fn test_api_key_store() -> secret_guard::auth::ApiKeyStore {
+    secret_guard::auth::ApiKeyStore::new(
+        &[],
+        std::path::Path::new("."),
+        vec![],
+        std::collections::HashSet::new(),
+        tmp_state_path("api-keys"),
+        std::sync::Arc::new(parking_lot::Mutex::new(())),
+    )
+}
+
 async fn spawn_mock_upstream() -> mockito::ServerGuard {
     mockito::Server::new_async().await
 }
@@ -123,7 +136,7 @@ async fn spawn_proxy_static_dynamic(
         providers: provider_table,
         dag: records,
         secrets,
-        api_keys: None,
+        api_keys: test_api_key_store(),
         auth_enabled: false,
         global_mock_prefix: std::sync::Arc::from(""),
         on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,
@@ -160,7 +173,7 @@ async fn spawn_proxy_with_prefix(global_mock_prefix: &str) -> String {
         providers: provider_table,
         dag: ConversationDag::new(64, 500, 1),
         secrets,
-        api_keys: None,
+        api_keys: test_api_key_store(),
         auth_enabled: false,
         global_mock_prefix: std::sync::Arc::from(global_mock_prefix),
         on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,
@@ -201,7 +214,7 @@ async fn spawn_proxy_with_probe_mode(
         providers: provider_table,
         dag: ConversationDag::new(64, 500, 1),
         secrets,
-        api_keys: None,
+        api_keys: test_api_key_store(),
         auth_enabled: false,
         global_mock_prefix: std::sync::Arc::from(""),
         on_probe_exhausted: mode,
@@ -1953,7 +1966,7 @@ async fn spawn_proxy_with_timeouts(
         providers: provider_table,
         dag: dag.clone(),
         secrets: test_secret_table(),
-        api_keys: None,
+        api_keys: test_api_key_store(),
         auth_enabled: false,
         global_mock_prefix: std::sync::Arc::from(""),
         on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,
@@ -3334,7 +3347,7 @@ async fn cross_table_shared_state_no_lost_update() {
         providers: provider_table,
         dag: ConversationDag::new(64, 500, 1),
         secrets: secret_table,
-        api_keys: None,
+        api_keys: test_api_key_store(),
         auth_enabled: false,
         global_mock_prefix: std::sync::Arc::from(""),
         on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,

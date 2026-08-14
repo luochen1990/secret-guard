@@ -32,7 +32,6 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 
-use crate::auth::ApiKeyStore;
 use crate::auth::apikey::ApiKeySummary;
 use crate::state::{AppState, NO_STORE};
 
@@ -58,17 +57,9 @@ pub(crate) struct ListApiKeysResponse {
     pub auth_enabled: bool,
 }
 
-/// 拿到 ApiKeyStore. 不存在说明内部装配错误 (server.rs 应总是注入), 返回 500.
-fn require_store(state: &AppState) -> Result<&ApiKeyStore, ApiError> {
-    state
-        .api_keys
-        .as_ref()
-        .ok_or_else(|| ApiError::internal("ApiKeyStore missing in AppState (server misassembly)"))
-}
-
 /// 列出所有 key (静态 + 动态), 不按用户过滤. 响应附带 `auth_enabled` (见 struct 注释).
 pub async fn list_api_keys(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
-    let api_keys = require_store(&state)?;
+    let api_keys = &state.api_keys;
     Ok((
         NO_STORE,
         Json(ListApiKeysResponse {
@@ -82,7 +73,7 @@ pub async fn create_api_key(
     State(state): State<AppState>,
     Json(payload): Json<CreateApiKeyRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let api_keys = require_store(&state)?;
+    let api_keys = &state.api_keys;
     // tenant_id / created_by 用 "admin" 占位 — 不隔离, 字段仅作展示和审计保留.
     let issued = api_keys
         .issue("admin", "admin", &payload.label)
@@ -95,7 +86,7 @@ pub async fn delete_api_key(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let api_keys = require_store(&state)?;
+    let api_keys = &state.api_keys;
     // 提前检查 static: 把 revoke 内部的 anyhow::bail! 映射为 409 conflict
     // (否则 from_any 会把它当作 500 internal error).
     if crate::auth::apikey::is_static(&id) {
@@ -119,7 +110,7 @@ pub async fn toggle_api_key(
     Path(id): Path<String>,
     Json(payload): Json<ToggleApiKeyRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let api_keys = require_store(&state)?;
+    let api_keys = &state.api_keys;
     // 用 store 实际落库的值响应 (严格反映服务端状态, 而非回声请求).
     let disabled = api_keys
         .set_disabled(&id, payload.disabled)
