@@ -25,7 +25,7 @@ use crate::provider::{Protocol, Provider};
 
 use super::auth::apply_provider_auth;
 use super::helpers::{build_upstream_url, is_streaming, sanitize_request_headers, utf8_view};
-use super::record::{build_call_event, parse_request_ir, redact_and_derive};
+use super::recorder::{build_call_event, parse_request_ir, redact_and_derive};
 
 /// 同协议转发: 字节透传 (无 redact) 或 IR 路径 (启用 redact).
 ///
@@ -158,7 +158,7 @@ pub(crate) async fn same_proto_forward(
     debug!(%record_id, method = %parts.method, url = %upstream_url, "forwarding redacted same-proto request");
 
     // 9. 发送到上游.
-    let upstream_resp = match super::record::send_upstream_or_fail(
+    let upstream_resp = match super::recorder::send_upstream_or_fail(
         &state.dag,
         record_id,
         started,
@@ -269,7 +269,7 @@ async fn same_proto_passthrough(
 
     debug!(%record_id, method = %parts.method, url = %upstream_url, "forwarding (passthrough)");
 
-    let upstream_resp = match super::record::send_upstream_or_fail(
+    let upstream_resp = match super::recorder::send_upstream_or_fail(
         &state.dag,
         record_id,
         started,

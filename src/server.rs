@@ -46,7 +46,7 @@
 //! | `MAX_ERROR_MSG_LEN` | 4 KiB | `proxy/mod.rs` | 错误响应回放 message 截断 | 4 KiB × 失败请求数 (常量小) |
 //! | `C5_INTERNAL_RETRIES` | 10_000 | `mock.rs` | mock 候选生成内部重试链 (safety bound, 防 C5 退化为概率) | CPU 限界, 不占内存 |
 //! | `MOCK_PROBE_LIMIT` | 2^20 (prod) / 512 (test) | `redact.rs` | gen_mock_for_ir 的 probing 上限 | CPU 限界, 不占内存 |
-//! | `PARSED_SYNC_INTERVAL` | 500 ms | `proxy/record.rs` | 流式 parsed view 节流写入间隔 (UX 与锁竞争折中) | 时间常量, 不占内存 |
+//! | `PARSED_SYNC_INTERVAL` | 500 ms | `proxy/recorder.rs` | 流式 parsed view 节流写入间隔 (UX 与锁竞争折中) | 时间常量, 不占内存 |
 //! | `records_capacity` (ServerConfig) | 1024 (默认, 用户可配) | `config.rs::ServerConfig` → `main.rs` → `serve()` → `ConversationDag::new(max_nodes, ...)` | DAG node 总数上限 (FIFO 淘汰) | ~每 node 几 KB (request/response body + metadata) × records_capacity |
 //! | `max_sessions` (硬编码 500) | 500 | `server.rs::serve()` → `ConversationDag::new(_, 500, _)` → `dag::DagInner::max_sessions` | session 总数上限 (安全阀, 防 fork 爆炸) | session 元数据 × 500 (常量小) |
 //! | `min_sessions` (硬编码 1) | 1 | 同上 → `dag::DagInner::min_sessions` | session 数下限 (保底, 避免界面清空) | 下限, 非上界 |

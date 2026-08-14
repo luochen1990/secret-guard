@@ -59,7 +59,7 @@
 //!   (进程级共享状态 `AppState` 在顶层 `crate::state`, 上移见 #145 偏差 3.)
 //! - `helpers`: HTTP header / URL / 字符串工具 (无业务语义).
 //! - `auth`: Provider 鉴权注入.
-//! - `record`: DAG record 构造 + 视图守卫 + 响应累积器.
+//! - `recorder`: DAG record 构造 + 视图守卫 + 响应累积器.
 //! - `same_proto`: 同协议转发 (字节透传 / IR redact).
 //! - `cross_proto`: 跨协议 codec 翻译.
 //! - `fan_out`: 三条响应扇出路径.
@@ -68,7 +68,7 @@ mod auth;
 mod cross_proto;
 mod fan_out;
 mod helpers;
-mod record;
+mod recorder;
 mod same_proto;
 
 use std::time::Instant;

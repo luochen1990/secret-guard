@@ -2147,7 +2147,7 @@
 
     // 判断 error 字符串是否表示客户端中断 (proxy 注入的固定标记).
     // 与真实上游错误区分: 客户端中断是正常使用路径, 不应渲染为红色 ERR.
-    // SSOT: proxy/record.rs::ERR_CLIENT_DISCONNECTED = "client disconnected".
+    // SSOT: proxy/recorder.rs::ERR_CLIENT_DISCONNECTED = "client disconnected".
     function isClientDisconnect(errorStr) {
       return errorStr === 'client disconnected';
     }

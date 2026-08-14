@@ -35,8 +35,8 @@ use crate::redact::RedactionMap;
 
 use super::helpers::{build_response_headers, redact_headers, utf8_view};
 #[cfg(feature = "consistency-check")]
-use super::record::assert_resp_parsed_matches_source_nonstream;
-use super::record::{
+use super::recorder::assert_resp_parsed_matches_source_nonstream;
+use super::recorder::{
     ERR_CLIENT_DISCONNECTED, ERR_RESP_CAP_EXCEEDED, ERR_STREAM_IDLE_TIMEOUT, ParsedSync,
     RecordAccumulator, next_chunk,
 };
@@ -89,7 +89,7 @@ pub(crate) async fn fan_out_streaming(
                     }
                 }
                 Err(e) => {
-                    let err_label = super::record::stream_err_label(&e);
+                    let err_label = super::recorder::stream_err_label(&e);
                     warn!(%record_id, error = %e, err = err_label, "upstream stream error mid-flight");
                     let _ = tx.send(Err(e)).await;
                     recorder.set_error(err_label);
@@ -194,7 +194,7 @@ pub(crate) async fn fan_out_buffered_ir(
                 recorder.acc.extend_from_slice(&b);
             }
             Err(e) => {
-                recorder.set_error(super::record::stream_err_label(&e));
+                recorder.set_error(super::recorder::stream_err_label(&e));
                 break;
             }
         }
@@ -326,7 +326,7 @@ pub(crate) async fn fan_out_streaming_with_restore(
                     }
                 }
                 Err(e) => {
-                    let err_label = super::record::stream_err_label(&e);
+                    let err_label = super::recorder::stream_err_label(&e);
                     warn!(%record_id, error = %e, err = err_label, "upstream stream error mid-flight");
                     let _ = tx.send(Err(e)).await;
                     recorder.set_error(err_label);

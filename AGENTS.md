@@ -127,9 +127,9 @@
 3. **原始数据是核心功能的真相**: secret-guard 的核心职责是转发 + Redact 的字节准确性.
    任何"派生视图更优雅"的诱惑都不能凌驾于数据准确性之上.
 
-已实践位置: `redactions` 字段从 RedactionMap 派生 (`proxy/record.rs::assert_redactions_match_map`)、
-`preview`/`model` 从 `req_body_raw` 派生 (`proxy/record.rs::assert_preview_model_match_source`)、
-`resp_parsed` (非流式) 从上游响应字节经 codec reader 派生 (`proxy/record.rs::assert_resp_parsed_matches_source_nonstream`)、
+已实践位置: `redactions` 字段从 RedactionMap 派生 (`proxy/recorder.rs::assert_redactions_match_map`)、
+`preview`/`model` 从 `req_body_raw` 派生 (`proxy/recorder.rs::assert_preview_model_match_source`)、
+`resp_parsed` (非流式) 从上游响应字节经 codec reader 派生 (`proxy/recorder.rs::assert_resp_parsed_matches_source_nonstream`)、
 `session.title` 从 root node preview 派生 (`dag/mod.rs::assert_session_title_matches_root_preview`)、
 `resp_parsed` (流式) 从 StreamScan 累积 (`proxy/fan_out.rs`, Phase A 已删除原始 SSE 字节, 派生与源物理分离, 暂不守卫).
 后续 Phase B 删除 parent.response 时必须走此流程.

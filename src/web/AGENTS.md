@@ -110,7 +110,7 @@ selected 游标 = `(session_id, latest_round, response_length)`:
 ### ForwardRecord.redactions
 
 `Vec<(mock, secret_id)>` — 从 `redact_ir` 产出的 `RedactionMap` SSOT 派生
-(见 `proxy/record.rs::derive_redactions`). WebUI 的 mock 高亮和 "命中" 筛选都基于此字段,
+(见 `proxy/recorder.rs::derive_redactions`). WebUI 的 mock 高亮和 "命中" 筛选都基于此字段,
 **永不**在前端重新计算, 避免前后端漂移. 不含真实 secret value, 可安全暴露.
 
 ### 安全姿态

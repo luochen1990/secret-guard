@@ -27,8 +27,8 @@ use crate::provider::{Protocol, Provider};
 use super::auth::apply_provider_auth;
 use super::helpers::{build_response_headers, redact_headers, sanitize_request_headers, utf8_view};
 #[cfg(feature = "consistency-check")]
-use super::record::assert_resp_parsed_matches_source_nonstream;
-use super::record::{build_call_event, parse_request_ir, redact_and_derive};
+use super::recorder::assert_resp_parsed_matches_source_nonstream;
+use super::recorder::{build_call_event, parse_request_ir, redact_and_derive};
 
 /// 跨协议转发: ingress 协议 → IR → egress 协议, 上游响应反向翻译.
 ///
@@ -186,7 +186,7 @@ pub(crate) async fn cross_proto_forward(
     );
 
     // 13. 发送到上游.
-    let upstream_resp = match super::record::send_upstream_or_fail(
+    let upstream_resp = match super::recorder::send_upstream_or_fail(
         &state.dag,
         record_id,
         started,
@@ -214,7 +214,7 @@ pub(crate) async fn cross_proto_forward(
         let mut exceeded = false;
         let mut stream_err: Option<std::io::Error> = None;
         while let Some(chunk) =
-            super::record::next_chunk(&mut stream, state.upstream_timeouts.stream_idle, &record_id)
+            super::recorder::next_chunk(&mut stream, state.upstream_timeouts.stream_idle, &record_id)
                 .await
         {
             match chunk {
@@ -232,7 +232,7 @@ pub(crate) async fn cross_proto_forward(
             }
         }
         if let Some(e) = stream_err {
-            let err_label = super::record::stream_err_label(&e);
+            let err_label = super::recorder::stream_err_label(&e);
             let elapsed = started.elapsed().as_millis() as u64;
             warn!(%record_id, error = %e, err = err_label, "cross-proto upstream stream error mid-flight");
             state.dag.attach_response(
@@ -249,7 +249,7 @@ pub(crate) async fn cross_proto_forward(
             );
             // 区分 idle timeout (504) 与其他 stream error (502), 与同协议路径一致.
             // 复用已算出的 err_label (stream_err_label 是 timeout 判定的 SSOT).
-            return Err(if err_label == super::record::ERR_STREAM_IDLE_TIMEOUT {
+            return Err(if err_label == super::recorder::ERR_STREAM_IDLE_TIMEOUT {
                 AppError::UpstreamTimeout(e.to_string())
             } else {
                 AppError::Upstream(e.to_string())

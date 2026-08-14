@@ -678,9 +678,9 @@
 
 | 派生字段 | 来源 | 守卫状态 |
 |---|---|---|
-| `redactions` | RedactionMap | ✅ `proxy/record.rs::assert_redactions_match_map` |
-| `preview` / `model` | extract_preview_and_model | ✅ `proxy/record.rs::assert_preview_model_match_source` ¹ |
-| `resp_parsed` (非流式) | reader.read_response | ✅ `proxy/record.rs::assert_resp_parsed_matches_source_nonstream` |
+| `redactions` | RedactionMap | ✅ `proxy/recorder.rs::assert_redactions_match_map` |
+| `preview` / `model` | extract_preview_and_model | ✅ `proxy/recorder.rs::assert_preview_model_match_source` ¹ |
+| `resp_parsed` (非流式) | reader.read_response | ✅ `proxy/recorder.rs::assert_resp_parsed_matches_source_nonstream` |
 | `resp_parsed` (流式) | StreamScan snapshot | ⏳ Phase A 已删除原始 SSE 字节, 派生与源物理分离, 暂无法守卫 |
 | `req_delta_messages` | extract_delta_messages_from_raw (derive.rs) | (每次 timeline 请求重算, 无 drift 风险) |
 | `session.title` | find_root_title | ✅ `dag/mod.rs::assert_session_title_matches_root_preview` |
