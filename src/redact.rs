@@ -82,7 +82,7 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::codec::ir::{IrBlock, IrDelta, IrRequest, IrResponse, IrTool};
+use crate::codec::ir::{IrBlock, IrRequest, IrResponse, IrTool};
 use crate::config::OnProbeExhausted;
 use crate::secrets::SecretEntry;
 
@@ -408,24 +408,10 @@ pub fn restore_ir_response(ir: &mut IrResponse, map: &RedactionMap) {
 
 // ─── StreamingRestorer: sliding window restore ──────────────────────────────
 
-/// Block delta 类型标识, 让 [`StreamingRestorer`] 在 flush 时能恢复正确的 IrDelta variant.
-///
-/// 一个 block 的生命周期内 (BlockStart .. BlockStop) delta 类型固定不变,
-/// restorer 每次 push 都更新 last_kind, flush 时按 last_kind 包装返回.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeltaKind {
-    Text,
-    InputJson,
-}
-
-impl DeltaKind {
-    pub fn to_ir_delta(self, s: String) -> IrDelta {
-        match self {
-            DeltaKind::Text => IrDelta::TextDelta(s),
-            DeltaKind::InputJson => IrDelta::InputJsonDelta(s),
-        }
-    }
-}
+// DeltaKind 已上移到 `codec::stream` (StreamRestoreHook 接口倒置的一部分, 见
+// #145 偏差 2: codec 不再 import redact, restore 能力由调用方注入). 这里 re-export
+// 保持 `redact::DeltaKind` 既有路径兼容 (redact 依赖 codec 是既定向下依赖).
+pub use crate::codec::stream::DeltaKind;
 
 /// Sliding-window mock→real restorer for streaming `IrStreamEvent`s.
 ///
@@ -561,6 +547,72 @@ impl StreamingRestorer {
             safe_end -= 1;
         }
         safe_end
+    }
+}
+
+// ─── StreamingRestorerSet: per-block restorer 集合 (codec StreamRestoreHook 实现) ──
+//
+// 接口倒置 (#145 偏差 2) 后, StreamTranslate 通过 `codec::stream::StreamRestoreHook`
+// trait 消费 restore 能力, 不再直接依赖本模块的类型. 本类型是 hook 的生产实现:
+// 持有 per-block-index 的独立 StreamingRestorer (block 间 mock 边界互不干扰),
+// 由 proxy/fan_out.rs 注入到 StreamTranslate::new_same_proto_restore.
+//
+// 历史: per-index HashMap + 时序编排原在 StreamTranslate 内 (restorers 字段),
+// hook 化后状态与编排随实现下沉到本模块, StreamTranslate 只驱动事件流.
+
+/// 按 block index 分片的 [`StreamingRestorer`] 集合, 实现
+/// [`crate::codec::stream::StreamRestoreHook`].
+///
+/// 每个 block index 惰性创建独立 restorer (首次 BlockDelta 时), BlockStop 时移除.
+pub struct StreamingRestorerSet {
+    map: RedactionMap,
+    restorers: HashMap<usize, StreamingRestorer>,
+}
+
+impl StreamingRestorerSet {
+    /// 构造. `map` 为空时所有 push 直接透传 (StreamingRestorer 空短路, 零开销).
+    pub fn new(map: RedactionMap) -> Self {
+        Self {
+            map,
+            restorers: HashMap::new(),
+        }
+    }
+}
+
+impl crate::codec::stream::StreamRestoreHook for StreamingRestorerSet {
+    fn restore_delta(&mut self, index: usize, kind: DeltaKind, s: String) -> String {
+        let r = self
+            .restorers
+            .entry(index)
+            .or_insert_with(|| StreamingRestorer::new(self.map.clone()));
+        r.set_kind(kind);
+        r.push(s)
+    }
+
+    fn flush_delta(&mut self, index: usize) -> (DeltaKind, String) {
+        match self.restorers.remove(&index) {
+            Some(mut r) => r.flush(),
+            // 未见过该 block (eg BlockStop 无前置 BlockDelta): 无残余, 默认 kind.
+            None => (DeltaKind::Text, String::new()),
+        }
+    }
+
+    fn flush_all(&mut self) -> Vec<(usize, DeltaKind, String)> {
+        let mut indices: Vec<usize> = self.restorers.keys().copied().collect();
+        // index 升序 emit, 避免违反客户端对 delta 时序的隐含假设
+        // (eg OpenAI tool_call arguments partial JSON parser 假设按 index 顺序到达).
+        indices.sort_unstable();
+        indices
+            .into_iter()
+            .filter_map(|i| {
+                let (kind, tail) = self.flush_delta(i);
+                (!tail.is_empty()).then_some((i, kind, tail))
+            })
+            .collect()
+    }
+
+    fn restore_inline(&mut self, s: &mut String) {
+        restore_str_inplace(s, &self.map);
     }
 }
 

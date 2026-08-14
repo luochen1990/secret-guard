@@ -104,5 +104,7 @@ response 路径的 2 个 property 标了 `#[ignore]`, 实现 L8 后启用.
 - **`proxy/`**: `dispatch` 根据 ingress/egress 协议是否一致 + 是否有 Redact,
   选择字节透传 / IR 路径 / 跨协议翻译. 详见 `src/proxy/mod.rs` 头部.
 - **`redact.rs`**: Redact/Restore 在 IR 层操作, 与 codec 同层, 两者自然组合
-  (跨协议翻译 + Redact 在同一 pipeline).
+  (跨协议翻译 + Redact 在同一 pipeline). 依赖方向: redact → codec (单向;
+  codec 不 import redact — 流式 restore 经 `stream::StreamRestoreHook` 接口倒置,
+  由 proxy 注入 `redact::StreamingRestorerSet` 实现, 见 #145 偏差 2).
 - **`dag` 模块**: DAG 节点存储 IrBlock, codec 的 IR 类型是 DAG 的内容寻址单元.

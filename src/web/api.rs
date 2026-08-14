@@ -28,12 +28,12 @@ use uuid::Uuid;
 
 use crate::config::{DeleteOutcome, OverrideMode, UpsertKind};
 use crate::dag::ResponseData;
+use crate::dto::{NodeDetail, NodeView};
 use crate::provider::{EffectiveProvider, Protocol, Provider};
 use crate::proxy::ProxyState;
 use crate::record::ForwardRecord;
 use crate::secrets::{EffectiveSecret, SecretCategory, SecretEntry};
 use crate::web::NO_STORE;
-use crate::dto::{NodeDetail, NodeView};
 
 // ─── CRUD 通用 helper (secret / provider 共享) ──────────────────────────────
 //

@@ -34,7 +34,7 @@ mod translate;
 use reassembler::SseReassembler;
 
 pub use scan::StreamScan;
-pub use translate::StreamTranslate;
+pub use translate::{DeltaKind, StreamRestoreHook, StreamTranslate};
 
 /// SSE 流终止符 sentinel (OpenAI 约定).
 pub const SSE_DONE_SENTINEL: &str = "[DONE]";
@@ -562,7 +562,12 @@ mod tests {
         use crate::redact::RedactionMap;
 
         let proto = Protocol::OpenAI;
-        let mut t = StreamTranslate::new_same_proto_restore(proto, RedactionMap::default());
+        let mut t = StreamTranslate::new_same_proto_restore(
+            proto,
+            Box::new(crate::redact::StreamingRestorerSet::new(
+                RedactionMap::default(),
+            )),
+        );
 
         let finish_chunk = serde_json::json!({
             "id": "x", "created": 0, "model": "gpt-4o",
@@ -595,7 +600,12 @@ mod tests {
         // 应该只产生一份 [DONE] 终止符 (finish() 时 emit_done=true).
         use crate::redact::RedactionMap;
         let proto = Protocol::Anthropic; // message_stop 在 Anthropic 是显式 event
-        let mut t = StreamTranslate::new_same_proto_restore(proto, RedactionMap::default());
+        let mut t = StreamTranslate::new_same_proto_restore(
+            proto,
+            Box::new(crate::redact::StreamingRestorerSet::new(
+                RedactionMap::default(),
+            )),
+        );
         let sse = concat!(
             "event: message_stop\n",
             "data: {\"type\":\"message_stop\"}\n\n",
@@ -627,7 +637,10 @@ mod tests {
         let mut map = crate::redact::RedactionMap::default();
         map.insert(real.to_string(), mock.to_string(), "id-test")
             .unwrap();
-        let mut t = StreamTranslate::new_same_proto_restore(Protocol::OpenAI, map);
+        let mut t = StreamTranslate::new_same_proto_restore(
+            Protocol::OpenAI,
+            Box::new(crate::redact::StreamingRestorerSet::new(map)),
+        );
 
         let sse1 = format!(
             r#"data: {{"id":"x","created":0,"model":"gpt-4o","choices":[{{"index":0,"delta":{{"content":"{chunk1_content}"}},"finish_reason":null}}]}}
@@ -962,14 +975,14 @@ mod tests {
             // 一次性 feed baseline.
             let mut whole = StreamTranslate::new_same_proto_restore(
                 Protocol::OpenAI,
-                RedactionMap::default(),
+                Box::new(crate::redact::StreamingRestorerSet::new(RedactionMap::default())),
             );
             let baseline: Vec<u8> = whole.feed(&full);
 
             // 任意切分点 feed.
             let mut chunked_t = StreamTranslate::new_same_proto_restore(
                 Protocol::OpenAI,
-                RedactionMap::default(),
+                Box::new(crate::redact::StreamingRestorerSet::new(RedactionMap::default())),
             );
             let mut chunked: Vec<u8> = Vec::new();
             let mut prev = 0usize;

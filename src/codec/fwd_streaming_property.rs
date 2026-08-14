@@ -157,7 +157,10 @@ fn run_same_proto_restore(
     upstream: &[u8],
     splits: &[usize],
 ) -> Vec<u8> {
-    let mut t = StreamTranslate::new_same_proto_restore(proto, map);
+    let mut t = StreamTranslate::new_same_proto_restore(
+        proto,
+        Box::new(crate::redact::StreamingRestorerSet::new(map)),
+    );
     feed_split_translator(&mut t, upstream, splits)
 }
 
@@ -956,7 +959,10 @@ fn prop_max_buf_abort_no_mock_leak_same_proto_restore() {
     let mock = "MOCKsecret".to_string();
     let map = build_redaction_map("sk-real-secret12345", &mock);
 
-    let mut t = StreamTranslate::new_same_proto_restore(Protocol::OpenAI, map);
+    let mut t = StreamTranslate::new_same_proto_restore(
+        Protocol::OpenAI,
+        Box::new(crate::redact::StreamingRestorerSet::new(map)),
+    );
 
     // 帧 1: 含 mock 的 text delta (restorer.push 走 sliding window, mock 被完整 restore,
     // buffer 残留 mock 之后的 "suffix" 安全内容).

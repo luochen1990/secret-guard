@@ -298,7 +298,11 @@ pub(crate) async fn fan_out_streaming_with_restore(
 
     tokio::spawn(async move {
         // 同协议 + restore 模式: ingress == egress, 但 IR re-serialize 用于 restore.
-        let mut translate = StreamTranslate::new_same_proto_restore(codec_proto, redaction_map);
+        // restore hook 由本层 (proxy) 注入 — codec::stream 不依赖 redact (解环 #145).
+        let mut translate = StreamTranslate::new_same_proto_restore(
+            codec_proto,
+            Box::new(crate::redact::StreamingRestorerSet::new(redaction_map)),
+        );
         // ParsedSync: 累积 parsed view (LLM 视角, 含 mock, 与 record 语义一致).
         // 喂的是上游原始字节 (与 translate.feed 同一份 b), ParsedSync 内部用 codec reader 解析.
         let mut parsed_sync = ParsedSync::new(codec_proto, dag.clone(), record_id);

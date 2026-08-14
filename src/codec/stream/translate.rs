@@ -12,7 +12,9 @@
 //! → ingress SSE bytes
 //! ```
 //!
-//! 同协议 + restore 模式下, BlockDelta 经 [`StreamingRestorer`] 处理跨 chunk mock 边界.
+//! 同协议 + restore 模式下, BlockDelta 经调用方注入的 [`StreamRestoreHook`] 处理跨
+//! chunk mock 边界 (hook 由 proxy 层注入, 让本模块不依赖 redact — 解除 codec ⇄ redact
+//! 模块级循环, 见 #145 偏差 2).
 //!
 //! # chunk-boundary
 //!
@@ -30,10 +32,62 @@ use super::reassembler::SseReassembler;
 use super::{SSE_DONE_FRAME, reframe_sse};
 use crate::codec::{
     Protocol, Reader, Writer,
-    ir::{IrStreamEvent, StreamDecodeState},
+    ir::{IrDelta, IrStreamEvent, StreamDecodeState},
 };
-use crate::redact::{DeltaKind, RedactionMap, StreamingRestorer, restore_str_inplace};
-use std::collections::HashMap;
+
+// ─── StreamRestoreHook: restore 能力的接口倒置 (codec 不依赖 redact) ──────────
+//
+// 历史上 StreamTranslate 直接 `use crate::redact::{StreamingRestorer, ...}`, 与
+// redact.rs `use crate::codec::ir::...` 构成模块级循环. Rust crate 内模块环合法,
+// 但 AGENTS.md 规划 "新增协议只需实现 Reader + Writer trait" — codec 是独立可复用件,
+// 这个环会让任何 codec 抽离都要把 StreamingRestorer 一起拖走. 这里把 restore 能力
+// 倒置为 trait, 由调用方 (proxy/fan_out.rs, 唯一生产调用点) 注入实现, codec::stream
+// 不再 import redact (ir.rs 本就零依赖, 是两者共同的纯类型下层).
+//
+// hook 自持 per-block 状态: index → 独立滑动窗口 (block 间 mock 边界互不干扰).
+// StreamTranslate 只负责时序编排 (BlockStop flush / MessageStop / finish 兜底).
+
+/// 流式 restore hook: 把流中 mock 片段还原为真实值, 由 proxy 层注入.
+///
+/// 契约 (由 `redact::StreamingRestorer` 实现, 行为对齐):
+/// - [`Self::restore_delta`]: 还原一段 block delta 内容. 实现持有 per-index 跨 chunk
+///   滑动窗口, 末尾 hold 字节直到能安全 emit. 返回空串表示当前内容全部 hold 在窗口内.
+/// - [`Self::flush_delta`]: block 终止时冲刷该 index 的窗口残余, 返回 `(kind, tail)`.
+///   `kind` 用于把 tail 包装回正确的 delta variant; 空串表示无残余.
+/// - [`Self::flush_all`]: 流终止 / MessageStop 兜底: 冲刷**所有** index 的残余,
+///   按 index 升序返回 (客户端假设 delta 按 index 顺序到达).
+/// - [`Self::restore_inline`]: 就地还原完整出现在单个 event 内的字符串
+///   (MessageDelta.stop_sequence / Error message; 无跨 chunk 边界问题).
+pub trait StreamRestoreHook: Send {
+    /// 还原一段 delta 内容 (跨 chunk 安全), 返回可安全 emit 的部分.
+    fn restore_delta(&mut self, index: usize, kind: DeltaKind, s: String) -> String;
+    /// 冲刷单个 block 的窗口残余 (BlockStop 时).
+    fn flush_delta(&mut self, index: usize) -> (DeltaKind, String);
+    /// 冲刷所有 block 的窗口残余 (MessageStop / finish 兜底), 按 index 升序.
+    fn flush_all(&mut self) -> Vec<(usize, DeltaKind, String)>;
+    /// 就地还原单 event 内的完整字符串 (无边界问题).
+    fn restore_inline(&mut self, s: &mut String);
+}
+
+/// block delta 的类型标识 (Text / InputJson), flush 时恢复正确的 IrDelta variant.
+///
+/// 历史上定义在 `redact::DeltaKind` 并由 codec 消费; 接口倒置后归属 codec 侧
+/// (hook 契约的一部分, 因 [`StreamRestoreHook::flush_delta`] 需要它包装返回值),
+/// redact 侧 re-export 保持既有路径兼容.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaKind {
+    Text,
+    InputJson,
+}
+
+impl DeltaKind {
+    pub fn to_ir_delta(self, s: String) -> IrDelta {
+        match self {
+            DeltaKind::Text => IrDelta::TextDelta(s),
+            DeltaKind::InputJson => IrDelta::InputJsonDelta(s),
+        }
+    }
+}
 
 /// 跨协议 SSE 翻译器. 由 [`feed`](Self::feed) 喂入 egress 字节,
 /// 由 [`finish`](Self::finish) 闭合流.
@@ -43,8 +97,8 @@ use std::collections::HashMap;
 /// - **跨协议翻译** ([`Self::new`]): ingress != egress, 把 egress SSE 翻译为 ingress SSE.
 ///   不做 redact restore (跨协议时 redact 在请求侧, response 直接翻译).
 /// - **同协议 restore** ([`Self::new_same_proto_restore`]): ingress == egress, SSE 字节
-///   解析为 IR 事件, 经 [`StreamingRestorer`] 还原 mock→real (sliding window, 跨 chunk 安全),
-///   再序列化回 SSE. 用于同协议 + redact + 流式场景.
+///   解析为 IR 事件, 经注入的 [`StreamRestoreHook`] 还原 mock→real (sliding window,
+///   跨 chunk 安全), 再序列化回 SSE. 用于同协议 + redact + 流式场景.
 pub struct StreamTranslate {
     ingress_writer: Box<dyn Writer>,
     egress_reader: Box<dyn Reader>,
@@ -58,11 +112,9 @@ pub struct StreamTranslate {
     start_usage: Option<crate::codec::IrUsage>,
     /// MessageStop 后是否再发 MessageDelta (post-stop guard).
     message_stopped: bool,
-    /// 同协议 restore 模式: per-block sliding window restorer.
-    /// 跨协议模式: `restorers` 空 + `redaction_map` None (不做 restore).
-    redaction_map: Option<RedactionMap>,
-    /// 每个 block index 对应一个独立 restorer (block 间 mock 边界互不干扰).
-    restorers: HashMap<usize, StreamingRestorer>,
+    /// 同协议 restore 模式: 调用方注入的 restore hook (自持 per-block 状态).
+    /// 跨协议模式: None (不做 restore).
+    restore: Option<Box<dyn StreamRestoreHook>>,
 }
 
 impl StreamTranslate {
@@ -79,17 +131,17 @@ impl StreamTranslate {
             emit_done: ingress.writer().emits_sse_done_terminator(),
             start_usage: None,
             message_stopped: false,
-            redaction_map: None,
-            restorers: HashMap::new(),
+            restore: None,
         })
     }
 
     /// 构造同协议 + restore 模式翻译器. 用于同协议 + redact + 流式响应场景.
     ///
-    /// 工作流: egress SSE → parse IR events → [`StreamingRestorer`] (跨 chunk restore)
-    /// → 序列化回 SSE. 失去 byte-exact (因为 IR re-serialize), 但语义等价,
-    /// 同时保留流式 UX + 跨 chunk mock restore.
-    pub fn new_same_proto_restore(proto: Protocol, map: RedactionMap) -> Self {
+    /// 工作流: egress SSE → parse IR events → `restore` hook (跨 chunk restore,
+    /// 由调用方注入, 生产路径是 `redact::StreamingRestorerSet`) → 序列化回 SSE.
+    /// 失去 byte-exact (因为 IR re-serialize), 但语义等价, 同时保留流式 UX +
+    /// 跨 chunk mock restore.
+    pub fn new_same_proto_restore(proto: Protocol, restore: Box<dyn StreamRestoreHook>) -> Self {
         Self {
             ingress_writer: proto.writer(),
             egress_reader: proto.reader(),
@@ -98,8 +150,7 @@ impl StreamTranslate {
             emit_done: proto.writer().emits_sse_done_terminator(),
             start_usage: None,
             message_stopped: false,
-            redaction_map: if map.is_empty() { None } else { Some(map) },
-            restorers: HashMap::new(),
+            restore: Some(restore),
         }
     }
 
@@ -127,7 +178,7 @@ impl StreamTranslate {
     /// 可能还在 buffer 中). flush 出来的内容包装为对应 kind 的 BlockDelta emit.
     pub fn finish(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
-        self.flush_all_restorers(&mut out);
+        self.emit_flush_all(&mut out);
         if self.reassembler.is_aborted() {
             // 流被异常中止: 发 ingress 协议的原生 error frame.
             let err = IrStreamEvent::Error("stream aborted: buffer overflow".into());
@@ -198,29 +249,45 @@ impl StreamTranslate {
                 self.message_stopped = true;
             }
 
-            // 同协议 restore 模式 (redaction_map = Some):
+            // 同协议 restore 模式 (restore hook 存在):
             //   - BlockStop: 先 flush 该 block 的尾部 buffer, emit 一个同 kind 的 BlockDelta.
             //   - MessageStop: flush 所有残留 restorers (上游异常漏发 BlockStop 时的兜底).
             //   - 其它: 走 restore_event_inplace (BlockDelta 内部走 sliding window).
-            // 跨协议模式 (redaction_map = None): 不做 restore, 直接 emit.
-            if self.redaction_map.is_some() {
-                if let IrStreamEvent::BlockStop { index } = &ev
-                    && let Some(tail_ev) = self.flush_block_as_event(*index)
-                {
-                    self.emit_ir_event(&tail_ev, out);
+            // 跨协议模式 (hook 不存在): 不做 restore, 直接 emit.
+            if let Some(hook) = self.restore.as_mut() {
+                let hook = hook.as_mut();
+                // 借用隔离: hook 持 &mut self.restore 期间不能走 &self.emit_ir_event,
+                // 故先收集本事件的全部 flush 产物, 释放借用后统一 emit.
+                let mut flushes: Vec<IrStreamEvent> = Vec::new();
+                if let IrStreamEvent::BlockStop { index } = &ev {
+                    let (kind, tail) = hook.flush_delta(*index);
+                    if !tail.is_empty() {
+                        flushes.push(IrStreamEvent::BlockDelta {
+                            index: *index,
+                            delta: kind.to_ir_delta(tail),
+                        });
+                    }
                 }
                 if matches!(ev, IrStreamEvent::MessageStop) {
                     // 上游异常漏发 BlockStop 时, 所有 restorers 残留 mock tail.
-                    self.flush_all_restorers(out);
+                    for (index, kind, tail) in hook.flush_all() {
+                        if !tail.is_empty() {
+                            flushes.push(IrStreamEvent::BlockDelta {
+                                index,
+                                delta: kind.to_ir_delta(tail),
+                            });
+                        }
+                    }
                 }
-                self.restore_event_inplace(&mut ev);
+                restore_event_inplace(hook, &mut ev);
+                for f in &flushes {
+                    self.emit_ir_event(f, out);
+                }
             }
 
             // BlockDelta 经 restorer.push 后内容可能为空 (全部 hold 在 buffer), 跳过 emit.
             if let IrStreamEvent::BlockDelta {
-                delta:
-                    crate::codec::ir::IrDelta::TextDelta(s)
-                    | crate::codec::ir::IrDelta::InputJsonDelta(s),
+                delta: IrDelta::TextDelta(s) | IrDelta::InputJsonDelta(s),
                 ..
             } = &ev
                 && s.is_empty()
@@ -232,63 +299,34 @@ impl StreamTranslate {
         }
     }
 
-    /// 对单个 event 应用 restore 逻辑 (in-place, 不改变 event 类型).
-    /// BlockDelta 内容走 per-index sliding-window restorer.
-    fn restore_event_inplace(&mut self, ev: &mut IrStreamEvent) {
-        let Some(map) = &self.redaction_map else {
-            return;
-        };
-        match ev {
-            IrStreamEvent::BlockDelta { index, delta } => {
-                let (kind, s) = match delta {
-                    crate::codec::ir::IrDelta::TextDelta(s) => (DeltaKind::Text, s),
-                    crate::codec::ir::IrDelta::InputJsonDelta(s) => (DeltaKind::InputJson, s),
-                };
-                let restorer = self
-                    .restorers
-                    .entry(*index)
-                    .or_insert_with(|| StreamingRestorer::new(map.clone()));
-                restorer.set_kind(kind);
-                *s = restorer.push(std::mem::take(s));
-            }
-            IrStreamEvent::MessageDelta {
-                stop_sequence: Some(s),
-                ..
-            } => restore_str_inplace(s, map),
-            IrStreamEvent::Error(msg) => restore_str_inplace(msg, map),
-            _ => {}
-        }
-    }
-
-    /// BlockStop 时取出该 block 的 restorer 并 flush, 包装成一个 BlockDelta event.
-    /// 若 buffer 为空则返回 None.
-    fn flush_block_as_event(&mut self, index: usize) -> Option<IrStreamEvent> {
-        let mut restorer = self.restorers.remove(&index)?;
-        let (kind, tail) = restorer.flush();
-        if tail.is_empty() {
-            return None;
-        }
-        Some(IrStreamEvent::BlockDelta {
-            index,
-            delta: kind.to_ir_delta(tail),
-        })
-    }
-
-    /// flush 所有残留 restorers (MessageStop / finish 兜底).
+    /// finish() 的 flush 入口: 冲刷所有 block 的窗口残余, 包装为 BlockDelta emit.
     ///
-    /// 按 block index 升序 emit, 避免违反客户端对 delta 时序的隐含假设
-    /// (eg OpenAI tool_call arguments partial JSON parser 假设按 index 顺序到达).
-    /// 触发场景: 上游异常漏发 BlockStop 时, 多个 block 同时残留 mock tail.
+    /// 借用隔离: 先从 hook 收集 flush 结果 (hook 持 &mut self.restore), 释放借用后
+    /// 再走不可变的 emit_ir_event.
+    ///
+    /// 按 block index 升序 emit (由 hook 的 flush_all 保证), 避免违反客户端对 delta
+    /// 时序的隐含假设 (eg OpenAI tool_call arguments partial JSON parser 假设按 index
+    /// 顺序到达). 触发场景: 上游异常漏发 BlockStop 时, 多个 block 同时残留 mock tail.
     ///
     /// **注意**: 此路径产生的 BlockDelta 在 Anthropic ingress 下可能缺少配对的
     /// content_block_start/stop (上游异常时). 客户端通常宽容处理, 但严格来说是协议违例.
-    fn flush_all_restorers(&mut self, out: &mut Vec<u8>) {
-        let mut indices: Vec<_> = self.restorers.keys().copied().collect();
-        indices.sort_unstable();
-        for index in indices {
-            if let Some(tail_ev) = self.flush_block_as_event(index) {
-                self.emit_ir_event(&tail_ev, out);
+    fn emit_flush_all(&mut self, out: &mut Vec<u8>) {
+        let flushed = self
+            .restore
+            .as_mut()
+            .map(|hook| hook.flush_all())
+            .unwrap_or_default();
+        for (index, kind, tail) in flushed {
+            if tail.is_empty() {
+                continue;
             }
+            self.emit_ir_event(
+                &IrStreamEvent::BlockDelta {
+                    index,
+                    delta: kind.to_ir_delta(tail),
+                },
+                out,
+            );
         }
     }
 
@@ -298,5 +336,25 @@ impl StreamTranslate {
             return; // writer 跳过此事件
         };
         out.extend_from_slice(&reframe_sse(&event_type, &data));
+    }
+}
+
+/// 对单个 event 应用 restore 逻辑 (in-place, 不改变 event 类型).
+/// BlockDelta 内容走 hook 的 per-index sliding-window.
+fn restore_event_inplace(hook: &mut dyn StreamRestoreHook, ev: &mut IrStreamEvent) {
+    match ev {
+        IrStreamEvent::BlockDelta { index, delta } => {
+            let (kind, s) = match delta {
+                IrDelta::TextDelta(s) => (DeltaKind::Text, s),
+                IrDelta::InputJsonDelta(s) => (DeltaKind::InputJson, s),
+            };
+            *s = hook.restore_delta(*index, kind, std::mem::take(s));
+        }
+        IrStreamEvent::MessageDelta {
+            stop_sequence: Some(s),
+            ..
+        } => hook.restore_inline(s),
+        IrStreamEvent::Error(msg) => hook.restore_inline(msg),
+        _ => {}
     }
 }
