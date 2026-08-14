@@ -5,9 +5,9 @@
 
 ## 职责
 
-- `mod.rs`: `/__sg` 子 router + `/` 根入口 + slash redirect + not_found + `NO_STORE` 共享常量.
+- `mod.rs`: `/__sg` 子 router + `/` 根入口 + slash redirect + not_found.
 - `api.rs`: `/__sg/api/*` JSON endpoints (records 单条 view + sessions + sync + sessions/timeline + secrets/providers CRUD).
-- `dto.rs`: WebUI 响应序列化 DTO (SessionView / NodeView / RoundBrief / TimelineRound / TimelineTail / TimelinePage / TimelineDiffData / SyncSnapshot). 构造逻辑留 dag 模块 (持读锁访问私有字段).
+- `dto.rs` (已移至顶层 `src/dto.rs`): WebUI 响应序列化 DTO (SessionView / NodeView / RoundBrief / TimelineRound / TimelineTail / TimelinePage / TimelineDiffData / SyncSnapshot). 构造逻辑留 dag 模块 (持读锁访问私有字段). 中立化理由见 `src/dto.rs` 头部 (dag 域 B 不再反向依赖 web 域 C).
 - `index.html`: 单页 UI (IM 风格: 会话折叠 sidebar + timeline 对话流, 内嵌 CSS + vanilla JS, 零外部依赖).
 
 ## 路由

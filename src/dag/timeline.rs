@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 use uuid::Uuid;
 
-use crate::web::dto::{
+use crate::dto::{
     RoundBrief, SyncSnapshot, TimelineDiffData, TimelinePage, TimelineRound, TimelineTail,
 };
 

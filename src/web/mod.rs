@@ -22,7 +22,6 @@
 //! server.rs 中显式注册了 `/__sg/` -> `/__sg` 的 redirect (307, 临时), 保证两种 URL 都可用.
 
 pub(crate) mod api;
-pub(crate) mod dto;
 
 use axum::{
     Router,

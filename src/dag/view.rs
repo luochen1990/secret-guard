@@ -23,7 +23,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::codec::ir::IrMessage;
-use crate::web::dto::{NodeDetail, NodeView, SessionView};
+use crate::dto::{NodeDetail, NodeView, SessionView};
 
 use super::types::Session;
 use super::{ConversationDag, DagInner, SessionId};

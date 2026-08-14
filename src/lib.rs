@@ -7,6 +7,7 @@
 //! - [`config`]  —— TOML 配置文件 schema (serde)
 //! - [`dag`]     —— 内容寻址的对话 DAG 存储 (BlockPool + Node + Merkle prefix)
 //! - [`mod@derive`]  —— 从 request body 字节派生 preview/model/text 的逻辑 (域 B 派生链)
+//! - [`dto`]     —— WebUI 响应 DTO 的中立类型层 (域 B → 域 C wire shape, dag 构造 / web 序列化)
 //! - [`error`]   —— 统一应用错误类型 (转发链 + 鉴权层共用, 不反向依赖)
 //! - [`mock`]    —— Per-secret mock 策略 (两维度: 初始值 / 生成策略)
 //! - [`provider`]—— Provider 注册表 + Protocol 类型 (ingress / egress 抽象)
@@ -27,6 +28,7 @@ pub mod codec;
 pub mod config;
 pub mod dag;
 pub mod derive;
+pub mod dto;
 pub mod error;
 pub mod mock;
 pub mod provider;

@@ -6,27 +6,28 @@
 //! `POST /api/sync`) 的 JSON 形态. 这些类型是 **域 B (派生链) → 域 C (渲染层)** 的
 //! wire shape: 从 DAG 读取数据后构造, 序列化为前端消费的 JSON.
 //!
-//! # 为什么不在 `dag` 模块
+//! # 为什么是顶层中立模块 (不在 web 也不在 dag)
 //!
-//! 历史上这些 DTO 定义在 [`crate::dag`], 但 [`crate::dag`] 是纯内存的内容寻址存储
-//! (BlockPool + Node + Merkle), 不关心也不应该关心序列化形态. 让 `dag` 模块 derive
-//! `Serialize` 把存储层与 wire shape 耦合, 违反单一职责. 故把 DTO 定义下沉到本模块
-//! (web 层), 让 dag 只保留核心数据结构 (BlockPool / Node / Session / ConversationDAG).
+//! 历史上这些 DTO 先定义在 `crate::dag` (#95 前的 dag.rs), 后移到 `crate::web::dto`
+//! (#95), 两次落点都不理想: 前者让存储层耦合 wire shape (违反单一职责), 后者让 dag
+//! (域 B) 反向依赖 web (域 C) 展示层路径 — 违反 "域 A → 域 B → 域 C 单向承诺"
+//! (见 AGENTS.md 模块依赖方向图). 移到顶层中立模块后, dag 与 web 各自**单向**依赖
+//! 本模块, dag 可脱离 web 单独抽出 (dag 是内容寻址通用件, 是最可能被复用的模块之一).
 //!
 //! # 构造方法留 dag 模块 (不在本模块)
 //!
 //! 这些 DTO 的**构造逻辑** (从 DAG 内部字段填充) 仍保留在 `dag` 模块的方法 / free
 //! function 中 (`node_view` / `session_view` / `build_timeline_round` 等), 因为它们需
 //! 持 `DagInner` 读锁访问私有字段 (`Node.event` / `Node.response` / `Session` 等).
-//! 移到 web 层会要求暴露 DAG 内部结构, 代价超过收益. dag 依赖 web::dto (本模块)
-//! 的类型定义是可接受的域内依赖 (web::dto 是哑数据载体, 非 web::api 展示层 handler).
+//! 移到独立模块会要求暴露 DAG 内部结构, 代价超过收益. 本模块只承载哑数据载体
+//! (无行为, 非 web::api 展示层 handler), dag 依赖它是向下的类型层依赖.
 //!
 //! # 与 `record::ForwardRecord` 的分工
 //!
 //! [`crate::record::ForwardRecord`] 是另一个 web 层 DTO (GET /records/{id} 响应),
 //! 历史上独立维护 "维持 Web API JSON shape 稳定" 的职责. 本模块的 9 个 DTO 与之同源
 //! (都是 web 层 wire shape), 仅按 endpoint 分文件: 本模块服务 sessions/timeline/sync,
-//! record.rs 服务 records 单条详情.
+//! record.rs 服务 records 单条详情. (record.rs 留在顶层是历史落点, 与本模块平级.)
 
 use std::collections::HashMap;
 use std::sync::Arc;
