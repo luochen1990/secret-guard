@@ -55,7 +55,8 @@
 //!
 //! 历史上是单文件 `proxy.rs` (prod ~1531 行, 接近 FILE_MAX_PROD_LINES=1600 硬门禁).
 //! 按职责拆分为模块目录:
-//! - `mod` (本文件): 公共类型 + 入口 + dispatch + 共享常量.
+//! - `mod` (本文件): 入口 + dispatch + 共享常量.
+//!   (进程级共享状态 `AppState` 在顶层 `crate::state`, 上移见 #145 偏差 3.)
 //! - `helpers`: HTTP header / URL / 字符串工具 (无业务语义).
 //! - `auth`: Provider 鉴权注入.
 //! - `record`: DAG record 构造 + 视图守卫 + 响应累积器.
@@ -70,7 +71,6 @@ mod helpers;
 mod record;
 mod same_proto;
 
-use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
@@ -80,36 +80,8 @@ use axum::{
 };
 
 use crate::error::AppError;
-use crate::provider::{Protocol, ProviderTable};
-use crate::secrets::SecretTable;
-
-/// 进程级共享状态, 在 router 与 handler 间共享.
-#[derive(Clone, Debug)]
-pub struct ProxyState {
-    pub upstream: reqwest::Client,
-    pub providers: ProviderTable,
-    pub dag: crate::dag::ConversationDag,
-    pub secrets: SecretTable,
-    /// API key 存储 (总是 Some; server.rs 无条件构造, 与 auth.enabled 无关).
-    /// 字段类型保留 Option 仅为兼容 tests/integration.rs 的简化构造 (None 写法),
-    /// handler 通过 require_store() 解包. 见 src/web/api.rs 中 /api-keys 段.
-    #[allow(unused)]
-    pub api_keys: Option<crate::auth::ApiKeyStore>,
-    /// 服务端认证是否启用 (来自 static config `[auth] enabled`). 与 ApiKeyStore
-    /// 的"无条件构造"正交: store 总存在, 但 forwarding 路径的 require_api_key
-    /// middleware 仅在 auth_enabled = true 时挂载. WebUI 用此标志区分 key 的
-    /// "启用中 / 已禁用 / 认证未启用" 三态 (见 src/web/api.rs::list_api_keys).
-    pub auth_enabled: bool,
-    /// 来自 `[redact] global_mock_prefix` (默认空串). WebUI secret upsert 时
-    /// 透传给 validate_and_resolve, 用于校验 value 不含此 prefix + 注入 Auto gen_spec.prefix.
-    pub global_mock_prefix: Arc<str>,
-    /// 来自 `[redact] on_probe_exhausted` (默认 FailOpen). 控制 redact probing 耗尽时
-    /// 是 fail-open (skip + 原样转发) 还是 fail-closed (返回 503 拒绝转发).
-    pub on_probe_exhausted: crate::config::OnProbeExhausted,
-    /// 来自 `[server] upstream_*_timeout_secs` 的上游超时配置.
-    /// forward 路径用它给 send().await / stream chunk 加超时保护.
-    pub upstream_timeouts: crate::config::UpstreamTimeouts,
-}
+use crate::provider::Protocol;
+use crate::state::AppState;
 
 /// axum 路径参数: `/{proto}/{name}/{*rest}`.
 ///
@@ -167,7 +139,7 @@ pub(crate) use {cross_proto::cross_proto_forward, fan_out::fan_out_streaming_wit
 /// MVP: 仅支持 ingress == provider.protocol (identity passthrough);
 /// 跨协议请求返回 501 Not Implemented.
 pub async fn forward(
-    State(state): State<ProxyState>,
+    State(state): State<AppState>,
     Path(fp): Path<ForwardPath>,
     req: Request<Body>,
 ) -> Result<Response<Body>, AppError> {
@@ -176,7 +148,7 @@ pub async fn forward(
 
 /// 路径只到 `/{proto}/{name}` (没有 rest 段) 的薄包装: 等价于 rest = "/".
 pub async fn forward_no_rest(
-    State(state): State<ProxyState>,
+    State(state): State<AppState>,
     Path((proto, name)): Path<(String, String)>,
     req: Request<Body>,
 ) -> Result<Response<Body>, AppError> {
@@ -189,7 +161,7 @@ pub async fn forward_no_rest(
 }
 
 async fn dispatch(
-    state: ProxyState,
+    state: AppState,
     fp: ForwardPath,
     req: Request<Body>,
 ) -> Result<Response<Body>, AppError> {

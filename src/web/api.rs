@@ -30,10 +30,9 @@ use crate::config::{DeleteOutcome, OverrideMode, UpsertKind};
 use crate::dag::ResponseData;
 use crate::dto::{NodeDetail, NodeView};
 use crate::provider::{EffectiveProvider, Protocol, Provider};
-use crate::proxy::ProxyState;
 use crate::record::ForwardRecord;
 use crate::secrets::{EffectiveSecret, SecretCategory, SecretEntry};
-use crate::web::NO_STORE;
+use crate::state::{AppState, NO_STORE};
 
 // ─── CRUD 通用 helper (secret / provider 共享) ──────────────────────────────
 //
@@ -110,7 +109,7 @@ fn classify_delete_outcome(
 // 原始 body) 按需拉取, 不依赖 list/timeline 路径.
 
 pub async fn get_record(
-    State(state): State<ProxyState>,
+    State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Query(q): Query<RecordQuery>,
 ) -> Result<impl IntoResponse, StatusCode> {
@@ -318,7 +317,7 @@ struct ListSessionsResponse {
     total: usize,
 }
 
-pub async fn list_sessions(State(state): State<ProxyState>) -> impl IntoResponse {
+pub async fn list_sessions(State(state): State<AppState>) -> impl IntoResponse {
     let sessions: Vec<SessionSummary> = state
         .dag
         .list_sessions()
@@ -364,7 +363,7 @@ impl TimelineQuery {
 /// 返回 timeline 分页 (oldest-first) + 末轮 tail + has_more.
 /// session 不存在 / leaf 无法定位 → 404.
 pub async fn session_timeline(
-    State(state): State<ProxyState>,
+    State(state): State<AppState>,
     Path(sid): Path<crate::dag::SessionId>,
     Query(q): Query<TimelineQuery>,
 ) -> Result<impl IntoResponse, StatusCode> {
@@ -424,7 +423,7 @@ pub struct SyncResponse {
 /// 在 DAG 层单个 read lock 内采集 sessions + expanded rounds + timeline diff,
 /// 映射 SessionView → SessionSummary 后返回. 无选中时 timeline 为 None.
 pub async fn sync(
-    State(state): State<ProxyState>,
+    State(state): State<AppState>,
     Json(req): Json<SyncRequest>,
 ) -> impl IntoResponse {
     let selected = req
@@ -448,7 +447,7 @@ pub async fn sync(
 
 // ─── /secrets ──────────────────────────────────────────────────────────────
 
-pub async fn list_secrets(State(state): State<ProxyState>) -> impl IntoResponse {
+pub async fn list_secrets(State(state): State<AppState>) -> impl IntoResponse {
     let secrets: Vec<EffectiveSecret> = state.secrets.effective_snapshot();
     let categories: Vec<&'static str> = SecretCategory::ALL.iter().map(|(_, s)| *s).collect();
     let decisions: Vec<&'static str> = OverrideMode::ALL.iter().map(|(_, s)| *s).collect();
@@ -463,7 +462,7 @@ pub async fn list_secrets(State(state): State<ProxyState>) -> impl IntoResponse 
 }
 
 pub async fn create_secret(
-    State(state): State<ProxyState>,
+    State(state): State<AppState>,
     Json(payload): Json<CreateSecretRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut entry = payload.into_entry()?;
@@ -500,7 +499,7 @@ pub async fn create_secret(
 }
 
 pub async fn update_secret(
-    State(state): State<ProxyState>,
+    State(state): State<AppState>,
     Path(id): Path<String>,
     Json(payload): Json<CreateSecretRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -524,7 +523,7 @@ pub async fn update_secret(
 }
 
 pub async fn delete_secret(
-    State(state): State<ProxyState>,
+    State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     // 若 dynamic 有此 id, 删除 (覆盖关系下仅移除 override, static 保留).
@@ -549,7 +548,7 @@ pub async fn delete_secret(
 /// 注: `SecretTable` 现为 `DynamicTable<SecretEntry>` 的别名, has_static 是
 /// 泛型 [`DynamicTable::has_static`](crate::config::DynamicTable) 提供的方法.
 pub async fn set_secret_decision(
-    State(state): State<ProxyState>,
+    State(state): State<AppState>,
     Path(id): Path<String>,
     Json(payload): Json<DecisionRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -625,7 +624,7 @@ impl CreateSecretRequest {
 
 // ─── /providers ────────────────────────────────────────────────────────────
 
-pub async fn list_providers(State(state): State<ProxyState>) -> impl IntoResponse {
+pub async fn list_providers(State(state): State<AppState>) -> impl IntoResponse {
     let providers: Vec<EffectiveProvider> = state.providers.effective_snapshot();
     let protocols: Vec<&'static str> = Protocol::ALL.iter().map(|(_, n, _)| *n).collect();
     let shorts: Vec<&'static str> = Protocol::ALL.iter().map(|(_, _, s)| *s).collect();
@@ -642,7 +641,7 @@ pub async fn list_providers(State(state): State<ProxyState>) -> impl IntoRespons
 }
 
 pub async fn create_provider(
-    State(state): State<ProxyState>,
+    State(state): State<AppState>,
     Json(payload): Json<UpsertProviderRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut entry = payload.into_provider()?;
@@ -670,7 +669,7 @@ pub async fn create_provider(
 }
 
 pub async fn update_provider(
-    State(state): State<ProxyState>,
+    State(state): State<AppState>,
     Path(id): Path<String>,
     Json(mut payload): Json<UpsertProviderRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -707,7 +706,7 @@ pub async fn update_provider(
 }
 
 pub async fn delete_provider(
-    State(state): State<ProxyState>,
+    State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let outcome = state
@@ -720,7 +719,7 @@ pub async fn delete_provider(
 
 /// 切换对 static id 的 per-item 决策. 同 [`set_secret_decision`].
 pub async fn set_provider_decision(
-    State(state): State<ProxyState>,
+    State(state): State<AppState>,
     Path(id): Path<String>,
     Json(payload): Json<DecisionRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -1203,15 +1202,15 @@ pub struct ListApiKeysResponse {
 }
 
 /// 拿到 ApiKeyStore. 不存在说明内部装配错误 (server.rs 应总是注入), 返回 500.
-fn require_store(state: &ProxyState) -> Result<&crate::auth::ApiKeyStore, ApiError> {
+fn require_store(state: &AppState) -> Result<&crate::auth::ApiKeyStore, ApiError> {
     state
         .api_keys
         .as_ref()
-        .ok_or_else(|| ApiError::internal("ApiKeyStore missing in ProxyState (server misassembly)"))
+        .ok_or_else(|| ApiError::internal("ApiKeyStore missing in AppState (server misassembly)"))
 }
 
 /// 列出所有 key (静态 + 动态), 不按用户过滤. 响应附带 `auth_enabled` (见 struct 注释).
-pub async fn list_api_keys(State(state): State<ProxyState>) -> Result<impl IntoResponse, ApiError> {
+pub async fn list_api_keys(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
     let api_keys = require_store(&state)?;
     Ok((
         NO_STORE,
@@ -1223,7 +1222,7 @@ pub async fn list_api_keys(State(state): State<ProxyState>) -> Result<impl IntoR
 }
 
 pub async fn create_api_key(
-    State(state): State<ProxyState>,
+    State(state): State<AppState>,
     Json(payload): Json<CreateApiKeyRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let api_keys = require_store(&state)?;
@@ -1236,7 +1235,7 @@ pub async fn create_api_key(
 
 /// 删除 (仅动态 key). 静态 key 返回 409 Conflict; 不存在返回 404 (与 toggle 对齐).
 pub async fn delete_api_key(
-    State(state): State<ProxyState>,
+    State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let api_keys = require_store(&state)?;
@@ -1259,7 +1258,7 @@ pub async fn delete_api_key(
 /// 静态 / 动态 key 均可 toggle (与 delete 不同 — delete 对 static 短路返回 409).
 /// 原因: set_disabled 对 static / dynamic 一视同仁, 不会 bail!.
 pub async fn toggle_api_key(
-    State(state): State<ProxyState>,
+    State(state): State<AppState>,
     Path(id): Path<String>,
     Json(payload): Json<ToggleApiKeyRequest>,
 ) -> Result<impl IntoResponse, ApiError> {

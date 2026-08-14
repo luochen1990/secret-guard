@@ -30,18 +30,7 @@ use axum::{
     routing::{get, patch, post},
 };
 
-use crate::proxy::ProxyState;
-
-/// 共享的 `no-store` header 设置 (axum 的 `[(name, value); N]` 接受 `(&str, &str)`).
-///
-/// 历史上定义在 `web::api` (资源组 CRUD 模块), 但消费者跨模块:
-/// - `web::api` (本模块所有 endpoint).
-/// - `crate::auth::handlers` (OIDC login/logout/me 响应).
-///
-/// 让 `auth` 反向依赖 `web::api` 违反层间单向承诺 (鉴权层是更低层基础设施).
-/// 故下沉到本模块 (`web::mod`) 作为整个 web 层的共享常量, `auth/handlers` 从
-/// `crate::web::NO_STORE` 取用, 不再触达 `web::api` 的资源组定义.
-pub const NO_STORE: [(&str, &str); 1] = [("cache-control", "no-store, no-cache, must-revalidate")];
+use crate::state::AppState;
 
 /// 内嵌的 HTML 单页 (build 时 `include_str!`).
 const INDEX_HTML: &str = include_str!("index.html");
@@ -51,8 +40,10 @@ pub async fn index_handler() -> Html<&'static str> {
     Html(INDEX_HTML)
 }
 
-/// 构建 `/__sg` 子 Router. 复用主 Router 的 `ProxyState`.
-pub fn router() -> Router<ProxyState> {
+/// 构建 `/__sg` 子 Router. 复用主 Router 的 [`AppState`].
+///
+/// `NO_STORE` 常量已上移 `crate::state` (消费者跨 web/auth 两层, 见 #145 偏差 3).
+pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(index_handler))
         .route("/api/records/{id}", get(api::get_record))

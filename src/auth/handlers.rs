@@ -25,7 +25,7 @@ use tower_sessions::Session;
 
 use crate::auth::ApiKeyStore;
 use crate::auth::oidc::{AuthSession, OidcBackend};
-use crate::web::NO_STORE;
+use crate::state::NO_STORE;
 
 /// session 中存储 PKCE verifier 的 key.
 const SK_PKCE_VERIFIER: &str = "oidc.pkce_verifier";
@@ -37,7 +37,7 @@ const SK_CSRF_STATE: &str = "oidc.csrf_state";
 const SK_NEXT_URL: &str = "oidc.next_url";
 
 /// 共享状态: 供 login/callback handler 访问 OIDC backend + API key store.
-/// 通过 axum Extension 注入 (不占用 Router 的 State 槽位, 让 ProxyState 保持唯一 State).
+/// 通过 axum Extension 注入 (不占用 Router 的 State 槽位, 让 AppState 保持唯一 State).
 #[derive(Clone, Debug)]
 pub struct AuthState {
     pub backend: OidcBackend,

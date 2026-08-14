@@ -35,7 +35,7 @@ use super::record::{build_call_event, parse_request_ir, redact_and_derive};
 ///   流式响应: 用 StreamTranslate 同协议 + restore 模式, 恢复流式 UX.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn same_proto_forward(
-    state: super::ProxyState,
+    state: crate::state::AppState,
     fp: super::ForwardPath,
     parts: axum::http::request::Parts,
     req_bytes: Bytes,
@@ -226,7 +226,7 @@ pub(crate) async fn same_proto_forward(
 /// 必须保持 byte-exact + 流式 UX 零回归.
 #[allow(clippy::too_many_arguments)]
 async fn same_proto_passthrough(
-    state: super::ProxyState,
+    state: crate::state::AppState,
     fp: super::ForwardPath,
     parts: axum::http::request::Parts,
     req_bytes: Bytes,

@@ -329,7 +329,7 @@ impl DynamicEntry for SecretEntry {
 
 // ─── SecretTable 别名 + 类型特定 effective 视图 ────────────────────────────
 
-/// Secret 表. 在 ProxyState 中作为共享可变状态.
+/// Secret 表. 在 AppState (crate::state) 中作为共享可变状态.
 ///
 /// 实际类型是 [`DynamicTable<SecretEntry>`](crate::config::DynamicTable),
 /// 所有通用方法 (effective_raw / get_effective / upsert_dynamic / ...) 在那里实现;

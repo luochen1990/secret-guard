@@ -17,10 +17,10 @@ use std::time::Duration;
 use secret_guard::{
     dag::ConversationDag,
     provider::{Protocol, Provider, ProviderTable},
-    proxy::ProxyState,
     record::ForwardRecord,
     secrets::{SecretCategory, SecretEntry, SecretTable},
     server,
+    state::AppState,
 };
 use tokio::net::TcpListener;
 
@@ -118,7 +118,7 @@ async fn spawn_proxy_static_dynamic(
     // SecretTable 由调用方构造 (内部已带独立的 decisions + persist_lock).
     // 测试场景下 secrets 与 providers 不共享 state 文件, 不影响测试结论.
     let _ = (decisions, persist_lock, state_path);
-    let proxy = ProxyState {
+    let proxy = AppState {
         upstream,
         providers: provider_table,
         dag: records,
@@ -155,7 +155,7 @@ async fn spawn_proxy_with_prefix(global_mock_prefix: &str) -> String {
     );
     let secrets = test_secret_table();
     let _ = (decisions, persist_lock, state_path);
-    let proxy = ProxyState {
+    let proxy = AppState {
         upstream: reqwest::Client::new(),
         providers: provider_table,
         dag: ConversationDag::new(64, 500, 1),
@@ -196,7 +196,7 @@ async fn spawn_proxy_with_probe_mode(
         persist_lock.clone(),
     );
     let _ = (decisions, persist_lock, state_path);
-    let proxy = ProxyState {
+    let proxy = AppState {
         upstream: reqwest::Client::new(),
         providers: provider_table,
         dag: ConversationDag::new(64, 500, 1),
@@ -1874,14 +1874,14 @@ async fn upstream_response_header_timeout_marks_record_504() {
         let _ = axum::serve(upstream_listener, upstream_app).await;
     });
 
-    // 构造 ProxyState, response_header_timeout = 1s (远小于上游的 5s sleep).
+    // 构造 AppState, response_header_timeout = 1s (远小于上游的 5s sleep).
     let upstream_timeouts = secret_guard::config::UpstreamTimeouts {
         connect: None,
         response_header: Some(std::time::Duration::from_secs(1)),
         stream_idle: None,
     };
 
-    // 用显式传 UpstreamTimeouts 的 helper (默认 ProxyState 无超时保护).
+    // 用显式传 UpstreamTimeouts 的 helper (默认 AppState 无超时保护).
     let (proxy_url, records_handle) =
         spawn_proxy_with_timeouts(&upstream_url, upstream_timeouts).await;
 
@@ -1948,7 +1948,7 @@ async fn spawn_proxy_with_timeouts(
     );
     let _ = (decisions, persist_lock, state_path);
     let dag = ConversationDag::new(64, 500, 1);
-    let proxy = ProxyState {
+    let proxy = AppState {
         upstream: server::build_upstream_client(upstream_timeouts.connect).unwrap(),
         providers: provider_table,
         dag: dag.clone(),
@@ -3329,7 +3329,7 @@ async fn cross_table_shared_state_no_lost_update() {
     );
     let secret_table =
         SecretTable::with_persist_lock(vec![], vec![], decisions, state_path.clone(), persist_lock);
-    let proxy = ProxyState {
+    let proxy = AppState {
         upstream: reqwest::Client::new(),
         providers: provider_table,
         dag: ConversationDag::new(64, 500, 1),

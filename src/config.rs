@@ -186,7 +186,7 @@ pub struct ServerConfig {
 
 /// 从 ServerConfig 派生的、已解析为 `Duration` (或 None) 的超时集合.
 ///
-/// 便于在 ProxyState / fan_out 等处直接消费 (避免每处都做 secs→Duration→Option 转换).
+/// 便于在 AppState / fan_out 等处直接消费 (避免每处都做 secs→Duration→Option 转换).
 /// 0 secs → `None` (等价于"无限", 向后兼容旧配置).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UpstreamTimeouts {

@@ -377,7 +377,7 @@ fn token_response_no_id_token() -> Response {
 
 /// 装配最小 client router: 只有 OIDC auth 路由 (无 forwarding / proxy).
 ///
-/// 与 `server.rs::build_router_with_auth_layers` 的差异: 不挂 ProxyState /
+/// 与 `server.rs::build_router_with_auth_layers` 的差异: 不挂 AppState /
 /// forwarding 路由, 只保留 OIDC session + handlers, 让测试聚焦 auth 行为.
 ///
 /// # 端口隔离

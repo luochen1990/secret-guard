@@ -245,7 +245,7 @@ impl DynamicEntry for Provider {
 
 // ─── ProviderTable 别名 + 类型特定 effective 视图 ──────────────────────────
 
-/// Provider 注册表. 进程级共享状态, 由 `ProxyState` 持有.
+/// Provider 注册表. 进程级共享状态, 由 `AppState` (crate::state) 持有.
 ///
 /// 实际类型是 [`DynamicTable<Provider>`](crate::config::DynamicTable),
 /// 所有通用方法 (effective_raw / get_effective / upsert_dynamic / ...) 在那里实现;

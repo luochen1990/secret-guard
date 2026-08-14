@@ -16,6 +16,7 @@
 //! - [`redact`]  —— Secret 改写 (请求) 与还原 (响应) 逻辑
 //! - [`secrets`] —— Secret 注册表 + 内存状态 + 配置持久化
 //! - [`server`]  —— axum router 装配与服务启动
+//! - [`state`]   —— 进程级共享状态 AppState + HTTP 共享常量 (NO_STORE)
 //! - [`web`]     —— `/__sg/*` Web UI 与 JSON API
 //!
 //! 设计目标: body 在字节层面流动, 中间件可对 body 做 find-and-replace.
@@ -37,6 +38,7 @@ pub mod record;
 pub mod redact;
 pub mod secrets;
 pub mod server;
+pub mod state;
 pub mod util;
 pub mod web;
 

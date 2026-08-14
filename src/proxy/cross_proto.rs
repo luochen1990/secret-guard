@@ -42,7 +42,7 @@ use super::record::{build_call_event, parse_request_ir, redact_and_derive};
 /// - 上游错误响应 (4xx/5xx) 也通过 codec 翻译为 ingress 协议的原生错误 envelope.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn cross_proto_forward(
-    state: super::ProxyState,
+    state: crate::state::AppState,
     fp: super::ForwardPath,
     parts: axum::http::request::Parts,
     req_bytes: Bytes,

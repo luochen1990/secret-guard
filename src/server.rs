@@ -76,8 +76,9 @@ use tracing::info;
 use crate::auth::{ApiKeyStore, AuthConfig, OidcBackend};
 use crate::dag::ConversationDag;
 use crate::provider::{Provider, ProviderTable};
-use crate::proxy::{ProxyState, forward, forward_no_rest};
+use crate::proxy::{forward, forward_no_rest};
 use crate::secrets::{SecretEntry, SecretTable};
+use crate::state::AppState;
 use crate::web;
 
 /// 构建 [`TraceLayer`] (SEC-3 加固: 显式限定 span 字段, 不记录 headers).
@@ -116,21 +117,21 @@ macro_rules! trace_layer {
 /// 构建 axum Router (单用户模式, 无认证).
 ///
 /// 这是 `auth.enabled = false` 时的入口, 与旧版完全兼容.
-pub fn build_router(state: ProxyState) -> Router {
+pub fn build_router(state: AppState) -> Router {
     build_router_inner(state, None)
 }
 
 /// 构建 axum Router (带认证).
 ///
 /// `auth_stack` 由 [`serve`] 在启用认证时构造.
-pub fn build_router_with_auth(state: ProxyState, auth_stack: AuthStack) -> Router {
+pub fn build_router_with_auth(state: AppState, auth_stack: AuthStack) -> Router {
     build_router_inner(state, Some(auth_stack))
 }
 
 /// 内部: 根据 auth_stack 是否存在, 条件化装配认证 layer.
-fn build_router_inner(state: ProxyState, auth_stack: Option<AuthStack>) -> Router {
-    // Forward router: 使用 ProxyState, 在 merge 前不调用 with_state.
-    let forward_router: Router<ProxyState> = Router::new()
+fn build_router_inner(state: AppState, auth_stack: Option<AuthStack>) -> Router {
+    // Forward router: 使用 AppState, 在 merge 前不调用 with_state.
+    let forward_router: Router<AppState> = Router::new()
         .route("/{proto}/{name}", any(forward_no_rest))
         .route("/{proto}/{name}/{*rest}", any(forward));
 
@@ -162,9 +163,9 @@ pub struct AuthStack {
 /// - 转发路由: API key middleware (require_api_key).
 /// - 登录路由 (/login, /callback, /logout): 公开 (不需要认证).
 fn build_router_with_auth_layers(
-    state: ProxyState,
+    state: AppState,
     auth: AuthStack,
-    forward_router: Router<ProxyState>,
+    forward_router: Router<AppState>,
 ) -> Router {
     use axum_login::AuthManagerLayerBuilder;
 
@@ -175,9 +176,9 @@ fn build_router_with_auth_layers(
     };
 
     // 公开路由 (login/callback/logout/me): 不挂 login_required guard.
-    // AuthState 通过 Extension 注入 (与 ProxyState 的 State 槽位正交).
+    // AuthState 通过 Extension 注入 (与 AppState 的 State 槽位正交).
     // me handler 不需要 AuthState, 只需要 AuthSession.
-    let webui_public: Router<ProxyState> = Router::new()
+    let webui_public: Router<AppState> = Router::new()
         .route(
             "/login",
             get(crate::auth::handlers::login_start).post(crate::auth::handlers::login_start),
@@ -190,11 +191,12 @@ fn build_router_with_auth_layers(
         .route("/api/me", get(crate::auth::handlers::me))
         .layer(axum::Extension(auth_state));
 
-    // 受保护路由: WebUI, 需要 login_required guard + ProxyState.
+    // 受保护路由: WebUI, 需要 login_required guard + AppState.
     // 注: /api/api-keys CRUD 不在此处挂载 — 见 `web::router()` (无条件挂载, 不隔离用户).
-    let webui_protected: Router<ProxyState> = web::router().route_layer(
-        axum_login::login_required!(OidcBackend, login_url = "/__sg/login"),
-    );
+    let webui_protected: Router<AppState> = web::router().route_layer(axum_login::login_required!(
+        OidcBackend,
+        login_url = "/__sg/login"
+    ));
 
     // 转发路由: 应用 API key middleware.
     // from_fn_with_state 在 layer 层注入 ApiKeyStore, 不改变 Router 的 state 类型.
@@ -243,11 +245,11 @@ pub fn build_upstream_client(connect_timeout: Option<Duration>) -> anyhow::Resul
 /// - `state_path`: state.toml 的写回路径.
 /// - `auth_config`: 认证配置 (来自 static config 的 `[auth]` 段).
 /// - `global_mock_prefix`: 来自 static config 的 `[redact] global_mock_prefix`,
-///   存入 ProxyState 供 WebUI handler 在 secret upsert 时校验 + resolve.
+///   存入 AppState 供 WebUI handler 在 secret upsert 时校验 + resolve.
 /// - `on_probe_exhausted`: 来自 static config 的 `[redact] on_probe_exhausted`,
-///   存入 ProxyState 供 forwarding 路径决定 probing 耗尽时 fail-open / fail-closed.
+///   存入 AppState 供 forwarding 路径决定 probing 耗尽时 fail-open / fail-closed.
 /// - `upstream_timeouts`: 来自 static config 的 `[server] upstream_*_timeout_secs`,
-///   存入 ProxyState 供 forward 路径给 send().await / stream chunk 加超时保护
+///   存入 AppState 供 forward 路径给 send().await / stream chunk 加超时保护
 ///   (防上游网络异常时 record 永久 pending).
 #[allow(clippy::too_many_arguments)]
 pub async fn serve(
@@ -302,7 +304,7 @@ pub async fn serve(
         persist_lock.clone(),
     );
 
-    let proxy = ProxyState {
+    let proxy = AppState {
         upstream,
         providers: provider_table,
         dag,
@@ -355,7 +357,7 @@ pub async fn serve(
         .await
         .map_err(|e| anyhow::anyhow!("OIDC initialization failed: {e}"))?;
 
-        // api_keys 已在 auth 分支外构造 (与 ProxyState 共享同一份).
+        // api_keys 已在 auth 分支外构造 (与 AppState 共享同一份).
         let auth_stack = AuthStack { backend, api_keys };
         build_router_with_auth(proxy, auth_stack)
     } else {
