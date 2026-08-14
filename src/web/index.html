@@ -3552,7 +3552,7 @@
     //   enabled  — auth on + !disabled (绿色, 实际生效)
     //   disabled — auth on + disabled   (红色, 用户主动禁用)
     //   inactive — auth off             (灰色, 服务端未启用认证, key 无消费方)
-    // 三态定义的 SSOT 在 src/web/api.rs 段注释; 此函数仅负责视觉映射.
+    // 三态定义的 SSOT 在 src/web/api/apikeys.rs 头部注释; 此函数仅负责视觉映射.
     function apiKeyStatusBadge(authEnabled, disabled) {
       if (!authEnabled) return '<span class="badge badge-inactive" title="Server authentication is disabled — all requests are accepted without a key. Enable [auth] in secret-guard.toml to activate.">inactive</span>';
       if (disabled) return '<span class="badge badge-err">disabled</span>';

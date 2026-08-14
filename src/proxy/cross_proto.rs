@@ -213,9 +213,12 @@ pub(crate) async fn cross_proto_forward(
         let mut stream = upstream_resp.bytes_stream();
         let mut exceeded = false;
         let mut stream_err: Option<std::io::Error> = None;
-        while let Some(chunk) =
-            super::recorder::next_chunk(&mut stream, state.upstream_timeouts.stream_idle, &record_id)
-                .await
+        while let Some(chunk) = super::recorder::next_chunk(
+            &mut stream,
+            state.upstream_timeouts.stream_idle,
+            &record_id,
+        )
+        .await
         {
             match chunk {
                 Ok(b) => {

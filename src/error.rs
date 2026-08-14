@@ -17,7 +17,7 @@
 //!
 //! # 与 `web::api::ApiError` 的分工
 //!
-//! `web::api::ApiError` (定义在 `src/web/api.rs`) 是 WebUI CRUD (`/api/secrets`,
+//! `web::api::ApiError` (定义在 `src/web/api/error.rs`) 是 WebUI CRUD (`/api/secrets`,
 //! `/api/providers` 等) 的错误类型, 用 `struct { status, message }` 形态 (手动映射
 //! 状态码, message 原样回客户端, 因为 CRUD 错误是用户可读的校验/冲突消息). 两者形态与
 //! 信息泄露策略都不同, 故不合并:

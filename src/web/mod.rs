@@ -75,7 +75,7 @@ pub fn router() -> Router<AppState> {
             patch(api::set_provider_decision),
         )
         // API key CRUD: 无条件挂载 (不依赖 auth.enabled), 不做用户隔离.
-        // 设计哲学: 只认证, 不隔离 — 见 src/web/api.rs 中 /api-keys 段注释.
+        // 设计哲学: 只认证, 不隔离 — 见 src/web/api/apikeys.rs 头部注释.
         //
         // 安全契约: auth 启用时, 整个 web::router() (含本段) 都被上层
         // login_required guard 守卫 (server.rs build_router_with_auth_layers).

@@ -16,7 +16,7 @@
 //!
 //! ApiKeyStore 总是构造 (与 `auth.enabled` 无关), 让 WebUI 在单用户模式下也能
 //! 管理和预配置 key. `/api/api-keys` CRUD 路由在 `web::router()` 里无条件挂载
-//! (不隔离, 见 `src/web/api.rs`); `require_api_key` middleware 仅在 auth 启用时挂载
+//! (不隔离, 见 `src/web/api/apikeys.rs`); `require_api_key` middleware 仅在 auth 启用时挂载
 //! 到 forwarding 路径.
 //!
 //! # 协议简写

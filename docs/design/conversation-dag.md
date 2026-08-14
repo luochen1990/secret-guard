@@ -255,7 +255,7 @@ struct ConversationDag {
 | config schema | toml 中 mock_strategy 不再支持 sticky 字段 (向后不兼容, 需 migration 提示) 📌 |
 | proxy.rs | push_from_ir / attach_response 取代 push/update 📌 实际命名为 `push_messages` |
 | codec/stream (现 `stream/scan.rs`) | StreamScan snapshot → attach 到 node |
-| web/api.rs | list 派生 RecordSummary (walk DAG); get_record 按需重建 |
+| web/api/{records,sessions}.rs | list 派生 RecordSummary (walk DAG); get_record 按需重建 |
 | web/index.html | secret 编辑表单删除 sticky 选项 |
 | config.rs | **不动** (records 纯内存, 不持久化) |
 | AGENTS.md | 更新 record/redact/mock 相关段落; 新增"忠实于原始数据"原则 |
@@ -268,7 +268,7 @@ struct ConversationDag {
 4. C3 契约重述 (redact.rs 头部注释) ✅
 5. lazy redact pipeline (redact_seed 注入 + seed 继承)
 6. proxy.rs 适配
-7. web/api.rs 适配
+7. web/api (records/sessions) 适配
 8. codec/stream.rs 适配
 9. 测试 (单元 + 集成 + WebUI Playwright)
 10. 文档 (AGENTS.md)

@@ -6,7 +6,14 @@
 ## 职责
 
 - `mod.rs`: `/__sg` 子 router + `/` 根入口 + slash redirect + not_found. (`NO_STORE` 共享常量已上移 `crate::state`, 消费者跨 web/auth 两层.)
-- `api.rs`: `/__sg/api/*` JSON endpoints (records 单条 view + sessions + sync + sessions/timeline + secrets/providers CRUD).
+- `api/` (目录, 按资源组拆分, 见 #146): `/__sg/api/*` JSON endpoints.
+  - `mod.rs` — 模块根 + handler re-export (`web::api::<handler>` 路径稳定).
+  - `error.rs` — `ApiError` 统一错误类型.
+  - `crud.rs` — secrets/providers 共享的 CRUD 泛型流程 (`EffectiveItem` + `CrudTable` + create/update/delete/decision flow, 错误消息经 kind_label 参数化).
+  - `records.rs` — `GET /records/{id}` 单条 raw + parsed view (弹窗按需拉).
+  - `sessions.rs` — `GET /sessions` + `GET /sessions/{sid}/timeline` + `POST /sync` (session-aware timeline API).
+  - `secrets.rs` / `providers.rs` — 各自 CRUD (5 endpoints), handler 是 crud.rs 泛型流程的薄壳.
+  - `apikeys.rs` — API key CRUD (4 endpoints, 无条件挂载, "只认证, 不隔离").
 - `dto.rs` (已移至顶层 `src/dto.rs`): WebUI 响应序列化 DTO (SessionView / NodeView / RoundBrief / TimelineRound / TimelineTail / TimelinePage / TimelineDiffData / SyncSnapshot). 构造逻辑留 dag 模块 (持读锁访问私有字段). 中立化理由见 `src/dto.rs` 头部 (dag 域 B 不再反向依赖 web 域 C).
 - `index.html`: 单页 UI (IM 风格: 会话折叠 sidebar + timeline 对话流, 内嵌 CSS + vanilla JS, 零外部依赖).
 
@@ -130,7 +137,7 @@ API key CRUD **无条件挂载** (在 `web::router()`, 不依赖 `auth.enabled`)
   暂无消费方, 但不影响数据生命周期.
 - `auth.enabled = true`: store 同时服务 WebUI 管理 + forwarding middleware 鉴权.
 - **不做用户隔离**: 移除 `tenant_id == user_sub` 过滤 — 所有 (登录的) 用户共享
-  同一份 key 池. 设计理由见 `src/web/api.rs` 的 `/api-keys` 段注释.
+  同一份 key 池. 设计理由见 `src/web/api/apikeys.rs` 头部注释.
 - `tenant_id` / `created_by` 字段保留 (兼容已有持久化数据), 统一填 `"admin"` 占位,
   不影响业务逻辑 (lookup 不读 tenant_id).
 

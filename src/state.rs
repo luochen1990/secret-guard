@@ -30,13 +30,13 @@ pub struct AppState {
     pub secrets: SecretTable,
     /// API key 存储 (总是 Some; server.rs 无条件构造, 与 auth.enabled 无关).
     /// 字段类型保留 Option 仅为兼容 tests/integration.rs 的简化构造 (None 写法),
-    /// handler 通过 require_store() 解包. 见 src/web/api.rs 中 /api-keys 段.
+    /// handler 通过 require_store() 解包. 见 src/web/api/apikeys.rs 头部注释.
     #[allow(unused)]
     pub api_keys: Option<ApiKeyStore>,
     /// 服务端认证是否启用 (来自 static config `[auth] enabled`). 与 ApiKeyStore
     /// 的"无条件构造"正交: store 总存在, 但 forwarding 路径的 require_api_key
     /// middleware 仅在 auth_enabled = true 时挂载. WebUI 用此标志区分 key 的
-    /// "启用中 / 已禁用 / 认证未启用" 三态 (见 src/web/api.rs::list_api_keys).
+    /// "启用中 / 已禁用 / 认证未启用" 三态 (见 src/web/api/apikeys.rs::list_api_keys).
     pub auth_enabled: bool,
     /// 来自 `[redact] global_mock_prefix` (默认空串). WebUI secret upsert 时
     /// 透传给 validate_and_resolve, 用于校验 value 不含此 prefix + 注入 Auto gen_spec.prefix.
