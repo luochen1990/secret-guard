@@ -22,6 +22,13 @@
 //!   redactMap 的 mock 生成. 同一 policy + 同一 messages 上下文 → 同一 seed → 同一
 //!   redactMap → mock 在会话全程稳定 (见 [`redact_ir`] 的 seed 语义).
 //!
+//!   **例外 (RED-2↔RED-3 张力裁决, #143)**: pre-replace IR 已含该 secret 的旧 mock 时
+//!   (客户端经上游 parse 失败 fallback 路径把 mock 回传进历史), probing counter 推进
+//!   → mock 实质必然变化 (碰撞概率可忽略). 若复用旧 mock, restore 会把历史中自然出现
+//!   的旧 mock 错替成 real, 破坏 C6 round-trip — C2 保护 restore 正确性优先于 C3 缓存
+//!   稳定性. 代价是 token 缓存费用 (经济性), 非 secret 泄漏. 详见 contracts.md RED-3
+//!   例外场景裁决与 `prop_mock_changes_when_ir_contains_old_mock_exception`.
+//!
 //!   **权衡**: policy 变动 (添加/删除/编辑任一 secret) 会改变 init_seed → 所有 secret 的
 //!   mock 全部变化 → 整个会话的前缀缓存失效. 这是 per-request seed 模型 (vs 旧 per-secret
 //!   seed) 的代价, 换取了 lazy redact 重建的极简 (node 只存单标量 seed). secret 编辑是
@@ -2184,6 +2191,252 @@ mod tests {
             prop_assert_eq!(
                 map1, map2,
                 "redact_ir must produce identical RedactionMap for identical (ir, secrets)"
+            );
+        }
+
+        /// 守卫 RED-3: 跨轮次 mock 稳定性 (前缀缓存友好性的核心声明, contracts.md §2, #143).
+        ///
+        /// 场景: 同一 policy 下客户端会话推进 — round2 IR = round1 历史 messages (原样
+        /// 保留 real 原文, 客户端本地历史不回传 mock) + 新增 assistant/user 轮.
+        /// 断言 secret 的 mock 跨轮字节不变: 上游看到的历史轮 (已含 round1 mock) 字节
+        /// 稳定, LLM Provider 侧 byte-exact 前缀缓存才能跨轮命中.
+        ///
+        /// 现有 `prop_c3_redact_ir_idempotent` 只测同一 IR 重复调用的确定性, 未覆盖
+        /// "IR 内容增长" 这一真实多轮形态 — 本 property 补齐 (与契约 property 同名).
+        ///
+        /// 生成器 charset 论证 (counter=0 候选必命中, 断言才精确):
+        /// secret `[A-Z]{6,20}` → mock charset 推断为纯大写且等长 (见
+        /// `mock_length_matches_real_when_no_prefix`), filler 全小写; C5 (RED-5) 保证
+        /// mock ≠ secret, 故 mock (全大写) 不可能出现在 IR 文本 (小写 + secret) 中.
+        #[test]
+        fn prop_same_policy_same_messages_same_mock(
+            secret in "[A-Z]{6,20}",
+            r1_filler in "[a-z ]{0,40}",
+            r2_reply in "[a-z ]{0,40}",
+        ) {
+            // round1: 单条 user 消息含 real secret.
+            let body1 = format!("{r1_filler} key={secret} end");
+            let secrets = vec![entry(&secret)];
+            let (map1, seed1) = redact_ir(&mut sample_ir_with_text(&body1), &secrets);
+            let mock1 = map1
+                .mock_for(&secret)
+                .expect("round1: secret 在 IR 中, 必须命中")
+                .to_string();
+
+            // round2: 历史前缀保留 (real 原文) + 追加 assistant 回复 + 新 user 轮.
+            // messages 严格增长, 全部文本不含任何旧 mock (正常路径: 客户端不回传 mock).
+            let mut ir2 = sample_ir_with_text(&body1);
+            ir2.messages.push(IrMessage {
+                role: IrRole::Assistant,
+                content: vec![IrBlock::Text {
+                    text: format!("ok {r2_reply}"),
+                }],
+                ..Default::default()
+            });
+            ir2.messages.push(IrMessage {
+                role: IrRole::User,
+                content: vec![IrBlock::Text {
+                    text: format!("again {secret} please"),
+                }],
+                ..Default::default()
+            });
+            let (map2, seed2) = redact_ir(&mut ir2, &secrets);
+            let mock2 = map2
+                .mock_for(&secret)
+                .expect("round2: secret 仍在 IR 中, 必须命中")
+                .to_string();
+
+            prop_assert_eq!(seed1, seed2, "init_seed 只依赖 policy, 不依赖 IR");
+            prop_assert_eq!(
+                mock2,
+                mock1,
+                "RED-3: 同一 policy + 历史不含旧 mock 时, IR 前缀增长不得改变 secret 的 mock \
+                 (上游前缀缓存从该 message 起的命中依赖此稳定性)"
+            );
+        }
+
+        /// 守卫 RED-3 (多 secret 变体): 跨轮 mock 稳定性在多 secret 交互下仍成立
+        /// (contracts.md §2, #143). 单 secret 版 (上方) 覆盖核心声明, 本变体补真实
+        /// 配置形态 — 多 secret 同轮出现时, probing 的 allocated 集合 + 长度倒序
+        /// 处理顺序交互下, 全部 mock 跨轮仍字节稳定.
+        ///
+        /// 稳定性论证 (归纳, 不依赖 counter=0 命中, 故 s1/s2 无需等长): mock 候选均为
+        /// 大写字符串, "候选是否在 IR 中" 仅取决于叶子上大写 run 的内容; 历史叶子的大写
+        /// run = {s1, s2} (real), 新增轮只引入小写 + 已有 real (不产生新大写 run);
+        /// 逐 secret 归纳: 每一步 probing 看到的 IR 大写内容与 round1 完全一致 →
+        /// counter 路径一致 → 全部 mock 稳定. (probing 本身会拒绝撞上 IR 的候选,
+        /// 包括 mock 恰为另一 secret 的情形, 两侧同轮同拒.)
+        #[test]
+        fn prop_same_policy_same_messages_same_mock_multi_secret(
+            s1 in "[A-Z]{6,20}",
+            s2 in "[A-Z]{6,20}",
+            r1_filler in "[a-z ]{0,40}",
+            r2_reply in "[a-z ]{0,40}",
+        ) {
+            prop_assume!(s1 != s2, "需要两个不同 secret");
+            let secrets = vec![entry(&s1), entry(&s2)];
+            let body1 = format!("{r1_filler} {s1} mid {s2} end");
+            let (map1, _) = redact_ir(&mut sample_ir_with_text(&body1), &secrets);
+            let mock1_s1 = map1
+                .mock_for(&s1)
+                .expect("round1: s1 在 IR 中, 必须命中")
+                .to_string();
+            let mock1_s2 = map1
+                .mock_for(&s2)
+                .expect("round1: s2 在 IR 中, 必须命中")
+                .to_string();
+            // sanity (RED-4): 两 mock 互异.
+            prop_assert_ne!(&mock1_s1, &mock1_s2);
+
+            // round2: 历史保留 + assistant 回复 (纯小写) + 新 user 轮 (real + 小写).
+            let mut ir2 = sample_ir_with_text(&body1);
+            ir2.messages.push(IrMessage {
+                role: IrRole::Assistant,
+                content: vec![IrBlock::Text {
+                    text: format!("ok {r2_reply}"),
+                }],
+                ..Default::default()
+            });
+            ir2.messages.push(IrMessage {
+                role: IrRole::User,
+                content: vec![IrBlock::Text {
+                    text: format!("use {s1} and {s2} again"),
+                }],
+                ..Default::default()
+            });
+            let (map2, _) = redact_ir(&mut ir2, &secrets);
+            let mock2_s1 = map2
+                .mock_for(&s1)
+                .expect("round2: s1 仍在 IR 中, 必须命中")
+                .to_string();
+            let mock2_s2 = map2
+                .mock_for(&s2)
+                .expect("round2: s2 仍在 IR 中, 必须命中")
+                .to_string();
+
+            prop_assert_eq!(
+                mock2_s1, mock1_s1,
+                "RED-3 多 secret: s1 的 mock 跨轮必须字节稳定"
+            );
+            prop_assert_eq!(
+                mock2_s2, mock1_s2,
+                "RED-3 多 secret: s2 的 mock 跨轮必须字节稳定"
+            );
+        }
+
+        /// 守卫 RED-3: policy 变动使 init_seed 与全部 mock 失效 (per-request seed 模型的
+        /// 已知代价, contracts.md §2, #143). 与契约 property 同名.
+        ///
+        /// 场景: 向 policy 添加一个不在 IR 中的新 secret — 该 secret 不产生任何替换,
+        /// 但 init_seed 是整个 policy 集合的 hash → 已有 secret 的 mock 也随之全部变化
+        /// (历史轮字节改变, 前缀缓存整体失效). 这不是 bug 而是模型代价, 本 property 锁定.
+        #[test]
+        fn prop_policy_change_invalidates_all_mocks(
+            s1 in "[A-Z]{6,20}",
+            s2 in "[A-Z]{6,20}",
+            filler in "[a-z ]{0,40}",
+        ) {
+            prop_assume!(s1 != s2, "需要两个不同 secret 构成 policy 变动");
+            let body = format!("{filler} key={s1} end");
+            let (map_a, seed_a) = redact_ir(&mut sample_ir_with_text(&body), &[entry(&s1)]);
+            let mock_a = map_a
+                .mock_for(&s1)
+                .expect("s1 在 IR 中, 必须命中")
+                .to_string();
+            // policy 变动: 追加 s2 (不在 IR 中, 不产生替换, 只改变 seed).
+            let (map_b, seed_b) =
+                redact_ir(&mut sample_ir_with_text(&body), &[entry(&s1), entry(&s2)]);
+
+            prop_assert_ne!(
+                seed_a, seed_b,
+                "policy 集合变化必须改变 init_seed (per-request seed 模型)"
+            );
+            let mock_b = map_b
+                .mock_for(&s1)
+                .expect("s1 仍在 IR 中, 必须命中 (未被 redact = secret 泄漏, 须显式失败)")
+                .to_string();
+            prop_assert_ne!(
+                mock_b,
+                mock_a,
+                "policy 变动后既有 secret 的 mock 必然变化 (前缀缓存整体失效是已知代价)"
+            );
+        }
+
+        /// 守卫 RED-3 例外裁决 (#143, contracts.md §2 RED-3 "例外场景"):
+        /// pre-replace IR 已含该 secret 的旧 mock 时, mock **允许且必然**变化.
+        ///
+        /// 触发路径 (现实可达): 流式/非流式上游响应 parse 失败 → fallback 透传含 mock 的
+        /// 字节 (根 AGENTS.md "已知限制") → 客户端把 mock 回传进历史 → 下一轮 IR 含旧 mock.
+        ///
+        /// 裁决理由: 若复用旧 mock, restore 会把历史中自然出现的旧 mock 错替成 real,
+        /// 破坏 RED-6 round-trip — RED-2 (in-context uniqueness) 保护 restore 正确性
+        /// 优先于 RED-3 缓存稳定性. 代价是 token 缓存费用 (经济性), 非 secret 泄漏.
+        ///
+        /// 不变量 (例外下仍须成立):
+        /// 1. mock 必然变化 (旧 mock 在 IR 中 → probing counter 推进; charset 论证同上,
+        ///    round1 的 mock1 即 counter=0 候选, round2 该候选撞车 → 必为 counter≥1 候选);
+        /// 2. RED-2: 新 mock 不在 pre-replace IR 中;
+        /// 3. RED-6: redact→restore round-trip 恒等, 且历史中的旧 mock 不被触碰 (不在本轮 map);
+        /// 4. 例外路径本身确定 (同输入同输出, counter 推进是确定性的, 非随机).
+        #[test]
+        fn prop_mock_changes_when_ir_contains_old_mock_exception(
+            secret in "[A-Z]{6,20}",
+            extra in "[a-z ]{0,40}",
+        ) {
+            // round1: 正常路径拿首选 mock (counter=0 候选, charset 论证保证).
+            let secrets = vec![entry(&secret)];
+            let body1 = format!("key={secret} end");
+            let (map1, _) = redact_ir(&mut sample_ir_with_text(&body1), &secrets);
+            let mock1 = map1
+                .mock_for(&secret)
+                .expect("round1: secret 在 IR 中, 必须命中")
+                .to_string();
+
+            // round2 (例外场景): 历史文本被污染 (含旧 mock1), 新一轮 user 消息仍含 real.
+            let body2 = format!("hist echo {mock1} {extra} new key={secret} end");
+            let mut ir2 = sample_ir_with_text(&body2);
+            let (map2, _) = redact_ir(&mut ir2, &secrets);
+            let mock2 = map2
+                .mock_for(&secret)
+                .expect("round2: real 仍命中, 必须被 redact")
+                .to_string();
+
+            // 不变量 1: mock 必然变化 (例外核心).
+            prop_assert_ne!(
+                &mock1, &mock2,
+                "RED-3 例外: IR 含旧 mock 时, counter 推进使 mock 必然变化"
+            );
+            // 不变量 2 (RED-2): 新 mock 不在 pre-replace IR 中 (body2 即 redact 前文本).
+            prop_assert!(
+                !body2.contains(mock2.as_str()),
+                "RED-2 仍成立: 新 mock 不得出现在 pre-replace IR"
+            );
+            // 不变量 3 (RED-6): redact 后 real 已替换, 历史旧 mock 原样保留;
+            // replace 回 real 后与 body2 恒等 (charset 论证保证 replace 无错位).
+            let text2 = match &ir2.messages[0].content[0] {
+                IrBlock::Text { text } => text.clone(),
+                _ => panic!("expected Text"),
+            };
+            prop_assert!(!text2.contains(secret.as_str()), "real 已被替换");
+            prop_assert!(
+                text2.contains(mock1.as_str()),
+                "历史中的旧 mock 不被本轮 redact/restore 触碰 (不在 map 中)"
+            );
+            prop_assert_eq!(
+                &text2.replace(&mock2, &secret),
+                &body2,
+                "RED-6 round-trip 恒等 (mock1 保留是 round-trip 的一部分)"
+            );
+            // 不变量 4: 例外路径确定 (同输入必产同 mock2).
+            let (map2b, _) = redact_ir(&mut sample_ir_with_text(&body2), &secrets);
+            let mock2b = map2b
+                .mock_for(&secret)
+                .expect("同 round2: secret 在 IR 中, 必须命中")
+                .to_string();
+            prop_assert_eq!(
+                mock2b,
+                mock2,
+                "例外路径仍确定性 (counter 推进可复现, 非随机)"
             );
         }
 

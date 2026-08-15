@@ -142,6 +142,11 @@ Redact 不应无必要地改变 request body 的字节内容, 避免破坏 LLM P
 保证同一 policy + 同一上下文 → 同一 mock. 详尽契约 (C1-C7) 见 `src/redact.rs` 头部
 与 `src/mock.rs` 头部.
 
+> 例外 (RED-3 裁决, #143): pre-replace IR 已含该 secret 的旧 mock 时 (客户端把 mock
+> 回传进历史), mock 允许变化 (probing counter 推进). 理由: 复用旧 mock 会让 restore
+> 错替历史中的旧 mock, 破坏 RED-6 round-trip — restore 正确性优先于缓存稳定性.
+> 代价是经济性 (前缀缓存失效), 非安全性. 详见 contracts.md RED-3 例外场景裁决.
+
 ## 前端不变量 (UI Invariants) → UI-1..UI-6 契约
 
 > 以下条目是**跨 web/dag/index.html 的强不变量**, 任何渲染优化或内存重构不得违反.
@@ -508,10 +513,13 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
   同协议 + 无 Redact 路径仍 byte-exact.
 - **流式 + Redact + 非 2xx 上游错误**: SSE 错误流不是单个 JSON, parse 失败时 fallback
   原样返回 (无 restore), 客户端可能看到 mock.
+  后续效应: 客户端把 mock 回传进下一轮历史时, 触发 RED-3 例外场景 (mock 跨轮变化,
+  见 contracts.md RED-3 例外裁决 / #143).
 - **同协议 + Redact + 非流式 2xx + 上游响应 parse 失败**: 上游返回的 body 不是合法 JSON 或 codec
   reader 无法 parse 时 (类型不符 / 空数组 / 越界), 转发路径 fallback 为透传含 mock 的字节, 无 restore,
   客户端收到 mock. 同协议路径见 `src/proxy/fan_out.rs` (non-stream 分支), 跨协议路径见
   `src/proxy/cross_proto.rs`. 均走 best-effort 鲁棒性原则 (ROB-*), parse 失败不 panic.
+  后续效应同上 (RED-3 例外场景).
 - **跨协议 ingress 的 timeline delta 切片可能错位**: OpenAI writer 会把 Anthropic 风格的
   混合 Text+ToolResult user 消息拆成 (1+N) 条 wire messages, 导致 `req_body_raw` 的
   messages 数 > IR messages 数. `extract_delta_messages_from_raw` 切片时跨协议路径的 start 偏小,

@@ -242,10 +242,15 @@
 
 **陈述**: redact 不应无必要改变 request body 字节. 同一 (policy, OriginRecord, seed) 三元组 → 同一 RedactionMap.
 
+**例外场景 (裁决, #143)**: pre-replace IR 已含该 secret 的**旧 mock** 时, 允许 (且实质必然, counter 候选哈希碰撞概率 ~26⁻ᴸ 可忽略 — "实质确定性" 术语先例见 RED-5) 生成不同 mock (probing counter 推进换候选). 现实触发路径: 上游响应 parse 失败 → fallback 透传含 mock 的字节 (根 AGENTS.md "已知限制") → 客户端把 mock 回传进历史 → 下一轮 IR 含旧 mock.
+
+**裁决理由**: 若复用旧 mock, restore 会把历史中自然出现的旧 mock 错替成 real, 破坏 RED-6 round-trip — RED-2 (in-context uniqueness) 保护 restore 正确性**优先于** RED-3 缓存稳定性. 后果是 token 缓存费用 (经济性), 非 secret 泄漏 (安全性). 例外路径仍确定性 (counter 推进可复现); 若旧 mock 消失, mock 回退 counter=0 候选 (跨轮振荡是本裁决的已知代价).
+
 **Properties**:
-- `prop_redact_ir_idempotent`: 对同一 (IrRequest, SecretTable, init_seed), 两次 `redact_ir` 产出语义相等的 RedactionMap.
-- `prop_same_policy_same_messages_same_mock`: 在多轮对话中, 同一 secret 在同一上下文下得到同一 mock (mock 在会话全程稳定).
-- `prop_policy_change_invalidates_all_mocks`: policy 变动 (添加/删除/编辑任一 secret) 改变 init_seed → 所有 mock 变化 (此为 per-request seed 模型的已知代价).
+- `prop_c3_redact_ir_idempotent`: 对同一 (IrRequest, SecretTable, init_seed), 两次 `redact_ir` 产出语义相等的 RedactionMap. (legacy C3 命名) ✅ `src/redact.rs::prop_c3_redact_ir_idempotent`.
+- `prop_same_policy_same_messages_same_mock`: 在多轮对话中 (IR 前缀增长, 历史不含旧 mock), 同一 secret 得到同一 mock (mock 在会话全程稳定, 前缀缓存友好核心声明). ✅ `src/redact.rs::prop_same_policy_same_messages_same_mock` + 多 secret 交互变体 `prop_same_policy_same_messages_same_mock_multi_secret`.
+- `prop_policy_change_invalidates_all_mocks`: policy 变动 (添加/删除/编辑任一 secret) 改变 init_seed → 所有 mock 变化 (此为 per-request seed 模型的已知代价). ✅ `src/redact.rs::prop_policy_change_invalidates_all_mocks`.
+- `prop_mock_changes_when_ir_contains_old_mock_exception`: 例外场景锁定 — IR 含旧 mock 时新 mock 实质必然不同 (碰撞概率可忽略), 但 RED-2 (新 mock 不在 pre-replace IR) + RED-6 (round-trip 恒等, 旧 mock 不被触碰) + 确定性仍成立. ✅ `src/redact.rs::prop_mock_changes_when_ir_contains_old_mock_exception`.
 
 ### RED-4 单射性 + 降级跳过
 
@@ -774,3 +779,4 @@
 | 2026-07-28 | UI-4/5/6 | 新增 UI-4 keyed reconciliation + UI-5 末轮 response 独立 drawer + UI-6 timeline 滚动状态机 | 前端不变量从 AGENTS.md I1-I3 扩展为 UI-1..UI-6, 完整收录 keyed reconciliation / drawer overlay / followMode 状态机 |
 | 2026-07-29 | FWD-1 | FWD-1 流式响应半段式 (`prop_streaming_response_half_byte_exact`) 追加 "理想 vs 现状" 注记: 字面 byte-exact 在 `same_proto_restore` 路径不成立, 当前守卫语义等价弱化形式 | 按 §0.5 漂移处理流程存档; 完整 byte-exact 需独立架构改动 (字节级扫描替换) |
 | 2026-08-02 | UI-6 | 新增 `prop_follow_invariant_under_new_round` (follow 闭合不变量): follow 状态在任意新 round 插入下不被翻转 + 末轮 request 不被 drawer 遮挡 (几何允许区间内); 声明 `contentEnd > wrapH - GAP - minH` 区间豁免 | 现有 `prop_follow_new_round_auto_scroll` 只在"长内容稳态"断言结果 (距底 < 100), 不守卫机制本身; 历史 bug: 短内容 (`contentEnd ≤ wrapH`) + drawer 已显示时, placeholder=0 不提供滚动空间, `bottomScrollTarget` 想预留 `drawerH+GAP` 但被 `maxScroll=0` clamp, 末轮被 drawer 遮挡; 修复方案: `updateResponseDrawerLayout` 在 follow + 短内容 + drawer 遮挡时压缩 drawer 到 `wrapH - contentEnd - GAP` (派生属性, 无外部 state) |
+| 2026-08-15 | RED-3 | 新增例外场景裁决: pre-replace IR 含旧 mock 时允许 mock 变化 (probing counter 推进), 理由是 RED-2/RED-6 保护 restore 正确性优先于缓存稳定性; 补跨轮次 property (原 3 条契约 property 名零同名测试, 幂等性仅有 legacy C3 命名的同 IR 重复调用等价物, 跨轮次稳定性零覆盖) | #143: RED-2↔RED-3 设计张力未裁决 — 客户端把 mock 回传进历史 (上游 parse 失败 fallback 路径) 后, 同一 secret 的 mock 跨轮振荡, 上游前缀缓存反复失效; 定性为经济性代价 (token 费用) 而非安全泄露, 裁决维持现状 (restore 正确性优先), 例外由 `prop_mock_changes_when_ir_contains_old_mock_exception` 锁定 |
