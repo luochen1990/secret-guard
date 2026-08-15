@@ -33,6 +33,17 @@ on:
   pull_request:
   workflow_dispatch: # 手动重试: forgejo UI → Actions → ci → Run workflow
 
+# PR 并发去旧 (issue #149-2): 同 PR 快速多次 push 时, 旧 run 的结果已无意义 (会被新
+# push 覆盖), 却在 runner single-job 假设下串行占用 runner, 让最新 push 的反馈延迟
+# 20min+. 按 PR number 分组 + cancel-in-progress 取消旧 run, 最新 push 立即开跑.
+# 非 PR 事件 (push master / dispatch) 的 group fallback 到 commit sha — push 与
+# dispatch 同 SHA 同在飞行中时后者会取消前者 (窗口极窄, 属良性 — 手动重试通常正是
+# 想取代在飞的自动 run). 注意: 这是 "同一 PR 的 run 之间" 去重, 与 runner 层
+# single-job 互斥 (见 check job env 段注释) 正交 — 后者约束 "不同 run 之间" 的并发.
+concurrency:
+  group: ci-pr-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
 jobs:
   pre:
     runs-on: vm-nix
@@ -70,7 +81,15 @@ jobs:
     # 双重去重: 事件去重 (push 仅 master) + 内容去重 (已有成功记录则跳过);
     # workflow_dispatch 直通 (pre 被 skip 时 should_skip 为空, != 'true' 仍跑)
     if: ${{ (github.event_name != 'push' || github.ref == 'refs/heads/master') && needs.pre.outputs.should_skip != 'true' }}
-    timeout-minutes: 20
+    # 冷启动预算 (issue #149-1): 持久卷全清后需串行完成 debug 插桩编译 (~20min) →
+    # 测试 → release LTO bench (10-20min) → playwright → audit → nix build
+    # (冷 store 全量 vendor 编译, 自身 timeout 30min), 双冷 (卷+store 同时重建,
+    # 仅 VM 首建/重建时出现) 场景总计可达 ~70min. 取 75min 留余量 (正常热路径 ~10min,
+    # 单冷启动 ~45-50min). 注意 job timeout 是硬上限, 超时算 job failure 会阻塞合并,
+    # continue-on-error 救不了 — 预算必须把非阻塞 step 的最坏耗时也计入. 不拆独立
+    # bench/nix job: 拆 job 会丢 CARGO_TARGET_DIR 跨步复用 (release 缓存与 debug 缓存
+    # 同卷) 且多一次 checkout, 改动成本高于调 timeout.
+    timeout-minutes: 75
     # 评论 PR 需要 write 权限 (仅 PR 事件下的 diff 报告 step 用). Forgejo Actions 自动注入
     # GITHUB_TOKEN 默认有此权限, 显式声明遵循最小权限原则.
     permissions:
