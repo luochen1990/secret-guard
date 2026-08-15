@@ -57,6 +57,11 @@ PATCH  /__sg/api/api-keys/{id}/toggle
 
 所有响应带 `Cache-Control: no-store`, 避免浏览器对自动刷新返回缓存内容.
 
+> **POST 的 `generated_id` 明示位** (#164 子项 6): secrets / providers 的 POST 请求
+> 不传 `id` (或传空串) 时, 服务端自动生成 UUID v4, 并在 201 响应体额外携带
+> `"generated_id": true` (显式传 id 时该字段缺席). 脚本用户可据此感知 id 是服务端
+> 生成的; 旧客户端忽略新字段即可, 向后兼容.
+
 > 注: 旧的 `GET /api/records` (扁平分页) + `GET /api/nodes/{id}/timeline` (基于 node_id)
 > 已删除, 由 session-aware sync API 替代. 详见 `dag` 模块的 session_rounds /
 > timeline_view / timeline_diff / sync_snapshot.

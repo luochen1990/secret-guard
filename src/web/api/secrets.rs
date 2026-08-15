@@ -12,7 +12,7 @@ use crate::config::OverrideMode;
 use crate::secrets::{EffectiveSecret, SecretCategory, SecretEntry};
 use crate::state::{AppState, NO_STORE};
 
-use super::crud::{DecisionRequest, create_flow, decision_flow, delete_flow, update_flow};
+use super::crud::{Created, DecisionRequest, create_flow, decision_flow, delete_flow, update_flow};
 use super::error::ApiError;
 
 pub async fn list_secrets(State(state): State<AppState>) -> impl IntoResponse {
@@ -33,7 +33,7 @@ pub async fn create_secret(
     State(state): State<AppState>,
     Json(payload): Json<CreateSecretRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let ev = create_flow(
+    let created: Created<EffectiveSecret> = create_flow(
         &state.secrets,
         "secret",
         || payload.into_entry(),
@@ -47,7 +47,7 @@ pub async fn create_secret(
                 .map_err(ApiError::validation)
         },
     )?;
-    Ok((StatusCode::CREATED, NO_STORE, Json(ev)))
+    Ok((StatusCode::CREATED, NO_STORE, Json(created)))
 }
 
 pub async fn update_secret(

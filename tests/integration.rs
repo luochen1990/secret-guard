@@ -2129,6 +2129,89 @@ async fn secrets_api_create_lists_update_delete() {
     assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
 }
 
+/// #164 子项 6: POST 不传 id 时服务端生成 UUID, 201 响应体以 `generated_id: true`
+/// 明示 (脚本用户可感知 id 是服务端生成的, 而非自己传入的); 显式传 id 时无该字段.
+#[tokio::test]
+async fn secrets_api_generated_id_is_signaled() {
+    let upstream = spawn_mock_upstream().await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
+    let client = reqwest::Client::new();
+
+    // 不传 id → 201 + generated_id: true + UUID 形态的 id.
+    let resp = client
+        .post(format!("{proxy_url}/__sg/api/secrets"))
+        .json(&serde_json::json!({ "value": "sk-gen-123456789" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let created: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(created["generated_id"], serde_json::json!(true));
+    let id = created["id"].as_str().unwrap().to_string();
+    assert!(
+        uuid::Uuid::parse_str(&id).is_ok(),
+        "id should be a generated UUID v4: {id}"
+    );
+
+    // 显式传 id → 201 + 无 generated_id 字段 (向后兼容的加法: 老字段原样).
+    let resp = client
+        .post(format!("{proxy_url}/__sg/api/secrets"))
+        .json(&serde_json::json!({
+            "id": "explicit-id-1",
+            "value": "sk-explicit-123456789",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let created: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(created["id"], "explicit-id-1");
+    assert!(
+        created.get("generated_id").is_none(),
+        "explicit id must not carry generated_id: {created}"
+    );
+
+    // 清理 (两个 secret 均为 dynamic-only, 可删).
+    for id in [id.as_str(), "explicit-id-1"] {
+        let resp = client
+            .delete(format!("{proxy_url}/__sg/api/secrets/{id}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+    }
+}
+
+/// #164 子项 6 (providers 侧同构): POST providers 不传 id 生成 UUID 并明示.
+#[tokio::test]
+async fn providers_api_generated_id_is_signaled() {
+    let upstream = spawn_mock_upstream().await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{proxy_url}/__sg/api/providers"))
+        .json(&serde_json::json!({
+            "protocol": "openai",
+            "base_url": upstream.url(),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let created: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(created["generated_id"], serde_json::json!(true));
+    let id = created["id"].as_str().unwrap().to_string();
+    assert!(uuid::Uuid::parse_str(&id).is_ok(), "id: {id}");
+
+    let resp = client
+        .delete(format!("{proxy_url}/__sg/api/providers/{id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+}
+
 #[tokio::test]
 async fn secrets_api_rejects_empty_value() {
     let upstream = spawn_mock_upstream().await;

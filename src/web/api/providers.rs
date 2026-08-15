@@ -13,7 +13,7 @@ use crate::config::OverrideMode;
 use crate::provider::{EffectiveProvider, Protocol, Provider};
 use crate::state::{AppState, NO_STORE};
 
-use super::crud::{DecisionRequest, decision_flow};
+use super::crud::{Created, DecisionRequest, decision_flow};
 use super::crud::{create_flow, delete_flow, update_flow};
 use super::error::ApiError;
 
@@ -37,13 +37,13 @@ pub async fn create_provider(
     State(state): State<AppState>,
     Json(payload): Json<UpsertProviderRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let ev = create_flow(
+    let created: Created<EffectiveProvider> = create_flow(
         &state.providers,
         "provider",
         || payload.into_provider(),
         |_| Ok(()), // provider 无 secret 式的 resolve 钩子 (validate 在 upsert 内).
     )?;
-    Ok((StatusCode::CREATED, NO_STORE, Json(ev)))
+    Ok((StatusCode::CREATED, NO_STORE, Json(created)))
 }
 
 pub async fn update_provider(

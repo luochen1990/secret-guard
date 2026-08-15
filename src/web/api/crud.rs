@@ -14,8 +14,8 @@
 //!   `DynamicTable<Provider>` 各自实现.
 //!
 //! 流程函数 (错误消息与原两份实现逐字相同, 仅 kind_label 参数化):
-//! - [`create_flow`]: into-entry → id 空则 Uuid → validate 钩子 → 冲突检查 →
-//!   upsert (Updated 视为并发冲突) → 查回 effective → 201.
+//! - [`create_flow`]: into-entry → id 空则 Uuid (201 响应体以 `generated_id` 明示) →
+//!   validate 钩子 → 冲突检查 → upsert (Updated 视为并发冲突) → 查回 effective → 201.
 //! - [`update_flow`]: 存在性检查 → build 钩子 → 填 id → validate 钩子 → upsert →
 //!   查回 → 200.
 //! - [`delete_flow`]: delete → DeleteOutcome 分类 (static-only 409 / 不存在 404) → 204.
@@ -173,19 +173,37 @@ fn classify_delete_outcome(
 
 // ─── 泛型流程函数 ───────────────────────────────────────────────────────────
 
+/// create 成功的 201 响应体: effective 视图 + `generated_id` 明示位 (#164 子项 6).
+///
+/// POST 不传 id 时服务端静默生成 UUID, 脚本用户拿到的 id 与预期不符却无提示.
+/// 现在在响应体加 `generated_id: true` 明示 (仅生成时出现, 显式传 id 时省略 —
+/// 向后兼容的加法, 旧客户端忽略新字段即可). WebUI 前端依赖自动生成逻辑不受影响.
+#[derive(Serialize)]
+pub(crate) struct Created<T> {
+    #[serde(flatten)]
+    effective: T,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    generated_id: bool,
+}
+
 /// create 通用流程: 构造 entry → id 空则 Uuid → validate 钩子 → effective 冲突检查 →
 /// upsert (Updated = 并发创建, 409) → 查回 effective 视图.
 ///
-/// 返回 effective_view, handler 加 `(StatusCode::CREATED, NO_STORE, Json)` 包装.
+/// 返回 [`Created`] (effective 视图 + generated_id 明示位), handler 加
+/// `(StatusCode::CREATED, NO_STORE, Json)` 包装.
 pub(crate) fn create_flow<T: CrudTable>(
     table: &T,
     kind_label: &str,
     build: impl FnOnce() -> Result<T::Entry, ApiError>,
     validate: impl FnOnce(&mut T::Entry) -> Result<(), ApiError>,
-) -> Result<T::Effective, ApiError> {
+) -> Result<Created<T::Effective>, ApiError>
+where
+    T::Effective: Serialize,
+{
     let mut entry = build()?;
-    // create 模式: 若没传 id, 自动生成.
-    if entry.entry_id().is_empty() {
+    // create 模式: 若没传 id, 自动生成. 记录该事实, 201 响应体明示 (脚本用户可感知).
+    let generated_id = entry.entry_id().is_empty();
+    if generated_id {
         entry.set_entry_id(uuid::Uuid::new_v4().to_string());
     }
     validate(&mut entry)?;
@@ -204,7 +222,10 @@ pub(crate) fn create_flow<T: CrudTable>(
         )));
     }
     // upsert_dynamic 不返回 effective 视图, 这里再查一次给前端 (低成本, 创建场景罕见).
-    Ok(effective_find_by_id(table.snapshot(), saved.entry_id()))
+    Ok(Created {
+        effective: effective_find_by_id(table.snapshot(), saved.entry_id()),
+        generated_id,
+    })
 }
 
 /// update 通用流程: 存在性检查 (404) → build 钩子 (构造 entry + 类型特定预处理) →
