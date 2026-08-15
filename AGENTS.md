@@ -301,7 +301,7 @@ URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标
 | 文件 | 角色 | 谁写 | 进入 git? |
 |---|---|---|---|
 | `secret-guard.toml` | **声明式 (static)** 配置: providers / secrets / server / redact / auth. 进程内只读. | 用户手写 | ✅ 推荐 |
-| `secret-guard.state.toml` | **动态 (dynamic)** 状态: WebUI 编辑结果 + 对 static 项的 decision. 删除即可重置. | 程序自动 | ❌ 推荐 .gitignore |
+| `secret-guard.state.toml` | **动态 (dynamic)** 状态: WebUI 编辑结果 + 对 static 项的 decision. 删除即可重置. **含明文敏感数据** (dynamic secret value / 显式写入的 api_key), 敏感级别与 static 同级 (#157). | 程序自动 | ❌ 推荐 .gitignore |
 
 合并语义 (OverrideMode: Default / PreferStatic / Disabled)、Effective source 4 种、
 CRUD 操作语义、DynamicTable 持久化策略、跨表并发安全的详尽描述见 `src/config.rs` 头部.

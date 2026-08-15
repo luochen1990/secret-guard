@@ -52,7 +52,11 @@ secret-guard 采用双层配置, 同一份实体可同时有 static 与 dynamic 
 | 文件 | 角色 | 谁写 | 进 git? |
 |---|---|---|---|
 | `secret-guard.toml`       | **声明式 (static)**: providers / secrets / server / redact / auth. 进程内只读. | 用户手写 | 推荐 |
-| `secret-guard.state.toml` | **动态 (dynamic)**: WebUI 编辑结果 + 对 static 项的 decision. 删除即可重置. | 程序自动 | 推荐 .gitignore |
+| `secret-guard.state.toml` | **动态 (dynamic)**: WebUI 编辑结果 + 对 static 项的 decision. 删除即可重置. | 程序自动 | 强烈推荐 .gitignore |
+
+> ⚠️ **敏感数据警示**: `secret-guard.state.toml` 含**明文**敏感数据 — 通过 WebUI 创建的
+> dynamic secret 的 `value`、显式提供的 provider `api_key` 都以明文落盘. 其敏感级别与
+> `secret-guard.toml` **同级**: 务必加入 `.gitignore`, 误 commit 会把 secret 泄漏进版本历史.
 
 合并语义 (`OverrideMode`: Default / PreferStatic / Disabled) 与各字段详情见 `AGENTS.md` 与 `src/config.rs` 头部注释.
 
