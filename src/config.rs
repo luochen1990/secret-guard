@@ -1126,17 +1126,6 @@ impl<T: DynamicEntry> DynamicTable<T> {
             .collect()
     }
 
-    /// 直接查 dynamic 层的原始条目 (不脱敏, 不与 static 合并). 供 update handler
-    /// 保留旧值时区分来源 (#157): dynamic 自有值可安全回填进 override; static 来源
-    /// 的已 resolve 值绝不回填 (否则明文落盘 state.toml). 不存在 → None.
-    pub fn get_dynamic(&self, id: &str) -> Option<T> {
-        self.dynamic_entries
-            .read()
-            .iter()
-            .find(|e| e.id() == id)
-            .cloned()
-    }
-
     // ─── 写: dynamic 层 CRUD + decision ────────────────────────────────
 
     /// 仅 dynamic 层 CRUD —— upsert. 若 id 同时存在于 static, 此操作创建 / 更新 override.
