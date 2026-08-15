@@ -537,13 +537,13 @@
 **陈述**:
 - POST 创建 dynamic-only item, id 与 static 冲突 → 409.
 - PUT 编辑: id 在 static 中 → 自动 fork dynamic override (git-style).
-- DELETE 仅作用于 dynamic.
+- DELETE 仅作用于 dynamic-only item; **只要 static 基线存在 (无论有无 dynamic override), 一律 409** (#156: 旧 "删 override 露出 static 返回 204" 语义让用户误以为删除成功, 而 item 仍存活, 在"下线止血"场景下是安全事故; 撤销 override 的正道是 decision).
 - PATCH `/{id}/decision` 切换对 static id 的决策.
 
 **Properties**:
 - `prop_post_conflict_with_static_returns_409`: POST 创建与 static 冲突的 id → 409.
 - `prop_put_forks_dynamic_when_id_in_static`: PUT 编辑 static id → 创建 dynamic override.
-- `prop_delete_dynamic_only_succeeds`: DELETE 仅作用于 dynamic, static id → 409.
+- `prop_delete_static_baseline_rejected`: DELETE static 基线存在的 id (static-only / static+override) → 409; dynamic-only → 204 且从 effective 消失.
 - `prop_patch_decision_toggles_override_mode`: PATCH decision 正确切换 OverrideMode.
 
 ### CFG-4 持久化原子性
@@ -787,3 +787,4 @@
 | 2026-08-15 | RED-4 | 陈述参数化: 降级行为从单一 fail-open 变为 `[redact] on_probe_exhausted` 可配置二选一 (fail_open 跳过该 secret / fail_closed 拒绝转发 503); property 按模式二分并挂实际测试名 (原 `prop_probing_exhausted_skips_not_panics` / `prop_redact_error_never_carries_secret_value` 为幻影名); `prop_redact_error_never_carries_secret_value` 交叉引用 SEC-2 | #150: `on_probe_exhausted = "fail_closed"` 已实现且测试锁定, 但契约仍只描述 fail-open 分支, 在 fail_closed 配置下字面为假 (§0.5 漂移处理流程真空案例); 编号不变, 属"调整"非"作废" |
 | 2026-08-15 | RED-3 | 新增例外场景裁决: pre-replace IR 含旧 mock 时允许 mock 变化 (probing counter 推进), 理由是 RED-2/RED-6 保护 restore 正确性优先于缓存稳定性; 补 3 条跨轮次 property (原 3 条契约 property 名零同名测试, 幂等性仅有 legacy C3 命名的同 IR 重复调用等价物, 跨轮次稳定性零覆盖) | #143: RED-2↔RED-3 设计张力未裁决 — 客户端把 mock 回传进历史 (上游 parse 失败 fallback 路径) 后, 同一 secret 的 mock 跨轮振荡, 上游前缀缓存反复失效; 定性为经济性代价 (token 费用) 而非安全泄露, 裁决维持现状 (restore 正确性优先), 例外由 `prop_mock_changes_when_ir_contains_old_mock_exception` 锁定 |
 | 2026-08-15 | DTO-8 | **作废** (编号永久作废不重用): 引用的 `GET /records` 列表 API 与 `prop_record_summary_excludes_body` 已随 session-aware sync API 取代删除而消亡, 全仓零同名实现 | #147: 契约文档漂移走查 — 条目未随 API 删除同步标作废, 违反 §0.2 "删除作废不重用" 规则 |
+| 2026-08-15 | CFG-3 | DELETE 语义收紧: static 基线存在 (含 static+dynamic override) 一律 409, 仅 dynamic-only 可 DELETE (204); 原 property `prop_delete_dynamic_only_succeeds` 改名 `prop_delete_static_baseline_rejected` 并扩展三态断言 | #156: 旧 "删 override 露出 static 返回 204" 语义让用户误以为删除成功, provider 仍存活继续转发, "下线止血"场景下是安全事故; 且与 secrets 侧 "首次即 409" 行为不一致. 人工授权 (issue 给出方案 A/B 二选一, 采纳 A) |

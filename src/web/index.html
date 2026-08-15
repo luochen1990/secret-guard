@@ -3438,7 +3438,7 @@
     //     见各 cfg 项, 含义自明.
     //   extraActions?: Record<actionName, (id: string) => void> — 可选.
     //     kind 特定的额外按钮动作 (如 provider 的 endpoints), 由 bindTableEvents 的
-    //     click 委托在通用 edit/delete/revert 之外分派. 仅在该 kind 的行渲染了对应
+    //     click 委托在通用 edit/delete 之外分派. 仅在该 kind 的行渲染了对应
     //     data-action 按钮时才会触发.
 
     const KINDS = {
@@ -3478,6 +3478,8 @@
     };
 
     // 通用 actions 按钮 (source 一致 → 按钮一致). 返回 HTML 字符串.
+    // 注: dynamic_override (static 基线存在) 不渲染 delete/revert — #156 后 DELETE
+    // 对其必 409; 撤销 override / 停用走 decision 选择器 (prefer_static / disabled).
     function rowActions(item) {
       const id = escapeHtml(item.id);
       const s = item.source;
@@ -3485,12 +3487,10 @@
         return `<button class="btn" data-action="edit" data-id="${id}">override</button>`;
       }
       if (s === 'static_preferred') {
-        return `<button class="btn" data-action="edit" data-id="${id}">edit dyn</button>`
-             + `<button class="btn btn-danger" data-action="revert" data-id="${id}">revert</button>`;
+        return `<button class="btn" data-action="edit" data-id="${id}">edit dyn</button>`;
       }
       if (s === 'dynamic_override') {
-        return `<button class="btn" data-action="edit" data-id="${id}">edit</button>`
-             + `<button class="btn btn-danger" data-action="revert" data-id="${id}">revert</button>`;
+        return `<button class="btn" data-action="edit" data-id="${id}">edit</button>`;
       }
       return `<button class="btn" data-action="edit" data-id="${id}">edit</button>`
            + `<button class="btn btn-danger" data-action="delete" data-id="${id}">delete</button>`;
@@ -3506,8 +3506,7 @@
         const id = btn.dataset.id;
         const action = btn.dataset.action;
         if (action === 'edit') cfg.openForm(cfg.list().find(x => x.id === id));
-        else if (action === 'delete') deleteItem(kind, id, false);
-        else if (action === 'revert') deleteItem(kind, id, true);
+        else if (action === 'delete') deleteItem(kind, id);
         else if (cfg.extraActions && cfg.extraActions[action]) cfg.extraActions[action](id);
       });
       body.addEventListener('change', async (e) => {
@@ -3571,13 +3570,11 @@
       if (replaceTbodyIfChanged(body, html)) renderStats(cfg.statsId, list);
     }
 
-    // 通用 delete / revert. revert = true 时跳过 confirm (用更准确的提示).
-    async function deleteItem(kind, id, revert) {
+    // 通用 delete. #156 后 DELETE 仅对 dynamic-only item 成功 (204); static 基线
+    // 存在时后端 409, 错误消息含 decision 指引, 由下方 !r.ok 分支 alert 提示.
+    async function deleteItem(kind, id) {
       const cfg = KINDS[kind];
-      const msg = revert
-        ? `Revert ${id} to its static baseline (drop dynamic override)?`
-        : `Delete dynamic ${kind} ${id}?`;
-      if (!confirm(msg)) return;
+      if (!confirm(`Delete dynamic ${kind} ${id}?`)) return;
       const r = await fetch(`${cfg.api}/${encodeURIComponent(id)}`, { method: 'DELETE' });
       if (!r.ok) {
         const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));

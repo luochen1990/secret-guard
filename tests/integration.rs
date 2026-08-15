@@ -90,6 +90,13 @@ fn provider_with(id: &str, proto: Protocol, base_url: &str) -> Provider {
         name: Some(id.into()),
     }
 }
+
+/// #157 族: 指定 inline api_key 的 OpenAI provider (openai_provider 变体).
+fn keyed_provider(id: &str, base_url: &str, api_key: &str) -> Provider {
+    let mut p = openai_provider(id, base_url);
+    p.api_key = api_key.into();
+    p
+}
 #[allow(clippy::too_many_arguments)]
 async fn spawn_proxy_full(
     providers: Vec<Provider>,
@@ -97,10 +104,14 @@ async fn spawn_proxy_full(
     records: ConversationDag,
     secrets: SecretTable,
 ) -> String {
-    spawn_proxy_static_dynamic(vec![], providers, upstream, records, secrets).await
+    spawn_proxy_static_dynamic(vec![], providers, upstream, records, secrets)
+        .await
+        .0
 }
 
 /// 显式同时指定 static + dynamic 两层.
+/// 返回 (proxy_url, providers 表的 state.toml 路径) — 后者供测试断言 state 文件内容
+/// (#157: 验证明文 api_key 不落盘).
 /// 旧 helper (`spawn_proxy_full`) 把所有传入视为 dynamic, 仍保持向后兼容.
 #[allow(clippy::too_many_arguments)]
 async fn spawn_proxy_static_dynamic(
@@ -109,7 +120,7 @@ async fn spawn_proxy_static_dynamic(
     upstream: reqwest::Client,
     records: ConversationDag,
     secrets: SecretTable,
-) -> String {
+) -> (String, std::path::PathBuf) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let state_path = tmp_state_path("sg-state");
@@ -130,7 +141,7 @@ async fn spawn_proxy_static_dynamic(
 
     // SecretTable 由调用方构造 (内部已带独立的 decisions + persist_lock).
     // 测试场景下 secrets 与 providers 不共享 state 文件, 不影响测试结论.
-    let _ = (decisions, persist_lock, state_path);
+    let _ = (decisions, persist_lock);
     let proxy = AppState {
         upstream,
         providers: provider_table,
@@ -146,7 +157,7 @@ async fn spawn_proxy_static_dynamic(
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    format!("http://{addr}")
+    (format!("http://{addr}"), state_path)
 }
 
 /// 启动 secret-guard, 可配置 global_mock_prefix (用于测试 prefix 拒绝等场景).
@@ -2455,23 +2466,8 @@ async fn providers_api_update_preserves_api_key_when_omitted() {
 async fn providers_api_update_preserves_api_key_on_static_fork() {
     // 编辑 static-only provider 时, api_key 省略应从 static baseline 保留.
     let upstream = spawn_mock_upstream().await;
-    let static_provider = Provider {
-        id: "oa-static".into(),
-        protocol: Protocol::OpenAI,
-        base_url: upstream.url(),
-        api_key: "sk-static-key".into(),
-        api_key_file: None,
-        enabled: true,
-        name: Some("Static".into()),
-    };
-    let proxy_url = spawn_proxy_static_dynamic(
-        vec![static_provider],
-        vec![],
-        reqwest::Client::new(),
-        ConversationDag::new(64, 500, 1),
-        test_secret_table(),
-    )
-    .await;
+    let static_provider = keyed_provider("oa-static", &upstream.url(), "sk-static-key");
+    let (proxy_url, _state_path) = spawn_with_static(static_provider).await;
     let client = reqwest::Client::new();
 
     // PUT 编辑 static-only id (不传 api_key) → 触发 fork, api_key 应来自 static.
@@ -2888,6 +2884,19 @@ async fn spawn_with_static_and_dynamic(
         test_secret_table(),
     )
     .await
+    .0
+}
+
+/// #157 族: 单 static provider + 空 dynamic, 返回 (url, state_path) 供断言落盘内容.
+async fn spawn_with_static(p: Provider) -> (String, std::path::PathBuf) {
+    spawn_proxy_static_dynamic(
+        vec![p],
+        vec![],
+        reqwest::Client::new(),
+        ConversationDag::new(64, 500, 1),
+        test_secret_table(),
+    )
+    .await
 }
 
 #[tokio::test]
@@ -3102,32 +3111,41 @@ async fn delete_static_only_provider_is_rejected() {
         reqwest::StatusCode::CONFLICT,
         "static 永不可删, 必须走 decision=disabled"
     );
+    // #156: 错误体必须含 decision 指引 (与 secrets 侧同构的 409 body).
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["error"].as_str().unwrap().contains("decision"),
+        "409 body must point to the decision endpoint, got: {body}"
+    );
 }
 
+/// #156: static + dynamic override 时 DELETE 也必须 409 (三态之一).
+/// 旧行为返回 204 (删 override 露出 static), 让用户误以为删除成功 — 已废除.
 #[tokio::test]
-async fn delete_dynamic_override_keeps_static_baseline() {
-    let mut upstream = spawn_mock_upstream().await;
-    let _m = upstream
-        .mock("POST", "/v1/chat/completions")
-        .with_body("static-back")
-        .create_async()
-        .await;
-
+async fn delete_provider_with_override_is_rejected() {
+    let upstream = spawn_mock_upstream().await;
     let static_p = openai_provider("p", &upstream.url());
-    let mut dynamic_p = openai_provider("p", "https://dynamic-invalid.example");
-    dynamic_p.api_key = "override-key".into();
+    let dynamic_p = openai_provider("p", "https://dynamic-invalid.example");
     let proxy_url = spawn_with_static_and_dynamic(vec![static_p], vec![dynamic_p]).await;
     let client = reqwest::Client::new();
 
-    // 删除 dynamic override → 回到 static.
     let resp = client
         .delete(format!("{proxy_url}/__sg/api/providers/p"))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CONFLICT,
+        "static 基线存在时 DELETE 必须拒绝, 无论有无 dynamic override"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["error"].as_str().unwrap().contains("decision"),
+        "409 body must point to the decision endpoint, got: {body}"
+    );
 
-    // List 显示 source 回到 static.
+    // override 未被删除: list 中该 id 仍是 dynamic_override, 路由仍走 dynamic.
     let body: serde_json::Value = client
         .get(format!("{proxy_url}/__sg/api/providers"))
         .send()
@@ -3138,12 +3156,44 @@ async fn delete_dynamic_override_keeps_static_baseline() {
         .unwrap();
     let arr = body.get("providers").unwrap().as_array().unwrap();
     assert_eq!(arr.len(), 1);
-    assert_eq!(arr[0]["source"], "static");
+    assert_eq!(arr[0]["source"], "dynamic_override");
+}
 
-    // 路由走 static (mock), 返回 ok.
-    let resp = proxy_request(&proxy_url, "POST", "/o/p/v1/chat/completions", "{}", &[]).await;
-    assert_eq!(resp.0, reqwest::StatusCode::OK);
-    assert_eq!(resp.1, "static-back");
+/// #156: 纯 dynamic provider DELETE → 204 (三态之一) + 真正删除.
+#[tokio::test]
+async fn delete_dynamic_only_provider_succeeds() {
+    let upstream = spawn_mock_upstream().await;
+    let d = openai_provider("dyn-only", &upstream.url());
+    let proxy_url = spawn_with_static_and_dynamic(vec![], vec![d]).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .delete(format!("{proxy_url}/__sg/api/providers/dyn-only"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+
+    // 真正删除: list 为空, 转发 404.
+    let body: serde_json::Value = client
+        .get(format!("{proxy_url}/__sg/api/providers"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body.get("providers").unwrap().as_array().unwrap().len(), 0);
+
+    let resp = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/dyn-only/v1/chat/completions",
+        "{}",
+        &[],
+    )
+    .await;
+    assert_eq!(resp.0, reqwest::StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -3210,7 +3260,7 @@ async fn secret_decision_disabled_drops_from_redaction() {
     let static_secrets = vec![secret("static-s", real_secret)];
     let secrets = SecretTable::new(static_secrets, vec![], decisions, secret_path);
 
-    let proxy_url = spawn_proxy_static_dynamic(
+    let (proxy_url, _state_path) = spawn_proxy_static_dynamic(
         vec![provider],
         vec![],
         reqwest::Client::new(),
@@ -4230,6 +4280,7 @@ async fn spawn_with_secrets(
         secrets,
     )
     .await
+    .0
 }
 
 /// 拉取 effective secrets 列表, 返回 (id → EffectiveSecret JSON) 映射, 便于断言.
@@ -4454,17 +4505,17 @@ mod cfg3_proptests {
             })?
         }
 
-        /// CFG-3: DELETE 仅作用于 dynamic, static id → 409.
+        /// CFG-3: DELETE 仅作用于 dynamic-only item, static 基线存在 → 409 (#156).
         ///
         /// scenario 提供三类 id:
-        /// 1) static-only id (无 dynamic): DELETE 必须返回 409 (契约: "static id → 409",
-        ///    提示用 PATCH .../decision + mode=disabled).
+        /// 1) static-only id (无 dynamic): DELETE 必须返回 409 (static 基线存在).
         /// 2) dynamic-only id (无 static): DELETE 必须返回 204, 且从 effective 消失.
-        /// 3) both id (static + dynamic override): DELETE 必须返回 204, 移除 dynamic override
-        ///    但保留 static 基线 (effective 中该 id 仍在, source 回落到 static).
+        /// 3) both id (static + dynamic override): DELETE 必须返回 **409** (#156 三态收紧:
+        ///    旧 "204 删 override 露出 static" 语义误导用户以为删除成功, 已废除;
+        ///    撤销 override 走 decision, 不走 DELETE).
         /// scenario 保证三桶均 ≥1.
         #[test]
-        fn prop_delete_dynamic_only_succeeds(scenario in arb_scenario()) {
+        fn prop_delete_static_baseline_rejected(scenario in arb_scenario()) {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
                 let proxy_url = spawn_with_secrets(
@@ -4494,22 +4545,22 @@ mod cfg3_proptests {
                 prop_assert!(!eff.contains_key(&dyn_id),
                     "deleted dynamic-only id must disappear from effective");
 
-                // ── both id (static + dynamic override) → 204 + 保留 static 基线 ──
+                // ── both id (static + dynamic override) → 409 + override 未被删除 ──
                 // arb_scenario 保证 both ≥1 (static + dynamic override 都存在).
-                let (both_id, sv, _dv) = scenario.both.first().unwrap().clone();
-                let sv_len = sv.chars().count();
+                let (both_id, _sv, dv) = scenario.both.first().unwrap().clone();
+                let dv_len = dv.chars().count();
                 let resp = client
                     .delete(format!("{proxy_url}/__sg/api/secrets/{both_id}"))
                     .send().await.unwrap();
-                prop_assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT,
-                    "DELETE on both id must return 204 (removes dynamic override, keeps static)");
+                prop_assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT,
+                    "DELETE on both id must return 409 (static baseline present, #156)");
                 let eff = fetch_effective_secrets(&client, &proxy_url).await;
                 let kept = eff.get(&both_id)
-                    .expect("both id must remain in effective (static baseline kept after dynamic delete)");
-                prop_assert_eq!(&kept["source"], &"static",
-                    "both id source must fall back to 'static' after dynamic override removed");
-                prop_assert_eq!(&kept["value_length"], &sv_len,
-                    "both id value_length must reflect static baseline after dynamic delete");
+                    .expect("both id must remain in effective (DELETE rejected, override kept)");
+                prop_assert_eq!(&kept["source"], &"dynamic_override",
+                    "both id source must stay dynamic_override (override must NOT be silently dropped)");
+                prop_assert_eq!(&kept["value_length"], &dv_len,
+                    "both id value_length must still reflect the dynamic override");
                 Ok(())
             })?
         }

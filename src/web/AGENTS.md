@@ -40,13 +40,14 @@ POST   /__sg/api/sync   body: {selected?, expanded[]}  → {sessions, rounds, ti
 GET    /__sg/api/secrets
 POST   /__sg/api/secrets
 PUT    /__sg/api/secrets/{id}
-DELETE /__sg/api/secrets/{id}
+DELETE /__sg/api/secrets/{id}            → static 基线存在 (含 override) 一律 409 (#156);
+                                           仅 dynamic-only 可删 (204)
 PATCH  /__sg/api/secrets/{id}/decision     body: {"mode": "default|prefer_static|disabled"}
 
 GET    /__sg/api/providers
 POST   /__sg/api/providers
 PUT    /__sg/api/providers/{id}
-DELETE /__sg/api/providers/{id}
+DELETE /__sg/api/providers/{id}           → 同 secrets (#156)
 PATCH  /__sg/api/providers/{id}/decision
 
 GET    /__sg/api/api-keys

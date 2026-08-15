@@ -10,7 +10,7 @@
 //! - `GET /__sg/api/secrets`                 —— effective secret 列表.
 //! - `POST /__sg/api/secrets`                —— 创建 dynamic secret.
 //! - `PUT /__sg/api/secrets/{id}`            —— 编辑 (static 自动 fork).
-//! - `DELETE /__sg/api/secrets/{id}`         —— 删除 (仅 dynamic).
+//! - `DELETE /__sg/api/secrets/{id}`         —— 删除 (仅 dynamic-only; static 基线一律 409, #156).
 //! - `PATCH /__sg/api/secrets/{id}/decision` —— 切换 OverrideMode.
 //! - `GET/POST/PUT/DELETE/PATCH /__sg/api/providers[/{id}[/decision]]` —— 同上.
 //! - `GET/POST/DELETE/PATCH /__sg/api/api-keys[/{id}[/toggle]]` —— API key CRUD (无条件挂载, 见 api/apikeys.rs).

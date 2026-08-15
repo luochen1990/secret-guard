@@ -18,7 +18,7 @@
 //!   validate 钩子 → 冲突检查 → upsert (Updated 视为并发冲突) → 查回 effective → 201.
 //! - [`update_flow`]: 存在性检查 → build 钩子 → 填 id → validate 钩子 → upsert →
 //!   查回 → 200.
-//! - [`delete_flow`]: delete → DeleteOutcome 分类 (static-only 409 / 不存在 404) → 204.
+//! - [`delete_flow`]: static 基线检查 (存在 → 409) → delete → 不存在 404 → 204.
 //! - [`decision_flow`]: static 检查 → set_decision → ack.
 
 use serde::{Deserialize, Serialize};
@@ -146,29 +146,12 @@ fn effective_find_by_id<I: EffectiveItem>(items: Vec<I>, id: &str) -> I {
         .expect("just upserted; effective view must contain it")
 }
 
-/// delete_dynamic 的 DeleteOutcome 分类: Deleted → 204; NotFound → 区分 static-only
-/// (409 conflict, 提示用 disabled decision) vs 真不存在 (404).
-///
-/// `kind_label` = "secret" | "provider", 用于错误消息.
-fn classify_delete_outcome(
-    outcome: DeleteOutcome,
-    has_static: bool,
-    kind_label: &str,
-    id: &str,
-) -> Result<(), ApiError> {
-    match outcome {
-        DeleteOutcome::Deleted => Ok(()), // 204 No Content.
-        DeleteOutcome::NotFound => {
-            if has_static {
-                Err(ApiError::conflict(format!(
-                    "cannot delete a static {kind_label}; use PATCH .../decision with \
-                     {{\"mode\":\"disabled\"}} to disable it"
-                )))
-            } else {
-                Err(ApiError::not_found(format!("{kind_label} {id} not found")))
-            }
-        }
-    }
+/// "static 基线存在 → DELETE 拒绝 (409)" 的错误消息. secrets / providers 共享 (#156).
+fn static_delete_conflict(kind_label: &str) -> ApiError {
+    ApiError::conflict(format!(
+        "cannot delete a static {kind_label}; use PATCH .../decision with \
+         {{\"mode\":\"disabled\"}} to disable it"
+    ))
 }
 
 // ─── 泛型流程函数 ───────────────────────────────────────────────────────────
@@ -252,18 +235,28 @@ pub(crate) fn update_flow<T: CrudTable>(
     Ok(effective_find_by_id(table.snapshot(), saved.entry_id()))
 }
 
-/// delete 通用流程: delete → outcome 分类 (static-only 409 / 不存在 404).
+/// delete 通用流程: static 基线检查 → delete → 不存在 404.
 /// 成功返回 `()` (handler 包装为 204 空 body).
+///
+/// #156 语义: 只要 static 基线存在 (无论有无 dynamic override), DELETE 一律 409 —
+/// 旧行为 ("先删 override 露出 static" 返回 204) 让用户误以为删除成功, 而 provider
+/// 仍存活继续转发, 在"下线止血"场景下是安全事故. 与 secrets 侧对齐: 撤销 override
+/// 的正道是 decision (PreferStatic / Disabled), 不是 DELETE.
 pub(crate) fn delete_flow<T: CrudTable>(
     table: &T,
     kind_label: &str,
     id: &str,
 ) -> Result<(), ApiError> {
-    // 若 dynamic 有此 id, 删除 (覆盖关系下仅移除 override, static 保留).
-    // 若 dynamic 无此 id 但 static 有, 拒绝删除 (static 永不可写; 提示用 disabled decision).
-    // 用 has_static 直接查 static 层, 不受 decision 影响 (disabled 的 id 也能正确报 409).
+    // 用 has_static 直接查 static 层, 不受 decision 影响 (disabled 的 id 也正确报 409).
+    if table.has_static(id) {
+        return Err(static_delete_conflict(kind_label));
+    }
     let outcome = table.delete(id).map_err(ApiError::from_any)?;
-    classify_delete_outcome(outcome, table.has_static(id), kind_label, id)
+    match outcome {
+        DeleteOutcome::Deleted => Ok(()), // 204 No Content.
+        // static 已由上方 has_static 检查排除, NotFound 只能是真不存在.
+        DeleteOutcome::NotFound => Err(ApiError::not_found(format!("{kind_label} {id} not found"))),
+    }
 }
 
 /// `PATCH /{id}/decision` 的请求 body (secrets / providers 共享).
