@@ -288,6 +288,56 @@ async fn proxy_request(
     (status, text, headers)
 }
 
+// ─── 转发链可观测性测试的 tracing 捕获 (#158/#160/#162/#163) ────────────────
+//
+// thread-scoped capture: `set_default` 设置 thread-local dispatcher 后, 同线程上
+// (含 #[tokio::test] current-thread runtime 内 spawn 的 axum server 任务) 的
+// tracing 事件都路由到捕获 writer, 无需全局 subscriber (并行测试互不干扰).
+
+/// 捕获 tracing 事件文本的 writer (thread-scoped, 见上).
+#[derive(Clone, Default)]
+struct CaptureLog {
+    buf: std::sync::Arc<parking_lot::Mutex<Vec<u8>>>,
+}
+
+impl CaptureLog {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// 返回已捕获日志的文本快照.
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.buf.lock()).into_owned()
+    }
+}
+
+impl std::io::Write for CaptureLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.buf.lock().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// 安装 thread-scoped tracing 捕获, 返回 (日志句柄, guard).
+///
+/// guard 存活期内同线程 ≥ level 的 tracing 事件全部捕获; guard 保持存活到测试
+/// 末尾即可 (无需提前 drop — 捕获窗口只会更大, 断言都是 contains 型).
+fn capture_tracing(level: tracing::Level) -> (CaptureLog, tracing::subscriber::DefaultGuard) {
+    let log = CaptureLog::new();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(level)
+        .with_writer({
+            let log = log.clone();
+            move || log.clone()
+        })
+        .finish();
+    (log, tracing::subscriber::set_default(subscriber))
+}
+
 /// 从 DAG 派生 `Vec<ForwardRecord>` (newest first), 供断言检查.
 ///
 /// 等价于旧 `RecordStore::list()` 的语义: walk 所有 node, 拼接元数据 + 请求 + 响应字段.
@@ -4632,6 +4682,7 @@ mod sec6_proptests {
 
 /// #163: 上游不可达 502 body 的 message 必须携带可读原因 (上游 host:port + 根因),
 /// 让 SDK 用户区分网关故障 vs 上游故障; 且不得携带 provider api_key.
+/// #160 (交叉): 错误终态 (502) 也必须有 forward 摘要行 (不只成功路径).
 #[tokio::test]
 async fn upstream_unreachable_502_body_carries_readable_cause() {
     let dummy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4643,6 +4694,7 @@ async fn upstream_unreachable_502_body_carries_readable_cause() {
     provider.api_key = "sk-live-supersecret-0123456789".into();
     let proxy_url = spawn_proxy_with_provider(provider).await;
 
+    let (log, _log_guard) = capture_tracing(tracing::Level::INFO);
     let (status, body, _) = proxy_request(
         &proxy_url,
         "POST",
@@ -4672,5 +4724,132 @@ async fn upstream_unreachable_502_body_carries_readable_cause() {
     assert!(
         !body.contains("sk-live-supersecret"),
         "502 body must not leak provider api_key: {body}"
+    );
+
+    // #160 交叉: 错误终态 (上游不可达 502) 也有 forward 摘要行.
+    let log_text = log.text();
+    assert!(
+        log_text.lines().any(|l| l.contains("forward")
+            && l.contains("method=POST")
+            && l.contains("path=/o/oa-dead/v1/chat/completions")
+            && l.contains("status=502")
+            && l.contains("provider=oa-dead")
+            && l.contains("complete=false")),
+        "#160: error-terminal forward summary missing; log: {log_text}"
+    );
+}
+
+/// #160: 成功转发完成时打一行 INFO 摘要 (method/path/status/redactions/provider).
+#[tokio::test]
+async fn forward_completion_logs_info_summary() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"chatcmpl-1","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
+        )
+        .create_async()
+        .await;
+
+    // 带 secret → redact 路径 (redactions=1), 走 fan_out_buffered_ir 完成点.
+    let real_secret = "sk-summary-secret-456";
+    let entries = vec![secret("api-key", real_secret)];
+    let secrets = test_secret_table_with(entries);
+    let provider = openai_provider("oa-main", &upstream.url());
+    let proxy_url = spawn_proxy_full(
+        vec![provider],
+        reqwest::Client::new(),
+        ConversationDag::new(64, 500, 1),
+        secrets,
+    )
+    .await;
+
+    let (log, _log_guard) = capture_tracing(tracing::Level::INFO);
+    let body = format!(
+        r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"use {real_secret}"}}]}}"#
+    );
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        &body,
+        &[("content-type", "application/json")],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+
+    // 摘要行存在且含关键字段 (结构化字段经 fmt 展开为 key=value 形态).
+    let log_text = log.text();
+    let summary_line = log_text
+        .lines()
+        .find(|l| l.contains("forward") && l.contains("method=POST"))
+        .unwrap_or_else(|| panic!("#160 violation: no forward summary line; log: {log_text}"));
+    for field in [
+        "method=POST",
+        "path=/o/oa-main/v1/chat/completions",
+        "status=200",
+        "provider=oa-main",
+    ] {
+        assert!(
+            summary_line.contains(field),
+            "#160: summary line missing {field}; got: {summary_line}"
+        );
+    }
+    assert!(
+        summary_line.contains("redactions=1"),
+        "#160: redactions count missing/wrong; got: {summary_line}"
+    );
+    assert!(
+        summary_line.contains("elapsed_ms="),
+        "#160: elapsed_ms missing; got: {summary_line}"
+    );
+    // 卫生: 摘要不泄漏 secret.
+    assert!(
+        !summary_line.contains(real_secret),
+        "#160: summary must not leak secret; got: {summary_line}"
+    );
+}
+
+/// #160 补充: 流式请求的摘要日志在流结束时打 (而非响应头到达时) —
+/// elapsed 覆盖完整流, 客户端拿完所有 chunk 后才出现摘要行.
+#[tokio::test]
+async fn forward_summary_for_streaming_logs_after_stream_end() {
+    let mut upstream = spawn_mock_upstream().await;
+    let sse_body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse_body)
+        .create_async()
+        .await;
+
+    // 无 secret → passthrough 路径 (fan_out_streaming 完成点).
+    let proxy_url = spawn_proxy(&upstream.url()).await;
+
+    let (log, _log_guard) = capture_tracing(tracing::Level::INFO);
+    let (status, text, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        r#"{"model":"gpt-4","stream":true}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert!(text.contains("[DONE]"));
+
+    // 客户端消费完整流之后, 摘要行应已出现 (流式路径的 record 完成点在流末).
+    let log_text = log.text();
+    assert!(
+        log_text.lines().any(|l| l.contains("forward")
+            && l.contains("method=POST")
+            && l.contains("streamed=true")),
+        "#160: streaming forward summary missing or lacks streamed=true; log: {log_text}"
     );
 }

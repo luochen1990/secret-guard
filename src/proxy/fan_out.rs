@@ -193,6 +193,9 @@ async fn fanout_stream_task(
             ..Default::default()
         },
     );
+    // record 最终态写入后再打摘要 (#160): status/elapsed 覆盖完整流时长,
+    // error (client disconnect / upstream error / overflow) 已就位.
+    super::recorder::log_forward_summary(&dag, record_id);
 }
 
 /// 流式字节扇出: 把上游 SSE 流式转发给客户端, 同时 (若有 codec) 用 StreamScan
@@ -397,6 +400,9 @@ pub(crate) async fn fan_out_buffered_ir(
             ..Default::default()
         },
     );
+    // record 最终态写入后打摘要 (#160). 注意: client_status (错误中断时 502/504)
+    // 只影响客户端响应, record 的 resp_status 仍是上游原值 — 摘要以 record 为准.
+    super::recorder::log_forward_summary(&dag, record_id);
 
     let mut resp = Response::new(Body::from(client_bytes));
     *resp.status_mut() = client_status;

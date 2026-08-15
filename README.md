@@ -29,6 +29,13 @@ URL 形如 `/{proto_short}/{provider_id}/*rest`, 同时编码 **入站协议** �
 
 `proto_short` 简写映射来自 `Protocol::ALL`, 详细路由错误语义见 `AGENTS.md`.
 
+### 日志与排障
+
+每笔转发完成时 stdout 打一行 INFO 摘要 (`forward method=... path=... status=... elapsed_ms=... redactions=N provider=...`),
+无需打开 WebUI 即可在命令行确认流量经过 secret-guard; 上游故障 (502/504) 的错误 body 也带可读原因
+(如 `upstream error: http://127.0.0.1:29999 (Connection refused)`). 量级大时可用
+`RUST_LOG=secret_guard=warn` 调低 (默认 `info`).
+
 ### WebUI 入口
 
 浏览器访问根路径 `http://127.0.0.1:18787/` 即可打开 WebUI:

@@ -250,35 +250,32 @@ pub(crate) async fn cross_proto_forward(
                     ..Default::default()
                 },
             );
+            // 摘要 (#160): 错误终态也打 (choke point 之一).
+            super::recorder::log_forward_summary(&state.dag, record_id);
             // 区分 idle timeout (504) 与其他 stream error (502), 与同协议路径一致.
             // 复用已算出的 err_label (stream_err_label 是 timeout 判定的 SSOT).
+            // 客户端 message 只用 err_label (固定字面量) — e 的 to_string 含完整上游
+            // URL (io_err_from_reqwest 内嵌), 不能进客户端 body (SEC 纪律, #163).
             return Err(if err_label == super::recorder::ERR_STREAM_IDLE_TIMEOUT {
-                AppError::UpstreamTimeout(e.to_string())
+                AppError::UpstreamTimeout(err_label.to_string())
             } else {
-                AppError::Upstream(e.to_string())
+                AppError::Upstream(err_label.to_string())
             });
         }
         if exceeded {
-            let elapsed = started.elapsed().as_millis() as u64;
             warn!(%record_id, cap = super::MAX_RESP_BODY_RECORD, "cross-proto upstream response exceeded cap; aborting");
-            state.dag.attach_response(
-                record_id,
-                ResponseData {
-                    resp_status: 502,
-                    elapsed_ms: elapsed,
-                    error: Some(format!(
-                        "upstream response exceeded {} byte cap",
-                        super::MAX_RESP_BODY_RECORD
-                    )),
-                    resp_complete: false,
-                    streamed: false,
-                    ..Default::default()
-                },
-            );
-            return Err(AppError::Upstream(format!(
+            let msg = format!(
                 "upstream response exceeded {} byte cap",
                 super::MAX_RESP_BODY_RECORD
-            )));
+            );
+            super::recorder::record_upstream_failure(
+                &state.dag,
+                record_id,
+                started,
+                502,
+                msg.clone(),
+            );
+            return Err(AppError::Upstream(msg));
         }
         Bytes::from(acc)
     };
@@ -354,6 +351,8 @@ pub(crate) async fn cross_proto_forward(
             ..Default::default()
         },
     );
+    // record 最终态写入后打摘要 (#160).
+    super::recorder::log_forward_summary(&state.dag, record_id);
 
     // 17. 构造响应.
     let mut resp = Response::new(Body::from(resp_body_out));

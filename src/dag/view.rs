@@ -108,7 +108,44 @@ pub(super) fn session_view(inner: &DagInner, sid: SessionId, s: &Session) -> Opt
 
 // ─── ConversationDag 读路径方法 (impl 扩展, 与 mod.rs 的 impl 块分离) ───────
 
+/// 转发摘要日志所需的标量字段集 (#160).
+///
+/// 与 [`NodeView`] 的区别: **不 clone 大字段** (parsed_response 的深拷贝 /
+/// req_delta resolve), 只取摘要日志需要的标量. 每笔转发完成都会打一行 INFO 摘要,
+/// 该路径必须避免为打日志付出 O(body) 的 JSON clone (见 view.rs 头部 "性能注").
+#[derive(Debug, Clone)]
+pub struct ForwardSummary {
+    pub method: String,
+    pub path: String,
+    pub resp_status: u16,
+    pub elapsed_ms: u64,
+    pub streamed: bool,
+    pub resp_complete: bool,
+    pub error: Option<String>,
+    pub redactions: usize,
+}
+
 impl ConversationDag {
+    /// 读取摘要日志所需的标量字段 (轻量版 `get_node`, 不构造完整 NodeView).
+    ///
+    /// 与 `get_node` 的分工: `get_node` 服务 WebUI (需要全部字段含 parsed);
+    /// 本方法服务转发完成时的 INFO 摘要 (热路径, 只需 8 个标量).
+    pub fn forward_summary_fields(&self, node_id: Uuid) -> Option<ForwardSummary> {
+        let g = self.inner.read();
+        let node = g.nodes.get(&node_id)?;
+        let resp = node.response.read();
+        Some(ForwardSummary {
+            method: node.event.method.clone(),
+            path: node.event.path.clone(),
+            resp_status: resp.as_ref().map(|r| r.resp_status).unwrap_or(0),
+            elapsed_ms: resp.as_ref().map(|r| r.elapsed_ms).unwrap_or(0),
+            streamed: resp.as_ref().map(|r| r.streamed).unwrap_or(false),
+            resp_complete: resp.as_ref().map(|r| r.resp_complete).unwrap_or(false),
+            error: resp.as_ref().and_then(|r| r.error.clone()),
+            redactions: node.event.redactions.len(),
+        })
+    }
+
     /// walk parent 链, 收集完整的 request messages (从根到本 node).
     ///
     /// 只含 req_delta (客户端发出的 messages), 不含 response.

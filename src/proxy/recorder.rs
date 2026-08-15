@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use axum::http::HeaderMap;
 use futures::StreamExt;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::helpers::redact_headers;
@@ -270,6 +270,9 @@ pub(super) fn assert_resp_parsed_matches_source_nonstream(
 }
 
 /// 写一条 "上游请求失败" 记录 (错误路径专用 helper).
+///
+/// 同时打转发摘要 (#160): 上游故障是命令行排障的最高价值场景, 错误终态也必须有
+/// INFO 摘要行 (与成功路径的 3 个完成点对齐; 此处是 502/504 错误终态的 choke point).
 pub(super) fn record_upstream_failure(
     dag: &ConversationDag,
     record_id: Uuid,
@@ -286,6 +289,46 @@ pub(super) fn record_upstream_failure(
             error: Some(error),
             ..Default::default()
         },
+    );
+    log_forward_summary(dag, record_id);
+}
+
+// ─── 转发摘要日志 (#160) ────────────────────────────────────────────────────
+
+/// 每笔转发完成 (record 最终态写入后) 打一行 INFO 摘要 (#160: 命令行排障).
+///
+/// 形如 `forward method=POST path=/o/p1/v1/chat/completions status=200
+/// elapsed_ms=123 redactions=1 provider=p1 streamed=false complete=true`.
+/// 字段全部从 DAG node 派生 (经 [`ConversationDag::forward_summary_fields`],
+/// 只读标量不 clone parsed view — 该路径每请求执行一次, 必须轻量).
+/// provider id 从 path 第二段解析 (`/{proto}/{provider}/...`, 与 ForwardPath
+/// 同构; cross_proto 的 path 带尾部 " [a → b]" 注释, 落在后续段不影响 nth(2)).
+///
+/// 安全: 字段均来自路由/元数据, 永不含 secret 值 (redactions 只记条数).
+///
+/// 调用点 (record 终态 choke points): fanout_stream_task (两条流式路径) /
+/// fan_out_buffered_ir / cross_proto 正常收尾 / record_upstream_failure
+/// (502/504 错误终态) / cross_proto 中途流错误与 cap 分支.
+///
+/// 流式请求在流结束 (attach_response 最终态) 时打, 而非响应头到达时 —
+/// 保证 elapsed_ms 覆盖完整流时长, 且 record 尚未落盘的错误能带上.
+pub(super) fn log_forward_summary(dag: &ConversationDag, record_id: Uuid) {
+    let Some(f) = dag.forward_summary_fields(record_id) else {
+        return;
+    };
+    let provider = f.path.split('/').nth(2).unwrap_or("?");
+    info!(
+        %record_id,
+        method = %f.method,
+        path = %f.path,
+        status = f.resp_status,
+        elapsed_ms = f.elapsed_ms,
+        redactions = f.redactions,
+        provider = %provider,
+        streamed = f.streamed,
+        complete = f.resp_complete,
+        error = ?f.error,
+        "forward"
     );
 }
 /// 发送上游请求, 可选地对"响应头到达"加超时保护. 失败时记录到 DAG 并返回 AppError.
