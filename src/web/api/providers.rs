@@ -13,9 +13,9 @@ use crate::config::OverrideMode;
 use crate::provider::{EffectiveProvider, Protocol, Provider};
 use crate::state::{AppState, NO_STORE};
 
-use super::crud::{create_flow, decision_flow, delete_flow, update_flow};
+use super::crud::{DecisionRequest, decision_flow};
+use super::crud::{create_flow, delete_flow, update_flow};
 use super::error::ApiError;
-use super::secrets::{DecisionAck, DecisionRequest};
 
 pub async fn list_providers(State(state): State<AppState>) -> impl IntoResponse {
     let providers: Vec<EffectiveProvider> = state.providers.effective_snapshot();
@@ -37,13 +37,13 @@ pub async fn create_provider(
     State(state): State<AppState>,
     Json(payload): Json<UpsertProviderRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let (status, ev) = create_flow(
+    let ev = create_flow(
         &state.providers,
         "provider",
         || payload.into_provider(),
         |_| Ok(()), // provider 无 secret 式的 resolve 钩子 (validate 在 upsert 内).
     )?;
-    Ok((status, NO_STORE, Json(ev)))
+    Ok((StatusCode::CREATED, NO_STORE, Json(ev)))
 }
 
 pub async fn update_provider(
@@ -86,8 +86,8 @@ pub async fn delete_provider(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let body = delete_flow(&state.providers, "provider", &id)?;
-    Ok((StatusCode::NO_CONTENT, NO_STORE, body))
+    delete_flow(&state.providers, "provider", &id)?;
+    Ok((StatusCode::NO_CONTENT, NO_STORE, ""))
 }
 
 /// 切换对 static id 的 per-item 决策. 同 [`super::secrets::set_secret_decision`].
@@ -97,16 +97,8 @@ pub async fn set_provider_decision(
     Json(payload): Json<DecisionRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mode = payload.into_mode()?;
-    let (id, resource, decision) = decision_flow(&state.providers, "provider", id, mode)?;
-    Ok((
-        StatusCode::OK,
-        NO_STORE,
-        Json(DecisionAck {
-            id,
-            resource,
-            decision,
-        }),
-    ))
+    let ack = decision_flow(&state.providers, "provider", id, mode)?;
+    Ok((StatusCode::OK, NO_STORE, Json(ack)))
 }
 
 #[derive(Serialize)]

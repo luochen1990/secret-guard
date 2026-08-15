@@ -21,7 +21,7 @@
 //! - [`delete_flow`]: delete → DeleteOutcome 分类 (static-only 409 / 不存在 404) → 204.
 //! - [`decision_flow`]: static 检查 → set_decision → ack.
 
-use axum::http::StatusCode;
+use serde::{Deserialize, Serialize};
 
 use crate::config::{DeleteOutcome, DynamicTable, OverrideMode, UpsertKind};
 use crate::provider::{EffectiveProvider, Provider};
@@ -155,9 +155,9 @@ fn classify_delete_outcome(
     has_static: bool,
     kind_label: &str,
     id: &str,
-) -> Result<&'static str, ApiError> {
+) -> Result<(), ApiError> {
     match outcome {
-        DeleteOutcome::Deleted => Ok(""), // 204 No Content 的空 body.
+        DeleteOutcome::Deleted => Ok(()), // 204 No Content.
         DeleteOutcome::NotFound => {
             if has_static {
                 Err(ApiError::conflict(format!(
@@ -176,13 +176,13 @@ fn classify_delete_outcome(
 /// create 通用流程: 构造 entry → id 空则 Uuid → validate 钩子 → effective 冲突检查 →
 /// upsert (Updated = 并发创建, 409) → 查回 effective 视图.
 ///
-/// 返回 `(StatusCode::CREATED, effective_view)`, handler 加 NO_STORE + Json 包装.
+/// 返回 effective_view, handler 加 `(StatusCode::CREATED, NO_STORE, Json)` 包装.
 pub(crate) fn create_flow<T: CrudTable>(
     table: &T,
     kind_label: &str,
     build: impl FnOnce() -> Result<T::Entry, ApiError>,
     validate: impl FnOnce(&mut T::Entry) -> Result<(), ApiError>,
-) -> Result<(StatusCode, T::Effective), ApiError> {
+) -> Result<T::Effective, ApiError> {
     let mut entry = build()?;
     // create 模式: 若没传 id, 自动生成.
     if entry.entry_id().is_empty() {
@@ -204,8 +204,7 @@ pub(crate) fn create_flow<T: CrudTable>(
         )));
     }
     // upsert_dynamic 不返回 effective 视图, 这里再查一次给前端 (低成本, 创建场景罕见).
-    let ev = effective_find_by_id(table.snapshot(), saved.entry_id());
-    Ok((StatusCode::CREATED, ev))
+    Ok(effective_find_by_id(table.snapshot(), saved.entry_id()))
 }
 
 /// update 通用流程: 存在性检查 (404) → build 钩子 (构造 entry + 类型特定预处理) →
@@ -233,17 +232,43 @@ pub(crate) fn update_flow<T: CrudTable>(
 }
 
 /// delete 通用流程: delete → outcome 分类 (static-only 409 / 不存在 404).
-/// 返回 204 的空 body.
+/// 成功返回 `()` (handler 包装为 204 空 body).
 pub(crate) fn delete_flow<T: CrudTable>(
     table: &T,
     kind_label: &str,
     id: &str,
-) -> Result<&'static str, ApiError> {
+) -> Result<(), ApiError> {
     // 若 dynamic 有此 id, 删除 (覆盖关系下仅移除 override, static 保留).
     // 若 dynamic 无此 id 但 static 有, 拒绝删除 (static 永不可写; 提示用 disabled decision).
     // 用 has_static 直接查 static 层, 不受 decision 影响 (disabled 的 id 也能正确报 409).
     let outcome = table.delete(id).map_err(ApiError::from_any)?;
     classify_delete_outcome(outcome, table.has_static(id), kind_label, id)
+}
+
+/// `PATCH /{id}/decision` 的请求 body (secrets / providers 共享).
+#[derive(Debug, Deserialize)]
+pub(crate) struct DecisionRequest {
+    pub mode: String,
+}
+
+impl DecisionRequest {
+    pub(crate) fn into_mode(self) -> Result<OverrideMode, ApiError> {
+        OverrideMode::parse(&self.mode).ok_or_else(|| {
+            ApiError::validation(format!(
+                "unknown decision mode '{}' (expected one of: default, prefer_static, disabled)",
+                self.mode
+            ))
+        })
+    }
+}
+
+/// `PATCH /{id}/decision` 的 ack 响应 (secrets / providers 共享).
+#[derive(Serialize)]
+pub(crate) struct DecisionAck {
+    pub id: String,
+    /// "provider" | "secret" — 前端可用于校验是否返回了正确资源类型.
+    pub resource: &'static str,
+    pub decision: OverrideMode,
 }
 
 /// decision 通用流程: static 检查 (404) → set_decision → ack.
@@ -252,12 +277,16 @@ pub(crate) fn decision_flow<T: CrudTable>(
     kind_label: &'static str,
     id: String,
     mode: OverrideMode,
-) -> Result<(String, &'static str, OverrideMode), ApiError> {
+) -> Result<DecisionAck, ApiError> {
     if !table.has_static(&id) {
         return Err(ApiError::not_found(format!(
             "{kind_label} {id} is not a static id; decision does not apply"
         )));
     }
     table.set_decision(&id, mode).map_err(ApiError::from_any)?;
-    Ok((id, kind_label, mode))
+    Ok(DecisionAck {
+        id,
+        resource: kind_label,
+        decision: mode,
+    })
 }

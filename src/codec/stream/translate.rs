@@ -270,14 +270,7 @@ impl StreamTranslate {
                 }
                 if matches!(ev, IrStreamEvent::MessageStop) {
                     // 上游异常漏发 BlockStop 时, 所有 restorers 残留 mock tail.
-                    for (index, kind, tail) in hook.flush_all() {
-                        if !tail.is_empty() {
-                            flushes.push(IrStreamEvent::BlockDelta {
-                                index,
-                                delta: kind.to_ir_delta(tail),
-                            });
-                        }
-                    }
+                    flushes.extend(tail_events(hook.flush_all()));
                 }
                 restore_event_inplace(hook, &mut ev);
                 for f in &flushes {
@@ -316,17 +309,8 @@ impl StreamTranslate {
             .as_mut()
             .map(|hook| hook.flush_all())
             .unwrap_or_default();
-        for (index, kind, tail) in flushed {
-            if tail.is_empty() {
-                continue;
-            }
-            self.emit_ir_event(
-                &IrStreamEvent::BlockDelta {
-                    index,
-                    delta: kind.to_ir_delta(tail),
-                },
-                out,
-            );
+        for ev in tail_events(flushed) {
+            self.emit_ir_event(&ev, out);
         }
     }
 
@@ -337,6 +321,20 @@ impl StreamTranslate {
         };
         out.extend_from_slice(&reframe_sse(&event_type, &data));
     }
+}
+
+/// hook `flush_all` 元组流 → BlockDelta 事件迭代器 (过滤空 tail).
+///
+/// MessageStop 分支 (translate_event 内收集) 与 finish 兜底 (emit_flush_all) 两处
+/// 共用的转换 SSOT; 空 tail 过滤集中在此 (hook 实现不再预滤, 见 StreamingRestorerSet).
+fn tail_events(flushed: Vec<(usize, DeltaKind, String)>) -> impl Iterator<Item = IrStreamEvent> {
+    flushed
+        .into_iter()
+        .filter(|(_, _, tail)| !tail.is_empty())
+        .map(|(index, kind, tail)| IrStreamEvent::BlockDelta {
+            index,
+            delta: kind.to_ir_delta(tail),
+        })
 }
 
 /// 对单个 event 应用 restore 逻辑 (in-place, 不改变 event 类型).

@@ -12,7 +12,7 @@ use crate::config::OverrideMode;
 use crate::secrets::{EffectiveSecret, SecretCategory, SecretEntry};
 use crate::state::{AppState, NO_STORE};
 
-use super::crud::{create_flow, decision_flow, delete_flow, update_flow};
+use super::crud::{DecisionRequest, create_flow, decision_flow, delete_flow, update_flow};
 use super::error::ApiError;
 
 pub async fn list_secrets(State(state): State<AppState>) -> impl IntoResponse {
@@ -33,7 +33,7 @@ pub async fn create_secret(
     State(state): State<AppState>,
     Json(payload): Json<CreateSecretRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let (status, ev) = create_flow(
+    let ev = create_flow(
         &state.secrets,
         "secret",
         || payload.into_entry(),
@@ -47,7 +47,7 @@ pub async fn create_secret(
                 .map_err(ApiError::validation)
         },
     )?;
-    Ok((status, NO_STORE, Json(ev)))
+    Ok((StatusCode::CREATED, NO_STORE, Json(ev)))
 }
 
 pub async fn update_secret(
@@ -74,8 +74,8 @@ pub async fn delete_secret(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let body = delete_flow(&state.secrets, "secret", &id)?;
-    Ok((StatusCode::NO_CONTENT, NO_STORE, body))
+    delete_flow(&state.secrets, "secret", &id)?;
+    Ok((StatusCode::NO_CONTENT, NO_STORE, ""))
 }
 
 /// 切换对 static id 的 per-item 决策. body: `{"mode": "default|prefer_static|disabled"}`.
@@ -94,16 +94,8 @@ pub async fn set_secret_decision(
     Json(payload): Json<DecisionRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let mode = payload.into_mode()?;
-    let (id, resource, decision) = decision_flow(&state.secrets, "secret", id, mode)?;
-    Ok((
-        StatusCode::OK,
-        NO_STORE,
-        Json(DecisionAck {
-            id,
-            resource,
-            decision,
-        }),
-    ))
+    let ack = decision_flow(&state.secrets, "secret", id, mode)?;
+    Ok((StatusCode::OK, NO_STORE, Json(ack)))
 }
 
 #[derive(Serialize)]
@@ -153,32 +145,6 @@ impl CreateSecretRequest {
             mock_strategy: self.mock_strategy.unwrap_or_default(),
         })
     }
-}
-
-/// `PATCH /{id}/decision` 的请求 body (secrets / providers 共享).
-#[derive(Debug, Deserialize)]
-pub(crate) struct DecisionRequest {
-    pub mode: String,
-}
-
-impl DecisionRequest {
-    pub(crate) fn into_mode(self) -> Result<OverrideMode, ApiError> {
-        OverrideMode::parse(&self.mode).ok_or_else(|| {
-            ApiError::validation(format!(
-                "unknown decision mode '{}' (expected one of: default, prefer_static, disabled)",
-                self.mode
-            ))
-        })
-    }
-}
-
-/// `PATCH /{id}/decision` 的 ack 响应 (secrets / providers 共享).
-#[derive(Serialize)]
-pub(crate) struct DecisionAck {
-    pub id: String,
-    /// "provider" | "secret" — 前端可用于校验是否返回了正确资源类型.
-    pub resource: &'static str,
-    pub decision: OverrideMode,
 }
 
 #[cfg(test)]

@@ -442,7 +442,8 @@ pub use crate::codec::stream::DeltaKind;
 ///
 /// # Scope / Out of scope
 ///
-/// - 处理 [`IrDelta::TextDelta`] 和 [`IrDelta::InputJsonDelta`] (内容字节流).
+/// - 处理 [`IrDelta::TextDelta`](crate::codec::ir::IrDelta::TextDelta) 和
+///   [`IrDelta::InputJsonDelta`](crate::codec::ir::IrDelta::InputJsonDelta) (内容字节流).
 /// - 不处理 `MessageDelta.stop_sequence` / `IrStreamEvent::Error`
 ///   (单 event 完整, 直接 `restore_str_inplace`).
 #[derive(Debug)]
@@ -602,11 +603,12 @@ impl crate::codec::stream::StreamRestoreHook for StreamingRestorerSet {
         // index 升序 emit, 避免违反客户端对 delta 时序的隐含假设
         // (eg OpenAI tool_call arguments partial JSON parser 假设按 index 顺序到达).
         indices.sort_unstable();
+        // 空 tail 过滤由消费方 (codec::stream::tail_events) 单点执行.
         indices
             .into_iter()
-            .filter_map(|i| {
+            .map(|i| {
                 let (kind, tail) = self.flush_delta(i);
-                (!tail.is_empty()).then_some((i, kind, tail))
+                (i, kind, tail)
             })
             .collect()
     }

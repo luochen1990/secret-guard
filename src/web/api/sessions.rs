@@ -19,46 +19,9 @@ use crate::state::{AppState, NO_STORE};
 
 // ─── /sessions ─────────────────────────────────────────────────────────────
 
-/// 会话列表 (叶子节点), sidebar 两级树的一级项.
-#[derive(Serialize)]
-pub(crate) struct SessionSummary {
-    /// 会话稳定标识 (前端选中/展开用, 刷新后不变).
-    pub session_id: crate::dag::SessionId,
-    pub leaf_id: Uuid,
-    pub root_id: Uuid,
-    pub record_count: usize,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub latest_at: chrono::DateTime<chrono::Utc>,
-    /// `Arc<str>`: 从 SessionView 透传, list_sessions (3s 轮询) 路径零拷贝.
-    /// serde 透明序列化为 string, 前端无感知.
-    pub preview: Option<std::sync::Arc<str>>,
-    pub model: Option<std::sync::Arc<str>>,
-    pub latest_resp_status: u16,
-    pub latest_error: Option<String>,
-    /// `Arc<[(String,String)]>`: 从 SessionView 透传, 零拷贝.
-    pub redactions: std::sync::Arc<[(String, String)]>,
-    /// 叶子节点 HTTP path (前端 provider icon 解析 proto 角标 + provider id).
-    pub path: String,
-}
-
-impl From<SessionView> for SessionSummary {
-    fn from(s: SessionView) -> Self {
-        Self {
-            session_id: s.session_id,
-            leaf_id: s.leaf_id,
-            root_id: s.root_id,
-            record_count: s.record_count,
-            created_at: s.created_at,
-            latest_at: s.latest_at,
-            preview: s.preview,
-            model: s.model,
-            latest_resp_status: s.latest_resp_status,
-            latest_error: s.latest_error,
-            redactions: s.redactions,
-            path: s.path,
-        }
-    }
-}
+/// 会话列表项 (sidebar 两级树的一级项). 直接复用中立层 [`SessionView`]
+/// (字段集合 / serde wire shape 完全一致, 历史上的恒等映射空壳已删, 见 #146 simplify).
+pub(crate) type SessionSummary = SessionView;
 
 #[derive(Serialize)]
 struct ListSessionsResponse {
@@ -67,12 +30,7 @@ struct ListSessionsResponse {
 }
 
 pub async fn list_sessions(State(state): State<AppState>) -> impl IntoResponse {
-    let sessions: Vec<SessionSummary> = state
-        .dag
-        .list_sessions()
-        .into_iter()
-        .map(SessionSummary::from)
-        .collect();
+    let sessions: Vec<SessionSummary> = state.dag.list_sessions();
     let total = sessions.len();
     (NO_STORE, Json(ListSessionsResponse { sessions, total }))
 }
@@ -162,8 +120,8 @@ pub(crate) struct SyncResponse {
 
 /// POST /api/sync handler.
 ///
-/// 在 DAG 层单个 read lock 内采集 sessions + expanded rounds + timeline diff,
-/// 映射 SessionView → SessionSummary 后返回. 无选中时 timeline 为 None.
+/// 在 DAG 层单个 read lock 内采集 sessions + expanded rounds + timeline diff
+/// (SessionSummary 是 SessionView 的恒等 alias, 直接透传). 无选中时 timeline 为 None.
 pub async fn sync(
     State(state): State<AppState>,
     Json(req): Json<SyncRequest>,
@@ -172,11 +130,7 @@ pub async fn sync(
         .selected
         .map(|c| (c.session_id, c.latest_round, c.response_length));
     let snap = state.dag.sync_snapshot(&req.expanded, selected);
-    let sessions: Vec<SessionSummary> = snap
-        .sessions
-        .into_iter()
-        .map(SessionSummary::from)
-        .collect();
+    let sessions: Vec<SessionSummary> = snap.sessions;
     (
         NO_STORE,
         Json(SyncResponse {
@@ -253,7 +207,7 @@ mod tests {
                     && !preview_marker.contains("policy"),
                 "marker must not contain 'policy' substring"
             );
-            let summary = SessionSummary {
+            let summary = SessionView {
                 session_id: crate::dag::SessionId::new(),
                 leaf_id: Uuid::new_v4(),
                 root_id: Uuid::new_v4(),
