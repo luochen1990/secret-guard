@@ -1908,6 +1908,16 @@ test.describe("WebUI 打磨 (#161 + #164)", () => {
     await page.waitForTimeout(500);
   });
 
+  // 本 describe 的 #161 用例会把 test-key 切到 disabled; 断言中途失败时跳过测试体内的
+  // 清理, disabled 残留会让后续依赖 test-key 参与 redaction 的用例连环假失败
+  // (workers=1 共享同一 server state). afterEach 幂等还原 (default 对已 default 的
+  // secret 是 no-op).
+  test.afterEach(async ({ request }) => {
+    await request.patch(`${SG_API}/secrets/test-key/decision`, {
+      data: { mode: "default" },
+    });
+  });
+
   test("#161: secret decision→Disabled 有 confirm; 取消回滚 / 确认后带 warning", async ({
     page,
   }) => {
@@ -1946,12 +1956,7 @@ test.describe("WebUI 打磨 (#161 + #164)", () => {
     await expect(
       page.locator('select.decision-select[data-id="test-key"]')
     ).toHaveCount(0);
-
-    // 清理: 通过 API 切回 default, 不污染后续测试.
-    await page.request.patch(`${SG_API}/secrets/test-key/decision`, {
-      data: { mode: "default" },
-    });
-    await page.waitForTimeout(100);
+    // 还原由 afterEach 幂等执行 (断言失败中断时也能恢复).
   });
 
   test("#161: PATCH decision API 响应 disabled 时含 warning 字段", async ({ request }) => {

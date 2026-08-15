@@ -3523,7 +3523,9 @@
           if (fallback) sel.value = fallback.value;
           return;
         }
-        await patchDecision(kind, sel.dataset.id, sel.value);
+        // confirm 已就地警示 → warnedInline 抑制 PATCH 成功后的二次 alert.
+        const warnedInline = kind === 'secret' && sel.value === 'disabled';
+        await patchDecision(kind, sel.dataset.id, sel.value, { warnedInline });
       });
     }
 
@@ -3544,16 +3546,17 @@
     function renderKind(kind) {
       const cfg = KINDS[kind];
       const list = cfg.list();
-      renderStats(cfg.statsId, list);
       const body = document.getElementById(cfg.bodyId);
       const html = list.length === 0
         ? `<tr><td colspan="${cfg.colspan}" class="empty">${cfg.emptyText}</td></tr>`
         : list.map(item => cfg.renderRow(item)).join('');
       // 数据未变化时跳过 DOM 重建 (#164-3): 行级 reconciliation 的最小替代 —
       // auto-refresh (3s) 空轮询 (数据静止) 不再打断自动化工具持有的 <tr> 引用
-      // (isConnected 反复失效). 数据真变化时仍整体重建 (罕见, 可接受).
+      // (isConnected 反复失效), 也不再重写 stats 条 (无谓的 style/layout).
+      // 数据真变化时仍整体重建 (罕见, 可接受).
       if (body.dataset.renderedHtml === html) return;
       body.dataset.renderedHtml = html;
+      renderStats(cfg.statsId, list);
       body.innerHTML = html;
     }
 
@@ -4143,8 +4146,19 @@
     });
 
     // ─── decision PATCH ──────────────────────────────────────────────────
-    async function patchDecision(kind, id, mode) {
+    // opts.warnedInline: 调用方已就地警示过后果 (如 confirm 弹窗), 抑制服务端 warning
+    // 的二次 alert — 正常 UI 路径 confirm → PATCH 成功不再连弹第二个内容重复的弹窗.
+    async function patchDecision(kind, id, mode, { warnedInline = false } = {}) {
       const cfg = KINDS[kind];
+      // 还原该行 decision 下拉的可见值到服务端真值 (defaultSelected). 失败/异常时调用:
+      // renderedHtml 短路下数据未变不会重渲染, 下拉会停留在用户选的失败值 (stale).
+      const rollbackSelect = () => {
+        const sel = document.querySelector(
+          `select.decision-select[data-kind="${cfg.kindParam}"][data-id="${CSS.escape(id)}"]`);
+        if (!sel) return;
+        const fallback = [...sel.options].find(o => o.defaultSelected) || sel.options[0];
+        if (fallback) sel.value = fallback.value;
+      };
       try {
         const r = await fetch(`${cfg.api}/${encodeURIComponent(id)}/decision`, {
           method: 'PATCH',
@@ -4154,16 +4168,19 @@
         if (!r.ok) {
           const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
           alert('Decision update failed: ' + (err.error || r.status));
+          rollbackSelect();
         } else {
-          // 后端在 mode=disabled + secret 时返回 warning 字段 (#161). 正常路径已由
-          // 前置 confirm 覆盖, 这里兜底展示 (如脚本绕过 UI / confirm 被自动化禁用).
+          // 后端在 mode=disabled + secret 时返回 warning 字段 (#161). UI 正常路径已有
+          // 前置 confirm (warnedInline), 这里兜底展示 (脚本绕过 UI / 其他调用方).
           const ack = await r.json().catch(() => null);
-          if (ack?.warning) alert(`Warning for ${id}: ${ack.warning}`);
+          if (ack?.warning && !warnedInline) alert(`Warning for ${id}: ${ack.warning}`);
         }
         // 无论成败都刷新: 成功则更新视图, 失败则回滚下拉.
         await cfg.refresh();
       } catch (e) {
         alert('Error: ' + e.message);
+        rollbackSelect();
+        await cfg.refresh().catch(() => {});
       }
     }
 

@@ -50,7 +50,6 @@ pub(crate) async fn cross_proto_forward(
     provider: Provider,
     started: Instant,
     secrets_snapshot: Vec<crate::secrets::SecretEntry>,
-    disabled_secrets: Vec<crate::secrets::SecretEntry>,
 ) -> Result<Response<Body>, AppError> {
     use crate::codec::Protocol as CodecProtocol;
 
@@ -103,7 +102,6 @@ pub(crate) async fn cross_proto_forward(
     let (redaction_map, redact_seed, redactions) = match redact_and_derive(
         &mut ir,
         &secrets_snapshot,
-        &disabled_secrets,
         state.on_probe_exhausted,
         "cross-proto",
     ) {

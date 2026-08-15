@@ -325,8 +325,13 @@ mod tests {
     use crate::secrets::SecretTable;
 
     /// 构造含一个 static secret 的表 (决策端到端测试用).
+    /// state 路径带 uuid (对齐 tests/integration.rs 惯例, 避免并行测试互踩).
     fn secret_table_with_static() -> SecretTable {
         use crate::secrets::SecretEntry;
+        let state_path = std::path::PathBuf::from(format!(
+            "/tmp/opencode/tmp/test-decision-ack-{}.toml",
+            uuid::Uuid::new_v4()
+        ));
         SecretTable::new(
             vec![SecretEntry {
                 id: "s1".into(),
@@ -338,7 +343,7 @@ mod tests {
             }],
             vec![],
             std::sync::Arc::new(parking_lot::RwLock::new(crate::config::Decisions::default())),
-            std::path::PathBuf::from("/tmp/opencode/tmp/test-decision-ack.toml"),
+            state_path,
         )
     }
 

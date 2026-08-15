@@ -111,21 +111,16 @@ type RedactOutcome = Result<(RedactionMap, u64, Vec<(String, String)>), RedactEr
 /// - [`OnProbeExhausted::FailOpen`] (默认): 耗尽时 warn+skip (向后兼容, 永不 Err).
 /// - [`OnProbeExhausted::FailClosed`]: 耗尽时返回 `Err(RedactError)`, 让调用方拒绝转发.
 ///
-/// `disabled_secrets`: decision=Disabled 的 secret (明文放行, 不参与 redact). 每次调用
-/// 检查其 value 是否命中本请求 IR, 命中才 WARN (#161) — 放在本共享 helper 内,
-/// same_proto / cross_proto 两条 IR 路径自动同享该可观测性.
-///
 /// 返回 `(redaction_map, redact_seed, redactions)`. redaction_map 非空时 debug 日志记录命中数.
+///
+/// 注: disabled secret 的明文放行 WARN (#161) 不在此层 — 挂在 dispatch (raw bytes)
+/// 以覆盖透传快捷分支, 见 [`crate::redact::warn_disabled_secrets_in_body`].
 pub(super) fn redact_and_derive(
     ir: &mut crate::codec::ir::IrRequest,
     secrets_snapshot: &[crate::secrets::SecretEntry],
-    disabled_secrets: &[crate::secrets::SecretEntry],
     mode: OnProbeExhausted,
     log_tag: &str,
 ) -> RedactOutcome {
-    if !disabled_secrets.is_empty() {
-        crate::redact::warn_disabled_secrets_in_ir(ir, disabled_secrets);
-    }
     let (redaction_map, redact_seed) = redact_ir_checked(ir, secrets_snapshot, mode)?;
     if !redaction_map.is_empty() {
         debug!(
