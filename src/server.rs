@@ -367,9 +367,7 @@ pub async fn serve(
     let addr: SocketAddr = format!("{host}:{port}")
         .parse()
         .with_context(|| format!("invalid listen address {host}:{port}"))?;
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("bind {addr} failed: is another secret-guard already running?"))?;
+    let listener = bind_listener(addr).await?;
     let auth_mode = if auth_config.enabled {
         "OIDC"
     } else {
@@ -381,6 +379,24 @@ pub async fn serve(
         .await
         .context("axum serve failed")?;
     Ok(())
+}
+
+/// 绑定监听端口, 失败时把 OS 错误 (事实) 放在首行、把猜测性提示降为 hint (#164 子项 4).
+///
+/// 历史文案 `bind {addr} failed: is another secret-guard already running?` 把猜测当
+/// 首行事实 — 实际占用者可以是任意进程 (实测 python 占位脚本即触发). 现在首行只
+/// 陈述事实 (bind 失败 + OS 错误的完整 Display, 如 "Address already in use (os error 98)"),
+/// 猜测性排查提示作为 hint 行附注且明确标示为猜测.
+async fn bind_listener(addr: SocketAddr) -> anyhow::Result<TcpListener> {
+    TcpListener::bind(addr).await.map_err(|e| {
+        anyhow::anyhow!(
+            "bind {addr} failed: {e}\n  \
+             hint: the port may be taken by another process (perhaps another \
+             secret-guard instance?); check with `ss -ltnp | grep :{port}` or \
+             pick another port (--port flag or [server] port in config)",
+            port = addr.port(),
+        )
+    })
 }
 
 async fn shutdown_signal() {
@@ -404,5 +420,43 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => info!("received Ctrl-C, shutting down"),
         _ = terminate => info!("received SIGTERM, shutting down"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #164 子项 4: 端口被占时首行陈述事实 ("Address already in use"), 不再断言式猜测.
+    /// 猜测只允许出现在 hint 行 (且仅作为附注, 不进 anyhow Caused by 链的首行).
+    #[tokio::test]
+    async fn bind_error_reports_fact_first_guess_as_hint() {
+        // 真占一个端口 (持有 listener 不 drop), 再绑同端口 → AddrInUse.
+        let holder = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = holder.local_addr().unwrap();
+        let err = bind_listener(addr).await.unwrap_err();
+        let msg = format!("{err:#}");
+        let first_line = msg.lines().next().unwrap_or_default();
+        // 事实: 首行含 bind + 地址 + OS 错误 Display.
+        assert!(first_line.contains("bind"), "first line: {first_line}");
+        assert!(
+            first_line.contains(&addr.to_string()),
+            "first line: {first_line}"
+        );
+        assert!(
+            first_line.contains("Address already in use"),
+            "first line must state the OS fact: {first_line}"
+        );
+        // 不再把猜测当事实: 首行不得含猜测性问句 (它只允许出现在 hint 行).
+        assert!(
+            !first_line.contains("already running"),
+            "first line must not assert a guess: {first_line}"
+        );
+        // hint: 猜测性提示存在且明确标示为猜测.
+        assert!(msg.contains("hint:"), "full message: {msg}");
+        assert!(
+            msg.contains("another process (perhaps another secret-guard instance?)"),
+            "guess must be explicitly marked as a guess: {msg}"
+        );
     }
 }

@@ -628,8 +628,16 @@ impl DynamicState {
         }
         let text = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("read state {}: {e}", path.display()))?;
-        let mut state: Self = toml::from_str(&text)
-            .map_err(|e| anyhow::anyhow!("parse state {}: {e}", path.display()))?;
+        // state 是 WebUI 写出的纯派生数据, 永远可丢弃重置 — 解析失败时给出
+        // 明确恢复路径 (删除即回到 static config 声明的纯净状态), 见 #164 子项 5.
+        let mut state: Self = toml::from_str(&text).map_err(|e| {
+            anyhow::anyhow!(
+                "parse state {}: {e}\n \
+                 hint: delete {} to reset dynamic state (static config is unaffected)",
+                path.display(),
+                path.display(),
+            )
+        })?;
         validate_and_resolve_secrets(path, &mut state.secrets, global_mock_prefix)?;
         validate_providers(path, &state.providers)?;
         Ok(state)
@@ -1492,6 +1500,26 @@ lowercase = true
         let ws = audit_static_config_text("[providers]\nid = \"m\"\n");
         // 不 panic 即可; serde 的硬错误在调用方路径覆盖.
         drop(ws);
+    }
+
+    /// #164 子项 5: 畸形 state (duplicate key) 报错含重置指引与路径.
+    #[test]
+    fn state_parse_error_hints_delete_to_reset() {
+        // UUID 后缀临时文件: 防并发测试进程互踩与残留 (与 mod tests 的 tempfile_path
+        // 同模式, 那个在另一 mod 不可见; 此处内联一份等价实现).
+        let path =
+            std::env::temp_dir().join(format!("sg-audit-state-hint-{}.toml", uuid::Uuid::new_v4()));
+        std::fs::write(&path, "duplicate = 1\nduplicate = 2\n").unwrap();
+        let err = DynamicState::load_or_empty(&path, "").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("duplicate"), "got: {msg}");
+        assert!(msg.contains("hint: delete"), "reset hint missing: {msg}");
+        assert!(
+            msg.contains(path.display().to_string().as_str()),
+            "state path missing in hint: {msg}"
+        );
+        assert!(msg.contains("static config is unaffected"), "got: {msg}");
+        let _ = std::fs::remove_file(&path);
     }
 
     // ─── 拼写建议纯函数 ───
