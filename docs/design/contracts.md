@@ -71,7 +71,7 @@
 | `SEC-*` | 安全姿态 (跨域) | (新增) | `src/web/AGENTS.md` + `src/secrets.rs` + `src/provider.rs` |
 | `ROB-*` | 鲁棒性 (跨域) | (新增) | 根 `AGENTS.md` "鲁棒性原则" |
 | `VIEW-*` | 视图正确性机制 (跨域) | (新增) | 根 `AGENTS.md` "视图正确性确保机制" |
-| `UI-*` | WebUI 渲染 (域 C) | I1→UI-1, I2→UI-2, I3→UI-3 | 根 `AGENTS.md` "前端不变量" |
+| `UI-*` | WebUI 渲染 (域 C) | I1→UI-1, I2→UI-2, I3→UI-3, I4→UI-6 (selectedRound 子属性), I5→UI-6 | 根 `AGENTS.md` "前端不变量" |
 
 **编号稳定性**: 契约编号一经分配**永不变更** (即使内容演进). 删除契约时编号作废不重用.
 
@@ -262,7 +262,7 @@
 **Properties**:
 - `prop_distinct_secrets_distinct_mocks`: 对 N 个不同 secret, 得到 N 个不同 mock. ✅ `src/redact.rs::prop_distinct_secrets_distinct_mocks` + `prop_redact_produces_distinct_mocks`.
 - `prop_probing_exhausted_skips_not_panics` (fail_open 模式下): 弱配置 (charset=1 char, length=1) 耗尽候选时, 跳过该 secret, 进程存活. ✅ `src/redact.rs::redact_ir_skips_secret_when_probing_exhausted_instead_of_panicking` + `redact_ir_checked_fail_open_skips_exhausted_secret` + `redact_ir_legacy_remains_fail_open_after_refactor`.
-- `prop_probing_exhausted_fail_closed_refuses_forward` (fail_closed 模式下): 弱配置 + 对抗性 IR 耗尽候选时, 返回 503 + 上游未被调用 + 503 body 无 secret 明文 (载荷卫生交叉引用 SEC-2 — fail_closed 使 RedactError 首次在转发路径可达, SEC-2 重要性上升). ✅ `tests/integration.rs::fail_closed_mode_returns_503_when_probing_exhausted` + `src/redact.rs::redact_ir_checked_fail_closed_returns_err_on_exhaustion` / `redact_ir_checked_fail_closed_returns_err_on_insert_collision` / `redact_ir_checked_fail_closed_succeeds_when_probing_succeeds` / `redact_ir_checked_fail_closed_no_secrets_returns_empty_map` + 配置 serde (`src/config.rs::on_probe_exhausted_*` / `redact_config_toml_parses_fail_closed`).
+- `prop_probing_exhausted_fail_closed_refuses_forward` (fail_closed 模式下): 弱配置 + 对抗性 IR 耗尽候选时, 返回 503 + 上游未被调用 + 503 body 无 secret 明文 (载荷卫生交叉引用 SEC-2 — fail_closed 使 RedactError 首次在转发路径可达, SEC-2 重要性上升). ✅ `tests/integration.rs::fail_closed_mode_returns_503_when_probing_exhausted` + `src/redact.rs::redact_ir_checked_fail_closed_returns_err_on_exhaustion` / `redact_ir_checked_fail_closed_returns_err_on_insert_collision` / `redact_ir_checked_fail_closed_succeeds_when_probing_succeeds` / `redact_ir_checked_fail_closed_no_secrets_returns_empty_map` + 配置 serde (`src/config.rs::on_probe_exhausted` 系列 serde 测试 / `redact_config_toml_parses_fail_closed`).
 - `prop_redact_error_never_carries_secret_value`: RedactError 只携带 secret_id + reason, 不含 secret 明文. ✅ `src/redact.rs::redaction_map_insert_collision_returns_err_without_leaking_secret` + `prop_redact_error_debug_no_secret_leak` (SEC-2 property 形式化).
 
 ### RED-5 mock 不含 real_secret 子串 (实质确定性)
@@ -493,12 +493,13 @@
 - `prop_session_title_from_root_node`: session.title == 根 node 的首条 user msg preview.
 - `prop_session_title_stable_across_rounds`: 同一 session N (≥3) 轮 push 后 title 不变.
 
-### DTO-8 RecordSummary 轻量化
+### DTO-8 RecordSummary 轻量化 (**已作废**)
 
-**陈述**: `GET /records` 列表返回的 RecordSummary 不含 body 字段 (req_body / resp_body / resp_parsed), 由详情接口按需拉取.
-
-**Properties**:
-- `prop_record_summary_excludes_body`: RecordSummary JSON 不含 req_body / resp_body / resp_parsed 字段.
+> **作废 (2026-08-15, #147)**: 引用的 `GET /records` 列表 API 与 property
+> `prop_record_summary_excludes_body` 均已随 session-aware sync API (`POST /api/sync`)
+> 取代删除而消亡 — 全仓 (src/ + tests/) 零同名实现, 条目长期未标作废属文档漂移.
+> 按 §0.2 "编号作废不重用" 规则, DTO-8 编号永久作废, 不再分配.
+> 现行轻量化语义由 NodeView (`src/dto.rs`) 承载.
 
 ---
 
@@ -785,3 +786,4 @@
 | 2026-08-02 | UI-6 | 新增 `prop_follow_invariant_under_new_round` (follow 闭合不变量): follow 状态在任意新 round 插入下不被翻转 + 末轮 request 不被 drawer 遮挡 (几何允许区间内); 声明 `contentEnd > wrapH - GAP - minH` 区间豁免 | 现有 `prop_follow_new_round_auto_scroll` 只在"长内容稳态"断言结果 (距底 < 100), 不守卫机制本身; 历史 bug: 短内容 (`contentEnd ≤ wrapH`) + drawer 已显示时, placeholder=0 不提供滚动空间, `bottomScrollTarget` 想预留 `drawerH+GAP` 但被 `maxScroll=0` clamp, 末轮被 drawer 遮挡; 修复方案: `updateResponseDrawerLayout` 在 follow + 短内容 + drawer 遮挡时压缩 drawer 到 `wrapH - contentEnd - GAP` (派生属性, 无外部 state) |
 | 2026-08-15 | RED-4 | 陈述参数化: 降级行为从单一 fail-open 变为 `[redact] on_probe_exhausted` 可配置二选一 (fail_open 跳过该 secret / fail_closed 拒绝转发 503); property 按模式二分并挂实际测试名 (原 `prop_probing_exhausted_skips_not_panics` / `prop_redact_error_never_carries_secret_value` 为幻影名); `prop_redact_error_never_carries_secret_value` 交叉引用 SEC-2 | #150: `on_probe_exhausted = "fail_closed"` 已实现且测试锁定, 但契约仍只描述 fail-open 分支, 在 fail_closed 配置下字面为假 (§0.5 漂移处理流程真空案例); 编号不变, 属"调整"非"作废" |
 | 2026-08-15 | RED-3 | 新增例外场景裁决: pre-replace IR 含旧 mock 时允许 mock 变化 (probing counter 推进), 理由是 RED-2/RED-6 保护 restore 正确性优先于缓存稳定性; 补 3 条跨轮次 property (原 3 条契约 property 名零同名测试, 幂等性仅有 legacy C3 命名的同 IR 重复调用等价物, 跨轮次稳定性零覆盖) | #143: RED-2↔RED-3 设计张力未裁决 — 客户端把 mock 回传进历史 (上游 parse 失败 fallback 路径) 后, 同一 secret 的 mock 跨轮振荡, 上游前缀缓存反复失效; 定性为经济性代价 (token 费用) 而非安全泄露, 裁决维持现状 (restore 正确性优先), 例外由 `prop_mock_changes_when_ir_contains_old_mock_exception` 锁定 |
+| 2026-08-15 | DTO-8 | **作废** (编号永久作废不重用): 引用的 `GET /records` 列表 API 与 `prop_record_summary_excludes_body` 已随 session-aware sync API 取代删除而消亡, 全仓零同名实现 | #147: 契约文档漂移走查 — 条目未随 API 删除同步标作废, 违反 §0.2 "删除作废不重用" 规则 |

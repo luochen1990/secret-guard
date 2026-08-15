@@ -8,7 +8,7 @@
 
 轻量级 LLM 网关 (本地进程): 透明转发 LLM 请求, 同时检测并替换 body 中的 secret,
 防止 agent 不经意把 secret 泄露到 LLM Provider. 响应回传时反向替换, 让本地工具仍能用真 secret.
-支持多 provider 配置 (OpenAI / Anthropic / Gemini / Ollama), 通过 URL 路径前缀选择目标.
+支持多 provider 配置 (OpenAI / Anthropic / Gemini / Ollama / Responses), 通过 URL 路径前缀选择目标.
 
 ## 术语表
 
@@ -23,7 +23,7 @@
 | **Restore** | 把 response body 中的 Mock 还原为 Secret 的反向操作 | 还原、反替换、恢复 | 全局 |
 | **Mock** | Redact 时替代 Secret 的占位值 (per-secret 稳定, 不含真 secret 子串) | 假值、替身、占位符 | 全局 |
 | **Provider** | 一个上游 LLM 服务端点 (id + protocol + base_url + api_key) | 上游、后端、模型、服务商 | 全局 |
-| **Protocol** | LLM API 的协议族 (OpenAI / Anthropic / Gemini / Ollama) | 协议、格式 | 全局 |
+| **Protocol** | LLM API 的协议族 (OpenAI / Anthropic / Gemini / Ollama / Responses) | 协议、格式 | 全局 |
 | **IR** | 协议无关的中间表示 (IrRequest / IrResponse / IrBlock) | 中间表示 | codec |
 | **RedactionMap** | 一次 Redact 产出的 Secret↔Mock 双向映射表 (per-request, 不持久化) | 映射表、redact map | redact |
 | **MockStrategy** | 每个 Secret 的 Mock 生成策略 (初始值 + 生成策略两维度) | mock 策略、生成策略 | mock/redact |
@@ -228,26 +228,13 @@ timeline 中带 `.selected` 类的 `.tl-round` 集合, 必须严格等于 `{stat
 
 ### I5 — timeline 滚动状态机: followMode 是视口位置的纯派生 (↔ UI-6)
 
-timeline 的 follow/pinned 状态由 **视口距底部距离** 机械推导 (SSOT), 不由 "最近点了什么"
-显式动作决定. 形式化: `state.timelineFollow == isNearBottom()`, 在每次 scroll 事件
-(RAF 合并) + 每次新内容追加后由 `syncFollowMode()` 重算.
-
-- **follow** (距底 ≤ `NEAR_BOTTOM_PX` ≈ 100px): 新 round 到达 → `scrollTimelineToBottomForce`
-  锁定视口 (预留 drawerH+GAP, 末轮 request 完整可见, 不被 drawer 遮挡); `unreadCount` 清零.
-  **follow 闭合不变量**: follow 状态在新 round 插入下必须保持 (不被翻转, 末轮 request 不被
-  drawer 遮挡). 短内容场景下 `updateResponseDrawerLayout` 自动压缩 drawer 保障此不变量;
-  几何失效区间 + 实现细节见 contracts.md UI-6 与 src/web/AGENTS.md.
-- **pinned** (距底 > `NEAR_BOTTOM_PX`): 新 round 到达 → 不滚动, `unreadCount` 累加,
-  `#unread-badge` 浮出显示 "↓ N".
-
-**follow/pinned 视觉指示 (WebUI 反馈1)**: drawer 顶部边缘颜色随状态切换 — follow 淡灰近不可见,
-pinned accent (mauve) 细条 (`.pinned` 类, 配色与 unread badge 一致), 用户可一眼区分当前状态.
-
-**`selectedRound` 与 followMode 解耦 (方案 X)**: `selectedRound` 是 "用户最后显式关注的轮次",
-**不随 follow 自动推进** (避免 Response 抽屉布局抖动 + `.flash` 反复触发). 仅在 "进入 follow 的显式动作"
-(点 Session / 点 unread badge / 初次 `loadTimeline`) 时重置 selected 到最新轮 (`.selected` 持续
-高亮, 不触发 `.flash` — 因为这些动作用 `scroll:'bottom'` 滚到底, 与 `highlightRound` 的 70% 定位
-冲突). follow 期间新消息到达: selected 不变.
+timeline 的 follow/pinned 状态由**视口距底部距离**机械推导 (纯派生), 不由 "最近点了什么"
+显式动作决定; `selectedRound` 与 followMode 解耦 (方案 X: 仅 "进入 follow 的显式动作" —
+点 Session / 点 unread badge / 初次 loadTimeline — 才重置 selected 到最新轮).
+完整状态机 (NEAR_BOTTOM_PX 阈值 / follow 闭合不变量 / 短内容 drawer 压缩 / 几何失效区间)
+的 SSOT 是 contracts.md **UI-6**; 视觉指示 (drawer 边缘配色 / `.pinned` 类) 与前端实现
+细节 (syncFollowMode 入口 / handleNewRounds / jumpToLatest) 见 `src/web/AGENTS.md`
+"timeline 滚动状态机" 段.
 
 **回归守卫**: 这五条不变量由 `tests/webui/im-ui.spec.ts` 守卫. 改前端渲染逻辑或后端
 delta 切片时, 必须同步跑 `just check-webui`.
@@ -265,8 +252,8 @@ URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标
 | `/{o\|a\|g\|l\|r}/{name}/{*rest}` | forward, rest 含前导 `/` |
 | 其他 | 404 (不再 catch-all 透传) |
 
-`proto_short` 简写映射 (单一事实来源: `Protocol::ALL`):
-- `o` = OpenAI (Chat Completions), `a` = Anthropic, `g` = Gemini, `l` = oLLama, `r` = Responses (OpenAI Responses API)
+`proto_short` 简写映射的 SSOT 是 `Protocol::ALL` (协议家族清单见术语表 Protocol 行),
+文档与代码注释一律引用该常量, 不维护手抄清单.
 
 错误语义:
 - 未知 protocol 简写 → 404 `not_found`
@@ -333,8 +320,8 @@ Secret / Provider 的两种 value 来源 (`value`/`value_file`、`api_key`/`api_
 | `upstream_response_header_timeout_secs` | u64 | `60` | 上游响应头到达超时 (秒). `0` = 无限. 超时记 504 record (防 `send().await` 永久阻塞). |
 | `upstream_stream_idle_timeout_secs` | u64 | `120` | 流式 chunk 空闲超时 (秒). `0` = 无限. 防上游发完响应头后 body 卡住. |
 
-> 注: `[server]` / `[redact]` 段仅在启动时读取一次, WebUI 修改不生效 (restart 才生效).
-> 这是为了保持转发核心路径的零运行时配置开销.
+> 注: `[server]` / `[redact]` / `[auth]` 段仅在启动时读取一次, WebUI 修改不生效 (restart
+> 才生效). 这是为了保持转发核心路径的零运行时配置开销.
 
 ### `[redact]` 段字段 (static, 启动时读取一次)
 
@@ -342,6 +329,31 @@ Secret / Provider 的两种 value 来源 (`value`/`value_file`、`api_key`/`api_
 |---|---|---|---|
 | `global_mock_prefix` | string | `""` | Auto 模式 mock 的统一前缀 (注入到每个 secret 的 `gen_spec.prefix`). 详见 `src/redact.rs` C5 契约. |
 | `on_probe_exhausted` | `"fail_open"` \| `"fail_closed"` | `"fail_open"` | Mock probing 耗尽时 (弱配置 + 对抗性 IR 无法生成唯一 mock) 的策略. `fail_open` (向后兼容) 跳过该 secret 原样转发; `fail_closed` 拒绝转发整个请求 (返回 503), 防止 secret 泄露. 详见 `src/redact.rs::redact_ir_checked` 与 `src/config.rs::OnProbeExhausted`. |
+
+### `[auth]` 段字段 (static, 启动时读取一次)
+
+> Schema SSOT: `AuthConfig`; OIDC / session / API key 的完整行为契约: 均见
+> `src/auth/mod.rs` 与其子模块头部. `[auth]` 是对象数组 + 嵌套表的混合段,
+> 故用树形列表而非扁平表.
+
+- `enabled` (bool, 默认 `false`): 双轨认证总开关. `false` = 单用户模式 (所有路由无认证,
+  向后兼容); `true` = 浏览器 WebUI 走 OIDC, SDK 转发走本地 API key (`Authorization: Bearer sg_...`).
+  注意: ApiKeyStore 与 `/api/api-keys` CRUD 总是可用 ("只认证, 不隔离" 哲学, 见 `src/auth/mod.rs` 头部).
+- `oidc` (可选嵌套表, 默认缺席): OIDC 登录配置 (`enabled = true` 时浏览器侧必需).
+  字段:
+  - `issuer_url` (string, 必填): IdP 的 OIDC issuer URL, 启动时 Discovery 拉取端点 (fail-fast).
+  - `client_id` (string, 必填): OIDC client id.
+  - `client_secret_file` (string, 可选): client secret 文件路径, 启动时读取 (public client
+    + PKCE 场景可不配).
+  - `redirect_url` (string, 可选): 覆盖由 host+port 派生的默认回调
+    (`http://{host}:{port}/__sg/oauth2/callback`); path 必须保持 `/__sg/oauth2/callback`,
+    只能换 scheme/host/port (如经反向代理暴露时).
+- `api_keys` (`[[auth.api_keys]]` 数组, 默认空): 静态预设 API key 列表 (如 CI/CD 场景),
+  启动时 hash 后注入 ApiKeyStore, 与 WebUI 签发的 key 共用同一池. 元素字段:
+  - `label` (string, 必填): 显示名.
+  - `key` (string) / `key_file` (string): 明文或文件路径, 二选一 (互斥语义同
+    `[secrets]` 的 `value`/`value_file`, 见 `src/secrets.rs`).
+  静态 key 不可删除, 只能 disable/enable.
 
 配置示例 (`secret-guard.toml`):
 ```toml
@@ -570,12 +582,11 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
   (返回 503), 防止 secret 泄露到 LLM provider (见 `redact_ir_checked`). 默认仍
   `fail_open` 以保持升级兼容. 注意 fail_closed 拒绝时返回的 503 body 不含 secret 明文
   (变量部分只含 secret id + reason 枚举, 语义由 SEC-2 契约锁定).
-- **C5 是实质确定性契约**: Auto 模式 mock 不含 real_secret ≥`k(L)` 字符子串
-  (`k(L) = max(4, ⌈L/3⌉)`, 随 secret 长度自适应 — 短 secret 强保护, 长 secret 弱保护,
-  信息泄露率上界 ~36%). gen_candidate 内置 10000 次确定性内部重试链
-  (`C5_INTERNAL_RETRIES = 10_000`, safety bound), `(1e-5)^10000 = 1e-50000` 远超宇宙原子数,
-  因此 C5 在 Auto 模式下实质等价于确定性契约.
-  设计论据 (信息论 + 业界 secret scanner 阈值) 见 `src/mock.rs` 头部 "C5" 段落 (SSOT).
+- **C5 是实质确定性契约**: Auto 模式 mock 不含 real_secret 的 ≥`k(L)` 字符连续子串,
+  阈值 `k(L)` 随 secret 长度自适应 (短 secret 强保护, 长 secret 弱保护), 内部重试链
+  使契约在 Auto 模式下实质等价于确定性 (失败概率天文级小).
+  完整数学定义 (`k(L)` 公式 / 信息泄露率上界 / 重试链 safety bound) 的 SSOT 在
+  `src/mock.rs` 头部 "C5" 段落 (= contracts.md **RED-5**), 此处不重述数字.
   `proptest-regressions/redact.txt` 记录历史失败种子.
 - **同协议 + Redact: normalize_json 相等, 非 byte-exact**: reader → redact_ir → writer 重序列化,
   字段顺序 / 空白等无语义差异由 `normalize_json` 吸收, 语义信息通过 wire 形态元数据保留
@@ -608,7 +619,7 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
   混合 Text+ToolResult user 消息拆成 (1+N) 条 wire messages, 导致 `req_body_raw` 的
   messages 数 > IR messages 数. `extract_delta_messages_from_raw` 切片时跨协议路径的 start 偏小,
   delta 可能包含前序轮消息. 同协议路径不受影响. 详见 `src/web/AGENTS.md`.
-- static config 的 `[server]` (含 `upstream_*_timeout_secs`) / `[redact]` 段仅在启动时读取一次, WebUI 改不生效 (restart 才生效).
+- static config 的 `[server]` (含 `upstream_*_timeout_secs`) / `[redact]` / `[auth]` 段仅在启动时读取一次, WebUI 改不生效 (restart 才生效).
 - **redact_headers 名单硬编码 (SEC-4)**: `proxy/helpers.rs::redact_headers` 的敏感 header
   脱敏名单是硬编码黑名单 (显式枚举主流 provider auth header + 含 "token" / "secret"
   子串匹配, 完整名单以 `is_sensitive_header` 为 SSOT). 未在名单内的 header 会原样
