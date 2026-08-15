@@ -1,5 +1,11 @@
 # secret-guard — justfile
 # 一键命令集合, 覆盖开发 / 检查 / 测试 / 运行.
+#
+# 约定: 验证类 cargo 命令 (check/clippy/test/check-features/coverage*/bench/bench-ci)
+# 统一带 --locked — Cargo.toml 改动而 Cargo.lock 未提交时直接失败, 防 CI 静默重
+# resolve 导致 "CI 测试的依赖集 ≠ 提交的 lockfile ≠ nix 发布产物" 三元漂移 (issue #142).
+# 本地手改 Cargo.toml 后碰到一次 "lock file needs to be updated" 报错属预期提醒,
+# 跑一次 `cargo build` 更新 lockfile 后提交即可; 开发内环 recipe (build/run/dev*) 不带.
 
 default:
     @just --list
@@ -58,18 +64,20 @@ dev-test:
 # 也能闭环; doc 构建复用 debug/ 元数据缓存, 增量开销秒级, 不拖慢 coverage 路径.
 # 不带 --document-private-items: 项目内部 doc 链接指向 private item 是合理的 (维护者文档),
 # --document-private-items 会把这些当警告. 只查 public doc 的链接完整性即可守住门禁初衷.
+#
+# --locked: 见文件头 "约定" 段 (SSOT).
 check *ARGS:
     cargo fmt -- --check
-    cargo clippy --all-targets -- -D warnings
+    cargo clippy --locked --all-targets -- -D warnings
     cargo machete
-    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+    RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
     just check-webui-syntax
     # cargo test --doc
     @if echo "{{ ARGS }}" | grep -q -- "--coverage"; then \
         cargo llvm-cov clean --workspace; \
-        cargo llvm-cov nextest --no-fail-fast --no-report; \
+        cargo llvm-cov nextest --locked --no-fail-fast --no-report; \
     else \
-        cargo nextest run --no-fail-fast; \
+        cargo nextest run --locked --no-fail-fast; \
         just check-features; \
     fi
 
@@ -77,8 +85,8 @@ check *ARGS:
 # 该 feature 默认关闭, 包含视图正确性断言 (proxy.rs::assert_redactions_match_map).
 # 详见 AGENTS.md "视图正确性确保机制". CI workflow 单独成步运行本目标.
 check-features:
-    cargo clippy --all-targets --features consistency-check -- -D warnings
-    cargo nextest run --no-fail-fast --features consistency-check
+    cargo clippy --locked --all-targets --features consistency-check -- -D warnings
+    cargo nextest run --locked --no-fail-fast --features consistency-check
 
 # 内嵌 JS 语法检查 (秒级, 阻塞式).
 # 从 src/web/index.html 提取 <script>...</script> 块, 用 node --check 验证语法.
@@ -162,11 +170,11 @@ fmt:
 
 # 仅 clippy.
 clippy:
-    cargo clippy --all-targets -- -D warnings
+    cargo clippy --locked --all-targets -- -D warnings
 
 # 仅 test.
 test:
-    cargo nextest run --no-fail-fast
+    cargo nextest run --locked --no-fail-fast
 
 # 仅运行 ignored 测试 (TDD 红灯循环用, 详见 AGENTS.md "TDD 与可选测试").
 # 子串按测试名过滤 (非 ignore reason): just test-ignored gemini
@@ -192,7 +200,7 @@ COVERAGE_MAX_UNCOVERED := "1450"
 
 # 覆盖率摘要 (终端表格).
 coverage:
-    cargo llvm-cov nextest --no-fail-fast --no-report
+    cargo llvm-cov nextest --locked --no-fail-fast --no-report
     cargo llvm-cov report --summary-only
 
 # 覆盖率门禁 (CI 用): 双阈值, 任一不满足则非零退出.
@@ -205,14 +213,14 @@ coverage-gate:
 
 # HTML 报告 (浏览器打开 coverage/html/index.html).
 coverage-html:
-    cargo llvm-cov nextest --no-fail-fast --no-report
+    cargo llvm-cov nextest --locked --no-fail-fast --no-report
     cargo llvm-cov report --output-dir coverage --html
     @echo "HTML report: coverage/html/index.html"
 
 # LCOV 报告 (CI / IDE 集成).
 coverage-lcov:
     mkdir -p coverage
-    cargo llvm-cov nextest --no-fail-fast --lcov --output-path coverage/lcov.info
+    cargo llvm-cov nextest --locked --no-fail-fast --lcov --output-path coverage/lcov.info
     @echo "LCOV report: coverage/lcov.info"
 
 # 启动 mock 上游 (用于本地集成测试; 占位).
@@ -247,7 +255,7 @@ typos:
 # CI 调用: 被 ci.yml "Performance benchmark" step 调用 (非阻塞, 走 bench-ci 做基线对比).
 # release 缓存复用 CARGO_TARGET_DIR/release/ (与 debug/ 物理隔离).
 bench *ARGS:
-    cargo bench --bench redact -- {{ ARGS }}
+    cargo bench --locked --bench redact -- {{ ARGS }}
 
 # CI 性能回归检测 (criterion baseline 机制).
 #
@@ -315,7 +323,7 @@ bench-ci mode *extra:
 
     # 跑 bench, 捕获输出. set +e: cargo bench 退化时仍 exit 0, 但编译/运行错误
     # 会 exit 非 101, 需捕获区分 (退化 vs 真失败).
-    OUTPUT=$(cargo bench --bench redact -- --quick $BENCH_FLAG {{ extra }} 2>&1)
+    OUTPUT=$(cargo bench --locked --bench redact -- --quick $BENCH_FLAG {{ extra }} 2>&1)
     BENCH_EXIT=$?
     echo "$OUTPUT"
     if [ "$BENCH_EXIT" -ne 0 ]; then
