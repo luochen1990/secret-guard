@@ -88,7 +88,7 @@ check *ARGS:
     just deny-offline
 
 # consistency-check feature 守卫 (CI 用): clippy + nextest 带 feature flag.
-# 该 feature 默认关闭, 包含视图正确性断言 (proxy.rs::assert_redactions_match_map).
+# 该 feature 默认关闭, 包含视图正确性断言 (proxy/recorder.rs::assert_redactions_match_map).
 # 详见 AGENTS.md "视图正确性确保机制". CI workflow 单独成步运行本目标.
 check-features:
     cargo clippy --locked --all-targets --features consistency-check -- -D warnings
@@ -400,8 +400,9 @@ check-benches:
 # 双阈值 (对齐 coverage-gate 风格):
 #   FILE_WARN_PROD_LINES: 软提醒阈值. 超过则 echo warning, 不阻断 (开发时感知).
 #   FILE_MAX_PROD_LINES:  硬门禁阈值. 超过则 exit 1 (CI 阻断).
-# 当前 prod 最大是 proxy.rs=1584, MAX 1600 留极小余量强制警觉; WARN 500 让任何
-# 模块膨胀到该规模时尽早引起注意 (拆分 ROI 评估的早期信号).
+# 当前 prod 最大是 codec/openai.rs=1127 (proxy.rs 拆分为 proxy/ 目录后各子模块已远低于
+# 阈值), MAX 1600 留余量; WARN 500 让任何模块膨胀到该规模时尽早引起注意 (拆分 ROI
+# 评估的早期信号). 更新数字前跑 `just check-file-size` 取实测值.
 FILE_WARN_PROD_LINES := "500"
 FILE_MAX_PROD_LINES := "1600"
 
@@ -449,6 +450,60 @@ check-file-size:
       exit 1
     fi
     echo "All source files within {{ FILE_MAX_PROD_LINES }} prod-line limit (test code excluded)."
+
+# ─── 文档新鲜度检查 (非阻塞, #147) ─────────────────────────────────────────
+# 校验文档 ↔ 代码/CI 的机械可查引用没漂移 (issue #147 的防复发机制):
+#   1. 文档中 `path/to.rs::symbol` 引用: 文件存在 && symbol 在该文件中出现.
+#      路径约定: 不带 src/ 前缀的相对 crate 根 (AGENTS.md 风格, 如 proxy/recorder.rs::xxx);
+#      带 src/ 或 tests/ 前缀的相对仓库根也接受 (contracts.md 风格).
+#   2. docs/ci.md "CI 流程" step 清单条数 == .forgejo/workflows/ci.yml 实际 `- name:` 数.
+#      (ci.md 另有若干背景性 step 提及, 不在编号清单内, 故只对齐编号清单.)
+# 非阻塞定位: 独立 recipe, 不进 `just check` 链 (文档漂移不拦编译, 且 symbol 字面匹配
+# 对 重命名/宏生成 有已知误报面 — 人工 triage 后再决定是否升级). 与 #144 (traceability
+# lint, property→测试) 互补: 本检查管 文档→符号/step.
+check-docs:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # rg 隐式依赖显式化: 缺 rg 时采集静默变空列表 → 假绿, 必须前置失败.
+    command -v rg >/dev/null 2>&1 || { echo "::error::check-docs: rg not found"; exit 1; }
+    errors=0
+    # 统一错误出口: 前缀 + 计数. (step=0 诊断不走此函数 — 那是锚点失效, 直接 exit.)
+    fail() { echo "::error::check-docs: $*"; errors=$((errors+1)); }
+    # --- 1. .rs::symbol 引用存在性 ---
+    while IFS= read -r ref; do
+      f="${ref%%::*}"
+      sym="${ref##*::}"
+      # 解析仓库相对路径: 无前缀 → 相对 crate 根 (src/), src/ 或 tests/ 前缀 → 相对仓库根.
+      case "$f" in
+        src/*|tests/*) path="$f" ;;
+        *)             path="src/$f" ;;
+      esac
+      if [ ! -f "$path" ]; then
+        fail "文档引用的文件不存在: $ref (path=$path)"
+        continue
+      fi
+      if ! rg -q --no-messages "\b$sym\b" "$path"; then
+        fail "文档引用的 symbol 不在目标文件中: $ref"
+      fi
+    done < <(rg --no-messages -o --no-filename -g '*.md' \
+      '[A-Za-z0-9_/.-]+\.rs::[A-Za-z0-9_]+' AGENTS.md docs src 2>/dev/null | sort -u)
+    # --- 2. ci.md step 清单 == ci.yml 实际 step 数 ---
+    # grep -c 零匹配时 exit 1 + 输出 0 (pipefail 会让脚本在此非零退出, 属 fail-closed,
+    # 但零匹配更可能是 awk 锚点失效 — 加诊断再退出).
+    md_steps=$(awk '/^## CI 流程/,/^> \*\*流程顺序原则/' docs/ci.md | grep -cE '^[0-9]+\. \*\*' || true)
+    yml_steps=$(grep -cE '^\s*- name:' .forgejo/workflows/ci.yml || true)
+    if [ "$md_steps" = "0" ] || [ "$yml_steps" = "0" ]; then
+      echo "::error::check-docs: step 计数为 0 (awk/grep 锚点可能失效), md=$md_steps yml=$yml_steps"
+      exit 1
+    fi
+    if [ "$md_steps" != "$yml_steps" ]; then
+      fail "docs/ci.md step 清单 ($md_steps) != ci.yml 实际 step 数 ($yml_steps)"
+    fi
+    if [ "$errors" -gt 0 ]; then
+      echo "check-docs: $errors 处文档引用漂移 (见上方 ::error, 非阻塞, 请人工确认)."
+      exit 1
+    fi
+    echo "check-docs: ✓ 文档 .rs::symbol 引用与 ci.md step 计数均与代码一致."
 
 # ─── PR diff 拆解 ──────────────────────────────────────────────────────────
 # 区分 diff 中的 prod 代码 vs test 代码, 用于 review 时判断真实膨胀.
