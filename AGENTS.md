@@ -306,6 +306,9 @@ URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标
 合并语义 (OverrideMode: Default / PreferStatic / Disabled)、Effective source 4 种、
 CRUD 操作语义、DynamicTable 持久化策略、跨表并发安全的详尽描述见 `src/config.rs` 头部.
 
+> 用户向的配置字段参考在 **`docs/configuration.md`** (README 已链接). 改配置 schema
+> (增删字段 / 改默认值) 时须同步更新该文档, 保持两份字段表一致.
+
 Secret / Provider 的两种 value 来源 (`value`/`value_file`、`api_key`/`api_key_file`)
 及其 fail-fast vs 热路径差异, 见 `src/secrets.rs` 与 `src/provider.rs` 头部.
 
@@ -421,7 +424,7 @@ OpenAI Python SDK:
 ```python
 from openai import OpenAI
 client = OpenAI(
-    base_url="http://127.0.0.1:18787/o/openai-main",
+    base_url="http://127.0.0.1:18787/o/openai-main/v1",  # SDK 不自动补 /v1, 需自带
     api_key="ignored",  # 由 provider 配置覆盖
 )
 ```
