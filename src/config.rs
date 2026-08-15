@@ -232,6 +232,315 @@ pub struct SecretsConfig {
     pub entries: Vec<SecretEntry>,
 }
 
+// ─── 静态配置审计 (未知字段 / 未知 section / 常见嵌套误用 → WARN) ──────────
+//
+// 背景 (#159): serde 默认静默忽略未知字段 — 拼写错误 (`protocl`) / 单数 section
+// (`[[provider]]`) / 字段放错层级都会被无提示吞掉, 用户以为已生效. 对安全工具而言
+// "以为被保护实则没有" 是最危险的失败模式, 故在正式反序列化**前**跑一遍本审计,
+// 对可疑但不致命的写法打 WARN (只加提示, 不改行为, 不破坏前向兼容).
+//
+// 实现选型 (网络不可达, serde_ignored 不可用; 且手工遍历更可控):
+// 解析为 `toml::Table` 后按 [`KNOWN_FIELDS`] 手工遍历对比 (table 值递归下降,
+// 如 mock_strategy 子树). 手工清单的 SSOT 漂移风险由
+// `audit_tests::known_fields_cover_serialized_defaults` 守卫 — 它把一个**全字段
+// 填充**的 Config 样本序列化回 TOML 并断言产物中每条字段路径都被清单覆盖,
+// 新增可序列化字段而漏更清单会直接红测 (default 序列化有空数组/None 盲区, 故不用).
+//
+// 检测函数是纯函数 (`audit_static_config_text` → Vec<String> 的 WARN 行), 加载器
+// 负责逐行 tracing::warn, 单测直接对返回值断言 (项目无日志捕获设施).
+
+/// 已知顶层 section 名 (与 [`Config`] 的字段一一对应).
+const KNOWN_SECTIONS: [&str; 5] = ["server", "providers", "secrets", "redact", "auth"];
+
+/// 各配置表的已知字段清单 (含数组 entry 级与嵌套 struct 字段), 键为 TOML 路径前缀.
+///
+/// **SSOT 同步要求**: 给对应 struct 新增可序列化字段时, 需同步两处 — 本清单 +
+/// 守卫测试的填充样本 (`serialized_full_sample_paths`). 只更清单不更样本时守卫
+/// 不红 (样本-based 守卫的固有限制), 清单 stale 会让合法配置被误 WARN;
+/// 漏更清单则由 `audit_tests::known_fields_cover_serialized_defaults` 兜底红测.
+/// `secrets` 前缀覆盖 `[secrets]` 表本身 (`entries`), `secrets.entries` 覆盖 entry 级,
+/// 更深前缀覆盖 mock_strategy 子树 (audit 对 table 值递归下降一层).
+const KNOWN_FIELDS: &[(&str, &[&str])] = &[
+    // Config::server (ServerConfig)
+    (
+        "server",
+        &[
+            "host",
+            "port",
+            "records_capacity",
+            "upstream_connect_timeout_secs",
+            "upstream_response_header_timeout_secs",
+            "upstream_stream_idle_timeout_secs",
+        ],
+    ),
+    // Config::providers (Vec<Provider>, 平铺 [[providers]])
+    (
+        "providers",
+        &[
+            "id",
+            "protocol",
+            "base_url",
+            "api_key",
+            "api_key_file",
+            "enabled",
+            "name",
+        ],
+    ),
+    // Config::secrets (SecretsConfig) — 表级仅 entries 一个键
+    ("secrets", &["entries"]),
+    // SecretEntry ([[secrets.entries]])
+    (
+        "secrets.entries",
+        &[
+            "id",
+            "name",
+            "category",
+            "value",
+            "value_file",
+            "mock_strategy",
+        ],
+    ),
+    // SecretEntry.mock_strategy (MockStrategy; gen_spec 在 wire 上名为 gen)
+    ("secrets.entries.mock_strategy", &["initial", "gen"]),
+    // InitialValue::Fixed (serde tag = "kind"; Auto 变体是字符串叶子无需清单)
+    ("secrets.entries.mock_strategy.initial", &["kind", "value"]),
+    // MockStrategy.gen_spec (GenSpec)
+    (
+        "secrets.entries.mock_strategy.gen",
+        &["prefix", "charset", "length_range"],
+    ),
+    // GenSpec.charset (Charset)
+    (
+        "secrets.entries.mock_strategy.gen.charset",
+        &[
+            "digits",
+            "lowercase",
+            "uppercase",
+            "underscore",
+            "hyphen",
+            "other",
+        ],
+    ),
+    // Config::redact (RedactConfig)
+    ("redact", &["global_mock_prefix", "on_probe_exhausted"]),
+    // Config::auth (AuthConfig)
+    ("auth", &["enabled", "oidc", "api_keys"]),
+    // auth.oidc (OidcConfig)
+    (
+        "auth.oidc",
+        &[
+            "issuer_url",
+            "client_id",
+            "client_secret_file",
+            "redirect_url",
+        ],
+    ),
+    // auth.api_keys entry (StaticApiKey)
+    ("auth.api_keys", &["label", "key", "key_file"]),
+];
+
+/// 极简编辑距离 (Levenshtein, ≤ max 时返回真实距离, 否则返回 None 用于剪枝).
+/// 仅用于拼写建议, 不追求高效 (候选集个位数 × 字段名长度 ≤ 40).
+fn edit_distance_within(a: &str, b: &str, max: usize) -> Option<usize> {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    // 长度差超过 max 时距离必然 > max, 直接剪枝 (免建 DP 表).
+    if a.len().abs_diff(b.len()) > max {
+        return None;
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    (prev[b.len()] <= max).then_some(prev[b.len()])
+}
+
+/// 在候选名中找编辑距离 ≤ 2 的最佳建议 (距离相同取字母序, 保证确定性).
+/// 返回借用自候选切片的 &'static str (调用方全部传字面量清单).
+/// 前置条件: typo 不在候选中 (调用方只在键不在清单时到达这里).
+fn suggest_field<'a>(typo: &str, candidates: &[&'a str]) -> Option<&'a str> {
+    candidates
+        .iter()
+        .filter_map(|c| edit_distance_within(typo, c, 2).map(|d| (d, *c)))
+        .min_by_key(|(d, c)| (*d, *c))
+        .map(|(_, c)| c)
+}
+
+/// 查 prefix 对应的已知字段清单 (无条目时返回空切片).
+fn known_fields_for(prefix: &str) -> &'static [&'static str] {
+    KNOWN_FIELDS
+        .iter()
+        .find(|(p, _)| *p == prefix)
+        .map(|(_, fs)| *fs)
+        .unwrap_or(&[])
+}
+
+/// 对一个 TOML table 的键做未知字段检查, 返回该层的 WARN 行.
+///
+/// `where_` 是用户可读定位 (如 `providers[1]` / `[server]`), `prefix` 是
+/// [`KNOWN_FIELDS`] 的查找键 (如 `providers`).
+///
+/// 递归: 键的值是 table 且 KNOWN_FIELDS 有对应子前缀 (`mock_strategy` →
+/// `mock_strategy.gen` → `...charset`) 时下降一层审计, 让深层拼写错误
+/// (如 `mock_strategy.inital`) 也能被观测 (#159 的目标在最深配置层同样成立).
+fn check_table_keys(table: &toml::Table, where_: &str, prefix: &str, out: &mut Vec<String>) {
+    let known = known_fields_for(prefix);
+    for (key, value) in table {
+        if known.contains(&key.as_str()) {
+            // 已知字段: 若值是 table 且存在子前缀清单, 递归审计一层 (如 mock_strategy).
+            if let Some(sub) = value.as_table() {
+                let sub_prefix = format!("{prefix}.{key}");
+                if !known_fields_for(&sub_prefix).is_empty() {
+                    check_table_keys(sub, &format!("{where_}.{key}"), &sub_prefix, out);
+                }
+            }
+            continue;
+        }
+        let suggestion = match suggest_field(key, known) {
+            Some(s) => format!(" (did you mean '{s}'?)"),
+            None => String::new(),
+        };
+        out.push(format!(
+            "config: unknown field '{key}' in {where_} will be ignored{suggestion}"
+        ));
+    }
+}
+
+/// 对 array-of-tables 的每个 entry 做未知字段审计 (类型不符元素跳过, 硬错误优先).
+fn check_table_array(arr: &toml::value::Array, prefix: &str, out: &mut Vec<String>) {
+    for (i, item) in arr.iter().enumerate() {
+        if let Some(t) = item.as_table() {
+            check_table_keys(t, &format!("{prefix}[{i}]"), prefix, out);
+        }
+    }
+}
+
+/// 审计静态配置文本, 返回 0..n 条 WARN 行 (每条一行, 已含定位与建议).
+///
+/// 纯函数 (不 IO / 不打日志), 由 [`Config::load_or_default`] 在**正式反序列化前**
+/// 调用并逐行 warn. TOML 本身 parse 失败时不产出审计行 (parse error 由调用方报).
+///
+/// 额外覆盖四条组合提示 (#159 第三梯度 + #155 子项 3):
+/// - 未知顶层 section (如单数 `[[provider]]`) → WARN + 单复数拼写建议.
+/// - 配置存在但 providers + secrets 全为空 → 一行提示 (转发将全部 404).
+/// - `[secrets]`/`[[secrets]]` 存在但无 `entries` 键 → 提示正确写法
+///   `[[secrets.entries]]` (providers 平铺 / secrets 嵌套的不一致是走查实测卡点).
+/// - `auth.oidc` 写成数组 → 提示应为单表 `[auth.oidc]` (与 secrets 的 hint 对称).
+pub(crate) fn audit_static_config_text(text: &str) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let Ok(table) = text.parse::<toml::Table>() else {
+        return warnings; // parse 失败由调用方的错误路径处理, 这里不重复报.
+    };
+
+    // ── 通道 1: 未知顶层 section (拼写建议) ──
+    for key in table.keys() {
+        if !KNOWN_SECTIONS.contains(&key.as_str()) {
+            let suggestion = match suggest_field(key, &KNOWN_SECTIONS) {
+                Some(s) => format!("; did you mean '{s}'?"),
+                None => String::new(),
+            };
+            warnings.push(format!(
+                "config: unknown top-level section '{key}' will be ignored{suggestion}"
+            ));
+        }
+    }
+
+    // ── 通道 2: 已知 section 内的未知字段 (逐表逐 entry) ──
+    // 结构假设 (与 serde schema 对齐, 类型不符时 serde 稍后会报硬错误):
+    //   server/redact/auth → table; providers → array of table;
+    //   secrets → table{ entries: array of table }; auth.oidc → table;
+    //   auth.api_keys → array of table. 类型不符的键跳过本通道 (硬错误优先).
+    if let Some(v) = table.get("server").and_then(|v| v.as_table()) {
+        check_table_keys(v, "[server]", "server", &mut warnings);
+    }
+    if let Some(v) = table.get("redact").and_then(|v| v.as_table()) {
+        check_table_keys(v, "[redact]", "redact", &mut warnings);
+    }
+    if let Some(auth) = table.get("auth").and_then(|v| v.as_table()) {
+        // oidc 子表由 check_table_keys 的递归下降审计 (定位 "[auth].oidc"),
+        // 不在此显式调用, 避免同一 table 双重审计 (双重 WARN).
+        check_table_keys(auth, "[auth]", "auth", &mut warnings);
+        if let Some(keys) = auth.get("api_keys").and_then(|v| v.as_array()) {
+            check_table_array(keys, "auth.api_keys", &mut warnings);
+        }
+    }
+    if let Some(v) = table.get("providers").and_then(|v| v.as_array()) {
+        check_table_array(v, "providers", &mut warnings);
+    }
+    if let Some(v) = table.get("secrets").and_then(|v| v.as_table()) {
+        check_table_keys(v, "[secrets]", "secrets", &mut warnings);
+        if let Some(entries) = v.get("entries").and_then(|e| e.as_array()) {
+            check_table_array(entries, "secrets.entries", &mut warnings);
+        }
+    }
+
+    // ── 组合提示: 空配置 (#159 第三梯度) ──
+    // 结构对齐上面通道 2 的假设: providers 是空数组 / 缺席, 且 secrets.entries
+    // 是空数组 / 缺席, 才算 "providers + secrets 全空".
+    let providers_empty = table
+        .get("providers")
+        .and_then(|v| v.as_array())
+        .is_none_or(|a| a.is_empty());
+    let secrets_empty = table
+        .get("secrets")
+        .and_then(|v| v.as_table())
+        .is_none_or(|s| {
+            s.get("entries")
+                .and_then(|e| e.as_array())
+                .is_none_or(|a| a.is_empty())
+        });
+    if providers_empty && secrets_empty {
+        // 取舍声明: 纯 WebUI 管理部署 (static 留空, 全部条目走 state.toml) 也会命中
+        // 本 WARN — 属已知误报, 文案已附 "or manage via WebUI" 指路; 对安全工具,
+        // "以为配了实则没配" 的漏报代价高于一次冗余提示, 故不收紧条件.
+        warnings.push(
+            "config: no providers and no secrets are configured in this file; forwarding \
+             requests will get 404 until some exist (add [[providers]] / \
+             [[secrets.entries]], or manage via WebUI)"
+                .to_string(),
+        );
+    }
+
+    // ── 组合提示: secrets 嵌套误用 (#155 子项 3) ──
+    if let Some(secrets_val) = table.get("secrets") {
+        let hint = "did you mean [[secrets.entries]]? (secrets must be nested, unlike \
+                    flat [[providers]])";
+        if secrets_val.as_array().is_some() {
+            warnings.push(format!(
+                "config: [[secrets]] is written as an array; {hint}"
+            ));
+        } else if let Some(sec_table) = secrets_val.as_table()
+            && !sec_table.contains_key("entries")
+            && !sec_table.is_empty()
+        {
+            warnings.push(format!(
+                "config: [secrets] section has no 'entries' key; {hint}"
+            ));
+        }
+    }
+
+    // ── 组合提示: auth.oidc 数组误用 (与 [[secrets]] 同型) ──
+    // `[auth.oidc]` 期望单表; 写成 `[[auth.oidc]]` 时 serde 会报类型硬错误, 这里
+    // 额外给出写法 hint (与 secrets 的专用 hint 对称).
+    if let Some(auth) = table.get("auth").and_then(|v| v.as_table())
+        && auth.get("oidc").and_then(|v| v.as_array()).is_some()
+    {
+        warnings.push(
+            "config: [[auth.oidc]] is written as an array; did you mean [auth.oidc]? \
+             (a single table, not an array of tables)"
+                .to_string(),
+        );
+    }
+
+    warnings
+}
+
 impl Config {
     /// 从 TOML 文件加载; 若文件不存在返回默认值并 warn.
     ///
@@ -252,6 +561,12 @@ impl Config {
         }
         let text = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("read config {}: {e}", path.display()))?;
+        // 预检审计 (#159): 正式反序列化前对未知 section / 未知字段打 WARN.
+        // 放在 parse 之前, 让"语法合法但语义可疑"的配置在 fail-fast 报错之前
+        // 也能先看到全部 WARN (若同一文件还有硬错误, 错误信息在其后输出).
+        for warning in audit_static_config_text(&text) {
+            tracing::warn!("{warning}");
+        }
         let mut cfg: Self = toml::from_str(&text)
             .map_err(|e| anyhow::anyhow!("parse config {}: {e}", path.display()))?;
         validate_and_resolve_secrets(
@@ -821,6 +1136,386 @@ impl<T: DynamicEntry> DynamicTable<T> {
         T::set_state_field(&mut state, new_dynamic.to_vec());
         let text = state.to_toml()?;
         atomic_write(&self.state_path, &text)
+    }
+}
+
+/// 漂移守卫素材: **全字段填充**的 Config 样本序列化产物中的全部字段路径.
+///
+/// 不用 `Config::default()` — default 的空数组 (`providers` / `secrets.entries` /
+/// `auth.api_keys`) 与 `Option::None` (`auth.oidc`) 在序列化产物中不出现, 会留下
+/// 5/8 前缀的守卫盲区. 样本显式填 1 个 provider + 1 个 secret (mock_strategy 全
+/// 字段, Fixed 模式避开 Auto infer) + 1 个静态 api_key + Some(OidcConfig).
+#[cfg(test)]
+fn serialized_full_sample_paths() -> Vec<String> {
+    let sample = Config {
+        server: ServerConfig::default(),
+        providers: vec![crate::provider::Provider {
+            id: "sample".into(),
+            protocol: crate::provider::Protocol::default(),
+            base_url: "http://127.0.0.1:1".into(),
+            api_key: "sk-sample".into(),
+            api_key_file: Some("/dev/null".into()),
+            enabled: true,
+            name: Some("sample".into()),
+        }],
+        secrets: SecretsConfig {
+            entries: vec![SecretEntry {
+                id: "sample".into(),
+                name: Some("sample".into()),
+                category: crate::secrets::SecretCategory::default(),
+                value: "sample-value".into(),
+                value_file: None,
+                mock_strategy: crate::mock::MockStrategy {
+                    initial: crate::mock::InitialValue::Fixed { value: "m".into() },
+                    gen_spec: Some(crate::mock::GenSpec {
+                        prefix: "p".into(),
+                        charset: crate::mock::Charset {
+                            digits: true,
+                            lowercase: true,
+                            uppercase: true,
+                            underscore: true,
+                            hyphen: true,
+                            other: vec!['!'],
+                        },
+                        length_range: (8, 12),
+                    }),
+                },
+            }],
+        },
+        redact: RedactConfig::default(),
+        auth: crate::auth::AuthConfig {
+            enabled: false,
+            oidc: Some(crate::auth::OidcConfig {
+                issuer_url: "https://idp.example".into(),
+                client_id: "cid".into(),
+                client_secret_file: Some("/dev/null".into()),
+                redirect_url: Some("http://127.0.0.1:1/cb".into()),
+            }),
+            api_keys: vec![crate::auth::StaticApiKey {
+                label: "sample".into(),
+                key: Some("sk-sample".into()),
+                key_file: None,
+            }],
+        },
+    };
+    let value = toml::Value::try_from(&sample).expect("sample Config serializes to TOML");
+    let mut paths = Vec::new();
+    fn walk(prefix: &str, v: &toml::Value, out: &mut Vec<String>) {
+        match v {
+            toml::Value::Table(t) => {
+                for (k, sub) in t {
+                    walk(&format!("{prefix}{k}."), sub, out);
+                }
+            }
+            toml::Value::Array(a) => {
+                // 只对 "元素是 table" 的数组下钻 (providers / secrets.entries /
+                // auth.api_keys, 下标对消费端零信息故不编码进路径);
+                // 原始值数组 (length_range / charset.other) 视作单一叶子.
+                if let Some(first) = a.first()
+                    && first.is_table()
+                {
+                    walk(prefix, first, out);
+                } else {
+                    out.push(prefix.trim_end_matches('.').to_string());
+                }
+            }
+            _ => {
+                out.push(prefix.trim_end_matches('.').to_string());
+            }
+        }
+    }
+    walk("", &value, &mut paths);
+    paths
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    /// 把 warnings 拼成多行文本便于 contains 断言.
+    fn joined(ws: &[String]) -> String {
+        ws.join("\n")
+    }
+
+    /// 漂移守卫 (SSOT): KNOWN_FIELDS 覆盖 default 序列化产物的全部字段路径.
+    /// 新增可序列化字段而漏更清单 → 本测试红 (清单与 struct schema 的同步契约).
+    #[test]
+    fn known_fields_cover_serialized_defaults() {
+        let paths = serialized_full_sample_paths();
+        assert!(
+            !paths.is_empty(),
+            "full sample must serialize non-empty (fill providers/secrets/api_keys/oidc)"
+        );
+        // 覆盖面自检: 每类前缀至少出现一条路径 (防样本自身漂移回 default 盲区).
+        for expected in [
+            "server.",
+            "providers.",
+            "secrets.entries.",
+            "secrets.entries.mock_strategy",
+            "redact.",
+            "auth.",
+            "auth.oidc.",
+            "auth.api_keys.",
+        ] {
+            assert!(
+                paths.iter().any(|p| p.starts_with(expected)),
+                "guard sample missing paths under '{expected}' — sample drifted?"
+            );
+        }
+        for path in &paths {
+            // 拆最后一段: `server.host` → ("server", "host");
+            // `providers.id` → ("providers", "id") (walk 已剥掉数组下标).
+            let Some((prefix, field)) = path.rsplit_once('.') else {
+                continue; // 顶层裸键不会出现在序列化产物中.
+            };
+            let known = KNOWN_FIELDS
+                .iter()
+                .find(|(p, _)| *p == prefix)
+                .map(|(_, fs)| *fs)
+                .unwrap_or_else(|| panic!("no KNOWN_FIELDS entry for prefix '{prefix}'"));
+            assert!(
+                known.contains(&field),
+                "serialized path '{path}' (field '{field}') missing from KNOWN_FIELDS \
+                 '{prefix}' — new field added without updating the audit list?"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_clean_config_produces_no_warnings() {
+        let text = r#"
+[[providers]]
+id = "m"
+protocol = "openai"
+base_url = "http://127.0.0.1:29804"
+
+[[secrets.entries]]
+id = "t"
+value = "abc"
+"#;
+        let ws = audit_static_config_text(text);
+        assert!(ws.is_empty(), "clean config must not warn: {ws:?}");
+    }
+
+    /// #159 现象 1: 未知字段 (totally_unknown_field / 拼写错误 protocl) 静默忽略.
+    #[test]
+    fn audit_warns_unknown_provider_fields() {
+        let text = r#"
+[[providers]]
+id = "m"
+protocol = "openai"
+base_url = "http://127.0.0.1:29804"
+totally_unknown_field = "oops"
+protocl = "openai"
+"#;
+        let ws = audit_static_config_text(text);
+        let all = joined(&ws);
+        assert!(all.contains("totally_unknown_field"), "got: {all}");
+        // 拼写建议: protocl → protocol (编辑距离 1).
+        assert!(
+            all.contains("protocl") && all.contains("did you mean 'protocol'"),
+            "suggestion missing: {all}"
+        );
+        // 定位含数组下标.
+        assert!(all.contains("providers[0]"), "got: {all}");
+    }
+
+    /// #159 现象 2: 单数 [[provider]] 静默忽略 → WARN + 单复数建议.
+    #[test]
+    fn audit_warns_singular_provider_section() {
+        let text = r#"
+[[provider]]
+id = "m"
+protocol = "openai"
+base_url = "http://127.0.0.1:29804"
+"#;
+        let ws = audit_static_config_text(text);
+        let all = joined(&ws);
+        assert!(
+            all.contains("unknown top-level section 'provider'"),
+            "got: {all}"
+        );
+        assert!(
+            all.contains("did you mean 'providers'"),
+            "plural suggestion missing: {all}"
+        );
+    }
+
+    /// #159 第三梯度: 配置文件存在但 providers + secrets 全空 → 一行提示.
+    #[test]
+    fn audit_warns_empty_providers_and_secrets() {
+        let text = "[server]\nport = 18787\n";
+        let ws = audit_static_config_text(text);
+        let all = joined(&ws);
+        assert!(
+            all.contains("no providers and no secrets are configured"),
+            "got: {all}"
+        );
+        assert!(all.contains("404"), "got: {all}");
+    }
+
+    /// 空配置提示不应误报: 有 provider 时 (即使 secrets 为空) 不打"全空"提示.
+    #[test]
+    fn audit_no_empty_warning_when_providers_present() {
+        let text = "[[providers]]\nid = \"m\"\nprotocol = \"openai\"\nbase_url = \"http://x\"\n";
+        let ws = audit_static_config_text(text);
+        assert!(
+            !joined(&ws).contains("no providers and no secrets"),
+            "must not false-positive: {ws:?}"
+        );
+    }
+
+    /// #155 子项 3 (代码部分): `[[secrets]]` 数组写法 → 提示正确嵌套写法.
+    #[test]
+    fn audit_hints_secrets_array_misuse() {
+        let text = "[[providers]]\nid=\"m\"\nprotocol=\"openai\"\nbase_url=\"http://127.0.0.1:1\"\n[[secrets]]\nid=\"t\"\nvalue=\"abc\"\n";
+        let ws = audit_static_config_text(text);
+        let all = joined(&ws);
+        assert!(
+            all.contains("[[secrets]] is written as an array"),
+            "got: {all}"
+        );
+        assert!(
+            all.contains("[[secrets.entries]]"),
+            "correct-syntax hint missing: {all}"
+        );
+    }
+
+    /// #155 子项 3 变体: `[secrets]` 存在但缺 entries 键.
+    #[test]
+    fn audit_hints_secrets_missing_entries() {
+        let text = "[secrets]\nid = \"t\"\nvalue = \"abc\"\n";
+        let ws = audit_static_config_text(text);
+        let all = joined(&ws);
+        assert!(all.contains("no 'entries' key"), "got: {all}");
+        assert!(all.contains("[[secrets.entries]]"), "got: {all}");
+    }
+
+    /// 未知字段在嵌套 section (redact/auth) 中也报, 且不误报已知字段.
+    #[test]
+    fn audit_warns_unknown_field_in_nested_sections() {
+        let text = "[redact]\nglobal_mock_prefix = \"sgm_\"\nunknown_thing = 1\n";
+        let ws = audit_static_config_text(text);
+        let all = joined(&ws);
+        assert!(
+            all.contains("unknown field 'unknown_thing' in [redact]"),
+            "got: {all}"
+        );
+        assert!(
+            !all.contains("global_mock_prefix"),
+            "known field must not warn: {all}"
+        );
+    }
+
+    /// 拼写建议边界: 编辑距离 ≤ 2 才建议 (portx → port), 距离过大不给建议.
+    #[test]
+    fn audit_suggestion_distance_bound() {
+        let text = "[server]\nportx = 1\ncompletely_different = 2\n";
+        let ws = audit_static_config_text(text);
+        let all = joined(&ws);
+        assert!(all.contains("portx"), "got: {all}");
+        assert!(
+            all.contains("did you mean 'port'"),
+            "near-typo should suggest: {all}"
+        );
+        assert!(
+            !all.contains("completely_different' (did"),
+            "far field should not suggest: {all}"
+        );
+    }
+
+    /// 深层 entry 字段: secrets.entries[0].valeu (value 拼错) 也有建议.
+    #[test]
+    fn audit_suggestion_in_secret_entries() {
+        let text = "[[secrets.entries]]\nid = \"t\"\nvaleu = \"abc\"\n";
+        let ws = audit_static_config_text(text);
+        let all = joined(&ws);
+        assert!(
+            all.contains("valeu") && all.contains("did you mean 'value'"),
+            "got: {all}"
+        );
+        assert!(all.contains("secrets.entries[0]"), "got: {all}");
+    }
+
+    /// mock_strategy 子树: 合法嵌套字段不误报; 深层拼错 (inital) 也有建议.
+    #[test]
+    fn audit_recurses_into_mock_strategy() {
+        // 合法的深层配置零 WARN.
+        let legal = r#"
+[[secrets.entries]]
+id = "t"
+value = "abc"
+[secrets.entries.mock_strategy]
+initial = "fixed"
+[secrets.entries.mock_strategy.gen]
+prefix = "sgm_"
+[secrets.entries.mock_strategy.gen.charset]
+digits = true
+lowercase = true
+"#;
+        let ws = audit_static_config_text(legal);
+        assert!(ws.is_empty(), "legal mock_strategy must not warn: {ws:?}");
+
+        // 深层拼错: mock_strategy.inital → initial.
+        let typo = "[[secrets.entries]]\nid = \"t\"\nvalue = \"abc\"\n[secrets.entries.mock_strategy]\ninital = \"fixed\"\n";
+        let ws = audit_static_config_text(typo);
+        let all = joined(&ws);
+        assert!(
+            all.contains("inital") && all.contains("did you mean 'initial'"),
+            "deep typo must be observed: {all}"
+        );
+    }
+
+    /// auth.oidc 写成数组 ([[auth.oidc]]) → 提示应为单表 [auth.oidc].
+    #[test]
+    fn audit_hints_auth_oidc_array_misuse() {
+        let text = "[[auth.oidc]]\nissuer_url = \"https://x\"\nclient_id = \"c\"\n";
+        let ws = audit_static_config_text(text);
+        let all = joined(&ws);
+        assert!(
+            all.contains("[[auth.oidc]] is written as an array"),
+            "got: {all}"
+        );
+        assert!(all.contains("[auth.oidc]"), "got: {all}");
+    }
+
+    /// TOML 语法错误: 审计层静默返回空 (硬错误由调用方 parse 路径报告).
+    #[test]
+    fn audit_silent_on_parse_error() {
+        let ws = audit_static_config_text("not [valid toml");
+        assert!(ws.is_empty());
+    }
+
+    /// 类型不符 (providers 写成 table): 硬错误由 serde 报, 审计不重复报也不 panic.
+    #[test]
+    fn audit_tolerates_type_mismatch() {
+        let ws = audit_static_config_text("[providers]\nid = \"m\"\n");
+        // 不 panic 即可; serde 的硬错误在调用方路径覆盖.
+        drop(ws);
+    }
+
+    // ─── 拼写建议纯函数 ───
+
+    #[test]
+    fn edit_distance_basics() {
+        assert_eq!(edit_distance_within("protocl", "protocol", 2), Some(1));
+        assert_eq!(edit_distance_within("abc", "abc", 2), Some(0));
+        assert_eq!(edit_distance_within("portx", "port", 2), Some(1));
+        assert_eq!(edit_distance_within("abcd", "", 2), None); // 距离 4 > 2
+        assert_eq!(edit_distance_within("provider", "providers", 2), Some(1));
+    }
+
+    #[test]
+    fn suggest_field_prefers_smallest_distance() {
+        // "prt" 同时接近 "port" (d=1); 不应给出更远的候选.
+        assert_eq!(
+            suggest_field("prt", &["port", "records_capacity"]),
+            Some("port")
+        );
+        // 距离相同取字母序第一个 (确定性): "cb" → "ca" / "cd" 均为 d=1, 取 "ca".
+        assert_eq!(suggest_field("cb", &["cd", "ca"]), Some("ca"));
+        // 无任何候选在距离 ≤2 内 → 不建议.
+        assert_eq!(suggest_field("zzzzzz", &["port"]), None);
     }
 }
 

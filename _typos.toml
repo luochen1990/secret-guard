@@ -22,3 +22,9 @@ thr = "thr"
 # 非 English 单词, 是构造畸形输入验证 parser 鲁棒性的字面量, 不应被纠正.
 hel = "hel"
 abd = "abd"
+# protocl / valeu = 静态配置审计 (#159) 的拼写错误 fixture — 测试 "did you mean"
+# 拼写建议 (protocl→protocol / valeu→value) 的关键输入, 故意拼错, 不应被纠正.
+protocl = "protocl"
+valeu = "valeu"
+# inital = 同上的深层 fixture (mock_strategy.inital → initial 建议).
+inital = "inital"
