@@ -52,7 +52,9 @@ single-job runner 上串行占位, 延迟最新 push 的反馈. workflow 级
    `consistency-check` feature 跑一次 (视图正确性断言, 详见根 AGENTS.md "视图正确性确保机制").
    单独成步复用 checkout, 在 coverage 的 cargo clean 前, 不影响磁盘峰值控制.
 8. **Check + coverage data** (`just check --coverage`): fmt + clippy + machete + **doc 门禁**
-   + 测试 + **typos + deny-offline**, 用 `cargo llvm-cov nextest` 插桩, 产出 profdata 供
+   + 测试 + **typos + deny-offline** + **check-contracts** (contracts.md property 落地
+   标注 lint, #144: ✅ 须同名命中 / 🔁 锚点须可 grep / 每条 property 必有标注), 用
+   `cargo llvm-cov nextest` 插桩, 产出 profdata 供
    下一步消费. **测试集只跑这一次**. cargo 命令均带 `--locked` (Cargo.toml/Cargo.lock
    不一致时 CI 硬失败, 防止 CI 静默重 resolve 导致测试对象漂移). doc 门禁
    (`RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps`) 位于 justfile check 的

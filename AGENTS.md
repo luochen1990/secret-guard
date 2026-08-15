@@ -370,6 +370,8 @@ nix develop --impure      # 进入 devShell
 
 # 一键 check (fmt + clippy + machete + doc + nextest + typos + deny-offline)
 # 注: doctest 当前禁用 (唯一 doctest 被 ignored), 需要时在 justfile 取消注释.
+#     check 链内还含 check-webui-syntax (index.html 内嵌 JS 语法) 与
+#     check-contracts (contracts.md property 落地标注 lint, #144).
 just check
 
 # 一键 check 含覆盖率插桩 (CI 用)
@@ -404,7 +406,8 @@ CI 配置在 `.forgejo/workflows/ci.yml`, 触发条件 `push` + `pull_request` +
 (skip-if-passed, ff-merge 后同 SHA 不重跑) + PR 并发去旧 (concurrency 取消同 PR 旧 run).
 `check` job 测试集只跑一次, 顺序为
 lock 守卫 → checkout → diff 报告 (PR, 非阻塞) → consistency-check → check+coverage
-(含 doc 门禁 + --locked + typos + deny-offline, 阻塞) → coverage-gate → bench (非阻塞) →
+(含 doc 门禁 + --locked + typos + deny-offline + check-contracts 契约标注 lint, 阻塞) →
+coverage-gate → bench (非阻塞) →
 file-size → WebUI (非阻塞) → cargo audit (非阻塞) → nix build cargoHash 校验 (非阻塞) →
 lock 校验.
 (checkout 策略 / 缓存复用 / 并发假设 / 评论写回 / 各 step 升级路径见 docs/ci.md.)
@@ -657,7 +660,7 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
 ## 后续工作 (非 MVP 范围)
 
 - **跨协议路径的 mock-not-restored WARN**: cross_proto 响应 parse 失败 fallback
-  (reader 拒绝 / 非 JSON) 时, 与同协议路径 (`fan_out.rs::warn_mock_not_restored`)
+  (reader 拒绝 / 非 JSON) 时, 与同协议路径 (`proxy/fan_out.rs::warn_mock_not_restored`)
   对称地在 redaction map 非空时打 `mock not restored` WARN (#158 只覆盖了
   同协议路径; 见 "已知限制" 对应条目).
 - **跨协议流式响应翻译**: 在 `cross_proto_forward` 检测 stream=true 时接入
