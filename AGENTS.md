@@ -88,6 +88,53 @@
 
 ## 关键不变式与工程纪律
 
+### 模块依赖方向图 (SSOT — 新增依赖前必查)
+
+> 数据流契约声明 "域 A (转发链) → 域 B (派生链) → 域 C (渲染层)" 单向承诺.
+> 本图是其实施层 (#145): 新增 `use crate::...` 前对照此图判断 "新依赖是否扩大偏离" —
+> 只允许**向下**依赖 (指向更低层), 反向 / 新横向依赖需先改图并在 PR 中说明理由.
+
+```text
+                    ┌──────────── 基础层 (零 / 极低业务依赖) ──────────┐
+                    │  util (hash)   error (AppError)   dto (wire     │
+                    │  shape)        state (AppState + NO_STORE)      │
+                    └─────────────────────────────────────────────────┘
+                                      ▲ ▲ ▲ ▲
+        ┌─────────────────────────────┘ │ │ └────────────────────────┐
+        │                               │ │                          │
+   ┌────┴─────┐   ┌────────────┐   ┌────┴──────┐   ┌────────────┐   ┌─┴─────────┐
+   │ config   │   │ codec      │◄──│ redact    │   │ dag        │◄──│ derive    │
+   │ (双层配置)│   │ (IR+R/W)  │   │ (改写)    │   │ (内容寻址) │   │ (字节派生)│
+   └────┬─────┘   └────┬───────┘   └────┬──────┘   └────┬───────┘   └───────────┘
+        ▲              ▲                │               │ ▲
+        │              │                └───────┬───────┘ │
+   ┌────┴──────────────┴────────────────────┐   │  ┌──────┴──────────┐
+   │ mock / provider / secrets (实体+表)    │   │  │ record (DTO)    │
+   └────┬───────────────────────────────────┘   │  └──────┬──────────┘
+        ▲         ▲                            │         │
+        │         │       ┌────────────────────┴────┐    │
+   ┌────┴─────┐   ┌───────┴──┐        ┌─────────────┴────┴──┐
+   │ auth     │   │ proxy    │───────►│ web (api/ + WebUI)  │ 域 C 渲染层
+   │ (鉴权)   │   │ (转发)   │        └─────────────────────┘
+   └──────────┘   └──────────┘          域 A 转发链 → 域 B 派生链
+```
+
+要点 (每条已按 #145 收紧; 完整边以代码为准, 本图标注**意图方向**与例外):
+- **codec ⇄ redact 已解环**: redact → codec 单向; codec::stream 经 `StreamRestoreHook`
+  接口倒置消费 restore 能力, 生产实现 `redact::StreamingRestorerSet` 由 proxy 注入
+  (codec 的 fwd_* property 测试仍 import redact — 测试代码不受此约束).
+- **dto / record 是中立 wire shape 层**: dag 构造之, web 序列化之, 两者互不依赖
+  (dag 不再触达 web 命名空间, #95 残留落点已纠正). 注: dto → dag 仅引用
+  `SessionId` (newtype 标识类型), 视作可接受的纯类型依赖.
+- **state (AppState) 是进程级共享状态**: proxy / web / auth 各自单向依赖之,
+  彼此之间除 "web → auth (挂载 guard)" 外无横向依赖 (原 ProxyState 落在 proxy 内).
+- **已接受的例外** (有 rationale, 勿扩大): redact → secrets (探测 secret 需读 entry);
+  dag → codec::ir (IrBlock 是内容寻址单元, 纯类型依赖); proxy → redact (转发即改写,
+  同属域 A); web/api → auth::apikey (API key CRUD 无条件挂载, "只认证不隔离");
+  config → auth (AuthConfig/ApiKeyEntry 是配置 schema 的一部分, 纯数据依赖);
+  mock ↔ secrets 对称引用 (SecretEntry 持 MockStrategy, mock 校验钩子被 SecretEntry
+  调用, 纯数据/校验层, 无业务行为).
+
 > secret-guard 的核心职责 (转发 + Redact) 必须对任意字节流零失败.
 > 围绕核心职责之外、**基于对 LLM 应用层行为模式强假设** 的附加功能
 > (preview 提取 / delta 切片 / WebUI 分组渲染 / tool name 推断等) 是"尽力而为"增强,
