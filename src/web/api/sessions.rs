@@ -150,7 +150,7 @@ pub(crate) struct SelectedCursor {
 /// POST /api/sync 响应体.
 ///
 /// 字段直接透传 [`crate::dag::ConversationDag::sync_snapshot`] 产出的
-/// [`SyncSnapshot`] (`Vec<SessionView>` + `HashMap<SessionId, Vec<RoundBrief>>` +
+/// [`crate::dto::SyncSnapshot`] (`Vec<SessionView>` + `HashMap<SessionId, Vec<RoundBrief>>` +
 /// `Option<TimelineDiffData>`). `timeline = None` 表示无 diff (前端游标已是最新, 等价 304).
 #[derive(Serialize)]
 pub(crate) struct SyncResponse {

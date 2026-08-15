@@ -210,6 +210,9 @@ pub(crate) fn create_flow<T: CrudTable>(
 
 /// update 通用流程: 存在性检查 (404) → build 钩子 (构造 entry + 类型特定预处理) →
 /// 填 path id → validate 钩子 → upsert → 查回 effective 视图.
+///
+/// 注: `build` 必须惰性 (FnOnce 闭包, 在存在性检查之后才求值) — 保持
+/// "404 先于 payload 校验" 的历史错误顺序.
 pub(crate) fn update_flow<T: CrudTable>(
     table: &T,
     kind_label: &str,

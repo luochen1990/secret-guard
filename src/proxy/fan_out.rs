@@ -58,7 +58,7 @@ trait ChunkPipeline {
     /// 透传模式恒 `Some` — 即便空 chunk 也照发, 保持与历史行为逐字节一致).
     fn transform(&mut self, chunk: &Bytes) -> Option<Bytes>;
     /// 流结束后输出尾巴字节 (identity: 空; restore: flush 残留 + 终止符). 上游错误 /
-    /// 客户端断开也调用 — 严格的 OpenAI 客户端需要 [DONE] 终止符才不 hang.
+    /// 客户端断开也调用 — 严格的 OpenAI 客户端需要 `[DONE]` 终止符才不 hang.
     fn finish_tail(&mut self) -> Bytes;
 }
 

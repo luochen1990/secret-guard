@@ -13,7 +13,7 @@
 //! - `DELETE /__sg/api/secrets/{id}`         —— 删除 (仅 dynamic).
 //! - `PATCH /__sg/api/secrets/{id}/decision` —— 切换 OverrideMode.
 //! - `GET/POST/PUT/DELETE/PATCH /__sg/api/providers[/{id}[/decision]]` —— 同上.
-//! - `GET/POST/DELETE/PATCH /__sg/api/api-keys[/{id}[/toggle]]` —— API key CRUD (无条件挂载, 见 api.rs).
+//! - `GET/POST/DELETE/PATCH /__sg/api/api-keys[/{id}[/toggle]]` —— API key CRUD (无条件挂载, 见 api/apikeys.rs).
 //!
 //! 注: 旧的 `GET /api/records` (扁平分页) + `GET /api/nodes/{id}/timeline` (基于 node_id)
 //! 已删除, 由 session-aware sync API 替代.
