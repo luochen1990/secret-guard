@@ -1508,6 +1508,10 @@
       prefer_static: 'Prefer static',
       disabled: 'Disabled',
     };
+    // secret decision=Disabled 的后果提示 (#161): Disabled = 关闭对该 secret 的保护,
+    // 其真实值将明文转发到上游 provider (不是"从列表忽略"). 供 option tooltip +
+    // change 确认弹窗 + PATCH 响应 warning 展示三处复用 (SSOT).
+    const SECRET_DISABLED_HINT = 'Disabled: protection OFF — the real secret value will be forwarded in plaintext to upstream providers.';
     const SOURCE_LABELS = {
       static: 'static',
       dynamic: 'dynamic',
@@ -2634,6 +2638,8 @@
         && state.timelineRecords[state.timelineRecords.length - 1].id === id;
       const t = isLastRound ? state.tail : null;
       const HIST = '(history round)';
+      // Time 与 sidebar/timeline 同一格式化函数 (SSOT, #164-2); 原始 UTC RFC3339
+      // 放 title tooltip (开发者向 hover 可见).
       let rows = {
         'Round ID': r.id,
         'Role': r.round_role || '(unknown)',
@@ -2648,9 +2654,13 @@
         'Error': t?.error || '(none)',
         'Redactions': redactionN > 0 ? `${redactionN} hit(s)` : 'none',
       };
-      const renderRows = () => `<table class="info-table">${Object.entries(rows).map(([k, v]) =>
-        `<tr><td class="info-key">${escapeHtml(k)}</td><td class="info-val">${escapeHtml(v)}</td></tr>`
-      ).join('')}</table>`;
+      const renderRows = () => `<table class="info-table">${Object.entries(rows).map(([k, v]) => {
+        // Time 行: 本地时间 (formatTime, 与 sidebar 一致) + title 保留原始 UTC.
+        if (k === 'Time') {
+          return `<tr><td class="info-key">${escapeHtml(k)}</td><td class="info-val" title="${escapeHtml(v)}">${escapeHtml(formatTime(v))}</td></tr>`;
+        }
+        return `<tr><td class="info-key">${escapeHtml(k)}</td><td class="info-val">${escapeHtml(v)}</td></tr>`;
+      }).join('')}</table>`;
       openRoundDialog('传输层信息', renderRows(), id);
       // 异步补全 method/path/model (ForwardRecord 字段, 不在 TimelineRound 中).
       const rec = await fetchRecordDetail(id);
@@ -2673,9 +2683,12 @@
         dlg.querySelector('.dialog-body').innerHTML = '<div class="raw-loading">Failed to load record.</div>';
         return;
       }
+      // 标注语义 (#164-1): req/resp body 存的都是 LLM 视角原文 — request 已 redact
+      // (含 mock), response 含 mock (restore 前的上游原文). 无标注会误导用户以为
+      // response 就是客户端收到的内容 (实为 restore 后版本).
       const respBodyNote = rec.streamed
         ? '(streamed response — raw SSE bytes not retained)'
-        : '';
+        : '(LLM view, values may contain mocks)';
       const sections = [
         ['Request Headers', '', formatHeaders(rec.req_headers)],
         ['Request Body', '(LLM view, secrets redacted)', rec.req_body || '(empty)'],
@@ -3404,7 +3417,11 @@
       // 仅 static id 显示 decision 控件. dynamic-only 不可选.
       if (!isStatic) return '<span class="meta">—</span>';
       const opts = Object.keys(DECISION_LABELS)
-        .map(k => `<option value="${k}"${k === current ? ' selected' : ''}>${escapeHtml(DECISION_LABELS[k])}</option>`)
+        .map(k => {
+          // Disabled option: 悬停提示后果 (仅 secret — provider 的 Disabled 是禁转发, 无泄密).
+          const title = kind === 'secret' && k === 'disabled' ? ` title="${escapeHtml(SECRET_DISABLED_HINT)}"` : '';
+          return `<option value="${k}"${title}${k === current ? ' selected' : ''}>${escapeHtml(DECISION_LABELS[k])}</option>`;
+        })
         .join('');
       return `<select class="decision-select" data-kind="${kind}" data-id="${escapeHtml(id)}">${opts}</select>`;
     }
@@ -3495,6 +3512,17 @@
       body.addEventListener('change', async (e) => {
         const sel = e.target.closest('select.decision-select');
         if (!sel || sel.dataset.kind !== cfg.kindParam) return;
+        // secret → Disabled: 二次确认 (#161). Disabled = 关闭保护 (明文放行), 与直觉的
+        // "忽略此条" 相反; confirm 是本文件既有交互先例 (deleteItem / deleteApiKey).
+        // 取消时: 数据未变 → renderKind 的 renderedHtml 短路不会重渲染, select 的
+        // 可见值停在 disabled — 必须显式还原 value (change 事件里 select 已是用户选的新值).
+        if (kind === 'secret' && sel.value === 'disabled'
+            && !confirm(`${SECRET_DISABLED_HINT}\n\nSet secret ${sel.dataset.id} to Disabled?`)) {
+          const opts = [...sel.options];
+          const fallback = opts.find(o => o.defaultSelected) || opts[0];
+          if (fallback) sel.value = fallback.value;
+          return;
+        }
         await patchDecision(kind, sel.dataset.id, sel.value);
       });
     }
@@ -3518,11 +3546,15 @@
       const list = cfg.list();
       renderStats(cfg.statsId, list);
       const body = document.getElementById(cfg.bodyId);
-      if (list.length === 0) {
-        body.innerHTML = `<tr><td colspan="${cfg.colspan}" class="empty">${cfg.emptyText}</td></tr>`;
-        return;
-      }
-      body.innerHTML = list.map(item => cfg.renderRow(item)).join('');
+      const html = list.length === 0
+        ? `<tr><td colspan="${cfg.colspan}" class="empty">${cfg.emptyText}</td></tr>`
+        : list.map(item => cfg.renderRow(item)).join('');
+      // 数据未变化时跳过 DOM 重建 (#164-3): 行级 reconciliation 的最小替代 —
+      // auto-refresh (3s) 空轮询 (数据静止) 不再打断自动化工具持有的 <tr> 引用
+      // (isConnected 反复失效). 数据真变化时仍整体重建 (罕见, 可接受).
+      if (body.dataset.renderedHtml === html) return;
+      body.dataset.renderedHtml = html;
+      body.innerHTML = html;
     }
 
     // 通用 delete / revert. revert = true 时跳过 confirm (用更准确的提示).
@@ -3591,11 +3623,9 @@
         <span><strong>${staticCount}</strong> static</span>
       `;
       warnEl.hidden = state.authEnabled;
-      if (total === 0) {
-        body.innerHTML = `<tr><td colspan="6" class="empty">No API keys configured</td></tr>`;
-        return;
-      }
-      body.innerHTML = state.apiKeysList.map(k => {
+      const html = total === 0
+        ? `<tr><td colspan="6" class="empty">No API keys configured</td></tr>`
+        : state.apiKeysList.map(k => {
         const srcBadge = `<span class="src-badge src-${escapeHtml(k.source)}">${escapeHtml(k.source)}</span>`;
         const statusBadge = apiKeyStatusBadge(state.authEnabled, k.disabled);
         // auth 关闭时 toggle 无实际效果 (请求被无条件接受), 按钮禁用以免误导.
@@ -3626,6 +3656,10 @@
           </tr>
         `;
       }).join('');
+      // 数据未变化时跳过 DOM 重建 (#164-3, 同 renderKind 的 renderedHtml 短路).
+      if (body.dataset.renderedHtml === html) return;
+      body.dataset.renderedHtml = html;
+      body.innerHTML = html;
       bindApiKeyActions(body);
     }
 
@@ -4120,6 +4154,11 @@
         if (!r.ok) {
           const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
           alert('Decision update failed: ' + (err.error || r.status));
+        } else {
+          // 后端在 mode=disabled + secret 时返回 warning 字段 (#161). 正常路径已由
+          // 前置 confirm 覆盖, 这里兜底展示 (如脚本绕过 UI / confirm 被自动化禁用).
+          const ack = await r.json().catch(() => null);
+          if (ack?.warning) alert(`Warning for ${id}: ${ack.warning}`);
         }
         // 无论成败都刷新: 成功则更新视图, 失败则回滚下拉.
         await cfg.refresh();
@@ -4133,10 +4172,21 @@
     sync();
     setInterval(() => {
       if (document.getElementById('auto').checked) {
-        const active = document.querySelector('.tab-content.active')?.id;
-        if (active === 'tab-secrets') refreshSecrets();
-        else if (active === 'tab-providers') refreshProviders();
-        else if (active === 'tab-apikeys') refreshApiKeys();
+        // 交互进行中暂停刷新 (#164-3): 弹窗开启 (编辑/创建/endpoints/reveal) 或表格内
+        // 有焦点元素 (下拉展开 / focus 未blur) 时跳过本轮 tick, 避免 fetch+渲染
+        // 打断交互. 历史行为: modal 开启时也刷新, 但 renderKind 不碰 dialog 内容,
+        // 用户感知不到 — 受害者主要是后台 tbody 重建打断自动化工具引用, 现由
+        // renderKind 的 renderedHtml 短路 + 此处暂停双保险覆盖.
+        const tableDialogOpen = ['secret-form', 'provider-form', 'apikey-form',
+          'provider-endpoints', 'apikey-reveal'].some(d => document.getElementById(d)?.open);
+        if (tableDialogOpen) return;
+        const activeTab = document.querySelector('.tab-content.active')?.id;
+        const tableHasFocus = ['tab-secrets', 'tab-providers', 'tab-apikeys'].includes(activeTab)
+          && document.getElementById(activeTab)?.contains(document.activeElement);
+        if (tableHasFocus) return;
+        if (activeTab === 'tab-secrets') refreshSecrets();
+        else if (activeTab === 'tab-providers') refreshProviders();
+        else if (activeTab === 'tab-apikeys') refreshApiKeys();
         else sync();
       }
     }, 3000);
