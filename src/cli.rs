@@ -22,11 +22,11 @@ pub enum Command {
 /// 网关启动参数. `Option<T>` 字段表示 "CLI 未显式指定时回退到 config".
 #[derive(Args, Debug, Clone)]
 pub struct RunArgs {
-    /// 监听地址.
+    /// 监听地址 (未指定时回退到 `server.host` 配置, 默认 127.0.0.1).
     #[arg(long, env = "SG_HOST")]
     pub host: Option<String>,
 
-    /// 监听端口.
+    /// 监听端口 (未指定时回退到 `server.port` 配置, 默认 8787).
     #[arg(long, env = "SG_PORT")]
     pub port: Option<u16>,
 
