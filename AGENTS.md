@@ -498,7 +498,7 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
   新增 `[redact] on_probe_exhausted = "fail_closed"` 让 proxy 在这种情况下**拒绝转发**
   (返回 503), 防止 secret 泄露到 LLM provider (见 `redact_ir_checked`). 默认仍
   `fail_open` 以保持升级兼容. 注意 fail_closed 拒绝时返回的 503 body 不含 secret 明文
-  (只含 secret id slug + reason 枚举).
+  (变量部分只含 secret id + reason 枚举, 语义由 SEC-2 契约锁定).
 - **C5 是实质确定性契约**: Auto 模式 mock 不含 real_secret ≥`k(L)` 字符子串
   (`k(L) = max(4, ⌈L/3⌉)`, 随 secret 长度自适应 — 短 secret 强保护, 长 secret 弱保护,
   信息泄露率上界 ~36%). gen_candidate 内置 10000 次确定性内部重试链

@@ -252,14 +252,18 @@
 - `prop_policy_change_invalidates_all_mocks`: policy 变动 (添加/删除/编辑任一 secret) 改变 init_seed → 所有 mock 变化 (此为 per-request seed 模型的已知代价). ✅ `src/redact.rs::prop_policy_change_invalidates_all_mocks`.
 - `prop_mock_changes_when_ir_contains_old_mock_exception`: 例外场景锁定 — IR 含旧 mock 时新 mock 实质必然不同 (碰撞概率可忽略), 但 RED-2 (新 mock 不在 pre-replace IR) + RED-6 (round-trip 恒等, 旧 mock 不被触碰) + 确定性仍成立. ✅ `src/redact.rs::prop_mock_changes_when_ir_contains_old_mock_exception`.
 
-### RED-4 单射性 + 降级跳过
+### RED-4 单射性 + 降级 (可配置: fail_open / fail_closed)
 
-**陈述**: 一次 `redact_ir` 内不同 secret → 不同 mock. 极端弱配置下探测耗尽时**跳过该 secret** (原样发往上游) 而非 panic.
+**陈述**: 一次 `redact_ir` 内不同 secret → 不同 mock. 极端弱配置下探测耗尽时的降级行为由 `[redact] on_probe_exhausted` 配置 (默认 `fail_open`):
+
+- **fail_open (默认, 向后兼容)**: **跳过该 secret** (原样发往上游) 而非 panic, 优先保进程存活.
+- **fail_closed**: **拒绝转发整个请求** (proxy 返回 503, body 的变量部分只含 secret id + reason 枚举, 不含 secret 明文), 防止 secret 泄露到 LLM provider.
 
 **Properties**:
-- `prop_distinct_secrets_distinct_mocks`: 对 N 个不同 secret, 得到 N 个不同 mock.
-- `prop_probing_exhausted_skips_not_panics`: 弱配置 (charset=1 char, length=1) 耗尽候选时, 跳过该 secret, 进程存活.
-- `prop_redact_error_never_carries_secret_value`: RedactError 只携带 secret_id + reason, 不含 secret 明文.
+- `prop_distinct_secrets_distinct_mocks`: 对 N 个不同 secret, 得到 N 个不同 mock. ✅ `src/redact.rs::prop_distinct_secrets_distinct_mocks` + `prop_redact_produces_distinct_mocks`.
+- `prop_probing_exhausted_skips_not_panics` (fail_open 模式下): 弱配置 (charset=1 char, length=1) 耗尽候选时, 跳过该 secret, 进程存活. ✅ `src/redact.rs::redact_ir_skips_secret_when_probing_exhausted_instead_of_panicking` + `redact_ir_checked_fail_open_skips_exhausted_secret` + `redact_ir_legacy_remains_fail_open_after_refactor`.
+- `prop_probing_exhausted_fail_closed_refuses_forward` (fail_closed 模式下): 弱配置 + 对抗性 IR 耗尽候选时, 返回 503 + 上游未被调用 + 503 body 无 secret 明文 (载荷卫生交叉引用 SEC-2 — fail_closed 使 RedactError 首次在转发路径可达, SEC-2 重要性上升). ✅ `tests/integration.rs::fail_closed_mode_returns_503_when_probing_exhausted` + `src/redact.rs::redact_ir_checked_fail_closed_returns_err_on_exhaustion` / `redact_ir_checked_fail_closed_returns_err_on_insert_collision` / `redact_ir_checked_fail_closed_succeeds_when_probing_succeeds` / `redact_ir_checked_fail_closed_no_secrets_returns_empty_map` + 配置 serde (`src/config.rs::on_probe_exhausted_*` / `redact_config_toml_parses_fail_closed`).
+- `prop_redact_error_never_carries_secret_value`: RedactError 只携带 secret_id + reason, 不含 secret 明文. ✅ `src/redact.rs::redaction_map_insert_collision_returns_err_without_leaking_secret` + `prop_redact_error_debug_no_secret_leak` (SEC-2 property 形式化).
 
 ### RED-5 mock 不含 real_secret 子串 (实质确定性)
 
@@ -779,4 +783,5 @@
 | 2026-07-28 | UI-4/5/6 | 新增 UI-4 keyed reconciliation + UI-5 末轮 response 独立 drawer + UI-6 timeline 滚动状态机 | 前端不变量从 AGENTS.md I1-I3 扩展为 UI-1..UI-6, 完整收录 keyed reconciliation / drawer overlay / followMode 状态机 |
 | 2026-07-29 | FWD-1 | FWD-1 流式响应半段式 (`prop_streaming_response_half_byte_exact`) 追加 "理想 vs 现状" 注记: 字面 byte-exact 在 `same_proto_restore` 路径不成立, 当前守卫语义等价弱化形式 | 按 §0.5 漂移处理流程存档; 完整 byte-exact 需独立架构改动 (字节级扫描替换) |
 | 2026-08-02 | UI-6 | 新增 `prop_follow_invariant_under_new_round` (follow 闭合不变量): follow 状态在任意新 round 插入下不被翻转 + 末轮 request 不被 drawer 遮挡 (几何允许区间内); 声明 `contentEnd > wrapH - GAP - minH` 区间豁免 | 现有 `prop_follow_new_round_auto_scroll` 只在"长内容稳态"断言结果 (距底 < 100), 不守卫机制本身; 历史 bug: 短内容 (`contentEnd ≤ wrapH`) + drawer 已显示时, placeholder=0 不提供滚动空间, `bottomScrollTarget` 想预留 `drawerH+GAP` 但被 `maxScroll=0` clamp, 末轮被 drawer 遮挡; 修复方案: `updateResponseDrawerLayout` 在 follow + 短内容 + drawer 遮挡时压缩 drawer 到 `wrapH - contentEnd - GAP` (派生属性, 无外部 state) |
-| 2026-08-15 | RED-3 | 新增例外场景裁决: pre-replace IR 含旧 mock 时允许 mock 变化 (probing counter 推进), 理由是 RED-2/RED-6 保护 restore 正确性优先于缓存稳定性; 补跨轮次 property (原 3 条契约 property 名零同名测试, 幂等性仅有 legacy C3 命名的同 IR 重复调用等价物, 跨轮次稳定性零覆盖) | #143: RED-2↔RED-3 设计张力未裁决 — 客户端把 mock 回传进历史 (上游 parse 失败 fallback 路径) 后, 同一 secret 的 mock 跨轮振荡, 上游前缀缓存反复失效; 定性为经济性代价 (token 费用) 而非安全泄露, 裁决维持现状 (restore 正确性优先), 例外由 `prop_mock_changes_when_ir_contains_old_mock_exception` 锁定 |
+| 2026-08-15 | RED-4 | 陈述参数化: 降级行为从单一 fail-open 变为 `[redact] on_probe_exhausted` 可配置二选一 (fail_open 跳过该 secret / fail_closed 拒绝转发 503); property 按模式二分并挂实际测试名 (原 `prop_probing_exhausted_skips_not_panics` / `prop_redact_error_never_carries_secret_value` 为幻影名); `prop_redact_error_never_carries_secret_value` 交叉引用 SEC-2 | #150: `on_probe_exhausted = "fail_closed"` 已实现且测试锁定, 但契约仍只描述 fail-open 分支, 在 fail_closed 配置下字面为假 (§0.5 漂移处理流程真空案例); 编号不变, 属"调整"非"作废" |
+| 2026-08-15 | RED-3 | 新增例外场景裁决: pre-replace IR 含旧 mock 时允许 mock 变化 (probing counter 推进), 理由是 RED-2/RED-6 保护 restore 正确性优先于缓存稳定性; 补 3 条跨轮次 property (原 3 条契约 property 名零同名测试, 幂等性仅有 legacy C3 命名的同 IR 重复调用等价物, 跨轮次稳定性零覆盖) | #143: RED-2↔RED-3 设计张力未裁决 — 客户端把 mock 回传进历史 (上游 parse 失败 fallback 路径) 后, 同一 secret 的 mock 跨轮振荡, 上游前缀缓存反复失效; 定性为经济性代价 (token 费用) 而非安全泄露, 裁决维持现状 (restore 正确性优先), 例外由 `prop_mock_changes_when_ir_contains_old_mock_exception` 锁定 |

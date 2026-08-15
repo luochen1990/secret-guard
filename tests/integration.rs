@@ -2550,9 +2550,13 @@ async fn fail_closed_mode_returns_503_when_probing_exhausted() {
     // 弱配置 + IR 含全部 10 个数字候选 → FailClosed 必然拒绝转发.
     let real_secret = "super-secret-fail-closed-DO-NOT-LEAK";
     let mut upstream = spawn_mock_upstream().await;
-    // mock 期望: 若被调用说明 FailClosed 失效 (回归). 故此 mock 用 expect(0) 守卫.
-    let _m = upstream
+    // mock 期望: 若被调用说明 FailClosed 失效 (回归). 用 expect(0) + assert 守卫
+    // "上游未被调用" (RED-4 fail_closed property 的显式子句). assert() 只读 mockito
+    // 共享 state (hit 计数在同步锁内累加, 不跨 await), 此处 client 已收到 503,
+    // proxy 侧 future 已结束, 无 "在途请求未计数" 窗口.
+    let mock = upstream
         .mock("POST", "/v1/chat/completions")
+        .expect(0)
         .with_status(200)
         .with_body(r#"{"id":"should-not-reach"}"#)
         .create_async()
@@ -2595,8 +2599,9 @@ async fn fail_closed_mode_returns_503_when_probing_exhausted() {
         !text.contains(real_secret),
         "FailClosed 503 body must not leak real secret; got: {text}"
     );
-    // 上游 mock 不应被调用 (FailClosed 在 redact 完成前就拒绝转发).
-    // 注: mockito 默认是 lenient 模式, 这里不做严格 expect(0); 由 status 503 已守卫.
+    // 上游 mock 不应被调用: FailClosed 在 redact 完成前就拒绝转发
+    // (expect(0) + assert 机制见上方 mock 创建处注释).
+    mock.assert();
 }
 
 #[tokio::test]
