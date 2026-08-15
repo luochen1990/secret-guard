@@ -195,6 +195,11 @@ async fn dispatch(
 
     // 4. 协议匹配: 同协议走 IR / 字节透传; 跨协议走 codec 翻译.
     let secrets_snapshot = state.secrets.effective_raw();
+    // decision=Disabled 的 static secrets 明文放行 (不参与 redact, #161). 传入 IR 转发
+    // 路径, 由 redact_and_derive 在 "value 命中本请求 IR" 时逐条 WARN (未命中零输出).
+    // 注: disabled secrets 全空时 IR 路径不会走到 redact_and_derive (见各路径的空表
+    // 快捷分支), 无需特判.
+    let disabled_secrets = state.secrets.disabled_statics();
     if ingress != provider.protocol {
         return cross_proto_forward(
             state,
@@ -205,6 +210,7 @@ async fn dispatch(
             provider,
             started,
             secrets_snapshot,
+            disabled_secrets,
         )
         .await;
     }
@@ -217,6 +223,7 @@ async fn dispatch(
         provider,
         started,
         secrets_snapshot,
+        disabled_secrets,
     )
     .await
 }

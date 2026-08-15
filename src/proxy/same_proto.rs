@@ -43,6 +43,7 @@ pub(crate) async fn same_proto_forward(
     provider: Provider,
     started: Instant,
     secrets_snapshot: Vec<crate::secrets::SecretEntry>,
+    disabled_secrets: Vec<crate::secrets::SecretEntry>,
 ) -> Result<Response<Body>, AppError> {
     if secrets_snapshot.is_empty() {
         // 字节透传: 不进入 codec, 不做 redact. 这是最热路径 (多数 provider 无 secret).
@@ -96,6 +97,7 @@ pub(crate) async fn same_proto_forward(
     let (redaction_map, redact_seed, redactions) = match redact_and_derive(
         &mut ir,
         &secrets_snapshot,
+        &disabled_secrets,
         state.on_probe_exhausted,
         "same-proto",
     ) {

@@ -732,6 +732,22 @@ impl<T: DynamicEntry> DynamicTable<T> {
         self.static_entries.read().iter().any(|e| e.id() == id)
     }
 
+    /// 所有被 decision=Disabled 完全排除的 static 项 (含完整 entry).
+    ///
+    /// 用途: 转发链对 "disabled secret 明文放行" 的按请求 WARN (#161) — 调用方拿到
+    /// 这些 entry 后扫描请求 IR, 命中才打日志 (未命中的请求零噪音).
+    /// 与 [`Self::effective_triples`] 对偶: 那里列出 Disabled 之外的所有项, 这里列出
+    /// Disabled 的项. dynamic-only id 不受 decision 影响, 永不出现在结果中.
+    pub fn disabled_statics(&self) -> Vec<T> {
+        let statics = self.static_entries.read();
+        let decisions = self.decisions.read();
+        statics
+            .iter()
+            .filter(|s| T::get_decision(&decisions, s.id()) == OverrideMode::Disabled)
+            .cloned()
+            .collect()
+    }
+
     // ─── 写: dynamic 层 CRUD + decision ────────────────────────────────
 
     /// 仅 dynamic 层 CRUD —— upsert. 若 id 同时存在于 static, 此操作创建 / 更新 override.
@@ -1260,6 +1276,42 @@ mod table_tests {
         assert!(t.get_effective("a").is_none());
         // has_static 不受 decision 影响, 仍能识别该 id.
         assert!(t.has_static("a"));
+    }
+
+    #[test]
+    fn disabled_statics_lists_only_disabled_static_entries() {
+        // #161: 转发链的 "disabled secret 明文放行 WARN" 需要"哪些 static 项被 Disabled"
+        // 的完整 entry 列表 (含 value 供 IR 扫描). 与 effective_raw 互补:
+        // effective_raw 排除 Disabled, disabled_statics 只含 Disabled.
+        let t = SecretTable::new(
+            vec![entry("a", "va"), entry("b", "vb")],
+            vec![entry("c", "vc-dyn"), entry("a", "va-dyn-override")],
+            empty_decisions(),
+            PathBuf::from("/tmp/x.toml"),
+        );
+        // 无 decision 时: 无 disabled 项.
+        assert!(t.disabled_statics().is_empty());
+        // a (static, 有 dynamic override) + b (static-only) 都 Disabled.
+        t.set_decision("a", OverrideMode::Disabled).unwrap();
+        t.set_decision("b", OverrideMode::Disabled).unwrap();
+        let mut got: Vec<(String, String)> = t
+            .disabled_statics()
+            .into_iter()
+            .map(|e| (e.id, e.value))
+            .collect();
+        got.sort();
+        // static 层的 value (不是 dynamic override 的 value): Disabled 排除的是整个 id,
+        // 但放行的明文以 static 注册值为准 — effective 语义下 dynamic override 在
+        // Default 模式才生效, Disabled 时两者都不参与 redact; 转发链告警取 static 值
+        // (与 decision 的作用对象一致: decision 仅对 static id 生效).
+        assert_eq!(
+            got,
+            vec![("a".into(), "va".into()), ("b".into(), "vb".into())]
+        );
+        // 切回 Default 后不再出现.
+        t.set_decision("a", OverrideMode::Default).unwrap();
+        let ids: Vec<String> = t.disabled_statics().into_iter().map(|e| e.id).collect();
+        assert_eq!(ids, vec!["b".to_string()]);
     }
 
     #[test]

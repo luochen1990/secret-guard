@@ -398,12 +398,41 @@ fn redact_ir_inner(
 /// 在 [`IrResponse`] 中反向替换 mock 为真实 secret.
 ///
 /// 非流式响应的 restore 路径. 遍历结构由 [`StringLeafOps for IrResponse`] 提供,
-/// 与 `ir_request_contains` / `ir_request_replace_all` 自动对齐 (新增 IrBlock variant 只改一处).
+/// 与 `ir_request_contains` / `ir_request_replace_all` 自动对齐.
 pub fn restore_ir_response(ir: &mut IrResponse, map: &RedactionMap) {
     if map.is_empty() {
         return;
     }
     ir.for_each_str_leaf_mut(&mut |s| restore_str(s, map));
+}
+
+/// disabled secret 明文放行检测 (#161): 对每个 decision=Disabled 的 secret, 检查其
+/// value 是否出现在请求 IR 中; 命中的逐条 WARN (含 secret id).
+///
+/// 背景: decision=Disabled 的语义是 "关闭对该 secret 的保护 (明文直通上游)", 但这些
+/// secret 不进入 [`redact_ir`] 的输入 (effective_raw 已排除), 转发链此前对此完全
+/// 静默. 本函数补上 "命中才告警" 的可观测性 — 与 issue #161 要求一致:
+/// - **精确检测**: 复用 [`ir_request_contains`] (与 redact 命中检查同一扫描设施),
+///   value 不在 IR 中的 disabled secret 零输出 (不刷屏).
+/// - **安全**: 日志只含 secret id, 永不含 secret value (SEC 纪律, 同其他 redact warn).
+/// - **成本**: 仅当存在 disabled secret 时才扫描 (每 disabled secret 一次 IR 叶子
+///   遍历); disabled 是罕见配置, 常态零开销.
+///
+/// 返回命中数 (供测试断言; 调用方无需使用返回值).
+pub fn warn_disabled_secrets_in_ir(ir: &IrRequest, disabled: &[SecretEntry]) -> usize {
+    let mut hits = 0;
+    for secret in disabled {
+        if secret.value.is_empty() || !ir_request_contains(ir, &secret.value) {
+            continue;
+        }
+        hits += 1;
+        warn!(
+            secret_id = %secret.id,
+            "secret forwarded in plaintext (decision=disabled): protection for this \
+             secret is turned off, its real value is sent to the upstream provider"
+        );
+    }
+    hits
 }
 
 // ─── StreamingRestorer: sliding window restore ──────────────────────────────
@@ -962,13 +991,13 @@ fn collect_value_leaves<'a>(value: &'a serde_json::Value, leaves: &mut Vec<&'a s
 /// IR 中是否出现 needle (在字符串字段中).
 ///
 /// 扫描范围: system blocks / messages.blocks / tools (name+description+input_schema) /
-/// IrBlock::ToolUse.{id, name, input} / IrBlock::ToolResult.content (递归) /
+/// `IrBlock::ToolUse.{id, name, input}` / `IrBlock::ToolResult.content` (递归) /
 /// stop sequences / user / extra (JSON 字符串叶子).
 ///
-/// **性能角色 (P2-1)**: [`redact_ir`] 入口的 secret 命中检查 + [`gen_mock_for_ir`]
+/// **性能角色 (P2-1)**: [`redact_ir`] 入口的 secret 命中检查 + `gen_mock_for_ir`
 /// 首次 probing (counter=0) 均用此函数 (零拷贝遍历). 仅当首次 probing 冲突 (P≥2) 时,
-/// `gen_mock_for_ir` 才切换到 [`collect_ir_str_leaves`] 缓存路径.
-fn ir_request_contains(ir: &IrRequest, needle: &str) -> bool {
+/// `gen_mock_for_ir` 才切换到 `collect_ir_str_leaves` 缓存路径.
+pub fn ir_request_contains(ir: &IrRequest, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
     }
@@ -1131,6 +1160,67 @@ mod tests {
             "gen mock must avoid existing IR content; got {m}"
         );
         assert_ne!(m, "placeholder-string-that-must-be-avoided");
+    }
+
+    /// #161: disabled secret 明文放行检测 — 命中才告警 (返回命中数), 未命中零输出.
+    /// 覆盖: value 出现 → hit; value 不出现 → 0; 空 value → 0 (防御).
+    #[test]
+    fn warn_disabled_secrets_hits_only_when_value_present() {
+        let ir = sample_ir_with_text("hello sk-live-qwerty987654 world");
+        let hit = entry("sk-live-qwerty987654");
+        let miss = entry("totally-absent-secret");
+        let mut empty_val = entry("");
+        empty_val.id = "empty".into();
+        assert_eq!(
+            warn_disabled_secrets_in_ir(&ir, std::slice::from_ref(&hit)),
+            1
+        );
+        assert_eq!(
+            warn_disabled_secrets_in_ir(&ir, std::slice::from_ref(&miss)),
+            0
+        );
+        // 同一 IR 多个 disabled secret: 各自独立检测.
+        assert_eq!(warn_disabled_secrets_in_ir(&ir, &[hit, miss, empty_val]), 1);
+        assert_eq!(warn_disabled_secrets_in_ir(&ir, &[]), 0);
+    }
+
+    /// #161 (SEC): 命中告警的日志内容只含 secret id + "forwarded in plaintext",
+    /// 永不含 secret value 本身. 复用 SEC-3 的捕获模式 (线程局部 dispatcher).
+    /// 注: entry() helper 的 id 是 "id-{value}" (为方便断言), 会携带 value — 测试
+    /// 用真实场景的独立 slug id (生产 id 由 validate_id 保证不含 value).
+    #[test]
+    fn warn_disabled_secrets_log_contains_id_not_value() {
+        let secret_value = "sk-live-qwerty987654";
+        let ir = sample_ir_with_text(&format!("ctx contains {secret_value}"));
+        let mut disabled = entry(secret_value);
+        disabled.id = "prod-like-slug".into();
+
+        let sink: std::sync::Arc<std::sync::Mutex<Vec<u8>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        tracing::dispatcher::with_default(
+            &tracing::dispatcher::Dispatch::new(
+                tracing_subscriber::fmt()
+                    .with_env_filter(tracing_subscriber::EnvFilter::new("warn"))
+                    .with_writer(CapturingMakeWriter { sink: sink.clone() })
+                    .with_timer(())
+                    .with_ansi(false)
+                    .finish(),
+            ),
+            || {
+                let _ = warn_disabled_secrets_in_ir(&ir, std::slice::from_ref(&disabled));
+            },
+        );
+        let buf = sink.lock().expect("sink poisoned").clone();
+        let log = String::from_utf8(buf).expect("captured tracing output must be valid UTF-8");
+        assert!(log.contains("forwarded in plaintext"), "log: {log}");
+        assert!(
+            log.contains("prod-like-slug"),
+            "log must carry secret_id: {log}"
+        );
+        assert!(
+            !log.contains(secret_value),
+            "log leaked secret value: {log}"
+        );
     }
 
     /// 守卫 collect_ir_str_leaves 与 StringLeafOps::for_each_str_leaf 收集相同叶子集合.

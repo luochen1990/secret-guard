@@ -269,9 +269,24 @@ pub(crate) struct DecisionAck {
     /// "provider" | "secret" — 前端可用于校验是否返回了正确资源类型.
     pub resource: &'static str,
     pub decision: OverrideMode,
+    /// 仅 mode=Disabled 且资源是 secret 时非 None (#161): 显式警告
+    /// "该 secret 将明文转发到上游". 其他 mode 缺省 (skip_serializing_if,
+    /// 向后兼容 — 旧客户端解析不到该字段).
+    ///
+    /// 仅对 secret 加: provider 的 Disabled 语义是 "禁止经此 provider 转发"
+    /// (503 unavailable), 不存在放行敏感数据的问题, 无需警告.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<&'static str>,
 }
 
+/// secret decision=Disabled 时返回的警告文案 (SSOT, 前端直接展示 ack.warning).
+pub(crate) const SECRET_DISABLED_WARNING: &str = "protection for this secret is disabled: it will be forwarded in plaintext \
+     to upstream providers";
+
 /// decision 通用流程: static 检查 (404) → set_decision → ack.
+///
+/// mode=Disabled + secret 时在 ack 上附 [`SECRET_DISABLED_WARNING`] (#161):
+/// Disabled 对 secret 意味着 "明文放行" (与产品核心承诺相反), 必须在响应中显式警示.
 pub(crate) fn decision_flow<T: CrudTable>(
     table: &T,
     kind_label: &'static str,
@@ -284,9 +299,89 @@ pub(crate) fn decision_flow<T: CrudTable>(
         )));
     }
     table.set_decision(&id, mode).map_err(ApiError::from_any)?;
+    let warning = if mode == OverrideMode::Disabled && kind_label == "secret" {
+        // 服务端日志同步警示 (#161): 让不看 PATCH 响应体的运维也能在 sg 日志中
+        // 发现 "该 secret 已被明文放行". 安全: 只记 id, 不记 value.
+        tracing::warn!(
+            secret_id = %id,
+            "secret decision set to disabled: it will be forwarded in plaintext \
+             to upstream providers"
+        );
+        Some(SECRET_DISABLED_WARNING)
+    } else {
+        None
+    };
     Ok(DecisionAck {
         id,
         resource: kind_label,
         decision: mode,
+        warning,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::secrets::SecretTable;
+
+    /// 构造含一个 static secret 的表 (决策端到端测试用).
+    fn secret_table_with_static() -> SecretTable {
+        use crate::secrets::SecretEntry;
+        SecretTable::new(
+            vec![SecretEntry {
+                id: "s1".into(),
+                name: None,
+                category: crate::secrets::SecretCategory::ApiKey,
+                value: "sk-live-qwerty987654".into(),
+                value_file: None,
+                mock_strategy: crate::mock::MockStrategy::default(),
+            }],
+            vec![],
+            std::sync::Arc::new(parking_lot::RwLock::new(crate::config::Decisions::default())),
+            std::path::PathBuf::from("/tmp/opencode/tmp/test-decision-ack.toml"),
+        )
+    }
+
+    /// #161: secret + disabled → ack.warning 非空 (明文放行警示);
+    /// 其他 mode / provider 的 disabled → warning 缺省 (None, 序列化时省略).
+    #[test]
+    fn decision_ack_warning_only_for_secret_disabled() {
+        let t = secret_table_with_static();
+
+        let ack = decision_flow(&t, "secret", "s1".into(), OverrideMode::Disabled).unwrap();
+        assert_eq!(ack.decision, OverrideMode::Disabled);
+        let warning = ack.warning.expect("secret+disabled must carry warning");
+        assert!(warning.contains("plaintext"), "warning wording: {warning}");
+
+        // 切回 default: 无 warning.
+        let ack = decision_flow(&t, "secret", "s1".into(), OverrideMode::Default).unwrap();
+        assert!(ack.warning.is_none());
+        // prefer_static: 无 warning.
+        let ack = decision_flow(&t, "secret", "s1".into(), OverrideMode::PreferStatic).unwrap();
+        assert!(ack.warning.is_none());
+
+        // provider 的 disabled: 语义是禁转发 (非放行 secret), 无 warning.
+        // (providers 表此处借 secret 表验证 flow 逻辑 — kind_label 决定 warning,
+        //  与表类型无关; provider 表的同构行为由同一段代码保证.)
+        let ack = decision_flow(&t, "provider", "s1".into(), OverrideMode::Disabled).unwrap();
+        assert!(ack.warning.is_none());
+    }
+
+    /// 序列化向后兼容: 非 disabled 时 JSON 无 warning 字段 (旧客户端 shape 不变);
+    /// disabled 时字段出现.
+    #[test]
+    fn decision_ack_json_warning_field_shape() {
+        let t = secret_table_with_static();
+        let ack = decision_flow(&t, "secret", "s1".into(), OverrideMode::Default).unwrap();
+        let json = serde_json::to_string(&ack).unwrap();
+        assert!(!json.contains("warning"), "default mode json: {json}");
+
+        let ack = decision_flow(&t, "secret", "s1".into(), OverrideMode::Disabled).unwrap();
+        let json = serde_json::to_string(&ack).unwrap();
+        assert!(json.contains("warning"), "disabled mode json: {json}");
+        assert!(
+            !json.contains("sk-live"),
+            "ack must not leak secret value: {json}"
+        );
+    }
 }
