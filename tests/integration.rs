@@ -3124,6 +3124,83 @@ async fn secret_decision_disabled_drops_from_redaction() {
     );
 }
 
+/// #161: PATCH decision=disabled 的 ack 响应携带 warning (secret 明文放行警示);
+/// default / prefer_static 不携带 (向后兼容 shape). provider 的 disabled 不携带
+/// (语义是禁转发, 非放行).
+#[tokio::test]
+async fn secret_decision_disabled_ack_carries_plaintext_warning() {
+    let upstream = spawn_mock_upstream().await;
+    let provider = openai_provider("oa-main", &upstream.url());
+    let decisions = std::sync::Arc::new(parking_lot::RwLock::new(
+        secret_guard::config::Decisions::default(),
+    ));
+    let secrets = SecretTable::new(
+        vec![secret("static-s", "static-secret-value")],
+        vec![],
+        decisions,
+        tmp_state_path("warn-ack-secret"),
+    );
+
+    // providers 表也放一个 static, 验证 provider 分支无 warning.
+    let proxy_url = spawn_proxy_static_dynamic(
+        vec![provider],
+        vec![],
+        reqwest::Client::new(),
+        ConversationDag::new(64, 500, 1),
+        secrets,
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    // 1. secret + disabled → warning 字段出现且含 "plaintext".
+    let ack: serde_json::Value = client
+        .patch(format!("{proxy_url}/__sg/api/secrets/static-s/decision"))
+        .json(&serde_json::json!({"mode": "disabled"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(ack["resource"], "secret");
+    assert_eq!(ack["decision"], "disabled");
+    let warning = ack["warning"].as_str().unwrap_or_default();
+    assert!(
+        warning.contains("plaintext"),
+        "warning must mention plaintext forwarding, got: {warning:?}"
+    );
+
+    // 2. 切回 default → 无 warning 字段 (旧客户端 shape).
+    let ack: serde_json::Value = client
+        .patch(format!("{proxy_url}/__sg/api/secrets/static-s/decision"))
+        .json(&serde_json::json!({"mode": "default"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        ack.get("warning").is_none() || ack["warning"].is_null(),
+        "default mode must not carry warning, got: {ack}"
+    );
+
+    // 3. provider + disabled → 无 warning (禁转发语义).
+    let ack: serde_json::Value = client
+        .patch(format!("{proxy_url}/__sg/api/providers/oa-main/decision"))
+        .json(&serde_json::json!({"mode": "disabled"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        ack.get("warning").is_none() || ack["warning"].is_null(),
+        "provider disabled must not carry warning, got: {ack}"
+    );
+}
+
 /// 辅助: 当测试未持有 ConversationDag handle 时, 通过 sync + timeline API 轮询直到
 /// 出现 count 条记录 (跨所有 session 累计).
 ///
