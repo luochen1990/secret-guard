@@ -307,7 +307,7 @@ on_probe_exhausted = "fail_closed"
 # 一次性环境
 nix develop --impure      # 进入 devShell
 
-# 一键 check (fmt + clippy + machete + nextest)
+# 一键 check (fmt + clippy + machete + doc + nextest + typos + deny-offline)
 # 注: doctest 当前禁用 (唯一 doctest 被 ignored), 需要时在 justfile 取消注释.
 just check
 
@@ -340,9 +340,12 @@ cargo run -- run --port 18787
 
 CI 配置在 `.forgejo/workflows/ci.yml`, 触发条件 `push` + `pull_request` +
 `workflow_dispatch`. 双重去重: 事件去重 (push 仅 master, PR 总是跑) + 内容去重
-(skip-if-passed, ff-merge 后同 SHA 不重跑). `check` job 测试集只跑一次, 顺序为
-checkout → diff 报告 (PR, 非阻塞) → consistency-check → check+coverage → coverage-gate →
-file-size → WebUI (非阻塞) → cargo audit (非阻塞) → cargo-deny → typos.
+(skip-if-passed, ff-merge 后同 SHA 不重跑) + PR 并发去旧 (concurrency 取消同 PR 旧 run).
+`check` job 测试集只跑一次, 顺序为
+lock 守卫 → checkout → diff 报告 (PR, 非阻塞) → consistency-check → check+coverage
+(含 doc 门禁 + --locked + typos + deny-offline, 阻塞) → coverage-gate → bench (非阻塞) →
+file-size → WebUI (非阻塞) → cargo audit (非阻塞) → nix build cargoHash 校验 (非阻塞) →
+lock 校验.
 (checkout 策略 / 缓存复用 / 并发假设 / 评论写回 / 各 step 升级路径见 docs/ci.md.)
 
 > CI 实现细节 (checkout 策略 / 缓存复用 / 并发假设 / 评论写回 / 各 step 升级路径) 见
@@ -452,12 +455,18 @@ prod 代码大量增加才需警惕). 工具用 syn AST 解析, 自动识别 `#[
 **走查纪律**: `.cargo/audit.toml` 的 ignore 项每半年走查一次; 上游若已修复, 立即移除忽略项
 并升级依赖. 走查触发 = `just audit` 时人工核对 (CI 每 PR 跑, 但 ignore 项不报错, 易遗忘).
 
-### cargo-deny (license + bans + advisory 二次审查)
+### cargo-deny (license + bans + sources 离线门禁; advisories 归 audit)
 
 `cargo audit` 只覆盖 RUSTSec CVE; `cargo-deny` 额外覆盖 license 不兼容 / 重复 crate 多版本 /
 禁止依赖 / git 源审计. 项目声明 MIT 且发布到 nixpkgs overlay, license 合规是硬约束 (引入
 GPL/AGPL 等 copyleft 会污染下游). 配置在 `deny.toml`, 与 `.cargo/audit.toml` 的 `[advisories.ignore]`
 保持同步 (互为冗余兜底).
+
+- **CI 阻塞门禁是纯离线的** (`just deny-offline` = `cargo deny --offline check licenses
+  bans sources`, 在 `just check` 链尾随 coverage step 执行, 不设独立 CI step): advisories
+  检查需联网拉 advisory DB, 网络抖动会让阻塞门禁随机失败, 故归给 continue-on-error 的
+  cargo audit. 本地 `just check` 链尾跑同一命令 (含 typos), 保证本地全绿 ⇒ CI 阻塞项必绿.
+  全量检查 (含 advisories) 用 `just deny`.
 
 - **license allow**: MIT / Apache-2.0 / BSD-* / ISC / Zlib / Unicode-* / MPL-2.0 (file-level
   copyleft, 不污染链接产物) / CC0-1.0 / CDLA-Permissive-2.0 (webpki-roots 的 CA 根证书数据协议).
