@@ -362,6 +362,13 @@ pub(crate) async fn fan_out_buffered_ir(
         match serde_json::from_slice::<serde_json::Value>(&recorder.acc) {
             Ok(v) => match reader.read_response(&v) {
                 Ok(mut ir) => {
+                    // #162: 协议错配 WARN (空 content + 零 usage 启发式, 共享 helper).
+                    super::recorder::warn_if_protocol_mismatch(
+                        record_id,
+                        reader.name(),
+                        &ir,
+                        resp_status.is_success(),
+                    );
                     // record 存 LLM 视角 (restore 之前, 含 mock).
                     resp_parsed_for_record = Some(writer.write_response(&ir));
                     crate::redact::restore_ir_response(&mut ir, &redaction_map);

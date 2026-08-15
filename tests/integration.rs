@@ -4948,3 +4948,71 @@ async fn stream_request_with_non_sse_upstream_warns_mock_not_restored() {
         "non-SSE content-type must record streamed=false"
     );
 }
+
+/// #162: provider 协议错配 (anthropic provider 指向 OpenAI shape 端点) →
+/// 2xx 宽松解析出空 content + 零 usage, 行为不变 (仍翻译返回), 但必须打 WARN.
+#[tokio::test]
+async fn protocol_mismatch_silent_empty_response_warns() {
+    let mut upstream = spawn_mock_upstream().await;
+    // OpenAI shape 响应: choices[] 而非 content[]. Anthropic reader 宽松解析:
+    // content 缺失 → 空数组, usage 字段名不匹配 → 全零 → 200 + 空 content (MRE).
+    let _m = upstream
+        .mock("POST", "/v1/messages")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"chatcmpl-mock-1","object":"chat.completion","model":"claude","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":2,"total_tokens":11}}"#,
+        )
+        .create_async()
+        .await;
+
+    // provider: protocol=anthropic, base_url 指向 OpenAI shape 端点 (错配).
+    // 配置一个 secret → same_proto 走 IR 路径 (MRE 路径; 无 secret 时是纯透传).
+    let real_secret = "sk-mismatch-secret-123";
+    let entries = vec![secret("api-key", real_secret)];
+    let secrets = test_secret_table_with(entries);
+    let provider = provider_with("mixed", Protocol::Anthropic, &upstream.url());
+    let proxy_url = spawn_proxy_full(
+        vec![provider],
+        reqwest::Client::new(),
+        ConversationDag::new(64, 500, 1),
+        secrets,
+    )
+    .await;
+
+    let (log, _log_guard) = capture_tracing(tracing::Level::WARN);
+    let (status, text, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/a/mixed/v1/messages",
+        r#"{"model":"claude","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}"#,
+        &[("content-type", "application/json")],
+    )
+    .await;
+
+    // (i) 行为不变: 200 + Anthropic 壳 (content 空数组 + usage 全零, MRE 形态).
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        v["content"].as_array().map(Vec::len),
+        Some(0),
+        "body: {text}"
+    );
+    assert_eq!(v["usage"]["input_tokens"], 0, "body: {text}");
+
+    // (ii) WARN 被捕获: 协议错配信号 (空 content + 零 usage + 协议提示).
+    let log_text = log.text();
+    assert!(
+        log_text.contains("empty content and zero usage"),
+        "#162 violation: no WARN about empty content/zero usage; log: {log_text}"
+    );
+    assert!(
+        log_text.contains("does the upstream actually speak"),
+        "#162: WARN should hint protocol mismatch; log: {log_text}"
+    );
+    // 可定位: record_id (uuid 格式字段) 必须出现.
+    assert!(
+        log_text.contains("record_id"),
+        "#162: WARN lacks record_id for locating; log: {log_text}"
+    );
+}

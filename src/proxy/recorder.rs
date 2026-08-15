@@ -293,7 +293,31 @@ pub(super) fn record_upstream_failure(
     log_forward_summary(dag, record_id);
 }
 
-// ─── 转发摘要日志 (#160) ────────────────────────────────────────────────────
+// ─── 转发可观测性: 摘要日志 (#160) + 协议错配 WARN (#162) ───────────────────
+
+/// #162: 2xx 响应被 reader 宽松解析为空 content + 零 usage 的协议错配 WARN
+/// (fan_out / cross_proto 响应解析成功分支共享).
+///
+/// 强烈的 "provider protocol 与上游实际协议错配" 信号 (典型: anthropic provider
+/// 指到 OpenAI 端点, reader 对缺字段 unwrap_or_default 降级, 字段全落空).
+/// 行为不变 (仍翻译返回), 仅打 WARN. 协议名只作结构化字段 `protocol`
+/// (两路径统一字段名, 便于 grep), 不在消息文案里重复插值.
+pub(super) fn warn_if_protocol_mismatch(
+    record_id: Uuid,
+    proto_name: &str,
+    ir_resp: &crate::codec::ir::IrResponse,
+    is_success: bool,
+) {
+    if is_success && ir_resp.content.is_empty() && ir_resp.usage.is_zero() {
+        warn!(
+            %record_id,
+            protocol = proto_name,
+            "upstream 2xx response parsed to empty content and zero usage; \
+             does the upstream actually speak the expected protocol? \
+             (check provider protocol vs upstream shape)"
+        );
+    }
+}
 
 /// 每笔转发完成 (record 最终态写入后) 打一行 INFO 摘要 (#160: 命令行排障).
 ///
@@ -331,6 +355,7 @@ pub(super) fn log_forward_summary(dag: &ConversationDag, record_id: Uuid) {
         "forward"
     );
 }
+
 /// 发送上游请求, 可选地对"响应头到达"加超时保护. 失败时记录到 DAG 并返回 AppError.
 ///
 /// `header_timeout = None` 时退化为普通 `send().await` (向后兼容 / 测试场景).

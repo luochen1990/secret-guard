@@ -289,6 +289,13 @@ pub(crate) async fn cross_proto_forward(
         match serde_json::from_slice::<serde_json::Value>(&resp_bytes) {
             Ok(v) => match egress_reader.read_response(&v) {
                 Ok(mut ir_resp) => {
+                    // #162: 协议错配 WARN (空 content + 零 usage 启发式, 共享 helper).
+                    super::recorder::warn_if_protocol_mismatch(
+                        record_id,
+                        provider.protocol.name(),
+                        &ir_resp,
+                        resp_status.is_success(),
+                    );
                     // record 存 LLM 视角 (restore 之前, 含 mock) 的 parsed view.
                     resp_parsed_for_record = Some(ingress_writer.write_response(&ir_resp));
                     // restore: mock → real (跨协议 + redact 时, 客户端看到的应该是真 secret).

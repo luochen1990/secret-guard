@@ -295,7 +295,7 @@ URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标
 | `dag/` (模块目录: mod/pool/types/view/timeline) | ConversationDAG 内容寻址存储 (BlockPool + Node + Merkle) | `src/dag/mod.rs` 头部 `//!` + `docs/design/conversation-dag.md` |
 | `derive.rs` | 从 request body 派生 preview/model/text 的字节级提取 + delta messages 切片 (域 B 派生链, ROB-1 永不 panic) | 文件头部 `//!` (含 "为什么不在 web::api" 归属论证) |
 | `dto.rs` | WebUI 响应 DTO 中立类型层 (SessionView/NodeView/.../SyncSnapshot, 域 B → 域 C wire shape; 构造逻辑留 dag) | 文件头部 `//!` (含 "为什么是顶层中立模块" 归属论证) |
-| `error.rs` | 统一应用错误类型 `AppError` (转发链 + 鉴权层共用, 不反向依赖) | 文件头部 `//!` (含与 `web::api::ApiError` 分工) |
+| `error.rs` | 统一应用错误类型 `AppError` (转发链 + 鉴权层共用, 不反向依赖) | 文件头部 `//!` (含与 `web::api::ApiError` 分工 + Upstream/UpstreamTimeout message 净化回传契约) |
 | `record.rs` | ForwardRecord (web 层 DTO, GET /records/{id} 响应 shape) | 文件头部 `//!` |
 | `redact.rs` | RedactionMap + redact/restore pipeline + 形式化契约 C1-C7 | 文件头部 `//!` |
 | `util.rs` | 集中的哈希工具 (`hash64` SipHash 单值入口) | 文件头部 `//!` |
@@ -583,13 +583,26 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
   extra / block-level 未知 part / response 侧 usage 字段位置 (详见 codec/AGENTS.md).
   同协议 + 无 Redact 路径仍 byte-exact.
 - **流式 + Redact + 非 2xx 上游错误**: SSE 错误流不是单个 JSON, parse 失败时 fallback
-  原样返回 (无 restore), 客户端可能看到 mock.
+  原样返回 (无 restore), 客户端可能看到 mock. 该 fallback 现在打 WARN
+  (`mock not restored; client will see mock values`, #158).
+- **流式 + Redact + 上游 Content-Type 非 text/event-stream**: 判型跳过流式 restore,
+  mock 逃逸到客户端 (与上一条同类, #158 发现的第三条逃逸路径). 行为不变 (透传),
+  但有两层 WARN: 判型处 (`non-SSE content-type for a stream=true request`) +
+  parse 失败 fallback (`mock not restored`).
   后续效应: 客户端把 mock 回传进下一轮历史时, 触发 RED-3 例外场景 (mock 跨轮变化,
   见 contracts.md RED-3 例外裁决 / #143).
 - **同协议 + Redact + 非流式 2xx + 上游响应 parse 失败**: 上游返回的 body 不是合法 JSON 或 codec
   reader 无法 parse 时 (类型不符 / 空数组 / 越界), 转发路径 fallback 为透传含 mock 的字节, 无 restore,
   客户端收到 mock. 同协议路径见 `src/proxy/fan_out.rs` (non-stream 分支), 跨协议路径见
   `src/proxy/cross_proto.rs`. 均走 best-effort 鲁棒性原则 (ROB-*), parse 失败不 panic.
+  同协议路径在 redaction map 非空时打 WARN (`mock not restored`, #158); 跨协议路径仅
+  reader 拒绝时打通用 parse 失败 WARN, 非 JSON fallback 静默 (mock-not-restored 信号
+  缺失, 补齐是后续工作).
+- **provider 协议与上游实际协议错配 → 静默空响应 (有 WARN)**: provider protocol=anthropic
+  但上游实为 OpenAI shape 时, 2xx 响应被 reader 宽松解析为空 content + 全零 usage
+  (reader 对缺字段 `unwrap_or_default` 降级, 不报错). 行为不变 (仍翻译返回), 但打 WARN
+  (`parsed to empty content and zero usage; does the upstream actually speak ...`,
+  #162) — 配置错误可从日志发现.
   后续效应同上 (RED-3 例外场景).
 - **跨协议 ingress 的 timeline delta 切片可能错位**: OpenAI writer 会把 Anthropic 风格的
   混合 Text+ToolResult user 消息拆成 (1+N) 条 wire messages, 导致 `req_body_raw` 的
@@ -626,6 +639,10 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
 
 ## 后续工作 (非 MVP 范围)
 
+- **跨协议路径的 mock-not-restored WARN**: cross_proto 响应 parse 失败 fallback
+  (reader 拒绝 / 非 JSON) 时, 与同协议路径 (`fan_out.rs::warn_mock_not_restored`)
+  对称地在 redaction map 非空时打 `mock not restored` WARN (#158 只覆盖了
+  同协议路径; 见 "已知限制" 对应条目).
 - **跨协议流式响应翻译**: 在 `cross_proto_forward` 检测 stream=true 时接入
   `StreamTranslate::new(ingress, egress)` 而非返回 501.
 - **更多协议**: Gemini / Ollama / Bedrock / Cohere / OpenAI Responses API.
