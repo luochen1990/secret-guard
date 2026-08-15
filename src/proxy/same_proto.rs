@@ -186,6 +186,19 @@ pub(crate) async fn same_proto_forward(
         .unwrap_or("")
         .to_string();
     let streamed = is_streaming(&content_type);
+    // #158: 本应走流式 restore (请求声明 stream=true 且本请求有 redact) 但上游
+    // Content-Type 非 text/event-stream 时, 下方会落入 fan_out_buffered_ir 的
+    // parse-失败 fallback — mock 不被 restore, 客户端拿到假 secret. 该 fallback
+    // 内的 WARN 是逃逸点日志; 此处补充上游侧信号 (实际收到的 content-type).
+    if ir.stream && !streamed && !redaction_map.is_empty() {
+        warn!(
+            %record_id,
+            provider = %provider.id,
+            content_type = %content_type,
+            "upstream returned non-SSE content-type for a stream=true request; \
+             falling back to buffered path"
+        );
+    }
 
     debug!(%record_id, status = %resp_status, streamed, "upstream responded");
 

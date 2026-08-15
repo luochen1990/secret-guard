@@ -4853,3 +4853,98 @@ async fn forward_summary_for_streaming_logs_after_stream_end() {
         "#160: streaming forward summary missing or lacks streamed=true; log: {log_text}"
     );
 }
+
+// ─── 转发链可观测性 (#158 / #160 / #162 / #163) ────────────────────────────
+//
+// 四条可观测性增强的集成锁定. 日志断言设施 (`capture_tracing` / `CaptureLog`)
+
+/// #158: 请求 stream=true + 配置 secret, 上游回 200 + Content-Type: application/json
+/// (body 为 SSE 形态含 mock) → mock 不被 restore (行为不变, 已知限制), 但必须打 WARN.
+#[tokio::test]
+async fn stream_request_with_non_sse_upstream_warns_mock_not_restored() {
+    let real_secret = "sk-live-zzz123456789";
+    let expected_mock = predict_mock(real_secret);
+    let mut upstream = spawn_mock_upstream().await;
+    // MRE (issue #158): 上游对 stream=true 回 application/json + SSE 格式 body
+    // (delta content 回显 mock, 模拟 LLM echo 了 redact 后的请求内容).
+    let sse_body = format!(
+        concat!(
+            "data: {{\"choices\": [{{\"delta\": {{\"content\": \"saw {mock}\"}}}}]}}\n\n",
+            "data: [DONE]\n\n",
+        ),
+        mock = expected_mock,
+    );
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(sse_body.clone())
+        .create_async()
+        .await;
+
+    let entries = vec![secret("api-key", real_secret)];
+    let secrets = test_secret_table_with(entries);
+    let records = ConversationDag::new(64, 500, 1);
+    let records_handle = records.clone();
+    let provider = openai_provider("oa-main", &upstream.url());
+    let proxy_url =
+        spawn_proxy_full(vec![provider], reqwest::Client::new(), records, secrets).await;
+
+    let (log, _log_guard) = capture_tracing(tracing::Level::WARN);
+    let body = format!(
+        r#"{{"model":"gpt-4o","stream":true,"messages":[{{"role":"user","content":"keep {real_secret}"}}]}}"#
+    );
+    let (status, text, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        &body,
+        &[("content-type", "application/json")],
+    )
+    .await;
+
+    // (i) 行为不变: 200 + 原样透传 (mock 可见 — 已知限制, 本 issue 只加日志).
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(
+        text, sse_body,
+        "fallback path must pass body through verbatim"
+    );
+
+    // (ii) WARN 被捕获: 逃逸点 (fan_out_buffered_ir parse 失败) + 上游信号
+    // (same_proto 判型) 至少一处. 断言核心文案 + 可定位字段.
+    let log_text = log.text();
+    assert!(
+        log_text.contains("mock not restored"),
+        "#158 violation: no WARN about mock not restored; log: {log_text}"
+    );
+    assert!(
+        log_text.contains("non-SSE content-type"),
+        "#158: upstream-side signal (non-SSE content-type for stream=true) missing; log: {log_text}"
+    );
+    // 可定位: 逃逸点 WARN 行本身必须带 record_id 字段 (行级断言, 防 warn! 漏带).
+    let warn_line = log_text
+        .lines()
+        .find(|l| l.contains("mock not restored"))
+        .expect("#158: WARN line must exist (checked above)");
+    assert!(
+        warn_line.contains("record_id="),
+        "#158: WARN lacks record_id for locating; got: {warn_line}"
+    );
+    // 卫生: 日志不得含真实 secret.
+    assert!(
+        !log_text.contains(real_secret),
+        "#158: WARN must not leak real secret; log: {log_text}"
+    );
+
+    // record 侧: streamed=false (content-type 判型结果), 行为与 issue 描述一致.
+    let list = wait_until_or_timeout(
+        &records_handle,
+        |l| l.first().map(|r| r.resp_complete).unwrap_or(false),
+        Duration::from_secs(2),
+    )
+    .await;
+    assert!(
+        !list[0].streamed,
+        "non-SSE content-type must record streamed=false"
+    );
+}

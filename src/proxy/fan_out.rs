@@ -342,6 +342,19 @@ pub(crate) async fn fan_out_buffered_ir(
     let reader = codec_proto.reader();
     let writer = codec_proto.writer();
     let mut resp_parsed_for_record: Option<serde_json::Value> = None;
+    // #158: parse 失败 fallback 时, 若本请求做过 redact (map 非空), body 中的 mock
+    // 不会被 restore — 客户端拿到假 secret. 记一条 WARN 让该逃逸可感知
+    // (行为不变: 仍原样透传, best-effort 原则).
+    let warn_mock_not_restored = |detail: &str| {
+        if !redaction_map.is_empty() {
+            warn!(
+                %record_id,
+                detail,
+                "response parse failed with redactions in flight; \
+                 mock not restored; client will see mock values"
+            );
+        }
+    };
     let client_bytes: Vec<u8> = if recorder.error_kind.is_some() {
         // stream 中途中断 → 不 parse, 返回空 body (状态码下方调整为 502/504).
         Vec::new()
@@ -355,9 +368,22 @@ pub(crate) async fn fan_out_buffered_ir(
                     let restored = writer.write_response(&ir);
                     serde_json::to_vec(&restored).unwrap_or_else(|_| recorder.acc.clone())
                 }
-                Err(_) => recorder.acc.clone(), // parse 失败: 原样返回 (无 restore).
+                Err(e) => {
+                    warn_mock_not_restored(&format!(
+                        "codec reader ({}) rejected response: {}",
+                        reader.name(),
+                        e.message
+                    ));
+                    recorder.acc.clone() // parse 失败: 原样返回 (无 restore).
+                }
             },
-            Err(_) => recorder.acc.clone(), // 非 JSON: 原样返回.
+            Err(e) => {
+                warn_mock_not_restored(&format!(
+                    "response body is not a single JSON value ({e}); \
+                     likely SSE-shaped body under a non-SSE content-type"
+                ));
+                recorder.acc.clone() // 非 JSON: 原样返回.
+            }
         }
     };
 
