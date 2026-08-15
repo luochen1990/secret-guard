@@ -101,6 +101,42 @@
 1. 编码人员 (含 AI agent) 修代码使其符合契约, commit msg 引用契约 ID.
 2. 若认为契约本身过时, **必须先报告人工 (项目维护者) 审批**, 批准后才能改契约. 改契约的 commit msg 注明 "docs(contracts): <ID> 因为 <原因> 调整", 重大调整 (语义变化) 在 [§99 变更日志](#99-变更日志) 记录.
 
+### 0.6 Property 落地状态标注 + traceability lint (#144)
+
+每条 property 行尾**必须**带三种落地状态标注之一, 由 `just check-contracts` (进 `just check`
+阻塞链) 机械守卫. **行格式契约**: property 行必须顶格 `- \`prop_...\`` (无缩进, 非表格),
+缩进/表格形式不被 lint 扫描.
+
+| 标注 | 语义 | lint 校验 |
+|---|---|---|
+| `✅` | 同名落地: property 名在 `src/+tests/` (*.rs/*.ts) 有**测试载体级**字面命中 | 名字 word-match 且命中行含 fn/test 定义形态 (纯注释提及不算, 防注释伪造 ✅) |
+| `🔁→\`锚点\`` | 改名落地 / 弱形式覆盖: 锚点 (通常是实际测试名) 在 `src/+tests/+justfile+ci.yml` grep 命中 | 🔁→ 起的全部反引号锚点 (排除 \`路径\` 形态) `grep -F` 命中 |
+| `⏳` | 待补: 真零测试 (语义核验后确认无近似落地) | 免 grep, 仅计数报告 |
+
+标注格式细节: 🔁 的锚点 = `🔁→` 之后行内反引号对 (排除文件路径形态; 前置说明如
+"🔁→人工审查项: `锚点`" 合法); 弱形式覆盖 (如仅部分维度 / 间接断言) 应在锚点后注明.
+UI 段的 Playwright 测试用中文标题, 锚点即标题子串 (须避开反引号; 可含空格与括号 —
+lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
+
+**⏳ 项补齐优先级** (按风险排序, 排期依据 — 23 条, 2026-08-15):
+
+1. **P0 安全 (5 条: SEC-1 穷举 2 + STR-3 泄漏 3)** — secret 泄漏类:
+   `prop_no_real_secret_in_any_json_response` / `prop_no_real_api_key_in_any_json_response`
+   (SEC-1, 穷举式"任意 GET 响应扫描真实值", 现有个别字段 assert 不足); STR-3 的
+   `prop_upstream_disconnect_no_mock_leak` / `prop_upstream_timeout_no_mock_leak`
+   (`prop_non_2xx_sse_no_mock_to_client` 属已知 gap, 见 STR-3 "理想 vs 现状" 注记,
+   补齐前需先裁决实现路线). mock 泄漏非 secret 泄漏但会破坏下游工具.
+2. **P1 行为语义无守卫 (4 条: DTO-4 优先级链 1 + UI-3 DOM 顺序 3)** — ROB-1 只守
+   never-panic, 行为语义 (fallback 链末端 / prepend 顺序 / replace 顺序 / 乱序自愈)
+   无回归守卫, 重构时易静默回归.
+3. **P2 边界补强 (其余 14 条)** — 已有实现遵循 + 邻近 property 间接覆盖, 专项断言
+   缺 (RED-1 charset/length, RED-5 重试链确定性, RED-6 tool_result/system/extra,
+   RED-7 block 隔离, CDAG-2/7, DTO-1 internal leak, DTO-6, FWD-2 流式双 round-trip,
+   SEC-4 set-cookie); 随相关模块改动顺带补齐.
+
+新增契约条目时必须同步给 property 标注 (lint 强制), 杜绝 "愿望清单" 再现
+(#144: 走查发现 ~85/156 条零落地标注, 全量标注后剩 23 条真 ⏳).
+
 ---
 
 ## 1. FWD: 转发忠实性 (Forwarding Fidelity)
@@ -125,9 +161,9 @@
 **不适用**: 跨协议路径 (ingress wire 与 egress wire 是不同协议格式, 由 FWD-3 单独约束).
 
 **Properties**:
-- `prop_request_half_byte_exact` (非流式, 请求侧): 对任意合法请求 wire 含 real secret, `normalize(secret-guard 发往上游的 wire) == normalize(原始 wire).replace(real, mock)`.
-- `prop_response_half_byte_exact` (非流式, 响应侧): 对任意合法响应 wire 含 mock, `normalize(secret-guard 返回客户端的 wire) == normalize(上游 wire).replace(mock, real)`.
-- `prop_streaming_response_half_byte_exact` (流式, 响应侧): 流式响应的 restore, 经任意 chunk 切分, 同上.
+- `prop_request_half_byte_exact` (非流式, 请求侧): 对任意合法请求 wire 含 real secret, `normalize(secret-guard 发往上游的 wire) == normalize(原始 wire).replace(real, mock)`. 🔁→`openai_request_redact_preserves_wire_except_secret` + `anthropic_request_redact_preserves_wire_except_secret` (半段式含 redact, `src/codec/fwd_property.rs`; 端到端 `redact_strips_secret_from_upstream_request`)
+- `prop_response_half_byte_exact` (非流式, 响应侧): 对任意合法响应 wire 含 mock, `normalize(secret-guard 返回客户端的 wire) == normalize(上游 wire).replace(mock, real)`. 🔁→`prop_response_round_trip_identity` / `prop_response_tool_use_input_restored` (redact.rs 响应侧) + 端到端 `restore_inserts_secret_back_for_client` (非流式) — 流式半段见 FWD-1 `prop_streaming_response_half_byte_exact` 弱化形式注记
+- `prop_streaming_response_half_byte_exact` (流式, 响应侧): 流式响应的 restore, 经任意 chunk 切分, 同上. 🔁→`prop_streaming_response_half_byte_exact_openai` + `prop_streaming_response_half_byte_exact_anthropic` (`src/codec/fwd_streaming_property.rs`; 语义等价弱化形式, 见下方 "理想 vs 现状" 注记)
 
 > **理想 vs 现状**: `prop_streaming_response_half_byte_exact` 的字面形式 (byte-exact) 在
 > `StreamTranslate::new_same_proto_restore` 路径下**不成立** — 该路径显式放弃 byte-exact 走
@@ -138,7 +174,7 @@
 > 当前 property (`fwd_streaming_property.rs`) 守卫**语义等价弱化形式**: no mock leak + content
 > fidelity + tool input fidelity + usage output fidelity. 完整 byte-exact 需重新设计
 > same_proto_restore 为字节级扫描替换 (避免 IR re-serialize), 作为独立架构改动.
-- `prop_proptest_generator_covers_edge_cases`: wire 生成器必须覆盖:
+- `prop_proptest_generator_covers_edge_cases`: wire 生成器必须覆盖: 🔁→`arb_openai_request_with_embedded_secret` 等生成器组 (`src/codec/fwd_property.rs` L555 起覆盖清单注释 + `fwd_streaming_property.rs` 的 byte_by_byte 用例)
   - 多个并行 tool_call (≥2)        [9712c52: writer 硬编码 index=0 致 N→1 合并]
   - 空 choices 数组                 [229b2cb: 3 处独立 bug 联合丢失 usage]
   - usage chunk (terminal delta)    [229b2cb]
@@ -157,8 +193,8 @@
 **适用范围**: 非流式 wire JSON (IrRequest / IrResponse) + 流式 SSE wire (IrStreamEvent 序列).
 
 **Properties**:
-- `prop_codec_round_trip_byte_exact_after_normalize` (非流式): `normalize(Writer(Reader(Writer(ir)))) == normalize(Writer(ir))`.
-- `prop_codec_stream_round_trip_byte_exact_after_normalize` (流式): 流式 reader → writer → 字节 → reader → writer → 字节, 两次最终字节 normalize 后 byte-exact.
+- `prop_codec_round_trip_byte_exact_after_normalize` (非流式): `normalize(Writer(Reader(Writer(ir)))) == normalize(Writer(ir))`. 🔁→`openai_request_preserves_wire_semantics` + `anthropic_request_preserves_wire_semantics` (`src/codec/fwd_property.rs`; 响应侧 `openai_response_preserves_wire_semantics` 因 L8 `#[ignore]`)
+- `prop_codec_stream_round_trip_byte_exact_after_normalize` (流式): 流式 reader → writer → 字节 → reader → writer → 字节, 两次最终字节 normalize 后 byte-exact. ⏳
 - 生成器覆盖要求见 FWD-1 的 `prop_proptest_generator_covers_edge_cases` (两契约共享同一组生成器要求).
 
 ### FWD-3 跨协议翻译: 建模范围内语义保留 + 范围外显式丢弃
@@ -178,41 +214,41 @@
 - Anthropic `disable_parallel_tool_use` 通过 tool_choice 载体映射, 语义脆弱.
 
 **Properties**:
-- `prop_cross_proto_modeled_fields_preserved`: 建模范围内的字段 (messages/tools/tool_use/tool_result/usage 总数/stop_reason) 跨协议 round-trip 后保留.
-- `prop_cross_proto_unmodeled_fields_explicitly_dropped`: 范围外字段 (如 reasoning_content) 不出现在 egress wire.
-- `prop_cross_proto_extra_cleared`: 跨协议路径下 ingress IR 的 extra 字段必须清空, 不允许源协议独有字段泄漏到 egress.
-- `prop_documented_semantic_loss_list`: 所有已知的语义损失点必须在 `src/codec/AGENTS.md` 显式列出 (人工审查项).
+- `prop_cross_proto_modeled_fields_preserved`: 建模范围内的字段 (messages/tools/tool_use/tool_result/usage 总数/stop_reason) 跨协议 round-trip 后保留. 🔁→`prop_cross_proto_modeled_fields_preserved_openai_to_anthropic` + `prop_cross_proto_modeled_fields_preserved_anthropic_to_openai` (`src/codec/fwd_cross_proto_property.rs`)
+- `prop_cross_proto_unmodeled_fields_explicitly_dropped`: 范围外字段 (如 reasoning_content) 不出现在 egress wire. ✅
+- `prop_cross_proto_extra_cleared`: 跨协议路径下 ingress IR 的 extra 字段必须清空, 不允许源协议独有字段泄漏到 egress. ✅
+- `prop_documented_semantic_loss_list`: 所有已知的语义损失点必须在 `src/codec/AGENTS.md` 显式列出 (人工审查项). ✅
 
 ### FWD-4 HTTP 语义透传 + 客户端响应与 record 累积分离
 
 **陈述**: 除 hop-by-hop header 外, HTTP 语义 (method / status / headers / stream 模式) 透传. **客户端响应路径与 record 累积路径是两条独立路径**: 客户端响应永远流式透传无大小上限, record 累积受 `MAX_RESP_BODY_RECORD` (32 MiB) 上限保护.
 
 **Properties**:
-- `prop_status_code_preserved`: 上游响应 status code 透传给客户端 (任意 status, 含错误码).
-- `prop_headers_preserved_except_hop_by_hop`: 上游响应 header 透传, 除 RFC 7230 §6.1 定义的 hop-by-hop header 外不丢失.
-- `prop_stream_mode_preserved`: 上游若返回 SSE/chunked, 客户端也以流式收到 (非 buffered).
-- `prop_client_response_not_capped_even_when_record_truncated`: 即使 record 累积超过 MAX_RESP_BODY_RECORD 被截断 (写入 TRUNCATED_BANNER), 客户端响应仍收到完整上游字节. 此契约禁止有人把 MAX_RESP_BODY_RECORD 改成"客户端响应上限" (会静默截断用户响应).
+- `prop_status_code_preserved`: 上游响应 status code 透传给客户端 (任意 status, 含错误码). 🔁→`upstream_non_2xx_is_forwarded` (`tests/integration.rs`)
+- `prop_headers_preserved_except_hop_by_hop`: 上游响应 header 透传, 除 RFC 7230 §6.1 定义的 hop-by-hop header 外不丢失. 🔁→`sanitize_strips_hop_by_hop_and_host` + `strips_custom_connection_listed_header`
+- `prop_stream_mode_preserved`: 上游若返回 SSE/chunked, 客户端也以流式收到 (非 buffered). 🔁→`forwards_streaming_sse` (弱形式: 断言 chunk 语义透传, 未断言非 buffered 到达时序)
+- `prop_client_response_not_capped_even_when_record_truncated`: 即使 record 累积超过 MAX_RESP_BODY_RECORD 被截断 (写入 TRUNCATED_BANNER), 客户端响应仍收到完整上游字节. 此契约禁止有人把 MAX_RESP_BODY_RECORD 改成"客户端响应上限" (会静默截断用户响应). 🔁→`fan_out_streaming_truncates_record_but_not_client_response` (`src/proxy/fan_out.rs`)
 
 ### FWD-5 路由分发契约
 
 **陈述**: URL = `/{proto_short}/{provider_id}/*path`. 未知 protocol / 未知 provider / 禁用 provider / 不支持的协议组合 必须返回明确错误码.
 
 **Properties**:
-- `prop_unknown_protocol_returns_404`: 未知 proto_short → 404 not_found.
-- `prop_unknown_provider_returns_404`: 未知 provider_id → 404 not_found.
-- `prop_disabled_provider_returns_503`: provider.enabled=false → 503 unavailable.
-- `prop_cross_proto_streaming_returns_501`: 跨协议 + stream=true → 501 (翻译未接入).
-- `prop_unsupported_codec_returns_501`: Gemini/Ollama 跨协议 → 501 (codec 未覆盖).
-- `prop_internal_url_not_forwarded`: `/__sg/*` 未匹配子路径 → 404, 绝不进入 forward (防止内部 URL 泄漏到上游).
+- `prop_unknown_protocol_returns_404`: 未知 proto_short → 404 not_found. 🔁→`unknown_protocol_returns_404` (`tests/integration.rs`)
+- `prop_unknown_provider_returns_404`: 未知 provider_id → 404 not_found. 🔁→`unknown_provider_returns_404` (`tests/integration.rs`)
+- `prop_disabled_provider_returns_503`: provider.enabled=false → 503 unavailable. 🔁→`disabled_provider_returns_503` (`tests/integration.rs`)
+- `prop_cross_proto_streaming_returns_501`: 跨协议 + stream=true → 501 (翻译未接入). 🔁→`cross_protocol_streaming_returns_501` (`tests/integration.rs`)
+- `prop_unsupported_codec_returns_501`: Gemini/Ollama 跨协议 → 501 (codec 未覆盖). 🔁→`cross_protocol_unknown_pair_returns_501` (`tests/integration.rs`)
+- `prop_internal_url_not_forwarded`: `/__sg/*` 未匹配子路径 → 404, 绝不进入 forward (防止内部 URL 泄漏到上游). 🔁→`web_namespace_not_forwarded_to_upstream` + `unmatched_path_returns_404` (`tests/integration.rs`)
 
 ### FWD-6 Provider 鉴权注入
 
 **陈述**: secret-guard 用 provider 配置的 api_key 覆盖客户端可能误传的 auth header, 注入对应协议的 auth header. 发往上游的请求**只含 ingress 协议对应的 auth header**, 其他协议的 auth header (`Authorization` / `x-api-key` / `x-goog-api-key` 三者中非 ingress 的两个) 必须剥离.
 
 **Properties**:
-- `prop_only_ingress_protocol_auth_header_sent`: 发往上游的请求只含 ingress 协议对应的 auth header, 非 ingress 协议的 auth header 被剥离 (避免客户端误传对手协议 header 干扰上游).
-- `prop_correct_auth_injected_per_protocol`: OpenAI/Ollama → `Authorization: Bearer`; Anthropic → `x-api-key`; Gemini → `x-goog-api-key`.
-- `prop_api_key_two_sources_resolved`: api_key 来自 `api_key` (直接值) 或 `api_key_file` (运行时读文件) 任一来源, 解析为同一 effective value.
+- `prop_only_ingress_protocol_auth_header_sent`: 发往上游的请求只含 ingress 协议对应的 auth header, 非 ingress 协议的 auth header 被剥离 (避免客户端误传对手协议 header 干扰上游). 🔁→`apply_provider_auth_strips_competing_headers` (`src/proxy/auth.rs`)
+- `prop_correct_auth_injected_per_protocol`: OpenAI/Ollama → `Authorization: Bearer`; Anthropic → `x-api-key`; Gemini → `x-goog-api-key`. 🔁→`provider_api_key_overrides_client_auth` (OpenAI Bearer) + `anthropic_provider_uses_x_api_key`; Gemini `x-goog-api-key` 注入无专项
+- `prop_api_key_two_sources_resolved`: api_key 来自 `api_key` (直接值) 或 `api_key_file` (运行时读文件) 任一来源, 解析为同一 effective value. 🔁→`provider_api_key_file_reads_secret_from_path` + `provider_api_key_file_missing_falls_through_to_no_auth` + `put_static_fork_null_api_key_inherits_api_key_file`
 
 ---
 
@@ -226,17 +262,17 @@
 **陈述**: 每个 mock 必须非空, 且满足其 `GenSpec` 的 prefix/charset/length 约束.
 
 **Properties**:
-- `prop_mock_non_empty`: 对任意 (secret, strategy), 生成的 mock 非空.
-- `prop_mock_matches_gen_spec_charset`: mock 字符全部来自 gen_spec.charset ∪ gen_spec.prefix.
-- `prop_mock_length_in_range`: mock 长度 ∈ gen_spec.length_range.
+- `prop_mock_non_empty`: 对任意 (secret, strategy), 生成的 mock 非空. ✅
+- `prop_mock_matches_gen_spec_charset`: mock 字符全部来自 gen_spec.charset ∪ gen_spec.prefix. ⏳
+- `prop_mock_length_in_range`: mock 长度 ∈ gen_spec.length_range. ⏳
 
 ### RED-2 上下文唯一性 (in-context uniqueness)
 
 **陈述**: 一次 `redact_ir` 调用内, 每个 mock 必须不出现在 pre-replace IR 中 (traverse IR 检查), 也不出现在已分配 mock 集合中.
 
 **Properties**:
-- `prop_mock_not_in_pre_redact_ir`: 对任意 (ir, secret), gen 出的 mock 不在 ir 的任何字符串叶子中.
-- `prop_mock_not_in_allocated`: 一次 redact_ir 调用内, 不同 secret 得到不同 mock.
+- `prop_mock_not_in_pre_redact_ir`: 对任意 (ir, secret), gen 出的 mock 不在 ir 的任何字符串叶子中. ✅
+- `prop_mock_not_in_allocated`: 一次 redact_ir 调用内, 不同 secret 得到不同 mock. 🔁→`prop_redact_produces_distinct_mocks` (`src/redact.rs`; N secret → N mock 即 "不在已分配集合"的加强形式)
 
 ### RED-3 前缀缓存友好性 (确定性)
 
@@ -261,43 +297,43 @@
 
 **Properties**:
 - `prop_distinct_secrets_distinct_mocks`: 对 N 个不同 secret, 得到 N 个不同 mock. ✅ `src/redact.rs::prop_distinct_secrets_distinct_mocks` + `prop_redact_produces_distinct_mocks`.
-- `prop_probing_exhausted_skips_not_panics` (fail_open 模式下): 弱配置 (charset=1 char, length=1) 耗尽候选时, 跳过该 secret, 进程存活. ✅ `src/redact.rs::redact_ir_skips_secret_when_probing_exhausted_instead_of_panicking` + `redact_ir_checked_fail_open_skips_exhausted_secret` + `redact_ir_legacy_remains_fail_open_after_refactor`.
-- `prop_probing_exhausted_fail_closed_refuses_forward` (fail_closed 模式下): 弱配置 + 对抗性 IR 耗尽候选时, 返回 503 + 上游未被调用 + 503 body 无 secret 明文 (载荷卫生交叉引用 SEC-2 — fail_closed 使 RedactError 首次在转发路径可达, SEC-2 重要性上升). ✅ `tests/integration.rs::fail_closed_mode_returns_503_when_probing_exhausted` + `src/redact.rs::redact_ir_checked_fail_closed_returns_err_on_exhaustion` / `redact_ir_checked_fail_closed_returns_err_on_insert_collision` / `redact_ir_checked_fail_closed_succeeds_when_probing_succeeds` / `redact_ir_checked_fail_closed_no_secrets_returns_empty_map` + 配置 serde (`src/config.rs::on_probe_exhausted` 系列 serde 测试 / `redact_config_toml_parses_fail_closed`).
-- `prop_redact_error_never_carries_secret_value`: RedactError 只携带 secret_id + reason, 不含 secret 明文. ✅ `src/redact.rs::redaction_map_insert_collision_returns_err_without_leaking_secret` + `prop_redact_error_debug_no_secret_leak` (SEC-2 property 形式化).
+- `prop_probing_exhausted_skips_not_panics` (fail_open 模式下): 弱配置 (charset=1 char, length=1) 耗尽候选时, 跳过该 secret, 进程存活. 🔁→`redact_ir_skips_secret_when_probing_exhausted_instead_of_panicking` + `redact_ir_checked_fail_open_skips_exhausted_secret` + `redact_ir_legacy_remains_fail_open_after_refactor` (`src/redact.rs`)
+- `prop_probing_exhausted_fail_closed_refuses_forward` (fail_closed 模式下): 弱配置 + 对抗性 IR 耗尽候选时, 返回 503 + 上游未被调用 + 503 body 无 secret 明文 (载荷卫生交叉引用 SEC-2 — fail_closed 使 RedactError 首次在转发路径可达, SEC-2 重要性上升). 🔁→`fail_closed_mode_returns_503_when_probing_exhausted` (`tests/integration.rs`) + `redact_ir_checked_fail_closed_returns_err_on_exhaustion` 系列 (`src/redact.rs`)
+- `prop_redact_error_never_carries_secret_value`: RedactError 只携带 secret_id + reason, 不含 secret 明文. 🔁→`redaction_map_insert_collision_returns_err_without_leaking_secret` + `prop_redact_error_debug_no_secret_leak` (`src/redact.rs`; SEC-2 property 形式化)
 
 ### RED-5 mock 不含 real_secret 子串 (实质确定性)
 
 **陈述**: mock 不含 real_secret 的 ≥ `k(L)=max(4, ⌈L/3⌉)` 字符连续子串. 阈值随 secret 长度 L 自适应 (短 secret 强保护, 长 secret 弱保护, 信息泄露率上界 ~36%).
 
 **Properties**:
-- `prop_no_real_substring_ascii`: 对任意 ASCII secret, mock 不含其 ≥ k(L) 子串.
-- `prop_no_real_substring_multibyte`: 对任意 UTF-8 secret (中文/emoji), 同上, char-level 而非 byte-level.
-- `prop_c5_auto_mode_deterministic`: Auto 模式下, 内部重试链 (C5_INTERNAL_RETRIES=10000) 使失败概率 ~(1e-5)^10000 ≈ 0, 实质等价于确定性契约.
-- `prop_c5_fixed_mode_validated_on_upsert`: Fixed 模式 / 用户 prefix 在 `validate_against_real` (upsert 时) 校验, 不合格的 secret 拒绝入库.
-- `prop_secret_with_mock_prefix_rejected`: secret value 含 `global_mock_prefix` 时被 `validate_value` 拒绝 (前缀非空时生效).
+- `prop_no_real_substring_ascii`: 对任意 ASCII secret, mock 不含其 ≥ k(L) 子串. 🔁→`prop_no_real_substring` (`src/redact.rs`) + `prop_c5_gen_candidate_auto_body_no_real_substring` (`src/mock.rs`)
+- `prop_no_real_substring_multibyte`: 对任意 UTF-8 secret (中文/emoji), 同上, char-level 而非 byte-level. ✅
+- `prop_c5_auto_mode_deterministic`: Auto 模式下, 内部重试链 (C5_INTERNAL_RETRIES=10000) 使失败概率 ~(1e-5)^10000 ≈ 0, 实质等价于确定性契约. ⏳
+- `prop_c5_fixed_mode_validated_on_upsert`: Fixed 模式 / 用户 prefix 在 `validate_against_real` (upsert 时) 校验, 不合格的 secret 拒绝入库. 🔁→`mock_strategy_validate_against_real_rejects_fixed_equals_real` 等 mock.rs validate 组 (upsert 链路经 `SecretEntry::validate_and_resolve` 调用)
+- `prop_secret_with_mock_prefix_rejected`: secret value 含 `global_mock_prefix` 时被 `validate_value` 拒绝 (前缀非空时生效). 🔁→`validate_value_rejects_short_pua_and_mock_prefix` (`src/secrets.rs`) + `validate_value_rejects_mock_prefix` (`tests/integration.rs`)
 
 ### RED-6 可逆性 (round-trip identity, 非流式)
 
 **陈述**: `restore_ir_response(redact_ir(req).0)` 后 IR 语义等价于原 IR. redact + restore 是可逆双射 (real ↔ mock 一一对应).
 
 **Properties**:
-- `prop_round_trip_identity_text`: text block 中 secret 的 round-trip identity.
-- `prop_round_trip_identity_tool_use_input`: tool_use input JSON 中 secret 的 round-trip identity.
-- `prop_round_trip_identity_tool_result`: tool_result 嵌套 text 中 secret 的 round-trip identity.
-- `prop_round_trip_identity_system`: system prompt 中 secret 的 round-trip identity.
-- `prop_round_trip_identity_extra`: extra 字段 (未建模 JSON) 中 secret 的 round-trip identity.
-- `prop_round_trip_identity_multi_secret`: 多 secret (1..10) 同时出现的 round-trip identity.
-- `prop_round_trip_identity_repeated_secret`: 同 secret 在多字段重复出现的 round-trip identity.
+- `prop_round_trip_identity_text`: text block 中 secret 的 round-trip identity. 🔁→`prop_round_trip_identity` (`src/redact.rs`, text 场景)
+- `prop_round_trip_identity_tool_use_input`: tool_use input JSON 中 secret 的 round-trip identity. 🔁→`prop_response_tool_use_input_restored` (`src/redact.rs`)
+- `prop_round_trip_identity_tool_result`: tool_result 嵌套 text 中 secret 的 round-trip identity. ⏳
+- `prop_round_trip_identity_system`: system prompt 中 secret 的 round-trip identity. ⏳
+- `prop_round_trip_identity_extra`: extra 字段 (未建模 JSON) 中 secret 的 round-trip identity. ⏳
+- `prop_round_trip_identity_multi_secret`: 多 secret (1..10) 同时出现的 round-trip identity. 🔁→`prop_multi_secret_round_trip` + `prop_response_multi_secret_round_trip` (`src/redact.rs`)
+- `prop_round_trip_identity_repeated_secret`: 同 secret 在多字段重复出现的 round-trip identity. 🔁→`prop_repeated_secret_round_trip` (`src/redact.rs`)
 
 ### RED-7 流式可逆性 (streaming restorability)
 
 **陈述**: `StreamingRestorer` 在任意 chunk 切分下保证 `concat(push(c_1..n), flush().1)` 严格等于 `content.replace(mock, real)`. UTF-8 安全.
 
 **Properties**:
-- `prop_streaming_restorer_round_trip`: 对任意 chunk_size (1..N), round-trip identity 成立.
-- `prop_streaming_restorer_utf8_safe`: 多字节字符不在 char boundary 中间切的 round-trip identity.
-- `prop_streaming_restorer_multi_mock`: 多 mock 在同一段文本中的 round-trip identity.
-- `prop_streaming_restorer_per_block_isolated`: 不同 block 的 restorer 状态独立 (block 间 mock 边界互不干扰).
+- `prop_streaming_restorer_round_trip`: 对任意 chunk_size (1..N), round-trip identity 成立. ✅
+- `prop_streaming_restorer_utf8_safe`: 多字节字符不在 char boundary 中间切的 round-trip identity. 🔁→`prop_streaming_restorer_round_trip_utf8` (`src/redact.rs`)
+- `prop_streaming_restorer_multi_mock`: 多 mock 在同一段文本中的 round-trip identity. 🔁→`prop_streaming_restorer_round_trip_multi_mock` + `restorer_round_trip_on_multiple_mocks_in_one_chunk` (`src/redact.rs`)
+- `prop_streaming_restorer_per_block_isolated`: 不同 block 的 restorer 状态独立 (block 间 mock 边界互不干扰). ⏳
 
 ---
 
@@ -310,20 +346,20 @@
 **陈述**: StreamTranslate 必须正确处理 TCP 切片 — 一个 SSE 帧可能被切成多个 chunk, 一个 chunk 也可能含多帧. 客户端最终看到的帧序列与上游发出的帧序列语义等价.
 
 **Properties**:
-- `prop_arbitrary_chunk_split_equivalence`: 对任意 chunk 切分 (含 1-byte 切分), StreamScan 累积结果 == 整体一次性 feed 结果.
-- `prop_stream_translate_chunk_split_equivalence`: 对任意 chunk 切分, StreamTranslate 输出 == 整体一次性 feed 结果.
-- `prop_crlf_lf_both_accepted`: SSE 帧终止符 CRLF 和 LF 都被正确识别.
+- `prop_arbitrary_chunk_split_equivalence`: 对任意 chunk 切分 (含 1-byte 切分), StreamScan 累积结果 == 整体一次性 feed 结果. ✅
+- `prop_stream_translate_chunk_split_equivalence`: 对任意 chunk 切分, StreamTranslate 输出 == 整体一次性 feed 结果. ✅
+- `prop_crlf_lf_both_accepted`: SSE 帧终止符 CRLF 和 LF 都被正确识别. 🔁→`find_terminator_crlf_crlf` + `translate_handles_crlf_sse_frames` (`src/codec/stream/mod.rs`)
 
 ### STR-2 StreamScan 累积正确
 
 **陈述**: 流式 SSE 经 StreamScan 累积的 IrResponse 必须与非流式路径的 IrResponse 语义等价 (即: 流式累积是 resp_parsed 字段的真相来源).
 
 **Properties**:
-- `prop_stream_scan_equals_non_streaming_parse`: 对任意合法 SSE 流, StreamScan snapshot == reader.read_response(累积的完整 SSE 字节).
-- `prop_stream_scan_accumulates_text`: 文本 token 跨 chunk 累积正确.
-- `prop_stream_scan_accumulates_tool_use`: tool_use input JSON 部分片段跨 chunk 累积正确.
-- `prop_stream_scan_include_usage_chunk`: OpenAI include_usage chunk 正确更新 usage (terminal delta input_tokens=0 时 backfill).
-- `prop_stream_scan_ignores_post_stop_noise`: stop event 后的噪声 chunk 被忽略.
+- `prop_stream_scan_equals_non_streaming_parse`: 对任意合法 SSE 流, StreamScan snapshot == reader.read_response(累积的完整 SSE 字节). ✅
+- `prop_stream_scan_accumulates_text`: 文本 token 跨 chunk 累积正确. ✅
+- `prop_stream_scan_accumulates_tool_use`: tool_use input JSON 部分片段跨 chunk 累积正确. ✅
+- `prop_stream_scan_include_usage_chunk`: OpenAI include_usage chunk 正确更新 usage (terminal delta input_tokens=0 时 backfill). ✅
+- `prop_stream_scan_ignores_post_stop_noise`: stop event 后的噪声 chunk 被忽略. ✅
 
 ### STR-3 流式错误降级 (best-effort, 不泄漏)
 
@@ -332,24 +368,24 @@
 > **理想 vs 现状**: 此契约是理想目标. 当前实现中 non-2xx SSE fallback 路径会原样返回上游字节 (含 mock), 是已知 gap.
 
 **Properties**:
-- `prop_non_2xx_sse_no_mock_to_client`: non-2xx SSE 响应的客户端可见 body 中不含任何 mock 字符串.
-- `prop_upstream_disconnect_no_mock_leak`: 上游断连后, 客户端可见 body 中不含 mock.
-- `prop_upstream_timeout_no_mock_leak`: 上游超时后, 客户端可见 body 中不含 mock.
+- `prop_non_2xx_sse_no_mock_to_client`: non-2xx SSE 响应的客户端可见 body 中不含任何 mock 字符串. ⏳
+- `prop_upstream_disconnect_no_mock_leak`: 上游断连后, 客户端可见 body 中不含 mock. ⏳
+- `prop_upstream_timeout_no_mock_leak`: 上游超时后, 客户端可见 body 中不含 mock. ⏳
 
 ### STR-4 缓冲溢出 abort
 
 **陈述**: reassembly 缓冲超过 MAX_BUF (16 MiB) 时, StreamTranslate 必须 abort 而非 OOM.
 
 **Properties**:
-- `prop_max_buf_overflow_aborts`: 上游发送无终止符字节流超过 MAX_BUF 时, StreamTranslate abort, 进程存活.
+- `prop_max_buf_overflow_aborts`: 上游发送无终止符字节流超过 MAX_BUF 时, StreamTranslate abort, 进程存活. 🔁→`prop_max_buf_overflow_aborts_openai_ingress` + `prop_max_buf_overflow_aborts_anthropic_ingress` (`src/codec/fwd_streaming_property.rs`)
 
 ### STR-5 流式 reader 多 tool_call 索引分配
 
 **陈述**: OpenAI 流式响应中多个并行 tool_call 必须被 reader 分配独立的 IR block index (用于后续 writer 透传到 wire 的 `tool_calls[].index`, 保证客户端按 index 聚合时不合并).
 
 **Properties**:
-- `prop_stream_reader_assigns_distinct_block_index`: 流式响应中 N (≥2) 个并行 tool_call 经 reader 解析后, 每个 tool_call 在 IR 中有独立的 block index.
-- `prop_stream_reader_mixed_text_and_tool_call_indices_correct`: 文本 + 多 tool_call 混合流的 block index 不冲突.
+- `prop_stream_reader_assigns_distinct_block_index`: 流式响应中 N (≥2) 个并行 tool_call 经 reader 解析后, 每个 tool_call 在 IR 中有独立的 block index. ✅
+- `prop_stream_reader_mixed_text_and_tool_call_indices_correct`: 文本 + 多 tool_call 混合流的 block index 不冲突. ✅
 
 > **历史 bug**: 9712c52. 注意此契约只覆盖 reader 侧. writer 侧"把 IR block index 透传到 wire `tool_calls[].index`"由 FWD-1/FWD-2 的 byte-exact property 守卫.
 
@@ -364,38 +400,38 @@
 **陈述**: 一个 Node 的 request 增量 (req_delta) 与 response 必须独立存储, 不捏造等式. response 完成与否不影响 req_delta 的可用性.
 
 **Properties**:
-- `prop_node_has_req_delta_even_without_response`: 即使 response 未完成 / 失败, req_delta 仍可查询.
-- `prop_response_attached_independently`: attach_response 不修改 req_delta.
+- `prop_node_has_req_delta_even_without_response`: 即使 response 未完成 / 失败, req_delta 仍可查询. 🔁→`nodeview_defaults_when_no_response_attached` (`src/dag/mod.rs`)
+- `prop_response_attached_independently`: attach_response 不修改 req_delta. 🔁→`attach_response_populates_nodeview_and_response` + `attach_response_can_be_called_twice_overwrites` (`src/dag/mod.rs`)
 
 ### CDAG-2 Merkle prefix hash 只基于 req_delta
 
 **陈述**: Node 的 own_hash 与 prefix_hash 只从 req_delta (MessageRef 序列) 计算, response 不参与 parent 查找.
 
 **Properties**:
-- `prop_prefix_hash_invariant_to_response`: 同一 req_delta + 不同 response → 同一 prefix_hash.
-- `prop_parent_found_by_prefix_hash`: push 时 Merkle prefix hash 找 parent 正确 (线性链 / 多跳链 / fork).
+- `prop_prefix_hash_invariant_to_response`: 同一 req_delta + 不同 response → 同一 prefix_hash. ⏳
+- `prop_parent_found_by_prefix_hash`: push 时 Merkle prefix hash 找 parent 正确 (线性链 / 多跳链 / fork). 🔁→`dag_push_linear_extension_finds_parent` / `dag_push_single_node_no_parent` / `dag_push_unrelated_messages_creates_new_root` / `dag_multi_hop_parent_chain` (`src/dag/mod.rs`)
 
 ### CDAG-3 Block refcount 一致
 
 **陈述**: BlockPool 的引用计数在 intern 时 ++, 淘汰时按 req_delta + response message 分别递减. 任何时刻 refcount ≥ 0.
 
 **Properties**:
-- `prop_refcount_positive_after_push_sequence`: 任意 push 序列后, 所有 block refcount ≥ 0.
-- `prop_refcount_zero_blocks_reclaimed`: refcount=0 的 block 被回收.
+- `prop_refcount_positive_after_push_sequence`: 任意 push 序列后, 所有 block refcount ≥ 0. 🔁→`prop_dag_refcount_positive_after_push_sequence` (`src/dag/mod.rs`)
+- `prop_refcount_zero_blocks_reclaimed`: refcount=0 的 block 被回收. 🔁→`dag_prefix_block_refcount_no_leak_after_evict` + `dag_fifo_eviction_releases_blocks` (`src/dag/mod.rs`)
 
 ### CDAG-4 req_delta 不可变
 
 **陈述**: Node 的 req_delta 入 DAG 后永不修改 (类型系统强制 `Arc<[MessageRef]>`).
 
 **Properties**:
-- `prop_req_delta_immutable_after_push`: push 后任意时刻查询 req_delta, 内容恒等于 push 时的内容.
+- `prop_req_delta_immutable_after_push`: push 后任意时刻查询 req_delta, 内容恒等于 push 时的内容. 🔁→`Arc<[MessageRef]>` 类型级保证 (无 mut API, 陈述自带); 运行时专项测试缺失
 
 ### CDAG-5 redact_seed 可重现
 
 **陈述**: 给定 (req_delta, policy, seed) 三元组, RedactionMap 完全确定. seed=0 表示 passthrough (无 redact).
 
 **Properties**:
-- `prop_redact_map_reproducible_from_seed`: 给定三元组, derive_redact_map 产出同一 RedactionMap.
+- `prop_redact_map_reproducible_from_seed`: 给定三元组, derive_redact_map 产出同一 RedactionMap. ✅
 
 ### CDAG-6 hash collision 处置
 
@@ -404,7 +440,7 @@
 > **实现**: `BlockPool::intern` 用 `assert!` (非 `debug_assert!`) 比对 hash 命中时的 block 内容, 不一致即 panic. 选择 panic 而非 log+skip: collision 属哈希函数 bug, 一旦真发生宁可暴露也不要静默继续 (静默会让两个不同 block 共享 hash, 引发难定位的数据损坏).
 
 **Properties**:
-- `prop_collision_detected_in_release`: release build 下 hash collision 也被检测 (不静默覆盖). ✅ `assert!` 在 release 也运行.
+- `prop_collision_detected_in_release`: release build 下 hash collision 也被检测 (不静默覆盖). 🔁→`block_pool_intern` 的 `assert!` (release 也运行, `src/dag/pool.rs`; 非 debug_assert)
 
 ### CDAG-7 孤儿节点可识别
 
@@ -413,16 +449,16 @@
 > **理想 vs 现状**: `NodeView::is_orphan` 未实现, 当前孤儿节点的 full_request_messages 返回 None.
 
 **Properties**:
-- `prop_orphan_node_identifiable`: parent 不存在的 node 被标记为 is_orphan.
-- `prop_orphan_node_degrades_gracefully`: 孤儿节点的 timeline 查询返回降级视图 (而非 panic / 残缺数据).
+- `prop_orphan_node_identifiable`: parent 不存在的 node 被标记为 is_orphan. ⏳
+- `prop_orphan_node_degrades_gracefully`: 孤儿节点的 timeline 查询返回降级视图 (而非 panic / 残缺数据). ⏳
 
 ### CDAG-8 session 聚类稳定
 
 **陈述**: Session id 由根 node 的 prefix_hash 决定 (稳定标识). 同一会话的 N 轮请求, 其 leaf node 前移时 session id 不变.
 
 **Properties**:
-- `prop_session_id_stable_across_rounds`: 同一会话 N (≥3) 轮 push 后, session id 恒等于根 node 决定的 id.
-- `prop_session_fork_creates_new_session`: fork (前缀相同但后续不同) 创建新 session.
+- `prop_session_id_stable_across_rounds`: 同一会话 N (≥3) 轮 push 后, session id 恒等于根 node 决定的 id. ✅
+- `prop_session_fork_creates_new_session`: fork (前缀相同但后续不同) 创建新 session. 🔁→`prop_session_fork_creates_new_session_id` (`src/dag/mod.rs`)
 
 ---
 
@@ -435,46 +471,46 @@
 **陈述**: ForwardRecord 的 JSON shape 必须稳定, 不随 DAG 内部结构变化漂移.
 
 **Properties**:
-- `prop_forward_record_json_shape_backward_compat`: 旧版序列化数据 (无 resp_parsed / redactions 字段) 仍能反序列化为合法 ForwardRecord.
-- `prop_forward_record_no_internal_leak`: ForwardRecord 不暴露 DAG 内部类型 (BlockHash / MessageRef 等).
+- `prop_forward_record_json_shape_backward_compat`: 旧版序列化数据 (无 resp_parsed / redactions 字段) 仍能反序列化为合法 ForwardRecord. 🔁→`legacy_json_without_redactions_deserializes_to_empty_vec` (`src/record.rs`; 仅 redactions 字段, resp_parsed 缺省兼容由 serde default 承载无专测)
+- `prop_forward_record_no_internal_leak`: ForwardRecord 不暴露 DAG 内部类型 (BlockHash / MessageRef 等). ⏳
 
 ### DTO-2 redactions 字段 SSOT 派生
 
 **陈述**: `redactions: Vec<(mock, secret_id)>` 必须从 RedactionMap SSOT 派生, 永不在前端 / API 层重新计算.
 
 **Properties**:
-- `prop_redactions_match_redaction_map`: redactions 字段的内容与 RedactionMap 一一对应 (consistency-check feature flag 守卫).
-- `prop_redactions_no_real_secret_value`: redactions 字段不含真实 secret value, 仅 (mock, secret_id) tuple.
+- `prop_redactions_match_redaction_map`: redactions 字段的内容与 RedactionMap 一一对应 (consistency-check feature flag 守卫). 🔁→`redact_populates_record_redactions_field` (`tests/integration.rs`) + consistency-check 守卫 `assert_redactions_match_map` (`src/proxy/recorder.rs`, VIEW-2 表)
+- `prop_redactions_no_real_secret_value`: redactions 字段不含真实 secret value, 仅 (mock, secret_id) tuple. 🔁→`redact_populates_record_redactions_field` 内嵌断言 "redactions must not leak real secret" (`tests/integration.rs`)
 
 ### DTO-3 resp_parsed 从 StreamScan 派生
 
 **陈述**: 流式响应的 `resp_parsed` 必须从 StreamScan 累积派生. 非流式响应从 reader.read_response(raw_body) 计算.
 
 **Properties**:
-- `prop_streaming_resp_parsed_equals_stream_scan_snapshot`: 流式 resp_parsed == StreamScan snapshot.
-- `prop_non_streaming_resp_parsed_equals_reader_parse`: 非流式 resp_parsed == reader.read_response(raw_resp_body).
-- `prop_resp_parsed_consistency_check`: resp_parsed 字段必须能通过 consistency-check 断言 (与原始数据视图一致).
+- `prop_streaming_resp_parsed_equals_stream_scan_snapshot`: 流式 resp_parsed == StreamScan snapshot. 🔁→`streaming_parsed_view_accumulates_text` (`tests/integration.rs`; 仅 text 累积维度)
+- `prop_non_streaming_resp_parsed_equals_reader_parse`: 非流式 resp_parsed == reader.read_response(raw_resp_body). 🔁→`assert_resp_parsed_matches_source_nonstream` (`src/proxy/recorder.rs`, consistency-check) + `web_api_records_view_parsed_openai_returns_structured`
+- `prop_resp_parsed_consistency_check`: resp_parsed 字段必须能通过 consistency-check 断言 (与原始数据视图一致). 🔁→`assert_resp_parsed_matches_source_nonstream` (`src/proxy/recorder.rs`, CI `just check-features` 执行)
 
 ### DTO-4 preview 提取 best-effort
 
 **陈述**: `preview` 字段从 req_body 提取 (sidebar 主标题). 必须满足 best-effort 永不 panic, 假设不成立时降级.
 
 **Properties**:
-- `prop_preview_extracts_last_user_message`: 优先取最后一条 user message (前 48 chars).
-- `prop_preview_fallback_when_no_user`: 无 user 时回退到最后一条有文本的 message.
-- `prop_preview_fallback_compression_marker`: 压缩 marker ("What did we do so far?") 命中时回退到最后一条 assistant 摘要.
-- `prop_preview_fallback_method_path`: 提取失败回退到 method + path.
-- `prop_preview_push_time_snapshot_matches_reextract`: push 时存的 preview 与之后从 req_body_raw 重新提取的结果一致 (consistency-check 守卫). 例外: `round_role = Tool` 的轮次, `push_messages` 会用 `extract_tool_use_name` 覆盖 preview 为 tool name, 覆盖后不再等于 req_body_raw 提取结果 — 此 drift 是预期的 (详见 VIEW-2 脚注 ¹).
+- `prop_preview_extracts_last_user_message`: 优先取最后一条 user message (前 48 chars). 🔁→`extract_preview_picks_last_user_message` (`src/derive.rs`)
+- `prop_preview_fallback_when_no_user`: 无 user 时回退到最后一条有文本的 message. 🔁→`extract_preview_no_user_falls_back_to_tool_result` (`src/derive.rs`)
+- `prop_preview_fallback_compression_marker`: 压缩 marker ("What did we do so far?") 命中时回退到最后一条 assistant 摘要. 🔁→`extract_preview_compressed_session_falls_back_to_last_assistant` (`src/derive.rs`)
+- `prop_preview_fallback_method_path`: 提取失败回退到 method + path. ⏳
+- `prop_preview_push_time_snapshot_matches_reextract`: push 时存的 preview 与之后从 req_body_raw 重新提取的结果一致 (consistency-check 守卫). 例外: `round_role = Tool` 的轮次, `push_messages` 会用 `extract_tool_use_name` 覆盖 preview 为 tool name, 覆盖后不再等于 req_body_raw 提取结果 — 此 drift 是预期的 (详见 VIEW-2 脚注 ¹). 🔁→`assert_preview_model_match_source` (`src/proxy/recorder.rs`, consistency-check, VIEW-2 表 ¹脚注)
 
 ### DTO-5 req_delta_messages 切片正确
 
 **陈述**: timeline 路径的 `req_delta_messages` 必须是本轮新增的 messages (从 req_body_raw 末尾截取), 同协议路径下与 IR req_delta 一致.
 
 **Properties**:
-- `prop_delta_slice_correct_same_proto`: 同协议路径下, req_delta_messages 与 IR req_delta (resolve + ingress writer 重序列化) 一致.
-- `prop_delta_includes_system_at_root`: 根节点 (start > 0) 的 delta 补回 system prompt.
-- `prop_delta_handles_non_json_body`: 非 JSON body 时返回空 vec (不 panic).
-- `prop_delta_handles_count_mismatch`: messages 数 < req_delta_count 时返回空 vec.
+- `prop_delta_slice_correct_same_proto`: 同协议路径下, req_delta_messages 与 IR req_delta (resolve + ingress writer 重序列化) 一致. ✅
+- `prop_delta_includes_system_at_root`: 根节点 (start > 0) 的 delta 补回 system prompt. ✅
+- `prop_delta_handles_non_json_body`: 非 JSON body 时返回空 vec (不 panic). ✅
+- `prop_delta_handles_count_mismatch`: messages 数 < req_delta_count 时返回空 vec. ✅
 
 ### DTO-6 跨协议 delta 切片行为定义
 
@@ -483,15 +519,15 @@
 > **理想 vs 现状**: 当前实现 delta 可能包含前序轮消息 (静默错位), 是已知 gap. 理想目标是从 IR req_delta resolve + ingress writer 重序列化.
 
 **Properties**:
-- `prop_cross_proto_delta_no_silent_misalignment`: 跨协议路径下 delta 切片要么正确, 要么显式标记降级 (不静默错位).
+- `prop_cross_proto_delta_no_silent_misalignment`: 跨协议路径下 delta 切片要么正确, 要么显式标记降级 (不静默错位). ⏳
 
 ### DTO-7 session title 取根 node
 
 **陈述**: session title 必须取会话根 node (最早 round) 的首条 user msg preview. 多轮对话中 title 不随每轮新问题漂移.
 
 **Properties**:
-- `prop_session_title_from_root_node`: session.title == 根 node 的首条 user msg preview.
-- `prop_session_title_stable_across_rounds`: 同一 session N (≥3) 轮 push 后 title 不变.
+- `prop_session_title_from_root_node`: session.title == 根 node 的首条 user msg preview. 🔁→`assert_session_title_matches_root_preview` (`src/dag/mod.rs`, consistency-check, VIEW-2 表) + `需求 6+7` (`tests/webui/im-ui.spec.ts`)
+- `prop_session_title_stable_across_rounds`: 同一 session N (≥3) 轮 push 后 title 不变. 🔁→`I3 守卫` (`tests/webui/im-ui.spec.ts`; 3 轮后仍按根 marker 定位会话 = title 不随轮次漂移)
 
 ### DTO-8 RecordSummary 轻量化 (**已作废**)
 
@@ -515,10 +551,10 @@
 - `Disabled`: 从 effective view 完全排除.
 
 **Properties**:
-- `prop_default_dynamic_wins`: Default 模式下, static + dynamic 都有同 id → 用 dynamic.
-- `prop_default_static_fallback`: Default 模式下, 仅 static 有 → 用 static.
-- `prop_prefer_static_ignores_dynamic`: PreferStatic 模式下, 用 static 原值.
-- `prop_disabled_excluded`: Disabled 模式下, id 不出现在 effective view.
+- `prop_default_dynamic_wins`: Default 模式下, static + dynamic 都有同 id → 用 dynamic. ✅
+- `prop_default_static_fallback`: Default 模式下, 仅 static 有 → 用 static. ✅
+- `prop_prefer_static_ignores_dynamic`: PreferStatic 模式下, 用 static 原值. ✅
+- `prop_disabled_excluded`: Disabled 模式下, id 不出现在 effective view. ✅
 
 ### CFG-2 Effective source 4 种标签正确
 
@@ -529,8 +565,8 @@
 - `static_preferred`: static + dynamic 都有, decision=PreferStatic → 用 static.
 
 **Properties**:
-- `prop_source_label_matches_actual_origin`: source 标签 == 实际生效值的来源.
-- `prop_runtime_assert_effective_value_matches_source`: 在 consistency-check 模式下, 断言 effective_view[i].value == 对应来源的 value.
+- `prop_source_label_matches_actual_origin`: source 标签 == 实际生效值的来源. ✅
+- `prop_runtime_assert_effective_value_matches_source`: 在 consistency-check 模式下, 断言 effective_view[i].value == 对应来源的 value. ✅
 
 ### CFG-3 CRUD 操作语义
 
@@ -541,19 +577,19 @@
 - PATCH `/{id}/decision` 切换对 static id 的决策.
 
 **Properties**:
-- `prop_post_conflict_with_static_returns_409`: POST 创建与 static 冲突的 id → 409.
-- `prop_put_forks_dynamic_when_id_in_static`: PUT 编辑 static id → 创建 dynamic override.
-- `prop_delete_static_baseline_rejected`: DELETE static 基线存在的 id (static-only / static+override) → 409; dynamic-only → 204 且从 effective 消失.
-- `prop_patch_decision_toggles_override_mode`: PATCH decision 正确切换 OverrideMode.
+- `prop_post_conflict_with_static_returns_409`: POST 创建与 static 冲突的 id → 409. ✅
+- `prop_put_forks_dynamic_when_id_in_static`: PUT 编辑 static id → 创建 dynamic override. ✅
+- `prop_delete_static_baseline_rejected`: DELETE static 基线存在的 id (static-only / static+override) → 409; dynamic-only → 204 且从 effective 消失. ✅
+- `prop_patch_decision_toggles_override_mode`: PATCH decision 正确切换 OverrideMode. ✅
 
 ### CFG-4 持久化原子性
 
 **陈述**: 先写 state.toml (atomic write + fsync), 再更新内存. 写失败时内存回滚.
 
 **Properties**:
-- `prop_persist_failure_rolls_back_memory`: state.toml 写失败时, 内存层不留下半提交状态.
-- `prop_atomic_write_no_corrupt_file`: atomic_write 用 tmp + rename, 中途崩溃不留下损坏的 state.toml.
-- `prop_persist_failure_rollback_under_concurrency`: 跨表并发写时, 一表 persist 失败回滚不影响另一表 in-flight 写入.
+- `prop_persist_failure_rolls_back_memory`: state.toml 写失败时, 内存层不留下半提交状态. ✅
+- `prop_atomic_write_no_corrupt_file`: atomic_write 用 tmp + rename, 中途崩溃不留下损坏的 state.toml. ✅
+- `prop_persist_failure_rollback_under_concurrency`: 跨表并发写时, 一表 persist 失败回滚不影响另一表 in-flight 写入. ✅
 
 > **理想 vs 现状**: 本 property 的完整"跨表"覆盖 (装配 SecretTable + ProviderTable 共享 persist_lock + Decisions + 同一 state_path) 尚未实现; 当前测试降级为单表 N 线程并发, 覆盖 "persist_lock 串行 RMW + 失败回滚" 核心不变量, 但未触及跨表 state.toml 文件交互 (一表 atomic_write 留下损坏文件会让另一表 load_or_empty 读到错误状态) 与共享 Decisions Arc 的跨表隔离. 跨表完整覆盖作为后续工作. 成功路径的"并发不丢更新"由 CFG-5 `prop_concurrent_upserts_no_lost_update` 覆盖.
 
@@ -562,9 +598,9 @@
 **陈述**: SecretTable 与 ProviderTable 共享 persist_lock (串行 RMW) 与 Decisions (同一份内存). 跨表并发写不丢更新.
 
 **Properties**:
-- `prop_concurrent_upserts_no_lost_update`: 单表 N 线程并发 upsert 不丢更新 (persist_lock 串行 RMW 基线).
-- `prop_concurrent_writes_serialized_via_persist_lock`: 跨表 (SecretTable + ProviderTable 共享 persist_lock + 同一 state_path + 同一 Decisions Arc, 与 server.rs 启动装配一致) 并发 upsert — 两表 effective 各含全部项 (跨表不丢更新) + 从磁盘 `load_or_empty` 重载得到的 DynamicState 同时含两表 dynamic 段 (persist_lock 串行 RMW, state.toml 不撕裂, 无跨表段覆盖).
-- `prop_cross_table_shared_decisions_isolation`: 共享 Decisions Arc 的跨表并发 `set_decision` (各改自己子表) 互不串扰 — secret id 的 decision 不误写到 providers 子表, 反之亦然; 合并后 state.toml 同时保留两子表 decision.
+- `prop_concurrent_upserts_no_lost_update`: 单表 N 线程并发 upsert 不丢更新 (persist_lock 串行 RMW 基线). ✅
+- `prop_concurrent_writes_serialized_via_persist_lock`: 跨表 (SecretTable + ProviderTable 共享 persist_lock + 同一 state_path + 同一 Decisions Arc, 与 server.rs 启动装配一致) 并发 upsert — 两表 effective 各含全部项 (跨表不丢更新) + 从磁盘 `load_or_empty` 重载得到的 DynamicState 同时含两表 dynamic 段 (persist_lock 串行 RMW, state.toml 不撕裂, 无跨表段覆盖). ✅
+- `prop_cross_table_shared_decisions_isolation`: 共享 Decisions Arc 的跨表并发 `set_decision` (各改自己子表) 互不串扰 — secret id 的 decision 不误写到 providers 子表, 反之亦然; 合并后 state.toml 同时保留两子表 decision. ✅
 
 > **覆盖现状**: CFG-5 的两个 property (`prop_concurrent_writes_serialized_via_persist_lock` + `prop_cross_table_shared_decisions_isolation`) 已实现跨表完整覆盖 — 装配方式与 `server.rs` 生产路径一致 (共享 `Arc<Mutex<()>>` persist_lock + 共享 `Arc<RwLock<Decisions>>` + 同一 state_path). 上方 CFG-4 "理想 vs 现状" 注记中提到的 "跨表 state.toml 文件交互" 与 "共享 Decisions Arc 的跨表隔离" 现由本节两个 property 覆盖; CFG-4 自身的跨表失败回滚 (`prop_persist_failure_rollback_under_concurrency`) 仍作为后续工作.
 
@@ -579,35 +615,35 @@
 **陈述**: GET API 永不返回 secret 的 `value` / provider 的 `api_key` 真实值, 用 mask_value 占位.
 
 **Properties**:
-- `prop_get_secret_masks_value`: GET /secrets 返回的 value 字段是 mask (如 `sk-****`), 非真实值.
-- `prop_get_provider_masks_api_key`: GET /providers 返回的 api_key 字段是 mask.
-- `prop_no_real_secret_in_any_json_response`: 任意 GET 响应 (含 ForwardRecord / EffectiveSnapshot / SessionSummary 等) 不含真实 secret value.
-- `prop_no_real_api_key_in_any_json_response`: 同上, 不含真实 api_key.
+- `prop_get_secret_masks_value`: GET /secrets 返回的 value 字段是 mask (如 `sk-****`), 非真实值. 🔁→`mask_value_hides_full_content` (`src/secrets.rs`) + `secrets_api_create_lists_update_delete` 内嵌 value_masked 断言 (`tests/integration.rs`)
+- `prop_get_provider_masks_api_key`: GET /providers 返回的 api_key 字段是 mask. 🔁→`effective_snapshot_includes_provenance_and_masks_api_key` (`src/provider.rs`) + `providers_api_lists_existing` 内嵌 api_key_masked 断言 (`tests/integration.rs`)
+- `prop_no_real_secret_in_any_json_response`: 任意 GET 响应 (含 ForwardRecord / EffectiveSnapshot / SessionSummary 等) 不含真实 secret value. ⏳
+- `prop_no_real_api_key_in_any_json_response`: 同上, 不含真实 api_key. ⏳
 
 ### SEC-2 RedactError 不携带 secret 明文
 
 **陈述**: RedactError 只携带 secret_id + reason, 类型系统级保证不含 secret value.
 
 **Properties**:
-- `prop_redact_error_struct_has_no_value_field`: RedactError struct 字段集合不含 value.
-- `prop_redact_error_debug_no_secret_leak`: RedactError 的 Debug 输出不含 secret 明文.
+- `prop_redact_error_struct_has_no_value_field`: RedactError struct 字段集合不含 value. 🔁→`RedactError` 类型级保证 (enum 无 value 变体, 陈述自带); 运行时专项测试缺失
+- `prop_redact_error_debug_no_secret_leak`: RedactError 的 Debug 输出不含 secret 明文. ✅
 
 ### SEC-3 assert/panic/log 不泄漏 secret
 
 **陈述**: 任何 assert / panic / log 消息不得包含 secret 明文.
 
 **Properties**:
-- `prop_assert_messages_no_secret`: assert/panic 消息中不含 secret.value (即使用于诊断).
-- `prop_log_messages_no_secret`: tracing log 不输出 secret.value.
+- `prop_assert_messages_no_secret`: assert/panic 消息中不含 secret.value (即使用于诊断). ✅ (consistency-check feature gate, CI `just check-features` 执行)
+- `prop_log_messages_no_secret`: tracing log 不输出 secret.value. ✅
 
 ### SEC-4 headers 脱敏
 
 **陈述**: 记录存储的 HTTP headers 中, auth/cookie 类敏感 header 必须脱敏为 `<redacted>`.
 
 **Properties**:
-- `prop_auth_headers_redacted_in_record`: Authorization / x-api-key / x-goog-api-key / cookie 类 header 在 record 中为 `<redacted>`.
-- `prop_set_cookie_redacted`: 上游 Set-Cookie header 在 record 中脱敏.
-- `prop_custom_token_headers_redacted`: 含 "token" / "secret" 关键词的自定义 header 也脱敏.
+- `prop_auth_headers_redacted_in_record`: Authorization / x-api-key / x-goog-api-key / cookie 类 header 在 record 中为 `<redacted>`. 🔁→`redact_headers_masks_secrets` (`src/proxy/helpers.rs`; authorization / x-api-key / x-goog-api-key)
+- `prop_set_cookie_redacted`: 上游 Set-Cookie header 在 record 中脱敏. ⏳
+- `prop_custom_token_headers_redacted`: 含 "token" / "secret" 关键词的自定义 header 也脱敏. ✅
 
   注: "key" 关键词过于宽泛 (会误伤 `x-request-key-hash` 等正常 header), 故不纳入关键词匹配; 已知 key 类 header (如 `x-api-key` / `x-goog-api-key` / `api-key` / `x-anthropic-api-key`) 由 `prop_auth_headers_redacted_in_record` 的显式黑名单覆盖.
 
@@ -616,16 +652,16 @@
 **陈述**: DAG Node 持有的 PolicySnapshot (含 secret value) 仅后端用, 永不序列化进 WebUI DTO.
 
 **Properties**:
-- `prop_policy_snapshot_not_in_forward_record`: ForwardRecord JSON 不含 PolicySnapshot 字段.
-- `prop_policy_snapshot_not_in_session_summary`: SessionSummary JSON 不含 PolicySnapshot.
+- `prop_policy_snapshot_not_in_forward_record`: ForwardRecord JSON 不含 PolicySnapshot 字段. ✅
+- `prop_policy_snapshot_not_in_session_summary`: SessionSummary JSON 不含 PolicySnapshot. ✅
 
 ### SEC-6 本地监听 + 内部 URL 不外泄
 
 **陈述**: 默认监听 127.0.0.1. `/__sg/*` 未匹配子路径返回 404, 绝不进入 forward.
 
 **Properties**:
-- `prop_default_host_localhost`: 默认 host=127.0.0.1.
-- `prop_internal_url_404_no_forward`: `/__sg/unknown` → 404, 不发送到上游.
+- `prop_default_host_localhost`: 默认 host=127.0.0.1. ✅
+- `prop_internal_url_404_no_forward`: `/__sg/unknown` → 404, 不发送到上游. 🔁→`web_namespace_not_forwarded_to_upstream` + `unmatched_path_returns_404` (`tests/integration.rs`)
 
 ---
 
@@ -638,9 +674,9 @@
 **陈述**: 对 preview / delta / tool_name 等尝试性解析, 缺字段 / 类型不符 / 空数组 / 越界 都返回 None 或空, 由调用方走 fallback.
 
 **Properties**:
-- `prop_preview_never_panics`: extract_preview_and_model 对任意字节输入 (含非 JSON / 空 / 损坏) 不 panic.
-- `prop_delta_never_panics`: extract_delta_messages_from_raw 同上.
-- `prop_tool_name_never_panics`: toolNameOfRound 对任意输入返回合法字符串 (含 '?').
+- `prop_preview_never_panics`: extract_preview_and_model 对任意字节输入 (含非 JSON / 空 / 损坏) 不 panic. 🔁→`prop_preview_never_panics_arbitrary_bytes` + `prop_preview_never_panics_perturbed_json` (`src/derive.rs`)
+- `prop_delta_never_panics`: extract_delta_messages_from_raw 同上. 🔁→`prop_delta_never_panics_arbitrary` + `prop_delta_never_panics_chat_json_edge_slice` (`src/derive.rs`)
+- `prop_tool_name_never_panics`: toolNameOfRound 对任意输入返回合法字符串 (含 '?'). 🔁→`extract_tool_use_name_empty_returns_none` / `extract_tool_use_name_no_tool_use_returns_none` (`src/derive.rs`; 纯 find_map 无 panic 路径)
 
 > **理想 vs 现状**: tool name 推断由后端 `extract_preview_and_model` 承担,
 > 其永不 panic 由 `prop_preview_never_panics` 守卫. 原 property 文本保留以维持编号稳定 (§0.5).
@@ -652,9 +688,9 @@
 2. 假设不成立时的降级行为.
 
 **Properties** (人工审查项):
-- `prop_extract_delta_messages_has_assumption_comment`: extract_delta_messages_from_raw 函数级注释含假设声明.
-- `prop_extract_preview_has_assumption_comment`: 同上.
-- `prop_tool_name_has_assumption_comment`: 同上.
+- `prop_extract_delta_messages_has_assumption_comment`: extract_delta_messages_from_raw 函数级注释含假设声明. 🔁→人工审查项: `extract_delta_messages_from_raw` 函数级注释含假设声明与降级行为 (`src/derive.rs`)
+- `prop_extract_preview_has_assumption_comment`: 同上. 🔁→人工审查项: `extract_preview_and_model` doc 含失败容错声明 (`src/derive.rs`)
+- `prop_tool_name_has_assumption_comment`: 同上. 🔁→人工审查项: `extract_tool_use_name` doc 含降级声明 (`src/derive.rs`)
 
 > **理想 vs 现状**: 假设声明载体是 `extract_preview_and_model` 的函数级注释,
 > 由 `prop_extract_preview_has_assumption_comment` 覆盖. 原 property 文本保留以维持编号稳定 (§0.5).
@@ -670,8 +706,8 @@
 **陈述**: 删除原始数据前, 必须用 `assert_eq!(derived_view, original_data)` 断言两者相等, 或写专项测试覆盖. 禁止仅凭"视图逻辑应该对"就删除原始数据.
 
 **Properties** (人工审查项 + feature flag):
-- `prop_view_deletion_has_assertion`: 任何"删除原始数据改用派生视图"的重构 commit 必须含 consistency-check 断言.
-- `prop_consistency_check_feature_runs_in_ci`: consistency-check feature flag 在 CI 中独立运行.
+- `prop_view_deletion_has_assertion`: 任何"删除原始数据改用派生视图"的重构 commit 必须含 consistency-check 断言. 🔁→人工审查项 + 既有断言 `assert_redactions_match_map` 等 (`src/proxy/recorder.rs`, VIEW-2 表)
+- `prop_consistency_check_feature_runs_in_ci`: consistency-check feature flag 在 CI 中独立运行. 🔁→CI step `consistency-check feature guard` (`.forgejo/workflows/ci.yml`) + `just check-features`
 
 ### VIEW-2 派生字段 consistency-check 覆盖
 
@@ -692,7 +728,7 @@
 > `extract_preview_and_model(req_body_raw)` 的结果 — 此 drift 是预期的修正, 不属于守卫失败.
 
 **Properties**:
-- `prop_each_derived_field_has_consistency_check`: 上表中每个"待补"字段最终都有 consistency-check 断言.
+- `prop_each_derived_field_has_consistency_check`: 上表中每个"待补"字段最终都有 consistency-check 断言. 🔁→`assert_redactions_match_map` 守卫状态表 (本节 VIEW-2 表格即 SSOT, 派生字段增删走表)
 
 ### VIEW-3 原始数据是核心功能真相
 
@@ -709,31 +745,31 @@
 **陈述**: 会话详情页 (timeline) 渲染的 Bubble 数量必须等于该 Node 对应 HTTP 请求的 IR messages 数组长度.
 
 **Properties**:
-- `prop_bubble_count_equals_ir_messages_length`: 对 N (≥1) 条 IR messages, timeline 渲染 N 个 Bubble.
+- `prop_bubble_count_equals_ir_messages_length`: 对 N (≥1) 条 IR messages, timeline 渲染 N 个 Bubble. 🔁→`I1 守卫` (`tests/webui/im-ui.spec.ts`, 参数化 N=1/3/5)
 
 ### UI-2 sidebar 条目数 == HTTP 请求数
 
 **陈述**: 左边栏每个一级条目 (Session) 下, 二级 + 三级条目总数必须等于归属该 Session 的 HTTP 请求数 (DAG 中以该 Session 叶子为终点的链上 Node 数).
 
 **Properties**:
-- `prop_sidebar_item_count_equals_http_request_count`: 对 M (≥1) 个 HTTP 请求的 Session, sidebar 二级+三级条目总数 == M.
+- `prop_sidebar_item_count_equals_http_request_count`: 对 M (≥1) 个 HTTP 请求的 Session, sidebar 二级+三级条目总数 == M. 🔁→`I2 守卫` (`tests/webui/im-ui.spec.ts`)
 
 ### UI-3 timeline 轮次 DOM 顺序 == 数据顺序 (oldest-first)
 
 **陈述**: timeline 中 `.tl-round` 在 DOM 里的出现顺序必须与 `state.timelineRecords` 完全一致 (oldest-first: 顶部最老, 底部最新).
 
 **Properties**:
-- `prop_timeline_dom_order_append`: append 模式 (新轮次追加) 下 DOM 顺序正确.
-- `prop_timeline_dom_order_prepend`: prepend 模式 (滚到顶加载更早轮次) 下 DOM 顺序正确.
-- `prop_timeline_dom_order_replace`: replace 模式 (切换会话) 下 DOM 顺序正确.
-- `prop_timeline_dom_order_concurrent_fingerprint_mismatch`: 并发请求导致 fingerprint 错配时 DOM 顺序仍正确.
+- `prop_timeline_dom_order_append`: append 模式 (新轮次追加) 下 DOM 顺序正确. 🔁→`I3 守卫` (`tests/webui/im-ui.spec.ts`, append 路径)
+- `prop_timeline_dom_order_prepend`: prepend 模式 (滚到顶加载更早轮次) 下 DOM 顺序正确. ⏳
+- `prop_timeline_dom_order_replace`: replace 模式 (切换会话) 下 DOM 顺序正确. ⏳
+- `prop_timeline_dom_order_concurrent_fingerprint_mismatch`: 并发请求导致 fingerprint 错配时 DOM 顺序仍正确. ⏳
 
 ### UI-4 keyed reconciliation 不破坏 DOM 状态
 
 **陈述**: 自动刷新触发 timeline 更新时, 公共节点的 DOM 完全保留 (scrollTop + 气泡展开状态), 仅新节点插入 / 消失节点删除.
 
 **Properties**:
-- `prop_reconcile_preserves_scrolltop`: 自动刷新前后 scrollTop Δ < 10px. ✅ `im-ui.spec.ts` "需求 1 (B1/B2 根治)".
+- `prop_reconcile_preserves_scrolltop`: 自动刷新前后 scrollTop Δ < 10px. 🔁→`自动刷新期间 scrollTop 保持` (`tests/webui/im-ui.spec.ts` "需求 1 (B1/B2 根治)")
 - `prop_reconcile_preserves_bubble_expand_state`: 已展开的气泡在 reconcile 后仍展开. ✅ `im-ui.spec.ts` "UI-4 prop_reconcile_preserves_bubble_expand_state".
 - `prop_reconcile_correct_for_all_change_modes`: keyed reconciliation 对 append/prepend/replace/完全不同 四种变动模式都正确. ✅ append (I3 守卫) + replace (切换会话, "需求 4") + 完全不同 ("UI-4 prop_reconcile_correct_for_all_change_modes"); prepend (滚到顶 lazy load) 待补.
 
@@ -743,7 +779,7 @@
 
 **Properties**:
 - `prop_detail_height_fixed`: `#detail` height == wrapH, 不依赖 drawerH. ✅ `im-ui.spec.ts` "UI-5 prop_detail_height_fixed".
-- `prop_drawer_overlay_not_in_round`: response drawer DOM 不在 `.tl-round` 子树内. ✅ `im-ui.spec.ts` "需求 3: response 抽屉固定底部" 间接覆盖.
+- `prop_drawer_overlay_not_in_round`: response drawer DOM 不在 `.tl-round` 子树内. 🔁→`需求 3: response 抽屉固定底部` (`tests/webui/im-ui.spec.ts`, 间接覆盖)
 
 ### UI-6 timeline 滚动状态机: followMode 是视口位置的纯派生 (↔ AGENTS.md I5)
 
@@ -756,13 +792,13 @@
 **已知限制 (几何失效区间)**: `contentEnd > wrapH - DRAWER_GAP - DRAWER_MIN_RATIO * wrapH` (短内容 + drawer 已显示) 时, drawer 压到 `minH` 仍遮挡末轮 ≤ `minH + GAP` (≈81px) — 几何上 contentEnd + minH + GAP > wrapH 不可兼得. 由 ROB-* best-effort 兜底, drawer 仍压到 minH 让遮挡最小化.
 
 **Properties**:
-- `prop_follow_initial_on_session_click`: 点 Session → follow + selected 在最新轮. ✅ `im-ui.spec.ts` "UI-6: 点 Session → follow + selected 在最新轮".
-- `prop_pinned_on_manual_scroll_up`: follow 状态下手动向上滚 → pinned. ✅ `im-ui.spec.ts` "UI-6: 手动向上滚 → pinned".
-- `prop_pinned_new_round_no_scroll`: pinned 期间新 round 到达 → scrollTop 不变 + unread badge 显示. ✅ `im-ui.spec.ts` "UI-6: pinned 状态下新 round 到达".
-- `prop_unread_badge_resets_selected`: 点 unread badge → follow + selected 重置到最新轮 + badge 消失. ✅ `im-ui.spec.ts` "UI-6: 点 unread badge".
-- `prop_follow_new_round_auto_scroll`: follow 期间新 round 到达 → 自动滚到底, 无 badge. ✅ `im-ui.spec.ts` "UI-6: follow 状态下新 round 到达".
-- `prop_selected_stable_during_pinned`: pinned 期间点历史轮, 新 round 到达时 selected 不变. ✅ `im-ui.spec.ts` "UI-6: pinned 期间点历史轮".
-- `prop_follow_invariant_under_new_round`: follow 状态在任意新 round 插入后必须保持 (不被翻转、末轮 request 不被 drawer 遮挡). ✅ `im-ui.spec.ts` "UI-6: follow 状态在新 round 插入下不变". 区别于 `prop_follow_new_round_auto_scroll`: 后者只在"长内容稳态"下断言结果 (距底 < 100), 本 property 守卫**机制本身**不被破坏, 且生成器须覆盖短→长跨越边界 (placeholder 高度 0→extremeMaxH 跳变) 这一历史 bug 路径.
+- `prop_follow_initial_on_session_click`: 点 Session → follow + selected 在最新轮. 🔁→`UI-6: 点 Session → follow (滚到底), 无 unread badge` (`tests/webui/im-ui.spec.ts`)
+- `prop_pinned_on_manual_scroll_up`: follow 状态下手动向上滚 → pinned. 🔁→`UI-6: 手动向上滚 → pinned (距底部 > NEAR_BOTTOM_PX)` (`tests/webui/im-ui.spec.ts`)
+- `prop_pinned_new_round_no_scroll`: pinned 期间新 round 到达 → scrollTop 不变 + unread badge 显示. 🔁→`UI-6: pinned 状态下新 round 到达 → unread badge 显示 + selected 不变` (`tests/webui/im-ui.spec.ts`)
+- `prop_unread_badge_resets_selected`: 点 unread badge → follow + selected 重置到最新轮 + badge 消失. 🔁→`UI-6: 点 unread badge → follow + selected 重置到最新轮 + badge 消失` (`tests/webui/im-ui.spec.ts`)
+- `prop_follow_new_round_auto_scroll`: follow 期间新 round 到达 → 自动滚到底, 无 badge. 🔁→`UI-6: follow 状态下新 round 到达 → 自动滚到底, 无 badge` (`tests/webui/im-ui.spec.ts`)
+- `prop_selected_stable_during_pinned`: pinned 期间点历史轮, 新 round 到达时 selected 不变. 🔁→`UI-6: pinned 期间点历史轮 → selected 停在该轮; 新 round 到达时 selected 不变` (`tests/webui/im-ui.spec.ts`)
+- `prop_follow_invariant_under_new_round`: follow 状态在任意新 round 插入后必须保持 (不被翻转、末轮 request 不被 drawer 遮挡). 🔁→`UI-6: follow 状态在新 round 插入下不变` (`tests/webui/im-ui.spec.ts`, 短内容 + 长内容稳态双用例)
 
 ---
 
