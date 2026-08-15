@@ -355,6 +355,7 @@ pub(super) fn log_forward_summary(dag: &ConversationDag, record_id: Uuid) {
         "forward"
     );
 }
+
 /// 发送上游请求, 可选地对"响应头到达"加超时保护. 失败时记录到 DAG 并返回 AppError.
 ///
 /// `header_timeout = None` 时退化为普通 `send().await` (向后兼容 / 测试场景).
