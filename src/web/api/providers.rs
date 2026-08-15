@@ -57,16 +57,21 @@ pub async fn update_provider(
         &id,
         || {
             // api_key / api_key_file 缺省时保留旧值 (避免 WebUI 编辑表单留空意外清空既有 key).
-            // 语义: payload None = 保留; Some(s) (含空串) = 显式覆盖.
-            // 取旧值用 get_effective (返回未脱敏的原始 Provider, 路由层同款).
+            // 语义: payload None = 保留; Some(s) = 显式覆盖 (static 基线下空串的清空
+            // 语义有已知限制, 见下方 api_key 字段注释).
             //
-            // 假设: 本地单用户场景, get_effective 与 upsert_dynamic 之间无并发修改.
+            // #157 关键: 只从 **dynamic 原始条目** (get_dynamic) 回填, 不用 get_effective.
+            // 旧值若是 static 来源, 把已 resolve 的明文搬进 override 会让明文落盘
+            // state.toml; 现在改为 override 不记录该字段 (None), effective 解析时由
+            // `Provider::inherit_from_static` 回落 static (转发仍带旧 key, 行为不变).
+            //
+            // 假设: 本地单用户场景, get_dynamic 与 upsert_dynamic 之间无并发修改.
             // 多用户/并发编辑场景下存在 TOCTOU (旧值可能过期), 但仅导致配置不一致, 无安全影响.
             //
             // 限制: 若 payload 显式提供 api_key (或 api_key_file), 另一字段仍从旧值保留,
             // 可能触发互斥校验报错 (例如旧值有 api_key, 新传 api_key_file). WebUI 不暴露
             // api_key_file 输入, 仅 SDK 直接调用可能触发, 影响低.
-            if let Some(old) = state.providers.get_effective(&id) {
+            if let Some(old) = state.providers.get_dynamic(&id) {
                 if payload.api_key.is_none() {
                     payload.api_key = Some(old.api_key);
                 }
@@ -118,15 +123,20 @@ pub(crate) struct UpsertProviderRequest {
     pub base_url: String,
     /// API key 明文值. 语义因 endpoint 而异:
     /// - POST (create): 省略 (None) 或空串 = 不设置 (适用 Ollama 等本地无 auth 场景).
-    /// - PUT (update): 省略 (None) = 保留旧值; 空串或具体值 = 显式覆盖.
+    /// - PUT (update): 省略 (None) = 保留旧值 — override **不记录**该字段 (不落盘明文,
+    ///   #157), effective 解析由 `inherit_from_static` 回落 static / dynamic 旧值.
+    ///   具体值 = 显式覆盖 (新值落盘 state.toml, 属预期).
+    ///
+    /// 已知限制: static 基线下显式空串 `""` 无法清空 key (会被继承回落 static),
+    /// 停用走 decision=disabled. 详见根 AGENTS.md "#157 已知限制" 条目.
     ///
     /// WebUI 编辑表单依赖此语义: 用户留空 input 时前端发 null, 不破坏既有 key.
     /// 与 `api_key_file` 互斥 (同时设置会在 `validate()` 报错).
     #[serde(default)]
     pub api_key: Option<String>,
-    /// 从文件路径读取 api_key. PUT 时若省略 (None) 则保留旧值, 同 `api_key`.
-    /// 与 `api_key` 互斥. WebUI 创建 dynamic-only provider 时可用,
-    /// 但通常只在 static config (sops 注入) 用.
+    /// 从文件路径读取 api_key. PUT 时若省略 (None) 则保留旧值 (同 `api_key` 的
+    /// "不记录 + 回落" 语义). 与 `api_key` 互斥. WebUI 创建 dynamic-only provider
+    /// 时可用, 但通常只在 static config (sops 注入) 用.
     #[serde(default)]
     pub api_key_file: Option<String>,
     #[serde(default = "crate::provider::default_true")]

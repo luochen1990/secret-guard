@@ -37,7 +37,7 @@ use parking_lot::Mutex;
 
 use crate::config::{
     Decisions, DynamicEntry, DynamicState, DynamicTable, EffectiveSource, OverrideMode,
-    classify_source, pick_effective,
+    classify_source, pick_with_inherit,
 };
 
 /// 记录已经 warn 过 api_key_file 读失败的 provider id.
@@ -241,6 +241,16 @@ impl DynamicEntry for Provider {
     fn set_decision(d: &mut Decisions, id: &str, mode: OverrideMode) {
         d.set_provider(id, mode);
     }
+
+    /// #157: override 未记录鉴权字段 (api_key 与 api_key_file 均空) → 两者从 static
+    /// 继承. 让 "PUT api_key=null 保留旧值" 的 override 不落盘明文, 转发仍带旧 key.
+    /// 已知限制 (static 基线下空串无法清空): 见根 AGENTS.md "#157 已知限制" 条目.
+    fn inherit_from_static(&mut self, static_ver: &Self) {
+        if self.api_key.is_empty() && self.api_key_file.is_none() {
+            self.api_key = static_ver.api_key.clone();
+            self.api_key_file = static_ver.api_key_file.clone();
+        }
+    }
 }
 
 // ─── ProviderTable 别名 + 类型特定 effective 视图 ──────────────────────────
@@ -319,14 +329,17 @@ impl DynamicTable<Provider> {
 
 /// 给定 (static_ver, dynamic_ver, mode), 计算 effective provider 的合并视图.
 /// 若 Disabled 或三者皆空, 返回 None.
+///
+/// #157: 用 `pick_with_inherit` (与 `get_effective` 同一收口) — override 未记录
+/// 鉴权字段时从 static 继承, 保证 WebUI 视图 (masked / length) 与路由层行为一致.
 fn compute_effective_provider(
     static_ver: Option<Provider>,
     dynamic_ver: Option<Provider>,
     mode: OverrideMode,
 ) -> Option<EffectiveProvider> {
-    let raw = pick_effective(static_ver.clone(), dynamic_ver.clone(), mode)?;
+    let raw = pick_with_inherit(static_ver.clone(), dynamic_ver.clone(), mode)?;
     let source = classify_source(static_ver.is_some(), dynamic_ver.is_some(), mode)
-        .expect("pick_effective Some ⇒ classify_source Some");
+        .expect("pick (with inherit) Some ⇒ classify_source Some");
     let api_key_length = raw.api_key.chars().count();
     let static_masked = static_ver.map(ProviderMasked::from);
     let dynamic_masked = dynamic_ver.map(ProviderMasked::from);
@@ -696,5 +709,87 @@ mod tests {
         assert_eq!(ov.base_url, "https://dynamic-override");
         assert!(ov.static_version.is_some());
         assert!(ov.dynamic_version.is_some());
+    }
+
+    // ─── inherit_from_static (#157): override 未记录鉴权字段时回落 static ──
+    //
+    // 语义: PUT api_key=null (保留旧值) 的 override 不落盘明文, effective 解析时
+    // 从 static 继承. 三条边界: 均未记录 → 继承; 有任一显式记录 → 不继承;
+    // get_effective 仅在 Default 模式下继承 (PreferStatic 选中的是 static 本身).
+
+    #[test]
+    fn inherit_from_static_fills_unrecorded_auth_fields() {
+        let mut s = p("x", Protocol::OpenAI, "https://s");
+        s.api_key = "sk-static".into();
+        let mut d = p("x", Protocol::OpenAI, "https://d");
+        d.api_key = String::new();
+        d.api_key_file = None;
+        d.inherit_from_static(&s);
+        assert_eq!(d.api_key, "sk-static");
+        assert_eq!(
+            d.base_url, "https://d",
+            "non-auth fields must stay from override"
+        );
+    }
+
+    #[test]
+    fn inherit_from_static_skips_when_override_records_auth() {
+        let mut s = p("x", Protocol::OpenAI, "https://s");
+        s.api_key = "sk-static".into();
+
+        // override 显式记录了 api_key → 不继承.
+        let mut d1 = p("x", Protocol::OpenAI, "https://d");
+        d1.api_key = "sk-dyn".into();
+        d1.inherit_from_static(&s);
+        assert_eq!(d1.api_key, "sk-dyn");
+
+        // override 显式记录了 api_key_file → 不继承 (含 static 的 api_key).
+        let mut d2 = p("x", Protocol::OpenAI, "https://d");
+        d2.api_key = String::new();
+        d2.api_key_file = Some(PathBuf::from("/run/secrets/k"));
+        d2.inherit_from_static(&s);
+        assert_eq!(d2.api_key, "");
+        assert_eq!(d2.api_key_file, Some(PathBuf::from("/run/secrets/k")));
+    }
+
+    #[test]
+    fn get_effective_inherits_unrecorded_api_key_from_static() {
+        let tmp = tempfile_path();
+        let mut s = p("x", Protocol::OpenAI, "https://s");
+        s.api_key = "sk-static".into();
+        let mut d = p("x", Protocol::OpenAI, "https://d");
+        d.api_key = String::new(); // override 未记录 key (#157: 不落盘明文)
+        let t = ProviderTable::new(vec![s], vec![d], empty_decisions(), tmp);
+
+        // Default: dynamic 被选中 + 未记录 key → effective 从 static 继承.
+        let eff = t.get_effective("x").unwrap();
+        assert_eq!(eff.base_url, "https://d");
+        assert_eq!(eff.api_key, "sk-static");
+
+        // PreferStatic: static 本身被选中, 继承无意义但也无害.
+        t.set_decision("x", OverrideMode::PreferStatic).unwrap();
+        let eff = t.get_effective("x").unwrap();
+        assert_eq!(eff.base_url, "https://s");
+        assert_eq!(eff.api_key, "sk-static");
+
+        // Disabled: 不存在 effective.
+        t.set_decision("x", OverrideMode::Disabled).unwrap();
+        assert!(t.get_effective("x").is_none());
+    }
+
+    #[test]
+    fn effective_snapshot_reflects_inherited_api_key() {
+        // WebUI 视图与路由层行为一致 (#157): 继承后的 masked/length 也要反映 static key.
+        let tmp = tempfile_path();
+        let mut s = p("x", Protocol::OpenAI, "https://s");
+        s.api_key = "sk-static-key".into();
+        let mut d = p("x", Protocol::OpenAI, "https://d");
+        d.api_key = String::new();
+        let t = ProviderTable::new(vec![s], vec![d], empty_decisions(), tmp);
+        let snap = t.effective_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].api_key_length, "sk-static-key".chars().count());
+        // dynamic_version 的 masked 仍显示 override 自身 (空) — 派生视图分离, 不混入.
+        assert_eq!(snap[0].dynamic_version.as_ref().unwrap().api_key_length, 0);
     }
 }

@@ -2481,6 +2481,210 @@ async fn providers_api_update_preserves_api_key_on_static_fork() {
     assert_eq!(forked["source"], "dynamic_override");
 }
 
+/// #157 现象 A: PUT 编辑 static inline-key provider 且 api_key=null →
+/// state.toml 不得含 static 明文 key; effective 仍带旧 key (转发行为不变).
+#[tokio::test]
+async fn put_static_fork_null_api_key_does_not_persist_plaintext() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .match_header("authorization", "Bearer sk-inline-upstream-key")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"chatcmpl-1"}"#)
+        .create_async()
+        .await;
+
+    let static_provider = keyed_provider("p1", &upstream.url(), "sk-inline-upstream-key");
+    let (proxy_url, state_path) = spawn_with_static(static_provider).await;
+    let client = reqwest::Client::new();
+
+    // PUT api_key=null (意图保留旧值). 旧 bug: 已 resolve 的 static 明文被写进 override.
+    let resp = client
+        .put(format!("{proxy_url}/__sg/api/providers/p1"))
+        .json(&serde_json::json!({
+            "protocol": "openai",
+            "base_url": upstream.url(),
+            "api_key": null,
+            "enabled": true,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // state.toml 不得含 static 明文 key (#157 核心 断言).
+    let state_text = std::fs::read_to_string(&state_path).unwrap();
+    assert!(
+        !state_text.contains("sk-inline-upstream-key"),
+        "state.toml must not contain the static plaintext api_key, got:\n{state_text}"
+    );
+
+    // effective 视图仍带旧 key (length 保留), source 是 dynamic_override.
+    let updated: serde_json::Value = client
+        .get(format!("{proxy_url}/__sg/api/providers"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let p = &updated["providers"][0];
+    assert_eq!(p["source"], "dynamic_override");
+    assert_eq!(p["api_key_length"], 22); // "sk-inline-upstream-key" 继承自 static
+
+    // 转发仍带旧 key: mock 只在 authorization 匹配旧 key 时返回 200.
+    let resp = proxy_request(&proxy_url, "POST", "/o/p1/v1/chat/completions", "{}", &[]).await;
+    assert_eq!(resp.0, reqwest::StatusCode::OK);
+}
+
+/// #157 现象 A 对照: PUT 显式提供新 api_key → 新 key 落盘 state.toml (预期行为,
+/// dynamic secret value 本来就落盘) + 转发带新 key.
+#[tokio::test]
+async fn put_static_fork_new_api_key_persists_and_forwards() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .match_header("authorization", "Bearer sk-new-explicit-key")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"chatcmpl-2"}"#)
+        .create_async()
+        .await;
+
+    let static_provider = keyed_provider("p1", &upstream.url(), "sk-inline-upstream-key");
+    let (proxy_url, state_path) = spawn_with_static(static_provider).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .put(format!("{proxy_url}/__sg/api/providers/p1"))
+        .json(&serde_json::json!({
+            "protocol": "openai",
+            "base_url": upstream.url(),
+            "api_key": "sk-new-explicit-key",
+            "enabled": true,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // 显式新 key 落盘 state.toml — 这是预期 (dynamic value 本来就落盘, 见 #157 现象 B 文档).
+    let state_text = std::fs::read_to_string(&state_path).unwrap();
+    assert!(
+        state_text.contains("sk-new-explicit-key"),
+        "explicitly provided api_key is expected to persist, got:\n{state_text}"
+    );
+    assert!(!state_text.contains("sk-inline-upstream-key"));
+
+    // 转发带新 key.
+    let resp = proxy_request(&proxy_url, "POST", "/o/p1/v1/chat/completions", "{}", &[]).await;
+    assert_eq!(resp.0, reqwest::StatusCode::OK);
+}
+
+/// #157: 继承语义也覆盖 api_key_file 来源的 static 基线 — PUT 不传 key 字段时
+/// override 不记录, effective 从 static 继承文件引用 (转发时读文件).
+#[tokio::test]
+async fn put_static_fork_null_api_key_inherits_api_key_file() {
+    let keyfile = std::path::PathBuf::from(format!(
+        "/tmp/opencode/tmp/test-put-file-key-{}.txt",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(keyfile.parent().unwrap()).unwrap();
+    std::fs::write(&keyfile, "sk-from-static-file\n").unwrap();
+
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .match_header("authorization", "Bearer sk-from-static-file")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"chatcmpl-3"}"#)
+        .create_async()
+        .await;
+
+    let mut static_provider = keyed_provider("pf", &upstream.url(), "");
+    static_provider.api_key_file = Some(keyfile.clone());
+    let (proxy_url, state_path) = spawn_with_static(static_provider).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .put(format!("{proxy_url}/__sg/api/providers/pf"))
+        .json(&serde_json::json!({
+            "protocol": "openai",
+            "base_url": upstream.url(),
+            "api_key": null,
+            "api_key_file": null,
+            "enabled": true,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // state 不落盘 key 内容; 且 override 未记录任何 key 字段 (api_key_file 路径也不在
+    // state 里 — 继承发生在 effective 解析时, static 持有路径).
+    let state_text = std::fs::read_to_string(&state_path).unwrap();
+    assert!(!state_text.contains("sk-from-static-file"));
+
+    // 正向断言: state 里也不含文件路径引用 (override 未记录该字段).
+    assert!(!state_text.contains("test-put-file-key"));
+
+    // 转发仍从文件读到旧 key.
+    let resp = proxy_request(&proxy_url, "POST", "/o/pf/v1/chat/completions", "{}", &[]).await;
+    assert_eq!(resp.0, reqwest::StatusCode::OK);
+    std::fs::remove_file(&keyfile).ok();
+}
+
+/// #157 已知限制锁定: static 基线下 PUT api_key="" (显式清空意图) 无法真正清空 —
+/// 落盘空串与 "未记录" 形态相同, effective 仍继承 static 旧 key. 该行为已文档化
+/// (根 AGENTS.md 已知限制 + providers.rs 字段注释); 本测试固化现状, schema 演进
+/// (区分两种空) 时此测试必须同步修改.
+#[tokio::test]
+async fn put_static_fork_empty_api_key_still_inherits_static() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .match_header("authorization", "Bearer sk-inline-upstream-key")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"chatcmpl-4"}"#)
+        .create_async()
+        .await;
+
+    let static_provider = keyed_provider("pe", &upstream.url(), "sk-inline-upstream-key");
+    let (proxy_url, _state_path) = spawn_with_static(static_provider).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .put(format!("{proxy_url}/__sg/api/providers/pe"))
+        .json(&serde_json::json!({
+            "protocol": "openai",
+            "base_url": upstream.url(),
+            "api_key": "",
+            "enabled": true,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // effective 视图: 空 api_key 显示为继承后的 static key length.
+    let updated: serde_json::Value = client
+        .get(format!("{proxy_url}/__sg/api/providers"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(updated["providers"][0]["api_key_length"], 22);
+
+    // 转发仍带 static 旧 key (继承生效 — 显式清空在 static 基线下不可达, 已知限制).
+    let resp = proxy_request(&proxy_url, "POST", "/o/pe/v1/chat/completions", "{}", &[]).await;
+    assert_eq!(resp.0, reqwest::StatusCode::OK);
+}
+
 #[tokio::test]
 async fn providers_api_rejects_bad_base_url() {
     let upstream = spawn_mock_upstream().await;
@@ -3325,7 +3529,7 @@ async fn secret_decision_disabled_ack_carries_plaintext_warning() {
     );
 
     // providers 表也放一个 static, 验证 provider 分支无 warning.
-    let proxy_url = spawn_proxy_static_dynamic(
+    let (proxy_url, _state_path) = spawn_proxy_static_dynamic(
         vec![provider],
         vec![],
         reqwest::Client::new(),

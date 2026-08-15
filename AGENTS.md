@@ -632,6 +632,12 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
   X-Forwarded-Proto 推断) 是后续工作.
 - **DAG 孤儿节点降级**: parent 被 LRU 淘汰后, child 的 `full_request_messages` 返回 None
   (timeline 降级展示, 不 panic). 显式孤儿标记 (CDAG-7) 尚未实现.
+- **static 基线下 PUT 空串 api_key 无法清空 key (#157 已知限制)**: dynamic override 的
+  `api_key` 落盘形态无法区分 "未记录" (PUT null → 空串, effective 继承 static) 与
+  "显式清空" (PUT `""` → 空串) — 两种空都会被 `inherit_from_static` 继承 static 旧 key.
+  停用 provider 请用 `PATCH .../decision {"mode":"disabled"}`. WebUI 编辑留空发 null
+  (保留语义), 仅 SDK 显式发空串可见. 根治需 schema 演进 (请求字段 Option 化或 sentinel
+  值), 属后续工作.
 - **auth 模块测试覆盖率 (OIDC 登录流程)**: auth 模块的纯逻辑已覆盖
   (`apikey.rs` 100% / `middleware.rs` ~99% / `session.rs` ~98% / `mod.rs` ~99%), 含
   require_api_key 的 Authorization 剥离断言 (SEC 红线) 与 build_session_layer 的

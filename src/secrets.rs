@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{
     Decisions, DynamicEntry, DynamicState, DynamicTable, EffectiveSource, OverrideMode,
-    classify_source, pick_effective,
+    classify_source, pick_with_inherit,
 };
 use crate::mock::MockStrategy;
 
@@ -387,14 +387,16 @@ impl DynamicTable<SecretEntry> {
 }
 
 /// 给定 (static_ver, dynamic_ver, mode), 计算 effective secret 的合并视图.
+/// 走 `pick_with_inherit` 统一收口 (SecretEntry 的 inherit 是 no-op, 行为与裸
+/// pick_effective 等价 — 保持三条 effective 读取路径的收口不变量成立, 见 #157).
 fn compute_effective_secret(
     static_ver: Option<SecretEntry>,
     dynamic_ver: Option<SecretEntry>,
     mode: OverrideMode,
 ) -> Option<EffectiveSecret> {
-    let raw = pick_effective(static_ver.clone(), dynamic_ver.clone(), mode)?;
+    let raw = pick_with_inherit(static_ver.clone(), dynamic_ver.clone(), mode)?;
     let source = classify_source(static_ver.is_some(), dynamic_ver.is_some(), mode)
-        .expect("pick_effective Some ⇒ classify_source Some");
+        .expect("pick (with inherit) Some ⇒ classify_source Some");
     let static_masked = static_ver.map(SecretMasked::from);
     let dynamic_masked = dynamic_ver.map(SecretMasked::from);
     Some(EffectiveSecret {

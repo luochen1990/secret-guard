@@ -7,7 +7,7 @@
 //! | 文件 | 角色 | 谁写 | 进入 git? |
 //! |---|---|---|---|
 //! | `secret-guard.toml`        | **声明式 (static)** 配置: providers / secrets / server / redact / auth. | 用户手写 | ✅ 推荐 |
-//! | `secret-guard.state.toml`  | **动态 (dynamic)** 状态: WebUI 编辑结果 + 对 static 项的 decision. | 程序自动 | ❌ 推荐 .gitignore |
+//! | `secret-guard.state.toml`  | **动态 (dynamic)** 状态: WebUI 编辑结果 + 对 static 项的 decision. **含明文敏感数据** (dynamic secret value / 显式写入的 api_key), 敏感级别与 static 同级 (#157). | 程序自动 | ❌ 推荐 .gitignore |
 //!
 //! 两者由 [`Config`] (static) 与 [`DynamicState`] (dynamic) 分别建模.
 //!
@@ -64,8 +64,10 @@
 //!
 //! - **POST** 创建 dynamic-only item. 若 id 与 static 冲突 → 409 (要用 PUT 走 fork 流程).
 //! - **PUT** 编辑: 若 id 在 static 中, 服务端自动 fork 出一份 dynamic override (git-style 心智模型).
-//! - **DELETE** 仅作用于 dynamic: 若有 dynamic 删除之 (override 关系下保留 static + 重置 decision);
-//!   若 id 仅在 static 中 → 409 (提示用 PATCH .../decision + mode=disabled).
+//! - **DELETE** (Web 层, #156 后): 仅 dynamic-only item 可删 (204); **static 基线存在
+//!   (无论有无 dynamic override) 一律 409** — "删 override 露出 static" 的静默 204 已
+//!   废除 (误导用户以为删除成功). 撤销 override 走 decision. 注: 存储层
+//!   `DynamicTable::delete_dynamic` 保留 "删 override 保留 static" 能力供非 Web 调用方.
 //! - **PATCH `/{id}/decision`** 切换对 static id 的决策. 返回 `{id, resource, decision}` ack.
 //!
 //! 类型钩子: `DynamicEntry` trait 让泛型表知道如何把 entry 写入 state 的对应字段
@@ -718,6 +720,27 @@ pub fn pick_effective<T>(
     }
 }
 
+/// `pick_effective` + `inherit_from_static` 的组合 (#157): 选出 effective 项后,
+/// 若选中的是 dynamic override 且 static 基线存在, 对未记录的鉴权字段做回落继承.
+///
+/// 这是 effective 读取路径 (`effective_raw` / `get_effective` / 类型特定的
+/// `compute_effective_*`) 的统一收口 — 三条路径必须走同一函数, 避免某条路径
+/// 静默绕过继承造成 "转发带 key / 视图不带 key" 的不一致.
+pub fn pick_with_inherit<T: DynamicEntry>(
+    static_ver: Option<T>,
+    dynamic_ver: Option<T>,
+    mode: OverrideMode,
+) -> Option<T> {
+    let mut picked = pick_effective(static_ver.clone(), dynamic_ver, mode)?;
+    // 继承仅在 "static 基线存在 + Default 模式 (override 被选中)" 下有意义;
+    // PreferStatic 选中的是 static 本身 (自反 no-op), Disabled 已在上面早退.
+    // static-only + Default 时对选中的 static 自身调用 inherit 同样是自反 no-op, 无害.
+    if let (Some(s), OverrideMode::Default) = (static_ver, mode) {
+        picked.inherit_from_static(&s);
+    }
+    Some(picked)
+}
+
 /// 由 (has_static, has_dynamic, mode) 推导 EffectiveSource. 与 [`pick_effective`] 严格对偶:
 /// `pick_effective` 返回 None 的输入 (Disabled / 全空 / dynamic-only+PreferStatic),
 /// 本函数也返回 None. 这样 `compute_effective_*` 中的 `.expect` 不会在生产 panic.
@@ -909,6 +932,20 @@ pub trait DynamicEntry: Clone + Send + Sync + 'static {
 
     /// 写 decisions 中对应子表的某 id.
     fn set_decision(d: &mut Decisions, id: &str, mode: OverrideMode);
+
+    /// override 未记录鉴权类字段时, 从 static 基线继承对应字段 (就地修改).
+    ///
+    /// 背景 (#157): PUT 编辑 static provider 时 api_key=null 意为 "保留旧值", override
+    /// 对该字段**不落盘** (dynamic `api_key` 空) — 这样 static 明文不进 state.toml.
+    /// 但合并语义要求 effective 仍带旧 key (转发行为不变), 故 effective 解析时遇到
+    /// "override 未记录"的字段回落 static. 本钩子就是那个"按类型逐字段回落"的实现:
+    ///
+    /// - `Provider`: `api_key` 与 `api_key_file` 均未记录 → 两者都从 static 继承.
+    /// - `SecretEntry`: 无此语义 (value 是 redact 依据, override 必须显式) → no-op.
+    ///
+    /// 仅在 "static 存在且 override 被选中" 的组合下由调用方调用 (`get_effective` /
+    /// `compute_effective_*`), dynamic-only item 不适用.
+    fn inherit_from_static(&mut self, _static_ver: &Self) {}
 }
 
 /// 双层 (static + dynamic) + per-id decision 的泛型表.
@@ -990,12 +1027,15 @@ impl<T: DynamicEntry> DynamicTable<T> {
     pub fn effective_raw(&self) -> Vec<T> {
         self.effective_triples()
             .into_iter()
-            .filter_map(|(s, d, m)| pick_effective(s, d, m))
+            .filter_map(|(s, d, m)| pick_with_inherit(s, d, m))
             .collect()
     }
 
     /// 列出每个可见 id 的 (static_ver, dynamic_ver, mode) 三元组.
     /// Disabled 的项 (经 pick_effective 判定返回 None) 不在结果中.
+    ///
+    /// 注意: 本方法返回的是**原始**三元组, 不做 `inherit_from_static` 回落 —
+    /// 消费方需要继承语义时必须走 `pick_with_inherit` (而非裸 `pick_effective`).
     ///
     /// 这是 effective_snapshot 这类"对外视图"方法的统一数据源: 调用方拿到三元组后
     /// 用类型特定的 `compute_effective_*` 函数映射到 masked 视图.
@@ -1034,6 +1074,10 @@ impl<T: DynamicEntry> DynamicTable<T> {
     }
 
     /// 路由层使用: 按 id 取 effective 原始项 (不脱敏). 不存在 / Disabled → None.
+    ///
+    /// #157: dynamic override 未记录鉴权字段 (api_key/api_key_file 均空) 时, 从
+    /// static 基线继承 (`pick_with_inherit`) — 让 "PUT api_key=null 保留旧值" 的
+    /// override 不落盘明文, 同时转发仍带旧 key.
     pub fn get_effective(&self, id: &str) -> Option<T> {
         let statics = self.static_entries.read();
         let dynamics = self.dynamic_entries.read();
@@ -1046,7 +1090,7 @@ impl<T: DynamicEntry> DynamicTable<T> {
             .map(|p| T::get_decision(&decisions, p.id()))
             .unwrap_or(OverrideMode::Default);
 
-        pick_effective(s, d, mode)
+        pick_with_inherit(s, d, mode)
     }
 
     /// 直接查 static 层, 不受 decision 影响. 供 Web handler 判断 "该 id 是否为 static
@@ -1069,6 +1113,17 @@ impl<T: DynamicEntry> DynamicTable<T> {
             .filter(|s| T::get_decision(&decisions, s.id()) == OverrideMode::Disabled)
             .cloned()
             .collect()
+    }
+
+    /// 直接查 dynamic 层的原始条目 (不脱敏, 不与 static 合并). 供 update handler
+    /// 保留旧值时区分来源 (#157): dynamic 自有值可安全回填进 override; static 来源
+    /// 的已 resolve 值绝不回填 (否则明文落盘 state.toml). 不存在 → None.
+    pub fn get_dynamic(&self, id: &str) -> Option<T> {
+        self.dynamic_entries
+            .read()
+            .iter()
+            .find(|e| e.id() == id)
+            .cloned()
     }
 
     // ─── 写: dynamic 层 CRUD + decision ────────────────────────────────
@@ -1097,6 +1152,10 @@ impl<T: DynamicEntry> DynamicTable<T> {
 
     /// 仅 dynamic 层 CRUD —— delete. 若 id 同时存在于 static, 此操作仅移除 override,
     /// 保留 static (decision 不变).
+    ///
+    /// 注: Web 层 (`web::api::crud::delete_flow`) 在 #156 后对 static 基线存在的 id
+    /// 前置拒绝 (409), 不会到达本方法的 "删 override 露出 static" 路径; 本方法保留
+    /// 该能力供非 Web 调用方 (如未来的 CLI) 自主决定语义.
     pub fn delete_dynamic(&self, id: &str) -> anyhow::Result<DeleteOutcome> {
         let _guard = self.persist_lock.lock();
         let new_entries = {
