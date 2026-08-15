@@ -1892,3 +1892,133 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     expect(listed2.find((k) => k.id === issued.id)).toBeUndefined();
   });
 });
+
+// ─── WebUI 打磨批次回归 (#161 + #164-1/2/3) ─────────────────────────────
+//
+// 覆盖四个新交互:
+//   1. (#161) secrets 表 decision 下拉选 Disabled → confirm 弹窗; 取消回滚 / 确认生效
+//      且 PATCH 响应含 warning.
+//   2. (#164-1) raw 弹窗 Response Body 区段带 "(LLM view, ...)" 标注.
+//   3. (#164-2) info 弹窗 Time 字段格式化为本地时间 (title 保留原始 UTC RFC3339).
+//   4. (#164-3) 数据未变化时 3s auto-refresh 不重建表格 DOM (tr 引用保持 isConnected).
+test.describe("WebUI 打磨 (#161 + #164)", () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto("/");
+    await page.waitForLoadState("networkidle");
+    await page.waitForTimeout(500);
+  });
+
+  test("#161: secret decision→Disabled 有 confirm; 取消回滚 / 确认后带 warning", async ({
+    page,
+  }) => {
+    // config 的 static secret id = "test-key" → secrets 表应渲染 decision 下拉.
+    await page.locator('a.tab[data-tab="secrets"]').click();
+    const sel = page.locator('select.decision-select[data-id="test-key"]');
+    await expect(sel).toBeVisible();
+
+    // 选 Disabled → confirm 出现, 文案含 "plaintext".
+    let confirmShown = "";
+    page.once("dialog", async (d) => {
+      confirmShown = d.message();
+      await d.dismiss(); // 先测取消路径.
+    });
+    await sel.selectOption("disabled");
+    await page.waitForTimeout(200);
+    expect(confirmShown).toContain("plaintext");
+
+    // 取消后: 下拉回滚为 default (refresh 重建, selected 复原).
+    await expect(page.locator('select.decision-select[data-id="test-key"]')).toHaveValue(
+      "default"
+    );
+
+    // 再测确认路径: confirm accept → PATCH 生效 (列表中该项消失 = disabled 语义).
+    let sawConfirm = false;
+    const confirmHandler = async (d: import("@playwright/test").Dialog) => {
+      sawConfirm = true;
+      await d.accept();
+      page.off("dialog", confirmHandler);
+    };
+    page.on("dialog", confirmHandler);
+    await page.locator('select.decision-select[data-id="test-key"]').selectOption("disabled");
+    await page.waitForTimeout(600);
+    expect(sawConfirm).toBe(true);
+    // disabled 后 secret 从 effective 列表消失 (表格不再渲染该行).
+    await expect(
+      page.locator('select.decision-select[data-id="test-key"]')
+    ).toHaveCount(0);
+
+    // 清理: 通过 API 切回 default, 不污染后续测试.
+    await page.request.patch(`${SG_API}/secrets/test-key/decision`, {
+      data: { mode: "default" },
+    });
+    await page.waitForTimeout(100);
+  });
+
+  test("#161: PATCH decision API 响应 disabled 时含 warning 字段", async ({ request }) => {
+    const ack = await request.patch(`${SG_API}/secrets/test-key/decision`, {
+      data: { mode: "disabled" },
+    });
+    expect(ack.status()).toBe(200);
+    const body = await ack.json();
+    expect(body.warning).toContain("plaintext");
+    // 切回 default: warning 字段缺省 (向后兼容 shape).
+    const ack2 = await request.patch(`${SG_API}/secrets/test-key/decision`, {
+      data: { mode: "default" },
+    });
+    const body2 = await ack2.json();
+    expect(body2.warning ?? null).toBeNull();
+  });
+
+  test("#164-1: raw 弹窗 Response Body 带 (LLM view) 标注", async ({ page }) => {
+    await sendChat(page, [{ role: "user", content: "raw-llm-view-marker" }]);
+    const sid = await findSessionLeafByPreview(page, "raw-llm-view-marker");
+    await clickSessionByLeaf(page, sid);
+    await page.waitForTimeout(500);
+
+    await page.locator("#detail .tl-actions button[data-action='raw']").click();
+    await page.waitForTimeout(500);
+    const rawText = await page.locator("dialog.round-dialog").textContent();
+    // 非流式响应: Response Body 区段应带 LLM view 标注 (含 mock 视角提示).
+    expect(rawText).toContain("Response Body (LLM view");
+    await page.locator("dialog.round-dialog .dialog-close").click();
+  });
+
+  test("#164-2: info 弹窗 Time 为本地时间, title 保留 UTC RFC3339", async ({ page }) => {
+    await sendChat(page, [{ role: "user", content: "info-time-marker" }]);
+    const sid = await findSessionLeafByPreview(page, "info-time-marker");
+    await clickSessionByLeaf(page, sid);
+    await page.waitForTimeout(500);
+
+    await page.locator("#detail .tl-actions button[data-action='info']").click();
+    await page.waitForTimeout(300);
+    const timeCell = page.locator("dialog.round-dialog .info-table tr", {
+      has: page.locator("td.info-key", { hasText: "Time" }),
+    }).locator("td.info-val");
+
+    // 显示值不再是原始 UTC RFC3339 (无 "T..Z" 形态), 而是本地时间.
+    const shown = await timeCell.textContent();
+    expect(shown).toBeTruthy();
+    expect(shown).not.toMatch(/T\d{2}:\d{2}:\d{2}.*Z$/);
+    // title 保留原始 UTC RFC3339 (开发者向).
+    const title = await timeCell.getAttribute("title");
+    expect(title).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
+    await page.locator("dialog.round-dialog .dialog-close").click();
+  });
+
+  test("#164-3: 数据静止时 auto-refresh 不重建表格 DOM", async ({ page }) => {
+    await page.locator('a.tab[data-tab="secrets"]').click();
+    const row = page.locator("#secrets-body tr").first();
+    await row.waitFor({ state: "attached" });
+
+    // 给首行打标签, 等 2 个 auto-refresh 周期 (3s × 2 + 余量) 后检查标签是否仍在
+    // 文档中. 数据未变化 (无人改配置) → renderedHtml 短路 → tbody 不重建 → 标签元素
+    // 保持连接. (elementHandle.isConnected 在本 Playwright 版本不可序列化, 用 evaluate.)
+    const stillConnected = await row.evaluate((el) => {
+      el.setAttribute("data-refresh-probe", "1");
+      return new Promise<boolean>((resolve) => {
+        setTimeout(() => resolve(el.isConnected), 7000);
+      });
+    });
+    expect(stillConnected, "数据静止时 tr 引用不应被刷新打断").toBe(true);
+  });
+});
