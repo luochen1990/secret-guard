@@ -4629,3 +4629,48 @@ mod sec6_proptests {
         }
     }
 }
+
+/// #163: 上游不可达 502 body 的 message 必须携带可读原因 (上游 host:port + 根因),
+/// 让 SDK 用户区分网关故障 vs 上游故障; 且不得携带 provider api_key.
+#[tokio::test]
+async fn upstream_unreachable_502_body_carries_readable_cause() {
+    let dummy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bad_addr = dummy_listener.local_addr().unwrap();
+    drop(dummy_listener);
+
+    // provider 带非空 api_key: 断言它不出现在 502 body (issue 明确要求).
+    let mut provider = openai_provider("oa-dead", &format!("http://{bad_addr}"));
+    provider.api_key = "sk-live-supersecret-0123456789".into();
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+
+    let (status, body, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-dead/v1/chat/completions",
+        "{}",
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::BAD_GATEWAY);
+
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["error"], "upstream_error", "body kind: {body}");
+    let msg = v["message"]
+        .as_str()
+        .expect("502 body message must be a non-null string (#163)");
+    // 可读原因: 根因 (连接拒绝) + 上游定位 (host:port).
+    // (io 错误文案大小写随平台, 断言用小写不敏感.)
+    assert!(
+        msg.to_lowercase().contains("connection refused"),
+        "message must carry the underlying cause, got: {msg}"
+    );
+    assert!(
+        msg.contains(&bad_addr.to_string()),
+        "message must name the upstream host:port for diagnosis, got: {msg}"
+    );
+    // 卫生: provider api_key 不得泄漏进错误 body.
+    assert!(
+        !body.contains("sk-live-supersecret"),
+        "502 body must not leak provider api_key: {body}"
+    );
+}

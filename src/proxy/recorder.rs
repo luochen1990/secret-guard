@@ -288,7 +288,6 @@ pub(super) fn record_upstream_failure(
         },
     );
 }
-
 /// 发送上游请求, 可选地对"响应头到达"加超时保护. 失败时记录到 DAG 并返回 AppError.
 ///
 /// `header_timeout = None` 时退化为普通 `send().await` (向后兼容 / 测试场景).
@@ -323,9 +322,11 @@ pub(super) async fn send_upstream_or_fail(
         Ok(r) => Ok(r),
         Err(Ok(e)) => {
             // reqwest 网络错误 (连接拒绝 / DNS / TLS 等) → 502.
+            // record 侧保留完整错误串; 客户端 502 body message 用净化后的可读原因
+            // (#163: 让 SDK 用户能区分网关故障 vs 上游故障并定位是哪个上游).
             let msg = format!("upstream send error: {e}");
-            record_upstream_failure(dag, record_id, started, 502, msg.clone());
-            Err(crate::error::AppError::Upstream(e.to_string()))
+            record_upstream_failure(dag, record_id, started, 502, msg);
+            Err(crate::error::AppError::Upstream(upstream_error_brief(&e)))
         }
         Err(Err(d)) => {
             // 响应头超时 → 504.
@@ -337,6 +338,47 @@ pub(super) async fn send_upstream_or_fail(
             )))
         }
     }
+}
+
+/// 把 reqwest 网络错误净化为一句可安全回传客户端的可读原因 (#163).
+///
+/// 形如 `upstream error: http://127.0.0.1:29999/v1/chat (tcp connect error:
+/// Connection refused (os error 111))`. 信息泄露策略 (SEC 纪律, 见 error.rs 头部):
+/// - URL 只保留 `scheme://host:port/path`: **防御性丢弃 userinfo / query / fragment**
+///   (上游 URL 的 query 可能携带 api_key 类参数, 即使当前 provider 配置不含也不能赌).
+/// - 根因取 error `source()` 链最深层 (如 "tcp connect error: Connection refused"),
+///   比首层 Display ("error sending request for url (...)") 更具体且天然不含 URL.
+///
+/// 与 record 侧 (`record_upstream_failure` 保留完整 `e.to_string()`) 分工: record 是
+/// 本地 WebUI 视图可含完整细节; 本函数的产物会进 502 响应 body 回传客户端.
+pub(super) fn upstream_error_brief(e: &reqwest::Error) -> String {
+    let root = root_error_cause(e);
+    match e.url() {
+        Some(u) => format!("upstream error: {} ({root})", safe_url_for_client(u)),
+        None => format!("upstream error: {root}"),
+    }
+}
+
+/// 沿 `source()` 链走到底, 取最深层的 Display (最具体的一层, 如 io/TCP 错误).
+fn root_error_cause(e: &reqwest::Error) -> String {
+    let mut cur: &dyn std::error::Error = e;
+    while let Some(next) = cur.source() {
+        cur = next;
+    }
+    cur.to_string()
+}
+
+/// URL → `scheme://host:port/path` (丢弃 userinfo / query / fragment).
+fn safe_url_for_client(u: &reqwest::Url) -> String {
+    let mut s = format!("{}://", u.scheme());
+    if let Some(host) = u.host_str() {
+        s.push_str(host);
+    }
+    if let Some(port) = u.port() {
+        s.push_str(&format!(":{port}"));
+    }
+    s.push_str(u.path());
+    s
 }
 
 /// 从上游 stream 取下一个 chunk, 可选地带空闲超时保护.
@@ -567,6 +609,88 @@ impl ParsedSync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── #163: 502 message 净化 (payload 进客户端错误 body, 信息泄露 SSOT 纪律) ──
+    //
+    // 契约 (issue #163): 502 body 的 message 填可读原因 (url host:port + 根因),
+    // 且不得带 provider api_key / secret 内容. 单测覆盖净化函数的两个维度
+    // (根因提取 + URL 剥离); 端到端 (连接拒绝 → body 文本) 由集成测试
+    // upstream_unreachable_502_body_carries_readable_cause 锁定.
+
+    #[test]
+    fn safe_url_strips_userinfo_query_fragment() {
+        let u: reqwest::Url = "https://user:pass@host.example:8443/pa/th?q=secret#frag"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            safe_url_for_client(&u),
+            "https://host.example:8443/pa/th",
+            "userinfo/query/fragment must be stripped"
+        );
+    }
+
+    #[test]
+    fn safe_url_keeps_scheme_host_port_path() {
+        let u: reqwest::Url = "http://127.0.0.1:29999/v1/chat/completions"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            safe_url_for_client(&u),
+            "http://127.0.0.1:29999/v1/chat/completions"
+        );
+        // 无显式 port 时不追加 :port (scheme 默认端口).
+        let u2: reqwest::Url = "https://api.example.com/v1".parse().unwrap();
+        assert_eq!(safe_url_for_client(&u2), "https://api.example.com/v1");
+    }
+
+    /// 语义锁定: reqwest::Error 首 layer 的 Display 含 URL 且描述宽泛
+    /// ("error sending request for url (...)"), 而根因在 source 链最深层.
+    /// 本测试连接死端口构造真实 reqwest 错误 (与生产 502 同型), 断言净化函数
+    /// 取的是最深层根因 (含 "connection refused"), 且 URL 部分已剥离 query.
+    #[test]
+    fn upstream_error_brief_picks_root_cause_and_sanitized_url() {
+        use std::error::Error as _;
+        // 手工构造三层 source 链: reqwest 错误的 url() 来自 builder, 这里用
+        // reqwest 真实错误构造最贴近生产: 连接一个死端口 (与集成测试同型).
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap();
+        let err = rt.block_on(async {
+            // bind 后立刻 drop: 保证该端口无 listener (connection refused 确定性触发).
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap();
+            drop(l);
+            reqwest::get(format!("http://{addr}/v1/chat?key=leak-me"))
+                .await
+                .expect_err("dead port must produce reqwest error")
+        });
+        // 根因在 source 链最深层, 且比首层 Display 更具体.
+        // (io 错误文案大小写随平台: Linux "Connection refused", 断言用小写不敏感.)
+        let first_layer = err.to_string();
+        let brief = upstream_error_brief(&err);
+        assert!(
+            brief.to_lowercase().contains("connection refused"),
+            "brief must carry the root cause, got: {brief}"
+        );
+        // 首 layer 的 Display 形如 "error sending request for url (...)" — 不含根因.
+        // (锁定语义: 若未来 reqwest 改变 Display 形态, 此断言提醒重评 root_error_cause.)
+        assert!(
+            !first_layer.to_lowercase().contains("connection refused"),
+            "first-layer Display unexpectedly carries root cause: {first_layer}"
+        );
+        // query (可能携带 key) 必须被剥离.
+        assert!(
+            !brief.contains("leak-me"),
+            "brief must not carry query string: {brief}"
+        );
+        assert!(
+            brief.contains(&err.url().unwrap().host_str().unwrap().to_string()),
+            "brief must name the upstream host for diagnosis: {brief}"
+        );
+        // source 链不为空 (root_error_cause 确实走了 >1 层).
+        assert!(err.source().is_some(), "reqwest error should be layered");
+    }
 
     // ─── MAX_RESP_BODY_RECORD 截断契约 (核心契约: 客户端响应无上限 vs record 有 cap) ─
     //

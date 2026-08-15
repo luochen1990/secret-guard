@@ -6,6 +6,12 @@
 //! 内部错误细节不回写客户端 (避免信息泄露 — reqwest::Error 等通常含完整上游 URL,
 //! 直接返回给客户端会暴露内部拓扑). 仅记录到 tracing.
 //!
+//! 例外: [`AppError::Upstream`] / [`AppError::UpstreamTimeout`] 的 payload 在构造点
+//! (`recorder.rs::send_upstream_or_fail` 等) 已经净化 (URL 只留 scheme://host:port/path,
+//! 根因取 source 链最深层), 故 message 回传客户端 (#163: 502/504 body 的 message
+//! 填可读原因, 让 SDK 用户区分网关故障 vs 上游故障). 这依赖构造点纪律, 见
+//! `proxy::recorder::upstream_error_brief`.
+//!
 //! # 归属判断
 //!
 //! 历史上 `AppError` 定义在 [`crate::proxy`] 中, 但它的实际消费者跨两层:
@@ -70,13 +76,19 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response<Body> {
         // 内部错误细节仅记录到日志, 不回写到响应 (避免信息泄露 — reqwest::Error 等通常
         // 含完整上游 URL, 直接返回给客户端会暴露内部拓扑).
-        // 因此 Upstream / BadBody / Internal 的 message 字段用 None (客户端只看到 kind);
+        // 因此 BadBody / Internal 的 message 字段用 None (客户端只看到 kind);
         // NotFound / Unavailable / NotImplemented 的 message 描述协议/路由层面的问题,
         // 信息量对客户端排查有用且不含敏感字段, 原样返回.
+        // Upstream / UpstreamTimeout 的 payload 在构造点已净化 (URL 剥离 userinfo/query,
+        // 见 recorder.rs::upstream_error_brief), 回传给客户端 (#163).
         let (status, kind, message) = match &self {
             AppError::BadBody(_) => (StatusCode::BAD_REQUEST, "bad_request", None),
-            AppError::Upstream(_) => (StatusCode::BAD_GATEWAY, "upstream_error", None),
-            AppError::UpstreamTimeout(_) => (StatusCode::GATEWAY_TIMEOUT, "upstream_timeout", None),
+            AppError::Upstream(m) => (StatusCode::BAD_GATEWAY, "upstream_error", Some(m.clone())),
+            AppError::UpstreamTimeout(m) => (
+                StatusCode::GATEWAY_TIMEOUT,
+                "upstream_timeout",
+                Some(m.clone()),
+            ),
             AppError::NotFound(m) => (StatusCode::NOT_FOUND, "not_found", Some(m.clone())),
             AppError::Unavailable(m) => (
                 StatusCode::SERVICE_UNAVAILABLE,
