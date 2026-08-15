@@ -37,7 +37,7 @@ dev-run:
 dev-test:
     cargo watch -x 'nextest run'
 
-# 一次跑完: fmt + clippy + machete + doc + test.
+# 一次跑完: fmt + clippy + machete + doc + test + typos + deny.
 # --coverage: 测试阶段改用插桩编译 (cargo llvm-cov nextest), 产出覆盖率数据到
 # ${CARGO_TARGET_DIR}/llvm-cov-target/, 后续 just coverage-gate / coverage-html 直接消费, 无需重跑测试.
 # 默认不带 (本地开发追求快速反馈, 无需插桩开销).
@@ -65,6 +65,10 @@ dev-test:
 # 不带 --document-private-items: 项目内部 doc 链接指向 private item 是合理的 (维护者文档),
 # --document-private-items 会把这些当警告. 只查 public doc 的链接完整性即可守住门禁初衷.
 #
+# 尾部 typos + deny-offline (issue #149-8): 保证 "本地 check 全绿 ⇒ CI 阻塞项必绿"
+# (CI 的 typos / deny 阻塞 step 与本地跑同一命令). deny-offline 是纯离线检查 (不拉
+# advisory DB), 秒级; 全量 deny (含 advisories, 需联网) 仍由 just deny 单独提供.
+#
 # --locked: 见文件头 "约定" 段 (SSOT).
 check *ARGS:
     cargo fmt -- --check
@@ -80,6 +84,8 @@ check *ARGS:
         cargo nextest run --locked --no-fail-fast; \
         just check-features; \
     fi
+    just typos
+    just deny-offline
 
 # consistency-check feature 守卫 (CI 用): clippy + nextest 带 feature flag.
 # 该 feature 默认关闭, 包含视图正确性断言 (proxy.rs::assert_redactions_match_map).
@@ -228,8 +234,11 @@ mock-upstream:
     @echo "TODO: 第二步会引入 mockito-based 上游"
 
 # 检查依赖漏洞.
+# CARGO_AUDIT_DB (可选): advisory DB 的 git repo 路径. cargo-audit 只认 --db flag
+# (无同名 env), 这里显式透传, 让 CI 的持久卷缓存 (见 ci.yml audit step) 经 env 生效
+# (issue #149-3). 未设时不传 --db, 落回工具自身默认 (自动尊重 CARGO_HOME).
 audit:
-    cargo audit
+    cargo audit ${CARGO_AUDIT_DB:+--db "$CARGO_AUDIT_DB"}
 
 # license 合规 + 依赖 bans + advisory 二次审查 (cargo-deny).
 # 与 audit 的分工: audit 专注 RUSTSec CVE; deny 额外覆盖 license 不兼容 / 重复 crate
@@ -241,8 +250,18 @@ audit:
 deny:
     cargo deny check --hide-inclusion-graph
 
+# 纯离线版 deny (licenses + bans + sources, 不含 advisories) — CI 阻塞门禁与本地
+# check 链共用 (issue #149-3/-8). 理由: advisories 检查需联网拉 advisory DB, 网络抖动
+# 会让 "阻塞门禁" 随机失败; 而 advisories 的职责已由 continue-on-error 的 cargo audit
+# 覆盖 (两者本就互为冗余兜底). 离线部分只查本地 lockfile + deny.toml, 结果确定性强,
+# 适合做门禁. 全量检查 (含 advisories) 用上方 just deny.
+# 注: --offline 是 cargo-deny 的全局 flag (须在 check 子命令之前), 只指定要跑的
+# 检查组即不触发 advisory DB 拉取.
+deny-offline:
+    cargo deny --offline check --hide-inclusion-graph licenses bans sources
+
 # 拼写检查 (typos-cli). 项目大量英文术语与中文注释混排, 拼写错误难人工抓.
-# 默认不限制退出码语义: 发现 typo 即 exit 1. CI 里用 continue-on-error 非阻塞起步.
+# 发现 typo 即 exit 1. CI 阻塞 step 与本地 check 链尾跑同一命令 (issue #149-8).
 # 白名单 (合法标识符 / test fixture 误报) 见 _typos.toml, 每项需注释说明为何是误报.
 typos:
     typos

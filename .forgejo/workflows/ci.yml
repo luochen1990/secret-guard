@@ -164,18 +164,20 @@ jobs:
       # 评论用纯 curl + Forgejo API (curl 是零依赖的 shell 命令, 比 JS action 更轻量).
       # upsert 语义: 用 HTML marker 标记评论, 找到则 PATCH 更新 (PR 多次 push 不刷屏),
       # 找不到则 POST 新建. 额外守卫 steps.report.outcome == 'success': 报告没生成就不发空评论.
+      # API base 用 github.api_url (与 pre job 同源, 避免实例地址硬编码漂移).
       - name: Upsert PR comment
         if: always() && github.event_name == 'pull_request' && steps.report.outcome == 'success'
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          API_BASE: ${{ github.api_url }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           BODY: ${{ steps.report.outputs.body }}
         run: |
           set -eu
           MARKER='<!-- rust-diff-analyzer -->'
           FULL_BODY="$MARKER"$'\n'"$BODY"
-          API="https://git.lambda.lc/api/v1/repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments"
+          API="$API_BASE/repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments"
 
           # 1. 查找已有评论 (按 marker 识别).
           EXISTING_ID=$(curl -fsSL -H "Authorization: token $GITHUB_TOKEN" "$API" \
@@ -237,8 +239,11 @@ jobs:
         id: consistency
         run: just check-features
 
-      # just check --coverage: fmt + clippy + machete + 测试 (插桩编译, 产出 profdata 供 coverage-gate 消费).
-      # 测试集只跑这一次 (而非 check 跑一次 + coverage-gate 再跑一次).
+      # just check --coverage: fmt + clippy + machete + doc 门禁 + 测试 (插桩编译, 产出
+      # profdata 供 coverage-gate 消费) + typos + deny-offline. 测试集只跑这一次 (而非
+      # check 跑一次 + coverage-gate 再跑一次). typos/deny-offline 不设独立 step
+      # (见下方 cargo-deny+typos 说明块), 在本 step 链尾失败时 Diagnose 表显示
+      # coverage=failure, 需翻 log 末尾区分具体挂在哪一环 (typos / deny-offline / doc / 测试).
       - name: Check + coverage data
         id: coverage
         run: just check --coverage
@@ -286,6 +291,7 @@ jobs:
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          API_BASE: ${{ github.api_url }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           EXIT_CODE: ${{ steps.bench.outputs.exit_code }}
           REPORT: ${{ steps.bench.outputs.report }}
@@ -308,7 +314,7 @@ jobs:
           SUMMARY=$(echo "$REPORT" | grep -E '^[a-z]|^[[:space:]]+time:[[:space:]]+\[[^]]*%' | tail -40)
           BODY="$ICON **benchmark**: $VERDICT."$'\n\n```\n'"$SUMMARY"$'\n```'
           FULL_BODY="$MARKER"$'\n'"$BODY"
-          API="https://git.lambda.lc/api/v1/repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments"
+          API="$API_BASE/repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments"
 
           EXISTING_ID=$(curl -fsSL -H "Authorization: token $GITHUB_TOKEN" "$API" \
             | jq --arg m "$MARKER" '.[] | select(.body | contains($m)) | .id' | head -1)
@@ -356,16 +362,81 @@ jobs:
       - name: WebUI regression (Playwright)
         id: playwright
         continue-on-error: true
-        run: just check-webui
+        run: |
+          set +e  # 捕获 playwright 退出码 (continue-on-error 兜底, 这里永不失败)
+          just check-webui 2>&1 | tee webui.txt
+          EXIT=${PIPESTATUS[0]}
+          echo "exit_code=$EXIT" >> "$GITHUB_OUTPUT"
+          {
+            echo "report<<EOF"
+            # 失败时贴末尾 80 行 (错误摘要通常在尾部; 完整 log 在 CI artifact); 成功贴一行.
+            if [ "$EXIT" -ne 0 ]; then
+              tail -80 webui.txt
+            else
+              grep -E 'passed|flaky|did not run' webui.txt | tail -5
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          exit 0
+
+      # WebUI 结果 upsert 到 PR 评论 (issue #149-4): 照抄 bench/audit 的 marker 机制,
+      # 修复可见性不对称 — WebUI 是 continue-on-error 非阻塞 step, 失败若只埋在
+      # job log + artifact, "连续 N=20 次绿 → 转阻塞" 的升级判据 (#86-2) 永远无人察觉.
+      # 评论让每次 run 的 WebUI 状态在 PR 上可见, 维护者合并前一眼确认.
+      # API base 用 github.api_url (与其他 upsert step 同源, 避免实例地址硬编码漂移).
+      - name: Upsert WebUI result to PR
+        if: always() && github.event_name == 'pull_request' && steps.playwright.outputs.exit_code != ''
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          API_BASE: ${{ github.api_url }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EXIT_CODE: ${{ steps.playwright.outputs.exit_code }}
+          REPORT: ${{ steps.playwright.outputs.report }}
+        run: |
+          set -eu
+          MARKER='<!-- webui-regression -->'
+          if [ "$EXIT_CODE" = "0" ]; then
+            ICON="✅"
+            VERDICT="WebUI 回归测试通过"
+          else
+            ICON="⚠️"
+            VERDICT="WebUI 回归测试失败 (非阻塞, 合并前请人工核对; artifact 见 Upload Playwright artifacts)"
+          fi
+          BODY="$ICON **webui**: $VERDICT."$'\n\n```\n'"$REPORT"$'\n```'
+          FULL_BODY="$MARKER"$'\n'"$BODY"
+          API="$API_BASE/repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments"
+
+          EXISTING_ID=$(curl -fsSL -H "Authorization: token $GITHUB_TOKEN" "$API" \
+            | jq --arg m "$MARKER" '.[] | select(.body | contains($m)) | .id' | head -1)
+
+          PAYLOAD=$(jq -n --arg b "$FULL_BODY" '{body: $b}')
+          if [ -n "$EXISTING_ID" ]; then
+            curl -fsSL -X PATCH \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$PAYLOAD" \
+              "$API/$EXISTING_ID" >/dev/null
+            echo "Updated webui comment $EXISTING_ID"
+          else
+            curl -fsSL -X POST \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$PAYLOAD" \
+              "$API" >/dev/null
+            echo "Created new webui comment"
+          fi
 
       # WebUI 测试失败时上传 Playwright 产物 (截图/trace/html 报告) 供事后排查 (issue #86 子项 #2).
       # 仅在 Playwright step 失败时上传 (成功时不产生 artifact, 省存储).
+      # 条件用 exit_code output 而非 outcome: playwright step 恒 exit 0 (continue-on-error
+      # 已兜底, 输出捕获模式与 bench/audit 一致), outcome 恒为 success, 真实成败在 exit_code.
       # 用 Forgejo 官方 fork: GitHub 官方 actions/upload-artifact@v4 会检测非 GitHub 环境直接报错.
       # node20 是 action API 级别声明 (>=20 即可), VM 的 nodejs 24 满足 (act 执行 JS action
       # 只需 node 在 PATH, forgejo-runner-vm.mod.nix 已配).
-      # artifact 存 Forgejo server 端 (默认本地 FS, retention 90 天), 无需 server 侧配置.
+      # artifact 存 Forgejo server 端 (默认本地 FS), 无需 server 侧配置. retention 见 with 段.
       - name: Upload Playwright artifacts on failure
-        if: always() && steps.playwright.outcome == 'failure'
+        if: always() && steps.playwright.outputs.exit_code != '' && steps.playwright.outputs.exit_code != '0'
         continue-on-error: true
         uses: https://code.forgejo.org/forgejo/upload-artifact@v4
         with:
@@ -387,6 +458,11 @@ jobs:
       - name: cargo audit (CVE scan)
         id: audit
         continue-on-error: true
+        env:
+          # advisory DB 缓存到持久卷 (issue #149-3): 首次 clone 后跨 job 复用, 后续
+          # 增量 fetch. cargo-audit 不认 CARGO_AUDIT_DB env (只认 --db flag), justfile
+          # 的 audit recipe 显式透传该 env 到 --db, 使此缓存生效.
+          CARGO_AUDIT_DB: /var/lib/forgejo-runner/cache/advisory-db
         run: |
           set +e  # 即使 audit 报告 CVE 也继续捕获输出 (cargo audit 发现漏洞会 exit 1)
           just audit 2>&1 | tee audit.txt
@@ -408,6 +484,7 @@ jobs:
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          API_BASE: ${{ github.api_url }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           EXIT_CODE: ${{ steps.audit.outputs.exit_code }}
           REPORT: ${{ steps.audit.outputs.report }}
@@ -424,7 +501,7 @@ jobs:
             BODY="$BODY"$'\n\n```\n'"$REPORT"$'\n```'
           fi
           FULL_BODY="$MARKER"$'\n'"$BODY"
-          API="https://git.lambda.lc/api/v1/repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments"
+          API="$API_BASE/repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments"
 
           EXISTING_ID=$(curl -fsSL -H "Authorization: token $GITHUB_TOKEN" "$API" \
             | jq --arg m "$MARKER" '.[] | select(.body | contains($m)) | .id' | head -1)
@@ -446,28 +523,14 @@ jobs:
             echo "Created new audit comment"
           fi
 
-      # cargo-deny: license 合规 + 依赖 bans + advisory 二次审查 (issue #86 子项 #1).
-      # 与 cargo audit 的分工: audit 专注 RUSTSec CVE; deny 额外覆盖 license 不兼容 /
-      # 重复 crate 多版本 / 禁止依赖. 项目声明 MIT 且发布到 nixpkgs overlay, license 合规
-      # 是硬约束 (引入 copyleft 会污染下游). 配置见 deny.toml.
-      #
-      # 阻塞门禁: 本地实测全绿 (deny.toml allow 列表覆盖全部依赖 license), 升级为阻塞
-      # (用户决策: 当前能通过的测试直接加门禁, 不设观察期). multiple-versions 在 deny.toml
-      # 配为 warn 不阻断 (传递依赖暂态).
-      #
-      # 工具: cargo-deny. devShell 已含 (flake.nix); VM 通过 host-sw-bin fallback 提供.
-      - name: cargo-deny (license + bans + advisory)
-        id: deny
-        run: just deny
-
-      # typos-cli: 拼写检查 (issue #86 子项 #6).
-      # 项目大量英文术语与中文注释混排, 拼写错误难人工抓. typos-cli 是 Rust 项目标配.
-      #
-      # 阻塞门禁: 白名单 (_typos.toml) 已覆盖已知误报 (pn / hel / abd), 本地全绿 (用户决策:
-      # 当前能通过的测试直接加门禁). 新误报出现时更新 _typos.toml 即可 (属正常维护).
-      - name: typos (spell check)
-        id: typos
-        run: just typos
+      # cargo-deny + typos (license 合规 / bans / sources / 拼写, **阻塞**):
+      # 不设独立 step — 上方 `just check --coverage` 链尾已运行同一组确定性离线命令
+      # (just deny-offline + just typos, 见 justfile check recipe), 独立 step 只可能
+      # "check 内失败后被 skip" 或 "check 内通过后重跑必过", 永远不产生独立失败信号,
+      # 反而把失败归属混进 coverage step (issue #149-3/-8 的联动设计).
+      # 本地 `just check` 链尾跑同一命令, 保证本地全绿 ⇒ CI 阻塞项必绿.
+      # 全量 deny (含联网 advisories) 本地用 `just deny`; 配置见 deny.toml / _typos.toml,
+      # 详见根 AGENTS.md "cargo-deny" 段.
 
       # 诊断 step: job 失败时把所有阻塞 step 的 outcome 汇总贴到 PR 评论,
       # 帮助无 admin 权限的 contributor 定位失败 step (无日志访问权限时的 fallback).
@@ -477,6 +540,7 @@ jobs:
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          API_BASE: ${{ github.api_url }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -eu
@@ -487,13 +551,11 @@ jobs:
             echo "|------|----|---------|"
             echo "| Reclaim cache | reclaim | ${{ steps.reclaim.outcome }} |"
             echo "| consistency-check | consistency | ${{ steps.consistency.outcome }} |"
-            echo "| Check+coverage | coverage | ${{ steps.coverage.outcome }} |"
+            echo "| Check+coverage (含 doc/--locked/typos/deny-offline) | coverage | ${{ steps.coverage.outcome }} |"
             echo "| Coverage gate | coverage_gate | ${{ steps.coverage_gate.outcome }} |"
             echo "| File size | filesize | ${{ steps.filesize.outcome }} |"
-            echo "| cargo-deny | deny | ${{ steps.deny.outcome }} |"
-            echo "| typos | typos | ${{ steps.typos.outcome }} |"
             echo ""
-            echo "(非阻塞 step 如 bench/playwright/audit 有 continue-on-error, 不列.)"
+            echo "(bench/playwright/audit 有 continue-on-error 且各有 PR 评论, 不列.)"
             echo ""
             echo "**Job status**: ${{ job.status }}"
             echo "**Run**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
@@ -501,7 +563,7 @@ jobs:
           MARKER='<!-- ci-diagnose -->'
           BODY="$(cat /tmp/diag.md)"
           FULL_BODY="$MARKER"$'\n'"$BODY"
-          API="https://git.lambda.lc/api/v1/repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments"
+          API="$API_BASE/repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments"
           PAYLOAD=$(jq -n --arg b "$FULL_BODY" '{body: $b}')
           curl -fsSL -X POST \
             -H "Authorization: token $GITHUB_TOKEN" \
