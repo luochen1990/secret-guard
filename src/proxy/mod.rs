@@ -195,11 +195,8 @@ async fn dispatch(
 
     // 4. 协议匹配: 同协议走 IR / 字节透传; 跨协议走 codec 翻译.
     let secrets_snapshot = state.secrets.effective_raw();
-    // decision=Disabled 的 static secrets 明文放行 (不参与 redact, #161). 在 dispatch
-    // 层对 raw 请求字节扫描 — **必须在此层**: 同协议透传快捷分支 (effective secrets
-    // 全部 disabled 时 snapshot 为空, 不进 codec) 也需要告警, 且该场景 ("唯一的
-    // secret 被 disable") 恰是 #161 最核心的告警场景. disabled 非空且 value 命中
-    // 请求字节时逐条 WARN; 未命中零输出 (不刷屏).
+    // disabled secret 明文放行按请求 WARN (#161): 挂 dispatch 层 (raw bytes 扫描) 以
+    // 覆盖透传快捷分支, 命中才告警. 挂载层级论证见 warn_disabled_secrets_in_body doc.
     let disabled_secrets = state.secrets.disabled_statics();
     if !disabled_secrets.is_empty() {
         crate::redact::warn_disabled_secrets_in_body(&req_bytes, &disabled_secrets);

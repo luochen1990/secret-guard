@@ -1509,8 +1509,9 @@
       disabled: 'Disabled',
     };
     // secret decision=Disabled 的后果提示 (#161): Disabled = 关闭对该 secret 的保护,
-    // 其真实值将明文转发到上游 provider (不是"从列表忽略"). 供 option tooltip +
-    // change 确认弹窗 + PATCH 响应 warning 展示三处复用 (SSOT).
+    // 其真实值将明文转发到上游 provider (不是"从列表忽略"). 两处使用: option tooltip +
+    // change 确认弹窗. (PATCH 响应的兜底 alert 展示服务端 ack.warning — 后端 SSOT:
+    // src/web/api/crud.rs SECRET_DISABLED_WARNING, 文案与前端这份语义配对.)
     const SECRET_DISABLED_HINT = 'Disabled: protection OFF — the real secret value will be forwarded in plaintext to upstream providers.';
     const SOURCE_LABELS = {
       static: 'static',
@@ -3514,19 +3515,26 @@
         if (!sel || sel.dataset.kind !== cfg.kindParam) return;
         // secret → Disabled: 二次确认 (#161). Disabled = 关闭保护 (明文放行), 与直觉的
         // "忽略此条" 相反; confirm 是本文件既有交互先例 (deleteItem / deleteApiKey).
-        // 取消时: 数据未变 → renderKind 的 renderedHtml 短路不会重渲染, select 的
-        // 可见值停在 disabled — 必须显式还原 value (change 事件里 select 已是用户选的新值).
-        if (kind === 'secret' && sel.value === 'disabled'
+        const disablingSecret = kind === 'secret' && sel.value === 'disabled';
+        // 取消时数据未变 → renderedHtml 短路不重渲染, 必须显式还原可见值.
+        if (disablingSecret
             && !confirm(`${SECRET_DISABLED_HINT}\n\nSet secret ${sel.dataset.id} to Disabled?`)) {
-          const opts = [...sel.options];
-          const fallback = opts.find(o => o.defaultSelected) || opts[0];
-          if (fallback) sel.value = fallback.value;
+          restoreDecisionSelect(sel);
           return;
         }
         // confirm 已就地警示 → warnedInline 抑制 PATCH 成功后的二次 alert.
-        const warnedInline = kind === 'secret' && sel.value === 'disabled';
-        await patchDecision(kind, sel.dataset.id, sel.value, { warnedInline });
+        await patchDecision(kind, sel.dataset.id, sel.value, { warnedInline: disablingSecret });
       });
+    }
+
+    /// 把 decision 下拉还原到服务端真值 (defaultSelected 的 option, 兜底第一个).
+    ///
+    /// 使用场景: 用户改了下拉但请求未发出/失败 (confirm 取消 / PATCH 失败) — renderedHtml
+    /// 短路下数据未变不会重渲染 tbody, 下拉的可见值会停留在用户选的无效值 (stale),
+    /// 必须显式还原. confirm-取消与 patchDecision 失败路径共用 (单一定义点).
+    function restoreDecisionSelect(sel) {
+      const fallback = [...sel.options].find(o => o.defaultSelected) || sel.options[0];
+      if (fallback) sel.value = fallback.value;
     }
 
     // 通用 refresh / render (kind 特定的 row 渲染通过 cfg.renderRow 注入).
@@ -3543,6 +3551,16 @@
       }
     }
 
+    /// 数据未变化时跳过 tbody 重建 (#164-3): 行级 reconciliation 的最小替代 —
+    /// auto-refresh (3s) 空轮询 (数据静止) 不再打断自动化工具持有的 <tr> 引用
+    /// (isConnected 反复失效). 返回是否实际写入 (调用方据此决定 stats 等联动更新).
+    function replaceTbodyIfChanged(body, html) {
+      if (body.dataset.renderedHtml === html) return false;
+      body.dataset.renderedHtml = html;
+      body.innerHTML = html;
+      return true;
+    }
+
     function renderKind(kind) {
       const cfg = KINDS[kind];
       const list = cfg.list();
@@ -3550,14 +3568,7 @@
       const html = list.length === 0
         ? `<tr><td colspan="${cfg.colspan}" class="empty">${cfg.emptyText}</td></tr>`
         : list.map(item => cfg.renderRow(item)).join('');
-      // 数据未变化时跳过 DOM 重建 (#164-3): 行级 reconciliation 的最小替代 —
-      // auto-refresh (3s) 空轮询 (数据静止) 不再打断自动化工具持有的 <tr> 引用
-      // (isConnected 反复失效), 也不再重写 stats 条 (无谓的 style/layout).
-      // 数据真变化时仍整体重建 (罕见, 可接受).
-      if (body.dataset.renderedHtml === html) return;
-      body.dataset.renderedHtml = html;
-      renderStats(cfg.statsId, list);
-      body.innerHTML = html;
+      if (replaceTbodyIfChanged(body, html)) renderStats(cfg.statsId, list);
     }
 
     // 通用 delete / revert. revert = true 时跳过 confirm (用更准确的提示).
@@ -3659,11 +3670,7 @@
           </tr>
         `;
       }).join('');
-      // 数据未变化时跳过 DOM 重建 (#164-3, 同 renderKind 的 renderedHtml 短路).
-      if (body.dataset.renderedHtml === html) return;
-      body.dataset.renderedHtml = html;
-      body.innerHTML = html;
-      bindApiKeyActions(body);
+      if (replaceTbodyIfChanged(body, html)) bindApiKeyActions(body);
     }
 
     // 事件委托: 绑定到 tbody, 避免 onclick 内联 (XSS 加固, 参照 secrets/providers 模式).
@@ -4150,14 +4157,12 @@
     // 的二次 alert — 正常 UI 路径 confirm → PATCH 成功不再连弹第二个内容重复的弹窗.
     async function patchDecision(kind, id, mode, { warnedInline = false } = {}) {
       const cfg = KINDS[kind];
-      // 还原该行 decision 下拉的可见值到服务端真值 (defaultSelected). 失败/异常时调用:
-      // renderedHtml 短路下数据未变不会重渲染, 下拉会停留在用户选的失败值 (stale).
+      // 失败/异常时还原该行下拉的可见值到服务端真值 (renderedHtml 短路下数据未变
+      // 不会重渲染, 见 restoreDecisionSelect).
       const rollbackSelect = () => {
         const sel = document.querySelector(
           `select.decision-select[data-kind="${cfg.kindParam}"][data-id="${CSS.escape(id)}"]`);
-        if (!sel) return;
-        const fallback = [...sel.options].find(o => o.defaultSelected) || sel.options[0];
-        if (fallback) sel.value = fallback.value;
+        if (sel) restoreDecisionSelect(sel);
       };
       try {
         const r = await fetch(`${cfg.api}/${encodeURIComponent(id)}/decision`, {

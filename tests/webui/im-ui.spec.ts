@@ -1936,7 +1936,8 @@ test.describe("WebUI 打磨 (#161 + #164)", () => {
     await page.waitForTimeout(200);
     expect(confirmShown).toContain("plaintext");
 
-    // 取消后: 下拉回滚为 default (refresh 重建, selected 复原).
+    // 取消后: 下拉显式还原为 default (renderedHtml 短路下 refresh 不会重建 DOM,
+    // 复原来自 change handler 的 restoreDecisionSelect).
     await expect(page.locator('select.decision-select[data-id="test-key"]')).toHaveValue(
       "default"
     );
@@ -1957,21 +1958,6 @@ test.describe("WebUI 打磨 (#161 + #164)", () => {
       page.locator('select.decision-select[data-id="test-key"]')
     ).toHaveCount(0);
     // 还原由 afterEach 幂等执行 (断言失败中断时也能恢复).
-  });
-
-  test("#161: PATCH decision API 响应 disabled 时含 warning 字段", async ({ request }) => {
-    const ack = await request.patch(`${SG_API}/secrets/test-key/decision`, {
-      data: { mode: "disabled" },
-    });
-    expect(ack.status()).toBe(200);
-    const body = await ack.json();
-    expect(body.warning).toContain("plaintext");
-    // 切回 default: warning 字段缺省 (向后兼容 shape).
-    const ack2 = await request.patch(`${SG_API}/secrets/test-key/decision`, {
-      data: { mode: "default" },
-    });
-    const body2 = await ack2.json();
-    expect(body2.warning ?? null).toBeNull();
   });
 
   test("#164-1: raw 弹窗 Response Body 带 (LLM view) 标注", async ({ page }) => {

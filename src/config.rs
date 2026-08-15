@@ -735,7 +735,7 @@ impl<T: DynamicEntry> DynamicTable<T> {
     /// 所有被 decision=Disabled 完全排除的 static 项 (含完整 entry).
     ///
     /// 用途: 转发链对 "disabled secret 明文放行" 的按请求 WARN (#161) — 调用方拿到
-    /// 这些 entry 后扫描请求 IR, 命中才打日志 (未命中的请求零噪音).
+    /// 这些 entry 后扫描请求 raw bytes, 命中才打日志 (未命中的请求零噪音).
     /// 与 [`Self::effective_triples`] 对偶: 那里列出 Disabled 之外的所有项, 这里列出
     /// Disabled 的项. dynamic-only id 不受 decision 影响, 永不出现在结果中.
     pub fn disabled_statics(&self) -> Vec<T> {

@@ -430,7 +430,7 @@ pub fn warn_disabled_secrets_in_body(body: &[u8], disabled: &[SecretEntry]) -> u
             continue;
         }
         let needle = secret.value.as_bytes();
-        if !body.windows(needle.len().max(1)).any(|w| w == needle) {
+        if !body.windows(needle.len()).any(|w| w == needle) {
             continue;
         }
         hits += 1;
