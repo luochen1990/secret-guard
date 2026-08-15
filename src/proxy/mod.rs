@@ -9,7 +9,7 @@
 //!
 //! # 路由策略
 //! URL = `/{proto_short}/{provider_id}/*path`, 由 [`ForwardPath`] 解析:
-//! - `proto_short` 决定 ingress 协议 (o/a/g/l).
+//! - `proto_short` 决定 ingress 协议 (完整映射见 [`Protocol::ALL`], SSOT).
 //! - `provider_id` 决定目标 provider (含 egress 协议).
 //! - 若 provider 不存在 / 被禁用: 返回 404 / 503.
 //!
@@ -132,7 +132,7 @@ pub(crate) use {cross_proto::cross_proto_forward, fan_out::fan_out_streaming_wit
 /// 主 handler: 路径 `/{proto}/{name}/{*rest}`, 解析后透传到对应 provider.
 ///
 /// 路径段语义:
-/// - `proto` = ingress 协议的单字母简写 (o/a/g/l).
+/// - `proto` = ingress 协议的单字母简写 (完整映射见 [`Protocol::ALL`], SSOT).
 /// - `name` = 目标 provider id.
 /// - `rest` = 上游 path (含前导 `/`), query string 单独从 uri 拼回.
 ///

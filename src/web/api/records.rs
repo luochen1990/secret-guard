@@ -230,7 +230,7 @@ mod tests {
 
     #[test]
     fn parsed_view_unknown_proto_short_returns_error() {
-        // 路径首段是未知简写 (非 o/a/g/l) → from_short 返回 None.
+        // 路径首段是未知简写 (非 Protocol::ALL 内的任一 short) → from_short 返回 None.
         let req_body = r#"{"q":"hi"}"#;
         let record = parsed_test_record("/x/foo/bar", req_body, "", false);
         let resp = build_parsed_response(record);

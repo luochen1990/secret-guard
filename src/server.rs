@@ -12,7 +12,7 @@
 //! `auth.enabled = false` (默认): 单用户模式, 所有路由无认证 (向后兼容).
 //! `auth.enabled = true`: 双轨认证 —
 //! - 浏览器 WebUI (`/__sg/*`): OIDC Authorization Code + PKCE → cookie session.
-//! - SDK 转发 (`/{o|a|g|l}/*`): 本地 API key (`Authorization: Bearer sg_...`).
+//! - SDK 转发 (`/{proto_short}/{name}/*`): 本地 API key (`Authorization: Bearer sg_...`).
 //!
 //! ApiKeyStore 总是构造 (与 `auth.enabled` 无关), 让 WebUI 在单用户模式下也能
 //! 管理和预配置 key. `/api/api-keys` CRUD 路由在 `web::router()` 里无条件挂载
@@ -20,7 +20,7 @@
 //! 到 forwarding 路径.
 //!
 //! # 协议简写
-//! `o`=OpenAI, `a`=Anthropic, `g`=Gemini, `l`=oLLama. 见 [`crate::provider::Protocol`].
+//! 完整映射见 [`crate::provider::Protocol::ALL`] (SSOT), 以代码为准.
 //!
 //! # Shutdown
 //! 默认监听 SIGTERM / Ctrl-C, axum 进入 graceful shutdown 期间不再接受新连接,
