@@ -76,6 +76,7 @@ check *ARGS:
     cargo machete
     RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
     just check-webui-syntax
+    just check-contracts
     # cargo test --doc
     @if echo "{{ ARGS }}" | grep -q -- "--coverage"; then \
         cargo llvm-cov clean --workspace; \
@@ -504,6 +505,105 @@ check-docs:
       exit 1
     fi
     echo "check-docs: ✓ 文档 .rs::symbol 引用与 ci.md step 计数均与代码一致."
+
+# ─── 契约 property traceability lint (#144, 阻塞) ──────────────────────────
+# 防 "愿望清单腐化" 复发: contracts.md 的每条 property 必须有落地状态标注, 且
+# 标注锚点必须真实存在于 src/+tests/ (防幻影标注). 三种标注 (语义 SSOT 见
+# contracts.md §0.6):
+#   ✅  同名落地 — property 名本身在 src/+tests/ (*.rs/*.ts) 有测试载体级字面命中
+#       (word-match + 排除纯注释行: 命中行须含 fn/test 定义形态, 防 "写行注释伪造 ✅").
+#   🔁  改名落地 — 行内 `🔁→\`锚点\`` 起**全部**反引号锚点 (排除 `路径` 形态) 在扫描
+#       范围内 grep -F 命中. 锚点通常是实际测试名; 对 Playwright (中文测试标题) /
+#       注释审查项 / CI step 类守卫, 锚点可以是任意可 grep 的固定串.
+#   ⏳  待补 — 真零测试. 免 grep, 但计数报告 (补齐排期见 contracts.md §0.6).
+# 规则 (全部 fail-closed, 含输入侧):
+#   R0: contracts.md 缺失 / property 行数为 0 (锚点 grep 失效或行格式漂移) → 报错.
+#       property 行格式契约: 顶格 `- \`prop_...\`` (§0.6), 缩进/表格形式不被扫描.
+#   R1: property 行缺三种标注之一 → 报错.
+#   R2: ✅ 行但 property 名零命中 → 报错 (假 ✅).
+#   R3: 🔁 行但任一锚点零命中 → 报错 (指向不存在的测试 = 双重幻影).
+# 已知豁免面 (机械 lint 无法覆盖, 由 review + 计数公开兜底):
+#   - 泛串锚点 (如 `fn`) 字面可命中 — 锚点应写具体测试名, review 时核对.
+#   - ⏳ 免检 — 但计数在输出公开 + §0.6 优先级表追踪, 滥用会立刻可见 (⏳ 数暴增).
+# 扫描范围: src/ tests/ (*.rs/*.ts) + justfile + .forgejo/workflows/ci.yml
+# (后两处覆盖 CI step / recipe 类锚点, 如 VIEW-1 的 consistency-check step).
+# 工具: 纯 bash+grep+sed (runner VM corePackages, 无 rg 依赖 — 区别于 check-docs
+# 的 rg; 本检查进 `just check` 阻塞链, 必须在 CI runner 可运行).
+# 自测方式: 删任一行的标注 → 本 recipe 红; 恢复 → 绿.
+check-contracts:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    md=docs/design/contracts.md
+    errors=0; n_ok=0; n_renamed=0; n_pending=0
+    fail() { echo "::error::check-contracts: $*"; errors=$((errors+1)); }
+    # R0 (输入侧 fail-closed): 文件缺失 / 零 property 行 = 锚点失效或格式漂移,
+    # 循环零次执行会让 lint 静默假绿, 必须显式拦截 (同 check-docs 的 step=0 防护).
+    if [ ! -f "$md" ]; then
+      echo "::error::check-contracts: $md 不存在 (被移动/改名? lint 会静默假绿, 需同步 recipe 路径)."
+      exit 1
+    fi
+    # 同 R0: 在循环前拦截 (n_lines 供末尾汇总复用).
+    n_lines=$(grep -cE '^- `prop_' "$md" || true)
+    if [ "$n_lines" -eq 0 ]; then
+      echo "::error::check-contracts: property 行数为 0 (^- \`prop_\` 锚点失效或行格式漂移?)."
+      exit 1
+    fi
+    # grep -w 用 _ 作为 word 字符, prop_xxx 名天然是完整 word (不会被更长名误命中).
+    # 测试载体过滤: 命中行须含 "fn <name>" (Rust) 或 "test(\"...<name>...\", async"
+    # (Playwright 标题; name 紧跟 test( 亦可) 定义形态, 排除纯注释 (/// doc / // 行)
+    # 的同名提及 — 只在注释里写一遍 property 名不构成 ✅ 落地.
+    hit_word() {
+      grep -rw --include='*.rs' --include='*.ts' -e "$1" src tests 2>/dev/null \
+        | grep -qE "(fn +$1|test\([^\"]*$1|$1[^\"]*\", *async)"
+    }
+    # 锚点固定串匹配: 不限文件类型 (justfile / ci.yml 无后缀匹配需求), grep -F 字节级.
+    hit_anchor() { grep -rqF -- "$1" src tests justfile .forgejo/workflows/ci.yml 2>/dev/null; }
+    # 🔁 行的全部锚点: 🔁→ 起的每个反引号对, 排除 `路径` 形态 (含 / 或 . 前后缀的
+    # 文件引用, 如 `src/redact.rs`); 多锚点全部校验 (L1: 第二锚点漂移也须拦截).
+    anchors_of() {
+      printf '%s' "$1" | sed -n 's/.*🔁→//p' \
+        | grep -oE '`[^`]+`' | tr -d '`' | grep -vE '/|\.rs$|\.ts$|\.md$|\.yml$' || true
+    }
+    while IFS= read -r line; do
+      prop=$(printf '%s' "$line" | sed -n 's/^- `\(prop_[a-z0-9_]*\)`.*/\1/p')
+      if [ -z "$prop" ]; then continue; fi
+      case "$line" in
+        *'⏳'*)
+          n_pending=$((n_pending+1))
+          ;;
+        *'🔁'*)
+          anchors=$(anchors_of "$line")
+          bad_anchor=""
+          # while read 整串消费: 防 word-splitting 的 glob 意外展开 (锚点含 * ? 时
+          # for-in 会展开成 cwd 文件列表) + 多词锚点保持整串校验语义.
+          while IFS= read -r anchor; do
+            hit_anchor "$anchor" || { bad_anchor="$anchor"; break; }
+          done <<< "$anchors"
+          if [ -z "$anchors" ]; then
+            fail "$prop: 🔁 标注缺锚点 (格式: 🔁→\`实际测试名\`)"
+          elif [ -n "$bad_anchor" ]; then
+            fail "$prop: 🔁 锚点 '$bad_anchor' 在 src/+tests/+justfile+ci.yml 零命中 (幻影锚点?)"
+          else
+            n_renamed=$((n_renamed+1))
+          fi
+          ;;
+        *'✅'*)
+          if hit_word "$prop"; then
+            n_ok=$((n_ok+1))
+          else
+            fail "$prop: 标 ✅ 但同名测试零命中 — 改名落地应用 🔁→\`实际名\`, 真零测试用 ⏳"
+          fi
+          ;;
+        *)
+          fail "$prop: 缺落地状态标注 (✅ 同名 / 🔁→\`实际名\` / ⏳ 待补; 见 contracts.md §0.6)"
+          ;;
+      esac
+    done < <(grep -E '^- `prop_' "$md")
+    if [ "$errors" -gt 0 ]; then
+      echo "check-contracts: $errors 处标注缺失/失效 (见上方 ::error)."
+      exit 1
+    fi
+    echo "check-contracts: ✓ $n_lines 条全量标注有效 — ✅ 同名 $n_ok / 🔁 改名 $n_renamed / ⏳ 待补 $n_pending (优先级见 contracts.md §0.6)."
 
 # ─── PR diff 拆解 ──────────────────────────────────────────────────────────
 # 区分 diff 中的 prod 代码 vs test 代码, 用于 review 时判断真实膨胀.
