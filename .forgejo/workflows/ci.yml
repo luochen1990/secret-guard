@@ -112,6 +112,26 @@ jobs:
       LLVM_PROFDATA: /run/current-system/sw/bin/llvm-profdata
       CARGO_TARGET_DIR: /var/lib/forgejo-runner/cache/cargo-target
     steps:
+      # ─── single-job 假设的运行时防御 (issue #149-7) ─────────────────────────
+      # 在 cache 卷根 (CARGO_TARGET_DIR 的父目录) 写 run_id 锁文件, job 结束时校验
+      # 未被覆盖. 不放在 CARGO_TARGET_DIR 内 — Reclaim step 的兜底全清
+      # `rm -rf $CARGO_TARGET_DIR/*` 会连带删掉它, 导致释放校验误报.
+      # 若 runner 未来改为多并发 (假设破裂), 两个 job 交替写同一 target dir:
+      # 后启动的 job 覆盖锁文件, 先启动的 job 结束时校验失败 → 把 "静默产物污染 /
+      # 偶现怪异失败" 转化为带指向性的硬失败. 届时按上方 env 段注释的应对预案改造
+      # (串行化或按 run_id 隔离), 然后可移除本防御.
+      # 放在所有 step 之前 (checkout 也可能写 target dir).
+      # 锁路径从 CARGO_TARGET_DIR 派生 (卷根), 末尾的 verify step 同源派生 — 两处联动.
+      - name: Guard single-job assumption (acquire target-dir lock)
+        id: lock
+        run: |
+          set -eu
+          : "${CARGO_TARGET_DIR:?}" # 防御本地摘脚本复现: 未设时锁会静默落到 cwd
+          LOCK="$(dirname "$CARGO_TARGET_DIR")/.ci-target-dir-lock"
+          mkdir -p "$(dirname "$LOCK")"
+          echo "$GITHUB_RUN_ID" > "$LOCK"
+          echo "lock: acquired target dir for run $GITHUB_RUN_ID (lock=$LOCK)"
+
       # PR 事件需要 fetch base+head 以支持三点 diff (origin/<base>...HEAD);
       # 其他事件 (push master / workflow_dispatch) 无 diff 需求, 保持浅克隆 --depth 1 省时.
       - name: Checkout via SSH
@@ -200,6 +220,24 @@ jobs:
               "$API" >/dev/null
             echo "Created new comment"
           fi
+
+      # ─── 工具链版本留痕 (issue #149-5b) ─────────────────────────────────────
+      # CI 工具链由 VM nixpkgs 决定, 三源 (CI/devShell/rust-toolchain.toml) 漂移时
+      # clippy 新 lint 可无预警阻塞所有 PR. 本 step 把 rustc 版本写入 step output,
+      # 由 Diagnose 评论携带, 留下每次 run 的工具链快照 (事后可追溯 "哪天升了").
+      # 放在首个阻塞 step 之前 + if: always() — 核心动机场景正是 "后续 step 因新
+      # lint 失败", 那时本 step 必须已跑过 (若放阻塞 step 之后会被 skip, 拿不到版本).
+      # rustc --version 零依赖秒级, 不需要 checkout.
+      # 选择并入 diag 评论而非独立评论/artifact: 零额外 API 调用, 成本最低.
+      # MSRV 下界的 SSOT 在 Cargo.toml rust-version (issue #149-5a).
+      - name: Record toolchain version
+        id: toolchain
+        if: always()
+        run: |
+          set -eu
+          RUSTC_VERSION=$(rustc --version)
+          echo "rustc_version=$RUSTC_VERSION" >> "$GITHUB_OUTPUT"
+          echo "toolchain snapshot: $RUSTC_VERSION"
 
       # 持久 cache 卷 (10G tmpfs) 防满清理: profraw 文件每次 CI 累积 ~45MB, ~110 次后触顶
       # 导致 ENOSPC, 所有 cargo 编译步骤立即失败. 本步在任何 cargo 命令前先释放空间.
@@ -383,7 +421,6 @@ jobs:
       # 修复可见性不对称 — WebUI 是 continue-on-error 非阻塞 step, 失败若只埋在
       # job log + artifact, "连续 N=20 次绿 → 转阻塞" 的升级判据 (#86-2) 永远无人察觉.
       # 评论让每次 run 的 WebUI 状态在 PR 上可见, 维护者合并前一眼确认.
-      # API base 用 github.api_url (与其他 upsert step 同源, 避免实例地址硬编码漂移).
       - name: Upsert WebUI result to PR
         if: always() && github.event_name == 'pull_request' && steps.playwright.outputs.exit_code != ''
         continue-on-error: true
@@ -532,9 +569,27 @@ jobs:
       # 全量 deny (含联网 advisories) 本地用 `just deny`; 配置见 deny.toml / _typos.toml,
       # 详见根 AGENTS.md "cargo-deny" 段.
 
+      # ─── nix package 验证 (issue #149-6, 非阻塞起步) ────────────────────────
+      # 验证 nix/package.nix 的 cargoHash 与 Cargo.lock 一致 (漂移时部署侧 ~/ws/nixos
+      # 重建才暴露, 排障跨仓库). runner 是 NixOS microvm 天然有 nix; store 缓存跨 job
+      # 复用, 热路径增量仅重编 workspace crate.
+      # continue-on-error: true (非阻塞起步): 首次/依赖大版本升级时全量 vendor 编译
+      # 较慢, 且 cargoHash 过期是已知高频事件 (升级依赖的 PR 必然触发).
+      # 转阻塞判据: 连续 N=20 次 master push 本 step 跑绿后, 移除 continue-on-error
+      # (判定方式同 WebUI step: 翻 Actions 历史筛 master + 本 step 取最近 20 次全绿).
+      # 注意: 依赖升级 PR 会合法地使 cargoHash 过期 → 本 step 失败属预期信号 (提醒
+      # 同步 nix/package.nix), 不应因非阻塞而被忽视, 维护者需人工关注.
+      - name: nix build (cargoHash validation)
+        id: nixbuild
+        continue-on-error: true
+        timeout-minutes: 30
+        run: nix build .#secret-guard -L
+
       # 诊断 step: job 失败时把所有阻塞 step 的 outcome 汇总贴到 PR 评论,
       # 帮助无 admin 权限的 contributor 定位失败 step (无日志访问权限时的 fallback).
       # 仅 PR 事件 + job 失败时触发. continue-on-error 兜底 (评论失败不影响 job 状态).
+      # 工具链版本 (issue #149-5b) 携带在此评论: 每次失败留痕 rustc 版本, 便于事后
+      # 追溯 "三源漂移" 类问题 (clippy 新 lint 突然阻塞).
       - name: Diagnose failure (post step outcomes to PR)
         if: always() && failure() && github.event_name == 'pull_request'
         continue-on-error: true
@@ -547,15 +602,20 @@ jobs:
           {
             echo "## 🔍 CI 诊断报告 (step outcomes)"
             echo ""
+            echo "**Toolchain**: ${{ steps.toolchain.outputs.rustc_version || 'unknown (step skipped)' }}"
+            echo ""
             echo "| Step | id | Outcome |"
             echo "|------|----|---------|"
+            echo "| Guard lock | lock | ${{ steps.lock.outcome }} |"
             echo "| Reclaim cache | reclaim | ${{ steps.reclaim.outcome }} |"
             echo "| consistency-check | consistency | ${{ steps.consistency.outcome }} |"
             echo "| Check+coverage (含 doc/--locked/typos/deny-offline) | coverage | ${{ steps.coverage.outcome }} |"
             echo "| Coverage gate | coverage_gate | ${{ steps.coverage_gate.outcome }} |"
             echo "| File size | filesize | ${{ steps.filesize.outcome }} |"
+            echo "| nix build | nixbuild | ${{ steps.nixbuild.outcome }} |"
             echo ""
-            echo "(bench/playwright/audit 有 continue-on-error 且各有 PR 评论, 不列.)"
+            echo "(bench/playwright/audit 有 continue-on-error 且各有 PR 评论, 不列;"
+            echo " nixbuild 虽同为非阻塞, 但特意列出 — cargoHash 漂移高频且无独立评论.)"
             echo ""
             echo "**Job status**: ${{ job.status }}"
             echo "**Run**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
@@ -570,6 +630,32 @@ jobs:
             -H "Content-Type: application/json" \
             -d "$PAYLOAD" \
             "$API" >/dev/null && echo "Diag comment posted" || echo "POST diag comment failed (non-fatal)"
+
+      # ─── single-job 假设的运行时防御: 释放校验 (issue #149-7) ────────────────
+      # 校验锁文件未被覆盖 (被覆盖 = 有第二个 job 并发写了同一 target dir, 假设破裂).
+      # if: always() — 无论 job 成败都校验 (污染检测优先于成败判定). 失败消息指向
+      # 上方 env 段的并发假设注释, 维护者可按预案改造. 放在最后: 需等所有写 target
+      # dir 的 step 结束后校验才有意义. 锁路径与开头的 acquire step 同源派生 (卷根).
+      - name: Guard single-job assumption (verify target-dir lock)
+        if: always()
+        run: |
+          set -eu
+          : "${CARGO_TARGET_DIR:?}" # 防御本地摘脚本复现: 未设时锁会静默落到 cwd
+          LOCK="$(dirname "$CARGO_TARGET_DIR")/.ci-target-dir-lock"
+          CURRENT=$(cat "$LOCK" 2>/dev/null || echo "MISSING")
+          if [ "$CURRENT" = "MISSING" ]; then
+            echo "::error::target-dir lock file missing: $LOCK (deleted mid-job? volume wiped?)."
+            echo "锁文件在 job 开始时由 acquire step 写入, 正常路径不可能消失 — 排查卷状态."
+            exit 1
+          fi
+          if [ "$CURRENT" != "$GITHUB_RUN_ID" ]; then
+            echo "::error::target-dir lock file corrupted: expected run $GITHUB_RUN_ID, got '$CURRENT'."
+            echo "另一个 job 并发写了同一 CARGO_TARGET_DIR — runner single-job 假设已破裂."
+            echo "按本 job env 段 '并发互斥假设' 注释的预案处理 (串行化 concurrency 或按 run_id 隔离),"
+            echo "详见 .forgejo/workflows/ci.yml 与 docs/ci.md '并发互斥假设' 段."
+            exit 1
+          fi
+          echo "lock: verified (run $GITHUB_RUN_ID, no concurrent writer)"
 
       # 历史: 早期曾用 "Bench compile check (release, --no-run)" 方案, 因 release 全量编译慢而移除;
       # 后改为 "dev profile --no-run" (上方已进一步升级为完整 bench 运行). 此处保留备选记录.

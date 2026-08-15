@@ -3,6 +3,12 @@
 # in flake.nix, currently 1.96). This file is kept for non-Nix contributors.
 # Use "stable" so rustup tracks the latest stable release; the exact nixpkgs
 # version may drift slightly but both paths stay on a recent stable rustc.
+#
+# 免责声明 (issue #149-5): 本文件不约束 CI / devShell 的工具链 —
+#   - CI: 工具链由 runner VM 的 nixpkgs 决定 (见 ci.yml 头部注释);
+#   - devShell: 由 flake.nix 锁定的 nixos-unstable 决定;
+#   - 本文件仅对 rustup 用户 (非 Nix 贡献者) 生效.
+# MSRV 下界的 SSOT 是 Cargo.toml 的 rust-version 字段.
 [toolchain]
 channel = "stable"
 components = ["rustfmt", "clippy"]

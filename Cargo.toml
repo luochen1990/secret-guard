@@ -2,6 +2,10 @@
 name = "secret-guard"
 version = "0.1.0"
 edition = "2024"
+# MSRV (issue #149-5): edition 2024 要求 rustc >= 1.85, 本项目按 devShell 实际工具链
+# (nixos-unstable, 当前 1.96) 声明下界. CI 与 devShell 不读此字段做强制 (工具链由
+# nixpkgs 决定), 它是给 cargo 报错信息 / 依赖 resolver / 维护者的明确契约.
+rust-version = "1.96"
 description = "A lightweight LLM gateway that prevents accidental secret leakage"
 license = "MIT"
 
