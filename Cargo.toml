@@ -48,7 +48,6 @@ rand = "0.8"
 tower-sessions = { version = "0.14", features = ["memory-store"] }
 axum-login = "0.18"
 openidconnect = { version = "4", default-features = false, features = ["reqwest", "rustls-tls"] }
-time = "0.3"
 
 [dev-dependencies]
 tokio-test = "0.4"
@@ -76,7 +75,3 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
-
-# cargo-machete 误报: time 被 tower_sessions::cookie::time::Duration 间接使用.
-[package.metadata.cargo-machete]
-ignored = ["time"]
