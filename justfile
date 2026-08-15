@@ -31,7 +31,7 @@ dev-run:
 dev-test:
     cargo watch -x 'nextest run'
 
-# 一次跑完: fmt + clippy + machete + test.
+# 一次跑完: fmt + clippy + machete + doc + test.
 # --coverage: 测试阶段改用插桩编译 (cargo llvm-cov nextest), 产出覆盖率数据到
 # ${CARGO_TARGET_DIR}/llvm-cov-target/, 后续 just coverage-gate / coverage-html 直接消费, 无需重跑测试.
 # 默认不带 (本地开发追求快速反馈, 无需插桩开销).
@@ -54,12 +54,15 @@ dev-test:
 # doc 检查: cargo doc --no-deps -D warnings 验证 rustdoc 能编译 (含跨文件 doc 链接).
 # 项目大量使用 //! 头部文档 + contracts.md 链接, doc 链接写错 (路径错/跨 crate 错) 在 CI 不会
 # 被 clippy 发现, 只有手跑 cargo doc 才暴露.
+# 放在 fmt/clippy/machete 之后的公共段 (两分支都跑, issue #141): CI 走 --coverage 分支
+# 也能闭环; doc 构建复用 debug/ 元数据缓存, 增量开销秒级, 不拖慢 coverage 路径.
 # 不带 --document-private-items: 项目内部 doc 链接指向 private item 是合理的 (维护者文档),
 # --document-private-items 会把这些当警告. 只查 public doc 的链接完整性即可守住门禁初衷.
 check *ARGS:
     cargo fmt -- --check
     cargo clippy --all-targets -- -D warnings
     cargo machete
+    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
     just check-webui-syntax
     # cargo test --doc
     @if echo "{{ ARGS }}" | grep -q -- "--coverage"; then \
@@ -68,7 +71,6 @@ check *ARGS:
     else \
         cargo nextest run --no-fail-fast; \
         just check-features; \
-        RUSTDOCFLAGS="-D warnings" cargo doc --no-deps; \
     fi
 
 # consistency-check feature 守卫 (CI 用): clippy + nextest 带 feature flag.
