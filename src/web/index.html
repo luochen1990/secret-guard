@@ -1553,6 +1553,15 @@
       timelineOldest: null,
       timelineReachedTop: false,
       loadingOlder: false,
+      // timeline 代际 (UI-7): "timeline 世界" 的版本号, 只增不减. 谁换世界谁 bump
+      // (loadTimeline / clearTimeline), 谁要写 records 谁先捕获再落地前对账 —
+      // 在途响应 (sync diff / loadOlder 页 / 旧 loadTimeline) 到达时若代数不匹配,
+      // 说明世界已换, timeline 段丢弃, 防跨会话脏 append.
+      timelineGen: 0,
+      // 当前 timelineRecords 归属的 session (与 selectedSession 区分: 点击后
+      // loadTimeline 在途时两者不同步). sync 构造游标前校验两者一致, 不一致
+      // 发 null 游标, 防止矛盾游标触发后端 "全链重放" 契约 (UI-7 形态①).
+      timelineSession: null,
       // tail: 当前末轮的 response 抽屉数据 (视图级, 由 GET /sessions/{sid}/timeline
       // 初始加载 + POST /api/sync 增量推送). 替代旧 RecordSummary 内嵌的 response 字段.
       // 后端契约: 非末轮 response 已被下一轮 delta 的 assistant message 消费,
@@ -1650,11 +1659,20 @@
     // - timeline diff (仅 selected session): new_rounds 追加到末尾 + tail 始终替换
     //   (后端按 length 判断是否变化, 前端直接更新抽屉即可).
     // - selected = null (无选中) 时 timeline 为 null, 仅更新 sidebar.
+    //
+    // 并发一致性 (UI-7): 出发时捕获 timelineGen; 响应到达时若代数已变 (用户切换了
+    // 会话), timeline 段丢弃 (sidebar 段照常应用 — 它与 timeline 世界无关).
+    // 游标构造前校验 timelineSession === selectedSession: 点击后 loadTimeline 在途
+    // 时两者不一致, 此时发 null 游标 (sidebar-only), 防止矛盾游标触发后端
+    // "after 不属于本 session → 全链重放" 契约把整条链 append 进旧 records.
     async function sync() {
+      // 出发时快照: 世界代数 + 游标合法性 (后续 await 期间两者都可能变化).
+      const gen = state.timelineGen;
+      const cursorValid = state.timelineSession === state.selectedSession;
       try {
         // 构造请求: selected 游标 + expanded 列表.
         const body = {
-          selected: state.selectedSession ? {
+          selected: cursorValid && state.selectedSession ? {
             session_id: state.selectedSession,
             latest_round: state.timelineRecords.length > 0
               ? state.timelineRecords[state.timelineRecords.length - 1].id
@@ -1695,19 +1713,27 @@
         }
 
         // 3. timeline diff (增量, 仅 selected session).
-        if (data.timeline) {
+        // UI-7 对账: 代数已变 (在途期间用户切换会话) → 本响应描述的是过气世界,
+        // timeline 段整体丢弃. sidebar 段 (上方) 不受影响, 照常应用.
+        if (data.timeline && gen === state.timelineGen) {
           // 先更新 tail (renderTimeline 内部的 drawer layout 会读 state.tail).
           state.tail = data.timeline.tail;
-          // new_rounds: latest_round 之后的新 round (可空). 追加 + reconcile.
-          let newCount = 0;
-          const wasFollow = state.timelineFollow;
-          if (data.timeline.new_rounds && data.timeline.new_rounds.length > 0) {
-            state.timelineRecords.push(...data.timeline.new_rounds);
-            newCount = data.timeline.new_rounds.length;
+          // 幂等去重: 双 sync 并发时 (tick + 主动) 各自可能带回相同 new_rounds,
+          // 按 round id 过滤已存在的, 防双倍 append (node id 全局唯一, 去重安全).
+          let fresh = [];
+          if (data.timeline.new_rounds) {
+            const existing = new Set(state.timelineRecords.map(r => r.id));
+            fresh = data.timeline.new_rounds.filter(r => !existing.has(r.id));
+          }
+          if (fresh.length > 0) {
+            // wasFollow 须在 renderTimeline 之前捕获: 语义是 "新 round 到达前"
+            // 的 follow 态 (renderTimeline 内的滚动会改变它).
+            const wasFollow = state.timelineFollow;
+            state.timelineRecords.push(...fresh);
             renderTimeline();  // reconcile 会 append 新 round + 刷 drawer (用已更新的 tail).
-            handleNewRounds(newCount, wasFollow);
+            handleNewRounds(fresh.length, wasFollow);
           } else {
-            // 仅 tail 变化 (response 增量): 刷抽屉内容 + 末轮 header.
+            // 无新 round (仅 tail 增量 / 全为重复): 刷抽屉内容 + 末轮 header.
             renderDrawer();
             updateLastRoundHeader();
           }
@@ -1788,6 +1814,8 @@
         return;
       }
       // 指纹: session_id + record_count + preview + status + state.selectedSession + expandedSessions.
+      // rounds 占位符的覆盖不依赖此指纹: sync() 在 renderSidebar (可能短路) 之后, 对每个
+      // rounds 缓存有变化的 sid 显式调 renderRounds(sid), 直接替换 .round-list 内容.
       const expandedKey = [...expandedSessions].sort().join(',');
       const fingerprint = state.filterMode + '|' + state.selectedSession + '|' + state.selectedRound + '|' + expandedKey + '|' + list.map(s =>
         `${s.session_id}:${s.record_count}:${s.latest_resp_status}:${s.latest_error || ''}:${(s.redactions||[]).length}:${s.preview || ''}:${s.model || ''}:${s.latest_at}`
@@ -1909,8 +1937,12 @@
     //
     // 展开 + 选中: 标记 expanded (下次 sync 自动回传该 sid 的 round 详情到 sidebar 三级),
     // 然后全量加载 timeline (GET /sessions/{sid}/timeline?limit=TIMELINE_PAGE) 并滚到底.
-    // 不再先拉 sessionRounds 再 selectRound — sync 的 expanded rounds 会异步填充,
-    // timeline 全量加载是进入会话的主路径.
+    // 不再先拉 sessionRounds 再 selectRound — timeline 全量加载是进入会话的主路径.
+    //
+    // UI-7: 立即触发一次 sync (不等 3s tick) 回填 sidebar 三级菜单 — 否则
+    // "Loading rounds…" 占位符要等下一次轮询 (最长 3s; auto-refresh 关闭时无限期).
+    // 此时 loadTimeline 在途, timelineSession 尚未指向新会话 → sync 的游标守卫
+    // 自动发 null 游标 (sidebar-only), 不产生矛盾游标, 无竞态.
     async function toggleSession(sessionId) {
       if (expandedSessions.has(sessionId)) {
         // 折叠.
@@ -1923,6 +1955,8 @@
       expandedSessions.add(sessionId);
       state.selectedSession = sessionId;
       renderSidebar(); // 立即显示 expanded 状态 (round-list 显示 loading 直到 sync 回填).
+      // 立即 sidebar 回填 (fire-and-forget; loadTimeline 不依赖它).
+      sync();
       // 首次进入: 全量加载 timeline. loadTimeline 内部会滚到底 (IM 风格) + 进入 follow.
       // scroll:'bottom' 由 loadTimeline 末尾的 scrollTimelineToBottomForce 提供.
       await loadTimeline(sessionId);
@@ -1978,8 +2012,11 @@
         await loadTimeline(sid, { scroll: 'highlight' });
       }
       // 循环向前加载直到包含目标 round 或到顶.
+      // UI-7: 每轮检查世界归属 — 在途翻页期间用户切了会话时立即停止 (gen 对账已
+      // 保证数据不污染, 此处只是避免对错世界连翻 100 页 + fallback 高亮漂移).
       let safety = 0;
       while (!state.timelineRecords.some(r => r.id === targetId) && !state.timelineReachedTop) {
+        if (state.timelineSession !== sid) return;
         if (++safety > 100) break; // 安全限位 (防异常死循环).
         await loadOlder();
       }
@@ -2197,19 +2234,35 @@
     //   'highlight':     滚到 selectedRound 的 70% 定位, 用于 selectRound path 2
     //                    (点具体轮次, 不应被强拉到底).
     async function loadTimeline(sid, { scroll: scrollMode = 'bottom' } = {}) {
+      // UI-7: bump 代数 = 声明 "我要构建新世界". 在途的旧世界响应 (sync diff /
+      // 旧 loadTimeline) 落地时对账失败被丢弃. ++ 在同步段第一行, 点击处理完的
+      // 瞬间生效, 无窗口.
+      // 注意: timelineSession 不在此处设置 — 在途期间保持旧值, sync 的游标守卫
+      // (timelineSession === selectedSession) 据此识别 "records 尚未落地", 发 null
+      // 游标. 若在此处提前设置, 紧随其后的外部 sync 会看到两者相等但 records
+      // 仍是旧会话的 → 矛盾游标漏网.
+      const gen = ++state.timelineGen;
       recordDetailCache.clear();  // 切换轮次时清空 (避免无界增长 + 旧数据残留)
       try {
         const r = await fetch(`${API_SESSIONS}/${sid}/timeline?limit=${TIMELINE_PAGE}`, { cache: 'no-store' });
         if (!r.ok) {
           if (r.status === 404) {
+            // 404 落地前也要对账: 用户可能已切走, 别把 "Session no longer exists"
+            // 写到别人的世界上 (清空动作留给下一轮 sync 的淘汰检查).
+            if (gen !== state.timelineGen) return;
             clearTimeline();
             document.getElementById('detail').innerHTML =
               '<div class="empty">Session no longer exists</div>';
+            renderSidebar();  // 清 selectedSession 后同步 .active 态 (与 eviction 路径一致)
           }
           return;
         }
         const data = await r.json();
+        // UI-7 对账: 在途期间世界已换 → 丢弃 (迟到的全量替换会覆盖新世界).
+        if (gen !== state.timelineGen) return;
         state.timelineRecords = data.rounds || [];
+        // 对账通过, 认领世界: 此后 sync 的游标守卫放行 (records 与归属一致).
+        state.timelineSession = sid;
         state.tail = data.tail || null;
         state.timelineOldest = state.timelineRecords.length > 0 ? state.timelineRecords[0].id : null;
         // has_more=false → 已到顶; has_more=true → 可能还有更老的 (loadOlder 时探测).
@@ -2226,7 +2279,9 @@
         syncFollowMode();
       } catch (e) {
         console.error(e);
-        // 错误时也清理抽屉/导航 (避免残留旧会话内容).
+        // 错误时也清理抽屉/导航 (避免残留旧会话内容). 世界已被本函数 bump,
+        // 对账必失败的场景是 "我们又切走了" — 那时错误也不该写进新世界.
+        if (gen !== state.timelineGen) return;
         clearTimeline();
         document.getElementById('detail').innerHTML =
           `<div class="empty status-err">Failed to load timeline: ${escapeHtml(e.message)}</div>`;
@@ -2234,6 +2289,9 @@
     }
 
     function clearTimeline() {
+      // UI-7: 清空 records 也是换世界 → bump, 作废在途的旧 loadTimeline 回填.
+      state.timelineGen++;
+      state.timelineSession = null;
       state.timelineRecords = [];
       state.timelineOldest = null;
       state.timelineReachedTop = false;
@@ -2258,8 +2316,17 @@
     // 惰性加载: 向上滚到顶时 prepend 更早的轮次. 保持滚动锚点.
     // 新 API: GET /sessions/{sid}/timeline?before=X&limit=N (取 X 之前更老的 N 条, 不含 X).
     async function loadOlder() {
+      // UI-7 入口游标守卫 (与 sync 的 cursorValid 对仗): loadTimeline 在途期间
+      // (gen 已 bump, timelineOldest 仍是旧会话的), 对旧内容滚顶触发本函数会发
+      // "selectedSession=B + before=A_oldest" 混合游标 → 后端跨 session 游标返回
+      // 404 → !ok 分支把 reachedTop=true 写进 B 的同代新世界 (gen 对账拦不住,
+      // 输入侧已脏), 永久禁用 B 的向上翻页. 归属未认领时直接不翻页.
+      if (state.timelineSession !== state.selectedSession) return;
       if (state.loadingOlder || state.timelineReachedTop || !state.timelineOldest) return;
       state.loadingOlder = true;
+      // UI-7: 捕获当前代 (不 bump — prepend 更老的轮次不改变游标语义, 与在途
+      // sync diff 同属一个世界, 作废它反而丢数据).
+      const gen = state.timelineGen;
       const pane = document.querySelector('#detail');
       const oldScrollHeight = pane ? pane.scrollHeight : 0;
       const oldScrollTop = pane ? pane.scrollTop : 0;
@@ -2269,11 +2336,19 @@
           `${API_SESSIONS}/${sid}/timeline?before=${state.timelineOldest}&limit=${TIMELINE_PAGE}`,
           { cache: 'no-store' },
         );
+        // UI-7 对账 (fetch resolve 后立即, 覆盖 ok 与 !ok 两分支): 翻页在途时用户切了
+        // 会话 → 本页属于旧世界, 整体丢弃. 特别地 !ok 分支若不对账, 会把
+        // timelineReachedTop=true 写进新世界, 永久禁用其向上翻页.
+        if (gen !== state.timelineGen) return;
         if (!r.ok) {
           state.timelineReachedTop = true;
           return;
         }
         const data = await r.json();
+        // UI-7 二次对账 (json 解析后): fetch resolve (响应头) 与 json resolve (完整
+        // body) 之间是真实的宏任务边界, 点击可插入 — 与 loadTimeline/sync 的
+        // post-json 对账对齐, 否则旧会话的 older 页会 prepend 进新世界.
+        if (gen !== state.timelineGen) return;
         state.timelineReachedTop = !data.has_more;
         const older = data.rounds || [];
         if (older.length === 0) {

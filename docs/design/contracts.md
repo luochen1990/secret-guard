@@ -800,6 +800,22 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 - `prop_selected_stable_during_pinned`: pinned 期间点历史轮, 新 round 到达时 selected 不变. 🔁→`UI-6: pinned 期间点历史轮 → selected 停在该轮; 新 round 到达时 selected 不变` (`tests/webui/im-ui.spec.ts`)
 - `prop_follow_invariant_under_new_round`: follow 状态在任意新 round 插入后必须保持 (不被翻转、末轮 request 不被 drawer 遮挡). 🔁→`UI-6: follow 状态在新 round 插入下不变` (`tests/webui/im-ui.spec.ts`, 短内容 + 长内容稳态双用例)
 
+### UI-7 sidebar rounds 回填时序 + timeline 并发一致性 (gen)
+
+**陈述**: 两个子性质:
+1. **回填时延**: 点击 sidebar 会话头 (toggleSession 展开) 后, 三级菜单的 "Loading rounds…" 占位符必须在点击触发的主动 sync 返回时被覆盖, 不得依赖 3s 轮询 tick (否则占位符存活 0~3s; auto-refresh 关闭时无限期).
+2. **timeline 世界一致性**: 以 `state.timelineGen` (代数, 只增不减) 划分 "timeline 世界". 核心不变量: **一个响应能写 `timelineRecords` / `state.tail` / `timelineReachedTop`, 当且仅当它描述的世界与当前世界同代**. 换世界者 bump (loadTimeline / clearTimeline); 写入者捕获出发时代数并在落地前对账 (sync 的 timeline 段 / loadOlder 全部落地路径含 !ok / loadTimeline 自身).
+
+**矛盾游标守卫** (UI-7 前置): sync 构造 `selected` 游标前必须校验 `timelineSession === selectedSession` (records 归属与选中一致). 不一致 (loadTimeline 在途) 时发 null 游标 — 否则矛盾游标触发后端 `build_timeline_diff_inner` 的 "after 不属于本 session → 全链重放" 契约, 把整条链 append 进旧 records. `timelineSession` 由 loadTimeline 在**落地对账通过后**认领 (入口只 bump gen, 不预置归属, 否则守卫失效).
+
+**幂等去重** (UI-7 补充): sync 的 `new_rounds` append 前按 round id 过滤已存在条目 (双 sync 并发时各自可能带回相同增量; node id 全局唯一, 去重安全).
+
+**Properties**:
+- `prop_rounds_immediate_fill_on_toggle`: auto-refresh 关闭时点击会话头, sidebar 三级菜单在 1s 内渲染实际条目 (非 loading 占位). 🔁→`UI-7: 点击会话后 sidebar rounds 立即回填 (不等 3s 轮询)` (`tests/webui/im-ui.spec.ts`)
+- `prop_sync_no_contradictory_cursor`: loadTimeline 在途时触发的 sync 不携带矛盾游标 (发 null); 落地后 records 纯净无跨会话 round. 🔁→`UI-7: 点击会话后 sync 不发矛盾游标 (timelineGen 守卫)` (`tests/webui/im-ui.spec.ts`)
+- `prop_stale_sync_diff_dropped`: 出发合法但迟到的 sync diff, 在世界切换后落地, timeline 段被丢弃, records 不被污染. 🔁→`UI-7: 在途 sync 的迟到 diff 不污染已切换的 timeline (gen 对账)` (`tests/webui/im-ui.spec.ts`)
+- `prop_rounds_append_idempotent`: 相同 new_rounds 重复 append 后 records 无重复 id. ⏳ (由 gen 对账 + Set 去重共同保证, 专项 e2e 待补)
+
 ---
 
 ## 99. 变更日志
@@ -825,3 +841,4 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 | 2026-08-15 | DTO-8 | **作废** (编号永久作废不重用): 引用的 `GET /records` 列表 API 与 `prop_record_summary_excludes_body` 已随 session-aware sync API 取代删除而消亡, 全仓零同名实现 | #147: 契约文档漂移走查 — 条目未随 API 删除同步标作废, 违反 §0.2 "删除作废不重用" 规则 |
 | 2026-08-15 | CFG-3 | DELETE 语义收紧: static 基线存在 (含 static+dynamic override) 一律 409, 仅 dynamic-only 可 DELETE (204); 原 property `prop_delete_dynamic_only_succeeds` 改名 `prop_delete_static_baseline_rejected` 并扩展三态断言 | #156: 旧 "删 override 露出 static 返回 204" 语义让用户以为删除成功, provider 仍存活继续转发, "下线止血"场景下是安全事故; 且与 secrets 侧 "首次即 409" 行为不一致. 人工授权 (issue 给出方案 A/B 二选一, 采纳 A) |
 | 2026-08-15 | 全部 | 建立 property 落地状态标注机制 (§0.6): 156 条 property 全量标注 ✅ 同名 53 / 🔁 改名 80 / ⏳ 待补 23, 并新增 `just check-contracts` lint (进 `just check` 阻塞链) 机械守卫 (✅ 须同名测试载体命中 / 🔁 全部锚点须可 grep / 每条必有标注 + 输入侧 fail-closed); ⏳ 项按风险排 P0-P2 补齐优先级 (§0.6) | #144: 走查发现 ~85/156 条 property 名零字面命中且无状态标注, 契约 Properties 列表部分沦为"愿望清单"; 其中改名落地断链占多数, 真零测试 23 条 |
+| 2026-08-16 | UI-7 | 新增 UI-7 sidebar rounds 回填时序 + timeline 并发一致性 (gen): 点击会话头后 "Loading rounds…" 占位符由主动 sync 覆盖 (不依赖 3s tick); `timelineGen` 代数对账消灭跨会话脏 append (矛盾游标守卫 + 迟到 diff 丢弃 + round-id 幂等去重) | 排查 "点击 sidebar 一级菜单后 loading rounds 卡数秒": 后端实测 12ms/0.6ms 非瓶颈, 根因是前端回填依赖轮询 tick; 修复主动 sync 时暴露两类并发交错 (矛盾游标 / 迟到 diff), 一并形式化 |

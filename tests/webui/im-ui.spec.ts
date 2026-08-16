@@ -1891,6 +1891,161 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     const listed2 = (await listRes2.json()).keys as Array<Record<string, unknown>>;
     expect(listed2.find((k) => k.id === issued.id)).toBeUndefined();
   });
+
+  // ─── UI-7: sidebar rounds 回填时序 + timeline 并发一致性 (gen) ─────────────
+  //
+  // 历史 bug: toggleSession 只 loadTimeline (右侧), 不为 sidebar 三级菜单发任何请求;
+  // rounds 回填只能等 3s 轮询 tick 的 sync() → "Loading rounds…" 卡 0~3s,
+  // 关闭 auto-refresh 时无限期. 修复: toggleSession 主动触发 sidebar-only sync.
+  //
+  // 同时引入 timeline 代际 (gen) 机制, 消除两类并发交错:
+  //   ① 矛盾游标: sync 出发时 records 归属 ≠ selectedSession (点击后 loadTimeline
+  //      在途) → 旧实现发出自相矛盾的游标, 后端按 "after 不属于本 session" 契约
+  //      返回全链 new_rounds, append 进旧 records → 跨会话脏数据.
+  //   ② 过气响应: sync 出发时合法, 响应落地前用户切了会话 → 旧 records 被
+  //      loadTimeline 替换后, 迟到的 diff 仍 append 上去.
+  // gen 不变量: 一个响应能写 timelineRecords, 当且仅当它描述的世界与当前世界同代.
+
+  test("UI-7: 点击会话后 sidebar rounds 立即回填 (不等 3s 轮询)", async ({ page }) => {
+    // 关闭 auto-refresh: 若修复缺失, rounds 只能靠 tick 回填 → 本测试必超时失败.
+    // 注: uncheck 在 findSessionLeafByPreview 之后 — 后者依赖 auto-refresh 拉新会话.
+    await sendChat(page, [{ role: "user", content: "ui7-immediate-rounds-marker" }]);
+    const leaf = await findSessionLeafByPreview(page, "ui7-immediate-rounds-marker");
+    await page.locator("#auto").uncheck();
+
+    // clickSessionByLeaf 等 #detail .request-pane 出现 (loadTimeline 完成),
+    // 但那是右侧; 这里专测 sidebar: round-list 应在该等待窗口内就有条目.
+    await page.locator(`.session-item[data-sid="${leaf}"]`).click();
+    // 断言: 1s 内 (无 tick 可依赖) sidebar 三级出现非 loading 的实际条目.
+    // 旧实现: "Loading rounds…" 停留至手动 refresh (无限期) → timeout 失败.
+    const wrap = page.locator(`.round-list[data-sid="${leaf}"]`);
+    await expect(
+      wrap.locator(".round-item"),
+      "auto-refresh 关闭时, 点击后 sidebar rounds 应立即回填"
+    ).toHaveCount(1, { timeout: 1000 });
+    await expect(wrap.locator(".empty")).toHaveCount(0);
+  });
+
+  test("UI-7: 点击会话后 sync 不发矛盾游标 (timelineGen 守卫)", async ({ page }) => {
+    // 守卫形态①: 点击 B 的瞬间 (loadTimeline(B) 在途), 主动触发 sync.
+    // 旧实现: selected.session_id=B 但 latest_round 还是 A 的叶子 → 后端契约返回
+    // 全链 new_rounds → push 进 A 的 records. 修复: timelineSession !== selectedSession
+    // 时 selected 游标发 null (后端 timeline=null, 纯 sidebar 回填).
+    await sendChat(page, [{ role: "user", content: "ui7-cursor-guard-a" }]);
+    await sendChat(page, [{ role: "user", content: "ui7-cursor-guard-b" }]);
+    const sidA = await findSessionLeafByPreview(page, "ui7-cursor-guard-a");
+    const sidB = await findSessionLeafByPreview(page, "ui7-cursor-guard-b");
+
+    // 1. 打开 A, 等 timeline 落地 (records 归属 = A, gen=g).
+    await clickSessionByLeaf(page, sidA);
+    const before = await page.evaluate(() => ({
+      records: state.timelineRecords.map((r) => r.id),
+      gen: state.timelineGen,
+    }));
+
+    // 2. 点击 B (loadTimeline(B) 在途, ~14ms 窗口), 立即 (同一帧序列) 主动 sync.
+    //    注意不 await loadTimeline — toggleSession 内部已完成 renderSidebar + 发起
+    //    fetch; 我们在 fetch resolve 前抢进 sync, 精确复现形态①.
+    await page.evaluate((sid) => {
+      document.querySelector(`.session-item[data-sid="${sid}"]`).click();
+      window.sync();
+    }, sidB);
+    // 等 B 的 timeline 落地并认领归属 (loadTimeline 对账通过 → timelineSession=sidB).
+    await expect
+      .poll(() => page.evaluate(() => state.timelineSession), { timeout: 2000 })
+      .toBe(sidB);
+
+    const after = await page.evaluate(() => ({
+      records: state.timelineRecords.map((r) => r.id),
+      session: state.timelineSession,
+      selected: state.selectedSession,
+      gen: state.timelineGen,
+    }));
+    // 世界已换到 B: gen 已 bump, records 归属 B.
+    expect(after.gen).toBeGreaterThan(before.gen);
+    expect(after.session).toBe(sidB);
+    expect(after.selected).toBe(sidB);
+    // 核心断言: records 是 B 的全量 (恰好 1 轮), 无 A 的 round 混入.
+    // 注: pre-fix 构建上若 loadTimeline(B) 先于矛盾游标的 sync 落地, 脏数据会被
+    // 随后的全量替换冲掉 (顺序依赖, 约一半概率 false-pass) — 本测试对形态①的
+    // 确定性检测力来自上方 gen/session 字段断言 (pre-fix 必挂: 无 bump 机制).
+    // records 断言在顺序有利时提供行为级佐证.
+    expect(after.records.length).toBe(1);
+  });
+
+  test("UI-7: 在途 sync 的迟到 diff 不污染已切换的 timeline (gen 对账)", async ({ page }) => {
+    // 守卫形态②: sync 带着完全合法的 A 游标出发 → 用户点 B → B 的 timeline 落地 →
+    // A 的 diff 才回来. 旧实现: diff.push 到 B 的 records 上. 修复: sync 落地前
+    // 对账 gen, 不匹配则丢弃 timeline 段 (sidebar 段照常应用).
+    //
+    // 检测力设计: A 打开 (游标=A1) 后再给 A 发一轮 A2, 然后出发 sync — 服务端
+    // 对该游标算出 new_rounds=[A2], 响应体真实携带非空 timeline 段. pre-fix 构建
+    // 上放行后 A2 会 append 进 B 的 records (records.length=2, 行为级红灯).
+    await sendChat(page, [{ role: "user", content: "ui7-stale-drop-a" }]);
+    await sendChat(page, [{ role: "user", content: "ui7-stale-drop-b" }]);
+    const sidA = await findSessionLeafByPreview(page, "ui7-stale-drop-a");
+    const sidB = await findSessionLeafByPreview(page, "ui7-stale-drop-b");
+
+    await clickSessionByLeaf(page, sidA);
+    const genA = await page.evaluate(() => state.timelineGen);
+
+    // 挂起 sync (Node 侧 pending 队列): route handler 收到响应后挂起, Node 侧逐个
+    // 放行. fulfilled 计数器提供正面等待信号 (放行 → fulfill 完成).
+    const pending: Array<() => void> = [];
+    let fulfilled = 0;
+    await page.route("**/api/sync", async (route) => {
+      const resp = await route.fetch();
+      await new Promise<void>(r => pending.push(r));
+      await route.fulfill({ response: resp });
+      fulfilled++;
+    });
+    try {
+      // 关闭 auto-refresh; 给 A 再发一轮 A2 (使其后出发的 sync 游标落后一轮,
+      // 响应携带 new_rounds=[A2]); 手动 refresh 触发 sync (出发时世界 = A, 游标合法).
+      await page.locator("#auto").uncheck();
+      await sendChat(page, [
+        { role: "user", content: "ui7-stale-drop-a" },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: "ui7-stale-drop-a round2" },
+      ]);
+      await page.locator("button.refresh").click();
+      // 等 refresh 的 sync 进入挂起队列 (A 游标, 响应含 A2 diff).
+      await expect
+        .poll(() => pending.length, { timeout: 2000 })
+        .toBeGreaterThan(0);
+
+      // 立刻点 B (换世界, gen bump), 等 B timeline 落地 + 主动 sync 也入队
+      // (null 游标, 无 timeline 段, 放行无害).
+      await clickSessionByLeaf(page, sidB);
+      await expect
+        .poll(() => pending.length, { timeout: 2000 })
+        .toBeGreaterThanOrEqual(2);
+      const mid = await page.evaluate(() => ({
+        gen: state.timelineGen,
+        records: state.timelineRecords.length,
+      }));
+      expect(mid.gen).toBeGreaterThan(genA);
+      expect(mid.records).toBe(1);
+
+      // 放行全部挂起的 sync (含携带 A2 diff 的迟到响应).
+      for (const release of pending.splice(0)) release();
+      // 正面等待: 放行的响应全部 fulfill 完成 (fetch resolve + sync 落地链路).
+      await expect
+        .poll(() => fulfilled, { timeout: 2000 })
+        .toBeGreaterThanOrEqual(2);
+
+      // B 的 records 不被 A 的 diff 污染: 仍恰好 B 的 1 轮 (pre-fix: A2 append → 2).
+      const after = await page.evaluate(() => ({
+        records: state.timelineRecords.map((r) => r.id),
+        gen: state.timelineGen,
+      }));
+      expect(after.records.length).toBe(1);
+    } finally {
+      // 清理: 释放残余挂起 + 移除 route 拦截, 避免影响后续测试.
+      for (const release of pending.splice(0)) release();
+      await page.unroute("**/api/sync");
+    }
+  });
 });
 
 // ─── WebUI 打磨批次回归 (#161 + #164-1/2/3) ─────────────────────────────

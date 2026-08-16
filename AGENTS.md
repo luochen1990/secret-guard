@@ -194,13 +194,13 @@ Redact 不应无必要地改变 request body 的字节内容, 避免破坏 LLM P
 > 错替历史中的旧 mock, 破坏 RED-6 round-trip — restore 正确性优先于缓存稳定性.
 > 代价是经济性 (前缀缓存失效), 非安全性. 详见 contracts.md RED-3 例外场景裁决.
 
-## 前端不变量 (UI Invariants) → UI-1..UI-6 契约
+## 前端不变量 (UI Invariants) → UI-1..UI-7 契约
 
 > 以下条目是**跨 web/dag/index.html 的强不变量**, 任何渲染优化或内存重构不得违反.
 >
 > **编号映射**: AGENTS.md 的 `I*` 是 contracts.md `UI-*` 的前身 (历史编号).
-> `I1=UI-1`, `I2=UI-2`, `I3=UI-3`, `I4=UI-6 的 selectedRound 子属性`, `I5=UI-6`.
-> contracts.md 收录并扩展为 UI-1..UI-6, 以 contracts.md 为 SSOT; 此处保留 I* 编号便于历史 grep.
+> `I1=UI-1`, `I2=UI-2`, `I3=UI-3`, `I4=UI-6 的 selectedRound 子属性`, `I5=UI-6`, `I6=UI-7`.
+> contracts.md 收录并扩展为 UI-1..UI-7, 以 contracts.md 为 SSOT; 此处保留 I* 编号便于历史 grep.
 ### I1 — 气泡数 == 上下文数组长度
 
 会话详情页 (timeline) 渲染的 Bubble 数量, 必须等于该 Node 对应 HTTP 请求的 IR messages
@@ -236,7 +236,19 @@ timeline 的 follow/pinned 状态由**视口距底部距离**机械推导 (纯�
 细节 (syncFollowMode 入口 / handleNewRounds / jumpToLatest) 见 `src/web/AGENTS.md`
 "timeline 滚动状态机" 段.
 
-**回归守卫**: 这五条不变量由 `tests/webui/im-ui.spec.ts` 守卫. 改前端渲染逻辑或后端
+### I6 — sidebar rounds 回填时序 + timeline 并发一致性 (↔ UI-7)
+
+点击 sidebar 会话头 (toggleSession 展开) 后, 三级菜单的 "Loading rounds…" 占位符由
+toggleSession 内触发的**主动 sync** 覆盖 (不依赖 3s 轮询 tick; auto-refresh 关闭时
+占位符不得无限期停留). timeline 并发一致性由**代数 (gen) 对账**保证:
+`state.timelineGen` 只增不减, 换世界者 (loadTimeline / clearTimeline) bump; 一切写
+`timelineRecords` / `tail` / `timelineReachedTop` 的在途响应落地前对账, 代数不匹配即
+丢弃 timeline 数据 (sidebar 数据照常应用). sync 构造 `selected` 游标前校验
+`timelineSession === selectedSession` (loadTimeline 落地对账通过后才认领归属),
+不一致发 null 游标, 防止矛盾游标触发后端 "after 不属于本 session → 全链重放" 契约.
+详尽形式化见 contracts.md **UI-7**.
+
+**回归守卫**: 这些不变量由 `tests/webui/im-ui.spec.ts` 守卫. 改前端渲染逻辑或后端
 delta 切片时, 必须同步跑 `just check-webui`.
 
 ## 路由策略 (核心契约)
@@ -445,7 +457,7 @@ client = Anthropic(
 | 单元 (纯函数) | `#[test]` | `provider::tests::protocol_short_roundtrip` |
 | Property-based | `proptest` | `redact::tests::prop_round_trip_identity` |
 | 集成 (端到端) | `mockito` + `axum::serve` | `tests/integration.rs::forwards_streaming_sse` |
-| WebUI 回归 | Playwright (TypeScript) | `tests/webui/im-ui.spec.ts` (守卫前端不变量 UI-1..UI-6) |
+| WebUI 回归 | Playwright (TypeScript) | `tests/webui/im-ui.spec.ts` (守卫前端不变量 UI-1..UI-7) |
 | 性能基线 | criterion | `benches/redact.rs` (redact_ir / StreamingRestorer 3 场景) |
 | 覆盖率 | cargo-llvm-cov (LLVM source-based) | `just coverage-html` |
 
