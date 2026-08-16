@@ -38,7 +38,7 @@
  */
 import { test, expect, type Page } from "@playwright/test";
 
-const SG_API = "/__sg/api";
+const SG_API = "/api";
 const FORWARD_URL = "/o/mock-openai/v1/chat/completions";
 
 // ─── 辅助: 通过 HTTP API 发 chat 请求生成 record ────────────────────────

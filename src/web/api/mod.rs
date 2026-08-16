@@ -1,4 +1,4 @@
-//! `/__sg/api/*` JSON endpoints (模块目录根: 按资源组拆分).
+//! `/api/*` JSON endpoints (模块目录根: 按资源组拆分).
 //!
 //! 所有响应都带 `Cache-Control: no-store`, 避免浏览器对自动刷新返回缓存内容.
 //!

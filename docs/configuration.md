@@ -128,7 +128,7 @@ digits = true
 | `issuer_url` | string | OIDC issuer (如 `https://sso.example.com/realms/main`). |
 | `client_id` | string | OAuth2 client id. |
 | `client_secret_file` | path | 可选, client secret 文件路径. |
-| `redirect_url` | string | 可选, 回调 URL. 只能换 scheme/host/port, path 固定为 `/__sg/oauth2/callback`. 监听地址非浏览器可达时 (如反代域名) 必须配置. |
+| `redirect_url` | string | 可选, 回调 URL. 只能换 scheme/host/port, path 固定为 `/oauth2/callback`. 监听地址非浏览器可达时 (如反代域名) 必须配置. |
 
 `[[auth.api_keys]]` 字段: `label` (唯一标识), `key` 或 `key_file` (二选一, 语义同上).
 

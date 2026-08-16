@@ -17,7 +17,7 @@
 //! - [`secrets`] —— Secret 注册表 + 内存状态 + 配置持久化
 //! - [`server`]  —— axum router 装配与服务启动
 //! - [`state`]   —— 进程级共享状态 AppState + HTTP 共享常量 (NO_STORE)
-//! - [`web`]     —— `/__sg/*` Web UI 与 JSON API
+//! - [`web`]     —— `/` + `/api/*` Web UI 与 JSON API
 //!
 //! 设计目标: body 在字节层面流动, 中间件可对 body 做 find-and-replace.
 //! 路由 `/{proto_short}/{provider_id}/*path` 同时编码 ingress protocol 与 provider.

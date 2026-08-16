@@ -5,8 +5,8 @@
 
 ## 职责
 
-- `mod.rs`: `/__sg` 子 router + `/` 根入口 + slash redirect + not_found. (`NO_STORE` 共享常量已上移 `crate::state`, 消费者跨 web/auth 两层.)
-- `api/` (目录, 按资源组拆分, 见 #146): `/__sg/api/*` JSON endpoints.
+- `mod.rs`: WebUI 顶级 router (`/` + `/api/*`) + `/api/{*rest}` 404 兜底 + not_found. (`NO_STORE` 共享常量已上移 `crate::state`, 消费者跨 web/auth 两层.)
+- `api/` (目录, 按资源组拆分, 见 #146): `/api/*` JSON endpoints.
   - `mod.rs` — 模块根 + handler re-export (`web::api::<handler>` 路径稳定).
   - `error.rs` — `ApiError` 统一错误类型.
   - `crud.rs` — secrets/providers 共享的 CRUD 泛型流程 (`EffectiveItem` + `CrudTable` + create/update/delete/decision flow, 错误消息经 kind_label 参数化).
@@ -19,41 +19,41 @@
 
 ## 路由
 
-- `GET /` 与 `GET /__sg` —— 单页 HTML (根路径主入口, `/__sg` 向后兼容).
-- `GET /__sg/` —— 307 redirect 到 `/__sg` (临时, 避免浏览器永久缓存).
-- `/__sg/*` 未匹配子路径 —— 404, **绝不**进入 forward (否则会泄漏内部 URL 到上游).
+> URI 分配的完整规划 (顶级保留字 / 命名空间不相交论证) 见 `docs/design/url-layout.md`.
 
-> 注意: axum 0.8 的 `nest("/__sg", ...)` 默认匹配不带尾斜杠的 `/__sg`. server.rs 显式注册了
-> `/__sg/` → `/__sg` 的 redirect.
+- `GET /` —— 单页 HTML (唯一 WebUI 入口; 旧 `/__sg` 前缀已移除, 历史 `git log -S "__sg"`).
+- `/api/*` 未匹配子路径 —— 404, **绝不**进入 forward (否则会泄漏内部 URL 到上游).
+- OIDC 认证路由 (`/login`, `/oauth2/callback`, `/logout`, 公开的 `/api/me`) 由
+  `server.rs` 装配 (不在本模块, 仅 auth 启用时挂载).
 
 ## API endpoints
 
 ```
-GET    /__sg/api/records/{id}[?view=parsed]   → {record, parsed_request?, parsed_response?, parse_error?}
-                                                (单条 raw + parsed view, WebUI 弹窗按需拉)
-GET    /__sg/api/sessions                     → {sessions, total}  (叶子节点, latest-first)
-GET    /__sg/api/sessions/{sid}/timeline[?before=UUID&limit=N]
-                                              → TimelinePage {rounds, tail, has_more}
-                                                (session-aware timeline 分页, oldest-first)
-POST   /__sg/api/sync   body: {selected?, expanded[]}  → {sessions, rounds, timeline?}
-                                                (WebUI 3s 轮询统一入口: sidebar + timeline diff 一次采集)
-GET    /__sg/api/secrets
-POST   /__sg/api/secrets
-PUT    /__sg/api/secrets/{id}
-DELETE /__sg/api/secrets/{id}            → static 基线存在 (含 override) 一律 409 (#156);
-                                           仅 dynamic-only 可删 (204)
-PATCH  /__sg/api/secrets/{id}/decision     body: {"mode": "default|prefer_static|disabled"}
+GET    /api/records/{id}[?view=parsed]   → {record, parsed_request?, parsed_response?, parse_error?}
+                                                 (单条 raw + parsed view, WebUI 弹窗按需拉)
+GET    /api/sessions                     → {sessions, total}  (叶子节点, latest-first)
+GET    /api/sessions/{sid}/timeline[?before=UUID&limit=N]
+                                               → TimelinePage {rounds, tail, has_more}
+                                                 (session-aware timeline 分页, oldest-first)
+POST   /api/sync   body: {selected?, expanded[]}  → {sessions, rounds, timeline?}
+                                                 (WebUI 3s 轮询统一入口: sidebar + timeline diff 一次采集)
+GET    /api/secrets
+POST   /api/secrets
+PUT    /api/secrets/{id}
+DELETE /api/secrets/{id}            → static 基线存在 (含 override) 一律 409 (#156);
+                                       仅 dynamic-only 可删 (204)
+PATCH  /api/secrets/{id}/decision     body: {"mode": "default|prefer_static|disabled"}
 
-GET    /__sg/api/providers
-POST   /__sg/api/providers
-PUT    /__sg/api/providers/{id}
-DELETE /__sg/api/providers/{id}           → 同 secrets (#156)
-PATCH  /__sg/api/providers/{id}/decision
+GET    /api/providers
+POST   /api/providers
+PUT    /api/providers/{id}
+DELETE /api/providers/{id}           → 同 secrets (#156)
+PATCH  /api/providers/{id}/decision
 
-GET    /__sg/api/api-keys
-POST   /__sg/api/api-keys
-DELETE /__sg/api/api-keys/{id}
-PATCH  /__sg/api/api-keys/{id}/toggle
+GET    /api/api-keys
+POST   /api/api-keys
+DELETE /api/api-keys/{id}
+PATCH  /api/api-keys/{id}/toggle
 ```
 
 所有响应带 `Cache-Control: no-store`, 避免浏览器对自动刷新返回缓存内容.

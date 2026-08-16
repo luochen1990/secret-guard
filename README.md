@@ -104,8 +104,6 @@ curl 直连则写完整路径 (见上方示例).
 - **Providers**: 管理 Provider 注册表.
 - **API Keys**: 签发 / 禁用转发路径认证用的 API key (启用 `[auth]` 后生效).
 
-(向后兼容入口 `/__sg` 仍保留.)
-
 ### 双层配置
 
 secret-guard 采用双层配置: 声明式文件 `secret-guard.toml` (用户手写, 进程内只读) +

@@ -1,6 +1,6 @@
 //! API 统一错误类型 [`ApiError`].
 //!
-//! 从 api.rs 单文件拆出 (见 #146 残留 1). 所有 `/__sg/api/*` handler 共享:
+//! 从 api.rs 单文件拆出 (见 #146 残留 1). 所有 `/api/*` handler 共享:
 //! 统一为合法 JSON 响应, 不泄露内部细节 (详细信息进 tracing, 不回客户端).
 
 use axum::http::StatusCode;

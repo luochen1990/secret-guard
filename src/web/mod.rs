@@ -1,25 +1,26 @@
 //! Web UI 模块: 转发记录浏览器 + secret 配置面板 + provider 配置面板.
 //!
-//! 路由策略 (由 [`crate::server::build_router`] 装配):
-//! - `GET /`             —— 单页 HTML (根路径主入口, 新).
-//! - `GET /__sg`         —— 同上 (保留旧入口, 向后兼容).
-//! - `GET /__sg/api/records/{id}`            —— 单条 record raw/parsed view (弹窗用).
-//! - `GET /__sg/api/sessions`                —— 会话列表 (首次加载/无选中时).
-//! - `GET /__sg/api/sessions/{sid}/timeline` —— session-aware timeline 分页.
-//! - `POST /__sg/api/sync`                   —— 统一轮询 (sessions + rounds + timeline diff).
-//! - `GET /__sg/api/secrets`                 —— effective secret 列表.
-//! - `POST /__sg/api/secrets`                —— 创建 dynamic secret.
-//! - `PUT /__sg/api/secrets/{id}`            —— 编辑 (static 自动 fork).
-//! - `DELETE /__sg/api/secrets/{id}`         —— 删除 (仅 dynamic-only; static 基线一律 409, #156).
-//! - `PATCH /__sg/api/secrets/{id}/decision` —— 切换 OverrideMode.
-//! - `GET/POST/PUT/DELETE/PATCH /__sg/api/providers[/{id}[/decision]]` —— 同上.
-//! - `GET/POST/DELETE/PATCH /__sg/api/api-keys[/{id}[/toggle]]` —— API key CRUD (无条件挂载, 见 api/apikeys.rs).
+//! 路由策略 (由 [`crate::server::build_router`] 装配, URL 布局的 SSOT 见
+//! `docs/design/url-layout.md`):
+//! - `GET /`                            —— 单页 HTML (唯一 WebUI 入口).
+//! - `GET /api/records/{id}`            —— 单条 record raw/parsed view (弹窗用).
+//! - `GET /api/sessions`                —— 会话列表 (首次加载/无选中时).
+//! - `GET /api/sessions/{sid}/timeline` —— session-aware timeline 分页.
+//! - `POST /api/sync`                   —— 统一轮询 (sessions + rounds + timeline diff).
+//! - `GET /api/secrets`                 —— effective secret 列表.
+//! - `POST /api/secrets`                —— 创建 dynamic secret.
+//! - `PUT /api/secrets/{id}`            —— 编辑 (static 自动 fork).
+//! - `DELETE /api/secrets/{id}`         —— 删除 (仅 dynamic-only; static 基线一律 409, #156).
+//! - `PATCH /api/secrets/{id}/decision` —— 切换 OverrideMode.
+//! - `GET/POST/PUT/DELETE/PATCH /api/providers[/{id}[/decision]]` —— 同上.
+//! - `GET/POST/DELETE/PATCH /api/api-keys[/{id}[/toggle]]` —— API key CRUD (无条件挂载, 见 api/apikeys.rs).
 //!
-//! 注: 旧的 `GET /api/records` (扁平分页) + `GET /api/nodes/{id}/timeline` (基于 node_id)
+//! 注 1: 旧的 `GET /api/records` (扁平分页) + `GET /api/nodes/{id}/timeline` (基于 node_id)
 //! 已删除, 由 session-aware sync API 替代.
 //!
-//! 注意: axum 0.8 的 `nest("/__sg", ...)` 默认匹配不带尾斜杠的 `/__sg`, 而不是 `/__sg/`.
-//! server.rs 中显式注册了 `/__sg/` -> `/__sg` 的 redirect (307, 临时), 保证两种 URL 都可用.
+//! 注 2: 旧入口 `/__sg` 前缀已于 URL 硬切重构中移除 (历史可 `git log -S "__sg"` 找回).
+//! `/api` 是顶级保留字, 与 forward 命名空间 (`/{o|a|g|l|r}/...` 首段必须是 proto 简写)
+//! 天然不相交, 见 url-layout.md "保留字" 一节.
 
 pub(crate) mod api;
 
@@ -35,12 +36,12 @@ use crate::state::AppState;
 /// 内嵌的 HTML 单页 (build 时 `include_str!`).
 const INDEX_HTML: &str = include_str!("index.html");
 
-/// `/` 与 `/__sg` 共用的 index handler.
+/// `/` 根入口的 index handler.
 pub async fn index_handler() -> Html<&'static str> {
     Html(INDEX_HTML)
 }
 
-/// 构建 `/__sg` 子 Router. 复用主 Router 的 [`AppState`].
+/// 构建 WebUI + JSON API 的顶级子 Router (`/api/*` + `/`). 复用主 Router 的 [`AppState`].
 ///
 /// `NO_STORE` 常量已上移 `crate::state` (消费者跨 web/auth 两层, 见 #145 偏差 3).
 pub fn router() -> Router<AppState> {
@@ -91,14 +92,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/api-keys/{id}/toggle", patch(api::toggle_api_key))
 }
 
-/// `/__sg/` -> `/__sg` 的 trailing-slash redirect.
-///
-/// 用 307 (临时) 而非 301 (永久): 避免浏览器永久缓存, 开发期改动路由更安全.
-pub async fn slash_redirect() -> axum::response::Redirect {
-    axum::response::Redirect::temporary("/__sg")
-}
-
-/// `/__sg/*` 中未匹配的子路径返回 404, 防止被 catch-all 转发到上游.
+/// `/api/*` 未匹配子路径的 404 handler (SEC-6: 内部 URL 绝不进入 forward).
 pub async fn not_found() -> (StatusCode, &'static str) {
     (StatusCode::NOT_FOUND, "not found")
 }

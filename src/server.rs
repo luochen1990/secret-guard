@@ -1,18 +1,21 @@
 //! axum router 装配与服务启动.
 //!
 //! # 路由策略
-//! - `/`                —— Web UI 入口 (新, 便于用户直接打开浏览器访问根 URL).
-//! - `/__sg`, `/__sg/*` —— Web UI + JSON API (保留旧入口以向后兼容).
+//! - `/`                —— Web UI 入口 (单页 HTML).
+//! - `/api/*`           —— Web UI JSON API (未匹配子路径 404, 绝不进 forward).
+//! - `/login`, `/oauth2/callback`, `/logout` —— OIDC 认证 (auth 启用时).
 //! - `/{proto}/{name}`        —— forward (`rest = "/"`).
 //! - `/{proto}/{name}/{*rest}`—— forward (含 sub-path).
 //! - 其他 —— 404 (不再 catch-all 透传, 避免误转发 + 明确契约).
+//!
+//! 完整的 URI 分配规划 (顶级保留字 / 命名空间不相交论证) 见 `docs/design/url-layout.md`.
 //!
 //! # 认证 (可选, 由 `[auth] enabled` 控制)
 //!
 //! `auth.enabled = false` (默认): 单用户模式, 所有路由无认证 (向后兼容).
 //! `auth.enabled = true`: 双轨认证 —
-//! - 浏览器 WebUI (`/__sg/*`): OIDC Authorization Code + PKCE → cookie session.
-//! - SDK 转发 (`/{proto_short}/{name}/*`): 本地 API key (`Authorization: Bearer sg_...`).
+//! - 浏览器 WebUI (`/`, `/api/*`): OIDC Authorization Code + PKCE → cookie session.
+//! - SDK 转发 (`/{proto_short}/{name}/*`, proto_short ∈ o/a/g/l/r): 本地 API key (`Authorization: Bearer sg_...`).
 //!
 //! ApiKeyStore 总是构造 (与 `auth.enabled` 无关), 让 WebUI 在单用户模式下也能
 //! 管理和预配置 key. `/api/api-keys` CRUD 路由在 `web::router()` 里无条件挂载
@@ -131,6 +134,8 @@ pub fn build_router_with_auth(state: AppState, auth_stack: AuthStack) -> Router 
 /// 内部: 根据 auth_stack 是否存在, 条件化装配认证 layer.
 fn build_router_inner(state: AppState, auth_stack: Option<AuthStack>) -> Router {
     // Forward router: 使用 AppState, 在 merge 前不调用 with_state.
+    // 首段 proto 简写 (o/a/g/l/r) 由 dispatch 校验; 顶级保留字 (api/login/logout/oauth2)
+    // 的静态路由优先于本参数路由, 二者天然不相交 (见 docs/design/url-layout.md).
     let forward_router: Router<AppState> = Router::new()
         .route("/{proto}/{name}", any(forward_no_rest))
         .route("/{proto}/{name}/{*rest}", any(forward));
@@ -139,10 +144,8 @@ fn build_router_inner(state: AppState, auth_stack: Option<AuthStack>) -> Router 
         None => {
             // 单用户模式: 所有路由无认证.
             Router::new()
-                .route("/", get(web::index_handler))
-                .nest("/__sg", web::router())
-                .route("/__sg/", get(web::slash_redirect))
-                .route("/__sg/{*rest}", get(web::not_found))
+                .merge(web::router())
+                .route("/api/{*rest}", any(web::not_found))
                 .merge(forward_router)
                 .with_state(state)
                 .layer(trace_layer!())
@@ -195,7 +198,7 @@ fn build_router_with_auth_layers(
     // 注: /api/api-keys CRUD 不在此处挂载 — 见 `web::router()` (无条件挂载, 不隔离用户).
     let webui_protected: Router<AppState> = web::router().route_layer(axum_login::login_required!(
         OidcBackend,
-        login_url = "/__sg/login"
+        login_url = "/login"
     ));
 
     // 转发路由: 应用 API key middleware.
@@ -210,11 +213,11 @@ fn build_router_with_auth_layers(
     let auth_layer = AuthManagerLayerBuilder::new(backend, session_layer).build();
 
     Router::new()
-        // auth 模式下根路径重定向到 /__sg (受 login_required 保护).
-        .route("/", get(|| async { axum::response::Redirect::to("/__sg") }))
-        .nest("/__sg", webui_public.merge(webui_protected))
-        .route("/__sg/", get(web::slash_redirect))
-        .route("/__sg/{*rest}", get(web::not_found))
+        .merge(webui_public)
+        .merge(webui_protected)
+        // /api/{*rest} 兜底在 login_required 之外 (有意): 未登录的未知 /api/* 路径
+        // 直接 404 而非 307 — 兜底作为 SEC-6 安全网应在任何认证状态下工作.
+        .route("/api/{*rest}", any(web::not_found))
         .merge(forward_protected)
         .with_state(state)
         .layer(auth_layer)
@@ -336,11 +339,11 @@ pub async fn serve(
             None => None,
         };
 
-        // redirect_url: 显式配置优先, 否则由 host+port 派生 (历史行为).
+        // redirect_url: 显式配置优先, 否则由 host+port 派生.
         let redirect_url = oidc_cfg
             .redirect_url
             .clone()
-            .unwrap_or_else(|| format!("http://{host}:{port}/__sg/oauth2/callback"));
+            .unwrap_or_else(|| format!("http://{host}:{port}/oauth2/callback"));
 
         info!(
             issuer = %oidc_cfg.issuer_url,

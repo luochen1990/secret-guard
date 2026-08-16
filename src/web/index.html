@@ -1497,12 +1497,12 @@
     // 注: 旧的 GET /api/records (扁平分页) + GET /api/nodes/{id}/timeline 已删除,
     // 由 session-aware 的 POST /api/sync + GET /api/sessions/{sid}/timeline 替代.
     // /api/records/{id} 保留 (raw view 弹窗按需拉). /api/sessions 保留 (首次加载 sidebar).
-    const API_RECORDS = '/__sg/api/records';        // + '/{id}' 详情 (raw view 弹窗用)
-    const API_SESSIONS = '/__sg/api/sessions';      // + '/{sid}/timeline' 分页 + 列表
-    const API_SYNC = '/__sg/api/sync';              // POST 统一轮询 (sidebar + timeline diff)
-    const API_SECRETS = '/__sg/api/secrets';
-    const API_PROVIDERS = '/__sg/api/providers';
-    const API_API_KEYS = '/__sg/api/api-keys';
+    const API_RECORDS = '/api/records';        // + '/{id}' 详情 (raw view 弹窗用)
+    const API_SESSIONS = '/api/sessions';      // + '/{sid}/timeline' 分页 + 列表
+    const API_SYNC = '/api/sync';              // POST 统一轮询 (sidebar + timeline diff)
+    const API_SECRETS = '/api/secrets';
+    const API_PROVIDERS = '/api/providers';
+    const API_API_KEYS = '/api/api-keys';
     const DECISION_LABELS = {
       default: 'Default (dynamic wins)',
       prefer_static: 'Prefer static',

@@ -254,12 +254,14 @@ delta 切片时, 必须同步跑 `just check-webui`.
 ## 路由策略 (核心契约)
 
 URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标 provider,
-为未来跨协议转换预留钩子.
+为未来跨协议转换预留钩子. **完整 URI 分配规划 (顶级保留字 / 命名空间不相交论证 /
+变更流程) 的 SSOT 见 `docs/design/url-layout.md`**, 下列路由改动必须同步该文档.
 
 | 路径 | 含义 |
 |---|---|
 | `/` | Web UI (主入口) |
-| `/__sg`, `/__sg/*` | Web UI + JSON API (向后兼容旧入口) |
+| `/api/*` | Web UI JSON API (未匹配子路径 404, 绝不进 forward) |
+| `/login`, `/oauth2/callback`, `/logout` | OIDC 认证 (auth 启用时) |
 | `/{o\|a\|g\|l\|r}/{name}` | forward, rest = "/" |
 | `/{o\|a\|g\|l\|r}/{name}/{*rest}` | forward, rest 含前导 `/` |
 | 其他 | 404 (不再 catch-all 透传) |
@@ -361,7 +363,7 @@ Secret / Provider 的两种 value 来源 (`value`/`value_file`、`api_key`/`api_
   - `client_secret_file` (string, 可选): client secret 文件路径, 启动时读取 (public client
     + PKCE 场景可不配).
   - `redirect_url` (string, 可选): 覆盖由 host+port 派生的默认回调
-    (`http://{host}:{port}/__sg/oauth2/callback`); path 必须保持 `/__sg/oauth2/callback`,
+    (`http://{host}:{port}/oauth2/callback`); path 必须保持 `/oauth2/callback`,
     只能换 scheme/host/port (如经反向代理暴露时).
 - `api_keys` (`[[auth.api_keys]]` 数组, 默认空): 静态预设 API key 列表 (如 CI/CD 场景),
   启动时 hash 后注入 ApiKeyStore, 与 WebUI 签发的 key 共用同一池. 元素字段:
@@ -576,8 +578,8 @@ CI 已升级为阻塞门禁: 当前 `deny.toml` allow 列表已实测覆盖全�
 NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 批量注入方案,
 见 **`docs/deployment-nixos.md`**.
 
-> 路径约定见上方"路由策略"表格; `/__sg` 子路由细节 (slash redirect / 未匹配 404 no-forward)
-> 见 `src/web/AGENTS.md`.
+> 路径约定见上方"路由策略"表格; `/api/*` 子路由细节 (未匹配 404 no-forward)
+> 见 `src/web/AGENTS.md`; 完整 URI 分配规划见 `docs/design/url-layout.md`.
 
 ## 已知限制 (MVP)
 

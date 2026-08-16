@@ -385,23 +385,26 @@ fn token_response_no_id_token() -> Response {
 /// 每次 `build_test_router` 都 `TcpListener::bind("127.0.0.1:0")` 让 OS 分配
 /// 空闲端口, 多个测试并行跑不会冲突. ApiKeyStore 的 state_path 也用 UUID 唯一化
 /// (避免跨测试 state 持久化文件污染).
-async fn build_test_router(backend: OidcBackend) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let base = format!("http://{addr}");
-
-    // 构造空 ApiKeyStore (无 static key + 无 dynamic entry). 用临时 state_path 满足
-    // 构造签名; 测试不触发 CRUD 持久化, 路径仅占位.
-    let tmp_state =
-        std::env::temp_dir().join(format!("sg-auth-oidc-test-{}.toml", uuid::Uuid::new_v4()));
-    let api_keys = ApiKeyStore::new(
+/// 构造空 ApiKeyStore (无 static key + 无 dynamic entry). 用 UUID 唯一化的临时
+/// state_path 满足构造签名 (测试不触发 CRUD 持久化, 路径仅占位, 且跨测试不互扰).
+fn empty_api_key_store(prefix: &str) -> ApiKeyStore {
+    let tmp_state = std::env::temp_dir().join(format!("{prefix}-{}.toml", uuid::Uuid::new_v4()));
+    ApiKeyStore::new(
         &[],
         std::path::Path::new("."),
         vec![],
         std::collections::HashSet::new(),
         tmp_state,
         std::sync::Arc::new(parking_lot::Mutex::new(())),
-    );
+    )
+}
+
+async fn build_test_router(backend: OidcBackend) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}");
+
+    let api_keys = empty_api_key_store("sg-auth-oidc-test");
     let auth_state = AuthState {
         backend: backend.clone(),
         api_keys,
@@ -418,7 +421,7 @@ async fn build_test_router(backend: OidcBackend) -> String {
     let session_layer = build_session_layer();
     let auth_layer = AuthManagerLayerBuilder::new(backend, session_layer).build();
 
-    let app = Router::new().nest("/__sg", auth_routes).layer(auth_layer);
+    let app = Router::new().merge(auth_routes).layer(auth_layer);
 
     tokio::spawn(async move {
         let _ = axum::serve(listener, app.into_make_service()).await;
@@ -438,7 +441,7 @@ async fn spawn_idp_with_backend() -> (MockIdp, OidcBackend) {
         idp.issuer(),
         idp.client_id(),
         None,
-        "http://127.0.0.1:1/__sg/oauth2/callback",
+        "http://127.0.0.1:1/oauth2/callback",
     )
     .await
     .expect("discover");
@@ -754,11 +757,7 @@ async fn login_start_redirects_to_idp_with_pkce_in_session() {
     // (含 PKCE verifier + nonce + state, 这些绝不能放 query string).
     let (idp, base) = spawn_idp_with_client().await;
     let client = http_client();
-    let resp = client
-        .get(format!("{base}/__sg/login"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(format!("{base}/login")).send().await.unwrap();
 
     // 1. 必须 302 redirect 到 IdP.
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
@@ -805,7 +804,7 @@ async fn login_start_sanitizes_next_url() {
 
     // 合法 next: 仍正常 redirect 到 IdP (next 已存入 session).
     let resp = client
-        .get(format!("{base}/__sg/login?next=/__sg/records"))
+        .get(format!("{base}/login?next=/api/records"))
         .send()
         .await
         .unwrap();
@@ -814,7 +813,7 @@ async fn login_start_sanitizes_next_url() {
     // 非法 next (//evil.com): 不阻断流程, 仍 redirect 到 IdP (next 被丢弃, 不进 session).
     // 守卫的是 "next 不会被用作 redirect 目标除非合法", 此处验证非法 next 不抛错.
     let resp2 = client
-        .get(format!("{base}/__sg/login?next=//evil.com"))
+        .get(format!("{base}/login?next=//evil.com"))
         .send()
         .await
         .unwrap();
@@ -842,11 +841,7 @@ async fn oauth_callback_rejects_idp_error_param() {
     let client = http_client();
 
     // 先 login 一次拿 cookie (建立 session). 提取 Set-Cookie 用于后续 callback 回传.
-    let login_resp = client
-        .get(format!("{base}/__sg/login"))
-        .send()
-        .await
-        .unwrap();
+    let login_resp = client.get(format!("{base}/login")).send().await.unwrap();
     assert_eq!(
         login_resp.status(),
         StatusCode::SEE_OTHER,
@@ -860,7 +855,7 @@ async fn oauth_callback_rejects_idp_error_param() {
     // 反序列化要求), 故这里随便填 dummy 值 — handler 会先检查 error 字段短路返回 401.
     let resp = client
         .get(format!(
-            "{base}/__sg/oauth2/callback?code=dummy&state=dummy&error=access_denied&error_description=user+cancelled"
+            "{base}/oauth2/callback?code=dummy&state=dummy&error=access_denied&error_description=user+cancelled"
         ))
         .header(header::COOKIE, session_cookie)
         .send()
@@ -882,9 +877,7 @@ async fn oauth_callback_rejects_missing_session_credentials() {
 
     // 不 login, 直接 callback. session 是空的 (无 cookie 回传).
     let resp = client
-        .get(format!(
-            "{base}/__sg/oauth2/callback?code=fake&state=anything"
-        ))
+        .get(format!("{base}/oauth2/callback?code=fake&state=anything"))
         .send()
         .await
         .unwrap();
@@ -903,11 +896,7 @@ async fn me_returns_unauthenticated_when_not_logged_in() {
     let (_idp, base) = spawn_idp_with_client().await;
     let client = http_client();
 
-    let resp = client
-        .get(format!("{base}/__sg/api/me"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(format!("{base}/api/me")).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body: serde_json::Value = serde_json::from_slice(&resp.bytes().await.unwrap()).unwrap();
     assert_eq!(body["authenticated"], false);
@@ -915,16 +904,12 @@ async fn me_returns_unauthenticated_when_not_logged_in() {
 
 #[tokio::test]
 async fn logout_clears_session_and_redirects() {
-    // logout handler: 调 auth_session.logout() + redirect 到 /__sg/login.
+    // logout handler: 调 auth_session.logout() + redirect 到 /login.
     // 即使未登录, logout 也不报错 (幂等, 调 logout on empty session 是 no-op).
     let (_idp, base) = spawn_idp_with_client().await;
     let client = http_client();
 
-    let resp = client
-        .post(format!("{base}/__sg/logout"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.post(format!("{base}/logout")).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     let loc = resp
         .headers()
@@ -932,5 +917,107 @@ async fn logout_clears_session_and_redirects() {
         .unwrap()
         .to_str()
         .unwrap();
-    assert_eq!(loc, "/__sg/login", "logout should redirect to login");
+    assert_eq!(loc, "/login", "logout should redirect to login");
+}
+
+// ─── server.rs auth 装配冒烟测试 ─────────────────────────────────────────
+//
+// 背景: axum 对重复路由注册是**运行期 panic** (matchit insert error), 不是编译期
+// 错误. `build_router_with_auth_layers` 把 webui_public (`/login` 等) 与
+// `web::router()` (`/`, `/api/*`) merge 到同一 Router, 是重复路由风险最集中的
+// 形态 — 例如未来有人在 web::router() 里加 `/api/me` 或 `/login`, 只会在 auth
+// 启用的生产启动时 panic, CI (默认走单用户 build_router) 全绿也无法发现.
+// 本测试用真实的 server::build_router_with_auth 做装配冒烟, 把该风险挡在 CI.
+
+/// 构造与生产 `serve()` 同构的完整 auth Router 并 spawn 到随机端口.
+///
+/// 与 `build_test_router` 的差异: 这里走真实的 `server::build_router_with_auth`
+/// (含 web::router() + forward 路由 + /api/{*rest} 兜底), 而非仅 OIDC handlers
+/// 的迷你装配. AppState 字段全用最小占位值 (冒烟只关心路由装配与认证跳转,
+/// 不关心转发逻辑). 双表共享同一 decisions + persist_lock, 与 server.rs 装配一致.
+async fn spawn_full_auth_router() -> String {
+    let (_idp, backend) = spawn_idp_with_backend().await;
+
+    let api_keys = empty_api_key_store("sg-auth-smoke");
+
+    let decisions = std::sync::Arc::new(parking_lot::RwLock::new(
+        secret_guard::config::Decisions::default(),
+    ));
+    let persist_lock = std::sync::Arc::new(parking_lot::Mutex::new(()));
+    let state_path =
+        std::env::temp_dir().join(format!("sg-auth-smoke-prov-{}.toml", uuid::Uuid::new_v4()));
+    let providers = secret_guard::provider::ProviderTable::with_persist_lock(
+        vec![],
+        vec![],
+        decisions.clone(),
+        state_path,
+        persist_lock.clone(),
+    );
+    let secrets_state_path =
+        std::env::temp_dir().join(format!("sg-auth-smoke-sec-{}.toml", uuid::Uuid::new_v4()));
+    let secrets = secret_guard::secrets::SecretTable::with_persist_lock(
+        vec![],
+        vec![],
+        decisions,
+        secrets_state_path,
+        persist_lock,
+    );
+    let state = secret_guard::state::AppState {
+        upstream: reqwest::Client::new(),
+        providers,
+        dag: secret_guard::dag::ConversationDag::new(8, 8, 1),
+        secrets,
+        api_keys: api_keys.clone(),
+        auth_enabled: true,
+        global_mock_prefix: std::sync::Arc::from(""),
+        on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,
+        upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
+    };
+
+    let app = secret_guard::server::build_router_with_auth(
+        state,
+        secret_guard::server::AuthStack { backend, api_keys },
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn full_auth_router_assembly_smoke() {
+    // 冒烟: 真实 auth 装配 (build_router_with_auth) 不 panic + 关键路由行为正确.
+    // 1. 装配本身不 panic (重复路由会在 serve/bind 时 panic, 这里直接暴露).
+    let base = spawn_full_auth_router().await;
+    let client = http_client();
+
+    // 2. 未登录访问受保护 `/` → 307 到 /login (login_required guard 生效;
+    //    axum-login 的 guard 用 Redirect::temporary = 307).
+    let resp = client.get(format!("{base}/")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+    let loc = resp
+        .headers()
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        loc.starts_with("/login"),
+        "guard should redirect to /login, got {loc}"
+    );
+
+    // 3. 未登录访问受保护 `/api/sync` → 同样 307 (web::router() 全量在 guard 内).
+    let resp = client
+        .post(format!("{base}/api/sync"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+
+    // 4. 公开路由 `/api/me` 不被 guard 拦截 (返回 200 + authenticated:false,
+    //    而非 307) — 守卫 webui_public 与 webui_protected 的分界.
+    let resp = client.get(format!("{base}/api/me")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }

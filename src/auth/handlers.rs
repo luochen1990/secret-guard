@@ -2,10 +2,10 @@
 //!
 //! # 路由
 //!
-//! - `GET/POST /__sg/login` — 发起 OIDC 流程 (生成 PKCE + nonce, redirect 到 IdP).
-//! - `GET /__sg/oauth2/callback` — IdP 回调 (交换 token, 验证 ID token, 登录).
-//! - `POST /__sg/logout` — 清除 session.
-//! - `GET /__sg/api/me` — 返回当前登录用户信息.
+//! - `GET/POST /login` — 发起 OIDC 流程 (生成 PKCE + nonce, redirect 到 IdP).
+//! - `GET /oauth2/callback` — IdP 回调 (交换 token, 验证 ID token, 登录).
+//! - `POST /logout` — 清除 session.
+//! - `GET /api/me` — 返回当前登录用户信息.
 //!
 //! # Session key
 //!
@@ -150,7 +150,7 @@ pub async fn oauth_callback(
             }
             let next: Option<String> = session.get(SK_NEXT_URL).await.ok().flatten();
             let _ = session.remove::<String>(SK_NEXT_URL).await;
-            let target = next.as_deref().unwrap_or("/__sg");
+            let target = next.as_deref().unwrap_or("/");
             Redirect::to(target).into_response()
         }
         Ok(None) => error_response(StatusCode::UNAUTHORIZED, "authentication failed"),
@@ -161,7 +161,7 @@ pub async fn oauth_callback(
 /// 登出: 清除 session.
 pub async fn logout(mut auth_session: AuthSession) -> Response {
     let _ = auth_session.logout().await;
-    Redirect::to("/__sg/login").into_response()
+    Redirect::to("/login").into_response()
 }
 
 /// 返回当前登录用户信息 (WebUI header 显示用).
@@ -208,7 +208,7 @@ fn error_response(status: StatusCode, e: impl std::fmt::Display) -> Response {
 
 /// 校验 next URL: 只允许站内相对路径, 防止 open redirect.
 ///
-/// 合法: `/path`, `/__sg/records`
+/// 合法: `/path`, `/api/records/{id}`
 /// 非法: `https://evil.com`, `//evil.com`, `/\\evil.com`
 fn sanitize_next_url(next: &str) -> Option<&str> {
     if next.starts_with('/')
@@ -229,7 +229,7 @@ mod tests {
 
     #[test]
     fn sanitize_next_url_accepts_relative_paths() {
-        assert_eq!(sanitize_next_url("/__sg/records"), Some("/__sg/records"));
+        assert_eq!(sanitize_next_url("/api/records"), Some("/api/records"));
         assert_eq!(sanitize_next_url("/"), Some("/"));
         assert_eq!(sanitize_next_url("/a/b/c"), Some("/a/b/c"));
     }

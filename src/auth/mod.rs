@@ -92,11 +92,10 @@ pub struct OidcConfig {
     /// 需显式配置的场景: 监听地址非浏览器可达时 (如 `0.0.0.0` 或经反向代理以独立域名暴露),
     /// 因为默认回退值含监听地址, IdP 会拒绝.
     ///
-    /// **path 必须是 `/__sg/oauth2/callback`** (与内部 axum 路由一致, 见 `server.rs`);
+    /// **path 必须是 `/oauth2/callback`** (与内部 axum 路由一致, 见 `server.rs`);
     /// 只能换 scheme/host/port, 换 path 会导致 IdP 回跳后 404.
     ///
-    /// 留空 (默认) 时, server.rs 回退为 `http://{host}:{port}/__sg/oauth2/callback`,
-    /// 与历史行为一致.
+    /// 留空 (默认) 时, server.rs 回退为 `http://{host}:{port}/oauth2/callback`.
     #[serde(default)]
     pub redirect_url: Option<String>,
 }
@@ -116,7 +115,7 @@ impl AuthConfig {
             }
             // redirect_url 校验前置到启动时 (集中式预处理), 避免错误延迟到 OIDC
             // Discovery 阶段才暴露. 不引入 url crate 作直接依赖, 只做最小校验:
-            // 必须是 http/https scheme + path 必须是 /__sg/oauth2/callback (与 axum 路由一致).
+            // 必须是 http/https scheme + path 必须是 /oauth2/callback (与 axum 路由一致).
             if let Some(ru) = oidc.redirect_url.as_ref() {
                 let trimmed = ru.trim();
                 if trimmed.is_empty() {
@@ -127,9 +126,9 @@ impl AuthConfig {
                         "[auth.oidc] redirect_url '{trimmed}' must start with http:// or https://"
                     ));
                 }
-                if !trimmed.ends_with("/__sg/oauth2/callback") {
+                if !trimmed.ends_with("/oauth2/callback") {
                     return Err(format!(
-                        "[auth.oidc] redirect_url '{trimmed}' must end with /__sg/oauth2/callback \
+                        "[auth.oidc] redirect_url '{trimmed}' must end with /oauth2/callback \
                          (axum callback route, only scheme/host/port can vary)"
                     ));
                 }
@@ -215,12 +214,12 @@ mod tests {
         let toml_text = r#"
             issuer_url = "https://idp.example.com"
             client_id = "sg"
-            redirect_url = "https://sg.example.com/__sg/oauth2/callback"
+            redirect_url = "https://sg.example.com/oauth2/callback"
         "#;
         let oidc: OidcConfig = toml::from_str(toml_text).expect("toml parse");
         assert_eq!(
             oidc.redirect_url.as_deref(),
-            Some("https://sg.example.com/__sg/oauth2/callback")
+            Some("https://sg.example.com/oauth2/callback")
         );
     }
 
@@ -228,7 +227,7 @@ mod tests {
     //
     // 与 issuer_url/client_id 对齐: 把"明显误配"在启动时 fail-fast, 而非延迟到
     // OIDC Discovery 阶段才暴露. 校验两条契约: (1) http/https scheme;
-    // (2) path 结尾 /__sg/oauth2/callback (与 axum callback 路由一致).
+    // (2) path 结尾 /oauth2/callback (与 axum callback 路由一致).
 
     /// 辅助: 构造一个 enabled=true 的 AuthConfig, oidc 必填字段已填合法值,
     /// 只留 redirect_url 给调用方覆盖.
@@ -255,7 +254,7 @@ mod tests {
     fn validate_redirect_url_valid_https_passes() {
         // 合法 https + 正确 path: ok.
         assert!(
-            auth_enabled_cfg(Some("https://sg.example.com/__sg/oauth2/callback"))
+            auth_enabled_cfg(Some("https://sg.example.com/oauth2/callback"))
                 .validate()
                 .is_ok()
         );
@@ -269,7 +268,7 @@ mod tests {
 
     #[test]
     fn validate_redirect_url_rejects_non_http_scheme() {
-        let err = auth_enabled_cfg(Some("ftp://sg.example.com/__sg/oauth2/callback"))
+        let err = auth_enabled_cfg(Some("ftp://sg.example.com/oauth2/callback"))
             .validate()
             .unwrap_err();
         assert!(err.contains("must start with http"), "got: {err}");
@@ -277,11 +276,11 @@ mod tests {
 
     #[test]
     fn validate_redirect_url_rejects_wrong_path() {
-        // scheme 对但 path 不是 /__sg/oauth2/callback → 会被 IdP 回跳后 404, 前置拒绝.
-        let err = auth_enabled_cfg(Some("https://sg.example.com/oauth2/callback"))
+        // scheme 对但 path 不是 /oauth2/callback → 会被 IdP 回跳后 404, 前置拒绝.
+        let err = auth_enabled_cfg(Some("https://sg.example.com/callback"))
             .validate()
             .unwrap_err();
-        assert!(err.contains("/__sg/oauth2/callback"), "got: {err}");
+        assert!(err.contains("/oauth2/callback"), "got: {err}");
     }
 
     #[test]

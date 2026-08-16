@@ -136,7 +136,7 @@ export default defineConfig({
     {
       // 2. 启动 secret-guard (在 mock 就绪后).
       command: `${SG_BIN} run --config ${SG_CONFIG} --state ${SG_STATE} --port ${SG_PORT}`,
-      url: `${SG_URL}__sg/api/providers`,
+      url: `${SG_URL}api/providers`,
       timeout: 15_000,
       reuseExistingServer: false,
     },

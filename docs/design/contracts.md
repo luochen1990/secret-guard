@@ -239,7 +239,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 - `prop_disabled_provider_returns_503`: provider.enabled=false → 503 unavailable. 🔁→`disabled_provider_returns_503` (`tests/integration.rs`)
 - `prop_cross_proto_streaming_returns_501`: 跨协议 + stream=true → 501 (翻译未接入). 🔁→`cross_protocol_streaming_returns_501` (`tests/integration.rs`)
 - `prop_unsupported_codec_returns_501`: Gemini/Ollama 跨协议 → 501 (codec 未覆盖). 🔁→`cross_protocol_unknown_pair_returns_501` (`tests/integration.rs`)
-- `prop_internal_url_not_forwarded`: `/__sg/*` 未匹配子路径 → 404, 绝不进入 forward (防止内部 URL 泄漏到上游). 🔁→`web_namespace_not_forwarded_to_upstream` + `unmatched_path_returns_404` (`tests/integration.rs`)
+- `prop_internal_url_404_no_forward`: `/api/*` 未匹配子路径 → 404, 绝不进入 forward (防止内部 URL 泄漏到上游; 同 SEC-6 的 property 名). 🔁→`web_namespace_not_forwarded_to_upstream` + `unmatched_path_returns_404` (`tests/integration.rs`)
 
 ### FWD-6 Provider 鉴权注入
 
@@ -657,11 +657,11 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 ### SEC-6 本地监听 + 内部 URL 不外泄
 
-**陈述**: 默认监听 127.0.0.1. `/__sg/*` 未匹配子路径返回 404, 绝不进入 forward.
+**陈述**: 默认监听 127.0.0.1. `/api/*` 未匹配子路径返回 404, 绝不进入 forward.
 
 **Properties**:
 - `prop_default_host_localhost`: 默认 host=127.0.0.1. ✅
-- `prop_internal_url_404_no_forward`: `/__sg/unknown` → 404, 不发送到上游. 🔁→`web_namespace_not_forwarded_to_upstream` + `unmatched_path_returns_404` (`tests/integration.rs`)
+- `prop_internal_url_404_no_forward`: `/api/unknown` → 404, 不发送到上游. 🔁→`web_namespace_not_forwarded_to_upstream` + `unmatched_path_returns_404` (`tests/integration.rs`)
 
 ---
 

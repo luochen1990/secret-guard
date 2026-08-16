@@ -10,7 +10,7 @@
 //! - 请求 header 透传; provider api_key 覆盖客户端 auth.
 //! - 转发记录被持久化.
 //! - 上游不可达时返回 502 + record 标记 incomplete.
-//! - Web UI: `/` 根路径 + `/__sg/` HTML; `/__sg/api/*` JSON.
+//! - Web UI: `/` 根路径 HTML; `/api/*` JSON.
 
 use std::time::Duration;
 
@@ -522,7 +522,7 @@ async fn streaming_parsed_view_accumulates_text() {
     // 拉 parsed view, 验证累积文本.
     let client = reqwest::Client::new();
     let env: serde_json::Value = client
-        .get(format!("{proxy_url}/__sg/api/records/{id}?view=parsed"))
+        .get(format!("{proxy_url}/api/records/{id}?view=parsed"))
         .send()
         .await
         .unwrap()
@@ -1600,16 +1600,31 @@ async fn root_serves_web_ui() {
 }
 
 #[tokio::test]
-async fn web_ui_legacy_path_still_works() {
-    let upstream = spawn_mock_upstream().await;
+async fn legacy_sg_prefix_returns_404() {
+    // URL 硬切: 旧 `/__sg` 前缀已移除. 单段 `/__sg` 无路由匹配 → 404;
+    // `/__sg/foo` 匹配 `/{proto}/{name}` 但 proto 解析失败 → 404 (不转发).
+    let mut upstream = spawn_mock_upstream().await;
+    // 上游零命中断言: 即使 mock 接受 ANY method/ANY path, 也不应被转发命中.
+    let mock = upstream
+        .mock("GET", mockito::Matcher::Any)
+        .expect(0)
+        .create_async()
+        .await;
     let proxy_url = spawn_proxy(&upstream.url()).await;
-    let resp = reqwest::Client::new()
-        .get(format!("{proxy_url}/__sg"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    assert!(resp.text().await.unwrap().contains("secret-guard"));
+    let client = reqwest::Client::new();
+    for path in ["/__sg", "/__sg/foo", "/__sg/api/sync"] {
+        let resp = client
+            .get(format!("{proxy_url}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "legacy prefix {path} must 404 after hard cut"
+        );
+    }
+    mock.assert_async().await;
 }
 
 #[tokio::test]
@@ -1654,7 +1669,7 @@ async fn web_api_sync_returns_sessions_after_forward() {
 
     // POST /api/sync 应返回 1 个 session (record_count=1).
     let resp = reqwest::Client::new()
-        .post(format!("{proxy_url}/__sg/api/sync"))
+        .post(format!("{proxy_url}/api/sync"))
         .json(&serde_json::json!({"expanded": [], "selected": null}))
         .send()
         .await
@@ -1709,7 +1724,7 @@ async fn web_api_returns_record_by_id() {
     let id = list[0].id;
 
     let resp = reqwest::Client::new()
-        .get(format!("{proxy_url}/__sg/api/records/{id}"))
+        .get(format!("{proxy_url}/api/records/{id}"))
         .send()
         .await
         .unwrap();
@@ -1729,7 +1744,7 @@ async fn web_api_404_for_unknown_record() {
     let proxy_url = spawn_proxy(&upstream.url()).await;
     let resp = reqwest::Client::new()
         .get(format!(
-            "{proxy_url}/__sg/api/records/00000000-0000-0000-0000-000000000000"
+            "{proxy_url}/api/records/00000000-0000-0000-0000-000000000000"
         ))
         .send()
         .await
@@ -1784,7 +1799,7 @@ async fn web_api_records_view_parsed_openai_returns_structured() {
     let id = list[0].id;
 
     let body: serde_json::Value = reqwest::Client::new()
-        .get(format!("{proxy_url}/__sg/api/records/{id}?view=parsed"))
+        .get(format!("{proxy_url}/api/records/{id}?view=parsed"))
         .send()
         .await
         .unwrap()
@@ -1881,7 +1896,7 @@ async fn gzip_compressed_upstream_response_is_decompressed_for_record() {
     let id = list[0].id;
 
     let body: serde_json::Value = reqwest::Client::new()
-        .get(format!("{proxy_url}/__sg/api/records/{id}?view=parsed"))
+        .get(format!("{proxy_url}/api/records/{id}?view=parsed"))
         .send()
         .await
         .unwrap()
@@ -2065,7 +2080,7 @@ async fn web_api_records_view_parsed_gemini_returns_error() {
     let id = records[0].id;
 
     let body: serde_json::Value = reqwest::Client::new()
-        .get(format!("{proxy_url}/__sg/api/records/{id}?view=parsed"))
+        .get(format!("{proxy_url}/api/records/{id}?view=parsed"))
         .send()
         .await
         .unwrap()
@@ -2086,7 +2101,7 @@ async fn web_api_400_for_invalid_uuid() {
     let upstream = spawn_mock_upstream().await;
     let proxy_url = spawn_proxy(&upstream.url()).await;
     let resp = reqwest::Client::new()
-        .get(format!("{proxy_url}/__sg/api/records/not-a-uuid"))
+        .get(format!("{proxy_url}/api/records/not-a-uuid"))
         .send()
         .await
         .unwrap();
@@ -2106,14 +2121,14 @@ async fn web_namespace_not_forwarded_to_upstream() {
     let proxy_url = spawn_proxy(&upstream.url()).await;
 
     let resp = reqwest::Client::new()
-        .get(format!("{proxy_url}/__sg/api/records/"))
+        .get(format!("{proxy_url}/api/records/"))
         .send()
         .await
         .unwrap();
     let status = resp.status();
     assert!(
         !status.is_success(),
-        "expected /__sg/* to NOT be forwarded upstream, got status {status}"
+        "expected /api/* to NOT be forwarded upstream, got status {status}"
     );
 }
 
@@ -2124,7 +2139,7 @@ async fn secrets_api_lists_empty() {
     let upstream = spawn_mock_upstream().await;
     let proxy_url = spawn_proxy(&upstream.url()).await;
     let resp = reqwest::Client::new()
-        .get(format!("{proxy_url}/__sg/api/secrets"))
+        .get(format!("{proxy_url}/api/secrets"))
         .send()
         .await
         .unwrap();
@@ -2143,7 +2158,7 @@ async fn secrets_api_create_lists_update_delete() {
     let client = reqwest::Client::new();
 
     let resp = client
-        .post(format!("{proxy_url}/__sg/api/secrets"))
+        .post(format!("{proxy_url}/api/secrets"))
         .json(&serde_json::json!({
             "id": "test-key-1",
             "name": "Test API Key",
@@ -2159,7 +2174,7 @@ async fn secrets_api_create_lists_update_delete() {
     assert_ne!(created["value_masked"], "sk-test-1234567890abcdef");
 
     let resp = client
-        .get(format!("{proxy_url}/__sg/api/secrets"))
+        .get(format!("{proxy_url}/api/secrets"))
         .send()
         .await
         .unwrap();
@@ -2169,7 +2184,7 @@ async fn secrets_api_create_lists_update_delete() {
     assert_eq!(secrets[0]["id"], "test-key-1");
 
     let resp = client
-        .put(format!("{proxy_url}/__sg/api/secrets/test-key-1"))
+        .put(format!("{proxy_url}/api/secrets/test-key-1"))
         .json(&serde_json::json!({
             "name": "Renamed",
             "category": "token",
@@ -2183,7 +2198,7 @@ async fn secrets_api_create_lists_update_delete() {
     assert_eq!(updated["name"], "Renamed");
 
     let resp = client
-        .delete(format!("{proxy_url}/__sg/api/secrets/test-key-1"))
+        .delete(format!("{proxy_url}/api/secrets/test-key-1"))
         .send()
         .await
         .unwrap();
@@ -2200,7 +2215,7 @@ async fn secrets_api_generated_id_is_signaled() {
 
     // 不传 id → 201 + generated_id: true + UUID 形态的 id.
     let resp = client
-        .post(format!("{proxy_url}/__sg/api/secrets"))
+        .post(format!("{proxy_url}/api/secrets"))
         .json(&serde_json::json!({ "value": "sk-gen-123456789" }))
         .send()
         .await
@@ -2216,7 +2231,7 @@ async fn secrets_api_generated_id_is_signaled() {
 
     // 显式传 id → 201 + 无 generated_id 字段 (向后兼容的加法: 老字段原样).
     let resp = client
-        .post(format!("{proxy_url}/__sg/api/secrets"))
+        .post(format!("{proxy_url}/api/secrets"))
         .json(&serde_json::json!({
             "id": "explicit-id-1",
             "value": "sk-explicit-123456789",
@@ -2235,7 +2250,7 @@ async fn secrets_api_generated_id_is_signaled() {
     // 清理 (两个 secret 均为 dynamic-only, 可删).
     for id in [id.as_str(), "explicit-id-1"] {
         let resp = client
-            .delete(format!("{proxy_url}/__sg/api/secrets/{id}"))
+            .delete(format!("{proxy_url}/api/secrets/{id}"))
             .send()
             .await
             .unwrap();
@@ -2251,7 +2266,7 @@ async fn providers_api_generated_id_is_signaled() {
     let client = reqwest::Client::new();
 
     let resp = client
-        .post(format!("{proxy_url}/__sg/api/providers"))
+        .post(format!("{proxy_url}/api/providers"))
         .json(&serde_json::json!({
             "protocol": "openai",
             "base_url": upstream.url(),
@@ -2266,7 +2281,7 @@ async fn providers_api_generated_id_is_signaled() {
     assert!(uuid::Uuid::parse_str(&id).is_ok(), "id: {id}");
 
     let resp = client
-        .delete(format!("{proxy_url}/__sg/api/providers/{id}"))
+        .delete(format!("{proxy_url}/api/providers/{id}"))
         .send()
         .await
         .unwrap();
@@ -2278,7 +2293,7 @@ async fn secrets_api_rejects_empty_value() {
     let upstream = spawn_mock_upstream().await;
     let proxy_url = spawn_proxy(&upstream.url()).await;
     let resp = reqwest::Client::new()
-        .post(format!("{proxy_url}/__sg/api/secrets"))
+        .post(format!("{proxy_url}/api/secrets"))
         .json(&serde_json::json!({
             "id": "bad",
             "value": "",
@@ -2294,7 +2309,7 @@ async fn secrets_api_delete_missing_returns_404() {
     let upstream = spawn_mock_upstream().await;
     let proxy_url = spawn_proxy(&upstream.url()).await;
     let resp = reqwest::Client::new()
-        .delete(format!("{proxy_url}/__sg/api/secrets/does-not-exist"))
+        .delete(format!("{proxy_url}/api/secrets/does-not-exist"))
         .send()
         .await
         .unwrap();
@@ -2308,7 +2323,7 @@ async fn providers_api_lists_existing() {
     let upstream = spawn_mock_upstream().await;
     let proxy_url = spawn_proxy(&upstream.url()).await;
     let resp = reqwest::Client::new()
-        .get(format!("{proxy_url}/__sg/api/providers"))
+        .get(format!("{proxy_url}/api/providers"))
         .send()
         .await
         .unwrap();
@@ -2331,7 +2346,7 @@ async fn providers_api_create_update_delete() {
 
     // 创建新 Anthropic provider.
     let resp = client
-        .post(format!("{proxy_url}/__sg/api/providers"))
+        .post(format!("{proxy_url}/api/providers"))
         .json(&serde_json::json!({
             "id": "an-main",
             "name": "Anthropic Main",
@@ -2351,7 +2366,7 @@ async fn providers_api_create_update_delete() {
 
     // List 看到 2 条.
     let resp = client
-        .get(format!("{proxy_url}/__sg/api/providers"))
+        .get(format!("{proxy_url}/api/providers"))
         .send()
         .await
         .unwrap();
@@ -2361,7 +2376,7 @@ async fn providers_api_create_update_delete() {
 
     // Update: 改 base_url.
     let resp = client
-        .put(format!("{proxy_url}/__sg/api/providers/an-main"))
+        .put(format!("{proxy_url}/api/providers/an-main"))
         .json(&serde_json::json!({
             "protocol": "anthropic",
             "base_url": "https://api.anthropic.com/v2",
@@ -2376,7 +2391,7 @@ async fn providers_api_create_update_delete() {
 
     // Delete.
     let resp = client
-        .delete(format!("{proxy_url}/__sg/api/providers/an-main"))
+        .delete(format!("{proxy_url}/api/providers/an-main"))
         .send()
         .await
         .unwrap();
@@ -2384,7 +2399,7 @@ async fn providers_api_create_update_delete() {
 
     // 剩 1 条.
     let resp = client
-        .get(format!("{proxy_url}/__sg/api/providers"))
+        .get(format!("{proxy_url}/api/providers"))
         .send()
         .await
         .unwrap();
@@ -2406,7 +2421,7 @@ async fn put_provider_omit_api_key(
     base_url: &str,
 ) -> reqwest::Response {
     client
-        .put(format!("{proxy_url}/__sg/api/providers/{id}"))
+        .put(format!("{proxy_url}/api/providers/{id}"))
         .header("Content-Type", "application/json")
         .body(format!(
             r#"{{"protocol":"openai","base_url":"{base_url}"}}"#
@@ -2424,7 +2439,7 @@ async fn providers_api_update_preserves_api_key_when_omitted() {
 
     // 创建带 api_key 的 provider.
     let resp = client
-        .post(format!("{proxy_url}/__sg/api/providers"))
+        .post(format!("{proxy_url}/api/providers"))
         .json(&serde_json::json!({
             "id": "oa-pres",
             "name": "OpenAI Preserve",
@@ -2448,7 +2463,7 @@ async fn providers_api_update_preserves_api_key_when_omitted() {
 
     // PUT 显式发空串 api_key: 应清空.
     let resp = client
-        .put(format!("{proxy_url}/__sg/api/providers/oa-pres"))
+        .put(format!("{proxy_url}/api/providers/oa-pres"))
         .json(&serde_json::json!({
             "protocol": "openai",
             "base_url": "https://example.com/v3",
@@ -2501,7 +2516,7 @@ async fn put_static_fork_null_api_key_does_not_persist_plaintext() {
 
     // PUT api_key=null (意图保留旧值). 旧 bug: 已 resolve 的 static 明文被写进 override.
     let resp = client
-        .put(format!("{proxy_url}/__sg/api/providers/p1"))
+        .put(format!("{proxy_url}/api/providers/p1"))
         .json(&serde_json::json!({
             "protocol": "openai",
             "base_url": upstream.url(),
@@ -2522,7 +2537,7 @@ async fn put_static_fork_null_api_key_does_not_persist_plaintext() {
 
     // effective 视图仍带旧 key (length 保留), source 是 dynamic_override.
     let updated: serde_json::Value = client
-        .get(format!("{proxy_url}/__sg/api/providers"))
+        .get(format!("{proxy_url}/api/providers"))
         .send()
         .await
         .unwrap()
@@ -2557,7 +2572,7 @@ async fn put_static_fork_new_api_key_persists_and_forwards() {
     let client = reqwest::Client::new();
 
     let resp = client
-        .put(format!("{proxy_url}/__sg/api/providers/p1"))
+        .put(format!("{proxy_url}/api/providers/p1"))
         .json(&serde_json::json!({
             "protocol": "openai",
             "base_url": upstream.url(),
@@ -2609,7 +2624,7 @@ async fn put_static_fork_null_api_key_inherits_api_key_file() {
     let client = reqwest::Client::new();
 
     let resp = client
-        .put(format!("{proxy_url}/__sg/api/providers/pf"))
+        .put(format!("{proxy_url}/api/providers/pf"))
         .json(&serde_json::json!({
             "protocol": "openai",
             "base_url": upstream.url(),
@@ -2657,7 +2672,7 @@ async fn put_static_fork_empty_api_key_still_inherits_static() {
     let client = reqwest::Client::new();
 
     let resp = client
-        .put(format!("{proxy_url}/__sg/api/providers/pe"))
+        .put(format!("{proxy_url}/api/providers/pe"))
         .json(&serde_json::json!({
             "protocol": "openai",
             "base_url": upstream.url(),
@@ -2671,7 +2686,7 @@ async fn put_static_fork_empty_api_key_still_inherits_static() {
 
     // effective 视图: 空 api_key 显示为继承后的 static key length.
     let updated: serde_json::Value = client
-        .get(format!("{proxy_url}/__sg/api/providers"))
+        .get(format!("{proxy_url}/api/providers"))
         .send()
         .await
         .unwrap()
@@ -2690,7 +2705,7 @@ async fn providers_api_rejects_bad_base_url() {
     let upstream = spawn_mock_upstream().await;
     let proxy_url = spawn_proxy(&upstream.url()).await;
     let resp = reqwest::Client::new()
-        .post(format!("{proxy_url}/__sg/api/providers"))
+        .post(format!("{proxy_url}/api/providers"))
         .json(&serde_json::json!({
             "id": "bad",
             "protocol": "openai",
@@ -3110,7 +3125,7 @@ async fn static_provider_is_listed_with_static_source() {
     let proxy_url = spawn_with_static_and_dynamic(vec![s], vec![]).await;
 
     let body: serde_json::Value = reqwest::Client::new()
-        .get(format!("{proxy_url}/__sg/api/providers"))
+        .get(format!("{proxy_url}/api/providers"))
         .send()
         .await
         .unwrap()
@@ -3191,7 +3206,7 @@ async fn decision_disabled_drops_static_provider() {
     // 切到 disabled.
     let resp = client
         .patch(format!(
-            "{proxy_url}/__sg/api/providers/static-disabled/decision"
+            "{proxy_url}/api/providers/static-disabled/decision"
         ))
         .json(&serde_json::json!({"mode": "disabled"}))
         .send()
@@ -3201,7 +3216,7 @@ async fn decision_disabled_drops_static_provider() {
 
     // List 不再包含.
     let body: serde_json::Value = client
-        .get(format!("{proxy_url}/__sg/api/providers"))
+        .get(format!("{proxy_url}/api/providers"))
         .send()
         .await
         .unwrap()
@@ -3244,7 +3259,7 @@ async fn decision_prefer_static_beats_dynamic_override() {
     let client = reqwest::Client::new();
 
     let resp = client
-        .patch(format!("{proxy_url}/__sg/api/providers/both/decision"))
+        .patch(format!("{proxy_url}/api/providers/both/decision"))
         .json(&serde_json::json!({"mode": "prefer_static"}))
         .send()
         .await
@@ -3269,7 +3284,7 @@ async fn put_static_provider_forks_dynamic_override() {
 
     // 用 PUT 编辑 static provider → 服务端自动 fork 出 dynamic.
     let resp = client
-        .put(format!("{proxy_url}/__sg/api/providers/static-p"))
+        .put(format!("{proxy_url}/api/providers/static-p"))
         .json(&serde_json::json!({
             "protocol": "openai",
             "base_url": upstream.url(),
@@ -3306,7 +3321,7 @@ async fn delete_static_only_provider_is_rejected() {
     let client = reqwest::Client::new();
 
     let resp = client
-        .delete(format!("{proxy_url}/__sg/api/providers/static-p"))
+        .delete(format!("{proxy_url}/api/providers/static-p"))
         .send()
         .await
         .unwrap();
@@ -3334,7 +3349,7 @@ async fn delete_provider_with_override_is_rejected() {
     let client = reqwest::Client::new();
 
     let resp = client
-        .delete(format!("{proxy_url}/__sg/api/providers/p"))
+        .delete(format!("{proxy_url}/api/providers/p"))
         .send()
         .await
         .unwrap();
@@ -3351,7 +3366,7 @@ async fn delete_provider_with_override_is_rejected() {
 
     // override 未被删除: list 中该 id 仍是 dynamic_override, 路由仍走 dynamic.
     let body: serde_json::Value = client
-        .get(format!("{proxy_url}/__sg/api/providers"))
+        .get(format!("{proxy_url}/api/providers"))
         .send()
         .await
         .unwrap()
@@ -3372,7 +3387,7 @@ async fn delete_dynamic_only_provider_succeeds() {
     let client = reqwest::Client::new();
 
     let resp = client
-        .delete(format!("{proxy_url}/__sg/api/providers/dyn-only"))
+        .delete(format!("{proxy_url}/api/providers/dyn-only"))
         .send()
         .await
         .unwrap();
@@ -3380,7 +3395,7 @@ async fn delete_dynamic_only_provider_succeeds() {
 
     // 真正删除: list 为空, 转发 404.
     let body: serde_json::Value = client
-        .get(format!("{proxy_url}/__sg/api/providers"))
+        .get(format!("{proxy_url}/api/providers"))
         .send()
         .await
         .unwrap()
@@ -3408,7 +3423,7 @@ async fn create_post_rejects_conflict_with_static_id() {
     let client = reqwest::Client::new();
 
     let resp = client
-        .post(format!("{proxy_url}/__sg/api/providers"))
+        .post(format!("{proxy_url}/api/providers"))
         .json(&serde_json::json!({
             "id": "static-p",
             "protocol": "openai",
@@ -3429,9 +3444,7 @@ async fn decision_endpoint_rejects_non_static_id() {
     let client = reqwest::Client::new();
 
     let resp = client
-        .patch(format!(
-            "{proxy_url}/__sg/api/providers/dynamic-only/decision"
-        ))
+        .patch(format!("{proxy_url}/api/providers/dynamic-only/decision"))
         .json(&serde_json::json!({"mode": "disabled"}))
         .send()
         .await
@@ -3476,7 +3489,7 @@ async fn secret_decision_disabled_drops_from_redaction() {
 
     // 禁用 static-s.
     let resp = client
-        .patch(format!("{proxy_url}/__sg/api/secrets/static-s/decision"))
+        .patch(format!("{proxy_url}/api/secrets/static-s/decision"))
         .json(&serde_json::json!({"mode": "disabled"}))
         .send()
         .await
@@ -3497,7 +3510,7 @@ async fn secret_decision_disabled_drops_from_redaction() {
     let records = wait_for_record_count(&proxy_url, 1).await;
     // list 不返回 req_body, 需通过 detail API 拉取.
     let detail: serde_json::Value = client
-        .get(format!("{proxy_url}/__sg/api/records/{}", records[0].id))
+        .get(format!("{proxy_url}/api/records/{}", records[0].id))
         .send()
         .await
         .unwrap()
@@ -3541,7 +3554,7 @@ async fn secret_decision_disabled_ack_carries_plaintext_warning() {
 
     // 1. secret + disabled → warning 字段出现且含 "plaintext".
     let ack: serde_json::Value = client
-        .patch(format!("{proxy_url}/__sg/api/secrets/static-s/decision"))
+        .patch(format!("{proxy_url}/api/secrets/static-s/decision"))
         .json(&serde_json::json!({"mode": "disabled"}))
         .send()
         .await
@@ -3559,7 +3572,7 @@ async fn secret_decision_disabled_ack_carries_plaintext_warning() {
 
     // 2. 切回 default → 无 warning 字段 (旧客户端 shape).
     let ack: serde_json::Value = client
-        .patch(format!("{proxy_url}/__sg/api/secrets/static-s/decision"))
+        .patch(format!("{proxy_url}/api/secrets/static-s/decision"))
         .json(&serde_json::json!({"mode": "default"}))
         .send()
         .await
@@ -3574,7 +3587,7 @@ async fn secret_decision_disabled_ack_carries_plaintext_warning() {
 
     // 3. provider + disabled → 无 warning (禁转发语义).
     let ack: serde_json::Value = client
-        .patch(format!("{proxy_url}/__sg/api/providers/oa-main/decision"))
+        .patch(format!("{proxy_url}/api/providers/oa-main/decision"))
         .json(&serde_json::json!({"mode": "disabled"}))
         .send()
         .await
@@ -3654,7 +3667,7 @@ async fn wait_for_record_count(proxy_url: &str, count: usize) -> Vec<RecordSumma
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     loop {
         // 1. POST /api/sync 拿 sessions (含 record_count).
-        let sync_url = format!("{proxy_url}/__sg/api/sync");
+        let sync_url = format!("{proxy_url}/api/sync");
         let sync_resp: SyncResponseBrief = client
             .post(&sync_url)
             .json(&serde_json::json!({"expanded": [], "selected": null}))
@@ -3681,7 +3694,7 @@ async fn wait_for_record_count(proxy_url: &str, count: usize) -> Vec<RecordSumma
                         .to_string(),
                     _ => continue,
                 };
-                let tl_url = format!("{proxy_url}/__sg/api/sessions/{sid_str}/timeline");
+                let tl_url = format!("{proxy_url}/api/sessions/{sid_str}/timeline");
                 let resp = client.get(&tl_url).send().await.unwrap();
                 if !resp.status().is_success() {
                     continue;
@@ -3721,7 +3734,7 @@ async fn decision_can_reenable_after_disabled() {
 
     // 1. disable.
     let resp = client
-        .patch(format!("{proxy_url}/__sg/api/providers/static-p/decision"))
+        .patch(format!("{proxy_url}/api/providers/static-p/decision"))
         .json(&serde_json::json!({"mode": "disabled"}))
         .send()
         .await
@@ -3730,7 +3743,7 @@ async fn decision_can_reenable_after_disabled() {
 
     // 2. 切回 default — 此时 effective_snapshot 看不到 static-p, 但 has_static 应当返回 true.
     let resp = client
-        .patch(format!("{proxy_url}/__sg/api/providers/static-p/decision"))
+        .patch(format!("{proxy_url}/api/providers/static-p/decision"))
         .json(&serde_json::json!({"mode": "default"}))
         .send()
         .await
@@ -3743,7 +3756,7 @@ async fn decision_can_reenable_after_disabled() {
 
     // 3. 重新出现在 list 中.
     let body: serde_json::Value = client
-        .get(format!("{proxy_url}/__sg/api/providers"))
+        .get(format!("{proxy_url}/api/providers"))
         .send()
         .await
         .unwrap()
@@ -3764,14 +3777,14 @@ async fn delete_disabled_static_id_returns_409() {
     let client = reqwest::Client::new();
 
     client
-        .patch(format!("{proxy_url}/__sg/api/providers/static-p/decision"))
+        .patch(format!("{proxy_url}/api/providers/static-p/decision"))
         .json(&serde_json::json!({"mode": "disabled"}))
         .send()
         .await
         .unwrap();
 
     let resp = client
-        .delete(format!("{proxy_url}/__sg/api/providers/static-p"))
+        .delete(format!("{proxy_url}/api/providers/static-p"))
         .send()
         .await
         .unwrap();
@@ -3831,7 +3844,7 @@ async fn cross_table_shared_state_no_lost_update() {
     let url2 = url.clone();
     let (r1, r2) = tokio::join!(
         async move {
-            c1.post(format!("{url1}/__sg/api/providers"))
+            c1.post(format!("{url1}/api/providers"))
                 .json(&serde_json::json!({
                     "id": "p-concurrent",
                     "protocol": "openai",
@@ -3843,7 +3856,7 @@ async fn cross_table_shared_state_no_lost_update() {
                 .unwrap()
         },
         async move {
-            c2.post(format!("{url2}/__sg/api/secrets"))
+            c2.post(format!("{url2}/api/secrets"))
                 .json(&serde_json::json!({
                     "id": "s-concurrent",
                     "value": "some-secret-value",
@@ -3869,7 +3882,7 @@ async fn validate_value_rejects_mock_prefix() {
     // 集成层验证 C5 前提: 配置 global_mock_prefix 后, 含该 prefix 的 secret 应被拒绝.
     let proxy_url = spawn_proxy_with_prefix("sgm_").await;
     let resp = reqwest::Client::new()
-        .post(format!("{proxy_url}/__sg/api/secrets"))
+        .post(format!("{proxy_url}/api/secrets"))
         .json(&serde_json::json!({
             "id": "bad",
             "value": "sgm_abc12345",
@@ -4164,14 +4177,14 @@ async fn streaming_redact_upstream_4xx_json_also_falls_back_without_restore() {
 // Proxy 转发路径 (`/{o|a|g|l}/{name}/*`) 当前 *不* 注入此 header (透传上游 header),
 // 这是当前实现的事实行为 — 本测试分别覆盖两条路径, 锁定各自契约.
 
-/// Web API 路径 (`/__sg/api/*`) 必须带 `Cache-Control: no-store` (防浏览器缓存).
+/// Web API 路径 (`/api/*`) 必须带 `Cache-Control: no-store` (防浏览器缓存).
 #[tokio::test]
 async fn web_api_responses_include_cache_control_no_store_header() {
     let upstream = spawn_mock_upstream().await;
     let proxy_url = spawn_proxy(&upstream.url()).await;
     // 用 /api/sessions 端点 (旧的 /api/records 扁平分页已删除, 由 sync API 替代).
     let resp = reqwest::Client::new()
-        .get(format!("{proxy_url}/__sg/api/sessions"))
+        .get(format!("{proxy_url}/api/sessions"))
         .send()
         .await
         .unwrap();
@@ -4195,7 +4208,7 @@ async fn web_api_cache_control_no_store_header_on_multiple_endpoints() {
     let proxy_url = spawn_proxy(&upstream.url()).await;
     let client = reqwest::Client::new();
 
-    for path in ["/__sg/api/providers", "/__sg/api/secrets"] {
+    for path in ["/api/providers", "/api/secrets"] {
         let resp = client
             .get(format!("{proxy_url}{path}"))
             .send()
@@ -4493,7 +4506,7 @@ async fn fetch_effective_secrets(
     proxy_url: &str,
 ) -> std::collections::HashMap<String, serde_json::Value> {
     let body: serde_json::Value = client
-        .get(format!("{proxy_url}/__sg/api/secrets"))
+        .get(format!("{proxy_url}/api/secrets"))
         .send()
         .await
         .unwrap()
@@ -4630,7 +4643,7 @@ mod cfg3_proptests {
                 // arb_scenario 保证 static_ids() ≥1 (两桶均 ≥1).
                 for sid in scenario.static_ids() {
                     let resp = client
-                        .post(format!("{proxy_url}/__sg/api/secrets"))
+                        .post(format!("{proxy_url}/api/secrets"))
                         .json(&serde_json::json!({
                             "id": sid,
                             "value": format!("attempt-{sid}"),
@@ -4646,7 +4659,7 @@ mod cfg3_proptests {
                 // fresh_id 前缀 `f` 避开三桶 (`s`/`d`/`b`) 前缀, 保证不冲突.
                 let fresh = format!("f{fresh_id}");
                 let resp = client
-                    .post(format!("{proxy_url}/__sg/api/secrets"))
+                    .post(format!("{proxy_url}/api/secrets"))
                     .json(&serde_json::json!({
                         "id": &fresh,
                         "value": "fresh-new-value",
@@ -4686,7 +4699,7 @@ mod cfg3_proptests {
                 let new_len = new_value.chars().count();
 
                 let resp = client
-                    .put(format!("{proxy_url}/__sg/api/secrets/{target_id}"))
+                    .put(format!("{proxy_url}/api/secrets/{target_id}"))
                     .json(&serde_json::json!({
                         "value": &new_value,
                     }))
@@ -4732,7 +4745,7 @@ mod cfg3_proptests {
                 // arb_scenario 保证 static_only ≥1.
                 let static_id = scenario.static_only.first().unwrap().0.clone();
                 let resp = client
-                    .delete(format!("{proxy_url}/__sg/api/secrets/{static_id}"))
+                    .delete(format!("{proxy_url}/api/secrets/{static_id}"))
                     .send().await.unwrap();
                 prop_assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT,
                     "DELETE on static-only id must return 409");
@@ -4741,7 +4754,7 @@ mod cfg3_proptests {
                 // arb_scenario 保证 dynamic_only ≥1.
                 let dyn_id = scenario.dynamic_only.first().unwrap().0.clone();
                 let resp = client
-                    .delete(format!("{proxy_url}/__sg/api/secrets/{dyn_id}"))
+                    .delete(format!("{proxy_url}/api/secrets/{dyn_id}"))
                     .send().await.unwrap();
                 prop_assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT,
                     "DELETE on dynamic-only id must return 204");
@@ -4754,7 +4767,7 @@ mod cfg3_proptests {
                 let (both_id, _sv, dv) = scenario.both.first().unwrap().clone();
                 let dv_len = dv.chars().count();
                 let resp = client
-                    .delete(format!("{proxy_url}/__sg/api/secrets/{both_id}"))
+                    .delete(format!("{proxy_url}/api/secrets/{both_id}"))
                     .send().await.unwrap();
                 prop_assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT,
                     "DELETE on both id must return 409 (static baseline present, #156)");
@@ -4793,7 +4806,7 @@ mod cfg3_proptests {
 
                 // ── default: dynamic 胜出 ──
                 let resp = client
-                    .patch(format!("{proxy_url}/__sg/api/secrets/{target_id}/decision"))
+                    .patch(format!("{proxy_url}/api/secrets/{target_id}/decision"))
                     .json(&serde_json::json!({"mode": "default"}))
                     .send().await.unwrap();
                 prop_assert_eq!(resp.status(), reqwest::StatusCode::OK, "PATCH default must succeed");
@@ -4807,7 +4820,7 @@ mod cfg3_proptests {
 
                 // ── prefer_static: static 强制 ──
                 let resp = client
-                    .patch(format!("{proxy_url}/__sg/api/secrets/{target_id}/decision"))
+                    .patch(format!("{proxy_url}/api/secrets/{target_id}/decision"))
                     .json(&serde_json::json!({"mode": "prefer_static"}))
                     .send().await.unwrap();
                 prop_assert_eq!(resp.status(), reqwest::StatusCode::OK, "PATCH prefer_static must succeed");
@@ -4819,7 +4832,7 @@ mod cfg3_proptests {
 
                 // ── disabled: 从 effective 消失 ──
                 let resp = client
-                    .patch(format!("{proxy_url}/__sg/api/secrets/{target_id}/decision"))
+                    .patch(format!("{proxy_url}/api/secrets/{target_id}/decision"))
                     .json(&serde_json::json!({"mode": "disabled"}))
                     .send().await.unwrap();
                 prop_assert_eq!(resp.status(), reqwest::StatusCode::OK, "PATCH disabled must succeed");
@@ -4829,7 +4842,7 @@ mod cfg3_proptests {
 
                 // ── 切回 default: 必须能恢复 (回归守卫, 防 "disabled 永久锁死") ──
                 let resp = client
-                    .patch(format!("{proxy_url}/__sg/api/secrets/{target_id}/decision"))
+                    .patch(format!("{proxy_url}/api/secrets/{target_id}/decision"))
                     .json(&serde_json::json!({"mode": "default"}))
                     .send().await.unwrap();
                 prop_assert_eq!(resp.status(), reqwest::StatusCode::OK,
@@ -4844,14 +4857,14 @@ mod cfg3_proptests {
     }
 }
 
-// ─── SEC-6: 内部 URL 不外泄 (/__sg/* 未匹配 → 404, 不转发) ───────────────
+// ─── SEC-6: 内部 URL 不外泄 (/api/* 未匹配 → 404, 不转发) ───────────────
 //
-// 契约 (docs/design/contracts.md §7 SEC-6): `/__sg/*` 未匹配的子路径返回 404,
-// 绝不进入 forward. 这是安全不变量 — 防止 `/__sg/unknown` 这类内部路径被误当成
+// 契约 (docs/design/contracts.md §7 SEC-6): `/api/*` 未匹配的子路径返回 404,
+// 绝不进入 forward. 这是安全不变量 — 防止 `/api/unknown` 这类内部路径被误当成
 // provider 转发到上游 (泄露请求细节 / 触发意外上游调用).
 //
 // 用 proptest 参数化 unknown 子路径的变体 (单段 / 多段 / 带 query string),
-// 确保所有未匹配的 `/__sg/*` 形态都走 404 + 不转发.
+// 确保所有未匹配的 `/api/*` 形态都走 404 + 不转发.
 
 mod sec6_proptests {
     use proptest::prelude::*;
@@ -4869,28 +4882,34 @@ mod sec6_proptests {
     }
 
     proptest! {
-        /// SEC-6: 任意 `/__sg/<unknown>` 子路径 → 404, 且上游收到 0 个请求.
+        /// SEC-6: 任意 `/api/<unknown>` 子路径 → 404, 且上游收到 0 个请求.
         ///
         /// 生成器: 随机化 unknown 段 (1-3 段, 字符集 [a-z0-9]) + 可选 query string,
-        /// 覆盖单段 (`/__sg/foo`) / 多段 (`/__sg/foo/bar`) / 带 query (`/__sg/foo?x=1`)
+        /// 覆盖单段 (`/api/foo`) / 多段 (`/api/foo/bar`) / 带 query (`/api/foo?x=1`)
         /// 三种形态. 关键: 即便上游 mock 配置成接受 ANY method/ANY path, 也不应被命中.
         ///
-        /// **范围限定**: 所有已知 `/__sg` 子路由都在 `/__sg/api/*` 下 (records /
-        /// sessions / sync / secrets / providers / api-keys). 用 prop_assume 跳过
-        /// seg1 == "api" 的 case (这些路径会命中已注册 handler, 不是 404 场景).
-        /// 跳过率 ~0.002% (1/36³), 可忽略.
+        /// **范围限定**: 已注册的 `/api/*` 子路由首段为 records / sessions / sync /
+        /// secrets / providers / api-keys / me. 用 prop_assume 跳过这些 seg1
+        /// (会命中已注册 handler 或其 deeper 404, 不是本 property 的转发守卫场景).
         ///
         /// 异步 + proptest 协作: async 块返回 Result<(), TestCaseError>, prop_assert_eq!
         /// 用 `return Err(...)` 短路; block_on 的结果 expect 把 TestCaseError 转为 panic
         /// (proptest 捕获 panic 视为 case 失败).
         #[test]
         fn prop_internal_url_404_no_forward(
-            seg1 in "[a-z0-9]{1,8}",
+            seg1 in "[a-z0-9-]{1,8}",
             extra_segs in prop::collection::vec("[a-z0-9]{1,6}", 0..3),
             with_query in any::<bool>(),
         ) {
-            // 跳过会命中已注册 /__sg/api/* handler 的路径 (那些不是 404 场景).
-            prop_assume!(seg1 != "api", "seg1='api' would hit a registered /__sg/api/* route");
+            // 跳过会命中已注册 /api/* handler 的路径 (那些不是 404 no-forward 场景;
+            // 已注册路由的 deeper unknown 由各资源组的单元/集成测试守卫).
+            let registered = [
+                "records", "sessions", "sync", "secrets", "providers", "api-keys", "me",
+            ];
+            prop_assume!(
+                !registered.contains(&seg1.as_str()),
+                "seg1 would hit a registered /api/* route"
+            );
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             let result: Result<(), proptest::test_runner::TestCaseError> = rt.block_on(async {
                 let mut upstream = super::spawn_mock_upstream().await;
@@ -4906,8 +4925,8 @@ mod sec6_proptests {
 
                 let proxy_url = super::spawn_proxy(&upstream.url()).await;
 
-                // 构造 unknown 路径: /__sg/<seg1>[/seg2/...][?query]
-                let mut path = format!("/__sg/{seg1}");
+                // 构造 unknown 路径: /api/<seg1>[/seg2/...][?query]
+                let mut path = format!("/api/{seg1}");
                 for s in &extra_segs {
                     path.push('/');
                     path.push_str(s);
@@ -4920,7 +4939,7 @@ mod sec6_proptests {
                 prop_assert_eq!(
                     status,
                     reqwest::StatusCode::NOT_FOUND,
-                    "SEC-6 violation: /__sg/* unknown subpath must return 404, got {} for path {}",
+                    "SEC-6 violation: /api/* unknown subpath must return 404, got {} for path {}",
                     status, path
                 );
 
