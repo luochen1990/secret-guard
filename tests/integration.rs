@@ -2054,25 +2054,15 @@ async fn gzip_compressed_upstream_response_is_decompressed_for_record() {
 
 #[tokio::test]
 async fn upstream_response_header_timeout_marks_record_504() {
-    // 起一个自定义上游 axum server, handler sleep 5s 后才返回响应头.
-    // secret-guard 配置 response_header_timeout = 1s → 应在 1s 后超时.
-    use axum::{Router, routing::post};
-    async fn slow_handler() -> axum::response::Json<serde_json::Value> {
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        axum::response::Json(serde_json::json!({"choices":[]}))
-    }
-    let upstream_app = Router::new().route("/v1/chat/completions", post(slow_handler));
-    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let upstream_addr = upstream_listener.local_addr().unwrap();
-    let upstream_url = format!("http://{upstream_addr}");
-    tokio::spawn(async move {
-        let _ = axum::serve(upstream_listener, upstream_app).await;
-    });
+    // 起一个 5s 后才返回响应头的上游; secret-guard 配置流式档 1s → 1s 后超时.
+    let upstream_url = spawn_slow_upstream(Duration::from_secs(5)).await;
 
     // 构造 AppState, response_header_timeout = 1s (远小于上游的 5s sleep).
+    // 显式流式档触发: body 带 "stream": true → 用 response_header 档.
     let upstream_timeouts = secret_guard::config::UpstreamTimeouts {
         connect: None,
         response_header: Some(std::time::Duration::from_secs(1)),
+        nonstream_response_header: Some(std::time::Duration::from_secs(10)),
         stream_idle: None,
     };
 
@@ -2081,10 +2071,13 @@ async fn upstream_response_header_timeout_marks_record_504() {
         spawn_proxy_with_timeouts(&upstream_url, upstream_timeouts).await;
 
     // 客户端发请求, 应在 ~1s 内收到 504 (而非永久 hang).
+    // body 带 "stream": true → 走流式档 (response_header = 1s). #175 分档后
+    // 无 stream 字段的 body 会走非流式档 (10s), 等到上游 5s 响应 → 200,
+    // 那条路径由 nonstream_slow_upstream_waits_with_nonstream_timeout 单独覆盖.
     let start = std::time::Instant::now();
     let resp = reqwest::Client::new()
         .post(format!("{proxy_url}/o/oa-main/v1/chat/completions"))
-        .body(r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#)
+        .body(r#"{"model":"gpt-4","stream":true,"messages":[{"role":"user","content":"hi"}]}"#)
         .send()
         .await
         .unwrap();
@@ -2121,10 +2114,197 @@ async fn upstream_response_header_timeout_marks_record_504() {
     );
 }
 
+// ─── 响应头超时分档: 流式 TTFT 档 vs 非流式整响应档 (#175) ─────────────────
+//
+// 验证按请求 stream 字段动态选超时档: 非流式慢上游 (响应头晚于流式档超时到达)
+// 应等到响应; 流式请求仍受流式档快超时保护 (回归守卫). 超时值压到 1s/5s 控制
+// 测试时长 (语义与 60s/300s 同构, 无需真等).
+
+/// 起一个 sleep `delay` 后才返回响应头的上游 (response body 为普通 JSON).
+async fn spawn_slow_upstream(delay: Duration) -> String {
+    // delay 由 move closure 捕获.
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(move || async move {
+            tokio::time::sleep(delay).await;
+            axum::response::Json(serde_json::json!({"choices":[]}))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}")
+}
+
+/// 非流式请求 (无 stream 字段): 上游响应头 2s 后到, 流式档 1s / 非流式档 5s —
+/// 旧逻辑 (单一 response_header=1s) 会 504, 新逻辑应等到 200.
+#[tokio::test]
+async fn nonstream_slow_upstream_waits_with_nonstream_timeout() {
+    let upstream_url = spawn_slow_upstream(Duration::from_secs(2)).await;
+    let upstream_timeouts = secret_guard::config::UpstreamTimeouts {
+        connect: None,
+        response_header: Some(Duration::from_secs(1)), // 流式档: 会误杀
+        // 非流式档 5s: 覆盖 2s 上游且留 3s CI 负载余量 (timeout 只是上界,
+        // 测试仍在响应到达的 ~2s 处结束, wall-clock 不变).
+        nonstream_response_header: Some(Duration::from_secs(5)),
+        stream_idle: None,
+    };
+    let (proxy_url, records_handle) =
+        spawn_proxy_with_timeouts(&upstream_url, upstream_timeouts).await;
+
+    // body 无 stream 字段 (OpenAI 默认非流式; #175 事故请求正是 stream:None).
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/o/oa-main/v1/chat/completions"))
+        .body(r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // record 完整标记 200 (而非 504). 窗口 5s 留 CI 负载余量.
+    let list = wait_until_or_timeout(
+        &records_handle,
+        |l| l.first().is_some_and(|r| r.resp_complete),
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(list[0].resp_status, 200);
+}
+
+/// 流式请求 (显式 stream=true): 上游响应头 4s 后到 → 仍被流式档 1s 快超时杀,
+/// 504 record 的 error 消息带上**实际生效**的超时值 (可观测性, 事故排障靠它).
+#[tokio::test]
+async fn stream_request_still_killed_by_stream_timeout_with_observable_message() {
+    // 上游 sleep 4s: 只为保证不早于 1s 流式档返回 (测试仍在 1s 超时处结束,
+    // wall-clock 不变), 4s 留足 CI 负载下的区分余量.
+    let upstream_url = spawn_slow_upstream(Duration::from_secs(4)).await;
+    let upstream_timeouts = secret_guard::config::UpstreamTimeouts {
+        connect: None,
+        response_header: Some(Duration::from_secs(1)), // 流式档: 生效档
+        nonstream_response_header: Some(Duration::from_secs(5)),
+        stream_idle: None,
+    };
+    let (proxy_url, records_handle) =
+        spawn_proxy_with_timeouts(&upstream_url, upstream_timeouts).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/o/oa-main/v1/chat/completions"))
+        .body(r#"{"model":"gpt-4","stream":true,"messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::GATEWAY_TIMEOUT);
+
+    let list = wait_until_or_timeout(
+        &records_handle,
+        |l| l.first().is_some_and(|r| r.resp_status == 504),
+        Duration::from_secs(3),
+    )
+    .await;
+    let r = &list[0];
+    // 504 消息内嵌实际生效的超时值 (1s 而非 5s), 事后排障能直接读出走了哪档.
+    assert!(
+        r.error.as_deref().is_some_and(|e| e.contains("1s")),
+        "504 error should embed the effective (stream-tier) timeout 1s, got: {:?}",
+        r.error
+    );
+}
+
+/// IR 路径 (secrets 非空 → reader → redact → writer) 的非流式分档: 选档信号源
+/// 是 `ir.stream` (而非 passthrough 的 `requests_stream` 字节扫描). #175 的实际
+/// 事故请求若走 redact 路径 (配置了 secret) 正是此链路, 端到端钉住.
+#[tokio::test]
+async fn ir_path_nonstream_slow_upstream_waits_with_nonstream_timeout() {
+    // 慢上游 + 合法 OpenAI 响应 (choices[0] 存在): ① reader 可正常 parse, 响应侧
+    // 走 restore 而非 parse-失败 fallback; ② 不触发 "mock not restored" WARN
+    // (#158) 污染测试日志; ③ 不触发 #162 空 content 启发式 WARN.
+    async fn ok_handler() -> axum::response::Json<serde_json::Value> {
+        axum::response::Json(serde_json::json!({
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]
+        }))
+    }
+    let delay = Duration::from_secs(2);
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(move || async move {
+            tokio::time::sleep(delay).await;
+            ok_handler().await
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let upstream_url = format!("http://{addr}");
+
+    let upstream_timeouts = secret_guard::config::UpstreamTimeouts {
+        connect: None,
+        response_header: Some(Duration::from_secs(1)), // 流式档: 会误杀
+        nonstream_response_header: Some(Duration::from_secs(5)),
+        stream_idle: None,
+    };
+    let secrets = test_secret_table_with(vec![secret("gh-test", "ghp_aaaaaaaaaaaaaaaaaa")]);
+    let (proxy_url, records_handle) =
+        spawn_proxy_with_timeouts_and_secrets(&upstream_url, upstream_timeouts, secrets).await;
+
+    // body 无 stream 字段 + 含 secret (触发 IR redact 路径, ir.stream = false).
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/o/oa-main/v1/chat/completions"))
+        .body(r#"{"model":"gpt-4","messages":[{"role":"user","content":"use ghp_aaaaaaaaaaaaaaaaaa"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let list = wait_until_or_timeout(
+        &records_handle,
+        |l| l.first().is_some_and(|r| r.resp_complete),
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(list[0].resp_status, 200);
+    // 钉住 IR 路径确实被触发: redactions 仅在 IR 路径 (redact_and_derive) 填充,
+    // passthrough 恒为空 — 无此断言则 dispatch 回退到 passthrough 时本测试仍绿
+    // (passthrough 对同 body 同样选非流式档, resp_status 断言无判别力).
+    assert_eq!(list[0].redactions.len(), 1, "IR path must be taken");
+    assert_eq!(list[0].redactions[0].1, "gh-test");
+}
+
+/// 畸形 body (非 JSON) 走非流式档 (保守判定, requests_stream doc 的端到端守卫):
+/// 上游 2s 后返回 → 若误判为流式档会在 1s 处 504, 非流式档 5s 等到 200.
+#[tokio::test]
+async fn malformed_body_falls_back_to_nonstream_timeout() {
+    let upstream_url = spawn_slow_upstream(Duration::from_secs(2)).await;
+    let upstream_timeouts = secret_guard::config::UpstreamTimeouts {
+        connect: None,
+        response_header: Some(Duration::from_secs(1)),
+        nonstream_response_header: Some(Duration::from_secs(5)),
+        stream_idle: None,
+    };
+    let (proxy_url, _records) = spawn_proxy_with_timeouts(&upstream_url, upstream_timeouts).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/o/oa-main/v1/chat/completions"))
+        .body("this is not json")
+        .send()
+        .await
+        .unwrap();
+    // passthrough 路径不 parse body (字节透传), 非 JSON 也转发, 等满 2s 收到 200.
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+}
+
 /// 启动 secret-guard, 显式指定 UpstreamTimeouts (超时回归测试专用).
-async fn spawn_proxy_with_timeouts(
+///
+/// SecretTable 为空 → passthrough 路径; secrets 非空 → same_proto IR 路径
+/// (reader → redact → writer). 两个路径的超时选档信号源不同
+/// (`requests_stream` vs `ir.stream`, 语义等价), 超时分档测试分别覆盖.
+async fn spawn_proxy_with_timeouts_and_secrets(
     upstream_url: &str,
     upstream_timeouts: secret_guard::config::UpstreamTimeouts,
+    secrets: SecretTable,
 ) -> (String, ConversationDag) {
     let provider = openai_provider("oa-main", upstream_url);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2147,7 +2327,7 @@ async fn spawn_proxy_with_timeouts(
         upstream: server::build_upstream_client(upstream_timeouts.connect).unwrap(),
         providers: provider_table,
         dag: dag.clone(),
-        secrets: test_secret_table(),
+        secrets,
         api_keys: test_api_key_store(),
         auth_enabled: false,
         global_mock_prefix: std::sync::Arc::from(""),
@@ -2159,6 +2339,15 @@ async fn spawn_proxy_with_timeouts(
         let _ = axum::serve(listener, app).await;
     });
     (format!("http://{addr}"), dag)
+}
+
+/// 便捷包装: 空 SecretTable (passthrough 路径, 既有超时测试用).
+async fn spawn_proxy_with_timeouts(
+    upstream_url: &str,
+    upstream_timeouts: secret_guard::config::UpstreamTimeouts,
+) -> (String, ConversationDag) {
+    spawn_proxy_with_timeouts_and_secrets(upstream_url, upstream_timeouts, test_secret_table())
+        .await
 }
 
 #[tokio::test]

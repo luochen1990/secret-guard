@@ -334,7 +334,8 @@ Secret / Provider 的两种 value 来源 (`value`/`value_file`、`api_key`/`api_
 | `port` | u16 | `8787` | 监听端口. |
 | `records_capacity` | usize | `1024` | 内存中保留的转发记录条数上限 (FIFO 淘汰). |
 | `upstream_connect_timeout_secs` | u64 | `15` | 上游 TCP+TLS 握手超时 (秒). `0` = 无限 (向后兼容, 不建议). 覆盖 reqwest `connect_timeout`. |
-| `upstream_response_header_timeout_secs` | u64 | `60` | 上游响应头到达超时 (秒). `0` = 无限. 超时记 504 record (防 `send().await` 永久阻塞). |
+| `upstream_response_header_timeout_secs` | u64 | `60` | 上游响应头到达超时 (秒), **流式请求档** (TTFT 语义): 只对显式 `stream: true` 的请求生效. `0` = 无限. 超时记 504 record (防 `send().await` 永久阻塞). |
+| `upstream_nonstream_response_header_timeout_secs` | u64 | `300` | 上游响应头到达超时 (秒), **非流式请求档** (整响应语义): 对其余请求生效 (缺 `stream` 字段也算非流式). 非流式响应头要等整个响应生成完, 60s 对它是错误量纲 (#175 事故: 74k token 上下文被 9 连续 504 误杀). 语义 SSOT = "显式顶层布尔 true 才算流式" (实现: `proxy::helpers::requests_stream` + codec reader, 两处等价). |
 | `upstream_stream_idle_timeout_secs` | u64 | `120` | 流式 chunk 空闲超时 (秒). `0` = 无限. 防上游发完响应头后 body 卡住. |
 
 > 注: `[server]` / `[redact]` / `[auth]` 段仅在启动时读取一次, WebUI 修改不生效 (restart

@@ -185,7 +185,11 @@ pub(crate) async fn cross_proto_forward(
         "cross-proto forwarding"
     );
 
-    // 13. 发送到上游.
+    // 13. 发送到上游. 响应头超时按流式语义选档 (#175): 上面的 501 门已保证
+    //     此处 ir.stream == false (跨协议强制非流式), 故实际恒走非流式档 —
+    //     egress body 由 writer 写出 stream=false, 响应头确实要等整响应生成完,
+    //     量纲与非流式档一致. 写 ir.stream 而非硬编码 false, 未来接入跨协议流式
+    //     翻译时此处自动选对流式档.
     let upstream_resp = match super::recorder::send_upstream_or_fail(
         &state.dag,
         record_id,
@@ -197,7 +201,7 @@ pub(crate) async fn cross_proto_forward(
             .header(axum::http::header::CONTENT_TYPE, "application/json")
             .header(axum::http::header::CONTENT_LENGTH, egress_bytes.len())
             .body(egress_bytes),
-        state.upstream_timeouts.response_header,
+        state.upstream_timeouts.header_timeout(ir.stream),
     )
     .await
     {

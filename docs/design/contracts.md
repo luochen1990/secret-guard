@@ -223,11 +223,14 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 **陈述**: 除 hop-by-hop header 外, HTTP 语义 (method / status / headers / stream 模式) 透传. **客户端响应路径与 record 累积路径是两条独立路径**: 客户端响应永远流式透传无大小上限, record 累积受 `MAX_RESP_BODY_RECORD` (32 MiB) 上限保护.
 
+**响应头超时分档 (#175)**: send().await 的"响应头到达"超时按请求的 stream 语义分两档 — 显式 `stream=true` → TTFT 档 (`upstream_response_header_timeout_secs`, 默认 60s: 响应头在首 token 生成后即返回); 其余 (含缺字段 / 非布尔 / 非 JSON, OpenAI/Anthropic/Responses 均默认非流式) → 整响应档 (`upstream_nonstream_response_header_timeout_secs`, 默认 300s: 非流式响应头要等整个响应生成完, 74k token 上下文晚高峰可超 60s, 旧单一 60s 档会结构性误杀 — #175 hermes cron 504 事故). 语义 SSOT = "显式顶层布尔 true 才算流式", 两处实现须保持等价: `proxy::helpers::requests_stream` (passthrough 路径, 字节扫描) 与 codec reader 的 stream 解析 (IR 路径, `ir.stream`). 已知盲区: Gemini `alt=sse` / Ollama 默认流式经 body 检测不可见, 落非流式档 (保守方向, 可接受).
+
 **Properties**:
 - `prop_status_code_preserved`: 上游响应 status code 透传给客户端 (任意 status, 含错误码). 🔁→`upstream_non_2xx_is_forwarded` (`tests/integration.rs`)
 - `prop_headers_preserved_except_hop_by_hop`: 上游响应 header 透传, 除 RFC 7230 §6.1 定义的 hop-by-hop header 外不丢失. 🔁→`sanitize_strips_hop_by_hop_and_host` + `strips_custom_connection_listed_header`
 - `prop_stream_mode_preserved`: 上游若返回 SSE/chunked, 客户端也以流式收到 (非 buffered). 🔁→`forwards_streaming_sse` (弱形式: 断言 chunk 语义透传, 未断言非 buffered 到达时序)
 - `prop_client_response_not_capped_even_when_record_truncated`: 即使 record 累积超过 MAX_RESP_BODY_RECORD 被截断 (写入 TRUNCATED_BANNER), 客户端响应仍收到完整上游字节. 此契约禁止有人把 MAX_RESP_BODY_RECORD 改成"客户端响应上限" (会静默截断用户响应). 🔁→`fan_out_streaming_truncates_record_but_not_client_response` (`src/proxy/fan_out.rs`)
+- `prop_header_timeout_matches_stream_semantics`: 响应头超时按 stream 语义选档 (显式 `stream=true` → TTFT 档; 缺字段 / 非布尔 / 非 JSON / 嵌套 stream → 整响应档), 且 504 错误消息内嵌实际生效的超时值. ✅ (选档本体同名单测; 畸形形态半句由同文件 `requests_stream_malformed_bodies_fall_back_to_nonstream` + `prop_requests_stream_strict_bool_gate` 守卫; "504 消息内嵌实际超时值" 半句由 🔁→`stream_request_still_killed_by_stream_timeout_with_observable_message` 覆盖)
 
 ### FWD-5 路由分发契约
 
@@ -858,3 +861,4 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 | 2026-08-15 | 全部 | 建立 property 落地状态标注机制 (§0.6): 156 条 property 全量标注 ✅ 同名 53 / 🔁 改名 80 / ⏳ 待补 23, 并新增 `just check-contracts` lint (进 `just check` 阻塞链) 机械守卫 (✅ 须同名测试载体命中 / 🔁 全部锚点须可 grep / 每条必有标注 + 输入侧 fail-closed); ⏳ 项按风险排 P0-P2 补齐优先级 (§0.6) | #144: 走查发现 ~85/156 条 property 名零字面命中且无状态标注, 契约 Properties 列表部分沦为"愿望清单"; 其中改名落地断链占多数, 真零测试 23 条 |
 | 2026-08-16 | UI-7 | 新增 UI-7 sidebar rounds 回填时序 + timeline 并发一致性 (gen): 点击会话头后 "Loading rounds…" 占位符由主动 sync 覆盖 (不依赖 3s tick); `timelineGen` 代数对账消灭跨会话脏 append (矛盾游标守卫 + 迟到 diff 丢弃 + round-id 幂等去重) | 排查 "点击 sidebar 一级菜单后 loading rounds 卡数秒": 后端实测 12ms/0.6ms 非瓶颈, 根因是前端回填依赖轮询 tick; 修复主动 sync 时暴露两类并发交错 (矛盾游标 / 迟到 diff), 一并形式化 |
 | 2026-08-23 | STR-6 | 新增: 流式 reasoning_content 建模与 restore (reader 解码 / writer 写回 / StreamScan 累积 / streaming restore / 三类 block index 互斥); 跨协议处置显式登记为 FWD-3 已知损失 (Anthropic signature / Responses encrypted_content 不可合成) | #176: redact 流式路径思考期零字节, 客户端空闲看门狗超时断连 (生产 499) |
+| 2026-08-23 | FWD-4 | 新增"响应头超时分档"段 + property `prop_header_timeout_matches_stream_semantics`: send().await 响应头超时按请求 stream 语义分两档 (显式 stream=true → TTFT 档 60s; 其余 → 整响应档 300s) | #175: 非流式大上下文请求 (响应头等整响应生成完) 被单一 60s TTFT 量纲超时结构性误杀 (hermes cron 9 连续 504 事故) |

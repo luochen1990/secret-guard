@@ -170,14 +170,28 @@ pub struct ServerConfig {
     /// 正常 < 3s, 异常 (上游不可达 / 网络黑洞) 时这个超时让 secret-guard 快速失败
     /// 而非永久 hang. 0 等价于 reqwest 默认行为 (无 connect 超时, 仅依赖 OS TCP 超时).
     pub upstream_connect_timeout_secs: u64,
-    /// 上游响应头到达超时 (秒). 0 = 无限 (向后兼容, 不建议).
+    /// 上游响应头到达超时 (秒), **流式请求档** (TTFT 语义). 0 = 无限 (向后兼容, 不建议).
     ///
     /// 覆盖 secret-guard → 上游的 `reqwest::send().await` 等待. reqwest 的 send 完成语义
     /// 是"收到响应头", response body 由后续 `bytes_stream()` 读. 这个超时只约束
     /// "响应头到达", 不影响流式 body 的总时长 (流式可能持续几分钟, 是正常的).
     ///
     /// 历史 bug: 上游网络异常时 send().await 永久阻塞 → record 永远 pending.
+    ///
+    /// #175 后本字段只约束显式 `stream=true` 的请求 (响应头在首 token 生成后即返回,
+    /// TTFT 量纲); 非流式请求 (响应头要等整个响应生成完) 用
+    /// [`ServerConfig::upstream_nonstream_response_header_timeout_secs`] (整响应量纲).
     pub upstream_response_header_timeout_secs: u64,
+    /// 上游响应头到达超时 (秒), **非流式请求档** (整响应语义). 0 = 无限 (向后兼容).
+    ///
+    /// 非流式请求的响应头要等**整个响应生成完**才返回 (LLM 生成 N token 的总时长),
+    /// 与流式请求的 TTFT 是不同量纲 — 大上下文 (几十 k token prefill) 晚高峰下
+    /// 整响应耗时轻松超过 60s, 用 TTFT 量纲的超时约束它会结构性误杀合法请求
+    /// (#175: hermes cron 9 连续 504 事故). 默认 300s 覆盖 74k token 上下文的
+    /// 整响应生成; 判定语义 ("显式顶层布尔 true 才算流式") 的实现有两处且须保持
+    /// 等价: `proxy::helpers::requests_stream` (passthrough) 与 codec reader
+    /// (IR 路径用 `ir.stream`).
+    pub upstream_nonstream_response_header_timeout_secs: u64,
     /// 上游流式响应 chunk 空闲超时 (秒). 0 = 无限 (向后兼容).
     ///
     /// 流式响应两个 chunk 之间的最大间隔. LLM 正常流式 chunk 间隔 < 1s;
@@ -193,8 +207,28 @@ pub struct ServerConfig {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UpstreamTimeouts {
     pub connect: Option<Duration>,
+    /// 流式请求 (显式 `stream=true`) 的响应头超时 — TTFT 语义 (默认 60s).
     pub response_header: Option<Duration>,
+    /// 非流式请求的响应头超时 — 整响应语义 (默认 300s, #175).
+    ///
+    /// 量纲论证见 `ServerConfig::upstream_nonstream_response_header_timeout_secs`.
+    pub nonstream_response_header: Option<Duration>,
     pub stream_idle: Option<Duration>,
+}
+
+impl UpstreamTimeouts {
+    /// 按请求的流式语义选响应头超时 (FWD-4 property: prop_header_timeout_matches_stream_semantics).
+    ///
+    /// `stream = true` → TTFT 档; `false` (含缺字段 / 非 JSON body 等按非流式处理的
+    /// 情形) → 整响应档. 判定规则 (为什么缺字段算非流式) 见
+    /// `proxy::helpers::requests_stream`.
+    pub fn header_timeout(&self, stream: bool) -> Option<Duration> {
+        if stream {
+            self.response_header
+        } else {
+            self.nonstream_response_header
+        }
+    }
 }
 
 impl From<&ServerConfig> for UpstreamTimeouts {
@@ -205,6 +239,7 @@ impl From<&ServerConfig> for UpstreamTimeouts {
         Self {
             connect: secs(cfg.upstream_connect_timeout_secs),
             response_header: secs(cfg.upstream_response_header_timeout_secs),
+            nonstream_response_header: secs(cfg.upstream_nonstream_response_header_timeout_secs),
             stream_idle: secs(cfg.upstream_stream_idle_timeout_secs),
         }
     }
@@ -218,9 +253,14 @@ impl Default for ServerConfig {
             records_capacity: 1024,
             // 15s: DNS+TCP+TLS 握手正常 < 3s, 15s 是宽松兜底.
             upstream_connect_timeout_secs: 15,
-            // 60s: 无论流式/非流式, LLM provider 应在 60s 内开始返回响应头.
-            // reasoning model 的"长思考"发生在 body 流, 不影响响应头到达.
+            // 60s: 流式请求 (TTFT) — 响应头在首 token 生成后即返回, 60s 覆盖
+            // 大上下文 prefill + 首 token. reasoning model 的"长思考"发生在 body 流,
+            // 不影响响应头到达.
             upstream_response_header_timeout_secs: 60,
+            // 300s: 非流式请求 (整响应) — 响应头要等整个响应生成完才返回,
+            // 大上下文 (74k token) 晚高峰整响应可超 60s, 300s 是 TTFT 量纲 60s 的
+            // 整响应量纲对应值 (#175).
+            upstream_nonstream_response_header_timeout_secs: 300,
             // 120s: 流式 chunk 空闲. 正常 < 1s, reasoning 静默可能较长, 120s 宽松.
             upstream_stream_idle_timeout_secs: 120,
         }
@@ -272,6 +312,7 @@ const KNOWN_FIELDS: &[(&str, &[&str])] = &[
             "records_capacity",
             "upstream_connect_timeout_secs",
             "upstream_response_header_timeout_secs",
+            "upstream_nonstream_response_header_timeout_secs",
             "upstream_stream_idle_timeout_secs",
         ],
     ),
@@ -3319,5 +3360,59 @@ mod proptests {
             "SEC-6 violation: default host must be 127.0.0.1 (loopback only), got '{}'",
             cfg.host
         );
+    }
+
+    // ─── FWD-4: 响应头超时分档 (流式 TTFT vs 非流式整响应, #175) ────────
+    //
+    // 契约 (docs/design/contracts.md FWD-4): 响应头超时按请求 stream 语义分档.
+    // 固定值断言 (配置 schema 是确定性的, 故 #[test] 而非 proptest!).
+
+    /// 默认值锁定: 流式档 60s (TTFT 量纲) / 非流式档 300s (整响应量纲).
+    /// 非流式默认从 60s 放宽到 300s 的 rationale 见 issue #175 (74k token 上下文
+    /// 晚高峰整响应 > 60s, 旧单一 60s 档结构性误杀非流式大请求).
+    #[test]
+    fn prop_nonstream_header_timeout_default_tiers() {
+        let t = UpstreamTimeouts::from(&ServerConfig::default());
+        assert_eq!(t.response_header, Some(Duration::from_secs(60)));
+        assert_eq!(t.nonstream_response_header, Some(Duration::from_secs(300)));
+    }
+
+    /// 分档选择: header_timeout(stream) 按 stream 语义选档 (FWD-4 核心 property).
+    #[test]
+    fn prop_header_timeout_matches_stream_semantics() {
+        let t = UpstreamTimeouts {
+            connect: None,
+            response_header: Some(Duration::from_secs(60)),
+            nonstream_response_header: Some(Duration::from_secs(300)),
+            stream_idle: None,
+        };
+        assert_eq!(t.header_timeout(true), Some(Duration::from_secs(60)));
+        assert_eq!(t.header_timeout(false), Some(Duration::from_secs(300)));
+    }
+
+    /// 0 = 无限: 两档的 0 值都解析为 None (与既有 `*_secs` 字段语义一致).
+    /// 注: ServerConfig 反序列化时字段在顶层 (无 `[server]` 头 — 那是 Config 的层级).
+    #[test]
+    fn prop_nonstream_header_timeout_zero_means_unlimited() {
+        let cfg: ServerConfig = toml::from_str(
+            r#"
+upstream_response_header_timeout_secs = 0
+upstream_nonstream_response_header_timeout_secs = 0
+"#,
+        )
+        .unwrap();
+        let t = UpstreamTimeouts::from(&cfg);
+        assert_eq!(t.response_header, None);
+        assert_eq!(t.nonstream_response_header, None);
+    }
+
+    /// TOML 覆盖: 显式配置非流式档 (向后兼容旧配置缺字段 → serde default).
+    #[test]
+    fn prop_nonstream_header_timeout_toml_override() {
+        let cfg: ServerConfig =
+            toml::from_str("upstream_nonstream_response_header_timeout_secs = 120").unwrap();
+        let t = UpstreamTimeouts::from(&cfg);
+        assert_eq!(t.response_header, Some(Duration::from_secs(60))); // 未配 → 默认
+        assert_eq!(t.nonstream_response_header, Some(Duration::from_secs(120))); // 显式覆盖
     }
 }

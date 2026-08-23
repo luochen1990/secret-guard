@@ -84,6 +84,76 @@ pub(super) fn is_streaming(content_type: &str) -> bool {
     ct.eq_ignore_ascii_case("text/event-stream") || ct.eq_ignore_ascii_case("application/x-ndjson")
 }
 
+/// 检测请求 body 是否为显式流式请求 (顶层 `"stream": true`, FWD-4 契约).
+///
+/// # 语义 (保守判定, #175)
+///
+/// 只把**显式 `stream: true`** 认作流式; 其余一律按非流式处理:
+/// - 缺 `stream` 字段: OpenAI / Anthropic / Responses 均默认非流式 — 按非流式.
+/// - `stream: false` / 非布尔 (字符串 "true" 等不合规写法): 按非流式.
+/// - 非 JSON body / 顶层非对象 (GET 类空 body 等): 按非流式.
+/// - `stream` 不是第一个字段: 字段顺序无关, 顶层任意位置的 `stream` 都识别.
+///
+/// # 已知盲区 (假设声明, ROB-*)
+///
+/// 本函数只看 body, 对 Gemini (`alt=sse` query param 触发流式, body 无 stream
+/// 字段) 和 Ollama (`/api/chat` 缺字段默认流式) 的真实流式请求会误判为非流式 →
+/// 落非流式档. 方向保守 (见下节 rationale, 只是 hang 检测变慢, 不误杀), 可接受;
+/// 这两条 passthrough 协议无 codec IR, 没有更精确的信号源.
+///
+/// # 为什么保守方向是"缺省算非流式"
+///
+/// 超时选错档的两种代价不对称: 非流式大上下文请求 (响应头要等整个响应生成完,
+/// 74k token 可轻松超 60s) 被流式短超时误杀 = **合法请求结构性失败** (#175 事故);
+/// 反方向 (流式请求吃到非流式长超时) 只是 hang 的流式请求晚一点超时 (且仍有
+/// `stream_idle` 超时兜底). 故缺字段 / 解析失败一律落到非流式长超时档.
+///
+/// # 与 codec reader 的等价性 (语义 SSOT)
+///
+/// "显式顶层布尔 true 才算流式" 这一语义有两处实现: 本函数 (passthrough 路径,
+/// 字节级扫描) 与 codec reader 的 `stream` 解析 (IR 路径, `obj.get("stream")
+/// .and_then(as_bool).unwrap_or(false)`). 两者必须保持语义等价 — 本函数的单测
+/// 与 reader 行为对齐 (非布尔 / 缺字段均非流式).
+///
+/// # 实现 (流式解析 + ROB-1 永不 panic)
+///
+/// 用 `serde_json::Deserializer::from_slice(...).deserialize_map` 流式逐 key 扫描:
+/// value 全部用 `IgnoredAny` 流式跳过 (不构建 Value 树 — 大上下文 body 可达
+/// 16 MiB, 全量 `Value` 解析在 passthrough 热路径上是纯浪费; reader 路径已有
+/// codec 全量解析, 调用方直接用 `ir.stream`, 不经过本函数). **找到 `stream` 后
+/// 不提前 return**, 继续把剩余 key 消费完 — serde_json 要求 MapAccess 驱动到
+/// 输入耗尽, 提前 return 会被判为 "trailing comma" 错误 (实测, 见本函数 tests).
+/// 任何解析异常 → `false` (best-effort 降级, 见 ROB-* 契约).
+pub(super) fn requests_stream(body: &[u8]) -> bool {
+    use serde::de::IgnoredAny;
+    // MapAccess visitor: 顶层逐 key 扫描, `stream` key 取布尔值, 其余跳过.
+    // 顶层非 object 时 serde 直接走 error 路径 (→ false).
+    struct TopKeysVisitor;
+    impl<'de> serde::de::Visitor<'de> for TopKeysVisitor {
+        type Value = bool;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a JSON object")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut stream = false;
+            while let Some(key) = map.next_key::<std::borrow::Cow<'_, str>>()? {
+                if key == "stream" {
+                    stream = map.next_value::<bool>()?; // 非布尔 → error → 整体 false
+                } else {
+                    let _ = map.next_value::<IgnoredAny>()?; // 跳过 (流式, 不入树)
+                }
+            }
+            Ok(stream)
+        }
+    }
+    use serde::Deserializer as _;
+    let mut de = serde_json::Deserializer::from_slice(body);
+    de.deserialize_map(TopKeysVisitor).unwrap_or(false)
+}
+
 /// 把字节投影为 String (非法 UTF-8 用 U+FFFD 替换, 不失败).
 pub(super) fn utf8_view(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
@@ -221,6 +291,82 @@ mod tests {
         assert!(!is_streaming("application/json"));
         assert!(!is_streaming("application/octet-stream"));
         assert!(!is_streaming("video/xyz-stream"));
+    }
+
+    // ─── FWD-4: requests_stream 显式 stream 检测 (#175) ────────────────────
+    //
+    // 契约 (docs/design/contracts.md FWD-4): 只有显式顶层 "stream": true 才按流式
+    // 选响应头超时; 其余 (含缺字段 / 非布尔 / 非 JSON / 顶层非对象) 一律非流式.
+    // 保守方向 rationale 见 requests_stream doc.
+
+    #[test]
+    fn requests_stream_only_explicit_true_is_streaming() {
+        // 显式 true (字段位置无关).
+        assert!(requests_stream(br#"{"stream":true}"#));
+        assert!(requests_stream(
+            br#"{"model":"gpt-4","stream":true,"messages":[]}"#
+        ));
+        // 显式 false / 缺字段 (OpenAI/Anthropic/Responses 默认非流式).
+        assert!(!requests_stream(br#"{"stream":false}"#));
+        assert!(!requests_stream(br#"{"model":"gpt-4","messages":[]}"#));
+        assert!(!requests_stream(br#"{}"#));
+        // 嵌套的 stream 不算 (只看顶层).
+        assert!(!requests_stream(br#"{"metadata":{"stream":true}}"#));
+    }
+
+    #[test]
+    fn requests_stream_malformed_bodies_fall_back_to_nonstream() {
+        // ROB-1: 任何解析异常 → false (非流式 = 长超时, 保守方向见 doc).
+        assert!(!requests_stream(b"")); // 空 body (GET / 非聊天端点)
+        assert!(!requests_stream(b"not json at all"));
+        assert!(!requests_stream(b"[1,2,3]")); // 顶层非对象
+        assert!(!requests_stream(br#"{"stream":"true"}"#)); // 非布尔
+        assert!(!requests_stream(br#"{"stream":"#)); // 截断 JSON
+    }
+
+    /// FWD-4 property: 任意 JSON 值塞进顶层 `stream` 字段, `requests_stream` 只有
+    /// 在该值**是布尔 true** 时返回 true — 所有其他形态 (含畸形) 一律非流式.
+    ///
+    /// 生成器覆盖: null / bool / 数字 / 字符串 / 数组 / 对象 / 截断字符串, 加上
+    /// stream 字段出现在对象头部/尾部两种位置 (字段顺序无关性).
+    #[test]
+    fn prop_requests_stream_strict_bool_gate() {
+        proptest!(|(stream_value in arb_stream_value_forms(), stream_first in proptest::bool::ANY)| {
+            let body = if stream_first {
+                format!(r#"{{"stream":{stream_value},"model":"m"}}"#)
+            } else {
+                format!(r#"{{"model":"m","stream":{stream_value}}}"#)
+            };
+            let expected = stream_value == "true";
+            prop_assert_eq!(
+                requests_stream(body.as_bytes()),
+                expected,
+                "body: {}",
+                body
+            );
+        });
+    }
+
+    /// 生成 `stream` 字段值的各种形态: 合法 JSON 值 (标量/数组/对象) + "语义上是
+    /// true 的非布尔写法" (字符串 "true" / 1) + 截断输入. 覆盖 requests_stream
+    /// 的全部降级路径.
+    fn arb_stream_value_forms() -> impl proptest::strategy::Strategy<Value = String> {
+        proptest::sample::select(vec![
+            "true",
+            "false",
+            "null",
+            "0",
+            "1",
+            "-1",
+            "3.14",
+            "\"true\"",
+            "\"false\"",
+            "[true]",
+            "{\"deep\":true}",
+            "{\"stream\": 12.4", // 截断 JSON (流式解析中途断掉, 尾值残缺)
+            "{\"stream\": \"st", // 截断字符串值
+        ])
+        .prop_map(str::to_string)
     }
 
     #[test]

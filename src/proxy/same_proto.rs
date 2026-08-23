@@ -24,7 +24,9 @@ use crate::error::AppError;
 use crate::provider::{Protocol, Provider};
 
 use super::auth::apply_provider_auth;
-use super::helpers::{build_upstream_url, is_streaming, sanitize_request_headers, utf8_view};
+use super::helpers::{
+    build_upstream_url, is_streaming, requests_stream, sanitize_request_headers, utf8_view,
+};
 use super::recorder::{build_call_event, parse_request_ir, redact_and_derive};
 
 /// 同协议转发: 字节透传 (无 redact) 或 IR 路径 (启用 redact).
@@ -157,7 +159,9 @@ pub(crate) async fn same_proto_forward(
 
     debug!(%record_id, method = %parts.method, url = %upstream_url, "forwarding redacted same-proto request");
 
-    // 9. 发送到上游.
+    // 9. 发送到上游. 响应头超时按**出站 body 的流式语义**选档 (#175): IR 的
+    //    stream 字段是 writer 产出的 egress body 真实语义 (该 body 发往上游),
+    //    比原始 req_bytes 检测更贴近被超时保护的实体.
     let upstream_resp = match super::recorder::send_upstream_or_fail(
         &state.dag,
         record_id,
@@ -169,7 +173,7 @@ pub(crate) async fn same_proto_forward(
             .header(axum::http::header::CONTENT_TYPE, "application/json")
             .header(axum::http::header::CONTENT_LENGTH, req_bytes_to_send.len())
             .body(req_bytes_to_send),
-        state.upstream_timeouts.response_header,
+        state.upstream_timeouts.header_timeout(ir.stream),
     )
     .await
     {
@@ -282,6 +286,10 @@ async fn same_proto_passthrough(
 
     debug!(%record_id, method = %parts.method, url = %upstream_url, "forwarding (passthrough)");
 
+    // 响应头超时按请求 body 的流式语义选档 (#175): passthrough 无 codec 解析,
+    // 用 requests_stream 对原始字节做顶层 "stream" 检测 (保守判定: 只有显式
+    // stream=true 才用流式短超时, rationale 见该函数 doc).
+    let stream_requested = requests_stream(&req_bytes);
     let upstream_resp = match super::recorder::send_upstream_or_fail(
         &state.dag,
         record_id,
@@ -291,7 +299,7 @@ async fn same_proto_passthrough(
             .request(parts.method, &upstream_url)
             .headers(fwd_headers)
             .body(req_bytes),
-        state.upstream_timeouts.response_header,
+        state.upstream_timeouts.header_timeout(stream_requested),
     )
     .await
     {

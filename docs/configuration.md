@@ -42,7 +42,8 @@ value = "ghp_0123456789abcdefghijklmnopqrstuvwxyz"
 | `port` | u16 | `8787` | 监听端口. 也可用 `--port` / 环境变量 `SG_PORT` 覆盖. |
 | `records_capacity` | usize | `1024` | 内存中保留的转发记录条数上限 (超出按 FIFO 淘汰). |
 | `upstream_connect_timeout_secs` | u64 | `15` | 连上游的 TCP+TLS 握手超时 (秒). `0` = 不限时. |
-| `upstream_response_header_timeout_secs` | u64 | `60` | 等上游响应头到达的超时 (秒), 超时返回 504. `0` = 不限时. |
+| `upstream_response_header_timeout_secs` | u64 | `60` | 等上游响应头到达的超时 (秒), **流式请求档**: 只对显式 `stream: true` 的请求生效 (流式响应头在首 token 生成后即返回, 60s 覆盖大上下文 prefill). 超时返回 504. `0` = 不限时. |
+| `upstream_nonstream_response_header_timeout_secs` | u64 | `300` | 等上游响应头到达的超时 (秒), **非流式请求档**: 对其余所有请求生效 (缺 `stream` 字段也算非流式). 非流式响应头要等**整个响应生成完**才返回, 大上下文 (几十 k token) 下总时长轻松超 60s, 默认放宽到 300s. 超时返回 504. `0` = 不限时. |
 | `upstream_stream_idle_timeout_secs` | u64 | `120` | 流式响应两个 chunk 之间的最大空闲 (秒). `0` = 不限时. |
 
 ## `[redact]` — 脱敏行为 (改动需重启)
