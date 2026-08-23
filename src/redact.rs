@@ -768,6 +768,7 @@ impl StringLeafOps for IrBlock {
                     f(s);
                 }
             }
+            IrBlock::ReasoningContent { text } => f(text),
         }
     }
 
@@ -799,6 +800,7 @@ impl StringLeafOps for IrBlock {
                     f(s);
                 }
             }
+            IrBlock::ReasoningContent { text } => f(text),
         }
     }
 }
@@ -975,6 +977,7 @@ fn collect_block_leaves<'a>(block: &'a IrBlock, leaves: &mut Vec<&'a str>) {
                 leaves.push(s);
             }
         }
+        IrBlock::ReasoningContent { text } => leaves.push(text),
     }
 }
 
@@ -1279,6 +1282,9 @@ mod tests {
                     },
                     IrBlock::Reasoning {
                         summary: vec!["reasoning-summary".to_string()],
+                    },
+                    IrBlock::ReasoningContent {
+                        text: "reasoning-content".to_string(),
                     },
                 ],
                 ..Default::default()

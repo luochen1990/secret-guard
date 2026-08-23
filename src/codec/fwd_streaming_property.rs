@@ -143,6 +143,75 @@ proptest! {
 
         assert_streaming_restore_fidelity(&upstream_sse, &client_sse, &real, &mock)?;
     }
+
+    /// STR-6 `prop_streaming_reasoning_restored_like_text` (#176):
+    /// 思考阶段 reasoning_content delta 中的 mock 必须被 restore (与 text 同算法),
+    /// 客户端拼接 == 上游拼接.replace(mock, real); 任意 chunk 切分下成立.
+    ///
+    /// 这是 #176 的核心回归守卫: 修复前 reader 不解码 reasoning_content → redact
+    /// 流式路径 (IR 重建) 思考期零字节, 客户端空闲看门狗超时断连 (生产 499).
+    /// 生成器 has_reasoning 强制为 true (直接构造, 排除随机 false 分支).
+    #[test]
+    fn prop_streaming_reasoning_restored_like_text(
+        mock_body in "[a-z]{4,12}",
+        splits in proptest::collection::vec(0usize..4096, 1..=16)
+    ) {
+        let mock = format!("MOCK{mock_body}");
+        let real = format!("sk-real-{mock_body}");
+        // 构造思考流: role chunk (附带首个 reasoning delta 含 mock) → 第二个 reasoning
+        // delta (mock 跨 chunk 候选) → finish → [DONE].
+        let frames = [
+            json!({
+                "id":"chatcmpl-r","object":"chat.completion.chunk","created":1700000000,
+                "model":"glm-5.3",
+                "choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":format!("secret is {mock}")},"finish_reason":Value::Null}]
+            }),
+            json!({
+                "id":"chatcmpl-r","object":"chat.completion.chunk","created":1700000000,
+                "model":"glm-5.3",
+                "choices":[{"index":0,"delta":{"reasoning_content":format!(" and more {mock} tail")},"finish_reason":Value::Null}]
+            }),
+            json!({
+                "id":"chatcmpl-r","object":"chat.completion.chunk","created":1700000000,
+                "model":"glm-5.3",
+                "choices":[{"index":0,"delta":{},"finish_reason":"stop"}]
+            }),
+        ];
+        let mut upstream_sse: Vec<u8> = frames
+            .iter()
+            .map(openai_chunk_frame)
+            .collect::<String>()
+            .into_bytes();
+        upstream_sse.extend_from_slice(b"data: [DONE]\n\n");
+
+        let map = build_redaction_map(&real, &mock);
+        let client_sse = run_same_proto_restore(Protocol::OpenAI, map, &upstream_sse, &splits);
+
+        // 思考期零字节回归: 客户端必须实际收到 reasoning 字节 (修复前为空).
+        // 放在 fidelity 断言前: 空串也是 fidelity 等式的一种 "平凡解", 先排除.
+        prop_assert!(
+            !collect_reasoning_deltas(&client_sse).is_empty(),
+            "STR-6: 客户端思考期零字节 (#176 回归)",
+        );
+        // reasoning fidelity: 客户端拼接 == 上游拼接.replace(mock, real).
+        let client_reasoning = collect_reasoning_deltas(&client_sse);
+        let upstream_reasoning = collect_reasoning_deltas(&upstream_sse);
+        prop_assert_eq!(
+            client_reasoning,
+            upstream_reasoning.replace(&mock, &real),
+            "STR-6 reasoning restore 违反 (mock={:?}, real={:?})",
+            mock,
+            real,
+        );
+        // no mock leak.
+        let client_str = String::from_utf8_lossy(&client_sse);
+        prop_assert!(
+            !client_str.contains(&mock),
+            "STR-6: 客户端 SSE 泄漏 mock={:?}\nclient={:?}",
+            mock,
+            client_str,
+        );
+    }
 }
 
 // ─── 辅助: 跑 StreamTranslate same-proto restore 路径 ──────────────────────
@@ -202,7 +271,9 @@ fn build_redaction_map(real: &str, mock: &str) -> RedactionMap {
 /// 1. **no mock leak** (安全核心): 客户端字节中不含 mock 字符串.
 /// 2. **content fidelity**: 客户端 TextDelta 拼接 == 上游 TextDelta 拼接.replace(mock, real).
 /// 3. **tool input fidelity**: 客户端 InputJsonDelta 拼接 == 上游拼接.replace(mock, real).
-/// 4. **usage output fidelity**: 客户端 usage.output_tokens == 上游 (允许 input_tokens
+/// 4. **reasoning fidelity** (#176): 客户端 reasoning_content delta 拼接 == 上游拼接
+///    .replace(mock, real) (思考原文是 secret 可能泄漏的位置, 必须与 text 同样 restore).
+/// 5. **usage output fidelity**: 客户端 usage.output_tokens == 上游 (允许 input_tokens
 ///    backfill, 故只比较 output_tokens).
 ///
 /// 注: chunk 结构重组 (StreamingRestorer sliding window 拆/并 chunk) 不影响语义,
@@ -215,8 +286,10 @@ fn assert_streaming_restore_fidelity(
 ) -> Result<(), proptest::test_runner::TestCaseError> {
     let upstream_text = collect_text_deltas(upstream);
     let upstream_json = collect_input_json_deltas(upstream);
+    let upstream_reasoning = collect_reasoning_deltas(upstream);
     let client_text = collect_text_deltas(client);
     let client_json = collect_input_json_deltas(client);
+    let client_reasoning = collect_reasoning_deltas(client);
     let upstream_usage = collect_usage_output_tokens(upstream);
     let client_usage = collect_usage_output_tokens(client);
 
@@ -249,7 +322,17 @@ fn assert_streaming_restore_fidelity(
         real,
     );
 
-    // 4. usage output_tokens fidelity.
+    // 4. reasoning fidelity (#176): 客户端 reasoning == 上游 reasoning.replace(mock, real).
+    let expected_reasoning = upstream_reasoning.replace(mock, real);
+    prop_assert_eq!(
+        client_reasoning,
+        expected_reasoning,
+        "FWD-1 流式 reasoning fidelity 违反 (STR-6)\nmock={:?}, real={:?}",
+        mock,
+        real,
+    );
+
+    // 5. usage output_tokens fidelity.
     prop_assert_eq!(
         client_usage,
         upstream_usage,
@@ -328,6 +411,29 @@ fn collect_input_json_deltas(sse_bytes: &[u8]) -> String {
     acc
 }
 
+/// 收集所有 reasoning_content delta 并拼接 (#176, OpenAI 思考型模型).
+///
+/// - OpenAI: `choices[].delta.reasoning_content` (string).
+/// - Anthropic: thinking_delta (本 property 不覆盖 — Anthropic egress 无 reasoning_content,
+///   same_proto_restore 的 Anthropic 路径上游不产 reasoning, 恒为空串, 断言自然成立).
+fn collect_reasoning_deltas(sse_bytes: &[u8]) -> String {
+    let mut acc = String::new();
+    for data in iter_sse_data_payloads(sse_bytes) {
+        if let Some(choices) = data.get("choices").and_then(Value::as_array) {
+            for ch in choices {
+                if let Some(rc) = ch
+                    .get("delta")
+                    .and_then(|d| d.get("reasoning_content"))
+                    .and_then(Value::as_str)
+                {
+                    acc.push_str(rc);
+                }
+            }
+        }
+    }
+    acc
+}
+
 /// 收集 usage.output_tokens (terminal usage chunk).
 ///
 /// - OpenAI: `usage.completion_tokens` (顶层 usage).
@@ -385,6 +491,7 @@ fn iter_sse_data_payloads(sse_bytes: &[u8]) -> impl Iterator<Item = Value> {
 /// input JSON 片段里都含 mock (跨字段重复, 守卫 FWD-1 L135).
 ///
 /// 流形态覆盖:
+/// - reasoning delta (含 mock, 思考阶段; #176 STR-6)
 /// - text delta (含 mock, 单 / 跨 chunk 候选)
 /// - tool_use 开始 + input JSON 片段 (含 mock)
 /// - finish_reason chunk
@@ -398,14 +505,25 @@ fn arb_openai_sse_stream_with_mock() -> impl Strategy<Value = (Vec<u8>, String, 
         "[a-z]{3,8}",        // tool_call id 主体
         any::<bool>(),       // 是否有 include_usage chunk
         any::<bool>(),       // 是否有 text content
+        any::<bool>(),       // 是否有 reasoning 阶段 (#176)
     )
-        .prop_map(|(mock_body, text_prefix, tool_name, tc_id_body, has_usage, has_text)| {
+        .prop_map(|(mock_body, text_prefix, tool_name, tc_id_body, has_usage, has_text, has_reasoning)| {
             // mock 与 real 都不含 SSE / JSON 特殊字符, 避免 JSON 转义干扰.
             let mock = format!("MOCK{mock_body}");
             let real = format!("sk-real-{mock_body}");
             let tc_id = format!("call_{tc_id_body}");
 
             let mut frames: Vec<String> = Vec::new();
+
+            // 帧 0 (可选, #176): 思考阶段首 chunk (MessageStart + BlockStart{ReasoningContent} + ReasoningDelta 含 mock).
+            // 覆盖 "mock 跨 reasoning/text 两类 block 重复" 的 restore 场景 (STR-6).
+            if has_reasoning {
+                frames.push(openai_chunk_frame(&json!({
+                    "id":"chatcmpl-x","object":"chat.completion.chunk","created":1700000000,
+                    "model":"gpt-4o",
+                    "choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":format!("thinking about {mock}...")},"finish_reason":Value::Null}]
+                })));
+            }
 
             // 帧 1: 第一个 chunk (fan-out: MessageStart + BlockStart + BlockDelta).
             let first_content = if has_text {

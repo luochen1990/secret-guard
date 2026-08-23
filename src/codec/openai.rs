@@ -15,7 +15,7 @@
 
 use serde_json::{Map, Value, json};
 
-use super::ir::{ContentForm, StopForm};
+use super::ir::{ContentForm, ReasoningContentForm, StopForm};
 use super::{
     IrBlock, IrBlockMeta, IrDelta, IrError, IrImageSource, IrMessage, IrRequest, IrResponse,
     IrRole, IrStopReason, IrStreamEvent, IrTool, IrToolChoice, IrUsage, Reader, Writer,
@@ -73,10 +73,29 @@ impl Reader for OpenAiReader {
             };
 
             // 先把 content 解析成 blocks (content 可能是 string 或 array).
-            let content_blocks = read_openai_content(msg.get("content"));
+            let mut blocks = read_openai_content(msg.get("content"));
+
+            // 思考型模型的 assistant 历史可能带 reasoning_content (客户端回传,
+            // 如 Chatbox / opencode 会把上一轮思考原文发回). FWD-1: 同协议
+            // redact 路径对 wire 的唯一合法修改是 real↔mock, 此字段必须建模,
+            // 否则历史 reasoning 静默丢失. 空串跳过 (无信息量; wire 形态由
+            // reasoning_content_form 保留, writer 据此写回).
+            // 假设: reasoning_content 是 string; 非 string 形态静默 drop (ROB-1).
+            // blocks 首位 (思考先于正文, 与 read_response / 流式累积顺序一致).
+            let rc_field = msg.get("reasoning_content");
+            if role == IrRole::Assistant
+                && let Some(rc) = rc_field.and_then(Value::as_str)
+                && !rc.is_empty()
+            {
+                blocks.insert(
+                    0,
+                    IrBlock::ReasoningContent {
+                        text: rc.to_string(),
+                    },
+                );
+            }
 
             // assistant 消息可能有 tool_calls (顶层字段, 不在 content 里).
-            let mut blocks = content_blocks;
             if let Some(tool_calls) = msg.get("tool_calls").and_then(Value::as_array) {
                 for tc in tool_calls {
                     if let Some(block) = read_tool_call(tc) {
@@ -110,12 +129,20 @@ impl Reader for OpenAiReader {
 
             // L1 保真: 记录 content 原始形态 (string / array / null).
             let content_form = ContentForm::classify(msg.get("content"));
+            // L1 保真 (#176): 记录 reasoning_content 的 "显式存在但无信息量" 形态
+            // (空串 / null) — 区分与字段缺席, writer 据此写回 (FWD-1).
+            let reasoning_content_form = if role == IrRole::Assistant {
+                ReasoningContentForm::classify(rc_field)
+            } else {
+                None
+            };
             let message = IrMessage {
                 // role==User 且 content 含非空 Text block (排除纯 tool_result user / assistant tool_call).
                 contains_user_text: role == IrRole::User && super::ir::blocks_has_text(&blocks),
                 role,
                 content: blocks,
                 content_form,
+                reasoning_content_form,
             };
             if role == IrRole::System {
                 // 提升到 system.
@@ -208,6 +235,14 @@ impl Reader for OpenAiReader {
         let message = choice0.get("message");
         let mut blocks = Vec::new();
         if let Some(message) = message {
+            // 思考原文 (reasoning model 非流式响应): blocks 首位 (思考在 content 之前).
+            if let Some(rc) = message.get("reasoning_content").and_then(Value::as_str)
+                && !rc.is_empty()
+            {
+                blocks.push(IrBlock::ReasoningContent {
+                    text: rc.to_string(),
+                });
+            }
             // 文本内容: content 可能是 string 或 array of parts.
             blocks.extend(read_openai_content(message.get("content")));
             // 工具调用: tool_calls[].
@@ -409,6 +444,12 @@ impl Writer for OpenAiWriter {
                     // OpenAI Chat 协议无 reasoning item 的标准对应 (有非标 reasoning_content, 但结构不同).
                     // 跨协议翻译时静默丢弃 (lossy-by-target); 同协议路径不会到达 Chat writer.
                 }
+                IrBlock::ReasoningContent { text } => {
+                    // 思考型模型的非标 reasoning_content 字段 (#176). 同协议 redact
+                    // 路径 round-trip 用; 跨协议来源不会出现 (Anthropic thinking /
+                    // Responses reasoning 不映射到本 block).
+                    message.insert("reasoning_content".to_string(), Value::String(text.clone()));
+                }
             }
         }
         // OpenAI content: 若只有文本, 用 string; 否则用 array.
@@ -474,6 +515,11 @@ impl Writer for OpenAiWriter {
                     // 这里返回 None 避免发出空 chunk (与 BlockStop 同样跳过).
                     return None;
                 }
+                IrBlockMeta::ReasoningContent => {
+                    // reasoning block start 同样隐式: 第一个 reasoning_content delta
+                    // chunk 自带内容. 跳过空 chunk (与 Text 对称).
+                    return None;
+                }
                 IrBlockMeta::ToolUse { id, name } => json!({
                     "choices": [{
                         "index": 0,
@@ -507,6 +553,13 @@ impl Writer for OpenAiWriter {
                                 "function": {"arguments": args},
                             }]
                         },
+                        "finish_reason": Value::Null,
+                    }]
+                }),
+                IrDelta::ReasoningDelta(rc) => json!({
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"reasoning_content": rc},
                         "finish_reason": Value::Null,
                     }]
                 }),
@@ -778,12 +831,15 @@ fn read_usage(usage: &Value) -> IrUsage {
 
 /// 分配下一个空闲的 IR block index.
 ///
-/// OpenAI flat stream 允许 text 与 tool_calls 以任意顺序到达. 为了避免 text 与 tool 占用
-/// 同一个 index (导致 Anthropic 端 `content_block_start` index 冲突), 每次开新 block
-/// 都查询当前已用的最大 index + 1.
+/// OpenAI flat stream 允许 text / reasoning / tool_calls 以任意顺序到达. 为了避免
+/// 多类 block 占用同一个 index (导致 Anthropic 端 `content_block_start` index 冲突),
+/// 每次开新 block 都查询当前已用的最大 index + 1.
 fn next_free_block_index(state: &StreamDecodeState) -> usize {
     let mut max = 0;
     if let Some(i) = state.text_index {
+        max = max.max(i);
+    }
+    if let Some(i) = state.reasoning_index {
         max = max.max(i);
     }
     for &i in state.tool_ir_index.values() {
@@ -839,6 +895,30 @@ fn read_openai_stream_chunk(data: &Value, state: &mut StreamDecodeState) -> Vec<
 
     // 2) 处理 delta 内容.
     if let Some(delta) = delta {
+        // 思考原文 delta (reasoning_content, #176). 先于 content 处理:
+        // 思考阶段的流形态是 reasoning chunks → content chunks, 同 chunk 同时
+        // 携带两者的场景未观测, 但保持 reader 顺序与 wire 字段出现顺序
+        // (reasoning_content 在 content 之前) 一致.
+        if let Some(rc) = delta.get("reasoning_content").and_then(Value::as_str)
+            && !rc.is_empty()
+        {
+            let index = if !state.reasoning_block_open {
+                let new_idx = next_free_block_index(state);
+                events.push(IrStreamEvent::BlockStart {
+                    index: new_idx,
+                    block: IrBlockMeta::ReasoningContent,
+                });
+                state.reasoning_block_open = true;
+                state.reasoning_index = Some(new_idx);
+                new_idx
+            } else {
+                state.reasoning_index.unwrap_or(0)
+            };
+            events.push(IrStreamEvent::BlockDelta {
+                index,
+                delta: IrDelta::ReasoningDelta(rc.to_string()),
+            });
+        }
         // 文本 delta.
         if let Some(content) = delta.get("content").and_then(Value::as_str)
             && !content.is_empty()
@@ -885,13 +965,14 @@ fn read_openai_stream_chunk(data: &Value, state: &mut StreamDecodeState) -> Vec<
     events
 }
 
-/// 流末尾的"关闭一切"操作: 依次关闭所有开着的 block (text + 全部 open tool), 然后
-/// emit `MessageDelta(stop_reason, usage)` 与 `MessageStop`.
+/// 流末尾的"关闭一切"操作: 依次关闭所有开着的 block (reasoning + text + 全部 open tool),
+/// 然后 emit `MessageDelta(stop_reason, usage)` 与 `MessageStop`.
 ///
-/// **顺序契约**: 先关 text block (若开着), 再按 oai_idx 升序关所有 open tool
-/// (`open_tools` 是 `BTreeSet`, 升序迭代), 最后 MessageDelta / MessageStop.
-/// 此顺序与单测 + STR-5 proptest 锁定的 wire 顺序一致, 不得调整 (Anthropic writer
-/// 把 BlockStop 翻译为 `content_block_stop`, 顺序错位会破坏客户端的 block 聚合).
+/// **顺序契约**: 先关 reasoning block (若开着), 再关 text block (若开着), 再按 oai_idx
+/// 升序关所有 open tool (`open_tools` 是 `BTreeSet`, 升序迭代), 最后 MessageDelta /
+/// MessageStop. 此顺序与单测 + STR-5/STR-6 proptest 锁定的 wire 顺序一致, 不得调整
+/// (Anthropic writer 把 BlockStop 翻译为 `content_block_stop`, 顺序错位会破坏客户端的
+/// block 聚合). reasoning 在最前: 思考先于正文, 与模型输出顺序一致.
 fn finish_stream(
     state: &mut StreamDecodeState,
     events: &mut Vec<IrStreamEvent>,
@@ -907,14 +988,21 @@ fn finish_stream(
     events.push(IrStreamEvent::MessageStop);
 }
 
-/// 关闭所有当前开着的 block: 先 text block (若开着), 再所有 open tool.
+/// 关闭所有当前开着的 block: 先 reasoning block, 再 text block, 再所有 open tool.
 ///
-/// 关闭后清空 `text_block_open` / `open_tools` / `tool_ir_index`.
-/// "关 text + 关全部 tool" 是两个状态机的统一收尾动作, 集中此处避免散落两处.
+/// 关闭后清空 `reasoning_block_open` / `text_block_open` / `open_tools` / `tool_ir_index`.
+/// "关 reasoning + text + 全部 tool" 是三个状态机的统一收尾动作, 集中此处避免散落.
 ///
 /// **行为等价**: `open_tools` (BTreeSet, 升序) 作为"哪些 oai_idx 开着"的真相源,
 /// `tool_ir_index` 仅查 ir_idx (不假设两集合 key 同步).
 fn close_open_blocks(state: &mut StreamDecodeState, events: &mut Vec<IrStreamEvent>) {
+    // 关闭 reasoning block.
+    if state.reasoning_block_open {
+        if let Some(idx) = state.reasoning_index {
+            events.push(IrStreamEvent::BlockStop { index: idx });
+        }
+        state.reasoning_block_open = false;
+    }
     // 关闭 text block.
     if state.text_block_open {
         if let Some(idx) = state.text_index {
@@ -1033,11 +1121,19 @@ fn write_message(msg: &IrMessage) -> Value {
         IrRole::Assistant => {
             let mut content_parts: Vec<Value> = Vec::new();
             let mut tool_calls: Vec<Value> = Vec::new();
+            // 思考原文 (reasoning model 的 assistant 历史回传, #176). FWD-1: 同协议
+            // redact 路径必须保留. 空 text 跳过 (与 wire 缺席等价, reader 侧对称).
+            let mut reasoning_content: Option<String> = None;
             for b in &msg.content {
                 match b {
                     IrBlock::Text { text } => {
                         if !text.is_empty() {
                             content_parts.push(Value::String(text.clone()));
+                        }
+                    }
+                    IrBlock::ReasoningContent { text } => {
+                        if !text.is_empty() {
+                            reasoning_content = Some(text.clone());
                         }
                     }
                     IrBlock::ToolUse { id, name, input } => {
@@ -1066,6 +1162,15 @@ fn write_message(msg: &IrMessage) -> Value {
             let mut obj = Map::new();
             obj.insert("role".to_string(), json!("assistant"));
             obj.insert("content".to_string(), content);
+            // reasoning_content 写回: 非空 block 优先; 否则按 wire 形态元数据恢复
+            // "显式空 / null" (L1 保真, 区分缺席; FWD-1). 跨协议来源 form=None +
+            // 无 block → 不输出 (缺席), 与原行为一致.
+            if let Some(rc) = reasoning_content.map(Value::String).or_else(|| {
+                msg.reasoning_content_form
+                    .map(ReasoningContentForm::to_value)
+            }) {
+                obj.insert("reasoning_content".to_string(), rc);
+            }
             if !tool_calls.is_empty() {
                 obj.insert("tool_calls".to_string(), Value::Array(tool_calls));
             }
@@ -1137,6 +1242,7 @@ fn write_user_block(b: &IrBlock) -> Option<Value> {
         }
         IrBlock::ToolUse { .. } => None, // user 消息里通常没有 ToolUse
         IrBlock::Reasoning { .. } => None, // user 消息里通常没有 Reasoning
+        IrBlock::ReasoningContent { .. } => None, // 同上 (思考原文属 assistant 消息)
     }
 }
 
@@ -2190,5 +2296,315 @@ mod tests {
         // 单 image block → array content (因为非单一 Text block).
         let url = msg["content"][0]["image_url"]["url"].as_str().unwrap();
         assert_eq!(url, "data:image/jpeg;base64,abc123");
+    }
+
+    // ─── reasoning_content (#176): reader 解码 + writer 写回 ─────────────
+    //
+    // 思考型模型 (glm / deepseek-r1 等 OpenAI 兼容 provider) 在响应与流式 delta 中
+    // 携带非标 `reasoning_content` 字段. 历史 bug: codec 未建模 → redact 流式路径
+    // (IR 重建) 思考期零字节, 客户端空闲看门狗超时断连 (Chatbox 30s, 生产 499).
+
+    #[test]
+    fn read_response_reasoning_content_becomes_block() {
+        // 非流式响应: message.reasoning_content → IrBlock::ReasoningContent (首位).
+        let body = json!({
+            "id": "chatcmpl-r1",
+            "model": "glm-5.3",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "reasoning_content": "let me think...",
+                    "content": "the answer is 3",
+                },
+                "finish_reason": "stop",
+            }],
+        });
+        let ir = reader().read_response(&body).unwrap();
+        assert_eq!(ir.content.len(), 2);
+        assert!(matches!(
+            &ir.content[0],
+            IrBlock::ReasoningContent { text } if text == "let me think..."
+        ));
+        assert!(matches!(
+            &ir.content[1],
+            IrBlock::Text { text } if text == "the answer is 3"
+        ));
+    }
+
+    #[test]
+    fn write_response_reasoning_content_round_trip() {
+        // writer: ReasoningContent block → message.reasoning_content 字段.
+        let ir = IrResponse {
+            content: vec![
+                IrBlock::ReasoningContent {
+                    text: "thinking...".into(),
+                },
+                IrBlock::Text {
+                    text: "answer".into(),
+                },
+            ],
+            stop_reason: Some(IrStopReason::EndTurn),
+            usage: IrUsage::default(),
+            model: Some("glm-5.3".into()),
+            id: Some("chatcmpl-r1".into()),
+            created: Some(1),
+            stop_sequence: None,
+        };
+        let v = writer().write_response(&ir);
+        let msg = &v["choices"][0]["message"];
+        assert_eq!(msg["reasoning_content"], "thinking...");
+        assert_eq!(msg["content"], "answer");
+        // round-trip: writer 输出重新被 reader 解析, blocks 保序保真.
+        let ir2 = reader().read_response(&v).unwrap();
+        assert_eq!(ir2.content, ir.content);
+    }
+
+    #[test]
+    fn read_request_assistant_history_reasoning_content_round_trip() {
+        // 客户端把上一轮思考原文回传进 assistant 历史 (Chatbox 等客户端行为).
+        // FWD-1: 同协议 redact 路径除 real↔mock 外不得改 wire → 必须建模 + 写回.
+        let body = json!({
+            "model": "glm-5.3",
+            "messages": [
+                {"role": "user", "content": "1+1?"},
+                {"role": "assistant", "reasoning_content": "trivial arithmetic",
+                 "content": "2"},
+                {"role": "user", "content": "and 2+2?"},
+            ],
+        });
+        let ir = reader().read_request(&body).unwrap();
+        assert!(matches!(
+            &ir.messages[1].content[0],
+            IrBlock::ReasoningContent { text } if text == "trivial arithmetic"
+        ));
+        let out = writer().write_request(&ir);
+        let msg = &out["messages"][1];
+        assert_eq!(msg["role"], "assistant");
+        assert_eq!(msg["reasoning_content"], "trivial arithmetic");
+        assert_eq!(msg["content"], "2");
+    }
+
+    // ─── reasoning_content 流式: reader 状态机 + writer 写回 (#176) ────────
+
+    #[test]
+    fn stream_reasoning_delta_emits_block_start_then_reasoning_delta() {
+        // 思考阶段首 chunk: MessageStart + BlockStart{ReasoningContent} + BlockDelta{ReasoningDelta}.
+        let chunk = json!({
+            "id": "chatcmpl-r",
+            "object": "chat.completion.chunk",
+            "created": 1700000000,
+            "model": "glm-5.3",
+            "choices": [{
+                "index": 0,
+                "delta": {"reasoning_content": "step 1"},
+                "finish_reason": Value::Null,
+            }]
+        });
+        let mut state = StreamDecodeState::default();
+        let events = reader().read_response_events("", &chunk, &mut state);
+        assert_eq!(events.len(), 3);
+        assert!(matches!(events[0], IrStreamEvent::MessageStart { .. }));
+        assert!(matches!(
+            events[1],
+            IrStreamEvent::BlockStart {
+                block: IrBlockMeta::ReasoningContent,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &events[2],
+            IrStreamEvent::BlockDelta {
+                delta: IrDelta::ReasoningDelta(s),
+                ..
+            } if s == "step 1"
+        ));
+    }
+
+    #[test]
+    fn stream_reasoning_then_text_distinct_indices() {
+        // 思考块与文本块必须是两个独立 block (独立 index), writer 各写各的 wire 字段.
+        let reasoning_chunk = json!({
+            "id": "chatcmpl-r", "object": "chat.completion.chunk", "created": 1700000000,
+            "model": "glm-5.3",
+            "choices": [{"index": 0, "delta": {"reasoning_content": "thinking"}, "finish_reason": Value::Null}]
+        });
+        let text_chunk = json!({
+            "id": "chatcmpl-r", "object": "chat.completion.chunk", "created": 1700000000,
+            "model": "glm-5.3",
+            "choices": [{"index": 0, "delta": {"content": "answer"}, "finish_reason": Value::Null}]
+        });
+        let finish_chunk = json!({
+            "id": "chatcmpl-r", "object": "chat.completion.chunk", "created": 1700000000,
+            "model": "glm-5.3",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+        });
+        let mut state = StreamDecodeState::default();
+        let mut all = Vec::new();
+        for chunk in [&reasoning_chunk, &text_chunk, &finish_chunk] {
+            all.extend(reader().read_response_events("", chunk, &mut state));
+        }
+
+        // reasoning 拿 index 1 (next_free_block_index 首个), text 拿 index 2 — 互不相同.
+        let reasoning_idx = all
+            .iter()
+            .find_map(|ev| match ev {
+                IrStreamEvent::BlockStart {
+                    index,
+                    block: IrBlockMeta::ReasoningContent,
+                } => Some(*index),
+                _ => None,
+            })
+            .expect("reasoning BlockStart");
+        let text_idx = all
+            .iter()
+            .find_map(|ev| match ev {
+                IrStreamEvent::BlockStart {
+                    index,
+                    block: IrBlockMeta::Text,
+                } => Some(*index),
+                _ => None,
+            })
+            .expect("text BlockStart");
+        assert_ne!(reasoning_idx, text_idx);
+
+        // finish: reasoning 先关 (BlockStop 顺序: reasoning → text), 再 text.
+        let stops: Vec<usize> = all
+            .iter()
+            .filter_map(|ev| match ev {
+                IrStreamEvent::BlockStop { index } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stops, vec![reasoning_idx, text_idx], "close order");
+
+        // writer: ReasoningDelta 写回 delta.reasoning_content, TextDelta 写 delta.content.
+        let mut saw_reasoning = false;
+        let mut saw_content = false;
+        for ev in &all {
+            if let Some((_, chunk)) = writer().write_response_event(ev)
+                && let Some(delta) = chunk
+                    .get("choices")
+                    .and_then(Value::as_array)
+                    .and_then(|c| c.first())
+                    .and_then(|c| c.get("delta"))
+            {
+                if delta.get("reasoning_content").is_some() {
+                    saw_reasoning = true;
+                }
+                if delta.get("content").is_some() {
+                    saw_content = true;
+                }
+            }
+        }
+        assert!(saw_reasoning, "writer must emit reasoning_content delta");
+        assert!(saw_content, "writer must emit content delta");
+    }
+
+    #[test]
+    fn stream_reasoning_writer_block_start_is_implicit() {
+        // OpenAI writer 对 BlockStart{ReasoningContent} 返回 None (start 隐式在首个 delta 内),
+        // 与 Text 对称 — 不发空 chunk.
+        let ev = IrStreamEvent::BlockStart {
+            index: 1,
+            block: IrBlockMeta::ReasoningContent,
+        };
+        assert!(writer().write_response_event(&ev).is_none());
+    }
+
+    // ─── ReasoningContent 跨协议丢弃 (FWD-3 范围外显式丢弃, #176) ──────────
+    //
+    // Anthropic thinking block 需 signature / Responses reasoning item 依赖
+    // encrypted_content, 均无法从思考原文合法合成 → writer 跳过 (lossy-by-target).
+    // 这里锁定该裁决: 防未来 "好心" 合成非法 wire 形态 (伪造 signature 会被
+    // Anthropic API 拒收). rationale SSOT 见 src/codec/AGENTS.md 支持矩阵注记.
+
+    #[test]
+    fn reasoning_content_block_dropped_by_anthropic_writer() {
+        use crate::codec::anthropic::{AnthropicReader, AnthropicWriter};
+        // 请求侧: assistant 历史含 ReasoningContent block → Anthropic wire 无 thinking.
+        let ir = IrRequest {
+            messages: vec![IrMessage {
+                role: IrRole::Assistant,
+                content: vec![IrBlock::ReasoningContent {
+                    text: "hidden chain of thought".into(),
+                }],
+                ..Default::default()
+            }],
+            model: "claude-x".into(),
+            ..Default::default()
+        };
+        let wire = AnthropicWriter.write_request(&ir);
+        let wire_str = serde_json::to_string(&wire).unwrap();
+        assert!(
+            !wire_str.contains("thinking") && !wire_str.contains("hidden chain"),
+            "Anthropic egress must not contain synthesized thinking block: {wire_str}"
+        );
+        // 响应侧: write_block / BlockStart meta / ReasoningDelta 全部跳过.
+        let resp = IrResponse {
+            content: vec![IrBlock::ReasoningContent { text: "cot".into() }],
+            ..Default::default()
+        };
+        let resp_wire = serde_json::to_string(&AnthropicWriter.write_response(&resp)).unwrap();
+        assert!(
+            !resp_wire.contains("thinking") && !resp_wire.contains("cot"),
+            "Anthropic response must not contain reasoning text: {resp_wire}"
+        );
+        assert!(
+            AnthropicWriter
+                .write_response_event(&IrStreamEvent::BlockStart {
+                    index: 0,
+                    block: IrBlockMeta::ReasoningContent,
+                })
+                .is_none()
+        );
+        assert!(
+            AnthropicWriter
+                .write_response_event(&IrStreamEvent::BlockDelta {
+                    index: 0,
+                    delta: IrDelta::ReasoningDelta("cot".into()),
+                })
+                .is_none()
+        );
+        // 丢弃后重读: Anthropic reader 不产出 ReasoningContent (round-trip 丢弃确认).
+        let ir2 = AnthropicReader.read_request(&wire).unwrap();
+        assert!(
+            !ir2.messages.iter().any(|m| m
+                .content
+                .iter()
+                .any(|b| matches!(b, IrBlock::ReasoningContent { .. }))),
+            "ReasoningContent must not survive cross-proto round-trip"
+        );
+    }
+
+    #[test]
+    fn reasoning_content_block_dropped_by_responses_writer() {
+        use crate::codec::responses::ResponsesWriter;
+        let ir = IrRequest {
+            messages: vec![IrMessage {
+                role: IrRole::Assistant,
+                content: vec![IrBlock::ReasoningContent {
+                    text: "hidden chain of thought".into(),
+                }],
+                ..Default::default()
+            }],
+            model: "o1".into(),
+            ..Default::default()
+        };
+        let wire = ResponsesWriter.write_request(&ir);
+        let wire_str = serde_json::to_string(&wire).unwrap();
+        assert!(
+            !wire_str.contains("encrypted_content") && !wire_str.contains("hidden chain"),
+            "Responses egress must not synthesize reasoning item: {wire_str}"
+        );
+        let resp = IrResponse {
+            content: vec![IrBlock::ReasoningContent { text: "cot".into() }],
+            ..Default::default()
+        };
+        let resp_wire = serde_json::to_string(&ResponsesWriter.write_response(&resp)).unwrap();
+        assert!(
+            !resp_wire.contains("\"reasoning\"") && !resp_wire.contains("cot"),
+            "Responses output must not contain reasoning item: {resp_wire}"
+        );
     }
 }

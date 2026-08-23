@@ -1362,6 +1362,112 @@ async fn streaming_redact_restores_when_upstream_skips_block_stop() {
 }
 
 #[tokio::test]
+async fn same_proto_streaming_with_redact_forwards_reasoning_content_deltas() {
+    // #176 回归: 思考型模型 (glm 等 OpenAI 兼容 provider) 流式响应的思考阶段,
+    // redact 路径 (secrets 非空 → IR 重建) 必须把 delta.reasoning_content 增量
+    // 透传给客户端. 修复前 reader 不解码该字段 → 思考期零字节, 客户端空闲
+    // 看门狗超时断连 (Chatbox 30s, 生产 499 事故).
+    let real_secret = "sk-test-123";
+    let expected_mock = predict_mock(real_secret);
+    let mut upstream = spawn_mock_upstream().await;
+    // 上游 SSE: 思考阶段 (reasoning chunks, 含 mock — LLM 在思考中 echo secret)
+    // → content 阶段 → finish → [DONE].
+    let sse_body = format!(
+        concat!(
+            "data: {{\"id\":\"chatcmpl-r\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"glm-5.3\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"reasoning_content\":\"step one with {mock}\"}},\"finish_reason\":null}}]}}\n\n",
+            "data: {{\"id\":\"chatcmpl-r\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"glm-5.3\",\"choices\":[{{\"index\":0,\"delta\":{{\"reasoning_content\":\" step two\"}},\"finish_reason\":null}}]}}\n\n",
+            "data: {{\"id\":\"chatcmpl-r\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"glm-5.3\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"final answer\"}},\"finish_reason\":null}}]}}\n\n",
+            "data: {{\"id\":\"chatcmpl-r\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"glm-5.3\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\n",
+            "data: [DONE]\n\n",
+        ),
+        mock = expected_mock,
+    );
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse_body)
+        .create_async()
+        .await;
+    let entries = vec![secret("api-key", real_secret)];
+    let secrets = test_secret_table_with(entries);
+    let upstream_client = reqwest::Client::new();
+    let records = ConversationDag::new(64, 500, 1);
+    let provider = openai_provider("oa-main", &upstream.url());
+    let proxy_url = spawn_proxy_full(vec![provider], upstream_client, records, secrets).await;
+
+    let body = format!(
+        r#"{{"model":"glm-5.3","stream":true,"messages":[{{"role":"user","content":"use {real_secret} now"}}]}}"#
+    );
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/o/oa-main/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let text = resp.text().await.unwrap();
+
+    // 核心: 思考增量必须到达客户端 (reasoning_content 字段).
+    // 注: "≥2" 依赖 mock 位于 delta 末尾 (find_safe_end 的 max_mock_end 迫使首 delta
+    // 全量 emit); 若测试帧构造改变 (mock 移到 delta 中间且尾部短于 hold), 两个 delta
+    // 可能合并为 1 个 emit — 届时此计数断言需调整, 拼接断言 (下方) 不受影响.
+    // 注: sliding window restore 会重组 chunk 边界 (文档化行为), 断言必须基于
+    // 同类 delta 的拼接而非裸 substring (reasoning/content 是不同 block 的独立流).
+    let reasoning_chunks = text.matches("reasoning_content").count();
+    assert!(
+        reasoning_chunks >= 2,
+        "#176 回归: 客户端思考期零字节 (reasoning_content chunks = {reasoning_chunks})\ntext: {text}"
+    );
+    let joined_content: String = collect_openai_delta_field(&text, "content");
+    let joined_reasoning: String = collect_openai_delta_field(&text, "reasoning_content");
+    // reasoning 内容保真: 两段思考拼接完整.
+    assert_eq!(
+        joined_reasoning,
+        format!("step one with {real_secret} step two"),
+        "reasoning fidelity; text: {text}"
+    );
+    // content 阶段也透传.
+    assert_eq!(joined_content, "final answer", "text: {text}");
+    // restore: reasoning 中的 mock 被还原为 real (secret 可能泄漏进思考流).
+    assert!(
+        joined_reasoning.contains(real_secret),
+        "mock in reasoning must be restored to real; text: {text}"
+    );
+    assert!(
+        !text.contains(&expected_mock),
+        "client should NOT see mock {expected_mock}; got: {text}"
+    );
+}
+
+/// 从客户端 SSE 文本中收集 `choices[].delta.<field>` (string) 的全部值并拼接.
+/// 用于流式断言 (sliding window 会拆 chunk, 必须拼接后比较).
+fn collect_openai_delta_field(sse_text: &str, field: &str) -> String {
+    let mut acc = String::new();
+    for line in sse_text.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
+        if let Some(choices) = v.get("choices").and_then(|c| c.as_array()) {
+            for ch in choices {
+                if let Some(s) = ch
+                    .get("delta")
+                    .and_then(|d| d.get(field))
+                    .and_then(|s| s.as_str())
+                {
+                    acc.push_str(s);
+                }
+            }
+        }
+    }
+    acc
+}
+
+#[tokio::test]
 async fn cross_protocol_with_redact_round_trips_through_ir_translation() {
     // 跨协议 + redact + restore: 客户端发 OpenAI (含 secret) → codec 翻译为 Anthropic
     // (含 mock) → 上游响应含 mock → codec 翻译回 OpenAI + restore mock 为 real_secret.

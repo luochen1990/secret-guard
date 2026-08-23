@@ -14,10 +14,19 @@
 - ✅ OpenAI Chat Completions ⇄ Anthropic Messages 双向 (非流式 + 流式 SSE).
 - ✅ OpenAI Responses API 同协议透传 + Redact (非流式; 流式 + Redact 返回 501).
 - ✅ OpenAI Responses ⇄ OpenAI Chat Completions 跨协议翻译 (非流式).
+- ✅ `reasoning_content` (思考原文, OpenAI 兼容 provider 非标字段) 同协议建模:
+  请求 (assistant 历史回传) / 非流式响应 / 流式 delta 三路径 reader↔writer 对称
+  (#176, 契约 STR-6). 跨协议丢弃 (见下).
 - ❌ Responses ⇄ Anthropic 跨协议: 未实现 (返回 501).
 - ❌ Responses 流式 SSE 事件翻译 (`read_response_events` / `write_response_event` 返回空/None).
 - ❌ 不在 MVP: Bedrock / Gemini / Cohere, reasoning `encrypted_content` (provider-specific opaque),
   Anthropic `thinking` blocks, citations, logprobs, prompt caching, Bedrock eventstream 二进制流.
+
+> **reasoning_content 跨协议丢弃 rationale** (#176, FWD-3 已知损失): Anthropic thinking
+> block 必须携带 signature (加密签名, secret-guard 无法合成 — 伪造会被 Anthropic API 拒收);
+> Responses reasoning item 依赖 `encrypted_content` (provider-opaque). 两者都无法从思考
+> 原文合法合成, writer 跳过 (返回 None) 而非发明非法 wire 形态. 跨协议流式本就未接入
+> dispatch (501), 此为增强面的合理降级.
 
 ## 核心抽象
 
@@ -69,6 +78,7 @@ normalize(v) == normalize(Writer(Reader(v)))
 | `IrRequest.stop_form: Option<StopForm>` | ir.rs | stop 字段形态 (String/Array), 区分 `"stop":"x"` vs `"stop":["x"]` |
 | `IrRequest.tools_present: bool` | ir.rs | tools 字段是否存在 (区分 `"tools":[]` vs 缺失) |
 | `IrMessage.content_form: Option<ContentForm>` | ir.rs | message content 形态 (String/Array/Null) |
+| `IrMessage.reasoning_content_form: Option<ReasoningContentForm>` | ir.rs | assistant 消息 `reasoning_content` 显式空/null 形态 (#176), 区分 `""`/`null` vs 缺失 |
 | `IrBlock::ToolResult.content_form: Option<ContentForm>` | ir.rs | tool_result 内 content 形态 (Anthropic 特有) |
 
 **清空 SSOT**: `IrRequest::clear_wire_fidelity()` 集中清空所有 wire_fidelity 字段
@@ -77,7 +87,8 @@ normalize(v) == normalize(Writer(Reader(v)))
 
 **当前覆盖与搁置**:
 
-- ✅ 已覆盖 (request): content 形态 (L1) / stop 形态 (L7) / tools 显式空 (L6) / tool_use input round-trip / 裸 string content part
+- ✅ 已覆盖 (request): content 形态 (L1) / stop 形态 (L7) / tools 显式空 (L6) / tool_use input round-trip / 裸 string content part /
+  reasoning_content 三路径对称 + 显式空/null 形态 (#176, `reasoning_content_form`)
 - ⏸️ 搁置 (待后续): 多 system messages 合并 (L2) / message-level extra (L4) / block-level 未知 part (L5) / usage 字段位置与计算 (L8, response 路径)
 
 搁置项对应的 proptest 生成器分支已用 `// NOTE` 标注, 实现后恢复即可.

@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1a14479cae23ca7c9d8700dc5d3884cbe932a5f506967b14570e1ea4d8ae55d7 # shrinks to wire_with_secret = (Object {"messages": Array [Object {"content": String("  token:aaaaaaaa"), "reasoning_content": String(""), "role": String("assistant")}], "model": String("gpt-4o"), "user": String("user-aaaaaaaa")}, "aaaaaaaa")
+cc 6aebaada2bffd896b8cae43a47a40673c9f26081b88d297ffeb60e93d742f108 # shrinks to v = Object {"messages": Array [Object {"content": String("a"), "reasoning_content": String(""), "role": String("assistant")}], "model": String("gpt-4o"), "stop": String(""), "stream": Bool(true)}

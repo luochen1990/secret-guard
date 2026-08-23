@@ -583,6 +583,15 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
 
 ## 已知限制 (MVP)
 
+- **reasoning_content (思考原文) 跨协议丢弃** (#176, 契约 STR-6): OpenAI 兼容 provider 的
+  思考原文 (`delta.reasoning_content` 流式 / `message.reasoning_content` 非流式 /
+  assistant 历史回传) 已建模为 `IrBlock::ReasoningContent`, 同协议路径 (含 Redact) 三路径
+  reader↔writer 对称 + 流式 restore 覆盖. **跨协议翻译时丢弃** — Anthropic thinking block
+  需要 signature (无法合法合成), Responses reasoning item 依赖 `encrypted_content`
+  (rationale 见 `src/codec/AGENTS.md` 支持矩阵注记).
+  边界: 请求侧 assistant 历史的显式空串/null 由 `reasoning_content_form` wire 元数据保真;
+  **响应侧** `IrResponse` 无对应元数据 — 上游非流式响应显式返回 `"reasoning_content": ""`
+  时, redact 路径 round-trip 后该字段会变为缺席 (信息无损失, 形态有差异).
 - **OpenAI Responses API 支持范围**: Responses 协议 (`/r/` proto_short) 已接入 codec,
   支持 Responses ⇄ Chat Completions 跨协议翻译 (非流式) + Responses 同协议透传 + Redact (非流式).
   **不支持**: Responses 流式 SSE 事件翻译 (Responses + Redact + `stream=true` 返回 501;
@@ -681,7 +690,11 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
   对称地在 redaction map 非空时打 `mock not restored` WARN (#158 只覆盖了
   同协议路径; 见 "已知限制" 对应条目).
 - **跨协议流式响应翻译**: 在 `cross_proto_forward` 检测 stream=true 时接入
-  `StreamTranslate::new(ingress, egress)` 而非返回 501.
+  `StreamTranslate::new(ingress, egress)` 而非返回 501. 前置条件 (#176 登记):
+  Anthropic writer 对 ReasoningContent block 只跳过 BlockStart/Delta, `BlockStop` 因 writer
+  无状态仍会 emit 未配对的 `content_block_stop` — 接入前需给 writer 加跳过 index
+  集合或在 StreamTranslate 层过滤 (见 `src/codec/anthropic.rs` write_response_event
+  的 ReasoningContent 分支注释).
 - **更多协议**: Gemini / Ollama / Bedrock / Cohere / OpenAI Responses API.
   新增协议只需实现 Reader + Writer trait (~200 行), 不动 dispatch.
 - **redact_headers 名单可配置**: 加 `[redact] redacted_headers = [...]` 配置项,

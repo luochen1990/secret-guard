@@ -480,6 +480,13 @@ impl Writer for AnthropicWriter {
                         "content_block": {"type": "text", "text": ""}
                     }),
                 )),
+                IrBlockMeta::ReasoningContent => {
+                    // 跳过: thinking block 需 signature, 无法合法合成 (伪造会被
+                    // Anthropic API 拒收). 裁决 rationale 见 codec/AGENTS.md 支持矩阵.
+                    // 注意: BlockStop 分支无状态仍会 emit 未配对的 content_block_stop —
+                    // 当前不可达 (跨协议流式 501), 接入前置条件见根 AGENTS.md 后续工作.
+                    None
+                }
                 IrBlockMeta::ToolUse { id, name } => Some((
                     "content_block_start".to_string(),
                     json!({
@@ -503,6 +510,11 @@ impl Writer for AnthropicWriter {
                         "delta": {"type": "text_delta", "text": text}
                     }),
                 )),
+                IrDelta::ReasoningDelta(_) => {
+                    // thinking_delta 需要 BlockStart(thinking) 配对 (见 BlockStart 分支),
+                    // 跳过 (跨协议流式本就未接入 dispatch, 此为防御性降级).
+                    None
+                }
                 IrDelta::InputJsonDelta(partial) => Some((
                     "content_block_delta".to_string(),
                     json!({
@@ -611,6 +623,8 @@ fn read_message(msg: &Value) -> Option<IrMessage> {
         contains_user_text: role == IrRole::User && super::ir::blocks_has_text(&content),
         content,
         content_form,
+        // Anthropic wire 无 reasoning_content 字段, 恒缺席.
+        reasoning_content_form: None,
     })
 }
 
@@ -888,6 +902,11 @@ fn write_block(b: &IrBlock) -> Option<Value> {
         IrBlock::Reasoning { .. } => {
             // Anthropic Messages 协议无 reasoning item 的直接对应 (有 thinking blocks, 但结构不同).
             // 跨协议翻译时静默丢弃 (lossy-by-target); 同协议路径不会到达 Anthropic writer.
+            None
+        }
+        IrBlock::ReasoningContent { .. } => {
+            // thinking block 需要 signature (无法合法合成) — 同 BlockStart{ReasoningContent}
+            // 分支的裁决, 静默丢弃 (lossy-by-target, 见 codec/AGENTS.md).
             None
         }
     }

@@ -489,3 +489,4 @@ OpenAI `metadata: map(16 KV)` vs Anthropic `metadata: {user_id}` — 这两个�
 | 日期 | 变更 | 作者 |
 |---|---|---|
 | 2026-08-05 | 初版 (基于三阶段调研: 前人工作 / 字段全景 / 使用统计) | opencode-bot |
+| 2026-08-23 | `reasoning_content` (思考原文, #176) 按 §2.2 准则判定: 出现在 OpenAI Chat 的请求 (assistant 历史回传) / 非流式响应 / 流式 delta 三路径, 但另两协议无合法合成形态 (Anthropic thinking 需 signature / Responses reasoning 需 encrypted_content) → **步骤 2 不满足, 建 first-class block (`IrBlock::ReasoningContent`) 但跨协议丢弃**. 这是 §2.2 准则的边界案例: "无跨协议映射"通常归 extra, 但 extra 是顶层字段逃生舱, 无法表达 message-level / stream delta 的同协议保真, 故建独立 block variant (契约 STR-6). 与 A1 (reasoning **配置**) 正交: A1 是请求侧 effort/budget 参数, 本条是响应侧思考原文. | opencode-bot |

@@ -98,6 +98,9 @@ pub(super) fn hash_block(block: &IrBlock) -> BlockHash {
                 s.hash(&mut h);
             }
         }
+        IrBlock::ReasoningContent { text } => {
+            text.hash(&mut h);
+        }
     }
     h.finish()
 }

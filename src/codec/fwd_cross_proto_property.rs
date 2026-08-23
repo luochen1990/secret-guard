@@ -23,12 +23,17 @@
 //!
 //! `extra.clear()` 是 FWD-3 的核心安全操作: [`crate::codec::collect_extra`] 把 reader 未
 //! 建模的字段塞进 `extra`, 同协议路径会透传 extra (FWD-1/FWD-2), 但跨协议路径必须清空
-//! (否则源协议独有字段如 OpenAI `reasoning_content` 会污染 Anthropic egress wire).
+//! (否则源协议独有字段如 OpenAI `reasoning_effort` 会污染 Anthropic egress wire).
+//!
+//! 注: `reasoning_content` (思考原文) 已建模为 first-class block (#176:
+//! `IrBlock::ReasoningContent`), 但**跨协议仍丢弃** (Anthropic thinking 需 signature /
+//! Responses reasoning 依赖 encrypted_content, 无法合法合成) — 属 FWD-3
+//! "范围外显式丢弃"的已知损失, 见 `src/codec/AGENTS.md` 支持矩阵.
 //!
 //! # 生成器覆盖
 //!
 //! 按契约 §0.3 第 3 条, 生成器覆盖度本身是契约要求. 本模块的生成器覆盖:
-//! - OpenAI ingress 独有字段: `reasoning_content` / `logprobs` / `logit_bias` /
+//! - OpenAI ingress 独有字段: `reasoning_content` (顶层弃用形态) / `logprobs` / `logit_bias` /
 //!   `response_format` / `seed` / `store` / `metadata` (顶层) / `n` / `presence_penalty` /
 //!   `frequency_penalty`
 //! - Anthropic ingress 独有字段: `thinking` / `citations` / `cache_control` /

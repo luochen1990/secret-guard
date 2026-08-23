@@ -389,6 +389,21 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 > **历史 bug**: 9712c52. 注意此契约只覆盖 reader 侧. writer 侧"把 IR block index 透传到 wire `tool_calls[].index`"由 FWD-1/FWD-2 的 byte-exact property 守卫.
 
+### STR-6 流式 reasoning_content 建模与 restore
+
+**陈述**: 思考型模型 (OpenAI 兼容 provider 的 `delta.reasoning_content` / `message.reasoning_content`) 的思考增量必须建模为 IR 流事件 (`IrDelta::ReasoningDelta` / `IrBlock::ReasoningContent`) 并流经与 text 完全相同的 redact/restore 路径. 客户端在思考阶段持续收到 reasoning 增量 (非零字节), 且 reasoning 中的 mock 被 restore 为 real.
+
+> **历史 bug** (#176): reader 不解码 `delta.reasoning_content` → redact 流式路径 (IR 重建) 思考期零字节 → 客户端空闲看门狗超时断连 (Chatbox 30s, 生产 499 事故). 非流式路径的 `message.reasoning_content` 与请求侧 assistant 历史回传同因丢失 (违反 FWD-1: redact 路径除 real↔mock 外不得改 wire).
+
+**跨协议处置** (FWD-3 "范围外显式丢弃" 的新条目): ReasoningContent block 跨协议翻译时丢弃 — Anthropic thinking block 需要 signature (secret-guard 无法合法合成, 伪造会被 Anthropic API 拒收), Responses reasoning item 依赖 `encrypted_content` (provider-opaque). 不发明非法 wire 形态.
+
+**Properties**:
+- `prop_streaming_reasoning_restored_like_text`: 任意 chunk 切分下, 客户端 reasoning 拼接 == 上游拼接.replace(mock, real) + 无 mock 泄漏 + 思考期非零字节. ✅
+- `prop_stream_scan_accumulates_reasoning`: StreamScan 把 reasoning delta 累积为 ReasoningContent block (与预期 IrResponse 一致). ✅
+- `prop_stream_reader_reasoning_text_tool_indices_correct`: reasoning / text / tool 三类 block 的 IR index 互不冲突. ✅
+
+**生成器覆盖** (§0.3 第 3 条): reasoning delta (含 mock, 跨 chunk 累积) 已加入 `arb_openai_sse_with_expected` (stream/mod.rs, has_reasoning 分支) 与 `arb_openai_sse_stream_with_mock` (fwd_streaming_property.rs); 非流式 `message.reasoning_content` / 请求侧 assistant 历史回传由 openai.rs 单测覆盖.
+
 ---
 
 ## 4. CDAG: Conversation DAG
@@ -842,3 +857,4 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 | 2026-08-15 | CFG-3 | DELETE 语义收紧: static 基线存在 (含 static+dynamic override) 一律 409, 仅 dynamic-only 可 DELETE (204); 原 property `prop_delete_dynamic_only_succeeds` 改名 `prop_delete_static_baseline_rejected` 并扩展三态断言 | #156: 旧 "删 override 露出 static 返回 204" 语义让用户以为删除成功, provider 仍存活继续转发, "下线止血"场景下是安全事故; 且与 secrets 侧 "首次即 409" 行为不一致. 人工授权 (issue 给出方案 A/B 二选一, 采纳 A) |
 | 2026-08-15 | 全部 | 建立 property 落地状态标注机制 (§0.6): 156 条 property 全量标注 ✅ 同名 53 / 🔁 改名 80 / ⏳ 待补 23, 并新增 `just check-contracts` lint (进 `just check` 阻塞链) 机械守卫 (✅ 须同名测试载体命中 / 🔁 全部锚点须可 grep / 每条必有标注 + 输入侧 fail-closed); ⏳ 项按风险排 P0-P2 补齐优先级 (§0.6) | #144: 走查发现 ~85/156 条 property 名零字面命中且无状态标注, 契约 Properties 列表部分沦为"愿望清单"; 其中改名落地断链占多数, 真零测试 23 条 |
 | 2026-08-16 | UI-7 | 新增 UI-7 sidebar rounds 回填时序 + timeline 并发一致性 (gen): 点击会话头后 "Loading rounds…" 占位符由主动 sync 覆盖 (不依赖 3s tick); `timelineGen` 代数对账消灭跨会话脏 append (矛盾游标守卫 + 迟到 diff 丢弃 + round-id 幂等去重) | 排查 "点击 sidebar 一级菜单后 loading rounds 卡数秒": 后端实测 12ms/0.6ms 非瓶颈, 根因是前端回填依赖轮询 tick; 修复主动 sync 时暴露两类并发交错 (矛盾游标 / 迟到 diff), 一并形式化 |
+| 2026-08-23 | STR-6 | 新增: 流式 reasoning_content 建模与 restore (reader 解码 / writer 写回 / StreamScan 累积 / streaming restore / 三类 block index 互斥); 跨协议处置显式登记为 FWD-3 已知损失 (Anthropic signature / Responses encrypted_content 不可合成) | #176: redact 流式路径思考期零字节, 客户端空闲看门狗超时断连 (生产 499) |

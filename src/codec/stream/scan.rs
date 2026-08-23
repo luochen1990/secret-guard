@@ -23,6 +23,8 @@ struct ScanBlock {
     text: String,
     /// InputJsonDelta 累积 (tool_use only).
     json_input: String,
+    /// ReasoningDelta 累积 (reasoning block only, #176).
+    reasoning: String,
     /// block 元信息 (BlockStart 时记录, 用于 finish 时构造 IrBlock).
     meta: Option<IrBlockMeta>,
 }
@@ -125,6 +127,7 @@ impl StreamScan {
                 match delta {
                     crate::codec::ir::IrDelta::TextDelta(s) => entry.text.push_str(s),
                     crate::codec::ir::IrDelta::InputJsonDelta(s) => entry.json_input.push_str(s),
+                    crate::codec::ir::IrDelta::ReasoningDelta(s) => entry.reasoning.push_str(s),
                 }
             }
             IrStreamEvent::BlockStop { index: _ } => {
@@ -189,8 +192,9 @@ impl StreamScan {
 
 /// 把 ScanBlock (累积状态) 折叠为最终 IrBlock.
 /// - meta=ToolUse → ToolUse block (input JSON parse, 失败则用空 object)
+/// - meta=ReasoningContent → ReasoningContent block (思考原文, 空内容不产出)
 /// - meta=Text 或缺失 (上游漏发 BlockStart) → Text block
-/// - 空内容 (text+json_input 均空) → None (不产出空气泡)
+/// - 空内容 (text+json_input+reasoning 均空) → None (不产出空气泡)
 fn fold_scan_block(b: &ScanBlock) -> Option<crate::codec::IrBlock> {
     match &b.meta {
         Some(IrBlockMeta::ToolUse { id, name }) => {
@@ -200,6 +204,15 @@ fn fold_scan_block(b: &ScanBlock) -> Option<crate::codec::IrBlock> {
                 name: name.clone(),
                 input,
             })
+        }
+        Some(IrBlockMeta::ReasoningContent) => {
+            if b.reasoning.is_empty() {
+                None
+            } else {
+                Some(crate::codec::IrBlock::ReasoningContent {
+                    text: b.reasoning.clone(),
+                })
+            }
         }
         // Text block 或 meta 缺失 (上游漏发 BlockStart, 退化为 Text).
         Some(IrBlockMeta::Text) | None => {

@@ -73,6 +73,7 @@ impl IrRequest {
         self.tools_present = false;
         for m in &mut self.messages {
             m.content_form = None;
+            m.reasoning_content_form = None;
             for b in &mut m.content {
                 if let IrBlock::ToolResult { content_form, .. } = b {
                     *content_form = None;
@@ -96,6 +97,11 @@ pub struct IrMessage {
     /// 仅同协议 round-trip 时填充, 用于 wire 形态保真 (L1).
     /// 跨协议翻译前由 caller 清空.
     pub content_form: Option<ContentForm>,
+    /// wire 形态元数据: assistant 消息的 `reasoning_content` 字段是否显式存在
+    /// (空串 / null 两种 "无信息量但显式存在" 的形态). #176 FWD-1 保真:
+    /// 区分 `"reasoning_content": ""` / `null` 与字段缺席, writer 据此写回.
+    /// 非 assistant 消息恒 None; 跨协议翻译前清空.
+    pub reasoning_content_form: Option<ReasoningContentForm>,
     /// 这条消息是否代表用户的**主动文本输入** (而非工具结果的隐式 user 角色).
     ///
     /// 背景: IR 把 OpenAI `role:"tool"` 和 Anthropic `role:"user"+tool_result` 都归一化
@@ -131,6 +137,41 @@ pub enum ContentForm {
     Array,
     /// null: `"content": null (assistant 调用工具时)
     Null,
+}
+
+/// wire 中 assistant 消息 `reasoning_content` 字段的形态 (L1 保真, #176).
+///
+/// - `Some(Empty)`: wire 显式 `"reasoning_content": ""` (reader 视为无信息量不建
+///   ReasoningContent block, 但 writer 必须写回空串 — 区分 "显式空" 与 "缺席")
+/// - `Some(Null)`: wire 显式 `"reasoning_content": null`
+/// - `None`: 字段缺席 (或跨协议路径, clear_wire_fidelity 后)
+///
+/// 非 string / 非 null 的异常形态归 `None` (writer 按缺席输出, ROB-1 降级).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningContentForm {
+    Empty,
+    Null,
+}
+
+impl ReasoningContentForm {
+    /// 从 wire 字段值推断形态 (与 [`ContentForm::classify`] / [`StopForm::classify`]
+    /// 同签名). 仅识别 "显式存在但无信息量" 的两形态: 空串 / null;
+    /// 非空 string (正常路径, 由 block 承载) / 缺失 / 异常类型 → None.
+    pub fn classify(value: Option<&Value>) -> Option<Self> {
+        match value {
+            Some(Value::String(s)) if s.is_empty() => Some(Self::Empty),
+            Some(Value::Null) => Some(Self::Null),
+            _ => None,
+        }
+    }
+
+    /// 形态 → wire 值 (与 `classify` 读写字面对称).
+    pub fn to_value(self) -> Value {
+        match self {
+            Self::Empty => Value::String(String::new()),
+            Self::Null => Value::Null,
+        }
+    }
 }
 
 impl ContentForm {
@@ -212,6 +253,17 @@ pub enum IrBlock {
     /// (同协议 round-trip 也会丢失); 这会破坏依赖 reasoning chain 的链式调用
     /// (如 `previous_response_id` + reasoning context compression). 这是已知限制.
     Reasoning { summary: Vec<String> },
+    /// 思考原文块 (OpenAI Chat 兼容 provider 的 `reasoning_content` 字段,
+    /// 思考型模型如 glm / deepseek-r1 的思考阶段原文).
+    ///
+    /// 与 [`IrBlock::Reasoning`] 的区别: 后者是 Responses API 的**摘要列表**
+    /// (`summary_text[]`), 本块是思考**原文连续文本** (非流式 message 字段 /
+    /// 流式 ReasoningDelta 累积). 两者语义不同, 不合并 (#176).
+    ///
+    /// Redact 覆盖: `text` 是 IR 字符串叶子 (secret 可能泄漏进思考流).
+    /// 跨协议: Anthropic writer 跳过 (thinking block 需要 signature, 无法合法
+    /// 合成); Responses writer 跳过 (reasoning item 依赖 encrypted_content).
+    ReasoningContent { text: String },
 }
 
 /// 图片来源 (跨协议中立的图片表达).
@@ -389,7 +441,16 @@ pub enum IrStreamEvent {
 #[derive(Debug, Clone, PartialEq)]
 pub enum IrBlockMeta {
     Text,
-    ToolUse { id: String, name: String },
+    ToolUse {
+        id: String,
+        name: String,
+    },
+    /// 思考原文块 (流式对应物: [`IrDelta::ReasoningDelta`]). #176.
+    ///
+    /// 命名配对规律: meta 名 == 折叠 block 名 (Text↔Text / ToolUse↔ToolUse /
+    /// 本变体 ↔ [`IrBlock::ReasoningContent`]). 注意 **不是** [`IrBlock::Reasoning`]
+    /// (后者是 Responses API 摘要列表语义, 无流式对应物).
+    ReasoningContent,
 }
 
 /// 内容块增量 (BlockDelta 携带).
@@ -399,6 +460,8 @@ pub enum IrDelta {
     TextDelta(String),
     /// 工具调用参数的 JSON 片段 (流式 partial JSON).
     InputJsonDelta(String),
+    /// 思考原文增量 (OpenAI 兼容流式 `delta.reasoning_content`). #176.
+    ReasoningDelta(String),
 }
 
 /// reader 端的流式解码状态. 用于 OpenAI flat stream 的 block 边界合成.
@@ -413,6 +476,11 @@ pub struct StreamDecodeState {
     /// 文本块在 IR 中的 index (OpenAI 流里 text 与 tool_call 的相对顺序不固定,
     /// 由首次出现位置决定 index).
     pub text_index: Option<usize>,
+    /// 思考块是否已开 (openai `delta.reasoning_content`, #176).
+    /// 与 text_block_open 对称: flat stream 需要合成 `BlockStart{ReasoningContent}`.
+    pub reasoning_block_open: bool,
+    /// 思考块在 IR 中的 index.
+    pub reasoning_index: Option<usize>,
     /// 已开启的 OpenAI tool_call 索引集合 (OpenAI `tool_calls[].index`).
     pub open_tools: std::collections::BTreeSet<usize>,
     /// 每个 OpenAI tool_call index 在 IR 中对应的 block index.

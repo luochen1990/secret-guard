@@ -1053,15 +1053,49 @@ mod tests {
             "[a-z0-9]{2,8}",             // partial JSON 字段值
             any::<bool>(),               // 是否有 include_usage chunk
             any::<bool>(),               // 是否在 finish 后追加噪声 chunk
+            "[a-z ]{2,12}",              // reasoning segment 1 (#176)
+            "[a-z ]{2,12}",              // reasoning segment 2 (跨 chunk 累积, #176)
+            any::<bool>(),               // 是否有思考阶段 chunk (#176)
         )
             .prop_map(
-                |(t1, t2, tool_name, tc_id, field, value, has_usage, has_noise)| {
+                |(
+                    t1,
+                    t2,
+                    tool_name,
+                    tc_id,
+                    field,
+                    value,
+                    has_usage,
+                    has_noise,
+                    r1,
+                    r2,
+                    has_reasoning,
+                )| {
                     let id = "chatcmpl-test".to_string();
                     let created: u64 = 1700000000;
                     let model = "gpt-4o".to_string();
                     let full_text = format!("{t1} {t2}");
 
                     let mut frames: Vec<String> = Vec::new();
+                    // 预期 blocks (首个元素按 has_reasoning 条件插入 ReasoningContent).
+                    let mut expected_blocks = Vec::new();
+
+                    // 帧 0 (可选, #176): 思考阶段. reasoning delta 两段 (跨 chunk 累积),
+                    // 在 text 之前 — 思考型模型的流形态 (reasoning chunks → content chunks).
+                    // has_reasoning=true 时 reasoning 拿 IR index 1, text 顺延为 2, tool 3.
+                    if has_reasoning {
+                        frames.push(oai_chunk(&json!({
+                            "id":id,"object":"chat.completion.chunk","created":created,"model":model,
+                            "choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":r1},"finish_reason":Value::Null}]
+                        })));
+                        frames.push(oai_chunk(&json!({
+                            "id":id,"object":"chat.completion.chunk","created":created,"model":model,
+                            "choices":[{"index":0,"delta":{"reasoning_content":format!(" {r2}")},"finish_reason":Value::Null}]
+                        })));
+                        expected_blocks.push(IrBlock::ReasoningContent {
+                            text: format!("{r1} {r2}"),
+                        });
+                    }
 
                     // 帧 1: 首个 text delta (fan-out: MessageStart + BlockStart{Text} + BlockDelta).
                     frames.push(oai_chunk(&json!({
@@ -1073,9 +1107,11 @@ mod tests {
                         "id":id,"object":"chat.completion.chunk","created":created,"model":model,
                         "choices":[{"index":0,"delta":{"content":format!(" {t2}")},"finish_reason":Value::Null}]
                     })));
+                    expected_blocks.push(IrBlock::Text { text: full_text });
                     // 帧 3: tool_call 开始 (index=0, id+name, BlockStart{ToolUse}).
                     // 用 oai tool_calls[].index=0 (与 text 的 IR index 不同: text index 由
-                    // next_free_block_index 分配, 这里 text 先到 → text=1, tool=2).
+                    // next_free_block_index 分配, 无思考阶段时 text=1 tool=2; 有思考阶段
+                    // reasoning=1, text=2, tool=3).
                     frames.push(oai_chunk(&json!({
                         "id":id,"object":"chat.completion.chunk","created":created,"model":model,
                         "choices":[{"index":0,"delta":{
@@ -1132,15 +1168,13 @@ mod tests {
                     // 构造预期 IrResponse (确定性, 与 SSE 语义等价).
                     let tool_input: Value = serde_json::from_str(&partial)
                         .unwrap_or_else(|_| json!({}));
+                    expected_blocks.push(IrBlock::ToolUse {
+                        id: tc_id,
+                        name: tool_name,
+                        input: tool_input,
+                    });
                     let expected = crate::codec::IrResponse {
-                        content: vec![
-                            IrBlock::Text { text: full_text },
-                            IrBlock::ToolUse {
-                                id: tc_id,
-                                name: tool_name,
-                                input: tool_input,
-                            },
-                        ],
+                        content: expected_blocks,
                         stop_reason: Some(IrStopReason::ToolUse),
                         stop_sequence: None,
                         usage: IrUsage {
@@ -1191,7 +1225,8 @@ mod tests {
 
         /// STR-2 `prop_stream_scan_accumulates_text`:
         /// text token 跨多 chunk 累积正确 (snapshot 的 Text block == 全部 text delta 拼接).
-        /// 由 arb_openai_sse_with_expected 的两段 text 覆盖; 这里单独断言 Text block.
+        /// 按 variant 查找 Text block (has_reasoning=true 时首块是 ReasoningContent,
+        /// 位置索引会空转).
         #[test]
         fn prop_stream_scan_accumulates_text(
             case in arb_openai_sse_with_expected()
@@ -1200,21 +1235,23 @@ mod tests {
             let mut scan = StreamScan::new(Protocol::OpenAI);
             scan.feed(&sse);
             let got = scan.snapshot();
-            // 第一个 block 是 Text, 内容 == 预期 Text block (两段拼接).
-            let got_text = got.content.first().and_then(|b| match b {
-                crate::codec::IrBlock::Text { text } => Some(text.clone()),
-                _ => None,
-            });
-            let want_text = expected.content.first().and_then(|b| match b {
-                crate::codec::IrBlock::Text { text } => Some(text.clone()),
-                _ => None,
-            });
-            prop_assert_eq!(got_text, want_text, "STR-2 text accumulation 违反");
+            let find_text = |blocks: &[crate::codec::IrBlock]| {
+                blocks.iter().find_map(|b| match b {
+                    crate::codec::IrBlock::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+            };
+            prop_assert_eq!(
+                find_text(&got.content),
+                find_text(&expected.content),
+                "STR-2 text accumulation 违反"
+            );
         }
 
         /// STR-2 `prop_stream_scan_accumulates_tool_use`:
         /// tool_use input JSON 部分片段跨 chunk 累积正确 (snapshot 的 ToolUse block.input
         /// == 全部 InputJsonDelta 拼接后 parse 的 JSON).
+        /// 按 variant 查找 ToolUse block (has_reasoning=true 时 index 1 是 Text 而非 ToolUse).
         #[test]
         fn prop_stream_scan_accumulates_tool_use(
             case in arb_openai_sse_with_expected()
@@ -1223,20 +1260,19 @@ mod tests {
             let mut scan = StreamScan::new(Protocol::OpenAI);
             scan.feed(&sse);
             let got = scan.snapshot();
-            // 第二个 block 是 ToolUse.
-            let got_tu = got.content.get(1).and_then(|b| match b {
-                crate::codec::IrBlock::ToolUse { id, name, input } => {
-                    Some((id.clone(), name.clone(), input.clone()))
-                }
-                _ => None,
-            });
-            let want_tu = expected.content.get(1).and_then(|b| match b {
-                crate::codec::IrBlock::ToolUse { id, name, input } => {
-                    Some((id.clone(), name.clone(), input.clone()))
-                }
-                _ => None,
-            });
-            prop_assert_eq!(got_tu, want_tu, "STR-2 tool_use accumulation 违反");
+            let find_tool = |blocks: &[crate::codec::IrBlock]| {
+                blocks.iter().find_map(|b| match b {
+                    crate::codec::IrBlock::ToolUse { id, name, input } => {
+                        Some((id.clone(), name.clone(), input.clone()))
+                    }
+                    _ => None,
+                })
+            };
+            prop_assert_eq!(
+                find_tool(&got.content),
+                find_tool(&expected.content),
+                "STR-2 tool_use accumulation 违反"
+            );
         }
 
         /// STR-2 `prop_stream_scan_include_usage_chunk`:
@@ -1274,6 +1310,32 @@ mod tests {
             prop_assert_eq!(
                 &got, &expected,
                 "STR-2 post-stop noise (空帧) 被错误累积进 snapshot"
+            );
+        }
+
+        /// STR-6 `prop_stream_scan_accumulates_reasoning` (#176):
+        /// 思考阶段 reasoning_content delta 跨 chunk 累积为 ReasoningContent block.
+        /// has_reasoning=true 时 snapshot 首个 block 必须是 ReasoningContent 且内容
+        /// == 两段 delta 拼接; has_reasoning=false 时不得凭空出现.
+        #[test]
+        fn prop_stream_scan_accumulates_reasoning(
+            case in arb_openai_sse_with_expected()
+        ) {
+            let (sse, expected) = case;
+            let mut scan = StreamScan::new(Protocol::OpenAI);
+            scan.feed(&sse);
+            let got = scan.snapshot();
+            let got_first = got.content.first().and_then(|b| match b {
+                crate::codec::IrBlock::ReasoningContent { text } => Some(text.clone()),
+                _ => None,
+            });
+            let want_first = expected.content.first().and_then(|b| match b {
+                crate::codec::IrBlock::ReasoningContent { text } => Some(text.clone()),
+                _ => None,
+            });
+            prop_assert_eq!(
+                got_first, want_first,
+                "STR-6 reasoning accumulation 违反 (首个 block 应为 ReasoningContent)"
             );
         }
     }
@@ -1427,6 +1489,58 @@ mod tests {
                 unique.len(), n,
                 "STR-5 混合: N 个 tool_call IR index 互不相同, 实际 {:?}",
                 tool_ir_idxs,
+            );
+        }
+
+        /// STR-6 `prop_stream_reader_reasoning_text_tool_indices_correct` (#176):
+        /// 思考 + 文本 + 多 tool_call 混合流的 IR block index 三类互不冲突.
+        ///
+        /// 构造: reasoning delta (先到) → text delta → N 个 tool_call. 断言三类
+        /// block index 两两不同 (next_free_block_index 的三状态覆盖).
+        #[test]
+        fn prop_stream_reader_reasoning_text_tool_indices_correct(
+            reasoning in "[a-z]{1,10}",
+            text in "[a-z]{1,10}",
+            n in 2usize..=4,
+        ) {
+            use crate::codec::Reader;
+            use crate::codec::ir::StreamDecodeState;
+            let reader = OpenAiReader;
+            let mut state = StreamDecodeState::default();
+
+            let base = json!({
+                "id":"chatcmpl-rmix","object":"chat.completion.chunk","created":1700000000,
+                "model":"gpt-4o",
+                "choices":[{"index":0,"delta":{},"finish_reason":Value::Null}]
+            });
+            let mut with_reasoning = base.clone();
+            with_reasoning["choices"][0]["delta"]["reasoning_content"] = json!(reasoning);
+            let _ = reader.read_response_events("", &with_reasoning, &mut state);
+
+            let mut with_text = base.clone();
+            with_text["choices"][0]["delta"]["content"] = json!(text);
+            let _ = reader.read_response_events("", &with_text, &mut state);
+
+            let ids: Vec<String> = (0..n).map(|i| format!("call_rmix_{i}")).collect();
+            let names: Vec<String> = (0..n).map(|i| format!("rmix_tool_{i}")).collect();
+            let tool_chunk = openai_multi_tool_call_start_chunk(n, &ids, &names);
+            let tool_events = reader.read_response_events("", &tool_chunk, &mut state);
+
+            let r_idx = state.reasoning_index.expect("reasoning index allocated");
+            let t_idx = state.text_index.expect("text index allocated");
+            let tool_idxs: Vec<usize> =
+                collect_tool_use_block_indices(&tool_events).into_iter().map(|(i, _)| i).collect();
+
+            let mut all = vec![r_idx, t_idx];
+            all.extend(tool_idxs.iter().copied());
+            let unique: std::collections::BTreeSet<usize> = all.iter().copied().collect();
+            prop_assert_eq!(
+                unique.len(),
+                all.len(),
+                "STR-6: reasoning/text/tool block index 冲突, 实际 r={:?} t={:?} tools={:?}",
+                r_idx,
+                t_idx,
+                tool_idxs,
             );
         }
     }

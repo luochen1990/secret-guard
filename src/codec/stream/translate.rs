@@ -69,7 +69,7 @@ pub trait StreamRestoreHook: Send {
     fn restore_inline(&mut self, s: &mut String);
 }
 
-/// block delta 的类型标识 (Text / InputJson), flush 时恢复正确的 IrDelta variant.
+/// block delta 的类型标识 (Text / InputJson / Reasoning), flush 时恢复正确的 IrDelta variant.
 ///
 /// 历史上定义在 `redact::DeltaKind` 并由 codec 消费; 接口倒置后归属 codec 侧
 /// (hook 契约的一部分, 因 [`StreamRestoreHook::flush_delta`] 需要它包装返回值),
@@ -78,6 +78,9 @@ pub trait StreamRestoreHook: Send {
 pub enum DeltaKind {
     Text,
     InputJson,
+    /// 思考原文增量 (`delta.reasoning_content`, #176). 与 Text 同样是纯文本流,
+    /// secret 可能泄漏进思考输出, 必须走同一 restore 滑窗路径.
+    Reasoning,
 }
 
 impl DeltaKind {
@@ -85,6 +88,7 @@ impl DeltaKind {
         match self {
             DeltaKind::Text => IrDelta::TextDelta(s),
             DeltaKind::InputJson => IrDelta::InputJsonDelta(s),
+            DeltaKind::Reasoning => IrDelta::ReasoningDelta(s),
         }
     }
 }
@@ -280,7 +284,8 @@ impl StreamTranslate {
 
             // BlockDelta 经 restorer.push 后内容可能为空 (全部 hold 在 buffer), 跳过 emit.
             if let IrStreamEvent::BlockDelta {
-                delta: IrDelta::TextDelta(s) | IrDelta::InputJsonDelta(s),
+                delta:
+                    IrDelta::TextDelta(s) | IrDelta::InputJsonDelta(s) | IrDelta::ReasoningDelta(s),
                 ..
             } = &ev
                 && s.is_empty()
@@ -345,6 +350,7 @@ fn restore_event_inplace(hook: &mut dyn StreamRestoreHook, ev: &mut IrStreamEven
             let (kind, s) = match delta {
                 IrDelta::TextDelta(s) => (DeltaKind::Text, s),
                 IrDelta::InputJsonDelta(s) => (DeltaKind::InputJson, s),
+                IrDelta::ReasoningDelta(s) => (DeltaKind::Reasoning, s),
             };
             *s = hook.restore_delta(*index, kind, std::mem::take(s));
         }

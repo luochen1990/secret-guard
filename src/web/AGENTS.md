@@ -177,6 +177,10 @@ timeline 每轮 header 含两个按钮:
 渲染在**同一个气泡**内, tool_call/tool_use 段用 `.bubble-tool-call` 子区域做视觉区分
 (边框 + 缩进 + monospace). 不拆分为多个独立气泡.
 
+思考原文 (`reasoning_content`, #176) 也渲染为 assistant 气泡内的 `.bubble-tool-call`
+子区域 (位于 text 段之前), 复用同款视觉区分 — 数据已到前端 JSON
+(request 历史 assistant 消息 + parsed response 的 message), 不渲染会静默不可见.
+
 ### Response 抽屉 (overlay 架构)
 
 Response 是独立的 `.response-drawer`, **悬浮**在 `#detail` 之上 (position:absolute overlay),

@@ -3269,11 +3269,16 @@
       return text !== null ? renderBubble(role, text, redactions, role) : '';
     }
 
-    // 构建 assistant 气泡的内部 HTML: text 段 + 每个 tool_call/tool_use 子区域.
-    // 一条 assistant message 可能同时含 content 文本和 tool_calls (OpenAI) 或
-    // content 数组中的 tool_use block (Anthropic). 合并在同一气泡内.
+    // 构建 assistant 气泡的内部 HTML: reasoning 段 + text 段 + 每个 tool_call/tool_use 子区域.
+    // 一条 assistant message 可能同时含 reasoning_content (思考原文, #176)、content 文本
+    // 和 tool_calls (OpenAI) 或 content 数组中的 tool_use block (Anthropic).
+    // 合并在同一气泡内; reasoning 用 .bubble-tool-call 子区域 (灰底区分, 与 tool 段同款).
     function assistantBubbleHtml(msg, redactions) {
       const segments = [];
+      const reasoning = msg.reasoning_content;
+      if (typeof reasoning === 'string' && reasoning !== '') {
+        segments.push(`<div class="bubble-tool-call" title="reasoning_content (思考原文)">${applyMockHighlight(escapeHtml(reasoning), redactions)}</div>`);
+      }
       const text = messageToText(msg);
       if (text !== null) {
         segments.push(applyMockHighlight(escapeHtml(text), redactions));

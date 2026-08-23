@@ -334,6 +334,11 @@ impl Writer for ResponsesWriter {
                         "summary": summary_items,
                     }));
                 }
+                IrBlock::ReasoningContent { .. } => {
+                    // Responses reasoning item 依赖 encrypted_content (provider-opaque),
+                    // 无法从思考原文合法合成 — 跳过不产出 (lossy-by-target, FWD-3 已知
+                    // 损失, 见 codec/AGENTS.md; 与 Reasoning{summary} 的降级同族).
+                }
                 IrBlock::ToolResult { .. } | IrBlock::Image { .. } => {
                     // 响应里通常不出现, 跳过.
                 }
@@ -815,6 +820,9 @@ fn write_input_items(msg: &IrMessage) -> Vec<Value> {
                     IrBlock::ToolUse { .. } | IrBlock::Reasoning { .. } => {
                         // user 消息里通常不出现, 跳过.
                     }
+                    IrBlock::ReasoningContent { .. } => {
+                        // user 消息里通常不出现 (思考原文属 assistant), 跳过.
+                    }
                 }
             }
             if !content_parts.is_empty() {
@@ -864,6 +872,10 @@ fn write_input_items(msg: &IrMessage) -> Vec<Value> {
                             .map(|s| json!({"type": "summary_text", "text": s}))
                             .collect();
                         items.push(json!({"type": "reasoning", "summary": summary_items}));
+                    }
+                    IrBlock::ReasoningContent { .. } => {
+                        // 跳过: Responses reasoning item 依赖 encrypted_content, 无法从
+                        // 思考原文合法合成 (见 write_response 同款分支).
                     }
                     IrBlock::ToolResult { .. } | IrBlock::Image { .. } => {
                         // assistant 消息里通常不出现, 跳过.

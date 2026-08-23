@@ -223,6 +223,13 @@ fn arb_openai_user_message() -> impl Strategy<Value = Value> {
 }
 
 fn arb_openai_assistant_message() -> impl Strategy<Value = Value> {
+    // reasoning_content 形态 (思考型模型的历史回传, #176): 非空 string / 空串 / null.
+    // 空串与 null 覆盖 FWD-1 边界: reader 丢弃后 writer 是否恢复 wire 形态.
+    let arb_reasoning_opt = prop::option::of(prop_oneof![
+        "[a-z ]{1,25}".prop_map(|s| json!(s)),
+        Just(json!("")),
+        Just(Value::Null),
+    ]);
     prop_oneof![
         // 纯文本 assistant (string 形态)
         "[a-z ]{1,30}".prop_map(|s| json!({"role":"assistant","content":s})),
@@ -247,6 +254,17 @@ fn arb_openai_assistant_message() -> impl Strategy<Value = Value> {
                 let arr: Vec<Value> = parts.into_iter().map(Value::String).collect();
                 json!({"role":"assistant","content":arr,"tool_calls":tcs})
             }),
+        // #176: assistant + 思考原文回传 (非空 / 空串 / null 三形态; null 内层 =
+        // 显式 `"reasoning_content": null`, 外层 None = 字段缺席).
+        ("[a-z ]{1,20}", arb_reasoning_opt).prop_map(|(text, rc)| {
+            let mut msg = serde_json::Map::new();
+            msg.insert("role".to_string(), json!("assistant"));
+            msg.insert("content".to_string(), json!(text));
+            if let Some(rc) = rc {
+                msg.insert("reasoning_content".to_string(), rc);
+            }
+            Value::Object(msg)
+        }),
     ]
 }
 
