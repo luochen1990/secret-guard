@@ -234,7 +234,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 ### FWD-5 路由分发契约
 
-**陈述**: URL = `/{proto_short}/{provider_id}/*path`. 未知 protocol / 未知 provider / 禁用 provider / 不支持的协议组合 必须返回明确错误码.
+**陈述**: URL = `/{proto_short}/{provider_id}/*path`. 未知 protocol / 未知 provider / 禁用 provider / 不支持的协议组合 必须返回明确错误码. provider 可能是**虚拟的** (`route_to` 指向另一 provider id, #179): dispatch 先跟随 route_to 链解析到链尾实体 provider, ingress 协议由 URL 决定, egress 协议由链尾实体决定 (不同则走跨协议翻译).
 
 **Properties**:
 - `prop_unknown_protocol_returns_404`: 未知 proto_short → 404 not_found. 🔁→`unknown_protocol_returns_404` (`tests/integration.rs`)
@@ -243,6 +243,11 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 - `prop_cross_proto_streaming_returns_501`: 跨协议 + stream=true → 501 (翻译未接入). 🔁→`cross_protocol_streaming_returns_501` (`tests/integration.rs`)
 - `prop_unsupported_codec_returns_501`: Gemini/Ollama 跨协议 → 501 (codec 未覆盖). 🔁→`cross_protocol_unknown_pair_returns_501` (`tests/integration.rs`)
 - `prop_internal_url_404_no_forward`: `/api/*` 未匹配子路径 → 404, 绝不进入 forward (防止内部 URL 泄漏到上游; 同 SEC-6 的 property 名). 🔁→`web_namespace_not_forwarded_to_upstream` + `unmatched_path_returns_404` (`tests/integration.rs`)
+- `prop_route_resolution_per_request` (#179): 虚拟 provider 的路由解析是 per-request 的 — 切换指向只影响新请求, in-flight 请求按已解析目标完成; 每轮 record 的 upstream_id 如实记录该轮实际归属, 历史轮次不随切换改写. 🔁→`virtual_provider_switches_target_mid_session` (`tests/integration.rs`)
+- `prop_route_broken_returns_503` (#179): 链上目标缺失 / entry-level disabled / 成环 → 503, message 只含 provider id 与 reason 枚举 (SEC-2 同型, 无 secret). 🔁→`virtual_provider_dangling_returns_503` + `virtual_provider_disabled_target_returns_503` (`tests/integration.rs`) + `resolve_route_missing_target` / `resolve_route_disabled_target` / `resolve_route_detects_cycles` (`src/provider.rs`)
+- `prop_route_cycle_termination` (#179): 任意 route 图 (含环 / 悬空 / 自环), `resolve_route` 有限步返回 (Ok ⇒ 链尾必为实体 provider, route_to=None). 🔁→`prop_resolve_route_terminates_on_random_graphs` (`src/provider.rs`, proptest; 生成器覆盖环与悬空)
+- `prop_route_cycle_rejected_at_upsert` (#179): upsert 形成环 (含自环) → 400 validation; 悬空目标放行 (创建顺序无关, 运行时 503 兜底). 🔁→`virtual_provider_cycle_upsert_rejected` (`tests/integration.rs`) + `would_cycle_rejects_indirect_cycle` / `would_cycle_updates_entry_in_place` / `validate_virtual_provider_semantics` (`src/provider.rs`)
+- `prop_upstream_id_observable` (#179): 每轮 record 携带 upstream_id = route_to 解析后的链尾实体 provider id (非虚拟请求 = URL provider id), 经 NodeView / TimelineRound / ForwardRecord 暴露给 WebUI. 🔁→`virtual_provider_switches_target_mid_session` (`tests/integration.rs`, latest_upstream_id 断言)
 
 ### FWD-6 Provider 鉴权注入
 

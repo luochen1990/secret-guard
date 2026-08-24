@@ -76,6 +76,7 @@ fn openai_provider(id: &str, base_url: &str) -> Provider {
         api_key_file: None,
         enabled: true,
         name: Some(id.into()),
+        route_to: None,
     }
 }
 
@@ -88,6 +89,7 @@ fn provider_with(id: &str, proto: Protocol, base_url: &str) -> Provider {
         api_key_file: None,
         enabled: true,
         name: Some(id.into()),
+        route_to: None,
     }
 }
 
@@ -96,6 +98,15 @@ fn keyed_provider(id: &str, base_url: &str, api_key: &str) -> Provider {
     let mut p = openai_provider(id, base_url);
     p.api_key = api_key.into();
     p
+}
+
+/// #179: 虚拟 provider (route_to = target). base_url 留空 (虚拟语义下被忽略).
+fn virtual_provider(id: &str, target: &str) -> Provider {
+    Provider {
+        route_to: Some(target.into()),
+        base_url: String::new(),
+        ..openai_provider(id, "https://ignored.invalid")
+    }
 }
 #[allow(clippy::too_many_arguments)]
 async fn spawn_proxy_full(
@@ -366,6 +377,7 @@ fn dag_list_forward_records(dag: &ConversationDag) -> Vec<ForwardRecord> {
                 created_at: view.created_at,
                 method: view.method,
                 path: view.path,
+                upstream_id: view.upstream_id.to_string(),
                 req_headers: detail.req_headers,
                 req_body: detail.req_body_raw,
                 resp_status: view.resp_status,
@@ -596,6 +608,7 @@ async fn provider_api_key_file_reads_secret_from_path() {
         api_key_file: Some(key_file.clone()),
         enabled: true,
         name: None,
+        route_to: None,
     };
     let proxy_url = spawn_proxy_with_provider(provider).await;
 
@@ -633,6 +646,7 @@ async fn provider_api_key_file_missing_falls_through_to_no_auth() {
         api_key_file: Some(std::path::PathBuf::from("/nonexistent/secret-guard-test")),
         enabled: true,
         name: None,
+        route_to: None,
     };
     let proxy_url = spawn_proxy_with_provider(provider).await;
 
@@ -667,6 +681,7 @@ async fn anthropic_provider_uses_x_api_key() {
         api_key_file: None,
         enabled: true,
         name: None,
+        route_to: None,
     };
     let proxy_url = spawn_proxy_with_provider(provider).await;
     let (status, _, _) =
@@ -5583,5 +5598,245 @@ async fn protocol_mismatch_silent_empty_response_warns() {
     assert!(
         log_text.contains("record_id"),
         "#162: WARN lacks record_id for locating; log: {log_text}"
+    );
+}
+
+// ─── 虚拟 provider 路由 (#179, FWD-5) ───────────────────────────────────────
+//
+// 契约: per-request 解析 (切换只影响新请求) / 坏路由 503 / 环 upsert 拒绝 /
+// upstream_id 可观测 / 跨协议虚拟切换.
+
+/// OpenAI chat completion mock (区分度 body: `{"upstream":"<tag>"}` 注入 content).
+fn openai_chat_mock(server: &mut mockito::ServerGuard, tag: &str) -> mockito::Mock {
+    server
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(format!(
+            r#"{{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"gpt-4o","choices":[{{"index":0,"message":{{"role":"assistant","content":"from {tag}"}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}}}"#
+        ))
+}
+
+const CHAT_REQ_BODY: &str = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"}]}"#;
+
+/// 读 DAG 最新 node 的 upstream_id (CallEvent 权威字段, #179).
+fn latest_upstream_id(dag: &ConversationDag) -> String {
+    let id = dag
+        .list_node_ids_newest_first()
+        .first()
+        .copied()
+        .expect("at least one node pushed");
+    dag.get_node(id)
+        .expect("node exists")
+        .upstream_id
+        .to_string()
+}
+
+#[tokio::test]
+async fn virtual_provider_switches_target_mid_session() {
+    // FWD-5 per-request 解析: 同一虚拟 endpoint, PUT 切换指向后新请求走新目标;
+    // 响应体区分两个上游; DAG 每轮 upstream_id 如实记录各自的实际归属.
+    let mut upstream1 = spawn_mock_upstream().await;
+    let mut upstream2 = spawn_mock_upstream().await;
+    let _m1 = openai_chat_mock(&mut upstream1, "one").create_async().await;
+    let _m2 = openai_chat_mock(&mut upstream2, "two").create_async().await;
+
+    let real1 = openai_provider("real1", &upstream1.url());
+    let real2 = openai_provider("real2", &upstream2.url());
+    let virt = virtual_provider("virt", "real1");
+
+    let dag = ConversationDag::new(64, 500, 1);
+    let dag_probe = dag.clone();
+    let proxy_url = spawn_proxy_static_dynamic(
+        vec![real1, real2, virt],
+        vec![],
+        reqwest::Client::new(),
+        dag,
+        test_secret_table(),
+    )
+    .await
+    .0;
+
+    // 1. 初始指向 real1.
+    let (status, text, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/virt/v1/chat/completions",
+        CHAT_REQ_BODY,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "via real1 must succeed");
+    assert!(text.contains("from one"), "body: {text}");
+    assert_eq!(latest_upstream_id(&dag_probe), "real1");
+
+    // 2. WebUI 即席切换: PUT override virt.route_to = real2.
+    let (status, body, _) = proxy_request(
+        &proxy_url,
+        "PUT",
+        "/api/providers/virt",
+        r#"{"protocol":"openai","route_to":"real2","base_url":"","enabled":true}"#,
+        &[("content-type", "application/json")],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "switch PUT must succeed");
+    // 切换落在 effective 层 (PUT 响应即 effective 视图, 锁住可观测性).
+    let updated: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(updated["route_to"], "real2", "effective view: {body}");
+
+    // 3. 新请求走 real2 (per-request 解析; 历史轮次的 upstream_id 不被改写).
+    let (status, text, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/virt/v1/chat/completions",
+        CHAT_REQ_BODY,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "via real2 must succeed");
+    assert!(text.contains("from two"), "body: {text}");
+    assert_eq!(latest_upstream_id(&dag_probe), "real2");
+}
+
+#[tokio::test]
+async fn virtual_provider_dangling_returns_503() {
+    // FWD-5 坏路由: 目标缺失 → 503, message 指名目标 id (SEC-2 同型: 无 secret).
+    let virt = virtual_provider("virt", "ghost");
+    let proxy_url = spawn_proxy_with_provider(virt).await;
+    let (status, text, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/virt/v1/chat/completions",
+        CHAT_REQ_BODY,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert!(text.contains("ghost"), "message names target: {text}");
+    assert!(text.contains("not found"), "message states reason: {text}");
+}
+
+#[tokio::test]
+async fn virtual_provider_disabled_target_returns_503() {
+    // FWD-5 坏路由: 链上目标 entry-level disabled → 503 (与入口自身 disabled 区分).
+    let mut real = openai_provider("real", "https://upstream.invalid");
+    real.enabled = false;
+    let virt = virtual_provider("virt", "real");
+    let proxy_url = spawn_proxy_static_dynamic(
+        vec![real, virt],
+        vec![],
+        reqwest::Client::new(),
+        ConversationDag::new(64, 500, 1),
+        test_secret_table(),
+    )
+    .await
+    .0;
+    let (status, text, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/virt/v1/chat/completions",
+        CHAT_REQ_BODY,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert!(text.contains("real"), "message names target: {text}");
+    assert!(
+        text.contains("is disabled"),
+        "message states entry-level disabled (区别于 missing 的 'disabled by decision'): {text}"
+    );
+}
+
+#[tokio::test]
+async fn virtual_provider_cycle_upsert_rejected() {
+    // FWD-5 环防护: 静态 a → b 已存在; PUT b.route_to = a (闭环) → 400;
+    // 自环 → 400 (Provider::validate); 悬空目标 → 放行 (运行时 503 兜底).
+    // 纯 CRUD 测试, 无转发 — 目标用字面量 URL (过 validate_base_url 即可).
+    let a = virtual_provider("a", "b");
+    let b = virtual_provider("b", "real1");
+    let real1 = openai_provider("real1", "https://u.invalid");
+    let proxy_url = spawn_proxy_static_dynamic(
+        vec![a, b, real1],
+        vec![],
+        reqwest::Client::new(),
+        ConversationDag::new(64, 500, 1),
+        test_secret_table(),
+    )
+    .await
+    .0;
+
+    // 跨条目环: b → a 闭环 (a → b 已存在).
+    let (status, text, _) = proxy_request(
+        &proxy_url,
+        "PUT",
+        "/api/providers/b",
+        r#"{"protocol":"openai","route_to":"a","base_url":"","enabled":true}"#,
+        &[("content-type", "application/json")],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "body: {text}");
+    assert!(text.contains("cycle"), "reason is cycle: {text}");
+
+    // 自环.
+    let (status, text, _) = proxy_request(
+        &proxy_url,
+        "PUT",
+        "/api/providers/b",
+        r#"{"protocol":"openai","route_to":"b","base_url":"","enabled":true}"#,
+        &[("content-type", "application/json")],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "body: {text}");
+    assert!(text.contains("itself"), "reason is self-loop: {text}");
+
+    // 悬空目标放行 (创建顺序无关).
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "PUT",
+        "/api/providers/b",
+        r#"{"protocol":"openai","route_to":"not-yet-created","base_url":"","enabled":true}"#,
+        &[("content-type", "application/json")],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "dangling route_to allowed");
+}
+
+#[tokio::test]
+async fn virtual_provider_cross_protocol_translates() {
+    // 虚拟 endpoint 指向异协议实体: ingress 由 URL (openai) 决定, egress 由目标
+    // (anthropic) 决定 → 自动落入既有 cross_proto 翻译 (#179 头线能力).
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/messages")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"msg_x","type":"message","role":"assistant","content":[{"type":"text","text":"OK"}],"model":"claude","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}"#,
+        )
+        .create_async()
+        .await;
+    let ant = provider_with("ant-main", Protocol::Anthropic, &upstream.url());
+    let virt = virtual_provider("virt", "ant-main");
+    let proxy_url = spawn_proxy_static_dynamic(
+        vec![ant, virt],
+        vec![],
+        reqwest::Client::new(),
+        ConversationDag::new(64, 500, 1),
+        test_secret_table(),
+    )
+    .await
+    .0;
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/virt/v1/chat/completions",
+        r#"{"model":"gpt-4o","max_tokens":16,"messages":[{"role":"user","content":"Hi"}]}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "cross-proto via virtual must translate"
     );
 }

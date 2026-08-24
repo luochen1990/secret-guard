@@ -193,6 +193,11 @@ pub struct CallEvent {
     /// 请求 body 顶层 model 字段 (OpenAI / Anthropic 共有). push 时一次性提取.
     /// `Arc<str>` 同上 (list 路径免 clone).
     pub model: Option<Arc<str>>,
+    /// 本轮实际承载转发的 provider id (#179): 虚拟 provider (route_to) 经
+    /// `resolve_route` 解析后的**链尾实体 provider** id; 非虚拟请求时即 URL 中的
+    /// provider id. 可观测性字段 — WebUI 用它区分 "客户端连的虚拟 endpoint" 与
+    /// "实际命中的上游" (虚拟指向切换后, 历史轮次仍如实记录各自的实际归属).
+    pub upstream_id: Arc<str>,
     /// 本次请求中实际发生的 redact 结果 (权威投影, 供 WebUI 渲染).
     /// 每个 tuple = `(mock_value, secret_id)`. **永不**包含真实 secret 值.
     /// 在 push 时设置 (redactions 是请求侧属性, 不依赖 response).

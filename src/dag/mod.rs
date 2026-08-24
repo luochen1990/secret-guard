@@ -575,6 +575,7 @@ mod tests {
             round_role: IrRole::User,
             preview: None,
             model: None,
+            upstream_id: Arc::from("test"),
             redactions: Arc::from([]),
         }
     }
@@ -594,6 +595,7 @@ mod tests {
             round_role: IrRole::User,
             preview: preview.map(Arc::<str>::from),
             model: model.map(Arc::<str>::from),
+            upstream_id: Arc::from("test"),
             redactions: Arc::from([]),
         }
     }

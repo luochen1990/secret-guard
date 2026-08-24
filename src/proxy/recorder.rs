@@ -511,6 +511,7 @@ pub(super) fn stream_err_label(e: &std::io::Error) -> &'static str {
 /// `req_text` 是已 redact 的请求 body 快照 (LLM 视角), 将作为 WebUI req_body 权威来源.
 /// `ir = Some(&ir)` (codec 路径): preview/model 从已 parse 的 IR 提取 (零重复 JSON parse).
 /// `ir = None` (passthrough 路径): 从 req_text 字符串提取 (passthrough 不 parse IR 保持 byte-exact).
+/// `upstream_id`: 实际承载转发的 provider id (route_to 解析后的链尾实体, #179).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_call_event(
     parts: &axum::http::request::Parts,
@@ -519,6 +520,7 @@ pub(super) fn build_call_event(
     req_text: &str,
     ir: Option<&crate::codec::ir::IrRequest>,
     ingress_protocol: Option<crate::codec::Protocol>,
+    upstream_id: &str,
     redact_seed: u64,
     secrets_snapshot: Option<&[crate::secrets::SecretEntry]>,
     redactions: Vec<(String, String)>,
@@ -544,6 +546,7 @@ pub(super) fn build_call_event(
         req_body_raw: req_text.to_string(),
         preview: preview.map(std::sync::Arc::<str>::from),
         model: model.map(std::sync::Arc::<str>::from),
+        upstream_id: std::sync::Arc::from(upstream_id),
         // round_role 占位值 (User); DAG push_messages 内部会根据 delta 的 contains_user_text 修正.
         round_role: crate::codec::ir::IrRole::User,
         redactions: std::sync::Arc::from(redactions),

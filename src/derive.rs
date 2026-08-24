@@ -836,6 +836,7 @@ mod tests {
             round_role: IrRole::User,
             preview: None,
             model: None,
+            upstream_id: Arc::from("test"),
             redactions: Arc::from([]),
         };
         // req_delta 用任意 MessageRef 填充到 count 长度 — 内容不重要, 只用 len().

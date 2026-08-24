@@ -23,6 +23,7 @@
 | **Restore** | 把 response body 中的 Mock 还原为 Secret 的反向操作 | 还原、反替换、恢复 | 全局 |
 | **Mock** | Redact 时替代 Secret 的占位值 (per-secret 稳定, 不含真 secret 子串) | 假值、替身、占位符 | 全局 |
 | **Provider** | 一个上游 LLM 服务端点 (id + protocol + base_url + api_key) | 上游、后端、模型、服务商 | 全局 |
+| **Virtual Provider** | `route_to` 指向另一 provider 的虚拟端点 — 自身不转发, 请求解析到链尾实体 provider (per-request, WebUI 即席切换指向, #179) | 虚拟 endpoint、路由 provider、别名 | provider/proxy |
 | **Protocol** | LLM API 的协议族 (OpenAI / Anthropic / Gemini / Ollama / Responses) | 协议、格式 | 全局 |
 | **IR** | 协议无关的中间表示 (IrRequest / IrResponse / IrBlock) | 中间表示 | codec |
 | **RedactionMap** | 一次 Redact 产出的 Secret↔Mock 双向映射表 (per-request, 不持久化) | 映射表、redact map | redact |
@@ -273,6 +274,9 @@ URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标
 - 未知 protocol 简写 → 404 `not_found`
 - 未知 provider id → 404 `not_found`
 - 禁用 provider (`enabled = false`) → 503 `unavailable`
+- 虚拟 provider (`route_to`) 坏路由: 目标缺失 / 目标 disabled / 成环 → 503
+  `unavailable` (message 只含 id + reason 枚举, SEC-2 同型; 解析 per-request,
+  切换只影响新请求 — FWD-5, #179)
 - 跨协议 + `stream=true` → 501 (流式跨协议翻译尚未接入 dispatch)
 - **Responses + Redact + `stream=true`** → 501 (Responses 流式 SSE 事件翻译未实现; 见 "已知限制")
 - Gemini/Ollama 跨协议 → 501 (codec 未覆盖)
@@ -290,7 +294,7 @@ URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标
 | `main.rs` / `cli.rs` / `lib.rs` | 二进制入口 + CLI 参数 schema | 文件头部 `//!` |
 | `auth/` | OIDC 登录 (WebUI) + 本地 API key (SDK 转发) + session | `auth/mod.rs` 头部 `//!` |
 | `config.rs` | 双层配置 schema + `DynamicTable<T>` 泛型 + 持久化 + 静态配置预检审计 (未知 section/字段 → 启动 WARN, #159) | 文件头部 `//!` (覆盖 OverrideMode / CRUD / Effective source / 跨表并发) |
-| `provider.rs` | Provider 实体 + Effective view + api_key 两来源 | 文件头部 `//!` |
+| `provider.rs` | Provider 实体 + Effective view + api_key 两来源 + 虚拟 provider 路由 (`route_to` / `resolve_route` / `would_cycle`, #179) | 文件头部 `//!` |
 | `secrets.rs` | SecretEntry 实体 + Effective view + value 两来源 | 文件头部 `//!` |
 | `mock.rs` | MockStrategy 两维度 (初始值 + 生成策略) + 确定性 seed + `[redact] global_mock_prefix` 注入 | 文件头部 `//!` (C3 根基) |
 | `dag/` (模块目录: mod/pool/types/view/timeline) | ConversationDAG 内容寻址存储 (BlockPool + Node + Merkle) | `src/dag/mod.rs` 头部 `//!` + `docs/design/conversation-dag.md` |
@@ -668,6 +672,17 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
   停用 provider 请用 `PATCH .../decision {"mode":"disabled"}`. WebUI 编辑留空发 null
   (保留语义), 仅 SDK 显式发空串可见. 根治需 schema 演进 (请求字段 Option 化或 sentinel
   值), 属后续工作.
+- **route_to 与 api_key 同型的 #157 继承限制 (#179 已知限制)**: static 声明的虚拟
+  provider 无法经 override 改回实体 provider — override 未记录 route_to (PUT 省略/
+  `""`) 时会被 `inherit_from_static` 继承回 static 的指向. dynamic-only 条目可完整
+  "虚拟 ↔ 实体" 往返 (WebUI 表单选 none). 另: 虚拟 provider 的 `model` 字段原样透传,
+  仅支持 "同 model 名多上游" 切换 (跨模型名切换 = model_override, 见后续工作).
+- **虚拟 provider 跨条目环的启动检查缺失 (#179)**: 自环在 `Provider::validate`
+  (static 加载 fail-fast) 拒绝; 跨条目环只在 WebUI upsert (`would_cycle`) 与运行时
+  (`resolve_route` visited-set, 503) 拦截. 两个漏网来源: ① 手改 state.toml; ② 并发
+  upsert 的 TOCTOU (环检查与落库非同一临界区, 单用户本地工具的可接受假设, 与
+  #157 的 update TOCTOU 声明同型). 漏网环到首个请求才以 503 暴露 (不挂起, 安全但
+  可观测性弱). 启动时对 merged 视图做环检查是可选加固.
 - **auth 模块测试覆盖率 (OIDC 登录流程)**: auth 模块的纯逻辑已覆盖
   (`apikey.rs` 100% / `middleware.rs` ~99% / `session.rs` ~98% / `mod.rs` ~99%), 含
   require_api_key 的 Authorization 剥离断言 (SEC 红线) 与 build_session_layer 的
@@ -686,6 +701,11 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
 
 ## 后续工作 (非 MVP 范围)
 
+- **虚拟 provider 的 model_override (#179 P2)**: 切换 = (target, model) 二元组 — body
+  里的 `model` 字段随指向重写, 支持跨模型名切换. 代价: override 生效时该 provider 的
+  同协议无-secret 路径必须放弃 byte-exact 字节直传, 改走 IR 改写 (前缀缓存失效, 用户
+  主动选择的降级); 需按 contracts.md §0.5 流程做契约裁决后实施. 佐证: Portkey
+  `override_params` / one-api `model_mapping`.
 - **跨协议路径的 mock-not-restored WARN**: cross_proto 响应 parse 失败 fallback
   (reader 拒绝 / 非 JSON) 时, 与同协议路径 (`proxy/fan_out.rs::warn_mock_not_restored`)
   对称地在 redaction map 非空时打 `mock not restored` WARN (#158 只覆盖了

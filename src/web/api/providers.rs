@@ -9,6 +9,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 
+use crate::config::DynamicEntry;
 use crate::config::OverrideMode;
 use crate::provider::{EffectiveProvider, Protocol, Provider};
 use crate::state::{AppState, NO_STORE};
@@ -41,7 +42,9 @@ pub async fn create_provider(
         &state.providers,
         "provider",
         || payload.into_provider(),
-        |_| Ok(()), // provider 无 secret 式的 resolve 钩子 (validate 在 upsert 内).
+        // #179: upsert 后 route_to 链成环 → 400 (自环已由 Provider::validate 拒绝,
+        // 这里覆盖跨条目环; 悬空目标放行 — 创建顺序无关, 运行时 503 兜底).
+        |entry| validate_provider_upsert(&state.providers, entry),
     )?;
     Ok((StatusCode::CREATED, NO_STORE, Json(created)))
 }
@@ -79,12 +82,34 @@ pub async fn update_provider(
                     payload.api_key_file =
                         old.api_key_file.map(|p| p.to_string_lossy().into_owned());
                 }
+                // route_to 同 "保留" 语义 (#179): payload 省略 (None) = 保留旧指向.
+                // 显式清空/切换由 WebUI 发 "" / "target-id" 表达 (见下方字段注释).
+                if payload.route_to.is_none() {
+                    payload.route_to = old.route_to;
+                }
             }
             payload.into_provider()
         },
-        |_| Ok(()),
+        |entry| validate_provider_upsert(&state.providers, entry),
     )?;
     Ok((StatusCode::OK, NO_STORE, Json(ev)))
+}
+
+/// upsert 钩子 (#179): 类型校验收口到语义 SSOT `Provider::validate` (crud 钩子在
+/// id 生成/填充后运行, 正是其正确位置 — into_provider 只做字段变换), 再叠加
+/// web 特有的跨条目环检查. 消息只含 provider id.
+fn validate_provider_upsert(
+    table: &crate::provider::ProviderTable,
+    entry: &Provider,
+) -> Result<(), ApiError> {
+    entry.validate().map_err(ApiError::validation)?;
+    if table.would_cycle(entry) {
+        return Err(ApiError::validation(format!(
+            "provider '{}' route_to would create a cycle",
+            entry.id
+        )));
+    }
+    Ok(())
 }
 
 pub async fn delete_provider(
@@ -120,6 +145,9 @@ pub(crate) struct UpsertProviderRequest {
     pub id: Option<String>,
     pub name: Option<String>,
     pub protocol: Protocol,
+    /// 上游 base URL. 实体 provider 必填 (http(s) + 无末尾 `/`); 虚拟 provider
+    /// (route_to 非空) 忽略, 可省略/为空 (#179).
+    #[serde(default)]
     pub base_url: String,
     /// API key 明文值. 语义因 endpoint 而异:
     /// - POST (create): 省略 (None) 或空串 = 不设置 (适用 Ollama 等本地无 auth 场景).
@@ -139,6 +167,17 @@ pub(crate) struct UpsertProviderRequest {
     /// 时可用, 但通常只在 static config (sops 注入) 用.
     #[serde(default)]
     pub api_key_file: Option<String>,
+    /// 虚拟 endpoint 路由目标 (#179). 三态语义:
+    /// - 省略 (None): 保留旧指向 (PUT) / 不设置 (POST). static 基线下由
+    ///   `inherit_from_static` 回落 static 的 route_to (#157 同型).
+    /// - `""` (空串): 显式清空指向 → 实体 provider. dynamic-only 条目可完整
+    ///   "虚拟 ↔ 实体" 往返; static 虚拟 provider 无法经 override 改回实体
+    ///   (会被继承回落, #157 同型已知限制).
+    /// - `"target-id"`: 指向目标 provider (虚拟 provider).
+    ///
+    /// 成环 (含自环) 在 validate/upsert 钩子拒绝 (400); 悬空目标放行 (运行时 503).
+    #[serde(default)]
+    pub route_to: Option<String>,
     #[serde(default = "crate::provider::default_true")]
     pub enabled: bool,
 }
@@ -151,9 +190,10 @@ impl UpsertProviderRequest {
         {
             return Err(ApiError::validation(e));
         }
-        if let Err(e) = crate::provider::validate_base_url(&self.base_url) {
-            return Err(ApiError::validation(e));
-        }
+        // 结构校验 (base_url / route_to 目标 id / 自环 / api_key 互斥) 收口在
+        // crud 钩子的 `Provider::validate` (见 validate_provider_upsert), 此处只做
+        // 字段变换: 空串 route_to = 显式清空指向 ("虚拟 → 实体").
+        let route_to = self.route_to.filter(|s| !s.is_empty());
         Ok(Provider {
             id: self.id.unwrap_or_default(),
             protocol: self.protocol,
@@ -162,6 +202,7 @@ impl UpsertProviderRequest {
             api_key_file: self.api_key_file.map(std::path::PathBuf::from),
             enabled: self.enabled,
             name: self.name.filter(|s| !s.trim().is_empty()),
+            route_to,
         })
     }
 }

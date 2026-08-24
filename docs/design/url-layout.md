@@ -65,6 +65,10 @@ forward 路由 (`/{proto}/{name}/...`) 首段必须是 proto 简写, 由
 3. **provider id 不会遮蔽内部路由**: provider id 出现在第二段, 不与顶级
    保留字竞争; 用户配置名为 `api` 的 provider id 不受影响 (路径是 `/o/api/...`).
 
+> 虚拟 provider (`route_to`, #179) 与实体 provider 共用同一 id 命名空间与同一
+> `/{proto}/{name}` 路由 — URL 层零新增保留字; dispatch 在 provider 解析后跟随
+> route_to 链 (ingress 仍由 URL proto 决定). 详见 FWD-5 (`docs/design/contracts.md`).
+
 ## `/api/*` 子空间分配
 
 本节只管**空间分配** (哪些资源组存在 + 挂载条件); HTTP 方法 / 参数 / 响应 shape

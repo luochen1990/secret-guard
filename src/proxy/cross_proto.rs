@@ -170,6 +170,7 @@ pub(crate) async fn cross_proto_forward(
         &req_text_for_record,
         Some(&ir),
         Some(ingress_codec),
+        &provider.id,
         redact_seed,
         Some(&secrets_snapshot),
         redactions,

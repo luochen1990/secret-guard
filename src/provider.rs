@@ -30,7 +30,7 @@
 //! 文件内容会被 `trim()` (容忍 sops / `echo | tee` 末尾换行符). 部署示例见 `docs/deployment-nixos.md`.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use parking_lot::Mutex;
@@ -124,6 +124,9 @@ pub struct Provider {
     /// 协议: 决定上游的 egress protocol. 当前 MVP 要求 ingress == egress.
     pub protocol: Protocol,
     /// 上游 base URL, 末尾**不带** `/`. 通过 [`validate_base_url`] 校验.
+    /// serde default (#179): 虚拟 provider (route_to 设置) 忽略 base_url, TOML 可省略;
+    /// 实体 provider 缺省时由 validate 在启动/upsert 报 "must not be empty".
+    #[serde(default)]
     pub base_url: String,
     /// API key 直接值. 明文存储在本地 config 文件中 (本地进程, 不通过网络暴露).
     /// 与 [`Provider::api_key_file`] 互斥 — 同时设置会在 [`Provider::validate`] 中报错.
@@ -139,6 +142,21 @@ pub struct Provider {
     /// (在 `crate::proxy`) 决定是否跳过 auth header 注入.
     #[serde(default)]
     pub api_key_file: Option<std::path::PathBuf>,
+    /// 可选: 虚拟 endpoint 的路由目标 (另一 provider 的 id). `Some(target)` 时本
+    /// provider 是**虚拟 provider** — 自身不承载转发, dispatch 时跟随 `route_to` 链
+    /// 解析到链尾的实体 provider (#179). 用于 "客户端固定连虚拟 endpoint, WebUI
+    /// 即席切换指向" 的模型 SSOT 动态切换.
+    ///
+    /// 字段独有语义:
+    /// - `base_url` / `api_key` / `api_key_file` 被忽略 (validate 允许 base_url 为空);
+    /// - `protocol` 仅作 WebUI 展示 — ingress 由 URL proto_short 决定, egress 由
+    ///   链尾实体 provider 的 protocol 决定 (不同则自动走 cross_proto 翻译).
+    ///
+    /// 路由语义 (per-request 解析 / 坏路由 503 / 环与悬空处置) 的 SSOT:
+    /// [`ProviderTable::resolve_route`] + [`ProviderTable::would_cycle`] + FWD-5 契约
+    /// (`docs/design/contracts.md`).
+    #[serde(default)]
+    pub route_to: Option<String>,
     /// 是否启用. `false` 时转发到该 provider 返回 503.
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -218,7 +236,17 @@ impl DynamicEntry for Provider {
 
     fn validate(&self) -> Result<(), String> {
         crate::secrets::validate_id(&self.id)?;
-        validate_base_url(&self.base_url)?;
+        if let Some(target) = &self.route_to {
+            // 虚拟 provider: base_url / api_key 被忽略, 允许 base_url 为空.
+            // 自环在此拒绝 (entry-local, 覆盖 static 加载与所有 upsert);
+            // 跨条目成环由 upsert 侧 would_cycle + 运行时 resolve_route 兜底.
+            crate::secrets::validate_id(target)?;
+            if target == &self.id {
+                return Err(format!("provider {} routes to itself", self.id));
+            }
+        } else {
+            validate_base_url(&self.base_url)?;
+        }
         // api_key 与 api_key_file 互斥: 同时设置时语义不明 (effective_api_key 会优先 api_key,
         // 但这种配置几乎肯定是误操作 — 比如 toml 既填了 api_key 又忘了删 api_key_file).
         if !self.api_key.is_empty() && self.api_key_file.is_some() {
@@ -245,10 +273,17 @@ impl DynamicEntry for Provider {
     /// #157: override 未记录鉴权字段 (api_key 与 api_key_file 均空) → 两者从 static
     /// 继承. 让 "PUT api_key=null 保留旧值" 的 override 不落盘明文, 转发仍带旧 key.
     /// 已知限制 (static 基线下空串无法清空): 见根 AGENTS.md "#157 已知限制" 条目.
+    ///
+    /// route_to 同语义 (#179): override 未记录 route_to (None) → 从 static 继承.
+    /// 已知限制 (同 #157 型): override 无法把 static 虚拟 provider 改回实体 provider
+    /// (PUT route_to="" 存为 None 后仍被继承回 static 的指向).
     fn inherit_from_static(&mut self, static_ver: &Self) {
         if self.api_key.is_empty() && self.api_key_file.is_none() {
             self.api_key = static_ver.api_key.clone();
             self.api_key_file = static_ver.api_key_file.clone();
+        }
+        if self.route_to.is_none() {
+            self.route_to = static_ver.route_to.clone();
         }
     }
 }
@@ -278,6 +313,8 @@ pub struct EffectiveProvider {
     pub api_key_length: usize,
     pub enabled: bool,
     pub name: Option<String>,
+    /// 虚拟 endpoint 的路由目标 (Some = 虚拟 provider). 见 [`Provider::route_to`].
+    pub route_to: Option<String>,
 
     // ─── provenance 元信息 (WebUI 渲染用) ───
     pub source: EffectiveSource,
@@ -299,6 +336,8 @@ pub struct ProviderMasked {
     pub api_key_masked: String,
     pub api_key_length: usize,
     pub enabled: bool,
+    /// 虚拟 endpoint 的路由目标 (Some = 虚拟 provider). 见 [`Provider::route_to`].
+    pub route_to: Option<String>,
 }
 
 impl From<Provider> for ProviderMasked {
@@ -312,6 +351,7 @@ impl From<Provider> for ProviderMasked {
             api_key_masked: crate::secrets::mask_value(&p.api_key),
             api_key_length,
             enabled: p.enabled,
+            route_to: p.route_to,
         }
     }
 }
@@ -325,7 +365,104 @@ impl DynamicTable<Provider> {
             .filter_map(|(s, d, m)| compute_effective_provider(s, d, m))
             .collect()
     }
+
+    /// 解析虚拟 provider 路由链 (#179): 跟随 `route_to` 直到链尾的实体 provider.
+    ///
+    /// - **per-request 语义**: dispatch 每次转发前调用, 切换指向只影响新请求
+    ///   (in-flight 请求已拿到解析结果, 按旧目标完成, 无需 drain);
+    /// - 每跳走 [`Self::get_effective`] (含 static+dynamic+decision 合并与 #157 继承),
+    ///   链上每个 provider 必须存在且 entry-level enabled;
+    /// - **链内非原子**: 两跳以上链的逐跳解析各自独立读表, 解析期间表被修改时
+    ///   本请求可能走 "切换前 + 切换后" 的混合链 — 这是 per-request 解析的自然
+    ///   语义 (本请求视角, 链在解析起点时刻的快照), 不额外加锁;
+    /// - visited-set 保证**有限步终止**: 表有限, 重复 id 即环 (validate/would_cycle
+    ///   之外的运行时兜底 — 手改 state.toml 或并发写入造成的环在这里安全降级为
+    ///   503, 不挂起);
+    /// - `entry` 自身无 route_to 时原样返回 (实体 provider 快路径, 零开销一跳).
+    ///
+    /// 错误消息只含 provider id 与 reason 枚举 (SEC-2 同型, 无 secret),
+    /// 经 `AppError::Unavailable` 原样回传客户端 503 body.
+    pub fn resolve_route(&self, entry: Provider) -> Result<Provider, RouteError> {
+        let mut cur = entry;
+        let mut visited = HashSet::from([cur.id.clone()]);
+        while let Some(target) = cur.route_to.clone() {
+            let next = self
+                .get_effective(&target)
+                .ok_or_else(|| RouteError::Missing(target.clone()))?;
+            if !next.enabled {
+                return Err(RouteError::Disabled(next.id.clone()));
+            }
+            if !visited.insert(next.id.clone()) {
+                return Err(RouteError::Cycle(next.id));
+            }
+            cur = next;
+        }
+        Ok(cur)
+    }
+
+    /// upsert 前校验: 写入 `entry` 后 route_to 链是否会成环 (WebUI 侧拒绝, 400).
+    ///
+    /// 用 effective 视图构造 id → route_to 映射, 用 entry 的新值覆盖其 id 后从
+    /// entry 起步走链 (与 `resolve_route` 同一走链语义); 目标不在映射中 (悬空 /
+    /// decision-disabled) 视为链断 — **不算环** (悬空写入放行以保证创建顺序无关,
+    /// 运行时由 `resolve_route` 503 兜底).
+    ///
+    /// 已知偏差 (仅漏报方向, 无误报): 检查图用 override **原始值**覆盖该 id — 若
+    /// 落库后经 `inherit_from_static` 展开为 Some (static 虚拟 + override 未记录),
+    /// 实际链可能成环而此处未检; 该前提要求表已含环 (static 手写), 本就是运行时
+    /// 兜底的场景. 并发写入的 TOCTOU 窗口 (检查与 upsert 非同一临界区) 同理 —
+    /// 单用户本地工具的可接受假设 (与 update_provider 的 #157 TOCTOU 声明一致),
+    /// 漏网环由 `resolve_route` visited-set 兜底为 503.
+    pub fn would_cycle(&self, entry: &Provider) -> bool {
+        let mut hops: HashMap<String, Option<String>> = self
+            .effective_snapshot()
+            .into_iter()
+            .map(|e| (e.id.clone(), e.route_to.clone()))
+            .collect();
+        hops.insert(entry.id.clone(), entry.route_to.clone());
+        let mut visited = HashSet::from([entry.id.clone()]);
+        let mut cur = entry.route_to.clone();
+        while let Some(id) = cur {
+            if !visited.insert(id.clone()) {
+                return true;
+            }
+            cur = match hops.get(&id) {
+                Some(r) => r.clone(),
+                None => return false, // 悬空: 链断, 无环.
+            };
+        }
+        false
+    }
 }
+
+/// 虚拟 provider 路由解析错误 (`resolve_route`). Display 消息进 503 body,
+/// 只含 provider id 与 reason (SEC-2 同型).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteError {
+    /// 链上一跳在 effective 视图中不存在 (目标缺失, 或被 decision=Disabled 排除).
+    Missing(String),
+    /// 链上一跳 entry-level enabled=false.
+    Disabled(String),
+    /// 链上出现环 (含自环). 字段 = 环回到的 provider id.
+    Cycle(String),
+}
+
+impl std::fmt::Display for RouteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RouteError::Missing(id) => {
+                write!(
+                    f,
+                    "route target '{id}' not found (missing or disabled by decision)"
+                )
+            }
+            RouteError::Disabled(id) => write!(f, "route target '{id}' is disabled"),
+            RouteError::Cycle(id) => write!(f, "route cycle detected at '{id}'"),
+        }
+    }
+}
+
+impl std::error::Error for RouteError {}
 
 /// 给定 (static_ver, dynamic_ver, mode), 计算 effective provider 的合并视图.
 /// 若 Disabled 或三者皆空, 返回 None.
@@ -351,6 +488,7 @@ fn compute_effective_provider(
         base_url: raw.base_url,
         enabled: raw.enabled,
         name: raw.name,
+        route_to: raw.route_to,
         source,
         decision: mode,
         static_version: static_masked,
@@ -377,6 +515,16 @@ mod tests {
             api_key_file: None,
             enabled: true,
             name: Some(format!("name-{id}")),
+            route_to: None,
+        }
+    }
+
+    /// 虚拟 provider (route_to = target). base_url 留空 (虚拟语义下被忽略).
+    fn v(id: &str, target: &str) -> Provider {
+        Provider {
+            route_to: Some(target.into()),
+            base_url: String::new(),
+            ..p(id, Protocol::OpenAI, "")
         }
     }
 
@@ -473,6 +621,7 @@ mod tests {
             api_key_file: None,
             enabled: true,
             name: None,
+            route_to: None,
         };
         assert!(bad_id.validate().is_err());
 
@@ -485,6 +634,7 @@ mod tests {
             api_key_file: None,
             enabled: true,
             name: None,
+            route_to: None,
         };
         assert!(bad_url.validate().is_err());
 
@@ -502,6 +652,7 @@ mod tests {
             api_key_file: Some(PathBuf::from("/run/secrets/whatever")),
             enabled: true,
             name: None,
+            route_to: None,
         };
         let err = both.validate().unwrap_err();
         assert!(err.contains("both api_key and api_key_file"), "got: {err}");
@@ -520,6 +671,7 @@ mod tests {
             api_key_file: None,
             enabled: true,
             name: None,
+            route_to: None,
         };
         assert_eq!(p.effective_api_key(), "sk-direct");
     }
@@ -542,6 +694,7 @@ mod tests {
             api_key_file: Some(tmp.clone()),
             enabled: true,
             name: None,
+            route_to: None,
         };
         assert_eq!(p.effective_api_key(), "sk-from-file");
 
@@ -559,6 +712,7 @@ mod tests {
             api_key_file: Some(PathBuf::from("/nonexistent/path/should/not/exist")),
             enabled: true,
             name: None,
+            route_to: None,
         };
         assert_eq!(p.effective_api_key(), "");
     }
@@ -594,6 +748,7 @@ mod tests {
             api_key_file: Some(tmp.clone()),
             enabled: true,
             name: None,
+            route_to: None,
         };
 
         // 1. 文件不存在 → 空 + WARNED 被插入 (首次失败).
@@ -637,6 +792,7 @@ mod tests {
             api_key_file: Some(PathBuf::from("/nonexistent/warn-once-test")),
             enabled: true,
             name: None,
+            route_to: None,
         };
         assert_eq!(p.effective_api_key(), "");
         assert!(
@@ -657,6 +813,7 @@ mod tests {
             api_key_file: None,
             enabled: true,
             name: None,
+            route_to: None,
         };
         assert_eq!(p.effective_api_key(), "");
     }
@@ -791,5 +948,275 @@ mod tests {
         assert_eq!(snap[0].api_key_length, "sk-static-key".chars().count());
         // dynamic_version 的 masked 仍显示 override 自身 (空) — 派生视图分离, 不混入.
         assert_eq!(snap[0].dynamic_version.as_ref().unwrap().api_key_length, 0);
+    }
+
+    // ─── 虚拟 provider 路由 (#179): resolve_route / would_cycle / validate ──
+    //
+    // 契约: FWD-5 (per-request 解析 / 坏路由 503 / 环终止).
+
+    /// 表: real → mock 上游; v1 → v2 → real (两跳链).
+    fn route_table() -> ProviderTable {
+        let mut real = p("real", Protocol::OpenAI, "https://upstream");
+        real.api_key = "sk-real".into();
+        let v2 = v("v2", "real");
+        let v1 = v("v1", "v2");
+        ProviderTable::new(
+            vec![real, v2, v1],
+            vec![],
+            empty_decisions(),
+            tempfile_path(),
+        )
+    }
+
+    #[test]
+    fn resolve_route_real_provider_passthrough() {
+        // 实体 provider (route_to=None) 原样返回, 零额外跳.
+        let t = route_table();
+        let real = t.get_effective("real").unwrap();
+        let out = t.resolve_route(real.clone()).unwrap();
+        assert_eq!(out.id, "real");
+        assert_eq!(out.base_url, "https://upstream");
+        assert_eq!(out.api_key, "sk-real", "resolved provider carries real key");
+    }
+
+    #[test]
+    fn resolve_route_follows_chain_to_real_provider() {
+        // v1 → v2 → real: 解析到链尾实体, 携带其实体字段 (base_url/api_key).
+        let t = route_table();
+        let v1 = t.get_effective("v1").unwrap();
+        let out = t.resolve_route(v1).unwrap();
+        assert_eq!(out.id, "real");
+        assert_eq!(out.base_url, "https://upstream");
+        assert_eq!(out.api_key, "sk-real");
+    }
+
+    #[test]
+    fn resolve_route_missing_target() {
+        let t = ProviderTable::new(
+            vec![v("v", "ghost")],
+            vec![],
+            empty_decisions(),
+            tempfile_path(),
+        );
+        let err = t.resolve_route(t.get_effective("v").unwrap()).unwrap_err();
+        assert_eq!(err, RouteError::Missing("ghost".into()));
+        assert!(err.to_string().contains("ghost"), "msg names the id: {err}");
+    }
+
+    #[test]
+    fn resolve_route_disabled_target() {
+        let mut real = p("real", Protocol::OpenAI, "https://u");
+        real.enabled = false;
+        let t = ProviderTable::new(
+            vec![real, v("v", "real")],
+            vec![],
+            empty_decisions(),
+            tempfile_path(),
+        );
+        // 入口 provider 自身 disabled 在 dispatch 层已挡 (503); 这里测链上中间跳.
+        let err = t.resolve_route(t.get_effective("v").unwrap()).unwrap_err();
+        assert_eq!(err, RouteError::Disabled("real".into()));
+    }
+
+    #[test]
+    fn resolve_route_detects_cycles() {
+        // 双节点环 (绕过 validate 直接构造 — 模拟手改 state.toml 的运行时兜底场景).
+        let t = ProviderTable::new(
+            vec![v("a", "b"), v("b", "a")],
+            vec![],
+            empty_decisions(),
+            tempfile_path(),
+        );
+        let err = t.resolve_route(t.get_effective("a").unwrap()).unwrap_err();
+        assert_eq!(err, RouteError::Cycle("a".into()));
+
+        // 自环 (单节点).
+        let t2 = ProviderTable::new(
+            vec![v("s", "s")],
+            vec![],
+            empty_decisions(),
+            tempfile_path(),
+        );
+        assert!(matches!(
+            t2.resolve_route(t2.get_effective("s").unwrap()),
+            Err(RouteError::Cycle(_))
+        ));
+    }
+
+    #[test]
+    fn would_cycle_rejects_indirect_cycle() {
+        // 已有 a → b; upsert b.route_to = a 形成环 → 必须拒绝.
+        let t = ProviderTable::new(
+            vec![
+                v("a", "b"),
+                v("b", "real"),
+                p("real", Protocol::OpenAI, "https://u"),
+            ],
+            vec![],
+            empty_decisions(),
+            tempfile_path(),
+        );
+        let b_to_a = v("b", "a");
+        assert!(t.would_cycle(&b_to_a), "b→a closes the a→b cycle");
+        // b → real (现状) 与 b → 悬空 都不成环.
+        assert!(!t.would_cycle(&v("b", "real")));
+        assert!(!t.would_cycle(&v("b", "ghost")));
+        // 自环.
+        assert!(t.would_cycle(&v("b", "b")));
+    }
+
+    #[test]
+    fn would_cycle_updates_entry_in_place() {
+        // upsert 替换已有条目: 表中 b → a 已有, 现在写入 a → b 也要识别为环
+        // (walk 必须用新 entry 值覆盖旧值, 而非读到旧 a 的 route_to=None 而漏判).
+        let t = ProviderTable::new(
+            vec![
+                v("a", "real"),
+                v("b", "a"),
+                p("real", Protocol::OpenAI, "https://u"),
+            ],
+            vec![],
+            empty_decisions(),
+            tempfile_path(),
+        );
+        let a_to_b = v("a", "b");
+        assert!(t.would_cycle(&a_to_b), "a→b closes the existing b→a cycle");
+    }
+
+    #[test]
+    fn validate_virtual_provider_semantics() {
+        // 虚拟: 允许空 base_url; 目标 id 必须合法; 自环拒绝.
+        assert!(v("v", "real").validate().is_ok());
+        let bad_target = v("v", "has space");
+        assert!(bad_target.validate().is_err());
+        let self_loop = v("v", "v");
+        let err = self_loop.validate().unwrap_err();
+        assert!(err.contains("routes to itself"), "got: {err}");
+        // 实体: 空 base_url 仍然拒绝 (现有行为不变).
+        let mut real = p("r", Protocol::OpenAI, "");
+        real.route_to = None;
+        assert!(real.validate().is_err());
+    }
+
+    #[test]
+    fn toml_route_to_roundtrip_and_default() {
+        // 缺省字段 (既有配置) → None; 显式 route_to → Some.
+        let legacy = r#"
+            id = "test"
+            protocol = "openai"
+            base_url = "https://api.example.com"
+        "#;
+        let p: Provider = toml::from_str(legacy).expect("legacy parse");
+        assert!(p.route_to.is_none());
+
+        let virtual_toml = r#"
+            id = "my-virtual"
+            protocol = "openai"
+            route_to = "openai-main"
+        "#;
+        let p: Provider = toml::from_str(virtual_toml).expect("virtual parse");
+        assert_eq!(p.route_to.as_deref(), Some("openai-main"));
+        assert_eq!(p.base_url, "", "virtual provider: empty base_url tolerated");
+        assert!(p.validate().is_ok());
+    }
+
+    #[test]
+    fn inherit_from_static_covers_route_to() {
+        // static 虚拟 + override 未记录 route_to → 继承指向 (路由层与 WebUI 视图一致).
+        let tmp = tempfile_path();
+        let s = v("x", "real");
+        let mut d = p("x", Protocol::OpenAI, "https://d");
+        d.route_to = None; // override 未记录 (#179 同 #157 语义)
+        let t = ProviderTable::new(
+            vec![s, p("real", Protocol::OpenAI, "https://u")],
+            vec![d],
+            empty_decisions(),
+            tmp,
+        );
+        assert_eq!(
+            t.get_effective("x").unwrap().route_to.as_deref(),
+            Some("real")
+        );
+        let snap = t.effective_snapshot();
+        let x = snap.iter().find(|e| e.id == "x").unwrap();
+        assert_eq!(x.route_to.as_deref(), Some("real"));
+    }
+
+    #[test]
+    fn prefer_static_decision_uses_static_route() {
+        // static 虚拟 (→ real1) + dynamic override (→ real2) + PreferStatic:
+        // 整条回 static, 路由随之 — decision 与 route 的组合不产生第三种语义.
+        let tmp = tempfile_path();
+        let t = ProviderTable::new(
+            vec![
+                v("x", "real1"),
+                p("real1", Protocol::OpenAI, "https://u1"),
+                p("real2", Protocol::OpenAI, "https://u2"),
+            ],
+            vec![v("x", "real2")],
+            empty_decisions(),
+            tmp,
+        );
+
+        // Default: override 生效 → real2.
+        assert_eq!(
+            t.get_effective("x").unwrap().route_to.as_deref(),
+            Some("real2")
+        );
+        // PreferStatic: static 整条生效 → real1 (inherit 对 static 自身是 no-op).
+        t.set_decision("x", OverrideMode::PreferStatic).unwrap();
+        let eff = t.get_effective("x").unwrap();
+        assert_eq!(eff.route_to.as_deref(), Some("real1"));
+        assert_eq!(t.resolve_route(eff).unwrap().id, "real1");
+    }
+
+    #[test]
+    fn resolve_route_target_disabled_by_decision_reports_missing() {
+        // decision=Disabled 的目标不在 effective 视图 → Missing (message 提示
+        // "disabled by decision", 与 entry-level disabled 区分).
+        let tmp = tempfile_path();
+        let t = ProviderTable::new(
+            vec![v("v", "real"), p("real", Protocol::OpenAI, "https://u")],
+            vec![],
+            empty_decisions(),
+            tmp,
+        );
+        t.set_decision("real", OverrideMode::Disabled).unwrap();
+        let err = t.resolve_route(t.get_effective("v").unwrap()).unwrap_err();
+        assert_eq!(err, RouteError::Missing("real".into()));
+        assert!(err.to_string().contains("disabled by decision"));
+    }
+
+    // FWD-5 环终止 property: 任意 route 图 (含环), `resolve_route` 有限步返回
+    // (Ok ⇒ 链尾必为实体 provider, route_to=None; Err ⇒ 明确错误类别).
+    // 历史教训 (生成器覆盖度): 图必须包含环与悬空, 否则 property 退化为恒真.
+    // 生成器: p{i} 的 route_to 由 edges.get(i) 决定 — 无边 → 实体, 目标 < n →
+    // 指向表内 (可成环/自环), 目标 ≥ n → 悬空 (ghost).
+    proptest::proptest! {
+        #[test]
+        fn prop_resolve_route_terminates_on_random_graphs(
+            n in 2usize..8,
+            edges in proptest::collection::vec(0usize..8, 0..16),
+        ) {
+            // n 个 provider: id = p0..p{n-1}; edges[i] 决定 p{i % n} 的 route_to
+            // (目标均匀取 0..8 → 覆盖存在/缺失/自环/成环).
+            let ids: Vec<String> = (0..n).map(|i| format!("p{i}")).collect();
+            let entries: Vec<Provider> = (0..n)
+                .map(|i| match edges.get(i) {
+                    Some(&t) if t < n => v(&ids[i], &ids[t]),
+                    Some(&t) => v(&ids[i], &format!("ghost-{t}")), // 悬空
+                    None => p(&ids[i], Protocol::OpenAI, "https://u"), // 实体
+                })
+                .collect();
+            let t = ProviderTable::new(entries, vec![], empty_decisions(), tempfile_path());
+            for id in &ids {
+                if let Some(entry) = t.get_effective(id) {
+                    // Err 分支 = 有限步返回明确错误 (同样满足终止性), 无需断言.
+                    if let Ok(final_p) = t.resolve_route(entry) {
+                        proptest::prop_assert!(final_p.route_to.is_none());
+                    }
+                }
+            }
+        }
     }
 }

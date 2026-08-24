@@ -61,9 +61,10 @@ value = "ghp_0123456789abcdefghijklmnopqrstuvwxyz"
 |---|---|---|---|
 | `id` | string | (必填) | 唯一标识. 1..=64 字符, 以字母/数字开头, 只允许字母数字、`_`、`-`. 出现在转发 URL 中 (`/o/<id>/...`). |
 | `protocol` | string | (必填) | 上游协议: `openai` / `anthropic` / `gemini` / `ollama` / `openairesponses` (OpenAI Responses API). |
-| `base_url` | string | (必填) | 上游 base URL. 必须以 `http://` 或 `https://` 开头, **末尾不带 `/`** (路径由 secret-guard 拼接). 如 `https://api.openai.com`. |
+| `base_url` | string | (实体必填) | 上游 base URL. 必须以 `http://` 或 `https://` 开头, **末尾不带 `/`** (路径由 secret-guard 拼接). 如 `https://api.openai.com`. 虚拟 provider (`route_to` 设置) 忽略本字段, 可省略. |
 | `api_key` | string | `""` | 上游 API key 明文. 与 `api_key_file` 互斥 (同时设置启动报错). |
 | `api_key_file` | path | — | 从文件读 API key (适合 sops-nix / systemd LoadCredential 等外部注入, 让 toml 本身不含敏感数据). 每次请求时读取, 读不到按空 key 处理并打 WARN. 文件内容自动去首尾空白. |
+| `route_to` | string | — | **虚拟 endpoint**: 指向另一 provider 的 id. 设置后本 provider 不直接转发 — `base_url` / `api_key` / `api_key_file` 被忽略 (base_url 可为空), 请求经 `route_to` 链解析到链尾的实体 provider. 解析是 **per-request** 的: 在 WebUI 即席切换指向只影响新请求. 链上目标必须存在且 `enabled`, 否则 503; 自环启动即报错, 跨条目环在 WebUI 写入时拒绝 (手写配置产生的环在请求时返回 503, 不挂起). |
 | `enabled` | bool | `true` | `false` 时转发到该 provider 返回 503. |
 | `name` | string | — | 可选的人类可读名称 (仅 WebUI 显示). |
 
@@ -74,6 +75,37 @@ protocol = "anthropic"
 base_url = "https://api.anthropic.com"
 api_key_file = "/run/credentials/anthropic.key"   # 与 api_key 二选一
 ```
+
+### 虚拟 endpoint (route_to) — 模型的 SSOT 动态切换
+
+客户端固定连接虚拟 endpoint 的 URL (如 `/o/my-model/v1/chat/completions`),
+实际打到哪个上游由 WebUI 即席切换 (Providers 页编辑该条目的 Route To):
+
+```toml
+[[providers]]
+id = "openai-main"
+protocol = "openai"
+base_url = "https://api.openai.com"
+api_key = "sk-..."
+
+[[providers]]
+id = "my-model"
+protocol = "openai"     # 仅作 WebUI 展示; ingress 由 URL 决定, egress 由目标决定
+route_to = "openai-main"
+```
+
+语义要点:
+- **切换只影响新请求** (per-request 解析), in-flight 请求按已解析目标完成.
+- 目标协议与 URL 协议不同时自动走跨协议翻译 (非流式; 流式跨协议返回 501,
+  与非虚拟行为一致).
+- WebUI timeline / 轮次详情的 "via ..." 角标与 `Upstream` 字段显示每轮实际命中的
+  上游 (虚拟切换后历史轮次仍如实记录各自归属).
+- **P1 限制**: 请求 body 里的 `model` 字段原样透传 — 虚拟切换适合"同 model 名多
+  上游"场景 (直连 ↔ 中转站); 跨模型名切换需后续的 model_override.
+- 已知限制 (#157 同型): static 声明的虚拟 provider 无法经 WebUI override 改回实体
+  provider (未记录 route_to 的 override 会继承 static 的指向); dynamic-only 条目
+  可完整 "虚拟 ↔ 实体" 往返 (编辑表单选 "none — real provider", 切回实体时需同时
+  填写 Base URL — 表单会前置提示).
 
 ## `[[secrets.entries]]` — 需要保护的 Secret (嵌套在 `[secrets]` 下)
 

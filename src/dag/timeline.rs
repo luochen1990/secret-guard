@@ -99,6 +99,8 @@ fn build_timeline_round(inner: &DagInner, node_id: Uuid) -> Option<TimelineRound
         round_role: node.event.round_role,
         preview: node.event.preview.clone(),
         created_at: node.event.created_at,
+        // 实际承载转发的 provider id (#179, 虚拟 endpoint 切换的可观测性).
+        upstream_id: std::sync::Arc::clone(&node.event.upstream_id),
         redactions: std::sync::Arc::clone(&node.event.redactions),
         req_delta_messages: crate::derive::extract_delta_messages_from_raw(node),
     })

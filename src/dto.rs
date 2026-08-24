@@ -102,6 +102,9 @@ pub struct NodeView {
     pub preview: Option<Arc<str>>,
     /// 请求 body 顶层 model 字段. `Arc<str>` 同上.
     pub model: Option<Arc<str>>,
+    /// 实际承载转发的 provider id (route_to 解析后的链尾实体, #179).
+    /// 非虚拟请求时即 URL 中的 provider id.
+    pub upstream_id: Arc<str>,
     /// 是否流式响应.
     pub streamed: bool,
     /// 响应是否完整 (上游错误 / 客户端断开 → false).
@@ -169,6 +172,9 @@ pub struct TimelineRound {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview: Option<Arc<str>>,
     pub created_at: DateTime<Utc>,
+    /// 实际承载转发的 provider id (route_to 解析后的链尾实体, #179).
+    /// 非虚拟请求时即 URL 中的 provider id; 前端用它渲染 "via ..." 归属角标.
+    pub upstream_id: Arc<str>,
     /// `Arc<[(String,String)]>`: 共享 event.redactions, 零拷贝.
     /// 每个 tuple = (mock_value, secret_id), **永不**含真实 secret.
     pub redactions: Arc<[(String, String)]>,

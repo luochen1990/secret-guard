@@ -27,6 +27,11 @@ pub struct ForwardRecord {
     pub created_at: DateTime<Utc>,
     pub method: String,
     pub path: String,
+    /// 实际承载转发的 provider id (route_to 解析后的链尾实体, #179).
+    /// 非虚拟请求时即 URL 中的 provider id.
+    /// serde default: 兼容旧序列化产物 (历史 JSON 无此字段).
+    #[serde(default)]
+    pub upstream_id: String,
     /// 客户端请求的所有 header (敏感 header 如 Authorization 会被脱敏).
     pub req_headers: Vec<(String, String)>,
     /// 客户端请求 body (LLM 视角, 已 redact; UTF-8 视图).
@@ -85,6 +90,7 @@ impl ForwardRecord {
             created_at: Utc::now(),
             method,
             path,
+            upstream_id: String::new(),
             req_headers,
             req_body,
             resp_status: 0,
@@ -139,6 +145,11 @@ mod tests {
         assert!(
             rec.redactions.is_empty(),
             "missing redactions field must default to empty vec"
+        );
+        // #179: upstream_id 同为后加字段, 缺省回落空串 (显式锁定 default 契约).
+        assert_eq!(
+            rec.upstream_id, "",
+            "missing upstream_id field must default to empty string"
         );
         // 其他字段仍正确填充.
         assert_eq!(rec.method, "POST");

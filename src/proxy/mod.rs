@@ -188,6 +188,21 @@ async fn dispatch(
         )));
     }
 
+    // 2.5 虚拟 provider 路由解析 (#179): 跟随 route_to 链到实体 provider.
+    // per-request 解析 — 切换指向只影响新请求 (in-flight 请求按已解析目标完成);
+    // 坏路由 (目标缺失 / disabled / 成环) → 503, message 只含 id + reason (SEC-2 同型).
+    // WARN: 悬空/disabled 指向是虚拟切换的主要运维事故形态, 静默 503 排障成本高.
+    let provider = match state.providers.resolve_route(provider) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(virtual = %fp.name, error = %e, "route resolution failed");
+            return Err(AppError::Unavailable(e.to_string()));
+        }
+    };
+    if fp.name != provider.id {
+        tracing::info!(virtual = %fp.name, upstream = %provider.id, "route resolved");
+    }
+
     // 3. 收集请求 body (跨协议和同协议都需要).
     let req_bytes = to_bytes(body, MAX_REQ_BODY)
         .await
