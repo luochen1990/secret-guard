@@ -64,6 +64,7 @@ fn build_forward_record(
         method: view.method,
         path: view.path,
         upstream_id: view.upstream_id.to_string(),
+        upstream_model: view.upstream_model.as_deref().map(str::to_string),
         req_headers: detail.req_headers,
         req_body: detail.req_body_raw,
         resp_status: view.resp_status,

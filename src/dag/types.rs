@@ -205,6 +205,11 @@ pub struct CallEvent {
     /// `Arc<[(String,String)]>` 让 list/session 路径共享切片而非 clone Vec
     /// (clone 成本随命中 secret 数线性增长).
     pub redactions: Arc<[(String, String)]>,
+    /// 实际发往上游的 model 值 (#183 D4): 仅当 model_override **实际改写**了
+    /// egress IR 时 Some (passthrough / 无 codec 降级恒 None — 非 None-ness 即
+    /// "本轮被 override" 的信号). `event.model` 保持 egress 视角派生
+    /// (req_body_raw SSOT), override 生效时两者同值.
+    pub upstream_model: Option<Arc<str>>,
 }
 
 /// LLM 返回的 response 数据 (message content + 元数据).

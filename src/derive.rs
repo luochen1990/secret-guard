@@ -838,6 +838,7 @@ mod tests {
             model: None,
             upstream_id: Arc::from("test"),
             redactions: Arc::from([]),
+            upstream_model: None,
         };
         // req_delta 用任意 MessageRef 填充到 count 长度 — 内容不重要, 只用 len().
         let dummy_ref = crate::dag::MessageRef {

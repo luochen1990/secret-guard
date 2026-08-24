@@ -278,7 +278,7 @@ URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标
   `unavailable` (message 只含 id + reason 枚举, SEC-2 同型; 解析 per-request,
   切换只影响新请求 — FWD-5, #179)
 - 跨协议 + `stream=true` → 501 (流式跨协议翻译尚未接入 dispatch)
-- **Responses + Redact + `stream=true`** → 501 (Responses 流式 SSE 事件翻译未实现; 见 "已知限制")
+- **Responses + (Redact 或 model_override) + `stream=true`** → 501 (Responses 流式 SSE 事件翻译未实现; override 亦迫使 IR 路径 #183 D5; 见 "已知限制")
 - Gemini/Ollama 跨协议 → 501 (codec 未覆盖)
 
 详尽的 dispatch 路径选择 (同协议透传 / IR 路径 / 跨协议翻译) 与 fan_out 三路径见
@@ -294,7 +294,7 @@ URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标
 | `main.rs` / `cli.rs` / `lib.rs` | 二进制入口 + CLI 参数 schema | 文件头部 `//!` |
 | `auth/` | OIDC 登录 (WebUI) + 本地 API key (SDK 转发) + session | `auth/mod.rs` 头部 `//!` |
 | `config.rs` | 双层配置 schema + `DynamicTable<T>` 泛型 + 持久化 + 静态配置预检审计 (未知 section/字段 → 启动 WARN, #159) | 文件头部 `//!` (覆盖 OverrideMode / CRUD / Effective source / 跨表并发) |
-| `provider.rs` | Provider 实体 + Effective view + api_key 两来源 + 虚拟 provider 路由 (`route_to` / `resolve_route` / `would_cycle`, #179) | 文件头部 `//!` |
+| `provider.rs` | Provider 实体 + Effective view + api_key 两来源 + 虚拟 provider 路由 (`route_to` / `resolve_route` / `would_cycle` + `model_override` first-wins, #179/#183) | 文件头部 `//!` |
 | `secrets.rs` | SecretEntry 实体 + Effective view + value 两来源 | 文件头部 `//!` |
 | `mock.rs` | MockStrategy 两维度 (初始值 + 生成策略) + 确定性 seed + `[redact] global_mock_prefix` 注入 | 文件头部 `//!` (C3 根基) |
 | `dag/` (模块目录: mod/pool/types/view/timeline) | ConversationDAG 内容寻址存储 (BlockPool + Node + Merkle) | `src/dag/mod.rs` 头部 `//!` + `docs/design/conversation-dag.md` |
@@ -600,7 +600,7 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
 - **OpenAI Responses API 支持范围**: Responses 协议 (`/r/` proto_short) 已接入 codec,
   支持 Responses ⇄ Chat Completions 跨协议翻译 (非流式) + Responses 同协议透传 + Redact (非流式).
   **不支持**: Responses 流式 SSE 事件翻译 (Responses + Redact + `stream=true` 返回 501;
-  无 Redact 的同协议流式透传正常工作); Responses ⇄ Anthropic 跨协议 (返回 501);
+  无 Redact 且无 model_override 的同协议流式透传正常工作; 配置了任一则 501, #183 D5); Responses ⇄ Anthropic 跨协议 (返回 501);
   hosted tools (web_search/file_search/computer_use/mcp → 静默丢弃); namespace tools
   flattening; `previous_response_id` 服务端状态 (secret-guard 是 stateless 代理);
   reasoning items 的 `encrypted_content` (同协议 round-trip 也会丢失, 会破坏 reasoning chain).
@@ -672,11 +672,15 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
   停用 provider 请用 `PATCH .../decision {"mode":"disabled"}`. WebUI 编辑留空发 null
   (保留语义), 仅 SDK 显式发空串可见. 根治需 schema 演进 (请求字段 Option 化或 sentinel
   值), 属后续工作.
-- **route_to 与 api_key 同型的 #157 继承限制 (#179 已知限制)**: static 声明的虚拟
-  provider 无法经 override 改回实体 provider — override 未记录 route_to (PUT 省略/
-  `""`) 时会被 `inherit_from_static` 继承回 static 的指向. dynamic-only 条目可完整
-  "虚拟 ↔ 实体" 往返 (WebUI 表单选 none). 另: 虚拟 provider 的 `model` 字段原样透传,
-  仅支持 "同 model 名多上游" 切换 (跨模型名切换 = model_override, 见后续工作).
+- **route_to / model_override 与 api_key 同型的 #157 继承限制 (#179/#183 已知限制)**:
+  static 声明的虚拟 provider 无法经 override 改回实体 provider — override 未记录
+  route_to (PUT 省略/`""`) 时会被 `inherit_from_static` 继承回 static 的指向;
+  static 配置了 model_override 的条目同样无法经 override 清空. dynamic-only 条目可
+  完整往返 (WebUI 表单选 none / 留空).
+- **model_override 生效时放弃 byte-exact (#183, FWD-1 修订)**: 配置了 override 的
+  provider, 其同协议无-secret 请求从字节直传降级为 IR 改写路径 (normalize 等价;
+  上游前缀缓存失效 — 用户主动选择的降级, 契约层面已由 FWD-1 修订授权, §99 登记).
+  Gemini/Ollama + override 无法改写: WARN + 原样透传 (body 不变).
 - **虚拟 provider 跨条目环的启动检查缺失 (#179)**: 自环在 `Provider::validate`
   (static 加载 fail-fast) 拒绝; 跨条目环只在 WebUI upsert (`would_cycle`) 与运行时
   (`resolve_route` visited-set, 503) 拦截. 两个漏网来源: ① 手改 state.toml; ② 并发
@@ -701,11 +705,10 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
 
 ## 后续工作 (非 MVP 范围)
 
-- **虚拟 provider 的 model_override (#179 P2)**: 切换 = (target, model) 二元组 — body
-  里的 `model` 字段随指向重写, 支持跨模型名切换. 代价: override 生效时该 provider 的
-  同协议无-secret 路径必须放弃 byte-exact 字节直传, 改走 IR 改写 (前缀缓存失效, 用户
-  主动选择的降级); 需按 contracts.md §0.5 流程做契约裁决后实施. 佐证: Portkey
-  `override_params` / one-api `model_mapping`.
+- **#162 协议错配 WARN 覆盖面补全 (#183 关联)**: M1 短路后, "secrets 配置但未命中"
+  的非流式响应走 `fan_out_streaming` 一次性 parse, 不再经过 `warn_if_protocol_mismatch`
+  (该 WARN 现只在 redact 命中 / cross_proto 路径触发)。可在 fan_out_streaming 的
+  非流式 finalize 处补对称调用 (注意会同时覆盖纯 passthrough 家族, 属行为增强需单独决策)。
 - **跨协议路径的 mock-not-restored WARN**: cross_proto 响应 parse 失败 fallback
   (reader 拒绝 / 非 JSON) 时, 与同协议路径 (`proxy/fan_out.rs::warn_mock_not_restored`)
   对称地在 redaction map 非空时打 `mock not restored` WARN (#158 只覆盖了

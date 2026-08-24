@@ -32,6 +32,10 @@ pub struct ForwardRecord {
     /// serde default: 兼容旧序列化产物 (历史 JSON 无此字段).
     #[serde(default)]
     pub upstream_id: String,
+    /// 实际改写的 model 值 (仅 model_override 生效时 Some, #183).
+    /// serde default: 兼容旧序列化产物.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_model: Option<String>,
     /// 客户端请求的所有 header (敏感 header 如 Authorization 会被脱敏).
     pub req_headers: Vec<(String, String)>,
     /// 客户端请求 body (LLM 视角, 已 redact; UTF-8 视图).
@@ -91,6 +95,7 @@ impl ForwardRecord {
             method,
             path,
             upstream_id: String::new(),
+            upstream_model: None,
             req_headers,
             req_body,
             resp_status: 0,

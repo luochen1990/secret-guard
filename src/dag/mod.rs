@@ -577,6 +577,7 @@ mod tests {
             model: None,
             upstream_id: Arc::from("test"),
             redactions: Arc::from([]),
+            upstream_model: None,
         }
     }
 
@@ -597,6 +598,7 @@ mod tests {
             model: model.map(Arc::<str>::from),
             upstream_id: Arc::from("test"),
             redactions: Arc::from([]),
+            upstream_model: None,
         }
     }
 

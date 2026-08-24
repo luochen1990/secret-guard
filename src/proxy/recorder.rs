@@ -88,16 +88,24 @@ pub(super) fn derive_redactions(
 /// 解析请求 body 为 JSON 并用 ingress reader 读为 IR (same_proto / cross_proto 共享).
 ///
 /// 失败返回 `BadBody` (JSON 解析失败或 codec reader 拒绝).
+/// 解析请求 body → IR; `model_override` 非空时**无条件注入**到 IR 的 model 字段
+/// (#183, D3 — 客户端 body 缺 model 亦注入; IrRequest.model 本是必填 String).
+/// 这是 model 重写的**唯一注入点** (same_proto IR 路径与 cross_proto 共享, SSOT).
 pub(super) fn parse_request_ir(
     req_bytes: &[u8],
     ingress: Protocol,
     reader: &dyn crate::codec::Reader,
+    model_override: Option<&str>,
 ) -> Result<crate::codec::ir::IrRequest, AppError> {
     let body: serde_json::Value = serde_json::from_slice(req_bytes)
         .map_err(|e| AppError::BadBody(format!("invalid JSON in {ingress} request body: {e}")))?;
-    reader
+    let mut ir = reader
         .read_request(&body)
-        .map_err(|e| AppError::BadBody(format!("{ingress} request parse failed: {}", e.message)))
+        .map_err(|e| AppError::BadBody(format!("{ingress} request parse failed: {}", e.message)))?;
+    if let Some(m) = model_override {
+        ir.model = m.to_string();
+    }
+    Ok(ir)
 }
 
 /// `redact_and_derive` 的返回类型别名 (避免 clippy::type_complexity 误报).
@@ -512,6 +520,8 @@ pub(super) fn stream_err_label(e: &std::io::Error) -> &'static str {
 /// `ir = Some(&ir)` (codec 路径): preview/model 从已 parse 的 IR 提取 (零重复 JSON parse).
 /// `ir = None` (passthrough 路径): 从 req_text 字符串提取 (passthrough 不 parse IR 保持 byte-exact).
 /// `upstream_id`: 实际承载转发的 provider id (route_to 解析后的链尾实体, #179).
+/// `upstream_model`: 实际改写的 model 值 (仅 override 实际注入 IR 时 Some; passthrough
+/// / 无 codec 降级路径恒 None, #183 D4 — 非 None-ness 即 "本轮被 override" 的信号).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_call_event(
     parts: &axum::http::request::Parts,
@@ -521,6 +531,7 @@ pub(super) fn build_call_event(
     ir: Option<&crate::codec::ir::IrRequest>,
     ingress_protocol: Option<crate::codec::Protocol>,
     upstream_id: &str,
+    upstream_model: Option<&str>,
     redact_seed: u64,
     secrets_snapshot: Option<&[crate::secrets::SecretEntry]>,
     redactions: Vec<(String, String)>,
@@ -547,6 +558,7 @@ pub(super) fn build_call_event(
         preview: preview.map(std::sync::Arc::<str>::from),
         model: model.map(std::sync::Arc::<str>::from),
         upstream_id: std::sync::Arc::from(upstream_id),
+        upstream_model: upstream_model.map(std::sync::Arc::<str>::from),
         // round_role 占位值 (User); DAG push_messages 内部会根据 delta 的 contains_user_text 修正.
         round_role: crate::codec::ir::IrRole::User,
         redactions: std::sync::Arc::from(redactions),

@@ -1443,6 +1443,12 @@
         Virtual endpoint: Base URL / API Key are ignored — requests are forwarded to the
         selected provider. Switch the target any time; only new requests are affected.
       </div>
+      <label for="p-model-override">Model Override</label>
+      <input type="text" id="p-model-override" placeholder="(none — pass client model through)">
+      <div class="hint" id="p-model-hint" style="grid-column: 1 / -1; display: none;">
+        Requests to this provider (directly or via routing) are rewritten to use this model —
+        the client's requested model is discarded. Costs byte-exact passthrough (prefix cache).
+      </div>
       <label for="p-base-url">Base URL</label>
       <input type="text" id="p-base-url" placeholder="https://api.openai.com (no trailing /)">
       <label for="p-api-key">API Key</label>
@@ -2752,6 +2758,8 @@
       rows['Method'] = rec.method || '(unknown)';
       rows['Path'] = rec.path || '(unknown)';
       rows['Upstream'] = rec.upstream_id || '(unknown)';
+      // #183: 仅 override 实际改写时显示 (None = 透传, 不加行以免噪音).
+      if (rec.upstream_model) rows['Upstream Model'] = rec.upstream_model;
       rows['Model'] = rec.model || '(unknown)';
       dlg.querySelector('.dialog-body').innerHTML = renderRows();
     }
@@ -3912,12 +3920,17 @@
 
     function renderProviderRow(p) {
       const rowCls = rowClass(p.source);
-      // #179: 虚拟 provider — base_url/api_key 被忽略, base_url 列显示指向;
-      // protocol pill 旁加 virtual 标识 (悬停提示语义).
-      const protoCell = p.route_to
-        ? `<span class="pill">${escapeHtml(p.protocol)}</span> `
-          + `<span class="pill" title="virtual endpoint — forwards to '${p.route_to}' (ignores base URL / API key)">virtual</span>`
-        : `<span class="pill">${escapeHtml(p.protocol)}</span>`;
+      // #179/#183: protocol pill 旁的 virtual + model 标识.
+      // virtual: route_to 指向另一 provider (悬停提示语义);
+      // model:X: model_override 生效 (悬停提示代价).
+      let pills = `<span class="pill">${escapeHtml(p.protocol)}</span>`;
+      if (p.route_to) {
+        pills += ` <span class="pill" title="virtual endpoint — forwards to '${p.route_to}' (ignores base URL / API key)">virtual</span>`;
+      }
+      if (p.model_override) {
+        pills += ` <span class="pill" title="model override — requests are rewritten to this model (client model discarded; costs byte-exact passthrough)">model:${escapeHtml(p.model_override)}</span>`;
+      }
+      const protoCell = `<td class="cell-short">${pills}</td>`;
       const urlCell = p.route_to
         ? `<td class="cell-long" title="virtual → ${escapeHtml(p.route_to)}"><span class="cell-ellipsis"><code>→ ${escapeHtml(p.route_to)}</code></span></td>`
         : `<td class="cell-long" title="${escapeHtml(p.base_url || '')}"><span class="cell-ellipsis"><code>${escapeHtml(p.base_url)}</code></span></td>`;
@@ -4206,6 +4219,17 @@
         });
         routeSel.dataset.bound = '1';
       }
+      // Model Override (#183): hint 联动 (有值时提示代价).
+      const modelInput = document.getElementById('p-model-override');
+      modelInput.value = existing?.model_override || '';
+      const modelHint = document.getElementById('p-model-hint');
+      modelHint.style.display = modelInput.value.trim() ? 'block' : 'none';
+      if (!modelInput.dataset.bound) {
+        modelInput.addEventListener('input', () => {
+          modelHint.style.display = modelInput.value.trim() ? 'block' : 'none';
+        });
+        modelInput.dataset.bound = '1';
+      }
       document.getElementById('p-base-url').value = existing?.base_url || '';
       const apiKeyInput = document.getElementById('p-api-key');
       apiKeyInput.value = '';
@@ -4281,6 +4305,8 @@
       const apiKeyInput = document.getElementById('p-api-key').value;
       const routeTo = document.getElementById('p-route-to').value;
       const baseUrl = document.getElementById('p-base-url').value.trim();
+      // model_override 总是发字符串 (#183): "" = 清空 (透传), "X" = 生效值.
+      const modelOverride = document.getElementById('p-model-override').value.trim();
       // 实体 provider 必须有 base_url (虚拟 → 实体切换时表单里往往是空值);
       // 前置拦截, 避免用户填完整个表单才收到后端 400. 返回 null 中止提交.
       if (!routeTo && !baseUrl) {
@@ -4292,6 +4318,7 @@
         name: document.getElementById('p-name').value.trim() || null,
         protocol: document.getElementById('p-protocol').value,
         route_to: routeTo,
+        model_override: modelOverride,
         base_url: baseUrl,
         enabled: document.getElementById('p-enabled').checked,
         api_key: isUpdate && apiKeyInput === '' ? null : apiKeyInput,

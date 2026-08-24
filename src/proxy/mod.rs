@@ -188,19 +188,25 @@ async fn dispatch(
         )));
     }
 
-    // 2.5 虚拟 provider 路由解析 (#179): 跟随 route_to 链到实体 provider.
-    // per-request 解析 — 切换指向只影响新请求 (in-flight 请求按已解析目标完成);
+    // 2.5 虚拟 provider 路由解析 (#179/#183): 跟随 route_to 链到实体 provider,
+    // 并收集链上 first-wins 的 model_override. per-request 解析 — 切换指向/模型
+    // 只影响新请求 (in-flight 请求按已解析目标完成);
     // 坏路由 (目标缺失 / disabled / 成环) → 503, message 只含 id + reason (SEC-2 同型).
     // WARN: 悬空/disabled 指向是虚拟切换的主要运维事故形态, 静默 503 排障成本高.
-    let provider = match state.providers.resolve_route(provider) {
-        Ok(p) => p,
+    let resolved = match state.providers.resolve_route(provider) {
+        Ok(r) => r,
         Err(e) => {
             tracing::warn!(virtual = %fp.name, error = %e, "route resolution failed");
             return Err(AppError::Unavailable(e.to_string()));
         }
     };
+    let provider = resolved.provider;
+    let model_override = resolved.model_override;
     if fp.name != provider.id {
         tracing::info!(virtual = %fp.name, upstream = %provider.id, "route resolved");
+    }
+    if let Some(m) = &model_override {
+        tracing::debug!(virtual = %fp.name, model_override = %m, "model override active");
     }
 
     // 3. 收集请求 body (跨协议和同协议都需要).
@@ -224,6 +230,7 @@ async fn dispatch(
             req_bytes,
             ingress,
             provider,
+            model_override,
             started,
             secrets_snapshot,
         )
@@ -236,6 +243,7 @@ async fn dispatch(
         req_bytes,
         ingress,
         provider,
+        model_override,
         started,
         secrets_snapshot,
     )

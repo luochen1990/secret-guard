@@ -105,6 +105,8 @@ pub struct NodeView {
     /// 实际承载转发的 provider id (route_to 解析后的链尾实体, #179).
     /// 非虚拟请求时即 URL 中的 provider id.
     pub upstream_id: Arc<str>,
+    /// 实际改写的 model 值 (仅 model_override 生效时 Some, #183).
+    pub upstream_model: Option<Arc<str>>,
     /// 是否流式响应.
     pub streamed: bool,
     /// 响应是否完整 (上游错误 / 客户端断开 → false).

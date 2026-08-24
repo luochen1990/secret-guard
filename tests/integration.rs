@@ -77,6 +77,7 @@ fn openai_provider(id: &str, base_url: &str) -> Provider {
         enabled: true,
         name: Some(id.into()),
         route_to: None,
+        model_override: None,
     }
 }
 
@@ -90,6 +91,7 @@ fn provider_with(id: &str, proto: Protocol, base_url: &str) -> Provider {
         enabled: true,
         name: Some(id.into()),
         route_to: None,
+        model_override: None,
     }
 }
 
@@ -378,6 +380,7 @@ fn dag_list_forward_records(dag: &ConversationDag) -> Vec<ForwardRecord> {
                 method: view.method,
                 path: view.path,
                 upstream_id: view.upstream_id.to_string(),
+                upstream_model: view.upstream_model.as_deref().map(str::to_string),
                 req_headers: detail.req_headers,
                 req_body: detail.req_body_raw,
                 resp_status: view.resp_status,
@@ -609,6 +612,7 @@ async fn provider_api_key_file_reads_secret_from_path() {
         enabled: true,
         name: None,
         route_to: None,
+        model_override: None,
     };
     let proxy_url = spawn_proxy_with_provider(provider).await;
 
@@ -647,6 +651,7 @@ async fn provider_api_key_file_missing_falls_through_to_no_auth() {
         enabled: true,
         name: None,
         route_to: None,
+        model_override: None,
     };
     let proxy_url = spawn_proxy_with_provider(provider).await;
 
@@ -682,6 +687,7 @@ async fn anthropic_provider_uses_x_api_key() {
         enabled: true,
         name: None,
         route_to: None,
+        model_override: None,
     };
     let proxy_url = spawn_proxy_with_provider(provider).await;
     let (status, _, _) =
@@ -5565,11 +5571,14 @@ async fn protocol_mismatch_silent_empty_response_warns() {
     .await;
 
     let (log, _log_guard) = capture_tracing(tracing::Level::WARN);
+    // body 命中 secret → redaction map 非空 → 响应走 restore 路径 (buffered_ir,
+    // reader 宽松解析发生处). 注: #183 M1 后, "配置了 secret 但未命中" 的请求响应
+    // 字节透传 (map 空), 不再经过 reader — MRE 形态只出现在真正的 restore 路径上.
     let (status, text, _) = proxy_request(
         &proxy_url,
         "POST",
         "/a/mixed/v1/messages",
-        r#"{"model":"claude","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}"#,
+        r#"{"model":"claude","max_tokens":100,"messages":[{"role":"user","content":"hi sk-mismatch-secret-123"}]}"#,
         &[("content-type", "application/json")],
     )
     .await;
@@ -5838,5 +5847,481 @@ async fn virtual_provider_cross_protocol_translates() {
         status,
         reqwest::StatusCode::OK,
         "cross-proto via virtual must translate"
+    );
+}
+
+// ─── model_override (#183, FWD-1 修订 / FWD-5 first-wins) ───────────────────
+//
+// 契约: prop_model_override_injects_into_egress_ir (egress model 无条件改写,
+// 无-secret 强制 IR 路径) / first-wins (单元已锁) / no_codec passthrough (D2 降级).
+
+#[tokio::test]
+async fn model_override_reaches_upstream() {
+    // override 到达上游: egress body 的 model 字段被改写 (含无 secret 场景).
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .match_body(mockito::Matcher::PartialJson(
+            serde_json::json!({"model": "claude-sonnet-4"}),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"claude-sonnet-4","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+        )
+        .create_async()
+        .await;
+
+    let mut provider = openai_provider("oa-main", &upstream.url());
+    provider.model_override = Some("claude-sonnet-4".into());
+    let dag = ConversationDag::new(64, 500, 1);
+    let dag_probe = dag.clone();
+    let proxy_url = spawn_proxy_static_dynamic(
+        vec![provider],
+        vec![],
+        reqwest::Client::new(),
+        dag,
+        test_secret_table(),
+    )
+    .await
+    .0;
+
+    // 客户端请求 model=gpt-4o, 上游必须收到 model=claude-sonnet-4 (match_body 已断言).
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        r#"{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"}]}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+
+    // 可观测性: record 的 model (egress 视角) = override 值, upstream_model 同值.
+    let id = dag_probe
+        .list_node_ids_newest_first()
+        .first()
+        .copied()
+        .unwrap();
+    let node = dag_probe.get_node(id).unwrap();
+    assert_eq!(node.model.as_deref(), Some("claude-sonnet-4"));
+    assert_eq!(
+        node.upstream_model.as_deref(),
+        Some("claude-sonnet-4"),
+        "upstream_model must be Some(override) when rewritten"
+    );
+}
+
+#[tokio::test]
+async fn model_override_no_secret_forces_ir_path() {
+    // 无 secret + override → 不走字节直传, 强制 IR 路径 (FWD-1 修订的契约代价).
+    // 判据: egress body 的 model 被改写 (直传路径不可能改写); 无 model 字段的
+    // body 也被注入 override (D3).
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .match_body(mockito::Matcher::PartialJson(
+            serde_json::json!({"model": "injected-model"}),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"injected-model","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+        )
+        .create_async()
+        .await;
+
+    let mut provider = openai_provider("oa-main", &upstream.url());
+    provider.model_override = Some("injected-model".into());
+    // 前提由结构保证: spawn_proxy_with_provider → test_secret_table() = 空表
+    // (override-only 场景, 验证 IR 路径被 override 单独强制).
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+
+    // body 无 model 字段 (OpenAI reader 容忍缺失 → IR.model 为空串 → 注入 override).
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        r#"{"messages":[{"role":"user","content":"Hi"}]}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "override injects model even when client body omits it"
+    );
+}
+
+#[tokio::test]
+async fn model_override_switch_via_put() {
+    // 即席切换模型: 虚拟 endpoint PUT model_override 后, 新请求用新 model
+    // (per-request; 历史轮次 record 不改写).
+    let mut upstream = spawn_mock_upstream().await;
+    let _m1 = upstream
+        .mock("POST", "/v1/chat/completions")
+        .match_body(mockito::Matcher::PartialJson(
+            serde_json::json!({"model": "model-v1"}),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"a","object":"chat.completion","created":1,"model":"model-v1","choices":[{"index":0,"message":{"role":"assistant","content":"1"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#)
+        .create_async()
+        .await;
+    let _m2 = upstream
+        .mock("POST", "/v1/chat/completions")
+        .match_body(mockito::Matcher::PartialJson(
+            serde_json::json!({"model": "model-v2"}),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"b","object":"chat.completion","created":1,"model":"model-v2","choices":[{"index":0,"message":{"role":"assistant","content":"2"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#)
+        .create_async()
+        .await;
+
+    let real = openai_provider("real", &upstream.url());
+    let virt = virtual_provider("virt", "real");
+    let dag = ConversationDag::new(64, 500, 1);
+    let dag_probe = dag.clone();
+    let proxy_url = spawn_proxy_static_dynamic(
+        vec![real, virt],
+        vec![],
+        reqwest::Client::new(),
+        dag,
+        test_secret_table(),
+    )
+    .await
+    .0;
+
+    // 1. PUT 设置 override = model-v1.
+    let (status, body, _) = proxy_request(
+        &proxy_url,
+        "PUT",
+        "/api/providers/virt",
+        r#"{"protocol":"openai","route_to":"real","model_override":"model-v1","base_url":"","enabled":true}"#,
+        &[("content-type", "application/json")],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "set override: {body}");
+
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/virt/v1/chat/completions",
+        CHAT_REQ_BODY,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+
+    // 2. 切换 model (PUT model_override = model-v2) → 新请求用 v2.
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "PUT",
+        "/api/providers/virt",
+        r#"{"protocol":"openai","route_to":"real","model_override":"model-v2","base_url":"","enabled":true}"#,
+        &[("content-type", "application/json")],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/virt/v1/chat/completions",
+        CHAT_REQ_BODY,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+
+    // 3. 两轮 record 各自如实记录 (egress model + upstream_model).
+    let ids = dag_probe.list_node_ids_newest_first();
+    assert_eq!(ids.len(), 2);
+    let latest = dag_probe.get_node(ids[0]).unwrap();
+    assert_eq!(latest.model.as_deref(), Some("model-v2"));
+    assert_eq!(latest.upstream_model.as_deref(), Some("model-v2"));
+    let prev = dag_probe.get_node(ids[1]).unwrap();
+    assert_eq!(prev.model.as_deref(), Some("model-v1"));
+    assert_eq!(prev.upstream_model.as_deref(), Some("model-v1"));
+}
+
+#[tokio::test]
+async fn model_override_gemini_passthrough_unrewritten() {
+    // D2 降级: 无 codec 协议 (Gemini) + override → body 不改写 (原样 model 到上游)
+    // + WARN (可观测). FWD-5 prop_model_override_no_codec_passthrough.
+    let mut upstream = spawn_mock_upstream().await;
+    // match_body 断言: 上游收到的仍是客户端原始 model (未被 override 改写).
+    let _m = upstream
+        .mock("POST", "/v1beta/models/gemini-pro:generateContent")
+        .match_body(mockito::Matcher::PartialJson(
+            serde_json::json!({"model": "gemini-pro"}),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"candidates":[{"content":{"parts":[{"text":"hi"}]}}]}"#)
+        .create_async()
+        .await;
+
+    let mut provider = provider_with("gem-main", Protocol::Gemini, &upstream.url());
+    provider.model_override = Some("gemini-flash".into());
+    let (log, _guard) = capture_tracing(tracing::Level::WARN);
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/g/gem-main/v1beta/models/gemini-pro:generateContent",
+        r#"{"model":"gemini-pro","contents":[{"parts":[{"text":"hello"}]}]}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "gemini + override still forwards"
+    );
+
+    let log_text = log.text();
+    assert!(
+        log_text.contains("model_override") && log_text.contains("does not"),
+        "#183 D2: no-codec override must WARN; log: {log_text}"
+    );
+}
+
+// M3 补强: FWD-1 联合公式 (override × secret 共存) / D5 (Responses 流式 501) /
+// cross_proto 注入 / PUT 清空往返.
+
+#[tokio::test]
+async fn model_override_with_secret_joint() {
+    // FWD-1 修订联合公式: egress == normalize(client).replace(real, mock).replace(model, override).
+    // 两个替换同时成立: 上游收到 model=override (match_body), 且 egress body 含 mock
+    // 不含 real (DAG record 的 req_body_raw 即 egress 视角, 直接断言).
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .match_body(mockito::Matcher::PartialJson(
+            serde_json::json!({"model": "target-model"}),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"c1","object":"chat.completion","created":1,"model":"target-model","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+        )
+        .create_async()
+        .await;
+
+    let mut provider = openai_provider("oa-main", &upstream.url());
+    provider.model_override = Some("target-model".into());
+    let dag = ConversationDag::new(64, 500, 1);
+    let dag_probe = dag.clone();
+    let proxy_url = spawn_proxy_static_dynamic(
+        vec![provider],
+        vec![],
+        reqwest::Client::new(),
+        dag,
+        test_secret_table_with(vec![secret("joint-secret", "sk-live-joint-secret")]),
+    )
+    .await
+    .0;
+
+    let (status, body, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        r#"{"model":"gpt-4o","messages":[{"role":"user","content":"key sk-live-joint-secret"}]}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "joint redact+override forwards: {body}"
+    );
+
+    // egress body (record req_body_raw): secret 已 redact + model 已 override.
+    let id = dag_probe.list_node_ids_newest_first()[0];
+    let detail = dag_probe.get_node_detail(id).unwrap();
+    assert!(
+        !detail.req_body_raw.contains("sk-live-joint-secret"),
+        "real secret must not reach egress body"
+    );
+    assert!(detail.req_body_raw.contains("target-model"));
+}
+
+#[tokio::test]
+async fn model_override_responses_streaming_returns_501() {
+    // D5: override-only (无 secret) 亦迫使 IR 路径 → Responses 流式触发既有 501.
+    let upstream = spawn_mock_upstream().await;
+    let mut provider = provider_with("resp-main", Protocol::OpenAIResponses, &upstream.url());
+    provider.model_override = Some("gpt-5".into());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+    let (status, body, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/r/resp-main/v1/responses",
+        r#"{"model":"gpt-4o","stream":true,"input":"Hi"}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::NOT_IMPLEMENTED);
+    assert!(
+        body.contains("model_override"),
+        "501 message must hint the override cause: {body}"
+    );
+}
+
+#[tokio::test]
+async fn model_override_cross_protocol() {
+    // cross_proto + override: OpenAI ingress → Anthropic egress, /v1/messages 的
+    // model 字段 = override (注入点共享 parse_request_ir, egress writer 写出).
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/messages")
+        .match_body(mockito::Matcher::PartialJson(
+            serde_json::json!({"model": "claude-target"}),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"msg_x","type":"message","role":"assistant","content":[{"type":"text","text":"OK"}],"model":"claude-target","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}"#,
+        )
+        .create_async()
+        .await;
+
+    let mut ant = provider_with("ant-main", Protocol::Anthropic, &upstream.url());
+    ant.model_override = Some("claude-target".into());
+    let virt = virtual_provider("virt", "ant-main");
+    let proxy_url = spawn_proxy_static_dynamic(
+        vec![ant, virt],
+        vec![],
+        reqwest::Client::new(),
+        ConversationDag::new(64, 500, 1),
+        test_secret_table(),
+    )
+    .await
+    .0;
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/virt/v1/chat/completions",
+        r#"{"model":"gpt-4o","max_tokens":16,"messages":[{"role":"user","content":"Hi"}]}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "cross-proto override translates model"
+    );
+}
+
+#[tokio::test]
+async fn model_override_put_clear_roundtrip() {
+    // 三态清空分支: PUT model_override="" → effective 清空 → 后续请求 model 透传.
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .match_body(mockito::Matcher::PartialJson(
+            serde_json::json!({"model": "gpt-4o"}),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"c","object":"chat.completion","created":1,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+        )
+        .create_async()
+        .await;
+
+    let real = openai_provider("real", &upstream.url());
+    let virt = virtual_provider("virt", "real");
+    let dag = ConversationDag::new(64, 500, 1);
+    let dag_probe = dag.clone();
+    let proxy_url = spawn_proxy_static_dynamic(
+        vec![real, virt],
+        vec![],
+        reqwest::Client::new(),
+        dag,
+        test_secret_table(),
+    )
+    .await
+    .0;
+
+    // 1. 设置 override.
+    let (status, body, _) = proxy_request(
+        &proxy_url,
+        "PUT",
+        "/api/providers/virt",
+        r#"{"protocol":"openai","route_to":"real","model_override":"tmp-model","base_url":"","enabled":true}"#,
+        &[("content-type", "application/json")],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["model_override"], "tmp-model");
+
+    // 2. 清空 (PUT model_override="") → static 层未配置 override, 清空后继承回落
+    //    None (#157 限制不触发 — 该限制只锁 static 已配置的场景)。
+    let (status, body, _) = proxy_request(
+        &proxy_url,
+        "PUT",
+        "/api/providers/virt",
+        r#"{"protocol":"openai","route_to":"real","model_override":"","base_url":"","enabled":true}"#,
+        &[("content-type", "application/json")],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(v["model_override"].is_null(), "cleared: {body}");
+
+    // 3. 后续请求 model 透传 (gpt-4o 原样到上游, match_body 已断言) + record 无 override 痕迹.
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/virt/v1/chat/completions",
+        CHAT_REQ_BODY,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let id = dag_probe.list_node_ids_newest_first()[0];
+    let node = dag_probe.get_node(id).unwrap();
+    assert_eq!(node.model.as_deref(), Some("gpt-4o"));
+    assert_eq!(node.upstream_model, None, "no override after clear");
+}
+
+#[tokio::test]
+async fn model_override_response_stays_byte_exact_streaming() {
+    // M1 (#183): override 只改写请求半段; 响应半段在 redaction map 为空时保持
+    // **字节透传** — 用带非常规格式 (紧凑空白 / [DONE] 前空行) 的 SSE 断言逐字节相等.
+    let sse_body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        "\n",
+        "data: [DONE]\n\n"
+    );
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse_body)
+        .create_async()
+        .await;
+
+    let mut provider = openai_provider("oa-main", &upstream.url());
+    provider.model_override = Some("target-model".into());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/o/oa-main/v1/chat/completions"))
+        .body(r#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"Hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let text = resp.text().await.unwrap();
+    assert_eq!(
+        text, sse_body,
+        "response must be byte-exact when override-only (map empty)"
     );
 }

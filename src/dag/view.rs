@@ -75,6 +75,8 @@ pub(super) fn node_view(inner: &DagInner, node_id: Uuid) -> Option<NodeView> {
         model: node.event.model.clone(),
         // 实际承载转发的 provider id (#179; 非虚拟请求 = URL provider id).
         upstream_id: std::sync::Arc::clone(&node.event.upstream_id),
+        // 实际改写的 model 值 (#183; None = 未 override / 透传).
+        upstream_model: node.event.upstream_model.clone(),
         streamed: resp.as_ref().map(|r| r.streamed).unwrap_or(false),
         resp_complete: resp.as_ref().map(|r| r.resp_complete).unwrap_or(false),
         error: resp.as_ref().and_then(|r| r.error.clone()),

@@ -586,6 +586,7 @@ mod tests {
             model: None,
             round_role: IrRole::User,
             redactions: Arc::from(Vec::new()),
+            upstream_model: None,
             upstream_id: Arc::from("test"),
         };
         let record_id = dag.push_messages(msgs, event);

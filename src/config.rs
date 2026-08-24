@@ -1266,6 +1266,7 @@ fn serialized_full_sample_paths() -> Vec<String> {
             enabled: true,
             name: Some("sample".into()),
             route_to: None,
+            model_override: None,
         }],
         secrets: SecretsConfig {
             entries: vec![SecretEntry {
@@ -1916,6 +1917,7 @@ on_probe_exhausted = "fail_closed"
             enabled: true,
             name: Some("P1".into()),
             route_to: None,
+            model_override: None,
         });
         state
             .decisions
@@ -1983,6 +1985,7 @@ on_probe_exhausted = "fail_closed"
                 api_key_file: None,
                 enabled: true,
                 route_to: None,
+                model_override: None,
             }
         }
 
@@ -2532,6 +2535,7 @@ mod proptests {
             enabled: true,
             name: Some(format!("name-{id}")),
             route_to: None,
+            model_override: None,
         }
     }
 

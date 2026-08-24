@@ -157,6 +157,19 @@ pub struct Provider {
     /// (`docs/design/contracts.md`).
     #[serde(default)]
     pub route_to: Option<String>,
+    /// 可选: 出站请求的 model 字段强制重写值 (#183). 设置后, 经此 provider (直接
+    /// 或作为 route_to 链的一跳) 转发的请求 body 顶层 `model` 字段被无条件替换为
+    /// 该值 — 客户端请求的 model 名被丢弃 (这正是 "虚拟 endpoint = 模型 X" 的语义).
+    ///
+    /// - 链上解析 **first-wins**: 沿 route_to 链从入口起第一个非空 override 生效
+    ///   (见 `resolve_route` / FWD-5 `prop_model_override_first_hop_wins`);
+    /// - 代价 (FWD-1 修订, §99 登记): override 生效时同协议无-secret 请求从字节
+    ///   直传降级为 IR 改写 (normalize 等价; 上游前缀缓存失效) — 用户主动选择的降级;
+    /// - 无 codec 协议 (Gemini/Ollama) 无法改写: WARN + 字节透传 (body 原样);
+    /// - Responses 流式 + override: 强制 IR 路径 → 既有 501;
+    /// - 空串非法 (validate 拒绝; 清空配置请省略字段 / WebUI 发 "").
+    #[serde(default)]
+    pub model_override: Option<String>,
     /// 是否启用. `false` 时转发到该 provider 返回 503.
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -247,6 +260,30 @@ impl DynamicEntry for Provider {
         } else {
             validate_base_url(&self.base_url)?;
         }
+        // model_override 空串非法 (#183): "清空" 语义应省略字段 (TOML) / WebUI 发 "".
+        // 静默 normalize (Some("") → None) 会掩盖手滑留下的空配置, fail-fast 更优.
+        // 长度上限与空白拒绝: 对齐 id/name 的输入卫生 (超长值进 WebUI pill / JSON /
+        // per-node DAG 存储; 纯空白在 WebUI 侧被 trim 掉, 配置侧同标准拒绝).
+        if let Some(m) = &self.model_override {
+            if m.is_empty() {
+                return Err(format!(
+                    "provider {} has empty model_override; omit the field to clear it",
+                    self.id
+                ));
+            }
+            if m.chars().count() > 128 {
+                return Err(format!(
+                    "provider {} model_override exceeds 128 chars",
+                    self.id
+                ));
+            }
+            if m.trim().is_empty() {
+                return Err(format!(
+                    "provider {} model_override is whitespace-only",
+                    self.id
+                ));
+            }
+        }
         // api_key 与 api_key_file 互斥: 同时设置时语义不明 (effective_api_key 会优先 api_key,
         // 但这种配置几乎肯定是误操作 — 比如 toml 既填了 api_key 又忘了删 api_key_file).
         if !self.api_key.is_empty() && self.api_key_file.is_some() {
@@ -285,6 +322,12 @@ impl DynamicEntry for Provider {
         if self.route_to.is_none() {
             self.route_to = static_ver.route_to.clone();
         }
+        // model_override 同语义 (#183): override 未记录 (None) → 从 static 继承.
+        // 已知限制同 route_to: static 配置了 override 的条目无法经 override 清空
+        // (PUT 省略 → 继承回 static 值); 根治同属 #157 schema 演进.
+        if self.model_override.is_none() {
+            self.model_override = static_ver.model_override.clone();
+        }
     }
 }
 
@@ -315,6 +358,8 @@ pub struct EffectiveProvider {
     pub name: Option<String>,
     /// 虚拟 endpoint 的路由目标 (Some = 虚拟 provider). 见 [`Provider::route_to`].
     pub route_to: Option<String>,
+    /// 出站 model 强制重写值 (#183). 见 [`Provider::model_override`].
+    pub model_override: Option<String>,
 
     // ─── provenance 元信息 (WebUI 渲染用) ───
     pub source: EffectiveSource,
@@ -338,6 +383,8 @@ pub struct ProviderMasked {
     pub enabled: bool,
     /// 虚拟 endpoint 的路由目标 (Some = 虚拟 provider). 见 [`Provider::route_to`].
     pub route_to: Option<String>,
+    /// 出站 model 强制重写值 (#183). 见 [`Provider::model_override`].
+    pub model_override: Option<String>,
 }
 
 impl From<Provider> for ProviderMasked {
@@ -352,6 +399,7 @@ impl From<Provider> for ProviderMasked {
             api_key_length,
             enabled: p.enabled,
             route_to: p.route_to,
+            model_override: p.model_override,
         }
     }
 }
@@ -366,12 +414,16 @@ impl DynamicTable<Provider> {
             .collect()
     }
 
-    /// 解析虚拟 provider 路由链 (#179): 跟随 `route_to` 直到链尾的实体 provider.
+    /// 解析虚拟 provider 路由链 (#179): 跟随 `route_to` 直到链尾的实体 provider,
+    /// 并收集链上生效的 `model_override` (#183).
     ///
     /// - **per-request 语义**: dispatch 每次转发前调用, 切换指向只影响新请求
     ///   (in-flight 请求已拿到解析结果, 按旧目标完成, 无需 drain);
     /// - 每跳走 [`Self::get_effective`] (含 static+dynamic+decision 合并与 #157 继承),
     ///   链上每个 provider 必须存在且 entry-level enabled;
+    /// - **model_override first-wins** (#183): 沿链从入口起第一个非空 override 生效
+    ///   — 入口 (虚拟级 "端点=模型X") > 中间跳 > 链尾实体 ("channel 强制模型"),
+    ///   高层意图优先, 切换 target 不隐式改变生效模型;
     /// - **链内非原子**: 两跳以上链的逐跳解析各自独立读表, 解析期间表被修改时
     ///   本请求可能走 "切换前 + 切换后" 的混合链 — 这是 per-request 解析的自然
     ///   语义 (本请求视角, 链在解析起点时刻的快照), 不额外加锁;
@@ -382,9 +434,10 @@ impl DynamicTable<Provider> {
     ///
     /// 错误消息只含 provider id 与 reason 枚举 (SEC-2 同型, 无 secret),
     /// 经 `AppError::Unavailable` 原样回传客户端 503 body.
-    pub fn resolve_route(&self, entry: Provider) -> Result<Provider, RouteError> {
+    pub fn resolve_route(&self, entry: Provider) -> Result<ResolvedRoute, RouteError> {
         let mut cur = entry;
         let mut visited = HashSet::from([cur.id.clone()]);
+        let mut model_override = cur.model_override.clone();
         while let Some(target) = cur.route_to.clone() {
             let next = self
                 .get_effective(&target)
@@ -395,9 +448,15 @@ impl DynamicTable<Provider> {
             if !visited.insert(next.id.clone()) {
                 return Err(RouteError::Cycle(next.id));
             }
+            if model_override.is_none() {
+                model_override = next.model_override.clone();
+            }
             cur = next;
         }
-        Ok(cur)
+        Ok(ResolvedRoute {
+            provider: cur,
+            model_override,
+        })
     }
 
     /// upsert 前校验: 写入 `entry` 后 route_to 链是否会成环 (WebUI 侧拒绝, 400).
@@ -464,6 +523,17 @@ impl std::fmt::Display for RouteError {
 
 impl std::error::Error for RouteError {}
 
+/// 路由解析结果 (#179/#183): 链尾实体 provider + 链上生效的 model_override.
+///
+/// `model_override` = 沿链 first-wins 收集的非空值 (全链未配置 → None, 即透传).
+#[derive(Debug, Clone)]
+pub struct ResolvedRoute {
+    /// 链尾实体 provider (route_to = None 的那一跳; 非虚拟请求即入口自身).
+    pub provider: Provider,
+    /// 链上生效的 model_override (first-wins; None = 客户端 model 透传).
+    pub model_override: Option<String>,
+}
+
 /// 给定 (static_ver, dynamic_ver, mode), 计算 effective provider 的合并视图.
 /// 若 Disabled 或三者皆空, 返回 None.
 ///
@@ -489,6 +559,7 @@ fn compute_effective_provider(
         enabled: raw.enabled,
         name: raw.name,
         route_to: raw.route_to,
+        model_override: raw.model_override,
         source,
         decision: mode,
         static_version: static_masked,
@@ -516,6 +587,7 @@ mod tests {
             enabled: true,
             name: Some(format!("name-{id}")),
             route_to: None,
+            model_override: None,
         }
     }
 
@@ -622,6 +694,7 @@ mod tests {
             enabled: true,
             name: None,
             route_to: None,
+            model_override: None,
         };
         assert!(bad_id.validate().is_err());
 
@@ -635,6 +708,7 @@ mod tests {
             enabled: true,
             name: None,
             route_to: None,
+            model_override: None,
         };
         assert!(bad_url.validate().is_err());
 
@@ -653,6 +727,7 @@ mod tests {
             enabled: true,
             name: None,
             route_to: None,
+            model_override: None,
         };
         let err = both.validate().unwrap_err();
         assert!(err.contains("both api_key and api_key_file"), "got: {err}");
@@ -672,6 +747,7 @@ mod tests {
             enabled: true,
             name: None,
             route_to: None,
+            model_override: None,
         };
         assert_eq!(p.effective_api_key(), "sk-direct");
     }
@@ -695,6 +771,7 @@ mod tests {
             enabled: true,
             name: None,
             route_to: None,
+            model_override: None,
         };
         assert_eq!(p.effective_api_key(), "sk-from-file");
 
@@ -713,6 +790,7 @@ mod tests {
             enabled: true,
             name: None,
             route_to: None,
+            model_override: None,
         };
         assert_eq!(p.effective_api_key(), "");
     }
@@ -749,6 +827,7 @@ mod tests {
             enabled: true,
             name: None,
             route_to: None,
+            model_override: None,
         };
 
         // 1. 文件不存在 → 空 + WARNED 被插入 (首次失败).
@@ -793,6 +872,7 @@ mod tests {
             enabled: true,
             name: None,
             route_to: None,
+            model_override: None,
         };
         assert_eq!(p.effective_api_key(), "");
         assert!(
@@ -814,6 +894,7 @@ mod tests {
             enabled: true,
             name: None,
             route_to: None,
+            model_override: None,
         };
         assert_eq!(p.effective_api_key(), "");
     }
@@ -973,7 +1054,7 @@ mod tests {
         // 实体 provider (route_to=None) 原样返回, 零额外跳.
         let t = route_table();
         let real = t.get_effective("real").unwrap();
-        let out = t.resolve_route(real.clone()).unwrap();
+        let out = t.resolve_route(real.clone()).unwrap().provider;
         assert_eq!(out.id, "real");
         assert_eq!(out.base_url, "https://upstream");
         assert_eq!(out.api_key, "sk-real", "resolved provider carries real key");
@@ -984,7 +1065,7 @@ mod tests {
         // v1 → v2 → real: 解析到链尾实体, 携带其实体字段 (base_url/api_key).
         let t = route_table();
         let v1 = t.get_effective("v1").unwrap();
-        let out = t.resolve_route(v1).unwrap();
+        let out = t.resolve_route(v1).unwrap().provider;
         assert_eq!(out.id, "real");
         assert_eq!(out.base_url, "https://upstream");
         assert_eq!(out.api_key, "sk-real");
@@ -1167,7 +1248,7 @@ mod tests {
         t.set_decision("x", OverrideMode::PreferStatic).unwrap();
         let eff = t.get_effective("x").unwrap();
         assert_eq!(eff.route_to.as_deref(), Some("real1"));
-        assert_eq!(t.resolve_route(eff).unwrap().id, "real1");
+        assert_eq!(t.resolve_route(eff).unwrap().provider.id, "real1");
     }
 
     #[test]
@@ -1185,6 +1266,162 @@ mod tests {
         let err = t.resolve_route(t.get_effective("v").unwrap()).unwrap_err();
         assert_eq!(err, RouteError::Missing("real".into()));
         assert!(err.to_string().contains("disabled by decision"));
+    }
+
+    // ─── model_override (#183, FWD-5 first-wins / FWD-1 修订) ──────────────
+
+    /// 表: entry(override=A) → mid(override=B) → real(override=C). 三层全配.
+    fn override_chain() -> ProviderTable {
+        let mut entry = v("entry", "mid");
+        entry.model_override = Some("model-A".into());
+        let mut mid = v("mid", "real");
+        mid.model_override = Some("model-B".into());
+        let mut real = p("real", Protocol::OpenAI, "https://u");
+        real.model_override = Some("model-C".into());
+        ProviderTable::new(
+            vec![entry, mid, real],
+            vec![],
+            empty_decisions(),
+            tempfile_path(),
+        )
+    }
+
+    #[test]
+    fn resolve_route_model_override_first_hop_wins() {
+        // FWD-5 prop_model_override_first_hop_wins: 沿链从入口起第一个非空值生效.
+        let t = override_chain();
+        // 三层全配 → 入口的 A 胜.
+        let r = t.resolve_route(t.get_effective("entry").unwrap()).unwrap();
+        assert_eq!(r.model_override.as_deref(), Some("model-A"));
+        assert_eq!(r.provider.id, "real");
+
+        // 中间层直连 (跳过 entry) → B 胜.
+        let r = t.resolve_route(t.get_effective("mid").unwrap()).unwrap();
+        assert_eq!(r.model_override.as_deref(), Some("model-B"));
+
+        // 链尾直连 → C 胜 (实体级 "channel 强制模型" 用法).
+        let r = t.resolve_route(t.get_effective("real").unwrap()).unwrap();
+        assert_eq!(r.model_override.as_deref(), Some("model-C"));
+    }
+
+    #[test]
+    fn resolve_route_model_override_skips_unconfigured_hops() {
+        // 入口/中间跳均未配 → 链尾实体的 override 生效; 全链未配 → None (透传).
+        // 直接构造目标形状 (三层链, 仅链尾配 C)。
+        let mut entry = v("entry", "mid");
+        entry.model_override = None;
+        let mut mid = v("mid", "real");
+        mid.model_override = None;
+        let mut real = p("real", Protocol::OpenAI, "https://u");
+        real.model_override = Some("model-C".into());
+        let t = ProviderTable::new(
+            vec![entry, mid, real],
+            vec![],
+            empty_decisions(),
+            tempfile_path(),
+        );
+        let r = t.resolve_route(t.get_effective("entry").unwrap()).unwrap();
+        assert_eq!(r.model_override.as_deref(), Some("model-C"));
+        // 全链未配 → None (透传).
+        let none_table = ProviderTable::new(
+            vec![v("e", "r"), p("r", Protocol::OpenAI, "https://u")],
+            vec![],
+            empty_decisions(),
+            tempfile_path(),
+        );
+        let r = none_table
+            .resolve_route(none_table.get_effective("e").unwrap())
+            .unwrap();
+        assert_eq!(r.model_override, None);
+    }
+
+    #[test]
+    fn inherit_from_static_covers_model_override() {
+        // static 配了 override + override 未记录 → 继承 (三层读路径一致).
+        let tmp = tempfile_path();
+        let mut s = p("x", Protocol::OpenAI, "https://s");
+        s.model_override = Some("m-static".into());
+        let mut d = p("x", Protocol::OpenAI, "https://d");
+        d.model_override = None;
+        let t = ProviderTable::new(vec![s], vec![d], empty_decisions(), tmp);
+        assert_eq!(
+            t.get_effective("x").unwrap().model_override.as_deref(),
+            Some("m-static")
+        );
+        let x = t.effective_snapshot().into_iter().next().unwrap();
+        assert_eq!(x.model_override.as_deref(), Some("m-static"));
+    }
+
+    #[test]
+    fn validate_rejects_empty_model_override() {
+        let mut bad = p("x", Protocol::OpenAI, "https://u");
+        bad.model_override = Some(String::new());
+        let err = bad.validate().unwrap_err();
+        assert!(err.contains("empty model_override"), "got: {err}");
+        // 纯空白 / 超长同样拒绝 (输入卫生, 对齐 id/name 纪律).
+        let mut ws = p("x", Protocol::OpenAI, "https://u");
+        ws.model_override = Some("   ".into());
+        assert!(ws.validate().is_err());
+        let mut long = p("x", Protocol::OpenAI, "https://u");
+        long.model_override = Some("m".repeat(129));
+        assert!(long.validate().is_err());
+        // 省略 (None) / 非空均合法.
+        assert!(p("x", Protocol::OpenAI, "https://u").validate().is_ok());
+        let mut ok = p("y", Protocol::OpenAI, "https://u");
+        ok.model_override = Some("claude-sonnet-4".into());
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn resolve_route_model_override_static_middle_hop_inherits() {
+        // L5: 继承 × first-wins 交互 — static 中间跳配了 override, dynamic override
+        // 未记录 → get_effective 展开后参与链上收集.
+        let tmp = tempfile_path();
+        let mut mid_static = v("mid", "real");
+        mid_static.model_override = Some("m-mid".into());
+        let t = ProviderTable::new(
+            vec![mid_static, p("real", Protocol::OpenAI, "https://u")],
+            vec![v("mid", "real")], // dynamic override 未记录 model_override
+            empty_decisions(),
+            tmp,
+        );
+        let mut entry = v("entry", "mid"); // 入口未配
+        entry.model_override = None;
+        let r = t.resolve_route(entry).unwrap();
+        // mid 的 effective override 从 static 继承 m-mid → 链上第一个非空.
+        assert_eq!(r.model_override.as_deref(), Some("m-mid"));
+    }
+
+    #[test]
+    fn toml_model_override_roundtrip_and_default() {
+        // 缺省 → None; 显式 → Some.
+        let legacy = r#"
+            id = "test"
+            protocol = "openai"
+            base_url = "https://api.example.com"
+        "#;
+        let p: Provider = toml::from_str(legacy).expect("legacy parse");
+        assert!(p.model_override.is_none());
+
+        let with_override = r#"
+            id = "my-model"
+            protocol = "openai"
+            route_to = "openai-main"
+            model_override = "gpt-4o-mini"
+        "#;
+        let p: Provider = toml::from_str(with_override).expect("parse");
+        assert_eq!(p.model_override.as_deref(), Some("gpt-4o-mini"));
+        assert!(p.validate().is_ok());
+
+        // 空串在 static 加载即 fail-fast (validate 拒绝).
+        let empty_str = r#"
+            id = "bad"
+            protocol = "openai"
+            base_url = "https://u"
+            model_override = ""
+        "#;
+        let p: Provider = toml::from_str(empty_str).expect("parse");
+        assert!(p.validate().is_err());
     }
 
     // FWD-5 环终止 property: 任意 route 图 (含环), `resolve_route` 有限步返回
@@ -1212,8 +1449,8 @@ mod tests {
             for id in &ids {
                 if let Some(entry) = t.get_effective(id) {
                     // Err 分支 = 有限步返回明确错误 (同样满足终止性), 无需断言.
-                    if let Ok(final_p) = t.resolve_route(entry) {
-                        proptest::prop_assert!(final_p.route_to.is_none());
+                    if let Ok(resolved) = t.resolve_route(entry) {
+                        proptest::prop_assert!(resolved.provider.route_to.is_none());
                     }
                 }
             }

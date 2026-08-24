@@ -65,6 +65,7 @@ value = "ghp_0123456789abcdefghijklmnopqrstuvwxyz"
 | `api_key` | string | `""` | 上游 API key 明文. 与 `api_key_file` 互斥 (同时设置启动报错). |
 | `api_key_file` | path | — | 从文件读 API key (适合 sops-nix / systemd LoadCredential 等外部注入, 让 toml 本身不含敏感数据). 每次请求时读取, 读不到按空 key 处理并打 WARN. 文件内容自动去首尾空白. |
 | `route_to` | string | — | **虚拟 endpoint**: 指向另一 provider 的 id. 设置后本 provider 不直接转发 — `base_url` / `api_key` / `api_key_file` 被忽略 (base_url 可为空), 请求经 `route_to` 链解析到链尾的实体 provider. 解析是 **per-request** 的: 在 WebUI 即席切换指向只影响新请求. 链上目标必须存在且 `enabled`, 否则 503; 自环启动即报错, 跨条目环在 WebUI 写入时拒绝 (手写配置产生的环在请求时返回 503, 不挂起). |
+| `model_override` | string | — | **出站 model 强制重写**: 经此 provider (直接或作为路由链一跳) 转发的请求 body 顶层 `model` 字段被无条件替换为该值, 客户端请求的模型名被丢弃. 链上 **first-wins** (入口起第一个非空值生效). 代价: override 生效时该 provider 的无-secret 请求从字节直传降级为 IR 改写 (语义等价, 上游前缀缓存失效). Gemini/Ollama 无 codec 无法改写: WARN + 原样透传. 空串非法 (清空请省略字段 / WebUI 留空). |
 | `enabled` | bool | `true` | `false` 时转发到该 provider 返回 503. |
 | `name` | string | — | 可选的人类可读名称 (仅 WebUI 显示). |
 
@@ -100,12 +101,15 @@ route_to = "openai-main"
   与非虚拟行为一致).
 - WebUI timeline / 轮次详情的 "via ..." 角标与 `Upstream` 字段显示每轮实际命中的
   上游 (虚拟切换后历史轮次仍如实记录各自归属).
-- **P1 限制**: 请求 body 里的 `model` 字段原样透传 — 虚拟切换适合"同 model 名多
-  上游"场景 (直连 ↔ 中转站); 跨模型名切换需后续的 model_override.
+- **跨模型名切换用 `model_override`** (#183): 虚拟 endpoint 同时配 `route_to` +
+  `model_override` 即 "切换 = (target, model) 二元组" — 客户端 body 里的 model 被
+  重写为目标模型, 适配 gpt-4o ↔ claude 等跨模型切换. 代价: 该 endpoint 的请求
+  放弃字节直传 (上游前缀缓存失效), 见字段表.
 - 已知限制 (#157 同型): static 声明的虚拟 provider 无法经 WebUI override 改回实体
   provider (未记录 route_to 的 override 会继承 static 的指向); dynamic-only 条目
   可完整 "虚拟 ↔ 实体" 往返 (编辑表单选 "none — real provider", 切回实体时需同时
-  填写 Base URL — 表单会前置提示).
+  填写 Base URL — 表单会前置提示). `model_override` 的清空受同型限制 (static 配置
+  了 override 的条目无法经 override 清空).
 
 ## `[[secrets.entries]]` — 需要保护的 Secret (嵌套在 `[secrets]` 下)
 

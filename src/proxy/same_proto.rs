@@ -2,12 +2,14 @@
 //!
 //! # 职责边界
 //!
-//! 同协议下按 SecretTable 是否空再分两路:
+//! 同协议下按 "SecretTable 非空 **或 model_override 生效**" 分两路 (#183 后判据扩维):
 //!
-//! - [`same_proto_forward`] (SecretTable 非空): IR 路径 (reader → redact_ir → writer).
-//!   非流式响应走 buffered + restore_ir_response; 流式响应走 StreamTranslate 同协议
-//!   restore 模式 (恢复流式 UX, 但失去 byte-exact).
-//! - [`same_proto_passthrough`] (SecretTable 空): 字节透传 (零回归, 最热路径).
+//! - [`same_proto_forward`] (有 secret 或 override): IR 路径 (reader → [model 注入] →
+//!   redact_ir → writer). 请求侧经 IR 改写 (FWD-1 修订授权: model 重写 / redact).
+//!   响应侧按 redaction map 分流 — map 非空才需要 restore: 流式 2xx 走 StreamTranslate
+//!   同协议 restore 模式, 其余走 buffered_ir; **map 为空 (override-only / secret 未命中)
+//!   响应保持字节透传** (fan_out_streaming, byte-exact + 流式 UX + parsed view 照常累积).
+//! - [`same_proto_passthrough`] (无 secret 且无 override): 字节透传 (零回归, 最热路径).
 //!
 //! **同协议 + 无 redact 保持 byte-exact + 流式 UX 零回归**; 同协议 + redact + 非流式
 //! 仅 normalize_json 相等 (IR re-serialize 改变字段顺序/空白), 语义信息通过 wire 形态
@@ -29,12 +31,13 @@ use super::helpers::{
 };
 use super::recorder::{build_call_event, parse_request_ir, redact_and_derive};
 
-/// 同协议转发: 字节透传 (无 redact) 或 IR 路径 (启用 redact).
+/// 同协议转发: 字节透传 (无 redact 且无 override) 或 IR 路径 (有 redact 或 override).
 ///
-/// **同协议 + 无 redact**: 字节透传, 保留流式 UX. 这条路径零回归.
-/// **同协议 + redact**: 走 IR (reader → redact_ir → writer).
-///   非流式响应: buffered + restore_ir_response.
-///   流式响应: 用 StreamTranslate 同协议 + restore 模式, 恢复流式 UX.
+/// **同协议 + 无 redact 无 override**: 字节透传, 保留流式 UX. 这条路径零回归.
+/// **同协议 + redact / model_override (#183)**: 请求侧走 IR (reader → model 注入 →
+///   redact_ir → writer); 响应侧仅 redaction map 非空时需要 restore
+///   (流式 2xx: StreamTranslate restore 模式; 其余: buffered_ir), map 为空时响应
+///   字节透传 (byte-exact 不受 override 影响).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn same_proto_forward(
     state: crate::state::AppState,
@@ -43,24 +46,29 @@ pub(crate) async fn same_proto_forward(
     req_bytes: Bytes,
     ingress: Protocol,
     provider: Provider,
+    model_override: Option<String>,
     started: Instant,
     secrets_snapshot: Vec<crate::secrets::SecretEntry>,
 ) -> Result<Response<Body>, AppError> {
-    if secrets_snapshot.is_empty() {
+    // 字节直传仅当 "无 secret 且无 model_override" (#183): override 需要改写
+    // egress IR 的 model 字段, 强制走 IR 路径 (FWD-1 修订的契约代价).
+    if secrets_snapshot.is_empty() && model_override.is_none() {
         // 字节透传: 不进入 codec, 不做 redact. 这是最热路径 (多数 provider 无 secret).
         return same_proto_passthrough(state, fp, parts, req_bytes, ingress, provider, started)
             .await;
     }
 
-    // IR 路径 (启用 redact).
+    // IR 路径 (启用 redact / model 改写).
     use crate::codec::Protocol as CodecProtocol;
     let Some(codec_proto) = CodecProtocol::from_native(ingress) else {
         // codec 不支持此协议 (Gemini/Ollama), 但同协议 + SecretTable 非空时本应做 redact.
         // 降级到字节透传: secret 原样转发到上游 (静默失效风险). 用 warn 让运维注意到.
         // 安全: 只记 protocol + provider id, 永不记 secret 值.
+        // #183 D2: model_override 同型降级 — 无 codec 无法改写 model, WARN + 原样透传.
         warn!(
-            "secrets configured for {} provider '{}', but codec does not cover {}; \
-             secrets will be forwarded unredacted to upstream",
+            "secrets or model_override configured for {} provider '{}', but codec does not \
+             cover {}; requests will be forwarded as-is (secrets unredacted / model not \
+             rewritten)",
             ingress.name(),
             provider.id,
             ingress.name()
@@ -72,17 +80,24 @@ pub(crate) async fn same_proto_forward(
     let reader = codec_proto.reader();
     let writer = codec_proto.writer();
 
-    // 1-2. 解析请求 body → IR (共享 helper).
-    let mut ir = parse_request_ir(&req_bytes, ingress, reader.as_ref())?;
+    // 1-2. 解析请求 body → IR (共享 helper; override 在此注入, SSOT).
+    let mut ir = parse_request_ir(
+        &req_bytes,
+        ingress,
+        reader.as_ref(),
+        model_override.as_deref(),
+    )?;
 
-    // Responses 协议 + Redact + 流式: 当前 codec 的 read_response_events 未实现
+    // Responses 协议 + IR 路径 + 流式: 当前 codec 的 read_response_events 未实现
     // (Responses 流式 SSE 事件翻译是 MVP 范围外). 若放行会静默产生空流.
-    // 显式返回 501, 与跨协议流式一致.
+    // 显式返回 501, 与跨协议流式一致. 触发条件 = redact **或 model_override** 任一
+    // 迫使请求走 IR 路径 (#183 D5 — override-only 也在此拦截).
     if ir.stream && ingress == Protocol::OpenAIResponses {
         return Err(AppError::NotImplemented(format!(
-            "streaming + redact for {} protocol is not yet supported (Responses SSE event \
-             translation unimplemented); either disable stream=true in the client request \
-             or remove secrets from this provider's config",
+            "streaming for {} protocol is not yet supported (Responses SSE event \
+             translation unimplemented) while this provider's config forces the IR path \
+             (secrets / model_override); either disable stream=true in the client \
+             request, remove secrets, or remove model_override from this provider's config",
             ingress.name()
         )));
     }
@@ -152,6 +167,7 @@ pub(crate) async fn same_proto_forward(
         Some(&ir),
         Some(codec_proto),
         &provider.id,
+        model_override.as_deref(),
         redact_seed,
         Some(&secrets_snapshot),
         redactions,
@@ -207,24 +223,43 @@ pub(crate) async fn same_proto_forward(
 
     debug!(%record_id, status = %resp_status, streamed, "upstream responded");
 
-    // 11. 响应处理:
-    //     - 流式 + redact: StreamTranslate 同协议模式, per-event restore (恢复流式 UX).
-    //     - 非流式 + redact: buffered + restore_ir_response.
-    if streamed && resp_status.is_success() {
-        super::fan_out::fan_out_streaming_with_restore(
-            state.dag.clone(),
-            record_id,
-            started,
-            upstream_resp,
-            resp_status,
-            resp_headers,
-            codec_proto,
-            redaction_map,
-            state.upstream_timeouts.stream_idle,
-        )
-        .await
+    // 11. 响应处理 — 仅 redaction map 非空才需要 restore (#183: override 只改写
+    //     **请求半段** 的 model, 响应半段不受 FWD-1 修订授权):
+    //     - map 非空 + 流式 2xx: StreamTranslate 同协议 restore 模式 (per-event restore).
+    //     - map 非空 + 其余: buffered_ir (parse 失败 fallback 透传, 见 #158).
+    //     - map 空 (override-only / secret 未命中): 字节透传 fan_out_streaming —
+    //       响应 byte-exact + 流式 UX, parsed view 照常累积/计算.
+    if !redaction_map.is_empty() {
+        if streamed && resp_status.is_success() {
+            super::fan_out::fan_out_streaming_with_restore(
+                state.dag.clone(),
+                record_id,
+                started,
+                upstream_resp,
+                resp_status,
+                resp_headers,
+                codec_proto,
+                redaction_map,
+                state.upstream_timeouts.stream_idle,
+            )
+            .await
+        } else {
+            super::fan_out::fan_out_buffered_ir(
+                state.dag.clone(),
+                record_id,
+                started,
+                upstream_resp,
+                resp_status,
+                resp_headers,
+                streamed,
+                codec_proto,
+                redaction_map,
+                state.upstream_timeouts.stream_idle,
+            )
+            .await
+        }
     } else {
-        super::fan_out::fan_out_buffered_ir(
+        super::fan_out::fan_out_streaming(
             state.dag.clone(),
             record_id,
             started,
@@ -232,8 +267,7 @@ pub(crate) async fn same_proto_forward(
             resp_status,
             resp_headers,
             streamed,
-            codec_proto,
-            redaction_map,
+            Some(codec_proto),
             state.upstream_timeouts.stream_idle,
         )
         .await
@@ -280,6 +314,7 @@ async fn same_proto_passthrough(
         None,
         crate::codec::Protocol::from_native(ingress),
         &provider.id,
+        None, // passthrough 未改写 model (override 配置了也到此为止, 见 D2 降级)
         0,
         None,
         vec![],

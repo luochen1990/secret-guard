@@ -87,6 +87,10 @@ pub async fn update_provider(
                 if payload.route_to.is_none() {
                     payload.route_to = old.route_to;
                 }
+                // model_override 同 "保留" 语义 (#183), 三态同 route_to.
+                if payload.model_override.is_none() {
+                    payload.model_override = old.model_override;
+                }
             }
             payload.into_provider()
         },
@@ -178,6 +182,14 @@ pub(crate) struct UpsertProviderRequest {
     /// 成环 (含自环) 在 validate/upsert 钩子拒绝 (400); 悬空目标放行 (运行时 503).
     #[serde(default)]
     pub route_to: Option<String>,
+    /// 出站 model 强制重写值 (#183). 三态语义同 `route_to`:
+    /// - 省略 (None): 保留旧值 (PUT) / 不设置 (POST); static 基线下经
+    ///   `inherit_from_static` 回落 static (#157 同型).
+    /// - `""` (空串): 显式清空 (透传客户端 model). dynamic-only 条目可完整往返;
+    ///   static 配置了 override 的条目会被继承回落 (#157 同型已知限制).
+    /// - `"model-id"`: 生效值 (写入侧过滤后永非空串).
+    #[serde(default)]
+    pub model_override: Option<String>,
     #[serde(default = "crate::provider::default_true")]
     pub enabled: bool,
 }
@@ -194,6 +206,7 @@ impl UpsertProviderRequest {
         // crud 钩子的 `Provider::validate` (见 validate_provider_upsert), 此处只做
         // 字段变换: 空串 route_to = 显式清空指向 ("虚拟 → 实体").
         let route_to = self.route_to.filter(|s| !s.is_empty());
+        let model_override = self.model_override.filter(|s| !s.is_empty());
         Ok(Provider {
             id: self.id.unwrap_or_default(),
             protocol: self.protocol,
@@ -203,6 +216,7 @@ impl UpsertProviderRequest {
             enabled: self.enabled,
             name: self.name.filter(|s| !s.trim().is_empty()),
             route_to,
+            model_override,
         })
     }
 }
