@@ -148,11 +148,20 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 **陈述**: secret-guard 是客户端与上游之间的字节级透明中继. **两个半段各自满足 byte-exact**:
 
 - **请求半段** (client → upstream): 客户端发送的请求 wire 经 secret-guard redact 后发往上游, 要求
-  `normalize(发往上游的 wire) == normalize(客户端请求 wire).replace(real, mock)`.
+  `normalize(发往上游的 wire) == normalize(客户端请求 wire).replace(real, mock)`; 若生效 provider 配置了
+  `model_override` (#183), 额外允许 model 字段重写:
+  `normalize(发往上游的 wire) == normalize(客户端请求 wire).replace(real, mock).replace(model, override)`.
 - **响应半段** (upstream → client): secret-guard 收到上游响应 wire 后经 restore 返回客户端, 要求
   `normalize(返回客户端的 wire) == normalize(上游响应 wire).replace(mock, real)`.
 
-等价表述: **secret-guard 对 wire 的唯一合法修改是 real↔mock 替换**, 除此之外的任何字节差异 (字段丢失 / 顺序错乱 / 重序列化改变 / 任意字段值变化) 都是 bug.
+等价表述: **secret-guard 对 wire 的合法修改有且仅有两种: real↔mock 替换, 以及 model 字段重写 (仅当生效 provider 配置了 `model_override`)**, 除此之外的任何字节差异 (字段丢失 / 顺序错乱 / 重序列化改变 / 任意字段值变化) 都是 bug.
+
+> **model_override 代价明示** (2026-08-24 修订, §99 登记): override 生效时, 同协议无-secret 请求
+> 从字节直传 (passthrough) 降级为 IR 改写路径 — 前者对无 redact 请求是 byte-exact 的, 后者经
+> reader→IR→writer 重序列化, 仅保证 normalize 后等价 (与 "同协议 + Redact" 的既有降级同型).
+> 这是用户配置 override 时**主动选择的降级**, 非 bug. 经济性代价: override 值与客户端请求的
+> model 不同时, 上游前缀缓存从该请求起失效. 解析语义 (链上 first-wins / 无 codec 协议降级) 见
+> FWD-5 `prop_model_override_*` 系列.
 
 `normalize` = canonical JSON (BTreeMap key 排序 + 紧凑序列化 + 无空白). 消除对语义无影响的字节差异, 剩下的差异全部是真正的信息差异.
 
@@ -161,7 +170,8 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 **不适用**: 跨协议路径 (ingress wire 与 egress wire 是不同协议格式, 由 FWD-3 单独约束).
 
 **Properties**:
-- `prop_request_half_byte_exact` (非流式, 请求侧): 对任意合法请求 wire 含 real secret, `normalize(secret-guard 发往上游的 wire) == normalize(原始 wire).replace(real, mock)`. 🔁→`openai_request_redact_preserves_wire_except_secret` + `anthropic_request_redact_preserves_wire_except_secret` (半段式含 redact, `src/codec/fwd_property.rs`; 端到端 `redact_strips_secret_from_upstream_request`)
+- `prop_request_half_byte_exact` (非流式, 请求侧): 对任意合法请求 wire 含 real secret, `normalize(secret-guard 发往上游的 wire) == normalize(原始 wire).replace(real, mock)` (无 model_override 时). 🔁→`openai_request_redact_preserves_wire_except_secret` + `anthropic_request_redact_preserves_wire_except_secret` (半段式含 redact, `src/codec/fwd_property.rs`; 端到端 `redact_strips_secret_from_upstream_request`)
+- `prop_request_half_byte_exact_with_model_override` (非流式, 请求侧): 生效 provider 配置 `model_override` 时, `normalize(secret-guard 发往上游的 wire) == normalize(原始 wire).replace(real, mock).replace(model, override)` — 无-secret 场景亦成立 (override 强制 IR 路径). 🔁→`model_override_reaches_upstream` + `model_override_no_secret_forces_ir_path` (`tests/integration.rs`)
 - `prop_response_half_byte_exact` (非流式, 响应侧): 对任意合法响应 wire 含 mock, `normalize(secret-guard 返回客户端的 wire) == normalize(上游 wire).replace(mock, real)`. 🔁→`prop_response_round_trip_identity` / `prop_response_tool_use_input_restored` (redact.rs 响应侧) + 端到端 `restore_inserts_secret_back_for_client` (非流式) — 流式半段见 FWD-1 `prop_streaming_response_half_byte_exact` 弱化形式注记
 - `prop_streaming_response_half_byte_exact` (流式, 响应侧): 流式响应的 restore, 经任意 chunk 切分, 同上. 🔁→`prop_streaming_response_half_byte_exact_openai` + `prop_streaming_response_half_byte_exact_anthropic` (`src/codec/fwd_streaming_property.rs`; 语义等价弱化形式, 见下方 "理想 vs 现状" 注记)
 
@@ -248,6 +258,9 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 - `prop_route_cycle_termination` (#179): 任意 route 图 (含环 / 悬空 / 自环), `resolve_route` 有限步返回 (Ok ⇒ 链尾必为实体 provider, route_to=None). 🔁→`prop_resolve_route_terminates_on_random_graphs` (`src/provider.rs`, proptest; 生成器覆盖环与悬空)
 - `prop_route_cycle_rejected_at_upsert` (#179): upsert 形成环 (含自环) → 400 validation; 悬空目标放行 (创建顺序无关, 运行时 503 兜底). 🔁→`virtual_provider_cycle_upsert_rejected` (`tests/integration.rs`) + `would_cycle_rejects_indirect_cycle` / `would_cycle_updates_entry_in_place` / `validate_virtual_provider_semantics` (`src/provider.rs`)
 - `prop_upstream_id_observable` (#179): 每轮 record 携带 upstream_id = route_to 解析后的链尾实体 provider id (非虚拟请求 = URL provider id), 经 NodeView / TimelineRound / ForwardRecord 暴露给 WebUI. 🔁→`virtual_provider_switches_target_mid_session` (`tests/integration.rs`, latest_upstream_id 断言)
+- `prop_model_override_first_hop_wins` (#183): 生效的 model_override = 沿 route_to 链**从入口起第一个非空值** (入口/中间跳/链尾实体任一层配置均生效; 高层优先). 🔁→`resolve_route_model_override_first_hop_wins` (`src/provider.rs`)
+- `prop_model_override_injects_into_egress_ir` (#183): 配置 override 且 codec 可用时, egress IR 的 model 字段被无条件改写为 override (客户端 body 缺 model 字段亦注入); 无-secret 请求因 override 强制走 IR 路径 (不再字节直传). 🔁→`model_override_reaches_upstream` + `model_override_no_secret_forces_ir_path` + `model_override_switch_via_put` (`tests/integration.rs`)
+- `prop_model_override_no_codec_passthrough` (#183): 无 codec 协议 (Gemini/Ollama) + override → 不改写 body, 字节透传 + WARN (与 "codec 缺失 + secrets" 降级同型). 🔁→`model_override_gemini_passthrough_unrewritten` (`tests/integration.rs`)
 
 ### FWD-6 Provider 鉴权注入
 
@@ -867,3 +880,5 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 | 2026-08-16 | UI-7 | 新增 UI-7 sidebar rounds 回填时序 + timeline 并发一致性 (gen): 点击会话头后 "Loading rounds…" 占位符由主动 sync 覆盖 (不依赖 3s tick); `timelineGen` 代数对账消灭跨会话脏 append (矛盾游标守卫 + 迟到 diff 丢弃 + round-id 幂等去重) | 排查 "点击 sidebar 一级菜单后 loading rounds 卡数秒": 后端实测 12ms/0.6ms 非瓶颈, 根因是前端回填依赖轮询 tick; 修复主动 sync 时暴露两类并发交错 (矛盾游标 / 迟到 diff), 一并形式化 |
 | 2026-08-23 | STR-6 | 新增: 流式 reasoning_content 建模与 restore (reader 解码 / writer 写回 / StreamScan 累积 / streaming restore / 三类 block index 互斥); 跨协议处置显式登记为 FWD-3 已知损失 (Anthropic signature / Responses encrypted_content 不可合成) | #176: redact 流式路径思考期零字节, 客户端空闲看门狗超时断连 (生产 499) |
 | 2026-08-23 | FWD-4 | 新增"响应头超时分档"段 + property `prop_header_timeout_matches_stream_semantics`: send().await 响应头超时按请求 stream 语义分两档 (显式 stream=true → TTFT 档 60s; 其余 → 整响应档 300s) | #175: 非流式大上下文请求 (响应头等整响应生成完) 被单一 60s TTFT 量纲超时结构性误杀 (hermes cron 9 连续 504 事故) |
+| 2026-08-24 | FWD-5 | 新增虚拟 provider 路由 5 条 property: per-request 解析 (`prop_route_resolution_per_request`) / 坏路由 503 (`prop_route_broken_returns_503`) / 环终止 (`prop_route_cycle_termination`) / upsert 环拒绝 (`prop_route_cycle_rejected_at_upsert`) / upstream_id 可观测 (`prop_upstream_id_observable`) | #179: 虚拟 endpoint (route_to) — 客户端固定连虚拟端点, WebUI 即席切换上游; 语义裁决 (per-request / 悬空放行 / 三层环防护) 经人工授权 |
+| 2026-08-24 | FWD-1 | **语义修订**: "对 wire 的唯一合法修改是 real↔mock 替换" → 扩为两种: real↔mock 替换 + **model 字段重写 (仅当生效 provider 配置 `model_override`)**; 请求半段等式追加条件项 `.replace(model, override)`; 新增 property `prop_request_half_byte_exact_with_model_override`. 代价明示: override 生效时同协议无-secret 请求从字节直传降级为 IR 改写 (normalize 等价, 前缀缓存失效 — 用户主动选择的降级). 配套 FWD-5 新增 `prop_model_override_*` 4 条 (first-wins 解析 / egress 注入 / 无 codec 降级) | #183: 虚拟 endpoint P2 — 跨模型名切换 (切换 = target+model 二元组); 修订经人工授权 (2026-08-24, issue #183 记录裁决与 D1-D5 设计决策) |
