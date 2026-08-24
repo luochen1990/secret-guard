@@ -46,12 +46,10 @@ single-job runner 上串行占位, 延迟最新 push 的反馈. workflow 级
    rust-toolchain.toml) 漂移导致 clippy 新 lint 无预警阻塞时, 事后可追溯 "哪天升的".
    放在首个阻塞 step 之前: 核心动机场景正是 "后续 step 因新 lint 失败", 那时本 step
    必须已跑过. MSRV 下界 SSOT 在 Cargo.toml `rust-version`.
-6. **Reclaim cache volume** (`continue-on-error`): 清理累积性中间产物 (profraw/profdata)
-   防 10G tmpfs 卷 ENOSPC; 清理后仍 < 1GB 可用时兜底全清 cargo-target (放弃增量复用).
-7. **consistency-check feature guard** (`just check-features`): clippy + nextest 带
+6. **consistency-check feature guard** (`just check-features`): clippy + nextest 带
    `consistency-check` feature 跑一次 (视图正确性断言, 详见根 AGENTS.md "视图正确性确保机制").
    单独成步复用 checkout, 在 coverage 的 cargo clean 前, 不影响磁盘峰值控制.
-8. **Check + coverage data** (`just check --coverage`): fmt + clippy + machete + **doc 门禁**
+7. **Check + coverage data** (`just check --coverage`): fmt + clippy + machete + **doc 门禁**
    + 测试 + **typos + deny-offline** + **check-contracts** (contracts.md property 落地
    标注 lint, #144: ✅ 须同名命中 / 🔁 锚点须可 grep / 每条 property 必有标注), 用
    `cargo llvm-cov nextest` 插桩, 产出 profdata 供
@@ -63,44 +61,44 @@ single-job runner 上串行占位, 延迟最新 push 的反馈. workflow 级
    在链尾执行, 不设独立 step — 独立 step 只可能 "check 内失败后被 skip" 或 "check 内
    通过后重跑必过", 永远不产生独立失败信号; 本地 `just check` 链尾跑同一命令, 保证本地
    全绿 ⇒ CI 必绿 (issue #149-3/-8).
-9. **Coverage gate** (`just coverage-gate`): 双阈值 (line% 下限 + 未覆盖行数上限, 阈值
+8. **Coverage gate** (`just coverage-gate`): 双阈值 (line% 下限 + 未覆盖行数上限, 阈值
    SSOT 在 justfile), 只做 report 读上一步 profdata, 不重跑测试.
-10. **Performance benchmark** (`just bench-ci`, `continue-on-error` 非阻塞): criterion
+9. **Performance benchmark** (`just bench-ci`, `continue-on-error` 非阻塞): criterion
     baseline 回归检测. master push → `bench-ci save` (滚动更新基线 `ci`); PR →
     `bench-ci compare` (只对比不覆盖, 冷启动自动 fallback 建 首基线). 退化判定 (解析
     criterion 输出的 change 中位数, 默认 20% 阈值) + 退出码契约 (0 正常 / 1 退化 / 2 失败)
     的 SSOT 在 justfile `bench-ci` recipe. criterion 基线落 `CARGO_TARGET_DIR/criterion/`
     跨 job 复用.
-11. **Upsert benchmark report to PR** (仅 PR 事件, `continue-on-error`): bench 结果 upsert
+10. **Upsert benchmark report to PR** (仅 PR 事件, `continue-on-error`): bench 结果 upsert
     到 PR 评论, 复用 marker 机制让退化信号不只埋在 job log.
-12. **File size gate** (`just check-file-size`): `rust-diff-analyzer` 对每个 .rs 做 AST 分类,
+11. **File size gate** (`just check-file-size`): `rust-diff-analyzer` 对每个 .rs 做 AST 分类,
     只统计 prod 行数 (排除 test), 双阈值 (WARN 500 软提醒 / MAX 1600 硬阻断, fail-closed).
-13. **WebUI regression (Playwright)** (`just check-webui`, `continue-on-error` 初期非阻塞):
+12. **WebUI regression (Playwright)** (`just check-webui`, `continue-on-error` 初期非阻塞):
     webServer 自动启动 mock upstream + secret-guard, 复用上一步编译的 debug binary
     (CARGO_TARGET_DIR 指向持久卷, playwright.config.ts 读此环境变量). 退出码与输出摘要
     写入 step output, 供下一步 upsert.
-14. **Upsert WebUI result to PR** (仅 PR 事件, `continue-on-error`): WebUI 结果 upsert 到
+13. **Upsert WebUI result to PR** (仅 PR 事件, `continue-on-error`): WebUI 结果 upsert 到
     PR 评论 (marker `<!-- webui-regression -->`). 修复可见性不对称: WebUI 是非阻塞 step,
     失败若只埋在 job log + artifact, "连续 N=20 次绿 → 转阻塞" 的升级判据永远无人察觉.
-15. **Upload Playwright artifacts on failure** (仅 Playwright 失败时, `continue-on-error`):
+14. **Upload Playwright artifacts on failure** (仅 Playwright 失败时, `continue-on-error`):
     上传截图/trace/html 报告. 用 Forgejo 官方 fork `forgejo/upload-artifact@v4`
     (GitHub 官方版会检测非 GitHub 环境报错), retention 14 天.
-16. **cargo audit** (`just audit`, `continue-on-error` 非阻塞): CVE 扫描 (含 advisory
+15. **cargo audit** (`just audit`, `continue-on-error` 非阻塞): CVE 扫描 (含 advisory
     DB 拉取 — 网络依赖是它保持非阻塞的原因之一; advisories 职责归此, 与 deny 互为冗余
     兜底), 输出 tee 到 audit.txt 供下一步 upsert 到 PR 评论. advisory DB 经
     `CARGO_AUDIT_DB` 持久缓存到卷 (justfile audit recipe 透传 `--db`, 首次 clone 后
     跨 job 增量 fetch). 忽略项配置 `.cargo/audit.toml`, 详见根 AGENTS.md
     "cargo-audit (CVE 监控)" 段.
-17. **Upsert cargo audit report to PR** (仅 PR 事件, `continue-on-error`): audit 结果 upsert
+16. **Upsert cargo audit report to PR** (仅 PR 事件, `continue-on-error`): audit 结果 upsert
     到 PR 评论, 复用 diff-loc 的 marker 机制让非阻塞的 CVE 不只埋在 job log.
-18. **nix build (cargoHash validation)** (`nix build .#secret-guard -L`,
+17. **nix build (cargoHash validation)** (`nix build .#secret-guard -L`,
     `continue-on-error` 非阻塞起步): 验证 nix/package.nix 的 cargoHash 与 Cargo.lock
     一致 (漂移时错误只在部署侧 ~/ws/nixos 重建时暴露, 排障跨仓库). 转阻塞判据: 连续
     N=20 次 master push 跑绿 (同 WebUI step 判据). 注意依赖升级 PR 会合法触发本 step
     失败 (提醒同步 cargoHash), 属预期信号.
-19. **Diagnose failure** (仅 PR + job 失败时, `continue-on-error`): 阻塞 step outcomes
+18. **Diagnose failure** (仅 PR + job 失败时, `continue-on-error`): 阻塞 step outcomes
     汇总表 + 工具链版本贴到 PR 评论.
-20. **Guard single-job assumption (verify)** (`if: always()`): 校验 Guard acquire step
+19. **Guard single-job assumption (verify)** (`if: always()`): 校验 Guard acquire step
     写入的锁文件未被覆盖; 被覆盖 (= 另一 job 并发写了同一 target dir) 则显式失败并指向
     "并发互斥假设" 段的应对预案.
 
@@ -156,9 +154,13 @@ CI 用纯 `curl` + Forgejo API (`POST/PATCH /repos/{owner}/{repo}/issues/{n}/com
 ## 跨 job target 复用 (CARGO_TARGET_DIR 缓存)
 
 `check` job 设 `CARGO_TARGET_DIR=/var/lib/forgejo-runner/cache/cargo-target`, 指向 runner VM
-的持久 tmpfs 卷 (宿主侧 10G tmpfs + virtiofs 共享, 见 nixos 仓库
+的持久 tmpfs 卷 (宿主侧 tmpfs + virtiofs 共享, 容量与预算构成 SSOT 见 nixos 仓库
 `forgejo-runner-vm.mod.nix`). 跨 job 复用 cargo 编译产物: 依赖 crate 只编一次, 后续 job
 增量编译 (秒级).
+
+- **卷卫生 (防 ENOSPC)**: 卷的防满回收由 runner VM 侧的 cache-reclaim 定时服务统一负责
+  (多 repo 共享同一卷, 回收逻辑收敛在基础设施层; 2026-08-24 ENOSPC 事故后从本 workflow
+  的 Reclaim step 迁出, 机制与阈值见 nixos 仓库 `forgejo-runner-vm-cache-reclaim.sh`).
 
 - **子目录隔离**: clippy/nextest 用 `debug/` 子目录, coverage 用 `llvm-cov-target/` 子目录,
   bench 用 `release/` 子目录, criterion 基线用 `criterion/` 子目录, 物理隔离无需全量
@@ -176,8 +178,8 @@ concurrency=1 或 single-job mode, 配置在 nixos 仓库 `forgejo-runner-vm.mod
 **运行时防御**: job 开头在 cache 卷根 (`/var/lib/forgejo-runner/cache/.ci-target-dir-lock`)
 写 run_id 锁文件, 结束时校验未被覆盖 — 被覆盖即说明另一 job 并发写了同一
 `CARGO_TARGET_DIR`, 校验 step 显式失败并指向本节. 把 "静默产物污染 / 偶现怪异失败"
-转化为带指向性的硬失败. 锁文件不放 CARGO_TARGET_DIR 内 (Reclaim step 的兜底全清
-`rm -rf $CARGO_TARGET_DIR/*` 会连带删掉它导致误报).
+转化为带指向性的硬失败. 锁文件不放 CARGO_TARGET_DIR 内 (卷级全清清理 `rm -rf $CARGO_TARGET_DIR/*`
+会连带删掉它导致误报).
 
 若该假设被打破 (runner 允许并发 job), 两个 job 同时写同一 `CARGO_TARGET_DIR` 会触发 cargo
 `Blocking waiting for file lock` (慢) 或产物交错污染.
