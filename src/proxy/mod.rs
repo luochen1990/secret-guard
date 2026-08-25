@@ -80,7 +80,7 @@ use axum::{
 };
 
 use crate::error::AppError;
-use crate::provider::{Protocol, ResolvedRoute};
+use crate::provider::{Protocol, ProviderKind, ResolvedRoute};
 use crate::state::AppState;
 
 /// axum 路径参数: `/{proto}/{name}/{*rest}`.
@@ -188,15 +188,30 @@ async fn dispatch(
         )));
     }
 
-    // 2.5 虚拟 provider 路由解析 (#179/#183): 跟随 route_to 链到实体 provider,
-    // 并收集链上 first-wins 的 model_override. per-request 解析 — 切换指向/模型
-    // 只影响新请求 (in-flight 请求按已解析目标完成);
-    // 坏路由 (目标缺失 / disabled / 成环) → 503, message 只含 id + reason (SEC-2 同型).
-    // WARN: 悬空/disabled 指向是虚拟切换的主要运维事故形态, 静默 503 排障成本高.
-    let resolved = match state.providers.resolve_route(provider) {
+    // 3. 收集请求 body (跨协议和同协议都需要).
+    let req_bytes = to_bytes(body, MAX_REQ_BODY)
+        .await
+        .map_err(|e| AppError::BadBody(e.to_string()))?;
+
+    // 3.5 路由 provider 解析 (#179 多规则化): 提取本请求的顶层 model 后按规则
+    // 链解析到链尾实体, 并收集链上生效的规则 model 重写值。**per-request 解析** —
+    // 路由现依赖请求 model (规则按 model 匹配), 故必须在 body 收集之后; 切换
+    // 规则只影响新请求 (in-flight 请求按已解析目标完成);
+    // 坏路由 (无规则命中 / 目标缺失 / disabled / 成环) → 503, message 只含
+    // id + model 名 + reason (SEC-2 同型).
+    // WARN: 悬空/disabled 指向是路由切换的主要运维事故形态, 静默 503 排障成本高.
+    // Direct 条目的 resolve_route 快路径不消费请求 model (无规则匹配),
+    // JSON 顶层扫描是纯浪费 — 仅 Router 构造需要. 守卫须在 provider 被
+    // resolve_route move 之前 (matches! 只读判别, 不发生 move).
+    let request_model = if matches!(provider.kind, ProviderKind::Router(_)) {
+        helpers::request_model(&req_bytes)
+    } else {
+        String::new()
+    };
+    let resolved = match state.providers.resolve_route(provider, &request_model) {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!(virtual = %fp.name, error = %e, "route resolution failed");
+            tracing::warn!(router = %fp.name, error = %e, "route resolution failed");
             return Err(AppError::Unavailable(e.to_string()));
         }
     };
@@ -205,19 +220,19 @@ async fn dispatch(
     let ResolvedRoute {
         id: upstream_id,
         provider,
-        model_override,
+        model_rewrite,
     } = resolved;
     if fp.name != upstream_id {
-        tracing::info!(virtual = %fp.name, upstream = %upstream_id, "route resolved");
+        tracing::info!(
+            router = %fp.name,
+            upstream = %upstream_id,
+            model = %crate::provider::truncate_model_for_echo(&request_model),
+            "route resolved"
+        );
     }
-    if let Some(m) = &model_override {
-        tracing::debug!(virtual = %fp.name, model_override = %m, "model override active");
+    if let Some(m) = &model_rewrite {
+        tracing::debug!(router = %fp.name, model_rewrite = %m, "model rewrite active (route)");
     }
-
-    // 3. 收集请求 body (跨协议和同协议都需要).
-    let req_bytes = to_bytes(body, MAX_REQ_BODY)
-        .await
-        .map_err(|e| AppError::BadBody(e.to_string()))?;
 
     // 4. 协议匹配: 同协议走 IR / 字节透传; 跨协议走 codec 翻译.
     let secrets_snapshot = state.secrets.effective_raw();
@@ -236,7 +251,7 @@ async fn dispatch(
             ingress,
             provider,
             &upstream_id,
-            model_override,
+            model_rewrite,
             started,
             secrets_snapshot,
         )
@@ -250,7 +265,7 @@ async fn dispatch(
         ingress,
         provider,
         &upstream_id,
-        model_override,
+        model_rewrite,
         started,
         secrets_snapshot,
     )

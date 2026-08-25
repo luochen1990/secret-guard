@@ -57,18 +57,22 @@ value = "ghp_0123456789abcdefghijklmnopqrstuvwxyz"
 ## `[[providers]]` — 上游 LLM 端点 (平铺数组)
 
 每个 provider 是**两种构造之一** (#187 sum type): **直连** (Direct, 真实上游端点) 或
-**虚拟** (Virtual, 可切换指向的路由端点)。由 **`kind` 字段判别** (`"direct"` /
-`"virtual"`, 必填 — 缺失时启动 fail-fast), 对应构造的字段写在同一个 `[[providers]]`
-表内。构造不匹配的字段会被**静默忽略** (serde flatten 无法拒绝未知字段): Virtual 条目
-写 base_url/api_key、Direct 条目写 route_to 均不生效 — 请勿依赖, 配置以 `kind` 为准。
+**路由** (Router, 按请求 model 分流的路由端点)。由 **`kind` 字段判别** (`"direct"` /
+`"router"`, 必填 — 缺失时启动 fail-fast), 对应构造的字段写在同一个 `[[providers]]`
+表内。构造不匹配的字段会被**静默忽略** (serde flatten 无法拒绝未知字段): Router 条目
+写 base_url/api_key、Direct 条目写 routes 均不生效 — 请勿依赖, 配置以 `kind` 为准。
+
+> **旧字段迁移提示**: 旧版的 `kind = "virtual"` + 顶层 `route_to` / `model_override` 写法
+> 已删除 — `virtual` 变体不存在会启动报错, 残留的 `route_to` / `model_override` 字段
+> 会触发启动 WARN (#159 静态预检) 且不生效。请改写为 `kind = "router"` +
+> `[[providers.routes]]` (见下文)。
 
 **共享字段** (两种构造均可配):
 
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `id` | string | (必填) | 唯一标识. 1..=64 字符, 以字母/数字开头, 只允许字母数字、`_`、`-`. 出现在转发 URL 中 (`/o/<id>/...`). |
-| `kind` | string | (必填) | 构造判别: `"direct"` (直连) 或 `"virtual"` (虚拟路由). |
-| `model_override` | string | — | **出站 model 强制重写**: 经此 provider (直接或作为路由链一跳) 转发的请求 body 顶层 `model` 字段被无条件替换为该值, 客户端请求的模型名被丢弃. 链上 **first-wins** (入口起第一个非空值生效). 代价: override 生效时该 provider 的无-secret 请求从字节直传降级为 IR 改写 (语义等价, 上游前缀缓存失效). Gemini/Ollama 无 codec 无法改写: WARN + 原样透传. 空串非法 (清空请省略字段 / WebUI 留空). |
+| `kind` | string | (必填) | 构造判别: `"direct"` (直连) 或 `"router"` (路由). |
 | `enabled` | bool | `true` | `false` 时转发到该 provider 返回 503. |
 | `name` | string | — | 可选的人类可读名称 (仅 WebUI 显示). |
 
@@ -81,12 +85,20 @@ value = "ghp_0123456789abcdefghijklmnopqrstuvwxyz"
 | `api_key` | string | `""` | 上游 API key 明文. 与 `api_key_file` 互斥 (同时设置启动报错). |
 | `api_key_file` | path | — | 从文件读 API key (适合 sops-nix / systemd LoadCredential 等外部注入, 让 toml 本身不含敏感数据). 每次请求时读取, 读不到按空 key 处理并打 WARN. 文件内容自动去首尾空白. |
 
-**Virtual 构造** (`kind = "virtual"`):
+**Router 构造** (`kind = "router"`) — 无 protocol / base_url / api_key 字段:
+
+Router 自身不转发, 按请求 model 匹配 `routes` 路由后链式解析到链尾的 Direct provider.
+ingress 协议由请求 URL 决定, egress 协议由链尾实体决定 (不同则自动跨协议翻译) —
+因此 Router **没有 protocol 字段** (残留发送会被静默忽略).
+
+路由写在 `[[providers.routes]]` 子表数组 (至少一条, 空表启动报错):
 
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
-| `route_to` | string | (必填) | 指向另一 provider 的 id. 本 provider 不直接转发, 请求经 `route_to` 链解析到链尾的实体 provider. 解析是 **per-request** 的: 在 WebUI 即席切换指向只影响新请求. 链上目标必须存在且 `enabled`, 否则 503; 自环启动即报错, 跨条目环在 WebUI 写入时拒绝 (手写配置产生的环在请求时返回 503, 不挂起). |
-| `protocol` | string | — | **仅 WebUI 展示** (可省略): ingress 由 URL 决定, egress 由链尾实体决定 (不同则自动跨协议翻译). |
+| `model_pattern` | string | (必填) | model 名通配符: 仅 `*` 是元字符 (匹配任意串, 含空串), 其余字符**字面匹配**, 大小写敏感. `"*"` 匹配一切. 非空, ≤64 字符. |
+| `target` | string | (必填) | 目标 provider id, 可指向另一 router (链式解析到链尾实体). 悬空目标 (不存在) 写入放行, 请求时 503. 启用路由自环启动报错 (禁用路由不构成环检查的边); 跨条目环在 WebUI 写入时拒绝 (手改配置产生的环在请求时返回 503, 不挂起). |
+| `upstream_model` | string | — (透传) | **出站 model 重写**: 命中该路由的请求 body 顶层 `model` 字段被替换为该值. 省略 = 透传客户端原 model. 链上多跳重写是 **pipeline** 语义: 改写值参与下一跳 router 的路由匹配, 后者覆盖前者. 非空 / 非纯空白 / ≤128 字符 (清空请省略字段). 代价: 重写生效时该请求放弃字节直传 (上游前缀缓存失效); Gemini/Ollama 无 codec 无法改写: WARN + 原样透传. |
+| `priority` | i64 | — (禁用) | 优先级, **越大越优先**. 省略 (null) = 该路由**禁用** (不参与匹配, 也不构成环检查的边). 同优先级按**列表出现顺序**取先者. |
 
 ```toml
 [[providers]]
@@ -97,10 +109,11 @@ base_url = "https://api.anthropic.com"
 api_key_file = "/run/credentials/anthropic.key"   # 与 api_key 二选一
 ```
 
-### 虚拟 endpoint (route_to) — 模型的 SSOT 动态切换
+### 路由 endpoint (routes) — 按请求 model 的路由转发
 
-客户端固定连接虚拟 endpoint 的 URL (如 `/o/my-model/v1/chat/completions`),
-实际打到哪个上游由 WebUI 即席切换 (Providers 页编辑该条目的 Route To):
+客户端固定连接路由 endpoint 的 URL (如 `/o/my-model/v1/chat/completions`),
+实际打到哪个上游由**请求 body 里的 model 名**决定 — dispatch 在请求 body 收集后
+提取顶层 `model`, 按路由匹配转发:
 
 ```toml
 [[providers]]
@@ -111,30 +124,53 @@ base_url = "https://api.openai.com"
 api_key = "sk-..."
 
 [[providers]]
+id = "anthropic-main"
+kind = "direct"
+protocol = "anthropic"
+base_url = "https://api.anthropic.com"
+api_key_file = "/run/credentials/anthropic.key"
+
+[[providers]]
 id = "my-model"
-kind = "virtual"
-route_to = "openai-main"
-# protocol 可选, 仅作 WebUI 展示; ingress 由 URL 决定, egress 由目标决定
+kind = "router"
+[[providers.routes]]
+model_pattern = "claude-*"        # claude 系模型走 Anthropic, 并重写为固定版本
+target = "anthropic-main"
+upstream_model = "claude-sonnet-4"
+priority = 100
+[[providers.routes]]
+model_pattern = "*"               # 兜底: 其余 (含无 model 字段的请求) 走 OpenAI
+target = "openai-main"
+priority = 0
 ```
 
 语义要点:
-- **切换只影响新请求** (per-request 解析), in-flight 请求按已解析目标完成.
+- **路由选择**: 启用 (`priority` 非 null) 且 model_pattern 匹配请求 model 的路由中
+  `priority` 最大者; 同优先级按列表出现顺序取先者. 请求 model 取 JSON **顶层**
+  string `model` 字段 — 非 JSON / 无该字段 / 非 string / 空 body 视为 `""`
+  (只有 `"*"` 类 model_pattern 能命中).
+- **model 重写是 pipeline**: 命中路由的 `upstream_model` 改写立即生效 — 链上下一个
+  router 按改写后的 model 匹配, 多跳重写后者覆盖前者. 跨模型名切换 (#183) 由路由的
+  `upstream_model` 字段承载 (替代已删除的 `model_override`): 命中即把客户端 model
+  替换为目标模型, 适配 gpt-4o ↔ claude 等切换. 代价: 重写生效的请求放弃字节直传
+  (上游前缀缓存失效), 见字段表.
+- **切换只影响新请求** (per-request 解析, body 收集后执行), in-flight 请求按已
+  解析目标完成.
+- **错误行为** (均 503): 无匹配路由 / 链上目标悬空 / 目标 `enabled = false` /
+  成环. 启用路由自环启动即报错 (禁用路由不构成环边), 跨条目环在 WebUI 写入时拒绝.
 - 目标协议与 URL 协议不同时自动走跨协议翻译 (非流式; 流式跨协议返回 501,
-  与非虚拟行为一致).
+  与直连行为一致).
 - WebUI timeline / 轮次详情的 "via ..." 角标与 `Upstream` 字段显示每轮实际命中的
-  上游 (虚拟切换后历史轮次仍如实记录各自归属).
-- **跨模型名切换用 `model_override`** (#183): 虚拟 endpoint 同时配 `route_to` +
-  `model_override` 即 "切换 = (target, model) 二元组" — 客户端 body 里的 model 被
-  重写为目标模型, 适配 gpt-4o ↔ claude 等跨模型切换. 代价: 该 endpoint 的请求
-  放弃字节直传 (上游前缀缓存失效), 见字段表.
-- 虚拟 ↔ 实体切换 (#187 sum type / #190 表单构造分野): 对话框顶部 **Kind**
+  上游 (路由切换后历史轮次仍如实记录各自归属).
+- **WebUI 覆盖静态 router 的方式 = PUT 全量 routes**: 调整 `priority` / 禁用某条
+  路由 (置 `priority: null`) / 新增路由行, 均通过提交完整的 routes 数组表达;
+  省略 `routes` 字段 = 保留旧值, 空数组 `[]` = 改回 Direct 构造.
+- 路由 ↔ 实体切换 (#187 sum type / #190 表单构造分野): 对话框顶部 **Kind**
   选择器切换构造, 表单按构造显示对应字段组 (Direct: Protocol/Base URL/API Key;
-  Virtual: Route To)。切换到 Direct 需填 Base URL (前置校验); static 基线下的
+  Router: Routes 编辑器)。切换到 Direct 需填 Base URL (前置校验); static 基线下的
   鉴权字段会从 static 继承复原。已知限制: **dynamic-only** 条目 Direct →
-  Virtual → Direct 往返会丢失 api_key (Virtual 构造无处存放, 切回时需重新填写 —
+  Router → Direct 往返会丢失 api_key (Router 构造无处存放, 切回时需重新填写 —
   表单 placeholder 会显示 "(optional)" 而非 "unchanged" 作为提示)。
-  `model_override` 的清空仍受 #157 同型限制 (static 配置了 override 的条目
-  无法经 override 清空)。
 
 ## `[[secrets.entries]]` — 需要保护的 Secret (嵌套在 `[secrets]` 下)
 
@@ -222,13 +258,16 @@ key = "sg_ci_abc123..."
 
 | 症状 | 原因与解法 |
 |---|---|
-| ``TOML parse error ... [[providers]] missing field `kind``` | provider 条目缺少构造判别字段 (#187 起必填): 补 `kind = "direct"` (直连上游) 或 `kind = "virtual"` (虚拟路由). 报错行号指向对应 `[[providers]]` 表头. |
+| ``TOML parse error ... [[providers]] missing field `kind``` | provider 条目缺少构造判别字段 (#187 起必填): 补 `kind = "direct"` (直连上游) 或 `kind = "router"` (路由). 报错行号指向对应 `[[providers]]` 表头. |
+| ``TOML parse error ... [[providers]] unknown variant `virtual`, expected `direct` or `router``` | 旧版 `kind = "virtual"` 已删除: 改为 `kind = "router"`, 原 `route_to` 指向改写为一条 `[[providers.routes]]` (`model_pattern = "*"` + `target = ...`), 原 `model_override` 改为路由的 `upstream_model` 字段. |
+| 启动 WARN `unknown field route_to` / `unknown field model_override` | 这两个 providers 顶层字段已删除 (#159 静态预检对残留字段告警, 残留不生效): 改写为 `[[providers.routes]]` 子表 (见上文 Router 构造). |
 | `TOML parse error ... [[secrets]] invalid type: map, expected a sequence` | secret 必须写 `[[secrets.entries]]`, 不能写 `[[secrets]]`. 报错前会先输出一行 WARN `did you mean [[secrets.entries]]?` 指路. |
-| 启动 WARN `unknown field ... did you mean ...?` | 字段拼写错误. 可选字段拼错会被忽略不生效 (仅 WARN 提示), "以为配了实际没配", 须修正; 必填字段 (如 `protocol`) 拼错则 WARN 后再报 `missing field` 启动失败. |
+| 启动 WARN `unknown field ... did you mean ...?` | 字段拼写错误. 可选字段拼错会被忽略不生效 (仅 WARN 提示), "以为配了实际没配", 须修正; 必填字段 (如 `protocol`) 拼错则 WARN 后再报 `missing field` 启动失败. `[[providers.routes]]` 内的未知字段同样会 WARN (定位含 entry 下标). |
 | `base_url must not end with '/'` | 去掉末尾 `/`, 路径由 secret-guard 拼接. |
 | `secret value too short (min 3 bytes)` | secret 真值至少 3 字节. |
 | `key and key_file are mutually exclusive` / `api_key` 与 `api_key_file` 同时设置 | 二选一, 删掉其中一个. |
+| `provider ... must declare at least one route` | Router 构造的 `routes` 为空 — 空路由 router 无法转发任何请求, 启动即拒. 至少配一条 (兜底可用 `model_pattern = "*"`). |
 | 请求返回 404 `not_found` | URL 里 provider id 不存在, 或 proto 前缀拼错 (见 README 路由表). |
-| 请求返回 503 `unavailable` | provider `enabled = false`. |
+| 请求返回 503 `unavailable` | provider `enabled = false`, 或路由坏链: message 含 `router provider '...' has no route matching model '...'` (无匹配路由 — 检查 model_pattern 与 priority) / `route target '...' not found` (悬空目标) / `route target '...' is disabled` / `route cycle detected` (手改配置产生的环). |
 
 配置文件缺失时进程仍可启动 (空配置 + 默认值, 但没有任何 provider 可转发, 启动日志有 WARN).

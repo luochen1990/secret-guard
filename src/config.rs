@@ -323,14 +323,18 @@ const KNOWN_FIELDS: &[(&str, &[&str])] = &[
             "id",
             "enabled",
             "name",
-            "model_override",
-            "kind", // #187 sum type tag (internally tagged; variant 字段平铺)
-            "protocol",
+            "kind",     // #187 sum type tag (internally tagged; variant 字段平铺)
+            "protocol", // Direct 构造字段 (Router 无 protocol; 清单按 section 平铺无法区分构造, 残留不告警)
             "base_url",
             "api_key",
             "api_key_file",
-            "route_to",
+            "routes", // Router 构造的路由数组 ([[providers.routes]]); 字段见 providers.routes
         ],
+    ),
+    // Router 构造的路由 entry ([[providers.routes]])
+    (
+        "providers.routes",
+        &["model_pattern", "target", "upstream_model", "priority"],
     ),
     // Config::secrets (SecretsConfig) — 表级仅 entries 一个键
     ("secrets", &["entries"]),
@@ -432,18 +436,27 @@ fn known_fields_for(prefix: &str) -> &'static [&'static str] {
 /// `where_` 是用户可读定位 (如 `providers[1]` / `[server]`), `prefix` 是
 /// [`KNOWN_FIELDS`] 的查找键 (如 `providers`).
 ///
-/// 递归: 键的值是 table 且 KNOWN_FIELDS 有对应子前缀 (`mock_strategy` →
-/// `mock_strategy.gen` → `...charset`) 时下降一层审计, 让深层拼写错误
-/// (如 `mock_strategy.inital`) 也能被观测 (#159 的目标在最深配置层同样成立).
+/// 递归: 键的值是 table (或 table 数组, 如 `[[providers.routes]]`) 且
+/// KNOWN_FIELDS 有对应子前缀 (`mock_strategy` → `mock_strategy.gen` →
+/// `...charset` / `routes` → `providers.routes`) 时下降一层审计, 让深层拼写错误
+/// (如 `mock_strategy.inital` / `routes.prioroty`) 也能被观测 (#159 的目标在
+/// 最深配置层同样成立).
 fn check_table_keys(table: &toml::Table, where_: &str, prefix: &str, out: &mut Vec<String>) {
     let known = known_fields_for(prefix);
     for (key, value) in table {
         if known.contains(&key.as_str()) {
             // 已知字段: 若值是 table 且存在子前缀清单, 递归审计一层 (如 mock_strategy).
-            if let Some(sub) = value.as_table() {
-                let sub_prefix = format!("{prefix}.{key}");
-                if !known_fields_for(&sub_prefix).is_empty() {
-                    check_table_keys(sub, &format!("{where_}.{key}"), &sub_prefix, out);
+            // sub_prefix 需先拼 (判空要用); 名单外 key 不拼 sub_where (免白做分配).
+            let sub_prefix = format!("{prefix}.{key}");
+            if !known_fields_for(&sub_prefix).is_empty() {
+                let sub_where = format!("{where_}.{key}");
+                if let Some(sub) = value.as_table() {
+                    check_table_keys(sub, &sub_where, &sub_prefix, out);
+                }
+                // array-of-tables (如 [[providers.routes]]): 逐 entry 递归审计.
+                // TOML 值模型 table/array 互斥, else if 表达之.
+                else if let Some(arr) = value.as_array() {
+                    check_table_array(arr, &sub_where, &sub_prefix, out);
                 }
             }
             continue;
@@ -459,10 +472,15 @@ fn check_table_keys(table: &toml::Table, where_: &str, prefix: &str, out: &mut V
 }
 
 /// 对 array-of-tables 的每个 entry 做未知字段审计 (类型不符元素跳过, 硬错误优先).
-fn check_table_array(arr: &toml::value::Array, prefix: &str, out: &mut Vec<String>) {
+///
+/// `where_` 是用户可读定位 (如 `providers` / `providers[0].routes`), `prefix` 是
+/// [`KNOWN_FIELDS`] 的查找键 (如 `providers` / `providers.routes`) — WARN 定位用
+/// where_, 字段清单查找用 prefix, 两者在嵌套场景 (routes 在某 provider entry 内)
+/// 才会分离.
+fn check_table_array(arr: &toml::value::Array, where_: &str, prefix: &str, out: &mut Vec<String>) {
     for (i, item) in arr.iter().enumerate() {
         if let Some(t) = item.as_table() {
-            check_table_keys(t, &format!("{prefix}[{i}]"), prefix, out);
+            check_table_keys(t, &format!("{where_}[{i}]"), prefix, out);
         }
     }
 }
@@ -509,21 +527,18 @@ pub(crate) fn audit_static_config_text(text: &str) -> Vec<String> {
         check_table_keys(v, "[redact]", "redact", &mut warnings);
     }
     if let Some(auth) = table.get("auth").and_then(|v| v.as_table()) {
-        // oidc 子表由 check_table_keys 的递归下降审计 (定位 "[auth].oidc"),
-        // 不在此显式调用, 避免同一 table 双重审计 (双重 WARN).
+        // oidc / api_keys 子结构均由 check_table_keys 的递归下降审计 (定位
+        // "[auth].oidc" / "[auth].api_keys[i]"), 不在此显式调用, 避免同一
+        // table 双重审计 (双重 WARN).
         check_table_keys(auth, "[auth]", "auth", &mut warnings);
-        if let Some(keys) = auth.get("api_keys").and_then(|v| v.as_array()) {
-            check_table_array(keys, "auth.api_keys", &mut warnings);
-        }
     }
     if let Some(v) = table.get("providers").and_then(|v| v.as_array()) {
-        check_table_array(v, "providers", &mut warnings);
+        check_table_array(v, "providers", "providers", &mut warnings);
     }
     if let Some(v) = table.get("secrets").and_then(|v| v.as_table()) {
+        // entries 子数组同样由 check_table_keys 的递归下降审计 (定位
+        // "[secrets].entries[i]"), 不在此显式调用 (同 auth.api_keys 理由).
         check_table_keys(v, "[secrets]", "secrets", &mut warnings);
-        if let Some(entries) = v.get("entries").and_then(|e| e.as_array()) {
-            check_table_array(entries, "secrets.entries", &mut warnings);
-        }
     }
 
     // ── 组合提示: 空配置 (#159 第三梯度) ──
@@ -1260,18 +1275,34 @@ impl<T: DynamicEntry> DynamicTable<T> {
 fn serialized_full_sample_paths() -> Vec<String> {
     let sample = Config {
         server: ServerConfig::default(),
-        providers: vec![Provider {
-            id: "sample".into(),
-            enabled: true,
-            name: Some("sample".into()),
-            model_override: None,
-            kind: crate::provider::ProviderKind::Direct(crate::provider::DirectProvider {
-                protocol: crate::provider::Protocol::default(),
-                base_url: "http://127.0.0.1:1".into(),
-                api_key: "sk-sample".into(),
-                api_key_file: Some("/dev/null".into()),
-            }),
-        }],
+        providers: vec![
+            Provider {
+                id: "sample".into(),
+                enabled: true,
+                name: Some("sample".into()),
+                kind: crate::provider::ProviderKind::Direct(crate::provider::DirectProvider {
+                    protocol: crate::provider::Protocol::default(),
+                    base_url: "http://127.0.0.1:1".into(),
+                    api_key: "sk-sample".into(),
+                    api_key_file: Some("/dev/null".into()),
+                }),
+            },
+            // Router 构造 (routes 全字段: model_pattern/target/upstream_model/priority 都序列化,
+            // 避开 Option::None / 缺省的盲区). 无 protocol 字段 (构造级删除).
+            Provider {
+                id: "sample-router".into(),
+                enabled: true,
+                name: Some("sample-router".into()),
+                kind: crate::provider::ProviderKind::Router(crate::provider::RouterProvider {
+                    routes: vec![crate::provider::Route {
+                        model_pattern: "gpt-*".into(),
+                        target: "sample".into(),
+                        upstream_model: Some("gpt-4o".into()),
+                        priority: Some(100),
+                    }],
+                }),
+            },
+        ],
         secrets: SecretsConfig {
             entries: vec![SecretEntry {
                 id: "sample".into(),
@@ -1323,12 +1354,17 @@ fn serialized_full_sample_paths() -> Vec<String> {
             }
             toml::Value::Array(a) => {
                 // 只对 "元素是 table" 的数组下钻 (providers / secrets.entries /
-                // auth.api_keys, 下标对消费端零信息故不编码进路径);
+                // auth.api_keys / providers.routes — **遍历全部元素** 而非仅首个:
+                // sum type 构造字段不同, 只看首个会漏掉另一构造的字段路径,
+                // 让 KNOWN_FIELDS 对该构造失去守卫); 下标对消费端零信息故不编码
+                // 进路径 (重复路径由调用方 dedup);
                 // 原始值数组 (length_range / charset.other) 视作单一叶子.
                 if let Some(first) = a.first()
                     && first.is_table()
                 {
-                    walk(prefix, first, out);
+                    for item in a {
+                        walk(prefix, item, out);
+                    }
                 } else {
                     out.push(prefix.trim_end_matches('.').to_string());
                 }
@@ -1339,6 +1375,8 @@ fn serialized_full_sample_paths() -> Vec<String> {
         }
     }
     walk("", &value, &mut paths);
+    paths.sort();
+    paths.dedup();
     paths
 }
 
@@ -1364,6 +1402,7 @@ mod audit_tests {
         for expected in [
             "server.",
             "providers.",
+            "providers.routes.",
             "secrets.entries.",
             "secrets.entries.mock_strategy",
             "redact.",
@@ -1434,6 +1473,44 @@ protocl = "openai"
         );
         // 定位含数组下标.
         assert!(all.contains("providers[0]"), "got: {all}");
+    }
+
+    /// #159 深层嵌套: [[providers.routes]] 内的未知字段 / 拼写错误也要被观测
+    /// (check_table_keys 对 array-of-tables 的递归下降).
+    #[test]
+    fn audit_warns_unknown_route_fields() {
+        let text = r#"
+[[providers]]
+id = "rt"
+kind = "router"
+
+[[providers.routes]]
+model_pattern = "gpt-*"
+target = "real"
+prioroty = 100
+"#;
+        let ws = audit_static_config_text(text);
+        let all = joined(&ws);
+        assert!(
+            all.contains("prioroty") && all.contains("did you mean 'priority'"),
+            "route field typo must warn with suggestion: {all}"
+        );
+        // 定位含 entry 下标 + routes 下标.
+        assert!(all.contains("providers[0].routes[0]"), "got: {all}");
+
+        // 合法 routes 字段不告警.
+        let clean = r#"
+[[providers]]
+id = "rt"
+kind = "router"
+
+[[providers.routes]]
+model_pattern = "gpt-*"
+target = "real"
+upstream_model = "gpt-4o"
+priority = 100
+"#;
+        assert!(audit_static_config_text(clean).is_empty());
     }
 
     /// #159 现象 2: 单数 [[provider]] 静默忽略 → WARN + 单复数建议.
@@ -1550,7 +1627,47 @@ base_url = "http://127.0.0.1:29804"
             all.contains("valeu") && all.contains("did you mean 'value'"),
             "got: {all}"
         );
-        assert!(all.contains("secrets.entries[0]"), "got: {all}");
+        // locator 是递归下降风格 (从 [secrets] 表下降到 entries 数组).
+        assert!(all.contains("[secrets].entries[0]"), "got: {all}");
+    }
+
+    /// 防回归 (双重 WARN): array-of-tables (providers.routes / auth.api_keys /
+    /// secrets.entries) 的同一未知字段只产出**恰好一条** WARN —
+    /// check_table_keys 的递归下降已覆盖这些子结构, audit_static_config_text
+    /// 不得再显式调用 check_table_array (历史回归: 同一 typo 两条 WARN +
+    /// 两种 locator `[auth].api_keys[0]` / `auth.api_keys[0]`).
+    #[test]
+    fn audit_array_of_tables_warns_exactly_once() {
+        let text = r#"
+[[providers]]
+id = "rt"
+kind = "router"
+
+[[providers.routes]]
+model_pattern = "gpt-*"
+target = "real"
+totally_unknown_field = 1
+
+[[auth.api_keys]]
+label = "k"
+totally_unknown_field = 1
+
+[[secrets.entries]]
+id = "t"
+value = "abc"
+totally_unknown_field = 1
+"#;
+        let ws = audit_static_config_text(text);
+        let hits = ws
+            .iter()
+            .filter(|w| w.contains("totally_unknown_field"))
+            .count();
+        assert_eq!(hits, 3, "each location warns exactly once: {ws:?}");
+        // locator 统一为递归下降风格 (section 方括号前缀).
+        let all = joined(&ws);
+        assert!(all.contains("providers[0].routes[0]"), "got: {all}");
+        assert!(all.contains("[auth].api_keys[0]"), "got: {all}");
+        assert!(all.contains("[secrets].entries[0]"), "got: {all}");
     }
 
     /// mock_strategy 子树: 合法嵌套字段不误报; 深层拼错 (inital) 也有建议.
@@ -1921,7 +2038,6 @@ on_probe_exhausted = "fail_closed"
             id: "p1".into(),
             enabled: true,
             name: Some("P1".into()),
-            model_override: None,
             kind: crate::provider::ProviderKind::Direct(crate::provider::DirectProvider {
                 protocol: crate::provider::Protocol::OpenAI,
                 base_url: "https://api.openai.com".into(),
@@ -1929,16 +2045,20 @@ on_probe_exhausted = "fail_closed"
                 api_key_file: None,
             }),
         });
-        // #187 sum type 持久化守卫: Virtual (flatten + internally tagged) 的
-        // 写出→读回 round-trip — 两种构造的 kind 必须无损存活.
+        // #187 sum type 持久化守卫: Router (flatten + internally tagged + 嵌套
+        // routes 数组) 的写出→读回 round-trip — 两种构造的 kind 与路由字段必须
+        // 无损存活.
         state.providers.push(Provider {
             id: "p2".into(),
             enabled: true,
             name: None,
-            model_override: None,
-            kind: crate::provider::ProviderKind::Virtual(crate::provider::VirtualProvider {
-                route_to: "p1".into(),
-                protocol: None,
+            kind: crate::provider::ProviderKind::Router(crate::provider::RouterProvider {
+                routes: vec![crate::provider::Route {
+                    model_pattern: "gpt-*".into(),
+                    target: "p1".into(),
+                    upstream_model: Some("gpt-4o".into()),
+                    priority: Some(10),
+                }],
             }),
         });
         state
@@ -1955,13 +2075,21 @@ on_probe_exhausted = "fail_closed"
             .iter()
             .map(|p| match &p.kind {
                 crate::provider::ProviderKind::Direct(_) => "direct",
-                crate::provider::ProviderKind::Virtual(_) => "virtual",
+                crate::provider::ProviderKind::Router(_) => "router",
             })
             .collect();
-        assert_eq!(kinds, vec!["direct", "virtual"], "round-trip text:\n{text}");
+        assert_eq!(kinds, vec!["direct", "router"], "round-trip text:\n{text}");
         assert_eq!(parsed.providers.len(), 2);
         assert_eq!(parsed.providers[0].id, "p1");
         assert_eq!(parsed.providers[1].id, "p2");
+        let crate::provider::ProviderKind::Router(r) = &parsed.providers[1].kind else {
+            panic!("p2 must stay Router after round-trip");
+        };
+        assert_eq!(r.routes.len(), 1);
+        assert_eq!(r.routes[0].model_pattern, "gpt-*");
+        assert_eq!(r.routes[0].target, "p1");
+        assert_eq!(r.routes[0].upstream_model.as_deref(), Some("gpt-4o"));
+        assert_eq!(r.routes[0].priority, Some(10));
         assert_eq!(
             parsed.decisions.provider("static-p"),
             OverrideMode::Disabled
@@ -2011,7 +2139,6 @@ on_probe_exhausted = "fail_closed"
             Provider {
                 id: id.to_string(),
                 name: Some(format!("name-{id}")),
-                model_override: None,
                 enabled: true,
                 kind: crate::provider::ProviderKind::Direct(crate::provider::DirectProvider {
                     protocol: Protocol::OpenAI,
@@ -2563,7 +2690,6 @@ mod proptests {
             id: id.into(),
             enabled: true,
             name: Some(format!("name-{id}")),
-            model_override: None,
             kind: crate::provider::ProviderKind::Direct(crate::provider::DirectProvider {
                 protocol: Protocol::OpenAI,
                 base_url: base_url.into(),

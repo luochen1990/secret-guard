@@ -22,8 +22,9 @@
 | **Redact** | 把 request body 中的 Secret 替换为 Mock 的正向操作 | 脱敏、过滤、打码、替换 | 全局 |
 | **Restore** | 把 response body 中的 Mock 还原为 Secret 的反向操作 | 还原、反替换、恢复 | 全局 |
 | **Mock** | Redact 时替代 Secret 的占位值 (per-secret 稳定, 不含真 secret 子串) | 假值、替身、占位符 | 全局 |
-| **Provider** | 一个 provider 条目 (sum type: Direct 直连实体 \| Virtual 虚拟路由, #187) | 上游、后端、模型、服务商 | 全局 |
-| **Virtual Provider** | `ProviderKind::Virtual` 构造的虚拟端点 (`route_to` 必填) — 自身不转发, 请求解析到链尾实体 provider (per-request, WebUI 即席切换指向, #179; sum type 化 #187) | 虚拟 endpoint、路由 provider、别名 | provider/proxy |
+| **Provider** | 一个 provider 条目 (sum type: Direct 直连实体 \| Router 路由, #187) | 上游、后端、模型、服务商 | 全局 |
+| **Router Provider** | `ProviderKind::Router` 构造的路由端点 (`routes` 路由列表必填) — 自身不转发, 按请求 model 匹配路由链式解析到链尾实体 provider (per-request, WebUI 即席改路由, #179 多规则化; sum type 化 #187) | 虚拟 endpoint、virtual provider、路由 provider、别名 | provider/proxy |
+| **Route** | 路由四元组 (`model_pattern` model 通配符 / `target` 目标 / `upstream_model` 重写 / `priority` 优先级) — model_pattern 匹配请求 model 时路由到 target, priority 越大越优先 (None = 禁用) | 规则、路由规则 | provider/proxy |
 | **Protocol** | LLM API 的协议族 (OpenAI / Anthropic / Gemini / Ollama / Responses) | 协议、格式 | 全局 |
 | **IR** | 协议无关的中间表示 (IrRequest / IrResponse / IrBlock) | 中间表示 | codec |
 | **RedactionMap** | 一次 Redact 产出的 Secret↔Mock 双向映射表 (per-request, 不持久化) | 映射表、redact map | redact |
@@ -274,11 +275,11 @@ URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标
 - 未知 protocol 简写 → 404 `not_found`
 - 未知 provider id → 404 `not_found`
 - 禁用 provider (`enabled = false`) → 503 `unavailable`
-- 虚拟 provider (`route_to`) 坏路由: 目标缺失 / 目标 disabled / 成环 → 503
-  `unavailable` (message 只含 id + reason 枚举, SEC-2 同型; 解析 per-request,
-  切换只影响新请求 — FWD-5, #179)
+- 路由 provider (routes) 坏路由: 无匹配路由 (NoMatch) / 目标缺失 / 目标 disabled / 成环 → 503
+  `unavailable` (message 只含 id + model 名 + reason 枚举, SEC-2 同型; 解析 per-request —
+  body 收集后按请求 model 匹配路由, 切换只影响新请求 — FWD-5, #179)
 - 跨协议 + `stream=true` → 501 (流式跨协议翻译尚未接入 dispatch)
-- **Responses + (Redact 或 model_override) + `stream=true`** → 501 (Responses 流式 SSE 事件翻译未实现; override 亦迫使 IR 路径 #183 D5; 见 "已知限制")
+- **Responses + (Redact 或路由 model 重写) + `stream=true`** → 501 (Responses 流式 SSE 事件翻译未实现; 重写亦迫使 IR 路径 #183 D5; 见 "已知限制")
 - Gemini/Ollama 跨协议 → 501 (codec 未覆盖)
 
 详尽的 dispatch 路径选择 (同协议透传 / IR 路径 / 跨协议翻译) 与 fan_out 三路径见
@@ -294,7 +295,7 @@ URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标
 | `main.rs` / `cli.rs` / `lib.rs` | 二进制入口 + CLI 参数 schema | 文件头部 `//!` |
 | `auth/` | OIDC 登录 (WebUI) + 本地 API key (SDK 转发) + session | `auth/mod.rs` 头部 `//!` |
 | `config.rs` | 双层配置 schema + `DynamicTable<T>` 泛型 + 持久化 + 静态配置预检审计 (未知 section/字段 → 启动 WARN, #159) | 文件头部 `//!` (覆盖 OverrideMode / CRUD / Effective source / 跨表并发) |
-| `provider.rs` | Provider sum type (Direct 直连 \| Virtual 虚拟路由, #187) + Effective view + api_key 两来源 + `resolve_route` first-wins (`route_to` / `model_override`) | 文件头部 `//!` |
+| `provider.rs` | Provider sum type (Direct 直连 \| Router 路由, #187) + Route (model_pattern 通配 / priority / 路由级 upstream_model 重写) + Effective view + api_key 两来源 + `resolve_route` 路由链解析 (per-request 按请求 model, model 重写 pipeline, #179 多规则化) | 文件头部 `//!` |
 | `secrets.rs` | SecretEntry 实体 + Effective view + value 两来源 | 文件头部 `//!` |
 | `mock.rs` | MockStrategy 两维度 (初始值 + 生成策略) + 确定性 seed + `[redact] global_mock_prefix` 注入 | 文件头部 `//!` (C3 根基) |
 | `dag/` (模块目录: mod/pool/types/view/timeline) | ConversationDAG 内容寻址存储 (BlockPool + Node + Merkle) | `src/dag/mod.rs` 头部 `//!` + `docs/design/conversation-dag.md` |
@@ -600,7 +601,7 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
 - **OpenAI Responses API 支持范围**: Responses 协议 (`/r/` proto_short) 已接入 codec,
   支持 Responses ⇄ Chat Completions 跨协议翻译 (非流式) + Responses 同协议透传 + Redact (非流式).
   **不支持**: Responses 流式 SSE 事件翻译 (Responses + Redact + `stream=true` 返回 501;
-  无 Redact 且无 model_override 的同协议流式透传正常工作; 配置了任一则 501, #183 D5); Responses ⇄ Anthropic 跨协议 (返回 501);
+  无 Redact 且路由链无 model 重写的同协议流式透传正常工作; 配置了任一则 501, #183 D5); Responses ⇄ Anthropic 跨协议 (返回 501);
   hosted tools (web_search/file_search/computer_use/mcp → 静默丢弃); namespace tools
   flattening; `previous_response_id` 服务端状态 (secret-guard 是 stateless 代理);
   reasoning items 的 `encrypted_content` (同协议 round-trip 也会丢失, 会破坏 reasoning chain).
@@ -672,27 +673,23 @@ NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 
   停用 provider 请用 `PATCH .../decision {"mode":"disabled"}`. WebUI 编辑留空发 null
   (保留语义), 仅 SDK 显式发空串可见. 根治需 schema 演进 (请求字段 Option 化或 sentinel
   值), 属后续工作.
-- **dynamic-only 条目 Direct → Virtual → Direct 往返丢 api_key (#187 已知限制)**:
-  sum type 下 Virtual 构造无处存放鉴权字段, 切回 Direct 时无恢复来源 (static 基线
+- **dynamic-only 条目 Direct → Router → Direct 往返丢 api_key (#187 已知限制)**:
+  sum type 下 Router 构造无处存放鉴权字段, 切回 Direct 时无恢复来源 (static 基线
   条目不受影响 — `inherit_from_static` Direct↔Direct 从 static 复原)。失败是静默的
   (空 key 出站 → 上游 401 才暴露), WebUI 表单 placeholder 变化 ("(optional)" 而非
-  "unchanged") 是唯一提示。根治需 Virtual 构造携带被遮蔽的 Direct 字段 (违背 sum
+  "unchanged") 是唯一提示。根治需 Router 构造携带被遮蔽的 Direct 字段 (违背 sum
   type 简洁性) 或 WebUI 本地暂存, 均不划算。
-- **model_override 的 #157 继承限制 (#183 已知限制)**: static 配置了
-  model_override 的条目无法经 override 清空 — override 未记录 (PUT 省略) 时会被
-  `inherit_from_static` 继承回 static 的值。dynamic-only 条目可完整往返 (WebUI 表单
-  留空)。(route_to 原有的同型限制已随 #187 sum type 重构根治: Direct override 即
-  显式 "改回实体", 见 `direct_override_replaces_static_virtual` 测试。)
-- **model_override 生效时放弃 byte-exact (#183, FWD-1 修订)**: 配置了 override 的
-  provider, 其同协议无-secret 请求从字节直传降级为 IR 改写路径 (normalize 等价;
-  上游前缀缓存失效 — 用户主动选择的降级, 契约层面已由 FWD-1 修订授权, §99 登记).
-  Gemini/Ollama + override 无法改写: WARN + 原样透传 (body 不变).
-- **虚拟 provider 跨条目环的启动检查缺失 (#179)**: 自环在 `Provider::validate`
-  (static 加载 fail-fast) 拒绝; 跨条目环只在 WebUI upsert (`would_cycle`) 与运行时
-  (`resolve_route` visited-set, 503) 拦截. 两个漏网来源: ① 手改 state.toml; ② 并发
-  upsert 的 TOCTOU (环检查与落库非同一临界区, 单用户本地工具的可接受假设, 与
-  #157 的 update TOCTOU 声明同型). 漏网环到首个请求才以 503 暴露 (不挂起, 安全但
-  可观测性弱). 启动时对 merged 视图做环检查是可选加固.
+- **路由 model 重写生效时放弃 byte-exact (#183, FWD-1 修订; 规则级化 2026-08-25)**:
+  路由链命中了携带 `upstream_model` 的路由的请求, 其同协议无-secret 分支从字节直传降级为 IR 改写
+  路径 (normalize 等价; 上游前缀缓存失效 — 用户主动选择的降级, 契约层面已由 FWD-1
+  修订授权, §99 登记). Gemini/Ollama + 重写无法改写: WARN + 原样透传 (body 不变).
+- **路由 provider 跨条目环的启动检查缺失 (#179)**: 自环在 `Provider::validate`
+  (static 加载 fail-fast) 拒绝; 跨条目环只在 WebUI upsert (`would_cycle`, 边集 =
+  启用路由的 target) 与运行时 (`resolve_route` visited-set, 503) 拦截. 两个漏网
+  来源: ① 手改 state.toml; ② 并发 upsert 的 TOCTOU (环检查与落库非同一临界区,
+  单用户本地工具的可接受假设, 与 #157 的 update TOCTOU 声明同型). 漏网环到首个
+  请求才以 503 暴露 (不挂起, 安全但可观测性弱). 启动时对 merged 视图做环检查是
+  可选加固.
 - **auth 模块测试覆盖率 (OIDC 登录流程)**: auth 模块的纯逻辑已覆盖
   (`apikey.rs` 100% / `middleware.rs` ~99% / `session.rs` ~98% / `mod.rs` ~99%), 含
   require_api_key 的 Authorization 剥离断言 (SEC 红线) 与 build_session_layer 的

@@ -356,7 +356,7 @@
     }
     dialog#provider-form {
       padding: 16px;
-      width: 480px;
+      width: 560px; /* #179 路由编辑器行内 6 字段需要比 480px 更宽 */
     }
     dialog#provider-form form {
       display: grid;
@@ -366,6 +366,7 @@
     }
     dialog#provider-form form input[type=text],
     dialog#provider-form form input[type=password],
+    dialog#provider-form form input[type=number],
     dialog#provider-form form select {
       width: 100%;
       font: inherit;
@@ -380,6 +381,42 @@
     }
     dialog#provider-form .kind-fields.hidden {
       display: none;
+    }
+    /* #179 路由编辑器 (Router 构造字段组): 路由行列表, 每行一条 Route.
+       routes-editor 跨整行 (grid-column 1/-1); 行内 6 列 = 启用/model_pattern/
+       target/upstream_model/priority/删除. */
+    #p-router-fields .routes-editor {
+      grid-column: 1 / -1;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    #p-router-fields .routes-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 12px;
+      color: var(--fg-muted);
+    }
+    #p-router-fields .routes-colhead,
+    #p-routes-list .route-row {
+      display: grid;
+      grid-template-columns: 22px 1fr 1.2fr 1.1fr 52px 26px;
+      gap: 4px;
+      align-items: center;
+    }
+    #p-router-fields .routes-colhead {
+      font-size: 10px;
+      color: var(--fg-muted);
+    }
+    #p-routes-list .route-row .route-del {
+      padding: 2px 4px;
+      font-size: 11px;
+    }
+    /* 列表路由摘要的 per-route egress 后缀 (小字, 悬停教育 tooltip). */
+    .route-egress {
+      color: var(--fg-muted);
+      font-size: 11px;
     }
     dialog#provider-form .actions {
       grid-column: 2;
@@ -1333,7 +1370,7 @@
               <th>ID</th>
               <th>Name</th>
               <th>Protocol</th>
-              <th>Base URL</th>
+              <th>Base URL / Routes</th>
               <th>API Key (masked)</th>
               <th>Enabled</th>
               <th>Source</th>
@@ -1442,7 +1479,7 @@
       <label for="p-kind">Kind</label>
       <select id="p-kind">
         <option value="direct">Direct — real upstream</option>
-        <option value="virtual">Virtual — routing endpoint</option>
+        <option value="router">Router — route-based routing</option>
       </select>
       <div class="hint" id="p-kind-hint" style="grid-column: 1 / -1; margin: 0 0 4px 0;">
         Forwards directly to a real LLM endpoint (base URL + API key).
@@ -1451,19 +1488,27 @@
       <input type="text" id="p-id" placeholder="unique slug, e.g. openai-main">
       <label for="p-name">Name</label>
       <input type="text" id="p-name" placeholder="(optional)">
-      <div class="kind-fields hidden" id="p-virtual-fields">
-        <label for="p-route-to">Route To</label>
-        <select id="p-route-to"></select>
-        <div class="hint" style="grid-column: 1 / -1;">
-          Requests to this endpoint follow the selected provider. Switch the target
-          any time; only new requests are affected. No base URL / API key of its own.
+      <div class="kind-fields hidden" id="p-router-fields">
+        <div class="routes-editor">
+          <div class="routes-head">
+            <span>Routes</span>
+            <button type="button" class="btn" id="p-route-add">+ Add route</button>
+          </div>
+          <div class="routes-colhead">
+            <span title="enabled — uncheck to keep the route without matching">on</span>
+            <span title="model name pattern ('*' wildcard)">model_pattern</span>
+            <span>target</span>
+            <span title="rewrite model (optional — overrides the client's model when this route wins)">upstream_model</span>
+            <span title="priority — higher wins, ties by list order">prio</span>
+            <span></span>
+          </div>
+          <div id="p-routes-list"></div>
+          <div class="hint" style="margin: 0 0 4px 0;">
+            The highest-priority enabled route whose model_pattern matches the request model routes the
+            request (ties: list order). model_pattern supports the '<code>*</code>' wildcard. Uncheck a
+            row to disable it — it is kept but never matched.
+          </div>
         </div>
-      </div>
-      <label for="p-model-override">Model Override</label>
-      <input type="text" id="p-model-override" placeholder="(none — pass client model through)">
-      <div class="hint" id="p-model-hint" style="grid-column: 1 / -1; display: none;">
-        Requests to this provider (directly or via routing) are rewritten to use this model —
-        the client's requested model is discarded. Costs byte-exact passthrough (prefix cache).
       </div>
       <div class="kind-fields" id="p-direct-fields">
         <label for="p-protocol">Protocol</label>
@@ -2869,7 +2914,7 @@
     //   (空文本), 反映 "数据不可用" 的事实.
     // 实际上游角标 (#179): round 的 upstream_id ≠ 会话 path 解析出的 provider id
     // (近似 "客户端连接的 endpoint") 时显示 "via <upstream>". upstream_id 是每轮的
-    // 权威事实 (route_to 解析后的链尾实体); 会话 path 取最新一轮, 混合会话中 older
+    // 权威事实 (路由解析后的链尾实体); 会话 path 取最新一轮, 混合会话中 older
     // round 的角标仅作归属提示.
     // pathId 是 timeline 级常量 (timelineSession 不变), 渲染方 hoist 后传参.
     function timelinePathProviderId() {
@@ -2879,7 +2924,7 @@
 
     function upstreamChip(r, pathId) {
       if (!r.upstream_id || !pathId || r.upstream_id === pathId) return '';
-      return `<span class="meta" title="actual upstream provider (virtual endpoint target)">via ${escapeHtml(r.upstream_id)}</span>`;
+      return `<span class="meta" title="actual upstream provider (router-resolved chain tail)">via ${escapeHtml(r.upstream_id)}</span>`;
     }
 
     function renderTimelineRound(r, idx, pathId) {
@@ -3938,29 +3983,96 @@
       return parts.join(' | ');
     }
 
+    // ─── provider 行渲染: router 路由摘要 + per-route egress 近似 (#179) ──────
+    //
+    // 跨协议教育提示 (静态, 无条件挂在 egress 标记上): 入口协议 ≠ 出口时的代价.
+    const EGRESS_CROSS_PROTO_TIP =
+      'If the ingress protocol ≠ this egress: cross-protocol translation kicks in — streaming requests return 501, reasoning_content is dropped';
+
+    // 启用 (priority 非 null) 路由中 priority 最大者; 并列按列表序先者 — 与后端
+    // `RouterProvider::select_route` 的确定性 tie-break 一致. 空/全禁用 → null.
+    function highestPriorityEnabledRoute(routes) {
+      return routes.reduce((best, r) => {
+        if (r.priority == null) return best;
+        return best == null || r.priority > best.priority ? r : best;
+      }, null);
+    }
+
+    // 从 provider id 出发 walk 到链尾 Direct 的 protocol (**展示近似**, #179):
+    // 中间 router 取其最高优先级启用路由的目标继续走 (忽略路由 upstream_model 重写
+    // 对后续跳匹配的影响 — 展示无需 per-model 精确解析); 防环 seen set; 悬空 / 无启用
+    // 路由 / 链尾非 Direct → null (调用方渲染 '?' 或降级 'unsupported').
+    // 假设: providersList 已在手且与后端一致 (本地派生, 无额外 fetch).
+    function chainTailProtocol(startId) {
+      let cur = state.providersList.find(x => x.id === startId);
+      const seen = new Set();
+      while (cur && cur.kind === 'router' && !seen.has(cur.id)) {
+        seen.add(cur.id);
+        const best = highestPriorityEnabledRoute(cur.routes || []);
+        if (!best) return null;
+        cur = state.providersList.find(x => x.id === best.target);
+      }
+      return cur && cur.kind === 'direct' ? cur.protocol : null;
+    }
+
+    // router 行的 protocol pill 文本: 各路由 egress 的去重集合. 单一 → 该 protocol;
+    // 多个 → 短列表逗号连接, 放不下 (cell-short 溢出) → 'mixed'; 悬空目标计入 '?'.
+    function routerEgressLabel(routes) {
+      const set = [...new Set(routes.map(r => chainTailProtocol(r.target) ?? '?'))];
+      if (set.length === 0) return '?';
+      if (set.length === 1) return set[0];
+      const joined = set.join(', ');
+      return joined.length <= 24 ? joined : 'mixed';
+    }
+
+    // 摘要折叠阈值: 超过 2 条路由时只显示首条 + "+N more" (全量在 td title).
+    const ROUTES_SUMMARY_MAX = 2;
+
+    // router 行的 URL 列: 路由摘要. 每条 "model_pattern → target · egress" (egress 为
+    // chainTailProtocol 近似, 悬空 → '?'); 禁用路由 (priority null) 主文本加 <s>
+    // 删除线. 沿用 cell-long + cell-ellipsis 溢出模式, td title 看全量.
+    function routerRoutesCell(routes) {
+      const renderRoute = (r) => {
+        const egress = chainTailProtocol(r.target) ?? '?';
+        const main = `${escapeHtml(r.model_pattern)} → ${escapeHtml(r.target)}`;
+        return (r.priority == null ? `<s>${main}</s>` : main)
+          + ` <span class="route-egress" title="${escapeHtml(EGRESS_CROSS_PROTO_TIP)}">· ${escapeHtml(egress)}</span>`;
+      };
+      const shown = routes.length > ROUTES_SUMMARY_MAX
+        ? [renderRoute(routes[0]), `<span class="meta">+${routes.length - ROUTES_SUMMARY_MAX} more</span>`]
+        : routes.map(renderRoute);
+      const full = routes
+        .map(r => `${r.priority == null ? '(disabled) ' : ''}${r.model_pattern} → ${r.target} [${chainTailProtocol(r.target) ?? '?'}]`)
+        .join('; ');
+      return `<td class="cell-long" title="${escapeHtml(full)}"><span class="cell-ellipsis"><code>${shown.join('; ')}</code></span></td>`;
+    }
+
     function renderProviderRow(p) {
       const rowCls = rowClass(p.source);
-      // #179/#183/#187: sum type — kind 判别 ('virtual' | 'direct').
-      // virtual: route_to 指向另一 provider (悬停提示语义);
-      // model:X: model_override 生效 (悬停提示代价).
-      const isVirtual = p.kind === 'virtual';
-      const protoLabel = p.protocol || '(any)';
-      let pills = `<span class="pill">${escapeHtml(protoLabel)}</span>`;
-      if (isVirtual) {
-        pills += ` <span class="pill" title="virtual endpoint — forwards to '${p.route_to}' (no base URL / API key of its own)">virtual</span>`;
+      // #179/#183/#187: sum type — kind 判别 ('direct' | 'router').
+      // router: 无 protocol 字段 — pill 显示路由 egress 去重集合 + router 徽标,
+      //   URL 列显示路由摘要 (per-route egress 近似, 见 routerRoutesCell);
+      // direct: protocol pill + base_url 原样展示.
+      const isRouter = p.kind === 'router';
+      let protoCell;
+      let urlCell;
+      if (isRouter) {
+        const routes = p.routes || [];
+        const egressLabel = routerEgressLabel(routes);
+        protoCell = `<td class="cell-short">`
+          + `<span class="pill" title="egress protocol(s) resolved from route targets (approximation: highest-priority enabled route)">${escapeHtml(egressLabel)}</span>`
+          + ` <span class="pill" title="route-based routing endpoint — forwards by route model_pattern (no base URL / API key of its own)">router</span>`
+          + `</td>`;
+        urlCell = routerRoutesCell(routes);
+      } else {
+        protoCell = `<td class="cell-short"><span class="pill">${escapeHtml(p.protocol)}</span></td>`;
+        urlCell = `<td class="cell-long" title="${escapeHtml(p.base_url || '')}"><span class="cell-ellipsis"><code>${escapeHtml(p.base_url)}</code></span></td>`;
       }
-      if (p.model_override) {
-        pills += ` <span class="pill" title="model override — requests are rewritten to this model (client model discarded; costs byte-exact passthrough)">model:${escapeHtml(p.model_override)}</span>`;
-      }
-      const protoCell = `<td class="cell-short">${pills}</td>`;
-      const urlCell = isVirtual
-        ? `<td class="cell-long" title="virtual → ${escapeHtml(p.route_to)}"><span class="cell-ellipsis"><code>→ ${escapeHtml(p.route_to)}</code></span></td>`
-        : `<td class="cell-long" title="${escapeHtml(p.base_url || '')}"><span class="cell-ellipsis"><code>${escapeHtml(p.base_url)}</code></span></td>`;
       return `
         <tr class="${rowCls}" data-id="${escapeHtml(p.id)}">
           <td title="${escapeHtml(p.id)}"><span class="cell-ellipsis"><code>${escapeHtml(p.id)}</code></span></td>
           <td title="${escapeHtml(p.name || '')}"><span class="cell-ellipsis">${escapeHtml(p.name || '')}</span></td>
-          <td class="cell-short">${protoCell}</td>
+          ${protoCell}
           ${urlCell}
           <td class="cell-long" title="${escapeHtml(p.api_key_masked || '')}"><span class="cell-ellipsis"><code>${escapeHtml(p.api_key_masked || '(none)')}</code></span></td>
           <td class="cell-short">${p.enabled ? '✓' : '<span class="status-err">✗</span>'}</td>
@@ -4165,17 +4277,12 @@
     // 暴露 codec 支持信息, 应改为 fetch 派生以消除此 SSOT 漂移点.
     const CODEC_SUPPORTED = new Set(['openai', 'anthropic']);
 
-    // #187: 虚拟 endpoint 的实际 egress = route_to 链尾实体的 protocol (入口数据
-    // providersList 已在手, 本地解析; 环/悬空时 protocol 字段兜底, 均无则 'unsupported'
-    // — endpoints 对话框仅是 copy-URL 辅助, 诚实降级不 panic).
+    // #187/#179: provider 的实际 egress = 链尾实体的 protocol (入口数据
+    // providersList 已在手, 本地解析). Direct → 自身 protocol; Router →
+    // chainTailProtocol 近似 (最高优先级启用路由的链尾). 环/悬空/无启用路由 →
+    // null (endpoints 对话框降级 'unsupported', 诚实降级不 panic).
     function resolveEgressProtocol(p) {
-      let cur = p;
-      const seen = new Set();
-      while (cur && cur.kind === 'virtual' && cur.route_to && !seen.has(cur.id)) {
-        seen.add(cur.id);
-        cur = state.providersList.find(x => x.id === cur.route_to);
-      }
-      return cur ? cur.protocol : null;
+      return p.kind === 'direct' ? p.protocol : chainTailProtocol(p.id);
     }
 
     function ingressMode(ingress, egress) {
@@ -4232,52 +4339,36 @@
       document.getElementById('p-name').value = existing?.name || '';
       document.getElementById('p-protocol').value = existing?.protocol || state.providerProtocols[0] || 'openai';
       // 构造选择 (#190): 按 kind 显隐字段组 — Direct: Protocol/Base URL/API Key;
-      // Virtual: Route To. 构造可切换 (编辑 static virtual → Direct override =
-      // 改回实体 #187 根治; dynamic 条目切换的丢 key 限制见 AGENTS.md).
+      // Router: 路由编辑器. 构造可切换 (编辑 static router → Direct override =
+      // 改回实体 #187 根治, 需显式发空 routes — 见下方 payload builder; dynamic
+      // 条目切换的丢 key 限制见 AGENTS.md).
       const kindSel = document.getElementById('p-kind');
       const kindHint = document.getElementById('p-kind-hint');
       const syncKind = () => {
-        const isVirtual = kindSel.value === 'virtual';
-        document.getElementById('p-direct-fields').classList.toggle('hidden', isVirtual);
-        document.getElementById('p-virtual-fields').classList.toggle('hidden', !isVirtual);
-        kindHint.textContent = isVirtual
-          ? 'Routing endpoint — requests follow Route To to the target provider. Switch it any time (new requests only).'
+        const isRouter = kindSel.value === 'router';
+        document.getElementById('p-direct-fields').classList.toggle('hidden', isRouter);
+        document.getElementById('p-router-fields').classList.toggle('hidden', !isRouter);
+        kindHint.textContent = isRouter
+          ? 'Route-based routing endpoint — the request model is matched against route model_patterns; the highest-priority enabled match routes the request. No base URL / API key of its own.'
           : 'Forwards directly to a real LLM endpoint (base URL + API key).';
       };
       kindSel.value = existing?.kind || 'direct';
       kindSel.onchange = syncKind;
       syncKind();
-      // Route To 下拉 (#179): 候选 = 其余 provider (排除自身, 防自环; 跨条目环由
-      // 服务端 would_cycle 校验拒绝). 悬空目标 (static 手写指向不存在的 id) 补一个
-      // "(missing)" 选项, 保证编辑保存不静默丢指向.
-      const routeSel = document.getElementById('p-route-to');
-      routeSel.innerHTML = '<option value="" disabled selected>(pick a target)</option>'
-        + state.providersList
-          .filter(x => x.id !== existing?.id)
-          .map(x => `<option value="${escapeHtml(x.id)}">${escapeHtml(x.id)}</option>`)
-          .join('');
-      if (existing?.kind === 'virtual' && existing.route_to
-          && !routeSel.querySelector(`option[value="${CSS.escape(existing.route_to)}"]`)) {
-        routeSel.insertAdjacentHTML('beforeend',
-          `<option value="${escapeHtml(existing.route_to)}">${escapeHtml(existing.route_to)} (missing)</option>`);
-      }
-      routeSel.value = existing?.route_to || '';
-      // Model Override (#183): hint 联动 (有值时提示代价).
-      const modelInput = document.getElementById('p-model-override');
-      modelInput.value = existing?.model_override || '';
-      const modelHint = document.getElementById('p-model-hint');
-      modelHint.style.display = modelInput.value.trim() ? 'block' : 'none';
-      if (!modelInput.dataset.bound) {
-        modelInput.addEventListener('input', () => {
-          modelHint.style.display = modelInput.value.trim() ? 'block' : 'none';
-        });
-        modelInput.dataset.bound = '1';
-      }
+      // 路由编辑器 (#179 多规则化): 行数据 SSOT 是 DOM 本身 (输入即状态), 打开表单
+      // 时从 existing 一次性物化; 非 Router 条目 (或新建) 给一行空白. 构造切换只
+      // 显隐字段组不清空行 — 用户 Direct↔Router 来回切不丢已填路由 (与 #190 的
+      // 字段保留语义一致).
+      const routesList = document.getElementById('p-routes-list');
+      routesList.innerHTML = '';
+      const routes = existing?.kind === 'router' ? (existing.routes || []) : [];
+      if (routes.length) routes.forEach(r => addRouteRow(r));
+      else addRouteRow();
       document.getElementById('p-base-url').value = existing?.base_url || '';
       const apiKeyInput = document.getElementById('p-api-key');
       apiKeyInput.value = '';
       // 编辑模式下用 masked 旧值做 placeholder, 提示"留空将保留"; 创建模式保持原提示.
-      // Virtual 旧值无 api_key_masked (构造上不存在) → (optional) 即 "需重新填写" 的提示.
+      // Router 旧值无 api_key_masked (构造上不存在) → (optional) 即 "需重新填写" 的提示.
       apiKeyInput.placeholder = existing?.api_key_masked
         ? `unchanged (${existing.api_key_masked}) — leave blank to keep`
         : '(optional for local providers like Ollama)';
@@ -4288,6 +4379,72 @@
       saveBtn.textContent = existing ? 'Update' : 'Create';
       dlg.showModal();
     }
+
+    // ─── router 路由编辑器 (#179) ─────────────────────────────────────────
+    //
+    // 每行一条 Route: model_pattern / target / upstream_model / priority + 启用 checkbox.
+    // wire 无独立 enabled 字段 — checkbox 取消 = 提交 priority: null (禁用, 路由
+    // 保留但不参与匹配). 增删行用静态容器 + 事件委托 (行是动态子元素).
+
+    // 物化一行路由输入. route 形如 {model_pattern, target, upstream_model, priority}
+    // (priority null/缺席 = 禁用行); 缺省参数 = 一行空白 (新建, 默认启用 priority 0 —
+    // 注意不能缺省 {}: undefined 的 `!= null` 判定会让新行意外以禁用态提交).
+    function addRouteRow(route = { priority: 0 }) {
+      const editId = document.getElementById('provider-form').dataset.editId || '';
+      // target 候选: 其余 provider (排除编辑对象自身, 防自环 — 后端 validate 兜底).
+      // 悬空目标 (static 手写指向不存在的 id) 补 "(missing)" 选项, 保证编辑保存
+      // 不静默丢指向 (沿用旧 Route To 下拉的模式).
+      const target = route.target || '';
+      const candidates = state.providersList.filter(x => x.id !== editId);
+      const missingOpt = target && !state.providersList.some(x => x.id === target)
+        ? `<option value="${escapeHtml(target)}">${escapeHtml(target)} (missing)</option>`
+        : '';
+      const row = document.createElement('div');
+      row.className = 'route-row';
+      row.innerHTML = `
+        <input type="checkbox" class="route-enabled" title="enabled — uncheck to keep this route without matching">
+        <input type="text" class="route-model-pattern" placeholder="gpt-*">
+        <select class="route-target">
+          <option value="" ${target ? '' : 'selected'} disabled>(target)</option>
+          ${candidates.map(x => `<option value="${escapeHtml(x.id)}">${escapeHtml(x.id)}</option>`).join('')}
+          ${missingOpt}
+        </select>
+        <input type="text" class="route-upstream-model" placeholder="rewrite model (optional)">
+        <input type="number" class="route-priority" step="1" placeholder="0">
+        <button type="button" class="btn route-del" title="Remove route">✕</button>`;
+      row.querySelector('.route-model-pattern').value = route.model_pattern || '';
+      row.querySelector('.route-upstream-model').value = route.upstream_model || '';
+      row.querySelector('.route-priority').value = route.priority ?? '';
+      if (target) row.querySelector('.route-target').value = target;
+      // 启用开关 ↔ priority 输入联动: 取消勾选灰掉输入 (提交侧发 priority null).
+      const enabled = row.querySelector('.route-enabled');
+      const prio = row.querySelector('.route-priority');
+      enabled.checked = route.priority != null;
+      const syncPrio = () => { prio.disabled = !enabled.checked; };
+      enabled.addEventListener('change', syncPrio);
+      syncPrio();
+      document.getElementById('p-routes-list').appendChild(row);
+    }
+
+    // 收集路由行 → Route wire shape (提交用): upstream_model 空 = null (透传);
+    // priority = 勾选时 Math.trunc(Number(输入)) || 0 (空/非法/小数 → 0;
+    // 小数截断防 i64 反序列化 400), 取消勾选 = null (禁用).
+    function collectRoutesFromForm() {
+      return [...document.querySelectorAll('#p-routes-list .route-row')].map(row => ({
+        model_pattern: row.querySelector('.route-model-pattern').value.trim(),
+        target: row.querySelector('.route-target').value,
+        upstream_model: row.querySelector('.route-upstream-model').value.trim() || null,
+        priority: row.querySelector('.route-enabled').checked
+          ? (Math.trunc(Number(row.querySelector('.route-priority').value)) || 0)
+          : null,
+      }));
+    }
+
+    document.getElementById('p-route-add').addEventListener('click', () => addRouteRow());
+    document.getElementById('p-routes-list').addEventListener('click', (ev) => {
+      const btn = ev.target.closest('.route-del');
+      if (btn) btn.closest('.route-row').remove();
+    });
 
     /// 编辑 static-only id 时, 提示 "此次会创建 dynamic override".
     function toggleOverrideBanner(dlg, existing) {
@@ -4347,38 +4504,56 @@
     }));
 
     bindFormSubmit('provider', 'provider-form-el', () => {
-      // #190: 按构造分野 payload — 表单 kind 选择器是唯一事实来源.
-      // - Direct: protocol + base_url (+api_key), route_to 发 "" (显式 Direct 构造).
-      // - Virtual: route_to (必填), protocol/base_url/api_key 发 null/"" (构造上不存在).
+      // #190/#179: 按构造分野 payload — 表单 kind 选择器是唯一事实来源.
+      // - Router: routes 全量发 (≥1 条, 每行 model_pattern/target 前端必填拦截);
+      //   protocol/base_url/api_key 不发 (构造上不存在, 残留发送也会被后端忽略).
+      // - Direct: protocol + base_url (+api_key); routes 原则上不发 (省略 = 保留/
+      //   Direct 构造), 唯一例外: 编辑对象当前是 Router 时发空数组 — PUT 省略 routes
+      //   会被后端回填旧路由停留在 Router, 空数组是后端定义的 "显式改回实体" wire 语义.
       // 编辑模式 (PUT): api_key 留空 → 发 null, 后端保留旧值 (见 update_provider handler).
-      // model_override 总是发字符串 (#183): "" = 清空 (透传), "X" = 生效值.
-      const isUpdate = !!document.getElementById('provider-form').dataset.editId;
-      const isVirtual = document.getElementById('p-kind').value === 'virtual';
-      const apiKeyInput = document.getElementById('p-api-key').value;
-      const routeTo = document.getElementById('p-route-to').value;
+      const editId = document.getElementById('provider-form').dataset.editId;
+      const isRouter = document.getElementById('p-kind').value === 'router';
+      const id = document.getElementById('p-id').value.trim() || null;
+      const name = document.getElementById('p-name').value.trim() || null;
+      const enabled = document.getElementById('p-enabled').checked;
+      if (isRouter) {
+        const routes = collectRoutesFromForm();
+        // 构造内必填前置拦截 (避免用户填完整个表单才收到后端 400).
+        if (routes.length === 0) {
+          alert('At least one route is required for a router provider.');
+          return null;
+        }
+        for (let i = 0; i < routes.length; i++) {
+          if (!routes[i].model_pattern) {
+            alert(`Route #${i + 1}: model_pattern is required (e.g. gpt-*).`);
+            return null;
+          }
+          if (!routes[i].target) {
+            alert(`Route #${i + 1}: route target is required (pick a provider, or create one first).`);
+            return null;
+          }
+        }
+        return { id, name, routes, enabled };
+      }
       const baseUrl = document.getElementById('p-base-url').value.trim();
-      const modelOverride = document.getElementById('p-model-override').value.trim();
-      // 构造内必填字段前置拦截 (避免用户填完整个表单才收到后端 400):
-      // Direct 需要 base_url; Virtual 需要目标 (下拉为空 = 没有可选 provider).
-      if (!isVirtual && !baseUrl) {
+      if (!baseUrl) {
         alert('Base URL is required for a direct provider.');
         return null;
       }
-      if (isVirtual && !routeTo) {
-        alert('Route To is required for a virtual provider (pick a target, or create one first).');
-        return null;
-      }
-      return {
-        id: document.getElementById('p-id').value.trim() || null,
-        name: document.getElementById('p-name').value.trim() || null,
-        protocol: isVirtual ? null : document.getElementById('p-protocol').value,
-        route_to: isVirtual ? routeTo : '',
-        model_override: modelOverride,
-        base_url: isVirtual ? '' : baseUrl,
-        enabled: document.getElementById('p-enabled').checked,
-        // api_key 三态: Virtual 构造不存在 / Direct 编辑留空 = 保留 (null) / 其余发值.
-        api_key: (isVirtual || (isUpdate && apiKeyInput === '')) ? null : apiKeyInput,
+      const apiKeyInput = document.getElementById('p-api-key').value;
+      const payload = {
+        id,
+        name,
+        protocol: document.getElementById('p-protocol').value,
+        base_url: baseUrl,
+        enabled,
+        // api_key 三态: Direct 编辑留空 = 保留 (null) / 其余发值.
+        api_key: (editId && apiKeyInput === '') ? null : apiKeyInput,
       };
+      if (editId && state.providersList.find(x => x.id === editId)?.kind === 'router') {
+        payload.routes = [];
+      }
+      return payload;
     });
 
     // ─── decision PATCH ──────────────────────────────────────────────────

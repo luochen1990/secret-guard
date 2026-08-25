@@ -148,20 +148,21 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 **陈述**: secret-guard 是客户端与上游之间的字节级透明中继. **两个半段各自满足 byte-exact**:
 
 - **请求半段** (client → upstream): 客户端发送的请求 wire 经 secret-guard redact 后发往上游, 要求
-  `normalize(发往上游的 wire) == normalize(客户端请求 wire).replace(real, mock)`; 若生效 provider 配置了
-  `model_override` (#183), 额外允许 model 字段重写:
-  `normalize(发往上游的 wire) == normalize(客户端请求 wire).replace(real, mock).replace(model, override)`.
+  `normalize(发往上游的 wire) == normalize(客户端请求 wire).replace(real, mock)`; 若路由链上命中了携带
+  `upstream_model` 的路由 (#183 语义被 `Route.upstream_model` 吸收), 额外允许 model 字段重写:
+  `normalize(发往上游的 wire) == normalize(客户端请求 wire).replace(real, mock).replace(model, rewrite)`
+  (rewrite = 链上最后一次命中的路由 `upstream_model`, pipeline 语义).
 - **响应半段** (upstream → client): secret-guard 收到上游响应 wire 后经 restore 返回客户端, 要求
   `normalize(返回客户端的 wire) == normalize(上游响应 wire).replace(mock, real)`.
 
-等价表述: **secret-guard 对 wire 的合法修改有且仅有两种: real↔mock 替换, 以及 model 字段重写 (仅当生效 provider 配置了 `model_override`)**, 除此之外的任何字节差异 (字段丢失 / 顺序错乱 / 重序列化改变 / 任意字段值变化) 都是 bug.
+等价表述: **secret-guard 对 wire 的合法修改有且仅有两种: real↔mock 替换, 以及 model 字段重写 (仅当路由链上命中了携带 `upstream_model` 的路由)**, 除此之外的任何字节差异 (字段丢失 / 顺序错乱 / 重序列化改变 / 任意字段值变化) 都是 bug.
 
-> **model_override 代价明示** (2026-08-24 修订, §99 登记): override 生效时, 同协议无-secret 请求
-> 从字节直传 (passthrough) 降级为 IR 改写路径 — 前者对无 redact 请求是 byte-exact 的, 后者经
-> reader→IR→writer 重序列化, 仅保证 normalize 后等价 (与 "同协议 + Redact" 的既有降级同型).
-> 这是用户配置 override 时**主动选择的降级**, 非 bug. 经济性代价: override 值与客户端请求的
-> model 不同时, 上游前缀缓存从该请求起失效. 解析语义 (链上 first-wins / 无 codec 协议降级) 见
-> FWD-5 `prop_model_override_*` 系列.
+> **路由 model 重写代价明示** (2026-08-24 修订 / 2026-08-25 措辞随多规则化同步, §99 登记): 重写生效时,
+> 同协议无-secret 请求从字节直传 (passthrough) 降级为 IR 改写路径 — 前者对无 redact 请求是 byte-exact
+> 的, 后者经 reader→IR→writer 重序列化, 仅保证 normalize 后等价 (与 "同协议 + Redact" 的既有降级同型).
+> 这是用户配置 route.upstream_model 时**主动选择的降级**, 非 bug. 经济性代价: 重写值与客户端请求的
+> model 不同时, 上游前缀缓存从该请求起失效. 解析语义 (链上 pipeline / 无 codec 协议降级) 见
+> FWD-5 `prop_model_rewrite_*` 系列.
 
 `normalize` = canonical JSON (BTreeMap key 排序 + 紧凑序列化 + 无空白). 消除对语义无影响的字节差异, 剩下的差异全部是真正的信息差异.
 
@@ -170,8 +171,8 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 **不适用**: 跨协议路径 (ingress wire 与 egress wire 是不同协议格式, 由 FWD-3 单独约束).
 
 **Properties**:
-- `prop_request_half_byte_exact` (非流式, 请求侧): 对任意合法请求 wire 含 real secret, `normalize(secret-guard 发往上游的 wire) == normalize(原始 wire).replace(real, mock)` (无 model_override 时). 🔁→`openai_request_redact_preserves_wire_except_secret` + `anthropic_request_redact_preserves_wire_except_secret` (半段式含 redact, `src/codec/fwd_property.rs`; 端到端 `redact_strips_secret_from_upstream_request`)
-- `prop_request_half_byte_exact_with_model_override` (非流式, 请求侧): 生效 provider 配置 `model_override` 时, `normalize(secret-guard 发往上游的 wire) == normalize(原始 wire).replace(real, mock).replace(model, override)` — 无-secret 场景亦成立 (override 强制 IR 路径). 🔁→`model_override_reaches_upstream` + `model_override_no_secret_forces_ir_path` (`tests/integration.rs`)
+- `prop_request_half_byte_exact` (非流式, 请求侧): 对任意合法请求 wire 含 real secret, `normalize(secret-guard 发往上游的 wire) == normalize(原始 wire).replace(real, mock)` (无路由 model 重写时). 🔁→`openai_request_redact_preserves_wire_except_secret` + `anthropic_request_redact_preserves_wire_except_secret` (半段式含 redact, `src/codec/fwd_property.rs`; 端到端 `redact_strips_secret_from_upstream_request`)
+- `prop_request_half_byte_exact_with_model_rewrite` (非流式, 请求侧; 2026-08-25 前名 `prop_request_half_byte_exact_with_model_override`): 路由链命中携带 `upstream_model` 的路由时, `normalize(secret-guard 发往上游的 wire) == normalize(原始 wire).replace(real, mock).replace(model, rewrite)` — 无-secret 场景亦成立 (重写强制 IR 路径). 🔁→`model_rewrite_reaches_upstream` + `model_rewrite_no_secret_forces_ir_path` + `model_rewrite_with_secret_joint` (联合公式端到端) (`tests/integration.rs`)
 - `prop_response_half_byte_exact` (非流式, 响应侧): 对任意合法响应 wire 含 mock, `normalize(secret-guard 返回客户端的 wire) == normalize(上游 wire).replace(mock, real)`. 🔁→`prop_response_round_trip_identity` / `prop_response_tool_use_input_restored` (redact.rs 响应侧) + 端到端 `restore_inserts_secret_back_for_client` (非流式) — 流式半段见 FWD-1 `prop_streaming_response_half_byte_exact` 弱化形式注记
 - `prop_streaming_response_half_byte_exact` (流式, 响应侧): 流式响应的 restore, 经任意 chunk 切分, 同上. 🔁→`prop_streaming_response_half_byte_exact_openai` + `prop_streaming_response_half_byte_exact_anthropic` (`src/codec/fwd_streaming_property.rs`; 语义等价弱化形式, 见下方 "理想 vs 现状" 注记)
 
@@ -244,7 +245,11 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 ### FWD-5 路由分发契约
 
-**陈述**: URL = `/{proto_short}/{provider_id}/*path`. 未知 protocol / 未知 provider / 禁用 provider / 不支持的协议组合 必须返回明确错误码. provider 可能是**虚拟的** (`route_to` 指向另一 provider id, #179): dispatch 先跟随 route_to 链解析到链尾实体 provider, ingress 协议由 URL 决定, egress 协议由链尾实体决定 (不同则走跨协议翻译).
+**陈述**: URL = `/{proto_short}/{provider_id}/*path`. 未知 protocol / 未知 provider / 禁用 provider / 不支持的协议组合 必须返回明确错误码. provider 可能是**路由的** (Router 构造, `routes` 路由列表, #179 多规则化): dispatch 在**请求 body 收集后**提取顶层 `model` 字段, router 按**请求 model** 匹配路由并链式解析到链尾实体 provider — 解析是 per-request 的, 切换路由只影响新请求. ingress 协议由 URL 决定, egress 协议由链尾实体决定 (不同则走跨协议翻译; Router 构造无 protocol 字段).
+
+**路由选择** (`RouterProvider::select_route`): 启用 (`priority` 非 None) 且 model_pattern 匹配 in-flight model 的路由中 `priority` **最大**者; 同值并列按**列表出现顺序**取先者 (确定性 tie-break). model_pattern 是 model 名通配符: 仅 `*` 是元字符 (匹配任意串, 含空串), 其余字符字面匹配 (大小写敏感). **model 重写 pipeline 语义** (`resolve_route`): 命中路由的 `upstream_model` 为 Some 时改写**立即生效** — in-flight model 被改写, 后续跳 router 按改写后的 model 匹配路由; 多跳重写后者覆盖前者; `ResolvedRoute.model_rewrite` = 最后一次命中的 route.upstream_model (全链未配置 = 透传客户端 model).
+
+**路由错误语义** (全部 503, message 只含 provider id / model 名 + reason 枚举, SEC-2 同型): 无匹配路由 (NoMatch — 启用路由中无 model_pattern 匹配请求 model) / 链上目标缺失 (Missing, 含被 decision-disabled 排除) / 链上目标 entry-level disabled (Disabled) / 成环 (Cycle, `resolve_route` visited-set 运行时兜底, 有限步终止). 悬空 `target` 写入放行 (创建顺序无关), 运行时 503 兜底; upsert 侧环检查 (`would_cycle`) 的边集 = 所有**启用**路由的 `target` (禁用路由不构成边), 任一分支成环 → 400.
 
 **Properties**:
 - `prop_unknown_protocol_returns_404`: 未知 proto_short → 404 not_found. 🔁→`unknown_protocol_returns_404` (`tests/integration.rs`)
@@ -253,14 +258,20 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 - `prop_cross_proto_streaming_returns_501`: 跨协议 + stream=true → 501 (翻译未接入). 🔁→`cross_protocol_streaming_returns_501` (`tests/integration.rs`)
 - `prop_unsupported_codec_returns_501`: Gemini/Ollama 跨协议 → 501 (codec 未覆盖). 🔁→`cross_protocol_unknown_pair_returns_501` (`tests/integration.rs`)
 - `prop_internal_url_404_no_forward`: `/api/*` 未匹配子路径 → 404, 绝不进入 forward (防止内部 URL 泄漏到上游; 同 SEC-6 的 property 名). 🔁→`web_namespace_not_forwarded_to_upstream` + `unmatched_path_returns_404` (`tests/integration.rs`)
-- `prop_route_resolution_per_request` (#179): 虚拟 provider 的路由解析是 per-request 的 — 切换指向只影响新请求, in-flight 请求按已解析目标完成; 每轮 record 的 upstream_id 如实记录该轮实际归属, 历史轮次不随切换改写. 🔁→`virtual_provider_switches_target_mid_session` (`tests/integration.rs`)
-- `prop_route_broken_returns_503` (#179): 链上目标缺失 / entry-level disabled / 成环 → 503, message 只含 provider id 与 reason 枚举 (SEC-2 同型, 无 secret). 🔁→`virtual_provider_dangling_returns_503` + `virtual_provider_disabled_target_returns_503` (`tests/integration.rs`) + `resolve_route_missing_target` / `resolve_route_disabled_target` / `resolve_route_detects_cycles` (`src/provider.rs`)
+- `prop_route_resolution_per_request` (#179): 路由 provider 的路由解析是 per-request 的 (body 收集后携带本请求 model) — 修改路由 / 切换指向只影响新请求, in-flight 请求按已解析目标完成; 每轮 record 的 upstream_id 如实记录该轮实际归属, 历史轮次不随切换改写. 🔁→`router_provider_switches_routes_mid_session` (`tests/integration.rs`)
+- `prop_router_request_model_extraction` (#179): 路由匹配的输入 model 取自请求 body 的 **JSON 顶层** string `model` 字段; 非 JSON / 顶层非 object / 无字段 / 非 string / 空 body → `""` (此时仅 `*` 类 model_pattern 可命中); 嵌套结构 (如 `messages` 内) 的 model 不误取. 🔁→`router_routes_route_by_model` (`tests/integration.rs`) + `request_model_extracts_top_level_string` / `request_model_nested_model_not_picked_up` / `request_model_malformed_bodies_fall_back_to_empty` (`src/proxy/helpers.rs`)
+- `prop_router_pattern_wildcard_semantics` (#179): model_pattern 通配语义: 仅 `*` 是元字符 (匹配任意串, 含空串), 其余字符字面匹配 (大小写敏感); `"*"` 匹配一切; 连续 `**` 折叠为单个 `*`; 无 `*` 的 model_pattern 退化为全等比较. 🔁→`prop_wildcard_split_pattern_matches_concat` + `prop_wildcard_star_matches_anything` (`src/provider.rs` proptest) + `wildcard_match_star_matches_all_including_empty` / `wildcard_match_consecutive_stars_collapse` (确定性边界用例)
+- `prop_router_rule_priority_ordering` (#179; ID 保留 rules→routes 重命名前的历史命名): 路由选择 = 启用路由中 model_pattern 匹配者的 priority 最大者; 同值并列按列表出现顺序取先者 (确定性 tie-break). 🔁→`router_routes_priority_decides_winner` (`tests/integration.rs`) + `select_route_highest_priority_wins` / `select_route_tie_breaks_by_list_order` (`src/provider.rs`)
+- `prop_router_disabled_rule_skipped` (#179; ID 保留 rules→routes 重命名前的历史命名): `priority = None` 的路由**禁用** — 不参与匹配 (让位给列表中更后的通配路由), 也不构成环检查边集. 🔁→`router_routes_disabled_route_skipped` (`tests/integration.rs`) + `select_route_skips_disabled_routes` (`src/provider.rs`)
+- `prop_router_no_match_returns_503` (#179): router 的启用路由中无 model_pattern 匹配请求 model → 503, message 形如 `router provider '{id}' has no route matching model '{model}'` (只含 id + model 名, SEC-2 同型). 🔁→`router_routes_no_match_returns_503` (`tests/integration.rs`) + `resolve_route_no_matching_route` (`src/provider.rs`)
+- `prop_route_broken_returns_503` (#179): 链上目标缺失 / entry-level disabled / 成环 → 503, message 只含 provider id 与 reason 枚举 (SEC-2 同型, 无 secret). 🔁→`router_provider_dangling_returns_503` + `router_provider_disabled_target_returns_503` (`tests/integration.rs`) + `resolve_route_missing_target` / `resolve_route_disabled_target` / `resolve_route_detects_cycles` (`src/provider.rs`)
 - `prop_route_cycle_termination` (#179): 任意 route 图 (含环 / 悬空 / 自环), `resolve_route` 有限步返回 (Ok ⇒ 链尾必为 Direct 构造 — #187 起由 `ResolvedRoute.provider: DirectProvider` 类型保证, proptest 断言随之弱化为纯终止性). 🔁→`prop_resolve_route_terminates_on_random_graphs` (`src/provider.rs`, proptest; 生成器覆盖环与悬空)
-- `prop_route_cycle_rejected_at_upsert` (#179): upsert 形成环 (含自环) → 400 validation; 悬空目标放行 (创建顺序无关, 运行时 503 兜底). 🔁→`virtual_provider_cycle_upsert_rejected` (`tests/integration.rs`) + `would_cycle_rejects_indirect_cycle` / `would_cycle_updates_entry_in_place` / `validate_virtual_provider_semantics` (`src/provider.rs`)
-- `prop_upstream_id_observable` (#179): 每轮 record 携带 upstream_id = route_to 解析后的链尾实体 provider id (非虚拟请求 = URL provider id), 经 NodeView / TimelineRound / ForwardRecord 暴露给 WebUI. 🔁→`virtual_provider_switches_target_mid_session` (`tests/integration.rs`, latest_upstream_id 断言)
-- `prop_model_override_first_hop_wins` (#183): 生效的 model_override = 沿 route_to 链**从入口起第一个非空值** (入口/中间跳/链尾实体任一层配置均生效; 高层优先). 🔁→`resolve_route_model_override_first_hop_wins` (`src/provider.rs`)
-- `prop_model_override_injects_into_egress_ir` (#183): 配置 override 且 codec 可用时, egress IR 的 model 字段被无条件改写为 override (客户端 body 缺 model 字段亦注入); 无-secret 请求因 override 强制走 IR 路径 (不再字节直传). 🔁→`model_override_reaches_upstream` + `model_override_no_secret_forces_ir_path` + `model_override_switch_via_put` (`tests/integration.rs`)
-- `prop_model_override_no_codec_passthrough` (#183): 无 codec 协议 (Gemini/Ollama) + override → 不改写 body, 字节透传 + WARN (与 "codec 缺失 + secrets" 降级同型). 🔁→`model_override_gemini_passthrough_unrewritten` (`tests/integration.rs`)
+- `prop_route_cycle_rejected_at_upsert` (#179): upsert 形成环 (含自环) → 400 validation; 环检查边集 = **启用**路由的 `target` (禁用路由不构成边; 汇聚型 diamond 分支不误报); 悬空目标放行 (创建顺序无关, 运行时 503 兜底). 🔁→`router_provider_cycle_upsert_rejected` (`tests/integration.rs`) + `would_cycle_rejects_indirect_cycle` / `would_cycle_updates_entry_in_place` / `would_cycle_checks_every_enabled_route_branch` / `would_cycle_diamond_convergence_is_not_a_cycle` / `validate_router_semantics` (`src/provider.rs`)
+- `prop_upstream_id_observable` (#179): 每轮 record 携带 upstream_id = 路由链解析后的链尾实体 provider id (非路由请求 = URL provider id), 经 NodeView / TimelineRound / ForwardRecord 暴露给 WebUI. 🔁→`router_provider_switches_routes_mid_session` (`tests/integration.rs`, latest_upstream_id 断言)
+- `prop_model_rewrite_pipeline_feeds_next_hop` (#183; 2026-08-25 前身 `prop_model_override_first_hop_wins` 已随 first-wins 语义作废): 命中路由的 `upstream_model` 重写对**下一跳路由**可见 — in-flight model 被改写后, 后续 router 按改写后的 model 匹配路由 (pipeline 语义, 非 first-wins). 🔁→`resolve_route_model_rewrite_pipeline_feeds_next_hop` (`src/provider.rs`)
+- `prop_model_rewrite_later_overrides_earlier` (#183): 多跳命中携带 `upstream_model` 的路由时, 后者重写值覆盖前者 — `ResolvedRoute.model_rewrite` = 最后一次命中; 全链未配置 = 透传客户端 model. 🔁→`resolve_route_later_rewrite_overrides_earlier` (`src/provider.rs`)
+- `prop_model_rewrite_injects_into_egress_ir` (#183; 2026-08-25 前名 `prop_model_override_injects_into_egress_ir`): 路由 upstream_model 重写生效且 codec 可用时, egress IR 的 model 字段被无条件改写为重写值 (客户端 body 缺 model 字段亦注入); 无-secret 请求因重写强制走 IR 路径 (不再字节直传). 🔁→`model_rewrite_reaches_upstream` + `model_rewrite_no_secret_forces_ir_path` + `model_rewrite_switch_via_put` (`tests/integration.rs`)
+- `prop_model_rewrite_no_codec_passthrough` (#183; 2026-08-25 前名 `prop_model_override_no_codec_passthrough`): 无 codec 协议 (Gemini/Ollama) + 路由 upstream_model 重写 → 不改写 body, 字节透传 + WARN (与 "codec 缺失 + secrets" 降级同型). 🔁→`model_rewrite_gemini_passthrough_unrewritten` (`tests/integration.rs`)
 
 ### FWD-6 Provider 鉴权注入
 
@@ -882,3 +893,4 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 | 2026-08-23 | FWD-4 | 新增"响应头超时分档"段 + property `prop_header_timeout_matches_stream_semantics`: send().await 响应头超时按请求 stream 语义分两档 (显式 stream=true → TTFT 档 60s; 其余 → 整响应档 300s) | #175: 非流式大上下文请求 (响应头等整响应生成完) 被单一 60s TTFT 量纲超时结构性误杀 (hermes cron 9 连续 504 事故) |
 | 2026-08-24 | FWD-5 | 新增虚拟 provider 路由 5 条 property: per-request 解析 (`prop_route_resolution_per_request`) / 坏路由 503 (`prop_route_broken_returns_503`) / 环终止 (`prop_route_cycle_termination`) / upsert 环拒绝 (`prop_route_cycle_rejected_at_upsert`) / upstream_id 可观测 (`prop_upstream_id_observable`) | #179: 虚拟 endpoint (route_to) — 客户端固定连虚拟端点, WebUI 即席切换上游; 语义裁决 (per-request / 悬空放行 / 三层环防护) 经人工授权 |
 | 2026-08-24 | FWD-1 | **语义修订**: "对 wire 的唯一合法修改是 real↔mock 替换" → 扩为两种: real↔mock 替换 + **model 字段重写 (仅当生效 provider 配置 `model_override`)**; 请求半段等式追加条件项 `.replace(model, override)`; 新增 property `prop_request_half_byte_exact_with_model_override`. 代价明示: override 生效时同协议无-secret 请求从字节直传降级为 IR 改写 (normalize 等价, 前缀缓存失效 — 用户主动选择的降级). 配套 FWD-5 新增 `prop_model_override_*` 4 条 (first-wins 解析 / egress 注入 / 无 codec 降级) | #183: 虚拟 endpoint P2 — 跨模型名切换 (切换 = target+model 二元组); 修订经人工授权 (2026-08-24, issue #183 记录裁决与 D1-D5 设计决策) |
+| 2026-08-25 | FWD-5 | **多规则路由 (router rules) 契约修订**: 虚拟 provider (单 `route_to` + provider 级 `model_override`) → Router 构造 (`rules` 规则列表: pattern 通配符 / route_to / 规则级 model / priority); 规则按**请求 model** 匹配 (per-request, body 收集后解析); model 重写改 **pipeline** 语义 (改写值参与下一跳匹配, 后者覆盖前者 — 作废 first-wins 的 `prop_model_override_first_hop_wins`, 新增 `prop_model_rewrite_pipeline_feeds_next_hop` + `prop_model_rewrite_later_overrides_earlier`); 错误清单新增 NoMatch (无匹配规则 → 503); 环检查边集 = 启用规则; 新增 property: 请求 model 提取 / 通配符语义 / priority 序 + 同值列表序 tie-break / 禁用规则跳过 / no-match 503. FWD-1 措辞同步: `model_override` → 规则级 `model` 重写 (`prop_request_half_byte_exact_with_model_override` 更名 `..._with_model_rewrite`) | 虚拟 provider 多规则化: model 通配符路由 + 规则级 model 改写 (pipeline) + 删除 model_override 配置字段 |

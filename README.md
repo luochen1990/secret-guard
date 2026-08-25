@@ -34,7 +34,7 @@ cargo install --git ssh://forgejo@git.lambda.lc:5522/lc-studio/secret-guard
 ```toml
 [[providers]]
 id = "openai-main"
-kind = "direct"                         # 直连上游 (虚拟路由端点用 "virtual")
+kind = "direct"                         # 直连上游 (路由端点用 "router")
 protocol = "openai"
 base_url = "https://api.openai.com"
 api_key = "sk-your-upstream-key"        # 转发时注入上游的 key

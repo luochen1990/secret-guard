@@ -84,6 +84,61 @@ pub(super) fn is_streaming(content_type: &str) -> bool {
     ct.eq_ignore_ascii_case("text/event-stream") || ct.eq_ignore_ascii_case("application/x-ndjson")
 }
 
+/// 提取 JSON body **顶层** 指定 key 的值 (`requests_stream` / `request_model` 的
+/// 共用机制层).
+///
+/// # 实现 (流式解析 + ROB-1 永不 panic)
+///
+/// 用 `serde_json::Deserializer::from_slice(...).deserialize_map` 流式逐 key 扫描:
+/// 命中 key 取 `T` 值, 其余 value 全部用 `IgnoredAny` 流式跳过 (不构建 Value 树 —
+/// 大上下文 body 可达 16 MiB, 全量 `Value` 解析在转发热路径上是纯浪费; 真正需要
+/// IR 的路径由 codec reader 解析, 不经过本函数).
+///
+/// serde 约束 (两个旧 visitor 各写一遍, 收口于此): **找到目标 key 后不提前
+/// return**, 继续把剩余 key 消费完 — serde_json 要求 MapAccess 驱动到输入耗尽,
+/// 提前 return 会被判为 "trailing comma" 错误 (实测, 见 tests).
+///
+/// 降级语义 (调用方各自包装): 重复 key 后者覆盖 (与 serde_json Value 的 dup-key
+/// 行为一致); 值类型不符 `T` / 非 JSON / 顶层非 object / 截断 body → serde error
+/// → `None`.
+fn top_level_field<T: serde::de::DeserializeOwned>(body: &[u8], key: &str) -> Option<T> {
+    use serde::de::IgnoredAny;
+    // MapAccess visitor: 顶层逐 key 扫描, 命中 key 取 T 值, 其余跳过.
+    // 顶层非 object 时 serde 直接走 error 路径 (→ None).
+    struct TopKeysVisitor<'a, T> {
+        key: &'a str,
+        marker: std::marker::PhantomData<T>,
+    }
+    impl<'de, T: serde::de::DeserializeOwned> serde::de::Visitor<'de> for TopKeysVisitor<'_, T> {
+        type Value = Option<T>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a JSON object")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut hit = None;
+            while let Some(k) = map.next_key::<std::borrow::Cow<'_, str>>()? {
+                if k == self.key {
+                    // 重复 key: 后者覆盖; 类型不符 → error → 整体 None.
+                    hit = Some(map.next_value::<T>()?);
+                } else {
+                    let _ = map.next_value::<IgnoredAny>()?; // 跳过 (流式, 不入树)
+                }
+            }
+            Ok(hit)
+        }
+    }
+    use serde::Deserializer as _;
+    let mut de = serde_json::Deserializer::from_slice(body);
+    de.deserialize_map(TopKeysVisitor {
+        key,
+        marker: std::marker::PhantomData,
+    })
+    .unwrap_or(None)
+}
+
 /// 检测请求 body 是否为显式流式请求 (顶层 `"stream": true`, FWD-4 契约).
 ///
 /// # 语义 (保守判定, #175)
@@ -115,43 +170,32 @@ pub(super) fn is_streaming(content_type: &str) -> bool {
 /// .and_then(as_bool).unwrap_or(false)`). 两者必须保持语义等价 — 本函数的单测
 /// 与 reader 行为对齐 (非布尔 / 缺字段均非流式).
 ///
-/// # 实现 (流式解析 + ROB-1 永不 panic)
+/// # 实现 (委托 [`top_level_field`])
 ///
-/// 用 `serde_json::Deserializer::from_slice(...).deserialize_map` 流式逐 key 扫描:
-/// value 全部用 `IgnoredAny` 流式跳过 (不构建 Value 树 — 大上下文 body 可达
-/// 16 MiB, 全量 `Value` 解析在 passthrough 热路径上是纯浪费; reader 路径已有
-/// codec 全量解析, 调用方直接用 `ir.stream`, 不经过本函数). **找到 `stream` 后
-/// 不提前 return**, 继续把剩余 key 消费完 — serde_json 要求 MapAccess 驱动到
-/// 输入耗尽, 提前 return 会被判为 "trailing comma" 错误 (实测, 见本函数 tests).
-/// 任何解析异常 → `false` (best-effort 降级, 见 ROB-* 契约).
+/// 字节级流式扫描的机制细节 (IgnoredAny 跳过 / 不提前 return / 降级路径) 见
+/// [`top_level_field`] doc; 本函数只包装降级默认值 (`None` / 非显式 true →
+/// 非流式, best-effort, 见 ROB-* 契约).
 pub(super) fn requests_stream(body: &[u8]) -> bool {
-    use serde::de::IgnoredAny;
-    // MapAccess visitor: 顶层逐 key 扫描, `stream` key 取布尔值, 其余跳过.
-    // 顶层非 object 时 serde 直接走 error 路径 (→ false).
-    struct TopKeysVisitor;
-    impl<'de> serde::de::Visitor<'de> for TopKeysVisitor {
-        type Value = bool;
-        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            f.write_str("a JSON object")
-        }
-        fn visit_map<A: serde::de::MapAccess<'de>>(
-            self,
-            mut map: A,
-        ) -> Result<Self::Value, A::Error> {
-            let mut stream = false;
-            while let Some(key) = map.next_key::<std::borrow::Cow<'_, str>>()? {
-                if key == "stream" {
-                    stream = map.next_value::<bool>()?; // 非布尔 → error → 整体 false
-                } else {
-                    let _ = map.next_value::<IgnoredAny>()?; // 跳过 (流式, 不入树)
-                }
-            }
-            Ok(stream)
-        }
-    }
-    use serde::Deserializer as _;
-    let mut de = serde_json::Deserializer::from_slice(body);
-    de.deserialize_map(TopKeysVisitor).unwrap_or(false)
+    top_level_field::<bool>(body, "stream") == Some(true)
+}
+
+/// 提取请求 body **顶层** `model` 字段 (string) — 路由规则的匹配输入
+/// (`resolve_route` 的 request_model 来源).
+///
+/// # 语义 (best-effort, ROB-1 永不 panic)
+///
+/// - 只扫**顶层** key: `messages` 等嵌套结构里的 model 字段**不误取** (value 用
+///   `IgnoredAny` 流式跳过, 不下降);
+/// - 非 JSON / 顶层非 object / 无 model 字段 / model 非 string / 空 body (GET) →
+///   空串 `""` (调用方语义: 空 model 只匹配 `"*"` 类 pattern);
+/// - 字段顺序无关 (顶层任意位置).
+///
+/// # 实现 (委托 [`top_level_field`])
+///
+/// 字节级流式扫描的机制细节 (IgnoredAny 跳过 / 不提前 return / 降级路径) 见
+/// [`top_level_field`] doc; 本函数只包装降级默认值 (`None` → `""`).
+pub(super) fn request_model(body: &[u8]) -> String {
+    top_level_field::<String>(body, "model").unwrap_or_default()
 }
 
 /// 把字节投影为 String (非法 UTF-8 用 U+FFFD 替换, 不失败).
@@ -214,6 +258,7 @@ fn is_sensitive_header(name: &str) -> bool {
 mod tests {
     use super::*;
     use axum::http::HeaderName;
+    use proptest::prelude::*;
 
     #[test]
     fn build_upstream_url_handles_trailing_slash() {
@@ -324,6 +369,60 @@ mod tests {
         assert!(!requests_stream(br#"{"stream":"#)); // 截断 JSON
     }
 
+    // ─── request_model: 路由规则匹配输入的顶层 model 提取 ──────────────────
+    //
+    // 语义: 只取顶层 string `model`; 嵌套不误取; 一切异常形态 (非 JSON / 顶层
+    // 非对象 / 缺字段 / 非字符串 / 空 body) 降级 "" (best-effort, ROB-1).
+
+    #[test]
+    fn request_model_extracts_top_level_string() {
+        assert_eq!(request_model(br#"{"model":"gpt-4o"}"#), "gpt-4o");
+        // 字段位置无关 (顶层任意位置).
+        assert_eq!(
+            request_model(br#"{"stream":false,"model":"claude-3","messages":[]}"#),
+            "claude-3"
+        );
+        // 重复 key: 后者覆盖 (与 serde_json Value 的 dup-key 行为一致).
+        assert_eq!(
+            request_model(br#"{"model":"a","model":"b"}"#),
+            "b",
+            "duplicate top-level model: last wins"
+        );
+    }
+
+    #[test]
+    fn request_model_missing_field_returns_empty() {
+        assert_eq!(request_model(br#"{"messages":[{"role":"user"}]}"#), "");
+        assert_eq!(request_model(br#"{}"#), "");
+    }
+
+    #[test]
+    fn request_model_nested_model_not_picked_up() {
+        // messages 里嵌套的 model 字段不能误取 (只扫顶层 key).
+        assert_eq!(
+            request_model(
+                br#"{"messages":[{"role":"user","content":"hi"},{"model":"nested-model"}]}"#
+            ),
+            "",
+            "nested model must not leak to routing"
+        );
+        // 顶层存在时嵌套值不干扰.
+        assert_eq!(
+            request_model(br#"{"model":"top","metadata":{"model":"nested"}}"#),
+            "top"
+        );
+    }
+
+    #[test]
+    fn request_model_malformed_bodies_fall_back_to_empty() {
+        assert_eq!(request_model(b""), ""); // 空 body (GET / 非聊天端点)
+        assert_eq!(request_model(b"not json at all"), "");
+        assert_eq!(request_model(b"[1,2,3]"), ""); // 顶层非对象
+        assert_eq!(request_model(br#"{"model":123}"#), ""); // 非字符串
+        assert_eq!(request_model(br#"{"model":null}"#), "");
+        assert_eq!(request_model(br#"{"model":"#), ""); // 截断 JSON
+    }
+
     /// FWD-4 property: 任意 JSON 值塞进顶层 `stream` 字段, `requests_stream` 只有
     /// 在该值**是布尔 true** 时返回 true — 所有其他形态 (含畸形) 一律非流式.
     ///
@@ -384,8 +483,6 @@ mod tests {
     // "key" 关键词不纳入匹配 (契约 §7 SEC-4 注): 过于宽泛会误伤 `x-request-key-hash`
     // 等正常 header. 已知 key 类敏感 header (`api-key` / `x-api-key` / `x-goog-api-key` /
     // `x-anthropic-api-key`) 由显式黑名单覆盖 (见 is_sensitive_header).
-
-    use proptest::prelude::*;
 
     proptest! {
         /// SEC-4: 任意含 "token" / "secret" 关键词的 header 名, redact_headers 输出值为

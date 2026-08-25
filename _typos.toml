@@ -28,3 +28,5 @@ protocl = "protocl"
 valeu = "valeu"
 # inital = 同上的深层 fixture (mock_strategy.inital → initial 建议).
 inital = "inital"
+# prioroty = 同上的深层 fixture (providers.routes.prioroty → priority 建议, 多规则化).
+prioroty = "prioroty"

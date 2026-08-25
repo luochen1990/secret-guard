@@ -42,8 +42,9 @@ pub async fn create_provider(
         &state.providers,
         "provider",
         || payload.into_provider(),
-        // #179: upsert 后 route_to 链成环 → 400 (自环已由 Provider::validate 拒绝,
-        // 这里覆盖跨条目环; 悬空目标放行 — 创建顺序无关, 运行时 503 兜底).
+        // #179: upsert 后路由边 (启用路由的 target) 成环 → 400 (自环已由
+        // Provider::validate 拒绝, 这里覆盖跨条目环; 悬空目标放行 — 创建顺序
+        // 无关, 运行时 503 兜底).
         |entry| validate_provider_upsert(&state.providers, entry),
     )?;
     Ok((StatusCode::CREATED, NO_STORE, Json(created)))
@@ -59,14 +60,19 @@ pub async fn update_provider(
         "provider",
         &id,
         || {
-            // api_key / api_key_file 缺省时保留旧值 (避免 WebUI 编辑表单留空意外清空既有 key).
-            // 语义: payload None = 保留; Some(s) = 显式覆盖 (static 基线下空串的清空
-            // 语义有已知限制, 见下方 api_key 字段注释).
+            // api_key / api_key_file / routes 缺省时保留旧值 (避免 WebUI 编辑表单
+            // 留空意外清空既有配置). 语义: payload None = 保留; Some = 显式覆盖
+            // (static 基线下空串的清空语义有已知限制, 见下方 api_key 字段注释).
             //
-            // #157 关键: 只从 **dynamic 原始条目** (get_dynamic) 回填, 不用 get_effective.
-            // 旧值若是 static 来源, 把已 resolve 的明文搬进 override 会让明文落盘
-            // state.toml; 现在改为 override 不记录该字段 (None), effective 解析时由
-            // `Provider::inherit_from_static` 回落 static (转发仍带旧 key, 行为不变).
+            // #157 关键: 鉴权字段只从 **dynamic 原始条目** (get_dynamic) 回填,
+            // 不用 get_effective — 旧值若是 static 来源, 把已 resolve 的明文搬进
+            // override 会让明文落盘 state.toml; 现在改为 override 不记录该字段
+            // (None), effective 解析时由 `Provider::inherit_from_static` 回落
+            // static (转发仍带旧 key, 行为不变).
+            //
+            // routes 回填则**可以**走 get_effective 兜底 (与 #190 protocol 回填
+            // 同模式): routes 非敏感, 无明文落盘顾虑 — static router 条目的
+            // PUT 即首次 override 场景也能 "省略 = 保留".
             //
             // 假设: 本地单用户场景, get_dynamic 与 upsert_dynamic 之间无并发修改.
             // 多用户/并发编辑场景下存在 TOCTOU (旧值可能过期), 但仅导致配置不一致, 无安全影响.
@@ -76,8 +82,8 @@ pub async fn update_provider(
             // api_key_file 输入, 仅 SDK 直接调用可能触发, 影响低.
             if let Some(old) = state.providers.get_dynamic(&id) {
                 // "保留旧值" 回填, 按旧值的构造分派 (sum type 同构, #187):
-                // Direct 旧值 → 鉴权字段回填; Virtual 旧值 → 指向回填.
-                // 显式清空/切换由 WebUI 发 "" / "target-id" 表达 (见下方字段注释).
+                // Direct 旧值 → 鉴权字段回填; Router 旧值 → routes 回填.
+                // 显式清空/切换由 WebUI 发空 routes 数组 / 完整字段表达 (见下方字段注释).
                 match &old.kind {
                     crate::provider::ProviderKind::Direct(d) => {
                         if payload.api_key.is_none() {
@@ -90,27 +96,31 @@ pub async fn update_provider(
                                 .map(|p| p.to_string_lossy().into_owned());
                         }
                     }
-                    crate::provider::ProviderKind::Virtual(v) => {
-                        // payload 省略 (None) = 保留旧指向; "" = 改回实体 (#187 根治).
-                        // 守卫对象是 payload 的显式新值 (客户端发新目标时不被旧值覆盖).
-                        if payload.route_to.is_none() {
-                            payload.route_to = Some(v.route_to.clone());
+                    crate::provider::ProviderKind::Router(r) => {
+                        // payload 省略 (None) = 保留旧路由; 显式发空数组 = 改回
+                        // Direct 意图. 守卫对象是 payload 的显式新值 (客户端发新
+                        // 路由时不被旧值覆盖).
+                        if payload.routes.is_none() {
+                            payload.routes = Some(r.routes.clone());
                         }
                     }
                 }
-                // model_override 同 "保留" 语义 (#183), 与构造无关.
-                if payload.model_override.is_none() {
-                    payload.model_override = old.model_override;
-                }
+            }
+            // routes 回填兜底: dynamic 无旧条目 (PUT 即首次 override) 时从
+            // **effective** 回填 (非敏感, 与下方 protocol 回填同模式).
+            if payload.routes.is_none()
+                && let Some(crate::provider::ProviderKind::Router(r)) =
+                    state.providers.get_effective(&id).map(|e| e.kind)
+            {
+                payload.routes = Some(r.routes);
             }
             // protocol 回填 (#190 保留语义): 从 **effective** 的 Direct 负载回填 —
             // 覆盖 static-only 条目 (get_dynamic 无旧值的场景, PUT 即首次 override)。
-            // 非敏感字段, 无 #157 明文落盘顾虑。守卫: 仅 **Direct 意图** 回填
-            // (route_to 非空 = Virtual 意图 — 顺带持久化旧 protocol 会让列表 pill
-            // 显示误导性协议); Virtual effective 无 Direct 负载可挖 → 不回填,
-            // payload 要 Direct 又没带 → into_provider 400 兜底。
-            let virtual_intent = matches!(&payload.route_to, Some(s) if !s.is_empty());
-            if payload.protocol.is_none() && !virtual_intent {
+            // 非敏感字段, 无 #157 明文落盘顾虑。回填只服务 Direct 意图 — Router
+            // 构造不消费 protocol (无此字段), 回填了也会被 into_provider 忽略,
+            // 故无需按 router 意图守卫; effective 为 Router 时无 Direct 负载可挖
+            // → 不回填, 也不报错。
+            if payload.protocol.is_none() {
                 let eff = state.providers.get_effective(&id);
                 if let Some(crate::provider::ProviderKind::Direct(d)) =
                     eff.as_ref().map(|e| &e.kind)
@@ -135,7 +145,7 @@ fn validate_provider_upsert(
     entry.validate().map_err(ApiError::validation)?;
     if table.would_cycle(entry) {
         return Err(ApiError::validation(format!(
-            "provider '{}' route_to would create a cycle",
+            "provider '{}' routes would create a cycle",
             entry.id
         )));
     }
@@ -174,14 +184,16 @@ pub(crate) struct ListProvidersResponse {
 pub(crate) struct UpsertProviderRequest {
     pub id: Option<String>,
     pub name: Option<String>,
-    /// 协议. **Direct 构造必填** (缺失 → 400, #190); **Virtual 构造不需要**
-    /// (仅 WebUI 展示的派生信息, 由链尾实体决定真实 egress), 省略/null 即可.
-    /// PUT 省略时若 effective 是 Direct → 回填其 protocol ("保留" 语义, 同 api_key;
-    /// 注意 partial PUT 仍需完整 Direct 字段 — base_url 不回填, 缺失 400).
+    /// 协议. **仅 Direct 构造必填**: 缺失 → 400. Router 构造不存在 protocol
+    /// (ingress 由 per-request URL 决定, egress 由 per-route 链尾决定 — 无可
+    /// 陈述的事实, 见 `RouterProvider`); 请求里残留发送时被忽略, 不报错.
+    /// PUT 省略时若 effective 是 Direct → 回填其 protocol ("保留" 语义, 同
+    /// api_key; 注意 partial PUT 仍需完整 Direct 字段 — base_url 不回填,
+    /// 缺失 400).
     #[serde(default)]
     pub protocol: Option<Protocol>,
-    /// 上游 base URL. 实体 provider 必填 (http(s) + 无末尾 `/`); 虚拟 provider
-    /// (route_to 非空) 忽略, 可省略/为空 (#179).
+    /// 上游 base URL. 实体 provider 必填 (http(s) + 无末尾 `/`); 路由 provider
+    /// (routes 非空) 忽略, 可省略/为空 (#179).
     #[serde(default)]
     pub base_url: String,
     /// API key 明文值. 语义因 endpoint 而异:
@@ -202,24 +214,19 @@ pub(crate) struct UpsertProviderRequest {
     /// 时可用, 但通常只在 static config (sops 注入) 用.
     #[serde(default)]
     pub api_key_file: Option<String>,
-    /// 虚拟 endpoint 路由目标 (#179/#187 sum type). 三态语义:
-    /// - 省略 (None): 保留旧值 (PUT) — dynamic 旧值是 Virtual 则回填其 route_to;
-    ///   static 基线下未回填 (static Direct) 的鉴权字段由 `inherit_from_static` 继承.
-    /// - `""` (空串): 显式 **Direct 构造** (改回实体 provider, #187 根治 — 不再被
-    ///   继承回落 static 指向; 需同时提供合法 base_url, 否则 validate 400).
-    /// - `"target-id"`: **Virtual 构造**, 指向目标 provider (悬空放行, 运行时 503).
+    /// 路由列表 (#179 多规则化 / #187 sum type). 直接复用 [`Route`] 的
+    /// 序列化 (model_pattern / target / upstream_model / priority). 三态语义:
+    /// - 省略 (None): 保留旧值 (PUT) — 优先从 dynamic 旧条目回填, 无则从
+    ///   effective 回填 (routes 非敏感, 无 #157 落盘顾虑); 两者皆非 Router 时不
+    ///   回填 → Direct 构造.
+    /// - 空数组 `[]`: 显式 **Direct 构造** (改回实体 provider — 与旧 route_to ""
+    ///   的 "改回实体" 语义同构).
+    /// - 非空数组: **Router 构造** (悬空目标放行, 运行时 503).
     ///
+    /// 路由的 enabled 开关由 `priority: null` 表达 (wire 无独立 enabled 字段)。
     /// 成环 (含自环) 在 validate/upsert 钩子拒绝 (400).
     #[serde(default)]
-    pub route_to: Option<String>,
-    /// 出站 model 强制重写值 (#183). 三态语义同 `route_to`:
-    /// - 省略 (None): 保留旧值 (PUT) / 不设置 (POST); static 基线下经
-    ///   `inherit_from_static` 回落 static (#157 同型).
-    /// - `""` (空串): 显式清空 (透传客户端 model). dynamic-only 条目可完整往返;
-    ///   static 配置了 override 的条目会被继承回落 (#157 同型已知限制).
-    /// - `"model-id"`: 生效值 (写入侧过滤后永非空串).
-    #[serde(default)]
-    pub model_override: Option<String>,
+    pub routes: Option<Vec<crate::provider::Route>>,
     #[serde(default = "crate::provider::default_true")]
     pub enabled: bool,
 }
@@ -232,16 +239,13 @@ impl UpsertProviderRequest {
         {
             return Err(ApiError::validation(e));
         }
-        // 结构校验 (base_url / route_to 目标 id / 自环 / api_key 互斥) 收口在
-        // crud 钩子的 `Provider::validate` (见 validate_provider_upsert), 此处只做
-        // 字段变换: 空串 route_to = 显式清空指向 ("虚拟 → 实体", #187 根治).
-        let model_override = self.model_override.filter(|s| !s.is_empty());
-        let kind = match self.route_to.filter(|s| !s.is_empty()) {
-            Some(route_to) => {
-                crate::provider::ProviderKind::Virtual(crate::provider::VirtualProvider {
-                    route_to,
-                    protocol: self.protocol,
-                })
+        // 结构校验 (base_url / 路由字段 / 自环 / api_key 互斥) 收口在 crud 钩子的
+        // `Provider::validate` (见 validate_provider_upsert), 此处只做字段变换:
+        // 空数组 routes = 显式改回实体 ("路由 → 实体", 与旧 route_to "" 语义同构).
+        // Router 构造不消费 protocol (无此字段) — 残留发送被静默忽略.
+        let kind = match self.routes.filter(|rs| !rs.is_empty()) {
+            Some(routes) => {
+                crate::provider::ProviderKind::Router(crate::provider::RouterProvider { routes })
             }
             None => {
                 let protocol = self.protocol.ok_or_else(|| {
@@ -259,7 +263,6 @@ impl UpsertProviderRequest {
             id: self.id.unwrap_or_default(),
             enabled: self.enabled,
             name: self.name.filter(|s| !s.trim().is_empty()),
-            model_override,
             kind,
         })
     }

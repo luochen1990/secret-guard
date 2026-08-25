@@ -16,7 +16,9 @@ use std::time::Duration;
 
 use secret_guard::{
     dag::ConversationDag,
-    provider::{DirectProvider, Protocol, Provider, ProviderKind, ProviderTable},
+    provider::{
+        DirectProvider, Protocol, Provider, ProviderKind, ProviderTable, Route, RouterProvider,
+    },
     record::ForwardRecord,
     secrets::{SecretCategory, SecretEntry, SecretTable},
     server,
@@ -72,7 +74,6 @@ fn openai_provider(id: &str, base_url: &str) -> Provider {
         id: id.into(),
         enabled: true,
         name: Some(id.into()),
-        model_override: None,
         kind: ProviderKind::Direct(DirectProvider {
             protocol: Protocol::OpenAI,
             base_url: base_url.into(),
@@ -87,7 +88,6 @@ fn provider_with(id: &str, proto: Protocol, base_url: &str) -> Provider {
         id: id.into(),
         enabled: true,
         name: Some(id.into()),
-        model_override: None,
         kind: ProviderKind::Direct(DirectProvider {
             protocol: proto,
             base_url: base_url.into(),
@@ -106,14 +106,37 @@ fn keyed_provider(id: &str, base_url: &str, api_key: &str) -> Provider {
     p
 }
 
-/// #179: 虚拟 provider (route_to = target). protocol 携带 Some (WebUI 展示值).
-fn virtual_provider(id: &str, target: &str) -> Provider {
+/// 路由: model_pattern → target (priority 默认 Some(0) = 启用, 无 upstream_model 改写).
+fn route(model_pattern: &str, target: &str) -> Route {
+    Route {
+        model_pattern: model_pattern.into(),
+        target: target.into(),
+        upstream_model: None,
+        priority: Some(0),
+    }
+}
+
+/// #179: catch-all 路由 provider (单路由 model_pattern="*" 指向 target — 旧 route_to
+/// 硬指向的等价形态). 构造无 protocol 字段 (见 RouterProvider 注释).
+fn catch_all_router(id: &str, target: &str) -> Provider {
+    router_provider(id, vec![route("*", target)])
+}
+
+/// #179 多规则化: 路由 provider (显式路由列表).
+fn router_provider(id: &str, routes: Vec<Route>) -> Provider {
     Provider {
-        kind: ProviderKind::Virtual(secret_guard::provider::VirtualProvider {
-            route_to: target.into(),
-            protocol: Some(Protocol::OpenAI),
-        }),
+        kind: ProviderKind::Router(RouterProvider { routes }),
         ..openai_provider(id, "https://ignored.invalid")
+    }
+}
+
+/// 路由 (带 upstream_model 改写): model_pattern 匹配的请求路由到 target 且出站 model 重写.
+fn rewrite_route(model_pattern: &str, target: &str, model: &str) -> Route {
+    Route {
+        model_pattern: model_pattern.into(),
+        target: target.into(),
+        upstream_model: Some(model.into()),
+        priority: Some(0),
     }
 }
 #[allow(clippy::too_many_arguments)]
@@ -613,7 +636,6 @@ async fn provider_api_key_file_reads_secret_from_path() {
         id: "oa-file".into(),
         enabled: true,
         name: None,
-        model_override: None,
         kind: ProviderKind::Direct(DirectProvider {
             protocol: Protocol::OpenAI,
             base_url: upstream.url(),
@@ -653,7 +675,6 @@ async fn provider_api_key_file_missing_falls_through_to_no_auth() {
         id: "oa-broken".into(),
         enabled: true,
         name: None,
-        model_override: None,
         kind: ProviderKind::Direct(DirectProvider {
             protocol: Protocol::OpenAI,
             base_url: upstream.url(),
@@ -690,7 +711,6 @@ async fn anthropic_provider_uses_x_api_key() {
         id: "an-main".into(),
         enabled: true,
         name: None,
-        model_override: None,
         kind: ProviderKind::Direct(DirectProvider {
             protocol: Protocol::Anthropic,
             base_url: upstream.url(),
@@ -5657,8 +5677,8 @@ fn latest_upstream_id(dag: &ConversationDag) -> String {
 }
 
 #[tokio::test]
-async fn virtual_provider_switches_target_mid_session() {
-    // FWD-5 per-request 解析: 同一虚拟 endpoint, PUT 切换指向后新请求走新目标;
+async fn router_provider_switches_routes_mid_session() {
+    // FWD-5 per-request 解析: 同一路由 endpoint, PUT 切换路由后新请求走新目标;
     // 响应体区分两个上游; DAG 每轮 upstream_id 如实记录各自的实际归属.
     let mut upstream1 = spawn_mock_upstream().await;
     let mut upstream2 = spawn_mock_upstream().await;
@@ -5667,12 +5687,12 @@ async fn virtual_provider_switches_target_mid_session() {
 
     let real1 = openai_provider("real1", &upstream1.url());
     let real2 = openai_provider("real2", &upstream2.url());
-    let virt = virtual_provider("virt", "real1");
+    let rt = catch_all_router("virt", "real1");
 
     let dag = ConversationDag::new(64, 500, 1);
     let dag_probe = dag.clone();
     let proxy_url = spawn_proxy_static_dynamic(
-        vec![real1, real2, virt],
+        vec![real1, real2, rt],
         vec![],
         reqwest::Client::new(),
         dag,
@@ -5694,19 +5714,22 @@ async fn virtual_provider_switches_target_mid_session() {
     assert!(text.contains("from one"), "body: {text}");
     assert_eq!(latest_upstream_id(&dag_probe), "real1");
 
-    // 2. WebUI 即席切换: PUT override virt.route_to = real2.
+    // 2. WebUI 即席切换: PUT override router 的 routes 指向 real2.
     let (status, body, _) = proxy_request(
         &proxy_url,
         "PUT",
         "/api/providers/virt",
-        r#"{"protocol":"openai","route_to":"real2","base_url":"","enabled":true}"#,
+        r#"{"routes":[{"model_pattern":"*","target":"real2","priority":0}],"base_url":"","enabled":true}"#,
         &[("content-type", "application/json")],
     )
     .await;
     assert_eq!(status, reqwest::StatusCode::OK, "switch PUT must succeed");
     // 切换落在 effective 层 (PUT 响应即 effective 视图, 锁住可观测性).
     let updated: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(updated["route_to"], "real2", "effective view: {body}");
+    assert_eq!(
+        updated["routes"][0]["target"], "real2",
+        "effective view: {body}"
+    );
 
     // 3. 新请求走 real2 (per-request 解析; 历史轮次的 upstream_id 不被改写).
     let (status, text, _) = proxy_request(
@@ -5723,10 +5746,10 @@ async fn virtual_provider_switches_target_mid_session() {
 }
 
 #[tokio::test]
-async fn virtual_provider_dangling_returns_503() {
+async fn router_provider_dangling_returns_503() {
     // FWD-5 坏路由: 目标缺失 → 503, message 指名目标 id (SEC-2 同型: 无 secret).
-    let virt = virtual_provider("virt", "ghost");
-    let proxy_url = spawn_proxy_with_provider(virt).await;
+    let rt = catch_all_router("virt", "ghost");
+    let proxy_url = spawn_proxy_with_provider(rt).await;
     let (status, text, _) = proxy_request(
         &proxy_url,
         "POST",
@@ -5741,13 +5764,13 @@ async fn virtual_provider_dangling_returns_503() {
 }
 
 #[tokio::test]
-async fn virtual_provider_disabled_target_returns_503() {
+async fn router_provider_disabled_target_returns_503() {
     // FWD-5 坏路由: 链上目标 entry-level disabled → 503 (与入口自身 disabled 区分).
     let mut real = openai_provider("real", "https://upstream.invalid");
     real.enabled = false;
-    let virt = virtual_provider("virt", "real");
+    let rt = catch_all_router("virt", "real");
     let proxy_url = spawn_proxy_static_dynamic(
-        vec![real, virt],
+        vec![real, rt],
         vec![],
         reqwest::Client::new(),
         ConversationDag::new(64, 500, 1),
@@ -5772,12 +5795,12 @@ async fn virtual_provider_disabled_target_returns_503() {
 }
 
 #[tokio::test]
-async fn virtual_provider_cycle_upsert_rejected() {
-    // FWD-5 环防护: 静态 a → b 已存在; PUT b.route_to = a (闭环) → 400;
+async fn router_provider_cycle_upsert_rejected() {
+    // FWD-5 环防护: 静态 a → b 已存在; PUT b 的路由指向 a (闭环) → 400;
     // 自环 → 400 (Provider::validate); 悬空目标 → 放行 (运行时 503 兜底).
     // 纯 CRUD 测试, 无转发 — 目标用字面量 URL (过 validate_base_url 即可).
-    let a = virtual_provider("a", "b");
-    let b = virtual_provider("b", "real1");
+    let a = catch_all_router("a", "b");
+    let b = catch_all_router("b", "real1");
     let real1 = openai_provider("real1", "https://u.invalid");
     let proxy_url = spawn_proxy_static_dynamic(
         vec![a, b, real1],
@@ -5794,7 +5817,7 @@ async fn virtual_provider_cycle_upsert_rejected() {
         &proxy_url,
         "PUT",
         "/api/providers/b",
-        r#"{"protocol":"openai","route_to":"a","base_url":"","enabled":true}"#,
+        r#"{"routes":[{"model_pattern":"*","target":"a","priority":0}],"base_url":"","enabled":true}"#,
         &[("content-type", "application/json")],
     )
     .await;
@@ -5806,7 +5829,7 @@ async fn virtual_provider_cycle_upsert_rejected() {
         &proxy_url,
         "PUT",
         "/api/providers/b",
-        r#"{"protocol":"openai","route_to":"b","base_url":"","enabled":true}"#,
+        r#"{"routes":[{"model_pattern":"*","target":"b","priority":0}],"base_url":"","enabled":true}"#,
         &[("content-type", "application/json")],
     )
     .await;
@@ -5818,16 +5841,20 @@ async fn virtual_provider_cycle_upsert_rejected() {
         &proxy_url,
         "PUT",
         "/api/providers/b",
-        r#"{"protocol":"openai","route_to":"not-yet-created","base_url":"","enabled":true}"#,
+        r#"{"routes":[{"model_pattern":"*","target":"not-yet-created","priority":0}],"base_url":"","enabled":true}"#,
         &[("content-type", "application/json")],
     )
     .await;
-    assert_eq!(status, reqwest::StatusCode::OK, "dangling route_to allowed");
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "dangling route target allowed"
+    );
 }
 
 #[tokio::test]
-async fn virtual_provider_cross_protocol_translates() {
-    // 虚拟 endpoint 指向异协议实体: ingress 由 URL (openai) 决定, egress 由目标
+async fn router_provider_cross_protocol_translates() {
+    // 路由 endpoint 指向异协议实体: ingress 由 URL (openai) 决定, egress 由目标
     // (anthropic) 决定 → 自动落入既有 cross_proto 翻译 (#179 头线能力).
     let mut upstream = spawn_mock_upstream().await;
     let _m = upstream
@@ -5840,9 +5867,9 @@ async fn virtual_provider_cross_protocol_translates() {
         .create_async()
         .await;
     let ant = provider_with("ant-main", Protocol::Anthropic, &upstream.url());
-    let virt = virtual_provider("virt", "ant-main");
+    let rt = catch_all_router("virt", "ant-main");
     let proxy_url = spawn_proxy_static_dynamic(
-        vec![ant, virt],
+        vec![ant, rt],
         vec![],
         reqwest::Client::new(),
         ConversationDag::new(64, 500, 1),
@@ -5861,18 +5888,19 @@ async fn virtual_provider_cross_protocol_translates() {
     assert_eq!(
         status,
         reqwest::StatusCode::OK,
-        "cross-proto via virtual must translate"
+        "cross-proto via router must translate"
     );
 }
 
-// ─── model_override (#183, FWD-1 修订 / FWD-5 first-wins) ───────────────────
+// ─── model 改写 (路由的 Route.upstream_model, #183 语义被路由吸收) ────────
 //
-// 契约: prop_model_override_injects_into_egress_ir (egress model 无条件改写,
-// 无-secret 强制 IR 路径) / first-wins (单元已锁) / no_codec passthrough (D2 降级).
+// 契约: prop_model_rewrite_injects_into_egress_ir (egress model 无条件改写,
+// 无-secret 强制 IR 路径) / pipeline 后者覆盖 (单元已锁) / no_codec passthrough
+// (D2 降级).
 
 #[tokio::test]
-async fn model_override_reaches_upstream() {
-    // override 到达上游: egress body 的 model 字段被改写 (含无 secret 场景).
+async fn model_rewrite_reaches_upstream() {
+    // 路由的 upstream_model 重写到达上游: egress body 的 model 字段被改写 (含无 secret 场景).
     let mut upstream = spawn_mock_upstream().await;
     let _m = upstream
         .mock("POST", "/v1/chat/completions")
@@ -5887,12 +5915,15 @@ async fn model_override_reaches_upstream() {
         .create_async()
         .await;
 
-    let mut provider = openai_provider("oa-main", &upstream.url());
-    provider.model_override = Some("claude-sonnet-4".into());
+    let real = openai_provider("oa-main", &upstream.url());
+    let router = router_provider(
+        "virt",
+        vec![rewrite_route("*", "oa-main", "claude-sonnet-4")],
+    );
     let dag = ConversationDag::new(64, 500, 1);
     let dag_probe = dag.clone();
     let proxy_url = spawn_proxy_static_dynamic(
-        vec![provider],
+        vec![real, router],
         vec![],
         reqwest::Client::new(),
         dag,
@@ -5905,14 +5936,14 @@ async fn model_override_reaches_upstream() {
     let (status, _, _) = proxy_request(
         &proxy_url,
         "POST",
-        "/o/oa-main/v1/chat/completions",
+        "/o/virt/v1/chat/completions",
         r#"{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"}]}"#,
         &[],
     )
     .await;
     assert_eq!(status, reqwest::StatusCode::OK);
 
-    // 可观测性: record 的 model (egress 视角) = override 值, upstream_model 同值.
+    // 可观测性: record 的 model (egress 视角) = 重写值, upstream_model 同值.
     let id = dag_probe
         .list_node_ids_newest_first()
         .first()
@@ -5928,10 +5959,10 @@ async fn model_override_reaches_upstream() {
 }
 
 #[tokio::test]
-async fn model_override_no_secret_forces_ir_path() {
-    // 无 secret + override → 不走字节直传, 强制 IR 路径 (FWD-1 修订的契约代价).
+async fn model_rewrite_no_secret_forces_ir_path() {
+    // 无 secret + 路由改写 → 不走字节直传, 强制 IR 路径 (FWD-1 修订的契约代价).
     // 判据: egress body 的 model 被改写 (直传路径不可能改写); 无 model 字段的
-    // body 也被注入 override (D3).
+    // body 也被注入重写值 (D3).
     let mut upstream = spawn_mock_upstream().await;
     let _m = upstream
         .mock("POST", "/v1/chat/completions")
@@ -5946,17 +5977,28 @@ async fn model_override_no_secret_forces_ir_path() {
         .create_async()
         .await;
 
-    let mut provider = openai_provider("oa-main", &upstream.url());
-    provider.model_override = Some("injected-model".into());
-    // 前提由结构保证: spawn_proxy_with_provider → test_secret_table() = 空表
-    // (override-only 场景, 验证 IR 路径被 override 单独强制).
-    let proxy_url = spawn_proxy_with_provider(provider).await;
+    let real = openai_provider("oa-main", &upstream.url());
+    let router = router_provider(
+        "virt",
+        vec![rewrite_route("*", "oa-main", "injected-model")],
+    );
+    // 前提由结构保证: test_secret_table() = 空表 (仅改写场景, 验证 IR 路径被
+    // 路由的 model 重写单独强制).
+    let proxy_url = spawn_proxy_static_dynamic(
+        vec![real, router],
+        vec![],
+        reqwest::Client::new(),
+        ConversationDag::new(64, 500, 1),
+        test_secret_table(),
+    )
+    .await
+    .0;
 
-    // body 无 model 字段 (OpenAI reader 容忍缺失 → IR.model 为空串 → 注入 override).
+    // body 无 model 字段 (OpenAI reader 容忍缺失 → IR.model 为空串 → 注入重写值).
     let (status, _, _) = proxy_request(
         &proxy_url,
         "POST",
-        "/o/oa-main/v1/chat/completions",
+        "/o/virt/v1/chat/completions",
         r#"{"messages":[{"role":"user","content":"Hi"}]}"#,
         &[],
     )
@@ -5964,13 +6006,13 @@ async fn model_override_no_secret_forces_ir_path() {
     assert_eq!(
         status,
         reqwest::StatusCode::OK,
-        "override injects model even when client body omits it"
+        "route rewrite injects model even when client body omits it"
     );
 }
 
 #[tokio::test]
-async fn model_override_switch_via_put() {
-    // 即席切换模型: 虚拟 endpoint PUT model_override 后, 新请求用新 model
+async fn model_rewrite_switch_via_put() {
+    // 即席切换模型: 路由 endpoint PUT 路由的 upstream_model 后, 新请求用新 model
     // (per-request; 历史轮次 record 不改写).
     let mut upstream = spawn_mock_upstream().await;
     let _m1 = upstream
@@ -5995,11 +6037,11 @@ async fn model_override_switch_via_put() {
         .await;
 
     let real = openai_provider("real", &upstream.url());
-    let virt = virtual_provider("virt", "real");
+    let rt = catch_all_router("virt", "real");
     let dag = ConversationDag::new(64, 500, 1);
     let dag_probe = dag.clone();
     let proxy_url = spawn_proxy_static_dynamic(
-        vec![real, virt],
+        vec![real, rt],
         vec![],
         reqwest::Client::new(),
         dag,
@@ -6008,16 +6050,16 @@ async fn model_override_switch_via_put() {
     .await
     .0;
 
-    // 1. PUT 设置 override = model-v1.
+    // 1. PUT 设置路由 upstream_model = model-v1.
     let (status, body, _) = proxy_request(
         &proxy_url,
         "PUT",
         "/api/providers/virt",
-        r#"{"protocol":"openai","route_to":"real","model_override":"model-v1","base_url":"","enabled":true}"#,
+        r#"{"routes":[{"model_pattern":"*","target":"real","upstream_model":"model-v1","priority":0}],"base_url":"","enabled":true}"#,
         &[("content-type", "application/json")],
     )
     .await;
-    assert_eq!(status, reqwest::StatusCode::OK, "set override: {body}");
+    assert_eq!(status, reqwest::StatusCode::OK, "set rewrite: {body}");
 
     let (status, _, _) = proxy_request(
         &proxy_url,
@@ -6029,12 +6071,12 @@ async fn model_override_switch_via_put() {
     .await;
     assert_eq!(status, reqwest::StatusCode::OK);
 
-    // 2. 切换 model (PUT model_override = model-v2) → 新请求用 v2.
+    // 2. 切换 model (PUT 路由 upstream_model = model-v2) → 新请求用 v2.
     let (status, _, _) = proxy_request(
         &proxy_url,
         "PUT",
         "/api/providers/virt",
-        r#"{"protocol":"openai","route_to":"real","model_override":"model-v2","base_url":"","enabled":true}"#,
+        r#"{"routes":[{"model_pattern":"*","target":"real","upstream_model":"model-v2","priority":0}],"base_url":"","enabled":true}"#,
         &[("content-type", "application/json")],
     )
     .await;
@@ -6062,9 +6104,9 @@ async fn model_override_switch_via_put() {
 }
 
 #[tokio::test]
-async fn model_override_gemini_passthrough_unrewritten() {
-    // D2 降级: 无 codec 协议 (Gemini) + override → body 不改写 (原样 model 到上游)
-    // + WARN (可观测). FWD-5 prop_model_override_no_codec_passthrough.
+async fn model_rewrite_gemini_passthrough_unrewritten() {
+    // D2 降级: 无 codec 协议 (Gemini) + 路由改写 → body 不改写 (原样 model 到上游)
+    // + WARN (可观测). FWD-5 prop_model_rewrite_no_codec_passthrough.
     let mut upstream = spawn_mock_upstream().await;
     // match_body 断言: 上游收到的仍是客户端原始 model (未被 override 改写).
     let _m = upstream
@@ -6078,15 +6120,23 @@ async fn model_override_gemini_passthrough_unrewritten() {
         .create_async()
         .await;
 
-    let mut provider = provider_with("gem-main", Protocol::Gemini, &upstream.url());
-    provider.model_override = Some("gemini-flash".into());
+    let gem = provider_with("gem-main", Protocol::Gemini, &upstream.url());
+    let router = router_provider("virt", vec![rewrite_route("*", "gem-main", "gemini-flash")]);
     let (log, _guard) = capture_tracing(tracing::Level::WARN);
-    let proxy_url = spawn_proxy_with_provider(provider).await;
+    let proxy_url = spawn_proxy_static_dynamic(
+        vec![gem, router],
+        vec![],
+        reqwest::Client::new(),
+        ConversationDag::new(64, 500, 1),
+        test_secret_table(),
+    )
+    .await
+    .0;
 
     let (status, _, _) = proxy_request(
         &proxy_url,
         "POST",
-        "/g/gem-main/v1beta/models/gemini-pro:generateContent",
+        "/g/virt/v1beta/models/gemini-pro:generateContent",
         r#"{"model":"gemini-pro","contents":[{"parts":[{"text":"hello"}]}]}"#,
         &[],
     )
@@ -6094,23 +6144,23 @@ async fn model_override_gemini_passthrough_unrewritten() {
     assert_eq!(
         status,
         reqwest::StatusCode::OK,
-        "gemini + override still forwards"
+        "gemini + route rewrite still forwards"
     );
 
     let log_text = log.text();
     assert!(
-        log_text.contains("model_override") && log_text.contains("does not"),
-        "#183 D2: no-codec override must WARN; log: {log_text}"
+        log_text.contains("model rewrite") && log_text.contains("does not"),
+        "#183 D2: no-codec rewrite must WARN; log: {log_text}"
     );
 }
 
-// M3 补强: FWD-1 联合公式 (override × secret 共存) / D5 (Responses 流式 501) /
+// M3 补强: FWD-1 联合公式 (改写 × secret 共存) / D5 (Responses 流式 501) /
 // cross_proto 注入 / PUT 清空往返.
 
 #[tokio::test]
-async fn model_override_with_secret_joint() {
-    // FWD-1 修订联合公式: egress == normalize(client).replace(real, mock).replace(model, override).
-    // 两个替换同时成立: 上游收到 model=override (match_body), 且 egress body 含 mock
+async fn model_rewrite_with_secret_joint() {
+    // FWD-1 修订联合公式: egress == normalize(client).replace(real, mock).replace(model, rewrite).
+    // 两个替换同时成立: 上游收到 model=重写值 (match_body), 且 egress body 含 mock
     // 不含 real (DAG record 的 req_body_raw 即 egress 视角, 直接断言).
     let mut upstream = spawn_mock_upstream().await;
     let _m = upstream
@@ -6126,12 +6176,12 @@ async fn model_override_with_secret_joint() {
         .create_async()
         .await;
 
-    let mut provider = openai_provider("oa-main", &upstream.url());
-    provider.model_override = Some("target-model".into());
+    let real = openai_provider("oa-main", &upstream.url());
+    let router = router_provider("virt", vec![rewrite_route("*", "oa-main", "target-model")]);
     let dag = ConversationDag::new(64, 500, 1);
     let dag_probe = dag.clone();
     let proxy_url = spawn_proxy_static_dynamic(
-        vec![provider],
+        vec![real, router],
         vec![],
         reqwest::Client::new(),
         dag,
@@ -6143,7 +6193,7 @@ async fn model_override_with_secret_joint() {
     let (status, body, _) = proxy_request(
         &proxy_url,
         "POST",
-        "/o/oa-main/v1/chat/completions",
+        "/o/virt/v1/chat/completions",
         r#"{"model":"gpt-4o","messages":[{"role":"user","content":"key sk-live-joint-secret"}]}"#,
         &[],
     )
@@ -6151,10 +6201,10 @@ async fn model_override_with_secret_joint() {
     assert_eq!(
         status,
         reqwest::StatusCode::OK,
-        "joint redact+override forwards: {body}"
+        "joint redact+rewrite forwards: {body}"
     );
 
-    // egress body (record req_body_raw): secret 已 redact + model 已 override.
+    // egress body (record req_body_raw): secret 已 redact + model 已重写.
     let id = dag_probe.list_node_ids_newest_first()[0];
     let detail = dag_probe.get_node_detail(id).unwrap();
     assert!(
@@ -6165,31 +6215,39 @@ async fn model_override_with_secret_joint() {
 }
 
 #[tokio::test]
-async fn model_override_responses_streaming_returns_501() {
-    // D5: override-only (无 secret) 亦迫使 IR 路径 → Responses 流式触发既有 501.
+async fn model_rewrite_responses_streaming_returns_501() {
+    // D5: 仅改写 (无 secret) 亦迫使 IR 路径 → Responses 流式触发既有 501.
     let upstream = spawn_mock_upstream().await;
-    let mut provider = provider_with("resp-main", Protocol::OpenAIResponses, &upstream.url());
-    provider.model_override = Some("gpt-5".into());
-    let proxy_url = spawn_proxy_with_provider(provider).await;
+    let resp = provider_with("resp-main", Protocol::OpenAIResponses, &upstream.url());
+    let router = router_provider("virt", vec![rewrite_route("*", "resp-main", "gpt-5")]);
+    let proxy_url = spawn_proxy_static_dynamic(
+        vec![resp, router],
+        vec![],
+        reqwest::Client::new(),
+        ConversationDag::new(64, 500, 1),
+        test_secret_table(),
+    )
+    .await
+    .0;
     let (status, body, _) = proxy_request(
         &proxy_url,
         "POST",
-        "/r/resp-main/v1/responses",
+        "/r/virt/v1/responses",
         r#"{"model":"gpt-4o","stream":true,"input":"Hi"}"#,
         &[],
     )
     .await;
     assert_eq!(status, reqwest::StatusCode::NOT_IMPLEMENTED);
     assert!(
-        body.contains("model_override"),
-        "501 message must hint the override cause: {body}"
+        body.contains("model rewrite"),
+        "501 message must hint the rewrite cause: {body}"
     );
 }
 
 #[tokio::test]
-async fn model_override_cross_protocol() {
-    // cross_proto + override: OpenAI ingress → Anthropic egress, /v1/messages 的
-    // model 字段 = override (注入点共享 parse_request_ir, egress writer 写出).
+async fn model_rewrite_cross_protocol() {
+    // cross_proto + 改写: OpenAI ingress → Anthropic egress, /v1/messages 的
+    // model 字段 = 重写值 (注入点共享 parse_request_ir, egress writer 写出).
     let mut upstream = spawn_mock_upstream().await;
     let _m = upstream
         .mock("POST", "/v1/messages")
@@ -6204,11 +6262,13 @@ async fn model_override_cross_protocol() {
         .create_async()
         .await;
 
-    let mut ant = provider_with("ant-main", Protocol::Anthropic, &upstream.url());
-    ant.model_override = Some("claude-target".into());
-    let virt = virtual_provider("virt", "ant-main");
+    let ant = provider_with("ant-main", Protocol::Anthropic, &upstream.url());
+    let router = router_provider(
+        "virt",
+        vec![rewrite_route("*", "ant-main", "claude-target")],
+    );
     let proxy_url = spawn_proxy_static_dynamic(
-        vec![ant, virt],
+        vec![ant, router],
         vec![],
         reqwest::Client::new(),
         ConversationDag::new(64, 500, 1),
@@ -6227,13 +6287,13 @@ async fn model_override_cross_protocol() {
     assert_eq!(
         status,
         reqwest::StatusCode::OK,
-        "cross-proto override translates model"
+        "cross-proto rewrite translates model"
     );
 }
 
 #[tokio::test]
-async fn model_override_put_clear_roundtrip() {
-    // 三态清空分支: PUT model_override="" → effective 清空 → 后续请求 model 透传.
+async fn model_rewrite_put_clear_roundtrip() {
+    // 清空分支: PUT 路由不带 upstream_model → effective 清空 → 后续请求 model 透传.
     let mut upstream = spawn_mock_upstream().await;
     let _m = upstream
         .mock("POST", "/v1/chat/completions")
@@ -6249,11 +6309,11 @@ async fn model_override_put_clear_roundtrip() {
         .await;
 
     let real = openai_provider("real", &upstream.url());
-    let virt = virtual_provider("virt", "real");
+    let rt = catch_all_router("virt", "real");
     let dag = ConversationDag::new(64, 500, 1);
     let dag_probe = dag.clone();
     let proxy_url = spawn_proxy_static_dynamic(
-        vec![real, virt],
+        vec![real, rt],
         vec![],
         reqwest::Client::new(),
         dag,
@@ -6262,34 +6322,36 @@ async fn model_override_put_clear_roundtrip() {
     .await
     .0;
 
-    // 1. 设置 override.
+    // 1. 设置路由 upstream_model = tmp-model.
     let (status, body, _) = proxy_request(
         &proxy_url,
         "PUT",
         "/api/providers/virt",
-        r#"{"protocol":"openai","route_to":"real","model_override":"tmp-model","base_url":"","enabled":true}"#,
+        r#"{"routes":[{"model_pattern":"*","target":"real","upstream_model":"tmp-model","priority":0}],"base_url":"","enabled":true}"#,
         &[("content-type", "application/json")],
     )
     .await;
     assert_eq!(status, reqwest::StatusCode::OK);
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(v["model_override"], "tmp-model");
+    assert_eq!(v["routes"][0]["upstream_model"], "tmp-model");
 
-    // 2. 清空 (PUT model_override="") → static 层未配置 override, 清空后继承回落
-    //    None (#157 限制不触发 — 该限制只锁 static 已配置的场景)。
+    // 2. 清空 (PUT 路由省略 upstream_model 字段) → 后续请求 model 透传.
     let (status, body, _) = proxy_request(
         &proxy_url,
         "PUT",
         "/api/providers/virt",
-        r#"{"protocol":"openai","route_to":"real","model_override":"","base_url":"","enabled":true}"#,
+        r#"{"routes":[{"model_pattern":"*","target":"real","priority":0}],"base_url":"","enabled":true}"#,
         &[("content-type", "application/json")],
     )
     .await;
     assert_eq!(status, reqwest::StatusCode::OK);
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert!(v["model_override"].is_null(), "cleared: {body}");
+    assert!(
+        v["routes"][0]["upstream_model"].is_null(),
+        "cleared: {body}"
+    );
 
-    // 3. 后续请求 model 透传 (gpt-4o 原样到上游, match_body 已断言) + record 无 override 痕迹.
+    // 3. 后续请求 model 透传 (gpt-4o 原样到上游, match_body 已断言) + record 无改写痕迹.
     let (status, _, _) = proxy_request(
         &proxy_url,
         "POST",
@@ -6302,12 +6364,12 @@ async fn model_override_put_clear_roundtrip() {
     let id = dag_probe.list_node_ids_newest_first()[0];
     let node = dag_probe.get_node(id).unwrap();
     assert_eq!(node.model.as_deref(), Some("gpt-4o"));
-    assert_eq!(node.upstream_model, None, "no override after clear");
+    assert_eq!(node.upstream_model, None, "no rewrite after clear");
 }
 
 #[tokio::test]
-async fn model_override_response_stays_byte_exact_streaming() {
-    // M1 (#183): override 只改写请求半段; 响应半段在 redaction map 为空时保持
+async fn model_rewrite_response_stays_byte_exact_streaming() {
+    // M1 (#183): 改写只作用于请求半段; 响应半段在 redaction map 为空时保持
     // **字节透传** — 用带非常规格式 (紧凑空白 / [DONE] 前空行) 的 SSE 断言逐字节相等.
     let sse_body = concat!(
         "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
@@ -6323,41 +6385,10 @@ async fn model_override_response_stays_byte_exact_streaming() {
         .create_async()
         .await;
 
-    let mut provider = openai_provider("oa-main", &upstream.url());
-    provider.model_override = Some("target-model".into());
-    let proxy_url = spawn_proxy_with_provider(provider).await;
-
-    let resp = reqwest::Client::new()
-        .post(format!("{proxy_url}/o/oa-main/v1/chat/completions"))
-        .body(r#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"Hi"}]}"#)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    let text = resp.text().await.unwrap();
-    assert_eq!(
-        text, sse_body,
-        "response must be byte-exact when override-only (map empty)"
-    );
-}
-
-// ─── provider 表单构造分野 (#190): protocol Option 化的 API 语义 ────────────
-
-#[tokio::test]
-async fn provider_create_virtual_without_protocol_succeeds() {
-    // Virtual 构造不需要 protocol (仅展示, 由链尾实体决定 egress) — 省略 → 201,
-    // effective 视图 protocol 为 null.
-    let mut upstream = spawn_mock_upstream().await;
-    let _m = upstream
-        .mock("POST", "/v1/chat/completions")
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(r#"{"id":"c","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#)
-        .create_async()
-        .await;
-    let real = openai_provider("real", &upstream.url());
+    let real = openai_provider("oa-main", &upstream.url());
+    let router = router_provider("virt", vec![rewrite_route("*", "oa-main", "target-model")]);
     let proxy_url = spawn_proxy_static_dynamic(
-        vec![real],
+        vec![real, router],
         vec![],
         reqwest::Client::new(),
         ConversationDag::new(64, 500, 1),
@@ -6366,33 +6397,56 @@ async fn provider_create_virtual_without_protocol_succeeds() {
     .await
     .0;
 
-    // POST 带 protocol: null (WebUI Virtual 表单的 payload 形态).
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/o/virt/v1/chat/completions"))
+        .body(r#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"Hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let text = resp.text().await.unwrap();
+    assert_eq!(
+        text, sse_body,
+        "response must be byte-exact when rewrite-only (map empty)"
+    );
+}
+
+// ─── provider 表单构造分野 (#190): protocol 字段的 API 语义 ─────────────────
+//
+// Router 构造不存在 protocol 字段 (ingress per-request URL / egress per-route
+// 链尾决定, 无可陈述的事实 — 见 RouterProvider 注释); Direct 构造必填.
+
+#[tokio::test]
+async fn provider_create_router_ignores_protocol() {
+    // Router 无 protocol: 不带 → 201 (不再是 400); 残留发送 (旧客户端习惯) →
+    // 静默忽略, 同样 201 — protocol 只进 Direct 构造, 不因它报错.
+    let proxy_url =
+        spawn_proxy_with_provider(openai_provider("oa-main", "https://u.invalid")).await;
     let (status, body, _) = proxy_request(
         &proxy_url,
         "POST",
         "/api/providers",
-        r#"{"id":"virt-no-proto","protocol":null,"route_to":"real","base_url":"","enabled":true}"#,
+        r#"{"id":"rt-no-proto","routes":[{"model_pattern":"*","target":"oa-main","priority":0}],"base_url":"","enabled":true}"#,
         &[("content-type", "application/json")],
     )
     .await;
     assert_eq!(status, reqwest::StatusCode::CREATED, "body: {body}");
-    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(v["kind"], "virtual");
+    let created: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(created["kind"], "router", "created as router: {body}");
     assert!(
-        v["protocol"].is_null(),
-        "virtual protocol stays None: {body}"
+        created.get("protocol").is_none(),
+        "router view carries no protocol: {body}"
     );
 
-    // 经它转发正常 (protocol None 不影响路由).
-    let (status, _, _) = proxy_request(
+    let (status, body, _) = proxy_request(
         &proxy_url,
         "POST",
-        "/o/virt-no-proto/v1/chat/completions",
-        CHAT_REQ_BODY,
-        &[],
+        "/api/providers",
+        r#"{"id":"rt-stray-proto","protocol":"openai","routes":[{"model_pattern":"*","target":"oa-main","priority":0}],"base_url":"","enabled":true}"#,
+        &[("content-type", "application/json")],
     )
     .await;
-    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(status, reqwest::StatusCode::CREATED, "body: {body}");
 }
 
 #[tokio::test]
@@ -6404,7 +6458,7 @@ async fn provider_create_direct_without_protocol_rejected() {
         &proxy_url,
         "POST",
         "/api/providers",
-        r#"{"id":"no-proto","route_to":"","base_url":"https://api.example.com","enabled":true}"#,
+        r#"{"id":"no-proto","base_url":"https://api.example.com","enabled":true}"#,
         &[("content-type", "application/json")],
     )
     .await;
@@ -6429,12 +6483,13 @@ async fn provider_update_partial_put_keeps_protocol() {
     )
     .await
     .0;
-    // static 条目 → PUT 创建 dynamic override (protocol 省略 → 回填 static 的 openai).
+    // static 条目 → PUT 创建 dynamic override (protocol 省略 → 回填 static 的 openai;
+    // routes 省略 + effective 是 Direct → 不回填 → Direct 意图).
     let (status, body, _) = proxy_request(
         &proxy_url,
         "PUT",
         "/api/providers/oa-main",
-        r#"{"name":"renamed","route_to":"","base_url":"https://api.example.com","enabled":true}"#,
+        r#"{"name":"renamed","base_url":"https://api.example.com","enabled":true}"#,
         &[("content-type", "application/json")],
     )
     .await;
@@ -6444,4 +6499,492 @@ async fn provider_update_partial_put_keeps_protocol() {
         v["protocol"], "openai",
         "protocol backfilled from old direct value"
     );
+}
+
+// ─── 路由 (#179 多规则化): 按 model 分流 / priority / NoMatch / PUT 覆盖 ──
+
+/// OpenAI chat mock (带 model match 断言): 上游收到的 body 含指定 model.
+async fn openai_chat_mock_matching_model(
+    upstream: &mut mockito::ServerGuard,
+    model: &str,
+) -> mockito::Mock {
+    upstream
+        .mock("POST", "/v1/chat/completions")
+        .match_body(mockito::Matcher::PartialJson(
+            serde_json::json!({"model": model}),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"chatcmpl-x","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+        )
+        .create_async()
+        .await
+}
+
+#[tokio::test]
+async fn router_routes_route_by_model() {
+    // 双上游分流: gpt-* → realA (路由改写 model=gpt-4o), claude-* → realB (透传).
+    // mockito match_body 断言各自收到的 model 值 (改写 vs 原样).
+    let mut upstream_a = spawn_mock_upstream().await;
+    let mut upstream_b = spawn_mock_upstream().await;
+    let _ma = openai_chat_mock_matching_model(&mut upstream_a, "gpt-4o").await;
+    let _mb = openai_chat_mock_matching_model(&mut upstream_b, "claude-3").await;
+
+    let real_a = openai_provider("real-a", &upstream_a.url());
+    let real_b = openai_provider("real-b", &upstream_b.url());
+    let rt = router_provider(
+        "rt",
+        vec![
+            rewrite_route("gpt-*", "real-a", "gpt-4o"),
+            route("claude-*", "real-b"),
+        ],
+    );
+    let dag = ConversationDag::new(64, 500, 1);
+    let dag_probe = dag.clone();
+    let proxy_url = spawn_proxy_static_dynamic(
+        vec![real_a, real_b, rt],
+        vec![],
+        reqwest::Client::new(),
+        dag,
+        test_secret_table(),
+    )
+    .await
+    .0;
+
+    // 1. model gpt-3.5 → 路由 gpt-* 命中 → real-a 收到改写后的 gpt-4o.
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/rt/v1/chat/completions",
+        r#"{"model":"gpt-3.5","messages":[{"role":"user","content":"Hi"}]}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(latest_upstream_id(&dag_probe), "real-a");
+
+    // 2. model claude-3 → 路由 claude-* 命中 → real-b 收到原样 claude-3 (透传).
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/rt/v1/chat/completions",
+        r#"{"model":"claude-3","messages":[{"role":"user","content":"Hi"}]}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(latest_upstream_id(&dag_probe), "real-b");
+}
+
+#[tokio::test]
+async fn router_routes_priority_decides_winner() {
+    // 两条路由都匹配: 高 priority 胜; 并列按列表序 (低 priority 在前也不抢).
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = openai_chat_mock(&mut upstream, "hi").create_async().await;
+    let real_a = openai_provider("real-a", &upstream.url());
+    let real_b = openai_provider("real-b", &upstream.url());
+
+    let mut low_first = route("*", "real-a"); // priority 0, 列表序在前
+    low_first.priority = Some(1);
+    let mut high_later = route("gpt-*", "real-b"); // priority 10, 列表序在后
+    high_later.priority = Some(10);
+    let rt = router_provider("rt", vec![low_first, high_later]);
+
+    let dag = ConversationDag::new(64, 500, 1);
+    let dag_probe = dag.clone();
+    let proxy_url = spawn_proxy_static_dynamic(
+        vec![real_a.clone(), real_b.clone(), rt],
+        vec![],
+        reqwest::Client::new(),
+        dag.clone(),
+        test_secret_table(),
+    )
+    .await
+    .0;
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/rt/v1/chat/completions",
+        CHAT_REQ_BODY,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(
+        latest_upstream_id(&dag_probe),
+        "real-b",
+        "higher priority wins regardless of list order"
+    );
+
+    // 并列 priority: 列表序先者胜 (共享 dag probe 断言胜者, 非仅 200).
+    let rt_tie = router_provider("tie", vec![route("*", "real-a"), route("*", "real-b")]);
+    let proxy_url = spawn_proxy_static_dynamic(
+        vec![real_a.clone(), real_b.clone(), rt_tie],
+        vec![],
+        reqwest::Client::new(),
+        dag.clone(),
+        test_secret_table(),
+    )
+    .await
+    .0;
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/tie/v1/chat/completions",
+        CHAT_REQ_BODY,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(
+        latest_upstream_id(&dag_probe),
+        "real-a",
+        "priority tie breaks by list order (first wins)"
+    );
+
+    // 负 priority 值域: 排序方向不因符号翻转 (-1 仍胜 -5).
+    let mut neg_wide = route("*", "real-a"); // priority -5, 列表序在前
+    neg_wide.priority = Some(-5);
+    let mut neg_precise = route("gpt-*", "real-b"); // priority -1, 列表序在后
+    neg_precise.priority = Some(-1);
+    let rt_neg = router_provider("rt-neg", vec![neg_wide, neg_precise]);
+    let proxy_url = spawn_proxy_static_dynamic(
+        vec![real_a, real_b, rt_neg],
+        vec![],
+        reqwest::Client::new(),
+        dag.clone(),
+        test_secret_table(),
+    )
+    .await
+    .0;
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/rt-neg/v1/chat/completions",
+        CHAT_REQ_BODY,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(
+        latest_upstream_id(&dag_probe),
+        "real-b",
+        "-1 beats -5: ordering holds in negative range"
+    );
+}
+
+#[tokio::test]
+async fn router_routes_disabled_route_skipped() {
+    // priority null = 禁用: 精确匹配的禁用路由让位于启用兜底路由.
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = openai_chat_mock(&mut upstream, "hi").create_async().await;
+    let real_a = openai_provider("real-a", &upstream.url());
+    let real_b = openai_provider("real-b", &upstream.url());
+
+    let mut disabled_precise = route("gpt-4o", "real-a");
+    disabled_precise.priority = None; // 禁用
+    let rt = router_provider("rt", vec![disabled_precise, route("*", "real-b")]);
+
+    let dag = ConversationDag::new(64, 500, 1);
+    let dag_probe = dag.clone();
+    let proxy_url = spawn_proxy_static_dynamic(
+        vec![real_a, real_b, rt],
+        vec![],
+        reqwest::Client::new(),
+        dag,
+        test_secret_table(),
+    )
+    .await
+    .0;
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/rt/v1/chat/completions",
+        CHAT_REQ_BODY, // model = gpt-4o: 禁用路由本应精确命中
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(
+        latest_upstream_id(&dag_probe),
+        "real-b",
+        "disabled route must be skipped"
+    );
+}
+
+#[tokio::test]
+async fn router_routes_no_match_returns_503() {
+    // 无启用路由匹配请求 model → 503, body 含 router id 与 model 名 (SEC-2 同型).
+    let rt = router_provider("rt", vec![route("gpt-*", "real")]);
+    let proxy_url = spawn_proxy_with_provider(rt).await;
+    let (status, text, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/rt/v1/chat/completions",
+        r#"{"model":"claude-3","messages":[{"role":"user","content":"Hi"}]}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert!(text.contains("rt"), "message names router id: {text}");
+    assert!(
+        text.contains("no route matching") && text.contains("claude-3"),
+        "message states no-match with model: {text}"
+    );
+}
+
+#[tokio::test]
+async fn router_routes_put_overrides_static() {
+    // per-request 语义: PUT 覆盖 static router 的 routes (调整指向 / 改写 / 禁用 /
+    // 新增路由) 后, 新请求立即按新路由转发.
+    let mut upstream_a = spawn_mock_upstream().await;
+    let mut upstream_b = spawn_mock_upstream().await;
+    let _ma = openai_chat_mock_matching_model(&mut upstream_a, "gpt-4o").await;
+    // claude-* → real-a 分支 (透传): real-a 也要能收到 claude-3.
+    let _ma2 = openai_chat_mock_matching_model(&mut upstream_a, "claude-3").await;
+    let _mb = openai_chat_mock_matching_model(&mut upstream_b, "gpt-5").await;
+
+    let real_a = openai_provider("real-a", &upstream_a.url());
+    let real_b = openai_provider("real-b", &upstream_b.url());
+    // static: gpt-* → real-a (无改写).
+    let rt = router_provider("rt", vec![route("gpt-*", "real-a")]);
+
+    let dag = ConversationDag::new(64, 500, 1);
+    let dag_probe = dag.clone();
+    let proxy_url = spawn_proxy_static_dynamic(
+        vec![real_a, real_b, rt],
+        vec![],
+        reqwest::Client::new(),
+        dag,
+        test_secret_table(),
+    )
+    .await
+    .0;
+
+    // 1. 初始: gpt-4o → real-a 原样.
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/rt/v1/chat/completions",
+        CHAT_REQ_BODY,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(latest_upstream_id(&dag_probe), "real-a");
+
+    // 2. PUT 覆盖 routes: 旧路由禁用 (priority null) + 新路由 gpt-* → real-b
+    //    (model 改写 gpt-5) + claude-* → real-a.
+    let (status, body, _) = proxy_request(
+        &proxy_url,
+        "PUT",
+        "/api/providers/rt",
+        r#"{"routes":[{"model_pattern":"gpt-*","target":"real-a","priority":null},{"model_pattern":"gpt-*","target":"real-b","upstream_model":"gpt-5","priority":10},{"model_pattern":"claude-*","target":"real-a","priority":0}],"base_url":"","enabled":true}"#,
+        &[("content-type", "application/json")],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "override routes: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        v["routes"].as_array().map(Vec::len),
+        Some(3),
+        "effective view: {body}"
+    );
+
+    // 3. 新请求: 禁用路由让位, gpt-* → real-b 且 model 改写为 gpt-5
+    //    (match_body 已断言 real-b 收到 gpt-5).
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/rt/v1/chat/completions",
+        CHAT_REQ_BODY,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(latest_upstream_id(&dag_probe), "real-b");
+
+    // 4. 新增路由分支生效: claude-3 → real-a.
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/rt/v1/chat/completions",
+        r#"{"model":"claude-3","messages":[{"role":"user","content":"Hi"}]}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(latest_upstream_id(&dag_probe), "real-a");
+}
+
+/// m3-1: PUT "保留" 语义 — 对 static router 发**不带 routes** 的 PUT (仅改
+/// name 的 SDK 形态) → 200; effective routes 从旧值回填 (不变), kind 仍 router.
+#[tokio::test]
+async fn router_routes_put_omitted_routes_keeps_old() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = openai_chat_mock(&mut upstream, "hi").create_async().await;
+    let real_a = openai_provider("real-a", &upstream.url());
+    let rt = router_provider("rt", vec![route("gpt-*", "real-a")]);
+
+    let dag = ConversationDag::new(64, 500, 1);
+    let dag_probe = dag.clone();
+    let proxy_url = spawn_proxy_static_dynamic(
+        vec![real_a, rt],
+        vec![],
+        reqwest::Client::new(),
+        dag,
+        test_secret_table(),
+    )
+    .await
+    .0;
+
+    // PUT 省略 routes: static router (dynamic 无旧条目) 从 effective 回填.
+    let (status, body, _) = proxy_request(
+        &proxy_url,
+        "PUT",
+        "/api/providers/rt",
+        r#"{"name":"renamed","base_url":"","enabled":true}"#,
+        &[("content-type", "application/json")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "put omitted routes: {body}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["kind"], "router", "kind stays router: {body}");
+    assert_eq!(
+        v["routes"].as_array().map(Vec::len),
+        Some(1),
+        "routes backfilled from effective: {body}"
+    );
+    assert_eq!(
+        v["routes"][0]["target"], "real-a",
+        "route content unchanged: {body}"
+    );
+
+    // 路由行为不变: gpt-4o 仍按旧路由到 real-a.
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/rt/v1/chat/completions",
+        CHAT_REQ_BODY,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(latest_upstream_id(&dag_probe), "real-a");
+}
+
+/// m3-2: PUT `routes: []` + Direct 完整字段 → kind 变 direct (空数组 = 显式
+/// "改回实体" 的 SDK 形态; 前端已有 Playwright 覆盖, 这里锁 API 契约).
+#[tokio::test]
+async fn router_routes_empty_array_switches_to_direct() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = openai_chat_mock(&mut upstream, "hi").create_async().await;
+    let real = openai_provider("real", &upstream.url());
+    let rt = router_provider("rt", vec![route("*", "real")]);
+
+    let proxy_url = spawn_proxy_static_dynamic(
+        vec![real, rt],
+        vec![],
+        reqwest::Client::new(),
+        ConversationDag::new(64, 500, 1),
+        test_secret_table(),
+    )
+    .await
+    .0;
+
+    // PUT 空数组 + Direct 完整字段 (protocol + base_url): override 变实体.
+    let (status, body, _) = proxy_request(
+        &proxy_url,
+        "PUT",
+        "/api/providers/rt",
+        &format!(
+            r#"{{"routes":[],"protocol":"openai","base_url":"{}","enabled":true}}"#,
+            upstream.url()
+        ),
+        &[("content-type", "application/json")],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "switch to direct: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["kind"], "direct", "kind switched to direct: {body}");
+    assert_eq!(
+        v["base_url"],
+        upstream.url(),
+        "direct fields active: {body}"
+    );
+
+    // 转发不再走路由: rt 自身即实体, 直连 PUT 的 base_url.
+    let (status, text, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/rt/v1/chat/completions",
+        CHAT_REQ_BODY,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {text}");
+    assert!(
+        text.contains("from hi"),
+        "served by the new direct target: {text}"
+    );
+}
+
+/// m3-4: 两跳 pipeline 端到端 — R1 (gpt-* → R2, 改写 m2-in) → R2 按改写后的
+/// m2-in 匹配 (m2-* → real-a, 改写 m2-tail-a). HTTP 层断言: 上游选择由**改写值**
+/// 决定 (若第二跳用原始 gpt-4o 匹配会走 real-b 的 * 兜底, 其 mock 不匹配 → 501),
+/// 最终 model = 第二跳链尾改写 (后写覆盖前写). mockito 双上游.
+#[tokio::test]
+async fn router_routes_two_hop_pipeline_rewrite_e2e() {
+    let mut upstream_a = spawn_mock_upstream().await;
+    let mut upstream_b = spawn_mock_upstream().await;
+    let _ma = openai_chat_mock_matching_model(&mut upstream_a, "m2-tail-a").await;
+    let _mb = openai_chat_mock_matching_model(&mut upstream_b, "gpt-4o").await;
+
+    let real_a = openai_provider("real-a", &upstream_a.url());
+    let real_b = openai_provider("real-b", &upstream_b.url());
+    // R2: m2-* → real-a (改写 m2-tail-a); 其余 → real-b (透传).
+    let r2 = router_provider(
+        "r2",
+        vec![
+            rewrite_route("m2-*", "real-a", "m2-tail-a"),
+            route("*", "real-b"),
+        ],
+    );
+    // R1: gpt-* → r2, 第一跳改写 m2-in (第二跳的匹配输入; 注意 "m2" 不匹配
+    // "m2-*" — 前缀 "m2-" 不可省, 改写值必须落在第二跳 model_pattern 的语言内).
+    let r1 = router_provider("r1", vec![rewrite_route("gpt-*", "r2", "m2-in")]);
+
+    let dag = ConversationDag::new(64, 500, 1);
+    let dag_probe = dag.clone();
+    let proxy_url = spawn_proxy_static_dynamic(
+        vec![real_a, real_b, r1, r2],
+        vec![],
+        reqwest::Client::new(),
+        dag,
+        test_secret_table(),
+    )
+    .await
+    .0;
+
+    let (status, text, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/r1/v1/chat/completions",
+        CHAT_REQ_BODY, // model = gpt-4o
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {text}");
+    assert_eq!(
+        latest_upstream_id(&dag_probe),
+        "real-a",
+        "second hop matches the REWRITTEN model m2-in, not the request model"
+    );
+    // match_body 已断言 real-a 收到 m2-tail-a (第二跳改写覆盖第一跳的 m2-in):
+    // real-a 的 mock 只匹配 model=m2-tail-a, 收到 m2-in 会 unmatched → 501.
 }

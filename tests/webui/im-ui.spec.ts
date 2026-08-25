@@ -2312,7 +2312,7 @@ test.describe("WebUI 表单失败保持 (#181)", () => {
     await page.locator("button", { hasText: "+ new provider" }).click();
     const dlg = page.locator("#provider-form");
     await expect(dlg).toBeVisible();
-    // 不填 base_url 也不选 route_to → builder 返回 null (#180 的前端拦截分支).
+    // 不填 base_url (Direct 默认构造) → builder 返回 null (#180 的前端拦截分支).
     await page.locator("#p-id").fill("no-baseurl-provider");
     await page.locator("#p-protocol").selectOption("openai");
 
@@ -2365,15 +2365,15 @@ test.describe("Provider 表单构造分野 (#190)", () => {
     await expect(page.locator("#providers-body tr").first()).toBeVisible();
   });
 
-  test("#190: 新建 Direct — 默认构造, Direct 字段组可见 / Virtual 字段组隐藏", async ({ page }) => {
+  test("#190: 新建 Direct — 默认构造, Direct 字段组可见 / Router 字段组隐藏", async ({ page }) => {
     await page.locator("button", { hasText: "+ new provider" }).click();
     const dlg = page.locator("#provider-form");
     await expect(dlg).toBeVisible();
 
-    // 默认 direct: Base URL / API Key / Protocol 可见; Route To 隐藏.
+    // 默认 direct: Base URL / API Key / Protocol 可见; 路由编辑器隐藏.
     // (断言组内代表字段而非 display:contents wrapper — 后者无盒, 可见性断言依赖浏览器实现细节.)
     await expect(page.locator("#p-base-url")).toBeVisible();
-    await expect(page.locator("#p-route-to")).not.toBeVisible();
+    await expect(page.locator("#p-routes-list")).not.toBeVisible();
 
     const uid = `direct-${Date.now()}`;
     await page.locator("#p-id").fill(uid);
@@ -2385,9 +2385,9 @@ test.describe("Provider 表单构造分野 (#190)", () => {
 
     const row = page.locator("#providers-body tr", { hasText: uid });
     await expect(row).toBeVisible();
-    // Direct 行: 显示 base_url, 无 virtual pill.
+    // Direct 行: 显示 base_url, 无 router pill.
     await expect(row).toContainText("127.0.0.1:19998");
-    await expect(row.locator(".pill", { hasText: "virtual" })).toHaveCount(0);
+    await expect(row.locator(".pill", { hasText: "router" })).toHaveCount(0);
 
     // 清理 (dynamic-only 可删): 注册 dialog handler 接受 confirm, DELETE 真实发出.
     autoAcceptAlerts(page);
@@ -2395,75 +2395,78 @@ test.describe("Provider 表单构造分野 (#190)", () => {
     await expect(row).not.toBeVisible();
   });
 
-  test("#190: 新建 Virtual — 切构造后字段组对调, protocol 不出现", async ({ page }) => {
+  test("#190: 新建 Router — 切构造后字段组对调, 路由行提交 + 列表渲染摘要", async ({ page }) => {
     await page.locator("button", { hasText: "+ new provider" }).click();
     const dlg = page.locator("#provider-form");
     await expect(dlg).toBeVisible();
 
-    // 切 virtual: 字段组对调.
-    await page.locator("#p-kind").selectOption("virtual");
-    await expect(page.locator("#p-route-to")).toBeVisible();
+    // 切 router: 字段组对调.
+    await page.locator("#p-kind").selectOption("router");
+    await expect(page.locator("#p-routes-list")).toBeVisible();
     await expect(page.locator("#p-base-url")).not.toBeVisible();
 
-    const uid = `virt-${Date.now()}`;
+    const uid = `router-${Date.now()}`;
     await page.locator("#p-id").fill(uid);
-    // 指向预置的 static provider (playwright.config.ts 的 mock-openai).
-    await page.locator("#p-route-to").selectOption("mock-openai");
+    // 默认一行空白路由: 填 model_pattern + 目标 (预置 static provider mock-openai).
+    await page.locator(".route-row").nth(0).locator(".route-model-pattern").fill("gpt-*");
+    await page.locator(".route-row").nth(0).locator(".route-target").selectOption("mock-openai");
 
     await page.locator('#provider-form-el button[value="save"]').click();
     await expect(dlg).not.toBeVisible();
 
     const row = page.locator("#providers-body tr", { hasText: uid });
     await expect(row).toBeVisible();
-    await expect(row.locator(".pill", { hasText: "virtual" })).toBeVisible();
-    // base_url 列显示指向, 而非空.
-    await expect(row).toContainText("→ mock-openai");
-    // protocol 为 (any) — Virtual payload 不带 protocol 且后端不回填 (L1):
-    // egress 由链尾决定, 不展示误导性协议.
-    await expect(row.locator(".pill", { hasText: "(any)" })).toBeVisible();
+    await expect(row.locator(".pill", { hasText: "router" })).toBeVisible();
+    // URL 列显示路由摘要 (model_pattern → target + per-route egress 后缀), 而非空.
+    await expect(row).toContainText("gpt-* → mock-openai");
+    await expect(row).toContainText("· openai");
+    // protocol pill = 路由 egress 的去重集合 (单一 → 'openai'; Router 构造无 protocol).
+    await expect(row.locator(".pill", { hasText: "openai" })).toBeVisible();
 
     autoAcceptAlerts(page);
     await row.locator('button[data-action="delete"]').click();
     await expect(row).not.toBeVisible();
   });
 
-  test("#190: 构造内必填前置校验 — Virtual 无目标时阻止提交", async ({ page }) => {
+  test("#190: 构造内必填前置校验 — Router 路由行缺 model_pattern 时阻止提交", async ({ page }) => {
     await page.locator("button", { hasText: "+ new provider" }).click();
     const dlg = page.locator("#provider-form");
     await expect(dlg).toBeVisible();
-    await page.locator("#p-kind").selectOption("virtual");
+    await page.locator("#p-kind").selectOption("router");
 
     const alerts = autoAcceptAlerts(page);
-    // id 填了但 route_to 留空 (select 无默认选中 → value 为 "").
+    // id 填了但路由行留空 (model_pattern 空 → 前端拦截).
     await page.locator("#p-id").fill(`no-target-${Date.now()}`);
     await page.locator('#provider-form-el button[value="save"]').click();
 
     await expect
       .poll(() => alerts.length, { timeout: 3000 })
       .toBeGreaterThan(0);
-    expect(alerts[0]).toContain("Route To is required");
+    expect(alerts[0]).toContain("model_pattern is required");
     await expect(dlg, "校验失败对话框保持打开").toBeVisible();
 
     await page.locator('#provider-form-el button[value="cancel"]').click();
   });
 
-  test("#190: 编辑 Virtual 条目 — kind 初始化 + 切 Direct 触发 base_url 必填校验", async ({ page }) => {
-    // 先建一个 virtual (复用 #190 创建路径).
+  test("#190: 编辑 Router 条目 — kind 初始化 + 切 Direct 触发 base_url 必填校验", async ({ page }) => {
+    // 先建一个 router (复用 #190 创建路径).
     await page.locator("button", { hasText: "+ new provider" }).click();
-    await page.locator("#p-kind").selectOption("virtual");
+    await page.locator("#p-kind").selectOption("router");
     const uid = `edit-${Date.now()}`;
     await page.locator("#p-id").fill(uid);
-    await page.locator("#p-route-to").selectOption("mock-openai");
+    await page.locator(".route-row").nth(0).locator(".route-model-pattern").fill("*");
+    await page.locator(".route-row").nth(0).locator(".route-target").selectOption("mock-openai");
     await page.locator('#provider-form-el button[value="save"]').click();
     const row = page.locator("#providers-body tr", { hasText: uid });
     await expect(row).toBeVisible();
 
-    // 编辑: kind 选择器初始化为 virtual, 字段组正确.
+    // 编辑: kind 选择器初始化为 router, 路由行回填 (1 行, model_pattern '*').
     await row.locator('button[data-action="edit"]').click();
     const dlg = page.locator("#provider-form");
     await expect(dlg).toBeVisible();
-    await expect(page.locator("#p-kind")).toHaveValue("virtual");
-    await expect(page.locator("#p-route-to")).toBeVisible();
+    await expect(page.locator("#p-kind")).toHaveValue("router");
+    await expect(page.locator(".route-row")).toHaveCount(1);
+    await expect(page.locator(".route-row .route-model-pattern")).toHaveValue("*");
 
     // 切 Direct (#187 改回实体场景): base_url 空 → 前置校验拦截.
     const alerts = autoAcceptAlerts(page);
@@ -2474,16 +2477,68 @@ test.describe("Provider 表单构造分野 (#190)", () => {
       .toBeGreaterThan(0);
     expect(alerts[0]).toContain("Base URL is required");
 
-    // 补上 base_url 后成功改回 Direct (kind 切换生效).
+    // 补上 base_url 后成功改回 Direct (kind 切换生效) — Direct 分支对 Router 旧条目
+    // 发空 routes 数组 ("显式改回实体"; PUT 省略 routes 会被后端回填旧路由停留在 Router).
     await page.locator("#p-base-url").fill("http://127.0.0.1:19997");
     await page.locator("#p-api-key").fill("sk-after-switch");
     await page.locator('#provider-form-el button[value="save"]').click();
     await expect(dlg).not.toBeVisible();
     const updated = page.locator("#providers-body tr", { hasText: uid });
     await expect(updated).toContainText("127.0.0.1:19997");
-    await expect(updated.locator(".pill", { hasText: "virtual" })).toHaveCount(0);
+    await expect(updated.locator(".pill", { hasText: "router" })).toHaveCount(0);
 
     await updated.locator('button[data-action="delete"]').click();
     await expect(updated).not.toBeVisible();
+  });
+
+  // ─── #179: 路由编辑器冒烟 — 增删行 / 禁用行 (checkbox) / PUT 后摘要渲染 ────
+  test("#179: 路由编辑器 — 增删行 / 禁用行 / PUT 后列表渲染路由摘要", async ({ page }) => {
+    await page.locator("button", { hasText: "+ new provider" }).click();
+    const dlg = page.locator("#provider-form");
+    await expect(dlg).toBeVisible();
+    await page.locator("#p-kind").selectOption("router");
+    const uid = `routes-${Date.now()}`;
+    await page.locator("#p-id").fill(uid);
+
+    // 行 1 (默认空白): gpt-* → mock-openai, 保持启用.
+    await page.locator(".route-row").nth(0).locator(".route-model-pattern").fill("gpt-*");
+    await page.locator(".route-row").nth(0).locator(".route-target").selectOption("mock-openai");
+    // + Add route 增行: 第二条填好后取消启用 checkbox (priority null = 禁用).
+    await page.locator("#p-route-add").click();
+    await expect(page.locator(".route-row")).toHaveCount(2);
+    await page.locator(".route-row").nth(1).locator(".route-model-pattern").fill("claude-*");
+    await page.locator(".route-row").nth(1).locator(".route-target").selectOption("mock-openai");
+    await page.locator(".route-row").nth(1).locator(".route-enabled").uncheck();
+    // 再增一行又删掉 (行删除按钮冒烟).
+    await page.locator("#p-route-add").click();
+    await expect(page.locator(".route-row")).toHaveCount(3);
+    await page.locator(".route-row").nth(2).locator(".route-del").click();
+    await expect(page.locator(".route-row")).toHaveCount(2);
+
+    await page.locator('#provider-form-el button[value="save"]').click();
+    await expect(dlg).not.toBeVisible();
+
+    // 列表摘要 (POST 后): ≤2 条不折叠, 两条都在; 禁用路由主文本 <s> 删除线; egress 后缀.
+    const row = page.locator("#providers-body tr", { hasText: uid });
+    await expect(row).toBeVisible();
+    await expect(row).toContainText("gpt-* → mock-openai");
+    await expect(row).toContainText("claude-*");
+    await expect(row.locator("s")).toHaveCount(1);
+    await expect(row).toContainText("· openai");
+
+    // 编辑 (PUT): 回填 2 行, 禁用态保持; 再禁用第一行 → 摘要两条都删除线.
+    await row.locator('button[data-action="edit"]').click();
+    await expect(dlg).toBeVisible();
+    await expect(page.locator(".route-row")).toHaveCount(2);
+    await expect(page.locator(".route-row").nth(0).locator(".route-enabled")).toBeChecked();
+    await expect(page.locator(".route-row").nth(1).locator(".route-enabled")).not.toBeChecked();
+    await page.locator(".route-row").nth(0).locator(".route-enabled").uncheck();
+    await page.locator('#provider-form-el button[value="save"]').click();
+    await expect(dlg).not.toBeVisible();
+    await expect(row.locator("s")).toHaveCount(2);
+
+    autoAcceptAlerts(page);
+    await row.locator('button[data-action="delete"]').click();
+    await expect(row).not.toBeVisible();
   });
 });

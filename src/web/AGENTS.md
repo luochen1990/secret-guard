@@ -153,6 +153,29 @@ API key CRUD **无条件挂载** (在 `web::router()`, 不依赖 `auth.enabled`)
 > I3 (timeline 轮次 DOM 顺序 == 数据顺序 oldest-first) 见根目录 AGENTS.md.
 > 回归守卫: `tests/webui/im-ui.spec.ts`.
 
+### Provider 表单 (构造分野 + 路由编辑器) 与列表 router 行渲染
+
+- 表单 `#p-kind` 是构造分野的唯一事实来源: **Direct** (Protocol / Base URL / API Key
+  字段组) vs **Router** (路由编辑器字段组 `#p-router-fields`). 切换只显隐字段组,
+  **不清空已输入内容** — Direct↔Router 来回切不丢数据 (与 #181 的字段保留语义一致).
+- **路由编辑器** (#179): 每行一条 `Route` — `model_pattern` (`*` 通配) / `target`
+  (下拉: 其余 provider, 排除编辑对象自身防自环; 悬空目标保留 "(missing)" option,
+  编辑保存不静默丢指向) / `upstream_model` (可选, 空 = null 透传) / `priority` (整数可负,
+  空输入按 0) + 启用 checkbox. **wire 无独立 enabled 字段**: 取消勾选 = 提交
+  `priority: null` (路由保留但不参与匹配).
+- **提交语义**: Router 分支全量发 `routes` (≥1 条; 每行 model_pattern / target 前端必填
+  拦截, 不依赖后端 400). Direct 分支不发 `routes` — **唯一例外**: 编辑对象当前是
+  Router 时发 `routes: []` ("显式改回实体"; PUT 省略 routes 会被后端回填旧路由停留在
+  Router).
+- **列表 router 行**: URL 列渲染路由摘要 `model_pattern → target · egress` (禁用路由主文本
+  删除线; 超过 2 条折叠为首条 + "+N more", 全量在 td title). egress 是**展示近似** —
+  从路由 target 出发 walk 链尾 Direct 的 protocol (中间 router 取最高优先级启用
+  路由的目标, 防环 seen set, 悬空 → `?`), 忽略路由 upstream_model 重写对后续跳匹配的影响
+  (展示无需 per-model 精确解析). protocol pill 显示路由 egress 的去重集合 (单一 →
+  该 protocol, 短列表逗号连接, 放不下 → `mixed`). egress 标记挂静态教育 tooltip
+  (跨协议代价: 流式 501 / reasoning_content 丢弃). endpoints 对话框复用同一近似
+  (`resolveEgressProtocol`).
+
 ### Sidebar 分组渲染 (二级 + 三级小圆点)
 
 - 二级条目 (`.round-item` = 用户轮次, req_delta 含 `role=user`) 显示 preview 文本 + 时间.

@@ -116,13 +116,15 @@ impl Protocol {
     }
 }
 
-/// 单个 provider 实例 — **sum type** (#187): 直连上游 (`Direct`) 或虚拟路由
-/// (`Virtual`) 两种构造, 配置项完全不同, 非法状态不可表示 (Virtual 根本没有
-/// base_url/api_key 字段).
+/// 单个 provider 实例 — **sum type** (#187): 直连上游 (`Direct`) 或路由
+/// (`Router`) 两种构造, 配置项完全不同, 非法状态不可表示 (Router 根本没有
+/// base_url/api_key 字段)。
 ///
-/// 共享字段: `id` / `name` / `enabled` / `model_override` (两种构造都可配).
+/// 共享字段: `id` / `name` / `enabled` (两种构造都可配)。出站 model 重写不再是
+/// provider 级字段 — 由 [`Route::upstream_model`] 承载 (路由命中即改写, #183 语义被
+/// 路由吸收)。
 ///
-/// serde: `kind` 字段为 internally tagged (`kind = "direct"/"virtual"`), variant
+/// serde: `kind` 字段为 internally tagged (`kind = "direct"/"router"`), variant
 /// 字段平铺在同一层 — 磁盘 TOML / state.toml / EffectiveProvider JSON 共用同一
 /// 形态 (SSOT):
 ///
@@ -134,9 +136,13 @@ impl Protocol {
 /// base_url = "https://api.openai.com"
 ///
 /// [[providers]]
-/// id = "my-model"
-/// kind = "virtual"
-/// route_to = "openai-main"
+/// id = "router"
+/// kind = "router"
+/// [[providers.routes]]
+/// model_pattern = "gpt-*"
+/// target = "openai-main"
+/// upstream_model = "gpt-4o"   # 省略此字段 = 透传
+/// priority = 100        # 省略此字段 (或 null) = 该路由禁用
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Provider {
@@ -148,12 +154,7 @@ pub struct Provider {
     /// 可选人类可读名称 (Web UI 显示).
     #[serde(default)]
     pub name: Option<String>,
-    /// 可选: 出站请求的 model 字段强制重写值 (#183). 两种构造均可配; 链上解析
-    /// first-wins (见 `resolve_route`). 代价与限制的 SSOT: FWD-1 修订 + FWD-5
-    /// `prop_model_override_*` (`docs/design/contracts.md`).
-    #[serde(default)]
-    pub model_override: Option<String>,
-    /// 构造判别: 直连上游 or 虚拟路由 (`kind` tag).
+    /// 构造判别: 直连上游 or 路由 (`kind` tag).
     #[serde(flatten)]
     pub kind: ProviderKind,
 }
@@ -165,8 +166,9 @@ pub struct Provider {
 pub enum ProviderKind {
     /// 直连上游: 真实 LLM 端点, 承载转发.
     Direct(DirectProvider),
-    /// 虚拟 endpoint: 不承载转发, 请求经 `route_to` 链解析到链尾实体 (#179).
-    Virtual(VirtualProvider),
+    /// 虚拟 endpoint: 不承载转发, 请求按请求 model 匹配 `routes` 路由链式
+    /// 解析到链尾实体 (#179 多规则化).
+    Router(RouterProvider),
 }
 
 /// 直连上游 provider 的构造负载 ([`ProviderKind::Direct`]).
@@ -193,20 +195,99 @@ pub struct DirectProvider {
     pub api_key_file: Option<std::path::PathBuf>,
 }
 
-/// 虚拟 endpoint provider 的构造负载 ([`ProviderKind::Virtual`]).
+/// 虚拟 endpoint (路由表) provider 的构造负载 ([`ProviderKind::Router`]).
 ///
 /// base_url / api_key / api_key_file **在此构造下不存在** (sum type 根治
 /// "配置了被忽略" 的非法状态). 路由语义 (per-request 解析 / 坏路由 503 / 环与
 /// 悬空处置) 的 SSOT: [`ProviderTable::resolve_route`] +
 /// [`ProviderTable::would_cycle`] + FWD-5 契约 (`docs/design/contracts.md`).
+///
+/// **无 protocol 字段**: router 没有事实意义上的协议 — ingress 由 per-request
+/// URL 的 proto_short 决定, egress 由 per-route 链尾实体的 protocol 决定 (混合
+/// egress 时单字段装不下, 声明也不产生任何行为约束), 故无可陈述的事实.
+/// 展示需求 (转换徽标) 由前端 per-route walk 链尾派生.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VirtualProvider {
-    /// 路由目标 (另一 provider 的 id). 非空 (WebUI/API 层已 filter 空串).
-    pub route_to: String,
-    /// 协议: **仅 WebUI 展示** — ingress 由 URL proto_short 决定, egress 由链尾
-    /// 实体的 protocol 决定 (不同则自动走 cross_proto 翻译). 可选.
+pub struct RouterProvider {
+    /// 路由列表. 至少一条 (validate 拒绝空表 — 空 routes 的 router 无法
+    /// 转发任何请求, 几乎肯定是配置残缺).
     #[serde(default)]
-    pub protocol: Option<Protocol>,
+    pub routes: Vec<Route>,
+}
+
+/// 一条路由: `model_pattern` 匹配请求 model 时, 把请求路由到 `target`。
+///
+/// `upstream_model` / `priority` 均可省略: 省略 `upstream_model` = 透传请求原
+/// model; 省略 `priority` = 该路由**禁用** (WebUI 的 enabled 开关由 priority
+/// null 表达)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Route {
+    /// model 名通配符. 仅支持 `'*'` 通配 (任意串, 含空), 大小写敏感; 其余字符
+    /// 字面匹配. 见 [`wildcard_match`].
+    pub model_pattern: String,
+    /// 目标 provider id (可指向另一 router, 链式解析).
+    pub target: String,
+    /// 出站 model 重写值; `None` = 透传请求原 model。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_model: Option<String>,
+    /// 优先级, 越大越优先; `None` = 该路由禁用 (不参与匹配与环检查)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i64>,
+}
+
+impl RouterProvider {
+    /// 路由选择: **启用** (`priority` 非 None) 且 model_pattern 匹配 `model` 的路由中
+    /// `priority` 最大者; 同值并列按**列表出现顺序**先者 (用户认可的确定性
+    /// tie-break, 由测试锁定)。
+    pub fn select_route<'a>(&'a self, model: &str) -> Option<&'a Route> {
+        self.routes
+            .iter()
+            .filter(|r| r.priority.is_some() && wildcard_match(&r.model_pattern, model))
+            // fold 而非 max_by: max_by 取并列最大值的**最后一个**, 与 "列表序
+            // 先者胜" 的 tie-break 相反; 此处只有**严格更大**才替换。
+            .fold(None, |best: Option<&Route>, r| match best {
+                Some(b) if r.priority <= b.priority => best,
+                _ => Some(r),
+            })
+    }
+}
+
+/// `'*'` 通配符匹配 (仅 `'*'` 是元字符, 其余字符字面匹配; 大小写敏感)。
+///
+/// 按 `'*'` 分段实现: 首段必须前缀匹配, 尾段必须后缀匹配, 中间段依序子串匹配。
+/// 性质:
+/// - `"*"` 匹配一切 (含空串);
+/// - 连续 `"**"` 折叠为单个 `"*"` (空段跳过);
+/// - 无 `'*'` 的 pattern 退化为全等比较。
+///
+/// 纯函数 (pub), 供 [`RouterProvider::select_route`] 与测试复用。
+pub fn wildcard_match(pattern: &str, name: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return pattern == name; // 无通配符: 字面全等.
+    }
+    // 首段: 前缀.
+    let first = parts[0];
+    if !name.starts_with(first) {
+        return false;
+    }
+    let mut rest = &name[first.len()..];
+    // 中间段: 依序子串 (空段 = 连续 '*', 跳过).
+    for seg in &parts[1..parts.len() - 1] {
+        if seg.is_empty() {
+            continue;
+        }
+        match rest.find(seg) {
+            Some(i) => rest = &rest[i + seg.len()..],
+            None => return false,
+        }
+    }
+    // 尾段: 后缀 (空尾段 = pattern 以 '*' 结尾, 已消费完毕; ends_with 已蕴含
+    // 长度检查).
+    let last = parts[parts.len() - 1];
+    if last.is_empty() {
+        return true;
+    }
+    rest.ends_with(last)
 }
 
 /// serde `default` helper: 让 `enabled` 字段缺省为 `true`.
@@ -295,37 +376,65 @@ impl DynamicEntry for Provider {
                     ));
                 }
             }
-            ProviderKind::Virtual(v) => {
-                // 自环在此拒绝 (entry-local, 覆盖 static 加载与所有 upsert);
-                // 跨条目成环由 upsert 侧 would_cycle + 运行时 resolve_route 兜底.
-                crate::secrets::validate_id(&v.route_to)?;
-                if v.route_to == self.id {
-                    return Err(format!("provider {} routes to itself", self.id));
+            ProviderKind::Router(r) => {
+                // 空 routes 拒绝: 空 router 无法转发任何请求 (NoMatch 恒真),
+                // 几乎肯定是配置残缺 — fail-fast 优于运行时 503 排障.
+                if r.routes.is_empty() {
+                    return Err(format!(
+                        "provider {} must declare at least one route",
+                        self.id
+                    ));
                 }
-            }
-        }
-        // model_override 空串非法 (#183): "清空" 语义应省略字段 (TOML) / WebUI 发 "".
-        // 静默 normalize (Some("") → None) 会掩盖手滑留下的空配置, fail-fast 更优.
-        // 长度上限与空白拒绝: 对齐 id/name 的输入卫生 (超长值进 WebUI pill / JSON /
-        // per-node DAG 存储; 纯空白在 WebUI 侧被 trim 掉, 配置侧同标准拒绝).
-        if let Some(m) = &self.model_override {
-            if m.is_empty() {
-                return Err(format!(
-                    "provider {} has empty model_override; omit the field to clear it",
-                    self.id
-                ));
-            }
-            if m.chars().count() > 128 {
-                return Err(format!(
-                    "provider {} model_override exceeds 128 chars",
-                    self.id
-                ));
-            }
-            if m.trim().is_empty() {
-                return Err(format!(
-                    "provider {} model_override is whitespace-only",
-                    self.id
-                ));
+                for route in &r.routes {
+                    // model_pattern 非空 + 长度上限: 输入卫生 (对齐 id/name 纪律,
+                    // 超长 model_pattern 进 WebUI / per-request 匹配热路径).
+                    if route.model_pattern.is_empty() {
+                        return Err(format!(
+                            "provider {} has a route with empty model_pattern",
+                            self.id
+                        ));
+                    }
+                    if route.model_pattern.chars().count() > 64 {
+                        return Err(format!(
+                            "provider {} route model_pattern exceeds 64 chars",
+                            self.id
+                        ));
+                    }
+                    // target 的 id 卫生对所有路由生效 (含禁用 — 落盘数据的
+                    // 合法性与启用状态无关);
+                    crate::secrets::validate_id(&route.target)?;
+                    // 自环仅对**启用**路由拒绝 — 与 would_cycle 的 "禁用路由不
+                    // 构成环检查的边" 语义对齐 (禁用路由不参与匹配与环遍历,
+                    // 拒绝它会阻止用户暂存一条自指路由). 跨条目成环由 upsert
+                    // 侧 would_cycle + 运行时 resolve_route 兜底.
+                    if route.target == self.id && route.priority.is_some() {
+                        return Err(format!("provider {} routes to itself", self.id));
+                    }
+                    // route.upstream_model 重写值的输入卫生 (校验措辞沿用原 provider 级改写):
+                    // 空串/纯空白/超长拒绝, 清空语义 = 省略字段.
+                    if let Some(m) = &route.upstream_model {
+                        if m.is_empty() {
+                            return Err(format!(
+                                "provider {} has empty route upstream_model; omit the field to clear it",
+                                self.id
+                            ));
+                        }
+                        if m.chars().count() > 128 {
+                            return Err(format!(
+                                "provider {} route upstream_model exceeds 128 chars",
+                                self.id
+                            ));
+                        }
+                        if m.trim().is_empty() {
+                            return Err(format!(
+                                "provider {} route upstream_model is whitespace-only",
+                                self.id
+                            ));
+                        }
+                    }
+                    // priority 数值不加范围限制 (i64 任意); 重复 model_pattern /
+                    // 重复优先级合法 (tie 按列表序, select_route 锁定).
+                }
             }
         }
         Ok(())
@@ -349,17 +458,11 @@ impl DynamicEntry for Provider {
     ///
     /// sum type 语义 (#187): 继承只在**同型构造**内发生 (Direct↔Direct 继承鉴权字段).
     /// 跨型不继承 — override 的构造本身就是显式决策:
-    /// - Direct override + Virtual static = **改回实体** (route_to 无 None 歧义,
+    /// - Direct override + Router static = **改回实体** (routes 无 None 歧义,
     ///   #179 登记的 "无法改回实体" 限制由类型系统根治);
-    /// - Virtual override + Direct static = 切为虚拟 (Virtual static 无鉴权字段
+    /// - Router override + Direct static = 切为路由 (Router static 无鉴权字段
     ///   可继承, 与旧行为等价 — 旧实现继承到的也是空).
     fn inherit_from_static(&mut self, static_ver: &Self) {
-        // model_override 共享字段, #157 语义不变: override 未记录 → 从 static 继承.
-        // 已知限制: static 配置了 override 的条目无法经 override 清空; 根治属
-        // #157 请求 schema 演进 (PUT null vs ""), 与构造类型无关.
-        if self.model_override.is_none() {
-            self.model_override = static_ver.model_override.clone();
-        }
         if let (ProviderKind::Direct(d), ProviderKind::Direct(sd)) =
             (&mut self.kind, &static_ver.kind)
             && d.api_key.is_empty()
@@ -390,11 +493,9 @@ pub struct EffectiveProvider {
     pub id: String,
     pub enabled: bool,
     pub name: Option<String>,
-    /// 出站 model 强制重写值 (#183). 见 [`Provider::model_override`].
-    pub model_override: Option<String>,
-    /// 构造判别 (直连 / 虚拟), JSON 为 internally tagged flatten:
+    /// 构造判别 (直连 / 路由), JSON 为 internally tagged flatten:
     /// `{"kind": "direct", "protocol": ..., "base_url": ...}` /
-    /// `{"kind": "virtual", "route_to": ...}`.
+    /// `{"kind": "router", "routes": [...]}`.
     #[serde(flatten)]
     pub kind: EffectiveProviderKind,
 
@@ -409,7 +510,8 @@ pub struct EffectiveProvider {
 }
 
 /// EffectiveProvider 的构造判别 (sum, #187). 字段集与 [`ProviderKind`] 对应
-/// (api_key 脱敏为 masked 视图; Virtual 的 protocol 可选).
+/// (api_key 脱敏为 masked 视图; Router 的 routes 非敏感直接序列化给前端,
+/// 无 protocol — 见 [`RouterProvider`]).
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EffectiveProviderKind {
@@ -421,10 +523,8 @@ pub enum EffectiveProviderKind {
         api_key_masked: String,
         api_key_length: usize,
     },
-    Virtual {
-        route_to: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        protocol: Option<Protocol>,
+    Router {
+        routes: Vec<Route>,
     },
 }
 
@@ -434,8 +534,6 @@ pub struct ProviderMasked {
     pub id: String,
     pub name: Option<String>,
     pub enabled: bool,
-    /// 出站 model 强制重写值 (#183). 见 [`Provider::model_override`].
-    pub model_override: Option<String>,
     #[serde(flatten)]
     pub kind: EffectiveProviderKind,
 }
@@ -452,16 +550,12 @@ impl From<Provider> for ProviderMasked {
                     base_url: d.base_url,
                 }
             }
-            ProviderKind::Virtual(v) => EffectiveProviderKind::Virtual {
-                route_to: v.route_to,
-                protocol: v.protocol,
-            },
+            ProviderKind::Router(r) => EffectiveProviderKind::Router { routes: r.routes },
         };
         Self {
             id: p.id,
             name: p.name,
             enabled: p.enabled,
-            model_override: p.model_override,
             kind,
         }
     }
@@ -477,16 +571,19 @@ impl DynamicTable<Provider> {
             .collect()
     }
 
-    /// 解析虚拟 provider 路由链 (#179): 跟随 `route_to` 直到链尾的实体 provider,
-    /// 并收集链上生效的 `model_override` (#183).
+    /// 解析路由 provider 的路由链 (#179 多规则化): 从 `entry` 出发, 按请求
+    /// model 逐跳匹配路由, 直到链尾的实体 provider, 并收集链上生效的 model
+    /// 重写值 (`Route::upstream_model`, #183 语义被路由吸收).
     ///
-    /// - **per-request 语义**: dispatch 每次转发前调用, 切换指向只影响新请求
-    ///   (in-flight 请求已拿到解析结果, 按旧目标完成, 无需 drain);
+    /// - **per-request 语义**: dispatch 每次转发前调用 (携带本请求的 model),
+    ///   切换路由只影响新请求 (in-flight 请求已拿到解析结果, 按旧目标完成);
     /// - 每跳走 [`Self::get_effective`] (含 static+dynamic+decision 合并与 #157 继承),
     ///   链上每个 provider 必须存在且 entry-level enabled;
-    /// - **model_override first-wins** (#183): 沿链从入口起第一个非空 override 生效
-    ///   — 入口 (虚拟级 "端点=模型X") > 中间跳 > 链尾实体 ("channel 强制模型"),
-    ///   高层意图优先, 切换 target 不隐式改变生效模型;
+    /// - **路由选择** ([`RouterProvider::select_route`]): 启用路由中 model_pattern
+    ///   匹配 **in-flight model** 的最大 priority 者, 并列按列表序; 无命中 → [`RouteError::NoMatch`];
+    /// - **model 重写 pipeline 语义**: 路由的 `upstream_model` 为 Some 时改写**立即生效** —
+    ///   后续 router 按改写后的 model 匹配, 多次改写后者覆盖前者 (与旧 #183
+    ///   first-wins 不同: 改写值参与下一跳的路由匹配);
     /// - **链内非原子**: 两跳以上链的逐跳解析各自独立读表, 解析期间表被修改时
     ///   本请求可能走 "切换前 + 切换后" 的混合链 — 这是 per-request 解析的自然
     ///   语义 (本请求视角, 链在解析起点时刻的快照), 不额外加锁;
@@ -495,12 +592,17 @@ impl DynamicTable<Provider> {
     ///   503, 不挂起);
     /// - `entry` 自身是 Direct 时原样返回 (实体 provider 快路径, 零开销一跳).
     ///
-    /// 错误消息只含 provider id 与 reason 枚举 (SEC-2 同型, 无 secret),
+    /// 错误消息只含 provider id / model 名与 reason 枚举 (SEC-2 同型, 无 secret),
     /// 经 `AppError::Unavailable` 原样回传客户端 503 body.
-    pub fn resolve_route(&self, entry: Provider) -> Result<ResolvedRoute, RouteError> {
+    pub fn resolve_route(
+        &self,
+        entry: Provider,
+        request_model: &str,
+    ) -> Result<ResolvedRoute, RouteError> {
         let mut cur = entry;
         let mut visited = HashSet::from([cur.id.clone()]);
-        let mut model_override = cur.model_override.clone();
+        let mut in_flight_model = request_model.to_string();
+        let mut model_rewrite: Option<String> = None;
         loop {
             match cur.kind {
                 // 链尾 (或入口即实体): 返回. `id` 一并带出 (DirectProvider 不持有 id,
@@ -509,21 +611,32 @@ impl DynamicTable<Provider> {
                     return Ok(ResolvedRoute {
                         id: cur.id,
                         provider: direct,
-                        model_override,
+                        model_rewrite,
                     });
                 }
-                ProviderKind::Virtual(virtual_) => {
+                ProviderKind::Router(router) => {
+                    // NoMatch 的 model 回显在构造处截断 (超长 model 名防日志
+                    // 洪水 / 503 body 膨胀); 匹配本身用未截断的 in_flight_model.
+                    let route = router.select_route(&in_flight_model).ok_or_else(|| {
+                        RouteError::NoMatch {
+                            id: cur.id.clone(),
+                            model: truncate_model_for_echo(&in_flight_model),
+                        }
+                    })?;
+                    // pipeline 语义: 改写立即生效 (后续 router 按改写后 model 匹配),
+                    // 多次改写后者覆盖前者.
+                    if let Some(m) = &route.upstream_model {
+                        model_rewrite = Some(m.clone());
+                        in_flight_model = m.clone();
+                    }
                     let next = self
-                        .get_effective(&virtual_.route_to)
-                        .ok_or_else(|| RouteError::Missing(virtual_.route_to.clone()))?;
+                        .get_effective(&route.target)
+                        .ok_or_else(|| RouteError::Missing(route.target.clone()))?;
                     if !next.enabled {
                         return Err(RouteError::Disabled(next.id.clone()));
                     }
                     if !visited.insert(next.id.clone()) {
                         return Err(RouteError::Cycle(next.id));
-                    }
-                    if model_override.is_none() {
-                        model_override = next.model_override.clone();
                     }
                     cur = next;
                 }
@@ -531,10 +644,12 @@ impl DynamicTable<Provider> {
         }
     }
 
-    /// upsert 前校验: 写入 `entry` 后 route_to 链是否会成环 (WebUI 侧拒绝, 400).
+    /// upsert 前校验: 写入 `entry` 后路由边是否会成环 (WebUI 侧拒绝, 400).
     ///
-    /// 用 effective 视图构造 id → route_to 映射, 用 entry 的新值覆盖其 id 后从
-    /// entry 起步走链 (与 `resolve_route` 同一走链语义); 目标不在映射中 (悬空 /
+    /// 边集 = **所有启用 (priority 非 None) 路由**的 `target` (禁用路由不可
+    /// 遍历, 不构成边). 用 effective 视图构造 id → 启用目标集映射, 用 entry 的
+    /// 新值覆盖其 id 后从 entry 起步沿**每条启用边**探测 (多规则图是 DAG 上有
+    /// 多条出边, 任一分支回到当前路径上的节点即环); 目标不在映射中 (悬空 /
     /// decision-disabled) 视为链断 — **不算环** (悬空写入放行以保证创建顺序无关,
     /// 运行时由 `resolve_route` 503 兜底).
     ///
@@ -542,40 +657,81 @@ impl DynamicTable<Provider> {
     /// 环落库 — 单用户本地工具的可接受假设 (与 update_provider 的 #157 TOCTOU 声明
     /// 一致), 漏网环由 `resolve_route` visited-set 兜底为 503.
     pub fn would_cycle(&self, entry: &Provider) -> bool {
-        // 检查图: id → route_to (Virtual 构造的目标; Direct 为 None = 链终止).
-        let mut hops: HashMap<String, Option<String>> = self
+        // 检查图: id → 启用路由的 target 集合 (Direct 构造为空 = 链终止).
+        let enabled_targets = |routes: &[Route]| -> Vec<String> {
+            routes
+                .iter()
+                .filter(|route| route.priority.is_some())
+                .map(|route| route.target.clone())
+                .collect()
+        };
+        let mut hops: HashMap<String, Vec<String>> = self
             .effective_snapshot()
             .into_iter()
             .map(|e| {
-                let target = match &e.kind {
-                    EffectiveProviderKind::Virtual { route_to, .. } => Some(route_to.clone()),
-                    EffectiveProviderKind::Direct { .. } => None,
+                let targets = match &e.kind {
+                    EffectiveProviderKind::Router { routes } => enabled_targets(routes),
+                    EffectiveProviderKind::Direct { .. } => vec![],
                 };
-                (e.id.clone(), target)
+                (e.id.clone(), targets)
             })
             .collect();
-        let entry_target = match &entry.kind {
-            ProviderKind::Virtual(v) => Some(v.route_to.clone()),
-            ProviderKind::Direct(..) => None,
+        let entry_targets = match &entry.kind {
+            ProviderKind::Router(r) => enabled_targets(&r.routes),
+            ProviderKind::Direct(..) => vec![],
         };
-        hops.insert(entry.id.clone(), entry_target.clone());
-        let mut visited = HashSet::from([entry.id.clone()]);
-        let mut cur = entry_target;
-        while let Some(id) = cur {
-            if !visited.insert(id.clone()) {
+        hops.insert(entry.id.clone(), entry_targets);
+
+        // DFS 环检测: `path` 是当前递归栈 (回到栈上节点 = 环); `done` 记忆已
+        // 完整探索且无环的子图 (汇聚型 DAG 分支不重复走, 也不误报).
+        fn reaches_cycle(
+            node: &str,
+            hops: &HashMap<String, Vec<String>>,
+            path: &mut HashSet<String>,
+            done: &mut HashSet<String>,
+        ) -> bool {
+            if path.contains(node) {
                 return true;
             }
-            cur = match hops.get(&id) {
-                Some(r) => r.clone(),
-                None => return false, // 悬空: 链断, 无环.
-            };
+            if !done.insert(node.to_string()) {
+                return false; // 已完整探索过, 该子图无环.
+            }
+            path.insert(node.to_string());
+            let found = hops
+                .get(node)
+                .is_some_and(|targets| targets.iter().any(|t| reaches_cycle(t, hops, path, done)));
+            path.remove(node);
+            found
         }
-        false
+        let mut path = HashSet::from([entry.id.clone()]);
+        let mut done = HashSet::new();
+        // entry 已在 path 上; 从它的目标起步, 任一分支回到 entry (或路径上节点) 即环.
+        hops.get(&entry.id).is_some_and(|targets| {
+            targets
+                .iter()
+                .any(|t| reaches_cycle(t, &hops, &mut path, &mut done))
+        })
     }
 }
 
-/// 虚拟 provider 路由解析错误 (`resolve_route`). Display 消息进 503 body,
-/// 只含 provider id 与 reason (SEC-2 同型).
+/// NoMatch 错误回显 model 的截断上限 (chars): model 来自请求 body (可任意长,
+/// 如 10 MiB 的畸形 model 名), 回显进 503 body 与日志前截断, 防日志洪水.
+/// (私有: 仅本文件消费; tests 模块同文件可直接访问.)
+const NOMATCH_MODEL_ECHO_LIMIT: usize = 64;
+
+/// 错误/日志回显 model 的截断: 超 64 chars 截到 64 + `…` 后缀.
+/// 消费点: NoMatch 构造处 (Display 保持纯粹, 同一值进 503 body 与 warn!) +
+/// proxy 的 "route resolved" info! (成功路径回显, 同类洪水风险).
+pub(crate) fn truncate_model_for_echo(model: &str) -> String {
+    // char_indices 单遍定位切点 (避免 count + take 双遍扫描); 切在 char 边界.
+    match model.char_indices().nth(NOMATCH_MODEL_ECHO_LIMIT) {
+        Some((i, _)) => format!("{}…", &model[..i]),
+        None => model.to_string(),
+    }
+}
+
+/// 路由 provider 解析错误 (`resolve_route`). Display 消息进 503 body,
+/// 只含 provider id / model 名与 reason (SEC-2 同型).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteError {
     /// 链上一跳在 effective 视图中不存在 (目标缺失, 或被 decision=Disabled 排除).
@@ -584,6 +740,9 @@ pub enum RouteError {
     Disabled(String),
     /// 链上出现环 (含自环). 字段 = 环回到的 provider id.
     Cycle(String),
+    /// router 的启用路由中无 model_pattern 匹配当前请求 model 的路由.
+    /// 字段 = 该 router 的 id + 当时的 in-flight model 名.
+    NoMatch { id: String, model: String },
 }
 
 impl std::fmt::Display for RouteError {
@@ -597,23 +756,28 @@ impl std::fmt::Display for RouteError {
             }
             RouteError::Disabled(id) => write!(f, "route target '{id}' is disabled"),
             RouteError::Cycle(id) => write!(f, "route cycle detected at '{id}'"),
+            RouteError::NoMatch { id, model } => write!(
+                f,
+                "router provider '{id}' has no route matching model '{model}'"
+            ),
         }
     }
 }
 
 impl std::error::Error for RouteError {}
 
-/// 路由解析结果 (#179/#183): 链尾实体 provider + 链上生效的 model_override.
+/// 路由解析结果 (#179/#183): 链尾实体 provider + 链上生效的 model 重写值.
 ///
-/// `model_override` = 沿链 first-wins 收集的非空值 (全链未配置 → None, 即透传).
+/// `model_rewrite` = 命中路由的 `upstream_model` 字段 (pipeline 语义, 多跳改写
+/// 后者覆盖前者; 全链路由均未配置 → None, 即透传).
 #[derive(Debug, Clone)]
 pub struct ResolvedRoute {
-    /// 链尾实体 provider 的 id (非虚拟请求即入口 id; CallEvent.upstream_id 用).
+    /// 链尾实体 provider 的 id (非路由请求即入口 id; CallEvent.upstream_id 用).
     pub id: String,
     /// 链尾实体 provider — **类型上保证是 Direct** (转发链只处理实体, #187).
     pub provider: DirectProvider,
-    /// 链上生效的 model_override (first-wins; None = 客户端 model 透传).
-    pub model_override: Option<String>,
+    /// 链上生效的 model 重写值 (路由 pipeline; None = 客户端 model 透传).
+    pub model_rewrite: Option<String>,
 }
 
 /// 给定 (static_ver, dynamic_ver, mode), 计算 effective provider 的合并视图.
@@ -634,7 +798,6 @@ fn compute_effective_provider(
         id,
         name,
         enabled,
-        model_override,
         kind,
     } = ProviderMasked::from(raw);
     let static_masked = static_ver.map(ProviderMasked::from);
@@ -643,7 +806,6 @@ fn compute_effective_provider(
         id,
         enabled,
         name,
-        model_override,
         kind,
         source,
         decision: mode,
@@ -659,6 +821,7 @@ mod tests {
     use std::sync::Arc;
 
     use parking_lot::RwLock;
+    use proptest::prelude::*;
 
     use crate::config::Decisions;
 
@@ -667,7 +830,6 @@ mod tests {
             id: id.into(),
             enabled: true,
             name: Some(format!("name-{id}")),
-            model_override: None,
             kind: ProviderKind::Direct(DirectProvider {
                 protocol: proto,
                 base_url: base.into(),
@@ -677,13 +839,26 @@ mod tests {
         }
     }
 
-    /// 虚拟 provider (route_to = target). protocol 携带 Some(OpenAI) (WebUI 展示值).
-    fn v(id: &str, target: &str) -> Provider {
+    /// 路由: model_pattern → target (priority 默认 Some(0) = 启用, 无 upstream_model 改写).
+    fn route(model_pattern: &str, target: &str) -> Route {
+        Route {
+            model_pattern: model_pattern.into(),
+            target: target.into(),
+            upstream_model: None,
+            priority: Some(0),
+        }
+    }
+
+    /// 路由 provider: 单路由 model_pattern="*" 指向 target (等价旧 route_to
+    /// 硬指向的等价形态). 构造无 protocol 字段 (见 RouterProvider 注释).
+    fn router_to(id: &str, target: &str) -> Provider {
+        router(id, vec![route("*", target)])
+    }
+
+    /// 路由 provider (显式路由列表). 无 protocol 字段 (见 RouterProvider 注释).
+    fn router(id: &str, routes: Vec<Route>) -> Provider {
         Provider {
-            kind: ProviderKind::Virtual(VirtualProvider {
-                route_to: target.into(),
-                protocol: Some(Protocol::OpenAI),
-            }),
+            kind: ProviderKind::Router(RouterProvider { routes }),
             ..p(id, Protocol::OpenAI, "")
         }
     }
@@ -692,7 +867,7 @@ mod tests {
     fn direct(p: &Provider) -> &DirectProvider {
         match &p.kind {
             ProviderKind::Direct(d) => d,
-            ProviderKind::Virtual(_) => panic!("expected Direct provider"),
+            _ => panic!("expected Direct provider"),
         }
     }
 
@@ -700,7 +875,7 @@ mod tests {
     fn direct_mut(p: &mut Provider) -> &mut DirectProvider {
         match &mut p.kind {
             ProviderKind::Direct(d) => d,
-            ProviderKind::Virtual(_) => panic!("expected Direct provider"),
+            _ => panic!("expected Direct provider"),
         }
     }
 
@@ -797,33 +972,12 @@ mod tests {
     #[test]
     fn validate_rejects_bad_id_and_base_url() {
         // id 校验失败.
-        let bad_id = Provider {
-            id: "has space".into(),
-            enabled: true,
-            name: None,
-            model_override: None,
-            kind: ProviderKind::Direct(DirectProvider {
-                protocol: Protocol::OpenAI,
-                base_url: "https://x".into(),
-                api_key: String::new(),
-                api_key_file: None,
-            }),
-        };
+        let mut bad_id = p("ok", Protocol::OpenAI, "https://x");
+        bad_id.id = "has space".into();
         assert!(bad_id.validate().is_err());
 
         // base_url 校验失败.
-        let bad_url = Provider {
-            id: "x".into(),
-            enabled: true,
-            name: None,
-            model_override: None,
-            kind: ProviderKind::Direct(DirectProvider {
-                protocol: Protocol::OpenAI,
-                base_url: "not-a-url".into(),
-                api_key: String::new(),
-                api_key_file: None,
-            }),
-        };
+        let bad_url = p("x", Protocol::OpenAI, "not-a-url");
         assert!(bad_url.validate().is_err());
 
         // 合法 provider 通过.
@@ -832,18 +986,9 @@ mod tests {
 
     #[test]
     fn validate_rejects_api_key_and_file_both_set() {
-        let both = Provider {
-            id: "x".into(),
-            enabled: true,
-            name: None,
-            model_override: None,
-            kind: ProviderKind::Direct(DirectProvider {
-                protocol: Protocol::OpenAI,
-                base_url: "https://x".into(),
-                api_key: "sk-direct".into(),
-                api_key_file: Some(PathBuf::from("/run/secrets/whatever")),
-            }),
-        };
+        let mut both = p("x", Protocol::OpenAI, "https://x");
+        direct_mut(&mut both).api_key = "sk-direct".into();
+        direct_mut(&mut both).api_key_file = Some(PathBuf::from("/run/secrets/whatever"));
         let err = both.validate().unwrap_err();
         assert!(err.contains("both api_key and api_key_file"), "got: {err}");
     }
@@ -853,18 +998,8 @@ mod tests {
     #[test]
     fn effective_api_key_prefers_direct_value() {
         // 即便 api_key_file 指向不存在的文件, 直接值优先 (且 validate 不会让你同时设两者).
-        let p = Provider {
-            id: "x".into(),
-            enabled: true,
-            name: None,
-            model_override: None,
-            kind: ProviderKind::Direct(DirectProvider {
-                protocol: Protocol::OpenAI,
-                base_url: "https://x".into(),
-                api_key: "sk-direct".into(),
-                api_key_file: None,
-            }),
-        };
+        let mut p = p("x", Protocol::OpenAI, "https://x");
+        direct_mut(&mut p).api_key = "sk-direct".into();
         assert_eq!(direct(&p).effective_api_key("x"), "sk-direct");
     }
 
@@ -878,18 +1013,9 @@ mod tests {
         std::fs::create_dir_all(tmp.parent().unwrap()).unwrap();
         std::fs::write(&tmp, "sk-from-file\n").unwrap();
 
-        let p = Provider {
-            id: "x".into(),
-            enabled: true,
-            name: None,
-            model_override: None,
-            kind: ProviderKind::Direct(DirectProvider {
-                protocol: Protocol::OpenAI,
-                base_url: "https://x".into(),
-                api_key: String::new(),
-                api_key_file: Some(tmp.clone()),
-            }),
-        };
+        let mut p = p("x", Protocol::OpenAI, "https://x");
+        direct_mut(&mut p).api_key = String::new();
+        direct_mut(&mut p).api_key_file = Some(tmp.clone());
         assert_eq!(direct(&p).effective_api_key("x"), "sk-from-file");
 
         std::fs::remove_file(&tmp).ok();
@@ -898,18 +1024,9 @@ mod tests {
     #[test]
     fn effective_api_key_missing_file_returns_empty() {
         // 单 provider 配置错误不应拖垮整个进程 — 返回空让 apply_provider_auth 跳过.
-        let p = Provider {
-            id: "x".into(),
-            enabled: true,
-            name: None,
-            model_override: None,
-            kind: ProviderKind::Direct(DirectProvider {
-                protocol: Protocol::OpenAI,
-                base_url: "https://x".into(),
-                api_key: String::new(),
-                api_key_file: Some(PathBuf::from("/nonexistent/path/should/not/exist")),
-            }),
-        };
+        let mut p = p("x", Protocol::OpenAI, "https://x");
+        direct_mut(&mut p).api_key = String::new();
+        direct_mut(&mut p).api_key_file = Some(PathBuf::from("/nonexistent/path/should/not/exist"));
         assert_eq!(direct(&p).effective_api_key("x"), "");
     }
 
@@ -936,17 +1053,11 @@ mod tests {
 
         // 用唯一 provider id 隔离全局 WARNED_API_KEY_FILE 状态 (并行测试安全).
         let pid = format!("recover-test-{unique}");
-        let make_provider = || Provider {
-            id: pid.clone(),
-            enabled: true,
-            name: None,
-            model_override: None,
-            kind: ProviderKind::Direct(DirectProvider {
-                protocol: Protocol::OpenAI,
-                base_url: "https://x".into(),
-                api_key: String::new(),
-                api_key_file: Some(tmp.clone()),
-            }),
+        let make_provider = || {
+            let mut p = p(&pid, Protocol::OpenAI, "https://x");
+            direct_mut(&mut p).api_key = String::new();
+            direct_mut(&mut p).api_key_file = Some(tmp.clone());
+            p
         };
 
         // 1. 文件不存在 → 空 + WARNED 被插入 (首次失败).
@@ -985,18 +1096,9 @@ mod tests {
         // (上面 recover 测试串了三步, 这里独立断言第一步, 让回归定位更精确.)
         let unique = uuid::Uuid::new_v4().to_string();
         let pid = format!("warn-once-{unique}");
-        let p = Provider {
-            id: pid.clone(),
-            enabled: true,
-            name: None,
-            model_override: None,
-            kind: ProviderKind::Direct(DirectProvider {
-                protocol: Protocol::OpenAI,
-                base_url: "https://x".into(),
-                api_key: String::new(),
-                api_key_file: Some(PathBuf::from("/nonexistent/warn-once-test")),
-            }),
-        };
+        let mut p = p(&pid, Protocol::OpenAI, "https://x");
+        direct_mut(&mut p).api_key = String::new();
+        direct_mut(&mut p).api_key_file = Some(PathBuf::from("/nonexistent/warn-once-test"));
         assert_eq!(direct(&p).effective_api_key(&pid), "");
         assert!(
             WARNED_API_KEY_FILE.lock().contains(&pid),
@@ -1008,18 +1110,8 @@ mod tests {
 
     #[test]
     fn effective_api_key_neither_set_returns_empty() {
-        let p = Provider {
-            id: "x".into(),
-            enabled: true,
-            name: None,
-            model_override: None,
-            kind: ProviderKind::Direct(DirectProvider {
-                protocol: Protocol::OpenAI,
-                base_url: "https://x".into(),
-                api_key: String::new(),
-                api_key_file: None,
-            }),
-        };
+        let mut p = p("x", Protocol::OpenAI, "https://x");
+        direct_mut(&mut p).api_key = String::new();
         assert_eq!(direct(&p).effective_api_key("x"), "");
     }
 
@@ -1178,18 +1270,242 @@ mod tests {
         assert_eq!(dyn_len, 0);
     }
 
-    // ─── 虚拟 provider 路由 (#179): resolve_route / would_cycle / validate ──
+    // ─── wildcard_match (路由 model_pattern 通配语义) ────────────────────
     //
-    // 契约: FWD-5 (per-request 解析 / 坏路由 503 / 环终止).
+    // 仅 '*' 是元字符; 大小写敏感; "*" 匹配一切 (含空串); "**" 折叠为 "*".
 
-    /// 表: real → mock 上游; v1 → v2 → real (两跳链).
+    #[test]
+    fn wildcard_match_exact_name() {
+        assert!(wildcard_match("gpt-4o", "gpt-4o"));
+        assert!(!wildcard_match("gpt-4o", "gpt-4o-mini"));
+        assert!(!wildcard_match("gpt-4o", "GPT-4O"), "大小写敏感");
+        // 无 '*' 的 pattern 退化为字面全等 (含空串边界).
+        assert!(wildcard_match("", ""));
+        assert!(!wildcard_match("", "x"));
+    }
+
+    #[test]
+    fn wildcard_match_prefix_suffix_infix() {
+        // 前缀 "gpt-*".
+        assert!(wildcard_match("gpt-*", "gpt-4o"));
+        assert!(wildcard_match("gpt-*", "gpt-"));
+        assert!(!wildcard_match("gpt-*", "xgpt-4o"));
+        assert!(!wildcard_match("gpt-*", "claude-3"));
+        // 后缀 "*-mini".
+        assert!(wildcard_match("*-mini", "gpt-4o-mini"));
+        assert!(!wildcard_match("*-mini", "gpt-4o"));
+        // 中缀 "gpt-*-mini".
+        assert!(wildcard_match("gpt-*-mini", "gpt-4o-mini"));
+        assert!(wildcard_match("gpt-*-mini", "gpt--mini"), "空中段");
+        assert!(!wildcard_match("gpt-*-mini", "gpt-4o"));
+        assert!(!wildcard_match("gpt-*-mini", "claude-4o-mini"));
+        // 多段组合 "*a*".
+        assert!(wildcard_match("*a*", "bab"));
+        assert!(!wildcard_match("*a*", "bb"));
+    }
+
+    #[test]
+    fn wildcard_match_star_matches_all_including_empty() {
+        assert!(wildcard_match("*", ""));
+        assert!(wildcard_match("*", "anything"));
+        assert!(wildcard_match("*", "a*b*c"));
+    }
+
+    #[test]
+    fn wildcard_match_consecutive_stars_collapse() {
+        // "**" 等价 "*" (空段跳过).
+        assert!(wildcard_match("**", "x"));
+        assert!(wildcard_match("**", ""));
+        assert!(wildcard_match("a**b", "axbxb"));
+        assert!(!wildcard_match("a**b", "b"));
+    }
+
+    /// 独立朴素参考实现 (递归回溯) — 与主实现的分段扫描写法**刻意不同**,
+    /// 供 proptest 交叉验证 (同构复用主实现逻辑无意义). 字节级递归与主实现的
+    /// str 级匹配等价: `*` 是单字节 ASCII, 不会落入多字节 UTF-8 序列中间,
+    /// 字节序相等 ⇔ 字符串相等 (生成器含多字节字符, 覆盖此等价性).
+    fn wildcard_match_reference(pattern: &str, name: &str) -> bool {
+        fn go(p: &[u8], n: &[u8]) -> bool {
+            match p.first() {
+                None => n.is_empty(),
+                Some(b'*') => (0..=n.len()).any(|skip| go(&p[1..], &n[skip..])),
+                Some(&c) => n.first() == Some(&c) && go(&p[1..], &n[1..]),
+            }
+        }
+        go(pattern.as_bytes(), name.as_bytes())
+    }
+
+    proptest! {
+        /// 基本性质: 对任意 s, pattern "{s}*{s}" 必匹配 "{s}{s}".
+        #[test]
+        fn prop_wildcard_split_pattern_matches_concat(s in "[a-z0-9-]{0,12}") {
+            let pattern = format!("{s}*{s}");
+            let name = format!("{s}{s}");
+            prop_assert!(wildcard_match(&pattern, &name),
+                "pattern={pattern:?} name={name:?}");
+        }
+
+        /// 基本性质: wildcard_match("*", x) 恒真 (含空串).
+        #[test]
+        fn prop_wildcard_star_matches_anything(x in "[a-zA-Z0-9-]{0,16}") {
+            prop_assert!(wildcard_match("*", &x));
+        }
+
+        /// 主实现 vs 参考实现一致性: 任意 pattern/name 组对结果相同.
+        /// 生成器: 字面段 ([a-z0-9é-], 可空 → 覆盖首尾 '*' / 连续 '**' 折叠 /
+        /// 无 '*' 纯字面) 以 '*' join 拼 pattern; 单段 = 无通配符边界.
+        /// 字符集含多字节字符 é → 非 ASCII 输入下的字节级/字符级等价性获得
+        /// 覆盖 (安全性: `*` 是单字节 ASCII, 不会落入多字节序列中间).
+        #[test]
+        fn prop_wildcard_matches_reference_impl(
+            lit_segs in proptest::collection::vec("[a-z0-9é-]{0,4}", 1..6),
+            name in "[a-z0-9é-]{0,12}",
+        ) {
+            let pattern = lit_segs.join("*");
+            // 注: prop_assert_eq 的消息经 concat! 展开, 不支持内联捕获,
+            // 用位置参数传诊断值.
+            prop_assert_eq!(
+                wildcard_match(&pattern, &name),
+                wildcard_match_reference(&pattern, &name),
+                "pattern={:?} name={:?}",
+                pattern,
+                name
+            );
+        }
+    }
+
+    // ─── 路由选择 (RouterProvider::select_route) ─────────────────────────
+    //
+    // 语义: 启用 (priority 非 None) 且匹配的路由中 priority 最大者;
+    // 并列按列表出现顺序先者; 禁用路由不参与.
+
+    #[test]
+    fn select_route_highest_priority_wins() {
+        let rp = RouterProvider {
+            routes: vec![
+                route("gpt-*", "low"),
+                Route {
+                    model_pattern: "gpt-4*".into(),
+                    target: "high".into(),
+                    upstream_model: None,
+                    priority: Some(100),
+                },
+                route("*", "fallback"),
+            ],
+        };
+        assert_eq!(rp.select_route("gpt-4o").unwrap().target, "high");
+        // 宽 pattern 低优先级只在高优先级路由不匹配时兜底.
+        assert_eq!(rp.select_route("claude-3").unwrap().target, "fallback");
+    }
+
+    #[test]
+    fn select_route_tie_breaks_by_list_order() {
+        // 同 priority 两条都匹配 → 列表序先者 (用户认可的确定性 tie-break).
+        let rp = RouterProvider {
+            routes: vec![route("*", "first"), route("*", "second")],
+        };
+        assert_eq!(rp.select_route("m").unwrap().target, "first");
+    }
+
+    #[test]
+    fn select_route_skips_disabled_routes() {
+        // priority None = 禁用: 匹配也不选, 落到次优启用路由.
+        let mut disabled = route("gpt-*", "disabled-target");
+        disabled.priority = None;
+        let rp = RouterProvider {
+            routes: vec![disabled, route("*", "fallback")],
+        };
+        assert_eq!(rp.select_route("gpt-4o").unwrap().target, "fallback");
+        // 全禁用 → None (resolve_route 层表现为 NoMatch).
+        let mut all_off = route("*", "x");
+        all_off.priority = None;
+        let rp2 = RouterProvider {
+            routes: vec![all_off],
+        };
+        assert!(rp2.select_route("gpt-4o").is_none());
+    }
+
+    // ─── validate: Router 构造的路由校验 ────────────────────────────────
+
+    #[test]
+    fn validate_router_rejects_empty_routes() {
+        let err = router("r", vec![]).validate().unwrap_err();
+        assert!(err.contains("at least one route"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_router_rejects_bad_model_patterns() {
+        // 空 model_pattern.
+        assert!(router("r", vec![route("", "real")]).validate().is_err());
+        // 恰 64 chars 合法 (边界), 65 拒绝.
+        assert!(
+            router("r", vec![route(&"a".repeat(64), "real")])
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            router("r", vec![route(&"a".repeat(65), "real")])
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_router_semantics() {
+        // 合法: 目标 id 合法且非自环; 重复 model_pattern / 重复 priority 合法 (tie 按列表序).
+        assert!(router("r", vec![route("*", "real")]).validate().is_ok());
+        assert!(
+            router("r", vec![route("*", "a"), route("*", "b")])
+                .validate()
+                .is_ok()
+        );
+        // 目标 id 非法.
+        assert!(
+            router("r", vec![route("*", "has space")])
+                .validate()
+                .is_err()
+        );
+        // 自环 (启用路由拒绝).
+        let err = router("r", vec![route("*", "r")]).validate().unwrap_err();
+        assert!(err.contains("routes to itself"), "got: {err}");
+        // 禁用自环路由合法 — 与 would_cycle "禁用路由不构成环检查的边" 对齐
+        // (用户暂存一条自指路由不被 400 拒绝).
+        let mut disabled_self = route("*", "r");
+        disabled_self.priority = None;
+        assert!(router("r", vec![disabled_self]).validate().is_ok());
+        // 实体: 空 base_url 仍然拒绝 (现有行为不变).
+        assert!(p("x", Protocol::OpenAI, "").validate().is_err());
+    }
+
+    #[test]
+    fn validate_router_route_upstream_model_hygiene() {
+        // route.upstream_model 的输入卫生: 空串 / 纯空白 / 超长 (>128) 拒绝.
+        for bad in ["", "   ", &"m".repeat(129)] {
+            let mut ru = route("*", "real");
+            ru.upstream_model = Some(bad.into());
+            assert!(router("r", vec![ru]).validate().is_err(), "model={bad:?}");
+        }
+        // 正常值 / 恰 128 chars (边界) / None 合法.
+        let mut ok = route("*", "real");
+        ok.upstream_model = Some("gpt-4o".into());
+        assert!(router("r", vec![ok]).validate().is_ok());
+        let mut edge = route("*", "real");
+        edge.upstream_model = Some("m".repeat(128));
+        assert!(router("r", vec![edge]).validate().is_ok());
+    }
+
+    // ─── 路由 provider 解析 (#179 多规则化): resolve_route / would_cycle ──
+    //
+    // 契约: FWD-5 (per-request 解析 / 坏路由 503 / 环终止 / NoMatch).
+
+    /// 表: real → mock 上游; rt2 → real; rt1 → rt2 (两跳链).
     fn route_table() -> ProviderTable {
         let mut real = p("real", Protocol::OpenAI, "https://upstream");
         direct_mut(&mut real).api_key = "sk-real".into();
-        let v2 = v("v2", "real");
-        let v1 = v("v1", "v2");
+        let rt2 = router_to("rt2", "real");
+        let rt1 = router_to("rt1", "rt2");
         ProviderTable::new(
-            vec![real, v2, v1],
+            vec![real, rt2, rt1],
             vec![],
             empty_decisions(),
             tempfile_path(),
@@ -1198,24 +1514,25 @@ mod tests {
 
     #[test]
     fn resolve_route_real_provider_passthrough() {
-        // Direct provider 原样返回, 零额外跳.
+        // Direct provider 原样返回, 零额外跳; 无路由改写.
         let t = route_table();
         let real = t.get_effective("real").unwrap();
-        let out = t.resolve_route(real.clone()).unwrap();
+        let out = t.resolve_route(real.clone(), "any-model").unwrap();
         assert_eq!(out.id, "real");
         assert_eq!(out.provider.base_url, "https://upstream");
         assert_eq!(
             out.provider.api_key, "sk-real",
             "resolved provider carries real key"
         );
+        assert_eq!(out.model_rewrite, None, "no route rewrite on direct entry");
     }
 
     #[test]
     fn resolve_route_follows_chain_to_real_provider() {
-        // v1 → v2 → real: 解析到链尾实体, 携带其实体字段 (base_url/api_key).
+        // rt1 → rt2 → real: 解析到链尾实体, 携带其实体字段 (base_url/api_key).
         let t = route_table();
-        let v1 = t.get_effective("v1").unwrap();
-        let out = t.resolve_route(v1).unwrap();
+        let rt1 = t.get_effective("rt1").unwrap();
+        let out = t.resolve_route(rt1, "gpt-4o").unwrap();
         assert_eq!(out.id, "real");
         assert_eq!(out.provider.base_url, "https://upstream");
         assert_eq!(out.provider.api_key, "sk-real");
@@ -1224,12 +1541,14 @@ mod tests {
     #[test]
     fn resolve_route_missing_target() {
         let t = ProviderTable::new(
-            vec![v("v", "ghost")],
+            vec![router_to("rt", "ghost")],
             vec![],
             empty_decisions(),
             tempfile_path(),
         );
-        let err = t.resolve_route(t.get_effective("v").unwrap()).unwrap_err();
+        let err = t
+            .resolve_route(t.get_effective("rt").unwrap(), "m")
+            .unwrap_err();
         assert_eq!(err, RouteError::Missing("ghost".into()));
         assert!(err.to_string().contains("ghost"), "msg names the id: {err}");
     }
@@ -1239,13 +1558,15 @@ mod tests {
         let mut real = p("real", Protocol::OpenAI, "https://u");
         real.enabled = false;
         let t = ProviderTable::new(
-            vec![real, v("v", "real")],
+            vec![real, router_to("rt", "real")],
             vec![],
             empty_decisions(),
             tempfile_path(),
         );
         // 入口 provider 自身 disabled 在 dispatch 层已挡 (503); 这里测链上中间跳.
-        let err = t.resolve_route(t.get_effective("v").unwrap()).unwrap_err();
+        let err = t
+            .resolve_route(t.get_effective("rt").unwrap(), "m")
+            .unwrap_err();
         assert_eq!(err, RouteError::Disabled("real".into()));
     }
 
@@ -1253,47 +1574,249 @@ mod tests {
     fn resolve_route_detects_cycles() {
         // 双节点环 (绕过 validate 直接构造 — 模拟手改 state.toml 的运行时兜底场景).
         let t = ProviderTable::new(
-            vec![v("a", "b"), v("b", "a")],
+            vec![router_to("a", "b"), router_to("b", "a")],
             vec![],
             empty_decisions(),
             tempfile_path(),
         );
-        let err = t.resolve_route(t.get_effective("a").unwrap()).unwrap_err();
+        let err = t
+            .resolve_route(t.get_effective("a").unwrap(), "m")
+            .unwrap_err();
         assert_eq!(err, RouteError::Cycle("a".into()));
 
         // 自环 (单节点).
         let t2 = ProviderTable::new(
-            vec![v("s", "s")],
+            vec![router_to("s", "s")],
             vec![],
             empty_decisions(),
             tempfile_path(),
         );
         assert!(matches!(
-            t2.resolve_route(t2.get_effective("s").unwrap()),
+            t2.resolve_route(t2.get_effective("s").unwrap(), "m"),
             Err(RouteError::Cycle(_))
         ));
     }
 
     #[test]
-    fn would_cycle_rejects_indirect_cycle() {
-        // 已有 a → b; upsert b.route_to = a 形成环 → 必须拒绝.
+    fn resolve_route_no_matching_route() {
+        // 启用路由中无 model_pattern 匹配请求 model → NoMatch (id + model 名进 503 body).
         let t = ProviderTable::new(
             vec![
-                v("a", "b"),
-                v("b", "real"),
+                router("rt", vec![route("gpt-*", "real")]),
                 p("real", Protocol::OpenAI, "https://u"),
             ],
             vec![],
             empty_decisions(),
             tempfile_path(),
         );
-        let b_to_a = v("b", "a");
+        let err = t
+            .resolve_route(t.get_effective("rt").unwrap(), "claude-3")
+            .unwrap_err();
+        assert_eq!(
+            err,
+            RouteError::NoMatch {
+                id: "rt".into(),
+                model: "claude-3".into(),
+            }
+        );
+        assert!(err.to_string().contains("no route matching"), "msg: {err}");
+        assert!(err.to_string().contains("rt") && err.to_string().contains("claude-3"));
+
+        // 全禁用路由同样 NoMatch (禁用 = 不存在).
+        let mut all_off = route("*", "real");
+        all_off.priority = None;
+        let t2 = ProviderTable::new(
+            vec![router("rt", vec![all_off])],
+            vec![],
+            empty_decisions(),
+            tempfile_path(),
+        );
+        assert!(matches!(
+            t2.resolve_route(t2.get_effective("rt").unwrap(), "m"),
+            Err(RouteError::NoMatch { .. })
+        ));
+    }
+
+    /// m2: NoMatch 回显的 model 在**构造处**截断 (超长 model 名不进 503 body
+    /// / WARN 日志, 防洪水). 边界: 恰 64 chars 原样, 65 起截断 + `…` 后缀.
+    #[test]
+    fn resolve_route_no_match_model_truncated_for_echo() {
+        // helper 边界 (64 原样 / 65 = 64 chars + 省略号).
+        assert_eq!(
+            truncate_model_for_echo(&"m".repeat(64)),
+            "m".repeat(64),
+            "exactly at limit: no truncation"
+        );
+        let got = truncate_model_for_echo(&"m".repeat(100));
+        assert_eq!(got.chars().count(), NOMATCH_MODEL_ECHO_LIMIT + 1);
+        assert!(got.starts_with(&"m".repeat(NOMATCH_MODEL_ECHO_LIMIT)));
+        assert!(got.ends_with('…'));
+
+        // 全链锁定: resolve_route 产出的 NoMatch 值已截断 (Display/503 同源).
+        let t = ProviderTable::new(
+            vec![
+                router("rt", vec![route("gpt-*", "real")]),
+                p("real", Protocol::OpenAI, "https://u"),
+            ],
+            vec![],
+            empty_decisions(),
+            tempfile_path(),
+        );
+        let err = t
+            .resolve_route(t.get_effective("rt").unwrap(), &"x".repeat(100))
+            .unwrap_err();
+        match err {
+            RouteError::NoMatch { model, .. } => {
+                assert_eq!(model.chars().count(), NOMATCH_MODEL_ECHO_LIMIT + 1);
+                assert!(model.ends_with('…'));
+            }
+            other => panic!("expected NoMatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_route_routes_by_request_model() {
+        // 多路由按请求 model 分流: gpt-* → real1, 其余 → real2.
+        let t = ProviderTable::new(
+            vec![
+                router("rt", vec![route("gpt-*", "real1"), route("*", "real2")]),
+                p("real1", Protocol::OpenAI, "https://u1"),
+                p("real2", Protocol::OpenAI, "https://u2"),
+            ],
+            vec![],
+            empty_decisions(),
+            tempfile_path(),
+        );
+        let entry = t.get_effective("rt").unwrap();
+        assert_eq!(
+            t.resolve_route(entry.clone(), "gpt-4o").unwrap().id,
+            "real1"
+        );
+        assert_eq!(
+            t.resolve_route(entry.clone(), "claude-3").unwrap().id,
+            "real2"
+        );
+        // 空 model (非 JSON / 无 model 字段请求): 只匹配 "*".
+        assert_eq!(t.resolve_route(entry, "").unwrap().id, "real2");
+    }
+
+    #[test]
+    fn resolve_route_model_rewrite_pipeline_feeds_next_hop() {
+        // pipeline 语义锁定: rt1 路由改写 model=claude-3 后, rt2 必须按**改写后**
+        // 的 model 匹配 (而非请求原 model gpt-4o) — rt2 只有 claude-* 路由能到达
+        // real, "错误" 路由 (匹配 gpt-*) 指向不存在目标.
+        let t = ProviderTable::new(
+            vec![
+                router(
+                    "rt1",
+                    vec![Route {
+                        model_pattern: "gpt-*".into(),
+                        target: "rt2".into(),
+                        upstream_model: Some("claude-3".into()),
+                        priority: Some(0),
+                    }],
+                ),
+                router(
+                    "rt2",
+                    vec![route("claude-*", "real"), route("gpt-*", "wrong-ghost")],
+                ),
+                p("real", Protocol::OpenAI, "https://u"),
+            ],
+            vec![],
+            empty_decisions(),
+            tempfile_path(),
+        );
+        let out = t
+            .resolve_route(t.get_effective("rt1").unwrap(), "gpt-4o")
+            .unwrap();
+        assert_eq!(out.id, "real", "rt2 matched rewritten model");
+        assert_eq!(out.model_rewrite.as_deref(), Some("claude-3"));
+
+        // 对照: 直入 rt2 (无改写) — 请求 model 自行匹配, 无 override.
+        let out2 = t
+            .resolve_route(t.get_effective("rt2").unwrap(), "claude-3")
+            .unwrap();
+        assert_eq!(out2.id, "real");
+        assert_eq!(out2.model_rewrite, None);
+    }
+
+    #[test]
+    fn resolve_route_later_rewrite_overrides_earlier() {
+        // 多跳改写: 后者覆盖前者 (pipeline, 非 first-wins).
+        let t = ProviderTable::new(
+            vec![
+                router(
+                    "rt1",
+                    vec![Route {
+                        model_pattern: "*".into(),
+                        target: "rt2".into(),
+                        upstream_model: Some("model-a".into()),
+                        priority: Some(0),
+                    }],
+                ),
+                router(
+                    "rt2",
+                    vec![Route {
+                        model_pattern: "*".into(),
+                        target: "real".into(),
+                        upstream_model: Some("model-b".into()),
+                        priority: Some(0),
+                    }],
+                ),
+                p("real", Protocol::OpenAI, "https://u"),
+            ],
+            vec![],
+            empty_decisions(),
+            tempfile_path(),
+        );
+        let out = t
+            .resolve_route(t.get_effective("rt1").unwrap(), "gpt-4o")
+            .unwrap();
+        assert_eq!(out.id, "real");
+        assert_eq!(out.model_rewrite.as_deref(), Some("model-b"));
+    }
+
+    #[test]
+    fn resolve_route_without_upstream_model_passes_through() {
+        // 路由无 upstream_model → 透传; 下游 router 按请求原 model 匹配.
+        let t = ProviderTable::new(
+            vec![
+                router("rt1", vec![route("*", "rt2")]),
+                router("rt2", vec![route("gpt-*", "real1"), route("*", "real2")]),
+                p("real1", Protocol::OpenAI, "https://u1"),
+                p("real2", Protocol::OpenAI, "https://u2"),
+            ],
+            vec![],
+            empty_decisions(),
+            tempfile_path(),
+        );
+        let out = t
+            .resolve_route(t.get_effective("rt1").unwrap(), "gpt-4o")
+            .unwrap();
+        assert_eq!(out.id, "real1", "no rewrite: next hop sees original model");
+        assert_eq!(out.model_rewrite, None);
+    }
+
+    #[test]
+    fn would_cycle_rejects_indirect_cycle() {
+        // 已有 a → b; upsert b 的路由指向 a 形成环 → 必须拒绝.
+        let t = ProviderTable::new(
+            vec![
+                router_to("a", "b"),
+                router_to("b", "real"),
+                p("real", Protocol::OpenAI, "https://u"),
+            ],
+            vec![],
+            empty_decisions(),
+            tempfile_path(),
+        );
+        let b_to_a = router_to("b", "a");
         assert!(t.would_cycle(&b_to_a), "b→a closes the a→b cycle");
         // b → real (现状) 与 b → 悬空 都不成环.
-        assert!(!t.would_cycle(&v("b", "real")));
-        assert!(!t.would_cycle(&v("b", "ghost")));
+        assert!(!t.would_cycle(&router_to("b", "real")));
+        assert!(!t.would_cycle(&router_to("b", "ghost")));
         // 自环.
-        assert!(t.would_cycle(&v("b", "b")));
+        assert!(t.would_cycle(&router_to("b", "b")));
     }
 
     #[test]
@@ -1302,35 +1825,67 @@ mod tests {
         // (walk 必须用新 entry 值覆盖旧值, 而非读到旧 a 的 Direct 构造而漏判).
         let t = ProviderTable::new(
             vec![
-                v("a", "real"),
-                v("b", "a"),
+                router_to("a", "real"),
+                router_to("b", "a"),
                 p("real", Protocol::OpenAI, "https://u"),
             ],
             vec![],
             empty_decisions(),
             tempfile_path(),
         );
-        let a_to_b = v("a", "b");
+        let a_to_b = router_to("a", "b");
         assert!(t.would_cycle(&a_to_b), "a→b closes the existing b→a cycle");
     }
 
     #[test]
-    fn validate_virtual_provider_semantics() {
-        // 虚拟: 允许空 base_url; 目标 id 必须合法; 自环拒绝.
-        assert!(v("v", "real").validate().is_ok());
-        let bad_target = v("v", "has space");
-        assert!(bad_target.validate().is_err());
-        let self_loop = v("v", "v");
-        let err = self_loop.validate().unwrap_err();
-        assert!(err.contains("routes to itself"), "got: {err}");
-        // 实体: 空 base_url 仍然拒绝 (现有行为不变).
-        let real = p("r", Protocol::OpenAI, "");
-        assert!(real.validate().is_err());
+    fn would_cycle_checks_every_enabled_route_branch() {
+        // 多路由: b 的两条启用路由中一条回到 a → 环 (只走单链会漏判).
+        let t = ProviderTable::new(
+            vec![
+                router_to("a", "b"),
+                p("real", Protocol::OpenAI, "https://u"),
+            ],
+            vec![],
+            empty_decisions(),
+            tempfile_path(),
+        );
+        let b_multi = router("b", vec![route("*", "real"), route("claude-*", "a")]);
+        assert!(
+            t.would_cycle(&b_multi),
+            "any enabled branch closing a cycle counts"
+        );
+
+        // 同形状但回边禁用 (priority None) → 不构成环 (禁用路由不可遍历).
+        let mut disabled_back = route("claude-*", "a");
+        disabled_back.priority = None;
+        let b_disabled = router("b", vec![route("*", "real"), disabled_back]);
+        assert!(!t.would_cycle(&b_disabled), "disabled route is not an edge");
     }
 
     #[test]
-    fn toml_route_to_roundtrip_and_default() {
-        // Direct 条目 (kind tag + 必填字段); Virtual 条目 (protocol 可选).
+    fn would_cycle_diamond_convergence_is_not_a_cycle() {
+        // 汇聚型 DAG (两条路径到同一节点) 不是环 — 检测用递归 path 而非全局 visited.
+        let t = ProviderTable::new(
+            vec![
+                router("entry", vec![route("a*", "mid1"), route("b*", "mid2")]),
+                router_to("mid1", "tail"),
+                router_to("mid2", "tail"),
+                p("tail", Protocol::OpenAI, "https://u"),
+            ],
+            vec![],
+            empty_decisions(),
+            tempfile_path(),
+        );
+        let entry = router("entry", vec![route("a*", "mid1"), route("b*", "mid2")]);
+        assert!(
+            !t.would_cycle(&entry),
+            "converging DAG branches are not a cycle"
+        );
+    }
+
+    #[test]
+    fn toml_router_routes_roundtrip_and_default() {
+        // Direct 条目 (kind tag + 必填字段).
         let direct = r#"
             id = "test"
             kind = "direct"
@@ -1340,17 +1895,37 @@ mod tests {
         let p: Provider = toml::from_str(direct).expect("direct parse");
         assert!(matches!(p.kind, ProviderKind::Direct(_)));
 
-        let virtual_toml = r#"
-            id = "my-virtual"
-            kind = "virtual"
-            route_to = "openai-main"
+        // Router 条目: routes 数组; 构造**无 protocol 字段** (ingress per-request
+        // URL / egress per-route 链尾决定, 见 RouterProvider 注释). route 的
+        // upstream_model/priority 可省略.
+        let router_toml = r#"
+            id = "my-router"
+            kind = "router"
+
+            [[routes]]
+            model_pattern = "gpt-*"
+            target = "openai-main"
+
+            [[routes]]
+            model_pattern = "*"
+            target = "fallback"
+            upstream_model = "gpt-4o"
+            priority = 100
         "#;
-        let p: Provider = toml::from_str(virtual_toml).expect("virtual parse");
-        let ProviderKind::Virtual(v) = &p.kind else {
-            panic!("kind tag must parse as Virtual");
+        let p: Provider = toml::from_str(router_toml).expect("router parse");
+        let ProviderKind::Router(r) = &p.kind else {
+            panic!("kind tag must parse as Router");
         };
-        assert_eq!(v.route_to, "openai-main");
-        assert_eq!(v.protocol, None, "protocol is optional for virtual");
+        assert_eq!(r.routes.len(), 2);
+        assert_eq!(r.routes[0].model_pattern, "gpt-*");
+        assert_eq!(r.routes[0].target, "openai-main");
+        assert_eq!(
+            r.routes[0].upstream_model, None,
+            "upstream_model omitted → None (透传)"
+        );
+        assert_eq!(r.routes[0].priority, None, "priority omitted → disabled");
+        assert_eq!(r.routes[1].upstream_model.as_deref(), Some("gpt-4o"));
+        assert_eq!(r.routes[1].priority, Some(100));
         assert!(p.validate().is_ok());
 
         // 缺 kind → fail-fast (sum type 无缺省构造, 不猜测).
@@ -1363,17 +1938,39 @@ mod tests {
             toml::from_str::<Provider>(untagged).is_err(),
             "missing kind tag must fail fast"
         );
+
+        // 旧配置残留 protocol (字段删除前的必填字段) → serde 静默忽略,
+        // 不拒绝加载 (audit 也不告警: protocol 仍是 Direct 构造的合法字段,
+        // KNOWN_FIELDS 按 section 平铺无法区分构造).
+        let stray_proto = r#"
+            id = "r"
+            kind = "router"
+            protocol = "openai"
+
+            [[routes]]
+            model_pattern = "*"
+            target = "x"
+        "#;
+        let p: Provider = toml::from_str(stray_proto).expect("stray protocol ignored");
+        let ProviderKind::Router(r) = &p.kind else {
+            panic!("must stay Router");
+        };
+        assert_eq!(r.routes.len(), 1);
+        assert!(p.validate().is_ok());
     }
 
     #[test]
-    fn direct_override_replaces_static_virtual() {
-        // #187 根治: static 虚拟 + Direct override = **改回实体** — 跨型不继承,
-        // route_to 无 None 歧义 (#179 时代的 "无法改回实体" 限制由类型系统消灭).
+    fn direct_override_replaces_static_router() {
+        // #187 根治: static 路由 + Direct override = **改回实体** — 跨型不继承,
+        // routes 无 None 歧义 (#179 时代的 "无法改回实体" 限制由类型系统消灭).
         let tmp = tempfile_path();
         let mut d = p("x", Protocol::OpenAI, "https://d");
         direct_mut(&mut d).api_key = "sk-dyn".into();
         let t = ProviderTable::new(
-            vec![v("x", "real"), p("real", Protocol::OpenAI, "https://u")],
+            vec![
+                router_to("x", "real"),
+                p("real", Protocol::OpenAI, "https://u"),
+            ],
             vec![d],
             empty_decisions(),
             tmp,
@@ -1381,30 +1978,30 @@ mod tests {
         let eff = t.get_effective("x").unwrap();
         assert!(matches!(eff.kind, ProviderKind::Direct(_)));
         // 路由解析直达自身 (实体快路径), 携带 override 的鉴权字段.
-        let r = t.resolve_route(eff).unwrap();
+        let r = t.resolve_route(eff, "m").unwrap();
         assert_eq!(r.id, "x");
         assert_eq!(r.provider.base_url, "https://d");
         assert_eq!(r.provider.api_key, "sk-dyn");
     }
 
     #[test]
-    fn static_direct_key_survives_virtual_excursion() {
-        // 互补链 (#187): static Direct → Virtual override → 再 Direct override —
+    fn static_direct_key_survives_router_excursion() {
+        // 互补链 (#187): static Direct → Router override → 再 Direct override —
         // 第二次 override 的 api_key 未记录 → Direct↔Direct 继承从 static 复原.
         // (dynamic-only 条目无此复原来源, 是 AGENTS.md 登记的已知限制.)
         let tmp = tempfile_path();
         let mut s = p("x", Protocol::OpenAI, "https://s");
         direct_mut(&mut s).api_key = "sk-static".into();
-        // 第一步: Virtual override (切换为虚拟).
+        // 第一步: Router override (切换为路由).
         let t1 = ProviderTable::new(
             vec![s.clone(), p("real", Protocol::OpenAI, "https://u")],
-            vec![v("x", "real")],
+            vec![router_to("x", "real")],
             empty_decisions(),
             tempfile_path(),
         );
         assert!(matches!(
             t1.get_effective("x").unwrap().kind,
-            ProviderKind::Virtual(_)
+            ProviderKind::Router(_)
         ));
         // 第二步: 再切回 Direct override, api_key 未记录 (PUT null 语义).
         let mut back = p("x", Protocol::OpenAI, "https://d");
@@ -1418,16 +2015,16 @@ mod tests {
 
     #[test]
     fn prefer_static_decision_uses_static_route() {
-        // static 虚拟 (→ real1) + dynamic override (→ real2) + PreferStatic:
+        // static 路由 (→ real1) + dynamic override (→ real2) + PreferStatic:
         // 整条回 static, 路由随之 — decision 与 route 的组合不产生第三种语义.
         let tmp = tempfile_path();
         let t = ProviderTable::new(
             vec![
-                v("x", "real1"),
+                router_to("x", "real1"),
                 p("real1", Protocol::OpenAI, "https://u1"),
                 p("real2", Protocol::OpenAI, "https://u2"),
             ],
-            vec![v("x", "real2")],
+            vec![router_to("x", "real2")],
             empty_decisions(),
             tmp,
         );
@@ -1435,16 +2032,16 @@ mod tests {
         // Default: override 生效 → real2.
         assert!(matches!(
             &t.get_effective("x").unwrap().kind,
-            ProviderKind::Virtual(v) if v.route_to == "real2"
+            ProviderKind::Router(r) if r.routes[0].target == "real2"
         ));
         // PreferStatic: static 整条生效 → real1 (inherit 对 static 自身是 no-op).
         t.set_decision("x", OverrideMode::PreferStatic).unwrap();
         let eff = t.get_effective("x").unwrap();
         assert!(matches!(
             &eff.kind,
-            ProviderKind::Virtual(v) if v.route_to == "real1"
+            ProviderKind::Router(r) if r.routes[0].target == "real1"
         ));
-        assert_eq!(t.resolve_route(eff).unwrap().id, "real1");
+        assert_eq!(t.resolve_route(eff, "m").unwrap().id, "real1");
     }
 
     #[test]
@@ -1453,193 +2050,40 @@ mod tests {
         // "disabled by decision", 与 entry-level disabled 区分).
         let tmp = tempfile_path();
         let t = ProviderTable::new(
-            vec![v("v", "real"), p("real", Protocol::OpenAI, "https://u")],
+            vec![
+                router_to("rt", "real"),
+                p("real", Protocol::OpenAI, "https://u"),
+            ],
             vec![],
             empty_decisions(),
             tmp,
         );
         t.set_decision("real", OverrideMode::Disabled).unwrap();
-        let err = t.resolve_route(t.get_effective("v").unwrap()).unwrap_err();
+        let err = t
+            .resolve_route(t.get_effective("rt").unwrap(), "m")
+            .unwrap_err();
         assert_eq!(err, RouteError::Missing("real".into()));
         assert!(err.to_string().contains("disabled by decision"));
     }
 
-    // ─── model_override (#183, FWD-5 first-wins / FWD-1 修订) ──────────────
-
-    /// 表: entry(override=A) → mid(override=B) → real(override=C). 三层全配.
-    fn override_chain() -> ProviderTable {
-        let mut entry = v("entry", "mid");
-        entry.model_override = Some("model-A".into());
-        let mut mid = v("mid", "real");
-        mid.model_override = Some("model-B".into());
-        let mut real = p("real", Protocol::OpenAI, "https://u");
-        real.model_override = Some("model-C".into());
-        ProviderTable::new(
-            vec![entry, mid, real],
-            vec![],
-            empty_decisions(),
-            tempfile_path(),
-        )
-    }
-
-    #[test]
-    fn resolve_route_model_override_first_hop_wins() {
-        // FWD-5 prop_model_override_first_hop_wins: 沿链从入口起第一个非空值生效.
-        let t = override_chain();
-        // 三层全配 → 入口的 A 胜.
-        let r = t.resolve_route(t.get_effective("entry").unwrap()).unwrap();
-        assert_eq!(r.model_override.as_deref(), Some("model-A"));
-        assert_eq!(r.id, "real");
-
-        // 中间层直连 (跳过 entry) → B 胜.
-        let r = t.resolve_route(t.get_effective("mid").unwrap()).unwrap();
-        assert_eq!(r.model_override.as_deref(), Some("model-B"));
-
-        // 链尾直连 → C 胜 (实体级 "channel 强制模型" 用法).
-        let r = t.resolve_route(t.get_effective("real").unwrap()).unwrap();
-        assert_eq!(r.model_override.as_deref(), Some("model-C"));
-    }
-
-    #[test]
-    fn resolve_route_model_override_skips_unconfigured_hops() {
-        // 入口/中间跳均未配 → 链尾实体的 override 生效; 全链未配 → None (透传).
-        // 直接构造目标形状 (三层链, 仅链尾配 C)。
-        let mut entry = v("entry", "mid");
-        entry.model_override = None;
-        let mut mid = v("mid", "real");
-        mid.model_override = None;
-        let mut real = p("real", Protocol::OpenAI, "https://u");
-        real.model_override = Some("model-C".into());
-        let t = ProviderTable::new(
-            vec![entry, mid, real],
-            vec![],
-            empty_decisions(),
-            tempfile_path(),
-        );
-        let r = t.resolve_route(t.get_effective("entry").unwrap()).unwrap();
-        assert_eq!(r.model_override.as_deref(), Some("model-C"));
-        // 全链未配 → None (透传).
-        let none_table = ProviderTable::new(
-            vec![v("e", "r"), p("r", Protocol::OpenAI, "https://u")],
-            vec![],
-            empty_decisions(),
-            tempfile_path(),
-        );
-        let r = none_table
-            .resolve_route(none_table.get_effective("e").unwrap())
-            .unwrap();
-        assert_eq!(r.model_override, None);
-    }
-
-    #[test]
-    fn inherit_from_static_covers_model_override() {
-        // static 配了 override + override 未记录 → 继承 (三层读路径一致).
-        let tmp = tempfile_path();
-        let mut s = p("x", Protocol::OpenAI, "https://s");
-        s.model_override = Some("m-static".into());
-        let mut d = p("x", Protocol::OpenAI, "https://d");
-        d.model_override = None;
-        let t = ProviderTable::new(vec![s], vec![d], empty_decisions(), tmp);
-        assert_eq!(
-            t.get_effective("x").unwrap().model_override.as_deref(),
-            Some("m-static")
-        );
-        let x = t.effective_snapshot().into_iter().next().unwrap();
-        assert_eq!(x.model_override.as_deref(), Some("m-static"));
-    }
-
-    #[test]
-    fn validate_rejects_empty_model_override() {
-        let mut bad = p("x", Protocol::OpenAI, "https://u");
-        bad.model_override = Some(String::new());
-        let err = bad.validate().unwrap_err();
-        assert!(err.contains("empty model_override"), "got: {err}");
-        // 纯空白 / 超长同样拒绝 (输入卫生, 对齐 id/name 纪律).
-        let mut ws = p("x", Protocol::OpenAI, "https://u");
-        ws.model_override = Some("   ".into());
-        assert!(ws.validate().is_err());
-        let mut long = p("x", Protocol::OpenAI, "https://u");
-        long.model_override = Some("m".repeat(129));
-        assert!(long.validate().is_err());
-        // 省略 (None) / 非空均合法.
-        assert!(p("x", Protocol::OpenAI, "https://u").validate().is_ok());
-        let mut ok = p("y", Protocol::OpenAI, "https://u");
-        ok.model_override = Some("claude-sonnet-4".into());
-        assert!(ok.validate().is_ok());
-    }
-
-    #[test]
-    fn resolve_route_model_override_static_middle_hop_inherits() {
-        // L5: 继承 × first-wins 交互 — static 中间跳配了 override, dynamic override
-        // 未记录 → get_effective 展开后参与链上收集.
-        let tmp = tempfile_path();
-        let mut mid_static = v("mid", "real");
-        mid_static.model_override = Some("m-mid".into());
-        let t = ProviderTable::new(
-            vec![mid_static, p("real", Protocol::OpenAI, "https://u")],
-            vec![v("mid", "real")], // dynamic override 未记录 model_override
-            empty_decisions(),
-            tmp,
-        );
-        let mut entry = v("entry", "mid"); // 入口未配
-        entry.model_override = None;
-        let r = t.resolve_route(entry).unwrap();
-        // mid 的 effective override 从 static 继承 m-mid → 链上第一个非空.
-        assert_eq!(r.model_override.as_deref(), Some("m-mid"));
-    }
-
-    #[test]
-    fn toml_model_override_roundtrip_and_default() {
-        // 缺省 → None; 显式 → Some (两种构造均可配).
-        let direct = r#"
-            id = "test"
-            kind = "direct"
-            protocol = "openai"
-            base_url = "https://api.example.com"
-        "#;
-        let p: Provider = toml::from_str(direct).expect("direct parse");
-        assert!(p.model_override.is_none());
-
-        let with_override = r#"
-            id = "my-model"
-            kind = "virtual"
-            route_to = "openai-main"
-            model_override = "gpt-4o-mini"
-        "#;
-        let p: Provider = toml::from_str(with_override).expect("parse");
-        assert_eq!(p.model_override.as_deref(), Some("gpt-4o-mini"));
-        assert!(p.validate().is_ok());
-
-        // 空串在 static 加载即 fail-fast (validate 拒绝).
-        let empty_str = r#"
-            id = "bad"
-            kind = "direct"
-            protocol = "openai"
-            base_url = "https://u"
-            model_override = ""
-        "#;
-        let p: Provider = toml::from_str(empty_str).expect("parse");
-        assert!(p.validate().is_err());
-    }
-
-    // FWD-5 环终止 property: 任意 route 图 (含环), `resolve_route` 有限步返回
+    // FWD-5 环终止 property: 任意路由图 (含环), `resolve_route` 有限步返回
     // (Ok ⇒ 链尾必为 Direct 构造 — 类型保证, 见 contracts.md FWD-5; Err ⇒ 明确错误类别).
     // 历史教训 (生成器覆盖度): 图必须包含环与悬空, 否则 property 退化为恒真.
-    // 生成器: p{i} 的 route_to 由 edges.get(i) 决定 — 无边 → 实体, 目标 < n →
+    // 生成器: p{i} 的路由目标由 edges.get(i) 决定 — 无边 → 实体, 目标 < n →
     // 指向表内 (可成环/自环), 目标 ≥ n → 悬空 (ghost).
-    proptest::proptest! {
+    proptest! {
         #[test]
         fn prop_resolve_route_terminates_on_random_graphs(
             n in 2usize..8,
             edges in proptest::collection::vec(0usize..8, 0..16),
         ) {
-            // n 个 provider: id = p0..p{n-1}; edges[i] 决定 p{i % n} 的 route_to
+            // n 个 provider: id = p0..p{n-1}; edges[i] 决定 p{i % n} 的路由目标
             // (目标均匀取 0..8 → 覆盖存在/缺失/自环/成环).
             let ids: Vec<String> = (0..n).map(|i| format!("p{i}")).collect();
             let entries: Vec<Provider> = (0..n)
                 .map(|i| match edges.get(i) {
-                    Some(&t) if t < n => v(&ids[i], &ids[t]),
-                    Some(&t) => v(&ids[i], &format!("ghost-{t}")), // 悬空
+                    Some(&t) if t < n => router_to(&ids[i], &ids[t]),
+                    Some(&t) => router_to(&ids[i], &format!("ghost-{t}")), // 悬空
                     None => p(&ids[i], Protocol::OpenAI, "https://u"), // 实体
                 })
                 .collect();
@@ -1648,7 +2092,7 @@ mod tests {
                 if let Some(entry) = t.get_effective(id) {
                     // Err 分支 = 有限步返回明确错误 (同样满足终止性), 无需断言.
                     // Ok ⇒ 链尾必为 Direct (类型保证, 无需运行时断言); 有限步返回即满足终止性.
-                    let _ = t.resolve_route(entry);
+                    let _ = t.resolve_route(entry, "gpt-4o");
                 }
             }
         }

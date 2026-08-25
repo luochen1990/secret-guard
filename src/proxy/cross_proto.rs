@@ -49,7 +49,7 @@ pub(crate) async fn cross_proto_forward(
     ingress: Protocol,
     provider: DirectProvider,
     upstream_id: &str,
-    model_override: Option<String>,
+    model_rewrite: Option<String>,
     started: Instant,
     secrets_snapshot: Vec<crate::secrets::SecretEntry>,
 ) -> Result<Response<Body>, AppError> {
@@ -78,7 +78,7 @@ pub(crate) async fn cross_proto_forward(
         &req_bytes,
         ingress,
         ingress_reader.as_ref(),
-        model_override.as_deref(),
+        model_rewrite.as_deref(),
     )?;
 
     // 4. MVP 限制: 跨协议时不支持流式 (StreamTranslate 尚未接入 dispatch).
@@ -178,7 +178,7 @@ pub(crate) async fn cross_proto_forward(
         Some(&ir),
         Some(ingress_codec),
         upstream_id,
-        model_override.as_deref(),
+        model_rewrite.as_deref(),
         redact_seed,
         Some(&secrets_snapshot),
         redactions,

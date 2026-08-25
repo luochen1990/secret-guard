@@ -27,12 +27,12 @@ pub struct ForwardRecord {
     pub created_at: DateTime<Utc>,
     pub method: String,
     pub path: String,
-    /// 实际承载转发的 provider id (route_to 解析后的链尾实体, #179).
-    /// 非虚拟请求时即 URL 中的 provider id.
+    /// 实际承载转发的 provider id (路由解析后的链尾实体, #179).
+    /// 非路由请求时即 URL 中的 provider id.
     /// serde default: 兼容旧序列化产物 (历史 JSON 无此字段).
     #[serde(default)]
     pub upstream_id: String,
-    /// 实际改写的 model 值 (仅 model_override 生效时 Some, #183).
+    /// 实际改写的 model 值 (仅路由规则改写生效时 Some, #183).
     /// serde default: 兼容旧序列化产物.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_model: Option<String>,
