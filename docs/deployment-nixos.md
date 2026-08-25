@@ -19,6 +19,7 @@ systemd.services.secret-guard.serviceConfig.LoadCredential = [
 services.secret-guard.configFile = (pkgs.writeText "secret-guard.toml" ''
   [[providers]]
   id = "zai-coding-plan"
+  kind = "direct"
   protocol = "openai"
   base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
   api_key_file = "/run/credentials/secret-guard.service/zai_key"
@@ -37,6 +38,7 @@ sops.secrets."zai_api_key" = { owner = "secret-guard"; };
 services.secret-guard.configFile = (pkgs.writeText "secret-guard.toml" ''
   [[providers]]
   id = "zai-coding-plan"
+  kind = "direct"
   protocol = "openai"
   base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
   api_key_file = "${config.sops.secrets."zai_api_key".path}"

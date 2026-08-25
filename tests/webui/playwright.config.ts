@@ -92,6 +92,7 @@ fs.writeFileSync(
   SG_CONFIG,
   `[[providers]]
 id = "mock-openai"
+kind = "direct"
 protocol = "openai"
 base_url = "http://127.0.0.1:${MOCK_PORT}"
 enabled = true

@@ -321,12 +321,15 @@ const KNOWN_FIELDS: &[(&str, &[&str])] = &[
         "providers",
         &[
             "id",
+            "enabled",
+            "name",
+            "model_override",
+            "kind", // #187 sum type tag (internally tagged; variant 字段平铺)
             "protocol",
             "base_url",
             "api_key",
             "api_key_file",
-            "enabled",
-            "name",
+            "route_to",
         ],
     ),
     // Config::secrets (SecretsConfig) — 表级仅 entries 一个键
@@ -1397,6 +1400,7 @@ mod audit_tests {
         let text = r#"
 [[providers]]
 id = "m"
+kind = "direct"
 protocol = "openai"
 base_url = "http://127.0.0.1:29804"
 
@@ -1414,6 +1418,7 @@ value = "abc"
         let text = r#"
 [[providers]]
 id = "m"
+kind = "direct"
 protocol = "openai"
 base_url = "http://127.0.0.1:29804"
 totally_unknown_field = "oops"
@@ -1746,6 +1751,7 @@ on_probe_exhausted = "fail_closed"
             r#"
             [[providers]]
             id = "bad"
+            kind = "direct"
             protocol = "openai"
             base_url = "https://api.example.com"
             api_key = "sk-direct"
@@ -1768,6 +1774,7 @@ on_probe_exhausted = "fail_closed"
             r#"
             [[providers]]
             id = "ok"
+            kind = "direct"
             protocol = "openai"
             base_url = "https://api.example.com"
             api_key_file = "/run/secrets/ok-key"
@@ -1785,6 +1792,7 @@ on_probe_exhausted = "fail_closed"
             r#"
             [[providers]]
             id = "bad"
+            kind = "direct"
             protocol = "openai"
             base_url = "https://api.example.com"
             api_key = "sk-direct"
@@ -1921,6 +1929,18 @@ on_probe_exhausted = "fail_closed"
                 api_key_file: None,
             }),
         });
+        // #187 sum type 持久化守卫: Virtual (flatten + internally tagged) 的
+        // 写出→读回 round-trip — 两种构造的 kind 必须无损存活.
+        state.providers.push(Provider {
+            id: "p2".into(),
+            enabled: true,
+            name: None,
+            model_override: None,
+            kind: crate::provider::ProviderKind::Virtual(crate::provider::VirtualProvider {
+                route_to: "p1".into(),
+                protocol: None,
+            }),
+        });
         state
             .decisions
             .set_provider("static-p", OverrideMode::Disabled);
@@ -1930,8 +1950,18 @@ on_probe_exhausted = "fail_closed"
 
         let text = state.to_toml().unwrap();
         let parsed: DynamicState = toml::from_str(&text).unwrap();
-        assert_eq!(parsed.providers.len(), 1);
+        let kinds: Vec<&str> = parsed
+            .providers
+            .iter()
+            .map(|p| match &p.kind {
+                crate::provider::ProviderKind::Direct(_) => "direct",
+                crate::provider::ProviderKind::Virtual(_) => "virtual",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["direct", "virtual"], "round-trip text:\n{text}");
+        assert_eq!(parsed.providers.len(), 2);
         assert_eq!(parsed.providers[0].id, "p1");
+        assert_eq!(parsed.providers[1].id, "p2");
         assert_eq!(
             parsed.decisions.provider("static-p"),
             OverrideMode::Disabled

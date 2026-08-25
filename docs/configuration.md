@@ -21,6 +21,7 @@ secret-guard 通过一个 TOML 文件启动 (默认 `secret-guard.toml`, 可用 
 ```toml
 [[providers]]
 id = "openai-main"
+kind = "direct"
 protocol = "openai"
 base_url = "https://api.openai.com"
 api_key = "sk-your-upstream-key"
@@ -56,28 +57,31 @@ value = "ghp_0123456789abcdefghijklmnopqrstuvwxyz"
 ## `[[providers]]` — 上游 LLM 端点 (平铺数组)
 
 每个 provider 是**两种构造之一** (#187 sum type): **直连** (Direct, 真实上游端点) 或
-**虚拟** (Virtual, 可切换指向的路由端点)。TOML 是平铺格式, 判别规则 = **`route_to`
-非空即虚拟** (两种构造的字段互不掺和; 虚拟条目写了 base_url/api_key 会被忽略)。
+**虚拟** (Virtual, 可切换指向的路由端点)。由 **`kind` 字段判别** (`"direct"` /
+`"virtual"`, 必填 — 缺失时启动 fail-fast), 对应构造的字段写在同一个 `[[providers]]`
+表内。构造不匹配的字段会被**静默忽略** (serde flatten 无法拒绝未知字段): Virtual 条目
+写 base_url/api_key、Direct 条目写 route_to 均不生效 — 请勿依赖, 配置以 `kind` 为准。
 
 **共享字段** (两种构造均可配):
 
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `id` | string | (必填) | 唯一标识. 1..=64 字符, 以字母/数字开头, 只允许字母数字、`_`、`-`. 出现在转发 URL 中 (`/o/<id>/...`). |
+| `kind` | string | (必填) | 构造判别: `"direct"` (直连) 或 `"virtual"` (虚拟路由). |
 | `model_override` | string | — | **出站 model 强制重写**: 经此 provider (直接或作为路由链一跳) 转发的请求 body 顶层 `model` 字段被无条件替换为该值, 客户端请求的模型名被丢弃. 链上 **first-wins** (入口起第一个非空值生效). 代价: override 生效时该 provider 的无-secret 请求从字节直传降级为 IR 改写 (语义等价, 上游前缀缓存失效). Gemini/Ollama 无 codec 无法改写: WARN + 原样透传. 空串非法 (清空请省略字段 / WebUI 留空). |
 | `enabled` | bool | `true` | `false` 时转发到该 provider 返回 503. |
 | `name` | string | — | 可选的人类可读名称 (仅 WebUI 显示). |
 
-**Direct 构造** (直连上游, 无 `route_to` 字段):
+**Direct 构造** (`kind = "direct"`):
 
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
-| `protocol` | string | (必填) | 上游协议: `openai` / `anthropic` / `gemini` / `ollama` / `openairesponses` (OpenAI Responses API). 缺失时启动报错 (fail-fast). |
+| `protocol` | string | (必填) | 上游协议: `openai` / `anthropic` / `gemini` / `ollama` / `openairesponses` (OpenAI Responses API). |
 | `base_url` | string | (必填) | 上游 base URL. 必须以 `http://` 或 `https://` 开头, **末尾不带 `/`** (路径由 secret-guard 拼接). 如 `https://api.openai.com`. |
 | `api_key` | string | `""` | 上游 API key 明文. 与 `api_key_file` 互斥 (同时设置启动报错). |
 | `api_key_file` | path | — | 从文件读 API key (适合 sops-nix / systemd LoadCredential 等外部注入, 让 toml 本身不含敏感数据). 每次请求时读取, 读不到按空 key 处理并打 WARN. 文件内容自动去首尾空白. |
 
-**Virtual 构造** (虚拟 endpoint, `route_to` 非空):
+**Virtual 构造** (`kind = "virtual"`):
 
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
@@ -87,6 +91,7 @@ value = "ghp_0123456789abcdefghijklmnopqrstuvwxyz"
 ```toml
 [[providers]]
 id = "anthropic-main"
+kind = "direct"
 protocol = "anthropic"
 base_url = "https://api.anthropic.com"
 api_key_file = "/run/credentials/anthropic.key"   # 与 api_key 二选一
@@ -100,14 +105,16 @@ api_key_file = "/run/credentials/anthropic.key"   # 与 api_key 二选一
 ```toml
 [[providers]]
 id = "openai-main"
+kind = "direct"
 protocol = "openai"
 base_url = "https://api.openai.com"
 api_key = "sk-..."
 
 [[providers]]
 id = "my-model"
-protocol = "openai"     # 仅作 WebUI 展示; ingress 由 URL 决定, egress 由目标决定
+kind = "virtual"
 route_to = "openai-main"
+# protocol 可选, 仅作 WebUI 展示; ingress 由 URL 决定, egress 由目标决定
 ```
 
 语义要点:
@@ -213,6 +220,7 @@ key = "sg_ci_abc123..."
 
 | 症状 | 原因与解法 |
 |---|---|
+| ``TOML parse error ... [[providers]] missing field `kind``` | provider 条目缺少构造判别字段 (#187 起必填): 补 `kind = "direct"` (直连上游) 或 `kind = "virtual"` (虚拟路由). 报错行号指向对应 `[[providers]]` 表头. |
 | `TOML parse error ... [[secrets]] invalid type: map, expected a sequence` | secret 必须写 `[[secrets.entries]]`, 不能写 `[[secrets]]`. 报错前会先输出一行 WARN `did you mean [[secrets.entries]]?` 指路. |
 | 启动 WARN `unknown field ... did you mean ...?` | 字段拼写错误. 可选字段拼错会被忽略不生效 (仅 WARN 提示), "以为配了实际没配", 须修正; 必填字段 (如 `protocol`) 拼错则 WARN 后再报 `missing field` 启动失败. |
 | `base_url must not end with '/'` | 去掉末尾 `/`, 路径由 secret-guard 拼接. |

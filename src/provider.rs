@@ -122,28 +122,46 @@ impl Protocol {
 ///
 /// 共享字段: `id` / `name` / `enabled` / `model_override` (两种构造都可配).
 ///
-/// serde 层经 `ProviderWire` (平铺 legacy 形态) 双向转换 — 磁盘 TOML / API
-/// payload 格式零变化 (有 `route_to` 即虚拟), 既有 secret-guard.toml / state.toml
-/// 直接兼容.
+/// serde: `kind` 字段为 internally tagged (`kind = "direct"/"virtual"`), variant
+/// 字段平铺在同一层 — 磁盘 TOML / state.toml / EffectiveProvider JSON 共用同一
+/// 形态 (SSOT):
+///
+/// ```toml
+/// [[providers]]
+/// id = "openai-main"
+/// kind = "direct"
+/// protocol = "openai"
+/// base_url = "https://api.openai.com"
+///
+/// [[providers]]
+/// id = "my-model"
+/// kind = "virtual"
+/// route_to = "openai-main"
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(try_from = "ProviderWire", into = "ProviderWire")]
 pub struct Provider {
     /// 唯一 id (slug). 同一份表 (static 或 dynamic) 中必须唯一.
     pub id: String,
     /// 是否启用. `false` 时转发到该 provider 返回 503.
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// 可选人类可读名称 (Web UI 显示).
+    #[serde(default)]
     pub name: Option<String>,
     /// 可选: 出站请求的 model 字段强制重写值 (#183). 两种构造均可配; 链上解析
     /// first-wins (见 `resolve_route`). 代价与限制的 SSOT: FWD-1 修订 + FWD-5
     /// `prop_model_override_*` (`docs/design/contracts.md`).
+    #[serde(default)]
     pub model_override: Option<String>,
-    /// 构造判别: 直连上游 or 虚拟路由.
+    /// 构造判别: 直连上游 or 虚拟路由 (`kind` tag).
+    #[serde(flatten)]
     pub kind: ProviderKind,
 }
 
-/// Provider 的两种构造 (#187 sum type).
+/// Provider 的两种构造 (#187 sum type). serde internally tagged: `kind` 字段
+/// 判别, variant 字段平铺 (见 [`Provider`] 文档的 TOML 示例).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProviderKind {
     /// 直连上游: 真实 LLM 端点, 承载转发.
     Direct(DirectProvider),
@@ -160,7 +178,8 @@ pub struct DirectProvider {
     pub base_url: String,
     /// API key 直接值. 明文存储在本地 config 文件中 (本地进程, 不通过网络暴露).
     /// 与 [`DirectProvider::api_key_file`] 互斥 — 同时设置会在 validate 中报错.
-    #[serde(default)]
+    /// skip 空串写出 (无 key 场景如 Ollama, 消 state.toml 噪音; 读回 default 等价).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub api_key: String,
     /// 可选: 从文件路径读取 api_key. 优先级低于 [`DirectProvider::api_key`].
     ///
@@ -182,111 +201,12 @@ pub struct DirectProvider {
 /// [`ProviderTable::would_cycle`] + FWD-5 契约 (`docs/design/contracts.md`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VirtualProvider {
-    /// 路由目标 (另一 provider 的 id). 非空 (wire 层已 filter 空串).
+    /// 路由目标 (另一 provider 的 id). 非空 (WebUI/API 层已 filter 空串).
     pub route_to: String,
     /// 协议: **仅 WebUI 展示** — ingress 由 URL proto_short 决定, egress 由链尾
-    /// 实体的 protocol 决定 (不同则自动走 cross_proto 翻译). sum 化后真正可选
-    /// (旧格式必有值, 读入保留).
+    /// 实体的 protocol 决定 (不同则自动走 cross_proto 翻译). 可选.
     #[serde(default)]
     pub protocol: Option<Protocol>,
-}
-
-/// Provider 的**平铺 wire 形态** (磁盘 TOML / 既有 API payload).
-///
-/// 判别规则: `route_to` 非空 → [`ProviderKind::Virtual`] (忽略 base_url/api_key,
-/// 兼容旧格式虚拟条目残留的实体字段); 否则 → [`ProviderKind::Direct`].
-///
-/// 这是 #187 重构的兼容层: 领域模型 sum 化, 序列化格式保持 #179/#183 之前的
-/// 平铺形态, 既有配置文件零破坏. 新代码不应直接使用本类型 (除 serde 边界).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct ProviderWire {
-    pub id: String,
-    /// Direct 必填 (缺失时 try_from 报错); Virtual 可选 (仅展示).
-    pub protocol: Option<Protocol>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub base_url: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub api_key: String,
-    #[serde(default)]
-    pub api_key_file: Option<std::path::PathBuf>,
-    #[serde(default)]
-    pub route_to: Option<String>,
-    #[serde(default)]
-    pub model_override: Option<String>,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default)]
-    pub name: Option<String>,
-}
-
-impl TryFrom<ProviderWire> for Provider {
-    type Error = String;
-
-    fn try_from(w: ProviderWire) -> Result<Self, Self::Error> {
-        let route_to = w.route_to.filter(|s| !s.is_empty());
-        let kind = match route_to {
-            Some(route_to) => ProviderKind::Virtual(VirtualProvider {
-                route_to,
-                protocol: w.protocol,
-            }),
-            None => {
-                let protocol = w.protocol.ok_or_else(|| {
-                    format!(
-                        "provider {}: protocol is required for direct providers",
-                        w.id
-                    )
-                })?;
-                ProviderKind::Direct(DirectProvider {
-                    protocol,
-                    base_url: w.base_url,
-                    api_key: w.api_key,
-                    api_key_file: w.api_key_file,
-                })
-            }
-        };
-        Ok(Provider {
-            id: w.id,
-            enabled: w.enabled,
-            name: w.name,
-            model_override: w.model_override,
-            kind,
-        })
-    }
-}
-
-impl From<Provider> for ProviderWire {
-    fn from(p: Provider) -> Self {
-        let (protocol, base_url, api_key, api_key_file, route_to) = match p.kind {
-            ProviderKind::Direct(d) => (
-                Some(d.protocol),
-                d.base_url,
-                d.api_key,
-                d.api_key_file,
-                None,
-            ),
-            ProviderKind::Virtual(v) => {
-                // 实体字段写空值: 虚拟条目在平铺格式下不携带实体配置.
-                (
-                    v.protocol,
-                    String::new(),
-                    String::new(),
-                    None,
-                    Some(v.route_to),
-                )
-            }
-        };
-        ProviderWire {
-            id: p.id,
-            protocol,
-            base_url,
-            api_key,
-            api_key_file,
-            route_to,
-            model_override: p.model_override,
-            enabled: p.enabled,
-            name: p.name,
-        }
-    }
 }
 
 /// serde `default` helper: 让 `enabled` 字段缺省为 `true`.
@@ -757,8 +677,7 @@ mod tests {
         }
     }
 
-    /// 虚拟 provider (route_to = target). protocol 默认 Some(OpenAI) 模拟旧格式
-    /// (平铺 wire 必有 protocol, 读入的 Virtual 总携带).
+    /// 虚拟 provider (route_to = target). protocol 携带 Some(OpenAI) (WebUI 展示值).
     fn v(id: &str, target: &str) -> Provider {
         Provider {
             kind: ProviderKind::Virtual(VirtualProvider {
@@ -837,6 +756,7 @@ mod tests {
     fn toml_deserializes_api_key_file_as_pathbuf() {
         let toml_text = r#"
             id = "test"
+            kind = "direct"
             protocol = "openai"
             base_url = "https://api.example.com"
             api_key_file = "/run/secrets/test-key"
@@ -854,10 +774,11 @@ mod tests {
     }
 
     #[test]
-    fn toml_deserializes_legacy_api_key_still_works() {
-        // 只有 api_key (无 api_key_file) 的老格式必须仍然能解析.
+    fn toml_direct_without_api_key_file_still_works() {
+        // 只有 api_key (无 api_key_file) 的条目必须仍然能解析.
         let toml_text = r#"
             id = "test"
+            kind = "direct"
             protocol = "openai"
             base_url = "https://api.example.com"
             api_key = "sk-legacy"
@@ -1409,27 +1330,39 @@ mod tests {
 
     #[test]
     fn toml_route_to_roundtrip_and_default() {
-        // 缺省字段 (既有配置) → None; 显式 route_to → Some.
-        let legacy = r#"
+        // Direct 条目 (kind tag + 必填字段); Virtual 条目 (protocol 可选).
+        let direct = r#"
             id = "test"
+            kind = "direct"
             protocol = "openai"
             base_url = "https://api.example.com"
         "#;
-        let p: Provider = toml::from_str(legacy).expect("legacy parse");
+        let p: Provider = toml::from_str(direct).expect("direct parse");
         assert!(matches!(p.kind, ProviderKind::Direct(_)));
 
         let virtual_toml = r#"
             id = "my-virtual"
-            protocol = "openai"
+            kind = "virtual"
             route_to = "openai-main"
         "#;
         let p: Provider = toml::from_str(virtual_toml).expect("virtual parse");
         let ProviderKind::Virtual(v) = &p.kind else {
-            panic!("route_to present must parse as Virtual");
+            panic!("kind tag must parse as Virtual");
         };
         assert_eq!(v.route_to, "openai-main");
-        assert_eq!(v.protocol, Some(Protocol::OpenAI));
+        assert_eq!(v.protocol, None, "protocol is optional for virtual");
         assert!(p.validate().is_ok());
+
+        // 缺 kind → fail-fast (sum type 无缺省构造, 不猜测).
+        let untagged = r#"
+            id = "test"
+            protocol = "openai"
+            base_url = "https://api.example.com"
+        "#;
+        assert!(
+            toml::from_str::<Provider>(untagged).is_err(),
+            "missing kind tag must fail fast"
+        );
     }
 
     #[test]
@@ -1657,18 +1590,19 @@ mod tests {
 
     #[test]
     fn toml_model_override_roundtrip_and_default() {
-        // 缺省 → None; 显式 → Some.
-        let legacy = r#"
+        // 缺省 → None; 显式 → Some (两种构造均可配).
+        let direct = r#"
             id = "test"
+            kind = "direct"
             protocol = "openai"
             base_url = "https://api.example.com"
         "#;
-        let p: Provider = toml::from_str(legacy).expect("legacy parse");
+        let p: Provider = toml::from_str(direct).expect("direct parse");
         assert!(p.model_override.is_none());
 
         let with_override = r#"
             id = "my-model"
-            protocol = "openai"
+            kind = "virtual"
             route_to = "openai-main"
             model_override = "gpt-4o-mini"
         "#;
@@ -1679,6 +1613,7 @@ mod tests {
         // 空串在 static 加载即 fail-fast (validate 拒绝).
         let empty_str = r#"
             id = "bad"
+            kind = "direct"
             protocol = "openai"
             base_url = "https://u"
             model_override = ""

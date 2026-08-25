@@ -106,7 +106,7 @@ fn keyed_provider(id: &str, base_url: &str, api_key: &str) -> Provider {
     p
 }
 
-/// #179: 虚拟 provider (route_to = target). protocol 携带 Some (模拟旧平铺格式读入).
+/// #179: 虚拟 provider (route_to = target). protocol 携带 Some (WebUI 展示值).
 fn virtual_provider(id: &str, target: &str) -> Provider {
     Provider {
         kind: ProviderKind::Virtual(secret_guard::provider::VirtualProvider {
