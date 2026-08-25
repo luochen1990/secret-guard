@@ -148,6 +148,20 @@ async function setupLongChatSelectRound(page: Page, marker: string, roundIdx: nu
 
 // ─── 测试用例 ────────────────────────────────────────────────────────────
 
+/**
+ * 挂 alert 自动 accept 处理器 (alert 阻塞页面 JS, 不处理会冻结), 并记录消息
+ * 供断言 "失败 alert 确实弹出" (证明 fetch 走了失败分支, 而非静默成功).
+ * #181/#190 两个表单相关 describe 共用.
+ */
+function autoAcceptAlerts(page: Page): string[] {
+  const alerts: string[] = [];
+  page.on("dialog", async (d) => {
+    alerts.push(d.message());
+    await d.accept();
+  });
+  return alerts;
+}
+
 test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
   test.beforeEach(async ({ page }) => {
     await page.goto("/");
@@ -2189,26 +2203,13 @@ test.describe("WebUI 表单失败保持 (#181)", () => {
     await page.waitForTimeout(500);
   });
 
-  /**
-   * 挂 alert 自动 accept 处理器 (alert 阻塞页面 JS, 不处理会冻结), 并记录消息
-   * 供断言 "失败 alert 确实弹出" (证明 fetch 走了失败分支, 而非静默成功).
-   */
-  function autoAcceptAlerts(page: Page): string[] {
-    const alerts: string[] = [];
-    page.on("dialog", async (d) => {
-      alerts.push(d.message());
-      await d.accept();
-    });
-    return alerts;
-  }
-
   test("#181: provider 表单 409 冲突时对话框保持打开 + 字段保留", async ({ page }) => {
     await page.locator('a.tab[data-tab="providers"]').click();
     // 等表格渲染 (refreshProviders 完成 → state.providerProtocols 已填充,
     // 否则 protocol 下拉为空, selectOption 会失败).
     await expect(page.locator("#providers-body tr").first()).toBeVisible();
 
-    await page.locator("button", { hasText: "+ new dynamic provider" }).click();
+    await page.locator("button", { hasText: "+ new provider" }).click();
     const dlg = page.locator("#provider-form");
     await expect(dlg).toBeVisible();
     // 已存在的 static id (playwright.config.ts 预置) → POST 409.
@@ -2281,7 +2282,7 @@ test.describe("WebUI 表单失败保持 (#181)", () => {
       else await route.continue();
     });
 
-    await page.locator("button", { hasText: "+ new dynamic provider" }).click();
+    await page.locator("button", { hasText: "+ new provider" }).click();
     const dlg = page.locator("#provider-form");
     await expect(dlg).toBeVisible();
     await page.locator("#p-id").fill("net-err-provider");
@@ -2308,7 +2309,7 @@ test.describe("WebUI 表单失败保持 (#181)", () => {
     await page.locator('a.tab[data-tab="providers"]').click();
     await expect(page.locator("#providers-body tr").first()).toBeVisible();
 
-    await page.locator("button", { hasText: "+ new dynamic provider" }).click();
+    await page.locator("button", { hasText: "+ new provider" }).click();
     const dlg = page.locator("#provider-form");
     await expect(dlg).toBeVisible();
     // 不填 base_url 也不选 route_to → builder 返回 null (#180 的前端拦截分支).
@@ -2337,7 +2338,7 @@ test.describe("WebUI 表单失败保持 (#181)", () => {
 
     // 唯一 id: 与其他测试隔离 (workers=1 共享 server state, 不清理也无害).
     const uid = `ok-provider-${Date.now()}`;
-    await page.locator("button", { hasText: "+ new dynamic provider" }).click();
+    await page.locator("button", { hasText: "+ new provider" }).click();
     const dlg = page.locator("#provider-form");
     await expect(dlg).toBeVisible();
     await page.locator("#p-id").fill(uid);
@@ -2352,5 +2353,137 @@ test.describe("WebUI 表单失败保持 (#181)", () => {
     await expect(
       page.locator("#providers-body tr", { hasText: uid })
     ).toBeVisible();
+  });
+});
+
+test.describe("Provider 表单构造分野 (#190)", () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto("/");
+    await page.waitForLoadState("networkidle");
+    await page.waitForTimeout(500);
+    await page.locator('a.tab[data-tab="providers"]').click();
+    await expect(page.locator("#providers-body tr").first()).toBeVisible();
+  });
+
+  test("#190: 新建 Direct — 默认构造, Direct 字段组可见 / Virtual 字段组隐藏", async ({ page }) => {
+    await page.locator("button", { hasText: "+ new provider" }).click();
+    const dlg = page.locator("#provider-form");
+    await expect(dlg).toBeVisible();
+
+    // 默认 direct: Base URL / API Key / Protocol 可见; Route To 隐藏.
+    // (断言组内代表字段而非 display:contents wrapper — 后者无盒, 可见性断言依赖浏览器实现细节.)
+    await expect(page.locator("#p-base-url")).toBeVisible();
+    await expect(page.locator("#p-route-to")).not.toBeVisible();
+
+    const uid = `direct-${Date.now()}`;
+    await page.locator("#p-id").fill(uid);
+    await page.locator("#p-protocol").selectOption("openai");
+    await page.locator("#p-base-url").fill("http://127.0.0.1:19998");
+
+    await page.locator('#provider-form-el button[value="save"]').click();
+    await expect(dlg).not.toBeVisible();
+
+    const row = page.locator("#providers-body tr", { hasText: uid });
+    await expect(row).toBeVisible();
+    // Direct 行: 显示 base_url, 无 virtual pill.
+    await expect(row).toContainText("127.0.0.1:19998");
+    await expect(row.locator(".pill", { hasText: "virtual" })).toHaveCount(0);
+
+    // 清理 (dynamic-only 可删): 注册 dialog handler 接受 confirm, DELETE 真实发出.
+    autoAcceptAlerts(page);
+    await row.locator('button[data-action="delete"]').click();
+    await expect(row).not.toBeVisible();
+  });
+
+  test("#190: 新建 Virtual — 切构造后字段组对调, protocol 不出现", async ({ page }) => {
+    await page.locator("button", { hasText: "+ new provider" }).click();
+    const dlg = page.locator("#provider-form");
+    await expect(dlg).toBeVisible();
+
+    // 切 virtual: 字段组对调.
+    await page.locator("#p-kind").selectOption("virtual");
+    await expect(page.locator("#p-route-to")).toBeVisible();
+    await expect(page.locator("#p-base-url")).not.toBeVisible();
+
+    const uid = `virt-${Date.now()}`;
+    await page.locator("#p-id").fill(uid);
+    // 指向预置的 static provider (playwright.config.ts 的 mock-openai).
+    await page.locator("#p-route-to").selectOption("mock-openai");
+
+    await page.locator('#provider-form-el button[value="save"]').click();
+    await expect(dlg).not.toBeVisible();
+
+    const row = page.locator("#providers-body tr", { hasText: uid });
+    await expect(row).toBeVisible();
+    await expect(row.locator(".pill", { hasText: "virtual" })).toBeVisible();
+    // base_url 列显示指向, 而非空.
+    await expect(row).toContainText("→ mock-openai");
+    // protocol 为 (any) — Virtual payload 不带 protocol 且后端不回填 (L1):
+    // egress 由链尾决定, 不展示误导性协议.
+    await expect(row.locator(".pill", { hasText: "(any)" })).toBeVisible();
+
+    autoAcceptAlerts(page);
+    await row.locator('button[data-action="delete"]').click();
+    await expect(row).not.toBeVisible();
+  });
+
+  test("#190: 构造内必填前置校验 — Virtual 无目标时阻止提交", async ({ page }) => {
+    await page.locator("button", { hasText: "+ new provider" }).click();
+    const dlg = page.locator("#provider-form");
+    await expect(dlg).toBeVisible();
+    await page.locator("#p-kind").selectOption("virtual");
+
+    const alerts = autoAcceptAlerts(page);
+    // id 填了但 route_to 留空 (select 无默认选中 → value 为 "").
+    await page.locator("#p-id").fill(`no-target-${Date.now()}`);
+    await page.locator('#provider-form-el button[value="save"]').click();
+
+    await expect
+      .poll(() => alerts.length, { timeout: 3000 })
+      .toBeGreaterThan(0);
+    expect(alerts[0]).toContain("Route To is required");
+    await expect(dlg, "校验失败对话框保持打开").toBeVisible();
+
+    await page.locator('#provider-form-el button[value="cancel"]').click();
+  });
+
+  test("#190: 编辑 Virtual 条目 — kind 初始化 + 切 Direct 触发 base_url 必填校验", async ({ page }) => {
+    // 先建一个 virtual (复用 #190 创建路径).
+    await page.locator("button", { hasText: "+ new provider" }).click();
+    await page.locator("#p-kind").selectOption("virtual");
+    const uid = `edit-${Date.now()}`;
+    await page.locator("#p-id").fill(uid);
+    await page.locator("#p-route-to").selectOption("mock-openai");
+    await page.locator('#provider-form-el button[value="save"]').click();
+    const row = page.locator("#providers-body tr", { hasText: uid });
+    await expect(row).toBeVisible();
+
+    // 编辑: kind 选择器初始化为 virtual, 字段组正确.
+    await row.locator('button[data-action="edit"]').click();
+    const dlg = page.locator("#provider-form");
+    await expect(dlg).toBeVisible();
+    await expect(page.locator("#p-kind")).toHaveValue("virtual");
+    await expect(page.locator("#p-route-to")).toBeVisible();
+
+    // 切 Direct (#187 改回实体场景): base_url 空 → 前置校验拦截.
+    const alerts = autoAcceptAlerts(page);
+    await page.locator("#p-kind").selectOption("direct");
+    await page.locator('#provider-form-el button[value="save"]').click();
+    await expect
+      .poll(() => alerts.length, { timeout: 3000 })
+      .toBeGreaterThan(0);
+    expect(alerts[0]).toContain("Base URL is required");
+
+    // 补上 base_url 后成功改回 Direct (kind 切换生效).
+    await page.locator("#p-base-url").fill("http://127.0.0.1:19997");
+    await page.locator("#p-api-key").fill("sk-after-switch");
+    await page.locator('#provider-form-el button[value="save"]').click();
+    await expect(dlg).not.toBeVisible();
+    const updated = page.locator("#providers-body tr", { hasText: uid });
+    await expect(updated).toContainText("127.0.0.1:19997");
+    await expect(updated.locator(".pill", { hasText: "virtual" })).toHaveCount(0);
+
+    await updated.locator('button[data-action="delete"]').click();
+    await expect(updated).not.toBeVisible();
   });
 });

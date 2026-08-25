@@ -103,6 +103,21 @@ pub async fn update_provider(
                     payload.model_override = old.model_override;
                 }
             }
+            // protocol 回填 (#190 保留语义): 从 **effective** 的 Direct 负载回填 —
+            // 覆盖 static-only 条目 (get_dynamic 无旧值的场景, PUT 即首次 override)。
+            // 非敏感字段, 无 #157 明文落盘顾虑。守卫: 仅 **Direct 意图** 回填
+            // (route_to 非空 = Virtual 意图 — 顺带持久化旧 protocol 会让列表 pill
+            // 显示误导性协议); Virtual effective 无 Direct 负载可挖 → 不回填,
+            // payload 要 Direct 又没带 → into_provider 400 兜底。
+            let virtual_intent = matches!(&payload.route_to, Some(s) if !s.is_empty());
+            if payload.protocol.is_none() && !virtual_intent {
+                let eff = state.providers.get_effective(&id);
+                if let Some(crate::provider::ProviderKind::Direct(d)) =
+                    eff.as_ref().map(|e| &e.kind)
+                {
+                    payload.protocol = Some(d.protocol);
+                }
+            }
             payload.into_provider()
         },
         |entry| validate_provider_upsert(&state.providers, entry),
@@ -159,7 +174,12 @@ pub(crate) struct ListProvidersResponse {
 pub(crate) struct UpsertProviderRequest {
     pub id: Option<String>,
     pub name: Option<String>,
-    pub protocol: Protocol,
+    /// 协议. **Direct 构造必填** (缺失 → 400, #190); **Virtual 构造不需要**
+    /// (仅 WebUI 展示的派生信息, 由链尾实体决定真实 egress), 省略/null 即可.
+    /// PUT 省略时若 effective 是 Direct → 回填其 protocol ("保留" 语义, 同 api_key;
+    /// 注意 partial PUT 仍需完整 Direct 字段 — base_url 不回填, 缺失 400).
+    #[serde(default)]
+    pub protocol: Option<Protocol>,
     /// 上游 base URL. 实体 provider 必填 (http(s) + 无末尾 `/`); 虚拟 provider
     /// (route_to 非空) 忽略, 可省略/为空 (#179).
     #[serde(default)]
@@ -220,15 +240,20 @@ impl UpsertProviderRequest {
             Some(route_to) => {
                 crate::provider::ProviderKind::Virtual(crate::provider::VirtualProvider {
                     route_to,
-                    protocol: Some(self.protocol),
+                    protocol: self.protocol,
                 })
             }
-            None => crate::provider::ProviderKind::Direct(crate::provider::DirectProvider {
-                protocol: self.protocol,
-                base_url: self.base_url,
-                api_key: self.api_key.unwrap_or_default(),
-                api_key_file: self.api_key_file.map(std::path::PathBuf::from),
-            }),
+            None => {
+                let protocol = self.protocol.ok_or_else(|| {
+                    ApiError::validation("protocol is required for direct providers")
+                })?;
+                crate::provider::ProviderKind::Direct(crate::provider::DirectProvider {
+                    protocol,
+                    base_url: self.base_url,
+                    api_key: self.api_key.unwrap_or_default(),
+                    api_key_file: self.api_key_file.map(std::path::PathBuf::from),
+                })
+            }
         };
         Ok(Provider {
             id: self.id.unwrap_or_default(),

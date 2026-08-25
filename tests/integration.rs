@@ -6340,3 +6340,108 @@ async fn model_override_response_stays_byte_exact_streaming() {
         "response must be byte-exact when override-only (map empty)"
     );
 }
+
+// ─── provider 表单构造分野 (#190): protocol Option 化的 API 语义 ────────────
+
+#[tokio::test]
+async fn provider_create_virtual_without_protocol_succeeds() {
+    // Virtual 构造不需要 protocol (仅展示, 由链尾实体决定 egress) — 省略 → 201,
+    // effective 视图 protocol 为 null.
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"c","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#)
+        .create_async()
+        .await;
+    let real = openai_provider("real", &upstream.url());
+    let proxy_url = spawn_proxy_static_dynamic(
+        vec![real],
+        vec![],
+        reqwest::Client::new(),
+        ConversationDag::new(64, 500, 1),
+        test_secret_table(),
+    )
+    .await
+    .0;
+
+    // POST 带 protocol: null (WebUI Virtual 表单的 payload 形态).
+    let (status, body, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/api/providers",
+        r#"{"id":"virt-no-proto","protocol":null,"route_to":"real","base_url":"","enabled":true}"#,
+        &[("content-type", "application/json")],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::CREATED, "body: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["kind"], "virtual");
+    assert!(
+        v["protocol"].is_null(),
+        "virtual protocol stays None: {body}"
+    );
+
+    // 经它转发正常 (protocol None 不影响路由).
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/virt-no-proto/v1/chat/completions",
+        CHAT_REQ_BODY,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn provider_create_direct_without_protocol_rejected() {
+    // Direct 构造 protocol 必填 — 缺失 → 400 (可行动消息), 非 serde 422.
+    let proxy_url =
+        spawn_proxy_with_provider(openai_provider("oa-main", "https://u.invalid")).await;
+    let (status, body, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/api/providers",
+        r#"{"id":"no-proto","route_to":"","base_url":"https://api.example.com","enabled":true}"#,
+        &[("content-type", "application/json")],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "body: {body}");
+    assert!(
+        body.contains("protocol is required"),
+        "actionable message: {body}"
+    );
+}
+
+#[tokio::test]
+async fn provider_update_partial_put_keeps_protocol() {
+    // PUT 保留语义 (#190): 只改 name 不带 protocol → 从 Direct 旧值回填, 不 400.
+    let upstream = spawn_mock_upstream().await;
+    let real = openai_provider("oa-main", &upstream.url());
+    let proxy_url = spawn_proxy_static_dynamic(
+        vec![real],
+        vec![],
+        reqwest::Client::new(),
+        ConversationDag::new(64, 500, 1),
+        test_secret_table(),
+    )
+    .await
+    .0;
+    // static 条目 → PUT 创建 dynamic override (protocol 省略 → 回填 static 的 openai).
+    let (status, body, _) = proxy_request(
+        &proxy_url,
+        "PUT",
+        "/api/providers/oa-main",
+        r#"{"name":"renamed","route_to":"","base_url":"https://api.example.com","enabled":true}"#,
+        &[("content-type", "application/json")],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        v["protocol"], "openai",
+        "protocol backfilled from old direct value"
+    );
+}

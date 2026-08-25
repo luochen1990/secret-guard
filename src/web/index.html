@@ -373,6 +373,14 @@
       border: 1px solid var(--border);
       border-radius: 6px;
     }
+    /* #190 构造字段组: display:contents 让子元素直接参与外层 form grid;
+       .hidden 整组隐藏 (非当前构造的字段不出现, 而非禁用). */
+    dialog#provider-form .kind-fields {
+      display: contents;
+    }
+    dialog#provider-form .kind-fields.hidden {
+      display: none;
+    }
     dialog#provider-form .actions {
       grid-column: 2;
       display: flex;
@@ -1317,7 +1325,7 @@
         <div class="secrets-toolbar">
           <div class="stats" id="providers-stats"></div>
           <span class="hint">URL pattern: <code>/{proto-short}/{provider-id}/*</code> · click <strong>endpoints</strong> in a row for details</span>
-          <button class="btn" onclick="openProviderForm()">+ new dynamic provider</button>
+          <button class="btn" onclick="openProviderForm()">+ new provider</button>
         </div>
         <table class="secrets">
           <thead>
@@ -1431,17 +1439,25 @@
     <form method="dialog" id="provider-form-el">
       <h3 style="grid-column: 1 / -1; margin: 0 0 8px 0;" id="provider-form-title">New provider</h3>
       <div id="provider-form-banner" class="banner" style="grid-column: 1 / -1; display: none;"></div>
+      <label for="p-kind">Kind</label>
+      <select id="p-kind">
+        <option value="direct">Direct — real upstream</option>
+        <option value="virtual">Virtual — routing endpoint</option>
+      </select>
+      <div class="hint" id="p-kind-hint" style="grid-column: 1 / -1; margin: 0 0 4px 0;">
+        Forwards directly to a real LLM endpoint (base URL + API key).
+      </div>
       <label for="p-id">ID</label>
       <input type="text" id="p-id" placeholder="unique slug, e.g. openai-main">
       <label for="p-name">Name</label>
       <input type="text" id="p-name" placeholder="(optional)">
-      <label for="p-protocol">Protocol</label>
-      <select id="p-protocol"></select>
-      <label for="p-route-to">Route To</label>
-      <select id="p-route-to"></select>
-      <div class="hint" id="p-route-hint" style="grid-column: 1 / -1; display: none;">
-        Virtual endpoint: Base URL / API Key are ignored — requests are forwarded to the
-        selected provider. Switch the target any time; only new requests are affected.
+      <div class="kind-fields hidden" id="p-virtual-fields">
+        <label for="p-route-to">Route To</label>
+        <select id="p-route-to"></select>
+        <div class="hint" style="grid-column: 1 / -1;">
+          Requests to this endpoint follow the selected provider. Switch the target
+          any time; only new requests are affected. No base URL / API key of its own.
+        </div>
       </div>
       <label for="p-model-override">Model Override</label>
       <input type="text" id="p-model-override" placeholder="(none — pass client model through)">
@@ -1449,10 +1465,14 @@
         Requests to this provider (directly or via routing) are rewritten to use this model —
         the client's requested model is discarded. Costs byte-exact passthrough (prefix cache).
       </div>
-      <label for="p-base-url">Base URL</label>
-      <input type="text" id="p-base-url" placeholder="https://api.openai.com (no trailing /)">
-      <label for="p-api-key">API Key</label>
-      <input type="password" id="p-api-key" placeholder="(optional for local providers like Ollama)">
+      <div class="kind-fields" id="p-direct-fields">
+        <label for="p-protocol">Protocol</label>
+        <select id="p-protocol"></select>
+        <label for="p-base-url">Base URL</label>
+        <input type="text" id="p-base-url" placeholder="https://api.openai.com (no trailing /)">
+        <label for="p-api-key">API Key</label>
+        <input type="password" id="p-api-key" placeholder="(optional for local providers like Ollama)">
+      </div>
       <label for="p-enabled">Enabled</label>
       <input type="checkbox" id="p-enabled" checked>
       <div class="actions">
@@ -4211,11 +4231,27 @@
       idInput.disabled = !!existing;
       document.getElementById('p-name').value = existing?.name || '';
       document.getElementById('p-protocol').value = existing?.protocol || state.providerProtocols[0] || 'openai';
+      // 构造选择 (#190): 按 kind 显隐字段组 — Direct: Protocol/Base URL/API Key;
+      // Virtual: Route To. 构造可切换 (编辑 static virtual → Direct override =
+      // 改回实体 #187 根治; dynamic 条目切换的丢 key 限制见 AGENTS.md).
+      const kindSel = document.getElementById('p-kind');
+      const kindHint = document.getElementById('p-kind-hint');
+      const syncKind = () => {
+        const isVirtual = kindSel.value === 'virtual';
+        document.getElementById('p-direct-fields').classList.toggle('hidden', isVirtual);
+        document.getElementById('p-virtual-fields').classList.toggle('hidden', !isVirtual);
+        kindHint.textContent = isVirtual
+          ? 'Routing endpoint — requests follow Route To to the target provider. Switch it any time (new requests only).'
+          : 'Forwards directly to a real LLM endpoint (base URL + API key).';
+      };
+      kindSel.value = existing?.kind || 'direct';
+      kindSel.onchange = syncKind;
+      syncKind();
       // Route To 下拉 (#179): 候选 = 其余 provider (排除自身, 防自环; 跨条目环由
       // 服务端 would_cycle 校验拒绝). 悬空目标 (static 手写指向不存在的 id) 补一个
       // "(missing)" 选项, 保证编辑保存不静默丢指向.
       const routeSel = document.getElementById('p-route-to');
-      routeSel.innerHTML = '<option value="">(none — real provider)</option>'
+      routeSel.innerHTML = '<option value="" disabled selected>(pick a target)</option>'
         + state.providersList
           .filter(x => x.id !== existing?.id)
           .map(x => `<option value="${escapeHtml(x.id)}">${escapeHtml(x.id)}</option>`)
@@ -4226,14 +4262,6 @@
           `<option value="${escapeHtml(existing.route_to)}">${escapeHtml(existing.route_to)} (missing)</option>`);
       }
       routeSel.value = existing?.route_to || '';
-      const routeHint = document.getElementById('p-route-hint');
-      routeHint.style.display = routeSel.value ? 'block' : 'none';
-      if (!routeSel.dataset.bound) {
-        routeSel.addEventListener('change', () => {
-          routeHint.style.display = routeSel.value ? 'block' : 'none';
-        });
-        routeSel.dataset.bound = '1';
-      }
       // Model Override (#183): hint 联动 (有值时提示代价).
       const modelInput = document.getElementById('p-model-override');
       modelInput.value = existing?.model_override || '';
@@ -4249,6 +4277,7 @@
       const apiKeyInput = document.getElementById('p-api-key');
       apiKeyInput.value = '';
       // 编辑模式下用 masked 旧值做 placeholder, 提示"留空将保留"; 创建模式保持原提示.
+      // Virtual 旧值无 api_key_masked (构造上不存在) → (optional) 即 "需重新填写" 的提示.
       apiKeyInput.placeholder = existing?.api_key_masked
         ? `unchanged (${existing.api_key_masked}) — leave blank to keep`
         : '(optional for local providers like Ollama)';
@@ -4318,30 +4347,37 @@
     }));
 
     bindFormSubmit('provider', 'provider-form-el', () => {
+      // #190: 按构造分野 payload — 表单 kind 选择器是唯一事实来源.
+      // - Direct: protocol + base_url (+api_key), route_to 发 "" (显式 Direct 构造).
+      // - Virtual: route_to (必填), protocol/base_url/api_key 发 null/"" (构造上不存在).
       // 编辑模式 (PUT): api_key 留空 → 发 null, 后端保留旧值 (见 update_provider handler).
-      // 创建模式 (POST): api_key 始终发字符串 (空串 = 不设置, 适用 Ollama).
-      // route_to (#179) 总是发字符串: "" = 实体 provider, "<id>" = 虚拟指向.
+      // model_override 总是发字符串 (#183): "" = 清空 (透传), "X" = 生效值.
       const isUpdate = !!document.getElementById('provider-form').dataset.editId;
+      const isVirtual = document.getElementById('p-kind').value === 'virtual';
       const apiKeyInput = document.getElementById('p-api-key').value;
       const routeTo = document.getElementById('p-route-to').value;
       const baseUrl = document.getElementById('p-base-url').value.trim();
-      // model_override 总是发字符串 (#183): "" = 清空 (透传), "X" = 生效值.
       const modelOverride = document.getElementById('p-model-override').value.trim();
-      // 实体 provider 必须有 base_url (虚拟 → 实体切换时表单里往往是空值);
-      // 前置拦截, 避免用户填完整个表单才收到后端 400. 返回 null 中止提交.
-      if (!routeTo && !baseUrl) {
-        alert('Base URL is required for a real provider (only virtual endpoints can leave it empty).');
+      // 构造内必填字段前置拦截 (避免用户填完整个表单才收到后端 400):
+      // Direct 需要 base_url; Virtual 需要目标 (下拉为空 = 没有可选 provider).
+      if (!isVirtual && !baseUrl) {
+        alert('Base URL is required for a direct provider.');
+        return null;
+      }
+      if (isVirtual && !routeTo) {
+        alert('Route To is required for a virtual provider (pick a target, or create one first).');
         return null;
       }
       return {
         id: document.getElementById('p-id').value.trim() || null,
         name: document.getElementById('p-name').value.trim() || null,
-        protocol: document.getElementById('p-protocol').value,
-        route_to: routeTo,
+        protocol: isVirtual ? null : document.getElementById('p-protocol').value,
+        route_to: isVirtual ? routeTo : '',
         model_override: modelOverride,
-        base_url: baseUrl,
+        base_url: isVirtual ? '' : baseUrl,
         enabled: document.getElementById('p-enabled').checked,
-        api_key: isUpdate && apiKeyInput === '' ? null : apiKeyInput,
+        // api_key 三态: Virtual 构造不存在 / Direct 编辑留空 = 保留 (null) / 其余发值.
+        api_key: (isVirtual || (isUpdate && apiKeyInput === '')) ? null : apiKeyInput,
       };
     });
 

@@ -127,12 +127,14 @@ route_to = "openai-main"
   `model_override` 即 "切换 = (target, model) 二元组" — 客户端 body 里的 model 被
   重写为目标模型, 适配 gpt-4o ↔ claude 等跨模型切换. 代价: 该 endpoint 的请求
   放弃字节直传 (上游前缀缓存失效), 见字段表.
-- 虚拟 ↔ 实体切换 (#187 sum type): 编辑表单 Route To 选 "none — real provider"
-  保存即**改回实体** (需同时填写 Base URL, 表单会前置提示); static 基线下的鉴权
-  字段会从 static 继承复原。已知限制: **dynamic-only** 条目 Direct → Virtual →
-  Direct 往返会丢失 api_key (Virtual 构造无处存放, 切回时需重新填写 — 表单
-  placeholder 会显示 "(optional)" 而非 "unchanged" 作为提示)。`model_override`
-  的清空仍受 #157 同型限制 (static 配置了 override 的条目无法经 override 清空)。
+- 虚拟 ↔ 实体切换 (#187 sum type / #190 表单构造分野): 对话框顶部 **Kind**
+  选择器切换构造, 表单按构造显示对应字段组 (Direct: Protocol/Base URL/API Key;
+  Virtual: Route To)。切换到 Direct 需填 Base URL (前置校验); static 基线下的
+  鉴权字段会从 static 继承复原。已知限制: **dynamic-only** 条目 Direct →
+  Virtual → Direct 往返会丢失 api_key (Virtual 构造无处存放, 切回时需重新填写 —
+  表单 placeholder 会显示 "(optional)" 而非 "unchanged" 作为提示)。
+  `model_override` 的清空仍受 #157 同型限制 (static 配置了 override 的条目
+  无法经 override 清空)。
 
 ## `[[secrets.entries]]` — 需要保护的 Secret (嵌套在 `[secrets]` 下)
 
