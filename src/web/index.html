@@ -4263,11 +4263,16 @@
         const dlg = document.getElementById(cfg.formDlgId);
         const btn = ev.submitter;
         if (!btn || btn.value !== 'save') return;
+        // 进门无条件阻止默认提交 (#181): method="dialog" 的默认 action 是关闭对话框,
+        // 而本 listener 是 async — 挂起在 await fetch 时默认 action 会抢先关掉对话框,
+        // 失败 alert 弹出时用户已填字段全部丢失. 对话框关闭只属于成功路径的显式
+        // dlg.close() (对齐 apikey 表单 handler 的写法). Cancel / Escape 不走本分支,
+        // 仍由默认 action 关闭.
+        ev.preventDefault();
         const editId = dlg.dataset.editId;
+        // null = builder 自行校验失败 (已 alert 提示), 中止提交 (对话框保持打开).
         const payload = buildPayload();
-        // null = builder 自行校验失败 (已 alert 提示). 必须阻止默认提交 —
-        // method="dialog" 的默认 action 是关闭对话框, 会丢掉用户已填字段.
-        if (payload == null) { ev.preventDefault(); return; }
+        if (payload == null) return;
         try {
           const url = editId ? `${cfg.api}/${encodeURIComponent(editId)}` : cfg.api;
           const method = editId ? 'PUT' : 'POST';

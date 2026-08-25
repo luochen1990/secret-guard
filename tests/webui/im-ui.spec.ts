@@ -2168,3 +2168,189 @@ test.describe("WebUI 打磨 (#161 + #164)", () => {
     expect(stillConnected, "数据静止时 tr 引用不应被刷新打断").toBe(true);
   });
 });
+
+// ─── #181: 表单提交失败时对话框保持打开 + 字段保留 ────────────────────────
+//
+// bindFormSubmit (secret/provider 两个表单共用) 的 listener 是 async:
+// 同步段跑到 `await fetch()` 即挂起, 事件派发完成后浏览器执行 method="dialog" 的
+// 默认 action (关闭对话框) — 此刻响应尚未到达. 失败 alert 弹出时表单已不存在,
+// 用户已填字段全部丢失 (重开表单被 openXxxForm 重置).
+//
+// 修复契约: save 分支进门无条件 preventDefault; 对话框关闭只发生在成功路径的
+// 显式 dlg.close() (对齐 apikey 表单的既有正确写法). 可用性原则: 可逆性 —
+// 失败 → 改正 → 直接重试, 无需重填.
+//
+// 覆盖四条路径: 409 冲突 (provider+secret) / 网络错误 (catch 分支) /
+// builder 校验 (#180 分支回归) / 成功路径 (对话框正常关闭, 守护修复不破坏正向流).
+test.describe("WebUI 表单失败保持 (#181)", () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto("/");
+    await page.waitForLoadState("networkidle");
+    await page.waitForTimeout(500);
+  });
+
+  /**
+   * 挂 alert 自动 accept 处理器 (alert 阻塞页面 JS, 不处理会冻结), 并记录消息
+   * 供断言 "失败 alert 确实弹出" (证明 fetch 走了失败分支, 而非静默成功).
+   */
+  function autoAcceptAlerts(page: Page): string[] {
+    const alerts: string[] = [];
+    page.on("dialog", async (d) => {
+      alerts.push(d.message());
+      await d.accept();
+    });
+    return alerts;
+  }
+
+  test("#181: provider 表单 409 冲突时对话框保持打开 + 字段保留", async ({ page }) => {
+    await page.locator('a.tab[data-tab="providers"]').click();
+    // 等表格渲染 (refreshProviders 完成 → state.providerProtocols 已填充,
+    // 否则 protocol 下拉为空, selectOption 会失败).
+    await expect(page.locator("#providers-body tr").first()).toBeVisible();
+
+    await page.locator("button", { hasText: "+ new dynamic provider" }).click();
+    const dlg = page.locator("#provider-form");
+    await expect(dlg).toBeVisible();
+    // 已存在的 static id (playwright.config.ts 预置) → POST 409.
+    await page.locator("#p-id").fill("mock-openai");
+    await page.locator("#p-name").fill("my precious name");
+    await page.locator("#p-protocol").selectOption("openai");
+    await page.locator("#p-base-url").fill("http://127.0.0.1:19999/v1");
+    await page.locator("#p-api-key").fill("sk-user-typed-key-123");
+
+    const alerts = autoAcceptAlerts(page);
+    await page.locator('#provider-form-el button[value="save"]').click();
+
+    // 核心断言: 修复前对话框在点击瞬间被默认 action 关闭 (fetch 仍在途).
+    await expect(dlg, "409 后对话框应保持打开").toBeVisible();
+    await expect(page.locator("#p-id")).toHaveValue("mock-openai");
+    await expect(page.locator("#p-name")).toHaveValue("my precious name");
+    await expect(page.locator("#p-base-url")).toHaveValue("http://127.0.0.1:19999/v1");
+    await expect(page.locator("#p-api-key")).toHaveValue("sk-user-typed-key-123");
+    // 失败 alert 确实弹出 (含 409 冲突语义).
+    await expect
+      .poll(() => alerts.length, { timeout: 3000 })
+      .toBeGreaterThan(0);
+    expect(alerts[0]).toContain("already exists");
+    // alert 之后对话框仍打开 (防 "alert 后再关" 类回归).
+    await expect(dlg).toBeVisible();
+
+    // 清理: Cancel 关闭 (依赖默认 action, 不走 preventDefault 分支).
+    await page.locator('#provider-form-el button[value="cancel"]').click();
+    await expect(dlg).not.toBeVisible();
+  });
+
+  test("#181: secret 表单 409 冲突时对话框保持打开 + 字段保留", async ({ page }) => {
+    await page.locator('a.tab[data-tab="secrets"]').click();
+    await expect(page.locator("#secrets-body tr").first()).toBeVisible();
+
+    await page.locator("button", { hasText: "+ new dynamic secret" }).click();
+    const dlg = page.locator("#secret-form");
+    await expect(dlg).toBeVisible();
+    // 已存在的 static id (test-key) → POST 409.
+    await page.locator("#f-id").fill("test-key");
+    await page.locator("#f-name").fill("my secret name");
+    await page.locator("#f-value").fill("some-typed-secret-value");
+
+    const alerts = autoAcceptAlerts(page);
+    await page.locator('#secret-form-el button[value="save"]').click();
+
+    await expect(dlg, "409 后对话框应保持打开").toBeVisible();
+    await expect(page.locator("#f-id")).toHaveValue("test-key");
+    await expect(page.locator("#f-name")).toHaveValue("my secret name");
+    // value 字段是敏感输入, 失败后也必须保留 (用户改 id 重试, 不应重敲 value).
+    await expect(page.locator("#f-value")).toHaveValue("some-typed-secret-value");
+    await expect
+      .poll(() => alerts.length, { timeout: 3000 })
+      .toBeGreaterThan(0);
+    expect(alerts[0]).toContain("already exists");
+    // alert 之后对话框仍打开 (防 "alert 后再关" 类回归).
+    await expect(dlg).toBeVisible();
+
+    await page.locator('#secret-form-el button[value="cancel"]').click();
+    await expect(dlg).not.toBeVisible();
+  });
+
+  test("#181: 网络错误 (fetch reject) 时对话框保持打开 (catch 分支)", async ({ page }) => {
+    await page.locator('a.tab[data-tab="providers"]').click();
+    await expect(page.locator("#providers-body tr").first()).toBeVisible();
+
+    // 模拟后端不可达: 拦截 POST /api/providers 直接 abort.
+    await page.route("**/api/providers", async (route) => {
+      if (route.request().method() === "POST") await route.abort("failed");
+      else await route.continue();
+    });
+
+    await page.locator("button", { hasText: "+ new dynamic provider" }).click();
+    const dlg = page.locator("#provider-form");
+    await expect(dlg).toBeVisible();
+    await page.locator("#p-id").fill("net-err-provider");
+    await page.locator("#p-protocol").selectOption("openai");
+    await page.locator("#p-base-url").fill("http://127.0.0.1:19999/v1");
+
+    const alerts = autoAcceptAlerts(page);
+    await page.locator('#provider-form-el button[value="save"]').click();
+
+    await expect(dlg, "网络错误后对话框应保持打开").toBeVisible();
+    await expect(page.locator("#p-id")).toHaveValue("net-err-provider");
+    await expect
+      .poll(() => alerts.length, { timeout: 3000 })
+      .toBeGreaterThan(0);
+    expect(alerts[0]).toContain("Error");
+    // alert 之后对话框仍打开 (防 "alert 后再关" 类回归).
+    await expect(dlg).toBeVisible();
+
+    await page.locator('#provider-form-el button[value="cancel"]').click();
+    await expect(dlg).not.toBeVisible();
+  });
+
+  test("#181: builder 校验失败 (base_url 缺失, #180) 时对话框保持打开", async ({ page }) => {
+    await page.locator('a.tab[data-tab="providers"]').click();
+    await expect(page.locator("#providers-body tr").first()).toBeVisible();
+
+    await page.locator("button", { hasText: "+ new dynamic provider" }).click();
+    const dlg = page.locator("#provider-form");
+    await expect(dlg).toBeVisible();
+    // 不填 base_url 也不选 route_to → builder 返回 null (#180 的前端拦截分支).
+    await page.locator("#p-id").fill("no-baseurl-provider");
+    await page.locator("#p-protocol").selectOption("openai");
+
+    const alerts = autoAcceptAlerts(page);
+    await page.locator('#provider-form-el button[value="save"]').click();
+
+    await expect(dlg, "builder 校验失败后对话框应保持打开").toBeVisible();
+    await expect(page.locator("#p-id")).toHaveValue("no-baseurl-provider");
+    await expect
+      .poll(() => alerts.length, { timeout: 3000 })
+      .toBeGreaterThan(0);
+    expect(alerts[0]).toContain("Base URL is required");
+    // alert 之后对话框仍打开 (防 "alert 后再关" 类回归).
+    await expect(dlg).toBeVisible();
+
+    await page.locator('#provider-form-el button[value="cancel"]').click();
+    await expect(dlg).not.toBeVisible();
+  });
+
+  test("#181: 成功路径对话框正常关闭 + 新条目出现 (守护正向流)", async ({ page }) => {
+    await page.locator('a.tab[data-tab="providers"]').click();
+    await expect(page.locator("#providers-body tr").first()).toBeVisible();
+
+    // 唯一 id: 与其他测试隔离 (workers=1 共享 server state, 不清理也无害).
+    const uid = `ok-provider-${Date.now()}`;
+    await page.locator("button", { hasText: "+ new dynamic provider" }).click();
+    const dlg = page.locator("#provider-form");
+    await expect(dlg).toBeVisible();
+    await page.locator("#p-id").fill(uid);
+    await page.locator("#p-protocol").selectOption("openai");
+    await page.locator("#p-base-url").fill("http://127.0.0.1:19999/v1");
+
+    await page.locator('#provider-form-el button[value="save"]').click();
+
+    // 修复后 dlg.close() 从 no-op 变为唯一关闭点: 成功路径必须关闭.
+    await expect(dlg, "成功后对话框应关闭").not.toBeVisible();
+    // 新条目渲染进表格.
+    await expect(
+      page.locator("#providers-body tr", { hasText: uid })
+    ).toBeVisible();
+  });
+});
