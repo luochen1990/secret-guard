@@ -75,19 +75,30 @@ pub async fn update_provider(
             // 可能触发互斥校验报错 (例如旧值有 api_key, 新传 api_key_file). WebUI 不暴露
             // api_key_file 输入, 仅 SDK 直接调用可能触发, 影响低.
             if let Some(old) = state.providers.get_dynamic(&id) {
-                if payload.api_key.is_none() {
-                    payload.api_key = Some(old.api_key);
-                }
-                if payload.api_key_file.is_none() {
-                    payload.api_key_file =
-                        old.api_key_file.map(|p| p.to_string_lossy().into_owned());
-                }
-                // route_to 同 "保留" 语义 (#179): payload 省略 (None) = 保留旧指向.
+                // "保留旧值" 回填, 按旧值的构造分派 (sum type 同构, #187):
+                // Direct 旧值 → 鉴权字段回填; Virtual 旧值 → 指向回填.
                 // 显式清空/切换由 WebUI 发 "" / "target-id" 表达 (见下方字段注释).
-                if payload.route_to.is_none() {
-                    payload.route_to = old.route_to;
+                match &old.kind {
+                    crate::provider::ProviderKind::Direct(d) => {
+                        if payload.api_key.is_none() {
+                            payload.api_key = Some(d.api_key.clone());
+                        }
+                        if payload.api_key_file.is_none() {
+                            payload.api_key_file = d
+                                .api_key_file
+                                .as_ref()
+                                .map(|p| p.to_string_lossy().into_owned());
+                        }
+                    }
+                    crate::provider::ProviderKind::Virtual(v) => {
+                        // payload 省略 (None) = 保留旧指向; "" = 改回实体 (#187 根治).
+                        // 守卫对象是 payload 的显式新值 (客户端发新目标时不被旧值覆盖).
+                        if payload.route_to.is_none() {
+                            payload.route_to = Some(v.route_to.clone());
+                        }
+                    }
                 }
-                // model_override 同 "保留" 语义 (#183), 三态同 route_to.
+                // model_override 同 "保留" 语义 (#183), 与构造无关.
                 if payload.model_override.is_none() {
                     payload.model_override = old.model_override;
                 }
@@ -171,15 +182,14 @@ pub(crate) struct UpsertProviderRequest {
     /// 时可用, 但通常只在 static config (sops 注入) 用.
     #[serde(default)]
     pub api_key_file: Option<String>,
-    /// 虚拟 endpoint 路由目标 (#179). 三态语义:
-    /// - 省略 (None): 保留旧指向 (PUT) / 不设置 (POST). static 基线下由
-    ///   `inherit_from_static` 回落 static 的 route_to (#157 同型).
-    /// - `""` (空串): 显式清空指向 → 实体 provider. dynamic-only 条目可完整
-    ///   "虚拟 ↔ 实体" 往返; static 虚拟 provider 无法经 override 改回实体
-    ///   (会被继承回落, #157 同型已知限制).
-    /// - `"target-id"`: 指向目标 provider (虚拟 provider).
+    /// 虚拟 endpoint 路由目标 (#179/#187 sum type). 三态语义:
+    /// - 省略 (None): 保留旧值 (PUT) — dynamic 旧值是 Virtual 则回填其 route_to;
+    ///   static 基线下未回填 (static Direct) 的鉴权字段由 `inherit_from_static` 继承.
+    /// - `""` (空串): 显式 **Direct 构造** (改回实体 provider, #187 根治 — 不再被
+    ///   继承回落 static 指向; 需同时提供合法 base_url, 否则 validate 400).
+    /// - `"target-id"`: **Virtual 构造**, 指向目标 provider (悬空放行, 运行时 503).
     ///
-    /// 成环 (含自环) 在 validate/upsert 钩子拒绝 (400); 悬空目标放行 (运行时 503).
+    /// 成环 (含自环) 在 validate/upsert 钩子拒绝 (400).
     #[serde(default)]
     pub route_to: Option<String>,
     /// 出站 model 强制重写值 (#183). 三态语义同 `route_to`:
@@ -204,19 +214,28 @@ impl UpsertProviderRequest {
         }
         // 结构校验 (base_url / route_to 目标 id / 自环 / api_key 互斥) 收口在
         // crud 钩子的 `Provider::validate` (见 validate_provider_upsert), 此处只做
-        // 字段变换: 空串 route_to = 显式清空指向 ("虚拟 → 实体").
-        let route_to = self.route_to.filter(|s| !s.is_empty());
+        // 字段变换: 空串 route_to = 显式清空指向 ("虚拟 → 实体", #187 根治).
         let model_override = self.model_override.filter(|s| !s.is_empty());
+        let kind = match self.route_to.filter(|s| !s.is_empty()) {
+            Some(route_to) => {
+                crate::provider::ProviderKind::Virtual(crate::provider::VirtualProvider {
+                    route_to,
+                    protocol: Some(self.protocol),
+                })
+            }
+            None => crate::provider::ProviderKind::Direct(crate::provider::DirectProvider {
+                protocol: self.protocol,
+                base_url: self.base_url,
+                api_key: self.api_key.unwrap_or_default(),
+                api_key_file: self.api_key_file.map(std::path::PathBuf::from),
+            }),
+        };
         Ok(Provider {
             id: self.id.unwrap_or_default(),
-            protocol: self.protocol,
-            base_url: self.base_url,
-            api_key: self.api_key.unwrap_or_default(),
-            api_key_file: self.api_key_file.map(std::path::PathBuf::from),
             enabled: self.enabled,
             name: self.name.filter(|s| !s.trim().is_empty()),
-            route_to,
             model_override,
+            kind,
         })
     }
 }

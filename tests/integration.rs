@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use secret_guard::{
     dag::ConversationDag,
-    provider::{Protocol, Provider, ProviderTable},
+    provider::{DirectProvider, Protocol, Provider, ProviderKind, ProviderTable},
     record::ForwardRecord,
     secrets::{SecretCategory, SecretEntry, SecretTable},
     server,
@@ -70,43 +70,49 @@ async fn spawn_proxy(upstream_base: &str) -> String {
 fn openai_provider(id: &str, base_url: &str) -> Provider {
     Provider {
         id: id.into(),
-        protocol: Protocol::OpenAI,
-        base_url: base_url.into(),
-        api_key: "sk-test-key".into(),
-        api_key_file: None,
         enabled: true,
         name: Some(id.into()),
-        route_to: None,
         model_override: None,
+        kind: ProviderKind::Direct(DirectProvider {
+            protocol: Protocol::OpenAI,
+            base_url: base_url.into(),
+            api_key: "sk-test-key".into(),
+            api_key_file: None,
+        }),
     }
 }
 
 fn provider_with(id: &str, proto: Protocol, base_url: &str) -> Provider {
     Provider {
         id: id.into(),
-        protocol: proto,
-        base_url: base_url.into(),
-        api_key: String::new(),
-        api_key_file: None,
         enabled: true,
         name: Some(id.into()),
-        route_to: None,
         model_override: None,
+        kind: ProviderKind::Direct(DirectProvider {
+            protocol: proto,
+            base_url: base_url.into(),
+            api_key: String::new(),
+            api_key_file: None,
+        }),
     }
 }
 
 /// #157 族: 指定 inline api_key 的 OpenAI provider (openai_provider 变体).
 fn keyed_provider(id: &str, base_url: &str, api_key: &str) -> Provider {
     let mut p = openai_provider(id, base_url);
-    p.api_key = api_key.into();
+    if let ProviderKind::Direct(d) = &mut p.kind {
+        d.api_key = api_key.into();
+    }
     p
 }
 
-/// #179: 虚拟 provider (route_to = target). base_url 留空 (虚拟语义下被忽略).
+/// #179: 虚拟 provider (route_to = target). protocol 携带 Some (模拟旧平铺格式读入).
 fn virtual_provider(id: &str, target: &str) -> Provider {
     Provider {
-        route_to: Some(target.into()),
-        base_url: String::new(),
+        kind: ProviderKind::Virtual(secret_guard::provider::VirtualProvider {
+            route_to: target.into(),
+            protocol: Some(Protocol::OpenAI),
+        }),
         ..openai_provider(id, "https://ignored.invalid")
     }
 }
@@ -605,14 +611,15 @@ async fn provider_api_key_file_reads_secret_from_path() {
 
     let provider = Provider {
         id: "oa-file".into(),
-        protocol: Protocol::OpenAI,
-        base_url: upstream.url(),
-        api_key: String::new(),
-        api_key_file: Some(key_file.clone()),
         enabled: true,
         name: None,
-        route_to: None,
         model_override: None,
+        kind: ProviderKind::Direct(DirectProvider {
+            protocol: Protocol::OpenAI,
+            base_url: upstream.url(),
+            api_key: String::new(),
+            api_key_file: Some(key_file.clone()),
+        }),
     };
     let proxy_url = spawn_proxy_with_provider(provider).await;
 
@@ -644,14 +651,15 @@ async fn provider_api_key_file_missing_falls_through_to_no_auth() {
 
     let provider = Provider {
         id: "oa-broken".into(),
-        protocol: Protocol::OpenAI,
-        base_url: upstream.url(),
-        api_key: String::new(),
-        api_key_file: Some(std::path::PathBuf::from("/nonexistent/secret-guard-test")),
         enabled: true,
         name: None,
-        route_to: None,
         model_override: None,
+        kind: ProviderKind::Direct(DirectProvider {
+            protocol: Protocol::OpenAI,
+            base_url: upstream.url(),
+            api_key: String::new(),
+            api_key_file: Some(std::path::PathBuf::from("/nonexistent/secret-guard-test")),
+        }),
     };
     let proxy_url = spawn_proxy_with_provider(provider).await;
 
@@ -680,14 +688,15 @@ async fn anthropic_provider_uses_x_api_key() {
 
     let provider = Provider {
         id: "an-main".into(),
-        protocol: Protocol::Anthropic,
-        base_url: upstream.url(),
-        api_key: "sk-ant-test".into(),
-        api_key_file: None,
         enabled: true,
         name: None,
-        route_to: None,
         model_override: None,
+        kind: ProviderKind::Direct(DirectProvider {
+            protocol: Protocol::Anthropic,
+            base_url: upstream.url(),
+            api_key: "sk-ant-test".into(),
+            api_key_file: None,
+        }),
     };
     let proxy_url = spawn_proxy_with_provider(provider).await;
     let (status, _, _) =
@@ -2935,7 +2944,9 @@ async fn put_static_fork_null_api_key_inherits_api_key_file() {
         .await;
 
     let mut static_provider = keyed_provider("pf", &upstream.url(), "");
-    static_provider.api_key_file = Some(keyfile.clone());
+    if let ProviderKind::Direct(d) = &mut static_provider.kind {
+        d.api_key_file = Some(keyfile.clone());
+    }
     let (proxy_url, state_path) = spawn_with_static(static_provider).await;
     let client = reqwest::Client::new();
 
@@ -3498,7 +3509,9 @@ async fn dynamic_override_replaces_static_in_routing() {
 
     let static_p = openai_provider("shared-id", &upstream_static.url());
     let mut dynamic_p = openai_provider("shared-id", &upstream_dyn.url());
-    dynamic_p.api_key = "dynamic-key".into();
+    if let ProviderKind::Direct(d) = &mut dynamic_p.kind {
+        d.api_key = "dynamic-key".into();
+    }
     let proxy_url = spawn_with_static_and_dynamic(vec![static_p], vec![dynamic_p]).await;
 
     let resp = proxy_request(
@@ -5281,7 +5294,9 @@ async fn upstream_unreachable_502_body_carries_readable_cause() {
 
     // provider 带非空 api_key: 断言它不出现在 502 body (issue 明确要求).
     let mut provider = openai_provider("oa-dead", &format!("http://{bad_addr}"));
-    provider.api_key = "sk-live-supersecret-0123456789".into();
+    if let ProviderKind::Direct(d) = &mut provider.kind {
+        d.api_key = "sk-live-supersecret-0123456789".into();
+    }
     let proxy_url = spawn_proxy_with_provider(provider).await;
 
     let (log, _log_guard) = capture_tracing(tracing::Level::INFO);

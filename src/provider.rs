@@ -116,23 +116,53 @@ impl Protocol {
     }
 }
 
-/// 单个 provider 实例.
+/// 单个 provider 实例 — **sum type** (#187): 直连上游 (`Direct`) 或虚拟路由
+/// (`Virtual`) 两种构造, 配置项完全不同, 非法状态不可表示 (Virtual 根本没有
+/// base_url/api_key 字段).
+///
+/// 共享字段: `id` / `name` / `enabled` / `model_override` (两种构造都可配).
+///
+/// serde 层经 `ProviderWire` (平铺 legacy 形态) 双向转换 — 磁盘 TOML / API
+/// payload 格式零变化 (有 `route_to` 即虚拟), 既有 secret-guard.toml / state.toml
+/// 直接兼容.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "ProviderWire", into = "ProviderWire")]
 pub struct Provider {
     /// 唯一 id (slug). 同一份表 (static 或 dynamic) 中必须唯一.
     pub id: String,
-    /// 协议: 决定上游的 egress protocol. 当前 MVP 要求 ingress == egress.
+    /// 是否启用. `false` 时转发到该 provider 返回 503.
+    pub enabled: bool,
+    /// 可选人类可读名称 (Web UI 显示).
+    pub name: Option<String>,
+    /// 可选: 出站请求的 model 字段强制重写值 (#183). 两种构造均可配; 链上解析
+    /// first-wins (见 `resolve_route`). 代价与限制的 SSOT: FWD-1 修订 + FWD-5
+    /// `prop_model_override_*` (`docs/design/contracts.md`).
+    pub model_override: Option<String>,
+    /// 构造判别: 直连上游 or 虚拟路由.
+    pub kind: ProviderKind,
+}
+
+/// Provider 的两种构造 (#187 sum type).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ProviderKind {
+    /// 直连上游: 真实 LLM 端点, 承载转发.
+    Direct(DirectProvider),
+    /// 虚拟 endpoint: 不承载转发, 请求经 `route_to` 链解析到链尾实体 (#179).
+    Virtual(VirtualProvider),
+}
+
+/// 直连上游 provider 的构造负载 ([`ProviderKind::Direct`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectProvider {
+    /// 协议: 决定上游的 egress protocol (跨协议请求自动走 codec 翻译).
     pub protocol: Protocol,
     /// 上游 base URL, 末尾**不带** `/`. 通过 [`validate_base_url`] 校验.
-    /// serde default (#179): 虚拟 provider (route_to 设置) 忽略 base_url, TOML 可省略;
-    /// 实体 provider 缺省时由 validate 在启动/upsert 报 "must not be empty".
-    #[serde(default)]
     pub base_url: String,
     /// API key 直接值. 明文存储在本地 config 文件中 (本地进程, 不通过网络暴露).
-    /// 与 [`Provider::api_key_file`] 互斥 — 同时设置会在 [`Provider::validate`] 中报错.
+    /// 与 [`DirectProvider::api_key_file`] 互斥 — 同时设置会在 validate 中报错.
     #[serde(default)]
     pub api_key: String,
-    /// 可选: 从文件路径读取 api_key. 优先级低于 [`Provider::api_key`].
+    /// 可选: 从文件路径读取 api_key. 优先级低于 [`DirectProvider::api_key`].
     ///
     /// 用法: 让 toml 本身不含敏感数据, secret 由外部机制 (sops-nix / systemd LoadCredential /
     /// docker secrets / k8s secrets) 解密到独立路径, secret-guard 在请求时读取.
@@ -142,52 +172,141 @@ pub struct Provider {
     /// (在 `crate::proxy`) 决定是否跳过 auth header 注入.
     #[serde(default)]
     pub api_key_file: Option<std::path::PathBuf>,
-    /// 可选: 虚拟 endpoint 的路由目标 (另一 provider 的 id). `Some(target)` 时本
-    /// provider 是**虚拟 provider** — 自身不承载转发, dispatch 时跟随 `route_to` 链
-    /// 解析到链尾的实体 provider (#179). 用于 "客户端固定连虚拟 endpoint, WebUI
-    /// 即席切换指向" 的模型 SSOT 动态切换.
-    ///
-    /// 字段独有语义:
-    /// - `base_url` / `api_key` / `api_key_file` 被忽略 (validate 允许 base_url 为空);
-    /// - `protocol` 仅作 WebUI 展示 — ingress 由 URL proto_short 决定, egress 由
-    ///   链尾实体 provider 的 protocol 决定 (不同则自动走 cross_proto 翻译).
-    ///
-    /// 路由语义 (per-request 解析 / 坏路由 503 / 环与悬空处置) 的 SSOT:
-    /// [`ProviderTable::resolve_route`] + [`ProviderTable::would_cycle`] + FWD-5 契约
-    /// (`docs/design/contracts.md`).
+}
+
+/// 虚拟 endpoint provider 的构造负载 ([`ProviderKind::Virtual`]).
+///
+/// base_url / api_key / api_key_file **在此构造下不存在** (sum type 根治
+/// "配置了被忽略" 的非法状态). 路由语义 (per-request 解析 / 坏路由 503 / 环与
+/// 悬空处置) 的 SSOT: [`ProviderTable::resolve_route`] +
+/// [`ProviderTable::would_cycle`] + FWD-5 契约 (`docs/design/contracts.md`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VirtualProvider {
+    /// 路由目标 (另一 provider 的 id). 非空 (wire 层已 filter 空串).
+    pub route_to: String,
+    /// 协议: **仅 WebUI 展示** — ingress 由 URL proto_short 决定, egress 由链尾
+    /// 实体的 protocol 决定 (不同则自动走 cross_proto 翻译). sum 化后真正可选
+    /// (旧格式必有值, 读入保留).
+    #[serde(default)]
+    pub protocol: Option<Protocol>,
+}
+
+/// Provider 的**平铺 wire 形态** (磁盘 TOML / 既有 API payload).
+///
+/// 判别规则: `route_to` 非空 → [`ProviderKind::Virtual`] (忽略 base_url/api_key,
+/// 兼容旧格式虚拟条目残留的实体字段); 否则 → [`ProviderKind::Direct`].
+///
+/// 这是 #187 重构的兼容层: 领域模型 sum 化, 序列化格式保持 #179/#183 之前的
+/// 平铺形态, 既有配置文件零破坏. 新代码不应直接使用本类型 (除 serde 边界).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ProviderWire {
+    pub id: String,
+    /// Direct 必填 (缺失时 try_from 报错); Virtual 可选 (仅展示).
+    pub protocol: Option<Protocol>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub base_url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub api_key: String,
+    #[serde(default)]
+    pub api_key_file: Option<std::path::PathBuf>,
     #[serde(default)]
     pub route_to: Option<String>,
-    /// 可选: 出站请求的 model 字段强制重写值 (#183). 设置后, 经此 provider (直接
-    /// 或作为 route_to 链的一跳) 转发的请求 body 顶层 `model` 字段被无条件替换为
-    /// 该值 — 客户端请求的 model 名被丢弃 (这正是 "虚拟 endpoint = 模型 X" 的语义).
-    ///
-    /// - 链上解析 **first-wins**: 沿 route_to 链从入口起第一个非空 override 生效
-    ///   (见 `resolve_route` / FWD-5 `prop_model_override_first_hop_wins`);
-    /// - 代价 (FWD-1 修订, §99 登记): override 生效时同协议无-secret 请求从字节
-    ///   直传降级为 IR 改写 (normalize 等价; 上游前缀缓存失效) — 用户主动选择的降级;
-    /// - 无 codec 协议 (Gemini/Ollama) 无法改写: WARN + 字节透传 (body 原样);
-    /// - Responses 流式 + override: 强制 IR 路径 → 既有 501;
-    /// - 空串非法 (validate 拒绝; 清空配置请省略字段 / WebUI 发 "").
     #[serde(default)]
     pub model_override: Option<String>,
-    /// 是否启用. `false` 时转发到该 provider 返回 503.
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// 可选人类可读名称 (Web UI 显示).
     #[serde(default)]
     pub name: Option<String>,
 }
 
-impl Provider {
-    /// 返回生效的 api_key: 优先 [`Provider::api_key`] 直接值, 否则从
-    /// [`Provider::api_key_file`] 读取 (trim 后). 两者都未配置 → 返回空字符串.
+impl TryFrom<ProviderWire> for Provider {
+    type Error = String;
+
+    fn try_from(w: ProviderWire) -> Result<Self, Self::Error> {
+        let route_to = w.route_to.filter(|s| !s.is_empty());
+        let kind = match route_to {
+            Some(route_to) => ProviderKind::Virtual(VirtualProvider {
+                route_to,
+                protocol: w.protocol,
+            }),
+            None => {
+                let protocol = w.protocol.ok_or_else(|| {
+                    format!(
+                        "provider {}: protocol is required for direct providers",
+                        w.id
+                    )
+                })?;
+                ProviderKind::Direct(DirectProvider {
+                    protocol,
+                    base_url: w.base_url,
+                    api_key: w.api_key,
+                    api_key_file: w.api_key_file,
+                })
+            }
+        };
+        Ok(Provider {
+            id: w.id,
+            enabled: w.enabled,
+            name: w.name,
+            model_override: w.model_override,
+            kind,
+        })
+    }
+}
+
+impl From<Provider> for ProviderWire {
+    fn from(p: Provider) -> Self {
+        let (protocol, base_url, api_key, api_key_file, route_to) = match p.kind {
+            ProviderKind::Direct(d) => (
+                Some(d.protocol),
+                d.base_url,
+                d.api_key,
+                d.api_key_file,
+                None,
+            ),
+            ProviderKind::Virtual(v) => {
+                // 实体字段写空值: 虚拟条目在平铺格式下不携带实体配置.
+                (
+                    v.protocol,
+                    String::new(),
+                    String::new(),
+                    None,
+                    Some(v.route_to),
+                )
+            }
+        };
+        ProviderWire {
+            id: p.id,
+            protocol,
+            base_url,
+            api_key,
+            api_key_file,
+            route_to,
+            model_override: p.model_override,
+            enabled: p.enabled,
+            name: p.name,
+        }
+    }
+}
+
+/// serde `default` helper: 让 `enabled` 字段缺省为 `true`.
+/// `pub(crate)` 以便 `web::api` 复用 (避免重复定义).
+pub(crate) fn default_true() -> bool {
+    true
+}
+
+impl DirectProvider {
+    /// 返回生效的 api_key: 优先 [`DirectProvider::api_key`] 直接值, 否则从
+    /// [`DirectProvider::api_key_file`] 读取 (trim 后). 两者都未配置 → 返回空字符串.
     ///
     /// 不报告错误: 上层 (`apply_provider_auth` 在 `crate::proxy`) 会基于空 key 决定是否跳过 auth 注入,
     /// 单个 provider 配置错误不应拖垮整个进程.
     ///
     /// 但会 `warn!` 一次让运维可观测 — 文件读不到时, 仅从上游 401/403 反推原因很痛苦.
     /// 与项目其他错误路径 (`proxy/` 中 `warn!` 各种 IO/header 错误) 风格一致.
-    pub fn effective_api_key(&self) -> String {
+    ///
+    /// `id` 仅用于 warn-once 去重键 (DirectProvider 自身不持有 id).
+    pub fn effective_api_key(&self, id: &str) -> String {
         if !self.api_key.is_empty() {
             return self.api_key.clone();
         }
@@ -195,16 +314,16 @@ impl Provider {
             match std::fs::read_to_string(path) {
                 Ok(s) => {
                     // 文件恢复可读, 清除 warn 记录, 让下次失败能再次 warn.
-                    WARNED_API_KEY_FILE.lock().remove(&self.id);
+                    WARNED_API_KEY_FILE.lock().remove(id);
                     return s.trim().to_string();
                 }
                 Err(e) => {
                     // 首次失败 warn 一次, 后续同样错误静默 — 避免 LLM 高 QPS 场景日志爆.
                     // (恢复后会再次 warn, 让运维感知到再次发生的失败.)
-                    let first_failure = WARNED_API_KEY_FILE.lock().insert(self.id.clone());
+                    let first_failure = WARNED_API_KEY_FILE.lock().insert(id.to_string());
                     if first_failure {
                         tracing::warn!(
-                            provider_id = %self.id,
+                            provider_id = %id,
                             path = %path.display(),
                             error = %e,
                             "failed to read api_key_file; falling back to empty key \
@@ -218,12 +337,6 @@ impl Provider {
         }
         String::new()
     }
-}
-
-/// serde `default` helper: 让 `enabled` 字段缺省为 `true`.
-/// `pub(crate)` 以便 `web::api` 复用 (避免重复定义).
-pub(crate) fn default_true() -> bool {
-    true
 }
 
 /// 校验 base_url. 必须是 http/https, 末尾不带 `/` (避免拼路径时双 `/`).
@@ -249,16 +362,27 @@ impl DynamicEntry for Provider {
 
     fn validate(&self) -> Result<(), String> {
         crate::secrets::validate_id(&self.id)?;
-        if let Some(target) = &self.route_to {
-            // 虚拟 provider: base_url / api_key 被忽略, 允许 base_url 为空.
-            // 自环在此拒绝 (entry-local, 覆盖 static 加载与所有 upsert);
-            // 跨条目成环由 upsert 侧 would_cycle + 运行时 resolve_route 兜底.
-            crate::secrets::validate_id(target)?;
-            if target == &self.id {
-                return Err(format!("provider {} routes to itself", self.id));
+        match &self.kind {
+            ProviderKind::Direct(d) => {
+                validate_base_url(&d.base_url)?;
+                // api_key 与 api_key_file 互斥: 同时设置时语义不明 (effective_api_key
+                // 会优先 api_key, 但这种配置几乎肯定是误操作 — 比如 toml 既填了
+                // api_key 又忘了删 api_key_file).
+                if !d.api_key.is_empty() && d.api_key_file.is_some() {
+                    return Err(format!(
+                        "provider {} has both api_key and api_key_file set; pick one",
+                        self.id
+                    ));
+                }
             }
-        } else {
-            validate_base_url(&self.base_url)?;
+            ProviderKind::Virtual(v) => {
+                // 自环在此拒绝 (entry-local, 覆盖 static 加载与所有 upsert);
+                // 跨条目成环由 upsert 侧 would_cycle + 运行时 resolve_route 兜底.
+                crate::secrets::validate_id(&v.route_to)?;
+                if v.route_to == self.id {
+                    return Err(format!("provider {} routes to itself", self.id));
+                }
+            }
         }
         // model_override 空串非法 (#183): "清空" 语义应省略字段 (TOML) / WebUI 发 "".
         // 静默 normalize (Some("") → None) 会掩盖手滑留下的空配置, fail-fast 更优.
@@ -284,14 +408,6 @@ impl DynamicEntry for Provider {
                 ));
             }
         }
-        // api_key 与 api_key_file 互斥: 同时设置时语义不明 (effective_api_key 会优先 api_key,
-        // 但这种配置几乎肯定是误操作 — 比如 toml 既填了 api_key 又忘了删 api_key_file).
-        if !self.api_key.is_empty() && self.api_key_file.is_some() {
-            return Err(format!(
-                "provider {} has both api_key and api_key_file set; pick one",
-                self.id
-            ));
-        }
         Ok(())
     }
 
@@ -311,22 +427,26 @@ impl DynamicEntry for Provider {
     /// 继承. 让 "PUT api_key=null 保留旧值" 的 override 不落盘明文, 转发仍带旧 key.
     /// 已知限制 (static 基线下空串无法清空): 见根 AGENTS.md "#157 已知限制" 条目.
     ///
-    /// route_to 同语义 (#179): override 未记录 route_to (None) → 从 static 继承.
-    /// 已知限制 (同 #157 型): override 无法把 static 虚拟 provider 改回实体 provider
-    /// (PUT route_to="" 存为 None 后仍被继承回 static 的指向).
+    /// sum type 语义 (#187): 继承只在**同型构造**内发生 (Direct↔Direct 继承鉴权字段).
+    /// 跨型不继承 — override 的构造本身就是显式决策:
+    /// - Direct override + Virtual static = **改回实体** (route_to 无 None 歧义,
+    ///   #179 登记的 "无法改回实体" 限制由类型系统根治);
+    /// - Virtual override + Direct static = 切为虚拟 (Virtual static 无鉴权字段
+    ///   可继承, 与旧行为等价 — 旧实现继承到的也是空).
     fn inherit_from_static(&mut self, static_ver: &Self) {
-        if self.api_key.is_empty() && self.api_key_file.is_none() {
-            self.api_key = static_ver.api_key.clone();
-            self.api_key_file = static_ver.api_key_file.clone();
-        }
-        if self.route_to.is_none() {
-            self.route_to = static_ver.route_to.clone();
-        }
-        // model_override 同语义 (#183): override 未记录 (None) → 从 static 继承.
-        // 已知限制同 route_to: static 配置了 override 的条目无法经 override 清空
-        // (PUT 省略 → 继承回 static 值); 根治同属 #157 schema 演进.
+        // model_override 共享字段, #157 语义不变: override 未记录 → 从 static 继承.
+        // 已知限制: static 配置了 override 的条目无法经 override 清空; 根治属
+        // #157 请求 schema 演进 (PUT null vs ""), 与构造类型无关.
         if self.model_override.is_none() {
             self.model_override = static_ver.model_override.clone();
+        }
+        if let (ProviderKind::Direct(d), ProviderKind::Direct(sd)) =
+            (&mut self.kind, &static_ver.kind)
+            && d.api_key.is_empty()
+            && d.api_key_file.is_none()
+        {
+            d.api_key = sd.api_key.clone();
+            d.api_key_file = sd.api_key_file.clone();
         }
     }
 }
@@ -342,24 +462,21 @@ pub type ProviderTable = DynamicTable<Provider>;
 
 /// Provider 的合并视图项. 同时携带生效值与 provenance, 供路由层与 WebUI 共用.
 ///
-/// - `effective_*` 字段是路由层实际使用的值;
+/// - effective 字段是路由层实际使用的值;
 /// - `static_version` / `dynamic_version` 是原始 baseline, 供 WebUI 渲染对比 / 切换.
 #[derive(Debug, Clone, Serialize)]
 pub struct EffectiveProvider {
-    // ─── effective 字段 (路由层用) ───
+    // ─── effective 共享字段 ───
     pub id: String,
-    pub protocol: Protocol,
-    pub base_url: String,
-    /// 直接值 (api_key 字段) 的 masked 视图. 若 provider 用 api_key_file,
-    /// 这里是空字符串 — 文件内容由 effective_api_key() 在转发时读取, 不进 effective 视图.
-    pub api_key_masked: String,
-    pub api_key_length: usize,
     pub enabled: bool,
     pub name: Option<String>,
-    /// 虚拟 endpoint 的路由目标 (Some = 虚拟 provider). 见 [`Provider::route_to`].
-    pub route_to: Option<String>,
     /// 出站 model 强制重写值 (#183). 见 [`Provider::model_override`].
     pub model_override: Option<String>,
+    /// 构造判别 (直连 / 虚拟), JSON 为 internally tagged flatten:
+    /// `{"kind": "direct", "protocol": ..., "base_url": ...}` /
+    /// `{"kind": "virtual", "route_to": ...}`.
+    #[serde(flatten)]
+    pub kind: EffectiveProviderKind,
 
     // ─── provenance 元信息 (WebUI 渲染用) ───
     pub source: EffectiveSource,
@@ -371,35 +488,61 @@ pub struct EffectiveProvider {
     pub dynamic_version: Option<ProviderMasked>,
 }
 
+/// EffectiveProvider 的构造判别 (sum, #187). 字段集与 [`ProviderKind`] 对应
+/// (api_key 脱敏为 masked 视图; Virtual 的 protocol 可选).
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EffectiveProviderKind {
+    Direct {
+        protocol: Protocol,
+        base_url: String,
+        /// 直接值 (api_key 字段) 的 masked 视图. 若 provider 用 api_key_file,
+        /// 这里是空字符串 — 文件内容由 effective_api_key() 在转发时读取, 不进 effective 视图.
+        api_key_masked: String,
+        api_key_length: usize,
+    },
+    Virtual {
+        route_to: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        protocol: Option<Protocol>,
+    },
+}
+
 /// 对外返回时屏蔽真实 api_key. 仍保留长度提示 (便于排查"是否配置了 key").
 #[derive(Debug, Clone, Serialize)]
 pub struct ProviderMasked {
     pub id: String,
     pub name: Option<String>,
-    pub protocol: Protocol,
-    pub base_url: String,
-    pub api_key_masked: String,
-    pub api_key_length: usize,
     pub enabled: bool,
-    /// 虚拟 endpoint 的路由目标 (Some = 虚拟 provider). 见 [`Provider::route_to`].
-    pub route_to: Option<String>,
     /// 出站 model 强制重写值 (#183). 见 [`Provider::model_override`].
     pub model_override: Option<String>,
+    #[serde(flatten)]
+    pub kind: EffectiveProviderKind,
 }
 
 impl From<Provider> for ProviderMasked {
     fn from(p: Provider) -> Self {
-        let api_key_length = p.api_key.chars().count();
+        let kind = match p.kind {
+            ProviderKind::Direct(d) => {
+                let api_key_length = d.api_key.chars().count();
+                EffectiveProviderKind::Direct {
+                    protocol: d.protocol,
+                    api_key_masked: crate::secrets::mask_value(&d.api_key),
+                    api_key_length,
+                    base_url: d.base_url,
+                }
+            }
+            ProviderKind::Virtual(v) => EffectiveProviderKind::Virtual {
+                route_to: v.route_to,
+                protocol: v.protocol,
+            },
+        };
         Self {
             id: p.id,
             name: p.name,
-            protocol: p.protocol,
-            base_url: p.base_url,
-            api_key_masked: crate::secrets::mask_value(&p.api_key),
-            api_key_length,
             enabled: p.enabled,
-            route_to: p.route_to,
             model_override: p.model_override,
+            kind,
         }
     }
 }
@@ -430,7 +573,7 @@ impl DynamicTable<Provider> {
     /// - visited-set 保证**有限步终止**: 表有限, 重复 id 即环 (validate/would_cycle
     ///   之外的运行时兜底 — 手改 state.toml 或并发写入造成的环在这里安全降级为
     ///   503, 不挂起);
-    /// - `entry` 自身无 route_to 时原样返回 (实体 provider 快路径, 零开销一跳).
+    /// - `entry` 自身是 Direct 时原样返回 (实体 provider 快路径, 零开销一跳).
     ///
     /// 错误消息只含 provider id 与 reason 枚举 (SEC-2 同型, 无 secret),
     /// 经 `AppError::Unavailable` 原样回传客户端 503 body.
@@ -438,25 +581,34 @@ impl DynamicTable<Provider> {
         let mut cur = entry;
         let mut visited = HashSet::from([cur.id.clone()]);
         let mut model_override = cur.model_override.clone();
-        while let Some(target) = cur.route_to.clone() {
-            let next = self
-                .get_effective(&target)
-                .ok_or_else(|| RouteError::Missing(target.clone()))?;
-            if !next.enabled {
-                return Err(RouteError::Disabled(next.id.clone()));
+        loop {
+            match cur.kind {
+                // 链尾 (或入口即实体): 返回. `id` 一并带出 (DirectProvider 不持有 id,
+                // downstream 的 CallEvent.upstream_id 需要).
+                ProviderKind::Direct(direct) => {
+                    return Ok(ResolvedRoute {
+                        id: cur.id,
+                        provider: direct,
+                        model_override,
+                    });
+                }
+                ProviderKind::Virtual(virtual_) => {
+                    let next = self
+                        .get_effective(&virtual_.route_to)
+                        .ok_or_else(|| RouteError::Missing(virtual_.route_to.clone()))?;
+                    if !next.enabled {
+                        return Err(RouteError::Disabled(next.id.clone()));
+                    }
+                    if !visited.insert(next.id.clone()) {
+                        return Err(RouteError::Cycle(next.id));
+                    }
+                    if model_override.is_none() {
+                        model_override = next.model_override.clone();
+                    }
+                    cur = next;
+                }
             }
-            if !visited.insert(next.id.clone()) {
-                return Err(RouteError::Cycle(next.id));
-            }
-            if model_override.is_none() {
-                model_override = next.model_override.clone();
-            }
-            cur = next;
         }
-        Ok(ResolvedRoute {
-            provider: cur,
-            model_override,
-        })
     }
 
     /// upsert 前校验: 写入 `entry` 后 route_to 链是否会成环 (WebUI 侧拒绝, 400).
@@ -466,21 +618,29 @@ impl DynamicTable<Provider> {
     /// decision-disabled) 视为链断 — **不算环** (悬空写入放行以保证创建顺序无关,
     /// 运行时由 `resolve_route` 503 兜底).
     ///
-    /// 已知偏差 (仅漏报方向, 无误报): 检查图用 override **原始值**覆盖该 id — 若
-    /// 落库后经 `inherit_from_static` 展开为 Some (static 虚拟 + override 未记录),
-    /// 实际链可能成环而此处未检; 该前提要求表已含环 (static 手写), 本就是运行时
-    /// 兜底的场景. 并发写入的 TOCTOU 窗口 (检查与 upsert 非同一临界区) 同理 —
-    /// 单用户本地工具的可接受假设 (与 update_provider 的 #157 TOCTOU 声明一致),
-    /// 漏网环由 `resolve_route` visited-set 兜底为 503.
+    /// 并发写入的 TOCTOU 窗口 (检查与 upsert 非同一临界区): 两个并发 PUT 交错可让
+    /// 环落库 — 单用户本地工具的可接受假设 (与 update_provider 的 #157 TOCTOU 声明
+    /// 一致), 漏网环由 `resolve_route` visited-set 兜底为 503.
     pub fn would_cycle(&self, entry: &Provider) -> bool {
+        // 检查图: id → route_to (Virtual 构造的目标; Direct 为 None = 链终止).
         let mut hops: HashMap<String, Option<String>> = self
             .effective_snapshot()
             .into_iter()
-            .map(|e| (e.id.clone(), e.route_to.clone()))
+            .map(|e| {
+                let target = match &e.kind {
+                    EffectiveProviderKind::Virtual { route_to, .. } => Some(route_to.clone()),
+                    EffectiveProviderKind::Direct { .. } => None,
+                };
+                (e.id.clone(), target)
+            })
             .collect();
-        hops.insert(entry.id.clone(), entry.route_to.clone());
+        let entry_target = match &entry.kind {
+            ProviderKind::Virtual(v) => Some(v.route_to.clone()),
+            ProviderKind::Direct(..) => None,
+        };
+        hops.insert(entry.id.clone(), entry_target.clone());
         let mut visited = HashSet::from([entry.id.clone()]);
-        let mut cur = entry.route_to.clone();
+        let mut cur = entry_target;
         while let Some(id) = cur {
             if !visited.insert(id.clone()) {
                 return true;
@@ -528,8 +688,10 @@ impl std::error::Error for RouteError {}
 /// `model_override` = 沿链 first-wins 收集的非空值 (全链未配置 → None, 即透传).
 #[derive(Debug, Clone)]
 pub struct ResolvedRoute {
-    /// 链尾实体 provider (route_to = None 的那一跳; 非虚拟请求即入口自身).
-    pub provider: Provider,
+    /// 链尾实体 provider 的 id (非虚拟请求即入口 id; CallEvent.upstream_id 用).
+    pub id: String,
+    /// 链尾实体 provider — **类型上保证是 Direct** (转发链只处理实体, #187).
+    pub provider: DirectProvider,
     /// 链上生效的 model_override (first-wins; None = 客户端 model 透传).
     pub model_override: Option<String>,
 }
@@ -547,19 +709,22 @@ fn compute_effective_provider(
     let raw = pick_with_inherit(static_ver.clone(), dynamic_ver.clone(), mode)?;
     let source = classify_source(static_ver.is_some(), dynamic_ver.is_some(), mode)
         .expect("pick (with inherit) Some ⇒ classify_source Some");
-    let api_key_length = raw.api_key.chars().count();
+    // kind 派生: 复用 ProviderMasked 的脱敏映射 (同一映射逻辑, SSOT).
+    let ProviderMasked {
+        id,
+        name,
+        enabled,
+        model_override,
+        kind,
+    } = ProviderMasked::from(raw);
     let static_masked = static_ver.map(ProviderMasked::from);
     let dynamic_masked = dynamic_ver.map(ProviderMasked::from);
     Some(EffectiveProvider {
-        api_key_masked: crate::secrets::mask_value(&raw.api_key),
-        api_key_length,
-        id: raw.id,
-        protocol: raw.protocol,
-        base_url: raw.base_url,
-        enabled: raw.enabled,
-        name: raw.name,
-        route_to: raw.route_to,
-        model_override: raw.model_override,
+        id,
+        enabled,
+        name,
+        model_override,
+        kind,
         source,
         decision: mode,
         static_version: static_masked,
@@ -580,23 +745,43 @@ mod tests {
     fn p(id: &str, proto: Protocol, base: &str) -> Provider {
         Provider {
             id: id.into(),
-            protocol: proto,
-            base_url: base.into(),
-            api_key: format!("k-{id}"),
-            api_key_file: None,
             enabled: true,
             name: Some(format!("name-{id}")),
-            route_to: None,
             model_override: None,
+            kind: ProviderKind::Direct(DirectProvider {
+                protocol: proto,
+                base_url: base.into(),
+                api_key: format!("k-{id}"),
+                api_key_file: None,
+            }),
         }
     }
 
-    /// 虚拟 provider (route_to = target). base_url 留空 (虚拟语义下被忽略).
+    /// 虚拟 provider (route_to = target). protocol 默认 Some(OpenAI) 模拟旧格式
+    /// (平铺 wire 必有 protocol, 读入的 Virtual 总携带).
     fn v(id: &str, target: &str) -> Provider {
         Provider {
-            route_to: Some(target.into()),
-            base_url: String::new(),
+            kind: ProviderKind::Virtual(VirtualProvider {
+                route_to: target.into(),
+                protocol: Some(Protocol::OpenAI),
+            }),
             ..p(id, Protocol::OpenAI, "")
+        }
+    }
+
+    /// 取 Provider 的 Direct 负载 (测试断言用; panic 表明构造不是 Direct).
+    fn direct(p: &Provider) -> &DirectProvider {
+        match &p.kind {
+            ProviderKind::Direct(d) => d,
+            ProviderKind::Virtual(_) => panic!("expected Direct provider"),
+        }
+    }
+
+    /// 可变取 Direct 负载 (测试改造用).
+    fn direct_mut(p: &mut Provider) -> &mut DirectProvider {
+        match &mut p.kind {
+            ProviderKind::Direct(d) => d,
+            ProviderKind::Virtual(_) => panic!("expected Direct provider"),
         }
     }
 
@@ -658,11 +843,14 @@ mod tests {
             enabled = true
         "#;
         let p: Provider = toml::from_str(toml_text).expect("toml parse");
+        let ProviderKind::Direct(d) = &p.kind else {
+            panic!("legacy direct provider must parse as Direct");
+        };
         assert_eq!(
-            p.api_key_file.as_deref(),
+            d.api_key_file.as_deref(),
             Some(std::path::Path::new("/run/secrets/test-key"))
         );
-        assert_eq!(p.api_key, ""); // 默认值
+        assert_eq!(d.api_key, ""); // 默认值
     }
 
     #[test]
@@ -676,8 +864,11 @@ mod tests {
             enabled = true
         "#;
         let p: Provider = toml::from_str(toml_text).expect("toml parse");
-        assert_eq!(p.api_key, "sk-legacy");
-        assert!(p.api_key_file.is_none());
+        let ProviderKind::Direct(d) = &p.kind else {
+            panic!("legacy direct provider must parse as Direct");
+        };
+        assert_eq!(d.api_key, "sk-legacy");
+        assert!(d.api_key_file.is_none());
     }
 
     // ─── DynamicEntry impl: Provider 特有的 validate 钩子 ───────────────
@@ -687,28 +878,30 @@ mod tests {
         // id 校验失败.
         let bad_id = Provider {
             id: "has space".into(),
-            protocol: Protocol::OpenAI,
-            base_url: "https://x".into(),
-            api_key: String::new(),
-            api_key_file: None,
             enabled: true,
             name: None,
-            route_to: None,
             model_override: None,
+            kind: ProviderKind::Direct(DirectProvider {
+                protocol: Protocol::OpenAI,
+                base_url: "https://x".into(),
+                api_key: String::new(),
+                api_key_file: None,
+            }),
         };
         assert!(bad_id.validate().is_err());
 
         // base_url 校验失败.
         let bad_url = Provider {
             id: "x".into(),
-            protocol: Protocol::OpenAI,
-            base_url: "not-a-url".into(),
-            api_key: String::new(),
-            api_key_file: None,
             enabled: true,
             name: None,
-            route_to: None,
             model_override: None,
+            kind: ProviderKind::Direct(DirectProvider {
+                protocol: Protocol::OpenAI,
+                base_url: "not-a-url".into(),
+                api_key: String::new(),
+                api_key_file: None,
+            }),
         };
         assert!(bad_url.validate().is_err());
 
@@ -720,14 +913,15 @@ mod tests {
     fn validate_rejects_api_key_and_file_both_set() {
         let both = Provider {
             id: "x".into(),
-            protocol: Protocol::OpenAI,
-            base_url: "https://x".into(),
-            api_key: "sk-direct".into(),
-            api_key_file: Some(PathBuf::from("/run/secrets/whatever")),
             enabled: true,
             name: None,
-            route_to: None,
             model_override: None,
+            kind: ProviderKind::Direct(DirectProvider {
+                protocol: Protocol::OpenAI,
+                base_url: "https://x".into(),
+                api_key: "sk-direct".into(),
+                api_key_file: Some(PathBuf::from("/run/secrets/whatever")),
+            }),
         };
         let err = both.validate().unwrap_err();
         assert!(err.contains("both api_key and api_key_file"), "got: {err}");
@@ -740,16 +934,17 @@ mod tests {
         // 即便 api_key_file 指向不存在的文件, 直接值优先 (且 validate 不会让你同时设两者).
         let p = Provider {
             id: "x".into(),
-            protocol: Protocol::OpenAI,
-            base_url: "https://x".into(),
-            api_key: "sk-direct".into(),
-            api_key_file: None,
             enabled: true,
             name: None,
-            route_to: None,
             model_override: None,
+            kind: ProviderKind::Direct(DirectProvider {
+                protocol: Protocol::OpenAI,
+                base_url: "https://x".into(),
+                api_key: "sk-direct".into(),
+                api_key_file: None,
+            }),
         };
-        assert_eq!(p.effective_api_key(), "sk-direct");
+        assert_eq!(direct(&p).effective_api_key("x"), "sk-direct");
     }
 
     #[test]
@@ -764,16 +959,17 @@ mod tests {
 
         let p = Provider {
             id: "x".into(),
-            protocol: Protocol::OpenAI,
-            base_url: "https://x".into(),
-            api_key: String::new(),
-            api_key_file: Some(tmp.clone()),
             enabled: true,
             name: None,
-            route_to: None,
             model_override: None,
+            kind: ProviderKind::Direct(DirectProvider {
+                protocol: Protocol::OpenAI,
+                base_url: "https://x".into(),
+                api_key: String::new(),
+                api_key_file: Some(tmp.clone()),
+            }),
         };
-        assert_eq!(p.effective_api_key(), "sk-from-file");
+        assert_eq!(direct(&p).effective_api_key("x"), "sk-from-file");
 
         std::fs::remove_file(&tmp).ok();
     }
@@ -783,16 +979,17 @@ mod tests {
         // 单 provider 配置错误不应拖垮整个进程 — 返回空让 apply_provider_auth 跳过.
         let p = Provider {
             id: "x".into(),
-            protocol: Protocol::OpenAI,
-            base_url: "https://x".into(),
-            api_key: String::new(),
-            api_key_file: Some(PathBuf::from("/nonexistent/path/should/not/exist")),
             enabled: true,
             name: None,
-            route_to: None,
             model_override: None,
+            kind: ProviderKind::Direct(DirectProvider {
+                protocol: Protocol::OpenAI,
+                base_url: "https://x".into(),
+                api_key: String::new(),
+                api_key_file: Some(PathBuf::from("/nonexistent/path/should/not/exist")),
+            }),
         };
-        assert_eq!(p.effective_api_key(), "");
+        assert_eq!(direct(&p).effective_api_key("x"), "");
     }
 
     // ─── effective_api_key warn-once 恢复契约 ────────────────────────────────
@@ -820,18 +1017,19 @@ mod tests {
         let pid = format!("recover-test-{unique}");
         let make_provider = || Provider {
             id: pid.clone(),
-            protocol: Protocol::OpenAI,
-            base_url: "https://x".into(),
-            api_key: String::new(),
-            api_key_file: Some(tmp.clone()),
             enabled: true,
             name: None,
-            route_to: None,
             model_override: None,
+            kind: ProviderKind::Direct(DirectProvider {
+                protocol: Protocol::OpenAI,
+                base_url: "https://x".into(),
+                api_key: String::new(),
+                api_key_file: Some(tmp.clone()),
+            }),
         };
 
         // 1. 文件不存在 → 空 + WARNED 被插入 (首次失败).
-        assert_eq!(make_provider().effective_api_key(), "");
+        assert_eq!(direct(&make_provider()).effective_api_key(&pid), "");
         assert!(
             WARNED_API_KEY_FILE.lock().contains(&pid),
             "first failure must record provider in WARNED set"
@@ -839,7 +1037,10 @@ mod tests {
 
         // 2. 创建文件 → 读到内容 + WARNED 被清除 (恢复路径).
         std::fs::write(&tmp, "sk-recovered\n").unwrap();
-        assert_eq!(make_provider().effective_api_key(), "sk-recovered");
+        assert_eq!(
+            direct(&make_provider()).effective_api_key(&pid),
+            "sk-recovered"
+        );
         assert!(
             WARNED_API_KEY_FILE.lock().get(&pid).is_none(),
             "recovery must clear WARNED record so next failure re-warns"
@@ -847,7 +1048,7 @@ mod tests {
 
         // 3. 再次删除文件 → 仍能正确返回空 + 重新插入 WARNED (状态机可循环).
         std::fs::remove_file(&tmp).unwrap();
-        assert_eq!(make_provider().effective_api_key(), "");
+        assert_eq!(direct(&make_provider()).effective_api_key(&pid), "");
         assert!(
             WARNED_API_KEY_FILE.lock().contains(&pid),
             "failure after recovery must re-record (warn-once state machine resets)"
@@ -865,16 +1066,17 @@ mod tests {
         let pid = format!("warn-once-{unique}");
         let p = Provider {
             id: pid.clone(),
-            protocol: Protocol::OpenAI,
-            base_url: "https://x".into(),
-            api_key: String::new(),
-            api_key_file: Some(PathBuf::from("/nonexistent/warn-once-test")),
             enabled: true,
             name: None,
-            route_to: None,
             model_override: None,
+            kind: ProviderKind::Direct(DirectProvider {
+                protocol: Protocol::OpenAI,
+                base_url: "https://x".into(),
+                api_key: String::new(),
+                api_key_file: Some(PathBuf::from("/nonexistent/warn-once-test")),
+            }),
         };
-        assert_eq!(p.effective_api_key(), "");
+        assert_eq!(direct(&p).effective_api_key(&pid), "");
         assert!(
             WARNED_API_KEY_FILE.lock().contains(&pid),
             "missing file must populate WARNED set for warn-once dedup"
@@ -887,16 +1089,17 @@ mod tests {
     fn effective_api_key_neither_set_returns_empty() {
         let p = Provider {
             id: "x".into(),
-            protocol: Protocol::OpenAI,
-            base_url: "https://x".into(),
-            api_key: String::new(),
-            api_key_file: None,
             enabled: true,
             name: None,
-            route_to: None,
             model_override: None,
+            kind: ProviderKind::Direct(DirectProvider {
+                protocol: Protocol::OpenAI,
+                base_url: "https://x".into(),
+                api_key: String::new(),
+                api_key_file: None,
+            }),
         };
-        assert_eq!(p.effective_api_key(), "");
+        assert_eq!(direct(&p).effective_api_key("x"), "");
     }
 
     // ─── effective_snapshot: 类型特定的 masked 视图 ─────────────────────
@@ -935,8 +1138,16 @@ mod tests {
         assert_eq!(s.source, EffectiveSource::Static);
         assert!(s.dynamic_version.is_none());
         assert!(s.static_version.is_some());
-        assert_ne!(s.api_key_masked, "k-static-only");
-        assert_eq!(s.api_key_length, "k-static-only".chars().count());
+        let EffectiveProviderKind::Direct {
+            api_key_masked,
+            api_key_length,
+            ..
+        } = &s.kind
+        else {
+            panic!("static-only must be Direct");
+        };
+        assert_ne!(api_key_masked, "k-static-only");
+        assert_eq!(*api_key_length, "k-static-only".chars().count());
 
         let d = by_id.get("dynamic-only").unwrap();
         assert_eq!(d.source, EffectiveSource::Dynamic);
@@ -944,7 +1155,10 @@ mod tests {
 
         let ov = by_id.get("override-id").unwrap();
         assert_eq!(ov.source, EffectiveSource::DynamicOverride);
-        assert_eq!(ov.base_url, "https://dynamic-override");
+        let EffectiveProviderKind::Direct { base_url, .. } = &ov.kind else {
+            panic!("override-id must be Direct");
+        };
+        assert_eq!(base_url, "https://dynamic-override");
         assert!(ov.static_version.is_some());
         assert!(ov.dynamic_version.is_some());
     }
@@ -958,14 +1172,15 @@ mod tests {
     #[test]
     fn inherit_from_static_fills_unrecorded_auth_fields() {
         let mut s = p("x", Protocol::OpenAI, "https://s");
-        s.api_key = "sk-static".into();
+        direct_mut(&mut s).api_key = "sk-static".into();
         let mut d = p("x", Protocol::OpenAI, "https://d");
-        d.api_key = String::new();
-        d.api_key_file = None;
+        direct_mut(&mut d).api_key = String::new();
+        direct_mut(&mut d).api_key_file = None;
         d.inherit_from_static(&s);
-        assert_eq!(d.api_key, "sk-static");
+        assert_eq!(direct(&d).api_key, "sk-static");
         assert_eq!(
-            d.base_url, "https://d",
+            direct(&d).base_url,
+            "https://d",
             "non-auth fields must stay from override"
         );
     }
@@ -973,42 +1188,45 @@ mod tests {
     #[test]
     fn inherit_from_static_skips_when_override_records_auth() {
         let mut s = p("x", Protocol::OpenAI, "https://s");
-        s.api_key = "sk-static".into();
+        direct_mut(&mut s).api_key = "sk-static".into();
 
         // override 显式记录了 api_key → 不继承.
         let mut d1 = p("x", Protocol::OpenAI, "https://d");
-        d1.api_key = "sk-dyn".into();
+        direct_mut(&mut d1).api_key = "sk-dyn".into();
         d1.inherit_from_static(&s);
-        assert_eq!(d1.api_key, "sk-dyn");
+        assert_eq!(direct(&d1).api_key, "sk-dyn");
 
         // override 显式记录了 api_key_file → 不继承 (含 static 的 api_key).
         let mut d2 = p("x", Protocol::OpenAI, "https://d");
-        d2.api_key = String::new();
-        d2.api_key_file = Some(PathBuf::from("/run/secrets/k"));
+        direct_mut(&mut d2).api_key = String::new();
+        direct_mut(&mut d2).api_key_file = Some(PathBuf::from("/run/secrets/k"));
         d2.inherit_from_static(&s);
-        assert_eq!(d2.api_key, "");
-        assert_eq!(d2.api_key_file, Some(PathBuf::from("/run/secrets/k")));
+        assert_eq!(direct(&d2).api_key, "");
+        assert_eq!(
+            direct(&d2).api_key_file,
+            Some(PathBuf::from("/run/secrets/k"))
+        );
     }
 
     #[test]
     fn get_effective_inherits_unrecorded_api_key_from_static() {
         let tmp = tempfile_path();
         let mut s = p("x", Protocol::OpenAI, "https://s");
-        s.api_key = "sk-static".into();
+        direct_mut(&mut s).api_key = "sk-static".into();
         let mut d = p("x", Protocol::OpenAI, "https://d");
-        d.api_key = String::new(); // override 未记录 key (#157: 不落盘明文)
+        direct_mut(&mut d).api_key = String::new(); // override 未记录 key (#157: 不落盘明文)
         let t = ProviderTable::new(vec![s], vec![d], empty_decisions(), tmp);
 
         // Default: dynamic 被选中 + 未记录 key → effective 从 static 继承.
         let eff = t.get_effective("x").unwrap();
-        assert_eq!(eff.base_url, "https://d");
-        assert_eq!(eff.api_key, "sk-static");
+        assert_eq!(direct(&eff).base_url, "https://d");
+        assert_eq!(direct(&eff).api_key, "sk-static");
 
         // PreferStatic: static 本身被选中, 继承无意义但也无害.
         t.set_decision("x", OverrideMode::PreferStatic).unwrap();
         let eff = t.get_effective("x").unwrap();
-        assert_eq!(eff.base_url, "https://s");
-        assert_eq!(eff.api_key, "sk-static");
+        assert_eq!(direct(&eff).base_url, "https://s");
+        assert_eq!(direct(&eff).api_key, "sk-static");
 
         // Disabled: 不存在 effective.
         t.set_decision("x", OverrideMode::Disabled).unwrap();
@@ -1020,15 +1238,23 @@ mod tests {
         // WebUI 视图与路由层行为一致 (#157): 继承后的 masked/length 也要反映 static key.
         let tmp = tempfile_path();
         let mut s = p("x", Protocol::OpenAI, "https://s");
-        s.api_key = "sk-static-key".into();
+        direct_mut(&mut s).api_key = "sk-static-key".into();
         let mut d = p("x", Protocol::OpenAI, "https://d");
-        d.api_key = String::new();
+        direct_mut(&mut d).api_key = String::new();
         let t = ProviderTable::new(vec![s], vec![d], empty_decisions(), tmp);
         let snap = t.effective_snapshot();
         assert_eq!(snap.len(), 1);
-        assert_eq!(snap[0].api_key_length, "sk-static-key".chars().count());
+        let eff_len = match &snap[0].kind {
+            EffectiveProviderKind::Direct { api_key_length, .. } => *api_key_length,
+            _ => panic!("must be Direct"),
+        };
+        assert_eq!(eff_len, "sk-static-key".chars().count());
         // dynamic_version 的 masked 仍显示 override 自身 (空) — 派生视图分离, 不混入.
-        assert_eq!(snap[0].dynamic_version.as_ref().unwrap().api_key_length, 0);
+        let dyn_len = match &snap[0].dynamic_version.as_ref().unwrap().kind {
+            EffectiveProviderKind::Direct { api_key_length, .. } => *api_key_length,
+            _ => panic!("must be Direct"),
+        };
+        assert_eq!(dyn_len, 0);
     }
 
     // ─── 虚拟 provider 路由 (#179): resolve_route / would_cycle / validate ──
@@ -1038,7 +1264,7 @@ mod tests {
     /// 表: real → mock 上游; v1 → v2 → real (两跳链).
     fn route_table() -> ProviderTable {
         let mut real = p("real", Protocol::OpenAI, "https://upstream");
-        real.api_key = "sk-real".into();
+        direct_mut(&mut real).api_key = "sk-real".into();
         let v2 = v("v2", "real");
         let v1 = v("v1", "v2");
         ProviderTable::new(
@@ -1054,10 +1280,13 @@ mod tests {
         // 实体 provider (route_to=None) 原样返回, 零额外跳.
         let t = route_table();
         let real = t.get_effective("real").unwrap();
-        let out = t.resolve_route(real.clone()).unwrap().provider;
+        let out = t.resolve_route(real.clone()).unwrap();
         assert_eq!(out.id, "real");
-        assert_eq!(out.base_url, "https://upstream");
-        assert_eq!(out.api_key, "sk-real", "resolved provider carries real key");
+        assert_eq!(out.provider.base_url, "https://upstream");
+        assert_eq!(
+            out.provider.api_key, "sk-real",
+            "resolved provider carries real key"
+        );
     }
 
     #[test]
@@ -1065,10 +1294,10 @@ mod tests {
         // v1 → v2 → real: 解析到链尾实体, 携带其实体字段 (base_url/api_key).
         let t = route_table();
         let v1 = t.get_effective("v1").unwrap();
-        let out = t.resolve_route(v1).unwrap().provider;
+        let out = t.resolve_route(v1).unwrap();
         assert_eq!(out.id, "real");
-        assert_eq!(out.base_url, "https://upstream");
-        assert_eq!(out.api_key, "sk-real");
+        assert_eq!(out.provider.base_url, "https://upstream");
+        assert_eq!(out.provider.api_key, "sk-real");
     }
 
     #[test]
@@ -1174,8 +1403,7 @@ mod tests {
         let err = self_loop.validate().unwrap_err();
         assert!(err.contains("routes to itself"), "got: {err}");
         // 实体: 空 base_url 仍然拒绝 (现有行为不变).
-        let mut real = p("r", Protocol::OpenAI, "");
-        real.route_to = None;
+        let real = p("r", Protocol::OpenAI, "");
         assert!(real.validate().is_err());
     }
 
@@ -1188,7 +1416,7 @@ mod tests {
             base_url = "https://api.example.com"
         "#;
         let p: Provider = toml::from_str(legacy).expect("legacy parse");
-        assert!(p.route_to.is_none());
+        assert!(matches!(p.kind, ProviderKind::Direct(_)));
 
         let virtual_toml = r#"
             id = "my-virtual"
@@ -1196,31 +1424,63 @@ mod tests {
             route_to = "openai-main"
         "#;
         let p: Provider = toml::from_str(virtual_toml).expect("virtual parse");
-        assert_eq!(p.route_to.as_deref(), Some("openai-main"));
-        assert_eq!(p.base_url, "", "virtual provider: empty base_url tolerated");
+        let ProviderKind::Virtual(v) = &p.kind else {
+            panic!("route_to present must parse as Virtual");
+        };
+        assert_eq!(v.route_to, "openai-main");
+        assert_eq!(v.protocol, Some(Protocol::OpenAI));
         assert!(p.validate().is_ok());
     }
 
     #[test]
-    fn inherit_from_static_covers_route_to() {
-        // static 虚拟 + override 未记录 route_to → 继承指向 (路由层与 WebUI 视图一致).
+    fn direct_override_replaces_static_virtual() {
+        // #187 根治: static 虚拟 + Direct override = **改回实体** — 跨型不继承,
+        // route_to 无 None 歧义 (#179 时代的 "无法改回实体" 限制由类型系统消灭).
         let tmp = tempfile_path();
-        let s = v("x", "real");
         let mut d = p("x", Protocol::OpenAI, "https://d");
-        d.route_to = None; // override 未记录 (#179 同 #157 语义)
+        direct_mut(&mut d).api_key = "sk-dyn".into();
         let t = ProviderTable::new(
-            vec![s, p("real", Protocol::OpenAI, "https://u")],
+            vec![v("x", "real"), p("real", Protocol::OpenAI, "https://u")],
             vec![d],
             empty_decisions(),
             tmp,
         );
-        assert_eq!(
-            t.get_effective("x").unwrap().route_to.as_deref(),
-            Some("real")
+        let eff = t.get_effective("x").unwrap();
+        assert!(matches!(eff.kind, ProviderKind::Direct(_)));
+        // 路由解析直达自身 (实体快路径), 携带 override 的鉴权字段.
+        let r = t.resolve_route(eff).unwrap();
+        assert_eq!(r.id, "x");
+        assert_eq!(r.provider.base_url, "https://d");
+        assert_eq!(r.provider.api_key, "sk-dyn");
+    }
+
+    #[test]
+    fn static_direct_key_survives_virtual_excursion() {
+        // 互补链 (#187): static Direct → Virtual override → 再 Direct override —
+        // 第二次 override 的 api_key 未记录 → Direct↔Direct 继承从 static 复原.
+        // (dynamic-only 条目无此复原来源, 是 AGENTS.md 登记的已知限制.)
+        let tmp = tempfile_path();
+        let mut s = p("x", Protocol::OpenAI, "https://s");
+        direct_mut(&mut s).api_key = "sk-static".into();
+        // 第一步: Virtual override (切换为虚拟).
+        let t1 = ProviderTable::new(
+            vec![s.clone(), p("real", Protocol::OpenAI, "https://u")],
+            vec![v("x", "real")],
+            empty_decisions(),
+            tempfile_path(),
         );
-        let snap = t.effective_snapshot();
-        let x = snap.iter().find(|e| e.id == "x").unwrap();
-        assert_eq!(x.route_to.as_deref(), Some("real"));
+        assert!(matches!(
+            t1.get_effective("x").unwrap().kind,
+            ProviderKind::Virtual(_)
+        ));
+        // 第二步: 再切回 Direct override, api_key 未记录 (PUT null 语义).
+        let mut back = p("x", Protocol::OpenAI, "https://d");
+        direct_mut(&mut back).api_key = String::new();
+        let t2 = ProviderTable::new(vec![s], vec![back], empty_decisions(), tmp);
+        let eff = t2.get_effective("x").unwrap();
+        // Direct override 胜出 + key 从 static Direct 继承复原.
+        assert_eq!(direct(&eff).base_url, "https://d");
+        assert_eq!(direct(&eff).api_key, "sk-static");
     }
 
     #[test]
@@ -1240,15 +1500,18 @@ mod tests {
         );
 
         // Default: override 生效 → real2.
-        assert_eq!(
-            t.get_effective("x").unwrap().route_to.as_deref(),
-            Some("real2")
-        );
+        assert!(matches!(
+            &t.get_effective("x").unwrap().kind,
+            ProviderKind::Virtual(v) if v.route_to == "real2"
+        ));
         // PreferStatic: static 整条生效 → real1 (inherit 对 static 自身是 no-op).
         t.set_decision("x", OverrideMode::PreferStatic).unwrap();
         let eff = t.get_effective("x").unwrap();
-        assert_eq!(eff.route_to.as_deref(), Some("real1"));
-        assert_eq!(t.resolve_route(eff).unwrap().provider.id, "real1");
+        assert!(matches!(
+            &eff.kind,
+            ProviderKind::Virtual(v) if v.route_to == "real1"
+        ));
+        assert_eq!(t.resolve_route(eff).unwrap().id, "real1");
     }
 
     #[test]
@@ -1293,7 +1556,7 @@ mod tests {
         // 三层全配 → 入口的 A 胜.
         let r = t.resolve_route(t.get_effective("entry").unwrap()).unwrap();
         assert_eq!(r.model_override.as_deref(), Some("model-A"));
-        assert_eq!(r.provider.id, "real");
+        assert_eq!(r.id, "real");
 
         // 中间层直连 (跳过 entry) → B 胜.
         let r = t.resolve_route(t.get_effective("mid").unwrap()).unwrap();
@@ -1449,9 +1712,8 @@ mod tests {
             for id in &ids {
                 if let Some(entry) = t.get_effective(id) {
                     // Err 分支 = 有限步返回明确错误 (同样满足终止性), 无需断言.
-                    if let Ok(resolved) = t.resolve_route(entry) {
-                        proptest::prop_assert!(resolved.provider.route_to.is_none());
-                    }
+                    // Ok ⇒ 链尾必为 Direct (类型保证, 无需运行时断言); 有限步返回即满足终止性.
+                    let _ = t.resolve_route(entry);
                 }
             }
         }

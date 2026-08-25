@@ -65,7 +65,7 @@ pub struct SecretEntry {
     pub value: String,
     /// 可选: 从文件路径读取 secret 明文. 与 [`SecretEntry::value`] 互斥.
     ///
-    /// # 设计意图 (与 [`crate::provider::Provider::api_key_file`] 对称)
+    /// # 设计意图 (与 [`crate::provider::DirectProvider::api_key_file`] 对称)
     ///
     /// 让 `secret-guard.toml` 本身不含敏感数据, secret 由外部机制 (sops-nix /
     /// systemd LoadCredential / docker secrets / k8s secrets) 解密到独立路径.
@@ -157,7 +157,7 @@ impl SecretEntry {
     /// # 与 Provider 的差异
     ///
     /// Provider 不需要此序列 — 它的 `api_key` 允许空 (Ollama 等场景), 且 `effective_api_key`
-    /// 是运行时每次请求读文件. 见 [`crate::provider::Provider::effective_api_key`].
+    /// 是运行时每次请求读文件. 见 [`crate::provider::DirectProvider::effective_api_key`].
     pub fn validate_and_resolve(&mut self, global_mock_prefix: &str) -> Result<(), String> {
         self.validate()?;
         self.resolve_value()?;

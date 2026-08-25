@@ -23,7 +23,7 @@ use bytes::Bytes;
 use tracing::{debug, warn};
 
 use crate::error::AppError;
-use crate::provider::{Protocol, Provider};
+use crate::provider::{DirectProvider, Protocol};
 
 use super::auth::apply_provider_auth;
 use super::helpers::{
@@ -45,7 +45,8 @@ pub(crate) async fn same_proto_forward(
     parts: axum::http::request::Parts,
     req_bytes: Bytes,
     ingress: Protocol,
-    provider: Provider,
+    provider: DirectProvider,
+    upstream_id: &str,
     model_override: Option<String>,
     started: Instant,
     secrets_snapshot: Vec<crate::secrets::SecretEntry>,
@@ -54,8 +55,17 @@ pub(crate) async fn same_proto_forward(
     // egress IR 的 model 字段, 强制走 IR 路径 (FWD-1 修订的契约代价).
     if secrets_snapshot.is_empty() && model_override.is_none() {
         // 字节透传: 不进入 codec, 不做 redact. 这是最热路径 (多数 provider 无 secret).
-        return same_proto_passthrough(state, fp, parts, req_bytes, ingress, provider, started)
-            .await;
+        return same_proto_passthrough(
+            state,
+            fp,
+            parts,
+            req_bytes,
+            ingress,
+            provider,
+            upstream_id,
+            started,
+        )
+        .await;
     }
 
     // IR 路径 (启用 redact / model 改写).
@@ -70,11 +80,20 @@ pub(crate) async fn same_proto_forward(
              cover {}; requests will be forwarded as-is (secrets unredacted / model not \
              rewritten)",
             ingress.name(),
-            provider.id,
+            upstream_id,
             ingress.name()
         );
-        return same_proto_passthrough(state, fp, parts, req_bytes, ingress, provider, started)
-            .await;
+        return same_proto_passthrough(
+            state,
+            fp,
+            parts,
+            req_bytes,
+            ingress,
+            provider,
+            upstream_id,
+            started,
+        )
+        .await;
     };
 
     let reader = codec_proto.reader();
@@ -150,7 +169,11 @@ pub(crate) async fn same_proto_forward(
     let mut fwd_headers = sanitize_request_headers(&parts.headers);
     fwd_headers.remove(axum::http::header::CONTENT_TYPE);
     fwd_headers.remove(axum::http::header::CONTENT_LENGTH);
-    apply_provider_auth(&mut fwd_headers, &provider.effective_api_key(), ingress);
+    apply_provider_auth(
+        &mut fwd_headers,
+        &provider.effective_api_key(upstream_id),
+        ingress,
+    );
 
     // 8. push 到 DAG (真实 messages + CallEvent 元数据).
     let path_for_record = format!(
@@ -166,7 +189,7 @@ pub(crate) async fn same_proto_forward(
         &req_text_for_record,
         Some(&ir),
         Some(codec_proto),
-        &provider.id,
+        upstream_id,
         model_override.as_deref(),
         redact_seed,
         Some(&secrets_snapshot),
@@ -214,7 +237,7 @@ pub(crate) async fn same_proto_forward(
     if ir.stream && !streamed && !redaction_map.is_empty() {
         warn!(
             %record_id,
-            provider = %provider.id,
+            provider = %upstream_id,
             content_type = %content_type,
             "upstream returned non-SSE content-type for a stream=true request; \
              falling back to buffered path"
@@ -283,7 +306,8 @@ async fn same_proto_passthrough(
     parts: axum::http::request::Parts,
     req_bytes: Bytes,
     ingress: Protocol,
-    provider: Provider,
+    provider: DirectProvider,
+    upstream_id: &str,
     started: Instant,
 ) -> Result<Response<Body>, AppError> {
     let req_text_for_record = utf8_view(&req_bytes);
@@ -295,7 +319,11 @@ async fn same_proto_passthrough(
     let upstream_url = build_upstream_url(&provider.base_url, &format!("{}{query}", fp.rest));
 
     let mut fwd_headers = sanitize_request_headers(&parts.headers);
-    apply_provider_auth(&mut fwd_headers, &provider.effective_api_key(), ingress);
+    apply_provider_auth(
+        &mut fwd_headers,
+        &provider.effective_api_key(upstream_id),
+        ingress,
+    );
 
     let path_for_record = format!(
         "/{}/{}/{}",
@@ -313,7 +341,7 @@ async fn same_proto_passthrough(
         &req_text_for_record,
         None,
         crate::codec::Protocol::from_native(ingress),
-        &provider.id,
+        upstream_id,
         None, // passthrough 未改写 model (override 配置了也到此为止, 见 D2 降级)
         0,
         None,

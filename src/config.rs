@@ -1257,16 +1257,17 @@ impl<T: DynamicEntry> DynamicTable<T> {
 fn serialized_full_sample_paths() -> Vec<String> {
     let sample = Config {
         server: ServerConfig::default(),
-        providers: vec![crate::provider::Provider {
+        providers: vec![Provider {
             id: "sample".into(),
-            protocol: crate::provider::Protocol::default(),
-            base_url: "http://127.0.0.1:1".into(),
-            api_key: "sk-sample".into(),
-            api_key_file: Some("/dev/null".into()),
             enabled: true,
             name: Some("sample".into()),
-            route_to: None,
             model_override: None,
+            kind: crate::provider::ProviderKind::Direct(crate::provider::DirectProvider {
+                protocol: crate::provider::Protocol::default(),
+                base_url: "http://127.0.0.1:1".into(),
+                api_key: "sk-sample".into(),
+                api_key_file: Some("/dev/null".into()),
+            }),
         }],
         secrets: SecretsConfig {
             entries: vec![SecretEntry {
@@ -1910,14 +1911,15 @@ on_probe_exhausted = "fail_closed"
         let mut state = DynamicState::default();
         state.providers.push(Provider {
             id: "p1".into(),
-            protocol: crate::provider::Protocol::OpenAI,
-            base_url: "https://api.openai.com".into(),
-            api_key: "sk-test".into(),
-            api_key_file: None,
             enabled: true,
             name: Some("P1".into()),
-            route_to: None,
             model_override: None,
+            kind: crate::provider::ProviderKind::Direct(crate::provider::DirectProvider {
+                protocol: crate::provider::Protocol::OpenAI,
+                base_url: "https://api.openai.com".into(),
+                api_key: "sk-test".into(),
+                api_key_file: None,
+            }),
         });
         state
             .decisions
@@ -1979,13 +1981,14 @@ on_probe_exhausted = "fail_closed"
             Provider {
                 id: id.to_string(),
                 name: Some(format!("name-{id}")),
-                protocol: Protocol::OpenAI,
-                base_url: "http://up".to_string(),
-                api_key: String::new(),
-                api_key_file: None,
-                enabled: true,
-                route_to: None,
                 model_override: None,
+                enabled: true,
+                kind: crate::provider::ProviderKind::Direct(crate::provider::DirectProvider {
+                    protocol: Protocol::OpenAI,
+                    base_url: "http://up".to_string(),
+                    api_key: String::new(),
+                    api_key_file: None,
+                }),
             }
         }
 
@@ -2528,14 +2531,15 @@ mod proptests {
     fn provider(id: &str, base_url: &str) -> Provider {
         Provider {
             id: id.into(),
-            protocol: Protocol::OpenAI,
-            base_url: base_url.into(),
-            api_key: format!("k-{id}"),
-            api_key_file: None,
             enabled: true,
             name: Some(format!("name-{id}")),
-            route_to: None,
             model_override: None,
+            kind: crate::provider::ProviderKind::Direct(crate::provider::DirectProvider {
+                protocol: Protocol::OpenAI,
+                base_url: base_url.into(),
+                api_key: format!("k-{id}"),
+                api_key_file: None,
+            }),
         }
     }
 

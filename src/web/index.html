@@ -3920,18 +3920,20 @@
 
     function renderProviderRow(p) {
       const rowCls = rowClass(p.source);
-      // #179/#183: protocol pill 旁的 virtual + model 标识.
+      // #179/#183/#187: sum type — kind 判别 ('virtual' | 'direct').
       // virtual: route_to 指向另一 provider (悬停提示语义);
       // model:X: model_override 生效 (悬停提示代价).
-      let pills = `<span class="pill">${escapeHtml(p.protocol)}</span>`;
-      if (p.route_to) {
-        pills += ` <span class="pill" title="virtual endpoint — forwards to '${p.route_to}' (ignores base URL / API key)">virtual</span>`;
+      const isVirtual = p.kind === 'virtual';
+      const protoLabel = p.protocol || '(any)';
+      let pills = `<span class="pill">${escapeHtml(protoLabel)}</span>`;
+      if (isVirtual) {
+        pills += ` <span class="pill" title="virtual endpoint — forwards to '${p.route_to}' (no base URL / API key of its own)">virtual</span>`;
       }
       if (p.model_override) {
         pills += ` <span class="pill" title="model override — requests are rewritten to this model (client model discarded; costs byte-exact passthrough)">model:${escapeHtml(p.model_override)}</span>`;
       }
       const protoCell = `<td class="cell-short">${pills}</td>`;
-      const urlCell = p.route_to
+      const urlCell = isVirtual
         ? `<td class="cell-long" title="virtual → ${escapeHtml(p.route_to)}"><span class="cell-ellipsis"><code>→ ${escapeHtml(p.route_to)}</code></span></td>`
         : `<td class="cell-long" title="${escapeHtml(p.base_url || '')}"><span class="cell-ellipsis"><code>${escapeHtml(p.base_url)}</code></span></td>`;
       return `
@@ -4143,6 +4145,19 @@
     // 暴露 codec 支持信息, 应改为 fetch 派生以消除此 SSOT 漂移点.
     const CODEC_SUPPORTED = new Set(['openai', 'anthropic']);
 
+    // #187: 虚拟 endpoint 的实际 egress = route_to 链尾实体的 protocol (入口数据
+    // providersList 已在手, 本地解析; 环/悬空时 protocol 字段兜底, 均无则 'unsupported'
+    // — endpoints 对话框仅是 copy-URL 辅助, 诚实降级不 panic).
+    function resolveEgressProtocol(p) {
+      let cur = p;
+      const seen = new Set();
+      while (cur && cur.kind === 'virtual' && cur.route_to && !seen.has(cur.id)) {
+        seen.add(cur.id);
+        cur = state.providersList.find(x => x.id === cur.route_to);
+      }
+      return cur ? cur.protocol : null;
+    }
+
     function ingressMode(ingress, egress) {
       if (ingress === egress) return 'direct';
       if (CODEC_SUPPORTED.has(ingress) && CODEC_SUPPORTED.has(egress)) return 'translate';
@@ -4162,7 +4177,7 @@
       const origin = window.location.origin;
       const rows = state.providerShorts.map((short, i) => {
         const proto = state.providerProtocols[i];
-        const mode = ingressMode(proto, p.protocol);
+        const mode = ingressMode(proto, resolveEgressProtocol(p));
         // encodeURIComponent 是 defense-in-depth: 后端 validate_id 限制 [A-Za-z0-9_-].
         const url = `${origin}/${short}/${encodeURIComponent(p.id)}/`;
         return endpointRow(proto, short, mode, url);
@@ -4205,7 +4220,7 @@
           .filter(x => x.id !== existing?.id)
           .map(x => `<option value="${escapeHtml(x.id)}">${escapeHtml(x.id)}</option>`)
           .join('');
-      if (existing?.route_to
+      if (existing?.kind === 'virtual' && existing.route_to
           && !routeSel.querySelector(`option[value="${CSS.escape(existing.route_to)}"]`)) {
         routeSel.insertAdjacentHTML('beforeend',
           `<option value="${escapeHtml(existing.route_to)}">${escapeHtml(existing.route_to)} (missing)</option>`);

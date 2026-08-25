@@ -22,7 +22,7 @@ use tracing::{debug, warn};
 
 use crate::dag::ResponseData;
 use crate::error::AppError;
-use crate::provider::{Protocol, Provider};
+use crate::provider::{DirectProvider, Protocol};
 
 use super::auth::apply_provider_auth;
 use super::helpers::{build_response_headers, redact_headers, sanitize_request_headers, utf8_view};
@@ -47,7 +47,8 @@ pub(crate) async fn cross_proto_forward(
     parts: axum::http::request::Parts,
     req_bytes: Bytes,
     ingress: Protocol,
-    provider: Provider,
+    provider: DirectProvider,
+    upstream_id: &str,
     model_override: Option<String>,
     started: Instant,
     secrets_snapshot: Vec<crate::secrets::SecretEntry>,
@@ -141,7 +142,7 @@ pub(crate) async fn cross_proto_forward(
     fwd_headers.remove(axum::http::header::CONTENT_LENGTH);
     apply_provider_auth(
         &mut fwd_headers,
-        &provider.effective_api_key(),
+        &provider.effective_api_key(upstream_id),
         provider.protocol,
     );
     // 跨协议时客户端不会自带 egress 协议的特定 header, 这里仅在缺失时注入默认.
@@ -176,7 +177,7 @@ pub(crate) async fn cross_proto_forward(
         &req_text_for_record,
         Some(&ir),
         Some(ingress_codec),
-        &provider.id,
+        upstream_id,
         model_override.as_deref(),
         redact_seed,
         Some(&secrets_snapshot),

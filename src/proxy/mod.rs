@@ -43,7 +43,7 @@
 //!
 //! # Provider 鉴权 (`apply_provider_auth`)
 //!
-//! 用 `provider.effective_api_key()` 注入对应协议的 auth header:
+//! 用 `DirectProvider::effective_api_key(id)` 注入对应协议的 auth header:
 //! - OpenAI / Ollama → `Authorization: Bearer <key>`
 //! - Anthropic → `x-api-key: <key>`
 //! - Gemini → `x-goog-api-key: <key>`
@@ -80,7 +80,7 @@ use axum::{
 };
 
 use crate::error::AppError;
-use crate::provider::Protocol;
+use crate::provider::{Protocol, ResolvedRoute};
 use crate::state::AppState;
 
 /// axum 路径参数: `/{proto}/{name}/{*rest}`.
@@ -200,10 +200,15 @@ async fn dispatch(
             return Err(AppError::Unavailable(e.to_string()));
         }
     };
-    let provider = resolved.provider;
-    let model_override = resolved.model_override;
-    if fp.name != provider.id {
-        tracing::info!(virtual = %fp.name, upstream = %provider.id, "route resolved");
+    // sum type 红利 (#187): resolved.provider 类型上即 DirectProvider — 转发链
+    // 从此处开始只处理实体, 下游 (same/cross/passthrough) 零判别逻辑.
+    let ResolvedRoute {
+        id: upstream_id,
+        provider,
+        model_override,
+    } = resolved;
+    if fp.name != upstream_id {
+        tracing::info!(virtual = %fp.name, upstream = %upstream_id, "route resolved");
     }
     if let Some(m) = &model_override {
         tracing::debug!(virtual = %fp.name, model_override = %m, "model override active");
@@ -230,6 +235,7 @@ async fn dispatch(
             req_bytes,
             ingress,
             provider,
+            &upstream_id,
             model_override,
             started,
             secrets_snapshot,
@@ -243,6 +249,7 @@ async fn dispatch(
         req_bytes,
         ingress,
         provider,
+        &upstream_id,
         model_override,
         started,
         secrets_snapshot,

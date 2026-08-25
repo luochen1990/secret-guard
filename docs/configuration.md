@@ -55,19 +55,34 @@ value = "ghp_0123456789abcdefghijklmnopqrstuvwxyz"
 
 ## `[[providers]]` — 上游 LLM 端点 (平铺数组)
 
-每个 provider 是一个上游服务的完整定义:
+每个 provider 是**两种构造之一** (#187 sum type): **直连** (Direct, 真实上游端点) 或
+**虚拟** (Virtual, 可切换指向的路由端点)。TOML 是平铺格式, 判别规则 = **`route_to`
+非空即虚拟** (两种构造的字段互不掺和; 虚拟条目写了 base_url/api_key 会被忽略)。
+
+**共享字段** (两种构造均可配):
 
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `id` | string | (必填) | 唯一标识. 1..=64 字符, 以字母/数字开头, 只允许字母数字、`_`、`-`. 出现在转发 URL 中 (`/o/<id>/...`). |
-| `protocol` | string | (必填) | 上游协议: `openai` / `anthropic` / `gemini` / `ollama` / `openairesponses` (OpenAI Responses API). |
-| `base_url` | string | (实体必填) | 上游 base URL. 必须以 `http://` 或 `https://` 开头, **末尾不带 `/`** (路径由 secret-guard 拼接). 如 `https://api.openai.com`. 虚拟 provider (`route_to` 设置) 忽略本字段, 可省略. |
-| `api_key` | string | `""` | 上游 API key 明文. 与 `api_key_file` 互斥 (同时设置启动报错). |
-| `api_key_file` | path | — | 从文件读 API key (适合 sops-nix / systemd LoadCredential 等外部注入, 让 toml 本身不含敏感数据). 每次请求时读取, 读不到按空 key 处理并打 WARN. 文件内容自动去首尾空白. |
-| `route_to` | string | — | **虚拟 endpoint**: 指向另一 provider 的 id. 设置后本 provider 不直接转发 — `base_url` / `api_key` / `api_key_file` 被忽略 (base_url 可为空), 请求经 `route_to` 链解析到链尾的实体 provider. 解析是 **per-request** 的: 在 WebUI 即席切换指向只影响新请求. 链上目标必须存在且 `enabled`, 否则 503; 自环启动即报错, 跨条目环在 WebUI 写入时拒绝 (手写配置产生的环在请求时返回 503, 不挂起). |
 | `model_override` | string | — | **出站 model 强制重写**: 经此 provider (直接或作为路由链一跳) 转发的请求 body 顶层 `model` 字段被无条件替换为该值, 客户端请求的模型名被丢弃. 链上 **first-wins** (入口起第一个非空值生效). 代价: override 生效时该 provider 的无-secret 请求从字节直传降级为 IR 改写 (语义等价, 上游前缀缓存失效). Gemini/Ollama 无 codec 无法改写: WARN + 原样透传. 空串非法 (清空请省略字段 / WebUI 留空). |
 | `enabled` | bool | `true` | `false` 时转发到该 provider 返回 503. |
 | `name` | string | — | 可选的人类可读名称 (仅 WebUI 显示). |
+
+**Direct 构造** (直连上游, 无 `route_to` 字段):
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `protocol` | string | (必填) | 上游协议: `openai` / `anthropic` / `gemini` / `ollama` / `openairesponses` (OpenAI Responses API). 缺失时启动报错 (fail-fast). |
+| `base_url` | string | (必填) | 上游 base URL. 必须以 `http://` 或 `https://` 开头, **末尾不带 `/`** (路径由 secret-guard 拼接). 如 `https://api.openai.com`. |
+| `api_key` | string | `""` | 上游 API key 明文. 与 `api_key_file` 互斥 (同时设置启动报错). |
+| `api_key_file` | path | — | 从文件读 API key (适合 sops-nix / systemd LoadCredential 等外部注入, 让 toml 本身不含敏感数据). 每次请求时读取, 读不到按空 key 处理并打 WARN. 文件内容自动去首尾空白. |
+
+**Virtual 构造** (虚拟 endpoint, `route_to` 非空):
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `route_to` | string | (必填) | 指向另一 provider 的 id. 本 provider 不直接转发, 请求经 `route_to` 链解析到链尾的实体 provider. 解析是 **per-request** 的: 在 WebUI 即席切换指向只影响新请求. 链上目标必须存在且 `enabled`, 否则 503; 自环启动即报错, 跨条目环在 WebUI 写入时拒绝 (手写配置产生的环在请求时返回 503, 不挂起). |
+| `protocol` | string | — | **仅 WebUI 展示** (可省略): ingress 由 URL 决定, egress 由链尾实体决定 (不同则自动跨协议翻译). |
 
 ```toml
 [[providers]]
@@ -105,11 +120,12 @@ route_to = "openai-main"
   `model_override` 即 "切换 = (target, model) 二元组" — 客户端 body 里的 model 被
   重写为目标模型, 适配 gpt-4o ↔ claude 等跨模型切换. 代价: 该 endpoint 的请求
   放弃字节直传 (上游前缀缓存失效), 见字段表.
-- 已知限制 (#157 同型): static 声明的虚拟 provider 无法经 WebUI override 改回实体
-  provider (未记录 route_to 的 override 会继承 static 的指向); dynamic-only 条目
-  可完整 "虚拟 ↔ 实体" 往返 (编辑表单选 "none — real provider", 切回实体时需同时
-  填写 Base URL — 表单会前置提示). `model_override` 的清空受同型限制 (static 配置
-  了 override 的条目无法经 override 清空).
+- 虚拟 ↔ 实体切换 (#187 sum type): 编辑表单 Route To 选 "none — real provider"
+  保存即**改回实体** (需同时填写 Base URL, 表单会前置提示); static 基线下的鉴权
+  字段会从 static 继承复原。已知限制: **dynamic-only** 条目 Direct → Virtual →
+  Direct 往返会丢失 api_key (Virtual 构造无处存放, 切回时需重新填写 — 表单
+  placeholder 会显示 "(optional)" 而非 "unchanged" 作为提示)。`model_override`
+  的清空仍受 #157 同型限制 (static 配置了 override 的条目无法经 override 清空)。
 
 ## `[[secrets.entries]]` — 需要保护的 Secret (嵌套在 `[secrets]` 下)
 
