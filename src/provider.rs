@@ -1198,7 +1198,7 @@ mod tests {
 
     #[test]
     fn resolve_route_real_provider_passthrough() {
-        // 实体 provider (route_to=None) 原样返回, 零额外跳.
+        // Direct provider 原样返回, 零额外跳.
         let t = route_table();
         let real = t.get_effective("real").unwrap();
         let out = t.resolve_route(real.clone()).unwrap();
@@ -1299,7 +1299,7 @@ mod tests {
     #[test]
     fn would_cycle_updates_entry_in_place() {
         // upsert 替换已有条目: 表中 b → a 已有, 现在写入 a → b 也要识别为环
-        // (walk 必须用新 entry 值覆盖旧值, 而非读到旧 a 的 route_to=None 而漏判).
+        // (walk 必须用新 entry 值覆盖旧值, 而非读到旧 a 的 Direct 构造而漏判).
         let t = ProviderTable::new(
             vec![
                 v("a", "real"),
@@ -1623,7 +1623,7 @@ mod tests {
     }
 
     // FWD-5 环终止 property: 任意 route 图 (含环), `resolve_route` 有限步返回
-    // (Ok ⇒ 链尾必为实体 provider, route_to=None; Err ⇒ 明确错误类别).
+    // (Ok ⇒ 链尾必为 Direct 构造 — 类型保证, 见 contracts.md FWD-5; Err ⇒ 明确错误类别).
     // 历史教训 (生成器覆盖度): 图必须包含环与悬空, 否则 property 退化为恒真.
     // 生成器: p{i} 的 route_to 由 edges.get(i) 决定 — 无边 → 实体, 目标 < n →
     // 指向表内 (可成环/自环), 目标 ≥ n → 悬空 (ghost).
