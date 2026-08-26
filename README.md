@@ -27,6 +27,27 @@ cargo install --git ssh://forgejo@git.lambda.lc:5522/lc-studio/secret-guard
 # 或克隆仓库后: cargo install --path .
 ```
 
+### NixOS 部署 (结构化选项)
+
+`nixosModules.secret-guard` 提供 `services.secret-guard.*` 结构化选项 — 未显式设
+`configFile` 时自动生成 toml (字段校验 eval 期 fail-fast, 配错在 rebuild 时即报错):
+
+```nix
+services.secret-guard = {
+  enable = true;
+  providers."zai-coding-plan" = {
+    kind = "direct";
+    protocol = "openai";
+    baseUrl = "https://open.bigmodel.cn/api/coding/paas/v4";
+    apiKeyFile = "/run/credentials/secret-guard.service/zai_key"; # 凭据走文件, toml 脱敏
+  };
+  secrets.entries = [ { id = "zai_key"; valueFile = "/run/credentials/secret-guard.service/zai_key"; } ];
+};
+```
+
+凭据注入姿势 (LoadCredential / sops) 与手写 configFile escape hatch 见
+`docs/deployment-nixos.md`.
+
 ### 2. 最小配置
 
 在某个目录创建 `secret-guard.toml` (1 个上游 provider + 1 个要保护的 secret 即可跑通):

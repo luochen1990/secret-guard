@@ -87,6 +87,7 @@ check *ARGS:
     fi
     just typos
     just deny-offline
+    just nix-check
 
 # consistency-check feature 守卫 (CI 用): clippy + nextest 带 feature flag.
 # 该 feature 默认关闭, 包含视图正确性断言 (proxy/recorder.rs::assert_redactions_match_map).
@@ -604,6 +605,25 @@ check-contracts:
       exit 1
     fi
     echo "check-contracts: ✓ $n_lines 条全量标注有效 — ✅ 同名 $n_ok / 🔁 改名 $n_renamed / ⏳ 待补 $n_pending (优先级见 contracts.md §0.6)."
+
+# nix 侧验证: render 契约测试 + 模块 eval 冒烟 (flake checks 的轻量子集 —
+# runCommand/python3/writeText, 不含 secret-guard 的 Rust 编译闭包, 秒级).
+# 挂在 just check 链尾; src serde schema 变更时此处先红.
+# --extra-experimental-features: 环境 (如 CI runner 的 Lix) 未启用
+# nix-command/flakes 时自包含可跑; 本地已启用时重复传无害.
+# nix-daemon 探测跳过: CI runner VM 架构禁止 nix 求值 (无 writableStoreOverlay /
+# 无 daemon, 见 forgejo-runner-vm.mod.nix「CI 工具链规范」), 探测到无 daemon socket
+# (NIX_DAEMON_SOCKET_PATH 默认路径, systemd socket-activation 按需拉起) 时打印
+# notice 跳过而非失败 — serde 漂移的 CI 门禁因此不可行, 由本地纪律承担.
+nix-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -S /nix/var/nix/daemon-socket/socket ]; then
+      echo "nix-check: skip — 无 nix-daemon (CI runner 架构禁止 nix 求值), 本地 just check 全量覆盖本项"
+      exit 0
+    fi
+    system="$(uname -m)-linux"
+    nix --extra-experimental-features "nix-command flakes" build ".#checks.${system}.render-test" ".#checks.${system}.module-eval" -L
 
 # ─── PR diff 拆解 ──────────────────────────────────────────────────────────
 # 区分 diff 中的 prod 代码 vs test 代码, 用于 review 时判断真实膨胀.

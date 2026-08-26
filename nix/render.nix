@@ -1,0 +1,334 @@
+# 职责: secret-guard 结构化选项 → toml 的纯渲染函数 (SSOT)
+#
+# 输入为结构化 attrset (nix/module.nix 的 providers / secrets.entries / auth 选项
+# 形态), 输出为 secret-guard.toml 字符串. 字段序/注释/排序规则只在此处声明一次,
+# 消费侧 (module.nix 自动 render + 本文件契约测试) 只传结构化数据 — 新增 provider
+# 只需设选项, 消灭"手抄 toml 模板 + mkForce 覆盖"模式.
+#
+# ── 与 src serde schema 的同步契约 (schema 变更时本文件同步改, 测试锁定) ──
+# 生成的 toml 字段名/嵌套必须与上游 serde 定义逐字段吻合 (选项 camelCase →
+# toml snake_case 的映射单源于本文件):
+#   - Provider (src/provider.rs, kind internally tagged): id / enabled / name?
+#     + direct: protocol / base_url / api_key? / api_key_file?
+#     + router: routes[] (model_pattern / target / upstream_model? / priority?,
+#       省略 = 透传 / 该路由禁用)
+#   - SecretEntry (src/secrets.rs): id / category / value_file (本函数只渲染脱敏
+#     形态 value_file, 不支持内联 value)
+#   - AuthConfig (src/auth/mod.rs): enabled + oidc{issuer_url / client_id /
+#     client_secret_file? / redirect_url?} + api_keys[]{label / key? / key_file?}
+#
+# eval 期校验单点收敛 (历史原型散在 render 与 checkToml 两处, 此处合一):
+#   - 语法: 生成物 fromTOML round-trip, 非法 TOML 在 eval 期即 throw
+#   - sum type fail-fast: direct 缺 protocol/baseUrl、分支专属字段串用、kind 非法、
+#     router 空 routes、apiKey/apiKeyFile 互斥、tomlComment 多行
+#   - base_url 卫生: 非空 + http(s):// 前缀 + 末尾不带 / (对齐上游 validate_base_url)
+#   - id 卫生: provider id / secrets entry id / route target 符合上游 validate_id
+#     (1..=64, 首字符字母数字, 其余 [A-Za-z0-9_-])
+#   - auth fail-fast: enabled 但无 oidc、apiKeys 的 key/keyFile 恰一、redirect_url
+#     形状 (对齐上游 AuthConfig::validate)
+#   - 跨 provider: route target 存在性 (声明式静态配置中所有 id 已知, 悬空即配置
+#     错误, 比上游 WebUI upsert 语义更严) + 启用边环检测 (对齐上游 would_cycle,
+#     禁用路由不构成环检测的边)
+#
+# 与 nixos 侧原型的语义差异: apiKeyFile / clientSecretFile / keyFile / valueFile
+# 均为纯路径直通 (与上游 *_file 字段 1:1), 不做任何 sops-key → LoadCredential
+# 路径派生 — 凭据注入姿势由部署侧决定 (见 docs/deployment-nixos.md).
+{
+  lib,
+  host,
+  port,
+  # attrsOf provider, attr 名 = provider id:
+  #   { <id> = { name ? str; enable ? bool; tomlComment ? [str];
+  #              kind == "direct": protocol, baseUrl, apiKey ? "", apiKeyFile ? path
+  #            | kind == "router": routes = [{ modelPattern, target,
+  #                                           upstreamModel ?, priority ? }] } }
+  providers,
+  # redact 段 ([[secrets.entries]]): [{ id, category ? "apikey", valueFile }]
+  secretsEntries ? [],
+  # null = 跳过 [auth] 段; 否则 { enabled, oidc ? null, apiKeys ? [] } (见上方 schema)
+  auth ? null,
+}: let
+  # JSON 字符串字面量是合法 TOML basic string (转义规则子集), 统一走它防注入.
+  q = lib.strings.toJSON;
+
+  # 上游 validate_id 的 Nix 镜像: 1..=64, 首字符字母数字, 其余 [A-Za-z0-9_-].
+  # 长度按字节计 (builtins.stringLength), 上游按 chars().count() — ASCII 场景等价,
+  # 多字节 model 名会被偏严拦截 (实际模型名均为 ASCII).
+  validId = id: builtins.match "[A-Za-z0-9][A-Za-z0-9_-]{0,63}" id != null;
+
+  # 上游 validate_base_url 的 Nix 镜像: 非空 + http(s):// + 末尾不带 /.
+  baseUrlOk = url:
+    url != ""
+    && (lib.hasPrefix "http://" url || lib.hasPrefix "https://" url)
+    && !lib.hasSuffix "/" url;
+
+  # *File 字段统一绝对路径校验: 上游三种 *_file 的相对路径解析语义各异
+  # (api_key_file/value_file 按进程 CWD 原样读, auth key_file 按 config 目录 join),
+  # 自动 render 产物在 /nix/store 下, 相对路径的解析基不可控 → eval 期统一拦截
+  # (手写 configFile 不经本函数, 语义不受影响).
+  absFile = ctx: v:
+    if !lib.hasPrefix "/" (toString v)
+    then throw "secret-guard render: ${ctx} 须为绝对路径 (以 / 开头): '${toString v}'"
+    else toString v;
+
+  # 重复元素检测 (O(n²), 配置规模下无碍): 返回出现 >1 次的元素.
+  dups = xs: lib.filter (x: lib.count (y: y == x) xs > 1) (lib.unique xs);
+
+  # 公共头: 可选块前注释行 + 表头 + id + 可选 name + kind 判别行注释.
+  # tomlComment 必须单行 (多行注释会注入合法 toml 行静默改变语义, 且注释不走
+  # toJSON 转义 — 本函数唯一的原文插值点). LF/CR 都拦 (CR 不是合法 TOML 注释字符).
+  providerHead = id: p:
+    lib.concatStringsSep "\n" (
+      map
+      (c:
+        lib.throwIf (lib.hasInfix "\n" c || lib.hasInfix "\r" c)
+        "secret-guard render: provider '${id}' 的 tomlComment 须为单行"
+        "# ${c}")
+      (p.tomlComment or [])
+      ++ [
+        "[[providers]]"
+        "id = ${q id}"
+      ]
+      ++ lib.optional ((p.name or null) != null) "name = ${q p.name}"
+      ++ ["# kind: provider 构造判别 (direct=直连上游 / router=虚拟路由), sum type 必填."]
+    );
+
+  # 单条路由: 省略 upstream_model / priority 行 = 上游 serde 的 None
+  # (透传请求原 model / 该路由禁用).
+  renderRoute = id: r:
+    if r.modelPattern == "" || builtins.stringLength r.modelPattern > 64
+    then throw "secret-guard render: provider '${id}' 的 route modelPattern 须为 1..=64 字符"
+    else if (r.upstreamModel or null) != null && (lib.trim r.upstreamModel == "" || builtins.stringLength r.upstreamModel > 128)
+    then throw "secret-guard render: provider '${id}' 的 route upstreamModel 须为非空非空白且 ≤128 字符 (清空语义 = 省略字段)"
+    else if !validId r.target
+    then throw "secret-guard render: provider '${id}' 的 route target '${r.target}' id 非法 (须 1..=64, 首字符字母数字, 其余 [A-Za-z0-9_-])"
+    else
+      lib.concatStringsSep "\n" (
+        [
+          "[[providers.routes]]"
+          "model_pattern = ${q r.modelPattern}"
+          "target = ${q r.target}"
+        ]
+        ++ lib.optional ((r.upstreamModel or null) != null) "upstream_model = ${q r.upstreamModel}"
+        ++ lib.optional ((r.priority or null) != null) "priority = ${toString r.priority}"
+      );
+
+  renderProvider = id: p:
+    if p.kind == "direct"
+    then
+      if (p.protocol or null) == null || (p.baseUrl or null) == null
+      then throw "secret-guard render: direct provider '${id}' 缺 protocol/baseUrl (kind=direct 必填)"
+      else if !baseUrlOk p.baseUrl
+      then throw "secret-guard render: direct provider '${id}' 的 baseUrl 非法: '${p.baseUrl}' (须 http(s):// 开头且末尾不带 /)"
+      else if (p.routes or []) != []
+      then throw "secret-guard render: direct provider '${id}' 不该有 routes (router 分支专属字段; kind 改写后遗留的 stray 字段会被上游静默忽略, 此处 fail-fast)"
+      else if (p.apiKeyFile or null) != null && (p.apiKey or "") != ""
+      then throw "secret-guard render: direct provider '${id}' 不该同时设 apiKeyFile/apiKey (互斥, 上游 validate 拒绝同设)"
+      else
+        lib.concatStringsSep "\n" (
+          [(providerHead id p)]
+          ++ [
+            "kind = \"direct\""
+            "protocol = ${q p.protocol}"
+            "base_url = ${q p.baseUrl}"
+          ]
+          ++ (
+            if (p.apiKeyFile or null) != null
+            then [
+              "# api_key 从文件读取: 每次转发时 read+trim (容忍换行), 读不到 → 空 key + warn."
+              "api_key_file = ${q (absFile "direct provider '${id}' 的 apiKeyFile" p.apiKeyFile)}"
+            ]
+            else lib.optional ((p.apiKey or "") != "") "api_key = ${q p.apiKey}"
+          )
+          ++ ["enabled = ${lib.boolToString (p.enable or true)}"]
+        )
+    else if p.kind == "router"
+    then
+      if (p.routes or []) == []
+      then throw "secret-guard render: router provider '${id}' routes 为空 (上游 validate 拒绝空路由表)"
+      else if (p.protocol or null) != null || (p.baseUrl or null) != null || (p.apiKeyFile or null) != null || (p.apiKey or "") != ""
+      then throw "secret-guard render: router provider '${id}' 不该有 protocol/baseUrl/apiKey/apiKeyFile (direct 分支专属字段, 上游 sum type 下不存在)"
+      else
+        lib.concatStringsSep "\n\n" (
+          [
+            (lib.concatStringsSep "\n" (
+              [(providerHead id p)]
+              ++ [
+                "kind = \"router\""
+                "enabled = ${lib.boolToString (p.enable or true)}"
+              ]
+            ))
+          ]
+          ++ map (renderRoute id) p.routes
+        )
+    else throw "secret-guard render: provider '${id}' kind 非法: ${toString p.kind}";
+
+  renderApiKey = k:
+    # key/keyFile 恰设其一 (对齐上游 StaticApiKey::resolve 的互斥与必设).
+    if ((k.key or null) != null) == ((k.keyFile or null) != null)
+    then throw "secret-guard render: auth.apiKeys '${k.label}' 须恰设 key/keyFile 之一 (同设/全无均被上游启动拒绝)"
+    else if lib.trim k.label == ""
+    then throw "secret-guard render: auth.apiKeys label 不得为空"
+    else
+      lib.concatStringsSep "\n" (
+        ["[[auth.api_keys]]" "label = ${q k.label}"]
+        ++ lib.optional ((k.key or null) != null) "key = ${q k.key}"
+        ++ lib.optional ((k.keyFile or null) != null) "key_file = ${q (absFile "auth.apiKeys '${k.label}' 的 keyFile" k.keyFile)}"
+      );
+
+  renderOidc = o: let
+    ru = o.redirectUrl or null;
+    # 对齐上游 AuthConfig::validate: http(s):// 前缀 + /oauth2/callback 结尾.
+    # 故意加严: 上游仅在 auth.enabled 时校验 issuer/client_id/redirect_url, 本函数
+    # 对 oidc != null 一律校验 — 声明式配置里配了 oidc 就该配完整, 半截配置
+    # 几乎肯定是迁移残留 (enabled=false 的占位值也应显式写全).
+    redirectOk = ru == null || (lib.trim ru != "" && (lib.hasPrefix "http://" ru || lib.hasPrefix "https://" ru) && lib.hasSuffix "/oauth2/callback" ru);
+  in
+    if lib.trim o.issuerUrl == "" || lib.trim o.clientId == ""
+    then throw "secret-guard render: auth.oidc 的 issuerUrl/clientId 不得为空"
+    else if !redirectOk
+    then throw "secret-guard render: auth.oidc 的 redirectUrl 形状非法: '${toString ru}' (须 http(s)://… 且以 /oauth2/callback 结尾, 只能换 scheme/host/port)"
+    else
+      lib.concatStringsSep "\n" (
+        [
+          "[auth.oidc]"
+          "# issuer 必须与 IdP metadata 的 issuer 字段逐字一致 (含/不含尾斜杠是不同值)."
+          "issuer_url = ${q o.issuerUrl}"
+          "client_id = ${q o.clientId}"
+        ]
+        ++ lib.optional ((o.clientSecretFile or null) != null) "client_secret_file = ${q (absFile "auth.oidc 的 clientSecretFile" o.clientSecretFile)}"
+        ++ lib.optionals (ru != null) [
+          "# 必须与 IdP 侧注册的 redirect URI 逐字节一致 (IdP 严格校验); 省略 = 由监听 host/port 派生."
+          "redirect_url = ${q ru}"
+        ]
+      );
+
+  renderAuth = a: let
+    # 重复 label 检查 (对齐上游 AuthConfig::validate — 该校验无条件执行, 与
+    # enabled 无关; 重复 label 会让 sg 启动即失败, 必须拦在 eval 期).
+    dupLabels = dups (map (k: k.label) (a.apiKeys or []));
+  in
+    if a.enabled && (a.oidc or null) == null
+    then throw "secret-guard render: auth 启用但 auth.oidc 未配置 (上游 validate 拒绝 enabled 无 oidc)"
+    else if dupLabels != []
+    then throw "secret-guard render: auth.apiKeys label 重复 (上游启动即拒绝): ${toString dupLabels}"
+    else
+      lib.concatStringsSep "\n\n" (
+        [
+          (lib.concatStringsSep "\n" [
+            "[auth]"
+            "enabled = ${lib.boolToString a.enabled}"
+          ])
+        ]
+        ++ lib.optional ((a.oidc or null) != null) (renderOidc a.oidc)
+        ++ map renderApiKey (a.apiKeys or [])
+      );
+
+  renderSecretEntry = e:
+    if !validId e.id
+    then throw "secret-guard render: secrets.entries 的 id '${e.id}' 非法 (须 1..=64, 首字符字母数字, 其余 [A-Za-z0-9_-])"
+    else if (e.valueFile or null) == null
+    then throw "secret-guard render: secrets.entries '${e.id}' 缺 valueFile (本渲染器只支持脱敏形态 value_file, 不支持内联 value)"
+    else
+      lib.concatStringsSep "\n" [
+        "[[secrets.entries]]"
+        "id = ${q e.id}"
+        "category = ${q (e.category or "apikey")}"
+        "value_file = ${q (absFile "secrets.entries '${e.id}' 的 valueFile" e.valueFile)}"
+      ];
+
+  header =
+    lib.concatStringsSep "\n" [
+      "# Auto-generated by services.secret-guard structured options"
+      "# DO NOT EDIT — 改 toml 内容请编辑 services.secret-guard.* 结构化选项 (或改用 configFile 手写接管)."
+    ];
+
+  secretsSection =
+    lib.concatStringsSep "\n" (
+      [
+        "# ── redact secrets: 防泄漏清单 (services.secret-guard.secrets.entries) ──"
+        "# 这些 secret 会被 redact_ir 在 LLM 请求字节流中扫描并替换为 mock,"
+        "# 防止 agent 不经意把它们写入 prompt 泄漏到上游 LLM provider."
+        "# secret-guard 启动时一次性 resolve (fail-fast: 文件读不到 → 启动失败)."
+      ]
+      ++ map renderSecretEntry secretsEntries
+    );
+
+  # 上游响应超时字段不渲染 (回归 sg 分档默认 #175): [server] 只写 host/port,
+  # 其余字段 (records_capacity/超时四项) 由上游 serde default 兜底.
+  serverSection =
+    lib.concatStringsSep "\n" [
+      "[server]"
+      "# 与 services.secret-guard.host/port 保持一致 (实际由 ExecStart --host/--port 参数覆盖, 此处仅作 fallback/调试参考)."
+      "host = ${q host}"
+      "port = ${toString port}"
+    ];
+
+  providerIds = lib.sort (a: b: a < b) (builtins.attrNames providers);
+
+  # 跨 provider 校验 1: provider id 卫生 (attr 名即 id).
+  badIds = lib.filter (id: !validId id) providerIds;
+
+  # 跨 provider 校验 2: route target 存在性 (含禁用路由 — 声明式配置中悬空即错误).
+  dangling =
+    lib.concatMap
+    (id:
+      map (r: "${id} → ${r.target}")
+      (lib.filter (r: !providers ? ${r.target}) (providers.${id}.routes or [])))
+    (lib.filter (id: providers.${id}.kind == "router") providerIds);
+
+  # 跨 provider 校验 3: 启用路由边环检测 (对齐上游 would_cycle — priority=null 的
+  # 禁用路由不构成边; 悬空目标已由校验 2 拦截, 边只含存在的 id).
+  # 与上游的已知偏差: 入口级 enable=false 的 provider 仍算图节点 (上游
+  # effective_snapshot 会排除) — 指向 disabled provider 的路由运行时必 503,
+  # fail-fast 合理, 仅错误归因可能显示为 "成环" 而非 "指向 disabled".
+  enabledEdges = lib.mapAttrs
+    (_: p:
+      if p.kind == "router"
+      then map (r: r.target) (lib.filter (r: (r.priority or null) != null) (p.routes or []))
+      else [])
+    providers;
+
+  # DFS: 沿启用边走, 回到 path 上的节点即环. enabledEdges.${node} 不设 or 兜底 —
+  # 悬空检查先行保证了所有 target 都在图中, 若未来校验链重排破坏此不变式,
+  # 缺 attr 会显式崩 (而非静默漏报环), 与 fail-fast 立场一致.
+  reachesPath = node: path:
+    lib.any
+    (t: lib.elem t path || reachesPath t (path ++ [t]))
+    enabledEdges.${node};
+
+  cyclicId = lib.findFirst (id: reachesPath id [id]) null providerIds;
+
+  # secrets.entries 重复 id 检查 (listOf 没有 attrsOf 的结构性去重; 上游 static
+  # 加载对重复 id first-wins 静默容忍, 这里加严 fail-fast — 声明式配置中重复
+  # id 几乎肯定是复制粘贴错误, redact 清单少一条是安全损失).
+  dupSecretIds = dups (map (e: e.id) secretsEntries);
+
+  result =
+    lib.concatStringsSep "\n\n" (
+      [header]
+      ++ map (id: renderProvider id providers.${id}) providerIds
+      ++ lib.optional (secretsEntries != []) secretsSection
+      ++ [serverSection]
+      ++ lib.optional (auth != null) (renderAuth auth)
+    )
+    + "\n";
+in
+  # 校验链 (全部在 eval 期强制): id 卫生 → 重复 secret id → 悬空 target → 环 →
+  # 语法 round-trip. 逐 provider 的 sum type fail-fast 与 auth 重复 label 检查在
+  # result 被 fromTOML 强制时触发.
+  lib.throwIf (badIds != [])
+  "secret-guard render: provider id 非法 (须 1..=64, 首字符字母数字, 其余 [A-Za-z0-9_-]): ${toString badIds}"
+  (
+    lib.throwIf (dupSecretIds != [])
+    "secret-guard render: secrets.entries id 重复: ${toString dupSecretIds}"
+    (
+      lib.throwIf (dangling != [])
+      "secret-guard render: route target 不存在于 providers (声明式配置中悬空即错误): ${toString dangling}"
+      (
+        lib.throwIf (cyclicId != null)
+        "secret-guard render: provider 路由成环, 沿启用路由边回到 '${cyclicId}' (禁用路由不构成边)"
+        (builtins.seq (builtins.fromTOML result) result)
+      )
+    )
+  )

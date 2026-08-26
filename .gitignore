@@ -1,7 +1,8 @@
 /target
 /.direnv
 /.devenv
-/result
+# nix build 产物 symlink (含连跑多次自动加 -N 后缀的 result-1/result-2..., 如 just nix-check)
+/result*
 *.swp
 *.swo
 .idea/

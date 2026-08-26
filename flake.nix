@@ -123,9 +123,25 @@
       nixpkgs.overlays = [self.overlays.default];
     };
 
-    # ─── checks (optional, 未来扩展) ────────────────────────────────────────
+    # ─── checks ──────────────────────────────────────────────────────────────
     #
-    # 跑 `nix flake check` 时, 用 module 的测试 runner 验证服务能启动.
-    # 当前 MVP 先不写, 等服务跑通后再补.
+    # render-test (nix/tests/render.nix): render.nix 纯函数契约断言 — 字段名与
+    #   src serde 吻合 / 字典序 / 转义 / 路径直通 / fail-fast 全覆盖.
+    # module-eval (nix/tests/module-eval.nix): 模块接线冒烟 — 结构化选项 →
+    #   configFile 自动生成 (python tomllib round-trip) + configFile 互斥/双缺
+    #   throw + 内联 key 合成 provider 组合.
+    checks = forAllSystems (system: let
+      pkgs = nixpkgsFor system;
+    in {
+      render-test = (import ./nix/tests/render.nix {
+        inherit (nixpkgs) lib;
+        inherit pkgs;
+      }).testRunner;
+      module-eval = (import ./nix/tests/module-eval.nix {
+        inherit (nixpkgs) lib;
+        inherit pkgs system;
+        secretGuardModule = self.nixosModules.secret-guard;
+      }).testRunner;
+    });
   };
 }

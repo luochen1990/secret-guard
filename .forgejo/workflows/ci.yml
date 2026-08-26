@@ -560,7 +560,15 @@ jobs:
         id: nixbuild
         continue-on-error: true
         timeout-minutes: 30
-        run: nix build .#secret-guard -L
+        # --extra-experimental-features: runner 的 Lix 未启用 nix-command/flakes
+        # (2026-08-26 #193 首跑实证; 本 step continue-on-error, 之前失败被掩盖).
+        run: nix --extra-experimental-features "nix-command flakes" build .#secret-guard -L
+
+      # 注: nix flake checks (render 契约) 不设 CI step — runner VM 架构禁止
+      # nix 求值 (无 writableStoreOverlay / 无 nix-daemon, 见 forgejo-runner-vm.mod.nix
+      # 文件头「CI 工具链规范」; 2026-08-26 #193 首跑实证: 先撞 experimental-features,
+      # 开启后仍会撞只读 store / 无法 fetch input). serde 漂移门禁由本地 just check
+      # 链尾的 just nix-check 承担 (recipe 内探测 nix-daemon, CI 环境自动跳过).
 
       # 诊断 step: job 失败时把所有阻塞 step 的 outcome 汇总贴到 PR 评论,
       # 帮助无 admin 权限的 contributor 定位失败 step (无日志访问权限时的 fallback).

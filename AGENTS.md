@@ -581,8 +581,16 @@ CI 已升级为阻塞门禁: 当前 `deny.toml` allow 列表已实测覆盖全�
 
 ## 部署
 
-NixOS + sops-nix 部署的两种姿势 (LoadCredential / 直接路径) + secret 批量注入方案,
-见 **`docs/deployment-nixos.md`**.
+NixOS 部署两代姿势: 结构化选项 (`services.secret-guard` 的 providers/secrets.entries/auth,
+未显式设 configFile 时经 `nix/render.nix` 自动生成 toml, eval 期校验 fail-fast) + 手写
+configFile (escape hatch, 互斥). 凭据注入 (LoadCredential / sops 直接路径) 与 secret
+批量注入方案见 **`docs/deployment-nixos.md`**.
+
+- toml 渲染 SSOT: `nix/render.nix` (纯函数, 与 src serde schema 的同步契约见其文件头,
+  契约测试 `nix/tests/render.nix` 锁定); 模块接线冒烟 `nix/tests/module-eval.nix`.
+  两者经 `just nix-check` 接入验证链 (挂在 `just check` 链尾, recipe 内探测
+  nix-daemon — CI runner 架构禁止 nix 求值故自动跳过, serde 漂移门禁由本地纪律承担)
+  — src serde schema 变更时本地先红.
 
 > 路径约定见上方"路由策略"表格; `/api/*` 子路由细节 (未匹配 404 no-forward)
 > 见 `src/web/AGENTS.md`; 完整 URI 分配规划见 `docs/design/url-layout.md`.
