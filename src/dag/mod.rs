@@ -41,7 +41,7 @@ mod view;
 
 // 公开类型 re-export: 保持 `crate::dag::*` 路径稳定 (外部 caller 无需改 import).
 pub use pool::{BlockHash, BlockPool, MessageRef};
-pub use types::{CallEvent, Node, PolicySnapshot, ResponseData, SessionId};
+pub use types::{CallEvent, Node, PolicySnapshot, ResponseData, RoundKind, SessionId};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -211,6 +211,26 @@ impl ConversationDag {
                 }
             }
         }
+
+        // 3.6 round_kind 判定 + Retry 继承 (三态语义与继承 rationale 的 SSOT 见
+        // `RoundKind` 文档, 此处只记 site-specific 约束):
+        // - 持锁不变式: Retry 分支内 parent 必然存在 (find_parent 返回值在 write
+        //   lock 内有效), `if let` 链的缺席 fallback (保留占位值) 仅为防御性编程.
+        // - session 归属: leaf 重试延续同 session (重试合并, 人工裁决 2026-08-26,
+        //   DTO-9); 非 leaf 重试由 step5 按 CDAG-8 fork 处理, 此处不干预.
+        event.round_kind = if lookup.split_at < msgs.len() {
+            RoundKind::Normal
+        } else if msgs.is_empty() {
+            RoundKind::NoMessages
+        } else {
+            if let Some(pid) = lookup.parent
+                && let Some(pn) = g.nodes.get(&pid)
+            {
+                event.round_role = pn.event.round_role;
+                event.preview = pn.event.preview.clone();
+            }
+            RoundKind::Retry
+        };
 
         // 4. 计算 own_hash + prefix_hash (只基于 req_delta, response 不参与).
         //
@@ -573,6 +593,7 @@ mod tests {
             policy: Arc::new(PolicySnapshot::default()),
             req_body_raw: String::new(),
             round_role: IrRole::User,
+            round_kind: RoundKind::Normal,
             preview: None,
             model: None,
             upstream_id: Arc::from("test"),
@@ -594,6 +615,7 @@ mod tests {
             policy: Arc::new(PolicySnapshot::default()),
             req_body_raw: req_body.to_string(),
             round_role: IrRole::User,
+            round_kind: RoundKind::Normal,
             preview: preview.map(Arc::<str>::from),
             model: model.map(Arc::<str>::from),
             upstream_id: Arc::from("test"),
@@ -1283,6 +1305,128 @@ mod tests {
         assert!(
             v.preview.is_none(),
             "User round preview 应保持 None (dummy_event 无 body, 不被覆盖)"
+        );
+    }
+
+    // ─── round_kind 三态判定 (UI-1 契约: 空 delta 轮渲染语义) ─────────────
+
+    #[test]
+    fn round_kind_retry_on_identical_repeat_request() {
+        // 字节级相同请求重复 push (全前缀命中, split_at == msgs.len(), delta 为空)
+        // → round_kind=Retry: 用户没有发新消息, 是客户端重发. 前端渲染 retry 徽章,
+        // 不渲染消息气泡 (防止捏造 "用户把同一句话说了一遍").
+        let dag = ConversationDag::new(8, 500, 1);
+        let msgs = || vec![text_msg(IrRole::User, "hi")];
+        let a = dag.push_messages(msgs(), dummy_event());
+        let b = dag.push_messages(msgs(), dummy_event());
+        assert_eq!(
+            dag.get_node(a).unwrap().round_kind,
+            RoundKind::Normal,
+            "首轮是常规轮"
+        );
+        assert_eq!(
+            dag.get_node(b).unwrap().round_kind,
+            RoundKind::Retry,
+            "全前缀重复 → Retry"
+        );
+        // Retry 轮仍延续同一 session (leaf 重试合并语义, 见 CDAG-8 / DTO-9).
+        assert_eq!(
+            dag.list_sessions().len(),
+            1,
+            "leaf 重试不拆 session (合并语义由用户裁决保留)"
+        );
+    }
+
+    #[test]
+    fn round_kind_retry_on_stale_prefix_forks_new_session() {
+        // 重发较旧轮次 (非当前 leaf 的前缀): round_kind 仍为 Retry (本轮无新消息),
+        // 但 session 归属走 step5 的 fork 语义 (parent 不是其 session 当前 leaf
+        // → 开新 session), 与 CDAG-8 一致. 场景: batch 重放 / 调试回放.
+        let dag = ConversationDag::new(8, 500, 1);
+        let _a = dag.push_messages(vec![text_msg(IrRole::User, "m1")], dummy_event());
+        let _b = dag.push_messages(
+            vec![text_msg(IrRole::User, "m1"), text_msg(IrRole::User, "m2")],
+            dummy_event(),
+        );
+        // 重发 [m1]: 全前缀命中 a (split_at == 1 == len) → Retry, 但 a 不是 leaf → fork.
+        let c = dag.push_messages(vec![text_msg(IrRole::User, "m1")], dummy_event());
+        assert_eq!(dag.get_node(c).unwrap().round_kind, RoundKind::Retry);
+        assert_eq!(
+            dag.list_sessions().len(),
+            2,
+            "非 leaf 重试按 fork 语义开新 session"
+        );
+    }
+
+    #[test]
+    fn round_kind_retry_inherits_parent_role_and_preview() {
+        // retry 轮继承 parent 的 round_role + preview: parent 的完整 messages ==
+        // 本请求 body, 其角色/preview 描述的就是同一内容. 工具轮重试 → round_role=Tool
+        // + preview=tool name (sidebar 呈 sub-dot 同型), 而非占位 User 造成的伪组首
+        // (preview=tool_result 文本, 捏造 "新一轮用户输入").
+        let dag = ConversationDag::new(8, 500, 1);
+        // 工具轮: ToolUse + ToolResult (round_role=Tool, preview=tool name "read_file").
+        let tool_msgs = || vec![tool_use_msg("read_file"), tool_result_msg()];
+        let a = dag.push_messages(tool_msgs(), dummy_event());
+        let va = dag.get_node(a).unwrap();
+        assert_eq!(va.round_role, IrRole::Tool);
+        assert_eq!(va.preview.as_deref(), Some("read_file"));
+        // 字节级重试同一请求.
+        let b = dag.push_messages(tool_msgs(), dummy_event());
+        let vb = dag.get_node(b).unwrap();
+        assert_eq!(vb.round_kind, RoundKind::Retry);
+        assert_eq!(vb.round_role, IrRole::Tool, "继承 parent 的 round_role");
+        assert_eq!(
+            vb.preview.as_deref(),
+            Some("read_file"),
+            "继承 parent 的 preview (tool name)"
+        );
+    }
+
+    #[test]
+    fn round_kind_normal_on_superset_extension() {
+        // 常规延续 (delta 非空) → Normal.
+        let dag = ConversationDag::new(8, 500, 1);
+        let _a = dag.push_messages(vec![text_msg(IrRole::User, "m1")], dummy_event());
+        let b = dag.push_messages(
+            vec![text_msg(IrRole::User, "m1"), text_msg(IrRole::User, "m2")],
+            dummy_event(),
+        );
+        assert_eq!(dag.get_node(b).unwrap().round_kind, RoundKind::Normal);
+    }
+
+    #[test]
+    fn round_kind_no_messages_on_empty_messages() {
+        // msgs 为空 (空 body 请求 / 无 messages 字段) → NoMessages: 真无消息可渲染,
+        // 前端保留 preview fallback.
+        let dag = ConversationDag::new(8, 500, 1);
+        let id = dag.push_messages(vec![], dummy_event());
+        assert_eq!(dag.get_node(id).unwrap().round_kind, RoundKind::NoMessages);
+    }
+
+    #[test]
+    fn timeline_and_brief_carry_round_kind() {
+        // DTO 透传: TimelineRound (timeline_view) / RoundBrief (session_rounds) /
+        // NodeView (get_node) 均携带 round_kind, 前端据此次定渲染分支
+        // (Retry 徽章 / Normal 气泡 / NoMessages fallback).
+        let dag = ConversationDag::new(8, 500, 1);
+        let body = r#"{"messages":[{"role":"user","content":"hi"}]}"#;
+        let a = push_with_response(&dag, vec![text_msg(IrRole::User, "hi")], body);
+        let b = push_with_response(&dag, vec![text_msg(IrRole::User, "hi")], body);
+        let sid = sid_of(&dag, a);
+
+        let page = dag.timeline_view(sid, None, 10).expect("page exists");
+        assert_eq!(page.rounds[0].round_kind, RoundKind::Normal);
+        assert_eq!(page.rounds[1].round_kind, RoundKind::Retry);
+
+        let briefs = dag.session_rounds(sid);
+        assert_eq!(briefs[0].round_kind, RoundKind::Normal);
+        assert_eq!(briefs[1].round_kind, RoundKind::Retry);
+
+        assert_eq!(
+            dag.get_node(b).unwrap().round_kind,
+            RoundKind::Retry,
+            "NodeView 也透传 round_kind"
         );
     }
 

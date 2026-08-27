@@ -561,6 +561,8 @@ pub(super) fn build_call_event(
         upstream_model: upstream_model.map(std::sync::Arc::<str>::from),
         // round_role 占位值 (User); DAG push_messages 内部会根据 delta 的 contains_user_text 修正.
         round_role: crate::codec::ir::IrRole::User,
+        // round_kind 占位值 (Normal); push_messages 内按 split_at 修正 (全前缀重复 → Retry).
+        round_kind: crate::dag::RoundKind::Normal,
         redactions: std::sync::Arc::from(redactions),
     };
     // 视图正确性守卫: preview/model 应与 req_body_raw (SSOT) 的字符串提取一致.

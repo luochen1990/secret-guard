@@ -834,6 +834,7 @@ mod tests {
             policy: Arc::new(PolicySnapshot::default()),
             req_body_raw,
             round_role: IrRole::User,
+            round_kind: crate::dag::RoundKind::Normal,
             preview: None,
             model: None,
             upstream_id: Arc::from("test"),

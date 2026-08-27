@@ -36,7 +36,7 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::codec::ir::IrRole;
-use crate::dag::SessionId;
+use crate::dag::{RoundKind, SessionId};
 
 /// 会话视图 (sidebar 一级树).
 #[derive(Debug, Clone, serde::Serialize)]
@@ -89,6 +89,8 @@ pub struct NodeView {
     /// 语义: "由于谁发了最后一条消息而触发了这次 HTTP 请求".
     /// WebUI 用它决定 sidebar 条目样式 + timeline 气泡渲染.
     pub round_role: IrRole,
+    /// 轮次展示类别 (Normal / Retry / NoMessages), 见 dag::types::RoundKind.
+    pub round_kind: RoundKind,
     pub req_delta_count: usize,
     pub has_response: bool,
     pub created_at: DateTime<Utc>,
@@ -155,6 +157,8 @@ pub struct NodeDetail {
 pub struct RoundBrief {
     pub id: Uuid,
     pub round_role: IrRole,
+    /// 轮次展示类别 (Normal / Retry / NoMessages): sidebar retry 轮加 ↻ 前缀.
+    pub round_kind: RoundKind,
     /// `Arc<str>`: 共享 event.preview, 轮询路径零拷贝.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview: Option<Arc<str>>,
@@ -171,6 +175,8 @@ pub struct RoundBrief {
 pub struct TimelineRound {
     pub id: Uuid,
     pub round_role: IrRole,
+    /// 轮次展示类别: 见 `dag::types::RoundKind` (Retry → 徽章, UI-1).
+    pub round_kind: RoundKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview: Option<Arc<str>>,
     pub created_at: DateTime<Utc>,

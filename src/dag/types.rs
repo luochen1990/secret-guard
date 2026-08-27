@@ -66,6 +66,32 @@ impl SessionId {
     }
 }
 
+/// 轮次的展示类别 (UI-1 契约: 空 delta 轮的渲染语义按此枚举分发, 消除前端捏造).
+///
+/// 判定是 `(split_at, msgs)` 的纯函数, 在 `push_messages` 内一次性预计算
+/// (与 round_role 同位置修正, SSOT); 查询路径零成本透传:
+/// - delta 非空 (`split_at < msgs.len()`) → `Normal`: 常规轮, 前端渲染 delta 气泡.
+/// - delta 空 + msgs 非空 (全前缀重复, `split_at == msgs.len()`) → `Retry`:
+///   客户端重发了 IR 等价的请求 (判定在 IR 哈希层 — 字节级相同是典型场景,
+///   JSON 空白/键序差异但 IR 相同的重发同样命中; 重试/批量重测), **用户没有发新消息** —
+///   前端渲染 retry 徽章而非消息气泡 (防止捏造 "用户把同一句话说了一遍").
+/// - msgs 为空 → `NoMessages`: 请求侧确实无 messages 可渲染
+///   (空 body / Responses ingress 的 `input[]` 等), 前端保留 preview fallback 气泡.
+///
+/// Retry 的展示元数据 (round_role + preview) 继承 parent: parent 的完整 messages
+/// == 本请求 body, 其角色/preview 描述的就是同一内容 — 工具轮重试呈 sub-dot 同型
+/// 展示, 而非捏造 round_role=User 的伪组首. session 归属: 重发当前 leaf → 延续同
+/// session (重试合并); 重发较旧轮次 → fork 开新 session (CDAG-8).
+///
+/// serde snake_case: "normal" / "retry" / "no_messages" (wire 字段, 前端 switch 消费).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoundKind {
+    Normal,
+    Retry,
+    NoMessages,
+}
+
 /// 一个会话的元数据 (sidebar 一级树).
 ///
 /// leaf_id 是游标 (最新轮次), 随新请求前移. root_id 是会话根 (parent=None 的那个).
@@ -182,6 +208,9 @@ pub struct CallEvent {
     /// 而非 "工具结果借 user 角色承载"). delta 任一条 contains_user_text → User.
     /// 不依赖 `IrMessage.role`: codec 归一化把 tool 消息也映射为 IrRole::User.
     pub round_role: IrRole,
+    /// 轮次展示类别 (Normal / Retry / NoMessages), 判定语义见 `RoundKind` 文档.
+    /// 构造点占位 Normal; push_messages 内按 split_at 修正 (与 round_role 同模式).
+    pub round_kind: RoundKind,
     /// WebUI sidebar / timeline preview 文本 (push 时从 req_body_raw 提取, 截断 48 chars).
     ///
     /// 提取逻辑见 derive::extract_preview_and_model (协议无关字节级):

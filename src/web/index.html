@@ -446,6 +446,20 @@
       font-size: 12px;
     }
 
+    /* retry 徽章: round_kind=retry 的轮次渲染 (非气泡 — 重试轮 delta 为空,
+       用户没有发新消息; 徽章如实标注 "客户端重发了相同请求", UI-1 契约). */
+    .retry-badge {
+      background: var(--panel);
+      border: 1px dashed var(--fg-muted);
+      color: var(--fg-muted);
+      padding: 4px 10px;
+      border-radius: 999px;
+      margin: 8px 0;
+      font-size: 12px;
+      font-style: italic;
+      display: inline-block;
+    }
+
     /* ─── F1: table cell ellipsis + hover tooltip ─────────────────────────── */
     /* 每个 td 内的内容用 .cell-ellipsis 包裹, 限制 max-width 并在溢出时显示省略号.
        完整值通过外层 td 的 title 属性由浏览器原生 tooltip 呈现. */
@@ -1981,7 +1995,10 @@
       wrap.innerHTML = groups.map(g => {
         const r = g.head;
         // RoundBrief 不含 method/path; fallback 到 '(no preview)'.
-        const preview = r.preview || '(no preview)';
+        // retry 轮加 ↻ 前缀: preview 与原轮相同, 无前缀时两个条目无法区分 (歧义).
+        const preview = r.round_kind === 'retry'
+          ? `↻ ${r.preview || '(no preview)'}`
+          : (r.preview || '(no preview)');
         const isActive = r.id === state.selectedRound;
         const headHtml = `
           <div class="round-item ${isActive ? 'active' : ''}" data-sid="${escapeHtml(sessionId)}" data-rid="${escapeHtml(r.id)}">
@@ -1993,8 +2010,10 @@
         const dotsHtml = g.tools.length > 0
           ? `<div class="sub-rounds">${g.tools.map(t => {
               // preview 已按 role 预计算: 非 user round 的 preview = tool name.
-              const name = t.preview || '?';
-              const color = providerColor(name);
+              // 工具轮重试 (round_kind=retry, 继承 parent 的 Tool role + tool name
+              // preview): 与原轮同型渲染, tooltip 加 ↻ 前缀区分 (与组首 ↻ 对称).
+              const name = t.round_kind === 'retry' ? `↻ ${t.preview || '?'}` : (t.preview || '?');
+              const color = providerColor(t.preview || '?');
               const dotActive = t.id === state.selectedRound ? ' active' : '';
               return `<span class="sub-dot${dotActive}" style="background:${color}" data-sid="${escapeHtml(sessionId)}" data-rid="${escapeHtml(t.id)}" title="${escapeHtml(name)} · ${escapeHtml(formatTime(t.created_at))}"></span>`;
             }).join('')}</div>`
@@ -2570,9 +2589,8 @@
         if (!reused.has(rid)) el.remove();
       }
 
-      // header 更新 (round count + user count). user count 用 round_role 判定 (后端预计算).
-      const userCount = state.timelineRecords.filter(r => r.round_role === 'user').length;
-      header.textContent = `Timeline (${state.timelineRecords.length} rounds${userCount > 0 ? `, ${userCount} user` : ''})`;
+      // header 更新: round count + user count (SSOT 文本在 timelineHeaderText).
+      header.textContent = timelineHeaderText();
       // placeholder 高度由 updateResponseDrawerLayout 设置.
     }
 
@@ -2796,6 +2814,7 @@
       let rows = {
         'Round ID': r.id,
         'Role': r.round_role || '(unknown)',
+        'Kind': r.round_kind || 'normal',
         'Time': r.created_at,
         'Method': '(loading…)',
         'Path': '(loading…)',
@@ -2883,14 +2902,20 @@
       dlg.showModal();
     }
 
+    // timeline header 文本 (round count + user count), renderTimelineHtml 与
+    // reconcileTimelineRounds 两处共用 (SSOT). userCount 过滤 retry 轮: 重试是
+    // parent 轮的重发, 不是新的用户消息 (UI-1 / DTO-9).
+    function timelineHeaderText() {
+      const userCount = state.timelineRecords
+        .filter(r => r.round_role === 'user' && r.round_kind !== 'retry').length;
+      return `Timeline (${state.timelineRecords.length} rounds${userCount > 0 ? `, ${userCount} user` : ''})`;
+    }
+
     // 渲染整个 timeline 的 HTML (每轮 = request bubble + response 打字框).
     // 注意: 悬浮导航按钮 (.scroll-nav) 不在此处渲染 — 它是 #detail-wrap 的固定子元素
     // (article 的直接子, #detail 的兄弟), 不随 #detail 内容滚动 (issue #36).
     function renderTimelineHtml() {
-      const userCount = state.timelineRecords.filter(r => r.round_role === 'user').length;
-      let html = `<div class="detail-header">
-        Timeline (${state.timelineRecords.length} rounds${userCount > 0 ? `, ${userCount} user` : ''})
-      </div>`;
+      let html = `<div class="detail-header">${timelineHeaderText()}</div>`;
       // 每轮. pathId 是 timeline 级常量, 渲染级取一次传入 (upstreamChip 用).
       const pathId = timelinePathProviderId();
       html += state.timelineRecords.map((r, idx) => renderTimelineRound(r, idx, pathId)).join('');
@@ -3021,9 +3046,16 @@
     // 无源气泡 (assistant): 前序轮 response 的历史副本, 纯展示.
     //   text 一个气泡 + 每个 tool_call 各自气泡 (tool_call 是独立语义动作).
     //
-    // fallback: 若 req_delta_messages 为空, 用 preview 渲染单个 user 气泡.
-    // (新 API: TimelineRound 不含 method/path, fallback 仅用 preview.)
+    // round_kind 分发 (UI-1 契约, 后端 push 时预计算 — 前端不做推断):
+    //   'normal'      → 渲染 delta 气泡 (下方主逻辑).
+    //   'retry'       → retry 徽章 (非气泡): 重试轮 delta 为空, 用户没有发新消息,
+    //                  渲染气泡会捏造 "用户把同一句话说了一遍" — 徽章如实标注重发.
+    //   'no_messages' / undefined → preview fallback 单气泡 (空 body 等真无消息场景;
+    //                  undefined 兼容旧后端数据).
     function renderRequestDelta(r, redactions) {
+      if (r.round_kind === 'retry') {
+        return `<div class="retry-badge">↻ retry — identical messages</div>`;
+      }
       const deltas = r.req_delta_messages || [];
       const fallback = () => renderBubble('user', r.preview || '(no content)', redactions, 'user');
       if (deltas.length === 0) return fallback();
@@ -3073,6 +3105,8 @@
 
     // 返回选中轮最后一条气泡下边缘的视口 y; 无选中轮 / 不在 DOM / 无气泡时返回 null.
     // (highlightRound 和 updateResponseDrawerLayout 共用, 保证两处位置判断一致.)
+    // 注: null 是常态输入之一 — retry 轮 0 气泡 (UI-1) 也会走到这里; 调用方各自
+    // 优雅降级 (highlightRound 跳过平滑滚动仍 .flash / drawer 布局回落 defaultH).
     function selectedBubbleBottomVp() {
       if (!state.selectedRound) return null;
       const round = document.querySelector(

@@ -33,6 +33,7 @@
 | **Node** | ConversationDAG 中的一个节点 = 一次 API 调用 | 轮次、round、节点 | dag/web |
 | **Session** | 由 Merkle 前缀哈希聚类的一组 Node 链 | 会话、对话、conversation | dag/web |
 | **req_delta** | 一个 Node 相对其 parent 新增的 messages | 增量、本轮新增、delta | dag/web |
+| **RoundKind** | 轮次展示类别三态 (Normal 常规 \| Retry IR 等价重发 \| NoMessages 无 messages), push 时从 (split_at, msgs) 预计算, UI-1 渲染分发的 SSOT (contracts.md DTO-9) | 重试标记、轮次类型 | dag/web |
 | **resp_parsed** | 流式响应经 StreamScan 累积的 IR 视图 | 解析结果、响应解析 | web |
 | **Ingress / Egress** | 请求进入 / 响应离开 secret-guard 时用的协议 | 入站/出站协议 | proxy/codec |
 | **Effective view** | 合并 static + dynamic + decision 后的生效配置 | 生效配置、最终配置、合并视图 | config |
@@ -203,10 +204,12 @@ Redact 不应无必要地改变 request body 的字节内容, 避免破坏 LLM P
 > **编号映射**: AGENTS.md 的 `I*` 是 contracts.md `UI-*` 的前身 (历史编号).
 > `I1=UI-1`, `I2=UI-2`, `I3=UI-3`, `I4=UI-6 的 selectedRound 子属性`, `I5=UI-6`, `I6=UI-7`.
 > contracts.md 收录并扩展为 UI-1..UI-7, 以 contracts.md 为 SSOT; 此处保留 I* 编号便于历史 grep.
-### I1 — 气泡数 == 上下文数组长度
+### I1 — 气泡数 == req_delta messages 长度
 
-会话详情页 (timeline) 渲染的 Bubble 数量, 必须等于该 Node 对应 HTTP 请求的 IR messages
-数组长度. 任何渲染优化 (折叠、合并、视图派生) 不得改变此等式.
+会话详情页 (timeline) 渲染的 Bubble 数量, 必须等于该 Node 的 req_delta messages
+数组长度. 空 delta 轮按 `round_kind` 三态分发 (DTO-9, push 时预计算): `retry`
+(IR 等价重发) → 0 气泡 + retry 徽章 (不捏造用户消息); `no_messages` → preview
+fallback 单气泡. 任何渲染优化 (折叠、合并、视图派生) 不得改变此等式.
 
 ### I2 — sidebar 条目数 == HTTP 请求数
 

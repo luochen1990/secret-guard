@@ -72,6 +72,7 @@ fn build_round_briefs(inner: &DagInner, chain: &[Uuid]) -> Vec<RoundBrief> {
             Some(RoundBrief {
                 id: node.id,
                 round_role: node.event.round_role,
+                round_kind: node.event.round_kind,
                 preview: node.event.preview.clone(),
                 created_at: node.event.created_at,
             })
@@ -97,6 +98,7 @@ fn build_timeline_round(inner: &DagInner, node_id: Uuid) -> Option<TimelineRound
     Some(TimelineRound {
         id: node.id,
         round_role: node.event.round_role,
+        round_kind: node.event.round_kind,
         preview: node.event.preview.clone(),
         created_at: node.event.created_at,
         // 实际承载转发的 provider id (#179, 虚拟 endpoint 切换的可观测性).

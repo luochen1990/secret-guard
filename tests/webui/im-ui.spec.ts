@@ -777,6 +777,54 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     });
   }
 
+  // ─── UI-1 retry 守卫: 相同请求重发不捏造用户消息 ─────────────────────────
+  //
+  // UI-1 精确化 (2026-08-26): 空 delta 轮的渲染语义按 round_kind 分发:
+  //   round_kind=retry (客户端字节级重发, 用户没有发新消息) → retry 徽章, 0 消息气泡.
+  //
+  // 历史 bug: 前端 fallback 把空 delta 渲染为 preview user 气泡 → N 次重发在 timeline
+  // 上呈现为 "用户把同一句话说了 N 遍" — 捏造事实. 重试合并到同会话的语义保留
+  // (用户裁决), 仅修展示.
+  test("UI-1 retry 守卫: 相同请求重发 → 1 会话 2 轮, 仅 1 个 user 气泡 + retry 徽章", async ({
+    page,
+  }) => {
+    const marker = "ui1-retry-guard-marker";
+    const messages = [{ role: "user", content: marker }];
+
+    // 两次字节级相同的请求: 第二次全前缀命中 (split_at == len, delta 空)
+    // → 同一 session 延续 (重试合并), round_kind=retry.
+    await sendChat(page, messages);
+    await sendChat(page, messages);
+
+    const sid = await findSessionLeafByPreview(page, marker);
+    await clickSessionByLeaf(page, sid);
+
+    // 轮次数 == 2: 重试不拆 session (每次真实转发都是可审计的一轮, I2 语义).
+    await expect(page.locator("#detail .tl-round")).toHaveCount(2);
+
+    // 消息气泡仅 1 个: 重试轮渲染徽章而非捏造用户消息 (UI-1 核心断言).
+    await expect(page.locator("#detail .request-pane .chat-bubble")).toHaveCount(1);
+
+    // retry 徽章恰好 1 个 (第二轮), 文本含 "retry".
+    const badge = page.locator("#detail .retry-badge");
+    await expect(badge).toHaveCount(1);
+    await expect(badge).toContainText("retry");
+
+    // sidebar: 同 session 2 个条目 (I2), retry 轮带 ↻ 前缀 (消除与原轮的 preview 歧义).
+    const roundList = page.locator(`.round-list[data-sid="${sid}"]`);
+    await expect(roundList.locator(".round-item")).toHaveCount(2);
+    await expect(roundList.locator(".round-item", { hasText: "↻" })).toHaveCount(1);
+
+    // 选中 retry 轮 (末轮): 0 气泡是常态输入, 布局应优雅降级 (选中态迁移 + 无异常,
+    // drawer 不因 selectedBubbleBottomVp=null 崩溃) — UI-1 retry 变体守卫.
+    await selectLastRoundAfterToggle(page);
+    await expect(page.locator("#detail .tl-round.selected .retry-badge")).toHaveCount(1);
+
+    // header userCount 过滤 retry: 2 轮但只有 1 条真实用户消息 (retry 不是新用户输入).
+    // (renderTimeline 写 #detail > .detail-header: "Timeline (N rounds, M user)".)
+    await expect(page.locator("#detail > .detail-header")).toContainText("Timeline (2 rounds, 1 user)");
+  });
+
   // ─── I2 显式不变量守卫: sidebar (round-item + sub-dot) 总数 == HTTP 请求数 ──
   //
   // AGENTS.md 前端不变量 I2:

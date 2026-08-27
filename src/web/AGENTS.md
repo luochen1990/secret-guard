@@ -149,9 +149,11 @@ API key CRUD **无条件挂载** (在 `web::router()`, 不依赖 `auth.enabled`)
 
 ## WebUI 渲染契约 (`index.html`)
 
-> 前端不变量 I1 (气泡数 == IR messages 长度) / I2 (sidebar 条目数 == HTTP 请求数) /
-> I3 (timeline 轮次 DOM 顺序 == 数据顺序 oldest-first) 见根目录 AGENTS.md.
-> 回归守卫: `tests/webui/im-ui.spec.ts`.
+> 前端不变量 I1 (气泡数 == req_delta messages 长度; 空 delta 轮按 round_kind 三态
+> 分发: retry → 0 气泡 + 徽章 / no_messages → preview fallback) / I2 (sidebar 条目数
+> == HTTP 请求数) / I3 (timeline 轮次 DOM 顺序 == 数据顺序 oldest-first) 见根目录
+> AGENTS.md. 回归守卫: `tests/webui/im-ui.spec.ts`. round_kind 派生语义 SSOT =
+> contracts.md DTO-9.
 
 ### Provider 表单 (构造分野 + 路由编辑器) 与列表 router 行渲染
 
@@ -183,6 +185,11 @@ API key CRUD **无条件挂载** (在 `web::router()`, 不依赖 `auth.enabled`)
   (`.sub-dot`), 横向排列在组首下方.
 - 圆点颜色 = tool name 哈希 (FNV-1a 调色板, 与 provider 图标复用), tooltip 显示 tool name + 时间.
 - 点击圆点 = `selectRound` (同二级条目).
+- **重试轮** (`round_kind === 'retry'`, 后端 push 时预计算, SSOT): 继承 parent 的
+  round_role + preview → 与原轮同型渲染 (用户轮重试仍是组首, 工具轮重试仍是 sub-dot
+  — fork 场景祖先链完整, 同型成立; 仅孤儿链 parent 被 LRU 淘汰时, Tool 重试轮作为
+  链首走隐式组首 fallback), preview/tooltip 加 `↻` 前缀区分 (消除与原轮的 preview
+  歧义). 语义: IR 等价重发, 用户没有发新消息, 见 contracts.md DTO-9 / UI-1.
 
 ### 每轮操作按钮 (info + raw)
 

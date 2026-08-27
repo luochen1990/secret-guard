@@ -585,6 +585,7 @@ mod tests {
             preview: None,
             model: None,
             round_role: IrRole::User,
+            round_kind: crate::dag::RoundKind::Normal,
             redactions: Arc::from(Vec::new()),
             upstream_model: None,
             upstream_id: Arc::from("test"),

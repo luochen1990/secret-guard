@@ -61,6 +61,7 @@ pub(super) fn node_view(inner: &DagInner, node_id: Uuid) -> Option<NodeView> {
         parent: node.parent,
         session_id: node.session_id,
         round_role: node.event.round_role,
+        round_kind: node.event.round_kind,
         req_delta_count: node.req_delta.len(),
         has_response: resp.is_some(),
         created_at: node.event.created_at,

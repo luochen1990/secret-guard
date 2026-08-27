@@ -584,6 +584,21 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 > 按 §0.2 "编号作废不重用" 规则, DTO-8 编号永久作废, 不再分配.
 > 现行轻量化语义由 NodeView (`src/dto.rs`) 承载.
 
+### DTO-9 round_kind 三态派生
+
+**陈述**: 轮次展示类别 `round_kind` 是 `(split_at, msgs)` 的纯函数, 在 `push_messages` 内一次性预计算 (与 round_role 同位置修正, SSOT), TimelineRound / RoundBrief / NodeView 零成本透传, 前端按其分发渲染 (UI-1). 三态:
+- delta 非空 (`split_at < msgs.len()`) → `normal`
+- msgs 非空但全前缀重复 (`split_at == msgs.len()`) → `retry` (客户端重发 IR 等价请求 — 判定在 IR 哈希层, 字节级相同是典型场景; session 归属: 重发对象是当前 leaf → 延续同 session (**重试合并**语义, 人工授权 2026-08-26); 重发较旧轮次 → 按 CDAG-8 fork 语义开新 session. retry 轮继承 parent 的 round_role + preview — parent 的完整 messages == 本请求 body, 工具轮重试呈 sub-dot 同型展示而非伪组首)
+- msgs 为空 → `no_messages` (空 body / Responses ingress 的 `input[]`)
+
+**Properties**:
+- `prop_round_kind_retry_on_identical_repeat`: 字节级相同请求重复 push (leaf 场景) → 第二轮 `retry` 且延续同一 session. 🔁→`round_kind_retry_on_identical_repeat_request` (`src/dag/mod.rs`)
+- `prop_round_kind_retry_on_stale_prefix_forks_new_session`: 重发非 leaf 前缀 → `retry` 且按 CDAG-8 fork 开新 session. 🔁→`round_kind_retry_on_stale_prefix_forks_new_session` (`src/dag/mod.rs`)
+- `prop_round_kind_retry_inherits_parent_role_preview`: retry 轮继承 parent 的 round_role + preview (工具轮重试呈 Tool + tool name). 🔁→`round_kind_retry_inherits_parent_role_and_preview` (`src/dag/mod.rs`)
+- `prop_round_kind_normal_on_superset`: 超集延续 (delta 非空) → `normal`. 🔁→`round_kind_normal_on_superset_extension` (`src/dag/mod.rs`)
+- `prop_round_kind_no_messages_on_empty`: msgs 为空 → `no_messages`. 🔁→`round_kind_no_messages_on_empty_messages` (`src/dag/mod.rs`)
+- `prop_round_kind_carried_by_dtos`: TimelineRound 与 RoundBrief 均携带 round_kind. 🔁→`timeline_and_brief_carry_round_kind` (`src/dag/mod.rs`)
+
 ---
 
 ## 6. CFG: 双层配置
@@ -787,12 +802,16 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 > 信任域 C. 跨 web/dag/index.html 的强不变量.
 
-### UI-1 气泡数 == IR messages 长度
+### UI-1 气泡数 == req_delta messages 长度 (空 delta 轮按 round_kind 分发)
 
-**陈述**: 会话详情页 (timeline) 渲染的 Bubble 数量必须等于该 Node 对应 HTTP 请求的 IR messages 数组长度.
+**陈述**: 会话详情页 (timeline) 渲染的 Bubble 数量必须等于该 Node 的 req_delta messages 数组长度. 空 delta 轮的渲染语义按 `round_kind` (DTO-9, 后端 push 时预计算) 分发, 前端不做推断:
+- `normal` → 渲染 delta 气泡 (气泡数 == delta messages 长度)
+- `retry` → **0 个消息气泡** + retry 徽章 (重试轮用户没有发新消息, 渲染气泡会捏造 "用户把同一句话说了一遍")
+- `no_messages` → preview fallback 单气泡 (空 body 等真无消息可渲染场景)
 
 **Properties**:
 - `prop_bubble_count_equals_ir_messages_length`: 对 N (≥1) 条 IR messages, timeline 渲染 N 个 Bubble. 🔁→`I1 守卫` (`tests/webui/im-ui.spec.ts`, 参数化 N=1/3/5)
+- `prop_retry_round_renders_badge_not_bubble`: 字节级相同请求重发 → 同 session 2 轮, 仅 1 个 user 气泡 + retry 徽章 + sidebar retry 条目带 ↻ 前缀. 🔁→`UI-1 retry 守卫` (`tests/webui/im-ui.spec.ts`)
 
 ### UI-2 sidebar 条目数 == HTTP 请求数
 
@@ -894,3 +913,4 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 | 2026-08-24 | FWD-5 | 新增虚拟 provider 路由 5 条 property: per-request 解析 (`prop_route_resolution_per_request`) / 坏路由 503 (`prop_route_broken_returns_503`) / 环终止 (`prop_route_cycle_termination`) / upsert 环拒绝 (`prop_route_cycle_rejected_at_upsert`) / upstream_id 可观测 (`prop_upstream_id_observable`) | #179: 虚拟 endpoint (route_to) — 客户端固定连虚拟端点, WebUI 即席切换上游; 语义裁决 (per-request / 悬空放行 / 三层环防护) 经人工授权 |
 | 2026-08-24 | FWD-1 | **语义修订**: "对 wire 的唯一合法修改是 real↔mock 替换" → 扩为两种: real↔mock 替换 + **model 字段重写 (仅当生效 provider 配置 `model_override`)**; 请求半段等式追加条件项 `.replace(model, override)`; 新增 property `prop_request_half_byte_exact_with_model_override`. 代价明示: override 生效时同协议无-secret 请求从字节直传降级为 IR 改写 (normalize 等价, 前缀缓存失效 — 用户主动选择的降级). 配套 FWD-5 新增 `prop_model_override_*` 4 条 (first-wins 解析 / egress 注入 / 无 codec 降级) | #183: 虚拟 endpoint P2 — 跨模型名切换 (切换 = target+model 二元组); 修订经人工授权 (2026-08-24, issue #183 记录裁决与 D1-D5 设计决策) |
 | 2026-08-25 | FWD-5 | **多规则路由 (router rules) 契约修订**: 虚拟 provider (单 `route_to` + provider 级 `model_override`) → Router 构造 (`rules` 规则列表: pattern 通配符 / route_to / 规则级 model / priority); 规则按**请求 model** 匹配 (per-request, body 收集后解析); model 重写改 **pipeline** 语义 (改写值参与下一跳匹配, 后者覆盖前者 — 作废 first-wins 的 `prop_model_override_first_hop_wins`, 新增 `prop_model_rewrite_pipeline_feeds_next_hop` + `prop_model_rewrite_later_overrides_earlier`); 错误清单新增 NoMatch (无匹配规则 → 503); 环检查边集 = 启用规则; 新增 property: 请求 model 提取 / 通配符语义 / priority 序 + 同值列表序 tie-break / 禁用规则跳过 / no-match 503. FWD-1 措辞同步: `model_override` → 规则级 `model` 重写 (`prop_request_half_byte_exact_with_model_override` 更名 `..._with_model_rewrite`) | 虚拟 provider 多规则化: model 通配符路由 + 规则级 model 改写 (pipeline) + 删除 model_override 配置字段 |
+| 2026-08-26 | UI-1 + DTO-9 | UI-1 精确化: "气泡数 == IR messages 长度" → "气泡数 == req_delta messages 长度, 空 delta 轮按 round_kind 分发" (retry → 0 气泡 + 徽章 / no_messages → preview fallback); 新增 DTO-9 round_kind 三态派生 (push 时预计算) + 6 条 property. 语义裁决 (人工授权): IR 等价的相同请求判定为重试, 重发对象是当前 leaf 时**合并保留** (延续同 session), 重发较旧轮次按 CDAG-8 fork 开新 session; retry 轮继承 parent 的 round_role + preview (工具轮重试呈 sub-dot 同型, 不捏造伪组首); 仅修展示 — 前端 fallback 曾把重试轮捏造为重复的用户消息气泡 | 用户报告: 多次发送相同请求 → timeline 出现多个重复用户消息, 不符合事实. 链路缺口 = 渲染规格的输入枚举不完备 (空 delta 轮未分类) + fallback 成 de facto 规格未审视 |
