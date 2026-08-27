@@ -148,7 +148,7 @@
 对"尝试性解析"功能, 必须同时满足:
 
 1. **鲁棒性处理**: 解析路径用 `Option`/`Result` 传播失败, 缺字段 / 类型不符 / 空数组 / 越界
-   都返回 `None` 或空, 由调用方走 fallback (如 preview fallback 到 `method + path`,
+   都返回 `None` 或空, 由调用方走 fallback (如 preview 为 None 时前端降级到占位文本,
    delta 切片 fallback 到空 `Vec`, tool name fallback 到 `'?'`).
    Rust 侧用 `?` 短路; 前端用 `|| []` / `|| '?'` 兜底.
 2. **假设声明注释**: 每个解析点必须在注释中显式写出它对输入的假设

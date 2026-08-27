@@ -80,11 +80,13 @@ PATCH  /api/api-keys/{id}/toggle
 - `preview`: sidebar 主标题 (截断到 48 chars). 优先取最后一条 user message (可读性好);
   无 user 时回退到最后一条有文本的 message (tool_result / assistant).
   压缩 marker ("What did we do so far?") 命中时 fallback 到最后一条 assistant 摘要.
-  提取失败 fallback 到 method+path.
+  提取失败 (非 JSON / 缺 messages) → preview=None, 前端降级到占位文本:
+  sidebar round-item `(no preview)` / sub-dot tooltip `?` / timeline 气泡 `(no content)`;
+  session 级条目先试 `path` 字段 (SessionView 携带, TimelineRound 不含).
 - `model`: 顶层 `model` 字段 (OpenAI / Anthropic 共有), sidebar 副标题第二行.
 
 **假设声明**: 假设 messages 数组中 user 在 assistant 之前; 假设压缩 marker 是固定字符串.
-**降级**: 任一假设不成立 → fallback (method+path / 空 model), **永不 panic**.
+**降级**: 任一假设不成立 → fallback (preview 占位文本 / 空 model), **永不 panic**.
 
 ### session-aware timeline (TimelineRound / TimelineTail / TimelineDiffData)
 

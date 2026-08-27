@@ -36,7 +36,7 @@
 //!
 //! 这些函数接收用户可控的 HTTP body (任意字节), 任何 panic 都能让单个恶意请求崩溃整个进程
 //! (DoS). 故对非 JSON / 字段缺失 / 类型不符 / 空数组 / 越界一律返回 `None`/空, 由调用方走
-//! fallback (preview fallback 到 method+path). 形式化契约 ROB-1 (永不 panic) 由本模块测试中
+//! fallback (preview 返回 None, 前端降级到占位文本). 形式化契约 ROB-1 (永不 panic) 由本模块测试中
 //! 的两个 proptest 守卫 (覆盖任意字节 + 合法 JSON 扰动两路径), 详见 `docs/design/contracts.md` §8.
 
 /// preview 截断上限 (char count). 后端唯一截断点, 前端直接渲染.
@@ -179,7 +179,7 @@ pub(crate) fn extract_tool_use_name(msgs: &[crate::codec::ir::IrMessage]) -> Opt
 /// 仅保留非空 + 非 `{` 开头的快速路径 guard (过滤 GET/DELETE 等无 body 场景).
 ///
 /// 失败容错: 非 JSON / 字段缺失 / 类型不匹配一律返回 (None, None), 不影响 list 响应.
-/// 前端按 None fallback 到 method+path (与旧行为一致).
+/// 前端按 None 降级到占位文本 (round/session 两级占位不同, 详见 `src/web/AGENTS.md`).
 pub(crate) fn extract_preview_and_model(req_body: &str) -> (Option<String>, Option<String>) {
     // 快速路径: 空 body 或明显非 JSON (不以 '{' 开头 = GET/DELETE 等无 body 场景).
     if req_body.is_empty() || !req_body.starts_with('{') {
