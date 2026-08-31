@@ -164,6 +164,11 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 > model 不同时, 上游前缀缓存从该请求起失效. 解析语义 (链上 pipeline / 无 codec 协议降级) 见
 > FWD-5 `prop_model_rewrite_*` 系列.
 
+> **router /models 本地终结** (2026-08-31 登记修订, **待人工授权** — §99): router provider 的模型列表
+> GET 请求 (端点清单见 FWD-7) 在 dispatch 内本地终结, 对这类请求 FWD-1 **不适用** — 响应为本地合成
+> (别名 + 可含缓存的上游清单, 非实时中继, 最旧可 stale 300s), 不存在 "发往上游的 wire" 半段.
+> Direct provider 的 /models 仍受 FWD-1 约束 (透传, 见 FWD-7 的 D6 回归守卫). #196.
+
 `normalize` = canonical JSON (BTreeMap key 排序 + 紧凑序列化 + 无空白). 消除对语义无影响的字节差异, 剩下的差异全部是真正的信息差异.
 
 **适用范围**: 同协议路径. 非流式 wire JSON + 流式 SSE wire.
@@ -281,6 +286,30 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 - `prop_only_ingress_protocol_auth_header_sent`: 发往上游的请求只含 ingress 协议对应的 auth header, 非 ingress 协议的 auth header 被剥离 (避免客户端误传对手协议 header 干扰上游). 🔁→`apply_provider_auth_strips_competing_headers` (`src/proxy/auth.rs`)
 - `prop_correct_auth_injected_per_protocol`: OpenAI/Ollama → `Authorization: Bearer`; Anthropic → `x-api-key`; Gemini → `x-goog-api-key`. 🔁→`provider_api_key_overrides_client_auth` (OpenAI Bearer) + `anthropic_provider_uses_x_api_key`; Gemini `x-goog-api-key` 注入无专项
 - `prop_api_key_two_sources_resolved`: api_key 来自 `api_key` (直接值) 或 `api_key_file` (运行时读文件) 任一来源, 解析为同一 effective value. 🔁→`provider_api_key_file_reads_secret_from_path` + `provider_api_key_file_missing_falls_through_to_no_auth` + `put_static_fork_null_api_key_inherits_api_key_file`
+
+### FWD-7 Router provider 模型列表本地合成 (GET /models, #196)
+
+**陈述**: router provider (`ProviderKind::Router`) 的模型列表类 GET 请求 (按 ingress 协议: o/r/a 的 `/models` 与 `/v1/models`; g 另含 `/v1beta/models`; l 的 `/api/tags`; query 参数忽略, rest 前导 `/` 形态容错) 在 dispatch 内**本地终结**, 不进转发链 (无 body 收集 / 无路由解析 / 无 DAG 记录 — D5)。响应 = **别名清单 ∪ 过滤后的上游模型清单**:
+
+- **别名段** (N2): 启用路由中不含 `*` 的 model_pattern (exact pattern), 按路由表序去重; 经 `resolve_route` 校验**可解析**才广告 (D2: advertised ⇒ resolvable)。
+- **合并段** (N1): `advertise(M) ⟺ resolve_route(router, M) = (T, E) ∧ E ∈ cached(T)` — E = 链上生效的 `model_rewrite` ∨ M; **广告名是 M** (客户端可寻址名), 不是 E。列表序 = 可达 Direct 的 walk 序 (DFS 按路由表序首达; 悬空 / disabled target 分支终止不贡献) × 各 provider 清单的**上游响应数组序**, 跨 provider 及与别名段去重。
+- **N6 顶层 wildcard gate**: 被查询 router 的**启用**路由中存在含 `*` 的 model_pattern 才 fetch+merge; 否则只返回别名 (**零上游请求**)。gate 只看顶层 (不看链上更深处) — exact-only 顶层 ⇒ 准入名 ⊆ 别名集 ⇒ merge 贡献 ≡ ∅。顺带修复 exact-only router 对 GET /models 的历史 503 (GET 无 body → `request_model=""` → NoMatch)。
+- **上游清单缓存** (N3/N4): per-Direct-provider (`{models, fetched_at}`), union 查询时现算 (不做 flat union 缓存); TTL 300s 常量 (不进配置); serve-stale-on-error (刷新失败保留旧数据); single-flight (持缓存锁串行 refresh, 等锁者读新鲜缓存); 懒加载 (首个查询触发 fetch); **失败退避** (fetch 失败后 30s 常量窗口内的过期/从未成功条目不再重试 — 窗口内查询立即 serve stale 或无贡献, 不阻塞不占锁重试, 防 dead target 逐查询阻塞 × 全局锁串行的可用性放大)。fetch 按目标 provider **自身 protocol** (非 ingress 协议): o/a/r → `/v1/models` `{data:[{id}]}`; g → `/v1beta/models` `{models:[{name:"models/X"}]}` (剥前缀); l → `/api/tags` `{models:[{name}]}`。
+- **ROB (best-effort 永不 fail 查询)**: 上游 fetch 失败 / 超时 (10s) / 非 2xx / 响应畸形 → 该 provider 跳过 + warn (只含 provider id + reason, 永不含 key/secret), 查询仍 200 (从未成功过则该 provider 无贡献 → 仅别名)。
+- **N5**: 所有条目 `owned_by: "router"` (统一, 不泄漏内部 provider id)。
+- **D1**: wildcard pattern 本身不列入响应 (其覆盖的真实模型名经 merge 自然出现)。
+- **D6 (回归守卫)**: Direct provider 的模型列表请求**不进此路径**, 透传行为完全不变 (byte-exact, 不进缓存)。
+- **锁纪律**: walk 可达集快照 (触碰 ProviderTable 读锁) 必须在持有缓存 Mutex 之前完成 (持缓存锁跨 await 期间不得再取 ProviderTable 读锁)。
+
+**Properties**:
+- `prop_router_models_advertise_matches_cached_oracle` (#196): 以缓存快照为 oracle, 合并段广告集恰为 {M ∈ ∪cached : resolve_route(M)=(T,E) ∧ E ∈ cached(T)}; 三边界成立 — 遮蔽 (更高 priority 路由夺走但目标清单无该名 → 过滤) / 重写 (判定看 egress E 是否在目标清单, 不看 M) / 解析失败 (NoMatch / 悬空 / 环 → 不广告); 列表序 = 别名 (路由表序) → walk 序 × 上游响应数组序, 全程去重。🔁→`router_models_default_plan_merge` + `n1_shadowing_and_fallback_boundaries` + `n1_rewrite_judges_egress_model_not_client_model` + `n1_broken_chain_not_advertised`
+- `prop_router_models_exact_only_zero_fetch` (#196, N6): exact-only router (启用路由均无 `*`) 的 /models 查询**零上游请求** (上游 mock 命中数为 0), 响应只含别名。🔁→`router_models_exact_only_skips_upstream` + `advertised_names_exact_only_returns_aliases_without_merge`
+- `prop_router_models_fetch_never_fails_query` (#196, ROB): 上游 fetch 失败 (非 2xx / 超时 / 畸形) 时 /models 查询仍 200 — 从未成功过则仅别名; 曾成功且 TTL 过期后刷新失败则 serve-stale 旧数据; TTL 过期后上游恢复则重新 fetch 覆盖。🔁→`router_models_upstream_error_serves_aliases_only` + `model_list_cache_stale_on_error_and_refresh_after_ttl`
+- `prop_router_models_fetch_failure_backoff` (#196, N4/M1): fetch 失败后的退避窗口 (30s 常量) 内, 过期/从未成功的条目**不再重试** — 窗口内后续查询立即 serve stale (或无贡献), 上游恰命中一次失败请求; 窗口过后允许重试 (上游恢复则拿到数据)。🔁→`model_list_cache_failure_backoff_blocks_retry_within_window`
+- `prop_router_models_single_flight` (#196, N4/M2): 并发 /models 查询 (首个 fetch 进行中到达第二个) 对同一 provider 的上游只发起**一次** fetch (等锁者随后读新鲜缓存, 不 stampede), 两查询响应一致。🔁→`router_models_single_flight_under_concurrency`
+- `prop_direct_models_passthrough_unchanged` (#196, D6 回归): Direct provider 的 GET /models 仍上游字节原样透传 (byte-exact), 且不进 router 的清单缓存 (每次查询都触达上游)。🔁→`direct_provider_models_passthrough_byte_exact`
+- `prop_router_models_alias_advertised_implies_resolvable` (#196, D2): 出现在响应别名段的 exact pattern 必可经 resolve_route 完整解析 (悬空 / 链上 NoMatch / disabled target 的 pattern 不广告); 禁用路由与 wildcard pattern 不进别名段。🔁→`alias_names_requires_full_chain_resolvable` + `alias_names_order_dedup_skip_disabled_and_wildcard`
+- `prop_router_models_no_dag_records` (#196, D5): /models 本地终结与上游 cache-fill fetch 均不产生 DAG session / node (查询后 /api/sessions total=0)。🔁→`router_models_default_plan_merge`
 
 ---
 
@@ -915,3 +944,5 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 | 2026-08-25 | FWD-5 | **多规则路由 (router rules) 契约修订**: 虚拟 provider (单 `route_to` + provider 级 `model_override`) → Router 构造 (`rules` 规则列表: pattern 通配符 / route_to / 规则级 model / priority); 规则按**请求 model** 匹配 (per-request, body 收集后解析); model 重写改 **pipeline** 语义 (改写值参与下一跳匹配, 后者覆盖前者 — 作废 first-wins 的 `prop_model_override_first_hop_wins`, 新增 `prop_model_rewrite_pipeline_feeds_next_hop` + `prop_model_rewrite_later_overrides_earlier`); 错误清单新增 NoMatch (无匹配规则 → 503); 环检查边集 = 启用规则; 新增 property: 请求 model 提取 / 通配符语义 / priority 序 + 同值列表序 tie-break / 禁用规则跳过 / no-match 503. FWD-1 措辞同步: `model_override` → 规则级 `model` 重写 (`prop_request_half_byte_exact_with_model_override` 更名 `..._with_model_rewrite`) | 虚拟 provider 多规则化: model 通配符路由 + 规则级 model 改写 (pipeline) + 删除 model_override 配置字段 |
 | 2026-08-26 | UI-1 + DTO-9 | UI-1 精确化: "气泡数 == IR messages 长度" → "气泡数 == req_delta messages 长度, 空 delta 轮按 round_kind 分发" (retry → 0 气泡 + 徽章 / no_messages → preview fallback); 新增 DTO-9 round_kind 三态派生 (push 时预计算) + 6 条 property. 语义裁决 (人工授权): IR 等价的相同请求判定为重试, 重发对象是当前 leaf 时**合并保留** (延续同 session), 重发较旧轮次按 CDAG-8 fork 开新 session; retry 轮继承 parent 的 round_role + preview (工具轮重试呈 sub-dot 同型, 不捏造伪组首); 仅修展示 — 前端 fallback 曾把重试轮捏造为重复的用户消息气泡 | 用户报告: 多次发送相同请求 → timeline 出现多个重复用户消息, 不符合事实. 链路缺口 = 渲染规格的输入枚举不完备 (空 delta 轮未分类) + fallback 成 de facto 规格未审视 |
 | 2026-08-27 | DTO-4 | property `prop_preview_fallback_method_path` 更名 `prop_preview_none_degrades_to_placeholder` 并改陈述: 原 "提取失败回退到 method+path" 描述的是已随 session-aware API 消亡的旧行为 (旧 RecordSummary 含 method/path, 现行 TimelineRound 不含), 实际降级链 = preview=None → 前端占位文本 (round 级 `(no preview)` / `(no content)`; session 级先试 `path` 字段). 同步修正 derive.rs 头注释/函数注释 + 根 AGENTS.md 鲁棒性段 + web/AGENTS.md 共 5 处散文残留 | 用户追问 NoMessages fallback 气泡内容时发现的文档漂移 (陈述与实现不符, 人工授权修正, PR #194 补充提交) |
+| 2026-08-31 | FWD-7 | 新增: router provider 模型列表 GET 请求本地合成 (别名 ∪ 过滤后上游清单), 收纳 N1 合并过滤 (以缓存快照为 oracle) / N6 exact-only 零 fetch / 上游 fetch best-effort 永不 fail 查询 / fetch 失败退避 (30s 窗口内不重试, 窗口内查询立即 serve stale) / single-flight 并发去重 / Direct 透传回归守卫 (D6) / 别名 advertised ⇒ resolvable (D2) / DAG 零记录 (D5) 共 8 条 property | #196: open-webui 等消费方依赖 /models 发现模型, 别名不在透传列表导致 taskModel 静默回退; exact-only router 对 GET /models 直接 503 |
+| 2026-08-31 | FWD-1 | **适用范围修订 (待人工授权)**: router provider 的模型列表 GET 请求 (FWD-7 域) 本地终结, 不转发上游 — 对这类请求 FWD-1 不适用 (响应为本地合成, 可含缓存上游清单, 非实时中继); Direct provider 的 /models 仍受 FWD-1 约束 (先例: 2026-08-24 #183 的 FWD-1 修订) | #196: 模型列表发现是网关自身的元数据职责, 透传上游列表无法承载路由别名 |

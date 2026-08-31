@@ -23,6 +23,10 @@
 //! | 同协议 + Redact | `same_proto_forward` | IR 路径: reader → `redact_ir` → writer |
 //! | 跨协议 | `cross_proto_forward` | IR 路径: reader → `redact_ir` → extra.clear → writer |
 //!
+//! 进入三条路径**之前**有一类本地终结分支 (#196, FWD-7): router provider + GET +
+//! 模型列表端点 → `models::handle_router_models` 本地合成 (别名 ∪ 过滤后上游清单),
+//! 不收集 body / 不做路由解析 / 不记 DAG。Direct provider 不进该分支。
+//!
 //! - **跨协议 + `stream=true`** → 501 (StreamTranslate 跨协议翻译已实现但未接入 dispatch).
 //! - **Gemini/Ollama 跨协议** → 501 (codec 未覆盖, `Protocol::from_native` 返回 None).
 //!
@@ -59,6 +63,8 @@
 //!   (进程级共享状态 `AppState` 在顶层 `crate::state`, 上移见 #145 偏差 3.)
 //! - `helpers`: HTTP header / URL / 字符串工具 (无业务语义).
 //! - `auth`: Provider 鉴权注入.
+//! - `models`: router GET /models 本地合成 + 上游清单缓存 (#196, FWD-7; 含
+//!   `ModelListCache` — AppState 聚合的纯数据 store, 经本模块根 re-export).
 //! - `recorder`: DAG record 构造 + 视图守卫 + 响应累积器.
 //! - `same_proto`: 同协议转发 (字节透传 / IR redact).
 //! - `cross_proto`: 跨协议 codec 翻译.
@@ -68,6 +74,7 @@ mod auth;
 mod cross_proto;
 mod fan_out;
 mod helpers;
+mod models;
 mod recorder;
 mod same_proto;
 
@@ -76,16 +83,24 @@ use std::time::Instant;
 use axum::{
     body::{Body, to_bytes},
     extract::{Path, Request, State},
-    http::Response,
+    http::{Method, Response},
 };
 
 use crate::error::AppError;
 use crate::provider::{Protocol, ProviderKind, ResolvedRoute};
 use crate::state::AppState;
 
+// AppState (crate::state) 持有 models::ModelListCache 字段: 类型是纯数据 store
+// (无 proxy 行为依赖), 在模块根 re-export 供 state / server / 集成测试命名
+// (子模块保持私有, 组合根先例同 state.rs 的 api_keys 字段, #196).
+pub use models::ModelListCache;
+
 /// axum 路径参数: `/{proto}/{name}/{*rest}`.
 ///
-/// `rest` 由 axum 的 catch-all 语法 (`{*rest}`) 提供, 含前导 `/`, 例如 `/v1/chat`.
+/// `rest` 由 axum 的 catch-all 语法 (`{*rest}`) 提供. **注意 (2026-08 实测, #196)**:
+/// axum 0.8 的 `{*rest}` 捕获**不含前导 `/`** (如 `v1/chat`); 旧注释 "含前导 `/`"
+/// 与实测不符 — 转发路径因 `helpers::build_upstream_url` 的双向容错从未暴露.
+/// 消费方一律经容错处理 (剥/补前导 `/`), 勿假设单一形态.
 /// 若 URL 只到 `/{proto}/{name}` 则走 [`forward_no_rest`] 单独路由.
 #[derive(serde::Deserialize, Debug)]
 pub struct ForwardPath {
@@ -134,7 +149,8 @@ pub(crate) use {cross_proto::cross_proto_forward, fan_out::fan_out_streaming_wit
 /// 路径段语义:
 /// - `proto` = ingress 协议的单字母简写 (完整映射见 [`Protocol::ALL`], SSOT).
 /// - `name` = 目标 provider id.
-/// - `rest` = 上游 path (含前导 `/`), query string 单独从 uri 拼回.
+/// - `rest` = 上游 path (axum 0.8 `{*rest}` 捕获**不含前导 `/`**, 见 [`ForwardPath`]
+///   注释; 消费方一律容错处理), query string 单独从 uri 拼回.
 ///
 /// MVP: 仅支持 ingress == provider.protocol (identity passthrough);
 /// 跨协议请求返回 501 Not Implemented.
@@ -186,6 +202,17 @@ async fn dispatch(
             "provider '{}' is disabled",
             provider.id
         )));
+    }
+
+    // 2.5 #196: router provider 的模型列表 GET 请求本地终结 (别名 ∪ 过滤后上游
+    // 清单, N1-N6 语义见 src/proxy/models.rs 头部 + contracts.md FWD-7): 无 body
+    // 收集 (GET 无 body), 无 route resolution, 无 DAG record (D5). Direct provider
+    // 不进此分支, /models 透传行为零变化 (D6). 非 GET / 非匹配路径落回原流程.
+    if parts.method == Method::GET
+        && matches!(provider.kind, ProviderKind::Router(_))
+        && models::is_model_list_path(ingress, &fp.rest)
+    {
+        return Ok(models::handle_router_models(&state, ingress, provider).await);
     }
 
     // 3. 收集请求 body (跨协议和同协议都需要).

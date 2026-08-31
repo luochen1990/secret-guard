@@ -136,7 +136,9 @@
   同属域 A); web/api → auth::apikey (API key CRUD 无条件挂载, "只认证不隔离");
   config → auth (AuthConfig/ApiKeyEntry 是配置 schema 的一部分, 纯数据依赖);
   mock ↔ secrets 对称引用 (SecretEntry 持 MockStrategy, mock 校验钩子被 SecretEntry
-  调用, 纯数据/校验层, 无业务行为).
+  调用, 纯数据/校验层, 无业务行为); state → proxy::ModelListCache (#196: AppState
+  聚合 router /models 的上游清单缓存, 纯数据 store 无 proxy 行为依赖, 组合根先例同
+  state → auth 的 ApiKeyStore — 见 `src/state.rs` 字段注释).
 
 > secret-guard 的核心职责 (转发 + Redact) 必须对任意字节流零失败.
 > 围绕核心职责之外、**基于对 LLM 应用层行为模式强假设** 的附加功能
@@ -285,6 +287,13 @@ URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标
 - **Responses + (Redact 或路由 model 重写) + `stream=true`** → 501 (Responses 流式 SSE 事件翻译未实现; 重写亦迫使 IR 路径 #183 D5; 见 "已知限制")
 - Gemini/Ollama 跨协议 → 501 (codec 未覆盖)
 
+**router provider 的模型列表 GET 请求本地终结 (#196)**: `GET /{o|a|g|l|r}/{router}` + 模型列表端点
+(o/r/a: `/models` 或 `/v1/models`; g 另含 `/v1beta/models`; l: `/api/tags`) 时, 响应本地合成 =
+别名清单 (exact pattern, 路由表序) ∪ 过滤后的上游模型清单 (per-Direct-provider 缓存,
+TTL 300s + serve-stale-on-error + single-flight; exact-only router 零上游请求 — N6 gate),
+不进转发链 / 不记 DAG (D5); Direct provider 的 /models 透传行为不变 (D6)。
+可测 property 见 `docs/design/contracts.md` **FWD-7**; 实现见 `src/proxy/models.rs` 头部。
+
 详尽的 dispatch 路径选择 (同协议透传 / IR 路径 / 跨协议翻译) 与 fan_out 三路径见
 `src/proxy/mod.rs` 头部 (拆分为模块目录, 各子路径实现在 `same_proto.rs` / `cross_proto.rs` /
 `fan_out.rs`); 路由相关的可测 property 见 `docs/design/contracts.md` **FWD-5**.
@@ -309,7 +318,7 @@ URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标
 | `redact.rs` | RedactionMap + redact/restore pipeline + 形式化契约 C1-C7 | 文件头部 `//!` |
 | `util.rs` | 集中的哈希工具 (`hash64` SipHash 单值入口) | 文件头部 `//!` |
 | `codec/` | 跨协议 IR + Reader/Writer trait + StreamTranslate (OpenAI / Anthropic / Responses) | **`src/codec/AGENTS.md`** + `docs/design/ir-fields-roadmap.md` (IR 字段建模路线图: extra 边界 + 字段提升判定准则 + 实施批次) |
-| `proxy/` | dispatch 路径选择 + fan_out 三路径 + Provider 鉴权 (拆分为 mod/helpers/auth/recorder/same_proto/cross_proto/fan_out 子模块) | `src/proxy/mod.rs` 头部 `//!` |
+| `proxy/` | dispatch 路径选择 + fan_out 三路径 + Provider 鉴权 + router GET /models 本地合成 (拆分为 mod/helpers/auth/models/recorder/same_proto/cross_proto/fan_out 子模块) | `src/proxy/mod.rs` 头部 `//!` |
 | `state.rs` | 进程级共享状态 `AppState` (原 ProxyState, 上移见 #145) + HTTP 共享常量 `NO_STORE` | 文件头部 `//!` |
 | `web/` | JSON API (`api/` 目录) + 单页 WebUI | **`src/web/AGENTS.md`** |
 | `server.rs` | router 装配 + 双层状态注入 + graceful shutdown | 文件头部 `//!` |
@@ -666,6 +675,12 @@ configFile (escape hatch, 互斥). 凭据注入 (LoadCredential / sops 直接路
   messages 数 > IR messages 数. `extract_delta_messages_from_raw` 切片时跨协议路径的 start 偏小,
   delta 可能包含前序轮消息. 同协议路径不受影响. 详见 `src/web/AGENTS.md`.
 - static config 的 `[server]` (含 `upstream_*_timeout_secs`) / `[redact]` / `[auth]` 段仅在启动时读取一次, WebUI 改不生效 (restart 才生效).
+- **router /models 合并清单的上游数据最旧可 stale 300s (#196, FWD-7)**: 上游清单缓存 TTL = 300s
+  常量 (不进配置), TTL 内上游新增/下线的模型不会反映在 router /models 响应中; 刷新失败时继续
+  serve 旧数据 (serve-stale-on-error), 且失败后 30s 退避窗口内不重试 (期间查询立即返回, 不被
+  dead upstream 逐查询阻塞)。exact-only router 不 fetch (只返回别名, N6 gate)。
+  缓存按 provider id 键控: WebUI 修改 provider 的 base_url/protocol 后, 最长 300s 内继续 serve
+  旧上游的清单 (TTL 到期自然收敛)。
 - **redact_headers 名单硬编码 (SEC-4)**: `proxy/helpers.rs::redact_headers` 的敏感 header
   脱敏名单是硬编码黑名单 (显式枚举主流 provider auth header + 含 "token" / "secret"
   子串匹配, 完整名单以 `is_sensitive_header` 为 SSOT). 未在名单内的 header 会原样
@@ -741,6 +756,11 @@ configFile (escape hatch, 互斥). 凭据注入 (LoadCredential / sops 直接路
 - **session cookie Secure flag 可配置**: 给 `build_session_layer` 加配置开关
   (`[auth] secure_cookie = true`) 或从 `X-Forwarded-Proto` header 动态推断.
   当前硬编码 false (本地 HTTP dev 必须), 见 `docs/deployment-nixos.md` "HTTPS 反向代理" 段.
+- **models.rs 缓存锁内的 api_key_file 同步读外移 (#196 review L2)**: `snapshot_refreshing`
+  持缓存锁期间 `fetch_model_list` 调 `effective_api_key` — api_key_file 路径是同步文件读
+  (`std::fs::read_to_string`), 在 tokio worker 线程上持锁执行。修法: walk 快照阶段预解析
+  key 并随 targets 传入 (三元组化), 消除锁内同步 IO。非紧急: 仅 api_key_file 配置存在时有
+  实际 IO (通常 <1ms), 失败退避已把重试频率降到每 30s 一次。
 - mock_secret 的 category-aware 默认生成 (Password/ApiKey/Cookie 等格式感知).
 - 配置热加载; 测试覆盖率自动上报 + fuzzing (cargo-fuzz).
 - **auth/oidc.rs + handlers OIDC 流程的集成测试 (已完成 happy + 错误路径)**:

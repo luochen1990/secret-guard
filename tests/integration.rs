@@ -194,6 +194,7 @@ async fn spawn_proxy_static_dynamic(
         global_mock_prefix: std::sync::Arc::from(""),
         on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,
         upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
+        model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
     };
     let app = server::build_router(proxy);
     tokio::spawn(async move {
@@ -231,6 +232,7 @@ async fn spawn_proxy_with_prefix(global_mock_prefix: &str) -> String {
         global_mock_prefix: std::sync::Arc::from(global_mock_prefix),
         on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,
         upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
+        model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
     };
     let app = server::build_router(proxy);
     tokio::spawn(async move {
@@ -272,6 +274,7 @@ async fn spawn_proxy_with_probe_mode(
         global_mock_prefix: std::sync::Arc::from(""),
         on_probe_exhausted: mode,
         upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
+        model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
     };
     let app = server::build_router(proxy);
     tokio::spawn(async move {
@@ -2383,6 +2386,7 @@ async fn spawn_proxy_with_timeouts_and_secrets(
         global_mock_prefix: std::sync::Arc::from(""),
         on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,
         upstream_timeouts,
+        model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
     };
     let app = server::build_router(proxy);
     tokio::spawn(async move {
@@ -4178,6 +4182,7 @@ async fn cross_table_shared_state_no_lost_update() {
         global_mock_prefix: std::sync::Arc::from(""),
         on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,
         upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
+        model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
     };
     let app = server::build_router(proxy);
     tokio::spawn(async move {

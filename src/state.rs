@@ -45,6 +45,12 @@ pub struct AppState {
     /// 来自 `[server] upstream_*_timeout_secs` 的上游超时配置.
     /// forward 路径用它给 send().await / stream chunk 加超时保护.
     pub upstream_timeouts: crate::config::UpstreamTimeouts,
+    /// Router provider GET /models 的上游模型清单缓存 (#196, FWD-7):
+    /// per-Direct-provider, TTL 300s + serve-stale-on-error + single-flight,
+    /// 语义 SSOT 见 `src/proxy/models.rs` 头部. 类型是纯数据 store (无 proxy
+    /// 行为依赖), 经 `crate::proxy` re-export 在此聚合 — 组合根先例同
+    /// `api_keys` (state 聚合各 feature 模块的 store 类型).
+    pub model_lists: Arc<crate::proxy::ModelListCache>,
 }
 
 // ─── HTTP 层共享常量 ────────────────────────────────────────────────────────

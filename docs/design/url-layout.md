@@ -69,6 +69,12 @@ forward 路由 (`/{proto}/{name}/...`) 首段必须是 proto 简写, 由
 > `/{proto}/{name}` 路由 — URL 层零新增保留字; dispatch 在 provider 解析后按请求
 > model 匹配路由并跟随 target 链 (ingress 仍由 URL proto 决定). 详见 FWD-5
 > (`docs/design/contracts.md`).
+>
+> **模型列表端点的行为注记 (#196, URL 不变)**: router provider 的模型列表 GET 端点
+> (o/a/r 的 `/models` 与 `/v1/models`, g 另含 `/v1beta/models`, l 的 `/api/tags`) 在
+> dispatch 内**本地终结** — 响应本地合成 (别名 ∪ 过滤后上游清单), 不透传上游。
+> 这是同一 URL 上的行为分派 (按 provider kind), 不是新的 URL 分配; 语义 SSOT 见
+> FWD-7 (`docs/design/contracts.md`)。Direct provider 的同端点仍透传。
 
 ## `/api/*` 子空间分配
 

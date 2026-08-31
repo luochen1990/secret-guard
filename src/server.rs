@@ -317,6 +317,7 @@ pub async fn serve(
         global_mock_prefix: Arc::from(global_mock_prefix),
         on_probe_exhausted,
         upstream_timeouts,
+        model_lists: Arc::new(crate::proxy::ModelListCache::new()),
     };
 
     // 条件化: 启用认证时构造 AuthStack, 否则单用户模式.
