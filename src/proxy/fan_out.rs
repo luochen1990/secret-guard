@@ -125,7 +125,10 @@ async fn fanout_stream_task(
     tx: mpsc::Sender<Result<Bytes, std::io::Error>>,
     parsed_sync: Option<ParsedSync>,
     mut pipe: impl ChunkPipeline + Send + 'static,
-    finalize_parsed: impl FnOnce(Option<ParsedSync>, &RecordAccumulator) -> (Option<serde_json::Value>, ResponseEcho)
+    finalize_parsed: impl FnOnce(
+        Option<ParsedSync>,
+        &RecordAccumulator,
+    ) -> (Option<serde_json::Value>, ResponseEcho)
     + Send
     + 'static,
     finalize_body: impl FnOnce(&RecordAccumulator) -> String + Send + 'static,

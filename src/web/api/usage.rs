@@ -5,9 +5,9 @@
 //! (单测在 usage 模块). domain hint: provider id → base_url host (models.dev
 //! vendor 消歧, 设计 §7 规则 2).
 
+use axum::Json;
 use axum::extract::{Query, State};
 use axum::response::IntoResponse;
-use axum::Json;
 use serde::Deserialize;
 
 use crate::state::{AppState, NO_STORE};
@@ -24,11 +24,11 @@ pub async fn usage_summary(
     Query(q): Query<SummaryQuery>,
 ) -> impl IntoResponse {
     let retention = state.usage.retention_days();
-    let days = q
-        .days
-        .unwrap_or(7)
-        .max(1)
-        .min(if retention > 0 { retention.max(1) } else { u32::MAX });
+    let days = q.days.unwrap_or(7).max(1).min(if retention > 0 {
+        retention.max(1)
+    } else {
+        u32::MAX
+    });
     let (table, status) = state.pricing.table(&state.upstream).await;
     // domain hint: 闭包借用 providers 表 (router 条目无 base_url → None).
     let hint = |pid: &str| -> Option<String> {
@@ -39,7 +39,12 @@ pub async fn usage_summary(
         }
     };
     let summary = build_summary(
-        SummaryInputs { store: &state.usage, table: &table, days, domain_hint: &hint },
+        SummaryInputs {
+            store: &state.usage,
+            table: &table,
+            days,
+            domain_hint: &hint,
+        },
         status,
     );
     (NO_STORE, Json(summary))
@@ -47,16 +52,16 @@ pub async fn usage_summary(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     /// days 归一逻辑 pin: 缺省 7 / 0 → 1 / retention 上限 / retention 0 无上限.
     #[test]
     fn days_normalization_matches_design() {
         // (query, retention) → expected — 直接复刻 handler 内联逻辑做回归锚.
         let norm = |q: Option<u32>, retention: u32| {
-            q.unwrap_or(7)
-                .max(1)
-                .min(if retention > 0 { retention.max(1) } else { u32::MAX })
+            q.unwrap_or(7).max(1).min(if retention > 0 {
+                retention.max(1)
+            } else {
+                u32::MAX
+            })
         };
         assert_eq!(norm(None, 90), 7);
         assert_eq!(norm(Some(0), 90), 1);

@@ -260,10 +260,7 @@ impl Reader for OpenAiReader {
             .and_then(Value::as_str)
             .map(read_stop_reason);
 
-        let usage = obj
-            .get("usage")
-            .filter(|v| v.is_object())
-            .map(read_usage);
+        let usage = obj.get("usage").filter(|v| v.is_object()).map(read_usage);
         let usage_present = usage.is_some();
         let usage = usage.unwrap_or_default();
 
@@ -1540,7 +1537,10 @@ mod tests {
         ))
         .unwrap();
         let ir = reader().read_response(&body).unwrap();
-        assert!(ir.usage_present, "explicit zero usage object must set presence");
+        assert!(
+            ir.usage_present,
+            "explicit zero usage object must set presence"
+        );
     }
 
     #[test]

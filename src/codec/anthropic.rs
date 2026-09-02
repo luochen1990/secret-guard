@@ -150,10 +150,7 @@ impl Reader for AnthropicReader {
             .map(|arr| arr.iter().filter_map(read_block).collect())
             .unwrap_or_default();
 
-        let usage = obj
-            .get("usage")
-            .filter(|v| v.is_object())
-            .map(read_usage);
+        let usage = obj.get("usage").filter(|v| v.is_object()).map(read_usage);
         let usage_present = usage.is_some();
         let usage = usage.unwrap_or_default();
 
@@ -990,7 +987,6 @@ mod tests {
     }
 
     // ─── read_tool_choice / read_stop_reason: 纯函数全分支覆盖 ──────────────
-
 
     // ─── usage_present (USAGE-2: presence 语义, usage-stats 采集) ─────────
     //

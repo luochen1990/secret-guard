@@ -196,10 +196,7 @@ impl Reader for ResponsesReader {
         let stop_reason = read_response_status(obj);
 
         // usage: Responses 用 input_tokens/output_tokens (而非 prompt_tokens/completion_tokens).
-        let usage = obj
-            .get("usage")
-            .filter(|v| v.is_object())
-            .map(read_usage);
+        let usage = obj.get("usage").filter(|v| v.is_object()).map(read_usage);
         let usage_present = usage.is_some();
         let usage = usage.unwrap_or_default();
         Ok(IrResponse {
@@ -959,21 +956,24 @@ mod tests {
 
     // ─── read_request: 基础映射 ──────────────────────────────────────────
 
-
     // ─── usage_present (USAGE-2: presence 语义, usage-stats 采集) ─────────
     //
 
     #[test]
     fn read_response_usage_present_semantics() {
         // 显式全零 usage → present; 缺席 → absent.
-        let present = reader().read_response(&json!({
-            "id": "resp_1", "model": "gpt-4o", "status": "completed",
-            "output": [], "usage": {"input_tokens": 0, "output_tokens": 0},
-        })).unwrap();
+        let present = reader()
+            .read_response(&json!({
+                "id": "resp_1", "model": "gpt-4o", "status": "completed",
+                "output": [], "usage": {"input_tokens": 0, "output_tokens": 0},
+            }))
+            .unwrap();
         assert!(present.usage_present);
-        let absent = reader().read_response(&json!({
-            "id": "resp_1", "model": "gpt-4o", "status": "completed", "output": [],
-        })).unwrap();
+        let absent = reader()
+            .read_response(&json!({
+                "id": "resp_1", "model": "gpt-4o", "status": "completed", "output": [],
+            }))
+            .unwrap();
         assert!(!absent.usage_present);
     }
 

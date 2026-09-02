@@ -414,6 +414,32 @@
     button.btn:hover:not([disabled]) { border-color: var(--border-strong); background: var(--panel-hi); }
     button.btn-danger:hover:not([disabled]) { border-color: var(--err); background: var(--err-soft); }
     button.btn[disabled] { color: var(--fg-faint); border-color: var(--border-faint); cursor: not-allowed; background: var(--panel-hi); }
+    /* ─── Usage tab (usage-stats) ─────────────────────────────────────── */
+    .usage-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 14px;
+      overflow-y: auto; padding: 14px 18px; }
+    .usage-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+    .range-switch { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+    .range-switch button { border: none; background: transparent; color: var(--fg-muted);
+      padding: 4px 12px; cursor: pointer; font-size: 12.5px; }
+    .range-switch button.active { background: var(--accent); color: var(--bg); }
+    .usage-pricing-status { font-size: 11.5px; color: var(--fg-faint); }
+    .usage-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(128px, 1fr)); gap: 8px; }
+    .usage-card { border: 1px solid var(--border-faint); border-radius: 10px; padding: 10px 12px; }
+    .usage-card .k { font-size: 11px; color: var(--fg-faint); text-transform: uppercase; letter-spacing: 0.04em; }
+    .usage-card .v { font-size: 17px; font-weight: 600; margin-top: 3px; font-variant-numeric: tabular-nums; }
+    .usage-card .v small { font-size: 11px; color: var(--fg-faint); font-weight: 400; }
+    .usage-chart-wrap h3, .usage-table-block h3 { font-size: 12.5px; color: var(--fg-muted); margin: 4px 0 6px; }
+    .usage-legend { font-weight: 400; font-size: 11px; color: var(--fg-faint); margin-left: 10px; }
+    .usage-legend i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin: 0 3px 0 8px; vertical-align: -1px; }
+    #usage-chart svg { width: 100%; height: 170px; display: block; }
+    .usage-tables { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .usage-table-block { min-width: 0; }
+    .usage-table-scroll { max-height: 320px; overflow: auto; border: 1px solid var(--border-faint); border-radius: 10px; }
+    .usage-table { width: 100%; }
+    .usage-table td, .usage-table th { font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .usage-footnote { max-width: 780px; }
+    @media (max-width: 900px) { .usage-tables { grid-template-columns: 1fr; } }
+
     .secrets-toolbar {
       margin: 8px 0;
       display: flex;
@@ -1443,6 +1469,7 @@
     <a class="tab" data-tab="secrets">Secrets</a>
     <a class="tab" data-tab="providers">Providers</a>
     <a class="tab" data-tab="apikeys">API Keys</a>
+    <a class="tab" data-tab="usage">Usage</a>
   </nav>
   <main>
     <section id="tab-records" class="tab-content active">
@@ -1557,6 +1584,45 @@
             <tr><td colspan="6" class="empty">No API keys configured</td></tr>
           </tbody>
         </table>
+      </div>
+    </section>
+    <section id="tab-usage" class="tab-content">
+      <div class="usage-main">
+        <div class="usage-toolbar">
+          <div class="range-switch" id="usage-range" role="group" aria-label="时间范围">
+            <button type="button" data-days="0">Today</button>
+            <button type="button" data-days="7" class="active">7d</button>
+            <button type="button" data-days="30">30d</button>
+            <button type="button" data-days="36500">All</button>
+          </div>
+          <span id="usage-pricing-status" class="usage-pricing-status"></span>
+        </div>
+        <div class="usage-cards" id="usage-cards"></div>
+        <div class="usage-chart-wrap">
+          <h3>tokens per day <span class="usage-legend" id="usage-legend"></span></h3>
+          <div id="usage-chart"><div class="empty">no data</div></div>
+        </div>
+        <div class="usage-tables">
+          <div class="usage-table-block">
+            <h3>By model</h3>
+            <div class="usage-table-scroll">
+              <table class="secrets usage-table">
+                <thead><tr><th>Model</th><th>Provider</th><th>Reqs</th><th>In</th><th>Cache R</th><th>Cache W</th><th>Out</th><th>~Cost</th><th>Share</th></tr></thead>
+                <tbody id="usage-by-model-body"><tr><td colspan="9" class="empty">no data</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="usage-table-block">
+            <h3>By provider</h3>
+            <div class="usage-table-scroll">
+              <table class="secrets usage-table">
+                <thead><tr><th>Provider</th><th>Reqs</th><th>In</th><th>Cache R</th><th>Cache W</th><th>Out</th><th>~Cost</th></tr></thead>
+                <tbody id="usage-by-provider-body"><tr><td colspan="7" class="empty">no data</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+        <div class="hint usage-footnote" id="usage-footnote"></div>
       </div>
     </section>
   </main>
@@ -1843,6 +1909,7 @@
         if (tab.dataset.tab === 'secrets') refreshSecrets();
         if (tab.dataset.tab === 'providers') refreshProviders();
         if (tab.dataset.tab === 'apikeys') refreshApiKeys();
+        if (tab.dataset.tab === 'usage') refreshUsage();
       });
     });
 
@@ -3972,6 +4039,168 @@
       return '<span class="badge badge-stream">enabled</span>';
     }
 
+    // ─── usage tab: 模型用量统计 (usage-stats 设计 M4) ────────────────────
+    //
+    // 数据流: GET /api/usage/summary?days=N (tab 激活时 5s 节流轮询 — summary 载荷
+    // 比 sync diff 重, 不进 3s 主循环). 渲染: 汇总卡 / 按天堆叠 SVG 柱状图 /
+    // by model / by provider 表. cost 恒为估算 ("~", P-4), 无价显示 "—".
+
+    let usageDays = 7;
+    let usageLastFetch = 0;
+
+    function setUsageDays(days, btn) {
+      usageDays = days;
+      document.querySelectorAll('#usage-range button').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      refreshUsage();
+    }
+
+    async function refreshUsage() {
+      // 节流: 手动切换 tab / 点击 range 立即拉, 轮询路径 5s 间隔.
+      const now = Date.now();
+      if (now - usageLastFetch < 4500) return;
+      usageLastFetch = now;
+      let data;
+      try {
+        const r = await fetch(`/api/usage/summary?days=${usageDays}`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        data = await r.json();
+      } catch (e) {
+        setStatus(`usage: ${e.message}`, 'err');
+        return;
+      }
+      renderUsage(data);
+    }
+
+    /** cost 紧凑格式: $12.41 / $0.0021 (<$0.01 用 4 位小数). */
+    function fmtCost(v) {
+      if (v === null || v === undefined) return '—';
+      if (v === 0) return '$0';
+      if (Math.abs(v) < 0.01) return '$' + v.toFixed(4);
+      return '$' + v.toFixed(2);
+    }
+
+    function usageCard(k, v, extra) {
+      return `<div class="usage-card"><div class="k">${k}</div><div class="v">${v}${extra || ''}</div></div>`;
+    }
+
+    function renderUsage(d) {
+      const t = d.totals || {};
+      // pricing 状态徽标.
+      const ps = document.getElementById('usage-pricing-status');
+      const psMap = { ok: '', loading: 'pricing: loading…', stale: 'pricing: stale (refresh failed, using old table)', offline: 'pricing: offline (no price data)' };
+      ps.textContent = psMap[d.pricing_status] ?? '';
+
+      // 汇总卡.
+      const hitRate = t.cache_hit_rate == null ? '—' : (t.cache_hit_rate * 100).toFixed(0) + '%';
+      const cov = t.cost_coverage == null ? '' :
+        `<small> · ${(t.cost_coverage * 100).toFixed(0)}% priced</small>`;
+      document.getElementById('usage-cards').innerHTML = [
+        usageCard('requests', String(t.requests ?? 0), t.requests_without_usage ? `<small> · ${t.requests_without_usage} no usage</small>` : ''),
+        usageCard('input', fmtTokens(t.input ?? 0)),
+        usageCard('output', fmtTokens(t.output ?? 0)),
+        usageCard('cache read', fmtTokens(t.cache_read ?? 0)),
+        usageCard('cache write', fmtTokens(t.cache_write ?? 0)),
+        usageCard('cache hit', hitRate),
+        usageCard('~ cost', fmtCost(t.est_cost_usd), cov),
+      ].join('');
+
+      renderUsageChart(d.by_day || []);
+      renderUsageModelTable(d.by_model || []);
+      renderUsageProviderTable(d.by_provider || []);
+
+      // 脚注: 估算语义 + 口径 + 无价提示 (include_usage 教育位).
+      const unpriced = (d.unpriced_models || []);
+      const parts = [
+        `<b>~cost</b> is an estimate from the <a href="https://models.dev" target="_blank" rel="noreferrer">models.dev</a> price table (always recomputed with the current table; add <code>[usage.pricing_override]</code> in <code>secret-guard.toml</code> for custom models).`,
+        `Session badges on the Records tab are per-process and reset on restart; this page is a persistent ledger (JSONL, retention via <code>[usage] retention_days</code>).`,
+      ];
+      if (unpriced.length) parts.push(`No price found for: ${unpriced.map(escapeHtml).join(', ')} — requests still count toward tokens, cost shows "—".`);
+      if ((t.cost_coverage != null && t.cost_coverage < 0.9) || (t.requests_without_usage || 0) > 0) {
+        parts.push(`OpenAI streaming requests only report usage when the client sets <code>stream_options.include_usage = true</code> — such requests appear here without token counts.`);
+      }
+      document.getElementById('usage-footnote').innerHTML = parts.join('<br>');
+    }
+
+    /** 按天堆叠柱状图: in / cache_read / cache_write / out 四段, 纯 SVG (零依赖). */
+    function renderUsageChart(days) {
+      const el = document.getElementById('usage-chart');
+      const legend = document.getElementById('usage-legend');
+      if (!days.length || days.every(x => (x.requests || 0) === 0)) {
+        el.innerHTML = '<div class="empty">no data in range</div>';
+        legend.innerHTML = '';
+        return;
+      }
+      legend.innerHTML =
+        '<i style="background:var(--accent)"></i>in' +
+        '<i style="background:#2dd4bf"></i>cache r' +
+        '<i style="background:#f5b83d"></i>cache w' +
+        '<i style="background:#a78bfa"></i>out';
+      const W = 24, H = 140, GAP = 8, AXIS = 34;
+      const max = Math.max(...days.map(x => (x.input || 0) + (x.cache_read || 0) + (x.cache_write || 0) + (x.output || 0)), 1);
+      const totalW = AXIS + days.length * (W + GAP);
+      let bars = '';
+      days.forEach((d, i) => {
+        const x = AXIS + i * (W + GAP);
+        let y = H;
+        const seg = (v, color) => {
+          const h = Math.round((v / max) * H);
+          if (h <= 0) return;
+          y -= h;
+          bars += `<rect x="${x}" y="${y}" width="${W}" height="${h}" fill="${color}" rx="2"><title>${d.day}: ${fmtTokens(v)}</title></rect>`;
+        };
+        seg(d.output || 0, '#a78bfa');
+        seg(d.cache_write || 0, '#f5b83d');
+        seg(d.cache_read || 0, '#2dd4bf');
+        seg(d.input || 0, 'var(--accent)');
+        // 日期标签: 窄窗口每天标, 宽窗口隔 k 个标 (最后一天总是标).
+        const step = Math.ceil(days.length / 10);
+        if (i % step === 0 || i === days.length - 1) {
+          bars += `<text x="${x + W / 2}" y="${H + 14}" text-anchor="middle" font-size="9" fill="var(--fg-faint)">${d.day.slice(5)}</text>`;
+        }
+      });
+      el.innerHTML =
+        `<svg viewBox="0 0 ${totalW} ${H + 22}" preserveAspectRatio="xMidYMid meet">` +
+        `<text x="0" y="12" font-size="9" fill="var(--fg-faint)">${fmtTokens(max)}</text>` +
+        `<line x1="${AXIS - 4}" y1="0" x2="${AXIS - 4}" y2="${H}" stroke="var(--border-faint)"/>` +
+        bars + `</svg>`;
+    }
+
+    function renderUsageModelTable(rows) {
+      const body = document.getElementById('usage-by-model-body');
+      if (!rows.length) { body.innerHTML = '<tr><td colspan="9" class="empty">no data</td></tr>'; return; }
+      body.innerHTML = rows.map(r => `<tr>
+        <td title="${escapeHtml(r.model || '(unknown)')}">${escapeHtml(r.model || '(unknown)')}</td>
+        <td>${escapeHtml(r.provider)}</td>
+        <td>${r.requests}</td>
+        <td>${fmtTokens(r.input)}</td>
+        <td>${fmtTokens(r.cache_read)}</td>
+        <td>${fmtTokens(r.cache_write)}</td>
+        <td>${fmtTokens(r.output)}</td>
+        <td>${fmtCost(r.est_cost_usd)}</td>
+        <td>${(r.cost_share * 100).toFixed(0)}%</td>
+      </tr>`).join('');
+    }
+
+    function renderUsageProviderTable(rows) {
+      const body = document.getElementById('usage-by-provider-body');
+      if (!rows.length) { body.innerHTML = '<tr><td colspan="7" class="empty">no data</td></tr>'; return; }
+      body.innerHTML = rows.map(r => `<tr>
+        <td>${escapeHtml(r.provider)}</td>
+        <td>${r.requests}</td>
+        <td>${fmtTokens(r.input)}</td>
+        <td>${fmtTokens(r.cache_read)}</td>
+        <td>${fmtTokens(r.cache_write)}</td>
+        <td>${fmtTokens(r.output)}</td>
+        <td>${fmtCost(r.est_cost_usd)}</td>
+      </tr>`).join('');
+    }
+
+    // range 切换按钮绑定 (data-days 驱动).
+    document.querySelectorAll('#usage-range button').forEach(btn => {
+      btn.addEventListener('click', () => setUsageDays(Number(btn.dataset.days), btn));
+    });
+
     async function refreshApiKeys() {
       try {
         const r = await fetch(API_API_KEYS, { cache: 'no-store' });
@@ -4800,6 +5029,8 @@
           'provider-endpoints', 'apikey-reveal'].some(d => document.getElementById(d)?.open);
         if (tableDialogOpen) return;
         const activeTab = document.querySelector('.tab-content.active')?.id;
+        // usage tab: 走独立的 5s 节流轮询 (refreshUsage 内部节流), 不进 sync 主循环.
+        if (activeTab === 'tab-usage') { refreshUsage(); return; }
         const tableHasFocus = ['tab-secrets', 'tab-providers', 'tab-apikeys'].includes(activeTab)
           && document.getElementById(activeTab)?.contains(document.activeElement);
         if (tableHasFocus) return;

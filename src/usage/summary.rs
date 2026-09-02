@@ -132,7 +132,7 @@ pub fn build_summary(input: SummaryInputs<'_>, status: PricingStatus) -> UsageSu
     let to = today.format("%Y-%m-%d").to_string();
 
     // 窗口内 cells 过滤 (day 字符串字典序 == 日期序).
-    let cells: Vec<((String, String, Option<String>), UsageAgg)> = input
+    let cells: Vec<(super::store::AggKey, UsageAgg)> = input
         .store
         .snapshot_cells()
         .into_iter()
@@ -146,7 +146,11 @@ pub fn build_summary(input: SummaryInputs<'_>, status: PricingStatus) -> UsageSu
         let hint = (input.domain_hint)(provider);
         *price_cache
             .entry((model.clone(), provider.to_string()))
-            .or_insert_with(|| input.table.price_for(model.as_deref().unwrap_or(""), hint.as_deref()))
+            .or_insert_with(|| {
+                input
+                    .table
+                    .price_for(model.as_deref().unwrap_or(""), hint.as_deref())
+            })
     };
 
     // ── totals + by_model (一次遍历; USAGE-1: 分项之和 == totals) ──
@@ -207,7 +211,11 @@ pub fn build_summary(input: SummaryInputs<'_>, status: PricingStatus) -> UsageSu
     totals.est_cost_usd = model_rows.iter().map(|r| r.est_cost_usd).sum();
     let denom = totals.est_cost_usd;
     for r in &mut model_rows {
-        r.cost_share = if denom > 0.0 { r.est_cost_usd / denom } else { 0.0 };
+        r.cost_share = if denom > 0.0 {
+            r.est_cost_usd / denom
+        } else {
+            0.0
+        };
     }
     let input_sum = totals.input + totals.cache_read + totals.cache_write;
     totals.cache_hit_rate = (input_sum > 0).then(|| totals.cache_read as f64 / input_sum as f64);
@@ -296,7 +304,12 @@ mod tests {
         s
     }
 
-    fn ev(day_offset_h: i64, provider: &str, model: Option<&str>, q: Option<UsageQuanta>) -> crate::usage::UsageEvent {
+    fn ev(
+        day_offset_h: i64,
+        provider: &str,
+        model: Option<&str>,
+        q: Option<UsageQuanta>,
+    ) -> crate::usage::UsageEvent {
         crate::usage::UsageEvent {
             ts: chrono::Utc::now() - chrono::Duration::hours(day_offset_h),
             provider: provider.to_string(),
@@ -314,7 +327,12 @@ mod tests {
         let mut overrides = HashMap::new();
         overrides.insert(
             "m-priced".to_string(),
-            ModelPrice { input: 1.0, output: 2.0, cache_read: 0.1, cache_write: 0.5 },
+            ModelPrice {
+                input: 1.0,
+                output: 2.0,
+                cache_read: 0.1,
+                cache_write: 0.5,
+            },
         );
         PricingTable::new(None, overrides)
     }
@@ -324,19 +342,57 @@ mod tests {
     #[test]
     fn summary_sums_match_totals_across_all_views() {
         let s = store_with(&[
-            ev(0, "p1", Some("m-priced"), Some(UsageQuanta { i: 1000, o: 500, cr: 0, cw: 0 })),
-            ev(0, "p1", Some("m-unpriced"), Some(UsageQuanta { i: 100, o: 0, cr: 0, cw: 0 })),
+            ev(
+                0,
+                "p1",
+                Some("m-priced"),
+                Some(UsageQuanta {
+                    i: 1000,
+                    o: 500,
+                    cr: 0,
+                    cw: 0,
+                }),
+            ),
+            ev(
+                0,
+                "p1",
+                Some("m-unpriced"),
+                Some(UsageQuanta {
+                    i: 100,
+                    o: 0,
+                    cr: 0,
+                    cw: 0,
+                }),
+            ),
             ev(0, "p2", Some("m-priced"), None),
-            ev(48, "p1", Some("m-priced"), Some(UsageQuanta { i: 100, o: 100, cr: 0, cw: 0 })), // 窗口外
+            ev(
+                48,
+                "p1",
+                Some("m-priced"),
+                Some(UsageQuanta {
+                    i: 100,
+                    o: 100,
+                    cr: 0,
+                    cw: 0,
+                }),
+            ), // 窗口外
         ]);
         let table = priced_table();
         let no_hint = |_p: &str| None;
         let sum = build_summary(
-            SummaryInputs { store: &s, table: &table, days: 1, domain_hint: &no_hint },
+            SummaryInputs {
+                store: &s,
+                table: &table,
+                days: 1,
+                domain_hint: &no_hint,
+            },
             PricingStatus::Ok,
         );
         let t = &sum.totals;
-        assert_eq!(t.requests, 3, "window = today only (48h-old event excluded)");
+        assert_eq!(
+            t.requests, 3,
+            "window = today only (48h-old event excluded)"
+        );
         assert_eq!(t.requests_without_usage, 1);
         assert_eq!(t.input, 1100);
         assert_eq!(t.output, 500);
@@ -362,13 +418,38 @@ mod tests {
     #[test]
     fn cost_is_linear_in_aggregation() {
         let s = store_with(&[
-            ev(0, "p", Some("m-priced"), Some(UsageQuanta { i: 1000, o: 500, cr: 0, cw: 0 })),
-            ev(0, "p", Some("m-priced"), Some(UsageQuanta { i: 2000, o: 1500, cr: 0, cw: 0 })),
+            ev(
+                0,
+                "p",
+                Some("m-priced"),
+                Some(UsageQuanta {
+                    i: 1000,
+                    o: 500,
+                    cr: 0,
+                    cw: 0,
+                }),
+            ),
+            ev(
+                0,
+                "p",
+                Some("m-priced"),
+                Some(UsageQuanta {
+                    i: 2000,
+                    o: 1500,
+                    cr: 0,
+                    cw: 0,
+                }),
+            ),
         ]);
         let table = priced_table();
         let no_hint = |_p: &str| None;
         let sum = build_summary(
-            SummaryInputs { store: &s, table: &table, days: 1, domain_hint: &no_hint },
+            SummaryInputs {
+                store: &s,
+                table: &table,
+                days: 1,
+                domain_hint: &no_hint,
+            },
             PricingStatus::Ok,
         );
         let folded = sum.totals.est_cost_usd;
@@ -385,12 +466,22 @@ mod tests {
             0,
             "p",
             Some("m-priced"),
-            Some(UsageQuanta { i: 100, o: 0, cr: 100, cw: 300 }),
+            Some(UsageQuanta {
+                i: 100,
+                o: 0,
+                cr: 100,
+                cw: 300,
+            }),
         )]);
         let table = priced_table();
         let no_hint = |_p: &str| None;
         let sum = build_summary(
-            SummaryInputs { store: &s, table: &table, days: 1, domain_hint: &no_hint },
+            SummaryInputs {
+                store: &s,
+                table: &table,
+                days: 1,
+                domain_hint: &no_hint,
+            },
             PricingStatus::Ok,
         );
         // 100 / (100+100+300) = 0.2.
@@ -405,7 +496,12 @@ mod tests {
         let table = PricingTable::empty();
         let no_hint = |_p: &str| None;
         let sum = build_summary(
-            SummaryInputs { store: &s, table: &table, days: 7, domain_hint: &no_hint },
+            SummaryInputs {
+                store: &s,
+                table: &table,
+                days: 7,
+                domain_hint: &no_hint,
+            },
             PricingStatus::Ok,
         );
         assert_eq!(sum.by_day.len(), 7, "zero-filled contiguous days");

@@ -120,25 +120,23 @@ impl PricingData {
 
     /// 步骤 2/3 的 remote 匹配 (无 override).
     fn lookup(&self, model: &str, domain_hint: Option<&str>) -> Option<ModelPrice> {
-        self.lookup_exact(model, domain_hint)
-            .or_else(|| {
-                // 剥日期后缀 ("-YYYY-MM-DD" = 11 chars) 再试一次.
-                model
-                    .as_bytes()
-                    .len()
-                    .checked_sub(11)
-                    .filter(|&i| {
-                        let b = model.as_bytes();
-                        b[i] == b'-'
-                            && b[i + 1..i + 5].iter().all(u8::is_ascii_digit)
-                            && b[i + 5] == b'-'
-                            && b[i + 6..i + 8].iter().all(u8::is_ascii_digit)
-                            && b[i + 8] == b'-'
-                            && b[i + 9..i + 11].iter().all(u8::is_ascii_digit)
-                    })
-                    .map(|i| &model[..i])
-                    .and_then(|stripped| self.lookup_exact(stripped, domain_hint))
-            })
+        self.lookup_exact(model, domain_hint).or_else(|| {
+            // 剥日期后缀 ("-YYYY-MM-DD" = 11 chars) 再试一次.
+            model
+                .len()
+                .checked_sub(11)
+                .filter(|&i| {
+                    let b = model.as_bytes();
+                    b[i] == b'-'
+                        && b[i + 1..i + 5].iter().all(u8::is_ascii_digit)
+                        && b[i + 5] == b'-'
+                        && b[i + 6..i + 8].iter().all(u8::is_ascii_digit)
+                        && b[i + 8] == b'-'
+                        && b[i + 9..i + 11].iter().all(u8::is_ascii_digit)
+                })
+                .map(|i| &model[..i])
+                .and_then(|stripped| self.lookup_exact(stripped, domain_hint))
+        })
     }
 
     fn lookup_exact(&self, model: &str, domain_hint: Option<&str>) -> Option<ModelPrice> {
@@ -173,7 +171,7 @@ fn parse_price(cost: &serde_json::Value) -> Option<ModelPrice> {
     })
 }
 
-/// URL → 小写 host (scheme://host[:port]/...). 解析不出返回 None.
+/// URL → 小写 host (`scheme://host[:port]/...` 形态). 解析不出返回 None.
 /// pub: web/api 的 domain hint 也用它解析 provider base_url.
 pub fn extract_host(api: &str) -> Option<String> {
     let rest = api.split_once("://")?.1;
@@ -244,7 +242,12 @@ impl std::fmt::Debug for PricingCache {
 }
 
 impl PricingCache {
-    pub fn new(url: String, ttl: Duration, disk_path: PathBuf, overrides: HashMap<String, ModelPrice>) -> Self {
+    pub fn new(
+        url: String,
+        ttl: Duration,
+        disk_path: PathBuf,
+        overrides: HashMap<String, ModelPrice>,
+    ) -> Self {
         // 冷启动: 无网络时读盘兜底 (fetched_at 置很久前 → 首查询即尝试刷新).
         let (disk_data, fetched_at) = match load_disk(&disk_path) {
             Some(d) => (Some(Arc::new(d)), Some(Instant::now() - ttl)),
@@ -270,9 +273,7 @@ impl PricingCache {
             let s = self.state.read();
             match (s.data.is_some(), s.fetched_at) {
                 // 从未有过数据且不在退避窗口 → 需要拉.
-                (false, _) => {
-                    s.last_failure.is_none_or(|t| t.elapsed() >= FETCH_BACKOFF)
-                }
+                (false, _) => s.last_failure.is_none_or(|t| t.elapsed() >= FETCH_BACKOFF),
                 // 有数据: TTL 内新鲜 → 不拉.
                 (_, Some(t)) if t.elapsed() < self.ttl => false,
                 // TTL 过期 → 拉 (serve-stale).
@@ -285,7 +286,8 @@ impl PricingCache {
             let still = {
                 let s = self.state.read();
                 s.fetched_at.is_none_or(|t| t.elapsed() >= self.ttl)
-                    || (s.data.is_none() && s.last_failure.is_none_or(|t| t.elapsed() >= FETCH_BACKOFF))
+                    || (s.data.is_none()
+                        && s.last_failure.is_none_or(|t| t.elapsed() >= FETCH_BACKOFF))
             };
             if still {
                 self.refresh(http).await;
@@ -306,29 +308,34 @@ impl PricingCache {
 
     async fn refresh(&self, http: &reqwest::Client) {
         match http.get(&self.url).timeout(FETCH_TIMEOUT).send().await {
-            Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
-                Ok(json) => {
-                    let (data, priced, skipped) = PricingData::parse(&json);
-                    if priced == 0 {
-                        // schema 漂移防护 (n7): 解析成功但零价 = 上游结构变了.
-                        warn!(url = %self.url, skipped, "models.dev parse yielded 0 priced models; schema drift? keeping old data");
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(json) => {
+                        let (data, priced, skipped) = PricingData::parse(&json);
+                        if priced == 0 {
+                            // schema 漂移防护 (n7): 解析成功但零价 = 上游结构变了.
+                            warn!(url = %self.url, skipped, "models.dev parse yielded 0 priced models; schema drift? keeping old data");
+                            self.record_failure();
+                            return;
+                        }
+                        if skipped > 0 {
+                            debug!(
+                                skipped,
+                                priced, "models.dev: some models have no cost (normal)"
+                            );
+                        }
+                        write_disk(&self.disk_path, &json);
+                        let mut s = self.state.write();
+                        s.data = Some(Arc::new(data));
+                        s.fetched_at = Some(Instant::now());
+                        s.last_failure = None;
+                    }
+                    Err(e) => {
+                        warn!(url = %self.url, error = %e, "models.dev fetch body parse failed");
                         self.record_failure();
-                        return;
                     }
-                    if skipped > 0 {
-                        debug!(skipped, priced, "models.dev: some models have no cost (normal)");
-                    }
-                    write_disk(&self.disk_path, &json);
-                    let mut s = self.state.write();
-                    s.data = Some(Arc::new(data));
-                    s.fetched_at = Some(Instant::now());
-                    s.last_failure = None;
                 }
-                Err(e) => {
-                    warn!(url = %self.url, error = %e, "models.dev fetch body parse failed");
-                    self.record_failure();
-                }
-            },
+            }
             Ok(resp) => {
                 warn!(url = %self.url, status = resp.status().as_u16(), "models.dev fetch non-2xx");
                 self.record_failure();
@@ -407,9 +414,14 @@ mod tests {
         let (data, priced, skipped) = PricingData::parse(&fixture());
         assert_eq!(priced, 4, "gpt-5.6-terra ×2 + gpt-free + claude-opus-5");
         assert_eq!(skipped, 1, "m-nc has no cost");
-        assert_eq!(data.vendor_domain.get("api.openai.com").map(String::as_str), Some("openai"));
         assert_eq!(
-            data.vendor_domain.get("api.anthropic.com").map(String::as_str),
+            data.vendor_domain.get("api.openai.com").map(String::as_str),
+            Some("openai")
+        );
+        assert_eq!(
+            data.vendor_domain
+                .get("api.anthropic.com")
+                .map(String::as_str),
             Some("anthropic")
         );
         assert!(!data.vendor_domain.contains_key("relay-x"), "no api field");
@@ -435,7 +447,12 @@ mod tests {
         let mut overrides = HashMap::new();
         overrides.insert(
             "my-relay/gpt-fork".to_string(),
-            ModelPrice { input: 0.5, output: 2.0, cache_read: 0.05, cache_write: 0.75 },
+            ModelPrice {
+                input: 0.5,
+                output: 2.0,
+                cache_read: 0.05,
+                cache_write: 0.75,
+            },
         );
         PricingTable::new(Some(Arc::new(data)), overrides)
     }
@@ -459,7 +476,9 @@ mod tests {
         let t = table();
         // 域名启发: hint 是 anthropic 的 host, 但 gpt-5.6-terra 候选只有
         // openai + relay-x → 启发不命中 → 字母序 (openai < relay-x).
-        let p = t.price_for("gpt-5.6-terra", Some("api.anthropic.com")).unwrap();
+        let p = t
+            .price_for("gpt-5.6-terra", Some("api.anthropic.com"))
+            .unwrap();
         assert!((p.input - 1.25).abs() < 1e-9, "alphabetical fallback");
         // 启发命中 relay 的场景: 构造 relay 域名 hint — fixture 中 relay-x 无 api
         // 字段, 故无法命中; 字母序兜底仍是 openai. (验证确定性即可.)
@@ -471,7 +490,10 @@ mod tests {
     fn match_strips_date_suffix() {
         let t = table();
         let p = t.price_for("claude-opus-5-2026-07-24", None).unwrap();
-        assert!((p.input - 5.0).abs() < 1e-9, "date-suffixed variant must match base");
+        assert!(
+            (p.input - 5.0).abs() < 1e-9,
+            "date-suffixed variant must match base"
+        );
         // 非日期后缀不剥.
         assert!(t.price_for("claude-opus-5-latest", None).is_none());
     }

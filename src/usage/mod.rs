@@ -272,7 +272,11 @@ mod tests {
             Arc::from(Vec::<SecretEntry>::new().into_boxed_slice()),
         );
         ctx.record_response(200, true, Some(IrUsage::default()), None);
-        assert_eq!(store.total_requests(), 0, "GET must not be recorded (USAGE-5)");
+        assert_eq!(
+            store.total_requests(),
+            0,
+            "GET must not be recorded (USAGE-5)"
+        );
     }
 
     #[test]

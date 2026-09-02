@@ -20,10 +20,12 @@
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use parking_lot::{Mutex, RwLock};
+#[cfg(test)]
+use parking_lot::Mutex;
+use parking_lot::RwLock;
 use tracing::{info, warn};
 
 use crate::config::UsageConfig;
@@ -57,8 +59,9 @@ impl UsageAgg {
     }
 }
 
-/// 聚合键 (day 是本地时区 "YYYY-MM-DD").
-type AggKey = (String, String, Option<String>);
+/// 聚合键: (day, provider, model). day 是本地时区 "YYYY-MM-DD".
+/// pub: summary 派生层复用 (AggKey 是 store 与 API 层共享的 cells 形状).
+pub type AggKey = (String, String, Option<String>);
 
 #[derive(Debug)]
 struct AggInner {
@@ -202,7 +205,12 @@ impl UsageStore {
 
     /// 聚合 cells 的快照 (M3 API 层派生 by_day / by_model / by_provider 视图).
     pub fn snapshot_cells(&self) -> Vec<(AggKey, UsageAgg)> {
-        self.inner.read().cells.iter().map(|(k, v)| (k.clone(), *v)).collect()
+        self.inner
+            .read()
+            .cells
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect()
     }
 
     /// 累计请求数 (测试 + 轻量可观测).
@@ -238,9 +246,8 @@ fn agg_key(ev: &UsageEvent) -> AggKey {
 
 /// retention 截止时刻; 0 = 永久保留 (None).
 fn retention_cutoff(config: &UsageConfig) -> Option<chrono::DateTime<chrono::Utc>> {
-    (config.retention_days > 0).then(|| {
-        chrono::Utc::now() - chrono::Duration::days(config.retention_days as i64)
-    })
+    (config.retention_days > 0)
+        .then(|| chrono::Utc::now() - chrono::Duration::days(config.retention_days as i64))
 }
 
 /// 逐行重放: (保留行, 过期行数, 非法行数). ROB: 非法行跳过不 panic.
@@ -311,7 +318,12 @@ mod tests {
     use crate::codec::ir::IrUsage;
     use crate::usage::UsageQuanta;
 
-    fn ev(day_offset_h: i64, provider: &str, model: Option<&str>, usage: Option<UsageQuanta>) -> UsageEvent {
+    fn ev(
+        day_offset_h: i64,
+        provider: &str,
+        model: Option<&str>,
+        usage: Option<UsageQuanta>,
+    ) -> UsageEvent {
         UsageEvent {
             ts: chrono::Utc::now() - chrono::Duration::hours(day_offset_h),
             provider: provider.to_string(),
@@ -376,15 +388,15 @@ mod tests {
             writeln!(f, "{{broken json").unwrap();
             writeln!(f, "{}", serde_json::to_string(&e2).unwrap()).unwrap();
         }
-        let cfg = UsageConfig { enabled: true, retention_days: 90, ..Default::default() };
+        let cfg = UsageConfig {
+            enabled: true,
+            retention_days: 90,
+            ..Default::default()
+        };
         let s = UsageStore::open(&cfg, &path);
         // 重放: 2 条合法计入; 残行被清理 (文件重写为 2 行).
         assert_eq!(s.total_requests(), 2);
-        let agg: u64 = s
-            .snapshot_cells()
-            .iter()
-            .map(|(_, a)| a.requests)
-            .sum();
+        let agg: u64 = s.snapshot_cells().iter().map(|(_, a)| a.requests).sum();
         assert_eq!(agg, 2);
         let content = std::fs::read_to_string(&path).unwrap();
         assert_eq!(content.lines().count(), 2, "malformed line must be cleaned");
@@ -417,7 +429,11 @@ mod tests {
             writeln!(f, "{}", serde_json::to_string(&old).unwrap()).unwrap();
             writeln!(f, "{}", serde_json::to_string(&fresh).unwrap()).unwrap();
         }
-        let cfg = UsageConfig { enabled: true, retention_days: 1, ..Default::default() };
+        let cfg = UsageConfig {
+            enabled: true,
+            retention_days: 1,
+            ..Default::default()
+        };
         let s = UsageStore::open(&cfg, &path);
         assert_eq!(s.total_requests(), 1, "expired line must be dropped");
         let content = std::fs::read_to_string(&path).unwrap();
@@ -435,6 +451,14 @@ mod tests {
             cache_read_input_tokens: None,
             cache_creation_input_tokens: None,
         });
-        assert_eq!(q, UsageQuanta { i: 5, o: 6, cr: 0, cw: 0 });
+        assert_eq!(
+            q,
+            UsageQuanta {
+                i: 5,
+                o: 6,
+                cr: 0,
+                cw: 0
+            }
+        );
     }
 }

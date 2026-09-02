@@ -7028,3 +7028,206 @@ async fn router_routes_two_hop_pipeline_rewrite_e2e() {
     // match_body 已断言 real-a 收到 m2-tail-a (第二跳改写覆盖第一跳的 m2-in):
     // real-a 的 mock 只匹配 model=m2-tail-a, 收到 m2-in 会 unmatched → 501.
 }
+
+// ─── usage-stats: 端到端 (proxy → UsageCtx → store → JSONL → API) ──────────
+//
+// 契约: USAGE-1/2/4/5 的集成层锚. 单元层 (store/summary/UsageCtx) 已分别覆盖,
+// 此处验证全链路接线: 上游回显 usage → codec 归一化 → 落账 (含 JSONL 持久化)
+// → GET /api/usage/summary 聚合. USAGE-5 的方法过滤 (GET /models 不计入) 一并守卫.
+
+/// usage-stats E2E 专用: 文件落盘的 UsageStore + 独立 AppState.
+async fn spawn_proxy_with_usage_store(
+    usage: std::sync::Arc<secret_guard::usage::UsageStore>,
+) -> String {
+    let upstream_client = reqwest::Client::new();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state_path = tmp_state_path("sg-usage-state");
+    // 直接构造 (不走 spawn_proxy_full — 它固定 for_tests store):
+    let provider_table = ProviderTable::with_persist_lock(
+        vec![openai_provider("oa-main", "http://127.0.0.1:1")],
+        vec![],
+        std::sync::Arc::new(parking_lot::RwLock::new(
+            secret_guard::config::Decisions::default(),
+        )),
+        state_path,
+        std::sync::Arc::new(parking_lot::Mutex::new(())),
+    );
+    let proxy = AppState {
+        upstream: upstream_client,
+        providers: provider_table,
+        dag: ConversationDag::new(64, 500, 1),
+        secrets: test_secret_table(),
+        api_keys: test_api_key_store(),
+        auth_enabled: false,
+        global_mock_prefix: std::sync::Arc::from(""),
+        on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,
+        upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
+        model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
+        usage,
+        pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::new(
+            "about:blank".to_string(),
+            std::time::Duration::from_secs(3600),
+            std::path::PathBuf::from("/dev/null"),
+            std::collections::HashMap::new(),
+        )),
+    };
+    let app = server::build_router(proxy);
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn usage_stats_end_to_end_records_replayed_and_served() {
+    // 1. mock 上游: chat completion 回显 usage (prompt_tokens 含 cached → 归一化校验点).
+    let mut server = mockito::Server::new_async().await;
+    let chat_body = serde_json::json!({
+        "id": "chatcmpl-e2e",
+        "model": "gpt-echoed",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"},
+                     "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 100, "completion_tokens": 50,
+                  "prompt_tokens_details": {"cached_tokens": 30}}
+    });
+    let _chat = server
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(serde_json::to_string(&chat_body).unwrap())
+        .create_async()
+        .await;
+    // GET /models 透传 (USAGE-5: 方法过滤 — 不产生 usage 事件).
+    let _models = server
+        .mock("GET", "/v1/models")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body("{\"data\":[]}")
+        .create_async()
+        .await;
+
+    // 2. 文件落盘的 store.
+    let dir = std::env::temp_dir().join(format!("sg-usage-e2e-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let jsonl = dir.join("usage.jsonl");
+    let _ = std::fs::remove_file(&jsonl);
+    let store = std::sync::Arc::new(secret_guard::usage::UsageStore::open(
+        &secret_guard::config::UsageConfig {
+            enabled: true,
+            retention_days: 90,
+            ..Default::default()
+        },
+        &jsonl,
+    ));
+    let base = spawn_proxy_with_usage_store(store.clone()).await;
+
+    // 3. provider base_url 指向 mock: 通过 state.toml 写 dynamic override 不可行 (helper
+    //    固定 127.0.0.1:1) — 改用 WebUI API 创建 provider (dynamic 路径), 指向 mock.
+    let client = reqwest::Client::new();
+    let create = serde_json::json!({
+        "id": "oa-mock", "enabled": true, "name": "mock",
+        "protocol": "openai", "base_url": server.url(), "api_key": "sk-x"
+    });
+    let resp = client
+        .post(format!("{base}/api/providers"))
+        .json(&create)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "create provider: {}",
+        resp.status()
+    );
+
+    // 4. POST chat → 回显 usage 应被采集; GET /models → 不应计入.
+    let chat = client
+        .post(format!("{base}/o/oa-mock/v1/chat/completions"))
+        .json(&serde_json::json!({"model": "gpt-req", "messages": [
+            {"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert!(chat.status().is_success());
+    let _ = chat.json::<serde_json::Value>().await;
+    let _ = client
+        .get(format!("{base}/o/oa-mock/v1/models"))
+        .send()
+        .await
+        .unwrap();
+
+    // 5. 轮询 summary 直到事件落地 (writer 线程异步 + record 同步进内存聚合,
+    //    summary 读内存 — 立即可见; 轮询是防御 scheduler 延迟).
+    let mut summary = None;
+    for _ in 0..100 {
+        let s = client
+            .get(format!("{base}/api/usage/summary?days=1"))
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap();
+        if s["totals"]["requests"].as_u64() == Some(1) {
+            summary = Some(s);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let s = summary.expect("usage event must land in summary");
+    let t = &s["totals"];
+    assert_eq!(
+        t["requests"].as_u64(),
+        Some(1),
+        "GET /models must not be counted (USAGE-5): {s}"
+    );
+    assert_eq!(t["requests_without_usage"].as_u64(), Some(0));
+    // OpenAI 归一化: prompt_tokens(100) - cached(30) = input 70; cr=30; out=50.
+    assert_eq!(t["input"].as_u64(), Some(70));
+    assert_eq!(t["cache_read"].as_u64(), Some(30));
+    assert_eq!(t["output"].as_u64(), Some(50));
+    // by_model: 回显 model 优先于请求 model (gpt-req).
+    let m0 = &s["by_model"][0];
+    assert_eq!(
+        m0["model"].as_str(),
+        Some("gpt-echoed"),
+        "echo model wins: {s}"
+    );
+    assert_eq!(m0["provider"].as_str(), Some("oa-mock"));
+
+    // 6. JSONL 持久化: 一行, model = 回显值.
+    let mut lines = None;
+    for _ in 0..100 {
+        if let Ok(c) = std::fs::read_to_string(&jsonl) {
+            if !c.is_empty() {
+                lines = Some(c);
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let content = lines.expect("usage jsonl must be written");
+    let line: serde_json::Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+    assert_eq!(line["model"].as_str(), Some("gpt-echoed"));
+    assert_eq!(line["model_req"].as_str(), Some("gpt-req"));
+    assert_eq!(line["usage"]["i"].as_u64(), Some(70));
+    assert_eq!(line["provider"].as_str(), Some("oa-mock"));
+    assert_eq!(line["method"].as_str(), Some("POST"));
+
+    // 7. 重放: 用同一文件再 open 一个 store, 聚合应恢复 (USAGE-1 持久一致性).
+    let store2 = secret_guard::usage::UsageStore::open(
+        &secret_guard::config::UsageConfig {
+            enabled: true,
+            retention_days: 90,
+            ..Default::default()
+        },
+        &jsonl,
+    );
+    assert_eq!(
+        store2.total_requests(),
+        1,
+        "replay must restore aggregation"
+    );
+    let _ = std::fs::remove_file(&jsonl);
+}
