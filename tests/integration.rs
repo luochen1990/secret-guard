@@ -196,6 +196,12 @@ async fn spawn_proxy_static_dynamic(
         upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
         model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
         usage: std::sync::Arc::new(secret_guard::usage::UsageStore::for_tests()),
+        pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::new(
+            "about:blank".to_string(),
+            std::time::Duration::from_secs(3600),
+            std::path::PathBuf::from("/dev/null"),
+            std::collections::HashMap::new(),
+        )),
     };
     let app = server::build_router(proxy);
     tokio::spawn(async move {
@@ -235,6 +241,12 @@ async fn spawn_proxy_with_prefix(global_mock_prefix: &str) -> String {
         upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
         model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
         usage: std::sync::Arc::new(secret_guard::usage::UsageStore::for_tests()),
+        pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::new(
+            "about:blank".to_string(),
+            std::time::Duration::from_secs(3600),
+            std::path::PathBuf::from("/dev/null"),
+            std::collections::HashMap::new(),
+        )),
     };
     let app = server::build_router(proxy);
     tokio::spawn(async move {
@@ -278,6 +290,12 @@ async fn spawn_proxy_with_probe_mode(
         upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
         model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
         usage: std::sync::Arc::new(secret_guard::usage::UsageStore::for_tests()),
+        pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::new(
+            "about:blank".to_string(),
+            std::time::Duration::from_secs(3600),
+            std::path::PathBuf::from("/dev/null"),
+            std::collections::HashMap::new(),
+        )),
     };
     let app = server::build_router(proxy);
     tokio::spawn(async move {
@@ -2391,6 +2409,12 @@ async fn spawn_proxy_with_timeouts_and_secrets(
         upstream_timeouts,
         model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
         usage: std::sync::Arc::new(secret_guard::usage::UsageStore::for_tests()),
+        pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::new(
+            "about:blank".to_string(),
+            std::time::Duration::from_secs(3600),
+            std::path::PathBuf::from("/dev/null"),
+            std::collections::HashMap::new(),
+        )),
     };
     let app = server::build_router(proxy);
     tokio::spawn(async move {
@@ -4188,6 +4212,12 @@ async fn cross_table_shared_state_no_lost_update() {
         upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
         model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
         usage: std::sync::Arc::new(secret_guard::usage::UsageStore::for_tests()),
+        pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::new(
+            "about:blank".to_string(),
+            std::time::Duration::from_secs(3600),
+            std::path::PathBuf::from("/dev/null"),
+            std::collections::HashMap::new(),
+        )),
     };
     let app = server::build_router(proxy);
     tokio::spawn(async move {

@@ -70,6 +70,8 @@ struct AggInner {
 #[derive(Debug)]
 pub struct UsageStore {
     enabled: bool,
+    /// 配置的 retention (API 层的 days 上限用; 0 = 永久 = 无上限).
+    retention_days: u32,
     inner: RwLock<AggInner>,
     /// JSONL writer 线程的发送端 (enabled 且文件可开时 Some; drop 时线程随 channel
     /// 关闭退出). 热路径 `record` 只 `send` (非阻塞).
@@ -86,6 +88,7 @@ impl UsageStore {
     pub fn disabled() -> Self {
         Self {
             enabled: false,
+            retention_days: 0,
             inner: RwLock::new(AggInner {
                 cells: HashMap::new(),
                 total_requests: 0,
@@ -101,6 +104,7 @@ impl UsageStore {
     pub fn for_tests() -> Self {
         Self {
             enabled: true,
+            retention_days: 0,
             inner: RwLock::new(AggInner {
                 cells: HashMap::new(),
                 total_requests: 0,
@@ -121,6 +125,7 @@ impl UsageStore {
             return Self::disabled();
         }
         let mut this = Self::for_tests();
+        this.retention_days = config.retention_days;
         // 1. 重放 (文件不存在 = 首次启动, 空开始).
         let (retained, expired, invalid) = match std::fs::File::open(jsonl_path) {
             Ok(f) => replay_lines(std::io::BufReader::new(f), retention_cutoff(config)),
@@ -203,6 +208,11 @@ impl UsageStore {
     /// 累计请求数 (测试 + 轻量可观测).
     pub fn total_requests(&self) -> u64 {
         self.inner.read().total_requests
+    }
+
+    /// 配置的 retention 天数 (API 的 days 查询上限; 0 = 无上限).
+    pub fn retention_days(&self) -> u32 {
+        self.retention_days
     }
 
     /// writer 丢弃计数 (诊断用).
@@ -366,7 +376,7 @@ mod tests {
             writeln!(f, "{{broken json").unwrap();
             writeln!(f, "{}", serde_json::to_string(&e2).unwrap()).unwrap();
         }
-        let cfg = UsageConfig { enabled: true, retention_days: 90 };
+        let cfg = UsageConfig { enabled: true, retention_days: 90, ..Default::default() };
         let s = UsageStore::open(&cfg, &path);
         // 重放: 2 条合法计入; 残行被清理 (文件重写为 2 行).
         assert_eq!(s.total_requests(), 2);
@@ -407,7 +417,7 @@ mod tests {
             writeln!(f, "{}", serde_json::to_string(&old).unwrap()).unwrap();
             writeln!(f, "{}", serde_json::to_string(&fresh).unwrap()).unwrap();
         }
-        let cfg = UsageConfig { enabled: true, retention_days: 1 };
+        let cfg = UsageConfig { enabled: true, retention_days: 1, ..Default::default() };
         let s = UsageStore::open(&cfg, &path);
         assert_eq!(s.total_requests(), 1, "expired line must be dropped");
         let content = std::fs::read_to_string(&path).unwrap();

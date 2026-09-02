@@ -56,6 +56,9 @@ pub struct AppState {
     /// `enabled = false` 时是 no-op store (record 零开销). 纯数据 store,
     /// 聚合先例同 `api_keys` / `model_lists`.
     pub usage: Arc<crate::usage::UsageStore>,
+    /// models.dev 定价缓存 (usage-stats §7): 惰性首拉 + TTL + serve-stale +
+    /// single-flight; 只被 /api/usage 查询路径触碰, 不在转发链上.
+    pub pricing: Arc<crate::usage::PricingCache>,
 }
 
 // ─── HTTP 层共享常量 ────────────────────────────────────────────────────────

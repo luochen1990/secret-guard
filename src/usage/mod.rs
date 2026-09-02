@@ -33,9 +33,13 @@
 //! 纯数据 + chrono/serde), 不依赖 dag / proxy / web (被 state 聚合, 组合根先例同
 //! `state.api_keys` / `state.model_lists`).
 
+mod pricing;
 mod store;
+pub mod summary;
 
+pub use pricing::{ModelPrice, PricingCache, PricingStatus, PricingTable, extract_host};
 pub use store::{UsageAgg, UsageStore};
+pub use summary::UsageSummary;
 
 use std::sync::Arc;
 

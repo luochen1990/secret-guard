@@ -51,6 +51,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/sessions", get(api::list_sessions))
         .route("/api/sessions/{sid}/timeline", get(api::session_timeline))
         .route("/api/sync", post(api::sync))
+        .route("/api/usage/summary", get(api::usage_summary))
         .route(
             "/api/secrets",
             get(api::list_secrets).post(api::create_secret),

@@ -125,6 +125,23 @@ pub struct UsageConfig {
     pub enabled: bool,
     /// 明细保留天数. 0 = 永久. 启动时按 ts 清理 (临时文件 + atomic rename).
     pub retention_days: u32,
+    /// 定价数据源 (models.dev api.json 格式; 可指向自托管镜像).
+    pub pricing_url: String,
+    /// 定价表刷新间隔 (秒). 表过期后首个 usage 查询触发刷新.
+    pub pricing_refresh_secs: u64,
+    /// 用户定价覆盖 (键 = 聚合用 model 字符串, 最高优先于 models.dev):
+    /// `[usage.pricing_override."my-relay/gpt-fork"]` 形态的 table 数组.
+    pub pricing_override: std::collections::HashMap<String, PriceOverride>,
+}
+
+/// 单模型定价覆盖 ($ / 1M tokens). cache 两维可缺省 (回退规则同 models.dev 解析:
+/// cache_read → input 价, cache_write → 1.25×input).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct PriceOverride {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: Option<f64>,
+    pub cache_write: Option<f64>,
 }
 
 impl Default for UsageConfig {
@@ -132,6 +149,9 @@ impl Default for UsageConfig {
         Self {
             enabled: true,
             retention_days: 90,
+            pricing_url: "https://models.dev/api.json".to_string(),
+            pricing_refresh_secs: 86400,
+            pricing_override: std::collections::HashMap::new(),
         }
     }
 }
@@ -399,7 +419,21 @@ const KNOWN_FIELDS: &[(&str, &[&str])] = &[
     // Config::redact (RedactConfig)
     ("redact", &["global_mock_prefix", "on_probe_exhausted"]),
     // Config::usage (UsageConfig, usage-stats)
-    ("usage", &["enabled", "retention_days"]),
+    (
+        "usage",
+        &[
+            "enabled",
+            "retention_days",
+            "pricing_url",
+            "pricing_refresh_secs",
+            "pricing_override",
+        ],
+    ),
+    // usage.pricing_override (PriceOverride, 键 = model 字符串)
+    (
+        "usage.pricing_override",
+        &["input", "output", "cache_read", "cache_write"],
+    ),
     // Config::auth (AuthConfig)
     ("auth", &["enabled", "oidc", "api_keys"]),
     // auth.oidc (OidcConfig)
