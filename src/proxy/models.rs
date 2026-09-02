@@ -1142,13 +1142,8 @@ mod tests {
             on_probe_exhausted: crate::config::OnProbeExhausted::FailOpen,
             upstream_timeouts: crate::config::UpstreamTimeouts::default(),
             model_lists: Arc::new(ModelListCache::new()),
-            usage: std::sync::Arc::new(crate::usage::UsageStore::for_tests()),
-            pricing: std::sync::Arc::new(crate::usage::PricingCache::new(
-                "about:blank".to_string(),
-                std::time::Duration::from_secs(3600),
-                std::path::PathBuf::from("/dev/null"),
-                std::collections::HashMap::new(),
-            )),
+            usage: std::sync::Arc::new(crate::usage::UsageStore::in_memory()),
+            pricing: std::sync::Arc::new(crate::usage::PricingCache::for_tests()),
         }
     }
 

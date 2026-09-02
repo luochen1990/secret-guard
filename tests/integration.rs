@@ -195,13 +195,8 @@ async fn spawn_proxy_static_dynamic(
         on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,
         upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
         model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
-        usage: std::sync::Arc::new(secret_guard::usage::UsageStore::for_tests()),
-        pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::new(
-            "about:blank".to_string(),
-            std::time::Duration::from_secs(3600),
-            std::path::PathBuf::from("/dev/null"),
-            std::collections::HashMap::new(),
-        )),
+        usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),
+        pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::for_tests()),
     };
     let app = server::build_router(proxy);
     tokio::spawn(async move {
@@ -240,13 +235,8 @@ async fn spawn_proxy_with_prefix(global_mock_prefix: &str) -> String {
         on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,
         upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
         model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
-        usage: std::sync::Arc::new(secret_guard::usage::UsageStore::for_tests()),
-        pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::new(
-            "about:blank".to_string(),
-            std::time::Duration::from_secs(3600),
-            std::path::PathBuf::from("/dev/null"),
-            std::collections::HashMap::new(),
-        )),
+        usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),
+        pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::for_tests()),
     };
     let app = server::build_router(proxy);
     tokio::spawn(async move {
@@ -289,13 +279,8 @@ async fn spawn_proxy_with_probe_mode(
         on_probe_exhausted: mode,
         upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
         model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
-        usage: std::sync::Arc::new(secret_guard::usage::UsageStore::for_tests()),
-        pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::new(
-            "about:blank".to_string(),
-            std::time::Duration::from_secs(3600),
-            std::path::PathBuf::from("/dev/null"),
-            std::collections::HashMap::new(),
-        )),
+        usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),
+        pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::for_tests()),
     };
     let app = server::build_router(proxy);
     tokio::spawn(async move {
@@ -2408,13 +2393,8 @@ async fn spawn_proxy_with_timeouts_and_secrets(
         on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,
         upstream_timeouts,
         model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
-        usage: std::sync::Arc::new(secret_guard::usage::UsageStore::for_tests()),
-        pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::new(
-            "about:blank".to_string(),
-            std::time::Duration::from_secs(3600),
-            std::path::PathBuf::from("/dev/null"),
-            std::collections::HashMap::new(),
-        )),
+        usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),
+        pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::for_tests()),
     };
     let app = server::build_router(proxy);
     tokio::spawn(async move {
@@ -4211,13 +4191,8 @@ async fn cross_table_shared_state_no_lost_update() {
         on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,
         upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
         model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
-        usage: std::sync::Arc::new(secret_guard::usage::UsageStore::for_tests()),
-        pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::new(
-            "about:blank".to_string(),
-            std::time::Duration::from_secs(3600),
-            std::path::PathBuf::from("/dev/null"),
-            std::collections::HashMap::new(),
-        )),
+        usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),
+        pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::for_tests()),
     };
     let app = server::build_router(proxy);
     tokio::spawn(async move {
@@ -7043,7 +7018,7 @@ async fn spawn_proxy_with_usage_store(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let state_path = tmp_state_path("sg-usage-state");
-    // 直接构造 (不走 spawn_proxy_full — 它固定 for_tests store):
+    // 直接构造 (不走 spawn_proxy_full — 它固定 in_memory store):
     let provider_table = ProviderTable::with_persist_lock(
         vec![openai_provider("oa-main", "http://127.0.0.1:1")],
         vec![],
@@ -7065,12 +7040,7 @@ async fn spawn_proxy_with_usage_store(
         upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
         model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
         usage,
-        pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::new(
-            "about:blank".to_string(),
-            std::time::Duration::from_secs(3600),
-            std::path::PathBuf::from("/dev/null"),
-            std::collections::HashMap::new(),
-        )),
+        pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::for_tests()),
     };
     let app = server::build_router(proxy);
     tokio::spawn(async move {
@@ -7199,11 +7169,11 @@ async fn usage_stats_end_to_end_records_replayed_and_served() {
     // 6. JSONL 持久化: 一行, model = 回显值.
     let mut lines = None;
     for _ in 0..100 {
-        if let Ok(c) = std::fs::read_to_string(&jsonl) {
-            if !c.is_empty() {
-                lines = Some(c);
-                break;
-            }
+        if let Ok(c) = std::fs::read_to_string(&jsonl)
+            && !c.is_empty()
+        {
+            lines = Some(c);
+            break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
@@ -7229,5 +7199,173 @@ async fn usage_stats_end_to_end_records_replayed_and_served() {
         1,
         "replay must restore aggregation"
     );
+    let _ = std::fs::remove_file(&jsonl);
+}
+
+/// 流式采集 E2E (USAGE-2/5): OpenAI 流式 + include_usage 终末 chunk → usage 落账.
+/// 链路: StreamScan 累积 (MessageStop 之后的 usage chunk) → ParsedSync.finalize
+/// 回显摘要 → UsageCtx 落账 → summary.
+#[tokio::test]
+async fn usage_stats_streaming_include_usage_recorded() {
+    let mut server = mockito::Server::new_async().await;
+    // SSE 帧: 每帧 data: 后必须是**单行** JSON (跨行续行会被 SSE 协议丢弃).
+    let c1 = r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"gpt-s","choices":[{"index":0,"delta":{"role":"assistant","content":"he"},"finish_reason":null}]}"#;
+    let c2 = r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"gpt-s","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#;
+    let c3 = r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"gpt-s","choices":[],"usage":{"prompt_tokens":42,"completion_tokens":7}}"#;
+    let sse = format!("data: {c1}\n\ndata: {c2}\n\ndata: {c3}\n\ndata: [DONE]\n\n");
+    let _m = server
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse)
+        .create_async()
+        .await;
+
+    let dir = std::env::temp_dir().join(format!("sg-usage-s-e2e-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let jsonl = dir.join("usage.jsonl");
+    let _ = std::fs::remove_file(&jsonl);
+    let store = std::sync::Arc::new(secret_guard::usage::UsageStore::open(
+        &secret_guard::config::UsageConfig {
+            enabled: true,
+            retention_days: 90,
+            ..Default::default()
+        },
+        &jsonl,
+    ));
+    let base = spawn_proxy_with_usage_store(store).await;
+    let client = reqwest::Client::new();
+    let create = serde_json::json!({
+        "id": "oa-mock", "enabled": true, "protocol": "openai",
+        "base_url": server.url(), "api_key": "sk-x"
+    });
+    let resp = client
+        .post(format!("{base}/api/providers"))
+        .json(&create)
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+
+    let chat = client
+        .post(format!("{base}/o/oa-mock/v1/chat/completions"))
+        .json(&serde_json::json!({"model": "gpt-s", "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert!(chat.status().is_success());
+    // 读完流 (spawn task 在流结束后 attach + 落账).
+    use futures::StreamExt;
+    let mut stream = chat.bytes_stream();
+    while let Some(_c) = stream.next().await {}
+
+    let mut summary = None;
+    for _ in 0..200 {
+        let s = client
+            .get(format!("{base}/api/usage/summary?days=1"))
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap();
+        if s["totals"]["requests"].as_u64() == Some(1) {
+            summary = Some(s);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let s = summary.expect("streaming usage must land");
+    assert_eq!(
+        s["totals"]["input"].as_u64(),
+        Some(42),
+        "include_usage chunk collected: {s}"
+    );
+    assert_eq!(s["totals"]["output"].as_u64(), Some(7));
+    let _ = std::fs::remove_file(&jsonl);
+}
+
+/// cross_proto 采集 E2E: anthropic ingress → openai 上游, 回显 usage 经 egress reader
+/// 归一化 (OpenAI→IR) 后落账; 响应侧翻译回 anthropic envelope 不影响 usage.
+#[tokio::test]
+async fn usage_stats_cross_proto_recorded() {
+    let mut server = mockito::Server::new_async().await;
+    let oai_body = serde_json::json!({
+        "id": "chatcmpl-x", "model": "gpt-cross",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "yo"},
+                     "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 4}
+    });
+    let _m = server
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(serde_json::to_string(&oai_body).unwrap())
+        .create_async()
+        .await;
+
+    let dir = std::env::temp_dir().join(format!("sg-usage-x-e2e-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let jsonl = dir.join("usage.jsonl");
+    let _ = std::fs::remove_file(&jsonl);
+    let store = std::sync::Arc::new(secret_guard::usage::UsageStore::open(
+        &secret_guard::config::UsageConfig {
+            enabled: true,
+            retention_days: 90,
+            ..Default::default()
+        },
+        &jsonl,
+    ));
+    let base = spawn_proxy_with_usage_store(store).await;
+    let client = reqwest::Client::new();
+    let create = serde_json::json!({
+        "id": "oa-mock", "enabled": true, "protocol": "openai",
+        "base_url": server.url(), "api_key": "sk-x"
+    });
+    let resp = client
+        .post(format!("{base}/api/providers"))
+        .json(&create)
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+
+    // anthropic 协议 ingress (path /a/...), 上游是 openai → cross_proto 路径.
+    let resp = client
+        .post(format!("{base}/a/oa-mock/v1/messages"))
+        .header("x-api-key", "ignored")
+        .header("anthropic-version", "2023-06-01")
+        .json(&serde_json::json!({"model": "gpt-cross", "max_tokens": 32,
+            "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+
+    let mut summary = None;
+    for _ in 0..200 {
+        let s = client
+            .get(format!("{base}/api/usage/summary?days=1"))
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap();
+        if s["totals"]["requests"].as_u64() == Some(1) {
+            summary = Some(s);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let s = summary.expect("cross-proto usage must land");
+    assert_eq!(
+        s["totals"]["input"].as_u64(),
+        Some(10),
+        "egress reader normalization: {s}"
+    );
+    assert_eq!(s["totals"]["output"].as_u64(), Some(4));
+    assert_eq!(s["by_model"][0]["model"].as_str(), Some("gpt-cross"));
     let _ = std::fs::remove_file(&jsonl);
 }

@@ -33,7 +33,8 @@ use crate::config::UsageConfig;
 use super::UsageEvent;
 
 /// 按 (day, provider, model) 三元组的聚合计数.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Serialize: summary DTO 经 `#[serde(flatten)]` 内嵌 (wire 键 == 字段名).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct UsageAgg {
     pub requests: u64,
     /// usage == None 的请求数 (P-3 缺失显式; 对 token / cost 贡献恒 0).
@@ -103,8 +104,8 @@ impl UsageStore {
         }
     }
 
-    /// 纯内存 store (无文件 IO) — 单测 / UsageCtx 行为测试用.
-    pub fn for_tests() -> Self {
+    /// 纯内存 store (无文件 IO) — 单测 / AppState 测试 fixture / open() 的构造基座.
+    pub fn in_memory() -> Self {
         Self {
             enabled: true,
             retention_days: 0,
@@ -127,7 +128,7 @@ impl UsageStore {
         if !config.enabled {
             return Self::disabled();
         }
-        let mut this = Self::for_tests();
+        let mut this = Self::in_memory();
         this.retention_days = config.retention_days;
         // 1. 重放 (文件不存在 = 首次启动, 空开始).
         let (retained, expired, invalid) = match std::fs::File::open(jsonl_path) {
@@ -164,11 +165,17 @@ impl UsageStore {
             Ok(file) => {
                 let (tx, rx) = std::sync::mpsc::channel::<UsageEvent>();
                 let dropped = Arc::clone(&this.dropped);
-                std::thread::Builder::new()
+                // spawn 失败 (资源耗尽) 与文件打开失败同型降级: WARN + 纯内存,
+                // 不阻塞网关启动 (ROB: usage 是增强功能).
+                match std::thread::Builder::new()
                     .name("usage-jsonl".into())
                     .spawn(move || writer_loop(file, rx, dropped))
-                    .expect("spawn usage-jsonl writer thread");
-                this.writer = Some(tx);
+                {
+                    Ok(_) => this.writer = Some(tx),
+                    Err(e) => {
+                        warn!(error = %e, "usage jsonl writer thread spawn failed; in-memory only")
+                    }
+                }
             }
             Err(e) => {
                 warn!(path = %jsonl_path.display(), error = %e, "usage jsonl not writable; stats run in-memory only");
@@ -221,11 +228,6 @@ impl UsageStore {
     /// 配置的 retention 天数 (API 的 days 查询上限; 0 = 无上限).
     pub fn retention_days(&self) -> u32 {
         self.retention_days
-    }
-
-    /// writer 丢弃计数 (诊断用).
-    pub fn dropped_events(&self) -> u64 {
-        self.dropped.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -298,6 +300,7 @@ fn writer_loop(
     dropped: Arc<AtomicU64>,
 ) {
     let mut out = std::io::BufWriter::new(file);
+    let mut warned = false;
     for ev in rx {
         let ok = (|| -> Result<(), Box<dyn std::error::Error>> {
             serde_json::to_writer(&mut out, &ev)?;
@@ -307,7 +310,16 @@ fn writer_loop(
         })()
         .is_ok();
         if !ok {
+            // 状态变化时 WARN 一次 (磁盘满等持续性故障不刷屏; 恢复后重置, 再失败再报).
+            if !warned {
+                warn!(
+                    "usage jsonl write failed; events being dropped (counted, not logged per-event)"
+                );
+                warned = true;
+            }
             dropped.fetch_add(1, Ordering::Relaxed);
+        } else {
+            warned = false;
         }
     }
 }
@@ -345,7 +357,7 @@ mod tests {
 
     #[test]
     fn record_accumulates_per_key_and_counts_missing_usage() {
-        let s = UsageStore::for_tests();
+        let s = UsageStore::in_memory();
         s.record(ev(0, "p1", Some("m1"), quanta(10, 5)));
         s.record(ev(0, "p1", Some("m1"), quanta(20, 5)));
         s.record(ev(0, "p1", Some("m1"), None));

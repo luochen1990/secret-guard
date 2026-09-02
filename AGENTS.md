@@ -141,7 +141,8 @@
   聚合 router /models 的上游清单缓存, 纯数据 store 无 proxy 行为依赖, 组合根先例同
   state → auth 的 ApiKeyStore — 见 `src/state.rs` 字段注释) + state → usage
   (usage-stats: AppState 聚合 UsageStore / PricingCache 两个纯数据 store, 同一先例;
-  usage 模块自身仅依赖 codec::ir / secrets 纯类型, 见 `src/usage/` 头部).
+  usage 模块自身仅依赖 codec::ir / secrets / config schema 纯数据类型, 见
+  `src/usage/` 头部 — usage→config 是向下合法边, 非例外, 性质同 provider→config).
 
 > secret-guard 的核心职责 (转发 + Redact) 必须对任意字节流零失败.
 > 围绕核心职责之外、**基于对 LLM 应用层行为模式强假设** 的附加功能
@@ -631,7 +632,8 @@ configFile (escape hatch, 互斥). 凭据注入 (LoadCredential / sops 直接路
   网关不代为注入 (FWD-1 未授权). 此类请求在 Usage 页只计请求数 (`requests_without_usage`
   / `cost_coverage` 指标可见), 页面有提示文案. Gemini / Ollama (无 codec) 同样无
   usage 回显提取 (P2 浅提取). 详见 `docs/design/usage-stats.md` §5.4.
-- **usage 成本恒为估算**: models.dev 价目表 ≠ 实际合同价; 历史成本按当前价目表实时
+- **usage 成本恒为估算**: models.dev 价目表 ≠ 实际合同价; 未列 cache 价的模型按宽松
+  近似回退 (cache_read → input 价, cache_write → 1.25×input); 历史成本按当前价目表实时
   重算 (会随价目表漂移, UI 明示). session 徽章 (Records tab) 是进程内口径, restart
   归零; Usage tab 是持久账本 (JSONL) — 两套口径不同, 页脚说明.
 - **reasoning_content (思考原文) 跨协议丢弃** (#176, 契约 STR-6): OpenAI 兼容 provider 的

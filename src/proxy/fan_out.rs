@@ -649,7 +649,7 @@ mod tests {
             None,  // codec_proto=None 跳过 StreamScan
             None,  // stream_idle_timeout=None (测试不禁用超时保护)
             crate::usage::UsageCtx::new(
-                std::sync::Arc::new(crate::usage::UsageStore::for_tests()),
+                std::sync::Arc::new(crate::usage::UsageStore::in_memory()),
                 std::sync::Arc::from("test"),
                 None,
                 "o",

@@ -4,6 +4,10 @@
 > 调研基线: opencode (sst/opencode@50efc05, `cli/cmd/stats.ts` + models.dev 定价),
 > claude-code `/cost` `/usage` + ccusage 生态, models.dev 开源模型定价库.
 > 关键约束 (用户指定): **充分利用模型回显信息, 尽量避免自己造轮子**.
+> v3 变更 (实施后走查, 2026-09-03): 实施中修正 — days 查询加硬上限 400
+> (ROB: GET 参数防分配 abort); passthrough 降级路径 (secrets 非空 + 无 codec)
+> 的 SEC model 扫描补全 (v2 遗漏); PricingCache 退避窗口补齐 serve-stale 形态;
+> cache_write 缺价回退 1.25×input 登记; `-YYMMDD` 后缀不剥 (rationale 见 §7).
 > v2 变更: 修正 v1 对代码库现状的两处误判 (死字段), 补采集层设计 (M0)、
 > usage presence 类型、计入判据、防淘汰方案、定价匹配规则、SEC 边界修正.
 
@@ -200,11 +204,16 @@ struct UsageAgg {            // 按 (day, provider, model) 三元组 fold
   2. models.dev `vendor/model_id` 全表扫描: `model_id` 与回显串**精确相等**且唯一
      命中 → 取; 多 vendor 同名 → 按 provider `base_url` 域名启发匹配 vendor
      (api.openai.com → openai 等), 仍歧义 → 取字母序第一个 + 响应标记 `ambiguous`;
-  3. 剥日期后缀 (regex `-YYYY-MM-DD$` 或 `-YYMMDD$`) 后重复步骤 2
-     (`gpt-5.6-terra-2026-07-09` → `gpt-5.6-terra`);
+  3. 剥日期后缀 (`-YYYY-MM-DD$`, 11 chars) 后重复步骤 2
+     (`gpt-5.6-terra-2026-07-09` → `gpt-5.6-terra`). 注: `-YYMMDD` 形态
+     (如 anthropic 的 `claude-3-5-sonnet-20240620`) 不剥 — 该 dated 形态本身通常
+     就是 models.dev 的 model_id, 剥了反而匹配不到;
   4. 均失败 → cost null, 计入 `unpriced_models` 清单 (UI 提示配 override).
 - 成本公式 (opencode 语义; IR 归一化后 `input_tokens` 恰为未缓存部分):
   `cost = i×in + cr×cache_read + cw×cache_write + o×out  (÷1M)`
+- 缺价字段回退 (P-2 的宽松近似, **有值时永远用真实值**): models.dev 未列
+  `cache_read` → 按 `input` 价; 未列 `cache_write` → 按 1.25×`input`
+  (Anthropic 质量型写入加价的惯例近似).
 - **快照语义决策**: 明细行不存 cost, 查询时按**当前**价目表实时重算. 理由: 价目表
   更新后历史估算随之修正 (本地工具更关心 "现在算要多少钱"), 明细行最小. 代价:
   历史数字随价目表漂移 —— UI 明示 "以当前价目表估算".

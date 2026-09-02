@@ -2589,4 +2589,38 @@ test.describe("Provider 表单构造分野 (#190)", () => {
     await row.locator('button[data-action="delete"]').click();
     await expect(row).not.toBeVisible();
   });
+
+});
+
+test.describe("usage-stats (模型用量统计)", () => {
+  // ─── usage-stats: Usage tab 冒烟 (数据流端到端 + 无脚本错误) ─────────────
+  //
+  // mock upstream 的 chat 响应带 usage (prompt 10 / completion 20, mock_upstream.py).
+  // 发一个请求 → 切 Usage tab → 汇总卡应显示 requests=1 且 token 维度非零
+  // (整条链: 回显采集 → store → /api/usage/summary → 前端渲染). 定价拉取在无外网
+  // 环境为 offline (卡片仍渲染, ~cost 显示 $0), 不作断言对象.
+  test("usage-stats: Usage tab 渲染请求与 token 汇总", async ({ page }) => {
+    await page.goto("/");
+    await sendChat(page, [{ role: "user", content: "hi for usage" }]);
+    await page.locator('a.tab[data-tab="usage"]').click();
+    // requests 卡: 至少 1 (轮询 5s 内到达; 给足 12s).
+    const cards = page.locator("#usage-cards .usage-card");
+    await expect
+      .poll(async () => cards.first().locator(".v").innerText(), { timeout: 12_000 })
+      .not.toBe("0");
+    // token 卡非零 (input = 10: mock 回显归一化后).
+    const tokenVals = cards.locator(".v");
+    await expect
+      .poll(async () => tokenVals.nth(1).innerText(), { timeout: 12_000 })
+      .not.toBe("0");
+    // by model 表出现行 (model 列含 mock 回显的 model 名).
+    await expect
+      .poll(async () => page.locator("#usage-by-model-body tr").count(), { timeout: 12_000 })
+      .toBeGreaterThan(0);
+    // 脚本零错误 (渲染路径无异常).
+    const errors: string[] = [];
+    page.on("pageerror", (e) => errors.push(String(e)));
+    await page.waitForTimeout(300);
+    expect(errors).toEqual([]);
+  });
 });

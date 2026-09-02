@@ -44,15 +44,14 @@ pub struct SummaryRange {
     pub days: u32,
 }
 
-/// 汇总卡 (UsageAgg 的超集 + 派生率).
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+/// 六维计数的 wire 载体: [`UsageAgg`] 经 `#[serde(flatten)]` 内嵌 — JSON 键与
+/// 直接声明完全一致 (USAGE-1 的 "分项之和 == totals" 由结构同源保证, 而非四处
+/// 拷贝字段碰巧一致).
+#[derive(Debug, Clone, Serialize)]
 pub struct Totals {
-    pub requests: u64,
-    pub requests_without_usage: u64,
-    pub input: u64,
-    pub output: u64,
-    pub cache_read: u64,
-    pub cache_write: u64,
+    #[serde(flatten)]
+    pub agg: UsageAgg,
+    // (Default 经下方手动 impl — flatten 字段非 Option 时 derive 不便)
     pub cache_hit_rate: Option<f64>,
     /// 估算成本 (仅含有价 cell 的贡献; P-4 恒为估算).
     pub est_cost_usd: f64,
@@ -63,12 +62,8 @@ pub struct Totals {
 #[derive(Debug, Clone, Serialize)]
 pub struct DayRow {
     pub day: String,
-    pub requests: u64,
-    pub requests_without_usage: u64,
-    pub input: u64,
-    pub output: u64,
-    pub cache_read: u64,
-    pub cache_write: u64,
+    #[serde(flatten)]
+    pub agg: UsageAgg,
     pub est_cost_usd: f64,
 }
 
@@ -76,12 +71,8 @@ pub struct DayRow {
 pub struct ModelRow {
     pub model: Option<String>,
     pub provider: String,
-    pub requests: u64,
-    pub requests_without_usage: u64,
-    pub input: u64,
-    pub output: u64,
-    pub cache_read: u64,
-    pub cache_write: u64,
+    #[serde(flatten)]
+    pub agg: UsageAgg,
     pub est_cost_usd: f64,
     /// 占总量 cost 的比例 (0..1; totals 为 0 时 0).
     pub cost_share: f64,
@@ -90,12 +81,8 @@ pub struct ModelRow {
 #[derive(Debug, Clone, Serialize)]
 pub struct ProviderRow {
     pub provider: String,
-    pub requests: u64,
-    pub requests_without_usage: u64,
-    pub input: u64,
-    pub output: u64,
-    pub cache_read: u64,
-    pub cache_write: u64,
+    #[serde(flatten)]
+    pub agg: UsageAgg,
     pub est_cost_usd: f64,
 }
 
@@ -131,22 +118,26 @@ pub fn build_summary(input: SummaryInputs<'_>, status: PricingStatus) -> UsageSu
     let from = from_date.format("%Y-%m-%d").to_string();
     let to = today.format("%Y-%m-%d").to_string();
 
-    // 窗口内 cells 过滤 (day 字符串字典序 == 日期序).
-    let cells: Vec<(super::store::AggKey, UsageAgg)> = input
+    // 窗口内 cells 过滤 + 排序 (USAGE-3 确定性: f64 求和顺序固定, HashMap 迭代序
+    // 非确定会让同两次查询的 cost 末位 ULP 不同; 排序顺带稳定 by_model 输出序).
+    let mut cells: Vec<(super::store::AggKey, UsageAgg)> = input
         .store
         .snapshot_cells()
         .into_iter()
         .filter(|((day, _, _), _)| day.as_str() >= from.as_str())
         .collect();
+    // 键在 HashMap 中唯一, 按键排序即全序 (确定性足够; UsageAgg 无需 Ord).
+    cells.sort_by(|a, b| a.0.cmp(&b.0));
 
     // 定价缓存: 同一 (model, provider-domain) 只查一次表.
     let mut price_cache: std::collections::HashMap<(Option<String>, String), Option<ModelPrice>> =
         std::collections::HashMap::new();
     let mut price_of = |model: &Option<String>, provider: &str| -> Option<ModelPrice> {
-        let hint = (input.domain_hint)(provider);
         *price_cache
             .entry((model.clone(), provider.to_string()))
             .or_insert_with(|| {
+                // domain_hint (providers 表查询, 最贵的部分) 惰性执行 — 缓存命中时零成本.
+                let hint = (input.domain_hint)(provider);
                 input
                     .table
                     .price_for(model.as_deref().unwrap_or(""), hint.as_deref())
@@ -165,14 +156,9 @@ pub fn build_summary(input: SummaryInputs<'_>, status: PricingStatus) -> UsageSu
         std::collections::HashMap::new();
 
     for ((day, provider, model), agg) in &cells {
-        totals.requests += agg.requests;
-        totals.requests_without_usage += agg.requests_without_usage;
-        totals.input = totals.input.saturating_add(agg.input);
-        totals.output = totals.output.saturating_add(agg.output);
-        totals.cache_read = totals.cache_read.saturating_add(agg.cache_read);
-        totals.cache_write = totals.cache_write.saturating_add(agg.cache_write);
+        merge_agg(&mut totals.agg, agg);
 
-        let with_usage = agg.requests - agg.requests_without_usage;
+        let with_usage = agg.requests.saturating_sub(agg.requests_without_usage);
         with_usage_requests += with_usage;
         let price = price_of(model, provider);
         let cost = price.map_or(0.0, |p| cost_usd(&p, agg));
@@ -191,12 +177,7 @@ pub fn build_summary(input: SummaryInputs<'_>, status: PricingStatus) -> UsageSu
         model_rows.push(ModelRow {
             model: model.clone(),
             provider: provider.clone(),
-            requests: agg.requests,
-            requests_without_usage: agg.requests_without_usage,
-            input: agg.input,
-            output: agg.output,
-            cache_read: agg.cache_read,
-            cache_write: agg.cache_write,
+            agg: *agg,
             est_cost_usd: cost,
             cost_share: 0.0, // totals cost 就绪后填.
         });
@@ -217,8 +198,9 @@ pub fn build_summary(input: SummaryInputs<'_>, status: PricingStatus) -> UsageSu
             0.0
         };
     }
-    let input_sum = totals.input + totals.cache_read + totals.cache_write;
-    totals.cache_hit_rate = (input_sum > 0).then(|| totals.cache_read as f64 / input_sum as f64);
+    let input_sum = totals.agg.input + totals.agg.cache_read + totals.agg.cache_write;
+    totals.cache_hit_rate =
+        (input_sum > 0).then(|| totals.agg.cache_read as f64 / input_sum as f64);
     totals.cost_coverage =
         (with_usage_requests > 0).then(|| priced_requests as f64 / with_usage_requests as f64);
 
@@ -231,12 +213,7 @@ pub fn build_summary(input: SummaryInputs<'_>, status: PricingStatus) -> UsageSu
         let (agg, cost) = day_agg.remove(&day).unwrap_or_default();
         by_day.push(DayRow {
             day,
-            requests: agg.requests,
-            requests_without_usage: agg.requests_without_usage,
-            input: agg.input,
-            output: agg.output,
-            cache_read: agg.cache_read,
-            cache_write: agg.cache_write,
+            agg,
             est_cost_usd: cost,
         });
     }
@@ -254,12 +231,7 @@ pub fn build_summary(input: SummaryInputs<'_>, status: PricingStatus) -> UsageSu
         .into_iter()
         .map(|(provider, (agg, cost))| ProviderRow {
             provider,
-            requests: agg.requests,
-            requests_without_usage: agg.requests_without_usage,
-            input: agg.input,
-            output: agg.output,
-            cache_read: agg.cache_read,
-            cache_write: agg.cache_write,
+            agg,
             est_cost_usd: cost,
         })
         .collect();
@@ -281,9 +253,22 @@ pub fn build_summary(input: SummaryInputs<'_>, status: PricingStatus) -> UsageSu
     }
 }
 
+impl Default for Totals {
+    fn default() -> Self {
+        Self {
+            agg: UsageAgg::default(),
+            cache_hit_rate: None,
+            est_cost_usd: 0.0,
+            cost_coverage: None,
+        }
+    }
+}
+
 fn merge_agg(dst: &mut UsageAgg, src: &UsageAgg) {
-    dst.requests += src.requests;
-    dst.requests_without_usage += src.requests_without_usage;
+    dst.requests = dst.requests.saturating_add(src.requests);
+    dst.requests_without_usage = dst
+        .requests_without_usage
+        .saturating_add(src.requests_without_usage);
     dst.input = dst.input.saturating_add(src.input);
     dst.output = dst.output.saturating_add(src.output);
     dst.cache_read = dst.cache_read.saturating_add(src.cache_read);
@@ -292,12 +277,17 @@ fn merge_agg(dst: &mut UsageAgg, src: &UsageAgg) {
 
 #[cfg(test)]
 mod tests {
+    /// 无域名启发的 hint (所有测试共享, 替代 4 处重复闭包).
+    fn no_hint(_p: &str) -> Option<String> {
+        None
+    }
+
     use super::*;
     use crate::usage::UsageQuanta;
     use std::collections::HashMap;
 
     fn store_with(events: &[crate::usage::UsageEvent]) -> UsageStore {
-        let s = UsageStore::for_tests();
+        let s = UsageStore::in_memory();
         for e in events {
             s.record(e.clone());
         }
@@ -378,7 +368,6 @@ mod tests {
             ), // 窗口外
         ]);
         let table = priced_table();
-        let no_hint = |_p: &str| None;
         let sum = build_summary(
             SummaryInputs {
                 store: &s,
@@ -390,22 +379,22 @@ mod tests {
         );
         let t = &sum.totals;
         assert_eq!(
-            t.requests, 3,
+            t.agg.requests, 3,
             "window = today only (48h-old event excluded)"
         );
-        assert_eq!(t.requests_without_usage, 1);
-        assert_eq!(t.input, 1100);
-        assert_eq!(t.output, 500);
+        assert_eq!(t.agg.requests_without_usage, 1);
+        assert_eq!(t.agg.input, 1100);
+        assert_eq!(t.agg.output, 500);
         // USAGE-1: by_model 之和 == totals.
-        let m_req: u64 = sum.by_model.iter().map(|r| r.requests).sum();
-        let m_in: u64 = sum.by_model.iter().map(|r| r.input).sum();
-        assert_eq!((m_req, m_in), (t.requests, t.input));
+        let m_req: u64 = sum.by_model.iter().map(|r| r.agg.requests).sum();
+        let m_in: u64 = sum.by_model.iter().map(|r| r.agg.input).sum();
+        assert_eq!((m_req, m_in), (t.agg.requests, t.agg.input));
         // by_provider 之和 == totals.
-        let p_req: u64 = sum.by_provider.iter().map(|r| r.requests).sum();
-        assert_eq!(p_req, t.requests);
+        let p_req: u64 = sum.by_provider.iter().map(|r| r.agg.requests).sum();
+        assert_eq!(p_req, t.agg.requests);
         // by_day 之和 == totals (窗口内仅今天有数据).
-        let d_req: u64 = sum.by_day.iter().map(|r| r.requests).sum();
-        assert_eq!(d_req, t.requests);
+        let d_req: u64 = sum.by_day.iter().map(|r| r.agg.requests).sum();
+        assert_eq!(d_req, t.agg.requests);
         // USAGE-4: cost_coverage 只算有 usage 的请求: 有 usage 2 (1 priced + 1 unpriced) → 0.5.
         assert!((t.cost_coverage.unwrap() - 0.5).abs() < 1e-9);
         assert_eq!(sum.unpriced_models, vec!["m-unpriced"]);
@@ -442,7 +431,6 @@ mod tests {
             ),
         ]);
         let table = priced_table();
-        let no_hint = |_p: &str| None;
         let sum = build_summary(
             SummaryInputs {
                 store: &s,
@@ -474,7 +462,6 @@ mod tests {
             }),
         )]);
         let table = priced_table();
-        let no_hint = |_p: &str| None;
         let sum = build_summary(
             SummaryInputs {
                 store: &s,
@@ -492,9 +479,8 @@ mod tests {
 
     #[test]
     fn empty_store_yields_zeroed_days_and_none_rates() {
-        let s = UsageStore::for_tests();
+        let s = UsageStore::in_memory();
         let table = PricingTable::empty();
-        let no_hint = |_p: &str| None;
         let sum = build_summary(
             SummaryInputs {
                 store: &s,
@@ -505,7 +491,7 @@ mod tests {
             PricingStatus::Ok,
         );
         assert_eq!(sum.by_day.len(), 7, "zero-filled contiguous days");
-        assert_eq!(sum.totals.requests, 0);
+        assert_eq!(sum.totals.agg.requests, 0);
         assert!(sum.totals.cache_hit_rate.is_none());
         assert!(sum.totals.cost_coverage.is_none());
     }

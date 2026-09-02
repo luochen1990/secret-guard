@@ -45,22 +45,15 @@ pub(super) const PARSED_SYNC_INTERVAL: Duration = Duration::from_millis(500);
 /// 流式 = StreamScan snapshot (经 [`ParsedSync::finalize`] 一并产出). proxy 全部
 /// ResponseData 构造点统一经此结构接线 (单一入口防新增转发路径漏接).
 /// 设计: docs/design/usage-stats.md §5.2.
+/// 两字段皆 Option — `#[derive(Default)]` 即 "无回显" 占位值 (错误路径 /
+/// parse 失败 / 无 codec 协议).
+#[derive(Default)]
 pub(crate) struct ResponseEcho {
     /// 回显的 token 用量. `None` = wire 无回显 (presence 语义见
     /// `IrResponse::usage_present`); 流式中断时为已累积部分值.
     pub usage: Option<crate::codec::ir::IrUsage>,
     /// 上游回显的实际服务模型名 (别名/路由场景比请求侧 model 更准).
     pub model: Option<String>,
-}
-
-impl Default for ResponseEcho {
-    /// 无回显 (错误路径 / parse 失败 / 无 codec 协议的占位值).
-    fn default() -> Self {
-        Self {
-            usage: None,
-            model: None,
-        }
-    }
 }
 
 impl ResponseEcho {

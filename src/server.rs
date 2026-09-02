@@ -131,49 +131,19 @@ pub fn build_router_with_auth(state: AppState, auth_stack: AuthStack) -> Router 
     build_router_inner(state, Some(auth_stack))
 }
 
+/// 与 static config 同目录的派生文件路径 (`<stem>.<suffix>`, 规则同 main.rs 的
+/// default_state_path 约定): usage JSONL (`<stem>.usage.jsonl`, 设计 §4) 与
+/// models.dev 定价缓存 (`<stem>.pricing.json`, 原样落盘供冷启动读回).
+fn config_sibling_path(config_path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    let file_name = config_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("secret-guard.toml");
+    let stem = file_name.strip_suffix(".toml").unwrap_or(file_name);
+    config_path.with_file_name(format!("{stem}.{suffix}"))
+}
+
 /// 内部: 根据 auth_stack 是否存在, 条件化装配认证 layer.
-/// usage JSONL 的默认路径: 与 static config 同目录, `<stem>.usage.jsonl`
-/// (派生规则同 main.rs 的 default_state_path `<stem>.state.toml` 约定, 设计 §4).
-fn default_usage_jsonl_path(config_path: &std::path::Path) -> std::path::PathBuf {
-    let file_name = config_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("secret-guard.toml");
-    let stem = file_name.strip_suffix(".toml").unwrap_or(file_name);
-    config_path.with_file_name(format!("{stem}.usage.jsonl"))
-}
-
-/// 定价缓存文件路径 (`<stem>.pricing.json`, 与 usage JSONL 同目录; models.dev
-/// 原样落盘, 冷启动无网络时读回).
-fn default_pricing_json_path(config_path: &std::path::Path) -> std::path::PathBuf {
-    let file_name = config_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("secret-guard.toml");
-    let stem = file_name.strip_suffix(".toml").unwrap_or(file_name);
-    config_path.with_file_name(format!("{stem}.pricing.json"))
-}
-
-/// `[usage.pricing_override]` → PricingTable 的 override map (cache 价回退规则
-/// 同 models.dev 解析: cache_read → input, cache_write → 1.25×input).
-fn price_overrides_to_table(
-    o: &std::collections::HashMap<String, crate::config::PriceOverride>,
-) -> std::collections::HashMap<String, crate::usage::ModelPrice> {
-    o.iter()
-        .map(|(k, v)| {
-            (
-                k.clone(),
-                crate::usage::ModelPrice {
-                    input: v.input,
-                    output: v.output,
-                    cache_read: v.cache_read.unwrap_or(v.input),
-                    cache_write: v.cache_write.unwrap_or(v.input * 1.25),
-                },
-            )
-        })
-        .collect()
-}
-
 fn build_router_inner(state: AppState, auth_stack: Option<AuthStack>) -> Router {
     // Forward router: 使用 AppState, 在 merge 前不调用 with_state.
     // 首段 proto 简写 (o/a/g/l/r) 由 dispatch 校验; 顶级保留字 (api/login/logout/oauth2)
@@ -363,13 +333,13 @@ pub async fn serve(
         model_lists: Arc::new(crate::proxy::ModelListCache::new()),
         usage: Arc::new(crate::usage::UsageStore::open(
             &usage_config,
-            &default_usage_jsonl_path(&config_path),
+            &config_sibling_path(&config_path, "usage.jsonl"),
         )),
         pricing: Arc::new(crate::usage::PricingCache::new(
             usage_config.pricing_url.clone(),
             std::time::Duration::from_secs(usage_config.pricing_refresh_secs.max(60)),
-            default_pricing_json_path(&config_path),
-            price_overrides_to_table(&usage_config.pricing_override),
+            config_sibling_path(&config_path, "pricing.json"),
+            crate::usage::price_overrides_from_config(&usage_config.pricing_override),
         )),
     };
 

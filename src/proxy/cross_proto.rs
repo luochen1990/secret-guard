@@ -183,16 +183,16 @@ pub(crate) async fn cross_proto_forward(
         Some(&secrets_snapshot),
         redactions,
     );
-    // usage-stats 采集上下文 (与 same_proto 同模式; event 消耗前捕获 model_req).
+    // usage-stats 采集上下文 (与 same_proto 同模式; helpers::usage_ctx SSOT).
     let model_req = event.model.as_ref().map(|m| m.to_string());
     let record_id = state.dag.push_messages(real_messages, event);
-    let usage_ctx = crate::usage::UsageCtx::new(
-        state.usage.clone(),
-        std::sync::Arc::from(upstream_id),
+    let usage_ctx = super::helpers::usage_ctx(
+        &state,
+        &fp,
+        &parts.method,
+        upstream_id,
         model_req,
-        fp.proto.clone(),
-        parts.method.as_str(),
-        std::sync::Arc::from(secrets_snapshot.into_boxed_slice()),
+        &secrets_snapshot,
     );
 
     debug!(

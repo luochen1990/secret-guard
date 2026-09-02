@@ -1128,13 +1128,8 @@ async fn spawn_full_auth_router() -> String {
         on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,
         upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
         model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
-        usage: std::sync::Arc::new(secret_guard::usage::UsageStore::for_tests()),
-        pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::new(
-            "about:blank".to_string(),
-            std::time::Duration::from_secs(3600),
-            std::path::PathBuf::from("/dev/null"),
-            std::collections::HashMap::new(),
-        )),
+        usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),
+        pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::for_tests()),
     };
 
     let app = secret_guard::server::build_router_with_auth(

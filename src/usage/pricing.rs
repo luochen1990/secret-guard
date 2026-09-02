@@ -158,17 +158,50 @@ impl PricingData {
     }
 }
 
-/// cost 对象 → ModelPrice (缺 cache 价的回退见 [`ModelPrice`] 文档).
+/// 缺 cache 价的回退规则 SSOT (P-2 的宽松近似, 有值时永远用真实值):
+/// `cache_read` 缺 → 按 `input` 价; `cache_write` 缺 → 按 **1.25×input**
+/// (Anthropic 质量型缓存写入加价的惯例近似). parse 与 config override 共用.
+impl ModelPrice {
+    pub fn with_cache_fallback(
+        input: f64,
+        output: f64,
+        cache_read: Option<f64>,
+        cache_write: Option<f64>,
+    ) -> Self {
+        Self {
+            input,
+            output,
+            cache_read: cache_read.unwrap_or(input),
+            cache_write: cache_write.unwrap_or(input * 1.25),
+        }
+    }
+}
+
+/// cost 对象 → ModelPrice (缺 cache 价回退见 [`ModelPrice::with_cache_fallback`]).
 fn parse_price(cost: &serde_json::Value) -> Option<ModelPrice> {
     let f = |k: &str| cost.get(k).and_then(|v| v.as_f64());
     let input = f("input")?;
     let output = f("output")?;
-    Some(ModelPrice {
+    Some(ModelPrice::with_cache_fallback(
         input,
         output,
-        cache_read: f("cache_read").unwrap_or(input),
-        cache_write: f("cache_write").unwrap_or(input * 1.25),
-    })
+        f("cache_read"),
+        f("cache_write"),
+    ))
+}
+
+/// `[usage.pricing_override]` 配置 → override map (server.rs 装配调用).
+pub fn price_overrides_from_config(
+    o: &std::collections::HashMap<String, crate::config::PriceOverride>,
+) -> HashMap<String, ModelPrice> {
+    o.iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                ModelPrice::with_cache_fallback(v.input, v.output, v.cache_read, v.cache_write),
+            )
+        })
+        .collect()
 }
 
 /// URL → 小写 host (`scheme://host[:port]/...` 形态). 解析不出返回 None.
@@ -222,6 +255,7 @@ struct CacheState {
 pub struct PricingCache {
     url: String,
     ttl: Duration,
+    backoff: Duration,
     disk_path: PathBuf,
     overrides: HashMap<String, ModelPrice>,
     state: RwLock<CacheState>,
@@ -248,14 +282,42 @@ impl PricingCache {
         disk_path: PathBuf,
         overrides: HashMap<String, ModelPrice>,
     ) -> Self {
-        // 冷启动: 无网络时读盘兜底 (fetched_at 置很久前 → 首查询即尝试刷新).
+        Self::with_backoff(url, ttl, FETCH_BACKOFF, disk_path, overrides)
+    }
+
+    /// 测试构造 (dead URL + /dev/null 盘 + 无 override): AppState fixture 用,
+    /// 与 `UsageStore::in_memory` 模式对称. TTL 取大值防测试环境意外拉取.
+    pub fn for_tests() -> Self {
+        Self::new(
+            "about:blank".to_string(),
+            Duration::from_secs(3600),
+            PathBuf::from("/dev/null"),
+            HashMap::new(),
+        )
+    }
+
+    /// 测试可注入退避窗口 (生产经 [`Self::new`] 用 FETCH_BACKOFF 常量).
+    pub fn with_backoff(
+        url: String,
+        ttl: Duration,
+        backoff: Duration,
+        disk_path: PathBuf,
+        overrides: HashMap<String, ModelPrice>,
+    ) -> Self {
+        // 冷启动: 无网络时读盘兜底 (fetched_at 置"过期" → 首查询即尝试刷新).
+        // checked_sub: uptime < ttl 的平台 (Windows Instant 单调钟不可表示过去点,
+        // 直接减会 panic) 退化为 None = "从未刷新", 首查询同样触发拉取 — 语义等价.
+        let stale_marker = Instant::now().checked_sub(ttl);
         let (disk_data, fetched_at) = match load_disk(&disk_path) {
-            Some(d) => (Some(Arc::new(d)), Some(Instant::now() - ttl)),
+            // fetched_at 直接透传 stale_marker (Option): None = "从未刷新" → 首查询
+            // 触发拉取 (fresh=false), status 落 Stale — 与可减平台语义一致.
+            Some(d) => (Some(Arc::new(d)), stale_marker),
             None => (None, None),
         };
         Self {
             url,
             ttl,
+            backoff,
             disk_path,
             overrides,
             state: RwLock::new(CacheState {
@@ -269,27 +331,19 @@ impl PricingCache {
 
     /// 取 (合并视图, 状态). 可能触发一次异步刷新 (惰性 + TTL + 退避 + single-flight).
     pub async fn table(&self, http: &reqwest::Client) -> (PricingTable, PricingStatus) {
-        let needs_refresh = {
-            let s = self.state.read();
-            match (s.data.is_some(), s.fetched_at) {
-                // 从未有过数据且不在退避窗口 → 需要拉.
-                (false, _) => s.last_failure.is_none_or(|t| t.elapsed() >= FETCH_BACKOFF),
-                // 有数据: TTL 内新鲜 → 不拉.
-                (_, Some(t)) if t.elapsed() < self.ttl => false,
-                // TTL 过期 → 拉 (serve-stale).
-                _ => true,
-            }
+        // 刷新门控 (与 #196 语义对齐): 表新鲜 → 不拉; 退避窗口内 (含 serve-stale 与
+        // 无数据两形态) → 不拉; 其余 (TTL 过期 / 从未拉过) → 拉.
+        // 注: 退避窗口同样约束 stale 表的重试 — 否则 dead 网络下每个查询都打一次上游.
+        let gate = |s: &CacheState| {
+            let fresh = s.fetched_at.is_some_and(|t| t.elapsed() < self.ttl);
+            let in_backoff = s.last_failure.is_some_and(|t| t.elapsed() < self.backoff);
+            !fresh && !in_backoff
         };
+        let needs_refresh = gate(&self.state.read());
         if needs_refresh {
             let _guard = self.refresh_lock.lock().await;
-            // double-check: 等锁期间可能已被首个查询者刷新.
-            let still = {
-                let s = self.state.read();
-                s.fetched_at.is_none_or(|t| t.elapsed() >= self.ttl)
-                    || (s.data.is_none()
-                        && s.last_failure.is_none_or(|t| t.elapsed() >= FETCH_BACKOFF))
-            };
-            if still {
+            // double-check: 等锁期间可能已被首个查询者刷新 (或刷新失败进入退避).
+            if gate(&self.state.read()) {
                 self.refresh(http).await;
             }
         }
@@ -509,5 +563,106 @@ mod tests {
         let empty = PricingTable::new(None, overrides);
         assert!(empty.price_for("y", None).is_none());
         assert!(empty.price_for("x", None).is_some());
+    }
+    // ─── PricingCache 状态机 (TTL / serve-stale / 退避 / 盘冷启动) ────────
+    // 语义照抄 #196 ModelListCache; mockito 构造真实 HTTP 上下文 (lib test 可用 dev-dep).
+
+    fn fixture_body() -> String {
+        serde_json::to_string(&fixture()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn pricing_cache_ttl_stale_backoff_and_disk_cold_start() {
+        let mut server = mockito::Server::new_async().await;
+        let url = format!("{}/api.json", server.url());
+        let dir = std::env::temp_dir().join(format!("sg-pricing-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let disk = dir.join("pricing.json");
+        let _ = std::fs::remove_file(&disk);
+
+        let ttl = Duration::from_millis(120);
+        // 余量放宽 (重负载 CI 的 assert_async 网络往返可能吃掉窗口): ttl 120ms /
+        // backoff 500ms, step3→step4 的退避窗口足够容纳一次往返.
+        let backoff = Duration::from_millis(500);
+        let cache =
+            PricingCache::with_backoff(url.clone(), ttl, backoff, disk.clone(), HashMap::new());
+        let http = reqwest::Client::new();
+
+        // 1. 首查询: Loading → fetch 成功 → Ok + 价格可用.
+        let ok_mock = server
+            .mock("GET", "/api.json")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(fixture_body())
+            .expect(1)
+            .create_async()
+            .await;
+        let (t, s) = cache.table(&http).await;
+        assert_eq!(s, PricingStatus::Ok);
+        assert!(t.price_for("claude-opus-5", None).is_some());
+        ok_mock.assert_async().await;
+
+        // 2. TTL 内: 不再 fetch, 仍 Ok.
+        let (_, s2) = cache.table(&http).await;
+        assert_eq!(s2, PricingStatus::Ok);
+
+        // 3. TTL 过期 + 上游 500 → serve-stale (旧表保留, 状态 Stale).
+        tokio::time::sleep(ttl + Duration::from_millis(30)).await;
+        let err_mock = server
+            .mock("GET", "/api.json")
+            .with_status(500)
+            .expect(1)
+            .create_async()
+            .await;
+        let (t3, s3) = cache.table(&http).await;
+        assert_eq!(s3, PricingStatus::Stale, "serve-stale-on-error");
+        assert!(
+            t3.price_for("claude-opus-5", None).is_some(),
+            "stale table still usable"
+        );
+        err_mock.assert_async().await;
+
+        // 4. 退避窗口内: 不重试 (无新请求), 状态仍 Stale.
+        let (_, s4) = cache.table(&http).await;
+        assert_eq!(s4, PricingStatus::Stale);
+        // (无 mock expect=0 断言手段下的近似: 上一个 err_mock expect(1) 已 assert,
+        //  若此处重试会命中默认 404 → 状态仍 Stale 但多一次请求 — 用计数器 mock 兜底)
+        let probe = server
+            .mock("GET", "/api.json")
+            .with_status(200)
+            .with_body(fixture_body())
+            .expect(0) // 退避窗口内绝不应被请求
+            .create_async()
+            .await;
+        let _ = cache.table(&http).await;
+        probe.assert_async().await;
+
+        // 5. 退避窗口过后 + 上游恢复 → 重新 Ok.
+        tokio::time::sleep(backoff + Duration::from_millis(80)).await;
+        let ok2 = server
+            .mock("GET", "/api.json")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(fixture_body())
+            .expect(1)
+            .create_async()
+            .await;
+        let (_, s5) = cache.table(&http).await;
+        assert_eq!(s5, PricingStatus::Ok);
+        ok2.assert_async().await;
+
+        // 6. 盘冷启动: 上游 dead URL + 同一 disk path → 读盘兜底, 状态 Stale.
+        let cache2 = PricingCache::with_backoff(
+            "http://127.0.0.1:1/dead.json".to_string(),
+            ttl,
+            backoff,
+            disk.clone(),
+            HashMap::new(),
+        );
+        let (t6, s6) = cache2.table(&http).await;
+        assert_eq!(s6, PricingStatus::Stale, "disk cold-start serves stale");
+        assert!(t6.price_for("claude-opus-5", None).is_some());
+
+        let _ = std::fs::remove_file(&disk);
     }
 }

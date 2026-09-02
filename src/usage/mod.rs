@@ -29,15 +29,19 @@
 //!
 //! # 依赖方向
 //!
-//! 域 B 派生链成员; 仅依赖基础层类型 (codec::ir::IrUsage / secrets::SecretEntry
-//! 纯数据 + chrono/serde), 不依赖 dag / proxy / web (被 state 聚合, 组合根先例同
-//! `state.api_keys` / `state.model_lists`).
+//! 域 B 派生链成员; 仅依赖基础层类型 (codec::ir::IrUsage / secrets::SecretEntry /
+//! config 的 UsageConfig+PriceOverride 纯数据 schema — usage→config 是向下合法边,
+//! 性质同 provider→config, 非例外), 不依赖 dag / proxy / web (被 state 聚合,
+//! 组合根先例同 `state.api_keys` / `state.model_lists`).
 
 mod pricing;
 mod store;
 pub mod summary;
 
-pub use pricing::{ModelPrice, PricingCache, PricingStatus, PricingTable, extract_host};
+pub use pricing::{
+    ModelPrice, PricingCache, PricingStatus, PricingTable, extract_host,
+    price_overrides_from_config,
+};
 pub use store::{UsageAgg, UsageStore};
 pub use summary::UsageSummary;
 
@@ -180,13 +184,12 @@ impl UsageCtx {
             return;
         }
         let secrets: &[SecretEntry] = &self.secrets;
-        let (model, _) = match &model_echo {
-            Some(m) => sanitize_model_string(m, secrets),
-            None => match &self.model_req {
-                Some(m) => sanitize_model_string(m, secrets),
-                None => (String::new(), false),
-            },
-        };
+        // 聚合 model: 回显优先, fallback 请求侧; 空串归一为 None.
+        let model = model_echo
+            .as_deref()
+            .or(self.model_req.as_deref())
+            .map(|m| sanitize_model_string(m, secrets).0)
+            .filter(|m| !m.is_empty());
         let model_req = self
             .model_req
             .as_deref()
@@ -194,7 +197,7 @@ impl UsageCtx {
         let event = UsageEvent {
             ts: self.ts,
             provider: self.provider.to_string(),
-            model: if model.is_empty() { None } else { Some(model) },
+            model,
             model_req,
             proto: self.proto.to_string(),
             method: self.method.to_string(),
@@ -248,18 +251,6 @@ mod tests {
 
     // ─── UsageCtx::record_response (USAGE-5 计入判据 + model 选择) ──────
 
-    /// 构造内存态 store (无文件) 的 ctx helper.
-    fn ctx_with(method: &str, model_req: Option<&str>, secrets: Vec<SecretEntry>) -> UsageCtx {
-        UsageCtx::new(
-            Arc::new(UsageStore::disabled()),
-            Arc::from("test-provider"),
-            model_req.map(String::from),
-            "o",
-            method,
-            Arc::from(secrets.into_boxed_slice()),
-        )
-    }
-
     #[test]
     fn record_response_filters_non_post() {
         let store = Arc::new(UsageStore::disabled());
@@ -281,7 +272,7 @@ mod tests {
 
     #[test]
     fn record_response_prefers_echo_model_and_sanitizes() {
-        let store = Arc::new(UsageStore::for_tests());
+        let store = Arc::new(UsageStore::in_memory());
         let ctx = UsageCtx::new(
             store.clone(),
             Arc::from("p"),
@@ -313,11 +304,5 @@ mod tests {
         assert_eq!(e.usage.as_ref().unwrap().i, 70);
         assert_eq!(e.usage.as_ref().unwrap().cr, 30);
         assert!(e.ok && e.complete);
-    }
-
-    // 防 unused 警告 (helper 在被禁用路径下可能未用).
-    #[allow(dead_code)]
-    fn _ctx_with_used() {
-        let _ = ctx_with("POST", None, vec![]);
     }
 }

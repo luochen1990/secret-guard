@@ -1593,7 +1593,7 @@
             <button type="button" data-days="0">Today</button>
             <button type="button" data-days="7" class="active">7d</button>
             <button type="button" data-days="30">30d</button>
-            <button type="button" data-days="36500">All</button>
+            <button type="button" data-days="400">All</button>
           </div>
           <span id="usage-pricing-status" class="usage-pricing-status"></span>
         </div>
@@ -4050,6 +4050,8 @@
 
     function setUsageDays(days, btn) {
       usageDays = days;
+      // 重置节流: 手动切换必须立即生效 (否则按钮已切换但数据窗口最长滞后 ~5s).
+      usageLastFetch = 0;
       document.querySelectorAll('#usage-range button').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       refreshUsage();

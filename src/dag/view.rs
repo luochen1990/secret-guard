@@ -96,8 +96,10 @@ pub(super) fn node_view(inner: &DagInner, node_id: Uuid) -> Option<NodeView> {
 /// 微秒级; 语义 = "本次进程内该会话已渲染轮次的累计" (restart 归零 / 淘汰缩水,
 /// 与 Usage 页持久账本口径不同, 前端脚注说明).
 pub(super) fn session_view(inner: &DagInner, sid: SessionId, s: &Session) -> Option<SessionView> {
-    let leaf = inner.nodes.get(&s.leaf_id)?;
-    let resp = leaf.response.read();
+    // usage 折叠**先于** leaf 的 response 读锁执行: 循环首轮会再次读 leaf 的同一把
+    // 锁, 若与外层持有嵌套, parking_lot RwLock 在有 writer 排队时递归读锁会死锁
+    // (read-me-maybe 语义, 2026-09 简化走查发现). 循环内逐节点短持锁, 循环外再取
+    // leaf 锁读 status/error — 两次**顺序**获取, 无嵌套.
     let mut usage_total = UsageView::default();
     {
         // 沿 parent 链折叠 usage (leaf → root; ROB: 节点缺失即止, 不 panic).
@@ -112,6 +114,8 @@ pub(super) fn session_view(inner: &DagInner, sid: SessionId, s: &Session) -> Opt
             cursor = node.parent;
         }
     }
+    let leaf = inner.nodes.get(&s.leaf_id)?;
+    let resp = leaf.response.read();
     Some(SessionView {
         session_id: sid,
         leaf_id: s.leaf_id,

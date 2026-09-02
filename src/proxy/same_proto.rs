@@ -55,6 +55,7 @@ pub(crate) async fn same_proto_forward(
     // egress IR 的 model 字段上, 强制走 IR 路径 (FWD-1 修订的契约代价).
     if secrets_snapshot.is_empty() && model_rewrite.is_none() {
         // 字节透传: 不进入 codec, 不做 redact. 这是最热路径 (多数 provider 无 secret).
+        // secrets_snapshot 此分支前提即为空, 传空.
         return same_proto_passthrough(
             state,
             fp,
@@ -64,6 +65,7 @@ pub(crate) async fn same_proto_forward(
             provider,
             upstream_id,
             started,
+            &[],
         )
         .await;
     }
@@ -83,6 +85,8 @@ pub(crate) async fn same_proto_forward(
             upstream_id,
             ingress.name()
         );
+        // 降级透传, 但 secrets_snapshot 必须传入 — UsageCtx 的 SEC model 扫描
+        // (USAGE-6) 恰防 "fail_open passthrough 把 secret 持久化进 JSONL".
         return same_proto_passthrough(
             state,
             fp,
@@ -92,6 +96,7 @@ pub(crate) async fn same_proto_forward(
             provider,
             upstream_id,
             started,
+            &secrets_snapshot,
         )
         .await;
     };
@@ -196,17 +201,16 @@ pub(crate) async fn same_proto_forward(
         Some(&secrets_snapshot),
         redactions,
     );
-    // usage-stats 采集上下文 (in-scope 元数据, 响应完成点落账; event 被 push 消耗
-    // 前捕获 model_req — CallEvent.model 是请求侧 model 的 SSOT).
+    // usage-stats 采集上下文 (in-scope 元数据, 响应完成点落账; helpers::usage_ctx SSOT).
     let model_req = event.model.as_ref().map(|m| m.to_string());
     let record_id = state.dag.push_messages(real_messages, event);
-    let usage_ctx = crate::usage::UsageCtx::new(
-        state.usage.clone(),
-        std::sync::Arc::from(upstream_id),
+    let usage_ctx = super::helpers::usage_ctx(
+        &state,
+        &fp,
+        &parts.method,
+        upstream_id,
         model_req,
-        fp.proto.clone(),
-        parts.method.as_str(),
-        std::sync::Arc::from(secrets_snapshot.into_boxed_slice()),
+        &secrets_snapshot,
     );
 
     debug!(%record_id, method = %parts.method, url = %upstream_url, "forwarding redacted same-proto request");
@@ -324,6 +328,7 @@ async fn same_proto_passthrough(
     provider: DirectProvider,
     upstream_id: &str,
     started: Instant,
+    secrets_snapshot: &[crate::secrets::SecretEntry],
 ) -> Result<Response<Body>, AppError> {
     let req_text_for_record = utf8_view(&req_bytes);
     let query = parts
@@ -362,17 +367,18 @@ async fn same_proto_passthrough(
         None,
         vec![],
     );
-    // usage-stats 采集上下文 (passthrough 路径: secrets 空 — 此路径的前提条件,
-    // SEC 扫描自然为空扫描).
+    // usage-stats 采集上下文. secrets_snapshot: 入口 1 (无 secret) 为空;
+    // 入口 2 (secrets 非空但无 codec 降级透传) 为全量快照 — USAGE-6 的 SEC 扫描
+    // 恰防后者的 model 字符串泄漏 (见 same_proto_forward 降级分支注释).
     let model_req = event.model.as_ref().map(|m| m.to_string());
     let record_id = state.dag.push_messages(vec![], event);
-    let usage_ctx = crate::usage::UsageCtx::new(
-        state.usage.clone(),
-        std::sync::Arc::from(upstream_id),
+    let usage_ctx = super::helpers::usage_ctx(
+        &state,
+        &fp,
+        &parts.method,
+        upstream_id,
         model_req,
-        fp.proto.clone(),
-        parts.method.as_str(),
-        std::sync::Arc::from(Vec::new().into_boxed_slice()),
+        secrets_snapshot,
     );
 
     debug!(%record_id, method = %parts.method, url = %upstream_url, "forwarding (passthrough)");

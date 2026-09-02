@@ -254,6 +254,29 @@ fn is_sensitive_header(name: &str) -> bool {
         || name.contains("secret")
 }
 
+// ─── usage-stats 采集上下文构造 (三转发路径共享) ─────────────────────────────
+
+/// 构造 [`crate::usage::UsageCtx`] (same_proto×2 / cross_proto 共享, SSOT —
+/// 未来新增转发路径不会漏带 SEC 扫描快照). `model_req` 在 push_messages 消耗
+/// event 前捕获 (CallEvent.model 是请求侧 model 的 SSOT).
+pub(super) fn usage_ctx(
+    state: &crate::state::AppState,
+    fp: &super::ForwardPath,
+    method: &axum::http::Method,
+    upstream_id: &str,
+    model_req: Option<String>,
+    secrets: &[crate::secrets::SecretEntry],
+) -> crate::usage::UsageCtx {
+    crate::usage::UsageCtx::new(
+        state.usage.clone(),
+        std::sync::Arc::from(upstream_id),
+        model_req,
+        fp.proto.clone(),
+        method.as_str(),
+        std::sync::Arc::from(secrets.to_vec().into_boxed_slice()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
