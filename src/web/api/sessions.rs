@@ -224,6 +224,7 @@ mod tests {
                 latest_error: Some(format!("err-{err_marker}")),
                 redactions: std::sync::Arc::from([(String::from("mock-x"), String::from("sid"))]),
                 path: format!("/o/{path_marker}/v1/chat"),
+                usage_total: Default::default(),
             };
             let json = serde_json::to_string(&summary).expect("serialize SessionSummary");
             prop_assert!(

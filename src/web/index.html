@@ -1192,6 +1192,14 @@
       margin-top: 4px;
     }
     .tl-round-header .tl-meta { display: flex; gap: 8px; align-items: center; }
+    /* usage 徽章 (usage-stats): 每轮 / 每会话的 token 用量, 紧凑数字 + muted 色.
+       hover title 展开 cache 细分. */
+    .usage-badge {
+      color: var(--fg-faint);
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+    .usage-badge b { font-weight: 500; color: var(--fg-muted); }
     /* 每轮操作按钮 (info / raw) — ghost, hover = accent 微染. */
     .tl-round-header .tl-actions { display: flex; gap: 2px; }
     .tl-round-header .tl-actions button {
@@ -2054,12 +2062,14 @@
           `status: ${sessionStatusText(s)}`,
           `latest: ${formatTime(s.latest_at)}`,
           `started: ${formatTime(s.created_at)}`,
-        ].join('\n');
+          s.usage_total ? `tokens (this process): ↑${s.usage_total.input} ↓${s.usage_total.output} (cache r:${s.usage_total.cache_read} w:${s.usage_total.cache_write})` : '',
+        ].filter(Boolean).join('\n');
         return `
           <div class="session-item ${isActive ? 'active' : ''} ${isExpanded ? 'expanded' : ''}" data-sid="${escapeHtml(s.session_id)}" title="${escapeHtml(title)}">
             <span class="ri-icon">${iconHtml}<span class="caret"></span></span>
             <span class="ri-line1" title="${escapeHtml(preview)}">${escapeHtml(preview)}</span>
             <span class="ri-right">
+              ${usageBadgeHtml(s.usage_total, 'Σ')}
               ${countBadge}
               <span class="${statusCls}" title="${status}">${status}</span>
               ${hitBadge}
@@ -3072,6 +3082,34 @@
       return `<span class="meta" title="actual upstream provider (router-resolved chain tail)">via ${escapeHtml(r.upstream_id)}</span>`;
     }
 
+    // ─── usage-stats 徽章 (usage-stats 设计 M1) ────────────────────────────
+    //
+    // 数据源: 后端 TimelineRound.usage / SessionView.usage_total (上游回显的
+    // token 用量, 四维 input/output/cache_read/cache_write). 无回显时字段缺席,
+    // 徽章不渲染 (缺失显式 — 不显示误导性的 0).
+
+    /** token 数的紧凑格式: 950 → "950", 1234 → "1.2k", 1.2M → "1.2M". */
+    function fmtTokens(n) {
+      if (n >= 1_000_000) return (n / 1_000_000).toFixed(1).replace(/\.0$/, '') + 'M';
+      if (n >= 1000) return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'k';
+      return String(n);
+    }
+
+    /** 四维用量的 hover title 文本 (cache 细分展开). */
+    function usageTitle(u) {
+      return `tokens — in: ${u.input}  out: ${u.output}  cache read: ${u.cache_read}  cache write: ${u.cache_write}`;
+    }
+
+    /**
+     * 每轮 / 每会话的 usage 徽章 HTML. u 为 null/undefined (无回显) 或全零 → ''
+     * (全零也隐藏: 无信息量, 避免 sidebar 噪音).
+     */
+    function usageBadgeHtml(u, prefix) {
+      if (!u || (u.input | u.output | u.cache_read | u.cache_write) === 0) return '';
+      const p = prefix || '';
+      return `<span class="usage-badge" title="${usageTitle(u)}">${p}<b>↑${fmtTokens(u.input)}</b> ↓${fmtTokens(u.output)}</span>`;
+    }
+
     function renderTimelineRound(r, idx, pathId) {
       const num = idx + 1;
       // 选中态用 .selected (持续高亮); 闪烁动画 .flash 由 highlightRound() 在选中瞬间叠加.
@@ -3083,6 +3121,7 @@
         <span class="tl-meta">
           <span>#${num}</span>
           <span>${escapeHtml(formatTime(r.created_at))}</span>
+          ${usageBadgeHtml(r.usage)}
           <span data-hdr="status"></span>
           <span class="meta" data-hdr="elapsed"></span>
           <span data-hdr="streamed"></span>

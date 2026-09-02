@@ -95,6 +95,13 @@ fn build_round_briefs(inner: &DagInner, chain: &[Uuid]) -> Vec<RoundBrief> {
 /// 路径永不 panic, 即便理论不变式被未来 bug 打破也只少一条 round, 不 500.
 fn build_timeline_round(inner: &DagInner, node_id: Uuid) -> Option<TimelineRound> {
     let node = inner.nodes.get(&node_id)?;
+    // usage 徽章数据 (usage-stats): 上游回显的 token 用量, None = 无回显.
+    let usage = node
+        .response
+        .read()
+        .as_ref()
+        .and_then(|r| r.usage.as_ref())
+        .map(crate::dto::UsageView::from_ir);
     Some(TimelineRound {
         id: node.id,
         round_role: node.event.round_role,
@@ -105,6 +112,7 @@ fn build_timeline_round(inner: &DagInner, node_id: Uuid) -> Option<TimelineRound
         upstream_id: std::sync::Arc::clone(&node.event.upstream_id),
         redactions: std::sync::Arc::clone(&node.event.redactions),
         req_delta_messages: crate::derive::extract_delta_messages_from_raw(node),
+        usage,
     })
 }
 

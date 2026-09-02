@@ -35,8 +35,41 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::codec::ir::IrRole;
+use crate::codec::ir::{IrRole, IrUsage};
 use crate::dag::{RoundKind, SessionId};
+
+/// token 用量的 wire 视图 (usage-stats, docs/design/usage-stats.md).
+///
+/// 四维与 [`IrUsage`] 一致; cache 两维的 `None` (上游未上报该维度) 按
+/// `unwrap_or(0)` 归一 (USAGE-2 相等断言按此语义表述). 纯数字, 天然无 secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+pub struct UsageView {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+}
+
+impl UsageView {
+    pub fn from_ir(u: &IrUsage) -> Self {
+        Self {
+            input: u.input_tokens,
+            output: u.output_tokens,
+            cache_read: u.cache_read_input_tokens.unwrap_or(0),
+            cache_write: u.cache_creation_input_tokens.unwrap_or(0),
+        }
+    }
+
+    /// 饱和加 (session 总量折叠用).
+    pub fn saturating_add(self, other: Self) -> Self {
+        Self {
+            input: self.input.saturating_add(other.input),
+            output: self.output.saturating_add(other.output),
+            cache_read: self.cache_read.saturating_add(other.cache_read),
+            cache_write: self.cache_write.saturating_add(other.cache_write),
+        }
+    }
+}
 
 /// 会话视图 (sidebar 一级树).
 #[derive(Debug, Clone, serde::Serialize)]
@@ -70,6 +103,9 @@ pub struct SessionView {
     /// protocol 角标 + provider id. 取最近一轮的 provider, 跨 provider 重试场景下
     /// 可能不代表整条会话的 provider.
     pub path: String,
+    /// 会话累计用量 (进程内口径: 沿链折叠各轮 ResponseData.usage, usage-stats §6 —
+    /// restart 归零 / 轮次被 FIFO 淘汰后缩水, 与 Usage 页的持久账本口径不同).
+    pub usage_total: UsageView,
 }
 
 /// Node 的轻量只读视图 (供 list / 元数据查询).
@@ -190,6 +226,10 @@ pub struct TimelineRound {
     /// 前端按 role 渲染气泡 (system/user/tool), 与末轮 response 抽屉互补.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub req_delta_messages: Vec<serde_json::Value>,
+    /// 本轮上游回显的 token 用量 (round 头部徽章, usage-stats). `None` = 无回显
+    /// (非 2xx / parse 失败 / OpenAI 流式未开 include_usage / 无 codec 协议).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<UsageView>,
 }
 
 /// timeline 抽屉 (视图级, 当前末轮的 response 内容).

@@ -23,7 +23,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::codec::ir::IrMessage;
-use crate::dto::{NodeDetail, NodeView, SessionView};
+use crate::dto::{NodeDetail, NodeView, SessionView, UsageView};
 
 use super::types::Session;
 use super::{ConversationDag, DagInner, SessionId};
@@ -90,9 +90,28 @@ pub(super) fn node_view(inner: &DagInner, node_id: Uuid) -> Option<NodeView> {
 
 /// 构造一个 SessionView (从 sessions map 中的 Session 派生).
 /// 不走 parent 链 — node_count / root_id / title 在 push 时增量维护.
+///
+/// 例外: `usage_total` 沿链折叠各轮 `ResponseData.usage` (usage-stats §6).
+/// O(chain) 但仅在 3s 轮询路径执行一次, 且总和 ≤ 全部 nodes 数 (FIFO cap 内),
+/// 微秒级; 语义 = "本次进程内该会话已渲染轮次的累计" (restart 归零 / 淘汰缩水,
+/// 与 Usage 页持久账本口径不同, 前端脚注说明).
 pub(super) fn session_view(inner: &DagInner, sid: SessionId, s: &Session) -> Option<SessionView> {
     let leaf = inner.nodes.get(&s.leaf_id)?;
     let resp = leaf.response.read();
+    let mut usage_total = UsageView::default();
+    {
+        // 沿 parent 链折叠 usage (leaf → root; ROB: 节点缺失即止, 不 panic).
+        let mut cursor = Some(s.leaf_id);
+        while let Some(id) = cursor {
+            let Some(node) = inner.nodes.get(&id) else {
+                break;
+            };
+            if let Some(u) = node.response.read().as_ref().and_then(|r| r.usage.as_ref()) {
+                usage_total = usage_total.saturating_add(UsageView::from_ir(u));
+            }
+            cursor = node.parent;
+        }
+    }
     Some(SessionView {
         session_id: sid,
         leaf_id: s.leaf_id,
@@ -108,6 +127,7 @@ pub(super) fn session_view(inner: &DagInner, sid: SessionId, s: &Session) -> Opt
         latest_error: resp.as_ref().and_then(|r| r.error.clone()),
         redactions: Arc::clone(&leaf.event.redactions),
         path: leaf.event.path.clone(),
+        usage_total,
     })
 }
 
