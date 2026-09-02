@@ -298,6 +298,8 @@ pub(crate) async fn cross_proto_forward(
     let ingress_writer = ingress_codec.writer();
     // parsed view: 记录 LLM 视角的 IR (restore 之前, 含 mock). 仅 2xx 成功响应.
     let mut resp_parsed_for_record: Option<serde_json::Value> = None;
+    // usage-stats 回显摘要 (restore 前提取, 语义同 fan_out_buffered_ir).
+    let mut resp_echo = super::recorder::ResponseEcho::default();
     let (resp_status_out, resp_body_out): (StatusCode, Vec<u8>) = if resp_status.is_success() {
         match serde_json::from_slice::<serde_json::Value>(&resp_bytes) {
             Ok(v) => match egress_reader.read_response(&v) {
@@ -310,6 +312,7 @@ pub(crate) async fn cross_proto_forward(
                         resp_status.is_success(),
                     );
                     // record 存 LLM 视角 (restore 之前, 含 mock) 的 parsed view.
+                    resp_echo = super::recorder::ResponseEcho::from_ir(&ir_resp);
                     resp_parsed_for_record = Some(ingress_writer.write_response(&ir_resp));
                     // restore: mock → real (跨协议 + redact 时, 客户端看到的应该是真 secret).
                     crate::redact::restore_ir_response(&mut ir_resp, &redaction_map);
@@ -368,6 +371,8 @@ pub(crate) async fn cross_proto_forward(
             elapsed_ms: elapsed,
             streamed: false,
             resp_complete: true,
+            usage: resp_echo.usage,
+            model: resp_echo.model,
             ..Default::default()
         },
     );

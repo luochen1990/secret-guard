@@ -312,6 +312,14 @@ pub struct IrResponse {
     pub stop_sequence: Option<String>,
     /// token 用量统计.
     pub usage: IrUsage,
+    /// wire 形态元数据: 上游响应是否**显式携带** usage 对象 (usage-stats 采集用).
+    ///
+    /// 区分 "无回显" (`false`, 如 OpenAI 流式未开 `include_usage` / 非 2xx /
+    /// parse 失败) 与 "显式零回显" (`true` + 全零, wire 有 `"usage": {全零}`) —
+    /// 用量统计的 P-3 原则 (缺失显式) 依赖此位. reader 在 wire 观测到 usage 对象时
+    /// 置 true; 流式侧由 StreamScan 在任一 usage 承载事件到达时置 true.
+    /// 不参与 wire 序列化 (writer 忽略; 与 content_form 等元数据同模式).
+    pub usage_present: bool,
     /// 上游实际服务的模型名 (响应里携带).
     pub model: Option<String>,
     /// 响应 id (OpenAI `chatcmpl-...`; Anthropic `msg_...`).
@@ -426,10 +434,16 @@ pub enum IrStreamEvent {
     /// 内容块结束.
     BlockStop { index: usize },
     /// 流终止前的元数据 (stop_reason + 最终 usage).
+    ///
+    /// `usage_present`: wire 是否显式携带 usage 对象 (与 [`IrResponse::usage_present`]
+    /// 同语义的流式事件版; reader 产出端设置, writer 忽略). 区分 "message_delta 无
+    /// usage 字段" 与 "usage 对象为全零" — StreamScan 据此精确累积 presence
+    /// (STR-2: scan ≡ 非流式 parse 的等价性要求).
     MessageDelta {
         stop_reason: Option<IrStopReason>,
         stop_sequence: Option<String>,
         usage: IrUsage,
+        usage_present: bool,
     },
     /// 流终止.
     MessageStop,

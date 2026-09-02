@@ -249,7 +249,14 @@ pub struct ResponseData {
     /// response 的 assistant message (LLM 原始返回, 含 mock, **未 restore**).
     /// 通常是一条 IrMessage (role=assistant), 但错误响应时可能为空.
     pub message: Option<MessageRef>,
-    pub usage: IrUsage,
+    /// 上游回显的 token 用量 (usage-stats 采集, docs/design/usage-stats.md §5).
+    ///
+    /// `Some` ⇔ `IrResponse.usage_present` (wire 显式携带 usage 对象 — 区分
+    /// "无回显" 与 "显式零回显", P-3 缺失显式原则). 流式侧 = StreamScan 曾观测到
+    /// usage 承载事件 (中断流的已累积部分值, 配合 `resp_complete=false` 语义).
+    /// `None` = 无回显 (非 2xx / parse 失败 / OpenAI 流式未开 include_usage /
+    /// 无 codec 协议) — 请求数仍进统计, token 不进 (USAGE-4).
+    pub usage: Option<IrUsage>,
     pub stop_reason: Option<IrStopReason>,
     pub stop_sequence: Option<String>,
     pub id: Option<String>,

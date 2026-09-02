@@ -43,7 +43,7 @@ use super::helpers::{build_response_headers, redact_headers, utf8_view};
 use super::recorder::assert_resp_parsed_matches_source_nonstream;
 use super::recorder::{
     ERR_CLIENT_DISCONNECTED, ERR_RESP_CAP_EXCEEDED, ERR_STREAM_IDLE_TIMEOUT, ParsedSync,
-    RecordAccumulator, next_chunk,
+    RecordAccumulator, ResponseEcho, next_chunk,
 };
 
 // ─── 流式 chunk 变换策略 (两条流式路径的差异点) ─────────────────────────────
@@ -114,7 +114,8 @@ struct FanoutStreamCtx {
 ///
 /// 差异 (闭包注入):
 /// - `pipe`: chunk 变换 (透传 / restore).
-/// - `finalize_parsed`: 最终 parsed view (流式 ParsedSync 快照 / 非流式一次性 parse).
+/// - `finalize_parsed`: 最终 parsed view + 回显摘要 (流式 ParsedSync 快照 /
+///   非流式一次性 parse). 回显摘要喂 ResponseData.usage/model (usage-stats).
 /// - `finalize_body`: record 的 raw_resp_body (banner / 空 / utf8_view 策略).
 async fn fanout_stream_task(
     ctx: FanoutStreamCtx,
@@ -122,7 +123,7 @@ async fn fanout_stream_task(
     tx: mpsc::Sender<Result<Bytes, std::io::Error>>,
     parsed_sync: Option<ParsedSync>,
     mut pipe: impl ChunkPipeline + Send + 'static,
-    finalize_parsed: impl FnOnce(Option<ParsedSync>, &RecordAccumulator) -> Option<serde_json::Value>
+    finalize_parsed: impl FnOnce(Option<ParsedSync>, &RecordAccumulator) -> (Option<serde_json::Value>, ResponseEcho)
     + Send
     + 'static,
     finalize_body: impl FnOnce(&RecordAccumulator) -> String + Send + 'static,
@@ -177,7 +178,7 @@ async fn fanout_stream_task(
     }
 
     let elapsed = started.elapsed().as_millis() as u64;
-    let final_parsed = finalize_parsed(parsed_sync, &recorder);
+    let (final_parsed, echo) = finalize_parsed(parsed_sync, &recorder);
     let body = finalize_body(&recorder);
     dag.attach_response(
         record_id,
@@ -190,6 +191,8 @@ async fn fanout_stream_task(
             streamed,
             resp_complete: recorder.complete(),
             error: recorder.error_kind,
+            usage: echo.usage,
+            model: echo.model,
             ..Default::default()
         },
     );
@@ -244,26 +247,39 @@ pub(crate) async fn fan_out_streaming(
         move |parsed_sync, recorder| {
             // 最终 parsed: 流式用 ParsedSync 快照; 非流式一次性 codec parse.
             if streamed {
-                parsed_sync.map(|ps| ps.finalize())
+                match parsed_sync {
+                    Some(ps) => {
+                        let (v, echo) = ps.finalize();
+                        (Some(v), echo)
+                    }
+                    // 无 ParsedSync = 无 codec 协议 (Gemini/Ollama): 无回显可提取.
+                    None => (None, ResponseEcho::default()),
+                }
             } else if let Some(cp) = codec_proto {
                 let reader = cp.reader();
                 let writer = cp.writer();
-                let parsed = serde_json::from_slice::<serde_json::Value>(&recorder.acc)
+                let parsed_ir = serde_json::from_slice::<serde_json::Value>(&recorder.acc)
                     .ok()
-                    .and_then(|v| reader.read_response(&v).ok())
-                    .map(|ir| writer.write_response(&ir));
+                    .and_then(|v| reader.read_response(&v).ok());
                 // 视图正确性守卫 (同协议 fan_out 路径): parsed 派生与 SSOT 在同一作用域内,
                 // 派生源 drift 风险低; 此处主要抽查 codec writer→reader 的 model 字段对称性
                 // (reader/writer 来自同一 codec, 守卫等价于 codec 内部 round-trip 测试的运行时抽查).
+                let (parsed, echo) = match parsed_ir {
+                    Some(ir) => {
+                        let echo = ResponseEcho::from_ir(&ir);
+                        (Some(writer.write_response(&ir)), echo)
+                    }
+                    None => (None, ResponseEcho::default()),
+                };
                 #[cfg(feature = "consistency-check")]
                 assert_resp_parsed_matches_source_nonstream(
                     parsed.as_ref(),
                     &recorder.acc,
                     reader.as_ref(),
                 );
-                parsed
+                (parsed, echo)
             } else {
-                None
+                (None, ResponseEcho::default())
             }
         },
         move |recorder| {
@@ -342,6 +358,9 @@ pub(crate) async fn fan_out_buffered_ir(
     let reader = codec_proto.reader();
     let writer = codec_proto.writer();
     let mut resp_parsed_for_record: Option<serde_json::Value> = None;
+    // usage-stats 回显摘要: parse 成功时从 IrResponse 提取 (restore 只改字符串叶子,
+    // 不触碰 usage 数字, 但在 restore 前提取保持 "LLM 原始回显" 语义清晰).
+    let mut resp_echo = ResponseEcho::default();
     // #158: parse 失败 fallback 时, 若本请求做过 redact (map 非空), body 中的 mock
     // 不会被 restore — 客户端拿到假 secret. 记一条 WARN 让该逃逸可感知
     // (行为不变: 仍原样透传, best-effort 原则).
@@ -370,6 +389,7 @@ pub(crate) async fn fan_out_buffered_ir(
                         resp_status.is_success(),
                     );
                     // record 存 LLM 视角 (restore 之前, 含 mock).
+                    resp_echo = ResponseEcho::from_ir(&ir);
                     resp_parsed_for_record = Some(writer.write_response(&ir));
                     crate::redact::restore_ir_response(&mut ir, &redaction_map);
                     let restored = writer.write_response(&ir);
@@ -430,6 +450,8 @@ pub(crate) async fn fan_out_buffered_ir(
             streamed,
             resp_complete: recorder.complete(),
             error: recorder.error_kind,
+            usage: resp_echo.usage,
+            model: resp_echo.model,
             ..Default::default()
         },
     );
@@ -488,10 +510,13 @@ pub(crate) async fn fan_out_streaming_with_restore(
         Some(parsed_sync),
         RestorePipe { translate },
         move |parsed_sync, _recorder| {
-            // 最终 parsed 快照. 即使 error_kind (client disconnect / upstream error),
-            // 也保留截至断流时的累积内容 — 用户能看到部分响应比看到空白更有价值.
-            // (overflow 时同理: 截至 Overflow 前的内容比 truncate banner 更有用.)
-            Some(parsed_sync.expect("restore 路径恒有 ParsedSync").finalize())
+            // 最终 parsed 快照 + 回显摘要. 即使 error_kind (client disconnect /
+            // upstream error), 也保留截至断流时的累积内容 — 用户能看到部分响应比
+            // 看到空白更有价值. (overflow 时同理: 截至 Overflow 前的内容比 truncate
+            // banner 更有用.)
+            let ps = parsed_sync.expect("restore 路径恒有 ParsedSync");
+            let (v, echo) = ps.finalize();
+            (Some(v), echo)
         },
         move |recorder| {
             if recorder.overflow {

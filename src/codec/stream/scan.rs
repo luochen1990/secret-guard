@@ -55,6 +55,12 @@ struct IrResponseMeta {
     id: Option<String>,
     created: Option<u64>,
     usage: crate::codec::IrUsage,
+    /// 是否观测到过 usage 承载事件 (IrResponse.usage_present 的流式来源).
+    ///
+    /// 语义: MessageStart 携带 `usage: Some(_)` (Anthropic message_start), 或
+    /// MessageDelta 的 `usage_present` 位为真 (wire 显式携带 usage 对象, 含全零).
+    /// 与非流式 reader 的 presence 判定精确一致 (STR-2: scan ≡ 非流式 parse).
+    usage_seen: bool,
     stop_reason: Option<crate::codec::IrStopReason>,
     stop_sequence: Option<String>,
 }
@@ -107,6 +113,7 @@ impl StreamScan {
                 usage,
             } => {
                 if let Some(u) = usage {
+                    self.meta.usage_seen = true;
                     self.meta.usage.input_tokens = u.input_tokens;
                     self.meta.usage.cache_creation_input_tokens = u.cache_creation_input_tokens;
                     self.meta.usage.cache_read_input_tokens = u.cache_read_input_tokens;
@@ -138,12 +145,16 @@ impl StreamScan {
                 stop_reason,
                 stop_sequence,
                 usage,
+                usage_present,
             } => {
                 if let Some(sr) = stop_reason {
                     self.meta.stop_reason = Some(*sr);
                 }
                 if let Some(ss) = stop_sequence {
                     self.meta.stop_sequence = Some(ss.clone());
+                }
+                if *usage_present {
+                    self.meta.usage_seen = true;
                 }
                 if usage.output_tokens > 0 {
                     self.meta.usage.output_tokens = usage.output_tokens;
@@ -183,6 +194,7 @@ impl StreamScan {
             stop_reason: self.meta.stop_reason,
             stop_sequence: self.meta.stop_sequence.clone(),
             usage: self.meta.usage.clone(),
+            usage_present: self.meta.usage_seen,
             model: self.meta.model.clone(),
             id: self.meta.id.clone(),
             created: self.meta.created,

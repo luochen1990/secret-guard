@@ -199,13 +199,15 @@ impl Reader for ResponsesReader {
         let usage = obj
             .get("usage")
             .filter(|v| v.is_object())
-            .map(read_usage)
-            .unwrap_or_default();
+            .map(read_usage);
+        let usage_present = usage.is_some();
+        let usage = usage.unwrap_or_default();
         Ok(IrResponse {
             content: blocks,
             stop_reason,
             stop_sequence: None,
             usage,
+            usage_present,
             model,
             id,
             created,
@@ -957,6 +959,24 @@ mod tests {
 
     // ─── read_request: 基础映射 ──────────────────────────────────────────
 
+
+    // ─── usage_present (USAGE-2: presence 语义, usage-stats 采集) ─────────
+    //
+
+    #[test]
+    fn read_response_usage_present_semantics() {
+        // 显式全零 usage → present; 缺席 → absent.
+        let present = reader().read_response(&json!({
+            "id": "resp_1", "model": "gpt-4o", "status": "completed",
+            "output": [], "usage": {"input_tokens": 0, "output_tokens": 0},
+        })).unwrap();
+        assert!(present.usage_present);
+        let absent = reader().read_response(&json!({
+            "id": "resp_1", "model": "gpt-4o", "status": "completed", "output": [],
+        })).unwrap();
+        assert!(!absent.usage_present);
+    }
+
     #[test]
     fn read_request_basic_chat() {
         let body = json!({
@@ -1325,6 +1345,7 @@ mod tests {
                 output_tokens: 5,
                 ..Default::default()
             },
+            usage_present: true,
             model: Some("gpt-4o".into()),
             id: Some("resp_01x".into()),
             created: None,
@@ -1360,6 +1381,7 @@ mod tests {
             ],
             stop_reason: Some(IrStopReason::ToolUse),
             usage: IrUsage::default(),
+            usage_present: false,
             model: Some("gpt-4o".into()),
             id: None,
             created: None,
@@ -1380,6 +1402,7 @@ mod tests {
             content: vec![IrBlock::Text { text: "Hi".into() }],
             stop_reason: Some(IrStopReason::EndTurn),
             usage: IrUsage::default(),
+            usage_present: false,
             model: Some("gpt-4o".into()),
             id: None,
             created: None,

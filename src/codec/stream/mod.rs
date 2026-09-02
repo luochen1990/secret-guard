@@ -1182,6 +1182,8 @@ mod tests {
                             output_tokens: usage_output,
                             ..Default::default()
                         },
+                        // presence = 流中实际出现 usage 帧 (has_usage=false 时整个帧不发).
+                        usage_present: has_usage,
                         model: Some(model),
                         id: Some(id),
                         created: Some(created),

@@ -153,14 +153,16 @@ impl Reader for AnthropicReader {
         let usage = obj
             .get("usage")
             .filter(|v| v.is_object())
-            .map(read_usage)
-            .unwrap_or_default();
+            .map(read_usage);
+        let usage_present = usage.is_some();
+        let usage = usage.unwrap_or_default();
 
         Ok(IrResponse {
             content,
             stop_reason,
             stop_sequence,
             usage,
+            usage_present,
             model,
             id,
             created: None,
@@ -272,15 +274,13 @@ impl Reader for AnthropicReader {
                     .filter(|s| !s.is_empty())
                     .map(String::from);
                 // usage 可能缺失 (message_delta 不带 usage 时不能 ?, 否则会丢失 stop_reason).
-                let usage = data
-                    .get("usage")
-                    .filter(|v| v.is_object())
-                    .map(read_usage)
-                    .unwrap_or_default();
+                let usage_obj = data.get("usage").filter(|v| v.is_object());
+                let usage = usage_obj.map(read_usage).unwrap_or_default();
                 vec![IrStreamEvent::MessageDelta {
                     stop_reason,
                     stop_sequence,
                     usage,
+                    usage_present: usage_obj.is_some(),
                 }]
             }
             "message_stop" => vec![IrStreamEvent::MessageStop],
@@ -532,6 +532,7 @@ impl Writer for AnthropicWriter {
                 stop_reason,
                 stop_sequence,
                 usage,
+                ..
             } => {
                 let mut delta = Map::new();
                 delta.insert(
@@ -990,6 +991,61 @@ mod tests {
 
     // ─── read_tool_choice / read_stop_reason: 纯函数全分支覆盖 ──────────────
 
+
+    // ─── usage_present (USAGE-2: presence 语义, usage-stats 采集) ─────────
+    //
+
+    #[test]
+    fn read_response_usage_present_true_when_usage_object_in_wire() {
+        // 显式全零 usage 对象也是 present (与非流式 OpenAI/Responses 语义一致).
+        let body = json!({
+            "id": "msg_1", "model": "claude-3",
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        });
+        let ir = reader().read_response(&body).unwrap();
+        assert!(ir.usage_present);
+        assert!(ir.usage.is_zero());
+    }
+
+    #[test]
+    fn read_response_usage_present_false_when_usage_absent() {
+        let body = json!({
+            "id": "msg_1", "model": "claude-3",
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn",
+        });
+        let ir = reader().read_response(&body).unwrap();
+        assert!(!ir.usage_present);
+    }
+
+    /// 流式 message_delta: usage 对象缺席 vs 显式全零 → 事件 presence 位区分两者,
+    /// StreamScan 据此精确累积 (STR-2 scan ≡ 非流式 parse).
+    #[test]
+    fn stream_message_delta_usage_presence_distinguishes_absent_and_zero() {
+        let absent = reader().read_response_events(
+            "message_delta",
+            &json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+            &mut crate::codec::ir::StreamDecodeState::default(),
+        );
+        match &absent[..] {
+            [IrStreamEvent::MessageDelta { usage_present, .. }] => assert!(!usage_present),
+            other => panic!("expected single MessageDelta, got: {other:?}"),
+        }
+
+        let zero = reader().read_response_events(
+            "message_delta",
+            &json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},
+                    "usage":{"input_tokens":0,"output_tokens":0}}),
+            &mut crate::codec::ir::StreamDecodeState::default(),
+        );
+        match &zero[..] {
+            [IrStreamEvent::MessageDelta { usage_present, .. }] => assert!(usage_present),
+            other => panic!("expected single MessageDelta, got: {other:?}"),
+        }
+    }
+
     #[test]
     fn read_tool_choice_covers_all_branches() {
         use crate::codec::ir::IrToolChoice;
@@ -1371,6 +1427,7 @@ mod tests {
                 output_tokens: 5,
                 ..Default::default()
             },
+            usage_present: true,
             model: Some("claude".into()),
             id: Some("msg_01x".into()),
             created: None,
@@ -1391,6 +1448,7 @@ mod tests {
             content: vec![IrBlock::Text { text: "Hi".into() }],
             stop_reason: Some(IrStopReason::EndTurn),
             usage: IrUsage::default(),
+            usage_present: false,
             model: Some("claude".into()),
             id: None,
             created: None,

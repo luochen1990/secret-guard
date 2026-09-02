@@ -37,6 +37,42 @@ use crate::redact::{RedactError, RedactionMap, redact_ir_checked};
 /// 太短 → DAG 写锁竞争; 太长 → WebUI 看不到流式进度. 500ms 是 UX 与锁竞争的折中.
 pub(super) const PARSED_SYNC_INTERVAL: Duration = Duration::from_millis(500);
 
+// ─── usage-stats 采集: 响应回显摘要 (M0 收口) ───────────────────────────────
+
+/// 上游响应的回显摘要 (usage + 实际模型名), usage-stats 采集的单一提取入口.
+///
+/// 数据源: 非流式 = `reader.read_response` 的 [`crate::codec::ir::IrResponse`];
+/// 流式 = StreamScan snapshot (经 [`ParsedSync::finalize`] 一并产出). proxy 全部
+/// ResponseData 构造点统一经此结构接线 (单一入口防新增转发路径漏接).
+/// 设计: docs/design/usage-stats.md §5.2.
+pub(crate) struct ResponseEcho {
+    /// 回显的 token 用量. `None` = wire 无回显 (presence 语义见
+    /// `IrResponse::usage_present`); 流式中断时为已累积部分值.
+    pub usage: Option<crate::codec::ir::IrUsage>,
+    /// 上游回显的实际服务模型名 (别名/路由场景比请求侧 model 更准).
+    pub model: Option<String>,
+}
+
+impl Default for ResponseEcho {
+    /// 无回显 (错误路径 / parse 失败 / 无 codec 协议的占位值).
+    fn default() -> Self {
+        Self {
+            usage: None,
+            model: None,
+        }
+    }
+}
+
+impl ResponseEcho {
+    /// 从 IrResponse 提取 (usage_present 位决定 usage 的 Option-ness).
+    pub(crate) fn from_ir(ir: &crate::codec::ir::IrResponse) -> Self {
+        Self {
+            usage: ir.usage_present.then(|| ir.usage.clone()),
+            model: ir.model.clone(),
+        }
+    }
+}
+
 // ─── 跨语言契约字符串 (前端 index.html 依赖, 见 isClientDisconnect) ─────────
 //
 // error_kind 字面量是前后端契约 (前端 index.html::isClientDisconnect 硬编码比较).
@@ -685,9 +721,11 @@ impl ParsedSync {
         }
     }
 
-    /// 流结束时的最终快照.
-    pub(super) fn finalize(self) -> serde_json::Value {
-        self.writer.write_response(&self.scan.snapshot())
+    /// 流结束时的最终快照 (parsed view + 回显摘要, usage-stats 采集一并产出).
+    pub(super) fn finalize(self) -> (serde_json::Value, ResponseEcho) {
+        let ir = self.scan.snapshot();
+        let echo = ResponseEcho::from_ir(&ir);
+        (self.writer.write_response(&ir), echo)
     }
 }
 

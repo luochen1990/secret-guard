@@ -263,14 +263,16 @@ impl Reader for OpenAiReader {
         let usage = obj
             .get("usage")
             .filter(|v| v.is_object())
-            .map(read_usage)
-            .unwrap_or_default();
+            .map(read_usage);
+        let usage_present = usage.is_some();
+        let usage = usage.unwrap_or_default();
 
         Ok(IrResponse {
             content: blocks,
             stop_reason,
             stop_sequence: None, // OpenAI 非流式响应不显式返回 stop_sequence
             usage,
+            usage_present,
             model,
             id,
             created,
@@ -884,6 +886,7 @@ fn read_openai_stream_chunk(data: &Value, state: &mut StreamDecodeState) -> Vec<
                     stop_reason: None,
                     stop_sequence: None,
                     usage: u,
+                    usage_present: true,
                 });
             }
             return events;
@@ -959,6 +962,7 @@ fn read_openai_stream_chunk(data: &Value, state: &mut StreamDecodeState) -> Vec<
             stop_reason: None,
             stop_sequence: None,
             usage: u,
+            usage_present: true,
         });
     }
 
@@ -983,7 +987,8 @@ fn finish_stream(
     events.push(IrStreamEvent::MessageDelta {
         stop_reason: Some(stop_reason),
         stop_sequence: None,
-        usage: usage.unwrap_or_default(),
+        usage: usage.clone().unwrap_or_default(),
+        usage_present: usage.is_some(),
     });
     events.push(IrStreamEvent::MessageStop);
 }
@@ -1516,6 +1521,36 @@ mod tests {
         }
     }
 
+    // ─── usage_present (USAGE-2: presence 语义, usage-stats 采集) ─────────
+    //
+
+    /// 最小合法 OpenAI 响应 body (read_response 的可复用 fixture).
+    fn oai_resp_body_with_extra(extra: &str) -> String {
+        format!(
+            r#"{{"id":"chatcmpl-1","model":"gpt-4o","choices":[{{"index":0,
+                "message":{{"role":"assistant","content":"hi"}},"finish_reason":"stop"}}]{extra}}}"#
+        )
+    }
+
+    #[test]
+    fn read_response_usage_present_true_when_usage_object_in_wire() {
+        // wire 显式携带 usage 对象 (即便全零) → usage_present = true (P-3: 缺失显式).
+        let body: Value = serde_json::from_str(&oai_resp_body_with_extra(
+            r#","usage":{"prompt_tokens":0,"completion_tokens":0}"#,
+        ))
+        .unwrap();
+        let ir = reader().read_response(&body).unwrap();
+        assert!(ir.usage_present, "explicit zero usage object must set presence");
+    }
+
+    #[test]
+    fn read_response_usage_present_false_when_usage_absent() {
+        // wire 无 usage 字段 → usage_present = false (与全零回显区分).
+        let body: Value = serde_json::from_str(&oai_resp_body_with_extra("")).unwrap();
+        let ir = reader().read_response(&body).unwrap();
+        assert!(!ir.usage_present, "absent usage must not set presence");
+    }
+
     #[test]
     fn read_response_cached_tokens_normalization() {
         // OpenAI prompt_tokens 含 cached 总和; reader 应减去 cached.
@@ -1590,6 +1625,7 @@ mod tests {
                 cache_read_input_tokens: Some(30),
                 ..Default::default()
             },
+            usage_present: true,
             model: Some("gpt-4o".into()),
             id: None,
             created: None,
@@ -1979,6 +2015,7 @@ mod tests {
                 output_tokens: 5,
                 ..Default::default()
             },
+            usage_present: true,
         };
         let (_, chunk) = writer()
             .write_response_event(&ev)
@@ -2006,6 +2043,7 @@ mod tests {
                 output_tokens: 3,
                 ..Default::default()
             },
+            usage_present: true,
         };
         let (_, chunk) = writer()
             .write_response_event(&ev)
@@ -2024,6 +2062,7 @@ mod tests {
             stop_reason: None,
             stop_sequence: None,
             usage: IrUsage::default(),
+            usage_present: false,
         };
         assert!(writer().write_response_event(&ev).is_none());
     }
@@ -2346,6 +2385,7 @@ mod tests {
             ],
             stop_reason: Some(IrStopReason::EndTurn),
             usage: IrUsage::default(),
+            usage_present: false,
             model: Some("glm-5.3".into()),
             id: Some("chatcmpl-r1".into()),
             created: Some(1),
