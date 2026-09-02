@@ -51,6 +51,11 @@ pub struct AppState {
     /// 行为依赖), 经 `crate::proxy` re-export 在此聚合 — 组合根先例同
     /// `api_keys` (state 聚合各 feature 模块的 store 类型).
     pub model_lists: Arc<crate::proxy::ModelListCache>,
+    /// 模型用量统计 store (usage-stats, docs/design/usage-stats.md):
+    /// 上游回显 usage 的内存聚合 + JSONL 持久化 (mpsc writer 线程).
+    /// `enabled = false` 时是 no-op store (record 零开销). 纯数据 store,
+    /// 聚合先例同 `api_keys` / `model_lists`.
+    pub usage: Arc<crate::usage::UsageStore>,
 }
 
 // ─── HTTP 层共享常量 ────────────────────────────────────────────────────────

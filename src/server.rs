@@ -132,6 +132,17 @@ pub fn build_router_with_auth(state: AppState, auth_stack: AuthStack) -> Router 
 }
 
 /// 内部: 根据 auth_stack 是否存在, 条件化装配认证 layer.
+/// usage JSONL 的默认路径: 与 static config 同目录, `<stem>.usage.jsonl`
+/// (派生规则同 main.rs 的 default_state_path `<stem>.state.toml` 约定, 设计 §4).
+fn default_usage_jsonl_path(config_path: &std::path::Path) -> std::path::PathBuf {
+    let file_name = config_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("secret-guard.toml");
+    let stem = file_name.strip_suffix(".toml").unwrap_or(file_name);
+    config_path.with_file_name(format!("{stem}.usage.jsonl"))
+}
+
 fn build_router_inner(state: AppState, auth_stack: Option<AuthStack>) -> Router {
     // Forward router: 使用 AppState, 在 merge 前不调用 with_state.
     // 首段 proto 简写 (o/a/g/l/r) 由 dispatch 校验; 顶级保留字 (api/login/logout/oauth2)
@@ -268,6 +279,7 @@ pub async fn serve(
     global_mock_prefix: String,
     on_probe_exhausted: crate::config::OnProbeExhausted,
     upstream_timeouts: crate::config::UpstreamTimeouts,
+    usage_config: crate::config::UsageConfig,
 ) -> anyhow::Result<()> {
     auth_config.validate().map_err(|e| anyhow::anyhow!(e))?;
 
@@ -318,6 +330,10 @@ pub async fn serve(
         on_probe_exhausted,
         upstream_timeouts,
         model_lists: Arc::new(crate::proxy::ModelListCache::new()),
+        usage: Arc::new(crate::usage::UsageStore::open(
+            &usage_config,
+            &default_usage_jsonl_path(&config_path),
+        )),
     };
 
     // 条件化: 启用认证时构造 AuthStack, 否则单用户模式.

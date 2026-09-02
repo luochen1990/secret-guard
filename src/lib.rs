@@ -39,6 +39,7 @@ pub mod redact;
 pub mod secrets;
 pub mod server;
 pub mod state;
+pub mod usage;
 pub mod util;
 pub mod web;
 

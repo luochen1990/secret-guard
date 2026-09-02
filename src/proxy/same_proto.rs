@@ -196,7 +196,18 @@ pub(crate) async fn same_proto_forward(
         Some(&secrets_snapshot),
         redactions,
     );
+    // usage-stats 采集上下文 (in-scope 元数据, 响应完成点落账; event 被 push 消耗
+    // 前捕获 model_req — CallEvent.model 是请求侧 model 的 SSOT).
+    let model_req = event.model.as_ref().map(|m| m.to_string());
     let record_id = state.dag.push_messages(real_messages, event);
+    let usage_ctx = crate::usage::UsageCtx::new(
+        state.usage.clone(),
+        std::sync::Arc::from(upstream_id),
+        model_req,
+        fp.proto.clone(),
+        parts.method.as_str(),
+        std::sync::Arc::from(secrets_snapshot.into_boxed_slice()),
+    );
 
     debug!(%record_id, method = %parts.method, url = %upstream_url, "forwarding redacted same-proto request");
 
@@ -265,6 +276,7 @@ pub(crate) async fn same_proto_forward(
                 codec_proto,
                 redaction_map,
                 state.upstream_timeouts.stream_idle,
+                usage_ctx.clone(),
             )
             .await
         } else {
@@ -279,6 +291,7 @@ pub(crate) async fn same_proto_forward(
                 codec_proto,
                 redaction_map,
                 state.upstream_timeouts.stream_idle,
+                usage_ctx.clone(),
             )
             .await
         }
@@ -293,6 +306,7 @@ pub(crate) async fn same_proto_forward(
             streamed,
             Some(codec_proto),
             state.upstream_timeouts.stream_idle,
+            usage_ctx,
         )
         .await
     }
@@ -348,7 +362,18 @@ async fn same_proto_passthrough(
         None,
         vec![],
     );
+    // usage-stats 采集上下文 (passthrough 路径: secrets 空 — 此路径的前提条件,
+    // SEC 扫描自然为空扫描).
+    let model_req = event.model.as_ref().map(|m| m.to_string());
     let record_id = state.dag.push_messages(vec![], event);
+    let usage_ctx = crate::usage::UsageCtx::new(
+        state.usage.clone(),
+        std::sync::Arc::from(upstream_id),
+        model_req,
+        fp.proto.clone(),
+        parts.method.as_str(),
+        std::sync::Arc::from(Vec::new().into_boxed_slice()),
+    );
 
     debug!(%record_id, method = %parts.method, url = %upstream_url, "forwarding (passthrough)");
 
@@ -394,6 +419,7 @@ async fn same_proto_passthrough(
         streamed,
         crate::codec::Protocol::from_native(ingress),
         state.upstream_timeouts.stream_idle,
+        usage_ctx,
     )
     .await
 }

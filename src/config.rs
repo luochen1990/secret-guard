@@ -109,6 +109,31 @@ pub struct Config {
     /// 所有路由无认证 (向后兼容本地部署).
     #[serde(default)]
     pub auth: crate::auth::AuthConfig,
+
+    /// 模型用量统计配置 (usage-stats, docs/design/usage-stats.md). 进程内只读.
+    #[serde(default)]
+    pub usage: UsageConfig,
+}
+
+/// Usage-stats 配置 (静态, 仅 `[usage]` 段, 启动读一次 — 同 `[redact]/[auth]` 模式).
+///
+/// 字段语义见 docs/design/usage-stats.md §10; 改动需 restart 生效 (static 语义).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UsageConfig {
+    /// 总开关. `false` = 不采集不落盘 (record 路径零开销).
+    pub enabled: bool,
+    /// 明细保留天数. 0 = 永久. 启动时按 ts 清理 (临时文件 + atomic rename).
+    pub retention_days: u32,
+}
+
+impl Default for UsageConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            retention_days: 90,
+        }
+    }
 }
 
 /// Redact 相关配置 (静态, 仅 `[redact]` 段).
@@ -292,7 +317,7 @@ pub struct SecretsConfig {
 // 负责逐行 tracing::warn, 单测直接对返回值断言 (项目无日志捕获设施).
 
 /// 已知顶层 section 名 (与 [`Config`] 的字段一一对应).
-const KNOWN_SECTIONS: [&str; 5] = ["server", "providers", "secrets", "redact", "auth"];
+const KNOWN_SECTIONS: [&str; 6] = ["server", "providers", "secrets", "redact", "auth", "usage"];
 
 /// 各配置表的已知字段清单 (含数组 entry 级与嵌套 struct 字段), 键为 TOML 路径前缀.
 ///
@@ -373,6 +398,8 @@ const KNOWN_FIELDS: &[(&str, &[&str])] = &[
     ),
     // Config::redact (RedactConfig)
     ("redact", &["global_mock_prefix", "on_probe_exhausted"]),
+    // Config::usage (UsageConfig, usage-stats)
+    ("usage", &["enabled", "retention_days"]),
     // Config::auth (AuthConfig)
     ("auth", &["enabled", "oidc", "api_keys"]),
     // auth.oidc (OidcConfig)
@@ -1328,6 +1355,7 @@ fn serialized_full_sample_paths() -> Vec<String> {
             }],
         },
         redact: RedactConfig::default(),
+        usage: UsageConfig::default(),
         auth: crate::auth::AuthConfig {
             enabled: false,
             oidc: Some(crate::auth::OidcConfig {

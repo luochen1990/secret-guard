@@ -102,6 +102,8 @@ struct FanoutStreamCtx {
     /// record 的 streamed 标志 (restore 路径恒 true).
     streamed: bool,
     stream_idle_timeout: Option<std::time::Duration>,
+    /// usage-stats 采集上下文 (响应完成点落账, 不回读 DAG — 设计 §5.2 防淘汰).
+    usage: crate::usage::UsageCtx,
 }
 
 /// 两条流式扇出路径的共享骨架: spawn task 内的 chunk 循环 + 记录 + 收尾.
@@ -136,6 +138,7 @@ async fn fanout_stream_task(
         status_u16,
         streamed,
         stream_idle_timeout,
+        usage,
     } = ctx;
 
     let mut stream = upstream_resp.bytes_stream();
@@ -180,6 +183,8 @@ async fn fanout_stream_task(
     let elapsed = started.elapsed().as_millis() as u64;
     let (final_parsed, echo) = finalize_parsed(parsed_sync, &recorder);
     let body = finalize_body(&recorder);
+    // resp_complete 在 error_kind move 进 ResponseData 前先取 (usage 落账同用).
+    let resp_complete = recorder.complete();
     dag.attach_response(
         record_id,
         ResponseData {
@@ -189,13 +194,16 @@ async fn fanout_stream_task(
             parsed: final_parsed,
             elapsed_ms: elapsed,
             streamed,
-            resp_complete: recorder.complete(),
+            resp_complete,
             error: recorder.error_kind,
-            usage: echo.usage,
-            model: echo.model,
+            usage: echo.usage.clone(),
+            model: echo.model.clone(),
             ..Default::default()
         },
     );
+    // usage-stats 落账 (USAGE-5 计入判据在 ctx 内统一执行; 与 DAG 无耦合,
+    // 节点被淘汰不影响).
+    usage.record_response(status_u16, resp_complete, echo.usage, echo.model);
     // record 最终态写入后再打摘要 (#160): status/elapsed 覆盖完整流时长,
     // error (client disconnect / upstream error / overflow) 已就位.
     super::recorder::log_forward_summary(&dag, record_id);
@@ -217,6 +225,7 @@ pub(crate) async fn fan_out_streaming(
     streamed: bool,
     codec_proto: Option<crate::codec::Protocol>,
     stream_idle_timeout: Option<std::time::Duration>,
+    usage: crate::usage::UsageCtx,
 ) -> Result<Response<Body>, AppError> {
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(32);
     let resp_headers_for_record = resp_headers.clone();
@@ -239,6 +248,7 @@ pub(crate) async fn fan_out_streaming(
             status_u16,
             streamed,
             stream_idle_timeout,
+            usage,
         },
         upstream_resp,
         tx,
@@ -320,6 +330,7 @@ pub(crate) async fn fan_out_buffered_ir(
     codec_proto: crate::codec::Protocol,
     redaction_map: RedactionMap,
     stream_idle_timeout: Option<std::time::Duration>,
+    usage: crate::usage::UsageCtx,
 ) -> Result<Response<Body>, AppError> {
     let resp_headers_for_record = resp_headers.clone();
     let status_u16 = resp_status.as_u16();
@@ -427,6 +438,7 @@ pub(crate) async fn fan_out_buffered_ir(
         &recorder.acc,
         reader.as_ref(),
     );
+    let resp_complete = recorder.complete();
     // stream 中途中断时, 客户端响应用错误状态码 (而非原始 2xx),
     // 避免给客户端返回"200 但 body 是截断/空"的误导性成功响应.
     // 在 attach_response 之前计算 (error_kind 之后会被 move 到 ResponseData).
@@ -448,13 +460,15 @@ pub(crate) async fn fan_out_buffered_ir(
             parsed: resp_parsed_for_record,
             elapsed_ms: elapsed,
             streamed,
-            resp_complete: recorder.complete(),
+            resp_complete,
             error: recorder.error_kind,
-            usage: resp_echo.usage,
-            model: resp_echo.model,
+            usage: resp_echo.usage.clone(),
+            model: resp_echo.model.clone(),
             ..Default::default()
         },
     );
+    // usage-stats 落账 (同 fanout_stream_task; USAGE-5 计入判据在 ctx 内统一执行).
+    usage.record_response(status_u16, resp_complete, resp_echo.usage, resp_echo.model);
     // record 最终态写入后打摘要 (#160). 注意: client_status (错误中断时 502/504)
     // 只影响客户端响应, record 的 resp_status 仍是上游原值 — 摘要以 record 为准.
     super::recorder::log_forward_summary(&dag, record_id);
@@ -480,6 +494,7 @@ pub(crate) async fn fan_out_streaming_with_restore(
     codec_proto: crate::codec::Protocol,
     redaction_map: RedactionMap,
     stream_idle_timeout: Option<std::time::Duration>,
+    usage: crate::usage::UsageCtx,
 ) -> Result<Response<Body>, AppError> {
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(32);
     let resp_headers_for_record = resp_headers.clone();
@@ -504,6 +519,7 @@ pub(crate) async fn fan_out_streaming_with_restore(
             status_u16,
             streamed: true,
             stream_idle_timeout,
+            usage,
         },
         upstream_resp,
         tx,
@@ -629,6 +645,14 @@ mod tests {
             false, // streamed=false
             None,  // codec_proto=None 跳过 StreamScan
             None,  // stream_idle_timeout=None (测试不禁用超时保护)
+            crate::usage::UsageCtx::new(
+                std::sync::Arc::new(crate::usage::UsageStore::for_tests()),
+                std::sync::Arc::from("test"),
+                None,
+                "o",
+                "POST",
+                std::sync::Arc::from(Vec::new().into_boxed_slice()),
+            ),
         )
         .await
         .expect("fan_out_streaming must not error on large body");

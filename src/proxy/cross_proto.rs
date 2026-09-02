@@ -183,7 +183,17 @@ pub(crate) async fn cross_proto_forward(
         Some(&secrets_snapshot),
         redactions,
     );
+    // usage-stats 采集上下文 (与 same_proto 同模式; event 消耗前捕获 model_req).
+    let model_req = event.model.as_ref().map(|m| m.to_string());
     let record_id = state.dag.push_messages(real_messages, event);
+    let usage_ctx = crate::usage::UsageCtx::new(
+        state.usage.clone(),
+        std::sync::Arc::from(upstream_id),
+        model_req,
+        fp.proto.clone(),
+        parts.method.as_str(),
+        std::sync::Arc::from(secrets_snapshot.into_boxed_slice()),
+    );
 
     debug!(
         %record_id,
@@ -263,6 +273,8 @@ pub(crate) async fn cross_proto_forward(
                     ..Default::default()
                 },
             );
+            // usage-stats: 响应头已到达但流中断 → 计请求数, 无回显 (USAGE-4).
+            usage_ctx.record_response(resp_status.as_u16(), false, None, None);
             // 摘要 (#160): 错误终态也打 (choke point 之一).
             super::recorder::log_forward_summary(&state.dag, record_id);
             // 区分 idle timeout (504) 与其他 stream error (502), 与同协议路径一致.
@@ -288,6 +300,8 @@ pub(crate) async fn cross_proto_forward(
                 502,
                 msg.clone(),
             );
+            // usage-stats: 响应头已到达但超 cap 中止 → 计请求数, 无回显.
+            usage_ctx.record_response(resp_status.as_u16(), false, None, None);
             return Err(AppError::Upstream(msg));
         }
         Bytes::from(acc)
@@ -371,10 +385,17 @@ pub(crate) async fn cross_proto_forward(
             elapsed_ms: elapsed,
             streamed: false,
             resp_complete: true,
-            usage: resp_echo.usage,
-            model: resp_echo.model,
+            usage: resp_echo.usage.clone(),
+            model: resp_echo.model.clone(),
             ..Default::default()
         },
+    );
+    // usage-stats 落账 (USAGE-5 计入判据在 ctx 内统一执行).
+    usage_ctx.record_response(
+        resp_status_out.as_u16(),
+        true,
+        resp_echo.usage,
+        resp_echo.model,
     );
     // record 最终态写入后打摘要 (#160).
     super::recorder::log_forward_summary(&state.dag, record_id);

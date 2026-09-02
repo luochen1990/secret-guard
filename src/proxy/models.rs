@@ -1142,6 +1142,7 @@ mod tests {
             on_probe_exhausted: crate::config::OnProbeExhausted::FailOpen,
             upstream_timeouts: crate::config::UpstreamTimeouts::default(),
             model_lists: Arc::new(ModelListCache::new()),
+            usage: std::sync::Arc::new(crate::usage::UsageStore::for_tests()),
         }
     }
 

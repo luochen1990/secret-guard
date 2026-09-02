@@ -69,6 +69,7 @@ async fn main() -> Result<()> {
         global_mock_prefix,
         on_probe_exhausted,
         upstream_timeouts,
+        static_cfg.usage,
     )
     .await
 }

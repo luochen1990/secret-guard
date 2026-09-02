@@ -121,6 +121,7 @@ async fn spawn(providers: Vec<Provider>) -> String {
         on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,
         upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
         model_lists: Arc::new(ModelListCache::new()),
+        usage: std::sync::Arc::new(secret_guard::usage::UsageStore::for_tests()),
     };
     let app = server::build_router(proxy);
     tokio::spawn(async move {
