@@ -80,6 +80,7 @@
 | `ROB-*` | 跨 | 鲁棒性原则 | best-effort 永不 panic + 假设声明注释必备 |
 | `VIEW-*` | 跨 | 视图正确性机制 | 先断言后删除 + 派生字段 consistency-check 覆盖 |
 | `UI-*` | C | **I1-I3** + 新增 | 气泡数 / sidebar 条目数 / DOM 顺序 / reconciliation / drawer |
+| `USAGE-*` | B | 新增 (usage-stats) | 回显保真 + 聚合一致性 + 成本纯函数 + 缺失显式 + 计入判据 + model SEC 扫描 |
 
 **核心纪律** (详见 `docs/design/contracts.md` §0.3 Property 设计原则 + §0.4 冗余覆盖原则 + §0.5 漂移处理流程):
 - Property 描述**外部可观察行为**, 不依赖内部实现 (避免过拟合).
@@ -138,7 +139,9 @@
   mock ↔ secrets 对称引用 (SecretEntry 持 MockStrategy, mock 校验钩子被 SecretEntry
   调用, 纯数据/校验层, 无业务行为); state → proxy::ModelListCache (#196: AppState
   聚合 router /models 的上游清单缓存, 纯数据 store 无 proxy 行为依赖, 组合根先例同
-  state → auth 的 ApiKeyStore — 见 `src/state.rs` 字段注释).
+  state → auth 的 ApiKeyStore — 见 `src/state.rs` 字段注释) + state → usage
+  (usage-stats: AppState 聚合 UsageStore / PricingCache 两个纯数据 store, 同一先例;
+  usage 模块自身仅依赖 codec::ir / secrets 纯类型, 见 `src/usage/` 头部).
 
 > secret-guard 的核心职责 (转发 + Redact) 必须对任意字节流零失败.
 > 围绕核心职责之外、**基于对 LLM 应用层行为模式强假设** 的附加功能
@@ -315,6 +318,7 @@ TTL 300s + serve-stale-on-error + single-flight; exact-only router 零上游请�
 | `dto.rs` | WebUI 响应 DTO 中立类型层 (SessionView/NodeView/.../SyncSnapshot, 域 B → 域 C wire shape; 构造逻辑留 dag) | 文件头部 `//!` (含 "为什么是顶层中立模块" 归属论证) |
 | `error.rs` | 统一应用错误类型 `AppError` (转发链 + 鉴权层共用, 不反向依赖) | 文件头部 `//!` (含与 `web::api::ApiError` 分工 + Upstream/UpstreamTimeout message 净化回传契约) |
 | `record.rs` | ForwardRecord (web 层 DTO, GET /records/{id} 响应 shape) | 文件头部 `//!` |
+| `usage/` (模块目录: mod/store/pricing/summary) | 模型用量统计: 上游回显 usage 采集 (UsageCtx) + JSONL 持久化 + 内存聚合 + models.dev 定价 + summary 派生 (设计 `docs/design/usage-stats.md`, 契约 USAGE-*) | `src/usage/mod.rs` 头部 `//!` |
 | `redact.rs` | RedactionMap + redact/restore pipeline + 形式化契约 C1-C7 | 文件头部 `//!` |
 | `util.rs` | 集中的哈希工具 (`hash64` SipHash 单值入口) | 文件头部 `//!` |
 | `codec/` | 跨协议 IR + Reader/Writer trait + StreamTranslate (OpenAI / Anthropic / Responses) | **`src/codec/AGENTS.md`** + `docs/design/ir-fields-roadmap.md` (IR 字段建模路线图: extra 边界 + 字段提升判定准则 + 实施批次) |
@@ -364,6 +368,19 @@ Secret / Provider 的两种 value 来源 (`value`/`value_file`、`api_key`/`api_
 |---|---|---|---|
 | `global_mock_prefix` | string | `""` | Auto 模式 mock 的统一前缀 (注入到每个 secret 的 `gen_spec.prefix`). 详见 `src/redact.rs` C5 契约. |
 | `on_probe_exhausted` | `"fail_open"` \| `"fail_closed"` | `"fail_open"` | Mock probing 耗尽时 (弱配置 + 对抗性 IR 无法生成唯一 mock) 的策略. `fail_open` (向后兼容) 跳过该 secret 原样转发; `fail_closed` 拒绝转发整个请求 (返回 503), 防止 secret 泄露. 详见 `src/redact.rs::redact_ir_checked` 与 `src/config.rs::OnProbeExhausted`. |
+
+### `[usage]` 段字段 (static, 启动时读取一次)
+
+> 完整字段表 (pricing_url / pricing_override 等) 见 `docs/configuration.md`;
+> 模块契约见 `src/usage/` 头部 + `docs/design/usage-stats.md` + contracts.md `USAGE-*`.
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `enabled` | bool | `true` | 模型用量统计总开关; false = 不采集不落盘 (零开销). |
+| `retention_days` | u32 | `90` | 明细 JSONL 保留天数; 0 = 永久. |
+| `pricing_url` | string | models.dev | 定价数据源 (可自托管镜像). |
+| `pricing_refresh_secs` | u64 | `86400` | 定价表 TTL (秒). |
+| `pricing_override` | model → 价格表 | 空 | 自定义模型定价 ($/1M, 优先于 models.dev). |
 
 ### `[auth]` 段字段 (static, 启动时读取一次)
 
@@ -609,6 +626,14 @@ configFile (escape hatch, 互斥). 凭据注入 (LoadCredential / sops 直接路
 
 ## 已知限制 (MVP)
 
+- **OpenAI 流式请求未开 `include_usage` 时无 token 统计** (usage-stats, USAGE-5):
+  OpenAI 流式默认不回显 usage, 需客户端设 `stream_options.include_usage = true`;
+  网关不代为注入 (FWD-1 未授权). 此类请求在 Usage 页只计请求数 (`requests_without_usage`
+  / `cost_coverage` 指标可见), 页面有提示文案. Gemini / Ollama (无 codec) 同样无
+  usage 回显提取 (P2 浅提取). 详见 `docs/design/usage-stats.md` §5.4.
+- **usage 成本恒为估算**: models.dev 价目表 ≠ 实际合同价; 历史成本按当前价目表实时
+  重算 (会随价目表漂移, UI 明示). session 徽章 (Records tab) 是进程内口径, restart
+  归零; Usage tab 是持久账本 (JSONL) — 两套口径不同, 页脚说明.
 - **reasoning_content (思考原文) 跨协议丢弃** (#176, 契约 STR-6): OpenAI 兼容 provider 的
   思考原文 (`delta.reasoning_content` 流式 / `message.reasoning_content` 非流式 /
   assistant 历史回传) 已建模为 `IrBlock::ReasoningContent`, 同协议路径 (含 Redact) 三路径

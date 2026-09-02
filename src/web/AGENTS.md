@@ -54,6 +54,12 @@ GET    /api/api-keys
 POST   /api/api-keys
 DELETE /api/api-keys/{id}
 PATCH  /api/api-keys/{id}/toggle
+
+GET    /api/usage/summary[?days=N]   → UsageSummary {range, pricing_status, totals,
+                                                 by_day[], by_model[], by_provider[],
+                                                 unpriced_models[]}
+                                                 (模型用量统计: days 缺省 7, 0=今日,
+                                                  上限 retention_days; usage tab 5s 节流轮询)
 ```
 
 所有响应带 `Cache-Control: no-store`, 避免浏览器对自动刷新返回缓存内容.

@@ -72,6 +72,7 @@
 | `ROB-*` | 鲁棒性 (跨域) | (新增) | 根 `AGENTS.md` "鲁棒性原则" |
 | `VIEW-*` | 视图正确性机制 (跨域) | (新增) | 根 `AGENTS.md` "视图正确性确保机制" |
 | `UI-*` | WebUI 渲染 (域 C) | I1→UI-1, I2→UI-2, I3→UI-3, I4→UI-6 (selectedRound 子属性), I5→UI-6 | 根 `AGENTS.md` "前端不变量" |
+| `USAGE-*` | 模型用量统计 (域 B, usage-stats) | (新增) | `docs/design/usage-stats.md` + `src/usage/` 头部 |
 
 **编号稳定性**: 契约编号一经分配**永不变更** (即使内容演进). 删除契约时编号作废不重用.
 
@@ -913,6 +914,80 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 ---
 
+## 11. USAGE: 模型用量统计
+
+> 信任域 B. 上游回显 usage 的采集 / 聚合 / 持久化 / 定价估算的正确性.
+> 设计 SSOT: `docs/design/usage-stats.md` (P-1..P-5 原则 / 数据流 / 定价匹配规则).
+
+### USAGE-1 聚合一致性
+
+**陈述**: 对任意查询窗口, `summary.totals` == 窗口内明细行 fold; `by_day` / `by_model` /
+`by_provider` 各自分项之和 == totals. 持久层同理: store 重放 (JSONL → 内存聚合) 与
+在线聚合产出相同的 cells.
+
+**Properties**:
+- `prop_usage_aggregation_consistency`: 三向相等 (totals / by_day / by_model / by_provider) + 窗口过滤 (day >= from). 🔁→`summary_sums_match_totals_across_all_views` (`src/usage/summary.rs`) + `open_replays_jsonl_and_folds_aggregation` (`src/usage/store.rs`; 重放维度)
+- `prop_usage_zero_filled_days`: by_day 是窗口内连续日期序列 (无数据日补零). 🔁→`empty_store_yields_zeroed_days_and_none_rates` (`src/usage/summary.rs`)
+
+### USAGE-2 回显保真 (presence + 归一化)
+
+**陈述**: 存储的 usage 四元组 == 上游回显经 codec reader 归一化的值 (OpenAI
+`prompt_tokens` 含 cached 总和, reader `saturating_sub`; cr/cw 的 `None` 按
+`unwrap_or(0)` 落盘). presence 位忠实区分 "wire 无 usage 对象" 与 "显式全零回显"
+(P-3 缺失显式): 非流式由 reader 判定, 流式由 MessageDelta.usage_present 位精确传递
+(与 STR-2 scan ≡ 非流式 parse 的等价性联动).
+
+**Properties**:
+- `prop_usage_presence_distinguishes_absent_and_zero`: 三 reader (openai/anthropic/responses) 非流式 + anthropic 流式 message_delta: usage 对象缺席 → present=false; 显式全零 → present=true. 🔁→`read_response_usage_present_true_when_usage_object_in_wire` (`src/codec/openai.rs` + `src/codec/anthropic.rs`; 同名两处) + `stream_message_delta_usage_presence_distinguishes_absent_and_zero` (`src/codec/anthropic.rs`)
+- `prop_usage_echo_fidelity_openai_normalization`: 端到端: 上游回显 prompt_tokens=100 + cached=30 → 存储与聚合 input=70 / cr=30 / output=50; 回显 model 优先于请求 model 作为聚合键. 🔁→`usage_stats_end_to_end_records_replayed_and_served` (`tests/integration.rs`)
+- `prop_usage_quanta_none_cache_normalized`: IrUsage 的 cr/cw None 落盘归一为 0. 🔁→`quanta_from_ir_normalizes_none_cache_fields` (`src/usage/store.rs`)
+
+### USAGE-3 成本纯函数与可复算
+
+**陈述**: `cost(event, price)` 是确定性纯函数 (同明细 + 同价目表 ⇒ 同 cost; 无价 ⇒
+None, UI 显示 "—" 而非 $0.00, P-4); 对聚合线性 (逐事件算再求和 == fold 后再算).
+明细行不存 cost, 查询时按当前价目表实时重算 (历史随价目漂移, UI 明示 — 设计 §7 快照语义).
+
+**Properties**:
+- `prop_usage_cost_linear_in_aggregation`: fold 后算 == 逐事件算再求和. 🔁→`cost_is_linear_in_aggregation` (`src/usage/summary.rs`)
+- `prop_usage_pricing_match_rule`: 匹配规则 SSOT: override 精确 > remote 精确 (多 vendor 域名消歧, 仍歧义字母序) > 剥 `-YYYY-MM-DD` 后缀重试 > None. 🔁→`match_override_wins_over_remote` (`src/usage/pricing.rs`) + `match_strips_date_suffix` (`src/usage/pricing.rs`) + `match_ambiguous_resolved_by_domain_hint_then_alphabetical` (`src/usage/pricing.rs`)
+- `prop_usage_pricing_schema_snapshot`: models.dev api.json 解析: cost 四价 + vendor api 域名提取; 无 cost 条目跳过; 解析成功但零价 (schema 漂移) 拒绝采信. 🔁→`parse_extracts_prices_and_vendor_domains` (`src/usage/pricing.rs`)
+
+### USAGE-4 缺失显式
+
+**陈述**: `requests == Σ(有 usage 行) + requests_without_usage`; usage 为空的行对
+token / cost 贡献恒为 0; `cost_coverage` 只以有 usage 的请求为分母; 无价 model 进
+`unpriced_models` 清单.
+
+**Properties**:
+- `prop_usage_missing_explicit_accounting`: without_usage 计数独立 + token 贡献为零 + coverage 分母口径. 🔁→`record_accumulates_per_key_and_counts_missing_usage` (`src/usage/store.rs`) + `summary_sums_match_totals_across_all_views` (`src/usage/summary.rs`; coverage=0.5 断言内嵌)
+- `prop_usage_unpriced_models_listed`: 无价 model 显示在 unpriced_models (提示配 override), 不产生 cost. 🔁→`summary_sums_match_totals_across_all_views` (`src/usage/summary.rs`; unpriced 断言内嵌) + `match_unpriced_returns_none` (`src/usage/pricing.rs`)
+
+### USAGE-5 计入判据
+
+**陈述**: 仅 **POST 且收到上游响应** (任何 status) 的转发请求产生 UsageEvent:
+- GET 请求被方法过滤 (GET /models 透传不计; router /models 本地终结无转发, 天然不计);
+- dispatch 前置拒绝 (404/503/501) 与上游 send 失败 (502/504, 无响应) 不计 —
+  "requests" 语义 = "上游实际返回了响应的 POST 请求数";
+- 流式中断 (响应头已到达) 计入, complete=false + usage=None.
+
+**Properties**:
+- `prop_usage_inclusion_post_only`: 非 POST → 零事件; 端到端 GET /models 透传不进 summary. 🔁→`record_response_filters_non_post` (`src/usage/mod.rs`) + `usage_stats_end_to_end_records_replayed_and_served` (`tests/integration.rs`; GET 不计入断言内嵌)
+- `prop_usage_disabled_store_zero_overhead`: `[usage] enabled = false` → record no-op, 聚合恒空. 🔁→`disabled_store_is_noop` (`src/usage/store.rs`)
+- `prop_usage_retention_expiry`: retention_days 过期行启动时清理 (文件重写 + 聚合不含). 🔁→`open_drops_expired_by_retention` (`src/usage/store.rs`)
+
+### USAGE-6 SEC 边界: model 字符串扫描 (关联 SEC 域)
+
+**陈述**: `model` / `model_req` 是自由 wire 字符串 (非受控 id) — fail_open passthrough
+场景下 secret 理论可出现在其中, 且 JSONL 会**持久化** (比内存 DAG 更严重). 落账前
+必须过 active secrets 扫描 (命中 → `<redacted:model>` 整体替换 + WARN) 并截断 256
+chars (char boundary 安全); 其余 UsageEvent 字段为受控类型, 天然无 secret.
+
+**Properties**:
+- `prop_usage_model_secret_scan`: 含 secret 的 model → 整体替换 + 无残留; 干净 model 保留 + 超长截断在 char boundary. 🔁→`sanitize_redacts_model_containing_secret` (`src/usage/mod.rs`) + `sanitize_keeps_clean_model_and_truncates_at_char_boundary` (`src/usage/mod.rs`)
+
+---
+
 ## 99. 变更日志
 
 记录契约的重大语义调整 (编号永不变更/重用, 仅作废).
@@ -945,4 +1020,5 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 | 2026-08-26 | UI-1 + DTO-9 | UI-1 精确化: "气泡数 == IR messages 长度" → "气泡数 == req_delta messages 长度, 空 delta 轮按 round_kind 分发" (retry → 0 气泡 + 徽章 / no_messages → preview fallback); 新增 DTO-9 round_kind 三态派生 (push 时预计算) + 6 条 property. 语义裁决 (人工授权): IR 等价的相同请求判定为重试, 重发对象是当前 leaf 时**合并保留** (延续同 session), 重发较旧轮次按 CDAG-8 fork 开新 session; retry 轮继承 parent 的 round_role + preview (工具轮重试呈 sub-dot 同型, 不捏造伪组首); 仅修展示 — 前端 fallback 曾把重试轮捏造为重复的用户消息气泡 | 用户报告: 多次发送相同请求 → timeline 出现多个重复用户消息, 不符合事实. 链路缺口 = 渲染规格的输入枚举不完备 (空 delta 轮未分类) + fallback 成 de facto 规格未审视 |
 | 2026-08-27 | DTO-4 | property `prop_preview_fallback_method_path` 更名 `prop_preview_none_degrades_to_placeholder` 并改陈述: 原 "提取失败回退到 method+path" 描述的是已随 session-aware API 消亡的旧行为 (旧 RecordSummary 含 method/path, 现行 TimelineRound 不含), 实际降级链 = preview=None → 前端占位文本 (round 级 `(no preview)` / `(no content)`; session 级先试 `path` 字段). 同步修正 derive.rs 头注释/函数注释 + 根 AGENTS.md 鲁棒性段 + web/AGENTS.md 共 5 处散文残留 | 用户追问 NoMessages fallback 气泡内容时发现的文档漂移 (陈述与实现不符, 人工授权修正, PR #194 补充提交) |
 | 2026-08-31 | FWD-7 | 新增: router provider 模型列表 GET 请求本地合成 (别名 ∪ 过滤后上游清单), 收纳 N1 合并过滤 (以缓存快照为 oracle) / N6 exact-only 零 fetch / 上游 fetch best-effort 永不 fail 查询 / fetch 失败退避 (30s 窗口内不重试, 窗口内查询立即 serve stale) / single-flight 并发去重 / Direct 透传回归守卫 (D6) / 别名 advertised ⇒ resolvable (D2) / DAG 零记录 (D5) 共 8 条 property | #196: open-webui 等消费方依赖 /models 发现模型, 别名不在透传列表导致 taskModel 静默回退; exact-only router 对 GET /models 直接 503 |
+| 2026-09-03 | USAGE-1..6 | 新增模型用量统计 (usage-stats) 契约域: 聚合一致性 (三向相等 + 重放恢复) / 回显保真 (presence 位区分无回显与显式零, 联动 STR-2) / 成本纯函数与可复算 (models.dev 匹配规则 SSOT + 实时重算快照语义) / 缺失显式 (without_usage + coverage 口径) / 计入判据 (仅 POST 且收到上游响应; GET /models 与 send 失败不计) / SEC 边界 (model 字符串扫描 + 截断) | 模型用量统计功能 (设计 `docs/design/usage-stats.md`, 网关计量位势: wire 层回显消费, 零 tokenizer) |
 | 2026-08-31 | FWD-1 | **适用范围修订 (待人工授权)**: router provider 的模型列表 GET 请求 (FWD-7 域) 本地终结, 不转发上游 — 对这类请求 FWD-1 不适用 (响应为本地合成, 可含缓存上游清单, 非实时中继); Direct provider 的 /models 仍受 FWD-1 约束 (先例: 2026-08-24 #183 的 FWD-1 修订) | #196: 模型列表发现是网关自身的元数据职责, 透传上游列表无法承载路由别名 |

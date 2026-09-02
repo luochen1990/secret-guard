@@ -54,6 +54,32 @@ value = "ghp_0123456789abcdefghijklmnopqrstuvwxyz"
 | `global_mock_prefix` | string | `""` | 所有 Auto 模式 mock 的统一前缀 (如 `"sgm_"`), 便于在日志 / WebUI 中一眼认出 mock. 设定后, secret 真值不允许包含该前缀. |
 | `on_probe_exhausted` | `"fail_open"` \| `"fail_closed"` | `"fail_open"` | mock 候选探测耗尽时 (极罕见, 需对抗性构造) 的策略: `fail_open` 跳过该 secret 照常转发; `fail_closed` 拒绝转发整个请求 (503), 宁可失败也不泄露. |
 
+## `[usage]` — 模型用量统计 (改动需重启)
+
+token 用量数据 100% 来自上游响应回显的 `usage` 字段 (零本地估算); 成本按
+[models.dev](https://models.dev) 价目表估算 (恒为估算, 无价模型显示 "—").
+明细持久化在与配置同目录的 `<stem>.usage.jsonl` (append-only, 每请求一行).
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `enabled` | bool | `true` | 总开关; `false` = 不采集不落盘 (零开销). |
+| `retention_days` | u32 | `90` | 明细保留天数; `0` = 永久. 启动时清理过期行. |
+| `pricing_url` | string | models.dev api.json | 定价数据源, 可指向自托管镜像. |
+| `pricing_refresh_secs` | u64 | `86400` | 定价表刷新间隔 (秒). |
+| `pricing_override` | model → price 表 | 空 | 自定义模型定价 (优先于 models.dev), 见下例. |
+
+定价覆盖示例 ($ / 1M tokens; `cache_read` / `cache_write` 可省略 — 回退到
+`input` 价 / 1.25×`input`):
+
+```toml
+[usage.pricing_override."my-relay/gpt-fork"]
+input = 0.5
+output = 2.0
+```
+
+已知限制: OpenAI 流式请求仅在客户端设置 `stream_options.include_usage = true`
+时上游才回显 usage — 此类请求在 Usage 页只计请求数, 无 token 统计 (页面有提示).
+
 ## `[[providers]]` — 上游 LLM 端点 (平铺数组)
 
 每个 provider 是**两种构造之一** (#187 sum type): **直连** (Direct, 真实上游端点) 或

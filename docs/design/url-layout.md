@@ -24,7 +24,7 @@
 | 路径 | 用途 | 挂载点 | 认证 (auth 启用时) |
 |---|---|---|---|
 | `/` | WebUI 单页 HTML | `web::router()` (`web/mod.rs`) | OIDC login_required |
-| `/api/*` | WebUI JSON API (sessions / sync / records / secrets / providers / api-keys / me) | `web::router()` + `server.rs` (`/api/me`) | OIDC login_required (`/api/me` 例外: 公开) |
+| `/api/*` | WebUI JSON API (sessions / sync / records / secrets / providers / api-keys / usage / me) | `web::router()` + `server.rs` (`/api/me`) | OIDC login_required (`/api/me` 例外: 公开) |
 | `/login`, `/oauth2/callback`, `/logout` | OIDC 认证流程 | `server.rs` `build_router_with_auth_layers` | 公开 (login_required 之外) |
 | `/{o\|a\|g\|l\|r}/{name}` | forward, rest = `/` | `server.rs` forward_router | API key (`require_api_key` middleware) |
 | `/{o\|a\|g\|l\|r}/{name}/{*rest}` | forward, 含 sub-path | 同上 | 同上 |
@@ -89,6 +89,7 @@ forward 路由 (`/{proto}/{name}/...`) 首段必须是 proto 简写, 由
 | `/api/secrets` [+ `/{id}` [+ `/decision`]] | secret CRUD + OverrideMode |
 | `/api/providers` [+ `/{id}` [+ `/decision`]] | provider CRUD + OverrideMode |
 | `/api/api-keys` [+ `/{id}` [+ `/toggle`]] | API key CRUD |
+| `/api/usage/summary` | 模型用量统计汇总 (usage-stats, 定价经 models.dev 惰性拉取) |
 | `/api/me` | 当前登录用户信息 (公开, 未登录返回 `authenticated:false`; 仅 auth 启用时挂载, 单用户模式无此路由) |
 | `/api/{*rest}` (未匹配) | **404 兜底, 绝不 forward** (SEC-6). 兜底在 login_required 之外 — 未登录也能收到 404 (而非 307), 这是有意设计: 兜底作为安全网应在任何认证状态下工作, 404 本身 fail-closed 不泄露内容; 副作用是 404 vs 307 可区分资源组是否存在 (评估为可接受的极低危信息) |
 
