@@ -721,13 +721,16 @@ configFile (escape hatch, 互斥). 凭据注入 (LoadCredential / sops 直接路
   require_api_key 的 Authorization 剥离断言 (SEC 红线) 与 build_session_layer 的
   cookie 配置 (sg.sid + HttpOnly).
   OIDC 流程的集成测试 (`tests/auth_oidc.rs`) 已通过本地 mock IdP server 覆盖
-  (起 axum server 模拟 discovery + token + jwks + RS256 签 id_token), 覆盖率:
-  - `oidc.rs` ~86%: `OidcBackend::discover` (含 issuer 字符串校验 / JWKS 拉取) /
+  (起 axum server 模拟 discovery + token + jwks + RS256 签 id_token, 支持密钥轮换
+  与 discovery 故障注入), 覆盖率:
+  - `oidc.rs` ~90%: `OidcBackend::discover` (含 issuer 字符串校验 / JWKS 拉取) /
     `exchange_and_verify` happy + 5 个错误路径 (CSRF mismatch / token HTTP 4xx /
-    NoIdToken / WrongSignature / WrongNonce) / `authorize_url` PKCE verifier round-trip.
+    NoIdToken / WrongSignature / WrongNonce) / `authorize_url` PKCE verifier round-trip /
+    **JWKS 轮换恢复** (SEC-AUTH-3, #198: 轮换后无需重启登录成功 + 刷新失败返回
+    原始错误且 IdP 恢复后自愈; 重验仍失败不放行坏签名由 WrongSignature 兼守).
   - `handlers.rs` ~64%: `login_start` (重定向 + session 写入 + sanitize_next_url) /
     `oauth_callback` 错误路径 (IdP error 参数 / 缺 session 凭证) / `logout` / `me`.
-  **仍未覆盖** (~36% handlers + ~14% oidc 残留): `oauth_callback` happy path 的
+  **仍未覆盖** (~36% handlers + ~10% oidc 残留): `oauth_callback` happy path 的
   PKCE verifier + nonce 完整端到端 round-trip — nonce 是 client-only 凭证存 server-side
   session, 外部 HTTP 测试无法读取; 这部分核心逻辑由 `exchange_and_verify_happy` 间接
   覆盖, 完整端到端需 mocking AuthSession (axum-login extractor), 留作后续工作.
@@ -800,6 +803,12 @@ configFile (escape hatch, 互斥). 凭据注入 (LoadCredential / sops 直接路
 
 ### 已知搁置 (有意识的不做)
 
+- **OIDC JWKS 刷新无退避/negative-cache (#198)**: `OidcBackend::exchange_and_verify`
+  遇签名类验签失败时每次都重跑 discovery (对比 #196 的 ModelListCache 有 TTL +
+  serve-stale + 30s 退避). 不做的原因: 登录是人工低频操作 + 重试严格有界 (只一次,
+  且触发前置是 token exchange 成功, 伪造 token 无法触发放大) + 真实轮换 (月频)
+  只有首个请求付代价. 若未来出现 IdP 异常期间的 discovery 压力, 再补"上次刷新
+  失败后 X 秒内不重试"的单时间戳退避.
 - **redact 性能优化 (Aho-Corasick 多模式匹配)**: `redact_ir` 的 `gen_mock_for_ir` 已
   做 P2-1 优化 (hybrid 延迟预拼接 IR 叶子缓存, 消除 P×L 因子, 详见 `src/redact.rs`
   `gen_mock_for_ir` 头部); `StreamingRestorer::find_safe_end` + `restore_str_inplace`

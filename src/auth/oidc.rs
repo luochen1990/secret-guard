@@ -13,7 +13,10 @@
 //!
 //! - PKCE verifier + nonce **必须存服务端 session**, 绝不放 cookie (安全红线).
 //! - ID token 必须验证签名 (JWKS) + nonce (防重放).
-//! - CoreClient 在启动时通过 OIDC Discovery 初始化, 进程内共享 (Clone, 内部 Arc).
+//! - CoreClient 在启动时通过 OIDC Discovery 初始化, 进程内共享.
+//! - **JWKS 轮换恢复** (#198): openidconnect 的 client 持 discovery 时抓取的 JWKS
+//!   快照且无公开刷新 API, 刷新责任在本模块 — 验签遇 `SignatureVerification` 类
+//!   失败时重跑 discovery 重建 client 并有界重验一次 (见 `exchange_and_verify`).
 //!
 //! # 类型状态 (typestate)
 //!
@@ -28,8 +31,9 @@ use std::sync::Arc;
 use axum_login::{AuthUser, AuthnBackend, UserId};
 use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata};
 use openidconnect::{
-    AuthType, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointMaybeSet, EndpointSet,
-    IssuerUrl, Nonce, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, TokenResponse,
+    AuthType, AuthorizationCode, ClaimsVerificationError, ClientId, ClientSecret, CsrfToken,
+    EndpointMaybeSet, EndpointSet, IssuerUrl, Nonce, PkceCodeChallenge, PkceCodeVerifier,
+    RedirectUrl, Scope, TokenResponse,
 };
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -90,10 +94,22 @@ impl User {
 /// (含 email/name). 进程重启后缓存清空, 但 session 也同步失效, 用户需重登.
 #[derive(Clone)]
 pub struct OidcBackend {
-    client: OidcClient,
+    /// discovery 构造参数快照 (JWKS 轮换刷新时用同参数重跑 discovery, #198).
+    ctor: Arc<DiscoverParams>,
+    /// 当前 client (启动时构造; 验签遇签名类失败触发轮换刷新时整体替换).
+    /// 读锁不跨 await: 一律先 clone (KB 级小结构体, 拷贝廉价) 再异步操作.
+    client: Arc<RwLock<OidcClient>>,
     http_client: reqwest::Client,
     /// 内存用户缓存: OIDC sub → User (含 email/name).
     users: Arc<RwLock<HashMap<String, User>>>,
+}
+
+/// `OidcBackend::discover` 的构造参数 (快照留存, 供 JWKS 轮换刷新重放, #198).
+struct DiscoverParams {
+    issuer_url: String,
+    client_id: String,
+    client_secret: Option<String>,
+    redirect_url: String,
 }
 
 /// 登录时从 session 取出的临时凭证 (PKCE + nonce + CSRF state).
@@ -151,55 +167,46 @@ impl OidcBackend {
         client_secret: Option<String>,
         redirect_url: &str,
     ) -> Result<Self, String> {
-        let issuer = IssuerUrl::new(issuer_url.to_string())
-            .map_err(|e| format!("invalid issuer_url '{issuer_url}': {e}"))?;
-        let redirect = RedirectUrl::new(redirect_url.to_string())
-            .map_err(|e| format!("invalid redirect_url '{redirect_url}': {e}"))?;
-
         // HTTP client: 禁止 redirect 防 SSRF (openidconnect 官方建议).
         let http_client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| format!("build OIDC http client: {e}"))?;
 
-        let metadata = CoreProviderMetadata::discover_async(issuer, &http_client)
-            .await
-            .map_err(|e| format!("OIDC discovery failed for '{issuer_url}': {e}"))?;
-
-        // 显式提取 token endpoint 并 set_token_uri, 让 typestate 变为 EndpointSet
-        // (保证 exchange_code 编译期可用).
-        let token_endpoint = metadata
-            .token_endpoint()
-            .cloned()
-            .ok_or_else(|| format!("OIDC discovery '{issuer_url}': no token_endpoint found"))?;
-
-        let client = CoreClient::from_provider_metadata(
-            metadata,
-            ClientId::new(client_id.to_string()),
-            client_secret.map(ClientSecret::new),
-        )
-        .set_token_uri(token_endpoint)
-        .set_redirect_uri(redirect)
-        // 用 RequestBody 传 client credentials 而非默认的 BasicAuth.
-        //
-        // oauth2 的 BasicAuth 按 RFC 6749 §2.3.1 url-encode secret, 但 kanidm (1.10) 取字面值
-        // 不 url-decode, 导致 base64 secret 末尾 `=` → `%3D` 与存储不等 → 401. RequestBody 把
-        // secret 放进 form body, kanidm 解 form 时还原原字符. 其他主流 IdP 两种都接受, 故更稳.
-        .set_auth_type(AuthType::RequestBody);
+        let ctor = DiscoverParams {
+            issuer_url: issuer_url.to_string(),
+            client_id: client_id.to_string(),
+            client_secret,
+            redirect_url: redirect_url.to_string(),
+        };
+        let client = discover_client(&ctor, &http_client).await?;
 
         Ok(Self {
-            client,
+            ctor: Arc::new(ctor),
+            client: Arc::new(RwLock::new(client)),
             http_client,
             users: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
+    /// 重跑 OIDC Discovery 重建 client (JWKS 轮换刷新, #198).
+    ///
+    /// 成功则整体替换 `self.client`; 失败保留旧 client (调用方返回原始验签错误,
+    /// 刷新失败不掩盖). CoreClient 无公开 API 就地替换 JWKS 快照, 故走完整
+    /// discovery 重建 — 轮换是月频事件, 性能无需精打细算. 并发调用幂等
+    /// (同参数重建, 后写者胜), 无需 single-flight.
+    async fn refresh_client(&self) -> Result<(), String> {
+        let client = discover_client(&self.ctor, &self.http_client).await?;
+        *self.client.write() = client;
+        Ok(())
+    }
+
     /// 生成授权 URL + PKCE verifier + nonce + CSRF state.
     /// 返回的 verifier/nonce/state 必须由调用方存入 server-side session.
     pub fn authorize_url(&self) -> AuthUrlParts {
+        let client = self.client.read().clone();
         let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
-        let (auth_url, csrf_state, nonce) = self
-            .client
+        let (auth_url, csrf_state, nonce) = client
             .authorize_url(
                 CoreAuthenticationFlow::AuthorizationCode,
                 CsrfToken::new_random,
@@ -224,7 +231,8 @@ impl OidcBackend {
     /// 步骤:
     /// 1. CSRF 校验 (old_state == new_state).
     /// 2. exchange code + PKCE verifier → token response (async).
-    /// 3. 验证 ID token 签名 + nonce.
+    /// 3. 验证 ID token 签名 + nonce; 签名类失败时刷新 JWKS (重跑 discovery)
+    ///    并有界重验一次 (#198: IdP 轮换签名密钥后旧快照查无新 kid).
     /// 4. 提取 sub/email/name → User.
     pub async fn exchange_and_verify(&self, creds: OidcCredentials) -> Result<User, OidcError> {
         // 1. CSRF 校验.
@@ -232,9 +240,10 @@ impl OidcBackend {
             return Err(OidcError::CsrfMismatch);
         }
 
+        let client = self.client.read().clone();
+
         // 2. exchange code + PKCE verifier → token (async, 不阻塞 tokio worker).
-        let token_response = self
-            .client
+        let token_response = client
             .exchange_code(AuthorizationCode::new(creds.code))
             .set_pkce_verifier(PkceCodeVerifier::new(creds.pkce_verifier))
             .request_async(&self.http_client)
@@ -243,9 +252,37 @@ impl OidcBackend {
 
         // 3. 验证 ID token + nonce.
         let id_token = token_response.id_token().ok_or(OidcError::NoIdToken)?;
-        let claims = id_token
-            .claims(&self.client.id_token_verifier(), &Nonce::new(creds.nonce))
-            .map_err(|e| OidcError::IdTokenVerification(e.to_string()))?;
+        let nonce = Nonce::new(creds.nonce);
+        // 签名类失败 (SignatureVerification, 含 NoMatchingKey / CryptoError)
+        // 是 JWKS 轮换的典型信号: 新 kid 不在快照, 或 IdP 原地换 key 不换 kid. 重跑
+        // discovery 刷新 client 后重验一次 — 有界重试 (只此一次), 恶意 token 最多
+        // 触发一轮刷新, 不构成刷新风暴. 非签名类失败 (nonce/issuer/audience/expired)
+        // 与 JWKS 无关, 不触发刷新. 刷新失败保留旧 client, 返回原始错误 (不掩盖).
+        let claims = match id_token.claims(&client.id_token_verifier(), &nonce) {
+            Ok(claims) => claims,
+            Err(e) if matches!(e, ClaimsVerificationError::SignatureVerification(_)) => {
+                // Debug (而非 Display): 内层 SignatureVerificationError 是 #[source]
+                // 不参与 Display (固定文案 "Signature verification failed"), Debug
+                // 才能区分 NoMatchingKey (轮换信号) 与 CryptoError, 且
+                // 不含敏感字节.
+                tracing::warn!(
+                    error = ?e,
+                    "ID token signature verification failed; refreshing JWKS (possible key rotation)"
+                );
+                if let Err(refresh_err) = self.refresh_client().await {
+                    tracing::warn!(
+                        error = %refresh_err,
+                        "JWKS refresh failed; keeping stale client"
+                    );
+                    return Err(OidcError::IdTokenVerification(e.to_string()));
+                }
+                let refreshed = self.client.read().clone();
+                id_token
+                    .claims(&refreshed.id_token_verifier(), &nonce)
+                    .map_err(|e| OidcError::IdTokenVerification(e.to_string()))?
+            }
+            Err(e) => return Err(OidcError::IdTokenVerification(e.to_string())),
+        };
 
         // 4. 提取 user 信息 + 缓存 (供 get_user 恢复完整 User).
         let user = User::from_claims(
@@ -256,6 +293,45 @@ impl OidcBackend {
         self.users.write().insert(user.sub.clone(), user.clone());
         Ok(user)
     }
+}
+
+/// 执行一次 OIDC Discovery 并构造 client (`OidcBackend::discover` 与
+/// `refresh_client` 共用; 同参数重放保证重建等价, #198).
+async fn discover_client(
+    ctor: &DiscoverParams,
+    http_client: &reqwest::Client,
+) -> Result<OidcClient, String> {
+    let issuer = IssuerUrl::new(ctor.issuer_url.clone())
+        .map_err(|e| format!("invalid issuer_url '{}': {e}", ctor.issuer_url))?;
+    let redirect = RedirectUrl::new(ctor.redirect_url.clone())
+        .map_err(|e| format!("invalid redirect_url '{}': {e}", ctor.redirect_url))?;
+
+    let metadata = CoreProviderMetadata::discover_async(issuer, http_client)
+        .await
+        .map_err(|e| format!("OIDC discovery failed for '{}': {e}", ctor.issuer_url))?;
+
+    // 显式提取 token endpoint 并 set_token_uri, 让 typestate 变为 EndpointSet
+    // (保证 exchange_code 编译期可用).
+    let token_endpoint = metadata.token_endpoint().cloned().ok_or_else(|| {
+        format!(
+            "OIDC discovery '{}': no token_endpoint found",
+            ctor.issuer_url
+        )
+    })?;
+
+    Ok(CoreClient::from_provider_metadata(
+        metadata,
+        ClientId::new(ctor.client_id.clone()),
+        ctor.client_secret.clone().map(ClientSecret::new),
+    )
+    .set_token_uri(token_endpoint)
+    .set_redirect_uri(redirect)
+    // 用 RequestBody 传 client credentials 而非默认的 BasicAuth.
+    //
+    // oauth2 的 BasicAuth 按 RFC 6749 §2.3.1 url-encode secret, 但 kanidm (1.10) 取字面值
+    // 不 url-decode, 导致 base64 secret 末尾 `=` → `%3D` 与存储不等 → 401. RequestBody 把
+    // secret 放进 form body, kanidm 解 form 时还原原字符. 其他主流 IdP 两种都接受, 故更稳.
+    .set_auth_type(AuthType::RequestBody))
 }
 
 impl AuthnBackend for OidcBackend {

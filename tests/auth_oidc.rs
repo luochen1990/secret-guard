@@ -22,6 +22,9 @@
 //! - **FWD-AUTH-1**: OidcBackend discover + exchange_and_verify happy path.
 //! - **FWD-AUTH-2**: handlers login_start / oauth_callback / logout / me.
 //! - **SEC-AUTH-1**: CSRF state mismatch / id_token 缺失 / 签名错误 均正确拒绝.
+//! - **SEC-AUTH-3**: IdP 轮换签名密钥后, 运行中的 secret-guard 无需重启仍能完成 OIDC
+//!   登录 (验签失败 → 刷新 JWKS → 有界重验一次). #198: rauthy 月度自动轮换后,
+//!   新 kid 的 id_token 在启动时抓取的 JWKS 快照中查无此 key, 登录永久 500.
 
 use std::sync::{Arc, OnceLock};
 
@@ -56,7 +59,7 @@ use openidconnect::PrivateSigningKey;
 
 // ─── mock IdP 核心: 密钥 + 签名工具 ─────────────────────────────────────
 
-/// 一次性生成一对 RSA 密钥 (主 + 野), 启动时 ~100ms.
+/// 一次性生成密钥组 (主 + 野 + 轮换代), 启动时 ~150ms.
 ///
 /// 主密钥的公钥进 JWKS (供客户端验签), 野密钥不公布 (用于 WrongSignature 测试).
 /// 两个都用 openidconnect 自己的 `CoreRsaPrivateSigningKey::from_pem` 包装,
@@ -64,23 +67,39 @@ use openidconnect::PrivateSigningKey;
 ///
 /// # 关键: 主/野密钥共用同一个 `kid`
 ///
-/// WrongSignature 测试的目标是验证"签名比较失败" (SignatureDoesNotMatch), 而非
+/// WrongSignature 测试的目标是验证"签名比较失败" (CryptoError "bad signature"), 而非
 /// "JWKS 找不到 kid" (NoMatchingKey). 若两把密钥用不同 kid, openidconnect 在 JWKS
 /// 按 kid 查不到野密钥的公钥, 直接报 NoMatchingKey 跳过签名比较 — 测试就无法
 /// 守卫 RSA 签名验证逻辑本身. 让两把密钥共用 kid, openidconnect 会用 JWKS 里
 /// 主密钥的公钥去验证野密钥签的 token, 命中签名 mismatch, 真正走完整验签路径.
+///
+/// # 轮换代密钥 (`rotated_key` + `rotated_jwks_json`)
+///
+/// `rotate_keys()` (SEC-AUTH-3, #198) 切换到的**新一代**密钥 (kid 不同), 其公钥
+/// 独立序列化为 `rotated_jwks_json` (只含新代公钥 — "旧 key 立即下线"是比真实
+/// IdP 新旧并存宽限期更严格的轮换形态). 预生成在静态 IdpKeys 里, 每个测试的
+/// rotate 只是指针切换, 无重复 RSA 生成开销.
 struct IdpKeys {
     signing_key: CoreRsaPrivateSigningKey,
     rogue_key: CoreRsaPrivateSigningKey,
+    rotated_key: CoreRsaPrivateSigningKey,
+    /// 只含轮换代公钥的 JWKS (预序列化).
+    rotated_jwks_json: String,
+    /// 只含初始主密钥公钥的 JWKS (预序列化).
+    initial_jwks_json: String,
 }
 
 /// 主/野密钥共用的 key id (强制 WrongSignature 走签名比较而非 NoMatchingKey).
 const SHARED_KID: &str = "test-key-1";
 
+/// 轮换代密钥的 key id (与 SHARED_KID 不同, 模拟 IdP 换发新 kid).
+const ROTATED_KID: &str = "test-key-rotated";
+
 fn generate_keys() -> IdpKeys {
     let mut rng = OsRng;
     let main_priv = RsaPrivateKey::new(&mut rng, 2048).expect("gen main rsa key");
     let rogue_priv = RsaPrivateKey::new(&mut rng, 2048).expect("gen rogue rsa key");
+    let rotated_priv = RsaPrivateKey::new(&mut rng, 2048).expect("gen rotated rsa key");
 
     let main_pem = main_priv
         .to_pkcs1_pem(LineEnding::LF)
@@ -88,6 +107,9 @@ fn generate_keys() -> IdpKeys {
     let rogue_pem = rogue_priv
         .to_pkcs1_pem(LineEnding::LF)
         .expect("rogue to pkcs1 pem");
+    let rotated_pem = rotated_priv
+        .to_pkcs1_pem(LineEnding::LF)
+        .expect("rotated to pkcs1 pem");
 
     // 主/野密钥故意共用 kid — 详见 IdpKeys 文档.
     let kid = JsonWebKeyId::new(SHARED_KID.to_string());
@@ -95,10 +117,27 @@ fn generate_keys() -> IdpKeys {
         CoreRsaPrivateSigningKey::from_pem(&main_pem, Some(kid.clone())).expect("main from pem");
     let rogue_key =
         CoreRsaPrivateSigningKey::from_pem(&rogue_pem, Some(kid)).expect("rogue from pem");
+    let rotated_key = CoreRsaPrivateSigningKey::from_pem(
+        &rotated_pem,
+        Some(JsonWebKeyId::new(ROTATED_KID.to_string())),
+    )
+    .expect("rotated from pem");
+
+    let initial_jwks_json = serde_json::to_string(&CoreJsonWebKeySet::new(vec![
+        signing_key.as_verification_key(),
+    ]))
+    .expect("serialize initial jwks");
+    let rotated_jwks_json = serde_json::to_string(&CoreJsonWebKeySet::new(vec![
+        rotated_key.as_verification_key(),
+    ]))
+    .expect("serialize rotated jwks");
 
     IdpKeys {
         signing_key,
         rogue_key,
+        rotated_key,
+        rotated_jwks_json,
+        initial_jwks_json,
     }
 }
 
@@ -171,11 +210,14 @@ struct IdpState {
     issuer: String,
     /// 客户端预期的 client_id (id_token aud claim 用).
     client_id: String,
-    /// 主签名密钥 (公钥进 JWKS) + 野密钥 (WrongSignature 用). 静态共享 (跨所有测试,
-    /// 避免每个测试重复生成 RSA 密钥对的 ~100ms 开销).
+    /// 静态密钥组 (跨所有测试共享): 初始主密钥 + 野密钥 + 轮换代密钥 + 两代 JWKS.
     keys: &'static IdpKeys,
-    /// JWKS JSON (预序列化, /jwks 直接返回).
-    jwks_json: String,
+    /// 当前活跃的是哪一代签名密钥 (false = 初始主密钥, true = 轮换代).
+    /// per-instance 状态: 不同测试 spawn 的 mock IdP 互不影响轮换进度.
+    rotated: Arc<Mutex<bool>>,
+    /// discovery 端点故障开关 (true = /.well-known/openid-configuration 返回 500).
+    /// 模拟 IdP 半故障 (token 端点正常但 discovery 不可用), 测试 JWKS 刷新失败路径.
+    discovery_broken: Arc<Mutex<bool>>,
     /// 下一次 /token 请求的策略. 一次性 (取出即清, 防串扰).
     token_policy: Arc<Mutex<Option<TokenPolicy>>>,
     /// 所有收到的 /token 请求 body (PKCE verifier 断言用).
@@ -192,6 +234,25 @@ impl MockIdp {
         *self.state.token_policy.lock() = Some(policy);
     }
 
+    /// 模拟 IdP 轮换签名密钥 (OIDC Core #RotateSigKeys): 切换到新一代密钥
+    /// (kid `test-key-rotated`), JWKS 替换为只含新代公钥.
+    ///
+    /// 之后所有 id_token 都用新密钥签 (与真实 IdP 行为一致: 轮换后新签发的 token
+    /// 全部用新 key). 客户端若仍持旧 JWKS 快照 → NoMatchingKey → #198.
+    fn rotate_keys(&self) {
+        *self.state.rotated.lock() = true;
+    }
+
+    /// 使 discovery 端点返回 500 (token 端点不受影响 — 模拟 IdP 半故障).
+    fn break_discovery(&self) {
+        *self.state.discovery_broken.lock() = true;
+    }
+
+    /// 恢复 discovery 端点正常响应 (与 break_discovery 对称).
+    fn fix_discovery(&self) {
+        *self.state.discovery_broken.lock() = false;
+    }
+
     /// 取出所有收到的 /token 请求 body (PKCE verifier round-trip 断言用).
     fn token_requests(&self) -> Vec<String> {
         self.state.token_requests.lock().clone()
@@ -206,16 +267,30 @@ impl MockIdp {
     }
 }
 
+impl IdpState {
+    /// 当前活跃签名密钥 + 其对应的 JWKS JSON (SSOT: "JWKS 公布的 == 活跃签名密钥
+    /// 的公钥" 这一 mock 保真度不变量由本方法唯一维护, /token 与 /jwks 共用).
+    fn active_signing(&self) -> (&CoreRsaPrivateSigningKey, &str) {
+        if *self.rotated.lock() {
+            (&self.keys.rotated_key, &self.keys.rotated_jwks_json)
+        } else {
+            (&self.keys.signing_key, &self.keys.initial_jwks_json)
+        }
+    }
+}
+
 /// 启动 mock IdP server (返回控制 handle).
 ///
 /// IdP endpoint 布局:
-/// - `GET /.well-known/openid-configuration`: discovery metadata (issuer == self origin).
-/// - `GET /jwks`: JWKS 公钥 (仅主密钥).
+/// - `GET /.well-known/openid-configuration`: discovery metadata (issuer == self origin;
+///   `break_discovery` 后返回 500, 模拟 IdP 半故障).
+/// - `GET /jwks`: JWKS 公钥 (初始主密钥; `rotate_keys` 后只含轮换代公钥).
 /// - `POST /token`: token exchange (按 token_policy 返回).
 /// - `GET /authorize`: 占位 (OIDC flow 不会真访问, 因为客户端 login 直接重定向 IdP
 ///   但本测试不发真实授权请求; 此路由存在仅是为了 discovery metadata 字段合法).
 async fn spawn_mock_idp() -> MockIdp {
-    // 跨测试共享 RSA 密钥对 (避免每个测试重复 ~100ms 生成开销, ~13 个测试 → 省 ~1.3s).
+    // 跨测试共享 RSA 密钥组 (避免每个测试重复 ~150ms 生成 3 把密钥的开销, ~19 个
+    // 测试 → 省数秒).
     // 安全性: 密钥仅用于测试签 id_token, 不持有任何真实凭证; 共享不影响测试隔离性
     // (每个测试的 nonce/state/code 仍独立生成, 验签只关心公钥-签名匹配而非密钥独占).
     static SHARED_KEYS: OnceLock<IdpKeys> = OnceLock::new();
@@ -225,14 +300,12 @@ async fn spawn_mock_idp() -> MockIdp {
     let addr = listener.local_addr().unwrap();
     let issuer = format!("http://{addr}");
 
-    let jwks = CoreJsonWebKeySet::new(vec![keys.signing_key.as_verification_key()]);
-    let jwks_json = serde_json::to_string(&jwks).expect("serialize jwks");
-
     let state = IdpState {
         issuer: issuer.clone(),
         client_id: "test-client".to_string(),
         keys,
-        jwks_json,
+        rotated: Arc::new(Mutex::new(false)),
+        discovery_broken: Arc::new(Mutex::new(false)),
         token_policy: Arc::new(Mutex::new(None)),
         token_requests: Arc::new(Mutex::new(vec![])),
     };
@@ -241,15 +314,27 @@ async fn spawn_mock_idp() -> MockIdp {
         .route(
             "/.well-known/openid-configuration",
             get({
+                let state = state.clone();
                 let iss = issuer.clone();
-                move || async move { discovery_response(&iss) }
+                move || async move {
+                    if *state.discovery_broken.lock() {
+                        let mut resp = idp_json_response(r#"{"error":"discovery broken by test"}"#);
+                        *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                        return resp;
+                    }
+                    discovery_response(&iss)
+                }
             }),
         )
         .route(
             "/jwks",
             get({
-                let jwks = state.jwks_json.clone();
-                move || std::future::ready(idp_json_response(&jwks))
+                let state = state.clone();
+                move || {
+                    let (_, jwks) = state.active_signing();
+                    let jwks = jwks.to_string();
+                    std::future::ready(idp_json_response(&jwks))
+                }
             }),
         )
         .route("/token", post(handle_token).with_state(state.clone()))
@@ -304,8 +389,11 @@ async fn handle_token(AxumState(state): AxumState<IdpState>, body: String) -> Re
 
     match policy {
         TokenPolicy::Happy { nonce } => {
+            // 活跃密钥按代数选择 (SSOT: IdpState::active_signing): rotate_keys 后用
+            // 新代密钥签, 模拟真实 IdP 轮换后所有新 token 都用新 key 签发.
+            let (active, _) = state.active_signing();
             let id_token = sign_id_token(
-                &state.keys.signing_key,
+                active,
                 &state.issuer,
                 &state.client_id,
                 &nonce,
@@ -318,9 +406,11 @@ async fn handle_token(AxumState(state): AxumState<IdpState>, body: String) -> Re
         TokenPolicy::NoIdToken => token_response_no_id_token(),
         TokenPolicy::WrongNonce { wrong_nonce } => {
             // nonce 故意错: 用 wrong_nonce 当 id_token 的 nonce claim, 但客户端
-            // 会用真实 nonce 验证 → InvalidNonce.
+            // 会用真实 nonce 验证 → InvalidNonce. 签名用活跃密钥 (mock 语义: 除
+            // rogue 例外, IdP 恒用活跃密钥签名), 保证失败发生在 nonce 层.
+            let (active, _) = state.active_signing();
             let id_token = sign_id_token(
-                &state.keys.signing_key,
+                active,
                 &state.issuer,
                 &state.client_id,
                 &wrong_nonce,
@@ -469,6 +559,16 @@ fn creds_from_parts(pkce_verifier: String, nonce: String, csrf_state: String) ->
         old_state: csrf_state.clone(),
         new_state: csrf_state,
     }
+}
+
+/// Happy 登录前置样板: 生成 authorize 凭证 (真实 nonce/state, 与生产 login_start
+/// 路径一致) + 预设 Happy token 策略. 其他 policy 的测试保持显式编排.
+fn happy_login_attempt(idp: &MockIdp, backend: &OidcBackend) -> OidcCredentials {
+    let parts = backend.authorize_url();
+    idp.set_token_policy(TokenPolicy::Happy {
+        nonce: parts.nonce.clone(),
+    });
+    creds_from_parts(parts.pkce_verifier, parts.nonce, parts.csrf_state)
 }
 
 #[tokio::test]
@@ -661,6 +761,11 @@ async fn exchange_and_verify_no_id_token() {
 #[tokio::test]
 async fn exchange_and_verify_wrong_signature() {
     // RED-CRYPTO-1 反向: id_token 用 JWKS 未公布的私钥签名 → 验签必失败.
+    //
+    // 修复 JWKS 轮换 (#198) 后, 此测试兼守卫有界重试的下界: rogue_key 与主密钥
+    // 共用 kid → CryptoError "bad signature" (SignatureVerification 类) → 触发一次 JWKS
+    // 刷新 + 重验 → 仍失败 → 最终必须仍报 IdTokenVerification (刷新不得掩盖
+    // 真正的验签失败, 也不得因刷新重验而放行坏签名).
     let (idp, backend) = spawn_idp_with_backend().await;
 
     let parts = backend.authorize_url();
@@ -673,7 +778,8 @@ async fn exchange_and_verify_wrong_signature() {
     let err = backend.exchange_and_verify(creds).await.unwrap_err();
     match err {
         OidcError::IdTokenVerification(msg) => {
-            // openidconnect 报 "SignatureDoesNotMatch" 或 "NoMatchingKey" (取决于 kid 不在 JWKS).
+            // 共用 kid 设计下 (见 IdpKeys 文档) 恒为 CryptoError "bad signature"
+            // (走完整签名比较), 不耦合 openidconnect 错误文案.
             assert!(!msg.is_empty());
         }
         other => panic!("expected IdTokenVerification, got: {other:?}"),
@@ -700,6 +806,55 @@ async fn exchange_and_verify_wrong_nonce() {
         matches!(err, OidcError::IdTokenVerification(_)),
         "expected IdTokenVerification, got: {err:?}"
     );
+}
+
+#[tokio::test]
+async fn exchange_and_verify_survives_jwks_rotation() {
+    // SEC-AUTH-3 (#198): IdP 轮换签名密钥后, 运行中的 secret-guard 无需重启仍能完成
+    // OIDC 登录. 场景复现 (2026-09-02 线上事故): rauthy 月度自动轮换签名 key, 新签
+    // 发 id_token 的 kid 不在启动时抓取的 JWKS 快照里 → NoMatchingKey → 登录永久
+    // 500, 直到进程重启. 期望: 验签失败触发 JWKS 刷新 (重跑 discovery) + 有界重验
+    // 一次 → 登录成功.
+    let (idp, backend) = spawn_idp_with_backend().await;
+
+    // backend 已持旧一代 JWKS 快照 (只含 kid test-key-1); IdP 轮换到新代
+    // (kid test-key-rotated, JWKS 只含新代公钥), 新 token 全部用新 key 签.
+    idp.rotate_keys();
+
+    let creds = happy_login_attempt(&idp, &backend);
+    let user = backend
+        .exchange_and_verify(creds)
+        .await
+        .expect("login should survive JWKS key rotation without restart");
+    assert_eq!(user.sub, "user-42");
+}
+
+#[tokio::test]
+async fn exchange_and_verify_rotation_refresh_failure_returns_original_error() {
+    // SEC-AUTH-3 边界 (#198): 签名验证失败 + JWKS 刷新也失败 (IdP discovery 故障,
+    // token 端点正常) 时, 必须返回**原始**验签错误 (刷新失败不掩盖真实验签失败,
+    // 也不引入新错误类别), 且旧 client 保持可用 — IdP 恢复后的下一次登录 (再次
+    // 触发刷新) 能自愈, 无需重启进程.
+    let (idp, backend) = spawn_idp_with_backend().await;
+    idp.rotate_keys();
+
+    // 第一轮: 轮换后的 token (新 kid) 验签失败 → 触发刷新 → discovery 500 → 刷新失败.
+    let creds = happy_login_attempt(&idp, &backend);
+    idp.break_discovery();
+    let err = backend.exchange_and_verify(creds).await.unwrap_err();
+    assert!(
+        matches!(err, OidcError::IdTokenVerification(_)),
+        "refresh failure must not mask the original verification error, got: {err:?}"
+    );
+
+    // 第二轮: IdP 恢复 → 同一进程的下一次登录自愈 (再次触发刷新并成功).
+    idp.fix_discovery();
+    let creds = happy_login_attempt(&idp, &backend);
+    let user = backend
+        .exchange_and_verify(creds)
+        .await
+        .expect("login should self-heal after IdP recovery without restart");
+    assert_eq!(user.sub, "user-42");
 }
 
 // ─── handlers 端到端测试 (login_start / oauth_callback / logout / me) ───
