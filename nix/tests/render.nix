@@ -255,6 +255,24 @@
       ok = lib.hasInfix "cache_write = 0." toml;
     }
     {
+      # 汇率换算形态 (CNY 刊例 ÷ 汇率常量): 双精度除法结果 >6 位有效数字,
+      # 序列化必然舍入但属表示属性而非语义改值, 守卫须放行 (混合容差:
+      # 绝对项 5e-7 = 定点 6 位小数舍入半宽 / 相对项覆盖有效数字形态,
+      # 两种 Nix 实现的舍入差异都远在容差内). 大小两档价格都验 — 小价格
+      # (CNY ¥0.1 档 ÷ 6.78 ≈ $0.0147) 是纯相对容差会误拦的值域 (守卫曾因此
+      # 过严), 绝对项正是为其引入.
+      name = "usage: 长小数价格 (汇率换算形态) 放行 — 表示舍入非语义改值";
+      ok =
+        renderOk {
+          usage = baseArgs.usage // {
+            pricingOverride = baseArgs.usage.pricingOverride // {
+              "glm-5.3" = {input = 8.0 / 6.78; output = 28.0 / 6.78; cacheRead = 2.0 / 6.78;};
+              "glm-5.3-flash" = {input = 0.1 / 6.78; output = 2.8 / 6.78; cacheRead = 0.23 / 6.78;};
+            };
+          };
+        };
+    }
+    {
       name = "usage=null → 不渲染 [usage] 段 (全默认走 serde default)";
       ok =
         let t = render (baseArgs // {usage = null;});

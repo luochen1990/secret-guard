@@ -59,9 +59,15 @@
   q = lib.strings.toJSON;
 
   # 浮点渲染为带小数点的 TOML float 形态. 不同 Nix 实现 float 序列化形态不同
-  # (Lix 定点 6 位小数 "1.400000" / 官方 Nix 最短表示, 整数值 float 可能无小数点
-  # "0"), fmtFloat 兜底补 ".0" 保 float 形态防未来严格 parser; round-trip 校验
-  # 兜住定点表示对 <1e-6 价格的静默舍入 (改值即 throw, 对齐本层 fail-fast 立场).
+  # (Lix 定点 6 位小数 "1.400000" / 官方 Nix 最短 round-trip 表示, 整数值 float
+  # 可能无小数点 "0"), fmtFloat 兜底补 ".0" 保 float 形态防未来严格 parser.
+  # round-trip 守卫拦"语义改值"(归零/数量级跳变), 放行"表示舍入"(如汇率换算
+  # 的长小数 8.0/6.78 = 1.179941…) — 混合容差两种序列化形态都完备覆盖:
+  #   - 绝对项 5.0e-7 = 定点 6 位小数的舍入半宽 (与量级无关), 覆盖 Lix 形态;
+  #   - 相对项 1.0e-5 × 对称 max 分母, 覆盖假想的"6 位有效数字"形态 (大数时
+  #     绝对项不够).
+  # 归零拦截的有效值域随之为 |v| > 5.0e-7 — 现实 LLM 价格 ≥ ~1e-3 ($0.015/M
+  # cache 档), 量级余量充足; 对齐本层 fail-fast 立场而不误伤换算形态.
   fmtFloat = v: let
     s = toString v;
     floted =
@@ -69,9 +75,17 @@
       then s
       else "${s}.0";
     rt = (builtins.fromTOML "v = ${floted}").v;
+    # 注 1: Nix float 字面量必须带小数点 (1e-5 非法), 故写 5.0e-7 / 1.0e-5;
+    # 注 2: abs 不用 builtins.abs (部分实现缺失), 内联分支式; 0 - x 是 Nix 的
+    # 一元负写法 (-x 非法).
+    abs = x: if x < 0 then 0 - x else x;
+    diff = abs (rt - v);
+    drifted =
+      rt != v
+      && !(diff <= 5.0e-7 || diff <= 1.0e-5 * lib.max (abs rt) (abs v));
   in
-    lib.throwIf (rt != v)
-    "secret-guard render: 浮点 '${s}' 经 TOML 序列化后改值 (${toString rt}), 价格精度超出 TOML 文本表示能力"
+    lib.throwIf drifted
+    "secret-guard render: 浮点 '${s}' 经 TOML 序列化后语义改值 (${toString rt}), 价格数量级超出 TOML 文本表示能力"
     floted;
 
   # 上游 validate_id 的 Nix 镜像: 1..=64, 首字符字母数字, 其余 [A-Za-z0-9_-].
