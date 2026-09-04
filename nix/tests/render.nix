@@ -2,14 +2,15 @@
 #
 # 覆盖:
 #   - 结构 round-trip: 生成物是合法 TOML (fromTOML), 字段名/嵌套与 src serde
-#     定义吻合 (provider sum type / routes / auth / secrets.entries)
+#     定义吻合 (provider sum type / routes / auth / secrets.entries / usage
+#     定价覆盖段)
 #   - 确定性: providers 按 id 字典序输出
 #   - 转义: 字符串值经 toJSON, 引号/反斜杠 round-trip 不损
 #   - 路径直通: apiKeyFile / valueFile / clientSecretFile / keyFile 原样写入
 #     (无 LoadCredential 派生 — 与 nixos 侧原型的语义差异)
 #   - 布局: 文件单换行结尾, 头部注释存在
 #   - fail-fast: sum type 违规 / base_url 卫生 / id 卫生 / auth 互斥 /
-#     悬空 target / 环检测 全部 eval 期 throw
+#     usage 键卫生与负价 / pricingUrl 形状 / 悬空 target / 环检测 全部 eval 期 throw
 #
 # 模块接线 (选项 → configFile 自动生成) 的冒烟在 nix/tests/module-eval.nix,
 # 本文件只测 render 纯函数. 语义断言 (priority null=禁用/并列列表序) 属上游
@@ -55,6 +56,18 @@
       };
       apiKeys = [{label = "opencode"; keyFile = "/run/secrets/sdk_api_key";}];
     };
+    # usage 全字段形态: 覆盖两模型 — 键故意非字母序 (验证输出按字典序) + 一个
+    # 含 '/' 与 '.' 的键 (验证 quoted key 形态), cache 字段一有一无 (验证省略)
+    usage = {
+      enable = true;
+      retentionDays = 30;
+      pricingUrl = "https://models.dev/api.json";
+      pricingRefreshSecs = 3600;
+      pricingOverride = {
+        "zhipuai/glm-5.3" = {input = 1.4; output = 4.4; cacheRead = 0.26; cacheWrite = 0.0;};
+        "glm-5.3" = {input = 1.4; output = 4.4;};
+      };
+    };
   };
 
   toml = render baseArgs;
@@ -72,6 +85,12 @@
       providers = baseArgs.providers // {${id} = baseArgs.providers.${id} // overrides;};
     });
   renderProviderFails = id: overrides: fails (providerToml id overrides);
+
+  # usage 覆盖的合并逻辑只声明一份 (providerToml 同模式: 保留其余字段,
+  # 保证 throw 源于被测字段)
+  usageFails = o: renderFails {usage = baseArgs.usage // o;};
+  # pricingOverride 单模型覆盖 (attr 键合并)
+  overrideFails = model: o: usageFails {pricingOverride = baseArgs.usage.pricingOverride // {${model} = o;};};
 
   assertions = [
     {
@@ -190,6 +209,58 @@
         in !lib.hasInfix "[auth]" t;
     }
 
+    # ── usage: 定价覆盖 (UsageConfig) ───────────────────────────────────
+    {
+      name = "usage 段: 标量四字段 round-trip 与上游 serde 吻合";
+      ok =
+        parsed.usage.enabled == true
+        && parsed.usage.retention_days == 30
+        && parsed.usage.pricing_url == "https://models.dev/api.json"
+        && parsed.usage.pricing_refresh_secs == 3600;
+    }
+    {
+      # fromTOML 后 attrNames 恒字典序 (attrset 无序), 文档序只有原始串可观测 —
+      # splitString (字面量子串, 非正则) head 长度 = 段头首现位置 (未找到时 head
+      # 为整串, 长度=全长, 比较为 false, 兜底安全)
+      name = "usage: pricingOverride 键字典序输出 (确定性)";
+      ok =
+        let
+          pos = s: builtins.stringLength (builtins.head (lib.splitString s toml));
+        in pos ''[usage.pricing_override."glm-5.3"]'' < pos ''[usage.pricing_override."zhipuai/glm-5.3"]'';
+    }
+    {
+      name = "usage: 含 '/' 键 quoted-key round-trip 不损";
+      ok =
+        let o = parsed.usage.pricing_override."zhipuai/glm-5.3";
+        in o.input == 1.4 && o.output == 4.4 && o.cache_read == 0.26 && o.cache_write == 0.0;
+    }
+    {
+      name = "usage: cacheRead/cacheWrite 省略 → 不生成行 (serde None, 上游回退)";
+      ok =
+        !(parsed.usage.pricing_override."glm-5.3" ? cache_read)
+        && !(parsed.usage.pricing_override."glm-5.3" ? cache_write);
+    }
+    {
+      name = "usage: enable=false + 空覆盖 → [usage] enabled=false 正常渲染 (显式关闭采集)";
+      ok =
+        let
+          t = render (baseArgs // {usage = baseArgs.usage // {enable = false; pricingOverride = {};};});
+          p = (builtins.fromTOML t).usage;
+        in p.enabled == false && !(p ? pricing_override);
+    }
+    {
+      # "0." 同时匹配 "0.0" (官方 Nix) 与 "0.000000" (Lix 定点表示), 排除裸 int "0";
+      # 跨实现锁定 fmtFloat 的 float 形态保证
+      name = "usage: 整数值渲染为 float 形态 (cache_write=0 → 0.x)";
+      ok = lib.hasInfix "cache_write = 0." toml;
+    }
+    {
+      name = "usage=null → 不渲染 [usage] 段 (全默认走 serde default)";
+      ok =
+        let t = render (baseArgs // {usage = null;});
+        in !lib.hasInfix "[usage]" t;
+    }
+
     # ── fail-fast: sum type / 字段卫生 ──────────────────────────────────
     {
       name = "fail-fast: direct 缺 protocol → throw";
@@ -300,6 +371,44 @@
     {
       name = "fail-fast: secrets.entries id 重复 → throw (上游 first-wins 静默, 这里加严)";
       ok = renderFails {secretsEntries = [{id = "k"; valueFile = "/a";} {id = "k"; valueFile = "/b";}];};
+    }
+
+    # ── fail-fast: usage ───────────────────────────────────────────────
+    {
+      name = "fail-fast: pricingOverride 键为空串 → throw";
+      ok = overrideFails "" {input = 1.0; output = 2.0;};
+    }
+    {
+      name = "fail-fast: pricingOverride 键带前后空格 → throw (精确匹配下永不生效)";
+      ok = overrideFails " glm-5.3" {input = 1.0; output = 2.0;};
+    }
+    {
+      name = "fail-fast: pricingOverride 负 input 价 → throw";
+      ok = overrideFails "glm-5.3" {input = -1.4; output = 4.4;};
+    }
+    {
+      name = "fail-fast: pricingOverride 负 output 价 → throw";
+      ok = overrideFails "glm-5.3" {input = 1.4; output = -4.4;};
+    }
+    {
+      name = "fail-fast: pricingOverride 负 cacheRead 价 → throw";
+      ok = overrideFails "glm-5.3" {input = 1.4; output = 4.4; cacheRead = -0.1;};
+    }
+    {
+      name = "fail-fast: pricingOverride 负 cacheWrite 价 → throw";
+      ok = overrideFails "glm-5.3" {input = 1.4; output = 4.4; cacheWrite = -0.01;};
+    }
+    {
+      name = "fail-fast: usage.enable=false 仍配 pricingOverride → throw (死配置)";
+      ok = usageFails {enable = false;};
+    }
+    {
+      name = "fail-fast: pricingUrl 空串 → throw";
+      ok = usageFails {pricingUrl = "";};
+    }
+    {
+      name = "fail-fast: pricingUrl 非 http(s) → throw (加严对齐 baseUrl 前缀检查)";
+      ok = usageFails {pricingUrl = "ftp://models.local/api.json";};
     }
 
     # ── fail-fast: 跨 provider 图校验 ──────────────────────────────────

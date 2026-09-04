@@ -6,7 +6,7 @@
 # 互补, 共同锁定 "模块选项 → configFile 生成" 链路.
 #
 # 用法: assert-toml.py <mode> <toml-path>
-#   mode = minimal : 全字段形态 (direct+router+secrets+auth), 对齐 module-eval
+#   mode = minimal : 全字段形态 (direct+router+secrets+auth+usage), 对齐 module-eval
 #                     的最小 host config
 #   mode = inline  : 内联 key 合成组合形态 (apiKey 直值 + 默认路由 router)
 # 字段名断言与 src serde schema (provider.rs/config.rs/auth/mod.rs/secrets.rs)
@@ -61,6 +61,15 @@ if mode == "minimal":
     k = a["api_keys"][0]
     assert k["label"] == "opencode" and k["key_file"] == "/run/secrets/sdk_api_key"
 
+    u = cfg["usage"]
+    assert u["enabled"] is True
+    assert u["retention_days"] == 90  # minimal 未显式设 → 默认值 e2e 镜像锁 (与 Rust impl Default 同步义务)
+    assert u["pricing_url"] == "https://models.dev/api.json"
+    assert u["pricing_refresh_secs"] == 86400  # 未显式设 → module 默认全量渲染
+    po = u["pricing_override"]["glm-5.3"]
+    assert po["input"] == 1.4 and po["output"] == 4.4
+    assert po["cache_read"] == 0.26 and po["cache_write"] == 0.0
+
 elif mode == "inline":
     assert [p["id"] for p in cfg["providers"]] == ["a-router", "b-upstream"], cfg["providers"]
     by_id = {p["id"]: p for p in cfg["providers"]}
@@ -74,6 +83,11 @@ elif mode == "inline":
     assert r["kind"] == "router"
     rt = r["routes"][0]
     assert rt["model_pattern"] == "*" and rt["target"] == "b-upstream" and rt["priority"] == 100
+    # 全默认段不渲染 (module 层 usageUsed/authUsed 判定 → serde default 兜底):
+    # 锁定 "nix options defaults ↔ usageDefaults 镜像 ↔ render 跳过" 的端到端一致
+    # 性 — 任一侧默认值漂移都会让本断言失败 (usage/auth 段出现即漂移)
+    assert "usage" not in cfg
+    assert "auth" not in cfg
 else:
     raise SystemExit(f"unknown mode: {mode}")
 

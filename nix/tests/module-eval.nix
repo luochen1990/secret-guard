@@ -18,7 +18,7 @@
   # nixosSystem 脚手架: 主模块 + 额外 modules (hostPlatform 由各 config 自带)
   sgEv = extra: lib.nixosSystem {modules = [secretGuardModule] ++ extra;};
 
-  # 结构化最小 host config: direct + router + secrets + auth 全字段形态.
+  # 结构化最小 host config: direct + router + secrets + auth + usage 全字段形态.
   minimalConfig = {
     nixpkgs.hostPlatform = system;
     services.secret-guard = {
@@ -51,6 +51,18 @@
           redirectUrl = "https://sg.example.com/oauth2/callback";
         };
         apiKeys = [{label = "opencode"; keyFile = "/run/secrets/sdk_api_key";}];
+      };
+      usage = {
+        # retentionDays 故意不设 — 锁定默认值 90 的 e2e 镜像链 (assert-toml 断言);
+        # 显式值 30 的 round-trip 由 nix/tests/render.nix 单测覆盖
+        pricingOverride = {
+          "glm-5.3" = {
+            input = 1.4;
+            output = 4.4;
+            cacheRead = 0.26;
+            cacheWrite = 0.0;
+          };
+        };
       };
     };
   };

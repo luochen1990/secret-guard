@@ -145,6 +145,8 @@ pub struct PriceOverride {
 }
 
 impl Default for UsageConfig {
+    // 默认值与 nix/module.nix 的 usageDefaults 互为镜像, 改动任一侧需双侧同步
+    // (usage_config_defaults_when_section_omitted 的字面值断言锁定漂移).
     fn default() -> Self {
         Self {
             enabled: true,
@@ -1908,6 +1910,60 @@ on_probe_exhausted = "fail_closed"
         let cfg: Config = toml::from_str(text).unwrap();
         assert_eq!(cfg.redact.global_mock_prefix, "sgm_");
         assert_eq!(cfg.redact.on_probe_exhausted, OnProbeExhausted::FailClosed);
+    }
+
+    // ─── UsageConfig serde (nix/module.nix render 产物的契约锁定) ──────────
+
+    #[test]
+    fn usage_config_toml_parses_pricing_override() {
+        // toml 形态对齐 nix/render.nix 的 [usage] 段输出 (camelCase 选项 → snake_case
+        // 字段): quoted-key 模型名 + cache 两维省略 (serde None → with_cache_fallback
+        // 回退) 与显式 0.0 (供应商缓存写免费) 两种形态都要能解析.
+        let text = r#"
+[usage]
+enabled = true
+retention_days = 30
+pricing_url = "https://models.dev/api.json"
+pricing_refresh_secs = 3600
+
+[usage.pricing_override."glm-5.3"]
+input = 1.4
+output = 4.4
+cache_read = 0.26
+cache_write = 0.0
+
+[usage.pricing_override."zhipuai-coding-plan/glm-5.3-flash"]
+input = 0.15
+output = 0.5
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        let u = &cfg.usage;
+        assert!(u.enabled);
+        assert_eq!(u.retention_days, 30);
+        assert_eq!(u.pricing_url, "https://models.dev/api.json");
+        assert_eq!(u.pricing_refresh_secs, 3600);
+        assert_eq!(u.pricing_override.len(), 2);
+        let full = &u.pricing_override["glm-5.3"];
+        assert_eq!((full.input, full.output), (1.4, 4.4));
+        assert_eq!((full.cache_read, full.cache_write), (Some(0.26), Some(0.0)));
+        let partial = &u.pricing_override["zhipuai-coding-plan/glm-5.3-flash"];
+        assert_eq!((partial.input, partial.output), (0.15, 0.5));
+        assert_eq!((partial.cache_read, partial.cache_write), (None, None));
+    }
+
+    #[test]
+    fn usage_config_defaults_when_section_omitted() {
+        // nix render 全默认时不生成 [usage] 段 — serde default 兜底. 字面值断言
+        // 锁定 nix/module.nix usageDefaults 镜像的数值层 (assert_eq!(cfg.usage,
+        // UsageConfig::default()) 是自指断言, 改 impl Default 不会红 — Rust 侧
+        // 默认变更时这里的字面量必须手动同步, 漂移即红).
+        let cfg: Config = toml::from_str("[server]\nport = 18787\n").unwrap();
+        let u = &cfg.usage;
+        assert!(u.enabled);
+        assert_eq!(u.retention_days, 90);
+        assert_eq!(u.pricing_url, "https://models.dev/api.json");
+        assert_eq!(u.pricing_refresh_secs, 86400);
+        assert!(u.pricing_override.is_empty());
     }
 
     // ─── Config::load_or_default: 启动时校验 ──────────────────────────────

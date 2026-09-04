@@ -1,7 +1,7 @@
 # NixOS module: services.secret-guard
 #
 # 职责: 把 secret-guard 二进制装成 systemd service, 并提供两代配置姿势:
-#   1. 结构化选项 (推荐): providers / secrets.entries / auth — 未显式设
+#   1. 结构化选项 (推荐): providers / secrets.entries / auth / usage — 未显式设
 #      configFile 时自动经 ./render.nix 生成 secret-guard.toml (eval 期校验内置,
 #      字段名与 src serde schema 同步契约见 render.nix 文件头);
 #   2. 手写 toml (escape hatch): 显式设 configFile 完全接管, 适配生成器覆盖不了
@@ -32,8 +32,30 @@
   # 上游"只认证, 不隔离"哲学: key 池无条件加载.
   authUsed = cfg.auth.enable || cfg.auth.oidc != null || cfg.auth.apiKeys != [];
 
+  # usage 段的 serde 默认值 (src/config.rs UsageConfig::default 的 nix 镜像,
+  # 改上游默认时同步). 用途: ① 判定 usage 是否被使用 (深比较); ② option default
+  # 的单一来源 (字面量只在此声明一次, 三份同步从结构上收敛为两份);
+  # ③ render 传参 (全默认 → null → 不渲染段, serde default 兜底).
+  usageDefaults = {
+    enable = true;
+    retentionDays = 90;
+    pricingUrl = "https://models.dev/api.json";
+    pricingRefreshSecs = 86400;
+    pricingOverride = {};
+  };
+
+  # usage 段是否被使用 (任一字段偏离默认; 深比较 submodule 合并值与默认结构).
+  usageUsed = cfg.usage != usageDefaults;
+
+  # render 的 usage 入参: 全默认 → null (跳过 [usage] 段); 偏离默认 → 全量渲染
+  # (显式优于隐式). 与 authArg 对称的具名绑定.
+  usageArg =
+    if usageUsed
+    then cfg.usage
+    else null;
+
   # 结构化选项是否被使用 (任一非默认).
-  structuredUsed = cfg.providers != {} || cfg.secrets.entries != [] || authUsed;
+  structuredUsed = cfg.providers != {} || cfg.secrets.entries != [] || authUsed || usageUsed;
 
   # render 的 auth 入参: auth 全默认时传 null (跳过 [auth] 段), 否则传完整结构
   # (选项 enable → toml enabled 的命名映射在此完成).
@@ -50,6 +72,7 @@
     inherit (cfg) host port providers;
     secretsEntries = cfg.secrets.entries;
     auth = authArg;
+    usage = usageArg;
   });
 
   # configFile 三态: 显式路径 (手写接管) / 结构化自动 render / 双缺 throw.
@@ -58,11 +81,11 @@
     if cfg.configFile != null
     then
       lib.throwIf structuredUsed
-      "services.secret-guard: configFile 与结构化选项 (providers/secrets.entries/auth) 互斥, 二选一 — 手写 toml 是完全接管, 与自动 render 会静默竞争"
+      "services.secret-guard: configFile 与结构化选项 (providers/secrets.entries/auth/usage) 互斥, 二选一 — 手写 toml 是完全接管, 与自动 render 会静默竞争"
       cfg.configFile
     else if structuredUsed
     then renderedConfig
-    else throw "services.secret-guard: 缺配置 — configFile (手写 toml) 与结构化选项 (providers/secrets.entries/auth) 至少设其一";
+    else throw "services.secret-guard: 缺配置 — configFile (手写 toml) 与结构化选项 (providers/secrets.entries/auth/usage) 至少设其一";
 in {
   options.services.secret-guard = {
     enable = lib.mkEnableOption "secret-guard: lightweight LLM gateway that prevents secret leakage";
@@ -99,7 +122,7 @@ in {
       description = ''
         指向手写 `secret-guard.toml` (声明式 static 配置) — **escape hatch, 完全接管**.
 
-        与结构化选项 (providers / secrets.entries / auth) 互斥, 同设会在 eval 期
+        与结构化选项 (providers / secrets.entries / auth / usage) 互斥, 同设会在 eval 期
         throw; 两者都不设也 throw. 未设此选项且结构化选项有内容时, 自动经
         ./render.nix 生成 toml (结果暴露在 `services.secret-guard.resolvedConfigFile`).
 
@@ -292,6 +315,67 @@ in {
         });
         default = [];
         description = "预填 SDK api key 列表 ([[auth.api_keys]] 段, 上游启动时 hash 后注入 key 池).";
+      };
+    };
+
+    usage = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = usageDefaults.enable;
+        description = ''
+          模型用量统计总开关 ([usage] enabled). false = 不采集不落盘 (record
+          路径零开销). 全 usage 段保持默认时整段不渲染 (serde default 兜底).
+        '';
+      };
+
+      retentionDays = lib.mkOption {
+        type = lib.types.ints.u32;
+        default = usageDefaults.retentionDays;
+        description = "用量明细保留天数 ([usage] retention_days). 0 = 永久保留; 启动时按 ts 清理. 类型对齐上游 u32.";
+      };
+
+      pricingUrl = lib.mkOption {
+        type = lib.types.str;
+        default = usageDefaults.pricingUrl;
+        description = "定价数据源 URL ([usage] pricing_url, models.dev api.json 格式; 可指向自托管镜像).";
+      };
+
+      pricingRefreshSecs = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = usageDefaults.pricingRefreshSecs;
+        description = "定价表刷新间隔秒 ([usage] pricing_refresh_secs; 故意加严: 类型拒 0, 上游 u64 接受但 0 会让每次查询都触发刷新打爆上游). 表过期后首个 usage 查询触发刷新.";
+      };
+
+      pricingOverride = lib.mkOption {
+        type = lib.types.attrsOf (lib.types.submodule {
+          options = {
+            input = lib.mkOption {
+              type = lib.types.float;
+              description = "输入价 ($/1M tokens).";
+            };
+            output = lib.mkOption {
+              type = lib.types.float;
+              description = "输出价 ($/1M tokens).";
+            };
+            cacheRead = lib.mkOption {
+              type = lib.types.nullOr lib.types.float;
+              default = null;
+              description = "缓存读价 ($/1M tokens). null = 省略字段, 上游回退按 input 价.";
+            };
+            cacheWrite = lib.mkOption {
+              type = lib.types.nullOr lib.types.float;
+              default = null;
+              description = "缓存写价 ($/1M tokens). null = 省略字段, 上游回退按 1.25×input (Anthropic 惯例近似); 供应商缓存写免费时应显式设 0.0 (注意 types.float 不收整数字面量).";
+            };
+          };
+        });
+        default = {};
+        description = ''
+          用户定价覆盖 ([usage.pricing_override], 键 = 聚合用 model 字符串).
+          最高优先于 models.dev 远程表 — 典型场景: 套餐/包年入口在 models.dev
+          登记为零价 (或域名消歧命中零价 vendor), 按官方 API 刊例价覆盖以真实
+          反映消耗. 聚合 model 串取上游回显 model (计费模型), fallback 请求 model.
+        '';
       };
     };
   };
