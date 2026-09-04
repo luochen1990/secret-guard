@@ -199,11 +199,18 @@ struct UsageAgg {            // 按 (day, provider, model) 三元组 fold
 - **冷启动行为**: 首拉完成前所有 cost = null, 响应携带
   `pricing_status: "loading" | "ok" | "stale" | "offline"`, UI 显示价目表状态;
   并发查询经 single-flight 等待首个结果 (超时 5s 按 offline 返回, 不阻塞).
-- **匹配规则** (v2 成文):
+- **匹配规则** (v2 成文, #202 修订碰撞语义):
   1. 用户 override 全名精确匹配 (键 = 聚合用 model 字符串本身) —— 最高优先;
-  2. models.dev `vendor/model_id` 全表扫描: `model_id` 与回显串**精确相等**且唯一
-     命中 → 取; 多 vendor 同名 → 按 provider `base_url` 域名启发匹配 vendor
-     (api.openai.com → openai 等), 仍歧义 → 取字母序第一个 + 响应标记 `ambiguous`;
+  2. models.dev `model_id` 精确匹配: 唯一命中 → 取; 多 vendor 同名 → 域名启发
+     消歧 —— hint host 的 vendor 集与候选集**交集非空则收缩到交集** (用户
+     provider 就部署在该 host 上, 交集外是别家 host 的 vendor), 空 = 无信号,
+     不收缩、全池落偏好序; 收缩后在池内按**确定性偏好序**取第一: 无 `-plan` 段
+     (套餐/订阅系 vendor) > 名字短 > 字母序. 同 host 多 vendor 碰撞 (如
+     open.bigmodel.cn 上 `zhipuai` 与 `zhipuai-coding-plan`) 全部保留候选,
+     **不依赖上游 JSON 键序** (#202: 单值 last-wins 曾让套餐 vendor 静默胜出,
+     cost 恒 0 且 coverage=1.0). 偏好序是**启发式策略而非正确性保证** (命名漂移
+     可击穿, 如不含 plan 段的订阅系命名), 被击穿时零价结果由 `zero_priced_models`
+     显式暴露 (见 §8), 用户可用 `pricing_override` 一锤定音;
   3. 剥日期后缀 (`-YYYY-MM-DD$`, 11 chars) 后重复步骤 2
      (`gpt-5.6-terra-2026-07-09` → `gpt-5.6-terra`). 注: `-YYMMDD` 形态
      (如 anthropic 的 `claude-3-5-sonnet-20240620`) 不剥 — 该 dated 形态本身通常
@@ -238,7 +245,10 @@ GET /api/usage/summary?days=7        # days=0 = 今日, 缺省 7; 上限 = reten
     "by_day":     [ { "day": "2026-09-01", ...UsageAgg, "est_cost_usd": ... }, ... ],
     "by_model":   [ { "model": "...", "provider": "...", ...UsageAgg, "est_cost_usd": ... }, ... ],
     "by_provider":[ { "provider": "...", ...UsageAgg, "est_cost_usd": ... }, ... ],
-    "unpriced_models": ["my-relay/gpt-fork"]
+    "unpriced_models": ["my-relay/gpt-fork"],
+    "zero_priced_models": ["glm-5.3"]        // 有价但四价全零 (免费档/套餐 vendor,
+                                              // 含 override 显式置零); 与 unpriced 分开
+                                              // 显式, 防 cost=0 + coverage=1.0 掩盖 (#202)
   }
 ```
 

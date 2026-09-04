@@ -950,18 +950,22 @@ None, UI 显示 "—" 而非 $0.00, P-4); 对聚合线性 (逐事件算再求和
 
 **Properties**:
 - `prop_usage_cost_linear_in_aggregation`: fold 后算 == 逐事件算再求和. 🔁→`cost_is_linear_in_aggregation` (`src/usage/summary.rs`)
-- `prop_usage_pricing_match_rule`: 匹配规则 SSOT: override 精确 > remote 精确 (多 vendor 域名消歧, 仍歧义字母序) > 剥 `-YYYY-MM-DD` 后缀重试 > None. 🔁→`match_override_wins_over_remote` (`src/usage/pricing.rs`) + `match_strips_date_suffix` (`src/usage/pricing.rs`) + `match_ambiguous_resolved_by_domain_hint_then_alphabetical` (`src/usage/pricing.rs`)
+- `prop_usage_pricing_match_rule`: 匹配规则 SSOT: override 精确 > remote 精确 (多 vendor 消歧: hint host 的 vendor 集与候选集交集非空则收缩到交集; 池内确定性偏好序 = 无 `-plan` 段 > 名短 > 字母序; 结果与上游数据键序无关, #202) > 剥 `-YYYY-MM-DD` 后缀重试 > None. 🔁→`match_override_wins_over_remote` (`src/usage/pricing.rs`) + `match_strips_date_suffix` (`src/usage/pricing.rs`) + `match_host_collision_prefers_non_plan_vendor` (`src/usage/pricing.rs`) + `match_host_pool_shrinks_to_own_host_vendors` (`src/usage/pricing.rs`) + `match_length_tiebreak_prefers_shorter_name` (`src/usage/pricing.rs`) + `plan_vendor_detection_uses_segment_match` (`src/usage/pricing.rs`) + `match_ambiguous_hint_miss_falls_back_to_preference_order` (`src/usage/pricing.rs`)
 - `prop_usage_pricing_schema_snapshot`: models.dev api.json 解析: cost 四价 + vendor api 域名提取; 无 cost 条目跳过; 解析成功但零价 (schema 漂移) 拒绝采信. 🔁→`parse_extracts_prices_and_vendor_domains` (`src/usage/pricing.rs`)
 
 ### USAGE-4 缺失显式
 
 **陈述**: `requests == Σ(有 usage 行) + requests_without_usage`; usage 为空的行对
 token / cost 贡献恒为 0; `cost_coverage` 只以有 usage 的请求为分母; 无价 model 进
-`unpriced_models` 清单.
+`unpriced_models` 清单; 有价但四价全零的 model (免费档 / 套餐 vendor 计量口径, 含
+override 显式置零) 进 `zero_priced_models` 清单 —— "$0 已知价"与"无价"分开显式,
+零价仍计入 coverage 分子 (零价是已知的价), 但单独列出防 cost=0 + coverage=1.0
+掩盖 (#202).
 
 **Properties**:
 - `prop_usage_missing_explicit_accounting`: without_usage 计数独立 + token 贡献为零 + coverage 分母口径. 🔁→`record_accumulates_per_key_and_counts_missing_usage` (`src/usage/store.rs`) + `summary_sums_match_totals_across_all_views` (`src/usage/summary.rs`; coverage=0.5 断言内嵌)
 - `prop_usage_unpriced_models_listed`: 无价 model 显示在 unpriced_models (提示配 override), 不产生 cost. 🔁→`summary_sums_match_totals_across_all_views` (`src/usage/summary.rs`; unpriced 断言内嵌) + `match_unpriced_returns_none` (`src/usage/pricing.rs`)
+- `prop_usage_zero_priced_models_listed`: 全零价 model 显示在 zero_priced_models (提示按量估算口径可能失真), coverage 口径不变. 🔁→`zero_priced_models_listed_without_breaking_coverage` (`src/usage/summary.rs`)
 
 ### USAGE-5 计入判据
 
@@ -1022,3 +1026,4 @@ chars (char boundary 安全); 其余 UsageEvent 字段为受控类型, 天然无
 | 2026-08-31 | FWD-7 | 新增: router provider 模型列表 GET 请求本地合成 (别名 ∪ 过滤后上游清单), 收纳 N1 合并过滤 (以缓存快照为 oracle) / N6 exact-only 零 fetch / 上游 fetch best-effort 永不 fail 查询 / fetch 失败退避 (30s 窗口内不重试, 窗口内查询立即 serve stale) / single-flight 并发去重 / Direct 透传回归守卫 (D6) / 别名 advertised ⇒ resolvable (D2) / DAG 零记录 (D5) 共 8 条 property | #196: open-webui 等消费方依赖 /models 发现模型, 别名不在透传列表导致 taskModel 静默回退; exact-only router 对 GET /models 直接 503 |
 | 2026-09-03 | USAGE-1..6 | 新增模型用量统计 (usage-stats) 契约域: 聚合一致性 (三向相等 + 重放恢复) / 回显保真 (presence 位区分无回显与显式零, 联动 STR-2) / 成本纯函数与可复算 (models.dev 匹配规则 SSOT + 实时重算快照语义) / 缺失显式 (without_usage + coverage 口径) / 计入判据 (仅 POST 且收到上游响应; GET /models 与 send 失败不计) / SEC 边界 (model 字符串扫描 + 截断) | 模型用量统计功能 (设计 `docs/design/usage-stats.md`, 网关计量位势: wire 层回显消费, 零 tokenizer) |
 | 2026-08-31 | FWD-1 | **适用范围修订 (待人工授权)**: router provider 的模型列表 GET 请求 (FWD-7 域) 本地终结, 不转发上游 — 对这类请求 FWD-1 不适用 (响应为本地合成, 可含缓存上游清单, 非实时中继); Direct provider 的 /models 仍受 FWD-1 约束 (先例: 2026-08-24 #183 的 FWD-1 修订) | #196: 模型列表发现是网关自身的元数据职责, 透传上游列表无法承载路由别名 |
+| 2026-09-04 | USAGE-3 + USAGE-4 | USAGE-3 多 vendor 消歧语义澄清 (人工授权, #202): 原文"域名消歧, 仍歧义字母序"未规定同 host 多 vendor 碰撞行为, 实现为 last-wins (结果静默依赖上游 JSON 键序, 套餐 vendor 胜出 → cost 恒 0). 修订为: hint host 的 vendor 集与候选集交集非空则收缩到交集, 池内确定性偏好序 (无 `-plan` 段 > 名短 > 字母序), 结果与数据键序无关; 偏好序是启发式策略而非正确性保证. USAGE-4 新增 `zero_priced_models` 显式清单 (零价 ≠ 无价, coverage 口径不变) | #202: 套餐入口部署 est_cost_usd 恒 0 且 cost_coverage=1.0 掩盖异常; 链路缺口 = 消歧规则对碰撞场景欠规定 + 零价缺少显式观测信号 |

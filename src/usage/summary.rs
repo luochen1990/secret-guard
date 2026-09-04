@@ -8,7 +8,8 @@
 //! - **USAGE-3 成本纯函数与可复算**: [`cost_usd`] 确定性纯函数, 对 fold 后的
 //!   agg 与逐事件求和线性一致 (input/cache 数字累加, 成本对数字线性).
 //! - **USAGE-4 缺失显式**: without_usage 的行对 token / cost 贡献恒 0 (agg 折叠
-//!   时已保证); `cost_coverage` 只把**有 usage 的请求**作为分母.
+//!   时已保证); `cost_coverage` 只把**有 usage 的请求**作为分母; 零价 (免费档 /
+//!   套餐 vendor, #202) 与无价分开显式 —— `zero_priced_models` 清单.
 //!
 //! # 口径注
 //!
@@ -33,6 +34,10 @@ pub struct UsageSummary {
     pub by_provider: Vec<ProviderRow>,
     /// 无价 model 清单 (提示用户配 pricing_override; P-4).
     pub unpriced_models: Vec<String>,
+    /// 有价但四价全零的 model 清单 (models.dev 免费档 / 套餐 vendor 的计量口径,
+    /// 含 override 显式置零). "$0 已知价"与"无价"分开显式 (USAGE-4): 防 cost=0 +
+    /// cost_coverage=1.0 掩盖实际零价口径 (#202).
+    pub zero_priced_models: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -149,6 +154,7 @@ pub fn build_summary(input: SummaryInputs<'_>, status: PricingStatus) -> UsageSu
     let mut with_usage_requests = 0u64;
     let mut priced_requests = 0u64;
     let mut unpriced: Vec<String> = Vec::new();
+    let mut zero_priced: Vec<String> = Vec::new();
     let mut model_rows: Vec<ModelRow> = Vec::new();
     let mut provider_agg: std::collections::HashMap<String, (UsageAgg, f64)> =
         std::collections::HashMap::new();
@@ -162,10 +168,20 @@ pub fn build_summary(input: SummaryInputs<'_>, status: PricingStatus) -> UsageSu
         with_usage_requests += with_usage;
         let price = price_of(model, provider);
         let cost = price.map_or(0.0, |p| cost_usd(&p, agg));
-        // coverage / unpriced 只看有 usage 的请求 (USAGE-4).
+        // coverage / unpriced / zero_priced 只看有 usage 的请求 (USAGE-4).
         if with_usage > 0 {
             match price {
-                Some(_) => priced_requests += with_usage,
+                Some(p) => {
+                    priced_requests += with_usage;
+                    // 零价也是"已知的价" → coverage 仍算 priced (口径不变);
+                    // 但单独列出, 不让 $0 冒充"全覆盖的成本估算".
+                    if p.is_all_zero() {
+                        let name = model.clone().unwrap_or_else(|| "(unknown)".to_string());
+                        if !zero_priced.contains(&name) {
+                            zero_priced.push(name);
+                        }
+                    }
+                }
                 None => {
                     let name = model.clone().unwrap_or_else(|| "(unknown)".to_string());
                     if !unpriced.contains(&name) {
@@ -250,6 +266,7 @@ pub fn build_summary(input: SummaryInputs<'_>, status: PricingStatus) -> UsageSu
         by_model: model_rows,
         by_provider,
         unpriced_models: unpriced,
+        zero_priced_models: zero_priced,
     }
 }
 
@@ -494,5 +511,64 @@ mod tests {
         assert_eq!(sum.totals.agg.requests, 0);
         assert!(sum.totals.cache_hit_rate.is_none());
         assert!(sum.totals.cost_coverage.is_none());
+    }
+
+    // ─── USAGE-4: zero_priced 显式 ($0 不冒充"全覆盖估算", #202) ──────
+
+    #[test]
+    fn zero_priced_models_listed_without_breaking_coverage() {
+        // m-zero: 四价全零 (套餐 vendor / 免费档形态); m-priced: 正常价.
+        let mut overrides = HashMap::new();
+        overrides.insert("m-zero".to_string(), ModelPrice::default());
+        overrides.insert(
+            "m-priced".to_string(),
+            ModelPrice {
+                input: 1.0,
+                output: 2.0,
+                cache_read: 0.1,
+                cache_write: 0.5,
+            },
+        );
+        let table = PricingTable::new(None, overrides);
+        let s = store_with(&[
+            ev(
+                0,
+                "p",
+                Some("m-zero"),
+                Some(UsageQuanta {
+                    i: 100,
+                    o: 50,
+                    cr: 0,
+                    cw: 0,
+                }),
+            ),
+            ev(
+                0,
+                "p",
+                Some("m-priced"),
+                Some(UsageQuanta {
+                    i: 100,
+                    o: 0,
+                    cr: 0,
+                    cw: 0,
+                }),
+            ),
+        ]);
+        let sum = build_summary(
+            SummaryInputs {
+                store: &s,
+                table: &table,
+                days: 1,
+                domain_hint: &no_hint,
+            },
+            PricingStatus::Ok,
+        );
+        // 零价是"已知的价" → coverage 仍算 fully priced (口径不变),
+        // 但 m-zero 显式出现在 zero_priced_models 而非 unpriced_models.
+        assert_eq!(sum.totals.cost_coverage, Some(1.0));
+        assert_eq!(sum.zero_priced_models, vec!["m-zero"]);
+        assert_eq!(sum.unpriced_models, Vec::<String>::new());
+        // cost 只有 m-priced 的贡献 (m-zero ×$0).
+        assert!((sum.totals.est_cost_usd - 0.0001).abs() < 1e-12);
     }
 }

@@ -4118,6 +4118,8 @@
         `Session badges on the Records tab are per-process and reset on restart; this page is a persistent ledger (JSONL, retention via <code>[usage] retention_days</code>).`,
       ];
       if (unpriced.length) parts.push(`No price found for: ${unpriced.map(escapeHtml).join(', ')} — requests still count toward tokens, cost shows "—".`);
+      const zeroPriced = (d.zero_priced_models || []);
+      if (zeroPriced.length) parts.push(`Priced at $0 (free tier or subscription-plan vendor): ${zeroPriced.map(escapeHtml).join(', ')} — costs above are metered estimates; use <code>[usage.pricing_override]</code> to pin exact plan pricing.`);
       if ((t.cost_coverage != null && t.cost_coverage < 0.9) || (t.requests_without_usage || 0) > 0) {
         parts.push(`OpenAI streaming requests only report usage when the client sets <code>stream_options.include_usage = true</code> — such requests appear here without token counts.`);
       }

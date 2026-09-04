@@ -19,9 +19,12 @@
 //! # 匹配规则 (usage-stats 设计 §7 "匹配规则")
 //!
 //! 1. 用户 override 全名精确匹配 (键 = 聚合用 model 字符串, 最高优先);
-//! 2. models.dev `model_id` 精确匹配: 唯一命中 → 取; 多 vendor 同名 → 按 provider
-//!    base_url 域名启发 (vendor 的 `api` 字段 host == hint) 消歧, 仍歧义 →
-//!    字母序第一个 + 标记 ambiguous;
+//! 2. models.dev `model_id` 精确匹配: 唯一命中 → 取; 多 vendor 同名 → 域名启发
+//!    消歧 (hint host 的 vendor 集 ∩ 候选集**非空则收缩到交集**; 空 = 无信号,
+//!    不收缩、全池落偏好序), 池内按**确定性偏好序**取第一: 无 `-plan` 段 >
+//!    名短 > 字母序 (同 host 多 vendor 碰撞场景, #202). 偏好序是启发式策略而非
+//!    正确性保证, 被击穿时零价结果由 `zero_priced_models` 显式暴露 (USAGE-4),
+//!    用户可用 `pricing_override` 一锤定音;
 //! 3. 剥日期后缀 (`-YYYY-MM-DD$`) 后重复步骤 2;
 //! 4. 均失败 → `None` (调用方计入 unpriced, P-4 不显示 $0.00).
 
@@ -49,8 +52,10 @@ pub struct ModelPrice {
 pub struct PricingData {
     /// model_id → 候选 (vendor, price) 列表 (同名多 vendor 时 len>1).
     by_model: HashMap<String, Vec<(String, ModelPrice)>>,
-    /// vendor 的 api base URL host → vendor id (域名启发消歧用).
-    vendor_domain: HashMap<String, String>,
+    /// vendor 的 api base URL host → 候选 vendor 列表 (域名启发消歧用;
+    /// 同 host 多 vendor 碰撞时**全部保留** — 单值 last-wins 会静默依赖上游
+    /// JSON 键序决定胜者, #202. parse 时排序保证与迭代序无关).
+    vendor_domain: HashMap<String, Vec<String>>,
 }
 
 /// 解析状态 (UI 的 `pricing_status`).
@@ -98,7 +103,11 @@ impl PricingData {
             if let Some(api) = obj.get("api").and_then(|v| v.as_str())
                 && let Some(host) = extract_host(api)
             {
-                data.vendor_domain.insert(host, vendor.clone());
+                // 同 host 碰撞全保留 (Vec), 不覆盖 (#202).
+                data.vendor_domain
+                    .entry(host)
+                    .or_default()
+                    .push(vendor.clone());
             }
             let Some(models) = obj.get("models").and_then(|v| v.as_object()) else {
                 continue;
@@ -114,6 +123,11 @@ impl PricingData {
                     .push((vendor.clone(), price));
                 priced += 1;
             }
+        }
+        // 仅为存储形态规范化 + 测试断言确定性 (查询语义由偏好序全序保证,
+        // 不依赖此序).
+        for vendors in data.vendor_domain.values_mut() {
+            vendors.sort();
         }
         (data, priced, skipped)
     }
@@ -144,18 +158,41 @@ impl PricingData {
             [] => None,
             [only] => Some(only.1),
             many => {
-                // 多 vendor 同名: 域名启发 (hint host == vendor 的 api host).
-                if let Some(hint) = domain_hint
-                    && let Some(vendor) = self.vendor_domain.get(hint)
-                    && let Some((_, price)) = many.iter().find(|(v, _)| v == vendor)
-                {
-                    return Some(*price);
-                }
-                // 仍歧义: 字母序第一个 (确定性; 设计 §7 规则 2).
-                many.iter().min_by_key(|(v, _)| v.as_str()).map(|(_, p)| *p)
+                // 多 vendor 同名消歧 (#202), 两级信号强度递减:
+                // 1) host 信号 (部署侧事实): hint host 的 vendor 集与候选的**交集非空
+                //    则收缩到交集** (用户 provider 就部署在该 host 上, 交集外的候选
+                //    是别家 host 的 vendor); 空交集 / 无 hint = 无信号, 不收缩.
+                let pool: Vec<&(String, ModelPrice)> = domain_hint
+                    .and_then(|h| self.vendor_domain.get(h))
+                    .and_then(|host_vendors| {
+                        let matched: Vec<_> = many
+                            .iter()
+                            .filter(|(v, _)| host_vendors.contains(v))
+                            .collect();
+                        (!matched.is_empty()).then_some(matched)
+                    })
+                    .unwrap_or_else(|| many.iter().collect());
+                // 2) 确定性偏好序 (数据侧先验, **启发式而非正确性保证**):
+                //    无 `-plan` 段 > 名字短 > 字母序. (bool, usize, &str) 是全序 →
+                //    唯一最小元, 结果与数据迭代序无关. 偏好序被击穿时 (如不含
+                //    plan 段的订阅系命名), 零价结果由 zero_priced_models 显式暴露.
+                pool.into_iter()
+                    .min_by_key(|(v, _)| disambig_key(v))
+                    .map(|(_, p)| *p)
             }
         }
     }
+}
+
+/// vendor 名是否为订阅/套餐系 (`-` 分段含 `plan`, 如 `zhipuai-coding-plan` /
+/// `tencent-token-plan`). 段匹配防 `planetscale` 型子串误伤.
+fn is_plan_vendor(v: &str) -> bool {
+    v.split('-').any(|seg| seg == "plan")
+}
+
+/// 碰撞消歧的偏好序键: (是否 plan vendor, 名长, 名字) 逐级字典序比较.
+fn disambig_key(v: &str) -> (bool, usize, &str) {
+    (is_plan_vendor(v), v.len(), v)
 }
 
 /// 缺 cache 价的回退规则 SSOT (P-2 的宽松近似, 有值时永远用真实值):
@@ -174,6 +211,13 @@ impl ModelPrice {
             cache_read: cache_read.unwrap_or(input),
             cache_write: cache_write.unwrap_or(input * 1.25),
         }
+    }
+
+    /// 四价全零 (models.dev 的免费档 / 套餐 vendor 计量口径). summary 据此把
+    /// model 列入 `zero_priced_models` — "$0 已知价" 与 "无价" 分开显式 (USAGE-4),
+    /// 防 cost=0 + coverage=1.0 掩盖 (#202).
+    pub fn is_all_zero(&self) -> bool {
+        self.input == 0.0 && self.output == 0.0 && self.cache_read == 0.0 && self.cache_write == 0.0
     }
 }
 
@@ -457,6 +501,73 @@ mod tests {
                     "gpt-5.6-terra": {"cost": {"input": 2.0, "output": 20.0}}
                 }
             },
+            // ─── 同 host 多 vendor 碰撞样本 (镜像 2026-09 models.dev 实测, #202) ───
+            // zhipuai 对 (按量 vs 套餐): host 均为 open.bigmodel.cn; 套餐侧 glm-5.3
+            // 全零价, glm-4.6v (套餐不含视觉) 保留按量价 → 套餐 vendor 非全零.
+            "zhipuai": {
+                "id": "zhipuai", "name": "Zhipu AI",
+                "api": "https://open.bigmodel.cn/api/paas/v4",
+                "models": {
+                    "glm-5.3": {"cost": {"input": 1.4, "output": 4.4, "cache_read": 0.26, "cache_write": 0}},
+                    "glm-4.6v": {"cost": {"input": 0.3, "output": 0.9}}
+                }
+            },
+            "zhipuai-coding-plan": {
+                "id": "zhipuai-coding-plan",
+                "api": "https://open.bigmodel.cn/api/coding/paas/v4",
+                "models": {
+                    "glm-5.3": {"cost": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}},
+                    "glm-4.6v": {"cost": {"input": 0.3, "output": 0.9}}
+                }
+            },
+            // 127.0.0.1 本地 vendor: openai/gpt-oss-20b 同时被 groq (异 host) 收录,
+            // 用于验证 "host 信号收缩交集" 优于偏好序全长比较.
+            "lmstudio": {
+                "id": "lmstudio",
+                "api": "http://127.0.0.1:1234/v1",
+                "models": {
+                    "openai/gpt-oss-20b": {"cost": {"input": 0.1, "output": 0.1}}
+                }
+            },
+            "groq": {
+                "id": "groq",
+                "api": "https://api.groq.com",
+                "models": {
+                    "openai/gpt-oss-20b": {"cost": {"input": 0.6, "output": 0.6}}
+                }
+            },
+            // llmgateway 对 (均无 plan 段, 前缀对): 锁定真实碰撞数据的确定性.
+            "llmgateway": {
+                "id": "llmgateway",
+                "api": "https://api.llmgateway.io",
+                "models": {
+                    "shared-model": {"cost": {"input": 3.0, "output": 9.0}}
+                }
+            },
+            "llmgateway-providers": {
+                "id": "llmgateway-providers",
+                "api": "https://api.llmgateway.io",
+                "models": {
+                    "shared-model": {"cost": {"input": 9.0, "output": 27.0}}
+                }
+            },
+            // 合成对 (非真实数据): 刻意让长度序与字典序**分歧** — 字母序选
+            // aa-hub-aggregator, 长度序选 zz-relay — 给偏好序的"名短"层判别力
+            // (前缀型真实碰撞对两序同向, 判别不出该层).
+            "zz-relay": {
+                "id": "zz-relay",
+                "api": "https://relay.example.net",
+                "models": {
+                    "discrim-model": {"cost": {"input": 0.7, "output": 0.7}}
+                }
+            },
+            "aa-hub-aggregator": {
+                "id": "aa-hub-aggregator",
+                "api": "https://hub.example.org",
+                "models": {
+                    "discrim-model": {"cost": {"input": 7.0, "output": 7.0}}
+                }
+            },
             "no-cost-vendor": {"id": "nc", "models": {"m-nc": {"limit": {}}}}
         })
     }
@@ -466,17 +577,33 @@ mod tests {
     #[test]
     fn parse_extracts_prices_and_vendor_domains() {
         let (data, priced, skipped) = PricingData::parse(&fixture());
-        assert_eq!(priced, 4, "gpt-5.6-terra ×2 + gpt-free + claude-opus-5");
+        assert_eq!(
+            priced, 14,
+            "gpt-5.6-terra ×2 + gpt-free + claude-opus-5 + 碰撞样本 10"
+        );
         assert_eq!(skipped, 1, "m-nc has no cost");
         assert_eq!(
-            data.vendor_domain.get("api.openai.com").map(String::as_str),
-            Some("openai")
+            data.vendor_domain.get("api.openai.com"),
+            Some(&vec!["openai".to_string()])
         );
         assert_eq!(
-            data.vendor_domain
-                .get("api.anthropic.com")
-                .map(String::as_str),
-            Some("anthropic")
+            data.vendor_domain.get("api.anthropic.com"),
+            Some(&vec!["anthropic".to_string()])
+        );
+        // 同 host 碰撞: 候选全保留且有序 (#202), 不再 last-wins.
+        assert_eq!(
+            data.vendor_domain.get("open.bigmodel.cn"),
+            Some(&vec![
+                "zhipuai".to_string(),
+                "zhipuai-coding-plan".to_string()
+            ])
+        );
+        assert_eq!(
+            data.vendor_domain.get("api.llmgateway.io"),
+            Some(&vec![
+                "llmgateway".to_string(),
+                "llmgateway-providers".to_string()
+            ])
         );
         assert!(!data.vendor_domain.contains_key("relay-x"), "no api field");
     }
@@ -526,16 +653,15 @@ mod tests {
     }
 
     #[test]
-    fn match_ambiguous_resolved_by_domain_hint_then_alphabetical() {
+    fn match_ambiguous_hint_miss_falls_back_to_preference_order() {
         let t = table();
-        // 域名启发: hint 是 anthropic 的 host, 但 gpt-5.6-terra 候选只有
-        // openai + relay-x → 启发不命中 → 字母序 (openai < relay-x).
+        // host 信号缺席 (hint 的 vendor 集与候选无交集) → 偏好序全长比较:
+        // openai 与 relay-x 均无 plan 段, openai 名短 → openai 胜.
         let p = t
             .price_for("gpt-5.6-terra", Some("api.anthropic.com"))
             .unwrap();
-        assert!((p.input - 1.25).abs() < 1e-9, "alphabetical fallback");
-        // 启发命中 relay 的场景: 构造 relay 域名 hint — fixture 中 relay-x 无 api
-        // 字段, 故无法命中; 字母序兜底仍是 openai. (验证确定性即可.)
+        assert!((p.input - 1.25).abs() < 1e-9, "preference-order fallback");
+        // hint host 未注册: 同样落偏好序 (确定性).
         let p2 = t.price_for("gpt-5.6-terra", Some("unknown.host")).unwrap();
         assert!((p2.input - 1.25).abs() < 1e-9);
     }
@@ -550,6 +676,79 @@ mod tests {
         );
         // 非日期后缀不剥.
         assert!(t.price_for("claude-opus-5-latest", None).is_none());
+    }
+
+    // ─── 同 host 多 vendor 碰撞消歧 (#202) ─────────────────────────────
+
+    /// 回归锚 (issue #202): 套餐入口部署 (base_url host 与按量 vendor 共享) 查
+    /// 共享 model, 不得命中套餐 vendor 的零价 —— plan 偏好序取代 last-wins /
+    /// 字母序巧合, 消歧结果与上游数据键序无关.
+    #[test]
+    fn match_host_collision_prefers_non_plan_vendor() {
+        let t = table();
+        let p = t.price_for("glm-5.3", Some("open.bigmodel.cn")).unwrap();
+        assert!(
+            (p.input - 1.4).abs() < 1e-9,
+            "zhipuai (metered) must win over coding-plan zeros, got input={}",
+            p.input
+        );
+        // 无 hint 路径同样 plan-last (字母序巧合被显式规则取代).
+        let p2 = t.price_for("glm-5.3", None).unwrap();
+        assert!((p2.input - 1.4).abs() < 1e-9);
+        // 套餐 vendor 非全零的实证: glm-4.6v (套餐不含视觉, 两侧同价) 消歧结果
+        // 不可观测, 断言其非零 — 把 fixture 的文档主张变成可执行断言.
+        let p3 = t.price_for("glm-4.6v", Some("open.bigmodel.cn")).unwrap();
+        assert!(!p3.is_all_zero());
+    }
+
+    /// host 信号收缩: 候选含别家 host 的 vendor 时, 收缩到本 host 交集 ——
+    /// 即使偏好序全长比较本会选别的 (groq 名比 lmstudio 短).
+    #[test]
+    fn match_host_pool_shrinks_to_own_host_vendors() {
+        let t = table();
+        // 候选 = [groq, lmstudio] (openai/gpt-oss-20b); hint 127.0.0.1 的 vendor 集
+        // 含 lmstudio → 交集 = [lmstudio] → 采信 lmstudio 的价.
+        let p = t
+            .price_for("openai/gpt-oss-20b", Some("127.0.0.1"))
+            .unwrap();
+        assert!(
+            (p.input - 0.1).abs() < 1e-9,
+            "own-host lmstudio must win over shorter-named groq, got input={}",
+            p.input
+        );
+        // 无 hint: 偏好序全长比较 → groq (4 字符) < lmstudio (8 字符) → groq.
+        let p2 = t.price_for("openai/gpt-oss-20b", None).unwrap();
+        assert!((p2.input - 0.6).abs() < 1e-9);
+    }
+
+    /// 偏好序第 2 级: 均无 plan 段时短名优先 (llmgateway vs llmgateway-providers;
+    /// 纯字母序会错选 providers 聚合视图).
+    #[test]
+    fn match_length_tiebreak_prefers_shorter_name() {
+        let t = table();
+        // 合成对 (zz-relay 8 字符 vs aa-hub-aggregator 17 字符) 刻意让长度序与
+        // 字典序分歧 — 字母序会选 aa-hub-aggregator, 此处断言长度序胜出;
+        // 真实前缀对 (llmgateway 对) 两序同向, 仅锁确定性.
+        let p = t.price_for("discrim-model", None).unwrap();
+        assert!(
+            (p.input - 0.7).abs() < 1e-9,
+            "zz-relay (shorter) must win over alphabetically-first aa-hub-aggregator"
+        );
+        let p2 = t.price_for("shared-model", None).unwrap();
+        assert!(
+            (p2.input - 3.0).abs() < 1e-9,
+            "prefix pair: deterministic pick"
+        );
+    }
+
+    /// plan 段匹配防误伤: `planetscale` 不含 `-plan` 段, 不被当作套餐 vendor.
+    #[test]
+    fn plan_vendor_detection_uses_segment_match() {
+        assert!(is_plan_vendor("zhipuai-coding-plan"));
+        assert!(is_plan_vendor("tencent-token-plan"));
+        assert!(is_plan_vendor("stepfun-ai-step-plan"));
+        assert!(!is_plan_vendor("planetscale"));
+        assert!(!is_plan_vendor("openai"));
     }
 
     #[test]

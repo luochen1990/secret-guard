@@ -57,7 +57,7 @@ PATCH  /api/api-keys/{id}/toggle
 
 GET    /api/usage/summary[?days=N]   → UsageSummary {range, pricing_status, totals,
                                                  by_day[], by_model[], by_provider[],
-                                                 unpriced_models[]}
+                                                 unpriced_models[], zero_priced_models[]}
                                                  (模型用量统计: days 缺省 7, 0=今日,
                                                   上限 retention_days; usage tab 5s 节流轮询)
 ```
