@@ -9,17 +9,30 @@
 
 ## 触发与去重
 
-CI 配置 `.forgejo/workflows/ci.yml`, 触发: `push` + `pull_request` + `workflow_dispatch`.
+CI 配置 `.forgejo/workflows/ci.yml`, 触发: `push` + `pull_request` (显式 `types`
+含 `edited`, 为 WIP 门禁衔接 — forgejo 默认事件集不含 title 编辑) + `workflow_dispatch`.
 
-双重去重 (节省 runner):
+三重跳过 (节省 runner):
 
 - **事件去重**: 同一 commit 在 feature branch 上会同时触发 push + pull_request, 跑两次
-  浪费. PR 事件总是跑 (合并前检查, 主要场景); push 仅 master 跑 (合并后的 commit,
-  feature branch 的 push 由 PR 覆盖).
+  浪费. PR 事件总是跑 (合并前检查, 主要场景; draft/WIP PR 除外, 见 WIP 门禁); push 仅
+  master 跑 (合并后的 commit, feature branch 的 push 由 PR 覆盖).
 - **内容去重 (skip-if-passed)**: ff-merge 后 commit SHA 不变, master 的 push 会重复
   触发已跑过的 CI. `pre` job 查 Forgejo API (`head_sha` + `status=success`, 限 ci.yml
   workflow), 命中则 `check` job 跳过 (连 checkout 都不执行). 失败退化为不跳过 (不阻断 CI).
   `workflow_dispatch` 直通不查 skip (手动重跑需无条件执行).
+- **WIP 门禁 (draft PR 跳过, issue #204 / nixos#791)**: draft PR (title 带 `WIP:`/
+  `[WIP]` 前缀) 不触发 CI — WIP PR 离可合并尚远 (forgejo 本就按 WIP 前缀阻塞合并),
+  其上每次 push 的 check 纯属浪费 (runner 单槽位且全 org 共享). 去 WIP 前缀 (title
+  编辑) 触发 `edited` 事件自动补跑. 判定用 payload `pull_request.draft` (=
+  forgejo `IsWorkInProgress()`, 与阻塞合并同一 SSOT, 前缀集随实例配置自动对齐).
+  关键语义 (forgejo v15.0.7 源码核实): ① `pre` + `check` **双 job 都必须门禁** — 只门禁
+  `check` 时 `pre` 跑成功 → run 结论 success → 污染 skip-if-passed 内容去重 (去 WIP 后
+  补跑被误判 "已通过"); 全 job skipped → run 结论 `skipped` (非 success) → 不污染.
+  ② job 级 skip 的 commit status 映射绿色 ("Has been skipped"), 已知残余窗口 (去 WIP →
+  覆盖 run 写 pending 之间, 亚秒) 由 merge automation 组织级根治兜底 (CI 判定改查
+  action runs, skipped run 不被采信, nixos#794). ③ WIP 化的 edited 事件经同
+  concurrency group 取消在跑 CI ("标记 draft 即停止烧 CI").
 
 **PR 并发去旧 (concurrency)**: 同 PR 快速多次 push 时, 旧 run 结果已无意义却在
 single-job runner 上串行占位, 延迟最新 push 的反馈. workflow 级

@@ -6,8 +6,29 @@
 #
 # 触发去重 (与 ~/ws/nixos 的 ci 一致):
 #   同一 commit 在 feature branch 上会同时触发 push + pull_request, 跑两次浪费 runner.
-#   PR 事件总是跑 (合并前检查, 主要场景); push 仅 master 跑 (合并后的 commit; feature
-#   branch 的 push 由 PR 覆盖). 另加 workflow_dispatch 供手动重试.
+#   PR 事件总是跑 (合并前检查, 主要场景; draft/WIP PR 除外, 见 WIP 门禁); push 仅
+#   master 跑 (合并后的 commit; feature branch 的 push 由 PR 覆盖). 另加
+#   workflow_dispatch 供手动重试.
+#
+# WIP 门禁 (issue #204, 模式源自 nixos#791): draft PR (title 带 WIP:/[WIP] 前缀) 不触发
+#   CI — WIP PR 离可合并尚远 (forgejo 本就按 WIP 前缀阻塞合并), 其上每次 push 的 check
+#   纯属浪费; runner 单槽位且全 org 共享串行, 跳过即释放. 判定用 payload 的
+#   pull_request.draft (forgejo 侧 = IsWorkInProgress(), 即阻塞合并的同一 SSOT — 前缀集/
+#   大小写随实例 WORK_IN_PROGRESS_PREFIXES 配置自动对齐, workflow 侧不复制).
+#   相关语义 (forgejo v15.0.7 源码核实, 详见 nixos#791):
+#   - pre + check 双 job 都必须门禁: 只门禁 check 时 pre 会跑成功 → run 结论 success →
+#     污染 skip-if-passed 内容去重 (去 WIP 后的补跑被误判 "已通过"). 全 job skipped →
+#     run 结论 skipped (AggregateJobStatus 全 skip → skipped, 非 success) → 不污染.
+#   - job 级 skip 的 commit status 按上游语义映射为绿色 ("Has been skipped"). 已知残余
+#     窗口: 去 WIP (title 编辑) → edited 事件的覆盖 run 写入 pending 之间 (服务端健康时
+#     亚秒, 无可乘之机); merge automation 侧已组织级根治 (CI 判定改查 action runs,
+#     skipped run 不被采信, nixos#794).
+#   - 衔接关键: forgejo 默认事件集 (opened/synchronize/reopened) 不含 title 编辑, 去 WIP
+#     前缀必须显式订阅 edited (见 on.pull_request.types) 才能自动补跑 CI; "skip 门禁" 与
+#     "edited 订阅" 在同一 ci.yml 版本内原子共存 (同一 head SHA 只有一份 workflow), 不存在
+#     "被 skip 过的 SHA 拿不到补跑" 的窗口.
+#   - WIP 化的 edited 事件经同 concurrency group 取消在跑 CI (符合 "标记 draft 即停止烧
+#     CI" 语义).
 #
 # 内容去重 (skip-if-passed): ff-merge 后 commit SHA 不变, master 的 push 会重复触发
 #   已跑过的 CI. pre job 查 Forgejo API 历史 run, 命中则 check job 跳过 (连 checkout 都不执行).
@@ -31,6 +52,12 @@ name: ci
 on:
   push:
   pull_request:
+    # 前 3 项为 forgejo 服务端默认事件集 (显式列出); edited 为 WIP 门禁衔接 —
+    # 去 WIP 前缀 (PR ready) 时补跑 CI, 机制见文件头 "WIP 门禁".
+    # 注: synchronize 是 forgejo 的转换名 (非 synchronized); edited 亦覆盖 body 编辑
+    # (与 title 编辑共用通知路径), 同 SHA 已成功 run 会被内容去重秒过, 在跑期间编辑则
+    # 经 concurrency 取消重启.
+    types: [opened, synchronize, reopened, edited]
   workflow_dispatch: # 手动重试: forgejo UI → Actions → ci → Run workflow
 
 # PR 并发去旧 (issue #149-2): 同 PR 快速多次 push 时, 旧 run 的结果已无意义 (会被新
@@ -47,8 +74,10 @@ concurrency:
 jobs:
   pre:
     runs-on: vm-nix
-    # workflow_dispatch 不查 skip (手动重跑应无条件执行); push 仅 master 才查
-    if: ${{ github.event_name != 'workflow_dispatch' && (github.event_name != 'push' || github.ref == 'refs/heads/master') }}
+    # workflow_dispatch 不查 skip (手动重跑应无条件执行); push 仅 master 才查;
+    # draft (WIP) PR 跳过 — pre 也必须门禁, 否则 pre 跑成功 → run 结论 success →
+    # 污染内容去重 (见文件头 "WIP 门禁")
+    if: ${{ github.event_name != 'workflow_dispatch' && (github.event_name != 'push' || github.ref == 'refs/heads/master') && (github.event_name != 'pull_request' || github.event.pull_request.draft != true) }}
     permissions:
       actions: read # 查 workflow runs API 需要
     outputs:
@@ -78,9 +107,10 @@ jobs:
   check:
     needs: pre
     runs-on: vm-nix
-    # 双重去重: 事件去重 (push 仅 master) + 内容去重 (已有成功记录则跳过);
+    # 双重去重 + WIP 门禁: 事件去重 (push 仅 master) + 内容去重 (已有成功记录则跳过) +
+    # draft (WIP) PR 跳过 (见文件头 "WIP 门禁");
     # workflow_dispatch 直通 (pre 被 skip 时 should_skip 为空, != 'true' 仍跑)
-    if: ${{ (github.event_name != 'push' || github.ref == 'refs/heads/master') && needs.pre.outputs.should_skip != 'true' }}
+    if: ${{ (github.event_name != 'push' || github.ref == 'refs/heads/master') && needs.pre.outputs.should_skip != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft != true) }}
     # 冷启动预算 (issue #149-1): 持久卷全清后需串行完成 debug 插桩编译 (~20min) →
     # 测试 → release LTO bench (10-20min) → playwright → audit → nix build
     # (冷 store 全量 vendor 编译, 自身 timeout 30min), 双冷 (卷+store 同时重建,

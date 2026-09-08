@@ -455,8 +455,10 @@ cargo run -- run --port 18787
 ### CI (Forgejo Actions)
 
 CI 配置在 `.forgejo/workflows/ci.yml`, 触发条件 `push` + `pull_request` +
-`workflow_dispatch`. 双重去重: 事件去重 (push 仅 master, PR 总是跑) + 内容去重
-(skip-if-passed, ff-merge 后同 SHA 不重跑) + PR 并发去旧 (concurrency 取消同 PR 旧 run).
+`workflow_dispatch`. 跳过/去重机制: 事件去重 (push 仅 master, PR 总是跑 — draft/WIP PR
+除外, 见 WIP 门禁) + 内容去重 (skip-if-passed, ff-merge 后同 SHA 不重跑) + PR 并发去旧
+(concurrency 取消同 PR 旧 run). WIP 门禁 (#204): draft PR (title 带 WIP 前缀) 不触发
+CI, 去 WIP 前缀时经 `edited` 事件自动补跑 (机制见 docs/ci.md "WIP 门禁").
 `check` job 测试集只跑一次, 顺序为
 lock 守卫 → checkout → diff 报告 (PR, 非阻塞) → consistency-check → check+coverage
 (含 doc 门禁 + --locked + typos + deny-offline + check-contracts 契约标注 lint, 阻塞) →
