@@ -649,7 +649,8 @@ configFile (escape hatch, 互斥). 凭据注入 (LoadCredential / sops 直接路
   支持 Responses ⇄ Chat Completions 跨协议翻译 (非流式) + Responses 同协议透传 + Redact (非流式).
   **不支持**: Responses 流式 SSE 事件翻译 (Responses + Redact + `stream=true` 返回 501;
   无 Redact 且路由链无 model 重写的同协议流式透传正常工作; 配置了任一则 501, #183 D5); Responses ⇄ Anthropic 跨协议 (返回 501);
-  hosted tools (web_search/file_search/computer_use/mcp → 静默丢弃); namespace tools
+  hosted tools (web_search/file_search/computer_use/mcp → 静默丢弃; MCP 在客户端 LLM 请求中
+  的呈现形态与协议约束边界调研见 `docs/research/mcp-notes.md`); namespace tools
   flattening; `previous_response_id` 服务端状态 (secret-guard 是 stateless 代理);
   reasoning items 的 `encrypted_content` (同协议 round-trip 也会丢失, 会破坏 reasoning chain).
 - **Responses 协议的 timeline delta 为空**: Responses ingress 的 `req_body_raw` 用 `input[]`
