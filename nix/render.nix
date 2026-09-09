@@ -1,7 +1,7 @@
 # 职责: secret-guard 结构化选项 → toml 的纯渲染函数 (SSOT)
 #
 # 输入为结构化 attrset (nix/module.nix 的 providers / secrets.entries / auth /
-# usage 选项形态), 输出为 secret-guard.toml 字符串. 字段序/注释/排序规则只在此处
+# usage / upstreamTimeouts 选项形态), 输出为 secret-guard.toml 字符串. 字段序/注释/排序规则只在此处
 # 声明一次, 消费侧 (module.nix 自动 render + 本文件契约测试) 只传结构化数据 —
 # 新增 provider 只需设选项, 消灭"手抄 toml 模板 + mkForce 覆盖"模式.
 #
@@ -20,6 +20,11 @@
 #     pricing_refresh_secs / pricing_override{model → input / output /
 #     cache_read? / cache_write?} (cache 两维省略 = serde None → 上游回退
 #     input / 1.25×input)
+#   - ServerConfig (src/config.rs): host / port (恒渲染, 实际由 ExecStart 参数
+#     覆盖) + 上游超时四项 upstreamTimeouts{connectTimeoutSecs /
+#     responseHeaderTimeoutSecs / nonstreamResponseHeaderTimeoutSecs /
+#     streamIdleTimeoutSecs} → snake_case *_secs (null = 全默认 → 不渲染,
+#     serde default 兜底; 非 null = 全量渲染四行; 0 = 无限)
 #
 # eval 期校验单点收敛 (历史原型散在 render 与 checkToml 两处, 此处合一):
 #   - 语法: 生成物 fromTOML round-trip, 非法 TOML 在 eval 期即 throw
@@ -47,6 +52,11 @@
   #            | kind == "router": routes = [{ modelPattern, target,
   #                                           upstreamModel ?, priority ? }] } }
   providers,
+  # [server] 上游超时四项: null = 全默认 → 不渲染 (serde default 兜底); 否则
+  # { connectTimeoutSecs, responseHeaderTimeoutSecs,
+  #    nonstreamResponseHeaderTimeoutSecs, streamIdleTimeoutSecs } 全量渲染
+  # (见上方 schema 注释; 0 = 无限)
+  upstreamTimeouts ? null,
   # redact 段 ([[secrets.entries]]): [{ id, category ? "apikey", valueFile }]
   secretsEntries ? [],
   # null = 跳过 [usage] 段; 否则 { enable, retentionDays, pricingUrl,
@@ -339,15 +349,30 @@
       ++ map renderSecretEntry secretsEntries
     );
 
-  # 上游响应超时字段不渲染 (回归 sg 分档默认 #175): [server] 只写 host/port,
-  # 其余字段 (records_capacity/超时四项) 由上游 serde default 兜底.
+  # [server] 恒写 host/port (实际由 ExecStart --host/--port 参数覆盖, 此处仅作
+  # fallback/调试参考); 超时四项仅在 upstreamTimeouts 非 null (任一字段偏离
+  # serde 默认, module 层深比较判定) 时全量渲染, records_capacity 仍由上游
+  # serde default 兜底 (与 host/port 一样是无需暴露的部署细节).
+  # 量纲: connect=握手 / response_header=流式 TTFT / nonstream_response_header=
+  # 非流式整响应 (单次生成时长上限) / stream_idle=chunk 空闲; 0 = 无限.
+  timeoutLines = lib.optionals (upstreamTimeouts != null) [
+    "# 上游超时 (services.secret-guard.upstreamTimeouts, 偏离默认时全量渲染): 0 = 无限."
+    "upstream_connect_timeout_secs = ${toString upstreamTimeouts.connectTimeoutSecs}"
+    "upstream_response_header_timeout_secs = ${toString upstreamTimeouts.responseHeaderTimeoutSecs}"
+    "upstream_nonstream_response_header_timeout_secs = ${toString upstreamTimeouts.nonstreamResponseHeaderTimeoutSecs}"
+    "upstream_stream_idle_timeout_secs = ${toString upstreamTimeouts.streamIdleTimeoutSecs}"
+  ];
+
   serverSection =
-    lib.concatStringsSep "\n" [
-      "[server]"
-      "# 与 services.secret-guard.host/port 保持一致 (实际由 ExecStart --host/--port 参数覆盖, 此处仅作 fallback/调试参考)."
-      "host = ${q host}"
-      "port = ${toString port}"
-    ];
+    lib.concatStringsSep "\n" (
+      [
+        "[server]"
+        "# 与 services.secret-guard.host/port 保持一致 (实际由 ExecStart --host/--port 参数覆盖, 此处仅作 fallback/调试参考)."
+        "host = ${q host}"
+        "port = ${toString port}"
+      ]
+      ++ timeoutLines
+    );
 
   providerIds = lib.sort (a: b: a < b) (builtins.attrNames providers);
 

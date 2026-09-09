@@ -9,6 +9,7 @@
 #   mode = minimal : 全字段形态 (direct+router+secrets+auth+usage), 对齐 module-eval
 #                     的最小 host config
 #   mode = inline  : 内联 key 合成组合形态 (apiKey 直值 + 默认路由 router)
+#   mode = timeouts: 超时调参形态 (只显式设 nonstream=0, 其余走 option default)
 # 字段名断言与 src serde schema (provider.rs/config.rs/auth/mod.rs/secrets.rs)
 # 逐字段对应 — schema 变更时同步改.
 import sys
@@ -47,9 +48,11 @@ if mode == "minimal":
 
     s = cfg["server"]
     assert s["host"] == "127.0.0.1" and s["port"] == 18787
-    # 超时字段不渲染 (回归上游 #175 分档默认)
+    # 超时字段整组不渲染 (upstreamTimeouts 全默认 → serde default 兜底, 回归 #175)
     assert "upstream_response_header_timeout_secs" not in s
     assert "upstream_connect_timeout_secs" not in s
+    assert "upstream_nonstream_response_header_timeout_secs" not in s
+    assert "upstream_stream_idle_timeout_secs" not in s
 
     a = cfg["auth"]
     assert a["enabled"] is True
@@ -88,6 +91,19 @@ elif mode == "inline":
     # 性 — 任一侧默认值漂移都会让本断言失败 (usage/auth 段出现即漂移)
     assert "usage" not in cfg
     assert "auth" not in cfg
+elif mode == "timeouts":
+    assert [p["id"] for p in cfg["providers"]] == ["b-upstream"], cfg["providers"]
+    s = cfg["server"]
+    assert s["host"] == "127.0.0.1" and s["port"] == 18787
+    # 任一字段偏离默认 (nonstream 300→0) → 四行全量渲染 (module 层 timeoutsUsed
+    # 深比较判定): 锁定 "nix options defaults ↔ upstreamTimeoutsDefaults 镜像 ↔
+    # render 全量" 的端到端一致性 — 任一侧默认值漂移都会让未显式设的三项断言失败
+    assert s["upstream_connect_timeout_secs"] == 15  # 未显式设 → option default
+    assert s["upstream_response_header_timeout_secs"] == 60
+    assert s["upstream_nonstream_response_header_timeout_secs"] == 0  # 拆墙: 无限 (agent-service#130)
+    assert s["upstream_stream_idle_timeout_secs"] == 120
+    # 其余段不受超时调参影响
+    assert "usage" not in cfg and "auth" not in cfg and "secrets" not in cfg
 else:
     raise SystemExit(f"unknown mode: {mode}")
 

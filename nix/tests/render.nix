@@ -185,8 +185,45 @@
         in (builtins.elemAt (builtins.fromTOML t).auth.api_keys 0).key == "sg_x";
     }
     {
-      name = "server 段: host/port 生成, 超时字段不渲染 (回归上游 #175 分档默认)";
+      name = "server 段: host/port 生成, upstreamTimeouts 缺省 → 超时行不渲染 (serde default 兜底, 回归 #175 分档默认)";
       ok = parsed.server.port == 18787 && parsed.server.host == "127.0.0.1" && !(parsed.server ? upstream_response_header_timeout_secs);
+    }
+    {
+      name = "server 段: upstreamTimeouts 显式 → 四行全量渲染, snake_case round-trip 与上游 serde 吻合";
+      ok =
+        let
+          t = render (baseArgs // {
+            upstreamTimeouts = {
+              connectTimeoutSecs = 10;
+              responseHeaderTimeoutSecs = 90;
+              nonstreamResponseHeaderTimeoutSecs = 600;
+              streamIdleTimeoutSecs = 180;
+            };
+          });
+          s = (builtins.fromTOML t).server;
+        in
+          s.host == "127.0.0.1" && s.port == 18787
+          && s.upstream_connect_timeout_secs == 10
+          && s.upstream_response_header_timeout_secs == 90
+          && s.upstream_nonstream_response_header_timeout_secs == 600
+          && s.upstream_stream_idle_timeout_secs == 180;
+    }
+    {
+      # 拆墙场景 (agent-service#130): 非流式整响应超时 300 → 0 (无限), 慢判定权
+      # 交消费方预算; 0 是合法值 (上游 serde 语义: 0 = None = reqwest 无限)
+      name = "server 段: nonstream=0 拆墙形态 → 合法渲染 (0 = 无限)";
+      ok =
+        let
+          t = render (baseArgs // {
+            upstreamTimeouts = {
+              connectTimeoutSecs = 15;
+              responseHeaderTimeoutSecs = 60;
+              nonstreamResponseHeaderTimeoutSecs = 0;
+              streamIdleTimeoutSecs = 120;
+            };
+          });
+          s = (builtins.fromTOML t).server;
+        in s.upstream_nonstream_response_header_timeout_secs == 0;
     }
     {
       name = "头部注释: Auto-generated 标记存在";

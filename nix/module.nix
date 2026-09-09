@@ -1,9 +1,10 @@
 # NixOS module: services.secret-guard
 #
 # 职责: 把 secret-guard 二进制装成 systemd service, 并提供两代配置姿势:
-#   1. 结构化选项 (推荐): providers / secrets.entries / auth / usage — 未显式设
-#      configFile 时自动经 ./render.nix 生成 secret-guard.toml (eval 期校验内置,
-#      字段名与 src serde schema 同步契约见 render.nix 文件头);
+#   1. 结构化选项 (推荐): providers / secrets.entries / auth / usage /
+#      upstreamTimeouts — 未显式设 configFile 时自动经 ./render.nix 生成
+#      secret-guard.toml (eval 期校验内置, 字段名与 src serde schema 同步
+#      契约见 render.nix 文件头);
 #   2. 手写 toml (escape hatch): 显式设 configFile 完全接管, 适配生成器覆盖不了
 #      的字段 (redact 段调参等).
 #   两代互斥 (同设 throw), 双缺也 throw (保留历史必填语义的兜底).
@@ -54,6 +55,29 @@
     then cfg.usage
     else null;
 
+  # 上游超时段的 serde 默认值 (src/config.rs ServerConfig::default 的 nix 镜像,
+  # 改上游默认时同步 — 与 usageDefaults 同模式). 用途: ① option default 的单一
+  # 来源; ② 判定超时是否被使用 (深比较); ③ render 传参 (全默认 → null → 不渲染
+  # 超时行, serde default 兜底).
+  upstreamTimeoutsDefaults = {
+    connectTimeoutSecs = 15;
+    responseHeaderTimeoutSecs = 60;
+    nonstreamResponseHeaderTimeoutSecs = 300;
+    streamIdleTimeoutSecs = 120;
+  };
+
+  # 超时段是否被使用 (任一字段偏离默认). 不参与 structuredUsed: 单设超时而无
+  # provider/secrets/auth/usage 仍是"缺配置" (throw) — 超时只是 server 段调参,
+  # 不构成网关有内容可跑的配置存在性.
+  timeoutsUsed = cfg.upstreamTimeouts != upstreamTimeoutsDefaults;
+
+  # render 的超时入参: 全默认 → null (跳过超时行); 偏离默认 → 全量渲染四行
+  # (显式优于隐式, 与 usageArg 对称).
+  timeoutsArg =
+    if timeoutsUsed
+    then cfg.upstreamTimeouts
+    else null;
+
   # 结构化选项是否被使用 (任一非默认).
   structuredUsed = cfg.providers != {} || cfg.secrets.entries != [] || authUsed || usageUsed;
 
@@ -70,6 +94,7 @@
   renderedConfig = pkgs.writeText "secret-guard.toml" (import ./render.nix {
     inherit lib;
     inherit (cfg) host port providers;
+    upstreamTimeouts = timeoutsArg;
     secretsEntries = cfg.secrets.entries;
     auth = authArg;
     usage = usageArg;
@@ -77,11 +102,13 @@
 
   # configFile 三态: 显式路径 (手写接管) / 结构化自动 render / 双缺 throw.
   # 显式 + 结构化同设 → throw (互斥): 手写会静默胜出, 几乎肯定是迁移残留.
+  # 互斥守卫涵盖 upstreamTimeouts (虽不计入 structuredUsed): 手写 configFile
+  # 下超时设置会无声丢失, 与 "显式 + usage 偏离" 同属迁移残留形态.
   resolvedConfigFile =
     if cfg.configFile != null
     then
-      lib.throwIf structuredUsed
-      "services.secret-guard: configFile 与结构化选项 (providers/secrets.entries/auth/usage) 互斥, 二选一 — 手写 toml 是完全接管, 与自动 render 会静默竞争"
+      lib.throwIf (structuredUsed || timeoutsUsed)
+      "services.secret-guard: configFile 与结构化选项 (providers/secrets.entries/auth/usage/upstreamTimeouts) 互斥, 二选一 — 手写 toml 是完全接管, 与自动 render 会静默竞争"
       cfg.configFile
     else if structuredUsed
     then renderedConfig
@@ -122,9 +149,9 @@ in {
       description = ''
         指向手写 `secret-guard.toml` (声明式 static 配置) — **escape hatch, 完全接管**.
 
-        与结构化选项 (providers / secrets.entries / auth / usage) 互斥, 同设会在 eval 期
-        throw; 两者都不设也 throw. 未设此选项且结构化选项有内容时, 自动经
-        ./render.nix 生成 toml (结果暴露在 `services.secret-guard.resolvedConfigFile`).
+        与结构化选项 (providers / secrets.entries / auth / usage / upstreamTimeouts)
+        互斥, 同设会在 eval 期 throw; 两者都不设也 throw. 未设此选项且结构化选项有内容时,
+        自动经 ./render.nix 生成 toml (结果暴露在 `services.secret-guard.resolvedConfigFile`).
 
         手写场景推荐 `pkgs.writeText` 生成纯文本 toml (可进 nix store, 调试可直接
         `cat`), 并让 toml 中的 `api_key_file` / `value_file` 字段引用外部 secret 路径
@@ -158,6 +185,59 @@ in {
       type = lib.types.bool;
       default = false;
       description = "是否在防火墙开放端口 (仅 host != 127.0.0.1 时有意义).";
+    };
+
+    # 上游超时四项: 合理取值随部署网络环境差异大 (本地 ollama vs 公网高延迟
+    # 上游), 故整体可配置. 类型对齐上游 u64 (ints.unsigned, 0 合法 = 无限).
+    # 量纲与分档语义的完整论证见 src/config.rs ServerConfig 字段注释
+    # (流式 TTFT 档 vs 非流式整响应档, #175).
+    upstreamTimeouts = {
+      connectTimeoutSecs = lib.mkOption {
+        type = lib.types.ints.unsigned;
+        default = upstreamTimeoutsDefaults.connectTimeoutSecs;
+        description = ''
+          上游 DNS+TCP+TLS 握手超时秒 ([server] upstream_connect_timeout_secs).
+          正常 < 3s; 异常 (上游不可达/网络黑洞) 时该超时让 secret-guard 快速失败
+          而非永久挂死. 0 = 无限 (reqwest 默认行为, 不建议).
+        '';
+      };
+
+      responseHeaderTimeoutSecs = lib.mkOption {
+        type = lib.types.ints.unsigned;
+        default = upstreamTimeoutsDefaults.responseHeaderTimeoutSecs;
+        description = ''
+          流式请求 (显式 stream=true) 的响应头到达超时秒 ([server]
+          upstream_response_header_timeout_secs), TTFT 量纲 — 响应头在首 token
+          生成后即返回, 长思考发生在 body 流不受此限. 0 = 无限 (向后兼容,
+          不建议 — 上游 hang 时该超时是唯一的活性检测).
+        '';
+      };
+
+      nonstreamResponseHeaderTimeoutSecs = lib.mkOption {
+        type = lib.types.ints.unsigned;
+        default = upstreamTimeoutsDefaults.nonstreamResponseHeaderTimeoutSecs;
+        description = ''
+          非流式请求的响应头到达超时秒 ([server]
+          upstream_nonstream_response_header_timeout_secs), 整响应量纲 — 非流式
+          响应头要等整个响应生成完才返回, 该值实际是单次生成时长上限.
+
+          默认 300 覆盖 74k token 上下文的整响应生成 (#175). 注意: 非流式请求
+          在生成完成前零字节流动, 网关侧无法区分"慢生成"与"hang 死", 任何墙钟
+          都会误杀超过它的合法慢生成 (agent-service#130: 思考模型大首轮 >300s
+          被掐断 → 消费方重试风暴). 若所有消费方都有自身超时预算兜底 (客户端
+          断连会取消上游请求), 可设 0 (无限) 拆墙 — 让"慢"的判定权归消费方/上游.
+        '';
+      };
+
+      streamIdleTimeoutSecs = lib.mkOption {
+        type = lib.types.ints.unsigned;
+        default = upstreamTimeoutsDefaults.streamIdleTimeoutSecs;
+        description = ''
+          流式响应相邻 chunk 空闲超时秒 ([server] upstream_stream_idle_timeout_secs).
+          正常 chunk 间隔 < 1s; reasoning model 思考静默可能较长 (通常有心跳
+          chunk). 超过视为上游 hang. 0 = 无限.
+        '';
+      };
     };
 
     providers = lib.mkOption {
