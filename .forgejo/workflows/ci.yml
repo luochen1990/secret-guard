@@ -40,6 +40,11 @@
 # `pre` job 产生 `ci / pre (*)` check, 但因 step continue-on-error 兜底,
 # 该 check 对 PR 事件恒为 success, 不影响 branch protection (无需加入 required list).
 #
+# permissions (job 级) 不声明 — Forgejo 不支持该字段 (值被忽略, 且 Actions 界面
+#   对带此字段的 job 显式告警); pre 查 workflow runs API 与 check 发 PR 评论
+#   (diff/bench/WebUI/audit/诊断 5 处) 所需权限由自动注入的 GITHUB_TOKEN 默认覆盖.
+#   迁移 GitHub 时恢复最小权限声明: pre → actions: read; check → pull-requests: write.
+#
 # checkout 直接用 git + SSH (不用 actions/checkout):
 #   forgejo 实例启用了 DISABLE_HTTP_GIT=true (禁止 git over HTTPS), 且内置 SSH server
 #   要求用户名 forgejo (不是 git) + 非标准端口 5522. actions/checkout@v4 硬编码 git@ 用户
@@ -78,8 +83,7 @@ jobs:
     # draft (WIP) PR 跳过 — pre 也必须门禁, 否则 pre 跑成功 → run 结论 success →
     # 污染内容去重 (见文件头 "WIP 门禁")
     if: ${{ github.event_name != 'workflow_dispatch' && (github.event_name != 'push' || github.ref == 'refs/heads/master') && (github.event_name != 'pull_request' || github.event.pull_request.draft != true) }}
-    permissions:
-      actions: read # 查 workflow runs API 需要
+    # 不声明 permissions: (Forgejo 不支持, 见文件头) — 迁移 GitHub 恢复 actions: read
     outputs:
       should_skip: ${{ steps.s.outputs.should_skip }}
     steps:
@@ -120,10 +124,7 @@ jobs:
     # bench/nix job: 拆 job 会丢 CARGO_TARGET_DIR 跨步复用 (release 缓存与 debug 缓存
     # 同卷) 且多一次 checkout, 改动成本高于调 timeout.
     timeout-minutes: 75
-    # 评论 PR 需要 write 权限 (仅 PR 事件下的 diff 报告 step 用). Forgejo Actions 自动注入
-    # GITHUB_TOKEN 默认有此权限, 显式声明遵循最小权限原则.
-    permissions:
-      pull-requests: write
+    # 不声明 permissions: (Forgejo 不支持, 见文件头) — 迁移 GitHub 恢复 pull-requests: write
     # cargo-llvm-cov 依赖 llvm-cov / llvm-profdata (rust 工具链不含). VM 的 systemPackages
     # 落 /run/current-system/sw/bin (NixOS 约定), job 级 env 让所有 step 共享, 无需各自 export.
     #
