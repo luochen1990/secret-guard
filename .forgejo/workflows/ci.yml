@@ -50,7 +50,10 @@
 #   要求用户名 forgejo (不是 git) + 非标准端口 5522. actions/checkout@v4 硬编码 git@ 用户
 #   且 SCP-style URL 无法嵌端口, 对此环境完全不兼容. 直接 git 命令把用户名和端口写在
 #   ssh:// URL 里 (forgejo@git.lambda.lc:5522), 一步到位, 无黑盒.
-#   host key 用 ssh-keyscan 每次动态获取 (runner 在可信 MicroVM, LAN 可信, 首次即信任).
+#   host key TOFU 固定 (2026-09-10 应用 org 标准 CI 模板补齐, directory-algebra #89 同源):
+#     优先 repo secret SSH_KNOWN_HOSTS (内容 = ssh-keyscan 原样输出, 消除动态 keyscan 的
+#     MITM 窗口); secret 缺失退回动态 keyscan + stderr 警告. 服务端 host key 变更须同步轮换.
+#     deploy key 也于同批补清理 step (checkout 后 always() 删除, org 共享 runner 最小权限).
 #   依赖一个 repo-level secret: DEPLOY_KEY (ed25519 私钥; 公钥在 repo Deploy keys 注册).
 name: ci
 
@@ -170,13 +173,19 @@ jobs:
         id: checkout
         env:
           DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
           set -eu
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
           printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -p 5522 git.lambda.lc >> ~/.ssh/known_hosts
+          if [ -n "$SSH_KNOWN_HOSTS" ]; then
+            printf '%s\n' "$SSH_KNOWN_HOSTS" >> ~/.ssh/known_hosts
+          else
+            echo "WARN: repo secret SSH_KNOWN_HOSTS 未设置 (TOFU 固定要求), 退回动态 ssh-keyscan (存在 MITM 窗口)." >&2
+            ssh-keyscan -p 5522 git.lambda.lc >> ~/.ssh/known_hosts
+          fi
           git init
           git remote add origin "ssh://forgejo@git.lambda.lc:5522/${GITHUB_REPOSITORY}.git"
           if [ -n "$BASE_REF" ]; then
@@ -186,6 +195,14 @@ jobs:
             git fetch --depth 1 origin "$GITHUB_SHA"
           fi
           git checkout "$GITHUB_SHA"
+
+      # 最小权限收尾: 清理 deploy key (2026-09-10 应用 org 标准 CI 模板补齐) —
+      # runner VM 与缓存卷为 org 各仓库共享 (单槽位串行), checkout 写入的 key 若不
+      # 清理, 本 repo 的只读 key 对 org 内其他 repo 的后续 job 可读 (ai-powered 首创).
+      # 放 checkout 后立即执行; 后续 diff 分析等非阻塞 step 不再持有 key.
+      - name: Cleanup deploy key
+        if: always() && steps.checkout.outcome == 'success'
+        run: rm -f ~/.ssh/id_ed25519
 
       # ─── PR diff 拆解 (仅 PR 事件, 附加功能, 真正非阻塞) ──────────────────
       # 放在 check 之前: 让 review 时尽早看到 prod/test 膨胀分析, 不必等编译+测试跑完.
