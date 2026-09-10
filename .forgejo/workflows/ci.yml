@@ -1,4 +1,7 @@
 # secret-guard — Forgejo Actions CI
+# form: legacy — 未接 org 薄骨架 (check-drift 豁免标记, 见 forgejo-actions#3):
+#   本仓双 job + PR 评论矩阵 + 锁防御等 ~21 step 编排重度依赖 github context/
+#   secrets, 收编 justfile 不可行 (调研报告 §3.2); 迁移决策另案讨论。
 #
 # runner label: vm-nix (microvm, 由 git.lambda.lc 管理员注册).
 # Rust 工具链直接装在 VM 里 (forgejo-runner-vm.mod.nix),
