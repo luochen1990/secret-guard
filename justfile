@@ -172,6 +172,17 @@ _kill-orphans:
 check-all: check _kill-orphans
     cd tests/webui && playwright test
 
+# org ci 契约 recipe (阻塞级门禁入口, 见 lc-studio/forgejo-actions README)。
+# 本仓是 legacy 形态 (双 job 编排保留在 workflow, 见 ci.yml 头 form: legacy 标记),
+# 本 recipe 收敛 CI 阻塞 job 的质量链 (check-features → check --coverage →
+# coverage-gate → check-file-size), 供本地一键复现与 org 契约走查; bench/WebUI/
+# PR 评论矩阵等编排类或 continue-on-error step 不在此列 (workflow 编排不可收编)。
+ci:
+    just check-features
+    just check --coverage
+    just coverage-gate
+    just check-file-size
+
 # 仅 fmt.
 fmt:
     cargo fmt

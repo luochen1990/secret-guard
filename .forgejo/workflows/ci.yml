@@ -203,8 +203,10 @@ jobs:
       # runner VM 与缓存卷为 org 各仓库共享 (单槽位串行), checkout 写入的 key 若不
       # 清理, 本 repo 的只读 key 对 org 内其他 repo 的后续 job 可读 (ai-powered 首创).
       # 放 checkout 后立即执行; 后续 diff 分析等非阻塞 step 不再持有 key.
+      # 无条件 always() (对齐骨架): checkout 脚本在写 key 之后失败 (fetch 网络抖动)
+      # 恰是最需清理的场景, outcome 条件反而在该路径跳过清理; rm -f 本身无失败面.
       - name: Cleanup deploy key
-        if: always() && steps.checkout.outcome == 'success'
+        if: always()
         run: rm -f ~/.ssh/id_ed25519
 
       # ─── PR diff 拆解 (仅 PR 事件, 附加功能, 真正非阻塞) ──────────────────
