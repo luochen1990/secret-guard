@@ -655,6 +655,8 @@ mod tests {
                 "o",
                 "POST",
                 crate::dag::RoundKind::Normal,
+                uuid::Uuid::new_v4(),
+                None,
                 std::sync::Arc::from(Vec::new().into_boxed_slice()),
             ),
         )

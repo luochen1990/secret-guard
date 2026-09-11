@@ -12,6 +12,10 @@
 > `ok: bool` → **status 原始状态码** (429/4xx/5xx 派生分类); 新增 **redact 审计**
 > (redact_events 表, B 级精度: 事件明细 + mock, USAGE-7; 请求侧落账). 旧 JSONL
 > 不迁移 (留在原地可手动删除). API `days` 参数 → `hours`.
+> v4b 变更 (同日治理扩展): redact 审计加治理三问维度 — 位置分类 category/count
+> (C 级结构化落地, `codec::ir::HitLocations`), auth 归因 api_key_label
+> (AuthenticatedTenant.label), 溯源 node 关联 (悬空容忍). 红线不变: 明文与文本
+> 片段永不持久化.
 > v3 变更 (实施后走查, 2026-09-03): 实施中修正 — days 查询加硬上限 400
 > (ROB: GET 参数防分配 abort); passthrough 降级路径 (secrets 非空 + 无 codec)
 > 的 SEC model 扫描补全 (v2 遗漏); PricingCache 退避窗口补齐 serve-stale 形态;
@@ -135,21 +139,37 @@ GET /api/usage/summary ──► SQLite SQL 聚合 × PricingTable ──► Web
 }
 ```
 
-### RedactEvent 审计行 schema (v4 新增: `redact_events` 表, 每请求 × 每命中 secret 一行)
+### RedactEvent 审计行 schema (v4: `redact_events` 表, 粒度 = 每请求 × 每命中
+secret × 每非零位置分类; v4b 治理三问扩展)
 
 ```jsonc
 {
   "ts": "...", "hour": "...",          // 同上
   "secret_id": "github-token",         // 受控 id (config schema, 无 secret 明文)
   "mock": "sgm_...",                   // 替换值 (C5 保证 + 防御纵深扫描, USAGE-6/7)
+  "category": "system",                // v4b 位置分类: system|tools|user|history|other
+                                       //   (C 级结构化落地 — 只存位置不存内容;
+                                       //    语义: system=提示词污染, tools=工具定义,
+                                       //    user=用户输入, history=历史回显, other=边缘)
+  "count": 2,                          // 该分类在本请求的出现次数 (聚合侧 SUM)
+  "node": "550e8400-...",              // v4b DAG node 关联 (溯源到 mock 化原文;
+                                       //   悬空容忍 — restart/淘汰后 404 降级)
+  "api_key_label": "ci-runner",        // v4b auth 归因 (单用户模式 null)
   "provider": "openai-main",
   "model_req": "gpt-fast",             // 请求侧 (redact 发生在请求侧, 回显未知)
   "proto": "o"
 }
 ```
 
-精度级别 (用户裁决, B 级): A 纯聚合 / **B 事件明细+mock (采纳)** / C B+出现位置 (P2).
-红线: real secret 明文与上下文片段永不持久化.
+精度级别 (用户裁决): A 纯聚合 / **B 事件明细+mock (采纳)** / C B+出现位置
+(**v4b 以结构化形态落地**: category+count 列, 无文本片段).
+红线: real secret 明文与上下文**文本片段**永不持久化 (片段可能含未声明的敏感
+信息; 事后取证走 node 关联的内存态 record, UI 点击 recent 行 view 拉取).
+
+治理工作流闭环: Redactions 视图发现 hits 异常 → 看 categories 判定污染环节
+(system=工具配置 / tools=MCP server / user=用户粘贴 / history=前序泄露回显) →
+看 api_key_label + node 定位客户端与会话 → 点击 (存活的) record 确认上下文 →
+处置 (修工具 + 轮换 secret).
 
 - **SEC 边界 (v2 修正)**: `model` / `model_req` 是**自由 wire 字符串**, 不是受控 id.
   passthrough + fail_open 场景下 secret 理论上可出现在其中 (如中转把路由 key 编码进
@@ -298,10 +318,12 @@ GET /api/usage/summary?hours=168     # hours=0 → 1, 缺省 168 (7d); 上限 = 
     "zero_priced_models": ["glm-5.3"],       // 有价但四价全零 (免费档/套餐 vendor,
                                               // 含 override 显式置零); 与 unpriced 分开
                                               // 显式, 防 cost=0 + coverage=1.0 掩盖 (#202)
-    "redactions": {                           // v4 审计视图 (USAGE-7), 与 usage 同窗口
+    "redactions": {                           // v4b 审计视图 (USAGE-7 治理三问), 与 usage 同窗口
       "by_secret": [ { "secret_id": "...", "mock": "...", "hits": 42,
+                       "categories": { "system": 30, "user": 12 },   // 位置分布
                        "first_ts": "...", "last_ts": "..." }, ... ],
-      "recent":     [ { "ts": "...", "secret_id": "...", "mock": "...",
+      "recent":     [ { "ts": "...", "secret_id": "...", "mock": "...", "category": "system",
+                         "count": 1, "node": "550e...", "api_key_label": null,
                          "provider": "...", "model_req": "...", "proto": "o" }, ... ]  // ≤100
     }
   }

@@ -120,6 +120,12 @@ pub struct RedactionMap {
     pub real_to_mock: HashMap<String, String>,
     /// mock_secret → real_secret.
     pub mock_to_real: HashMap<String, String>,
+    /// real_secret → 位置分类命中计数 (redact 审计, USAGE-7 治理归因:
+    /// "哪个环节把 secret 塞进来"). 键是 real 明文 — 仅内存态, 持久化侧
+    /// 由 usage 层翻译为 (secret_id, category) 行, 明文永不落盘.
+    /// 形态 [`crate::codec::ir::HitLocations`] (IR 位置语义归 codec 域,
+    /// redact 与 usage 均可依赖, 无横向边).
+    pub hits: HashMap<String, crate::codec::ir::HitLocations>,
 }
 
 impl RedactionMap {
@@ -340,6 +346,9 @@ fn redact_ir_inner(
             continue;
         }
         hit_any = true;
+        // 位置统计 (替换前, 只读): 仅对命中的 secret 执行, 与替换遍历同阶
+        // (USAGE-7 治理归因 — 哪个环节把 secret 塞进来).
+        let locations = count_hit_locations(ir, &secret.value);
         match gen_mock_for_ir(ir, secret, seed, &allocated) {
             Ok(mock) => {
                 // 先 insert 到 map (防御性 C4 检查); 成功后再改写 IR + allocated,
@@ -348,6 +357,7 @@ fn redact_ir_inner(
                     Ok(()) => {
                         ir_request_replace_all(ir, &secret.value, &mock);
                         allocated.insert(mock);
+                        map.hits.insert(secret.value.clone(), locations);
                     }
                     Err(e) => {
                         // insert 的 collision 在防御性检查中触发时, 同样降级跳过 (不 panic).
@@ -1027,6 +1037,57 @@ fn ir_request_replace_all(ir: &mut IrRequest, from: &str, to: &str) {
         return;
     }
     ir.for_each_str_leaf_mut(&mut |s| replace_in_place(s, from, to));
+}
+
+// ─── 位置统计 (redact 审计, USAGE-7 治理归因) ──────────────────────────────
+
+/// 只读统计 needle 在单个字符串叶子的出现次数.
+fn str_occurrences(s: &str, needle: &str) -> u64 {
+    if needle.is_empty() {
+        return 0;
+    }
+    s.matches(needle).count() as u64
+}
+
+/// 只读统计 needle 在 [`StringLeafOps`] 结构的全部字符串叶子出现次数
+/// (复用既有只读遍历; 与替换路径 (`for_each_str_leaf_mut`) 覆盖同一叶子集).
+fn leaf_hits(x: &impl StringLeafOps, needle: &str) -> u64 {
+    let mut n = 0;
+    x.for_each_str_leaf(&mut |s| n += str_occurrences(s, needle));
+    n
+}
+
+/// 统计 needle (real secret) 在 IR 各位置类别的出现次数, redact 替换前调用.
+///
+/// 调用前提: `ir_request_contains` 已命中 (本函数不再短路, 直接全量遍历).
+/// 分类语义见 [`HitLocations`]: system / tools / user (contains_user_text) /
+/// history (其余 messages) / other (stop / user 字段 / extra).
+fn count_hit_locations(ir: &IrRequest, needle: &str) -> crate::codec::ir::HitLocations {
+    let mut h = crate::codec::ir::HitLocations {
+        system: ir.system.iter().map(|b| leaf_hits(b, needle)).sum(),
+        tools: ir.tools.iter().map(|t| leaf_hits(t, needle)).sum(),
+        ..Default::default()
+    };
+    for msg in &ir.messages {
+        let n: u64 = msg.content.iter().map(|b| leaf_hits(b, needle)).sum();
+        if n > 0 {
+            if msg.contains_user_text {
+                h.user += n;
+            } else {
+                h.history += n;
+            }
+        }
+    }
+    // other: 协议边缘位置 (stop / user 字段 / extra), 罕见但替换路径覆盖, 审计同步覆盖.
+    let mut other: u64 = ir.stop.iter().map(|s| str_occurrences(s, needle)).sum();
+    if let Some(u) = &ir.user {
+        other += str_occurrences(u, needle);
+    }
+    for v in ir.extra.values() {
+        other += leaf_hits(v, needle);
+    }
+    h.other = other;
+    h
 }
 
 /// 在 s 中替换所有 from 出现为 to.
@@ -2937,5 +2998,89 @@ mod tests {
                 log
             );
         }
+    }
+}
+
+// ─── count_hit_locations (USAGE-7 位置统计) ────────────────────────────────
+
+#[cfg(test)]
+mod hit_location_tests {
+    use super::*;
+    use crate::codec::ir::{IrBlock, IrMessage, IrRole, IrTool};
+
+    fn msg(role: IrRole, text: &str, user_text: bool) -> IrMessage {
+        IrMessage {
+            role,
+            content: vec![IrBlock::Text {
+                text: text.to_string(),
+            }],
+            contains_user_text: user_text,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn hit_locations_classifies_system_tools_user_history_other() {
+        let needle = "sk-secret";
+        let ir = IrRequest {
+            system: vec![IrBlock::Text {
+                text: format!("preamble {needle} here"),
+            }],
+            messages: vec![
+                msg(IrRole::User, &format!("user pasted {needle}"), true),
+                msg(
+                    IrRole::Assistant,
+                    &format!("assistant echoed {needle} {needle}"),
+                    false,
+                ),
+                msg(IrRole::User, "tool result echoes sk-secret", false),
+            ],
+            tools: vec![IrTool {
+                name: format!("tool_{needle}"),
+                description: None,
+                input_schema: serde_json::Value::Null,
+            }],
+            stop: vec![format!("stop-{needle}")],
+            ..Default::default()
+        };
+        let h = count_hit_locations(&ir, needle);
+        assert_eq!(h.system, 1);
+        assert_eq!(h.tools, 1);
+        assert_eq!(h.user, 1);
+        // assistant 2 次 + tool_result 借 user 角色承载 1 次 (contains_user_text=false → history).
+        assert_eq!(h.history, 3);
+        assert_eq!(h.other, 1, "stop 序列入 other");
+        assert_eq!(h.non_zero().count(), 5);
+    }
+
+    #[test]
+    fn hit_locations_matches_actual_replacement_total() {
+        // 一致性: map.hits 的分类总和 == replace 前的 needle 总出现数
+        // (统计与替换遍历覆盖同一叶子集, StringLeafOps 单一实现保证).
+        let needle = "sk-xyz";
+        let mut ir = sample_ir_with_text(&format!("a {needle} b {needle} c"));
+        let (map, _) = redact_ir(&mut ir, &[secret_entry("sid", needle)]);
+        let total: u64 = map
+            .hits
+            .values()
+            .map(|h| h.system + h.tools + h.user + h.history + h.other)
+            .sum();
+        assert_eq!(total, 2, "两处命中都计入位置统计");
+        // sample_ir_with_text 的 fixture 未设 contains_user_text (Default false)
+        // → 该位置的命中归 history; user/history 的分类判定由上方显式 fixture 测试覆盖.
+        assert!(map.hits.values().all(|h| h.history == 2));
+    }
+
+    fn secret_entry(id: &str, value: &str) -> crate::secrets::SecretEntry {
+        let mut e = crate::secrets::SecretEntry {
+            id: id.to_string(),
+            name: None,
+            category: crate::secrets::SecretCategory::ApiKey,
+            value: value.to_string(),
+            value_file: None,
+            mock_strategy: crate::mock::MockStrategy::default(),
+        };
+        e.mock_strategy.resolve_against(&e.value, "");
+        e
     }
 }

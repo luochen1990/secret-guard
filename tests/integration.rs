@@ -7179,9 +7179,17 @@ async fn usage_stats_redact_audit_and_retry_round_recorded() {
         !mock.contains("sk-live-e2e-secret-value"),
         "mock must not leak secret"
     );
+    // 治理归因: 位置分类 — secret 在 user message 里 (两次请求各 1 次).
+    let cats = &by_secret[0]["categories"];
+    assert_eq!(cats["user"].as_u64(), Some(2), "user-message category: {s}");
+    assert_eq!(cats["system"].as_u64(), None, "no system-prompt hit: {s}");
     let recent = s["redactions"]["recent"].as_array().expect("recent");
     assert_eq!(recent.len(), 2);
     assert_eq!(recent[0]["provider"].as_str(), Some("oa-mock"));
+    // 治理溯源: node 列非空 (DAG 关联, 内存态可 drill down); auth 未启用 → key null.
+    assert!(recent[0]["node"].as_str().is_some_and(|n| !n.is_empty()));
+    assert!(recent[0]["api_key_label"].is_null());
+    assert_eq!(recent[0]["category"].as_str(), Some("user"));
     assert!(!format!("{recent:?}").contains("sk-live-e2e-secret-value"));
     let _ = std::fs::remove_file(&db);
 }

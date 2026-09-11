@@ -256,23 +256,50 @@ fn is_sensitive_header(name: &str) -> bool {
 
 // ─── usage-stats 采集上下文构造 (三转发路径共享) ─────────────────────────────
 
+/// usage 接线参数 (usage_ctx_and_record_redactions 的收口 — 避免 10 参签名).
+pub(super) struct UsageWire<'a> {
+    pub fp: &'a super::ForwardPath,
+    pub method: &'a axum::http::Method,
+    pub upstream_id: &'a str,
+    /// 请求侧 model (push_messages 消耗 event 前捕获; CallEvent.model 是 SSOT).
+    pub model_req: Option<String>,
+    pub secrets: &'a [crate::secrets::SecretEntry],
+    /// push_messages 返回的 node id.
+    pub record_id: uuid::Uuid,
+    /// redact 审计采集单元 (redact_and_derive 产出, push 前捕获).
+    pub hits: &'a [crate::usage::RedactHit],
+    /// auth 启用时的 API key label 归因 (单用户模式 None).
+    pub api_key_label: Option<String>,
+}
+
+/// 从 request parts 提取 auth 归因 (require_api_key middleware 注入的 Extension;
+/// auth 未启用时 middleware 不挂载 → None). proxy → auth 是纯类型依赖
+/// (AuthenticatedTenant 数据形态), 见根 AGENTS.md 依赖图例外条目.
+pub(super) fn auth_label(parts: &axum::http::request::Parts) -> Option<String> {
+    parts
+        .extensions
+        .get::<crate::auth::AuthenticatedTenant>()
+        .map(|t| t.label.clone())
+}
+
 /// 构造 [`crate::usage::UsageCtx`] 并**立即落账 redact 审计事件** (USAGE-7 请求侧
 /// 落账点, same_proto×2 / cross_proto 共享, SSOT — 未来新增转发路径不会漏带 SEC
-/// 扫描快照与审计接线). `model_req` 在 push_messages 消耗 event 前捕获
-/// (CallEvent.model 是请求侧 model 的 SSOT); `record_id` 用于回读刚 push 节点的
-/// RoundKind (与 attach_response 同型的安全窗口, 详见 `dag::round_kind_of`);
-/// `redactions` 即 CallEvent.redactions (push 前 Arc-clone, 避免回读 DAG).
-#[allow(clippy::too_many_arguments)]
+/// 扫描快照与审计接线). `record_id` 用于回读刚 push 节点的 RoundKind (与
+/// attach_response 同型的安全窗口, 详见 `dag::round_kind_of`).
 pub(super) fn usage_ctx_and_record_redactions(
     state: &crate::state::AppState,
-    fp: &super::ForwardPath,
-    method: &axum::http::Method,
-    upstream_id: &str,
-    model_req: Option<String>,
-    secrets: &[crate::secrets::SecretEntry],
-    record_id: uuid::Uuid,
-    redactions: &std::sync::Arc<[(String, String)]>,
+    wire: UsageWire<'_>,
 ) -> crate::usage::UsageCtx {
+    let UsageWire {
+        fp,
+        method,
+        upstream_id,
+        model_req,
+        secrets,
+        record_id,
+        hits,
+        api_key_label,
+    } = wire;
     let round_kind = state
         .dag
         .round_kind_of(record_id)
@@ -284,9 +311,11 @@ pub(super) fn usage_ctx_and_record_redactions(
         fp.proto.clone(),
         method.as_str(),
         round_kind,
+        record_id,
+        api_key_label,
         std::sync::Arc::from(secrets.to_vec().into_boxed_slice()),
     );
-    ctx.record_redactions(redactions);
+    ctx.record_redactions(hits);
     ctx
 }
 

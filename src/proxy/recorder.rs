@@ -140,7 +140,40 @@ pub(super) fn parse_request_ir(
 /// `redact_and_derive` 的返回类型别名 (避免 clippy::type_complexity 误报).
 ///
 /// 三元组语义: `(redaction_map, redact_seed, redactions)`.
-type RedactOutcome = Result<(RedactionMap, u64, Vec<(String, String)>), RedactError>;
+/// 从 RedactionMap (SSOT) 派生 usage 审计的采集单元: (secret_id, mock, 位置分布).
+/// 与 [`derive_redactions`] 同源同型 — id 从 snapshot 反查 (real → SecretEntry.id),
+/// locations 取 map.hits (redact_ir_inner 在替换前采集).
+fn derive_redact_hits(
+    redaction_map: &RedactionMap,
+    secrets_snapshot: &[crate::secrets::SecretEntry],
+) -> Vec<crate::usage::RedactHit> {
+    redaction_map
+        .real_to_mock
+        .iter()
+        .filter_map(|(real, mock)| {
+            let id = secrets_snapshot
+                .iter()
+                .find(|s| &s.value == real)
+                .map(|s| s.id.clone())?;
+            let locations = redaction_map.hits.get(real).copied().unwrap_or_default();
+            Some(crate::usage::RedactHit {
+                secret_id: id,
+                mock: mock.clone(),
+                locations,
+            })
+        })
+        .collect()
+}
+
+type RedactOutcome = Result<
+    (
+        RedactionMap,
+        u64,
+        Vec<(String, String)>,
+        Vec<crate::usage::RedactHit>,
+    ),
+    RedactError,
+>;
 
 /// 对 IR 应用 redact 并派生 CallEvent.redactions (same_proto / cross_proto 共享).
 ///
@@ -166,11 +199,14 @@ pub(super) fn redact_and_derive(
         );
     }
     let redactions = derive_redactions(&redaction_map, secrets_snapshot);
+    // usage 审计派生 (USAGE-7 治理归因): (secret_id, mock, 位置分布), 与
+    // derive_redactions 同源 (map SSOT) — mock/id 供落账, locations 供分类.
+    let redact_hits = derive_redact_hits(&redaction_map, secrets_snapshot);
     // 视图正确性守卫: redactions 是 RedactionMap (SSOT) 的派生视图, 每次派生都断言不变式.
     // 集中在 helper 内部确保 same_proto / cross_proto 两条路径都覆盖.
     #[cfg(feature = "consistency-check")]
     assert_redactions_match_map(&redactions, &redaction_map, secrets_snapshot);
-    Ok((redaction_map, redact_seed, redactions))
+    Ok((redaction_map, redact_seed, redactions, redact_hits))
 }
 
 // ─── 视图正确性守卫 (CI 用, 需 `--features consistency-check`) ─────────────

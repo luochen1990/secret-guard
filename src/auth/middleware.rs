@@ -24,9 +24,14 @@ use crate::error::AppError;
 
 /// 已认证的租户身份. 注入 request extension, 供下游 handler 用.
 /// M1 不做隔离 (所有 tenant 共享数据), M2 起作为 scope key.
+///
+/// `label` 是 API key 的人类可读名 (静态 key 的 label / WebUI 签发时指定),
+/// 用作 usage-stats redact 审计的归因维度 (USAGE-7: "谁在泄密"; proxy 侧以
+/// 纯数据形式消费, 见根 AGENTS.md 依赖图 proxy → auth 例外条目).
 #[derive(Clone, Debug)]
 pub struct AuthenticatedTenant {
     pub tenant_id: String,
+    pub label: String,
 }
 
 /// API key 校验 middleware.
@@ -61,6 +66,7 @@ pub async fn require_api_key(
 
     req.extensions_mut().insert(AuthenticatedTenant {
         tenant_id: entry.tenant_id,
+        label: entry.label,
     });
     Ok(next.run(req).await)
 }

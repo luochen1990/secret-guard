@@ -121,6 +121,47 @@ pub struct IrMessage {
 }
 
 /// content blocks 是否含非空 Text block.
+/// secret 在 IR 各位置的命中计数 (redact 审计的治理归因维度, 采集于替换前的
+/// 只读遍历 — `redact.rs::count_hit_locations`).
+///
+/// 归属论证: 描述的是 **IR 结构位置** (system / tools / messages / 协议边缘),
+/// 与 `contains_user_text` 同族; redact (域 A 改写) 与 usage (域 B 审计) 都可
+/// 依赖本模块, 不引入横向边.
+///
+/// 分类语义 (治理行动映射):
+/// - `system`: system prompt 污染 → 通常是工具/环境配置把 secret 注入了系统提示词;
+/// - `tools`: 工具定义 (name/description/schema) → MCP server 或工具注册时硬编码;
+/// - `user`: 真用户输入 (`contains_user_text` 判定) → 用户/agent 把 secret 粘进了消息;
+/// - `history`: 其余 messages (assistant 历史 / tool_result 回传) → 前序轮次已泄或工具回显;
+/// - `other`: stop 序列 / user 字段 / extra — 罕见的协议边缘位置.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct HitLocations {
+    pub system: u64,
+    pub tools: u64,
+    pub user: u64,
+    pub history: u64,
+    pub other: u64,
+}
+
+impl HitLocations {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// 非零分类的 (名称, 计数) 迭代 (持久化展开与 UI 渲染共用; 固定序保证确定性).
+    pub fn non_zero(&self) -> impl Iterator<Item = (&'static str, u64)> {
+        [
+            ("system", self.system),
+            ("tools", self.tools),
+            ("user", self.user),
+            ("history", self.history),
+            ("other", self.other),
+        ]
+        .into_iter()
+        .filter(|(_, n)| *n > 0)
+    }
+}
+
 /// 用于 reader 入口判定 `contains_user_text`.
 pub fn blocks_has_text(blocks: &[IrBlock]) -> bool {
     blocks

@@ -97,11 +97,13 @@ pub struct UsageEvent {
     pub usage: Option<UsageQuanta>,
 }
 
-/// redact 审计明细 (SQLite `redact_events` 一行, 每请求 × 每命中 secret 一条).
+/// redact 审计明细 (SQLite `redact_events` 一行, 粒度 = 每请求 × 每命中
+/// secret × 每非零位置分类).
 ///
-/// B 级精度 (usage-stats 设计 §4b): ts / secret_id / mock / provider / model_req /
-/// proto — 支持 "哪个 secret、什么时间、发往哪个 provider 时被替换" 的审计回查;
-/// mock 与外部日志中的占位符可对上. **永不**含 real secret 明文 (USAGE-7 SEC):
+/// B 级精度 (usage-stats 设计 §4b) + 治理三问扩展 (USAGE-7): ts / secret_id /
+/// mock / provider / model_req / proto 回答 "何时何地泄了什么"; `category` (结构化
+/// 位置) 回答 "哪个环节塞进来的"; `node` / `api_key_label` 回答 "谁" (DAG 节点
+/// 关联 + auth 归因). **永不**含 real secret 明文与上下文文本片段 (红线):
 /// mock 由 C5 契约保证不含 secret 的 ≥k(L) 连续子串, 落账前仍做防御纵深扫描.
 #[derive(Debug, Clone)]
 pub struct RedactEvent {
@@ -110,10 +112,27 @@ pub struct RedactEvent {
     pub secret_id: String,
     /// 替换用的 mock 值 (已过 SEC 防御扫描 + 截断).
     pub mock: String,
+    /// 位置分类 (`HitLocations::non_zero` 展开的一档; 见该类型文档的治理语义).
+    pub category: &'static str,
+    /// 该分类在本请求中的出现次数 (聚合侧 SUM).
+    pub count: u64,
+    /// DAG node id (Uuid 字符串; 悬空容忍 — restart/淘汰后不可回查, UI 降级提示).
+    pub node: String,
+    /// auth 启用时的 API key label 归因; 单用户模式 (auth 未启用) 为 None.
+    pub api_key_label: Option<String>,
     pub provider: String,
     /// 请求侧 model (redact 发生在请求侧, 响应 model 尚未可知).
     pub model_req: Option<String>,
     pub proto: String,
+}
+
+/// 一次 redact 的审计采集单元 (per request × per secret, 位置分布聚合形态;
+/// [`UsageCtx::record_redactions`] 按 `non_zero()` 展开为 N 条 RedactEvent).
+#[derive(Debug, Clone)]
+pub struct RedactHit {
+    pub secret_id: String,
+    pub mock: String,
+    pub locations: crate::codec::ir::HitLocations,
 }
 
 /// 四维 token 用量的持久化形态 (与 [`crate::dto::UsageView`] 同构, 独立定义避免
@@ -186,6 +205,11 @@ pub struct UsageCtx {
     method: Arc<str>,
     /// push 后由 proxy 注入 (dag.round_kind_of; SSOT 判定在 push_messages).
     round_kind: crate::dag::RoundKind,
+    /// 本请求的 DAG node id (push 返回; redact 审计的溯源关联, 悬空容忍).
+    node: uuid::Uuid,
+    /// auth 启用时的 API key label (归因; 单用户模式 None). 纯数据, 经 proxy 从
+    /// request extension 提取注入 (proxy → auth 的纯类型依赖, 见根 AGENTS.md).
+    api_key_label: Option<String>,
     /// active secrets 快照 (SEC model/mock 扫描用; 与 CallEvent.policy 同源).
     secrets: Arc<[SecretEntry]>,
 }
@@ -199,6 +223,8 @@ impl UsageCtx {
         proto: impl Into<Arc<str>>,
         method: impl Into<Arc<str>>,
         round_kind: crate::dag::RoundKind,
+        node: uuid::Uuid,
+        api_key_label: Option<String>,
         secrets: Arc<[SecretEntry]>,
     ) -> Self {
         Self {
@@ -209,6 +235,8 @@ impl UsageCtx {
             proto: proto.into(),
             method: method.into(),
             round_kind,
+            node,
+            api_key_label,
             secrets,
         }
     }
@@ -220,27 +248,33 @@ impl UsageCtx {
             .map(|m| sanitize_free_string(m, REDACTED_MODEL, secrets).0)
     }
 
-    /// 请求侧 redact 落账点: 每命中 secret 一条 RedactEvent (USAGE-7).
+    /// 请求侧 redact 落账点: 每命中 secret × 每非零位置分类一条 RedactEvent (USAGE-7).
     ///
-    /// 在 push_messages 后立即调用 (redactions 已进 CallEvent, 从 event 借用);
-    /// 不过滤 method (redact 只发生在 body 改写路径, 审计语义与 method 无关).
-    pub fn record_redactions(&self, redactions: &[(String, String)]) {
-        if self.store.is_disabled() || redactions.is_empty() {
+    /// 在 push_messages 后立即调用 (hits 从 redact_and_derive 的 map 派生, push 前
+    /// 捕获); 不过滤 method (redact 只发生在 body 改写路径, 审计语义与 method 无关).
+    pub fn record_redactions(&self, hits: &[RedactHit]) {
+        if self.store.is_disabled() || hits.is_empty() {
             return;
         }
         let secrets: &[SecretEntry] = &self.secrets;
         let model_req = self.sanitized_model_req(secrets);
-        for (mock, secret_id) in redactions {
+        for h in hits {
             // 防御纵深: C5 已保证 mock 不含 secret 子串, 扫描是纵深 (USAGE-7 property).
-            let mock = sanitize_free_string(mock, REDACTED_MOCK, secrets).0;
-            self.store.record_redact(RedactEvent {
-                ts: self.ts,
-                secret_id: secret_id.clone(),
-                mock,
-                provider: self.provider.to_string(),
-                model_req: model_req.clone(),
-                proto: self.proto.to_string(),
-            });
+            let mock = sanitize_free_string(&h.mock, REDACTED_MOCK, secrets).0;
+            for (category, count) in h.locations.non_zero() {
+                self.store.record_redact(RedactEvent {
+                    ts: self.ts,
+                    secret_id: h.secret_id.clone(),
+                    mock: mock.clone(),
+                    category,
+                    count,
+                    node: self.node.to_string(),
+                    api_key_label: self.api_key_label.clone(),
+                    provider: self.provider.to_string(),
+                    model_req: model_req.clone(),
+                    proto: self.proto.to_string(),
+                });
+            }
         }
     }
 
@@ -295,6 +329,26 @@ mod tests {
         Arc::from(Vec::<SecretEntry>::new().into_boxed_slice())
     }
 
+    /// UsageCtx 测试构造收口 (node/label 归因用例单独构造).
+    fn ctx_with(
+        store: &Arc<UsageStore>,
+        model_req: Option<&str>,
+        method: &str,
+        secrets: Arc<[SecretEntry]>,
+    ) -> UsageCtx {
+        UsageCtx::new(
+            store.clone(),
+            Arc::from("p"),
+            model_req.map(String::from),
+            "o",
+            method,
+            RoundKind::Normal,
+            uuid::Uuid::new_v4(),
+            None,
+            secrets,
+        )
+    }
+
     fn entry_with_value(v: &str) -> SecretEntry {
         SecretEntry {
             id: format!("sid-{v}"),
@@ -337,16 +391,12 @@ mod tests {
     #[test]
     fn record_response_filters_non_post() {
         let store = Arc::new(UsageStore::disabled());
-        let ctx = UsageCtx::new(
-            store.clone(),
-            Arc::from("p"),
+        ctx_with(&store, None, "GET", no_secrets()).record_response(
+            200,
+            true,
+            Some(IrUsage::default()),
             None,
-            "o",
-            "GET",
-            RoundKind::Normal,
-            no_secrets(),
         );
-        ctx.record_response(200, true, Some(IrUsage::default()), None);
         assert_eq!(
             store.total_events(),
             0,
@@ -357,13 +407,10 @@ mod tests {
     #[test]
     fn record_response_prefers_echo_model_and_sanitizes() {
         let store = Arc::new(UsageStore::in_memory());
-        let ctx = UsageCtx::new(
-            store.clone(),
-            Arc::from("p"),
-            Some("sk-live-abc123-alias".to_string()), // model_req 含 secret
-            "o",
+        let ctx = ctx_with(
+            &store,
+            Some("sk-live-abc123-alias"), // model_req 含 secret
             "POST",
-            RoundKind::Normal,
             Arc::from(vec![entry_with_value("sk-live-abc123")].into_boxed_slice()),
         );
         ctx.record_response(
@@ -408,6 +455,8 @@ mod tests {
                 "o",
                 "POST",
                 kind,
+                uuid::Uuid::new_v4(),
+                None,
                 no_secrets(),
             )
             .record_response(status, true, None, None);
@@ -425,10 +474,34 @@ mod tests {
         assert_eq!(agg.errors_4xx, 0);
     }
 
-    // ─── UsageCtx::record_redactions (USAGE-7) ───────────────────────────
+    // ─── UsageCtx::record_redactions (USAGE-7 治理三问: 位置/归因/溯源) ────
+
+    fn hit(secret_id: &str, mock: &str, locations: crate::codec::ir::HitLocations) -> RedactHit {
+        RedactHit {
+            secret_id: secret_id.to_string(),
+            mock: mock.to_string(),
+            locations,
+        }
+    }
+
+    fn locs(
+        system: u64,
+        tools: u64,
+        user: u64,
+        history: u64,
+        other: u64,
+    ) -> crate::codec::ir::HitLocations {
+        crate::codec::ir::HitLocations {
+            system,
+            tools,
+            user,
+            history,
+            other,
+        }
+    }
 
     #[test]
-    fn record_redactions_persists_per_secret_rows_and_sanitizes_mock() {
+    fn record_redactions_expands_categories_and_sanitizes_mock() {
         let store = Arc::new(UsageStore::in_memory());
         let ctx = UsageCtx::new(
             store.clone(),
@@ -437,50 +510,66 @@ mod tests {
             "o",
             "POST",
             RoundKind::Normal,
+            uuid::Uuid::new_v4(),
+            None,
             Arc::from(vec![entry_with_value("sk-live-abc123")].into_boxed_slice()),
         );
+        // sid-1: system 1 + user 2 (展开 2 行); sid-2: mock 含 secret (防御纵深) + user 1.
         ctx.record_redactions(&[
-            ("sgm_clean_mock_111".to_string(), "sid-1".to_string()),
-            ("leak-sk-live-abc123-x".to_string(), "sid-2".to_string()), // 防御纵深: mock 命中 secret
+            hit("sid-1", "sgm_clean_mock_111", locs(1, 0, 2, 0, 0)),
+            hit("sid-2", "leak-sk-live-abc123-x", locs(0, 0, 1, 0, 0)),
         ]);
         let (by_secret, recent) = store.query_redacts("", 10);
         assert_eq!(by_secret.len(), 2);
-        assert!(
-            by_secret
-                .iter()
-                .any(|r| r.secret_id == "sid-1" && r.mock == "sgm_clean_mock_111" && r.hits == 1)
-        );
-        // USAGE-7 SEC: 含 secret 子串的 mock 必须被整体替换.
-        let hit = by_secret.iter().find(|r| r.secret_id == "sid-2").unwrap();
-        assert_eq!(hit.mock, REDACTED_MOCK);
+        let r1 = by_secret.iter().find(|r| r.secret_id == "sid-1").unwrap();
+        assert_eq!(r1.hits, 3);
+        assert_eq!(r1.categories.get("system"), Some(&1));
+        assert_eq!(r1.categories.get("user"), Some(&2));
+        // USAGE-7 SEC: 含 secret 子串的 mock 必须被整体替换 (防御纵深).
+        let r2 = by_secret.iter().find(|r| r.secret_id == "sid-2").unwrap();
+        assert_eq!(r2.mock, REDACTED_MOCK);
+        assert_eq!(recent.len(), 3);
         assert!(!format!("{recent:?}").contains("sk-live-abc123"));
     }
 
     #[test]
-    fn record_redactions_noop_on_disabled_or_empty() {
+    fn record_redactions_carries_node_and_api_key_label() {
+        let store = Arc::new(UsageStore::in_memory());
+        let node = uuid::Uuid::new_v4();
+        UsageCtx::new(
+            store.clone(),
+            Arc::from("p"),
+            None,
+            "o",
+            "POST",
+            RoundKind::Normal,
+            node,
+            Some("ci-runner".to_string()),
+            no_secrets(),
+        )
+        .record_redactions(&[hit("sid", "m", locs(0, 1, 0, 0, 0))]);
+        let (_, recent) = store.query_redacts("", 10);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].node.as_deref(), Some(node.to_string().as_str()));
+        assert_eq!(recent[0].api_key_label.as_deref(), Some("ci-runner"));
+        assert_eq!(recent[0].category, "tools");
+    }
+
+    #[test]
+    fn record_redactions_noop_on_disabled_or_zero_locations() {
         let disabled = Arc::new(UsageStore::disabled());
-        UsageCtx::new(
-            disabled.clone(),
-            Arc::from("p"),
-            None,
-            "o",
-            "POST",
-            RoundKind::Normal,
-            no_secrets(),
-        )
-        .record_redactions(&[("m".to_string(), "s".to_string())]);
-        let empty = Arc::new(UsageStore::in_memory());
-        UsageCtx::new(
-            empty.clone(),
-            Arc::from("p"),
-            None,
-            "o",
-            "POST",
-            RoundKind::Normal,
-            no_secrets(),
-        )
-        .record_redactions(&[]);
+        ctx_with(&disabled, None, "POST", no_secrets()).record_redactions(&[hit(
+            "s",
+            "m",
+            locs(0, 0, 1, 0, 0),
+        )]);
+        let zero = Arc::new(UsageStore::in_memory());
+        ctx_with(&zero, None, "POST", no_secrets()).record_redactions(&[hit(
+            "s",
+            "m",
+            locs(0, 0, 0, 0, 0),
+        )]); // 全零 → 零行
         assert!(disabled.query_redacts("", 10).0.is_empty());
-        assert!(empty.query_redacts("", 10).0.is_empty());
+        assert!(zero.query_redacts("", 10).0.is_empty());
     }
 }

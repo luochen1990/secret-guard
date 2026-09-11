@@ -106,7 +106,7 @@ pub(crate) async fn cross_proto_forward(
 
     // 8. redact IR + derive redactions (共享 helper, 内含 consistency-check 守卫).
     //    FailClosed 模式下 probing 耗尽 → 直接 503 拒绝转发 (防 secret 泄露).
-    let (redaction_map, redact_seed, redactions) = match redact_and_derive(
+    let (redaction_map, redact_seed, redactions, redact_hits) = match redact_and_derive(
         &mut ir,
         &secrets_snapshot,
         state.on_probe_exhausted,
@@ -186,17 +186,19 @@ pub(crate) async fn cross_proto_forward(
     // usage-stats 采集上下文 + redact 审计落账 (helpers SSOT: 请求侧, redact 已
     // 实际发生, 即使响应失败也不丢 — USAGE-7).
     let model_req = event.model.as_ref().map(|m| m.to_string());
-    let redactions_echo = std::sync::Arc::clone(&event.redactions);
     let record_id = state.dag.push_messages(real_messages, event);
     let usage_ctx = super::helpers::usage_ctx_and_record_redactions(
         &state,
-        &fp,
-        &parts.method,
-        upstream_id,
-        model_req,
-        &secrets_snapshot,
-        record_id,
-        &redactions_echo,
+        super::helpers::UsageWire {
+            fp: &fp,
+            method: &parts.method,
+            upstream_id,
+            model_req,
+            secrets: &secrets_snapshot,
+            record_id,
+            hits: &redact_hits,
+            api_key_label: super::helpers::auth_label(&parts),
+        },
     );
 
     debug!(

@@ -1627,8 +1627,8 @@
             <h3>Redactions · by secret</h3>
             <div class="usage-table-scroll">
               <table class="secrets usage-table">
-                <thead><tr><th>Secret</th><th>Mock</th><th>Hits</th><th>First seen</th><th>Last seen</th></tr></thead>
-                <tbody id="redact-by-secret-body"><tr><td colspan="5" class="empty">no data</td></tr></tbody>
+                <thead><tr><th>Secret</th><th>Mock</th><th>Hits</th><th>Where</th><th>First seen</th><th>Last seen</th></tr></thead>
+                <tbody id="redact-by-secret-body"><tr><td colspan="6" class="empty">no data</td></tr></tbody>
               </table>
             </div>
           </div>
@@ -1636,8 +1636,8 @@
             <h3>Redactions · recent</h3>
             <div class="usage-table-scroll">
               <table class="secrets usage-table">
-                <thead><tr><th>Time</th><th>Secret</th><th>Mock</th><th>Provider</th><th>Model</th></tr></thead>
-                <tbody id="redact-recent-body"><tr><td colspan="5" class="empty">no data</td></tr></tbody>
+                <thead><tr><th>Time</th><th>Secret</th><th>Mock</th><th>Where</th><th>Key</th><th>Provider</th><th>Model</th><th>Record</th></tr></thead>
+                <tbody id="redact-recent-body"><tr><td colspan="8" class="empty">no data</td></tr></tbody>
               </table>
             </div>
           </div>
@@ -1647,6 +1647,14 @@
     </section>
   </main>
 
+  <dialog id="audit-record-dialog">
+    <h3 style="margin: 0 0 8px 0;">Redacted request (LLM view)</h3>
+    <div class="hint" id="audit-record-meta" style="margin-bottom: 8px;"></div>
+    <pre id="audit-record-body" style="max-width: 720px; max-height: 60vh; overflow: auto; font-size: 11.5px; white-space: pre-wrap;"></pre>
+    <form method="dialog" style="margin-top: 10px; text-align: right;">
+      <button type="submit" class="btn">Close</button>
+    </form>
+  </dialog>
   <dialog id="secret-form">
     <form method="dialog" id="secret-form-el">
       <h3 style="grid-column: 1 / -1; margin: 0 0 8px 0;" id="secret-form-title">New secret</h3>
@@ -4247,23 +4255,60 @@
       </tr>`);
     }
 
-    /** redact 审计视图 (USAGE-7): mock 不含 real secret, 可安全展示. */
+    /** categories 分布的紧凑展示 ("system 12 · user 3"; 治理归因: 哪个环节塞进来的). */
+    function fmtWhere(categories) {
+      const parts = Object.entries(categories || {})
+        .filter(([, n]) => n > 0)
+        .map(([k, n]) => `${escapeHtml(k)} ${n}`);
+      return parts.length ? parts.join(' · ') : '—';
+    }
+
+    /** redact 审计视图 (USAGE-7 治理三问): mock 不含 real secret, 可安全展示;
+     *  Where = 位置分类; Key = auth 归因; Record = 溯源跳转 (内存 DAG, 悬空降级). */
     function renderRedactions(red) {
-      tbodyHtml('redact-by-secret-body', red.by_secret || [], 5, r => `<tr>
+      tbodyHtml('redact-by-secret-body', red.by_secret || [], 6, r => `<tr>
         <td>${escapeHtml(r.secret_id)}</td>
         <td title="${escapeHtml(r.mock)}"><code>${escapeHtml(r.mock)}</code></td>
         <td>${r.hits}</td>
+        <td>${fmtWhere(r.categories)}</td>
         <td>${fmtTsShort(r.first_ts)}</td>
         <td>${fmtTsShort(r.last_ts)}</td>
       </tr>`);
-      tbodyHtml('redact-recent-body', red.recent || [], 5, r => `<tr>
+      tbodyHtml('redact-recent-body', red.recent || [], 8, r => `<tr>
         <td>${fmtTsShort(r.ts)}</td>
         <td>${escapeHtml(r.secret_id)}</td>
         <td title="${escapeHtml(r.mock)}"><code>${escapeHtml(r.mock)}</code></td>
+        <td>${fmtWhere({ [r.category]: r.count })}</td>
+        <td>${r.api_key_label ? escapeHtml(r.api_key_label) : '—'}</td>
         <td>${escapeHtml(r.provider)}</td>
         <td>${escapeHtml(r.model_req || '—')}</td>
+        <td><button type="button" class="btn btn-small" data-audit-node="${escapeHtml(r.node || '')}" title="查看 redact 后的请求原文 (内存态, 重启后不可回查)">view</button></td>
       </tr>`);
     }
+
+    // 审计溯源: 点击 recent 行的 view → 拉取该 node 的 parsed record (LLM 视角,
+    // 已 redact) 弹窗展示. node 被淘汰 / restart 后 404 → 提示不可回查 (悬空容忍).
+    document.getElementById('tab-usage')?.addEventListener('click', async (e) => {
+      const btn = e.target.closest('button[data-audit-node]');
+      if (!btn) return;
+      const node = btn.dataset.auditNode;
+      const dlg = document.getElementById('audit-record-dialog');
+      const meta = document.getElementById('audit-record-meta');
+      const body = document.getElementById('audit-record-body');
+      meta.textContent = `node ${node} — loading…`;
+      body.textContent = '';
+      dlg.showModal();
+      try {
+        const r = await fetch(`/api/records/${encodeURIComponent(node)}?view=parsed`, { cache: 'no-store' });
+        if (!r.ok) throw new Error(r.status === 404 ? 'record no longer in memory (restarted or evicted)' : `HTTP ${r.status}`);
+        const data = await r.json();
+        meta.textContent = `node ${node}`;
+        body.textContent = JSON.stringify(data.parsed_request ?? data.record ?? data, null, 2);
+      } catch (err) {
+        meta.textContent = `node ${node}`;
+        body.textContent = `⚠ ${err.message}`;
+      }
+    });
 
     // range 切换按钮绑定 (data-hours 驱动).
     document.querySelectorAll('#usage-range button').forEach(btn => {

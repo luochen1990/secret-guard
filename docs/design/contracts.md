@@ -993,18 +993,33 @@ chars (char boundary 安全); 其余事件字段为受控类型, 天然无 secre
 **Properties**:
 - `prop_usage_model_secret_scan`: 含 secret 的 model → 整体替换 + 无残留; 干净 model 保留 + 超长截断在 char boundary. 🔁→`sanitize_redacts_model_containing_secret` (`src/usage/mod.rs`) + `sanitize_keeps_clean_model_and_truncates_at_char_boundary` (`src/usage/mod.rs`)
 
-### USAGE-7 redact 审计持久化 (B 级精度)
+### USAGE-7 redact 审计持久化 (B 级 + 治理三问)
 
-**陈述**: 每次请求侧 redact (每命中 secret 一条) 持久化审计事件: ts / secret_id /
-mock / provider / model_req / proto — 支持 "哪个 secret、什么时间、发往哪个 provider
-时被替换" 的回查 (summary 的 `redactions` 子对象: by_secret 聚合 + recent 明细).
-**永不**持久化 real secret 明文或上下文片段; 落账点在请求侧 (redact 已实际发生,
-即使响应失败也不丢); 不过滤 method (redact 只发生在 body 改写路径, 审计语义与
-method 无关). 存储精度为 **B 级** (事件明细 + mock, 不含出现位置 — 取证级留 P2).
+**陈述**: 每次请求侧 redact 持久化审计事件, 粒度 = 每请求 × 每命中 secret × 每
+非零位置分类, 列集: ts / secret_id / mock / **category** / **count** / **node** /
+**api_key_label** / provider / model_req / proto — 治理三问齐备:
+- "何时何地泄了什么": ts / secret_id / mock / provider / model (B 级基线);
+- "哪个环节塞进来的": category = 结构化位置分类 (system / tools / user /
+  history / other, 语义与判定 SSOT 见 `codec::ir::HitLocations`; **C 级位置元数据
+  的结构化落地 — 只存位置不存内容**), count = 该分类出现次数;
+- "谁": node = DAG node 关联 (溯源到 mock 化请求原文, **悬空容忍** — restart /
+  淘汰后 GET 404, UI 降级提示) + api_key_label = auth 归因 (API key 人类可读名,
+  单用户模式 null).
+
+**红线**: **永不**持久化 real secret 明文或上下文文本片段 (片段可能含未声明的
+敏感信息, 持久化它们 = 泄露放大器; 事后取证走 node 关联的内存态 record 或显式
+手动导出, 不做静默全量落盘). 落账点在请求侧 (redact 已实际发生, 即使响应失败也
+不丢); 不过滤 method (redact 只发生在 body 改写路径, 审计语义与 method 无关).
+
+**一致性**: `map.hits` 的分类计数 == 替换遍历覆盖的叶子集 (`StringLeafOps` 单一
+实现), 统计于替换前的只读遍历.
 
 **Properties**:
-- `prop_usage_redact_persist_no_secret`: 持久化行 (含 mock) 过 active secrets 扫描永不命中 — 命中 secret 子串的 mock 整体替换为 `<redacted:mock>` (C5 防御纵深). 🔁→`record_redactions_persists_per_secret_rows_and_sanitizes_mock` (`src/usage/mod.rs`)
-- `prop_usage_redact_noop_guards`: disabled store 或空 redactions → 零落账. 🔁→`record_redactions_noop_on_disabled_or_empty` (`src/usage/mod.rs`)
+- `prop_usage_redact_persist_no_secret`: 持久化行 (含 mock) 过 active secrets 扫描永不命中 — 命中 secret 子串的 mock 整体替换为 `<redacted:mock>` (C5 防御纵深). 🔁→`record_redactions_expands_categories_and_sanitizes_mock` (`src/usage/mod.rs`)
+- `prop_usage_redact_category_expansion`: per (secret, category) 展开保真 — hits 之和 == 分类计数之和, categories 聚合 == 明细 fold, 全零 locations → 零行. 🔁→`record_redactions_expands_categories_and_sanitizes_mock` + `record_redactions_noop_on_disabled_or_zero_locations` (`src/usage/mod.rs`)
+- `prop_usage_redact_governance_attribution`: node / api_key_label 透传落列 (悬空容忍不 panic). 🔁→`record_redactions_carries_node_and_api_key_label` (`src/usage/mod.rs`)
+- `prop_usage_hit_locations_classification`: 位置分类 (system/tools/user/history/other) 与 contains_user_text 联动; 分类总和 == 替换前 needle 总出现数. 🔁→`hit_locations_classifies_system_tools_user_history_other` + `hit_locations_matches_actual_replacement_total` (`src/redact.rs`)
+- `prop_usage_redact_governance_e2e`: 端到端: secret 在 user message → summary.redactions 的 categories.user 计数 + node 非空 + mock 不泄漏. 🔁→`usage_stats_redact_audit_and_retry_round_recorded` (`tests/integration.rs`)
 
 ---
 
@@ -1015,7 +1030,7 @@ method 无关). 存储精度为 **B 级** (事件明细 + mock, 不含出现位�
 | 日期 | 契约 ID | 调整 | 原因 |
 |---|---|---|---|
 | 2026-07-26 | (initial) | 建立本文档, 收纳 C1-C7 / INV-1..5 / I1-I3 为 RED-1..7 / CDAG-1..5 / UI-1..3 | QA 系统梳理, 边界契约先行 |
-| 2026-09-11 | USAGE-1/5/6/7 | 人工授权 (usage-stats v4): 存储层 JSONL → SQLite (USAGE-1 聚合一致性改为 SQL 直查, "重放恢复" 重述为 "持久恢复"; 无内存双份簿记); 聚合粒度 day → **hour** (≤14 天 hour bucket, 更长 day 折叠, by_day → by_bucket); USAGE-1 新增 rounds 三态维度 (round_kind 真值透传自 dag push 判定); USAGE-5 新增 status 原始状态码语义 (429/4xx/5xx 派生分类, 不落 per-class flag); USAGE-6 扫描范围扩至 mock; 新增 **USAGE-7** redact 审计持久化 (B 级精度: 事件明细 + mock, 永不含 real secret). | 用户需求: 小时精度 / SQLite / rounds 与 retry 可见性 / 429 独立统计 / redact 审计记录 |
+| 2026-09-11 | USAGE-1/5/6/7 | 人工授权 (usage-stats v4): 存储层 JSONL → SQLite (USAGE-1 聚合一致性改为 SQL 直查, "重放恢复" 重述为 "持久恢复"; 无内存双份簿记); 聚合粒度 day → **hour** (≤14 天 hour bucket, 更长 day 折叠, by_day → by_bucket); USAGE-1 新增 rounds 三态维度 (round_kind 真值透传自 dag push 判定); USAGE-5 新增 status 原始状态码语义 (429/4xx/5xx 派生分类, 不落 per-class flag); USAGE-6 扫描范围扩至 mock; 新增 **USAGE-7** redact 审计持久化 + 治理三问扩展 (B 级: 事件明细 + mock; 位置元数据 category/count (C 级结构化落地, 只存位置不存内容) + 归因 api_key_label + 溯源 node 关联 (悬空容忍); 永不含 real secret 与上下文片段). | 用户需求: 小时精度 / SQLite / rounds 与 retry 可见性 / 429 独立统计 / redact 审计记录 |
 | 2026-07-26 | FWD-1 / FWD-2 | FWD-1 升级为透明中继半段式 byte-exact (端到端最强契约); FWD-2 降为 FWD-1 的分解 (纯 codec round-trip byte-exact, 便于 bug 定位); 增加 §0.3 Property 设计原则 + §0.4 冗余覆盖原则 | 讨论中意识到 semantic_equiv 难以测, normalize 后 byte-exact 是可机械验证的最强 property |
 | 2026-07-26 | FWD-3 | 重写为"建模范围内语义保留 + 范围外显式丢弃", 不再承诺"保留 chat completion 语义" | 讨论中意识到跨协议翻译有不可避免的语义损失 (reasoning/citations/logproms 等), 契约必须显式声明建模范围 |
 | 2026-07-26 | FWD-4 | `prop_response_never_size_capped` 改名为 `prop_client_response_not_capped_even_when_record_truncated`, 陈述精确化 | 讨论中澄清"客户端响应路径与 record 累积路径是两条独立路径" |

@@ -97,6 +97,9 @@ pub struct RedactSecretRow {
     pub secret_id: String,
     pub mock: String,
     pub hits: u64,
+    /// 位置分类分布 (category → 计数; SQL json_group_object 聚合, 治理归因:
+    /// "哪个环节把 secret 塞进来", 语义见 `codec::ir::HitLocations`).
+    pub categories: std::collections::BTreeMap<String, u64>,
     /// 首次 / 最近命中 (RFC3339 UTC; 同 secret 多 mock 行各自统计).
     pub first_ts: String,
     pub last_ts: String,
@@ -108,6 +111,13 @@ pub struct RedactRecentRow {
     pub ts: String,
     pub secret_id: String,
     pub mock: String,
+    pub category: String,
+    /// 该分类在本请求中的出现次数.
+    pub count: u64,
+    /// DAG node id (悬空容忍: restart/淘汰后 GET /records/{node} 404, UI 降级提示).
+    pub node: Option<String>,
+    /// auth 归因 (API key label; 单用户模式 null).
+    pub api_key_label: Option<String>,
     pub provider: String,
     pub model_req: Option<String>,
     pub proto: String,
@@ -352,21 +362,30 @@ impl UsageStore {
             return (Vec::new(), Vec::new());
         };
         let conn = conn.lock();
+        // 两层聚合: 内层 per (secret, mock, category) 计数, 外层折回 (secret, mock)
+        // 并用 json_group_object (SQLite JSON1, bundled 版内置) 组装 categories
+        // 分布 — Rust 侧解析回 Map, wire 上是 JSON object 而非字符串.
         let by_secret = conn
             .prepare(
-                "SELECT secret_id, mock, COUNT(*), MIN(ts), MAX(ts) \
-                 FROM redact_events WHERE hour >= ?1 \
+                "SELECT secret_id, mock, SUM(cnt), MIN(first_ts), MAX(last_ts), \
+                        json_group_object(category, cnt) \
+                 FROM (SELECT secret_id, mock, category, \
+                              SUM(count) AS cnt, MIN(ts) AS first_ts, MAX(ts) AS last_ts \
+                       FROM redact_events WHERE hour >= ?1 \
+                       GROUP BY secret_id, mock, category) \
                  GROUP BY secret_id, mock \
-                 ORDER BY COUNT(*) DESC, secret_id, mock",
+                 ORDER BY SUM(cnt) DESC, secret_id, mock",
             )
             .and_then(|mut s| {
                 s.query_map([cutoff], |row| {
+                    let categories_json: String = row.get(5)?;
                     Ok(RedactSecretRow {
                         secret_id: row.get(0)?,
                         mock: row.get(1)?,
                         hits: row.get::<_, i64>(2)? as u64,
                         first_ts: row.get(3)?,
                         last_ts: row.get(4)?,
+                        categories: serde_json::from_str(&categories_json).unwrap_or_default(),
                     })
                 })
                 .map(|iter| iter.filter_map(Result::ok).collect())
@@ -377,7 +396,8 @@ impl UsageStore {
             });
         let recent = conn
             .prepare(
-                "SELECT ts, secret_id, mock, provider, model_req, proto \
+                "SELECT ts, secret_id, mock, category, count, node, api_key_label, \
+                        provider, model_req, proto \
                  FROM redact_events WHERE hour >= ?1 \
                  ORDER BY id DESC LIMIT ?2",
             )
@@ -387,9 +407,13 @@ impl UsageStore {
                         ts: row.get(0)?,
                         secret_id: row.get(1)?,
                         mock: row.get(2)?,
-                        provider: row.get(3)?,
-                        model_req: row.get(4)?,
-                        proto: row.get(5)?,
+                        category: row.get(3)?,
+                        count: row.get::<_, i64>(4)? as u64,
+                        node: row.get(5)?,
+                        api_key_label: row.get(6)?,
+                        provider: row.get(7)?,
+                        model_req: row.get(8)?,
+                        proto: row.get(9)?,
                     })
                 })
                 .map(|iter| iter.filter_map(Result::ok).collect())
@@ -459,6 +483,10 @@ fn init_schema(conn: &Connection) {
             hour TEXT NOT NULL, \
             secret_id TEXT NOT NULL, \
             mock TEXT NOT NULL, \
+            category TEXT NOT NULL, \
+            count INTEGER NOT NULL, \
+            node TEXT NOT NULL, \
+            api_key_label TEXT, \
             provider TEXT NOT NULL, \
             model_req TEXT, \
             proto TEXT NOT NULL);\
@@ -606,8 +634,9 @@ fn insert_usages(conn: &mut Connection, events: &[UsageEvent]) -> usize {
 }
 
 const INSERT_REDACT_SQL: &str = "\
-    INSERT INTO redact_events (ts, hour, secret_id, mock, provider, model_req, proto) \
-    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
+    INSERT INTO redact_events \
+    (ts, hour, secret_id, mock, category, count, node, api_key_label, provider, model_req, proto) \
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)";
 
 /// 批量 insert redact 事件 (单事务; 调用方持有连接锁). 返回成功行数.
 fn insert_redacts(conn: &mut Connection, events: &[RedactEvent]) -> usize {
@@ -617,6 +646,10 @@ fn insert_redacts(conn: &mut Connection, events: &[RedactEvent]) -> usize {
             hour_key(&ev.ts),
             ev.secret_id,
             ev.mock,
+            ev.category,
+            ev.count as i64,
+            ev.node,
+            ev.api_key_label,
             ev.provider,
             ev.model_req,
             ev.proto,

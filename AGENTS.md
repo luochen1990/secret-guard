@@ -143,7 +143,10 @@
   (usage-stats: AppState 聚合 UsageStore / PricingCache 两个纯数据 store, 同一先例;
   usage 模块自身仅依赖 codec::ir / secrets / dag::RoundKind 纯类型 / config schema
   纯数据类型, 见 `src/usage/` 头部 — usage→config 是向下合法边, 非例外, 性质同
-  provider→config; usage→dag 仅引用 RoundKind 枚举, 同 dto→dag 的纯类型依赖先例).
+  provider→config; usage→dag 仅引用 RoundKind 枚举, 同 dto→dag 的纯类型依赖先例)
+  + proxy → auth::AuthenticatedTenant (v4b redact 审计归因: proxy 从 request
+  extension 提取 API key label 注入 usage 采集, 纯类型依赖, 性质同 config→auth
+  的 AuthConfig 纯数据边, 无 auth 行为依赖).
 
 > secret-guard 的核心职责 (转发 + Redact) 必须对任意字节流零失败.
 > 围绕核心职责之外、**基于对 LLM 应用层行为模式强假设** 的附加功能

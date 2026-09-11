@@ -135,7 +135,7 @@ pub(crate) async fn same_proto_forward(
     //    流式响应里的 TextDelta / InputJsonDelta 都会经 StreamingRestorer 做 sliding-window
     //    restore (在 StreamTranslate::new_same_proto_restore 中), 不再需要 warn.
     //    FailClosed 模式下 probing 耗尽 → 直接 503 拒绝转发 (防 secret 泄露).
-    let (redaction_map, redact_seed, redactions) = match redact_and_derive(
+    let (redaction_map, redact_seed, redactions, redact_hits) = match redact_and_derive(
         &mut ir,
         &secrets_snapshot,
         state.on_probe_exhausted,
@@ -204,17 +204,19 @@ pub(crate) async fn same_proto_forward(
     // usage-stats 采集上下文 + redact 审计落账 (helpers SSOT: 请求侧, redact 已
     // 实际发生, 即使响应失败也不丢 — USAGE-7).
     let model_req = event.model.as_ref().map(|m| m.to_string());
-    let redactions_echo = std::sync::Arc::clone(&event.redactions);
     let record_id = state.dag.push_messages(real_messages, event);
     let usage_ctx = super::helpers::usage_ctx_and_record_redactions(
         &state,
-        &fp,
-        &parts.method,
-        upstream_id,
-        model_req,
-        &secrets_snapshot,
-        record_id,
-        &redactions_echo,
+        super::helpers::UsageWire {
+            fp: &fp,
+            method: &parts.method,
+            upstream_id,
+            model_req,
+            secrets: &secrets_snapshot,
+            record_id,
+            hits: &redact_hits,
+            api_key_label: super::helpers::auth_label(&parts),
+        },
     );
 
     debug!(%record_id, method = %parts.method, url = %upstream_url, "forwarding redacted same-proto request");
@@ -376,17 +378,19 @@ async fn same_proto_passthrough(
     // — USAGE-6 的 SEC 扫描恰防后者的 model 字符串泄漏. redactions echo: passthrough
     // 路径恒空 (无 IR 改写), 统一走 helper 防未来该路径出现 redact 时漏接.
     let model_req = event.model.as_ref().map(|m| m.to_string());
-    let redactions_echo = std::sync::Arc::clone(&event.redactions);
     let record_id = state.dag.push_messages(vec![], event);
     let usage_ctx = super::helpers::usage_ctx_and_record_redactions(
         &state,
-        &fp,
-        &parts.method,
-        upstream_id,
-        model_req,
-        secrets_snapshot,
-        record_id,
-        &redactions_echo,
+        super::helpers::UsageWire {
+            fp: &fp,
+            method: &parts.method,
+            upstream_id,
+            model_req,
+            secrets: secrets_snapshot,
+            record_id,
+            hits: &[],
+            api_key_label: super::helpers::auth_label(&parts),
+        },
     );
 
     debug!(%record_id, method = %parts.method, url = %upstream_url, "forwarding (passthrough)");
