@@ -1590,16 +1590,16 @@
       <div class="usage-main">
         <div class="usage-toolbar">
           <div class="range-switch" id="usage-range" role="group" aria-label="时间范围">
-            <button type="button" data-days="0">Today</button>
-            <button type="button" data-days="7" class="active">7d</button>
-            <button type="button" data-days="30">30d</button>
-            <button type="button" data-days="400">All</button>
+            <button type="button" data-hours="24">24h</button>
+            <button type="button" data-hours="168" class="active">7d</button>
+            <button type="button" data-hours="720">30d</button>
+            <button type="button" data-hours="9600">All</button>
           </div>
           <span id="usage-pricing-status" class="usage-pricing-status"></span>
         </div>
         <div class="usage-cards" id="usage-cards"></div>
         <div class="usage-chart-wrap">
-          <h3>tokens per day <span class="usage-legend" id="usage-legend"></span></h3>
+          <h3><span id="usage-chart-title">tokens</span> <span class="usage-legend" id="usage-legend"></span></h3>
           <div id="usage-chart"><div class="empty">no data</div></div>
         </div>
         <div class="usage-tables">
@@ -1607,8 +1607,8 @@
             <h3>By model</h3>
             <div class="usage-table-scroll">
               <table class="secrets usage-table">
-                <thead><tr><th>Model</th><th>Provider</th><th>Reqs</th><th>In</th><th>Cache R</th><th>Cache W</th><th>Out</th><th>~Cost</th><th>Share</th></tr></thead>
-                <tbody id="usage-by-model-body"><tr><td colspan="9" class="empty">no data</td></tr></tbody>
+                <thead><tr><th>Model</th><th>Provider</th><th>Reqs</th><th>Retries</th><th>429</th><th>In</th><th>Cache R</th><th>Cache W</th><th>Out</th><th>~Cost</th><th>Share</th></tr></thead>
+                <tbody id="usage-by-model-body"><tr><td colspan="11" class="empty">no data</td></tr></tbody>
               </table>
             </div>
           </div>
@@ -1616,8 +1616,28 @@
             <h3>By provider</h3>
             <div class="usage-table-scroll">
               <table class="secrets usage-table">
-                <thead><tr><th>Provider</th><th>Reqs</th><th>In</th><th>Cache R</th><th>Cache W</th><th>Out</th><th>~Cost</th></tr></thead>
-                <tbody id="usage-by-provider-body"><tr><td colspan="7" class="empty">no data</td></tr></tbody>
+                <thead><tr><th>Provider</th><th>Reqs</th><th>Retries</th><th>429</th><th>In</th><th>Cache R</th><th>Cache W</th><th>Out</th><th>~Cost</th></tr></thead>
+                <tbody id="usage-by-provider-body"><tr><td colspan="9" class="empty">no data</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+        <div class="usage-tables" style="margin-top: 14px;">
+          <div class="usage-table-block">
+            <h3>Redactions · by secret</h3>
+            <div class="usage-table-scroll">
+              <table class="secrets usage-table">
+                <thead><tr><th>Secret</th><th>Mock</th><th>Hits</th><th>First seen</th><th>Last seen</th></tr></thead>
+                <tbody id="redact-by-secret-body"><tr><td colspan="5" class="empty">no data</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="usage-table-block">
+            <h3>Redactions · recent</h3>
+            <div class="usage-table-scroll">
+              <table class="secrets usage-table">
+                <thead><tr><th>Time</th><th>Secret</th><th>Mock</th><th>Provider</th><th>Model</th></tr></thead>
+                <tbody id="redact-recent-body"><tr><td colspan="5" class="empty">no data</td></tr></tbody>
               </table>
             </div>
           </div>
@@ -4045,11 +4065,11 @@
     // 比 sync diff 重, 不进 3s 主循环). 渲染: 汇总卡 / 按天堆叠 SVG 柱状图 /
     // by model / by provider 表. cost 恒为估算 ("~", P-4), 无价显示 "—".
 
-    let usageDays = 7;
+    let usageHours = 168;
     let usageLastFetch = 0;
 
-    function setUsageDays(days, btn) {
-      usageDays = days;
+    function setUsageHours(hours, btn) {
+      usageHours = hours;
       // 重置节流: 手动切换必须立即生效 (否则按钮已切换但数据窗口最长滞后 ~5s).
       usageLastFetch = 0;
       document.querySelectorAll('#usage-range button').forEach(b => b.classList.remove('active'));
@@ -4064,7 +4084,7 @@
       usageLastFetch = now;
       let data;
       try {
-        const r = await fetch(`/api/usage/summary?days=${usageDays}`);
+        const r = await fetch(`/api/usage/summary?hours=${usageHours}`);
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         data = await r.json();
       } catch (e) {
@@ -4082,6 +4102,14 @@
       return '$' + v.toFixed(2);
     }
 
+    /** RFC3339 → 本地短时间 (MM-DD HH:mm). */
+    function fmtTsShort(ts) {
+      const d = new Date(ts);
+      if (isNaN(d)) return escapeHtml(ts);
+      const p = n => String(n).padStart(2, '0');
+      return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+    }
+
     function usageCard(k, v, extra) {
       return `<div class="usage-card"><div class="k">${k}</div><div class="v">${v}${extra || ''}</div></div>`;
     }
@@ -4093,12 +4121,16 @@
       const psMap = { ok: '', loading: 'pricing: loading…', stale: 'pricing: stale (refresh failed, using old table)', offline: 'pricing: offline (no price data)' };
       ps.textContent = psMap[d.pricing_status] ?? '';
 
-      // 汇总卡.
+      // 汇总卡: requests / retries / 429 (+err 5xx 尾注) / token 四维 / hit / cost.
       const hitRate = t.cache_hit_rate == null ? '—' : (t.cache_hit_rate * 100).toFixed(0) + '%';
       const cov = t.cost_coverage == null ? '' :
         `<small> · ${(t.cost_coverage * 100).toFixed(0)}% priced</small>`;
+      const noUsage = t.requests_without_usage ? `<small> · ${t.requests_without_usage} no usage</small>` : '';
+      const err5 = (t.errors_5xx || 0) > 0 ? `<small> · ${t.errors_5xx} 5xx</small>` : '';
       document.getElementById('usage-cards').innerHTML = [
-        usageCard('requests', String(t.requests ?? 0), t.requests_without_usage ? `<small> · ${t.requests_without_usage} no usage</small>` : ''),
+        usageCard('requests', String(t.requests ?? 0), noUsage),
+        usageCard('retries', String(t.retries ?? 0)),
+        usageCard('429 rate-limited', String(t.rate_limited_429 ?? 0), err5),
         usageCard('input', fmtTokens(t.input ?? 0)),
         usageCard('output', fmtTokens(t.output ?? 0)),
         usageCard('cache read', fmtTokens(t.cache_read ?? 0)),
@@ -4107,15 +4139,16 @@
         usageCard('~ cost', fmtCost(t.est_cost_usd), cov),
       ].join('');
 
-      renderUsageChart(d.by_day || []);
+      renderUsageChart(d.by_bucket || [], d.range ? d.range.granularity : 'hour');
       renderUsageModelTable(d.by_model || []);
       renderUsageProviderTable(d.by_provider || []);
+      renderRedactions(d.redactions || {});
 
       // 脚注: 估算语义 + 口径 + 无价提示 (include_usage 教育位).
       const unpriced = (d.unpriced_models || []);
       const parts = [
         `<b>~cost</b> is an estimate from the <a href="https://models.dev" target="_blank" rel="noreferrer">models.dev</a> price table (always recomputed with the current table; add <code>[usage.pricing_override]</code> in <code>secret-guard.toml</code> for custom models).`,
-        `Session badges on the Records tab are per-process and reset on restart; this page is a persistent ledger (JSONL, retention via <code>[usage] retention_days</code>).`,
+        `Session badges on the Records tab are per-process and reset on restart; this page is a persistent ledger (SQLite, retention via <code>[usage] retention_days</code>). <b>Retries</b> are IR-equivalent re-sends — gateway view, each retry is real upstream spend.`,
       ];
       if (unpriced.length) parts.push(`No price found for: ${unpriced.map(escapeHtml).join(', ')} — requests still count toward tokens, cost shows "—".`);
       const zeroPriced = (d.zero_priced_models || []);
@@ -4126,11 +4159,14 @@
       document.getElementById('usage-footnote').innerHTML = parts.join('<br>');
     }
 
-    /** 按天堆叠柱状图: in / cache_read / cache_write / out 四段, 纯 SVG (零依赖). */
-    function renderUsageChart(days) {
+    /** 堆叠柱状图: in / cache_read / cache_write / out 四段, 纯 SVG (零依赖).
+     *  bucket = hour (`YYYY-MM-DDTHH`) 或 day (`YYYY-MM-DD`), 由 granularity 决定. */
+    function renderUsageChart(buckets, granularity) {
       const el = document.getElementById('usage-chart');
       const legend = document.getElementById('usage-legend');
-      if (!days.length || days.every(x => (x.requests || 0) === 0)) {
+      document.getElementById('usage-chart-title').textContent =
+        'tokens per ' + (granularity === 'day' ? 'day' : 'hour');
+      if (!buckets.length || buckets.every(x => (x.requests || 0) === 0)) {
         el.innerHTML = '<div class="empty">no data in range</div>';
         legend.innerHTML = '';
         return;
@@ -4141,26 +4177,30 @@
         '<i style="background:#f5b83d"></i>cache w' +
         '<i style="background:#a78bfa"></i>out';
       const W = 24, H = 140, GAP = 8, AXIS = 34;
-      const max = Math.max(...days.map(x => (x.input || 0) + (x.cache_read || 0) + (x.cache_write || 0) + (x.output || 0)), 1);
-      const totalW = AXIS + days.length * (W + GAP);
+      const max = Math.max(...buckets.map(x => (x.input || 0) + (x.cache_read || 0) + (x.cache_write || 0) + (x.output || 0)), 1);
+      const totalW = AXIS + buckets.length * (W + GAP);
       let bars = '';
-      days.forEach((d, i) => {
+      buckets.forEach((d, i) => {
         const x = AXIS + i * (W + GAP);
         let y = H;
         const seg = (v, color) => {
           const h = Math.round((v / max) * H);
           if (h <= 0) return;
           y -= h;
-          bars += `<rect x="${x}" y="${y}" width="${W}" height="${h}" fill="${color}" rx="2"><title>${d.day}: ${fmtTokens(v)}</title></rect>`;
+          bars += `<rect x="${x}" y="${y}" width="${W}" height="${h}" fill="${color}" rx="2"><title>${d.bucket}: ${fmtTokens(v)}</title></rect>`;
         };
         seg(d.output || 0, '#a78bfa');
         seg(d.cache_write || 0, '#f5b83d');
         seg(d.cache_read || 0, '#2dd4bf');
         seg(d.input || 0, 'var(--accent)');
-        // 日期标签: 窄窗口每天标, 宽窗口隔 k 个标 (最后一天总是标).
-        const step = Math.ceil(days.length / 10);
-        if (i % step === 0 || i === days.length - 1) {
-          bars += `<text x="${x + W / 2}" y="${H + 14}" text-anchor="middle" font-size="9" fill="var(--fg-faint)">${d.day.slice(5)}</text>`;
+        // bucket 标签: hour 粒度 "MM-DD HH" / day 粒度 "MM-DD"; 窄窗口每格标,
+        // 宽窗口隔 k 个标 (最后一格总是标).
+        const step = Math.ceil(buckets.length / 10);
+        if (i % step === 0 || i === buckets.length - 1) {
+          const label = granularity === 'day'
+            ? d.bucket.slice(5)
+            : d.bucket.slice(5).replace('T', ' ');
+          bars += `<text x="${x + W / 2}" y="${H + 14}" text-anchor="middle" font-size="9" fill="var(--fg-faint)">${label}</text>`;
         }
       });
       el.innerHTML =
@@ -4170,39 +4210,64 @@
         bars + `</svg>`;
     }
 
+    /** usage 页表格渲染收口: 空态 colspan + 行渲染器 (4 表共享). */
+    function tbodyHtml(tbodyId, rows, colspan, renderRow) {
+      const body = document.getElementById(tbodyId);
+      if (!rows.length) { body.innerHTML = `<tr><td colspan="${colspan}" class="empty">no data</td></tr>`; return; }
+      body.innerHTML = rows.map(renderRow).join('');
+    }
+
     function renderUsageModelTable(rows) {
-      const body = document.getElementById('usage-by-model-body');
-      if (!rows.length) { body.innerHTML = '<tr><td colspan="9" class="empty">no data</td></tr>'; return; }
-      body.innerHTML = rows.map(r => `<tr>
+      tbodyHtml('usage-by-model-body', rows, 11, r => `<tr>
         <td title="${escapeHtml(r.model || '(unknown)')}">${escapeHtml(r.model || '(unknown)')}</td>
         <td>${escapeHtml(r.provider)}</td>
         <td>${r.requests}</td>
+        <td>${r.retries ?? 0}</td>
+        <td>${r.rate_limited_429 ?? 0}</td>
         <td>${fmtTokens(r.input)}</td>
         <td>${fmtTokens(r.cache_read)}</td>
         <td>${fmtTokens(r.cache_write)}</td>
         <td>${fmtTokens(r.output)}</td>
         <td>${fmtCost(r.est_cost_usd)}</td>
         <td>${(r.cost_share * 100).toFixed(0)}%</td>
-      </tr>`).join('');
+      </tr>`);
     }
 
     function renderUsageProviderTable(rows) {
-      const body = document.getElementById('usage-by-provider-body');
-      if (!rows.length) { body.innerHTML = '<tr><td colspan="7" class="empty">no data</td></tr>'; return; }
-      body.innerHTML = rows.map(r => `<tr>
+      tbodyHtml('usage-by-provider-body', rows, 9, r => `<tr>
         <td>${escapeHtml(r.provider)}</td>
         <td>${r.requests}</td>
+        <td>${r.retries ?? 0}</td>
+        <td>${r.rate_limited_429 ?? 0}</td>
         <td>${fmtTokens(r.input)}</td>
         <td>${fmtTokens(r.cache_read)}</td>
         <td>${fmtTokens(r.cache_write)}</td>
         <td>${fmtTokens(r.output)}</td>
         <td>${fmtCost(r.est_cost_usd)}</td>
-      </tr>`).join('');
+      </tr>`);
     }
 
-    // range 切换按钮绑定 (data-days 驱动).
+    /** redact 审计视图 (USAGE-7): mock 不含 real secret, 可安全展示. */
+    function renderRedactions(red) {
+      tbodyHtml('redact-by-secret-body', red.by_secret || [], 5, r => `<tr>
+        <td>${escapeHtml(r.secret_id)}</td>
+        <td title="${escapeHtml(r.mock)}"><code>${escapeHtml(r.mock)}</code></td>
+        <td>${r.hits}</td>
+        <td>${fmtTsShort(r.first_ts)}</td>
+        <td>${fmtTsShort(r.last_ts)}</td>
+      </tr>`);
+      tbodyHtml('redact-recent-body', red.recent || [], 5, r => `<tr>
+        <td>${fmtTsShort(r.ts)}</td>
+        <td>${escapeHtml(r.secret_id)}</td>
+        <td title="${escapeHtml(r.mock)}"><code>${escapeHtml(r.mock)}</code></td>
+        <td>${escapeHtml(r.provider)}</td>
+        <td>${escapeHtml(r.model_req || '—')}</td>
+      </tr>`);
+    }
+
+    // range 切换按钮绑定 (data-hours 驱动).
     document.querySelectorAll('#usage-range button').forEach(btn => {
-      btn.addEventListener('click', () => setUsageDays(Number(btn.dataset.days), btn));
+      btn.addEventListener('click', () => setUsageHours(Number(btn.dataset.hours), btn));
     });
 
     async function refreshApiKeys() {

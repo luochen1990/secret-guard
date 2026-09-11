@@ -2603,15 +2603,16 @@ test.describe("usage-stats (模型用量统计)", () => {
     await page.goto("/");
     await sendChat(page, [{ role: "user", content: "hi for usage" }]);
     await page.locator('a.tab[data-tab="usage"]').click();
+    // 按标签语义定位卡片 (不依赖 DOM 顺序, 抗未来卡片增删).
+    const cardVal = (label: string) =>
+      page.locator("#usage-cards .usage-card", { hasText: label }).locator(".v");
     // requests 卡: 至少 1 (轮询 5s 内到达; 给足 12s).
-    const cards = page.locator("#usage-cards .usage-card");
     await expect
-      .poll(async () => cards.first().locator(".v").innerText(), { timeout: 12_000 })
+      .poll(async () => cardVal("requests").innerText(), { timeout: 12_000 })
       .not.toBe("0");
     // token 卡非零 (input = 10: mock 回显归一化后).
-    const tokenVals = cards.locator(".v");
     await expect
-      .poll(async () => tokenVals.nth(1).innerText(), { timeout: 12_000 })
+      .poll(async () => cardVal("input").innerText(), { timeout: 12_000 })
       .not.toBe("0");
     // by model 表出现行 (model 列含 mock 回显的 model 名).
     await expect

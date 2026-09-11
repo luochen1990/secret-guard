@@ -132,8 +132,9 @@ pub fn build_router_with_auth(state: AppState, auth_stack: AuthStack) -> Router 
 }
 
 /// 与 static config 同目录的派生文件路径 (`<stem>.<suffix>`, 规则同 main.rs 的
-/// default_state_path 约定): usage JSONL (`<stem>.usage.jsonl`, 设计 §4) 与
-/// models.dev 定价缓存 (`<stem>.pricing.json`, 原样落盘供冷启动读回).
+/// default_state_path 约定): usage SQLite 库 (`<stem>.usage.sqlite3`, 设计 §4,
+/// 2026-09 起替代 JSONL — 旧 `<stem>.usage.jsonl` 不迁移, 留在原地可手动删除)
+/// 与 models.dev 定价缓存 (`<stem>.pricing.json`, 原样落盘供冷启动读回).
 fn config_sibling_path(config_path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
     let file_name = config_path
         .file_name()
@@ -333,7 +334,7 @@ pub async fn serve(
         model_lists: Arc::new(crate::proxy::ModelListCache::new()),
         usage: Arc::new(crate::usage::UsageStore::open(
             &usage_config,
-            &config_sibling_path(&config_path, "usage.jsonl"),
+            &config_sibling_path(&config_path, "usage.sqlite3"),
         )),
         pricing: Arc::new(crate::usage::PricingCache::new(
             usage_config.pricing_url.clone(),

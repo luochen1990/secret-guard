@@ -141,8 +141,9 @@
   聚合 router /models 的上游清单缓存, 纯数据 store 无 proxy 行为依赖, 组合根先例同
   state → auth 的 ApiKeyStore — 见 `src/state.rs` 字段注释) + state → usage
   (usage-stats: AppState 聚合 UsageStore / PricingCache 两个纯数据 store, 同一先例;
-  usage 模块自身仅依赖 codec::ir / secrets / config schema 纯数据类型, 见
-  `src/usage/` 头部 — usage→config 是向下合法边, 非例外, 性质同 provider→config).
+  usage 模块自身仅依赖 codec::ir / secrets / dag::RoundKind 纯类型 / config schema
+  纯数据类型, 见 `src/usage/` 头部 — usage→config 是向下合法边, 非例外, 性质同
+  provider→config; usage→dag 仅引用 RoundKind 枚举, 同 dto→dag 的纯类型依赖先例).
 
 > secret-guard 的核心职责 (转发 + Redact) 必须对任意字节流零失败.
 > 围绕核心职责之外、**基于对 LLM 应用层行为模式强假设** 的附加功能
@@ -319,7 +320,7 @@ TTL 300s + serve-stale-on-error + single-flight; exact-only router 零上游请�
 | `dto.rs` | WebUI 响应 DTO 中立类型层 (SessionView/NodeView/.../SyncSnapshot, 域 B → 域 C wire shape; 构造逻辑留 dag) | 文件头部 `//!` (含 "为什么是顶层中立模块" 归属论证) |
 | `error.rs` | 统一应用错误类型 `AppError` (转发链 + 鉴权层共用, 不反向依赖) | 文件头部 `//!` (含与 `web::api::ApiError` 分工 + Upstream/UpstreamTimeout message 净化回传契约) |
 | `record.rs` | ForwardRecord (web 层 DTO, GET /records/{id} 响应 shape) | 文件头部 `//!` |
-| `usage/` (模块目录: mod/store/pricing/summary) | 模型用量统计: 上游回显 usage 采集 (UsageCtx) + JSONL 持久化 + 内存聚合 + models.dev 定价 + summary 派生 (设计 `docs/design/usage-stats.md`, 契约 USAGE-*) | `src/usage/mod.rs` 头部 `//!` |
+| `usage/` (模块目录: mod/store/pricing/summary) | 模型用量统计 + redact 审计: 上游回显 usage 采集 (UsageCtx, rounds 三态 + status 原始码) + SQLite 持久化 (writer 线程批量事务) + SQL 聚合 (hour 粒度) + models.dev 定价 + summary 派生 (设计 `docs/design/usage-stats.md`, 契约 USAGE-*) | `src/usage/mod.rs` 头部 `//!` |
 | `redact.rs` | RedactionMap + redact/restore pipeline + 形式化契约 C1-C7 | 文件头部 `//!` |
 | `util.rs` | 集中的哈希工具 (`hash64` SipHash 单值入口) | 文件头部 `//!` |
 | `codec/` | 跨协议 IR + Reader/Writer trait + StreamTranslate (OpenAI / Anthropic / Responses) | **`src/codec/AGENTS.md`** + `docs/design/ir-fields-roadmap.md` (IR 字段建模路线图: extra 边界 + 字段提升判定准则 + 实施批次) |
@@ -378,7 +379,7 @@ Secret / Provider 的两种 value 来源 (`value`/`value_file`、`api_key`/`api_
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `enabled` | bool | `true` | 模型用量统计总开关; false = 不采集不落盘 (零开销). |
-| `retention_days` | u32 | `90` | 明细 JSONL 保留天数; 0 = 永久. |
+| `retention_days` | u32 | `90` | 明细 SQLite 行保留天数; 0 = 永久. |
 | `pricing_url` | string | models.dev | 定价数据源 (可自托管镜像). |
 | `pricing_refresh_secs` | u64 | `86400` | 定价表 TTL (秒). |
 | `pricing_override` | model → 价格表 | 空 | 自定义模型定价 ($/1M, 优先于 models.dev). |
@@ -637,7 +638,7 @@ configFile (escape hatch, 互斥). 凭据注入 (LoadCredential / sops 直接路
 - **usage 成本恒为估算**: models.dev 价目表 ≠ 实际合同价; 未列 cache 价的模型按宽松
   近似回退 (cache_read → input 价, cache_write → 1.25×input); 历史成本按当前价目表实时
   重算 (会随价目表漂移, UI 明示). session 徽章 (Records tab) 是进程内口径, restart
-  归零; Usage tab 是持久账本 (JSONL) — 两套口径不同, 页脚说明.
+  归零; Usage tab 是持久账本 (SQLite) — 两套口径不同, 页脚说明.
 - **reasoning_content (思考原文) 跨协议丢弃** (#176, 契约 STR-6): OpenAI 兼容 provider 的
   思考原文 (`delta.reasoning_content` 流式 / `message.reasoning_content` 非流式 /
   assistant 历史回传) 已建模为 `IrBlock::ReasoningContent`, 同协议路径 (含 Redact) 三路径

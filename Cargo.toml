@@ -48,6 +48,7 @@ rand = "0.8"
 tower-sessions = { version = "0.14", features = ["memory-store"] }
 axum-login = "0.18"
 openidconnect = { version = "4", default-features = false, features = ["reqwest", "rustls-tls"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 [dev-dependencies]
 tokio-test = "0.4"

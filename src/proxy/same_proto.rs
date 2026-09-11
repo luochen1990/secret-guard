@@ -86,7 +86,7 @@ pub(crate) async fn same_proto_forward(
             ingress.name()
         );
         // 降级透传, 但 secrets_snapshot 必须传入 — UsageCtx 的 SEC model 扫描
-        // (USAGE-6) 恰防 "fail_open passthrough 把 secret 持久化进 JSONL".
+        // (USAGE-6) 恰防 "fail_open passthrough 把 secret 持久化进 SQLite".
         return same_proto_passthrough(
             state,
             fp,
@@ -201,16 +201,20 @@ pub(crate) async fn same_proto_forward(
         Some(&secrets_snapshot),
         redactions,
     );
-    // usage-stats 采集上下文 (in-scope 元数据, 响应完成点落账; helpers::usage_ctx SSOT).
+    // usage-stats 采集上下文 + redact 审计落账 (helpers SSOT: 请求侧, redact 已
+    // 实际发生, 即使响应失败也不丢 — USAGE-7).
     let model_req = event.model.as_ref().map(|m| m.to_string());
+    let redactions_echo = std::sync::Arc::clone(&event.redactions);
     let record_id = state.dag.push_messages(real_messages, event);
-    let usage_ctx = super::helpers::usage_ctx(
+    let usage_ctx = super::helpers::usage_ctx_and_record_redactions(
         &state,
         &fp,
         &parts.method,
         upstream_id,
         model_req,
         &secrets_snapshot,
+        record_id,
+        &redactions_echo,
     );
 
     debug!(%record_id, method = %parts.method, url = %upstream_url, "forwarding redacted same-proto request");
@@ -367,18 +371,22 @@ async fn same_proto_passthrough(
         None,
         vec![],
     );
-    // usage-stats 采集上下文. secrets_snapshot: 入口 1 (无 secret) 为空;
-    // 入口 2 (secrets 非空但无 codec 降级透传) 为全量快照 — USAGE-6 的 SEC 扫描
-    // 恰防后者的 model 字符串泄漏 (见 same_proto_forward 降级分支注释).
+    // usage-stats 采集上下文 + redact 审计落账 (helpers SSOT). secrets_snapshot:
+    // 入口 1 (无 secret) 为空; 入口 2 (secrets 非空但无 codec 降级透传) 为全量快照
+    // — USAGE-6 的 SEC 扫描恰防后者的 model 字符串泄漏. redactions echo: passthrough
+    // 路径恒空 (无 IR 改写), 统一走 helper 防未来该路径出现 redact 时漏接.
     let model_req = event.model.as_ref().map(|m| m.to_string());
+    let redactions_echo = std::sync::Arc::clone(&event.redactions);
     let record_id = state.dag.push_messages(vec![], event);
-    let usage_ctx = super::helpers::usage_ctx(
+    let usage_ctx = super::helpers::usage_ctx_and_record_redactions(
         &state,
         &fp,
         &parts.method,
         upstream_id,
         model_req,
         secrets_snapshot,
+        record_id,
+        &redactions_echo,
     );
 
     debug!(%record_id, method = %parts.method, url = %upstream_url, "forwarding (passthrough)");

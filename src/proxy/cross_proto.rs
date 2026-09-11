@@ -183,16 +183,20 @@ pub(crate) async fn cross_proto_forward(
         Some(&secrets_snapshot),
         redactions,
     );
-    // usage-stats 采集上下文 (与 same_proto 同模式; helpers::usage_ctx SSOT).
+    // usage-stats 采集上下文 + redact 审计落账 (helpers SSOT: 请求侧, redact 已
+    // 实际发生, 即使响应失败也不丢 — USAGE-7).
     let model_req = event.model.as_ref().map(|m| m.to_string());
+    let redactions_echo = std::sync::Arc::clone(&event.redactions);
     let record_id = state.dag.push_messages(real_messages, event);
-    let usage_ctx = super::helpers::usage_ctx(
+    let usage_ctx = super::helpers::usage_ctx_and_record_redactions(
         &state,
         &fp,
         &parts.method,
         upstream_id,
         model_req,
         &secrets_snapshot,
+        record_id,
+        &redactions_echo,
     );
 
     debug!(

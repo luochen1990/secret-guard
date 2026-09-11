@@ -1,9 +1,17 @@
 # secret-guard 模型用量统计 (Usage Stats) 功能设计
 
-> 状态: Draft v2 (评审修订版, 待用户评审)
+> 状态: Implemented v4 (2026-09-11 存储升级 + rounds/redact 扩展)
 > 调研基线: opencode (sst/opencode@50efc05, `cli/cmd/stats.ts` + models.dev 定价),
 > claude-code `/cost` `/usage` + ccusage 生态, models.dev 开源模型定价库.
 > 关键约束 (用户指定): **充分利用模型回显信息, 尽量避免自己造轮子**.
+> v4 变更 (2026-09-11, 人工授权 — contracts.md 变更日志同日条目): 存储层
+> JSONL → **SQLite** (rusqlite bundled, WAL, writer 线程批量事务; 内存聚合 +
+> 启动重放删除, summary SQL 直查 — 架构净简化); 聚合粒度 day → **hour**
+> (≤14 天 hour bucket, 更长 day 折叠; `by_day` → `by_bucket` + `granularity`);
+> 新增 **rounds 三态** (round_kind 列, 真值透传自 dag push 判定, retry 可见性);
+> `ok: bool` → **status 原始状态码** (429/4xx/5xx 派生分类); 新增 **redact 审计**
+> (redact_events 表, B 级精度: 事件明细 + mock, USAGE-7; 请求侧落账). 旧 JSONL
+> 不迁移 (留在原地可手动删除). API `days` 参数 → `hours`.
 > v3 变更 (实施后走查, 2026-09-03): 实施中修正 — days 查询加硬上限 400
 > (ROB: GET 参数防分配 abort); passthrough 降级路径 (secrets 非空 + 无 codec)
 > 的 SEC model 扫描补全 (v2 遗漏); PricingCache 退避窗口补齐 serve-stale 形态;
@@ -58,7 +66,10 @@ secret-guard 是本地 LLM 网关, 所有工具 (opencode / claude-code / cursor
   **不得**伪装成 0 token 参与成本.
 - **P-4 成本永远是估算**: 所有 cost 展示带 "estimated" 语义; 无价格匹配时显示
   "—" (null), 不显示 $0.00.
-- **P-5 轻量持久**: append-only JSONL 明细 + 内存聚合, 不引入数据库.
+- **P-5 轻量持久 (v4 修订)**: SQLite 明细 (rusqlite bundled, 单文件 WAL) + SQL
+  聚合直查, 无内存聚合双份簿记. 引入 SQLite 的触发条件 (v2 时声明过): ad-hoc
+  历史查询需求 (redact 审计回查 / 小时粒度) + 免启动重放 — 交换的是
+  libsqlite3-sys 一个 C 依赖, license (MIT + public domain) 过审无障碍.
 
 ## 3. 现状盘点 (v2 修正: 如实版)
 
@@ -90,28 +101,55 @@ ResponseData { usage: Option<IrUsage>, model: Option<String> }
   ├─ (a) DAG 实时路径: TimelineRound.usage / SessionView.usage_total ──► 徽章 (P1)
   │
   └─ (b) 持久统计路径: proxy 响应完成点 (与 attach 同点, in-scope 上下文, 不回读 DAG)
-        ► UsageStore.record(UsageEvent)   # mpsc channel → 独立 writer task (热路径零同步 IO)
-        ► 内存增量聚合 + append secret-guard.usage.jsonl (启动时重放)
+        ► UsageStore.record(UsageEvent)   # mpsc channel → 独立 writer 线程批量事务 insert
+        ► (b') redact 审计路径 (v4): 请求侧 push 后立即 record_redactions
+              (redact 已实际发生, 响应失败也不丢 — USAGE-7)
+        ► summary 查询 = SQLite SQL GROUP BY 直查 (hour 粒度, 无内存聚合)
   ▼
-GET /api/usage/summary ──► 内存聚合 × PricingTable ──► WebUI Usage 页
+GET /api/usage/summary ──► SQLite SQL 聚合 × PricingTable ──► WebUI Usage 页
 ```
 
-### UsageEvent 明细行 schema (JSONL, 每请求一行, ~180B)
+### UsageEvent 明细行 schema (v4: SQLite `usage_events` 表, 每请求一行)
 
-```jsonc
+```sql
+-- 列即字段; JSON 视图仅示意
+-- ts: RFC3339 UTC (retention 按 ts); hour: 本地时区 'YYYY-MM-DDTHH' (聚合键,
+--      day 视图 = substr(hour,1,10) 折叠; Rust 侧插入时计算, 避免 SQL 时区体操)
+-- status: 原始 HTTP 状态码 (v4 替代 ok:bool; 2xx/429/其余4xx/5xx 分类在
+--      summary 派生层完成 — 一列原始事实回答所有 "某类错误多不多" 的问题)
+-- round_kind: 0/1/2 = Normal/Retry/NoMessages (真值透传自 dag push_messages
+--      判定; retries + no_messages 独立计数, normal = requests - 两者, 派生)
 {
   "ts": "2026-09-02T15:04:05.678Z",   // CallEvent.created_at
+  "hour": "2026-09-02T23",             // 本地时区 (示例 TZ=UTC+8)
   "provider": "openai-main",           // upstream_id (路由解析后的链尾实体)
   "model": "gpt-5.6-terra",            // 回显 model 优先 (M0 接线后), fallback 请求 model
   "model_req": "gpt-fast",             // 请求侧 model (两者不同 = 命中别名/重写)
   "proto": "o",                        // ingress proto_short
-  "ok": true,                          // resp_status == 2xx
+  "status": 200,                       // 原始状态码 (v4)
   "complete": true,                    // resp_complete (流式中断 = false)
-  "usage": { "i": 70, "o": 10, "cr": 30, "cw": 0 }  // usage_present=false 时为 null;
+  "round_kind": 0,                     // v4 rounds 三态
+  "usage": { "i": 70, "o": 10, "cr": 30, "cw": 0 }  // usage 四列 NULL ⇔ 无回显;
                                                     // cr/cw 的 None 按约定 unwrap_or(0) 落盘
                                                     // (USAGE-2 的相等断言按此语义表述)
 }
 ```
+
+### RedactEvent 审计行 schema (v4 新增: `redact_events` 表, 每请求 × 每命中 secret 一行)
+
+```jsonc
+{
+  "ts": "...", "hour": "...",          // 同上
+  "secret_id": "github-token",         // 受控 id (config schema, 无 secret 明文)
+  "mock": "sgm_...",                   // 替换值 (C5 保证 + 防御纵深扫描, USAGE-6/7)
+  "provider": "openai-main",
+  "model_req": "gpt-fast",             // 请求侧 (redact 发生在请求侧, 回显未知)
+  "proto": "o"
+}
+```
+
+精度级别 (用户裁决, B 级): A 纯聚合 / **B 事件明细+mock (采纳)** / C B+出现位置 (P2).
+红线: real secret 明文与上下文片段永不持久化.
 
 - **SEC 边界 (v2 修正)**: `model` / `model_req` 是**自由 wire 字符串**, 不是受控 id.
   passthrough + fail_open 场景下 secret 理论上可出现在其中 (如中转把路由 key 编码进
@@ -119,12 +157,12 @@ GET /api/usage/summary ──► 内存聚合 × PricingTable ──► WebUI Us
   model 字符串做 active secrets 扫描 (复用 PolicySnapshot 的 contains 判定, O(secrets)
   小扫描), 命中 → 替换 `<redacted:model>` + WARN; 另截断 256 chars. 其余字段为受控
   类型 (数字 / provider id / proto 枚举), 天然无 secret.
-- 崩溃残行: 启动重放跳过非法行 + WARN (ROB best-effort).
-- 文件路径: 与 state.toml 同目录派生 (`secret-guard.usage.jsonl`, 派生规则同
-  config → state 路径约定).
-- 写失败降级: writer task 写失败 → WARN + 计数 (`dropped_events`), 内存聚合继续
-  (best-effort: 明细可丢, 聚合不崩).
-- retention 清理: 启动时读入内存后, 若有过期行 → 临时文件重写 + atomic rename.
+- 文件路径: 与 state.toml 同目录派生 (`secret-guard.usage.sqlite3`, 派生规则同
+  config → state 路径约定). WAL + synchronous=NORMAL + busy_timeout 5s.
+  打开失败 → WARN + 降级 `:memory:` (统计可用, 明细不持久 — best-effort).
+- 写失败降级: writer 线程 insert 失败 → WARN 一次 + `dropped` 计数, 查询照常
+  (best-effort: 明细可丢, 进程不崩). schema 版本经 PRAGMA user_version 管理.
+- retention 清理: 启动时 `DELETE WHERE ts < cutoff` (O(过期行), 非 JSONL 版全文件重写).
 
 ## 5. 采集层设计 (M0, v2 新增)
 
@@ -172,21 +210,28 @@ GET /api/usage/summary ──► 内存聚合 × PricingTable ──► WebUI Us
 
 ## 6. 聚合设计
 
-内存结构 (启动重放 JSONL + record() 增量维护, 单 `RwLock`):
+聚合结构 (v4: SQL GROUP BY 直查, 无内存聚合 — 单一事实来源):
 
-```rust
-struct UsageAgg {            // 按 (day, provider, model) 三元组 fold
-    requests: u64, requests_without_usage: u64,
-    input: u64, output: u64, cache_read: u64, cache_write: u64,
-}
+```sql
+-- 按 (hour, provider, model) 三元组; day 视图 = substr(hour,1,10) 折叠
+SELECT hour, provider, model, COUNT(*), SUM(usage_i IS NULL),
+       SUM(round_kind = 1), SUM(round_kind = 2),          -- retries / no_messages
+       SUM(status = 429), SUM(status BETWEEN 400 AND 499 AND status != 429),
+       SUM(status >= 500),                                 -- 429 / 4xx / 5xx (v4)
+       SUM(COALESCE(usage_i,0)), SUM(COALESCE(usage_o,0)),
+       SUM(COALESCE(usage_cr,0)), SUM(COALESCE(usage_cw,0))
+FROM usage_events WHERE hour >= ?1
+GROUP BY hour, provider, model ORDER BY hour, provider, model   -- 确定性 (USAGE-3)
 ```
 
-- **day 键**: 本地时区 (本地工具, 用户直觉是 "今天"), 启动时确定 (YAGNI, 不做 TZ 配置).
+- **hour 键**: 本地时区 `YYYY-MM-DDTHH` (v4 从 day 升级; 本地工具, 用户直觉是
+  "今天/这一小时"). 查询粒度自适应: 窗口 ≤14 天 (336h) hour bucket, 更长 day
+  折叠 (payload 控制); 补零连续序列在 summary 派生层生成.
 - **model 键**: 回显 model (M0 接线后) 优先, None 时请求 model; `model_req != model`
   的行按回显 model 归并 (它才是计费模型).
 - session 级聚合**不做持久化** (SessionId 是内存实例生命周期, 跨 restart 无意义):
   session 用量 = 实时从 DAG fold TimelineRound.usage. **口径漂移声明** (UI 显式表达):
-  restart 后 session 徽章从零起算、FIFO 淘汰后缩水, 而 by_day 持久累计 —— 两套数字
+  restart 后 session 徽章从零起算、LRU (session) 淘汰后缩水, 而持久账本累计 —— 两套数字
   语义不同 (session 徽章 = "本次进程内该会话的已渲染轮次", Usage 页 = "持久账本"),
   Usage 页脚注说明.
 
@@ -229,26 +274,36 @@ struct UsageAgg {            // 按 (day, provider, model) 三元组 fold
 ## 8. API 设计
 
 ```
-GET /api/usage/summary?days=7        # days=0 = 今日, 缺省 7; 上限 = retention_days
+GET /api/usage/summary?hours=168     # hours=0 → 1, 缺省 168 (7d); 上限 = min(retention_days×24, 9600)
 → {
-    "range": { "from": "...", "to": "...", "days": 7 },
+    "range": { "from": "...", "to": "...", "hours": 168, "granularity": "hour" },
+                                     // ≤336h hour bucket ('YYYY-MM-DDTHH'), 更长 day 折叠
     "pricing_status": "ok",
     "totals": {
       "requests": 412, "requests_without_usage": 3,
+      "retries": 37, "no_messages": 2,        // v4 rounds 三态 (normal = requests - 两者, 派生)
+      "rate_limited_429": 12,                 // v4 status 原始码派生分类
+      "errors_4xx": 1, "errors_5xx": 3,
       "input": 8_112_334, "output": 210_998,
       "cache_read": 5_004_112, "cache_write": 91_200,
       "cache_hit_rate": 0.86,                 // cr / (i + cr + cw); cache_write 计入
-                                               // 分母 (它也是 input 的一部分), 口径注明
+                                                // 分母 (它也是 input 的一部分), 口径注明
       "est_cost_usd": 12.41,                  // 仅含有价行
       "cost_coverage": 0.97                    // 有价且有 usage 请求占比 (P-4 可观测)
     },
-    "by_day":     [ { "day": "2026-09-01", ...UsageAgg, "est_cost_usd": ... }, ... ],
+    "by_bucket":  [ { "bucket": "2026-09-11T14", ...UsageAgg, "est_cost_usd": ... }, ... ],
     "by_model":   [ { "model": "...", "provider": "...", ...UsageAgg, "est_cost_usd": ... }, ... ],
     "by_provider":[ { "provider": "...", ...UsageAgg, "est_cost_usd": ... }, ... ],
     "unpriced_models": ["my-relay/gpt-fork"],
-    "zero_priced_models": ["glm-5.3"]        // 有价但四价全零 (免费档/套餐 vendor,
+    "zero_priced_models": ["glm-5.3"],       // 有价但四价全零 (免费档/套餐 vendor,
                                               // 含 override 显式置零); 与 unpriced 分开
                                               // 显式, 防 cost=0 + coverage=1.0 掩盖 (#202)
+    "redactions": {                           // v4 审计视图 (USAGE-7), 与 usage 同窗口
+      "by_secret": [ { "secret_id": "...", "mock": "...", "hits": 42,
+                       "first_ts": "...", "last_ts": "..." }, ... ],
+      "recent":     [ { "ts": "...", "secret_id": "...", "mock": "...",
+                         "provider": "...", "model_req": "...", "proto": "o" }, ... ]  // ≤100
+    }
   }
 ```
 
@@ -262,11 +317,12 @@ GET /api/usage/summary?days=7        # days=0 = 今日, 缺省 7; 上限 = reten
 ## 9. WebUI 设计
 
 1. **Usage 页** (顶部导航新 tab):
-   - 时间范围切换 (Today / 7d / 30d / All = retention 全域);
+   - 时间范围切换 (24h / 7d / 30d / All = retention 全域);
    - 汇总卡片行: Requests · Input · Output · Cache Read · Cache Write · Cache Hit % ·
      Est. Cost ("~$12.41" 样式, 恒带 "~"; coverage < 100% 角标; pricing_status ≠ ok
      时显示价目表状态); coverage 低 + OpenAI provider 存在时展示 include_usage 提示;
-   - 按天堆叠柱状图 (in / cache_read / cache_write / out 四段): 纯 SVG/CSS, 不引入
+   - 堆叠柱状图 (in / cache_read / cache_write / out 四段): 粒度随窗口自适应
+     (≤14d 按小时, 更长按天; 阈值 HOURLY_MAX_HOURS = 336), 纯 SVG/CSS, 不引入
      图表库 (index.html 无构建链, 保持零依赖);
    - By Model 表 (provider 列 / reqs / 四维 token / ~cost / 占比%) + By Provider 表;
    - 页脚: 口径说明 (估算语义 / session 徽章与持久账本口径差异).
@@ -286,9 +342,9 @@ GET /api/usage/summary?days=7        # days=0 = 今日, 缺省 7; 上限 = reten
 
 ## 11. 契约 (新增 `USAGE-*` 域, 挂入 contracts.md)
 
-- **USAGE-1 聚合一致性**: ∀窗口. `summary.totals` == 窗口内明细行 fold;
-  `by_day` / `by_model` / `by_provider` 各自分项之和 == totals
-  (proptest: 随机事件流 + 随机窗口, 三向相等).
+- **USAGE-1 聚合一致性 (hour 粒度 + rounds 三态)**: ∀窗口. `summary.totals` ==
+  窗口内明细行 fold; `by_bucket` / `by_model` / `by_provider` 各自分项之和 == totals;
+  `requests == Σ(normal + retry + no_messages)` (完整 SSOT 见 contracts.md USAGE-1).
 - **USAGE-2 回显保真**: 存储的 usage == 上游回显经 codec 归一化值 (cr/cw 的 None 按
   `unwrap_or(0)` 语义落盘); presence 位忠实反映 "wire 是否观测到 usage"
   (property: 对 codec round-trip fixture, UsageEvent == (ResponseData.usage, in-scope
@@ -297,8 +353,9 @@ GET /api/usage/summary?days=7        # days=0 = 今日, 缺省 7; 上限 = reten
   ⇒ 同 cost; 无价 ⇒ None. proptest: 逐行算再求和 == fold 后再算 (线性性).
 - **USAGE-4 缺失显式**: `requests == Σ(usage 非空行) + requests_without_usage`;
   usage 为空的行对 token / cost 贡献恒为 0.
-- **USAGE-5 计入判据**: 仅 POST 且实际发生上游转发的请求产生 UsageEvent; GET /models
-  (透传与本地终结) / dispatch 前置拒绝不产生.
+- **USAGE-5 计入判据 + status 原始事实**: 仅 POST 且实际发生上游转发的请求产生
+  UsageEvent; GET /models (透传与本地终结) / dispatch 前置拒绝不产生; status 存原始
+  状态码 (429/4xx/5xx 派生分类).
 - **SEC 关联**: UsageEvent 序列化前过 model 字符串 secret 扫描 (§4); pricing 缓存与
   JSONL 无 body 内容 —— 入 SEC-* 走查清单.
 
@@ -317,8 +374,12 @@ GET /api/usage/summary?days=7        # days=0 = 今日, 缺省 7; 上限 = reten
 - **cost 是估算**: models.dev 价格 ≠ 实际合同价; 无价模型显示 "—".
 - **历史 cost 随价目表漂移** (§7 快照语义).
 - **restart 时在途请求丢失** (append 在响应完成点); 写失败降级丢明细 (§4).
+- **shutdown 时 channel 尾批可能丢失** (v4): writer 线程批量 insert, 进程退出时
+  已 record 但未落库的事件 (≤ 批量上限 64 条 + 在途批) 随 detached 线程蒸发;
+  channel 关闭时 drain-then-exit 兜底大部分, 无 fsync-on-shutdown 钩子 (本地工具
+  可接受; JSONL 版逐行 flush 的耐久粒度更细).
 - **session 徽章与持久账本口径不同** (§6): 前者进程内, 后者持久.
-- **多实例并发写同一 JSONL 未设计** (单用户本地工具假设, 与 #157 TOCTOU 声明同型).
+- **多实例并发写同一 SQLite 未设计** (单用户本地工具假设, 与 #157 TOCTOU 声明同型).
 
 ## 13. 里程碑 (v2: 增 M0, 补文档同步义务)
 

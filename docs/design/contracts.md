@@ -915,19 +915,19 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 ---
 
 ## 11. USAGE: 模型用量统计
+### USAGE-1 聚合一致性 (hour 粒度 + rounds 三态)
 
-> 信任域 B. 上游回显 usage 的采集 / 聚合 / 持久化 / 定价估算的正确性.
-> 设计 SSOT: `docs/design/usage-stats.md` (P-1..P-5 原则 / 数据流 / 定价匹配规则).
-
-### USAGE-1 聚合一致性
-
-**陈述**: 对任意查询窗口, `summary.totals` == 窗口内明细行 fold; `by_day` / `by_model` /
-`by_provider` 各自分项之和 == totals. 持久层同理: store 重放 (JSONL → 内存聚合) 与
-在线聚合产出相同的 cells.
+**陈述**: 对任意查询窗口, `summary.totals` == 窗口内明细行 fold; `by_bucket` /
+`by_model` / `by_provider` 各自分项之和 == totals. 聚合键是**本地时区 hour**
+(`YYYY-MM-DDTHH`); 窗口 ≤14 天按 hour 粒度, 更长按 day 折叠 (bucket 前缀). rounds
+三态满足 `requests == Σ(normal + retry + no_messages)`; `round_kind` 存储值 ==
+dag `push_messages` 判定值的真值透传 (proxy 经 `round_kind_of` 回读刚 push 节点).
 
 **Properties**:
-- `prop_usage_aggregation_consistency`: 三向相等 (totals / by_day / by_model / by_provider) + 窗口过滤 (day >= from). 🔁→`summary_sums_match_totals_across_all_views` (`src/usage/summary.rs`) + `open_replays_jsonl_and_folds_aggregation` (`src/usage/store.rs`; 重放维度)
-- `prop_usage_zero_filled_days`: by_day 是窗口内连续日期序列 (无数据日补零). 🔁→`empty_store_yields_zeroed_days_and_none_rates` (`src/usage/summary.rs`)
+- `prop_usage_aggregation_consistency`: 三向相等 (totals / by_bucket / by_model / by_provider) + 窗口过滤 (bucket >= cutoff). 🔁→`summary_sums_match_totals_across_all_views` (`src/usage/summary.rs`) + `open_reuses_existing_db_and_restores_aggregation` (`src/usage/store.rs`; 持久维度)
+- `prop_usage_zero_filled_buckets`: by_bucket 是窗口内连续 bucket 序列 (无数据补零), 粒度随窗口自适应. 🔁→`empty_store_yields_zeroed_buckets_and_none_rates` + `long_window_folds_to_day_granularity` (`src/usage/summary.rs`)
+- `prop_usage_hour_bucket_separation`: 相互间隔整小时的事件落入不同 hour bucket; day 折叠求和守恒. 🔁→`hour_granularity_separates_buckets_within_one_day` (`src/usage/store.rs`)
+- `prop_usage_round_dimensions`: round_kind 三态 (retries / no_messages) + status 分类 (429 / 4xx / 5xx) 独立计数, 总和关系成立. 🔁→`record_response_counts_retry_and_429_dimensions` (`src/usage/mod.rs`)
 
 ### USAGE-2 回显保真 (presence + 归一化)
 
@@ -956,7 +956,7 @@ None, UI 显示 "—" 而非 $0.00, P-4); 对聚合线性 (逐事件算再求和
 ### USAGE-4 缺失显式
 
 **陈述**: `requests == Σ(有 usage 行) + requests_without_usage`; usage 为空的行对
-token / cost 贡献恒为 0; `cost_coverage` 只以有 usage 的请求为分母; 无价 model 进
+token / cost 贡献恒 0; `cost_coverage` 只以有 usage 的请求为分母; 无价 model 进
 `unpriced_models` 清单; 有价但四价全零的 model (免费档 / 套餐 vendor 计量口径, 含
 override 显式置零) 进 `zero_priced_models` 清单 —— "$0 已知价"与"无价"分开显式,
 零价仍计入 coverage 分子 (零价是已知的价), 但单独列出防 cost=0 + coverage=1.0
@@ -967,28 +967,44 @@ override 显式置零) 进 `zero_priced_models` 清单 —— "$0 已知价"与"
 - `prop_usage_unpriced_models_listed`: 无价 model 显示在 unpriced_models (提示配 override), 不产生 cost. 🔁→`summary_sums_match_totals_across_all_views` (`src/usage/summary.rs`; unpriced 断言内嵌) + `match_unpriced_returns_none` (`src/usage/pricing.rs`)
 - `prop_usage_zero_priced_models_listed`: 全零价 model 显示在 zero_priced_models (提示按量估算口径可能失真), coverage 口径不变. 🔁→`zero_priced_models_listed_without_breaking_coverage` (`src/usage/summary.rs`)
 
-### USAGE-5 计入判据
+### USAGE-5 计入判据 + status 原始事实
 
-**陈述**: 仅 **POST 且收到上游响应** (任何 status) 的转发请求产生 UsageEvent:
+**陈述**: 仅 **POST 且收到上游响应** 的转发请求产生 UsageEvent:
 - GET 请求被方法过滤 (GET /models 透传不计; router /models 本地终结无转发, 天然不计);
 - dispatch 前置拒绝 (404/503/501) 与上游 send 失败 (502/504, 无响应) 不计 —
   "requests" 语义 = "上游实际返回了响应的 POST 请求数";
-- 流式中断 (响应头已到达) 计入, complete=false + usage=None.
+- 流式中断 (响应头已到达) 计入, complete=false + usage=None;
+- `status` 存**原始 HTTP 状态码** (SSOT: 一列原始事实, 2xx/429/其余 4xx/5xx 的分类
+  在 summary 派生层完成 — 回答所有 "某类错误多不多" 的问题, 不落 per-class flag).
 
 **Properties**:
 - `prop_usage_inclusion_post_only`: 非 POST → 零事件; 端到端 GET /models 透传不进 summary. 🔁→`record_response_filters_non_post` (`src/usage/mod.rs`) + `usage_stats_end_to_end_records_replayed_and_served` (`tests/integration.rs`; GET 不计入断言内嵌)
 - `prop_usage_disabled_store_zero_overhead`: `[usage] enabled = false` → record no-op, 聚合恒空. 🔁→`disabled_store_is_noop` (`src/usage/store.rs`)
-- `prop_usage_retention_expiry`: retention_days 过期行启动时清理 (文件重写 + 聚合不含). 🔁→`open_drops_expired_by_retention` (`src/usage/store.rs`)
+- `prop_usage_retention_expiry`: retention_days 过期行启动时清理 (SQL DELETE, 聚合不含). 🔁→`open_drops_expired_by_retention` (`src/usage/store.rs`)
 
-### USAGE-6 SEC 边界: model 字符串扫描 (关联 SEC 域)
+### USAGE-6 SEC 边界: 自由字符串扫描 (关联 SEC 域)
 
-**陈述**: `model` / `model_req` 是自由 wire 字符串 (非受控 id) — fail_open passthrough
-场景下 secret 理论可出现在其中, 且 JSONL 会**持久化** (比内存 DAG 更严重). 落账前
-必须过 active secrets 扫描 (命中 → `<redacted:model>` 整体替换 + WARN) 并截断 256
-chars (char boundary 安全); 其余 UsageEvent 字段为受控类型, 天然无 secret.
+**陈述**: `model` / `model_req` / redact 的 `mock` 是自由字符串 (非受控 id) —
+fail_open passthrough 场景下 secret 理论可出现在 model 中 (mock 虽由 C5 保证不含
+secret 子串, 仍做防御纵深), 且 SQLite 会**持久化** (比内存 DAG 更严重). 落账前
+必须过 active secrets 扫描 (命中 → `<redacted:...>` 整体替换 + WARN) 并截断 256
+chars (char boundary 安全); 其余事件字段为受控类型, 天然无 secret.
 
 **Properties**:
 - `prop_usage_model_secret_scan`: 含 secret 的 model → 整体替换 + 无残留; 干净 model 保留 + 超长截断在 char boundary. 🔁→`sanitize_redacts_model_containing_secret` (`src/usage/mod.rs`) + `sanitize_keeps_clean_model_and_truncates_at_char_boundary` (`src/usage/mod.rs`)
+
+### USAGE-7 redact 审计持久化 (B 级精度)
+
+**陈述**: 每次请求侧 redact (每命中 secret 一条) 持久化审计事件: ts / secret_id /
+mock / provider / model_req / proto — 支持 "哪个 secret、什么时间、发往哪个 provider
+时被替换" 的回查 (summary 的 `redactions` 子对象: by_secret 聚合 + recent 明细).
+**永不**持久化 real secret 明文或上下文片段; 落账点在请求侧 (redact 已实际发生,
+即使响应失败也不丢); 不过滤 method (redact 只发生在 body 改写路径, 审计语义与
+method 无关). 存储精度为 **B 级** (事件明细 + mock, 不含出现位置 — 取证级留 P2).
+
+**Properties**:
+- `prop_usage_redact_persist_no_secret`: 持久化行 (含 mock) 过 active secrets 扫描永不命中 — 命中 secret 子串的 mock 整体替换为 `<redacted:mock>` (C5 防御纵深). 🔁→`record_redactions_persists_per_secret_rows_and_sanitizes_mock` (`src/usage/mod.rs`)
+- `prop_usage_redact_noop_guards`: disabled store 或空 redactions → 零落账. 🔁→`record_redactions_noop_on_disabled_or_empty` (`src/usage/mod.rs`)
 
 ---
 
@@ -999,6 +1015,7 @@ chars (char boundary 安全); 其余 UsageEvent 字段为受控类型, 天然无
 | 日期 | 契约 ID | 调整 | 原因 |
 |---|---|---|---|
 | 2026-07-26 | (initial) | 建立本文档, 收纳 C1-C7 / INV-1..5 / I1-I3 为 RED-1..7 / CDAG-1..5 / UI-1..3 | QA 系统梳理, 边界契约先行 |
+| 2026-09-11 | USAGE-1/5/6/7 | 人工授权 (usage-stats v4): 存储层 JSONL → SQLite (USAGE-1 聚合一致性改为 SQL 直查, "重放恢复" 重述为 "持久恢复"; 无内存双份簿记); 聚合粒度 day → **hour** (≤14 天 hour bucket, 更长 day 折叠, by_day → by_bucket); USAGE-1 新增 rounds 三态维度 (round_kind 真值透传自 dag push 判定); USAGE-5 新增 status 原始状态码语义 (429/4xx/5xx 派生分类, 不落 per-class flag); USAGE-6 扫描范围扩至 mock; 新增 **USAGE-7** redact 审计持久化 (B 级精度: 事件明细 + mock, 永不含 real secret). | 用户需求: 小时精度 / SQLite / rounds 与 retry 可见性 / 429 独立统计 / redact 审计记录 |
 | 2026-07-26 | FWD-1 / FWD-2 | FWD-1 升级为透明中继半段式 byte-exact (端到端最强契约); FWD-2 降为 FWD-1 的分解 (纯 codec round-trip byte-exact, 便于 bug 定位); 增加 §0.3 Property 设计原则 + §0.4 冗余覆盖原则 | 讨论中意识到 semantic_equiv 难以测, normalize 后 byte-exact 是可机械验证的最强 property |
 | 2026-07-26 | FWD-3 | 重写为"建模范围内语义保留 + 范围外显式丢弃", 不再承诺"保留 chat completion 语义" | 讨论中意识到跨协议翻译有不可避免的语义损失 (reasoning/citations/logproms 等), 契约必须显式声明建模范围 |
 | 2026-07-26 | FWD-4 | `prop_response_never_size_capped` 改名为 `prop_client_response_not_capped_even_when_record_truncated`, 陈述精确化 | 讨论中澄清"客户端响应路径与 record 累积路径是两条独立路径" |

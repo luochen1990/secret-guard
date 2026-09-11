@@ -7004,15 +7004,71 @@ async fn router_routes_two_hop_pipeline_rewrite_e2e() {
     // real-a 的 mock 只匹配 model=m2-tail-a, 收到 m2-in 会 unmatched → 501.
 }
 
-// ─── usage-stats: 端到端 (proxy → UsageCtx → store → JSONL → API) ──────────
+// ─── usage-stats: 端到端 (proxy → UsageCtx → store → SQLite → API) ────────
+
+/// usage E2E fixture: 临时目录 + 全新文件 store (WAL 侧车一并清理).
+/// 返回 (store, db path); 用后 remove_file(db) 清理.
+fn usage_e2e_store(
+    tag: &str,
+) -> (
+    std::sync::Arc<secret_guard::usage::UsageStore>,
+    std::path::PathBuf,
+) {
+    let dir = std::env::temp_dir().join(format!("sg-{tag}-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let db = dir.join("usage.sqlite3");
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
+    }
+    let store = std::sync::Arc::new(secret_guard::usage::UsageStore::open(
+        &secret_guard::config::UsageConfig {
+            enabled: true,
+            retention_days: 90,
+            ..Default::default()
+        },
+        &db,
+    ));
+    (store, db)
+}
+
+/// 轮询 /api/usage/summary 直到谓词满足 (writer 线程异步落库的等待收敛).
+async fn poll_usage_summary(
+    client: &reqwest::Client,
+    base: &str,
+    satisfied: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    for _ in 0..100 {
+        let s = client
+            .get(format!("{base}/api/usage/summary?hours=24"))
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap();
+        if satisfied(&s) {
+            return s;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("usage summary condition not met within poll budget");
+}
 //
 // 契约: USAGE-1/2/4/5 的集成层锚. 单元层 (store/summary/UsageCtx) 已分别覆盖,
-// 此处验证全链路接线: 上游回显 usage → codec 归一化 → 落账 (含 JSONL 持久化)
+// 此处验证全链路接线: 上游回显 usage → codec 归一化 → 落账 (含 SQLite 持久化)
 // → GET /api/usage/summary 聚合. USAGE-5 的方法过滤 (GET /models 不计入) 一并守卫.
 
-/// usage-stats E2E 专用: 文件落盘的 UsageStore + 独立 AppState.
+/// usage-stats E2E 专用: 文件落盘的 UsageStore + 独立 AppState (空 secrets).
 async fn spawn_proxy_with_usage_store(
     usage: std::sync::Arc<secret_guard::usage::UsageStore>,
+) -> String {
+    spawn_proxy_with_usage_store_and_secrets(usage, test_secret_table()).await
+}
+
+/// 同上, 但 secrets 表可注入 (redact 审计 E2E 用).
+async fn spawn_proxy_with_usage_store_and_secrets(
+    usage: std::sync::Arc<secret_guard::usage::UsageStore>,
+    secrets: SecretTable,
 ) -> String {
     let upstream_client = reqwest::Client::new();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -7032,7 +7088,7 @@ async fn spawn_proxy_with_usage_store(
         upstream: upstream_client,
         providers: provider_table,
         dag: ConversationDag::new(64, 500, 1),
-        secrets: test_secret_table(),
+        secrets,
         api_keys: test_api_key_store(),
         auth_enabled: false,
         global_mock_prefix: std::sync::Arc::from(""),
@@ -7047,6 +7103,87 @@ async fn spawn_proxy_with_usage_store(
         let _ = axum::serve(listener, app).await;
     });
     format!("http://{addr}")
+}
+
+// ─── USAGE-7 + USAGE-1 (rounds) 穿透 E2E ─────────────────────────────────
+//
+// 全链路: 请求 body 含 secret → same-proto redact → record_redactions (请求侧,
+// push 后立即) → SQLite redact_events → /api/usage/summary 的 redactions 视图;
+// 同时验证 rounds 三态接线: 完全相同的 messages 重发 → RoundKind::Retry →
+// summary.totals.retries == 1 (round_kind 真值透传自 dag push 判定).
+#[tokio::test]
+async fn usage_stats_redact_audit_and_retry_round_recorded() {
+    let mut server = mockito::Server::new_async().await;
+    let chat_body = serde_json::json!({
+        "id": "chatcmpl-redact",
+        "model": "gpt-r",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
+                     "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+    });
+    let _chat = server
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(serde_json::to_string(&chat_body).unwrap())
+        .create_async()
+        .await;
+
+    let (store, db) = usage_e2e_store("redact-e2e");
+    let base = spawn_proxy_with_usage_store_and_secrets(
+        store.clone(),
+        test_secret_table_with(vec![secret("sid-e2e", "sk-live-e2e-secret-value")]),
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let create = serde_json::json!({
+        "id": "oa-mock", "enabled": true, "protocol": "openai",
+        "base_url": server.url(), "api_key": "sk-x"
+    });
+    let resp = client
+        .post(format!("{base}/api/providers"))
+        .json(&create)
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+
+    // 两次完全相同的 chat (body 含 secret): 第一次 Normal + redact, 第二次 Retry.
+    let body = serde_json::json!({"model": "gpt-r", "messages": [
+        {"role": "user", "content": "use sk-live-e2e-secret-value to call api"}]});
+    for _ in 0..2 {
+        let r = client
+            .post(format!("{base}/o/oa-mock/v1/chat/completions"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success());
+        let _ = r.json::<serde_json::Value>().await;
+    }
+    store.flush_for_test();
+
+    let s = poll_usage_summary(&client, &base, |s| {
+        s["totals"]["requests"].as_u64() == Some(2)
+    })
+    .await;
+    // USAGE-1 rounds 三态: 第二次全前缀重发 → Retry.
+    assert_eq!(s["totals"]["retries"].as_u64(), Some(1), "retry round: {s}");
+    // USAGE-7: redact 审计视图 (by_secret + recent), mock 不含 secret 明文.
+    let by_secret = s["redactions"]["by_secret"].as_array().expect("by_secret");
+    assert_eq!(by_secret.len(), 1, "one secret hit: {s}");
+    assert_eq!(by_secret[0]["secret_id"].as_str(), Some("sid-e2e"));
+    assert_eq!(by_secret[0]["hits"].as_u64(), Some(2));
+    let mock = by_secret[0]["mock"].as_str().unwrap();
+    assert!(
+        !mock.contains("sk-live-e2e-secret-value"),
+        "mock must not leak secret"
+    );
+    let recent = s["redactions"]["recent"].as_array().expect("recent");
+    assert_eq!(recent.len(), 2);
+    assert_eq!(recent[0]["provider"].as_str(), Some("oa-mock"));
+    assert!(!format!("{recent:?}").contains("sk-live-e2e-secret-value"));
+    let _ = std::fs::remove_file(&db);
 }
 
 #[tokio::test]
@@ -7078,18 +7215,7 @@ async fn usage_stats_end_to_end_records_replayed_and_served() {
         .await;
 
     // 2. 文件落盘的 store.
-    let dir = std::env::temp_dir().join(format!("sg-usage-e2e-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
-    let jsonl = dir.join("usage.jsonl");
-    let _ = std::fs::remove_file(&jsonl);
-    let store = std::sync::Arc::new(secret_guard::usage::UsageStore::open(
-        &secret_guard::config::UsageConfig {
-            enabled: true,
-            retention_days: 90,
-            ..Default::default()
-        },
-        &jsonl,
-    ));
+    let (store, db) = usage_e2e_store("usage-e2e");
     let base = spawn_proxy_with_usage_store(store.clone()).await;
 
     // 3. provider base_url 指向 mock: 通过 state.toml 写 dynamic override 不可行 (helper
@@ -7129,23 +7255,10 @@ async fn usage_stats_end_to_end_records_replayed_and_served() {
 
     // 5. 轮询 summary 直到事件落地 (writer 线程异步 + record 同步进内存聚合,
     //    summary 读内存 — 立即可见; 轮询是防御 scheduler 延迟).
-    let mut summary = None;
-    for _ in 0..100 {
-        let s = client
-            .get(format!("{base}/api/usage/summary?days=1"))
-            .send()
-            .await
-            .unwrap()
-            .json::<serde_json::Value>()
-            .await
-            .unwrap();
-        if s["totals"]["requests"].as_u64() == Some(1) {
-            summary = Some(s);
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    let s = summary.expect("usage event must land in summary");
+    let s = poll_usage_summary(&client, &base, |s| {
+        s["totals"]["requests"].as_u64() == Some(1)
+    })
+    .await;
     let t = &s["totals"];
     assert_eq!(
         t["requests"].as_u64(),
@@ -7166,40 +7279,31 @@ async fn usage_stats_end_to_end_records_replayed_and_served() {
     );
     assert_eq!(m0["provider"].as_str(), Some("oa-mock"));
 
-    // 6. JSONL 持久化: 一行, model = 回显值.
-    let mut lines = None;
-    for _ in 0..100 {
-        if let Ok(c) = std::fs::read_to_string(&jsonl)
-            && !c.is_empty()
-        {
-            lines = Some(c);
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    let content = lines.expect("usage jsonl must be written");
-    let line: serde_json::Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
-    assert_eq!(line["model"].as_str(), Some("gpt-echoed"));
-    assert_eq!(line["model_req"].as_str(), Some("gpt-req"));
-    assert_eq!(line["usage"]["i"].as_u64(), Some(70));
-    assert_eq!(line["provider"].as_str(), Some("oa-mock"));
-    assert_eq!(line["method"].as_str(), Some("POST"));
-
-    // 7. 重放: 用同一文件再 open 一个 store, 聚合应恢复 (USAGE-1 持久一致性).
+    // 6. SQLite 持久化: flush 屏障 (writer 线程批量落库) 后, 重开同一路径的
+    //    store, 明细行应恢复 (USAGE-1 持久一致性 — SQL 直查, 明细即真相).
+    store.flush_for_test();
     let store2 = secret_guard::usage::UsageStore::open(
         &secret_guard::config::UsageConfig {
             enabled: true,
             retention_days: 90,
             ..Default::default()
         },
-        &jsonl,
+        &db,
     );
+    assert_eq!(store2.total_events(), 1, "row must persist in sqlite");
+    let cells = store2.query_cells("", secret_guard::usage::Granularity::Hour);
+    assert_eq!(cells.len(), 1);
+    let ((_, provider, model), agg) = &cells[0];
+    assert_eq!(provider, "oa-mock");
     assert_eq!(
-        store2.total_requests(),
-        1,
-        "replay must restore aggregation"
+        model.as_deref(),
+        Some("gpt-echoed"),
+        "echo model wins in persisted row"
     );
-    let _ = std::fs::remove_file(&jsonl);
+    assert_eq!(agg.input, 70);
+    assert_eq!(agg.cache_read, 30);
+    assert_eq!(agg.output, 50);
+    let _ = std::fs::remove_file(&db);
 }
 
 /// 流式采集 E2E (USAGE-2/5): OpenAI 流式 + include_usage 终末 chunk → usage 落账.
@@ -7221,18 +7325,7 @@ async fn usage_stats_streaming_include_usage_recorded() {
         .create_async()
         .await;
 
-    let dir = std::env::temp_dir().join(format!("sg-usage-s-e2e-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
-    let jsonl = dir.join("usage.jsonl");
-    let _ = std::fs::remove_file(&jsonl);
-    let store = std::sync::Arc::new(secret_guard::usage::UsageStore::open(
-        &secret_guard::config::UsageConfig {
-            enabled: true,
-            retention_days: 90,
-            ..Default::default()
-        },
-        &jsonl,
-    ));
+    let (store, db) = usage_e2e_store("usage-s-e2e");
     let base = spawn_proxy_with_usage_store(store).await;
     let client = reqwest::Client::new();
     let create = serde_json::json!({
@@ -7260,30 +7353,17 @@ async fn usage_stats_streaming_include_usage_recorded() {
     let mut stream = chat.bytes_stream();
     while let Some(_c) = stream.next().await {}
 
-    let mut summary = None;
-    for _ in 0..200 {
-        let s = client
-            .get(format!("{base}/api/usage/summary?days=1"))
-            .send()
-            .await
-            .unwrap()
-            .json::<serde_json::Value>()
-            .await
-            .unwrap();
-        if s["totals"]["requests"].as_u64() == Some(1) {
-            summary = Some(s);
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-    let s = summary.expect("streaming usage must land");
+    let s = poll_usage_summary(&client, &base, |s| {
+        s["totals"]["requests"].as_u64() == Some(1)
+    })
+    .await;
     assert_eq!(
         s["totals"]["input"].as_u64(),
         Some(42),
         "include_usage chunk collected: {s}"
     );
     assert_eq!(s["totals"]["output"].as_u64(), Some(7));
-    let _ = std::fs::remove_file(&jsonl);
+    let _ = std::fs::remove_file(&db);
 }
 
 /// cross_proto 采集 E2E: anthropic ingress → openai 上游, 回显 usage 经 egress reader
@@ -7305,18 +7385,7 @@ async fn usage_stats_cross_proto_recorded() {
         .create_async()
         .await;
 
-    let dir = std::env::temp_dir().join(format!("sg-usage-x-e2e-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
-    let jsonl = dir.join("usage.jsonl");
-    let _ = std::fs::remove_file(&jsonl);
-    let store = std::sync::Arc::new(secret_guard::usage::UsageStore::open(
-        &secret_guard::config::UsageConfig {
-            enabled: true,
-            retention_days: 90,
-            ..Default::default()
-        },
-        &jsonl,
-    ));
+    let (store, db) = usage_e2e_store("usage-x-e2e");
     let base = spawn_proxy_with_usage_store(store).await;
     let client = reqwest::Client::new();
     let create = serde_json::json!({
@@ -7343,23 +7412,10 @@ async fn usage_stats_cross_proto_recorded() {
         .unwrap();
     assert!(resp.status().is_success());
 
-    let mut summary = None;
-    for _ in 0..200 {
-        let s = client
-            .get(format!("{base}/api/usage/summary?days=1"))
-            .send()
-            .await
-            .unwrap()
-            .json::<serde_json::Value>()
-            .await
-            .unwrap();
-        if s["totals"]["requests"].as_u64() == Some(1) {
-            summary = Some(s);
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-    let s = summary.expect("cross-proto usage must land");
+    let s = poll_usage_summary(&client, &base, |s| {
+        s["totals"]["requests"].as_u64() == Some(1)
+    })
+    .await;
     assert_eq!(
         s["totals"]["input"].as_u64(),
         Some(10),
@@ -7367,5 +7423,5 @@ async fn usage_stats_cross_proto_recorded() {
     );
     assert_eq!(s["totals"]["output"].as_u64(), Some(4));
     assert_eq!(s["by_model"][0]["model"].as_str(), Some("gpt-cross"));
-    let _ = std::fs::remove_file(&jsonl);
+    let _ = std::fs::remove_file(&db);
 }

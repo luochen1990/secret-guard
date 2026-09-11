@@ -654,6 +654,7 @@ mod tests {
                 None,
                 "o",
                 "POST",
+                crate::dag::RoundKind::Normal,
                 std::sync::Arc::from(Vec::new().into_boxed_slice()),
             ),
         )

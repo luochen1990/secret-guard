@@ -13,15 +13,16 @@ use serde::Deserialize;
 use crate::state::{AppState, NO_STORE};
 use crate::usage::summary::{SummaryInputs, build_summary};
 
-/// days 的硬上限 (与 retention 无关): 防 `days=u32::MAX` 触发 by_day 补零序列的
-/// 巨量分配 (ROB: GET 参数直达的分配 abort 不可接受). 400 天 ≈ 13 个月, 覆盖
-/// 本地工具的合理回看窗口; retention 更小则进一步被 min 压缩.
-const MAX_DAYS: u32 = 400;
+/// hours 的硬上限 (与 retention 无关): 防 `hours=u32::MAX` 触发补零序列的巨量
+/// 分配 (ROB: GET 参数直达的分配 abort 不可接受). 400 天 ≈ 13 个月, 覆盖本地
+/// 工具的合理回看窗口; retention 更小则进一步被 min 压缩.
+const MAX_HOURS: u32 = 400 * 24;
 
 #[derive(Debug, Deserialize)]
 pub struct SummaryQuery {
-    /// 查询窗口天数. 0 = 今日; 缺省 7; 上限 = min(retention_days, 400).
-    pub days: Option<u32>,
+    /// 查询窗口小时数. 0 → 1 (当前小时); 缺省 168 (7 天); 上限 =
+    /// min(retention_days × 24, MAX_HOURS). ≤14 天按小时粒度, 更长按天折叠.
+    pub hours: Option<u32>,
 }
 
 pub async fn usage_summary(
@@ -30,11 +31,11 @@ pub async fn usage_summary(
 ) -> impl IntoResponse {
     let retention = state.usage.retention_days();
     let cap = if retention > 0 {
-        retention.min(MAX_DAYS)
+        retention.saturating_mul(24).min(MAX_HOURS)
     } else {
-        MAX_DAYS
+        MAX_HOURS
     };
-    let days = q.days.unwrap_or(7).max(1).min(cap);
+    let hours = q.hours.unwrap_or(168).max(1).min(cap);
     let (table, status) = state.pricing.table(&state.upstream).await;
     // domain hint: 闭包借用 providers 表 (router 条目无 base_url → None).
     let hint = |pid: &str| -> Option<String> {
@@ -48,7 +49,7 @@ pub async fn usage_summary(
         SummaryInputs {
             store: &state.usage,
             table: &table,
-            days,
+            hours,
             domain_hint: &hint,
         },
         status,
@@ -58,31 +59,31 @@ pub async fn usage_summary(
 
 #[cfg(test)]
 mod tests {
-    use super::MAX_DAYS;
+    use super::MAX_HOURS;
 
-    /// days 归一逻辑 pin: 缺省 7 / 0 → 1 / retention 上限 / retention 0 无上限.
+    /// hours 归一逻辑 pin: 缺省 168 / 0 → 1 / retention 上限 / retention 0 无上限.
     #[test]
-    fn days_normalization_matches_design() {
+    fn hours_normalization_matches_design() {
         // (query, retention) → expected — 直接复刻 handler 内联逻辑做回归锚.
         let norm = |q: Option<u32>, retention: u32| {
             let cap = if retention > 0 {
-                retention.min(MAX_DAYS)
+                retention.saturating_mul(24).min(MAX_HOURS)
             } else {
-                MAX_DAYS
+                MAX_HOURS
             };
-            q.unwrap_or(7).max(1).min(cap)
+            q.unwrap_or(168).max(1).min(cap)
         };
-        assert_eq!(norm(None, 90), 7);
+        assert_eq!(norm(None, 90), 168);
         assert_eq!(norm(Some(0), 90), 1);
-        assert_eq!(norm(Some(365), 90), 90, "capped by retention");
+        assert_eq!(norm(Some(3000), 90), 90 * 24, "capped by retention");
         assert_eq!(
-            norm(Some(365), 0),
-            365,
-            "retention 0: capped by MAX_DAYS only"
+            norm(Some(20000), 0),
+            MAX_HOURS,
+            "retention 0: capped by MAX_HOURS only"
         );
         assert_eq!(
             norm(Some(u32::MAX), 0),
-            MAX_DAYS,
+            MAX_HOURS,
             "hard cap prevents abort (ROB)"
         );
     }

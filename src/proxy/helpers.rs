@@ -256,25 +256,38 @@ fn is_sensitive_header(name: &str) -> bool {
 
 // ─── usage-stats 采集上下文构造 (三转发路径共享) ─────────────────────────────
 
-/// 构造 [`crate::usage::UsageCtx`] (same_proto×2 / cross_proto 共享, SSOT —
-/// 未来新增转发路径不会漏带 SEC 扫描快照). `model_req` 在 push_messages 消耗
-/// event 前捕获 (CallEvent.model 是请求侧 model 的 SSOT).
-pub(super) fn usage_ctx(
+/// 构造 [`crate::usage::UsageCtx`] 并**立即落账 redact 审计事件** (USAGE-7 请求侧
+/// 落账点, same_proto×2 / cross_proto 共享, SSOT — 未来新增转发路径不会漏带 SEC
+/// 扫描快照与审计接线). `model_req` 在 push_messages 消耗 event 前捕获
+/// (CallEvent.model 是请求侧 model 的 SSOT); `record_id` 用于回读刚 push 节点的
+/// RoundKind (与 attach_response 同型的安全窗口, 详见 `dag::round_kind_of`);
+/// `redactions` 即 CallEvent.redactions (push 前 Arc-clone, 避免回读 DAG).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn usage_ctx_and_record_redactions(
     state: &crate::state::AppState,
     fp: &super::ForwardPath,
     method: &axum::http::Method,
     upstream_id: &str,
     model_req: Option<String>,
     secrets: &[crate::secrets::SecretEntry],
+    record_id: uuid::Uuid,
+    redactions: &std::sync::Arc<[(String, String)]>,
 ) -> crate::usage::UsageCtx {
-    crate::usage::UsageCtx::new(
+    let round_kind = state
+        .dag
+        .round_kind_of(record_id)
+        .unwrap_or(crate::dag::RoundKind::Normal);
+    let ctx = crate::usage::UsageCtx::new(
         state.usage.clone(),
         std::sync::Arc::from(upstream_id),
         model_req,
         fp.proto.clone(),
         method.as_str(),
+        round_kind,
         std::sync::Arc::from(secrets.to_vec().into_boxed_slice()),
-    )
+    );
+    ctx.record_redactions(redactions);
+    ctx
 }
 
 #[cfg(test)]

@@ -542,6 +542,18 @@ impl ConversationDag {
         *node.response.write() = Some(response);
     }
 
+    /// 读取 node 的 [`RoundKind`] (usage-stats 采集用: proxy 在 push 后立即回读,
+    /// 与 `attach_response` 同型的 "刚 push 节点" 安全窗口 — LRU 淘汰按
+    /// session.latest_at 挑最旧会话, 刚 push 节点所属 session 的 latest_at ≈ now
+    /// 是全场最大, 不会成为淘汰 victim).
+    ///
+    /// 节点不存在 (理论外的极端并发淘汰) → None, 调用方 fallback `RoundKind::Normal`
+    /// (ROB: 统计降级不崩溃, 判定 SSOT 仍在 `push_messages` 单点).
+    pub fn round_kind_of(&self, node_id: Uuid) -> Option<RoundKind> {
+        let g = self.inner.read();
+        g.nodes.get(&node_id).map(|n| n.event.round_kind)
+    }
+
     /// 增量更新 node 的 parsed view (流式节流写入专用).
     ///
     /// 若 node 尚无 ResponseData (流过程中尚未 attach), 自动创建一个 default 占位
