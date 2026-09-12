@@ -14,7 +14,8 @@
 //! - serve-stale-on-error: 刷新失败继续用旧表 (`stale` 状态);
 //! - 失败退避 30s: 窗口内查询立即返回, 不重试 (防 dead 网络逐查询阻塞);
 //! - single-flight: tokio Mutex 串行 refresh, 并发查询等首个结果;
-//! - 离线冷启动兜底: 成功后写 `secret-guard.pricing.json`, 无网络时读盘.
+//! - 离线冷启动兜底: 成功后写 state 目录固定名 `pricing.json`
+//!   (SSOT: `server.rs::state_dir_artifact`), 无网络时读盘.
 //!
 //! # 匹配规则 (usage-stats 设计 §7 "匹配规则")
 //!

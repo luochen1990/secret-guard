@@ -61,7 +61,7 @@
 //!   cap 是防御恶意 / 误传大 body 的 safety bound, 不是稳态运行预算.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -131,17 +131,25 @@ pub fn build_router_with_auth(state: AppState, auth_stack: AuthStack) -> Router 
     build_router_inner(state, Some(auth_stack))
 }
 
-/// 与 static config 同目录的派生文件路径 (`<stem>.<suffix>`, 规则同 main.rs 的
-/// default_state_path 约定): usage SQLite 库 (`<stem>.usage.sqlite3`, 设计 §4,
-/// 2026-09 起替代 JSONL — 旧 `<stem>.usage.jsonl` 不迁移, 留在原地可手动删除)
-/// 与 models.dev 定价缓存 (`<stem>.pricing.json`, 原样落盘供冷启动读回).
-fn config_sibling_path(config_path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
-    let file_name = config_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("secret-guard.toml");
-    let stem = file_name.strip_suffix(".toml").unwrap_or(file_name);
-    config_path.with_file_name(format!("{stem}.{suffix}"))
+/// state 目录内的运行时工件路径 (**固定名**, 不带 config stem): usage SQLite 库
+/// (`usage.sqlite3`, 设计 §4) 与 models.dev 定价缓存 (`pricing.json`, 原样落盘
+/// 供冷启动读回).
+///
+/// 为什么挂 state 目录而非 config 目录, 且不用 config 文件名做 stem:
+/// - 部署形态中 static config 常在只读位置 (nixos 模块: /nix/store), state
+///   目录才是部署声明的唯一可写域 (systemd StateDirectory). 旧实现派生 config
+///   同目录, 令 usage 库打开恒失败 → 恒降级 `:memory:`, 统计重启即丢
+///   (2026-09-12 home-pc 生产事故).
+/// - nix store 文件名含内容 hash (内容变更即变), 做 stem 会令每次 rebuild
+///   切到一个新的空库文件, 持久化名存实亡.
+/// - state 目录即实例身份 (一目录一实例), 工件无需 config 前缀消歧.
+///
+/// standalone: state 默认在 config 旁 (main.rs default_state_path), 旧
+/// `<stem>.usage.sqlite3` 不自动迁移, 首启前手动改名即可.
+fn state_dir_artifact(state_path: &Path, file_name: &str) -> PathBuf {
+    // parent 为空目录 (裸文件名 state) 时 join 即裸文件名 — PathBuf::push 对空
+    // buffer 直接追加, 不引入 "./" 前缀.
+    state_path.parent().unwrap_or(Path::new("")).join(file_name)
 }
 
 /// 内部: 根据 auth_stack 是否存在, 条件化装配认证 layer.
@@ -334,12 +342,12 @@ pub async fn serve(
         model_lists: Arc::new(crate::proxy::ModelListCache::new()),
         usage: Arc::new(crate::usage::UsageStore::open(
             &usage_config,
-            &config_sibling_path(&config_path, "usage.sqlite3"),
+            &state_dir_artifact(&state_path, "usage.sqlite3"),
         )),
         pricing: Arc::new(crate::usage::PricingCache::new(
             usage_config.pricing_url.clone(),
             std::time::Duration::from_secs(usage_config.pricing_refresh_secs.max(60)),
-            config_sibling_path(&config_path, "pricing.json"),
+            state_dir_artifact(&state_path, "pricing.json"),
             crate::usage::price_overrides_from_config(&usage_config.pricing_override),
         )),
     };
@@ -485,6 +493,36 @@ mod tests {
         assert!(
             msg.contains("another process (perhaps another secret-guard instance?)"),
             "guess must be explicitly marked as a guess: {msg}"
+        );
+    }
+
+    // ─── 运行时工件路径派生: 跟随 state 目录 (固定名) ─────────────────────
+    //
+    // 回归 2026-09-12 home-pc 生产事故, 根因详见 state_dir_artifact docstring.
+    // config 无关性由函数签名固定 (不接收 config 参数), 无需运行时断言.
+
+    #[test]
+    fn runtime_artifacts_follow_state_dir_with_fixed_name() {
+        let state = Path::new("/var/lib/secret-guard/state.toml");
+        assert_eq!(
+            state_dir_artifact(state, "usage.sqlite3"),
+            PathBuf::from("/var/lib/secret-guard/usage.sqlite3"),
+            "usage 库必须落 state 目录且用固定名 (StateDirectory 可写域)"
+        );
+        assert_eq!(
+            state_dir_artifact(state, "pricing.json"),
+            PathBuf::from("/var/lib/secret-guard/pricing.json"),
+            "定价缓存同一规则 (同类运行时可写工件)"
+        );
+    }
+
+    #[test]
+    fn runtime_artifacts_bare_state_path_derives_cwd_relative() {
+        // 相对裸文件名 state (无目录成分): 产物也落裸文件名 (cwd 相对), 不引入
+        // 冗余 "./" 前缀.
+        assert_eq!(
+            state_dir_artifact(Path::new("state.toml"), "usage.sqlite3"),
+            PathBuf::from("usage.sqlite3")
         );
     }
 }

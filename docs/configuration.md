@@ -58,7 +58,7 @@ value = "ghp_0123456789abcdefghijklmnopqrstuvwxyz"
 
 token 用量数据 100% 来自上游响应回显的 `usage` 字段 (零本地估算); 成本按
 [models.dev](https://models.dev) 价目表估算 (恒为估算, 无价模型显示 "—").
-明细持久化在与配置同目录的 `<stem>.usage.sqlite3` (SQLite, usage_events 表每请求一行 + redact_events 审计表; 2026-09 前的 `<stem>.usage.jsonl` 不迁移, 留在原地可手动删除).
+明细持久化在 state.toml 同目录的 `usage.sqlite3` (SQLite 固定名, usage_events 表每请求一行 + redact_events 审计表; 旧 `<stem>.usage.jsonl` 与 `<stem>.usage.sqlite3` 不迁移, 留在原地可手动删除/改名).
 
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|

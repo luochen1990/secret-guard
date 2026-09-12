@@ -2,9 +2,11 @@
 //!
 //! # 持久化语义 (P-5 修订: SQLite, 2026-09)
 //!
-//! - 存储是单个 SQLite 文件 (`secret-guard.usage.sqlite3`, 与 static config 同
-//!   目录派生, 规则同 state.toml 的 `<stem>.<suffix>` 约定). WAL 模式 + NORMAL
-//!   同步 — 本地单进程下崩溃安全与性能的常规平衡点.
+//! - 存储是单个 SQLite 文件 (`usage.sqlite3` 固定名, 落 state.toml 同目录 —
+//!   SSOT: `server.rs::state_dir_artifact`; 不能挂 config 同目录: 部署形态
+//!   config 常在只读位置如 /nix/store, 且 store 文件名含内容 hash 做 stem
+//!   会随 rebuild 换库. WAL 模式 + NORMAL 同步 — 本地单进程下崩溃安全与
+//!   性能的常规平衡点.
 //! - **热路径零同步 IO**: `record` / `record_redact` 经 std mpsc 交给独立 writer
 //!   线程, 批量事务 insert (非阻塞 drain 攒批, channel 排空即 flush — 无定时
 //!   驻留窗口, 上限 64 条/批; 设计 §4, 不在 tokio worker 上做 DB IO).

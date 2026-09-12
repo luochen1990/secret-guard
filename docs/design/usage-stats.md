@@ -177,8 +177,10 @@ secret × 每非零位置分类; v4b 治理三问扩展)
   model 字符串做 active secrets 扫描 (复用 PolicySnapshot 的 contains 判定, O(secrets)
   小扫描), 命中 → 替换 `<redacted:model>` + WARN; 另截断 256 chars. 其余字段为受控
   类型 (数字 / provider id / proto 枚举), 天然无 secret.
-- 文件路径: 与 state.toml 同目录派生 (`secret-guard.usage.sqlite3`, 派生规则同
-  config → state 路径约定). WAL + synchronous=NORMAL + busy_timeout 5s.
+- 文件路径: 与 state.toml 同目录, **固定名** `usage.sqlite3` (SSOT:
+  `server.rs::state_dir_artifact`; 不挂 config 同目录 — 部署形态 config 常在
+  只读位置如 nixos 的 /nix/store, 且 store 文件名含内容 hash 做 stem 会随
+  rebuild 换库, 2026-09-12 修复). WAL + synchronous=NORMAL + busy_timeout 5s.
   打开失败 → WARN + 降级 `:memory:` (统计可用, 明细不持久 — best-effort).
 - 写失败降级: writer 线程 insert 失败 → WARN 一次 + `dropped` 计数, 查询照常
   (best-effort: 明细可丢, 进程不崩). schema 版本经 PRAGMA user_version 管理.
@@ -259,8 +261,8 @@ GROUP BY hour, provider, model ORDER BY hour, provider, model   -- 确定性 (US
 
 - 数据源: `https://models.dev/api.json` (单文件全量, MIT).
 - 缓存: 照抄 #196 ModelListCache 语义 —— 惰性首拉 (首个 usage 查询触发, 不阻塞启动),
-  TTL 24h (可配), serve-stale-on-error, 失败退避 30s, single-flight; 成功后写
-  `secret-guard.pricing.json` 作离线冷启动兜底.
+  TTL 24h (可配), serve-stale-on-error, 失败退避 30s, single-flight; 成功后写 state
+  目录固定名 `pricing.json` 作离线冷启动兜底 (路径规则同 usage 库, `state_dir_artifact`).
 - **冷启动行为**: 首拉完成前所有 cost = null, 响应携带
   `pricing_status: "loading" | "ok" | "stale" | "offline"`, UI 显示价目表状态;
   并发查询经 single-flight 等待首个结果 (超时 5s 按 offline 返回, 不阻塞).
