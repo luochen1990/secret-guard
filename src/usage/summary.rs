@@ -183,8 +183,9 @@ fn window(hours: u32) -> (Granularity, String, Vec<String>) {
 /// 纯派生入口 (web handler 薄包装).
 ///
 /// by_bucket 对窗口内每个 bucket 补零 (连续序列, 图表友好); by_model 按 (model,
-/// provider) cell 直出 (设计 §9 "By Model 表含 provider 列"), cost 降序 (无价最后);
-/// by_provider fold by provider; redactions 与 usage 同 cutoff 直查.
+/// provider) 键跨 bucket 折叠 (设计 §9 "By Model 表含 provider 列", 时间维度由
+/// by_bucket 承担), cost 降序 (无价最后); by_provider fold by provider; redactions
+/// 与 usage 同 cutoff 直查.
 pub fn build_summary(input: SummaryInputs<'_>, status: PricingStatus) -> UsageSummary {
     let (gran, cutoff, buckets) = window(input.hours);
     let granularity_str = match gran {
@@ -217,7 +218,10 @@ pub fn build_summary(input: SummaryInputs<'_>, status: PricingStatus) -> UsageSu
     let mut priced_requests = 0u64;
     let mut unpriced: Vec<String> = Vec::new();
     let mut zero_priced: Vec<String> = Vec::new();
-    let mut model_rows: Vec<ModelRow> = Vec::new();
+    // by_model 折叠表: (model, provider) → (agg, cost) — 跨 bucket 合并, 与
+    // provider_agg / bucket_agg 同型同 idiom (USAGE-1 键唯一).
+    let mut model_agg: std::collections::HashMap<(Option<String>, String), (UsageAgg, f64)> =
+        std::collections::HashMap::new();
     let mut provider_agg: std::collections::HashMap<String, (UsageAgg, f64)> =
         std::collections::HashMap::new();
     let mut bucket_agg: std::collections::HashMap<String, (UsageAgg, f64)> =
@@ -252,13 +256,11 @@ pub fn build_summary(input: SummaryInputs<'_>, status: PricingStatus) -> UsageSu
                 }
             }
         }
-        model_rows.push(ModelRow {
-            model: model.clone(),
-            provider: provider.clone(),
-            agg: *agg,
-            est_cost_usd: cost,
-            cost_share: 0.0, // totals cost 就绪后填.
-        });
+        let m = model_agg
+            .entry((model.clone(), provider.clone()))
+            .or_default();
+        merge_agg(&mut m.0, agg);
+        m.1 += cost;
         let p = provider_agg.entry(provider.clone()).or_default();
         merge_agg(&mut p.0, agg);
         p.1 += cost;
@@ -267,6 +269,26 @@ pub fn build_summary(input: SummaryInputs<'_>, status: PricingStatus) -> UsageSu
         b.1 += cost;
     }
 
+    // ── by_model: 从折叠表构建行 + 排序 (cost 降序, 次键 model 名, 末键
+    //    provider — 折叠后同 model 可跨 provider, 三键全序保证 USAGE-3 确定性) ──
+    let mut model_rows: Vec<ModelRow> = model_agg
+        .into_iter()
+        .map(|((model, provider), (agg, cost))| ModelRow {
+            model,
+            provider,
+            agg,
+            est_cost_usd: cost,
+            cost_share: 0.0, // totals cost 就绪后填.
+        })
+        .collect();
+    model_rows.sort_by(|a, b| {
+        b.est_cost_usd
+            .partial_cmp(&a.est_cost_usd)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.model.cmp(&b.model))
+            .then_with(|| a.provider.cmp(&b.provider))
+    });
+    // totals cost 在排序后求和 — 全序 ⇒ f64 求和顺序固定 (同上 cells 排序注释).
     totals.est_cost_usd = model_rows.iter().map(|r| r.est_cost_usd).sum();
     let denom = totals.est_cost_usd;
     for r in &mut model_rows {
@@ -294,14 +316,6 @@ pub fn build_summary(input: SummaryInputs<'_>, status: PricingStatus) -> UsageSu
             }
         })
         .collect();
-
-    // ── by_model: cost 降序, 无价最后 (稳定: 次键 model 名) ──
-    model_rows.sort_by(|a, b| {
-        b.est_cost_usd
-            .partial_cmp(&a.est_cost_usd)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.model.cmp(&b.model))
-    });
 
     // ── by_provider: cost 降序 ──
     let mut by_provider: Vec<ProviderRow> = provider_agg
@@ -490,6 +504,75 @@ mod tests {
         assert_eq!(sum.unpriced_models, vec!["m-unpriced"]);
         // USAGE-3: cost = 1000×1 + 500×2 (M) = $0.002.
         assert!((t.est_cost_usd - 0.002).abs() < 1e-12);
+    }
+
+    // ─── USAGE-1: by_model (model, provider) 键唯一 (跨 bucket 折叠) ────
+
+    #[test]
+    fn by_model_folds_buckets_into_one_row_per_model_provider() {
+        // 同 (provider, model) 跨 3 个 hour bucket + 同 model 不同 provider →
+        // by_model 恰好 2 行 (键唯一), agg 与 cost 合并; 时间维度由 by_bucket 承担.
+        // 回归: 旧实现按 (bucket, provider, model) cell 直出, 同 model 每
+        // 小时一行 (WebUI "By model" 表同 provider+model 多行).
+        let s = store_with(&[
+            ev(
+                0,
+                "p1",
+                Some("m-priced"),
+                Some(UsageQuanta {
+                    i: 10,
+                    o: 1,
+                    cr: 0,
+                    cw: 0,
+                }),
+            ),
+            ev(
+                2,
+                "p1",
+                Some("m-priced"),
+                Some(UsageQuanta {
+                    i: 20,
+                    o: 2,
+                    cr: 0,
+                    cw: 0,
+                }),
+            ),
+            ev(4, "p1", Some("m-priced"), None),
+            ev(
+                0,
+                "p2",
+                Some("m"),
+                Some(UsageQuanta {
+                    i: 30,
+                    o: 3,
+                    cr: 0,
+                    cw: 0,
+                }),
+            ),
+        ]);
+        let table = priced_table();
+        let sum = summarize(&s, &table, 24);
+        assert_eq!(
+            sum.by_model.len(),
+            2,
+            "one row per (model, provider): {:#?}",
+            sum.by_model
+        );
+        let p1 = sum
+            .by_model
+            .iter()
+            .find(|r| r.provider == "p1")
+            .expect("p1 row folded");
+        assert_eq!(p1.model.as_deref(), Some("m-priced"));
+        assert_eq!(p1.agg.requests, 3);
+        assert_eq!(p1.agg.requests_without_usage, 1);
+        assert_eq!(p1.agg.input, 30);
+        assert_eq!(p1.agg.output, 3);
+        // cost 随折叠合并: (10×1+1×2 + 20×1+2×2) / 1e6 = 3.6e-5 ($/1M 价表).
+        assert!((p1.est_cost_usd - 3.6e-5).abs() < 1e-12);
+        // USAGE-1 折叠后仍成立: by_model 分项之和 == totals.
+        let m_req: u64 = sum.by_model.iter().map(|r| r.agg.requests).sum();
+        assert_eq!(m_req, sum.totals.agg.requests);
     }
 
     // ─── 长窗口: day 折叠粒度 ──────────────────────────────────────────

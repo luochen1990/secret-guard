@@ -925,6 +925,7 @@ dag `push_messages` 判定值的真值透传 (proxy 经 `round_kind_of` 回读�
 
 **Properties**:
 - `prop_usage_aggregation_consistency`: 三向相等 (totals / by_bucket / by_model / by_provider) + 窗口过滤 (bucket >= cutoff). 🔁→`summary_sums_match_totals_across_all_views` (`src/usage/summary.rs`) + `open_reuses_existing_db_and_restores_aggregation` (`src/usage/store.rs`; 持久维度)
+- `prop_usage_by_model_key_unique`: by_model 的 (model, provider) 键唯一 — 跨 bucket 折叠 (时间维度只在 by_bucket, 设计 §8 DTO 无 bucket 字段). 🔁→`by_model_folds_buckets_into_one_row_per_model_provider` (`src/usage/summary.rs`)
 - `prop_usage_zero_filled_buckets`: by_bucket 是窗口内连续 bucket 序列 (无数据补零), 粒度随窗口自适应. 🔁→`empty_store_yields_zeroed_buckets_and_none_rates` + `long_window_folds_to_day_granularity` (`src/usage/summary.rs`)
 - `prop_usage_hour_bucket_separation`: 相互间隔整小时的事件落入不同 hour bucket; day 折叠求和守恒. 🔁→`hour_granularity_separates_buckets_within_one_day` (`src/usage/store.rs`)
 - `prop_usage_round_dimensions`: round_kind 三态 (retries / no_messages) + status 分类 (429 / 4xx / 5xx) 独立计数, 总和关系成立. 🔁→`record_response_counts_retry_and_429_dimensions` (`src/usage/mod.rs`)

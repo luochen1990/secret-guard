@@ -330,6 +330,8 @@ GET /api/usage/summary?hours=168     # hours=0 → 1, 缺省 168 (7d); 上限 = 
 ```
 
 - by_model / by_provider 按 est_cost 降序 (null 视为最小).
+- by_model 按 (model, provider) 键跨 bucket 折叠 (时间维度由 by_bucket 承担);
+  by_provider fold by provider.
 - **DTO 载体 (v2 修正)**: timeline 徽章 → `TimelineRound` 增 `usage` (非 NodeView —
   timeline 走 TimelineDiffData); session 徽章 → `SessionView` 增 `usage_total`;
   `RoundBrief` 不加 (sidebar 三级菜单保持轻量). 均走既有 3s sync.
