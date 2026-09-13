@@ -2436,6 +2436,7 @@ dependencies = [
  "criterion",
  "flate2",
  "futures",
+ "memchr",
  "mockito",
  "openidconnect",
  "parking_lot",

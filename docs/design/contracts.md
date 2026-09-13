@@ -381,8 +381,8 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 **Properties**:
 - `prop_round_trip_identity_text`: text block 中 secret 的 round-trip identity. 🔁→`prop_round_trip_identity` (`src/redact.rs`, text 场景)
 - `prop_round_trip_identity_tool_use_input`: tool_use input JSON 中 secret 的 round-trip identity. 🔁→`prop_response_tool_use_input_restored` (`src/redact.rs`)
-- `prop_round_trip_identity_tool_result`: tool_result 嵌套 text 中 secret 的 round-trip identity. ⏳
-- `prop_round_trip_identity_system`: system prompt 中 secret 的 round-trip identity. ⏳
+- `prop_round_trip_identity_tool_result`: tool_result 嵌套 text 中 secret 的 round-trip identity. 🔁→`prop_round_trip_identity_all_positions` (`src/redact.rs`)
+- `prop_round_trip_identity_system`: system prompt 中 secret 的 round-trip identity. 🔁→`prop_round_trip_identity_all_positions` (`src/redact.rs`)
 - `prop_round_trip_identity_extra`: extra 字段 (未建模 JSON) 中 secret 的 round-trip identity. ⏳
 - `prop_round_trip_identity_multi_secret`: 多 secret (1..10) 同时出现的 round-trip identity. 🔁→`prop_multi_secret_round_trip` + `prop_response_multi_secret_round_trip` (`src/redact.rs`)
 - `prop_round_trip_identity_repeated_secret`: 同 secret 在多字段重复出现的 round-trip identity. 🔁→`prop_repeated_secret_round_trip` (`src/redact.rs`)

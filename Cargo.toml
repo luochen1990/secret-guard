@@ -49,6 +49,10 @@ tower-sessions = { version = "0.14", features = ["memory-store"] }
 axum-login = "0.18"
 openidconnect = { version = "4", default-features = false, features = ["reqwest", "rustls-tls"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+# 子串搜索 (memmem::Finder): warn_disabled_secrets_in_body 对 raw body 的多 needle
+# 扫描, 替代朴素 O(n·m) 窗口比较. 已是 lock 中传递依赖 (axum / futures 等), 显式化
+# 不新增构建图 crate. license MIT OR UNLICENSE, deny allow 列表已覆盖.
+memchr = "2.8.3"
 
 [dev-dependencies]
 tokio-test = "0.4"

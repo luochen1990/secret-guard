@@ -216,6 +216,13 @@ pub(crate) fn extract_preview_and_model(req_body: &str) -> (Option<String>, Opti
 /// 从单条 wire message 中提取可展示文本 (content string 或 array of text blocks).
 /// 跳过无文本的 message (tool_call only / null content / 空串).
 /// 仅 passthrough 路径 (字符串入口) 使用; codec 路径直接从 IR 的 IrBlock::Text 提取.
+///
+/// **收集时截断**: 只保留 [`preview_head`] 的头部 chars. select_and_truncate_preview
+/// 的消费方式只依赖候选文本头部 (COMPRESSED_MARKER 精确相等 + 归一化后首 PREVIEW_MAX
+/// chars), 多轮大对话 (100+ messages) 无需把每条 message 的完整文本 clone 进 candidates
+/// (PERF: 多轮场景曾有 MiB 级全量克隆, 只为最终选 48 char preview). 已知边界: array
+/// content 分支仍先 `join` 完整文本再截断 (瞬时单次分配, 随即丢弃; 常驻 candidates
+/// 已缩到 ≤49 chars — 主路径 OpenAI string content 无此开销), 不再进一步优化.
 fn message_text(m: &serde_json::Value) -> Option<String> {
     let content = m.get("content")?;
     // string content: 直接取 (空串视为无文本).
@@ -223,14 +230,28 @@ fn message_text(m: &serde_json::Value) -> Option<String> {
         return if s.is_empty() {
             None
         } else {
-            Some(s.to_string())
+            Some(preview_head(s))
         };
     }
     // array content: 拼接所有 type=text 的 text 字段.
     if let Some(arr) = content.as_array() {
-        return extract_text_blocks(arr).map(|t| t.join(" "));
+        return extract_text_blocks(arr).map(|t| preview_head(&t.join(" ")));
     }
     None
+}
+
+/// 收集时截断的头部上限: [`PREVIEW_MAX`] + 1 (char count, char-boundary 安全).
+///
+/// +1 保留 "超长" 信号: `truncate_preview` 靠 `count() > PREVIEW_MAX` 判定是否追加
+/// '…'; 恰好截到 PREVIEW_MAX 会让所有长文本归一化后 ≤ 48, 省略号永不出现.
+/// COMPRESSED_MARKER (23 chars) 精确相等比较不受影响: 更长的文本截断后是 49 chars,
+/// 恒不等于 23 chars 的 marker.
+///
+/// 已知可接受差异: 截断发生在空白归一化**之前**, 极端空白 (前 49 chars 是长空白 run,
+/// 后续才有内容) 时归一化结果与全量文本不同. preview 是 best-effort 展示字段
+/// (域 B, ROB-1 只约束不 panic, 无 byte-exact 契约), 差异仅影响该极端场景的展示.
+fn preview_head(s: &str) -> String {
+    s.chars().take(PREVIEW_MAX + 1).collect()
 }
 
 /// 从 content blocks 数组中收集所有 text 块的文本.

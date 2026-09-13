@@ -430,7 +430,12 @@ pub fn restore_ir_response(ir: &mut IrResponse, map: &RedactionMap) {
 ///   形如 `\uXXXX`) 会漏检 — 漏检仅少打一条告警, 无安全影响, 可接受.
 /// - **安全**: 日志只含 secret id, 永不含 secret value (SEC 纪律, 同其他 redact warn).
 /// - **成本**: 仅当存在 disabled secret 时才扫描 (每 disabled secret 一次子串搜索);
-///   disabled 是罕见配置, 常态零开销.
+///   disabled 是罕见配置, 常态零开销. 搜索用 [`memchr::memmem::find`] (均摊 O(n)),
+///   替代朴素 O(n·m) 窗口比较 — 大 body (数 MiB) × 每 disabled secret 数十万次
+///   窗口比较在 memmem 下消失. 每 needle 单次搜索, one-shot 自由函数即可 (无需
+///   Finder 句柄 — 它为跨多次搜索复用而生); secret 可经 WebUI 动态增删, 不引入
+///   跨请求缓存 (失效复杂度不值得, 同 [`redact_ir`] 对 secrets 快照的 per-request
+///   语义).
 ///
 /// 返回命中数 (供测试断言; 调用方无需使用返回值).
 pub fn warn_disabled_secrets_in_body(body: &[u8], disabled: &[SecretEntry]) -> usize {
@@ -439,8 +444,7 @@ pub fn warn_disabled_secrets_in_body(body: &[u8], disabled: &[SecretEntry]) -> u
         if secret.value.is_empty() {
             continue;
         }
-        let needle = secret.value.as_bytes();
-        if !body.windows(needle.len()).any(|w| w == needle) {
+        if memchr::memmem::find(body, secret.value.as_bytes()).is_none() {
             continue;
         }
         hits += 1;
@@ -2172,12 +2176,34 @@ mod tests {
         prop_oneof!["[a-z0-9 ]{0,40}", "[A-Za-z0-9 \\x{4e00}-\\x{9fff}]{0,40}",].boxed()
     }
 
+    /// RED-4 单射性测试的 secret 对生成器: 50% 宽池 / 50% 窄池.
+    ///
+    /// 窄池 `[ab]{6,10}` = **相似对压力测试**: 2 字符池下 s1/s2 高度相似 (子串对
+    /// 如 "ababab" ⊂ "abababab"、共享长前缀对的生成率显著升高), 考验长度倒序替换
+    /// 的 span 消费语义与 C2 (mock 不在 pre-replace IR 中, IR 是高重复 ab 模式).
+    /// 注意 charset 推断是**字符类**级 (`Charset::infer_from`: real ∈ [ab] →
+    /// lowercase=true → enabled_chars 展开为全 26 小写), mock 候选空间是 26^L 而非
+    /// 2^L — probing 耗尽无忧 (counter 只在 C2/C4 冲突时递进, C5 由 gen_candidate
+    /// 内部重试链消化不消耗 counter; test 档 MOCK_PROBE_LIMIT 512 内全撞概率可忽略).
+    /// 子串对 **不排除**: IR 形态 "{s1} {s2}" 下短者的出现 span [0, len(s1)) 与长者
+    /// 的替换 span [len(s1)+1, ..) 恒不相交 (secret 不含空格, 无法跨界), 两者恒各有
+    /// 一次幸存的独立出现 → 恒双双进 map. 长度倒序替换的覆盖语义
+    /// (redact_ir_longer_secret_wins_overlapping) 要求短者出现完全包含在长者内部,
+    /// 本 IR 形态不可能满足.
+    fn arb_secret_pair_for_injectivity() -> impl Strategy<Value = (String, String)> {
+        prop_oneof![
+            // 宽池基线 (历史生成器): 26 字符池, 碰撞罕见.
+            ("[a-z]{4,12}", "[a-z]{4,12}"),
+            // 窄池: 2 字符池, 高碰撞压力.
+            ("[ab]{6,10}", "[ab]{6,10}"),
+        ]
+    }
+
     proptest! {
         /// 守卫 RED-4: 不同 secret → 不同 mock (单射性, contracts.md §2).
         #[test]
         fn prop_distinct_secrets_distinct_mocks(
-            s1 in "[a-z]{4,12}",
-            s2 in "[a-z]{4,12}"
+            (s1, s2) in arb_secret_pair_for_injectivity()
         ) {
             prop_assume!(s1 != s2);
             // 在同一个空 IR 上, 两个 secret 应映射到不同 mock.
@@ -2230,6 +2256,70 @@ mod tests {
                 }
             }
             prop_assert_eq!(restored, original_text);
+        }
+
+        /// 守卫 RED-6: secret 分布在 system prompt / user text / tool_result 嵌套
+        /// text (两层 ToolResult 嵌套) 的**全位置** round-trip identity
+        /// (可逆双射, contracts.md §2; 转正 tool_result + system 两个位置维度).
+        ///
+        /// 区别于 `prop_round_trip_identity` (单 text block + 手写字符串 replace):
+        /// 本 property 用固定骨架 IR 把 secret 同时注入多个结构位置 (system text /
+        /// user text / tool_use_id / tool_result 两层嵌套 text), secret 内容与前后缀
+        /// 随机化. restore 侧复用生产 `restore_str` (per-leaf 替换) + `StringLeafOps`
+        /// 的 IrRequest 叶子遍历 — 若 **restore 侧** (IrBlock 遍历或替换) 对任一位置
+        /// 遗漏, redact 改写过的 mock 会残留在该位置, 整 IR 相等断言即失败.
+        /// (redact 侧 `ir_request_replace_all` 与本遍历共享 StringLeafOps for IrBlock,
+        /// 两者**同时**遗漏的对称故障不被本断言捕获 — 那是 StringLeafOps 自身单点
+        /// 的责任, 由 `collect_leaves_matches_for_each_str_leaf` 等守卫.)
+        #[test]
+        fn prop_round_trip_identity_all_positions(
+            body_prefix in "[a-z0-9 ,.!?'\"\n]{0,60}",
+            secret in "[A-Z]{4,12}",
+            body_suffix in "[a-z0-9 ,.!?'\"\n]{0,60}"
+        ) {
+            let mut ir = IrRequest {
+                system: vec![IrBlock::Text {
+                    text: format!("sys-pre {secret} {body_suffix}"),
+                }],
+                messages: vec![
+                    IrMessage {
+                        role: IrRole::User,
+                        content: vec![IrBlock::Text {
+                            text: format!("{body_prefix} {secret} {body_suffix}"),
+                        }],
+                        ..Default::default()
+                    },
+                    IrMessage {
+                        role: IrRole::User,
+                        content: vec![IrBlock::ToolResult {
+                            // tool_use_id 也是字符串叶子 (secret 可经工具调用 id 泄漏).
+                            tool_use_id: format!("call-{secret}"),
+                            content: vec![
+                                IrBlock::Text {
+                                    text: format!("outer-result {secret} {body_suffix}"),
+                                },
+                                IrBlock::ToolResult {
+                                    tool_use_id: "call-nested".to_string(),
+                                    content: vec![IrBlock::Text {
+                                        text: format!("nested-result {body_prefix} {secret}"),
+                                    }],
+                                    is_error: false,
+                                    content_form: None,
+                                },
+                            ],
+                            is_error: false,
+                            content_form: None,
+                        }],
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            };
+            let original = ir.clone();
+            let (map, _) = redact_ir(&mut ir, &[entry(&secret)]);
+            // restore: 与生产 restore_ir_response 相同的叶子遍历 + 替换.
+            ir.for_each_str_leaf_mut(&mut |s| restore_str(s, &map));
+            prop_assert_eq!(ir, original);
         }
 
         /// 守卫 RED-1: mock 非空 (mock 非空性, contracts.md §2).
