@@ -1193,6 +1193,48 @@ mod tests {
         );
     }
 
+    // ─── 孤儿节点降级 (CDAG-7 已知限制的行为守卫) ──────────────────────────
+
+    #[test]
+    fn prop_orphan_node_degrades_gracefully() {
+        // CDAG-7 降级路径 (AGENTS.md "DAG 孤儿节点降级" 已知限制): parent 被淘汰后,
+        // 存活 child 的 full_request_messages 返回 None (而非 panic / 残缺数据),
+        // timeline 退化为仅剩存活轮次.
+        //
+        // 白盒构造说明: gc_cascade 的入口节点是无条件删除 (child_count 保护只对级联
+        // 的 parent 生效), 直接以 parent a (而非 session leaf) 为入口级联, 即得到
+        // "child 存活 + parent 缺席" 的孤儿态. 公共 eviction 路径按 session leaf 级联,
+        // leaf 恒无 child, 正常不可达该状态 — 本测试守卫的是读路径
+        // (collect_req_delta_refs / walk_chain) 的防御性降级契约.
+        let dag = ConversationDag::new(8, 500, 1);
+        let a = dag.push_messages(vec![text_msg(IrRole::User, "m1")], dummy_event());
+        let b = dag.push_messages(
+            vec![text_msg(IrRole::User, "m1"), text_msg(IrRole::User, "m2")],
+            dummy_event(),
+        );
+        // 前置 sanity: 链完整时 b 能 walk 到根.
+        assert_eq!(dag.full_request_messages(b).expect("链完整").len(), 2);
+
+        // 淘汰 parent a → b 成为孤儿 (get_node(b) 仍 Some, 不连带删除).
+        {
+            let mut g = dag.inner.write();
+            super::ConversationDag::gc_cascade(&mut g, a);
+        }
+        assert!(dag.get_node(a).is_none(), "a 已被淘汰");
+        assert!(dag.get_node(b).is_some(), "b 仍存活 (孤儿态)");
+
+        // 降级契约: full_request_messages → None (不 panic).
+        assert!(
+            dag.full_request_messages(b).is_none(),
+            "孤儿 child 降级为 None, 不 panic"
+        );
+        // timeline 同步降级: 只剩存活轮次 b (缺失的祖先被截断, 而非 panic / 500).
+        let sid = sid_of(&dag, b);
+        let page = dag.timeline_view(sid, None, 10).expect("session 仍可查");
+        assert_eq!(page.rounds.len(), 1, "timeline 降级为仅存活轮次");
+        assert_eq!(page.rounds[0].id, b);
+    }
+
     // ─── round_role (contains_user_text 判定) ──────────────────────────────
 
     fn tool_result_msg() -> IrMessage {
@@ -2227,6 +2269,93 @@ mod tests {
                     "fork (parent 不是当前 leaf) → 新 session"
                 );
             }
+        }
+
+        /// CDAG-2 `prop_prefix_hash_invariant_to_response`:
+        /// Merkle prefix hash 只基于 req_delta, response 内容不参与. 若 hash 意外
+        /// 混入 response, session id 会在 attach 后漂移 / cluster 分裂 — 而既有
+        /// session 测试从不 attach_response, 全绿灯也无法捕获. 三重守卫:
+        /// 1. 同一 node 两次 attach 不同 response, prefix_hash 与 session_id 均不变;
+        /// 2. 差分对照: 相同 messages 序列, 一个 DAG attach / 一个不 attach,
+        ///    对应 node 的 prefix_hash 逐一相等 (hash 计算全程与 response 无关);
+        /// 3. attach 之后继续 push 仍按 prefix hash 命中 parent 并延续同一 session
+        ///    (hash 链未被 response 污染); fork 分支 (m3 不同) hash 互不相同.
+        #[test]
+        fn prop_prefix_hash_invariant_to_response(
+            m1 in arb_text_message(),
+            m2 in arb_text_message(),
+            m3 in arb_text_message(),
+            m3_alt in arb_text_message(),
+            resp_body in "[a-z0-9 ]{1,24}",
+            resp_body_alt in "[a-z0-9 ]{1,24}",
+        ) {
+            prop_assume!(m3.content != m3_alt.content, "m3 != m3_alt 才构成 fork");
+            prop_assume!(resp_body != resp_body_alt, "两次 attach 的 response 须不同");
+            // (prefix_hash, session_id) 快照: 白盒读 Node 字段 (NodeView 不暴露 hash).
+            let meta = |dag: &ConversationDag, id: Uuid| -> (u64, SessionId) {
+                let g = dag.inner.read();
+                let n = g.nodes.get(&id).expect("node exists");
+                (n.prefix_hash, n.session_id)
+            };
+            let attach_response = |dag: &ConversationDag, id: Uuid, body: &str| {
+                dag.attach_response(
+                    id,
+                    ResponseData {
+                        resp_status: 200,
+                        raw_resp_body: body.to_string(),
+                        resp_complete: true,
+                        ..Default::default()
+                    },
+                );
+            };
+
+            let attach = ConversationDag::new(64, 500, 1);
+            let control = ConversationDag::new(64, 500, 1);
+            let a = attach.push_messages(vec![m1.clone()], dummy_event());
+            let b = attach.push_messages(vec![m1.clone(), m2.clone()], dummy_event());
+            // 对照组: 相同 messages, 全程不 attach response.
+            let ca = control.push_messages(vec![m1.clone()], dummy_event());
+            let cb = control.push_messages(vec![m1.clone(), m2.clone()], dummy_event());
+
+            let sid_a = meta(&attach, a).1;
+            let meta_b_before = meta(&attach, b);
+            prop_assert_eq!(meta_b_before.1, sid_a, "A+B 延续同一 session");
+
+            // 守卫 1: 两次 attach 不同 response, prefix_hash / session_id 不变.
+            attach_response(&attach, b, &resp_body);
+            prop_assert_eq!(meta(&attach, b), meta_b_before, "attach #1 不改 hash/session");
+            attach_response(&attach, b, &resp_body_alt);
+            prop_assert_eq!(meta(&attach, b), meta_b_before, "attach #2 不改 hash/session");
+
+            // 守卫 2: 差分对照 — attach 与不 attach 的 DAG 对应 node hash 逐一相等.
+            prop_assert_eq!(meta(&attach, a).0, meta(&control, ca).0, "A 与对照 CA 同 hash");
+            prop_assert_eq!(meta(&attach, b).0, meta(&control, cb).0, "B 与对照 CB 同 hash");
+
+            // 守卫 3: attach 后继续 push 仍命中 parent + 延续 session; fork 分支
+            // hash 互不相同 (hash 只随 messages 变化, 与各分支 response 内容无关).
+            let c = attach.push_messages(vec![m1.clone(), m2.clone(), m3], dummy_event());
+            prop_assert_eq!(
+                attach.full_request_messages(c).expect("链完整").len(),
+                3,
+                "attach 后 push 仍按 prefix hash 找到 parent 链"
+            );
+            let meta_c_before = meta(&attach, c);
+            prop_assert_eq!(meta_c_before.1, meta_b_before.1, "C 延续同一 session");
+            attach_response(&attach, c, &resp_body_alt);
+            prop_assert_eq!(meta(&attach, c), meta_c_before, "C attach 后 hash/session 不变");
+
+            let d = attach.push_messages(
+                vec![m1, m2, m3_alt],
+                dummy_event(),
+            );
+            let meta_d_before = meta(&attach, d);
+            prop_assert_ne!(meta_d_before.1, meta_c_before.1, "fork (D 的 parent=B 非 leaf) → 新 session");
+            prop_assert_ne!(
+                meta_d_before.0, meta_c_before.0,
+                "不同 m3 → 不同 prefix_hash (hash 随 messages 变化)"
+            );
+            attach_response(&attach, d, &resp_body);
+            prop_assert_eq!(meta(&attach, d), meta_d_before, "D attach 后 hash/session 不变");
         }
     }
 }

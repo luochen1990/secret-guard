@@ -780,6 +780,21 @@ mod tests {
         Some(UsageQuanta { i, o, cr: 0, cw: 0 })
     }
 
+    fn redact_ev(hour_offset: i64, secret_id: &str) -> RedactEvent {
+        RedactEvent {
+            ts: chrono::Utc::now() - chrono::Duration::hours(hour_offset),
+            secret_id: secret_id.to_string(),
+            mock: format!("mock-{secret_id}"),
+            category: "user",
+            count: 1,
+            node: format!("node-{secret_id}"),
+            api_key_label: None,
+            provider: "p".to_string(),
+            model_req: None,
+            proto: "o".to_string(),
+        }
+    }
+
     fn tmp_db(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("sg-usage-{tag}-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
@@ -895,12 +910,26 @@ mod tests {
         let s = UsageStore::open(&cfg(1), &path);
         s.record(ev(48, "p", None, quanta(1, 1))); // 48h 前 → 过期
         s.record(ev(1, "p", None, quanta(2, 2))); // 1h 前 → 保留
+        // USAGE-7: redact_events 同受 retention 清理 (apply_retention 的
+        // DELETE FROM redact_events 分支; 白盒 COUNT 验证, 公共查询 API 只做聚合).
+        s.record_redact(redact_ev(48, "sid-old")); // 48h 前 → 过期
+        s.record_redact(redact_ev(1, "sid-new")); // 1h 前 → 保留
         s.flush_for_test();
         drop(s);
         let s2 = UsageStore::open(&cfg(1), &path);
         assert_eq!(s2.total_events(), 1, "expired row must be deleted");
         let cells = s2.query_cells("", Granularity::Hour);
         assert_eq!(cells[0].1.input, 2);
+        let redact_rows = s2
+            .conn
+            .as_ref()
+            .expect("file db has connection")
+            .lock()
+            .query_row("SELECT COUNT(*) FROM redact_events", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .expect("count redact_events");
+        assert_eq!(redact_rows, 1, "expired redact row must be deleted");
         let _ = std::fs::remove_file(&path);
     }
 

@@ -485,7 +485,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 **陈述**: Node 的 own_hash 与 prefix_hash 只从 req_delta (MessageRef 序列) 计算, response 不参与 parent 查找.
 
 **Properties**:
-- `prop_prefix_hash_invariant_to_response`: 同一 req_delta + 不同 response → 同一 prefix_hash. ⏳
+- `prop_prefix_hash_invariant_to_response`: 同一 req_delta + 不同 response → 同一 prefix_hash. ✅
 - `prop_parent_found_by_prefix_hash`: push 时 Merkle prefix hash 找 parent 正确 (线性链 / 多跳链 / fork). 🔁→`dag_push_linear_extension_finds_parent` / `dag_push_single_node_no_parent` / `dag_push_unrelated_messages_creates_new_root` / `dag_multi_hop_parent_chain` (`src/dag/mod.rs`)
 
 ### CDAG-3 Block refcount 一致
@@ -527,7 +527,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 **Properties**:
 - `prop_orphan_node_identifiable`: parent 不存在的 node 被标记为 is_orphan. ⏳
-- `prop_orphan_node_degrades_gracefully`: 孤儿节点的 timeline 查询返回降级视图 (而非 panic / 残缺数据). ⏳
+- `prop_orphan_node_degrades_gracefully`: 孤儿节点的 timeline 查询返回降级视图 (而非 panic / 残缺数据). ✅ (白盒构造孤儿态 — 公共 eviction 被 child_count 保护正常不可达; 断言 full_request_messages → None + timeline 截断到存活轮次, 不 panic)
 
 ### CDAG-8 session 聚类稳定
 
@@ -717,8 +717,8 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 **Properties**:
 - `prop_get_secret_masks_value`: GET /secrets 返回的 value 字段是 mask (如 `sk-****`), 非真实值. 🔁→`mask_value_hides_full_content` (`src/secrets.rs`) + `secrets_api_create_lists_update_delete` 内嵌 value_masked 断言 (`tests/integration.rs`)
 - `prop_get_provider_masks_api_key`: GET /providers 返回的 api_key 字段是 mask. 🔁→`effective_snapshot_includes_provenance_and_masks_api_key` (`src/provider.rs`) + `providers_api_lists_existing` 内嵌 api_key_masked 断言 (`tests/integration.rs`)
-- `prop_no_real_secret_in_any_json_response`: 任意 GET 响应 (含 ForwardRecord / EffectiveSnapshot / SessionSummary 等) 不含真实 secret value. ⏳
-- `prop_no_real_api_key_in_any_json_response`: 同上, 不含真实 api_key. ⏳
+- `prop_no_real_secret_in_any_json_response`: 任意 GET 响应 (含 ForwardRecord / EffectiveSnapshot / SessionSummary 等) 不含真实 secret value. ✅ (穷举式扫描: 遍历全部读端点, 非 2xx 即断言失败)
+- `prop_no_real_api_key_in_any_json_response`: 同上, 不含真实 api_key. ✅ (同上, api_key 维度)
 
 ### SEC-2 RedactError 不携带 secret 明文
 

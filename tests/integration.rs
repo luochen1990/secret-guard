@@ -2271,6 +2271,174 @@ async fn stream_request_still_killed_by_stream_timeout_with_observable_message()
     );
 }
 
+// ─── 流式 chunk 空闲超时 (`upstream_stream_idle_timeout_secs`) e2e ──────────
+//
+// 防御路径: 上游发完响应头 (+首 chunk) 后 body 卡住. 此前 5 处超时 spawn 均为
+// `stream_idle: None`, 该档零测试. 覆盖两条 fan_out 分支:
+// - 流式 restore 路径 (redact + stream=true + SSE): 客户端已收 200 + 首 chunk,
+//   idle 超时后 body 流被终止 (而非永久 hang), record 标记 idle timeout error.
+// - buffered_ir 路径 (redact + 非流式): 客户端收到 504 (TimedOut → GATEWAY_TIMEOUT,
+//   fan_out.rs client_status 推断; record 的 resp_status 仍是上游原值 200).
+
+/// 起一个上游: 发送响应头 + 1 个 body chunk 后永久 hang (chunk 空闲的最小复现).
+///
+/// 上游侧 hang 用 `futures::stream::pending` 表达 — 测试必然先于上游 "恢复" 超时,
+/// 无需真实长 sleep (测试时长只由 proxy 的 1s idle timeout 决定).
+async fn spawn_upstream_first_chunk_then_hang(
+    content_type: &'static str,
+    first_chunk: &'static [u8],
+) -> String {
+    use futures::StreamExt as _;
+    // Handler 需要 closure: Clone — stream (非 Clone) 只能在 handler 体内构造,
+    // closure 仅捕获 &'static 参数 (Clone).
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(move || async move {
+            // 200 (默认) + content-type + 首 chunk 后永久 hang 的 body 流.
+            let body_stream = futures::stream::once(async {
+                Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(first_chunk))
+            })
+            .chain(futures::stream::pending());
+            (
+                [("content-type", content_type)],
+                axum::body::Body::from_stream(body_stream),
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}")
+}
+
+/// idle timeout 专用配置: response_header 两档拉高 (10s) 排除干扰, 只留
+/// stream_idle = 1s 生效 — 断言到的中断只能来自 idle 档.
+fn idle_only_timeouts() -> secret_guard::config::UpstreamTimeouts {
+    secret_guard::config::UpstreamTimeouts {
+        connect: None,
+        response_header: Some(Duration::from_secs(10)),
+        nonstream_response_header: Some(Duration::from_secs(10)),
+        stream_idle: Some(Duration::from_secs(1)),
+    }
+}
+
+const IDLE_ERR: &str = "upstream stream idle timeout";
+
+/// 流式 + redact 路径: 上游 SSE 发 1 chunk 后卡住 → 客户端流在 ~1s 内终止
+/// (非永久 hang), record 标记 idle timeout error + resp_complete=false.
+#[tokio::test]
+async fn stream_idle_timeout_terminates_hung_sse_stream_and_marks_record() {
+    let upstream_url = spawn_upstream_first_chunk_then_hang(
+        "text/event-stream",
+        b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+    )
+    .await;
+    let secrets = test_secret_table_with(vec![secret("gh-idle", "ghp_idle_stream_secret_abcdef")]);
+    let (proxy_url, records_handle) =
+        spawn_proxy_with_timeouts_and_secrets(&upstream_url, idle_only_timeouts(), secrets).await;
+
+    let start = std::time::Instant::now();
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/o/oa-main/v1/chat/completions"))
+        .body(
+            r#"{"model":"gpt-4","stream":true,"messages":[{"role":"user","content":"use ghp_idle_stream_secret_abcdef to call api"}]}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+    // 上游响应头 + 首 chunk 已正常到达 (200), hang 发生在 body 中段.
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // 读循环必须在有限时间内终止: idle 超时把 Err 推进客户端 body 流 (hyper 终止
+    // 连接), 而非让客户端陪上游永久 hang. 上限 10s 只是防 hang 护栏, 预期 ~1s.
+    use futures::StreamExt;
+    let mut stream = resp.bytes_stream();
+    let (received, elapsed) = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut received = 0usize;
+        while let Some(item) = stream.next().await {
+            // Ok = 正常 chunk (首 chunk); Err = 中断信号. 两者都终止循环 — 关键是
+            // 循环会终止, 且不等到上游 "恢复" (它永远不会).
+            match item {
+                Ok(b) => received += b.len(),
+                Err(_) => break,
+            }
+        }
+        (received, start.elapsed())
+    })
+    .await
+    .expect("read loop must terminate (not hang with upstream)");
+    assert!(received > 0, "first SSE chunk must have reached client");
+    assert!(
+        elapsed >= Duration::from_millis(900) && elapsed < Duration::from_secs(5),
+        "stream should terminate at ~1s idle timeout, got {elapsed:?}"
+    );
+
+    // record: error = idle timeout label (stream_err_label SSOT), 上游原始 200 保留,
+    // resp_complete=false.
+    assert_idle_timeout_record(&records_handle).await;
+}
+
+/// 等待并断言首条 record 呈现 idle-timeout 终止形态: error label ==
+/// `upstream stream idle timeout` + 上游原始 200 保留 + resp_complete=false.
+/// 两条 fan_out 分支 (streaming restore / buffered_ir) 共用.
+async fn assert_idle_timeout_record(records_handle: &ConversationDag) {
+    let list = wait_until_or_timeout(
+        records_handle,
+        |l| {
+            l.first()
+                .is_some_and(|r| r.error.as_deref() == Some(IDLE_ERR))
+        },
+        Duration::from_secs(3),
+    )
+    .await;
+    let r = &list[0];
+    assert_eq!(
+        r.resp_status, 200,
+        "record keeps upstream's original status"
+    );
+    assert!(!r.resp_complete, "interrupted stream is incomplete");
+}
+
+/// buffered_ir 路径 (redact + 非流式): 上游 JSON body 发一半卡住 → 客户端收到
+/// 504 (TimedOut → GATEWAY_TIMEOUT 映射), 而非 200 + 截断 JSON 的误导性成功.
+#[tokio::test]
+async fn stream_idle_timeout_buffered_path_returns_504() {
+    let upstream_url = spawn_upstream_first_chunk_then_hang(
+        "application/json",
+        b"{\"choices\":[{\"index\":0,\"message\":{\"role\":\"ass",
+    )
+    .await;
+    let secrets = test_secret_table_with(vec![secret("gh-idle", "ghp_idle_buffer_secret_abcdef")]);
+    let (proxy_url, records_handle) =
+        spawn_proxy_with_timeouts_and_secrets(&upstream_url, idle_only_timeouts(), secrets).await;
+
+    // buffered 路径: proxy 读完整个 body 才回客户端 → send() 本身在 ~1s idle
+    // 超时后返回 (10s timeout 只是防 hang 护栏).
+    let start = std::time::Instant::now();
+    let resp = tokio::time::timeout(
+        Duration::from_secs(10),
+        reqwest::Client::new()
+            .post(format!("{proxy_url}/o/oa-main/v1/chat/completions"))
+            .body(
+                r#"{"model":"gpt-4","messages":[{"role":"user","content":"use ghp_idle_buffer_secret_abcdef to call api"}]}"#,
+            )
+            .send(),
+    )
+    .await
+    .expect("send must resolve (not hang with upstream)")
+    .unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!(resp.status(), reqwest::StatusCode::GATEWAY_TIMEOUT);
+    assert!(
+        elapsed >= Duration::from_millis(900) && elapsed < Duration::from_secs(5),
+        "should 504 at ~1s idle timeout, got {elapsed:?}"
+    );
+
+    assert_idle_timeout_record(&records_handle).await;
+}
+
 /// IR 路径 (secrets 非空 → reader → redact → writer) 的非流式分档: 选档信号源
 /// 是 `ir.stream` (而非 passthrough 的 `requests_stream` 字节扫描). #175 的实际
 /// 事故请求若走 redact 路径 (配置了 secret) 正是此链路, 端到端钉住.
@@ -7546,5 +7714,170 @@ async fn usage_stats_cross_proto_recorded() {
     );
     assert_eq!(s["totals"]["output"].as_u64(), Some(4));
     assert_eq!(s["by_model"][0]["model"].as_str(), Some("gpt-cross"));
+    let _ = std::fs::remove_file(&db);
+}
+
+// ─── SEC-1: 读端点穷举扫描 (real secret / provider api_key 永不泄漏) ────────
+//
+// 契约: `prop_no_real_secret_in_any_json_response` /
+// `prop_no_real_api_key_in_any_json_response` (contracts.md SEC-1, P0).
+// 现状只有点状断言 (单端点单字段 mask), 穷举式扫描保证任何端点 / 任何字段
+// (含 ForwardRecord / SessionSummary / SyncSnapshot / usage 聚合) 都不含明文.
+
+/// SEC-1 植入敏感值 (setup 植入与扫描 needle 同源 — 改一处即处处改, 防止
+/// needle 与植入值漂移导致扫描恒空过的 vacuous 绿).
+/// 约束: 值只含 JSON 序列化无需转义的字符 (否则响应序列化后子串形态改变会漏检).
+const SEC1_SECRET: &str = "sk-real-secret-abc123xyz";
+const SEC1_API_KEY: &str = "sk-live-provider-key-777xyz";
+
+/// SEC-1 扫描共享前置: 构造 "record / session / usage / redact 审计全有数据"
+/// 的实例 — 1 个 secret + 1 个带 api_key 的 dynamic provider (mockito 上游) +
+/// 1 次带 secret 的转发. 返回 (client, base, db) — db 供测试末尾清理.
+async fn sec1_scan_setup(tag: &str) -> (reqwest::Client, String, std::path::PathBuf) {
+    let mut upstream = spawn_mock_upstream().await;
+    let chat_body = serde_json::json!({
+        "id": "chatcmpl-sec1",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
+                     "finish_reason": "stop"}]
+    });
+    let _chat = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(serde_json::to_string(&chat_body).unwrap())
+        .create_async()
+        .await;
+
+    let (store, db) = usage_e2e_store(tag);
+    let base = spawn_proxy_with_usage_store_and_secrets(
+        store,
+        test_secret_table_with(vec![secret("sec1", SEC1_SECRET)]),
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    // provider 显式带 api_key (明文落 state.toml, GET 必须返回 mask).
+    let create = serde_json::json!({
+        "id": "oa-sec1", "enabled": true, "protocol": "openai",
+        "base_url": upstream.url(), "api_key": SEC1_API_KEY
+    });
+    let resp = client
+        .post(format!("{base}/api/providers"))
+        .json(&create)
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "create provider");
+
+    // 1 次带 secret 的转发 → record / session / usage / redact_events 均有数据.
+    let chat = client
+        .post(format!("{base}/o/oa-sec1/v1/chat/completions"))
+        .json(&serde_json::json!({"model": "gpt-4", "messages": [
+            {"role": "user", "content": format!("use {SEC1_SECRET} to call api")}]}))
+        .send()
+        .await
+        .unwrap();
+    assert!(chat.status().is_success());
+
+    // 等待 usage 事件落库 (writer 线程异步) — 数据面全部就绪后再扫描.
+    poll_usage_summary(&client, &base, |s| {
+        s["totals"]["requests"].as_u64().is_some_and(|n| n >= 1)
+    })
+    .await;
+
+    (client, base, db)
+}
+
+/// 遍历全部 JSON API 读端点, 返回 (label, body) 列表.
+///
+/// 端点清单以 `src/web/mod.rs` 实际路由为准 (全部 GET + 数据面聚合 POST /api/sync;
+/// 无 GET /api/records 列表端点 — record 经 timeline/sync 暴露). 含路径参数的端点
+/// 从 sessions / timeline 响应派生真实 id (setup 保证 ≥1 session/round, 故用
+/// expect fail-closed — if-let 静默跳过会让扫描面收窄而测试照绿); 所有端点断言
+/// 2xx (非 2xx 的错误 body 无扫描价值, 且会静默弱化穷举).
+async fn sec1_read_all_endpoints(client: &reqwest::Client, base: &str) -> Vec<(String, String)> {
+    async fn fetch(client: &reqwest::Client, base: &str, path: &str) -> (String, String) {
+        let resp = client.get(format!("{base}{path}")).send().await.unwrap();
+        assert!(
+            resp.status().is_success(),
+            "GET {path} should be 2xx, got {}",
+            resp.status()
+        );
+        (path.to_string(), resp.text().await.unwrap())
+    }
+
+    let mut out: Vec<(String, String)> = vec![
+        fetch(client, base, "/api/secrets").await,
+        fetch(client, base, "/api/providers").await,
+        fetch(client, base, "/api/api-keys").await,
+        fetch(client, base, "/api/usage/summary?hours=24").await,
+    ];
+    let (sessions_label, sessions_body) = fetch(client, base, "/api/sessions").await;
+    let sessions: serde_json::Value = serde_json::from_str(&sessions_body).unwrap();
+    out.push((sessions_label, sessions_body));
+    let sid = sessions["sessions"][0]["session_id"]
+        .as_str()
+        .expect("setup 保证 ≥1 session (已成功转发)");
+    let timeline_path = format!("/api/sessions/{sid}/timeline");
+    let (timeline_label, timeline_body) = fetch(client, base, &timeline_path).await;
+    let timeline: serde_json::Value = serde_json::from_str(&timeline_body).unwrap();
+    out.push((timeline_label, timeline_body));
+    let rid = timeline["rounds"][0]["id"]
+        .as_str()
+        .expect("setup 保证 ≥1 round (已成功转发)");
+    out.push(fetch(client, base, &format!("/api/records/{rid}")).await);
+    out.push(fetch(client, base, &format!("/api/records/{rid}?view=parsed")).await);
+    // sync: 数据面聚合 DTO (sessions + rounds + timeline diff 一次拿全).
+    let sync_resp = client
+        .post(format!("{base}/api/sync"))
+        .json(&serde_json::json!({
+            "selected": {"session_id": sid, "latest_round": null, "response_length": 0},
+            "expanded": [sid]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        sync_resp.status().is_success(),
+        "POST /api/sync should be 2xx"
+    );
+    out.push((
+        "POST /api/sync".to_string(),
+        sync_resp.text().await.unwrap(),
+    ));
+    out
+}
+
+/// 遍历全部读端点, 返回 body 含 `needle` 明文的端点 label 列表 (空 = 通过).
+/// needle 须为 JSON 序列化后原样保留的子串 (植入值见 SEC1_* 常量约束).
+async fn sec1_scan_leaks(client: &reqwest::Client, base: &str, needle: &str) -> Vec<String> {
+    sec1_read_all_endpoints(client, base)
+        .await
+        .into_iter()
+        .filter(|(_, body)| body.contains(needle))
+        .map(|(label, _)| label)
+        .collect()
+}
+
+/// SEC-1 `prop_no_real_secret_in_any_json_response`:
+/// 任意读端点响应体不含配置的 real secret 明文 (穷举式扫描, 非点状 mask 断言).
+#[tokio::test]
+async fn prop_no_real_secret_in_any_json_response() {
+    let (client, base, db) = sec1_scan_setup("sec1-secret").await;
+    let leaks = sec1_scan_leaks(&client, &base, SEC1_SECRET).await;
+    assert!(leaks.is_empty(), "SEC-1: real secret leaks via: {leaks:?}");
+    let _ = std::fs::remove_file(&db);
+}
+
+/// SEC-1 `prop_no_real_api_key_in_any_json_response`:
+/// 任意读端点响应体不含 provider 的 api_key 明文 (同上, api_key 维度).
+#[tokio::test]
+async fn prop_no_real_api_key_in_any_json_response() {
+    let (client, base, db) = sec1_scan_setup("sec1-apikey").await;
+    let leaks = sec1_scan_leaks(&client, &base, SEC1_API_KEY).await;
+    assert!(
+        leaks.is_empty(),
+        "SEC-1: provider api_key leaks via: {leaks:?}"
+    );
     let _ = std::fs::remove_file(&db);
 }
