@@ -85,26 +85,16 @@ pub(super) const ERR_RESP_CAP_EXCEEDED: &str = "response exceeds record cap";
 /// 这是 [`CallEvent::redactions`] 的唯一派生入口. 输出**永不**包含真实 secret 值.
 /// 可以直接序列化到 GET API 响应中给 WebUI.
 ///
-/// 匹配规则: `redaction_map.real_to_mock` 的 key (真实 secret) 与 `secrets_snapshot`
-/// 的 `value` 字段比对. 仅命中的 secret 才进入列表 (eg secret 在表中但本次请求体没有
-/// 它, 不计入). 同一 secret 多次匹配仍只投影一次 (HashMap 已去重).
-///
-/// 边角: 若两个 SecretEntry 共享同一 `value` (eg 用户重复配置), `find` 返回首个匹配;
-/// 由于 RedactionMap 按 value 去重, 对应只有一个 mock — 这种重复配置语义上就是冗余,
-/// WebUI 只展示其中一个 id 是可接受的 (它们指向相同的 secret 内容).
+/// 匹配规则与去重语义见 [`derive_redact_hits`] 的共享 join (两投影同源,
+/// mock↔secret_id 关联一致性由 `redaction_projections_agree_on_mock_secret_pairing`
+/// 测试守卫; consistency-check 守卫 [`assert_redactions_match_map`] 只覆盖本投影).
 pub(super) fn derive_redactions(
     redaction_map: &RedactionMap,
     secrets_snapshot: &[crate::secrets::SecretEntry],
 ) -> Vec<(String, String)> {
-    redaction_map
-        .real_to_mock
-        .iter()
-        .filter_map(|(real, mock)| {
-            secrets_snapshot
-                .iter()
-                .find(|s| s.value == *real)
-                .map(|s| (mock.clone(), s.id.clone()))
-        })
+    derive_redact_hits(redaction_map, secrets_snapshot)
+        .into_iter()
+        .map(|h| (h.mock, h.secret_id))
         .collect()
 }
 
@@ -137,11 +127,20 @@ pub(super) fn parse_request_ir(
     Ok(ir)
 }
 
-/// `redact_and_derive` 的返回类型别名 (避免 clippy::type_complexity 误报).
+/// `redaction_map.real_to_mock` × `secrets_snapshot` 的共享 join (M-C4).
 ///
-/// 三元组语义: `(redaction_map, redact_seed, redactions)`.
-/// 从 RedactionMap (SSOT) 派生 usage 审计的采集单元: (secret_id, mock, 位置分布).
-/// 与 [`derive_redactions`] 同源同型 — id 从 snapshot 反查 (real → SecretEntry.id),
+/// 匹配规则: `real_to_mock` 的 key (真实 secret) 与 snapshot 的 `value` 字段
+/// first-match. 仅命中的 secret 才进入列表 (eg secret 在表中但本次请求体没有它,
+/// 不计入). 同一 secret 多次匹配仍只投影一次 (HashMap 已去重).
+///
+/// 边角: 若两个 SecretEntry 共享同一 `value` (eg 用户重复配置), `find` 返回首个匹配;
+/// 由于 RedactionMap 按 value 去重, 对应只有一个 mock — 这种重复配置语义上就是冗余,
+/// WebUI 只展示其中一个 id 是可接受的 (它们指向相同的 secret 内容).
+///
+/// 本函数是该 join 的**唯一实现** ( [`derive_redactions`] 的 (mock, secret_id)
+/// 投影从本函数结果派生 — 两投影对同一 (map, snapshot) 输入的 mock↔secret_id
+/// 关联恒一致, 由 `redaction_projections_agree_on_mock_secret_pairing` 守卫).
+/// 从 RedactionMap (SSOT) 派生 usage 审计的采集单元: (secret_id, mock, 位置分布);
 /// locations 取 map.hits (redact_ir_inner 在替换前采集).
 fn derive_redact_hits(
     redaction_map: &RedactionMap,
@@ -165,6 +164,11 @@ fn derive_redact_hits(
         .collect()
 }
 
+/// `redact_and_derive` 的返回类型别名 (避免 clippy::type_complexity 误报).
+///
+/// 四元组语义: `(redaction_map, redact_seed, redactions, redact_hits)`.
+/// Err 是已构造好的客户端错误 (fail_closed 503, 见 [`probe_exhausted_error`]),
+/// 调用方用 `?` 直接传播.
 type RedactOutcome = Result<
     (
         RedactionMap,
@@ -172,16 +176,17 @@ type RedactOutcome = Result<
         Vec<(String, String)>,
         Vec<crate::usage::RedactHit>,
     ),
-    RedactError,
+    AppError,
 >;
 
 /// 对 IR 应用 redact 并派生 CallEvent.redactions (same_proto / cross_proto 共享).
 ///
 /// `mode` 控制 probing 耗尽时的策略:
 /// - [`OnProbeExhausted::FailOpen`] (默认): 耗尽时 warn+skip (向后兼容, 永不 Err).
-/// - [`OnProbeExhausted::FailClosed`]: 耗尽时返回 `Err(RedactError)`, 让调用方拒绝转发.
+/// - [`OnProbeExhausted::FailClosed`]: 耗尽时返回 `Err(AppError)` (503, 由
+///   [`probe_exhausted_error`] 构造), 调用方 `?` 传播拒绝转发.
 ///
-/// 返回 `(redaction_map, redact_seed, redactions)`. redaction_map 非空时 debug 日志记录命中数.
+/// 返回 `(redaction_map, redact_seed, redactions, redact_hits)`. redaction_map 非空时 debug 日志记录命中数.
 ///
 /// 注: disabled secret 的明文放行 WARN (#161) 不在此层 — 挂在 dispatch (raw bytes)
 /// 以覆盖透传快捷分支, 见 [`crate::redact::warn_disabled_secrets_in_body`].
@@ -191,7 +196,12 @@ pub(super) fn redact_and_derive(
     mode: OnProbeExhausted,
     log_tag: &str,
 ) -> RedactOutcome {
-    let (redaction_map, redact_seed) = redact_ir_checked(ir, secrets_snapshot, mode)?;
+    let (redaction_map, redact_seed) = match redact_ir_checked(ir, secrets_snapshot, mode) {
+        Ok(ok) => ok,
+        // fail_closed 拒绝转发: 503 错误构造收口在此 (两路径共用同一 log_tag,
+        // 消除调用方镜像 match 与 tag 字面量的双写漂移面).
+        Err(e) => return Err(probe_exhausted_error(&e, log_tag)),
+    };
     if !redaction_map.is_empty() {
         debug!(
             redactions = redaction_map.real_to_mock.len(),
@@ -207,6 +217,27 @@ pub(super) fn redact_and_derive(
     #[cfg(feature = "consistency-check")]
     assert_redactions_match_map(&redactions, &redaction_map, secrets_snapshot);
     Ok((redaction_map, redact_seed, redactions, redact_hits))
+}
+
+/// fail_closed 拒绝转发时的 WARN + 客户端 503 错误构造 (redact_and_derive 内部使用).
+///
+/// 该 503 文案是客户端可见错误 body (SEC-2 同型契约面: 变量部分只含 secret id +
+/// reason, 不含 secret 明文) — same_proto / cross_proto 两路径经同一
+/// `redact_and_derive` 调用点触达, 文案单点维护. `log_tag` 与
+/// [`redact_and_derive`] 的同名参数一致 ("same-proto" / "cross-proto"),
+/// 仅用于 WARN 日志的路径归因.
+fn probe_exhausted_error(e: &RedactError, log_tag: &str) -> AppError {
+    warn!(
+        secret_id = %e.secret_id,
+        reason = ?e.reason,
+        "redact probe exhausted in {log_tag} path; refusing to forward (fail_closed)"
+    );
+    AppError::Unavailable(format!(
+        "redact probe exhausted, secret forwarding refused by policy \
+             (on_probe_exhausted=fail_closed); check secret mock_strategy config \
+             (secret_id hint: {}, reason: {:?})",
+        e.secret_id, e.reason
+    ))
 }
 
 // ─── 视图正确性守卫 (CI 用, 需 `--features consistency-check`) ─────────────
@@ -510,6 +541,9 @@ fn root_error_cause(e: &reqwest::Error) -> String {
 }
 
 /// URL → `scheme://host:port/path` (丢弃 userinfo / query / fragment).
+///
+/// 消费方: [`upstream_error_brief`] (502 body) 与 [`safe_url_for_log`]
+/// (debug 日志脱敏, SEC-C4).
 fn safe_url_for_client(u: &reqwest::Url) -> String {
     let mut s = format!("{}://", u.scheme());
     if let Some(host) = u.host_str() {
@@ -520,6 +554,24 @@ fn safe_url_for_client(u: &reqwest::Url) -> String {
     }
     s.push_str(u.path());
     s
+}
+
+/// 字符串 URL 的脱敏入口 (SEC-C4): 剥离 userinfo / query / fragment 后返回
+/// 可安全写日志的形态. 复用 [`safe_url_for_client`] 的剥离逻辑.
+///
+/// 用途: same_proto 两处 `debug!(url = ...)` — 上游 URL 可能携带客户端 query
+/// (如 Gemini `?key=...`), 原样打日志会把 secret 泄露到 debug 输出.
+/// 解析失败的防御性降级: 至少按首个 `?` 剥掉 query (输入是内部拼接的 URL,
+/// 异常形态仅理论可能; 剥 query 保证降级路径也不携带敏感参数).
+pub(super) fn safe_url_for_log(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(u) => safe_url_for_client(&u),
+        Err(_) => url
+            .split_once('?')
+            .map(|(head, _)| head)
+            .unwrap_or(url)
+            .to_string(),
+    }
 }
 
 /// 从上游 stream 取下一个 chunk, 可选地带空闲超时保护.
@@ -581,7 +633,10 @@ pub(super) fn stream_err_label(e: &std::io::Error) -> &'static str {
 /// `secrets_snapshot = None` 表示 passthrough 路径 (无机密命中), 用空 policy + seed=0.
 /// `secrets_snapshot = Some(s)` 表示 codec 路径, policy 持有真实 secret 列表 (COW Arc).
 ///
-/// `req_text` 是已 redact 的请求 body 快照 (LLM 视角), 将作为 WebUI req_body 权威来源.
+/// `req_text` 是已 redact 的请求 body 快照 (LLM 视角), **按值接收** 直接 move 进
+/// `req_body_raw` (WebUI req_body 权威来源) — 调用方不再保留则零拷贝
+/// (IR 路径用 `serde_json::to_string` 产 String; passthrough 路径一次
+/// `from_utf8_lossy`, 外部输入可能是非法 UTF-8).
 /// `ir = Some(&ir)` (codec 路径): preview/model 从已 parse 的 IR 提取 (零重复 JSON parse).
 /// `ir = None` (passthrough 路径): 从 req_text 字符串提取 (passthrough 不 parse IR 保持 byte-exact).
 /// `upstream_id`: 实际承载转发的 provider id (路由解析后的链尾实体, #179).
@@ -592,7 +647,7 @@ pub(super) fn build_call_event(
     parts: &axum::http::request::Parts,
     path: &str,
     fwd_headers: &HeaderMap,
-    req_text: &str,
+    req_text: String,
     ir: Option<&crate::codec::ir::IrRequest>,
     ingress_protocol: Option<crate::codec::Protocol>,
     upstream_id: &str,
@@ -603,7 +658,7 @@ pub(super) fn build_call_event(
 ) -> CallEvent {
     let (preview, model) = match ir {
         Some(ir) => crate::derive::extract_preview_and_model_from_ir(ir),
-        None => crate::derive::extract_preview_and_model(req_text),
+        None => crate::derive::extract_preview_and_model(&req_text),
     };
     let policy = match secrets_snapshot {
         Some(s) => std::sync::Arc::new(PolicySnapshot {
@@ -619,7 +674,7 @@ pub(super) fn build_call_event(
         ingress_protocol,
         redact_seed,
         policy,
-        req_body_raw: req_text.to_string(),
+        req_body_raw: req_text,
         preview: preview.map(std::sync::Arc::<str>::from),
         model: model.map(std::sync::Arc::<str>::from),
         upstream_id: std::sync::Arc::from(upstream_id),
@@ -761,6 +816,109 @@ impl ParsedSync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── M-C4: derive_redactions / derive_redact_hits 投影一致性 ────────────
+    //
+    // 两投影共享 derive_redact_hits 的单次 join (M-C4 去重后 redactions 从 hits
+    // 派生). 本测试锁定关联不变式: 对同一 (map, snapshot) 输入, redactions 的
+    // (mock, secret_id) 集合与 hits 的 (mock, secret_id) 集合逐对相等 — 防未来
+    // 重构让两投影各自维护 join 再次分叉.
+
+    #[test]
+    fn redaction_projections_agree_on_mock_secret_pairing() {
+        use crate::redact::RedactionMap;
+        use crate::secrets::{SecretCategory, SecretEntry};
+
+        fn entry(id: &str, value: &str) -> SecretEntry {
+            SecretEntry {
+                id: id.into(),
+                name: None,
+                category: SecretCategory::ApiKey,
+                value: value.into(),
+                value_file: None,
+                mock_strategy: crate::mock::MockStrategy::default(),
+            }
+        }
+
+        let mut map = RedactionMap::default();
+        // 两条命中映射 + 一条未命中 (snapshot 无对应 secret, 不进任何投影).
+        for (real, mock) in [("real-A", "mock-A"), ("real-B", "mock-B")] {
+            map.real_to_mock.insert(real.into(), mock.into());
+            map.mock_to_real.insert(mock.into(), real.into());
+        }
+        map.real_to_mock
+            .insert("real-NOHIT".into(), "mock-NOHIT".into());
+        // 共享 value 边角: sid-A2 与 sid-A 同 value → first-match 语义只投影
+        // 一个 id (doc 声明的行为, 防 join 方向被反转为 snapshot-iter 后退化).
+        let snapshot = vec![
+            entry("sid-A", "real-A"),
+            entry("sid-A2", "real-A"),
+            entry("sid-B", "real-B"),
+        ];
+
+        let redactions = derive_redactions(&map, &snapshot);
+        let hits = derive_redact_hits(&map, &snapshot);
+
+        let mut expected: Vec<(String, String)> = hits
+            .iter()
+            .map(|h| (h.mock.clone(), h.secret_id.clone()))
+            .collect();
+        expected.sort();
+        let mut actual = redactions;
+        actual.sort();
+        assert_eq!(
+            actual, expected,
+            "redactions' (mock, secret_id) pairings must equal hits'"
+        );
+        // 共享 value 去重: 每条映射只投影一次 (first-match), 总数仍为 2 而非 3.
+        assert_eq!(actual.len(), 2);
+        assert_eq!(hits.len(), 2);
+        assert!(
+            actual.contains(&("mock-A".into(), "sid-A".to_string())),
+            "shared-value first-match must pick the earlier entry: {actual:?}"
+        );
+        assert!(
+            !actual.iter().any(|(_, id)| id == "sid-A2"),
+            "duplicate-value entry must be deduplicated away: {actual:?}"
+        );
+        assert!(
+            !actual.iter().any(|(m, _)| m.contains("NOHIT")),
+            "unmatched real must not project"
+        );
+    }
+
+    // ─── stream_err_label: 504/502 分类 SSOT ───────────────────────────────
+    //
+    // stream_err_label 是 "idle timeout → 504 / 其他 → 502" 判定的 SSOT
+    // (fan_out 三路径 + cross_proto 的 client_status 推断共用). 锁定两类分支.
+
+    #[test]
+    fn stream_err_label_distinguishes_timeout_from_other_errors() {
+        let timed_out = std::io::Error::new(std::io::ErrorKind::TimedOut, "idle");
+        assert_eq!(stream_err_label(&timed_out), ERR_STREAM_IDLE_TIMEOUT);
+        let other = std::io::Error::other("upstream reset");
+        assert_eq!(stream_err_label(&other), ERR_UPSTREAM_STREAM);
+    }
+
+    // ─── SEC-C4b: safe_url_for_log 的 query 剥离 ───────────────────────────
+    //
+    // debug 日志的 URL 脱敏入口 (same_proto 两处消费). 锁定 Ok 路径 (经
+    // safe_url_for_client 剥 userinfo/query/fragment) 与解析失败 fallback
+    // (至少剥 query) 两个分支.
+
+    #[test]
+    fn safe_url_for_log_strips_query_and_fallback_strips_query() {
+        // Ok 路径: query (可能带 ?key=...) 与 userinfo 被剥离.
+        assert_eq!(
+            safe_url_for_log("https://api.example.com/v1/chat?key=leak-me"),
+            "https://api.example.com/v1/chat"
+        );
+        // 解析失败 fallback (空 host 是非法 URL): 仍按首个 '?' 剥 query.
+        assert_eq!(
+            safe_url_for_log("http://:///path?api_key=leak-me"),
+            "http://:///path"
+        );
+    }
 
     // ─── #163: 502 message 净化 (payload 进客户端错误 body, 信息泄露 SSOT 纪律) ──
     //

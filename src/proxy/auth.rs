@@ -19,6 +19,14 @@ use tracing::warn;
 
 use crate::provider::Protocol;
 
+/// Anthropic wire 协议版本 (`anthropic-version` header 值), M-C3 收口.
+///
+/// 两处消费方共享: `cross_proto` 转发的默认版本注入 (客户端未自带时) /
+/// `models` 的上游清单 fetch (从零构造 headers, 必须显式注入 — 否则真实
+/// Anthropic 上游对 GET /v1/models 返回 400). Anthropic 上游缺失此 header
+/// 会拒绝请求, 双处硬编码易漂移, 故收口在 provider 鉴权/协议 header 注入层.
+pub(super) const ANTHROPIC_VERSION: &str = "2023-06-01";
+
 /// 若 provider 配置了 api_key, 注入对应的 auth header.
 ///
 /// 空 key (含纯空白) 跳过注入 (保留客户端原有 header). 非法 HTTP header 字符的 key

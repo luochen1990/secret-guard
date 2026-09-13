@@ -24,6 +24,7 @@ use crate::dag::ResponseData;
 use crate::error::AppError;
 use crate::provider::{DirectProvider, Protocol};
 
+use super::auth::ANTHROPIC_VERSION;
 use super::auth::apply_provider_auth;
 use super::helpers::{build_response_headers, redact_headers, sanitize_request_headers, utf8_view};
 #[cfg(feature = "consistency-check")]
@@ -105,28 +106,14 @@ pub(crate) async fn cross_proto_forward(
     let real_messages = ir.messages.clone();
 
     // 8. redact IR + derive redactions (共享 helper, 内含 consistency-check 守卫).
-    //    FailClosed 模式下 probing 耗尽 → 直接 503 拒绝转发 (防 secret 泄露).
-    let (redaction_map, redact_seed, redactions, redact_hits) = match redact_and_derive(
+    //    FailClosed 模式下 probing 耗尽时 redact_and_derive 内部构造 503 并在此
+    //    `?` 拒绝转发 (防 secret 泄露).
+    let (redaction_map, redact_seed, redactions, redact_hits) = redact_and_derive(
         &mut ir,
         &secrets_snapshot,
         state.on_probe_exhausted,
         "cross-proto",
-    ) {
-        Ok(out) => out,
-        Err(e) => {
-            warn!(
-                secret_id = %e.secret_id,
-                reason = ?e.reason,
-                "redact probe exhausted in cross-proto path; refusing to forward (fail_closed)"
-            );
-            return Err(AppError::Unavailable(format!(
-                "redact probe exhausted, secret forwarding refused by policy \
-                     (on_probe_exhausted=fail_closed); check secret mock_strategy config \
-                     (secret_id hint: {}, reason: {:?})",
-                e.secret_id, e.reason
-            )));
-        }
-    };
+    )?;
 
     // 9. IR → egress body.
     let egress_body_value = egress_writer.write_request(&ir);
@@ -147,10 +134,11 @@ pub(crate) async fn cross_proto_forward(
     );
     // 跨协议时客户端不会自带 egress 协议的特定 header, 这里仅在缺失时注入默认.
     // 用 entry().or_insert() 而非 insert(), 保留客户端主动设置更新的版本的能力.
+    // 版本值收口在 auth::ANTHROPIC_VERSION (与 models.rs 的 fetch 共享, M-C3).
     if provider.protocol == Protocol::Anthropic {
         fwd_headers
             .entry("anthropic-version")
-            .or_insert_with(|| HeaderValue::from_static("2023-06-01"));
+            .or_insert_with(|| HeaderValue::from_static(ANTHROPIC_VERSION));
     }
 
     // 12. push 到 DAG.
@@ -166,15 +154,16 @@ pub(crate) async fn cross_proto_forward(
     // 理由与 same_proto_forward 一致: record 应保存 "redact 后的视图" (LLM 看到的版本),
     // 而非客户端原始 body (可能含未 redact 的真实 secret). 这里用 ingress writer 而非
     // egress writer, 让 WebUI 的 parsed view 能用 ingress codec 正确 round-trip 解析.
+    // writer 输出恒为合法 UTF-8, 直接产 String 按值 move 进 record (req_body_raw),
+    // 消除 to_vec → lossy copy → to_string 拷贝链 (PERF-C2).
     let req_view_value = ingress_writer.write_request(&ir);
-    let req_view_bytes = serde_json::to_vec(&req_view_value)
+    let req_text_for_record = serde_json::to_string(&req_view_value)
         .map_err(|e| AppError::Internal(format!("serialize ingress view body failed: {e}")))?;
-    let req_text_for_record = utf8_view(&req_view_bytes);
     let event = build_call_event(
         &parts,
         &path_for_record,
         &fwd_headers,
-        &req_text_for_record,
+        req_text_for_record,
         Some(&ir),
         Some(ingress_codec),
         upstream_id,

@@ -91,11 +91,6 @@ const MODEL_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const MODEL_FETCH_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Anthropic API 全端点强制要求的版本 header 值. fetch 从零构造 headers (无客户端
-/// header 可透传), 必须显式注入 — 否则真实 Anthropic 上游对 GET /v1/models 返回
-/// 400, 该 provider 永无贡献 (转发路径透传客户端 header, 从不需要注入).
-const ANTHROPIC_VERSION: &str = "2023-06-01";
-
 /// fetch 失败后的退避窗口 (M1): 窗口内的过期/从未成功条目不再重试 — 查询立即
 /// serve stale (或无贡献), 不阻塞不占锁重试. 防 dead target 逐查询阻塞
 /// (每次 ≤ MODEL_FETCH_TIMEOUT) × 全局缓存锁串行的可用性放大.
@@ -410,7 +405,7 @@ async fn fetch_model_list(
     if direct.protocol == Protocol::Anthropic {
         headers.insert(
             "anthropic-version",
-            HeaderValue::from_static(ANTHROPIC_VERSION),
+            HeaderValue::from_static(super::auth::ANTHROPIC_VERSION),
         );
     }
     let request = async {
@@ -1093,7 +1088,7 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("GET", "/v1/models")
-            .match_header("anthropic-version", ANTHROPIC_VERSION)
+            .match_header("anthropic-version", super::super::auth::ANTHROPIC_VERSION)
             .with_status(200)
             .with_body(r#"{"data":[{"id":"c1"}]}"#)
             .expect(1)

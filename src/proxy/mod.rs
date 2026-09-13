@@ -185,10 +185,16 @@ async fn dispatch(
     let started = Instant::now();
     let (parts, body) = req.into_parts();
 
-    // 1. 解析 ingress 协议.
+    // 1. 解析 ingress 协议. 合法简写清单从 Protocol::ALL 派生 (SSOT, 先例:
+    //    web/api/providers.rs 同款投影), 新增协议无需同步此文案.
     let ingress = Protocol::from_short(&fp.proto).ok_or_else(|| {
+        let shorts = Protocol::ALL
+            .iter()
+            .map(|(_, _, s)| *s)
+            .collect::<Vec<_>>()
+            .join("/");
         AppError::NotFound(format!(
-            "unknown protocol '/{}' (expected one of: o/a/g/l/r)",
+            "unknown protocol '/{}' (expected one of: {shorts})",
             fp.proto
         ))
     })?;

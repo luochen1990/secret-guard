@@ -29,7 +29,7 @@ use super::auth::apply_provider_auth;
 use super::helpers::{
     build_upstream_url, is_streaming, requests_stream, sanitize_request_headers, utf8_view,
 };
-use super::recorder::{build_call_event, parse_request_ir, redact_and_derive};
+use super::recorder::{build_call_event, parse_request_ir, redact_and_derive, safe_url_for_log};
 
 /// 同协议转发: 字节透传 (无 redact 且无 override) 或 IR 路径 (有 redact 或 override).
 ///
@@ -131,37 +131,24 @@ pub(crate) async fn same_proto_forward(
     //    WebUI 查询时 lazy apply redactMap).
     let real_messages = ir.messages.clone();
 
-    // 4. redact IR + derive redactions (共享 helper).
+    // 4. redact IR + derive redactions (共享 helper; FailClosed 模式下 probing 耗尽
+    //    时 redact_and_derive 内部构造 503 并在此 `?` 拒绝转发, 防止 secret 泄露).
     //    流式响应里的 TextDelta / InputJsonDelta 都会经 StreamingRestorer 做 sliding-window
     //    restore (在 StreamTranslate::new_same_proto_restore 中), 不再需要 warn.
-    //    FailClosed 模式下 probing 耗尽 → 直接 503 拒绝转发 (防 secret 泄露).
-    let (redaction_map, redact_seed, redactions, redact_hits) = match redact_and_derive(
+    let (redaction_map, redact_seed, redactions, redact_hits) = redact_and_derive(
         &mut ir,
         &secrets_snapshot,
         state.on_probe_exhausted,
         "same-proto",
-    ) {
-        Ok(out) => out,
-        Err(e) => {
-            warn!(
-                secret_id = %e.secret_id,
-                reason = ?e.reason,
-                "redact probe exhausted in same-proto path; refusing to forward (fail_closed)"
-            );
-            return Err(AppError::Unavailable(format!(
-                "redact probe exhausted, secret forwarding refused by policy \
-                     (on_probe_exhausted=fail_closed); check secret mock_strategy config \
-                     (secret_id hint: {}, reason: {:?})",
-                e.secret_id, e.reason
-            )));
-        }
-    };
+    )?;
 
-    // 5. IR → 请求 body (同协议 writer 重序列化).
+    // 5. IR → 请求 body (同协议 writer 重序列化). writer 输出恒为合法 UTF-8,
+    //    直接产 String 按值 move 进 record (req_body_raw); 出站仅一次
+    //    clone().into_bytes() (消除 to_vec → lossy copy → to_string 三段拷贝链).
     let new_body = writer.write_request(&ir);
-    let req_bytes_to_send = serde_json::to_vec(&new_body)
+    let req_text_for_record = serde_json::to_string(&new_body)
         .map_err(|e| AppError::Internal(format!("serialize redacted body failed: {e}")))?;
-    let req_text_for_record = utf8_view(&req_bytes_to_send);
+    let req_bytes_to_send = req_text_for_record.clone().into_bytes();
 
     // 6. 构造上游 URL.
     let query = parts
@@ -192,7 +179,7 @@ pub(crate) async fn same_proto_forward(
         &parts,
         &path_for_record,
         &fwd_headers,
-        &req_text_for_record,
+        req_text_for_record,
         Some(&ir),
         Some(codec_proto),
         upstream_id,
@@ -219,7 +206,8 @@ pub(crate) async fn same_proto_forward(
         },
     );
 
-    debug!(%record_id, method = %parts.method, url = %upstream_url, "forwarding redacted same-proto request");
+    // url 脱敏 (SEC-C4): query 可能携带客户端 key (如 Gemini ?key=...).
+    debug!(%record_id, method = %parts.method, url = %safe_url_for_log(&upstream_url), "forwarding redacted same-proto request");
 
     // 9. 发送到上游. 响应头超时按**出站 body 的流式语义**选档 (#175): IR 的
     //    stream 字段是 writer 产出的 egress body 真实语义 (该 body 发往上游),
@@ -364,7 +352,7 @@ async fn same_proto_passthrough(
         &parts,
         &path_for_record,
         &fwd_headers,
-        &req_text_for_record,
+        req_text_for_record,
         None,
         crate::codec::Protocol::from_native(ingress),
         upstream_id,
@@ -393,7 +381,7 @@ async fn same_proto_passthrough(
         },
     );
 
-    debug!(%record_id, method = %parts.method, url = %upstream_url, "forwarding (passthrough)");
+    debug!(%record_id, method = %parts.method, url = %safe_url_for_log(&upstream_url), "forwarding (passthrough)");
 
     // 响应头超时按请求 body 的流式语义选档 (#175): passthrough 无 codec 解析,
     // 用 requests_stream 对原始字节做顶层 "stream" 检测 (保守判定: 只有显式

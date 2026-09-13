@@ -3533,6 +3533,67 @@ async fn fail_open_mode_remains_forwarding_when_probing_exhausted() {
     );
 }
 
+/// fail_closed 的 503 拒绝在 **cross_proto 路径**同样生效 (M-C1 守卫: 错误映射
+/// 收口到 probe_exhausted_error 后, same-proto / cross-proto 两路径行为一致).
+/// 上游 provider 是 openai, ingress 用 anthropic (`/a/`) → 跨协议翻译路径.
+#[tokio::test]
+async fn fail_closed_mode_returns_503_when_probing_exhausted_cross_proto() {
+    let real_secret = "super-secret-fail-closed-cross-proto";
+    let mut upstream = spawn_mock_upstream().await;
+    // expect(0) + assert 守卫 "上游未被调用" (与 same-proto 版同型, RED-4 子句).
+    let mock = upstream
+        .mock("POST", "/v1/chat/completions")
+        .expect(0)
+        .with_status(200)
+        .with_body(r#"{"id":"should-not-reach"}"#)
+        .create_async()
+        .await;
+
+    let entries = vec![weak_secret("weak-api-key", real_secret)];
+    let secrets = test_secret_table_with(entries);
+    let proxy_url = spawn_proxy_with_probe_mode(
+        secret_guard::config::OnProbeExhausted::FailClosed,
+        secrets,
+        &upstream.url(),
+    )
+    .await;
+
+    // anthropic ingress body (role/max_tokens 为 reader 必填形态) + 全部 10 个
+    // 数字候选 → redact_ir 的 mock probing 必然耗尽 → 503 拒绝转发.
+    let body = format!(
+        r#"{{"model":"m","max_tokens":16,"messages":[{{"role":"user","content":"0 1 2 3 4 5 6 7 8 9 filler {real_secret}"}}]}}"#
+    );
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/a/oa-main/v1/messages"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "FailClosed must return 503 on probing exhaustion (cross-proto path)"
+    );
+    let text = resp.text().await.unwrap();
+    // M-C1 守卫: pin 503 message 全文 (客户端可见契约面, SEC-2 同型 — 两路径
+    // 共享 probe_exhausted_error, 文案漂移在此立即暴露). message 无引号/反斜杠,
+    // JSON 转义不影响子串形态.
+    let expected_msg = "redact probe exhausted, secret forwarding refused by policy \
+         (on_probe_exhausted=fail_closed); check secret mock_strategy config \
+         (secret_id hint: weak-api-key, reason: ProbingExhausted)";
+    assert!(
+        text.contains(expected_msg),
+        "503 body must pin the exact refusal message; got: {text}"
+    );
+    assert!(
+        !text.contains(real_secret),
+        "FailClosed 503 body must not leak real secret; got: {text}"
+    );
+    mock.assert();
+}
+
 #[tokio::test]
 async fn restore_inserts_secret_back_for_client() {
     // IR-based redact round-trip: 请求里 secret → mock → LLM, 响应里 mock → secret → client.
