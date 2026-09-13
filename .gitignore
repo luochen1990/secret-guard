@@ -24,6 +24,7 @@ secret-guard.state.toml
 
 # Playwright MCP 工具的 a11y snapshot / console log 临时产物
 /.playwright-mcp/
+/.playwright-cli/
 
 # cargo-llvm-cov 产物 (target/llvm-cov-target/ 已被 /target 覆盖).
 /coverage/
