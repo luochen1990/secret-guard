@@ -1022,7 +1022,7 @@ pub fn prune_dangling_decisions(
 /// 原子写文件: 先写带 UUID 的 `.tmp`, sync, 再 rename.
 ///
 /// 同时被 [`DynamicTable::persist_dynamic`] (provider / secret 共享) 调用.
-/// `pub(crate)` 暴露给 redact 等需要原子写的模块.
+/// `pub(crate)` 暴露给 auth (api_key 写回) 等需要原子写的模块.
 ///
 /// SEC-8: 所有调用方写的都是 state.toml (含明文敏感数据, #157), tmp 以 0600
 /// 创建 (`util::create_owner_only`), rename 后目标文件保持 owner-only.
