@@ -696,6 +696,14 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 > **覆盖现状**: CFG-5 的两个 property (`prop_concurrent_writes_serialized_via_persist_lock` + `prop_cross_table_shared_decisions_isolation`) 已实现跨表完整覆盖 — 装配方式与 `server.rs` 生产路径一致 (共享 `Arc<Mutex<()>>` persist_lock + 共享 `Arc<RwLock<Decisions>>` + 同一 state_path). 上方 CFG-4 "理想 vs 现状" 注记中提到的 "跨表 state.toml 文件交互" 与 "共享 Decisions Arc 的跨表隔离" 现由本节两个 property 覆盖; CFG-4 自身的跨表失败回滚 (`prop_persist_failure_rollback_under_concurrency`) 仍作为后续工作.
 
+### CFG-6 悬空 decision 清理 (prune)
+
+**陈述**: decision 仅作用于当前 static 层存在的 id. state.toml 中指向已不存在 static id 的悬空 decision 在启动时被清除 (内存 + 尽力持久化, 逐条 WARN), 防 "static id 删除后重新加入时静默继承旧 decision" (如 disabled → 条目从 WebUI 消失且无提示, 2026-09-13 排查).
+
+**Properties**:
+- `prop_prune_dangling_decisions`: 任意 (id 池 × static 存活子集 × 子表归属 × mode) 组合下, prune 清除的恰是全部悬空条目 (有非 Default decision 且不在对应 static 集合), 存活 id 的 decision (mode + 归属) 原样保留. ✅
+- 场景回归: `prune_disabled_secret_id_revive_no_longer_shadowed` (`src/config.rs`) — static id 复活后查询回退 Default (未被残留条目遮蔽). ✅
+
 ---
 
 ## 7. SEC: 安全姿态

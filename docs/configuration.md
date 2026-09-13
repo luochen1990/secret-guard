@@ -14,6 +14,33 @@ secret-guard 通过一个 TOML 文件启动 (默认 `secret-guard.toml`, 可用 
 > ⚠️ `secret-guard.state.toml` 含**明文**敏感数据 (WebUI 创建的 secret、显式写入的 api_key),
 > 务必加入 `.gitignore`.
 
+### `secret-guard.state.toml` 布局速查 (手编排障用)
+
+状态文件由程序自动写回, 一般不需要手编; 但排障时 (如条目从 WebUI 消失) 可按此速查
+各 section 的职责. **decision 独立成表**是设计而非冗余 — 它是对 `secret-guard.toml`
+里 static 条目的"态度", 而条目本身住在一个程序不可写的文件里:
+
+```toml
+providers = []            # WebUI fork 出的 dynamic override / dynamic-only 条目 (条目内容层)
+secrets = []
+api_keys = []             # WebUI 签发的 API key (存 hash)
+api_keys_disabled = []    # static API key 被禁用的 label 集合 (态度层, 一维)
+
+[decisions.providers]     # 对 static provider id 的三态决策 (态度层):
+"openai-main" = "disabled"   # default (不入表) | prefer_static | disabled
+
+[decisions.secrets]       # 对 static secret id 的三态决策, 同上
+```
+
+- 条目**内容**与对条目的**态度**分离存储: disabled 的 static 条目不在上面的
+  `providers = []` 数组里 (那里只有 dynamic 层), 它的禁用状态只记录在 `[decisions]` 表.
+- decision=disabled 的条目在 WebUI 的 Secrets / Providers 页以**灰色删除线行**显示,
+  用行内 decision 下拉可切回 (`default` / `prefer_static`) 恢复.
+- 从 `secret-guard.toml` 删除某 id 后, state 里残留的对应 decision 会在**下次启动时
+  自动清除** (日志可见 `pruned dangling decision` WARN) — 同 id 日后重新加入不会被
+  旧状态静默禁用.
+- 整个文件删除即重置: secret-guard 回到 `secret-guard.toml` 声明的纯净状态.
+
 配置文件可以只写需要的部分 — 所有 section 都可缺省, 缺省条目为空、数值取下表默认值.
 
 ## 最小可用示例

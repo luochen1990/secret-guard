@@ -1844,10 +1844,12 @@
     const state = {
       // secrets tab
       secretsList: [],
+      secretsDisabled: [],
       secretCategories: [],
       secretDecisions: [],
       // providers tab
       providersList: [],
+      providersDisabled: [],
       providerProtocols: [],
       providerShorts: [],
       providerDecisions: [],
@@ -3898,9 +3900,9 @@
     // 主流程只写一次. 新增资源类型时只需在 KINDS 加一项.
     //
     // cfg 字段契约:
-    //   api / list / setList / bodyId / statsId / formDlgId / formElId / colspan /
-    //   emptyText / kindParam / refresh / renderRow / populateSelects / openForm —
-    //     见各 cfg 项, 含义自明.
+    //   api / list / disabledList / setList / bodyId / statsId / formDlgId / formElId /
+    //   colspan / emptyText / kindParam / refresh / renderRow / renderDisabledRow /
+    //   populateSelects / openForm — 见各 cfg 项, 含义自明.
     //   extraActions?: Record<actionName, (id: string) => void> — 可选.
     //     kind 特定的额外按钮动作 (如 provider 的 endpoints), 由 bindTableEvents 的
     //     click 委托在通用 edit/delete 之外分派. 仅在该 kind 的行渲染了对应
@@ -3910,7 +3912,8 @@
       secret: {
         api: API_SECRETS,
         list: () => state.secretsList,
-        setList: (d) => { state.secretsList = d.secrets || []; state.secretCategories = d.categories || []; state.secretDecisions = d.decisions || []; },
+        disabledList: () => state.secretsDisabled,
+        setList: (d) => { state.secretsList = d.secrets || []; state.secretsDisabled = d.disabled || []; state.secretCategories = d.categories || []; state.secretDecisions = d.decisions || []; },
         bodyId: 'secrets-body',
         statsId: 'secrets-stats',
         formDlgId: 'secret-form',
@@ -3920,13 +3923,15 @@
         kindParam: 'secret', // decision endpoint URL 用
         refresh: () => refreshSecrets(),
         renderRow: renderSecretRow,
+        renderDisabledRow: renderDisabledSecretRow,
         populateSelects: populateCategorySelect,
         openForm: openSecretForm,
       },
       provider: {
         api: API_PROVIDERS,
         list: () => state.providersList,
-        setList: (d) => { state.providersList = d.providers || []; state.providerProtocols = d.protocols || []; state.providerShorts = d.shorts || []; state.providerDecisions = d.decisions || []; },
+        disabledList: () => state.providersDisabled,
+        setList: (d) => { state.providersList = d.providers || []; state.providersDisabled = d.disabled || []; state.providerProtocols = d.protocols || []; state.providerShorts = d.shorts || []; state.providerDecisions = d.decisions || []; },
         bodyId: 'providers-body',
         statsId: 'providers-stats',
         formDlgId: 'provider-form',
@@ -3936,6 +3941,7 @@
         kindParam: 'provider',
         refresh: () => refreshProviders(),
         renderRow: renderProviderRow,
+        renderDisabledRow: renderDisabledProviderRow,
         populateSelects: populateProtocolSelect,
         openForm: openProviderForm,
         extraActions: { endpoints: openProviderEndpoints },
@@ -4029,9 +4035,14 @@
       const cfg = KINDS[kind];
       const list = cfg.list();
       const body = document.getElementById(cfg.bodyId);
-      const html = list.length === 0
+      // disabled 行 (decision=Disabled 的 static 条目) 追加在有效行之后: 灰色删除线
+      // + decision 下拉可切回. 数据来自响应的 disabled 数组 (masked), 与有效行
+      // 分开渲染 (shape 不同: 无 source/decision 字段, decision 恒为 disabled).
+      // stats 口径 = effective view (仅有效行), 不计 disabled 行 — 与转发/脱敏生效集一致.
+      const disabledRows = cfg.disabledList().map(item => cfg.renderDisabledRow(item));
+      const html = list.length === 0 && disabledRows.length === 0
         ? `<tr><td colspan="${cfg.colspan}" class="empty">${cfg.emptyText}</td></tr>`
-        : list.map(item => cfg.renderRow(item)).join('');
+        : list.map(item => cfg.renderRow(item)).join('') + disabledRows.join('');
       if (replaceTbodyIfChanged(body, html)) renderStats(cfg.statsId, list);
     }
 
@@ -4487,6 +4498,25 @@
       `;
     }
 
+    // decision=Disabled 的 static secret 行 (数据 = SecretMasked, 无 source/decision 字段):
+    // 灰色删除线 + decision 下拉恒 disabled (可切回 default/prefer_static 复活条目).
+    // actions 留空 — edit 走 update_flow 会 404 (不在 effective view), delete 对 static 必 409.
+    function renderDisabledSecretRow(s) {
+      return `
+        <tr class="row-disabled" data-id="${escapeHtml(s.id)}">
+          <td title="${escapeHtml(s.id)}"><span class="cell-ellipsis"><code>${escapeHtml(s.id)}</code></span></td>
+          <td title="${escapeHtml(s.name || '')}"><span class="cell-ellipsis">${escapeHtml(s.name || '')}</span></td>
+          <td class="cell-short"><span class="pill ${escapeHtml(s.category)}">${escapeHtml(s.category)}</span></td>
+          <td class="cell-long" title="${escapeHtml(s.value_masked || '')}"><span class="cell-ellipsis"><code>${escapeHtml(s.value_masked)}</code></span></td>
+          <td class="cell-short">${escapeHtml(s.value_length)}</td>
+          <td class="cell-short" title="${escapeHtml(mockStrategyTooltip(s.mock_strategy))}"><span class="cell-ellipsis">${mockStrategyBadge(s.mock_strategy)}</span></td>
+          <td>${srcBadge('static')}</td>
+          <td>${decisionCell('secret', s.id, 'disabled', true)}</td>
+          <td class="actions"></td>
+        </tr>
+      `;
+    }
+
     // ─── mock strategy 渲染 (摘要 + tooltip) ──────────────────────────────
     //
     // 列表只显示简短摘要 (如 "auto", "fixed"); 详情悬停 tooltip.
@@ -4626,6 +4656,38 @@
       if (source === 'dynamic_override') return 'row-override';
       if (source === 'static_preferred') return 'row-preferred';
       return '';
+    }
+
+    // decision=Disabled 的 static provider 行 (数据 = ProviderMasked, JSON shape 与
+    // EffectiveProvider 的 kind 部分一致: kind 判别 + direct(protocol/base_url/
+    // api_key_masked) | router(routes)). 灰色删除线 + decision 下拉恒 disabled
+    // (可切回复活). actions 留空 — edit 走 update_flow 会 404 (不在 effective view),
+    // delete 对 static 必 409; endpoints 对 404 的 id 无意义.
+    function renderDisabledProviderRow(p) {
+      const isRouter = p.kind === 'router';
+      let protoCell;
+      let urlCell;
+      if (isRouter) {
+        const routes = p.routes || [];
+        protoCell = `<td class="cell-short"><span class="pill" title="route-based routing endpoint — forwards by route model_pattern (no base URL / API key of its own)">router</span></td>`;
+        urlCell = routerRoutesCell(routes);
+      } else {
+        protoCell = `<td class="cell-short"><span class="pill">${escapeHtml(p.protocol)}</span></td>`;
+        urlCell = `<td class="cell-long" title="${escapeHtml(p.base_url || '')}"><span class="cell-ellipsis"><code>${escapeHtml(p.base_url)}</code></span></td>`;
+      }
+      return `
+        <tr class="row-disabled" data-id="${escapeHtml(p.id)}">
+          <td title="${escapeHtml(p.id)}"><span class="cell-ellipsis"><code>${escapeHtml(p.id)}</code></span></td>
+          <td title="${escapeHtml(p.name || '')}"><span class="cell-ellipsis">${escapeHtml(p.name || '')}</span></td>
+          ${protoCell}
+          ${urlCell}
+          <td class="cell-long" title="${escapeHtml(p.api_key_masked || '')}"><span class="cell-ellipsis"><code>${escapeHtml(p.api_key_masked || '(none)')}</code></span></td>
+          <td class="cell-short">${p.enabled ? '✓' : '<span class="status-err">✗</span>'}</td>
+          <td>${srcBadge('static')}</td>
+          <td>${decisionCell('provider', p.id, 'disabled', true)}</td>
+          <td class="actions"></td>
+        </tr>
+      `;
     }
 
     bindTableEvents('secret');

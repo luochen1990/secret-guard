@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::DynamicEntry;
 use crate::config::OverrideMode;
-use crate::provider::{EffectiveProvider, Protocol, Provider};
+use crate::provider::{EffectiveProvider, Protocol, Provider, ProviderMasked};
 use crate::state::{AppState, NO_STORE};
 
 use super::crud::{Created, DecisionRequest, decision_flow};
@@ -20,6 +20,14 @@ use super::error::ApiError;
 
 pub async fn list_providers(State(state): State<AppState>) -> impl IntoResponse {
     let providers: Vec<EffectiveProvider> = state.providers.effective_snapshot();
+    // decision=Disabled 的条目不在 effective view (CFG-1), 单独附上 masked 视图,
+    // 让前端能渲染灰行 + 提供切回入口 (SEC: 必须经 ProviderMasked 脱敏, 不回明文).
+    let disabled: Vec<ProviderMasked> = state
+        .providers
+        .disabled_statics()
+        .into_iter()
+        .map(ProviderMasked::from)
+        .collect();
     let protocols: Vec<&'static str> = Protocol::ALL.iter().map(|(_, n, _)| *n).collect();
     let shorts: Vec<&'static str> = Protocol::ALL.iter().map(|(_, _, s)| *s).collect();
     let decisions: Vec<&'static str> = OverrideMode::ALL.iter().map(|(_, s)| *s).collect();
@@ -27,6 +35,7 @@ pub async fn list_providers(State(state): State<AppState>) -> impl IntoResponse 
         NO_STORE,
         Json(ListProvidersResponse {
             providers,
+            disabled,
             protocols,
             shorts,
             decisions,
@@ -174,6 +183,9 @@ pub async fn set_provider_decision(
 #[derive(Serialize)]
 pub(crate) struct ListProvidersResponse {
     pub providers: Vec<EffectiveProvider>,
+    /// decision=Disabled 的 static 条目 (masked). effective view 排除它们 (CFG-1),
+    /// 此数组让前端可见并提供 decision 切回入口.
+    pub disabled: Vec<ProviderMasked>,
     pub protocols: Vec<&'static str>,
     pub shorts: Vec<&'static str>,
     pub decisions: Vec<&'static str>,

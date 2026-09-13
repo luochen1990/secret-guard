@@ -9,7 +9,7 @@ use axum::response::{IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 
 use crate::config::OverrideMode;
-use crate::secrets::{EffectiveSecret, SecretCategory, SecretEntry};
+use crate::secrets::{EffectiveSecret, SecretCategory, SecretEntry, SecretMasked};
 use crate::state::{AppState, NO_STORE};
 
 use super::crud::{Created, DecisionRequest, create_flow, decision_flow, delete_flow, update_flow};
@@ -17,12 +17,21 @@ use super::error::ApiError;
 
 pub async fn list_secrets(State(state): State<AppState>) -> impl IntoResponse {
     let secrets: Vec<EffectiveSecret> = state.secrets.effective_snapshot();
+    // decision=Disabled 的条目不在 effective view (CFG-1), 单独附上 masked 视图,
+    // 让前端能渲染灰行 + 提供切回入口 (SEC: 必须经 SecretMasked 脱敏, 不回明文).
+    let disabled: Vec<SecretMasked> = state
+        .secrets
+        .disabled_statics()
+        .into_iter()
+        .map(SecretMasked::from)
+        .collect();
     let categories: Vec<&'static str> = SecretCategory::ALL.iter().map(|(_, s)| *s).collect();
     let decisions: Vec<&'static str> = OverrideMode::ALL.iter().map(|(_, s)| *s).collect();
     (
         NO_STORE,
         Json(ListSecretsResponse {
             secrets,
+            disabled,
             categories,
             decisions,
         }),
@@ -101,6 +110,9 @@ pub async fn set_secret_decision(
 #[derive(Serialize)]
 pub(crate) struct ListSecretsResponse {
     pub secrets: Vec<EffectiveSecret>,
+    /// decision=Disabled 的 static 条目 (masked). effective view 排除它们 (CFG-1),
+    /// 此数组让前端可见并提供 decision 切回入口.
+    pub disabled: Vec<SecretMasked>,
     pub categories: Vec<&'static str>,
     /// 所有合法的 OverrideMode 字符串名, 供前端渲染 decision 选择器.
     pub decisions: Vec<&'static str>,

@@ -67,6 +67,12 @@ GET    /api/usage/summary[?hours=N]  → UsageSummary {range, pricing_status, to
 
 所有响应带 `Cache-Control: no-store`, 避免浏览器对自动刷新返回缓存内容.
 
+> **disabled 条目可见性**: `GET /api/secrets` / `GET /api/providers` 的响应各带一个
+> `disabled` 数组 (decision=Disabled 的 static 条目, **masked** 视图 —
+> `SecretMasked` / `ProviderMasked`, 绝不回明文). effective view 排除它们 (CFG-1),
+> 此数组让 WebUI 渲染灰色删除线行并提供 decision 切回入口 (2026-09-13 排查修复).
+> 悬空 decision (static 侧已删除的 id) 在启动时被 prune (contracts.md **CFG-6**).
+
 > **POST 的 `generated_id` 明示位** (#164 子项 6): secrets / providers 的 POST 请求
 > 不传 `id` (或传空串) 时, 服务端自动生成 UUID v4, 并在 201 响应体额外携带
 > `"generated_id": true` (显式传 id 时该字段缺席). 脚本用户可据此感知 id 是服务端

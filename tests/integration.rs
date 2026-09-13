@@ -3599,6 +3599,121 @@ async fn decision_disabled_drops_static_provider() {
     assert_eq!(resp.0, reqwest::StatusCode::NOT_FOUND);
 }
 
+/// CFG-1 (effective view 排除) 与 WebUI 可见性解耦: disabled 条目经 `disabled`
+/// 数组以 masked 形式返回 (SEC: 不回明文), 且 decision 可切回复活 —
+/// 修复 "disable 后条目从 WebUI 消失且无恢复入口" (2026-09-13 排查).
+#[tokio::test]
+async fn disabled_provider_listed_masked_and_recoverable() {
+    let s = openai_provider("static-disabled", "https://upstream.example");
+    let proxy_url = spawn_with_static_and_dynamic(vec![s], vec![]).await;
+    let client = reqwest::Client::new();
+
+    // 切到 disabled.
+    let resp = client
+        .patch(format!(
+            "{proxy_url}/api/providers/static-disabled/decision"
+        ))
+        .json(&serde_json::json!({"mode": "disabled"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // disabled 数组含该条目, 且 api_key masked (SEC: 响应文本不含明文).
+    let body: serde_json::Value = client
+        .get(format!("{proxy_url}/api/providers"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let arr = body.get("disabled").unwrap().as_array().unwrap();
+    assert_eq!(arr.len(), 1, "disabled 数组应含被禁条目: {body}");
+    assert_eq!(arr[0]["id"], "static-disabled");
+    let raw = body.to_string();
+    assert!(!raw.contains("sk-test-key"), "SEC: 明文 api_key 不得回传");
+
+    // decision 切回复活: 条目回到 effective (providers 数组), disabled 数组清空.
+    let resp = client
+        .patch(format!(
+            "{proxy_url}/api/providers/static-disabled/decision"
+        ))
+        .json(&serde_json::json!({"mode": "default"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = client
+        .get(format!("{proxy_url}/api/providers"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let arr = body.get("providers").unwrap().as_array().unwrap();
+    assert_eq!(arr.len(), 1, "切回 default 后条目应回归 effective: {body}");
+    assert_eq!(
+        body.get("disabled").unwrap().as_array().unwrap().len(),
+        0,
+        "disabled 数组应清空"
+    );
+}
+
+/// secrets 侧同构: disabled secret 经 disabled 数组返回 masked 视图, 可切回.
+#[tokio::test]
+async fn disabled_secret_listed_masked_and_recoverable() {
+    let proxy_url = spawn_with_secrets(vec![secret("s1", "super-secret-value")], vec![]).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .patch(format!("{proxy_url}/api/secrets/s1/decision"))
+        .json(&serde_json::json!({"mode": "disabled"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let body: serde_json::Value = client
+        .get(format!("{proxy_url}/api/secrets"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let arr = body.get("disabled").unwrap().as_array().unwrap();
+    assert_eq!(arr.len(), 1, "disabled 数组应含被禁 secret: {body}");
+    assert_eq!(arr[0]["id"], "s1");
+    let raw = body.to_string();
+    assert!(
+        !raw.contains("super-secret-value"),
+        "SEC: 明文 value 不得回传"
+    );
+
+    // 切回 prefer_static: 条目回归 effective (static-only id 的生效路径).
+    let resp = client
+        .patch(format!("{proxy_url}/api/secrets/s1/decision"))
+        .json(&serde_json::json!({"mode": "prefer_static"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = client
+        .get(format!("{proxy_url}/api/secrets"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let arr = body.get("secrets").unwrap().as_array().unwrap();
+    assert_eq!(arr.len(), 1, "切回后条目应回归 effective: {body}");
+    assert_eq!(arr[0]["source"], "static");
+    assert_eq!(body.get("disabled").unwrap().as_array().unwrap().len(), 0);
+}
+
 #[tokio::test]
 async fn decision_prefer_static_beats_dynamic_override() {
     let mut upstream_static = spawn_mock_upstream().await;

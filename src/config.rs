@@ -980,6 +980,40 @@ impl Decisions {
     }
 }
 
+/// 清理悬空 decision: 不在对应 static 层的 id (契约 CFG-6).
+///
+/// 背景: static config 删除/重命名某 id 后, state.toml 的 `[decisions]` 段仍残留该
+/// id 的 mode。若同 id 日后重新进入 static (临时下线再恢复是常见运维路径), 会
+/// **静默**继承旧 decision (如 disabled → 条目从 WebUI 消失且无任何提示)。
+/// 启动时调用本函数清除悬空条目, 保证 "decision 只作用于当前 static 层存在的 id"。
+///
+/// 纯函数 (不碰文件/锁): 持久化与 WARN 由调用方 (server.rs 装配层) 收口 —
+/// Decisions 跨 provider/secret 两子表, 只有装配层能同时看到两张表的 static ids。
+///
+/// 返回被清理的 `("provider"|"secret", id)` 列表; 空列表 = 无悬空 (调用方免写盘)。
+pub fn prune_dangling_decisions(
+    d: &mut Decisions,
+    static_provider_ids: &std::collections::HashSet<String>,
+    static_secret_ids: &std::collections::HashSet<String>,
+) -> Vec<(&'static str, String)> {
+    let mut pruned = Vec::new();
+    d.providers.retain(|id, _| {
+        let keep = static_provider_ids.contains(id);
+        if !keep {
+            pruned.push(("provider", id.clone()));
+        }
+        keep
+    });
+    d.secrets.retain(|id, _| {
+        let keep = static_secret_ids.contains(id);
+        if !keep {
+            pruned.push(("secret", id.clone()));
+        }
+        keep
+    });
+    pruned
+}
+
 // ─── atomic_write 共用工具 ─────────────────────────────────────────────────
 
 /// 原子写文件: 先写带 UUID 的 `.tmp`, sync, 再 rename.
@@ -2421,6 +2455,26 @@ mod table_tests {
         assert_eq!(ids, vec!["b".to_string()]);
     }
 
+    // ─── prune_dangling_decisions (CFG-6) ────────────────────────────────
+    // 主 property (悬空清除 + 存活保留的全组合覆盖) 在下方 proptests::
+    // prop_prune_dangling_decisions; 此处保留排查事件的场景回归叙事.
+
+    fn ids(v: &[&str]) -> std::collections::HashSet<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn prune_disabled_secret_id_revive_no_longer_shadowed() {
+        // 排查场景回归 (2026-09-13): static 删除 id → state 残留 disabled → 同 id
+        // 重新进入 static 后被静默禁用. prune 后复活条目不受残留 decision 影响.
+        let mut d = Decisions::default();
+        d.set_secret("x", OverrideMode::Disabled);
+        let pruned = prune_dangling_decisions(&mut d, &ids(&[]), &ids(&[]));
+        assert_eq!(pruned, vec![("secret", "x".to_string())]);
+        // 同 id 复活后 decision 查询回退 Default (未被残留条目遮蔽).
+        assert_eq!(d.secret("x"), OverrideMode::Default);
+    }
+
     #[test]
     fn get_effective_falls_back_to_static() {
         let t = SecretTable::new(
@@ -3420,6 +3474,77 @@ mod proptests {
                 reloaded.decisions.provider("p-static"), pm,
                 "persisted provider decision must survive"
             );
+        }
+    }
+
+    // ─── CFG-6: 悬空 decision prune ─────────────────────────────────────────
+    //
+    // 契约: decision 仅作用于当前 static 层存在的 id. 参数化 (id 池 × 存活子集 ×
+    // per-id mode × 子表归属; id 允许重复但不被 oracle 依赖 — 快照推导对任意
+    // 终态 map 成立), 锁住 "悬空条目恰被清除 + 存活条目 mode 不变" 全组合.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        /// CFG-6: prune 清除全部悬空 decision (不在 static 层的 id), 保留全部存活
+        /// id 的 decision (mode 与子表归属都不变).
+        ///
+        /// Oracle 是 **prune 前快照** (`d.clone()`) 的直接推导 — 恰删除快照中不在
+        /// static 集合的 key、其余原样保留 — 不复述 `set_*` 的写入语义 (Default→remove
+        /// 等由专项单测覆盖), 对 CFG-6 的验证更聚焦且不易随实现漂移.
+        #[test]
+        fn prop_prune_dangling_decisions(
+            // 每项 = (id, 是否在 static, 哪个子表, mode). id 池允许重复.
+            spec in prop::collection::vec(
+                ("[a-z][a-z0-9]{0,3}", any::<bool>(), any::<bool>(), 0u8..3), 1..6),
+        ) {
+            let spec: Vec<(String, bool, bool, OverrideMode)> = spec
+                .into_iter().map(|(id, alive, is_provider, m)| (id, alive, is_provider, mode_of(m)))
+                .collect();
+            // static id 集合按子表分流.
+            let mut static_p = std::collections::HashSet::new();
+            let mut static_s = std::collections::HashSet::new();
+            for (id, alive, is_provider, _) in &spec {
+                if *alive {
+                    (if *is_provider { &mut static_p } else { &mut static_s }).insert(id.clone());
+                }
+            }
+            // 被测输入: 逐条走真实写入路径 (set_* 与 WebUI PATCH decision 同路径).
+            let mut d = Decisions::default();
+            for (id, _, is_provider, mode) in &spec {
+                if *is_provider { d.set_provider(id, *mode); } else { d.set_secret(id, *mode); }
+            }
+            let before = d.clone();
+            let in_static = |is_provider: bool, id: &String| {
+                if is_provider { static_p.contains(id) } else { static_s.contains(id) }
+            };
+
+            // 期望 (kind, id) 序: 快照 providers/secrets 两 map 中不在对应 static 集合的 key.
+            let mut expect_pruned: Vec<(&'static str, String)> =
+                before.providers.iter().filter(|(id, _)| !in_static(true, id))
+                    .map(|(id, _)| ("provider", id.clone()))
+                    .chain(before.secrets.iter().filter(|(id, _)| !in_static(false, id))
+                        .map(|(id, _)| ("secret", id.clone())))
+                    .collect();
+            expect_pruned.sort();
+
+            let mut got = prune_dangling_decisions(&mut d, &static_p, &static_s);
+            got.sort();
+            prop_assert_eq!(got, expect_pruned.clone(), "pruned set must be exactly the dangling decisions");
+
+            // 存活 id (快照条目且在 static 集合) 的 decision 原样保留; 悬空条目
+            // 查询回退 Default. 两个子表各走各的 getter.
+            for (id, mode) in before.providers.iter() {
+                if !in_static(true, id) { continue; }
+                prop_assert_eq!(d.provider(id), *mode, "live provider decision must survive prune, id={}", id);
+            }
+            for (id, mode) in before.secrets.iter() {
+                if !in_static(false, id) { continue; }
+                prop_assert_eq!(d.secret(id), *mode, "live secret decision must survive prune, id={}", id);
+            }
+            for (kind, id) in &expect_pruned {
+                let actual = if *kind == "provider" { d.provider(id) } else { d.secret(id) };
+                prop_assert_eq!(actual, OverrideMode::Default, "dangling decision must be gone, id={}", id);
+            }
         }
     }
 

@@ -282,7 +282,7 @@ pub async fn serve(
     records_capacity: usize,
     static_providers: Vec<Provider>,
     static_secrets: Vec<SecretEntry>,
-    dyn_state: crate::config::DynamicState,
+    mut dyn_state: crate::config::DynamicState,
     state_path: PathBuf,
     config_path: PathBuf,
     auth_config: AuthConfig,
@@ -298,6 +298,42 @@ pub async fn serve(
 
     // 跨表共享: persist_lock 串行整个 RMW, decisions 是同一份 mutable map.
     let persist_lock = Arc::new(Mutex::new(()));
+
+    // 悬空 decision prune (CFG-6): 清除 state.toml 中指向已不存在 static id 的
+    // decision 条目, 防 "static id 复活后静默继承旧 decision" (如 disabled →
+    // WebUI 条目消失无提示)。必须在 decisions 装入 Arc 前做 (此后只读语义)。
+    let provider_ids: std::collections::HashSet<String> =
+        static_providers.iter().map(|p| p.id.clone()).collect();
+    let secret_ids: std::collections::HashSet<String> =
+        static_secrets.iter().map(|s| s.id.clone()).collect();
+    let pruned = crate::config::prune_dangling_decisions(
+        &mut dyn_state.decisions,
+        &provider_ids,
+        &secret_ids,
+    );
+    if !pruned.is_empty() {
+        for (kind, id) in &pruned {
+            tracing::warn!(
+                kind = kind,
+                id = %id,
+                "pruned dangling decision (static id no longer exists)"
+            );
+        }
+        // 启动期单线程 (表未构造, 无并发写), 整文件重写不走 persist_lock。
+        // 失败仅 WARN 不阻塞启动: 内存 decisions 已清理, 本次运行正确;
+        // 磁盘残留下次启动会被再次 prune (state.toml 本就"永远可丢弃重置")。
+        match dyn_state
+            .to_toml()
+            .and_then(|text| crate::config::atomic_write(&state_path, &text))
+        {
+            Ok(()) => {}
+            Err(e) => tracing::warn!(
+                error = ?e,
+                "state.toml rewrite after decision prune failed; dangling entries persist on disk"
+            ),
+        }
+    }
+
     let decisions = Arc::new(RwLock::new(dyn_state.decisions));
 
     let secret_table = SecretTable::with_persist_lock(
