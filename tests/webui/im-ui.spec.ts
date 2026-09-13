@@ -2159,7 +2159,7 @@ test.describe("WebUI 打磨 (#161 + #164)", () => {
       "default"
     );
 
-    // 再测确认路径: confirm accept → PATCH 生效 (列表中该项消失 = disabled 语义).
+    // 再测确认路径: confirm accept → PATCH 生效 (条目转灰显 disabled 行, 2e2a921).
     let sawConfirm = false;
     const confirmHandler = async (d: import("@playwright/test").Dialog) => {
       sawConfirm = true;
@@ -2170,10 +2170,15 @@ test.describe("WebUI 打磨 (#161 + #164)", () => {
     await page.locator('select.decision-select[data-id="test-key"]').selectOption("disabled");
     await page.waitForTimeout(600);
     expect(sawConfirm).toBe(true);
-    // disabled 后 secret 从 effective 列表消失 (表格不再渲染该行).
+    // disabled 后条目不再从表格消失 — 2e2a921 起 disabled static 条目保留灰显行
+    // (decision 下拉恒 disabled, 可切回 default/prefer_static 复活, 见
+    // renderDisabledSecretRow); 断言改为: 行灰显 + 下拉值 = disabled.
     await expect(
       page.locator('select.decision-select[data-id="test-key"]')
-    ).toHaveCount(0);
+    ).toHaveValue("disabled");
+    await expect(
+      page.locator('tr.row-disabled[data-id="test-key"]')
+    ).toBeVisible();
     // 还原由 afterEach 幂等执行 (断言失败中断时也能恢复).
   });
 
