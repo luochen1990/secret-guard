@@ -97,6 +97,7 @@
 > 数据流契约声明 "域 A (转发链) → 域 B (派生链) → 域 C (渲染层)" 单向承诺.
 > 本图是其实施层 (#145): 新增 `use crate::...` 前对照此图判断 "新依赖是否扩大偏离" —
 > 只允许**向下**依赖 (指向更低层), 反向 / 新横向依赖需先改图并在 PR 中说明理由.
+> 图只画主干; 完整例外边以下方 "已接受的例外" 清单为准.
 
 ```text
                     ┌──────────── 基础层 (零 / 极低业务依赖) ──────────┐
@@ -110,9 +111,9 @@
    │ config   │   │ codec      │◄──│ redact    │   │ dag        │◄──│ derive    │
    │ (双层配置)│   │ (IR+R/W)  │   │ (改写)    │   │ (内容寻址) │   │ (字节派生)│
    └────┬─────┘   └────┬───────┘   └────┬──────┘   └────┬───────┘   └───────────┘
-        ▲              ▲                │               │ ▲
+        ▲              │                │               │ ▲
         │              │                └───────┬───────┘ │
-   ┌────┴──────────────┴────────────────────┐   │  ┌──────┴──────────┐
+   ┌────┴──────────────▼────────────────────┐   │  ┌──────┴──────────┐
    │ mock / provider / secrets (实体+表)    │   │  │ record (DTO)    │
    └────┬───────────────────────────────────┘   │  └──────┬──────────┘
         ▲         ▲                            │         │
@@ -128,22 +129,35 @@
   接口倒置消费 restore 能力, 生产实现 `redact::StreamingRestorerSet` 由 proxy 注入
   (codec 的 fwd_* property 测试仍 import redact — 测试代码不受此约束).
 - **dto / record 是中立 wire shape 层**: dag 构造之, web 序列化之, 两者互不依赖
-  (dag 不再触达 web 命名空间, #95 残留落点已纠正). 注: dto → dag 仅引用
-  `SessionId` (newtype 标识类型), 视作可接受的纯类型依赖.
+  (dag 不再触达 web 命名空间, #95 残留落点已纠正). 注: dto → {dag, codec::ir}
+  仅纯类型 (前者 `SessionId` newtype 标识, 后者 `IrRole`/`IrUsage`), 视作可接受的
+  纯类型依赖.
 - **state (AppState) 是进程级共享状态**: proxy / web / auth 各自单向依赖之,
   彼此之间除 "web → auth (挂载 guard)" 外无横向依赖 (原 ProxyState 落在 proxy 内).
 - **已接受的例外** (有 rationale, 勿扩大): redact → secrets (探测 secret 需读 entry);
-  dag → codec::ir (IrBlock 是内容寻址单元, 纯类型依赖); proxy → redact (转发即改写,
+  redact → config (仅 `OnProbeExhausted` 枚举 — `[redact] on_probe_exhausted` 的
+  消费点, 纯数据枚举); dag → codec (IrBlock 是内容寻址单元, 纯类型依赖; 另
+  dag/types 的 `ingress_protocol` 字段引用 codec::Protocol 枚举, 同性质); codec →
+  provider (仅 Protocol 枚举做 from_native 映射, 纯类型依赖; 长期归宿: 若
+  codec/provider 拆 crate, Protocol 全局枚举应下沉基础层, 桥接函数自然消失);
+  proxy → redact (转发即改写,
   同属域 A); web/api → auth::apikey (API key CRUD 无条件挂载, "只认证不隔离");
-  config → auth (AuthConfig/ApiKeyEntry 是配置 schema 的一部分, 纯数据依赖);
+  config → {auth, provider, secrets} (AuthConfig/ApiKeyEntry 与 Provider/SecretEntry
+  均是配置 schema 的组成部分 — static 加载期组合 + validate 钩子调用, 纯数据依赖;
+  provider/secrets 同 auth 型, 走查补登记);
   mock ↔ secrets 对称引用 (SecretEntry 持 MockStrategy, mock 校验钩子被 SecretEntry
-  调用, 纯数据/校验层, 无业务行为); state → proxy::ModelListCache (#196: AppState
+  调用, 纯数据/校验层, 无业务行为); provider → secrets (仅 validate_id/mask_value
+  两个校验/脱敏工具函数复用, 纯函数借用, 无实体耦合); state → proxy::ModelListCache
+  (#196: AppState
   聚合 router /models 的上游清单缓存, 纯数据 store 无 proxy 行为依赖, 组合根先例同
   state → auth 的 ApiKeyStore — 见 `src/state.rs` 字段注释) + state → usage
   (usage-stats: AppState 聚合 UsageStore / PricingCache 两个纯数据 store, 同一先例;
-  usage 模块自身仅依赖 codec::ir / secrets / dag::RoundKind 纯类型 / config schema
-  纯数据类型, 见 `src/usage/` 头部 — usage→config 是向下合法边, 非例外, 性质同
-  provider→config; usage→dag 仅引用 RoundKind 枚举, 同 dto→dag 的纯类型依赖先例)
+  usage 模块未画入图 (聚合根旁的纯数据+派生层, 主干外), 图外另有 web/api/usage.rs →
+  usage (GET /api/usage/summary 直读 UsageStore 聚合 + summary 纯函数派生, 域 B
+  派生链消费). usage 模块自身仅依赖 codec::ir / secrets / dag::RoundKind 纯类型 /
+  config schema 纯数据类型, 见 `src/usage/` 头部 — usage→config 是向下合法边,
+  非例外, 性质同 provider→config; usage→dag 仅引用 RoundKind 枚举, 同 dto→dag 的
+  纯类型依赖先例)
   + proxy → auth::AuthenticatedTenant (v4b redact 审计归因: proxy 从 request
   extension 提取 API key label 注入 usage 采集, 纯类型依赖, 性质同 config→auth
   的 AuthConfig 纯数据边, 无 auth 行为依赖).
@@ -278,7 +292,7 @@ URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标
 | `/api/*` | Web UI JSON API (未匹配子路径 404, 绝不进 forward) |
 | `/login`, `/oauth2/callback`, `/logout` | OIDC 认证 (auth 启用时) |
 | `/{o\|a\|g\|l\|r}/{name}` | forward, rest = "/" |
-| `/{o\|a\|g\|l\|r}/{name}/{*rest}` | forward, rest 含前导 `/` |
+| `/{o\|a\|g\|l\|r}/{name}/{*rest}` | forward, rest 为子路径 ({*rest} 捕获不含前导 `/`, 消费方容错处理, 见 `ForwardPath` 注释) |
 | 其他 | 404 (不再 catch-all 透传) |
 
 `proto_short` 简写映射的 SSOT 是 `Protocol::ALL` (协议家族清单见术语表 Protocol 行),
@@ -313,7 +327,7 @@ TTL 300s + serve-stale-on-error + single-flight; exact-only router 零上游请�
 | 模块 | 职责 (一句话) | 详尽契约位置 |
 |---|---|---|
 | `main.rs` / `cli.rs` / `lib.rs` | 二进制入口 + CLI 参数 schema | 文件头部 `//!` |
-| `auth/` | OIDC 登录 (WebUI) + 本地 API key (SDK 转发) + session | `auth/mod.rs` 头部 `//!` |
+| `auth/` (模块目录: mod/oidc/handlers/session/apikey/middleware) | OIDC 登录 (WebUI) + 本地 API key (SDK 转发) + session | `auth/mod.rs` 头部 `//!` |
 | `config.rs` | 双层配置 schema + `DynamicTable<T>` 泛型 + 持久化 + 静态配置预检审计 (未知 section/字段 → 启动 WARN, #159) | 文件头部 `//!` (覆盖 OverrideMode / CRUD / Effective source / 跨表并发) |
 | `provider.rs` | Provider sum type (Direct 直连 \| Router 路由, #187) + Route (model_pattern 通配 / priority / 路由级 upstream_model 重写) + Effective view + api_key 两来源 + `resolve_route` 路由链解析 (per-request 按请求 model, model 重写 pipeline, #179 多规则化) | 文件头部 `//!` |
 | `secrets.rs` | SecretEntry 实体 + Effective view + value 两来源 | 文件头部 `//!` |
@@ -623,7 +637,10 @@ configFile (escape hatch, 互斥). 凭据注入 (LoadCredential / sops 直接路
 批量注入方案见 **`docs/deployment-nixos.md`**.
 
 - toml 渲染 SSOT: `nix/render.nix` (纯函数, 与 src serde schema 的同步契约见其文件头,
-  契约测试 `nix/tests/render.nix` 锁定); 模块接线冒烟 `nix/tests/module-eval.nix`.
+  契约测试 `nix/tests/render.nix` 锁定); 模块接线冒烟 `nix/tests/module-eval.nix`
+  (build 期经 `nix/tests/assert-toml.py` 用 python tomllib 对生成的 configFile 做
+  TOML 语法 + 结构 round-trip 断言, 与 render.nix 的 eval 期断言互补, 共同锁定
+  "模块选项 → configFile 生成" 链路).
   两者经 `just nix-check` 接入验证链 (挂在 `just check` 链尾, recipe 内探测
   nix-daemon — CI runner 架构禁止 nix 求值故自动跳过, serde 漂移门禁由本地纪律承担)
   — src serde schema 变更时本地先红.
@@ -750,24 +767,23 @@ configFile (escape hatch, 互斥). 凭据注入 (LoadCredential / sops 直接路
   单用户本地工具的可接受假设, 与 #157 的 update TOCTOU 声明同型). 漏网环到首个
   请求才以 503 暴露 (不挂起, 安全但可观测性弱). 启动时对 merged 视图做环检查是
   可选加固.
-- **auth 模块测试覆盖率 (OIDC 登录流程)**: auth 模块的纯逻辑已覆盖
-  (`apikey.rs` 100% / `middleware.rs` ~99% / `session.rs` ~98% / `mod.rs` ~99%), 含
-  require_api_key 的 Authorization 剥离断言 (SEC 红线) 与 build_session_layer 的
-  cookie 配置 (sg.sid + HttpOnly).
-  OIDC 流程的集成测试 (`tests/auth_oidc.rs`) 已通过本地 mock IdP server 覆盖
-  (起 axum server 模拟 discovery + token + jwks + RS256 签 id_token, 支持密钥轮换
-  与 discovery 故障注入), 覆盖率:
-  - `oidc.rs` ~90%: `OidcBackend::discover` (含 issuer 字符串校验 / JWKS 拉取) /
+- **auth 模块测试覆盖率 (OIDC 登录流程)**: auth 模块纯逻辑 (apikey / middleware /
+  session / mod) 高覆盖, 含 require_api_key 的 Authorization 剥离断言 (SEC 红线) 与
+  build_session_layer 的 cookie 配置 (sg.sid + HttpOnly). OIDC 集成测试
+  (`tests/auth_oidc.rs`) 已通过本地 mock IdP server 覆盖 (起 axum server 模拟
+  discovery + token + jwks + RS256 签 id_token, 支持密钥轮换与 discovery 故障注入):
+  - `oidc.rs`: `OidcBackend::discover` (含 issuer 字符串校验 / JWKS 拉取) /
     `exchange_and_verify` happy + 5 个错误路径 (CSRF mismatch / token HTTP 4xx /
     NoIdToken / WrongSignature / WrongNonce) / `authorize_url` PKCE verifier round-trip /
     **JWKS 轮换恢复** (SEC-AUTH-3, #198: 轮换后无需重启登录成功 + 刷新失败返回
     原始错误且 IdP 恢复后自愈; 重验仍失败不放行坏签名由 WrongSignature 兼守).
-  - `handlers.rs` ~64%: `login_start` (重定向 + session 写入 + sanitize_next_url) /
+  - `handlers.rs`: `login_start` (重定向 + session 写入 + sanitize_next_url) /
     `oauth_callback` 错误路径 (IdP error 参数 / 缺 session 凭证) / `logout` / `me`.
-  **仍未覆盖** (~36% handlers + ~10% oidc 残留): `oauth_callback` happy path 的
+  **仍未覆盖**: `oauth_callback` happy path 的
   PKCE verifier + nonce 完整端到端 round-trip — nonce 是 client-only 凭证存 server-side
   session, 外部 HTTP 测试无法读取; 这部分核心逻辑由 `exchange_and_verify_happy` 间接
   覆盖, 完整端到端需 mocking AuthSession (axum-login extractor), 留作后续工作.
+  (精确百分比是 `just coverage-html` 实时产物的职责, 此处不维护快照数字.)
 
 ## 后续工作 (非 MVP 范围)
 

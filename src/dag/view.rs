@@ -17,6 +17,13 @@
 //! `node_view` / `session_view` 是 free function 形态 (接收 `&DagInner`), 避免在
 //! `list_page` / `list_sessions` / `sync_snapshot` 路径重复 `self.inner.read()`.
 //! 公开的 `get_node` / `get_response` / `get_node_detail` 是 thin wrapper (各自上一次读锁).
+//!
+//! # SEC 约束 (full_request_messages)
+//!
+//! `full_request_messages` 是**内存明文存量面** (BlockPool 持有 redact 前的真实
+//! 内容, 含历史真实 secret), **禁止**直接出 web 层 — redact_map 是 per-request
+//! 不持久化的, restart 后无从 lazy apply, 直出即泄露真实 secret (SEC-1).
+//! 详见该方法的红线注记.
 
 use std::sync::Arc;
 
@@ -182,6 +189,11 @@ impl ConversationDag {
     ///
     /// **不 apply redact**: 返回的是 OriginRecord (真实内容).
     /// 调用方需要 SecureRecord 时, 自行 derive redactMap 并 apply.
+    ///
+    /// **红线 (内存明文存量面, SEC-1)**: 本方法返回 redact 前真实内容 (BlockPool
+    /// 持有历史真实 secret), **禁止**直接出 web 层 —— redact_map 是 per-request
+    /// 不持久化的, restart 后无从 lazy apply, 直出即泄露真实 secret. 当前调用方
+    /// 仅限测试; 任何新调用点必须先过 SEC 评审.
     pub fn full_request_messages(&self, node_id: Uuid) -> Option<Vec<IrMessage>> {
         let g = self.inner.read();
         let msg_refs = self.collect_req_delta_refs(&g, node_id)?;

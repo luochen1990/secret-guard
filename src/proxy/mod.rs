@@ -61,7 +61,8 @@
 //! 按职责拆分为模块目录:
 //! - `mod` (本文件): 入口 + dispatch + 共享常量.
 //!   (进程级共享状态 `AppState` 在顶层 `crate::state`, 上移见 #145 偏差 3.)
-//! - `helpers`: HTTP header / URL / 字符串工具 (无业务语义).
+//! - `helpers`: HTTP header / URL / 字符串工具 + 转发链轻量语义判定点
+//!   (stream 档位 / 请求 model 提取 / usage 采集编排, 详见该文件头部).
 //! - `auth`: Provider 鉴权注入.
 //! - `models`: router GET /models 本地合成 + 上游清单缓存 (#196, FWD-7; 含
 //!   `ModelListCache` — AppState 聚合的纯数据 store, 经本模块根 re-export).

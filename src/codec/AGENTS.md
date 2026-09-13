@@ -5,7 +5,8 @@
 
 ## 职责
 
-在 OpenAI Chat Completions 与 Anthropic Messages 之间双向翻译, 借鉴 Busbar
+现含 OpenAI Chat Completions / Anthropic Messages / OpenAI Responses 三协议
+(覆盖范围以支持矩阵为准), 在协议间双向翻译, 借鉴 Busbar
 (`GetBusbar/busbar`, Apache-2.0) 的 superset IR + Reader/Writer trait 设计,
 大幅精简以匹配 secret-guard 的 MVP 范围.
 

@@ -27,7 +27,8 @@
 //! `/api/providers` 等) 的错误类型, 用 `struct { status, message }` 形态 (手动映射
 //! 状态码, message 原样回客户端, 因为 CRUD 错误是用户可读的校验/冲突消息). 两者形态与
 //! 信息泄露策略都不同, 故不合并:
-//! - `AppError`: 转发/鉴权, message 按变体选择性回传 (Upstream/Internal 不回传).
+//! - `AppError`: 转发/鉴权, message 按变体选择性回传 (Upstream/UpstreamTimeout
+//!   构造点净化后回传, 见上方例外条款; BadBody/Unauthorized/Internal 不回传).
 //! - `ApiError`: CRUD, message 总是回传 (用户可操作的错误描述).
 
 use axum::{

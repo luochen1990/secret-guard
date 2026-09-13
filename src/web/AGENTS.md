@@ -1,6 +1,6 @@
 # web 模块 — JSON API + 单页 WebUI 契约
 
-> 本文件是 `src/web/` 目录的导航与契约汇总. 源文件 (`api.rs` / `mod.rs`) 头部有更细节的注释.
+> 本文件是 `src/web/` 目录的导航与契约汇总. 源文件 (`mod.rs` / `api/` 目录下各子模块) 头部有更细节的注释.
 > 项目级原则 (鲁棒性、视图正确性、前端不变量 I1/I2/I3、术语) 见根目录 `AGENTS.md`.
 
 ## 职责
@@ -14,6 +14,8 @@
   - `sessions.rs` — `GET /sessions` + `GET /sessions/{sid}/timeline` + `POST /sync` (session-aware timeline API).
   - `secrets.rs` / `providers.rs` — 各自 CRUD (5 endpoints), handler 是 crud.rs 泛型流程的薄壳.
   - `apikeys.rs` — API key CRUD (4 endpoints, 无条件挂载, "只认证, 不隔离").
+  - `usage.rs` — `GET /usage/summary` 用量汇总查询 (usage-stats §8; 直读 UsageStore
+    SQL 聚合, 派生走 `usage::summary::build_summary` 纯函数).
 - `dto.rs` (已移至顶层 `src/dto.rs`): WebUI 响应序列化 DTO (SessionView / NodeView / RoundBrief / TimelineRound / TimelineTail / TimelinePage / TimelineDiffData / SyncSnapshot). 构造逻辑留 dag 模块 (持读锁访问私有字段). 中立化理由见 `src/dto.rs` 头部 (dag 域 B 不再反向依赖 web 域 C).
 - `index.html`: 单页 UI (IM 风格: 会话折叠 sidebar + timeline 对话流, 内嵌 CSS + vanilla JS, 零外部依赖).
 

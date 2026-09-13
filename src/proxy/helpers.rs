@@ -1,10 +1,15 @@
-//! HTTP header / URL / 字符串处理工具 (转发链共享, 无业务语义).
+//! HTTP header / URL / 字符串处理工具 + 转发链共享的轻量语义判定点.
 //!
 //! # 职责边界
 //!
-//! 纯函数工具集: hop-by-hop header 过滤、上游 URL 拼接、content-type 流式判定、
-//! 字节→字符串的 lossy 投影、敏感 header 脱敏. 这些函数无状态、无副作用,
-//! 被 same_proto / cross_proto / fan_out 等转发子模块共用.
+//! 两类内容, 均无状态、无副作用, 被 same_proto / cross_proto / fan_out 等转发
+//! 子模块共用:
+//! - 纯工具: hop-by-hop header 过滤、上游 URL 拼接、content-type 流式判定、
+//!   字节→字符串的 lossy 投影、敏感 header 脱敏 (SEC-4).
+//! - 转发链语义判定/编排点 (字节级 body 顶层字段扫描, 不建 IR): `requests_stream`
+//!   (FWD-4 流式档位判定)、`request_model` (路由规则匹配输入)、
+//!   `usage_ctx_and_record_redactions` + `auth_label` (USAGE-7 采集上下文构造 +
+//!   redact 审计落账, 三转发路径共享的 SSOT 接线).
 //!
 //! # 归属判断
 //!
