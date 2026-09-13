@@ -68,7 +68,7 @@
 | `CDAG-*` | Conversation DAG (域 B) | INV-1→CDAG-1, INV-2→CDAG-2, INV-3→CDAG-3, INV-4→CDAG-4, INV-5→CDAG-5 | `src/dag/mod.rs` 头部 + `docs/design/conversation-dag.md` |
 | `DTO-*` | WebUI DTO 派生 (域 B) | (新增) | `src/web/AGENTS.md` + `src/record.rs` 头部 |
 | `CFG-*` | 双层配置 (域 B) | (新增) | `src/config.rs` 头部 |
-| `SEC-*` | 安全姿态 (跨域) | (新增) | `src/web/AGENTS.md` + `src/secrets.rs` + `src/provider.rs` |
+| `SEC-*` | 安全姿态 (跨域) | (新增) | `src/web/AGENTS.md` + `src/secrets.rs` + `src/provider.rs` + `src/server_host_guard.rs` (SEC-7) + `src/util.rs` (SEC-8) |
 | `ROB-*` | 鲁棒性 (跨域) | (新增) | 根 `AGENTS.md` "鲁棒性原则" |
 | `VIEW-*` | 视图正确性机制 (跨域) | (新增) | 根 `AGENTS.md` "视图正确性确保机制" |
 | `UI-*` | WebUI 渲染 (域 C) | I1→UI-1, I2→UI-2, I3→UI-3, I4→UI-6 (selectedRound 子属性), I5→UI-6 | 根 `AGENTS.md` "前端不变量" |
@@ -735,6 +735,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 **Properties**:
 - `prop_assert_messages_no_secret`: assert/panic 消息中不含 secret.value (即使用于诊断). ✅ (consistency-check feature gate, CI `just check-features` 执行)
 - `prop_log_messages_no_secret`: tracing log 不输出 secret.value. ✅
+- `prop_trace_span_no_query_string`: HTTP trace span 只记 path 不记 query — query 可能携带 key/token 类敏感参数 (SEC-C4a, 2026-09 扩展边界). 🔁→`trace_span_no_query_string` + `trace_span_omits_query_string` (`src/server.rs` / `tests/integration.rs`)
 
 ### SEC-4 headers 脱敏
 
@@ -762,6 +763,44 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 **Properties**:
 - `prop_default_host_localhost`: 默认 host=127.0.0.1. ✅
 - `prop_internal_url_404_no_forward`: `/api/unknown` → 404, 不发送到上游. 🔁→`web_namespace_not_forwarded_to_upstream` + `unmatched_path_returns_404` (`tests/integration.rs`)
+
+### SEC-7 Host 白名单 + Origin/Sec-Fetch-Site 校验 (防 DNS rebinding)
+
+**陈述**: server 层最外层 middleware 对所有请求校验 Host 白名单 (防 DNS rebinding
+— 单用户模式下 "同源策略兜底" 的假设被 rebinding 击穿); 对 `/api/*` 非安全方法
+校验 Origin / Sec-Fetch-Site (CSRF 纵深). 白名单语义 SSOT 见
+`src/server_host_guard.rs` 头部: 显式 port 必须匹配; 域名 Host 一律拒绝;
+loopback IP 字面量 / 配置 host / `localhost` / 空 host 放行; 配置 host 非
+loopback 时任意 IP 字面量放行.
+
+**Properties**:
+- `prop_host_whitelist_rejects_domain_host`: 域名形式 Host (rebinding 载体) 对任意路由 (`/`, `/api/*`) 返回 403; port 不匹配 / 畸形 Host 同样 403. 🔁→`host_guard_rejects_domain_host_on_all_routes` (`tests/integration.rs`) + `loopback_config_rejects_domain_and_foreign_ip` (`src/server_host_guard.rs`)
+- `prop_host_whitelist_allows_loopback`: loopback IP / localhost / 配置 host / 空 host (port 匹配) 放行; 配置 host 非 loopback (0.0.0.0 / LAN IP) 时任意 IP 字面量放行、域名仍拒. 🔁→`host_guard_allows_loopback_host` + `non_loopback_config_allows_any_ip_literal` + `portless_host_only_allowed_on_default_port`
+- `prop_api_write_requires_browser_same_origin`: 非安全方法的 `/api/*` 请求带恶意 Origin / `Origin: null` / `Sec-Fetch-Site: cross-site` → 403; 两 header 缺席 (SDK 场景) 或同源值 (same-origin / same-site / none) 放行; GET 豁免. 🔁→`api_post_rejects_cross_origin` + `api_post_allows_missing_or_same_origin_headers` (`tests/integration.rs`)
+
+### SEC-8 敏感落盘文件 owner-only (0600)
+
+**陈述**: state 目录内的敏感工件 (state.toml 明文 secret/api_key, #157;
+usage.sqlite3 redact 审计 **及其 `-wal`/`-shm` 侧车**; pricing.json) 在 unix 下权限
+owner-only (0600): 新建即 0600 (`util::create_owner_only` / 写后收紧), 启动加载时
+对旧版本残留文件 best-effort chmod 收紧 (失败 WARN 不阻塞; 设备文件跳过).
+sqlite 侧车在首个写事务时才创建 (open 处收紧追不上), 由 writer 线程在每批
+落库后收紧 (`tighten_wal_sidecars`, 幂等). 非 unix 平台无 POSIX mode, no-op.
+
+**Properties**:
+- `prop_state_file_owner_only`: `atomic_write` 写出的文件 mode & 0o777 == 0o600 (rename 重写后不回退); 0644 残留在 `load_or_empty` 时被收紧. 🔁→`atomic_write_creates_owner_only_mode` + `load_or_empty_tightens_loose_permissions` (`src/config.rs`)
+- `prop_usage_sqlite_owner_only`: `open_file_db` 创建/打开的 usage 库文件 0600 (含新建即收紧); `-wal`/`-shm` 侧车在首批写入后 0600. 🔁→`open_file_db_creates_owner_only_mode` + `wal_sidecars_tightened_after_first_write` (`src/usage/store.rs`)
+- `prop_pricing_cache_owner_only`: `write_disk` 落盘的 pricing 缓存 0600. 🔁→`write_disk_owner_only_mode` (`src/usage/pricing.rs`)
+
+### SEC-9 API/WebUI 响应携带 nosniff
+
+**陈述**: 所有 WebUI / JSON API / auth 响应带 `x-content-type-options: nosniff`
+(`crate::state::NO_STORE` header 组成员, SEC-S1) — 阻止浏览器 MIME sniffing, 对
+`escapeHtml` 纪律的纵深兜底。转发链响应**不带** — FWD-1 byte-exact 禁止网关向上游
+响应追加 header, 由 fwd_* property 族隐式守卫。
+
+**Properties**:
+- `prop_response_nosniff_header`: `/` (HTML) / `/api/*` (JSON) / `/api/*` 404 兜底响应均含 `x-content-type-options: nosniff`. 🔁→`webui_and_api_responses_carry_nosniff` (`tests/integration.rs`)
 
 ---
 

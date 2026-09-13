@@ -201,6 +201,9 @@ impl UsageStore {
         if n_expired > 0 {
             info!(path = %db_path.display(), n_expired, "usage sqlite: expired rows deleted (retention)");
         }
+        // SEC-8: init_schema / retention DELETE 在 writer 线程存在之前就可能写库,
+        // 按 umask 创建 0644 侧车 — 此处先收紧一次 (writer 线程随后每批再兜底).
+        tighten_wal_sidecars(db_path);
         info!(path = %db_path.display(), "usage stats store ready");
         let conn = Arc::new(Mutex::new(conn));
         // writer 线程 spawn 失败 (资源耗尽): WARN + 降级同步直写模式
@@ -212,7 +215,8 @@ impl UsageStore {
             .spawn({
                 let conn = Arc::clone(&conn);
                 let dropped = Arc::clone(&dropped);
-                move || writer_loop(conn, rx, dropped)
+                let db_path = db_path.to_path_buf();
+                move || writer_loop(conn, rx, dropped, db_path)
             }) {
             Ok(_) => Some(tx),
             Err(e) => {
@@ -449,16 +453,41 @@ impl UsageStore {
 // ─── 内部: schema / insert / writer ────────────────────────────────────────
 
 /// 打开文件库: WAL + busy_timeout + synchronous=NORMAL (本地单进程的常规平衡).
+///
+/// SEC-8: 库文件 (含 redact 审计: secret_id / mock / api_key_label) 打开后
+/// best-effort 收紧到 0600 — 覆盖新建 (sqlite 默认按 umask 0644) 与旧版本残留
+/// 两种形态. `-wal` / `-shm` 侧车不在此处收紧 (它们在**首个写事务**时才创建,
+/// 见 `tighten_wal_sidecars`).
 fn open_file_db(path: &Path) -> rusqlite::Result<Connection> {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     let conn = Connection::open(path)?;
+    crate::util::tighten_file_permissions(path);
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.busy_timeout(Duration::from_millis(5000))?;
     init_schema(&conn);
     Ok(conn)
+}
+
+/// SEC-8: 收紧 `-wal` / `-shm` 侧车权限 (owner-only).
+///
+/// 侧车由 sqlite 在**首个写事务**时按 umask 创建 (典型 0644 — `open_file_db`
+/// 的收紧点追不上), 且 `-wal` 持有未 checkpoint 的 redact 审计行, 进程存活期
+/// (长跑网关 = 天/周级) 持续可读. 收紧点恰好两处: `UsageStore::open` 在启动期
+/// 写事务 (init_schema / retention) 之后一次 + writer 线程每批落库后一次
+/// (幂等, group/other 位已清时 stat 即返回).
+///
+/// 已知 best-effort 缺口: writer spawn 失败的同步直写降级路径, 若启动期未产生
+/// 侧车 (存量库 + 无过期行), 首次同步写创建的侧车不被收紧 — 触发条件极罕见
+/// (线程资源耗尽) 且数据仅元数据 (secret_id / mock / label, 非真 secret).
+fn tighten_wal_sidecars(db_path: &Path) {
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = db_path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        crate::util::tighten_file_permissions(std::path::Path::new(&sidecar));
+    }
 }
 
 /// 建表 (幂等) + 版本标记. schema 演进策略: 新版本二进制打开旧库 → 建新表
@@ -707,7 +736,12 @@ impl Batch {
 
 /// writer 线程主体: recv 阻塞等首条 → 非阻塞 drain 攒批 (上限 BATCH_MAX, Flush
 /// 屏障立即收尾) → 单事务 insert; Flush 命令在批次落库后 ack.
-fn writer_loop(conn: Arc<Mutex<Connection>>, rx: Receiver<Command>, dropped: Arc<AtomicU64>) {
+fn writer_loop(
+    conn: Arc<Mutex<Connection>>,
+    rx: Receiver<Command>,
+    dropped: Arc<AtomicU64>,
+    db_path: std::path::PathBuf,
+) {
     let mut warned = false;
     loop {
         let mut batch = Batch::new();
@@ -719,7 +753,10 @@ fn writer_loop(conn: Arc<Mutex<Connection>>, rx: Receiver<Command>, dropped: Arc
                 while let Ok(cmd) = rx.try_recv() {
                     batch.push(cmd);
                 }
-                batch.write(&mut conn.lock());
+                let (expected, _) = batch.write(&mut conn.lock());
+                if expected > 0 {
+                    tighten_wal_sidecars(&db_path);
+                }
                 return;
             }
         }
@@ -734,6 +771,11 @@ fn writer_loop(conn: Arc<Mutex<Connection>>, rx: Receiver<Command>, dropped: Arc
             }
         }
         let (expected, ok) = batch.write(&mut conn.lock());
+        // SEC-8: 侧车在首个写事务才创建 — 落库后收紧, 且必须先于 Flush ack
+        // (flush_for_test 借 ack 屏障断言权限, 无竞态窗口).
+        if expected > 0 {
+            tighten_wal_sidecars(&db_path);
+        }
         let failed = expected - ok;
         if failed > 0 {
             let total = dropped.fetch_add(failed, Ordering::Relaxed) + failed;
@@ -882,6 +924,42 @@ mod tests {
     }
 
     // ─── USAGE-1 持久一致性: SQLite 重开恢复 ──────────────────────────────
+
+    /// SEC-8: 新建 usage sqlite 文件 owner-only (0600) — 库含 redact 审计
+    /// (secret_id / mock / api_key_label), 不得 group/other-readable.
+    #[cfg(unix)]
+    #[test]
+    fn open_file_db_creates_owner_only_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp_db("perm");
+        let _conn = open_file_db(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "usage sqlite must be owner-only");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// SEC-8: `-wal`/`-shm` 侧车 (sqlite 在**首个写事务**时按 umask 0644 创建,
+    /// `-wal` 持有未 checkpoint 的 redact 审计行) 在首批落库后被收紧到
+    /// owner-only — Flush ack 屏障保证断言时 tighten 已完成 (无竞态).
+    #[cfg(unix)]
+    #[test]
+    fn wal_sidecars_tightened_after_first_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp_db("perm-wal");
+        let s = UsageStore::open(&cfg(90), &path);
+        s.record(ev(0, "p1", Some("m1"), quanta(1, 1)));
+        s.flush_for_test();
+        for suffix in ["-wal", "-shm"] {
+            let mut p = path.as_os_str().to_os_string();
+            p.push(suffix);
+            let p = std::path::PathBuf::from(p);
+            assert!(p.exists(), "{} must exist after first write", p.display());
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "{} must be owner-only", p.display());
+        }
+        drop(s);
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn open_reuses_existing_db_and_restores_aggregation() {

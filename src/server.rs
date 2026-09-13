@@ -1,5 +1,9 @@
 //! axum router 装配与服务启动.
 //!
+//! # 安全层 (最外层, 所有路由)
+//! Host/Origin guard (SEC-7, 防 DNS rebinding + CSRF 纵深) 以最外层 middleware
+//! 挂载, 定义与白名单语义见 [`crate::server_host_guard`].
+//!
 //! # 路由策略
 //! - `/`                —— Web UI 入口 (单页 HTML).
 //! - `/api/*`           —— Web UI JSON API (未匹配子路径 404, 绝不进 forward).
@@ -81,6 +85,7 @@ use crate::dag::ConversationDag;
 use crate::provider::{Provider, ProviderTable};
 use crate::proxy::{forward, forward_no_rest};
 use crate::secrets::{SecretEntry, SecretTable};
+use crate::server_host_guard::{self, HostGuard};
 use crate::state::AppState;
 use crate::web;
 
@@ -107,10 +112,13 @@ macro_rules! trace_layer {
     () => {
         TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
             // SEC-3: 字段白名单 — 见宏 doc (不在此处记 headers/body).
+            // SEC-C4a: 只记 path 不记完整 uri — query 可能携带 key/token 类敏感
+            // 参数, 一律丢弃 (契约边界见 contracts.md SEC-3
+            // `prop_trace_span_no_query_string`).
             tracing::info_span!(
                 "http.request",
                 method = %request.method(),
-                uri = %request.uri(),
+                path = %request.uri().path(),
                 version = ?request.version(),
             )
         })
@@ -120,15 +128,18 @@ macro_rules! trace_layer {
 /// 构建 axum Router (单用户模式, 无认证).
 ///
 /// 这是 `auth.enabled = false` 时的入口, 与旧版完全兼容.
-pub fn build_router(state: AppState) -> Router {
-    build_router_inner(state, None)
+/// `guard`: Host/Origin 校验白名单 (SEC-7, 由 [`crate::server_host_guard`] 定义;
+/// 调用方需用与实际监听 port 一致的 [`HostGuard::new`] 构造 — 测试 spawn 时
+/// 从已 bind 的 listener 取 port).
+pub fn build_router(state: AppState, guard: HostGuard) -> Router {
+    build_router_inner(state, None, guard)
 }
 
 /// 构建 axum Router (带认证).
 ///
 /// `auth_stack` 由 [`serve`] 在启用认证时构造.
-pub fn build_router_with_auth(state: AppState, auth_stack: AuthStack) -> Router {
-    build_router_inner(state, Some(auth_stack))
+pub fn build_router_with_auth(state: AppState, auth_stack: AuthStack, guard: HostGuard) -> Router {
+    build_router_inner(state, Some(auth_stack), guard)
 }
 
 /// state 目录内的运行时工件路径 (**固定名**, 不带 config stem): usage SQLite 库
@@ -153,7 +164,11 @@ fn state_dir_artifact(state_path: &Path, file_name: &str) -> PathBuf {
 }
 
 /// 内部: 根据 auth_stack 是否存在, 条件化装配认证 layer.
-fn build_router_inner(state: AppState, auth_stack: Option<AuthStack>) -> Router {
+///
+/// trace + Host/Origin guard 在两个分支的结果上**统一**叠加 (后挂者为最外层):
+/// guard 对任何装配分支恒为最外层是 SEC-7 不变量, 结构性保证而非各分支自行记得.
+/// 403 拒绝发生在认证 / trace 之前 (guard 内自带 WARN 日志, 保证可观测).
+fn build_router_inner(state: AppState, auth_stack: Option<AuthStack>, guard: HostGuard) -> Router {
     // Forward router: 使用 AppState, 在 merge 前不调用 with_state.
     // 首段 proto 简写 (o/a/g/l/r) 由 dispatch 校验; 顶级保留字 (api/login/logout/oauth2)
     // 的静态路由优先于本参数路由, 二者天然不相交 (见 docs/design/url-layout.md).
@@ -161,7 +176,7 @@ fn build_router_inner(state: AppState, auth_stack: Option<AuthStack>) -> Router 
         .route("/{proto}/{name}", any(forward_no_rest))
         .route("/{proto}/{name}/{*rest}", any(forward));
 
-    match auth_stack {
+    let router = match auth_stack {
         None => {
             // 单用户模式: 所有路由无认证.
             Router::new()
@@ -169,10 +184,15 @@ fn build_router_inner(state: AppState, auth_stack: Option<AuthStack>) -> Router 
                 .route("/api/{*rest}", any(web::not_found))
                 .merge(forward_router)
                 .with_state(state)
-                .layer(trace_layer!())
         }
         Some(auth) => build_router_with_auth_layers(state, auth, forward_router),
-    }
+    };
+    router
+        .layer(trace_layer!())
+        .layer(middleware::from_fn_with_state(
+            guard,
+            server_host_guard::guard,
+        ))
 }
 
 /// 认证层的完整装配状态 (启用认证时由 serve 构造).
@@ -186,6 +206,7 @@ pub struct AuthStack {
 /// - WebUI 路由: OIDC session guard (login_required).
 /// - 转发路由: API key middleware (require_api_key).
 /// - 登录路由 (/login, /callback, /logout): 公开 (不需要认证).
+/// - trace / Host guard 由 build_router_inner 在本函数结果之外统一叠加.
 fn build_router_with_auth_layers(
     state: AppState,
     auth: AuthStack,
@@ -242,7 +263,6 @@ fn build_router_with_auth_layers(
         .merge(forward_protected)
         .with_state(state)
         .layer(auth_layer)
-        .layer(trace_layer!())
 }
 
 /// 构造 reqwest 客户端 (与上游连接复用).
@@ -388,6 +408,18 @@ pub async fn serve(
         )),
     };
 
+    let addr: SocketAddr = format!("{host}:{port}")
+        .parse()
+        .with_context(|| format!("invalid listen address {host}:{port}"))?;
+    let listener = bind_listener(addr).await?;
+    // 实际监听 port (bind 后取 — 配置 port=0 时 OS 分配临时端口, 配置值不可用):
+    // 供 SEC-7 Host guard 白名单与 OIDC redirect_url 派生共用.
+    let listen_port = listener
+        .local_addr()
+        .expect("bound listener has addr")
+        .port();
+    let host_guard = HostGuard::new(host, listen_port);
+
     // 条件化: 启用认证时构造 AuthStack, 否则单用户模式.
     let app = if auth_config.enabled {
         let oidc_cfg = auth_config
@@ -408,11 +440,12 @@ pub async fn serve(
             None => None,
         };
 
-        // redirect_url: 显式配置优先, 否则由 host+port 派生.
+        // redirect_url: 显式配置优先, 否则由 host + 实际监听 port 派生 (port=0
+        // 时配置值会派生 http://host:0 — 浏览器实际访问的是真实端口).
         let redirect_url = oidc_cfg
             .redirect_url
             .clone()
-            .unwrap_or_else(|| format!("http://{host}:{port}/oauth2/callback"));
+            .unwrap_or_else(|| format!("http://{host}:{listen_port}/oauth2/callback"));
 
         info!(
             issuer = %oidc_cfg.issuer_url,
@@ -431,15 +464,11 @@ pub async fn serve(
 
         // api_keys 已在 auth 分支外构造 (与 AppState 共享同一份).
         let auth_stack = AuthStack { backend, api_keys };
-        build_router_with_auth(proxy, auth_stack)
+        build_router_with_auth(proxy, auth_stack, host_guard)
     } else {
-        build_router(proxy)
+        build_router(proxy, host_guard)
     };
 
-    let addr: SocketAddr = format!("{host}:{port}")
-        .parse()
-        .with_context(|| format!("invalid listen address {host}:{port}"))?;
-    let listener = bind_listener(addr).await?;
     let auth_mode = if auth_config.enabled {
         "OIDC"
     } else {
@@ -532,11 +561,23 @@ mod tests {
         );
     }
 
+    /// SEC-3 (SEC-C4a): trace span 只记 path, 不记 query — query 可能携带
+    /// key/token 类敏感参数. 本测试锁定 "取 path 后不含 '?'" 的性质, 宏调用处
+    /// (trace_layer!) 依赖该性质丢弃 query.
+    #[test]
+    fn trace_span_no_query_string() {
+        let uri: axum::http::Uri = "/v1/chat/completions?api-key=sk-secret&x=1"
+            .parse()
+            .unwrap();
+        let path = uri.path();
+        assert_eq!(path, "/v1/chat/completions");
+        assert!(!path.contains('?'), "path must not carry query: {path}");
+    }
+
     // ─── 运行时工件路径派生: 跟随 state 目录 (固定名) ─────────────────────
     //
     // 回归 2026-09-12 home-pc 生产事故, 根因详见 state_dir_artifact docstring.
     // config 无关性由函数签名固定 (不接收 config 参数), 无需运行时断言.
-
     #[test]
     fn runtime_artifacts_follow_state_dir_with_fixed_name() {
         let state = Path::new("/var/lib/secret-guard/state.toml");

@@ -198,7 +198,10 @@ async fn spawn_proxy_static_dynamic(
         usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),
         pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::for_tests()),
     };
-    let app = server::build_router(proxy);
+    let app = server::build_router(
+        proxy,
+        secret_guard::server_host_guard::HostGuard::new("127.0.0.1", addr.port()),
+    );
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
@@ -238,7 +241,10 @@ async fn spawn_proxy_with_prefix(global_mock_prefix: &str) -> String {
         usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),
         pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::for_tests()),
     };
-    let app = server::build_router(proxy);
+    let app = server::build_router(
+        proxy,
+        secret_guard::server_host_guard::HostGuard::new("127.0.0.1", addr.port()),
+    );
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
@@ -282,7 +288,10 @@ async fn spawn_proxy_with_probe_mode(
         usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),
         pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::for_tests()),
     };
-    let app = server::build_router(proxy);
+    let app = server::build_router(
+        proxy,
+        secret_guard::server_host_guard::HostGuard::new("127.0.0.1", addr.port()),
+    );
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
@@ -2564,7 +2573,10 @@ async fn spawn_proxy_with_timeouts_and_secrets(
         usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),
         pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::for_tests()),
     };
-    let app = server::build_router(proxy);
+    let app = server::build_router(
+        proxy,
+        secret_guard::server_host_guard::HostGuard::new("127.0.0.1", addr.port()),
+    );
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
@@ -4538,7 +4550,10 @@ async fn cross_table_shared_state_no_lost_update() {
         usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),
         pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::for_tests()),
     };
-    let app = server::build_router(proxy);
+    let app = server::build_router(
+        proxy,
+        secret_guard::server_host_guard::HostGuard::new("127.0.0.1", addr.port()),
+    );
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
@@ -7442,7 +7457,10 @@ async fn spawn_proxy_with_usage_store_and_secrets(
         usage,
         pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::for_tests()),
     };
-    let app = server::build_router(proxy);
+    let app = server::build_router(
+        proxy,
+        secret_guard::server_host_guard::HostGuard::new("127.0.0.1", addr.port()),
+    );
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
@@ -7941,4 +7959,255 @@ async fn prop_no_real_api_key_in_any_json_response() {
         "SEC-1: provider api_key leaks via: {leaks:?}"
     );
     let _ = std::fs::remove_file(&db);
+}
+
+// ─── SEC-7: Host guard / Origin 校验 (防 DNS rebinding + CSRF 纵深) ─────────
+//
+// 白名单语义的单元级覆盖在 src/server_host_guard.rs; 此处验证全链路接线:
+// middleware 挂载在最外层, 对所有路由生效 (含 `/` WebUI 与 `/api/*`).
+// 负例 Host 校验用裸 socket — reqwest 以 URL 派生 Host, 覆盖语义不保证.
+
+/// SEC-7 专用 spawn: 最小 AppState + 带 Host guard 的 Router (与生产 serve()
+/// 同构 — guard 用实际监听 port 构造), 返回 (base_url, addr).
+async fn spawn_guarded(config_host: &str) -> (String, std::net::SocketAddr) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state_path = tmp_state_path("sg-state-hostguard");
+    let decisions = std::sync::Arc::new(parking_lot::RwLock::new(
+        secret_guard::config::Decisions::default(),
+    ));
+    let persist_lock = std::sync::Arc::new(parking_lot::Mutex::new(()));
+    let provider_table =
+        ProviderTable::with_persist_lock(vec![], vec![], decisions, state_path, persist_lock);
+    let proxy = AppState {
+        upstream: reqwest::Client::new(),
+        providers: provider_table,
+        dag: ConversationDag::new(64, 500, 1),
+        secrets: test_secret_table(),
+        api_keys: test_api_key_store(),
+        auth_enabled: false,
+        global_mock_prefix: std::sync::Arc::from(""),
+        on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,
+        upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
+        model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
+        usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),
+        pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::for_tests()),
+    };
+    let app = server::build_router(
+        proxy,
+        secret_guard::server_host_guard::HostGuard::new(config_host, addr.port()),
+    );
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}"), addr)
+}
+
+/// 裸 HTTP/1.1 请求 (精确控制 Host header), 返回响应 status code.
+/// `Connection: close` 让服务器主动关连接, read_to_end 以 EOF 终止.
+async fn raw_http_status(addr: std::net::SocketAddr, request: &str) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    sock.write_all(request.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    let _n = sock.read_to_end(&mut buf).await;
+    let head = String::from_utf8_lossy(&buf);
+    head.lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("malformed HTTP response: {head}"))
+}
+
+#[tokio::test]
+async fn host_guard_rejects_domain_host_on_all_routes() {
+    let (_base, addr) = spawn_guarded("127.0.0.1").await;
+    // rebinding 载体: 域名形式 Host 一律 403 — WebUI 根路径 / /api/* / 转发族.
+    // guard 包裹所有 route 与 fallback service (axum Router::layer 语义), 先于
+    // handler 执行 — /o/p 未配 provider 本应 404, 收到 403 即证明 guard 生效,
+    // 断言语义不依赖具体 handler 的路由匹配结果.
+    for target in ["/", "/api/sessions", "/o/p"] {
+        let status = raw_http_status(
+            addr,
+            &format!(
+                "GET {target} HTTP/1.1\r\nHost: attacker.com:{}\r\nConnection: close\r\n\r\n",
+                addr.port()
+            ),
+        )
+        .await;
+        assert_eq!(status, 403, "domain Host must be rejected on {target}");
+    }
+    // port 不匹配的合法 IP Host 同样拒绝
+    let status = raw_http_status(
+        addr,
+        &format!(
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+            addr.port() + 1
+        ),
+    )
+    .await;
+    assert_eq!(status, 403, "port-mismatched Host must be rejected");
+}
+
+#[tokio::test]
+async fn host_guard_allows_loopback_host() {
+    let (base, addr) = spawn_guarded("127.0.0.1").await;
+    let client = reqwest::Client::new();
+    // reqwest 从 URL 派生 Host = 127.0.0.1:port → 放行
+    let resp = client
+        .get(format!("{base}/api/sessions"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    // 裸请求显式验证 localhost 形态 + 空 host 形态
+    for host in [
+        format!("localhost:{}", addr.port()),
+        format!("127.0.0.1:{}", addr.port()),
+        format!(":{}", addr.port()),
+    ] {
+        let status = raw_http_status(
+            addr,
+            &format!("GET /api/sessions HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"),
+        )
+        .await;
+        assert_eq!(status, 200, "Host {host} should be allowed");
+    }
+}
+
+#[tokio::test]
+async fn api_post_rejects_cross_origin() {
+    let (base, _addr) = spawn_guarded("127.0.0.1").await;
+    let client = reqwest::Client::new();
+    // 恶意 Origin (host 不在白名单) → 403
+    let resp = client
+        .post(format!("{base}/api/sync"))
+        .header("Origin", "http://attacker.com:8080")
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "cross-origin API write must be rejected"
+    );
+    // Sec-Fetch-Site: cross-site → 403
+    let resp = client
+        .post(format!("{base}/api/sync"))
+        .header("Sec-Fetch-Site", "cross-site")
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "cross-site API write must be rejected");
+    // Origin: null (沙箱 iframe / 隐私上下文) → 403
+    let resp = client
+        .post(format!("{base}/api/sync"))
+        .header("Origin", "null")
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "Origin: null must be rejected");
+}
+
+#[tokio::test]
+async fn api_post_allows_missing_or_same_origin_headers() {
+    let (base, addr) = spawn_guarded("127.0.0.1").await;
+    let client = reqwest::Client::new();
+    // 非浏览器 SDK: 两个 header 都缺 → 放行
+    let resp = client
+        .post(format!("{base}/api/sync"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "SDK without Origin must pass");
+    // 浏览器同源: Origin = 本机白名单 + Sec-Fetch-Site: same-origin → 放行
+    let resp = client
+        .post(format!("{base}/api/sync"))
+        .header("Origin", format!("http://127.0.0.1:{}", addr.port()))
+        .header("Sec-Fetch-Site", "same-origin")
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "same-origin browser write must pass");
+    // Sec-Fetch-Site: none (用户直接发起, 如地址栏/书签) → 放行
+    let resp = client
+        .post(format!("{base}/api/sync"))
+        .header("Sec-Fetch-Site", "none")
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "Sec-Fetch-Site: none must pass");
+    // GET 不校验 Origin (安全方法豁免 — 恶意 Origin 的 GET 放行, 泄漏由 SEC-1 守卫)
+    let resp = client
+        .get(format!("{base}/api/sessions"))
+        .header("Origin", "http://attacker.com:8080")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "GET must skip Origin check");
+}
+
+/// SEC-S1 (nosniff): WebUI `/` 与 `/api/*` 响应必须带 `x-content-type-options:
+/// nosniff` (NO_STORE header 组成员)。转发链响应**不带** — 由 FWD-1 byte-exact
+/// 契约 (fwd_* property 族) 隐式守卫, 网关不向上游响应追加 header。
+#[tokio::test]
+async fn webui_and_api_responses_carry_nosniff() {
+    let (base, _addr) = spawn_guarded("127.0.0.1").await;
+    let client = reqwest::Client::new();
+    for (label, url) in [
+        ("webui html", format!("{base}/")),
+        ("api json", format!("{base}/api/sessions")),
+        ("api 404 fallback", format!("{base}/api/nonexistent")),
+    ] {
+        let resp = client.get(&url).send().await.unwrap();
+        let nosniff = resp
+            .headers()
+            .get("x-content-type-options")
+            .and_then(|v| v.to_str().ok());
+        assert_eq!(nosniff, Some("nosniff"), "{label} must carry nosniff");
+    }
+}
+
+/// SEC-3 (SEC-C4a): http.request trace span 只记 path 不记 query — 用
+/// FmtSpan::NEW 捕获 span 创建行 (渲染 span 字段), 断言敏感 query 不进日志。
+/// (server.rs 的 `trace_span_no_query_string` 单测只锁定 Uri::path() 性质,
+/// 本测试锁定 span 字段的实际接线。)
+#[tokio::test]
+async fn trace_span_omits_query_string() {
+    // capture_tracing 变体: 追加 span 创建事件, 让 span 字段可被文本断言。
+    let log = CaptureLog::new();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::NEW)
+        .with_writer({
+            let log = log.clone();
+            move || log.clone()
+        })
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let (base, _addr) = spawn_guarded("127.0.0.1").await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{base}/api/sessions?api-key=sk-probe-secret&x=1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let text = log.text();
+    assert!(
+        text.contains("path=/api/sessions"),
+        "span must record path field, got: {text}"
+    );
+    assert!(
+        !text.contains("sk-probe-secret"),
+        "span must not carry query string, got: {text}"
+    );
 }

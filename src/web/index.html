@@ -4206,7 +4206,7 @@
           const h = Math.round((v / max) * H);
           if (h <= 0) return;
           y -= h;
-          bars += `<rect x="${x}" y="${y}" width="${W}" height="${h}" fill="${color}" rx="2"><title>${d.bucket}: ${fmtTokens(v)}</title></rect>`;
+          bars += `<rect x="${x}" y="${y}" width="${W}" height="${h}" fill="${color}" rx="2"><title>${escapeHtml(d.bucket)}: ${fmtTokens(v)}</title></rect>`;
         };
         seg(d.output || 0, '#a78bfa');
         seg(d.cache_write || 0, '#f5b83d');
@@ -4219,7 +4219,7 @@
           const label = granularity === 'day'
             ? d.bucket.slice(5)
             : d.bucket.slice(5).replace('T', ' ');
-          bars += `<text x="${x + W / 2}" y="${H + 14}" text-anchor="middle" font-size="9" fill="var(--fg-faint)">${label}</text>`;
+          bars += `<text x="${x + W / 2}" y="${H + 14}" text-anchor="middle" font-size="9" fill="var(--fg-faint)">${escapeHtml(label)}</text>`;
         }
       });
       el.innerHTML =

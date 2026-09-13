@@ -16,6 +16,7 @@
 //! - [`redact`]  —— Secret 改写 (请求) 与还原 (响应) 逻辑
 //! - [`secrets`] —— Secret 注册表 + 内存状态 + 配置持久化
 //! - [`server`]  —— axum router 装配与服务启动
+//! - [`server_host_guard`] —— Host/Origin 校验 middleware (SEC-7, 防 DNS rebinding)
 //! - [`state`]   —— 进程级共享状态 AppState + HTTP 共享常量 (NO_STORE)
 //! - [`web`]     —— `/` + `/api/*` Web UI 与 JSON API
 //!
@@ -38,6 +39,7 @@ pub mod record;
 pub mod redact;
 pub mod secrets;
 pub mod server;
+pub mod server_host_guard;
 pub mod state;
 pub mod usage;
 pub mod util;

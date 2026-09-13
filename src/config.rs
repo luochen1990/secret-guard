@@ -750,6 +750,9 @@ impl DynamicState {
         if !path.exists() {
             return Ok(Self::default());
         }
+        // SEC-8: 旧版本创建的 state.toml 可能 group/other-readable — 启动加载时
+        // best-effort 收紧到 0600 (后续重写由 atomic_write 的 0600 tmp 保证).
+        crate::util::tighten_file_permissions(path);
         let text = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("read state {}: {e}", path.display()))?;
         // state 是 WebUI 写出的纯派生数据, 永远可丢弃重置 — 解析失败时给出
@@ -1020,6 +1023,9 @@ pub fn prune_dangling_decisions(
 ///
 /// 同时被 [`DynamicTable::persist_dynamic`] (provider / secret 共享) 调用.
 /// `pub(crate)` 暴露给 redact 等需要原子写的模块.
+///
+/// SEC-8: 所有调用方写的都是 state.toml (含明文敏感数据, #157), tmp 以 0600
+/// 创建 (`util::create_owner_only`), rename 后目标文件保持 owner-only.
 pub(crate) fn atomic_write(path: &Path, text: &str) -> anyhow::Result<()> {
     use std::io::Write;
 
@@ -1034,7 +1040,7 @@ pub(crate) fn atomic_write(path: &Path, text: &str) -> anyhow::Result<()> {
     let tmp_name = format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4().simple());
     let tmp = parent.join(&tmp_name);
 
-    let mut f = std::fs::File::create(&tmp)
+    let mut f = crate::util::create_owner_only(&tmp)
         .map_err(|e| anyhow::anyhow!("create tmp {} failed: {e}", tmp.display()))?;
     f.write_all(text.as_bytes())
         .map_err(|e| anyhow::anyhow!("write tmp {} failed: {e}", tmp.display()))?;
@@ -2609,6 +2615,46 @@ mod table_tests {
         let tmp = tempfile_path("atomic");
         atomic_write(&tmp, "hello").unwrap();
         assert_eq!(std::fs::read_to_string(&tmp).unwrap(), "hello");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// SEC-8: atomic_write 新建文件必须 owner-only (0600) — state.toml 含明文
+    /// secret / api_key (#157), 不得 group/other-readable. rename 后权限保持.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_creates_owner_only_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile_path("atomic-perm");
+        atomic_write(&tmp, "secret-value").unwrap();
+        let mode = std::fs::metadata(&tmp).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "state file must be owner-only");
+        // 重写 (rename 替换) 后权限不回退
+        atomic_write(&tmp, "secret-value-2").unwrap();
+        let mode = std::fs::metadata(&tmp).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "rewritten state file must stay owner-only"
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// SEC-8: 旧版本残留的过宽 state.toml 在 load_or_empty 时被收紧到 0600
+    /// (启动 best-effort 收紧路径; atomic_write 之外的历史文件兜底).
+    #[cfg(unix)]
+    #[test]
+    fn load_or_empty_tightens_loose_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile_path("atomic-tighten");
+        std::fs::write(&tmp, "").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let _ = DynamicState::load_or_empty(&tmp, "").unwrap();
+        let mode = std::fs::metadata(&tmp).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "loose state file must be tightened at load"
+        );
         let _ = std::fs::remove_file(&tmp);
     }
 

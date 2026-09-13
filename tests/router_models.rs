@@ -124,7 +124,10 @@ async fn spawn(providers: Vec<Provider>) -> String {
         usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),
         pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::for_tests()),
     };
-    let app = server::build_router(proxy);
+    let app = server::build_router(
+        proxy,
+        secret_guard::server_host_guard::HostGuard::new("127.0.0.1", addr.port()),
+    );
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });

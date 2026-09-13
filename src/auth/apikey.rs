@@ -11,6 +11,8 @@
 //! 注入 store. 静态 key 的 id 形如 `ak_static_<label>`, 不可删除 (只能 disable/enable).
 //! 静态 key 的 disabled 状态持久化在 state.toml 的 `api_keys_disabled` 字段 (以 label 为 key),
 //! 以保证用户 disable 后重启仍生效.
+//! 明文短于 `MIN_STATIC_KEY_CHARS` (20) 的静态 key 装载时 WARN (SEC-I2 — 只存
+//! SHA-256 hash, 短 key 可被离线暴力破解; 保守 WARN 不阻断启动).
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -45,6 +47,18 @@ pub struct ApiKeyEntry {
 /// `source` 由 id 前缀推断, 不单独存字段.
 pub fn is_static(id: &str) -> bool {
     id.starts_with("ak_static_")
+}
+
+/// 静态 key 最小熵阈值 (SEC-I2, 字符数): 低于它的 user-chosen key 在 state 文件
+/// 泄漏时可被离线暴力破解 (store 只存 SHA-256 hash, 短 key 空间小). 取 20 ≈
+/// 动态签发 key (`sg_` + 32 slug) 的一半, 对齐常见 token 长度下限. 保守 WARN
+/// 不阻断 (兼容存量部署); 动态 key 由 `issue` 自签 (35 chars), 恒满足, 不检查.
+const MIN_STATIC_KEY_CHARS: usize = 20;
+
+/// 静态 key 明文是否过短 (SEC-I2). 纯函数, 供 [`ApiKeyStore::new`] 的 WARN 路径
+/// 与阈值边界测试共用 (SSOT — 阈值只在此定义一次).
+fn static_key_too_short(plaintext: &str) -> bool {
+    plaintext.chars().count() < MIN_STATIC_KEY_CHARS
 }
 
 /// API key 签发结果 (包含明文, 仅此一次返回给前端).
@@ -123,6 +137,15 @@ impl ApiKeyStore {
         for sk in static_keys {
             match sk.resolve(config_path) {
                 Ok(plaintext) => {
+                    // SEC-I2: 短 key 离线可暴力破解 (只存 hash), WARN 提示但不
+                    // 拒绝启动 (保守兼容). disabled 的 key 也提示 — 可被 re-enable.
+                    if static_key_too_short(&plaintext) {
+                        tracing::warn!(
+                            label = %sk.label,
+                            n = plaintext.chars().count(),
+                            "static api key is short; vulnerable to offline brute-force if state files leak"
+                        );
+                    }
                     let disabled = static_disabled.contains(&sk.label);
                     entries.push(ApiKeyEntry {
                         id: format!("ak_static_{}", sk.label),
@@ -300,6 +323,24 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SEC-I2: 短 key 阈值边界 — 19 chars 过短 (WARN), 20 chars 达标.
+    /// (WARN 本身不可断言, 纯函数锁定判定逻辑; `ApiKeyStore::new` 的静态 key
+    /// 装载路径调用它.)
+    #[test]
+    fn static_key_too_short_threshold_boundary() {
+        assert!(static_key_too_short(""), "empty is short");
+        assert!(
+            static_key_too_short(&"x".repeat(19)),
+            "19 chars < 20 is short"
+        );
+        assert!(
+            !static_key_too_short(&"x".repeat(20)),
+            "20 chars meets threshold"
+        );
+        // 动态签发形态 (sg_ + 32) 恒达标 — 阈值不会误伤自签 key
+        assert!(!static_key_too_short(&format!("sg_{}", "a".repeat(32))));
+    }
 
     fn tmp_path(label: &str) -> PathBuf {
         let path = PathBuf::from(format!(

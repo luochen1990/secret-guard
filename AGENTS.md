@@ -76,7 +76,7 @@
 | `CDAG-*` | B | **DAG INV-1..5** + 新增 | 内容寻址 + Merkle + refcount + 孤儿节点 + session 稳定 |
 | `DTO-*` | B | 新增 | WebUI DTO 派生 (redactions / resp_parsed / preview / delta / title) |
 | `CFG-*` | B | 新增 | 双层配置合并 / CRUD / 持久化 / 并发 |
-| `SEC-*` | 跨 | 新增 | GET 不泄漏 / panic 不泄漏 / headers 脱敏 / 本地监听 |
+| `SEC-*` | 跨 | 新增 | GET 不泄漏 / panic 不泄漏 / headers 脱敏 / 本地监听 / Host·Origin 校验 (SEC-7, 防 DNS rebinding) / 敏感落盘 owner-only (SEC-8) / API nosniff (SEC-9) |
 | `ROB-*` | 跨 | 鲁棒性原则 | best-effort 永不 panic + 假设声明注释必备 |
 | `VIEW-*` | 跨 | 视图正确性机制 | 先断言后删除 + 派生字段 consistency-check 覆盖 |
 | `UI-*` | C | **I1-I3** + 新增 | 气泡数 / sidebar 条目数 / DOM 顺序 / reconciliation / drawer |
@@ -101,8 +101,9 @@
 
 ```text
                     ┌──────────── 基础层 (零 / 极低业务依赖) ──────────┐
-                    │  util (hash)   error (AppError)   dto (wire     │
-                    │  shape)        state (AppState + NO_STORE)      │
+                    │  util (hash + 0600 收紧)  error (AppError)       │
+                    │  dto (wire shape)  state (AppState + NO_STORE)   │
+                    │  server_host_guard (Host/Origin 校验, SEC-7)     │
                     └─────────────────────────────────────────────────┘
                                       ▲ ▲ ▲ ▲
         ┌─────────────────────────────┘ │ │ └────────────────────────┐
@@ -220,6 +221,31 @@ Redact 不应无必要地改变 request body 的字节内容, 避免破坏 LLM P
 > 回传进历史), mock 允许变化 (probing counter 推进). 理由: 复用旧 mock 会让 restore
 > 错替历史中的旧 mock, 破坏 RED-6 round-trip — restore 正确性优先于缓存稳定性.
 > 代价是经济性 (前缀缓存失效), 非安全性. 详见 contracts.md RED-3 例外场景裁决.
+
+### Host / Origin 校验 (SEC-7, 防 DNS rebinding + CSRF 纵深)
+
+默认单用户模式 (auth disabled) 下无认证, "同源策略兜底" 的旧假设会被 DNS rebinding
+击穿 — 攻击页面的域名 rebind 到 127.0.0.1 后, 浏览器发出的请求对本地 server 是
+"同源"的, 可读 `/api/sync`、可写 provider base_url / secret decision。server 层以
+最外层 middleware 对**所有**路由做两类校验 (实现 `src/server_host_guard.rs`,
+挂载 `src/server.rs`, 失败一律 403):
+
+1. **Host 白名单** (所有请求): Host 的显式 port 必须等于监听 port (无 port 仅当
+   监听 80 时合法 — 浏览器默认省略); host 部分放行: loopback IP 字面量
+   (127.0.0.0/8, `[::1]`) / 配置 host / `localhost` / 空 host; 配置 host 非
+   loopback (`0.0.0.0` / `::` / LAN IP — 本机非环回地址无法枚举) 时放行任意
+   **IP 字面量**; **域名形式 Host 一律拒绝** (本地工具, 合法访问不用域名;
+   生产 `serve()` 要求 host 可解析为 SocketAddr, 域名 host 启动即报错,
+   无配置项豁免)。
+   缺 Host header 放行 (rebinding 必带域名 Host)。
+2. **`/api/*` 非安全方法 (POST/PUT/DELETE/PATCH) 的 Origin / Sec-Fetch-Site 校验**:
+   带 Origin 则其 host:port 必须在白名单 (`Origin: null` 拒绝); 带
+   Sec-Fetch-Site 则必须是 same-origin / same-site / none; 两者都缺放行
+   (非浏览器 SDK)。GET/HEAD 等安全方法豁免 (读端泄漏由 SEC-1 守卫)。
+   转发路径 (`/{o|a|g|l|r}/...`) 不做 Origin 校验 (SDK 场景, Host 校验已覆盖)。
+
+测试: 单元 (`src/server_host_guard.rs::tests`) + 集成 (`tests/integration.rs`
+SEC-7 段); 可测 property 见 `docs/design/contracts.md` **SEC-7**。
 
 ## 前端不变量 (UI Invariants) → UI-1..UI-7 契约
 
@@ -344,7 +370,8 @@ TTL 300s + serve-stale-on-error + single-flight; exact-only router 零上游请�
 | `proxy/` | dispatch 路径选择 + fan_out 三路径 + Provider 鉴权 + router GET /models 本地合成 (拆分为 mod/helpers/auth/models/recorder/same_proto/cross_proto/fan_out 子模块) | `src/proxy/mod.rs` 头部 `//!` |
 | `state.rs` | 进程级共享状态 `AppState` (原 ProxyState, 上移见 #145) + HTTP 共享常量 `NO_STORE` | 文件头部 `//!` |
 | `web/` | JSON API (`api/` 目录) + 单页 WebUI | **`src/web/AGENTS.md`** |
-| `server.rs` | router 装配 + 双层状态注入 + graceful shutdown | 文件头部 `//!` |
+| `server.rs` | router 装配 + 双层状态注入 + graceful shutdown + Host/Origin guard 最外层挂载 | 文件头部 `//!` |
+| `server_host_guard.rs` | Host 白名单 + Origin/Sec-Fetch-Site 校验 middleware (SEC-7: 防 DNS rebinding + CSRF 纵深; 白名单语义见文件头) | 文件头部 `//!` |
 
 > `ProviderTable` 与 `SecretTable` 是 `DynamicTable<T>` (`src/config.rs`) 的类型别名,
 > 通用合并 / CRUD / 持久化算法都在 config.rs; 各模块只补充类型特定的 EffectiveView
@@ -732,6 +759,16 @@ configFile (escape hatch, 互斥). 凭据注入 (LoadCredential / sops 直接路
   dead upstream 逐查询阻塞)。exact-only router 不 fetch (只返回别名, N6 gate)。
   缓存按 provider id 键控: WebUI 修改 provider 的 base_url/protocol 后, 最长 300s 内继续 serve
   旧上游的清单 (TTL 到期自然收敛)。
+- **域名形式 Host 一律 403 (SEC-7 Host guard)**: server 层对所有路由做 Host 白名单
+  校验 (防 DNS rebinding, 语义见 "Host / Origin 校验" 段), 域名 Host 拒绝。经反向
+  代理以域名 (如 `sg.example.com`) 暴露 secret-guard 的部署会被 403 — 需直接用
+  IP / localhost 访问, 或让反代把转发给上游的 Host 改写为 IP 形态。无配置项豁免
+  (本地工具的定位决策; 如需域名部署再评估白名单配置化)。
+- **敏感落盘文件收紧为 0600 (SEC-8)**: state.toml / usage.sqlite3 (含 `-wal`/`-shm`
+  侧车, writer 线程每批落库后收紧) / pricing.json 在 unix 下创建即 owner-only,
+  启动加载时对旧版本残留文件 best-effort chmod 收紧 (helper
+  `src/util.rs::tighten_file_permissions`, 设备文件与更严形态 (0400 等) 跳过)。
+  依赖 group/other 读这些文件的部署 (如共享目录跑第三方读取器) 会受影响。
 - **redact_headers 名单硬编码 (SEC-4)**: `proxy/helpers.rs::redact_headers` 的敏感 header
   脱敏名单是硬编码黑名单 (显式枚举主流 provider auth header + 含 "token" / "secret"
   子串匹配, 完整名单以 `is_sensitive_header` 为 SSOT). 未在名单内的 header 会原样

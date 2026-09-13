@@ -31,14 +31,16 @@ use axum::{
     routing::{get, patch, post},
 };
 
-use crate::state::AppState;
+use crate::state::{AppState, NO_STORE};
 
 /// 内嵌的 HTML 单页 (build 时 `include_str!`).
 const INDEX_HTML: &str = include_str!("index.html");
 
 /// `/` 根入口的 index handler.
-pub async fn index_handler() -> Html<&'static str> {
-    Html(INDEX_HTML)
+///
+/// 带 NO_STORE (含 nosniff, SEC-S1): WebUI HTML 与 API 响应同一安全 header 组.
+pub async fn index_handler() -> impl axum::response::IntoResponse {
+    (StatusCode::OK, NO_STORE, Html(INDEX_HTML))
 }
 
 /// 构建 WebUI + JSON API 的顶级子 Router (`/api/*` + `/`). 复用主 Router 的 [`AppState`].
@@ -81,7 +83,10 @@ pub fn router() -> Router<AppState> {
         //
         // 安全契约: auth 启用时, 整个 web::router() (含本段) 都被上层
         // login_required guard 守卫 (server.rs build_router_with_auth_layers).
-        // auth 关闭时, 单用户模式默认本地监听 (127.0.0.1) + 同源策略兜底.
+        // auth 关闭时, 单用户模式默认本地监听 (127.0.0.1) + server 层 Host guard
+        // (src/server_host_guard.rs, SEC-7) 防 DNS rebinding — 外部页面的域名
+        // Host 无法通过校验; /api/* 写操作另由 Origin/Sec-Fetch-Site 纵深校验
+        // 兜底 ("同源策略兜底" 的旧假设已被 rebinding 攻破, 不再单独依赖).
         .route(
             "/api/api-keys",
             get(api::list_api_keys).post(api::create_api_key),
@@ -94,6 +99,6 @@ pub fn router() -> Router<AppState> {
 }
 
 /// `/api/*` 未匹配子路径的 404 handler (SEC-6: 内部 URL 绝不进入 forward).
-pub async fn not_found() -> (StatusCode, &'static str) {
-    (StatusCode::NOT_FOUND, "not found")
+pub async fn not_found() -> impl axum::response::IntoResponse {
+    (StatusCode::NOT_FOUND, NO_STORE, "not found")
 }

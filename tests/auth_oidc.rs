@@ -1132,12 +1132,15 @@ async fn spawn_full_auth_router() -> String {
         pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::for_tests()),
     };
 
+    // 与生产 serve() 同构: 先 bind listener 拿到实际 port, 再用该 port 构造
+    // Host guard (SEC-7) 装配 Router.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
     let app = secret_guard::server::build_router_with_auth(
         state,
         secret_guard::server::AuthStack { backend, api_keys },
+        secret_guard::server_host_guard::HostGuard::new("127.0.0.1", addr.port()),
     );
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });

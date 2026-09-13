@@ -63,10 +63,21 @@ pub struct AppState {
 
 // ─── HTTP 层共享常量 ────────────────────────────────────────────────────────
 
-/// 共享的 `no-store` header 设置 (axum 的 `[(name, value); N]` 接受 `(&str, &str)`).
+/// 共享的响应安全 header 组 (axum 的 `[(name, value); N]` 接受 `(&str, &str)`).
+///
+/// - `cache-control: no-store, ...` — WebUI/API 响应是动态数据, 不经任何缓存.
+/// - `x-content-type-options: nosniff` (SEC-S1) — 阻止浏览器 MIME sniffing:
+///   JSON/文本端点即使被注入也不得被重新解释为脚本/HTML (纵深防御, 对
+///   `escapeHtml` 纪律的兜底).
+///
+/// 仅用于 WebUI / JSON API / auth 响应 — **转发链响应绝不带** (FWD-1: 网关对
+/// wire 的唯一合法修改是 real↔mock 替换, 不追加 header).
 ///
 /// 历史上定义在 `web::api` (资源组 CRUD 模块) → `web::mod` (web 层共享常量), 但消费者
 /// 跨层: web::api (本模块所有 endpoint) + `crate::auth::handlers` (OIDC login/logout/me).
 /// 让 auth 反向依赖 web 违反层间单向承诺 (鉴权层是更低层基础设施), 故落位顶层
 /// HTTP 常量小模块, web / auth 各自单向取用 (#145 偏差 3).
-pub const NO_STORE: [(&str, &str); 1] = [("cache-control", "no-store, no-cache, must-revalidate")];
+pub const NO_STORE: [(&str, &str); 2] = [
+    ("cache-control", "no-store, no-cache, must-revalidate"),
+    ("x-content-type-options", "nosniff"),
+];

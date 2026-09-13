@@ -452,6 +452,9 @@ impl PricingCache {
 }
 
 fn load_disk(path: &Path) -> Option<PricingData> {
+    // SEC-8: 旧版本写的缓存文件可能过宽 — 读时 best-effort 收紧 (与 state 目录
+    // 内其他工件一致; /dev/null 等非普通文件由 helper 内部跳过).
+    crate::util::tighten_file_permissions(path);
     let raw = std::fs::read(path).ok()?;
     let json: serde_json::Value = serde_json::from_slice(&raw).ok()?;
     let (data, priced, _) = PricingData::parse(&json);
@@ -459,10 +462,15 @@ fn load_disk(path: &Path) -> Option<PricingData> {
 }
 
 fn write_disk(path: &Path, json: &serde_json::Value) {
+    use std::io::Write;
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if let Err(e) = std::fs::write(path, serde_json::to_vec(json).unwrap_or_default()) {
+    // SEC-8: 创建即 0600 (util::create_owner_only, 消除 umask 0644 中间窗口);
+    // 非 unix 平台退化为 File::create 同语义.
+    let bytes = serde_json::to_vec(json).unwrap_or_default();
+    let res = crate::util::create_owner_only(path).and_then(|mut f| f.write_all(&bytes));
+    if let Err(e) = res {
         warn!(path = %path.display(), error = %e, "pricing disk cache write failed (non-fatal)");
     }
 }
@@ -769,6 +777,21 @@ mod tests {
 
     fn fixture_body() -> String {
         serde_json::to_string(&fixture()).unwrap()
+    }
+
+    /// SEC-8: pricing 缓存落盘 owner-only (0600) — 与 state 目录内其他工件一致.
+    #[cfg(unix)]
+    #[test]
+    fn write_disk_owner_only_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "sg-pricing-perm-{}.json",
+            uuid::Uuid::new_v4().simple()
+        ));
+        write_disk(&path, &json!({}));
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "pricing cache must be owner-only");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
