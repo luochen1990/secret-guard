@@ -166,7 +166,7 @@ impl StreamTranslate {
         // 已占用 &mut self), 所以采用"先收集后处理"模式.
         let mut frames: Vec<(String, serde_json::Value)> = Vec::new();
         self.reassembler.feed(chunk, |event_type, data| {
-            frames.push((event_type.to_string(), data.clone()));
+            frames.push((event_type, data));
         });
 
         let mut out = Vec::new();

@@ -376,7 +376,7 @@ mod tests {
         assert!(!r.is_aborted(), "fresh reassembler must not be aborted");
         let huge = vec![b'a'; MAX_BUF + 1];
         let mut seen: Vec<(String, Value)> = Vec::new();
-        r.feed(&huge, |et, d| seen.push((et.to_string(), d.clone())));
+        r.feed(&huge, |et, d| seen.push((et, d)));
         assert!(r.is_aborted(), "should abort after >MAX_BUF unparsable buf");
         // 无帧终止符 → 不应误触发任何 on_frame 回调.
         assert!(seen.is_empty(), "no frame terminator, no callbacks");
@@ -410,14 +410,14 @@ mod tests {
         let mut r = SseReassembler::new();
         let chunk = b"data: {\"a\":1}\n\ndata: {\"b\":2}\n\ndata: {\"c\":";
         let mut got: Vec<Value> = Vec::new();
-        r.feed(chunk, |_et, d| got.push(d.clone()));
+        r.feed(chunk, |_et, d| got.push(d));
         // 两个完整帧触发回调, 不完整尾帧留在 buffer.
         assert_eq!(got.len(), 2);
         assert_eq!(got[0], json!({"a":1}));
         assert_eq!(got[1], json!({"b":2}));
         // 补全尾帧, 应触发第三个回调.
         got.clear();
-        r.feed(b"3}\n\n", |_et, d| got.push(d.clone()));
+        r.feed(b"3}\n\n", |_et, d| got.push(d));
         assert_eq!(got.len(), 1);
         assert_eq!(got[0], json!({"c":3}));
     }
@@ -428,7 +428,7 @@ mod tests {
         let mut r = SseReassembler::new();
         let chunk = b"data: \n\ndata: [DONE]\n\ndata: not json\n\ndata: {\"ok\":true}\n\n";
         let mut got: Vec<Value> = Vec::new();
-        r.feed(chunk, |_et, d| got.push(d.clone()));
+        r.feed(chunk, |_et, d| got.push(d));
         assert_eq!(
             got.len(),
             1,

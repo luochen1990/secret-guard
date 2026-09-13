@@ -90,7 +90,7 @@ impl StreamScan {
     pub fn feed(&mut self, chunk: &[u8]) {
         let mut frames: Vec<(String, serde_json::Value)> = Vec::new();
         self.reassembler.feed(chunk, |event_type, data| {
-            frames.push((event_type.to_string(), data.clone()));
+            frames.push((event_type, data));
         });
 
         for (event_type, data) in &frames {

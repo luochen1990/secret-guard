@@ -7,7 +7,8 @@
 //! # 用法
 //!
 //! 调用者持有一个 `SseReassembler` 字段, 通过 [`SseReassembler::feed`] 喂入 chunk,
-//! 传入 `on_frame` 回调处理每个完整帧 (回调签名 `FnMut(&str event_type, &Value)`).
+//! 传入 `on_frame` 回调处理每个完整帧 (回调签名 `FnMut(String event_type, Value)` —
+//! 帧所有权 move 给回调, 避免 consumer 侧整树深拷贝).
 //!
 //! # 借用隔离
 //!
@@ -37,11 +38,13 @@ impl SseReassembler {
         }
     }
 
-    /// 喂入一个 chunk. 对每个完整 SSE 帧 (parse + JSON 反序列化成功后) 调用 `on_frame(event_name, data)`.
+    /// 喂入一个 chunk. 对每个完整 SSE 帧 (parse + JSON 反序列化成功后) 调用
+    /// `on_frame(event_type, data)`, 帧的 owned `String` / `Value` move 给回调
+    /// (骨架内部不再使用, consumer 免深拷贝).
     ///
     /// 回调约束: 调用者不应在 `on_frame` 内拿 `&mut self` (骨架已占用), 应把 frame
     /// 累积到外部集合再循环处理.
-    pub(super) fn feed<F: FnMut(&str, &serde_json::Value)>(
+    pub(super) fn feed<F: FnMut(String, serde_json::Value)>(
         &mut self,
         chunk: &[u8],
         mut on_frame: F,
@@ -78,7 +81,7 @@ impl SseReassembler {
                 continue; // 非 JSON, 跳过 (恶意 / 损坏)
             };
 
-            on_frame(&event_type, &data);
+            on_frame(event_type, data);
         }
 
         // 回收已消费前缀 (单次 shift, 线性而非 O(n^2)).
