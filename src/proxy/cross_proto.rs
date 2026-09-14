@@ -116,8 +116,11 @@ pub(crate) async fn cross_proto_forward(
     }
 
     // 6. 清空 ingress-only 元数据:
-    //    - extra: ingress-only 字段会泄漏到 egress
+    //    - extra: ingress-only 字段会泄漏到 egress (Responses 的 hosted tools
+    //      (web_search/mcp/...) 承载于 extra["tools"], 会被一并清空 — 丢弃计数
+    //      供 T5 WARN, 见下方 record_id 就位后的告警点)
     //    - wire_fidelity (stop_form / content_form / tools_present): ingress wire 形态
+    let dropped_hosted_tools = count_hosted_tools_in_extra(&ir.extra);
     ir.extra.clear();
     ir.clear_wire_fidelity();
 
@@ -134,7 +137,14 @@ pub(crate) async fn cross_proto_forward(
         "cross-proto",
     )?;
 
-    // 9. IR → egress body.
+    // 9. IR → egress body. (T5: 请求侧 ReasoningContent blocks 会被 egress writer
+    //    丢弃 (#176, 见 count_reasoning_blocks 假设声明) — 计数, WARN 在步骤 12 后
+    //    record_id 就位时打.)
+    let dropped_req_reasoning = count_reasoning_blocks(&ir.system)
+        + ir.messages
+            .iter()
+            .map(|m| count_reasoning_blocks(&m.content))
+            .sum::<usize>();
     let egress_body_value = egress_writer.write_request(&ir);
     let egress_bytes = serde_json::to_vec(&egress_body_value)
         .map_err(|e| AppError::Internal(format!("serialize egress body failed: {e}")))?;
@@ -208,6 +218,24 @@ pub(crate) async fn cross_proto_forward(
             api_key_label: super::helpers::auth_label(&parts),
         },
     );
+
+    // T5: 跨协议丢弃可观测性 — 计数在丢弃点 (步骤 6/9) 已算, record_id 此刻才产生,
+    // WARN 延后到这里打 (只记计数, 绝不记内容). hosted tools = extra["tools"] 中
+    // type != "function" 的条目; reasoning = IrBlock::ReasoningContent (思考原文).
+    if dropped_hosted_tools > 0 {
+        warn!(
+            %record_id,
+            count = dropped_hosted_tools,
+            "dropping hosted tool(s) in cross-protocol translation"
+        );
+    }
+    if dropped_req_reasoning > 0 {
+        warn!(
+            %record_id,
+            count = dropped_req_reasoning,
+            "dropping reasoning block(s) from request history in cross-protocol translation"
+        );
+    }
 
     debug!(
         %record_id,
@@ -378,6 +406,16 @@ pub(crate) async fn cross_proto_forward(
                         &ir_resp,
                         resp_status.is_success(),
                     );
+                    // T5: 响应侧 ReasoningContent blocks 会被 ingress writer 丢弃
+                    // (#176), 计数告警 (同请求侧, 只记计数不记内容).
+                    let dropped_resp_reasoning = count_reasoning_blocks(&ir_resp.content);
+                    if dropped_resp_reasoning > 0 {
+                        warn!(
+                            %record_id,
+                            count = dropped_resp_reasoning,
+                            "dropping reasoning block(s) from response in cross-protocol translation"
+                        );
+                    }
                     // record 存 LLM 视角 (restore 之前, 含 mock) 的 parsed view.
                     resp_echo = super::recorder::ResponseEcho::from_ir(&ir_resp);
                     resp_parsed_for_record = Some(ingress_writer.write_response(&ir_resp));
@@ -520,9 +558,64 @@ fn http_status_to_error_kind(status: u16) -> &'static str {
     }
 }
 
+/// 统计 block 切片中 [`IrBlock::ReasoningContent`] (思考原文, #176) 的数量,
+/// 递归含 ToolResult.content (writer 的 block 写出对任何位置统一跳过, 计数同构).
+/// 请求侧调用点: `ir.system` + 各 `ir.messages[].content`; 响应侧: `ir_resp.content`.
+///
+/// # 假设声明 (计数 ⇒ 实际丢弃)
+///
+/// 跨协议时 egress/ingress writer 对 ReasoningContent 返回 None (Anthropic thinking
+/// block 需要 signature / Responses reasoning item 依赖 encrypted_content, 均无法从
+/// 思考原文合法合成). 当前支持矩阵下会**生产**此 block 的 ingress 只有 OpenAI
+/// (assistant 历史回传 / 响应的 `reasoning_content` 字段), 其跨协议目标
+/// (anthropic / responses writer) 均丢弃 — count > 0 ⇒ 实际丢弃. OpenAI writer 虽
+/// 保留 (assistant message / response), 但 anthropic / responses ingress 不生产此
+/// block, 不构成误报; 新增协议 reader 时需复核此假设 (届时应把 "egress 是否丢弃"
+/// 提为 Writer capability 而非在本模块硬编码).
+fn count_reasoning_blocks(blocks: &[crate::codec::ir::IrBlock]) -> usize {
+    blocks
+        .iter()
+        .map(|b| match b {
+            crate::codec::ir::IrBlock::ReasoningContent { .. } => 1,
+            crate::codec::ir::IrBlock::ToolResult { content, .. } => {
+                count_reasoning_blocks(content)
+            }
+            _ => 0,
+        })
+        .sum()
+}
+
+/// 统计 `extra["tools"]` 数组中 hosted tool (`type != "function"`) 的条目数.
+///
+/// Responses reader 把顶层 `tools` 原样留在 extra (同协议经 extra 透传保真),
+/// 跨协议 `ir.extra.clear()` 时丢弃 — 本计数驱动丢弃前 WARN (web_search /
+/// file_search / computer / mcp / image_generation 等, 见 `src/codec/responses.rs`).
+///
+/// # 假设声明 (lenient, ROB-*)
+///
+/// `extra["tools"]` 非数组 / 条目非 object / 条目缺 `type` 或 `type` 非 string:
+/// 视为畸形形态, 该条目不计 — 计数仅用于告警, 畸形输入不值得 fail (返回 0 计数).
+fn count_hosted_tools_in_extra(extra: &serde_json::Map<String, serde_json::Value>) -> usize {
+    extra
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter(|e| {
+                    e.get("type")
+                        .and_then(|t| t.as_str())
+                        .is_some_and(|t| t != "function")
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::http_status_to_error_kind;
+    use super::{count_hosted_tools_in_extra, count_reasoning_blocks, http_status_to_error_kind};
+    use crate::codec::ir::IrBlock;
+    use serde_json::json;
 
     /// 覆盖所有 match 分支, 确保 status → kind 映射完整且稳定.
     /// (错误 kind 字符串暴露给客户端 envelope, 改动属契约性变更, 测试守卫之.)
@@ -549,5 +642,93 @@ mod tests {
                 "status {status}"
             );
         }
+    }
+
+    // ─── T5 纯函数: 跨协议丢弃计数 ────────────────────────────────────────
+
+    /// count_reasoning_blocks: 只计 ReasoningContent (思考原文), 不计 Reasoning
+    /// (Responses summary) / Text 等其他 variant; 递归 ToolResult.content.
+    #[test]
+    fn count_reasoning_blocks_counts_only_reasoning_content_recursively() {
+        let blocks = vec![
+            IrBlock::Text {
+                text: "user text".into(),
+            },
+            IrBlock::ReasoningContent {
+                text: "thinking...".into(),
+            },
+            IrBlock::Reasoning {
+                summary: vec!["summary 不是思考原文".into()],
+            },
+            IrBlock::ToolResult {
+                tool_use_id: "tu_1".into(),
+                content: vec![
+                    IrBlock::Text { text: "ok".into() },
+                    IrBlock::ReasoningContent {
+                        text: "nested thinking".into(),
+                    },
+                ],
+                is_error: false,
+                content_form: None,
+            },
+            IrBlock::ReasoningContent {
+                text: "trailing".into(),
+            },
+        ];
+        // 顶层 2 个 + ToolResult 嵌套 1 个 = 3; Reasoning(summary) 不计.
+        assert_eq!(count_reasoning_blocks(&blocks), 3);
+        assert_eq!(count_reasoning_blocks(&[]), 0);
+    }
+
+    /// count_hosted_tools_in_extra: hosted (web_search / mcp / ...) 计数,
+    /// function 不计; 混合数组只计 hosted.
+    #[test]
+    fn count_hosted_tools_counts_non_function_entries() {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "tools".to_string(),
+            json!([
+                {"type": "function", "name": "get_weather", "parameters": {}},
+                {"type": "web_search"},
+                {"type": "mcp", "server_label": "github"},
+                {"type": "file_search", "vector_store_ids": ["vs_1"]},
+            ]),
+        );
+        assert_eq!(count_hosted_tools_in_extra(&extra), 3);
+
+        // 全 function → 0.
+        let mut fn_only = serde_json::Map::new();
+        fn_only.insert(
+            "tools".to_string(),
+            json!([{"type": "function", "name": "f1"}]),
+        );
+        assert_eq!(count_hosted_tools_in_extra(&fn_only), 0);
+        // extra 无 tools 键 → 0.
+        assert_eq!(count_hosted_tools_in_extra(&serde_json::Map::new()), 0);
+    }
+
+    /// count_hosted_tools_in_extra: 畸形形态 lenient → 不计 (计数仅供告警).
+    #[test]
+    fn count_hosted_tools_lenient_on_malformed_shapes() {
+        // tools 非数组 (string / object) → 0.
+        for malformed in [json!("not-an-array"), json!({"nested": true})] {
+            let mut extra = serde_json::Map::new();
+            extra.insert("tools".to_string(), malformed);
+            assert_eq!(count_hosted_tools_in_extra(&extra), 0);
+        }
+        // 条目级畸形: 非 object / 缺 type / type 非 string → 各自不计;
+        // 畸形条目不拖累同数组中合法的 hosted 条目.
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "tools".to_string(),
+            json!([
+                "bare string entry",
+                42,
+                {"name": "missing-type-field"},
+                {"type": 123},
+                {"type": "web_search"},
+            ]),
+        );
+        assert_eq!(count_hosted_tools_in_extra(&extra), 1);
     }
 }

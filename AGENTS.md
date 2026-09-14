@@ -694,18 +694,21 @@ configFile (escape hatch, 互斥). 凭据注入 (LoadCredential / sops 直接路
 - **reasoning_content (思考原文) 跨协议丢弃** (#176, 契约 STR-6): OpenAI 兼容 provider 的
   思考原文 (`delta.reasoning_content` 流式 / `message.reasoning_content` 非流式 /
   assistant 历史回传) 已建模为 `IrBlock::ReasoningContent`, 同协议路径 (含 Redact) 三路径
-  reader↔writer 对称 + 流式 restore 覆盖. **跨协议翻译时丢弃** — Anthropic thinking block
-  需要 signature (无法合法合成), Responses reasoning item 依赖 `encrypted_content`
-  (rationale 见 `src/codec/AGENTS.md` 支持矩阵注记).
+  reader↔writer 对称 + 流式 restore 覆盖. **跨协议翻译时丢弃 (有 WARN)** — Anthropic
+  thinking block 需要 signature (无法合法合成), Responses reasoning item 依赖
+  `encrypted_content` (rationale 见 `src/codec/AGENTS.md` 支持矩阵注记). 丢弃时
+  `cross_proto_forward` 按 block 计数打 WARN (请求侧历史 / 响应侧各一条, 只记计数
+  不记内容, 见 `proxy/cross_proto.rs::count_reasoning_blocks` 的假设声明).
   边界: 请求侧 assistant 历史的显式空串/null 由 `reasoning_content_form` wire 元数据保真;
   **响应侧** `IrResponse` 无对应元数据 — 上游非流式响应显式返回 `"reasoning_content": ""`
   时, redact 路径 round-trip 后该字段会变为缺席 (信息无损失, 形态有差异).
 - **OpenAI Responses API 支持范围**: Responses 协议 (`/r/` proto_short) 已接入 codec,
   支持 Responses ⇄ Chat Completions 跨协议翻译 (非流式) + Responses 同协议透传 + Redact (非流式).
   **不支持**: Responses 流式 SSE 事件翻译 (Responses + Redact + `stream=true` 返回 501;
-  无 Redact 且路由链无 model 重写的同协议流式透传正常工作; 配置了任一则 501, #183 D5;
-  跨协议 Responses 任一侧 + `stream=true` 同样 501); Responses ⇄ Anthropic 跨协议 (返回 501);
-  hosted tools (web_search/file_search/computer_use/mcp → 静默丢弃; MCP 在客户端 LLM 请求中
+  无 Redact 且路由链无 model 重写的同协议流式透传正常工作; 配置了任一则 501, #183 D5); Responses ⇄ Anthropic 跨协议 (返回 501);
+  hosted tools (web_search/file_search/computer_use/mcp → 跨协议翻译时丢弃并有 WARN
+  (`dropping hosted tool(s) in cross-protocol translation`, 见
+  `proxy/cross_proto.rs::count_hosted_tools_in_extra`; 同协议经 extra 透传保真); MCP 在客户端 LLM 请求中
   的呈现形态与协议约束边界调研见 `docs/research/mcp-notes.md`); namespace tools
   flattening; `previous_response_id` 服务端状态 (secret-guard 是 stateless 代理);
   reasoning items 的 `encrypted_content` (同协议 round-trip 也会丢失, 会破坏 reasoning chain).
