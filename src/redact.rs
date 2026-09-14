@@ -56,6 +56,11 @@
 //!   [`StreamingRestorer`] 在任意 chunk 切分下保证 round-trip identity —
 //!   `concat(push(c_1), push(c_2), ..., push(c_n), flush().1)` 严格等于
 //!   `content.replace(mock, real)`. UTF-8 安全 (多字节字符不在 char boundary 中间切).
+//! - **C8 JSON 叶子级兜底 restore (fallback restorability)**: codec 无法 parse 上游
+//!   响应时 (reader 拒绝 / 非 JSON body), [`restore_json_leaves_fallback`] 以
+//!   "parse 为 JSON Value + 字符串值叶子替换" 兜底还原 mock, 尽力不让 mock 逃逸到
+//!   客户端; 未命中/parse 失败返回 None 保持原字节透传 (byte-exact 优先).
+//!   契约编号: contracts.md **RED-8**.
 //!
 //! # 扫描覆盖范围
 //!
@@ -416,6 +421,45 @@ pub fn restore_ir_response(ir: &mut IrResponse, map: &RedactionMap) {
     ir.for_each_str_leaf_mut(&mut |s| restore_str(s, map));
 }
 
+/// 兜底 restore (C8): 把 bytes parse 为单个 JSON Value, 遍历所有字符串**值叶子**,
+/// 把 mock 替换回真实 secret. 仅在**至少发生一次替换**时返回 `Some(新字节)`;
+/// 未命中任何 mock / parse 失败 / map 空一律返回 `None` — 调用方保持**原字节透传**
+/// (FWD-1 byte-exact: 未命中 mock 的响应绝不能被重序列化).
+///
+/// # 为什么必须走 JSON 树遍历而非字节级 find/replace
+///
+/// real secret 若含 `"` / 反斜杠 / 控制字符, 其在 JSON wire 上的形态是**转义后的**
+/// (`\"` / `\\` / `\uXXXX`); 字节级把 mock 替换为 real 原文会把这些字符以**未转义**
+/// 形态插入, 破坏 JSON 结构 (raw `"` 提前终止字符串). JSON 树遍历在 String 值上做
+/// 替换, serde_json 重序列化时正确处理转义 — 输出仍是合法 JSON 且叶子 == real 原文
+/// (非 ASCII 字符同理: 语义上是同一个 String, 与 wire 形态无关). 此差异化价值由
+/// `restore_json_leaves_fallback_escapes_real_secret_correctly` 守卫.
+///
+/// # 契约 (ROB: best-effort 永不 panic)
+///
+/// - parse 失败返回 `None` (调用方透传原字节).
+/// - body 必须是**单个** JSON Value; SSE-shaped 多帧 body parse 失败 → `None`
+///   (留透传, 属已知限制, 见根 AGENTS.md "流式 + Redact" 条目).
+/// - 只遍历字符串**值**叶子 (Object 的 value / Array 元素递归), 不碰 Object key
+///   (key 极少承载 LLM echo 的 secret 内容, 改 key 会改变协议字段语义).
+///
+/// 调用方: `proxy::fan_out::fan_out_buffered_ir` / `proxy::cross_proto::cross_proto_forward`
+/// 的 parse-失败 fallback 分支 (codec reader 拒绝 / 非 JSON body 时尽力不让 mock 逃逸).
+pub fn restore_json_leaves_fallback(bytes: &[u8], map: &RedactionMap) -> Option<Vec<u8>> {
+    if map.is_empty() {
+        return None;
+    }
+    let mut v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let mut replaced = false;
+    v.for_each_str_leaf_mut(&mut |s| {
+        replaced |= restore_str_inplace(s, map);
+    });
+    if !replaced {
+        return None;
+    }
+    serde_json::to_vec(&v).ok()
+}
+
 /// disabled secret 明文放行检测 (#161): 对每个 decision=Disabled 的 secret, 检查其
 /// value 字节是否出现在原始请求 body 中; 命中的逐条 WARN (含 secret id).
 ///
@@ -670,15 +714,20 @@ impl crate::codec::stream::StreamRestoreHook for StreamingRestorerSet {
 }
 
 /// [`restore_str`] 的纯函数版本 (in-place), 复用同一段 find-and-replace 逻辑.
-pub(crate) fn restore_str_inplace(s: &mut String, map: &RedactionMap) {
+/// 返回是否发生了至少一次替换 — 供 [`restore_json_leaves_fallback`] 判断
+/// "未命中则保持原字节" (避免每个叶子 clone 比对).
+pub(crate) fn restore_str_inplace(s: &mut String, map: &RedactionMap) -> bool {
     if map.is_empty() || s.is_empty() {
-        return;
+        return false;
     }
+    let mut replaced = false;
     for (mock, real) in &map.mock_to_real {
         if s.contains(mock) {
             *s = s.replace(mock, real);
+            replaced = true;
         }
     }
+    replaced
 }
 
 // ─── IR traverse helpers (StringLeafOps trait) ──────────────────────────────
@@ -1925,6 +1974,76 @@ mod tests {
         }
     }
 
+    // ─── C8: restore_json_leaves_fallback (parse-失败 fallback 的 JSON 叶子级兜底) ──
+
+    /// 嵌套 JSON (数组/对象/字符串值叶子) 命中 mock → Some 且所有命中叶子被还原,
+    /// 未命中叶子保持原值.
+    #[test]
+    fn restore_json_leaves_fallback_restores_nested_leaves() {
+        let map = map_with("real-secret", "MOCKXYZLEAF1");
+        let body = br#"{"choices":[{"message":{"content":"a MOCKXYZLEAF1 b"}}],"arr":[1,"x MOCKXYZLEAF1 y",true],"untouched":"clean"}"#;
+        let out = restore_json_leaves_fallback(body, &map).expect("must restore");
+        let v: serde_json::Value = serde_json::from_slice(&out).expect("valid JSON out");
+        assert_eq!(v["choices"][0]["message"]["content"], "a real-secret b");
+        assert_eq!(v["arr"][1], "x real-secret y");
+        assert_eq!(v["untouched"], "clean");
+    }
+
+    /// 合法 JSON 但无 mock 命中 → None (byte-exact: 未命中的 body 绝不被重序列化).
+    #[test]
+    fn restore_json_leaves_fallback_no_mock_returns_none() {
+        let map = map_with("real-secret", "MOCKXYZLEAF1");
+        assert!(restore_json_leaves_fallback(br#"{"a":"no mock here","b":[1,2]}"#, &map).is_none());
+        // 非 JSON / SSE-shaped 多帧 body: parse 失败 → None (留透传, 已知限制).
+        assert!(
+            restore_json_leaves_fallback(
+                b"data: {\"x\":\"MOCKXYZLEAF1\"}\n\ndata: [DONE]\n\n",
+                &map
+            )
+            .is_none()
+        );
+        assert!(restore_json_leaves_fallback(b"not json at all", &map).is_none());
+    }
+
+    /// map 空 → None (无 redaction 在途, 兜底无从谈起).
+    #[test]
+    fn restore_json_leaves_fallback_empty_map_returns_none() {
+        let body = br#"{"a":"MOCKXYZLEAF1"}"#;
+        assert!(restore_json_leaves_fallback(body, &RedactionMap::default()).is_none());
+    }
+
+    /// 本 helper 的差异化价值: real secret 含 `"` / 反斜杠 / 中文时, 树遍历替换 +
+    /// serde 重序列化保证输出仍是合法 JSON 且叶子 == real 原文. (字节级 mock→real
+    /// 替换会把未转义的 `"` 插进 JSON 字符串, 提前终止字符串破坏结构.)
+    #[test]
+    fn restore_json_leaves_fallback_escapes_real_secret_correctly() {
+        let real = "他说\"hi\"\\路径"; // 含 `"` / 反斜杠 / 中文
+        let map = map_with(real, "MOCKXYZLEAF1");
+        let body = br#"{"echo":"prefix MOCKXYZLEAF1 suffix"}"#;
+        let out = restore_json_leaves_fallback(body, &map).expect("must restore");
+        let v: serde_json::Value =
+            serde_json::from_slice(&out).expect("escaped real must keep JSON valid");
+        assert_eq!(v["echo"], format!("prefix {real} suffix"));
+        // wire 上 real 的 `"` 必然以转义形态出现 (合法 JSON 的前提).
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("\\\""),
+            "raw quote must be escaped on wire: {text}"
+        );
+    }
+
+    /// Object key 不被 restore (契约: 只遍历字符串**值**叶子) — mock 出现在 key 时
+    /// key 保持原样, 同一 JSON 里的 value 叶子照常还原.
+    #[test]
+    fn restore_json_leaves_fallback_leaves_object_keys_untouched() {
+        let map = map_with("real-secret", "MOCKXYZLEAF1");
+        let body = br#"{"MOCKXYZLEAF1":"MOCKXYZLEAF1"}"#;
+        let out = restore_json_leaves_fallback(body, &map).expect("value leaf must restore");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(v.get("MOCKXYZLEAF1").is_some(), "key must stay untouched");
+        assert_eq!(v["MOCKXYZLEAF1"], "real-secret");
+    }
+
     // ─── StreamingRestorer ───────────────────────────────────────────────
 
     use super::StreamingRestorer;
@@ -3087,6 +3206,81 @@ mod tests {
                 "SEC-3 violation: tracing log leaks secret. log={}",
                 log
             );
+        }
+    }
+
+    // ─── C8/RED-8 property: JSON 叶子级兜底 restore (任意 JSON 树 + 嵌入 mock) ────
+
+    /// 任意 JSON 树生成器 (RED-8 覆盖度契约, §0.3): 字符串叶子限制在字母 'a'
+    /// 字母表 — mock (`MOCKq7ZLEAF`) 不可能随机出现, 保证 "无残留" 断言对随机树
+    /// 严格成立 (不靠概率). 树含 string/bool/number/null 叶子 + 嵌套 array/object.
+    fn arb_json_tree() -> impl Strategy<Value = serde_json::Value> {
+        let leaf = prop_oneof![
+            6 => "a{0,8}".prop_map(serde_json::Value::String),
+            1 => any::<bool>().prop_map(serde_json::Value::Bool),
+            1 => any::<i64>().prop_map(serde_json::Value::from),
+            1 => Just(serde_json::Value::Null),
+        ];
+        leaf.prop_recursive(3, 32, 4, |inner| {
+            use proptest::collection::vec as vec_strategy;
+            prop_oneof![
+                vec_strategy(inner.clone(), 0..4).prop_map(serde_json::Value::Array),
+                vec_strategy(("a{0,5}", inner.clone()), 0..4)
+                    .prop_map(|kvs| { serde_json::Value::Object(kvs.into_iter().collect()) }),
+            ]
+        })
+    }
+
+    /// 在第一字符串**值**叶子 (确定性 DFS 序: array 按序 / object 按 map 迭代序,
+    /// 与 `StringLeafOps for Value` 的遍历同构) 上套用 f. 无字符串叶子 → false.
+    fn map_first_string_leaf(v: &mut serde_json::Value, f: &impl Fn(String) -> String) -> bool {
+        match v {
+            serde_json::Value::String(s) => {
+                *s = f(std::mem::take(s));
+                true
+            }
+            serde_json::Value::Array(arr) => arr.iter_mut().any(|e| map_first_string_leaf(e, f)),
+            serde_json::Value::Object(obj) => obj.values_mut().any(|e| map_first_string_leaf(e, f)),
+            _ => false,
+        }
+    }
+
+    /// 按同一 DFS 序收集全部字符串值叶子 (供嵌入位置与还原结果的逐叶子比对).
+    fn collect_str_leaves(v: &serde_json::Value) -> Vec<String> {
+        let mut out = Vec::new();
+        v.for_each_str_leaf(&mut |s| out.push(s.to_string()));
+        out
+    }
+
+    proptest! {
+        /// RED-8: 任意 JSON 树的任一字符串值叶子嵌入 mock → 兜底 restore 后:
+        /// (i) 输出可 parse 为合法 JSON; (ii) 叶子列表 == [嵌入位置的预期串] ++
+        /// [其余原叶子] — 同时锁定 "对应位置含 real"、"无 mock 残留"、"其他叶子
+        /// 不变" 三个维度. 未嵌入时 (含无字符串叶子的树) → None (byte-exact 保持).
+        /// real 含 `"`/反斜杠/中文 (需转义字符), 差异化价值场景常驻.
+        #[test]
+        fn prop_json_leaf_fallback_restores_mock(v in arb_json_tree()) {
+            let real = "他说\"hi\"\\tok";
+            let mock = "MOCKq7ZLEAF";
+            let map = map_with(real, mock);
+
+            // 无 mock 命中 → None (未命中的 body 不被重序列化).
+            let orig_bytes = serde_json::to_vec(&v).unwrap();
+            prop_assert!(restore_json_leaves_fallback(&orig_bytes, &map).is_none());
+
+            let orig_leaves = collect_str_leaves(&v);
+            let mut embedded = v.clone();
+            if map_first_string_leaf(&mut embedded, &|_| format!("pre-{mock}-post")) {
+                let emb_bytes = serde_json::to_vec(&embedded).unwrap();
+                let out = restore_json_leaves_fallback(&emb_bytes, &map)
+                    .expect("embedded mock must be restored");
+                let restored: serde_json::Value = serde_json::from_slice(&out)
+                    .expect("fallback output must be valid JSON");
+                let mut expected_leaves = orig_leaves;
+                expected_leaves[0] = format!("pre-{real}-post");
+                prop_assert_eq!(collect_str_leaves(&restored), expected_leaves);
+            }
+            // else: 树无字符串叶子, 上方 None 断言已覆盖该分支.
         }
     }
 }

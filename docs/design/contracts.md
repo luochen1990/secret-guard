@@ -63,7 +63,7 @@
 | 段前缀 | 域 | 现有编号 → 新编号 | 原位置 |
 |---|---|---|---|
 | `FWD-*` | 转发忠实性 (域 A) | codec INV-1/2/5 → FWD-1/2/5; proxy DoD → FWD-4/6 | `src/proxy/mod.rs` 头部 + `src/codec/AGENTS.md` |
-| `RED-*` | Redact/Restore (域 A) | C1→RED-1, C2→RED-2, C3→RED-3, C4→RED-4, C5→RED-5, C6→RED-6, C7→RED-7 | `src/redact.rs` + `src/mock.rs` 头部 |
+| `RED-*` | Redact/Restore (域 A) | C1→RED-1, C2→RED-2, C3→RED-3, C4→RED-4, C5→RED-5, C6→RED-6, C7→RED-7, C8→RED-8 | `src/redact.rs` + `src/mock.rs` 头部 |
 | `STR-*` | 流式 SSE (域 A) | codec INV-4 → STR-5 | `src/codec/stream/` (目录, 拆分见 `src/codec/AGENTS.md`) |
 | `CDAG-*` | Conversation DAG (域 B) | INV-1→CDAG-1, INV-2→CDAG-2, INV-3→CDAG-3, INV-4→CDAG-4, INV-5→CDAG-5 | `src/dag/mod.rs` 头部 + `docs/design/conversation-dag.md` |
 | `DTO-*` | WebUI DTO 派生 (域 B) | (新增) | `src/web/AGENTS.md` + `src/record.rs` 头部 |
@@ -390,7 +390,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 ### RED-7 流式可逆性 (streaming restorability)
 
-**陈述**: `StreamingRestorer` 在任意 chunk 切分下保证 `concat(push(c_1..n), flush().1)` 严格等于 `content.replace(mock, real)`. UTF-8 安全. 同协议路径 (StreamTranslate 同协议 restore 模式) 与跨协议路径 (StreamTranslate 跨协议模式注入 hook, 2026-09-15 起接入 dispatch) 均适用.
+**陈述**: `StreamingRestorer` 在任意 chunk 切分下保证 round-trip identity — `concat(push(c_1..n), flush().1)` 严格等于 `content.replace(mock, real)`. UTF-8 安全.
 
 **Properties**:
 - `prop_streaming_restorer_round_trip`: 对任意 chunk_size (1..N), round-trip identity 成立. ✅
@@ -398,6 +398,17 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 - `prop_streaming_restorer_multi_mock`: 多 mock 在同一段文本中的 round-trip identity. 🔁→`prop_streaming_restorer_round_trip_multi_mock` + `restorer_round_trip_on_multiple_mocks_in_one_chunk` (`src/redact.rs`)
 - `prop_streaming_restorer_per_block_isolated`: 不同 block 的 restorer 状态独立 (block 间 mock 边界互不干扰). ⏳
 - `prop_cross_proto_streaming_no_mock_leak_dispatch_integrated` (2026-09-15): 跨协议流式 + restore (生产 dispatch 同型构造) 下, 客户端 SSE 不含 mock 且 content / tool input == 上游拼接 `.replace(mock, real)` (端到端 HTTP 层由集成测试 `cross_protocol_streaming_redact_restores_mock_no_leak` 覆盖). ✅
+
+### RED-8 JSON 叶子级兜底 restore (fallback restorability)
+
+**陈述**: codec 无法 parse 上游响应时 (`fan_out_buffered_ir` / `cross_proto_forward` 的 parse-失败 fallback 分支), 若 body 仍是**单个合法 JSON Value**, `restore_json_leaves_fallback` 必须在字符串**值叶子**上把 mock 还原为 real (JSON 树遍历, 非 byte find/replace — real 含 `"`/反斜杠/非 ASCII 时字节级替换会产出非法 JSON); 未命中任何 mock / parse 失败 (含 SSE-shaped 多帧 body) / map 空时返回 None, 调用方保持**原字节透传** (byte-exact 优先). Object key 不在遍历范围.
+
+**Properties**:
+- `prop_json_leaf_fallback_restores_mock`: 任意 JSON 树的任一字符串值叶子嵌入 mock → 兜底后输出可 parse 且叶子列表 == [嵌入位置的预期串 (含 real)] ++ [其余原叶子] (同时锁定 "对应位置含 real" / "无 mock 残留" / "其他叶子不变"); 未嵌入 → None. 生成器: string/bool/number/null 叶子 + 嵌套 array/object, 字符串字母表与 mock 不相交 (无残留断言严格成立); real 含 `"`/反斜杠/中文. ✅ `src/redact.rs::prop_json_leaf_fallback_restores_mock`.
+- `prop_json_leaf_fallback_escaped_real`: real 含 `"`/反斜杠/中文时, 兜底输出仍是合法 JSON 且叶子 == real 原文 (wire 上正确转义 — 字节级替换会破坏 JSON, 本 helper 的差异化价值). 🔁→`restore_json_leaves_fallback_escapes_real_secret_correctly` (`src/redact.rs`)
+- `prop_json_leaf_fallback_none_paths`: 未命中 / 非法 JSON / SSE-shaped 多帧 / map 空 → None (原字节透传, FWD-1 byte-exact 保持). 🔁→`restore_json_leaves_fallback_no_mock_returns_none` + `restore_json_leaves_fallback_empty_map_returns_none` (`src/redact.rs`) + `non_json_body_with_mock_still_passes_through_when_fallback_fails` (`tests/integration.rs`, 端到端行为守卫)
+- `prop_json_leaf_fallback_wired_in_fallback_branches`: 同协议 reader 拒绝 / 跨协议 reader 拒绝的端到端场景, 客户端收到还原后的 JSON + restored-via-fallback WARN (不带 secret 明文). 🔁→`buffered_reader_reject_restores_mock_via_json_leaf_fallback` + `cross_proto_reader_reject_restores_mock_via_json_leaf_fallback` (`tests/integration.rs`)
+- `prop_json_leaf_fallback_keys_untouched`: 只遍历字符串**值**叶子, Object key 不被改写. 🔁→`restore_json_leaves_fallback_leaves_object_keys_untouched` (`src/redact.rs`)
 
 ---
 
@@ -1081,6 +1092,7 @@ chars (char boundary 安全); 其余事件字段为受控类型, 天然无 secre
 
 | 日期 | 契约 ID | 调整 | 原因 |
 |---|---|---|---|
+| 2026-09-14 | RED-8 | 新增 JSON 叶子级兜底 restore 契约 (C8): codec parse 失败的 fallback 分支 (fan_out_buffered_ir / cross_proto_forward) 先尝试 JSON 树叶子级 restore, 尽力不让 mock 逃逸到客户端; 未命中/parse 失败返回 None 保持原字节透传. 同步补齐 cross_proto 非 JSON fallback 的 mock-not-restored WARN (#158 遗留). | parse-失败 fallback 透传含 mock 字节是已知逃逸路径; body 仍是合法 JSON (eg 字段类型错配) 时叶子级替换可堵住, byte-exact 仅在确有替换时让位 |
 | 2026-07-26 | (initial) | 建立本文档, 收纳 C1-C7 / INV-1..5 / I1-I3 为 RED-1..7 / CDAG-1..5 / UI-1..3 | QA 系统梳理, 边界契约先行 |
 | 2026-09-11 | USAGE-1/5/6/7 | 人工授权 (usage-stats v4): 存储层 JSONL → SQLite (USAGE-1 聚合一致性改为 SQL 直查, "重放恢复" 重述为 "持久恢复"; 无内存双份簿记); 聚合粒度 day → **hour** (≤14 天 hour bucket, 更长 day 折叠, by_day → by_bucket); USAGE-1 新增 rounds 三态维度 (round_kind 真值透传自 dag push 判定); USAGE-5 新增 status 原始状态码语义 (429/4xx/5xx 派生分类, 不落 per-class flag); USAGE-6 扫描范围扩至 mock; 新增 **USAGE-7** redact 审计持久化 + 治理三问扩展 (B 级: 事件明细 + mock; 位置元数据 category/count (C 级结构化落地, 只存位置不存内容) + 归因 api_key_label + 溯源 node 关联 (悬空容忍); 永不含 real secret 与上下文片段). | 用户需求: 小时精度 / SQLite / rounds 与 retry 可见性 / 429 独立统计 / redact 审计记录 |
 | 2026-07-26 | FWD-1 / FWD-2 | FWD-1 升级为透明中继半段式 byte-exact (端到端最强契约); FWD-2 降为 FWD-1 的分解 (纯 codec round-trip byte-exact, 便于 bug 定位); 增加 §0.3 Property 设计原则 + §0.4 冗余覆盖原则 | 讨论中意识到 semantic_equiv 难以测, normalize 后 byte-exact 是可机械验证的最强 property |

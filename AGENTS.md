@@ -742,11 +742,15 @@ configFile (escape hatch, 互斥). 凭据注入 (LoadCredential / sops 直接路
   extra / block-level 未知 part / response 侧 usage 字段位置 (详见 codec/AGENTS.md).
   同协议 + 无 Redact 路径仍 byte-exact.
 - **流式 + Redact + 非 2xx 上游错误**: SSE 错误流不是单个 JSON, parse 失败时 fallback
-  原样返回 (无 restore), 客户端可能看到 mock. 该 fallback 现在打 WARN
+  会先尝试 JSON 叶子级 restore 兜底 (RED-8, body 仍是单个 JSON error envelope 时可
+  还原 mock), 仅当兜底也失败 (如 SSE-shaped 多帧 body) 才原样返回 (无 restore),
+  客户端可能看到 mock. 兜底失败时打 WARN
   (`mock not restored; client will see mock values`, #158).
 - **流式 + Redact + 上游 Content-Type 非 text/event-stream**: 判型跳过流式 restore,
-  mock 逃逸到客户端 (与上一条同类, #158 发现的第三条逃逸路径). 行为不变 (透传),
-  但有两层 WARN: 判型处 (`non-SSE content-type for a stream=true request`) +
+  落入 buffered fallback. 该 fallback 会先尝试 JSON 叶子级 restore 兜底 (RED-8) —
+  body 是单个 JSON Value 时 mock 可被还原; 仅当兜底也失败 (如 SSE-shaped 多帧 body,
+  #158 发现的第三条逃逸路径) 才透传 (客户端看到 mock).
+  兜底失败时有两层 WARN: 判型处 (`non-SSE content-type for a stream=true request`) +
   parse 失败 fallback (`mock not restored`).
   后续效应: 客户端把 mock 回传进下一轮历史时, 触发 RED-3 例外场景 (mock 跨轮变化,
   见 contracts.md RED-3 例外裁决 / #143).
@@ -754,9 +758,11 @@ configFile (escape hatch, 互斥). 凭据注入 (LoadCredential / sops 直接路
   reader 无法 parse 时 (类型不符 / 空数组 / 越界), 转发路径 fallback 为透传含 mock 的字节, 无 restore,
   客户端收到 mock. 同协议路径见 `src/proxy/fan_out.rs` (non-stream 分支), 跨协议路径见
   `src/proxy/cross_proto.rs`. 均走 best-effort 鲁棒性原则 (ROB-*), parse 失败不 panic.
-  两路径在 redaction map 非空时均打 WARN (`mock not restored`, #158; 跨协议路径的
-  补齐经共享 helper `recorder::warn_mock_not_restored`, reader 拒绝与非 JSON fallback
-  两个分支都覆盖).
+  **JSON 叶子级 restore 兜底 (RED-8)**: 两路径的 fallback 分支都会先尝试
+  `redact::restore_json_leaves_fallback` (body 仍是单个合法 JSON 时, 在字符串值叶子上
+  还原 mock + `restored mocks via JSON leaf fallback` WARN); 仅当兜底也失败 (非 JSON /
+  SSE-shaped 多帧 / 无命中) 才透传 + `mock not restored` WARN (同协议 #158; 跨协议
+  已对称补齐, 含此前静默的非 JSON 分支).
 - **provider 协议与上游实际协议错配 → 静默空响应 (有 WARN)**: provider protocol=anthropic
   但上游实为 OpenAI shape 时, 2xx 响应被 reader 宽松解析为空 content + 全零 usage
   (reader 对缺字段 `unwrap_or_default` 降级, 不报错). 行为不变 (仍翻译返回), 但打 WARN

@@ -5079,18 +5079,18 @@ async fn streaming_redact_upstream_error_known_limitation_locked() {
     );
 }
 
-/// 已知限制回归 (变体): 流式 + Redact + 上游 4xx (eg 400 bad request) 时,
-/// 上游在响应 body 里 echo 了 mock. 与 500 + SSE 场景同样的降级路径, real_secret 不泄漏.
+/// RED-8 已知限制改善回归 (变体): 流式 + Redact + 上游 4xx (eg 400 bad request) 时,
+/// 上游在响应 body 里 echo 了 mock. 与 500 + SSE 场景同样落入 buffered fallback,
+/// 但 body 是**单个合法 JSON** → `restore_json_leaves_fallback` 在字符串值叶子上
+/// 把 mock 还原为 real (客户端拿到自己拥有的真 secret, 非 mock 逃逸).
 ///
-/// 实现细节: 即便上游返回单个 JSON (可被 serde_json::from_slice 解析),
-/// `fan_out_buffered_ir` 仍会 fallback 到原样返回 — 因为 codec reader 只能解析
-/// 成功响应 shape (eg OpenAI `{"choices":[...]}`), 无法把 `{"error":{...}}`
-/// 解析成 IrResponse, 故 `reader.read_response` 返回 Err → 原样返回.
-///
-/// 这条变体把 known-limitation 的覆盖从 "SSE body" 扩展到 "非 2xx body (任意 shape)",
-/// 进一步锁定: **只要上游返回非 2xx, restore 就走不通**, real_secret 仍不泄漏.
+/// 实现细节: codec reader 只能解析成功响应 shape (eg OpenAI `{"choices":[...]}`),
+/// 无法把 `{"error":{...}}` 解析成 IrResponse, `reader.read_response` 返回 Err →
+/// 走 RED-8 JSON 叶子级兜底 (而非原样返回). 与 500 + SSE 变体
+/// (`streaming_redact_upstream_error_known_limitation_locked`, SSE 多帧 body
+/// 兜底也失败, 仍透传) 分工锁定两分支.
 #[tokio::test]
-async fn streaming_redact_upstream_4xx_json_also_falls_back_without_restore() {
+async fn streaming_redact_upstream_4xx_json_restores_mock_via_leaf_fallback() {
     let real_secret = "sk-test-123";
     let expected_mock = predict_mock(real_secret);
     let mut upstream = spawn_mock_upstream().await;
@@ -5111,9 +5111,11 @@ async fn streaming_redact_upstream_4xx_json_also_falls_back_without_restore() {
     let secrets = test_secret_table_with(entries);
     let upstream_client = reqwest::Client::new();
     let records = ConversationDag::new(64, 500, 1);
+    let records_handle = records.clone();
     let provider = openai_provider("oa-main", &upstream.url());
     let proxy_url = spawn_proxy_full(vec![provider], upstream_client, records, secrets).await;
 
+    let (log, _log_guard) = capture_tracing(tracing::Level::WARN);
     let body = format!(
         r#"{{"model":"gpt-4o","stream":true,"messages":[{{"role":"user","content":"use {real_secret}"}}]}}"#
     );
@@ -5128,16 +5130,41 @@ async fn streaming_redact_upstream_4xx_json_also_falls_back_without_restore() {
     let text = resp.text().await.unwrap();
 
     assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-    // ★ 关键不变量: real_secret 绝不泄漏 (与 SSE 500 变体一致).
+    // RED-8: 单 JSON error envelope 的 mock 已被兜底还原 — 客户端看到自己拥有的
+    // real secret (而非 mock 逃逸). real 出现在客户端响应来自本地 RedactionMap,
+    // 不是上游 echo (上游从未收到 real, 由下方 req_body 断言守卫).
     assert!(
-        !text.contains(real_secret),
-        "REGRESSION: real_secret leaked to client in 4xx fallback path! got: {text}"
+        text.contains(real_secret),
+        "RED-8: mock in JSON error envelope must be restored to real; got: {text}"
     );
-    // 已知限制: 4xx + JSON 同样走 fallback (codec reader 无法把 error 解析成 IrResponse),
-    // 客户端看到 mock. 改善后此断言应换成 real_secret.
     assert!(
-        text.contains(&expected_mock),
-        "known limitation: 4xx response should fall back to verbatim (mock visible); got: {text}"
+        !text.contains(&expected_mock),
+        "RED-8: no mock should escape to client; got: {text}"
+    );
+    // 可观测: restored-via-fallback WARN.
+    let log_text = log.text();
+    assert!(
+        log_text.contains("restored mocks via JSON leaf fallback"),
+        "RED-8 violation: fallback restore WARN missing; log: {log_text}"
+    );
+    assert!(
+        !log_text.contains(real_secret),
+        "WARN must not leak real secret; log: {log_text}"
+    );
+
+    // 记录侧契约: req_body 必须已被 redact (LLM 视角, 不含 real_secret) —
+    // real 流向上游的方向性泄漏仍由这条守卫.
+    let list = wait_until_or_timeout(
+        &records_handle,
+        |l| l.first().map(|r| r.resp_complete).unwrap_or(false),
+        Duration::from_secs(2),
+    )
+    .await;
+    let r = &list[0];
+    assert!(
+        !r.req_body.contains(real_secret),
+        "record req_body must not contain real_secret; got: {}",
+        r.req_body
     );
 }
 
@@ -6193,6 +6220,207 @@ async fn stream_request_with_non_sse_upstream_warns_mock_not_restored() {
     assert!(
         !list[0].streamed,
         "non-SSE content-type must record streamed=false"
+    );
+}
+
+// ─── RED-8: JSON 叶子级 restore 兜底 (parse-失败 fallback 不让 mock 逃逸) ────
+//
+// codec 无法 parse 上游响应时 (reader 拒绝 / 非 JSON body), fan_out_buffered_ir 与
+// cross_proto_forward 的 fallback 分支先尝试 restore_json_leaves_fallback — body
+// 仍是合法 JSON 的场景下, mock 在字符串值叶子被还原, 客户端拿到 real.
+
+/// 同协议 + secret 命中 + 非流式 + 上游 200 但响应 JSON 无法被 codec reader 解析
+/// (choices 类型错配) 且含 mock → 兜底 restore: 客户端收到 real (不再逃逸 mock).
+#[tokio::test]
+async fn buffered_reader_reject_restores_mock_via_json_leaf_fallback() {
+    let real_secret = "sk-live-leaf12345678";
+    let expected_mock = predict_mock(real_secret);
+    let mut upstream = spawn_mock_upstream().await;
+    // reader 拒绝形态: `choices` 是 string (openai reader 要求 array 且非空) —
+    // 合法 JSON 但非协议 shape; echo 字段携带 mock (模拟 LLM 回响 redacted 内容).
+    let upstream_body = format!(r#"{{"choices":"wrongtype","echo":"saw {expected_mock} end"}}"#);
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(upstream_body)
+        .create_async()
+        .await;
+
+    let entries = vec![secret("api-key", real_secret)];
+    let secrets = test_secret_table_with(entries);
+    let provider = openai_provider("oa-main", &upstream.url());
+    let proxy_url = spawn_proxy_full(
+        vec![provider],
+        reqwest::Client::new(),
+        ConversationDag::new(64, 500, 1),
+        secrets,
+    )
+    .await;
+
+    let (log, _log_guard) = capture_tracing(tracing::Level::WARN);
+    let body = format!(
+        r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"keep {real_secret}"}}]}}"#
+    );
+    let (status, text, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        &body,
+        &[("content-type", "application/json")],
+    )
+    .await;
+
+    // 兜底 restore: 200 + echo 字段的 mock 已还原为 real.
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {text}");
+    let v: serde_json::Value =
+        serde_json::from_str(&text).expect("fallback output must remain valid JSON; got: {text}");
+    assert_eq!(
+        v["echo"],
+        format!("saw {real_secret} end"),
+        "mock must be restored to real; got: {text}"
+    );
+    assert!(!text.contains(&expected_mock), "got: {text}");
+
+    // 可观测: restored-via-fallback WARN (body 经过了非 codec 的改写路径).
+    let log_text = log.text();
+    assert!(
+        log_text.contains("restored mocks via JSON leaf fallback"),
+        "RED-8 violation: no WARN about fallback restore; log: {log_text}"
+    );
+    // 卫生: 日志不得含真实 secret.
+    assert!(
+        !log_text.contains(real_secret),
+        "WARN must not leak real secret; log: {log_text}"
+    );
+}
+
+/// 跨协议 (o→a) + secret + 上游 200 返回 reader 拒绝的 JSON (非 object 形态) 含
+/// mock → 客户端收到还原后的 JSON (cross_proto 的 reader 拒绝分支对称接入兜底).
+#[tokio::test]
+async fn cross_proto_reader_reject_restores_mock_via_json_leaf_fallback() {
+    let real_secret = "sk-live-xleaf34567";
+    let expected_mock = predict_mock(real_secret);
+    let mut upstream = spawn_mock_upstream().await;
+    // anthropic reader 拒绝形态: 顶层是 array (reader 要求 JSON object) — 合法 JSON
+    // 但非协议 shape; 元素携带 mock.
+    let upstream_body = format!(r#"[{{"content":"echo {expected_mock}"}}]"#);
+    let _m = upstream
+        .mock("POST", "/v1/messages")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(upstream_body)
+        .create_async()
+        .await;
+
+    let entries = vec![secret("api-key", real_secret)];
+    let secrets = test_secret_table_with(entries);
+    let provider = provider_with("an-main", Protocol::Anthropic, &upstream.url());
+    let proxy_url = spawn_proxy_full(
+        vec![provider],
+        reqwest::Client::new(),
+        ConversationDag::new(64, 500, 1),
+        secrets,
+    )
+    .await;
+
+    let (log, _log_guard) = capture_tracing(tracing::Level::WARN);
+    let body = format!(
+        r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"use {real_secret} now"}}]}}"#
+    );
+    let (status, text, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/an-main/v1/chat/completions",
+        &body,
+        &[("content-type", "application/json")],
+    )
+    .await;
+
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {text}");
+    // 兜底 restore 后的 JSON: 叶子里的 mock 已还原 (仍是 array 形态的透传 shape).
+    let v: serde_json::Value =
+        serde_json::from_str(&text).expect("fallback output must remain valid JSON; got: {text}");
+    assert_eq!(
+        v[0]["content"],
+        format!("echo {real_secret}"),
+        "mock must be restored to real; got: {text}"
+    );
+    assert!(!text.contains(&expected_mock), "got: {text}");
+
+    // 可观测: cross_proto 此前缺 restored/mock-not-restored 信号, 现在对称.
+    let log_text = log.text();
+    assert!(
+        log_text.contains("restored mocks via JSON leaf fallback"),
+        "RED-8 violation: cross-proto fallback restore WARN missing; log: {log_text}"
+    );
+    assert!(
+        !log_text.contains(real_secret),
+        "WARN must not leak real secret; log: {log_text}"
+    );
+}
+
+/// 上游返回非 JSON body (SSE 形态) 含 mock → 兜底无法 parse → 仍原样透传
+/// (行为守卫: 保持现状不劣化) + mock-not-restored WARN.
+#[tokio::test]
+async fn non_json_body_with_mock_still_passes_through_when_fallback_fails() {
+    let real_secret = "sk-live-njson456789";
+    let expected_mock = predict_mock(real_secret);
+    let mut upstream = spawn_mock_upstream().await;
+    let sse_body = format!(
+        concat!(
+            "data: {{\"choices\": [{{\"delta\": {{\"content\": \"saw {mock}\"}}}}]}}\n\n",
+            "data: [DONE]\n\n",
+        ),
+        mock = expected_mock,
+    );
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(sse_body.clone())
+        .create_async()
+        .await;
+
+    let entries = vec![secret("api-key", real_secret)];
+    let secrets = test_secret_table_with(entries);
+    let provider = openai_provider("oa-main", &upstream.url());
+    let proxy_url = spawn_proxy_full(
+        vec![provider],
+        reqwest::Client::new(),
+        ConversationDag::new(64, 500, 1),
+        secrets,
+    )
+    .await;
+
+    let (log, _log_guard) = capture_tracing(tracing::Level::WARN);
+    let body = format!(
+        r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"keep {real_secret}"}}]}}"#
+    );
+    let (status, text, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        &body,
+        &[("content-type", "application/json")],
+    )
+    .await;
+
+    // 兜底失败 (非单 JSON Value): 原样透传 (已知限制, 行为不变).
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(
+        text, sse_body,
+        "fallback failure must pass body through verbatim"
+    );
+    // mock-not-restored WARN 仍在 (detail 补充 json leaf fallback also failed).
+    let log_text = log.text();
+    assert!(
+        log_text.contains("mock not restored"),
+        "mock-not-restored WARN must still fire; log: {log_text}"
+    );
+    assert!(
+        log_text.contains("json leaf fallback also failed"),
+        "WARN detail should mention fallback attempt; log: {log_text}"
     );
 }
 

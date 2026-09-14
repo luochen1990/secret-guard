@@ -282,6 +282,38 @@ fn is_sensitive_header(name: &str) -> bool {
 
 // ─── usage-stats 采集上下文构造 (三转发路径共享) ─────────────────────────────
 
+// ─── parse-失败 fallback 可观测性 (#158 + RED-8, fan_out / cross_proto 共享) ──
+
+/// 上游响应 parse 失败 (codec reader 拒绝 / 非 JSON) 但 JSON 叶子级兜底 restore
+/// **成功**还原了 mock (RED-8). 客户端拿到的是真 secret, 但 body 经过了非 codec 的
+/// 改写路径 (重序列化), 记 WARN 保持可观测 (风格仿照 #158 的 mock-not-restored).
+pub(super) fn warn_mocks_restored_via_json_leaf_fallback(record_id: uuid::Uuid) {
+    tracing::warn!(
+        %record_id,
+        detail = "restored mocks via JSON leaf fallback; response was not parseable by codec",
+        "response parse failed with redactions in flight; \
+         mocks restored via JSON leaf fallback"
+    );
+}
+
+/// 上游响应 parse 失败且 JSON 叶子级兜底也失败 → mock 逃逸到客户端 (#158).
+/// 仅当本请求做过 redact (`map` 非空) 时打 — 无 redaction 在途的 parse 失败只是
+/// 普通透传, 无 mock 可逃.
+pub(super) fn warn_mock_not_restored(
+    record_id: uuid::Uuid,
+    detail: &str,
+    map: &crate::redact::RedactionMap,
+) {
+    if !map.is_empty() {
+        tracing::warn!(
+            %record_id,
+            detail,
+            "response parse failed with redactions in flight; \
+             mock not restored; client will see mock values"
+        );
+    }
+}
+
 /// usage 接线参数 (usage_ctx_and_record_redactions 的收口 — 避免 10 参签名).
 pub(super) struct UsageWire<'a> {
     pub fp: &'a super::ForwardPath,

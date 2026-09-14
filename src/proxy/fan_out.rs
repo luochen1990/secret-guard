@@ -389,10 +389,14 @@ pub(crate) async fn fan_out_buffered_ir(
     // usage-stats 回显摘要: parse 成功时从 IrResponse 提取 (restore 只改字符串叶子,
     // 不触碰 usage 数字, 但在 restore 前提取保持 "LLM 原始回显" 语义清晰).
     let mut resp_echo = ResponseEcho::default();
-    // #158: parse 失败 fallback 的 mock-not-restored WARN 走 recorder 共享 helper
-    // (与 cross_proto 非流式 fallback 分支对称).
-    let warn_not_restored = |detail: &str| {
-        super::recorder::warn_mock_not_restored(record_id, &redaction_map, detail);
+    // #158 + RED-8: parse 失败 fallback 家族的可观测性 (SSOT 在 helpers, cross_proto
+    // 对称使用): 兜底 restore 成功 → restored-via-fallback WARN; 兜底也失败且本请求
+    // 做过 redact (map 非空) → mock-not-restored WARN (客户端拿到假 secret, 可感知).
+    let warn_mock_not_restored = |detail: &str| {
+        super::helpers::warn_mock_not_restored(record_id, detail, &redaction_map);
+    };
+    let warn_restored_via_fallback = || {
+        super::helpers::warn_mocks_restored_via_json_leaf_fallback(record_id);
     };
     let client_bytes: Vec<u8> = if recorder.error_kind.is_some() {
         // stream 中途中断 → 不 parse, 返回空 body (状态码下方调整为 502/504).
@@ -416,20 +420,44 @@ pub(crate) async fn fan_out_buffered_ir(
                     serde_json::to_vec(&restored).unwrap_or_else(|_| recorder.acc.clone())
                 }
                 Err(e) => {
-                    warn_not_restored(&format!(
-                        "codec reader ({}) rejected response: {}",
-                        reader.name(),
-                        e.message
-                    ));
-                    recorder.acc.clone() // parse 失败: 原样返回 (无 restore).
+                    // RED-8: reader 拒绝 (eg choices 类型错配) 但 body 仍是合法 JSON —
+                    // 先尝试 JSON 叶子级 restore 兜底, 尽力不让 mock 逃逸到客户端.
+                    match crate::redact::restore_json_leaves_fallback(&recorder.acc, &redaction_map)
+                    {
+                        Some(restored) => {
+                            warn_restored_via_fallback();
+                            restored
+                        }
+                        None => {
+                            warn_mock_not_restored(&format!(
+                                "codec reader ({}) rejected response: {}; \
+                                 json leaf fallback also failed",
+                                reader.name(),
+                                e.message
+                            ));
+                            recorder.acc.clone() // parse 失败: 原样返回 (无 restore).
+                        }
+                    }
                 }
             },
             Err(e) => {
-                warn_not_restored(&format!(
-                    "response body is not a single JSON value ({e}); \
-                     likely SSE-shaped body under a non-SSE content-type"
-                ));
-                recorder.acc.clone() // 非 JSON: 原样返回.
+                // 非 JSON body (eg SSE-shaped 多帧): 叶子级兜底同样无法 parse →
+                // None → 透传 (已知限制, 见根 AGENTS.md). Some 分支防御性保留
+                // (与 reader 拒绝分支对称; 单 JSON Value 不会走到这里).
+                match crate::redact::restore_json_leaves_fallback(&recorder.acc, &redaction_map) {
+                    Some(restored) => {
+                        warn_restored_via_fallback();
+                        restored
+                    }
+                    None => {
+                        warn_mock_not_restored(&format!(
+                            "response body is not a single JSON value ({e}); \
+                             likely SSE-shaped body under a non-SSE content-type; \
+                             json leaf fallback also failed"
+                        ));
+                        recorder.acc.clone() // 非 JSON: 原样返回.
+                    }
+                }
             }
         }
     };

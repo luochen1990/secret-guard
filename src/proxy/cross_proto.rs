@@ -389,33 +389,47 @@ pub(crate) async fn cross_proto_forward(
                 }
                 Err(e) => {
                     warn!(%record_id, error = %e.message, "failed to parse upstream response as {}; passing through verbatim", provider.protocol.name());
-                    // #158 补全: parse 失败 fallback + redact 在飞 → mock 不被 restore,
-                    // 客户端拿到假 secret. 与 same_proto 路径 (fan_out_buffered_ir) 对称的
-                    // 可感知 WARN (行为不变: 仍原样透传).
-                    super::recorder::warn_mock_not_restored(
-                        record_id,
-                        &redaction_map,
-                        &format!(
-                            "cross-proto codec reader ({}) rejected response: {}",
-                            provider.protocol.name(),
-                            e.message
-                        ),
-                    );
-                    (resp_status, resp_bytes.to_vec())
+                    // RED-8: reader 拒绝但 body 仍是合法 JSON — 先尝试 JSON 叶子级
+                    // restore 兜底 (与 fan_out_buffered_ir 对称), 不让 mock 逃逸.
+                    match crate::redact::restore_json_leaves_fallback(&resp_bytes, &redaction_map) {
+                        Some(restored) => {
+                            super::helpers::warn_mocks_restored_via_json_leaf_fallback(record_id);
+                            (resp_status, restored)
+                        }
+                        None => {
+                            // 补齐 #158 的 mock-not-restored 信号 (cross_proto 此前缺失).
+                            super::helpers::warn_mock_not_restored(
+                                record_id,
+                                "codec reader rejected response; json leaf fallback also failed",
+                                &redaction_map,
+                            );
+                            (resp_status, resp_bytes.to_vec())
+                        }
+                    }
                 }
             },
             Err(e) => {
-                // #158 补全: 非 JSON body (如 SSE-shaped body 判型降级到此处) 同样
-                // 无法 restore, 对称 WARN.
-                super::recorder::warn_mock_not_restored(
-                    record_id,
-                    &redaction_map,
-                    &format!(
-                        "cross-proto response body is not a single JSON value ({e}); \
-                         likely SSE-shaped body under a non-SSE content-type"
-                    ),
-                );
-                (resp_status, resp_bytes.to_vec())
+                // 非 JSON body: 兜底同样无法 parse → None → 透传 (已知限制).
+                // Some 分支防御性保留 (与 reader 拒绝分支对称; 单 JSON Value 不走到这里).
+                match crate::redact::restore_json_leaves_fallback(&resp_bytes, &redaction_map) {
+                    Some(restored) => {
+                        super::helpers::warn_mocks_restored_via_json_leaf_fallback(record_id);
+                        (resp_status, restored)
+                    }
+                    None => {
+                        // 此前完全静默 — 补 WARN (已知限制条目明说要补的 mock-not-restored
+                        // 信号; 无 redaction 在途时只是普通透传, 不打).
+                        super::helpers::warn_mock_not_restored(
+                            record_id,
+                            &format!(
+                                "response body is not a single JSON value ({e}); \
+                                 json leaf fallback also failed"
+                            ),
+                            &redaction_map,
+                        );
+                        (resp_status, resp_bytes.to_vec())
+                    }
+                }
             }
         }
     } else {
