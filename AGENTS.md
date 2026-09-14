@@ -836,10 +836,6 @@ configFile (escape hatch, 互斥). 凭据注入 (LoadCredential / sops 直接路
 
 ## 后续工作 (非 MVP 范围)
 
-- **#162 协议错配 WARN 覆盖面补全 (#183 关联)**: M1 短路后, "secrets 配置但未命中"
-  的非流式响应走 `fan_out_streaming` 一次性 parse, 不再经过 `warn_if_protocol_mismatch`
-  (该 WARN 现只在 redact 命中 / cross_proto 路径触发)。可在 fan_out_streaming 的
-  非流式 finalize 处补对称调用 (注意会同时覆盖纯 passthrough 家族, 属行为增强需单独决策)。
 - **跨协议路径的 mock-not-restored WARN**: cross_proto 响应 parse 失败 fallback
   (reader 拒绝 / 非 JSON) 时, 与同协议路径 (`proxy/fan_out.rs::warn_mock_not_restored`)
   对称地在 redaction map 非空时打 `mock not restored` WARN (#158 只覆盖了

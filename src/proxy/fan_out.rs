@@ -279,6 +279,14 @@ pub(crate) async fn fan_out_streaming(
                 // (reader/writer 来自同一 codec, 守卫等价于 codec 内部 round-trip 测试的运行时抽查).
                 let (parsed, echo) = match parsed_ir {
                     Some(ir) => {
+                        // #162: 协议错配 WARN (空 content + 零 usage 启发式, 共享 helper).
+                        // parse 失败 (None) 不调: 无 IR 对象可查, 透传降级已有自身语义.
+                        super::recorder::warn_if_protocol_mismatch(
+                            record_id,
+                            reader.name(),
+                            &ir,
+                            resp_status.is_success(),
+                        );
                         let echo = ResponseEcho::from_ir(&ir);
                         (Some(writer.write_response(&ir)), echo)
                     }

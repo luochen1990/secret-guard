@@ -5982,7 +5982,8 @@ async fn protocol_mismatch_silent_empty_response_warns() {
     let (log, _log_guard) = capture_tracing(tracing::Level::WARN);
     // body 命中 secret → redaction map 非空 → 响应走 restore 路径 (buffered_ir,
     // reader 宽松解析发生处). 注: #183 M1 后, "配置了 secret 但未命中" 的请求响应
-    // 字节透传 (map 空), 不再经过 reader — MRE 形态只出现在真正的 restore 路径上.
+    // 字节透传 (map 空), 客户端不再看到 MRE 形态 — 但 record 派生侧仍经过 reader
+    // (fan_out_streaming 非流式一次性 parse, protocol_mismatch WARN 亦挂于此).
     let (status, text, _) = proxy_request(
         &proxy_url,
         "POST",
@@ -6013,6 +6014,61 @@ async fn protocol_mismatch_silent_empty_response_warns() {
         "#162: WARN should hint protocol mismatch; log: {log_text}"
     );
     // 可定位: record_id (uuid 格式字段) 必须出现.
+    assert!(
+        log_text.contains("record_id"),
+        "#162: WARN lacks record_id for locating; log: {log_text}"
+    );
+}
+
+/// #162 覆盖面补全: 纯 passthrough 家族 (无 secret 配置 → same_proto 字节透传) 的
+/// 非流式 2xx 响应协议错配 → 空 content + 零 usage, 行为不变 (byte-exact 透传),
+/// 但必须打 WARN (此前该家族无 WARN 触点, 错配静默).
+#[tokio::test]
+async fn protocol_mismatch_warns_on_pure_passthrough_nonstream() {
+    let mut upstream = spawn_mock_upstream().await;
+    // OpenAI shape 响应 (choices[]) 喂给 anthropic provider — 错配 MRE 同
+    // protocol_mismatch_silent_empty_response_warns, 差异仅在不配 secret.
+    let openai_shape_body = r#"{"id":"chatcmpl-mock-1","object":"chat.completion","model":"claude","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":2,"total_tokens":11}}"#;
+    let _m = upstream
+        .mock("POST", "/v1/messages")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(openai_shape_body)
+        .create_async()
+        .await;
+
+    // 无 secret → same_proto 走纯字节透传 (passthrough 家族, fan_out_streaming
+    // 非流式分支做一次性 parse 仅为派生 parsed view).
+    let provider = provider_with("mixed-pt", Protocol::Anthropic, &upstream.url());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+
+    let (log, _log_guard) = capture_tracing(tracing::Level::WARN);
+    let (status, text, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/a/mixed-pt/v1/messages",
+        r#"{"model":"claude","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}"#,
+        &[("content-type", "application/json")],
+    )
+    .await;
+
+    // (i) 行为不变: 200 + byte-exact 透传 (passthrough 家族无 IR 改写).
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(
+        text, openai_shape_body,
+        "passthrough family must stay byte-exact; body: {text}"
+    );
+
+    // (ii) WARN 被捕获: 协议错配信号 (与 redact 路径同文案, 两路径统一可 grep).
+    let log_text = log.text();
+    assert!(
+        log_text.contains("empty content and zero usage"),
+        "#162 coverage gap: pure-passthrough non-stream family emits no mismatch WARN; log: {log_text}"
+    );
+    assert!(
+        log_text.contains("does the upstream actually speak"),
+        "#162: WARN should hint protocol mismatch; log: {log_text}"
+    );
     assert!(
         log_text.contains("record_id"),
         "#162: WARN lacks record_id for locating; log: {log_text}"
