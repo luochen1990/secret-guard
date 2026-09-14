@@ -905,8 +905,9 @@ configFile (escape hatch, 互斥). 凭据注入 (LoadCredential / sops 直接路
   (real 不还原 — 失败响应体高概率进客户端日志); 显式 `"restore"` opt-in 时先尝试
   JSON 叶子级 restore 兜底 (RED-8, body 仍是单个 JSON error envelope 时可还原 mock),
   仅当兜底也失败 (如 SSE-shaped 多帧 body) 才原样返回. 两形态都打 WARN
-  (`mock not restored; client will see mock values`, #158 — withhold 形态的 WARN
-  detail 额外含 opt-in 提示).
+  (`mock not restored; client will see mock values`, #158 — WARN detail 的 opt-in
+  提示只在 reader-拒绝 + 单 JSON 臂出现 (restore 唯一有意义的地方); 非 JSON 臂
+  (含本条目的 SSE 多帧场景) 无提示, restore 本就无意义).
 - **流式 + Redact + 上游 Content-Type 非 text/event-stream**: 判型跳过流式 restore,
   落入 buffered fallback. 该 fallback 同按 `on_fallback_restore` 分流 (SEC-10):
   默认 withhold 保留 Mock 透传; 显式 `"restore"` 时 body 是单个 JSON Value 的 mock

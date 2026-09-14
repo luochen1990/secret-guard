@@ -110,6 +110,7 @@ async fn spawn(providers: Vec<Provider>) -> String {
     let persist_lock = Arc::new(parking_lot::Mutex::new(()));
     let provider_table =
         ProviderTable::with_persist_lock(providers, vec![], decisions, state_path, persist_lock);
+    let redact = secret_guard::config::RedactConfig::default();
     let proxy = AppState {
         upstream: reqwest::Client::new(),
         providers: provider_table,
@@ -118,9 +119,10 @@ async fn spawn(providers: Vec<Provider>) -> String {
         api_keys: test_api_key_store(),
         auth_enabled: false,
         global_mock_prefix: Arc::from(""),
-        on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,
-        on_unsupported_protocol: secret_guard::config::OnUnsupportedProtocol::FailOpen,
-        on_fallback_restore: secret_guard::config::OnFallbackRestore::Withhold,
+        // [redact] 三 gate 镜像生产默认 (SEC-10); 本 harness 不触降级路径.
+        on_probe_exhausted: redact.on_probe_exhausted,
+        on_unsupported_protocol: redact.on_unsupported_protocol,
+        on_fallback_restore: redact.on_fallback_restore,
         upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
         model_lists: Arc::new(ModelListCache::new()),
         usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),

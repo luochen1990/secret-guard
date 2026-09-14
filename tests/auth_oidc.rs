@@ -1117,6 +1117,7 @@ async fn spawn_full_auth_router() -> String {
         secrets_state_path,
         persist_lock,
     );
+    let redact = secret_guard::config::RedactConfig::default();
     let state = secret_guard::state::AppState {
         upstream: reqwest::Client::new(),
         providers,
@@ -1125,9 +1126,10 @@ async fn spawn_full_auth_router() -> String {
         api_keys: api_keys.clone(),
         auth_enabled: true,
         global_mock_prefix: std::sync::Arc::from(""),
-        on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,
-        on_unsupported_protocol: secret_guard::config::OnUnsupportedProtocol::FailOpen,
-        on_fallback_restore: secret_guard::config::OnFallbackRestore::Withhold,
+        // [redact] 三 gate 镜像生产默认 (SEC-10); 本 harness 不触降级路径.
+        on_probe_exhausted: redact.on_probe_exhausted,
+        on_unsupported_protocol: redact.on_unsupported_protocol,
+        on_fallback_restore: redact.on_fallback_restore,
         upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
         model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
         usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),

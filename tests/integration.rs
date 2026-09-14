@@ -184,26 +184,9 @@ async fn spawn_proxy_static_dynamic(
     // SecretTable 由调用方构造 (内部已带独立的 decisions + persist_lock).
     // 测试场景下 secrets 与 providers 不共享 state 文件, 不影响测试结论.
     let _ = (decisions, persist_lock);
-    // [redact] 三 gate 镜像生产默认 (RedactConfig::default, SEC-10 降级偏安全) —
-    // 本 harness 不指定 [redact] 行为, 测试默认路径; 需要 opt-in 的测试用
-    // spawn_proxy_with_redact_gates 显式传三 gate.
-    let redact = secret_guard::config::RedactConfig::default();
-    let proxy = AppState {
-        upstream,
-        providers: provider_table,
-        dag: records,
-        secrets,
-        api_keys: test_api_key_store(),
-        auth_enabled: false,
-        global_mock_prefix: std::sync::Arc::from(""),
-        on_probe_exhausted: redact.on_probe_exhausted,
-        on_unsupported_protocol: redact.on_unsupported_protocol,
-        on_fallback_restore: redact.on_fallback_restore,
-        upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
-        model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
-        usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),
-        pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::for_tests()),
-    };
+    // [redact] 三 gate 镜像生产默认 (base_app_state SSOT, SEC-10); 需要 opt-in
+    // 的测试用 spawn_proxy_with_redact_gates 显式传三 gate.
+    let proxy = base_app_state(upstream, provider_table, records, secrets);
     let app = server::build_router(
         proxy,
         secret_guard::server_host_guard::HostGuard::new("127.0.0.1", addr.port()),
@@ -233,23 +216,14 @@ async fn spawn_proxy_with_prefix(global_mock_prefix: &str) -> String {
     );
     let secrets = test_secret_table();
     let _ = (decisions, persist_lock, state_path);
-    // [redact] 三 gate 镜像生产默认 (同 spawn_proxy_static_dynamic 注释).
-    let redact = secret_guard::config::RedactConfig::default();
     let proxy = AppState {
-        upstream: reqwest::Client::new(),
-        providers: provider_table,
-        dag: ConversationDag::new(64, 500, 1),
-        secrets,
-        api_keys: test_api_key_store(),
-        auth_enabled: false,
         global_mock_prefix: std::sync::Arc::from(global_mock_prefix),
-        on_probe_exhausted: redact.on_probe_exhausted,
-        on_unsupported_protocol: redact.on_unsupported_protocol,
-        on_fallback_restore: redact.on_fallback_restore,
-        upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
-        model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
-        usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),
-        pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::for_tests()),
+        ..base_app_state(
+            reqwest::Client::new(),
+            provider_table,
+            ConversationDag::new(64, 500, 1),
+            secrets,
+        )
     };
     let app = server::build_router(
         proxy,
@@ -261,11 +235,42 @@ async fn spawn_proxy_with_prefix(global_mock_prefix: &str) -> String {
     format!("http://{addr}")
 }
 
+/// AppState 测试构造 SSOT: 恒定字段 (api_keys / auth_enabled / [redact] 三 gate
+/// 镜像生产默认 SEC-10 / model_lists / pricing) 收口在此; 差异字段经参数传入,
+/// 个别差异用 struct-update 覆盖 (`AppState { field, ..base_app_state(..) }`).
+/// 新增 AppState 字段时: 默认值改这里, 非 harness 字面量会因缺字段编译失败 —
+/// 强制逐处显式决策, 杜绝镜像漂移 (曾发生: gate 默认翻转漏改 3 处 harness).
+fn base_app_state(
+    upstream: reqwest::Client,
+    providers: ProviderTable,
+    dag: ConversationDag,
+    secrets: SecretTable,
+) -> AppState {
+    let redact = secret_guard::config::RedactConfig::default();
+    AppState {
+        upstream,
+        providers,
+        dag,
+        secrets,
+        api_keys: test_api_key_store(),
+        auth_enabled: false,
+        global_mock_prefix: std::sync::Arc::from(""),
+        on_probe_exhausted: redact.on_probe_exhausted,
+        on_unsupported_protocol: redact.on_unsupported_protocol,
+        on_fallback_restore: redact.on_fallback_restore,
+        upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
+        model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
+        usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),
+        pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::for_tests()),
+    }
+}
+
 /// 启动 secret-guard, 显式指定三个 `[redact]` 降级 gate (on_probe_exhausted /
 /// on_unsupported_protocol / on_fallback_restore) + provider 列表 + secret 表 +
 /// upstream client. (`spawn_proxy_with_probe_mode` / codec-less 停损 / RED-8 restore
 /// opt-in 测试的共享核心 — 三个 gate 独立配置, 各测试只动其需要的, 其余传
 /// `..::default()` 保持生产默认, SEC-10 降级偏安全.)
+#[allow(clippy::too_many_arguments)]
 async fn spawn_proxy_with_redact_gates(
     on_probe_exhausted: secret_guard::config::OnProbeExhausted,
     on_unsupported_protocol: secret_guard::config::OnUnsupportedProtocol,
@@ -274,6 +279,7 @@ async fn spawn_proxy_with_redact_gates(
     secrets: SecretTable,
     upstream: reqwest::Client,
     state_tag: &str,
+    records: ConversationDag,
 ) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -291,20 +297,10 @@ async fn spawn_proxy_with_redact_gates(
     );
     let _ = (decisions, persist_lock, state_path);
     let proxy = AppState {
-        upstream,
-        providers: provider_table,
-        dag: ConversationDag::new(64, 500, 1),
-        secrets,
-        api_keys: test_api_key_store(),
-        auth_enabled: false,
-        global_mock_prefix: std::sync::Arc::from(""),
         on_probe_exhausted,
         on_unsupported_protocol,
         on_fallback_restore,
-        upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
-        model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
-        usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),
-        pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::for_tests()),
+        ..base_app_state(upstream, provider_table, records, secrets)
     };
     let app = server::build_router(
         proxy,
@@ -334,6 +330,7 @@ async fn spawn_proxy_with_probe_mode(
         secrets,
         reqwest::Client::new(),
         "sg-state-probe",
+        ConversationDag::new(64, 500, 1),
     )
     .await
 }
@@ -2847,23 +2844,14 @@ async fn spawn_proxy_with_timeouts_and_secrets(
     );
     let _ = (decisions, persist_lock, state_path);
     let dag = ConversationDag::new(64, 500, 1);
-    // [redact] 三 gate 镜像生产默认 (同 spawn_proxy_static_dynamic 注释).
-    let redact = secret_guard::config::RedactConfig::default();
     let proxy = AppState {
-        upstream: server::build_upstream_client(upstream_timeouts.connect).unwrap(),
-        providers: provider_table,
-        dag: dag.clone(),
-        secrets,
-        api_keys: test_api_key_store(),
-        auth_enabled: false,
-        global_mock_prefix: std::sync::Arc::from(""),
-        on_probe_exhausted: redact.on_probe_exhausted,
-        on_unsupported_protocol: redact.on_unsupported_protocol,
-        on_fallback_restore: redact.on_fallback_restore,
         upstream_timeouts,
-        model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
-        usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),
-        pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::for_tests()),
+        ..base_app_state(
+            server::build_upstream_client(upstream_timeouts.connect).unwrap(),
+            provider_table,
+            dag.clone(),
+            secrets,
+        )
     };
     let app = server::build_router(
         proxy,
@@ -4829,24 +4817,12 @@ async fn cross_table_shared_state_no_lost_update() {
     );
     let secret_table =
         SecretTable::with_persist_lock(vec![], vec![], decisions, state_path.clone(), persist_lock);
-    // [redact] 三 gate 镜像生产默认 (同 spawn_proxy_static_dynamic 注释).
-    let redact = secret_guard::config::RedactConfig::default();
-    let proxy = AppState {
-        upstream: reqwest::Client::new(),
-        providers: provider_table,
-        dag: ConversationDag::new(64, 500, 1),
-        secrets: secret_table,
-        api_keys: test_api_key_store(),
-        auth_enabled: false,
-        global_mock_prefix: std::sync::Arc::from(""),
-        on_probe_exhausted: redact.on_probe_exhausted,
-        on_unsupported_protocol: redact.on_unsupported_protocol,
-        on_fallback_restore: redact.on_fallback_restore,
-        upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
-        model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
-        usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),
-        pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::for_tests()),
-    };
+    let proxy = base_app_state(
+        reqwest::Client::new(),
+        provider_table,
+        ConversationDag::new(64, 500, 1),
+        secret_table,
+    );
     let app = server::build_router(
         proxy,
         secret_guard::server_host_guard::HostGuard::new("127.0.0.1", addr.port()),
@@ -5162,48 +5138,19 @@ async fn streaming_redact_upstream_4xx_json_restores_mock_via_leaf_fallback() {
     let records = ConversationDag::new(64, 500, 1);
     let records_handle = records.clone();
     let provider = openai_provider("oa-main", &upstream.url());
-    // RED-8 兜底 restore 是 opt-in 行为 (SEC-10 默认 withhold), 显式配置.
-    // 内联 harness (spawn_proxy_with_redact_gates 不暴露内部 dag), 以便用
-    // records_handle 轮询 record 断言.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let state_path = tmp_state_path("sg-state-r8-restore-4xx");
-    let decisions = std::sync::Arc::new(parking_lot::RwLock::new(
-        secret_guard::config::Decisions::default(),
-    ));
-    let persist_lock = std::sync::Arc::new(parking_lot::Mutex::new(()));
-    let provider_table = ProviderTable::with_persist_lock(
+    // RED-8 兜底 restore 是 opt-in 行为 (SEC-10 默认 withhold), 显式配置;
+    // records 经 gates harness 传入, 保留 handle 供轮询 record 断言.
+    let proxy_url = spawn_proxy_with_redact_gates(
+        secret_guard::config::OnProbeExhausted::default(),
+        secret_guard::config::OnUnsupportedProtocol::default(),
+        secret_guard::config::OnFallbackRestore::Restore,
         vec![provider],
-        vec![],
-        decisions.clone(),
-        state_path.clone(),
-        persist_lock.clone(),
-    );
-    let _ = (decisions, persist_lock, state_path);
-    let proxy = AppState {
-        upstream: reqwest::Client::new(),
-        providers: provider_table,
-        dag: records,
         secrets,
-        api_keys: test_api_key_store(),
-        auth_enabled: false,
-        global_mock_prefix: std::sync::Arc::from(""),
-        on_probe_exhausted: secret_guard::config::OnProbeExhausted::default(),
-        on_unsupported_protocol: secret_guard::config::OnUnsupportedProtocol::default(),
-        on_fallback_restore: secret_guard::config::OnFallbackRestore::Restore,
-        upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
-        model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
-        usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),
-        pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::for_tests()),
-    };
-    let app = server::build_router(
-        proxy,
-        secret_guard::server_host_guard::HostGuard::new("127.0.0.1", addr.port()),
-    );
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-    let proxy_url = format!("http://{addr}");
+        reqwest::Client::new(),
+        "sg-state-r8-restore-4xx",
+        records,
+    )
+    .await;
 
     let (log, _log_guard) = capture_tracing(tracing::Level::WARN);
     let body = format!(
@@ -5541,6 +5488,7 @@ async fn gemini_provider_with_secrets_forwards_unredacted() {
         secrets,
         reqwest::Client::new(),
         "sg-state-gem-open",
+        ConversationDag::new(64, 500, 1),
     )
     .await;
 
@@ -5591,6 +5539,7 @@ async fn gemini_secrets_fail_closed_returns_503_zero_upstream_hits() {
         secrets,
         reqwest::Client::new(),
         "sg-state-unsup",
+        ConversationDag::new(64, 500, 1),
     )
     .await;
 
@@ -5650,6 +5599,7 @@ async fn gemini_rewrite_only_fail_closed_still_passthrough() {
         test_secret_table(), // 空: 仅重写, 无 secret
         reqwest::Client::new(),
         "sg-state-unsup",
+        ConversationDag::new(64, 500, 1),
     )
     .await;
 
@@ -6609,6 +6559,7 @@ async fn buffered_reader_reject_restores_mock_via_json_leaf_fallback() {
         secrets,
         reqwest::Client::new(),
         "sg-state-r8-restore",
+        ConversationDag::new(64, 500, 1),
     )
     .await;
 
@@ -6681,6 +6632,7 @@ async fn cross_proto_reader_reject_restores_mock_via_json_leaf_fallback() {
         secrets,
         reqwest::Client::new(),
         "sg-state-r8-restore",
+        ConversationDag::new(64, 500, 1),
     )
     .await;
 
@@ -8501,23 +8453,14 @@ async fn spawn_proxy_with_usage_store_and_secrets(
         state_path,
         std::sync::Arc::new(parking_lot::Mutex::new(())),
     );
-    // [redact] 三 gate 镜像生产默认 (同 spawn_proxy_static_dynamic 注释).
-    let redact = secret_guard::config::RedactConfig::default();
     let proxy = AppState {
-        upstream: upstream_client,
-        providers: provider_table,
-        dag: ConversationDag::new(64, 500, 1),
-        secrets,
-        api_keys: test_api_key_store(),
-        auth_enabled: false,
-        global_mock_prefix: std::sync::Arc::from(""),
-        on_probe_exhausted: redact.on_probe_exhausted,
-        on_unsupported_protocol: redact.on_unsupported_protocol,
-        on_fallback_restore: redact.on_fallback_restore,
-        upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
-        model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
         usage,
-        pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::for_tests()),
+        ..base_app_state(
+            upstream_client,
+            provider_table,
+            ConversationDag::new(64, 500, 1),
+            secrets,
+        )
     };
     let app = server::build_router(
         proxy,
@@ -9045,24 +8988,12 @@ async fn spawn_guarded(
     let persist_lock = std::sync::Arc::new(parking_lot::Mutex::new(()));
     let provider_table =
         ProviderTable::with_persist_lock(vec![], vec![], decisions, state_path, persist_lock);
-    // [redact] 三 gate 镜像生产默认 (同 spawn_proxy_static_dynamic 注释).
-    let redact = secret_guard::config::RedactConfig::default();
-    let proxy = AppState {
-        upstream: reqwest::Client::new(),
-        providers: provider_table,
-        dag: ConversationDag::new(64, 500, 1),
-        secrets: test_secret_table(),
-        api_keys: test_api_key_store(),
-        auth_enabled: false,
-        global_mock_prefix: std::sync::Arc::from(""),
-        on_probe_exhausted: redact.on_probe_exhausted,
-        on_unsupported_protocol: redact.on_unsupported_protocol,
-        on_fallback_restore: redact.on_fallback_restore,
-        upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
-        model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
-        usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),
-        pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::for_tests()),
-    };
+    let proxy = base_app_state(
+        reqwest::Client::new(),
+        provider_table,
+        ConversationDag::new(64, 500, 1),
+        test_secret_table(),
+    );
     let app = server::build_router(
         proxy,
         secret_guard::server_host_guard::HostGuard::new(config_host, addr.port())

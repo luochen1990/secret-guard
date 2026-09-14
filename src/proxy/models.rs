@@ -1135,6 +1135,7 @@ mod tests {
     /// 失效发生 fetch, 结果仍应只含别名: merge 贡献 ≡ ∅ 且 fetch 失败被吞).
     fn unit_app_state(providers: Vec<Provider>) -> AppState {
         let decisions = Arc::new(RwLock::new(Decisions::default()));
+        let redact = crate::config::RedactConfig::default();
         AppState {
             upstream: reqwest::Client::new(),
             providers: ProviderTable::new(
@@ -1160,9 +1161,10 @@ mod tests {
             ),
             auth_enabled: false,
             global_mock_prefix: Arc::from(""),
-            on_probe_exhausted: crate::config::OnProbeExhausted::FailOpen,
-            on_unsupported_protocol: crate::config::OnUnsupportedProtocol::FailOpen,
-            on_fallback_restore: crate::config::OnFallbackRestore::Withhold,
+            // [redact] 三 gate 镜像生产默认 (SEC-10); 本 harness 不触降级路径.
+            on_probe_exhausted: redact.on_probe_exhausted,
+            on_unsupported_protocol: redact.on_unsupported_protocol,
+            on_fallback_restore: redact.on_fallback_restore,
             upstream_timeouts: crate::config::UpstreamTimeouts::default(),
             model_lists: Arc::new(ModelListCache::new()),
             usage: std::sync::Arc::new(crate::usage::UsageStore::in_memory()),
