@@ -292,6 +292,9 @@ pub fn build_upstream_client(connect_timeout: Option<Duration>) -> anyhow::Resul
 ///   存入 AppState 供 WebUI handler 在 secret upsert 时校验 + resolve.
 /// - `on_probe_exhausted`: 来自 static config 的 `[redact] on_probe_exhausted`,
 ///   存入 AppState 供 forwarding 路径决定 probing 耗尽时 fail-open / fail-closed.
+/// - `on_unsupported_protocol`: 来自 static config 的
+///   `[redact] on_unsupported_protocol`, 存入 AppState 供 forwarding 路径决定
+///   codec 不覆盖的协议 (gemini/ollama) 上配置了 secrets 时 fail-open / fail-closed.
 /// - `upstream_timeouts`: 来自 static config 的 `[server] upstream_*_timeout_secs`,
 ///   存入 AppState 供 forward 路径给 send().await / stream chunk 加超时保护
 ///   (防上游网络异常时 record 永久 pending).
@@ -308,6 +311,7 @@ pub async fn serve(
     auth_config: AuthConfig,
     global_mock_prefix: String,
     on_probe_exhausted: crate::config::OnProbeExhausted,
+    on_unsupported_protocol: crate::config::OnUnsupportedProtocol,
     upstream_timeouts: crate::config::UpstreamTimeouts,
     usage_config: crate::config::UsageConfig,
     allowed_domains: Vec<String>,
@@ -395,6 +399,7 @@ pub async fn serve(
         auth_enabled: auth_config.enabled,
         global_mock_prefix: Arc::from(global_mock_prefix),
         on_probe_exhausted,
+        on_unsupported_protocol,
         upstream_timeouts,
         model_lists: Arc::new(crate::proxy::ModelListCache::new()),
         usage: Arc::new(crate::usage::UsageStore::open(

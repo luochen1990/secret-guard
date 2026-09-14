@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use crate::auth::ApiKeyStore;
-use crate::config::OnProbeExhausted;
+use crate::config::{OnProbeExhausted, OnUnsupportedProtocol};
 use crate::dag::ConversationDag;
 use crate::provider::ProviderTable;
 use crate::secrets::SecretTable;
@@ -42,6 +42,11 @@ pub struct AppState {
     /// 来自 `[redact] on_probe_exhausted` (默认 FailOpen). 控制 redact probing 耗尽时
     /// 是 fail-open (skip + 原样转发) 还是 fail-closed (返回 503 拒绝转发).
     pub on_probe_exhausted: OnProbeExhausted,
+    /// 来自 `[redact] on_unsupported_protocol` (默认 FailOpen). 控制 codec 不覆盖的
+    /// 协议 (gemini/ollama) 上配置了 secrets 时是 fail-open (WARN + 透传放行) 还是
+    /// fail-closed (返回 503 拒绝转发). 仅管 secret 安全性 — 仅 model 重写降级
+    /// (无 secret) 时两模式都维持 WARN 透传. 消费点 `proxy::same_proto`.
+    pub on_unsupported_protocol: OnUnsupportedProtocol,
     /// 来自 `[server] upstream_*_timeout_secs` 的上游超时配置.
     /// forward 路径用它给 send().await / stream chunk 加超时保护.
     pub upstream_timeouts: crate::config::UpstreamTimeouts,

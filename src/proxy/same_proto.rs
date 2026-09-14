@@ -11,6 +11,10 @@
 //!   响应保持字节透传** (fan_out_streaming, byte-exact + 流式 UX + parsed view 照常累积).
 //! - [`same_proto_passthrough`] (无 secret 且无改写): 字节透传 (零回归, 最热路径).
 //!
+//! codec 不覆盖的协议 (Gemini/Ollama) 走 [`same_proto_forward`] 时受
+//! `[redact] on_unsupported_protocol` 停损开关管约 (fail_closed + secrets → 503):
+//! 详见函数内 from_native-None 分支.
+//!
 //! **同协议 + 无 redact 保持 byte-exact + 流式 UX 零回归**; 同协议 + redact + 非流式
 //! 仅 normalize_json 相等 (IR re-serialize 改变字段顺序/空白), 语义信息通过 wire 形态
 //! 元数据保留.
@@ -74,9 +78,34 @@ pub(crate) async fn same_proto_forward(
     use crate::codec::Protocol as CodecProtocol;
     let Some(codec_proto) = CodecProtocol::from_native(ingress) else {
         // codec 不支持此协议 (Gemini/Ollama), 但同协议 + SecretTable 非空时本应做 redact.
-        // 降级到字节透传: secret 原样转发到上游 (静默失效风险). 用 warn 让运维注意到.
-        // 安全: 只记 protocol + provider id, 永不记 secret 值.
-        // #183 D2: model 改写同型降级 — 无 codec 无法改写 model, WARN + 原样透传.
+        // `[redact] on_unsupported_protocol` 停损开关 (与 on_probe_exhausted 同型):
+        // - FailClosed + 配置了 secrets: 拒绝转发 (503) — secret 原样出站是安全降级
+        //   的底线, 敏感场景宁可不转发. 仅管 secret 安全性: 仅 model 改写降级
+        //   (无 secret) 时不触发, 维持 WARN 透传.
+        // - FailOpen (默认, 历史行为): 降级到字节透传, secret 原样转发到上游
+        //   (静默失效风险), 用 warn 让运维注意到.
+        // 安全: 只记 protocol + provider id, 永不记 secret 值 (SEC-2).
+        if state.on_unsupported_protocol == crate::config::OnUnsupportedProtocol::FailClosed
+            && !secrets_snapshot.is_empty()
+        {
+            warn!(
+                "secrets configured for {} provider '{}', but codec does not cover {}; \
+                 refusing to forward (on_unsupported_protocol=fail_closed)",
+                ingress.name(),
+                upstream_id,
+                ingress.name()
+            );
+            return Err(AppError::Unavailable(format!(
+                "provider '{upstream_id}' uses protocol {} which the redaction codec does \
+                 not cover, and secrets are configured for it; forwarding refused by \
+                 policy (on_unsupported_protocol=fail_closed); use a codec-covered \
+                 protocol path (o/a/r), remove this provider's secret dependency, or \
+                 set on_unsupported_protocol = \"fail_open\" to forward unredacted",
+                ingress.name()
+            )));
+        }
+        // #183 D2: model 改写同型降级 — 无 codec 无法改写 model, WARN + 原样透传
+        // (两模式下都如此 — 重写不涉及 secret 安全性).
         warn!(
             "secrets or a model rewrite (route) configured for {} provider '{}', but \
              codec does not cover {}; requests will be forwarded as-is (secrets unredacted / \

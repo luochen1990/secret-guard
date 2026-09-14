@@ -167,6 +167,11 @@ impl Default for UsageConfig {
 /// `on_probe_exhausted` 控制 redact probing 耗尽 (弱配置 + 对抗性 IR) 时的策略:
 /// `FailOpen` (默认, 向后兼容) 跳过该 secret 原样转发; `FailClosed` 拒绝转发
 /// (返回 503). 详见 `redact.rs` 的 redact_ir_checked.
+///
+/// `on_unsupported_protocol` 控制 codec 不覆盖的协议 (gemini/ollama) 上配置了
+/// secrets 时的策略: `FailOpen` (默认, 向后兼容) WARN + 放行透传 (secret 原样
+/// 出站); `FailClosed` 拒绝转发 (返回 503). 仅管 secret 安全性 — 仅 model 重写
+/// 降级 (无 secret) 时两模式都维持 WARN 透传. 详见 `proxy::same_proto`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RedactConfig {
@@ -175,6 +180,9 @@ pub struct RedactConfig {
     pub global_mock_prefix: String,
     /// Mock probing 耗尽时的策略 (默认 `FailOpen` 向后兼容).
     pub on_probe_exhausted: OnProbeExhausted,
+    /// codec 不覆盖的协议 (gemini/ollama) 上配置了 secrets 时的策略
+    /// (默认 `FailOpen` 向后兼容; 仅管 secret 安全性, model 重写降级不受影响).
+    pub on_unsupported_protocol: OnUnsupportedProtocol,
 }
 
 /// Mock probing 耗尽时 (弱配置 + 对抗性 IR 无法生成唯一 mock) 的处理策略.
@@ -198,6 +206,37 @@ pub struct RedactConfig {
 #[serde(rename_all = "snake_case")]
 pub enum OnProbeExhausted {
     /// 跳过该 secret 原样转发 (warn 日志, 历史行为, 向后兼容).
+    #[default]
+    FailOpen,
+    /// 拒绝转发整个请求 (返回 503, 防止 secret 泄露).
+    FailClosed,
+}
+
+/// codec 不覆盖的协议 (gemini / ollama) 上配置了 secrets 时 ("本应 redact 但
+/// 协议无 codec, 无法 redact") 的处理策略.
+///
+/// - `FailOpen`: WARN + 字节透传放行 (secret 原样出站, 历史行为, 向后兼容).
+/// - `FailClosed`: 拒绝转发整个请求 (返回 503), 防止 secret 泄露到 LLM provider.
+///
+/// **只管 secret 安全性**: 仅 model 重写降级 (无 secret) 时两模式都维持 WARN 透传
+/// (重写不涉及 secret, 降级代价只是 model 未改写).
+///
+/// 配置示例 (`secret-guard.toml`):
+/// ```toml
+/// [redact]
+/// on_unsupported_protocol = "fail_closed"
+/// ```
+///
+/// # 设计动机
+///
+/// 与 `on_probe_exhausted` 同型: 历史上 codec-less 协议 + secrets 是静默降级放行
+/// (仅 WARN), 敏感场景下运维需要停损开关. `FailClosed` 让这类请求显式失败
+/// (503 message 只含协议名 + provider id + 出路提示, SEC-2 同型), 即便付出请求
+/// 失败的代价. 默认仍 `FailOpen` 以避免升级时破坏现有部署.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnUnsupportedProtocol {
+    /// WARN + 字节透传放行 (secret 原样出站, 历史行为, 向后兼容).
     #[default]
     FailOpen,
     /// 拒绝转发整个请求 (返回 503, 防止 secret 泄露).
@@ -433,7 +472,14 @@ const KNOWN_FIELDS: &[(&str, &[&str])] = &[
         ],
     ),
     // Config::redact (RedactConfig)
-    ("redact", &["global_mock_prefix", "on_probe_exhausted"]),
+    (
+        "redact",
+        &[
+            "global_mock_prefix",
+            "on_probe_exhausted",
+            "on_unsupported_protocol",
+        ],
+    ),
     // Config::usage (UsageConfig, usage-stats)
     (
         "usage",
@@ -1964,6 +2010,69 @@ on_probe_exhausted = "fail_closed"
         let cfg: Config = toml::from_str(text).unwrap();
         assert_eq!(cfg.redact.global_mock_prefix, "sgm_");
         assert_eq!(cfg.redact.on_probe_exhausted, OnProbeExhausted::FailClosed);
+    }
+
+    // ─── OnUnsupportedProtocol serde + Default ───────────────────────────
+
+    #[test]
+    fn on_unsupported_protocol_default_is_fail_open() {
+        assert_eq!(
+            OnUnsupportedProtocol::default(),
+            OnUnsupportedProtocol::FailOpen
+        );
+        // RedactConfig::default() 也必须是 FailOpen (向后兼容旧配置无此字段).
+        assert_eq!(
+            RedactConfig::default().on_unsupported_protocol,
+            OnUnsupportedProtocol::FailOpen
+        );
+    }
+
+    #[test]
+    fn on_unsupported_protocol_serde_snake_case_roundtrip() {
+        // serde rename_all = "snake_case": fail_open / fail_closed.
+        for (variant, name) in [
+            (OnUnsupportedProtocol::FailOpen, "fail_open"),
+            (OnUnsupportedProtocol::FailClosed, "fail_closed"),
+        ] {
+            let s = serde_json::to_string(&variant).unwrap();
+            assert_eq!(s, format!("\"{name}\""));
+            let back: OnUnsupportedProtocol = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, variant);
+        }
+    }
+
+    #[test]
+    fn on_unsupported_protocol_serde_rejects_unknown_variant() {
+        // 未知字符串应反序列化失败 (fail-closed on config typos, 避免静默回退到默认).
+        let err = serde_json::from_str::<OnUnsupportedProtocol>("\"fail-closed\"");
+        assert!(err.is_err(), "hyphenated form must be rejected");
+        let err = serde_json::from_str::<OnUnsupportedProtocol>("\"unknown\"");
+        assert!(err.is_err(), "unknown variant must be rejected");
+    }
+
+    #[test]
+    fn redact_config_toml_default_omits_on_unsupported_protocol_field() {
+        // 空 [redact] 段应解析为默认 (FailOpen), 向后兼容.
+        let cfg: Config = toml::from_str("[redact]\n").unwrap();
+        assert_eq!(
+            cfg.redact.on_unsupported_protocol,
+            OnUnsupportedProtocol::FailOpen
+        );
+    }
+
+    #[test]
+    fn redact_config_toml_parses_unsupported_protocol_fail_closed() {
+        let text = r#"
+[redact]
+on_unsupported_protocol = "fail_closed"
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        assert_eq!(
+            cfg.redact.on_unsupported_protocol,
+            OnUnsupportedProtocol::FailClosed
+        );
+        // 两开关独立 (on_probe_exhausted 不受影响).
+        assert_eq!(cfg.redact.on_probe_exhausted, OnProbeExhausted::FailOpen);
     }
 
     // ─── UsageConfig serde (nix/module.nix render 产物的契约锁定) ──────────

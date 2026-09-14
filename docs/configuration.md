@@ -81,6 +81,7 @@ value = "ghp_0123456789abcdefghijklmnopqrstuvwxyz"
 |---|---|---|---|
 | `global_mock_prefix` | string | `""` | 所有 Auto 模式 mock 的统一前缀 (如 `"sgm_"`), 便于在日志 / WebUI 中一眼认出 mock. 设定后, secret 真值不允许包含该前缀. |
 | `on_probe_exhausted` | `"fail_open"` \| `"fail_closed"` | `"fail_open"` | mock 候选探测耗尽时 (极罕见, 需对抗性构造) 的策略: `fail_open` 跳过该 secret 照常转发; `fail_closed` 拒绝转发整个请求 (503), 宁可失败也不泄露. |
+| `on_unsupported_protocol` | `"fail_open"` \| `"fail_closed"` | `"fail_open"` | codec 不覆盖的协议 (目前 gemini / ollama) 上配置了 secrets 时的策略: `fail_open` (默认, 历史行为) WARN + 放行透传 — secret 会**原样出站**; `fail_closed` 拒绝转发整个请求 (503), 停损防泄露 (message 只含协议名 + provider id, 不含 secret). 只管 secret 安全性: 仅 model 重写降级 (无 secret) 时两模式都维持 WARN 透传. |
 
 ## `[usage]` — 模型用量统计 (改动需重启)
 

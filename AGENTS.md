@@ -419,6 +419,7 @@ Secret / Provider 的两种 value 来源 (`value`/`value_file`、`api_key`/`api_
 |---|---|---|---|
 | `global_mock_prefix` | string | `""` | Auto 模式 mock 的统一前缀 (注入到每个 secret 的 `gen_spec.prefix`). 详见 `src/redact.rs` C5 契约. |
 | `on_probe_exhausted` | `"fail_open"` \| `"fail_closed"` | `"fail_open"` | Mock probing 耗尽时 (弱配置 + 对抗性 IR 无法生成唯一 mock) 的策略. `fail_open` (向后兼容) 跳过该 secret 原样转发; `fail_closed` 拒绝转发整个请求 (返回 503), 防止 secret 泄露. 详见 `src/redact.rs::redact_ir_checked` 与 `src/config.rs::OnProbeExhausted`. |
+| `on_unsupported_protocol` | `"fail_open"` \| `"fail_closed"` | `"fail_open"` | codec 不覆盖的协议 (gemini/ollama) 上配置了 secrets 时的策略. `fail_open` (向后兼容, 历史行为) WARN + 放行透传 — secret 原样出站; `fail_closed` 拒绝转发整个请求 (返回 503), 停损防泄露 (message 只含协议名 + provider id + 出路提示, SEC-2 同型). **只管 secret 安全性**: 仅 model 重写降级 (无 secret) 时两模式都维持 WARN 透传. 详见 `src/proxy/same_proto.rs` from_native-None 分支与 `src/config.rs::OnUnsupportedProtocol`. |
 
 ### `[usage]` 段字段 (static, 启动时读取一次)
 
@@ -463,6 +464,7 @@ Secret / Provider 的两种 value 来源 (`value`/`value_file`、`api_key`/`api_
 [redact]
 global_mock_prefix = "sgm_"
 on_probe_exhausted = "fail_closed"
+on_unsupported_protocol = "fail_closed"
 ```
 
 ## 开发流程
@@ -822,6 +824,11 @@ configFile (escape hatch, 互斥). 凭据注入 (LoadCredential / sops 直接路
   路由链命中了携带 `upstream_model` 的路由的请求, 其同协议无-secret 分支从字节直传降级为 IR 改写
   路径 (normalize 等价; 上游前缀缓存失效 — 用户主动选择的降级, 契约层面已由 FWD-1
   修订授权, §99 登记). Gemini/Ollama + 重写无法改写: WARN + 原样透传 (body 不变).
+- **Gemini/Ollama 同协议 + secrets: 无 codec 无法 Redact (默认 fail_open 透传)**: codec 只覆盖
+  OpenAI/Anthropic/Responses; gemini/ollama provider 上配置了 secrets 时, 历史行为是 WARN +
+  降级字节透传 (secret 原样出站, 静默降级放行). 可配 `[redact] on_unsupported_protocol = "fail_closed"`
+  停损: 该场景拒绝转发 (返回 503, message 只含协议名 + provider id + 出路提示, SEC-2 同型,
+  上游零请求). 仅 model 重写降级 (无 secret) 不受开关影响, 两模式都维持 WARN 透传.
 - **路由 provider 跨条目环的启动检查缺失 (#179)**: 自环在 `Provider::validate`
   (static 加载 fail-fast) 拒绝; 跨条目环只在 WebUI upsert (`would_cycle`, 边集 =
   启用路由的 target) 与运行时 (`resolve_route` visited-set, 503) 拦截. 两个漏网

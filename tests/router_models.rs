@@ -119,6 +119,7 @@ async fn spawn(providers: Vec<Provider>) -> String {
         auth_enabled: false,
         global_mock_prefix: Arc::from(""),
         on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,
+        on_unsupported_protocol: secret_guard::config::OnUnsupportedProtocol::FailOpen,
         upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
         model_lists: Arc::new(ModelListCache::new()),
         usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),

@@ -1126,6 +1126,7 @@ async fn spawn_full_auth_router() -> String {
         auth_enabled: true,
         global_mock_prefix: std::sync::Arc::from(""),
         on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,
+        on_unsupported_protocol: secret_guard::config::OnUnsupportedProtocol::FailOpen,
         upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
         model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
         usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),

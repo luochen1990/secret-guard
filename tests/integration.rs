@@ -193,6 +193,7 @@ async fn spawn_proxy_static_dynamic(
         auth_enabled: false,
         global_mock_prefix: std::sync::Arc::from(""),
         on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,
+        on_unsupported_protocol: secret_guard::config::OnUnsupportedProtocol::FailOpen,
         upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
         model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
         usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),
@@ -236,6 +237,7 @@ async fn spawn_proxy_with_prefix(global_mock_prefix: &str) -> String {
         auth_enabled: false,
         global_mock_prefix: std::sync::Arc::from(global_mock_prefix),
         on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,
+        on_unsupported_protocol: secret_guard::config::OnUnsupportedProtocol::FailOpen,
         upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
         model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
         usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),
@@ -283,6 +285,58 @@ async fn spawn_proxy_with_probe_mode(
         auth_enabled: false,
         global_mock_prefix: std::sync::Arc::from(""),
         on_probe_exhausted: mode,
+        on_unsupported_protocol: secret_guard::config::OnUnsupportedProtocol::FailOpen,
+        upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
+        model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
+        usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),
+        pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::for_tests()),
+    };
+    let app = server::build_router(
+        proxy,
+        secret_guard::server_host_guard::HostGuard::new("127.0.0.1", addr.port()),
+    );
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}")
+}
+
+/// 启动 secret-guard, 显式指定 `[redact] on_unsupported_protocol` 模式 +
+/// provider 列表 + secret 表.
+///
+/// 用于 codec-less 协议 (gemini/ollama) 停损开关的集成测试: 配置了 secrets 的
+/// gemini 请求在 fail_closed 下应 503 (上游零请求), fail_open 下透传.
+async fn spawn_proxy_with_unsupported_protocol_mode(
+    mode: secret_guard::config::OnUnsupportedProtocol,
+    providers: Vec<Provider>,
+    secrets: SecretTable,
+    upstream: reqwest::Client,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state_path = tmp_state_path("sg-state-unsup");
+    let decisions = std::sync::Arc::new(parking_lot::RwLock::new(
+        secret_guard::config::Decisions::default(),
+    ));
+    let persist_lock = std::sync::Arc::new(parking_lot::Mutex::new(()));
+    let provider_table = ProviderTable::with_persist_lock(
+        providers,
+        vec![],
+        decisions.clone(),
+        state_path.clone(),
+        persist_lock.clone(),
+    );
+    let _ = (decisions, persist_lock, state_path);
+    let proxy = AppState {
+        upstream,
+        providers: provider_table,
+        dag: ConversationDag::new(64, 500, 1),
+        secrets,
+        api_keys: test_api_key_store(),
+        auth_enabled: false,
+        global_mock_prefix: std::sync::Arc::from(""),
+        on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,
+        on_unsupported_protocol: mode,
         upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
         model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
         usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),
@@ -2816,6 +2870,7 @@ async fn spawn_proxy_with_timeouts_and_secrets(
         auth_enabled: false,
         global_mock_prefix: std::sync::Arc::from(""),
         on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,
+        on_unsupported_protocol: secret_guard::config::OnUnsupportedProtocol::FailOpen,
         upstream_timeouts,
         model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
         usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),
@@ -4793,6 +4848,7 @@ async fn cross_table_shared_state_no_lost_update() {
         auth_enabled: false,
         global_mock_prefix: std::sync::Arc::from(""),
         on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,
+        on_unsupported_protocol: secret_guard::config::OnUnsupportedProtocol::FailOpen,
         upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
         model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
         usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),
@@ -5463,6 +5519,105 @@ async fn gemini_provider_with_secrets_forwards_unredacted() {
         "Gemini passthrough must hit upstream mock (body contains real secret)"
     );
     let _ = resp.text().await.unwrap();
+}
+
+/// `[redact] on_unsupported_protocol = "fail_closed"`: codec-less 协议 (gemini) +
+/// secrets → 503 拒绝转发, 上游零请求 (停损), 错误 body 不含 secret 明文 (SEC-2).
+#[tokio::test]
+async fn gemini_secrets_fail_closed_returns_503_zero_upstream_hits() {
+    let real_secret = "sk-gemini-secret-DO-NOT-LEAK";
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", mockito::Matcher::Any)
+        .with_status(200)
+        .with_body("{}")
+        // 停损语义: 上游零请求 (secret 绝不出站) — expect(0) + assert_async 锁定.
+        .expect(0)
+        .create_async()
+        .await;
+    let secrets = test_secret_table_with(vec![secret("api-key", real_secret)]);
+    let provider = provider_with("gem-main", Protocol::Gemini, &upstream.url());
+    let proxy_url = spawn_proxy_with_unsupported_protocol_mode(
+        secret_guard::config::OnUnsupportedProtocol::FailClosed,
+        vec![provider],
+        secrets,
+        reqwest::Client::new(),
+    )
+    .await;
+
+    let body = format!(r#"{{"contents":[{{"parts":[{{"text":"use {real_secret} now"}}]}}]}}"#);
+    let (status, text, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/g/gem-main/v1beta/models/gemini-pro:generateContent",
+        &body,
+        &[],
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "fail_closed must refuse forwarding for codec-less protocol with secrets: {text}"
+    );
+    // SEC-2: message 只含协议名 + provider id + 出路提示, 不含 secret 明文.
+    assert!(
+        !text.contains(real_secret),
+        "503 body must not leak secret: {text}"
+    );
+    assert!(
+        text.contains("gemini"),
+        "503 body names the protocol: {text}"
+    );
+    assert!(
+        text.contains("gem-main"),
+        "503 body names the provider id: {text}"
+    );
+    _m.assert_async().await;
+}
+
+/// fail_closed 只管 secret 安全性: 仅 model 重写降级 (无 secret) 的 codec-less
+/// 请求在 fail_closed 下仍 WARN + 透传 (body 不改写, 与 fail_open 行为一致).
+#[tokio::test]
+async fn gemini_rewrite_only_fail_closed_still_passthrough() {
+    let mut upstream = spawn_mock_upstream().await;
+    let passthrough_body = r#"{"contents":[{"parts":[{"text":"hi"}]}]}"#;
+    let _m = upstream
+        .mock("POST", "/v1beta/models/gemini-pro:generateContent")
+        // Gemini 的 model 在 URL path 而非 body (D2 降级 = body 原样, 无字段可改写);
+        // Exact 锁定 byte-exact 透传 (mockito 对 unmatched 请求回 501, 需精确匹配).
+        .match_body(mockito::Matcher::Exact(passthrough_body.to_string()))
+        .with_status(200)
+        .with_body("{}")
+        .expect(1)
+        .create_async()
+        .await;
+    let gem = provider_with("gem-main", Protocol::Gemini, &upstream.url());
+    let router = router_provider("virt", vec![rewrite_route("*", "gem-main", "gemini-flash")]);
+    let proxy_url = spawn_proxy_with_unsupported_protocol_mode(
+        secret_guard::config::OnUnsupportedProtocol::FailClosed,
+        vec![gem, router],
+        test_secret_table(), // 空: 仅重写, 无 secret
+        reqwest::Client::new(),
+    )
+    .await;
+
+    let (status, text, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/g/virt/v1beta/models/gemini-pro:generateContent",
+        r#"{"contents":[{"parts":[{"text":"hi"}]}]}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "rewrite-only (no secrets) must still pass through under fail_closed: {}",
+        text
+    );
+    // D2 降级不变: body byte-exact 未改写 — mock 的 Exact body 匹配命中即证明
+    // (expect(1) 锁定恰好一次).
+    _m.assert_async().await;
 }
 
 // ─── CFG-3: CRUD 操作语义 (HTTP 集成测试, property-based) ──────────────────
@@ -7984,6 +8139,7 @@ async fn spawn_proxy_with_usage_store_and_secrets(
         auth_enabled: false,
         global_mock_prefix: std::sync::Arc::from(""),
         on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,
+        on_unsupported_protocol: secret_guard::config::OnUnsupportedProtocol::FailOpen,
         upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
         model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
         usage,
@@ -8524,6 +8680,7 @@ async fn spawn_guarded(
         auth_enabled: false,
         global_mock_prefix: std::sync::Arc::from(""),
         on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,
+        on_unsupported_protocol: secret_guard::config::OnUnsupportedProtocol::FailOpen,
         upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
         model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
         usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),
