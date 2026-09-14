@@ -127,8 +127,9 @@ pub(crate) async fn same_proto_forward(
         )));
     }
 
-    // 3. 快照真实 messages (redact 前) 给 DAG (DAG 存 OriginRecord 视角真实内容,
-    //    WebUI 查询时 lazy apply redactMap).
+    // 3. 快照真实 messages (redact 前) 给 DAG — 仅用于内容寻址 / parent 增量计算
+    //    (req_delta 切片). WebUI 读的是 redact 后的 req_body_raw (LLM 视角), 永不
+    //    触碰这份真实快照 (见 src/web/AGENTS.md "req_delta_messages 实现" 段).
     let real_messages = ir.messages.clone();
 
     // 4. redact IR + derive redactions (共享 helper; FailClosed 模式下 probing 耗尽

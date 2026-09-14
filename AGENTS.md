@@ -719,6 +719,13 @@ configFile (escape hatch, 互斥). 凭据注入 (LoadCredential / sops 直接路
   (返回 503), 防止 secret 泄露到 LLM provider (见 `redact_ir_checked`). 默认仍
   `fail_open` 以保持升级兼容. 注意 fail_closed 拒绝时返回的 503 body 不含 secret 明文
   (变量部分只含 secret id + reason 枚举, 语义由 SEC-2 契约锁定).
+  **fail_open 的 WebUI 回显边界 (2026-09-15 走查明确)**: 被跳过的 secret 随请求原样
+  转发, 该轮 record 的 `req_body_raw` 与派生 `preview` 含**未脱敏的真实 secret**, 经
+  `GET /api/records/{id}` / `POST /api/sync` / timeline 回显 — 即 SEC-1 ("任意 GET
+  响应不含真实 secret") 在 fail_open 触发场景不成立 (SEC-1 扫描测试只覆盖 redact
+  成功路径). 默认 Auto 模式下 probing 耗尽概率天文级小 (C5 重试链), 该边界仅在显式
+  弱配置 + 对抗性 IR 下可达; 安全敏感部署应配 `fail_closed`. SEC-1 契约例外条款的
+  正式登记待人工授权 (contracts.md §0.5 流程).
 - **C5 是实质确定性契约**: Auto 模式 mock 不含 real_secret 的 ≥`k(L)` 字符连续子串,
   阈值 `k(L)` 随 secret 长度自适应 (短 secret 强保护, 长 secret 弱保护), 内部重试链
   使契约在 Auto 模式下实质等价于确定性 (失败概率天文级小).
