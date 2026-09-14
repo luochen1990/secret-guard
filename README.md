@@ -1,23 +1,53 @@
-Secret Guard
-============
+<p align="center">
+  <img src="assets/logo.svg" width="110" alt="Secret Guard logo">
+</p>
 
-防止你的 Agent 不经意间将你的 Secrets (password, private keys, token, cookies) 泄露到 LLM Provider 服务器上.
+# Secret Guard
 
----
+**跑在本地的轻量 LLM 网关: 出站把请求中的 Secret 替换为等长仿真 Mock, 回传响应自动还原为真值 — LLM 全程接触不到你的 Secret, Agent 工具照常工作。**
 
-这是一个超轻量级的 LLM Gateway, 它提供的功能是:
+[文档站](https://secret-guard.lambda.lc/zh-cn/) · [下载](https://secret-guard.lambda.lc/zh-cn/download/) · [快速上手](https://secret-guard.lambda.lc/zh-cn/tutorial-quick-start/) · [已知限制](#边界与已知限制) · [English](https://secret-guard.lambda.lc/en/)
 
-1. 在本地起一个 LLM 网关进程, 你可以将 claude-code / opencode / hermes-agent 等软件的 API BASE URL 指向它监听的本地地址
-2. 它将原封不动地转发LLM的输入输出, 同时在本地程序中检查其中是否包含你的 Secret, 并将其替换为 Mock Secret.
-3. 它会在收到的LLM响应中(包括工具调用中)进行反向替换, 以使得包含 Secret 的工具调用在你的本地仍然能正常运行. 整个过程只对 LLM 透明.
-4. 它会在生成 Mock Secret 时, 确保它在会话中的唯一性, 以使得它完全不可能跟其他内容出现同名撞车, 不用担心响应中的内容被错误地替换.
-5. 它会精心生成像模像样的 Mock Secret , 以使得从 LLM 的视角看, 它几乎就是一个真 Secret, 不会被 LLM 质疑这个 Secret 的合法性 (比如 LLM 不会因发现 Mock Secret 很假而错误地提示你 "它的长度太短" 之类的问题, 而引入 LLM 响应噪音)
+## 为什么需要 Secret Guard?
+
+claude-code / opencode / hermes-agent 这类 Agent 工具替你干活的方式, 就是把材料整段塞进提示词 — 代码、配置、终端输出, 连同其中的 password、private key、token、cookies, 全部送到了 LLM Provider 的服务器上。这些数据一旦离开本机就不再受你控制: 可能进入 Provider 日志、用于模型训练、或随一次泄露事件曝光。
+
+而 "不要把 Secret 放进上下文" 在 Agent 工作流里并不现实 — 凭证恰恰是 Agent 替你操作真实系统时要用的东西。Secret Guard 化解的正是这个矛盾: **Agent 继续用你的 Secret 干活, LLM 却永远接触不到真值。**
+
+## 工作原理
+
+接入成本只有一行: 把 Agent 工具的 API base URL 指向本地网关, 流量经它转发到 Provider:
+
+```text
+请求出站:  Agent 工具 ──真 Secret──►  secret-guard  ──仿真 Mock──►  LLM Provider
+响应回传:  本地工具   ◄──真 Secret──  secret-guard  ◄──Mock 应答──  LLM Provider
+                           (Redact / Restore 均发生在本地, 双向透明)
+```
+
+- **出站 Redact**: 发往 LLM 的请求中, Secret 被替换为等长、同字符集的仿真 Mock
+  (默认策略) — LLM 拿着它照常干活, 浑然不觉。
+- **回传 Restore**: LLM 响应回传时 (包括工具调用参数), Mock 被反向还原为真值 — 含 Secret 的 curl 命令落到你机器上时认证照常通过。
+
+一笔真实请求出站前后的样子 (截自真实运行, 仅 token 值为虚构):
+
+```text
+Agent 发出的:     GITHUB_TOKEN=ghp_0123456789abcdefghijklmnopqrstuvwxyz
+Provider 收到的:  GITHUB_TOKEN=2_9rr_61dr1lmv2wf15aotyyt262l3t9_2pt4uih
+```
+
+每笔转发都可在 WebUI 的 Records 页核对 (会话时间线 + 请求详情, Secret 位置以高亮
+Mock 呈现, 即 LLM 所见):
+
+![WebUI Records 页 — 会话时间线与请求详情 (LLM 所见)](assets/records-detail.webp)
 
 ## 快速开始
 
 ### 1. 安装
 
 ```bash
+# 二进制归档 (Linux musl 全静态 / Windows, 附 SHA256 校验) — 见下载页:
+#   https://secret-guard.lambda.lc/zh-cn/download/
+
 # Nix (flake, 需配置好 forgejo 的 SSH key):
 nix run git+ssh://forgejo@git.lambda.lc:5522/lc-studio/secret-guard -- --help
 # 或将 overlay / nixosModule 接入你的 flake 后直接用 pkgs.secret-guard
@@ -27,26 +57,8 @@ cargo install --git ssh://forgejo@git.lambda.lc:5522/lc-studio/secret-guard
 # 或克隆仓库后: cargo install --path .
 ```
 
-### NixOS 部署 (结构化选项)
-
-`nixosModules.secret-guard` 提供 `services.secret-guard.*` 结构化选项 — 未显式设
-`configFile` 时自动生成 toml (字段校验 eval 期 fail-fast, 配错在 rebuild 时即报错):
-
-```nix
-services.secret-guard = {
-  enable = true;
-  providers."zai-coding-plan" = {
-    kind = "direct";
-    protocol = "openai";
-    baseUrl = "https://open.bigmodel.cn/api/coding/paas/v4";
-    apiKeyFile = "/run/credentials/secret-guard.service/zai_key"; # 凭据走文件, toml 脱敏
-  };
-  secrets.entries = [ { id = "zai_key"; valueFile = "/run/credentials/secret-guard.service/zai_key"; } ];
-};
-```
-
-凭据注入姿势 (LoadCredential / sops) 与手写 configFile escape hatch 见
-`docs/deployment-nixos.md`.
+> NixOS 用户推荐 `services.secret-guard.*` 结构化选项部署 (eval 期校验配置,
+> 凭据走文件注入), 见 [docs/deployment-nixos.md](docs/deployment-nixos.md)。
 
 ### 2. 最小配置
 
@@ -66,7 +78,7 @@ value = "ghp_0123456789abcdefghijklmnopqrstuvwxyz"   # 要保护的 secret (不�
 ```
 
 > 注意层级: secret 写在 `[[secrets.entries]]` 下 (providers 是平铺 `[[providers]]`,
-> 两套写法不一致). 全部配置字段见 [docs/configuration.md](docs/configuration.md).
+> 两套写法不一致)。全部配置字段见 [docs/configuration.md](docs/configuration.md)。
 
 ### 3. 启动并发出第一个请求
 
@@ -77,69 +89,104 @@ curl http://127.0.0.1:18787/o/openai-main/v1/chat/completions \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"My token is ghp_0123456789abcdefghijklmnopqrstuvwxyz, please summarize."}]}'
 ```
 
-> 本文示例统一用端口 `18787`; 不指定 `--port` 时默认监听 `127.0.0.1:8787`
-> (也可用 `[server] port` 或环境变量 `SG_PORT` 修改).
+上游收到的是仿真 Mock — 转发完成日志的 `redactions=1` 即替换计数;
+浏览器打开 `http://127.0.0.1:18787/` 可在 Records 页回看这笔请求。
 
-请求中的 secret 已被替换为等长的仿真 Mock Secret 发往上游 (每笔转发完成日志的
-`redactions=1` 即替换计数), LLM 全程看不到真值. 浏览器打开 `http://127.0.0.1:18787/`
-可在 WebUI 的 Records 页查看这次请求的 LLM 视角 (secret 位置以高亮 mock 呈现).
+> 示例统一用端口 `18787`; 默认监听 `127.0.0.1:8787`, 可用 `[server] port`
+> 或环境变量 `SG_PORT` 修改。
 
-日常使用时, 把 agent 工具的 `base_url` 指过来即可, 无需手写 curl:
+日常使用时, 把 Agent 工具的 `base_url` 指向网关即可, 无需手写 curl:
 
 ```python
 from openai import OpenAI
 client = OpenAI(base_url="http://127.0.0.1:18787/o/openai-main/v1", api_key="ignored")
 ```
 
-> SDK 的 `base_url` 需自带版本路径前缀 (如 `/v1`), secret-guard 只原样透传;
-> Anthropic SDK 的 `base_url` 同理配到 `/a/<provider-id>` 即可 (其 SDK 自带 `/v1/messages`).
-
 ### 路由约定
 
-URL 形如 `/{proto_short}/{provider_id}/*rest`, 同时编码 **入站协议** 与 **目标 Provider**:
+URL 形如 `/{proto_short}/{provider_id}/*rest`, 同时编码**入站协议**与**目标 Provider**:
 
-| proto_short | Protocol | SDK 示例 (`base_url`) |
+| proto_short | 协议 | SDK 示例 (`base_url`) |
 |---|---|---|
-| `o` | OpenAI    | `http://127.0.0.1:18787/o/<provider-id>/v1` |
+| `o` | OpenAI | `http://127.0.0.1:18787/o/<provider-id>/v1` |
 | `a` | Anthropic | `http://127.0.0.1:18787/a/<provider-id>` |
-| `g` | Gemini    | `http://127.0.0.1:18787/g/<provider-id>` |
-| `l` | oLLama    | `http://127.0.0.1:18787/l/<provider-id>` |
+| `g` | Gemini | `http://127.0.0.1:18787/g/<provider-id>` |
+| `l` | Ollama | `http://127.0.0.1:18787/l/<provider-id>` |
 | `r` | Responses (OpenAI Responses API) | `http://127.0.0.1:18787/r/<provider-id>/v1` |
 
-`proto_short` 简写映射来自 `Protocol::ALL`, 详细路由错误语义见 `AGENTS.md`.
-注: 表中 URL 是 SDK `base_url` 口径 — OpenAI SDK (Chat Completions 与 Responses 同 SDK)
-需自带 `/v1` 前缀; Anthropic SDK 自行拼 `/v1/messages`, 配到 `/a/<provider-id>` 即可;
-curl 直连则写完整路径 (见上方示例).
+> SDK 侧注意: OpenAI SDK 需自带 `/v1` 前缀; Anthropic SDK 自行拼 `/v1/messages`,
+> 配到 `/a/<provider-id>` 即可。
+
+### 配置模型: 静态 + 动态双层
+
+- `secret-guard.toml` — 声明式配置, 用户手写, 进程内只读。
+- `secret-guard.state.toml` — WebUI 编辑结果自动落盘的动态状态, 删除即可重置; 同一实体
+  的 dynamic 来源可覆盖 static。
+
+> ⚠️ **敏感数据警示**: `state.toml` 含**明文**敏感数据 (WebUI 创建的 secret value、
+> 显式写入的 provider api_key), 敏感级别与 `secret-guard.toml` 同级: 务必加入
+> `.gitignore`, 误 commit 会把 secret 泄漏进版本历史。
 
 ### 日志与排障
 
-每笔转发完成时 stdout 打一行 INFO 摘要 (`forward method=... path=... status=... elapsed_ms=... redactions=N provider=...`),
-无需打开 WebUI 即可在命令行确认流量经过 secret-guard; 上游故障 (502/504) 的错误 body 也带可读原因
-(如 `upstream error: http://127.0.0.1:29999 (Connection refused)`). 量级大时可用
-`RUST_LOG=secret_guard=warn` 调低 (默认 `info`).
+每笔转发完成时打一行 INFO 摘要 (`forward ... status=... elapsed_ms=... redactions=N
+provider=...`), 命令行即可确认流量经过 secret-guard; 上游故障 (502/504) 的错误 body 带
+可读原因。日志量大时用 `RUST_LOG=secret_guard=warn` 调低 (默认 `info`)。
 
-### WebUI 入口
+## 何以可靠
 
-浏览器访问根路径 `http://127.0.0.1:18787/` 即可打开 WebUI (端口同上, 默认 8787):
-- **Records**: 会话 / 轮次时间线, 查看每次转发的请求与响应 (LLM 视角, 含 Mock Secret).
-- **Secrets**: 管理 Secret 注册表.
-- **Providers**: 管理 Provider 注册表.
-- **API Keys**: 签发 / 禁用转发路径认证用的 API key (启用 `[auth]` 后生效).
+把生产流量交给一个中间进程, 需要它先证明自己不会帮倒忙。以下性质以 property-based
+测试与端到端集成测试固化在仓库中, 每次发版全量验证:
 
-### 双层配置
+- **透明中继**: 无 Redact 时字节级透传; 有 Redact 时除 real↔mock 替换外语义完全
+  不变 (仅字段顺序等无语义的序列化差异) — 行为与直连无异。
+- **严格可逆**: 每个 Mock 与真值一一对应, Restore 是 Redact 的精确逆运算 — 含 Secret
+  的工具调用不会因替换而损坏。
+- **确定性 Mock**: 同一 Secret 的 Mock 跨轮保持稳定, 不破坏 Provider 的前缀缓存 —
+  正常会话中命中率与 token 成本不受影响 (mock 意外逃逸并被回传的例外见下)。
+- **上下文内不撞车**: Mock 绝不与请求中的其他内容重名, 响应不会被错误替换。
+- **多 Provider 路由**: 支持多 Provider 配置 (OpenAI / Anthropic / Gemini / Ollama /
+  Responses), 按请求 model 通配符路由到不同上游。
 
-secret-guard 采用双层配置: 声明式文件 `secret-guard.toml` (用户手写, 进程内只读) +
-动态状态文件 `secret-guard.state.toml` (WebUI 编辑结果自动落盘, 删除即可重置).
-同一实体可同时有 static 与 dynamic 来源, 后者可覆盖前者.
+## 边界与已知限制
 
-> ⚠️ **敏感数据警示**: `secret-guard.state.toml` 含**明文**敏感数据 — 通过 WebUI 创建的
-> dynamic secret 的 `value`、显式提供的 provider `api_key` 都以明文落盘, 其敏感级别与
-> `secret-guard.toml` **同级**: 务必加入 `.gitignore`, 误 commit 会把 secret 泄漏进版本历史.
+不适用场景如下, 完整清单 (面向维护者) 见 `AGENTS.md` "已知限制" 段:
 
-文件分工与各配置段全部字段 / 类型 / 默认值 / 常见错误见
-**[docs/configuration.md](docs/configuration.md)**; 合并语义 (`OverrideMode`:
-Default / PreferStatic / Disabled) 等开发者向细节见 `AGENTS.md` 与 `src/config.rs` 头部注释.
+- **Gemini / Ollama 暂无 Redact 能力**: 这两族协议目前只做字节透传 — 若配置了
+  secrets, Redact 在 `g/` `l/` 路径上**静默降级为放行** (secret 原样出站, 日志有
+  WARN); 它们也不支持跨协议接入 (返回 501)。要保护的流量请走 `o/` `a/` `r/`
+  路径 (三族 codec 完整覆盖)。
+- **两类流式场景返回 501**: ① 跨协议翻译 + `stream=true`; ② Responses 协议 +
+  (Redact 或路由 model 重写) + `stream=true` (SSE 事件翻译未实现)。
+- **跨协议翻译会丢弃部分字段**: 思考原文 (reasoning content) 与 hosted tools
+  (web_search 等) 在跨协议翻译中丢弃; Responses 协议即使同协议 round-trip 也会丢
+  reasoning items 的 `encrypted_content`。
+- **异常路径下 mock 可能不被还原**: 上游非 2xx / Content-Type 判型失败 / 响应 parse
+  失败时, 转发降级为透传, 客户端可能看到 mock (日志有 WARN)。
+- **极端配置下 mock 生成可能耗尽**: 弱 mock 策略 (字符集/长度约束过窄) + 对抗性
+  内容可使探测耗尽, 默认 fail-open 跳过该 secret (原样出站, WARN); 可在
+  `[redact] on_probe_exhausted = "fail_closed"` 配置为拒绝转发。
+- **路由 model 重写命中时放弃字节直传**: 该请求改走 IR 改写路径 (语义等价, 但上游
+  前缀缓存失效) — 属用户主动选择的降级。
+- **部分入站形态的 WebUI 增量气泡降级**: 跨协议翻译 / Responses 入站的请求,
+  时间线不渲染增量气泡 (preview 与轮次记录正常)。
 
----
+## 文档
 
-更详尽的开发 / 部署 / 测试流程见 `AGENTS.md`.
+你可能正在找:
+
+- 三分钟跑通第一个受保护请求 → [站点·快速上手](https://secret-guard.lambda.lc/zh-cn/tutorial-quick-start/)
+- 全部配置字段 / 类型 / 默认值 → [docs/configuration.md](docs/configuration.md)
+- WebUI 各页面用法 → [站点·WebUI 指南](https://secret-guard.lambda.lc/zh-cn/manual-webui/)
+- NixOS 部署与凭据注入 → [docs/deployment-nixos.md](docs/deployment-nixos.md)
+- 架构设计与数据流契约 → [docs/design/](docs/design/) (contracts.md)
+- 开发流程 / 测试策略 / 模块契约 → [AGENTS.md](AGENTS.md)
+
+## 贡献
+
+欢迎 issue 与 PR (仓库托管在 [git.lambda.lc/lc-studio/secret-guard](https://git.lambda.lc/lc-studio/secret-guard))。
+开发环境、测试链与代码规范见 [AGENTS.md](AGENTS.md)。
+
+## License
+
+MIT — 见 [LICENSE](LICENSE)。

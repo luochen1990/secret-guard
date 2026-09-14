@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" fill="none">
+  <!-- secret-guard logo: 盾牌 + 钥匙孔 (用 currentColor 适配明暗主题) -->
+  <path
+    d="M64 10 L110 26 V62 C110 88 91 106 64 118 C37 106 18 88 18 62 V26 Z"
+    stroke="currentColor"
+    stroke-width="7"
+    stroke-linejoin="round"
+  />
+  <circle cx="64" cy="56" r="11" fill="currentColor" />
+  <path d="M58 64 H70 L73 90 H55 Z" fill="currentColor" />
+</svg>
