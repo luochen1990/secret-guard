@@ -218,9 +218,10 @@ pub(crate) async fn cross_proto_forward(
         },
     );
 
-    // T5: 跨协议丢弃可观测性 — 计数在丢弃点 (步骤 6/9) 已算, record_id 此刻才产生,
-    // WARN 延后到这里打 (只记计数, 绝不记内容). hosted tools = extra["tools"] 中
-    // type != "function" 的条目; reasoning = IrBlock::ReasoningContent (思考原文).
+    // T5: 跨协议丢弃可观测性 — 计数在丢弃点 (步骤 9 请求历史 / 步骤 15 响应) 已算,
+    // record_id 此刻才产生, WARN 延后到这里打 (只记计数, 绝不记内容).
+    // reasoning = IrBlock::ReasoningContent (思考原文); hosted tools 的丢弃 WARN
+    // 不在此处 — 在 responses.rs reader 丢弃点 (见步骤 6 注释).
     if dropped_req_reasoning > 0 {
         warn!(
             %record_id,

@@ -6677,7 +6677,7 @@ async fn cross_proto_hosted_tools_drop_warns() {
     assert_eq!(status, reqwest::StatusCode::OK);
     let log_text = log.text();
     assert!(
-        log_text.contains("dropping hosted tool(s) not representable in IR"),
+        log_text.contains("dropping tool definition(s) not representable in IR"),
         "T5: hosted tools drop WARN missing; log: {log_text}"
     );
 }

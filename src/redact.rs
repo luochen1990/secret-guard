@@ -445,6 +445,8 @@ pub fn restore_ir_response(ir: &mut IrResponse, map: &RedactionMap) {
 ///
 /// 调用方: `proxy::fan_out::fan_out_buffered_ir` / `proxy::cross_proto::cross_proto_forward`
 /// 的 parse-失败 fallback 分支 (codec reader 拒绝 / 非 JSON body 时尽力不让 mock 逃逸).
+/// 注: 生产调用方持有外层已 parse 的 Value, 实际走 [`restore_json_value_fallback`]
+/// (零二次 parse); 本 bytes 包装变体是契约测试面 (contracts.md RED-8) 与未来调用方的入口.
 pub fn restore_json_leaves_fallback(bytes: &[u8], map: &RedactionMap) -> Option<Vec<u8>> {
     if map.is_empty() {
         return None;
@@ -722,7 +724,7 @@ impl crate::codec::stream::StreamRestoreHook for StreamingRestorerSet {
 }
 
 /// [`restore_str`] 的纯函数版本 (in-place), 复用同一段 find-and-replace 逻辑.
-/// 返回是否发生了至少一次替换 — 供 [`restore_json_leaves_fallback`] 判断
+/// 返回是否发生了至少一次替换 — 供 [`restore_json_value_fallback`] 判断
 /// "未命中则保持原字节" (避免每个叶子 clone 比对).
 pub(crate) fn restore_str_inplace(s: &mut String, map: &RedactionMap) -> bool {
     if map.is_empty() || s.is_empty() {

@@ -772,7 +772,7 @@ configFile (escape hatch, 互斥). 凭据注入 (LoadCredential / sops 直接路
   `src/proxy/cross_proto.rs`. 均走 best-effort 鲁棒性原则 (ROB-*), parse 失败不 panic.
   **JSON 叶子级 restore 兜底 (RED-8)**: 两路径的 fallback 分支都会先尝试
   `redact::restore_json_leaves_fallback` (body 仍是单个合法 JSON 时, 在字符串值叶子上
-  还原 mock + `restored mocks via JSON leaf fallback` WARN); 仅当兜底也失败 (非 JSON /
+  还原 mock + `mocks restored via JSON leaf fallback` WARN); 仅当兜底也失败 (非 JSON /
   SSE-shaped 多帧 / 无命中) 才透传 + `mock not restored` WARN (同协议 #158; 跨协议
   已对称补齐, 含此前静默的非 JSON 分支).
 - **provider 协议与上游实际协议错配 → 静默空响应 (有 WARN)**: provider protocol=anthropic

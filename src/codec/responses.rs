@@ -132,8 +132,9 @@ impl Reader for ResponsesReader {
             if hosted > 0 {
                 tracing::warn!(
                     count = hosted,
-                    "dropping hosted tool(s) not representable in IR \
-                     (web_search/file_search/computer/mcp/...); only function tools \
+                    "dropping tool definition(s) not representable in IR \
+                     (hosted tools: web_search/file_search/computer/mcp/..., or \
+                     malformed function entries); only well-formed function tools \
                      round-trip through the codec"
                 );
             }
