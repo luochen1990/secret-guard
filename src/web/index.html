@@ -591,7 +591,8 @@
 
     /* ─── F1: table cell ellipsis + hover tooltip ─────────────────────────── */
     /* 每个 td 内的内容用 .cell-ellipsis 包裹, 限制 max-width 并在溢出时显示省略号.
-       完整值通过外层 td 的 title 属性由浏览器原生 tooltip 呈现. */
+       完整值通过外层 td 的 title 属性由浏览器原生 tooltip 呈现.
+       (usage 页 4 表经 ellCell() 走 span-title 变体: title 在包裹 span 上, 语义等价.) */
     table.secrets td {
       max-width: 280px;     /* 默认上限; 下方 per-column 覆盖. */
     }
@@ -4236,10 +4237,21 @@
       body.innerHTML = rows.map(renderRow).join('');
     }
 
+    /** F1 cell-ellipsis 收口 (usage 页 4 表共用): 溢出截断 + hover tooltip 看全值.
+     *  必须: 可溢出文本单元格一律经此包裹 — usage 表同时挂 class="secrets", 继承
+     *  table.secrets 的 per-column max-width, 而 .usage-table td 是 nowrap, 裸文本
+     *  超宽时会溢出 td 盒子画到相邻列 (文字重叠 bug, 由 im-ui.spec.ts 溢出守卫锁定).
+     *  code=true 时内容以 <code> 呈现 (mock / 值类列). */
+    function ellCell(text, code = false) {
+      const esc = escapeHtml(text);
+      const inner = code ? `<code>${esc}</code>` : esc;
+      return `<span class="cell-ellipsis" title="${esc}">${inner}</span>`;
+    }
+
     function renderUsageModelTable(rows) {
       tbodyHtml('usage-by-model-body', rows, 11, r => `<tr>
-        <td title="${escapeHtml(r.model || '(unknown)')}">${escapeHtml(r.model || '(unknown)')}</td>
-        <td>${escapeHtml(r.provider)}</td>
+        <td>${ellCell(r.model || '(unknown)')}</td>
+        <td>${ellCell(r.provider)}</td>
         <td>${r.requests}</td>
         <td>${r.retries ?? 0}</td>
         <td>${r.rate_limited_429 ?? 0}</td>
@@ -4254,7 +4266,7 @@
 
     function renderUsageProviderTable(rows) {
       tbodyHtml('usage-by-provider-body', rows, 9, r => `<tr>
-        <td>${escapeHtml(r.provider)}</td>
+        <td>${ellCell(r.provider)}</td>
         <td>${r.requests}</td>
         <td>${r.retries ?? 0}</td>
         <td>${r.rate_limited_429 ?? 0}</td>
@@ -4266,11 +4278,12 @@
       </tr>`);
     }
 
-    /** categories 分布的紧凑展示 ("system 12 · user 3"; 治理归因: 哪个环节塞进来的). */
+    /** categories 分布的紧凑展示 ("system 12 · user 3"; 治理归因: 哪个环节塞进来的).
+     *  返回纯文本 — escape 由展示侧 ellCell 统一处理 (避免 raw/escaped 双形态漂移). */
     function fmtWhere(categories) {
       const parts = Object.entries(categories || {})
         .filter(([, n]) => n > 0)
-        .map(([k, n]) => `${escapeHtml(k)} ${n}`);
+        .map(([k, n]) => `${k} ${n}`);
       return parts.length ? parts.join(' · ') : '—';
     }
 
@@ -4278,21 +4291,21 @@
      *  Where = 位置分类; Key = auth 归因; Record = 溯源跳转 (内存 DAG, 悬空降级). */
     function renderRedactions(red) {
       tbodyHtml('redact-by-secret-body', red.by_secret || [], 6, r => `<tr>
-        <td>${escapeHtml(r.secret_id)}</td>
-        <td title="${escapeHtml(r.mock)}"><code>${escapeHtml(r.mock)}</code></td>
+        <td>${ellCell(r.secret_id)}</td>
+        <td>${ellCell(r.mock, true)}</td>
         <td>${r.hits}</td>
-        <td>${fmtWhere(r.categories)}</td>
+        <td>${ellCell(fmtWhere(r.categories))}</td>
         <td>${fmtTsShort(r.first_ts)}</td>
         <td>${fmtTsShort(r.last_ts)}</td>
       </tr>`);
       tbodyHtml('redact-recent-body', red.recent || [], 8, r => `<tr>
         <td>${fmtTsShort(r.ts)}</td>
-        <td>${escapeHtml(r.secret_id)}</td>
-        <td title="${escapeHtml(r.mock)}"><code>${escapeHtml(r.mock)}</code></td>
-        <td>${fmtWhere({ [r.category]: r.count })}</td>
-        <td>${r.api_key_label ? escapeHtml(r.api_key_label) : '—'}</td>
-        <td>${escapeHtml(r.provider)}</td>
-        <td>${escapeHtml(r.model_req || '—')}</td>
+        <td>${ellCell(r.secret_id)}</td>
+        <td>${ellCell(r.mock, true)}</td>
+        <td>${ellCell(fmtWhere({ [r.category]: r.count }))}</td>
+        <td>${ellCell(r.api_key_label || '—')}</td>
+        <td>${ellCell(r.provider)}</td>
+        <td>${ellCell(r.model_req || '—')}</td>
         <td><button type="button" class="btn btn-small" data-audit-node="${escapeHtml(r.node || '')}" title="查看 redact 后的请求原文 (内存态, 重启后不可回查)">view</button></td>
       </tr>`);
     }

@@ -37,6 +37,7 @@
  * 所有测试共享一个 browser context, 按声明顺序执行 (workers=1).
  */
 import { test, expect, type Page } from "@playwright/test";
+import { TEST_SECRET_VALUE } from "./fixtures";
 
 const SG_API = "/api";
 const FORWARD_URL = "/o/mock-openai/v1/chat/completions";
@@ -2628,5 +2629,65 @@ test.describe("usage-stats (模型用量统计)", () => {
     page.on("pageerror", (e) => errors.push(String(e)));
     await page.waitForTimeout(300);
     expect(errors).toEqual([]);
+  });
+
+  // ─── usage 表格溢出守卫: td 内容不溢出盒子 (redaction 文字重叠回归) ──────
+  //
+  // 历史 bug: usage 页 4 表 (class="secrets usage-table") 继承 table.secrets 的
+  // per-column max-width 约束, 而 .usage-table td 是 white-space: nowrap; 渲染器
+  // 未按 F1 约定包 .cell-ellipsis → 长 mock / 长 secret_id 溢出 td 盒子画到相邻列
+  // (视觉上文字重叠).
+  //
+  // property (外部可观察行为, 不过拟合实现): 4 个 tbody 内所有 td 的
+  // scrollWidth ≤ clientWidth (+1px 容差) — 浏览器原生的 paint 级溢出度量.
+  // 前置: 发送含 static secret (fixtures.ts, 长值 → mock 决定性超宽) 的请求,
+  // 并等 redactions / by-model 两表都有数据 — 防部分表空态 vacuous 通过.
+  test("usage-stats: usage 表格 td 内容不溢出盒子 (redaction 文字重叠回归)", async ({ page }) => {
+    await page.goto("/");
+    await sendChat(page, [
+      { role: "user", content: `usage-overlap-marker secret=${TEST_SECRET_VALUE}` },
+    ]);
+    await page.locator('a.tab[data-tab="usage"]').click();
+    // tab 切换立即 refreshUsage; store writer 即时批量落库.
+    const dataRows = (tbodyId: string) =>
+      page.locator(`#${tbodyId} tr:not(:has(td.empty))`).count();
+    await expect.poll(async () => dataRows("redact-by-secret-body"), { timeout: 15_000 })
+      .toBeGreaterThan(0);
+    await expect.poll(async () => dataRows("usage-by-model-body"), { timeout: 15_000 })
+      .toBeGreaterThan(0);
+
+    // 度量口径: scrollWidth vs clientWidth (浏览器原生的溢出度量, 反映 paint 级溢出).
+    // 不用 Range.getBoundingClientRect — 它返回布局几何, 不被 overflow:hidden 裁剪,
+    // 会把已正确截断的 .cell-ellipsis 内容误报为溢出.
+    const overflows = await page.evaluate(() => {
+      const bad: Array<{
+        table: string; row: number; col: number;
+        clientW: number; scrollW: number; text: string;
+      }> = [];
+      const tids = [
+        "usage-by-model-body", "usage-by-provider-body",
+        "redact-by-secret-body", "redact-recent-body",
+      ];
+      for (const tid of tids) {
+        const tb = document.getElementById(tid);
+        if (!tb) continue;
+        tb.querySelectorAll("tr").forEach((tr, ri) => {
+          Array.from(tr.querySelectorAll("td")).forEach((td, ci) => {
+            if (td.scrollWidth > td.clientWidth + 1) {
+              bad.push({
+                table: tid, row: ri, col: ci,
+                clientW: td.clientWidth, scrollW: td.scrollWidth,
+                text: (td.textContent || "").slice(0, 30),
+              });
+            }
+          });
+        });
+      }
+      return bad;
+    });
+    expect(
+      overflows,
+      `td 内容溢出盒子 (= 文字重叠): ${JSON.stringify(overflows, null, 2)}`
+    ).toEqual([]);
   });
 });

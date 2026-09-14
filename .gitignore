@@ -16,10 +16,13 @@ secret-guard.state.toml
 *.state
 
 # Playwright WebUI 测试产物 (node_modules 是 nix shellHook 创建的 symlink, 不入库;
-# tests/ 子目录是 cwd=tests/webui 时 shellHook 相对路径再生的嵌套副本, 同因)
-/tests/webui/node_modules/
+# 注意不带尾斜杠 — gitignore 的尾斜杠只匹配目录, 会漏掉 symlink 形态;
+# tests/ 子目录是 cwd=tests/webui 时 shellHook 相对路径再生的嵌套副本, 同因;
+# 根级 test-results/ 是 cwd=仓库根 直接调 playwright test 时的产物落点)
+/tests/webui/node_modules
 /tests/webui/tests/
 /tests/webui/test-results/
+/test-results/
 /tests/webui/playwright-report/
 
 # Playwright MCP 工具的 a11y snapshot / console log 临时产物

@@ -15,6 +15,7 @@ import { defineConfig } from "@playwright/test";
 import * as path from "path";
 import * as fs from "fs";
 import * as os from "os";
+import { TEST_SECRET_VALUE } from "./fixtures";
 
 // Playwright 加载 config 时 cwd = config 所在目录 (tests/webui).
 // 不用 import.meta.url (在 CJS 模式下不可用, 在 ESM 模式下又要求 package.json type:module).
@@ -99,7 +100,7 @@ enabled = true
 
 [[secrets.entries]]
 id = "test-key"
-value = "sk-test-secret-1234567890"
+value = "${TEST_SECRET_VALUE}"
 category = "apikey"
 `
 );
