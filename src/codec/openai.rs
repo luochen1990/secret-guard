@@ -452,11 +452,7 @@ impl Writer for OpenAiWriter {
             }
         }
         // OpenAI content: 若只有文本, 用 string; 否则用 array.
-        let content = match content_parts.len() {
-            0 => Value::Null,
-            1 => content_parts.into_iter().next().unwrap(),
-            _ => Value::Array(content_parts),
-        };
+        let content = single_or_array(content_parts);
         message.insert("content".to_string(), content);
         if !tool_calls.is_empty() {
             message.insert("tool_calls".to_string(), Value::Array(tool_calls));
@@ -1080,6 +1076,16 @@ fn process_tool_call_delta(
 
 // ─── Helpers: write ────────────────────────────────────────────────────────
 
+/// 单元素 Vec 收敛为该元素, 多元素保持数组, 空归 null
+/// (OpenAI assistant content 的 wire 形态收敛: string | array | null).
+fn single_or_array(parts: Vec<Value>) -> Value {
+    match parts.len() {
+        0 => Value::Null,
+        1 => parts.into_iter().next().unwrap(),
+        _ => Value::Array(parts),
+    }
+}
+
 /// IR 消息 → OpenAI wire 消息 (含 tool 消息的特殊处理).
 fn write_message(msg: &IrMessage) -> Value {
     match msg.role {
@@ -1155,11 +1161,7 @@ fn write_message(msg: &IrMessage) -> Value {
             let content = match (msg.content_form, content_parts.len()) {
                 (Some(ContentForm::Array), _) => Value::Array(content_parts),
                 (Some(ContentForm::Null), 0) => Value::Null,
-                _ => match content_parts.len() {
-                    0 => Value::Null,
-                    1 => content_parts.into_iter().next().unwrap(),
-                    _ => Value::Array(content_parts),
-                },
+                _ => single_or_array(content_parts),
             };
             let mut obj = Map::new();
             obj.insert("role".to_string(), json!("assistant"));
@@ -1566,6 +1568,18 @@ mod tests {
         let ir = reader().read_response(&body).unwrap();
         assert_eq!(ir.usage.input_tokens, 70, "uncached input = 100 - 30");
         assert_eq!(ir.usage.cache_read_input_tokens, Some(30));
+    }
+
+    // ─── single_or_array: 纯函数全分支覆盖 ────────────────────────────────
+
+    #[test]
+    fn single_or_array_forms() {
+        assert_eq!(single_or_array(vec![]), Value::Null);
+        assert_eq!(single_or_array(vec![json!("hi")]), json!("hi"));
+        assert_eq!(
+            single_or_array(vec![json!("a"), json!("b")]),
+            json!(["a", "b"])
+        );
     }
 
     // ─── write_request: 基础映射 ────────────────────────────────────────
