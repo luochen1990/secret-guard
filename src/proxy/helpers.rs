@@ -313,6 +313,26 @@ pub(super) fn warn_mock_not_restored(
     }
 }
 
+/// RED-8 reader 拒绝分支的共享兜底决策序列 (fan_out_buffered_ir / cross_proto_forward
+/// 的 SSOT): 在外层**已 parse** 的 `v` 上尝试 JSON 叶子级 restore (零二次 parse) —
+/// 成功 → restored WARN + 重序列化字节; 未命中/无 redaction → mock-not-restored WARN
+/// + 原字节透传 (FWD-1: 未命中绝不重序列化).
+pub(super) fn restore_via_json_leaf_fallback(
+    record_id: uuid::Uuid,
+    v: &mut serde_json::Value,
+    original: &[u8],
+    reject_detail: &str,
+    map: &crate::redact::RedactionMap,
+) -> Vec<u8> {
+    if crate::redact::restore_json_value_fallback(v, map) {
+        warn_mocks_restored_via_json_leaf_fallback(record_id);
+        serde_json::to_vec(v).unwrap_or_else(|_| original.to_vec())
+    } else {
+        warn_mock_not_restored(record_id, reject_detail, map);
+        original.to_vec()
+    }
+}
+
 /// usage 接线参数 (usage_ctx_and_record_redactions 的收口 — 避免 10 参签名).
 pub(super) struct UsageWire<'a> {
     pub fp: &'a super::ForwardPath,

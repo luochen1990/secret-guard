@@ -858,13 +858,12 @@ impl ParsedSync {
             .is_none_or(|t| t.elapsed() >= PARSED_SYNC_INTERVAL);
         if due {
             let parsed = self.scan.snapshot();
-            if scan_decoded_nothing(&parsed) {
-                // 仍记录 last_sync: 零事件流的每次 snapshot 都是空, 无需重试判定.
-                self.last_sync = Some(std::time::Instant::now());
-                return;
+            // 零语义事件 (如 Responses 流) 不写 — 捏造空响应对象违反派生纪律,
+            // 由 [`Self::finalize`] 统一降级 None; 仍推进 last_sync (snapshot 恒空).
+            if !scan_decoded_nothing(&parsed) {
+                self.dag
+                    .update_parsed_response(self.record_id, self.writer.write_response(&parsed));
             }
-            self.dag
-                .update_parsed_response(self.record_id, self.writer.write_response(&parsed));
             self.last_sync = Some(std::time::Instant::now());
         }
     }

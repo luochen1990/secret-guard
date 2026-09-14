@@ -253,68 +253,21 @@ async fn spawn_proxy_with_prefix(global_mock_prefix: &str) -> String {
     format!("http://{addr}")
 }
 
-/// 启动 secret-guard, 显式指定 `[redact] on_probe_exhausted` 模式 + secret 列表.
-///
-/// 用于 fail_closed 集成测试: 构造弱配置 secret + 对抗性 IR → 验证 proxy 返回 503.
-async fn spawn_proxy_with_probe_mode(
-    mode: secret_guard::config::OnProbeExhausted,
-    secrets: SecretTable,
-    upstream_url: &str,
-) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let state_path = tmp_state_path("sg-state-probe");
-    let decisions = std::sync::Arc::new(parking_lot::RwLock::new(
-        secret_guard::config::Decisions::default(),
-    ));
-    let persist_lock = std::sync::Arc::new(parking_lot::Mutex::new(()));
-    let provider_table = ProviderTable::with_persist_lock(
-        vec![openai_provider("oa-main", upstream_url)],
-        vec![],
-        decisions.clone(),
-        state_path.clone(),
-        persist_lock.clone(),
-    );
-    let _ = (decisions, persist_lock, state_path);
-    let proxy = AppState {
-        upstream: reqwest::Client::new(),
-        providers: provider_table,
-        dag: ConversationDag::new(64, 500, 1),
-        secrets,
-        api_keys: test_api_key_store(),
-        auth_enabled: false,
-        global_mock_prefix: std::sync::Arc::from(""),
-        on_probe_exhausted: mode,
-        on_unsupported_protocol: secret_guard::config::OnUnsupportedProtocol::FailOpen,
-        upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
-        model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
-        usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),
-        pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::for_tests()),
-    };
-    let app = server::build_router(
-        proxy,
-        secret_guard::server_host_guard::HostGuard::new("127.0.0.1", addr.port()),
-    );
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-    format!("http://{addr}")
-}
-
-/// 启动 secret-guard, 显式指定 `[redact] on_unsupported_protocol` 模式 +
-/// provider 列表 + secret 表.
-///
-/// 用于 codec-less 协议 (gemini/ollama) 停损开关的集成测试: 配置了 secrets 的
-/// gemini 请求在 fail_closed 下应 503 (上游零请求), fail_open 下透传.
-async fn spawn_proxy_with_unsupported_protocol_mode(
-    mode: secret_guard::config::OnUnsupportedProtocol,
+/// 启动 secret-guard, 显式指定两个 `[redact]` 开关 (on_probe_exhausted /
+/// on_unsupported_protocol) + provider 列表 + secret 表 + upstream client.
+/// (`spawn_proxy_with_probe_mode` 与 codec-less 停损测试的共享核心 —
+/// 两个开关独立配置, 各测试只动其一, 另一个保持默认 FailOpen.)
+async fn spawn_proxy_with_redact_gates(
+    on_probe_exhausted: secret_guard::config::OnProbeExhausted,
+    on_unsupported_protocol: secret_guard::config::OnUnsupportedProtocol,
     providers: Vec<Provider>,
     secrets: SecretTable,
     upstream: reqwest::Client,
+    state_tag: &str,
 ) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let state_path = tmp_state_path("sg-state-unsup");
+    let state_path = tmp_state_path(state_tag);
     let decisions = std::sync::Arc::new(parking_lot::RwLock::new(
         secret_guard::config::Decisions::default(),
     ));
@@ -335,8 +288,8 @@ async fn spawn_proxy_with_unsupported_protocol_mode(
         api_keys: test_api_key_store(),
         auth_enabled: false,
         global_mock_prefix: std::sync::Arc::from(""),
-        on_probe_exhausted: secret_guard::config::OnProbeExhausted::FailOpen,
-        on_unsupported_protocol: mode,
+        on_probe_exhausted,
+        on_unsupported_protocol,
         upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
         model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
         usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),
@@ -350,6 +303,25 @@ async fn spawn_proxy_with_unsupported_protocol_mode(
         let _ = axum::serve(listener, app).await;
     });
     format!("http://{addr}")
+}
+
+/// 启动 secret-guard, 显式指定 `[redact] on_probe_exhausted` 模式 (单个 openai provider).
+///
+/// 用于 fail_closed 集成测试: 构造弱配置 secret + 对抗性 IR → 验证 proxy 返回 503.
+async fn spawn_proxy_with_probe_mode(
+    mode: secret_guard::config::OnProbeExhausted,
+    secrets: SecretTable,
+    upstream_url: &str,
+) -> String {
+    spawn_proxy_with_redact_gates(
+        mode,
+        secret_guard::config::OnUnsupportedProtocol::FailOpen,
+        vec![openai_provider("oa-main", upstream_url)],
+        secrets,
+        reqwest::Client::new(),
+        "sg-state-probe",
+    )
+    .await
 }
 
 fn test_secret_table() -> SecretTable {
@@ -5537,11 +5509,13 @@ async fn gemini_secrets_fail_closed_returns_503_zero_upstream_hits() {
         .await;
     let secrets = test_secret_table_with(vec![secret("api-key", real_secret)]);
     let provider = provider_with("gem-main", Protocol::Gemini, &upstream.url());
-    let proxy_url = spawn_proxy_with_unsupported_protocol_mode(
+    let proxy_url = spawn_proxy_with_redact_gates(
+        secret_guard::config::OnProbeExhausted::FailOpen,
         secret_guard::config::OnUnsupportedProtocol::FailClosed,
         vec![provider],
         secrets,
         reqwest::Client::new(),
+        "sg-state-unsup",
     )
     .await;
 
@@ -5593,11 +5567,13 @@ async fn gemini_rewrite_only_fail_closed_still_passthrough() {
         .await;
     let gem = provider_with("gem-main", Protocol::Gemini, &upstream.url());
     let router = router_provider("virt", vec![rewrite_route("*", "gem-main", "gemini-flash")]);
-    let proxy_url = spawn_proxy_with_unsupported_protocol_mode(
+    let proxy_url = spawn_proxy_with_redact_gates(
+        secret_guard::config::OnProbeExhausted::FailOpen,
         secret_guard::config::OnUnsupportedProtocol::FailClosed,
         vec![gem, router],
         test_secret_table(), // 空: 仅重写, 无 secret
         reqwest::Client::new(),
+        "sg-state-unsup",
     )
     .await;
 

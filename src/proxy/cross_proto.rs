@@ -420,25 +420,19 @@ pub(crate) async fn cross_proto_forward(
                 }
                 Err(e) => {
                     warn!(%record_id, error = %e.message, "failed to parse upstream response as {}; passing through verbatim", provider.protocol.name());
-                    // RED-8: reader 拒绝但 body 仍是合法 JSON — 复用外层已 parse 的 v
-                    // 做 JSON 叶子级 restore 兜底 (与 fan_out_buffered_ir 对称, 零二次
-                    // parse), 不让 mock 逃逸.
+                    // RED-8: reader 拒绝但 body 仍是合法 JSON — 共享兜底决策序列
+                    // (helpers SSOT, 与 fan_out_buffered_ir 对称), 不让 mock 逃逸.
                     let mut v = v;
-                    if crate::redact::restore_json_value_fallback(&mut v, &redaction_map) {
-                        super::helpers::warn_mocks_restored_via_json_leaf_fallback(record_id);
-                        (
-                            resp_status,
-                            serde_json::to_vec(&v).unwrap_or_else(|_| resp_bytes.to_vec()),
-                        )
-                    } else {
-                        // 补齐 #158 的 mock-not-restored 信号 (cross_proto 此前缺失).
-                        super::helpers::warn_mock_not_restored(
+                    (
+                        resp_status,
+                        super::helpers::restore_via_json_leaf_fallback(
                             record_id,
+                            &mut v,
+                            &resp_bytes,
                             "codec reader rejected response",
                             &redaction_map,
-                        );
-                        (resp_status, resp_bytes.to_vec())
-                    }
+                        ),
+                    )
                 }
             },
             Err(e) => {

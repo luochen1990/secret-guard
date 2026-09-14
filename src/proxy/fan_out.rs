@@ -394,15 +394,12 @@ pub(crate) async fn fan_out_buffered_ir(
     let warn_mock_not_restored = |detail: &str| {
         super::helpers::warn_mock_not_restored(record_id, detail, &redaction_map);
     };
-    let warn_restored_via_fallback = || {
-        super::helpers::warn_mocks_restored_via_json_leaf_fallback(record_id);
-    };
     let client_bytes: Vec<u8> = if recorder.error_kind.is_some() {
         // stream 中途中断 → 不 parse, 返回空 body (状态码下方调整为 502/504).
         Vec::new()
     } else {
         match serde_json::from_slice::<serde_json::Value>(&recorder.acc) {
-            Ok(v) => match reader.read_response(&v) {
+            Ok(mut v) => match reader.read_response(&v) {
                 Ok(mut ir) => {
                     // #162: 协议错配 WARN (空 content + 零 usage 启发式, 共享 helper).
                     super::recorder::warn_if_protocol_mismatch(
@@ -421,19 +418,18 @@ pub(crate) async fn fan_out_buffered_ir(
                 Err(e) => {
                     // RED-8: reader 拒绝 (eg choices 类型错配) 但 body 仍是合法 JSON —
                     // 复用外层已 parse 的 v 做 JSON 叶子级 restore 兜底 (零二次 parse),
-                    // 尽力不让 mock 逃逸到客户端.
-                    let mut v = v;
-                    if crate::redact::restore_json_value_fallback(&mut v, &redaction_map) {
-                        warn_restored_via_fallback();
-                        serde_json::to_vec(&v).unwrap_or_else(|_| recorder.acc.clone())
-                    } else {
-                        warn_mock_not_restored(&format!(
+                    // 尽力不让 mock 逃逸到客户端. 决策序列 SSOT 在 helpers.
+                    super::helpers::restore_via_json_leaf_fallback(
+                        record_id,
+                        &mut v,
+                        &recorder.acc,
+                        &format!(
                             "codec reader ({}) rejected response: {}",
                             reader.name(),
                             e.message
-                        ));
-                        recorder.acc.clone() // parse 失败: 原样返回 (无 restore).
-                    }
+                        ),
+                        &redaction_map,
+                    )
                 }
             },
             Err(e) => {
