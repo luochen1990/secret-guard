@@ -89,6 +89,27 @@ pub(super) fn is_streaming(content_type: &str) -> bool {
     ct.eq_ignore_ascii_case("text/event-stream") || ct.eq_ignore_ascii_case("application/x-ndjson")
 }
 
+/// content-type 是否为 SSE (text/event-stream)? 比 [`is_streaming`] 更窄 —
+/// StreamTranslate 管道只会重组 SSE 帧 (空行分帧), ndjson 进翻译会产出空流,
+/// 流式翻译分支的判型用本函数.
+pub(super) fn is_sse(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .eq_ignore_ascii_case("text/event-stream")
+}
+
+/// 从响应 headers 提取 content-type (缺失 / 非法 UTF-8 → 空串, 调用方判型自然落
+/// 非流式分支). same_proto / cross_proto 判型处的共享入口.
+pub(super) fn response_content_type(headers: &HeaderMap) -> &str {
+    headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
+
 /// 提取 JSON body **顶层** 指定 key 的值 (`requests_stream` / `request_model` 的
 /// 共用机制层).
 ///

@@ -1691,13 +1691,40 @@ async fn cross_protocol_translates_anthropic_ingress_to_openai_upstream() {
 }
 
 #[tokio::test]
-async fn cross_protocol_streaming_returns_501() {
-    // MVP: 跨协议 + stream=true 应返回 501 (尚未支持).
-    let upstream = spawn_mock_upstream().await;
+async fn cross_protocol_streaming_translates_openai_ingress_from_anthropic_upstream() {
+    // 跨协议流式: OpenAI ingress → Anthropic upstream (SSE) → 翻译回 OpenAI SSE.
+    // 上游流形态: message_start(usage) → text block → message_delta → message_stop.
+    let mut upstream = spawn_mock_upstream().await;
+    let sse_body = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_01test\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-sonnet\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi from Claude\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":5}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+    // 上游收到 Anthropic 形态 + stream=true (egress writer 透传流式意图).
+    let _m = upstream
+        .mock("POST", "/v1/messages")
+        .match_header("anthropic-version", "2023-06-01")
+        .match_body(mockito::Matcher::PartialJson(
+            serde_json::json!({"stream": true}),
+        ))
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse_body)
+        .create_async()
+        .await;
     let provider = provider_with("an-main", Protocol::Anthropic, &upstream.url());
     let proxy_url = spawn_proxy_with_provider(provider).await;
-    let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"}],"stream":true}"#;
-    let (status, body, _) = proxy_request(
+    let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"stream":true}"#;
+    let (status, resp_body, _) = proxy_request(
         &proxy_url,
         "POST",
         "/o/an-main/v1/chat/completions",
@@ -1705,8 +1732,229 @@ async fn cross_protocol_streaming_returns_501() {
         &[],
     )
     .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {resp_body}");
+    // 客户端收到 OpenAI 形态 SSE: role chunk + content delta + finish + usage + [DONE].
+    assert!(
+        resp_body.contains("\"object\":\"chat.completion.chunk\""),
+        "got: {resp_body}"
+    );
+    assert!(
+        resp_body.contains("\"content\":\"Hi from Claude\""),
+        "text must survive translation: {resp_body}"
+    );
+    assert!(
+        resp_body.contains("\"finish_reason\":\"stop\""),
+        "got: {resp_body}"
+    );
+    // usage 透传: Anthropic input=10/output=5 → OpenAI prompt/completion_tokens
+    // (input 经 start_usage backfill).
+    assert!(
+        resp_body.contains("\"prompt_tokens\":10"),
+        "usage input backfill: {resp_body}"
+    );
+    assert!(
+        resp_body.contains("\"completion_tokens\":5"),
+        "usage output passthrough: {resp_body}"
+    );
+    assert!(resp_body.contains("data: [DONE]"), "got: {resp_body}");
+    // 终止符恰好一次 (message_stop 在 OpenAI 侧由 finish() 的 [DONE] 承载).
+    assert_eq!(resp_body.matches("data: [DONE]").count(), 1);
+    // wire 顺序: 最后一个 content chunk 在 finish_reason chunk 之前 (OpenAI 规范
+    // finish_reason 后不应再有 content — 锁定 restore 尾部不得延迟到流末).
+    let last_content = resp_body
+        .rfind("\"content\":\"")
+        .expect("content chunks must exist");
+    let finish_pos = resp_body
+        .find("\"finish_reason\":\"stop\"")
+        .expect("finish_reason chunk must exist");
+    assert!(
+        last_content < finish_pos,
+        "content chunk after finish_reason is illegal OpenAI wire order: {resp_body}"
+    );
+}
+
+#[tokio::test]
+async fn cross_protocol_streaming_translates_anthropic_ingress_from_openai_upstream() {
+    // 反向: Anthropic ingress → OpenAI upstream (SSE 含 include_usage 末尾 chunk)
+    // → 翻译回 Anthropic SSE. 守卫 wire 顺序: message_delta(usage) 必须在
+    // message_stop 之前 (deferred stop, 1b).
+    let mut upstream = spawn_mock_upstream().await;
+    let sse_body = concat!(
+        "data: {\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hi from GPT\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-4o\",\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":4,\"total_tokens\":16}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse_body)
+        .create_async()
+        .await;
+    let provider = provider_with("oa-main", Protocol::OpenAI, &upstream.url());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+    let body = r#"{"model":"claude","messages":[{"role":"user","content":"Hello"}],"max_tokens":50,"stream":true}"#;
+    let (status, resp_body, _) =
+        proxy_request(&proxy_url, "POST", "/a/oa-main/v1/messages", body, &[]).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {resp_body}");
+    // 客户端收到 Anthropic 形态 SSE.
+    assert!(
+        resp_body.contains("event: message_start"),
+        "got: {resp_body}"
+    );
+    assert!(
+        resp_body.contains("\"type\":\"text_delta\""),
+        "got: {resp_body}"
+    );
+    assert!(
+        resp_body.contains("\"text\":\"Hi from GPT\""),
+        "text must survive translation: {resp_body}"
+    );
+    // wire 顺序: message_delta (含 usage) 在 message_stop 之前 — OpenAI 末尾
+    // include_usage chunk 在 finish_reason 之后到达, 朴素翻译会产出
+    // message_stop 之后的 message_delta (Anthropic 非法顺序).
+    let delta_pos = resp_body
+        .rfind("event: message_delta")
+        .expect("message_delta must be present");
+    let stop_pos = resp_body
+        .find("event: message_stop")
+        .expect("message_stop must be present");
+    assert!(
+        delta_pos < stop_pos,
+        "message_delta must precede message_stop (Anthropic wire order): {resp_body}"
+    );
+    // usage 透传 (OpenAI prompt=12 → Anthropic input_tokens=12).
+    assert!(
+        resp_body.contains("\"input_tokens\":12"),
+        "usage passthrough: {resp_body}"
+    );
+    // message_stop 恰好一次, 且无 [DONE] (Anthropic 不用该终止符).
+    assert_eq!(resp_body.matches("event: message_stop").count(), 1);
+    assert!(!resp_body.contains("[DONE]"), "got: {resp_body}");
+}
+
+#[tokio::test]
+async fn cross_protocol_streaming_redact_restores_mock_no_leak() {
+    // 跨协议流式 + redact: 上游 (Anthropic SSE) 在 text 里 echo mock, 客户端
+    // (OpenAI SSE) 必须看到 real secret 且绝无 mock (RED-7 流式可逆性, 跨协议路径).
+    let real_secret = "sk-cross-proto-stream";
+    let expected_mock = predict_mock(real_secret);
+    let mut upstream = spawn_mock_upstream().await;
+    let sse_body = format!(
+        concat!(
+            "event: message_start\n",
+            "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_01m\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{{\"input_tokens\":3,\"output_tokens\":1}}}}}}\n\n",
+            "event: content_block_start\n",
+            "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"the key is {mock} indeed\"}}}}\n\n",
+            "event: content_block_stop\n",
+            "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n",
+            "event: message_delta\n",
+            "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\",\"stop_sequence\":null}},\"usage\":{{\"output_tokens\":2}}}}\n\n",
+            "event: message_stop\n",
+            "data: {{\"type\":\"message_stop\"}}\n\n",
+        ),
+        mock = expected_mock,
+    );
+    let _m = upstream
+        .mock("POST", "/v1/messages")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse_body)
+        .create_async()
+        .await;
+    let entries = vec![secret("api-key", real_secret)];
+    let secrets = test_secret_table_with(entries);
+    let provider = provider_with("an-main", Protocol::Anthropic, &upstream.url());
+    let proxy_url = spawn_proxy_full(
+        vec![provider],
+        reqwest::Client::new(),
+        ConversationDag::new(64, 500, 1),
+        secrets,
+    )
+    .await;
+
+    let body = format!(
+        r#"{{"model":"gpt-4o","stream":true,"messages":[{{"role":"user","content":"use {real_secret} now"}}]}}"#
+    );
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/o/an-main/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let text = resp.text().await.unwrap();
+    // 客户端看到 real secret (响应侧 mock→real restore).
+    assert!(
+        text.contains(real_secret),
+        "client should see real_secret restored; got: {text}"
+    );
+    // 客户端绝不看到 mock (no leak).
+    assert!(
+        !text.contains(&expected_mock),
+        "client must NOT see mock {expected_mock}; got: {text}"
+    );
+    // wire 顺序 (OpenAI ingress): 最后一个 content chunk 在 finish_reason 之前 —
+    // restore 的 hold 窗口尾部不得延迟到流末 (H-1 回归).
+    let last_content = text
+        .rfind("\"content\":\"")
+        .expect("content chunks must exist");
+    let finish_pos = text
+        .find("\"finish_reason\":\"stop\"")
+        .expect("finish_reason chunk must exist");
+    assert!(
+        last_content < finish_pos,
+        "content chunk after finish_reason is illegal OpenAI wire order: {text}"
+    );
+}
+
+#[tokio::test]
+async fn cross_protocol_streaming_responses_ingress_returns_501() {
+    // Responses 作 ingress (egress OpenAI) + stream=true 同样 501 — ingress writer
+    // 的 write_response_event 未实现, 放行会翻译出空流 (501 门的另一半分支).
+    let upstream = spawn_mock_upstream().await;
+    let provider = provider_with("oa-main", Protocol::OpenAI, &upstream.url());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+    let body = r#"{"model":"gpt-4o","input":"Hi","stream":true}"#;
+    let (status, body, _) =
+        proxy_request(&proxy_url, "POST", "/r/oa-main/v1/responses", body, &[]).await;
     assert_eq!(status, reqwest::StatusCode::NOT_IMPLEMENTED);
-    assert!(body.contains("streaming cross-protocol"));
+    assert!(
+        body.contains("streaming cross-protocol"),
+        "501 body should name the cross-proto streaming gate: {body}"
+    );
+}
+
+#[tokio::test]
+async fn cross_protocol_streaming_responses_egress_returns_501() {
+    // Responses egress + stream=true 仍 501 (read_response_events 未实现, 放行会
+    // 翻译出空流). 原 "跨协议流式一律 501" 的断言已随 dispatch 接入作废, 本测试
+    // 锁定 Responses 残留范围.
+    let upstream = spawn_mock_upstream().await;
+    let provider = provider_with("resp-main", Protocol::OpenAIResponses, &upstream.url());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+    let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"}],"stream":true}"#;
+    let (status, body, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/resp-main/v1/chat/completions",
+        body,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::NOT_IMPLEMENTED);
+    assert!(
+        body.contains("streaming cross-protocol"),
+        "501 body should name the cross-proto streaming gate: {body}"
+    );
+    assert!(
+        body.contains("Responses SSE event translation unimplemented"),
+        "501 body should name the Responses cause: {body}"
+    );
 }
 
 #[tokio::test]

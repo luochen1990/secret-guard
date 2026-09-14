@@ -2,17 +2,20 @@
 //!
 //! # 职责边界
 //!
-//! 三条 fan_out 路径, 按 "redact / 流式" 两维度选择 (调用方 same_proto / cross_proto
-//! 负责选路):
+//! 四条 fan_out 路径, 按 "redact / 流式 / 跨协议" 维度选择 (调用方 same_proto /
+//! cross_proto 负责选路):
 //!
 //! - [`fan_out_streaming`]: 字节流式透传, 用于 same-proto + 无 Redact. 客户端响应 = 上游字节.
 //! - [`fan_out_streaming_with_restore`]: 流式 + IR restore, 用于 same-proto + Redact + 流式响应.
 //!   用 StreamTranslate 同协议 restore 模式 (egress SSE → IR event → restore → ingress SSE).
 //!   失去 byte-exact (IR re-serialize), 但保留流式 UX.
+//! - [`fan_out_streaming_cross_proto`]: 跨协议流式翻译 (可选 restore), 用于
+//!   cross-proto + stream=true + 2xx SSE. egress SSE → IR event → (restore) →
+//!   ingress SSE; parsed view 用 egress scan + ingress writer 序列化.
 //! - [`fan_out_buffered_ir`]: 非流式 + IR restore, 用于 same-proto + Redact + 非流式 / cross-proto.
 //!   完整累积响应, restore, 一次性返回.
 //!
-//! 两条流式路径的 spawn task 骨架 (chunk 循环 / 错误分支 / 记录累积 / attach_response)
+//! 三条流式路径的 spawn task 骨架 (chunk 循环 / 错误分支 / 记录累积 / attach_response)
 //! 逐行同构, 抽为共享的 [`fanout_stream_task`] + [`ChunkPipeline`] (chunk 变换策略),
 //! 仅 final parsed / body 计算作闭包注入 (差异是语义性的: 流式 vs 非流式 parse / body
 //! 保留策略). `fan_out_buffered_ir` 结构差异大, 不参与合并.
@@ -51,7 +54,9 @@ use super::recorder::{
 /// 流式扇出的 chunk 管道: [`fanout_stream_task`] 的 chunk 变换策略.
 ///
 /// - [`PassthroughPipe`]: 字节透传 ([`fan_out_streaming`], 无 Redact).
-/// - [`RestorePipe`]: StreamTranslate 同协议 restore ([`fan_out_streaming_with_restore`]).
+/// - [`RestorePipe`]: StreamTranslate 变换 — 同协议 restore
+///   ([`fan_out_streaming_with_restore`]) 或跨协议翻译+可选 restore
+///   ([`fan_out_streaming_cross_proto`]), 协议模式由构造时注入的 translator 决定.
 trait ChunkPipeline {
     /// 变换单个上游 chunk (identity clone / IR restore 翻译), 返回要发给客户端的字节.
     /// `None` = 本 chunk 无输出 (restore 模式下 chunk 不足以构成完整 SSE 帧是常态;
@@ -74,7 +79,8 @@ impl ChunkPipeline for PassthroughPipe {
     }
 }
 
-/// IR restore 管道: egress SSE → IR 事件 → restore (mock→real) → ingress SSE.
+/// StreamTranslate 变换管道: egress SSE → IR 事件 → (restore) → ingress SSE.
+/// 同协议 restore 模式与跨协议翻译模式共用 (模式在 translator 构造时决定).
 struct RestorePipe {
     translate: crate::codec::stream::StreamTranslate,
 }
@@ -383,18 +389,10 @@ pub(crate) async fn fan_out_buffered_ir(
     // usage-stats 回显摘要: parse 成功时从 IrResponse 提取 (restore 只改字符串叶子,
     // 不触碰 usage 数字, 但在 restore 前提取保持 "LLM 原始回显" 语义清晰).
     let mut resp_echo = ResponseEcho::default();
-    // #158: parse 失败 fallback 时, 若本请求做过 redact (map 非空), body 中的 mock
-    // 不会被 restore — 客户端拿到假 secret. 记一条 WARN 让该逃逸可感知
-    // (行为不变: 仍原样透传, best-effort 原则).
-    let warn_mock_not_restored = |detail: &str| {
-        if !redaction_map.is_empty() {
-            warn!(
-                %record_id,
-                detail,
-                "response parse failed with redactions in flight; \
-                 mock not restored; client will see mock values"
-            );
-        }
+    // #158: parse 失败 fallback 的 mock-not-restored WARN 走 recorder 共享 helper
+    // (与 cross_proto 非流式 fallback 分支对称).
+    let warn_not_restored = |detail: &str| {
+        super::recorder::warn_mock_not_restored(record_id, &redaction_map, detail);
     };
     let client_bytes: Vec<u8> = if recorder.error_kind.is_some() {
         // stream 中途中断 → 不 parse, 返回空 body (状态码下方调整为 502/504).
@@ -418,7 +416,7 @@ pub(crate) async fn fan_out_buffered_ir(
                     serde_json::to_vec(&restored).unwrap_or_else(|_| recorder.acc.clone())
                 }
                 Err(e) => {
-                    warn_mock_not_restored(&format!(
+                    warn_not_restored(&format!(
                         "codec reader ({}) rejected response: {}",
                         reader.name(),
                         e.message
@@ -427,7 +425,7 @@ pub(crate) async fn fan_out_buffered_ir(
                 }
             },
             Err(e) => {
-                warn_mock_not_restored(&format!(
+                warn_not_restored(&format!(
                     "response body is not a single JSON value ({e}); \
                      likely SSE-shaped body under a non-SSE content-type"
                 ));
@@ -507,10 +505,6 @@ pub(crate) async fn fan_out_streaming_with_restore(
     stream_idle_timeout: Option<std::time::Duration>,
     usage: crate::usage::UsageCtx,
 ) -> Result<Response<Body>, AppError> {
-    let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(32);
-    let resp_headers_for_record = resp_headers.clone();
-    let status_u16 = resp_status.as_u16();
-
     // 同协议 + restore 模式: ingress == egress, 但 IR re-serialize 用于 restore.
     // restore hook 由本层 (proxy) 注入 — codec::stream 不依赖 redact (解环 #145).
     let translate = crate::codec::stream::StreamTranslate::new_same_proto_restore(
@@ -520,6 +514,93 @@ pub(crate) async fn fan_out_streaming_with_restore(
     // ParsedSync: 累积 parsed view (LLM 视角, 含 mock, 与 record 语义一致).
     // 喂的是上游原始字节 (与 pipe.transform 同一份 b), ParsedSync 内部用 codec reader 解析.
     let parsed_sync = ParsedSync::new(codec_proto, dag.clone(), record_id);
+
+    spawn_restore_fanout(
+        dag,
+        record_id,
+        started,
+        upstream_resp,
+        resp_status,
+        resp_headers,
+        translate,
+        parsed_sync,
+        stream_idle_timeout,
+        usage,
+    )
+}
+
+/// 跨协议流式扇出: egress SSE → IR 事件 → (可选 restore) → ingress SSE, 复用
+/// [`spawn_restore_fanout`] 管道 (与 [`fan_out_streaming_with_restore`] 同骨架,
+/// 差异仅 translator 构造与 ParsedSync 的 scan/writer 协议分离).
+///
+/// 用于: cross-proto + stream=true + 2xx SSE 成功响应.
+/// - `redaction_map` 非空时注入 restore hook (响应侧 mock→real, RED-7 流式可逆性
+///   在跨协议路径同样成立); 为空时纯翻译 (无 restore).
+/// - parsed view: StreamScan 用 **egress** proto 解析上游字节, 序列化用 **ingress**
+///   writer (与非流式 cross_proto 的 resp_parsed 语义一致, WebUI 按 ingress codec 解析).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn fan_out_streaming_cross_proto(
+    dag: ConversationDag,
+    record_id: uuid::Uuid,
+    started: Instant,
+    upstream_resp: reqwest::Response,
+    resp_status: StatusCode,
+    resp_headers: HeaderMap,
+    ingress: crate::codec::Protocol,
+    egress: crate::codec::Protocol,
+    redaction_map: RedactionMap,
+    stream_idle_timeout: Option<std::time::Duration>,
+    usage: crate::usage::UsageCtx,
+) -> Result<Response<Body>, AppError> {
+    // 跨协议模式 translator: redact 场景注入 StreamingRestorerSet (hook 由本层注入,
+    // codec::stream 不依赖 redact, 解环 #145 — 与同协议 restore 路径同一先例).
+    // ingress != egress 由 caller (cross_proto_forward) 的路径前提保证 — 该函数只在
+    // 跨协议 dispatch 分支被调用, expect 是内部不变式断言而非外部输入校验.
+    let translate = crate::codec::stream::StreamTranslate::new_cross_proto(
+        ingress,
+        egress,
+        (!redaction_map.is_empty()).then(|| {
+            Box::new(crate::redact::StreamingRestorerSet::new(redaction_map))
+                as Box<dyn crate::codec::stream::StreamRestoreHook>
+        }),
+    )
+    .expect("cross-proto fan-out requires ingress != egress (dispatch invariant)");
+    // ParsedSync: scan 用 egress, 序列化用 ingress (见函数 doc).
+    let parsed_sync = ParsedSync::new_cross_proto(egress, ingress, dag.clone(), record_id);
+
+    spawn_restore_fanout(
+        dag,
+        record_id,
+        started,
+        upstream_resp,
+        resp_status,
+        resp_headers,
+        translate,
+        parsed_sync,
+        stream_idle_timeout,
+        usage,
+    )
+}
+
+/// 两条 StreamTranslate 流式扇出路径 (同协议 restore / 跨协议翻译) 的共享 spawn
+/// 骨架: 两者仅 translator 与 ParsedSync 的构造方式不同, finalize 闭包与响应构造
+/// 逐字相同 (语义 SSOT: 断流仍保留累积 parsed; 2xx SSE 成功响应不保留原始字节).
+#[allow(clippy::too_many_arguments)]
+fn spawn_restore_fanout(
+    dag: ConversationDag,
+    record_id: uuid::Uuid,
+    started: Instant,
+    upstream_resp: reqwest::Response,
+    resp_status: StatusCode,
+    resp_headers: HeaderMap,
+    translate: crate::codec::stream::StreamTranslate,
+    parsed_sync: ParsedSync,
+    stream_idle_timeout: Option<std::time::Duration>,
+    usage: crate::usage::UsageCtx,
+) -> Result<Response<Body>, AppError> {
+    let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(32);
+    let resp_headers_for_record = resp_headers.clone();
+    let status_u16 = resp_status.as_u16();
 
     tokio::spawn(fanout_stream_task(
         FanoutStreamCtx {
@@ -536,21 +617,22 @@ pub(crate) async fn fan_out_streaming_with_restore(
         tx,
         Some(parsed_sync),
         RestorePipe { translate },
-        move |parsed_sync, _recorder| {
+        |parsed_sync, _recorder| {
             // 最终 parsed 快照 + 回显摘要. 即使 error_kind (client disconnect /
             // upstream error), 也保留截至断流时的累积内容 — 用户能看到部分响应比
             // 看到空白更有价值. (overflow 时同理: 截至 Overflow 前的内容比 truncate
             // banner 更有用.)
-            let ps = parsed_sync.expect("restore 路径恒有 ParsedSync");
+            let ps = parsed_sync.expect("StreamTranslate 流式路径恒有 ParsedSync");
             let (v, echo) = ps.finalize();
             (Some(v), echo)
         },
-        move |recorder| {
+        |recorder| {
             if recorder.overflow {
                 super::TRUNCATED_BANNER.to_string()
             } else {
-                // 此路径仅用于 2xx 成功响应 (非 2xx 走 fan_out_buffered_ir).
-                // 2xx 流式成功响应不保留原始 SSE 字节 (parsed view 已覆盖语义内容).
+                // 两条路径都仅用于 2xx SSE 成功响应 (非 2xx / 非 SSE 走 buffered
+                // 家族). 2xx 流式成功响应不保留原始 SSE 字节 (parsed view 已覆盖
+                // 语义内容).
                 String::new()
             }
         },
@@ -559,10 +641,9 @@ pub(crate) async fn fan_out_streaming_with_restore(
     let body = Body::from_stream(ReceiverStream::new(rx));
     let mut resp = Response::new(body);
     *resp.status_mut() = resp_status;
-    let out_headers = build_response_headers(&resp_headers);
-    // restore 后的 SSE, content-type 仍是 text/event-stream (SSE 是 SSE).
+    // 翻译/restore 后的 SSE, content-type 仍是 text/event-stream (SSE 是 SSE).
     // 不强改 content-type, 保留上游声明的.
-    *resp.headers_mut() = out_headers;
+    *resp.headers_mut() = build_response_headers(&resp_headers);
     Ok(resp)
 }
 

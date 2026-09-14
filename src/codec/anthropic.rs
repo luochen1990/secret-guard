@@ -480,8 +480,9 @@ impl Writer for AnthropicWriter {
                 IrBlockMeta::ReasoningContent => {
                     // 跳过: thinking block 需 signature, 无法合法合成 (伪造会被
                     // Anthropic API 拒收). 裁决 rationale 见 codec/AGENTS.md 支持矩阵.
-                    // 注意: BlockStop 分支无状态仍会 emit 未配对的 content_block_stop —
-                    // 当前不可达 (跨协议流式 501), 接入前置条件见根 AGENTS.md 后续工作.
+                    // 同 index 的 BlockStop 由 StreamTranslate 的跳过 block 配对过滤
+                    // 兜底 (跨协议模式, stream/translate.rs) — 不产生未配对的
+                    // content_block_stop.
                     None
                 }
                 IrBlockMeta::ToolUse { id, name } => Some((
@@ -509,7 +510,8 @@ impl Writer for AnthropicWriter {
                 )),
                 IrDelta::ReasoningDelta(_) => {
                     // thinking_delta 需要 BlockStart(thinking) 配对 (见 BlockStart 分支),
-                    // 跳过 (跨协议流式本就未接入 dispatch, 此为防御性降级).
+                    // 跳过 (配对 BlockStart 被 writer 跳过的 block, 其 delta 亦不 emit —
+                    // StreamTranslate 的配对过滤跳过同 index BlockStop, 三者一致).
                     None
                 }
                 IrDelta::InputJsonDelta(partial) => Some((

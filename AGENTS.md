@@ -334,8 +334,9 @@ URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标
 - 路由 provider (routes) 坏路由: 无匹配路由 (NoMatch) / 目标缺失 / 目标 disabled / 成环 → 503
   `unavailable` (message 只含 id + model 名 + reason 枚举, SEC-2 同型; 解析 per-request —
   body 收集后按请求 model 匹配路由, 切换只影响新请求 — FWD-5, #179)
-- 跨协议 + `stream=true` → 501 (流式跨协议翻译尚未接入 dispatch)
-- **Responses + (Redact 或路由 model 重写) + `stream=true`** → 501 (Responses 流式 SSE 事件翻译未实现; 重写亦迫使 IR 路径 #183 D5; 见 "已知限制")
+- **跨协议 + `stream=true`**: OpenAI ⇄ Anthropic 走 StreamTranslate 流式翻译 (含
+  Redact 场景的响应侧 restore); **Responses (任一侧) 例外** → 501 (Responses 流式
+  SSE 事件翻译未实现, 放行会翻译出空流; 重写亦迫使 IR 路径 #183 D5; 见 "已知限制")
 - Gemini/Ollama 跨协议 → 501 (codec 未覆盖)
 
 **router provider 的模型列表 GET 请求本地终结 (#196)**: `GET /{o|a|g|l|r}/{router}` + 模型列表端点
@@ -345,7 +346,7 @@ TTL 300s + serve-stale-on-error + single-flight; exact-only router 零上游请�
 不进转发链 / 不记 DAG (D5); Direct provider 的 /models 透传行为不变 (D6)。
 可测 property 见 `docs/design/contracts.md` **FWD-7**; 实现见 `src/proxy/models.rs` 头部。
 
-详尽的 dispatch 路径选择 (同协议透传 / IR 路径 / 跨协议翻译) 与 fan_out 三路径见
+详尽的 dispatch 路径选择 (同协议透传 / IR 路径 / 跨协议翻译) 与 fan_out 四路径见
 `src/proxy/mod.rs` 头部 (拆分为模块目录, 各子路径实现在 `same_proto.rs` / `cross_proto.rs` /
 `fan_out.rs`); 路由相关的可测 property 见 `docs/design/contracts.md` **FWD-5**.
 
@@ -370,7 +371,7 @@ TTL 300s + serve-stale-on-error + single-flight; exact-only router 零上游请�
 | `redact.rs` | RedactionMap + redact/restore pipeline + 形式化契约 C1-C7 | 文件头部 `//!` |
 | `util.rs` | 集中的哈希工具 (`hash64` SipHash 单值入口) | 文件头部 `//!` |
 | `codec/` | 跨协议 IR + Reader/Writer trait + StreamTranslate (OpenAI / Anthropic / Responses) | **`src/codec/AGENTS.md`** + `docs/design/ir-fields-roadmap.md` (IR 字段建模路线图: extra 边界 + 字段提升判定准则 + 实施批次) |
-| `proxy/` | dispatch 路径选择 + fan_out 三路径 + Provider 鉴权 + router GET /models 本地合成 (拆分为 mod/helpers/auth/models/recorder/same_proto/cross_proto/fan_out 子模块) | `src/proxy/mod.rs` 头部 `//!` |
+| `proxy/` | dispatch 路径选择 + fan_out 四路径 + Provider 鉴权 + router GET /models 本地合成 (拆分为 mod/helpers/auth/models/recorder/same_proto/cross_proto/fan_out 子模块) | `src/proxy/mod.rs` 头部 `//!` |
 | `state.rs` | 进程级共享状态 `AppState` (原 ProxyState, 上移见 #145) + HTTP 共享常量 `NO_STORE` | 文件头部 `//!` |
 | `web/` | JSON API (`api/` 目录) + 单页 WebUI | **`src/web/AGENTS.md`** |
 | `server.rs` | router 装配 + 双层状态注入 + graceful shutdown + Host/Origin guard 最外层挂载 | 文件头部 `//!` |
@@ -702,7 +703,8 @@ configFile (escape hatch, 互斥). 凭据注入 (LoadCredential / sops 直接路
 - **OpenAI Responses API 支持范围**: Responses 协议 (`/r/` proto_short) 已接入 codec,
   支持 Responses ⇄ Chat Completions 跨协议翻译 (非流式) + Responses 同协议透传 + Redact (非流式).
   **不支持**: Responses 流式 SSE 事件翻译 (Responses + Redact + `stream=true` 返回 501;
-  无 Redact 且路由链无 model 重写的同协议流式透传正常工作; 配置了任一则 501, #183 D5); Responses ⇄ Anthropic 跨协议 (返回 501);
+  无 Redact 且路由链无 model 重写的同协议流式透传正常工作; 配置了任一则 501, #183 D5;
+  跨协议 Responses 任一侧 + `stream=true` 同样 501); Responses ⇄ Anthropic 跨协议 (返回 501);
   hosted tools (web_search/file_search/computer_use/mcp → 静默丢弃; MCP 在客户端 LLM 请求中
   的呈现形态与协议约束边界调研见 `docs/research/mcp-notes.md`); namespace tools
   flattening; `previous_response_id` 服务端状态 (secret-guard 是 stateless 代理);
@@ -710,8 +712,6 @@ configFile (escape hatch, 互斥). 凭据注入 (LoadCredential / sops 直接路
 - **Responses 协议的 timeline delta 为空**: Responses ingress 的 `req_body_raw` 用 `input[]`
   (而非 `messages[]`), `extract_delta_messages_from_raw` 找不到 messages 字段, 返回空 Vec.
   WebUI timeline 仍能显示 preview / role, 但不渲染增量气泡 (与跨协议 ingress 的 delta 限制一致).
-- **跨协议 + 流式响应**: OpenAI ⇄ Anthropic 跨协议时 `stream=true` 返回 501
-  (StreamTranslate 已实现跨协议翻译, 但尚未接入 dispatch; 迁移计划见 "后续工作").
 - **Mock probing 耗尽可配置 fail-open / fail-closed**: 弱配置 (charset/length 仅产生
   极少候选) + 对抗性 IR 可能让 `redact_ir` 的 mock probing 耗尽 (`MOCK_PROBE_LIMIT`).
   历史行为是 **fail-open** (warn + 跳过该 secret, 原样转发到上游, 见 `redact_ir`).
@@ -750,9 +750,9 @@ configFile (escape hatch, 互斥). 凭据注入 (LoadCredential / sops 直接路
   reader 无法 parse 时 (类型不符 / 空数组 / 越界), 转发路径 fallback 为透传含 mock 的字节, 无 restore,
   客户端收到 mock. 同协议路径见 `src/proxy/fan_out.rs` (non-stream 分支), 跨协议路径见
   `src/proxy/cross_proto.rs`. 均走 best-effort 鲁棒性原则 (ROB-*), parse 失败不 panic.
-  同协议路径在 redaction map 非空时打 WARN (`mock not restored`, #158); 跨协议路径仅
-  reader 拒绝时打通用 parse 失败 WARN, 非 JSON fallback 静默 (mock-not-restored 信号
-  缺失, 补齐是后续工作).
+  两路径在 redaction map 非空时均打 WARN (`mock not restored`, #158; 跨协议路径的
+  补齐经共享 helper `recorder::warn_mock_not_restored`, reader 拒绝与非 JSON fallback
+  两个分支都覆盖).
 - **provider 协议与上游实际协议错配 → 静默空响应 (有 WARN)**: provider protocol=anthropic
   但上游实为 OpenAI shape 时, 2xx 响应被 reader 宽松解析为空 content + 全零 usage
   (reader 对缺字段 `unwrap_or_default` 降级, 不报错). 行为不变 (仍翻译返回), 但打 WARN
@@ -836,16 +836,6 @@ configFile (escape hatch, 互斥). 凭据注入 (LoadCredential / sops 直接路
 
 ## 后续工作 (非 MVP 范围)
 
-- **跨协议路径的 mock-not-restored WARN**: cross_proto 响应 parse 失败 fallback
-  (reader 拒绝 / 非 JSON) 时, 与同协议路径 (`proxy/fan_out.rs::warn_mock_not_restored`)
-  对称地在 redaction map 非空时打 `mock not restored` WARN (#158 只覆盖了
-  同协议路径; 见 "已知限制" 对应条目).
-- **跨协议流式响应翻译**: 在 `cross_proto_forward` 检测 stream=true 时接入
-  `StreamTranslate::new(ingress, egress)` 而非返回 501. 前置条件 (#176 登记):
-  Anthropic writer 对 ReasoningContent block 只跳过 BlockStart/Delta, `BlockStop` 因 writer
-  无状态仍会 emit 未配对的 `content_block_stop` — 接入前需给 writer 加跳过 index
-  集合或在 StreamTranslate 层过滤 (见 `src/codec/anthropic.rs` write_response_event
-  的 ReasoningContent 分支注释).
 - **更多协议**: Gemini / Ollama / Bedrock / Cohere / OpenAI Responses API.
   新增协议只需实现 Reader + Writer trait (~200 行), 不动 dispatch.
 - **redact_headers 名单可配置**: 加 `[redact] redacted_headers = [...]` 配置项,

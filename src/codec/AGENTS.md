@@ -12,22 +12,25 @@
 
 ## 支持矩阵
 
-- ✅ OpenAI Chat Completions ⇄ Anthropic Messages 双向 (非流式 + 流式 SSE).
+- ✅ OpenAI Chat Completions ⇄ Anthropic Messages 双向 (非流式 + 流式 SSE, 含 Redact
+  场景 — 流式经 StreamTranslate 跨协议模式 + restore hook, 已接入 dispatch).
 - ✅ OpenAI Responses API 同协议透传 + Redact (非流式; 流式 + Redact 返回 501).
 - ✅ OpenAI Responses ⇄ OpenAI Chat Completions 跨协议翻译 (非流式).
 - ✅ `reasoning_content` (思考原文, OpenAI 兼容 provider 非标字段) 同协议建模:
   请求 (assistant 历史回传) / 非流式响应 / 流式 delta 三路径 reader↔writer 对称
   (#176, 契约 STR-6). 跨协议丢弃 (见下).
 - ❌ Responses ⇄ Anthropic 跨协议: 未实现 (返回 501).
-- ❌ Responses 流式 SSE 事件翻译 (`read_response_events` / `write_response_event` 返回空/None).
+- ❌ Responses 流式 SSE 事件翻译 (`read_response_events` / `write_response_event` 返回空/None),
+  含跨协议 Responses 任一侧 + stream=true (501).
 - ❌ 不在 MVP: Bedrock / Gemini / Cohere, reasoning `encrypted_content` (provider-specific opaque),
   Anthropic `thinking` blocks, citations, logprobs, prompt caching, Bedrock eventstream 二进制流.
 
 > **reasoning_content 跨协议丢弃 rationale** (#176, FWD-3 已知损失): Anthropic thinking
 > block 必须携带 signature (加密签名, secret-guard 无法合成 — 伪造会被 Anthropic API 拒收);
 > Responses reasoning item 依赖 `encrypted_content` (provider-opaque). 两者都无法从思考
-> 原文合法合成, writer 跳过 (返回 None) 而非发明非法 wire 形态. 跨协议流式本就未接入
-> dispatch (501), 此为增强面的合理降级.
+> 原文合法合成, writer 跳过 (返回 None) 而非发明非法 wire 形态. 流式路径由
+> StreamTranslate 的跳过 block 配对过滤兜底 (writer 跳过 BlockStart 的 index, 其
+> BlockStop 一并跳过, 不产生未配对的 content_block_stop), 见 `stream/translate.rs`.
 
 ## 核心抽象
 
@@ -36,7 +39,7 @@
 | `IrRequest` / `IrResponse` / `IrBlock` / `IrStreamEvent` | `ir.rs` | 协议无关的中间表示 (chat completion 范围) |
 | `Reader` trait | `mod.rs` | wire JSON/Bytes → IR (`read_request` / `read_response` / `read_response_events`) |
 | `Writer` trait | `mod.rs` | IR → wire (`write_request` / `write_response` / `write_response_event` / `requires_max_tokens` / `emits_sse_done_terminator` / `write_error`) |
-| `StreamTranslate` | `stream/translate.rs` | egress SSE → IR 事件流 → ingress SSE (chunk-boundary 处理 + 跨协议翻译 + 同协议 restore 两种模式) |
+| `StreamTranslate` | `stream/translate.rs` | egress SSE → IR 事件流 → ingress SSE (chunk-boundary 处理; 跨协议翻译 [可选 restore] + 同协议 restore 两类模式, 跨协议模式含跳过 block 配对过滤 + deferred message_stop) |
 | `StreamScan` | `stream/scan.rs` | 流式 SSE → IrResponse 累积器 (供 WebUI parsed view) |
 | `Protocol` enum | `mod.rs` | codec 当前支持的协议子集 (OpenAI/Anthropic/Responses); `from_native` 是 Gemini/Ollama → None 的单一接入点 |
 

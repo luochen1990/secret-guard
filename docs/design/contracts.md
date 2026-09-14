@@ -232,6 +232,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 **Properties**:
 - `prop_cross_proto_modeled_fields_preserved`: 建模范围内的字段 (messages/tools/tool_use/tool_result/usage 总数/stop_reason) 跨协议 round-trip 后保留. 🔁→`prop_cross_proto_modeled_fields_preserved_openai_to_anthropic` + `prop_cross_proto_modeled_fields_preserved_anthropic_to_openai` (`src/codec/fwd_cross_proto_property.rs`)
+- `prop_cross_proto_stream_content_fidelity` (2026-09-15, 流式半段): 跨协议流式翻译 (StreamTranslate 跨协议模式, 任意 chunk 切分含 1-byte) 内容保真 — text / tool input 拼接相等, tool_use id/name 保真, usage output_tokens 透传; wire 帧顺序合法性由确定性单测守卫 (双方向: Anthropic ingress 的 message_delta-before-message_stop + 跳过 block 配对, OpenAI ingress 的 content-before-finish_reason + restore 尾部及时冲刷). 🔁→`prop_cross_proto_stream_openai_to_anthropic` + `prop_cross_proto_stream_byte_by_byte_openai_to_anthropic` + `prop_cross_proto_stream_byte_by_byte_anthropic_to_openai` + `cross_proto_reasoning_block_yields_no_unpaired_block_stop` + `cross_proto_defers_message_stop_until_post_stop_usage` + `cross_proto_openai_ingress_flushes_skipped_block_tail_before_finish_reason`
 - `prop_cross_proto_unmodeled_fields_explicitly_dropped`: 范围外字段 (如 reasoning_content) 不出现在 egress wire. ✅
 - `prop_cross_proto_extra_cleared`: 跨协议路径下 ingress IR 的 extra 字段必须清空, 不允许源协议独有字段泄漏到 egress. ✅
 - `prop_documented_semantic_loss_list`: 所有已知的语义损失点必须在 `src/codec/AGENTS.md` 显式列出 (人工审查项). ✅
@@ -261,7 +262,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 - `prop_unknown_protocol_returns_404`: 未知 proto_short → 404 not_found. 🔁→`unknown_protocol_returns_404` (`tests/integration.rs`)
 - `prop_unknown_provider_returns_404`: 未知 provider_id → 404 not_found. 🔁→`unknown_provider_returns_404` (`tests/integration.rs`)
 - `prop_disabled_provider_returns_503`: provider.enabled=false → 503 unavailable. 🔁→`disabled_provider_returns_503` (`tests/integration.rs`)
-- `prop_cross_proto_streaming_returns_501`: 跨协议 + stream=true → 501 (翻译未接入). 🔁→`cross_protocol_streaming_returns_501` (`tests/integration.rs`)
+- `prop_cross_proto_streaming_responses_returns_501` (2026-09-15 收窄; 前身 `prop_cross_proto_streaming_returns_501` 随 OpenAI⇄Anthropic 流式接入 dispatch 作废): 跨协议 + stream=true 中 **Responses 任一侧** → 501 (`read_response_events` 未实现, 放行会翻译出空流). OpenAI⇄Anthropic 方向不再 501 (翻译行为由 FWD-3 `prop_cross_proto_stream_content_fidelity` 守卫). 🔁→`cross_protocol_streaming_responses_egress_returns_501` + `cross_protocol_streaming_responses_ingress_returns_501` (`tests/integration.rs`)
 - `prop_unsupported_codec_returns_501`: Gemini/Ollama 跨协议 → 501 (codec 未覆盖). 🔁→`cross_protocol_unknown_pair_returns_501` (`tests/integration.rs`)
 - `prop_internal_url_404_no_forward`: `/api/*` 未匹配子路径 → 404, 绝不进入 forward (防止内部 URL 泄漏到上游; 同 SEC-6 的 property 名). 🔁→`web_namespace_not_forwarded_to_upstream` + `unmatched_path_returns_404` (`tests/integration.rs`)
 - `prop_route_resolution_per_request` (#179): 路由 provider 的路由解析是 per-request 的 (body 收集后携带本请求 model) — 修改路由 / 切换指向只影响新请求, in-flight 请求按已解析目标完成; 每轮 record 的 upstream_id 如实记录该轮实际归属, 历史轮次不随切换改写. 🔁→`router_provider_switches_routes_mid_session` (`tests/integration.rs`)
@@ -389,13 +390,14 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 ### RED-7 流式可逆性 (streaming restorability)
 
-**陈述**: `StreamingRestorer` 在任意 chunk 切分下保证 `concat(push(c_1..n), flush().1)` 严格等于 `content.replace(mock, real)`. UTF-8 安全.
+**陈述**: `StreamingRestorer` 在任意 chunk 切分下保证 `concat(push(c_1..n), flush().1)` 严格等于 `content.replace(mock, real)`. UTF-8 安全. 同协议路径 (StreamTranslate 同协议 restore 模式) 与跨协议路径 (StreamTranslate 跨协议模式注入 hook, 2026-09-15 起接入 dispatch) 均适用.
 
 **Properties**:
 - `prop_streaming_restorer_round_trip`: 对任意 chunk_size (1..N), round-trip identity 成立. ✅
 - `prop_streaming_restorer_utf8_safe`: 多字节字符不在 char boundary 中间切的 round-trip identity. 🔁→`prop_streaming_restorer_round_trip_utf8` (`src/redact.rs`)
 - `prop_streaming_restorer_multi_mock`: 多 mock 在同一段文本中的 round-trip identity. 🔁→`prop_streaming_restorer_round_trip_multi_mock` + `restorer_round_trip_on_multiple_mocks_in_one_chunk` (`src/redact.rs`)
 - `prop_streaming_restorer_per_block_isolated`: 不同 block 的 restorer 状态独立 (block 间 mock 边界互不干扰). ⏳
+- `prop_cross_proto_streaming_no_mock_leak_dispatch_integrated` (2026-09-15): 跨协议流式 + restore (生产 dispatch 同型构造) 下, 客户端 SSE 不含 mock 且 content / tool input == 上游拼接 `.replace(mock, real)` (端到端 HTTP 层由集成测试 `cross_protocol_streaming_redact_restores_mock_no_leak` 覆盖). ✅
 
 ---
 
@@ -1109,3 +1111,4 @@ chars (char boundary 安全); 其余事件字段为受控类型, 天然无 secre
 | 2026-09-03 | USAGE-1..6 | 新增模型用量统计 (usage-stats) 契约域: 聚合一致性 (三向相等 + 重放恢复) / 回显保真 (presence 位区分无回显与显式零, 联动 STR-2) / 成本纯函数与可复算 (models.dev 匹配规则 SSOT + 实时重算快照语义) / 缺失显式 (without_usage + coverage 口径) / 计入判据 (仅 POST 且收到上游响应; GET /models 与 send 失败不计) / SEC 边界 (model 字符串扫描 + 截断) | 模型用量统计功能 (设计 `docs/design/usage-stats.md`, 网关计量位势: wire 层回显消费, 零 tokenizer) |
 | 2026-08-31 | FWD-1 | **适用范围修订 (待人工授权)**: router provider 的模型列表 GET 请求 (FWD-7 域) 本地终结, 不转发上游 — 对这类请求 FWD-1 不适用 (响应为本地合成, 可含缓存上游清单, 非实时中继); Direct provider 的 /models 仍受 FWD-1 约束 (先例: 2026-08-24 #183 的 FWD-1 修订) | #196: 模型列表发现是网关自身的元数据职责, 透传上游列表无法承载路由别名 |
 | 2026-09-04 | USAGE-3 + USAGE-4 | USAGE-3 多 vendor 消歧语义澄清 (人工授权, #202): 原文"域名消歧, 仍歧义字母序"未规定同 host 多 vendor 碰撞行为, 实现为 last-wins (结果静默依赖上游 JSON 键序, 套餐 vendor 胜出 → cost 恒 0). 修订为: hint host 的 vendor 集与候选集交集非空则收缩到交集, 池内确定性偏好序 (无 `-plan` 段 > 名短 > 字母序), 结果与数据键序无关; 偏好序是启发式策略而非正确性保证. USAGE-4 新增 `zero_priced_models` 显式清单 (零价 ≠ 无价, coverage 口径不变) | #202: 套餐入口部署 est_cost_usd 恒 0 且 cost_coverage=1.0 掩盖异常; 链路缺口 = 消歧规则对碰撞场景欠规定 + 零价缺少显式观测信号 |
+| 2026-09-15 | FWD-5 + FWD-3 + RED-7 | **跨协议流式接入 dispatch**: OpenAI⇄Anthropic + stream=true 从 501 改为 StreamTranslate 跨协议模式流式翻译 (redact 场景注入 restore hook, 响应侧 mock→real); FWD-5 的 `prop_cross_proto_streaming_returns_501` 作废, 收窄为 `prop_cross_proto_streaming_responses_returns_501` (Responses 任一侧仍 501 — read_response_events 未实现, 放行会翻译出空流); FWD-3 新增 `prop_cross_proto_stream_content_fidelity` (流式半段内容保真 + wire 帧顺序合法性); RED-7 适用范围扩至跨协议路径 + 新增 `prop_cross_proto_streaming_no_mock_leak_dispatch_integrated`. 配套实现: StreamTranslate 跨协议模式新增跳过 block 配对过滤 (writer 跳过 BlockStart 的 index 其 BlockStop 一并跳过, 不产生未配对 content_block_stop) + deferred message_stop (message_delta[usage] 先于 message_stop, Anthropic wire 合法顺序) | 跨协议流式翻译已实现且有 property 守卫, 但从未接入 dispatch (501 占位); dispatch 接入任务授权 (评审设计 2026-09-15) |

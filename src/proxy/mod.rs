@@ -27,15 +27,19 @@
 //! 模型列表端点 → `models::handle_router_models` 本地合成 (别名 ∪ 过滤后上游清单),
 //! 不收集 body / 不做路由解析 / 不记 DAG。Direct provider 不进该分支。
 //!
-//! - **跨协议 + `stream=true`** → 501 (StreamTranslate 跨协议翻译已实现但未接入 dispatch).
+//! - **跨协议 + `stream=true`** (OpenAI ⇄ Anthropic): StreamTranslate 跨协议流式翻译,
+//!   经流式扇出回传 (redact 场景响应侧 restore); **Responses 任一侧例外** → 501
+//!   (Responses 流式 SSE 事件翻译未实现, 放行会翻译出空流).
 //! - **Gemini/Ollama 跨协议** → 501 (codec 未覆盖, `Protocol::from_native` 返回 None).
 //!
-//! # fan_out 三路径 (响应扇出)
+//! # fan_out 四路径 (响应扇出)
 //!
 //! - `fan_out_streaming`: 字节流式透传, 用于 same-proto + 无 Redact. 客户端响应 = 上游字节.
 //! - `fan_out_streaming_with_restore`: 流式 + IR restore, 用于 same-proto + Redact + 流式响应.
 //!   用 StreamTranslate 同协议 restore 模式 (egress SSE → IR event → restore → ingress SSE).
 //!   失去 byte-exact (IR re-serialize), 但保留流式 UX.
+//! - `fan_out_streaming_cross_proto`: 跨协议流式翻译 (可选 restore), 用于 cross-proto +
+//!   stream=true + 2xx SSE. egress SSE → IR event → (restore) → ingress SSE.
 //! - `fan_out_buffered_ir`: 非流式 + IR restore, 用于 same-proto + Redact + 非流式 / cross-proto.
 //!   完整累积响应, restore, 一次性返回.
 //! - **客户端响应永远无大小上限**; 只有 record 累积受 `MAX_RESP_BODY_RECORD` (32 MiB) 约束.

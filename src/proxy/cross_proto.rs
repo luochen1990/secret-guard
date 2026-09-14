@@ -3,15 +3,17 @@
 //! # 职责边界
 //!
 //! ingress 协议 → IR → egress 协议, 上游响应反向翻译. 与 same_proto 的差异:
-//! - 强制非流式 (上游 stream=false; 客户端若 stream=true 返回 501).
-//! - 应用 redact (在 IR 层, 不与 codec 翻译冲突).
-//! - 响应直接翻译 (无 restore, mock 不在响应中出现).
+//! - 流式响应 (2xx + SSE): StreamTranslate 跨协议模式实时翻译 (可选 restore),
+//!   经 mpsc 扇出管道回传 (见 `fan_out::fan_out_streaming_cross_proto`).
+//! - 应用 redact (在 IR 层, 不与 codec 翻译冲突). redact 场景的流式响应经
+//!   StreamRestoreHook 做响应侧 mock→real (与非流式的 `restore_ir_response` 对称).
 //! - 上游错误响应 (4xx/5xx) 也通过 codec 翻译为 ingress 协议的原生错误 envelope.
 //!
-//! # MVP 范围与限制
+//! # 范围与限制
 //!
-//! 只支持 OpenAI ⇄ Anthropic 双向 (其他组合返回 501). StreamTranslate 跨协议翻译
-//! 已实现但未接入 dispatch (跨协议 + stream=true → 501).
+//! 只支持 OpenAI ⇄ Anthropic 双向流式/非流式. Responses (ingress 或 egress) 的
+//! 流式仍返回 501 — 其 `read_response_events` 未实现, 放行会翻译出空流
+//! (同 same_proto 路径的 Responses 流式 501, #183 D5).
 
 use std::time::Instant;
 
@@ -26,21 +28,31 @@ use crate::provider::{DirectProvider, Protocol};
 
 use super::auth::ANTHROPIC_VERSION;
 use super::auth::apply_provider_auth;
-use super::helpers::{build_response_headers, redact_headers, sanitize_request_headers, utf8_view};
+use super::helpers::{
+    build_response_headers, is_streaming, redact_headers, sanitize_request_headers, utf8_view,
+};
 #[cfg(feature = "consistency-check")]
 use super::recorder::assert_resp_parsed_matches_source_nonstream;
 use super::recorder::{build_call_event, parse_request_ir, redact_and_derive};
 
 /// 跨协议转发: ingress 协议 → IR → egress 协议, 上游响应反向翻译.
 ///
-/// # MVP 限制
+/// # 路径选择 (响应侧)
+///
+/// - `ir.stream == true` + 2xx + Content-Type 是 SSE: 流式翻译扇出
+///   (`fan_out_streaming_cross_proto`), redact 场景注入 restore hook.
+/// - 其余 (非流式请求 / 非 2xx / 非 SSE): 完整 buffer 后一次性翻译 (非流式语义).
+///   流式请求但上游返回非 SSE 时打 WARN (与 same_proto 判型处对称).
+/// - 上游错误响应 (4xx/5xx) 也通过 codec 翻译为 ingress 协议的原生错误 envelope.
+///
+/// # 限制
 ///
 /// - 只支持 OpenAI ⇄ Anthropic 双向 (其他组合返回 501).
-/// - **强制非流式**: 上游 stream=false (即便客户端请求 stream=true). 客户端若 stream=true,
-///   目前返回 501 (`streaming cross-protocol not yet supported`).
+/// - **Responses (ingress 或 egress) + stream=true → 501**: Responses 流式 SSE
+///   事件翻译未实现 (`read_response_events` 返回空), 放行会静默产出空流.
 /// - **应用 redact**: 跨协议 + redact 通过 [`crate::redact::redact_ir`] 在 IR 层做替换,
-///   不会与 codec 翻译冲突. 跨协议路径响应直接翻译 (无 restore, mock 不在响应中出现).
-/// - 上游错误响应 (4xx/5xx) 也通过 codec 翻译为 ingress 协议的原生错误 envelope.
+///   不会与 codec 翻译冲突. 响应侧: 非流式经 `restore_ir_response`, 流式经
+///   StreamTranslate 的 restore hook (mock→real, RED-7).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn cross_proto_forward(
     state: crate::state::AppState,
@@ -82,11 +94,18 @@ pub(crate) async fn cross_proto_forward(
         model_rewrite.as_deref(),
     )?;
 
-    // 4. MVP 限制: 跨协议时不支持流式 (StreamTranslate 尚未接入 dispatch).
-    if ir.stream {
+    // 4. 流式: OpenAI ⇄ Anthropic 已接入 (StreamTranslate 跨协议模式 + 流式扇出);
+    //    Responses (ingress 或 egress) 仍 501 — 其 read_response_events 未实现
+    //    (返回空), 放行会静默翻译出空流. 文案与 same_proto 路径的 Responses 流式
+    //    501 同风格 (#183 D5).
+    if ir.stream
+        && (ingress_codec == CodecProtocol::OpenAIResponses
+            || egress_codec == CodecProtocol::OpenAIResponses)
+    {
         return Err(AppError::NotImplemented(format!(
-            "streaming cross-protocol ({ingress} → {}) is not yet supported; \
-             disable stream=true in the client request",
+            "streaming cross-protocol ({ingress} → {}) is not yet supported \
+             (Responses SSE event translation unimplemented); disable stream=true \
+             in the client request",
             provider.protocol.name()
         )));
     }
@@ -199,11 +218,9 @@ pub(crate) async fn cross_proto_forward(
         "cross-proto forwarding"
     );
 
-    // 13. 发送到上游. 响应头超时按流式语义选档 (#175): 上面的 501 门已保证
-    //     此处 ir.stream == false (跨协议强制非流式), 故实际恒走非流式档 —
-    //     egress body 由 writer 写出 stream=false, 响应头确实要等整响应生成完,
-    //     量纲与非流式档一致. 写 ir.stream 而非硬编码 false, 未来接入跨协议流式
-    //     翻译时此处自动选对流式档.
+    // 13. 发送到上游. 响应头超时按流式语义选档 (#175): ir.stream 是 writer 产出的
+    //     egress body 真实语义 (该 body 发往上游) — 流式请求走 TTFT 档, 非流式走
+    //     整响应档, 与 same_proto 路径同构.
     let upstream_resp = match super::recorder::send_upstream_or_fail(
         &state.dag,
         record_id,
@@ -223,9 +240,50 @@ pub(crate) async fn cross_proto_forward(
         Err(e) => return Err(e),
     };
 
-    // 14. 完整 buffer 上游响应 (跨协议 MVP 不支持流式). 受 MAX_RESP_BODY_RECORD 上限保护.
+    // 14. 判型: 流式请求 + 2xx + SSE → 跨协议流式翻译扇出 (mpsc 管道, 不 buffer);
+    //     其余 (非流式请求 / 非 2xx / 非 SSE) 落入下方 buffered 翻译路径.
+    //     假设: 上游对 stream=true 的 2xx 响应 Content-Type 是 text/event-stream;
+    //     不成立时 (如上游不支持流式返回整 JSON) 走 buffered 翻译 + WARN 降级,
+    //     不让请求失败 (best-effort).
     let resp_status = upstream_resp.status();
     let resp_headers = upstream_resp.headers().clone();
+    let content_type = super::helpers::response_content_type(&resp_headers);
+    let streamed = is_streaming(content_type);
+    // 流式翻译管道只会重组 SSE 帧 (空行分帧), 判型用比 is_streaming 更窄的
+    // is_sse — is_streaming 额外放行的 application/x-ndjson 进翻译会产出空流,
+    // 应落 buffered.
+    let sse_upstream = super::helpers::is_sse(content_type);
+    // 判型 WARN: 2xx 但非 SSE 才是异常信号 (上游无视流式请求); 非 2xx 是常态
+    // 错误流 (4xx/5xx JSON body), 不打 WARN 防噪音. 与 same_proto 判型处 (#158,
+    // 按 redact 在飞门控) 差异: 跨协议所有响应都经翻译, 2xx 非流式无论有无
+    // redact 都意味着 "客户端要流式却拿到整块", 信号本身值得保留.
+    if ir.stream && resp_status.is_success() && !streamed {
+        warn!(
+            %record_id,
+            provider = %upstream_id,
+            content_type = %content_type,
+            "upstream returned non-SSE content-type for a stream=true cross-proto \
+             request; falling back to buffered translation"
+        );
+    }
+    if ir.stream && resp_status.is_success() && sse_upstream {
+        return super::fan_out::fan_out_streaming_cross_proto(
+            state.dag.clone(),
+            record_id,
+            started,
+            upstream_resp,
+            resp_status,
+            resp_headers,
+            ingress_codec,
+            egress_codec,
+            redaction_map,
+            state.upstream_timeouts.stream_idle,
+            usage_ctx,
+        )
+        .await;
+    }
+
+    // 15. 完整 buffer 上游响应 (非流式 / 非 2xx / 非 SSE 判型降级). 受 MAX_RESP_BODY_RECORD 上限保护.
     let resp_bytes: Bytes = {
         let mut acc: Vec<u8> = Vec::new();
         let mut stream = upstream_resp.bytes_stream();
@@ -302,7 +360,7 @@ pub(crate) async fn cross_proto_forward(
         Bytes::from(acc)
     };
 
-    // 15. 翻译响应: egress JSON → IR → (restore redact) → ingress JSON.
+    // 16. 翻译响应: egress JSON → IR → (restore redact) → ingress JSON.
     let egress_reader = egress_codec.reader();
     let ingress_writer = ingress_codec.writer();
     // parsed view: 记录 LLM 视角的 IR (restore 之前, 含 mock). 仅 2xx 成功响应.
@@ -331,10 +389,34 @@ pub(crate) async fn cross_proto_forward(
                 }
                 Err(e) => {
                     warn!(%record_id, error = %e.message, "failed to parse upstream response as {}; passing through verbatim", provider.protocol.name());
+                    // #158 补全: parse 失败 fallback + redact 在飞 → mock 不被 restore,
+                    // 客户端拿到假 secret. 与 same_proto 路径 (fan_out_buffered_ir) 对称的
+                    // 可感知 WARN (行为不变: 仍原样透传).
+                    super::recorder::warn_mock_not_restored(
+                        record_id,
+                        &redaction_map,
+                        &format!(
+                            "cross-proto codec reader ({}) rejected response: {}",
+                            provider.protocol.name(),
+                            e.message
+                        ),
+                    );
                     (resp_status, resp_bytes.to_vec())
                 }
             },
-            Err(_) => (resp_status, resp_bytes.to_vec()),
+            Err(e) => {
+                // #158 补全: 非 JSON body (如 SSE-shaped body 判型降级到此处) 同样
+                // 无法 restore, 对称 WARN.
+                super::recorder::warn_mock_not_restored(
+                    record_id,
+                    &redaction_map,
+                    &format!(
+                        "cross-proto response body is not a single JSON value ({e}); \
+                         likely SSE-shaped body under a non-SSE content-type"
+                    ),
+                );
+                (resp_status, resp_bytes.to_vec())
+            }
         }
     } else {
         // 错误响应: 截断 + 解析上游 error.message 防止泄漏内部细节.
@@ -357,7 +439,7 @@ pub(crate) async fn cross_proto_forward(
         (resp_status, body)
     };
 
-    // 16. attach 响应到 DAG.
+    // 17. attach 响应到 DAG.
     let elapsed = started.elapsed().as_millis() as u64;
     // 视图正确性守卫: resp_parsed (非流式) 是 resp_bytes (SSOT) 经 egress reader 的派生视图.
     // 仅在 2xx 成功响应时触发 — 非 2xx 错误响应即便 reader 能解析也不派生 parsed
@@ -378,7 +460,10 @@ pub(crate) async fn cross_proto_forward(
             raw_resp_body: utf8_view(&resp_body_out),
             parsed: resp_parsed_for_record,
             elapsed_ms: elapsed,
-            streamed: false,
+            // 判型结果 (上游响应是否 SSE-shaped) — 客户端实际收到的是 buffered 翻译
+            // (非流式回传), 但 record 的 streamed 语义与 same_proto 家族一致: 记录
+            // 上游响应形态 (非 2xx SSE 错误体落在此路径时为 true).
+            streamed,
             resp_complete: true,
             usage: resp_echo.usage.clone(),
             model: resp_echo.model.clone(),
@@ -395,7 +480,7 @@ pub(crate) async fn cross_proto_forward(
     // record 最终态写入后打摘要 (#160).
     super::recorder::log_forward_summary(&state.dag, record_id);
 
-    // 17. 构造响应.
+    // 18. 构造响应.
     let mut resp = Response::new(Body::from(resp_body_out));
     *resp.status_mut() = resp_status_out;
     let mut out_headers = build_response_headers(&resp_headers);

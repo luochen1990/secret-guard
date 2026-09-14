@@ -726,7 +726,7 @@ fn anthropic_frame(event_type: &str, data: &Value) -> String {
     format!("event: {event_type}\ndata: {data}\n\n")
 }
 
-// ─── 跨协议流式翻译 property (STR-1 × FWD-3, RED-7 交集盲区) ────────────────
+// ─── 跨协议流式翻译 property (STR-1 × FWD-3, RED-7 交集) ────────────────
 //
 // # 背景 (与同协议 restore property 的差异)
 //
@@ -734,23 +734,12 @@ fn anthropic_frame(event_type: &str, data: &Value) -> String {
 // 路径: egress SSE → IR events → StreamingRestorer (mock→real) → ingress SSE.
 // 该路径 ingress == egress, 不做协议翻译, 只做 restore.
 //
-// 跨协议翻译路径 (`StreamTranslate::new(ingress, egress)`, ingress != egress) 当前
-// 生产 dispatch (cross_proto_forward) 对 stream=true 返回 501 — 跨协议流式翻译尚未
-// 接入 dispatch. 但 `StreamTranslate::new` 的纯翻译逻辑 (egress SSE → IR events →
-// ingress SSE) 是存在的, 可以在单元/property 层面直接测.
-//
-// # Redact 在跨协议流式响应中的位置
-//
-// 跨协议时 redact 发生在**请求侧** (cross_proto.rs:104), 响应侧的非流式路径有
-// `restore_ir_response` (cross_proto.rs:271-273). 但流式响应侧的 restore **未接入**
-// (StreamTranslate 跨协议模式 redaction_map = None, 不做 restore). 故:
-//
-// - **能测** (本模块): 跨协议流式翻译的**内容保真度** — 上游 egress content 经
-//   `.replace(mock, real)` 后, 与翻译出的 ingress content 语义等价. 这守卫 STR-1
-//   (chunk 边界透明) + FWD-3 (建模范围内语义保留) 在流式路径的交集.
-// - **暂搁置** (需 dispatch 接入): "客户端 SSE 不含 mock" 的端到端 property — 需要
-//   dispatch 层把 StreamTranslate 跨协议模式与 restore 组合 (或在 IR 事件层插入
-//   restore 步骤). 当前用 `#[ignore]` 标记 (AGENTS.md "TDD 与可选测试" 场景 B).
+// 跨协议翻译路径 (`StreamTranslate::new_cross_proto`, ingress != egress) 已接入
+// 生产 dispatch (`cross_proto_forward` 的流式分支): egress SSE → IR events →
+// (可选 restore hook) → ingress SSE. 纯翻译 (无 redact) 的内容保真由本段
+// property 守卫; + restore 的 no-mock-leak 由
+// `prop_cross_proto_streaming_no_mock_leak_dispatch_integrated` 守卫 (端到端
+// HTTP 层再由 `tests/integration.rs` 的 `cross_protocol_streaming_*` 覆盖).
 
 proptest! {
     /// STR-1 × FWD-3: OpenAI egress SSE → Anthropic ingress SSE, 任意 chunk 切分下
@@ -762,10 +751,10 @@ proptest! {
     /// - tool input fidelity: 客户端 input_json_delta 拼接 == 上游 tool_calls[].arguments 拼接.
     /// - usage output fidelity: output_tokens 透传.
     ///
-    /// 注: 此 property 不守卫 "no mock leak" — 跨协议模式不做 restore, 上游若回显
-    /// mock 则客户端会看到. no-mock-leak 的端到端 property 见
-    /// `prop_cross_proto_streaming_no_mock_leak_dispatch_integrated` (ignored, 待
-    /// dispatch 接入).
+    /// 注: 此 property 不守卫 "no mock leak" — 纯翻译模式不做 restore, 上游若回显
+    /// mock 则客户端会看到. no-mock-leak 的 property 见
+    /// `prop_cross_proto_streaming_no_mock_leak_dispatch_integrated` (+restore,
+    /// 生产 dispatch 同型构造).
     #[test]
     fn prop_cross_proto_stream_openai_to_anthropic(
         case in arb_openai_sse_stream_with_mock(),
@@ -837,33 +826,56 @@ proptest! {
     }
 }
 
-/// STR-1 × FWD-3 × RED-7: 跨协议流式 + redact restore 端到端 no-mock-leak.
-///
-/// **当前 ignored**: 生产路径 `cross_proto_forward` 对 stream=true 返回 501
-/// (StreamTranslate 跨协议模式未接入 dispatch, 且跨协议模式下 redaction_map=None
-/// 不做 restore). 此 property 是 TDD 场景 B: 生成器和断言已就绪, 待 dispatch 层
-/// 把跨协议流式翻译与 restore 组合后启用.
-///
-/// 启用条件:
-/// 1. dispatch 层 cross_proto_forward 在 stream=true 时调用 StreamTranslate (而非 501).
-/// 2. StreamTranslate 跨协议模式支持 redaction_map 注入 (或 dispatch 在 IR 事件层
-///    插入 restore 步骤), 使响应侧 mock → real.
-///
-/// 守卫 (启用后):
-/// - 客户端 SSE 不含 mock 字符串 (no mock leak, 安全核心).
-/// - 客户端 content == 上游 content.replace(mock, real).
-#[test]
-#[ignore = "待 StreamTranslate 跨协议模式接入 dispatch + restore (cross_proto_forward stream=true 当前 501)"]
-fn prop_cross_proto_streaming_no_mock_leak_dispatch_integrated() {
-    // 此测试是 TDD 占位: 当 dispatch 接入跨协议流式 + restore 后, 把 run_cross_proto_translate
-    // 替换为含 restore 的变体 (或走真实 dispatch), 并启用 assert_streaming_restore_fidelity.
-    //
-    // 当前用同协议 restore runner 做形态校验 (验证测试骨架可编译), 真正语义待启用.
-    let upstream_sse: Vec<u8> = Vec::new();
-    let map = build_redaction_map("sk-real-test", "MOCKtest");
-    let client_sse = run_same_proto_restore(Protocol::OpenAI, map, &upstream_sse, &[]);
-    let client_str = String::from_utf8_lossy(&client_sse);
-    assert!(!client_str.contains("MOCKtest"), "no mock leak");
+// STR-1 × FWD-3 × RED-7: 跨协议流式 + redact restore 端到端 no-mock-leak.
+//
+// dispatch 已接入跨协议流式翻译 (`cross_proto_forward` 不再对 stream=true 返回
+// 501), StreamTranslate 跨协议模式支持 restore hook 注入 — 本 property 用与生产
+// dispatch 相同的构造方式 (`StreamTranslate::new_cross_proto` + `StreamingRestorerSet`)
+// 直接验证 codec 层管线, 端到端 (HTTP 层) 覆盖见 `tests/integration.rs` 的
+// `cross_protocol_streaming_*` 系列.
+//
+// 守卫:
+// - 客户端 SSE 不含 mock 字符串 (no mock leak, 安全核心).
+// - 客户端 content / tool input == 上游对应拼接 `.replace(mock, real)`.
+// - tool_use id/name / usage output_tokens 保真 (透传).
+proptest! {
+    #[test]
+    fn prop_cross_proto_streaming_no_mock_leak_dispatch_integrated(
+        case in arb_openai_sse_stream_with_mock(),
+        splits in proptest::collection::vec(0usize..4096, 1..=16)
+    ) {
+        let (upstream_sse, real, mock) = case;
+        let map = build_redaction_map(&real, &mock);
+        // 跨协议 + restore: OpenAI egress → Anthropic ingress (生产 dispatch 同型).
+        let client_sse = run_cross_proto_restore(
+            Protocol::Anthropic, // ingress
+            Protocol::OpenAI,    // egress
+            map,
+            &upstream_sse,
+            &splits,
+        );
+
+        assert_cross_proto_restore_fidelity(&upstream_sse, &client_sse, &real, &mock)?;
+    }
+
+    /// 反向: Anthropic egress → OpenAI ingress + restore.
+    #[test]
+    fn prop_cross_proto_streaming_no_mock_leak_dispatch_integrated_reverse(
+        case in arb_anthropic_sse_stream_with_mock(),
+        splits in proptest::collection::vec(0usize..4096, 1..=16)
+    ) {
+        let (upstream_sse, real, mock) = case;
+        let map = build_redaction_map(&real, &mock);
+        let client_sse = run_cross_proto_restore(
+            Protocol::OpenAI,    // ingress
+            Protocol::Anthropic, // egress
+            map,
+            &upstream_sse,
+            &splits,
+        );
+
+        assert_cross_proto_restore_fidelity(&upstream_sse, &client_sse, &real, &mock)?;
+    }
 }
 
 // ─── 辅助: 跑 StreamTranslate 跨协议翻译 ──────────────────────────────────
@@ -881,6 +893,90 @@ fn run_cross_proto_translate(
     let mut t = StreamTranslate::new(ingress, egress)
         .expect("ingress != egress required for cross-proto translate");
     feed_split_translator(&mut t, upstream, splits)
+}
+
+/// 用跨协议 + restore 模式 (生产 dispatch 同型: `new_cross_proto` +
+/// `StreamingRestorerSet`) 跑一次翻译, 返回客户端收到的完整 SSE 字节.
+fn run_cross_proto_restore(
+    ingress: Protocol,
+    egress: Protocol,
+    map: RedactionMap,
+    upstream: &[u8],
+    splits: &[usize],
+) -> Vec<u8> {
+    let mut t = StreamTranslate::new_cross_proto(
+        ingress,
+        egress,
+        Some(Box::new(crate::redact::StreamingRestorerSet::new(map))),
+    )
+    .expect("ingress != egress required for cross-proto translate");
+    feed_split_translator(&mut t, upstream, splits)
+}
+
+/// 断言跨协议 + restore 路径的语义保真 (FWD-1 流式弱化形式 × FWD-3 跨协议):
+///
+/// 1. **no mock leak** (安全核心): 客户端字节中不含 mock 字符串.
+/// 2. **content fidelity**: 客户端 text 拼接 == 上游拼接 `.replace(mock, real)`.
+/// 3. **tool input fidelity**: 客户端 input_json 拼接 == 上游拼接 `.replace(mock, real)`.
+/// 4. **tool_use 身份保真**: (id, name) 对按序相等 (FWD-3 建模范围).
+/// 5. **usage output fidelity**: output_tokens 透传.
+///
+/// 与同协议版 ([`assert_streaming_restore_fidelity`]) 的差异: **不比较 reasoning**
+/// — ReasoningContent 跨协议显式丢弃 (STR-6 裁决: thinking signature 无法合法合成),
+/// 上游 reasoning 拼接非空时客户端恒为空是**预期行为**.
+fn assert_cross_proto_restore_fidelity(
+    upstream: &[u8],
+    client: &[u8],
+    real: &str,
+    mock: &str,
+) -> Result<(), proptest::test_runner::TestCaseError> {
+    // 1. no mock leak (安全核心).
+    let client_str = String::from_utf8_lossy(client);
+    prop_assert!(
+        !client_str.contains(mock),
+        "跨协议流式 no-mock-leak 违反: 客户端 SSE 含 mock={:?}\nclient={:?}",
+        mock,
+        client_str,
+    );
+
+    // 2. content fidelity.
+    let upstream_text = collect_text_deltas(upstream);
+    let client_text = collect_text_deltas(client);
+    prop_assert_eq!(
+        client_text,
+        upstream_text.replace(mock, real),
+        "跨协议流式 content fidelity 违反\nmock={:?}, real={:?}\nupstream={:?}\nclient={:?}",
+        mock,
+        real,
+        String::from_utf8_lossy(upstream),
+        client_str,
+    );
+
+    // 3. tool input fidelity.
+    let upstream_json = collect_input_json_deltas(upstream);
+    let client_json = collect_input_json_deltas(client);
+    prop_assert_eq!(
+        client_json,
+        upstream_json.replace(mock, real),
+        "跨协议流式 tool input fidelity 违反\nmock={:?}, real={:?}",
+        mock,
+        real,
+    );
+
+    // 4. tool_use 身份保真 (id/name).
+    prop_assert_eq!(
+        collect_tool_use_ids_names(client),
+        collect_tool_use_ids_names(upstream),
+        "跨协议流式 tool_use id/name fidelity 违反",
+    );
+
+    // 5. usage output_tokens fidelity.
+    prop_assert_eq!(
+        collect_usage_output_tokens(client),
+        collect_usage_output_tokens(upstream),
+        "跨协议流式 usage.output_tokens fidelity 违反",
+    );
+    Ok(())
 }
 
 /// 断言跨协议流式翻译的内容保真度 (STR-1 × FWD-3 流式路径):

@@ -417,8 +417,27 @@ pub(super) fn warn_if_protocol_mismatch(
             %record_id,
             protocol = proto_name,
             "upstream 2xx response parsed to empty content and zero usage; \
-             does the upstream actually speak the expected protocol? \
-             (check provider protocol vs upstream shape)"
+              does the upstream actually speak the expected protocol? \
+              (check provider protocol vs upstream shape)"
+        );
+    }
+}
+
+/// #158: 响应 parse 失败 fallback 时的 mock-not-restored WARN (共享 helper).
+///
+/// 本请求做过 redact (map 非空) 且响应走 parse 失败 fallback (原样透传, 无 restore)
+/// 时, body 中的 mock 不会被还原 — 客户端拿到假 secret. 记一条 WARN 让该逃逸
+/// 可感知 (行为不变: 仍原样透传, best-effort 原则).
+///
+/// 调用方: fan_out_buffered_ir 的两个 fallback 分支 (reader 拒绝 / 非 JSON) +
+/// cross_proto 非流式翻译的对称分支 (#158 补全, AGENTS.md "后续工作" 登记项).
+pub(super) fn warn_mock_not_restored(record_id: Uuid, redaction_map: &RedactionMap, detail: &str) {
+    if !redaction_map.is_empty() {
+        warn!(
+            %record_id,
+            detail,
+            "response parse failed with redactions in flight; \
+             mock not restored; client will see mock values"
         );
     }
 }
@@ -766,8 +785,10 @@ impl RecordAccumulator {
 
 /// 流式 parsed view 累积器 + 节流写入 DAG 的小封装.
 ///
-/// fan_out_streaming / fan_out_streaming_with_restore 共享同一套节流策略,
-/// 避免两处重复 StreamScan + writer + last_sync 的管理逻辑.
+/// 三条流式扇出路径 (fan_out_streaming / fan_out_streaming_with_restore /
+/// fan_out_streaming_cross_proto) 共享同一套节流策略, 避免多处重复 StreamScan +
+/// writer + last_sync 的管理逻辑 (同协议路径经 [`Self::new`], 跨协议路径经
+/// [`Self::new_cross_proto`] 分离 scan/writer 协议).
 pub(super) struct ParsedSync {
     scan: crate::codec::stream::StreamScan,
     writer: Box<dyn crate::codec::Writer>,
@@ -782,9 +803,22 @@ impl ParsedSync {
         dag: ConversationDag,
         record_id: Uuid,
     ) -> Self {
+        Self::new_cross_proto(proto, proto, dag, record_id)
+    }
+
+    /// 参数化构造: `scan_proto` 解析上游 (egress) SSE 字节, `writer_proto` 序列化
+    /// parsed view. 跨协议流式路径两者不同 (scan 用 egress reader, 序列化用
+    /// ingress writer — 与非流式 cross_proto 的 resp_parsed 语义一致, WebUI 按
+    /// ingress codec 解析); 同协议路径传相同值 (经 [`Self::new`]).
+    pub(super) fn new_cross_proto(
+        scan_proto: crate::codec::Protocol,
+        writer_proto: crate::codec::Protocol,
+        dag: ConversationDag,
+        record_id: Uuid,
+    ) -> Self {
         Self {
-            scan: crate::codec::stream::StreamScan::new(proto),
-            writer: proto.writer(),
+            scan: crate::codec::stream::StreamScan::new(scan_proto),
+            writer: writer_proto.writer(),
             dag,
             record_id,
             last_sync: None,

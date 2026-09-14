@@ -1781,7 +1781,7 @@
       <h3 style="margin: 0 0 8px 0;">Endpoints</h3>
       <div class="hint" style="margin-bottom: 8px;">
         URL pattern: <code>/{proto-short}/{provider-id}/*</code>. Same-protocol = direct,
-        OpenAI⇄Anthropic = cross-protocol translation (non-streaming only), others = not supported.
+        OpenAI⇄Anthropic = cross-protocol translation (streaming included), others = not supported.
       </div>
       <div id="provider-endpoints-body"></div>
       <div class="actions">
@@ -4566,7 +4566,7 @@
     //
     // 跨协议教育提示 (静态, 无条件挂在 egress 标记上): 入口协议 ≠ 出口时的代价.
     const EGRESS_CROSS_PROTO_TIP =
-      'If the ingress protocol ≠ this egress: cross-protocol translation kicks in — streaming requests return 501, reasoning_content is dropped';
+      'If the ingress protocol ≠ this egress: cross-protocol translation kicks in — reasoning_content is dropped (streaming is translated too)';
 
     // 启用 (priority 非 null) 路由中 priority 最大者; 并列按列表序先者 — 与后端
     // `RouterProvider::select_route` 的确定性 tie-break 一致. 空/全禁用 → null.

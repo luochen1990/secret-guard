@@ -235,11 +235,7 @@ pub(crate) async fn same_proto_forward(
     // 10. 收集响应元数据.
     let resp_status = upstream_resp.status();
     let resp_headers = upstream_resp.headers().clone();
-    let content_type = resp_headers
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let content_type = super::helpers::response_content_type(&resp_headers).to_string();
     let streamed = is_streaming(&content_type);
     // #158: 本应走流式 restore (请求声明 stream=true 且本请求有 redact) 但上游
     // Content-Type 非 text/event-stream 时, 下方会落入 fan_out_buffered_ir 的
@@ -407,11 +403,7 @@ async fn same_proto_passthrough(
 
     let resp_status = upstream_resp.status();
     let resp_headers = upstream_resp.headers().clone();
-    let content_type = resp_headers
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let content_type = super::helpers::response_content_type(&resp_headers).to_string();
     let streamed = is_streaming(&content_type);
 
     debug!(%record_id, status = %resp_status, streamed, "upstream responded");

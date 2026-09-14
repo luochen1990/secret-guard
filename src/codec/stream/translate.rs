@@ -12,9 +12,9 @@
 //! → ingress SSE bytes
 //! ```
 //!
-//! 同协议 + restore 模式下, BlockDelta 经调用方注入的 [`StreamRestoreHook`] 处理跨
-//! chunk mock 边界 (hook 由 proxy 层注入, 让本模块不依赖 redact — 解除 codec ⇄ redact
-//! 模块级循环, 见 #145 偏差 2).
+//! 同协议 restore 模式与跨协议 + redact 模式下, BlockDelta 经调用方注入的
+//! [`StreamRestoreHook`] 处理跨 chunk mock 边界 (hook 由 proxy 层注入, 让本模块
+//! 不依赖 redact — 解除 codec ⇄ redact 模块级循环, 见 #145 偏差 2).
 //!
 //! # chunk-boundary
 //!
@@ -96,10 +96,26 @@ impl DeltaKind {
 /// 跨协议 SSE 翻译器. 由 [`feed`](Self::feed) 喂入 egress 字节,
 /// 由 [`finish`](Self::finish) 闭合流.
 ///
-/// # 两种模式
+/// # 三种模式
 ///
-/// - **跨协议翻译** ([`Self::new`]): ingress != egress, 把 egress SSE 翻译为 ingress SSE.
-///   不做 redact restore (跨协议时 redact 在请求侧, response 直接翻译).
+/// - **跨协议翻译** ([`Self::new_cross_proto`], 兼容入口 [`Self::new`]): ingress != egress,
+///   把 egress SSE 翻译为 ingress SSE. 可选注入 [`StreamRestoreHook`] 做响应侧
+///   mock→real 还原 (跨协议 + redact 场景; 无 redact 传 `None`).
+///   跨协议模式额外启用两个 wire 合法性机制 (同协议模式**不启用**, 行为由现有
+///   property 测试锁定):
+///   - **跳过 block 的配对过滤**: ingress writer 对 `BlockStart` 返回 None 的 index
+///     (如 Anthropic writer 对 `IrBlockMeta::ReasoningContent` — thinking block 需
+///     signature 无法合成) 记入集合, 同 index 的 `BlockStop` 一并跳过 — 否则会 emit
+///     未配对的 `content_block_stop` (协议违例). `BlockDelta` 不在过滤范围: OpenAI
+///     writer 对 Text/Reasoning 的 `BlockStart` 返回 None 是**结构性隐式** (delta 仍
+///     是内容, 必须照常 emit), 语义性整体跳过只发生在 Anthropic writer 对
+///     ReasoningContent (其 `ReasoningDelta` 本就被 writer 跳过).
+///   - **deferred message_stop**: OpenAI egress 开 `include_usage` 时末尾 usage chunk
+///     在 finish_reason 之后 → IR 时序 MessageStop 之后跟 MessageDelta{usage}. 但
+///     Anthropic ingress 若在 message_stop 后再 emit message_delta 是非法 wire 顺序
+///     (Anthropic 规范 message_delta 在 message_stop 之前). 故 MessageStop 先缓存,
+///     post-stop usage delta 到达则先 emit delta 再 flush 缓存的 stop; `finish()`
+///     时 flush 残留.
 /// - **同协议 restore** ([`Self::new_same_proto_restore`]): ingress == egress, SSE 字节
 ///   解析为 IR 事件, 经注入的 [`StreamRestoreHook`] 还原 mock→real (sliding window,
 ///   跨 chunk 安全), 再序列化回 SSE. 用于同协议 + redact + 流式场景.
@@ -116,14 +132,37 @@ pub struct StreamTranslate {
     start_usage: Option<crate::codec::IrUsage>,
     /// MessageStop 后是否再发 MessageDelta (post-stop guard).
     message_stopped: bool,
+    /// 跨协议模式: MessageStop 已缓存未 emit (deferred stop, 见结构体文档).
+    pending_stop: bool,
+    /// 跨协议模式标志 (deferred stop + 配对过滤 仅跨协议启用; 同协议行为锁定).
+    cross_proto: bool,
+    /// ingress writer 对 BlockStart 返回 None 的 block index 集合 (配对过滤, 见
+    /// 结构体文档). 同协议模式恒空 (不启用过滤).
+    skipped_block_starts: std::collections::HashSet<usize>,
     /// 同协议 restore 模式: 调用方注入的 restore hook (自持 per-block 状态).
-    /// 跨协议模式: None (不做 restore).
+    /// 跨协议模式: redact 场景注入 (响应侧 mock→real), 无 redact 为 None.
     restore: Option<Box<dyn StreamRestoreHook>>,
 }
 
 impl StreamTranslate {
-    /// 构造跨协议翻译器. `None` 表示 `ingress == egress` (caller 应走字节透传或 restore 模式).
+    /// 构造跨协议翻译器 (兼容入口, 无 restore). `None` 表示 `ingress == egress`
+    /// (caller 应走字节透传或 restore 模式). 返回的实例以跨协议模式运行
+    /// (deferred stop + 配对过滤启用, 见结构体文档).
     pub fn new(ingress: Protocol, egress: Protocol) -> Option<Self> {
+        Self::new_cross_proto(ingress, egress, None)
+    }
+
+    /// 构造跨协议翻译器 (完整入口).
+    ///
+    /// - `ingress == egress` 时返回 `None` (caller 应走字节透传或同协议 restore 模式).
+    /// - `restore`: 跨协议 + redact 场景注入响应侧 mock→real 还原 hook (生产实现
+    ///   `redact::StreamingRestorerSet`, 由 proxy 注入 — codec 不依赖 redact, 解环
+    ///   #145); 无 redact 传 `None`.
+    pub fn new_cross_proto(
+        ingress: Protocol,
+        egress: Protocol,
+        restore: Option<Box<dyn StreamRestoreHook>>,
+    ) -> Option<Self> {
         if ingress == egress {
             return None;
         }
@@ -135,7 +174,10 @@ impl StreamTranslate {
             emit_done: ingress.writer().emits_sse_done_terminator(),
             start_usage: None,
             message_stopped: false,
-            restore: None,
+            pending_stop: false,
+            cross_proto: true,
+            skipped_block_starts: std::collections::HashSet::new(),
+            restore,
         })
     }
 
@@ -145,6 +187,9 @@ impl StreamTranslate {
     /// 由调用方注入, 生产路径是 `redact::StreamingRestorerSet`) → 序列化回 SSE.
     /// 失去 byte-exact (因为 IR re-serialize), 但语义等价, 同时保留流式 UX +
     /// 跨 chunk mock restore.
+    ///
+    /// 同协议模式**不启用** deferred stop 与配对过滤 (OpenAI 原生顺序
+    /// finish→usage 合法, 行为由 `fwd_streaming_property.rs` 的 property 测试锁定).
     pub fn new_same_proto_restore(proto: Protocol, restore: Box<dyn StreamRestoreHook>) -> Self {
         Self {
             ingress_writer: proto.writer(),
@@ -154,6 +199,9 @@ impl StreamTranslate {
             emit_done: proto.writer().emits_sse_done_terminator(),
             start_usage: None,
             message_stopped: false,
+            pending_stop: false,
+            cross_proto: false,
+            skipped_block_starts: std::collections::HashSet::new(),
             restore: Some(restore),
         }
     }
@@ -180,6 +228,8 @@ impl StreamTranslate {
     ///
     /// 同时 flush 所有残留 restorers (上游异常未发 BlockStop 时, 某些 block 的 mock 尾部
     /// 可能还在 buffer 中). flush 出来的内容包装为对应 kind 的 BlockDelta emit.
+    /// 跨协议模式下 deferred MessageStop 的残留也在此 flush (上游未发 post-stop
+    /// usage delta 的常态路径).
     pub fn finish(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
         self.emit_flush_all(&mut out);
@@ -187,6 +237,13 @@ impl StreamTranslate {
             // 流被异常中止: 发 ingress 协议的原生 error frame.
             let err = IrStreamEvent::Error("stream aborted: buffer overflow".into());
             self.emit_ir_event(&err, &mut out);
+        }
+        // deferred stop flush (跨协议模式; 同协议 pending_stop 恒 false, 零开销).
+        // 顺序: 在 [DONE] 之前 — message_stop 是 Anthropic ingress 的流终止 event,
+        // [DONE] 是 OpenAI ingress 的流终止符, 两者互斥但都应最后发出.
+        if self.pending_stop {
+            self.pending_stop = false;
+            self.emit_ir_event(&IrStreamEvent::MessageStop, &mut out);
         }
         if self.emit_done {
             out.extend_from_slice(SSE_DONE_FRAME);
@@ -228,30 +285,101 @@ impl StreamTranslate {
                 }
             }
 
-            // post-stop guard: MessageStop 后若再来 MessageDelta, 仅当携带 usage 时放行
-            // (OpenAI `stream_options.include_usage: true` 的末尾 usage chunk 就出现在
-            // finish_reason chunk 之后, 我们在 reader 里把它解析为 MessageStop 之后的
-            // MessageDelta; 丢弃它会让客户端拿不到 token 统计).
-            // 无 usage 的 post-stop delta 是无意义的, 仍然丢弃.
+            // post-stop guard + deferred MessageStop. 两模式共用 message_stopped
+            // 标志, 但 post-stop 放行策略不同 (同协议行为锁定, 跨协议为 wire
+            // 合法性收紧):
             //
-            // TODO(cross-proto-streaming): 当前 dispatch 对跨协议 + 流式返回 501, 所以
-            // 此 guard 只影响 OpenAI egress. 未来接入跨协议流式 (OpenAI → Anthropic) 时,
-            // Anthropic writer 会在 message_stop 之后收到 MessageDelta{usage} 并产生
-            // 非法的 wire 顺序. 届时需要把 OpenAI 末尾 usage chunk 折叠到 message_stop
-            // 之前的 message_delta, 或让 cross-proto 模式忽略此 guard.
-            if self.message_stopped {
-                if let IrStreamEvent::MessageDelta { usage, .. } = &ev {
-                    if usage.is_zero() {
+            // - 同协议模式 (既有行为, property 测试锁定): MessageStop 后若再来
+            //   MessageDelta, 仅当携带非零 usage 时放行 (OpenAI
+            //   `stream_options.include_usage: true` 的末尾 usage chunk 就出现在
+            //   finish_reason chunk 之后, 丢弃它会让客户端拿不到 token 统计);
+            //   重复 MessageStop 丢弃; 其余事件类型放行 (OpenAI 原生顺序
+            //   finish→usage 合法, 无 wire 顺序问题).
+            // - 跨协议模式 (deferred stop): MessageStop 不立即 emit 而是缓存
+            //   (pending_stop). post-stop 只放行带非零 usage 的 MessageDelta —
+            //   Anthropic ingress 在 message_stop 之后再 emit message_delta 是非法
+            //   wire 顺序 (Anthropic 规范 message_delta 在 message_stop 之前), 故
+            //   usage delta 先 emit、缓存的 stop 随后 flush (见循环尾); 其他
+            //   post-stop 事件类型 (block 事件等) 在真实 reader 产出中不存在,
+            //   保守丢弃 (比同协议 guard 更严, 防止 stop 后再出 block 帧的违例).
+            if self.cross_proto {
+                if matches!(ev, IrStreamEvent::MessageStop) {
+                    if !self.message_stopped {
+                        self.message_stopped = true;
+                        self.pending_stop = true; // 缓存, 待 post-stop usage delta 或 finish() flush
+                    }
+                    continue; // 首个与重复的 MessageStop 都不立即 emit
+                }
+                if self.message_stopped {
+                    // 只放行 "首个带非零 usage 的 post-stop MessageDelta" (pending_stop
+                    // 仍缓存 = 尚未 flush) — 它触发 delta→stop 的有序 flush. 后续
+                    // post-stop 事件 (含第二个 usage delta, 病态上游) 一律丢弃:
+                    // stop 已 flush 后再 emit 任何事件都违反 Anthropic wire 顺序.
+                    let usage_bearing_trigger = matches!(&ev,
+                        IrStreamEvent::MessageDelta { usage, .. } if !usage.is_zero())
+                        && self.pending_stop;
+                    if !usage_bearing_trigger {
                         continue;
                     }
-                } else if matches!(ev, IrStreamEvent::MessageStop) {
-                    // 重复的 MessageStop, 丢弃.
+                }
+            } else {
+                if self.message_stopped {
+                    if let IrStreamEvent::MessageDelta { usage, .. } = &ev {
+                        if usage.is_zero() {
+                            continue;
+                        }
+                    } else if matches!(ev, IrStreamEvent::MessageStop) {
+                        // 重复的 MessageStop, 丢弃.
+                        continue;
+                    }
+                }
+                if matches!(ev, IrStreamEvent::MessageStop) {
+                    self.message_stopped = true;
+                }
+            }
+
+            // 跨协议模式的跳过 block 配对过滤 (仅对 writer 主动跳过 BlockStart 的
+            // index 生效; 见结构体文档 "配对过滤" 段). BlockDelta 不在过滤范围:
+            // OpenAI writer 对 Text BlockStart 返回 None 是结构性隐式, delta 仍是
+            // 内容 (由 writer 自行决定 emit); 语义性整体跳过 (Anthropic 对
+            // ReasoningContent) 的 ReasoningDelta 本就被 writer 跳过.
+            // 同协议模式不启用 (skipped_block_starts 恒空).
+            if self.cross_proto {
+                if let IrStreamEvent::BlockStart { index, .. } = &ev
+                    && self.ingress_writer.write_response_event(&ev).is_none()
+                {
+                    self.skipped_block_starts.insert(*index);
+                    continue;
+                }
+                if let IrStreamEvent::BlockStop { index } = &ev
+                    && self.skipped_block_starts.contains(index)
+                {
+                    // 未配对的 content_block_stop 是协议违例, 跳过其 emit. 但 restore
+                    // hook 的 per-block 窗口残余仍须在此冲刷 — 空跳过会让 OpenAI
+                    // ingress 的 text 尾部 (hold 窗口字节) 延迟到 finish() 才发出,
+                    // 落在 finish_reason 之后 (wire 顺序违例 + 严格客户端丢尾部).
+                    // tail 包装回同 kind BlockDelta emit: Anthropic ingress 的
+                    // Reasoning tail 被 writer 丢弃 (无害), OpenAI ingress 的 text
+                    // tail 在 BlockStop 的正确时机到达.
+                    let flushed = self
+                        .restore
+                        .as_mut()
+                        .map(|hook| hook.flush_delta(*index))
+                        .filter(|(_, tail)| !tail.is_empty());
+                    if let Some((kind, tail)) = flushed {
+                        let flush_ev = IrStreamEvent::BlockDelta {
+                            index: *index,
+                            delta: kind.to_ir_delta(tail),
+                        };
+                        self.emit_ir_event(&flush_ev, out);
+                    }
                     continue;
                 }
             }
-            if matches!(ev, IrStreamEvent::MessageStop) {
-                self.message_stopped = true;
-            }
+
+            // deferred stop flush 时机: pending_stop 为 true 时唯一能走到这里的事件
+            // 是 post-stop usage delta (上方 guard 保证), emit delta 后立即补 stop.
+            let flush_stop_after = self.cross_proto && self.pending_stop;
 
             // 同协议 restore 模式 (restore hook 存在):
             //   - BlockStop: 先 flush 该 block 的尾部 buffer, emit 一个同 kind 的 BlockDelta.
@@ -294,6 +422,14 @@ impl StreamTranslate {
             }
 
             self.emit_ir_event(&ev, out);
+
+            // deferred stop flush: 跨协议模式下 post-stop usage delta 已 emit,
+            // 现在补发缓存的 MessageStop (message_delta 在 message_stop 之前,
+            // Anthropic wire 合法顺序).
+            if flush_stop_after {
+                self.pending_stop = false;
+                self.emit_ir_event(&IrStreamEvent::MessageStop, out);
+            }
         }
     }
 
@@ -360,5 +496,290 @@ fn restore_event_inplace(hook: &mut dyn StreamRestoreHook, ev: &mut IrStreamEven
         } => hook.restore_inline(s),
         IrStreamEvent::Error(msg) => hook.restore_inline(msg),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! 跨协议模式的 wire 合法性确定性单测 (配对过滤 + deferred stop).
+    //!
+    //! property 测试 (fwd_streaming_property.rs) 守卫内容保真, 但不断言 wire 帧顺序
+    //! 合法性 — 这里的两个测试补上: 构造最小事件序列, 在 Anthropic writer 层断言
+    //! 输出的 SSE 帧序列满足协议约束.
+
+    use super::*;
+
+    /// 把完整 SSE 字节解析为 (event_type, data JSON) 帧序列 (测试辅助).
+    /// 假设: 输入是已 reassembled 的完整 SSE, LF 行尾, 帧以空行分隔.
+    fn parse_frames(sse: &str) -> Vec<(String, serde_json::Value)> {
+        sse.split("\n\n")
+            .filter_map(|frame| {
+                let mut padded = frame.as_bytes().to_vec();
+                padded.extend_from_slice(b"\n\n");
+                let (et, data) = super::super::parse_sse_frame(&padded)?;
+                if data.is_empty() || data == "[DONE]" {
+                    return None;
+                }
+                serde_json::from_str::<serde_json::Value>(&data)
+                    .ok()
+                    .map(|v| (et, v))
+            })
+            .collect()
+    }
+
+    /// OpenAI egress 的 reasoning 流 fixture: 思考 chunk → 文本 chunk → finish →
+    /// include_usage → [DONE] (思考型模型的典型流形态, #176).
+    fn openai_reasoning_stream() -> String {
+        [
+            r#"data: {"id":"chatcmpl-x","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"thinking..."},"finish_reason":null}]}"#,
+            r#"data: {"id":"chatcmpl-x","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":null}]}"#,
+            r#"data: {"id":"chatcmpl-x","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+            r#"data: {"id":"chatcmpl-x","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
+            "data: [DONE]",
+        ]
+        .map(|f| f.to_string() + "\n\n")
+        .concat()
+    }
+
+    /// 1a 配对过滤: Anthropic ingress 下, writer 跳过的 ReasoningContent BlockStart
+    /// 不得产生未配对的 content_block_stop (修复前: BlockStop 无状态恒 emit).
+    ///
+    /// 不变式: 每个 content_block_stop 都有同 index 的前置 content_block_start;
+    /// 每个 content_block_delta 同理. 同时守卫 text 内容保真 (reasoning 被显式
+    /// 丢弃是 STR-6 裁决的预期行为, 不在断言范围).
+    #[test]
+    fn cross_proto_reasoning_block_yields_no_unpaired_block_stop() {
+        let mut t = StreamTranslate::new_cross_proto(
+            Protocol::Anthropic, // ingress
+            Protocol::OpenAI,    // egress
+            None,
+        )
+        .expect("ingress != egress");
+        let out = t.feed(openai_reasoning_stream().as_bytes());
+        let finish = t.finish();
+        let combined = [out, finish].concat();
+        let client = String::from_utf8_lossy(&combined);
+
+        let frames = parse_frames(&client);
+        assert!(!frames.is_empty(), "client should receive frames: {client}");
+
+        // 配对追踪: open 集合内的 index 才允许 delta / stop.
+        let mut open: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        for (et, data) in &frames {
+            let index = data.get("index").and_then(serde_json::Value::as_u64);
+            match et.as_str() {
+                "content_block_start" => {
+                    assert!(
+                        open.insert(index.expect("content_block_start has index")),
+                        "duplicate content_block_start for open index: {client}"
+                    );
+                }
+                "content_block_delta" => {
+                    assert!(
+                        open.contains(&index.expect("content_block_delta has index")),
+                        "content_block_delta without matching content_block_start: {client}"
+                    );
+                }
+                "content_block_stop" => {
+                    let idx = index.expect("content_block_stop has index");
+                    assert!(
+                        open.remove(&idx),
+                        "unpaired content_block_stop (index={idx}) — \
+                         skipped BlockStart must also skip BlockStop: {client}"
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert!(open.is_empty(), "unclosed content_block_start: {client}");
+
+        // text 内容保真: reasoning 丢弃, 但 answer 必须到达客户端.
+        assert!(
+            client.contains("\"text\":\"answer\""),
+            "text lost: {client}"
+        );
+        // reasoning 增量不得到达 (Anthropic 无法承载 thinking block).
+        assert!(
+            !client.contains("thinking..."),
+            "reasoning leaked: {client}"
+        );
+    }
+
+    /// 1b deferred stop: OpenAI egress 开 include_usage 时, 末尾 usage chunk 在
+    /// finish_reason 之后 (IR 时序 MessageStop 之后跟 MessageDelta{usage}). Anthropic
+    /// ingress 必须先 emit message_delta(usage) 再 emit message_stop — 修复前
+    /// message_stop 之后的 message_delta 是非法 wire 顺序.
+    #[test]
+    fn cross_proto_defers_message_stop_until_post_stop_usage() {
+        let mut t = StreamTranslate::new_cross_proto(
+            Protocol::Anthropic, // ingress
+            Protocol::OpenAI,    // egress
+            None,
+        )
+        .expect("ingress != egress");
+        let out = t.feed(openai_reasoning_stream().as_bytes());
+        let finish = t.finish();
+        let combined = [out, finish].concat();
+        let client = String::from_utf8_lossy(&combined);
+
+        let frames = parse_frames(&client);
+        let pos = |name: &str| frames.iter().position(|(et, _)| et == name);
+
+        let stop = pos("message_stop").expect("message_stop must be emitted");
+        // 最后一个 message_delta (含 usage) 必须在 message_stop 之前.
+        let last_delta = frames
+            .iter()
+            .rposition(|(et, _)| et == "message_delta")
+            .expect("message_delta must be emitted");
+        assert!(
+            last_delta < stop,
+            "message_delta after message_stop is illegal Anthropic wire order: {client}"
+        );
+        // usage 必须透传 (deferred stop 不能吞掉 include_usage 数据).
+        assert!(
+            client.contains("\"input_tokens\":10"),
+            "usage must pass through: {client}"
+        );
+        // message_stop 恰好一个 (含 stop_reason 的 delta 与 usage delta 分开 emit, 但 stop 只一次).
+        assert_eq!(
+            frames.iter().filter(|(et, _)| et == "message_stop").count(),
+            1,
+            "exactly one message_stop: {client}"
+        );
+    }
+
+    /// 1b 兜底: 上游不发 post-stop usage chunk (无 include_usage) 时, 缓存的
+    /// MessageStop 在 finish() flush — message_stop 仍恰好一次且是最后的事件帧.
+    #[test]
+    fn cross_proto_flushes_pending_stop_at_finish_without_usage_chunk() {
+        let mut t = StreamTranslate::new_cross_proto(
+            Protocol::Anthropic, // ingress
+            Protocol::OpenAI,    // egress
+            None,
+        )
+        .expect("ingress != egress");
+        // 只到 finish_reason, 无 include_usage chunk.
+        let sse = [
+            r#"data: {"id":"chatcmpl-x","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}"#,
+            r#"data: {"id":"chatcmpl-x","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+            "data: [DONE]",
+        ]
+        .map(|f| f.to_string() + "\n\n")
+        .concat();
+        let out = t.feed(sse.as_bytes());
+        // feed 期间 message_stop 不 emit (deferred) — 输出里没有 message_stop 帧.
+        assert!(
+            !String::from_utf8_lossy(&out).contains("event: message_stop"),
+            "MessageStop must be deferred during feed: {}",
+            String::from_utf8_lossy(&out)
+        );
+        let finish = t.finish();
+        let combined = [out, finish].concat();
+        let client = String::from_utf8_lossy(&combined);
+        let frames = parse_frames(&client);
+        assert_eq!(
+            frames.iter().filter(|(et, _)| et == "message_stop").count(),
+            1,
+            "pending stop flushed exactly once at finish: {client}"
+        );
+        // message_stop 是最后一个事件帧.
+        assert_eq!(
+            frames.last().map(|(et, _)| et.as_str()),
+            Some("message_stop"),
+            "message_stop must be the final event frame: {client}"
+        );
+    }
+
+    /// H-1 回归 (OpenAI ingress + restore 方向): 配对过滤不得延迟 restore 的
+    /// per-block 尾部 — text block 的 BlockStop 虽被跳过 (OpenAI writer 对
+    /// BlockStart{Text} 返回 None 是结构性隐式, index 在 skipped 集合内), hook
+    /// 持有的尾部字节仍必须在 finish_reason chunk **之前**发出. 修复前: 尾部
+    /// 延迟到 finish() 的 flush_all, 落在 finish_reason 之后 (wire 顺序违例,
+    /// 在 finish_reason 处停止读取的客户端丢尾部).
+    #[test]
+    fn cross_proto_openai_ingress_flushes_skipped_block_tail_before_finish_reason() {
+        use crate::redact::RedactionMap;
+
+        // real + mock: mock 出现在 text 中段, 其后还有尾部文本 (会被 restorer 的
+        // hold 窗口扣住, 直到 BlockStop flush).
+        let real = "sk-real-tailtest-99";
+        let mock = "MOCKtailtest";
+        let mut map = RedactionMap::default();
+        map.insert(real.to_string(), mock.to_string(), "id-tail")
+            .expect("single mock no conflict");
+
+        let mut t = StreamTranslate::new_cross_proto(
+            Protocol::OpenAI,    // ingress
+            Protocol::Anthropic, // egress
+            Some(Box::new(crate::redact::StreamingRestorerSet::new(map))),
+        )
+        .expect("ingress != egress");
+        // Anthropic egress 流: text block (含 mock + 尾部) → message_delta(stop) →
+        // message_stop.
+        let frame = |event: &str, data: &str| format!("event: {event}\ndata: {data}\n\n");
+        let sse = [
+            frame(
+                "message_start",
+                r#"{"type":"message_start","message":{"id":"msg_01t","type":"message","role":"assistant","content":[],"model":"claude-3","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":5,"output_tokens":1}}}"#,
+            ),
+            frame(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            ),
+            frame(
+                "content_block_delta",
+                &format!(
+                    r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"head {mock} tail-end-words"}}}}"#
+                ),
+            ),
+            frame("content_block_stop", r#"{"type":"content_block_stop","index":0}"#),
+            frame(
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":3}}"#,
+            ),
+            frame("message_stop", r#"{"type":"message_stop"}"#),
+        ]
+        .concat();
+        let out = t.feed(sse.as_bytes());
+        let finish = t.finish();
+        let combined = [out, finish].concat();
+        let client = String::from_utf8_lossy(&combined);
+
+        // 内容保真: real 到达, mock 绝不泄漏 (tail flush 产物已 restore). 内容用
+        // 拼接断言 — restorer 的 hold 窗口会把文本切到多个 chunk (chunk 划分不是
+        // 契约, 拼接才是).
+        assert!(
+            client.contains(real),
+            "real secret must be restored: {client}"
+        );
+        assert!(!client.contains(mock), "mock must not leak: {client}");
+        let frames = parse_frames(&client);
+        let content_all: String = frames
+            .iter()
+            .filter_map(|(_, d)| {
+                d.get("choices")?
+                    .get(0)?
+                    .get("delta")?
+                    .get("content")?
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect();
+        assert!(
+            content_all.ends_with("tail-end-words"),
+            "tail content must be delivered (joined={content_all:?})"
+        );
+        // wire 顺序: 最后一个 content chunk 必须在 finish_reason chunk 之前.
+        let last_content = client
+            .rfind("\"content\":")
+            .expect("content chunks must exist");
+        let finish_reason = client
+            .find("\"finish_reason\":\"stop\"")
+            .expect("finish_reason chunk must exist");
+        assert!(
+            last_content < finish_reason,
+            "content chunk after finish_reason is illegal OpenAI wire order \
+             (skipped-block tail must flush at BlockStop, not at finish): {client}"
+        );
     }
 }

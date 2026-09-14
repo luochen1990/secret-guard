@@ -197,7 +197,7 @@ API key CRUD **无条件挂载** (在 `web::router()`, 不依赖 `auth.enabled`)
   路由的目标, 防环 seen set, 悬空 → `?`), 忽略路由 upstream_model 重写对后续跳匹配的影响
   (展示无需 per-model 精确解析). protocol pill 显示路由 egress 的去重集合 (单一 →
   该 protocol, 短列表逗号连接, 放不下 → `mixed`). egress 标记挂静态教育 tooltip
-  (跨协议代价: 流式 501 / reasoning_content 丢弃). endpoints 对话框复用同一近似
+  (跨协议代价: reasoning_content 丢弃; 流式已接入翻译). endpoints 对话框复用同一近似
   (`resolveEgressProtocol`).
 
 ### Sidebar 分组渲染 (二级 + 三级小圆点)
