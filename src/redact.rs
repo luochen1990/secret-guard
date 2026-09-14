@@ -37,8 +37,10 @@
 //!   (因为每次 gen_mock_for_ir 都检查 allocated 集合). 极端弱配置下探测可能耗尽,
 //!   此时 [`redact_ir`] **跳过该 secret** (原样发往上游) 而非 panic, 优先保进程存活.
 //!   [`RedactionMap::insert`] 的 C4 违反 (defense-in-depth) 同样降级跳过, 永不 panic.
-//!   **可配置 fail-closed**: [`redact_ir_checked`] 配合 [`crate::config::OnProbeExhausted::FailClosed`]
-//!   时, probing 耗尽或 insert collision 都返回 `Err`, 让调用方拒绝转发 (防 secret 泄露).
+//!   **降级偏安全 (SEC-10)**: 生产路径经 [`redact_ir_checked`] 读
+//!   `[redact] on_probe_exhausted` (默认 `FailClosed`, 2026-09 翻转) — probing
+//!   耗尽或 insert collision 返回 `Err`, 调用方拒绝转发 (防 secret 泄露); 历史
+//!   fail-open 行为由显式 `FailOpen` opt-in 保留 (legacy [`redact_ir`] 恒 fail-open).
 //! - **C5 不含 real_secret 子串** (实质确定性契约, 阈值随 L 自适应):
 //!   - 阈值 `k(L) = max(4, ⌈L/3⌉)` (见 [`crate::mock::c5_threshold_len`]); Auto 模式由
 //!     [`crate::mock::gen_candidate`] 内部重试链保证兑现.

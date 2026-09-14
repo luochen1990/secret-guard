@@ -76,7 +76,7 @@
 | `CDAG-*` | B | **DAG INV-1..5** + 新增 | 内容寻址 + Merkle + refcount + 孤儿节点 + session 稳定 |
 | `DTO-*` | B | 新增 | WebUI DTO 派生 (redactions / resp_parsed / preview / delta / title) |
 | `CFG-*` | B | 新增 | 双层配置合并 / CRUD / 持久化 / 并发 |
-| `SEC-*` | 跨 | 新增 | GET 不泄漏 / panic 不泄漏 / headers 脱敏 / 本地监听 / Host·Origin 校验 (SEC-7, 防 DNS rebinding) / 敏感落盘 owner-only (SEC-8) / API nosniff (SEC-9) |
+| `SEC-*` | 跨 | 新增 | GET 不泄漏 / panic 不泄漏 / headers 脱敏 / 本地监听 / Host·Origin 校验 (SEC-7, 防 DNS rebinding) / 敏感落盘 owner-only (SEC-8) / API nosniff (SEC-9) / 降级偏安全 (SEC-10) |
 | `ROB-*` | 跨 | 鲁棒性原则 | best-effort 永不 panic + 假设声明注释必备 |
 | `VIEW-*` | 跨 | 视图正确性机制 | 先断言后删除 + 派生字段 consistency-check 覆盖 |
 | `UI-*` | C | **I1-I3** + 新增 | 气泡数 / sidebar 条目数 / DOM 顺序 / reconciliation / drawer |
@@ -142,7 +142,11 @@
   provider (仅 Protocol 枚举做 from_native 映射, 纯类型依赖; 长期归宿: 若
   codec/provider 拆 crate, Protocol 全局枚举应下沉基础层, 桥接函数自然消失);
   proxy → redact (转发即改写,
-  同属域 A); web/api → auth::apikey (API key CRUD 无条件挂载, "只认证不隔离");
+  同属域 A); proxy → config (仅降级 gate / 超时快照的纯数据枚举与结构 —
+  `OnProbeExhausted` / `OnUnsupportedProtocol` / `OnFallbackRestore` /
+  `UpstreamTimeouts`: 转发路径降级决策的输入, 消费点 same_proto from_native-None
+  分支 / helpers restore 门控 / recorder redact_and_derive, 纯数据依赖无 config
+  行为依赖, 性质同 redact → config); web/api → auth::apikey (API key CRUD 无条件挂载, "只认证不隔离");
   config → {auth, provider, secrets} (AuthConfig/ApiKeyEntry 与 Provider/SecretEntry
   均是配置 schema 的组成部分 — static 加载期组合 + validate 钩子调用, 纯数据依赖;
   provider/secrets 同 auth 型, 走查补登记);
@@ -249,6 +253,16 @@ Redact 不应无必要地改变 request body 的字节内容, 避免破坏 LLM P
 
 测试: 单元 (`src/server_host_guard.rs::tests`) + 集成 (`tests/integration.rs`
 SEC-7 段); 可测 property 见 `docs/design/contracts.md` **SEC-7**。
+
+## 降级偏安全原则 (fail-safe degradation) → SEC-10 契约
+
+secret-guard 在无法维持核心保证 (real secret 不出现在未授权位置) 的降级路径上,
+**默认不扩散真实 secret** — 请求侧降级默认拒绝转发 (503), 响应侧降级默认保留 Mock
+透传; real 进入更大暴露面 (上游 / 易被日志采集的失败响应体) 必须显式 opt-in.
+rationale 是不对称性: 可用性损失可重试恢复, 机密性损失不可逆. 三个开关
+(`[redact] on_probe_exhausted` / `on_unsupported_protocol` / `on_fallback_restore`,
+2026-09 起默认全部安全侧) 是本原则的配置面; 完整陈述与 property 见
+`docs/design/contracts.md` **SEC-10**.
 
 ## 前端不变量 (UI Invariants) → UI-1..UI-7 契约
 

@@ -353,10 +353,10 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 ### RED-4 单射性 + 降级 (可配置: fail_open / fail_closed)
 
-**陈述**: 一次 `redact_ir` 内不同 secret → 不同 mock. 极端弱配置下探测耗尽时的降级行为由 `[redact] on_probe_exhausted` 配置 (默认 `fail_open`):
+**陈述**: 一次 `redact_ir` 内不同 secret → 不同 mock. 极端弱配置下探测耗尽时的降级行为由 `[redact] on_probe_exhausted` 配置 (默认 `fail_closed`, SEC-10 降级偏安全 — 2026-09 翻转, 见 §99):
 
-- **fail_open (默认, 向后兼容)**: **跳过该 secret** (原样发往上游) 而非 panic, 优先保进程存活.
-- **fail_closed**: **拒绝转发整个请求** (proxy 返回 503, body 的变量部分只含 secret id + reason 枚举, 不含 secret 明文), 防止 secret 泄露到 LLM provider.
+- **fail_closed (默认)**: **拒绝转发整个请求** (proxy 返回 503, body 的变量部分只含 secret id + reason 枚举, 不含 secret 明文), 防止 secret 泄露到 LLM provider.
+- **fail_open (显式 opt-in, 历史行为)**: **跳过该 secret** (原样发往上游) 而非 panic, 优先保进程存活.
 
 **Properties**:
 - `prop_distinct_secrets_distinct_mocks`: 对 N 个不同 secret, 得到 N 个不同 mock. ✅ `src/redact.rs::prop_distinct_secrets_distinct_mocks` + `prop_redact_produces_distinct_mocks`.
@@ -399,15 +399,17 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 - `prop_streaming_restorer_per_block_isolated`: 不同 block 的 restorer 状态独立 (block 间 mock 边界互不干扰). ⏳
 - `prop_cross_proto_streaming_no_mock_leak_dispatch_integrated` (2026-09-15): 跨协议流式 + restore (生产 dispatch 同型构造) 下, 客户端 SSE 不含 mock 且 content / tool input == 上游拼接 `.replace(mock, real)` (端到端 HTTP 层由集成测试 `cross_protocol_streaming_redact_restores_mock_no_leak` 覆盖). ✅
 
-### RED-8 JSON 叶子级兜底 restore (fallback restorability)
+### RED-8 JSON 叶子级兜底 restore (fallback restorability, opt-in)
 
-**陈述**: codec 无法 parse 上游响应时 (`fan_out_buffered_ir` / `cross_proto_forward` 的 parse-失败 fallback 分支), 若 body 仍是**单个合法 JSON Value**, `restore_json_leaves_fallback` 必须在字符串**值叶子**上把 mock 还原为 real (JSON 树遍历, 非 byte find/replace — real 含 `"`/反斜杠/非 ASCII 时字节级替换会产出非法 JSON); 未命中任何 mock / parse 失败 (含 SSE-shaped 多帧 body) / map 空时返回 None, 调用方保持**原字节透传** (byte-exact 优先). Object key 不在遍历范围. 兜底**命中**时的输出为 normalize_json 等价 (serde_json 未启 preserve_order, key 按字母序重排), 非 byte-exact — 该路径本就以"codec 已拒绝 body"为前提, byte-exact 不成立, 由 restored-via-fallback WARN 保持可观测.
+**陈述**: **仅当 `[redact] on_fallback_restore = "restore"` (显式 opt-in, SEC-10)** 时: codec 无法 parse 上游响应 (`fan_out_buffered_ir` / `cross_proto_forward` 的 reader-拒绝 fallback 分支), 若 body 仍是**单个合法 JSON Value**, `restore_json_leaves_fallback` 必须在字符串**值叶子**上把 mock 还原为 real (JSON 树遍历, 非 byte find/replace — real 含 `"`/反斜杠/非 ASCII 时字节级替换会产出非法 JSON); 未命中任何 mock / parse 失败 (含 SSE-shaped 多帧 body) / map 空时返回 None, 调用方保持**原字节透传** (byte-exact 优先). Object key 不在遍历范围. 兜底**命中**时的输出为 normalize_json 等价 (serde_json 未启 preserve_order, key 按字母序重排), 非 byte-exact — 该路径本就以"codec 已拒绝 body"为前提, byte-exact 不成立, 由 restored-via-fallback WARN 保持可观测.
 
-**Properties**:
+**默认行为 (withhold) 归 SEC-10**: 默认 `on_fallback_restore = "withhold"` 下 reader-拒绝分支**不尝试 restore** — 保留 Mock 原字节透传 + mock-not-restored WARN (detail 含 opt-in 提示), real 不进入降级响应体. 非 JSON 分支两模式行为一致 (恒透传 + WARN, restore 本就无意义). 裁决 rationale (失败/降级响应体是最高概率被客户端日志系统 / 错误追踪 / 会话记录采集的内容, 把 real 还原进去等于精准投放泄露) 见 **SEC-10**.
+
+**Properties** (opt-in 模式下; 对应测试均显式配 `restore`):
 - `prop_json_leaf_fallback_restores_mock`: 任意 JSON 树的任一字符串值叶子嵌入 mock → 兜底后输出可 parse 且叶子列表 == [嵌入位置的预期串 (含 real)] ++ [其余原叶子] (同时锁定 "对应位置含 real" / "无 mock 残留" / "其他叶子不变"); 未嵌入 → None. 生成器: string/bool/number/null 叶子 + 嵌套 array/object, 字符串字母表与 mock 不相交 (无残留断言严格成立); real 含 `"`/反斜杠/中文. ✅ `src/redact.rs::prop_json_leaf_fallback_restores_mock`.
 - `prop_json_leaf_fallback_escaped_real`: real 含 `"`/反斜杠/中文时, 兜底输出仍是合法 JSON 且叶子 == real 原文 (wire 上正确转义 — 字节级替换会破坏 JSON, 本 helper 的差异化价值). 🔁→`restore_json_leaves_fallback_escapes_real_secret_correctly` (`src/redact.rs`)
 - `prop_json_leaf_fallback_none_paths`: 未命中 / 非法 JSON / SSE-shaped 多帧 / map 空 → None (原字节透传, FWD-1 byte-exact 保持). 🔁→`restore_json_leaves_fallback_no_mock_returns_none` + `restore_json_leaves_fallback_empty_map_returns_none` (`src/redact.rs`) + `non_json_body_with_mock_still_passes_through_when_fallback_fails` (`tests/integration.rs`, 端到端行为守卫)
-- `prop_json_leaf_fallback_wired_in_fallback_branches`: 同协议 reader 拒绝 / 跨协议 reader 拒绝的端到端场景, 客户端收到还原后的 JSON + restored-via-fallback WARN (不带 secret 明文). 🔁→`buffered_reader_reject_restores_mock_via_json_leaf_fallback` + `cross_proto_reader_reject_restores_mock_via_json_leaf_fallback` (`tests/integration.rs`)
+- `prop_json_leaf_fallback_wired_in_fallback_branches`: 同协议 reader 拒绝 / 跨协议 reader 拒绝的端到端场景 (显式 `restore` 配置), 客户端收到还原后的 JSON + restored-via-fallback WARN (不带 secret 明文). 🔁→`buffered_reader_reject_restores_mock_via_json_leaf_fallback` + `cross_proto_reader_reject_restores_mock_via_json_leaf_fallback` (`tests/integration.rs`)
 - `prop_json_leaf_fallback_keys_untouched`: 只遍历字符串**值**叶子, Object key 不被改写. 🔁→`restore_json_leaves_fallback_leaves_object_keys_untouched` (`src/redact.rs`)
 
 ---
@@ -817,6 +819,27 @@ sqlite 侧车在首个写事务时才创建 (open 处收紧追不上), 由 write
 **Properties**:
 - `prop_response_nosniff_header`: `/` (HTML) / `/api/*` (JSON) / `/api/*` 404 兜底响应均含 `x-content-type-options: nosniff`. 🔁→`webui_and_api_responses_carry_nosniff` (`tests/integration.rs`)
 
+### SEC-10 降级偏安全 (fail-safe degradation)
+
+**陈述**: 在 secret-guard 无法维持核心保证 (real secret 不出现在未授权位置) 的降级
+路径上, 默认策略必须**不扩散 real secret** — 请求侧降级 (mock probing 耗尽 /
+codec-less 协议 + secrets) 默认拒绝转发 (503, 上游零请求); 响应侧降级 (codec parse
+失败 fallback) 默认保留 Mock 透传 (Mock 按 RED-5 设计为可安全暴露). real 进入更大
+暴露面 (上游 / 易被日志采集的失败响应体) 必须显式 opt-in (`on_probe_exhausted =
+"fail_open"` / `on_unsupported_protocol = "fail_open"` / `on_fallback_restore =
+"restore"`). 三个开关: `[redact] on_probe_exhausted` / `[redact]
+on_unsupported_protocol` / `[redact] on_fallback_restore`.
+
+**Rationale (不对称性)**: 可用性损失 (请求被拒 / 客户端看到 Mock) 可重试恢复 —
+重试 / 换协议路径 / opt-in; 机密性损失 (real 随上游请求或客户端日志扩散) 不可逆.
+失败/降级响应体是最高概率被客户端日志系统 / 错误追踪 / 会话记录采集的内容, 把
+real 还原进去等于精准投放泄露. 故默认"偏安全", 暴露侧行为一律显式 opt-in.
+
+**Properties**:
+- `prop_degradation_defaults_are_safe_side`: 三个降级开关 (`OnProbeExhausted` / `OnUnsupportedProtocol` / `OnFallbackRestore`) 的 `Default::default()` 均为安全侧 (FailClosed / FailClosed / Withhold), 且 `RedactConfig::default()` ([redact] 段缺字段时的 serde 回退) 与之一致 — 任一默认翻回暴露侧都是安全姿态回归. ✅ `src/config.rs::prop_degradation_defaults_are_safe_side`
+- `prop_degradation_request_side_refused_by_default`: 默认配置下, 请求侧降级路径出站无 real secret — codec-less 协议 (gemini) + secrets → 503 + 上游零请求; probing 耗尽 → 503 + 上游零请求 (后者测试显式配 fail_closed, 默认值等价由 `prop_degradation_defaults_are_safe_side` 锁定). 🔁→`gemini_secrets_fail_closed_returns_503_zero_upstream_hits` (默认路径) + `fail_closed_mode_returns_503_when_probing_exhausted` (显式 fail_closed 行为) (`tests/integration.rs`)
+- `prop_degradation_response_side_withholds_real_by_default`: 默认配置 (withhold) 下, 响应侧降级路径 (reader-拒绝 fallback) 的客户端 body 含 Mock 不含 real (原字节透传) + mock-not-restored WARN (detail 含 opt-in 提示), 同协议 / 跨协议两路径对称. 🔁→`reader_reject_withholds_real_secret_by_default_same_proto` + `reader_reject_withholds_real_secret_by_default_cross_proto` (`tests/integration.rs`)
+
 ---
 
 ## 8. ROB: 鲁棒性 (best-effort 永不 panic)
@@ -1092,6 +1115,8 @@ chars (char boundary 安全); 其余事件字段为受控类型, 天然无 secre
 
 | 日期 | 契约 ID | 调整 | 原因 |
 |---|---|---|---|
+| 2026-09-15 | SEC-10 (新增) + RED-4 | 新增 **SEC-10 降级偏安全 (fail-safe degradation)**: 请求侧降级 (probing 耗尽 / codec-less 协议 + secrets) 默认拒绝转发 (503), 响应侧降级 (codec parse 失败 fallback) 默认保留 Mock 透传, real 进入更大暴露面必须显式 opt-in. 配套默认值翻转 ×2 (用户授权): `[redact] on_probe_exhausted` / `on_unsupported_protocol` 默认 fail_open → fail_closed (RED-4 陈述同步: fail_closed 为默认, fail_open 显式 opt-in); 新增开关 `[redact] on_fallback_restore` (默认 withhold). 三开关默认值 + 默认配置下降级路径出站无 real 由 SEC-10 property 锁定 | 用户授权的安全裁决 (PR #222 增量反馈): 失败/降级响应体是最高概率被客户端日志系统 / 错误追踪 / 会话记录采集的内容, 把 real 还原进去等于精准投放泄露; 可用性损失可重试恢复, 机密性损失不可逆 — 一切降级路径默认偏安全; 自用项目无兼容负担 |
+| 2026-09-15 | RED-8 | 陈述改写为条件式: JSON 叶子级兜底 restore 仅在 `[redact] on_fallback_restore = "restore"` (显式 opt-in) 时生效; 默认 (withhold) 行为移交 SEC-10 (保留 Mock 原字节透传 + mock-not-restored WARN 含 opt-in 提示, real 不进入降级响应体). 5 条 property 标注不变 (对应测试改为显式 restore 配置后仍成立); 非 JSON 分支两模式行为一致 (恒透传 + WARN). 编号不变 | 同上 (SEC-10 裁决): RED-8 的兜底 restore 把 real 还原进降级响应体, 与降级偏安全默认相悖, 转为 opt-in; 默认行为归 SEC-10 统一陈述 |
 | 2026-09-14 | RED-8 | 新增 JSON 叶子级兜底 restore 契约 (C8): codec parse 失败的 fallback 分支 (fan_out_buffered_ir / cross_proto_forward) 先尝试 JSON 树叶子级 restore, 尽力不让 mock 逃逸到客户端; 未命中/parse 失败返回 None 保持原字节透传. 同步补齐 cross_proto 非 JSON fallback 的 mock-not-restored WARN (#158 遗留). | parse-失败 fallback 透传含 mock 字节是已知逃逸路径; body 仍是合法 JSON (eg 字段类型错配) 时叶子级替换可堵住, byte-exact 仅在确有替换时让位 |
 | 2026-07-26 | (initial) | 建立本文档, 收纳 C1-C7 / INV-1..5 / I1-I3 为 RED-1..7 / CDAG-1..5 / UI-1..3 | QA 系统梳理, 边界契约先行 |
 | 2026-09-11 | USAGE-1/5/6/7 | 人工授权 (usage-stats v4): 存储层 JSONL → SQLite (USAGE-1 聚合一致性改为 SQL 直查, "重放恢复" 重述为 "持久恢复"; 无内存双份簿记); 聚合粒度 day → **hour** (≤14 天 hour bucket, 更长 day 折叠, by_day → by_bucket); USAGE-1 新增 rounds 三态维度 (round_kind 真值透传自 dag push 判定); USAGE-5 新增 status 原始状态码语义 (429/4xx/5xx 派生分类, 不落 per-class flag); USAGE-6 扫描范围扩至 mock; 新增 **USAGE-7** redact 审计持久化 + 治理三问扩展 (B 级: 事件明细 + mock; 位置元数据 category/count (C 级结构化落地, 只存位置不存内容) + 归因 api_key_label + 溯源 node 关联 (悬空容忍); 永不含 real secret 与上下文片段). | 用户需求: 小时精度 / SQLite / rounds 与 retry 可见性 / 429 独立统计 / redact 审计记录 |
