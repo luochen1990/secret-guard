@@ -317,19 +317,40 @@ pub(super) fn warn_mock_not_restored(
 /// 的 SSOT): 在外层**已 parse** 的 `v` 上尝试 JSON 叶子级 restore (零二次 parse) —
 /// 成功 → restored WARN + 重序列化字节; 未命中/无 redaction → mock-not-restored WARN
 /// + 原字节透传 (FWD-1: 未命中绝不重序列化).
+///
+/// `mode` = `[redact] on_fallback_restore` (SEC-10 降级偏安全):
+/// - `Withhold` (默认): **不尝试 restore**, 保留 Mock 透传 + mock-not-restored
+///   WARN (detail 追加 opt-in 提示). 失败/降级响应体是最高概率被客户端日志系统
+///   采集的内容, 把 real 还原进去等于精准投放泄露; Mock 按 RED-5 设计可安全暴露.
+/// - `Restore` (显式 opt-in, RED-8 行为): JSON 叶子级 restore 兜底如上.
 pub(super) fn restore_via_json_leaf_fallback(
     record_id: uuid::Uuid,
     v: &mut serde_json::Value,
     original: &[u8],
     reject_detail: &str,
     map: &crate::redact::RedactionMap,
+    mode: crate::config::OnFallbackRestore,
 ) -> Vec<u8> {
-    if crate::redact::restore_json_value_fallback(v, map) {
-        warn_mocks_restored_via_json_leaf_fallback(record_id);
-        serde_json::to_vec(v).unwrap_or_else(|_| original.to_vec())
-    } else {
-        warn_mock_not_restored(record_id, reject_detail, map);
-        original.to_vec()
+    match mode {
+        crate::config::OnFallbackRestore::Withhold => {
+            warn_mock_not_restored(
+                record_id,
+                &format!(
+                    "{reject_detail}; set [redact] on_fallback_restore = \"restore\" to opt in"
+                ),
+                map,
+            );
+            original.to_vec()
+        }
+        crate::config::OnFallbackRestore::Restore => {
+            if crate::redact::restore_json_value_fallback(v, map) {
+                warn_mocks_restored_via_json_leaf_fallback(record_id);
+                serde_json::to_vec(v).unwrap_or_else(|_| original.to_vec())
+            } else {
+                warn_mock_not_restored(record_id, reject_detail, map);
+                original.to_vec()
+            }
+        }
     }
 }
 

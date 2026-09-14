@@ -182,9 +182,10 @@ type RedactOutcome = Result<
 /// 对 IR 应用 redact 并派生 CallEvent.redactions (same_proto / cross_proto 共享).
 ///
 /// `mode` 控制 probing 耗尽时的策略:
-/// - [`OnProbeExhausted::FailOpen`] (默认): 耗尽时 warn+skip (向后兼容, 永不 Err).
-/// - [`OnProbeExhausted::FailClosed`]: 耗尽时返回 `Err(AppError)` (503, 由
-///   [`probe_exhausted_error`] 构造), 调用方 `?` 传播拒绝转发.
+/// - [`OnProbeExhausted::FailClosed`] (默认, SEC-10): 耗尽时返回 `Err(AppError)`
+///   (503, 由 [`probe_exhausted_error`] 构造), 调用方 `?` 传播拒绝转发.
+/// - [`OnProbeExhausted::FailOpen`] (显式 opt-in, 历史行为): 耗尽时 warn+skip
+///   (向后兼容, 永不 Err).
 ///
 /// 返回 `(redaction_map, redact_seed, redactions, redact_hits)`. redaction_map 非空时 debug 日志记录命中数.
 ///

@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use crate::auth::ApiKeyStore;
-use crate::config::{OnProbeExhausted, OnUnsupportedProtocol};
+use crate::config::{OnFallbackRestore, OnProbeExhausted, OnUnsupportedProtocol};
 use crate::dag::ConversationDag;
 use crate::provider::ProviderTable;
 use crate::secrets::SecretTable;
@@ -39,14 +39,24 @@ pub struct AppState {
     /// 来自 `[redact] global_mock_prefix` (默认空串). WebUI secret upsert 时
     /// 透传给 validate_and_resolve, 用于校验 value 不含此 prefix + 注入 Auto gen_spec.prefix.
     pub global_mock_prefix: Arc<str>,
-    /// 来自 `[redact] on_probe_exhausted` (默认 FailOpen). 控制 redact probing 耗尽时
-    /// 是 fail-open (skip + 原样转发) 还是 fail-closed (返回 503 拒绝转发).
+    /// 来自 `[redact] on_probe_exhausted` (默认 FailClosed, SEC-10 降级偏安全).
+    /// 控制 redact probing 耗尽时是 fail-closed (返回 503 拒绝转发) 还是
+    /// fail-open (显式 opt-in, skip + 原样转发).
     pub on_probe_exhausted: OnProbeExhausted,
-    /// 来自 `[redact] on_unsupported_protocol` (默认 FailOpen). 控制 codec 不覆盖的
-    /// 协议 (gemini/ollama) 上配置了 secrets 时是 fail-open (WARN + 透传放行) 还是
-    /// fail-closed (返回 503 拒绝转发). 仅管 secret 安全性 — 仅 model 重写降级
-    /// (无 secret) 时两模式都维持 WARN 透传. 消费点 `proxy::same_proto`.
+    /// 来自 `[redact] on_unsupported_protocol` (默认 FailClosed, SEC-10). 控制
+    /// codec 不覆盖的协议 (gemini/ollama) 上配置了 secrets 时是 fail-closed
+    /// (返回 503 拒绝转发) 还是 fail-open (显式 opt-in, WARN + 透传放行).
+    /// 仅管 secret 安全性 — 仅 model 重写降级 (无 secret) 时两模式都维持 WARN
+    /// 透传. 消费点 `proxy::same_proto`.
     pub on_unsupported_protocol: OnUnsupportedProtocol,
+    /// 来自 `[redact] on_fallback_restore` (默认 Withhold, SEC-10). 控制 codec
+    /// 无法 parse 上游响应的 fallback 路径 (reader 拒绝但 body 仍是合法 JSON)
+    /// 上, 是否把 Mock 还原为 real 发给客户端: Withhold (默认) 保留 Mock 透传
+    /// (降级偏安全 — 失败响应体高概率进入客户端日志系统, Mock 按设计可安全
+    /// 暴露); Restore (显式 opt-in) 恢复 RED-8 行为 (本地工具直接可用, 但 real
+    /// 可能随日志扩散). 消费点 `proxy::helpers::restore_via_json_leaf_fallback`
+    /// (fan_out / cross_proto 的 reader-拒绝臂共享). 非 JSON 分支不受影响.
+    pub on_fallback_restore: OnFallbackRestore,
     /// 来自 `[server] upstream_*_timeout_secs` 的上游超时配置.
     /// forward 路径用它给 send().await / stream chunk 加超时保护.
     pub upstream_timeouts: crate::config::UpstreamTimeouts,

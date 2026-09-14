@@ -334,6 +334,10 @@ pub(crate) async fn fan_out_streaming(
 /// 重新序列化后一次性返回给客户端. 失去流式 UX.
 ///
 /// 用于: 同协议 + redact + 非流式响应; 同协议 + redact + 流式响应但上游出错 (非 2xx).
+///
+/// `on_fallback_restore` = `[redact] on_fallback_restore` (SEC-10): reader-拒绝
+/// fallback 臂是否 restore (withhold 保留 Mock / restore 还原), 见
+/// `helpers::restore_via_json_leaf_fallback`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn fan_out_buffered_ir(
     dag: ConversationDag,
@@ -345,6 +349,7 @@ pub(crate) async fn fan_out_buffered_ir(
     streamed: bool,
     codec_proto: crate::codec::Protocol,
     redaction_map: RedactionMap,
+    on_fallback_restore: crate::config::OnFallbackRestore,
     stream_idle_timeout: Option<std::time::Duration>,
     usage: crate::usage::UsageCtx,
 ) -> Result<Response<Body>, AppError> {
@@ -416,9 +421,11 @@ pub(crate) async fn fan_out_buffered_ir(
                     serde_json::to_vec(&restored).unwrap_or_else(|_| recorder.acc.clone())
                 }
                 Err(e) => {
-                    // RED-8: reader 拒绝 (eg choices 类型错配) 但 body 仍是合法 JSON —
-                    // 复用外层已 parse 的 v 做 JSON 叶子级 restore 兜底 (零二次 parse),
-                    // 尽力不让 mock 逃逸到客户端. 决策序列 SSOT 在 helpers.
+                    // RED-8 / SEC-10: reader 拒绝 (eg choices 类型错配) 但 body 仍是
+                    // 合法 JSON — 决策序列 SSOT 在 helpers (on_fallback_restore:
+                    // withhold 保留 Mock / restore 尝试 JSON 叶子级 restore 兜底),
+                    // 尽力不让 real 扩散进易被日志采集的失败响应体 / 不让 mock
+                    // 逃逸到客户端 (按配置二选一).
                     super::helpers::restore_via_json_leaf_fallback(
                         record_id,
                         &mut v,
@@ -429,6 +436,7 @@ pub(crate) async fn fan_out_buffered_ir(
                             e.message
                         ),
                         &redaction_map,
+                        on_fallback_restore,
                     )
                 }
             },

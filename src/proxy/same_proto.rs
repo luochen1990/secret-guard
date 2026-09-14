@@ -80,11 +80,12 @@ pub(crate) async fn same_proto_forward(
     use crate::codec::Protocol as CodecProtocol;
     let Some(codec_proto) = CodecProtocol::from_native(ingress) else {
         // codec 不支持此协议 (Gemini/Ollama), 但同协议 + SecretTable 非空时本应做 redact.
-        // `[redact] on_unsupported_protocol` 停损开关 (与 on_probe_exhausted 同型):
-        // - FailClosed + 配置了 secrets: 拒绝转发 (503) — secret 原样出站是安全降级
-        //   的底线, 敏感场景宁可不转发. 仅管 secret 安全性: 仅 model 改写降级
-        //   (无 secret) 时不触发, 维持 WARN 透传.
-        // - FailOpen (默认, 历史行为): 降级到字节透传, secret 原样转发到上游
+        // `[redact] on_unsupported_protocol` 停损开关 (SEC-10 降级偏安全, 与
+        // on_probe_exhausted 同型):
+        // - FailClosed (默认, 2026-09 自 FailOpen 翻转) + 配置了 secrets: 拒绝转发
+        //   (503) — secret 原样出站是安全降级的底线, 默认停损. 仅管 secret 安全性:
+        //   仅 model 改写降级 (无 secret) 时不触发, 维持 WARN 透传.
+        // - FailOpen (显式 opt-in, 历史行为): 降级到字节透传, secret 原样转发到上游
         //   (静默失效风险), 用 warn 让运维注意到.
         // 安全: 只记 protocol + provider id, 永不记 secret 值 (SEC-2).
         if state.on_unsupported_protocol == crate::config::OnUnsupportedProtocol::FailClosed
@@ -321,6 +322,7 @@ pub(crate) async fn same_proto_forward(
                 streamed,
                 codec_proto,
                 redaction_map,
+                state.on_fallback_restore,
                 state.upstream_timeouts.stream_idle,
                 usage_ctx.clone(),
             )

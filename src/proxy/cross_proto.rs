@@ -420,8 +420,9 @@ pub(crate) async fn cross_proto_forward(
                 }
                 Err(e) => {
                     warn!(%record_id, error = %e.message, "failed to parse upstream response as {}; passing through verbatim", provider.protocol.name());
-                    // RED-8: reader 拒绝但 body 仍是合法 JSON — 共享兜底决策序列
-                    // (helpers SSOT, 与 fan_out_buffered_ir 对称), 不让 mock 逃逸.
+                    // RED-8 / SEC-10: reader 拒绝但 body 仍是合法 JSON — 共享兜底
+                    // 决策序列 (helpers SSOT, 与 fan_out_buffered_ir 对称;
+                    // on_fallback_restore: withhold 保留 Mock / restore 兜底还原).
                     let mut v = v;
                     (
                         resp_status,
@@ -431,6 +432,7 @@ pub(crate) async fn cross_proto_forward(
                             &resp_bytes,
                             "codec reader rejected response",
                             &redaction_map,
+                            state.on_fallback_restore,
                         ),
                     )
                 }

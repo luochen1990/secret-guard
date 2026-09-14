@@ -36,6 +36,7 @@ async fn main() -> Result<()> {
     let global_mock_prefix = static_cfg.redact.global_mock_prefix.clone();
     let on_probe_exhausted = static_cfg.redact.on_probe_exhausted;
     let on_unsupported_protocol = static_cfg.redact.on_unsupported_protocol;
+    let on_fallback_restore = static_cfg.redact.on_fallback_restore;
     let dyn_state = DynamicState::load_or_empty(&state_path, &global_mock_prefix)?;
 
     let host = args.host.unwrap_or_else(|| static_cfg.server.host.clone());
@@ -55,6 +56,7 @@ async fn main() -> Result<()> {
         decisions = dyn_state.decisions.providers.len() + dyn_state.decisions.secrets.len(),
         on_probe_exhausted = ?on_probe_exhausted,
         on_unsupported_protocol = ?on_unsupported_protocol,
+        on_fallback_restore = ?on_fallback_restore,
         "starting secret-guard"
     );
 
@@ -71,6 +73,7 @@ async fn main() -> Result<()> {
         global_mock_prefix,
         on_probe_exhausted,
         on_unsupported_protocol,
+        on_fallback_restore,
         upstream_timeouts,
         static_cfg.usage,
         static_cfg.server.allowed_domains,

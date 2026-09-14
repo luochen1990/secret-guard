@@ -165,58 +165,74 @@ impl Default for UsageConfig {
 /// 日志 / WebUI timeline 中视觉可辨识. 详见 `redact.rs` 的 C5 契约.
 ///
 /// `on_probe_exhausted` 控制 redact probing 耗尽 (弱配置 + 对抗性 IR) 时的策略:
-/// `FailOpen` (默认, 向后兼容) 跳过该 secret 原样转发; `FailClosed` 拒绝转发
-/// (返回 503). 详见 `redact.rs` 的 redact_ir_checked.
+/// `FailClosed` (默认, SEC-10 降级偏安全) 拒绝转发 (返回 503); `FailOpen`
+/// (显式 opt-in, 历史行为) 跳过该 secret 原样转发. 详见 `redact.rs` 的
+/// redact_ir_checked.
 ///
 /// `on_unsupported_protocol` 控制 codec 不覆盖的协议 (gemini/ollama) 上配置了
-/// secrets 时的策略: `FailOpen` (默认, 向后兼容) WARN + 放行透传 (secret 原样
-/// 出站); `FailClosed` 拒绝转发 (返回 503). 仅管 secret 安全性 — 仅 model 重写
-/// 降级 (无 secret) 时两模式都维持 WARN 透传. 详见 `proxy::same_proto`.
+/// secrets 时的策略: `FailClosed` (默认, SEC-10) 拒绝转发 (返回 503); `FailOpen`
+/// (显式 opt-in, 历史行为) WARN + 放行透传 (secret 原样出站). 仅管 secret
+/// 安全性 — 仅 model 重写降级 (无 secret) 时两模式都维持 WARN 透传. 详见
+/// `proxy::same_proto`.
+///
+/// `on_fallback_restore` 控制 codec 无法 parse 上游响应的 fallback 路径上, 是否把
+/// Mock 还原为 real 发给客户端: `Withhold` (默认, SEC-10) 保留 Mock 透传 — 失败/
+/// 降级响应体是最高概率被客户端日志系统 / 错误追踪 / 会话记录采集的内容, 把 real
+/// 还原进去等于精准投放泄露, 而 Mock 按 RED-5 设计为可安全暴露; `Restore`
+/// (显式 opt-in, RED-8 行为) 本地工具直接可用真 secret, 但 real 可能随日志扩散.
+/// 详见 `proxy::helpers::restore_via_json_leaf_fallback`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RedactConfig {
     /// Auto 模式 mock 的统一前缀, 在 secret resolve 阶段注入到每个 secret 的
     /// `gen_spec.prefix` (per-secret prefix 仍可覆盖). 默认空串.
     pub global_mock_prefix: String,
-    /// Mock probing 耗尽时的策略 (默认 `FailOpen` 向后兼容).
+    /// Mock probing 耗尽时的策略 (默认 `FailClosed` 降级偏安全, SEC-10).
     pub on_probe_exhausted: OnProbeExhausted,
     /// codec 不覆盖的协议 (gemini/ollama) 上配置了 secrets 时的策略
-    /// (默认 `FailOpen` 向后兼容; 仅管 secret 安全性, model 重写降级不受影响).
+    /// (默认 `FailClosed` 降级偏安全, SEC-10; 仅管 secret 安全性,
+    /// model 重写降级不受影响).
     pub on_unsupported_protocol: OnUnsupportedProtocol,
+    /// codec 无法 parse 上游响应的 fallback 路径上是否把 Mock 还原为 real 发给
+    /// 客户端 (默认 `Withhold` 降级偏安全, SEC-10; 仅管 reader-拒绝但 body 仍是
+    /// 合法 JSON 的分支 — 非 JSON 分支 restore 本就无意义, 不受开关影响).
+    pub on_fallback_restore: OnFallbackRestore,
 }
 
 /// Mock probing 耗尽时 (弱配置 + 对抗性 IR 无法生成唯一 mock) 的处理策略.
 ///
-/// - `FailOpen`: 跳过该 secret 原样转发到上游 (历史行为, 向后兼容).
-/// - `FailClosed`: 拒绝转发整个请求 (返回 503), 防止 secret 泄露到 LLM provider.
+/// - `FailClosed` (默认): 拒绝转发整个请求 (返回 503), 防止 secret 泄露到 LLM provider.
+/// - `FailOpen`: 跳过该 secret 原样转发到上游 (历史行为, 显式 opt-in 向后兼容).
 ///
 /// 配置示例 (`secret-guard.toml`):
 /// ```toml
 /// [redact]
-/// on_probe_exhausted = "fail_closed"
+/// on_probe_exhausted = "fail_open"
 /// ```
 ///
 /// # 设计动机
 ///
 /// `FailOpen` 优先保进程存活, 但与 secret-guard 的核心使命 (防 secret 泄露) 相悖:
 /// 对抗性请求可构造让 mock probing 必然耗尽的 IR, 从而把 secret 原样发往上游.
-/// `FailClosed` 让运维在敏感场景显式拒绝这种降级, 即便付出请求失败的代价.
-/// 默认仍 `FailOpen` 以避免升级时破坏现有部署.
+/// 默认 `FailClosed` (SEC-10 降级偏安全, 2026-09 自 `FailOpen` 翻转): 配置期
+/// lint (`MockStrategy::lint_candidate_space`) 已把弱配置拦截在写入时 (WARN),
+/// 运行时残余的耗尽正是对抗场景, 默认拒绝 — 请求失败可重试恢复, 机密性损失
+/// 不可逆. 旧行为 `FailOpen` 显式配置保留 (自用项目无兼容负担).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OnProbeExhausted {
-    /// 跳过该 secret 原样转发 (warn 日志, 历史行为, 向后兼容).
+    /// 拒绝转发整个请求 (返回 503, 防止 secret 泄露). 默认.
     #[default]
-    FailOpen,
-    /// 拒绝转发整个请求 (返回 503, 防止 secret 泄露).
     FailClosed,
+    /// 跳过该 secret 原样转发 (warn 日志, 历史行为, 显式 opt-in 向后兼容).
+    FailOpen,
 }
 
 /// codec 不覆盖的协议 (gemini / ollama) 上配置了 secrets 时 ("本应 redact 但
 /// 协议无 codec, 无法 redact") 的处理策略.
 ///
-/// - `FailOpen`: WARN + 字节透传放行 (secret 原样出站, 历史行为, 向后兼容).
-/// - `FailClosed`: 拒绝转发整个请求 (返回 503), 防止 secret 泄露到 LLM provider.
+/// - `FailClosed` (默认): 拒绝转发整个请求 (返回 503), 防止 secret 泄露到 LLM provider.
+/// - `FailOpen`: WARN + 字节透传放行 (secret 原样出站, 历史行为, 显式 opt-in 向后兼容).
 ///
 /// **只管 secret 安全性**: 仅 model 重写降级 (无 secret) 时两模式都维持 WARN 透传
 /// (重写不涉及 secret, 降级代价只是 model 未改写).
@@ -224,23 +240,56 @@ pub enum OnProbeExhausted {
 /// 配置示例 (`secret-guard.toml`):
 /// ```toml
 /// [redact]
-/// on_unsupported_protocol = "fail_closed"
+/// on_unsupported_protocol = "fail_open"
 /// ```
 ///
 /// # 设计动机
 ///
 /// 与 `on_probe_exhausted` 同型: 历史上 codec-less 协议 + secrets 是静默降级放行
-/// (仅 WARN), 敏感场景下运维需要停损开关. `FailClosed` 让这类请求显式失败
-/// (503 message 只含协议名 + provider id + 出路提示, SEC-2 同型), 即便付出请求
-/// 失败的代价. 默认仍 `FailOpen` 以避免升级时破坏现有部署.
+/// (仅 WARN), secret 原样出站. 默认 `FailClosed` (SEC-10 降级偏安全, 2026-09 自
+/// `FailOpen` 翻转): secret 原样出站是安全降级的底线, 默认停损 — 请求失败可重试
+/// 恢复 (换 codec 覆盖的协议路径 / 解除 secret 依赖 / 显式 opt-in fail_open),
+/// 机密性损失不可逆; 503 message 只含协议名 + provider id + 出路提示 (SEC-2 同型).
+/// 旧行为 `FailOpen` 显式配置保留 (自用项目无兼容负担).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OnUnsupportedProtocol {
-    /// WARN + 字节透传放行 (secret 原样出站, 历史行为, 向后兼容).
+    /// 拒绝转发整个请求 (返回 503, 防止 secret 泄露). 默认.
     #[default]
-    FailOpen,
-    /// 拒绝转发整个请求 (返回 503, 防止 secret 泄露).
     FailClosed,
+    /// WARN + 字节透传放行 (secret 原样出站, 历史行为, 显式 opt-in 向后兼容).
+    FailOpen,
+}
+
+/// codec 无法 parse 上游响应的 fallback 路径上 (reader 拒绝但 body 仍是合法
+/// JSON), 是否把 Mock 还原为 real 发给客户端 (SEC-10 降级偏安全).
+///
+/// - `Withhold` (默认): 保留 Mock 透传 + mock-not-restored WARN (含 opt-in 提示).
+///   失败/降级响应体是最高概率被客户端日志系统 / 错误追踪 / 会话记录采集的内容,
+///   把 real 还原进去等于精准投放泄露; Mock 按 RED-5 设计为可安全暴露.
+/// - `Restore`: 显式 opt-in 恢复 RED-8 行为 (JSON 叶子级 restore 兜底, mock
+///   还原为 real + restored-via-fallback WARN) — 本地工具直接可用真 secret,
+///   但 real 可能随客户端日志扩散.
+///
+/// 配置示例 (`secret-guard.toml`):
+/// ```toml
+/// [redact]
+/// on_fallback_restore = "restore"
+/// ```
+///
+/// # 边界
+///
+/// 仅管 reader-拒绝 (body 仍是单个合法 JSON) 的 fallback 分支; 非 JSON 分支
+/// (SSE-shaped 多帧 body 等) restore 本就无意义 (叶子级兜底以单 JSON Value 为
+/// 前提), 不受本开关影响, 恒为透传 + mock-not-restored WARN.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnFallbackRestore {
+    /// 保留 Mock 透传 (降级偏安全, SEC-10) + mock-not-restored WARN. 默认.
+    #[default]
+    Withhold,
+    /// JSON 叶子级 restore 兜底 (RED-8 行为, 显式 opt-in): mock 还原为 real.
+    Restore,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -478,6 +527,7 @@ const KNOWN_FIELDS: &[(&str, &[&str])] = &[
             "global_mock_prefix",
             "on_probe_exhausted",
             "on_unsupported_protocol",
+            "on_fallback_restore",
         ],
     ),
     // Config::usage (UsageConfig, usage-stats)
@@ -1960,12 +2010,13 @@ mod tests {
     // ─── OnProbeExhausted serde + Default ─────────────────────────────────
 
     #[test]
-    fn on_probe_exhausted_default_is_fail_open() {
-        assert_eq!(OnProbeExhausted::default(), OnProbeExhausted::FailOpen);
-        // RedactConfig::default() 也必须是 FailOpen (向后兼容旧配置无此字段).
+    fn on_probe_exhausted_default_is_fail_closed() {
+        assert_eq!(OnProbeExhausted::default(), OnProbeExhausted::FailClosed);
+        // RedactConfig::default() 也必须是 FailClosed (SEC-10 降级偏安全默认,
+        // 2026-09 自 FailOpen 翻转).
         assert_eq!(
             RedactConfig::default().on_probe_exhausted,
-            OnProbeExhausted::FailOpen
+            OnProbeExhausted::FailClosed
         );
     }
 
@@ -1994,36 +2045,37 @@ mod tests {
 
     #[test]
     fn redact_config_toml_default_omits_on_probe_exhausted_field() {
-        // 空 [redact] 段应解析为默认 (FailOpen + 空 prefix), 向后兼容.
+        // 空 [redact] 段应解析为默认 (FailClosed + 空 prefix), 向后兼容.
         let cfg: Config = toml::from_str("[redact]\n").unwrap();
         assert_eq!(cfg.redact.global_mock_prefix, "");
-        assert_eq!(cfg.redact.on_probe_exhausted, OnProbeExhausted::FailOpen);
+        assert_eq!(cfg.redact.on_probe_exhausted, OnProbeExhausted::FailClosed);
     }
 
     #[test]
-    fn redact_config_toml_parses_fail_closed() {
+    fn redact_config_toml_parses_fail_open_opt_in() {
         let text = r#"
 [redact]
 global_mock_prefix = "sgm_"
-on_probe_exhausted = "fail_closed"
+on_probe_exhausted = "fail_open"
 "#;
         let cfg: Config = toml::from_str(text).unwrap();
         assert_eq!(cfg.redact.global_mock_prefix, "sgm_");
-        assert_eq!(cfg.redact.on_probe_exhausted, OnProbeExhausted::FailClosed);
+        assert_eq!(cfg.redact.on_probe_exhausted, OnProbeExhausted::FailOpen);
     }
 
     // ─── OnUnsupportedProtocol serde + Default ───────────────────────────
 
     #[test]
-    fn on_unsupported_protocol_default_is_fail_open() {
+    fn on_unsupported_protocol_default_is_fail_closed() {
         assert_eq!(
             OnUnsupportedProtocol::default(),
-            OnUnsupportedProtocol::FailOpen
+            OnUnsupportedProtocol::FailClosed
         );
-        // RedactConfig::default() 也必须是 FailOpen (向后兼容旧配置无此字段).
+        // RedactConfig::default() 也必须是 FailClosed (SEC-10 降级偏安全默认,
+        // 2026-09 自 FailOpen 翻转).
         assert_eq!(
             RedactConfig::default().on_unsupported_protocol,
-            OnUnsupportedProtocol::FailOpen
+            OnUnsupportedProtocol::FailClosed
         );
     }
 
@@ -2052,27 +2104,109 @@ on_probe_exhausted = "fail_closed"
 
     #[test]
     fn redact_config_toml_default_omits_on_unsupported_protocol_field() {
-        // 空 [redact] 段应解析为默认 (FailOpen), 向后兼容.
+        // 空 [redact] 段应解析为默认 (FailClosed), 向后兼容.
         let cfg: Config = toml::from_str("[redact]\n").unwrap();
-        assert_eq!(
-            cfg.redact.on_unsupported_protocol,
-            OnUnsupportedProtocol::FailOpen
-        );
-    }
-
-    #[test]
-    fn redact_config_toml_parses_unsupported_protocol_fail_closed() {
-        let text = r#"
-[redact]
-on_unsupported_protocol = "fail_closed"
-"#;
-        let cfg: Config = toml::from_str(text).unwrap();
         assert_eq!(
             cfg.redact.on_unsupported_protocol,
             OnUnsupportedProtocol::FailClosed
         );
-        // 两开关独立 (on_probe_exhausted 不受影响).
-        assert_eq!(cfg.redact.on_probe_exhausted, OnProbeExhausted::FailOpen);
+    }
+
+    #[test]
+    fn redact_config_toml_parses_unsupported_protocol_fail_open_opt_in() {
+        let text = r#"
+[redact]
+on_unsupported_protocol = "fail_open"
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        assert_eq!(
+            cfg.redact.on_unsupported_protocol,
+            OnUnsupportedProtocol::FailOpen
+        );
+        // 两开关独立 (on_probe_exhausted 不受影响, 仍为默认 FailClosed).
+        assert_eq!(cfg.redact.on_probe_exhausted, OnProbeExhausted::FailClosed);
+    }
+
+    // ─── OnFallbackRestore serde + Default ───────────────────────────────
+
+    #[test]
+    fn on_fallback_restore_default_is_withhold() {
+        assert_eq!(OnFallbackRestore::default(), OnFallbackRestore::Withhold);
+        // RedactConfig::default() 也必须是 Withhold (SEC-10 降级偏安全默认).
+        assert_eq!(
+            RedactConfig::default().on_fallback_restore,
+            OnFallbackRestore::Withhold
+        );
+    }
+
+    #[test]
+    fn on_fallback_restore_serde_snake_case_roundtrip() {
+        // serde rename_all = "snake_case": withhold / restore.
+        for (variant, name) in [
+            (OnFallbackRestore::Withhold, "withhold"),
+            (OnFallbackRestore::Restore, "restore"),
+        ] {
+            let s = serde_json::to_string(&variant).unwrap();
+            assert_eq!(s, format!("\"{name}\""));
+            let back: OnFallbackRestore = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, variant);
+        }
+    }
+
+    #[test]
+    fn on_fallback_restore_serde_rejects_unknown_variant() {
+        // 未知字符串应反序列化失败 (fail-closed on config typos, 避免静默回退到默认).
+        let err = serde_json::from_str::<OnFallbackRestore>("\"with-hold\"");
+        assert!(err.is_err(), "hyphenated form must be rejected");
+        let err = serde_json::from_str::<OnFallbackRestore>("\"keep\"");
+        assert!(err.is_err(), "unknown variant must be rejected");
+    }
+
+    #[test]
+    fn redact_config_toml_default_omits_on_fallback_restore_field() {
+        // 空 [redact] 段应解析为默认 (Withhold), 向后兼容.
+        let cfg: Config = toml::from_str("[redact]\n").unwrap();
+        assert_eq!(cfg.redact.on_fallback_restore, OnFallbackRestore::Withhold);
+    }
+
+    #[test]
+    fn redact_config_toml_parses_fallback_restore_opt_in() {
+        let text = r#"
+[redact]
+on_fallback_restore = "restore"
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        assert_eq!(cfg.redact.on_fallback_restore, OnFallbackRestore::Restore);
+        // 三开关独立 (另两个不受影响, 仍为默认 FailClosed).
+        assert_eq!(cfg.redact.on_probe_exhausted, OnProbeExhausted::FailClosed);
+        assert_eq!(
+            cfg.redact.on_unsupported_protocol,
+            OnUnsupportedProtocol::FailClosed
+        );
+    }
+
+    /// SEC-10 (降级偏安全) property: 三个降级开关的 `Default::default()` 全部
+    /// 锁定在安全侧 — 请求侧两开关拒绝转发 (FailClosed), 响应侧开关保留 Mock
+    /// (Withhold). 任一默认值翻回暴露侧都是安全姿态回归, 此处必须红.
+    ///
+    /// 契约: docs/design/contracts.md §7 SEC-10.
+    #[test]
+    fn prop_degradation_defaults_are_safe_side() {
+        assert_eq!(OnProbeExhausted::default(), OnProbeExhausted::FailClosed);
+        assert_eq!(
+            OnUnsupportedProtocol::default(),
+            OnUnsupportedProtocol::FailClosed
+        );
+        assert_eq!(OnFallbackRestore::default(), OnFallbackRestore::Withhold);
+        // RedactConfig (整段默认) 与三个枚举默认一致 — [redact] 段缺字段时的
+        // serde(default) 回退值同样锁定在安全侧.
+        let redact = RedactConfig::default();
+        assert_eq!(redact.on_probe_exhausted, OnProbeExhausted::FailClosed);
+        assert_eq!(
+            redact.on_unsupported_protocol,
+            OnUnsupportedProtocol::FailClosed
+        );
+        assert_eq!(redact.on_fallback_restore, OnFallbackRestore::Withhold);
     }
 
     // ─── UsageConfig serde (nix/module.nix render 产物的契约锁定) ──────────

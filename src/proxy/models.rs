@@ -1162,6 +1162,7 @@ mod tests {
             global_mock_prefix: Arc::from(""),
             on_probe_exhausted: crate::config::OnProbeExhausted::FailOpen,
             on_unsupported_protocol: crate::config::OnUnsupportedProtocol::FailOpen,
+            on_fallback_restore: crate::config::OnFallbackRestore::Withhold,
             upstream_timeouts: crate::config::UpstreamTimeouts::default(),
             model_lists: Arc::new(ModelListCache::new()),
             usage: std::sync::Arc::new(crate::usage::UsageStore::in_memory()),

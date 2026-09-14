@@ -286,6 +286,10 @@ fn gen_mock_for_ir(
 /// 此函数会 **warn + 跳过该 secret** (原样转发到上游), 优先保进程存活. 这与 secret-guard
 /// 核心使命 (防泄露) 相悖; 若需严格拒绝转发, 用 [`redact_ir_checked`] 配合
 /// [`OnProbeExhausted::FailClosed`].
+///
+/// 注: 本函数是不读配置的历史 API (单测在用), 硬编码 FailOpen. 生产路径经
+/// [`redact_ir_checked`] 读 `[redact] on_probe_exhausted`, 默认已翻转为
+/// FailClosed (SEC-10 降级偏安全); FailOpen 仅在显式配置时生效.
 pub fn redact_ir(ir: &mut IrRequest, secrets: &[SecretEntry]) -> (RedactionMap, u64) {
     // 历史行为: FailOpen. 遇 Err 仍降级跳过 (与旧实现语义完全一致, 向后兼容).
     match redact_ir_inner(ir, secrets, OnProbeExhausted::FailOpen) {
@@ -388,13 +392,15 @@ fn redact_ir_inner(
                 match mode {
                     OnProbeExhausted::FailOpen => {
                         // 降级: 跳过该 secret (原样发往上游), 不替换. 优于崩溃整个进程.
+                        // 仅在显式 fail_open 下到达 (默认已翻转为 fail_closed, SEC-10).
                         // 安全: 只记 secret id 与 reason, 永不记 secret value.
                         warn!(
                             secret_id = %e.secret_id,
                             reason = ?e.reason,
-                            "mock probing exhausted; skipping this secret (forwarded unredacted). \
-                             consider widening charset or length_range for this secret, or set \
-                             [redact] on_probe_exhausted = \"fail_closed\" to refuse forwarding"
+                            "mock probing exhausted; skipping this secret (forwarded unredacted \
+                             by explicit fail_open). consider widening charset or length_range \
+                             for this secret, or remove [redact] on_probe_exhausted = \"fail_open\" \
+                             to restore the fail_closed default"
                         );
                     }
                     OnProbeExhausted::FailClosed => {

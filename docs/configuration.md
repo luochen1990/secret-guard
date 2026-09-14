@@ -80,8 +80,9 @@ value = "ghp_0123456789abcdefghijklmnopqrstuvwxyz"
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `global_mock_prefix` | string | `""` | 所有 Auto 模式 mock 的统一前缀 (如 `"sgm_"`), 便于在日志 / WebUI 中一眼认出 mock. 设定后, secret 真值不允许包含该前缀. |
-| `on_probe_exhausted` | `"fail_open"` \| `"fail_closed"` | `"fail_open"` | mock 候选探测耗尽时 (极罕见, 需对抗性构造) 的策略: `fail_open` 跳过该 secret 照常转发; `fail_closed` 拒绝转发整个请求 (503), 宁可失败也不泄露. |
-| `on_unsupported_protocol` | `"fail_open"` \| `"fail_closed"` | `"fail_open"` | codec 不覆盖的协议 (目前 gemini / ollama) 上配置了 secrets 时的策略: `fail_open` (默认, 历史行为) WARN + 放行透传 — secret 会**原样出站**; `fail_closed` 拒绝转发整个请求 (503), 停损防泄露 (message 只含协议名 + provider id, 不含 secret). 只管 secret 安全性: 仅 model 重写降级 (无 secret) 时两模式都维持 WARN 透传. |
+| `on_probe_exhausted` | `"fail_open"` \| `"fail_closed"` | `"fail_closed"` | mock 候选探测耗尽时 (极罕见, 需对抗性构造; 配置期 lint 已前置拦截弱配置) 的策略: `fail_closed` (默认, 降级偏安全) 拒绝转发整个请求 (503), 宁可失败也不泄露; `fail_open` 跳过该 secret 照常转发 (显式 opt-in, 历史行为). |
+| `on_unsupported_protocol` | `"fail_open"` \| `"fail_closed"` | `"fail_closed"` | codec 不覆盖的协议 (目前 gemini / ollama) 上配置了 secrets 时的策略: `fail_closed` (默认, 降级偏安全) 拒绝转发整个请求 (503), 停损防泄露 (message 只含协议名 + provider id, 不含 secret); `fail_open` (显式 opt-in, 历史行为) WARN + 放行透传 — secret 会**原样出站**. 只管 secret 安全性: 仅 model 重写降级 (无 secret) 时两模式都维持 WARN 透传. |
+| `on_fallback_restore` | `"withhold"` \| `"restore"` | `"withhold"` | codec 无法 parse 上游响应的 fallback 路径上 (body 仍是合法 JSON), 是否把 Mock 还原为 real 发给客户端: `withhold` (默认, 降级偏安全) 保留 Mock 透传 — 失败/降级响应体是最高概率被客户端日志系统 / 错误追踪采集的内容, 把 real 还原进去等于精准投放泄露, 而 Mock 按设计可安全暴露; `restore` (显式 opt-in) 还原 mock → real (本地工具直接可用真 secret, 但 real 可能随客户端日志扩散). 非 JSON body 的 fallback 分支不受此开关影响 (restore 本就无意义, 恒透传 + WARN). |
 
 ## `[usage]` — 模型用量统计 (改动需重启)
 
