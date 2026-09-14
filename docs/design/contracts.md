@@ -300,7 +300,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 - **N5**: 所有条目 `owned_by: "router"` (统一, 不泄漏内部 provider id)。
 - **D1**: wildcard pattern 本身不列入响应 (其覆盖的真实模型名经 merge 自然出现)。
 - **D6 (回归守卫)**: Direct provider 的模型列表请求**不进此路径**, 透传行为完全不变 (byte-exact, 不进缓存)。
-- **锁纪律**: walk 可达集快照 (触碰 ProviderTable 读锁) 必须在持有缓存 Mutex 之前完成 (持缓存锁跨 await 期间不得再取 ProviderTable 读锁)。
+- **锁纪律**: walk 可达集快照 (触碰 ProviderTable 读锁) 必须在持有缓存 Mutex 之前完成 (持缓存锁跨 await 期间不得再取 ProviderTable 读锁)。实现级锁纪律的完整 SSOT (含 api_key 锁外预解析, #196 review L2) 见 `src/proxy/models.rs` 模块头 "锁纪律" 段。
 
 **Properties**:
 - `prop_router_models_advertise_matches_cached_oracle` (#196): 以缓存快照为 oracle, 合并段广告集恰为 {M ∈ ∪cached : resolve_route(M)=(T,E) ∧ E ∈ cached(T)}; 三边界成立 — 遮蔽 (更高 priority 路由夺走但目标清单无该名 → 过滤) / 重写 (判定看 egress E 是否在目标清单, 不看 M) / 解析失败 (NoMatch / 悬空 / 环 → 不广告); 列表序 = 别名 (路由表序) → walk 序 × 上游响应数组序, 全程去重。🔁→`router_models_default_plan_merge` + `n1_shadowing_and_fallback_boundaries` + `n1_rewrite_judges_egress_model_not_client_model` + `n1_broken_chain_not_advertised`

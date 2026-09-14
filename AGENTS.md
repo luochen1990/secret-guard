@@ -854,11 +854,6 @@ configFile (escape hatch, 互斥). 凭据注入 (LoadCredential / sops 直接路
 - **session cookie Secure flag 可配置**: 给 `build_session_layer` 加配置开关
   (`[auth] secure_cookie = true`) 或从 `X-Forwarded-Proto` header 动态推断.
   当前硬编码 false (本地 HTTP dev 必须), 见 `docs/deployment-nixos.md` "HTTPS 反向代理" 段.
-- **models.rs 缓存锁内的 api_key_file 同步读外移 (#196 review L2)**: `snapshot_refreshing`
-  持缓存锁期间 `fetch_model_list` 调 `effective_api_key` — api_key_file 路径是同步文件读
-  (`std::fs::read_to_string`), 在 tokio worker 线程上持锁执行。修法: walk 快照阶段预解析
-  key 并随 targets 传入 (三元组化), 消除锁内同步 IO。非紧急: 仅 api_key_file 配置存在时有
-  实际 IO (通常 <1ms), 失败退避已把重试频率降到每 30s 一次。
 - mock_secret 的 category-aware 默认生成 (Password/ApiKey/Cookie 等格式感知).
 - 配置热加载; 测试覆盖率自动上报 + fuzzing (cargo-fuzz).
 - **auth/oidc.rs + handlers OIDC 流程的集成测试 (已完成 happy + 错误路径)**:

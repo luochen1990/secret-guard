@@ -46,15 +46,17 @@
 //!   (剥 `models/` 前缀)
 //! - Ollama: `GET {base_url}/api/tags`, shape `{models:[{name}]}`
 //!
-//! headers 复用 `apply_provider_auth` (effective api_key); 整体 10s 超时. 失败 / 超时 /
-//! 缺字段 / 非 2xx → 该 provider 跳过并 `warn!` (只含 provider id + reason, 永不含
+//! headers 复用 `apply_provider_auth`; 整体 10s 超时. 失败 / 超时 / 缺字段 /
+//! 非 2xx → 该 provider 跳过并 `warn!` (只含 provider id + reason, 永不含
 //! key/secret), 绝不 fail 整个 /models 查询.
 //!
 //! # 锁纪律
 //!
-//! walk (可达集快照, 触碰 ProviderTable 读锁) 必须在持有缓存 Mutex **之前**完成 —
-//! `snapshot_refreshing` 持锁跨 await 期间不得再取 ProviderTable 读锁 (锁序: 先快照
-//! 后加缓存锁).
+//! walk (可达集快照, 触碰 ProviderTable 读锁) 与 api_key 预解析
+//! (`effective_api_key`: api_key_file 路径是同步文件读) 都必须在持有缓存 Mutex
+//! **之前**完成 — `snapshot_refreshing` 持锁跨 await 期间不得再取 ProviderTable
+//! 读锁 (锁序: 先快照后加缓存锁), 也不得执行同步文件 IO (阻塞所有 router 的
+//! /models 查询, #196 review L2).
 //!
 //! # 归属 (组合根先例)
 //!
@@ -104,6 +106,14 @@ const MODEL_FETCH_BACKOFF: Duration = Duration::from_millis(300);
 /// 不应能借 /models 查询撑爆内存; 超限按该 provider fetch 失败处理).
 const MAX_MODELS_BODY: usize = 4 * 1024 * 1024;
 
+/// 可达 Direct 目标: id + 构造快照 + 锁外预解析的 api_key (`advertised_names`
+/// 组装, 供 `snapshot_refreshing` 消费). 命名结构体防 id/api_key 位置错换.
+struct FetchTarget {
+    id: String,
+    direct: DirectProvider,
+    api_key: String,
+}
+
 /// per-Direct-provider 的上游模型清单缓存 (AppState 持有 Arc, 所有 router 共享).
 ///
 /// single-flight: `snapshot_refreshing` 持有内部 Mutex 串行执行过期项 refresh,
@@ -136,8 +146,9 @@ impl ModelListCache {
 
     /// 返回 per-provider 缓存清单, 顺带刷新过期项 (single-flight).
     ///
-    /// - `targets` 必须是**先行完成**的可达 Direct 快照 (本函数持缓存锁跨 await,
-    ///   期间不得再取 ProviderTable 读锁 — 锁纪律见模块头部);
+    /// - `targets` 必须是**先行完成**的可达 Direct 快照, 且每项的 api_key 已在锁外
+    ///   预解析 (锁纪律见模块头部; warn-once 语义在 `effective_api_key` 内, 与调用
+    ///   点无关);
     /// - 刷新判定 (M1): 条目缺席 → 懒加载必须试; `fetched_at` 在 TTL 内 → 复用;
     ///   过期/从未成功 **且** 距 `last_attempt` 超过退避窗口 → 重试. 退避窗口内的
     ///   查询**立即** serve stale (或无贡献), 不 fetch — 不阻塞、不占锁重试, 防
@@ -145,14 +156,19 @@ impl ModelListCache {
     /// - 成功 → 覆写 (models, Some(now), now); 失败 → 只推进 `last_attempt`
     ///   (serve-stale 保留旧数据; 从未成功则登记空贡献条目) + warn (只含
     ///   provider id + reason).
-    pub(super) async fn snapshot_refreshing(
+    async fn snapshot_refreshing(
         &self,
         client: &reqwest::Client,
-        targets: &[(String, DirectProvider)],
+        targets: &[FetchTarget],
     ) -> HashMap<String, Vec<String>> {
         let mut map = self.inner.lock().await;
         let mut out = HashMap::new();
-        for (id, direct) in targets {
+        for FetchTarget {
+            id,
+            direct,
+            api_key,
+        } in targets
+        {
             let needs_refresh = match map.get(id) {
                 // 无条目 = 从未尝试 (懒加载首查), 必须试.
                 None => true,
@@ -162,7 +178,7 @@ impl ModelListCache {
                 }
             };
             if needs_refresh {
-                match fetch_model_list(client, id, direct).await {
+                match fetch_model_list(client, api_key, direct).await {
                     Ok(models) => {
                         tracing::debug!(
                             provider_id = %id,
@@ -305,13 +321,13 @@ fn walk_reachable_directs(
 
 /// 缓存快照 → 合并候选序: 按 walk 序 × 各 provider 清单的上游序拼接, 去重
 /// (先出现者占位). 过滤 (N1) 由调用方在消费时执行.
-fn union_from_cache(
-    targets: &[(String, DirectProvider)],
+fn union_from_cache<'a>(
+    ids: impl Iterator<Item = &'a str>,
     cached: &HashMap<String, Vec<String>>,
 ) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    for (id, _) in targets {
+    for id in ids {
         for model in cached.get(id).into_iter().flatten() {
             if seen.insert(model.clone()) {
                 out.push(model.clone());
@@ -348,15 +364,24 @@ pub(super) async fn advertised_names(state: &AppState, entry: &Provider) -> Vec<
     if !needs_upstream_merge(entry) {
         return aliases;
     }
-    // 锁纪律: 先快照 (walk 触碰 ProviderTable 读锁), 后加缓存锁.
-    let targets = walk_reachable_directs(&state.providers, entry);
+    // 锁纪律 (模块头部): 快照 + api_key 预解析均在缓存锁外.
+    // 代价: api_key_file 配置的 provider 每次 /models 查询读一次文件 (锁外,
+    // 通常 <1ms — 旧形态仅在 refresh 时读, 频率被 TTL/退避压低).
+    let targets = walk_reachable_directs(&state.providers, entry)
+        .into_iter()
+        .map(|(id, direct)| FetchTarget {
+            api_key: direct.effective_api_key(&id),
+            id,
+            direct,
+        })
+        .collect::<Vec<_>>();
     let cached = state
         .model_lists
         .snapshot_refreshing(&state.upstream, &targets)
         .await;
     let seen: HashSet<String> = aliases.iter().cloned().collect();
     let mut out = aliases;
-    for model in union_from_cache(&targets, &cached) {
+    for model in union_from_cache(targets.iter().map(|t| t.id.as_str()), &cached) {
         // N2 去重: union 内部已去重, contains 只需挡与别名同名的上游模型.
         if !seen.contains(&model) && n1_accepts(&state.providers, entry, &model, &cached) {
             out.push(model);
@@ -387,11 +412,13 @@ pub(super) async fn handle_router_models(
 /// 按 provider 自身 protocol fetch 模型清单 (best-effort, 错误消息只含 id + reason,
 /// 永不含 key/secret — reqwest 错误经 `upstream_error_brief` 净化, 剥 userinfo/query).
 ///
+/// `api_key` 由调用方在缓存锁外预解析传入 (见模块头部锁纪律).
+///
 /// 超时是**整体**的 (send + 状态检查 + body 有界累积全程): 防上游 "发完响应头后
 /// body 停滞" 永久持有 `snapshot_refreshing` 的缓存锁.
 async fn fetch_model_list(
     client: &reqwest::Client,
-    id: &str,
+    api_key: &str,
     direct: &DirectProvider,
 ) -> Result<Vec<String>, String> {
     let path = match direct.protocol {
@@ -401,7 +428,7 @@ async fn fetch_model_list(
     };
     let url = super::helpers::build_upstream_url(&direct.base_url, path);
     let mut headers = HeaderMap::new();
-    super::auth::apply_provider_auth(&mut headers, &direct.effective_api_key(id), direct.protocol);
+    super::auth::apply_provider_auth(&mut headers, api_key, direct.protocol);
     if direct.protocol == Protocol::Anthropic {
         headers.insert(
             "anthropic-version",
@@ -775,27 +802,21 @@ mod tests {
 
     #[test]
     fn union_preserves_walk_then_upstream_order_with_dedup() {
-        let targets = vec![
-            (
-                "main".to_string(),
-                direct_proto(Protocol::OpenAI, "http://m"),
-            ),
-            (
-                "fallback".to_string(),
-                direct_proto(Protocol::OpenAI, "http://f"),
-            ),
-        ];
+        let ids = ["main", "fallback"];
         let c = cached(&[
             ("main", &["glm-4.7", "glm-4.8"]),
             ("fallback", &["glm-4.8", "qwen-3"]),
         ]);
         assert_eq!(
-            union_from_cache(&targets, &c),
+            union_from_cache(ids.into_iter(), &c),
             strs(&["glm-4.7", "glm-4.8", "qwen-3"])
         );
         // 无缓存的 provider 无贡献.
         let empty = cached(&[]);
-        assert_eq!(union_from_cache(&targets, &empty), Vec::<String>::new());
+        assert_eq!(
+            union_from_cache(ids.into_iter(), &empty),
+            Vec::<String>::new()
+        );
     }
 
     // ─── N1 过滤三边界 (brief §3.1) ─────────────────────────────────────
@@ -945,10 +966,13 @@ mod tests {
             .with_body(r#"{"data":[{"id":"m1"}]}"#)
             .create_async()
             .await;
-        let direct_provider = direct_proto(Protocol::OpenAI, &server.url());
+        let targets = vec![FetchTarget {
+            id: "p1".to_string(),
+            direct: direct_proto(Protocol::OpenAI, &server.url()),
+            api_key: String::new(), // direct_proto 无 key 配置, 预解析恒为空串
+        }];
         let cache = ModelListCache::new();
         let client = reqwest::Client::new();
-        let targets = vec![("p1".to_string(), direct_provider)];
 
         // 首查: 懒加载 fetch → m1.
         let s1 = cache.snapshot_refreshing(&client, &targets).await;
@@ -1011,10 +1035,11 @@ mod tests {
             .expect(1)
             .create_async()
             .await;
-        let targets = vec![(
-            "p1".to_string(),
-            direct_proto(Protocol::OpenAI, &server.url()),
-        )];
+        let targets = vec![FetchTarget {
+            id: "p1".to_string(),
+            direct: direct_proto(Protocol::OpenAI, &server.url()),
+            api_key: String::new(), // direct_proto 无 key 配置, 预解析恒为空串
+        }];
         let cache = ModelListCache::new();
         let client = reqwest::Client::new();
 
@@ -1056,7 +1081,7 @@ mod tests {
             std::future::pending::<()>().await;
         });
         let direct = direct_proto(Protocol::OpenAI, &format!("http://{addr}"));
-        let err = fetch_model_list(&reqwest::Client::new(), "p", &direct)
+        let err = fetch_model_list(&reqwest::Client::new(), "", &direct)
             .await
             .unwrap_err();
         assert_eq!(err, "timeout", "停滞上游必须被整体超时掐断");
@@ -1075,7 +1100,7 @@ mod tests {
             .create_async()
             .await;
         let direct = direct_proto(Protocol::OpenAI, &server.url());
-        let err = fetch_model_list(&reqwest::Client::new(), "p", &direct)
+        let err = fetch_model_list(&reqwest::Client::new(), "", &direct)
             .await
             .unwrap_err();
         assert!(err.contains("exceeds"), "超限 body 必须按失败处理: {err}");
@@ -1096,7 +1121,8 @@ mod tests {
             .await;
         let mut direct = direct_proto(Protocol::Anthropic, &server.url());
         direct.api_key = "sk-ant-test".into();
-        let models = fetch_model_list(&reqwest::Client::new(), "p", &direct)
+        // key = direct.api_key 直配值 (预解析结果).
+        let models = fetch_model_list(&reqwest::Client::new(), "sk-ant-test", &direct)
             .await
             .unwrap();
         assert_eq!(models, strs(&["c1"]));
