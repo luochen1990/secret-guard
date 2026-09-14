@@ -15,9 +15,10 @@
 //!
 //! 流程函数 (错误消息与原两份实现逐字相同, 仅 kind_label 参数化):
 //! - [`create_flow`]: into-entry → id 空则 Uuid (201 响应体以 `generated_id` 明示) →
-//!   validate 钩子 → 冲突检查 → upsert (Updated 视为并发冲突) → 查回 effective → 201.
+//!   validate 钩子 → 冲突检查 → upsert (Updated 视为并发冲突) → 查回 effective → 201
+//!   (查回落空 = 并发删除/禁用 → 409, 见 [`refetch_effective`]).
 //! - [`update_flow`]: 存在性检查 → build 钩子 → 填 id → validate 钩子 → upsert →
-//!   查回 → 200.
+//!   查回 → 200 (查回落空同上 → 409).
 //! - [`delete_flow`]: static 基线检查 (存在 → 409) → delete → 不存在 404 → 204.
 //! - [`decision_flow`]: static 检查 → set_decision → ack.
 
@@ -138,12 +139,25 @@ fn effective_contains_id(items: &[impl EffectiveItem], id: &str) -> bool {
 }
 
 /// upsert 后从 effective 视图按 id 查回最新状态 (upsert_dynamic 不返回 effective 视图,
-/// 需重新查一次给前端). 找不到时 panic (刚 upsert, 不应发生).
-fn effective_find_by_id<I: EffectiveItem>(items: Vec<I>, id: &str) -> I {
-    items
+/// 需重新查一次给前端).
+///
+/// 并发窗口: upsert 与 snapshot 之间条目可被另一请求 DELETE (dynamic-only) 或
+/// decision disabled (effective_snapshot 排除 disabled 项) → 查回落空 → 409
+/// (客户端重试即可), 而非 panic (ROB-*).
+fn refetch_effective<T: CrudTable>(
+    table: &T,
+    kind_label: &str,
+    saved_id: &str,
+) -> Result<T::Effective, ApiError> {
+    table
+        .snapshot()
         .into_iter()
-        .find(|x| x.effective_id() == id)
-        .expect("just upserted; effective view must contain it")
+        .find(|x| x.effective_id() == saved_id)
+        .ok_or_else(|| {
+            ApiError::conflict(format!(
+                "{kind_label} was concurrently disabled or deleted; please retry"
+            ))
+        })
 }
 
 /// "static 基线存在 → DELETE 拒绝 (409)" 的错误消息. secrets / providers 共享 (#156).
@@ -205,8 +219,9 @@ where
         )));
     }
     // upsert_dynamic 不返回 effective 视图, 这里再查一次给前端 (低成本, 创建场景罕见).
+    let effective = refetch_effective(table, kind_label, saved.entry_id())?;
     Ok(Created {
-        effective: effective_find_by_id(table.snapshot(), saved.entry_id()),
+        effective,
         generated_id,
     })
 }
@@ -232,7 +247,8 @@ pub(crate) fn update_flow<T: CrudTable>(
     entry.set_entry_id(id.to_string());
     validate(&mut entry)?;
     let (saved, _kind) = table.upsert(entry).map_err(ApiError::from_any)?;
-    Ok(effective_find_by_id(table.snapshot(), saved.entry_id()))
+    // 并发窗口语义同 create_flow (见 refetch_effective): 查回落空 → 409, 不 panic.
+    refetch_effective(table, kind_label, saved.entry_id())
 }
 
 /// delete 通用流程: static 基线检查 → delete → 不存在 404.
@@ -401,6 +417,119 @@ mod tests {
         assert!(
             !json.contains("sk-live"),
             "ack must not leak secret value: {json}"
+        );
+    }
+
+    // ─── 并发窗口 stub (upsert 后条目从 effective 视图消失) ────────────────────
+
+    /// stub 的 effective 视图项: 只需 id 访问 + Serialize (Created 的 bound).
+    #[derive(Serialize)]
+    struct StubEffective {
+        id: String,
+    }
+    impl EffectiveItem for StubEffective {
+        fn effective_id(&self) -> &str {
+            &self.id
+        }
+    }
+
+    /// stub 的写入 entry: 只需 id 读写.
+    #[derive(Default)]
+    struct StubEntry {
+        id: String,
+    }
+    impl EntryItem for StubEntry {
+        fn entry_id(&self) -> &str {
+            &self.id
+        }
+        fn set_entry_id(&mut self, id: String) {
+            self.id = id;
+        }
+    }
+
+    /// 并发窗口 stub: upsert 恒成功, 但 upsert 之后的 snapshot 查回落空 —
+    /// 模拟同 id 条目在 upsert 与 snapshot 之间被另一请求 DELETE (dynamic-only)
+    /// 或 PATCH decision disabled (effective_snapshot 排除 disabled 项).
+    ///
+    /// `visible_on_first_snapshot` 区分两个 flow 的前置:
+    /// - create_flow: 冲突检查时条目应不存在 (false);
+    /// - update_flow: 存在性检查时条目应存在 (true).
+    ///
+    /// 两者第 2 次 snapshot (upsert 后查回) 一律返回空.
+    struct VanishingTable {
+        visible_on_first_snapshot: bool,
+        snapshot_calls: std::cell::Cell<usize>,
+    }
+
+    impl CrudTable for VanishingTable {
+        type Entry = StubEntry;
+        type Effective = StubEffective;
+
+        fn snapshot(&self) -> Vec<Self::Effective> {
+            let n = self.snapshot_calls.get();
+            self.snapshot_calls.set(n + 1);
+            if n == 0 && self.visible_on_first_snapshot {
+                vec![StubEffective { id: "s1".into() }]
+            } else {
+                vec![]
+            }
+        }
+        fn upsert(&self, entry: Self::Entry) -> anyhow::Result<(Self::Entry, UpsertKind)> {
+            Ok((entry, UpsertKind::Inserted))
+        }
+        fn delete(&self, _id: &str) -> anyhow::Result<DeleteOutcome> {
+            Ok(DeleteOutcome::Deleted)
+        }
+        fn has_static(&self, _id: &str) -> bool {
+            false
+        }
+        fn set_decision(&self, _id: &str, _mode: OverrideMode) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// ROB-*: upsert 后条目被并发禁用/删除 → 查回落空, create_flow 必须返回
+    /// 409 conflict 而非 panic (单用户双开 tab 即可触发的真实窗口).
+    #[test]
+    fn create_flow_vanished_after_upsert_returns_conflict() {
+        let table = VanishingTable {
+            visible_on_first_snapshot: false,
+            snapshot_calls: std::cell::Cell::new(0),
+        };
+        let result = create_flow(&table, "secret", || Ok(StubEntry::default()), |_| Ok(()));
+        let err = result
+            .err()
+            .expect("vanished entry must surface as Err, not panic");
+        assert_eq!(err.status, axum::http::StatusCode::CONFLICT);
+        assert!(
+            err.message.contains("disabled or deleted"),
+            "conflict message must pin the vanished-after-upsert branch: {}",
+            err.message
+        );
+    }
+
+    /// 同上, update_flow 路径 (存在性检查通过 + upsert 成功后查回落空).
+    #[test]
+    fn update_flow_vanished_after_upsert_returns_conflict() {
+        let table = VanishingTable {
+            visible_on_first_snapshot: true,
+            snapshot_calls: std::cell::Cell::new(0),
+        };
+        let result = update_flow(
+            &table,
+            "secret",
+            "s1",
+            || Ok(StubEntry::default()),
+            |_| Ok(()),
+        );
+        let err = result
+            .err()
+            .expect("vanished entry must surface as Err, not panic");
+        assert_eq!(err.status, axum::http::StatusCode::CONFLICT);
+        assert!(
+            err.message.contains("disabled or deleted"),
+            "conflict message must pin the vanished-after-upsert branch: {}",
+            err.message
         );
     }
 }
