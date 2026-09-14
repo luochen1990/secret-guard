@@ -769,13 +769,15 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 **陈述**: server 层最外层 middleware 对所有请求校验 Host 白名单 (防 DNS rebinding
 — 单用户模式下 "同源策略兜底" 的假设被 rebinding 击穿); 对 `/api/*` 非安全方法
 校验 Origin / Sec-Fetch-Site (CSRF 纵深). 白名单语义 SSOT 见
-`src/server_host_guard.rs` 头部: 显式 port 必须匹配; 域名 Host 一律拒绝;
-loopback IP 字面量 / 配置 host / `localhost` / 空 host 放行; 配置 host 非
-loopback 时任意 IP 字面量放行.
+`src/server_host_guard.rs` 头部: 显式 port 必须匹配; **未声明**的域名 Host 一律
+拒绝; loopback IP 字面量 / 配置 host / `localhost` / 空 host 放行; 配置 host 非
+loopback 时任意 IP 字面量放行; `[server] allowed_domains` 声明的信任域名按名字
+精确匹配且端口宽松 (反代 + 域名部署形态).
 
 **Properties**:
 - `prop_host_whitelist_rejects_domain_host`: 域名形式 Host (rebinding 载体) 对任意路由 (`/`, `/api/*`) 返回 403; port 不匹配 / 畸形 Host 同样 403. 🔁→`host_guard_rejects_domain_host_on_all_routes` (`tests/integration.rs`) + `loopback_config_rejects_domain_and_foreign_ip` (`src/server_host_guard.rs`)
 - `prop_host_whitelist_allows_loopback`: loopback IP / localhost / 配置 host / 空 host (port 匹配) 放行; 配置 host 非 loopback (0.0.0.0 / LAN IP) 时任意 IP 字面量放行、域名仍拒. 🔁→`host_guard_allows_loopback_host` + `non_loopback_config_allows_any_ip_literal` + `portless_host_only_allowed_on_default_port`
+- `prop_allowed_domains_declared_pass_undeclared_reject`: 声明域名 (含无端口/$http_host 端口形态/大小写) 放行且 Origin 同享; 未声明域名 / 后缀拼接 / 前缀拼接仍拒; IP 字面量条目跳过 ≠ 放行. 🔁→`allowed_domains_lets_declared_domain_pass_and_others_reject` (`tests/integration.rs`) + `declared_domain_ignores_port_and_case` + `undeclared_domain_still_rejected_even_with_allowlist` + `allow_domains_skips_ip_literals_and_noise` + `origin_with_declared_domain_allowed` (`src/server_host_guard.rs`)
 - `prop_api_write_requires_browser_same_origin`: 非安全方法的 `/api/*` 请求带恶意 Origin / `Origin: null` / `Sec-Fetch-Site: cross-site` → 403; 两 header 缺席 (SDK 场景) 或同源值 (same-origin / same-site / none) 放行; GET 豁免. 🔁→`api_post_rejects_cross_origin` + `api_post_allows_missing_or_same_origin_headers` (`tests/integration.rs`)
 
 ### SEC-8 敏感落盘文件 owner-only (0600)

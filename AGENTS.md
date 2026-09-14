@@ -234,12 +234,15 @@ Redact 不应无必要地改变 request body 的字节内容, 避免破坏 LLM P
    监听 80 时合法 — 浏览器默认省略); host 部分放行: loopback IP 字面量
    (127.0.0.0/8, `[::1]`) / 配置 host / `localhost` / 空 host; 配置 host 非
    loopback (`0.0.0.0` / `::` / LAN IP — 本机非环回地址无法枚举) 时放行任意
-   **IP 字面量**; **域名形式 Host 一律拒绝** (本地工具, 合法访问不用域名;
-   生产 `serve()` 要求 host 可解析为 SocketAddr, 域名 host 启动即报错,
-   无配置项豁免)。
+   **IP 字面量**; **未声明的域名形式 Host 一律拒绝** — 例外:
+   `[server] allowed_domains` 显式声明的信任域名按名字精确匹配且**端口宽松**
+   (反代 + 域名部署形态, 攻击者的域名进不了这份用户手写的名单; 条目归一化
+   trim + 小写, 含 `:` 形态 (host:port/裸 IPv6)/IP 字面量/localhost/空串条目 WARN 跳过)。生产 `serve()` 要求
+   host 可解析为 SocketAddr, 域名 host 启动即报错 (仅 Host header 侧有白名单)。
    缺 Host header 放行 (rebinding 必带域名 Host)。
 2. **`/api/*` 非安全方法 (POST/PUT/DELETE/PATCH) 的 Origin / Sec-Fetch-Site 校验**:
-   带 Origin 则其 host:port 必须在白名单 (`Origin: null` 拒绝); 带
+   带 Origin 则其 host:port 必须在白名单 (`Origin: null` 拒绝;
+   `allowed_domains` 声明域名同享且端口宽松); 带
    Sec-Fetch-Site 则必须是 same-origin / same-site / none; 两者都缺放行
    (非浏览器 SDK)。GET/HEAD 等安全方法豁免 (读端泄漏由 SEC-1 守卫)。
    转发路径 (`/{o|a|g|l|r}/...`) 不做 Origin 校验 (SDK 场景, Host 校验已覆盖)。
@@ -404,6 +407,7 @@ Secret / Provider 的两种 value 来源 (`value`/`value_file`、`api_key`/`api_
 | `upstream_response_header_timeout_secs` | u64 | `60` | 上游响应头到达超时 (秒), **流式请求档** (TTFT 语义): 只对显式 `stream: true` 的请求生效. `0` = 无限. 超时记 504 record (防 `send().await` 永久阻塞). |
 | `upstream_nonstream_response_header_timeout_secs` | u64 | `300` | 上游响应头到达超时 (秒), **非流式请求档** (整响应语义): 对其余请求生效 (缺 `stream` 字段也算非流式). 非流式响应头要等整个响应生成完, 60s 对它是错误量纲 (#175 事故: 74k token 上下文被 9 连续 504 误杀). 语义 SSOT = "显式顶层布尔 true 才算流式" (实现: `proxy::helpers::requests_stream` + codec reader, 两处等价). |
 | `upstream_stream_idle_timeout_secs` | u64 | `120` | 流式 chunk 空闲超时 (秒). `0` = 无限. 防上游发完响应头后 body 卡住. |
+| `allowed_domains` | string[] | `[]` | SEC-7 Host guard 信任域名 (反代 + 域名部署). 命中按名字精确匹配且端口宽松; 未声明域名仍 403. 含 `:` 形态/IP 字面量/localhost/空串条目 WARN 跳过. |
 
 > 注: `[server]` / `[redact]` / `[auth]` 段仅在启动时读取一次, WebUI 修改不生效 (restart
 > 才生效). 这是为了保持转发核心路径的零运行时配置开销.
@@ -759,11 +763,12 @@ configFile (escape hatch, 互斥). 凭据注入 (LoadCredential / sops 直接路
   dead upstream 逐查询阻塞)。exact-only router 不 fetch (只返回别名, N6 gate)。
   缓存按 provider id 键控: WebUI 修改 provider 的 base_url/protocol 后, 最长 300s 内继续 serve
   旧上游的清单 (TTL 到期自然收敛)。
-- **域名形式 Host 一律 403 (SEC-7 Host guard)**: server 层对所有路由做 Host 白名单
-  校验 (防 DNS rebinding, 语义见 "Host / Origin 校验" 段), 域名 Host 拒绝。经反向
-  代理以域名 (如 `sg.example.com`) 暴露 secret-guard 的部署会被 403 — 需直接用
-  IP / localhost 访问, 或让反代把转发给上游的 Host 改写为 IP 形态。无配置项豁免
-  (本地工具的定位决策; 如需域名部署再评估白名单配置化)。
+- **未声明域名 Host 一律 403 (SEC-7 Host guard)**: server 层对所有路由做 Host 白名单
+  校验 (防 DNS rebinding, 语义见 "Host / Origin 校验" 段), 未声明的域名 Host 拒绝。
+  经反向代理以域名 (如 `sg.example.com`) 暴露 secret-guard 的部署, 需在
+  `[server] allowed_domains` 声明该域名 (反代保留原始 Host, 见
+  `docs/deployment-nixos.md` "HTTPS 反向代理" 段的推荐配置), 或直接用
+  IP / localhost 访问。声明域名端口宽松 (按名字精确匹配)。
 - **敏感落盘文件收紧为 0600 (SEC-8)**: state.toml / usage.sqlite3 (含 `-wal`/`-shm`
   侧车, writer 线程每批落库后收紧) / pricing.json 在 unix 下创建即 owner-only,
   启动加载时对旧版本残留文件 best-effort chmod 收紧 (helper

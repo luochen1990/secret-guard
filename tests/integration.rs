@@ -7969,7 +7969,11 @@ async fn prop_no_real_api_key_in_any_json_response() {
 
 /// SEC-7 专用 spawn: 最小 AppState + 带 Host guard 的 Router (与生产 serve()
 /// 同构 — guard 用实际监听 port 构造), 返回 (base_url, addr).
-async fn spawn_guarded(config_host: &str) -> (String, std::net::SocketAddr) {
+/// `allowed_domains`: `[server] allowed_domains` 的直通 (域名白名单).
+async fn spawn_guarded(
+    config_host: &str,
+    allowed_domains: &[&str],
+) -> (String, std::net::SocketAddr) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let state_path = tmp_state_path("sg-state-hostguard");
@@ -7995,7 +7999,8 @@ async fn spawn_guarded(config_host: &str) -> (String, std::net::SocketAddr) {
     };
     let app = server::build_router(
         proxy,
-        secret_guard::server_host_guard::HostGuard::new(config_host, addr.port()),
+        secret_guard::server_host_guard::HostGuard::new(config_host, addr.port())
+            .allow_domains(allowed_domains.iter().copied()),
     );
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
@@ -8021,7 +8026,7 @@ async fn raw_http_status(addr: std::net::SocketAddr, request: &str) -> u16 {
 
 #[tokio::test]
 async fn host_guard_rejects_domain_host_on_all_routes() {
-    let (_base, addr) = spawn_guarded("127.0.0.1").await;
+    let (_base, addr) = spawn_guarded("127.0.0.1", &[]).await;
     // rebinding 载体: 域名形式 Host 一律 403 — WebUI 根路径 / /api/* / 转发族.
     // guard 包裹所有 route 与 fallback service (axum Router::layer 语义), 先于
     // handler 执行 — /o/p 未配 provider 本应 404, 收到 403 即证明 guard 生效,
@@ -8051,7 +8056,7 @@ async fn host_guard_rejects_domain_host_on_all_routes() {
 
 #[tokio::test]
 async fn host_guard_allows_loopback_host() {
-    let (base, addr) = spawn_guarded("127.0.0.1").await;
+    let (base, addr) = spawn_guarded("127.0.0.1", &[]).await;
     let client = reqwest::Client::new();
     // reqwest 从 URL 派生 Host = 127.0.0.1:port → 放行
     let resp = client
@@ -8077,7 +8082,7 @@ async fn host_guard_allows_loopback_host() {
 
 #[tokio::test]
 async fn api_post_rejects_cross_origin() {
-    let (base, _addr) = spawn_guarded("127.0.0.1").await;
+    let (base, _addr) = spawn_guarded("127.0.0.1", &[]).await;
     let client = reqwest::Client::new();
     // 恶意 Origin (host 不在白名单) → 403
     let resp = client
@@ -8114,7 +8119,7 @@ async fn api_post_rejects_cross_origin() {
 
 #[tokio::test]
 async fn api_post_allows_missing_or_same_origin_headers() {
-    let (base, addr) = spawn_guarded("127.0.0.1").await;
+    let (base, addr) = spawn_guarded("127.0.0.1", &[]).await;
     let client = reqwest::Client::new();
     // 非浏览器 SDK: 两个 header 都缺 → 放行
     let resp = client
@@ -8153,12 +8158,58 @@ async fn api_post_allows_missing_or_same_origin_headers() {
     assert_eq!(resp.status(), 200, "GET must skip Origin check");
 }
 
+/// SEC-7 域名白名单 (`[server] allowed_domains`): 声明的信任域名放行 (端口宽松,
+/// 反代 + 域名部署形态), 未声明域名仍 403 (rebinding 攻击域名进不了名单)。
+#[tokio::test]
+async fn allowed_domains_lets_declared_domain_pass_and_others_reject() {
+    let (_base, addr) = spawn_guarded("127.0.0.1", &["sg.example.com", "sg.lan"]).await;
+    // 声明域名: 无端口 (反代 proxy_set_header Host $host 形态) → 放行
+    assert_eq!(
+        raw_http_status(
+            addr,
+            "GET /api/sessions HTTP/1.1\r\nHost: sg.example.com\r\nConnection: close\r\n\r\n"
+        )
+        .await,
+        200
+    );
+    // 声明域名: 保留外部端口 ($http_host 形态) → 放行
+    assert_eq!(
+        raw_http_status(
+            addr,
+            "GET /api/sessions HTTP/1.1\r\nHost: sg.lan:8443\r\nConnection: close\r\n\r\n"
+        )
+        .await,
+        200
+    );
+    // 未声明域名 (rebinding 载体) → 仍 403
+    assert_eq!(
+        raw_http_status(
+            addr,
+            "GET /api/sessions HTTP/1.1\r\nHost: attacker.com\r\nConnection: close\r\n\r\n"
+        )
+        .await,
+        403
+    );
+    // 声明域名的浏览器写: /api/* POST 带 https://sg.example.com Origin → 放行
+    // (reqwest 经 IP URL 连接, 手动覆盖 Origin 模拟反代后浏览器).
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{addr}/api/sync"))
+        .header("Host", "sg.example.com")
+        .header("Origin", "https://sg.example.com")
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "declared-domain Origin write must pass");
+}
+
 /// SEC-S1 (nosniff): WebUI `/` 与 `/api/*` 响应必须带 `x-content-type-options:
 /// nosniff` (NO_STORE header 组成员)。转发链响应**不带** — 由 FWD-1 byte-exact
 /// 契约 (fwd_* property 族) 隐式守卫, 网关不向上游响应追加 header。
 #[tokio::test]
 async fn webui_and_api_responses_carry_nosniff() {
-    let (base, _addr) = spawn_guarded("127.0.0.1").await;
+    let (base, _addr) = spawn_guarded("127.0.0.1", &[]).await;
     let client = reqwest::Client::new();
     for (label, url) in [
         ("webui html", format!("{base}/")),
@@ -8193,7 +8244,7 @@ async fn trace_span_omits_query_string() {
         .finish();
     let _guard = tracing::subscriber::set_default(subscriber);
 
-    let (base, _addr) = spawn_guarded("127.0.0.1").await;
+    let (base, _addr) = spawn_guarded("127.0.0.1", &[]).await;
     let client = reqwest::Client::new();
     let resp = client
         .get(format!("{base}/api/sessions?api-key=sk-probe-secret&x=1"))

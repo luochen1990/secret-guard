@@ -7,8 +7,8 @@
 //!
 //! 1. **Host 白名单** (所有请求, SEC-7 主体): 防 DNS rebinding — 默认单用户模式
 //!    (auth disabled) 下无认证, 攻击者页面把自己的域名 rebind 到 127.0.0.1 后,
-//!    浏览器发出的请求 Host 仍是攻击者域名; 域名形式 Host 一律拒绝即可击穿该攻击
-//!    (本项目是本地工具, 合法访问不会用域名)。
+//!    浏览器发出的请求 Host 仍是攻击者域名; 拒绝未声明的域名形式 Host 即可击穿
+//!    该攻击 (声明信任域名见 `[server] allowed_domains`, 白名单语义段 e 条)。
 //! 2. **`/api/*` 非安全方法的 Origin / Sec-Fetch-Site 校验**: auth enabled 时的
 //!    CSRF 纵深 (cookie session 不会被跨站伪造); auth disabled 时与 Host 校验
 //!    共同防 rebinding 写操作 (改 provider base_url / 关 redact decision)。
@@ -16,9 +16,11 @@
 //!
 //! # 白名单语义 (normative)
 //!
-//! 启动时由 `[server] host` + 实际监听 port 构建一次 (`HostGuard::new`):
+//! 启动时由 `[server] host` + 实际监听 port 构建一次 (`HostGuard::new`),
+//! 可选经 `.allow_domains(...)` 声明信任域名 (`[server] allowed_domains`):
 //! - **port 必须匹配**监听 port (无显式 port 的 Host 仅在监听 80 时合法 — 浏览器
-//!   对默认端口省略 port; 其余视为可疑拒绝)。
+//!   对默认端口省略 port; 其余视为可疑拒绝)。**例外**: 命中 `allowed_domains`
+//!   的域名端口宽松 (见 e 条)。
 //! - host 部分属于以下之一即放行:
 //!   a. 任意 **IP 字面量** (IPv4 / `[IPv6]`) 且是 loopback (`127.0.0.0/8`, `[::1]`);
 //!   b. 配置 host 为非 loopback (如 `0.0.0.0` / `::` / LAN IP) 时 — 任意 **IP 字面量**
@@ -26,9 +28,13 @@
 //!   c. 等于配置 host 或 `localhost` (大小写不敏感; 配置 host 是字符串白名单成员
 //!   — 生产 `serve()` 要求 host 可解析为 SocketAddr, 域名 host 启动即报错,
 //!   该"域名例外"仅对测试/程序化直接构造 `HostGuard` 的调用方可达);
-//!   d. 空 host (`":port"` 形态, HTTP/1.0 边缘)。
-//! - **域名形式 Host 一律拒绝** — 已知限制: 经反向代理以域名暴露的部署会被 403
-//!   (见根 AGENTS.md 已知限制)。
+//!   d. 空 host (`":port"` 形态, HTTP/1.0 边缘);
+//!   e. 命中 **`allowed_domains`** (用户显式声明的信任域名, 反代 + 域名部署形态):
+//!   按**名字**精确匹配 (大小写不敏感), **忽略端口** — 反代转发的 Host 形态
+//!   不可穷举 (`proxy_set_header Host $host` 无端口 / `$http_host` 保留外部端口)。
+//!   安全性: 攻击者的域名无法进入这份用户手写的名单 — 这正是"显式声明"
+//!   与"放行所有域名"的本质区别 (rebinding 攻击域名不在名单, 仍被拒)。
+//! - **未声明的域名形式 Host 一律拒绝** (SEC-7 主体: rebinding 载体是域名)。
 //!
 //! # 已知边界
 //!
@@ -59,6 +65,11 @@ pub struct HostGuard {
     /// 配置 host 为非 loopback (bind `0.0.0.0` / `::` / LAN IP) 时为 true:
     /// 额外接受任意 IP 字面量 host (本机非环回地址无法枚举)。
     allow_any_ip_literal: bool,
+    /// 用户显式声明的信任域名 (`[server] allowed_domains`, 小写):
+    /// 命中即放行且**端口宽松** — 反代链路的 Host 形态不可穷举
+    /// (`$host` 无端口 / `$http_host` 保留外部端口)。
+    /// 攻击者的域名进不了这份名单, 这是与"放行所有域名"的本质区别。
+    domain_allowlist: HashSet<String>,
 }
 
 impl HostGuard {
@@ -71,7 +82,34 @@ impl HostGuard {
             port,
             allowed_hosts: HashSet::from([configured, "localhost".to_string()]),
             allow_any_ip_literal: !configured_loopback,
+            domain_allowlist: HashSet::new(),
         }
+    }
+
+    /// 声明信任的域名 (builder, `[server] allowed_domains` 的消费入口)。
+    ///
+    /// 归一化: trim + 小写; **跳过**对域名白名单无意义的条目并 WARN —
+    /// 含 `:` 的形态 (host:port / 裸 IPv6)、IP 字面量 (走 `host_allowed`
+    /// 专门分支)、`localhost` (已在基础白名单)、空串。
+    /// 跳过 ≠ 放行: 名单里写 IP / host:port 不会让该目标被放行。
+    pub fn allow_domains<I, S>(mut self, domains: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for raw in domains {
+            let d = raw.as_ref().trim().to_ascii_lowercase();
+            if d.is_empty() || d.contains(':') || d == "localhost" || parse_ip_literal(&d).is_some()
+            {
+                tracing::warn!(
+                    domain = %d,
+                    "allowed_domains entry skipped (host:port / IP literal / localhost / empty is meaningless here)"
+                );
+                continue;
+            }
+            self.domain_allowlist.insert(d);
+        }
+        self
     }
 
     /// `host[:port]` 形态的 authority 是否在白名单内 (Host header / Origin 共用)。
@@ -79,6 +117,13 @@ impl HostGuard {
         let Some((host, port)) = split_authority(authority) else {
             return false; // 畸形 authority (如 port 非 u16) — 保守拒绝
         };
+        // 用户声明域名: 按名字匹配, 端口宽松 (反代转发形态不可穷举, 见字段注释)。
+        // is_empty 前置: 默认空名单时热路径零分配 (Host 校验每请求都跑)。
+        if !self.domain_allowlist.is_empty()
+            && self.domain_allowlist.contains(&host.to_ascii_lowercase())
+        {
+            return true;
+        }
         match port {
             Some(p) if p != self.port => false,
             // 无显式 port: 仅监听 80 (浏览器默认省略) 时接受
@@ -305,5 +350,57 @@ mod tests {
         assert!(!is_api_path("/apisync")); // 前缀但不属于命名空间
         assert!(!is_api_path("/o/x/v1"));
         assert!(!is_api_path("/"));
+    }
+
+    // ─── allowed_domains (域名白名单, 反代 + 域名部署形态) ─────────────────
+
+    #[test]
+    fn declared_domain_ignores_port_and_case() {
+        // 反代链路 Host 形态不可穷举 (proxy_set_header Host $host 无端口 /
+        // $http_host 保留外部端口) — 名单内域名按**名字**匹配, 端口宽松.
+        let g = HostGuard::new("127.0.0.1", PORT).allow_domains(["sg.example.com"]);
+        assert!(g.authority_allowed("sg.example.com")); // 无端口 (反代 $host)
+        assert!(g.authority_allowed(&format!("sg.example.com:{PORT}")));
+        assert!(g.authority_allowed(&format!("sg.example.com:{}", PORT + 1))); // 外部端口
+        assert!(g.authority_allowed(&format!("SG.Example.COM:{PORT}"))); // 大小写
+    }
+
+    #[test]
+    fn undeclared_domain_still_rejected_even_with_allowlist() {
+        // 域名白名单不弱化对未声明域名的拒绝 (rebinding 攻击域名进不了名单).
+        let g = HostGuard::new("127.0.0.1", PORT).allow_domains(["sg.example.com"]);
+        assert!(!g.authority_allowed("attacker.com"));
+        assert!(!g.authority_allowed(&format!("attacker.com:{PORT}")));
+        assert!(!g.authority_allowed("sg.example.com.evil.io")); // 后缀拼接不是子串匹配
+        assert!(!g.authority_allowed("not-sg.example.com")); // 前缀拼接
+    }
+
+    #[test]
+    fn allow_domains_skips_ip_literals_and_noise() {
+        // IP 字面量 / host:port / 裸 IPv6 / localhost / 空串对域名白名单无意义
+        // (IP 走专门分支, 域名不含 ':') — 归一化时跳过, 不进集合.
+        let g = HostGuard::new("127.0.0.1", PORT).allow_domains([
+            "SG.Example.COM", // 归一化为小写
+            "  sg.lan  ",     // trim
+            "10.0.0.5",       // IP 字面量 → 跳过
+            "sg.lan:8443",    // host:port 形态 → 跳过 (合法域名不含 ':')
+            "::1",            // 裸 IPv6 (无括号) → 含 ':' 跳过
+            "localhost",      // 已在基础白名单 → 跳过
+            "",               // 空串 → 跳过
+        ]);
+        assert!(g.authority_allowed(&format!("sg.example.com:{PORT}")));
+        assert!(g.authority_allowed(&format!("sg.lan:{PORT}")));
+        // IP 条目被跳过 ≠ IP 被放行 (loopback 配置下非 loopback IP 仍拒).
+        assert!(!g.authority_allowed(&format!("10.0.0.5:{PORT}")));
+    }
+
+    #[test]
+    fn origin_with_declared_domain_allowed() {
+        // 浏览器经 https://sg.example.com 访问 WebUI: Origin 域名在名单内 →
+        // /api/* 非安全方法放行 (与 Host 校验共享 authority 判定).
+        let g = HostGuard::new("127.0.0.1", PORT).allow_domains(["sg.example.com"]);
+        assert!(g.origin_allowed("https://sg.example.com"));
+        assert!(g.origin_allowed("https://sg.example.com:8443"));
+        assert!(!g.origin_allowed("https://attacker.com"));
     }
 }

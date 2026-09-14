@@ -135,11 +135,25 @@ Traefik) 终止 TLS, 浏览器与反代之间虽然是 HTTPS, 但 `secret-guard`
 **当前缓解**: 反向代理配置 HTTP→HTTPS 301 重定向 (nginx `return 301 https://$host$request_uri`),
 让浏览器无法通过 HTTP 访问 origin.
 
-**Host guard 注意 (SEC-7)**: 反向代理必须把转发给 `secret-guard` 的 `Host` header
-**改写为 IP/loopback 形态** (如 nginx `proxy_set_header Host 127.0.0.1:<port>;`).
-Host guard (`src/server_host_guard.rs`) 拒绝域名形式的 Host — 这是防 DNS rebinding
-的有意设计 (本地工具定位, 域名 Host 一律 403); 反代默认透传客户端域名 Host 会被拒.
-`X-Forwarded-Proto` 等头不受影响.
+**Host guard 推荐姿势 (SEC-7)**: 反向代理**显式保留原始域名 Host** 并在
+secret-guard 声明信任该域名 (NixOS 选项 `services.secret-guard.allowedDomains`,
+手写 toml 形态 `[server] allowed_domains = [...]`):
+
+```nix
+services.secret-guard.allowedDomains = [ "sg.example.com" ];
+```
+
+```nginx
+# 注意: nginx 默认 proxy_set_header Host $proxy_host (即 proxy_pass 的 IP:port),
+# 不保留客户端域名 — 必须显式声明:
+proxy_set_header Host $host;
+```
+
+声明域名按**名字**精确匹配且端口宽松 (反代转发的 Host 形态不可穷举); 未声明的
+域名形式 Host 一律 403 — 这是防 DNS rebinding 的设计 (攻击者的域名进不了这份
+你手写的名单), 见 `src/server_host_guard.rs` 头部白名单语义。
+备选 (不推荐): 反代把 Host 改写为 IP 形态 (`proxy_set_header Host 127.0.0.1:18787;`)
+也可放行, 但浏览器侧 OIDC redirect / cookie 域语义可能受影响。
 
 **根治方案 (后续工作)**: 给 `build_session_layer` 加配置开关 (例如 `[auth] secure_cookie = true`),
 或从 `X-Forwarded-Proto` header 动态推断. 当前硬编码 `false` 是 MVP 的简化, 见

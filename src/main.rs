@@ -70,6 +70,7 @@ async fn main() -> Result<()> {
         on_probe_exhausted,
         upstream_timeouts,
         static_cfg.usage,
+        static_cfg.server.allowed_domains,
     )
     .await
 }

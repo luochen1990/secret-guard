@@ -73,6 +73,7 @@ value = "ghp_0123456789abcdefghijklmnopqrstuvwxyz"
 | `upstream_response_header_timeout_secs` | u64 | `60` | 等上游响应头到达的超时 (秒), **流式请求档**: 只对显式 `stream: true` 的请求生效 (流式响应头在首 token 生成后即返回, 60s 覆盖大上下文 prefill). 超时返回 504. `0` = 不限时. |
 | `upstream_nonstream_response_header_timeout_secs` | u64 | `300` | 等上游响应头到达的超时 (秒), **非流式请求档**: 对其余所有请求生效 (缺 `stream` 字段也算非流式). 非流式响应头要等**整个响应生成完**才返回, 大上下文 (几十 k token) 下总时长轻松超 60s, 默认放宽到 300s. 超时返回 504. `0` = 不限时. |
 | `upstream_stream_idle_timeout_secs` | u64 | `120` | 流式响应两个 chunk 之间的最大空闲 (秒). `0` = 不限时. |
+| `allowed_domains` | string[] | `[]` | SEC-7 Host guard 信任域名, **反代 + 域名部署形态用**. 经反向代理以域名 (如 `sg.example.com`) 暴露 secret-guard 时, 反代保留原始 Host (`proxy_set_header Host $host`) 并在此声明该域名 — 命中按名字精确匹配 (大小写不敏感) 且**端口宽松** (反代转发的 Host 形态不可穷举). 未声明的域名形式 Host 一律 403 (防 DNS rebinding: 攻击者的域名进不了这份你手写的名单). 含 `:` 的形态 (host:port / 裸 IPv6)、IP 字面量、`localhost`、空串条目无意义, 启动时 WARN 跳过. 示例: `allowed_domains = ["sg.example.com"]` |
 
 ## `[redact]` — 脱敏行为 (改动需重启)
 

@@ -73,6 +73,9 @@
   toml = render baseArgs;
   parsed = builtins.fromTOML toml;
   byId = builtins.listToAttrs (map (p: lib.nameValuePair p.id p) parsed.providers);
+  # allowed_domains 非字母序输入 → 验证输出按字典序 (确定性)
+  domainsToml = render (baseArgs // {allowedDomains = ["z.lan" "a.example.com"];});
+  domainsParsed = builtins.fromTOML domainsToml;
 
   # eval 失败/成功断言: 契约核心是 "违规 → eval 失败 / 合法 → eval 通过"
   fails = e: !(builtins.tryEval e).success;
@@ -96,6 +99,14 @@
     {
       name = "结构 round-trip: 2 个 provider, 字段与上游 serde 吻合";
       ok = builtins.length parsed.providers == 2 && byId.b-upstream.kind == "direct" && byId.a-router.kind == "router";
+    }
+    {
+      name = "SEC-7: allowedDomains 默认不渲染 (空 = 拒绝所有域名, serde default 兜底)";
+      ok = !(parsed.server ? allowed_domains);
+    }
+    {
+      name = "SEC-7: allowedDomains 非空渲染且按字典序 (确定性)";
+      ok = domainsParsed.server.allowed_domains == ["a.example.com" "z.lan"];
     }
     {
       # fromTOML 保留文档序 — 消费者 (上游 Rust serde) 看到的正是这个序

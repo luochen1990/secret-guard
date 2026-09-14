@@ -93,7 +93,7 @@
 
   renderedConfig = pkgs.writeText "secret-guard.toml" (import ./render.nix {
     inherit lib;
-    inherit (cfg) host port providers;
+    inherit (cfg) host port providers allowedDomains;
     upstreamTimeouts = timeoutsArg;
     secretsEntries = cfg.secrets.entries;
     auth = authArg;
@@ -107,8 +107,8 @@
   resolvedConfigFile =
     if cfg.configFile != null
     then
-      lib.throwIf (structuredUsed || timeoutsUsed)
-      "services.secret-guard: configFile 与结构化选项 (providers/secrets.entries/auth/usage/upstreamTimeouts) 互斥, 二选一 — 手写 toml 是完全接管, 与自动 render 会静默竞争"
+      lib.throwIf (structuredUsed || timeoutsUsed || cfg.allowedDomains != [])
+      "services.secret-guard: configFile 与结构化选项 (providers/secrets.entries/auth/usage/upstreamTimeouts/allowedDomains) 互斥, 二选一 — 手写 toml 是完全接管, 与自动 render 会静默竞争"
       cfg.configFile
     else if structuredUsed
     then renderedConfig
@@ -141,6 +141,20 @@ in {
       type = lib.types.port;
       default = 18787;
       description = "监听端口.";
+    };
+
+    allowedDomains = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [];
+      description = ''
+        SEC-7 Host guard 信任域名 ([server] allowed_domains), 反代 + 域名部署形态:
+        经反向代理以域名 (如 sg.example.com) 暴露 secret-guard 时, 反代保留原始
+        Host (proxy_set_header Host $host) 并在此声明该域名, 域名 Host/Origin 即放行
+        (端口宽松). 未声明的域名形式 Host 一律 403 (防 DNS rebinding — 攻击者的
+        域名进不了这份用户手写的名单). 条目归一化: trim + 小写; 含 : 的形态
+        (host:port / 裸 IPv6) / IP 字面量 / localhost / 空串条目无意义, 启动时
+        WARN 跳过. 空 (默认) = 拒绝所有域名.
+      '';
     };
 
     configFile = lib.mkOption {

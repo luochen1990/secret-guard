@@ -310,6 +310,7 @@ pub async fn serve(
     on_probe_exhausted: crate::config::OnProbeExhausted,
     upstream_timeouts: crate::config::UpstreamTimeouts,
     usage_config: crate::config::UsageConfig,
+    allowed_domains: Vec<String>,
 ) -> anyhow::Result<()> {
     auth_config.validate().map_err(|e| anyhow::anyhow!(e))?;
 
@@ -418,7 +419,7 @@ pub async fn serve(
         .local_addr()
         .expect("bound listener has addr")
         .port();
-    let host_guard = HostGuard::new(host, listen_port);
+    let host_guard = HostGuard::new(host, listen_port).allow_domains(&allowed_domains);
 
     // 条件化: 启用认证时构造 AuthStack, 否则单用户模式.
     let app = if auth_config.enabled {

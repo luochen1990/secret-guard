@@ -245,6 +245,17 @@ pub struct ServerConfig {
     /// reasoning model "思考"阶段会有较长静默但通常有心跳 chunk. 超过此间隔
     /// 视为上游 hang, 标记 record 为 incomplete + 返回客户端错误.
     pub upstream_stream_idle_timeout_secs: u64,
+    /// 显式声明信任的**域名** (SEC-7 Host guard 白名单, 反代 + 域名部署形态).
+    ///
+    /// 命中名单的 Host/Origin 域名放行且端口宽松 (反代转发的 Host 形态不可穷举);
+    /// 未声明的域名形式 Host 一律 403 (防 DNS rebinding — 攻击者域名进不了这份
+    /// 用户手写的名单). 条目归一化: trim + 小写; 含 `:` 的形态 (host:port /
+    /// 裸 IPv6)、IP 字面量、`localhost`、空串条目无意义, 启动时 WARN 跳过
+    /// (跳过 ≠ 放行).
+    ///
+    /// 典型用法 (HTTPS 反代): 反代保留原始 Host (`proxy_set_header Host $host`),
+    /// 此处配 `allowed_domains = ["sg.example.com"]`.
+    pub allowed_domains: Vec<String>,
 }
 
 /// 从 ServerConfig 派生的、已解析为 `Duration` (或 None) 的超时集合.
@@ -310,6 +321,8 @@ impl Default for ServerConfig {
             upstream_nonstream_response_header_timeout_secs: 300,
             // 120s: 流式 chunk 空闲. 正常 < 1s, reasoning 静默可能较长, 120s 宽松.
             upstream_stream_idle_timeout_secs: 120,
+            // 空: 默认拒绝所有域名 Host (SEC-7). 见字段 doc 注释.
+            allowed_domains: Vec::new(),
         }
     }
 }
@@ -361,6 +374,7 @@ const KNOWN_FIELDS: &[(&str, &[&str])] = &[
             "upstream_response_header_timeout_secs",
             "upstream_nonstream_response_header_timeout_secs",
             "upstream_stream_idle_timeout_secs",
+            "allowed_domains",
         ],
     ),
     // Config::providers (Vec<Provider>, 平铺 [[providers]])

@@ -24,7 +24,9 @@
 #     覆盖) + 上游超时四项 upstreamTimeouts{connectTimeoutSecs /
 #     responseHeaderTimeoutSecs / nonstreamResponseHeaderTimeoutSecs /
 #     streamIdleTimeoutSecs} → snake_case *_secs (null = 全默认 → 不渲染,
-#     serde default 兜底; 非 null = 全量渲染四行; 0 = 无限)
+#     serde default 兜底; 非 null = 全量渲染四行; 0 = 无限) +
+#     allowedDomains → allowed_domains (空 = 不渲染 = 拒绝所有域名 Host,
+#     SEC-7; 非空 = 渲染字符串数组, 排序保确定性)
 #
 # eval 期校验单点收敛 (历史原型散在 render 与 checkToml 两处, 此处合一):
 #   - 语法: 生成物 fromTOML round-trip, 非法 TOML 在 eval 期即 throw
@@ -57,6 +59,9 @@
   #    nonstreamResponseHeaderTimeoutSecs, streamIdleTimeoutSecs } 全量渲染
   # (见上方 schema 注释; 0 = 无限)
   upstreamTimeouts ? null,
+  # [server] allowed_domains (SEC-7 域名白名单): [] = 不渲染 (serde default
+  # 空 = 拒绝所有域名 Host); 非空 = 渲染为 toml 字符串数组 (反代 + 域名部署形态)
+  allowedDomains ? [],
   # redact 段 ([[secrets.entries]]): [{ id, category ? "apikey", valueFile }]
   secretsEntries ? [],
   # null = 跳过 [usage] 段; 否则 { enable, retentionDays, pricingUrl,
@@ -363,6 +368,12 @@
     "upstream_stream_idle_timeout_secs = ${toString upstreamTimeouts.streamIdleTimeoutSecs}"
   ];
 
+  # SEC-7 域名白名单: 非空才渲染 (空 = serde default 兜底 = 拒绝所有域名).
+  allowedDomainsLines = lib.optionals (allowedDomains != []) [
+    "# SEC-7 Host guard 信任域名 (反代 + 域名部署; 未声明的域名 Host 一律 403)."
+    "allowed_domains = [${lib.concatMapStringsSep ", " q (lib.sort (a: b: a < b) allowedDomains)}]"
+  ];
+
   serverSection =
     lib.concatStringsSep "\n" (
       [
@@ -372,6 +383,7 @@
         "port = ${toString port}"
       ]
       ++ timeoutLines
+      ++ allowedDomainsLines
     );
 
   providerIds = lib.sort (a: b: a < b) (builtins.attrNames providers);

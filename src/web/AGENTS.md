@@ -149,7 +149,7 @@ selected 游标 = `(session_id, latest_round, response_length)`:
 
 - GET 永不返回 secret 的 `value` / provider 的 `api_key` 真实值 (用 `mask_value` 占位).
 - 写操作由本地监听 (默认 127.0.0.1) + server 层 Host/Origin guard (SEC-7,
-  `src/server_host_guard.rs` — 防 DNS rebinding, 域名 Host 一律 403;
+  `src/server_host_guard.rs` — 防 DNS rebinding, 未声明域名 Host 一律 403;
   `/api/*` 写另校验 Origin/Sec-Fetch-Site) 保护。"同源策略兜底" 的旧假设已被
   rebinding 攻破, 不再单独依赖.
 - 内部错误细节不通过响应体返回, 仅进 tracing.
