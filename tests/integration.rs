@@ -1879,15 +1879,15 @@ async fn cross_protocol_streaming_redact_restores_mock_no_leak() {
     let body = format!(
         r#"{{"model":"gpt-4o","stream":true,"messages":[{{"role":"user","content":"use {real_secret} now"}}]}}"#
     );
-    let resp = reqwest::Client::new()
-        .post(format!("{proxy_url}/o/an-main/v1/chat/completions"))
-        .header("content-type", "application/json")
-        .body(body)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    let text = resp.text().await.unwrap();
+    let (status, text, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/an-main/v1/chat/completions",
+        &body,
+        &[("content-type", "application/json")],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
     // 客户端看到 real secret (响应侧 mock→real restore).
     assert!(
         text.contains(real_secret),

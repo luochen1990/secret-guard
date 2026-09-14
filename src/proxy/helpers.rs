@@ -83,22 +83,22 @@ fn filter_headers(src: &HeaderMap, drop_fn: impl Fn(&str) -> bool) -> HeaderMap 
     out
 }
 
-/// content-type 是否表示流式响应 (SSE / NDJSON)?
+/// content-type 是否表示流式响应 (SSE / NDJSON)? 子集关系以代码表达:
+/// `is_streaming ≡ is_sse ∨ ndjson` — 两判型不会各自漂移.
 pub(super) fn is_streaming(content_type: &str) -> bool {
-    let ct = content_type.split(';').next().unwrap_or("").trim();
-    ct.eq_ignore_ascii_case("text/event-stream") || ct.eq_ignore_ascii_case("application/x-ndjson")
+    is_sse(content_type) || media_type(content_type).eq_ignore_ascii_case("application/x-ndjson")
 }
 
 /// content-type 是否为 SSE (text/event-stream)? 比 [`is_streaming`] 更窄 —
 /// StreamTranslate 管道只会重组 SSE 帧 (空行分帧), ndjson 进翻译会产出空流,
 /// 流式翻译分支的判型用本函数.
 pub(super) fn is_sse(content_type: &str) -> bool {
-    content_type
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .eq_ignore_ascii_case("text/event-stream")
+    media_type(content_type).eq_ignore_ascii_case("text/event-stream")
+}
+
+/// 剥离 content-type 的参数 (`; charset=...`) 取裸 media type (小写比较由调用方做).
+fn media_type(content_type: &str) -> &str {
+    content_type.split(';').next().unwrap_or("").trim()
 }
 
 /// 从响应 headers 提取 content-type (缺失 / 非法 UTF-8 → 空串, 调用方判型自然落

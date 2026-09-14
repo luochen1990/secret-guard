@@ -916,10 +916,8 @@ fn run_cross_proto_restore(
 /// 断言跨协议 + restore 路径的语义保真 (FWD-1 流式弱化形式 × FWD-3 跨协议):
 ///
 /// 1. **no mock leak** (安全核心): 客户端字节中不含 mock 字符串.
-/// 2. **content fidelity**: 客户端 text 拼接 == 上游拼接 `.replace(mock, real)`.
-/// 3. **tool input fidelity**: 客户端 input_json 拼接 == 上游拼接 `.replace(mock, real)`.
-/// 4. **tool_use 身份保真**: (id, name) 对按序相等 (FWD-3 建模范围).
-/// 5. **usage output fidelity**: output_tokens 透传.
+/// 2. content / tool input / tool_use 身份 / usage 保真: 期望值经 `.replace(mock, real)`
+///    (共享断言核心 [`assert_cross_proto_content_fidelity_with`], expect = restore 映射).
 ///
 /// 与同协议版 ([`assert_streaming_restore_fidelity`]) 的差异: **不比较 reasoning**
 /// — ReasoningContent 跨协议显式丢弃 (STR-6 裁决: thinking signature 无法合法合成),
@@ -939,42 +937,57 @@ fn assert_cross_proto_restore_fidelity(
         client_str,
     );
 
-    // 2. content fidelity.
+    // 2-5. 共享断言集, 期望值经 mock→real 映射.
+    assert_cross_proto_content_fidelity_with(upstream, client, |s| s.replace(mock, real))
+}
+
+/// 跨协议保真断言集的共享核心 (content / tool input / tool_use 身份 / usage 四维,
+/// 纯翻译与 restore 两版 property 必须协同演化的 SSOT).
+///
+/// `expect`: 期望值的字符串映射 — 纯翻译版传 identity ([`str::to_string`]),
+/// restore 版传 `.replace(mock, real)`.
+fn assert_cross_proto_content_fidelity_with(
+    upstream: &[u8],
+    client: &[u8],
+    expect: impl Fn(&str) -> String,
+) -> Result<(), proptest::test_runner::TestCaseError> {
+    // content fidelity (跨协议文本透传).
     let upstream_text = collect_text_deltas(upstream);
     let client_text = collect_text_deltas(client);
     prop_assert_eq!(
         client_text,
-        upstream_text.replace(mock, real),
-        "跨协议流式 content fidelity 违反\nmock={:?}, real={:?}\nupstream={:?}\nclient={:?}",
-        mock,
-        real,
+        expect(&upstream_text),
+        "STR-1×FWD-3 流式 content fidelity 违反 (跨协议文本损失)\nupstream={:?}\nclient={:?}",
         String::from_utf8_lossy(upstream),
-        client_str,
+        String::from_utf8_lossy(client),
     );
 
-    // 3. tool input fidelity.
+    // tool_use id/name fidelity (跨协议 tool_use 身份透传).
+    // 守卫 FWD-3 建模范围内的 tool_use (id + name + input) 完整保留, 不仅是 input JSON.
+    let upstream_tools = collect_tool_use_ids_names(upstream);
+    let client_tools = collect_tool_use_ids_names(client);
+    prop_assert_eq!(
+        client_tools,
+        upstream_tools,
+        "STR-1×FWD-3 流式 tool_use id/name fidelity 违反 (跨协议 tool 身份损失)"
+    );
+
+    // tool input fidelity (跨协议 tool arguments 透传).
     let upstream_json = collect_input_json_deltas(upstream);
     let client_json = collect_input_json_deltas(client);
     prop_assert_eq!(
         client_json,
-        upstream_json.replace(mock, real),
-        "跨协议流式 tool input fidelity 违反\nmock={:?}, real={:?}",
-        mock,
-        real,
+        expect(&upstream_json),
+        "STR-1×FWD-3 流式 tool input fidelity 违反 (跨协议 tool arguments 损失)",
     );
 
-    // 4. tool_use 身份保真 (id/name).
+    // usage output_tokens fidelity (terminal usage 透传).
+    let upstream_usage = collect_usage_output_tokens(upstream);
+    let client_usage = collect_usage_output_tokens(client);
     prop_assert_eq!(
-        collect_tool_use_ids_names(client),
-        collect_tool_use_ids_names(upstream),
-        "跨协议流式 tool_use id/name fidelity 违反",
-    );
-
-    // 5. usage output_tokens fidelity.
-    prop_assert_eq!(
-        collect_usage_output_tokens(client),
-        collect_usage_output_tokens(upstream),
-        "跨协议流式 usage.output_tokens fidelity 违反",
+        client_usage,
+        upstream_usage,
+        "STR-1×FWD-3 流式 usage.output_tokens fidelity 违反",
     );
     Ok(())
 }
@@ -986,7 +999,8 @@ fn assert_cross_proto_restore_fidelity(
 /// 3. usage output fidelity: output_tokens 透传.
 ///
 /// 不比较 id/created/model (跨协议时 StreamTranslate 会剥离 foreign 身份, 由
-/// ingress writer 合成本地格式). 不断言 "no mock leak" — 跨协议模式不做 restore.
+/// ingress writer 合成本地格式). 不断言 "no mock leak" — 纯翻译模式不做 restore
+/// (restore 版见 [`assert_cross_proto_restore_fidelity`]).
 ///
 /// 不需要协议参数: `collect_text_deltas` / `collect_input_json_deltas` /
 /// `collect_usage_output_tokens` 都是协议无关的 SSE 帧扫描器, 对任意协议的 SSE 都能工作.
@@ -994,45 +1008,8 @@ fn assert_cross_proto_streaming_content_fidelity(
     upstream_sse: &[u8],
     client_sse: &[u8],
 ) -> Result<(), proptest::test_runner::TestCaseError> {
-    // content fidelity (跨协议文本透传).
-    let upstream_text = collect_text_deltas(upstream_sse);
-    let client_text = collect_text_deltas(client_sse);
-    prop_assert_eq!(
-        client_text,
-        upstream_text,
-        "STR-1×FWD-3 流式 content fidelity 违反 (跨协议文本损失)\nupstream={:?}\nclient={:?}",
-        String::from_utf8_lossy(upstream_sse),
-        String::from_utf8_lossy(client_sse),
-    );
-
-    // tool_use id/name fidelity (跨协议 tool_use 身份透传).
-    // 守卫 FWD-3 建模范围内的 tool_use (id + name + input) 完整保留, 不仅是 input JSON.
-    let upstream_tools = collect_tool_use_ids_names(upstream_sse);
-    let client_tools = collect_tool_use_ids_names(client_sse);
-    prop_assert_eq!(
-        client_tools,
-        upstream_tools,
-        "STR-1×FWD-3 流式 tool_use id/name fidelity 违反 (跨协议 tool 身份损失)"
-    );
-
-    // tool input fidelity (跨协议 tool arguments 透传).
-    let upstream_json = collect_input_json_deltas(upstream_sse);
-    let client_json = collect_input_json_deltas(client_sse);
-    prop_assert_eq!(
-        client_json,
-        upstream_json,
-        "STR-1×FWD-3 流式 tool input fidelity 违反 (跨协议 tool arguments 损失)",
-    );
-
-    // usage output_tokens fidelity (terminal usage 透传).
-    let upstream_usage = collect_usage_output_tokens(upstream_sse);
-    let client_usage = collect_usage_output_tokens(client_sse);
-    prop_assert_eq!(
-        client_usage,
-        upstream_usage,
-        "STR-1×FWD-3 流式 usage.output_tokens fidelity 违反",
-    );
-    Ok(())
+    // 纯翻译: 期望值恒等映射 (identity).
+    assert_cross_proto_content_fidelity_with(upstream_sse, client_sse, str::to_string)
 }
 
 /// 从 SSE 字节流中收集所有 tool_use 的 (id, name) 对, 按出现顺序.

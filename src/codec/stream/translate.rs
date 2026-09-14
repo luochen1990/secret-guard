@@ -230,6 +230,13 @@ impl StreamTranslate {
     /// 可能还在 buffer 中). flush 出来的内容包装为对应 kind 的 BlockDelta emit.
     /// 跨协议模式下 deferred MessageStop 的残留也在此 flush (上游未发 post-stop
     /// usage delta 的常态路径).
+    ///
+    /// **顺序边界 (病态上游)**: 若 pending_stop 已被 post-stop usage delta 提前 flush,
+    /// 此处 `emit_flush_all` 的残余 block 尾部会落在已发出的 message_stop **之后**.
+    /// 该形态仅当 "block 未闭合 + MessageStop + post-stop 非零 usage delta" 三者同时
+    /// 成立时可达 — OpenAI reader 在 finish_reason 无条件 close_open_blocks,
+    /// Anthropic egress 无 post-stop usage 形态, 两个真实 reader 都产不出该组合,
+    /// 仅手工构造的病态 wire 可达 (同协议模式无此不对称: MessageStop 处先 flush_all).
     pub fn finish(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
         self.emit_flush_all(&mut out);

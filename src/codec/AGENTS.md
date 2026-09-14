@@ -31,6 +31,10 @@
 > 原文合法合成, writer 跳过 (返回 None) 而非发明非法 wire 形态. 流式路径由
 > StreamTranslate 的跳过 block 配对过滤兜底 (writer 跳过 BlockStart 的 index, 其
 > BlockStop 一并跳过, 不产生未配对的 content_block_stop), 见 `stream/translate.rs`.
+> 已知次生损失: 跨协议流式跳过 reasoning block 后, Anthropic ingress 客户端看到的
+> block index 序列出现**空洞** (如首个 content_block_start 是 index=1 而非 0) —
+> Anthropic 官方流恒从 0 连续递增, 按 index 做 map key 的 SDK 无碍, 按位置预分配
+> 数组的严格客户端可能错位 (IR index 原样透传, 不做重映射; 仅跨协议 + reasoning 场景).
 
 ## 核心抽象
 
