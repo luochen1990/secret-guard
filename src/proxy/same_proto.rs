@@ -7,8 +7,10 @@
 //! - [`same_proto_forward`] (有 secret 或 override): IR 路径 (reader → [model 注入] →
 //!   redact_ir → writer). 请求侧经 IR 改写 (FWD-1 修订授权: model 重写 / redact).
 //!   响应侧按 redaction map 分流 — map 非空才需要 restore: 流式 2xx 走 StreamTranslate
-//!   同协议 restore 模式, 其余走 buffered_ir; **map 为空 (override-only / secret 未命中)
-//!   响应保持字节透传** (fan_out_streaming, byte-exact + 流式 UX + parsed view 照常累积).
+//!   同协议 restore 模式 (Responses 流式除外: 501, 事件翻译未实现), 其余走 buffered_ir;
+//!   **map 为空 (override-only / secret 未命中) 响应保持字节透传** (fan_out_streaming,
+//!   byte-exact + 流式 UX; parsed view 按协议累积 — Responses 的 SSE 事件未实现,
+//!   降级 None, 见 ParsedSync::finalize).
 //! - [`same_proto_passthrough`] (无 secret 且无改写): 字节透传 (零回归, 最热路径).
 //!
 //! codec 不覆盖的协议 (Gemini/Ollama) 走 [`same_proto_forward`] 时受
@@ -145,17 +147,6 @@ pub(crate) async fn same_proto_forward(
     // (Responses 流式 SSE 事件翻译是 MVP 范围外). 若放行会静默产生空流.
     // 显式返回 501, 与跨协议流式一致. 触发条件 = redact **或 model 改写**任一
     // 迫使请求走 IR 路径 (#183 D5 — 仅改写也在此拦截).
-    if ir.stream && ingress == Protocol::OpenAIResponses {
-        return Err(AppError::NotImplemented(format!(
-            "streaming for {} protocol is not yet supported (Responses SSE event \
-             translation unimplemented) while this provider's config forces the IR path \
-             (secrets / model rewrite); either disable stream=true in the client \
-             request, remove secrets, or remove the model rewrite from this \
-             provider's routes",
-            ingress.name()
-        )));
-    }
-
     // 3. 快照真实 messages (redact 前) 给 DAG — 仅用于内容寻址 / parent 增量计算
     //    (req_delta 切片). WebUI 读的是 redact 后的 req_body_raw (LLM 视角), 永不
     //    触碰这份真实快照 (见 src/web/AGENTS.md "req_delta_messages 实现" 段).
@@ -171,6 +162,22 @@ pub(crate) async fn same_proto_forward(
         state.on_probe_exhausted,
         "same-proto",
     )?;
+
+    // Responses 协议 + 流式 + **Redact 命中** (map 非空): 响应需要 restore, 而
+    // Responses 的 read_response_events 未实现 (SSE 事件层翻译是 MVP 范围外),
+    // 放行会让 mock 静默流到客户端. 显式返回 501, 与跨协议流式一致.
+    // 两档语义 (#183 D5 收窄): model 重写-only (map 空) 时**不拦** — 重写只作用于
+    // 请求半段, 响应无需任何 restore, 走 fan_out_streaming SSE 字节透传
+    // (byte-exact; resp_parsed 因 Responses 事件未解码降级 None, 前端占位).
+    if ir.stream && ingress == Protocol::OpenAIResponses && !redaction_map.is_empty() {
+        return Err(AppError::NotImplemented(format!(
+            "streaming for {} protocol is not yet supported while redaction is active \
+             (Responses SSE event translation unimplemented); remove stream=true from \
+             the client request, or remove the secrets matched by this request to \
+             stream (model rewrite alone no longer blocks streaming)",
+            ingress.name()
+        )));
+    }
 
     // 5. IR → 请求 body (同协议 writer 重序列化). writer 输出恒为合法 UTF-8,
     //    直接产 String 按值 move 进 record (req_body_raw); 出站仅一次

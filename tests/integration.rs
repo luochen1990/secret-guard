@@ -7275,10 +7275,26 @@ async fn model_rewrite_with_secret_joint() {
     assert!(detail.req_body_raw.contains("target-model"));
 }
 
+/// #183 D5 收窄: 仅 model 重写 (无 secret 命中) 的 Responses 流式请求**放行** —
+/// 请求半段 model 被重写 (IR 路径), 响应半段 SSE 字节透传 (map 空, 无需 restore).
 #[tokio::test]
-async fn model_rewrite_responses_streaming_returns_501() {
-    // D5: 仅改写 (无 secret) 亦迫使 IR 路径 → Responses 流式触发既有 501.
-    let upstream = spawn_mock_upstream().await;
+async fn model_rewrite_responses_streaming_passthrough() {
+    let sse = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n";
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/responses")
+        // 上游收到重写后的 model (gpt-5, 非 gpt-4o) + stream 保真 (Responses writer
+        // 保留 stream: true, 单测锁定见 codec::fwd_responses_property 的
+        // responses_request_preserves_wire_semantics).
+        .match_body(mockito::Matcher::PartialJson(
+            serde_json::json!({"model": "gpt-5", "stream": true}),
+        ))
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse)
+        .expect(1)
+        .create_async()
+        .await;
     let resp = provider_with("resp-main", Protocol::OpenAIResponses, &upstream.url());
     let router = router_provider("virt", vec![rewrite_route("*", "resp-main", "gpt-5")]);
     let proxy_url = spawn_proxy_static_dynamic(
@@ -7298,11 +7314,59 @@ async fn model_rewrite_responses_streaming_returns_501() {
         &[],
     )
     .await;
-    assert_eq!(status, reqwest::StatusCode::NOT_IMPLEMENTED);
-    assert!(
-        body.contains("model rewrite"),
-        "501 message must hint the rewrite cause: {body}"
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "rewrite-only must stream: {body}"
     );
+    // 响应半段 byte-exact: map 空 → fan_out_streaming 字节透传, 不经 codec 事件层.
+    assert_eq!(body, sse, "client must receive upstream SSE bytes verbatim");
+    _m.assert_async().await;
+}
+
+/// #183 D5 收窄: Responses 流式 + **Redact 命中** (secret 在 body 中) 仍 501 —
+/// 响应需要 restore 而 Responses 的 SSE 事件翻译未实现, 放行会让 mock 静默外流.
+#[tokio::test]
+async fn responses_streaming_with_secret_hit_returns_501() {
+    let real_secret = "sk-live-resp-secret";
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", mockito::Matcher::Any)
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body("data: {}\n\n")
+        .expect(0)
+        .create_async()
+        .await;
+    let resp = provider_with("resp-main", Protocol::OpenAIResponses, &upstream.url());
+    let router = router_provider("virt", vec![rewrite_route("*", "resp-main", "gpt-5")]);
+    let proxy_url = spawn_proxy_static_dynamic(
+        vec![resp, router],
+        vec![],
+        reqwest::Client::new(),
+        ConversationDag::new(64, 500, 1),
+        test_secret_table_with(vec![secret("api-key", real_secret)]),
+    )
+    .await
+    .0;
+    let body = format!(r#"{{"model":"gpt-4o","stream":true,"input":"key {real_secret}"}}"#);
+    let (status, text, _) =
+        proxy_request(&proxy_url, "POST", "/r/virt/v1/responses", &body, &[]).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::NOT_IMPLEMENTED,
+        "redact-hit streaming must still 501: {text}"
+    );
+    // SEC-2: message 不含 secret 明文; 提示 "移除 secrets 即可流式".
+    assert!(
+        !text.contains(real_secret),
+        "501 body must not leak secret: {text}"
+    );
+    assert!(
+        text.contains("secrets"),
+        "501 message must hint removing secrets unlocks streaming: {text}"
+    );
+    _m.assert_async().await;
 }
 
 #[tokio::test]

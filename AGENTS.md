@@ -337,6 +337,10 @@ URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标
 - **跨协议 + `stream=true`**: OpenAI ⇄ Anthropic 走 StreamTranslate 流式翻译 (含
   Redact 场景的响应侧 restore); **Responses (任一侧) 例外** → 501 (Responses 流式
   SSE 事件翻译未实现, 放行会翻译出空流; 重写亦迫使 IR 路径 #183 D5; 见 "已知限制")
+- 跨协议 + `stream=true` → 501 (流式跨协议翻译尚未接入 dispatch)
+- **Responses + Redact 命中 + `stream=true`** → 501 (Responses 流式 SSE 事件翻译未实现, 放行会让
+  mock 静默外流; 仅路由 model 重写 (map 空, 响应无需 restore) 时流式放行 SSE 字节透传 — #183 D5
+  收窄; 见 "已知限制")
 - Gemini/Ollama 跨协议 → 501 (codec 未覆盖)
 
 **router provider 的模型列表 GET 请求本地终结 (#196)**: `GET /{o|a|g|l|r}/{router}` + 模型列表端点
@@ -706,11 +710,14 @@ configFile (escape hatch, 互斥). 凭据注入 (LoadCredential / sops 直接路
   时, redact 路径 round-trip 后该字段会变为缺席 (信息无损失, 形态有差异).
 - **OpenAI Responses API 支持范围**: Responses 协议 (`/r/` proto_short) 已接入 codec,
   支持 Responses ⇄ Chat Completions 跨协议翻译 (非流式) + Responses 同协议透传 + Redact (非流式).
-  **不支持**: Responses 流式 SSE 事件翻译 (Responses + Redact + `stream=true` 返回 501;
-  无 Redact 且路由链无 model 重写的同协议流式透传正常工作; 配置了任一则 501, #183 D5); Responses ⇄ Anthropic 跨协议 (返回 501);
-  hosted tools (web_search/file_search/computer_use/mcp → 跨协议翻译时丢弃并有 WARN
-  (`dropping hosted tool(s) in cross-protocol translation`, 见
-  `proxy/cross_proto.rs::count_hosted_tools_in_extra`; 同协议经 extra 透传保真); MCP 在客户端 LLM 请求中
+  **不支持**: Responses 流式 SSE 事件翻译 (Responses + **Redact 命中** (map 非空) + `stream=true`
+  返回 501, 防止 mock 静默外流; 仅路由 model 重写 (map 空, 响应无需 restore) 时流式放行 SSE 字节
+  透传 — #183 D5 收窄, `resp_parsed` 因事件未解码降级 None, 前端占位);
+  Responses ⇄ Anthropic 跨协议 (返回 501);
+  hosted tools (web_search/file_search/computer_use/mcp → reader 读取时丢弃并有 WARN
+  (`dropping tool definition(s) not representable in IR`, responses reader 丢弃点 —
+  同协议 IR 重建路径同样丢弃, 仅纯字节透传不受影响; hosted tools 不进 IR 也不进
+  extra, tools 是 collect_extra 的 modeled 排除键); MCP 在客户端 LLM 请求中
   的呈现形态与协议约束边界调研见 `docs/research/mcp-notes.md`); namespace tools
   flattening; `previous_response_id` 服务端状态 (secret-guard 是 stateless 代理);
   reasoning items 的 `encrypted_content` (同协议 round-trip 也会丢失, 会破坏 reasoning chain).

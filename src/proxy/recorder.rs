@@ -309,11 +309,17 @@ pub(super) fn assert_preview_model_match_source(event: &CallEvent) {
         rederived_model.as_deref(),
         "stored model drifts from req_body_raw SSOT"
     );
-    debug_assert_eq!(
-        event.preview.as_deref(),
-        rederived_preview.as_deref(),
-        "stored preview drifts from req_body_raw SSOT"
-    );
+    // preview 的 "IR 提取 == 字符串提取" 等价性在 Responses ingress 上**不可定义**:
+    // 其 wire 形态用 input[] 而非 messages[] (字符串提取器结构上看不见, 恒 None —
+    // 与 "Responses 协议的 timeline delta 为空" 已知限制同根), 而 IR 提取可见.
+    // 跳过 preview 比对 (model 是顶层字段, 两路径都可见, 仍比对).
+    if event.ingress_protocol != Some(crate::codec::Protocol::OpenAIResponses) {
+        debug_assert_eq!(
+            event.preview.as_deref(),
+            rederived_preview.as_deref(),
+            "stored preview drifts from req_body_raw SSOT"
+        );
+    }
 }
 
 /// 视图正确性守卫 (CI 用, 需 `--features consistency-check`).
@@ -797,6 +803,23 @@ pub(super) struct ParsedSync {
     last_sync: Option<std::time::Instant>,
 }
 
+/// IrResponse "scan 零语义事件" 判定: 事件层的所有字段均未被观测过.
+///
+/// Responses 协议的 `read_response_events` 未实现 (恒返回空事件), 流式 scan 永远
+/// 零事件; OpenAI/Anthropic 正常流的首个事件即携带 model/id 或 block. 零事件时
+/// `write_response` 会产出 "合成 id + 空 output + status completed" 的畸形 parsed
+/// view (凭空捏造响应元数据, DTO 派生纪律禁止) — 调用方据此降级为 `None`
+/// (前端降级占位).
+fn scan_decoded_nothing(ir: &crate::codec::ir::IrResponse) -> bool {
+    ir.content.is_empty()
+        && ir.model.is_none()
+        && ir.id.is_none()
+        && ir.created.is_none()
+        && ir.stop_reason.is_none()
+        && ir.stop_sequence.is_none()
+        && !ir.usage_present
+}
+
 impl ParsedSync {
     pub(super) fn new(
         proto: crate::codec::Protocol,
@@ -826,6 +849,8 @@ impl ParsedSync {
     }
 
     /// 喂入上游 chunk; 按节流间隔把 snapshot 写入 DAG node 的 parsed 字段.
+    /// 零语义事件 (如 Responses 流) 不写 — 捏造空响应对象违反派生纪律,
+    /// 由 [`Self::finalize`] 统一降级 None.
     pub(super) fn feed(&mut self, b: &[u8]) {
         self.scan.feed(b);
         let due = self
@@ -833,6 +858,11 @@ impl ParsedSync {
             .is_none_or(|t| t.elapsed() >= PARSED_SYNC_INTERVAL);
         if due {
             let parsed = self.scan.snapshot();
+            if scan_decoded_nothing(&parsed) {
+                // 仍记录 last_sync: 零事件流的每次 snapshot 都是空, 无需重试判定.
+                self.last_sync = Some(std::time::Instant::now());
+                return;
+            }
             self.dag
                 .update_parsed_response(self.record_id, self.writer.write_response(&parsed));
             self.last_sync = Some(std::time::Instant::now());
@@ -840,10 +870,14 @@ impl ParsedSync {
     }
 
     /// 流结束时的最终快照 (parsed view + 回显摘要, usage-stats 采集一并产出).
-    pub(super) fn finalize(self) -> (serde_json::Value, ResponseEcho) {
+    /// 零语义事件时 parsed 为 `None` (前端降级占位, 不捏造空响应对象).
+    pub(super) fn finalize(self) -> (Option<serde_json::Value>, ResponseEcho) {
         let ir = self.scan.snapshot();
         let echo = ResponseEcho::from_ir(&ir);
-        (self.writer.write_response(&ir), echo)
+        if scan_decoded_nothing(&ir) {
+            return (None, echo);
+        }
+        (Some(self.writer.write_response(&ir)), echo)
     }
 }
 
@@ -1080,6 +1114,97 @@ mod tests {
         acc.set_error(ERR_CLIENT_DISCONNECTED);
         assert!(!acc.complete(), "after error, not complete");
         assert_eq!(acc.error_kind.as_deref(), Some(ERR_CLIENT_DISCONNECTED));
+    }
+
+    // ─── ParsedSync: 零语义事件流降级 None (DTO 派生纪律: 不捏造响应) ──────
+    //
+    // Responses 的 read_response_events 未实现 (恒返回空事件): map 空 + stream 的
+    // Responses 请求放行 SSE 字节透传后 (#183 D5 收窄), ParsedSync 对这类流
+    // accumulate 零事件 — write_response 会捏造 "合成 id + 空 output + completed"
+    // 的畸形对象. 锁定: 零事件 → parsed None + echo 无回显; 有事件 → Some 照常.
+
+    #[test]
+    fn parsed_sync_responses_stream_decodes_to_none() {
+        let dag = ConversationDag::new(4, 8, 1);
+        let mut ps = ParsedSync::new(
+            crate::codec::Protocol::OpenAIResponses,
+            dag.clone(),
+            Uuid::nil(),
+        );
+        // Responses 流式 SSE fixture (事件层语义真实, 但 reader 不解任何事件).
+        ps.feed(b"event: response.output_text.delta\n");
+        ps.feed(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n");
+        ps.feed(b"event: response.completed\n");
+        ps.feed(b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":5}}}\n\n");
+        let (parsed, echo) = ps.finalize();
+        assert!(
+            parsed.is_none(),
+            "zero-event scan must degrade to None, got {parsed:?}"
+        );
+        assert!(
+            echo.usage.is_none(),
+            "usage must not be fabricated from undecoded events"
+        );
+        assert!(echo.model.is_none());
+        // feed 路径也不得把捏造对象写进 DAG (节点无 parsed 字段或 None).
+        // (此 fixture 的 record_id 不存在于 dag, update 被吞 — 单独覆盖见下个测试.)
+    }
+
+    #[test]
+    fn parsed_sync_feed_zero_events_does_not_write_dag() {
+        let dag = ConversationDag::new(4, 8, 1);
+        // 先 push 一个节点, 让 update_parsed_response 有真实落点.
+        let event = CallEvent {
+            created_at: chrono::Utc::now(),
+            method: "POST".to_string(),
+            path: "/r/x/v1/responses".to_string(),
+            req_headers: vec![],
+            ingress_protocol: None,
+            redact_seed: 0,
+            policy: std::sync::Arc::new(PolicySnapshot::default()),
+            req_body_raw: String::new(),
+            round_role: crate::codec::ir::IrRole::User,
+            round_kind: crate::dag::RoundKind::Normal,
+            preview: None,
+            model: None,
+            upstream_id: std::sync::Arc::from("test"),
+            redactions: std::sync::Arc::from([]),
+            upstream_model: None,
+        };
+        let id = dag.push_messages(vec![], event);
+        let mut ps = ParsedSync::new(crate::codec::Protocol::OpenAIResponses, dag.clone(), id);
+        ps.feed(b"data: {\"type\":\"response.created\"}\n\n");
+        // 零事件: parsed 绝不能是捏造的 "空 output + completed" 对象
+        // (节点可能尚无 ResponseData — 两种形态都合法, Some(捏造对象) 不合法).
+        let fabricated = dag
+            .get_response(id)
+            .and_then(|r| r.parsed)
+            .filter(|p| p.get("object").and_then(|o| o.as_str()) == Some("response"));
+        assert!(
+            fabricated.is_none(),
+            "feed must not write a fabricated empty response: {:?}",
+            fabricated
+        );
+    }
+
+    #[test]
+    fn parsed_sync_openai_stream_decodes_to_some() {
+        let dag = ConversationDag::new(4, 8, 1);
+        let mut ps = ParsedSync::new(crate::codec::Protocol::OpenAI, dag, Uuid::nil());
+        // OpenAI 流式 chunk (带 model/id), reader 会解码出 MessageStart + 增量.
+        ps.feed(b"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"}}]}\n\n");
+        ps.feed(b"data: [DONE]\n\n");
+        let (parsed, echo) = ps.finalize();
+        let parsed = parsed.expect("decoded OpenAI stream must yield Some parsed view");
+        let content = parsed
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .unwrap_or_default();
+        assert_eq!(content, "Hi", "parsed view carries decoded text: {parsed}");
+        assert_eq!(echo.model.as_deref(), Some("gpt-4o"));
     }
 
     // ─── SEC-3: assert/panic 消息不泄漏 secret ───────────────────────────

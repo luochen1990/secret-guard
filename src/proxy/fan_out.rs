@@ -265,12 +265,11 @@ pub(crate) async fn fan_out_streaming(
         PassthroughPipe,
         move |parsed_sync, recorder| {
             // 最终 parsed: 流式用 ParsedSync 快照; 非流式一次性 codec parse.
+            // ParsedSync::finalize 对零语义事件流 (如 Responses, read_response_events
+            // 未实现) 返回 None — 前端降级占位, 不捏造空响应对象.
             if streamed {
                 match parsed_sync {
-                    Some(ps) => {
-                        let (v, echo) = ps.finalize();
-                        (Some(v), echo)
-                    }
+                    Some(ps) => ps.finalize(),
                     // 无 ParsedSync = 无 codec 协议 (Gemini/Ollama): 无回显可提取.
                     None => (None, ResponseEcho::default()),
                 }
@@ -649,10 +648,9 @@ fn spawn_restore_fanout(
             // 最终 parsed 快照 + 回显摘要. 即使 error_kind (client disconnect /
             // upstream error), 也保留截至断流时的累积内容 — 用户能看到部分响应比
             // 看到空白更有价值. (overflow 时同理: 截至 Overflow 前的内容比 truncate
-            // banner 更有用.)
+            // banner 更有用.) 零语义事件流 (畸形 SSE) 降级 None, 同 fan_out_streaming.
             let ps = parsed_sync.expect("StreamTranslate 流式路径恒有 ParsedSync");
-            let (v, echo) = ps.finalize();
-            (Some(v), echo)
+            ps.finalize()
         },
         |recorder| {
             if recorder.overflow {
