@@ -116,11 +116,10 @@ pub(crate) async fn cross_proto_forward(
     }
 
     // 6. 清空 ingress-only 元数据:
-    //    - extra: ingress-only 字段会泄漏到 egress (Responses 的 hosted tools
-    //      (web_search/mcp/...) 承载于 extra["tools"], 会被一并清空 — 丢弃计数
-    //      供 T5 WARN, 见下方 record_id 就位后的告警点)
+    //    - extra: ingress-only 字段会泄漏到 egress, 一并清空. (注: Responses 的
+    //      hosted tools 不在 extra — tools 是 modeled 字段被 collect_extra 排除,
+    //      丢弃发生在 reader 读取时并在该处 WARN, 见 responses.rs read_request)
     //    - wire_fidelity (stop_form / content_form / tools_present): ingress wire 形态
-    let dropped_hosted_tools = count_hosted_tools_in_extra(&ir.extra);
     ir.extra.clear();
     ir.clear_wire_fidelity();
 
@@ -222,13 +221,6 @@ pub(crate) async fn cross_proto_forward(
     // T5: 跨协议丢弃可观测性 — 计数在丢弃点 (步骤 6/9) 已算, record_id 此刻才产生,
     // WARN 延后到这里打 (只记计数, 绝不记内容). hosted tools = extra["tools"] 中
     // type != "function" 的条目; reasoning = IrBlock::ReasoningContent (思考原文).
-    if dropped_hosted_tools > 0 {
-        warn!(
-            %record_id,
-            count = dropped_hosted_tools,
-            "dropping hosted tool(s) in cross-protocol translation"
-        );
-    }
     if dropped_req_reasoning > 0 {
         warn!(
             %record_id,
@@ -427,47 +419,38 @@ pub(crate) async fn cross_proto_forward(
                 }
                 Err(e) => {
                     warn!(%record_id, error = %e.message, "failed to parse upstream response as {}; passing through verbatim", provider.protocol.name());
-                    // RED-8: reader 拒绝但 body 仍是合法 JSON — 先尝试 JSON 叶子级
-                    // restore 兜底 (与 fan_out_buffered_ir 对称), 不让 mock 逃逸.
-                    match crate::redact::restore_json_leaves_fallback(&resp_bytes, &redaction_map) {
-                        Some(restored) => {
-                            super::helpers::warn_mocks_restored_via_json_leaf_fallback(record_id);
-                            (resp_status, restored)
-                        }
-                        None => {
-                            // 补齐 #158 的 mock-not-restored 信号 (cross_proto 此前缺失).
-                            super::helpers::warn_mock_not_restored(
-                                record_id,
-                                "codec reader rejected response; json leaf fallback also failed",
-                                &redaction_map,
-                            );
-                            (resp_status, resp_bytes.to_vec())
-                        }
-                    }
-                }
-            },
-            Err(e) => {
-                // 非 JSON body: 兜底同样无法 parse → None → 透传 (已知限制).
-                // Some 分支防御性保留 (与 reader 拒绝分支对称; 单 JSON Value 不走到这里).
-                match crate::redact::restore_json_leaves_fallback(&resp_bytes, &redaction_map) {
-                    Some(restored) => {
+                    // RED-8: reader 拒绝但 body 仍是合法 JSON — 复用外层已 parse 的 v
+                    // 做 JSON 叶子级 restore 兜底 (与 fan_out_buffered_ir 对称, 零二次
+                    // parse), 不让 mock 逃逸.
+                    let mut v = v;
+                    if crate::redact::restore_json_value_fallback(&mut v, &redaction_map) {
                         super::helpers::warn_mocks_restored_via_json_leaf_fallback(record_id);
-                        (resp_status, restored)
-                    }
-                    None => {
-                        // 此前完全静默 — 补 WARN (已知限制条目明说要补的 mock-not-restored
-                        // 信号; 无 redaction 在途时只是普通透传, 不打).
+                        (
+                            resp_status,
+                            serde_json::to_vec(&v).unwrap_or_else(|_| resp_bytes.to_vec()),
+                        )
+                    } else {
+                        // 补齐 #158 的 mock-not-restored 信号 (cross_proto 此前缺失).
                         super::helpers::warn_mock_not_restored(
                             record_id,
-                            &format!(
-                                "response body is not a single JSON value ({e}); \
-                                 json leaf fallback also failed"
-                            ),
+                            "codec reader rejected response",
                             &redaction_map,
                         );
                         (resp_status, resp_bytes.to_vec())
                     }
                 }
+            },
+            Err(e) => {
+                // 非 JSON body: 叶子级兜底以单 JSON Value 为前提, 对同一字节再 parse
+                // 必然同样失败 — 不再尝试, 直接透传 (已知限制). 此前完全静默 —
+                // 补 WARN (已知限制条目明说要补的 mock-not-restored 信号;
+                // 无 redaction 在途时只是普通透传, 不打).
+                super::helpers::warn_mock_not_restored(
+                    record_id,
+                    &format!("response body is not a single JSON value ({e})"),
+                    &redaction_map,
+                );
+                (resp_status, resp_bytes.to_vec())
             }
         }
     } else {
@@ -509,6 +492,10 @@ pub(crate) async fn cross_proto_forward(
         ResponseData {
             resp_status: resp_status_out.as_u16(),
             resp_headers: redact_headers(&resp_headers),
+            // 视角语义注意: 与 fan_out_buffered_ir ("LLM 视角, 含 mock") 不同, 这里
+            // raw_resp_body 沿用 master 起的客户端视角 (翻译 + restore 后的出站字节) —
+            // DAG OriginRecord 本就按真值存储, 无安全边界问题, 仅为两条路径语义
+            // 不一致的显式声明 (WebUI raw view 在 cross-proto 下展示真 secret).
             raw_resp_body: utf8_view(&resp_body_out),
             parsed: resp_parsed_for_record,
             elapsed_ms: elapsed,
@@ -585,37 +572,10 @@ fn count_reasoning_blocks(blocks: &[crate::codec::ir::IrBlock]) -> usize {
         .sum()
 }
 
-/// 统计 `extra["tools"]` 数组中 hosted tool (`type != "function"`) 的条目数.
-///
-/// Responses reader 把顶层 `tools` 原样留在 extra (同协议经 extra 透传保真),
-/// 跨协议 `ir.extra.clear()` 时丢弃 — 本计数驱动丢弃前 WARN (web_search /
-/// file_search / computer / mcp / image_generation 等, 见 `src/codec/responses.rs`).
-///
-/// # 假设声明 (lenient, ROB-*)
-///
-/// `extra["tools"]` 非数组 / 条目非 object / 条目缺 `type` 或 `type` 非 string:
-/// 视为畸形形态, 该条目不计 — 计数仅用于告警, 畸形输入不值得 fail (返回 0 计数).
-fn count_hosted_tools_in_extra(extra: &serde_json::Map<String, serde_json::Value>) -> usize {
-    extra
-        .get("tools")
-        .and_then(|t| t.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter(|e| {
-                    e.get("type")
-                        .and_then(|t| t.as_str())
-                        .is_some_and(|t| t != "function")
-                })
-                .count()
-        })
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{count_hosted_tools_in_extra, count_reasoning_blocks, http_status_to_error_kind};
+    use super::{count_reasoning_blocks, http_status_to_error_kind};
     use crate::codec::ir::IrBlock;
-    use serde_json::json;
 
     /// 覆盖所有 match 分支, 确保 status → kind 映射完整且稳定.
     /// (错误 kind 字符串暴露给客户端 envelope, 改动属契约性变更, 测试守卫之.)
@@ -678,57 +638,5 @@ mod tests {
         // 顶层 2 个 + ToolResult 嵌套 1 个 = 3; Reasoning(summary) 不计.
         assert_eq!(count_reasoning_blocks(&blocks), 3);
         assert_eq!(count_reasoning_blocks(&[]), 0);
-    }
-
-    /// count_hosted_tools_in_extra: hosted (web_search / mcp / ...) 计数,
-    /// function 不计; 混合数组只计 hosted.
-    #[test]
-    fn count_hosted_tools_counts_non_function_entries() {
-        let mut extra = serde_json::Map::new();
-        extra.insert(
-            "tools".to_string(),
-            json!([
-                {"type": "function", "name": "get_weather", "parameters": {}},
-                {"type": "web_search"},
-                {"type": "mcp", "server_label": "github"},
-                {"type": "file_search", "vector_store_ids": ["vs_1"]},
-            ]),
-        );
-        assert_eq!(count_hosted_tools_in_extra(&extra), 3);
-
-        // 全 function → 0.
-        let mut fn_only = serde_json::Map::new();
-        fn_only.insert(
-            "tools".to_string(),
-            json!([{"type": "function", "name": "f1"}]),
-        );
-        assert_eq!(count_hosted_tools_in_extra(&fn_only), 0);
-        // extra 无 tools 键 → 0.
-        assert_eq!(count_hosted_tools_in_extra(&serde_json::Map::new()), 0);
-    }
-
-    /// count_hosted_tools_in_extra: 畸形形态 lenient → 不计 (计数仅供告警).
-    #[test]
-    fn count_hosted_tools_lenient_on_malformed_shapes() {
-        // tools 非数组 (string / object) → 0.
-        for malformed in [json!("not-an-array"), json!({"nested": true})] {
-            let mut extra = serde_json::Map::new();
-            extra.insert("tools".to_string(), malformed);
-            assert_eq!(count_hosted_tools_in_extra(&extra), 0);
-        }
-        // 条目级畸形: 非 object / 缺 type / type 非 string → 各自不计;
-        // 畸形条目不拖累同数组中合法的 hosted 条目.
-        let mut extra = serde_json::Map::new();
-        extra.insert(
-            "tools".to_string(),
-            json!([
-                "bare string entry",
-                42,
-                {"name": "missing-type-field"},
-                {"type": 123},
-                {"type": "web_search"},
-            ]),
-        );
-        assert_eq!(count_hosted_tools_in_extra(&extra), 1);
     }
 }

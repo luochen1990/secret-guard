@@ -25,7 +25,8 @@
 //! - usage 双向映射
 //! - 非流式响应: `output[]` 中的 `message` (output_text) + `function_call` items
 //!
-//! **不覆盖** (跨协议翻译时显式丢弃, 同协议 round-trip 通过 extra 透传):
+//! **不覆盖** (reader 读取时丢弃 — 仅 function 工具进入 IR, 同协议 IR 重建路径
+//! 与跨协议翻译同受影响; 纯字节透传路径不受影响; 丢弃点打 WARN):
 //! - hosted tools (web_search / file_search / computer_use / mcp / image_generation)
 //! - namespace tools flattening (留作后续)
 //! - reasoning 的 `encrypted_content` (provider-specific opaque, 不可跨协议)
@@ -121,17 +122,29 @@ impl Reader for ResponsesReader {
 
         // tools: Responses 的 tools 是平铺数组, 每个有 type.
         // function 类型: {type:"function", name, parameters, description, strict?}
-        // 其他类型 (web_search/file_search/computer/mcp/namespace/custom/...): 静默丢弃.
+        // 其他类型 (web_search/file_search/computer/mcp/namespace/custom/...): 丢弃.
+        // 丢弃点就在这里 (reader 层, 同协议 IR 重建与跨协议翻译共用此 choke point —
+        // hosted tools 不进 IR.tools, 也不进 extra: collect_extra 的 known 列表含
+        // "tools")。只记计数不记内容 (SEC 纪律)。
         let (tools, tools_present) = if let Some(arr) = obj.get("tools").and_then(Value::as_array) {
             let tools: Vec<IrTool> = arr.iter().filter_map(read_tool_def).collect();
+            let hosted = arr.len().saturating_sub(tools.len());
+            if hosted > 0 {
+                tracing::warn!(
+                    count = hosted,
+                    "dropping hosted tool(s) not representable in IR \
+                     (web_search/file_search/computer/mcp/...); only function tools \
+                     round-trip through the codec"
+                );
+            }
             (tools, true)
         } else {
             (Vec::new(), false)
         };
 
-        // extra: 透传顶层未建模字段. 同协议 round-trip 时承载 hosted tools (顶层 tools[]) /
-        // previous_response_id 等顶层 wire (跨协议前 caller 清空).
-        // 注意: 嵌套字段 (如 input[].encrypted_content) 不被 collect_extra 捕获, 会丢失.
+        // extra: 透传顶层未建模字段 (previous_response_id 等; 跨协议前 caller 清空).
+        // 注意: tools 是 modeled 字段, 不进 extra; 嵌套字段 (如 input[].encrypted_content)
+        // 不被 collect_extra 捕获, 会丢失.
         let extra = collect_extra(
             obj,
             &[

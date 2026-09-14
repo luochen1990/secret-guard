@@ -450,14 +450,22 @@ pub fn restore_json_leaves_fallback(bytes: &[u8], map: &RedactionMap) -> Option<
         return None;
     }
     let mut v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    restore_json_value_fallback(&mut v, map).then(|| serde_json::to_vec(&v).ok())?
+}
+
+/// [`restore_json_leaves_fallback`] 的已-parse 变体: 调用方已持有 body 的 JSON
+/// Value (codec reader 拒绝分支 — 外层 `from_slice` 刚成功), 复用它避免第二次
+/// 完整 parse。原地改写 `v` 的字符串值叶子, 返回是否发生了至少一次替换;
+/// `false` 时 `v` 与传入等价 (调用方保持原字节透传, 无需重序列化)。
+pub fn restore_json_value_fallback(v: &mut serde_json::Value, map: &RedactionMap) -> bool {
+    if map.is_empty() {
+        return false;
+    }
     let mut replaced = false;
     v.for_each_str_leaf_mut(&mut |s| {
         replaced |= restore_str_inplace(s, map);
     });
-    if !replaced {
-        return None;
-    }
-    serde_json::to_vec(&v).ok()
+    replaced
 }
 
 /// disabled secret 明文放行检测 (#161): 对每个 decision=Disabled 的 secret, 检查其

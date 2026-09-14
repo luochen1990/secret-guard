@@ -401,7 +401,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 ### RED-8 JSON 叶子级兜底 restore (fallback restorability)
 
-**陈述**: codec 无法 parse 上游响应时 (`fan_out_buffered_ir` / `cross_proto_forward` 的 parse-失败 fallback 分支), 若 body 仍是**单个合法 JSON Value**, `restore_json_leaves_fallback` 必须在字符串**值叶子**上把 mock 还原为 real (JSON 树遍历, 非 byte find/replace — real 含 `"`/反斜杠/非 ASCII 时字节级替换会产出非法 JSON); 未命中任何 mock / parse 失败 (含 SSE-shaped 多帧 body) / map 空时返回 None, 调用方保持**原字节透传** (byte-exact 优先). Object key 不在遍历范围.
+**陈述**: codec 无法 parse 上游响应时 (`fan_out_buffered_ir` / `cross_proto_forward` 的 parse-失败 fallback 分支), 若 body 仍是**单个合法 JSON Value**, `restore_json_leaves_fallback` 必须在字符串**值叶子**上把 mock 还原为 real (JSON 树遍历, 非 byte find/replace — real 含 `"`/反斜杠/非 ASCII 时字节级替换会产出非法 JSON); 未命中任何 mock / parse 失败 (含 SSE-shaped 多帧 body) / map 空时返回 None, 调用方保持**原字节透传** (byte-exact 优先). Object key 不在遍历范围. 兜底**命中**时的输出为 normalize_json 等价 (serde_json 未启 preserve_order, key 按字母序重排), 非 byte-exact — 该路径本就以"codec 已拒绝 body"为前提, byte-exact 不成立, 由 restored-via-fallback WARN 保持可观测.
 
 **Properties**:
 - `prop_json_leaf_fallback_restores_mock`: 任意 JSON 树的任一字符串值叶子嵌入 mock → 兜底后输出可 parse 且叶子列表 == [嵌入位置的预期串 (含 real)] ++ [其余原叶子] (同时锁定 "对应位置含 real" / "无 mock 残留" / "其他叶子不变"); 未嵌入 → None. 生成器: string/bool/number/null 叶子 + 嵌套 array/object, 字符串字母表与 mock 不相交 (无残留断言严格成立); real 含 `"`/反斜杠/中文. ✅ `src/redact.rs::prop_json_leaf_fallback_restores_mock`.

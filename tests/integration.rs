@@ -5200,7 +5200,7 @@ async fn streaming_redact_upstream_4xx_json_restores_mock_via_leaf_fallback() {
     // 可观测: restored-via-fallback WARN.
     let log_text = log.text();
     assert!(
-        log_text.contains("restored mocks via JSON leaf fallback"),
+        log_text.contains("mocks restored via JSON leaf fallback"),
         "RED-8 violation: fallback restore WARN missing; log: {log_text}"
     );
     assert!(
@@ -6428,8 +6428,9 @@ async fn buffered_reader_reject_restores_mock_via_json_leaf_fallback() {
 
     // 兜底 restore: 200 + echo 字段的 mock 已还原为 real.
     assert_eq!(status, reqwest::StatusCode::OK, "body: {text}");
-    let v: serde_json::Value =
-        serde_json::from_str(&text).expect("fallback output must remain valid JSON; got: {text}");
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| {
+        panic!("fallback output must remain valid JSON; got: {text}, err: {e}")
+    });
     assert_eq!(
         v["echo"],
         format!("saw {real_secret} end"),
@@ -6440,7 +6441,7 @@ async fn buffered_reader_reject_restores_mock_via_json_leaf_fallback() {
     // 可观测: restored-via-fallback WARN (body 经过了非 codec 的改写路径).
     let log_text = log.text();
     assert!(
-        log_text.contains("restored mocks via JSON leaf fallback"),
+        log_text.contains("mocks restored via JSON leaf fallback"),
         "RED-8 violation: no WARN about fallback restore; log: {log_text}"
     );
     // 卫生: 日志不得含真实 secret.
@@ -6494,8 +6495,9 @@ async fn cross_proto_reader_reject_restores_mock_via_json_leaf_fallback() {
 
     assert_eq!(status, reqwest::StatusCode::OK, "body: {text}");
     // 兜底 restore 后的 JSON: 叶子里的 mock 已还原 (仍是 array 形态的透传 shape).
-    let v: serde_json::Value =
-        serde_json::from_str(&text).expect("fallback output must remain valid JSON; got: {text}");
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| {
+        panic!("fallback output must remain valid JSON; got: {text}, err: {e}")
+    });
     assert_eq!(
         v[0]["content"],
         format!("echo {real_secret}"),
@@ -6506,7 +6508,7 @@ async fn cross_proto_reader_reject_restores_mock_via_json_leaf_fallback() {
     // 可观测: cross_proto 此前缺 restored/mock-not-restored 信号, 现在对称.
     let log_text = log.text();
     assert!(
-        log_text.contains("restored mocks via JSON leaf fallback"),
+        log_text.contains("mocks restored via JSON leaf fallback"),
         "RED-8 violation: cross-proto fallback restore WARN missing; log: {log_text}"
     );
     assert!(
@@ -6567,15 +6569,116 @@ async fn non_json_body_with_mock_still_passes_through_when_fallback_fails() {
         text, sse_body,
         "fallback failure must pass body through verbatim"
     );
-    // mock-not-restored WARN 仍在 (detail 补充 json leaf fallback also failed).
+    // mock-not-restored WARN 仍在 (非 JSON body 无兜底可试, 直接透传).
     let log_text = log.text();
     assert!(
         log_text.contains("mock not restored"),
         "mock-not-restored WARN must still fire; log: {log_text}"
     );
     assert!(
-        log_text.contains("json leaf fallback also failed"),
-        "WARN detail should mention fallback attempt; log: {log_text}"
+        log_text.contains("not a single JSON value"),
+        "WARN detail should name the non-JSON cause; log: {log_text}"
+    );
+}
+
+// ─── T5: 跨协议丢弃字段的可观测性 (reasoning / hosted tools 丢弃点 WARN) ──────
+//
+// 三个 WARN 发射点 (cross_proto_forward 请求侧历史 / 响应侧 / extra 的 hosted
+// tools) 的接线守卫 — 纯函数计数已有单测, 这里锁定 "丢弃确实发生在预期路径上",
+// 防未来重构把计数挪到 clear/翻译之后 (恒 0) 而测试不红. WARN 只记计数不记内容.
+
+/// o→a: assistant 历史携带 `reasoning_content` (reader 解析为 ReasoningContent,
+/// anthropic writer 无法合成 signature 而丢弃) → 请求侧丢弃 WARN.
+#[tokio::test]
+async fn cross_proto_request_reasoning_history_drop_warns() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/messages")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"msg_x","type":"message","role":"assistant","content":[{"type":"text","text":"OK"}],"model":"claude","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}"#,
+        )
+        .create_async()
+        .await;
+    let provider = provider_with("an-main", Protocol::Anthropic, &upstream.url());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+
+    let (log, _log_guard) = capture_tracing(tracing::Level::WARN);
+    let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"},{"role":"assistant","reasoning_content":"pondering deeply","content":"answer"},{"role":"user","content":"go on"}]}"#;
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/an-main/v1/chat/completions",
+        body,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let log_text = log.text();
+    assert!(
+        log_text.contains("dropping reasoning block(s) from request history"),
+        "T5: request-side reasoning drop WARN missing; log: {log_text}"
+    );
+}
+
+/// a→o: OpenAI 兼容上游响应携带 `message.reasoning_content` (reader 解析为
+/// ReasoningContent, anthropic ingress writer 跳过) → 响应侧丢弃 WARN.
+#[tokio::test]
+async fn cross_proto_response_reasoning_drop_warns() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"chatcmpl-r","object":"chat.completion","created":1700000000,"model":"glm-5.3","choices":[{"index":0,"message":{"role":"assistant","reasoning_content":"let me think","content":"final answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":5}}"#,
+        )
+        .create_async()
+        .await;
+    let provider = provider_with("oa-main", Protocol::OpenAI, &upstream.url());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+
+    let (log, _log_guard) = capture_tracing(tracing::Level::WARN);
+    let body =
+        r#"{"model":"claude-3","max_tokens":64,"messages":[{"role":"user","content":"Hi"}]}"#;
+    let (status, _, _) =
+        proxy_request(&proxy_url, "POST", "/a/oa-main/v1/messages", body, &[]).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let log_text = log.text();
+    assert!(
+        log_text.contains("dropping reasoning block(s) from response"),
+        "T5: response-side reasoning drop WARN missing; log: {log_text}"
+    );
+}
+
+/// Responses 入站的 hosted tools (web_search 等非 function 类型) 不进 IR
+/// (reader 的 filter_map 丢弃, 也不进 extra — tools 是 modeled 字段) → 读取点 WARN.
+/// 该 choke point 同时覆盖同协议 IR 重建路径与跨协议路径, 故用 r→a 场景锁接线.
+#[tokio::test]
+async fn cross_proto_hosted_tools_drop_warns() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/messages")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"msg_x","type":"message","role":"assistant","content":[{"type":"text","text":"OK"}],"model":"claude","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}"#,
+        )
+        .create_async()
+        .await;
+    let provider = provider_with("an-main", Protocol::Anthropic, &upstream.url());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+
+    let (log, _log_guard) = capture_tracing(tracing::Level::WARN);
+    let body = r#"{"model":"gpt-4o","input":"hi","tools":[{"type":"function","name":"f","parameters":{"type":"object"}},{"type":"web_search"}]}"#;
+    let (status, _, _) =
+        proxy_request(&proxy_url, "POST", "/r/an-main/v1/responses", body, &[]).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let log_text = log.text();
+    assert!(
+        log_text.contains("dropping hosted tool(s) not representable in IR"),
+        "T5: hosted tools drop WARN missing; log: {log_text}"
     );
 }
 

@@ -290,9 +290,8 @@ fn is_sensitive_header(name: &str) -> bool {
 pub(super) fn warn_mocks_restored_via_json_leaf_fallback(record_id: uuid::Uuid) {
     tracing::warn!(
         %record_id,
-        detail = "restored mocks via JSON leaf fallback; response was not parseable by codec",
         "response parse failed with redactions in flight; \
-         mocks restored via JSON leaf fallback"
+         mocks restored via JSON leaf fallback (response was not parseable by codec)"
     );
 }
 
