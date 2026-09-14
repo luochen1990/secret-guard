@@ -361,7 +361,7 @@ TTL 300s + serve-stale-on-error + single-flight; exact-only router 零上游请�
 | `config.rs` | 双层配置 schema + `DynamicTable<T>` 泛型 + 持久化 + 静态配置预检审计 (未知 section/字段 → 启动 WARN, #159) | 文件头部 `//!` (覆盖 OverrideMode / CRUD / Effective source / 跨表并发) |
 | `provider.rs` | Provider sum type (Direct 直连 \| Router 路由, #187) + Route (model_pattern 通配 / priority / 路由级 upstream_model 重写) + Effective view + api_key 两来源 + `resolve_route` 路由链解析 (per-request 按请求 model, model 重写 pipeline, #179 多规则化) | 文件头部 `//!` |
 | `secrets.rs` | SecretEntry 实体 + Effective view + value 两来源 | 文件头部 `//!` |
-| `mock.rs` | MockStrategy 两维度 (初始值 + 生成策略) + 确定性 seed + `[redact] global_mock_prefix` 注入 | 文件头部 `//!` (C3 根基) |
+| `mock.rs` | MockStrategy 两维度 (初始值 + 生成策略) + 确定性 seed + `[redact] global_mock_prefix` 注入 + GenSpec 候选空间配置期 lint (WARN, 弱 mock 策略前置暴露) | 文件头部 `//!` (C3 根基) |
 | `dag/` (模块目录: mod/pool/types/view/timeline) | ConversationDAG 内容寻址存储 (BlockPool + Node + Merkle) | `src/dag/mod.rs` 头部 `//!` + `docs/design/conversation-dag.md` |
 | `derive.rs` | 从 request body 派生 preview/model/text 的字节级提取 + delta messages 切片 (域 B 派生链, ROB-1 永不 panic) | 文件头部 `//!` (含 "为什么不在 web::api" 归属论证) |
 | `dto.rs` | WebUI 响应 DTO 中立类型层 (SessionView/NodeView/.../SyncSnapshot, 域 B → 域 C wire shape; 构造逻辑留 dag) | 文件头部 `//!` (含 "为什么是顶层中立模块" 归属论证) |
@@ -714,6 +714,9 @@ configFile (escape hatch, 互斥). 凭据注入 (LoadCredential / sops 直接路
   WebUI timeline 仍能显示 preview / role, 但不渲染增量气泡 (与跨协议 ingress 的 delta 限制一致).
 - **Mock probing 耗尽可配置 fail-open / fail-closed**: 弱配置 (charset/length 仅产生
   极少候选) + 对抗性 IR 可能让 `redact_ir` 的 mock probing 耗尽 (`MOCK_PROBE_LIMIT`).
+  配置写入时 (static 加载 / WebUI upsert) 会对 GenSpec 候选空间做 lint WARN
+  (`MockStrategy::lint_candidate_space`, 阈值 `MIN_CANDIDATE_SPACE_WARN` = 2^20,
+  低于即 WARN, 不拒绝) — 把这类弱配置前置暴露.
   历史行为是 **fail-open** (warn + 跳过该 secret, 原样转发到上游, 见 `redact_ir`).
   新增 `[redact] on_probe_exhausted = "fail_closed"` 让 proxy 在这种情况下**拒绝转发**
   (返回 503), 防止 secret 泄露到 LLM provider (见 `redact_ir_checked`). 默认仍

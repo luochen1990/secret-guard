@@ -262,6 +262,13 @@ digits = true
 约束: `length_range` 两个值都须 > 0 且 min ≤ max; `prefix` 长度不能超过 min; charset 至少
 开启一类. 固定替身不能等于真值, 也不能包含真值的长子串 (启动时校验).
 
+候选空间提示: charset 与 body 长度区间 (总长减 prefix) 共同决定候选 mock 的总数
+`Σ charset大小^长度`. 候选总数低于 2^20 (运行时探测预算) 时, 配置写入时 (static 加载 /
+WebUI 保存) 会打 WARN 提示运行时探测可能耗尽 (此时由 `[redact] on_probe_exhausted`
+决定跳过或拒绝) — 收到该 WARN 请加宽 `charset` 或 `length_range`. 例如 charset 仅 2
+个字符 × 固定长度 4 只有 16 个候选, 属于高危配置; 缺省 (按真值推断) 的策略对正常长度
+的 secret 通常空间充足, 但真值字符种类退化 (如 `"aaaa"` → 单字符 charset) 时同样会触发.
+
 ## `[auth]` — 认证 (默认关闭 = 单用户模式)
 
 默认 `enabled = false`: 所有路由无认证, 适合个人本机使用. 需要多用户 / 暴露给

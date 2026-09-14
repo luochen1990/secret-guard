@@ -204,6 +204,116 @@ impl GenSpec {
     }
 }
 
+// ─── 候选空间 lint (配置期 WARN) ──────────────────────────────────────────
+
+/// 配置期候选空间 lint 的 WARN 阈值: Auto 模式 gen spec 的候选空间低于此值时,
+/// [`MockStrategy::lint_candidate_space`] 返回 `Some` (由调用方 WARN).
+///
+/// # rationale
+///
+/// 运行时 mock probing 上限是 `redact::MOCK_PROBE_LIMIT` (生产 2^20, 见
+/// `src/redact.rs`): redact 需要为每个 secret 找到**不在 IR 中且未被分配**的 mock,
+/// 有效空间还要再扣除 IR 已有内容与已分配 mock — 因此名义候选空间一旦低于探测
+/// 上限, 配合对抗性 IR 内容即可让 probing 耗尽 (触发
+/// `[redact] on_probe_exhausted` 的 fail-open/fail-closed). 本 lint 把这类弱配置
+/// 提前到配置写入时 (static 加载 / WebUI upsert) 暴露.
+///
+/// # 与 `redact::MOCK_PROBE_LIMIT` 的关系
+///
+/// 阈值语义独立成常量, **不引用** `redact::MOCK_PROBE_LIMIT` — mock → redact 是
+/// 反向依赖 (依赖方向图见根 AGENTS.md, redact → codec/mock 才是合法方向).
+/// 两者数值若需联动, 由人维护同步 (当前同为 2^20).
+pub const MIN_CANDIDATE_SPACE_WARN: u64 = 1 << 20;
+
+/// 弱候选空间 lint 的结果 (纯数据; 由调用方决定 WARN 文案, 便于单元测试).
+/// 严禁携带 secret value 或 mock 明文 (SEC 红线).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CandidateSpaceLint {
+    /// 候选空间 Σ charset_size^len (body 区间, u64 saturating — 超大空间封顶).
+    pub space: u64,
+    /// 去重后 charset 大小 ([`Charset::enabled_chars`] 的长度).
+    pub charset_size: usize,
+    /// 参与求和的 body 长度闭区间 (总长 `length_range` 减 prefix 字符数;
+    /// prefix 是固定字节不参与随机选择, 同 `GenSpec::body_length_range` 的语义).
+    pub body_length_range: (usize, usize),
+}
+
+impl GenSpec {
+    /// body (随机部分) 的长度闭区间: 总长 `length_range` 减 prefix 字符数
+    /// (saturating). 与 `gen_one_auto_body` 的生成语义对齐 — prefix 固定不随机.
+    fn body_length_range(&self) -> (usize, usize) {
+        let prefix_len = self.prefix.chars().count();
+        (
+            self.length_range.0.saturating_sub(prefix_len),
+            self.length_range.1.saturating_sub(prefix_len),
+        )
+    }
+
+    /// 候选空间大小: 对 body 长度区间求和 `Σ charset_size^len`, u64 saturating
+    /// (超大空间封顶于 `u64::MAX`, 不因溢出 panic).
+    ///
+    /// # 假设声明 (lenient, 纯算术不 panic)
+    ///
+    /// 输入按"已 resolve + 已 validate"的 spec 设计 (min ≥ 1, min ≤ max,
+    /// prefix ≤ min, charset 非空), 但对未 resolve / 畸形形态按字面求和:
+    /// - charset 为空 → `0` (无法生成任何候选; validate 已拒绝此形态);
+    /// - `length_range = (0, 0)` (未配置) → `charset_size^0 = 1` (唯一空 body 候选);
+    /// - `min > max` (畸形区间) → 求和为空集 → `0` (validate 已拒绝此形态).
+    pub fn candidate_space(&self) -> u64 {
+        let charset_size = self.charset.enabled_chars().len() as u64;
+        if charset_size == 0 {
+            return 0;
+        }
+        let (bmin, bmax) = self.body_length_range();
+        if bmax < bmin {
+            return 0;
+        }
+        if charset_size == 1 {
+            // 每个长度恰 1 个候选: 空间 = 区间宽度. 直接算, 避免对极宽区间逐长度循环.
+            return ((bmax - bmin) as u64).saturating_add(1);
+        }
+        // charset ≥ 2: term 每步至少 ×2, ≤64 步内饱和; 饱和后早退, 循环有界
+        // (防极宽 length_range 造成 lint 自身长循环).
+        let mut term: u64 = if bmin >= 64 {
+            u64::MAX
+        } else {
+            charset_size.saturating_pow(bmin as u32)
+        };
+        let mut total = term;
+        for _ in (bmin + 1)..=bmax {
+            if term == u64::MAX {
+                break;
+            }
+            term = term.saturating_mul(charset_size);
+            total = total.saturating_add(term);
+        }
+        total
+    }
+}
+
+impl MockStrategy {
+    /// 配置期 lint: Auto 模式下 gen spec 的候选空间 < [`MIN_CANDIDATE_SPACE_WARN`]
+    /// 时返回 `Some` (弱配置信号). **纯函数不直接打日志**, 由调用方 WARN — 便于单元测试.
+    ///
+    /// # 调用前提 (无重复 resolve 副作用)
+    ///
+    /// 必须在 [`MockStrategy::resolve_against`] **之后**调用 (如
+    /// `crate::secrets::SecretEntry::validate_and_resolve` 的第四步后): Auto 模式
+    /// 此时 `gen_spec` 已是 `Some` (用户显式设置或 infer 填充), 直接读取即可,
+    /// 本函数不做任何 resolve / 变异. 以下形态返回 `None` (无法 lint, 不误报):
+    /// - `gen_spec = None` (Auto 未 resolve, 或 Fixed 模式): 前者空间未知,
+    ///   后者的 probing 候选是 `{value}_{counter}` (counter 无上界), 不受 gen spec 限制.
+    pub fn lint_candidate_space(&self) -> Option<CandidateSpaceLint> {
+        let gen_spec = self.gen_spec.as_ref()?;
+        let space = gen_spec.candidate_space();
+        (space < MIN_CANDIDATE_SPACE_WARN).then(|| CandidateSpaceLint {
+            space,
+            charset_size: gen_spec.charset.enabled_chars().len(),
+            body_length_range: gen_spec.body_length_range(),
+        })
+    }
+}
+
 // ─── InitialValue ──────────────────────────────────────────────────────────
 
 /// 初始值模式 (维度一).
@@ -416,10 +526,7 @@ fn gen_one_auto_body(
     counter: u32,
     retry: u32,
 ) -> String {
-    let (min, max) = gen_spec.length_range;
-    let prefix_len = gen_spec.prefix.chars().count();
-    let body_min = min.saturating_sub(prefix_len);
-    let body_max = max.saturating_sub(prefix_len);
+    let (body_min, body_max) = gen_spec.body_length_range();
 
     // body 长度: min==max 时固定, 否则按 hash 在 [body_min, body_max] 选.
     // `retry` 进入 hash 输入 → 不同 retry 产出不同长度 (当 min!=max) 或不同字符.
@@ -430,6 +537,7 @@ fn gen_one_auto_body(
         body_min + (h % (body_max - body_min + 1) as u64) as usize
     };
 
+    let prefix_len = gen_spec.prefix.chars().count();
     let mut buf = String::with_capacity(prefix_len + body_len);
     buf.push_str(&gen_spec.prefix);
     for i in 0..body_len {
@@ -623,6 +731,223 @@ mod tests {
             length_range: (10, 20),
         };
         assert!(gen_spec.validate().is_ok());
+    }
+
+    // ─── 候选空间 (candidate_space) ────────────────────────────────────────
+
+    /// 构造仅含 n 个自定义字符的 charset (其余全关).
+    fn charset_of(n_chars: &str) -> Charset {
+        Charset {
+            other: n_chars.chars().collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn candidate_space_fixed_small() {
+        // charset 2 × 固定长度 4 = 2^4 = 16 (任务书示例的弱配置).
+        let gen_spec = GenSpec {
+            prefix: "".into(),
+            charset: charset_of("ab"),
+            length_range: (4, 4),
+        };
+        assert_eq!(gen_spec.candidate_space(), 16);
+    }
+
+    #[test]
+    fn candidate_space_range_sum() {
+        // charset 2 × 区间 [3,5] = 2^3 + 2^4 + 2^5 = 56.
+        let gen_spec = GenSpec {
+            prefix: "".into(),
+            charset: charset_of("ab"),
+            length_range: (3, 5),
+        };
+        assert_eq!(gen_spec.candidate_space(), 8 + 16 + 32);
+    }
+
+    #[test]
+    fn candidate_space_subtracts_prefix() {
+        // prefix "ab" 固定 2 字符 → body 区间 [2,2], charset 2 → 2^2 = 4.
+        let gen_spec = GenSpec {
+            prefix: "ab".into(),
+            charset: charset_of("xy"),
+            length_range: (4, 4),
+        };
+        assert_eq!(gen_spec.candidate_space(), 4);
+        assert_eq!(gen_spec.body_length_range(), (2, 2));
+    }
+
+    #[test]
+    fn candidate_space_saturates() {
+        // charset 36 × 长度 64: 36^64 远超 u64 → 封顶 u64::MAX, 不 panic.
+        let gen_spec = GenSpec {
+            prefix: "".into(),
+            charset: Charset {
+                digits: true,
+                lowercase: true,
+                ..Default::default()
+            },
+            length_range: (64, 64),
+        };
+        assert_eq!(gen_spec.candidate_space(), u64::MAX);
+        // 极宽区间同样封顶 (早退, 不长循环).
+        let wide = GenSpec {
+            prefix: "".into(),
+            charset: charset_of("ab"),
+            length_range: (1, usize::MAX),
+        };
+        assert_eq!(wide.candidate_space(), u64::MAX);
+    }
+
+    #[test]
+    fn candidate_space_single_char_charset() {
+        // charset 1: 每个长度恰 1 个候选, 空间 = 区间宽度 [4,8] = 5.
+        let gen_spec = GenSpec {
+            prefix: "".into(),
+            charset: charset_of("x"),
+            length_range: (4, 8),
+        };
+        assert_eq!(gen_spec.candidate_space(), 5);
+    }
+
+    #[test]
+    fn candidate_space_lenient_degenerate_shapes() {
+        // 假设声明的字面语义 (validate 已拒绝的形态, 纯算术不 panic):
+        // 空 charset → 0.
+        let empty_cs = GenSpec {
+            prefix: "".into(),
+            charset: Charset::default(),
+            length_range: (4, 4),
+        };
+        assert_eq!(empty_cs.candidate_space(), 0);
+        // 未配置 (0,0) → 单一空 body 候选 = 1.
+        let unconfigured = GenSpec {
+            prefix: "".into(),
+            charset: charset_of("ab"),
+            length_range: (0, 0),
+        };
+        assert_eq!(unconfigured.candidate_space(), 1);
+        // 畸形 min > max → 空集求和 = 0.
+        let malformed = GenSpec {
+            prefix: "".into(),
+            charset: charset_of("ab"),
+            length_range: (5, 3),
+        };
+        assert_eq!(malformed.candidate_space(), 0);
+    }
+
+    // ─── 候选空间 lint (lint_candidate_space) ──────────────────────────────
+
+    #[test]
+    fn lint_explicit_weak_spec_is_some() {
+        // 显式弱配置: charset 2 × len 4 = 16 << 2^20.
+        let s = MockStrategy {
+            initial: InitialValue::Auto,
+            gen_spec: Some(GenSpec {
+                prefix: "".into(),
+                charset: charset_of("ab"),
+                length_range: (4, 4),
+            }),
+        };
+        let lint = s.lint_candidate_space().expect("weak spec should lint");
+        assert_eq!(lint.space, 16);
+        assert_eq!(lint.charset_size, 2);
+        assert_eq!(lint.body_length_range, (4, 4));
+    }
+
+    #[test]
+    fn lint_strong_spec_is_none() {
+        // 强配置: charset 62 (alnum+_) × len 12 → 62^12 远超 2^20.
+        let s = MockStrategy {
+            initial: InitialValue::Auto,
+            gen_spec: Some(GenSpec {
+                prefix: "".into(),
+                charset: Charset {
+                    digits: true,
+                    lowercase: true,
+                    uppercase: true,
+                    underscore: true,
+                    ..Default::default()
+                },
+                length_range: (12, 12),
+            }),
+        };
+        assert!(s.lint_candidate_space().is_none());
+    }
+
+    #[test]
+    fn lint_auto_degenerate_real_is_some() {
+        // Auto + 退化 real "aaaa": infer 出 lowercase 类 (26 字符), 空间 26^4 = 456976
+        // 仍低于 2^20 → lint.
+        let mut s = MockStrategy::default();
+        s.resolve_against("aaaa", "");
+        let lint = s
+            .lint_candidate_space()
+            .expect("degenerate real should lint");
+        assert_eq!(lint.charset_size, 26);
+        assert_eq!(lint.space, 456_976);
+        // 全 "other" 字符的退化 real: charset 退化为单字符 '!' → 空间 1.
+        let mut s = MockStrategy::default();
+        s.resolve_against("!!!!", "");
+        let lint = s
+            .lint_candidate_space()
+            .expect("degenerate real should lint");
+        assert_eq!(lint.charset_size, 1);
+        assert_eq!(lint.space, 1);
+    }
+
+    #[test]
+    fn lint_auto_normal_real_is_none() {
+        // Auto + 正常 real (多种字符, 足够长) → infer 空间远超 2^20.
+        let mut s = MockStrategy::default();
+        s.resolve_against("sk-1234567890abcdef", "");
+        assert!(s.lint_candidate_space().is_none());
+    }
+
+    #[test]
+    fn lint_fixed_mode_and_unresolved_auto_are_none() {
+        // Fixed 模式: probing 候选 {value}_{counter} 无上界, 不受 gen spec 限制.
+        let fixed = MockStrategy {
+            initial: InitialValue::Fixed {
+                value: "mock-value".into(),
+            },
+            gen_spec: None,
+        };
+        assert!(fixed.lint_candidate_space().is_none());
+        // Auto 未 resolve (gen None): 空间未知, 不误报.
+        let unresolved = MockStrategy::default();
+        assert!(unresolved.lint_candidate_space().is_none());
+    }
+
+    #[test]
+    fn lint_threshold_boundary() {
+        // 边界语义: space == 阈值不 lint (< 才 lint); space == 阈值/2 lint.
+        let at = MockStrategy {
+            initial: InitialValue::Auto,
+            gen_spec: Some(GenSpec {
+                prefix: "".into(),
+                charset: charset_of("ab"),
+                length_range: (20, 20), // 2^20 = MIN_CANDIDATE_SPACE_WARN.
+            }),
+        };
+        assert_eq!(
+            at.gen_spec.as_ref().unwrap().candidate_space(),
+            MIN_CANDIDATE_SPACE_WARN
+        );
+        assert!(at.lint_candidate_space().is_none(), "space == 阈值不 lint");
+
+        let below = MockStrategy {
+            initial: InitialValue::Auto,
+            gen_spec: Some(GenSpec {
+                prefix: "".into(),
+                charset: charset_of("ab"),
+                length_range: (19, 19), // 2^19 = 阈值/2 < 阈值.
+            }),
+        };
+        assert!(
+            below.lint_candidate_space().is_some(),
+            "space < 阈值要 lint"
+        );
     }
 
     // ─── MockStrategy ─────────────────────────────────────────────────────

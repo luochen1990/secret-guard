@@ -153,6 +153,9 @@ impl SecretEntry {
     ///    [`MockStrategy::validate_against_real`]): 用 resolve 后的 real value infer
     ///    gen spec (Auto 模式) 并校验 Fixed 不含 real 子串 (C5 best-effort). 必须在 value
     ///    resolve 后跑, 因为 infer 与 C5 检查都依赖 real value.
+    /// 5. **候选空间 lint** ([`MockStrategy::lint_candidate_space`]): gen spec 定型后
+    ///    对弱候选空间 (低于 [`crate::mock::MIN_CANDIDATE_SPACE_WARN`]) 打 WARN —
+    ///    把运行时 probing 耗尽的风险前置到配置写入时. 仅 WARN 不 reject (合法但高危).
     ///
     /// # 与 Provider 的差异
     ///
@@ -165,6 +168,21 @@ impl SecretEntry {
         self.mock_strategy
             .resolve_against(&self.value, global_mock_prefix);
         self.mock_strategy.validate_against_real(&self.value)?;
+        // 配置期候选空间 lint (弱 mock 策略前置 WARN, 非 reject): resolve 之后 gen_spec
+        // 已定型, 此处纯读. 所有 entry 进入系统的路径 (static 加载 / dynamic 加载 /
+        // WebUI upsert) 都经过本方法, 是公共 choke point. WARN 内容严禁含 secret value
+        // 或 mock (SEC 红线) — 只含 id / 数字 / 建议.
+        if let Some(lint) = self.mock_strategy.lint_candidate_space() {
+            tracing::warn!(
+                secret_id = %self.id,
+                charset_size = lint.charset_size,
+                body_length_range = ?lint.body_length_range,
+                candidate_space = lint.space,
+                min_recommended = crate::mock::MIN_CANDIDATE_SPACE_WARN,
+                "mock gen spec candidate space is below the probing budget; runtime \
+                 probing may exhaust (on_probe_exhausted); widen charset or length_range"
+            );
+        }
         Ok(())
     }
 }
@@ -675,6 +693,74 @@ mod tests {
             mock_strategy: crate::mock::MockStrategy::default(),
         };
         assert!(e.validate().is_ok());
+    }
+
+    // ─── validate_and_resolve 的候选空间 lint 触发路径 ─────────────────────
+    //
+    // validate_and_resolve 是 static 加载 (Config::load_or_default) / dynamic 加载
+    // (DynamicState::load_or_empty) / WebUI upsert (web::api::secrets create/update)
+    // 三条路径的公共 choke point; lint 在其内部第四步 (resolve_against) 之后执行.
+    // 日志断言不做 (tracing 测试开销大), 单元级验证: 返回值 Ok + resolve 后的
+    // entry 状态使 lint 触发/不触发.
+
+    #[test]
+    fn validate_and_resolve_leaves_weak_spec_lintable() {
+        // 显式弱 mock 策略 (charset 2 × len 4 = 16 候选): 校验通过 (合法但高危),
+        // validate_and_resolve 后 lint 仍可触发 — 即 choke point 路径上 WARN 会发出.
+        let mut e = SecretEntry {
+            id: "weak-spec".into(),
+            name: None,
+            category: SecretCategory::ApiKey,
+            value: "some-real-secret-value".into(),
+            value_file: None,
+            mock_strategy: crate::mock::MockStrategy {
+                initial: crate::mock::InitialValue::Auto,
+                gen_spec: Some(crate::mock::GenSpec {
+                    prefix: "".into(),
+                    charset: crate::mock::Charset {
+                        other: vec!['a', 'b'],
+                        ..Default::default()
+                    },
+                    length_range: (4, 4),
+                }),
+            },
+        };
+        assert!(e.validate_and_resolve("").is_ok());
+        let lint = e
+            .mock_strategy
+            .lint_candidate_space()
+            .expect("weak spec should be lintable after validate_and_resolve");
+        assert_eq!(lint.space, 16);
+        // lint 结果不含 value/mock 字段是类型系统保证 (CandidateSpaceLint 只有数字).
+    }
+
+    #[test]
+    fn validate_and_resolve_auto_degenerate_real_lintable() {
+        // Auto + 退化 real "aaaa": infer 出 lowercase 类 (26 字符) × len 4 = 456976 候选,
+        // 仍低于 2^20 → validate_and_resolve 后 lint 可触发.
+        let mut e = SecretEntry {
+            id: "degenerate".into(),
+            name: None,
+            category: SecretCategory::ApiKey,
+            value: "aaaa".into(),
+            value_file: None,
+            mock_strategy: crate::mock::MockStrategy::default(),
+        };
+        assert!(e.validate_and_resolve("").is_ok());
+        let lint = e
+            .mock_strategy
+            .lint_candidate_space()
+            .expect("degenerate real should be lintable after validate_and_resolve");
+        assert_eq!(lint.space, 456_976);
+        assert_eq!(lint.charset_size, 26);
+    }
+
+    #[test]
+    fn validate_and_resolve_normal_real_not_lintable() {
+        // 正常 real + 默认 Auto 策略: infer 空间充足, lint 不触发.
+        let mut e = entry("normal", "sk-1234567890abcdef");
+        assert!(e.validate_and_resolve("").is_ok());
+        assert!(e.mock_strategy.lint_candidate_space().is_none());
     }
 
     // ─── SEC-1: EffectiveSecret JSON 永不含真实 value ────────────────────
