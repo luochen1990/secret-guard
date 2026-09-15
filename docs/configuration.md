@@ -281,6 +281,7 @@ WebUI 保存) 会打 WARN 提示运行时探测可能耗尽 (此时由 `[redact]
 | `enabled` | bool | `false` | `true` 时: WebUI 需 OIDC 登录, 转发路径需 API key. |
 | `oidc` | table | — | OIDC Provider 配置 (enabled = true 时必填). |
 | `api_keys` | array | `[]` | 静态预设 API key (也可在 WebUI 的 API Keys 页签发). |
+| `secure_cookie` | bool | `false` | session cookie 是否带 Secure flag. 经反向代理以 HTTPS 暴露时应设 `true` (本地 HTTP dev 必须 `false` — `true` 时浏览器不回传 cookie). |
 
 `[auth.oidc]` 字段:
 

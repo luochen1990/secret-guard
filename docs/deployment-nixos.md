@@ -122,18 +122,27 @@ store, 调试不便, 与 nixos 生态主流模式 (hermes-agent / bazarr) 不一
 
 ## HTTPS 反向代理: session cookie 的 Secure flag
 
-`secret-guard` 当前在 `src/auth/session.rs::build_session_layer` 中**硬编码
-`with_secure(false)`**. 这是本地 HTTP 开发模式必须的设置 — `Secure` flag 会让浏览器
-拒绝在 HTTP 连接上回传 cookie, 导致 OIDC 流程在 `localhost` 调试时无法登录.
+`secret-guard` 的 session cookie Secure flag 由 `[auth] secure_cookie` 控制, **默认
+`false`** — 这是本地 HTTP 开发模式必须的设置: `Secure` flag 会让浏览器拒绝在 HTTP
+连接上回传 cookie, 导致 OIDC 流程在 `localhost` 调试时无法登录.
 
-**生产部署的隐患**: 若把 `secret-guard` 暴露在公网并通过反向代理 (nginx / Caddy /
-Traefik) 终止 TLS, 浏览器与反代之间虽然是 HTTPS, 但 `secret-guard` 本身仍监听 HTTP,
-发出的 session cookie 不带 `Secure` flag. 此时 cookie 在浏览器与反代之间的 HTTPS 段
-是安全的, 但浏览器若误用 HTTP 访问相同 origin (如用户手输 URL 漏 `https://`), cookie
+**生产部署**: 若把 `secret-guard` 暴露在公网并通过反向代理 (nginx / Caddy /
+Traefik) 终止 TLS, 应显式设 `[auth] secure_cookie = true`, 让 session cookie 带
+`Secure` flag. 不设的隐患: 浏览器与反代之间虽然是 HTTPS, 但 cookie 不带 `Secure`
+flag, 浏览器若误用 HTTP 访问相同 origin (如用户手输 URL 漏 `https://`), cookie
 会被明文发送, 构成 MITM 风险.
 
-**当前缓解**: 反向代理配置 HTTP→HTTPS 301 重定向 (nginx `return 301 https://$host$request_uri`),
-让浏览器无法通过 HTTP 访问 origin.
+```toml
+[auth]
+enabled = true
+secure_cookie = true
+```
+
+> NixOS 结构化选项 (`services.secret-guard.auth.*`) 暂未暴露此字段 — 用
+> `configFile` escape hatch 手写 toml (与结构化选项互斥, 见 "configFile 互斥" 段),
+> 或暂以反代 HTTP→HTTPS 301 重定向 (nginx `return 301 https://$host$request_uri`)
+> 缓解: 让浏览器无法通过 HTTP 访问 origin. 从 `X-Forwarded-Proto` header 动态推断
+> 仍是后续工作.
 
 **Host guard 推荐姿势 (SEC-7)**: 反向代理**显式保留原始域名 Host** 并在
 secret-guard 声明信任该域名 (NixOS 选项 `services.secret-guard.allowedDomains`,
@@ -154,10 +163,6 @@ proxy_set_header Host $host;
 你手写的名单), 见 `src/server_host_guard.rs` 头部白名单语义。
 备选 (不推荐): 反代把 Host 改写为 IP 形态 (`proxy_set_header Host 127.0.0.1:18787;`)
 也可放行, 但浏览器侧 OIDC redirect / cookie 域语义可能受影响。
-
-**根治方案 (后续工作)**: 给 `build_session_layer` 加配置开关 (例如 `[auth] secure_cookie = true`),
-或从 `X-Forwarded-Proto` header 动态推断. 当前硬编码 `false` 是 MVP 的简化, 见
-`src/auth/session.rs::build_session_layer` 头部注释.
 
 ## secret entries 的批量注入 (value_file + LoadCredential)
 

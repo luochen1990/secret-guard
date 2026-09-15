@@ -199,6 +199,8 @@ fn build_router_inner(state: AppState, auth_stack: Option<AuthStack>, guard: Hos
 pub struct AuthStack {
     pub backend: OidcBackend,
     pub api_keys: ApiKeyStore,
+    /// session cookie Secure flag (来自 `[auth] secure_cookie`).
+    pub secure_cookie: bool,
 }
 
 /// 构建带认证的 router.
@@ -214,7 +216,11 @@ fn build_router_with_auth_layers(
 ) -> Router {
     use axum_login::AuthManagerLayerBuilder;
 
-    let AuthStack { backend, api_keys } = auth;
+    let AuthStack {
+        backend,
+        api_keys,
+        secure_cookie,
+    } = auth;
     let auth_state = crate::auth::handlers::AuthState {
         backend: backend.clone(),
         api_keys: api_keys.clone(),
@@ -251,7 +257,7 @@ fn build_router_with_auth_layers(
     ));
 
     // session + auth layer (应用于整个 app).
-    let session_layer = crate::auth::build_session_layer();
+    let session_layer = crate::auth::build_session_layer(secure_cookie);
     let auth_layer = AuthManagerLayerBuilder::new(backend, session_layer).build();
 
     Router::new()
@@ -474,7 +480,11 @@ pub async fn serve(
         .map_err(|e| anyhow::anyhow!("OIDC initialization failed: {e}"))?;
 
         // api_keys 已在 auth 分支外构造 (与 AppState 共享同一份).
-        let auth_stack = AuthStack { backend, api_keys };
+        let auth_stack = AuthStack {
+            backend,
+            api_keys,
+            secure_cookie: auth_config.secure_cookie,
+        };
         build_router_with_auth(proxy, auth_stack, host_guard)
     } else {
         build_router(proxy, host_guard)

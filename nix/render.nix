@@ -16,6 +16,7 @@
 #     形态 value_file, 不支持内联 value)
 #   - AuthConfig (src/auth/mod.rs): enabled + oidc{issuer_url / client_id /
 #     client_secret_file? / redirect_url?} + api_keys[]{label / key? / key_file?}
+#     (secure_cookie 不经渲染器 — 结构化选项未暴露, 用 configFile escape hatch)
 #   - UsageConfig (src/config.rs): enabled / retention_days / pricing_url /
 #     pricing_refresh_secs / pricing_override{model → input / output /
 #     cache_read? / cache_write?} (cache 两维省略 = serde None → 上游回退

@@ -547,7 +547,7 @@ const KNOWN_FIELDS: &[(&str, &[&str])] = &[
         &["input", "output", "cache_read", "cache_write"],
     ),
     // Config::auth (AuthConfig)
-    ("auth", &["enabled", "oidc", "api_keys"]),
+    ("auth", &["enabled", "oidc", "api_keys", "secure_cookie"]),
     // auth.oidc (OidcConfig)
     (
         "auth.oidc",
@@ -1555,6 +1555,7 @@ fn serialized_full_sample_paths() -> Vec<String> {
                 key: Some("sk-sample".into()),
                 key_file: None,
             }],
+            secure_cookie: true,
         },
     };
     let value = toml::Value::try_from(&sample).expect("sample Config serializes to TOML");

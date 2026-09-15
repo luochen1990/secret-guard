@@ -44,6 +44,10 @@ pub struct AuthConfig {
     /// 静态预设 API key 列表.
     #[serde(default)]
     pub api_keys: Vec<StaticApiKey>,
+    /// session cookie 是否带 Secure flag. 默认 false (本地 HTTP dev 必须 — true 时浏览器
+    /// 不回传 cookie). 经反向代理以 HTTPS 暴露 secret-guard 时应设 true.
+    #[serde(default)]
+    pub secure_cookie: bool,
 }
 
 /// 静态预设 API key. 明文由用户直接写在配置文件中, 启动时 hash 后注入 ApiKeyStore.
@@ -241,6 +245,7 @@ mod tests {
                 redirect_url: redirect_url.map(str::to_string),
             }),
             api_keys: vec![],
+            secure_cookie: false,
         }
     }
 

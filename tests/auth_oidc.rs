@@ -662,7 +662,7 @@ async fn build_test_router(backend: OidcBackend) -> String {
         .route("/api/me", get(me))
         .layer(axum::Extension(auth_state));
 
-    let session_layer = build_session_layer();
+    let session_layer = build_session_layer(false); // 测试走 HTTP, Secure flag 须关
     let auth_layer = AuthManagerLayerBuilder::new(backend, session_layer).build();
 
     let app = Router::new().merge(auth_routes).layer(auth_layer);
@@ -1206,7 +1206,7 @@ async fn oauth_callback_happy_path_full_round_trip() {
     //      (IdP 真实验 PKCE S256 + 用 authorize 时记录的 nonce 签 id_token) →
     //      验签 + nonce 匹配 → 登录成功 303 "/"
     //   4. /api/me → 200 + 已登录用户 claims
-    let (idp, base) = spawn_full_auth_router().await;
+    let (idp, base) = spawn_full_auth_router(false).await;
     idp.set_token_policy(TokenPolicy::AuthorizeCode);
     let client = http_client();
 
@@ -1309,7 +1309,7 @@ async fn oauth_callback_rejects_pkce_verification_failure() {
     // PKCE 负对照 (FWD-AUTH-3 的反向): IdP 侧记录的 code_challenge 被篡改后,
     // S256(server session 里的 verifier) 必不匹配 → /token 400 → exchange 失败 →
     // callback 500 + 用户未登录. 证明 happy path 里的 PKCE 比对是真实门禁而非摆设.
-    let (idp, base) = spawn_full_auth_router().await;
+    let (idp, base) = spawn_full_auth_router(false).await;
     idp.set_token_policy(TokenPolicy::AuthorizeCode);
     let client = http_client();
 
@@ -1422,7 +1422,7 @@ async fn logout_clears_session_and_redirects() {
 /// 先 bind listener 拿到实际 port, 再用该 port 构造 redirect_url 做 discovery —
 /// mock IdP /authorize 的 302 因此指回本 server 的真实 callback URL, 测试可原样
 /// 跟随 (与生产 redirect_url 形态一致).
-async fn spawn_full_auth_router() -> (MockIdp, String) {
+async fn spawn_full_auth_router(secure_cookie: bool) -> (MockIdp, String) {
     let idp = spawn_mock_idp().await;
 
     let api_keys = empty_api_key_store("sg-auth-smoke");
@@ -1479,7 +1479,11 @@ async fn spawn_full_auth_router() -> (MockIdp, String) {
     // Host guard (SEC-7) 装配 Router.
     let app = secret_guard::server::build_router_with_auth(
         state,
-        secret_guard::server::AuthStack { backend, api_keys },
+        secret_guard::server::AuthStack {
+            backend,
+            api_keys,
+            secure_cookie, // 由调用方决定 — false: HTTP 测试; true: 接线 e2e
+        },
         secret_guard::server_host_guard::HostGuard::new("127.0.0.1", addr.port()),
     );
     tokio::spawn(async move {
@@ -1492,7 +1496,7 @@ async fn spawn_full_auth_router() -> (MockIdp, String) {
 async fn full_auth_router_assembly_smoke() {
     // 冒烟: 真实 auth 装配 (build_router_with_auth) 不 panic + 关键路由行为正确.
     // 1. 装配本身不 panic (重复路由会在 serve/bind 时 panic, 这里直接暴露).
-    let (_idp, base) = spawn_full_auth_router().await;
+    let (_idp, base) = spawn_full_auth_router(false).await;
     let client = http_client();
 
     // 2. 未登录访问受保护 `/` → 307 到 /login (login_required guard 生效;
@@ -1522,4 +1526,39 @@ async fn full_auth_router_assembly_smoke() {
     //    而非 307) — 守卫 webui_public 与 webui_protected 的分界.
     let resp = client.get(format!("{base}/api/me")).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn full_auth_router_secure_cookie_wiring_e2e() {
+    // [auth] secure_cookie 接线端到端: AuthConfig.secure_cookie → AuthStack →
+    // build_session_layer(secure) 的这条 wire 若在未来重构中断裂 (如 AuthStack
+    // 丢字段), 配置会静默失效 — 本测试用 secure_cookie=true 的生产同构装配
+    // 断言 /login 的 Set-Cookie 携带 Secure 属性, 锁定接线不静默回归.
+    let (_idp, base) = spawn_full_auth_router(true).await;
+    let client = http_client();
+
+    let resp = client.get(format!("{base}/login")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let set_cookie = resp
+        .headers()
+        .get(header::SET_COOKIE)
+        .expect("Set-Cookie must be present after session modification")
+        .to_str()
+        .unwrap();
+    assert!(set_cookie.contains("sg.sid="), "cookie name: {set_cookie}");
+    // 属性断言按 ";" 切分跳过 name=value 段后精确比对 (与 session.rs 单测的
+    // cookie_attrs 同尺子) — 朴素 contains 会误匹配随机 session id 值的子串.
+    let attrs: Vec<String> = set_cookie
+        .split(';')
+        .skip(1)
+        .map(|a| a.trim().to_ascii_lowercase())
+        .collect();
+    assert!(
+        attrs.iter().any(|a| a == "secure"),
+        "secure_cookie=true must set Secure flag, got: {set_cookie}"
+    );
+    assert!(
+        attrs.iter().any(|a| a == "httponly"),
+        "HttpOnly red line independent of secure_cookie, got: {set_cookie}"
+    );
 }

@@ -484,6 +484,9 @@ Secret / Provider 的两种 value 来源 (`value`/`value_file`、`api_key`/`api_
   - `key` (string) / `key_file` (string): 明文或文件路径, 二选一 (互斥语义同
     `[secrets]` 的 `value`/`value_file`, 见 `src/secrets.rs`).
   静态 key 不可删除, 只能 disable/enable.
+- `secure_cookie` (bool, 默认 `false`): session cookie 是否带 Secure flag (本地 HTTP dev
+  必须 false — true 时浏览器不回传 cookie); 经反向代理以 HTTPS 暴露时应设 true
+  (见 `docs/deployment-nixos.md` "HTTPS 反向代理" 段).
 
 配置示例 (`secret-guard.toml`):
 ```toml
@@ -879,10 +882,11 @@ CI runner VM 未预装 treefmt 时 check-fmt 降级 rust-only (见 justfile).
   记录到 WebUI DAG record. 用户若使用自定义 auth header (如 `x-my-service-key`),
   当前无法在不改代码的情况下追加. 后续工作: 暴露为 `[redact] redacted_headers = [...]`
   配置项.
-- **session cookie Secure flag 硬编码 false**: `auth/session.rs::build_session_layer`
-  硬编码 `with_secure(false)` (本地 HTTP dev 必须). 经反向代理暴露 HTTPS 时 cookie 不带
-  Secure flag, 详见 `docs/deployment-nixos.md` "HTTPS 反向代理" 段. 根治方案 (配置开关 /
-  X-Forwarded-Proto 推断) 是后续工作.
+- **session cookie Secure flag 需手动配置 (`secure_cookie`, 无自动推断)**: HTTPS
+  反代部署需手动设 `[auth] secure_cookie = true`, 两个缺口: ① 无 `X-Forwarded-Proto`
+  动态推断; ② NixOS 结构化选项 (`services.secret-guard.auth.*`) 未暴露该字段, 须用
+  `configFile` escape hatch (见 `docs/deployment-nixos.md` "HTTPS 反向代理" 段).
+  忘设的缓解 = 反代 HTTP→HTTPS 301 重定向.
 - **DAG 孤儿节点降级**: parent 被 LRU 淘汰后, child 的 `full_request_messages` 返回 None
   (timeline 降级展示, 不 panic). 显式孤儿标记 (CDAG-7) 尚未实现.
 - **static 基线下 PUT 空串 api_key 无法清空 key (#157 已知限制)**: dynamic override 的
@@ -941,9 +945,6 @@ CI runner VM 未预装 treefmt 时 check-fmt 降级 rust-only (见 justfile).
 - **redact_headers 名单可配置**: 加 `[redact] redacted_headers = [...]` 配置项,
   默认值是现有硬编码名单, 用户可扩展自定义 auth header. 当前硬编码黑名单见
   `proxy/helpers.rs::is_sensitive_header` (SEC-4 已知限制).
-- **session cookie Secure flag 可配置**: 给 `build_session_layer` 加配置开关
-  (`[auth] secure_cookie = true`) 或从 `X-Forwarded-Proto` header 动态推断.
-  当前硬编码 false (本地 HTTP dev 必须), 见 `docs/deployment-nixos.md` "HTTPS 反向代理" 段.
 - mock_secret 的 category-aware 默认生成 (Password/ApiKey/Cookie 等格式感知).
 - 配置热加载; 测试覆盖率自动上报 + fuzzing (cargo-fuzz).
 - **依赖升级** (滞后是稳态, 非风险; Cargo.lock 锁定保证可复现构建; 触发条件满足时再升,
