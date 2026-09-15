@@ -400,6 +400,18 @@ pub async fn serve(
         persist_lock.clone(),
     );
 
+    // #179 可选加固: 启动时对 merged provider 视图做路由环检查, 每环一条 WARN.
+    // 漏网来源 = 手改 state.toml / 并发 upsert TOCTOU (`would_cycle` 检查与
+    // 落库非同一临界区), 否则要等首个请求 503 才暴露 (可观测性弱).
+    // 不阻塞启动: 环只影响这些 router 的请求 (`resolve_route` 503 兜底),
+    // state.toml 永远可删除重置 — fail-fast 会把可恢复状态变成启动死锁.
+    for cycle in provider_table.find_cycles() {
+        tracing::warn!(
+            cycle = ?cycle,
+            "router provider cycle detected (hand-edited state.toml or concurrent upsert?); requests to these routers will 503"
+        );
+    }
+
     let proxy = AppState {
         upstream,
         providers: provider_table,

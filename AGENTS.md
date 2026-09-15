@@ -912,13 +912,16 @@ CI runner VM 未预装 treefmt 时 check-fmt 降级 rust-only (见 justfile).
   fail_open 翻转, SEC-10 降级偏安全). 历史 WARN + 降级字节透传行为 (secret 原样出站,
   静默降级放行) 需显式配 `"fail_open"` opt-in. 仅 model 重写降级 (无 secret) 不受
   开关影响, 两模式都维持 WARN 透传.
-- **路由 provider 跨条目环的启动检查缺失 (#179)**: 自环在 `Provider::validate`
-  (static 加载 fail-fast) 拒绝; 跨条目环只在 WebUI upsert (`would_cycle`, 边集 =
-  启用路由的 target) 与运行时 (`resolve_route` visited-set, 503) 拦截. 两个漏网
-  来源: ① 手改 state.toml; ② 并发 upsert 的 TOCTOU (环检查与落库非同一临界区,
-  单用户本地工具的可接受假设, 与 #157 的 update TOCTOU 声明同型). 漏网环到首个
-  请求才以 503 暴露 (不挂起, 安全但可观测性弱). 启动时对 merged 视图做环检查是
-  可选加固.
+- **路由 provider 跨条目环的残余缺口仅剩启动后 TOCTOU 窗口 (#179)**: 自环在
+  `Provider::validate` (static 加载 fail-fast) 拒绝; 跨条目环的拦截点: WebUI upsert
+  (`would_cycle`, 边集 = 启用路由的 target) / 运行时 (`resolve_route` visited-set,
+  503) / **启动诊断** (`ProviderTable::find_cycles`, `serve()` 对 merged 视图整体做
+  环检查, 每个检测到的环一条 WARN 含环路径; 存在性完备 — 有环必有 WARN — 但不枚举
+  全部简单环, 修复已报告环后重启暴露残余环 — 手改 state.toml 漏网的环在启动日志即暴露, 不必
+  等首个请求 503; 不阻塞启动, 环只影响该 provider 的请求, state.toml 永远可删除
+  重置, fail-fast 会把可恢复状态变成启动死锁). 残余缺口: 并发 upsert 的 TOCTOU
+  (环检查与落库非同一临界区) — 启动后动态产生的环 (启动检查天然覆盖不到) 只有
+  运行时 503 兜底 — 单用户本地工具的可接受假设, 与 #157 的 update TOCTOU 声明同型.
 - **auth 模块测试覆盖率 (OIDC 登录流程)**: auth 模块纯逻辑 (apikey / middleware /
   session / mod) 高覆盖, 含 require_api_key 的 Authorization 剥离断言 (SEC 红线) 与
   build_session_layer 的 cookie 配置 (sg.sid + HttpOnly). OIDC 集成测试

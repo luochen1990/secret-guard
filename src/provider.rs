@@ -200,7 +200,8 @@ pub struct DirectProvider {
 /// base_url / api_key / api_key_file **在此构造下不存在** (sum type 根治
 /// "配置了被忽略" 的非法状态). 路由语义 (per-request 解析 / 坏路由 503 / 环与
 /// 悬空处置) 的 SSOT: [`ProviderTable::resolve_route`] +
-/// [`ProviderTable::would_cycle`] + FWD-5 契约 (`docs/design/contracts.md`).
+/// [`ProviderTable::would_cycle`] + [`ProviderTable::find_cycles`] (启动诊断) +
+/// FWD-5 契约 (`docs/design/contracts.md`).
 ///
 /// **无 protocol 字段**: router 没有事实意义上的协议 — ingress 由 per-request
 /// URL 的 proto_short 决定, egress 由 per-route 链尾实体的 protocol 决定 (混合
@@ -644,73 +645,152 @@ impl DynamicTable<Provider> {
         }
     }
 
-    /// upsert 前校验: 写入 `entry` 后路由边是否会成环 (WebUI 侧拒绝, 400).
-    ///
-    /// 边集 = **所有启用 (priority 非 None) 路由**的 `target` (禁用路由不可
-    /// 遍历, 不构成边). 用 effective 视图构造 id → 启用目标集映射, 用 entry 的
-    /// 新值覆盖其 id 后从 entry 起步沿**每条启用边**探测 (多规则图是 DAG 上有
-    /// 多条出边, 任一分支回到当前路径上的节点即环); 目标不在映射中 (悬空 /
-    /// decision-disabled) 视为链断 — **不算环** (悬空写入放行以保证创建顺序无关,
-    /// 运行时由 `resolve_route` 503 兜底).
+    /// upsert 前校验: 写入 `entry` 后 entry 的路由可达子图内是否存在环
+    /// (WebUI 侧拒绝, 400). 边集语义 (启用路由 / 悬空 / decision-disabled
+    /// 均不算环) 见 `route_graph` doc — 边集 SSOT; 悬空写入放行以保证创建
+    /// 顺序无关, 运行时由 `resolve_route` 503 兜底.
     ///
     /// 并发写入的 TOCTOU 窗口 (检查与 upsert 非同一临界区): 两个并发 PUT 交错可让
     /// 环落库 — 单用户本地工具的可接受假设 (与 update_provider 的 #157 TOCTOU 声明
     /// 一致), 漏网环由 `resolve_route` visited-set 兜底为 503.
     pub fn would_cycle(&self, entry: &Provider) -> bool {
-        // 检查图: id → 启用路由的 target 集合 (Direct 构造为空 = 链终止).
-        let enabled_targets = |routes: &[Route]| -> Vec<String> {
-            routes
-                .iter()
-                .filter(|route| route.priority.is_some())
-                .map(|route| route.target.clone())
-                .collect()
+        // 检查图 = merged 视图邻接表, 用 entry 新值覆盖其 id (walk 必须看到
+        // upsert 后的形态, 而非表中旧值).
+        let mut hops = self.route_graph();
+        let entry_targets = match &entry.kind {
+            ProviderKind::Router(r) => enabled_targets_of(&r.routes),
+            ProviderKind::Direct(..) => vec![],
         };
-        let mut hops: HashMap<String, Vec<String>> = self
-            .effective_snapshot()
+        hops.insert(entry.id.clone(), entry_targets);
+        // 从 entry 起步扫其可达子图: 存在性完备 (有环 ⇔ 至少报一条), 布尔即非空.
+        let mut scan = CycleScan::new(&hops);
+        scan.visit(&entry.id);
+        !scan.out.is_empty()
+    }
+
+    /// merged (static+dynamic+decision) 视图的路由邻接表: provider id → 启用
+    /// 路由的 target 列表. Direct 构造为空 (链终止); dangling target 不在键集
+    /// (走到即止). [`Self::would_cycle`] 与 [`Self::find_cycles`] 的边集 SSOT:
+    /// 禁用路由 (priority=None) 不构成边, decision-disabled 项被 effective
+    /// 视图排除; entry 级 `enabled=false` 的 router 仍贡献边 (潜伏环也值得
+    /// 启动时暴露 — 踏上它的请求实际以 Disabled 503 终止, 语义偏保守无害).
+    fn route_graph(&self) -> HashMap<String, Vec<String>> {
+        self.effective_snapshot()
             .into_iter()
             .map(|e| {
                 let targets = match &e.kind {
-                    EffectiveProviderKind::Router { routes } => enabled_targets(routes),
+                    EffectiveProviderKind::Router { routes } => enabled_targets_of(routes),
                     EffectiveProviderKind::Direct { .. } => vec![],
                 };
                 (e.id.clone(), targets)
             })
-            .collect();
-        let entry_targets = match &entry.kind {
-            ProviderKind::Router(r) => enabled_targets(&r.routes),
-            ProviderKind::Direct(..) => vec![],
-        };
-        hops.insert(entry.id.clone(), entry_targets);
+            .collect()
+    }
 
-        // DFS 环检测: `path` 是当前递归栈 (回到栈上节点 = 环); `done` 记忆已
-        // 完整探索且无环的子图 (汇聚型 DAG 分支不重复走, 也不误报).
-        fn reaches_cycle(
-            node: &str,
-            hops: &HashMap<String, Vec<String>>,
-            path: &mut HashSet<String>,
-            done: &mut HashSet<String>,
-        ) -> bool {
-            if path.contains(node) {
-                return true;
-            }
-            if !done.insert(node.to_string()) {
-                return false; // 已完整探索过, 该子图无环.
-            }
-            path.insert(node.to_string());
-            let found = hops
-                .get(node)
-                .is_some_and(|targets| targets.iter().any(|t| reaches_cycle(t, hops, path, done)));
-            path.remove(node);
-            found
+    /// 对 merged (static+dynamic+decision) 视图整体做路由环检测 (启动诊断用,
+    /// #179 可选加固). 返回检测到的环, 每个环是 provider id 序列
+    /// (a → b → ... → a, 首尾相同). 保证**存在性完备** (图有环 ⇔ 至少报一条)
+    /// 且零误报, 但不保证枚举全部简单环 — 经已探索节点绕行的替代环不单独
+    /// 报告, 修复已报告环后重启即暴露残余环 (启动诊断的迭代发现语义).
+    ///
+    /// 边集 = `route_graph` (边集 SSOT, 语义见其 doc); dangling target 走到
+    /// 即止, 不算环 — 与 `resolve_route` 语义一致, 目标缺失是请求期 503 的事.
+    ///
+    /// 同一环只报告一次: canonical 形态旋转到字典序最小 id 起步 (\[a,b\] 与
+    /// \[b,a\] 是同一环). 消费点: `server::serve` 启动 WARN — 把手改 state.toml
+    /// / 并发 upsert TOCTOU 漏网的环提前到启动日志暴露, 而非等到首个请求 503.
+    pub fn find_cycles(&self) -> Vec<Vec<String>> {
+        let hops = self.route_graph();
+        // 起点按 id 排序 (HashMap 遍历序不确定, 诊断输出需稳定).
+        let mut starts: Vec<&String> = hops.keys().collect();
+        starts.sort();
+        let mut scan = CycleScan::new(&hops);
+        for start in starts {
+            scan.visit(start);
         }
-        let mut path = HashSet::from([entry.id.clone()]);
-        let mut done = HashSet::new();
-        // entry 已在 path 上; 从它的目标起步, 任一分支回到 entry (或路径上节点) 即环.
-        hops.get(&entry.id).is_some_and(|targets| {
-            targets
-                .iter()
-                .any(|t| reaches_cycle(t, &hops, &mut path, &mut done))
-        })
+        scan.out
+    }
+}
+
+/// 路由列表 → 启用路由 (priority 非 None) 的 target 列表. 环检查的边集单元
+/// (`route_graph` 与 `would_cycle` 的 entry 覆盖共用): 禁用路由不可遍历.
+fn enabled_targets_of(routes: &[Route]) -> Vec<String> {
+    routes
+        .iter()
+        .filter(|route| route.priority.is_some())
+        .map(|route| route.target.clone())
+        .collect()
+}
+
+/// 路由图环检测的 DFS 扫描器 (`would_cycle` 与 `find_cycles` 共用的遍历核心,
+/// path-based 三色标记): `on_stack` 是当前递归栈 (灰色), 回到栈上节点 = 环;
+/// `done` 记忆已探索的节点 (黑色 — 存在性完备: 其可达子图有环则必有一条已
+/// 报告, 但经它绕行的替代环不再单独报告); `seen` 去重**平行路由边**: 同一
+/// router 多条启用路由指向同一 on-stack target 时同一栈段会被报告多次
+/// (不同入口的再发现由 `done` 短路, 到不了这).
+struct CycleScan<'a> {
+    hops: &'a HashMap<String, Vec<String>>,
+    stack: Vec<String>,
+    on_stack: HashSet<String>,
+    done: HashSet<String>,
+    seen: HashSet<Vec<String>>,
+    out: Vec<Vec<String>>,
+}
+
+impl<'a> CycleScan<'a> {
+    fn new(hops: &'a HashMap<String, Vec<String>>) -> Self {
+        Self {
+            hops,
+            stack: Vec::new(),
+            on_stack: HashSet::new(),
+            done: HashSet::new(),
+            seen: HashSet::new(),
+            out: Vec::new(),
+        }
+    }
+
+    fn visit(&mut self, node: &str) {
+        if !self.done.insert(node.to_string()) {
+            return; // 黑色: 该子图的所有环已报告过.
+        }
+        self.stack.push(node.to_string());
+        self.on_stack.insert(node.to_string());
+        for target in self.hops.get(node).into_iter().flatten() {
+            if self.on_stack.contains(target) {
+                self.report_cycle(target);
+            } else {
+                self.visit(target);
+            }
+        }
+        self.stack.pop();
+        self.on_stack.remove(node);
+    }
+
+    /// 栈上回到 `target` = 环: 截取栈上 `target..=top` 段, 旋转到字典序最小
+    /// id 起步去重后 (平行路由边防护), 以首尾相同的完整形态 (a → ... → a) 报告.
+    fn report_cycle(&mut self, target: &str) {
+        let start = self
+            .stack
+            .iter()
+            .position(|id| id == target)
+            .expect("on_stack hit implies stack position");
+        let cycle = &self.stack[start..];
+        let min_idx = cycle
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| a.cmp(b))
+            .expect("cycle is non-empty")
+            .0;
+        let canonical: Vec<String> = {
+            // 后段接前段 = 旋转到 min_idx 起步.
+            let (before, after) = cycle.split_at(min_idx);
+            after.iter().chain(before).cloned().collect()
+        };
+        if self.seen.insert(canonical.clone()) {
+            let mut full = canonical;
+            full.push(full[0].clone());
+            self.out.push(full);
+        }
     }
 }
 
@@ -1838,6 +1918,27 @@ mod tests {
     }
 
     #[test]
+    fn would_cycle_rejects_entry_reaching_existing_cycle() {
+        // entry 不在环上但**可达**既有环 (手改 state 落库 a↔b 后, upsert 无辜
+        // feeder c→a): 拒绝条件是 entry 可达子图存在环, 而非 entry 自身在环上.
+        let t = ProviderTable::new(
+            vec![
+                router_to("a", "b"),
+                router_to("b", "a"),
+                p("real", Protocol::OpenAI, "https://u"),
+            ],
+            vec![],
+            empty_decisions(),
+            tempfile_path(),
+        );
+        assert!(
+            t.would_cycle(&router_to("c", "a")),
+            "c reaches the existing a↔b cycle"
+        );
+        assert!(!t.would_cycle(&router_to("c", "real")));
+    }
+
+    #[test]
     fn would_cycle_checks_every_enabled_route_branch() {
         // 多路由: b 的两条启用路由中一条回到 a → 环 (只走单链会漏判).
         let t = ProviderTable::new(
@@ -1880,6 +1981,180 @@ mod tests {
         assert!(
             !t.would_cycle(&entry),
             "converging DAG branches are not a cycle"
+        );
+    }
+
+    // ─── find_cycles (启动诊断, #179 可选加固) ────────────────────────
+
+    #[test]
+    fn find_cycles_detects_two_node_cycle() {
+        // static a→b + dynamic b→a 合并成环 — 正是既有拦截点都漏网的形态:
+        // static validate 只查单条目 (自环), dynamic 落库不经 would_cycle
+        // (手改 state.toml). 恰好检出 1 个环, 路径首尾相同.
+        let t = ProviderTable::new(
+            vec![
+                router_to("a", "b"),
+                p("real", Protocol::OpenAI, "https://u"),
+            ],
+            vec![router_to("b", "a")],
+            empty_decisions(),
+            tempfile_path(),
+        );
+        let cycles = t.find_cycles();
+        assert_eq!(cycles.len(), 1, "a↔b closes exactly one cycle");
+        assert_eq!(cycles[0], vec!["a", "b", "a"]);
+    }
+
+    #[test]
+    fn find_cycles_empty_when_acyclic() {
+        // 链式 (router→router→direct) 与汇聚 diamond 都无环 (不误报).
+        let t = ProviderTable::new(
+            vec![
+                router("entry", vec![route("a*", "mid1"), route("b*", "mid2")]),
+                router_to("mid1", "tail"),
+                router_to("mid2", "tail"),
+                router_to("chain", "entry"),
+                p("tail", Protocol::OpenAI, "https://u"),
+            ],
+            vec![],
+            empty_decisions(),
+            tempfile_path(),
+        );
+        assert!(t.find_cycles().is_empty(), "chain + diamond have no cycle");
+    }
+
+    #[test]
+    fn find_cycles_ignores_disabled_route_edges() {
+        // 禁用路由 (priority=None) 不构成边: a→b (启用) + b→a (禁用) 不成环.
+        let mut back = route("*", "a");
+        back.priority = None;
+        let t = ProviderTable::new(
+            vec![
+                router_to("a", "b"),
+                router("b", vec![back]),
+                p("real", Protocol::OpenAI, "https://u"),
+            ],
+            vec![],
+            empty_decisions(),
+            tempfile_path(),
+        );
+        assert!(t.find_cycles().is_empty(), "disabled route is not an edge");
+    }
+
+    #[test]
+    fn find_cycles_dangling_target_is_not_a_cycle() {
+        // dangling target 指向不存在的 id: 走到即止, 不算环 (与 resolve_route
+        // 语义一致 — 目标缺失是请求期 503 的事).
+        let t = ProviderTable::new(
+            vec![
+                router_to("a", "ghost"),
+                p("real", Protocol::OpenAI, "https://u"),
+            ],
+            vec![],
+            empty_decisions(),
+            tempfile_path(),
+        );
+        assert!(
+            t.find_cycles().is_empty(),
+            "dangling target breaks the walk"
+        );
+    }
+
+    #[test]
+    fn find_cycles_detects_self_loop() {
+        // dynamic 侧自环可绕过 static validate (fail-fast 只覆盖 static 加载)
+        // 与 would_cycle (手改 state.toml 不经 upsert) 落库 — 启动诊断应检出.
+        let t = ProviderTable::new(
+            vec![p("real", Protocol::OpenAI, "https://u")],
+            vec![router_to("a", "a")],
+            empty_decisions(),
+            tempfile_path(),
+        );
+        let cycles = t.find_cycles();
+        assert_eq!(cycles.len(), 1);
+        assert_eq!(cycles[0], vec!["a", "a"]);
+    }
+
+    #[test]
+    fn find_cycles_reports_shared_cycle_once() {
+        // 环外 feeder c→a: a 的再入在 done 短路 (不同入口不会重新发现环),
+        // 环仍恰好报一次.
+        let t = ProviderTable::new(
+            vec![
+                router_to("a", "b"),
+                router_to("b", "a"),
+                router_to("c", "a"),
+                p("real", Protocol::OpenAI, "https://u"),
+            ],
+            vec![],
+            empty_decisions(),
+            tempfile_path(),
+        );
+        let cycles = t.find_cycles();
+        assert_eq!(cycles.len(), 1, "feeder rediscovery deduped");
+        assert_eq!(cycles[0], vec!["a", "b", "a"]);
+    }
+
+    #[test]
+    fn find_cycles_dedupes_parallel_route_edges() {
+        // 平行路由边: b 的两条启用路由指向同一 target a — 同一栈段会被报告
+        // 两次, `seen` canonical 去重后只报一次 (enabled_targets_of 不去重
+        // target, 不同 model_pattern 同 target 是完全合法配置).
+        let t = ProviderTable::new(
+            vec![
+                router_to("a", "b"),
+                router("b", vec![route("gpt-*", "a"), route("claude-*", "a")]),
+                p("real", Protocol::OpenAI, "https://u"),
+            ],
+            vec![],
+            empty_decisions(),
+            tempfile_path(),
+        );
+        let cycles = t.find_cycles();
+        assert_eq!(cycles.len(), 1, "parallel edges to same target deduped");
+        assert_eq!(cycles[0], vec!["a", "b", "a"]);
+    }
+
+    #[test]
+    fn find_cycles_walks_extra_edges_off_cycle() {
+        // 环上节点带额外出边 (b→[a, c], c 又指回环上的 b): 报告 a↔b 环后
+        // walk 继续当前节点的其余边, b↔c 环也被检出 — 若实现改为报告后 break
+        // 边循环, start c 时 b 已 done 会短路, 第二个环漏报 (本断言必红).
+        let t = ProviderTable::new(
+            vec![
+                router_to("a", "b"),
+                router("b", vec![route("*", "a"), route("gpt-*", "c")]),
+                router_to("c", "b"),
+            ],
+            vec![],
+            empty_decisions(),
+            tempfile_path(),
+        );
+        let mut cycles = t.find_cycles();
+        cycles.sort();
+        assert_eq!(cycles.len(), 2, "off-cycle edges keep being walked");
+        assert_eq!(cycles[0], vec!["a", "b", "a"]);
+        assert_eq!(cycles[1], vec!["b", "c", "b"]);
+    }
+
+    #[test]
+    fn find_cycles_decision_disabled_breaks_cycle() {
+        // decision=Disabled 把环上条目从 effective 视图排除 → 边消失, 不成环
+        // (doc 承诺的 decision-disabled 排除语义).
+        let t = ProviderTable::new(
+            vec![
+                router_to("a", "b"),
+                router_to("b", "a"),
+                p("real", Protocol::OpenAI, "https://u"),
+            ],
+            vec![],
+            empty_decisions(),
+            tempfile_path(),
+        );
+        t.set_decision("b", OverrideMode::Disabled).unwrap();
+        assert!(
+            t.find_cycles().is_empty(),
+            "decision-disabled router contributes no edge"
         );
     }
 
@@ -2093,6 +2368,97 @@ mod tests {
                     // Err 分支 = 有限步返回明确错误 (同样满足终止性), 无需断言.
                     // Ok ⇒ 链尾必为 Direct (类型保证, 无需运行时断言); 有限步返回即满足终止性.
                     let _ = t.resolve_route(entry, "gpt-4o");
+                }
+            }
+        }
+    }
+
+    // ─── find_cycles property 交叉验证 (启动环诊断的存在性完备 + 零误报) ──────
+
+    /// 测试参考侧的启用路由边判定, 独立于生产 `route_graph` (测试原则: 不信任
+    /// 被测代码): `from` 是 Router 且存在启用路由 (priority 非 None) target == `to`.
+    fn ref_route_edge(entries: &[Provider], from: &str, to: &str) -> bool {
+        entries.iter().any(|e| {
+            e.id == from
+                && matches!(&e.kind, ProviderKind::Router(r)
+                    if r.routes.iter().any(|rt| rt.priority.is_some() && rt.target == to))
+        })
+    }
+
+    /// 独立参考实现: 朴素 path-DFS 判图是否有环 (邻接只含表内存在的目标,
+    /// 与 find_cycles 的 "dangling 即止" 语义一致; 生成器无 decisions, 全启用).
+    fn ref_has_cycle_impl(ids: &[String], entries: &[Provider]) -> bool {
+        use std::collections::{HashMap, HashSet};
+
+        // 邻接表: Router id → 启用路由的表内目标列表.
+        let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
+        for e in entries {
+            if let ProviderKind::Router(r) = &e.kind {
+                for rt in &r.routes {
+                    if rt.priority.is_some() && ids.iter().any(|id| id == &rt.target) {
+                        adj.entry(e.id.as_str()).or_default().push(&rt.target);
+                    }
+                }
+            }
+        }
+        // 逐起点 path-DFS: 目标已在当前路径上 = 环.
+        fn dfs<'a>(
+            cur: &'a str,
+            adj: &HashMap<&'a str, Vec<&'a str>>,
+            on_path: &mut HashSet<&'a str>,
+        ) -> bool {
+            adj.get(cur).is_some_and(|targets| {
+                targets.iter().any(|&t| {
+                    on_path.contains(t) || {
+                        on_path.insert(t);
+                        let hit = dfs(t, adj, on_path);
+                        on_path.remove(t);
+                        hit
+                    }
+                })
+            })
+        }
+        ids.iter().any(|start| {
+            let mut on_path = HashSet::from([start.as_str()]);
+            dfs(start, &adj, &mut on_path)
+        })
+    }
+
+    proptest! {
+        /// find_cycles 与独立参考实现交叉验证: (a) 存在性完备 — 图有环 ⇔ 检出
+        /// 非空; (b) 零误报 — 每条报告的环首尾相同且相邻 id 间有真实启用路由边.
+        /// 生成器复用 prop_resolve_route 的图分布 (历史教训: 必须含环/自环/悬空).
+        #[test]
+        fn prop_find_cycles_matches_reference(
+            n in 2usize..8,
+            edges in proptest::collection::vec(0usize..8, 0..16),
+        ) {
+            let ids: Vec<String> = (0..n).map(|i| format!("p{i}")).collect();
+            let entries: Vec<Provider> = (0..n)
+                .map(|i| match edges.get(i) {
+                    Some(&t) if t < n => router_to(&ids[i], &ids[t]),
+                    Some(&t) => router_to(&ids[i], &format!("ghost-{t}")),
+                    None => p(&ids[i], Protocol::OpenAI, "https://u"),
+                })
+                .collect();
+            let t = ProviderTable::new(entries.clone(), vec![], empty_decisions(), tempfile_path());
+            let cycles = t.find_cycles();
+
+            // (a) 存在性: 独立 path-DFS 参考实现.
+            let expected = ref_has_cycle_impl(&ids, &entries);
+            prop_assert_eq!(cycles.is_empty(), !expected, "existence mismatch");
+
+            // (b) 零误报: 每条环路径闭合 + 相邻 id 间有启用路由边.
+            for cyc in &cycles {
+                prop_assert_eq!(cyc.first(), cyc.last(), "cycle must be closed: {:?}", cyc);
+                for w in cyc.windows(2) {
+                    prop_assert!(
+                        ref_route_edge(&entries, &w[0], &w[1]),
+                        "edge {} -> {} must be an enabled route edge: {:?}",
+                        w[0],
+                        w[1],
+                        cyc
+                    );
                 }
             }
         }
