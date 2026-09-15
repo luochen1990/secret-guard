@@ -600,7 +600,7 @@ jobs:
       # 详见根 AGENTS.md "cargo-deny" 段.
 
       # ─── nix package 验证 (issue #149-6, 非阻塞起步) ────────────────────────
-      # 验证 nix/package.nix 的 cargoHash 与 Cargo.lock 一致 (漂移时部署侧 ~/ws/nixos
+      # 验证 nix/pkgs/secret-guard.nix 的 cargoHash 与 Cargo.lock 一致 (漂移时部署侧 ~/ws/nixos
       # 重建才暴露, 排障跨仓库). runner 是 NixOS microvm 天然有 nix; store 缓存跨 job
       # 复用, 热路径增量仅重编 workspace crate.
       # continue-on-error: true (非阻塞起步): 首次/依赖大版本升级时全量 vendor 编译
@@ -608,7 +608,7 @@ jobs:
       # 转阻塞判据: 连续 N=20 次 master push 本 step 跑绿后, 移除 continue-on-error
       # (判定方式同 WebUI step: 翻 Actions 历史筛 master + 本 step 取最近 20 次全绿).
       # 注意: 依赖升级 PR 会合法地使 cargoHash 过期 → 本 step 失败属预期信号 (提醒
-      # 同步 nix/package.nix), 不应因非阻塞而被忽视, 维护者需人工关注.
+      # 同步 nix/pkgs/secret-guard.nix), 不应因非阻塞而被忽视, 维护者需人工关注.
       - name: nix build (cargoHash validation)
         id: nixbuild
         continue-on-error: true

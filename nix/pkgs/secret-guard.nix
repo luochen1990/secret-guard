@@ -38,10 +38,10 @@ rustPlatform.buildRustPackage {
     "/nix"
     "/proptest-regressions"
     "/rust-toolchain.toml"
-  ] ../.;
+  ] ../../.;
 
   cargoLock = {
-    lockFile = ../Cargo.lock;
+    lockFile = ../../Cargo.lock;
     # 若未来引入 git dep, 在此处追加 outputHashes; 当前所有 crate 都来自 crates.io.
     outputHashes = {};
   };

@@ -610,7 +610,7 @@ ignored 测试默认不运行故不计入覆盖率, 转正后自动纳入.
 ### 覆盖率工具 (`cargo-llvm-cov`)
 
 集成 cargo-nextest. 工具链与 `LLVM_COV` / `LLVM_PROFDATA` 环境变量由 devShell 注入
-(nix rust toolchain 不带 llvm-tools-preview 组件, 见 `flake.nix`). 所有 coverage 命令
+(nix rust toolchain 不带 llvm-tools-preview 组件, 见 `nix/shells/default.nix`). 所有 coverage 命令
 需在 `nix develop` 内执行.
 
 - `just coverage`: 终端摘要表格.
@@ -688,6 +688,29 @@ NixOS 部署两代姿势: 结构化选项 (`services.secret-guard` 的 providers
 未显式设 configFile 时经 `nix/render.nix` 自动生成 toml, eval 期校验 fail-fast) + 手写
 configFile (escape hatch, 互斥). 凭据注入 (LoadCredential / sops 直接路径) 与 secret
 批量注入方案见 **`docs/deployment-nixos.md`**.
+
+### nix flake 布局 (flake-fhs)
+
+flake outputs 由 [flake-fhs](https://github.com/luochen1990/flake-fhs) 按目录树生成
+(`layout.roots = ["/nix"]`, embed 布局), 目录约定:
+
+- `nix/pkgs/<name>.nix` → `packages.<sys>.<name>` (callPackage 注入)
+- `nix/modules/<name>.nix` → `nixosModules.<name>` (单文件 module, 无 enable 注入)
+- `nix/shells/<name>.nix` → `devShells.<sys>.<name>` (evalContext 注入 pkgs/system)
+- `nix/checks/<name>.nix` → `checks.<sys>.<name>` (callPackage; `nix/checks/scope.nix`
+  补注 lib — scope 默认的 `pkgs.lib` 不含 `nixosSystem`, 见该文件头)
+
+flake-fhs 不生成的 output 由 flake.nix 手动补: `overlays.default` (SSOT 在
+`nix/overlay.nix`, module 内注入与 packages 共用), `packages.default` 别名.
+`nixpkgs.config = {}` 显式清零框架默认的 `allowUnfree = true` (license 合规由
+deny 体系把关, unfree 应被拒绝). 框架无条件生成 `formatter` output (无
+treefmt 配置时 = nixfmt-tree) — 存量 nix 文件 (`nix/module.nix` / `nix/render.nix` /
+`nix/pkgs/secret-guard.nix`) 非 nixfmt 风格, `nix fmt` 全量跑会产生
+大 diff, 格式化单个文件时注意其作用范围.
+扫描名单目录之外的散件 (`nix/module.nix` / `nix/render.nix` / `nix/tests/`) 不被
+收集 — 测试辅助库因此必须留在 `nix/tests/` (checks 目录内的裸 .nix 会被当 check).
+`nix/modules/secret-guard.nix` 是薄组装层 (imports `nix/module.nix` 本体 + overlay
+注入), 保持 `nixosModules.secret-guard` 的 "module + overlay" 语义.
 
 - toml 渲染 SSOT: `nix/render.nix` (纯函数, 与 src serde schema 的同步契约见其文件头,
   契约测试 `nix/tests/render.nix` 锁定); 模块接线冒烟 `nix/tests/module-eval.nix`

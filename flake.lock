@@ -1,5 +1,25 @@
 {
   "nodes": {
+    "flake-fhs": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1784956577,
+        "narHash": "sha256-P5hbwGmmQwqB09lIiCi3PQhSg+oeggQFpMqYGrHOOQI=",
+        "owner": "luochen1990",
+        "repo": "flake-fhs",
+        "rev": "a4e5d6f29400ed7b3a96c108e173a2d28e57f756",
+        "type": "github"
+      },
+      "original": {
+        "owner": "luochen1990",
+        "repo": "flake-fhs",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1788614874,
@@ -18,6 +38,7 @@
     },
     "root": {
       "inputs": {
+        "flake-fhs": "flake-fhs",
         "nixpkgs": "nixpkgs"
       }
     }

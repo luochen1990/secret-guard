@@ -5,7 +5,7 @@
 #   - cargo-deny:  额外覆盖 license 不兼容 + 重复 crate 多版本 + 禁止依赖,
 #                  advisory 段与 cargo-audit 重叠 (互为冗余兜底, 不冲突).
 #
-# 项目声明 MIT license 且要发布 (nix/package.nix), license 合规是硬约束:
+# 项目声明 MIT license 且要发布 (nix/pkgs/secret-guard.nix), license 合规是硬约束:
 # 引入 GPL/AGPL 等 copyleft 会污染下游. 本配置 allow 列表只放宽松 license.
 #
 # 文档: https://embarkstudios.github.io/cargo-deny/

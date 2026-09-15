@@ -105,7 +105,7 @@ single-job runner 上串行占位, 延迟最新 push 的反馈. workflow 级
 16. **Upsert cargo audit report to PR** (仅 PR 事件, `continue-on-error`): audit 结果 upsert
     到 PR 评论, 复用 diff-loc 的 marker 机制让非阻塞的 CVE 不只埋在 job log.
 17. **nix build (cargoHash validation)** (`nix build .#secret-guard -L`,
-    `continue-on-error` 非阻塞起步): 验证 nix/package.nix 的 cargoHash 与 Cargo.lock
+    `continue-on-error` 非阻塞起步): 验证 nix/pkgs/secret-guard.nix 的 cargoHash 与 Cargo.lock
     一致 (漂移时错误只在部署侧 ~/ws/nixos 重建时暴露, 排障跨仓库). 转阻塞判据: 连续
     N=20 次 master push 跑绿 (同 WebUI step 判据). 注意依赖升级 PR 会合法触发本 step
     失败 (提醒同步 cargoHash), 属预期信号.
@@ -135,7 +135,7 @@ single-job runner 上串行占位, 延迟最新 push 的反馈. workflow 级
   无升级计划 (附加功能性质).
 - **nix build (cargoHash validation)**: `continue-on-error` 非阻塞起步 — 首次/依赖大版本
   升级时全量 vendor 编译较慢, 且 cargoHash 过期是已知高频事件 (升级依赖的 PR 必然触发,
-  失败属预期提醒: 同步 nix/package.nix). **退出条件**: 连续 N=20 次 master push 本 step
+  失败属预期提醒: 同步 nix/pkgs/secret-guard.nix). **退出条件**: 连续 N=20 次 master push 本 step
   跑绿后移除 `continue-on-error` (判定方式同 WebUI: 翻 Actions 历史筛 master + 本 step
   取最近 20 次全绿).
 - **cargo-deny / typos**: 已是阻塞门禁 (无观察期, 见下 blockquote). 新误报出现时更新对应

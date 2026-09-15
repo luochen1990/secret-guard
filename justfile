@@ -203,7 +203,7 @@ test-ignored *ARGS:
 
 # ─── coverage ─────────────────────────────────────────────────────────────
 # 基于 LLVM source-based coverage (cargo-llvm-cov). 工具链与 LLVM_COV/LLVM_PROFDATA
-# 环境变量由 nix devShell 注入 (见 flake.nix), 因此以下命令需在 `nix develop` 内执行.
+# 环境变量由 nix devShell 注入 (见 nix/shells/default.nix), 因此以下命令需在 `nix develop` 内执行.
 # CI 里 ci.yml 用 job 级 env 写死绝对路径注入 (runner VM 不进 devShell).
 # 产物默认写到 target/llvm-cov-target/ + coverage/ (已 .gitignore).
 #
