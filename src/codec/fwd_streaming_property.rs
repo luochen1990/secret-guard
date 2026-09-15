@@ -994,9 +994,8 @@ fn assert_cross_proto_content_fidelity_with(
 
 /// 断言跨协议流式翻译的内容保真度 (STR-1 × FWD-3 流式路径):
 ///
-/// 1. content fidelity: 双方 TextDelta 拼接相等 (跨协议翻译不丢文本).
-/// 2. tool input fidelity: 双方 InputJsonDelta 拼接相等.
-/// 3. usage output fidelity: output_tokens 透传.
+/// 四维断言集 (content / tool_use 身份 / tool input / usage, 期望值恒等映射) 见
+/// 共享核心 [`assert_cross_proto_content_fidelity_with`].
 ///
 /// 不比较 id/created/model (跨协议时 StreamTranslate 会剥离 foreign 身份, 由
 /// ingress writer 合成本地格式). 不断言 "no mock leak" — 纯翻译模式不做 restore
