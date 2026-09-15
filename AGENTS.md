@@ -926,11 +926,12 @@ CI runner VM 未预装 treefmt 时 check-fmt 降级 rust-only (见 justfile).
     **JWKS 轮换恢复** (SEC-AUTH-3, #198: 轮换后无需重启登录成功 + 刷新失败返回
     原始错误且 IdP 恢复后自愈; 重验仍失败不放行坏签名由 WrongSignature 兼守).
   - `handlers.rs`: `login_start` (重定向 + session 写入 + sanitize_next_url) /
-    `oauth_callback` 错误路径 (IdP error 参数 / 缺 session 凭证) / `logout` / `me`.
-  **仍未覆盖**: `oauth_callback` happy path 的
-  PKCE verifier + nonce 完整端到端 round-trip — nonce 是 client-only 凭证存 server-side
-  session, 外部 HTTP 测试无法读取; 这部分核心逻辑由 `exchange_and_verify_happy` 间接
-  覆盖, 完整端到端需 mocking AuthSession (axum-login extractor), 留作后续工作.
+    `oauth_callback` 错误路径 (IdP error 参数 / 缺 session 凭证 / PKCE 验证失败) /
+    `logout` / `me` / **`oauth_callback` happy path 完整端到端 round-trip** (mock
+    IdP `/authorize` 记录 nonce + code_challenge, code-绑定 `/token` 真实执行 PKCE
+    S256 比对并用 stored nonce 签发 id_token; 测试经 sg.sid cookie 驱动
+    login → authorize → callback → /api/me 全链, PKCE 负对照
+    `oauth_callback_rejects_pkce_verification_failure` 守卫比对非摆设).
   (精确百分比是 `just coverage-html` 实时产物的职责, 此处不维护快照数字.)
 
 ## 后续工作 (非 MVP 范围)
@@ -945,14 +946,6 @@ CI runner VM 未预装 treefmt 时 check-fmt 降级 rust-only (见 justfile).
   当前硬编码 false (本地 HTTP dev 必须), 见 `docs/deployment-nixos.md` "HTTPS 反向代理" 段.
 - mock_secret 的 category-aware 默认生成 (Password/ApiKey/Cookie 等格式感知).
 - 配置热加载; 测试覆盖率自动上报 + fuzzing (cargo-fuzz).
-- **auth/oidc.rs + handlers OIDC 流程的集成测试 (已完成 happy + 错误路径)**:
-  `tests/auth_oidc.rs` 起本地 mock OIDC IdP server (axum, 模拟 discovery + token +
-  jwks + RS256 签 id_token), 覆盖 `OidcBackend::discover` / `exchange_and_verify` /
-  `handlers::login_start` + `oauth_callback` (错误路径) + `logout` + `me`.
-  详见 "已知限制" 对应条目的当前覆盖率数字.
-  **Followup (未完成)**: `oauth_callback` happy path 的 PKCE verifier + nonce 完整
-  端到端 round-trip — 需 mocking AuthSession (axum-login extractor) 或在 server 端
-  加 testing-only nonce 注入钩子 (生产代码改动).
 - **依赖升级** (滞后是稳态, 非风险; Cargo.lock 锁定保证可复现构建; 触发条件满足时再升,
   默认触发条件 = CVE / 解 duplicate / 需要 feature, 各子项仅标注例外;
   2026-09 已完成: CVE 批量 update (rustls 0.23.45, RUSTSEC-2026-0285) / rand 0.10 /

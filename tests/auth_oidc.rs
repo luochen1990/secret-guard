@@ -21,18 +21,29 @@
 //! - **RED-CRYPTO-2**: nonce 精确匹配 (login 时生成, id_token 的 nonce claim 必须相等).
 //! - **FWD-AUTH-1**: OidcBackend discover + exchange_and_verify happy path.
 //! - **FWD-AUTH-2**: handlers login_start / oauth_callback / logout / me.
+//! - **FWD-AUTH-3**: oauth_callback happy path 完整端到端 round-trip — mock IdP 实现
+//!   /authorize (记录 nonce + code_challenge) 与 code-绑定 /token (真实执行 PKCE
+//!   S256 比对 + 用 stored nonce 签发 id_token), 测试经 sg.sid cookie 逐步驱动
+//!   login → authorize → callback → /api/me 全链 (PKCE 负对照见
+//!   `oauth_callback_rejects_pkce_verification_failure`).
 //! - **SEC-AUTH-1**: CSRF state mismatch / id_token 缺失 / 签名错误 均正确拒绝.
 //! - **SEC-AUTH-3**: IdP 轮换签名密钥后, 运行中的 secret-guard 无需重启仍能完成 OIDC
 //!   登录 (验签失败 → 刷新 JWKS → 有界重验一次). #198: rauthy 月度自动轮换后,
 //!   新 kid 的 id_token 在启动时抓取的 JWKS 快照中查无此 key, 登录永久 500.
 
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use axum::Router;
-use axum::extract::State as AxumState;
+use axum::extract::{Query, State as AxumState};
 use axum::http::{HeaderValue, StatusCode, header};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+// PKCE S256 比对 (BASE64URL_NOPAD(SHA256(verifier))) — 与 oauth2 crate 的
+// `PkceCodeChallenge::from_code_verifier_sha256` 同一编码 (见 handle_token 的
+// AuthorizeCode 分支).
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use openidconnect::core::{
     CoreIdToken, CoreIdTokenClaims, CoreJsonWebKeySet, CoreJwsSigningAlgorithm,
     CoreRsaPrivateSigningKey,
@@ -52,6 +63,7 @@ use secret_guard::auth::handlers::{AuthState, login_start, logout, me, oauth_cal
 use secret_guard::auth::oidc::{OidcBackend, OidcCredentials, OidcError};
 use secret_guard::auth::{ApiKeyStore, build_session_layer};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 
 // AuthnBackend + PrivateSigningKey traits 在 scope: 前者调 get_user, 后者调
@@ -203,6 +215,29 @@ enum TokenPolicy {
     WrongSignature { nonce: String },
     /// HTTP 错误响应 (任意 status + body).
     Error { status: u16, body: String },
+    /// code-绑定路径 (完整 OIDC flow 端到端用): 从 form body 取 `code` 查 /authorize
+    /// 时签发的记录, 真实执行 PKCE S256 比对 (`BASE64URL_NOPAD(SHA256(code_verifier))`
+    /// == 记录的 code_challenge) + redirect_uri 一致性校验, 用记录的 **nonce**
+    /// (authorize 时经 query 到达 IdP 的) 签发 id_token — 无需测试读取 server-side
+    /// session 即可闭合 nonce round-trip.
+    AuthorizeCode,
+}
+
+/// /authorize 签发的 authorization code 对应的请求记录 (code-绑定 token 签发数据源).
+///
+/// state 不入 record: 它只在 authorize 应答里原样 echo 回 redirect_uri (见
+/// `handle_authorize`), /token 请求不携带 state, 无消费点 (存了就是 dead field).
+#[derive(Clone)]
+struct AuthorizeRecord {
+    /// authorize 请求 query 里的 nonce — id_token 的 nonce claim 来源
+    /// (RED-CRYPTO-2 round-trip 的 IdP 侧起点).
+    nonce: String,
+    /// authorize 请求 query 里的 code_challenge (S256) — token 交换时 PKCE
+    /// 验证的比对基准.
+    code_challenge: String,
+    /// authorize 请求 query 里的 redirect_uri — token 交换时一致性校验
+    /// (RFC 6749 §4.1.3).
+    redirect_uri: String,
 }
 
 /// mock IdP 的共享状态 (跨多 handler 协作).
@@ -224,6 +259,9 @@ struct IdpState {
     token_policy: Arc<Mutex<Option<TokenPolicy>>>,
     /// 所有收到的 /token 请求 body (PKCE verifier 断言用).
     token_requests: Arc<Mutex<Vec<String>>>,
+    /// /authorize 签发的 code → 请求记录 (TokenPolicy::AuthorizeCode 的 PKCE 验证
+    /// + stored-nonce 签发数据源).
+    authorize_codes: Arc<Mutex<HashMap<String, AuthorizeRecord>>>,
 }
 
 /// 已启动的 mock IdP handle (测试用).
@@ -260,6 +298,15 @@ impl MockIdp {
         self.state.token_requests.lock().clone()
     }
 
+    /// 篡改所有已签发 code 的 code_challenge (PKCE 负对照: 让 token 交换时
+    /// S256(session 里的 verifier) 必不匹配 → /token 400 → callback 登录失败,
+    /// 证明 AuthorizeCode 路径的 PKCE 比对是真实门禁而非摆设).
+    fn tamper_all_code_challenges(&self) {
+        for record in self.state.authorize_codes.lock().values_mut() {
+            record.code_challenge = "tampered-challenge-will-not-match".to_string();
+        }
+    }
+
     fn issuer(&self) -> &str {
         &self.state.issuer
     }
@@ -279,6 +326,20 @@ impl IdpState {
             (&self.keys.signing_key, &self.keys.initial_jwks_json)
         }
     }
+
+    /// 用指定密钥签 id_token (issuer/client_id 来自本 state; 测试用户恒为
+    /// user-42 / alice@example.com / Alice — 多处测试断言的 claims SSOT).
+    fn id_token_for(&self, key: &CoreRsaPrivateSigningKey, nonce: &str) -> String {
+        sign_id_token(
+            key,
+            &self.issuer,
+            &self.client_id,
+            nonce,
+            "user-42",
+            Some("alice@example.com"),
+            Some("Alice"),
+        )
+    }
 }
 
 /// 启动 mock IdP server (返回控制 handle).
@@ -288,8 +349,8 @@ impl IdpState {
 ///   `break_discovery` 后返回 500, 模拟 IdP 半故障).
 /// - `GET /jwks`: JWKS 公钥 (初始主密钥; `rotate_keys` 后只含轮换代公钥).
 /// - `POST /token`: token exchange (按 token_policy 返回).
-/// - `GET /authorize`: 占位 (OIDC flow 不会真访问, 因为客户端 login 直接重定向 IdP
-///   但本测试不发真实授权请求; 此路由存在仅是为了 discovery metadata 字段合法).
+/// - `GET /authorize`: 完整授权端点 (校验参数 + 签发 code + 302 回 redirect_uri,
+///   见 `handle_authorize`; 既有测试不访问它, 行为不受影响).
 async fn spawn_mock_idp() -> MockIdp {
     // 跨测试共享 RSA 密钥组 (避免每个测试重复 ~150ms 生成 3 把密钥的开销, ~19 个
     // 测试 → 省数秒).
@@ -310,6 +371,7 @@ async fn spawn_mock_idp() -> MockIdp {
         discovery_broken: Arc::new(Mutex::new(false)),
         token_policy: Arc::new(Mutex::new(None)),
         token_requests: Arc::new(Mutex::new(vec![])),
+        authorize_codes: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let app = Router::new()
@@ -340,7 +402,10 @@ async fn spawn_mock_idp() -> MockIdp {
             }),
         )
         .route("/token", post(handle_token).with_state(state.clone()))
-        .route("/authorize", get(|| async { "authorize placeholder" }));
+        .route(
+            "/authorize",
+            get(handle_authorize).with_state(state.clone()),
+        );
 
     tokio::spawn(async move {
         let _ = axum::serve(listener, app.into_make_service()).await;
@@ -378,7 +443,9 @@ fn idp_json_response(body: &str) -> Response {
 
 /// /token handler: 取出当前策略, 用 IdpState 的 key 签 id_token, 构造响应.
 async fn handle_token(AxumState(state): AxumState<IdpState>, body: String) -> Response {
-    state.token_requests.lock().push(body);
+    // clone 留档: AuthorizeCode 分支还要解析 form body (code / code_verifier /
+    // redirect_uri), 既有断言 (PKCE verifier round-trip) 也读原始 body.
+    state.token_requests.lock().push(body.clone());
 
     let policy = state
         .token_policy
@@ -394,15 +461,7 @@ async fn handle_token(AxumState(state): AxumState<IdpState>, body: String) -> Re
             // 活跃密钥按代数选择 (SSOT: IdpState::active_signing): rotate_keys 后用
             // 新代密钥签, 模拟真实 IdP 轮换后所有新 token 都用新 key 签发.
             let (active, _) = state.active_signing();
-            let id_token = sign_id_token(
-                active,
-                &state.issuer,
-                &state.client_id,
-                &nonce,
-                "user-42",
-                Some("alice@example.com"),
-                Some("Alice"),
-            );
+            let id_token = state.id_token_for(active, &nonce);
             token_response_with_id_token(id_token)
         }
         TokenPolicy::NoIdToken => token_response_no_id_token(),
@@ -411,28 +470,12 @@ async fn handle_token(AxumState(state): AxumState<IdpState>, body: String) -> Re
             // 会用真实 nonce 验证 → InvalidNonce. 签名用活跃密钥 (mock 语义: 除
             // rogue 例外, IdP 恒用活跃密钥签名), 保证失败发生在 nonce 层.
             let (active, _) = state.active_signing();
-            let id_token = sign_id_token(
-                active,
-                &state.issuer,
-                &state.client_id,
-                &wrong_nonce,
-                "user-42",
-                Some("alice@example.com"),
-                Some("Alice"),
-            );
+            let id_token = state.id_token_for(active, &wrong_nonce);
             token_response_with_id_token(id_token)
         }
         TokenPolicy::WrongSignature { nonce } => {
             // 用 rogue_key 签 (不公布 JWKS), 客户端验签必失败.
-            let id_token = sign_id_token(
-                &state.keys.rogue_key,
-                &state.issuer,
-                &state.client_id,
-                &nonce,
-                "user-42",
-                Some("alice@example.com"),
-                Some("Alice"),
-            );
+            let id_token = state.id_token_for(&state.keys.rogue_key, &nonce);
             token_response_with_id_token(id_token)
         }
         TokenPolicy::Error { status, body } => {
@@ -442,6 +485,51 @@ async fn handle_token(AxumState(state): AxumState<IdpState>, body: String) -> Re
             *resp.status_mut() =
                 StatusCode::from_u16(status).expect("TokenPolicy::Error: valid u16 status");
             resp
+        }
+        TokenPolicy::AuthorizeCode => {
+            // 完整 OIDC flow 的 token 端点语义 (RFC 6749 + RFC 7636):
+            // 1. 解析 urlencoded form body (openidconnect AuthType::RequestBody —
+            //    client_id / code / code_verifier / redirect_uri 都在 form).
+            let form: HashMap<String, String> =
+                openidconnect::url::form_urlencoded::parse(body.as_bytes())
+                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                    .collect();
+            // 2. code 必须是 /authorize 签发过的, 且 single-use — 兑换即移除
+            //    (RFC 6749 §4.1.2 的一次性语义).
+            let code = form.get("code").cloned().unwrap_or_default();
+            let Some(record) = state.authorize_codes.lock().remove(&code) else {
+                return idp_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_grant",
+                    "unknown authorization code",
+                );
+            };
+            // 3. redirect_uri 必须与 authorize 时一致 (RFC 6749 §4.1.3).
+            if form.get("redirect_uri").map(String::as_str) != Some(record.redirect_uri.as_str()) {
+                return idp_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_grant",
+                    "redirect_uri mismatch",
+                );
+            }
+            // 4. PKCE S256 验证 (RFC 7636 §4.6): verifier 是 secret-guard 从
+            //    server-side session 取出送来的 — 比对通过即证明 session 里的
+            //    verifier 与 authorize 时的 challenge 同源 (PKCE round-trip 成立).
+            //    编码与 oauth2 的 from_code_verifier_sha256 逐字节一致.
+            let verifier = form.get("code_verifier").cloned().unwrap_or_default();
+            let computed = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+            if computed != record.code_challenge {
+                return idp_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_grant",
+                    "PKCE verification failed",
+                );
+            }
+            // 5. 用 authorize 时记录的 nonce 签发 (nonce 经 authorize query 到达 IdP,
+            //    客户端将用 session 里的同一 nonce 验证 — RED-CRYPTO-2 round-trip).
+            let (active, _) = state.active_signing();
+            let id_token = state.id_token_for(active, &record.nonce);
+            token_response_with_id_token(id_token)
         }
     }
 }
@@ -463,6 +551,70 @@ fn token_response_no_id_token() -> Response {
         "expires_in": 3600
     });
     idp_json_response(&body.to_string())
+}
+
+/// /authorize handler: 完整 OIDC 授权端点 (供 happy path 端到端测试).
+///
+/// 校验必填参数 (client_id / redirect_uri / state / nonce / code_challenge /
+/// `code_challenge_method == S256` / `response_type == code`), 签发一次性 code 并把
+/// (nonce, code_challenge, redirect_uri) 记入 `authorize_codes`, 302 回
+/// `{redirect_uri}?code=...&state=...` (state 原样 echo — secret-guard 侧的 CSRF
+/// 校验由此被真实驱动).
+///
+/// 假设声明 (ROB 风格): redirect_uri 无既有 query (测试内恒真 — sg 的 callback URL
+/// 不带 query), 故直接 `?` 拼接; code (uuid v4 hex) 与 state (openidconnect 用
+/// base64url-nopad 生成) 均为 URL-safe 字符, 无需 percent-encode. 假设不成立时
+/// 产生畸形 Location → 测试断言失败 (fail loudly, 不静默).
+async fn handle_authorize(
+    AxumState(state): AxumState<IdpState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let bad_request =
+        |what: &str| idp_error_response(StatusCode::BAD_REQUEST, "invalid_request", what);
+
+    let (Some(client_id), Some(redirect_uri), Some(state_param), Some(nonce), Some(code_challenge)) = (
+        params.get("client_id"),
+        params.get("redirect_uri"),
+        params.get("state"),
+        params.get("nonce"),
+        params.get("code_challenge"),
+    ) else {
+        return bad_request("missing client_id/redirect_uri/state/nonce/code_challenge");
+    };
+    if client_id != &state.client_id {
+        return bad_request("unknown client_id");
+    }
+    if params.get("response_type").map(String::as_str) != Some("code") {
+        return bad_request("only response_type=code is supported");
+    }
+    // 只接受 S256 (plain challenge 会让 PKCE 形同虚设; openidconnect 恒发 S256).
+    if params.get("code_challenge_method").map(String::as_str) != Some("S256") {
+        return bad_request("only S256 code_challenge_method is supported");
+    }
+
+    let code = uuid::Uuid::new_v4().to_string();
+    state.authorize_codes.lock().insert(
+        code.clone(),
+        AuthorizeRecord {
+            nonce: nonce.clone(),
+            code_challenge: code_challenge.clone(),
+            redirect_uri: redirect_uri.clone(),
+        },
+    );
+
+    // 302 Found: 真实 IdP 授权端点的重定向语义 (Redirect::to 是 303, 此处显式用
+    // FOUND 更贴近 wire 形态).
+    let location = format!("{redirect_uri}?code={code}&state={state_param}");
+    (StatusCode::FOUND, [(header::LOCATION, location)]).into_response()
+}
+
+/// /token 与 /authorize 的错误响应 (OAuth2 wire 形态, RFC 6749 §5.2: 结构化
+/// error + error_description 字段).
+fn idp_error_response(status: StatusCode, error: &str, description: &str) -> Response {
+    let mut resp =
+        idp_json_response(&json!({ "error": error, "error_description": description }).to_string());
+    *resp.status_mut() = status;
+    resp
 }
 
 // ─── client router (secret-guard 侧 handlers 装配) ─────────────────────
@@ -861,22 +1013,17 @@ async fn exchange_and_verify_rotation_refresh_failure_returns_original_error() {
 
 // ─── handlers 端到端测试 (login_start / oauth_callback / logout / me) ───
 //
-// # oauth_callback happy path 为何不在此处端到端覆盖
-//
-// OIDC nonce 是 client-only 的安全凭证, 从不发给 IdP. 真实 OIDC 流程中:
-//   client.authorize_url() 生成 nonce → 存 server-side session → callback 时取出
-//   传给 exchange_and_verify → id_token 的 nonce claim 必须与之一致.
-// 在外部 HTTP 测试里, 测试既无法读到 session 内的 nonce (HttpOnly cookie + server
-// 内存), 也不能让 IdP 知道 nonce (违反 OIDC 安全模型).
-// 故 oauth_callback happy path 的 nonce round-trip 由 `exchange_and_verify_happy`
-// (直接构造 OidcCredentials 调用) 覆盖核心逻辑; 此处只覆盖端到端的:
-//   - login_start (session 写入 + redirect + sanitize_next_url 守卫)
-//   - oauth_callback 错误路径 (IdP error / 缺 PKCE verifier)
-//   - logout (session 清除)
-//   - me (未登录态)
-//
-// 完整的 happy path 端到端需要 mocking AuthSession (axum-login extractor), 复杂度
-// 优于本 PR 范围, 留作 followup (见 PR body).
+// oauth_callback happy path 在此端到端覆盖 (无需 mocking AuthSession):
+// - nonce 虽存 server-side session, 但它经 authorize URL query 传给 IdP — mock IdP
+//   的 /authorize 把它记入 AuthorizeRecord, code-绑定的 /token (AuthorizeCode) 再用
+//   stored nonce 签 id_token, 全链 nonce round-trip 由此闭合;
+// - PKCE verifier 经 token exchange form body 到达 IdP, /token 真实执行
+//   S256(verifier) == authorize 记录的 code_challenge 比对 (RFC 7636 §4.6);
+// - 测试用禁用 redirect 的 reqwest client + 手动回传 sg.sid cookie 驱动 4 步
+//   浏览器 flow (login → authorize → callback → /api/me), 见
+//   `oauth_callback_happy_path_full_round_trip` 与 PKCE 负对照
+//   `oauth_callback_rejects_pkce_verification_failure`.
+// 下方另有各错误路径 (IdP error 参数 / 缺 session 凭证) 与 logout / me 测试.
 
 /// 装配一个 reqwest client, **禁用自动 redirect** (手动跟 redirect 以断言 Location).
 ///
@@ -1048,6 +1195,185 @@ async fn oauth_callback_rejects_missing_session_credentials() {
 }
 
 #[tokio::test]
+async fn oauth_callback_happy_path_full_round_trip() {
+    // FWD-AUTH-3: 完整 OIDC 登录 flow 端到端 — 生产同构装配 (build_router_with_auth)
+    // + mock IdP 完整授权端点 (handle_authorize + TokenPolicy::AuthorizeCode).
+    // 逐步驱动浏览器 flow (sg.sid cookie 串起 server-side session), 断言每一跳:
+    //   1. /login → 303 IdP authorize URL (PKCE challenge + state + nonce 在 query;
+    //      verifier 留在 session)
+    //   2. IdP /authorize → 302 回 sg callback (code + state echo)
+    //   3. /oauth2/callback → server 从 session 取 verifier/nonce → token exchange
+    //      (IdP 真实验 PKCE S256 + 用 authorize 时记录的 nonce 签 id_token) →
+    //      验签 + nonce 匹配 → 登录成功 303 "/"
+    //   4. /api/me → 200 + 已登录用户 claims
+    let (idp, base) = spawn_full_auth_router().await;
+    idp.set_token_policy(TokenPolicy::AuthorizeCode);
+    let client = http_client();
+
+    // Step 1: /login — 303 到 IdP authorize URL.
+    let resp = client.get(format!("{base}/login")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let authorize_url = resp
+        .headers()
+        .get(header::LOCATION)
+        .expect("Location header")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        authorize_url.starts_with(idp.issuer()),
+        "authorize URL should be on IdP: {authorize_url}"
+    );
+    assert!(
+        authorize_url.contains("code_challenge="),
+        "PKCE challenge in authorize query: {authorize_url}"
+    );
+    assert!(
+        authorize_url.contains("nonce="),
+        "nonce in authorize query: {authorize_url}"
+    );
+    assert!(
+        authorize_url.contains("state="),
+        "CSRF state in authorize query: {authorize_url}"
+    );
+    let mut session_cookie = extract_session_cookie(&resp).expect("login should set sg.sid cookie");
+
+    // Step 2: IdP /authorize — 记录 (nonce, code_challenge, redirect_uri), 302 回
+    // sg 的 callback URL (redirect_uri 与 discovery 配置一致 → 指回本 server).
+    let resp = client.get(&authorize_url).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    let callback_url = resp
+        .headers()
+        .get(header::LOCATION)
+        .expect("Location header")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        callback_url.starts_with(&base),
+        "authorize should redirect back to sg callback: {callback_url}"
+    );
+    assert!(
+        callback_url.contains("code=") && callback_url.contains("state="),
+        "authorization code + state in callback: {callback_url}"
+    );
+
+    // Step 3: /oauth2/callback (带 session cookie) — 登录成功 → 303 到 "/"
+    // (next 缺省). 注: axum-login 的 login() 在首次登录时 cycle session id (防
+    // session fixation, tower-sessions cycle_id 会删除旧 id 并签发新 sg.sid) —
+    // 后续请求必须用新 cookie. 断言 id 确实轮换, 守卫该防护不静默回归.
+    let resp = client
+        .get(&callback_url)
+        .header(header::COOKIE, &session_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::SEE_OTHER,
+        "callback should redirect on success"
+    );
+    let loc = resp
+        .headers()
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert_eq!(loc, "/", "callback success should redirect to / (no next)");
+    let cycled = extract_session_cookie(&resp)
+        .expect("callback should re-set sg.sid (login writes session)");
+    assert_ne!(
+        cycled, session_cookie,
+        "login() must cycle session id (session fixation mitigation)"
+    );
+    session_cookie = cycled;
+
+    // Step 4: /api/me (轮换后的 cookie) — 200 + 完整用户 claims (sub/email/name
+    // 来自 id_token, me handler 的响应 shape).
+    let resp = client
+        .get(format!("{base}/api/me"))
+        .header(header::COOKIE, &session_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(&resp.bytes().await.unwrap()).unwrap();
+    assert_eq!(body["authenticated"], true);
+    assert_eq!(body["sub"], "user-42");
+    assert_eq!(body["email"], "alice@example.com");
+    assert_eq!(body["name"], "Alice");
+}
+
+#[tokio::test]
+async fn oauth_callback_rejects_pkce_verification_failure() {
+    // PKCE 负对照 (FWD-AUTH-3 的反向): IdP 侧记录的 code_challenge 被篡改后,
+    // S256(server session 里的 verifier) 必不匹配 → /token 400 → exchange 失败 →
+    // callback 500 + 用户未登录. 证明 happy path 里的 PKCE 比对是真实门禁而非摆设.
+    let (idp, base) = spawn_full_auth_router().await;
+    idp.set_token_policy(TokenPolicy::AuthorizeCode);
+    let client = http_client();
+
+    // Step 1-2: 与 happy path 相同 — login 拿 session cookie, authorize 拿 code.
+    let resp = client.get(format!("{base}/login")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let authorize_url = resp
+        .headers()
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let mut session_cookie = extract_session_cookie(&resp).expect("login should set sg.sid cookie");
+
+    let resp = client.get(&authorize_url).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    let callback_url = resp
+        .headers()
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // 篡改 IdP 侧的 authorize 记录: PKCE 比对基准不再对应 session 里的 verifier.
+    idp.tamper_all_code_challenges();
+
+    // Step 3: callback → IdP PKCE 验证失败 (400) → TokenExchange 错误 → 500 envelope.
+    let resp = client
+        .get(&callback_url)
+        .header(header::COOKIE, &session_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "PKCE failure should surface as 500 (token exchange failed)"
+    );
+    // 先取 Set-Cookie 再消费 body (bytes() 会 move resp).
+    if let Some(refreshed) = extract_session_cookie(&resp) {
+        session_cookie = refreshed;
+    }
+    let body: serde_json::Value = serde_json::from_slice(&resp.bytes().await.unwrap()).unwrap();
+    let err = body["error"].as_str().unwrap();
+    assert!(
+        err.contains("token exchange"),
+        "should surface token exchange failure, got: {err}"
+    );
+
+    // Step 4: 登录未发生 — /api/me 仍 authenticated=false.
+    let resp = client
+        .get(format!("{base}/api/me"))
+        .header(header::COOKIE, &session_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(&resp.bytes().await.unwrap()).unwrap();
+    assert_eq!(body["authenticated"], false);
+}
+
+#[tokio::test]
 async fn me_returns_unauthenticated_when_not_logged_in() {
     // 未登录访问 /api/me: 返回 authenticated=false (不报 401, 因为 me 是公开路由).
     let (_idp, base) = spawn_idp_with_client().await;
@@ -1092,10 +1418,21 @@ async fn logout_clears_session_and_redirects() {
 /// (含 web::router() + forward 路由 + /api/{*rest} 兜底), 而非仅 OIDC handlers
 /// 的迷你装配. AppState 字段全用最小占位值 (冒烟只关心路由装配与认证跳转,
 /// 不关心转发逻辑). 双表共享同一 decisions + persist_lock, 与 server.rs 装配一致.
-async fn spawn_full_auth_router() -> String {
-    let (_idp, backend) = spawn_idp_with_backend().await;
+///
+/// 先 bind listener 拿到实际 port, 再用该 port 构造 redirect_url 做 discovery —
+/// mock IdP /authorize 的 302 因此指回本 server 的真实 callback URL, 测试可原样
+/// 跟随 (与生产 redirect_url 形态一致).
+async fn spawn_full_auth_router() -> (MockIdp, String) {
+    let idp = spawn_mock_idp().await;
 
     let api_keys = empty_api_key_store("sg-auth-smoke");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let redirect_url = format!("http://{addr}/oauth2/callback");
+    let backend = OidcBackend::discover(idp.issuer(), idp.client_id(), None, &redirect_url)
+        .await
+        .expect("discover");
 
     let decisions = std::sync::Arc::new(parking_lot::RwLock::new(
         secret_guard::config::Decisions::default(),
@@ -1140,8 +1477,6 @@ async fn spawn_full_auth_router() -> String {
 
     // 与生产 serve() 同构: 先 bind listener 拿到实际 port, 再用该 port 构造
     // Host guard (SEC-7) 装配 Router.
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
     let app = secret_guard::server::build_router_with_auth(
         state,
         secret_guard::server::AuthStack { backend, api_keys },
@@ -1150,14 +1485,14 @@ async fn spawn_full_auth_router() -> String {
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    format!("http://{addr}")
+    (idp, format!("http://{addr}"))
 }
 
 #[tokio::test]
 async fn full_auth_router_assembly_smoke() {
     // 冒烟: 真实 auth 装配 (build_router_with_auth) 不 panic + 关键路由行为正确.
     // 1. 装配本身不 panic (重复路由会在 serve/bind 时 panic, 这里直接暴露).
-    let base = spawn_full_auth_router().await;
+    let (_idp, base) = spawn_full_auth_router().await;
     let client = http_client();
 
     // 2. 未登录访问受保护 `/` → 307 到 /login (login_required guard 生效;
