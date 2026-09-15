@@ -231,6 +231,71 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     expect(bubbleClasses.some((c) => c.includes("bubble-user"))).toBe(true);
   });
 
+  test("XML 块渲染: 气泡内块级 XML → 带背景色独立区块; 未闭合降级纯文本", async ({
+    page,
+  }) => {
+    // 会话 1: 同轮 delta 含 user + assistant 两条 XML 消息 (一次覆盖两条气泡渲染路径;
+    // user 块体内含 static secret, 验证 mock 高亮在块内照常生效).
+    await sendChat(page, [
+      {
+        role: "user",
+        content:
+          `xmlblk-user before\n<system-reminder>\nhidden context ${TEST_SECRET_VALUE}\n</system-reminder>\nafter text`,
+      },
+      { role: "assistant", content: "<agent-note>\nagent xml body\n</agent-note>" },
+    ]);
+    // 会话 2: 未闭合标签 → 不识别, 保持纯文本 (best-effort 降级契约).
+    await sendChat(page, [
+      { role: "user", content: "xmlblk-unclosed\n<foo>\nnever closed" },
+    ]);
+    // 会话 3: 块内自闭合行 (<note/>) 不得虚增同名 depth 计数 (否则合法块整体降级).
+    await sendChat(page, [
+      { role: "user", content: "xmlblk-selfclose\n<note>\n<note/>\ninner line\n</note>" },
+    ]);
+
+    // 会话 1: user 气泡内 1 个 xml 块, 标签字面行不重复出现, 前后文本保留.
+    const sid1 = await findSessionLeafByPreview(page, "xmlblk-user");
+    await clickSessionByLeaf(page, sid1);
+    const block = page.locator("#detail .request-pane .chat-bubble.bubble-user .xml-block");
+    await expect(block).toHaveCount(1);
+    // data-tag 是块的语义锚点 (与徽章文本同源, 属性断言更稳).
+    await expect(block).toHaveAttribute("data-tag", "system-reminder");
+    // per-tag tint class 稳定附带 + 背景色生效 (区块契约): 两条互补断言落同一块上
+    // (兜底 --xml-bg 不透明, bg 检查证明不了 tint 已挂; class 检查证明不了 CSS 接线对).
+    await expect(block).toHaveClass(/xml-c\d/);
+    const bg = await block.evaluate((el) => getComputedStyle(el).backgroundColor);
+    expect(bg).not.toBe("rgba(0, 0, 0, 0)");
+    await expect(block.locator(".xml-block-body")).toContainText("hidden context");
+    // mock 高亮在块内生效 (secret 已被 redact 为 mock 并包 mark).
+    await expect(block.locator(".xml-block-body mark.secret-hit")).toHaveCount(1);
+    const userBubble = page.locator("#detail .request-pane .chat-bubble.bubble-user");
+    const userText = (await userBubble.textContent()) ?? "";
+    expect(userText).toContain("before");
+    expect(userText).toContain("after text");
+    expect(userText).not.toContain("<system-reminder>");
+
+    // 会话 1 assistant 气泡: XML 块走 assistantBubbleHtml 路径, 同样区块化.
+    const agentBlock = page.locator("#detail .request-pane .chat-bubble.bubble-assistant .xml-block");
+    await expect(agentBlock).toHaveCount(1);
+    await expect(agentBlock).toHaveAttribute("data-tag", "agent-note");
+    await expect(agentBlock.locator(".xml-block-body")).toContainText("agent xml body");
+
+    // 会话 2: 未闭合 <foo> 不产生块, 字面标签保留.
+    const sid2 = await findSessionLeafByPreview(page, "xmlblk-unclosed");
+    await clickSessionByLeaf(page, sid2);
+    await expect(page.locator("#detail .request-pane .xml-block")).toHaveCount(0);
+    const rawText = (await page.locator("#detail .request-pane .chat-bubble.bubble-user").textContent()) ?? "";
+    expect(rawText).toContain("<foo>");
+
+    // 会话 3: 块内自闭合行不影响识别 (若 <note/> 虚增 depth, 单个 </note> 无法归零
+    // → 块整体降级, toHaveCount(1) 即红; body 断言守住块内容正常渲染).
+    const sid3 = await findSessionLeafByPreview(page, "xmlblk-selfclose");
+    await clickSessionByLeaf(page, sid3);
+    const noteBlock = page.locator("#detail .request-pane .xml-block");
+    await expect(noteBlock).toHaveCount(1);
+    await expect(noteBlock.locator(".xml-block-body")).toContainText("inner line");
+  });
+
   test("需求 2 (IM 风格): 每轮渲染本轮 delta, 不重复历史", async ({ page }) => {
     // 多轮对话 (累积 messages 数组): 旧版会每轮重复显示前序历史气泡.
     // 修复后 (issue #27): 每轮 request-pane 渲染本轮 req_delta 的所有非 assistant messages.

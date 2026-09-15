@@ -258,6 +258,25 @@ timeline 每轮 header 含两个按钮:
 子区域 (位于 text 段之前), 复用同款视觉区分 — 数据已到前端 JSON
 (request 历史 assistant 消息 + parsed response 的 message), 不渲染会静默不可见.
 
+### 气泡内 XML 块渲染 (`renderTextWithXmlBlocks`)
+
+气泡文本 (system/user/tool 纯文本气泡 + assistant 的 reasoning/text 段 + Anthropic
+response text block) 中 "开/闭标签各自独占一行" 形态的块级 XML (如
+`<system-reminder>` / `<function_results>` / agent 自定义标签) 被渲染为气泡**内部**
+带背景色的独立区块 `.xml-block` (层级同 `.bubble-tool-call` 子区域) — **不拆新气泡**,
+UI-1 气泡数不变量不受影响. 区块结构: 徽章行 (tag 名 + 开标签属性原文, 信息无损 —
+字面标签行不重复展示) + body (内容, mock 高亮照常生效).
+
+- **识别是 best-effort** (ROB 纪律, `xmlBlockSegments`): 行级正则 + 同名标签 depth
+  计数 + 未闭合扫描 memo 化 (同 tag 重复形态 O(N), 防主线程冻结; 最坏互异 tag 仍
+  O(N²)); 行内标签 / 自闭合 / 未闭合 / 属性含尖括号一律不识别, 降级为纯文本原样
+  展示, 永不 panic. 安全性: 只做行级识别, 先分段再 escapeHtml, 无注入面.
+- **配色**: per-tag FNV-1a 稳定映射 `.xml-c0..xml-c5` tint class (同 tag 恒同色;
+  `XML_TINT_COUNT` 与 CSS 变体类是两处同步的对偶), 颜色全走 CSS `light-dark()`
+  跟随主题, 不拼 inline style (主题切换不 stale).
+- 回归守卫: `tests/webui/im-ui.spec.ts` "XML 块渲染" 用例 (块化 + mock 块内高亮 +
+  自闭合 depth 安全 + 未闭合降级).
+
 ### Response 抽屉 (overlay 架构)
 
 Response 是独立的 `.response-drawer`, **悬浮**在 `#detail` 之上 (position:absolute overlay),
