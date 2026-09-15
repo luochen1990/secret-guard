@@ -140,7 +140,9 @@ class Handler(BaseHTTPRequestHandler):
         err = _match_error_trigger(user_msg)
         if err is not None:
             status, etype = err
-            body = json.dumps({"error": {"type": etype, "message": f"mock {status}"}}).encode()
+            body = json.dumps(
+                {"error": {"type": etype, "message": f"mock {status}"}}
+            ).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))

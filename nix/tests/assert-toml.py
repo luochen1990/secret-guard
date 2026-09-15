@@ -20,7 +20,9 @@ with open(path, "rb") as f:
     cfg = tomllib.load(f)
 
 if mode == "minimal":
-    assert [p["id"] for p in cfg["providers"]] == ["a-router", "b-upstream"], cfg["providers"]
+    assert [p["id"] for p in cfg["providers"]] == ["a-router", "b-upstream"], cfg[
+        "providers"
+    ]
     by_id = {p["id"]: p for p in cfg["providers"]}
 
     d = by_id["b-upstream"]
@@ -34,10 +36,16 @@ if mode == "minimal":
 
     r = by_id["a-router"]
     assert r["kind"] == "router"
-    assert "base_url" not in r and "protocol" not in r  # sum type: router 无 direct 字段
+    assert (
+        "base_url" not in r and "protocol" not in r
+    )  # sum type: router 无 direct 字段
     assert len(r["routes"]) == 2
     rt0, rt1 = r["routes"]
-    assert rt0["model_pattern"] == "*" and rt0["target"] == "b-upstream" and rt0["priority"] == 100
+    assert (
+        rt0["model_pattern"] == "*"
+        and rt0["target"] == "b-upstream"
+        and rt0["priority"] == 100
+    )
     assert "upstream_model" not in rt0  # 省略 = 透传 (serde None)
     assert rt1["model_pattern"] == "gpt-*" and rt1["upstream_model"] == "glm-4.7"
     assert "priority" not in rt1  # 省略 = 该路由禁用 (serde None)
@@ -66,7 +74,9 @@ if mode == "minimal":
 
     u = cfg["usage"]
     assert u["enabled"] is True
-    assert u["retention_days"] == 90  # minimal 未显式设 → 默认值 e2e 镜像锁 (与 Rust impl Default 同步义务)
+    assert (
+        u["retention_days"] == 90
+    )  # minimal 未显式设 → 默认值 e2e 镜像锁 (与 Rust impl Default 同步义务)
     assert u["pricing_url"] == "https://models.dev/api.json"
     assert u["pricing_refresh_secs"] == 86400  # 未显式设 → module 默认全量渲染
     po = u["pricing_override"]["glm-5.3"]
@@ -74,7 +84,9 @@ if mode == "minimal":
     assert po["cache_read"] == 0.26 and po["cache_write"] == 0.0
 
 elif mode == "inline":
-    assert [p["id"] for p in cfg["providers"]] == ["a-router", "b-upstream"], cfg["providers"]
+    assert [p["id"] for p in cfg["providers"]] == ["a-router", "b-upstream"], cfg[
+        "providers"
+    ]
     by_id = {p["id"]: p for p in cfg["providers"]}
     d = by_id["b-upstream"]
     assert d["kind"] == "direct" and d["protocol"] == "openai"
@@ -85,7 +97,11 @@ elif mode == "inline":
     r = by_id["a-router"]
     assert r["kind"] == "router"
     rt = r["routes"][0]
-    assert rt["model_pattern"] == "*" and rt["target"] == "b-upstream" and rt["priority"] == 100
+    assert (
+        rt["model_pattern"] == "*"
+        and rt["target"] == "b-upstream"
+        and rt["priority"] == 100
+    )
     # 全默认段不渲染 (module 层 usageUsed/authUsed 判定 → serde default 兜底):
     # 锁定 "nix options defaults ↔ usageDefaults 镜像 ↔ render 跳过" 的端到端一致
     # 性 — 任一侧默认值漂移都会让本断言失败 (usage/auth 段出现即漂移)
@@ -100,7 +116,9 @@ elif mode == "timeouts":
     # render 全量" 的端到端一致性 — 任一侧默认值漂移都会让未显式设的三项断言失败
     assert s["upstream_connect_timeout_secs"] == 15  # 未显式设 → option default
     assert s["upstream_response_header_timeout_secs"] == 60
-    assert s["upstream_nonstream_response_header_timeout_secs"] == 0  # 拆墙: 无限 (agent-service#130)
+    assert (
+        s["upstream_nonstream_response_header_timeout_secs"] == 0
+    )  # 拆墙: 无限 (agent-service#130)
     assert s["upstream_stream_idle_timeout_secs"] == 120
     # 其余段不受超时调参影响
     assert "usage" not in cfg and "auth" not in cfg and "secrets" not in cfg

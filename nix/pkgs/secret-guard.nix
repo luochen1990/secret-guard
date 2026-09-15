@@ -43,7 +43,7 @@ rustPlatform.buildRustPackage {
   cargoLock = {
     lockFile = ../../Cargo.lock;
     # 若未来引入 git dep, 在此处追加 outputHashes; 当前所有 crate 都来自 crates.io.
-    outputHashes = {};
+    outputHashes = { };
   };
 
   # secret-guard 是 binary-only, 不产出 .so / .a, 无需 configure/检查 stages.

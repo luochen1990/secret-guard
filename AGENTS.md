@@ -49,6 +49,9 @@
   (dynamic, WebUI 写回). 详尽语义见 `src/config.rs` 头部.
 - **测试**: cargo-nextest + proptest (property-based) + mockito (集成测试) + Playwright (WebUI)
 - **覆盖率**: cargo-llvm-cov (LLVM source-based, 行级精度). 细节见"测试策略".
+- **格式化**: treefmt 全仓 (nixfmt / rustfmt / taplo / ruff-format), 配置 SSOT =
+  根 `treefmt.toml`; 门禁 = `just check-fmt` (treefmt --fail-on-change). 细节见
+  "nix flake 布局 (flake-fhs)" 段.
 
 ## 数据流契约 (总览)
 
@@ -703,10 +706,12 @@ flake outputs 由 [flake-fhs](https://github.com/luochen1990/flake-fhs) 按目�
 flake-fhs 不生成的 output 由 flake.nix 手动补: `overlays.default` (SSOT 在
 `nix/overlay.nix`, module 内注入与 packages 共用), `packages.default` 别名.
 `nixpkgs.config = {}` 显式清零框架默认的 `allowUnfree = true` (license 合规由
-deny 体系把关, unfree 应被拒绝). 框架无条件生成 `formatter` output (无
-treefmt 配置时 = nixfmt-tree) — 存量 nix 文件 (`nix/module.nix` / `nix/render.nix` /
-`nix/pkgs/secret-guard.nix`) 非 nixfmt 风格, `nix fmt` 全量跑会产生
-大 diff, 格式化单个文件时注意其作用范围.
+deny 体系把关, unfree 应被拒绝). `formatter` output = 裸 `pkgs.treefmt`
+(flake-fhs 探测到仓库根 `treefmt.toml` 后自动切换) — 注意 `nix fmt` 仅在
+devShell 内可用 (treefmt 调用的 nixfmt/taplo/ruff 需在 PATH; devShell 已备齐).
+全仓格式化 SSOT = 根 `treefmt.toml` (覆盖 nix/rust/toml/py; 排除 md/yaml/ts
+的理由见其头部), devShell `treefmt` 与 CI `just check-fmt` 读同一份配置;
+CI runner VM 未预装 treefmt 时 check-fmt 降级 rust-only (见 justfile).
 扫描名单目录之外的散件 (`nix/module.nix` / `nix/render.nix` / `nix/tests/`) 不被
 收集 — 测试辅助库因此必须留在 `nix/tests/` (checks 目录内的裸 .nix 会被当 check).
 `nix/modules/secret-guard.nix` 是薄组装层 (imports `nix/module.nix` 本体 + overlay

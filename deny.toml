@@ -18,7 +18,7 @@
 # 与 .cargo/audit.toml 的 ignore 保持一致 (SSOT 同步).
 # 详尽论证见 .cargo/audit.toml.
 ignore = [
-    "RUSTSEC-2023-0071", # rsa Marvin Attack — 公钥验证侧不在攻击面, 见 .cargo/audit.toml
+  "RUSTSEC-2023-0071", # rsa Marvin Attack — 公钥验证侧不在攻击面, 见 .cargo/audit.toml
 ]
 
 # ─── licenses ──────────────────────────────────────────────────────────────
@@ -26,18 +26,18 @@ ignore = [
 # 这是 license 合规门禁的核心 — 项目发布到 nixpkgs overlay, 不能被 copyleft 污染.
 [licenses]
 allow = [
-    "MIT",
-    "Apache-2.0",
-    "Apache-2.0 WITH LLVM-exception",
-    "BSD-2-Clause",
-    "BSD-3-Clause",
-    "ISC",
-    "Zlib",
-    "Unicode-DFS-2016",
-    "Unicode-3.0",
-    "MPL-2.0",               # file-level copyleft (不污染链接产物)
-    "CC0-1.0",               # public domain dedication
-    "CDLA-Permissive-2.0",   # webpki-roots 的 CA 根证书数据协议 (permissive, 非 copyleft)
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-DFS-2016",
+  "Unicode-3.0",
+  "MPL-2.0",                        # file-level copyleft (不污染链接产物)
+  "CC0-1.0",                        # public domain dedication
+  "CDLA-Permissive-2.0",            # webpki-roots 的 CA 根证书数据协议 (permissive, 非 copyleft)
 ]
 # confidence-threshold: license 探测置信度下限. 默认 0.8 足够.
 # 注: multiple-versions 不在此段 (0.20 schema 把它移到 [bans]), 见下方 [bans].

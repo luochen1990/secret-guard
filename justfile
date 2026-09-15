@@ -71,7 +71,7 @@ dev-test:
 #
 # --locked: 见文件头 "约定" 段 (SSOT).
 check *ARGS:
-    cargo fmt -- --check
+    just check-fmt
     cargo clippy --locked --all-targets -- -D warnings
     cargo machete
     RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
@@ -183,9 +183,20 @@ ci:
     just coverage-gate
     just check-file-size
 
-# 仅 fmt.
+# 仅 fmt: treefmt 全仓格式化 (nix/rust/toml/py; 配置 SSOT = 根 treefmt.toml).
+# 仅想格式化 rust 时手动 `cargo fmt` 亦可 (edition 一致, 输出等价).
 fmt:
-    cargo fmt
+    treefmt
+
+# 格式门禁: treefmt (格式范围同上方 fmt recipe 的括注). CI runner VM 未预装
+# treefmt 时降级为 cargo fmt --check (仅 rust) + WARN — VM 预装
+# treefmt/nixfmt/taplo/ruff 后删除降级分支 (lc-studio/nixos#1048);
+# 降级窗口内 .nix/.toml/.py 的格式漂移不被 CI 拦, 记得本地跑 just fmt.
+check-fmt:
+    @if command -v treefmt >/dev/null 2>&1; then treefmt --fail-on-change; else \
+        echo "WARN: treefmt 未安装, 降级为 cargo fmt --check (仅 rust 格式门禁; 全量门禁见 lc-studio/nixos#1048)"; \
+        cargo fmt -- --check; \
+    fi
 
 # 仅 clippy.
 clippy:

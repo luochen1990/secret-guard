@@ -1,0 +1,42 @@
+# treefmt 配置 — 全仓格式化的 SSOT (覆盖 nix / rust / toml / python).
+#
+# 消费点 (集成细节与降级门禁见 justfile check-fmt 与 AGENTS.md
+# "nix flake 布局" 段, 此处不复述):
+#   - devShell 内 `treefmt` / `just fmt`;
+#   - CI `just check` 链.
+# 注意: treefmt 调用的 nixfmt/rustfmt/taplo/ruff 须在 PATH — 即任何形态
+# (裸 treefmt 或 `nix fmt`) 都要求在 devShell 内或有等价 PATH 的环境.
+#
+# 刻意不纳入的文件类型 (修改前先权衡, 勿顺手打开):
+#   - markdown: AGENTS.md 体系手工维护, prettier 对 CJK 表格宽度计算不可靠;
+#   - yaml / json: 仅 .forgejo/workflows/ci.yml 与生成的 flake.lock, 无收益;
+#   - typescript: WebUI JS 内嵌于 html 无法格式化, tests/webui 的 spec 仅数个,
+#     为其引入 biome/deno 工具链不值当.
+
+# excludes 是相对 tree-root 的 glob: "x/**" 只挡根级, "**/x/**" 挡嵌套, 两种形态
+# 都写才能全覆盖 (实测矩阵见 PR #227 review 记录). Cargo.lock / flake.lock 不匹配
+# 任何 formatter 的 includes (*.toml / *.nix / *.rs / *.py), 天然不入格式化范围.
+excludes = ["target/**", "**/target/**", "coverage/**", "**/coverage/**"]
+
+[formatter.nix]
+command = "nixfmt"
+includes = ["*.nix"]
+
+[formatter.rustfmt]
+command = "rustfmt"
+# 单文件模式下 rustfmt 不读 Cargo.toml 的 edition, 必须显式传,
+# 保证与 cargo fmt (走 cargo metadata 的 edition 2024) 输出一致.
+options = ["--edition", "2024"]
+includes = ["*.rs"]
+
+# taplo 走 stdin 协议必须用 `format` 子命令 (treefmt 自动补 `-` 参数);
+# `fmt` 子命令只支持原地改写, 在 treefmt 调用下 exit 2.
+[formatter.taplo]
+command = "taplo"
+options = ["format"]
+includes = ["*.toml"]
+
+[formatter.ruff-format]
+command = "ruff"
+options = ["format"]
+includes = ["*.py", "*.pyi"]

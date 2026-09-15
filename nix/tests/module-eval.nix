@@ -14,9 +14,10 @@
   pkgs,
   system,
   secretGuardModule,
-}: let
+}:
+let
   # nixosSystem 脚手架: 主模块 + 额外 modules (hostPlatform 由各 config 自带)
-  sgEv = extra: lib.nixosSystem {modules = [secretGuardModule] ++ extra;};
+  sgEv = extra: lib.nixosSystem { modules = [ secretGuardModule ] ++ extra; };
 
   # 结构化最小 host config: direct + router + secrets + auth + usage 全字段形态.
   minimalConfig = {
@@ -34,13 +35,24 @@
         "a-router" = {
           kind = "router";
           routes = [
-            {modelPattern = "*"; target = "b-upstream"; priority = 100;}
-            {modelPattern = "gpt-*"; target = "b-upstream"; upstreamModel = "glm-4.7";}
+            {
+              modelPattern = "*";
+              target = "b-upstream";
+              priority = 100;
+            }
+            {
+              modelPattern = "gpt-*";
+              target = "b-upstream";
+              upstreamModel = "glm-4.7";
+            }
           ];
         };
       };
       secrets.entries = [
-        {id = "llm__k_api_key"; valueFile = "/run/secrets/llm__k_api_key";}
+        {
+          id = "llm__k_api_key";
+          valueFile = "/run/secrets/llm__k_api_key";
+        }
       ];
       auth = {
         enable = true;
@@ -50,7 +62,12 @@
           clientSecretFile = "/run/secrets/oidc_client_secret";
           redirectUrl = "https://sg.example.com/oauth2/callback";
         };
-        apiKeys = [{label = "opencode"; keyFile = "/run/secrets/sdk_api_key";}];
+        apiKeys = [
+          {
+            label = "opencode";
+            keyFile = "/run/secrets/sdk_api_key";
+          }
+        ];
       };
       usage = {
         # retentionDays 故意不设 — 锁定默认值 90 的 e2e 镜像链 (assert-toml 断言);
@@ -67,7 +84,7 @@
     };
   };
 
-  ev = sgEv [minimalConfig];
+  ev = sgEv [ minimalConfig ];
 
   # --config 路径在 ExecStart 中 (eval 期断言; 不插值进 build 脚本以免把
   # secret-guard package 拖进 check 的构建闭包)
@@ -77,136 +94,181 @@
 
   # 内联 key 合成组合 (独立 host config): 验证非文件凭据形态 (apiKey 直值) 的
   # provider 组合同样走 render 链路 — direct + 默认路由 router
-  inlineEv = sgEv [{
-    nixpkgs.hostPlatform = system;
-    services.secret-guard = {
-      enable = true;
-      providers = {
-        "b-upstream" = {
-          name = "Upstream B";
-          kind = "direct";
-          protocol = "openai";
-          baseUrl = "https://up.example.com/v1";
-          apiKey = "test-inline-key";
-        };
-        "a-router" = {
-          kind = "router";
-          routes = [{modelPattern = "*"; target = "b-upstream"; priority = 100;}];
+  inlineEv = sgEv [
+    {
+      nixpkgs.hostPlatform = system;
+      services.secret-guard = {
+        enable = true;
+        providers = {
+          "b-upstream" = {
+            name = "Upstream B";
+            kind = "direct";
+            protocol = "openai";
+            baseUrl = "https://up.example.com/v1";
+            apiKey = "test-inline-key";
+          };
+          "a-router" = {
+            kind = "router";
+            routes = [
+              {
+                modelPattern = "*";
+                target = "b-upstream";
+                priority = 100;
+              }
+            ];
+          };
         };
       };
-    };
-  }];
+    }
+  ];
   inlineConfig = inlineEv.config.services.secret-guard.resolvedConfigFile;
 
   # 超时调参形态 (独立 host config): 验证 upstreamTimeouts 选项 → [server] 超时行
   # 的模块接线. 场景取拆墙形态 (agent-service#130: 非流式整响应 300 → 0), 只显式设
   # nonstream 一项 — 锁定 "任一偏离默认 → 四行全量渲染 (未设字段带 option
   # default)" 的 e2e 镜像链 (assert-toml 断言).
-  timeoutsEv = sgEv [{
-    nixpkgs.hostPlatform = system;
-    services.secret-guard = {
-      enable = true;
-      providers."b-upstream" = {
-        kind = "direct";
-        protocol = "openai";
-        baseUrl = "https://up.example.com/v1";
-        apiKeyFile = "/run/secrets/upstream_key";
+  timeoutsEv = sgEv [
+    {
+      nixpkgs.hostPlatform = system;
+      services.secret-guard = {
+        enable = true;
+        providers."b-upstream" = {
+          kind = "direct";
+          protocol = "openai";
+          baseUrl = "https://up.example.com/v1";
+          apiKeyFile = "/run/secrets/upstream_key";
+        };
+        upstreamTimeouts.nonstreamResponseHeaderTimeoutSecs = 0;
       };
-      upstreamTimeouts.nonstreamResponseHeaderTimeoutSecs = 0;
-    };
-  }];
+    }
+  ];
   timeoutsConfig = timeoutsEv.config.services.secret-guard.resolvedConfigFile;
 
   # eval 失败/成功断言 (强制点: ExecStart 会连带强制 resolvedConfigFile 的三态解析)
   fails = e: !(builtins.tryEval e).success;
   unitOf = e: e.config.systemd.services.secret-guard.serviceConfig.ExecStart;
 
-  mutualExclusionFails = fails (unitOf (sgEv [{
-    nixpkgs.hostPlatform = system;
-    services.secret-guard = {
-      enable = true;
-      configFile = "/etc/secret-guard.toml";
-      providers."x".kind = "direct";
-      providers."x".protocol = "openai";
-      providers."x".baseUrl = "https://x";
-    };
-  }]));
+  mutualExclusionFails = fails (
+    unitOf (sgEv [
+      {
+        nixpkgs.hostPlatform = system;
+        services.secret-guard = {
+          enable = true;
+          configFile = "/etc/secret-guard.toml";
+          providers."x".kind = "direct";
+          providers."x".protocol = "openai";
+          providers."x".baseUrl = "https://x";
+        };
+      }
+    ])
+  );
 
-  missingConfigFails =
-    fails (unitOf (sgEv [{
-      nixpkgs.hostPlatform = system;
-      services.secret-guard.enable = true;
-    }]));
+  missingConfigFails = fails (
+    unitOf (sgEv [
+      {
+        nixpkgs.hostPlatform = system;
+        services.secret-guard.enable = true;
+      }
+    ])
+  );
 
   # 互斥守卫涵盖 upstreamTimeouts (不计入 structuredUsed 但属迁移残留形态):
   # 手写 configFile 下超时设置会无声丢失, 必须与 providers 等同拦.
   # 注意不带 providers — structuredUsed 保持 false, 使 throw 只能源于
   # timeoutsUsed (带 providers 会让本断言退化为既有 mutualExclusionFails
   # 的重复, 对 "|| timeoutsUsed" 的回退零防护).
-  timeoutsMutualExclusionFails =
-    fails (unitOf (sgEv [{
+  timeoutsMutualExclusionFails = fails (
+    unitOf (sgEv [
+      {
+        nixpkgs.hostPlatform = system;
+        services.secret-guard = {
+          enable = true;
+          configFile = "/etc/secret-guard.toml";
+          upstreamTimeouts.streamIdleTimeoutSecs = 1;
+        };
+      }
+    ])
+  );
+
+  # 手写 configFile (escape hatch): 原样透传 (resolvedConfigFile = 用户路径, 非 store render)
+  handWritten = sgEv [
+    {
       nixpkgs.hostPlatform = system;
       services.secret-guard = {
         enable = true;
-        configFile = "/etc/secret-guard.toml";
-        upstreamTimeouts.streamIdleTimeoutSecs = 1;
+        configFile = pkgs.writeText "hand-written.toml" ''
+          [[providers]]
+          id = "hand"
+          kind = "direct"
+          protocol = "openai"
+          base_url = "https://hand.example.com"
+          enabled = true
+        '';
       };
-    }]));
-
-  # 手写 configFile (escape hatch): 原样透传 (resolvedConfigFile = 用户路径, 非 store render)
-  handWritten = sgEv [{
-    nixpkgs.hostPlatform = system;
-    services.secret-guard = {
-      enable = true;
-      configFile = pkgs.writeText "hand-written.toml" ''
-        [[providers]]
-        id = "hand"
-        kind = "direct"
-        protocol = "openai"
-        base_url = "https://hand.example.com"
-        enabled = true
-      '';
-    };
-  }];
-  handWrittenOk = handWritten.config.services.secret-guard.resolvedConfigFile == handWritten.config.services.secret-guard.configFile;
+    }
+  ];
+  handWrittenOk =
+    handWritten.config.services.secret-guard.resolvedConfigFile
+    == handWritten.config.services.secret-guard.configFile;
 
   assertions = [
-    {name = "ExecStart 接线: --config <resolvedConfigFile>"; ok = execStartOk;}
-    {name = "configFile 互斥: 显式 + 结构化同设 → eval throw"; ok = mutualExclusionFails;}
-    {name = "configFile 互斥: 显式 + upstreamTimeouts 偏离 → eval throw (防设置无声丢失)"; ok = timeoutsMutualExclusionFails;}
-    {name = "双缺: 无 configFile 无结构化 → eval throw"; ok = missingConfigFails;}
-    {name = "手写 configFile (escape hatch) 原样透传"; ok = handWrittenOk;}
+    {
+      name = "ExecStart 接线: --config <resolvedConfigFile>";
+      ok = execStartOk;
+    }
+    {
+      name = "configFile 互斥: 显式 + 结构化同设 → eval throw";
+      ok = mutualExclusionFails;
+    }
+    {
+      name = "configFile 互斥: 显式 + upstreamTimeouts 偏离 → eval throw (防设置无声丢失)";
+      ok = timeoutsMutualExclusionFails;
+    }
+    {
+      name = "双缺: 无 configFile 无结构化 → eval throw";
+      ok = missingConfigFails;
+    }
+    {
+      name = "手写 configFile (escape hatch) 原样透传";
+      ok = handWrittenOk;
+    }
   ];
   failed = builtins.filter (a: !a.ok) assertions;
 
-  testRunner = pkgs.runCommand "secret-guard-module-eval-tests" {
-    nativeBuildInputs = [pkgs.python3];
-  } ''
-    ${lib.concatMapStrings (a: ''
-        echo "[sg-module-eval] ${a.name}: ${if a.ok then "PASS" else "FAIL"}" >&2
-      '')
-      assertions}
-
-    ${if failed == []
-      then ''
-        echo "[sg-module-eval] 全部 ${toString (builtins.length assertions)} 项 eval 断言通过" >&2
+  testRunner =
+    pkgs.runCommand "secret-guard-module-eval-tests"
+      {
+        nativeBuildInputs = [ pkgs.python3 ];
+      }
       ''
-      else ''
-        echo "[sg-module-eval] ${toString (builtins.length failed)} 项断言失败, 详情见上" >&2
-        exit 1
-      ''}
+        ${lib.concatMapStrings (a: ''
+          echo "[sg-module-eval] ${a.name}: ${if a.ok then "PASS" else "FAIL"}" >&2
+        '') assertions}
 
-    # 生成物 round-trip (build 期 tomllib): minimal 全字段 + 内联 key 合成组合形态
-    # + 超时调参形态
-    python3 ${./assert-toml.py} minimal ${generatedConfig}
-    python3 ${./assert-toml.py} inline ${inlineConfig}
-    python3 ${./assert-toml.py} timeouts ${timeoutsConfig}
+        ${
+          if failed == [ ] then
+            ''
+              echo "[sg-module-eval] 全部 ${toString (builtins.length assertions)} 项 eval 断言通过" >&2
+            ''
+          else
+            ''
+              echo "[sg-module-eval] ${toString (builtins.length failed)} 项断言失败, 详情见上" >&2
+              exit 1
+            ''
+        }
 
-    grep -q "Auto-generated by services.secret-guard structured options" ${generatedConfig} \
-      || { echo "[sg-module-eval] 头部注释缺失" >&2; exit 1; }
+        # 生成物 round-trip (build 期 tomllib): minimal 全字段 + 内联 key 合成组合形态
+        # + 超时调参形态
+        python3 ${./assert-toml.py} minimal ${generatedConfig}
+        python3 ${./assert-toml.py} inline ${inlineConfig}
+        python3 ${./assert-toml.py} timeouts ${timeoutsConfig}
 
-    touch $out
-  '';
-in {
+        grep -q "Auto-generated by services.secret-guard structured options" ${generatedConfig} \
+          || { echo "[sg-module-eval] 头部注释缺失" >&2; exit 1; }
+
+        touch $out
+      '';
+in
+{
   inherit testRunner assertions;
 }

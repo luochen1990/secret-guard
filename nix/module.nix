@@ -26,12 +26,13 @@
   lib,
   pkgs,
   ...
-}: let
+}:
+let
   cfg = config.services.secret-guard;
 
   # auth 段是否被使用 (三项任一非默认). apiKeys/oidc 在 enable=false 时也可配 —
   # 上游"只认证, 不隔离"哲学: key 池无条件加载.
-  authUsed = cfg.auth.enable || cfg.auth.oidc != null || cfg.auth.apiKeys != [];
+  authUsed = cfg.auth.enable || cfg.auth.oidc != null || cfg.auth.apiKeys != [ ];
 
   # usage 段的 serde 默认值 (src/config.rs UsageConfig::default 的 nix 镜像,
   # 改上游默认时同步). 用途: ① 判定 usage 是否被使用 (深比较); ② option default
@@ -42,7 +43,7 @@
     retentionDays = 90;
     pricingUrl = "https://models.dev/api.json";
     pricingRefreshSecs = 86400;
-    pricingOverride = {};
+    pricingOverride = { };
   };
 
   # usage 段是否被使用 (任一字段偏离默认; 深比较 submodule 合并值与默认结构).
@@ -50,10 +51,7 @@
 
   # render 的 usage 入参: 全默认 → null (跳过 [usage] 段); 偏离默认 → 全量渲染
   # (显式优于隐式). 与 authArg 对称的具名绑定.
-  usageArg =
-    if usageUsed
-    then cfg.usage
-    else null;
+  usageArg = if usageUsed then cfg.usage else null;
 
   # 上游超时段的 serde 默认值 (src/config.rs ServerConfig::default 的 nix 镜像,
   # 改上游默认时同步 — 与 usageDefaults 同模式). 用途: ① option default 的单一
@@ -73,47 +71,53 @@
 
   # render 的超时入参: 全默认 → null (跳过超时行); 偏离默认 → 全量渲染四行
   # (显式优于隐式, 与 usageArg 对称).
-  timeoutsArg =
-    if timeoutsUsed
-    then cfg.upstreamTimeouts
-    else null;
+  timeoutsArg = if timeoutsUsed then cfg.upstreamTimeouts else null;
 
   # 结构化选项是否被使用 (任一非默认).
-  structuredUsed = cfg.providers != {} || cfg.secrets.entries != [] || authUsed || usageUsed;
+  structuredUsed = cfg.providers != { } || cfg.secrets.entries != [ ] || authUsed || usageUsed;
 
   # render 的 auth 入参: auth 全默认时传 null (跳过 [auth] 段), 否则传完整结构
   # (选项 enable → toml enabled 的命名映射在此完成).
   authArg =
-    if authUsed
-    then {
-      enabled = cfg.auth.enable;
-      inherit (cfg.auth) oidc apiKeys;
-    }
-    else null;
+    if authUsed then
+      {
+        enabled = cfg.auth.enable;
+        inherit (cfg.auth) oidc apiKeys;
+      }
+    else
+      null;
 
-  renderedConfig = pkgs.writeText "secret-guard.toml" (import ./render.nix {
-    inherit lib;
-    inherit (cfg) host port providers allowedDomains;
-    upstreamTimeouts = timeoutsArg;
-    secretsEntries = cfg.secrets.entries;
-    auth = authArg;
-    usage = usageArg;
-  });
+  renderedConfig = pkgs.writeText "secret-guard.toml" (
+    import ./render.nix {
+      inherit lib;
+      inherit (cfg)
+        host
+        port
+        providers
+        allowedDomains
+        ;
+      upstreamTimeouts = timeoutsArg;
+      secretsEntries = cfg.secrets.entries;
+      auth = authArg;
+      usage = usageArg;
+    }
+  );
 
   # configFile 三态: 显式路径 (手写接管) / 结构化自动 render / 双缺 throw.
   # 显式 + 结构化同设 → throw (互斥): 手写会静默胜出, 几乎肯定是迁移残留.
   # 互斥守卫涵盖 upstreamTimeouts (虽不计入 structuredUsed): 手写 configFile
   # 下超时设置会无声丢失, 与 "显式 + usage 偏离" 同属迁移残留形态.
   resolvedConfigFile =
-    if cfg.configFile != null
-    then
-      lib.throwIf (structuredUsed || timeoutsUsed || cfg.allowedDomains != [])
-      "services.secret-guard: configFile 与结构化选项 (providers/secrets.entries/auth/usage/upstreamTimeouts/allowedDomains) 互斥, 二选一 — 手写 toml 是完全接管, 与自动 render 会静默竞争"
-      cfg.configFile
-    else if structuredUsed
-    then renderedConfig
-    else throw "services.secret-guard: 缺配置 — configFile (手写 toml) 与结构化选项 (providers/secrets.entries/auth/usage) 至少设其一";
-in {
+    if cfg.configFile != null then
+      lib.throwIf (structuredUsed || timeoutsUsed || cfg.allowedDomains != [ ])
+        "services.secret-guard: configFile 与结构化选项 (providers/secrets.entries/auth/usage/upstreamTimeouts/allowedDomains) 互斥, 二选一 — 手写 toml 是完全接管, 与自动 render 会静默竞争"
+        cfg.configFile
+    else if structuredUsed then
+      renderedConfig
+    else
+      throw "services.secret-guard: 缺配置 — configFile (手写 toml) 与结构化选项 (providers/secrets.entries/auth/usage) 至少设其一";
+in
+{
   options.services.secret-guard = {
     enable = lib.mkEnableOption "secret-guard: lightweight LLM gateway that prevents secret leakage";
 
@@ -145,7 +149,7 @@ in {
 
     allowedDomains = lib.mkOption {
       type = lib.types.listOf lib.types.str;
-      default = [];
+      default = [ ];
       description = ''
         SEC-7 Host guard 信任域名 ([server] allowed_domains), 反代 + 域名部署形态:
         经反向代理以域名 (如 sg.example.com) 暴露 secret-guard 时, 反代保留原始
@@ -255,99 +259,123 @@ in {
     };
 
     providers = lib.mkOption {
-      type = lib.types.attrsOf (lib.types.submodule {
-        options = {
-          name = lib.mkOption {
-            type = lib.types.nullOr lib.types.str;
-            default = null;
-            description = "可选人类可读名称 (WebUI 显示).";
+      type = lib.types.attrsOf (
+        lib.types.submodule {
+          options = {
+            name = lib.mkOption {
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              description = "可选人类可读名称 (WebUI 显示).";
+            };
+            enable = lib.mkOption {
+              type = lib.types.bool;
+              default = true;
+              description = "是否启用 (映射 toml enabled; false 时转发到该 provider 返回 503).";
+            };
+            tomlComment = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ ];
+              description = "生成 toml 中该 provider 块前的注释行 (来源/用途说明, 随配置声明走 SSOT; 须单行).";
+            };
+            kind = lib.mkOption {
+              type = lib.types.enum [
+                "direct"
+                "router"
+              ];
+              description = "构造判别: direct=直连上游 (protocol/baseUrl/apiKey*) / router=虚拟路由表 (routes).";
+            };
+            protocol = lib.mkOption {
+              type = lib.types.nullOr (
+                lib.types.enum [
+                  "openai"
+                  "anthropic"
+                  "gemini"
+                  "ollama"
+                  "openairesponses"
+                ]
+              );
+              default = null;
+              description = "kind=direct 必填: 上游协议 (决定 egress protocol, 跨协议请求自动走 codec 翻译).";
+            };
+            baseUrl = lib.mkOption {
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              description = "kind=direct 必填: 上游 base URL, 须 http(s):// 开头且末尾不带 /.";
+            };
+            apiKey = lib.mkOption {
+              type = lib.types.str;
+              default = "";
+              description = "内联 api key 直值 — 仅用于非敏感场景 (toml 会明文携带该值); 敏感凭据一律走 apiKeyFile. 与 apiKeyFile 互斥 (render 层同设即 throw, 与上游 validate 的互斥语义对齐).";
+            };
+            apiKeyFile = lib.mkOption {
+              type = lib.types.nullOr lib.types.path;
+              default = null;
+              description = "api key 文件路径 (与上游 api_key_file 字段 1:1 纯路径直通, 每次转发时读取并 trim). 敏感凭据推荐走此通道: sops.secrets 路径或 systemd LoadCredential 注入路径 (姿势见 docs/deployment-nixos.md), 保持 toml 本身脱敏.";
+            };
+            routes = lib.mkOption {
+              type = lib.types.listOf (
+                lib.types.submodule {
+                  options = {
+                    modelPattern = lib.mkOption {
+                      type = lib.types.str;
+                      description = "model 名通配符 (仅 '*' 是元字符, 其余字面匹配).";
+                    };
+                    target = lib.mkOption {
+                      type = lib.types.str;
+                      description = "目标 provider id (可链式指向另一 router; render 层校验存在性 + 环检测).";
+                    };
+                    upstreamModel = lib.mkOption {
+                      type = lib.types.nullOr lib.types.str;
+                      default = null;
+                      description = "出站 model 重写值; null = 透传请求原 model.";
+                    };
+                    priority = lib.mkOption {
+                      type = lib.types.nullOr lib.types.int;
+                      default = null;
+                      description = "优先级 (越大越优先, 并列按列表序); null = 该路由禁用 (省略 priority 行).";
+                    };
+                  };
+                }
+              );
+              default = [ ];
+              description = "kind=router 的路由表 (上游 validate 要求非空).";
+            };
           };
-          enable = lib.mkOption {
-            type = lib.types.bool;
-            default = true;
-            description = "是否启用 (映射 toml enabled; false 时转发到该 provider 返回 503).";
-          };
-          tomlComment = lib.mkOption {
-            type = lib.types.listOf lib.types.str;
-            default = [];
-            description = "生成 toml 中该 provider 块前的注释行 (来源/用途说明, 随配置声明走 SSOT; 须单行).";
-          };
-          kind = lib.mkOption {
-            type = lib.types.enum ["direct" "router"];
-            description = "构造判别: direct=直连上游 (protocol/baseUrl/apiKey*) / router=虚拟路由表 (routes).";
-          };
-          protocol = lib.mkOption {
-            type = lib.types.nullOr (lib.types.enum ["openai" "anthropic" "gemini" "ollama" "openairesponses"]);
-            default = null;
-            description = "kind=direct 必填: 上游协议 (决定 egress protocol, 跨协议请求自动走 codec 翻译).";
-          };
-          baseUrl = lib.mkOption {
-            type = lib.types.nullOr lib.types.str;
-            default = null;
-            description = "kind=direct 必填: 上游 base URL, 须 http(s):// 开头且末尾不带 /.";
-          };
-          apiKey = lib.mkOption {
-            type = lib.types.str;
-            default = "";
-            description = "内联 api key 直值 — 仅用于非敏感场景 (toml 会明文携带该值); 敏感凭据一律走 apiKeyFile. 与 apiKeyFile 互斥 (render 层同设即 throw, 与上游 validate 的互斥语义对齐).";
-          };
-          apiKeyFile = lib.mkOption {
-            type = lib.types.nullOr lib.types.path;
-            default = null;
-            description = "api key 文件路径 (与上游 api_key_file 字段 1:1 纯路径直通, 每次转发时读取并 trim). 敏感凭据推荐走此通道: sops.secrets 路径或 systemd LoadCredential 注入路径 (姿势见 docs/deployment-nixos.md), 保持 toml 本身脱敏.";
-          };
-          routes = lib.mkOption {
-            type = lib.types.listOf (lib.types.submodule {
-              options = {
-                modelPattern = lib.mkOption {
-                  type = lib.types.str;
-                  description = "model 名通配符 (仅 '*' 是元字符, 其余字面匹配).";
-                };
-                target = lib.mkOption {
-                  type = lib.types.str;
-                  description = "目标 provider id (可链式指向另一 router; render 层校验存在性 + 环检测).";
-                };
-                upstreamModel = lib.mkOption {
-                  type = lib.types.nullOr lib.types.str;
-                  default = null;
-                  description = "出站 model 重写值; null = 透传请求原 model.";
-                };
-                priority = lib.mkOption {
-                  type = lib.types.nullOr lib.types.int;
-                  default = null;
-                  description = "优先级 (越大越优先, 并列按列表序); null = 该路由禁用 (省略 priority 行).";
-                };
-              };
-            });
-            default = [];
-            description = "kind=router 的路由表 (上游 validate 要求非空).";
-          };
-        };
-      });
-      default = {};
+        }
+      );
+      default = { };
       description = "provider 集 (attr 名 = provider id; attrsOf 跨模块/跨文件可合并, 各设各的 key). 渲染按 id 字典序, 字段校验 fail-fast 见 nix/render.nix.";
     };
 
     secrets = {
       entries = lib.mkOption {
-        type = lib.types.listOf (lib.types.submodule {
-          options = {
-            id = lib.mkOption {
-              type = lib.types.str;
-              description = "secret 唯一 id (1..=64, 首字符字母数字, 其余 [A-Za-z0-9_-]).";
+        type = lib.types.listOf (
+          lib.types.submodule {
+            options = {
+              id = lib.mkOption {
+                type = lib.types.str;
+                description = "secret 唯一 id (1..=64, 首字符字母数字, 其余 [A-Za-z0-9_-]).";
+              };
+              category = lib.mkOption {
+                type = lib.types.enum [
+                  "password"
+                  "apikey"
+                  "token"
+                  "cookie"
+                  "privatekey"
+                  "other"
+                ];
+                default = "apikey";
+                description = "类别 (影响 mock 生成策略, 对齐上游 SecretCategory serde lowercase 命名).";
+              };
+              valueFile = lib.mkOption {
+                type = lib.types.path;
+                description = "secret 明文文件路径 (与上游 value_file 1:1; 启动时一次性 resolve, 读不到 → fail-fast 启动失败). 保持 toml 脱敏的推荐通道.";
+              };
             };
-            category = lib.mkOption {
-              type = lib.types.enum ["password" "apikey" "token" "cookie" "privatekey" "other"];
-              default = "apikey";
-              description = "类别 (影响 mock 生成策略, 对齐上游 SecretCategory serde lowercase 命名).";
-            };
-            valueFile = lib.mkOption {
-              type = lib.types.path;
-              description = "secret 明文文件路径 (与上游 value_file 1:1; 启动时一次性 resolve, 读不到 → fail-fast 启动失败). 保持 toml 脱敏的推荐通道.";
-            };
-          };
-        });
-        default = [];
+          }
+        );
+        default = [ ];
         description = "redact 保护清单 ([[secrets.entries]] 段): 这些 secret 会在 LLM 请求字节流中被扫描并替换为 mock, 防止 agent 泄漏到上游.";
       };
     };
@@ -360,9 +388,8 @@ in {
       };
 
       oidc = lib.mkOption {
-        type =
-          lib.types.nullOr
-          (lib.types.submodule {
+        type = lib.types.nullOr (
+          lib.types.submodule {
             options = {
               issuerUrl = lib.mkOption {
                 type = lib.types.str;
@@ -383,31 +410,34 @@ in {
                 description = "回调 URL, 必须与 IdP 侧注册值逐字节一致 (IdP 严格校验); 须以 /oauth2/callback 结尾 (只能换 scheme/host/port). 省略 = 由监听 host/port 派生.";
               };
             };
-          });
+          }
+        );
         default = null;
         description = "OIDC 接入参数 (auth.enable=true 时必填, render 层 fail-fast).";
       };
 
       apiKeys = lib.mkOption {
-        type = lib.types.listOf (lib.types.submodule {
-          options = {
-            label = lib.mkOption {
-              type = lib.types.str;
-              description = "api key 展示标签 (如消费方名 opencode), 不得重复留空.";
+        type = lib.types.listOf (
+          lib.types.submodule {
+            options = {
+              label = lib.mkOption {
+                type = lib.types.str;
+                description = "api key 展示标签 (如消费方名 opencode), 不得重复留空.";
+              };
+              key = lib.mkOption {
+                type = lib.types.nullOr lib.types.str;
+                default = null;
+                description = "内联 api key 直值. 与 keyFile 恰设其一 (render 层 fail-fast).";
+              };
+              keyFile = lib.mkOption {
+                type = lib.types.nullOr lib.types.path;
+                default = null;
+                description = "api key 文件路径 (与上游 key_file 1:1). 与 key 恰设其一.";
+              };
             };
-            key = lib.mkOption {
-              type = lib.types.nullOr lib.types.str;
-              default = null;
-              description = "内联 api key 直值. 与 keyFile 恰设其一 (render 层 fail-fast).";
-            };
-            keyFile = lib.mkOption {
-              type = lib.types.nullOr lib.types.path;
-              default = null;
-              description = "api key 文件路径 (与上游 key_file 1:1). 与 key 恰设其一.";
-            };
-          };
-        });
-        default = [];
+          }
+        );
+        default = [ ];
         description = "预填 SDK api key 列表 ([[auth.api_keys]] 段, 上游启动时 hash 后注入 key 池).";
       };
     };
@@ -441,29 +471,31 @@ in {
       };
 
       pricingOverride = lib.mkOption {
-        type = lib.types.attrsOf (lib.types.submodule {
-          options = {
-            input = lib.mkOption {
-              type = lib.types.float;
-              description = "输入价 ($/1M tokens).";
+        type = lib.types.attrsOf (
+          lib.types.submodule {
+            options = {
+              input = lib.mkOption {
+                type = lib.types.float;
+                description = "输入价 ($/1M tokens).";
+              };
+              output = lib.mkOption {
+                type = lib.types.float;
+                description = "输出价 ($/1M tokens).";
+              };
+              cacheRead = lib.mkOption {
+                type = lib.types.nullOr lib.types.float;
+                default = null;
+                description = "缓存读价 ($/1M tokens). null = 省略字段, 上游回退按 input 价.";
+              };
+              cacheWrite = lib.mkOption {
+                type = lib.types.nullOr lib.types.float;
+                default = null;
+                description = "缓存写价 ($/1M tokens). null = 省略字段, 上游回退按 1.25×input (Anthropic 惯例近似); 供应商缓存写免费时应显式设 0.0 (注意 types.float 不收整数字面量).";
+              };
             };
-            output = lib.mkOption {
-              type = lib.types.float;
-              description = "输出价 ($/1M tokens).";
-            };
-            cacheRead = lib.mkOption {
-              type = lib.types.nullOr lib.types.float;
-              default = null;
-              description = "缓存读价 ($/1M tokens). null = 省略字段, 上游回退按 input 价.";
-            };
-            cacheWrite = lib.mkOption {
-              type = lib.types.nullOr lib.types.float;
-              default = null;
-              description = "缓存写价 ($/1M tokens). null = 省略字段, 上游回退按 1.25×input (Anthropic 惯例近似); 供应商缓存写免费时应显式设 0.0 (注意 types.float 不收整数字面量).";
-            };
-          };
-        });
-        default = {};
+          }
+        );
+        default = { };
         description = ''
           用户定价覆盖 ([usage.pricing_override], 键 = 聚合用 model 字符串).
           最高优先于 models.dev 远程表 — 典型场景: 套餐/包年入口在 models.dev
@@ -483,21 +515,25 @@ in {
       home = "/var/lib/secret-guard";
       createHome = false;
     };
-    users.groups.secret-guard = lib.mkIf cfg.enable {};
+    users.groups.secret-guard = lib.mkIf cfg.enable { };
 
     systemd.services.secret-guard = lib.mkIf cfg.enable {
       description = "secret-guard: lightweight LLM gateway that prevents secret leakage";
-      wantedBy = ["multi-user.target"];
-      after = ["network.target"];
+      wantedBy = [ "multi-user.target" ];
+      after = [ "network.target" ];
 
       serviceConfig = {
         ExecStart = lib.concatStringsSep " " [
           "${cfg.package}/bin/secret-guard"
           "run"
-          "--config" "${resolvedConfigFile}"
-          "--state" "${cfg.stateFile}"
-          "--host" "${cfg.host}"
-          "--port" "${toString cfg.port}"
+          "--config"
+          "${resolvedConfigFile}"
+          "--state"
+          "${cfg.stateFile}"
+          "--host"
+          "${cfg.host}"
+          "--port"
+          "${toString cfg.port}"
         ];
         Type = "simple";
         Restart = "on-failure";
@@ -523,18 +559,22 @@ in {
         ProtectKernelTunables = true;
         ProtectSystem = "strict";
         ProtectHome = true;
-        RestrictAddressFamilies = ["AF_INET" "AF_INET6" "AF_UNIX"];
+        RestrictAddressFamilies = [
+          "AF_INET"
+          "AF_INET6"
+          "AF_UNIX"
+        ];
         RestrictNamespaces = true;
         RestrictRealtime = true;
         RestrictSUIDSGID = true;
         LockPersonality = true;
         SystemCallArchitectures = "native";
-        SystemCallFilter = ["@system-service"];
+        SystemCallFilter = [ "@system-service" ];
         CapabilityBoundingSet = "";
         AmbientCapabilities = "";
       };
     };
 
-    networking.firewall.allowedTCPPorts = lib.mkIf (cfg.enable && cfg.openFirewall) [cfg.port];
+    networking.firewall.allowedTCPPorts = lib.mkIf (cfg.enable && cfg.openFirewall) [ cfg.port ];
   };
 }

@@ -23,7 +23,14 @@ consistency-check = []
 axum = { version = "0.8", features = ["macros"] }
 # gzip/brotli/deflate: 启用 reqwest 的自动解压 (上游 LLM provider 普遍支持压缩响应,
 # 不启用会导致 secret-guard 拿到压缩字节 → record.resp_body 乱码 + parsed view 失败).
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "gzip", "brotli", "deflate"] }
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls",
+  "json",
+  "stream",
+  "gzip",
+  "brotli",
+  "deflate",
+] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 tower-http = { version = "0.7", features = ["trace"] }
@@ -47,7 +54,10 @@ rand = "0.8"
 # axum-login re-export tower-sessions core, 但 MemoryStore 需要 memory-store feature.
 tower-sessions = { version = "0.14", features = ["memory-store"] }
 axum-login = "0.18"
-openidconnect = { version = "4", default-features = false, features = ["reqwest", "rustls-tls"] }
+openidconnect = { version = "4", default-features = false, features = [
+  "reqwest",
+  "rustls-tls",
+] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 # 子串搜索 (memmem::Finder): warn_disabled_secrets_in_body 对 raw body 的多 needle
 # 扫描, 替代朴素 O(n·m) 窗口比较. 已是 lock 中传递依赖 (axum / futures 等), 显式化

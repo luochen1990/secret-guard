@@ -47,6 +47,12 @@ pkgs.mkShell {
     rust-analyzer
     pkg-config
     openssl
+    # 全仓格式化 (just fmt / check 链门禁): treefmt 调度器 + 它调用的三个
+    # 工具 (rustfmt 已在上方). 配置 SSOT = 根 treefmt.toml, treefmt 自动发现.
+    treefmt
+    nixfmt
+    taplo
+    ruff
     # WebUI 回归测试 (tests/webui/): playwright-test 自带 @playwright/test + 浏览器.
     # shellHook 把它的 node_modules symlink 到 tests/webui/node_modules,
     # 让 TS 源码的 `import "@playwright/test"` 能解析 (ESM resolver 不读 NODE_PATH).
