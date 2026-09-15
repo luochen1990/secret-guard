@@ -294,20 +294,12 @@ pub fn build_upstream_client(connect_timeout: Option<Duration>) -> anyhow::Resul
 /// - `dyn_state`: 来自 `secret-guard.state.toml`, 拆为 dynamic 列表 + decisions.
 /// - `state_path`: state.toml 的写回路径.
 /// - `auth_config`: 认证配置 (来自 static config 的 `[auth]` 段).
-/// - `global_mock_prefix`: 来自 static config 的 `[redact] global_mock_prefix`,
-///   存入 AppState 供 WebUI handler 在 secret upsert 时校验 + resolve.
-/// - `on_probe_exhausted`: 来自 static config 的 `[redact] on_probe_exhausted`,
-///   存入 AppState 供 forwarding 路径决定 probing 耗尽时 fail-open / fail-closed.
-/// - `on_unsupported_protocol`: 来自 static config 的
-///   `[redact] on_unsupported_protocol`, 存入 AppState 供 forwarding 路径决定
-///   codec 不覆盖的协议 (gemini/ollama) 上配置了 secrets 时 fail-open / fail-closed.
-/// - `on_fallback_restore`: 来自 static config 的 `[redact] on_fallback_restore`,
-///   存入 AppState 供响应侧 parse-失败 fallback 路径决定是否把 Mock 还原为
-///   real 发给客户端 (withhold 保留 Mock / restore 还原, SEC-10).
-/// - `redacted_headers`: 来自 static config 的 `[redact] redacted_headers`
-///   (SEC-4), 归一化 (trim + lowercase, 空串条目跳过, 见
-///   `state::normalize_redacted_headers`) 后存入 AppState, 供请求/响应两侧
-///   record 记录点的 header 脱敏与硬编码黑名单并集生效.
+/// - `redact_config`: 脱敏配置 (来自 static config 的 `[redact]` 段, 整段传入 —
+///   各字段的 AppState 去向与消费点见 [`AppState`] 的字段
+///   注释: `global_mock_prefix` / `on_probe_exhausted` / `on_unsupported_protocol` /
+///   `on_fallback_restore` / `redacted_headers`, 后者经
+///   `state::normalize_redacted_headers` 归一化 (trim + lowercase, 空串条目跳过)
+///   后供请求/响应两侧 record 记录点的 header 脱敏与硬编码黑名单并集生效, SEC-4).
 /// - `upstream_timeouts`: 来自 static config 的 `[server] upstream_*_timeout_secs`,
 ///   存入 AppState 供 forward 路径给 send().await / stream chunk 加超时保护
 ///   (防上游网络异常时 record 永久 pending).
@@ -322,15 +314,18 @@ pub async fn serve(
     state_path: PathBuf,
     config_path: PathBuf,
     auth_config: AuthConfig,
-    global_mock_prefix: String,
-    on_probe_exhausted: crate::config::OnProbeExhausted,
-    on_unsupported_protocol: crate::config::OnUnsupportedProtocol,
-    on_fallback_restore: crate::config::OnFallbackRestore,
-    redacted_headers: Vec<String>,
+    redact_config: crate::config::RedactConfig,
     upstream_timeouts: crate::config::UpstreamTimeouts,
     usage_config: crate::config::UsageConfig,
     allowed_domains: Vec<String>,
 ) -> anyhow::Result<()> {
+    let crate::config::RedactConfig {
+        global_mock_prefix,
+        on_probe_exhausted,
+        on_unsupported_protocol,
+        on_fallback_restore,
+        redacted_headers,
+    } = redact_config;
     auth_config.validate().map_err(|e| anyhow::anyhow!(e))?;
 
     let upstream = build_upstream_client(upstream_timeouts.connect)?;
