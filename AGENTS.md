@@ -665,21 +665,32 @@ GPL/AGPL 等 copyleft 会污染下游). 配置在 `deny.toml`, 与 `.cargo/audit
   copyleft, 不污染链接产物) / CC0-1.0 / CDLA-Permissive-2.0 (webpki-roots 的 CA 根证书数据协议).
   copyleft (GPL/AGPL/LGPL) 与不明 license 被 deny.
 - **multiple-versions = warn**: 重复 crate 只警告不阻断. Rust 生态 duplicate 多为传递依赖
-  暂态, 强制 deny 会频繁阻塞. 当前重复清单 (2026-08 实测, 删 time 死依赖后), 两个口径:
-  - linux 构建图 (`cargo tree -d`): **9 个家族** — base64 / getrandom (3 版) / rand /
-    rand_chacha / rand_core / syn / thiserror + thiserror-impl / tower-http;
-  - Cargo.lock 全平台口径: **15 个家族** — 上述 9 个再加 cpufeatures / hashbrown /
+  暂态, 强制 deny 会频繁阻塞. 当前重复清单 (2026-09 实测, rand 0.10 + criterion 0.8
+  升级 + CVE 批量 update 后), 两个口径:
+  - linux 构建图 (`cargo tree -d`): **11 个家族** — base64 / cpufeatures / getrandom
+    (3 版) / itertools / rand (3 版) / rand_chacha / rand_core (3 版) / syn /
+    thiserror + thiserror-impl / tower-http;
+  - Cargo.lock 全平台口径: **17 个家族** — 上述 11 个再加 bitflags / hashbrown /
     indexmap / r-efi / schemars / windows-sys.
-  lock-only 家族的归因 (两类): ① indexmap 1.9 + schemars 0.9 + hashbrown 0.12 孤立
-  老版本簇是 serde_with 的 legacy optional feature (serde_with 本身在 linux 构建
-  图内, 经 openidconnect 引入; 簇成员不进构建图), cpufeatures 0.3.0 同理源自
-  reqwest 未启用的 http3 → rand 0.10 → chacha20 — 消解时点取决于上游移除对应
-  optional feature (serde_with legacy feature / reqwest http3), openidconnect /
-  reqwest 自身升级只是载体, 均无独立升级条目; ② r-efi / windows-sys 为
-  windows/UEFI target 专属暂态.
-  构建图内家族的解法已记录于 "后续工作": tower-http (reqwest 0.13) / rand 簇
-  (rand 条目, 注意升级后 0.8/0.9 传递仍留存); base64/getrandom/syn/thiserror 为
-  生态暂态, 无独立条目.
+  归因 (三类): ① **rand 簇** (rand / rand_core / rand_chacha / getrandom /
+  cpufeatures): 我方 rand 0.8→0.10 (2026-09) 后的固有 spread — openidconnect /
+  oauth2 钉 0.8, proptest / mockito (dev) 用 0.9, 我方 0.10; rand 0.10 的 default
+  feature 链 (default → `std_rng` / `thread_rng` → chacha20) 把 chacha20 +
+  cpufeatures 0.3 带进构建图 (ThreadRng 以 chacha20 为核心, 无法在保留 thread_rng
+  的前提下裁掉), cpufeatures 0.2 来自 sha2 0.10 时代 crypto 链. 消解时点 =
+  rand 0.8 侧持有者 (openidconnect / oauth2 / tower-sessions-core /
+  rsa→num-bigint-dig 链) 集体升级.
+  ② **itertools**: criterion 0.8 (dev) 用 0.13 vs openidconnect 钉 0.10
+  (2026-09 criterion 0.5→0.8 引入), dev-only, 发布二进制无感.
+  ③ lock-only 家族: indexmap 1.9 + schemars 0.9 + hashbrown 0.12 孤立老版本簇
+  是 serde_with 的 legacy optional feature (serde_with 本身在 linux 构建图内,
+  经 openidconnect 引入; 簇成员不进构建图); base64 0.23 / bitflags 1 /
+  hashbrown 0.16 / r-efi / windows-sys 为禁用 optional feature 或非 linux
+  target (wasm / windows / UEFI) 专属暂态 — 消解时点取决于上游移除对应
+  optional feature, openidconnect / reqwest 自身升级只是载体, 均无独立升级条目.
+  构建图内家族的解法已记录于 "后续工作": tower-http (reqwest 0.13 条目, 但 oauth2
+  钉 reqwest 0.12, 实际被上游阻塞); base64 0.21 (openidconnect 钉) / getrandom /
+  syn / thiserror 为生态暂态, 无独立条目.
 - **sources**: 只允许 crates.io + 本地 path 源, 禁止私有 registry / git 直链 (难审计).
 
 CI 已升级为阻塞门禁: 当前 `deny.toml` allow 列表已实测覆盖全部依赖 license (本地全绿),
@@ -938,28 +949,20 @@ CI runner VM 未预装 treefmt 时 check-fmt 降级 rust-only (见 justfile).
   端到端 round-trip — 需 mocking AuthSession (axum-login extractor) 或在 server 端
   加 testing-only nonce 注入钩子 (生产代码改动).
 - **依赖升级** (滞后是稳态, 非风险; Cargo.lock 锁定保证可复现构建; 触发条件满足时再升,
-  默认触发条件 = CVE / 解 duplicate / 需要 feature, 各子项仅标注例外):
-  - rand 0.8 → latest (0.10): 0.9/0.10 API 有 breaking (`thread_rng()` → `rng()`,
-    `Rng::gen()` → `random()`), 升级时 `src/auth/apikey.rs` + `tests/auth_oidc.rs`
-    两处需改 (rand 使用点全集; mock.rs/redact.rs 用确定性 SipHash 不调 RNG).
-    注意两处迁移不对称: apikey.rs 随迁 0.10 API; auth_oidc.rs 的 OsRng 喂给
-    `rsa::RsaPrivateKey::new`, 而 rsa 0.9 钉死 rand_core 0.6 trait bounds (且 0.10
-    已无 `rand::rngs::OsRng`), 须改用 `rsa::rand_core::OsRng` (rsa re-export,
-    零新增依赖), 不能随迁 0.10 API.
-    **预期管理**: tower-sessions-core / oauth2 / openidconnect (直接 + 经 rsa)
-    也引用 rand 0.8, mockito / proptest (dev) 用 rand 0.9 — 升级后 0.8/0.9 作为传递
-    依赖仍留存 (Cargo.lock 中 rand 0.8/0.9/0.10 三版本共存), 勿误判 "升级未生效".
+  默认触发条件 = CVE / 解 duplicate / 需要 feature, 各子项仅标注例外;
+  2026-09 已完成: CVE 批量 update (rustls 0.23.45, RUSTSEC-2026-0285) / rand 0.10 /
+  criterion 0.8:
   - sha2 0.10 → 0.11: 注意 openidconnect 4.0.1 **直接**依赖 `sha2 ^0.10.6`, 且经
     oauth2 5.0.0 再依赖 `sha2 ^0.10` (双重阻塞), **升级主依赖也无法解 duplicate**,
     直到 openidconnect 上游升级.
   - tower-sessions 0.14 → 0.15: **需与 axum-login 同步升级**
     (axum-login 0.18 当前硬依赖 tower-sessions 0.14, 单独升会 duplicate).
-  - reqwest 0.12 → 0.13: 0.13 breaking 较多 (`rustls-tls` feature 改名 `rustls`,
-    rustls roots 改用 `rustls-platform-verifier`, 需验证行为);
-    升级可解 tower-http 0.6.11 + 0.7 duplicate (reqwest 0.12 传递依赖 0.6).
-  - criterion 0.5 → 0.8: 触发条件 = 需要新统计特性 / bench 大改时. 跨 3 个主版本 (0.6/0.7/0.8),
-    若升级成本高, 评估迁移到 divan (更轻量, 编译更快). 当前 `benches/redact.rs` 仅一个 bench,
-    升级 ROI 低, 暂稳态.
+  - reqwest 0.12 → 0.13: **被 oauth2 上游阻塞** — oauth2 5.0.0 (2025-01, 仍是最新)
+    的 reqwest 集成 (openidconnect 的 `reqwest` feature 所启用) 钉 `^0.12`; 单独升
+    我方会形成双 HTTP 栈 (OIDC 走 0.12 / 转发走 0.13, hyper 连接池与 TLS 各两套),
+    解 tower-http duplicate 的收益不抵双栈成本. 升级时点 = oauth2 上游支持 0.13.
+    届时注意 0.13 breaking 较多 (`rustls-tls` feature 改名 `rustls`, rustls roots
+    改用 `rustls-platform-verifier`, 需验证行为).
   - parking_lot 0.12.5 (当前最新): 当前最新稳定版. 长期可评估迁移到 `std::sync::Mutex/RwLock`
     (Rust 1.62+ 后 std 锁性能已接近 parking_lot, 可减少一个依赖). 触发条件 = 解 duplicate /
     减少依赖数.

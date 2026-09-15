@@ -42,10 +42,12 @@ use openidconnect::{
     LocalizedClaim, Nonce, StandardClaims, SubjectIdentifier,
 };
 use parking_lot::Mutex;
-use rand::rngs::OsRng;
 use rsa::RsaPrivateKey;
 use rsa::pkcs1::EncodeRsaPrivateKey;
 use rsa::pkcs8::LineEnding;
+// rand 0.10 无 rand::rngs::OsRng; rsa 0.9 钉死 rand_core 0.6 trait bounds,
+// 其 re-export 的 OsRng 是唯一零新增依赖来源 (多版本共存归因见 AGENTS.md cargo-deny 段).
+use rsa::rand_core::OsRng;
 use secret_guard::auth::handlers::{AuthState, login_start, logout, me, oauth_callback};
 use secret_guard::auth::oidc::{OidcBackend, OidcCredentials, OidcError};
 use secret_guard::auth::{ApiKeyStore, build_session_layer};

@@ -48,7 +48,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 parking_lot = "0.12"
 sha2 = "0.10"
-rand = "0.8"
+rand = "0.10"
 
 # 认证: OIDC (浏览器 WebUI) + 本地 API key (SDK 转发路径).
 # axum-login re-export tower-sessions core, 但 MemoryStore 需要 memory-store feature.
@@ -69,7 +69,7 @@ tokio-test = "0.4"
 mockito = "1"
 pretty_assertions = "1"
 proptest = "1"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 # OIDC mock IdP 集成测试 (tests/auth_oidc.rs):
 # 这些 crate 都已在依赖树中 (经 openidconnect / rustls 传递), 此处仅显式化以便测试
 # 直接用于生成 RSA 密钥对 + 手签 RS256 id_token. 不引入新传递依赖.

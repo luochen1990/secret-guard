@@ -297,10 +297,9 @@ impl ApiKeyStore {
 // ─── 纯函数: key 生成 + hash ──────────────────────────────────────────────
 
 fn random_slug(n: usize) -> String {
-    use rand::Rng;
-    (0..n)
-        .map(|_| rand::thread_rng().sample(rand::distributions::Alphanumeric) as char)
-        .collect()
+    // openidconnect/oauth2 仍钉 rand 0.8, 多版本共存归因见 AGENTS.md cargo-deny 段.
+    use rand::distr::{Alphanumeric, SampleString};
+    Alphanumeric.sample_string(&mut rand::rng(), n)
 }
 
 pub(crate) fn hash_key(plaintext: &str) -> String {
@@ -340,6 +339,20 @@ mod tests {
         );
         // 动态签发形态 (sg_ + 32) 恒达标 — 阈值不会误伤自签 key
         assert!(!static_key_too_short(&format!("sg_{}", "a".repeat(32))));
+    }
+
+    /// random_slug 的行为契约: 长度 = n 且全 ASCII alphanumeric.
+    /// 锁定 rand 大版本迁移 (0.8 → 0.10, 及未来) 时的等价性.
+    #[test]
+    fn random_slug_length_and_charset() {
+        for n in [1usize, 8, 32, 64] {
+            let s = random_slug(n);
+            assert_eq!(s.len(), n, "length must be exactly n");
+            assert!(
+                s.chars().all(|c| c.is_ascii_alphanumeric()),
+                "charset must be alphanumeric: {s:?}"
+            );
+        }
     }
 
     fn tmp_path(label: &str) -> PathBuf {

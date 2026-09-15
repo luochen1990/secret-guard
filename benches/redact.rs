@@ -46,11 +46,13 @@
 //!
 //! ```bash
 //! just bench                              # 完整 bench (criterion 默认 100 samples)
-//! cargo bench --bench redact -- --quick   # 快速验证 setup (1 sample, criterion 0.5 支持)
+//! cargo bench --bench redact -- --quick   # 快速验证 setup (1 sample)
 //! cargo bench --bench redact --no-run     # 仅编译验证
 //! ```
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+// criterion 0.6+ 弃用自带 black_box, 统一走 std::hint (0.5 → 0.8 升级迁移).
+use std::hint::black_box;
 
 use secret_guard::codec::ir::{IrBlock, IrMessage, IrRequest, IrRole};
 use secret_guard::mock::MockStrategy;
