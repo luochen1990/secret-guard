@@ -3912,17 +3912,6 @@
       return null;
     }
 
-    function extractSystemText(sys) {
-      if (typeof sys === 'string') return sys;
-      if (Array.isArray(sys)) {
-        return sys
-          .filter(b => b && b.type === 'text' && typeof b.text === 'string')
-          .map(b => b.text)
-          .join('\n');
-      }
-      return '';
-    }
-
     function safeJsonStringify(v) {
       try { return JSON.stringify(v, null, 2); } catch (_) { return String(v); }
     }
