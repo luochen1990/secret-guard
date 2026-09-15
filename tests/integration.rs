@@ -235,6 +235,48 @@ async fn spawn_proxy_with_prefix(global_mock_prefix: &str) -> String {
     format!("http://{addr}")
 }
 
+/// SEC-4: 启动 secret-guard, 显式配置 `[redact] redacted_headers` (自定义敏感
+/// header 脱敏名单). 模拟生产 serve() 的装配 (normalize → AppState), 用于
+/// redacted_headers 端到端测试.
+async fn spawn_proxy_with_redacted_headers(
+    redacted_headers: Vec<String>,
+    upstream_base: &str,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state_path = tmp_state_path("sg-state-redacted-headers");
+    let decisions = std::sync::Arc::new(parking_lot::RwLock::new(
+        secret_guard::config::Decisions::default(),
+    ));
+    let persist_lock = std::sync::Arc::new(parking_lot::Mutex::new(()));
+    let provider_table = ProviderTable::with_persist_lock(
+        vec![openai_provider("oa-main", upstream_base)],
+        vec![],
+        decisions.clone(),
+        state_path.clone(),
+        persist_lock.clone(),
+    );
+    let secrets = test_secret_table();
+    let _ = (decisions, persist_lock, state_path);
+    let proxy = AppState {
+        redacted_headers: secret_guard::state::normalize_redacted_headers(&redacted_headers),
+        ..base_app_state(
+            reqwest::Client::new(),
+            provider_table,
+            ConversationDag::new(64, 500, 1),
+            secrets,
+        )
+    };
+    let app = server::build_router(
+        proxy,
+        secret_guard::server_host_guard::HostGuard::new("127.0.0.1", addr.port()),
+    );
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}")
+}
+
 /// AppState 测试构造 SSOT: 恒定字段 (api_keys / auth_enabled / [redact] 三 gate
 /// 镜像生产默认 SEC-10 / model_lists / pricing) 收口在此; 差异字段经参数传入,
 /// 个别差异用 struct-update 覆盖 (`AppState { field, ..base_app_state(..) }`).
@@ -258,6 +300,9 @@ fn base_app_state(
         on_probe_exhausted: redact.on_probe_exhausted,
         on_unsupported_protocol: redact.on_unsupported_protocol,
         on_fallback_restore: redact.on_fallback_restore,
+        // SEC-4: 镜像生产装配 (normalize 后入 state); 测试要配置自定义名单时用
+        // struct-update 覆盖 (见 spawn_proxy_with_redacted_headers).
+        redacted_headers: secret_guard::state::normalize_redacted_headers(&redact.redacted_headers),
         upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
         model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
         usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),
@@ -2911,6 +2956,75 @@ async fn web_api_records_view_parsed_gemini_returns_error() {
         err.contains("gemini") || err.contains("protocol"),
         "parse_error should mention gemini/protocol, got: {err}"
     );
+}
+
+// ─── SEC-4: [redact] redacted_headers 自定义脱敏名单 (端到端) ────────────────
+//
+// 契约 (docs/design/contracts.md §7 SEC-4): 配置进 [redact] redacted_headers 的
+// 自定义 header (不含 token/secret 关键词, 不在硬编码黑名单), 其值在 record 的
+// req_headers / resp_headers 中必须显示 <redacted>; 未配置的无关 header 不受
+// 影响 (并集语义, 非全量脱敏).
+
+#[tokio::test]
+async fn redacted_headers_config_masks_custom_header_in_record() {
+    let mut upstream = spawn_mock_upstream().await;
+    // 上游响应也带同名自定义敏感 header — 同一请求覆盖两条脱敏接线:
+    // 请求侧 (recorder::build_call_event) 与响应侧 (fan_out_streaming 的
+    // FanoutStreamCtx).
+    let _m = upstream
+        .mock("POST", mockito::Matcher::Any)
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_header("x-my-service-key", "resp-leak")
+        .with_body(r#"{"id":"1","choices":[]}"#)
+        .create_async()
+        .await;
+
+    // 配置条目故意混大小写 + 带空白: 验证装配点 normalize (trim + lowercase) 生效.
+    let proxy_url =
+        spawn_proxy_with_redacted_headers(vec!["  X-My-Service-Key ".to_string()], &upstream.url())
+            .await;
+    let _ = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        r#"{"model":"gpt-4o","messages":[]}"#,
+        &[("x-my-service-key", "req-leak"), ("x-innocent", "plain")],
+    )
+    .await;
+    let records = wait_for_record_count(&proxy_url, 1).await;
+    let id = records[0].id;
+
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{proxy_url}/api/records/{id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // req_headers / resp_headers 序列化为 [["name","value"], ...] 数对数组.
+    let header_value = |key: &str, name: &str| -> String {
+        body["record"][key]
+            .as_array()
+            .unwrap_or_else(|| panic!("{key} must be an array"))
+            .iter()
+            .find_map(|pair| {
+                (pair[0].as_str() == Some(name))
+                    .then(|| pair[1].as_str().expect("value").to_string())
+            })
+            .unwrap_or_else(|| panic!("{name} missing from {key}"))
+    };
+    assert_eq!(
+        header_value("req_headers", "x-my-service-key"),
+        "<redacted>"
+    );
+    assert_eq!(
+        header_value("resp_headers", "x-my-service-key"),
+        "<redacted>"
+    );
+    // 未配置的无关 header 原样记录 (默认行为不变).
+    assert_eq!(header_value("req_headers", "x-innocent"), "plain");
 }
 
 #[tokio::test]

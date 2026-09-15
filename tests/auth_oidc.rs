@@ -1469,6 +1469,8 @@ async fn spawn_full_auth_router(secure_cookie: bool) -> (MockIdp, String) {
         on_probe_exhausted: redact.on_probe_exhausted,
         on_unsupported_protocol: redact.on_unsupported_protocol,
         on_fallback_restore: redact.on_fallback_restore,
+        // SEC-4: 镜像生产装配 (normalize 后入 state); 本 harness 无自定义名单.
+        redacted_headers: secret_guard::state::normalize_redacted_headers(&redact.redacted_headers),
         upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
         model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
         usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),

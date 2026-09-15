@@ -236,18 +236,18 @@ pub(super) fn utf8_view(b: &[u8]) -> String {
 ///
 /// # 名单边界 (用户自定义 auth header)
 ///
-/// 脱敏名单是**硬编码黑名单** (见 [`is_sensitive_header`]): 主流 LLM provider 的
-/// 标准 auth header (**显式枚举, 非 glob 前缀匹配**) 加上含 `token` /
-/// `secret` 子串的关键词匹配. 完整名单以 [`is_sensitive_header`] 为 SSOT.
-///
-/// **未在名单内的 header 会原样记录到 WebUI DAG record**. 用户若使用自定义 auth header
-/// (如 `x-my-service-key`), 需在 [`is_sensitive_header`] 追加 (后续工作: 暴露为
-/// `[redact] redacted_headers` 配置项; 当前硬编码, 见 AGENTS.md "已知限制").
-pub(super) fn redact_headers(src: &HeaderMap) -> Vec<(String, String)> {
+/// 脱敏名单 = **硬编码黑名单** (见 [`is_sensitive_header`]: 主流 LLM provider 的
+/// 标准 auth header — 显式枚举, 非 glob 前缀匹配 — 加上含 `token` / `secret`
+/// 子串的关键词匹配) **∪ `extra` 追加名单** (来自 `[redact] redacted_headers`,
+/// 经 `state::normalize_redacted_headers` 归一化后存入
+/// `AppState::redacted_headers`, 启动时读取一次). `extra` 条目按 lowercase
+/// header 名**精确匹配** (调用方保证已 trim + lowercase — 匹配端不做归一化).
+/// 默认空 `extra` = 仅黑名单生效, 行为不变.
+pub(super) fn redact_headers(src: &HeaderMap, extra: &[String]) -> Vec<(String, String)> {
     src.iter()
         .map(|(name, value)| {
             let name_str = name.as_str().to_lowercase();
-            let v = if is_sensitive_header(&name_str) {
+            let v = if is_sensitive_header(&name_str) || extra.contains(&name_str) {
                 "<redacted>".to_string()
             } else {
                 value.to_str().unwrap_or("<binary>").to_string()
@@ -258,6 +258,8 @@ pub(super) fn redact_headers(src: &HeaderMap) -> Vec<(String, String)> {
 }
 
 /// 判断 header 是否敏感: 黑名单关键词匹配 (覆盖各 LLM provider 常见字段).
+/// 用户自定义 auth header 经 `[redact] redacted_headers` 配置追加 (并集语义,
+/// 见 [`redact_headers`] — 匹配在调用方做, 本函数只管硬编码黑名单).
 ///
 /// "key" 关键词不纳入匹配 (过于宽泛会误伤 `x-request-key-hash` 等正常 header).
 /// 已知 key 类敏感 header (`api-key` / `x-api-key` / `x-goog-api-key` /
@@ -482,13 +484,63 @@ mod tests {
         src.insert("x-goog-api-key", "gkey".parse().unwrap());
         src.insert("x-custom-token", "tok".parse().unwrap());
         src.insert("x-custom", "value".parse().unwrap());
-        let v = redact_headers(&src);
+        // 默认 (extra 空): 仅硬编码黑名单生效, 行为与配置项引入前一致.
+        let v = redact_headers(&src, &[]);
         let m: std::collections::HashMap<_, _> = v.into_iter().collect();
         assert_eq!(m.get("authorization").unwrap(), "<redacted>");
         assert_eq!(m.get("x-api-key").unwrap(), "<redacted>");
         assert_eq!(m.get("x-goog-api-key").unwrap(), "<redacted>");
         assert_eq!(m.get("x-custom-token").unwrap(), "<redacted>");
         assert_eq!(m.get("x-custom").unwrap(), "value");
+    }
+
+    // ─── SEC-4: [redact] redacted_headers 追加名单 (并集语义) ──────────────
+    //
+    // 契约 (docs/design/contracts.md §7 SEC-4): extra 条目按 lowercase header 名
+    // 精确匹配, 命中即脱敏; 匹配端不做归一化 (trim/lowercase 由装配点
+    // state::normalize_redacted_headers 集中完成 — 条目假定已规范).
+
+    #[test]
+    fn redact_headers_extra_config_hits_custom_header() {
+        // 自定义 auth header (不含 token/secret 关键词, 不在黑名单): 配置进 extra
+        // 后必须脱敏; 未配置的同类 header 仍原样记录.
+        let mut src = HeaderMap::new();
+        src.insert("x-my-service-key", "hunter2".parse().unwrap());
+        src.insert("x-other-key", "plain".parse().unwrap());
+        let extra = vec!["x-my-service-key".to_string()];
+        let m: std::collections::HashMap<_, _> = redact_headers(&src, &extra).into_iter().collect();
+        assert_eq!(m.get("x-my-service-key").unwrap(), "<redacted>");
+        assert_eq!(m.get("x-other-key").unwrap(), "plain");
+    }
+
+    #[test]
+    fn redact_headers_extra_is_exact_match_not_substring() {
+        // 精确匹配语义: extra 含 "x-my-key" 不波及 "x-my-key-v2" / "prefix-x-my-key".
+        let mut src = HeaderMap::new();
+        src.insert("x-my-key", "a".parse().unwrap());
+        src.insert("x-my-key-v2", "b".parse().unwrap());
+        src.insert("prefix-x-my-key", "c".parse().unwrap());
+        let extra = vec!["x-my-key".to_string()];
+        let m: std::collections::HashMap<_, _> = redact_headers(&src, &extra).into_iter().collect();
+        assert_eq!(m.get("x-my-key").unwrap(), "<redacted>");
+        assert_eq!(m.get("x-my-key-v2").unwrap(), "b");
+        assert_eq!(m.get("prefix-x-my-key").unwrap(), "c");
+    }
+
+    #[test]
+    fn redact_headers_extra_is_exact_match_assumes_normalized_entries() {
+        // 假设声明 (集中式预处理的对应面): extra 条目假定已归一化 — 混大小写条目
+        // 不命中 lowercase header 名. 归一化职责在 state::normalize_redacted_headers
+        // (有专项测试), 本测试锁定匹配端不悄悄做归一化 (避免双重处理的语义漂移).
+        let mut src = HeaderMap::new();
+        src.insert("x-my-service-key", "hunter2".parse().unwrap());
+        let extra = vec!["X-My-Service-Key".to_string()];
+        let m: std::collections::HashMap<_, _> = redact_headers(&src, &extra).into_iter().collect();
+        assert_eq!(
+            m.get("x-my-service-key").unwrap(),
+            "hunter2",
+            "non-normalized extra entry must NOT match (normalization is upstream's job)"
+        );
     }
 
     #[test]
@@ -676,7 +728,7 @@ mod tests {
                     .expect("header name bytes must be valid"),
                 value.parse().expect("value must be valid HeaderValue"),
             );
-            let redacted = redact_headers(&src);
+            let redacted = redact_headers(&src, &[]);
             prop_assert_eq!(redacted.len(), 1, "exactly one header expected");
             // redact_headers 把 name to_lowercase, value 替换为 <redacted> (若是敏感 header).
             prop_assert_eq!(

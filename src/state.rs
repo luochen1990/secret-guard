@@ -57,6 +57,11 @@ pub struct AppState {
     /// 可能随日志扩散). 消费点 `proxy::helpers::restore_via_json_leaf_fallback`
     /// (fan_out / cross_proto 的 reader-拒绝臂共享). 非 JSON 分支不受影响.
     pub on_fallback_restore: OnFallbackRestore,
+    /// 来自 `[redact] redacted_headers` (默认空), 经 [`normalize_redacted_headers`]
+    /// 归一化 (trim + lowercase, 空串条目跳过) 的追加脱敏名单. 消费点
+    /// `proxy::helpers::redact_headers` — 与硬编码黑名单并集生效 (SEC-4),
+    /// 请求/响应两侧所有 record 记录点统一取本字段.
+    pub redacted_headers: Arc<[String]>,
     /// 来自 `[server] upstream_*_timeout_secs` 的上游超时配置.
     /// forward 路径用它给 send().await / stream chunk 加超时保护.
     pub upstream_timeouts: crate::config::UpstreamTimeouts,
@@ -96,3 +101,42 @@ pub const NO_STORE: [(&str, &str); 2] = [
     ("cache-control", "no-store, no-cache, must-revalidate"),
     ("x-content-type-options", "nosniff"),
 ];
+
+// ─── [redact] redacted_headers 归一化 (SEC-4) ────────────────────────────────
+
+/// 归一化 `[redact] redacted_headers` 配置: 每条 trim + lowercase, 归一化后为
+/// 空串的条目跳过. 产物供 [`AppState::redacted_headers`] 持有, 与
+/// `redact_headers` 的 lowercase header 名做**精确匹配** — 匹配端不做归一化
+/// (集中式预处理: 配置的所有脏形态在装配点一次收口).
+pub fn normalize_redacted_headers(raw: &[String]) -> Arc<[String]> {
+    raw.iter()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_trims_lowercases_and_skips_empty() {
+        let raw = vec![
+            "  X-My-Service-Key ".to_string(), // trim + lowercase
+            "x-other".to_string(),             // 已规范, 原样保留
+            "   ".to_string(),                 // 纯空白 → 跳过
+            String::new(),                     // 空串 → 跳过
+        ];
+        let out = normalize_redacted_headers(&raw);
+        assert_eq!(
+            out.iter().as_slice(),
+            ["x-my-service-key".to_string(), "x-other".to_string()].as_slice()
+        );
+    }
+
+    #[test]
+    fn normalize_empty_input_yields_empty_list() {
+        // 默认配置 (空名单) 归一化后仍为空 — 默认行为不变的契约前提.
+        assert!(normalize_redacted_headers(&[]).is_empty());
+    }
+}

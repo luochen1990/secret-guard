@@ -304,6 +304,10 @@ pub fn build_upstream_client(connect_timeout: Option<Duration>) -> anyhow::Resul
 /// - `on_fallback_restore`: 来自 static config 的 `[redact] on_fallback_restore`,
 ///   存入 AppState 供响应侧 parse-失败 fallback 路径决定是否把 Mock 还原为
 ///   real 发给客户端 (withhold 保留 Mock / restore 还原, SEC-10).
+/// - `redacted_headers`: 来自 static config 的 `[redact] redacted_headers`
+///   (SEC-4), 归一化 (trim + lowercase, 空串条目跳过, 见
+///   `state::normalize_redacted_headers`) 后存入 AppState, 供请求/响应两侧
+///   record 记录点的 header 脱敏与硬编码黑名单并集生效.
 /// - `upstream_timeouts`: 来自 static config 的 `[server] upstream_*_timeout_secs`,
 ///   存入 AppState 供 forward 路径给 send().await / stream chunk 加超时保护
 ///   (防上游网络异常时 record 永久 pending).
@@ -322,6 +326,7 @@ pub async fn serve(
     on_probe_exhausted: crate::config::OnProbeExhausted,
     on_unsupported_protocol: crate::config::OnUnsupportedProtocol,
     on_fallback_restore: crate::config::OnFallbackRestore,
+    redacted_headers: Vec<String>,
     upstream_timeouts: crate::config::UpstreamTimeouts,
     usage_config: crate::config::UsageConfig,
     allowed_domains: Vec<String>,
@@ -423,6 +428,7 @@ pub async fn serve(
         on_probe_exhausted,
         on_unsupported_protocol,
         on_fallback_restore,
+        redacted_headers: crate::state::normalize_redacted_headers(&redacted_headers),
         upstream_timeouts,
         model_lists: Arc::new(crate::proxy::ModelListCache::new()),
         usage: Arc::new(crate::usage::UsageStore::open(

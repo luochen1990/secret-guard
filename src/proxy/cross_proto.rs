@@ -191,6 +191,7 @@ pub(crate) async fn cross_proto_forward(
         &parts,
         &path_for_record,
         &fwd_headers,
+        &state.redacted_headers,
         req_text_for_record,
         Some(&ir),
         Some(ingress_codec),
@@ -295,6 +296,7 @@ pub(crate) async fn cross_proto_forward(
             upstream_resp,
             resp_status,
             resp_headers,
+            state.redacted_headers.clone(),
             ingress_codec,
             egress_codec,
             redaction_map,
@@ -339,7 +341,7 @@ pub(crate) async fn cross_proto_forward(
                 record_id,
                 ResponseData {
                     resp_status: resp_status.as_u16(),
-                    resp_headers: redact_headers(&resp_headers),
+                    resp_headers: redact_headers(&resp_headers, &state.redacted_headers),
                     elapsed_ms: elapsed,
                     error: Some(err_label.to_string()),
                     resp_complete: false,
@@ -488,7 +490,7 @@ pub(crate) async fn cross_proto_forward(
         record_id,
         ResponseData {
             resp_status: resp_status_out.as_u16(),
-            resp_headers: redact_headers(&resp_headers),
+            resp_headers: redact_headers(&resp_headers, &state.redacted_headers),
             // 视角语义注意: 与 fan_out_buffered_ir ("LLM 视角, 含 mock") 不同, 这里
             // raw_resp_body 沿用 master 起的客户端视角 (翻译 + restore 后的出站字节) —
             // DAG OriginRecord 本就按真值存储, 无安全边界问题, 仅为两条路径语义

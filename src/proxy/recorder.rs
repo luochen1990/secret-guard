@@ -649,11 +649,14 @@ pub(super) fn stream_err_label(e: &std::io::Error) -> &'static str {
 /// `upstream_id`: 实际承载转发的 provider id (路由解析后的链尾实体, #179).
 /// `upstream_model`: 实际改写的 model 值 (仅 override 实际注入 IR 时 Some; passthrough
 /// / 无 codec 降级路径恒 None, #183 D4 — 非 None-ness 即 "本轮被 override" 的信号).
+/// `redacted_headers`: 追加脱敏名单 (`AppState::redacted_headers`, 来自
+/// `[redact] redacted_headers`, SEC-4) — 与硬编码黑名单并集, 见 `helpers::redact_headers`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_call_event(
     parts: &axum::http::request::Parts,
     path: &str,
     fwd_headers: &HeaderMap,
+    redacted_headers: &[String],
     req_text: String,
     ir: Option<&crate::codec::ir::IrRequest>,
     ingress_protocol: Option<crate::codec::Protocol>,
@@ -677,7 +680,7 @@ pub(super) fn build_call_event(
         created_at: chrono::Utc::now(),
         method: parts.method.as_str().to_string(),
         path: path.to_string(),
-        req_headers: redact_headers(fwd_headers),
+        req_headers: redact_headers(fwd_headers, redacted_headers),
         ingress_protocol,
         redact_seed,
         policy,

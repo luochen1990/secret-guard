@@ -1485,6 +1485,8 @@ mod tests {
             on_probe_exhausted: redact.on_probe_exhausted,
             on_unsupported_protocol: redact.on_unsupported_protocol,
             on_fallback_restore: redact.on_fallback_restore,
+            // redacted_headers 镜像生产装配 (normalize 后入 state); 本 harness 无自定义名单.
+            redacted_headers: crate::state::normalize_redacted_headers(&redact.redacted_headers),
             upstream_timeouts: crate::config::UpstreamTimeouts::default(),
             model_lists: Arc::new(ModelListCache::new()),
             usage: std::sync::Arc::new(crate::usage::UsageStore::in_memory()),

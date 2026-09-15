@@ -446,6 +446,7 @@ Secret / Provider 的两种 value 来源 (`value`/`value_file`、`api_key`/`api_
 | `on_probe_exhausted` | `"fail_open"` \| `"fail_closed"` | `"fail_closed"` | Mock probing 耗尽时 (弱配置 + 对抗性 IR 无法生成唯一 mock) 的策略. `fail_closed` (默认, SEC-10 降级偏安全, 2026-09 翻转) 拒绝转发整个请求 (返回 503), 防止 secret 泄露; `fail_open` (显式 opt-in, 历史行为) 跳过该 secret 原样转发. 详见 `src/redact.rs::redact_ir_checked` 与 `src/config.rs::OnProbeExhausted`. |
 | `on_unsupported_protocol` | `"fail_open"` \| `"fail_closed"` | `"fail_closed"` | codec 不覆盖的协议 (gemini/ollama) 上配置了 secrets 时的策略. `fail_closed` (默认, SEC-10, 2026-09 翻转) 拒绝转发整个请求 (返回 503), 停损防泄露 (message 只含协议名 + provider id + 出路提示, SEC-2 同型); `fail_open` (显式 opt-in, 历史行为) WARN + 放行透传 — secret 原样出站. **只管 secret 安全性**: 仅 model 重写降级 (无 secret) 时两模式都维持 WARN 透传. 详见 `src/proxy/same_proto.rs` from_native-None 分支与 `src/config.rs::OnUnsupportedProtocol`. |
 | `on_fallback_restore` | `"withhold"` \| `"restore"` | `"withhold"` | codec 无法 parse 上游响应的 fallback 路径上 (body 仍是合法 JSON), 是否把 Mock 还原为 real 发给客户端. `withhold` (默认, SEC-10 降级偏安全) 保留 Mock 透传 — 失败/降级响应体是最高概率被客户端日志系统采集的内容, real 不默认投放进去, Mock 按 RED-5 可安全暴露; `restore` (显式 opt-in, RED-8 行为) 还原 mock → real (本地工具直接可用, 但 real 可能随日志扩散). 非 JSON 分支不受影响. 详见 `src/proxy/helpers.rs::restore_via_json_leaf_fallback` 与 `src/config.rs::OnFallbackRestore`. |
+| `redacted_headers` | string[] | `[]` | 追加进 WebUI record header 脱敏名单的 header 名 (SEC-4): 启动时归一化 (trim + lowercase, 空串条目跳过, 见 `state.rs::normalize_redacted_headers`) 后按 lowercase header 名**精确匹配**, 与硬编码黑名单 (`proxy::helpers::is_sensitive_header`) 并集生效, 请求/响应两侧 record 记录点统一取 `AppState::redacted_headers`. 用于自定义 auth header (如 `x-my-service-key`). 默认空 = 行为不变. |
 
 ### `[usage]` 段字段 (static, 启动时读取一次)
 
@@ -876,12 +877,13 @@ CI runner VM 未预装 treefmt 时 check-fmt 降级 rust-only (见 justfile).
   启动加载时对旧版本残留文件 best-effort chmod 收紧 (helper
   `src/util.rs::tighten_file_permissions`, 设备文件与更严形态 (0400 等) 跳过)。
   依赖 group/other 读这些文件的部署 (如共享目录跑第三方读取器) 会受影响。
-- **redact_headers 名单硬编码 (SEC-4)**: `proxy/helpers.rs::redact_headers` 的敏感 header
-  脱敏名单是硬编码黑名单 (显式枚举主流 provider auth header + 含 "token" / "secret"
-  子串匹配, 完整名单以 `is_sensitive_header` 为 SSOT). 未在名单内的 header 会原样
-  记录到 WebUI DAG record. 用户若使用自定义 auth header (如 `x-my-service-key`),
-  当前无法在不改代码的情况下追加. 后续工作: 暴露为 `[redact] redacted_headers = [...]`
-  配置项.
+- **redact_headers 名单 = 硬编码黑名单 ∪ `[redact] redacted_headers` (SEC-4)**:
+  `proxy/helpers.rs::redact_headers` 的敏感 header 脱敏名单以硬编码黑名单为基础
+  (显式枚举主流 provider auth header + 含 "token" / "secret" 子串匹配, 完整名单以
+  `is_sensitive_header` 为 SSOT), 用户可用 `[redact] redacted_headers = [...]`
+  追加自定义 auth header (如 `x-my-service-key`) — 条目启动时归一化 (trim +
+  lowercase, 空串跳过) 后按 lowercase header 名**精确匹配**, 并集生效; 默认空 =
+  行为不变。注意精确匹配非子串匹配 (`x-my-key` 不波及 `x-my-key-v2`)。
 - **session cookie Secure flag 需手动配置 (`secure_cookie`, 无自动推断)**: HTTPS
   反代部署需手动设 `[auth] secure_cookie = true`, 两个缺口: ① 无 `X-Forwarded-Proto`
   动态推断; ② NixOS 结构化选项 (`services.secret-guard.auth.*`) 未暴露该字段, 须用
@@ -945,9 +947,6 @@ CI runner VM 未预装 treefmt 时 check-fmt 降级 rust-only (见 justfile).
 
 - **更多协议**: Gemini / Ollama / Bedrock / Cohere / OpenAI Responses API.
   新增协议只需实现 Reader + Writer trait (~200 行), 不动 dispatch.
-- **redact_headers 名单可配置**: 加 `[redact] redacted_headers = [...]` 配置项,
-  默认值是现有硬编码名单, 用户可扩展自定义 auth header. 当前硬编码黑名单见
-  `proxy/helpers.rs::is_sensitive_header` (SEC-4 已知限制).
 - mock_secret 的 category-aware 默认生成 (Password/ApiKey/Cookie 等格式感知).
 - 配置热加载; 测试覆盖率自动上报 + fuzzing (cargo-fuzz).
 - **依赖升级** (滞后是稳态, 非风险; Cargo.lock 锁定保证可复现构建; 触发条件满足时再升,

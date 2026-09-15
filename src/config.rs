@@ -181,6 +181,12 @@ impl Default for UsageConfig {
 /// 还原进去等于精准投放泄露, 而 Mock 按 RED-5 设计为可安全暴露; `Restore`
 /// (显式 opt-in, RED-8 行为) 本地工具直接可用真 secret, 但 real 可能随日志扩散.
 /// 详见 `proxy::helpers::restore_via_json_leaf_fallback`.
+///
+/// `redacted_headers` 是追加进 WebUI record header 脱敏名单的 header 名 (在硬编码
+/// 黑名单 `proxy::helpers::is_sensitive_header` 之上**并集**生效, SEC-4): 装配点
+/// 归一化 (trim + lowercase, 空串条目跳过) 后按 lowercase header 名**精确匹配**.
+/// 用于自定义 auth header (如 `x-my-service-key`) — 不在硬编码黑名单内时若不配置,
+/// 其值会原样记录到 WebUI record. 默认空 = 行为不变.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RedactConfig {
@@ -197,6 +203,10 @@ pub struct RedactConfig {
     /// 客户端 (默认 `Withhold` 降级偏安全, SEC-10; 仅管 reader-拒绝但 body 仍是
     /// 合法 JSON 的分支 — 非 JSON 分支 restore 本就无意义, 不受开关影响).
     pub on_fallback_restore: OnFallbackRestore,
+    /// 追加进 WebUI record header 脱敏名单的 header 名 (小写归一化, 精确匹配),
+    /// 与硬编码黑名单 (`proxy::helpers::is_sensitive_header`) 并集生效 (SEC-4).
+    /// 默认空 = 行为不变. 归一化见 `state.rs::normalize_redacted_headers`.
+    pub redacted_headers: Vec<String>,
 }
 
 /// Mock probing 耗尽时 (弱配置 + 对抗性 IR 无法生成唯一 mock) 的处理策略.
@@ -528,6 +538,7 @@ const KNOWN_FIELDS: &[(&str, &[&str])] = &[
             "on_probe_exhausted",
             "on_unsupported_protocol",
             "on_fallback_restore",
+            "redacted_headers",
         ],
     ),
     // Config::usage (UsageConfig, usage-stats)
@@ -1540,7 +1551,12 @@ fn serialized_full_sample_paths() -> Vec<String> {
                 },
             }],
         },
-        redact: RedactConfig::default(),
+        // redacted_headers 显式填非空样本 (SEC-4): 与本函数 "全字段填充防盲区"
+        // 的哲学一致, 双保险锁定 `redact.redacted_headers` 的 KNOWN_FIELDS 同步.
+        redact: RedactConfig {
+            redacted_headers: vec!["x-my-service-key".into()],
+            ..RedactConfig::default()
+        },
         usage: UsageConfig::default(),
         auth: crate::auth::AuthConfig {
             enabled: false,
@@ -2183,6 +2199,29 @@ on_fallback_restore = "restore"
         assert_eq!(
             cfg.redact.on_unsupported_protocol,
             OnUnsupportedProtocol::FailClosed
+        );
+    }
+
+    // ─── redacted_headers (SEC-4 自定义 header 脱敏名单) ─────────────────
+
+    #[test]
+    fn redact_config_toml_default_omits_redacted_headers_field() {
+        // 空 [redact] 段应解析为空名单 (行为与配置项引入前一致), 向后兼容.
+        let cfg: Config = toml::from_str("[redact]\n").unwrap();
+        assert!(cfg.redact.redacted_headers.is_empty());
+    }
+
+    #[test]
+    fn redact_config_toml_parses_redacted_headers() {
+        let text = r#"
+[redact]
+redacted_headers = ["x-my-service-key", "X-Other-Key  "]
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        // config 层按字面解析 (归一化是装配点 state.rs 的职责, 不在 serde 层做).
+        assert_eq!(
+            cfg.redact.redacted_headers,
+            vec!["x-my-service-key".to_string(), "X-Other-Key  ".to_string()]
         );
     }
 

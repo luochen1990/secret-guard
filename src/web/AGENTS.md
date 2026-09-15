@@ -245,7 +245,8 @@ timeline 每轮 header 含两个按钮:
   全部来自 TimelineRound / TimelineTail, 无需网络请求).
 - `raw`: 弹窗展示原始 req_body / resp_body / req_headers / resp_headers (按需懒拉
   `GET /api/records/{id}`). body 是 LLM 视角 (已 redact, 安全展示); headers 已脱敏
-  (auth/cookie 等 = `<redacted>`). 流式响应的 resp_body 为空 (不保留 SSE 字节), 显示提示.
+  (auth/cookie 等 = `<redacted>`; 名单 = 硬编码黑名单 ∪ `[redact] redacted_headers`,
+  SEC-4). 流式响应的 resp_body 为空 (不保留 SSE 字节), 显示提示.
 
 ### Response 气泡渲染
 

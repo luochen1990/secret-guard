@@ -754,12 +754,13 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 ### SEC-4 headers 脱敏
 
-**陈述**: 记录存储的 HTTP headers 中, auth/cookie 类敏感 header 必须脱敏为 `<redacted>`.
+**陈述**: 记录存储的 HTTP headers 中, auth/cookie 类敏感 header 必须脱敏为 `<redacted>`. 名单 = 硬编码黑名单 ∪ `[redact] redacted_headers` (用户追加, 归一化后精确匹配, 默认空 = 行为不变).
 
 **Properties**:
 - `prop_auth_headers_redacted_in_record`: Authorization / x-api-key / x-goog-api-key / cookie 类 header 在 record 中为 `<redacted>`. 🔁→`redact_headers_masks_secrets` (`src/proxy/helpers.rs`; authorization / x-api-key / x-goog-api-key)
 - `prop_set_cookie_redacted`: 上游 Set-Cookie header 在 record 中脱敏. ⏳
 - `prop_custom_token_headers_redacted`: 含 "token" / "secret" 关键词的自定义 header 也脱敏. ✅
+- `prop_configured_headers_redacted`: `[redact] redacted_headers` 配置的 header (归一化: trim + lowercase) 在 record 的 req_headers / resp_headers 中为 `<redacted>`; 未配置的无关 header 不受影响; 匹配为精确匹配非子串. 🔁→`redact_headers_extra_config_hits_custom_header` + `redact_headers_extra_is_exact_match_not_substring` (`src/proxy/helpers.rs`) + `normalize_trims_lowercases_and_skips_empty` (`src/state.rs`) + `redacted_headers_config_masks_custom_header_in_record` (`tests/integration.rs`, 端到端)
 
   注: "key" 关键词过于宽泛 (会误伤 `x-request-key-hash` 等正常 header), 故不纳入关键词匹配; 已知 key 类 header (如 `x-api-key` / `x-goog-api-key` / `api-key` / `x-anthropic-api-key`) 由 `prop_auth_headers_redacted_in_record` 的显式黑名单覆盖.
 

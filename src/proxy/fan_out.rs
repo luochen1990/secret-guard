@@ -104,6 +104,9 @@ struct FanoutStreamCtx {
     started: Instant,
     /// 供 record 用的响应 headers (已脱敏前 clone; 原始 headers 归客户端响应构造).
     resp_headers_for_record: HeaderMap,
+    /// 追加脱敏名单 (`AppState::redacted_headers`, `[redact] redacted_headers`,
+    /// SEC-4) — spawn task 无法回读 AppState, 随 ctx 快照携带.
+    redacted_headers: std::sync::Arc<[String]>,
     status_u16: u16,
     /// record 的 streamed 标志 (restore 路径恒 true).
     streamed: bool,
@@ -144,6 +147,7 @@ async fn fanout_stream_task(
         record_id,
         started,
         resp_headers_for_record,
+        redacted_headers,
         status_u16,
         streamed,
         stream_idle_timeout,
@@ -198,7 +202,7 @@ async fn fanout_stream_task(
         record_id,
         ResponseData {
             resp_status: status_u16,
-            resp_headers: redact_headers(&resp_headers_for_record),
+            resp_headers: redact_headers(&resp_headers_for_record, &redacted_headers),
             raw_resp_body: body,
             parsed: final_parsed,
             elapsed_ms: elapsed,
@@ -223,6 +227,9 @@ async fn fanout_stream_task(
 ///
 /// `codec_proto = None` 时 (Gemini/Ollama 无 codec) 跳过 StreamScan,
 /// parsed view 不可用 (前端 fallback raw).
+///
+/// `redacted_headers`: 追加脱敏名单 (`AppState::redacted_headers`, SEC-4) —
+/// record 的 resp_headers 脱敏用 (下同, 四条扇出路径同源).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn fan_out_streaming(
     dag: ConversationDag,
@@ -231,6 +238,7 @@ pub(crate) async fn fan_out_streaming(
     upstream_resp: reqwest::Response,
     resp_status: StatusCode,
     resp_headers: HeaderMap,
+    redacted_headers: std::sync::Arc<[String]>,
     streamed: bool,
     codec_proto: Option<crate::codec::Protocol>,
     stream_idle_timeout: Option<std::time::Duration>,
@@ -254,6 +262,7 @@ pub(crate) async fn fan_out_streaming(
             record_id,
             started,
             resp_headers_for_record,
+            redacted_headers,
             status_u16,
             streamed,
             stream_idle_timeout,
@@ -338,6 +347,8 @@ pub(crate) async fn fan_out_streaming(
 /// `on_fallback_restore` = `[redact] on_fallback_restore` (SEC-10): reader-拒绝
 /// fallback 臂是否 restore (withhold 保留 Mock / restore 还原), 见
 /// `helpers::restore_via_json_leaf_fallback`.
+///
+/// `redacted_headers`: 追加脱敏名单 (`AppState::redacted_headers`, SEC-4).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn fan_out_buffered_ir(
     dag: ConversationDag,
@@ -346,6 +357,7 @@ pub(crate) async fn fan_out_buffered_ir(
     upstream_resp: reqwest::Response,
     resp_status: StatusCode,
     resp_headers: HeaderMap,
+    redacted_headers: std::sync::Arc<[String]>,
     streamed: bool,
     codec_proto: crate::codec::Protocol,
     redaction_map: RedactionMap,
@@ -483,7 +495,7 @@ pub(crate) async fn fan_out_buffered_ir(
         record_id,
         ResponseData {
             resp_status: status_u16,
-            resp_headers: redact_headers(&resp_headers_for_record),
+            resp_headers: redact_headers(&resp_headers_for_record, &redacted_headers),
             raw_resp_body: acc_text,
             parsed: resp_parsed_for_record,
             elapsed_ms: elapsed,
@@ -511,6 +523,8 @@ pub(crate) async fn fan_out_buffered_ir(
 /// 实时翻译 egress SSE → IR 事件 → restore → ingress SSE. 保持流式 UX.
 ///
 /// 用于: 同协议 + redact + 流式响应.
+///
+/// `redacted_headers`: 追加脱敏名单 (`AppState::redacted_headers`, SEC-4).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn fan_out_streaming_with_restore(
     dag: ConversationDag,
@@ -519,6 +533,7 @@ pub(crate) async fn fan_out_streaming_with_restore(
     upstream_resp: reqwest::Response,
     resp_status: StatusCode,
     resp_headers: HeaderMap,
+    redacted_headers: std::sync::Arc<[String]>,
     codec_proto: crate::codec::Protocol,
     redaction_map: RedactionMap,
     stream_idle_timeout: Option<std::time::Duration>,
@@ -541,6 +556,7 @@ pub(crate) async fn fan_out_streaming_with_restore(
         upstream_resp,
         resp_status,
         resp_headers,
+        redacted_headers,
         translate,
         parsed_sync,
         stream_idle_timeout,
@@ -557,6 +573,8 @@ pub(crate) async fn fan_out_streaming_with_restore(
 ///   在跨协议路径同样成立); 为空时纯翻译 (无 restore).
 /// - parsed view: StreamScan 用 **egress** proto 解析上游字节, 序列化用 **ingress**
 ///   writer (与非流式 cross_proto 的 resp_parsed 语义一致, WebUI 按 ingress codec 解析).
+///
+/// `redacted_headers`: 追加脱敏名单 (`AppState::redacted_headers`, SEC-4).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn fan_out_streaming_cross_proto(
     dag: ConversationDag,
@@ -565,6 +583,7 @@ pub(crate) async fn fan_out_streaming_cross_proto(
     upstream_resp: reqwest::Response,
     resp_status: StatusCode,
     resp_headers: HeaderMap,
+    redacted_headers: std::sync::Arc<[String]>,
     ingress: crate::codec::Protocol,
     egress: crate::codec::Protocol,
     redaction_map: RedactionMap,
@@ -594,6 +613,7 @@ pub(crate) async fn fan_out_streaming_cross_proto(
         upstream_resp,
         resp_status,
         resp_headers,
+        redacted_headers,
         translate,
         parsed_sync,
         stream_idle_timeout,
@@ -612,6 +632,7 @@ fn spawn_restore_fanout(
     upstream_resp: reqwest::Response,
     resp_status: StatusCode,
     resp_headers: HeaderMap,
+    redacted_headers: std::sync::Arc<[String]>,
     translate: crate::codec::stream::StreamTranslate,
     parsed_sync: ParsedSync,
     stream_idle_timeout: Option<std::time::Duration>,
@@ -627,6 +648,7 @@ fn spawn_restore_fanout(
             record_id,
             started,
             resp_headers_for_record,
+            redacted_headers,
             status_u16,
             streamed: true,
             stream_idle_timeout,
@@ -752,6 +774,8 @@ mod tests {
             upstream_resp,
             StatusCode::OK,
             resp_headers,
+            // 空 extra: 本测试只验证截断契约, 不涉 header 脱敏 (SEC-4 有专项测试).
+            Arc::from(Vec::new()),
             false, // streamed=false
             None,  // codec_proto=None 跳过 StreamScan
             None,  // stream_idle_timeout=None (测试不禁用超时保护)
