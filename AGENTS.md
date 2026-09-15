@@ -137,7 +137,8 @@
   仅纯类型 (前者 `SessionId` newtype 标识, 后者 `IrRole`/`IrUsage`), 视作可接受的
   纯类型依赖.
 - **state (AppState) 是进程级共享状态**: proxy / web / auth 各自单向依赖之,
-  彼此之间除 "web → auth (挂载 guard)" 外无横向依赖 (原 ProxyState 落在 proxy 内).
+  彼此之间除 "web → auth (挂载 guard)" 与 "web/api/providers → proxy::models" (probe
+ 端点, 见下方例外清单) 外无横向依赖 (原 ProxyState 落在 proxy 内).
 - **已接受的例外** (有 rationale, 勿扩大): redact → secrets (探测 secret 需读 entry);
   redact → config (仅 `OnProbeExhausted` 枚举 — `[redact] on_probe_exhausted` 的
   消费点, 纯数据枚举); dag → codec (IrBlock 是内容寻址单元, 纯类型依赖; 另
@@ -168,7 +169,11 @@
   纯类型依赖先例)
   + proxy → auth::AuthenticatedTenant (v4b redact 审计归因: proxy 从 request
   extension 提取 API key label 注入 usage 采集, 纯类型依赖, 性质同 config→auth
-  的 AuthConfig 纯数据边, 无 auth 行为依赖).
+  的 AuthConfig 纯数据边, 无 auth 行为依赖)
+  + web/api/providers → proxy::models (probe 端点复用上游模型清单探测基建;
+  行为借用 — `probe_provider_upstream` 执行出站 HTTP 探测, 非纯数据/纯函数,
+  但复用同款 fetch 防御 (整体超时/有界累积/错误净化) 且无转发链状态依赖,
+  handler 只是薄壳, 无独立实现 — 勿以此为先例扩张 web → proxy 的行为依赖).
 
 > secret-guard 的核心职责 (转发 + Redact) 必须对任意字节流零失败.
 > 围绕核心职责之外、**基于对 LLM 应用层行为模式强假设** 的附加功能
@@ -391,7 +396,7 @@ TTL 300s + serve-stale-on-error + single-flight; exact-only router 零上游请�
 | `redact.rs` | RedactionMap + redact/restore pipeline + 形式化契约 C1-C7 | 文件头部 `//!` |
 | `util.rs` | 集中的哈希工具 (`hash64` SipHash 单值入口) | 文件头部 `//!` |
 | `codec/` | 跨协议 IR + Reader/Writer trait + StreamTranslate (OpenAI / Anthropic / Responses) | **`src/codec/AGENTS.md`** + `docs/design/ir-fields-roadmap.md` (IR 字段建模路线图: extra 边界 + 字段提升判定准则 + 实施批次) |
-| `proxy/` | dispatch 路径选择 + fan_out 四路径 + Provider 鉴权 + router GET /models 本地合成 (拆分为 mod/helpers/auth/models/recorder/same_proto/cross_proto/fan_out 子模块) | `src/proxy/mod.rs` 头部 `//!` |
+| `proxy/` | dispatch 路径选择 + fan_out 四路径 + Provider 鉴权 + router GET /models 本地合成 + provider 协议探测 (拆分为 mod/helpers/auth/models/recorder/same_proto/cross_proto/fan_out 子模块) | `src/proxy/mod.rs` 头部 `//!` |
 | `state.rs` | 进程级共享状态 `AppState` (原 ProxyState, 上移见 #145) + HTTP 共享常量 `NO_STORE` | 文件头部 `//!` |
 | `web/` | JSON API (`api/` 目录) + 单页 WebUI | **`src/web/AGENTS.md`** |
 | `server.rs` | router 装配 + 双层状态注入 + graceful shutdown + Host/Origin guard 最外层挂载 | 文件头部 `//!` |

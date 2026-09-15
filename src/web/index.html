@@ -148,7 +148,8 @@
     }
     /* 代码 / 原始字节区统一用等宽 (语义需要, 非全局风格). 集中声明, 避免下方重复. */
     pre, code, .raw-pre, .resp-body, .bubble-tool, .bubble-tool-call,
-    .full-body, .info-val, dialog#secret-form form textarea, textarea#apikey-reveal-value {
+    .full-body, .info-val, dialog#secret-form form textarea, textarea#apikey-reveal-value,
+    #p-probe-result .probe-chip {
       font-family: "SF Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
     }
     /* 数字密集区统一 tabular-nums (时间戳/计数/表格), 避免数字宽窄跳动. */
@@ -547,6 +548,41 @@
       color: var(--fg-muted);
       font-size: 11px;
     }
+    /* Detect 协议探测 (#p-direct-fields 内, Direct 构造专属 — Router 下随组隐藏):
+       按钮 + 结果区各跨整行 (form grid 两列). 结果区由 renderProbeResult 填充
+       (状态行 / note hint / 模型 chips), 清空后由 :empty 折叠 (不残留空行).
+       容器用 grid 而非 flex column: 单列隐式行堆叠等价, 且全局 .hint { flex: 1 }
+       对 grid item 天然无效, 免去中和补偿规则. */
+    #p-detect { grid-column: 1 / -1; justify-self: start; }
+    #p-probe-result { grid-column: 1 / -1; display: grid; gap: 4px; }
+    #p-probe-result:empty { display: none; }
+    #p-probe-result .probe-line { font-size: 12px; color: var(--fg-muted); }
+    #p-probe-result .probe-line-ok { color: var(--ok); }
+    #p-probe-result .probe-line-err { color: var(--err); }
+    /* 模型 chips 预览 (MVP 深度 = 浏览 + 点击复制): 可滚动容器, 标题随内容滚动. */
+    #p-probe-result .probe-models {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      align-content: flex-start;
+      max-height: 128px;
+      overflow-y: auto;
+      padding: 6px;
+      border: 1px solid var(--border-faint);
+      border-radius: var(--radius-sm);
+    }
+    #p-probe-result .probe-models-title { flex-basis: 100%; font-size: 11px; color: var(--fg-faint); }
+    #p-probe-result .probe-chip {
+      padding: 2px 8px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: var(--panel-hi);
+      color: var(--fg-muted);
+      font-size: 11px;
+      cursor: pointer;
+    }
+    #p-probe-result .probe-chip:hover { border-color: var(--border-strong); color: var(--fg); }
+    #p-probe-result .probe-chip.copied { border-color: var(--ok); background: var(--ok-soft); color: var(--ok); }
     dialog#provider-form .actions {
       grid-column: 2;
       display: flex;
@@ -1754,6 +1790,8 @@
         <input type="text" id="p-base-url" placeholder="https://api.openai.com (no trailing /)">
         <label for="p-api-key">API Key</label>
         <input type="password" id="p-api-key" placeholder="(optional for local providers like Ollama)">
+        <button type="button" class="btn" id="p-detect" title="Probe the base URL to detect its protocol and list available models (does not save)">Detect</button>
+        <div id="p-probe-result"></div>
       </div>
       <label for="p-enabled">Enabled</label>
       <input type="checkbox" id="p-enabled" checked>
@@ -1854,6 +1892,10 @@
       providerProtocols: [],
       providerShorts: [],
       providerDecisions: [],
+      // provider 表单 Detect 探测代数 (镜像 timelineGen 模式): dialog 每次打开 bump;
+      // 在途 probe 响应落地前对账, 代数不匹配即丢弃 — 防在途旧结果写入重开后的新
+      // 表单世界 (含静默改写 #p-protocol 导致存错协议的数据级后果).
+      probeEpoch: 0,
       // auth tab (static preset API keys)
       apiKeysList: [],
       authEnabled: false,
@@ -4976,6 +5018,15 @@
       if (routes.length) routes.forEach(r => addRouteRow(r));
       else addRouteRow();
       document.getElementById('p-base-url').value = existing?.base_url || '';
+      // Detect 探测结果随 dialog 打开清空 (旧结果属于旧的表单世界; base_url/api_key
+      // 后续变更不自动清除 — 下次点击以当前表单值发请求并覆盖, 见 runProviderProbe).
+      // epoch bump 让在途 probe 响应落地时对账丢弃 (probeEpoch 注释); 按钮就地重置
+      // 覆盖 "关闭时 in-flight 卡在 Detecting…/disabled" 的窗口 (旧 finally 因代数
+      // 不匹配不再越世界恢复).
+      document.getElementById('p-probe-result').innerHTML = '';
+      state.probeEpoch++;
+      document.getElementById('p-detect').disabled = false;
+      document.getElementById('p-detect').textContent = 'Detect';
       const apiKeyInput = document.getElementById('p-api-key');
       apiKeyInput.value = '';
       // 编辑模式下用 masked 旧值做 placeholder, 提示"留空将保留"; 创建模式保持原提示.
@@ -5055,6 +5106,132 @@
     document.getElementById('p-routes-list').addEventListener('click', (ev) => {
       const btn = ev.target.closest('.route-del');
       if (btn) btn.closest('.route-row').remove();
+    });
+
+    // ─── provider Detect 协议探测 (Direct 字段组) ────────────────────────
+    //
+    // POST /api/providers/probe {base_url, api_key} → {probes[], recommended, note}.
+    // 手动触发, 建议非命令: recommended 只用于设置 #p-protocol select (用户仍可手改,
+    // 词表 = GET /api/providers 的 protocols 数组), 绝不自动保存. 探测结果 DOM 派生
+    // 内容全部留在 #p-probe-result 内 (不进 state, 同表单其余字段惯例); 模型预览
+    // 深度 = 浏览 + 点击复制 (MVP).
+    async function runProviderProbe() {
+      const resultEl = document.getElementById('p-probe-result');
+      const baseUrl = document.getElementById('p-base-url').value.trim();
+      if (!baseUrl) {
+        resultEl.innerHTML = '<div class="probe-line">Enter a base URL first</div>';
+        return;
+      }
+      const btn = document.getElementById('p-detect');
+      // 代数捕获 (probeEpoch): 落地前对账, 世界已换 (dialog 重开) 则丢弃旧结果 —
+      // 含 finally 的按钮恢复 (防旧 finally 解除新世界 in-flight 按钮的禁用).
+      const epoch = state.probeEpoch;
+      const apiKey = document.getElementById('p-api-key').value;
+      // 编辑态 key 留空: probe 按表单当前值发 (masked 旧值不可逆, 不复用存量 key),
+      // 结果里的 auth_failed 未必是配置坏了 — 落地后补一行提示消歧.
+      // 前置: 编辑对象确实配置过 key (api_key_masked 非空, 从 providersList /
+      // providersDisabled 查该 id 条目 — GET /api/providers 的 masked 字段).
+      // 从未配过 key 的 provider (如 Ollama) 留空是常态, 提示 "saved key is
+      // not reused" 是误导, 不出.
+      const editId = document.getElementById('provider-form').dataset.editId;
+      const savedKeyMasked = [state.providersList, state.providersDisabled]
+        .flat().find(x => x.id === editId)?.api_key_masked;
+      const keylessHint = editId && apiKey === '' && !!savedKeyMasked;
+      btn.disabled = true;
+      btn.textContent = 'Detecting…';
+      resultEl.innerHTML = '';
+      try {
+        const r = await fetch(`${API_PROVIDERS}/probe`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ base_url: baseUrl, api_key: apiKey }),
+        });
+        if (!r.ok) {
+          const fallback = 'HTTP ' + r.status;
+          const err = await r.json().catch(() => ({ error: fallback }));
+          if (epoch === state.probeEpoch) renderProbeError(err.error || fallback);
+          return;
+        }
+        const data = await r.json();
+        if (epoch === state.probeEpoch) {
+          renderProbeResult(data);
+          if (keylessHint) {
+            resultEl.insertAdjacentHTML('beforeend',
+              '<div class="hint">Probed without an API key — the saved key is not reused; auth_failed may just mean the probe carried no key.</div>');
+          }
+        }
+      } catch (e) {
+        if (epoch === state.probeEpoch) renderProbeError(e.message);
+      } finally {
+        if (epoch === state.probeEpoch) {
+          btn.disabled = false;
+          btn.textContent = 'Detect';
+        }
+      }
+    }
+
+    // 网络失败 / 非 200 → 结果区单行错误 (不弹窗打断表单填写).
+    function renderProbeError(msg) {
+      document.getElementById('p-probe-result').innerHTML =
+        `<div class="probe-line probe-line-err">${escapeHtml(`Probe failed: ${msg}`)}</div>`;
+    }
+
+    // 渲染探测结果. 三段式 (顺序固定): 状态行 (recommended 有无二选一) / note hint /
+    // 模型 chips (有可展示 models 才出现). 契约: probes[].status ok=有 models,
+    // 其余 (auth_failed/absent/error) detail 有值; recommended null = 无 ok 命中.
+    function renderProbeResult(data) {
+      const probes = data.probes || [];
+      const parts = [];
+      if (data.recommended) {
+        const protoSel = document.getElementById('p-protocol');
+        // 契约保证 recommended ∈ protocols 词表; 防御集成期漂移 — 给 select 赋
+        // 不存在的值会把它置空, 宁可不选也不覆盖用户已选值.
+        if ([...protoSel.options].some(o => o.value === data.recommended)) {
+          protoSel.value = data.recommended;
+        }
+        parts.push(`<div class="probe-line probe-line-ok">Detected: <code>${escapeHtml(data.recommended)}</code></div>`);
+      } else {
+        // 无推荐: 逐行列出各 probe (基类 + 状态色: ok 行弱化, 失败行错误色调).
+        if (probes.length === 0) parts.push('<div class="probe-line probe-line-err">No probes returned</div>');
+        for (const pr of probes) {
+          const cls = pr.status === 'ok' ? 'probe-line' : 'probe-line probe-line-err';
+          const detail = pr.detail ? ` — ${pr.detail}` : '';
+          parts.push(`<div class="${cls}">${escapeHtml(`${pr.protocol} — ${pr.status}${detail}`)}</div>`);
+        }
+      }
+      if (data.note) parts.push(`<div class="hint">${escapeHtml(data.note)}</div>`);
+      // 模型预览来源: recommended 对应 probe; recommended 为 null 时退到首个 ok probe.
+      const source = data.recommended
+        ? probes.find(pr => pr.protocol === data.recommended)
+        : probes.find(pr => pr.status === 'ok');
+      const models = source?.status === 'ok' ? (source.models || []) : [];
+      if (models.length) {
+        const chips = models.map(m =>
+          `<button type="button" class="probe-chip" data-model="${escapeHtml(m)}" title="Copy model name">${escapeHtml(m)}</button>`).join('');
+        parts.push(`<div class="probe-models"><div class="probe-models-title">Models (${models.length})</div>${chips}</div>`);
+      }
+      document.getElementById('p-probe-result').innerHTML = parts.join('');
+    }
+
+    document.getElementById('p-detect').addEventListener('click', runProviderProbe);
+    // 模型 chip 点击复制 (事件委托: chips 是动态子元素, 同 #p-routes-list 模式).
+    // 反馈瞬时: 文案切 "✓ copied" 900ms 后恢复, 重复点击重置定时器不叠加.
+    // localhost 是 secure context, clipboard API 可用; 失败 fallback 提示 (同
+    // copyRevealedApiKey 惯例).
+    document.getElementById('p-probe-result').addEventListener('click', (ev) => {
+      const chip = ev.target.closest('.probe-chip');
+      if (!chip) return;
+      navigator.clipboard.writeText(chip.dataset.model).then(() => {
+        chip.textContent = '✓ copied';
+        chip.classList.add('copied');
+        clearTimeout(chip._copyTimer);
+        chip._copyTimer = setTimeout(() => {
+          chip.textContent = chip.dataset.model;
+          chip.classList.remove('copied');
+        }, 900);
+      }).catch(() => {
+        alert('Copy failed — select the model name manually.');
+      });
     });
 
     /// 编辑 static-only id 时, 提示 "此次会创建 dynamic override".

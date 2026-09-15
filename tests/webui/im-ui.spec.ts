@@ -37,6 +37,7 @@
  * 所有测试共享一个 browser context, 按声明顺序执行 (workers=1).
  */
 import { test, expect, type Page } from "@playwright/test";
+import * as http from "http";
 import { TEST_SECRET_VALUE } from "./fixtures";
 
 const SG_API = "/api";
@@ -2689,5 +2690,137 @@ test.describe("usage-stats (模型用量统计)", () => {
       overflows,
       `td 内容溢出盒子 (= 文字重叠): ${JSON.stringify(overflows, null, 2)}`
     ).toEqual([]);
+  });
+});
+
+// ─── Provider Detect 协议探测 (POST /api/providers/probe) ─────────────────
+//
+// mock probe 上游: 独立 node http server (与 webServer 的 mock_upstream.py /
+// secret-guard 进程均无关). 探测链路是 浏览器 → sg 后端 POST /api/providers/probe
+// → sg 后端 GET {base_url}/v1/models 等三路 — 场景由 base_url (端口) 键控:
+// fast 端口 = openai shape 即答 (recommended=openai); slow 端口 = /v1/models
+// 延迟后 anthropic shape (recommended=anthropic, 与重开表单的默认 openai 可区分,
+// 越世界落地时 select 改写可观测).
+
+type ProbeUpstream = { url: string; close: () => Promise<void> };
+
+function startProbeUpstream(
+  respond: (pathname: string) => { status: number; body: string; delayMs?: number }
+): Promise<ProbeUpstream> {
+  return new Promise((resolve, reject) => {
+    const server = http.createServer((req, res) => {
+      const { status, body, delayMs } = respond(req.url ?? "");
+      const send = () => {
+        res.writeHead(status, { "Content-Type": "application/json" });
+        res.end(body);
+      };
+      if (delayMs) setTimeout(send, delayMs);
+      else send();
+    });
+    // bind 失败 (如 fd 耗尽) 快速报错, 而非挂到全局超时.
+    server.on("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address() as { port: number };
+      resolve({
+        url: `http://127.0.0.1:${port}`,
+        close: () =>
+          new Promise<void>((done) => {
+            // 掐断 keep-alive 连接 (sg 的 reqwest 连接池), 否则 close() 要等对端
+            // socket 超时才回调.
+            server.closeAllConnections();
+            server.close(() => done());
+          }),
+      });
+    });
+  });
+}
+
+test.describe("Provider Detect 协议探测", () => {
+  let fastUpstream: ProbeUpstream;
+  let slowUpstream: ProbeUpstream;
+
+  test.beforeAll(async () => {
+    // fast: /v1/models → openai shape (3 models, chips 数断言用); 其余端点 404
+    // (absent) — recommended=openai.
+    fastUpstream = await startProbeUpstream((pathname) => {
+      if (pathname === "/v1/models") {
+        return {
+          status: 200,
+          body: JSON.stringify({
+            object: "list",
+            data: [
+              { id: "m1", object: "model" },
+              { id: "m2", object: "model" },
+              { id: "m3", object: "model" },
+            ],
+          }),
+        };
+      }
+      return { status: 404, body: "{}" };
+    });
+    // slow: /v1/models 延迟 800ms 后 anthropic shape; 其余端点 404 即答.
+    slowUpstream = await startProbeUpstream((pathname) => {
+      if (pathname === "/v1/models") {
+        return {
+          status: 200,
+          delayMs: 800,
+          body: JSON.stringify({
+            data: [{ type: "model", id: "claude-x", display_name: "X" }],
+          }),
+        };
+      }
+      return { status: 404, body: "{}" };
+    });
+  });
+
+  test.afterAll(async () => {
+    await fastUpstream.close();
+    await slowUpstream.close();
+  });
+
+  async function openNewProviderForm(page: Page): Promise<void> {
+    await page.locator("button", { hasText: "+ new provider" }).click();
+    await expect(page.locator("#provider-form")).toBeVisible();
+  }
+
+  test("Detect: openai shape 上游 → recommended 改写 select + Detected 行 + 3 chips", async ({ page }) => {
+    await page.goto("/");
+    await page.locator('a.tab[data-tab="providers"]').click();
+    await openNewProviderForm(page);
+    // 预先把 select 改到非推荐值: 断言 "被 recommended 改写", 排除 "本来就是
+    // openai" 的 vacuous 通过.
+    await page.locator("#p-protocol").selectOption("anthropic");
+    await page.locator("#p-base-url").fill(fastUpstream.url);
+    await page.locator("#p-detect").click();
+    await expect(page.locator("#p-probe-result .probe-line-ok")).toContainText("Detected: openai");
+    await expect(page.locator("#p-protocol")).toHaveValue("openai");
+    await expect(page.locator("#p-probe-result .probe-chip")).toHaveCount(3);
+    // finally 恢复: 按钮可点且文案复位.
+    await expect(page.locator("#p-detect")).toBeEnabled();
+    await expect(page.locator("#p-detect")).toHaveText("Detect");
+  });
+
+  test("Detect: dialog 关闭重开后在途响应不落地 (probeEpoch 对账)", async ({ page }) => {
+    await page.goto("/");
+    await page.locator('a.tab[data-tab="providers"]').click();
+    await openNewProviderForm(page);
+    // 先挂 response 监听再点击: 稍后 await 它 = "旧响应确已回到浏览器" 成为
+    // 前置断言 (替代固定 sleep, 消除 CI 慢时空转通过窗口)。
+    const staleResponse = page.waitForResponse(
+      (r) => r.url().includes("/api/providers/probe") && r.request().method() === "POST"
+    );
+    await page.locator("#p-base-url").fill(slowUpstream.url);
+    await page.locator("#p-detect").click();
+    // 立即关闭并重开 dialog (重开即 epoch bump; 新世界: 空 base_url, select 回
+    // 默认 openai) — 800ms 延迟给 close+reopen 留足窗口.
+    await page.locator('#provider-form-el button[value="cancel"]').click();
+    await expect(page.locator("#provider-form")).not.toBeVisible();
+    await openNewProviderForm(page);
+    await staleResponse;
+    // 旧响应已落地浏览器: 若无 epoch 守卫, 此刻会渲染 "Detected: anthropic" 并
+    // 改写 select. 断言两者都没发生.
+    await expect(page.locator("#p-probe-result .probe-line")).toHaveCount(0);
+    await expect(page.locator("#p-probe-result .hint")).toHaveCount(0);
+    await expect(page.locator("#p-protocol")).toHaveValue("openai");
   });
 });

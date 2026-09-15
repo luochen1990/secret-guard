@@ -100,6 +100,11 @@ use crate::state::AppState;
 // (子模块保持私有, 组合根先例同 state.rs 的 api_keys 字段, #196).
 pub use models::ModelListCache;
 
+// probe 端点 (web/api/providers) 复用 models 的上游探测基建: 行为借用
+// (probe_provider_upstream 执行出站 HTTP 探测, 非纯数据/纯函数), 依赖方向
+// 例外已登记在根 AGENTS.md "已接受的例外".
+pub(crate) use models::probe_provider_upstream;
+
 /// axum 路径参数: `/{proto}/{name}/{*rest}`.
 ///
 /// `rest` 由 axum 的 catch-all 语法 (`{*rest}`) 提供. **注意 (2026-08 实测, #196)**:

@@ -1,8 +1,12 @@
-//! providers CRUD: `GET/POST/PUT/DELETE /providers[/{id}]` + `PATCH /{id}/decision`.
+//! providers CRUD: `GET/POST/PUT/DELETE /providers[/{id}]` + `PATCH /{id}/decision`
+//! + `POST /providers/probe` (协议自动探测) + `PUT/DELETE /providers/probe`
+//!   (存量 id="probe" 条目的管理薄 wrapper, 见 [`update_provider_probe`]).
 //!
 //! 从 api.rs 单文件拆出 (见 #146 残留 1). CRUD 流程骨架在 [`super::crud`]
 //! (泛型, 与 secrets 共享), 本文件只承载 provider 特有的 entry 构造 / api_key
-//! 保留逻辑 / 列表附加字段 (protocols/shorts).
+//! 保留逻辑 / 列表附加字段 (protocols/shorts). probe 是薄壳: 校验 base_url 后
+//! 调 `crate::proxy::probe_provider_upstream` (探测算法 SSOT 在 proxy 层, 与
+//! 上游模型清单 fetch 同乡).
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -54,7 +58,20 @@ pub async fn create_provider(
         // #179: upsert 后路由边 (启用路由的 target) 成环 → 400 (自环已由
         // Provider::validate 拒绝, 这里覆盖跨条目环; 悬空目标放行 — 创建顺序
         // 无关, 运行时 503 兜底).
-        |entry| validate_provider_upsert(&state.providers, entry),
+        //
+        // id="probe" 保留字 (**仅挡新建**, 纯防混淆): 该 id 与探测端点共用
+        // /api/providers/probe — PUT/DELETE 该 URL 的语义是 "管理同名条目",
+        // 新建会让 "探测" 与 "编辑" 挤在同一 URL 上, 拒绝以免混淆. 存量条目
+        // (保留字校验上线前创建 / 手写 toml) 不受影响: 经该端点补齐的
+        // PUT/DELETE wrapper (update_provider_probe) 完全可管理.
+        |entry| {
+            if entry.id == "probe" {
+                return Err(ApiError::validation(
+                    "provider id 'probe' is reserved (conflicts with the /api/providers/probe endpoint)",
+                ));
+            }
+            validate_provider_upsert(&state.providers, entry)
+        },
     )?;
     Ok((StatusCode::CREATED, NO_STORE, Json(created)))
 }
@@ -147,6 +164,9 @@ pub async fn update_provider(
 /// upsert 钩子 (#179): 类型校验收口到语义 SSOT `Provider::validate` (crud 钩子在
 /// id 生成/填充后运行, 正是其正确位置 — into_provider 只做字段变换), 再叠加
 /// web 特有的跨条目环检查. 消息只含 provider id.
+///
+/// id="probe" 保留字检查**不在此** (create/update 共用本钩子, 在这拒绝会连
+/// 存量条目的合法编辑一起挡掉): 仅挡新建, 收在 create_provider 的闭包里.
 fn validate_provider_upsert(
     table: &crate::provider::ProviderTable,
     entry: &Provider,
@@ -169,6 +189,28 @@ pub async fn delete_provider(
     Ok((StatusCode::NO_CONTENT, NO_STORE, ""))
 }
 
+/// `PUT /api/providers/probe`: 以固定 id="probe" 适配到 [`update_provider`]
+/// 的薄 wrapper (不复制 flow 逻辑, 纯参数适配).
+///
+/// 存在理由: matchit 静态段优先于 `{id}` 参数段, `PUT /api/providers/{id}`
+/// 永远接不到 id="probe" 的请求 — 没有本 wrapper 时存量 "probe" 条目
+/// (保留字校验上线前创建 / 手写 toml) 经 API 不可编辑 (405). 补齐后该 id
+/// 条目与其他条目同等可管理; 新建仍被拒 (纯防混淆, 见 create_provider).
+pub async fn update_provider_probe(
+    State(state): State<AppState>,
+    Json(payload): Json<UpsertProviderRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    update_provider(State(state), Path("probe".to_string()), Json(payload)).await
+}
+
+/// `DELETE /api/providers/probe`: [`update_provider_probe`] 的删除侧薄 wrapper
+/// (语义与存在理由同彼, 405 补齐).
+pub async fn delete_provider_probe(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, ApiError> {
+    delete_provider(State(state), Path("probe".to_string())).await
+}
+
 /// 切换对 static id 的 per-item 决策. 同 [`super::secrets::set_secret_decision`].
 pub async fn set_provider_decision(
     State(state): State<AppState>,
@@ -178,6 +220,34 @@ pub async fn set_provider_decision(
     let mode = payload.into_mode()?;
     let ack = decision_flow(&state.providers, "provider", id, mode)?;
     Ok((StatusCode::OK, NO_STORE, Json(ack)))
+}
+
+/// `POST /api/providers/probe` 的请求 body.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ProbeRequest {
+    /// 待探测的上游 base URL (http(s), 规则同 provider 配置的 validate_base_url).
+    pub base_url: String,
+    /// 可选 api_key (空串 = 无 auth 探测, Ollama 等本地场景; serde default).
+    #[serde(default)]
+    pub api_key: String,
+}
+
+/// `POST /api/providers/probe`: 对任意 base_url 探测 4 族协议端点 (薄壳 —
+/// 校验 base_url 后调 `crate::proxy::probe_provider_upstream`, 判定/推荐算法
+/// SSOT 在 proxy 层).
+///
+/// 探测失败是**数据不是 HTTP 错误**: 恒 200 (结果落在 status=error 的 outcome),
+/// 仅 base_url 非法 (复用 [`crate::provider::validate_base_url`] 同一规则) → 400.
+/// 响应不含 api_key (探测 detail 经 `upstream_error_brief` 净化).
+pub async fn probe_provider(
+    State(state): State<AppState>,
+    Json(payload): Json<ProbeRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    crate::provider::validate_base_url(&payload.base_url).map_err(ApiError::validation)?;
+    let response =
+        crate::proxy::probe_provider_upstream(&state.upstream, &payload.base_url, &payload.api_key)
+            .await;
+    Ok((StatusCode::OK, NO_STORE, Json(response)))
 }
 
 #[derive(Serialize)]

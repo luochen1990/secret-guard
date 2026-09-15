@@ -13,6 +13,10 @@
   - `records.rs` — `GET /records/{id}` 单条 raw + parsed view (弹窗按需拉).
   - `sessions.rs` — `GET /sessions` + `GET /sessions/{sid}/timeline` + `POST /sync` (session-aware timeline API).
   - `secrets.rs` / `providers.rs` — 各自 CRUD (5 endpoints), handler 是 crud.rs 泛型流程的薄壳.
+    providers.rs 另含 `POST /providers/probe` (协议自动探测): base_url 校验后的薄壳,
+    探测算法 SSOT 在 `proxy::models::probe_provider_upstream` (与上游模型清单 fetch 同乡);
+    以及 `PUT/DELETE /providers/probe` — 存量 id="probe" 条目的管理薄 wrapper
+    (固定 id 适配到 update/delete flow, 静态路由 405 阴影的补齐).
   - `apikeys.rs` — API key CRUD (4 endpoints, 无条件挂载, "只认证, 不隔离").
   - `usage.rs` — `GET /usage/summary` 用量汇总查询 (usage-stats §8; 直读 UsageStore
     SQL 聚合, 派生走 `usage::summary::build_summary` 纯函数).
@@ -51,6 +55,17 @@ POST   /api/providers
 PUT    /api/providers/{id}
 DELETE /api/providers/{id}           → 同 secrets (#156)
 PATCH  /api/providers/{id}/decision
+POST   /api/providers/probe          body: {base_url, api_key?} →
+                                         {probes[4] (openai/anthropic/gemini/ollama,
+                                          status: ok|auth_failed|absent|error,
+                                          models?, detail?), recommended?, note?}
+                                         (协议自动探测; 失败是数据不是 HTTP 错误 — 恒 200,
+                                          仅非法 base_url → 400; 算法在 proxy::models)
+PUT    /api/providers/probe          → 同 PUT /api/providers/{id}, 固定 id="probe"
+DELETE /api/providers/probe          → 同 DELETE /api/providers/{id}, 固定 id="probe"
+                                         (静态段优先于 {id} 参数段, 该 id 的编辑/删除只能
+                                          经此进 — 补齐前存量 "probe" 条目 405 不可管理;
+                                          新建该 id 仍被拒绝, 纯防混淆)
 
 GET    /api/api-keys
 POST   /api/api-keys
@@ -66,6 +81,12 @@ GET    /api/usage/summary[?hours=N]  → UsageSummary {range, pricing_status, to
                                                   ≤14d hour 粒度, 更长 day 折叠;
                                                   usage tab 5s 节流轮询)
 ```
+
+> **探测假设 (best-effort 已知边界)**: 探测假设 base_url 是裸 origin/base (不带
+> 路径前缀), 探测端点 = `{base_url}/v1/models` 等。Azure 风格路径前缀 base
+> (如 `https://xx.openai.azure.com/openai`) 的探测 URL 会拼出不存在的端点,
+> 大概率全部 `absent` / 无 recommended — 属 best-effort 已知边界, 手选 protocol
+> 即可。
 
 所有响应带 `Cache-Control: no-store`, 避免浏览器对自动刷新返回缓存内容.
 
@@ -191,6 +212,10 @@ API key CRUD **无条件挂载** (在 `web::router()`, 不依赖 `auth.enabled`)
   拦截, 不依赖后端 400). Direct 分支不发 `routes` — **唯一例外**: 编辑对象当前是
   Router 时发 `routes: []` ("显式改回实体"; PUT 省略 routes 会被后端回填旧路由停留在
   Router).
+- **Detect 协议探测** (Direct 字段组): `POST /api/providers/probe` (base_url + 当前
+  api_key) 手动触发; recommended 只自动填入 `#p-protocol` (建议非命令, 用户可手改),
+  另附模型 chips 预览 (MVP 深度 = 浏览 + 点击复制). dialog 每次打开清空结果区; 表单
+  值变更后旧结果不自动清除 (下次点击以当前表单值覆盖).
 - **列表 router 行**: URL 列渲染路由摘要 `model_pattern → target · egress` (禁用路由主文本
   删除线; 超过 2 条折叠为首条 + "+N more", 全量在 td title). egress 是**展示近似** —
   从路由 target 出发 walk 链尾 Direct 的 protocol (中间 router 取最高优先级启用

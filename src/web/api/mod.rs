@@ -20,7 +20,9 @@
 //! - `sessions`: `GET /sessions` + `GET /sessions/{sid}/timeline` + `POST /sync`
 //!   (session-aware timeline API).
 //! - `secrets`: secrets CRUD (5 endpoints).
-//! - `providers`: providers CRUD (5 endpoints).
+//! - `providers`: providers CRUD (5 endpoints) + `POST /providers/probe` 协议探测
+//!   (薄壳, 算法在 `proxy::models`) + `PUT/DELETE /providers/probe` 存量 "probe"
+//!   id 条目的管理薄 wrapper.
 //! - `apikeys`: API key CRUD (4 endpoints, 无条件挂载, 见该文件头注释).
 //!
 //! # 安全姿态
@@ -41,7 +43,8 @@ pub(crate) mod usage;
 // handler re-export: 保持 `web::api::<handler>` 路径稳定 (web/mod.rs router 直接引用).
 pub use apikeys::{create_api_key, delete_api_key, list_api_keys, toggle_api_key};
 pub use providers::{
-    create_provider, delete_provider, list_providers, set_provider_decision, update_provider,
+    create_provider, delete_provider, delete_provider_probe, list_providers, probe_provider,
+    set_provider_decision, update_provider, update_provider_probe,
 };
 pub use records::get_record;
 pub use secrets::{create_secret, delete_secret, list_secrets, set_secret_decision, update_secret};

@@ -13,6 +13,10 @@
 //! - `DELETE /api/secrets/{id}`         —— 删除 (仅 dynamic-only; static 基线一律 409, #156).
 //! - `PATCH /api/secrets/{id}/decision` —— 切换 OverrideMode.
 //! - `GET/POST/PUT/DELETE/PATCH /api/providers[/{id}[/decision]]` —— 同上.
+//! - `POST /api/providers/probe` —— base_url 协议自动探测 (探测算法在
+//!   `proxy::models`, 薄壳 handler 在 `api/providers.rs`).
+//! - `PUT/DELETE /api/providers/probe` —— 存量 id="probe" 条目的管理薄 wrapper
+//!   (静态段阴影 {id} 路由的 405 补齐, 见 `api::update_provider_probe`).
 //! - `GET/POST/DELETE/PATCH /api/api-keys[/{id}[/toggle]]` —— API key CRUD (无条件挂载, 见 api/apikeys.rs).
 //!
 //! 注 1: 旧的 `GET /api/records` (扁平分页) + `GET /api/nodes/{id}/timeline` (基于 node_id)
@@ -69,6 +73,17 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/providers",
             get(api::list_providers).post(api::create_provider),
+        )
+        // 协议探测 (POST) + 存量 id="probe" 条目的管理 wrapper (PUT/DELETE 以
+        // 固定 id 适配到 update/delete flow, api/providers.rs). 静态段优先于
+        // {id} 参数段: 该 id 的 PUT/DELETE 只能经此路由进 — 补齐前存量条目
+        // 不可编辑/删除 (405), 新建该 id 仍被 upsert 校验拒绝 (纯防混淆) — 见
+        // url-layout.md.
+        .route(
+            "/api/providers/probe",
+            post(api::probe_provider)
+                .put(api::update_provider_probe)
+                .delete(api::delete_provider_probe),
         )
         .route(
             "/api/providers/{id}",

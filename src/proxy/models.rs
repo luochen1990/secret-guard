@@ -1,4 +1,5 @@
-//! Router provider 的模型列表合成 (GET /models, #196).
+//! Router provider 的模型列表合成 (GET /models, #196) + Provider 协议探测
+//! (probe 端点).
 //!
 //! # 职责边界
 //!
@@ -63,12 +64,32 @@
 //! `ModelListCache` 是纯数据 store (无 proxy 行为依赖), 经 `crate::proxy` re-export
 //! 给 `crate::state::AppState` 聚合持有 — 组合根先例同 `api_keys` (state 聚合各
 //! feature 模块的 store 类型), 详见 `src/state.rs` 字段注释.
+//!
+//! # Provider 协议探测 (`probe_provider_upstream`)
+//!
+//! `POST /api/providers/probe` 的核心 (handler 薄壳在 `web/api/providers.rs`,
+//! base_url 合法性校验在 handler 侧): 对任意 base_url 并行探测 3 个候选端点,
+//! 输出固定 4 项 outcome (顺序 openai / anthropic / gemini / ollama) + 推荐.
+//! 判定规则:
+//! - `/v1/models` 一路判两族 (openai + anthropic 共用端点, 靠 data 条目的判别
+//!   字段分家, 见 `classify_v1_family`); 401|403 → 双 auth_failed, 404|405 →
+//!   双 absent, 其余失败 (连接/超时/超大 body/非法 JSON/其他非 2xx) → 双 error.
+//! - `/v1beta/models` (gemini) / `/api/tags` (ollama) 独立判定: 2xx + shape
+//!   解析成功 → ok; 401|403 → auth_failed; 404|405 → absent; 其余 → error.
+//! - 探测失败是**数据不是 HTTP 错误** (handler 对探测结果恒 200).
+//! - 推荐序: openai (ollama 双命中附 note) > anthropic > gemini (no-codec
+//!   note) > ollama (同 note); 无任何 ok → recommended null.
+//!
+//! 依赖方向: web/api/providers → 本模块 已在根 AGENTS.md "已接受的例外" 登记
+//! (probe 端点复用上游探测基建; 行为借用 — 探测执行出站 HTTP, 非纯数据/
+//! 纯函数, handler 只是薄壳无独立实现).
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, Response, StatusCode};
+use serde::Serialize;
 use serde_json::json;
 
 use crate::provider::{DirectProvider, Protocol, Provider, ProviderKind, ProviderTable};
@@ -413,9 +434,6 @@ pub(super) async fn handle_router_models(
 /// 永不含 key/secret — reqwest 错误经 `upstream_error_brief` 净化, 剥 userinfo/query).
 ///
 /// `api_key` 由调用方在缓存锁外预解析传入 (见模块头部锁纪律).
-///
-/// 超时是**整体**的 (send + 状态检查 + body 有界累积全程): 防上游 "发完响应头后
-/// body 停滞" 永久持有 `snapshot_refreshing` 的缓存锁.
 async fn fetch_model_list(
     client: &reqwest::Client,
     api_key: &str,
@@ -435,21 +453,39 @@ async fn fetch_model_list(
             HeaderValue::from_static(super::auth::ANTHROPIC_VERSION),
         );
     }
+    let (status, body) = fetch_status_and_body(client, &url, headers).await?;
+    if !status.is_success() {
+        return Err(status_detail(status));
+    }
+    parse_model_ids(direct.protocol, &body)
+}
+
+/// GET 上游 + 有界累积 body, **整体**超时覆盖全程 (send → 状态行 → body 读毕).
+///
+/// `fetch_model_list` (router /models 缓存填充) 与 `probe_provider_upstream`
+/// (协议探测) 的共享防御层: 停滞上游超时掐断 (防 fetch 永久持有缓存锁 / 探测
+/// 挂起), 破损上游有界累积 (防撑爆内存, 见 MAX_MODELS_BODY), 错误串经
+/// `upstream_error_brief` 净化 (不含 key/secret). 成功返回 (status, body) —
+/// status 判定留给调用方 (缓存填充看 is_success, 探测要分 401/404 桶).
+///
+/// 重构自 fetch_model_list 的两处**有意**行为差异 (提取时声明, 非回归):
+/// ① 非 2xx 的 body 也读毕再判错 (探测侧 status 桶判定需要 body 一致路径;
+///    上限仍是 MAX_MODELS_BODY; 推论: 非 2xx + 超大 body 时错误串是
+///    "response body exceeds ..." 而非 "upstream returned NNN" — 仅日志面差异);
+/// ② 非 2xx 错误串统一为纯数字 code (`upstream returned 404`, 契约示例形态)
+///    — 旧形态含 reason phrase。
+async fn fetch_status_and_body(
+    client: &reqwest::Client,
+    url: &str,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Vec<u8>), String> {
     let request = async {
-        let mut resp = client
-            .get(&url)
-            .headers(headers)
-            .send()
-            .await
-            .map_err(|e| {
-                format!(
-                    "request failed: {}",
-                    super::recorder::upstream_error_brief(&e)
-                )
-            })?;
-        if !resp.status().is_success() {
-            return Err(format!("upstream returned {}", resp.status()));
-        }
+        let mut resp = client.get(url).headers(headers).send().await.map_err(|e| {
+            format!(
+                "request failed: {}",
+                super::recorder::upstream_error_brief(&e)
+            )
+        })?;
         // 有界累积 (超限按失败处理 — 见 MAX_MODELS_BODY 注释).
         let mut buf = Vec::new();
         while let Some(chunk) = resp.chunk().await.map_err(|e| {
@@ -463,12 +499,11 @@ async fn fetch_model_list(
                 return Err(format!("response body exceeds {} bytes", MAX_MODELS_BODY));
             }
         }
-        Ok(buf)
+        Ok((resp.status(), buf))
     };
-    let body = tokio::time::timeout(MODEL_FETCH_TIMEOUT, request)
+    tokio::time::timeout(MODEL_FETCH_TIMEOUT, request)
         .await
-        .map_err(|_| "timeout".to_string())??;
-    parse_model_ids(direct.protocol, &body)
+        .map_err(|_| "timeout".to_string())?
 }
 
 /// 尝试性解析上游 /models 响应 (ROB-*: 非法 JSON / 缺数组字段 → Err;
@@ -545,6 +580,291 @@ fn build_models_body(ingress: Protocol, names: &[String]) -> String {
         }),
     }
     .to_string()
+}
+
+// ─── Provider 协议探测 (POST /api/providers/probe 的核心) ─────────────
+
+/// 双命中 (openai + ollama 同时 ok) 时的推荐理由 (wire 文案冻结于接口契约).
+const PROBE_NOTE_DUAL_OLLAMA: &str = "Ollama native endpoint also detected. The OpenAI-compatible endpoint is recommended because secret redaction requires a codec-covered protocol (OpenAI/Anthropic/Responses).";
+/// 无 codec 协议 (gemini / ollama) 被推荐时的理由 (同上, 冻结文案).
+const PROBE_NOTE_NO_CODEC: &str = "No codec for this protocol: secret redaction is unavailable, and requests hitting secrets are rejected by default (on_unsupported_protocol = fail_closed).";
+
+/// 单个协议的探测结果 (wire DTO).
+#[derive(Debug, Serialize)]
+pub(crate) struct ProbeOutcome {
+    /// 协议名 (= `Protocol::name`, 与 `Protocol::ALL` 同步).
+    pub protocol: &'static str,
+    pub status: ProbeStatus,
+    /// `status == ok` 时必有 (可为空数组 — data 空数组也是合法 shape); 其余 null.
+    pub models: Option<Vec<String>>,
+    /// `status == ok` 时 null; 其余必有 (上游 status / 家族判别 / 净化后的错误串).
+    pub detail: Option<String>,
+}
+
+impl ProbeOutcome {
+    /// ok 轮次: models 必有 (可为空数组), detail 必 null (字段不变量的类型化).
+    fn ok(protocol: &'static str, models: Vec<String>) -> Self {
+        Self {
+            protocol,
+            status: ProbeStatus::Ok,
+            models: Some(models),
+            detail: None,
+        }
+    }
+
+    /// 非 ok 轮次 (auth_failed / absent / error): models 必 null, detail 必有.
+    fn non_ok(protocol: &'static str, status: ProbeStatus, detail: String) -> Self {
+        debug_assert!(status != ProbeStatus::Ok);
+        Self {
+            protocol,
+            status,
+            models: None,
+            detail: Some(detail),
+        }
+    }
+}
+
+/// 探测状态 (wire 枚举, snake_case — 冻结契约).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProbeStatus {
+    /// 2xx + shape 匹配 (models 必有).
+    Ok,
+    /// 401 | 403 — 端点存在但鉴权失败.
+    AuthFailed,
+    /// 404 | 405, 或 /v1/models 的 shape 指向家族另一员 — 端点不属于该协议.
+    Absent,
+    /// 连接失败 / 超时 / 非法 JSON / 超大 body / 其他非 2xx (detail 必有).
+    Error,
+}
+
+/// 探测响应 (wire DTO). 探测失败是**数据不是 HTTP 错误** — handler 对本结构恒 200.
+#[derive(Debug, Serialize)]
+pub(crate) struct ProbeResponse {
+    /// 固定 4 项, 顺序: openai, anthropic, gemini, ollama.
+    pub probes: Vec<ProbeOutcome>,
+    /// 无任何 ok 时 null.
+    pub recommended: Option<&'static str>,
+    /// 推荐理由, 可为 null.
+    pub note: Option<&'static str>,
+}
+
+/// 探测请求的统一 headers (三路 GET 共用).
+///
+/// **不走 `apply_provider_auth`**: 它按单一已知协议剥离竞争 auth header (转发
+/// 路径的正确防御 — 防上游误识别), 而探测时协议未知, 三个候选协议的 auth
+/// header (`authorization: Bearer` / `x-api-key` / `x-goog-api-key`) 必须
+/// **并发携带**, 由上游按自己的方言取用. `anthropic-version` 恒加 (Anthropic
+/// 上游缺失此 header 会 400, 对其他协议无害). api_key 为空 (含纯空白) 时全部
+/// auth header 跳过 (Ollama 等本地无 auth 场景); 含非法 header 字符时 warn 后
+/// 跳过该项 (同 `apply_provider_auth` 纪律: 永不 panic, 让上游自行拒绝).
+fn probe_headers(api_key: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "anthropic-version",
+        HeaderValue::from_static(super::auth::ANTHROPIC_VERSION),
+    );
+    let key = api_key.trim();
+    if key.is_empty() {
+        return headers;
+    }
+    for (name, value) in [
+        ("authorization", format!("Bearer {key}")),
+        ("x-api-key", key.to_string()),
+        ("x-goog-api-key", key.to_string()),
+    ] {
+        match HeaderValue::from_str(&value) {
+            Ok(v) => {
+                headers.insert(name, v);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    name,
+                    "probe api_key contains illegal header chars; skipping auth header"
+                );
+            }
+        }
+    }
+    headers
+}
+
+/// /v1/models 的家族归属 (openai 与 anthropic 共用该端点, 靠 shape 判别字段分家).
+enum V1Family {
+    OpenAI,
+    Anthropic,
+}
+
+/// /v1/models 200 响应的家族判别: 扫描 `data` 数组, **首个含判别字段的条目**决定 —
+/// 有 `object` 字段 → OpenAI (条目形如 `{"id","object":"model",...}`); 有
+/// `display_name` 或 `type` → Anthropic (`{"type":"model","id","display_name"}`).
+/// 同一条目两者兼有时 `object` 优先 (判别字段是 OpenAI 家族更显式的指纹).
+/// 全部条目无判别字段 (含 data 空) → OpenAI (该端点的历史默认方言).
+///
+/// 假设: 判别只看字段名存在性, 不看字段值. 降级: body 已由调用方经
+/// `parse_model_ids` 验证, 此处再 parse 失败 (理论不可达) → OpenAI (ROB-*).
+fn classify_v1_family(body: &[u8]) -> V1Family {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return V1Family::OpenAI;
+    };
+    let Some(entries) = value.get("data").and_then(|d| d.as_array()) else {
+        return V1Family::OpenAI;
+    };
+    for entry in entries {
+        if entry.get("object").is_some() {
+            return V1Family::OpenAI;
+        }
+        if entry.get("display_name").is_some() || entry.get("type").is_some() {
+            return V1Family::Anthropic;
+        }
+    }
+    V1Family::OpenAI
+}
+
+/// 非 2xx status → 探测状态桶: 401|403 → auth_failed, 404|405 → absent,
+/// 其余 → error. (2xx 由调用方在 shape 判定分支处理, 不进本函数.)
+fn status_probe_bucket(status: StatusCode) -> ProbeStatus {
+    if matches!(status.as_u16(), 401 | 403) {
+        ProbeStatus::AuthFailed
+    } else if matches!(status.as_u16(), 404 | 405) {
+        ProbeStatus::Absent
+    } else {
+        ProbeStatus::Error
+    }
+}
+
+/// detail 文案: 只含数字 status code (契约示例形态 "upstream returned 401"),
+/// 不含 reason phrase (无信息量且冗长).
+fn status_detail(status: StatusCode) -> String {
+    format!("upstream returned {}", status.as_u16())
+}
+
+/// 单端点判定 (gemini: /v1beta/models; ollama: /api/tags): 2xx + shape 解析成功
+/// → ok (models 必有); 401|403 → auth_failed; 404|405 → absent; 其余 (连接失败/
+/// 超时/超大 body/非法 JSON/其他非 2xx) → error (detail 必有).
+fn judge_single_endpoint(
+    protocol: Protocol,
+    res: &Result<(StatusCode, Vec<u8>), String>,
+) -> ProbeOutcome {
+    let name = protocol.name();
+    match res {
+        Err(reason) => ProbeOutcome::non_ok(name, ProbeStatus::Error, reason.clone()),
+        Ok((status, body)) if status.is_success() => match parse_model_ids(protocol, body) {
+            Ok(models) => ProbeOutcome::ok(name, models),
+            Err(reason) => ProbeOutcome::non_ok(name, ProbeStatus::Error, reason),
+        },
+        Ok((status, _)) => {
+            ProbeOutcome::non_ok(name, status_probe_bucket(*status), status_detail(*status))
+        }
+    }
+}
+
+/// /v1/models 端点判定 → (openai, anthropic) 一对 outcome.
+///
+/// 两家族共用端点与 `data[].id` 解析 (parse_model_ids(OpenAI) == (Anthropic)):
+/// parse 失败 (非法 JSON / 缺 data) → 双 error; 成功后按 `classify_v1_family`
+/// 分家 — 赢家 ok (带 models), 输家 absent (detail 指明家族归属).
+fn judge_v1_pair(res: &Result<(StatusCode, Vec<u8>), String>) -> (ProbeOutcome, ProbeOutcome) {
+    let (openai, anthropic) = (Protocol::OpenAI.name(), Protocol::Anthropic.name());
+    // 两族共担同一命运 (error / auth_failed / absent) 的对称二元组构造.
+    let both = |status: ProbeStatus, detail: String| {
+        (
+            ProbeOutcome::non_ok(openai, status, detail.clone()),
+            ProbeOutcome::non_ok(anthropic, status, detail),
+        )
+    };
+    match res {
+        Err(reason) => both(ProbeStatus::Error, reason.clone()),
+        Ok((status, body)) if status.is_success() => {
+            match parse_model_ids(Protocol::OpenAI, body) {
+                Err(reason) => both(ProbeStatus::Error, reason),
+                Ok(models) => match classify_v1_family(body) {
+                    V1Family::OpenAI => (
+                        ProbeOutcome::ok(openai, models),
+                        ProbeOutcome::non_ok(
+                            anthropic,
+                            ProbeStatus::Absent,
+                            "endpoint speaks OpenAI family shape".to_string(),
+                        ),
+                    ),
+                    V1Family::Anthropic => (
+                        ProbeOutcome::non_ok(
+                            openai,
+                            ProbeStatus::Absent,
+                            "endpoint speaks Anthropic family shape".to_string(),
+                        ),
+                        ProbeOutcome::ok(anthropic, models),
+                    ),
+                },
+            }
+        }
+        Ok((status, _)) => both(status_probe_bucket(*status), status_detail(*status)),
+    }
+}
+
+/// 推荐序 (模块头部 "探测" 段): openai (ollama 双命中附 note) > anthropic >
+/// gemini (no-codec note) > ollama (同 note); 无任何 ok → (null, null).
+/// 按协议名查 ok 状态, 与 probes 的排列顺序解耦 (顺序本身是冻结的 wire 契约,
+/// 不应再成为推荐逻辑的隐式输入).
+fn recommend(probes: &[ProbeOutcome]) -> (Option<&'static str>, Option<&'static str>) {
+    let ok = |name: &str| {
+        probes
+            .iter()
+            .any(|p| p.protocol == name && p.status == ProbeStatus::Ok)
+    };
+    if ok(Protocol::OpenAI.name()) {
+        if ok(Protocol::Ollama.name()) {
+            (Some(Protocol::OpenAI.name()), Some(PROBE_NOTE_DUAL_OLLAMA))
+        } else {
+            (Some(Protocol::OpenAI.name()), None)
+        }
+    } else if ok(Protocol::Anthropic.name()) {
+        (Some(Protocol::Anthropic.name()), None)
+    } else if ok(Protocol::Gemini.name()) {
+        (Some(Protocol::Gemini.name()), Some(PROBE_NOTE_NO_CODEC))
+    } else if ok(Protocol::Ollama.name()) {
+        (Some(Protocol::Ollama.name()), Some(PROBE_NOTE_NO_CODEC))
+    } else {
+        (None, None)
+    }
+}
+
+/// 对 base_url 并行探测 4 族协议端点 (base_url 合法性已由 handler 侧校验 —
+/// 集中式预处理; 此处不做重复校验, 非法 URL 的最坏结果是全 error outcome).
+///
+/// 并行 3 个 GET (`tokio::join!`): `/v1/models` (判 openai/anthropic 两族),
+/// `/v1beta/models` (gemini), `/api/tags` (ollama). 每路复用
+/// `fetch_status_and_body` 防御 (整体超时 + 有界 body + 错误串净化 — detail
+/// 不含 api_key).
+///
+/// 永不 Err / 永不 panic (ROB-*): 探测失败是数据不是 HTTP 错误.
+pub(crate) async fn probe_provider_upstream(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+) -> ProbeResponse {
+    let headers = probe_headers(api_key);
+    // URL 先绑定再借用 (join! 的 future 存活到 .await 完成, 临时值撑不到).
+    let (v1_url, gemini_url, ollama_url) = (
+        super::helpers::build_upstream_url(base_url, "/v1/models"),
+        super::helpers::build_upstream_url(base_url, "/v1beta/models"),
+        super::helpers::build_upstream_url(base_url, "/api/tags"),
+    );
+    let (v1, gemini, ollama) = tokio::join!(
+        fetch_status_and_body(client, &v1_url, headers.clone()),
+        fetch_status_and_body(client, &gemini_url, headers.clone()),
+        fetch_status_and_body(client, &ollama_url, headers),
+    );
+    let (openai, anthropic) = judge_v1_pair(&v1);
+    let gemini = judge_single_endpoint(Protocol::Gemini, &gemini);
+    let ollama = judge_single_endpoint(Protocol::Ollama, &ollama);
+    let probes = vec![openai, anthropic, gemini, ollama];
+    let (recommended, note) = recommend(&probes);
+    ProbeResponse {
+        probes,
+        recommended,
+        note,
+    }
 }
 
 #[cfg(test)]
@@ -1184,5 +1504,360 @@ mod tests {
             strs(&["ultra", "flash"]),
             "exact-only: 只返回别名, 不 fetch (N6)"
         );
+    }
+
+    // ─── Provider 协议探测 ─────────────────────────────────────────────
+
+    /// 三端点探测 mock: (v1/models, v1beta/models, api/tags) 各挂一个
+    /// (status, body) — 全部显式挂载, 不留 mockito 未匹配的隐式行为.
+    async fn probe_upstream(
+        v1: (u16, &str),
+        v1beta: (u16, &str),
+        tags: (u16, &str),
+    ) -> mockito::ServerGuard {
+        let mut server = mockito::Server::new_async().await;
+        for (path, (status, body)) in [
+            ("/v1/models", v1),
+            ("/v1beta/models", v1beta),
+            ("/api/tags", tags),
+        ] {
+            server
+                .mock("GET", path)
+                .with_status(status as usize)
+                .with_body(body)
+                .create_async()
+                .await;
+        }
+        server
+    }
+
+    async fn probe(server: &mockito::ServerGuard, api_key: &str) -> ProbeResponse {
+        probe_provider_upstream(&reqwest::Client::new(), &server.url(), api_key).await
+    }
+
+    #[tokio::test]
+    async fn probe_openai_shape_happy() {
+        let server = probe_upstream(
+            (
+                200,
+                r#"{"object":"list","data":[{"id":"gpt-4o","object":"model","owned_by":"x"}]}"#,
+            ),
+            (404, ""),
+            (404, ""),
+        )
+        .await;
+        let resp = probe(&server, "").await;
+        let names: Vec<&str> = resp.probes.iter().map(|p| p.protocol).collect();
+        assert_eq!(names, ["openai", "anthropic", "gemini", "ollama"]);
+        let oa = &resp.probes[0];
+        assert_eq!(oa.status, ProbeStatus::Ok);
+        assert_eq!(oa.models.as_ref().unwrap(), &strs(&["gpt-4o"]));
+        assert!(oa.detail.is_none());
+        let an = &resp.probes[1];
+        assert_eq!(an.status, ProbeStatus::Absent);
+        assert_eq!(
+            an.detail.as_deref(),
+            Some("endpoint speaks OpenAI family shape")
+        );
+        assert_eq!(resp.probes[2].status, ProbeStatus::Absent, "404 → absent");
+        assert_eq!(resp.probes[3].status, ProbeStatus::Absent);
+        assert_eq!(resp.recommended, Some("openai"));
+        assert!(resp.note.is_none());
+    }
+
+    /// 判别字段分家: display_name/type 指向 Anthropic 家族 (object 字段缺席).
+    #[tokio::test]
+    async fn probe_anthropic_shape_happy() {
+        let server = probe_upstream(
+            (
+                200,
+                r#"{"data":[{"type":"model","id":"claude-3-5","display_name":"Claude 3.5"}]}"#,
+            ),
+            (404, ""),
+            (404, ""),
+        )
+        .await;
+        let resp = probe(&server, "").await;
+        let an = &resp.probes[1];
+        assert_eq!(an.status, ProbeStatus::Ok);
+        assert_eq!(an.models.as_ref().unwrap(), &strs(&["claude-3-5"]));
+        assert!(an.detail.is_none());
+        let oa = &resp.probes[0];
+        assert_eq!(oa.status, ProbeStatus::Absent);
+        assert_eq!(
+            oa.detail.as_deref(),
+            Some("endpoint speaks Anthropic family shape")
+        );
+        assert_eq!(resp.recommended, Some("anthropic"));
+        assert!(resp.note.is_none());
+    }
+
+    #[tokio::test]
+    async fn probe_gemini_happy() {
+        let server = probe_upstream(
+            (404, ""),
+            (
+                200,
+                r#"{"models":[{"name":"models/gem-1"},{"name":"models/gem-2"}]}"#,
+            ),
+            (404, ""),
+        )
+        .await;
+        let resp = probe(&server, "").await;
+        let g = &resp.probes[2];
+        assert_eq!(g.status, ProbeStatus::Ok);
+        assert_eq!(g.models.as_ref().unwrap(), &strs(&["gem-1", "gem-2"]));
+        assert_eq!(resp.recommended, Some("gemini"));
+        // note 断言用冻结文案字面量 (与 detail 的字面量断言风格统一): 断言常量
+        // 自身是同义反复, 文案漂移时恒绿, 起不到契约冻结作用.
+        assert_eq!(
+            resp.note,
+            Some(
+                "No codec for this protocol: secret redaction is unavailable, and requests hitting secrets are rejected by default (on_unsupported_protocol = fail_closed)."
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_ollama_happy() {
+        let server = probe_upstream(
+            (404, ""),
+            (404, ""),
+            (200, r#"{"models":[{"name":"llama3:latest"}]}"#),
+        )
+        .await;
+        let resp = probe(&server, "").await;
+        let o = &resp.probes[3];
+        assert_eq!(o.status, ProbeStatus::Ok);
+        assert_eq!(o.models.as_ref().unwrap(), &strs(&["llama3:latest"]));
+        assert_eq!(resp.recommended, Some("ollama"));
+        assert_eq!(
+            resp.note,
+            Some(
+                "No codec for this protocol: secret redaction is unavailable, and requests hitting secrets are rejected by default (on_unsupported_protocol = fail_closed)."
+            )
+        );
+    }
+
+    /// 双命中 (openai + ollama): 推荐 openai 并附双命中 note.
+    #[tokio::test]
+    async fn probe_openai_ollama_dual_hit_recommends_openai() {
+        let server = probe_upstream(
+            (200, r#"{"data":[{"id":"gpt-4o","object":"model"}]}"#),
+            (404, ""),
+            (200, r#"{"models":[{"name":"llama3:latest"}]}"#),
+        )
+        .await;
+        let resp = probe(&server, "").await;
+        assert_eq!(resp.probes[0].status, ProbeStatus::Ok);
+        assert_eq!(resp.probes[3].status, ProbeStatus::Ok);
+        assert_eq!(resp.recommended, Some("openai"));
+        assert_eq!(
+            resp.note,
+            Some(
+                "Ollama native endpoint also detected. The OpenAI-compatible endpoint is recommended because secret redaction requires a codec-covered protocol (OpenAI/Anthropic/Responses)."
+            )
+        );
+    }
+
+    /// /v1/models 401: openai 与 anthropic 双 auth_failed (端点共用, 鉴权同源);
+    /// 其余两族 absent → 无任何 ok → recommended null.
+    #[tokio::test]
+    async fn probe_v1_models_401_both_auth_failed() {
+        let server = probe_upstream((401, ""), (404, ""), (404, "")).await;
+        let resp = probe(&server, "").await;
+        for i in [0, 1] {
+            assert_eq!(resp.probes[i].status, ProbeStatus::AuthFailed);
+            assert_eq!(
+                resp.probes[i].detail.as_deref(),
+                Some("upstream returned 401")
+            );
+        }
+        assert_eq!(resp.recommended, None);
+        assert_eq!(resp.note, None);
+    }
+
+    /// data 无判别字段 / data 空: 默认 OpenAI 家族 (models 可为空).
+    #[tokio::test]
+    async fn probe_v1_models_no_discriminator_defaults_openai() {
+        let server = probe_upstream((200, r#"{"data":[{"id":"m1"}]}"#), (404, ""), (404, "")).await;
+        let resp = probe(&server, "").await;
+        assert_eq!(resp.probes[0].status, ProbeStatus::Ok);
+        assert_eq!(resp.probes[0].models.as_ref().unwrap(), &strs(&["m1"]));
+        assert_eq!(resp.probes[1].status, ProbeStatus::Absent);
+
+        let server = probe_upstream((200, r#"{"data":[]}"#), (404, ""), (404, "")).await;
+        let resp = probe(&server, "").await;
+        assert_eq!(
+            resp.probes[0].status,
+            ProbeStatus::Ok,
+            "data 空也是合法 shape"
+        );
+        assert_eq!(
+            resp.probes[0].models.as_ref().unwrap(),
+            &Vec::<String>::new()
+        );
+        assert_eq!(resp.probes[1].status, ProbeStatus::Absent);
+    }
+
+    /// 判别优先级: 同一条目兼有 object + display_name → object 优先 (OpenAI).
+    #[tokio::test]
+    async fn probe_v1_models_object_field_wins_over_display_name() {
+        let server = probe_upstream(
+            (
+                200,
+                r#"{"data":[{"id":"hybrid","object":"model","display_name":"Hybrid"}]}"#,
+            ),
+            (404, ""),
+            (404, ""),
+        )
+        .await;
+        let resp = probe(&server, "").await;
+        assert_eq!(resp.probes[0].status, ProbeStatus::Ok, "object 字段优先");
+        assert_eq!(resp.probes[1].status, ProbeStatus::Absent);
+    }
+
+    /// 跨条目扫描: 首条目无判别字段, 后续条目有 type → Anthropic (扫描越过
+    /// 无判别字段的条目, 与 classify_v1_family 头部声明的规则一致).
+    #[tokio::test]
+    async fn probe_v1_models_scan_skips_undiscriminated_entries() {
+        let server = probe_upstream(
+            (
+                200,
+                r#"{"data":[{"id":"opaque"},{"type":"model","id":"claude-x","display_name":"X"}]}"#,
+            ),
+            (404, ""),
+            (404, ""),
+        )
+        .await;
+        let resp = probe(&server, "").await;
+        assert_eq!(resp.probes[1].status, ProbeStatus::Ok);
+        assert_eq!(
+            resp.probes[1].models.as_ref().unwrap(),
+            &strs(&["opaque", "claude-x"])
+        );
+        assert_eq!(resp.probes[0].status, ProbeStatus::Absent);
+    }
+
+    /// 200 但非法 JSON (gemini 路径) → error (detail 含 invalid JSON).
+    #[tokio::test]
+    async fn probe_gemini_invalid_json_errors() {
+        let server = probe_upstream((404, ""), (200, "not-json{{"), (404, "")).await;
+        let resp = probe(&server, "").await;
+        assert_eq!(resp.probes[2].status, ProbeStatus::Error);
+        let detail = resp.probes[2].detail.as_deref().unwrap();
+        assert!(detail.contains("invalid JSON"), "detail: {detail}");
+        assert_eq!(resp.recommended, None);
+    }
+
+    /// 超大 body (超出 MAX_MODELS_BODY) → error, 不撑爆内存.
+    #[tokio::test]
+    async fn probe_oversized_body_errors() {
+        let huge = "x".repeat(MAX_MODELS_BODY + 1);
+        let server = probe_upstream((200, &huge), (200, &huge), (200, &huge)).await;
+        let resp = probe(&server, "").await;
+        for p in &resp.probes {
+            assert_eq!(p.status, ProbeStatus::Error);
+            assert!(
+                p.detail.as_deref().unwrap().contains("exceeds"),
+                "detail: {:?}",
+                p.detail
+            );
+        }
+        assert_eq!(resp.recommended, None);
+    }
+
+    /// 死连接 (TcpListener 收连接但永不响应): 3 路探测全部被整体超时掐断 → error,
+    /// 不挂起. 同时守卫 SEC: 响应体序列化后不含 api_key 子串 (错误串经净化).
+    #[tokio::test]
+    async fn probe_dead_upstream_times_out_without_key_leak() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // 收连接 (3 路并行) 并持有 socket 但永不响应 — 停滞上游.
+            let mut held = Vec::new();
+            while let Ok((conn, _)) = listener.accept().await {
+                held.push(conn);
+            }
+        });
+        let api_key = "sk-probe-leaky-key-9876";
+        let resp =
+            probe_provider_upstream(&reqwest::Client::new(), &format!("http://{addr}"), api_key)
+                .await;
+        for p in &resp.probes {
+            assert_eq!(p.status, ProbeStatus::Error);
+            assert!(
+                p.detail.as_deref().unwrap().contains("timeout"),
+                "detail: {:?}",
+                p.detail
+            );
+        }
+        assert_eq!(resp.recommended, None);
+        // SEC: 序列化响应不含 api_key 子串 (detail 走 upstream_error_brief 净化).
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(
+            !json.contains(api_key),
+            "probe response must not leak api_key: {json}"
+        );
+    }
+
+    /// api_key 非空时三路并发携带三种 auth header + anthropic-version
+    /// (协议未知, 不预剥离 — 见 probe_headers 注释).
+    #[tokio::test]
+    async fn probe_sends_all_auth_headers_when_keyed() {
+        let mut server = mockito::Server::new_async().await;
+        let key = "sk-probe-key";
+        let mock = server
+            .mock("GET", "/v1/models")
+            .match_header(
+                "authorization",
+                mockito::Matcher::Exact(format!("Bearer {key}")),
+            )
+            .match_header("x-api-key", key)
+            .match_header("x-goog-api-key", key)
+            .match_header("anthropic-version", super::super::auth::ANTHROPIC_VERSION)
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"m"}]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        for path in ["/v1beta/models", "/api/tags"] {
+            server
+                .mock("GET", path)
+                .with_status(404)
+                .create_async()
+                .await;
+        }
+        let resp = probe(&server, key).await;
+        assert_eq!(resp.probes[0].status, ProbeStatus::Ok);
+        mock.assert_async().await;
+    }
+
+    /// api_key 为空: 全部 auth header 跳过 (Ollama 等本地无 auth 场景),
+    /// anthropic-version 仍恒加.
+    #[tokio::test]
+    async fn probe_skips_auth_headers_when_key_empty() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/api/tags")
+            .match_header("authorization", mockito::Matcher::Missing)
+            .match_header("x-api-key", mockito::Matcher::Missing)
+            .match_header("x-goog-api-key", mockito::Matcher::Missing)
+            .match_header("anthropic-version", super::super::auth::ANTHROPIC_VERSION)
+            .with_status(200)
+            .with_body(r#"{"models":[{"name":"llama3"}]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        for path in ["/v1/models", "/v1beta/models"] {
+            server
+                .mock("GET", path)
+                .with_status(404)
+                .create_async()
+                .await;
+        }
+        let resp = probe(&server, "").await;
+        assert_eq!(resp.probes[3].status, ProbeStatus::Ok);
+        mock.assert_async().await;
     }
 }

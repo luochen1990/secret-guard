@@ -87,7 +87,7 @@ forward 路由 (`/{proto}/{name}/...`) 首段必须是 proto 简写, 由
 | `/api/sessions` [+ `/{sid}/timeline`] | 会话列表 + session-aware timeline 分页 |
 | `/api/sync` | WebUI 3s 轮询统一入口 (sidebar + timeline diff) |
 | `/api/secrets` [+ `/{id}` [+ `/decision`]] | secret CRUD + OverrideMode |
-| `/api/providers` [+ `/{id}` [+ `/decision`]] | provider CRUD + OverrideMode |
+| `/api/providers` [+ `/{id}` [+ `/decision`]] + `/probe` | provider CRUD + OverrideMode + 协议自动探测 (静态段优先于 `{id}`: POST = 探测; PUT/DELETE `/probe` = 以固定 id="probe" 适配的编辑/删除薄 wrapper, 存量 "probe" 条目由此可管理 — 新建该 id 仍在 upsert 校验层拒绝, 纯防混淆) |
 | `/api/api-keys` [+ `/{id}` [+ `/toggle`]] | API key CRUD |
 | `/api/usage/summary` | 模型用量统计汇总 (usage-stats, 定价经 models.dev 惰性拉取) |
 | `/api/me` | 当前登录用户信息 (公开, 未登录返回 `authenticated:false`; 仅 auth 启用时挂载, 单用户模式无此路由) |

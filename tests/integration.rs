@@ -3536,6 +3536,206 @@ async fn providers_api_rejects_bad_base_url() {
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 }
 
+// ─── providers probe API (POST /api/providers/probe) ─────────────────────
+
+/// 非法 base_url (同 provider validate_base_url 规则) → 400; 各形态都测一遍.
+#[tokio::test]
+async fn providers_probe_api_rejects_invalid_base_url() {
+    let upstream = spawn_mock_upstream().await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
+    let client = reqwest::Client::new();
+    for bad in ["not-a-url", "ftp://x", "http://x/", ""] {
+        let resp = client
+            .post(format!("{proxy_url}/api/providers/probe"))
+            .json(&serde_json::json!({ "base_url": bad, "api_key": "" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "base_url {bad:?} must be rejected"
+        );
+    }
+}
+
+/// id 保留字: "probe" 会阴影 PUT/DELETE /api/providers/{id} (静态段优先),
+/// 创建时必须拒绝 (validate_provider_upsert 的路由保留不变量).
+#[tokio::test]
+async fn providers_api_rejects_probe_reserved_id() {
+    let upstream = spawn_mock_upstream().await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/api/providers"))
+        .json(&serde_json::json!({
+            "id": "probe",
+            "protocol": "openai",
+            "base_url": upstream.url(),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    // 断言拒绝原因, 防其它先行的校验拦截造成假阳性通过.
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("reserved"),
+        "rejection must come from the reserved-id rule: {body}"
+    );
+}
+
+/// 端到端: OpenAI shape 上游 → 200 + 固定 4 项 probes + recommended; 响应体
+/// (raw text) 不含 api_key 子串 (SEC 红线, 双保险于单测的净化断言).
+#[tokio::test]
+async fn providers_probe_api_end_to_end_openai() {
+    let mut upstream = spawn_mock_upstream().await;
+    upstream
+        .mock("GET", "/v1/models")
+        .with_status(200)
+        .with_body(r#"{"object":"list","data":[{"id":"gpt-4o","object":"model"}]}"#)
+        .expect(1)
+        .create_async()
+        .await;
+    for path in ["/v1beta/models", "/api/tags"] {
+        upstream
+            .mock("GET", path)
+            .with_status(404)
+            .create_async()
+            .await;
+    }
+    let proxy_url = spawn_proxy(&upstream.url()).await;
+    let api_key = "sk-integration-leaky";
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/api/providers/probe"))
+        .json(&serde_json::json!({ "base_url": upstream.url(), "api_key": api_key }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let raw = resp.text().await.unwrap();
+    assert!(
+        !raw.contains(api_key),
+        "probe response must not leak api_key: {raw}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let names: Vec<&str> = body["probes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["protocol"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["openai", "anthropic", "gemini", "ollama"]);
+    assert_eq!(body["probes"][0]["status"], "ok");
+    assert_eq!(body["probes"][0]["models"][0], "gpt-4o");
+    assert_eq!(body["probes"][1]["status"], "absent");
+    assert_eq!(body["probes"][2]["status"], "absent");
+    assert_eq!(body["probes"][3]["status"], "absent");
+    assert_eq!(body["recommended"], "openai");
+    assert!(body["note"].is_null());
+}
+
+/// 探测全失败 (上游三个端点全部 500) 仍是 200 — 失败是数据不是 HTTP 错误,
+/// recommended 为 null.
+#[tokio::test]
+async fn providers_probe_api_all_failures_still_200() {
+    let mut upstream = spawn_mock_upstream().await;
+    for path in ["/v1/models", "/v1beta/models", "/api/tags"] {
+        upstream
+            .mock("GET", path)
+            .with_status(500)
+            .create_async()
+            .await;
+    }
+    let proxy_url = spawn_proxy(&upstream.url()).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/api/providers/probe"))
+        .json(&serde_json::json!({ "base_url": upstream.url() }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    for probe in body["probes"].as_array().unwrap() {
+        assert_eq!(probe["status"], "error");
+        assert!(probe["detail"].is_string(), "error 必有 detail");
+    }
+    assert!(body["recommended"].is_null());
+    assert!(body["note"].is_null());
+}
+
+/// 路由补齐 (PUT/DELETE /api/providers/probe): 存量 id="probe" 条目可编辑可删除.
+///
+/// 存量条目在 AppState 构造期直插 (dynamic 层, 绕过 API — 模拟保留字校验上线
+/// 前创建的条目, 静态路由阴影 {id} 段曾使其不可管理/405)。补齐后 PUT 改
+/// base_url 生效, DELETE 真删除 (dynamic-only 无 static 冲突)。
+#[tokio::test]
+async fn providers_probe_api_legacy_probe_id_editable_and_deletable() {
+    // 初值 base_url 用哑地址即可: 本测试不发转发请求, PUT 第一步就覆盖它.
+    let upstream_b = spawn_mock_upstream().await;
+    let legacy = openai_provider("probe", "http://127.0.0.1:1");
+    let proxy_url = spawn_proxy_full(
+        vec![legacy],
+        reqwest::Client::new(),
+        ConversationDag::new(64, 500, 1),
+        test_secret_table(),
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    // PUT (改 base_url; 其余 Direct 字段走回填) → 200, effective base_url 已切换.
+    let resp = client
+        .put(format!("{proxy_url}/api/providers/probe"))
+        .json(&serde_json::json!({ "base_url": upstream_b.url() }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["id"], "probe");
+    assert_eq!(body["base_url"], upstream_b.url());
+
+    // DELETE → 204; 列表再无该条目.
+    let resp = client
+        .delete(format!("{proxy_url}/api/providers/probe"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+    let resp = client
+        .get(format!("{proxy_url}/api/providers"))
+        .send()
+        .await
+        .unwrap();
+    let list: serde_json::Value = resp.json().await.unwrap();
+    let ids: Vec<&str> = list["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["id"].as_str().unwrap())
+        .collect();
+    assert!(!ids.contains(&"probe"), "probe entry must be gone: {ids:?}");
+}
+
+/// PATCH decision 对存量 id="probe" 的可达性 (matchit 回溯语义 pin).
+///
+/// 静态路由 `/api/providers/probe` 只有 2 段; 3 段的 `/api/providers/probe/decision`
+/// 依赖 matchit 0.8 的回溯 (沿静态段下降遇死端后回到 `{id}` 参数分支) 匹配到
+/// `/api/providers/{id}/decision`。matchit 0.7 曾移除回溯, 该语义历史上有过翻转 —
+/// 本测试把它钉死在契约层: 未来 axum/matchit 升级若再变语义, 这里红灯而非静默 404
+/// (存量 id="probe" 条目的 enable/disable 将不可用)。
+#[tokio::test]
+async fn providers_probe_static_probe_id_decision_reachable() {
+    let s = openai_provider("probe", "http://127.0.0.1:1");
+    let proxy_url = spawn_with_static_and_dynamic(vec![s], vec![]).await;
+    let resp = reqwest::Client::new()
+        .patch(format!("{proxy_url}/api/providers/probe/decision"))
+        .json(&serde_json::json!({ "mode": "disabled" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+}
+
 // ─── redact / restore flow ─────────────────────────────────────────────────
 
 #[tokio::test]
