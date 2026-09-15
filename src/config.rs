@@ -1099,6 +1099,17 @@ impl<T: DynamicEntry> DynamicTable<T> {
         self.static_entries.read().iter().any(|e| e.id() == id)
     }
 
+    /// 直接查 dynamic 层的原始条目 (不脱敏, 不与 static 合并). 供 update handler
+    /// 保留旧值时区分来源 (#157): dynamic 自有值可安全回填进 override; static 来源
+    /// 的已 resolve 值绝不回填 (否则明文落盘 state.toml). 不存在 → None.
+    pub fn get_dynamic(&self, id: &str) -> Option<T> {
+        self.dynamic_entries
+            .read()
+            .iter()
+            .find(|e| e.id() == id)
+            .cloned()
+    }
+
     /// 所有被 decision=Disabled 完全排除的 static 项 (含完整 entry).
     ///
     /// 用途: 转发链对 "disabled secret 明文放行" 的按请求 WARN (#161) — 调用方拿到
