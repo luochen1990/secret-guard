@@ -144,10 +144,6 @@ pub(crate) async fn same_proto_forward(
         model_rewrite.as_deref(),
     )?;
 
-    // Responses 协议 + IR 路径 + 流式: 当前 codec 的 read_response_events 未实现
-    // (Responses 流式 SSE 事件翻译是 MVP 范围外). 若放行会静默产生空流.
-    // 显式返回 501, 与跨协议流式一致. 触发条件 = redact **或 model 改写**任一
-    // 迫使请求走 IR 路径 (#183 D5 — 仅改写也在此拦截).
     // 3. 快照真实 messages (redact 前) 给 DAG — 仅用于内容寻址 / parent 增量计算
     //    (req_delta 切片). WebUI 读的是 redact 后的 req_body_raw (LLM 视角), 永不
     //    触碰这份真实快照 (见 src/web/AGENTS.md "req_delta_messages 实现" 段).

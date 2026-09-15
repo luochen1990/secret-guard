@@ -390,7 +390,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 ### RED-7 流式可逆性 (streaming restorability)
 
-**陈述**: `StreamingRestorer` 在任意 chunk 切分下保证 round-trip identity — `concat(push(c_1..n), flush().1)` 严格等于 `content.replace(mock, real)`. UTF-8 安全.
+**陈述**: `StreamingRestorer` 在任意 chunk 切分下保证 round-trip identity — `concat(push(c_1..n), flush().1)` 严格等于 `content.replace(mock, real)`. UTF-8 安全. 同协议路径 (StreamTranslate 同协议 restore 模式) 与跨协议路径 (StreamTranslate 跨协议模式注入 hook, 2026-09-15 起接入 dispatch) 均适用.
 
 **Properties**:
 - `prop_streaming_restorer_round_trip`: 对任意 chunk_size (1..N), round-trip identity 成立. ✅

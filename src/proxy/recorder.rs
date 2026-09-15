@@ -430,25 +430,6 @@ pub(super) fn warn_if_protocol_mismatch(
     }
 }
 
-/// #158: 响应 parse 失败 fallback 时的 mock-not-restored WARN (共享 helper).
-///
-/// 本请求做过 redact (map 非空) 且响应走 parse 失败 fallback (原样透传, 无 restore)
-/// 时, body 中的 mock 不会被还原 — 客户端拿到假 secret. 记一条 WARN 让该逃逸
-/// 可感知 (行为不变: 仍原样透传, best-effort 原则).
-///
-/// 调用方: fan_out_buffered_ir 的两个 fallback 分支 (reader 拒绝 / 非 JSON) +
-/// cross_proto 非流式翻译的对称分支 (#158 补全, AGENTS.md "后续工作" 登记项).
-pub(super) fn warn_mock_not_restored(record_id: Uuid, redaction_map: &RedactionMap, detail: &str) {
-    if !redaction_map.is_empty() {
-        warn!(
-            %record_id,
-            detail,
-            "response parse failed with redactions in flight; \
-             mock not restored; client will see mock values"
-        );
-    }
-}
-
 /// 每笔转发完成 (record 最终态写入后) 打一行 INFO 摘要 (#160: 命令行排障).
 ///
 /// 形如 `forward method=POST path=/o/p1/v1/chat/completions status=200
