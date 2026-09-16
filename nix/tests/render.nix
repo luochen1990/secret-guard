@@ -2,15 +2,16 @@
 #
 # 覆盖:
 #   - 结构 round-trip: 生成物是合法 TOML (fromTOML), 字段名/嵌套与 src serde
-#     定义吻合 (provider sum type / routes / auth / secrets.entries / usage
-#     定价覆盖段)
+#     定义吻合 (provider sum type / routes / auth (含 secure_cookie) /
+#     secrets.entries / redact.redacted_headers / usage 定价覆盖段)
 #   - 确定性: providers 按 id 字典序输出
 #   - 转义: 字符串值经 toJSON, 引号/反斜杠 round-trip 不损
 #   - 路径直通: apiKeyFile / valueFile / clientSecretFile / keyFile 原样写入
 #     (无 LoadCredential 派生 — 与 nixos 侧原型的语义差异)
 #   - 布局: 文件单换行结尾, 头部注释存在
 #   - fail-fast: sum type 违规 / base_url 卫生 / id 卫生 / auth 互斥 /
-#     usage 键卫生与负价 / pricingUrl 形状 / 悬空 target / 环检测 全部 eval 期 throw
+#     usage 键卫生与负价 / pricingUrl 形状 / 悬空 target / 环检测 /
+#     redactedHeaders 空白条目 全部 eval 期 throw
 #
 # 模块接线 (选项 → configFile 自动生成) 的冒烟在 nix/tests/module-eval.nix,
 # 本文件只测 render 纯函数. 语义断言 (priority null=禁用/并列列表序) 属上游
@@ -57,8 +58,15 @@ let
         valueFile = "/run/secrets/llm__k_api_key";
       }
     ];
+    # 非字母序 + 大小写混合 → 验证输出按字典序 (确定性); 归一化 (trim+lowercase)
+    # 是上游启动行为, render 层原样写出
+    redactedHeaders = [
+      "z-vault-token"
+      "X-My-Service-Key"
+    ];
     auth = {
       enabled = true;
+      secureCookie = true;
       oidc = {
         issuerUrl = "https://idp.example.com/v1/";
         clientId = "test-client";
@@ -158,6 +166,44 @@ let
           "a.example.com"
           "z.lan"
         ];
+    }
+    {
+      name = "SEC-4: redactedHeaders 非空渲染且按字典序 (确定性, 原样不归一化)";
+      ok =
+        parsed.redact.redacted_headers == [
+          "X-My-Service-Key"
+          "z-vault-token"
+        ];
+    }
+    {
+      name = "auth: secureCookie=true 渲染 secure_cookie 行 ([auth] 段内)";
+      ok = parsed.auth.secure_cookie == true;
+    }
+    {
+      name = "SEC-4: 空白 redactedHeaders 条目 eval 期 throw (笔误 fail-fast)";
+      ok = renderFails {
+        redactedHeaders = [
+          "x-ok"
+          "  "
+        ];
+      };
+    }
+    {
+      name = "redact 默认: 未传 redactedHeaders 时不渲染 [redact] 段";
+      ok =
+        let
+          t = builtins.fromTOML (render (builtins.removeAttrs baseArgs [ "redactedHeaders" ]));
+        in
+        !(t ? redact);
+    }
+    {
+      name = "auth 默认: secureCookie 缺省 (or false 回退) 时无 secure_cookie 键";
+      ok =
+        let
+          a = builtins.removeAttrs baseArgs.auth [ "secureCookie" ];
+          t = builtins.fromTOML (render (baseArgs // { auth = a; }));
+        in
+        t.auth.enabled == true && !(t.auth ? secure_cookie);
     }
     {
       # fromTOML 保留文档序 — 消费者 (上游 Rust serde) 看到的正是这个序

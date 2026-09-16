@@ -707,7 +707,7 @@ CI 已升级为阻塞门禁: 当前 `deny.toml` allow 列表已实测覆盖全�
 
 ## 部署
 
-NixOS 部署两代姿势: 结构化选项 (`services.secret-guard` 的 providers/secrets.entries/auth,
+NixOS 部署两代姿势: 结构化选项 (`services.secret-guard` 的 providers/secrets.entries/redact/auth,
 未显式设 configFile 时经 `nix/render.nix` 自动生成 toml, eval 期校验 fail-fast) + 手写
 configFile (escape hatch, 互斥). 凭据注入 (LoadCredential / sops 直接路径) 与 secret
 批量注入方案见 **`docs/deployment-nixos.md`**.
@@ -885,10 +885,11 @@ CI runner VM 未预装 treefmt 时 check-fmt 降级 rust-only (见 justfile).
   lowercase, 空串跳过) 后按 lowercase header 名**精确匹配**, 并集生效; 默认空 =
   行为不变。注意精确匹配非子串匹配 (`x-my-key` 不波及 `x-my-key-v2`)。
 - **session cookie Secure flag 需手动配置 (`secure_cookie`, 无自动推断)**: HTTPS
-  反代部署需手动设 `[auth] secure_cookie = true`, 两个缺口: ① 无 `X-Forwarded-Proto`
-  动态推断; ② NixOS 结构化选项 (`services.secret-guard.auth.*`) 未暴露该字段, 须用
-  `configFile` escape hatch (见 `docs/deployment-nixos.md` "HTTPS 反向代理" 段).
-  忘设的缓解 = 反代 HTTP→HTTPS 301 重定向.
+  反代部署需手动设 `[auth] secure_cookie = true` (NixOS 结构化选项
+  `services.secret-guard.auth.secureCookie`, 2026-09-16 已暴露 — 此前须 configFile
+  escape hatch). 残余缺口: 无 `X-Forwarded-Proto` 动态推断 (见
+  `docs/deployment-nixos.md` "HTTPS 反向代理" 段). 忘设的缓解 = 反代 HTTP→HTTPS
+  301 重定向.
 - **DAG 孤儿节点降级**: parent 被 LRU 淘汰后, child 的 `full_request_messages` 返回 None
   (timeline 降级展示, 不 panic). 显式孤儿标记 (CDAG-7) 尚未实现.
 - **static 基线下 PUT 空串 api_key 无法清空 key (#157 已知限制)**: dynamic override 的

@@ -54,8 +54,11 @@ let
           valueFile = "/run/secrets/llm__k_api_key";
         }
       ];
+      # SEC-4 + cookie 旋钮的 e2e 镜像链 (assert-toml 断言渲染形态)
+      redact.redactedHeaders = [ "x-my-service-key" ];
       auth = {
         enable = true;
+        secureCookie = true;
         oidc = {
           issuerUrl = "https://idp.example.com/v1/";
           clientId = "test-client";
@@ -190,6 +193,21 @@ let
     ])
   );
 
+  # redact (redactedHeaders) 同型: 不计入 structuredUsed 但手写 configFile 下
+  # 脱敏名单会无声丢失 — 不带 providers 使 throw 只能源于 redactUsed.
+  redactMutualExclusionFails = fails (
+    unitOf (sgEv [
+      {
+        nixpkgs.hostPlatform = system;
+        services.secret-guard = {
+          enable = true;
+          configFile = "/etc/secret-guard.toml";
+          redact.redactedHeaders = [ "x-my-service-key" ];
+        };
+      }
+    ])
+  );
+
   # 手写 configFile (escape hatch): 原样透传 (resolvedConfigFile = 用户路径, 非 store render)
   handWritten = sgEv [
     {
@@ -223,6 +241,10 @@ let
     {
       name = "configFile 互斥: 显式 + upstreamTimeouts 偏离 → eval throw (防设置无声丢失)";
       ok = timeoutsMutualExclusionFails;
+    }
+    {
+      name = "configFile 互斥: 显式 + redact.redactedHeaders → eval throw (防脱敏名单无声丢失)";
+      ok = redactMutualExclusionFails;
     }
     {
       name = "双缺: 无 configFile 无结构化 → eval throw";

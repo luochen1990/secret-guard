@@ -54,6 +54,9 @@ if mode == "minimal":
     assert e["id"] == "llm__k_api_key" and e["category"] == "apikey"
     assert e["value_file"] == "/run/secrets/llm__k_api_key"
 
+    rd = cfg["redact"]
+    assert rd["redacted_headers"] == ["x-my-service-key"]  # SEC-4 名单渲染
+
     s = cfg["server"]
     assert s["host"] == "127.0.0.1" and s["port"] == 18787
     # 超时字段整组不渲染 (upstreamTimeouts 全默认 → serde default 兜底, 回归 #175)
@@ -64,6 +67,7 @@ if mode == "minimal":
 
     a = cfg["auth"]
     assert a["enabled"] is True
+    assert a["secure_cookie"] is True  # auth.secureCookie = true → 渲染
     o = a["oidc"]
     assert o["issuer_url"] == "https://idp.example.com/v1/"
     assert o["client_id"] == "test-client"
@@ -102,11 +106,12 @@ elif mode == "inline":
         and rt["target"] == "b-upstream"
         and rt["priority"] == 100
     )
-    # 全默认段不渲染 (module 层 usageUsed/authUsed 判定 → serde default 兜底):
-    # 锁定 "nix options defaults ↔ usageDefaults 镜像 ↔ render 跳过" 的端到端一致
-    # 性 — 任一侧默认值漂移都会让本断言失败 (usage/auth 段出现即漂移)
+    # 全默认段不渲染 (module 层 usageUsed/authUsed/redactUsed 判定 → serde default
+    # 兜底): 锁定 "nix options defaults ↔ 默认镜像 ↔ render 跳过" 的端到端一致
+    # 性 — 任一侧默认值漂移都会让本断言失败 (usage/auth/redact 段出现即漂移)
     assert "usage" not in cfg
     assert "auth" not in cfg
+    assert "redact" not in cfg
 elif mode == "timeouts":
     assert [p["id"] for p in cfg["providers"]] == ["b-upstream"], cfg["providers"]
     s = cfg["server"]
@@ -122,6 +127,7 @@ elif mode == "timeouts":
     assert s["upstream_stream_idle_timeout_secs"] == 120
     # 其余段不受超时调参影响
     assert "usage" not in cfg and "auth" not in cfg and "secrets" not in cfg
+    assert "redact" not in cfg
 else:
     raise SystemExit(f"unknown mode: {mode}")
 

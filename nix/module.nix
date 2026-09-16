@@ -1,12 +1,12 @@
 # NixOS module: services.secret-guard
 #
 # 职责: 把 secret-guard 二进制装成 systemd service, 并提供两代配置姿势:
-#   1. 结构化选项 (推荐): providers / secrets.entries / auth / usage /
-#      upstreamTimeouts — 未显式设 configFile 时自动经 ./render.nix 生成
+#   1. 结构化选项 (推荐): providers / secrets.entries / redact / auth / usage /
+#      upstreamTimeouts / allowedDomains — 未显式设 configFile 时自动经 ./render.nix 生成
 #      secret-guard.toml (eval 期校验内置, 字段名与 src serde schema 同步
 #      契约见 render.nix 文件头);
 #   2. 手写 toml (escape hatch): 显式设 configFile 完全接管, 适配生成器覆盖不了
-#      的字段 (redact 段调参等).
+#      的字段 ([redact] 三降级开关 / global_mock_prefix 等调参).
 #   两代互斥 (同设 throw), 双缺也 throw (保留历史必填语义的兜底).
 #
 # 关键设计:
@@ -30,9 +30,16 @@
 let
   cfg = config.services.secret-guard;
 
-  # auth 段是否被使用 (三项任一非默认). apiKeys/oidc 在 enable=false 时也可配 —
-  # 上游"只认证, 不隔离"哲学: key 池无条件加载.
-  authUsed = cfg.auth.enable || cfg.auth.oidc != null || cfg.auth.apiKeys != [ ];
+  # auth 段是否被使用 (四项任一非默认). apiKeys/oidc 在 enable=false 时也可配 —
+  # 上游"只认证, 不隔离"哲学: key 池无条件加载. secureCookie 同理可先行配置
+  # (仅影响 OIDC session cookie, enable=false 时无行为但配置合法).
+  authUsed =
+    cfg.auth.enable || cfg.auth.oidc != null || cfg.auth.apiKeys != [ ] || cfg.auth.secureCookie;
+
+  # [redact] 段是否被使用 (redactedHeaders 非空). 不参与 structuredUsed: 单设
+  # header 名单而无 provider/secrets/auth/usage 仍是"缺配置" — 名单只是脱敏调参,
+  # 不构成网关有内容可跑的配置存在性 (与 upstreamTimeouts 同理).
+  redactUsed = cfg.redact.redactedHeaders != [ ];
 
   # usage 段的 serde 默认值 (src/config.rs UsageConfig::default 的 nix 镜像,
   # 改上游默认时同步). 用途: ① 判定 usage 是否被使用 (深比较); ② option default
@@ -83,6 +90,7 @@ let
       {
         enabled = cfg.auth.enable;
         inherit (cfg.auth) oidc apiKeys;
+        secureCookie = cfg.auth.secureCookie;
       }
     else
       null;
@@ -98,6 +106,7 @@ let
         ;
       upstreamTimeouts = timeoutsArg;
       secretsEntries = cfg.secrets.entries;
+      redactedHeaders = cfg.redact.redactedHeaders;
       auth = authArg;
       usage = usageArg;
     }
@@ -106,11 +115,12 @@ let
   # configFile 三态: 显式路径 (手写接管) / 结构化自动 render / 双缺 throw.
   # 显式 + 结构化同设 → throw (互斥): 手写会静默胜出, 几乎肯定是迁移残留.
   # 互斥守卫涵盖 upstreamTimeouts (虽不计入 structuredUsed): 手写 configFile
-  # 下超时设置会无声丢失, 与 "显式 + usage 偏离" 同属迁移残留形态.
+  # 下超时设置会无声丢失, 与 "显式 + usage 偏离" 同属迁移残留形态. redact
+  # (redactedHeaders) 同理 — 手写接管下脱敏名单会无声丢失.
   resolvedConfigFile =
     if cfg.configFile != null then
-      lib.throwIf (structuredUsed || timeoutsUsed || cfg.allowedDomains != [ ])
-        "services.secret-guard: configFile 与结构化选项 (providers/secrets.entries/auth/usage/upstreamTimeouts/allowedDomains) 互斥, 二选一 — 手写 toml 是完全接管, 与自动 render 会静默竞争"
+      lib.throwIf (structuredUsed || timeoutsUsed || redactUsed || cfg.allowedDomains != [ ])
+        "services.secret-guard: configFile 与结构化选项 (providers/secrets.entries/redact/auth/usage/upstreamTimeouts/allowedDomains) 互斥, 二选一 — 手写 toml 是完全接管, 与自动 render 会静默竞争"
         cfg.configFile
     else if structuredUsed then
       renderedConfig
@@ -167,8 +177,9 @@ in
       description = ''
         指向手写 `secret-guard.toml` (声明式 static 配置) — **escape hatch, 完全接管**.
 
-        与结构化选项 (providers / secrets.entries / auth / usage / upstreamTimeouts)
-        互斥, 同设会在 eval 期 throw; 两者都不设也 throw. 未设此选项且结构化选项有内容时,
+        与结构化选项 (providers / secrets.entries / redact / auth / usage /
+        upstreamTimeouts / allowedDomains) 互斥, 同设会在 eval 期 throw; 两者都
+        不设也 throw. 未设此选项且结构化选项有内容时,
         自动经 ./render.nix 生成 toml (结果暴露在 `services.secret-guard.resolvedConfigFile`).
 
         手写场景推荐 `pkgs.writeText` 生成纯文本 toml (可进 nix store, 调试可直接
@@ -380,6 +391,20 @@ in
       };
     };
 
+    redact = {
+      redactedHeaders = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        description = ''
+          自定义敏感 header 名单 ([redact] redacted_headers, SEC-4): 追加进 WebUI
+          record 脱敏名单的 header 名, 与硬编码黑名单并集. 上游启动时对条目
+          trim + lowercase 归一化后按名**精确匹配** (非子串: 配 x-my-key 不波及
+          x-my-key-v2), 仅影响 record 脱敏不影响转发字节. 空 (默认) = 仅硬编码
+          黑名单, 行为不变. 空白条目在 eval 期 fail-fast (笔误).
+        '';
+      };
+    };
+
     auth = {
       enable = lib.mkOption {
         type = lib.types.bool;
@@ -439,6 +464,18 @@ in
         );
         default = [ ];
         description = "预填 SDK api key 列表 ([[auth.api_keys]] 段, 上游启动时 hash 后注入 key 池).";
+      };
+
+      secureCookie = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          session cookie 是否带 Secure flag ([auth] secure_cookie). 默认 false —
+          本地 HTTP 开发必须 false (true 时浏览器不回传 cookie, OIDC 无法登录).
+          经反向代理以 HTTPS 暴露 secret-guard 时应设 true (见
+          docs/deployment-nixos.md "HTTPS 反向代理" 段). 仅 true 时渲染进 toml
+          (false 是上游 serde default).
+        '';
       };
     };
 

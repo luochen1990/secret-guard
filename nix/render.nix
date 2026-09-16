@@ -16,7 +16,10 @@
 #     形态 value_file, 不支持内联 value)
 #   - AuthConfig (src/auth/mod.rs): enabled + oidc{issuer_url / client_id /
 #     client_secret_file? / redirect_url?} + api_keys[]{label / key? / key_file?}
-#     (secure_cookie 不经渲染器 — 结构化选项未暴露, 用 configFile escape hatch)
+#     + secure_cookie (secureCookie, 仅 true 渲染 — false 是 serde default)
+#   - RedactConfig (src/config.rs): redacted_headers (redactedHeaders, 非空才
+#     渲染 [redact] 段; 条目空白 fail-fast — 上游 trim+lowercase 归一化后
+#     精确匹配, 与硬编码黑名单并集, SEC-4)
 #   - UsageConfig (src/config.rs): enabled / retention_days / pricing_url /
 #     pricing_refresh_secs / pricing_override{model → input / output /
 #     cache_read? / cache_write?} (cache 两维省略 = serde None → 上游回退
@@ -65,6 +68,10 @@
   allowedDomains ? [ ],
   # redact 段 ([[secrets.entries]]): [{ id, category ? "apikey", valueFile }]
   secretsEntries ? [ ],
+  # [redact] redacted_headers (SEC-4 自定义敏感 header 名单): [] = 不渲染段
+  # (serde default 空); 非空 = 渲染 [redact] 段, 按字典序保确定性 (上游匹配是
+  # 集合语义, 顺序无关; 空白条目 fail-fast)
+  redactedHeaders ? [ ],
   # null = 跳过 [usage] 段; 否则 { enable, retentionDays, pricingUrl,
   # pricingRefreshSecs, pricingOverride ? {} } (见上方 schema)
   usage ? null,
@@ -298,10 +305,15 @@ let
     else
       lib.concatStringsSep "\n\n" (
         [
-          (lib.concatStringsSep "\n" [
-            "[auth]"
-            "enabled = ${lib.boolToString a.enabled}"
-          ])
+          (lib.concatStringsSep "\n" (
+            [
+              "[auth]"
+              "enabled = ${lib.boolToString a.enabled}"
+            ]
+            # secure_cookie 仅 true 渲染 (false 是 serde default; HTTPS 反代部署
+            # 用, 本地 HTTP dev 必须保持 false — 浏览器不回传带 Secure 的 cookie)
+            ++ lib.optional (a.secureCookie or false) "secure_cookie = true"
+          ))
         ]
         ++ lib.optional ((a.oidc or null) != null) (renderOidc a.oidc)
         ++ map renderApiKey (a.apiKeys or [ ])
@@ -394,6 +406,21 @@ let
     ++ map renderSecretEntry secretsEntries
   );
 
+  # [redact] redacted_headers (SEC-4): 非空才渲染 (空 = serde default 兜底 =
+  # 仅硬编码黑名单). 空白条目 fail-fast — 上游 trim 后为空的条目只会 WARN 跳过,
+  # 声明式配置中它几乎肯定是笔误, eval 期拦截比运行期 WARN 更早暴露.
+  # 字典序渲染保确定性 (上游匹配是集合语义, 顺序无影响; 重复条目无害 —
+  # 并集匹配下无数据损失, 与 secrets id first-wins 不同性质, 故不拦).
+  blankHeaders = lib.filter (h: lib.trim h == "") redactedHeaders;
+
+  redactSection = lib.concatStringsSep "\n" ([
+    "[redact]"
+    "# 自定义敏感 header 名单 (services.secret-guard.redact.redactedHeaders, SEC-4):"
+    "# 启动时 trim+lowercase 归一化后按名精确匹配, 与硬编码黑名单并集, 仅影响"
+    "# WebUI record 脱敏, 不影响转发字节."
+    "redacted_headers = [${lib.concatMapStringsSep ", " q (lib.sort (a: b: a < b) redactedHeaders)}]"
+  ]);
+
   # [server] 恒写 host/port (实际由 ExecStart --host/--port 参数覆盖, 此处仅作
   # fallback/调试参考); 超时四项仅在 upstreamTimeouts 非 null (任一字段偏离
   # serde 默认, module 层深比较判定) 时全量渲染, records_capacity 仍由上游
@@ -469,6 +496,7 @@ let
       [ header ]
       ++ map (id: renderProvider id providers.${id}) providerIds
       ++ lib.optional (secretsEntries != [ ]) secretsSection
+      ++ lib.optional (redactedHeaders != [ ]) redactSection
       ++ [ serverSection ]
       ++ lib.optional (auth != null) (renderAuth auth)
       ++ lib.optional (usage != null) (renderUsage usage)
@@ -476,8 +504,8 @@ let
     + "\n";
 in
 # 校验链 (全部在 eval 期强制): id 卫生 → 重复 secret id → 悬空 target → 环 →
-# 语法 round-trip. 逐 provider 的 sum type fail-fast 与 auth 重复 label 检查在
-# result 被 fromTOML 强制时触发.
+# 空白 redacted_headers → 语法 round-trip. 逐 provider 的 sum type fail-fast
+# 与 auth 重复 label 检查在 result 被 fromTOML 强制时触发.
 lib.throwIf (badIds != [ ])
   "secret-guard render: provider id 非法 (须 1..=64, 首字符字母数字, 其余 [A-Za-z0-9_-]): ${toString badIds}"
   (
@@ -489,7 +517,11 @@ lib.throwIf (badIds != [ ])
           (
             lib.throwIf (cyclicId != null)
               "secret-guard render: provider 路由成环, 沿启用路由边回到 '${cyclicId}' (禁用路由不构成边)"
-              (builtins.seq (builtins.fromTOML result) result)
+              (
+                lib.throwIf (blankHeaders != [ ])
+                  "secret-guard render: redactedHeaders 空白条目无意义 (上游归一化时 WARN 跳过, 几乎肯定是笔误): ${toString blankHeaders}"
+                  (builtins.seq (builtins.fromTOML result) result)
+              )
           )
       )
   )

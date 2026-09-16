@@ -6,8 +6,9 @@
 
 ## 姿势 0: 结构化选项 + 自动 render (推荐)
 
-`services.secret-guard` 的结构化选项 (`providers` / `secrets.entries` / `auth` / `usage` /
-`upstreamTimeouts`) 在未显式设 `configFile` 时自动生成 `secret-guard.toml` (渲染 SSOT:
+`services.secret-guard` 的结构化选项 (`providers` / `secrets.entries` / `redact` /
+`auth` / `usage` / `upstreamTimeouts`) 在未显式设 `configFile` 时自动生成
+`secret-guard.toml` (渲染 SSOT:
 `nix/render.nix`, 字段校验 — sum type / base_url 卫生 / 路由悬空与环检测 — 全部 eval 期
 fail-fast, 配错在 `nixos-rebuild` 时即报错而非部署后 crash-loop). 生成物暴露在只读选项
 `services.secret-guard.resolvedConfigFile`, 调试可直接
@@ -71,7 +72,8 @@ fail-fast, 配错在 `nixos-rebuild` 时即报错而非部署后 crash-loop). �
 
 **configFile 互斥**: 显式设 `configFile` (见姿势 1/2) 与结构化选项**不能同设** (eval 期
 throw, 手写是"完全接管", 同设会静默竞争); 两者都不设也 throw. 手写 toml 仍是 escape hatch —
-结构化选项覆盖不了的字段 (如 `[redact]` 段调参、secret entry 的 `name`/`mock_strategy`)
+结构化选项覆盖不了的字段 (如 `[redact]` 三降级开关 / `global_mock_prefix` 等调参、
+secret entry 的 `name`/`mock_strategy`)
 走此通道.
 
 ## 姿势 1: sops.secrets + systemd LoadCredential (手写 configFile)
@@ -138,11 +140,10 @@ enabled = true
 secure_cookie = true
 ```
 
-> NixOS 结构化选项 (`services.secret-guard.auth.*`) 暂未暴露此字段 — 用
-> `configFile` escape hatch 手写 toml (与结构化选项互斥, 见 "configFile 互斥" 段),
-> 或暂以反代 HTTP→HTTPS 301 重定向 (nginx `return 301 https://$host$request_uri`)
-> 缓解: 让浏览器无法通过 HTTP 访问 origin. 从 `X-Forwarded-Proto` header 动态推断
-> 仍是后续工作.
+> NixOS 结构化选项形态: `services.secret-guard.auth.secureCookie = true` (与
+> 手写 configFile 互斥, 见 "configFile 互斥" 段). 无 `X-Forwarded-Proto` 动态推断,
+> 从 header 自动判定仍是后续工作; 忘设的缓解 = 反代 HTTP→HTTPS 301 重定向
+> (nginx `return 301 https://$host$request_uri`): 让浏览器无法通过 HTTP 访问 origin.
 
 **Host guard 推荐姿势 (SEC-7)**: 反向代理**显式保留原始域名 Host** 并在
 secret-guard 声明信任该域名 (NixOS 选项 `services.secret-guard.allowedDomains`,
