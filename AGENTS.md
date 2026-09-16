@@ -510,7 +510,10 @@ nix develop --impure      # 进入 devShell
 #     check-contracts (contracts.md property 落地标注 lint, #144).
 just check
 
-# 一键 check 含覆盖率插桩 (CI 用)
+# 一键复现 CI P0 门禁全链 (check-features + check 主链 + file-size; "本地全绿 ⇒ CI 必绿" 的锚)
+just ci-merge
+
+# check 含覆盖率插桩 (P2 ci-periodic 档内容; 本地按需)
 just check --coverage
 
 # 覆盖率报告 (HTML 写到 coverage/html/, 需在 devShell 内)
@@ -537,21 +540,24 @@ cargo run -- run --port 18787
 
 ### CI (Forgejo Actions)
 
-CI 配置在 `.forgejo/workflows/ci.yml`, 触发条件 `push` + `pull_request` +
-`workflow_dispatch`. 跳过/去重机制: 事件去重 (push 仅 master, PR 总是跑 — draft/WIP PR
-除外, 见 WIP 门禁) + 内容去重 (skip-if-passed, ff-merge 后同 SHA 不重跑) + PR 并发去旧
-(concurrency 取消同 PR 旧 run). WIP 门禁 (#204): draft PR (title 带 WIP 前缀) 不触发
-CI, 去 WIP 前缀时经 `edited` 事件自动补跑 (机制见 docs/ci.md "WIP 门禁").
-`check` job 测试集只跑一次, 顺序为
-lock 守卫 → checkout → diff 报告 (PR, 非阻塞) → consistency-check → check+coverage
-(含 doc 门禁 + --locked + typos + deny-offline + check-contracts 契约标注 lint, 阻塞) →
-coverage-gate → bench (非阻塞) →
-file-size → WebUI (非阻塞) → cargo audit (非阻塞) → nix build cargoHash 校验 (非阻塞) →
-lock 校验.
-(checkout 策略 / 缓存复用 / 并发假设 / 评论写回 / 各 step 升级路径见 docs/ci.md.)
+v3.0 三档 (org 分级契约, 见 lc-studio/forgejo-actions README; 命名即门禁):
 
-> CI 实现细节 (checkout 策略 / 缓存复用 / 并发假设 / 评论写回 / 各 step 升级路径) 见
-> **docs/ci.md**.
+| 档 | workflow | 触发 | 阻塞 | 内容 |
+|---|---|---|---|---|
+| P0 `ci-merge.yml` | PR + master push + 手动 | PR 合入 | check-features + check 主链 (fmt/clippy/machete/doc/测试/typos/deny-offline/check-contracts) + file-size |
+| P1 `ci-deploy.yml` | master push + nightly + 手动 | 部署 | audit (CVE) + bench compare-save + nix build cargoHash (**非超集**偏差, 见 workflow 头声明) |
+| P2 `ci-periodic.yml` | nightly per-SHA 去重 + 手动 (无 push) | 无 | check --coverage + coverage-gate + WebUI Playwright |
+
+跳过/去重机制: 事件去重 (push 仅 master; PR 总是跑 — draft/WIP PR 除外) + 内容去重
+(skip-if-passed 共享 action, ff-merge 后同 SHA 不重跑; P2 按 SHA 去重次晚自愈) + PR
+并发去旧 (concurrency). WIP 门禁 (#204): draft PR 不触发 CI, 去 WIP 前缀时经 `edited`
+事件自动补跑 (机制见 docs/ci.md "WIP 门禁")。
+
+**本地复现锚点**: `just ci-merge` = P0 全链 ("本地全绿 ⇒ CI 阻塞项必绿"); P1/P2 的
+本地近似入口见 justfile `ci-deploy` / `ci-periodic` recipe 注释。
+
+> CI 实现细节 (checkout 策略 / 缓存复用 / 并发假设 / 评论写回 / 三档 step 明细与
+> 迁移去向表 / 各 step 升级路径) 见 **docs/ci.md**。
 
 ### 客户端使用示例
 

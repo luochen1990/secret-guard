@@ -1,0 +1,216 @@
+# secret-guard — Forgejo Actions CI · P2 周期兜底档 (org v3.0 三档分级)
+# form: thin — org 薄骨架形态 (SSOT: lc-studio/forgejo-actions; 本文件关键结构由
+#   其 tools/check-drift.sh 断言锁定: **无 push 触发** (负向断言) / skip 仅 schedule
+#   查询 / workflow_file 自指 / `run: just ci-periodic` 契约调用)。
+#
+# 无门禁语义: ci-periodic 红 = 欠债待还, **不阻塞任何事** — 低频功能验证 /
+#   特定场景回归的兜底网。本档承接旧 ci.yml 的 coverage 防倒退 (check --coverage +
+#   coverage-gate) 与 WebUI Playwright 回归 (政策变化: 旧 = 每 PR 非阻塞 + 评论;
+#   新 = nightly 兜底, 慢内容离开 PR 反馈路径)。
+#
+# 刻意不订阅 push (三档分级的立意所在, check-drift 负向断言): 慢内容 (插桩编译 +
+#   全量测试 + Playwright) 离开 push 关键路径 — master push 的即时验证由 ci-merge/
+#   ci-deploy 承担, P2 内容延迟到夜间消化, 单槽位 org runner 的白天槽位留给门禁类 run。
+#
+# 按 SHA 去重 (与 ci-deploy nightly 的非对称分工, 勿"顺手统一"):
+#   ci-deploy nightly  无条件重跑 — 安全类步骤环境敏感 (同 SHA, 新 CVE 出现即须再验)
+#   本档按 SHA 去重     — 回归测试代码敏感 (同代码同结果), 同 SHA 跑一次即足:
+#     新 commit 合入当晚跑一次, 此后夜间 skip (空闲期零 runner 成本); 失败无 success
+#     记录 → 次晚自动重试 (自愈); 手动 dispatch = 显式重试意图, 永不跳过。
+#   代价声明: P2 步骤自身的环境漂移不设兜底 (非核心, 接受; 环境缓变由 ci-deploy
+#   nightly 无条件覆盖)。
+#
+# 特定情况逃生舱: workflow_dispatch 在 forgejo UI 可选任意分支 — 高风险 PR 想在
+#   合入前跑全量 P2 回归 (coverage + WebUI), 手动 dispatch 到该分支即可 (checkout
+#   链按 GITHUB_SHA 取所选分支 HEAD, 零额外机制)。
+#
+# runner label / 工具链 / checkout 策略 / 锁守卫机制: 同 ci-merge.yml 文件头 (共卷
+#   CARGO_TARGET_DIR 持久复用; 插桩产物落 llvm-cov-target/ 子目录, 与 debug//release/
+#   物理隔离)。
+#
+# permissions (job 级) 不声明 — Forgejo 不支持该字段; skip 探针所需 actions: read 由
+#   自动注入的 GITHUB_TOKEN 默认覆盖。本档无 PR 事件, 无 PR 评论矩阵 (WebUI 结果
+#   tail 摘要进日志 + 失败 artifact)。
+name: ci-periodic
+
+on:
+  schedule:
+    # 按 SHA 去重的延迟验证入口 (去重原理见文件头; 语义上等价于 "每个新 commit 的
+    # P2 内容在夜间被验证一次", 而非 "每晚无条件全量")。
+    # 20:00 UTC ≈ 北京次日 04:00, 与 ci-deploy 的 19:00 刻意错峰 (单槽位 runner
+    # 先消化门禁档再跑兜底档)。
+    - cron: '0 20 * * *'
+  workflow_dispatch: # 手动重试/逃生舱: forgejo UI → Actions → ci-periodic → Run
+                      # workflow (可选任意分支 — 高风险 PR 合入前全量回归)
+
+# 快推去旧: 夜间验证对象始终是 master HEAD (被更新的 HEAD supersede 的旧 HEAD
+# 不值得跑); dispatch 到 PR 分支时 ref 不同 → 独立 group 不互踩。schedule 的 ref
+# 为 master → 与 master 上的 dispatch 共组互取消, 属良性。
+concurrency:
+  group: ci-periodic-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: vm-nix
+    # 无 job 级 if (同 ci-deploy.yml): 无 PR 事件 → 无 WIP 门禁需求;
+    # schedule 天然只在默认分支跑, dispatch 的分支由触发者自选
+    #
+    # 冷启动预算 (v3.0 重算): P2 最坏冷链 (持久卷全清) = llvm-cov 插桩编译 ~20-25min
+    # (issue #149-1 的 ~20min debug 编译 + 插桩开销, 全量依赖重编) + 测试运行 ~5-8min
+    # + coverage report ~1min + WebUI (webServer 启动 + Playwright ~3-5min, secret-guard
+    # binary 复用插桩产物零额外编译) ≈ 30-39min, 取 45min 留余量。正常热路径 ~8-12min。
+    timeout-minutes: 45
+    # 不声明 permissions: (Forgejo 不支持, 见文件头)
+    #
+    # cargo-llvm-cov 依赖 llvm-cov / llvm-profdata (rust 工具链不含). VM 的
+    # systemPackages 落 /run/current-system/sw/bin (NixOS 约定), job 级 env 让所有
+    # step 共享 (runner 不进 devShell; 本仓 nix devShell 亦注入同名变量, 本地/CI
+    # 同源)。CARGO_TARGET_DIR 持久卷复用 + single-job 并发互斥假设与锁守卫: 同
+    # ci-merge.yml env 段注释 (三档共卷一体适用)。
+    env:
+      LLVM_COV: /run/current-system/sw/bin/llvm-cov
+      LLVM_PROFDATA: /run/current-system/sw/bin/llvm-profdata
+      CARGO_TARGET_DIR: /var/lib/forgejo-runner/cache/cargo-target
+    steps:
+      # ─── single-job 假设的运行时防御 (同 ci-merge.yml; 三档共卷必须各自守卫) ───
+      - name: Guard single-job assumption (acquire target-dir lock)
+        id: lock
+        run: |
+          set -eu
+          : "${CARGO_TARGET_DIR:?}" # 防御本地摘脚本复现: 未设时锁会静默落到 cwd
+          LOCK="$(dirname "$CARGO_TARGET_DIR")/.ci-target-dir-lock"
+          mkdir -p "$(dirname "$LOCK")"
+          echo "$GITHUB_RUN_ID" > "$LOCK"
+          echo "lock: acquired target dir for run $GITHUB_RUN_ID (lock=$LOCK)"
+
+      # checkout 链 (与 ci-merge.yml 逐字节同构): 本 workflow 无 PR 事件, BASE_REF
+      # 恒为空 → 恒走浅克隆 --depth 1 分支 (保留 BASE_REF 分支是为保持各骨架单一形态)。
+      - name: Checkout via SSH
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          if [ -n "$SSH_KNOWN_HOSTS" ]; then
+            printf '%s\n' "$SSH_KNOWN_HOSTS" >> ~/.ssh/known_hosts
+          else
+            echo "WARN: repo secret SSH_KNOWN_HOSTS 未设置 (TOFU 固定要求), 退回动态 ssh-keyscan (存在 MITM 窗口)." >&2
+            ssh-keyscan -p 5522 git.lambda.lc >> ~/.ssh/known_hosts
+          fi
+          git init
+          git remote add origin "ssh://forgejo@git.lambda.lc:5522/${GITHUB_REPOSITORY}.git"
+          if [ -n "$BASE_REF" ]; then
+            git fetch --no-tags origin "$BASE_REF"
+            git fetch --no-tags origin "$GITHUB_SHA"
+          else
+            git fetch --depth 1 origin "$GITHUB_SHA"
+          fi
+          git checkout "$GITHUB_SHA"
+
+      # 最小权限收尾: 清理 deploy key (同 ci-merge.yml)。
+      - name: Cleanup deploy key
+        if: always()
+        run: rm -f ~/.ssh/id_ed25519
+
+      # ─── 内容去重 (checkout 后本地 action 可读) ───
+      # 仅 schedule 事件查询 (per-SHA 去重, 见文件头): dispatch 是显式重试/逃生舱
+      # 意图, 不查询。
+      # workflow_file 显式自指 ci-periodic.yml (关键, check-drift 有断言) — 查询的是
+      # **ci-periodic workflow 自身** 的历史成功 run。若沿用默认值 ci-merge.yml,
+      # PR/合入阶段的 P0 成功记录会毒化判定 → P2 被静默跳过 (P0 过 ≠ P2 过)。
+      # continue-on-error: API 失败退化为不跳过 (fail-open; 宁可重跑不可漏验)。
+      - name: skip-if-passed
+        id: skip
+        uses: ./.forgejo/actions/skip-if-passed
+        with:
+          workflow_file: ci-periodic.yml
+        if: success() && github.event_name == 'schedule'
+        continue-on-error: true
+
+      # P2 质量门禁 — 契约层入口 (`just ci-periodic`, org v3.0 可选契约, 非超集):
+      # check --coverage (fmt + clippy + machete + doc 门禁 + 插桩测试 + typos +
+      # deny-offline + check-contracts, 产出 profdata) + coverage-gate (双阈值,
+      # 阻塞 — coverage 防倒退按 rubric 归 P2: 质量债而非用户面缺陷, 不卡合入)。
+      # 测试集只跑这一次; 判定细节见 justfile ci-periodic recipe。
+      # 阻塞级语义: run 内红 → 次晚自愈重试 (无 success 记录) + 看板可见。
+      - name: Quality gate (just ci-periodic)
+        id: gate
+        if: success() && steps.skip.outputs.should_skip != 'true'
+        run: just ci-periodic
+
+      # WebUI 回归测试 (Playwright 端到端)。
+      # webServer 自动启动 mock upstream + secret-guard, binary 候选链 release > debug
+      # > llvm-cov-target/debug (playwright.config.ts), 本档上一步插桩产物命中第三候选
+      # (CARGO_TARGET_DIR 指向持久卷, playwright.config.ts 读此环境变量)。
+      #
+      # continue-on-error: true — Playwright 在 CI 环境 (无 GPU / chromium 渲染稳定性)
+      # 可能有 flake, 保持非阻塞 (同旧 ci.yml 的 #86-2 观察; P2 无 PR 合入语义,
+      # 无 "转阻塞" 升级目标, flake 由次晚 schedule 重试自愈)。
+      # 结果处理 (v3.0 政策变化): 旧 = PR 评论 upsert (可见性); 新 = 无 PR 事件,
+      # 失败时 tail 末尾 80 行摘要进日志 (错误摘要通常在尾部) + artifact 上传,
+      # 成功贴一行摘要。真实退出码写 step output 供 artifact step 条件消费。
+      - name: WebUI regression (Playwright)
+        id: playwright
+        if: success() && steps.skip.outputs.should_skip != 'true'
+        continue-on-error: true
+        run: |
+          set +e  # 捕获 playwright 退出码 (continue-on-error 兜底, 这里永不失败)
+          just check-webui 2>&1 | tee webui.txt
+          EXIT=${PIPESTATUS[0]}
+          echo "exit_code=$EXIT" >> "$GITHUB_OUTPUT"
+          # 摘要进日志 (替代旧 PR 评论的可见性): 失败贴末尾 80 行, 成功贴结论行。
+          if [ "$EXIT" -ne 0 ]; then
+            echo "webui: FAILED (exit $EXIT) — 末尾 80 行摘要 (完整 log 在本 step 输出, artifact 见上传 step):"
+            tail -80 webui.txt
+          else
+            echo "webui: OK —"
+            grep -E 'passed|flaky|did not run' webui.txt | tail -5
+          fi
+          exit 0
+
+      # WebUI 测试失败时上传 Playwright 产物 (截图/trace/html 报告) 供事后排查 (issue #86 子项 #2).
+      # 仅在 Playwright step 失败时上传 (成功时不产生 artifact, 省存储)。
+      # 条件用 exit_code output 而非 outcome: playwright step 恒 exit 0 (continue-on-error
+      # 已兜底), outcome 恒为 success, 真实成败在 exit_code。
+      # 用 Forgejo 官方 fork: GitHub 官方 actions/upload-artifact@v4 会检测非 GitHub 环境直接报错。
+      # node20 是 action API 级别声明 (>=20 即可), VM 的 nodejs 24 满足 (act 执行 JS action
+      # 只需 node 在 PATH, forgejo-runner-vm.mod.nix 已配)。
+      # artifact 存 Forgejo server 端 (默认本地 FS), 无需 server 侧配置。retention 见 with 段。
+      - name: Upload Playwright artifacts on failure
+        if: always() && steps.playwright.outputs.exit_code != '' && steps.playwright.outputs.exit_code != '0'
+        continue-on-error: true
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: playwright-failure
+          # just check-webui 在 repo 根执行, Playwright 默认产物路径 (见 .gitignore):
+          path: |
+            tests/webui/test-results/
+            tests/webui/playwright-report/
+          retention-days: 14
+
+      # ─── single-job 假设的运行时防御: 释放校验 (同 ci-merge.yml) ─────────────
+      - name: Guard single-job assumption (verify target-dir lock)
+        if: always()
+        run: |
+          set -eu
+          : "${CARGO_TARGET_DIR:?}" # 防御本地摘脚本复现: 未设时锁会静默落到 cwd
+          LOCK="$(dirname "$CARGO_TARGET_DIR")/.ci-target-dir-lock"
+          CURRENT=$(cat "$LOCK" 2>/dev/null || echo "MISSING")
+          if [ "$CURRENT" = "MISSING" ]; then
+            echo "::error::target-dir lock file missing: $LOCK (deleted mid-job? volume wiped?)."
+            echo "锁文件在 job 开始时由 acquire step 写入, 正常路径不可能消失 — 排查卷状态."
+            exit 1
+          fi
+          if [ "$CURRENT" != "$GITHUB_RUN_ID" ]; then
+            echo "::error::target-dir lock file corrupted: expected run $GITHUB_RUN_ID, got '$CURRENT'."
+            echo "另一个 job 并发写了同一 CARGO_TARGET_DIR — runner single-job 假设已破裂."
+            echo "按 ci-merge.yml env 段 '并发互斥假设' 注释的预案处理 (串行化或按 run_id 隔离),"
+            echo "详见 .forgejo/workflows/ci-periodic.yml 与 docs/ci.md '并发互斥假设' 段."
+            exit 1
+          fi
+          echo "lock: verified (run $GITHUB_RUN_ID, no concurrent writer)"

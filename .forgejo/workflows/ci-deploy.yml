@@ -1,0 +1,197 @@
+# secret-guard — Forgejo Actions CI · P1 部署门禁档 (org v3.0 三档分级)
+# form: thin — org 薄骨架形态 (SSOT: lc-studio/forgejo-actions; 本文件关键结构由
+#   其 tools/check-drift.sh 断言锁定: checkout 链安全行 / skip-if-passed 接线自指 /
+#   push 收窄 master / nightly schedule / `run: just ci-deploy` 契约调用)。
+#
+# 门禁语义 (v3.0 命名即门禁): ci-deploy 红 = 不能部署 — 验证 master 的可部署性,
+#   **不执行部署动作** (部署由 ~/ws/nixos 侧另行实施). P1 档职责 = 确保安全性
+#   (cargo audit), 性能基线 (criterion bench), 发布物可构建 (nix build cargoHash).
+#
+# 三档 (详见 forgejo-actions README「CI 分级」+ 本仓 docs/ci.md):
+#   P0 ci-merge.yml   (`just ci-merge`)     — 合入时刻: 阻塞 PR 合入, 快反馈
+#   P1 本文件          (`just ci-deploy`)   — 部署时刻: master push + nightly + 手动
+#   P2 ci-periodic.yml (`just ci-periodic`) — 无门禁: coverage/WebUI 兜底
+#
+# [v3.0 迁移记录] 本文件承接旧 ci.yml 的 audit / bench / nix build 三个 step (去向表
+#   见 docs/ci.md)。政策变化 (相对旧单 workflow 形态):
+#   - bench: 旧 = master save / PR compare 非阻塞 + PR 评论; 新 = compare-save 单模式
+#     (判回归 + 滚动更新基线), 退化时 run 红 (P1 门禁信号)。
+#   - audit / nix build: 旧 = continue-on-error 非阻塞起步 (升级判据 N=20 次 master 绿,
+#     针对的是 "不阻塞 PR 合并"); 新 = P1 阻塞级 — P1 不门禁 PR 合入, 旧非阻塞理由
+#     不再适用; "红 = 不能部署" 正是本档职责 (audit 发现 CVE / cargoHash 漂移导致
+#     发布物不可构建, 都是该挡下部署的真信号)。
+#
+# [超集偏差声明] org 契约的默认语义是 ci-deploy ⊇ ci-merge (单 workflow 绿即可部署,
+#   决策不交叉查别的 workflow)。本仓偏差: **只跑 P1 增量**, 不重跑 P0 全链。理由:
+#   ① 当前无部署流水线消费 "ci-deploy / check (*)" 作为门禁 (部署由人工触发, 合入
+#   前已有 P0 全链绿); ② P0 全链重跑实测 6-9min, 在单槽位 org runner 上对同一 commit
+#   重复执行纯属浪费 (master push 时 ci-merge.yml 已对同 SHA 跑过 P0, skip-if-passed
+#   秒过也不能省去本档的增量价值)。升级路径: 未来若出现消费本检查的部署流水线,
+#   在 justfile ci-deploy recipe 头部加 `just ci-merge` 即恢复超集语义 (一行改动)。
+#
+# runner label / 工具链 / checkout 策略 / 锁守卫机制: 同 ci-merge.yml 文件头 (共卷
+#   CARGO_TARGET_DIR 持久复用, release/ 子目录与 debug/ 物理隔离)。
+#
+# permissions (job 级) 不声明 — Forgejo 不支持该字段; skip 探针所需 actions: read 由
+#   自动注入的 GITHUB_TOKEN 默认覆盖。本档无 PR 事件, 无 PR 评论矩阵。
+name: ci-deploy
+
+on:
+  push:
+    # P1 只验证 master (合入后的完整验证); feature branch push 由 ci-merge.yml 的
+    # PR 事件覆盖, 此处收窄避免双触发浪费单槽位 runner
+    branches: [master]
+  schedule:
+    # nightly 兜底 (无条件重跑): 覆盖 skip 判定粒度之外的环境缓变 — 安全类步骤
+    # (audit) 是环境敏感的: 代码不变, 新 CVE 发布 / 依赖版本漂移 / 缓存损坏,
+    # 同一 SHA 也须重跑才能发现。与 push/dispatch 跑同一零参数契约 `just ci-deploy`。
+    # 19:00 UTC ≈ 北京次日 03:00, 与 ci-periodic 的 20:00 刻意错峰 (单槽位 runner
+    # 先消化门禁档再跑兜底档)。
+    - cron: '0 19 * * *'
+  workflow_dispatch: # 手动重试: forgejo UI → Actions → ci-deploy → Run workflow
+
+# 快推去旧: 连续快合多个 PR → master 连续多个 push, 中间 commit 的完整验证已被
+# supersede, 只验证最新 master HEAD (部署追平语义只需要最新)。schedule/dispatch
+# 的 ref 同为 master → 与 push 共组互取消, 属良性 (同 HEAD 重跑无信息增量,
+# nightly 次日还会再来)。
+concurrency:
+  group: ci-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: vm-nix
+    # 无 job 级 if (与 ci-merge.yml 的差异): 本 workflow 无 PR 事件 → 无 WIP 门禁需求;
+    # push 已被 on.push.branches 收窄到 master, schedule/dispatch 天然只在默认分支跑
+    #
+    # 冷启动预算 (v3.0 重算): P1 最坏冷链 (持久卷 + nix store 双冷, 仅 VM 首建/重建
+    # 时出现) = release bench 编译 10-20min (issue #149-1 实测, LTO) + bench --quick
+    # 运行 ~3min + audit advisory DB 冷 clone ~2min + nix build 冷 store 全量 vendor
+    # 编译 (step 自带硬上限 30min) → 串行最坏 ≈ 55min, 取 60min。正常热路径 ~8-12min
+    # (release/store 增量 + audit DB 增量 fetch)。注意 nix step 的 30min 自身上限已把
+    # 其最坏耗时封顶, job 预算只需容纳其余 step 的最坏和。
+    timeout-minutes: 60
+    # 不声明 permissions: (Forgejo 不支持, 见文件头)
+    #
+    # CARGO_TARGET_DIR 持久卷复用 (同 ci-merge.yml; bench 用 release/ + criterion/
+    # 子目录, 与 P0 的 debug/ 物理隔离) + CARGO_AUDIT_DB advisory DB 持久缓存
+    # (issue #149-3: 首次 clone 后跨 job 复用, 后续增量 fetch。cargo-audit 不认
+    # CARGO_AUDIT_DB env (只认 --db flag), justfile 的 audit recipe 显式透传该 env
+    # 到 --db, 使此缓存生效)。
+    # single-job 并发互斥假设与锁守卫: 同 ci-merge.yml env 段注释 (三档共卷一体适用)。
+    env:
+      CARGO_TARGET_DIR: /var/lib/forgejo-runner/cache/cargo-target
+      CARGO_AUDIT_DB: /var/lib/forgejo-runner/cache/advisory-db
+    steps:
+      # ─── single-job 假设的运行时防御 (同 ci-merge.yml; 三档共卷必须各自守卫) ───
+      - name: Guard single-job assumption (acquire target-dir lock)
+        id: lock
+        run: |
+          set -eu
+          : "${CARGO_TARGET_DIR:?}" # 防御本地摘脚本复现: 未设时锁会静默落到 cwd
+          LOCK="$(dirname "$CARGO_TARGET_DIR")/.ci-target-dir-lock"
+          mkdir -p "$(dirname "$LOCK")"
+          echo "$GITHUB_RUN_ID" > "$LOCK"
+          echo "lock: acquired target dir for run $GITHUB_RUN_ID (lock=$LOCK)"
+
+      # checkout 链 (与 ci-merge.yml 逐字节同构): 本 workflow 无 PR 事件, BASE_REF
+      # 恒为空 → 恒走浅克隆 --depth 1 分支 (保留 BASE_REF 分支是为保持各骨架单一形态)。
+      - name: Checkout via SSH
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          if [ -n "$SSH_KNOWN_HOSTS" ]; then
+            printf '%s\n' "$SSH_KNOWN_HOSTS" >> ~/.ssh/known_hosts
+          else
+            echo "WARN: repo secret SSH_KNOWN_HOSTS 未设置 (TOFU 固定要求), 退回动态 ssh-keyscan (存在 MITM 窗口)." >&2
+            ssh-keyscan -p 5522 git.lambda.lc >> ~/.ssh/known_hosts
+          fi
+          git init
+          git remote add origin "ssh://forgejo@git.lambda.lc:5522/${GITHUB_REPOSITORY}.git"
+          if [ -n "$BASE_REF" ]; then
+            git fetch --no-tags origin "$BASE_REF"
+            git fetch --no-tags origin "$GITHUB_SHA"
+          else
+            git fetch --depth 1 origin "$GITHUB_SHA"
+          fi
+          git checkout "$GITHUB_SHA"
+
+      # 最小权限收尾: 清理 deploy key (同 ci-merge.yml)。
+      - name: Cleanup deploy key
+        if: always()
+        run: rm -f ~/.ssh/id_ed25519
+
+      # ─── 内容去重 (checkout 后本地 action 可读) ───
+      # 仅 push 事件查询 — nightly 的存在意义就是无条件兜底重跑 (环境敏感步骤),
+      # dispatch 是手动重试, 均不查询。
+      # workflow_file 显式自指 ci-deploy.yml (关键, check-drift 有断言) — 查询的是
+      # **ci-deploy workflow 自身** 的历史成功 run。若沿用默认值 ci-merge.yml,
+      # ff-merge 后 PR 阶段的 ci-merge 成功记录会毒化判定 → P1 部署门禁被静默跳过
+      # (P0 过 ≠ P1 过, 门禁语义被偷换)。
+      # continue-on-error: API 失败退化为不跳过 (fail-open, 不阻断 CI)。
+      - name: skip-if-passed
+        id: skip
+        uses: ./.forgejo/actions/skip-if-passed
+        with:
+          workflow_file: ci-deploy.yml
+        if: success() && github.event_name == 'push'
+        continue-on-error: true
+
+      # P1 质量门禁 — 契约层入口 (`just ci-deploy`, org v3.0 可选契约):
+      # audit (CVE, 阻塞 — 旧 PR-非阻塞语义不适用本档, 见文件头政策变化注记) +
+      # bench 基线 compare-save (判回归 + 滚动更新, 退化 exit 1 → run 红)。
+      # 判定逻辑 SSOT 在 justfile (audit / bench-ci recipe)。
+      - name: Quality gate (just ci-deploy)
+        if: success() && steps.skip.outputs.should_skip != 'true'
+        run: just ci-deploy
+
+      # ─── nix package 验证 (issue #149-6) ────────────────────────────────────
+      # 验证 nix/pkgs/secret-guard.nix 的 cargoHash 与 Cargo.lock 一致 (漂移时部署侧
+      # ~/ws/nixos 重建才暴露, 排障跨仓库)。runner 是 NixOS microvm 天然有 nix; store
+      # 缓存跨 job 复用, 热路径增量仅重编 workspace crate。
+      # 留在 workflow 层而非 ci-deploy recipe: 需 step 级 timeout-minutes: 30 硬上限
+      # (recipe 层无法表达 per-step timeout; 冷 store 全量 vendor 编译可达上限)。
+      # P1 阻塞级 (v3.0 政策变化, 见文件头): cargoHash 漂移 → 发布物不可构建 → 红 =
+      # 不能部署, 属本档职责内真信号 (依赖升级 PR 合入后此处红提醒同步 cargoHash,
+      # 属预期信号, 维护者需人工关注)。
+      # --extra-experimental-features: runner 的 Lix 未启用 nix-command/flakes
+      # (2026-08-26 #193 首跑实证)。
+      - name: nix build (cargoHash validation)
+        id: nixbuild
+        if: success() && steps.skip.outputs.should_skip != 'true'
+        timeout-minutes: 30
+        run: nix --extra-experimental-features "nix-command flakes" build .#secret-guard -L
+
+      # 注: nix flake checks (render 契约) 不设 CI step — runner VM 架构禁止
+      # nix 求值 (无 writableStoreOverlay / 无 nix-daemon, 见 forgejo-runner-vm.mod.nix
+      # 文件头「CI 工具链规范」; 2026-08-26 #193 首跑实证: 先撞 experimental-features,
+      # 开启后仍会撞只读 store / 无法 fetch input). serde 漂移门禁由本地 just check
+      # 链尾的 just nix-check 承担 (recipe 内探测 nix-daemon, CI 环境自动跳过)。
+
+      # ─── single-job 假设的运行时防御: 释放校验 (同 ci-merge.yml) ─────────────
+      - name: Guard single-job assumption (verify target-dir lock)
+        if: always()
+        run: |
+          set -eu
+          : "${CARGO_TARGET_DIR:?}" # 防御本地摘脚本复现: 未设时锁会静默落到 cwd
+          LOCK="$(dirname "$CARGO_TARGET_DIR")/.ci-target-dir-lock"
+          CURRENT=$(cat "$LOCK" 2>/dev/null || echo "MISSING")
+          if [ "$CURRENT" = "MISSING" ]; then
+            echo "::error::target-dir lock file missing: $LOCK (deleted mid-job? volume wiped?)."
+            echo "锁文件在 job 开始时由 acquire step 写入, 正常路径不可能消失 — 排查卷状态."
+            exit 1
+          fi
+          if [ "$CURRENT" != "$GITHUB_RUN_ID" ]; then
+            echo "::error::target-dir lock file corrupted: expected run $GITHUB_RUN_ID, got '$CURRENT'."
+            echo "另一个 job 并发写了同一 CARGO_TARGET_DIR — runner single-job 假设已破裂."
+            echo "按 ci-merge.yml env 段 '并发互斥假设' 注释的预案处理 (串行化或按 run_id 隔离),"
+            echo "详见 .forgejo/workflows/ci-deploy.yml 与 docs/ci.md '并发互斥假设' 段."
+            exit 1
+          fi
+          echo "lock: verified (run $GITHUB_RUN_ID, no concurrent writer)"

@@ -52,10 +52,10 @@ dev-test:
 # doctest 暂时禁用: 当前唯一的 doctest (auth::middleware) 被标为 ```ignore, 测试价值为零.
 # 需要时取消下行注释即可恢复 (增量开销 <1s, 复用 clippy 的 debug/ 产物).
 #
-# consistency-check feature 守卫 (CI 用): 默认关闭的视图正确性断言. 非覆盖率分支末尾
-# 调用 just check-features 增量编译该 feature 跑 clippy + nextest, 确保守卫断言持续可用
-# 且不漂移. CI workflow 单独成步运行 check-features (在 coverage 的 cargo clean 前),
-# 复用同一 target/debug, 不影响上面的磁盘峰值控制.
+# consistency-check feature 守卫: 默认关闭的视图正确性断言. v3.0 起不再内嵌于本
+# recipe 的非覆盖率分支 (由 ci-merge recipe 的 all 档聚合; CI 侧在 ci-merge.yml
+# 单独成步 — contracts.md prop_consistency_check_feature_runs_in_ci 的锚点),
+# 确保守卫断言持续可用且不漂移, 复用同一 target/debug, 不影响磁盘峰值控制.
 #
 # doc 检查: cargo doc --no-deps -D warnings 验证 rustdoc 能编译 (含跨文件 doc 链接).
 # 项目大量使用 //! 头部文档 + contracts.md 链接, doc 链接写错 (路径错/跨 crate 错) 在 CI 不会
@@ -83,7 +83,6 @@ check *ARGS:
         cargo llvm-cov nextest --locked --no-fail-fast --no-report; \
     else \
         cargo nextest run --locked --no-fail-fast; \
-        just check-features; \
     fi
     just typos
     just deny-offline
@@ -166,22 +165,49 @@ _kill-orphans:
 
 # check + check-webui (完整验证, devShell 内).
 # 行为差异提醒: 本地 check-all 让 Playwright 阻塞 (失败即 exit 1), 但 CI 的 WebUI step
-# 用 continue-on-error (非阻塞, 见 .forgejo/workflows/ci.yml WebUI regression step 注释).
-# 即 "本地全绿 → push" 不代表 CI 必绿 — CI flake 不会阻断合并, 维护者需人工关注 CI log.
-# 这是有意设计 (WebUI 在 CI 环境 flake 率高), 详见 ci.yml 注释与 AGENTS.md "CI" 段.
+# 用 continue-on-error (非阻塞, v3.0 起位于 ci-periodic.yml — nightly 兜底, flake 由
+# 次晚重试自愈).
+# 即 "本地全绿 → push" 不代表 CI 必绿 — 这是有意设计 (WebUI 在 CI 环境 flake 率高),
+# 详见 ci-periodic.yml 注释与 AGENTS.md "CI" 段.
 check-all: check _kill-orphans
     cd tests/webui && playwright test
 
-# org ci 契约 recipe (阻塞级门禁入口, 见 lc-studio/forgejo-actions README)。
-# 本仓是 legacy 形态 (双 job 编排保留在 workflow, 见 ci.yml 头 form: legacy 标记),
-# 本 recipe 收敛 CI 阻塞 job 的质量链 (check-features → check --coverage →
-# coverage-gate → check-file-size), 供本地一键复现与 org 契约走查; bench/WebUI/
-# PR 评论矩阵等编排类或 continue-on-error step 不在此列 (workflow 编排不可收编)。
-ci:
-    just check-features
+# org ci 契约 recipe (阻塞级门禁入口, 见 lc-studio/forgejo-actions README「CI 分级」)。
+# v3.0 三档: 本仓 thin 形态 (SSOT 骨架 + 本地 skip-if-passed action), 质量链拆三档 —
+#   P0 ci-merge    (ci-merge.yml)   合入时刻: check-features + check 主链 + file-size
+#   P1 ci-deploy   (ci-deploy.yml)  部署时刻: audit + bench 基线 (nix build 留 workflow 层)
+#   P2 ci-periodic (ci-periodic.yml) 周期兜底: check --coverage + coverage-gate
+# stage 语义 (CI 编排与本地复现逐段等价、无重复执行):
+#   all (默认, 本地) = check-features + 主链 (just check) + file-size
+#                      —— "本地全绿 ⇒ CI 阻塞项必绿" 的锚点在本档
+#   main (CI gate)   = 仅 check 主链 (check-features / file-size 由 workflow 独立
+#                      step 执行, Diagnose 表按 step 定位失败)
+ci-merge *stage:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{ stage }}" in
+      main) just check ;;
+      ""|all) just check-features; just check; just check-file-size ;;
+      *) echo "ci-merge: 未知 stage '{{ stage }}' (main | all)" >&2; exit 2 ;;
+    esac
+
+# org ci 契约 P1 (部署门禁档, ci-deploy.yml 调用): audit (CVE) + bench compare-save
+# (判回归 + 滚动更新基线, 退化 exit 1 → run 红)。v3.0 政策变化: 旧单 workflow 里两者
+# continue-on-error 非阻塞的理由是 "不阻塞 PR 合并" — P1 不门禁 PR 合入, 理由不再适用;
+# "红 = 不能部署" 是本档职责 (audit 发现 CVE / 性能退化都该挡下部署)。
+# nix build cargoHash 验证留 workflow 层 (需 step 级 timeout-minutes: 30, recipe 层
+# 无法表达); 本地近似复现: just audit / just bench-ci compare-save /
+# nix --extra-experimental-features "nix-command flakes" build .#secret-guard -L
+ci-deploy:
+    just audit
+    just bench-ci compare-save
+
+# org ci 契约 P2 (周期兜底档, ci-periodic.yml 调用, 非超集): coverage 防倒退
+# (插桩测试 + 双阈值门禁)。WebUI Playwright 因 continue-on-error 语义留 workflow
+# 独立 step (flake 不打断兜底 run); 本地全量复现: just ci-periodic && just check-webui。
+ci-periodic:
     just check --coverage
     just coverage-gate
-    just check-file-size
 
 # 仅 fmt: treefmt 全仓格式化 (nix/rust/toml/py; 配置 SSOT = 根 treefmt.toml).
 # 仅想格式化 rust 时手动 `cargo fmt` 亦可 (edition 一致, 输出等价).
@@ -306,12 +332,14 @@ bench *ARGS:
 #   criterion 即使检测到显著退化也永远 exit 0 (仅基线缺失时 panic exit 101).
 #   因此本 recipe 自行解析输出, 按中位数变化率判定回归, 超阈值则 exit 1.
 #
-# 两阶段设计 (与 ci.yml 的 master/PR 双事件配合):
-#   - mode=save  (master push):  `--save-baseline ci` — 先对比再覆盖基线, 让基线
-#     持续滚动更新 (master 永远是最新基准).
-#   - mode=compare (PR):          `--baseline ci`      — 只对比不覆盖. 基线缺失
+# 三模式设计:
+#   - mode=save          (本地):  `--save-baseline ci` — 纯更新基线, 不判定.
+#   - mode=compare       (本地):  `--baseline ci`      — 只对比不覆盖. 基线缺失
 #     (冷启动) 时 criterion panic, 本 recipe 先检测基线目录是否存在, 缺失则
-#     fallback 到 save 模式建立首基线 (PR 第一次跑无历史可对比, 属正常).
+#     fallback 到 save 模式建立首基线 (第一次跑无历史可对比, 属正常).
+#   - mode=compare-save  (CI, ci-deploy.yml 调用): `--save-baseline ci` — criterion
+#     对该 flag 的输出仍含 vs 旧基线的 change 行, 故判回归与滚动更新一步完成;
+#     退化 exit 1 → ci-deploy run 红 (P1 "红 = 不能部署" 信号). 冷启动 fallback 同 compare.
 #
 # 退化判定逻辑 (解析 criterion stdout):
 #   每个场景输出 `change: time:   [lo% med% hi%]` 行. 取 med (中位数):
@@ -348,19 +376,24 @@ bench-ci mode *extra:
 
     # 选择 criterion flag.
     ACTION="{{ mode }}"
-    if [ "$ACTION" = "save" ]; then
+    if [ "$ACTION" = "save" ] || [ "$ACTION" = "compare-save" ]; then
+        if [ "$ACTION" = "compare-save" ] && ! baseline_exists; then
+            # 冷启动: 无旧基线可判回归, fallback 纯建立. 不算回归.
+            echo "bench-ci: 基线 '$BASELINE_NAME' 不存在 (冷启动), 本次仅建立基线不判定回归." >&2
+            ACTION="save"
+        fi
         BENCH_FLAG="--save-baseline $BASELINE_NAME"
     elif [ "$ACTION" = "compare" ]; then
         if baseline_exists; then
             BENCH_FLAG="--baseline $BASELINE_NAME"
         else
-            # 冷启动: PR 第一次跑无基线可对比, fallback 建立. 不算回归.
+            # 冷启动: 第一次跑无基线可对比, fallback 建立. 不算回归.
             echo "bench-ci: 基线 '$BASELINE_NAME' 不存在 (冷启动), 本次仅建立基线不判定回归." >&2
             BENCH_FLAG="--save-baseline $BASELINE_NAME"
             ACTION="save"
         fi
     else
-        echo "bench-ci: 未知 mode '$ACTION' (应为 save 或 compare)" >&2
+        echo "bench-ci: 未知 mode '$ACTION' (应为 save / compare / compare-save)" >&2
         exit 2
     fi
 
@@ -379,6 +412,10 @@ bench-ci mode *extra:
         echo "bench-ci: 基线 '$BASELINE_NAME' 已更新."
         exit 0
     fi
+
+    # compare-save (ci-deploy): 上方 --save-baseline 已滚动更新基线, 此处只补一行
+    # 说明 (退化判定走下方公共路径, 退化时 exit 1 → run 红).
+    [ "$ACTION" = "compare-save" ] && echo "bench-ci: 基线 '$BASELINE_NAME' 已滚动更新 (compare-save)."
 
     # compare 模式: 解析每个场景的 change 中位数, 判定回归.
     # criterion 输出格式 (实测): 每个场景有绝对 time 行 [lo med hi] (无 %), change 区段
@@ -480,7 +517,7 @@ check-file-size:
 #   1. 文档中 `path/to.rs::symbol` 引用: 文件存在 && symbol 在该文件中出现.
 #      路径约定: 不带 src/ 前缀的相对 crate 根 (AGENTS.md 风格, 如 proxy/recorder.rs::xxx);
 #      带 src/ 或 tests/ 前缀的相对仓库根也接受 (contracts.md 风格).
-#   2. docs/ci.md "CI 流程" step 清单条数 == .forgejo/workflows/ci.yml 实际 `- name:` 数.
+#   2. docs/ci.md "CI 流程" step 清单条数 == .forgejo/workflows/ci-merge.yml 实际 `- name:` 数.
 #      (ci.md 另有若干背景性 step 提及, 不在编号清单内, 故只对齐编号清单.)
 # 非阻塞定位: 独立 recipe, 不进 `just check` 链 (文档漂移不拦编译, 且 symbol 字面匹配
 # 对 重命名/宏生成 有已知误报面 — 人工 triage 后再决定是否升级). 与 #144 (traceability
@@ -515,7 +552,7 @@ check-docs:
     # grep -c 零匹配时 exit 1 + 输出 0 (pipefail 会让脚本在此非零退出, 属 fail-closed,
     # 但零匹配更可能是 awk 锚点失效 — 加诊断再退出).
     md_steps=$(awk '/^## CI 流程/,/^> \*\*流程顺序原则/' docs/ci.md | grep -cE '^[0-9]+\. \*\*' || true)
-    yml_steps=$(grep -cE '^\s*- name:' .forgejo/workflows/ci.yml || true)
+    yml_steps=$(grep -cE '^\s*- name:' .forgejo/workflows/ci-merge.yml || true)
     if [ "$md_steps" = "0" ] || [ "$yml_steps" = "0" ]; then
       echo "::error::check-docs: step 计数为 0 (awk/grep 锚点可能失效), md=$md_steps yml=$yml_steps"
       exit 1
@@ -548,7 +585,7 @@ check-docs:
 # 已知豁免面 (机械 lint 无法覆盖, 由 review + 计数公开兜底):
 #   - 泛串锚点 (如 `fn`) 字面可命中 — 锚点应写具体测试名, review 时核对.
 #   - ⏳ 免检 — 但计数在输出公开 + §0.6 优先级表追踪, 滥用会立刻可见 (⏳ 数暴增).
-# 扫描范围: src/ tests/ (*.rs/*.ts) + justfile + .forgejo/workflows/ci.yml
+# 扫描范围: src/ tests/ (*.rs/*.ts) + justfile + .forgejo/workflows/ci-merge.yml
 # (后两处覆盖 CI step / recipe 类锚点, 如 VIEW-1 的 consistency-check step).
 # 工具: 纯 bash+grep+sed (runner VM corePackages, 无 rg 依赖 — 区别于 check-docs
 # 的 rg; 本检查进 `just check` 阻塞链, 必须在 CI runner 可运行).
@@ -580,7 +617,7 @@ check-contracts:
         | grep -qE "(fn +$1|test\([^\"]*$1|$1[^\"]*\", *async)"
     }
     # 锚点固定串匹配: 不限文件类型 (justfile / ci.yml 无后缀匹配需求), grep -F 字节级.
-    hit_anchor() { grep -rqF -- "$1" src tests justfile .forgejo/workflows/ci.yml 2>/dev/null; }
+    hit_anchor() { grep -rqF -- "$1" src tests justfile .forgejo/workflows/ci-merge.yml 2>/dev/null; }
     # 🔁 行的全部锚点: 🔁→ 起的每个反引号对, 排除 `路径` 形态 (含 / 或 . 前后缀的
     # 文件引用, 如 `src/redact.rs`); 多锚点全部校验 (L1: 第二锚点漂移也须拦截).
     anchors_of() {

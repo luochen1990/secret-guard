@@ -1,0 +1,399 @@
+# secret-guard — Forgejo Actions CI · P0 合入门禁 (org v3.0 三档分级)
+# form: thin — 已接 org 薄骨架形态 (SSOT: lc-studio/forgejo-actions; 本文件关键结构由
+#   其 tools/check-drift.sh 断言锁定: checkout 链安全行 / skip-if-passed 接线 / 触发集 /
+#   WIP 门禁 / `run: just ci-merge` 契约调用)。
+#
+# 三档 (v3.0 命名即门禁, 详见 forgejo-actions README「CI 分级」+ 本仓 docs/ci.md):
+#   P0 ci-merge.yml   (本文件, `just ci-merge`)  — 合入时刻: 阻塞 PR 合入, 快反馈
+#   P1 ci-deploy.yml  (`just ci-deploy`)          — 部署时刻: 安全性/性能基线/发布物可构建
+#   P2 ci-periodic.yml (`just ci-periodic`)       — 无门禁: coverage 防倒退 + WebUI 回归兜底
+#
+# [v3.0 迁移记录] 前身单 workflow ci.yml (~21 step legacy 重度编排) 按步骤归层 rubric 拆为
+#   三档; 本文件继承其全部 P0 层 step 与 sg 特有定制 (锁守卫 / PR 评论矩阵 / 持久卷 env /
+#   工具链留痕 / Diagnose 评论)。移出档: coverage+coverage-gate→P2, bench→P1, WebUI→P2,
+#   audit→P1, nix build→P1 (各 step 去向表见 PR 描述 / docs/ci.md)。
+#   双 job (pre+check) 内联 jq 探针被替换为共享本地 action skip-if-passed (逻辑层机器同步,
+#   与 SSOT 逐字节 cmp): 过滤全量下沉服务端查询参数 (head_sha/status/workflow_id), 免去
+#   各仓库内联拷贝的漂移面; 单 job 形态同时消除 "pre job 级故障 → check 被静默 skip →
+#   CI 绿但零测试" 的 silent-green-CI 窗口。改名后新 workflow 无历史 success 记录, 下一次
+#   push 全量跑一次属预期 (一次性代价)。
+#
+# runner label: vm-nix (microvm, 由 git.lambda.lc 管理员注册).
+# Rust 工具链直接装在 VM 里 (forgejo-runner-vm.mod.nix),
+# CI 不走 nix develop (每次评估 flake + 补 store 太慢). 工具链版本由 VM 的 nixpkgs 决定.
+#
+# 触发去重 (与 ~/ws/nixos 的 ci 一致):
+#   同一 commit 在 feature branch 上会同时触发 push + pull_request, 跑两次浪费 runner.
+#   PR 事件总是跑 (合并前检查, 主要场景; draft/WIP PR 除外, 见 WIP 门禁); push 仅
+#   master 跑 (合并后的 commit; feature branch 的 push 由 PR 覆盖). 另加
+#   workflow_dispatch 供手动重试.
+#
+# WIP 门禁 (issue #204, 模式源自 nixos#791): draft PR (title 带 WIP:/[WIP] 前缀) 不触发
+#   CI — WIP PR 离可合并尚远 (forgejo 本就按 WIP 前缀阻塞合并), 其上每次 push 的 check
+#   纯属浪费; runner 单槽位且全 org 共享串行, 跳过即释放. 判定用 payload 的
+#   pull_request.draft (forgejo 侧 = IsWorkInProgress(), 即阻塞合并的同一 SSOT — 前缀集/
+#   大小写随实例 WORK_IN_PROGRESS_PREFIXES 配置自动对齐, workflow 侧不复制)。
+#   v3.0 单 job 化后的语义: 全部 step 都在唯一 `check` job 的 if 门内, job 被跳过 →
+#   run 结论 skipped (AggregateJobStatus 全 skip → skipped, 非 success) → 不污染
+#   skip-if-passed 内容去重 (去 WIP 后的补跑不会被误判 "已通过")。衔接关键: forgejo
+#   默认事件集 (opened/synchronize/reopened) 不含 title 编辑, 去 WIP 前缀必须显式订阅
+#   edited (见 on.pull_request.types) 才能自动补跑 CI。WIP 化的 edited 事件经同
+#   concurrency group 取消在跑 CI (符合 "标记 draft 即停止烧 CI" 语义)。
+#
+# 内容去重 (skip-if-passed): ff-merge 后 commit SHA 不变, master 的 push 会重复触发
+#   已跑过的 CI. 共享 action (.forgejo/actions/skip-if-passed, SSOT 机器同步) 查 Forgejo
+#   API 历史 run (服务端过滤 head_sha+status=success+workflow_id=ci-merge.yml), 命中则
+#   后续门禁 step 跳过. 失败退化为不跳过 (continue-on-error 兜底, 不阻断 CI)。
+#   仅 push 事件查询 (PR close-reopen 同 SHA 场景, 历史 push run 的 success 会误跳过 PR
+#   的验证 — PR 是合并前主场景); workflow_dispatch 直通不查 (手动重跑应无条件执行)。
+#
+# workflow `name: ci-merge` + job_id `check` 对齐 branch protection 规则 "ci-merge / check (*)",
+# 通配符 (*) 同时覆盖 (push) 与 (pull_request) 两种事件后缀, 门禁不会因多事件分裂.
+# (v3.0 改名: 旧规则 "ci / check (*)" → "ci-merge / check (*)" 的同步由 nixos 仓的
+# branch protection 声明式管理承担, 不在本仓库内。)
+#
+# permissions (job 级) 不声明 — Forgejo 不支持该字段 (值被忽略, 且 Actions 界面
+#   对带此字段的 job 显式告警); skip 探针查 workflow runs API 与 check 发 PR 评论
+#   (diff/诊断 2 处) 所需权限由自动注入的 GITHUB_TOKEN 默认覆盖.
+#   迁移 GitHub 时恢复最小权限声明: check → actions: read + pull-requests: write.
+#
+# checkout 直接用 git + SSH (不用 actions/checkout):
+#   forgejo 实例启用了 DISABLE_HTTP_GIT=true (禁止 git over HTTPS), 且内置 SSH server
+#   要求用户名 forgejo (不是 git) + 非标准端口 5522. actions/checkout@v4 硬编码 git@ 用户
+#   且 SCP-style URL 无法嵌端口, 对此环境完全不兼容. 直接 git 命令把用户名和端口写在
+#   ssh:// URL 里 (forgejo@git.lambda.lc:5522), 一步到位, 无黑盒.
+#   host key TOFU 固定 (directory-algebra #89 同源): 优先 repo secret SSH_KNOWN_HOSTS
+#   (内容 = ssh-keyscan 原样输出, 消除动态 keyscan 的 MITM 窗口); secret 缺失退回动态
+#   keyscan + stderr 警告. 服务端 host key 变更须同步轮换. deploy key 于 checkout 后
+#   always() 清理 (org 共享 runner 最小权限).
+#   依赖一个 repo-level secret: DEPLOY_KEY (ed25519 私钥; 公钥在 repo Deploy keys 注册).
+name: ci-merge
+
+on:
+  push:
+    # 事件去重: push 仅 master (合并后 commit); feature branch 的 push 由 PR 覆盖
+    branches: [master]
+  pull_request:
+    # 前 3 项为 forgejo 服务端默认事件集 (显式列出); edited 为 WIP 门禁衔接 —
+    # 去 WIP 前缀 (PR ready) 时补跑 CI, 机制见文件头 "WIP 门禁".
+    # 注: synchronize 是 forgejo 的转换名 (非 synchronized); edited 亦覆盖 body 编辑
+    # (与 title 编辑共用通知路径), 同 SHA 已成功 run 会被内容去重秒过, 在跑期间编辑则
+    # 经 concurrency 取消重启.
+    types: [opened, synchronize, reopened, edited]
+  workflow_dispatch: # 手动重试: forgejo UI → Actions → ci-merge → Run workflow
+
+# PR 并发去旧 (issue #149-2): 同 PR 快速多次 push 时, 旧 run 的结果已无意义 (会被新
+# push 覆盖), 却在 runner single-job 假设下串行占用 runner, 让最新 push 的反馈延迟
+# 20min+. 按 PR number 分组 + cancel-in-progress 取消旧 run, 最新 push 立即开跑.
+# 非 PR 事件 (push master / dispatch) 的 group fallback 到 commit sha — push 与
+# dispatch 同 SHA 同在飞行中时后者会取消前者 (窗口极窄, 属良性 — 手动重试通常正是
+# 想取代在飞的自动 run). 注意: 这是 "同一 PR 的 run 之间" 去重, 与 runner 层
+# single-job 互斥 (见 check job env 段注释) 正交 — 后者约束 "不同 run 之间" 的并发.
+concurrency:
+  group: ci-merge-pr-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: vm-nix
+    # 事件去重 (push 仅 master) + WIP 门禁 (draft PR 不烧 CI; 判定用
+    # pull_request.draft = forgejo IsWorkInProgress(), 阻塞合并的同一 SSOT;
+    # 全 skip 时 run 结论 skipped 非 success, 不污染 skip-if-passed)
+    if: ${{ (github.event_name != 'push' || github.ref == 'refs/heads/master') && (github.event_name != 'pull_request' || github.event.pull_request.draft != true) }}
+    # 冷启动预算 (v3.0 重算, 接替旧 ci.yml 的 75min 单预算): P0 最坏冷链 (持久卷全清)
+    # = debug 编译 (clippy+nextest, ~20min, issue #149-1 实测) + check-features 增量
+    # (~2min) + diff/toolchain/filesize (~2min) ≈ 24min; 已不含移出档的最坏耗时
+    # (插桩 llvm-cov 编译 / release LTO bench 编译 10-20min / playwright / audit /
+    # nix 全量 vendor ≤30min — 分摊到 ci-deploy 60min 与 ci-periodic 45min 预算).
+    # 取 40min 留 ~65% 余量 (job timeout 是硬上限, 超时算 failure 阻塞合并,
+    # continue-on-error 救不了). 正常热路径 ~6-9min (旧全链实测 15-19min40s 减去
+    # 移出档份额).
+    timeout-minutes: 40
+    # 不声明 permissions: (Forgejo 不支持, 见文件头) — 迁移 GitHub 恢复 actions: read + pull-requests: write
+    #
+    # CARGO_TARGET_DIR 指向 runner VM 的持久卷, 跨 job 复用编译产物.
+    # 完整机制 (卷生命周期 / 子目录隔离 / 串行保证) 见 AGENTS.md "CI" 段.
+    #
+    # 并发互斥假设 (issue #86 子项 #4): 本 workflow 假设 runner vm-nix 同一时刻只跑一个 job
+    # (即 runner 注册时 concurrency 设为 1, 或 forgejo-runner 配置 single-job mode).
+    # 若该假设不成立 (runner 允许并发 job), 两个 job 同时写同一 CARGO_TARGET_DIR 会触发
+    # cargo `Blocking waiting for file lock` (慢) 或产物交错污染. 该假设的确认在 nixos 仓库
+    # forgejo-runner-vm.mod.nix (本仓库不可见); 若未来 runner 改为多并发, 需在此加
+    # `concurrency: { group: ci-vm-nix, cancel-in-progress: false }` 串行化所有 CI run,
+    # 或改 CARGO_TARGET_DIR 按 run_id 隔离 (但会丢跨 job 缓存复用, 编译变慢).
+    # 注: v3.0 三档 workflow 共享同一持久卷, 该假设与下方锁守卫对三档一体适用.
+    env:
+      CARGO_TARGET_DIR: /var/lib/forgejo-runner/cache/cargo-target
+    steps:
+      # ─── single-job 假设的运行时防御 (issue #149-7) ─────────────────────────
+      # 在 cache 卷根 (CARGO_TARGET_DIR 的父目录) 写 run_id 锁文件, job 结束时校验
+      # 未被覆盖. 不放在 CARGO_TARGET_DIR 内 — 卷级全清清理 (`rm -rf
+      # $CARGO_TARGET_DIR/*`, 见 runner VM 侧 cache-reclaim 定时服务, nixos 仓库
+      # forgejo-runner-vm.mod.nix) 会连带删掉它, 导致释放校验误报.
+      # 若 runner 未来改为多并发 (假设破裂), 两个 job 交替写同一 target dir:
+      # 后启动的 job 覆盖锁文件, 先启动的 job 结束时校验失败 → 把 "静默产物污染 /
+      # 偶现怪异失败" 转化为带指向性的硬失败. 届时按上方 env 段注释的应对预案改造
+      # (串行化或按 run_id 隔离), 然后可移除本防御.
+      # 放在所有 step 之前 (checkout 也可能写 target dir).
+      # 锁路径从 CARGO_TARGET_DIR 派生 (卷根), 末尾的 verify step 同源派生 — 两处联动.
+      - name: Guard single-job assumption (acquire target-dir lock)
+        id: lock
+        run: |
+          set -eu
+          : "${CARGO_TARGET_DIR:?}" # 防御本地摘脚本复现: 未设时锁会静默落到 cwd
+          LOCK="$(dirname "$CARGO_TARGET_DIR")/.ci-target-dir-lock"
+          mkdir -p "$(dirname "$LOCK")"
+          echo "$GITHUB_RUN_ID" > "$LOCK"
+          echo "lock: acquired target dir for run $GITHUB_RUN_ID (lock=$LOCK)"
+
+      # PR 事件需要 fetch base+head 以支持三点 diff (origin/<base>...HEAD);
+      # 其他事件 (push master / workflow_dispatch) 无 diff 需求, 保持浅克隆 --depth 1 省时.
+      # (checkout 链与 org 三骨架逐字节同构 — 无法 action 化的鸡生蛋问题见
+      # forgejo-actions README v2.1 修正记录; 仅额外带 id 供 diff step 的 outcome 守卫.)
+      - name: Checkout via SSH
+        id: checkout
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          if [ -n "$SSH_KNOWN_HOSTS" ]; then
+            printf '%s\n' "$SSH_KNOWN_HOSTS" >> ~/.ssh/known_hosts
+          else
+            echo "WARN: repo secret SSH_KNOWN_HOSTS 未设置 (TOFU 固定要求), 退回动态 ssh-keyscan (存在 MITM 窗口)." >&2
+            ssh-keyscan -p 5522 git.lambda.lc >> ~/.ssh/known_hosts
+          fi
+          git init
+          git remote add origin "ssh://forgejo@git.lambda.lc:5522/${GITHUB_REPOSITORY}.git"
+          if [ -n "$BASE_REF" ]; then
+            git fetch --no-tags origin "$BASE_REF"
+            git fetch --no-tags origin "$GITHUB_SHA"
+          else
+            git fetch --depth 1 origin "$GITHUB_SHA"
+          fi
+          git checkout "$GITHUB_SHA"
+
+      # 最小权限收尾: 清理 deploy key — runner VM 与缓存卷为 org 各仓库共享 (单槽位
+      # 串行), checkout 写入的 key 若不清理, 本 repo 的只读 key 对 org 内其他 repo 的
+      # 后续 job 可读 (ai-powered 首创).
+      # 放 checkout 后立即执行; 后续 diff 分析等非阻塞 step 不再持有 key.
+      # 无条件 always() (对齐骨架): checkout 脚本在写 key 之后失败 (fetch 网络抖动)
+      # 恰是最需清理的场景, outcome 条件反而在该路径跳过清理; rm -f 本身无失败面.
+      - name: Cleanup deploy key
+        if: always()
+        run: rm -f ~/.ssh/id_ed25519
+
+      # ─── 内容去重 (checkout 后, 本地 action 此时才可读; 编排在骨架, 判定在逻辑层) ───
+      # 仅 push 事件查询 (PR close-reopen 同 SHA 场景历史 success 会误跳过 PR 验证);
+      # continue-on-error: API 失败退化为不跳过 (fail-open, 不阻断 CI).
+      # 代价: push 事件命中跳过时白做一次 checkout (~1-2s 浅克隆, 可忽略).
+      # success() 显式写出隐式默认门 (if 条件不含 status 函数时自动前缀 success() &&):
+      # checkout 失败时不进空 workspace 跑探针.
+      - name: skip-if-passed
+        id: skip
+        uses: ./.forgejo/actions/skip-if-passed
+        if: success() && github.event_name == 'push'
+        continue-on-error: true
+
+      # ─── PR diff 拆解 (仅 PR 事件, 附加功能, 真正非阻塞) ──────────────────
+      # 放在门禁之前: 让 review 时尽早看到 prod/test 膨胀分析, 不必等编译+测试跑完.
+      # 工具 rust-diff-analyzer 由 runner VM 的 systemPackages 提供 (见 nixos 仓库
+      # rust.mod.nix), 不需要 install step.
+      #
+      # 真正非阻塞 (continue-on-error: true): 即使这些 step 失败 (网络/工具/API 抽风),
+      # 也不影响 check job 状态, 不阻塞合并 —— 遵循"附加功能不影响核心职责"的鲁棒性原则.
+      # if 条件四重与:
+      #   always()                          — 即使门禁失败也跑 (review 时仍想看膨胀)
+      #   github.event_name == 'pull_request' — 非 PR 事件无 diff 可分析
+      #   steps.checkout.outcome == 'success' — checkout 挂了没代码可分析, 不进入 (避免发空评论)
+      - name: Generate diff breakdown report
+        id: report
+        if: always() && github.event_name == 'pull_request' && steps.checkout.outcome == 'success'
+        continue-on-error: true
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          # --format comment: 输出 markdown, 适合 PR 评论.
+          # --no-fail: 工具自身不因检测到膨胀而退出非零.
+          {
+            echo "body<<EOF"
+            git diff "origin/$BASE_REF...HEAD" | rust-diff-analyzer --format comment --no-fail
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # 评论用纯 curl + Forgejo API (curl 是零依赖的 shell 命令, 比 JS action 更轻量).
+      # upsert 语义: 用 HTML marker 标记评论, 找到则 PATCH 更新 (PR 多次 push 不刷屏),
+      # 找不到则 POST 新建. 额外守卫 steps.report.outcome == 'success': 报告没生成就不发空评论.
+      # API base 用 github.api_url (与 skip 探针同源, 避免实例地址硬编码漂移).
+      - name: Upsert PR comment
+        if: always() && github.event_name == 'pull_request' && steps.report.outcome == 'success'
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          API_BASE: ${{ github.api_url }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BODY: ${{ steps.report.outputs.body }}
+        run: |
+          set -eu
+          MARKER='<!-- rust-diff-analyzer -->'
+          FULL_BODY="$MARKER"$'\n'"$BODY"
+          API="$API_BASE/repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments"
+
+          # 1. 查找已有评论 (按 marker 识别).
+          EXISTING_ID=$(curl -fsSL -H "Authorization: token $GITHUB_TOKEN" "$API" \
+            | jq --arg m "$MARKER" '.[] | select(.body | contains($m)) | .id' | head -1)
+
+          # 2. upsert: 找到 → PATCH 更新; 没找到 → POST 新建.
+          PAYLOAD=$(jq -n --arg b "$FULL_BODY" '{body: $b}')
+          if [ -n "$EXISTING_ID" ]; then
+            curl -fsSL -X PATCH \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$PAYLOAD" \
+              "$API/$EXISTING_ID" >/dev/null
+            echo "Updated comment $EXISTING_ID"
+          else
+            curl -fsSL -X POST \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$PAYLOAD" \
+              "$API" >/dev/null
+            echo "Created new comment"
+          fi
+
+      # ─── 工具链版本留痕 (issue #149-5b) ─────────────────────────────────────
+      # CI 工具链由 VM nixpkgs 决定, 三源 (CI/devShell/rust-toolchain.toml) 漂移时
+      # clippy 新 lint 可无预警阻塞所有 PR. 本 step 把 rustc 版本写入 step output,
+      # 由 Diagnose 评论携带, 留下每次 run 的工具链快照 (事后可追溯 "哪天升了").
+      # 放在首个阻塞 step 之前 + if: always() — 核心动机场景正是 "后续 step 因新
+      # lint 失败", 那时本 step 必须已跑过 (若放阻塞 step 之后会被 skip, 拿不到版本).
+      # rustc --version 零依赖秒级, 不需要 checkout.
+      # 选择并入 diag 评论而非独立评论/artifact: 零额外 API 调用, 成本最低.
+      # MSRV 下界的 SSOT 在 Cargo.toml rust-version (issue #149-5a).
+      - name: Record toolchain version
+        id: toolchain
+        if: always()
+        run: |
+          set -eu
+          RUSTC_VERSION=$(rustc --version)
+          echo "rustc_version=$RUSTC_VERSION" >> "$GITHUB_OUTPUT"
+          echo "toolchain snapshot: $RUSTC_VERSION"
+
+      # (cache 卷的防满回收不在此处: 由 runner VM 侧的 cache-reclaim 定时服务统一
+      # 负责 — 多 repo 共享同一卷, 回收逻辑收敛在基础设施层, 各 workflow 保持纯粹.
+      # 见 nixos 仓库 forgejo-runner-vm.mod.nix. 2026-08-24 ENOSPC 事故的教训记录:
+      # 旧版 CI 内嵌 Reclaim step 只清 profraw 且全清阈值 1G 过低, 挡不住 cargo
+      # 陈旧依赖产物的无界累积.)
+
+      # consistency-check feature 守卫: clippy + nextest 带 feature flag 跑一次.
+      # 该 feature 是默认关闭的 CI 守卫 (视图正确性断言, 详见 AGENTS.md "视图正确性确保机制"),
+      # 必须显式启用才能让断言执行. 单独成步, 复用 checkout; 也是 contracts.md
+      # prop_consistency_check_feature_runs_in_ci 契约的锚点 (check-contracts lint 核验).
+      - name: consistency-check feature guard
+        id: consistency
+        if: success() && steps.skip.outputs.should_skip != 'true'
+        run: just check-features
+
+      # P0 质量门禁主链 — 契约层入口 (`just ci-merge`, org v3.0 必须契约).
+      # ci-merge recipe 的 main 档 = 普通 check 主链 (fmt + clippy + machete + doc 门禁
+      # + 测试 + typos + deny-offline + check-webui-syntax + check-contracts + nix-check,
+      # 不带 --coverage — 插桩编译与 coverage-gate 已下沉 P2 ci-periodic).
+      # consistency 与 file-size 在本 workflow 独立成步 (紧邻前后, Diagnose 表按 step
+      # 定位失败), 故 gate 只跑主链段 — recipe 的默认档 (本地 `just ci-merge`) 则聚合
+      # 全链三段, 与本 job 编排逐段等价、无重复执行 (判定细节见 justfile ci-merge recipe).
+      # success() 显式默认门: checkout 失败时不进空 workspace 跑 just, 避免次级噪音.
+      - name: Quality gate (just ci-merge)
+        id: gate
+        if: success() && steps.skip.outputs.should_skip != 'true'
+        run: just ci-merge main
+
+      # 文件长度门禁: 防止单文件 prod 代码失控膨胀 (拆分 ROI 为负时的早期预警).
+      # 用 rust-diff-analyzer 对每个 .rs 做 AST 分类, 只统计 prod 行数 (排除 test).
+      # 依赖 rust-diff-analyzer (runner VM systemPackages 提供, 同 diff-loc 步).
+      # 双阈值: 超 FILE_WARN_PROD_LINES (500) 报 warning 不阻断; 超 FILE_MAX_PROD_LINES
+      # (1600) 则 exit 1 阻断. 不依赖编译产物, 放最后作为补充守卫.
+      - name: File size gate
+        id: filesize
+        if: success() && steps.skip.outputs.should_skip != 'true'
+        run: just check-file-size
+
+      # 诊断 step: job 失败时把所有阻塞 step 的 outcome 汇总贴到 PR 评论,
+      # 帮助无 admin 权限的 contributor 定位失败 step (无日志访问权限时的 fallback).
+      # 仅 PR 事件 + job 失败时触发. continue-on-error 兜底 (评论失败不影响 job 状态).
+      # 工具链版本 (issue #149-5b) 携带在此评论: 每次失败留痕 rustc 版本, 便于事后
+      # 追溯 "三源漂移" 类问题 (clippy 新 lint 突然阻塞).
+      # v3.0: 表随三档结构更新 — bench/playwright/audit/nix 不再在本 job (去向
+      # ci-deploy / ci-periodic, 见 docs/ci.md 步骤去向表).
+      - name: Diagnose failure (post step outcomes to PR)
+        if: always() && failure() && github.event_name == 'pull_request'
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          API_BASE: ${{ github.api_url }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -eu
+          {
+            echo "## 🔍 CI 诊断报告 (step outcomes)"
+            echo ""
+            echo "**Toolchain**: ${{ steps.toolchain.outputs.rustc_version || 'unknown (step skipped)' }}"
+            echo ""
+            echo "| Step | id | Outcome |"
+            echo "|------|----|---------|"
+            echo "| Guard lock | lock | ${{ steps.lock.outcome }} |"
+            echo "| consistency-check | consistency | ${{ steps.consistency.outcome }} |"
+            echo "| Quality gate (check 主链: fmt/clippy/machete/doc/--locked/typos/deny-offline/check-contracts) | gate | ${{ steps.gate.outcome }} |"
+            echo "| File size | filesize | ${{ steps.filesize.outcome }} |"
+            echo ""
+            echo "(coverage-gate/WebUI/bench/audit/nix 不在本 job — v3.0 三档拆分后分别归"
+            echo " ci-periodic (P2) 与 ci-deploy (P1), 各自 run 红即可见, 无 PR 评论矩阵.)"
+            echo ""
+            echo "**Job status**: ${{ job.status }}"
+            echo "**Run**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > /tmp/diag.md
+          MARKER='<!-- ci-diagnose -->'
+          BODY="$(cat /tmp/diag.md)"
+          FULL_BODY="$MARKER"$'\n'"$BODY"
+          API="$API_BASE/repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments"
+          PAYLOAD=$(jq -n --arg b "$FULL_BODY" '{body: $b}')
+          curl -fsSL -X POST \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "$API" >/dev/null && echo "Diag comment posted" || echo "POST diag comment failed (non-fatal)"
+
+      # ─── single-job 假设的运行时防御: 释放校验 (issue #149-7) ────────────────
+      # 校验锁文件未被覆盖 (被覆盖 = 有第二个 job 并发写了同一 target dir, 假设破裂).
+      # if: always() — 无论 job 成败都校验 (污染检测优先于成败判定). 失败消息指向
+      # 上方 env 段的并发假设注释, 维护者可按预案改造. 放在最后: 需等所有写 target
+      # dir 的 step 结束后校验才有意义. 锁路径与开头的 acquire step 同源派生 (卷根).
+      - name: Guard single-job assumption (verify target-dir lock)
+        if: always()
+        run: |
+          set -eu
+          : "${CARGO_TARGET_DIR:?}" # 防御本地摘脚本复现: 未设时锁会静默落到 cwd
+          LOCK="$(dirname "$CARGO_TARGET_DIR")/.ci-target-dir-lock"
+          CURRENT=$(cat "$LOCK" 2>/dev/null || echo "MISSING")
+          if [ "$CURRENT" = "MISSING" ]; then
+            echo "::error::target-dir lock file missing: $LOCK (deleted mid-job? volume wiped?)."
+            echo "锁文件在 job 开始时由 acquire step 写入, 正常路径不可能消失 — 排查卷状态."
+            exit 1
+          fi
+          if [ "$CURRENT" != "$GITHUB_RUN_ID" ]; then
+            echo "::error::target-dir lock file corrupted: expected run $GITHUB_RUN_ID, got '$CURRENT'."
+            echo "另一个 job 并发写了同一 CARGO_TARGET_DIR — runner single-job 假设已破裂."
+            echo "按本 job env 段 '并发互斥假设' 注释的预案处理 (串行化 concurrency 或按 run_id 隔离),"
+            echo "详见 .forgejo/workflows/ci-merge.yml 与 docs/ci.md '并发互斥假设' 段."
+            exit 1
+          fi
+          echo "lock: verified (run $GITHUB_RUN_ID, no concurrent writer)"
+
+      # 历史: 早期曾用 "Bench compile check (release, --no-run)" 方案, 因 release 全量编译慢而移除;
+      # 后改为 "dev profile --no-run" (v3.0 起 bench 整体移至 ci-deploy.yml). 此处保留备选记录.
+      # - name: Bench compile check (release --no-run)
+      #   continue-on-error: true
+      #   run: just check-benches

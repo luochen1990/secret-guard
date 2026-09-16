@@ -1,16 +1,18 @@
 # CI 实现细节 (Forgejo Actions)
 
-> **职责**: `.forgejo/workflows/ci.yml` 的实现细节 SSOT (checkout 策略 / 缓存复用 /
-> 并发假设 / 评论写回), 面向 CI 维护者.
+> **职责**: `.forgejo/workflows/{ci-merge,ci-deploy,ci-periodic}.yml` 三档 workflow 的
+> 实现细节 SSOT (checkout 策略 / 缓存复用 / 并发假设 / 评论写回), 面向 CI 维护者.
 > **受众**: 修改 CI 配置 / 需要调整 workflow 的人.
 > **接口性质的高层概述** (配置位置 / 触发条件 / CI 做了什么) 在根 `AGENTS.md`
 > "## 开发流程 → ### CI (Forgejo Actions)" 段, 改 CI 配置前先读那段了解整体定位.
-> 与 ci.yml 不一致时以 ci.yml 为准.
+> 与 workflow 文件不一致时以 workflow 文件为准 (P0 = ci-merge.yml).
 
 ## 触发与去重
 
-CI 配置 `.forgejo/workflows/ci.yml`, 触发: `push` + `pull_request` (显式 `types`
-含 `edited`, 为 WIP 门禁衔接 — forgejo 默认事件集不含 title 编辑) + `workflow_dispatch`.
+v3.0 三档: `ci-merge.yml` (P0, PR + master push + 手动) / `ci-deploy.yml` (P1, master
+push + nightly + 手动) / `ci-periodic.yml` (P2, nightly per-SHA 去重 + 手动, 无 push)。
+P0 的 `pull_request` 显式 `types` 含 `edited` (WIP 门禁衔接 — forgejo 默认事件集不含
+title 编辑); 三档共用 repo secrets (DEPLOY_KEY / SSH_KNOWN_HOSTS) 与持久卷。
 
 三重跳过 (节省 runner):
 
@@ -18,17 +20,18 @@ CI 配置 `.forgejo/workflows/ci.yml`, 触发: `push` + `pull_request` (显式 `
   浪费. PR 事件总是跑 (合并前检查, 主要场景; draft/WIP PR 除外, 见 WIP 门禁); push 仅
   master 跑 (合并后的 commit, feature branch 的 push 由 PR 覆盖).
 - **内容去重 (skip-if-passed)**: ff-merge 后 commit SHA 不变, master 的 push 会重复
-  触发已跑过的 CI. `pre` job 查 Forgejo API (`head_sha` + `status=success`, 限 ci.yml
-  workflow), 命中则 `check` job 跳过 (连 checkout 都不执行). 失败退化为不跳过 (不阻断 CI).
-  `workflow_dispatch` 直通不查 skip (手动重跑需无条件执行).
+  触发已跑过的 CI. 共享本地 action `skip-if-passed` 查 Forgejo API (服务端过滤
+  `head_sha`+`status=success`+`workflow_id` 自指), 命中则后续门禁 step 跳过.
+  失败退化为不跳过 (不阻断 CI). 查询时机按档位不同: P0/P1 仅 push 事件, P2 仅
+  schedule 事件 (per-SHA 去重); `workflow_dispatch` 直通不查 (手动重跑需无条件执行).
 - **WIP 门禁 (draft PR 跳过, issue #204 / nixos#791)**: draft PR (title 带 `WIP:`/
   `[WIP]` 前缀) 不触发 CI — WIP PR 离可合并尚远 (forgejo 本就按 WIP 前缀阻塞合并),
   其上每次 push 的 check 纯属浪费 (runner 单槽位且全 org 共享). 去 WIP 前缀 (title
   编辑) 触发 `edited` 事件自动补跑. 判定用 payload `pull_request.draft` (=
   forgejo `IsWorkInProgress()`, 与阻塞合并同一 SSOT, 前缀集随实例配置自动对齐).
-  关键语义 (forgejo v15.0.7 源码核实): ① `pre` + `check` **双 job 都必须门禁** — 只门禁
-  `check` 时 `pre` 跑成功 → run 结论 success → 污染 skip-if-passed 内容去重 (去 WIP 后
-  补跑被误判 "已通过"); 全 job skipped → run 结论 `skipped` (非 success) → 不污染.
+  关键语义 (forgejo v15.0.7 源码核实): ① v3.0 单 job 化后, WIP 门禁在 `check` job 的
+  `if` 上 — job 被跳过 → run 结论 `skipped` (非 success) → 不污染 skip-if-passed
+  (去 WIP 后补跑不会被误判 "已通过"; 旧双 job 形态的 "pre 污染" 窗口随 pre 删除消失).
   ② job 级 skip 的 commit status 映射绿色 ("Has been skipped"), 已知残余窗口 (去 WIP →
   覆盖 run 写 pending 之间, 亚秒) 由 merge automation 组织级根治兜底 (CI 判定改查
   action runs, skipped run 不被采信, nixos#794). ③ WIP 化的 edited 事件经同
@@ -40,110 +43,106 @@ single-job runner 上串行占位, 延迟最新 push 的反馈. workflow 级
 取消旧 run. 与 runner 层 single-job 互斥 (见下文"并发互斥假设") 正交 — 前者约束
 "同一 PR 的 run 之间", 后者约束 "不同 run 之间".
 
-## CI 流程 (check job, 测试集只跑一次)
+## CI 流程 (v3.0 三档; P0 = ci-merge.yml check job)
 
-按 ci.yml step 顺序 (本节是导航辅助):
+按 ci-merge.yml step 顺序 (本节是导航辅助; check-docs 机器校验本编号清单与文件
+`- name:` 数一致):
 
 1. **Guard single-job assumption (acquire)** — 在 cache 卷根写 run_id 锁文件, 供末尾
    的释放校验检测 "另一 job 并发写了同一 CARGO_TARGET_DIR" (single-job 假设破裂时把
-   静默产物污染转为带指向性的硬失败, 详见下文"并发互斥假设").
+   静默产物污染转为带指向性的硬失败, 详见下文"并发互斥假设")。
 2. **Checkout via SSH** — 见下文"checkout 用 git + SSH". PR 事件 fetch base+head 支持三点
-   diff; 其他事件浅克隆 `--depth 1` 省时.
-3. **Generate diff breakdown report** (仅 PR 事件, `continue-on-error` 真正非阻塞):
-   `rust-diff-analyzer` (runner VM systemPackages 提供) 对 `origin/<base>...HEAD` 跑 diff
-   拆解, `--format comment` 输出 markdown. 放在 check 之前让 review 尽早看到膨胀分析.
-4. **Upsert PR comment** (仅 PR 事件, `continue-on-error`): 把上一步报告以评论形式贴出,
-   upsert 机制见下文"评论写回机制".
-5. **Record toolchain version** (`if: always()`): 把 `rustc --version` 写入 step output,
-   由 Diagnose 评论携带留痕 — CI 工具链由 VM nixpkgs 决定, 三源 (CI/devShell/
-   rust-toolchain.toml) 漂移导致 clippy 新 lint 无预警阻塞时, 事后可追溯 "哪天升的".
-   放在首个阻塞 step 之前: 核心动机场景正是 "后续 step 因新 lint 失败", 那时本 step
-   必须已跑过. MSRV 下界 SSOT 在 Cargo.toml `rust-version`.
-6. **consistency-check feature guard** (`just check-features`): clippy + nextest 带
-   `consistency-check` feature 跑一次 (视图正确性断言, 详见根 AGENTS.md "视图正确性确保机制").
-   单独成步复用 checkout, 在 coverage 的 cargo clean 前, 不影响磁盘峰值控制.
-7. **Check + coverage data** (`just check --coverage`): fmt + clippy + machete + **doc 门禁**
-   + 测试 + **typos + deny-offline** + **check-contracts** (contracts.md property 落地
-   标注 lint, #144: ✅ 须同名命中 / 🔁 锚点须可 grep / 每条 property 必有标注), 用
-   `cargo llvm-cov nextest` 插桩, 产出 profdata 供
-   下一步消费. **测试集只跑这一次**. cargo 命令均带 `--locked` (Cargo.toml/Cargo.lock
-   不一致时 CI 硬失败, 防止 CI 静默重 resolve 导致测试对象漂移). doc 门禁
-   (`RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps`) 位于 justfile check 的
-   公共段 — 原先仅在非 coverage 分支执行而 CI 恒走 coverage 分支, 是从未生效的死门禁
-   (issue #141). typos + deny-offline (`cargo deny --offline check licenses bans sources`)
-   在链尾执行, 不设独立 step — 独立 step 只可能 "check 内失败后被 skip" 或 "check 内
-   通过后重跑必过", 永远不产生独立失败信号; 本地 `just check` 链尾跑同一命令, 保证本地
-   全绿 ⇒ CI 必绿 (issue #149-3/-8).
-8. **Coverage gate** (`just coverage-gate`): 双阈值 (line% 下限 + 未覆盖行数上限, 阈值
-   SSOT 在 justfile), 只做 report 读上一步 profdata, 不重跑测试.
-9. **Performance benchmark** (`just bench-ci`, `continue-on-error` 非阻塞): criterion
-    baseline 回归检测. master push → `bench-ci save` (滚动更新基线 `ci`); PR →
-    `bench-ci compare` (只对比不覆盖, 冷启动自动 fallback 建 首基线). 退化判定 (解析
-    criterion 输出的 change 中位数, 默认 20% 阈值) + 退出码契约 (0 正常 / 1 退化 / 2 失败)
-    的 SSOT 在 justfile `bench-ci` recipe. criterion 基线落 `CARGO_TARGET_DIR/criterion/`
-    跨 job 复用.
-10. **Upsert benchmark report to PR** (仅 PR 事件, `continue-on-error`): bench 结果 upsert
-    到 PR 评论, 复用 marker 机制让退化信号不只埋在 job log.
-11. **File size gate** (`just check-file-size`): `rust-diff-analyzer` 对每个 .rs 做 AST 分类,
-    只统计 prod 行数 (排除 test), 双阈值 (WARN 500 软提醒 / MAX 1600 硬阻断, fail-closed).
-12. **WebUI regression (Playwright)** (`just check-webui`, `continue-on-error` 初期非阻塞):
-    webServer 自动启动 mock upstream + secret-guard, 复用上一步编译的 debug binary
-    (CARGO_TARGET_DIR 指向持久卷, playwright.config.ts 读此环境变量). 退出码与输出摘要
-    写入 step output, 供下一步 upsert.
-13. **Upsert WebUI result to PR** (仅 PR 事件, `continue-on-error`): WebUI 结果 upsert 到
-    PR 评论 (marker `<!-- webui-regression -->`). 修复可见性不对称: WebUI 是非阻塞 step,
-    失败若只埋在 job log + artifact, "连续 N=20 次绿 → 转阻塞" 的升级判据永远无人察觉.
-14. **Upload Playwright artifacts on failure** (仅 Playwright 失败时, `continue-on-error`):
-    上传截图/trace/html 报告. 用 Forgejo 官方 fork `forgejo/upload-artifact@v4`
-    (GitHub 官方版会检测非 GitHub 环境报错), retention 14 天.
-15. **cargo audit** (`just audit`, `continue-on-error` 非阻塞): CVE 扫描 (含 advisory
-    DB 拉取 — 网络依赖是它保持非阻塞的原因之一; advisories 职责归此, 与 deny 互为冗余
-    兜底), 输出 tee 到 audit.txt 供下一步 upsert 到 PR 评论. advisory DB 经
-    `CARGO_AUDIT_DB` 持久缓存到卷 (justfile audit recipe 透传 `--db`, 首次 clone 后
-    跨 job 增量 fetch). 忽略项配置 `.cargo/audit.toml`, 详见根 AGENTS.md
-    "cargo-audit (CVE 监控)" 段.
-16. **Upsert cargo audit report to PR** (仅 PR 事件, `continue-on-error`): audit 结果 upsert
-    到 PR 评论, 复用 diff-loc 的 marker 机制让非阻塞的 CVE 不只埋在 job log.
-17. **nix build (cargoHash validation)** (`nix build .#secret-guard -L`,
-    `continue-on-error` 非阻塞起步): 验证 nix/pkgs/secret-guard.nix 的 cargoHash 与 Cargo.lock
-    一致 (漂移时错误只在部署侧 ~/ws/nixos 重建时暴露, 排障跨仓库). 转阻塞判据: 连续
-    N=20 次 master push 跑绿 (同 WebUI step 判据). 注意依赖升级 PR 会合法触发本 step
-    失败 (提醒同步 cargoHash), 属预期信号.
-18. **Diagnose failure** (仅 PR + job 失败时, `continue-on-error`): 阻塞 step outcomes
-    汇总表 + 工具链版本贴到 PR 评论.
-19. **Guard single-job assumption (verify)** (`if: always()`): 校验 Guard acquire step
-    写入的锁文件未被覆盖; 被覆盖 (= 另一 job 并发写了同一 target dir) 则显式失败并指向
-    "并发互斥假设" 段的应对预案.
+   diff; 其他事件浅克隆 `--depth 1` 省时。
+3. **Cleanup deploy key** (`if: always()`) — org 共享 runner 最小权限收尾, checkout
+   写入的只读 key 用后即清。
+4. **skip-if-passed** (内容去重) — 共享本地 action (`.forgejo/actions/skip-if-passed`,
+   与 SSOT 逐字节同步), 仅 push 事件查询; 替代旧双 job 形态的内联 `pre` 探针。
+5. **Generate diff breakdown report** (仅 PR 事件, `continue-on-error` 真正非阻塞):
+   `rust-diff-analyzer` 对 `origin/<base>...HEAD` 跑 diff 拆解, `--format comment`
+   输出 markdown. 放在门禁之前让 review 尽早看到膨胀分析。
+6. **Upsert PR comment** (仅 PR 事件, `continue-on-error`): 把上一步报告以评论形式贴出,
+   upsert 机制见下文"评论写回机制"。
+7. **Record toolchain version** (`if: always()`): 把 `rustc --version` 写入 step output,
+   由 Diagnose 评论携带留痕 (CI 工具链由 VM nixpkgs 决定, 三源漂移事后可追溯)。
+8. **consistency-check feature guard** (`just check-features`): clippy + nextest 带
+   `consistency-check` feature 跑一次 (视图正确性断言, 详见根 AGENTS.md "视图正确性确保
+   机制"; 也是 contracts.md `prop_consistency_check_feature_runs_in_ci` 的锚点)。
+9. **Quality gate (just ci-merge main)** — P0 阻塞主链: `just check` 普通档 (fmt +
+   clippy + machete + doc 门禁 + 测试 + typos + deny-offline + check-webui-syntax +
+   check-contracts + nix-check, **不带 --coverage** — 插桩与 coverage-gate 已归 P2)。
+   cargo 命令均带 `--locked`。测试集只跑这一次。stage 机制见 justfile `ci-merge`
+   recipe (CI 拆 step / 本地 all 档聚合, 逐段等价无重复)。
+10. **File size gate** (`just check-file-size`): `rust-diff-analyzer` 对每个 .rs 做 AST
+    分类, 只统计 prod 行数 (排除 test), 双阈值 (WARN 500 软提醒 / MAX 1600 硬阻断,
+    fail-closed)。
+11. **Diagnose failure** (仅 PR + job 失败时, `continue-on-error`): 阻塞 step outcomes
+    汇总表 + 工具链版本贴到 PR 评论 (无日志权限 contributor 的 fallback)。
+12. **Guard single-job assumption (verify)** (`if: always()`): 校验 acquire step 写入的
+    锁文件未被覆盖; 被覆盖则显式失败并指向 "并发互斥假设" 段的应对预案。
 
-> **流程顺序原则**: 真正非阻塞的附加检查 (diff 报告 / bench / WebUI / audit / nix build) 用
-> `continue-on-error` 兜底, 即使抽风也不影响 `check` job 状态; 阻塞门禁 (consistency-check /
-> check 含 doc/--locked/typos/deny-offline / coverage-gate / file-size / lock 校验) 失败则
-> job 失败.
+> **流程顺序原则**: 真正非阻塞的附加检查 (diff 报告 / Diagnose) 用 `continue-on-error`
+> 兜底, 即使抽风也不影响 `check` job 状态; 阻塞门禁 (consistency-check / check 主链
+> 含 doc/--locked/typos/deny-offline/check-contracts / file-size / lock 校验) 失败则
+> job 失败。
+
+### P1 ci-deploy.yml (master push + nightly `0 19 * * *` + 手动; `just ci-deploy`)
+
+部署门禁档 — 红 = 不能部署 (**不执行部署动作**)。非超集偏差 (只跑 P1 增量, 不重跑 P0
+全链): 无部署流水线消费本检查 + P0 全链 6-9min 单槽位重跑不值; 升级路径 = ci-deploy
+recipe 头部加一行 `just ci-merge`。step: Guard acquire / Checkout (恒浅克隆) / Cleanup
+key / skip-if-passed (`workflow_file: ci-deploy.yml` 自指, 仅 push 查询 — nightly/
+dispatch 无条件) / **Quality gate (`just ci-deploy`)** = cargo audit (CVE, 阻塞) +
+bench compare-save (判回归 + 滚动更新基线, 退化 → run 红) / **nix build (cargoHash
+validation)** (阻塞, step 级 timeout 30) / Guard verify。
+
+政策变化 (相对旧单 workflow): audit / nix build 由 PR 上的 continue-on-error 非阻塞
+转为 P1 阻塞 — 旧非阻塞理由 ("不阻塞 PR 合并") 在 P1 (不门禁 PR 合入) 不再适用;
+"红 = 不能部署" 正是本档职责 (audit 发现 CVE / cargoHash 漂移致发布物不可构建 /
+性能退化, 都是该挡下部署的真信号)。
+
+### P2 ci-periodic.yml (nightly `0 20 * * *` per-SHA 去重 + 手动; `just ci-periodic`)
+
+周期兜底档 — 红 = 欠债待还, **不阻塞任何事**。**刻意无 push 触发** (check-drift 负向
+断言): 慢内容 (插桩编译 + 全量测试 + Playwright) 离开 push 关键路径, 白天槽位留给门禁
+run。skip 仅 schedule 事件查询 + `workflow_file: ci-periodic.yml` 自指 → 按 SHA 去重
+(同代码同结果, 同 SHA 跑一次即足; 失败无 success 记录 → 次晚自愈重试; dispatch 永不
+跳过且可选任意分支 = 高风险 PR 合入前全量回归逃生舱)。step: Guard acquire / Checkout /
+Cleanup key / skip-if-passed / **Quality gate (`just ci-periodic`)** = `just check
+--coverage` (插桩测试, 测试集只跑这一次) + `just coverage-gate` (双阈值防倒退, 阻塞) /
+**WebUI regression (Playwright)** (`just check-webui`, continue-on-error — flake 由次晚
+重试自愈; binary 复用插桩产物, playwright.config.ts 候选链第三命中) / Upload Playwright
+artifacts on failure (截图/trace/报告, retention 14 天) / Guard verify。
+
+### 旧 ci.yml step → v3.0 去向表
+
+| 旧 step | 去向 |
+|---|---|
+| Guard acquire/verify, Checkout, Cleanup key | P0 (三档各自保留, 逐字节同构) |
+| pre job (内联探针) | 删除 — 换共享本地 action (三档各自接线, workflow_file 自指) |
+| diff breakdown + Upsert 评论, toolchain 留痕, Diagnose | P0 保留 |
+| consistency-check feature guard | P0 保留 (独立 step, contracts.md 锚点) |
+| Check + coverage data (`--coverage` 插桩) | 拆分: 普通主链留 P0 (step 9); 插桩归 P2 |
+| Coverage gate | **P2** (rubric: 覆盖率防倒退 = 质量债, 不卡合入) |
+| Performance benchmark + bench PR 评论 | **P1** (compare-save 单模式; PR 评论随 PR 事件消失) |
+| WebUI regression + 评论 + artifact | **P2** (评论随 PR 事件消失 → 日志摘要 + artifact) |
+| cargo audit + PR 评论 | **P1** (转阻塞; 评论随 PR 事件消失) |
+| nix build (cargoHash) | **P1** (转阻塞, 留 workflow 层) |
 
 ## 非阻塞检查的升级路径
 
-- **cargo audit**: 保持 `continue-on-error` 非阻塞 (非阻塞理由见上 "cargo audit" step). 结果已 upsert
-  到 PR 评论供 review 时看到, 无需进 job log 翻找.
-- **Performance benchmark**: `continue-on-error` 非阻塞 (`--quick` 10 samples 噪声大, p>0.05
-  常态, 退化判定只做量级级粗筛防 2x+ 退化, 避免误伤 PR). 退化信号已 upsert 到 PR 评论供
-  人工判断. **退出条件**: 连续 N=20 次 master push 无误报后, 可移除 PR 的 `continue-on-error`.
-- **WebUI regression (Playwright)**: 初期 `continue-on-error` (CI 环境无 GPU / chromium 渲染
-  可能有 flake). **退出条件**: 连续 N=20 次 master 分支 (push 事件) 本 step 跑绿后, 移除
-  `continue-on-error` 升级为阻塞. 判定: 翻 Actions 历史筛 master + WebUI step 取最近 20 次
-  全绿即达标; 升级前先在 PR 评论记录达标证据 (20 次 run 链接).
-- **diff 报告**: 真正非阻塞 (`continue-on-error: true`), 工具/网络/API 失败也不影响合并,
-  无升级计划 (附加功能性质).
-- **nix build (cargoHash validation)**: `continue-on-error` 非阻塞起步 — 首次/依赖大版本
-  升级时全量 vendor 编译较慢, 且 cargoHash 过期是已知高频事件 (升级依赖的 PR 必然触发,
-  失败属预期提醒: 同步 nix/pkgs/secret-guard.nix). **退出条件**: 连续 N=20 次 master push 本 step
-  跑绿后移除 `continue-on-error` (判定方式同 WebUI: 翻 Actions 历史筛 master + 本 step
-  取最近 20 次全绿).
-- **cargo-deny / typos**: 已是阻塞门禁 (无观察期, 见下 blockquote). 新误报出现时更新对应
-  配置 (`deny.toml` / `_typos.toml`) 即可, 属正常维护.
+- **diff 报告 / Diagnose**: 真正非阻塞 (`continue-on-error: true`), 工具/网络/API 失败
+  也不影响合并, 无升级计划 (附加功能性质)。
+- **WebUI regression (Playwright, P2)**: 保持 `continue-on-error` — P2 无 PR 合入语义,
+  无 "转阻塞" 升级目标; flake 由次晚 schedule 重试自愈, 失败 tail 摘要 + artifact 可见。
+- **Performance benchmark (P1, compare-save)**: 已是 P1 阻塞信号 (退化 exit 1 → run 红);
+  `--quick` 10 samples 噪声大 (±15% 实测), 阈值 20% 只做量级级粗筛 — 升级到完整 samples
+  后可收紧到 10%。
+- **cargo audit / nix build (P1)**: v3.0 起已阻塞化 (P1 语义), 无观察期。
+- **cargo-deny / typos**: 已是 P0 阻塞门禁 (check 链尾, 无观察期)。新误报出现时更新
+  对应配置 (`deny.toml` / `_typos.toml`) 即可, 属正常维护。
 
-> license 合规 (cargo-deny) 与 CVE (cargo audit) 性质不同 — license 违规是真问题 (污染下游),
-> 已升级阻塞; CVE 受网络 DB 抖动影响保持非阻塞更稳.
-
+> license 合规 (cargo-deny, P0 阻塞) 与 CVE (cargo audit, P1) 性质不同 — license 违规
+> 污染下游是真问题; CVE 属环境敏感信号, 归 nightly 无条件兜底档。
 ## 评论写回机制 (PR comment upsert)
 
 CI 用纯 `curl` + Forgejo API (`POST/PATCH /repos/{owner}/{repo}/issues/{n}/comments`)
@@ -197,7 +196,7 @@ concurrency=1 或 single-job mode, 配置在 nixos 仓库 `forgejo-runner-vm.mod
 若该假设被打破 (runner 允许并发 job), 两个 job 同时写同一 `CARGO_TARGET_DIR` 会触发 cargo
 `Blocking waiting for file lock` (慢) 或产物交错污染.
 
-**应对预案** (见 ci.yml `check` job `env` 段注释):
+**应对预案** (见 ci-merge.yml `check` job `env` 段注释, 三档一体适用):
 
 1. 加 `concurrency: { group: ci-vm-nix, cancel-in-progress: false }` 串行化所有 CI run; 或
 2. 改 `CARGO_TARGET_DIR` 按 `run_id` 隔离 (但会丢跨 job 缓存复用, 编译变慢).
@@ -205,25 +204,30 @@ concurrency=1 或 single-job mode, 配置在 nixos 仓库 `forgejo-runner-vm.mod
 > 注: workflow 级 `concurrency` (PR 并发去旧, 见 "触发与去重") 不解决本节问题 — 它只
 > 取消同 PR 的旧 run, 不同 PR 的 run 之间仍依赖 runner single-job 假设.
 
-## job 超时预算
+## job 超时预算 (v3.0 按档拆分)
 
-`check` job `timeout-minutes: 75` (issue #149-1). 正常热路径 ~10min; 持久卷全清后的
-冷启动需串行完成 debug 插桩编译 (~20min) → 测试 → release LTO bench (10-20min) →
-playwright → audit → nix build (自身 timeout 30min), 双冷 (卷 + nix store 同时
-重建, 仅 VM 首建/重建时出现) 总计可达 ~70min, 75min 留余量. 20min 的旧值在冷启动场景
-必超时且 timeout 算 job failure 会阻塞合并 (continue-on-error 救不了 job 级 timeout,
-预算必须计入非阻塞 step 的最坏耗时).
+旧单 workflow 75min 预算按三档重算 (issue #149-1 的冷启动实测口径; timeout 算 job
+failure, continue-on-error 救不了 — P0 超时会阻塞合并):
+
+- `ci-merge` 40min: 冷链 = debug 编译 ~20min + check-features + diff/filesize ≈ 24min,
+  正常热路径 ~6-9min (旧全链实测 15-19min40s 减移出档份额).
+- `ci-deploy` 60min: release LTO bench 编译 10-20min + bench 运行 + audit + nix build
+  (step 自身硬上限 30min), 正常热路径 ~8-12min.
+- `ci-periodic` 45min: 插桩编译 20-25min + 测试 + report + Playwright ~3-5min,
+  正常热路径 ~8-12min.
 
 ## commit status context (workflow name / job_id 禁改)
 
-`ci / check (pull_request)` 或 `ci / check (push)` 是 branch protection 的 required status
-check. context 由 workflow `name: ci` + job_id `check` 拼成.
+`ci-merge / check (pull_request)` 或 `ci-merge / check (push)` 是 branch protection 的
+required status check. context 由 workflow `name: ci-merge` + job_id `check` 拼成.
 
-**禁止改 workflow `name` 或 job_id `check`** — 会改变 context 破坏门禁规则. branch protection
-status check 规则 `ci / check (*)` 用通配符覆盖 push 与 pull_request 两种事件后缀.
+**禁止改 workflow `name` 或 job_id `check`** — 会改变 context 破坏门禁规则. branch
+protection 规则由 nixos 仓 forgejo-sync 声明式管理 (v3.0 迁移期为 dual-glob 桥接
+`ci* / check*`, 新旧名同过门禁; 全 org 迁完后收紧, 见 forgejo-actions AGENTS.md) —
+改名/调整走 nixos 仓 PR, 勿在本仓或 UI 命令式修改.
 
-> 注: `pre` job 产生 `ci / pre (*)` check, 但因 step `continue-on-error` 兜底, 该 check 对 PR
-> 事件恒为 success, 不影响 branch protection (无需加入 required list).
+> 注: 旧 `pre` job (`ci / pre (*)` check) 已随 v3.0 单 job 化删除 (探针并入 check job 的
+> skip step).
 
 ## checkout 用 git + SSH (不用 actions/checkout)
 
@@ -234,8 +238,9 @@ forgejo 实例启用了 `DISABLE_HTTP_GIT=true` (禁止 git over HTTPS), 且内�
 直接用 git 命令把用户名和端口写在 `ssh://` URL 里 (`ssh://forgejo@git.lambda.lc:5522/...`),
 一步到位无黑盒:
 
-- **host key**: `ssh-keyscan -p 5522 git.lambda.lc` 每次动态获取 (runner 在可信 MicroVM, LAN
-  可信, 首次即信任).
+- **host key**: TOFU — 优先 repo secret `SSH_KNOWN_HOSTS` (keyscan 原样输出, 消除动态
+  keyscan 的 MITM 窗口); secret 缺失退回动态 `ssh-keyscan -p 5522` + stderr 警告 (org
+  标准链, directory-algebra #89 同源).
 - **凭据**: 依赖一个 repo-level secret `DEPLOY_KEY` (ed25519 私钥, 公钥在 repo Deploy keys 注册),
   写入 `~/.ssh/id_ed25519` (mode 0600).
 - **clone 策略**: `git init` + `git remote add` + `git fetch`. PR 事件 fetch base+head

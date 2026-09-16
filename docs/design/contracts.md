@@ -885,7 +885,7 @@ real 还原进去等于精准投放泄露. 故默认"偏安全", 暴露侧行为
 
 **Properties** (人工审查项 + feature flag):
 - `prop_view_deletion_has_assertion`: 任何"删除原始数据改用派生视图"的重构 commit 必须含 consistency-check 断言. 🔁→人工审查项 + 既有断言 `assert_redactions_match_map` 等 (`src/proxy/recorder.rs`, VIEW-2 表)
-- `prop_consistency_check_feature_runs_in_ci`: consistency-check feature flag 在 CI 中独立运行. 🔁→CI step `consistency-check feature guard` (`.forgejo/workflows/ci.yml`) + `just check-features`
+- `prop_consistency_check_feature_runs_in_ci`: consistency-check feature flag 在 CI 中独立运行. 🔁→CI step `consistency-check feature guard` (`.forgejo/workflows/ci-merge.yml`) + `just check-features`
 
 ### VIEW-2 派生字段 consistency-check 覆盖
 
