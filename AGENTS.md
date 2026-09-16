@@ -757,6 +757,10 @@ CI runner VM 未预装 treefmt 时 check-fmt 降级 rust-only (见 justfile).
 
 ## 已知限制 (MVP)
 
+- **协议支持范围未经真实上游实地测试** (2026-09 用户决策, 开源诚实边界): Gemini /
+  Ollama (仅透传, 无 codec) 与 Anthropic 协议及其参与的跨协议翻译, 测试覆盖全部基于
+  mockito 模拟上游; 真实 Provider 上的实地验证尚未进行。README "边界与已知限制" 与
+  文档站已对用户声明此边界。后续实地验证时按协议逐族补集成测试 + 更新声明。
 - **OpenAI 流式请求未开 `include_usage` 时无 token 统计** (usage-stats, USAGE-5):
   OpenAI 流式默认不回显 usage, 需客户端设 `stream_options.include_usage = true`;
   网关不代为注入 (FWD-1 未授权). 此类请求在 Usage 页只计请求数 (`requests_without_usage`

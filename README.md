@@ -45,15 +45,15 @@ Mock 呈现, 即 LLM 所见):
 ### 1. 安装
 
 ```bash
-# 二进制归档 (Linux musl 全静态 / Windows, 附 SHA256 校验) — 见下载页:
+# 二进制归档 (Linux x86_64 / ARM64, musl 全静态, 附 SHA256 校验) — 见下载页:
 #   https://secret-guard.lambda.lc/zh-cn/download/
 
-# Nix (flake, 需配置好 forgejo 的 SSH key):
-nix run git+ssh://forgejo@git.lambda.lc:5522/lc-studio/secret-guard -- --help
+# Nix (flake):
+nix run github:luochen1990/secret-guard -- --help
 # 或将 overlay / nixosModule 接入你的 flake 后直接用 pkgs.secret-guard
 
 # Cargo (从源码构建, 需要 rustc >= 1.96):
-cargo install --git ssh://forgejo@git.lambda.lc:5522/lc-studio/secret-guard
+cargo install --git https://github.com/luochen1990/secret-guard
 # 或克隆仓库后: cargo install --path .
 ```
 
@@ -152,9 +152,10 @@ provider=...`), 命令行即可确认流量经过 secret-guard; 上游故障 (50
 
 不适用场景如下, 完整清单 (面向维护者) 见 `AGENTS.md` "已知限制" 段:
 
-- **Gemini / Ollama 暂无 Redact 能力**: 这两族协议目前只做字节透传 — 若配置了
-  secrets, Redact 在 `g/` `l/` 路径上**静默降级为放行** (secret 原样出站, 日志有
-  WARN); 它们也不支持跨协议接入 (返回 501)。要保护的流量请走 `o/` `a/` `r/`
+- **Gemini / Ollama 暂无 Redact 能力**: 这两族协议目前只做字节透传, codec 未覆盖 —
+  若配置了 secrets, 这两族路径上的请求**默认拒绝转发** (返回 503, 日志说明原因;
+  可显式配置 `[redact] on_unsupported_protocol = "fail_open"` 放行透传, 但 secret
+  将原样出站); 它们也不支持跨协议接入 (返回 501)。要保护的流量请走 `o/` `a/` `r/`
   路径 (三族 codec 完整覆盖)。
 - **两类流式场景返回 501**: ① 跨协议翻译 + `stream=true`; ② Responses 协议 +
   (Redact 或路由 model 重写) + `stream=true` (SSE 事件翻译未实现)。
@@ -162,10 +163,17 @@ provider=...`), 命令行即可确认流量经过 secret-guard; 上游故障 (50
   (web_search 等) 在跨协议翻译中丢弃; Responses 协议即使同协议 round-trip 也会丢
   reasoning items 的 `encrypted_content`。
 - **异常路径下 mock 可能不被还原**: 上游非 2xx / Content-Type 判型失败 / 响应 parse
-  失败时, 转发降级为透传, 客户端可能看到 mock (日志有 WARN)。
+  失败时, 转发降级为保留 Mock 透传 (降级偏安全: 失败响应体高概率被客户端日志采集,
+  真值不默认投放), 客户端可能看到 mock (日志有 WARN); 可显式配置
+  `[redact] on_fallback_restore = "restore"` 让 fallback 路径尝试还原 mock → 真值。
 - **极端配置下 mock 生成可能耗尽**: 弱 mock 策略 (字符集/长度约束过窄) + 对抗性
-  内容可使探测耗尽, 默认 fail-open 跳过该 secret (原样出站, WARN); 可在
-  `[redact] on_probe_exhausted = "fail_closed"` 配置为拒绝转发。
+  内容可使探测耗尽, 默认 **fail-closed 拒绝转发整个请求** (返回 503, 不含 secret
+  明文); 可显式配置 `[redact] on_probe_exhausted = "fail_open"` 跳过该 secret
+  原样出站 (WARN)。默认配置下探测耗尽的概率天文级小。
+- **协议实地测试边界**: Gemini / Ollama (透传) 与 Anthropic (claude) 协议、以及
+  Anthropic 参与的跨协议翻译, 当前仅由模拟上游 (mockito) 的自动化测试覆盖,
+  **尚未在真实 Provider 上实地验证**。首次接入这些协议时, 建议先在 WebUI Records
+  页核对一笔真实流量再放开使用。
 - **路由 model 重写命中时放弃字节直传**: 该请求改走 IR 改写路径 (语义等价, 但上游
   前缀缓存失效) — 属用户主动选择的降级。
 - **部分入站形态的 WebUI 增量气泡降级**: 跨协议翻译 / Responses 入站的请求,
@@ -184,7 +192,8 @@ provider=...`), 命令行即可确认流量经过 secret-guard; 上游故障 (50
 
 ## 贡献
 
-欢迎 issue 与 PR (仓库托管在 [git.lambda.lc/lc-studio/secret-guard](https://git.lambda.lc/lc-studio/secret-guard))。
+欢迎 issue 与 PR — 主仓库托管在
+[github.com/luochen1990/secret-guard](https://github.com/luochen1990/secret-guard)。
 开发环境、测试链与代码规范见 [AGENTS.md](AGENTS.md)。
 
 ## License
