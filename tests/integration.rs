@@ -3267,6 +3267,11 @@ async fn providers_api_lists_existing() {
     assert_eq!(providers[0]["api_key_masked"], "s*********y"); // "sk-test-key" (11 chars)
     assert!(body.get("protocols").unwrap().as_array().unwrap().len() >= 4);
     assert!(body.get("shorts").unwrap().as_array().unwrap().len() >= 4);
+    // webui_protocols: 仅 codec 覆盖族 (openai/anthropic/openairesponses), 不含
+    // 透传族 gemini/ollama — WebUI 新建表单词表 (见 list_providers).
+    let webui: Vec<String> =
+        serde_json::from_value(body.get("webui_protocols").cloned().unwrap()).unwrap();
+    assert_eq!(webui, ["openai", "anthropic", "openairesponses"]);
 }
 
 #[tokio::test]

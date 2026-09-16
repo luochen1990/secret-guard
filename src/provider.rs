@@ -93,6 +93,18 @@ impl Protocol {
             .expect("ALL covers every variant")
     }
 
+    /// 该协议族是否有完整 codec 覆盖 (Reader/Writer/IR 路径可用 — Redact 与跨协议
+    /// 翻译都依赖 codec; 模型列表解析与之正交, 全 5 族均支持). Gemini/Ollama 目前
+    /// 仅字节透传、无 codec, Redact 在这两族上不可用 (默认
+    /// `on_unsupported_protocol = "fail_closed"` 拒绝). 消费方: WebUI 新建 provider
+    /// 的协议词表只引导 codec 覆盖族 (`webui_protocols`, 见 `web/api/providers.rs`);
+    /// 透传族仍可手写配置文件使用 (实验性, 见 README "协议支持").
+    /// 与 `codec::Protocol::from_native` 的 Some 集合同一事实两处编码, 同步守卫
+    /// 测试见 `tests::test_codec_covered_matches_codec_from_native`.
+    pub const fn codec_covered(self) -> bool {
+        matches!(self, Self::OpenAI | Self::Anthropic | Self::OpenAIResponses)
+    }
+
     pub fn name(self) -> &'static str {
         Self::ALL
             .into_iter()
@@ -990,6 +1002,21 @@ mod tests {
             assert_eq!(proto.name(), name);
         }
         assert_eq!(Protocol::from_name("xxx"), None);
+    }
+
+    /// `codec_covered` 与 `codec::Protocol::from_native` 的 Some 集合同一事实两处
+    /// 编码 (from_native 有 `_ => None` 通配, 漏更新不报编译错) — 本测试双向锁死:
+    /// 将来任一侧新增协议覆盖 (如 Gemini codec) 而忘改另一侧会在此红灯
+    /// (WebUI 词表静默隐藏 / 静默放行均不可接受).
+    #[test]
+    fn test_codec_covered_matches_codec_from_native() {
+        for (proto, _, _) in Protocol::ALL {
+            assert_eq!(
+                proto.codec_covered(),
+                crate::codec::Protocol::from_native(proto).is_some(),
+                "codec_covered 与 codec::Protocol::from_native 对 {proto} 不一致"
+            );
+        }
     }
 
     #[test]

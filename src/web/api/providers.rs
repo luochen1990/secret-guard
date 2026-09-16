@@ -34,6 +34,14 @@ pub async fn list_providers(State(state): State<AppState>) -> impl IntoResponse 
         .collect();
     let protocols: Vec<&'static str> = Protocol::ALL.iter().map(|(_, n, _)| *n).collect();
     let shorts: Vec<&'static str> = Protocol::ALL.iter().map(|(_, _, s)| *s).collect();
+    // WebUI 新建 provider 表单的协议词表: 仅 codec 覆盖族 (Gemini/Ollama 无 codec,
+    // Redact 不可用且默认 fail_closed — 不在表单里引导普通用户创建; 手写配置
+    // 文件/API 仍可用, 存量条目编辑时前端 append "experimental" 选项).
+    let webui_protocols: Vec<&'static str> = Protocol::ALL
+        .iter()
+        .filter(|(p, _, _)| p.codec_covered())
+        .map(|(_, n, _)| *n)
+        .collect();
     let decisions: Vec<&'static str> = OverrideMode::ALL.iter().map(|(_, s)| *s).collect();
     (
         NO_STORE,
@@ -42,6 +50,7 @@ pub async fn list_providers(State(state): State<AppState>) -> impl IntoResponse 
             disabled,
             protocols,
             shorts,
+            webui_protocols,
             decisions,
         }),
     )
@@ -258,6 +267,9 @@ pub(crate) struct ListProvidersResponse {
     pub disabled: Vec<ProviderMasked>,
     pub protocols: Vec<&'static str>,
     pub shorts: Vec<&'static str>,
+    /// WebUI 新建 provider 表单展示的协议词表 (仅 codec 覆盖族, 见 `list_providers`).
+    /// `protocols`/`shorts` 保持全量 — 前端路由约定表格与存量条目编辑仍需全量.
+    pub webui_protocols: Vec<&'static str>,
     pub decisions: Vec<&'static str>,
 }
 

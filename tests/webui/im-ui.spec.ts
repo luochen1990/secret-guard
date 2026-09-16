@@ -2452,6 +2452,39 @@ test.describe("WebUI 表单失败保持 (#181)", () => {
     await expect(dlg).not.toBeVisible();
   });
 
+  test("webui_protocols: 存量 gemini provider 编辑 — experimental 选项 + 保存 round-trip 协议不漂移", async ({ page }) => {
+    await page.goto("/");
+    await page.locator('a.tab[data-tab="providers"]').click();
+    // 等词表落地 (refreshProviders 完成 → select 已 populate, 同 2328 守卫 rationale).
+    await expect(page.locator("#providers-body tr").first()).toBeVisible();
+    const row = page.locator("#providers-body tr", { hasText: "mock-gemini" });
+    await expect(row).toBeVisible();
+
+    await row.locator('button[data-action="edit"]').click();
+    const dlg = page.locator("#provider-form");
+    await expect(dlg).toBeVisible();
+
+    // gemini 不在新建词表 (webui_protocols 仅 codec 覆盖族) — 经
+    // setProtocolSelectValue 动态 append "(experimental)" 选项后选中.
+    const sel = page.locator("#p-protocol");
+    await expect(sel).toHaveValue("gemini");
+    await expect(sel.locator('option[value="gemini"]')).toHaveText("gemini (experimental)");
+    // 新建词表三族仍在 (append 不挤掉既有选项).
+    for (const p of ["openai", "anthropic", "openairesponses"]) {
+      await expect(sel.locator(`option[value="${p}"]`)).toBeAttached();
+    }
+
+    // 保存 round-trip: 协议必须仍是 gemini (回归形态 = select 落回首个 codec
+    // 选项, 保存时静默把 gemini 改写成 openai — 数据完整性).
+    await page.locator('#provider-form-el button[value="save"]').click();
+    await expect(dlg).not.toBeVisible();
+    await row.locator('button[data-action="edit"]').click();
+    await expect(dlg).toBeVisible();
+    await expect(page.locator("#p-protocol")).toHaveValue("gemini");
+    await page.locator('#provider-form-el button[value="cancel"]').click();
+    await expect(dlg).not.toBeVisible();
+  });
+
   test("#181: 成功路径对话框正常关闭 + 新条目出现 (守护正向流)", async ({ page }) => {
     await page.locator('a.tab[data-tab="providers"]').click();
     await expect(page.locator("#providers-body tr").first()).toBeVisible();

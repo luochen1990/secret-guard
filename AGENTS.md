@@ -757,9 +757,17 @@ CI runner VM 未预装 treefmt 时 check-fmt 降级 rust-only (见 justfile).
 
 ## 已知限制 (MVP)
 
+> **呈现策略 (2026-09 用户决策)**: 本段是限制项的**完整 SSOT** (面向维护者);
+> README 不再维护负面清单, 以"协议支持矩阵 (正面) + Roadmap & 贡献 (机会框架)"
+> 呈现同一事实 (`Protocol::codec_covered()` 是代码侧谓词 SSOT)。WebUI 新建
+> provider 表单的协议词表只引导 codec 覆盖族 (`webui_protocols`, gemini/ollama
+> 后端能力保留 — 存量编辑/探测推荐经前端 append "(experimental)" 选项)。
+> 新增限制条目时同步评估: README 矩阵/Roadmap 与 probe note (`PROBE_NOTE_*`)
+> 是否需要联动。
+
 - **协议支持范围未经真实上游实地测试** (2026-09 用户决策, 开源诚实边界): Gemini /
   Ollama (仅透传, 无 codec) 与 Anthropic 协议及其参与的跨协议翻译, 测试覆盖全部基于
-  mockito 模拟上游; 真实 Provider 上的实地验证尚未进行。README "边界与已知限制" 与
+  mockito 模拟上游; 真实 Provider 上的实地验证尚未进行。README "协议支持" 与
   文档站已对用户声明此边界。后续实地验证时按协议逐族补集成测试 + 更新声明。
 - **OpenAI 流式请求未开 `include_usage` 时无 token 统计** (usage-stats, USAGE-5):
   OpenAI 流式默认不回显 usage, 需客户端设 `stream_options.include_usage = true`;

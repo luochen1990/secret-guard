@@ -6,7 +6,7 @@
 
 **跑在本地的轻量 LLM 网关: 出站把请求中的 Secret 替换为等长仿真 Mock, 回传响应自动还原为真值 — LLM 全程接触不到你的 Secret, Agent 工具照常工作。**
 
-[文档站](https://secret-guard.lambda.lc/zh-cn/) · [下载](https://secret-guard.lambda.lc/zh-cn/download/) · [快速上手](https://secret-guard.lambda.lc/zh-cn/tutorial-quick-start/) · [已知限制](#边界与已知限制) · [English](https://secret-guard.lambda.lc/en/)
+[文档站](https://secret-guard.lambda.lc/zh-cn/) · [下载](https://secret-guard.lambda.lc/zh-cn/download/) · [快速上手](https://secret-guard.lambda.lc/zh-cn/tutorial-quick-start/) · [协议支持](#协议支持) · [English](https://secret-guard.lambda.lc/en/)
 
 ## 为什么需要 Secret Guard?
 
@@ -148,36 +148,42 @@ provider=...`), 命令行即可确认流量经过 secret-guard; 上游故障 (50
 - **多 Provider 路由**: 支持多 Provider 配置 (OpenAI / Anthropic / Gemini / Ollama /
   Responses), 按请求 model 通配符路由到不同上游。
 
-## 边界与已知限制
+## 协议支持
 
-不适用场景如下, 完整清单 (面向维护者) 见 `AGENTS.md` "已知限制" 段:
+| 协议 | 转发 | Secret Redact | 跨协议翻译 |
+|---|---|---|---|
+| OpenAI (Chat Completions) | ✅ | ✅ | ✅ ⇄ Anthropic (含流式) / ⇄ Responses (非流式) |
+| Anthropic (claude) | ✅ | ✅ | ✅ ⇄ OpenAI (含流式) |
+| OpenAI Responses | ✅ | ✅ (非流式) | ✅ ⇄ Chat Completions (非流式) |
+| Gemini / Ollama | ✅ 字节透传 | 🚧 [Roadmap](#roadmap--贡献) | 🚧 [Roadmap](#roadmap--贡献) |
 
-- **Gemini / Ollama 暂无 Redact 能力**: 这两族协议目前只做字节透传, codec 未覆盖 —
-  若配置了 secrets, 这两族路径上的请求**默认拒绝转发** (返回 503, 日志说明原因;
-  可显式配置 `[redact] on_unsupported_protocol = "fail_open"` 放行透传, 但 secret
-  将原样出站); 它们也不支持跨协议接入 (返回 501)。要保护的流量请走 `o/` `a/` `r/`
-  路径 (三族 codec 完整覆盖)。
-- **两类流式场景返回 501**: ① 跨协议翻译 + `stream=true`; ② Responses 协议 +
-  (Redact 或路由 model 重写) + `stream=true` (SSE 事件翻译未实现)。
-- **跨协议翻译会丢弃部分字段**: 思考原文 (reasoning content) 与 hosted tools
-  (web_search 等) 在跨协议翻译中丢弃; Responses 协议即使同协议 round-trip 也会丢
-  reasoning items 的 `encrypted_content`。
-- **异常路径下 mock 可能不被还原**: 上游非 2xx / Content-Type 判型失败 / 响应 parse
-  失败时, 转发降级为保留 Mock 透传 (降级偏安全: 失败响应体高概率被客户端日志采集,
-  真值不默认投放), 客户端可能看到 mock (日志有 WARN); 可显式配置
-  `[redact] on_fallback_restore = "restore"` 让 fallback 路径尝试还原 mock → 真值。
-- **极端配置下 mock 生成可能耗尽**: 弱 mock 策略 (字符集/长度约束过窄) + 对抗性
-  内容可使探测耗尽, 默认 **fail-closed 拒绝转发整个请求** (返回 503, 不含 secret
-  明文); 可显式配置 `[redact] on_probe_exhausted = "fail_open"` 跳过该 secret
-  原样出站 (WARN)。默认配置下探测耗尽的概率天文级小。
-- **协议实地测试边界**: Gemini / Ollama (透传) 与 Anthropic (claude) 协议、以及
-  Anthropic 参与的跨协议翻译, 当前仅由模拟上游 (mockito) 的自动化测试覆盖,
-  **尚未在真实 Provider 上实地验证**。首次接入这些协议时, 建议先在 WebUI Records
-  页核对一笔真实流量再放开使用。
-- **路由 model 重写命中时放弃字节直传**: 该请求改走 IR 改写路径 (语义等价, 但上游
-  前缀缓存失效) — 属用户主动选择的降级。
-- **部分入站形态的 WebUI 增量气泡降级**: 跨协议翻译 / Responses 入站的请求,
-  时间线不渲染增量气泡 (preview 与轮次记录正常)。
+- Gemini / Ollama 是透明字节透传 (转发本身完整可用); 由于 codec 尚未覆盖, Redact
+  不作用于这两族 — 配置了 secrets 时, 它们路径上的请求默认被**拒绝** (503,
+  `[redact] on_unsupported_protocol = "fail_closed"`, 错误信息自带出路提示)。
+  手写配置文件 / REST API 可创建这两族 provider (适合无 secret 的纯转发场景);
+  WebUI 新建表单不引导, 但编辑存量条目与 Detect 探测推荐会以 "(experimental)"
+  选项支持。
+- **降级偏安全**: Redact 的异常路径 (上游响应无法解析 / 非 2xx) 默认保留 Mock
+  透传 — 真值不进失败响应体; `on_fallback_restore = "restore"` 可显式 opt-in
+  还原。三个降级开关的完整语义见 [docs/configuration.md](docs/configuration.md)。
+- 协议行为由 property-based 测试与模拟上游的集成测试固化; Anthropic / Gemini /
+  Ollama 的真实 Provider 实地验证尚未进行 (见 [Roadmap](#roadmap--贡献)) — 首次
+  接入建议先在 WebUI Records 页核对一笔真实流量。
+
+## Roadmap & 贡献
+
+以下方向正在推进, 欢迎 issue / PR — 主仓库
+[github.com/luochen1990/secret-guard](https://github.com/luochen1990/secret-guard),
+完整开发指南见 [AGENTS.md](AGENTS.md):
+
+- **Gemini / Ollama codec**: 补齐这两族的 Redact 与跨协议能力。新增协议只需实现
+  Reader + Writer trait (~200 行), 不动 dispatch — 架构见 `src/codec/AGENTS.md`。
+- **Responses 流式 SSE 翻译**: Responses + Redact 命中 + `stream=true` 返回 501
+  (防止 mock 静默外流); 仅路由 model 重写 (无 Redact) 时流式放行, SSE 字节透传。
+- **Responses 参与的跨协议流式**: OpenAI ⇄ Anthropic 流式翻译已支持, Responses
+  侧的流式事件翻译待实现; 跨协议翻译中 reasoning content / hosted tools 暂被
+  丢弃 (有 WARN)。
+- **真实 Provider 实地验证**: 为协议矩阵补真实上游的集成测试 profile。
 
 ## 文档
 
@@ -189,12 +195,6 @@ provider=...`), 命令行即可确认流量经过 secret-guard; 上游故障 (50
 - NixOS 部署与凭据注入 → [docs/deployment-nixos.md](docs/deployment-nixos.md)
 - 架构设计与数据流契约 → [docs/design/](docs/design/) (contracts.md)
 - 开发流程 / 测试策略 / 模块契约 → [AGENTS.md](AGENTS.md)
-
-## 贡献
-
-欢迎 issue 与 PR — 主仓库托管在
-[github.com/luochen1990/secret-guard](https://github.com/luochen1990/secret-guard)。
-开发环境、测试链与代码规范见 [AGENTS.md](AGENTS.md)。
 
 ## License
 

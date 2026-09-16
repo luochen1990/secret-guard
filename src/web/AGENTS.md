@@ -200,6 +200,13 @@ API key CRUD **无条件挂载** (在 `web::router()`, 不依赖 `auth.enabled`)
 
 ### Provider 表单 (构造分野 + 路由编辑器) 与列表 router 行渲染
 
+- **协议词表两套** (2026-09 决策, 见根 AGENTS.md 已知限制段呈现策略): 新建表单
+  `#p-protocol` 下拉词表 = `GET /api/providers` 的 `webui_protocols` (仅 codec 覆盖族
+  openai/anthropic/openairesponses, 代码侧谓词 SSOT = `Protocol::codec_covered()`);
+  全量 `protocols`/`shorts` 仅供路由约定表格渲染. 存量 gemini/ollama 条目编辑与
+  Detect 探测推荐经 `setProtocolSelectValue` 动态 append "(experimental)" 选项
+  (每次 `populateProtocolSelect()` 重建 innerHTML 恰好清掉上一次的 append, 时序:
+  populate 先于 set) — 后端能力保留, 只是新建不引导.
 - 表单 `#p-kind` 是构造分野的唯一事实来源: **Direct** (Protocol / Base URL / API Key
   字段组) vs **Router** (路由编辑器字段组 `#p-router-fields`). 切换只显隐字段组,
   **不清空已输入内容** — Direct↔Router 来回切不丢数据 (与 #181 的字段保留语义一致).

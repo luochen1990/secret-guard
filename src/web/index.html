@@ -1927,6 +1927,7 @@
       providersDisabled: [],
       providerProtocols: [],
       providerShorts: [],
+      providerWebuiProtocols: [],
       providerDecisions: [],
       // provider 表单 Detect 探测代数 (镜像 timelineGen 模式): dialog 每次打开 bump;
       // 在途 probe 响应落地前对账, 代数不匹配即丢弃 — 防在途旧结果写入重开后的新
@@ -4102,7 +4103,7 @@
         api: API_PROVIDERS,
         list: () => state.providersList,
         disabledList: () => state.providersDisabled,
-        setList: (d) => { state.providersList = d.providers || []; state.providersDisabled = d.disabled || []; state.providerProtocols = d.protocols || []; state.providerShorts = d.shorts || []; state.providerDecisions = d.decisions || []; },
+        setList: (d) => { state.providersList = d.providers || []; state.providersDisabled = d.disabled || []; state.providerProtocols = d.protocols || []; state.providerShorts = d.shorts || []; state.providerWebuiProtocols = d.webui_protocols || []; state.providerDecisions = d.decisions || []; },
         bodyId: 'providers-body',
         statsId: 'providers-stats',
         formDlgId: 'provider-form',
@@ -4883,7 +4884,27 @@
 
     function populateProtocolSelect() {
       const sel = document.getElementById('p-protocol');
-      sel.innerHTML = state.providerProtocols.map(p => `<option value="${escapeHtml(p)}">${escapeHtml(p)}</option>`).join('');
+      // 词表 = webui_protocols (仅 codec 覆盖族): Gemini/Ollama 无 codec, Redact
+      // 不可用且默认 fail_closed — 表单不引导创建; 存量/探测值经 setProtocolSelectValue
+      // 动态 append "(experimental)" 选项, 手写配置族仍可编辑. 无全量回退层:
+      // webui_protocols 与 protocols 同源同生 (同一响应体), 空即 fetch 未落地,
+      // 此时留空词表 + openai 兜底 (见 openProviderForm), 不静默降级回全量词表.
+      sel.innerHTML = state.providerWebuiProtocols.map(p => `<option value="${escapeHtml(p)}">${escapeHtml(p)}</option>`).join('');
+    }
+
+    // 设置 protocol select 的值; 值不在词表 (透传族 gemini/ollama, 如存量条目编辑
+    // 或探测推荐) 时动态 append 一个 "(experimental)" 标注选项再选中 (策略见
+    // populateProtocolSelect 注释). 词表为空 (providers fetch 未落地, 首开竞态)
+    // 时不加后缀 — 此时 append 的是普通选项而非 experimental.
+    function setProtocolSelectValue(value) {
+      const sel = document.getElementById('p-protocol');
+      if (!value) return;
+      if (![...sel.options].some(o => o.value === value)) {
+        const label = sel.options.length
+          ? `${escapeHtml(value)} (experimental)` : escapeHtml(value);
+        sel.insertAdjacentHTML('beforeend', `<option value="${escapeHtml(value)}">${label}</option>`);
+      }
+      sel.value = value;
     }
 
     function openSecretForm(existing) {
@@ -5118,7 +5139,10 @@
       idInput.value = existing?.id || '';
       idInput.disabled = !!existing;
       document.getElementById('p-name').value = existing?.name || '';
-      document.getElementById('p-protocol').value = existing?.protocol || state.providerProtocols[0] || 'openai';
+      // 存量 protocol 可能是透传族 (gemini/ollama, 手写配置) — 经 helper append
+      // "(experimental)" 选项; 新建默认取 webui 词表首项, 空词表 (fetch 未落地)
+      // 兜底 'openai'.
+      setProtocolSelectValue(existing?.protocol || state.providerWebuiProtocols[0] || 'openai');
       // 构造选择 (#190): 按 kind 显隐字段组 — Direct: Protocol/Base URL/API Key;
       // Router: 路由编辑器. 构造可切换 (编辑 static router → Direct override =
       // 改回实体 #187 根治, 需显式发空 routes — 见下方 payload builder; dynamic
@@ -5240,9 +5264,9 @@
     //
     // POST /api/providers/probe {base_url, api_key} → {probes[], recommended, note}.
     // 手动触发, 建议非命令: recommended 只用于设置 #p-protocol select (用户仍可手改,
-    // 词表 = GET /api/providers 的 protocols 数组), 绝不自动保存. 探测结果 DOM 派生
-    // 内容全部留在 #p-probe-result 内 (不进 state, 同表单其余字段惯例); 模型预览
-    // 深度 = 浏览 + 点击复制 (MVP).
+    // 词表 = GET /api/providers 的 webui_protocols 数组, 透传族动态 append), 绝不
+    // 自动保存. 探测结果 DOM 派生内容全部留在 #p-probe-result 内 (不进 state,
+    // 同表单其余字段惯例); 模型预览深度 = 浏览 + 点击复制 (MVP).
     async function runProviderProbe() {
       const resultEl = document.getElementById('p-probe-result');
       const baseUrl = document.getElementById('p-base-url').value.trim();
@@ -5311,12 +5335,9 @@
       const probes = data.probes || [];
       const parts = [];
       if (data.recommended) {
-        const protoSel = document.getElementById('p-protocol');
-        // 契约保证 recommended ∈ protocols 词表; 防御集成期漂移 — 给 select 赋
-        // 不存在的值会把它置空, 宁可不选也不覆盖用户已选值.
-        if ([...protoSel.options].some(o => o.value === data.recommended)) {
-          protoSel.value = data.recommended;
-        }
+        // recommended 可能是透传族 (gemini/ollama, probe 对这两族也有探测端点) —
+        // append "(experimental)" 选项后选中 (仍属建议非命令, 用户可手改).
+        setProtocolSelectValue(data.recommended);
         parts.push(`<div class="probe-line probe-line-ok">Detected: <code>${escapeHtml(data.recommended)}</code></div>`);
       } else {
         // 无推荐: 逐行列出各 probe (基类 + 状态色: ok 行弱化, 失败行错误色调).
