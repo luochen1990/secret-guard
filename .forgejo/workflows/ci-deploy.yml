@@ -16,10 +16,12 @@
 #   见 docs/ci.md)。政策变化 (相对旧单 workflow 形态):
 #   - bench: 旧 = master save / PR compare 非阻塞 + PR 评论; 新 = compare-save 单模式
 #     (判回归 + 滚动更新基线), 退化时 run 红 (P1 门禁信号)。
-#   - audit / nix build: 旧 = continue-on-error 非阻塞起步 (升级判据 N=20 次 master 绿,
-#     针对的是 "不阻塞 PR 合并"); 新 = P1 阻塞级 — P1 不门禁 PR 合入, 旧非阻塞理由
-#     不再适用; "红 = 不能部署" 正是本档职责 (audit 发现 CVE / cargoHash 漂移导致
-#     发布物不可构建, 都是该挡下部署的真信号)。
+#   - audit / nix build: 旧 = continue-on-error 非阻塞 (升级判据 N=20 次 master 绿,
+#     针对的是 "不阻塞 PR 合并"); 新 = audit 阻塞级 — P1 不门禁 PR 合入, 旧非阻塞理由
+#     不再适用; "红 = 不能部署" 正是本档职责 (audit 发现 CVE 是该挡下部署的真信号)。
+#     nix build 维持 continue-on-error 但语义改为 canary 探针 — runner VM 无 nix-daemon,
+#     该 step 在现架构下恒失败 (2026-09-16 首跑实证, 见 step 注释), 转绿即 runner 具备
+#     nix 能力之时, 届时再转阻塞。
 #
 # [超集偏差声明] org 契约的默认语义是 ci-deploy ⊇ ci-merge (单 workflow 绿即可部署,
 #   决策不交叉查别的 workflow)。本仓偏差: **只跑 P1 增量**, 不重跑 P0 全链。理由:
@@ -153,18 +155,24 @@ jobs:
 
       # ─── nix package 验证 (issue #149-6) ────────────────────────────────────
       # 验证 nix/pkgs/secret-guard.nix 的 cargoHash 与 Cargo.lock 一致 (漂移时部署侧
-      # ~/ws/nixos 重建才暴露, 排障跨仓库)。runner 是 NixOS microvm 天然有 nix; store
-      # 缓存跨 job 复用, 热路径增量仅重编 workspace crate。
+      # ~/ws/nixos 重建才暴露, 排障跨仓库)。
+      # **canary 语义 (continue-on-error, v3.0 合并后首跑修正)**: 当前 runner VM 无
+      # nix-daemon — nix 求值需 temproots/可写 store, 2026-09-16 首跑实证
+      # `/nix/var/nix/temproots: Permission denied` (同因见 justfile nix-check 的
+      # daemon 探测跳过与 #193 记录)。本 step 在现架构下恒失败, 作探针保留:
+      # 转绿之日即 runner 获得 nix 能力之时, 届时移除 continue-on-error 恢复 P1
+      # 阻塞语义 (cargoHash 漂移 = 发布物不可构建 = 该挡下部署的真信号)。在那之前,
+      # P1 的 "发布物可构建" 职责由本地纪律 (just nix-check) + nixos 仓部署侧重建兜底。
+      # (旧单 workflow 时代本 step 同样恒失败, 只是 continue-on-error 遮掩——v3.0
+      # 首次转阻塞时暴露, 属迁移的正常收获。)
       # 留在 workflow 层而非 ci-deploy recipe: 需 step 级 timeout-minutes: 30 硬上限
-      # (recipe 层无法表达 per-step timeout; 冷 store 全量 vendor 编译可达上限)。
-      # P1 阻塞级 (v3.0 政策变化, 见文件头): cargoHash 漂移 → 发布物不可构建 → 红 =
-      # 不能部署, 属本档职责内真信号 (依赖升级 PR 合入后此处红提醒同步 cargoHash,
-      # 属预期信号, 维护者需人工关注)。
+      # (recipe 层无法表达; 即便恒失败也保留结构, runner 能力就位后零重构启用)。
       # --extra-experimental-features: runner 的 Lix 未启用 nix-command/flakes
       # (2026-08-26 #193 首跑实证)。
       - name: nix build (cargoHash validation)
         id: nixbuild
         if: success() && steps.skip.outputs.should_skip != 'true'
+        continue-on-error: true
         timeout-minutes: 30
         run: nix --extra-experimental-features "nix-command flakes" build .#secret-guard -L
 

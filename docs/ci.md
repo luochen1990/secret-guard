@@ -93,12 +93,14 @@ recipe 头部加一行 `just ci-merge`。step: Guard acquire / Checkout (恒浅�
 key / skip-if-passed (`workflow_file: ci-deploy.yml` 自指, 仅 push 查询 — nightly/
 dispatch 无条件) / **Quality gate (`just ci-deploy`)** = cargo audit (CVE, 阻塞) +
 bench compare-save (判回归 + 滚动更新基线, 退化 → run 红) / **nix build (cargoHash
-validation)** (阻塞, step 级 timeout 30) / Guard verify。
+validation)** (canary 探针, continue-on-error — runner 无 nix-daemon 恒失败, 转绿即
+runner 具备 nix 能力, 届时再转阻塞; 见 workflow step 注释) / Guard verify。
 
-政策变化 (相对旧单 workflow): audit / nix build 由 PR 上的 continue-on-error 非阻塞
-转为 P1 阻塞 — 旧非阻塞理由 ("不阻塞 PR 合并") 在 P1 (不门禁 PR 合入) 不再适用;
-"红 = 不能部署" 正是本档职责 (audit 发现 CVE / cargoHash 漂移致发布物不可构建 /
-性能退化, 都是该挡下部署的真信号)。
+政策变化 (相对旧单 workflow): audit 由 PR 上的 continue-on-error 非阻塞转为 P1 阻塞
+— 旧非阻塞理由 ("不阻塞 PR 合并") 在 P1 (不门禁 PR 合入) 不再适用, "audit 发现 CVE
+= 该挡下部署" 正是本档职责。nix build 维持 continue-on-error, 语义改为 canary 探针
+(runner 无 nix-daemon 恒失败 — 旧形态下同样恒失败只是被遮掩, v3.0 转阻塞首跑暴露;
+转绿之日再恢复阻塞语义)。
 
 ### P2 ci-periodic.yml (nightly `0 20 * * *` per-SHA 去重 + 手动; `just ci-periodic`)
 
@@ -126,7 +128,7 @@ artifacts on failure (截图/trace/报告, retention 14 天) / Guard verify。
 | Performance benchmark + bench PR 评论 | **P1** (compare-save 单模式; PR 评论随 PR 事件消失) |
 | WebUI regression + 评论 + artifact | **P2** (评论随 PR 事件消失 → 日志摘要 + artifact) |
 | cargo audit + PR 评论 | **P1** (转阻塞; 评论随 PR 事件消失) |
-| nix build (cargoHash) | **P1** (转阻塞, 留 workflow 层) |
+| nix build (cargoHash) | **P1** (canary 探针 — runner 无 nix-daemon 恒失败, 保留待 runner 具备 nix 能力后转阻塞) |
 
 ## 非阻塞检查的升级路径
 
@@ -137,7 +139,10 @@ artifacts on failure (截图/trace/报告, retention 14 天) / Guard verify。
 - **Performance benchmark (P1, compare-save)**: 已是 P1 阻塞信号 (退化 exit 1 → run 红);
   `--quick` 10 samples 噪声大 (±15% 实测), 阈值 20% 只做量级级粗筛 — 升级到完整 samples
   后可收紧到 10%。
-- **cargo audit / nix build (P1)**: v3.0 起已阻塞化 (P1 语义), 无观察期。
+- **cargo audit (P1)**: v3.0 起已阻塞化 (P1 语义), 无观察期。
+- **nix build (P1, canary)**: runner 无 nix-daemon 恒失败, continue-on-error 探针保留;
+  启用条件 = runner 侧 nix 能力就位 (nixos 仓 forgejo-runner-vm 模块演进), 转绿后
+  移除 continue-on-error 即恢复 P1 阻塞语义。
 - **cargo-deny / typos**: 已是 P0 阻塞门禁 (check 链尾, 无观察期)。新误报出现时更新
   对应配置 (`deny.toml` / `_typos.toml`) 即可, 属正常维护。
 

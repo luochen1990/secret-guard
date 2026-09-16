@@ -545,7 +545,7 @@ v3.0 三档 (org 分级契约, 见 lc-studio/forgejo-actions README; 命名即�
 | 档 | workflow | 触发 | 阻塞 | 内容 |
 |---|---|---|---|---|
 | P0 `ci-merge.yml` | PR + master push + 手动 | PR 合入 | check-features + check 主链 (fmt/clippy/machete/doc/测试/typos/deny-offline/check-contracts) + file-size |
-| P1 `ci-deploy.yml` | master push + nightly + 手动 | 部署 | audit (CVE) + bench compare-save + nix build cargoHash (**非超集**偏差, 见 workflow 头声明) |
+| P1 `ci-deploy.yml` | master push + nightly + 手动 | 部署 | audit (CVE, 阻塞) + bench compare-save + nix build cargoHash (canary 探针, runner 无 nix-daemon 恒失败) (**非超集**偏差, 见 workflow 头声明) |
 | P2 `ci-periodic.yml` | nightly per-SHA 去重 + 手动 (无 push) | 无 | check --coverage + coverage-gate + WebUI Playwright |
 
 跳过/去重机制: 事件去重 (push 仅 master; PR 总是跑 — draft/WIP PR 除外) + 内容去重

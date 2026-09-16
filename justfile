@@ -192,11 +192,12 @@ ci-merge *stage:
     esac
 
 # org ci 契约 P1 (部署门禁档, ci-deploy.yml 调用): audit (CVE) + bench compare-save
-# (判回归 + 滚动更新基线, 退化 exit 1 → run 红)。v3.0 政策变化: 旧单 workflow 里两者
-# continue-on-error 非阻塞的理由是 "不阻塞 PR 合并" — P1 不门禁 PR 合入, 理由不再适用;
-# "红 = 不能部署" 是本档职责 (audit 发现 CVE / 性能退化都该挡下部署)。
-# nix build cargoHash 验证留 workflow 层 (需 step 级 timeout-minutes: 30, recipe 层
-# 无法表达); 本地近似复现: just audit / just bench-ci compare-save /
+# (判回归 + 滚动更新基线, 退化 exit 1 → run 红)。v3.0 政策变化: audit 由旧单 workflow
+# 的 continue-on-error 非阻塞转 P1 阻塞 ("红 = 不能部署" 是本档职责; 旧非阻塞理由
+# "不阻塞 PR 合并" 在 P1 不再适用)。
+# nix build cargoHash 验证留 workflow 层且为 canary 探针 (continue-on-error — runner
+# 无 nix-daemon 恒失败, 转绿即 runner 具备 nix 能力, 届时转阻塞); 本地近似复现:
+# just audit / just bench-ci compare-save /
 # nix --extra-experimental-features "nix-command flakes" build .#secret-guard -L
 ci-deploy:
     just audit
