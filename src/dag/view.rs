@@ -66,6 +66,9 @@ pub(super) fn node_view(inner: &DagInner, node_id: Uuid) -> Option<NodeView> {
     Some(NodeView {
         id: node.id,
         parent: node.parent,
+        // CDAG-7 孤儿标记: parent 有值但在 nodes 中缺席 = parent 已被淘汰.
+        // 纯派生 (只读 inner, 不 mutate); 根 (parent=None) 恒 false.
+        is_orphan: node.parent.is_some_and(|p| !inner.nodes.contains_key(&p)),
         session_id: node.session_id,
         round_role: node.event.round_role,
         round_kind: node.event.round_kind,

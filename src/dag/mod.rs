@@ -1235,6 +1235,40 @@ mod tests {
         assert_eq!(page.rounds[0].id, b);
     }
 
+    #[test]
+    fn prop_orphan_node_identifiable() {
+        // CDAG-7 可识别性: parent 被淘汰后, 存活 child 的 NodeView.is_orphan == true;
+        // 正常链上 node 与根 node (parent = None) 均为 false (根不是孤儿 — 它只是链头).
+        // 白盒构造手法同 prop_orphan_node_degrades_gracefully (见其注释).
+        let dag = ConversationDag::new(8, 500, 1);
+        let a = dag.push_messages(vec![text_msg(IrRole::User, "m1")], dummy_event());
+        let b = dag.push_messages(
+            vec![text_msg(IrRole::User, "m1"), text_msg(IrRole::User, "m2")],
+            dummy_event(),
+        );
+
+        // 正常态: 根 a (parent=None) 与链上 b 都不是孤儿.
+        assert!(
+            !dag.get_node(a).expect("a exists").is_orphan,
+            "根节点 (parent=None) 不是孤儿"
+        );
+        assert!(
+            !dag.get_node(b).expect("b exists").is_orphan,
+            "parent 存活的正常链上节点不是孤儿"
+        );
+
+        // 淘汰 parent a → b 成为孤儿, is_orphan 显式标记.
+        {
+            let mut g = dag.inner.write();
+            super::ConversationDag::gc_cascade(&mut g, a);
+        }
+        assert!(dag.get_node(a).is_none(), "a 已被淘汰");
+        assert!(
+            dag.get_node(b).expect("b 仍存活").is_orphan,
+            "parent 缺席的存活 child 被标记为孤儿"
+        );
+    }
+
     // ─── round_role (contains_user_text 判定) ──────────────────────────────
 
     fn tool_result_msg() -> IrMessage {

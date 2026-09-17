@@ -909,7 +909,9 @@ CI runner VM 未预装 treefmt 时 check-fmt 降级 rust-only (见 justfile).
   `docs/deployment-nixos.md` "HTTPS 反向代理" 段). 忘设的缓解 = 反代 HTTP→HTTPS
   301 重定向.
 - **DAG 孤儿节点降级**: parent 被 LRU 淘汰后, child 的 `full_request_messages` 返回 None
-  (timeline 降级展示, 不 panic). 显式孤儿标记 (CDAG-7) 尚未实现.
+  (timeline 降级展示, 不 panic). 显式孤儿标记 `NodeView::is_orphan` 已实现 (CDAG-7,
+  读时纯派生: parent 有值但在 nodes 缺席); wire DTO (ForwardRecord / TimelineRound)
+  传播与前端徽章利用留后续 — 打通前该字段仅在 NodeView 层可见.
 - **static 基线下 PUT 空串 api_key 无法清空 key (#157 已知限制)**: dynamic override 的
   `api_key` 落盘形态无法区分 "未记录" (PUT null → 空串, effective 继承 static) 与
   "显式清空" (PUT `""` → 空串) — 两种空都会被 `inherit_from_static` 继承 static 旧 key.

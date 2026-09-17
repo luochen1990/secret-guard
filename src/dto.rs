@@ -119,6 +119,12 @@ pub struct SessionView {
 pub struct NodeView {
     pub id: Uuid,
     pub parent: Option<Uuid>,
+    /// CDAG-7: 本节点是否为孤儿 (parent 已被 LRU 淘汰, 链在此截断).
+    /// 根节点 (parent = None) 与 parent 存活的正常节点均为 false — 根不是孤儿.
+    /// 前端可据此显式降级展示 (孤儿轮次的前缀上下文已缺失), 而非渲染残缺数据;
+    /// 注意: 本字段仅在 NodeView 层派生, ForwardRecord / TimelineRound 等 wire DTO
+    /// 的传播尚未接通 (后续工作) — 打通前该字段到不了任何 JSON 端点.
+    pub is_orphan: bool,
     /// 所属会话的稳定标识 (push 时确定).
     pub session_id: SessionId,
     /// 本轮的主导角色 = req_delta 最后一条 message 的 role.
