@@ -500,6 +500,49 @@ mod tests {
         assert_eq!(m.get("x-custom").unwrap(), "value");
     }
 
+    /// 守卫 SEC-4: 上游 Set-Cookie header 在 record 中脱敏 (contracts.md §7).
+    /// wire 侧 header 名大小写不敏感 — http 层 HeaderName 解析即规范化为
+    /// lowercase, 脱敏匹配 (`is_sensitive_header`) 在 lowercase 上进行, 故
+    /// "Set-Cookie" / "set-cookie" 两种 wire 形态同键命中. 控制组: 无关 header
+    /// 不受波及 (精确匹配, 非子串).
+    #[test]
+    fn prop_set_cookie_redacted() {
+        let mut src = HeaderMap::new();
+        src.insert("set-cookie", "session=abc; Path=/".parse().unwrap());
+        let mixed_case: axum::http::HeaderName = "Set-Cookie".parse().unwrap();
+        assert_eq!(
+            mixed_case.as_str(),
+            "set-cookie",
+            "HeaderName parse normalizes wire casing"
+        );
+        // 同键覆盖: 后插者胜 — 大小写变体落在同一规范化键上.
+        src.insert(mixed_case, "session=xyz; Path=/; HttpOnly".parse().unwrap());
+        src.insert("x-custom", "value".parse().unwrap());
+        let v = redact_headers(&src, &[]);
+        let m: std::collections::HashMap<_, _> = v.into_iter().collect();
+        assert_eq!(
+            m.get("set-cookie").unwrap(),
+            "<redacted>",
+            "Set-Cookie must be redacted in records (both wire casings)"
+        );
+        assert_eq!(m.get("x-custom").unwrap(), "value");
+    }
+
+    /// SEC-4 补充: 真实上游常发**多条**同名 Set-Cookie (HTTP 语义允许重复),
+    /// `redact_headers` 逐条处理, 全部脱敏.
+    #[test]
+    fn prop_set_cookie_redacted_multi_value() {
+        let mut src = HeaderMap::new();
+        src.append("set-cookie", "a=1; Path=/".parse().unwrap());
+        src.append("set-cookie", "b=2; Path=/; HttpOnly".parse().unwrap());
+        let values: Vec<_> = redact_headers(&src, &[])
+            .into_iter()
+            .filter(|(k, _)| k == "set-cookie")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(values, vec!["<redacted>", "<redacted>"]);
+    }
+
     // ─── SEC-4: [redact] redacted_headers 追加名单 (并集语义) ──────────────
     //
     // 契约 (docs/design/contracts.md §7 SEC-4): extra 条目按 lowercase header 名

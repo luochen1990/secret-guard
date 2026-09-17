@@ -2459,6 +2459,49 @@ mod tests {
             prop_assert_eq!(ir, original);
         }
 
+        /// 守卫 RED-6: extra 字段 (未建模 JSON) 中字符串叶子的 secret round-trip
+        /// identity (contracts.md §2). 主体消息**不含** secret — extra 是唯一命中
+        /// 位置, 确保 redact 侧 (`StringLeafOps for IrRequest` 对 extra 的叶子遍历,
+        /// `ir_request_contains` / `ir_request_replace_all` 均经此 trait) 确实覆盖
+        /// extra; secret 注入多层嵌套的字符串**值**叶子 (顶层 / 嵌套 object / array
+        /// 元素), 键与非字符串叶子不在改写范围 (StringLeafOps 只遍历值叶子).
+        /// 预断言 (redact 后 mock 落进 IR) 排除 "redact 未命中 extra → round-trip
+        /// 空转" 的假绿.
+        #[test]
+        fn prop_round_trip_identity_extra(
+            body_prefix in "[a-z0-9 ,.!?'\"\n]{0,40}",
+            secret in "[A-Z]{4,12}",
+            body_suffix in "[a-z0-9 ,.!?'\"\n]{0,40}"
+        ) {
+            let extra_value = serde_json::json!({
+                "custom_top": format!("{body_prefix} {secret} {body_suffix}"),
+                "nested": {
+                    "inner_str": format!("inner {secret}"),
+                    "deeper": {
+                        "leaf": format!("{secret} deep"),
+                        "num": 42,
+                        "flag": true,
+                    },
+                    "arr": [format!("elem {secret}"), 7, null, false],
+                },
+                "plain_num": 2.5,
+                "null_leaf": null,
+            });
+            let mut ir = sample_ir_with_text("unrelated message body");
+            ir.extra = extra_value.as_object().expect("static json! object").clone();
+            let original = ir.clone();
+            let (map, _) = redact_ir(&mut ir, &[entry(&secret)]);
+            // 预断言: secret 被处理且 mock 落进 IR (extra 被改写, 非 round-trip 空转).
+            let mock = map.mock_for(&secret).expect("secret in extra must be redacted");
+            prop_assert!(
+                ir_request_contains(&ir, mock),
+                "mock must appear in redacted IR (extra string leaves rewritten)"
+            );
+            // restore: 与生产 restore_ir_response 相同的叶子遍历 + 替换.
+            ir.for_each_str_leaf_mut(&mut |s| restore_str(s, &map));
+            prop_assert_eq!(ir, original);
+        }
+
         /// 守卫 RED-1: mock 非空 (mock 非空性, contracts.md §2).
         #[test]
         fn prop_mock_non_empty(

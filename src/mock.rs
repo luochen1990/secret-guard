@@ -1373,6 +1373,58 @@ mod tests {
     // (历史 regression: proptest-regressions/redact.txt).
     use proptest::prelude::*;
 
+    /// RED-1 / RED-5 property 测试的 GenSpec 生成器: 随机 prefix / charset 类开关组合 /
+    /// `other` 自定义字符 (含多字节 €, 覆盖非 ASCII 维度 — 生成器覆盖度本身是
+    /// 契约要求, contracts.md §0.3) / length_range, 保证 `validate()` 通过
+    /// (charset 非空, prefix_len ≤ min ≤ max, min > 0; prop_map 尾部
+    /// debug_assert 机械守护). 全类开关关闭且 other 为空时回落 digits=true
+    /// (避免空 charset, 免 prop_filter 拒绝采样开销).
+    fn valid_auto_gen_spec() -> impl Strategy<Value = GenSpec> {
+        (
+            "[a-zA-Z0-9_]{0,6}",
+            any::<bool>(),
+            any::<bool>(),
+            any::<bool>(),
+            any::<bool>(),
+            any::<bool>(),
+            "[@#$%€]{0,3}",
+            0usize..24,
+            0usize..24,
+        )
+            .prop_map(
+                |(prefix, digits, lower, upper, under, hyph, other, min_pad, span)| {
+                    let other: Vec<char> = other.chars().collect();
+                    let charset = Charset {
+                        digits: digits || !(lower || upper || under || hyph || !other.is_empty()),
+                        lowercase: lower,
+                        uppercase: upper,
+                        underscore: under,
+                        hyphen: hyph,
+                        other,
+                    };
+                    let prefix_len = prefix.chars().count();
+                    let min = prefix_len + 1 + min_pad; // ≥ prefix_len + 1 > 0
+                    let max = min + span;
+                    let gen_spec = GenSpec {
+                        prefix,
+                        charset,
+                        length_range: (min, max),
+                    };
+                    debug_assert!(gen_spec.validate().is_ok());
+                    gen_spec
+                },
+            )
+    }
+
+    /// resolve 后 Auto 策略的 gen spec 提取 (三条 RED-1/5 property 共用).
+    /// resolve_against 保证 Auto 模式必有 gen spec (None → infer).
+    fn resolved_gen(strategy: &MockStrategy) -> &GenSpec {
+        strategy
+            .gen_spec
+            .as_ref()
+            .expect("Auto after resolve_against always has gen spec")
+    }
+
     proptest! {
         /// 守卫 RED-5: gen_candidate (Auto) body 不含 real ≥k(L) 字符子串 (contracts.md §2).
         #[test]
@@ -1401,6 +1453,93 @@ mod tests {
                 let mock = gen_candidate(&real, &strategy, seed, counter);
                 assert_no_c5_substring(&mock, &real);
             }
+        }
+
+        /// 守卫 RED-1: mock 字符全部来自 gen_spec.charset ∪ gen_spec.prefix
+        /// (contracts.md §2). gen_spec 双来源覆盖: 显式配置 (Some) 与
+        /// resolve_against infer (None → infer_default_for), 两条路径的产出
+        /// 都受本性质约束.
+        #[test]
+        fn prop_mock_matches_gen_spec_charset(
+            real in "[A-Za-z0-9]{4,32}",
+            gen_spec in proptest::option::of(valid_auto_gen_spec()),
+            global_prefix in "(sgm_|mock-)?",
+            seed in any::<u64>(),
+            counter in 0u32..4,
+        ) {
+            let mut strategy = MockStrategy {
+                initial: InitialValue::Auto,
+                gen_spec,
+            };
+            strategy.resolve_against(&real, &global_prefix);
+            let resolved = resolved_gen(&strategy);
+            let mock = gen_candidate(&real, &strategy, seed, counter);
+            let allowed: std::collections::HashSet<char> = resolved
+                .charset
+                .enabled_chars()
+                .into_iter()
+                .chain(resolved.prefix.chars())
+                .collect();
+            prop_assert!(
+                mock.chars().all(|c| allowed.contains(&c)),
+                "mock {mock:?} has chars outside charset ∪ prefix (allowed: {allowed:?})"
+            );
+        }
+
+        /// 守卫 RED-1: mock 总长 (char count) ∈ gen_spec.length_range (contracts.md §2).
+        /// 长度语义: length_range 是**含 prefix 的总长** (GenSpec 文档 "char count"),
+        /// body 长度区间 = length_range 减 prefix 字符数 (`body_length_range`),
+        /// 实现见 `gen_one_auto_body` (prefix 固定 + body 随机).
+        #[test]
+        fn prop_mock_length_in_range(
+            real in "[A-Za-z0-9]{4,32}",
+            gen_spec in proptest::option::of(valid_auto_gen_spec()),
+            global_prefix in "(sgm_|mock-)?",
+            seed in any::<u64>(),
+            counter in 0u32..4,
+        ) {
+            let mut strategy = MockStrategy {
+                initial: InitialValue::Auto,
+                gen_spec,
+            };
+            strategy.resolve_against(&real, &global_prefix);
+            let resolved = resolved_gen(&strategy);
+            let mock = gen_candidate(&real, &strategy, seed, counter);
+            let (min, max) = resolved.length_range;
+            let len = mock.chars().count();
+            prop_assert!(
+                len >= min && len <= max,
+                "mock char len {len} not in length_range [{min},{max}]: {mock:?}"
+            );
+        }
+
+        /// 守卫 RED-5: Auto 模式确定性 — 同 (real, strategy, seed, counter) 两次调用
+        /// gen_candidate 结果相等. 内部重试链 (C5_INTERNAL_RETRIES) 是纯函数
+        /// (retry 经 hash 进候选, 无随机源 / 无全局状态), 使 C5 实质等价于确定性
+        /// 契约 (contracts.md §2). 两次调用之间穿插不同 seed 的干扰调用, 排除
+        /// 隐藏可变状态.
+        ///
+        /// 注: first == second 对恒空输出也平凡成立 — 非平凡性由姊妹 property
+        /// `prop_mock_non_empty` / `_matches_gen_spec_charset` / `_length_in_range`
+        /// 互补钉住, 勿单独删除姊妹测试.
+        #[test]
+        fn prop_c5_auto_mode_deterministic(
+            real in "[A-Za-z0-9]{4,32}",
+            gen_spec in proptest::option::of(valid_auto_gen_spec()),
+            global_prefix in "(sgm_|mock-)?",
+            seed in any::<u64>(),
+            counter in 0u32..4,
+        ) {
+            let mut strategy = MockStrategy {
+                initial: InitialValue::Auto,
+                gen_spec,
+            };
+            strategy.resolve_against(&real, &global_prefix);
+            let first = gen_candidate(&real, &strategy, seed, counter);
+            // 干扰调用: 不同 seed 的候选穿插其间, 若存在隐藏全局状态会污染第二次结果.
+            let _noise = gen_candidate(&real, &strategy, seed ^ 0xdead_beef, counter);
+            let second = gen_candidate(&real, &strategy, seed, counter);
+            prop_assert_eq!(first, second);
         }
     }
 
