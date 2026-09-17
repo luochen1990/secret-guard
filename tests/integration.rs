@@ -2862,6 +2862,211 @@ async fn malformed_body_falls_back_to_nonstream_timeout() {
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 }
 
+// ─── STR-3: 上游超时/断连后客户端 body 不泄漏未 restore 的 mock ──────────────
+//
+// 契约 (docs/design/contracts.md §3 STR-3): 上游流式响应出错 (超时 / 断连) 时,
+// mock 字符串不得出现在最终返回给客户端的响应 body 中. 两条路径分别覆盖:
+// - 超时: 响应头档 504 (错误体由 proxy 合成, 必须不回显请求侧内容);
+// - 断连: 流中段连接异常终止 (fanout_stream_task Err 分支 + finish_tail flush),
+//   客户端已收字节与滑窗残留 flush 均不得含 mock.
+
+#[tokio::test]
+async fn prop_upstream_timeout_no_mock_leak() {
+    // 上游 5s 不回响应头; 流式档 1s 超时 → 504 (proxy 合成错误体).
+    let upstream_url = spawn_slow_upstream(Duration::from_secs(5)).await;
+    let upstream_timeouts = secret_guard::config::UpstreamTimeouts {
+        connect: None,
+        response_header: Some(Duration::from_secs(1)),
+        nonstream_response_header: Some(Duration::from_secs(10)),
+        stream_idle: None,
+    };
+    let real_secret = "ghp_str3_timeout_secret_abcdef";
+    let expected_mock = predict_mock(real_secret);
+    let secrets = test_secret_table_with(vec![secret("gh-str3-tmo", real_secret)]);
+    let (proxy_url, records_handle) =
+        spawn_proxy_with_timeouts_and_secrets(&upstream_url, upstream_timeouts, secrets).await;
+
+    // stream=true + secret 命中 → 请求侧 redact (mock 进入上游请求 body) + IR 路径.
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/o/oa-main/v1/chat/completions"))
+        .body(format!(
+            r#"{{"model":"gpt-4","stream":true,"messages":[{{"role":"user","content":"use {real_secret} now"}}]}}"#
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::GATEWAY_TIMEOUT);
+    let text = resp.text().await.unwrap();
+    assert!(
+        !text.contains(&expected_mock),
+        "504 body must not contain mock {expected_mock}; got: {text}"
+    );
+    assert!(
+        !text.contains(real_secret),
+        "504 body must not contain real secret; got: {text}"
+    );
+
+    // 钉住 IR 路径确实被触发 (redact 命中), 排除 passthrough 下的空转绿灯.
+    let list = wait_until_or_timeout(
+        &records_handle,
+        |l| l.first().is_some_and(|r| r.resp_status == 504),
+        Duration::from_secs(3),
+    )
+    .await;
+    assert_eq!(list[0].redactions.len(), 1, "IR redact path must be taken");
+}
+
+/// 起一个上游: 回 200 + SSE 头, 依序发送 `chunks` (相邻间隔 `gap`), 最后以 body
+/// 流错误 abruptly 断连 (hyper 终止连接, 客户端读到 truncated body). 用于 STR-3
+/// 断连场景 — 相比 mockito (静态 body fixture), body 流 Err 是唯一能模拟中段断连
+/// 的手段.
+///
+/// `gap` 不可省: 瞬时连发全部 chunk 再 Err 时, hyper 服务端可能在 flush 响应头
+/// 之前就中止连接 (head 都到不了 secret-guard, 客户端收到 502 而非 200 截断流),
+/// 退化成"首字节前失败", 命中不了 fanout 流式路径. 相邻 chunk 间 sleep 保证
+/// head + 已发 chunk 先 flush 到 socket, 错误真正落在 body 中段 (150ms 在 loopback
+/// 上余量充足; CI 负载下间歇红时优先增大此值).
+async fn spawn_upstream_sse_then_disconnect(gap: Duration, chunks: Vec<bytes::Bytes>) -> String {
+    use futures::StreamExt as _;
+    // Handler closure 需可重入: (gap, chunks) 经 Arc clone-in (每 invocation 克隆
+    // Arc 重建 body 流; 与 spawn_upstream_first_chunk_then_hang 的 &'static 参数
+    // 方案同型, 适用于动态构造的 chunk 内容).
+    let source = std::sync::Arc::new((gap, chunks));
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(move || {
+            let source = source.clone();
+            async move {
+                let (gap, chunks) = (source.0, source.1.clone());
+                // chunk 间 sleep gap (首块立即发让响应头尽快到达), 最后 Err →
+                // hyper 中止连接 (无最终 chunk 终止符). then 逐个 await (存续单个
+                // pending future, 完成后才取下一个), 串行保序.
+                let body_stream = futures::stream::iter(chunks.into_iter().enumerate()).then(
+                    move |(i, c)| async move {
+                        if i > 0 {
+                            tokio::time::sleep(gap).await;
+                        }
+                        Ok(c)
+                    },
+                );
+                let body_stream = body_stream.chain(futures::stream::once(async move {
+                    tokio::time::sleep(gap).await;
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        "upstream disconnected mid-stream",
+                    ))
+                }));
+                (
+                    [("content-type", "text/event-stream")],
+                    axum::body::Body::from_stream(body_stream),
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn prop_upstream_disconnect_no_mock_leak() {
+    let real_secret = "ghp_str3_disc_secret_abcdef";
+    let expected_mock = predict_mock(real_secret);
+    // 上游 SSE 回显 mock (模型复述 redacted prompt 的形态), 三条事件覆盖
+    // StreamingRestorer 滑窗的各泄漏面 (find_safe_end = max(最后完整 mock 末尾,
+    // len - hold), 完整 mock 即时 restore+emit, hold 只扣留疑似 mock 前缀的尾部):
+    // - A 完整帧, mock 居中 + 长尾部 padding → mock 在安全区内, restore+emit,
+    //   客户端收到 real (证明流确实过了 restore 管道, 非零字节空转);
+    // - B 完整帧, mock 后仅 1 字节 → 断连时尾部残留 hold 滑窗 (flush 残留路径);
+    // - C 半截帧 (无 \n\n 终止符) 含 mock → 断连时停留在重组器 raw buffer (未解析).
+    // 随后上游断连: A/B/C 任何路径的 mock 都不得出现在客户端 body.
+    let event_a = format!(
+        "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"echo {expected_mock} with ample trailing padding to push safely past the hold window\"}}}}]}}\n\n"
+    );
+    let event_b = format!(
+        "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"tail {expected_mock} x\"}}}}]}}\n\n"
+    );
+    let event_c = format!(
+        "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"dangling {expected_mock}"
+    );
+    let upstream_url = spawn_upstream_sse_then_disconnect(
+        Duration::from_millis(150),
+        vec![
+            bytes::Bytes::from(event_a),
+            bytes::Bytes::from(event_b),
+            bytes::Bytes::from(event_c),
+        ],
+    )
+    .await;
+
+    // 超时档拉满排除干扰: 断连错误自身终止流, 不依赖任何超时.
+    let upstream_timeouts = secret_guard::config::UpstreamTimeouts {
+        connect: None,
+        response_header: Some(Duration::from_secs(10)),
+        nonstream_response_header: Some(Duration::from_secs(10)),
+        stream_idle: None,
+    };
+    let secrets = test_secret_table_with(vec![secret("gh-str3-disc", real_secret)]);
+    let (proxy_url, records_handle) =
+        spawn_proxy_with_timeouts_and_secrets(&upstream_url, upstream_timeouts, secrets).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/o/oa-main/v1/chat/completions"))
+        .body(format!(
+            r#"{{"model":"gpt-4","stream":true,"messages":[{{"role":"user","content":"use {real_secret} now"}}]}}"#
+        ))
+        .send()
+        .await
+        .unwrap();
+    // 响应头已正常到达 (200 + SSE), 断连发生在 body 中段 (gap 保证, 见 helper 注释).
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // 读完客户端 body (断连 → 流以 Err/EOF 终止, 不得 hang; 10s 是防 hang 护栏).
+    use futures::StreamExt;
+    let mut stream = resp.bytes_stream();
+    let client_body = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut buf = Vec::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(b) => buf.extend_from_slice(&b),
+                Err(_) => break,
+            }
+        }
+        buf
+    })
+    .await
+    .expect("client body read must terminate (not hang with upstream)");
+    let text = String::from_utf8_lossy(&client_body);
+    // sanity: 事件 A 已 restore, 客户端应看到 real secret — 排除 "客户端零字节 /
+    // 未走 restore 管道 → 无 mock 平凡成立" 的空转绿灯.
+    assert!(
+        text.contains(real_secret),
+        "sanity: restored event A (real secret) must reach client; got: {text}"
+    );
+    assert!(
+        !text.contains(&expected_mock),
+        "client body after disconnect must not contain unrestored mock {expected_mock}; got: {text}"
+    );
+
+    // record: 上游流错误 label (ConnectionAborted 非 TimedOut → ERR_UPSTREAM_STREAM,
+    // 与 recorder::stream_err_label 分类一致; 形态同 IDLE_ERR 先例, 防别的错误蒙混)
+    // + redact 命中 (IR 路径钉住).
+    const UPSTREAM_STREAM_ERR: &str = "upstream stream error";
+    let list = wait_until_or_timeout(
+        &records_handle,
+        |l| {
+            l.first()
+                .is_some_and(|r| r.error.as_deref() == Some(UPSTREAM_STREAM_ERR))
+        },
+        Duration::from_secs(3),
+    )
+    .await;
+    assert_eq!(list[0].redactions.len(), 1, "IR redact path must be taken");
+}
+
 /// 启动 secret-guard, 显式指定 UpstreamTimeouts (超时回归测试专用).
 ///
 /// SecretTable 为空 → passthrough 路径; secrets 非空 → same_proto IR 路径
