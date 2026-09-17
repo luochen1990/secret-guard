@@ -462,11 +462,7 @@ pub(crate) async fn cross_proto_forward(
                     .and_then(|m| m.as_str())
                     .map(String::from)
             })
-            .unwrap_or_else(|| {
-                let raw = std::str::from_utf8(&resp_bytes).unwrap_or("");
-                let cap = raw.len().min(super::MAX_ERROR_MSG_LEN);
-                raw[..cap].to_string()
-            });
+            .unwrap_or_else(|| raw_error_snippet(&resp_bytes));
         let kind = http_status_to_error_kind(resp_status.as_u16());
         let envelope = ingress_writer.write_error(resp_status.as_u16(), kind, &friendly);
         let body = serde_json::to_vec(&envelope).unwrap_or_default();
@@ -544,6 +540,17 @@ fn http_status_to_error_kind(status: u16) -> &'static str {
     }
 }
 
+/// 错误响应 body 解析不出 `error.message` 时的回退 message: 原始字节按 UTF-8
+/// 尽力解释 (非法 UTF-8 → 空串), 截断到 [`super::MAX_ERROR_MSG_LEN`] 字节.
+///
+/// 契约 (ROB-1): 截断切点必须落在 char boundary — 上游 body 是任意字节, 多字节
+/// 字符上直切字节偏移会 panic, 掐断整个连接.
+fn raw_error_snippet(resp_bytes: &[u8]) -> String {
+    let raw = std::str::from_utf8(resp_bytes).unwrap_or("");
+    let cap = raw.len().min(super::MAX_ERROR_MSG_LEN);
+    raw[..cap].to_string()
+}
+
 /// 统计 block 切片中 [`IrBlock::ReasoningContent`] (思考原文, #176) 的数量,
 /// 递归含 ToolResult.content (writer 的 block 写出对任何位置统一跳过, 计数同构).
 /// 请求侧调用点: `ir.system` + 各 `ir.messages[].content`; 响应侧: `ir_resp.content`.
@@ -573,8 +580,27 @@ fn count_reasoning_blocks(blocks: &[crate::codec::ir::IrBlock]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{count_reasoning_blocks, http_status_to_error_kind};
+    use super::{count_reasoning_blocks, http_status_to_error_kind, raw_error_snippet};
     use crate::codec::ir::IrBlock;
+
+    /// ROB-1: 错误响应 body 含多字节字符且超过 MAX_ERROR_MSG_LEN 时, 截断切点
+    /// 会落在字符中间 — 不得 panic (历史 bug: 字节偏移直切 `raw[..cap]`).
+    ///
+    /// 构造: "错" (3 bytes/char) × 2000 = 6000 bytes; 4096 = 3×1365 + 1, 切点
+    /// 4096 落在第 1366 个字符 (span 4095..4098) 内部.
+    #[test]
+    fn raw_error_snippet_truncates_multibyte_on_char_boundary() {
+        let body = "错".repeat(2000);
+        let s = raw_error_snippet(body.as_bytes());
+        // 不 panic 且是合法 UTF-8 (类型即保证); 截断发生在 char boundary.
+        assert!(s.len() < body.len(), "必须发生截断");
+        assert_eq!(s.len(), 3 * 1365, "4096 floor 到最近的 char boundary = 4095");
+        assert!(s.chars().all(|c| c == '错'), "不得出现残缺字符");
+        // 未超限时原样保留 (含 ASCII 快速路径).
+        assert_eq!(raw_error_snippet(b"short error"), "short error");
+        // 非法 UTF-8 → 空串 (与既有行为一致).
+        assert_eq!(raw_error_snippet(&[0xff, 0xfe]), "");
+    }
 
     /// 覆盖所有 match 分支, 确保 status → kind 映射完整且稳定.
     /// (错误 kind 字符串暴露给客户端 envelope, 改动属契约性变更, 测试守卫之.)
