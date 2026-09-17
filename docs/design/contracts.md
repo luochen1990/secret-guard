@@ -119,21 +119,25 @@
 UI 段的 Playwright 测试用中文标题, 锚点即标题子串 (须避开反引号; 可含空格与括号 —
 lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
-**⏳ 项补齐优先级** (按风险排序, 排期依据 — 23 条, 2026-08-15):
+**⏳ 项补齐优先级** (按风险排序, 排期依据 — 剩 10 条 = 9 条 property (lint 口径) + VIEW-2 表格注记, 2026-09-17; 原始 23 条见 2026-08-15 版变更日志):
 
-1. **P0 安全 (5 条: SEC-1 穷举 2 + STR-3 泄漏 3)** — secret 泄漏类:
-   `prop_no_real_secret_in_any_json_response` / `prop_no_real_api_key_in_any_json_response`
-   (SEC-1, 穷举式"任意 GET 响应扫描真实值", 现有个别字段 assert 不足); STR-3 的
-   `prop_upstream_disconnect_no_mock_leak` / `prop_upstream_timeout_no_mock_leak`
-   (`prop_non_2xx_sse_no_mock_to_client` 属已知 gap, 见 STR-3 "理想 vs 现状" 注记,
-   补齐前需先裁决实现路线). mock 泄漏非 secret 泄漏但会破坏下游工具.
-2. **P1 行为语义无守卫 (4 条: DTO-4 优先级链 1 + UI-3 DOM 顺序 3)** — ROB-1 只守
-   never-panic, 行为语义 (fallback 链末端 / prepend 顺序 / replace 顺序 / 乱序自愈)
-   无回归守卫, 重构时易静默回归.
-3. **P2 边界补强 (其余 14 条)** — 已有实现遵循 + 邻近 property 间接覆盖, 专项断言
-   缺 (RED-1 charset/length, RED-5 重试链确定性, RED-6 tool_result/system/extra,
-   RED-7 block 隔离, CDAG-2/7, DTO-1 internal leak, DTO-6, FWD-2 流式双 round-trip,
-   SEC-4 set-cookie); 随相关模块改动顺带补齐.
+1. **待裁决 / 架构受限 (3 条)** — 补齐前需先做实现路线裁决或架构改动:
+   STR-3 `prop_non_2xx_sse_no_mock_to_client` (已知实现 gap, 见 STR-3 "理想 vs 现状" 注记,
+   出路与 SEC-10 opt-in 哲学纠缠, 需维护者拍板); DTO-6
+   `prop_cross_proto_delta_no_silent_misalignment` (理想方案需在 web 层重建 redactMap,
+   有 secret 泄露顾虑, 见 web/AGENTS.md TODO); VIEW-2 流式 `resp_parsed`
+   (Phase A 已物理删除源字节, 需 Phase B 或 consistency-check 双累积).
+2. **UI e2e 类 (5 条: DTO-4 + UI-3×3 + UI-7)** — 后端半边多已覆盖, 缺 Playwright
+   专项 e2e (fallback 占位 / prepend / replace / 乱序自愈 / 重复 append 幂等);
+   构造确定性有成本, 随前端改动顺带补齐.
+3. **可排期 (2 条: FWD-2 流式双 round-trip + RED-7 block 隔离)** — 生成器/基建齐全,
+   FWD-2 流式条初期可能红灯 (writer 的 id/created 合成不确定性), 红灯本身即定位价值.
+
+> 2026-09-17 集中补齐批次 (9 条 ⏳→✅): RED-1 charset/length + RED-5 确定性 +
+> RED-6 extra + STR-3 timeout/disconnect (断连双防线实证: StreamingRestorer::flush
+> restore + mpsc 保序) + CDAG-7 (is_orphan 后端落地, wire 传播留后续) + DTO-1 +
+> SEC-4 set-cookie; 另补 CFG-4 跨表失败回滚 (原 "后续工作" 注记关闭) 与
+> dto::UsageView 饱和边界 (DTO 未编号加固).
 
 新增契约条目时必须同步给 property 标注 (lint 强制), 杜绝 "愿望清单" 再现
 (#144: 走查发现 ~85/156 条零落地标注, 全量标注后剩 23 条真 ⏳).
@@ -326,8 +330,8 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 **Properties**:
 - `prop_mock_non_empty`: 对任意 (secret, strategy), 生成的 mock 非空. ✅
-- `prop_mock_matches_gen_spec_charset`: mock 字符全部来自 gen_spec.charset ∪ gen_spec.prefix. ⏳
-- `prop_mock_length_in_range`: mock 长度 ∈ gen_spec.length_range. ⏳
+- `prop_mock_matches_gen_spec_charset`: mock 字符全部来自 gen_spec.charset ∪ gen_spec.prefix. ✅
+- `prop_mock_length_in_range`: mock 长度 ∈ gen_spec.length_range. ✅ (长度含 prefix — 与 mock.rs `body_length_range` 归一化语义一致)
 
 ### RED-2 上下文唯一性 (in-context uniqueness)
 
@@ -371,7 +375,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 **Properties**:
 - `prop_no_real_substring_ascii`: 对任意 ASCII secret, mock 不含其 ≥ k(L) 子串. 🔁→`prop_no_real_substring` (`src/redact.rs`) + `prop_c5_gen_candidate_auto_body_no_real_substring` (`src/mock.rs`)
 - `prop_no_real_substring_multibyte`: 对任意 UTF-8 secret (中文/emoji), 同上, char-level 而非 byte-level. ✅
-- `prop_c5_auto_mode_deterministic`: Auto 模式下, 内部重试链 (C5_INTERNAL_RETRIES=10000) 使失败概率 ~(1e-5)^10000 ≈ 0, 实质等价于确定性契约. ⏳
+- `prop_c5_auto_mode_deterministic`: Auto 模式下, 内部重试链 (C5_INTERNAL_RETRIES=10000) 使失败概率 ~(1e-5)^10000 ≈ 0, 实质等价于确定性契约. ✅
 - `prop_c5_fixed_mode_validated_on_upsert`: Fixed 模式 / 用户 prefix 在 `validate_against_real` (upsert 时) 校验, 不合格的 secret 拒绝入库. 🔁→`mock_strategy_validate_against_real_rejects_fixed_equals_real` 等 mock.rs validate 组 (upsert 链路经 `SecretEntry::validate_and_resolve` 调用)
 - `prop_secret_with_mock_prefix_rejected`: secret value 含 `global_mock_prefix` 时被 `validate_value` 拒绝 (前缀非空时生效). 🔁→`validate_value_rejects_short_pua_and_mock_prefix` (`src/secrets.rs`) + `validate_value_rejects_mock_prefix` (`tests/integration.rs`)
 
@@ -384,7 +388,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 - `prop_round_trip_identity_tool_use_input`: tool_use input JSON 中 secret 的 round-trip identity. 🔁→`prop_response_tool_use_input_restored` (`src/redact.rs`)
 - `prop_round_trip_identity_tool_result`: tool_result 嵌套 text 中 secret 的 round-trip identity. 🔁→`prop_round_trip_identity_all_positions` (`src/redact.rs`)
 - `prop_round_trip_identity_system`: system prompt 中 secret 的 round-trip identity. 🔁→`prop_round_trip_identity_all_positions` (`src/redact.rs`)
-- `prop_round_trip_identity_extra`: extra 字段 (未建模 JSON) 中 secret 的 round-trip identity. ⏳
+- `prop_round_trip_identity_extra`: extra 字段 (未建模 JSON) 中 secret 的 round-trip identity. ✅
 - `prop_round_trip_identity_multi_secret`: 多 secret (1..10) 同时出现的 round-trip identity. 🔁→`prop_multi_secret_round_trip` + `prop_response_multi_secret_round_trip` (`src/redact.rs`)
 - `prop_round_trip_identity_repeated_secret`: 同 secret 在多字段重复出现的 round-trip identity. 🔁→`prop_repeated_secret_round_trip` (`src/redact.rs`)
 
@@ -446,8 +450,8 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 **Properties**:
 - `prop_non_2xx_sse_no_mock_to_client`: non-2xx SSE 响应的客户端可见 body 中不含任何 mock 字符串. ⏳
-- `prop_upstream_disconnect_no_mock_leak`: 上游断连后, 客户端可见 body 中不含 mock. ⏳
-- `prop_upstream_timeout_no_mock_leak`: 上游超时后, 客户端可见 body 中不含 mock. ⏳
+- `prop_upstream_disconnect_no_mock_leak`: 上游断连后, 客户端可见 body 中不含 mock. ✅ (断连场景需 chunk 间 gap 保证 head 先 flush — 见 `spawn_upstream_sse_then_disconnect` helper 注释; 双防线: `StreamingRestorer::flush` 对残留做 restore + mpsc 保序使 Err 后 tail 不可达)
+- `prop_upstream_timeout_no_mock_leak`: 上游超时后, 客户端可见 body 中不含 mock. ✅
 
 ### STR-4 缓冲溢出 abort
 
@@ -538,10 +542,10 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 **陈述**: 当 parent 被 LRU 淘汰后, child 节点必须能被识别为孤儿 (is_orphan), WebUI 据此降级展示而非显示残缺数据.
 
-> **理想 vs 现状**: `NodeView::is_orphan` 未实现, 当前孤儿节点的 full_request_messages 返回 None.
+> **现状 (2026-09-17)**: `NodeView::is_orphan` 已实现 (dto 字段 + view 派生, 直查 parent 存活性, 不做链完整性 walk — 孙节点 parent 存活恒 false, delta 无损无需标记)。降级展示半边由 `full_request_messages → None` + preview fallback 承载; **wire 传播尚未接通** (NodeView 无 Serialize, ForwardRecord / TimelineRound 未携带该字段), 前端徽章利用留后续。
 
 **Properties**:
-- `prop_orphan_node_identifiable`: parent 不存在的 node 被标记为 is_orphan. ⏳
+- `prop_orphan_node_identifiable`: parent 不存在的 node 被标记为 is_orphan. ✅
 - `prop_orphan_node_degrades_gracefully`: 孤儿节点的 timeline 查询返回降级视图 (而非 panic / 残缺数据). ✅ (白盒构造孤儿态 — 公共 eviction 被 child_count 保护正常不可达; 断言 full_request_messages → None + timeline 截断到存活轮次, 不 panic)
 
 ### CDAG-8 session 聚类稳定
@@ -564,7 +568,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 **Properties**:
 - `prop_forward_record_json_shape_backward_compat`: 旧版序列化数据 (无 resp_parsed / redactions 字段) 仍能反序列化为合法 ForwardRecord. 🔁→`legacy_json_without_redactions_deserializes_to_empty_vec` (`src/record.rs`; 仅 redactions 字段, resp_parsed 缺省兼容由 serde default 承载无专测)
-- `prop_forward_record_no_internal_leak`: ForwardRecord 不暴露 DAG 内部类型 (BlockHash / MessageRef 等). ⏳
+- `prop_forward_record_no_internal_leak`: ForwardRecord 不暴露 DAG 内部类型 (BlockHash / MessageRef 等). ✅ (marker 填充 + 序列化扫描禁词; 灵敏度由 `dto1_scanner_detects_internal_field_when_present` 守卫)
 
 ### DTO-2 redactions 字段 SSOT 派生
 
@@ -697,8 +701,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 - `prop_persist_failure_rolls_back_memory`: state.toml 写失败时, 内存层不留下半提交状态. ✅
 - `prop_atomic_write_no_corrupt_file`: atomic_write 用 tmp + rename, 中途崩溃不留下损坏的 state.toml. ✅
 - `prop_persist_failure_rollback_under_concurrency`: 跨表并发写时, 一表 persist 失败回滚不影响另一表 in-flight 写入. ✅
-
-> **理想 vs 现状**: 本 property 的完整"跨表"覆盖 (装配 SecretTable + ProviderTable 共享 persist_lock + Decisions + 同一 state_path) 尚未实现; 当前测试降级为单表 N 线程并发, 覆盖 "persist_lock 串行 RMW + 失败回滚" 核心不变量, 但未触及跨表 state.toml 文件交互 (一表 atomic_write 留下损坏文件会让另一表 load_or_empty 读到错误状态) 与共享 Decisions Arc 的跨表隔离. 跨表完整覆盖作为后续工作. 成功路径的"并发不丢更新"由 CFG-5 `prop_concurrent_upserts_no_lost_update` 覆盖.
+- `prop_persist_failure_rollback_under_concurrency_cross_table`: 跨表完整覆盖 (装配 SecretTable + ProviderTable 共享 persist_lock + Decisions + 同一 state_path, 与 server.rs 一致): 只读窗口内双表并发写全失败 → 内存各自回滚互不污染 + 共享 Decisions 完全回滚且跨子表隔离 + state.toml 字节级不变; 窗口恢复后另一表写入成功提交, 终态内存/磁盘精确集合断言. ✅ (2026-09-17 补齐, 原 "单表降级 + 跨表作为后续工作" 注记关闭; 共享 state_path 下只读窗口对两表对称失败, "窗口内一表失败 + 另一表并发成功" 经锁序论证结构性不可达, 故按三确定性阶段覆盖)
 
 ### CFG-5 跨表并发安全
 
@@ -709,7 +712,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 - `prop_concurrent_writes_serialized_via_persist_lock`: 跨表 (SecretTable + ProviderTable 共享 persist_lock + 同一 state_path + 同一 Decisions Arc, 与 server.rs 启动装配一致) 并发 upsert — 两表 effective 各含全部项 (跨表不丢更新) + 从磁盘 `load_or_empty` 重载得到的 DynamicState 同时含两表 dynamic 段 (persist_lock 串行 RMW, state.toml 不撕裂, 无跨表段覆盖). ✅
 - `prop_cross_table_shared_decisions_isolation`: 共享 Decisions Arc 的跨表并发 `set_decision` (各改自己子表) 互不串扰 — secret id 的 decision 不误写到 providers 子表, 反之亦然; 合并后 state.toml 同时保留两子表 decision. ✅
 
-> **覆盖现状**: CFG-5 的两个 property (`prop_concurrent_writes_serialized_via_persist_lock` + `prop_cross_table_shared_decisions_isolation`) 已实现跨表完整覆盖 — 装配方式与 `server.rs` 生产路径一致 (共享 `Arc<Mutex<()>>` persist_lock + 共享 `Arc<RwLock<Decisions>>` + 同一 state_path). 上方 CFG-4 "理想 vs 现状" 注记中提到的 "跨表 state.toml 文件交互" 与 "共享 Decisions Arc 的跨表隔离" 现由本节两个 property 覆盖; CFG-4 自身的跨表失败回滚 (`prop_persist_failure_rollback_under_concurrency`) 仍作为后续工作.
+> **覆盖现状**: CFG-5 的两个 property (`prop_concurrent_writes_serialized_via_persist_lock` + `prop_cross_table_shared_decisions_isolation`) 已实现跨表完整覆盖 — 装配方式与 `server.rs` 生产路径一致 (共享 `Arc<Mutex<()>>` persist_lock + 共享 `Arc<RwLock<Decisions>>` + 同一 state_path); CFG-4 的跨表失败回滚由 `prop_persist_failure_rollback_under_concurrency_cross_table` (CFG-4 节) 覆盖.
 
 ### CFG-6 悬空 decision 清理 (prune)
 
@@ -758,7 +761,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 **Properties**:
 - `prop_auth_headers_redacted_in_record`: Authorization / x-api-key / x-goog-api-key / cookie 类 header 在 record 中为 `<redacted>`. 🔁→`redact_headers_masks_secrets` (`src/proxy/helpers.rs`; authorization / x-api-key / x-goog-api-key)
-- `prop_set_cookie_redacted`: 上游 Set-Cookie header 在 record 中脱敏. ⏳
+- `prop_set_cookie_redacted`: 上游 Set-Cookie header 在 record 中脱敏. ✅ (`prop_set_cookie_redacted` + `prop_set_cookie_redacted_multi_value`, `src/proxy/helpers.rs`)
 - `prop_custom_token_headers_redacted`: 含 "token" / "secret" 关键词的自定义 header 也脱敏. ✅
 - `prop_configured_headers_redacted`: `[redact] redacted_headers` 配置的 header (归一化: trim + lowercase) 在 record 的 req_headers / resp_headers 中为 `<redacted>`; 未配置的无关 header 不受影响; 匹配为精确匹配非子串. 🔁→`redact_headers_extra_config_hits_custom_header` + `redact_headers_extra_is_exact_match_not_substring` (`src/proxy/helpers.rs`) + `normalize_trims_lowercases_and_skips_empty` (`src/state.rs`) + `redacted_headers_config_masks_custom_header_in_record` (`tests/integration.rs`, 端到端)
 
@@ -1150,3 +1153,4 @@ chars (char boundary 安全); 其余事件字段为受控类型, 天然无 secre
 | 2026-08-31 | FWD-1 | **适用范围修订 (待人工授权)**: router provider 的模型列表 GET 请求 (FWD-7 域) 本地终结, 不转发上游 — 对这类请求 FWD-1 不适用 (响应为本地合成, 可含缓存上游清单, 非实时中继); Direct provider 的 /models 仍受 FWD-1 约束 (先例: 2026-08-24 #183 的 FWD-1 修订) | #196: 模型列表发现是网关自身的元数据职责, 透传上游列表无法承载路由别名 |
 | 2026-09-04 | USAGE-3 + USAGE-4 | USAGE-3 多 vendor 消歧语义澄清 (人工授权, #202): 原文"域名消歧, 仍歧义字母序"未规定同 host 多 vendor 碰撞行为, 实现为 last-wins (结果静默依赖上游 JSON 键序, 套餐 vendor 胜出 → cost 恒 0). 修订为: hint host 的 vendor 集与候选集交集非空则收缩到交集, 池内确定性偏好序 (无 `-plan` 段 > 名短 > 字母序), 结果与数据键序无关; 偏好序是启发式策略而非正确性保证. USAGE-4 新增 `zero_priced_models` 显式清单 (零价 ≠ 无价, coverage 口径不变) | #202: 套餐入口部署 est_cost_usd 恒 0 且 cost_coverage=1.0 掩盖异常; 链路缺口 = 消歧规则对碰撞场景欠规定 + 零价缺少显式观测信号 |
 | 2026-09-15 | FWD-5 + FWD-3 + RED-7 | **跨协议流式接入 dispatch**: OpenAI⇄Anthropic + stream=true 从 501 改为 StreamTranslate 跨协议模式流式翻译 (redact 场景注入 restore hook, 响应侧 mock→real); FWD-5 的 `prop_cross_proto_streaming_returns_501` 作废, 收窄为 `prop_cross_proto_streaming_responses_returns_501` (Responses 任一侧仍 501 — read_response_events 未实现, 放行会翻译出空流); FWD-3 新增 `prop_cross_proto_stream_content_fidelity` (流式半段内容保真 + wire 帧顺序合法性); RED-7 适用范围扩至跨协议路径 + 新增 `prop_cross_proto_streaming_no_mock_leak_dispatch_integrated`. 配套实现: StreamTranslate 跨协议模式新增跳过 block 配对过滤 (writer 跳过 BlockStart 的 index 其 BlockStop 一并跳过, 不产生未配对 content_block_stop) + deferred message_stop (message_delta[usage] 先于 message_stop, Anthropic wire 合法顺序) | 跨协议流式翻译已实现且有 property 守卫, 但从未接入 dispatch (501 占位); dispatch 接入任务授权 (评审设计 2026-09-15) |
+| 2026-09-17 | 多域 (ROB/工具+测试补齐) | **帕累托改进集中批次** (⏳ 9 条→✅): RED-1 charset/length + RED-5 确定性 + RED-6 extra + STR-3 timeout/disconnect + CDAG-7 + DTO-1 + SEC-4 set-cookie; CFG-4 补跨表失败回滚 `prop_persist_failure_rollback_under_concurrency_cross_table` (关闭 "后续工作" 注记); §0.6 清单同步 (剩 10 条: 待裁决/架构受限 3 + UI e2e 5 + 可排期 2). 配套生产修复: cross_proto 错误消息截断守 char boundary (原字节直切在多字节切点 panic, ROB-1 违例) + util 公共截断族 DRY (4 处合一); CDAG-7 `NodeView::is_orphan` 后端落地 (wire 传播留后续, 见 CDAG-7 现状注记) | 项目走查 (帕累托改进点集中实施): 走查发现 panic bug + 契约 ⏳ 清单 + 代码重复/热路径冗余 |
