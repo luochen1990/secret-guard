@@ -603,57 +603,70 @@ impl DynamicTable<Provider> {
     /// - visited-set 保证**有限步终止**: 表有限, 重复 id 即环 (validate/would_cycle
     ///   之外的运行时兜底 — 手改 state.toml 或并发写入造成的环在这里安全降级为
     ///   503, 不挂起);
-    /// - `entry` 自身是 Direct 时原样返回 (实体 provider 快路径, 零开销一跳).
+    /// - `entry` 按借用传入 (per-model 批量解析场景 — `/models` 合成 (FWD-7) 对
+    ///   每个候选 model 解析一次 — 避免整棵 Provider 逐次 clone): 首跳零拷贝,
+    ///   仅换跳 (`get_effective`) 与 Direct 返回 (id + DirectPayload) 才构造
+    ///   owned 值;
+    /// - `entry` 自身是 Direct 时原样返回 (实体 provider 快路径, 零路由匹配一跳).
     ///
     /// 错误消息只含 provider id / model 名与 reason 枚举 (SEC-2 同型, 无 secret),
     /// 经 `AppError::Unavailable` 原样回传客户端 503 body.
     pub fn resolve_route(
         &self,
-        entry: Provider,
+        entry: &Provider,
         request_model: &str,
     ) -> Result<ResolvedRoute, RouteError> {
-        let mut cur = entry;
-        let mut visited = HashSet::from([cur.id.clone()]);
+        let mut visited = HashSet::from([entry.id.clone()]);
         let mut in_flight_model = request_model.to_string();
         let mut model_rewrite: Option<String> = None;
+        // 借用语义的循环骨架: 首跳借用调用方 entry, 换跳才持有 owned next —
+        // `owned` 每轮至多保留一跳中间 Provider (换跳瞬间新旧两跳短暂共存后
+        // 旧值被 drop, 峰值与原实现的 `cur = next` 一致). 每轮决策在 scoped
+        // 块内完成, 块结束时借用随之释放, 之后的 `owned = Some(next)` 写入
+        // 不与借用冲突.
+        let mut owned: Option<Provider> = None;
         loop {
-            match cur.kind {
-                // 链尾 (或入口即实体): 返回. `id` 一并带出 (DirectProvider 不持有 id,
-                // downstream 的 CallEvent.upstream_id 需要).
-                ProviderKind::Direct(direct) => {
-                    return Ok(ResolvedRoute {
-                        id: cur.id,
-                        provider: direct,
-                        model_rewrite,
-                    });
-                }
-                ProviderKind::Router(router) => {
-                    // NoMatch 的 model 回显在构造处截断 (超长 model 名防日志
-                    // 洪水 / 503 body 膨胀); 匹配本身用未截断的 in_flight_model.
-                    let route = router.select_route(&in_flight_model).ok_or_else(|| {
-                        RouteError::NoMatch {
+            let next = {
+                let cur = owned.as_ref().unwrap_or(entry);
+                match &cur.kind {
+                    // 链尾 (或入口即实体): 返回. `id` 一并带出 (DirectProvider 不持有 id,
+                    // downstream 的 CallEvent.upstream_id 需要).
+                    ProviderKind::Direct(direct) => {
+                        return Ok(ResolvedRoute {
                             id: cur.id.clone(),
-                            model: truncate_model_for_echo(&in_flight_model),
+                            provider: direct.clone(),
+                            model_rewrite,
+                        });
+                    }
+                    ProviderKind::Router(router) => {
+                        // NoMatch 的 model 回显在构造处截断 (超长 model 名防日志
+                        // 洪水 / 503 body 膨胀); 匹配本身用未截断的 in_flight_model.
+                        let route = router.select_route(&in_flight_model).ok_or_else(|| {
+                            RouteError::NoMatch {
+                                id: cur.id.clone(),
+                                model: truncate_model_for_echo(&in_flight_model),
+                            }
+                        })?;
+                        // pipeline 语义: 改写立即生效 (后续 router 按改写后 model 匹配),
+                        // 多次改写后者覆盖前者.
+                        if let Some(m) = &route.upstream_model {
+                            model_rewrite = Some(m.clone());
+                            in_flight_model = m.clone();
                         }
-                    })?;
-                    // pipeline 语义: 改写立即生效 (后续 router 按改写后 model 匹配),
-                    // 多次改写后者覆盖前者.
-                    if let Some(m) = &route.upstream_model {
-                        model_rewrite = Some(m.clone());
-                        in_flight_model = m.clone();
+                        let next = self
+                            .get_effective(&route.target)
+                            .ok_or_else(|| RouteError::Missing(route.target.clone()))?;
+                        if !next.enabled {
+                            return Err(RouteError::Disabled(next.id.clone()));
+                        }
+                        if !visited.insert(next.id.clone()) {
+                            return Err(RouteError::Cycle(next.id));
+                        }
+                        next
                     }
-                    let next = self
-                        .get_effective(&route.target)
-                        .ok_or_else(|| RouteError::Missing(route.target.clone()))?;
-                    if !next.enabled {
-                        return Err(RouteError::Disabled(next.id.clone()));
-                    }
-                    if !visited.insert(next.id.clone()) {
-                        return Err(RouteError::Cycle(next.id));
-                    }
-                    cur = next;
                 }
-            }
+            };
+            owned = Some(next);
         }
     }
 
@@ -1620,7 +1633,7 @@ mod tests {
         // Direct provider 原样返回, 零额外跳; 无路由改写.
         let t = route_table();
         let real = t.get_effective("real").unwrap();
-        let out = t.resolve_route(real.clone(), "any-model").unwrap();
+        let out = t.resolve_route(&real, "any-model").unwrap();
         assert_eq!(out.id, "real");
         assert_eq!(out.provider.base_url, "https://upstream");
         assert_eq!(
@@ -1635,7 +1648,7 @@ mod tests {
         // rt1 → rt2 → real: 解析到链尾实体, 携带其实体字段 (base_url/api_key).
         let t = route_table();
         let rt1 = t.get_effective("rt1").unwrap();
-        let out = t.resolve_route(rt1, "gpt-4o").unwrap();
+        let out = t.resolve_route(&rt1, "gpt-4o").unwrap();
         assert_eq!(out.id, "real");
         assert_eq!(out.provider.base_url, "https://upstream");
         assert_eq!(out.provider.api_key, "sk-real");
@@ -1650,7 +1663,7 @@ mod tests {
             tempfile_path(),
         );
         let err = t
-            .resolve_route(t.get_effective("rt").unwrap(), "m")
+            .resolve_route(&t.get_effective("rt").unwrap(), "m")
             .unwrap_err();
         assert_eq!(err, RouteError::Missing("ghost".into()));
         assert!(err.to_string().contains("ghost"), "msg names the id: {err}");
@@ -1668,7 +1681,7 @@ mod tests {
         );
         // 入口 provider 自身 disabled 在 dispatch 层已挡 (503); 这里测链上中间跳.
         let err = t
-            .resolve_route(t.get_effective("rt").unwrap(), "m")
+            .resolve_route(&t.get_effective("rt").unwrap(), "m")
             .unwrap_err();
         assert_eq!(err, RouteError::Disabled("real".into()));
     }
@@ -1683,7 +1696,7 @@ mod tests {
             tempfile_path(),
         );
         let err = t
-            .resolve_route(t.get_effective("a").unwrap(), "m")
+            .resolve_route(&t.get_effective("a").unwrap(), "m")
             .unwrap_err();
         assert_eq!(err, RouteError::Cycle("a".into()));
 
@@ -1695,7 +1708,7 @@ mod tests {
             tempfile_path(),
         );
         assert!(matches!(
-            t2.resolve_route(t2.get_effective("s").unwrap(), "m"),
+            t2.resolve_route(&t2.get_effective("s").unwrap(), "m"),
             Err(RouteError::Cycle(_))
         ));
     }
@@ -1713,7 +1726,7 @@ mod tests {
             tempfile_path(),
         );
         let err = t
-            .resolve_route(t.get_effective("rt").unwrap(), "claude-3")
+            .resolve_route(&t.get_effective("rt").unwrap(), "claude-3")
             .unwrap_err();
         assert_eq!(
             err,
@@ -1735,7 +1748,7 @@ mod tests {
             tempfile_path(),
         );
         assert!(matches!(
-            t2.resolve_route(t2.get_effective("rt").unwrap(), "m"),
+            t2.resolve_route(&t2.get_effective("rt").unwrap(), "m"),
             Err(RouteError::NoMatch { .. })
         ));
     }
@@ -1766,7 +1779,7 @@ mod tests {
             tempfile_path(),
         );
         let err = t
-            .resolve_route(t.get_effective("rt").unwrap(), &"x".repeat(100))
+            .resolve_route(&t.get_effective("rt").unwrap(), &"x".repeat(100))
             .unwrap_err();
         match err {
             RouteError::NoMatch { model, .. } => {
@@ -1791,16 +1804,10 @@ mod tests {
             tempfile_path(),
         );
         let entry = t.get_effective("rt").unwrap();
-        assert_eq!(
-            t.resolve_route(entry.clone(), "gpt-4o").unwrap().id,
-            "real1"
-        );
-        assert_eq!(
-            t.resolve_route(entry.clone(), "claude-3").unwrap().id,
-            "real2"
-        );
+        assert_eq!(t.resolve_route(&entry, "gpt-4o").unwrap().id, "real1");
+        assert_eq!(t.resolve_route(&entry, "claude-3").unwrap().id, "real2");
         // 空 model (非 JSON / 无 model 字段请求): 只匹配 "*".
-        assert_eq!(t.resolve_route(entry, "").unwrap().id, "real2");
+        assert_eq!(t.resolve_route(&entry, "").unwrap().id, "real2");
     }
 
     #[test]
@@ -1830,14 +1837,14 @@ mod tests {
             tempfile_path(),
         );
         let out = t
-            .resolve_route(t.get_effective("rt1").unwrap(), "gpt-4o")
+            .resolve_route(&t.get_effective("rt1").unwrap(), "gpt-4o")
             .unwrap();
         assert_eq!(out.id, "real", "rt2 matched rewritten model");
         assert_eq!(out.model_rewrite.as_deref(), Some("claude-3"));
 
         // 对照: 直入 rt2 (无改写) — 请求 model 自行匹配, 无 override.
         let out2 = t
-            .resolve_route(t.get_effective("rt2").unwrap(), "claude-3")
+            .resolve_route(&t.get_effective("rt2").unwrap(), "claude-3")
             .unwrap();
         assert_eq!(out2.id, "real");
         assert_eq!(out2.model_rewrite, None);
@@ -1873,7 +1880,7 @@ mod tests {
             tempfile_path(),
         );
         let out = t
-            .resolve_route(t.get_effective("rt1").unwrap(), "gpt-4o")
+            .resolve_route(&t.get_effective("rt1").unwrap(), "gpt-4o")
             .unwrap();
         assert_eq!(out.id, "real");
         assert_eq!(out.model_rewrite.as_deref(), Some("model-b"));
@@ -1894,7 +1901,7 @@ mod tests {
             tempfile_path(),
         );
         let out = t
-            .resolve_route(t.get_effective("rt1").unwrap(), "gpt-4o")
+            .resolve_route(&t.get_effective("rt1").unwrap(), "gpt-4o")
             .unwrap();
         assert_eq!(out.id, "real1", "no rewrite: next hop sees original model");
         assert_eq!(out.model_rewrite, None);
@@ -2276,7 +2283,7 @@ mod tests {
         let eff = t.get_effective("x").unwrap();
         assert!(matches!(eff.kind, ProviderKind::Direct(_)));
         // 路由解析直达自身 (实体快路径), 携带 override 的鉴权字段.
-        let r = t.resolve_route(eff, "m").unwrap();
+        let r = t.resolve_route(&eff, "m").unwrap();
         assert_eq!(r.id, "x");
         assert_eq!(r.provider.base_url, "https://d");
         assert_eq!(r.provider.api_key, "sk-dyn");
@@ -2339,7 +2346,7 @@ mod tests {
             &eff.kind,
             ProviderKind::Router(r) if r.routes[0].target == "real1"
         ));
-        assert_eq!(t.resolve_route(eff, "m").unwrap().id, "real1");
+        assert_eq!(t.resolve_route(&eff, "m").unwrap().id, "real1");
     }
 
     #[test]
@@ -2358,7 +2365,7 @@ mod tests {
         );
         t.set_decision("real", OverrideMode::Disabled).unwrap();
         let err = t
-            .resolve_route(t.get_effective("rt").unwrap(), "m")
+            .resolve_route(&t.get_effective("rt").unwrap(), "m")
             .unwrap_err();
         assert_eq!(err, RouteError::Missing("real".into()));
         assert!(err.to_string().contains("disabled by decision"));
@@ -2390,7 +2397,7 @@ mod tests {
                 if let Some(entry) = t.get_effective(id) {
                     // Err 分支 = 有限步返回明确错误 (同样满足终止性), 无需断言.
                     // Ok ⇒ 链尾必为 Direct (类型保证, 无需运行时断言); 有限步返回即满足终止性.
-                    let _ = t.resolve_route(entry, "gpt-4o");
+                    let _ = t.resolve_route(&entry, "gpt-4o");
                 }
             }
         }

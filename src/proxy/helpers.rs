@@ -41,17 +41,22 @@ pub(super) fn build_upstream_url(base: &str, path_and_query: &str) -> String {
 }
 
 /// 是否在 `Connection` header 列表中? (RFC 7230 §6.1: 这些也是 hop-by-hop.)
+///
+/// 前置条件: `name` 已小写 (由 [`filter_headers`] 统一归一后传入). 比较端
+/// `eq_ignore_ascii_case` 本就大小写不敏感, 无需预先 `to_lowercase`.
 fn connection_listed(name: &str, src: &HeaderMap) -> bool {
-    let target = name.to_lowercase();
     src.get("connection")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').any(|t| t.trim().eq_ignore_ascii_case(&target)))
+        .map(|s| s.split(',').any(|t| t.trim().eq_ignore_ascii_case(name)))
         .unwrap_or(false)
 }
 
+/// 前置条件: `name` 已小写 (由 [`filter_headers`] 统一归一后传入),
+/// 与全小写的 `HOP_BY_HOP` 直接比较, 无需 `to_lowercase` 再分配.
+/// debug_assert 把前置条件变为可执行契约 (混合大小写输入会静默失配).
 fn is_hop_by_hop(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    HOP_BY_HOP.iter().any(|h| *h == lower)
+    debug_assert!(!name.chars().any(|c| c.is_ascii_uppercase()));
+    HOP_BY_HOP.contains(&name)
 }
 
 /// 请求 header 清洗: 剥离 hop-by-hop / Connection-listed / host / content-length.

@@ -244,14 +244,14 @@ async fn dispatch(
     // id + model 名 + reason (SEC-2 同型).
     // WARN: 悬空/disabled 指向是路由切换的主要运维事故形态, 静默 503 排障成本高.
     // Direct 条目的 resolve_route 快路径不消费请求 model (无规则匹配),
-    // JSON 顶层扫描是纯浪费 — 仅 Router 构造需要. 守卫须在 provider 被
-    // resolve_route move 之前 (matches! 只读判别, 不发生 move).
+    // JSON 顶层扫描是纯浪费 — 仅 Router 构造需要. 守卫用 matches! 只读判别
+    // (provider 以借用传入 resolve_route, 无需 clone).
     let request_model = if matches!(provider.kind, ProviderKind::Router(_)) {
         helpers::request_model(&req_bytes)
     } else {
         String::new()
     };
-    let resolved = match state.providers.resolve_route(provider, &request_model) {
+    let resolved = match state.providers.resolve_route(&provider, &request_model) {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(router = %fp.name, error = %e, "route resolution failed");

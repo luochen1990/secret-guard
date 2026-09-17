@@ -290,9 +290,7 @@ fn alias_names(table: &ProviderTable, entry: &Provider) -> Vec<String> {
         }
         // 去重短路: 重复 pattern 不再重复 resolve.
         if seen.insert(route.model_pattern.clone())
-            && table
-                .resolve_route(entry.clone(), &route.model_pattern)
-                .is_ok()
+            && table.resolve_route(entry, &route.model_pattern).is_ok()
         {
             out.push(route.model_pattern.clone());
         }
@@ -366,7 +364,7 @@ fn n1_accepts(
     model: &str,
     cached: &HashMap<String, Vec<String>>,
 ) -> bool {
-    match table.resolve_route(entry.clone(), model) {
+    match table.resolve_route(entry, model) {
         Ok(resolved) => {
             let egress = resolved.model_rewrite.unwrap_or_else(|| model.to_string());
             cached
@@ -508,9 +506,27 @@ async fn fetch_status_and_body(
 
 /// 尝试性解析上游 /models 响应 (ROB-*: 非法 JSON / 缺数组字段 → Err;
 /// 条目缺 id/name 的元素跳过; 去重保序).
+///
+/// 薄包装: parse + 委托 [`parse_model_ids_from_value`] (单次解析双消费的
+/// 拆层, 见 `judge_v1_pair`).
 fn parse_model_ids(protocol: Protocol, body: &[u8]) -> Result<Vec<String>, String> {
-    let value: serde_json::Value =
-        serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {e}"))?;
+    parse_model_ids_from_value(protocol, &parse_json_value(body)?)
+}
+
+/// parse 层 SSOT: `from_slice` + 统一错误串 ("invalid JSON: {e}").
+/// `parse_model_ids` 与 `judge_v1_pair` 共用 — 错误串是 wire 可见的
+/// (`ProbeOutcome.detail`), 单一构造点防两侧漂移.
+fn parse_json_value(body: &[u8]) -> Result<serde_json::Value, String> {
+    serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {e}"))
+}
+
+/// [`parse_model_ids`] 的纯逻辑层 (body 已 parse 为 Value; 调用方若还需对同一
+/// body 做其它 Value 级判别 — 如 `judge_v1_pair` 的家族判别 — 应 parse 一次
+/// 共用同一棵 Value 树, 而非各自 `from_slice` 双解析).
+fn parse_model_ids_from_value(
+    protocol: Protocol,
+    value: &serde_json::Value,
+) -> Result<Vec<String>, String> {
     // (数组字段, 条目字段, 条目名前缀): 三族协议 shape 的全部差异收敛于此表.
     // OpenAI/Responses/Anthropic 共用 data[].id; Gemini/Ollama 共用 models[].name,
     // 前者 name 带 "models/" 前缀需剥掉. strip 为空串时 strip_prefix 恒 Some (无操作),
@@ -701,12 +717,11 @@ enum V1Family {
 /// 同一条目两者兼有时 `object` 优先 (判别字段是 OpenAI 家族更显式的指纹).
 /// 全部条目无判别字段 (含 data 空) → OpenAI (该端点的历史默认方言).
 ///
-/// 假设: 判别只看字段名存在性, 不看字段值. 降级: body 已由调用方经
-/// `parse_model_ids` 验证, 此处再 parse 失败 (理论不可达) → OpenAI (ROB-*).
-fn classify_v1_family(body: &[u8]) -> V1Family {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return V1Family::OpenAI;
-    };
+/// 入参是调用方已 parse 的 Value 树 (与 `parse_model_ids_from_value` 共用单次解析,
+/// 见 `judge_v1_pair`); 缺 `data` 数组 / 非 array 形态 → OpenAI (ROB-*).
+///
+/// 假设: 判别只看字段名存在性, 不看字段值.
+fn classify_v1_family(value: &serde_json::Value) -> V1Family {
     let Some(entries) = value.get("data").and_then(|d| d.as_array()) else {
         return V1Family::OpenAI;
     };
@@ -776,9 +791,15 @@ fn judge_v1_pair(res: &Result<(StatusCode, Vec<u8>), String>) -> (ProbeOutcome, 
     match res {
         Err(reason) => both(ProbeStatus::Error, reason.clone()),
         Ok((status, body)) if status.is_success() => {
-            match parse_model_ids(Protocol::OpenAI, body) {
+            // 单次 parse: 条目解析与家族判别共用同一棵 Value 树 (body ≤
+            // MAX_MODELS_BODY, 双 `from_slice` 是纯浪费).
+            let value = match parse_json_value(body) {
+                Ok(value) => value,
+                Err(reason) => return both(ProbeStatus::Error, reason),
+            };
+            match parse_model_ids_from_value(Protocol::OpenAI, &value) {
                 Err(reason) => both(ProbeStatus::Error, reason),
-                Ok(models) => match classify_v1_family(body) {
+                Ok(models) => match classify_v1_family(&value) {
                     V1Family::OpenAI => (
                         ProbeOutcome::ok(openai, models),
                         ProbeOutcome::non_ok(
