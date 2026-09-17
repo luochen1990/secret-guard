@@ -710,8 +710,11 @@ pub(super) fn build_call_event(
 /// 职责边界 — 何为 "接线":
 /// 1. `event.model` 捕获 model_req (`push_messages` 消耗 event 前的最后快照点);
 /// 2. `push_messages` 把 (messages, event) 写入 DAG, 返回 node id (`record_id`);
-/// 3. `usage_ctx_and_record_redactions` 构造 [`crate::usage::UsageCtx`] 并立即落账
-///    redact 审计事件 (USAGE-7 请求侧落账: redact 已实际发生, 即使响应失败也不丢).
+/// 3. 构造 [`crate::usage::UsageCtx`] 并**立即落账 redact 审计事件** (USAGE-7 请求侧
+///    落账: redact 已实际发生, 即使响应失败也不丢). `record_id` 用于回读刚 push
+///    节点的 RoundKind (与 attach_response 同型的安全窗口, 详见 `dag::round_kind_of`);
+///    auth 归因从 request parts 的 Extension 提取 (require_api_key middleware 注入,
+///    未启用时 None — proxy → auth 是纯类型依赖, 见根 AGENTS.md 依赖图例外条目).
 ///
 /// 三调用点的差异全部经参数显式表达, 本函数不吞语义:
 /// - `messages`: same_proto_forward / cross_proto 传 redact 前的真实 messages 快照;
@@ -732,19 +735,26 @@ pub(super) fn push_event_and_wire_usage(
 ) -> (Uuid, crate::usage::UsageCtx) {
     let model_req = event.model.as_ref().map(|m| m.to_string());
     let record_id = state.dag.push_messages(messages, event);
-    let usage_ctx = super::helpers::usage_ctx_and_record_redactions(
-        state,
-        super::helpers::UsageWire {
-            fp,
-            method: &parts.method,
-            upstream_id,
-            model_req,
-            secrets,
-            record_id,
-            hits,
-            api_key_label: super::helpers::auth_label(parts),
-        },
+    let round_kind = state
+        .dag
+        .round_kind_of(record_id)
+        .unwrap_or(crate::dag::RoundKind::Normal);
+    let api_key_label = parts
+        .extensions
+        .get::<crate::auth::AuthenticatedTenant>()
+        .map(|t| t.label.clone());
+    let usage_ctx = crate::usage::UsageCtx::new(
+        state.usage.clone(),
+        std::sync::Arc::from(upstream_id),
+        model_req,
+        fp.proto.clone(),
+        parts.method.as_str(),
+        round_kind,
+        record_id,
+        api_key_label,
+        std::sync::Arc::from(secrets.to_vec().into_boxed_slice()),
     );
+    usage_ctx.record_redactions(hits);
     (record_id, usage_ctx)
 }
 

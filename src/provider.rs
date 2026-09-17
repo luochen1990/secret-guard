@@ -619,54 +619,47 @@ impl DynamicTable<Provider> {
         let mut visited = HashSet::from([entry.id.clone()]);
         let mut in_flight_model = request_model.to_string();
         let mut model_rewrite: Option<String> = None;
-        // 借用语义的循环骨架: 首跳借用调用方 entry, 换跳才持有 owned next —
-        // `owned` 每轮至多保留一跳中间 Provider (换跳瞬间新旧两跳短暂共存后
-        // 旧值被 drop, 峰值与原实现的 `cur = next` 一致). 每轮决策在 scoped
-        // 块内完成, 块结束时借用随之释放, 之后的 `owned = Some(next)` 写入
-        // 不与借用冲突.
-        let mut owned: Option<Provider> = None;
+        // 借用语义经 Cow 表达: 首跳借用调用方 entry, 换跳才构造 owned —
+        // 峰值至多保留一跳中间 Provider, 与原实现的 `cur = next` 一致.
+        let mut cur = std::borrow::Cow::Borrowed(entry);
         loop {
-            let next = {
-                let cur = owned.as_ref().unwrap_or(entry);
-                match &cur.kind {
-                    // 链尾 (或入口即实体): 返回. `id` 一并带出 (DirectProvider 不持有 id,
-                    // downstream 的 CallEvent.upstream_id 需要).
-                    ProviderKind::Direct(direct) => {
-                        return Ok(ResolvedRoute {
-                            id: cur.id.clone(),
-                            provider: direct.clone(),
-                            model_rewrite,
-                        });
-                    }
-                    ProviderKind::Router(router) => {
-                        // NoMatch 的 model 回显在构造处截断 (超长 model 名防日志
-                        // 洪水 / 503 body 膨胀); 匹配本身用未截断的 in_flight_model.
-                        let route = router.select_route(&in_flight_model).ok_or_else(|| {
-                            RouteError::NoMatch {
-                                id: cur.id.clone(),
-                                model: truncate_model_for_echo(&in_flight_model),
-                            }
-                        })?;
-                        // pipeline 语义: 改写立即生效 (后续 router 按改写后 model 匹配),
-                        // 多次改写后者覆盖前者.
-                        if let Some(m) = &route.upstream_model {
-                            model_rewrite = Some(m.clone());
-                            in_flight_model = m.clone();
-                        }
-                        let next = self
-                            .get_effective(&route.target)
-                            .ok_or_else(|| RouteError::Missing(route.target.clone()))?;
-                        if !next.enabled {
-                            return Err(RouteError::Disabled(next.id.clone()));
-                        }
-                        if !visited.insert(next.id.clone()) {
-                            return Err(RouteError::Cycle(next.id));
-                        }
-                        next
-                    }
+            match &cur.kind {
+                // 链尾 (或入口即实体): 返回. `id` 一并带出 (DirectProvider 不持有 id,
+                // downstream 的 CallEvent.upstream_id 需要).
+                ProviderKind::Direct(direct) => {
+                    return Ok(ResolvedRoute {
+                        id: cur.id.clone(),
+                        provider: direct.clone(),
+                        model_rewrite,
+                    });
                 }
-            };
-            owned = Some(next);
+                ProviderKind::Router(router) => {
+                    // NoMatch 的 model 回显在构造处截断 (超长 model 名防日志
+                    // 洪水 / 503 body 膨胀); 匹配本身用未截断的 in_flight_model.
+                    let route = router.select_route(&in_flight_model).ok_or_else(|| {
+                        RouteError::NoMatch {
+                            id: cur.id.clone(),
+                            model: truncate_model_for_echo(&in_flight_model),
+                        }
+                    })?;
+                    // pipeline 语义: 改写立即生效 (后续 router 按改写后 model 匹配),
+                    // 多次改写后者覆盖前者.
+                    if let Some(m) = &route.upstream_model {
+                        model_rewrite = Some(m.clone());
+                        in_flight_model = m.clone();
+                    }
+                    let next = self
+                        .get_effective(&route.target)
+                        .ok_or_else(|| RouteError::Missing(route.target.clone()))?;
+                    if !next.enabled {
+                        return Err(RouteError::Disabled(next.id.clone()));
+                    }
+                    if !visited.insert(next.id.clone()) {
+                        return Err(RouteError::Cycle(next.id));
+                    }
+                    cur = std::borrow::Cow::Owned(next);
+                }
+            }
         }
     }
 

@@ -2,14 +2,14 @@
 //!
 //! # 职责边界
 //!
-//! 两类内容, 均无状态、无副作用, 被 same_proto / cross_proto / fan_out 等转发
-//! 子模块共用:
-//! - 纯工具: hop-by-hop header 过滤、上游 URL 拼接、content-type 流式判定、
+//! 三类内容, 被 same_proto / cross_proto / fan_out 等转发子模块共用:
+//! - 纯工具 (无状态): hop-by-hop header 过滤、上游 URL 拼接、content-type 流式判定、
 //!   字节→字符串的 lossy 投影、敏感 header 脱敏 (SEC-4).
-//! - 转发链语义判定/编排点 (字节级 body 顶层字段扫描, 不建 IR): `requests_stream`
-//!   (FWD-4 流式档位判定)、`request_model` (路由规则匹配输入)、
-//!   `usage_ctx_and_record_redactions` + `auth_label` (USAGE-7 采集上下文构造 +
-//!   redact 审计落账).
+//! - 转发链语义判定点 (字节级 body 顶层字段扫描, 不建 IR): `requests_stream`
+//!   (FWD-4 流式档位判定)、`request_model` (路由规则匹配输入).
+//!   (USAGE-7 的采集上下文接线随 `recorder::push_event_and_wire_usage` 收口.)
+//! - parse-失败 fallback 兜底: `restore_via_json_leaf_fallback` + WARN 可观测性
+//!   (`warn_mock_not_restored` 等, RED-8/SEC-10 的日志半边).
 //!
 //! # 归属判断
 //!
@@ -42,8 +42,7 @@ pub(super) fn build_upstream_url(base: &str, path_and_query: &str) -> String {
 
 /// 是否在 `Connection` header 列表中? (RFC 7230 §6.1: 这些也是 hop-by-hop.)
 ///
-/// 前置条件: `name` 已小写 (由 [`filter_headers`] 统一归一后传入). 比较端
-/// `eq_ignore_ascii_case` 本就大小写不敏感, 无需预先 `to_lowercase`.
+/// 比较端 `eq_ignore_ascii_case` 大小写不敏感, 无需预先归一.
 fn connection_listed(name: &str, src: &HeaderMap) -> bool {
     src.get("connection")
         .and_then(|v| v.to_str().ok())
@@ -51,9 +50,9 @@ fn connection_listed(name: &str, src: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-/// 前置条件: `name` 已小写 (由 [`filter_headers`] 统一归一后传入),
-/// 与全小写的 `HOP_BY_HOP` 直接比较, 无需 `to_lowercase` 再分配.
-/// debug_assert 把前置条件变为可执行契约 (混合大小写输入会静默失配).
+/// 前置条件: `name` 已小写 — 调用方经 [`HeaderName::as_str`] 取名, http crate
+/// 构造期即规范化为小写 (不变量). 与全小写的 `HOP_BY_HOP` 直接比较, 零分配.
+/// debug_assert 把前置条件变为可执行契约 (未来裸 &str 调用方混入大写会被抓到).
 fn is_hop_by_hop(name: &str) -> bool {
     debug_assert!(!name.chars().any(|c| c.is_ascii_uppercase()));
     HOP_BY_HOP.contains(&name)
@@ -79,8 +78,8 @@ pub(super) fn build_response_headers(src: &HeaderMap) -> HeaderMap {
 fn filter_headers(src: &HeaderMap, drop_fn: impl Fn(&str) -> bool) -> HeaderMap {
     let mut out = HeaderMap::with_capacity(src.len());
     for (name, value) in src.iter() {
-        let name_str = name.as_str().to_lowercase();
-        if drop_fn(&name_str) {
+        // HeaderName 构造期即规范化为小写, as_str() 恒 lowercase — 无需再归一.
+        if drop_fn(name.as_str()) {
             continue;
         }
         out.append(name.clone(), value.clone());
@@ -251,13 +250,15 @@ pub(super) fn utf8_view(b: &[u8]) -> String {
 pub(super) fn redact_headers(src: &HeaderMap, extra: &[String]) -> Vec<(String, String)> {
     src.iter()
         .map(|(name, value)| {
-            let name_str = name.as_str().to_lowercase();
-            let v = if is_sensitive_header(&name_str) || extra.contains(&name_str) {
+            // HeaderName::as_str() 恒 lowercase (http crate 不变量) — 直接与
+            // lowercase 归一化后的 extra 名单精确匹配.
+            let name_str = name.as_str();
+            let v = if is_sensitive_header(name_str) || extra.iter().any(|e| e == name_str) {
                 "<redacted>".to_string()
             } else {
                 value.to_str().unwrap_or("<binary>").to_string()
             };
-            (name_str, v)
+            (name_str.to_string(), v)
         })
         .collect()
 }
@@ -357,72 +358,6 @@ pub(super) fn restore_via_json_leaf_fallback(
             }
         }
     }
-}
-
-// ─── usage-stats 采集上下文构造 ─────────────────────────────────────────────
-
-/// usage 接线参数 (usage_ctx_and_record_redactions 的收口 — 避免 10 参签名).
-pub(super) struct UsageWire<'a> {
-    pub fp: &'a super::ForwardPath,
-    pub method: &'a axum::http::Method,
-    pub upstream_id: &'a str,
-    /// 请求侧 model (CallEvent.model 是 SSOT).
-    pub model_req: Option<String>,
-    pub secrets: &'a [crate::secrets::SecretEntry],
-    /// push_messages 返回的 node id.
-    pub record_id: uuid::Uuid,
-    /// redact 审计采集单元 (redact_and_derive 产出, push 前捕获).
-    pub hits: &'a [crate::usage::RedactHit],
-    /// auth 启用时的 API key label 归因 (单用户模式 None).
-    pub api_key_label: Option<String>,
-}
-
-/// 从 request parts 提取 auth 归因 (require_api_key middleware 注入的 Extension;
-/// auth 未启用时 middleware 不挂载 → None). proxy → auth 是纯类型依赖
-/// (AuthenticatedTenant 数据形态), 见根 AGENTS.md 依赖图例外条目.
-pub(super) fn auth_label(parts: &axum::http::request::Parts) -> Option<String> {
-    parts
-        .extensions
-        .get::<crate::auth::AuthenticatedTenant>()
-        .map(|t| t.label.clone())
-}
-
-/// 构造 [`crate::usage::UsageCtx`] 并**立即落账 redact 审计事件** (USAGE-7 请求侧
-/// 落账点, 仅由 recorder::push_event_and_wire_usage 调用 — 三转发路径的接线 SSOT
-/// 在该函数). 未来新增转发路径不会漏带 SEC 扫描快照与审计接线.
-/// `record_id` 用于回读刚 push 节点的 RoundKind (与 attach_response 同型的
-/// 安全窗口, 详见 `dag::round_kind_of`).
-pub(super) fn usage_ctx_and_record_redactions(
-    state: &crate::state::AppState,
-    wire: UsageWire<'_>,
-) -> crate::usage::UsageCtx {
-    let UsageWire {
-        fp,
-        method,
-        upstream_id,
-        model_req,
-        secrets,
-        record_id,
-        hits,
-        api_key_label,
-    } = wire;
-    let round_kind = state
-        .dag
-        .round_kind_of(record_id)
-        .unwrap_or(crate::dag::RoundKind::Normal);
-    let ctx = crate::usage::UsageCtx::new(
-        state.usage.clone(),
-        std::sync::Arc::from(upstream_id),
-        model_req,
-        fp.proto.clone(),
-        method.as_str(),
-        round_kind,
-        record_id,
-        api_key_label,
-        std::sync::Arc::from(secrets.to_vec().into_boxed_slice()),
-    );
-    ctx.record_redactions(hits);
-    ctx
 }
 
 #[cfg(test)]
@@ -753,16 +688,15 @@ mod tests {
         /// `<redacted>`.
         ///
         /// `is_sensitive_header` 用 `name.contains("token") || name.contains("secret")`
-        /// 做关键词匹配 (case-insensitive, 因为 redact_headers 在调用前会 to_lowercase).
+        /// 做关键词匹配 (输入恒小写 — `HeaderName::as_str()` 的 http crate 不变量).
         /// 本 property 随机化 prefix / suffix / keyword 三个维度, 覆盖任意位置含关键词
         /// 的自定义 header (如 `x-my-token`, `token-foo`, `x-secret-bar`).
         ///
         /// "key" 关键词不在匹配范围 (契约 §7 SEC-4 注: 过宽误伤正常 header), 已知 key
         /// 类敏感 header 由显式黑名单覆盖 (见 mod 级注释).
         ///
-        /// 字符集 [a-z0-9-]: HTTP header name 合法字符 (token 字符), 且避免大写干扰
-        /// contains 匹配 (redact_headers 已 lowercase, 但 prop 中我们也用 lowercase
-        /// 生成, 保证一致性).
+        /// 字符集 [a-z0-9-]: HTTP header name 合法字符 (token 字符), lowercase 生成
+        /// 与 as_str() 小写不变量一致.
         #[test]
         fn prop_custom_token_headers_redacted(
             prefix in "[a-z]{0,8}",
@@ -779,7 +713,7 @@ mod tests {
             );
             let redacted = redact_headers(&src, &[]);
             prop_assert_eq!(redacted.len(), 1, "exactly one header expected");
-            // redact_headers 把 name to_lowercase, value 替换为 <redacted> (若是敏感 header).
+            // 敏感 header 的 value 替换为 <redacted> (name 侧由 as_str() 恒小写).
             prop_assert_eq!(
                 &redacted[0].1, "<redacted>",
                 "SEC-4 violation: header '{}' contains keyword '{}' but was not redacted",

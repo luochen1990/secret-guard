@@ -1425,6 +1425,21 @@ mod tests {
             .expect("Auto after resolve_against always has gen spec")
     }
 
+    /// RED-1/5 property 共用的前置: Auto 策略构造 + resolve (gen_spec None → infer,
+    /// prefix 注入等语义由 resolve_against 统一处理).
+    fn resolved_auto_strategy(
+        gen_spec: Option<GenSpec>,
+        real: &str,
+        global_prefix: &str,
+    ) -> MockStrategy {
+        let mut strategy = MockStrategy {
+            initial: InitialValue::Auto,
+            gen_spec,
+        };
+        strategy.resolve_against(real, global_prefix);
+        strategy
+    }
+
     proptest! {
         /// 守卫 RED-5: gen_candidate (Auto) body 不含 real ≥k(L) 字符子串 (contracts.md §2).
         #[test]
@@ -1467,13 +1482,9 @@ mod tests {
             seed in any::<u64>(),
             counter in 0u32..4,
         ) {
-            let mut strategy = MockStrategy {
-                initial: InitialValue::Auto,
-                gen_spec,
-            };
-            strategy.resolve_against(&real, &global_prefix);
-            let resolved = resolved_gen(&strategy);
+            let strategy = resolved_auto_strategy(gen_spec, &real, &global_prefix);
             let mock = gen_candidate(&real, &strategy, seed, counter);
+            let resolved = resolved_gen(&strategy);
             let allowed: std::collections::HashSet<char> = resolved
                 .charset
                 .enabled_chars()
@@ -1498,14 +1509,9 @@ mod tests {
             seed in any::<u64>(),
             counter in 0u32..4,
         ) {
-            let mut strategy = MockStrategy {
-                initial: InitialValue::Auto,
-                gen_spec,
-            };
-            strategy.resolve_against(&real, &global_prefix);
-            let resolved = resolved_gen(&strategy);
+            let strategy = resolved_auto_strategy(gen_spec, &real, &global_prefix);
             let mock = gen_candidate(&real, &strategy, seed, counter);
-            let (min, max) = resolved.length_range;
+            let (min, max) = resolved_gen(&strategy).length_range;
             let len = mock.chars().count();
             prop_assert!(
                 len >= min && len <= max,
@@ -1530,11 +1536,7 @@ mod tests {
             seed in any::<u64>(),
             counter in 0u32..4,
         ) {
-            let mut strategy = MockStrategy {
-                initial: InitialValue::Auto,
-                gen_spec,
-            };
-            strategy.resolve_against(&real, &global_prefix);
+            let strategy = resolved_auto_strategy(gen_spec, &real, &global_prefix);
             let first = gen_candidate(&real, &strategy, seed, counter);
             // 干扰调用: 不同 seed 的候选穿插其间, 若存在隐藏全局状态会污染第二次结果.
             let _noise = gen_candidate(&real, &strategy, seed ^ 0xdead_beef, counter);
