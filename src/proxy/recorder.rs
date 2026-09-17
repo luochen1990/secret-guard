@@ -5,6 +5,8 @@
 //! 汇集转发链中所有与 DAG 记录相关的辅助逻辑:
 //! - [`build_call_event`]: 三条转发路径 (same_proto passthrough / same_proto IR /
 //!   cross_proto) 共用的 [`CallEvent`] 构造器.
+//! - [`push_event_and_wire_usage`]: 同三路径共用的 "push DAG + usage 接线" 前置
+//!   (USAGE-7 请求侧).
 //! - [`record_upstream_failure`]: 错误路径的 incomplete 记录写入.
 //! - [`derive_redactions`] / [`parse_request_ir`] / [`redact_and_derive`]: IR 解析
 //!   与 redact 派生 (same_proto / cross_proto 共享的前半段).
@@ -701,6 +703,49 @@ pub(super) fn build_call_event(
     #[cfg(feature = "consistency-check")]
     assert_preview_model_match_source(&event);
     event
+}
+
+/// 转发路径的 "push DAG + usage 接线" 一次性前置 (same_proto×2 / cross_proto 共享, SSOT).
+///
+/// 职责边界 — 何为 "接线":
+/// 1. `event.model` 捕获 model_req (`push_messages` 消耗 event 前的最后快照点);
+/// 2. `push_messages` 把 (messages, event) 写入 DAG, 返回 node id (`record_id`);
+/// 3. `usage_ctx_and_record_redactions` 构造 [`crate::usage::UsageCtx`] 并立即落账
+///    redact 审计事件 (USAGE-7 请求侧落账: redact 已实际发生, 即使响应失败也不丢).
+///
+/// 三调用点的差异全部经参数显式表达, 本函数不吞语义:
+/// - `messages`: same_proto_forward / cross_proto 传 redact 前的真实 messages 快照;
+///   same_proto_passthrough 传 `vec![]` (字节透传无 IR 解析, 孤立节点).
+/// - `secrets`: 无 secret 的透传入口传 `&[]`, 其余传全量快照
+///   (USAGE-6 的 SEC 扫描输入).
+/// - `hits`: `redact_and_derive` 产出的审计单元; passthrough 恒 `&[]` (无 IR 改写).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn push_event_and_wire_usage(
+    state: &crate::state::AppState,
+    fp: &super::ForwardPath,
+    parts: &axum::http::request::Parts,
+    upstream_id: &str,
+    messages: Vec<crate::codec::ir::IrMessage>,
+    event: CallEvent,
+    secrets: &[crate::secrets::SecretEntry],
+    hits: &[crate::usage::RedactHit],
+) -> (Uuid, crate::usage::UsageCtx) {
+    let model_req = event.model.as_ref().map(|m| m.to_string());
+    let record_id = state.dag.push_messages(messages, event);
+    let usage_ctx = super::helpers::usage_ctx_and_record_redactions(
+        state,
+        super::helpers::UsageWire {
+            fp,
+            method: &parts.method,
+            upstream_id,
+            model_req,
+            secrets,
+            record_id,
+            hits,
+            api_key_label: super::helpers::auth_label(parts),
+        },
+    );
+    (record_id, usage_ctx)
 }
 
 // ─── 响应累积器 (fan_out 三路径共享) ───────────────────────────────────────

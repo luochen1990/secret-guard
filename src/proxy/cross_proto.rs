@@ -33,7 +33,9 @@ use super::helpers::{
 };
 #[cfg(feature = "consistency-check")]
 use super::recorder::assert_resp_parsed_matches_source_nonstream;
-use super::recorder::{build_call_event, parse_request_ir, redact_and_derive};
+use super::recorder::{
+    build_call_event, parse_request_ir, push_event_and_wire_usage, redact_and_derive,
+};
 
 /// 跨协议转发: ingress 协议 → IR → egress 协议, 上游响应反向翻译.
 ///
@@ -201,22 +203,15 @@ pub(crate) async fn cross_proto_forward(
         Some(&secrets_snapshot),
         redactions,
     );
-    // usage-stats 采集上下文 + redact 审计落账 (helpers SSOT: 请求侧, redact 已
-    // 实际发生, 即使响应失败也不丢 — USAGE-7).
-    let model_req = event.model.as_ref().map(|m| m.to_string());
-    let record_id = state.dag.push_messages(real_messages, event);
-    let usage_ctx = super::helpers::usage_ctx_and_record_redactions(
+    let (record_id, usage_ctx) = push_event_and_wire_usage(
         &state,
-        super::helpers::UsageWire {
-            fp: &fp,
-            method: &parts.method,
-            upstream_id,
-            model_req,
-            secrets: &secrets_snapshot,
-            record_id,
-            hits: &redact_hits,
-            api_key_label: super::helpers::auth_label(&parts),
-        },
+        &fp,
+        &parts,
+        upstream_id,
+        real_messages,
+        event,
+        &secrets_snapshot,
+        &redact_hits,
     );
 
     // T5: 跨协议丢弃可观测性 — 计数在丢弃点 (步骤 9 请求历史 / 步骤 15 响应) 已算,
@@ -243,7 +238,7 @@ pub(crate) async fn cross_proto_forward(
     // 13. 发送到上游. 响应头超时按流式语义选档 (#175): ir.stream 是 writer 产出的
     //     egress body 真实语义 (该 body 发往上游) — 流式请求走 TTFT 档, 非流式走
     //     整响应档, 与 same_proto 路径同构.
-    let upstream_resp = match super::recorder::send_upstream_or_fail(
+    let upstream_resp = super::recorder::send_upstream_or_fail(
         &state.dag,
         record_id,
         started,
@@ -256,11 +251,7 @@ pub(crate) async fn cross_proto_forward(
             .body(egress_bytes),
         state.upstream_timeouts.header_timeout(ir.stream),
     )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => return Err(e),
-    };
+    .await?;
 
     // 14. 判型: 流式请求 + 2xx + SSE → 跨协议流式翻译扇出 (mpsc 管道, 不 buffer);
     //     其余 (非流式请求 / 非 2xx / 非 SSE) 落入下方 buffered 翻译路径.

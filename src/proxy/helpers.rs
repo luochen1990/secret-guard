@@ -9,7 +9,7 @@
 //! - 转发链语义判定/编排点 (字节级 body 顶层字段扫描, 不建 IR): `requests_stream`
 //!   (FWD-4 流式档位判定)、`request_model` (路由规则匹配输入)、
 //!   `usage_ctx_and_record_redactions` + `auth_label` (USAGE-7 采集上下文构造 +
-//!   redact 审计落账, 三转发路径共享的 SSOT 接线).
+//!   redact 审计落账).
 //!
 //! # 归属判断
 //!
@@ -282,8 +282,6 @@ fn is_sensitive_header(name: &str) -> bool {
         || name.contains("secret")
 }
 
-// ─── usage-stats 采集上下文构造 (三转发路径共享) ─────────────────────────────
-
 // ─── parse-失败 fallback 可观测性 (#158 + RED-8, fan_out / cross_proto 共享) ──
 
 /// 上游响应 parse 失败 (codec reader 拒绝 / 非 JSON) 但 JSON 叶子级兜底 restore
@@ -356,12 +354,14 @@ pub(super) fn restore_via_json_leaf_fallback(
     }
 }
 
+// ─── usage-stats 采集上下文构造 ─────────────────────────────────────────────
+
 /// usage 接线参数 (usage_ctx_and_record_redactions 的收口 — 避免 10 参签名).
 pub(super) struct UsageWire<'a> {
     pub fp: &'a super::ForwardPath,
     pub method: &'a axum::http::Method,
     pub upstream_id: &'a str,
-    /// 请求侧 model (push_messages 消耗 event 前捕获; CallEvent.model 是 SSOT).
+    /// 请求侧 model (CallEvent.model 是 SSOT).
     pub model_req: Option<String>,
     pub secrets: &'a [crate::secrets::SecretEntry],
     /// push_messages 返回的 node id.
@@ -383,9 +383,10 @@ pub(super) fn auth_label(parts: &axum::http::request::Parts) -> Option<String> {
 }
 
 /// 构造 [`crate::usage::UsageCtx`] 并**立即落账 redact 审计事件** (USAGE-7 请求侧
-/// 落账点, same_proto×2 / cross_proto 共享, SSOT — 未来新增转发路径不会漏带 SEC
-/// 扫描快照与审计接线). `record_id` 用于回读刚 push 节点的 RoundKind (与
-/// attach_response 同型的安全窗口, 详见 `dag::round_kind_of`).
+/// 落账点, 仅由 recorder::push_event_and_wire_usage 调用 — 三转发路径的接线 SSOT
+/// 在该函数). 未来新增转发路径不会漏带 SEC 扫描快照与审计接线.
+/// `record_id` 用于回读刚 push 节点的 RoundKind (与 attach_response 同型的
+/// 安全窗口, 详见 `dag::round_kind_of`).
 pub(super) fn usage_ctx_and_record_redactions(
     state: &crate::state::AppState,
     wire: UsageWire<'_>,

@@ -35,7 +35,10 @@ use super::auth::apply_provider_auth;
 use super::helpers::{
     build_upstream_url, is_streaming, requests_stream, sanitize_request_headers, utf8_view,
 };
-use super::recorder::{build_call_event, parse_request_ir, redact_and_derive, safe_url_for_log};
+use super::recorder::{
+    build_call_event, parse_request_ir, push_event_and_wire_usage, redact_and_derive,
+    safe_url_for_log,
+};
 
 /// 同协议转发: 字节透传 (无 redact 且无 override) 或 IR 路径 (有 redact 或 override).
 ///
@@ -184,13 +187,8 @@ pub(crate) async fn same_proto_forward(
         .map_err(|e| AppError::Internal(format!("serialize redacted body failed: {e}")))?;
     let req_bytes_to_send = req_text_for_record.clone().into_bytes();
 
-    // 6. 构造上游 URL.
-    let query = parts
-        .uri
-        .query()
-        .map(|q| format!("?{q}"))
-        .unwrap_or_default();
-    let upstream_url = build_upstream_url(&provider.base_url, &format!("{}{query}", fp.rest));
+    // 6. 构造上游 URL + record path (同协议两路径共享 helper).
+    let (upstream_url, path_for_record) = same_proto_upstream_url_and_path(&provider, &fp, &parts);
 
     // 7. 复制请求 headers + 应用 auth. 删除客户端的 content-type/length (重新计算).
     let mut fwd_headers = sanitize_request_headers(&parts.headers);
@@ -203,12 +201,6 @@ pub(crate) async fn same_proto_forward(
     );
 
     // 8. push 到 DAG (真实 messages + CallEvent 元数据).
-    let path_for_record = format!(
-        "/{}/{}/{}",
-        fp.proto,
-        fp.name,
-        fp.rest.trim_start_matches('/')
-    );
     let event = build_call_event(
         &parts,
         &path_for_record,
@@ -223,22 +215,15 @@ pub(crate) async fn same_proto_forward(
         Some(&secrets_snapshot),
         redactions,
     );
-    // usage-stats 采集上下文 + redact 审计落账 (helpers SSOT: 请求侧, redact 已
-    // 实际发生, 即使响应失败也不丢 — USAGE-7).
-    let model_req = event.model.as_ref().map(|m| m.to_string());
-    let record_id = state.dag.push_messages(real_messages, event);
-    let usage_ctx = super::helpers::usage_ctx_and_record_redactions(
+    let (record_id, usage_ctx) = push_event_and_wire_usage(
         &state,
-        super::helpers::UsageWire {
-            fp: &fp,
-            method: &parts.method,
-            upstream_id,
-            model_req,
-            secrets: &secrets_snapshot,
-            record_id,
-            hits: &redact_hits,
-            api_key_label: super::helpers::auth_label(&parts),
-        },
+        &fp,
+        &parts,
+        upstream_id,
+        real_messages,
+        event,
+        &secrets_snapshot,
+        &redact_hits,
     );
 
     // url 脱敏 (SEC-C4): query 可能携带客户端 key (如 Gemini ?key=...).
@@ -247,7 +232,7 @@ pub(crate) async fn same_proto_forward(
     // 9. 发送到上游. 响应头超时按**出站 body 的流式语义**选档 (#175): IR 的
     //    stream 字段是 writer 产出的 egress body 真实语义 (该 body 发往上游),
     //    比原始 req_bytes 检测更贴近被超时保护的实体.
-    let upstream_resp = match super::recorder::send_upstream_or_fail(
+    let upstream_resp = super::recorder::send_upstream_or_fail(
         &state.dag,
         record_id,
         started,
@@ -260,11 +245,7 @@ pub(crate) async fn same_proto_forward(
             .body(req_bytes_to_send),
         state.upstream_timeouts.header_timeout(ir.stream),
     )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => return Err(e),
-    };
+    .await?;
 
     // 10. 收集响应元数据.
     let resp_status = upstream_resp.status();
@@ -360,12 +341,7 @@ async fn same_proto_passthrough(
     secrets_snapshot: &[crate::secrets::SecretEntry],
 ) -> Result<Response<Body>, AppError> {
     let req_text_for_record = utf8_view(&req_bytes);
-    let query = parts
-        .uri
-        .query()
-        .map(|q| format!("?{q}"))
-        .unwrap_or_default();
-    let upstream_url = build_upstream_url(&provider.base_url, &format!("{}{query}", fp.rest));
+    let (upstream_url, path_for_record) = same_proto_upstream_url_and_path(&provider, &fp, &parts);
 
     let mut fwd_headers = sanitize_request_headers(&parts.headers);
     apply_provider_auth(
@@ -374,12 +350,6 @@ async fn same_proto_passthrough(
         ingress,
     );
 
-    let path_for_record = format!(
-        "/{}/{}/{}",
-        fp.proto,
-        fp.name,
-        fp.rest.trim_start_matches('/')
-    );
     // passthrough 路径无 IR 解析 (字节透传). DAG node 存空 messages (孤立节点) +
     // req_body_raw (原始字节) 作为 WebUI req_body 权威来源. Gemini/Ollama 无 codec
     // 协议也走此路径 (parsed view 不可用, 与旧行为一致).
@@ -397,24 +367,18 @@ async fn same_proto_passthrough(
         None,
         vec![],
     );
-    // usage-stats 采集上下文 + redact 审计落账 (helpers SSOT). secrets_snapshot:
-    // 入口 1 (无 secret) 为空; 入口 2 (secrets 非空但无 codec 降级透传) 为全量快照
-    // — USAGE-6 的 SEC 扫描恰防后者的 model 字符串泄漏. redactions echo: passthrough
-    // 路径恒空 (无 IR 改写), 统一走 helper 防未来该路径出现 redact 时漏接.
-    let model_req = event.model.as_ref().map(|m| m.to_string());
-    let record_id = state.dag.push_messages(vec![], event);
-    let usage_ctx = super::helpers::usage_ctx_and_record_redactions(
+    // usage 接线 (SSOT helper, 接线契约见其函数 doc). secrets_snapshot: 入口 1
+    // (无 secret) 为空; 入口 2 (secrets 非空但无 codec 降级透传) 为全量快照 —
+    // USAGE-6 的 SEC 扫描恰防后者的 model 字符串泄漏.
+    let (record_id, usage_ctx) = push_event_and_wire_usage(
         &state,
-        super::helpers::UsageWire {
-            fp: &fp,
-            method: &parts.method,
-            upstream_id,
-            model_req,
-            secrets: secrets_snapshot,
-            record_id,
-            hits: &[],
-            api_key_label: super::helpers::auth_label(&parts),
-        },
+        &fp,
+        &parts,
+        upstream_id,
+        vec![],
+        event,
+        secrets_snapshot,
+        &[],
     );
 
     debug!(%record_id, method = %parts.method, url = %safe_url_for_log(&upstream_url), "forwarding (passthrough)");
@@ -423,7 +387,7 @@ async fn same_proto_passthrough(
     // 用 requests_stream 对原始字节做顶层 "stream" 检测 (保守判定: 只有显式
     // stream=true 才用流式短超时, rationale 见该函数 doc).
     let stream_requested = requests_stream(&req_bytes);
-    let upstream_resp = match super::recorder::send_upstream_or_fail(
+    let upstream_resp = super::recorder::send_upstream_or_fail(
         &state.dag,
         record_id,
         started,
@@ -434,11 +398,7 @@ async fn same_proto_passthrough(
             .body(req_bytes),
         state.upstream_timeouts.header_timeout(stream_requested),
     )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => return Err(e),
-    };
+    .await?;
 
     let resp_status = upstream_resp.status();
     let resp_headers = upstream_resp.headers().clone();
@@ -461,4 +421,32 @@ async fn same_proto_passthrough(
         usage_ctx,
     )
     .await
+}
+
+/// 同协议两路径 (forward / passthrough) 共享的上游 URL + record path 构造.
+///
+/// - `upstream_url`: base_url + rest + query (query 可能携带客户端 key, 如 Gemini
+///   `?key=...`; 落日志前经 `safe_url_for_log` 脱敏, SEC-C4).
+/// - `path_for_record`: 还原 ingress 侧的完整路径形态 `/{proto}/{name}/{rest}`.
+///
+/// 刻意不合入 cross_proto: 其 URL 用 egress writer 的固定 `upstream_path()`,
+/// record path 带 `[a → b]` 协议尾注 (语义不同).
+fn same_proto_upstream_url_and_path(
+    provider: &DirectProvider,
+    fp: &super::ForwardPath,
+    parts: &axum::http::request::Parts,
+) -> (String, String) {
+    let query = parts
+        .uri
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    let upstream_url = build_upstream_url(&provider.base_url, &format!("{}{query}", fp.rest));
+    let path_for_record = format!(
+        "/{}/{}/{}",
+        fp.proto,
+        fp.name,
+        fp.rest.trim_start_matches('/')
+    );
+    (upstream_url, path_for_record)
 }
