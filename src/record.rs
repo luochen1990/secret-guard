@@ -255,6 +255,22 @@ mod tests {
 
     use proptest::prelude::*;
 
+    /// 构造 marker 填充全部字符串字段的 ForwardRecord 并序列化为 JSON —
+    /// SEC-5 与 DTO-1 两个泄漏扫描 property 的共用 payload 构造 (单点维护,
+    /// 结构性保证两者始终覆盖同一字段形态, 不会单边编辑后静默漂移).
+    fn serialize_marker_filled_record(method: &str, path: &str, body: &str, error: &str) -> String {
+        let mut rec = ForwardRecord::new(
+            format!("POST-{method}"),
+            format!("/o/{path}/v1/chat"),
+            vec![],
+            format!("body-{body}"),
+        );
+        rec.error = Some(format!("err-{error}"));
+        rec.resp_parsed = Some(serde_json::json!({"k": "v"}));
+        rec.redactions = vec![("mock-x".into(), "secret-id-1".into())];
+        serde_json::to_string(&rec).expect("serialize ForwardRecord")
+    }
+
     proptest! {
         /// SEC-5: ForwardRecord 序列化后的 JSON 不含 PolicySnapshot 字段.
         ///
@@ -280,17 +296,9 @@ mod tests {
                     && !body_marker.contains("policy") && !error_marker.contains("policy"),
                 "marker must not contain 'policy' substring"
             );
-            let mut rec = ForwardRecord::new(
-                format!("POST-{method_marker}"),
-                format!("/o/{path_marker}/v1/chat"),
-                vec![],
-                format!("body-{body_marker}"),
+            let json = serialize_marker_filled_record(
+                &method_marker, &path_marker, &body_marker, &error_marker,
             );
-            rec.error = Some(format!("err-{error_marker}"));
-            rec.resp_parsed = Some(serde_json::json!({"k": "v"}));
-            rec.redactions = vec![("mock-x".into(), "secret-id-1".into())];
-
-            let json = serde_json::to_string(&rec).expect("serialize ForwardRecord");
             // 核心: JSON 不得含字段名 "policy" 或类型名 "PolicySnapshot".
             prop_assert!(
                 !json.contains("\"policy\"") && !json.contains("PolicySnapshot"),
@@ -312,6 +320,91 @@ mod tests {
             serialized.contains("\"policy\""),
             "SEC-5 scanner broken: json.contains(\"\\\"policy\\\"\") is false even when field \
              present. sec5 proptest would pass vacuously. json={serialized}"
+        );
+    }
+
+    // ─── DTO-1: ForwardRecord 不暴露 DAG 内部类型标记 ──────────────────────
+    //
+    // 契约 (docs/design/contracts.md §5 DTO-1): ForwardRecord 的 JSON shape 必须稳定,
+    // 不随 DAG 内部结构变化漂移 — 具体即不暴露 DAG 内容寻址存储的内部类型
+    // (BlockHash / MessageRef / BlockPool). 与 SEC-5 同构的防御性第二道闸: 当前
+    // ForwardRecord 字段集合全是基础类型 (String / Vec / Option<Value>, 见 struct
+    // 定义), 但未来若有人为省一次派生把 DAG Node / MessageRef 直接嵌入 DTO,
+    // 序列化扫描会 fail.
+
+    /// DTO-1 禁词表. 取自 DAG 内部类型**若被序列化将采用的 serde 默认命名**
+    /// (当前 MessageRef/BlockPool/Node 均未 derive Serialize — 这正是 DTO-1 要守卫的
+    /// 现状; 禁词按 serde 默认字段名 + 类型名兜底, 嵌入字段或误加 derive 均会命中):
+    /// - `MessageRef { role, blocks: Vec<BlockHash> }` (pool.rs) → 字段名 "blocks";
+    /// - `Node { own_hash, prefix_hash, req_delta: Arc<[MessageRef]> }` (types.rs)
+    ///   → "own_hash" / "prefix_hash" / "req_delta" ("req_delta" 同时是 Node 内部
+    ///   切片概念, wire 上只允许派生出的 req_delta_messages 形态存在于其他 DTO);
+    /// - `BlockPool { blocks, refcount }` (pool.rs) → "refcount";
+    /// - Merkle 前缀哈希机制 → "merkle" / "prefix_hash";
+    /// - u64 hash 的语义名 → "block_hash" / "message_ref"; 类型名兜底 →
+    ///   "BlockHash" / "MessageRef" / "BlockPool" (serde(tag) / rename 场景).
+    const INTERNAL_MARKERS: [&str; 12] = [
+        "\"block_hash\"",
+        "\"message_ref\"",
+        "\"blocks\"",
+        "\"refcount\"",
+        "\"own_hash\"",
+        "\"prefix_hash\"",
+        "\"req_delta\"",
+        "\"merkle\"",
+        "\"pool\"",
+        "BlockHash",
+        "MessageRef",
+        "BlockPool",
+    ];
+
+    /// 纯小写字母的禁词子串集合 (供 prop_assume 排除 marker 假阳性; 含下划线/
+    /// 驼峰的禁词不可能由 `[a-z]{3,8}` marker 拼出, 无需列出).
+    const MARKER_FALSE_POSITIVES: [&str; 4] = ["pool", "blocks", "refcount", "merkle"];
+
+    proptest! {
+        /// DTO-1: ForwardRecord 序列化后的 JSON 不含 DAG 内部类型标记.
+        ///
+        /// 生成器与 SEC-5 同款: 任意 marker 填充全部字符串字段, 确保扫描覆盖
+        /// 每个可能携带内容的字段. marker 字符集 [a-z] 避免与禁词意外重叠
+        /// (残余概率由 prop_assume 排除).
+        #[test]
+        fn prop_forward_record_no_internal_leak(
+            method_marker in "[a-z]{3,8}",
+            path_marker in "[a-z]{3,8}",
+            body_marker in "[a-z]{3,8}",
+            error_marker in "[a-z]{3,8}",
+        ) {
+            prop_assume!(
+                [&method_marker, &path_marker, &body_marker, &error_marker]
+                    .iter()
+                    .all(|m| !MARKER_FALSE_POSITIVES.iter().any(|w| m.contains(w))),
+                "marker must not collide with forbidden substring words"
+            );
+            let json = serialize_marker_filled_record(
+                &method_marker, &path_marker, &body_marker, &error_marker,
+            );
+            // 核心: JSON 不得含任何 DAG 内部类型标记 (字段名或类型名形态).
+            prop_assert!(
+                !INTERNAL_MARKERS.iter().any(|m| json.contains(m)),
+                "DTO-1 violation: ForwardRecord JSON leaks DAG-internal type marker. \
+                 json={json}"
+            );
+        }
+    }
+
+    /// DTO-1 扫描器灵敏度守卫 (与 sec5_scanner 同款): 验证禁词扫描在 JSON 真含
+    /// 内部字段时确实命中, 防止序列化格式变化让 proptest 退化为空洞恒真.
+    #[test]
+    fn dto1_scanner_detects_internal_field_when_present() {
+        // 模拟 "误把 Node.req_delta 直接嵌入 DTO" 的序列化产物.
+        let leaked = serde_json::json!({"req_delta": [{"role": "user", "blocks": [42]}]});
+        let serialized = serde_json::to_string(&leaked).unwrap();
+        assert!(
+            INTERNAL_MARKERS.iter().any(|m| serialized.contains(m)),
+            "DTO-1 scanner broken: none of the forbidden markers hit a JSON that \
+             actually contains req_delta/blocks. proptest would pass vacuously. \
+             json={serialized}"
         );
     }
 }

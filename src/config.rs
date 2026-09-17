@@ -2992,6 +2992,16 @@ mod table_tests {
             .unwrap();
         }
 
+        /// 恢复可写 (与 make_readonly 对称, Drop guard 同值). 供 "只读失败窗口 →
+        /// 恢复后提交" 形态的测试在窗口结束后归一恢复手法.
+        pub(super) fn make_writable(&self) {
+            std::fs::set_permissions(
+                &self.dir,
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            )
+            .unwrap();
+        }
+
         pub(super) fn state_path(&self) -> PathBuf {
             self.dir.join("state.toml")
         }
@@ -3041,8 +3051,7 @@ mod table_tests {
         assert!(t.decisions.read().secret("new") == OverrideMode::Default);
 
         // 恢复权限后 (Drop guard 会做, 但这里显式做以验证后续可写).
-        std::fs::set_permissions(&ro.dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
-            .unwrap();
+        ro.make_writable();
         // 同一 table 恢复后应能正常 upsert (状态未被半破坏).
         t.upsert_dynamic(entry("new", "value-new"))
             .expect("upsert must succeed after permissions restored");
@@ -3222,6 +3231,37 @@ mod proptests {
             1 => OverrideMode::PreferStatic,
             _ => OverrideMode::Disabled,
         }
+    }
+
+    // ─── 跨表 (CFG-4/CFG-5) fixture: server.rs 同款装配 ────────────────────
+    //
+    // "与 server.rs 启动装配一致" 的代码级单点: 共享 persist_lock (串行 RMW) +
+    // 共享 Decisions Arc + 同一 state_path, 两表各带 1 个 static entry
+    // (set_decision 的作用对象 — decision 只对 static id 生效). 需要 static
+    // decision 作用对象的跨表测试经此构造, 防装配声明散落多处后单边漂移;
+    // (empty-statics 变体的跨表装配见 prop_concurrent_writes_serialized_via_persist_lock,
+    // 其 disk 断言依赖 statics 为空, 不适合共用本 fixture.)
+
+    fn cross_table_with_statics(
+        state_path: PathBuf,
+    ) -> (SecretTable, ProviderTable, Arc<RwLock<Decisions>>) {
+        let shared_lock = Arc::new(Mutex::new(()));
+        let shared_decisions = empty_decisions();
+        let secrets = SecretTable::with_persist_lock(
+            vec![entry("s-static", "static-secret-value")],
+            vec![],
+            shared_decisions.clone(),
+            state_path.clone(),
+            shared_lock.clone(),
+        );
+        let providers = ProviderTable::with_persist_lock(
+            vec![provider("p-static", "https://up.example.com")],
+            vec![],
+            shared_decisions.clone(),
+            state_path,
+            shared_lock,
+        );
+        (secrets, providers, shared_decisions)
     }
 
     // ─── 生成器 ───────────────────────────────────────────────────────────
@@ -3750,19 +3790,12 @@ mod proptests {
             provider_mode in 0u8..3,
         ) {
             let tmp = tempfile_path("cross-decisions");
-            let shared_lock = Arc::new(Mutex::new(()));
-            let shared_decisions = empty_decisions();
             let state_path = tmp.clone();
 
-            // 各表带 1 个 static entry (id 互不相同), 让 set_decision 有作用对象.
-            let secrets = SecretTable::with_persist_lock(
-                vec![entry("s-static", "seed-secret-value")], vec![],
-                shared_decisions.clone(), state_path.clone(), shared_lock.clone(),
-            );
-            let providers = ProviderTable::with_persist_lock(
-                vec![provider("p-static", "https://up.example.com")], vec![],
-                shared_decisions.clone(), state_path.clone(), shared_lock.clone(),
-            );
+            // 各表带 1 个 static entry (id 互不相同), 让 set_decision 有作用对象
+            // (server.rs 同款共享装配, fixture 单点维护).
+            let (secrets, providers, shared_decisions) =
+                cross_table_with_statics(state_path.clone());
 
             let sm = mode_of(secret_mode);
             let pm = mode_of(provider_mode);
@@ -4051,11 +4084,11 @@ mod proptests {
         /// CFG-4: 并发写时, persist 失败回滚不影响其他 in-flight 写入.
         ///
         /// **降级说明 (契约 CFG-4 诚实标注)**: 契约原文要求"**跨表**并发写时, **一表** persist
-        /// 失败回滚**不影响另一表** in-flight 写入". 真正的"跨表"覆盖需要装配 SecretTable +
-        /// ProviderTable 共享 persist_lock + Decisions + 同一 state_path, 复杂度高. 本测试
-        /// **降级为单表** (同一 SecretTable) N 线程并发, 覆盖"persist_lock 串行 RMW + 失败回滚"
-        /// 这一核心不变量, 但**未触及**跨表 state.toml 文件交互 (一表 atomic_write 损坏文件
-        /// 影响另一表 load_or_empty) 与共享 Decisions Arc 的跨表隔离. 跨表完整覆盖作为后续工作.
+        /// 失败回滚**不影响另一表** in-flight 写入". 本测试**降级为单表** (同一
+        /// SecretTable) N 线程并发, 覆盖"persist_lock 串行 RMW + 失败回滚"这一核心
+        /// 不变量. 跨表完整覆盖 (装配 SecretTable + ProviderTable 共享 persist_lock +
+        /// Decisions + 同一 state_path) 已由紧随其后的
+        /// `prop_persist_failure_rollback_under_concurrency_cross_table` 补齐.
         ///
         /// N (2..=6) 线程并发对只读目录上的 SecretTable 写, 断言所有写入都失败且内存不留半提交.
         /// 成功路径 (并发不丢更新) 由 CFG-5 的 `prop_concurrent_upserts_no_lost_update` 覆盖,
@@ -4091,6 +4124,191 @@ mod proptests {
             prop_assert!(
                 disk.is_empty() || !disk.contains("id-"),
                 "concurrent failed writes: state.toml must not contain any new id"
+            );
+        }
+
+        /// CFG-4: 跨表装配下, 一表 persist 失败回滚不影响另一表 in-flight 写入
+        /// (contracts.md §6 CFG-4 `prop_persist_failure_rollback_under_concurrency`
+        /// 的跨表完整覆盖 — 补齐该契约"理想 vs 现状"注记的缺口).
+        ///
+        /// **装配**: SecretTable + ProviderTable 共享 persist_lock + 共享 Decisions +
+        /// 同一 state_path (与 server.rs 启动装配一致), 注入 persist 失败的方式与
+        /// `prop_persist_failure_rolls_back_memory` 同款 (state_path 所在目录切只读,
+        /// atomic_write 的 tmp 创建 EACCES).
+        ///
+        /// **关于 "in-flight" 的语义**: 共享同一 state_path 时, 只读窗口对两表的
+        /// persist 是对称失败的 — "窗口内一表失败 + 另一表并发成功" 不可构造.
+        /// 故按契约原文语义拆成三个确定性阶段 (阶段间 join 屏障, 无 sleep/无时序竞态):
+        /// - 阶段 0 (可写): 两表各完成 upsert + set_decision 成功提交 (基线);
+        /// - 阶段 1 (只读失败窗口): 双表并发 upsert + set_decision 全部失败 — 断言
+        ///   (a) 两表内存各自完全回滚, 互不污染 (跨表内存隔离);
+        ///   (b) 共享 Decisions 完全回滚, secret 表失败回滚不动 provider 子表条目,
+        ///       反之亦然 (共享 Decisions 跨表失败隔离);
+        ///   (c) state.toml 字节级不变 + load_or_empty 仍成功 — 双表失败的
+        ///       atomic_write 都不撕裂共享文件 (跨表 state.toml 文件交互);
+        /// - 阶段 2 (恢复可写): "另一表 in-flight 写入的成功提交" — provider 表新
+        ///   upsert / set_decision 成功, secret 表亦然; 断言跨窗口累积完整
+        ///   (失败表回滚没偷走另一表已提交/待提交的写入), 磁盘 reload 同含两表段.
+        #[test]
+        fn prop_persist_failure_rollback_under_concurrency_cross_table(
+            half in 2usize..=4,               // 失败窗口内每表的并发 upsert 线程数.
+            value_seed in "[a-z0-9]{4,12}",
+        ) {
+            // ── 装配 (server.rs 同款跨表共享, fixture 单点维护) ──
+            let ro = ReadOnlyDir::new("prop-conc-fail-cross");
+            let state_path = ro.state_path();
+            // 预写合法 (空) 初始 state, 让 load_or_empty 能读到.
+            atomic_write(&state_path, "").unwrap();
+            let (secrets, providers, shared_decisions) =
+                cross_table_with_statics(state_path.clone());
+
+            // ── 阶段 0 (可写): 双表成功提交基线 ──
+            secrets
+                .upsert_dynamic(entry("id-s0", &format!("{value_seed}-s0")))
+                .expect("phase 0: secret upsert must succeed");
+            providers
+                .upsert_dynamic(provider("id-p0", &format!("https://up-{value_seed}-0.example.com")))
+                .expect("phase 0: provider upsert must succeed");
+            secrets.set_decision("s-static", OverrideMode::Disabled)
+                .expect("phase 0: secret set_decision must succeed");
+            providers.set_decision("p-static", OverrideMode::PreferStatic)
+                .expect("phase 0: provider set_decision must succeed");
+
+            // 快照 (内存两表 + 共享 decisions + 磁盘字节) — 阶段 1 的回滚基准.
+            // secret 表用 (id, value) 对 (value 是 SecretEntry 的真实字段);
+            // provider 的 base_url 在 kind 变体内无顶层字段, 用 id 集合
+            // (与 CFG-5 既有跨表断言的粒度一致).
+            let snap_secrets: HashSet<(String, String)> = secrets
+                .effective_raw().into_iter().map(|e| (e.id, e.value)).collect();
+            let snap_providers: HashSet<String> = providers
+                .effective_raw().into_iter().map(|e| e.id).collect();
+            let snap_decisions = shared_decisions.read().clone();
+            let snap_disk = std::fs::read_to_string(&state_path).unwrap();
+
+            // ── 阶段 1 (只读失败窗口): 双表并发写, 全部必须失败 ──
+            ro.make_readonly();
+            let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
+            for i in 0..half {
+                // secret 表并发 upsert 新 id.
+                let t = secrets.clone();
+                let v = format!("{value_seed}-sf{i}");
+                handles.push(std::thread::spawn(move || {
+                    let _ = t.upsert_dynamic(entry(&format!("id-sf{i}"), &v));
+                }));
+                // provider 表并发 upsert 新 id.
+                let t = providers.clone();
+                let base = format!("https://up-{value_seed}-f{i}.example.com");
+                handles.push(std::thread::spawn(move || {
+                    let _ = t.upsert_dynamic(provider(&format!("id-pf{i}"), base.as_str()));
+                }));
+            }
+            // 每表各一个并发 set_decision (改成与阶段 0 不同的 mode, 失败后须回滚).
+            {
+                let t = secrets.clone();
+                handles.push(std::thread::spawn(move || {
+                    let _ = t.set_decision("s-static", OverrideMode::PreferStatic);
+                }));
+            }
+            {
+                let t = providers.clone();
+                handles.push(std::thread::spawn(move || {
+                    let _ = t.set_decision("p-static", OverrideMode::Disabled);
+                }));
+            }
+            for h in handles {
+                h.join().expect("phase 1 worker must not panic");
+            }
+
+            // (a) 两表内存各自完全回滚到阶段 0 基线, 互不污染 (无半提交 + 无跨表串扰).
+            let got_secrets: HashSet<(String, String)> = secrets
+                .effective_raw().into_iter().map(|e| (e.id, e.value)).collect();
+            prop_assert_eq!(
+                got_secrets, snap_secrets,
+                "failed secret-table writes must roll back without touching own memory"
+            );
+            let got_providers: HashSet<String> = providers
+                .effective_raw().into_iter().map(|e| e.id).collect();
+            prop_assert_eq!(
+                got_providers, snap_providers,
+                "secret-table persist failure must NOT pollute provider-table memory (and vice versa)"
+            );
+            // (b) 共享 Decisions 完全回滚: 双表失败的 set_decision 不留内存漂移,
+            // 且一表失败回滚不动另一表子表的条目 (跨表失败隔离).
+            prop_assert_eq!(
+                shared_decisions.read().clone(), snap_decisions,
+                "failed cross-table set_decision must leave shared Decisions untouched"
+            );
+            // (c) 跨表 state.toml 文件交互: 双表失败的 atomic_write 都不撕裂共享文件
+            // (字节级不变), 且从另一表视角 load_or_empty 仍成功读到一致状态.
+            prop_assert_eq!(
+                std::fs::read_to_string(&state_path).unwrap(), snap_disk,
+                "failed atomic_writes from both tables must not tear the shared state.toml"
+            );
+            DynamicState::load_or_empty(&state_path, "")
+                .expect("state.toml must remain loadable after cross-table failures");
+
+            // ── 阶段 2 (恢复可写): "另一表 in-flight 写入的成功提交" ──
+            ro.make_writable();
+            providers
+                .upsert_dynamic(provider("id-p1", &format!("https://up-{value_seed}-1.example.com")))
+                .expect("phase 2: provider upsert after peer rollback window must succeed");
+            secrets
+                .upsert_dynamic(entry("id-s1", &format!("{value_seed}-s1")))
+                .expect("phase 2: secret upsert after own rollback window must succeed");
+            providers.set_decision("p-static", OverrideMode::Default)
+                .expect("phase 2: provider set_decision must succeed");
+            secrets.set_decision("s-static", OverrideMode::Default)
+                .expect("phase 2: secret set_decision must succeed");
+
+            // 跨窗口累积完整 (精确集合): 失败窗口的回滚没偷走两表已提交/新提交的
+            // 写入, 失败窗口的 id (id-sf*/id-pf*, 全部下标) 一个不混入, 且无多余
+            // 条目 — 阶段 2 已把两个 static decision 重置 Default, static 条目回到
+            // 合并视图, 故终态恰为 static + 已提交 dynamic 的并集.
+            let final_secrets: HashSet<String> = secrets
+                .effective_raw().into_iter().map(|e| e.id).collect();
+            let final_providers: HashSet<String> = providers
+                .effective_raw().into_iter().map(|e| e.id).collect();
+            let want_secret_eff: HashSet<String> =
+                ["s-static", "id-s0", "id-s1"].into_iter().map(String::from).collect();
+            let want_provider_eff: HashSet<String> =
+                ["p-static", "id-p0", "id-p1"].into_iter().map(String::from).collect();
+            prop_assert_eq!(
+                final_secrets, want_secret_eff,
+                "secret-table memory must hold exactly static + committed ids across the failure window"
+            );
+            prop_assert_eq!(
+                final_providers, want_provider_eff,
+                "provider-table memory must hold exactly static + committed ids across the failure window"
+            );
+            // 磁盘终态: reload 的 dynamic 段恰好含两表的 dynamic-only 提交
+            // (s-static / p-static 是 static 层构造, 不进 state.toml dynamic 段;
+            // effective_raw 是含 static 的合并视图, 不可直接与 disk 段比较),
+            // decisions 回到 Default (阶段 2 显式 reset, 条目移除后查询回落).
+            let reloaded = DynamicState::load_or_empty(&state_path, "")
+                .expect("state.toml must be loadable after recovery phase");
+            let disk_secret_ids: HashSet<String> =
+                reloaded.secrets.iter().map(|e| e.id.clone()).collect();
+            let disk_provider_ids: HashSet<String> =
+                reloaded.providers.iter().map(|e| e.id.clone()).collect();
+            let want_secret_dyn: HashSet<String> =
+                ["id-s0", "id-s1"].into_iter().map(String::from).collect();
+            let want_provider_dyn: HashSet<String> =
+                ["id-p0", "id-p1"].into_iter().map(String::from).collect();
+            prop_assert_eq!(
+                disk_secret_ids, want_secret_dyn,
+                "disk secrets segment must hold exactly the committed dynamic ids"
+            );
+            prop_assert_eq!(
+                disk_provider_ids, want_provider_dyn,
+                "disk providers segment must hold exactly the committed dynamic ids"
+            );
+            prop_assert_eq!(
+                reloaded.decisions.secret("s-static"), OverrideMode::Default,
+                "recovered secret decision must be Default (phase 2 reset)"
+            );
+            prop_assert_eq!(
+                reloaded.decisions.provider("p-static"), OverrideMode::Default,
+                "recovered provider decision must be Default (phase 2 reset)"
             );
         }
     }

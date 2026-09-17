@@ -295,3 +295,151 @@ pub struct SyncSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeline: Option<TimelineDiffData>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    // ─── UsageView: 饱和加法代数性质 (session 总量折叠的算术根基) ─────────────
+    //
+    // UsageView.saturating_add 是 session usage_total 折叠 (dag::view 沿链求和) 的
+    // 唯一算子, 上游 IrUsage 回显值是外部输入 (恶意/损坏的上游可回 u64 极值), 折叠
+    // 必须在任意输入下不 panic 且封顶. 数学背景: 饱和加法 (⊞) 在非负整数上满足
+    // 交换律与结合律 — 结合律证明分两case: 三数之和 ≤ MAX 时两侧均不饱和 (退化为
+    // 普通加法, 结合); > MAX 时两侧均饱和到 MAX, 相等. 本 block 用极值偏置生成器
+    // 锁住这些性质 (生成器覆盖度作为契约要求, contracts.md §0.3).
+
+    /// 极值偏置的 u64 生成器: 混合全域随机与饱和边界 (0 / 1 / MAX 邻域),
+    /// 确保极值邻域不靠概率性触达 (全域 any::<u64> 撞中 MAX±64 的概率 ~2^-58).
+    fn arb_u64_sat() -> impl Strategy<Value = u64> {
+        prop_oneof![
+            4 => any::<u64>(),
+            1 => Just(0u64),
+            1 => Just(1u64),
+            2 => (u64::MAX - 64)..=u64::MAX,
+        ]
+    }
+
+    /// 四维独立的 UsageView 生成器 (每维独立取极值偏置值).
+    fn arb_usage_view() -> impl Strategy<Value = UsageView> {
+        (arb_u64_sat(), arb_u64_sat(), arb_u64_sat(), arb_u64_sat()).prop_map(
+            |(input, output, cache_read, cache_write)| UsageView {
+                input,
+                output,
+                cache_read,
+                cache_write,
+            },
+        )
+    }
+
+    /// from_ir 归一契约: cache 两维的 None (上游未上报) 归 0, 其余透传.
+    /// 固定值断言 (字段映射是确定性的, 无随机输入空间).
+    #[test]
+    fn from_ir_normalizes_none_cache_dims_to_zero() {
+        let u = UsageView::from_ir(&IrUsage {
+            input_tokens: 100,
+            output_tokens: 7,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+        });
+        assert_eq!(
+            u,
+            UsageView {
+                input: 100,
+                output: 7,
+                cache_read: 0,
+                cache_write: 0
+            },
+            "None cache dims must normalize to 0 (USAGE-2 相等断言语义)"
+        );
+        // 极值透传: u64::MAX 不被 from_ir 截断.
+        let extreme = UsageView::from_ir(&IrUsage {
+            input_tokens: u64::MAX,
+            output_tokens: u64::MAX,
+            cache_read_input_tokens: Some(u64::MAX),
+            cache_creation_input_tokens: Some(u64::MAX),
+        });
+        assert_eq!(
+            extreme,
+            UsageView {
+                input: u64::MAX,
+                output: u64::MAX,
+                cache_read: u64::MAX,
+                cache_write: u64::MAX
+            },
+            "u64::MAX must pass through from_ir unchanged"
+        );
+    }
+
+    proptest! {
+        /// 交换律: a ⊞ b == b ⊞ a (逐维).
+        #[test]
+        fn prop_saturating_add_commutative(a in arb_usage_view(), b in arb_usage_view()) {
+            prop_assert_eq!(a.saturating_add(b), b.saturating_add(a));
+        }
+
+        /// 结合律: (a ⊞ b) ⊞ c == a ⊞ (b ⊞ c). 饱和加法在非负整数上满足结合律
+        /// (论证见 mod 头部注释), 极值偏置生成器保证饱和分支被实际触达.
+        #[test]
+        fn prop_saturating_add_associative(
+            a in arb_usage_view(), b in arb_usage_view(), c in arb_usage_view(),
+        ) {
+            let left = a.saturating_add(b).saturating_add(c);
+            let right = a.saturating_add(b.saturating_add(c));
+            prop_assert_eq!(left, right);
+        }
+
+        /// 单位元: a ⊞ 0 == 0 ⊞ a == a (零用量轮次不改变累计值).
+        #[test]
+        fn prop_saturating_add_identity(a in arb_usage_view()) {
+            let zero = UsageView::default();
+            prop_assert_eq!(a.saturating_add(zero), a);
+            prop_assert_eq!(zero.saturating_add(a), a);
+        }
+
+        /// 封顶与支配性: 结果逐维 ≥ max(a,b) (单调不亏)、任一操作数该维为 MAX 时
+        /// 结果恰为 MAX (吸收元), 且 "未溢出 == 普通加法精确值, 溢出 == 恰为 MAX"
+        /// (饱和只在溢出处介入, 不引入其他偏差). 不 panic 性由测试本身执行到
+        /// 断言即证明 (误用 `+` 会在 property 求值时溢出 panic, 走不到 checked 分支).
+        #[test]
+        fn prop_saturating_add_caps_at_max(a in arb_usage_view(), b in arb_usage_view()) {
+            let s = a.saturating_add(b);
+            for (x, y, z) in [
+                (a.input, b.input, s.input),
+                (a.output, b.output, s.output),
+                (a.cache_read, b.cache_read, s.cache_read),
+                (a.cache_write, b.cache_write, s.cache_write),
+            ] {
+                prop_assert!(z >= x.max(y), "saturated sum must dominate both operands");
+                if x == u64::MAX || y == u64::MAX {
+                    prop_assert_eq!(z, u64::MAX, "u64::MAX must be absorbing");
+                }
+                // 数学和未溢出时必须精确等于普通加法 (饱和只在溢出处介入).
+                match x.checked_add(y) {
+                    Some(exact) => prop_assert_eq!(z, exact, "no overflow: must equal plain add"),
+                    None => prop_assert_eq!(z, u64::MAX, "overflow: must saturate to MAX"),
+                }
+            }
+        }
+    }
+
+    /// 极值锚点: MAX ⊞ MAX 每维恰为 MAX, 不 panic. 固定值断言 (极值点是确定的,
+    /// proptest 已概率性覆盖, 此处给回归时一眼可读的显式锚).
+    #[test]
+    fn saturating_add_max_saturated_point() {
+        let m = UsageView {
+            input: u64::MAX,
+            output: u64::MAX,
+            cache_read: u64::MAX,
+            cache_write: u64::MAX,
+        };
+        assert_eq!(m.saturating_add(m), m, "MAX ⊞ MAX must saturate to MAX");
+        // MAX 维 + 1: 该维封顶在 MAX; 加数其余维为 0 (单位元), MAX 维保持 MAX.
+        let one = UsageView {
+            input: 1,
+            ..Default::default()
+        };
+        assert_eq!(m.saturating_add(one), m, "MAX-dim + 1 must stay at MAX");
+    }
+}
