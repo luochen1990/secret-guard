@@ -174,16 +174,8 @@ fn sanitize_free_string(value: &str, placeholder: &str, secrets: &[SecretEntry])
             return (placeholder.to_string(), true);
         }
     }
-    let mut out = value.to_string();
-    if out.len() > 256 {
-        let cut = out
-            .char_indices()
-            .nth(256)
-            .map(|(i, _)| i)
-            .unwrap_or(out.len());
-        out.truncate(cut);
-    }
-    (out, false)
+    let truncated = crate::util::truncate_chars(value, 256);
+    (truncated.to_string(), false)
 }
 
 /// proxy 侧的采集上下文.

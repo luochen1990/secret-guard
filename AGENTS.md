@@ -104,7 +104,7 @@
 
 ```text
                     ┌──────────── 基础层 (零 / 极低业务依赖) ──────────┐
-                    │  util (hash + 0600 收紧)  error (AppError)       │
+                    │  util (hash + 0600 + 截断族)  error (AppError)   │
                     │  dto (wire shape)  state (AppState + NO_STORE)   │
                     │  server_host_guard (Host/Origin 校验, SEC-7)     │
                     └─────────────────────────────────────────────────┘
@@ -394,7 +394,7 @@ TTL 300s + serve-stale-on-error + single-flight; exact-only router 零上游请�
 | `record.rs` | ForwardRecord (web 层 DTO, GET /records/{id} 响应 shape) | 文件头部 `//!` |
 | `usage/` (模块目录: mod/store/pricing/summary) | 模型用量统计 + redact 审计: 上游回显 usage 采集 (UsageCtx, rounds 三态 + status 原始码) + SQLite 持久化 (writer 线程批量事务) + SQL 聚合 (hour 粒度) + models.dev 定价 + summary 派生 (设计 `docs/design/usage-stats.md`, 契约 USAGE-*) | `src/usage/mod.rs` 头部 `//!` |
 | `redact.rs` | RedactionMap + redact/restore pipeline + 形式化契约 C1-C7 | 文件头部 `//!` |
-| `util.rs` | 集中的哈希工具 (`hash64` SipHash 单值入口) | 文件头部 `//!` |
+| `util.rs` | 集中的哈希工具 + 文件权限收紧 (SEC-8) + 字符串截断族 (char boundary 安全, ROB-1) | 文件头部 `//!` |
 | `codec/` | 跨协议 IR + Reader/Writer trait + StreamTranslate (OpenAI / Anthropic / Responses) | **`src/codec/AGENTS.md`** + `docs/design/ir-fields-roadmap.md` (IR 字段建模路线图: extra 边界 + 字段提升判定准则 + 实施批次) |
 | `proxy/` | dispatch 路径选择 + fan_out 四路径 + Provider 鉴权 + router GET /models 本地合成 + provider 协议探测 (拆分为 mod/helpers/auth/models/recorder/same_proto/cross_proto/fan_out 子模块) | `src/proxy/mod.rs` 头部 `//!` |
 | `state.rs` | 进程级共享状态 `AppState` (原 ProxyState, 上移见 #145) + HTTP 共享常量 `NO_STORE` | 文件头部 `//!` |

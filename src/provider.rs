@@ -815,11 +815,7 @@ const NOMATCH_MODEL_ECHO_LIMIT: usize = 64;
 /// 消费点: NoMatch 构造处 (Display 保持纯粹, 同一值进 503 body 与 warn!) +
 /// proxy 的 "route resolved" info! (成功路径回显, 同类洪水风险).
 pub(crate) fn truncate_model_for_echo(model: &str) -> String {
-    // char_indices 单遍定位切点 (避免 count + take 双遍扫描); 切在 char 边界.
-    match model.char_indices().nth(NOMATCH_MODEL_ECHO_LIMIT) {
-        Some((i, _)) => format!("{}…", &model[..i]),
-        None => model.to_string(),
-    }
+    crate::util::truncate_chars_with_ellipsis(model, NOMATCH_MODEL_ECHO_LIMIT)
 }
 
 /// 路由 provider 解析错误 (`resolve_route`). Display 消息进 503 body,

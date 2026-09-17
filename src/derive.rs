@@ -86,16 +86,7 @@ fn select_and_truncate_preview(candidates: &[(&str, &str)]) -> Option<String> {
 /// 归一化空白 + 截断到 PREVIEW_MAX chars (SSOT, 前后端一致).
 fn truncate_preview(s: &str) -> String {
     let normalized = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.chars().count() > PREVIEW_MAX {
-        let end = normalized
-            .char_indices()
-            .nth(PREVIEW_MAX)
-            .map(|(i, _)| i)
-            .unwrap_or(normalized.len());
-        format!("{}…", &normalized[..end])
-    } else {
-        normalized
-    }
+    crate::util::truncate_chars_with_ellipsis(&normalized, PREVIEW_MAX)
 }
 
 // ─── IR 入口 (codec 路径, 零重复 parse) ─────────────────────────────────────
@@ -242,10 +233,10 @@ fn message_text(m: &serde_json::Value) -> Option<String> {
 
 /// 收集时截断的头部上限: [`PREVIEW_MAX`] + 1 (char count, char-boundary 安全).
 ///
-/// +1 保留 "超长" 信号: `truncate_preview` 靠 `count() > PREVIEW_MAX` 判定是否追加
-/// '…'; 恰好截到 PREVIEW_MAX 会让所有长文本归一化后 ≤ 48, 省略号永不出现.
-/// COMPRESSED_MARKER (23 chars) 精确相等比较不受影响: 更长的文本截断后是 49 chars,
-/// 恒不等于 23 chars 的 marker.
+/// +1 保留 "超长" 信号: `truncate_preview` 只对归一化后超过 PREVIEW_MAX chars 的
+/// 文本追加 '…'; 恰好截到 PREVIEW_MAX 会让所有长文本归一化后 ≤ 48, 省略号永不
+/// 出现. COMPRESSED_MARKER (23 chars) 精确相等比较不受影响: 更长的文本截断后是
+/// 49 chars, 恒不等于 23 chars 的 marker.
 ///
 /// 已知可接受差异: 截断发生在空白归一化**之前**, 极端空白 (前 49 chars 是长空白 run,
 /// 后续才有内容) 时归一化结果与全量文本不同. preview 是 best-effort 展示字段

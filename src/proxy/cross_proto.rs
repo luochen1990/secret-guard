@@ -547,8 +547,7 @@ fn http_status_to_error_kind(status: u16) -> &'static str {
 /// 字符上直切字节偏移会 panic, 掐断整个连接.
 fn raw_error_snippet(resp_bytes: &[u8]) -> String {
     let raw = std::str::from_utf8(resp_bytes).unwrap_or("");
-    let cap = raw.len().min(super::MAX_ERROR_MSG_LEN);
-    raw[..cap].to_string()
+    crate::util::truncate_str_on_char_boundary(raw, super::MAX_ERROR_MSG_LEN).to_string()
 }
 
 /// 统计 block 切片中 [`IrBlock::ReasoningContent`] (思考原文, #176) 的数量,
@@ -594,7 +593,11 @@ mod tests {
         let s = raw_error_snippet(body.as_bytes());
         // 不 panic 且是合法 UTF-8 (类型即保证); 截断发生在 char boundary.
         assert!(s.len() < body.len(), "必须发生截断");
-        assert_eq!(s.len(), 3 * 1365, "4096 floor 到最近的 char boundary = 4095");
+        assert_eq!(
+            s.len(),
+            3 * 1365,
+            "4096 floor 到最近的 char boundary = 4095"
+        );
         assert!(s.chars().all(|c| c == '错'), "不得出现残缺字符");
         // 未超限时原样保留 (含 ASCII 快速路径).
         assert_eq!(raw_error_snippet(b"short error"), "short error");
