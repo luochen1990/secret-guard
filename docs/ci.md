@@ -137,8 +137,10 @@ artifacts on failure (截图/trace/报告, retention 14 天) / Guard verify。
 - **WebUI regression (Playwright, P2)**: 保持 `continue-on-error` — P2 无 PR 合入语义,
   无 "转阻塞" 升级目标; flake 由次晚 schedule 重试自愈, 失败 tail 摘要 + artifact 可见。
 - **Performance benchmark (P1, compare-save)**: 已是 P1 阻塞信号 (退化 exit 1 → run 红);
-  `--quick` 10 samples 噪声大 (±15% 实测), 阈值 20% 只做量级级粗筛 — 升级到完整 samples
-  后可收紧到 10%。
+  `--quick` 10 samples 噪声大 (±15% 实测), 判定为双门槛 — med > 20% **且** p ≤ 0.05
+  (显著性门槛吸收同宿主并发 CI job 的系统性膨胀: 2026-09-17 事故中姊妹 runner VM 的
+  并发负载让 6 场景全部 +7~24% 且 p 全 > 0.05, 纯 med 判定误报红灯; 复盘见 justfile
+  `bench-ci` recipe 头注) — 只做量级级粗筛; 升级到完整 samples 后可收紧到 10%。
 - **cargo audit (P1)**: v3.0 起已阻塞化 (P1 语义), 无观察期。
 - **nix build (P1, canary)**: runner 无 nix-daemon 恒失败, continue-on-error 探针保留;
   启用条件 = runner 侧 nix 能力就位 (nixos 仓 forgejo-runner-vm 模块演进), 转绿后

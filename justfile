@@ -343,15 +343,20 @@ bench *ARGS:
 #     退化 exit 1 → ci-deploy run 红 (P1 "红 = 不能部署" 信号). 冷启动 fallback 同 compare.
 #
 # 退化判定逻辑 (解析 criterion stdout):
-#   每个场景输出 `change: time:   [lo% med% hi%]` 行. 取 med (中位数):
-#     - med > +REGRESSION_THRESHOLD (默认 20%): 标记回归, 收集进报告, 最终 exit 1.
-#     - 否则: 视为正常波动 (--quick 10 samples 下 p>0.05 是常态, 统计显著性弱,
-#       只能做量级级粗筛, 防 2x+ 退化).
+#   每个场景输出 `change: time:   [lo% med% hi%] (p = x.xx …)` 行. 双门槛:
+#     - med > +REGRESSION_THRESHOLD (默认 20%) **且** p ≤ 0.05: 标记回归, 收集进
+#       报告, 最终 exit 1.
+#     - 否则: 视为正常波动. p 门槛吸收系统性环境噪声: --quick 10 samples 下单场景
+#       波动 p>0.05 是常态; 更重要的是同物理宿主上并发的姊妹 runner VM CI job 会
+#       造成全场景一致膨胀 10~25% (2026-09-17 事故: 手动重跑的 ci-merge 与 ci-deploy
+#       的 bench 窗口重叠, 宿主 CPU 争抢让 6 场景全部 +7~24%, criterion 自判全部
+#       "No change in performance detected" (p>0.05), 但纯 med 判定误报红灯).
+#       真 20%+ 退化在 10 samples 下 p 几乎必 < 0.05, 该门槛不损灵敏度.
 #
 # 输出契约 (供 CI 消费):
 #   - stdout:  criterion 原始输出 + 末尾的回归判定摘要 (如有).
 #   - exit 0:  无回归 (或基线冷启动).
-#   - exit 1:  至少一个场景中位数退化超阈值.
+#   - exit 1:  至少一个场景中位数退化超阈值且统计显著 (p ≤ 0.05).
 #   - exit 2:  bench 本身失败 (编译/运行错误, 非退化).
 #
 # 阈值 SSOT: REGRESSION_THRESHOLD (百分比, 不带 %). 20% 的依据: --quick 噪声大
@@ -431,7 +436,14 @@ bench-ci mode *extra:
             if (match($0, /\[[^]]*\]/)) {
                 split(substr($0, RSTART+1, RLENGTH-2), v, /[%[:space:]]+/)
                 med = v[2] + 0
-                if (med > thr) printf "%s: +%d%%\n", bench, med
+                # 显著性门槛: change 行尾 "(p = 0.10 > 0.05)". p > 0.05 时 criterion
+                # 自判 "No change in performance detected" — 同宿主并发 CI job 的
+                # 系统性负载膨胀 (全场景 +10~25%) 不判退化 (2026-09-17 误报复盘,
+                # 详见 recipe 头注). p 解析失败按 p=0 (显著) 处理 — 保持旧行为,
+                # criterion 输出格式漂移不会让门禁静默放水.
+                p = 0
+                if (match($0, /\(p = [0-9.]+/)) p = substr($0, RSTART+5, RLENGTH-5) + 0
+                if (med > thr && p <= 0.05) printf "%s: +%d%% (p=%.2f)\n", bench, med, p
             }
         }
     ')
