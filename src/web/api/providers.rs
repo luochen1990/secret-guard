@@ -141,27 +141,28 @@ pub async fn update_provider(
                     }
                 }
             }
-            // routes 回填兜底: dynamic 无旧条目 (PUT 即首次 override) 时从
-            // **effective** 回填 (非敏感, 与下方 protocol 回填同模式).
-            if payload.routes.is_none()
-                && let Some(crate::provider::ProviderKind::Router(r)) =
-                    state.providers.get_effective(&id).map(|e| e.kind)
-            {
-                payload.routes = Some(r.routes);
-            }
+            // routes 回填兜底 + protocol 回填共用**一次** effective 快照 (单次取锁
+            // + merge, 也消除两次快照间的漂移窗口). 两分支按 kind 变体互斥分派:
+            // effective 是 Router 时只有 routes 分支可能命中, 是 Direct 时只有
+            // protocol 分支可能命中.
+            //
+            // routes 回填兜底: dynamic 无旧条目 (PUT 即首次 override) 时触发;
+            // rationale (非敏感, "省略 = 保留") 见上方闭包注释.
+            //
             // protocol 回填 (#190 保留语义): 从 **effective** 的 Direct 负载回填 —
-            // 覆盖 static-only 条目 (get_dynamic 无旧值的场景, PUT 即首次 override)。
-            // 非敏感字段, 无 #157 明文落盘顾虑。回填只服务 Direct 意图 — Router
-            // 构造不消费 protocol (无此字段), 回填了也会被 into_provider 忽略,
-            // 故无需按 router 意图守卫; effective 为 Router 时无 Direct 负载可挖
-            // → 不回填, 也不报错。
-            if payload.protocol.is_none() {
-                let eff = state.providers.get_effective(&id);
-                if let Some(crate::provider::ProviderKind::Direct(d)) =
-                    eff.as_ref().map(|e| &e.kind)
-                {
+            // 覆盖 static-only 条目 (get_dynamic 无旧值的场景)。非敏感字段, 无
+            // #157 明文落盘顾虑。回填只服务 Direct 意图 — Router 构造不消费
+            // protocol (无此字段), 回填了也会被 into_provider 忽略, 故无需按
+            // router 意图守卫; effective 为 Router 时无 Direct 负载可挖 → 不回填,
+            // 也不报错。
+            match state.providers.get_effective(&id).map(|e| e.kind) {
+                Some(crate::provider::ProviderKind::Router(r)) if payload.routes.is_none() => {
+                    payload.routes = Some(r.routes);
+                }
+                Some(crate::provider::ProviderKind::Direct(d)) if payload.protocol.is_none() => {
                     payload.protocol = Some(d.protocol);
                 }
+                _ => {}
             }
             payload.into_provider()
         },
