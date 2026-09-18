@@ -27,6 +27,12 @@ pub struct ForwardRecord {
     pub created_at: DateTime<Utc>,
     pub method: String,
     pub path: String,
+    /// 请求 body 的顶层 model 字段 (egress 视角: 路由改写生效时与
+    /// [`Self::upstream_model`] 同值, 见 `dag/types.rs` NodeView.model 说明;
+    /// 无改写时 = 客户端原值). round-info 弹窗 Model 行的数据源.
+    /// serde default: 兼容旧序列化产物 (历史 JSON 无此字段).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// 实际承载转发的 provider id (路由解析后的链尾实体, #179).
     /// 非路由请求时即 URL 中的 provider id.
     /// serde default: 兼容旧序列化产物 (历史 JSON 无此字段).
@@ -94,6 +100,7 @@ impl ForwardRecord {
             created_at: Utc::now(),
             method,
             path,
+            model: None,
             upstream_id: String::new(),
             upstream_model: None,
             req_headers,
@@ -156,6 +163,11 @@ mod tests {
             rec.upstream_id, "",
             "missing upstream_id field must default to empty string"
         );
+        // M1: model 同为后加字段, 缺省回落 None (显式锁定 default 契约).
+        assert!(
+            rec.model.is_none(),
+            "missing model field must default to None"
+        );
         // 其他字段仍正确填充.
         assert_eq!(rec.method, "POST");
         assert_eq!(rec.resp_body, "world");
@@ -212,6 +224,7 @@ mod tests {
         );
         assert!(rec.error.is_none(), "no error until one occurs");
         assert!(rec.redactions.is_empty(), "no redactions until redact runs");
+        assert!(rec.model.is_none(), "model only set via DTO projection");
     }
 
     // ─── resp_parsed 字段 skip_serializing_if = Option::is_none ─────────────
@@ -238,6 +251,26 @@ mod tests {
         assert!(
             json.contains("resp_parsed"),
             "Some resp_parsed must be present in JSON, got: {json}"
+        );
+    }
+
+    // ─── model 字段 skip_serializing_if = Option::is_none (M1) ────────────────
+    //
+    // None 不出现在 JSON (payload 精简 + 前端 `rec.model || '(unknown)'` 兜底),
+    // Some 正常携带 — round-info 弹窗 Model 行的数据源.
+
+    #[test]
+    fn model_none_omitted_some_included_in_json() {
+        let mut rec = ForwardRecord::new("POST".into(), "/p".into(), vec![], "body".into());
+        assert!(
+            !serde_json::to_string(&rec).unwrap().contains("model"),
+            "None model must be omitted from JSON"
+        );
+        rec.model = Some("gpt-model-x".into());
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(
+            json.contains(r#""model":"gpt-model-x""#),
+            "Some model must be present in JSON, got: {json}"
         );
     }
 

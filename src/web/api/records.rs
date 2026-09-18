@@ -63,6 +63,9 @@ fn build_forward_record(
         created_at: view.created_at,
         method: view.method,
         path: view.path,
+        // 请求的顶层 model (egress 视角: 路由改写生效时与 upstream_model 同值,
+        // SSOT 在 NodeView.model; 走查 M1).
+        model: view.model.as_deref().map(str::to_string),
         upstream_id: view.upstream_id.to_string(),
         upstream_model: view.upstream_model.as_deref().map(str::to_string),
         req_headers: detail.req_headers,
