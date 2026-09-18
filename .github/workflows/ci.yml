@@ -1,0 +1,73 @@
+# GitHub 镜像侧 CI — PR / master push 的绿勾信任信号 (开源门面).
+#
+# SSOT 门禁在 forgejo (`.forgejo/workflows/ci-merge.yml`, P0): 本文件是其**可移植子集**,
+# step 集与 `just check` 主链对齐, 经 just 复用 recipe (格式/脚本逻辑不双写).
+# 与 forgejo P0 的差异 (无 nix-daemon / 无持久卷 runner 的裁剪):
+#   - 无 nix-check (toml 渲染与 module eval 契约测试归 forgejo)
+#   - 无 check-file-size (rust-diff-analyzer 是 devShell lazy 工具, 不进镜像 CI)
+#   - 无 coverage / WebUI Playwright (forgejo P2 ci-periodic 档)
+#   - check-fmt 降级 rust-only (treefmt 需 nix 工具链, runner 无; 降级分支是
+#     justfile 内建的预期行为, 非 hack)
+#   - 工具链: rustup stable (rust-toolchain.toml 钉 stable; MSRV 下界 SSOT =
+#     Cargo.toml rust-version) vs forgejo 的 nixpkgs 1.96 — 两条非 Nix 贡献者路径一致.
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # just / nextest / machete / deny / ripgrep (check-contracts 依赖):
+      # 预编译二进制安装, 避免 cargo install 编译耗时.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-nextest,cargo-machete,cargo-deny,ripgrep
+
+      - name: fmt (rust-only; treefmt unavailable on this runner)
+        run: just check-fmt
+
+      - name: clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: unused deps (machete)
+        run: cargo machete
+
+      - name: docs
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
+
+      - name: WebUI inline JS syntax
+        run: just check-webui-syntax
+
+      - name: contracts.md property lint
+        run: just check-contracts
+
+      - name: clippy + tests (consistency-check feature)
+        run: just check-features
+
+      - name: tests
+        run: cargo nextest run --locked --no-fail-fast
+
+      - name: typos
+        uses: crate-ci/typos@v1
+
+      - name: deny (licenses / bans / sources, offline)
+        run: just deny-offline
