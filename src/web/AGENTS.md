@@ -63,9 +63,15 @@ POST   /api/providers/probe          body: {base_url, api_key?} →
                                           仅非法 base_url → 400; 算法在 proxy::models)
 PUT    /api/providers/probe          → 同 PUT /api/providers/{id}, 固定 id="probe"
 DELETE /api/providers/probe          → 同 DELETE /api/providers/{id}, 固定 id="probe"
-                                         (静态段优先于 {id} 参数段, 该 id 的编辑/删除只能
-                                          经此进 — 补齐前存量 "probe" 条目 405 不可管理;
-                                          新建该 id 仍被拒绝, 纯防混淆)
+                                          (静态段优先于 {id} 参数段, 该 id 的编辑/删除只能
+                                           经此进 — 补齐前存量 "probe" 条目 405 不可管理;
+                                           新建该 id 仍被拒绝, 纯防混淆)
+POST   /api/providers/{id}/pool-reset → {id, reset} — 清空该 pool 全部成员闹钟
+                                          (非 pool 条目 400 / 不存在含 decision-Disabled 404;
+                                           只动运行时内存态, 不触碰配置)
+GET    /api/providers                → pool 条目平级附加 pool_status[] (每成员
+                                          {id, active, permanent, resume_in_secs} —
+                                          PoolStates 只读派生, 非 pool 条目该字段缺席)
 
 GET    /api/api-keys
 POST   /api/api-keys
@@ -207,18 +213,35 @@ API key CRUD **无条件挂载** (在 `web::router()`, 不依赖 `auth.enabled`)
   Detect 探测推荐经 `setProtocolSelectValue` 动态 append "(experimental)" 选项
   (每次 `populateProtocolSelect()` 重建 innerHTML 恰好清掉上一次的 append, 时序:
   populate 先于 set) — 后端能力保留, 只是新建不引导.
-- 表单 `#p-kind` 是构造分野的唯一事实来源: **Direct** (Protocol / Base URL / API Key
-  字段组) vs **Router** (路由编辑器字段组 `#p-router-fields`). 切换只显隐字段组,
-  **不清空已输入内容** — Direct↔Router 来回切不丢数据 (与 #181 的字段保留语义一致).
+- 表单 `#p-kind` 是构造分野的唯一事实来源 (**三构造**: Direct / Router / Pool):
+  **Direct** (Protocol / Base URL / API Key 字段组) vs **Router** (路由编辑器字段组
+  `#p-router-fields`) vs **Pool** (成员编辑器 + exhaust 高级配置字段组
+  `#p-pool-fields`). 切换只显隐字段组, **不清空已输入内容** — Direct↔Router↔Pool
+  来回切不丢数据 (与 #181 的字段保留语义一致)。
+- **Pool 构造** (spec-pool-provider §10): 成员编辑器 = 有序 Direct provider 下拉
+  (行序 = failover 优先级, ↑/↓ 排序, 候选排除编辑对象自身 + 仅 Direct 条目, 悬空
+  成员补 "(missing)" 选项); exhaust 三通道 + cooldown 在原生 `<details>` 高级区
+  (默认折叠, 显示 "默认策略" 提示), **dirty 追踪** — 未改动不发送 (创建 → 后端
+  内置窗口限额默认表 / 编辑 → 回填旧值), 改动过才全量发送 (后端字段级替换)。
+  提交语义: Pool 分支全量发 `members` (≥1 条, 每行前端必填拦截)。
+- **构造切换的显式取消** (后端 PUT 省略 = 回填旧值的配对语义): 编辑对象是
+  router/pool 而表单构造不是时, 分别发 `routes: []` / `members: []` (后端定义的
+  "显式退出该构造" wire 语义)。
+- **列表 pool 行**: URL 列渲染成员清单 + 运行时状态徽章 (数据 = 响应的
+  `pool_status` 服务端派生字段, 前端不重算): ▸ 首个 active 成员 (当前命中,
+  列表序 pick 的前端派生) + dot 三态 (● active / ◐ 耗尽至闹钟 `until HH:MM` 或
+  剩余秒 / ○ 永久挂起 `(off)`, missing/disabled 成员); 超过 2 条折叠 + "+N more"。
+  actions 附 `reset` 按钮 (`POST /api/providers/{id}/pool-reset` 后刷新)。
+  protocol pill 显示成员 egress 去重集合 (首个成员的链尾近似)。disabled pool 行
+  纯配置展示 (无运行时数据)。
 - **路由编辑器** (#179): 每行一条 `Route` — `model_pattern` (`*` 通配) / `target`
   (下拉: 其余 provider, 排除编辑对象自身防自环; 悬空目标保留 "(missing)" option,
   编辑保存不静默丢指向) / `upstream_model` (可选, 空 = null 透传) / `priority` (整数可负,
   空输入按 0) + 启用 checkbox. **wire 无独立 enabled 字段**: 取消勾选 = 提交
   `priority: null` (路由保留但不参与匹配).
 - **提交语义**: Router 分支全量发 `routes` (≥1 条; 每行 model_pattern / target 前端必填
-  拦截, 不依赖后端 400). Direct 分支不发 `routes` — **唯一例外**: 编辑对象当前是
-  Router 时发 `routes: []` ("显式改回实体"; PUT 省略 routes 会被后端回填旧路由停留在
-  Router).
+  拦截, 不依赖后端 400). Direct 分支不发 `routes` / `members` — 构造切换的显式取消
+  例外见上方 "构造切换的显式取消" 条.
 - **Detect 协议探测** (Direct 字段组): `POST /api/providers/probe` (base_url + 当前
   api_key) 手动触发; recommended 只自动填入 `#p-protocol` (建议非命令, 用户可手改),
   另附模型 chips 预览 (MVP 深度 = 浏览 + 点击复制). dialog 每次打开清空结果区; 表单

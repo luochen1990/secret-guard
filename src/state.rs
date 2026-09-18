@@ -82,8 +82,9 @@ pub struct AppState {
     /// Pool provider (套餐池) 的进程级成员状态机: 顺序 failover pick + 耗尽
     /// 闹钟 (内存态, 不持久化 — 真相在上游, 重启重新探测). 纯数据 + 派生层
     /// store, 聚合先例同 `api_keys` / `model_lists` (state 聚合各 feature 模块
-    /// 的 store 类型); 消费点: proxy dispatch (`resolve_route` 注入 pick) 与
-    /// 响应侧耗尽检测 (T2)。契约见 `src/pool.rs` 头部。
+    /// 的 store 类型); 消费点: proxy dispatch (`resolve_route` 注入 pick) /
+    /// 响应侧耗尽检测 (T2) / web 观察面 (`list_providers` 的成员状态 +
+    /// `pool-reset`, T3)。契约见 `src/pool.rs` 头部。
     pub pools: crate::pool::PoolStates,
 }
 

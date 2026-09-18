@@ -130,6 +130,19 @@ fn router_provider(id: &str, routes: Vec<Route>) -> Provider {
     }
 }
 
+/// 套餐池 provider (spec-pool-provider): 默认 exhaust (内置窗口限额表) + cooldown 60.
+fn pool_provider(id: &str, members: &[&str]) -> Provider {
+    use secret_guard::provider::{ExhaustConfig, PoolProvider};
+    Provider {
+        kind: ProviderKind::Pool(PoolProvider {
+            members: members.iter().map(|s| s.to_string()).collect(),
+            exhaust: ExhaustConfig::default(),
+            cooldown_secs: 60,
+        }),
+        ..openai_provider(id, "https://ignored.invalid")
+    }
+}
+
 /// 路由 (带 upstream_model 改写): model_pattern 匹配的请求路由到 target 且出站 model 重写.
 fn rewrite_route(model_pattern: &str, target: &str, model: &str) -> Route {
     Route {
@@ -4036,6 +4049,385 @@ async fn providers_api_rejects_bad_base_url() {
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+// ─── providers API — pool 构造 (spec-pool-provider §10/T3) ──────────────────
+//
+// 覆盖: 创建 / Direct↔Pool↔Router 构造切换 (三态语义 + 显式空数组退出) /
+// 运行时状态观察 (pool_status 派生) / pool-reset 端点 / exhaust lint 不拒绝。
+
+/// 启动 secret-guard, 显式注入 pool 运行时状态 (预标记耗尽 — T2 响应侧挂接
+/// 未落地前的 API 观察面测试通道; AppState 构造对齐 spawn_proxy_with_prefix)。
+/// providers 的 base_url 由调用方给定 (测试不转发, 无需 mock 上游)。
+async fn spawn_proxy_with_pools(
+    providers: Vec<Provider>,
+    pools: secret_guard::pool::PoolStates,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state_path = tmp_state_path("sg-state-pool");
+    let decisions = std::sync::Arc::new(parking_lot::RwLock::new(
+        secret_guard::config::Decisions::default(),
+    ));
+    let persist_lock = std::sync::Arc::new(parking_lot::Mutex::new(()));
+    let provider_table = ProviderTable::with_persist_lock(
+        providers,
+        vec![],
+        decisions.clone(),
+        state_path.clone(),
+        persist_lock.clone(),
+    );
+    let _ = (decisions, persist_lock, state_path);
+    let proxy = AppState {
+        pools,
+        ..base_app_state(
+            reqwest::Client::new(),
+            provider_table,
+            ConversationDag::new(64, 500, 1),
+            test_secret_table(),
+        )
+    };
+    let app = server::build_router(
+        proxy,
+        secret_guard::server_host_guard::HostGuard::new("127.0.0.1", addr.port()),
+    );
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}")
+}
+
+/// 从 GET /api/providers 提取指定 id 的条目。
+async fn get_provider_entry(
+    client: &reqwest::Client,
+    proxy_url: &str,
+    id: &str,
+) -> serde_json::Value {
+    client
+        .get(format!("{proxy_url}/api/providers"))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap()["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == id)
+        .cloned()
+        .unwrap_or_else(|| panic!("provider {id} missing from list"))
+}
+
+#[tokio::test]
+async fn providers_api_pool_create_roundtrip_and_default_exhaust() {
+    let upstream = spawn_mock_upstream().await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
+    let client = reqwest::Client::new();
+
+    // 创建 pool (members 指向存量 oa-main + 一个悬空 id — 放行, 运行时 failover).
+    let resp = client
+        .post(format!("{proxy_url}/api/providers"))
+        .json(&serde_json::json!({
+            "id": "glm-pool",
+            "name": "智谱编码套餐池",
+            "members": ["oa-main", "glm-acc2"],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let created: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(created["kind"], "pool");
+    assert_eq!(
+        created["members"],
+        serde_json::json!(["oa-main", "glm-acc2"])
+    );
+    // 省略 exhaust = 内置窗口限额默认表 (字段级默认); cooldown = 60.
+    assert_eq!(created["cooldown_secs"], 60);
+    assert_eq!(
+        created["exhaust"]["codes"],
+        serde_json::json!(["1308", "1310"])
+    );
+
+    // list: pool 条目附带 pool_status (从未转发 → 全 active, 字段形状锁定).
+    let entry = get_provider_entry(&client, &proxy_url, "glm-pool").await;
+    assert_eq!(
+        entry["pool_status"],
+        serde_json::json!([
+            {"id": "oa-main", "active": true, "permanent": false, "resume_in_secs": null},
+            {"id": "glm-acc2", "active": true, "permanent": false, "resume_in_secs": null},
+        ])
+    );
+    // 非 pool 条目不带 pool_status 字段 (向后兼容 shape).
+    let direct = get_provider_entry(&client, &proxy_url, "oa-main").await;
+    assert!(direct.get("pool_status").is_none());
+}
+
+#[tokio::test]
+async fn providers_api_pool_switches_between_constructs() {
+    // 三构造切换往返 (direct↔pool 显式字段 / pool↔router 省略式 + 空数组式):
+    // M1 回归 — 省略旧构造字段 + 显式发新构造字段必须直接成立 (构造意图哨兵
+    // 抑制回填), 不得被服务端回填制造出 "双显式 400"。
+    let upstream = spawn_mock_upstream().await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
+    let client = reqwest::Client::new();
+
+    // 造第二个 Direct 条目 (成员候选; 另用悬空 id 覆盖放行语义).
+    let resp = client
+        .post(format!("{proxy_url}/api/providers"))
+        .json(&serde_json::json!({
+            "id": "oa-second",
+            "protocol": "openai",
+            "base_url": upstream.url(),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+
+    // Direct → Pool: 显式 members 即 Pool 构造 (api_key 残留发送被忽略 —
+    // Pool 构造无鉴权字段, 与 #187 Router 同型的已知丢失限制).
+    let resp = client
+        .put(format!("{proxy_url}/api/providers/oa-main"))
+        .json(&serde_json::json!({ "members": ["oa-main-2"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let entry = get_provider_entry(&client, &proxy_url, "oa-main").await;
+    assert_eq!(entry["kind"], "pool");
+
+    // Pool → Direct: members=[] 显式退出 Pool 构造 + Direct 必填字段.
+    let resp = client
+        .put(format!("{proxy_url}/api/providers/oa-main"))
+        .json(&serde_json::json!({
+            "members": [],
+            "protocol": "openai",
+            "base_url": upstream.url(),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let entry = get_provider_entry(&client, &proxy_url, "oa-main").await;
+    assert_eq!(entry["kind"], "direct");
+    assert_eq!(entry["base_url"], upstream.url());
+
+    // Direct → Router (基线路径): routes 非空.
+    let resp = client
+        .put(format!("{proxy_url}/api/providers/oa-main"))
+        .json(&serde_json::json!({
+            "routes": [{"model_pattern": "*", "target": "oa-main-2", "priority": 0}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // Router → Pool **省略式**切换 (M1 核心): 只发 members 非空, 省略 routes —
+    // 服务端不得回填旧 routes 制造双显式 400.
+    let resp = client
+        .put(format!("{proxy_url}/api/providers/oa-main"))
+        .json(&serde_json::json!({ "members": ["oa-second", "oa-ghost"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let entry = get_provider_entry(&client, &proxy_url, "oa-main").await;
+    assert_eq!(entry["kind"], "pool");
+    assert_eq!(
+        entry["members"],
+        serde_json::json!(["oa-second", "oa-ghost"])
+    );
+
+    // Pool → Router 省略式切换 (对称): 只发 routes 非空, 省略 members.
+    let resp = client
+        .put(format!("{proxy_url}/api/providers/oa-main"))
+        .json(&serde_json::json!({
+            "routes": [{"model_pattern": "gpt-*", "target": "oa-main-2", "priority": 0}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let entry = get_provider_entry(&client, &proxy_url, "oa-main").await;
+    assert_eq!(entry["kind"], "router");
+}
+
+#[tokio::test]
+async fn providers_api_pool_put_omitted_fields_preserve_old_values() {
+    // T1 遗留问题根治验证: pool 条目的 PUT 不再 400 / 静默切 Direct —
+    // 省略 members/exhaust/cooldown = 保留旧值 (dynamic 旧条目回填).
+    let upstream = spawn_mock_upstream().await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
+    let client = reqwest::Client::new();
+
+    // 创建 pool, 带自定义 exhaust + cooldown.
+    let resp = client
+        .post(format!("{proxy_url}/api/providers"))
+        .json(&serde_json::json!({
+            "id": "pl",
+            "members": ["oa-main"],
+            "exhaust": {"codes": ["1308"], "statuses": [402], "headers": []},
+            "cooldown_secs": 300,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+
+    // PUT 只改 name (省略 pool 三字段) → 构造与 exhaust/cooldown 原样保留.
+    let resp = client
+        .put(format!("{proxy_url}/api/providers/pl"))
+        .json(&serde_json::json!({ "name": "renamed" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let entry = get_provider_entry(&client, &proxy_url, "pl").await;
+    assert_eq!(
+        entry["kind"], "pool",
+        "omitted members must keep the pool construct"
+    );
+    assert_eq!(entry["name"], "renamed");
+    assert_eq!(entry["exhaust"]["codes"], serde_json::json!(["1308"]));
+    assert_eq!(entry["exhaust"]["statuses"], serde_json::json!([402]));
+    assert_eq!(entry["exhaust"]["headers"], serde_json::json!([]));
+    assert_eq!(entry["cooldown_secs"], 300);
+
+    // PUT 显式只改 members → exhaust/cooldown 仍保留 (partial PUT 语义).
+    let resp = client
+        .put(format!("{proxy_url}/api/providers/pl"))
+        .json(&serde_json::json!({ "members": ["oa-main", "another"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let entry = get_provider_entry(&client, &proxy_url, "pl").await;
+    assert_eq!(entry["members"], serde_json::json!(["oa-main", "another"]));
+    assert_eq!(entry["cooldown_secs"], 300);
+}
+
+#[tokio::test]
+async fn providers_api_pool_rejects_conflicting_and_invalid_constructs() {
+    // 基线 provider (oa-main) 挂在 proxy 上, upstream 变量本身不再使用.
+    let _upstream = spawn_mock_upstream().await;
+    let proxy_url = spawn_proxy(&_upstream.url()).await;
+    let client = reqwest::Client::new();
+
+    // members 与 routes 双显式 → 400 (sum type 单构造).
+    let resp = client
+        .post(format!("{proxy_url}/api/providers"))
+        .json(&serde_json::json!({
+            "id": "bad",
+            "members": ["oa-main"],
+            "routes": [{"model_pattern": "*", "target": "oa-main", "priority": 0}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // 自环 (member 含自身 id) → 400 (Provider::validate).
+    let resp = client
+        .post(format!("{proxy_url}/api/providers"))
+        .json(&serde_json::json!({ "id": "selfy", "members": ["selfy"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // 畸形 exhaust header 规则 → 仍 201 (lint WARN 不拒绝, 仿 mock 候选空间先例).
+    let resp = client
+        .post(format!("{proxy_url}/api/providers"))
+        .json(&serde_json::json!({
+            "id": "linty",
+            "members": ["oa-main"],
+            "exhaust": {"headers": ["no-equals-sign", "x-status=blocked"], "codes": [], "statuses": []},
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn providers_api_pool_reset_and_runtime_status_observation() {
+    // 运行时观察面 (核心价值): 预标记的耗尽状态经 list 响应回显; reset 清空
+    // 后回到全 active; 非 pool / 不存在条目的 reset 语义.
+    use std::time::Instant;
+
+    use secret_guard::provider::PoolPicker;
+
+    let members: Vec<String> = vec!["m1".into(), "m2".into()];
+    let pools = secret_guard::pool::PoolStates::new();
+    let t0 = Instant::now();
+    pools.mark_member_exhausted("pl", &members, 0, Some(t0 + Duration::from_secs(3600)));
+    pools.mark_member_exhausted("pl", &members, 1, None); // 永久 (missing/disabled 形态)
+
+    let proxy_url = spawn_proxy_with_pools(
+        vec![
+            pool_provider("pl", &["m1", "m2"]),
+            openai_provider("oa", "https://x.invalid"),
+        ],
+        pools,
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    // list: m1 耗尽 (剩余 ~3600s), m2 永久挂起.
+    let entry = get_provider_entry(&client, &proxy_url, "pl").await;
+    let st = entry["pool_status"].as_array().unwrap();
+    assert_eq!(st[0]["id"], "m1");
+    assert_eq!(st[0]["active"], false);
+    assert_eq!(st[0]["permanent"], false);
+    let secs = st[0]["resume_in_secs"].as_u64().unwrap();
+    assert!(
+        (3595..=3600).contains(&secs),
+        "resume_in_secs ≈ 3600, got {secs}"
+    );
+    assert_eq!(st[1]["active"], false);
+    assert_eq!(st[1]["permanent"], true);
+    assert_eq!(st[1]["resume_in_secs"], serde_json::Value::Null);
+
+    // reset: 200 + ack; 之后 list 全 active.
+    let resp = client
+        .post(format!("{proxy_url}/api/providers/pl/pool-reset"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let ack: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(ack["id"], "pl");
+    assert_eq!(ack["reset"], true);
+
+    let entry = get_provider_entry(&client, &proxy_url, "pl").await;
+    let st = entry["pool_status"].as_array().unwrap();
+    assert!(
+        st.iter().all(|s| s["active"] == true),
+        "reset clears all alarms"
+    );
+
+    // 非 pool 条目 → 400; 不存在 → 404; reset 幂等 (重复调用仍 200).
+    let resp = client
+        .post(format!("{proxy_url}/api/providers/oa/pool-reset"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let resp = client
+        .post(format!("{proxy_url}/api/providers/nope/pool-reset"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    let resp = client
+        .post(format!("{proxy_url}/api/providers/pl/pool-reset"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
 }
 
 // ─── providers probe API (POST /api/providers/probe) ─────────────────────

@@ -1,12 +1,13 @@
 //! providers CRUD: `GET/POST/PUT/DELETE /providers[/{id}]` + `PATCH /{id}/decision`
 //! + `POST /providers/probe` (协议自动探测) + `PUT/DELETE /providers/probe`
-//!   (存量 id="probe" 条目的管理薄 wrapper, 见 [`update_provider_probe`]).
+//!   (存量 id="probe" 条目的管理薄 wrapper, 见 [`update_provider_probe`])
+//! + `POST /providers/{id}/pool-reset` (套餐池成员闹钟清空).
 //!
 //! 从 api.rs 单文件拆出 (见 #146 残留 1). CRUD 流程骨架在 [`super::crud`]
 //! (泛型, 与 secrets 共享), 本文件只承载 provider 特有的 entry 构造 / api_key
-//! 保留逻辑 / 列表附加字段 (protocols/shorts). probe 是薄壳: 校验 base_url 后
-//! 调 `crate::proxy::probe_provider_upstream` (探测算法 SSOT 在 proxy 层, 与
-//! 上游模型清单 fetch 同乡).
+//! 保留逻辑 / 列表附加字段 (protocols/shorts/pool 运行时状态). probe 是薄壳:
+//! 校验 base_url 后调 `crate::proxy::probe_provider_upstream` (探测算法 SSOT 在
+//! proxy 层, 与上游模型清单 fetch 同乡).
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -15,15 +16,49 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::DynamicEntry;
 use crate::config::OverrideMode;
-use crate::provider::{EffectiveProvider, Protocol, Provider, ProviderMasked};
+use crate::pool::MemberStatusView;
+use crate::provider::{
+    EffectiveProvider, EffectiveProviderKind, ExhaustConfig, Protocol, Provider, ProviderMasked,
+};
 use crate::state::{AppState, NO_STORE};
 
 use super::crud::{Created, DecisionRequest, decision_flow};
 use super::crud::{create_flow, delete_flow, update_flow};
 use super::error::ApiError;
 
+/// list 响应的单个条目: [`EffectiveProvider`] + pool 条目的**运行时观察面**
+/// (平级附加字段, 非 EffectiveProvider 本体 — static/dynamic 版本走
+/// [`ProviderMasked`], 无运行时语义, 不附着)。非 pool 条目该字段缺席
+/// (`skip_serializing_if`, 向后兼容 — 旧客户端 shape 不变)。GET 不泄漏原则
+/// 天然满足: 只有成员 id 与时刻/秒数, 无敏感值 (SEC-1)。
+#[derive(Serialize)]
+pub(crate) struct ProviderListItem {
+    #[serde(flatten)]
+    effective: EffectiveProvider,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pool_status: Option<Vec<MemberStatusView>>,
+}
+
 pub async fn list_providers(State(state): State<AppState>) -> impl IntoResponse {
-    let providers: Vec<EffectiveProvider> = state.providers.effective_snapshot();
+    let providers: Vec<ProviderListItem> = state
+        .providers
+        .effective_snapshot()
+        .into_iter()
+        .map(|p| {
+            // pool 条目附加每成员运行时状态 (核心价值: 用户要看 "现在打到哪份
+            // 套餐/谁耗尽了")。member_status 只读无副作用 (GET 语义, 见其 doc)。
+            let pool_status = match &p.kind {
+                EffectiveProviderKind::Pool { members, .. } => {
+                    Some(state.pools.member_status(&p.id, members))
+                }
+                _ => None,
+            };
+            ProviderListItem {
+                effective: p,
+                pool_status,
+            }
+        })
+        .collect();
     // decision=Disabled 的条目不在 effective view (CFG-1), 单独附上 masked 视图,
     // 让前端能渲染灰行 + 提供切回入口 (SEC: 必须经 ProviderMasked 脱敏, 不回明文).
     let disabled: Vec<ProviderMasked> = state
@@ -95,8 +130,8 @@ pub async fn update_provider(
         "provider",
         &id,
         || {
-            // api_key / api_key_file / routes 缺省时保留旧值 (避免 WebUI 编辑表单
-            // 留空意外清空既有配置). 语义: payload None = 保留; Some = 显式覆盖
+            // api_key / api_key_file / routes / members 缺省时保留旧值 (避免 WebUI
+            // 编辑表单留空意外清空既有配置). 语义: payload None = 保留; Some = 显式覆盖
             // (static 基线下空串的清空语义有已知限制, 见下方 api_key 字段注释).
             //
             // #157 关键: 鉴权字段只从 **dynamic 原始条目** (get_dynamic) 回填,
@@ -105,9 +140,9 @@ pub async fn update_provider(
             // (None), effective 解析时由 `Provider::inherit_from_static` 回落
             // static (转发仍带旧 key, 行为不变).
             //
-            // routes 回填则**可以**走 get_effective 兜底 (与 #190 protocol 回填
-            // 同模式): routes 非敏感, 无明文落盘顾虑 — static router 条目的
-            // PUT 即首次 override 场景也能 "省略 = 保留".
+            // routes / members / exhaust / cooldown 回填则**可以**走 get_effective
+            // 兜底 (与 #190 protocol 回填同模式): 均非敏感, 无明文落盘顾虑 —
+            // static 条目的 PUT 即首次 override 场景也能 "省略 = 保留".
             //
             // 假设: 本地单用户场景, get_dynamic 与 upsert_dynamic 之间无并发修改.
             // 多用户/并发编辑场景下存在 TOCTOU (旧值可能过期), 但仅导致配置不一致, 无安全影响.
@@ -115,10 +150,20 @@ pub async fn update_provider(
             // 限制: 若 payload 显式提供 api_key (或 api_key_file), 另一字段仍从旧值保留,
             // 可能触发互斥校验报错 (例如旧值有 api_key, 新传 api_key_file). WebUI 不暴露
             // api_key_file 输入, 仅 SDK 直接调用可能触发, 影响低.
+            //
+            // 构造意图哨兵: payload 显式非空 members / routes = 显式 Pool / Router
+            // 构造决策 — 此时**不回填对方构造的字段** (旧值属于另一构造; 回填会
+            // 把服务端自己制造的数据伪装成调用方的 "双显式" 而 400, 错误归因错位)。
+            // 省略旧构造字段 + 显式发新构造字段 = 构造切换 (router↔pool 两个方向),
+            // 与 Direct 意图 PUT 的静默停留行为对齐。
+            let explicit_pool = payload.members.as_ref().is_some_and(|m| !m.is_empty());
+            let explicit_router = payload.routes.as_ref().is_some_and(|rs| !rs.is_empty());
             if let Some(old) = state.providers.get_dynamic(&id) {
                 // "保留旧值" 回填, 按旧值的构造分派 (sum type 同构, #187):
-                // Direct 旧值 → 鉴权字段回填; Router 旧值 → routes 回填.
-                // 显式清空/切换由 WebUI 发空 routes 数组 / 完整字段表达 (见下方字段注释).
+                // Direct 旧值 → 鉴权字段回填; Router 旧值 → routes 回填;
+                // Pool 旧值 → members/exhaust/cooldown_secs 三字段回填 (均非
+                // 敏感, 无 #157 明文落盘顾虑)。显式清空/切换由 WebUI 发空数组
+                // (routes=[] / members=[]) 表达 (见下方字段注释)。
                 match &old.kind {
                     crate::provider::ProviderKind::Direct(d) => {
                         if payload.api_key.is_none() {
@@ -131,27 +176,23 @@ pub async fn update_provider(
                                 .map(|p| p.to_string_lossy().into_owned());
                         }
                     }
+                    // 哨兵语义 (explicit_pool / explicit_router) 见 helper doc.
                     crate::provider::ProviderKind::Router(r) => {
-                        // payload 省略 (None) = 保留旧路由; 显式发空数组 = 改回
-                        // Direct 意图. 守卫对象是 payload 的显式新值 (客户端发新
-                        // 路由时不被旧值覆盖).
-                        if payload.routes.is_none() {
-                            payload.routes = Some(r.routes.clone());
-                        }
+                        payload.backfill_routes(&r.routes, explicit_pool);
                     }
-                    // Pool 旧值暂无回填字段 (UpsertProviderRequest 的 pool 构造
-                    // 字段 members/exhaust/cooldown_secs 属 T3 — WebUI/API 面
-                    // 扩展任务); 此处显式声明而非 `_` 通配, T3 落地时补回填.
-                    crate::provider::ProviderKind::Pool(_) => {}
+                    crate::provider::ProviderKind::Pool(p) => {
+                        payload.backfill_pool(p, explicit_router);
+                    }
                 }
             }
-            // routes 回填兜底 + protocol 回填共用**一次** effective 快照 (单次取锁
-            // + merge, 也消除两次快照间的漂移窗口). 两分支按 kind 变体互斥分派:
-            // effective 是 Router 时只有 routes 分支可能命中, 是 Direct 时只有
-            // protocol 分支可能命中.
+            // routes 回填兜底 + protocol 回填 + pool 三字段回填兜底共用**一次**
+            // effective 快照 (单次取锁 + merge, 也消除两次快照间的漂移窗口)。
+            // 各分支按 kind 变体互斥分派: effective 是 Router 时只有 routes 分支
+            // 可能命中, 是 Direct 时只有 protocol 分支可能命中, 是 Pool 时只有
+            // pool 分支可能命中。
             //
             // routes 回填兜底: dynamic 无旧条目 (PUT 即首次 override) 时触发;
-            // rationale (非敏感, "省略 = 保留") 见上方闭包注释.
+            // rationale (非敏感, "省略 = 保留") 见上方闭包注释。
             //
             // protocol 回填 (#190 保留语义): 从 **effective** 的 Direct 负载回填 —
             // 覆盖 static-only 条目 (get_dynamic 无旧值的场景)。非敏感字段, 无
@@ -159,12 +200,21 @@ pub async fn update_provider(
             // protocol (无此字段), 回填了也会被 into_provider 忽略, 故无需按
             // router 意图守卫; effective 为 Router 时无 Direct 负载可挖 → 不回填,
             // 也不报错。
+            //
+            // pool 回填兜底 (T3, 同 routes rationale): static pool 条目的 PUT 即
+            // 首次 override 场景; exhaust/cooldown 逐字段回填 — 即便 payload
+            // 显式发了新 members 也保留未触及字段 (partial PUT, 防 "改个成员把
+            // 自定义 exhaust 静默重置回默认表")。显式退出 Pool 构造由 members=[]
+            // 表达; 哨兵语义同 dynamic 层 (helper doc)。
             match state.providers.get_effective(&id).map(|e| e.kind) {
-                Some(crate::provider::ProviderKind::Router(r)) if payload.routes.is_none() => {
-                    payload.routes = Some(r.routes);
+                Some(crate::provider::ProviderKind::Router(r)) => {
+                    payload.backfill_routes(&r.routes, explicit_pool);
                 }
                 Some(crate::provider::ProviderKind::Direct(d)) if payload.protocol.is_none() => {
                     payload.protocol = Some(d.protocol);
+                }
+                Some(crate::provider::ProviderKind::Pool(p)) => {
+                    payload.backfill_pool(&p, explicit_router);
                 }
                 _ => {}
             }
@@ -236,6 +286,40 @@ pub async fn set_provider_decision(
     Ok((StatusCode::OK, NO_STORE, Json(ack)))
 }
 
+/// `POST /api/providers/{id}/pool-reset`: 清空该 pool 全部成员闹钟 (用户动作:
+/// 知道续费了/换窗了, 想立即恢复探测 — 不等闹钟自然到期)。
+///
+/// - 条目不存在 (含 decision=Disabled — effective 视图排除, 与 update_flow 的
+///   存在性口径一致) → 404; 非 Pool 构造 → 400。
+/// - reset 幂等且只动运行时内存态 (`PoolStates::reset`), 不触碰配置/落盘。
+/// - ack 是轻量确认; 前端随后刷新列表取新的成员状态 (GET 派生)。
+pub async fn pool_reset(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Some(entry) = state.providers.get_effective(&id) else {
+        return Err(ApiError::not_found(format!("provider {id} not found")));
+    };
+    let crate::provider::ProviderKind::Pool(_) = entry.kind else {
+        return Err(ApiError::validation(format!(
+            "provider '{id}' is not a pool provider"
+        )));
+    };
+    state.pools.reset(&id);
+    Ok((
+        StatusCode::OK,
+        NO_STORE,
+        Json(PoolResetAck { id, reset: true }),
+    ))
+}
+
+/// [`pool_reset`] 的 ack 响应 (轻量 — 状态明细走随后的 GET /api/providers)。
+#[derive(Serialize)]
+struct PoolResetAck {
+    id: String,
+    reset: bool,
+}
+
 /// `POST /api/providers/probe` 的请求 body.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ProbeRequest {
@@ -266,7 +350,7 @@ pub async fn probe_provider(
 
 #[derive(Serialize)]
 pub(crate) struct ListProvidersResponse {
-    pub providers: Vec<EffectiveProvider>,
+    pub providers: Vec<ProviderListItem>,
     /// decision=Disabled 的 static 条目 (masked). effective view 排除它们 (CFG-1),
     /// 此数组让前端可见并提供 decision 切回入口.
     pub disabled: Vec<ProviderMasked>,
@@ -318,19 +402,70 @@ pub(crate) struct UpsertProviderRequest {
     /// - 省略 (None): 保留旧值 (PUT) — 优先从 dynamic 旧条目回填, 无则从
     ///   effective 回填 (routes 非敏感, 无 #157 落盘顾虑); 两者皆非 Router 时不
     ///   回填 → Direct 构造.
-    /// - 空数组 `[]`: 显式 **Direct 构造** (改回实体 provider — 与旧 route_to ""
-    ///   的 "改回实体" 语义同构).
+    /// - 空数组 `[]`: 显式 **退出 Router 构造** (改回实体 provider — 与旧
+    ///   route_to "" 的 "改回实体" 语义同构).
     /// - 非空数组: **Router 构造** (悬空目标放行, 运行时 503).
     ///
     /// 路由的 enabled 开关由 `priority: null` 表达 (wire 无独立 enabled 字段)。
     /// 成环 (含自环) 在 validate/upsert 钩子拒绝 (400).
     #[serde(default)]
     pub routes: Option<Vec<crate::provider::Route>>,
+    /// Pool 成员列表 (T3; 三态语义与 `routes` 先例逐字同构):
+    /// - 省略 (None): 保留旧值 (PUT) — 优先从 dynamic 旧条目回填, 无则从
+    ///   effective 回填 (非敏感, 无 #157 落盘顾虑); 两者皆非 Pool 时不回填 →
+    ///   Direct/Router 构造.
+    /// - 空数组 `[]`: 显式**退出 Pool 构造** (与 routes=[] 的 "改回实体" 语义
+    ///   同构 — 编辑 pool 条目切到 Direct/Router 时 WebUI 发空数组取消旧构造).
+    /// - 非空数组: **Pool 构造** (悬空/重复成员放行 — 运行时 pick 永久标记 +
+    ///   failover; 自环/非法 id 在 validate 拒绝).
+    ///
+    /// **构造切换**: 显式非空 `members` + 省略 `routes` = router→pool 切换
+    /// (构造意图哨兵抑制对方构造字段的回填, 见 update_provider); 反向同理。
+    /// 调用方**真实**同时显式非空 members 与 routes → 400 (sum type 单构造,
+    /// 双显式是调用方错误). Direct/Router 构造下残留发送被静默忽略.
+    #[serde(default)]
+    pub members: Option<Vec<String>>,
+    /// 耗尽信号配置 (三通道 OR). 省略 (None) = 保留旧值 (PUT) / 内置窗口限额
+    /// 默认表 (POST 创建); 显式值 = 整体替换 (**字段级替换**语义, 见
+    /// [`ExhaustConfig`] — 空通道 = 显式关闭). 仅 Pool 构造消费, 其余构造残留
+    /// 发送被忽略. 畸形 header 规则在 validate 钩子 WARN (不拒绝).
+    #[serde(default)]
+    pub exhaust: Option<ExhaustConfig>,
+    /// 兜底闹钟时长 (秒). 三态语义同 `exhaust` (None = 保留旧值 / 默认 60).
+    #[serde(default)]
+    pub cooldown_secs: Option<u64>,
     #[serde(default = "crate::provider::default_true")]
     pub enabled: bool,
 }
 
 impl UpsertProviderRequest {
+    /// routes 回填: None = 保留旧值。`explicit_pool` (payload 显式非空 members =
+    /// Pool 构造意图) 哨兵抑制回填 — 省略式构造切换 (router→pool) 不被旧 routes
+    /// 补成 "双显式 400" (错误归因错位, 见 update_provider 闭包注释)。
+    /// dynamic / effective 两层回填共用 (同语义不变量的结构保证, 两层调用点
+    /// 不再各自内联判卫)。
+    fn backfill_routes(&mut self, routes: &[crate::provider::Route], explicit_pool: bool) {
+        if self.routes.is_none() && !explicit_pool {
+            self.routes = Some(routes.to_vec());
+        }
+    }
+
+    /// Pool 三字段回填: None = 保留旧值。members 受 `explicit_router` 哨兵
+    /// (省略式 pool→router 切换不回填 members, 同 [`Self::backfill_routes`]);
+    /// exhaust/cooldown 属 Pool 构造, 对方构造不消费, 恒回填无害。dynamic /
+    /// effective 两层共用。
+    fn backfill_pool(&mut self, p: &crate::provider::PoolProvider, explicit_router: bool) {
+        if self.members.is_none() && !explicit_router {
+            self.members = Some(p.members.clone());
+        }
+        if self.exhaust.is_none() {
+            self.exhaust = Some(p.exhaust.clone());
+        }
+        if self.cooldown_secs.is_none() {
+            self.cooldown_secs = Some(p.cooldown_secs);
+        }
+    }
+
     fn into_provider(self) -> Result<Provider, ApiError> {
         if let Some(id) = &self.id
             && !id.is_empty()
@@ -339,14 +474,37 @@ impl UpsertProviderRequest {
             return Err(ApiError::validation(e));
         }
         // 结构校验 (base_url / 路由字段 / 自环 / api_key 互斥) 收口在 crud 钩子的
-        // `Provider::validate` (见 validate_provider_upsert), 此处只做字段变换:
-        // 空数组 routes = 显式改回实体 ("路由 → 实体", 与旧 route_to "" 语义同构).
-        // Router 构造不消费 protocol (无此字段) — 残留发送被静默忽略.
-        let kind = match self.routes.filter(|rs| !rs.is_empty()) {
-            Some(routes) => {
+        // `Provider::validate` (见 validate_provider_upsert), 此处只做字段变换。
+        // 构造判别 (sum type, 单构造): 显式非空 members → Pool; 显式非空 routes
+        // → Router; 双显式 = 调用方错误 (400); 其余 → Direct (protocol 必填)。
+        // 空数组 = 显式取消该构造 (routes=[] / members=[] 同构语义, 见字段注释),
+        // 落到 Direct/Router 判定。构造不消费的字段残留发送被静默忽略 (同
+        // protocol 在 Router 下的先例)。
+        let kind = match (
+            self.members.filter(|m| !m.is_empty()),
+            self.routes.filter(|rs| !rs.is_empty()),
+        ) {
+            (Some(_), Some(_)) => {
+                return Err(ApiError::validation(
+                    "cannot specify both 'members' (pool) and 'routes' (router) — pick one construct",
+                ));
+            }
+            (Some(members), None) => {
+                crate::provider::ProviderKind::Pool(crate::provider::PoolProvider {
+                    members,
+                    // 缺省 = 内置窗口限额默认表 (ExhaustConfig::default) / 60s —
+                    // update 路径的 "保留旧值" 已在上游回填, 到这里的 None 只剩
+                    // 创建/切换构造场景, 取默认即正确语义.
+                    exhaust: self.exhaust.unwrap_or_default(),
+                    cooldown_secs: self
+                        .cooldown_secs
+                        .unwrap_or_else(crate::provider::default_pool_cooldown_secs),
+                })
+            }
+            (None, Some(routes)) => {
                 crate::provider::ProviderKind::Router(crate::provider::RouterProvider { routes })
             }
-            None => {
+            (None, None) => {
                 let protocol = self.protocol.ok_or_else(|| {
                     ApiError::validation("protocol is required for direct providers")
                 })?;

@@ -16,6 +16,9 @@
 //! 2. **[`detect_exhaustion`]**: 判定一次上游响应是否为 "成员所属凭证的
 //!    窗口限额耗尽" (三通道 OR: HTTP status / body 码 / response header),
 //!    并尽力解析恢复时刻。纯函数, ROB-*: 对任意字节输入零 panic。
+//! 3. **观察面** ([`PoolStates::member_status`] / [`PoolStates::reset`]): WebUI
+//!    的运行时状态查询 (每成员 active / 永久挂起 / 剩余秒, 只读无副作用) 与
+//!    手动清闹钟 (续费/换窗后立即恢复)。纯数据派生, 无新状态。
 //!
 //! # 内置默认信号表 (窗口限额语义域, SSOT 引用)
 //!
@@ -53,6 +56,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::http::{HeaderMap, HeaderName, StatusCode};
 use parking_lot::RwLock;
+use serde::Serialize;
 
 use crate::provider::{AllMembersExhausted, ExhaustConfig, PoolHop, PoolPicker, PoolProvider};
 
@@ -71,7 +75,7 @@ pub enum MemberSlot {
 /// 一个 pool 的运行时状态: slots 与配置 members 按位置对齐。`member_ids`
 /// 记忆对齐基准 — "同位置同 id 的耗尽状态保留, id 变了视为新成员" 需要
 /// 逐位置比较 id (只存 slots 无法区分 "改配置" 与 "闹钟语义")。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct PoolRuntime {
     member_ids: Vec<String>,
     slots: Vec<MemberSlot>,
@@ -144,6 +148,63 @@ impl PoolStates {
         align_runtime(rt, members);
         f(rt)
     }
+
+    /// 只读观察快照 (T3 WebUI 派生源): 该 pool 全部成员的运行时状态, 与
+    /// `members` 配置快照按位置对齐 (复用 pick/mark 的对齐语义, 但**只读** —
+    /// 无运行时状态的 pool 返回全 Active 视图且**不创建条目**, GET 无副作用;
+    /// 实现取读锁 clone 后在锁外对齐, 不污染共享状态)。闹钟已过的 slot 观察
+    /// 为 active (与 pick 顺带清除后的行为一致 — 观察不代跑 pick)。
+    ///
+    /// 纯数据, 无敏感值 (只有成员 id 与时刻, SEC-1 天然满足)。
+    pub fn member_status(&self, pool_id: &str, members: &[String]) -> Vec<MemberStatusView> {
+        let mut rt = {
+            let guard = self.inner.read();
+            match guard.get(pool_id) {
+                Some(rt) => rt.clone(),
+                None => {
+                    // 从未转发 / 已 reset: 与 fresh 一致的全 Active 视图, 不插入.
+                    return members
+                        .iter()
+                        .map(|id| MemberStatusView::active(id))
+                        .collect();
+                }
+            }
+        };
+        align_runtime(&mut rt, members);
+        let now = Instant::now();
+        rt.slots
+            .iter()
+            .zip(members)
+            .map(|(slot, id)| match *slot {
+                MemberSlot::Active => MemberStatusView::active(id),
+                MemberSlot::Exhausted { until: None } => MemberStatusView {
+                    id: id.clone(),
+                    active: false,
+                    permanent: true,
+                    resume_in_secs: None,
+                },
+                MemberSlot::Exhausted { until: Some(t) } if t > now => MemberStatusView {
+                    id: id.clone(),
+                    active: false,
+                    permanent: false,
+                    // 向上取整 (div_ceil): 毫秒级残余不显示为 0s (用户视角
+                    // "还剩不到 1s" 无意义), 整秒不虚加.
+                    resume_in_secs: Some(((t - now).as_millis() as u64).div_ceil(1000)),
+                },
+                // 闹钟已过 (t <= now): 观察为可用, 不代跑 pick 的清除.
+                MemberSlot::Exhausted { .. } => MemberStatusView::active(id),
+            })
+            .collect()
+    }
+
+    /// 清空该 pool 全部成员闹钟 (T3 reset 端点的状态侧语义: 用户知道续费了/
+    /// 换窗了, 想立即恢复探测)。幂等: 丢弃整条运行时状态, 下次 pick 以全
+    /// Active 重建 — 语义等价 "从未耗尽"。missing/disabled 成员的永久标记
+    /// 同样被清 (若成员仍 missing, 下次解析时被 resolve_route 重新标记 —
+    /// per-request 标记语义自洽, 无泄漏窗口)。
+    pub fn reset(&self, pool_id: &str) {
+        self.inner.write().remove(pool_id);
+    }
 }
 
 impl MemberSlot {
@@ -152,6 +213,32 @@ impl MemberSlot {
         match *self {
             MemberSlot::Active => None,
             MemberSlot::Exhausted { until } => until,
+        }
+    }
+}
+
+/// 单个成员的运行时观察视图 ([`PoolStates::member_status`] 的产物, WebUI list
+/// 的 pool 状态徽章数据源)。纯数据 — 只有成员 id 与时刻/秒数, 无敏感值
+/// (SEC-1 天然满足, 勿在此类型上附加任何 secret 相关字段)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MemberStatusView {
+    /// 成员 id (与配置 members 按位置对齐)。
+    pub id: String,
+    /// 当前可用 (Active, 或闹钟已过 — 与 pick 顺带清除语义一致)。
+    pub active: bool,
+    /// 永久挂起 (missing/disabled 成员, until=None; `active` 恒 false)。
+    pub permanent: bool,
+    /// 距恢复闹钟的剩余秒 (向上取整); `None` = active 或永久挂起。
+    pub resume_in_secs: Option<u64>,
+}
+
+impl MemberStatusView {
+    fn active(id: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            active: true,
+            permanent: false,
+            resume_in_secs: None,
         }
     }
 }
@@ -1094,6 +1181,79 @@ mod tests {
         let m = members(&["a"]);
         pools.mark_member_exhausted("pl", &m, 7, Some(Instant::now()));
         assert_eq!(slots_of(&pools, "pl"), vec![MemberSlot::Active]);
+    }
+
+    // ─── 观察面: member_status / reset (T3 WebUI 派生源) ─────────────────────
+
+    #[test]
+    fn member_status_absent_pool_returns_all_active_without_insert() {
+        // 从未转发的 pool: 全 Active 视图, 且查询无副作用 (不创建运行时条目 —
+        // GET 语义; 内部 map 保持空, 反复查询不膨胀).
+        let pools = PoolStates::new();
+        let m = members(&["a", "b"]);
+        let st = pools.member_status("pl", &m);
+        assert_eq!(
+            st,
+            vec![MemberStatusView::active("a"), MemberStatusView::active("b")]
+        );
+        assert!(pools.inner.read().is_empty(), "GET must not create state");
+    }
+
+    #[test]
+    fn member_status_maps_exhausted_permanent_and_expired_alarm() {
+        // 三态映射: 耗尽(闹钟) → active=false + resume_in_secs ≈ 剩余秒;
+        // 永久 → permanent; 闹钟已过 → 观察 active (pick 顺带清除的同义观察).
+        let pools = PoolStates::new();
+        let m = members(&["a", "b", "c"]);
+        let t0 = Instant::now();
+        pools.mark_member_exhausted("pl", &m, 0, Some(t0 + Duration::from_secs(3600)));
+        pools.mark_member_exhausted("pl", &m, 1, None);
+        pools.mark_member_exhausted(
+            "pl",
+            &m,
+            2,
+            t0.checked_sub(Duration::from_secs(1)), // 早已过期的闹钟
+        );
+        let st = pools.member_status("pl", &m);
+        assert_eq!(st[0].id, "a");
+        assert!(!st[0].active && !st[0].permanent);
+        assert_eq!(st[0].resume_in_secs, Some(3600), "ceil to full seconds");
+        assert!(!st[1].active && st[1].permanent && st[1].resume_in_secs.is_none());
+        assert_eq!(st[2], MemberStatusView::active("c"));
+    }
+
+    #[test]
+    fn member_status_aligns_with_current_config_members() {
+        // 对齐语义与 pick 同源: 同位置同 id 保留耗尽状态, id 变更 → 新成员
+        // Active (观察视图跟随配置, 不残留旧位置的耗尽).
+        let pools = PoolStates::new();
+        let m0 = members(&["a", "b"]);
+        pools.mark_member_exhausted("pl", &m0, 0, None);
+        let m1 = members(&["a", "c"]);
+        let st = pools.member_status("pl", &m1);
+        assert!(
+            !st[0].active && st[0].permanent,
+            "same-position same-id keeps state"
+        );
+        assert_eq!(st[1], MemberStatusView::active("c"));
+    }
+
+    #[test]
+    fn reset_clears_all_member_alarms_and_is_idempotent() {
+        // reset = 丢弃整条运行时状态: 全部成员回到 Active (含永久标记);
+        // 重复 reset 无副作用; 丢弃后 pick 立即回到列表头成员.
+        let pools = PoolStates::new();
+        let m = members(&["a", "b"]);
+        let t0 = Instant::now();
+        pools.mark_member_exhausted("pl", &m, 0, Some(t0 + Duration::from_secs(999)));
+        pools.mark_member_exhausted("pl", &m, 1, None);
+        pools.reset("pl");
+        assert_eq!(
+            pools.member_status("pl", &m),
+            vec![MemberStatusView::active("a"), MemberStatusView::active("b")]
+        );
+        pools.reset("pl"); // 幂等: 不存在条目时 remove 是 no-op.
+        assert_eq!(pools.pick_member("pl", &m, t0).unwrap(), 0);
     }
 
     // ─── 配置对齐重建 ─────────────────────────────────────────────────────

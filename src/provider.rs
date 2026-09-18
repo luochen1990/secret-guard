@@ -290,8 +290,9 @@ pub const DEFAULT_WINDOW_EXHAUST_HEADERS: [&str; 2] = [
 ];
 
 /// serde default: `PoolProvider::cooldown_secs` = 60s (信号无精确恢复时刻的
-/// 兜底闹钟时长).
-fn default_pool_cooldown_secs() -> u64 {
+/// 兜底闹钟时长). pub: web upsert 的 Pool 构造 (`UpsertProviderRequest`) 缺省
+/// 回填与此共享同一 SSOT (先例同 `default_true`).
+pub fn default_pool_cooldown_secs() -> u64 {
     60
 }
 
@@ -365,6 +366,31 @@ impl Default for ExhaustConfig {
             codes: default_window_exhaust_codes(),
             headers: default_window_exhaust_headers(),
         }
+    }
+}
+
+impl ExhaustConfig {
+    /// 配置期 lint: headers 通道中畸形的规则条目 — 检测器
+    /// (`crate::pool::header_rule_matches`) 对这类条目 ROB 静默跳过, 用户手滑
+    /// 写错会表现为 "该通道永远不命中" 而无任何线索。此处让脏条目在写入时
+    /// WARN 可见 (仿 `MockStrategy::lint_candidate_space` 先例: WARN 不 reject —
+    /// 合法但高危的配置是用户意图, 不替用户决策)。畸形判定与检测器的跳过集
+    /// 对齐 (无 `=` / `=` 前空 name / 非法 header name 字节); 返回**原始条目**
+    /// (与配置文件可 grep 对齐), 空 = 干净; 空白条目跳过不报 (等价关闭该条,
+    /// 无歧义)。
+    pub fn lint_malformed_header_rules(&self) -> Vec<&str> {
+        self.headers
+            .iter()
+            .filter(|s| {
+                let trimmed = s.trim();
+                !trimmed.is_empty()
+                    && trimmed.split_once('=').is_none_or(|(name, _)| {
+                        name.trim().is_empty()
+                            || axum::http::HeaderName::from_bytes(name.trim().as_bytes()).is_err()
+                    })
+            })
+            .map(|s| s.as_str())
+            .collect()
     }
 }
 
@@ -573,6 +599,20 @@ impl DynamicEntry for Provider {
                 }
                 // 重复成员不拒绝: 同一 provider 出现两次, 第二次 pick 到它时
                 // 它已被标记耗尽, 行为无歧义 (与 Router 平行路由边先例一致).
+                //
+                // 配置期 lint (WARN 不 reject, 仿 `MockStrategy::lint_candidate_space`
+                // 先例): 畸形 header 规则在检测器里被 ROB 静默跳过, 此处让手滑在
+                // 写入时可见。validate 是所有 entry 进入系统的公共 choke point
+                // (static 加载 / dynamic 加载 / WebUI upsert 都经过), 与 secrets 的
+                // validate_and_resolve lint 挂点同型。
+                let malformed = p.exhaust.lint_malformed_header_rules();
+                if !malformed.is_empty() {
+                    tracing::warn!(
+                        provider_id = %self.id,
+                        rules = ?malformed,
+                        "pool exhaust header rules are malformed (expected 'name=value'); they will never match"
+                    );
+                }
             }
         }
         Ok(())
@@ -2904,6 +2944,57 @@ mod tests {
         assert!(pool("pl", &["has space"]).validate().is_err());
         // 合法: 重复成员不拒绝 (第二次 pick 到时已耗尽, 行为无歧义).
         assert!(pool("pl", &["a", "a"]).validate().is_ok());
+    }
+
+    #[test]
+    fn exhaust_lint_flags_malformed_header_rules_only() {
+        // lint 只抓 "永远不命中" 的畸形条目 (无 '=' / 空 name / 非法 header name
+        // 字节 — 与检测器 header_rule_matches 的跳过集对齐); 合法条目与空白条目
+        // (等价关闭, 无歧义) 不报。上报**原始条目** (含周边空白, 与配置文件可
+        // grep 对齐)。WARN 不 reject: validate 仍 Ok。
+        let clean = ExhaustConfig {
+            headers: vec![
+                "x-status=blocked".into(),
+                "anthropic-ratelimit-unified-5h-status = blocked".into(), // 双侧容忍空白
+                "   ".into(),                                             // 空白条目跳过
+            ],
+            ..ExhaustConfig::default()
+        };
+        assert!(clean.lint_malformed_header_rules().is_empty());
+        assert!(pool("pl", &["a"]).validate().is_ok());
+
+        let dirty = ExhaustConfig {
+            headers: vec![
+                "no-equals-sign".into(),
+                "=empty-name".into(),
+                " =also-empty".into(),
+                "bad name[]=v".into(), // 非法 header name 字节 (空格/方括号)
+                "x-status=blocked".into(),
+            ],
+            ..ExhaustConfig::default()
+        };
+        let malformed = dirty.lint_malformed_header_rules();
+        assert_eq!(
+            malformed,
+            vec![
+                "no-equals-sign",
+                "=empty-name",
+                " =also-empty",
+                "bad name[]=v"
+            ]
+        );
+        // lint 不影响 validate 结论 (WARN 通道, 非 reject).
+        let prov = Provider {
+            id: "pl".into(),
+            enabled: true,
+            name: None,
+            kind: ProviderKind::Pool(PoolProvider {
+                members: vec!["a".into()],
+                exhaust: dirty,
+                cooldown_secs: default_pool_cooldown_secs(),
+            }),
+        };
+        assert!(prov.validate().is_ok());
     }
 
     #[test]

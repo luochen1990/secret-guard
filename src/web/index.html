@@ -548,6 +548,58 @@
       color: var(--fg-muted);
       font-size: 11px;
     }
+    /* Pool 构造字段组 (#179 同型的第三构造): members 编辑器复用 routes-editor
+       骨架; 成员行 = 下拉 + 上移/下移/删除 (顺序即 failover 优先级).
+       exhaust 高级配置用原生 <details> 折叠 (默认收起, 显示默认策略提示). */
+    #p-pool-fields .routes-editor {
+      grid-column: 1 / -1;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    #p-pool-fields .routes-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 12px;
+      color: var(--fg-muted);
+    }
+    #p-members-list .member-row {
+      display: grid;
+      grid-template-columns: 1fr auto auto auto;
+      gap: 4px;
+      align-items: center;
+    }
+    #p-members-list .member-row .btn {
+      padding: 2px 6px;
+      font-size: 11px;
+    }
+    #p-exhaust-details {
+      grid-column: 1 / -1;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 6px 8px;
+    }
+    #p-exhaust-details summary {
+      cursor: pointer;
+      font-size: 12px;
+      color: var(--fg-muted);
+    }
+    #p-exhaust-details .exhaust-grid {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 6px 10px;
+      align-items: center;
+      margin-top: 8px;
+    }
+    /* 列表 pool 成员运行时状态点: ● active (绿) / ◐ 耗尽至闹钟 (琥珀) /
+       ○ 永久挂起 (灰, missing/disabled)。currentColorScheme 无关 — 纯文本
+       着色走语义变量, 自动跟随 light-dark(). */
+    .pm-dot { font-weight: 700; }
+    .pm-dot.pm-on { color: var(--ok); }
+    .pm-dot.pm-wait { color: var(--warn); }
+    .pm-dot.pm-off { color: var(--fg-faint); }
+    .pm-cur { color: var(--accent); font-weight: 700; }
     /* Detect 协议探测 (#p-direct-fields 内, Direct 构造专属 — Router 下随组隐藏):
        按钮 + 结果区各跨整行 (form grid 两列). 结果区由 renderProbeResult 填充
        (状态行 / note hint / 模型 chips), 清空后由 :empty 折叠 (不残留空行).
@@ -1789,6 +1841,7 @@
       <select id="p-kind">
         <option value="direct">Direct — real upstream</option>
         <option value="router">Router — route-based routing</option>
+        <option value="pool">Pool — subscription failover</option>
       </select>
       <div class="hint" id="p-kind-hint" style="grid-column: 1 / -1; margin: 0 0 4px 0;">
         Forwards directly to a real LLM endpoint (base URL + API key).
@@ -1818,6 +1871,39 @@
             row to disable it — it is kept but never matched.
           </div>
         </div>
+      </div>
+      <div class="kind-fields hidden" id="p-pool-fields">
+        <div class="routes-editor">
+          <div class="routes-head">
+            <span>Members (ordered failover)</span>
+            <button type="button" class="btn" id="p-member-add">+ Add member</button>
+          </div>
+          <div id="p-members-list"></div>
+          <div class="hint" style="margin: 0 0 4px 0;">
+            Requests always go to the first available member (list order = failover priority); on
+            window-quota exhaustion the member is suspended until its alarm expires and traffic moves
+            to the next. Members are direct providers.
+          </div>
+        </div>
+        <details id="p-exhaust-details">
+          <summary>Exhaust signals (advanced) — default: built-in subscription window-quota table</summary>
+          <div class="hint" style="margin: 6px 0 0 0;">
+            Three OR channels; a hit suspends the member. Explicit values replace the default table
+            per channel (empty = channel off). Codes are matched loosely from body
+            <code>error.code</code>/<code>error.type</code>/<code>error.status</code>/top-level
+            <code>code</code>; headers match <code>name=value</code> exactly (case-insensitive name).
+          </div>
+          <div class="exhaust-grid">
+            <label for="p-exh-statuses">Statuses</label>
+            <input type="text" id="p-exh-statuses" placeholder="e.g. 402, 429 (empty = channel off)">
+            <label for="p-exh-codes">Codes</label>
+            <textarea id="p-exh-codes" rows="2" placeholder="one per line, e.g. 1308"></textarea>
+            <label for="p-exh-headers">Headers</label>
+            <textarea id="p-exh-headers" rows="2" placeholder="name=value, one per line"></textarea>
+            <label for="p-cooldown">Cooldown (s)</label>
+            <input type="number" id="p-cooldown" min="0" step="1" placeholder="60">
+          </div>
+        </details>
       </div>
       <div class="kind-fields" id="p-direct-fields">
         <label for="p-protocol">Protocol</label>
@@ -4117,7 +4203,7 @@
         renderDisabledRow: renderDisabledProviderRow,
         populateSelects: populateProtocolSelect,
         openForm: openProviderForm,
-        extraActions: { endpoints: openProviderEndpoints },
+        extraActions: { endpoints: openProviderEndpoints, 'pool-reset': resetPool },
       },
     };
 
@@ -4752,25 +4838,37 @@
 
     // 从 provider id 出发 walk 到链尾 Direct 的 protocol (**展示近似**, #179):
     // 中间 router 取其最高优先级启用路由的目标继续走 (忽略路由 upstream_model 重写
-    // 对后续跳匹配的影响 — 展示无需 per-model 精确解析); 防环 seen set; 悬空 / 无启用
-    // 路由 / 链尾非 Direct → null (调用方渲染 '?' 或降级 'unsupported').
+    // 对后续跳匹配的影响 — 展示无需 per-model 精确解析); 中间 pool 取**首个成员**
+    // (配置序近似 — 运行时状态的耗尽切换不进此派生, 列表徽章才呈现运行时);
+    // 防环 seen set; 悬空 / 无启用路由 / 空成员 / 链尾非 Direct → null (调用方
+    // 渲染 '?' 或降级 'unsupported').
     // 假设: providersList 已在手且与后端一致 (本地派生, 无额外 fetch).
     function chainTailProtocol(startId) {
       let cur = state.providersList.find(x => x.id === startId);
       const seen = new Set();
-      while (cur && cur.kind === 'router' && !seen.has(cur.id)) {
+      while (cur && !seen.has(cur.id)) {
+        if (cur.kind === 'direct') break;
         seen.add(cur.id);
-        const best = highestPriorityEnabledRoute(cur.routes || []);
-        if (!best) return null;
-        cur = state.providersList.find(x => x.id === best.target);
+        if (cur.kind === 'router') {
+          const best = highestPriorityEnabledRoute(cur.routes || []);
+          if (!best) return null;
+          cur = state.providersList.find(x => x.id === best.target);
+        } else if (cur.kind === 'pool') {
+          const first = (cur.members || [])[0];
+          if (!first) return null;
+          cur = state.providersList.find(x => x.id === first);
+        } else {
+          return null;
+        }
       }
       return cur && cur.kind === 'direct' ? cur.protocol : null;
     }
 
-    // router 行的 protocol pill 文本: 各路由 egress 的去重集合. 单一 → 该 protocol;
-    // 多个 → 短列表逗号连接, 放不下 (cell-short 溢出) → 'mixed'; 悬空目标计入 '?'.
-    function routerEgressLabel(routes) {
-      const set = [...new Set(routes.map(r => chainTailProtocol(r.target) ?? '?'))];
+    // 一组 provider id 的 egress pill 文本: 各 id (链尾近似) 的去重集合. 单一 →
+    // 该 protocol; 多个 → 短列表逗号连接, 放不下 (cell-short 溢出) → 'mixed';
+    // 悬空目标计入 '?'. router 行 (各 route target) 与 pool 行 (各 member) 共用.
+    function egressLabelOf(ids) {
+      const set = [...new Set(ids.map(t => chainTailProtocol(t) ?? '?'))];
       if (set.length === 0) return '?';
       if (set.length === 1) return set[0];
       const joined = set.join(', ');
@@ -4799,23 +4897,88 @@
       return `<td class="cell-long" title="${escapeHtml(full)}"><span class="cell-ellipsis"><code>${shown.join('; ')}</code></span></td>`;
     }
 
+    // pool 行的 URL 列: 成员清单 + 运行时状态徽章 (数据 = GET /api/providers 的
+    // pool_status 字段, 服务端派生 SSOT, 前端不重算)。每成员 "▸? dot id [resume]";
+    // - ▸ 标记首个 active 成员 (当前命中成员 — 列表序 pick 的前端派生, 同后端
+    //   pick_member 语义);
+    // - dot 三态: ● active / ◐ 耗尽至闹钟 (+ resume 文案) / ○ 永久挂起 ("off");
+    // - 字段缺席 (disabled 行走 ProviderMasked 无运行时数据) 降级为纯文本 id。
+    // 摘要折叠同 routes: 超过 2 条折叠为首条 + "+N more" (全量 + 状态在 td title)。
+    function fmtResume(secs) {
+      if (secs == null) return '';
+      // 长闹钟显示恢复时刻 (本地时间; 跨日带月/日消歧), 短闹钟显示剩余秒.
+      if (secs >= 120) {
+        const d = new Date(Date.now() + secs * 1000);
+        const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+        const sameDay = d.toDateString() === new Date().toDateString();
+        return sameDay ? `until ${hm}` : `until ${d.getMonth() + 1}/${d.getDate()} ${hm}`;
+      }
+      return `${secs}s`;
+    }
+
+    const POOL_SUMMARY_MAX = 2;
+    const POOL_PILL_TIP =
+      'subscription pool — ordered failover across member direct providers (no base URL / API key of its own)';
+
+    function poolMembersCell(members, status) {
+      const stat = i => (status && status[i]) || { id: members[i], active: true };
+      // 三态分类单点派生 (badge HTML 与 title 文本共用同一编码, 防两份漂移).
+      const stateOf = st => (st.active ? 'active' : (st.permanent ? 'off' : 'exhausted'));
+      const firstActive = members.findIndex((_, i) => stat(i).active);
+      const renderMember = (m, i) => {
+        const st = stat(i);
+        let dot, extra = '';
+        if (stateOf(st) === 'active') {
+          dot = '<span class="pm-dot pm-on" title="active">●</span>';
+        } else if (stateOf(st) === 'off') {
+          dot = '<span class="pm-dot pm-off" title="suspended permanently (missing or disabled member)">○</span>';
+          extra = ' <span class="meta">(off)</span>';
+        } else {
+          dot = '<span class="pm-dot pm-wait" title="window-quota exhausted — suspended until its alarm expires">◐</span>';
+          extra = ` <span class="meta">${escapeHtml(fmtResume(st.resume_in_secs))}</span>`;
+        }
+        const cur = i === firstActive
+          ? '<span class="pm-cur" title="requests go to the first available member (list order)">▸</span>' : '';
+        return `${cur}${dot} ${escapeHtml(m)}${extra}`;
+      };
+      const shown = members.length > POOL_SUMMARY_MAX
+        ? [renderMember(members[0], 0), `<span class="meta">+${members.length - POOL_SUMMARY_MAX} more</span>`]
+        : members.map(renderMember);
+      const full = members.map((m, i) => {
+        const st = stat(i);
+        const s = stateOf(st);
+        return `${m} [${s}${s === 'exhausted' ? ' ' + fmtResume(st.resume_in_secs) : ''}]`;
+      }).join('; ');
+      return `<td class="cell-long" title="${escapeHtml(full)}"><span class="cell-ellipsis"><code>${shown.join('; ')}</code></span></td>`;
+    }
+
     function renderProviderRow(p) {
       const rowCls = rowClass(p.source);
-      // #179/#183/#187: sum type — kind 判别 ('direct' | 'router').
+      // #179/#183/#187: sum type — kind 判别 ('direct' | 'router' | 'pool').
       // router: 无 protocol 字段 — pill 显示路由 egress 去重集合 + router 徽标,
       //   URL 列显示路由摘要 (per-route egress 近似, 见 routerRoutesCell);
+      // pool: pill 显示成员 egress 去重集合 + pool 徽标, URL 列显示成员清单 +
+      //   运行时状态徽章 (poolMembersCell), actions 附 reset 按钮;
       // direct: protocol pill + base_url 原样展示.
-      const isRouter = p.kind === 'router';
+      const kind = p.kind;
       let protoCell;
       let urlCell;
-      if (isRouter) {
+      if (kind === 'router') {
         const routes = p.routes || [];
-        const egressLabel = routerEgressLabel(routes);
+        const egressLabel = egressLabelOf(routes.map(r => r.target));
         protoCell = `<td class="cell-short">`
           + `<span class="pill" title="egress protocol(s) resolved from route targets (approximation: highest-priority enabled route)">${escapeHtml(egressLabel)}</span>`
           + ` <span class="pill" title="route-based routing endpoint — forwards by route model_pattern (no base URL / API key of its own)">router</span>`
           + `</td>`;
         urlCell = routerRoutesCell(routes);
+      } else if (kind === 'pool') {
+        const members = p.members || [];
+        const egressLabel = egressLabelOf(members);
+        protoCell = `<td class="cell-short">`
+          + `<span class="pill" title="egress protocol(s) resolved from members (approximation: per-member chain-tail walk)">${escapeHtml(egressLabel)}</span>`
+          + ` <span class="pill" title="${POOL_PILL_TIP}">pool</span>`
+          + `</td>`;
+        urlCell = poolMembersCell(members, p.pool_status);
       } else {
         protoCell = `<td class="cell-short"><span class="pill">${escapeHtml(p.protocol)}</span></td>`;
         urlCell = `<td class="cell-long" title="${escapeHtml(p.base_url || '')}"><span class="cell-ellipsis"><code>${escapeHtml(p.base_url)}</code></span></td>`;
@@ -4831,6 +4994,7 @@
           <td>${srcBadge(p.source)}</td>
           <td>${decisionCell('provider', p.id, p.decision, !!p.static_version)}</td>
           <td class="actions">
+            ${kind === 'pool' ? `<button class="btn" data-action="pool-reset" data-id="${escapeHtml(p.id)}" title="Clear all member exhaustion alarms (resume probing now)">reset</button>` : ''}
             <button class="btn" data-action="endpoints" data-id="${escapeHtml(p.id)}" title="View endpoint URLs for each protocol">endpoints</button>
             ${rowActions(p)}
           </td>
@@ -4850,13 +5014,19 @@
     // (可切回复活). actions 留空 — edit 走 update_flow 会 404 (不在 effective view),
     // delete 对 static 必 409; endpoints 对 404 的 id 无意义.
     function renderDisabledProviderRow(p) {
-      const isRouter = p.kind === 'router';
+      const kind = p.kind;
       let protoCell;
       let urlCell;
-      if (isRouter) {
+      if (kind === 'router') {
         const routes = p.routes || [];
         protoCell = `<td class="cell-short"><span class="pill" title="route-based routing endpoint — forwards by route model_pattern (no base URL / API key of its own)">router</span></td>`;
         urlCell = routerRoutesCell(routes);
+      } else if (kind === 'pool') {
+        // disabled pool: 纯配置展示 (ProviderMasked 无运行时数据 — 不转发的条目
+        // 无状态可观察), 成员以 "→" 串联表达 failover 序.
+        const members = p.members || [];
+        protoCell = `<td class="cell-short"><span class="pill" title="${POOL_PILL_TIP}">pool</span></td>`;
+        urlCell = `<td class="cell-long" title="${escapeHtml(members.join(' → '))}"><span class="cell-ellipsis"><code>${escapeHtml(members.join(' → '))}</code></span></td>`;
       } else {
         protoCell = `<td class="cell-short"><span class="pill">${escapeHtml(p.protocol)}</span></td>`;
         urlCell = `<td class="cell-long" title="${escapeHtml(p.base_url || '')}"><span class="cell-ellipsis"><code>${escapeHtml(p.base_url)}</code></span></td>`;
@@ -5121,6 +5291,24 @@
       dlg.showModal();
     }
 
+    // ─── pool reset (T3) ─────────────────────────────────────────────────
+    //
+    // POST /api/providers/{id}/pool-reset — 用户动作 (知道续费了/换窗了, 想立即
+    // 恢复探测)。成功后刷新列表取新的成员状态 (pool_status 服务端派生)。
+    async function resetPool(id) {
+      try {
+        const r = await fetch(`${API_PROVIDERS}/${encodeURIComponent(id)}/pool-reset`, { method: 'POST' });
+        if (!r.ok) {
+          const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+          alert('Pool reset failed: ' + (err.error || r.status));
+          return;
+        }
+        await refreshProviders();
+      } catch (e) {
+        alert('Error: ' + e.message);
+      }
+    }
+
     // 单行渲染. 三态分支拆为两个独立派生 (url 单元格 + badge 单元格),
     // 避免嵌套三元: badge 走 mode→string 查表, url 用单层三元.
     // translate 的 tooltip 按 pair 分化 (M2 走查修复, 与 #183 后的实际行为对齐):
@@ -5157,22 +5345,42 @@
       // 兜底 'openai'.
       setProtocolSelectValue(existing?.protocol || state.providerWebuiProtocols[0] || 'openai');
       // 构造选择 (#190): 按 kind 显隐字段组 — Direct: Protocol/Base URL/API Key;
-      // Router: 路由编辑器. 构造可切换 (编辑 static router → Direct override =
-      // 改回实体 #187 根治, 需显式发空 routes — 见下方 payload builder; dynamic
-      // 条目切换的丢 key 限制见 AGENTS.md).
+      // Router: 路由编辑器; Pool: 成员编辑器 + exhaust 高级配置. 构造可切换
+      // (编辑 static router/pool → Direct override = 改回实体 #187 根治, 需显式
+      // 发空 routes/members — 见下方 payload builder; dynamic 条目切换的丢 key
+      // 限制见 AGENTS.md).
       const kindSel = document.getElementById('p-kind');
       const kindHint = document.getElementById('p-kind-hint');
+      const KIND_HINTS = {
+        direct: 'Forwards directly to a real LLM endpoint (base URL + API key).',
+        router: 'Route-based routing endpoint — the request model is matched against route model_patterns; the highest-priority enabled match routes the request. No base URL / API key of its own.',
+        pool: 'Subscription pool — ordered members (direct providers); traffic goes to the first available member and fails over on window-quota exhaustion signals. No base URL / API key of its own.',
+      };
       const syncKind = () => {
-        const isRouter = kindSel.value === 'router';
-        document.getElementById('p-direct-fields').classList.toggle('hidden', isRouter);
-        document.getElementById('p-router-fields').classList.toggle('hidden', !isRouter);
-        kindHint.textContent = isRouter
-          ? 'Route-based routing endpoint — the request model is matched against route model_patterns; the highest-priority enabled match routes the request. No base URL / API key of its own.'
-          : 'Forwards directly to a real LLM endpoint (base URL + API key).';
+        const kind = kindSel.value;
+        document.getElementById('p-direct-fields').classList.toggle('hidden', kind !== 'direct');
+        document.getElementById('p-router-fields').classList.toggle('hidden', kind !== 'router');
+        document.getElementById('p-pool-fields').classList.toggle('hidden', kind !== 'pool');
+        kindHint.textContent = KIND_HINTS[kind] || KIND_HINTS.direct;
       };
       kindSel.value = existing?.kind || 'direct';
       kindSel.onchange = syncKind;
       syncKind();
+      // 成员编辑器 (T3): 行数据 SSOT 是 DOM 本身 (同路由编辑器模式), 打开表单时从
+      // existing 一次性物化; 非 Pool 条目 (或新建) 给一行空白. 构造切换只显隐字段
+      // 组不清空行 — 用户 Direct↔Pool 来回切不丢已选成员 (与 #190 的字段保留
+      // 语义一致).
+      const membersList = document.getElementById('p-members-list');
+      membersList.innerHTML = '';
+      const memberIds = existing?.kind === 'pool' ? (existing.members || []) : [];
+      if (memberIds.length) memberIds.forEach(m => addMemberRow(m));
+      else addMemberRow();
+      // exhaust 高级配置: 从 existing 装载 (编辑 pool = 现值; 其余/新建 = 空, 折叠
+      // 收起 + dirty 清零 — 未改动不发送, 后端取默认/回填旧值).
+      loadExhaustIntoForm(
+        existing?.kind === 'pool' ? existing.exhaust : null,
+        existing?.kind === 'pool' ? existing.cooldown_secs : null,
+      );
       // 路由编辑器 (#179 多规则化): 行数据 SSOT 是 DOM 本身 (输入即状态), 打开表单
       // 时从 existing 一次性物化; 非 Router 条目 (或新建) 给一行空白. 构造切换只
       // 显隐字段组不清空行 — 用户 Direct↔Router 来回切不丢已填路由 (与 #190 的
@@ -5272,6 +5480,97 @@
       const btn = ev.target.closest('.route-del');
       if (btn) btn.closest('.route-row').remove();
     });
+
+    // ─── pool 成员编辑器 (T3) ─────────────────────────────────────────────
+    //
+    // 每行一个成员 (Direct provider 下拉) + 上移/下移/删除。行序 = failover 优先级
+    // (后端 pick 无游标列表序)。增删/排序用事件委托 (行是动态子元素, 同
+    // #p-routes-list 模式)。
+
+    // 物化一行成员输入。memberId 缺省 = 一行空白 (新建); 指向不可选 id (不存在
+    // 的悬空条目 / 存在但非 Direct 的条目 — 后者运行时可解析 (嵌套 Pool→Router
+    // 合法), 仅编辑器候选不引导) 补标注选项, 编辑保存不静默丢指向 (route-target
+    // 同模式)。
+    function addMemberRow(memberId = '') {
+      const editId = document.getElementById('provider-form').dataset.editId || '';
+      // 候选: 其余 **Direct** 条目 (成员 = 一份独立凭证实体; 排除编辑对象自身防
+      // 自环 — 后端 validate 兜底)。
+      const candidates = state.providersList.filter(x => x.id !== editId && x.kind === 'direct');
+      const tagOpt = memberId && !candidates.some(x => x.id === memberId)
+        ? (() => {
+            const known = state.providersList.some(x => x.id === memberId);
+            const tag = known ? '(not a direct provider)' : '(missing)';
+            return `<option value="${escapeHtml(memberId)}">${escapeHtml(memberId)} ${tag}</option>`;
+          })()
+        : '';
+      const row = document.createElement('div');
+      row.className = 'member-row';
+      row.innerHTML = `
+        <select class="member-select">
+          <option value="" ${memberId ? '' : 'selected'} disabled>(member)</option>
+          ${candidates.map(x => `<option value="${escapeHtml(x.id)}">${escapeHtml(x.id)}</option>`).join('')}
+          ${tagOpt}
+        </select>
+        <button type="button" class="btn member-up" title="Move up (higher failover priority)">↑</button>
+        <button type="button" class="btn member-down" title="Move down">↓</button>
+        <button type="button" class="btn member-del" title="Remove member">✕</button>`;
+      if (memberId) row.querySelector('.member-select').value = memberId;
+      document.getElementById('p-members-list').appendChild(row);
+    }
+
+    // 收集成员行 → 有序 id 列表 (提交用)。
+    function collectMembersFromForm() {
+      return [...document.querySelectorAll('#p-members-list .member-row')]
+        .map(row => row.querySelector('.member-select').value);
+    }
+
+    document.getElementById('p-member-add').addEventListener('click', () => addMemberRow());
+    document.getElementById('p-members-list').addEventListener('click', (ev) => {
+      const row = ev.target.closest('.member-row');
+      if (!row) return;
+      if (ev.target.closest('.member-del')) row.remove();
+      else if (ev.target.closest('.member-up') && row.previousElementSibling) row.previousElementSibling.before(row);
+      else if (ev.target.closest('.member-down') && row.nextElementSibling) row.nextElementSibling.after(row);
+    });
+
+    // ─── pool exhaust 高级配置 (T3) ────────────────────────────────────────
+    //
+    // 原生 <details> 折叠 (默认收起)。**dirty 追踪**: 打开表单时装载现值并清零
+    // dirty; 任一输入改动置位。提交时未改动 → 不发送 exhaust/cooldown (创建 →
+    // 后端内置默认表 / 编辑 → 后端回填旧值); 改动过 → 全量发送 (后端字段级
+    // 替换语义)。前端不硬编码默认表内容 (避免与后端 SSOT 漂移)。
+    let exhaustDirty = false;
+    document.getElementById('p-exhaust-details').addEventListener('input', () => { exhaustDirty = true; });
+
+    function loadExhaustIntoForm(exhaust, cooldown) {
+      document.getElementById('p-exh-statuses').value = (exhaust?.statuses || []).join(', ');
+      document.getElementById('p-exh-codes').value = (exhaust?.codes || []).join('\n');
+      document.getElementById('p-exh-headers').value = (exhaust?.headers || []).join('\n');
+      document.getElementById('p-cooldown').value = cooldown != null ? cooldown : '';
+      document.getElementById('p-exhaust-details').open = false;
+      exhaustDirty = false;
+    }
+
+    // 收集 exhaust 配置 → {ok, exhaust, cooldown_secs} / {ok:false, error}
+    // (调用方 alert 提示)。statuses 逗号/空白分隔整数; codes/headers 每行一条
+    // (trim + 空行跳过); cooldown 空 = 默认 60。
+    function collectExhaustFromForm() {
+      const statuses = [];
+      for (const tok of document.getElementById('p-exh-statuses').value.split(/[\s,]+/).filter(Boolean)) {
+        const n = Number(tok);
+        if (!Number.isInteger(n) || n < 100 || n > 599) {
+          return { ok: false, error: `Invalid HTTP status "${tok}" — use integers in 100..599, comma-separated.` };
+        }
+        statuses.push(n);
+      }
+      const lines = id => document.getElementById(id).value.split('\n').map(s => s.trim()).filter(Boolean);
+      const cooldownRaw = document.getElementById('p-cooldown').value.trim();
+      const cooldown = cooldownRaw === '' ? 60 : Number(cooldownRaw);
+      if (!Number.isInteger(cooldown) || cooldown < 0) {
+        return { ok: false, error: 'Cooldown must be a non-negative integer (seconds).' };
+      }
+      return { ok: true, exhaust: { statuses, codes: lines('p-exh-codes'), headers: lines('p-exh-headers') }, cooldown_secs: cooldown };
+    }
 
     // ─── provider Detect 协议探测 (Direct 字段组) ────────────────────────
     //
@@ -5454,19 +5753,31 @@
     }));
 
     bindFormSubmit('provider', 'provider-form-el', () => {
-      // #190/#179: 按构造分野 payload — 表单 kind 选择器是唯一事实来源.
+      // #190/#179/#187: 按构造分野 payload — 表单 kind 选择器是唯一事实来源.
       // - Router: routes 全量发 (≥1 条, 每行 model_pattern/target 前端必填拦截);
       //   protocol/base_url/api_key 不发 (构造上不存在, 残留发送也会被后端忽略).
-      // - Direct: protocol + base_url (+api_key); routes 原则上不发 (省略 = 保留/
-      //   Direct 构造), 唯一例外: 编辑对象当前是 Router 时发空数组 — PUT 省略 routes
-      //   会被后端回填旧路由停留在 Router, 空数组是后端定义的 "显式改回实体" wire 语义.
+      // - Pool: members 全量发 (≥1 条, 每行选过 provider); exhaust/cooldown 仅在
+      //   高级区改动过才发 (dirty 追踪 — 未改动 → 后端取默认/回填旧值).
+      // - Direct: protocol + base_url (+api_key).
+      // 构造切换的**显式取消** (后端 PUT 省略 = 回填旧值的配对语义): 编辑对象是
+      // router 而表单构造不是 → 发 routes: []; 编辑对象是 pool 而表单构造不是 →
+      // 发 members: [] (空数组 = 后端定义的 "显式退出该构造" wire 语义).
       // 编辑模式 (PUT): api_key 留空 → 发 null, 后端保留旧值 (见 update_provider handler).
       const editId = document.getElementById('provider-form').dataset.editId;
-      const isRouter = document.getElementById('p-kind').value === 'router';
+      const formKind = document.getElementById('p-kind').value;
+      const editKind = editId ? state.providersList.find(x => x.id === editId)?.kind : undefined;
       const id = document.getElementById('p-id').value.trim() || null;
       const name = document.getElementById('p-name').value.trim() || null;
       const enabled = document.getElementById('p-enabled').checked;
-      if (isRouter) {
+      // 构造切换的显式取消 (单一 SSOT, 2×2 矩阵收口于此): 编辑对象构造 ≠ 表单
+      // 构造 → 发空数组显式退出旧构造 (后端 PUT 省略 = 回填旧值的配对语义,
+      // routes=[] / members=[] 的 wire 含义)。各分支 return 前统一过此 post-pass。
+      const cancelSwitchedConstruct = (payload) => {
+        if (editKind === 'router' && formKind !== 'router') payload.routes = [];
+        if (editKind === 'pool' && formKind !== 'pool') payload.members = [];
+        return payload;
+      };
+      if (formKind === 'router') {
         const routes = collectRoutesFromForm();
         // 构造内必填前置拦截 (避免用户填完整个表单才收到后端 400).
         if (routes.length === 0) {
@@ -5483,7 +5794,31 @@
             return null;
           }
         }
-        return { id, name, routes, enabled };
+        return cancelSwitchedConstruct({ id, name, routes, enabled });
+      }
+      if (formKind === 'pool') {
+        const members = collectMembersFromForm();
+        if (members.length === 0) {
+          alert('At least one member is required for a pool provider.');
+          return null;
+        }
+        for (let i = 0; i < members.length; i++) {
+          if (!members[i]) {
+            alert(`Member #${i + 1}: pick a direct provider (or create one first).`);
+            return null;
+          }
+        }
+        const payload = { id, name, members, enabled };
+        if (exhaustDirty) {
+          const adv = collectExhaustFromForm();
+          if (!adv.ok) {
+            alert(adv.error);
+            return null;
+          }
+          payload.exhaust = adv.exhaust;
+          payload.cooldown_secs = adv.cooldown_secs;
+        }
+        return cancelSwitchedConstruct(payload);
       }
       const baseUrl = document.getElementById('p-base-url').value.trim();
       if (!baseUrl) {
@@ -5500,10 +5835,7 @@
         // api_key 三态: Direct 编辑留空 = 保留 (null) / 其余发值.
         api_key: (editId && apiKeyInput === '') ? null : apiKeyInput,
       };
-      if (editId && state.providersList.find(x => x.id === editId)?.kind === 'router') {
-        payload.routes = [];
-      }
-      return payload;
+      return cancelSwitchedConstruct(payload);
     });
 
     // ─── decision PATCH ──────────────────────────────────────────────────

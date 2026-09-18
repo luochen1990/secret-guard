@@ -17,6 +17,8 @@
 //!   `proxy::models`, 薄壳 handler 在 `api/providers.rs`).
 //! - `PUT/DELETE /api/providers/probe` —— 存量 id="probe" 条目的管理薄 wrapper
 //!   (静态段阴影 {id} 路由的 405 补齐, 见 `api::update_provider_probe`).
+//! - `POST /api/providers/{id}/pool-reset` —— pool 条目成员闹钟清空
+//!   (两段路径与 `{id}/decision` 同型, 见 `api::pool_reset`).
 //! - `GET/POST/DELETE/PATCH /api/api-keys[/{id}[/toggle]]` —— API key CRUD (无条件挂载, 见 api/apikeys.rs).
 //!
 //! 注 1: 旧的 `GET /api/records` (扁平分页) + `GET /api/nodes/{id}/timeline` (基于 node_id)
@@ -93,6 +95,9 @@ pub fn router() -> Router<AppState> {
             "/api/providers/{id}/decision",
             patch(api::set_provider_decision),
         )
+        // pool 条目成员闹钟清空 (T3; 两段路径与 {id}/decision 同型 — 静态尾段
+        // 优先于任何未来单段扩展, 无 "probe" 型阴影问题).
+        .route("/api/providers/{id}/pool-reset", post(api::pool_reset))
         // API key CRUD: 无条件挂载 (不依赖 auth.enabled), 不做用户隔离.
         // 设计哲学: 只认证, 不隔离 — 见 src/web/api/apikeys.rs 头部注释.
         //
