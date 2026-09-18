@@ -752,6 +752,9 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     expect(infoText).toContain("Path");
     expect(infoText).toContain("Status");
     expect(infoText).toContain("Elapsed");
+    // M1 走查回归: Model 行异步补全后必须是请求的 model 值 (sendChat 默认
+    // test-model-abc), 而非 "(unknown)" — 历史缺陷: ForwardRecord 无 model 字段.
+    await expect(infoDialog).toContainText("test-model-abc", { timeout: 5000 });
     // 关闭.
     await page.locator("dialog.round-dialog .dialog-close").click();
 
@@ -2695,6 +2698,43 @@ test.describe("Provider 表单构造分野 (#190)", () => {
     await expect(row).not.toBeVisible();
   });
 
+});
+
+test.describe("Provider endpoints 弹窗 (M2 走查)", () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto("/");
+    await page.locator('a.tab[data-tab="providers"]').click();
+    // 等表格渲染 (refreshProviders 完成 → state.providerShorts/Protocols 已填充).
+    await expect(page.locator("#providers-body tr").first()).toBeVisible();
+  });
+
+  // M2 走查回归: translate 徽章的流式语义必须与实际行为一致 — OpenAI⇄Anthropic
+  // 流式翻译已接入 (StreamTranslate), 仅含 Responses 任一侧的 pair 是非流式
+  // (stream=true → 501). 历史缺陷: tooltip 写死 "Non-streaming only" (过时的
+  // #183 前文案), 且 CODEC_SUPPORTED 缺 openairesponses (Responses 行误显示
+  // "not supported" — Responses⇄Chat 非流式翻译实际可用).
+  test("openai provider: direct/translate 三态矩阵 + 流式 tooltip 按 pair 分化", async ({ page }) => {
+    const row = page.locator("#providers-body tr", { hasText: "mock-openai" });
+    await row.locator('button[data-action="endpoints"]').click();
+    const dlg = page.locator("#provider-endpoints");
+    await expect(dlg).toBeVisible();
+
+    const rowOf = (short: string) => dlg.locator("tr", { hasText: `/${short}/)` });
+    const badgeOf = (short: string) => rowOf(short).locator(".badge");
+
+    // /o/ 同协议 → direct.
+    await expect(badgeOf("o")).toHaveText("direct");
+    // /a/ 跨协议 (OpenAI⇄Anthropic) → translate, 流式已接入 (不得再声称 non-streaming only).
+    await expect(badgeOf("a")).toHaveText("translate");
+    await expect(badgeOf("a")).toHaveAttribute("title", /streaming included/);
+    await expect(badgeOf("a")).not.toHaveAttribute("title", /[Nn]on-streaming only/);
+    // /r/ 跨协议 (Responses⇄Chat) → translate (非 not supported), 非流式 tooltip.
+    await expect(badgeOf("r")).toHaveText("translate");
+    await expect(badgeOf("r")).toHaveAttribute("title", /non-streaming only/);
+    // /g/ /l/ 无 codec → not supported.
+    await expect(rowOf("g").locator(".unsupported")).toHaveText("not supported");
+    await expect(rowOf("l").locator(".unsupported")).toHaveText("not supported");
+  });
 });
 
 test.describe("usage-stats (模型用量统计)", () => {

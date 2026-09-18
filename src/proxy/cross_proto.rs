@@ -11,8 +11,10 @@
 //!
 //! # 范围与限制
 //!
-//! 只支持 OpenAI ⇄ Anthropic 双向流式/非流式. Responses (ingress 或 egress) 的
-//! 流式仍返回 501 — 其 `read_response_events` 未实现, 放行会翻译出空流
+//! codec 覆盖族内 (openai/anthropic/openairesponses) 任意 pair 的非流式翻译均经通用
+//! IR 路径承载 (含 Responses 参与的 pair, 双向各有集成测试锁定). 流式翻译仅
+//! OpenAI ⇄ Anthropic (StreamTranslate); Responses (ingress 或 egress) 的流式返回
+//! 501 — 其 `read_response_events` 未实现, 放行会翻译出空流
 //! (同 same_proto 路径的 Responses 流式 501, #183 D5).
 
 use std::time::Instant;
@@ -49,7 +51,8 @@ use super::recorder::{
 ///
 /// # 限制
 ///
-/// - 只支持 OpenAI ⇄ Anthropic 双向 (其他组合返回 501).
+/// - codec 覆盖族内 (openai/anthropic/responses) 任意 pair 均可翻译; gemini/ollama
+///   任一侧 → 501 (`Protocol::from_native` 返回 None).
 /// - **Responses (ingress 或 egress) + stream=true → 501**: Responses 流式 SSE
 ///   事件翻译未实现 (`read_response_events` 返回空), 放行会静默产出空流.
 /// - **应用 redact**: 跨协议 + redact 通过 [`crate::redact::redact_ir`] 在 IR 层做替换,
@@ -73,13 +76,13 @@ pub(crate) async fn cross_proto_forward(
     // 1. 检查 codec 是否支持此协议对.
     let Some(ingress_codec) = CodecProtocol::from_native(ingress) else {
         return Err(AppError::NotImplemented(format!(
-            "ingress protocol '{}' is not supported by codec (only openai/anthropic)",
+            "ingress protocol '{}' is not supported by codec (only openai/anthropic/openairesponses)",
             ingress.name()
         )));
     };
     let Some(egress_codec) = CodecProtocol::from_native(provider.protocol) else {
         return Err(AppError::NotImplemented(format!(
-            "egress protocol '{}' is not supported by codec (only openai/anthropic)",
+            "egress protocol '{}' is not supported by codec (only openai/anthropic/openairesponses)",
             provider.protocol.name()
         )));
     };

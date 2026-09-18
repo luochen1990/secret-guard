@@ -16,10 +16,13 @@
   场景 — 流式经 StreamTranslate 跨协议模式 + restore hook, 已接入 dispatch).
 - ✅ OpenAI Responses API 同协议透传 + Redact (非流式; 流式 + Redact 返回 501).
 - ✅ OpenAI Responses ⇄ OpenAI Chat Completions 跨协议翻译 (非流式).
+- ✅ Responses ⇄ Anthropic 跨协议翻译 (非流式, 经通用 IR 路径; r→a 接线由
+  `cross_proto_hosted_tools_drop_warns` 集成锁定, a→r 由
+  `cross_protocol_translates_anthropic_ingress_to_responses_upstream` 锁定).
 - ✅ `reasoning_content` (思考原文, OpenAI 兼容 provider 非标字段) 同协议建模:
   请求 (assistant 历史回传) / 非流式响应 / 流式 delta 三路径 reader↔writer 对称
   (#176, 契约 STR-6). 跨协议丢弃 (见下).
-- ❌ Responses ⇄ Anthropic 跨协议: 未实现 (返回 501).
+- ❌ Responses ⇄ Anthropic 跨协议的流式 → 501 (同下条: Responses SSE 事件翻译未实现).
 - ❌ Responses 流式 SSE 事件翻译 (`read_response_events` / `write_response_event` 返回空/None),
   含跨协议 Responses 任一侧 + stream=true (501).
 - ❌ 不在 MVP: Bedrock / Gemini / Cohere, reasoning `encrypted_content` (provider-specific opaque),

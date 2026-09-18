@@ -153,8 +153,8 @@ provider=...`), 命令行即可确认流量经过 secret-guard; 上游故障 (50
 | 协议 | 转发 | Secret Redact | 跨协议翻译 |
 |---|---|---|---|
 | OpenAI (Chat Completions) | ✅ | ✅ | ✅ ⇄ Anthropic (含流式) / ⇄ Responses (非流式) |
-| Anthropic (claude) | ✅ | ✅ | ✅ ⇄ OpenAI (含流式) |
-| OpenAI Responses | ✅ | ✅ (非流式) | ✅ ⇄ Chat Completions (非流式) |
+| Anthropic (claude) | ✅ | ✅ | ✅ ⇄ OpenAI (含流式) / ⇄ Responses (非流式) |
+| OpenAI Responses | ✅ | ✅ (非流式) | ✅ ⇄ Chat Completions / Anthropic (非流式) |
 | Gemini / Ollama | ✅ 字节透传 | 🚧 [Roadmap](#roadmap--贡献) | 🚧 [Roadmap](#roadmap--贡献) |
 
 - Gemini / Ollama 是透明字节透传 (转发本身完整可用); 由于 codec 尚未覆盖, Redact

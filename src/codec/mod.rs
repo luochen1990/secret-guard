@@ -4,9 +4,9 @@
 //!
 //! 借鉴 Busbar (`GetBusbar/busbar` Apache-2.0) 的 superset IR + Reader/Writer trait 设计,
 //! 但大幅精简以匹配 secret-guard 的 MVP 范围:
-//! - 覆盖 **OpenAI ⇄ Anthropic** 双向 (chat completion 范围).
-//! - 覆盖 **OpenAI Responses ⇄ OpenAI Chat** 单向 (request 方向, 响应方向也翻译).
-//! - **Responses ⇄ Anthropic** 跨协议翻译: 未实现 (返回 501).
+//! - 覆盖 **OpenAI ⇄ Anthropic** 双向流式/非流式 (StreamTranslate).
+//! - 覆盖 **Responses ⇄ Chat Completions / Anthropic** 非流式 (经通用 IR 路径;
+//!   Responses 的 SSE 事件翻译未实现, 流式 → 501, 见 `proxy::cross_proto_forward`).
 //! - 不覆盖 embeddings/moderation/rerank.
 //! - **不做** prompt caching / citations / logprobs.
 //! - **不做** Bedrock eventstream 二进制流.

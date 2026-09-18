@@ -508,6 +508,7 @@ fn dag_list_forward_records(dag: &ConversationDag) -> Vec<ForwardRecord> {
                 created_at: view.created_at,
                 method: view.method,
                 path: view.path,
+                model: view.model.as_deref().map(str::to_string),
                 upstream_id: view.upstream_id.to_string(),
                 upstream_model: view.upstream_model.as_deref().map(str::to_string),
                 req_headers: detail.req_headers,
@@ -1772,6 +1773,115 @@ async fn cross_protocol_translates_anthropic_ingress_to_openai_upstream() {
     );
 }
 
+/// Responses 上游的 happy-path 响应 body (a→r / o→r 两测试共用, 仅 ingress 不同;
+/// 复用 idiom 同 `CHAT_REQ_BODY` — 同一 body 多测试共享走 section-local const).
+const RESPONSES_OK_BODY: &str = r#"{"id":"resp_abc","object":"response","created_at":1700000000,"model":"gpt-4o","status":"completed","output":[{"type":"message","id":"msg_1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Hi from Responses"}]}],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}"#;
+
+/// a→r 方向的跨协议非流式翻译 (Anthropic ingress → Responses upstream) — 经通用
+/// IR 路径. 历史文档曾声称 "Responses ⇄ Anthropic 未实现 (返回 501)", 实际 501
+/// 仅流式成立 (cross_proto_forward 的 streaming gate); 非流式由通用 IR 翻译承载,
+/// r→a 方向已被 `cross_proto_hosted_tools_drop_warns` 锁定, 本测试补齐 a→r 锚点
+/// (endpoints 弹窗对 codec 覆盖族任意 pair 显示 translate 的依据, M2 走查).
+#[tokio::test]
+async fn cross_protocol_translates_anthropic_ingress_to_responses_upstream() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/responses")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(RESPONSES_OK_BODY)
+        .create_async()
+        .await;
+    let provider = provider_with("resp-main", Protocol::OpenAIResponses, &upstream.url());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+    let body =
+        r#"{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"max_tokens":50}"#;
+    let (status, resp_body, _) =
+        proxy_request(&proxy_url, "POST", "/a/resp-main/v1/messages", body, &[]).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {resp_body}");
+    // 响应翻译回 Anthropic 格式. stop_reason 是 Anthropic envelope 独有标记
+    // (Responses mock 只有 status 无 stop_reason) — 排除 "reader/writer 回退到
+    // fallback 透传原始 Responses 字节" 的假绿 (ROB 已知限制路径).
+    assert!(resp_body.contains("\"stop_reason\""), "got: {resp_body}");
+    assert!(resp_body.contains("Hi from Responses"), "got: {resp_body}");
+    assert!(
+        resp_body.contains("\"input_tokens\":10"),
+        "got: {resp_body}"
+    );
+}
+
+/// o→r 方向的跨协议非流式翻译 (OpenAI Chat ingress → Responses upstream) —
+/// Responses⇄Chat pair 的 happy-path 锚点 (此前该 pair 只有流式 501 测试),
+/// 与 a→r 测试同因: endpoints 弹窗对该 pair 显示 translate (M2 走查).
+#[tokio::test]
+async fn cross_protocol_translates_openai_ingress_to_responses_upstream() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/responses")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(RESPONSES_OK_BODY)
+        .create_async()
+        .await;
+    let provider = provider_with("resp-main", Protocol::OpenAIResponses, &upstream.url());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+    let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}]}"#;
+    let (status, resp_body, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/resp-main/v1/chat/completions",
+        body,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {resp_body}");
+    // 响应翻译回 OpenAI Chat 格式: envelope + choices text + usage. 这些标记在
+    // Responses mock body 中不存在, 断言具判别力 (fallback 透传会失败).
+    assert!(
+        resp_body.contains("\"object\":\"chat.completion\""),
+        "got: {resp_body}"
+    );
+    assert!(resp_body.contains("Hi from Responses"), "got: {resp_body}");
+    assert!(resp_body.contains("\"prompt_tokens\""), "got: {resp_body}");
+}
+
+/// r→o 方向的跨协议非流式翻译 (Responses ingress → OpenAI Chat upstream) —
+/// Responses⇄Chat pair 的 happy-path 锚点 (o→r 的反向), M2 走查同因.
+#[tokio::test]
+async fn cross_protocol_translates_responses_ingress_to_openai_upstream() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"chatcmpl-test","object":"chat.completion","created":1700000000,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"Hi from GPT"},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":4,"total_tokens":16}}"#,
+        )
+        .create_async()
+        .await;
+    let provider = provider_with("oa-main", Protocol::OpenAI, &upstream.url());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+    // Responses ingress 客户端发 Responses 格式 (input items).
+    let body = r#"{"model":"gpt-4o","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Hello"}]}]}"#;
+    let (status, resp_body, _) =
+        proxy_request(&proxy_url, "POST", "/r/oa-main/v1/responses", body, &[]).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {resp_body}");
+    // 响应翻译回 Responses 格式: response envelope + output message + usage.
+    assert!(
+        resp_body.contains("\"object\":\"response\""),
+        "got: {resp_body}"
+    );
+    assert!(
+        resp_body.contains("\"type\":\"output_text\""),
+        "got: {resp_body}"
+    );
+    assert!(resp_body.contains("Hi from GPT"), "got: {resp_body}");
+    assert!(
+        resp_body.contains("\"input_tokens\":12"),
+        "got: {resp_body}"
+    );
+}
+
 #[tokio::test]
 async fn cross_protocol_streaming_translates_openai_ingress_from_anthropic_upstream() {
     // 跨协议流式: OpenAI ingress → Anthropic upstream (SSE) → 翻译回 OpenAI SSE.
@@ -2240,6 +2350,69 @@ async fn web_api_returns_record_by_id() {
     assert_eq!(body["record"]["resp_status"], 200);
     assert!(body.get("parsed_request").is_some());
     assert!(body["parsed_request"].is_null());
+}
+
+/// M1 走查回归: `GET /api/records/{id}` 的 record 必须携带请求的顶层
+/// `model` (egress 视角: 路由改写生效时与 upstream_model 同值, 本测试场景
+/// 无路由 → 客户端原值) — round-info 弹窗 Model 行的数据源. 历史缺陷:
+/// 前端读 `rec.model` 但 DTO 无此字段, 弹窗 Model 恒为 "(unknown)".
+/// 同时锁定 `upstream_model` 仅在路由改写生效时出现 (skip_serializing_if
+/// = None, 无路由 → 字段缺席).
+#[tokio::test]
+async fn web_api_record_includes_client_model() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_body(r#"{"ok":true}"#)
+        .create_async()
+        .await;
+
+    let upstream_client = reqwest::Client::new();
+    let records = ConversationDag::new(64, 500, 1);
+    let records_handle = records.clone();
+    let provider = openai_provider("oa-main", &upstream.url());
+    let proxy_url = spawn_proxy_full(
+        vec![provider],
+        upstream_client,
+        records,
+        test_secret_table(),
+    )
+    .await;
+
+    let _ = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        r#"{"model":"gpt-model-x","messages":[{"role":"user","content":"hi"}]}"#,
+        &[],
+    )
+    .await;
+
+    let list = wait_until_or_timeout(
+        &records_handle,
+        |l| l.first().map(|r| r.resp_complete).unwrap_or(false),
+        Duration::from_secs(2),
+    )
+    .await;
+    let id = list[0].id;
+
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{proxy_url}/api/records/{id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        body["record"]["model"], "gpt-model-x",
+        "record must carry the client's top-level model field: {body}"
+    );
+    assert!(
+        body["record"].get("upstream_model").is_none(),
+        "no route rewrite → upstream_model must be absent (not null): {body}"
+    );
 }
 
 #[tokio::test]

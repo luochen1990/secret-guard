@@ -1854,8 +1854,9 @@
     <form method="dialog">
       <h3 style="margin: 0 0 8px 0;">Endpoints</h3>
       <div class="hint" style="margin-bottom: 8px;">
-        URL pattern: <code>/{proto-short}/{provider-id}/*</code>. Same-protocol = direct,
-        OpenAI⇄Anthropic = cross-protocol translation (streaming included), others = not supported.
+        URL pattern: <code>/{proto-short}/{provider-id}/*</code>. Same-protocol = direct; cross-protocol = translation
+        between OpenAI / Anthropic / Responses (streaming only for OpenAI⇄Anthropic; Responses pairs are non-streaming);
+        Gemini/Ollama ingress = not supported.
       </div>
       <div id="provider-endpoints-body"></div>
       <div class="actions">
@@ -4736,8 +4737,9 @@
     // ─── provider 行渲染: router 路由摘要 + per-route egress 近似 (#179) ──────
     //
     // 跨协议教育提示 (静态, 无条件挂在 egress 标记上): 入口协议 ≠ 出口时的代价.
+    // 流式限定 = 实际行为: 含 Responses 任一侧时 stream=true → 501 (M2 走查对齐).
     const EGRESS_CROSS_PROTO_TIP =
-      'If the ingress protocol ≠ this egress: cross-protocol translation kicks in — reasoning_content is dropped (streaming is translated too)';
+      'If the ingress protocol ≠ this egress: cross-protocol translation kicks in — reasoning_content is dropped (streaming translated only when neither side is Responses)';
 
     // 启用 (priority 非 null) 路由中 priority 最大者; 并列按列表序先者 — 与后端
     // `RouterProvider::select_route` 的确定性 tie-break 一致. 空/全禁用 → null.
@@ -5067,17 +5069,20 @@
 
     // ─── provider endpoints 弹窗 ──────────────────────────────────────────
     //
-    // 展示某个 provider 在 4 种 ingress 协议下的入口 URL 和支持状态.
+    // 展示某个 provider 在各 ingress 协议下的入口 URL 和支持状态.
     // 判定 SSOT: 与后端 `proxy/mod.rs::dispatch` 一致 —
     //   ingress == egress → direct (同协议透传/IR redact);
-    //   ingress != egress 且两者 codec 都支持 (openai/anthropic) → cross-protocol 转译
-    //     (注: 仅非流式, stream=true 时后端返回 501, 见 cross_proto_forward);
-    //   任一协议 codec 不支持 (gemini/ollama) → 不支持.
+    //   ingress != egress 且两者 codec 都覆盖 (openai/anthropic/openairesponses,
+    //     = 后端 `Protocol::codec_covered()`) → cross-protocol 翻译 — 经通用 IR
+    //     路径, 任意覆盖族 pair 均可; **流式仅 OpenAI⇄Anthropic** (StreamTranslate),
+    //     含 Responses 任一侧时 stream=true → 501 (其 SSE 事件翻译未实现, #183);
+    //   任一协议 codec 不覆盖 (gemini/ollama) → 不支持.
     //
-    // codec 支持矩阵与 `codec::Protocol::from_native` 一致 (仅 openai/anthropic).
+    // codec 覆盖集与 `codec::Protocol::from_native` 的 Some 集合同一事实两处编码
+    // (后端守卫: provider.rs `test_codec_covered_matches_codec_from_native`).
     // 这是 codec 内部性质, 后端无 API 暴露, 硬编码在渲染层作为派生真相; 若未来后端
     // 暴露 codec 支持信息, 应改为 fetch 派生以消除此 SSOT 漂移点.
-    const CODEC_SUPPORTED = new Set(['openai', 'anthropic']);
+    const CODEC_SUPPORTED = new Set(['openai', 'anthropic', 'openairesponses']);
 
     // #187/#179: provider 的实际 egress = 链尾实体的 protocol (入口数据
     // providersList 已在手, 本地解析). Direct → 自身 protocol; Router →
@@ -5104,12 +5109,13 @@
       // 关闭时清理, 避免内容残留 (SEC-* 精神: 数据不残留).
       dlg.addEventListener('close', () => { body.innerHTML = ''; }, { once: true });
       const origin = window.location.origin;
+      const egress = resolveEgressProtocol(p);
       const rows = state.providerShorts.map((short, i) => {
         const proto = state.providerProtocols[i];
-        const mode = ingressMode(proto, resolveEgressProtocol(p));
+        const mode = ingressMode(proto, egress);
         // encodeURIComponent 是 defense-in-depth: 后端 validate_id 限制 [A-Za-z0-9_-].
         const url = `${origin}/${short}/${encodeURIComponent(p.id)}/`;
-        return endpointRow(proto, short, mode, url);
+        return endpointRow(proto, short, mode, url, egress);
       }).join('');
       body.innerHTML = `<table class="ep-table">${rows}</table>`;
       dlg.showModal();
@@ -5117,14 +5123,21 @@
 
     // 单行渲染. 三态分支拆为两个独立派生 (url 单元格 + badge 单元格),
     // 避免嵌套三元: badge 走 mode→string 查表, url 用单层三元.
-    function endpointRow(proto, short, mode, url) {
+    // translate 的 tooltip 按 pair 分化 (M2 走查修复, 与 #183 后的实际行为对齐):
+    // 含 Responses 任一侧 → 非流式 (stream=true → 501, Responses SSE 事件翻译未实现);
+    // 否则 (OpenAI⇄Anthropic) → 流式翻译已接入 (StreamTranslate).
+    function endpointRow(proto, short, mode, url, egress) {
       const label = escapeHtml(`${proto} (/${short}/)`);
       const urlCell = mode === 'unsupported'
         ? '<td class="unsupported">not supported</td>'
         : `<td class="url"><code>${escapeHtml(url)}</code></td>`;
+      const involvesResponses = proto === 'openairesponses' || egress === 'openairesponses';
+      const translateTip = involvesResponses
+        ? 'Cross-protocol translation — non-streaming only (stream=true returns 501: Responses SSE event translation unimplemented)'
+        : 'Cross-protocol translation (streaming included) — reasoning_content is dropped';
       const badgeCell = {
         direct:      '<td><span class="badge badge-stream">direct</span></td>',
-        translate:   '<td><span class="badge" title="Non-streaming only — stream=true returns 501">translate</span></td>',
+        translate:   `<td><span class="badge" title="${translateTip}">translate</span></td>`,
         unsupported: '<td><span class="badge badge-inactive">n/a</span></td>',
       }[mode];
       return `<tr><td class="label">${label}</td>${urlCell}${badgeCell}</tr>`;

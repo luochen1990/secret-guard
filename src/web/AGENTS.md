@@ -229,8 +229,10 @@ API key CRUD **无条件挂载** (在 `web::router()`, 不依赖 `auth.enabled`)
   路由的目标, 防环 seen set, 悬空 → `?`), 忽略路由 upstream_model 重写对后续跳匹配的影响
   (展示无需 per-model 精确解析). protocol pill 显示路由 egress 的去重集合 (单一 →
   该 protocol, 短列表逗号连接, 放不下 → `mixed`). egress 标记挂静态教育 tooltip
-  (跨协议代价: reasoning_content 丢弃; 流式已接入翻译). endpoints 对话框复用同一近似
-  (`resolveEgressProtocol`).
+  (跨协议代价: reasoning_content 丢弃; 流式翻译仅 OpenAI⇄Anthropic, 含 Responses
+  任一侧时 stream=true → 501 — M2 走查对齐实际行为). endpoints 对话框复用同一近似
+  (`resolveEgressProtocol`), 其 translate 徽章 tooltip 按 pair 分化流式语义
+  (`endpointRow`), 覆盖集 `CODEC_SUPPORTED` 与后端 `Protocol::codec_covered()` 同步.
 
 ### Sidebar 分组渲染 (二级 + 三级小圆点)
 
@@ -248,8 +250,12 @@ API key CRUD **无条件挂载** (在 `web::router()`, 不依赖 `auth.enabled`)
 ### 每轮操作按钮 (info + raw)
 
 timeline 每轮 header 含两个按钮:
-- `ℹ` info: 弹窗展示传输层元数据 (method/path/status/elapsed/streamed/model/error/redactions 等,
-  全部来自 TimelineRound / TimelineTail, 无需网络请求).
+- `ℹ` info: 弹窗展示传输层元数据. 字段两路来源: 本地即时渲染 (TimelineRound 的
+  id/round_role/created_at/redactions + 末轮 TimelineTail 的 status/elapsed/streamed/
+  complete/error — 非末轮显示 "(history round)") + 异步懒拉补全 (`GET /api/records/{id}`
+  的 method/path/model/upstream_id; model 是 **egress 视角** — 路由改写生效时与
+  upstream_model 同值 (改写轮次两行显示相同值), 无改写时 = 客户端原值 — M1 走查
+  修复: record DTO 补 model 字段, 弹窗 Model 行不再恒 "(unknown)").
 - `raw`: 弹窗展示原始 req_body / resp_body / req_headers / resp_headers (按需懒拉
   `GET /api/records/{id}`). body 是 LLM 视角 (已 redact, 安全展示); headers 已脱敏
   (auth/cookie 等 = `<redacted>`; 名单 = 硬编码黑名单 ∪ `[redact] redacted_headers`,

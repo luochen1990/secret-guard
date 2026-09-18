@@ -790,11 +790,12 @@ CI runner VM 未预装 treefmt 时 check-fmt 降级 rust-only (见 justfile).
   **响应侧** `IrResponse` 无对应元数据 — 上游非流式响应显式返回 `"reasoning_content": ""`
   时, redact 路径 round-trip 后该字段会变为缺席 (信息无损失, 形态有差异).
 - **OpenAI Responses API 支持范围**: Responses 协议 (`/r/` proto_short) 已接入 codec,
-  支持 Responses ⇄ Chat Completions 跨协议翻译 (非流式) + Responses 同协议透传 + Redact (非流式).
+  支持 Responses ⇄ Chat Completions / Anthropic 跨协议翻译 (非流式, 经通用 IR 路径,
+  双向各有集成测试锁定) + Responses 同协议透传 + Redact (非流式).
   **不支持**: Responses 流式 SSE 事件翻译 (Responses + **Redact 命中** (map 非空) + `stream=true`
   返回 501, 防止 mock 静默外流; 仅路由 model 重写 (map 空, 响应无需 restore) 时流式放行 SSE 字节
   透传 — #183 D5 收窄, `resp_parsed` 因事件未解码降级 None, 前端占位;
-  跨协议 Responses 任一侧 + `stream=true` 同样 501); Responses ⇄ Anthropic 跨协议 (返回 501);
+  跨协议 Responses 任一侧 + `stream=true` 同样 501 — 含 Responses⇄Anthropic pair);
   hosted tools (web_search/file_search/computer_use/mcp → reader 读取时丢弃并有 WARN
   (`dropping tool definition(s) not representable in IR`, responses reader 丢弃点 —
   同协议 IR 重建路径同样丢弃, 仅纯字节透传不受影响; hosted tools 不进 IR 也不进
