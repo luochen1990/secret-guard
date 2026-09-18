@@ -70,7 +70,7 @@ POST   /api/providers/{id}/pool-reset → {id, reset} — 清空该 pool 全部�
                                           (非 pool 条目 400 / 不存在含 decision-Disabled 404;
                                            只动运行时内存态, 不触碰配置)
 GET    /api/providers                → pool 条目平级附加 pool_status[] (每成员
-                                          {id, active, permanent, resume_in_secs} —
+                                          {id, active, resume_in_secs} —
                                           PoolStates 只读派生, 非 pool 条目该字段缺席)
 
 GET    /api/api-keys
@@ -229,10 +229,11 @@ API key CRUD **无条件挂载** (在 `web::router()`, 不依赖 `auth.enabled`)
   "显式退出该构造" wire 语义)。
 - **列表 pool 行**: URL 列渲染成员清单 + 运行时状态徽章 (数据 = 响应的
   `pool_status` 服务端派生字段, 前端不重算): ▸ 首个 active 成员 (当前命中,
-  列表序 pick 的前端派生) + dot 三态 (● active / ◐ 耗尽至闹钟 `until HH:MM` 或
-  剩余秒 / ○ 永久挂起 `(off)`, missing/disabled 成员); 超过 2 条折叠 + "+N more"。
+  列表序解析的前端派生) + dot 两态 (● active / ◐ 耗尽至闹钟 `until HH:MM` 或
+  剩余秒 — missing/disabled 成员不进状态机, 徽章恒 active, 由 decision/enabled
+  表达); 超过 2 条折叠 + "+N more"。
   actions 附 `reset` 按钮 (`POST /api/providers/{id}/pool-reset` 后刷新)。
-  protocol pill 显示成员 egress 去重集合 (首个成员的链尾近似)。disabled pool 行
+  protocol pill 显示成员 egress 去重集合 (每成员的链尾近似; 中间 pool 跳取其首个成员)。disabled pool 行
   纯配置展示 (无运行时数据)。
 - **路由编辑器** (#179): 每行一条 `Route` — `model_pattern` (`*` 通配) / `target`
   (下拉: 其余 provider, 排除编辑对象自身防自环; 悬空目标保留 "(missing)" option,

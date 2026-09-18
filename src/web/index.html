@@ -592,13 +592,11 @@
       align-items: center;
       margin-top: 8px;
     }
-    /* 列表 pool 成员运行时状态点: ● active (绿) / ◐ 耗尽至闹钟 (琥珀) /
-       ○ 永久挂起 (灰, missing/disabled)。currentColorScheme 无关 — 纯文本
-       着色走语义变量, 自动跟随 light-dark(). */
+    /* 列表 pool 成员运行时状态点: ● active (绿) / ◐ 耗尽至闹钟 (琥珀)。
+       currentColorScheme 无关 — 纯文本着色走语义变量, 自动跟随 light-dark(). */
     .pm-dot { font-weight: 700; }
     .pm-dot.pm-on { color: var(--ok); }
     .pm-dot.pm-wait { color: var(--warn); }
-    .pm-dot.pm-off { color: var(--fg-faint); }
     .pm-cur { color: var(--accent); font-weight: 700; }
     /* Detect 协议探测 (#p-direct-fields 内, Direct 构造专属 — Router 下随组隐藏):
        按钮 + 结果区各跨整行 (form grid 两列). 结果区由 renderProbeResult 填充
@@ -4899,9 +4897,9 @@
 
     // pool 行的 URL 列: 成员清单 + 运行时状态徽章 (数据 = GET /api/providers 的
     // pool_status 字段, 服务端派生 SSOT, 前端不重算)。每成员 "▸? dot id [resume]";
-    // - ▸ 标记首个 active 成员 (当前命中成员 — 列表序 pick 的前端派生, 同后端
-    //   pick_member 语义);
-    // - dot 三态: ● active / ◐ 耗尽至闹钟 (+ resume 文案) / ○ 永久挂起 ("off");
+    // - ▸ 标记首个 active 成员 (当前命中成员 — 列表序解析的前端派生, 同后端
+    //   active_members 语义);
+    // - dot 两态: ● active / ◐ 耗尽至闹钟 (+ resume 文案);
     // - 字段缺席 (disabled 行走 ProviderMasked 无运行时数据) 降级为纯文本 id。
     // 摘要折叠同 routes: 超过 2 条折叠为首条 + "+N more" (全量 + 状态在 td title)。
     function fmtResume(secs) {
@@ -4922,17 +4920,16 @@
 
     function poolMembersCell(members, status) {
       const stat = i => (status && status[i]) || { id: members[i], active: true };
-      // 三态分类单点派生 (badge HTML 与 title 文本共用同一编码, 防两份漂移).
-      const stateOf = st => (st.active ? 'active' : (st.permanent ? 'off' : 'exhausted'));
+      // 两态分类单点派生 (badge HTML 与 title 文本共用同一编码, 防两份漂移):
+      // active / exhausted(闹钟). missing/disabled 成员不进状态机 — 徽章恒
+      // active, 配置不可用性由 provider 列表自身的 decision/enabled 表达.
+      const stateOf = st => (st.active ? 'active' : 'exhausted');
       const firstActive = members.findIndex((_, i) => stat(i).active);
       const renderMember = (m, i) => {
         const st = stat(i);
         let dot, extra = '';
         if (stateOf(st) === 'active') {
           dot = '<span class="pm-dot pm-on" title="active">●</span>';
-        } else if (stateOf(st) === 'off') {
-          dot = '<span class="pm-dot pm-off" title="suspended permanently (missing or disabled member)">○</span>';
-          extra = ' <span class="meta">(off)</span>';
         } else {
           dot = '<span class="pm-dot pm-wait" title="window-quota exhausted — suspended until its alarm expires">◐</span>';
           extra = ` <span class="meta">${escapeHtml(fmtResume(st.resume_in_secs))}</span>`;

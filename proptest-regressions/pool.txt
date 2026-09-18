@@ -4,4 +4,3 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc b864d57a32b1953a16408cefc952429235f4061093d0d678fef8029b5d8549a6 # shrinks to n_members = 1, ops = [(0, None, 0, false)]

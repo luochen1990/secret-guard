@@ -320,7 +320,7 @@ fn default_window_exhaust_headers() -> Vec<String> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoolProvider {
     /// 有序成员列表 (Direct provider ids). 顺序 failover: 列表序即优先级
-    /// (`crate::pool::PoolStates::pick_member`), 正常全打第一个可用成员.
+    /// (`crate::pool::PoolStates::active_members` 候选的列表序解析), 正常全打第一个可用成员.
     /// validate 拒绝空表 (空 members 的 pool 无法转发任何请求, 几乎肯定是
     /// 配置残缺) 与自环 (member 含自身 id).
     pub members: Vec<String>,
@@ -379,19 +379,27 @@ impl ExhaustConfig {
     /// (与配置文件可 grep 对齐), 空 = 干净; 空白条目跳过不报 (等价关闭该条,
     /// 无歧义)。
     pub fn lint_malformed_header_rules(&self) -> Vec<&str> {
+        // 畸形判定 = parse_header_rule 失败 (与检测器 matcher 共享同一 parser,
+        // 对齐是结构性的而非注释约定 — matcher 静默跳过的集合恰是这里 WARN 的
+        // 集合; 空白条目先过滤: 完全空串跳过不告警, 与 serde 空串条目语义一致).
         self.headers
             .iter()
             .filter(|s| {
                 let trimmed = s.trim();
-                !trimmed.is_empty()
-                    && trimmed.split_once('=').is_none_or(|(name, _)| {
-                        name.trim().is_empty()
-                            || axum::http::HeaderName::from_bytes(name.trim().as_bytes()).is_err()
-                    })
+                !trimmed.is_empty() && parse_header_rule(trimmed).is_none()
             })
             .map(|s| s.as_str())
             .collect()
     }
+}
+
+/// header 触发规则 `"name=value"` 的共享 parser (lint 与检测器 matcher 的
+/// 单一事实来源; 规则格式是 [`ExhaustConfig`] schema 的一部分, 故住本模块 —
+/// pool 消费方向合法)。失败 = 畸形 (无 `=` / 空 name / 非法 header 名)。
+pub fn parse_header_rule(rule: &str) -> Option<(axum::http::HeaderName, &str)> {
+    let (name, value) = rule.split_once('=')?;
+    let name = axum::http::HeaderName::from_bytes(name.trim().as_bytes()).ok()?;
+    Some((name, value))
 }
 
 /// `'*'` 通配符匹配 (仅 `'*'` 是元字符, 其余字符字面匹配; 大小写敏感)。
@@ -597,8 +605,8 @@ impl DynamicEntry for Provider {
                         return Err(format!("provider {} lists itself as pool member", self.id));
                     }
                 }
-                // 重复成员不拒绝: 同一 provider 出现两次, 第二次 pick 到它时
-                // 它已被标记耗尽, 行为无歧义 (与 Router 平行路由边先例一致).
+                // 重复成员不拒绝: 同一 provider 占两个 slot, 各有独立的闹钟
+                // 生命, 行为无歧义 (与 Router 平行路由边先例一致).
                 //
                 // 配置期 lint (WARN 不 reject, 仿 `MockStrategy::lint_candidate_space`
                 // 先例): 畸形 header 规则在检测器里被 ROB 静默跳过, 此处让手滑在
@@ -773,10 +781,10 @@ impl DynamicTable<Provider> {
     ///   链上每个 provider 必须存在且 entry-level enabled;
     /// - **路由选择** ([`RouterProvider::select_route`]): 启用路由中 model_pattern
     ///   匹配 **in-flight model** 的最大 priority 者, 并列按列表序; 无命中 → [`RouteError::NoMatch`];
-    /// - **Pool 分支** ([`PoolPicker`]): `pick_member` 无游标列表序选第一个可用
-    ///   成员; missing/disabled 成员 = 永久标记 (until=None) + 取下一个候选
-    ///   (不直接报错 — pool 的存在意义就是 failover); 全部不可用 →
-    ///   [`RouteError::AllMembersExhausted`]. 状态机实现 [`crate::pool::PoolStates`]
+    /// - **Pool 分支** ([`PoolPicker`]): `active_members` 返回候选列表 (无闹钟/
+    ///   闹钟已过, 列表序即优先级), 取第一个配置可用 (effective 存在且 enabled)
+    ///   成员; missing/disabled 候选跳过但不标记 (配置可用性不进状态机 —
+    ///   重新 enable 即时回归); 全部不可用 → [`RouteError::AllMembersExhausted`]. 状态机实现 [`crate::pool::PoolStates`]
     ///   由调用方注入 (接口倒置, 先例同 codec::StreamRestoreHook — 保持
     ///   pool → provider 单向依赖);
     /// - **model 重写 pipeline 语义**: 路由的 `upstream_model` 为 Some 时改写**立即生效** —
@@ -851,34 +859,35 @@ impl DynamicTable<Provider> {
                     cur = std::borrow::Cow::Owned(next);
                 }
                 ProviderKind::Pool(pool) => {
-                    // pick (无游标列表序) → 成员存在性/enabled 检查; missing 或
-                    // disabled 成员 = 永久标记 (until=None — disabled 是用户显式
-                    // 动作, 不做闹钟探测) + 回到 pick 取下一个候选 (内层 loop),
-                    // 与 Router 的 Missing/Disabled 503 语义不同: pool 的存在
-                    // 意义就是 failover. 内层 loop 有限步收敛 (每次 mark 后
-                    // pick 跳过该 slot, members 有限).
+                    // 候选 = 状态机的 active 成员 (无闹钟/闹钟已过, 列表序即
+                    // 优先级); 配置可用性在此逐个检查: missing (被 decision
+                    // 排除) / disabled 的候选**跳过但不标记** — 配置可用性不
+                    // 进状态机 (无持久副作用: 重新 enable 自动回归, GET
+                    // /models 的可解析性探针复用同一路径亦安全), 与 Router 的
+                    // Missing/Disabled 503 语义不同: pool 的存在意义就是 failover.
+                    // 候选耗尽 (闹钟) 或候选全配置不可用 → AllMembersExhausted
+                    // (earliest_resume: None = 配置面全不可用, 无闹钟可期).
                     //
-                    // members 直接借用 `cur.kind` (NLL: 最后使用点在内层 loop,
+                    // members 直接借用 `cur.kind` (NLL: 最后使用点在本分支内,
                     // 此后 cur 被 move 合法) — 与 Router 臂的 route 借用同形态,
                     // 零成员表 clone.
                     let pool_id = cur.id.clone();
-                    let (member_idx, next) = loop {
-                        let member_idx = pools
-                            .pick_member(&pool_id, &pool.members, std::time::Instant::now())
-                            .map_err(RouteError::AllMembersExhausted)?;
-                        match self.get_effective(&pool.members[member_idx]) {
-                            Some(next) if next.enabled => break (member_idx, next),
-                            // 悬空 (被 decision 排除) / disabled → 永久标记后取下一个.
-                            // (裸索引依赖 PoolPicker 契约 "idx < members.len()" —
-                            // 违约 = 实现方编程错误, 不做运行时防御.)
-                            _ => pools.mark_member_exhausted(
-                                &pool_id,
-                                &pool.members,
-                                member_idx,
-                                None,
-                            ),
-                        }
-                    };
+                    let candidates = pools
+                        .active_members(&pool_id, &pool.members, std::time::Instant::now())
+                        .map_err(RouteError::AllMembersExhausted)?;
+                    // 悬空 / disabled 候选 → 跳过 (无标记) 取下一候选.
+                    let (member_idx, next) = candidates
+                        .into_iter()
+                        .find_map(|idx| {
+                            self.get_effective(&pool.members[idx])
+                                .filter(|p| p.enabled)
+                                .map(|p| (idx, p))
+                        })
+                        .ok_or(RouteError::AllMembersExhausted(AllMembersExhausted {
+                            pool_id: pool_id.clone(),
+                            // 全部候选配置不可用: 无闹钟信息 (区别于闹钟型耗尽).
+                            earliest_resume: None,
+                        }))?;
                     if !visited.insert(next.id.clone()) {
                         return Err(RouteError::Cycle(next.id));
                     }
@@ -1082,8 +1091,8 @@ pub enum RouteError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AllMembersExhausted {
     pub pool_id: String,
-    /// 最早到期的闹钟 (`None` = 全部永久耗尽 — missing/disabled 成员无闹钟,
-    /// 无自动恢复, 需改配置 / 重启 / T3 复位端点).
+    /// 最早到期的闹钟 (`None` = 本路径无闹钟信息 — 通常是候选全部为配置
+    /// 不可用 (missing/disabled), 重新 enable 即时回归, 无需复位端点).
     pub earliest_resume: Option<std::time::Instant>,
 }
 
@@ -1124,30 +1133,34 @@ impl std::fmt::Display for RouteError {
 impl std::error::Error for RouteError {}
 
 /// Pool 成员状态机的消费接口 (**接口倒置**, 先例同 codec::StreamRestoreHook):
-/// [`DynamicTable::<Provider>::resolve_route`] 的图遍历需要驱动 pool 状态机
-/// (pick + 永久标记), 而状态机实现 [`crate::pool::PoolStates`] 又依赖
+/// [`DynamicTable::<Provider>::resolve_route`] 的图遍历需要读 pool 状态机
+/// (候选成员 + 耗尽标记), 而状态机实现 [`crate::pool::PoolStates`] 又依赖
 /// provider 类型 — trait 定义在本模块 (被 resolve_route 消费), 生产实现由
 /// 调用方 (proxy dispatch / 测试) 注入, 保持 pool → provider 单向依赖.
 pub trait PoolPicker: Send + Sync {
-    /// 选成员: 无游标列表序 (顺序 failover) — 返回第一个 Active slot 的下标,
-    /// 闹钟已过的 slot 顺带清除 (成员回归列表头, 前缀缓存最大化); 全部
-    /// Exhausted → [`AllMembersExhausted`] (含最早到期闹钟). `members` 是当前
-    /// 配置快照 — 实现方每次调用先做配置对齐 (WebUI 可随时改配置).
-    fn pick_member(
+    /// 候选成员: 返回全部无闹钟/闹钟已过成员的下标列表 (列表序保持 members
+    /// 优先级, 闹钟过期的顺带清除 — 成员回归列表头, 前缀缓存最大化); 全部
+    /// 成员在闹钟期内 → [`AllMembersExhausted`] (含最早到期闹钟). `members`
+    /// 是当前配置快照 — 实现方每次调用先做配置对齐 (WebUI 可随时改配置).
+    ///
+    /// **只反映耗尽闹钟, 不反映配置可用性** — missing/disabled 成员的跳过
+    /// 由调用方 (resolve_route) 对候选逐个 get_effective 检查, 无持久副作用
+    /// (重新 enable 自动回归; GET /models 探针复用同一路径亦安全).
+    fn active_members(
         &self,
         pool_id: &str,
         members: &[String],
         now: std::time::Instant,
-    ) -> Result<usize, AllMembersExhausted>;
+    ) -> Result<Vec<usize>, AllMembersExhausted>;
 
-    /// 标记成员耗尽 (幂等: 重复标记刷新 until). `until = None` = 永久
-    /// (missing/disabled 成员 — 不做闹钟探测). `members` 同上 (对齐基准).
+    /// 标记成员耗尽 (幂等: 重复标记刷新 until — 探测失败重挂闹钟).
+    /// `members` 同上 (对齐基准).
     fn mark_member_exhausted(
         &self,
         pool_id: &str,
         members: &[String],
         member_idx: usize,
-        until: Option<std::time::Instant>,
+        until: std::time::Instant,
     );
 }
 
@@ -3027,9 +3040,10 @@ mod tests {
 
     #[test]
     fn resolve_route_pool_skips_missing_and_disabled_members() {
-        // missing / disabled 成员 = 永久标记 + 取下一个候选 (不直接报错 —
-        // pool 的存在意义就是 failover); 标记的永久性经共享 PoolStates 的
-        // 后续 pick 观察 (m1 即使后来在表中补上, 也不再被 pick).
+        // missing / disabled 成员 = 跳过取下一个候选 (不直接报错 — pool 的
+        // 存在意义就是 failover), 且**无持久标记**: 配置可用性不进状态机,
+        // 成员后来补上 / 重新 enable 后下一次解析即自动回归列表头
+        // (GET /models 的可解析性探针复用同一路径, 无持久副作用).
         let pools = PoolStates::new();
         let t = ProviderTable::new(
             vec![
@@ -3050,19 +3064,15 @@ mod tests {
         assert_eq!(out.id, "m2", "ghost (missing) + disabled skipped");
         assert_eq!(out.pool.as_ref().unwrap().member_idx, 2);
 
-        // 永久标记可观察: 补上 ghost 为实体后再 pick — ghost/off 的永久标记
-        // (until=None, 不探测) 不因实体补上而失效, 仍被跳过, 落到 m2 (spec §6:
-        // "disabled 是用户显式动作"; 恢复途径 = 改 members 触发对齐重建 / 重启).
+        // 无持久标记可观察: 补上 ghost 为实体后再解析 — ghost 回归列表头
+        // (配置可用性的恢复即时生效, 无需 reset / 重启).
         t.upsert_dynamic(p("ghost", Protocol::OpenAI, "https://u-ghost"))
             .unwrap();
         let out2 = t
             .resolve_route(&t.get_effective("pl").unwrap(), "m", &pools)
             .unwrap();
-        assert_eq!(
-            out2.id, "m2",
-            "re-added member stays skipped: permanent marks never expire"
-        );
-        assert_eq!(out2.pool.as_ref().unwrap().member_idx, 2);
+        assert_eq!(out2.id, "ghost", "re-added member returns to head");
+        assert_eq!(out2.pool.as_ref().unwrap().member_idx, 0);
     }
 
     #[test]
@@ -3084,7 +3094,7 @@ mod tests {
         assert_eq!(e.pool_id, "pl");
         assert_eq!(
             e.earliest_resume, None,
-            "all members missing = permanent, no alarm"
+            "no alarm among candidates (all missing/disabled)"
         );
         let msg = err.to_string();
         assert!(msg.contains("pl"), "message names the pool: {msg}");

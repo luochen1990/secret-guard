@@ -254,12 +254,12 @@ secret-guard 检测到"窗口限额耗尽"信号后自动切换到下一个成�
 
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
-| `members` | string[] | (必填) | 有序成员列表 (Direct provider id, 每成员 = 一份独立套餐凭证). **列表序即 failover 优先级**. 空表 / 自环 (含自身 id) / 非法 id 启动报错; 悬空成员 (不存在) 写入放行, 请求时永久跳过 (重新启用后不自动回归 — 恢复途径: 删除后重加该成员 / 重启 / pool-reset 端点). 成员边参与环检测 (全部成员恒为边 — 与 route target 的 "仅启用路由构成边" 不同, 无禁用等价物). |
+| `members` | string[] | (必填) | 有序成员列表 (Direct provider id, 每成员 = 一份独立套餐凭证). **列表序即 failover 优先级**. 空表 / 自环 (含自身 id) / 非法 id 启动报错; 悬空成员 (不存在) 写入放行, 请求时跳过 — 配置可用性不进耗尽状态机, 成员补上后下一次解析即自动回归列表头. 成员边参与环检测 (全部成员恒为边 — 与 route target 的 "仅启用路由构成边" 不同, 无禁用等价物). |
 | `exhaust` | table | (内置默认表) | 耗尽信号配置 (三通道 OR, 见下). 省略整段 = 内置窗口限额默认表. |
 | `exhaust.statuses` | u16[] | `[]` (关闭) | status 通道 (匹配语义见下). |
 | `exhaust.codes` | string[] | `["1308", "1310"]` | code 通道 (匹配语义见下). |
 | `exhaust.headers` | string[] | (Claude unified 两项, 见内置默认表) | header 通道 (匹配语义见下). 畸形条目 (无 `=` / 非法 header 名) 写入时 WARN, 永不匹配. |
-| `cooldown_secs` | u64 | `60` | 兜底闹钟时长 (秒): 信号命中但解析不出精确恢复时刻时, 成员挂起 now + cooldown. 也是闹钟下限 (防探测风暴; 解析出的时刻统一 clamp 到 [cooldown, 7d]). 请配在 7d (604800) 以内 — 超过时当前实现按下限 (闹钟可超过 7d, 见契约 POOL-3 现状注记). |
+| `cooldown_secs` | u64 | `60` | 兜底闹钟时长 (秒): 信号命中但解析不出精确恢复时刻时, 成员挂起 now + cooldown. 也是闹钟下限 (防探测风暴; 解析出的时刻统一 clamp 到 [cooldown, 7d], 且 7d 封顶优先 — cooldown 配超 7d 时按下限折叠到 7d). |
 
 > **字段级替换语义**: 显式配某字段 = **替换**该字段默认值 (空数组 = 显式关闭该通道);
 > 想"删掉默认表里某个码" = 重抄剩余码. 这是有意设计 (保留删除能力).
@@ -330,7 +330,7 @@ codes = ["1308", "1310"]              # 显式配置 = 替换默认 (重抄语�
 
 **运行时观察与复位** (WebUI / API):
 
-- Providers 页对 pool 条目显示每成员运行时徽章 (active / 耗尽至剩余秒 / 永久挂起);
+- Providers 页对 pool 条目显示每成员运行时徽章 (● active / ◐ 耗尽至剩余秒 — missing/disabled 成员不进状态机, 徽章恒 active, 由 decision/enabled 表达);
 - `POST /api/providers/{id}/pool-reset` — 清空该 pool 全部成员闹钟 (知道续费了/
   换窗了想立即恢复探测时用; 幂等, 只动内存态).
 
@@ -453,10 +453,10 @@ key = "sg_ci_abc123..."
 | `secret value too short (min 3 bytes)` | secret 真值至少 3 字节. |
 | `key and key_file are mutually exclusive` / `api_key` 与 `api_key_file` 同时设置 | 二选一, 删掉其中一个. |
 | `provider ... must declare at least one route` | Router 构造的 `routes` 为空 — 空路由 router 无法转发任何请求, 启动即拒. 至少配一条 (兜底可用 `model_pattern = "*"`). |
-| `provider ... must declare at least one pool member` / `... lists itself as pool member` | Pool 构造的 `members` 为空或含自身 id — 空 pool 无法转发任何请求 / 自环必为 Cycle, 启动即拒. 成员应为 Direct provider id (指向 Router/Pool 也会链式解析, 非典型用法); 悬空成员 (不存在) 写入放行, 请求时永久跳过. |
+| `provider ... must declare at least one pool member` / `... lists itself as pool member` | Pool 构造的 `members` 为空或含自身 id — 空 pool 无法转发任何请求 / 自环必为 Cycle, 启动即拒. 成员应为 Direct provider id (指向 Router/Pool 也会链式解析, 非典型用法); 悬空成员 (不存在) 写入放行, 请求时跳过 (成员补上后自动回归). |
 | 启动 WARN `pool exhaust header rules are malformed (expected 'name=value')` | `[providers.exhaust]` 的 headers 条目缺 `=` 或 header 名非法 — 该条目永远不匹配 (等于白配), 检查拼写. |
 | 请求返回 404 `not_found` | URL 里 provider id 不存在, 或 proto 前缀拼错 (见 README 路由表). |
 | 请求返回 503 `unavailable` | provider `enabled = false`, 或路由坏链: message 含 `router provider '...' has no route matching model '...'` (无匹配路由 — 检查 model_pattern 与 priority) / `route target '...' not found` (悬空目标) / `route target '...' is disabled` / `route cycle detected` (手改配置产生的环). |
-| 请求返回 503 `unavailable` (套餐池) | 全部成员耗尽/missing/disabled: message 含 `pool provider '...' has no available member (all exhausted, missing or disabled; earliest resumes in ~Ns)` (N 秒后最早成员恢复) 或 `... no scheduled recovery` (全部永久 — 检查成员 enabled / 用 pool-reset 复位). |
+| 请求返回 503 `unavailable` (套餐池) | 全部成员耗尽/missing/disabled: message 含 `pool provider '...' has no available member (all exhausted, missing or disabled; earliest resumes in ~Ns)` (N 秒后最早成员恢复) 或 `... no scheduled recovery` (当前无闹钟成员 — 通常是成员全部 missing/disabled, 检查成员 enabled / decision; 重新启用即生效, 无需 reset). |
 
 配置文件缺失时进程仍可启动 (空配置 + 默认值, 但没有任何 provider 可转发, 启动日志有 WARN).

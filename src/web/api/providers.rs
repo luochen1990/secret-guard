@@ -416,8 +416,8 @@ pub(crate) struct UpsertProviderRequest {
     ///   Direct/Router 构造.
     /// - 空数组 `[]`: 显式**退出 Pool 构造** (与 routes=[] 的 "改回实体" 语义
     ///   同构 — 编辑 pool 条目切到 Direct/Router 时 WebUI 发空数组取消旧构造).
-    /// - 非空数组: **Pool 构造** (悬空/重复成员放行 — 运行时 pick 永久标记 +
-    ///   failover; 自环/非法 id 在 validate 拒绝).
+    /// - 非空数组: **Pool 构造** (悬空/重复成员放行 — 运行时解析跳过 missing/
+    ///   disabled 候选 + failover; 自环/非法 id 在 validate 拒绝).
     ///
     /// **构造切换**: 显式非空 `members` + 省略 `routes` = router→pool 切换
     /// (构造意图哨兵抑制对方构造字段的回填, 见 update_provider); 反向同理。

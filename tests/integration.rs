@@ -4056,8 +4056,9 @@ async fn providers_api_rejects_bad_base_url() {
 // 覆盖: 创建 / Direct↔Pool↔Router 构造切换 (三态语义 + 显式空数组退出) /
 // 运行时状态观察 (pool_status 派生) / pool-reset 端点 / exhaust lint 不拒绝。
 
-/// 启动 secret-guard, 显式注入 pool 运行时状态 (预标记耗尽 — T2 响应侧挂接
-/// 未落地前的 API 观察面测试通道; AppState 构造对齐 spawn_proxy_with_prefix)。
+/// 启动 secret-guard, 显式注入 pool 运行时状态 (预标记耗尽 — 读端点观察面的
+/// 确定性状态注入通道, 免于驱动真实 429 流量; 端到端检测链路在
+/// tests/pool_failover.rs; AppState 构造对齐 spawn_proxy_with_prefix)。
 /// providers 的 base_url 由调用方给定 (测试不转发, 无需 mock 上游)。
 async fn spawn_proxy_with_pools(
     providers: Vec<Provider>,
@@ -4155,8 +4156,8 @@ async fn providers_api_pool_create_roundtrip_and_default_exhaust() {
     assert_eq!(
         entry["pool_status"],
         serde_json::json!([
-            {"id": "oa-main", "active": true, "permanent": false, "resume_in_secs": null},
-            {"id": "glm-acc2", "active": true, "permanent": false, "resume_in_secs": null},
+            {"id": "oa-main", "active": true, "resume_in_secs": null},
+            {"id": "glm-acc2", "active": true, "resume_in_secs": null},
         ])
     );
     // 非 pool 条目不带 pool_status 字段 (向后兼容 shape).
@@ -4363,8 +4364,8 @@ async fn providers_api_pool_reset_and_runtime_status_observation() {
     let members: Vec<String> = vec!["m1".into(), "m2".into()];
     let pools = secret_guard::pool::PoolStates::new();
     let t0 = Instant::now();
-    pools.mark_member_exhausted("pl", &members, 0, Some(t0 + Duration::from_secs(3600)));
-    pools.mark_member_exhausted("pl", &members, 1, None); // 永久 (missing/disabled 形态)
+    pools.mark_member_exhausted("pl", &members, 0, t0 + Duration::from_secs(3600));
+    pools.mark_member_exhausted("pl", &members, 1, t0 + Duration::from_secs(7200));
 
     let proxy_url = spawn_proxy_with_pools(
         vec![
@@ -4376,20 +4377,19 @@ async fn providers_api_pool_reset_and_runtime_status_observation() {
     .await;
     let client = reqwest::Client::new();
 
-    // list: m1 耗尽 (剩余 ~3600s), m2 永久挂起.
+    // list: m1 耗尽 (剩余 ~3600s), m2 闹钟 ~7200s (两成员都有恢复时刻 —
+    // 状态机只有闹钟语义, 无永久形态).
     let entry = get_provider_entry(&client, &proxy_url, "pl").await;
     let st = entry["pool_status"].as_array().unwrap();
     assert_eq!(st[0]["id"], "m1");
     assert_eq!(st[0]["active"], false);
-    assert_eq!(st[0]["permanent"], false);
     let secs = st[0]["resume_in_secs"].as_u64().unwrap();
     assert!(
         (3595..=3600).contains(&secs),
         "resume_in_secs ≈ 3600, got {secs}"
     );
     assert_eq!(st[1]["active"], false);
-    assert_eq!(st[1]["permanent"], true);
-    assert_eq!(st[1]["resume_in_secs"], serde_json::Value::Null);
+    assert!(st[1]["resume_in_secs"].as_u64().unwrap() > 7000);
 
     // reset: 200 + ack; 之后 list 全 active.
     let resp = client

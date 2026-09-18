@@ -17,7 +17,7 @@
 //!    窗口限额耗尽" (三通道 OR: HTTP status / body 码 / response header),
 //!    并尽力解析恢复时刻。纯函数, ROB-*: 对任意字节输入零 panic。
 //! 3. **观察面** ([`PoolStates::member_status`] / [`PoolStates::reset`]): WebUI
-//!    的运行时状态查询 (每成员 active / 永久挂起 / 剩余秒, 只读无副作用) 与
+//!    的运行时状态查询 (每成员 active / 剩余秒, 只读无副作用) 与
 //!    手动清闹钟 (续费/换窗后立即恢复)。纯数据派生, 无新状态。
 //!
 //! # 内置默认信号表 (窗口限额语义域, SSOT 引用)
@@ -54,7 +54,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axum::http::{HeaderMap, HeaderName, StatusCode};
+use axum::http::{HeaderMap, StatusCode};
 use parking_lot::RwLock;
 use serde::Serialize;
 
@@ -65,11 +65,12 @@ use crate::provider::{AllMembersExhausted, ExhaustConfig, PoolHop, PoolPicker, P
 /// 单个成员的运行时状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemberSlot {
-    /// 可用 (从未耗尽, 或闹钟已过被 pick 顺带清除)。
+    /// 可用 (从未耗尽, 或闹钟已过被解析顺带清除)。
     Active,
-    /// 窗口限额耗尽, 挂起至 `until`; `None` = **永久** (成员 missing/disabled —
-    /// disabled 是用户显式动作, 不做闹钟探测)。
-    Exhausted { until: Option<Instant> },
+    /// 窗口限额耗尽, 挂起至 `until` (总有恢复时刻 — missing/disabled 成员
+    /// **不进状态机**: 解析时跳过 (见 `PoolPicker::active_members`), 重新
+    /// enable 后自动回归, 不产生持久副作用 (GET /models 探针同样安全)。
+    Exhausted { until: Instant },
 }
 
 /// 一个 pool 的运行时状态: slots 与配置 members 按位置对齐。`member_ids`
@@ -157,18 +158,14 @@ impl PoolStates {
     ///
     /// 纯数据, 无敏感值 (只有成员 id 与时刻, SEC-1 天然满足)。
     pub fn member_status(&self, pool_id: &str, members: &[String]) -> Vec<MemberStatusView> {
+        // 从未转发 / 已 reset 的 pool: fresh (全 Active) 折叠进统一映射路径 —
+        // 只 clone 不插入, GET 无副作用语义不变 (fresh 对齐为 no-op).
         let mut rt = {
             let guard = self.inner.read();
-            match guard.get(pool_id) {
-                Some(rt) => rt.clone(),
-                None => {
-                    // 从未转发 / 已 reset: 与 fresh 一致的全 Active 视图, 不插入.
-                    return members
-                        .iter()
-                        .map(|id| MemberStatusView::active(id))
-                        .collect();
-                }
-            }
+            guard
+                .get(pool_id)
+                .cloned()
+                .unwrap_or_else(|| PoolRuntime::fresh(members))
         };
         align_runtime(&mut rt, members);
         let now = Instant::now();
@@ -177,42 +174,34 @@ impl PoolStates {
             .zip(members)
             .map(|(slot, id)| match *slot {
                 MemberSlot::Active => MemberStatusView::active(id),
-                MemberSlot::Exhausted { until: None } => MemberStatusView {
+                MemberSlot::Exhausted { until } if until > now => MemberStatusView {
                     id: id.clone(),
                     active: false,
-                    permanent: true,
-                    resume_in_secs: None,
-                },
-                MemberSlot::Exhausted { until: Some(t) } if t > now => MemberStatusView {
-                    id: id.clone(),
-                    active: false,
-                    permanent: false,
                     // 向上取整 (div_ceil): 毫秒级残余不显示为 0s (用户视角
                     // "还剩不到 1s" 无意义), 整秒不虚加.
-                    resume_in_secs: Some(((t - now).as_millis() as u64).div_ceil(1000)),
+                    resume_in_secs: Some(((until - now).as_millis() as u64).div_ceil(1000)),
                 },
-                // 闹钟已过 (t <= now): 观察为可用, 不代跑 pick 的清除.
+                // 闹钟已过 (until <= now): 观察为可用, 不代跑解析的清除.
                 MemberSlot::Exhausted { .. } => MemberStatusView::active(id),
             })
             .collect()
     }
 
     /// 清空该 pool 全部成员闹钟 (T3 reset 端点的状态侧语义: 用户知道续费了/
-    /// 换窗了, 想立即恢复探测)。幂等: 丢弃整条运行时状态, 下次 pick 以全
-    /// Active 重建 — 语义等价 "从未耗尽"。missing/disabled 成员的永久标记
-    /// 同样被清 (若成员仍 missing, 下次解析时被 resolve_route 重新标记 —
-    /// per-request 标记语义自洽, 无泄漏窗口)。
+    /// 换窗了, 想立即恢复探测)。幂等: 丢弃整条运行时状态, 下次解析以全
+    /// Active 重建 — 语义等价 "从未耗尽"。
     pub fn reset(&self, pool_id: &str) {
         self.inner.write().remove(pool_id);
     }
 }
 
 impl MemberSlot {
-    /// 闹钟时刻 (Active → None; Exhausted 原样透传 until — None 即永久)。
+    /// 闹钟时刻 (Active → None; Exhausted 原样透传 until — 恒有时刻,
+    /// 无永久形态)。
     fn alarm(&self) -> Option<Instant> {
         match *self {
             MemberSlot::Active => None,
-            MemberSlot::Exhausted { until } => until,
+            MemberSlot::Exhausted { until } => Some(until),
         }
     }
 }
@@ -224,11 +213,9 @@ impl MemberSlot {
 pub struct MemberStatusView {
     /// 成员 id (与配置 members 按位置对齐)。
     pub id: String,
-    /// 当前可用 (Active, 或闹钟已过 — 与 pick 顺带清除语义一致)。
+    /// 当前可用 (Active, 或闹钟已过 — 与解析顺带清除语义一致)。
     pub active: bool,
-    /// 永久挂起 (missing/disabled 成员, until=None; `active` 恒 false)。
-    pub permanent: bool,
-    /// 距恢复闹钟的剩余秒 (向上取整); `None` = active 或永久挂起。
+    /// 距恢复闹钟的剩余秒 (向上取整); `None` = active。
     pub resume_in_secs: Option<u64>,
 }
 
@@ -237,54 +224,60 @@ impl MemberStatusView {
         Self {
             id: id.to_string(),
             active: true,
-            permanent: false,
             resume_in_secs: None,
         }
     }
 }
 
 impl PoolPicker for PoolStates {
-    /// pick 语义 (spec §6): 无显式 cursor — 列表序即优先级, 找第一个 Active
-    /// slot (闹钟已过的顺带清除为 Active → 成员回归列表头); 全部 Exhausted →
-    /// Err (含最早到期的闹钟; 全 None = 全永久, 无自动恢复)。
+    /// 候选语义: 返回全部**无闹钟/闹钟已过**成员的 idx 列表 (列表序保持
+    /// members 优先级; 闹钟过期的顺带清除为 Active → 成员回归列表头)。
+    /// 调用方 (resolve_route) 自行对候选做 get_effective 检查跳过
+    /// missing/disabled — 配置可用性不进状态机 (无持久副作用, 重新 enable
+    /// 自动回归; GET /models 探针复用同一路径亦安全)。全部成员在闹钟期内
+    /// → Err (含最早到期时刻)。
     ///
-    /// 拿写锁而非读锁: pick 可能写三处 (首次 entry 插入 / 配置对齐重建 /
+    /// 拿写锁而非读锁: 解析可能写三处 (首次 entry 插入 / 配置对齐重建 /
     /// 过期闹钟清除), 读升级写不存在, 语义简单优先。
-    fn pick_member(
+    fn active_members(
         &self,
         pool_id: &str,
         members: &[String],
         now: Instant,
-    ) -> Result<usize, AllMembersExhausted> {
+    ) -> Result<Vec<usize>, AllMembersExhausted> {
         self.with_pool(pool_id, members, |rt| {
+            let mut out = Vec::new();
             for (idx, slot) in rt.slots.iter_mut().enumerate() {
                 match *slot {
-                    MemberSlot::Active => return Ok(idx),
-                    MemberSlot::Exhausted { until: Some(t) } if t <= now => {
-                        // 闹钟过期: 顺带清除为 Active (下次 pick 不会再走到这里)。
+                    MemberSlot::Active => out.push(idx),
+                    MemberSlot::Exhausted { until } if until <= now => {
+                        // 闹钟过期: 顺带清除为 Active (下次解析不再走到这里)。
                         *slot = MemberSlot::Active;
-                        return Ok(idx);
+                        out.push(idx);
                     }
                     MemberSlot::Exhausted { .. } => {}
                 }
             }
-            // 全部 Exhausted: earliest = Some(until) 的最小值; 全永久 (None) → None。
-            Err(AllMembersExhausted {
-                pool_id: pool_id.to_string(),
-                earliest_resume: rt.slots.iter().filter_map(|s| s.alarm()).min(),
-            })
+            if out.is_empty() {
+                Err(AllMembersExhausted {
+                    pool_id: pool_id.to_string(),
+                    earliest_resume: rt.slots.iter().filter_map(|s| s.alarm()).min(),
+                })
+            } else {
+                Ok(out)
+            }
         })
     }
 
     /// mark 语义 (spec §6): 该 slot → Exhausted{until} (**幂等**: 重复标记
     /// 刷新 until — 探测失败重挂闹钟)。idx 越界 (配置并发变更窗口内对齐后
-    /// 失效) 静默忽略 — 下次 pick 对齐后自然收敛, 不 panic (ROB-*)。
+    /// 失效) 静默忽略 — 下次解析对齐后自然收敛, 不 panic (ROB-*)。
     fn mark_member_exhausted(
         &self,
         pool_id: &str,
         members: &[String],
         member_idx: usize,
-        until: Option<Instant>,
+        until: Instant,
     ) {
         self.with_pool(pool_id, members, |rt| {
             if let Some(slot) = rt.slots.get_mut(member_idx) {
@@ -384,10 +377,9 @@ pub fn detect_exhaustion(
 /// 名 / 非法 value 字节) 跳过 — 配置卫生问题不让检测路径 panic (ROB-*),
 /// 静默不匹配。
 fn header_rule_matches(headers: &HeaderMap, rule: &str) -> bool {
-    let Some((name, value)) = rule.split_once('=') else {
-        return false;
-    };
-    let Ok(name) = HeaderName::from_bytes(name.trim().as_bytes()) else {
+    // 解析共享 provider::parse_header_rule (与配置期 lint 单一事实来源 —
+    // 畸形规则在两边的行为结构性对齐: 这里静默不中, lint 那里 WARN).
+    let Some((name, value)) = crate::provider::parse_header_rule(rule) else {
         return false;
     };
     headers
@@ -416,13 +408,16 @@ fn collect_body_codes(body: &serde_json::Value) -> Vec<&str> {
 }
 
 /// 解析出的恢复时刻 clamp 到 `[now+cooldown, now+7d]` (cap 优先于下限 —
-/// 用户配 cooldown > 7d 时按封顶; `checked_add` 防极端 cooldown 溢出,
+/// 用户配 cooldown > 7d 时下限折叠到封顶; `checked_add` 防极端 cooldown 溢出,
 /// 溢出按封顶处理)。
 fn clamp_resume(t: Instant, now: Instant, cooldown_secs: u64) -> Instant {
     let upper = now + RESUME_CAP; // 7d 恒在单调钟安全边界内
+    // 下限不得越过封顶 (cap 优先): cooldown > 7d 时折叠为 upper, 防"下限
+    // 先命中"把恢复时刻推过 7d (回归锁: resume_cap_wins_when_cooldown_exceeds_cap).
     let lower = now
         .checked_add(Duration::from_secs(cooldown_secs))
-        .unwrap_or(upper);
+        .unwrap_or(upper)
+        .min(upper);
     if t < lower {
         lower
     } else if t > upper {
@@ -579,18 +574,14 @@ impl PoolWatch {
             return;
         };
         let now = Instant::now();
-        // 兜底闹钟: checked_add 防极端 cooldown (≥ ~9.2e9s 超单调钟表示域)
-        // 溢出 panic — 与 clamp_resume 同型防御, 溢出按 7d 封顶 (ROB-*).
-        let until = hit.resume_at.unwrap_or_else(|| {
-            now.checked_add(Duration::from_secs(self.cfg.cooldown_secs))
-                .unwrap_or(now + RESUME_CAP)
-        });
-        self.states.mark_member_exhausted(
-            &self.pool_id,
-            &self.cfg.members,
-            self.member_idx,
-            Some(until),
-        );
+        // 兜底闹钟复用 clamp_resume (下限 + 7d 封顶 + 溢出防御的不变量单点 —
+        // t = now 时 clamp 结果即 now+cooldown 折叠形态): 解析路径与兜底路径的
+        // 封顶语义由此结构性同源 (回归锁: watch_fallback_alarm_* 两档).
+        let until = hit
+            .resume_at
+            .unwrap_or_else(|| clamp_resume(now, now, self.cfg.cooldown_secs));
+        self.states
+            .mark_member_exhausted(&self.pool_id, &self.cfg.members, self.member_idx, until);
         let member = self
             .cfg
             .members
@@ -618,6 +609,7 @@ mod tests {
     use proptest::prelude::*;
 
     use crate::provider::PoolPicker;
+    use axum::http::HeaderName;
 
     fn members(ids: &[&str]) -> Vec<String> {
         ids.iter().map(|s| s.to_string()).collect()
@@ -988,6 +980,29 @@ mod tests {
     }
 
     #[test]
+    fn resume_cap_wins_when_cooldown_exceeds_cap() {
+        // 病态配置 cooldown > 7d (非溢出区间): cap 优先于下限 — 解析出的
+        // 任意恢复时刻 (含落在 cap 与 cooldown 之间的) 都不得越过 7d 封顶.
+        let over_cap_cooldown = (7 * 24 * 3600 + 24 * 3600) as u64; // 8d
+        for retry_after in ["648000", "432000", "60"] {
+            // 7.5d / 5d / 1min
+            let hit = detect_exhaustion(
+                &ExhaustConfig::default(),
+                over_cap_cooldown,
+                status(429),
+                &hdrs(&[("retry-after", retry_after)]),
+                br#"{"error":{"code":"1308"}}"#,
+            )
+            .unwrap();
+            assert_instant_close(
+                hit.resume_at.unwrap(),
+                Instant::now() + RESUME_CAP,
+                "cap wins over oversized cooldown",
+            );
+        }
+    }
+
+    #[test]
     fn resume_floored_at_cooldown() {
         // Retry-After: 0 → 下限 cooldown (防探测风暴); 过去时刻的
         // next_flush_time 同样折叠到下限.
@@ -1057,96 +1072,66 @@ mod tests {
         );
     }
 
-    // ─── pick: 无游标列表序 + 闹钟语义 ───────────────────────────────────
+    // ─── active_members: 无游标列表序 + 闹钟语义 ──────────────────────────
 
     #[test]
-    fn pick_returns_first_active_in_list_order() {
-        // 列表序即优先级: 正常全打第一个成员 (顺序 failover).
+    fn active_members_returns_in_list_order() {
+        // 列表序即优先级: 全 Active 时返回全部下标 (调用方取第一个可用).
         let pools = PoolStates::new();
         let m = members(&["a", "b", "c"]);
         let now = Instant::now();
-        assert_eq!(pools.pick_member("pl", &m, now).unwrap(), 0);
-        // 重复 pick 稳定 (无游标 — 状态不变则结果不变).
-        assert_eq!(pools.pick_member("pl", &m, now).unwrap(), 0);
+        assert_eq!(pools.active_members("pl", &m, now).unwrap(), vec![0, 1, 2]);
+        // 重复调用稳定 (无游标 — 状态不变则结果不变).
+        assert_eq!(pools.active_members("pl", &m, now).unwrap(), vec![0, 1, 2]);
     }
 
     #[test]
-    fn pick_skips_exhausted_until_alarm_expires_then_returns_to_head() {
-        // 成员 0 耗尽 → pick 落到成员 1; 闹钟过期后成员 0 回归**列表头**
+    fn active_members_skips_exhausted_until_alarm_expires_then_head_returns() {
+        // 成员 0 耗尽 → 候选只剩成员 1; 闹钟过期后成员 0 回归**列表头**
         // (前缀缓存最大化 — 无游标设计的核心收益).
         let pools = PoolStates::new();
         let m = members(&["a", "b"]);
         let t0 = Instant::now();
-        pools.mark_member_exhausted("pl", &m, 0, Some(t0 + Duration::from_secs(100)));
+        pools.mark_member_exhausted("pl", &m, 0, t0 + Duration::from_secs(100));
         assert_eq!(
             pools
-                .pick_member("pl", &m, t0 + Duration::from_secs(1))
+                .active_members("pl", &m, t0 + Duration::from_secs(1))
                 .unwrap(),
-            1
+            vec![1]
         );
-        // 闹钟未过: 仍在成员 1.
+        // 闹钟未过: 仍只有成员 1.
         assert_eq!(
             pools
-                .pick_member("pl", &m, t0 + Duration::from_secs(99))
+                .active_members("pl", &m, t0 + Duration::from_secs(99))
                 .unwrap(),
-            1
+            vec![1]
         );
-        // 闹钟已过: 成员 0 回归 (顺带清除为 Active).
+        // 闹钟已过: 成员 0 回归列表头 (顺带清除为 Active).
         assert_eq!(
             pools
-                .pick_member("pl", &m, t0 + Duration::from_secs(101))
+                .active_members("pl", &m, t0 + Duration::from_secs(101))
                 .unwrap(),
-            0
+            vec![0, 1]
         );
         assert_eq!(
             slots_of(&pools, "pl")[0],
             MemberSlot::Active,
             "expired alarm cleared"
         );
-        // 清除后再 pick (闹钟早已过去): 仍选成员 0.
-        assert_eq!(
-            pools
-                .pick_member("pl", &m, t0 + Duration::from_secs(200))
-                .unwrap(),
-            0
-        );
     }
 
     #[test]
-    fn pick_permanent_marks_never_expire() {
-        // until=None 永久 (missing/disabled 成员): 任意时刻不再回归.
-        let pools = PoolStates::new();
-        let m = members(&["a", "b"]);
-        let t0 = Instant::now();
-        pools.mark_member_exhausted("pl", &m, 0, None);
-        pools.mark_member_exhausted("pl", &m, 1, Some(t0 + Duration::from_secs(10)));
-        assert_eq!(
-            pools
-                .pick_member("pl", &m, t0 + Duration::from_secs(1000))
-                .unwrap(),
-            1,
-            "only the alarmed member recovers; the permanent one never does"
-        );
-    }
-
-    #[test]
-    fn pick_all_exhausted_reports_earliest_alarm() {
-        // 全部 Exhausted → Err(earliest = Some(until) 的最小值).
+    fn active_members_all_exhausted_reports_earliest_alarm() {
+        // 全部 Exhausted → Err(earliest = until 的最小值).
         let pools = PoolStates::new();
         let m = members(&["a", "b", "c"]);
         let t0 = Instant::now();
-        pools.mark_member_exhausted("pl", &m, 0, Some(t0 + Duration::from_secs(300)));
-        pools.mark_member_exhausted("pl", &m, 1, None);
-        pools.mark_member_exhausted("pl", &m, 2, Some(t0 + Duration::from_secs(100)));
-        let err = pools.pick_member("pl", &m, t0).unwrap_err();
+        pools.mark_member_exhausted("pl", &m, 0, t0 + Duration::from_secs(300));
+        pools.mark_member_exhausted("pl", &m, 1, t0 + Duration::from_secs(200));
+        pools.mark_member_exhausted("pl", &m, 2, t0 + Duration::from_secs(100));
+        let err = pools.active_members("pl", &m, t0).unwrap_err();
         assert_eq!(err.pool_id, "pl");
         assert_eq!(err.earliest_resume, Some(t0 + Duration::from_secs(100)));
-
-        // 全永久 → earliest = None (无自动恢复).
-        pools.mark_member_exhausted("pl", &m, 0, None);
-        pools.mark_member_exhausted("pl", &m, 2, None);
-        let err = pools.pick_member("pl", &m, t0).unwrap_err();
-        assert_eq!(err.earliest_resume, None);
     }
 
     // ─── mark_exhausted: 幂等刷新 + 越界防御 ─────────────────────────────
@@ -1157,20 +1142,14 @@ mod tests {
         let pools = PoolStates::new();
         let m = members(&["a"]);
         let t0 = Instant::now();
-        pools.mark_member_exhausted("pl", &m, 0, Some(t0 + Duration::from_secs(10)));
-        pools.mark_member_exhausted("pl", &m, 0, Some(t0 + Duration::from_secs(999)));
+        pools.mark_member_exhausted("pl", &m, 0, t0 + Duration::from_secs(10));
+        pools.mark_member_exhausted("pl", &m, 0, t0 + Duration::from_secs(999));
         assert_eq!(
             slots_of(&pools, "pl")[0],
             MemberSlot::Exhausted {
-                until: Some(t0 + Duration::from_secs(999))
+                until: t0 + Duration::from_secs(999)
             },
             "repeated mark refreshes (not min/max — last write wins)"
-        );
-        // 永久 ↔ 闹钟互转同样直接覆盖.
-        pools.mark_member_exhausted("pl", &m, 0, None);
-        assert_eq!(
-            slots_of(&pools, "pl")[0],
-            MemberSlot::Exhausted { until: None }
         );
     }
 
@@ -1179,7 +1158,7 @@ mod tests {
         // idx 越界 (配置并发变更窗口) 静默忽略 — ROB-*: 不 panic, 不误标.
         let pools = PoolStates::new();
         let m = members(&["a"]);
-        pools.mark_member_exhausted("pl", &m, 7, Some(Instant::now()));
+        pools.mark_member_exhausted("pl", &m, 7, Instant::now());
         assert_eq!(slots_of(&pools, "pl"), vec![MemberSlot::Active]);
     }
 
@@ -1200,60 +1179,55 @@ mod tests {
     }
 
     #[test]
-    fn member_status_maps_exhausted_permanent_and_expired_alarm() {
-        // 三态映射: 耗尽(闹钟) → active=false + resume_in_secs ≈ 剩余秒;
-        // 永久 → permanent; 闹钟已过 → 观察 active (pick 顺带清除的同义观察).
+    fn member_status_maps_exhausted_and_expired_alarm() {
+        // 两态映射: 耗尽(闹钟) → active=false + resume_in_secs ≈ 剩余秒;
+        // 闹钟已过 → 观察 active (解析顺带清除的同义观察).
         let pools = PoolStates::new();
-        let m = members(&["a", "b", "c"]);
+        let m = members(&["a", "b"]);
         let t0 = Instant::now();
-        pools.mark_member_exhausted("pl", &m, 0, Some(t0 + Duration::from_secs(3600)));
-        pools.mark_member_exhausted("pl", &m, 1, None);
+        pools.mark_member_exhausted("pl", &m, 0, t0 + Duration::from_secs(3600));
         pools.mark_member_exhausted(
             "pl",
             &m,
-            2,
-            t0.checked_sub(Duration::from_secs(1)), // 早已过期的闹钟
+            1,
+            t0.checked_sub(Duration::from_secs(1)).unwrap_or(t0), // 早已过期的闹钟
         );
         let st = pools.member_status("pl", &m);
         assert_eq!(st[0].id, "a");
-        assert!(!st[0].active && !st[0].permanent);
+        assert!(!st[0].active);
         assert_eq!(st[0].resume_in_secs, Some(3600), "ceil to full seconds");
-        assert!(!st[1].active && st[1].permanent && st[1].resume_in_secs.is_none());
-        assert_eq!(st[2], MemberStatusView::active("c"));
+        assert_eq!(st[1], MemberStatusView::active("b"));
     }
 
     #[test]
     fn member_status_aligns_with_current_config_members() {
-        // 对齐语义与 pick 同源: 同位置同 id 保留耗尽状态, id 变更 → 新成员
+        // 对齐语义与解析同源: 同位置同 id 保留耗尽状态, id 变更 → 新成员
         // Active (观察视图跟随配置, 不残留旧位置的耗尽).
         let pools = PoolStates::new();
         let m0 = members(&["a", "b"]);
-        pools.mark_member_exhausted("pl", &m0, 0, None);
+        pools.mark_member_exhausted("pl", &m0, 0, Instant::now() + Duration::from_secs(50));
         let m1 = members(&["a", "c"]);
         let st = pools.member_status("pl", &m1);
-        assert!(
-            !st[0].active && st[0].permanent,
-            "same-position same-id keeps state"
-        );
+        assert!(!st[0].active, "same-position same-id keeps state");
         assert_eq!(st[1], MemberStatusView::active("c"));
     }
 
     #[test]
     fn reset_clears_all_member_alarms_and_is_idempotent() {
-        // reset = 丢弃整条运行时状态: 全部成员回到 Active (含永久标记);
-        // 重复 reset 无副作用; 丢弃后 pick 立即回到列表头成员.
+        // reset = 丢弃整条运行时状态: 全部成员回到 Active;
+        // 重复 reset 无副作用; 丢弃后解析立即回到列表头成员.
         let pools = PoolStates::new();
         let m = members(&["a", "b"]);
         let t0 = Instant::now();
-        pools.mark_member_exhausted("pl", &m, 0, Some(t0 + Duration::from_secs(999)));
-        pools.mark_member_exhausted("pl", &m, 1, None);
+        pools.mark_member_exhausted("pl", &m, 0, t0 + Duration::from_secs(999));
+        pools.mark_member_exhausted("pl", &m, 1, t0 + Duration::from_secs(999));
         pools.reset("pl");
         assert_eq!(
             pools.member_status("pl", &m),
             vec![MemberStatusView::active("a"), MemberStatusView::active("b")]
         );
         pools.reset("pl"); // 幂等: 不存在条目时 remove 是 no-op.
-        assert_eq!(pools.pick_member("pl", &m, t0).unwrap(), 0);
+        assert_eq!(pools.active_members("pl", &m, t0).unwrap(), vec![0, 1]);
     }
 
     // ─── 配置对齐重建 ─────────────────────────────────────────────────────
@@ -1263,39 +1237,36 @@ mod tests {
         // 对齐三态 (spec §6): 长度变化 / 顺序变化 / 同位置同 id 保留.
         let pools = PoolStates::new();
         let t0 = Instant::now();
-        // 初始 [a, b, c]: a 永久, b 闹钟.
+        // 初始 [a, b, c]: a 闹钟 50s, b/c Active.
         let m0 = members(&["a", "b", "c"]);
-        pools.mark_member_exhausted("pl", &m0, 0, None);
-        pools.mark_member_exhausted("pl", &m0, 1, Some(t0 + Duration::from_secs(50)));
+        pools.mark_member_exhausted("pl", &m0, 0, t0 + Duration::from_secs(50));
 
-        // ① 长度变化 [a, b, c] → [a, c]: 位置 0 同 id a → 永久保留; 位置 1
+        // ① 长度变化 [a, b, c] → [a, c]: 位置 0 同 id a → 闹钟保留; 位置 1
         //    旧 b vs 新 c → 新成员 Active.
         let m1 = members(&["a", "c"]);
         assert_eq!(
-            pools.pick_member("pl", &m1, t0).unwrap(),
-            1,
-            "c is active, a stays permanent"
-        );
-        assert_eq!(
-            slots_of(&pools, "pl")[0],
-            MemberSlot::Exhausted { until: None }
+            pools.active_members("pl", &m1, t0).unwrap(),
+            vec![1],
+            "c is active, a stays alarmed"
         );
 
         // ② 顺序变化 [a, c] → [c, a]: 逐位置比较 → 两位置 id 都变了 → 全新
         //    Active (耗尽状态不跨顺序迁移 — id 变了视为新成员).
         let m2 = members(&["c", "a"]);
-        assert_eq!(pools.pick_member("pl", &m2, t0).unwrap(), 0);
+        assert_eq!(pools.active_members("pl", &m2, t0).unwrap(), vec![0, 1]);
         assert_eq!(
             slots_of(&pools, "pl"),
             vec![MemberSlot::Active, MemberSlot::Active]
         );
 
-        // ③ 同列表重复 pick: 状态保留 (完全一致不重建).
-        pools.mark_member_exhausted("pl", &m2, 1, None);
-        assert_eq!(pools.pick_member("pl", &m2, t0).unwrap(), 0);
+        // ③ 同列表重复解析: 状态保留 (完全一致不重建).
+        pools.mark_member_exhausted("pl", &m2, 1, t0 + Duration::from_secs(50));
+        assert_eq!(pools.active_members("pl", &m2, t0).unwrap(), vec![0]);
         assert_eq!(
             slots_of(&pools, "pl")[1],
-            MemberSlot::Exhausted { until: None }
+            MemberSlot::Exhausted {
+                until: t0 + Duration::from_secs(50)
+            }
         );
     }
 
@@ -1328,7 +1299,7 @@ mod tests {
             br#"{"error":{"code":"1308"}}"#,
         );
         match slots_of(&pools, "pl")[0] {
-            MemberSlot::Exhausted { until: Some(t) } => {
+            MemberSlot::Exhausted { until: t } => {
                 let expect = Instant::now() + Duration::from_secs(30);
                 assert_instant_close(t, expect, "cooldown fallback alarm");
             }
@@ -1348,7 +1319,7 @@ mod tests {
             br#"{"error":{"code":"1308"}}"#,
         );
         match slots_of(&pools, "pl")[0] {
-            MemberSlot::Exhausted { until: Some(t) } => {
+            MemberSlot::Exhausted { until: t } => {
                 let expect = Instant::now() + Duration::from_secs(120);
                 assert_instant_close(t, expect, "retry-after precise alarm");
             }
@@ -1358,7 +1329,7 @@ mod tests {
 
     #[test]
     fn watch_fallback_alarm_with_absurd_cooldown_caps_at_7d_no_panic() {
-        // M1 回归锁: cooldown_secs = u64::MAX + 无恢复来源 → 兜底闹钟
+        // M1 回归锁 (溢出档): cooldown_secs = u64::MAX + 无恢复来源 → 兜底闹钟
         // checked_add 溢出按 7d 封顶, 不 panic (裸 `now + duration` 会溢出).
         let pools = PoolStates::new();
         let m = members(&["a", "b"]);
@@ -1369,9 +1340,31 @@ mod tests {
             br#"{"error":{"code":"1308"}}"#,
         );
         match slots_of(&pools, "pl")[0] {
-            MemberSlot::Exhausted { until: Some(t) } => {
+            MemberSlot::Exhausted { until: t } => {
                 let expect = Instant::now() + RESUME_CAP;
                 assert_instant_close(t, expect, "overflow fallback capped at 7d");
+            }
+            other => panic!("expected alarmed Exhausted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn watch_fallback_alarm_obeys_7d_cap_for_oversized_cooldown() {
+        // M1 回归锁 (非溢出越界档): cooldown_secs = 8d (> 7d 封顶) + 无恢复
+        // 来源 (Claude header 形态的典型场景) → 兜底闹钟同样折叠到 7d —
+        // 与 clamp_resume 的 cap-优先判序同一不变量, 两路径封顶语义一致.
+        let pools = PoolStates::new();
+        let m = members(&["a", "b"]);
+        let w = watch(&pools, &m, 7 * 24 * 3600 + 24 * 3600); // 8d, 不溢出
+        w.detect_and_mark(
+            status(429),
+            &HeaderMap::new(),
+            br#"{"error":{"code":"1308"}}"#,
+        );
+        match slots_of(&pools, "pl")[0] {
+            MemberSlot::Exhausted { until: t } => {
+                let expect = Instant::now() + RESUME_CAP;
+                assert_instant_close(t, expect, "oversized cooldown folded to 7d cap");
             }
             other => panic!("expected alarmed Exhausted, got {other:?}"),
         }
@@ -1395,25 +1388,25 @@ mod tests {
             w.detect_and_mark(status, &HeaderMap::new(), body);
         }
         assert_eq!(
-            pools.pick_member("pl", &m, Instant::now()).unwrap(),
-            0,
-            "no signal → member 0 stays active (2xx short-circuit + non-signal errors)"
+            pools.active_members("pl", &m, Instant::now()).unwrap(),
+            vec![0, 1],
+            "no signal → members stay active (2xx short-circuit + non-signal errors)"
         );
     }
 
     // ─── proptest: 状态机全态空间鲁棒性 ───────────────────────────────────
 
-    // 任意耗尽/恢复/配置变更序列下: pick 永不 panic 且返回值 sound
-    // (Ok ⇒ idx < members.len(); Err ⇒ AllMembersExhausted 且 pool_id 回显).
-    // 结构: 每步先 pick (在任意中间状态下断言 soundness), 再做一次状态变更
-    // (mark 带闹钟/永久两态, 或配置重组覆盖长度/顺序变化) — 保证 pick 分支
+    // 任意耗尽/恢复/配置变更序列下: 解析永不 panic 且返回值 sound
+    // (Ok ⇒ 非空下标列表且全部 < members.len(); Err ⇒ AllMembersExhausted 且
+    // pool_id 回显). 结构: 每步先解析 (在任意中间状态下断言 soundness), 再做
+    // 一次状态变更 (mark 闹钟, 或配置重组覆盖长度/顺序变化) — 保证解析分支
     // 恒被覆盖 (生成器覆盖度, 历史教训: 生成器太窄致漏测).
     proptest! {
         #[test]
         fn prop_pool_states_arbitrary_sequences_never_panic(
             n_members in 1usize..6,
             ops in proptest::collection::vec(
-                (0usize..8, proptest::option::of(0u64..600), 0u64..300, proptest::bool::ANY),
+                (0usize..8, 0u64..600, 0u64..300, proptest::bool::ANY),
                 0..60,
             ),
         ) {
@@ -1426,17 +1419,18 @@ mod tests {
             for (op_idx, until_off, advance, reconfig) in &ops {
                 now += Duration::from_secs(*advance);
                 // 每步 pick: 任意中间状态下 sound.
-                match pools.pick_member("pl", &members, now) {
-                    Ok(i) => {
+                match pools.active_members("pl", &members, now) {
+                    Ok(idxs) => {
                         pick_count += 1;
-                        prop_assert!(i < members.len(), "pick index out of range");
+                        prop_assert!(!idxs.is_empty(), "active list never empty on Ok");
+                        prop_assert!(*idxs.last().unwrap() < members.len(), "index out of range");
                     }
                     Err(e) => {
                         prop_assert_eq!(e.pool_id, "pl");
                     }
                 }
                 // 状态变更: 配置重组 (长度/顺序变化/重复成员 — validate 允许
-                // 重复 id, 生成器须覆盖) 或 mark (闹钟/永久).
+                // 重复 id, 生成器须覆盖) 或 mark (闹钟).
                 let op_idx = *op_idx;
                 let idx = op_idx % members.len();
                 if *reconfig {
@@ -1454,7 +1448,7 @@ mod tests {
                         "pl",
                         &members,
                         idx,
-                        until_off.map(|s| now + Duration::from_secs(s)),
+                        now + Duration::from_secs(*until_off),
                     );
                 }
             }

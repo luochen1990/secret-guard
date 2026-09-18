@@ -1127,19 +1127,19 @@ chars (char boundary 安全); 其余事件字段为受控类型, 天然无 secre
 
 **陈述**: pick 无游标 — `members` 配置列表序即优先级, 每次请求解析 (`resolve_route` 的 Pool 跳, per-request) 选第一个 Active 成员。
 
-- **闹钟回归**: 闹钟到期成员被 pick 顺带清除, 自然回归**列表头** (前缀缓存最大化命中, 无游标状态); 全部成员 Exhausted → `AllMembersExhausted` (含最早到期闹钟; 全永久 = None)。
+- **闹钟回归**: 闹钟到期成员被解析顺带清除, 自然回归**列表头** (前缀缓存最大化命中, 无游标状态); 全部成员在闹钟期内 → `AllMembersExhausted` (含最早到期闹钟)。
 - **配置对齐重建**: 配置随时可改 (WebUI) — 同位置同 id 保留耗尽状态, id 变化 (含长度/顺序变化导致的错位) 视为新成员 (Active)。
-- **missing/disabled 成员**: **永久标记** (`until=None`, 不探测 — disabled 是用户显式动作) + 取下一候选 (不直接报错 — pool 的存在意义就是 failover); 重新启用后不自动回归, 恢复途径 = 改 members / 重启 / pool-reset 端点。
+- **missing/disabled 成员**: 解析时**跳过但不标记** (配置可用性不进状态机 — 无持久副作用: GET /models 的可解析性探针复用同一解析路径亦安全); 重新 enable / 补上实体后下一次解析即自动回归列表头。
 - **持久化**: 运行时状态仅存内存不持久化 (真相在上游, 重启重新探测)。
 - **嵌套与环**: Router→Pool / Pool→Router 天然支持; pool members 构成新图边 — `would_cycle` / `find_cycles` 边集含**全部** members (与 route target 的 "仅启用路由构成边" 不同, members 无禁用等价物), `resolve_route` visited-set 运行时兜底。
 
 **Properties**:
-- `prop_pool_pick_first_active_list_order`: pick 恒返回第一个 Active 成员 (重复 pick 稳定 — 无游标, 状态不变则结果不变); 闹钟过期成员回归列表头; 永久标记任意时刻不回归. 🔁→`pick_returns_first_active_in_list_order` + `pick_skips_exhausted_until_alarm_expires_then_returns_to_head` + `pick_permanent_marks_never_expire` (`src/pool.rs`)
-- `prop_pool_all_exhausted_earliest_alarm`: 全部 Exhausted → Err 携带最早到期闹钟 (全永久 = None) + pool_id 回显. 🔁→`pick_all_exhausted_reports_earliest_alarm` (`src/pool.rs`)
+- `prop_pool_pick_first_active_list_order`: 解析恒取候选列表 (列表序) 的第一个配置可用成员 (重复解析稳定 — 无游标, 状态不变则结果不变); 闹钟过期成员回归列表头. 🔁→`active_members_returns_in_list_order` + `active_members_skips_exhausted_until_alarm_expires_then_head_returns` + `resolve_route_pool_skips_missing_and_disabled_members` (`src/pool.rs` / `src/provider.rs`)
+- `prop_pool_all_exhausted_earliest_alarm`: 全部成员在闹钟期内 → Err 携带最早到期闹钟 + pool_id 回显; 候选全为配置不可用 (missing/disabled) → 同 Err 但 earliest = None (无闹钟可期 — 配置可用性不进状态机, 重新 enable 即时回归). 🔁→`active_members_all_exhausted_reports_earliest_alarm` + `resolve_route_pool_all_unavailable_sanitized_message` (`src/pool.rs` / `src/provider.rs`)
 - `prop_pool_config_realignment_positional`: 配置对齐 — 完全一致保留 / 同位置同 id 保留耗尽状态 / id 变化视为新成员 (长度变化 / 顺序变化). 🔁→`align_rebuilds_on_member_changes_preserving_same_position_same_id` + `member_status_aligns_with_current_config_members` (`src/pool.rs`)
-- `prop_pool_missing_disabled_permanent_skip`: missing/disabled 成员被永久标记并跳过 (取下一候选, 不报错). 🔁→`resolve_route_pool_skips_missing_and_disabled_members` + `resolve_route_pool_picks_first_member` (`src/provider.rs`)
+- `prop_pool_missing_disabled_skip_no_persistent_mark`: missing/disabled 成员被跳过 (取下一候选, 不报错, **无持久标记** — 补上实体后回归列表头). 🔁→`resolve_route_pool_skips_missing_and_disabled_members` + `resolve_route_pool_picks_first_member` (`src/provider.rs`)
 - `prop_pool_nesting_and_cycle_edges`: Router→Pool 嵌套解析; pool 成员边参与三层环检测 (visited-set 运行时 / would_cycle upsert / find_cycles 启动诊断). 🔁→`resolve_route_router_to_pool_nesting` + `resolve_route_pool_cycle_detected` + `would_cycle_covers_pool_member_edges` + `find_cycles_detects_pool_edges` (`src/provider.rs`)
-- `prop_pool_states_arbitrary_sequences_never_panic`: 任意耗尽/恢复/配置变更序列下 pick 永不 panic 且返回值 sound (Ok ⇒ idx < members.len(); Err ⇒ pool_id 回显) — 状态机全态空间鲁棒性; 生成器覆盖 mark 闹钟/永久两态与配置重组 (长度/顺序/重复成员). ✅
+- `prop_pool_states_arbitrary_sequences_never_panic`: 任意耗尽/恢复/配置变更序列下解析永不 panic 且返回值 sound (Ok ⇒ 非空下标列表且全部 < members.len(); Err ⇒ pool_id 回显) — 状态机全态空间鲁棒性; 生成器覆盖 mark 闹钟与配置重组 (长度/顺序/重复成员). ✅
 - `prop_pool_failover_end_to_end`: 端到端 — 成员 1 收到耗尽信号 (智谱码形态 / Claude header 形态) 后, 下一请求打到成员 2 上游; 闹钟到期后成员 1 回归列表头. 🔁→`zhipu_window_exhaust_switches_to_second_member` + `claude_subscription_header_exhaust_switches_member` + `exhausted_member_returns_to_head_after_cooldown_alarm` (`tests/pool_failover.rs`)
 
 ### POOL-2 三通道信号判定纯函数性
@@ -1159,17 +1159,12 @@ chars (char boundary 安全); 其余事件字段为受控类型, 天然无 secre
 
 ### POOL-3 闹钟自愈 (精确信号优先, cooldown 兜底)
 
-**陈述**: 命中耗尽信号后, 恢复时刻按优先序取第一个可解析的: ① `Retry-After` header (非负整数秒 / HTTP-date) → ② body `next_flush_time` (智谱; `error` 对象内 / 顶层两位置; RFC3339 或 naive 本地时区) → ③ `anthropic-ratelimit-*-reset` header 族 (RFC3339 / unix 秒均尝试, 多个可解析值取**最晚** — 5h 与 weekly 同时 blocked 按晚者). 全部失败 → `resume_at = None`, 调用方挂 `now + cooldown_secs` 兜底闹钟. 解析出的时刻 clamp 到 `[now + cooldown_secs, now + 7d]` (下限防 `Retry-After: 0` 探测风暴; 封顶防天文数字 → 成员永久休眠); 兜底闹钟的 cooldown 溢出 (超单调钟表示域) 同按 7d 封顶. 全部解析 best-effort (ROB, 失败回落下一来源).
-
-> **理想 vs 现状**: 病态配置 `cooldown_secs > 7d` (非溢出区间) 下, 现实现 `clamp_resume`
-> 先查下限再查封顶, 下限可越过 7d 封顶 — 与其自身 "cap 优先于下限" 注释相悖 (成员可被
-> 挂起超过 7d, 极端值近永久休眠). 本契约按注释意图陈述 (cap 优先); 该偏差已随 T4 文档
-> 交付上报待修, 默认 cooldown=60s 的 sane 配置域下不可达.
+**陈述**: 命中耗尽信号后, 恢复时刻按优先序取第一个可解析的: ① `Retry-After` header (非负整数秒 / HTTP-date) → ② body `next_flush_time` (智谱; `error` 对象内 / 顶层两位置; RFC3339 或 naive 本地时区) → ③ `anthropic-ratelimit-*-reset` header 族 (RFC3339 / unix 秒均尝试, 多个可解析值取**最晚** — 5h 与 weekly 同时 blocked 按晚者). 全部失败 → `resume_at = None`, 调用方挂 `now + cooldown_secs` 兜底闹钟. 解析出的时刻 clamp 到 `[now + cooldown_secs, now + 7d]`, 且 **cap 优先于下限** (cooldown > 7d 时下限折叠到 7d 封顶; 下限防 `Retry-After: 0` 探测风暴; 封顶防天文数字 → 成员永久休眠); 兜底闹钟的 cooldown 溢出 (超单调钟表示域) 同按 7d 封顶. 全部解析 best-effort (ROB, 失败回落下一来源).
 
 **Properties**:
 - `prop_pool_resume_priority_order`: Retry-After (秒数 / HTTP-date 两形态) 优先于 body 恢复源. 🔁→`resume_retry_after_seconds_wins_over_body_sources` + `resume_retry_after_http_date` (`src/pool.rs`)
 - `prop_pool_resume_next_flush_time_forms`: next_flush_time 两位置 (顶层 / error 对象内) × 两格式 (RFC3339 / naive 本地时区). 🔁→`resume_next_flush_time_naive_local_and_error_position` (`src/pool.rs`)
-- `prop_pool_resume_clamp_bounds`: 封顶 7d / 下限 cooldown / 过去时刻折叠到下限 / 兜底闹钟极端 cooldown 溢出封顶不 panic. 🔁→`resume_capped_at_seven_days` + `resume_floored_at_cooldown` + `watch_fallback_alarm_with_absurd_cooldown_caps_at_7d_no_panic` (`src/pool.rs`)
+- `prop_pool_resume_clamp_bounds`: 封顶 7d / 下限 cooldown / 过去时刻折叠到下限 / cap 优先于越界下限 (cooldown > 7d 折叠) / 兜底闹钟极端 cooldown 溢出封顶不 panic. 🔁→`resume_capped_at_seven_days` + `resume_floored_at_cooldown` + `resume_cap_wins_when_cooldown_exceeds_cap` + `watch_fallback_alarm_with_absurd_cooldown_caps_at_7d_no_panic` (`src/pool.rs`)
 - `prop_pool_resume_anthropic_reset_latest_wins`: anthropic reset 族 RFC3339 / unix 秒两格式, 多值取最晚. 🔁→`resume_anthropic_reset_headers_rfc3339_unix_and_latest_wins` (`src/pool.rs`)
 - `prop_pool_watch_alarm_precise_or_fallback`: PoolWatch 命中时 mark 的闹钟 = 精确信号 (可解析) 或 now+cooldown (不可解析兜底). 🔁→`watch_marks_member_with_parsed_resume_at` + `watch_marks_member_on_exhaust_signal_with_cooldown_fallback` (`src/pool.rs`)
 
@@ -1242,4 +1237,4 @@ chars (char boundary 安全); 其余事件字段为受控类型, 天然无 secre
 | 2026-09-04 | USAGE-3 + USAGE-4 | USAGE-3 多 vendor 消歧语义澄清 (人工授权, #202): 原文"域名消歧, 仍歧义字母序"未规定同 host 多 vendor 碰撞行为, 实现为 last-wins (结果静默依赖上游 JSON 键序, 套餐 vendor 胜出 → cost 恒 0). 修订为: hint host 的 vendor 集与候选集交集非空则收缩到交集, 池内确定性偏好序 (无 `-plan` 段 > 名短 > 字母序), 结果与数据键序无关; 偏好序是启发式策略而非正确性保证. USAGE-4 新增 `zero_priced_models` 显式清单 (零价 ≠ 无价, coverage 口径不变) | #202: 套餐入口部署 est_cost_usd 恒 0 且 cost_coverage=1.0 掩盖异常; 链路缺口 = 消歧规则对碰撞场景欠规定 + 零价缺少显式观测信号 |
 | 2026-09-15 | FWD-5 + FWD-3 + RED-7 | **跨协议流式接入 dispatch**: OpenAI⇄Anthropic + stream=true 从 501 改为 StreamTranslate 跨协议模式流式翻译 (redact 场景注入 restore hook, 响应侧 mock→real); FWD-5 的 `prop_cross_proto_streaming_returns_501` 作废, 收窄为 `prop_cross_proto_streaming_responses_returns_501` (Responses 任一侧仍 501 — read_response_events 未实现, 放行会翻译出空流); FWD-3 新增 `prop_cross_proto_stream_content_fidelity` (流式半段内容保真 + wire 帧顺序合法性); RED-7 适用范围扩至跨协议路径 + 新增 `prop_cross_proto_streaming_no_mock_leak_dispatch_integrated`. 配套实现: StreamTranslate 跨协议模式新增跳过 block 配对过滤 (writer 跳过 BlockStart 的 index 其 BlockStop 一并跳过, 不产生未配对 content_block_stop) + deferred message_stop (message_delta[usage] 先于 message_stop, Anthropic wire 合法顺序) | 跨协议流式翻译已实现且有 property 守卫, 但从未接入 dispatch (501 占位); dispatch 接入任务授权 (评审设计 2026-09-15) |
 | 2026-09-17 | 多域 (ROB/工具+测试补齐) | **帕累托改进集中批次** (⏳ 9 条→✅): RED-1 charset/length + RED-5 确定性 + RED-6 extra + STR-3 timeout/disconnect + CDAG-7 + DTO-1 + SEC-4 set-cookie; CFG-4 补跨表失败回滚 `prop_persist_failure_rollback_under_concurrency_cross_table` (关闭 "后续工作" 注记); §0.6 清单同步 (剩 10 条: 待裁决/架构受限 3 + UI e2e 5 + 可排期 2). 配套生产修复: cross_proto 错误消息截断守 char boundary (原字节直切在多字节切点 panic, ROB-1 违例) + util 公共截断族 DRY (4 处合一); CDAG-7 `NodeView::is_orphan` 后端落地 (wire 传播留后续, 见 CDAG-7 现状注记) | 项目走查 (帕累托改进点集中实施): 走查发现 panic bug + 契约 ⏳ 清单 + 代码重复/热路径冗余 |
-| 2026-09-19 | POOL-1..6 (新增, 待人工授权) | 新增套餐池 failover 契约域: POOL-1 顺序 failover (无游标列表序 + 闹钟回归列表头 + 位置对齐重建 + missing/disabled 永久标记) / POOL-2 三通道信号判定纯函数性 (status/header/code OR + 四位置字符串码 + ROB 零 panic) / POOL-3 闹钟自愈 (Retry-After → next_flush_time → anthropic reset 优先序, clamp [cooldown, 7d], cooldown 兜底) / POOL-4 全耗尽本地 503 快速失败 (零上游请求 + SEC-2 净化) / POOL-5 检测旁路性 (不改转发响应任何字节, FWD-1 附属) / POOL-6 默认表窗口限额语义域 (付费/瞬态不进默认) + 字段级替换配置语义. 全部 property 挂现有测试 (`src/pool.rs` / `src/provider.rs` / `tests/pool_failover.rs`), 1 条 ✅ + 22 条 🔁 | Pool Provider 特性 (编码订阅套餐窗口限额轮换, spec 已与用户确认 2026-09-18); 本段为 T4 文档同步的契约起草, 按 §0.5 流程待用户登记授权 |
+| 2026-09-19 | POOL-1..6 (新增, 待人工授权) | 新增套餐池 failover 契约域: POOL-1 顺序 failover (无游标列表序 + 闹钟回归列表头 + 位置对齐重建 + missing/disabled 跳过无持久标记 — 配置可用性不进状态机) / POOL-2 三通道信号判定纯函数性 (status/header/code OR + 四位置字符串码 + ROB 零 panic) / POOL-3 闹钟自愈 (Retry-After → next_flush_time → anthropic reset 优先序, clamp [cooldown, 7d], cooldown 兜底) / POOL-4 全耗尽本地 503 快速失败 (零上游请求 + SEC-2 净化) / POOL-5 检测旁路性 (不改转发响应任何字节, FWD-1 附属) / POOL-6 默认表窗口限额语义域 (付费/瞬态不进默认) + 字段级替换配置语义. 全部 property 挂现有测试 (`src/pool.rs` / `src/provider.rs` / `tests/pool_failover.rs`), 1 条 ✅ + 22 条 🔁 | Pool Provider 特性 (编码订阅套餐窗口限额轮换, spec 已与用户确认 2026-09-18); 本段为 T4 文档同步的契约起草, 按 §0.5 流程待用户登记授权 |

@@ -26,7 +26,7 @@
 | **Router Provider** | `ProviderKind::Router` 构造的路由端点 (`routes` 路由列表必填) — 自身不转发, 按请求 model 匹配路由链式解析到链尾实体 provider (per-request, WebUI 即席改路由, #179 多规则化; sum type 化 #187) | 虚拟 endpoint、virtual provider、路由 provider、别名 | provider/proxy |
 | **Pool Provider** | `ProviderKind::Pool` 构造的套餐池端点 (`members` 有序成员列表必填) — 自身不转发, 顺序 failover: 正常全打第一个可用成员, 检测到窗口限额耗尽信号后自动切下一个成员, 耗尽成员按恢复闹钟自动回归; 运行时状态内存态不持久化 (契约 POOL-*) | 套餐轮换、配额池、账号池、用完了切下一个 | provider/proxy/pool |
 | **Member (成员)** | Pool 的 `members[]` 指向的一个 Direct provider id (= 一份独立套餐凭证) | 池成员、成员账号 | pool |
-| **闹钟 (alarm)** | 成员耗尽时记录的恢复时刻 (`Exhausted{until}`) — 来自上游精确信号解析 (`resume_at`) 或 `now + cooldown_secs` 兜底; `None` = 永久挂起 (missing/disabled 成员, 不探测) | 恢复时间、冷却时间 | pool |
+| **闹钟 (alarm)** | 成员耗尽时记录的恢复时刻 (`Exhausted{until}`) — 来自上游精确信号解析 (`resume_at`) 或 `now + cooldown_secs` 兜底 (恒有时刻, 无永久形态) | 恢复时间、冷却时间 | pool |
 | **三通道 (exhaust signal channels)** | 耗尽信号的三条独立匹配线 (HTTP status / body 码 / response header, OR 关系), 判定 SSOT = `pool::detect_exhaustion` | 信号通道、触发线 | pool |
 | **Route** | 路由四元组 (`model_pattern` model 通配符 / `target` 目标 / `upstream_model` 重写 / `priority` 优先级) — model_pattern 匹配请求 model 时路由到 target, priority 越大越优先 (None = 禁用) | 规则、路由规则 | provider/proxy |
 | **Protocol** | LLM API 的协议族 (OpenAI / Anthropic / Gemini / Ollama / Responses) | 协议、格式 | 全局 |
@@ -185,8 +185,8 @@
   行为借用 — `probe_provider_upstream` 执行出站 HTTP 探测, 非纯数据/纯函数,
   但复用同款 fetch 防御 (整体超时/有界累积/错误净化) 且无转发链状态依赖,
   handler 只是薄壳, 无独立实现 — 勿以此为先例扩张 web → proxy 的行为依赖)
-  + proxy → pool (套餐池转发即状态机驱动: dispatch 经 `PoolPicker` 注入 pick +
-  missing/disabled 永久标记, 响应侧 `PoolWatch::detect_and_mark` 旁路检测 —
+  + proxy → pool (套餐池转发即状态机驱动: dispatch 经 `PoolPicker` 注入候选解析
+  (active_members), 响应侧 `PoolWatch::detect_and_mark` 旁路检测 —
   同属域 A 转发链, 性质同 proxy → redact 的 "转发即改写")
   + state → pool (AppState.pools 聚合 `PoolStates` 纯数据+状态机 store,
   组合根先例同 state → usage 的 UsageStore / state → auth 的 ApiKeyStore —
@@ -950,11 +950,10 @@ CI runner VM 未预装 treefmt 时 check-fmt 降级 rust-only (见 justfile).
   Direct↔Router 同型)。失败是静默的 (空 key 出站 → 上游 401 才暴露), WebUI 表单
   placeholder 变化 ("(optional)" 而非 "unchanged") 是唯一提示。根治需虚拟构造携带被
   遮蔽的 Direct 字段 (违背 sum type 简洁性) 或 WebUI 本地暂存, 均不划算。
-- **pool 成员 missing/disabled 永久标记, 重新启用后不自动回归**: resolve_route 把
-  missing/disabled 成员标记为 `Exhausted{until: None}` (永久 — disabled 是用户显式
-  动作, 不做闹钟探测); 成员随后重新启用/补建后**不会自动回到可用集** (永久标记无
-  信号源可清除)。恢复途径 = 使该成员位置错位的编辑 (如删除后重加, 触发对齐重建) /
-  重启进程 / `POST /api/providers/{id}/pool-reset`。
+- **pool 成员 missing/disabled 在解析时跳过, 无持久标记**: resolve_route 对
+  missing/disabled 候选**跳过但不写状态机** (配置可用性不进耗尽闹钟 — GET /models
+  的可解析性探针复用同一解析路径, 无持久副作用); 成员重新启用/补建后下一次解析即
+  自动回归列表头, 无需 reset / 重启。
 - **pool 耗尽检测不覆盖流式 2xx 的 mid-stream SSE 错误事件**: 检测挂在 "上游错误
   响应 (4xx/5xx, body 已缓冲)" 的位置, `PoolWatch` 对 2xx 直接短路 — 假设: 智谱/Claude
   撞窗在 HTTP 层拒绝 (429 + 错误信封), 不在 SSE 流中 (假设声明见
