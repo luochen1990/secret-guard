@@ -70,6 +70,7 @@ pub(crate) async fn cross_proto_forward(
     model_rewrite: Option<String>,
     started: Instant,
     secrets_snapshot: Vec<crate::secrets::SecretEntry>,
+    pool_watch: Option<crate::pool::PoolWatch>,
 ) -> Result<Response<Body>, AppError> {
     use crate::codec::Protocol as CodecProtocol;
 
@@ -326,6 +327,15 @@ pub(crate) async fn cross_proto_forward(
                     break;
                 }
             }
+        }
+        // 15.5 Pool 耗尽旁路检测 (T2): 上游原文 (resp_status / resp_headers /
+        // 已累积的 acc) 在翻译前检测 — 用原文而非翻译后的 ingress envelope;
+        // 只读副本, 翻译 (步骤 16) 与检测互不相干 (FWD-1). 位置在两个早退
+        // return (stream_err / cap) **之前**: 流中断时 acc 是部分字节, code
+        // 通道 best-effort 降级, status/header 通道不受影响 — 与同协议
+        // buffered_ir 路径的 error_kind 场景行为对称。
+        if let Some(watch) = &pool_watch {
+            watch.detect_and_mark(resp_status, &resp_headers, &acc);
         }
         if let Some(e) = stream_err {
             let err_label = super::recorder::stream_err_label(&e);

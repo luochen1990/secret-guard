@@ -59,6 +59,7 @@ pub(crate) async fn same_proto_forward(
     model_rewrite: Option<String>,
     started: Instant,
     secrets_snapshot: Vec<crate::secrets::SecretEntry>,
+    pool_watch: Option<crate::pool::PoolWatch>,
 ) -> Result<Response<Body>, AppError> {
     // 字节直传仅当 "无 secret 且无 model 改写" (#183): 改写需要作用在
     // egress IR 的 model 字段上, 强制走 IR 路径 (FWD-1 修订的契约代价).
@@ -75,6 +76,7 @@ pub(crate) async fn same_proto_forward(
             upstream_id,
             started,
             &[],
+            pool_watch,
         )
         .await;
     }
@@ -132,6 +134,7 @@ pub(crate) async fn same_proto_forward(
             upstream_id,
             started,
             &secrets_snapshot,
+            pool_watch,
         )
         .await;
     };
@@ -274,6 +277,8 @@ pub(crate) async fn same_proto_forward(
     //     - map 非空 + 其余: buffered_ir (parse 失败 fallback 透传, 见 #158).
     //     - map 空 (override-only / secret 未命中): 字节透传 fan_out_streaming —
     //       响应 byte-exact + 流式 UX, parsed view 照常累积/计算.
+    //     pool_watch: with_restore 分支恒 2xx (检测短路), 不传; 其余两分支
+    //     传给 fan_out 层的非 2xx body 缓冲点旁路检测 (T2).
     if !redaction_map.is_empty() {
         if streamed && resp_status.is_success() {
             super::fan_out::fan_out_streaming_with_restore(
@@ -305,6 +310,7 @@ pub(crate) async fn same_proto_forward(
                 state.on_fallback_restore,
                 state.upstream_timeouts.stream_idle,
                 usage_ctx.clone(),
+                pool_watch,
             )
             .await
         }
@@ -321,6 +327,7 @@ pub(crate) async fn same_proto_forward(
             Some(codec_proto),
             state.upstream_timeouts.stream_idle,
             usage_ctx,
+            pool_watch,
         )
         .await
     }
@@ -339,6 +346,7 @@ async fn same_proto_passthrough(
     upstream_id: &str,
     started: Instant,
     secrets_snapshot: &[crate::secrets::SecretEntry],
+    pool_watch: Option<crate::pool::PoolWatch>,
 ) -> Result<Response<Body>, AppError> {
     let req_text_for_record = utf8_view(&req_bytes);
     let (upstream_url, path_for_record) = same_proto_upstream_url_and_path(&provider, &fp, &parts);
@@ -419,6 +427,7 @@ async fn same_proto_passthrough(
         crate::codec::Protocol::from_native(ingress),
         state.upstream_timeouts.stream_idle,
         usage_ctx,
+        pool_watch,
     )
     .await
 }

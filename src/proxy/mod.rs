@@ -270,10 +270,20 @@ async fn dispatch(
         id: upstream_id,
         provider,
         model_rewrite,
-        // Pool 跳归因锚点: 响应侧耗尽检测 (T2) 经此 mark_exhausted; 当前
-        // 转发路径不消费 (检测挂接是独立任务), 显式命名留给 T2。
-        pool: _pool_hop,
+        pool: pool_hop,
     } = resolved;
+    // Pool 耗尽检测上下文 (T2): 响应侧旁路检测的归因锚点 + 配置**入口快照**
+    // (per-request 解析精神 — 在途配置变更由 PoolStates 按位置对齐收敛; pool
+    // 条目在 resolve 后被改成非 Pool 构造的窗口内放弃检测). 非 pool 流量 =
+    // None, 检测点零开销短路.
+    let pool_watch = pool_hop.as_ref().and_then(|hop| {
+        match state.providers.get_effective(&hop.pool_id).map(|p| p.kind) {
+            Some(crate::provider::ProviderKind::Pool(cfg)) => {
+                Some(crate::pool::PoolWatch::new(hop, cfg, &state.pools))
+            }
+            _ => None,
+        }
+    });
     if fp.name != upstream_id {
         tracing::info!(
             router = %fp.name,
@@ -306,6 +316,7 @@ async fn dispatch(
             model_rewrite,
             started,
             secrets_snapshot,
+            pool_watch,
         )
         .await;
     }
@@ -320,6 +331,7 @@ async fn dispatch(
         model_rewrite,
         started,
         secrets_snapshot,
+        pool_watch,
     )
     .await
 }

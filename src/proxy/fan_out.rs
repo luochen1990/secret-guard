@@ -113,6 +113,10 @@ struct FanoutStreamCtx {
     stream_idle_timeout: Option<std::time::Duration>,
     /// usage-stats 采集上下文 (响应完成点落账, 不回读 DAG — 设计 §5.2 防淘汰).
     usage: crate::usage::UsageCtx,
+    /// pool 耗尽检测上下文 (T2, 旁路): 非 2xx 的 body 在骨架的 chunk 循环内
+    /// 缓冲完毕, 流结束后消费; None (非 pool 流量) 零开销. spawn task 无法回读
+    /// AppState, 随 ctx 携带 (PoolStates 内部是 Arc, clone 共享).
+    pool_watch: Option<crate::pool::PoolWatch>,
 }
 
 /// 两条流式扇出路径的共享骨架: spawn task 内的 chunk 循环 + 记录 + 收尾.
@@ -152,6 +156,7 @@ async fn fanout_stream_task(
         streamed,
         stream_idle_timeout,
         usage,
+        pool_watch,
     } = ctx;
 
     let mut stream = upstream_resp.bytes_stream();
@@ -185,6 +190,18 @@ async fn fanout_stream_task(
                 break;
             }
         }
+    }
+    // 流一结束即做 pool 耗尽旁路检测 (failover 时效): 非 2xx 响应 body 已在
+    // recorder.acc 缓冲 (上游拒绝时不是 SSE), 客户端字节已流出自有管道 — 检测
+    // 只读副本, 绝不改动任何转发字节 (FWD-1). 流式 2xx mid-stream SSE error
+    // 不检测: detect_and_mark 的 status 短路 + 假设声明 (智谱/Claude 撞窗在
+    // HTTP 层拒绝) 见其 doc.
+    if let Some(watch) = &pool_watch {
+        watch.detect_and_mark(
+            StatusCode::from_u16(status_u16).unwrap_or(StatusCode::BAD_GATEWAY),
+            &resp_headers_for_record,
+            &recorder.acc,
+        );
     }
     // 流末尾: 管道尾巴 (restore 模式 = flush 残留 + 终止符; 即便 upstream error 也要发,
     // 否则严格的 OpenAI 客户端会 hang). 仅 tx.send 失败 (client disconnect) 时由 `let _` 吞掉.
@@ -230,6 +247,9 @@ async fn fanout_stream_task(
 ///
 /// `redacted_headers`: 追加脱敏名单 (`AppState::redacted_headers`, SEC-4) —
 /// record 的 resp_headers 脱敏用 (下同, 四条扇出路径同源).
+///
+/// `pool_watch`: pool 耗尽检测上下文 (T2, 旁路) — 非 2xx 响应在骨架 chunk 循环
+/// 缓冲后检测. 2xx 流式路径 (restore 家族) 恒短路, 不接受此参数.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn fan_out_streaming(
     dag: ConversationDag,
@@ -243,6 +263,7 @@ pub(crate) async fn fan_out_streaming(
     codec_proto: Option<crate::codec::Protocol>,
     stream_idle_timeout: Option<std::time::Duration>,
     usage: crate::usage::UsageCtx,
+    pool_watch: Option<crate::pool::PoolWatch>,
 ) -> Result<Response<Body>, AppError> {
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(32);
     let resp_headers_for_record = resp_headers.clone();
@@ -267,6 +288,7 @@ pub(crate) async fn fan_out_streaming(
             streamed,
             stream_idle_timeout,
             usage,
+            pool_watch,
         },
         upstream_resp,
         tx,
@@ -349,6 +371,9 @@ pub(crate) async fn fan_out_streaming(
 /// `helpers::restore_via_json_leaf_fallback`.
 ///
 /// `redacted_headers`: 追加脱敏名单 (`AppState::redacted_headers`, SEC-4).
+///
+/// `pool_watch`: pool 耗尽检测上下文 (T2, 旁路) — 累积循环结束 (body 完整缓冲)
+/// 后检测; 与流式骨架的检测点语义一致 (FWD-1: 只读副本).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn fan_out_buffered_ir(
     dag: ConversationDag,
@@ -364,6 +389,7 @@ pub(crate) async fn fan_out_buffered_ir(
     on_fallback_restore: crate::config::OnFallbackRestore,
     stream_idle_timeout: Option<std::time::Duration>,
     usage: crate::usage::UsageCtx,
+    pool_watch: Option<crate::pool::PoolWatch>,
 ) -> Result<Response<Body>, AppError> {
     let resp_headers_for_record = resp_headers.clone();
     let status_u16 = resp_status.as_u16();
@@ -391,6 +417,12 @@ pub(crate) async fn fan_out_buffered_ir(
                 break;
             }
         }
+    }
+
+    // Pool 耗尽旁路检测 (T2): body 已完整缓冲 (recorder.acc), 检测只读副本 —
+    // client_bytes 由此后的 parse 从同一 acc 派生, 与检测互不相干 (FWD-1).
+    if let Some(watch) = &pool_watch {
+        watch.detect_and_mark(resp_status, &resp_headers_for_record, &recorder.acc);
     }
 
     let elapsed = started.elapsed().as_millis() as u64;
@@ -653,6 +685,9 @@ fn spawn_restore_fanout(
             streamed: true,
             stream_idle_timeout,
             usage,
+            // restore 家族 (with_restore / cross_proto 流式) 仅承载 2xx SSE 成功
+            // 响应 — 检测的 status 短路恒成立, 恒 None (不构造, 死参数).
+            pool_watch: None,
         },
         upstream_resp,
         tx,
@@ -790,6 +825,7 @@ mod tests {
                 None,
                 std::sync::Arc::from(Vec::new().into_boxed_slice()),
             ),
+            None, // pool_watch: 非 pool 流量 (检测短路路径)
         )
         .await
         .expect("fan_out_streaming must not error on large body");

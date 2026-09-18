@@ -54,7 +54,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use axum::http::{HeaderMap, HeaderName, StatusCode};
 use parking_lot::RwLock;
 
-use crate::provider::{AllMembersExhausted, ExhaustConfig, PoolPicker};
+use crate::provider::{AllMembersExhausted, ExhaustConfig, PoolHop, PoolPicker, PoolProvider};
 
 // ─── 成员状态机 ─────────────────────────────────────────────────────────────
 
@@ -420,6 +420,106 @@ fn instant_from_unix(target_unix: i64, now: Instant) -> Option<Instant> {
     }
     let d = Duration::from_secs(u64::try_from(delta).ok()?);
     now.checked_add(d)
+}
+
+// ─── 响应侧检测编排 (PoolWatch, proxy 挂接的消费面) ─────────────────────────
+
+/// 一次请求的 pool 耗尽检测上下文: dispatch 层从 `ResolvedRoute.pool` + pool
+/// 配置**入口快照**构造, 随转发路径传递到上游响应 body 已可见的位置消费
+/// ([`PoolWatch::detect_and_mark`]).
+///
+/// 职责: 把 [`detect_exhaustion`] (纯函数) 与 [`PoolStates::mark_member_exhausted`]
+/// (状态机写入) 编排成一个旁路动作 — proxy 各转发路径只需一处调用, 挂接细节
+/// 不泄漏到转发代码.
+///
+/// **FWD-1 红线**: 检测是旁路 — `detect_and_mark` 无返回值, 不修改调用方的
+/// 任何字节; 非 pool 流量由 `Option<PoolWatch>` = None 表达, 检测点零开销短路.
+///
+/// 配置快照取**请求入口时刻** (per-request 解析精神): 在途配置变更 (WebUI 改
+/// members/exhaust) 由 `PoolStates` 的按位置对齐机制收敛 — mark 落到快照
+/// members 上, 下次 pick 对齐后状态按 id 匹配保留或重置.
+#[derive(Debug, Clone)]
+pub struct PoolWatch {
+    pool_id: String,
+    member_idx: usize,
+    /// 入口配置快照: `members` = mark 的对齐基准 + INFO 日志的成员 id 来源;
+    /// `exhaust` / `cooldown_secs` = 检测与兜底闹钟参数. 按值持有 (整体快照,
+    /// 非 & 借用 — 需 'static 进 fan_out 的 spawn task).
+    cfg: PoolProvider,
+    states: PoolStates,
+}
+
+impl PoolWatch {
+    /// 从路由解析产出的 pool 跳 + pool 配置快照构造 (`cfg` 按值 move — dispatch
+    /// 侧 `get_effective` 已 clone 整个 Provider, 此处不再二次深拷贝). 配置表
+    /// 读取由调用方 (proxy dispatch) 完成 — 本模块只依赖 provider **类型**,
+    /// 不触 ProviderTable 行为 (依赖方向: proxy → pool → provider).
+    pub fn new(hop: &PoolHop, cfg: PoolProvider, states: &PoolStates) -> Self {
+        Self {
+            pool_id: hop.pool_id.clone(),
+            member_idx: hop.member_idx,
+            cfg,
+            states: states.clone(),
+        }
+    }
+
+    /// 旁路检测: 上游响应非 2xx (拒绝, body 非 SSE 已缓冲) 时跑三通道判定,
+    /// 命中则 mark 该成员耗尽 (精确闹钟优先, `now + cooldown` 兜底) 并打一条
+    /// INFO (SEC-2: 只含 pool id / 成员 id / 恢复时长, 绝不含 body 原文).
+    ///
+    /// 短路: **非 error status 直接返回** — 覆盖流式 2xx mid-stream SSE error
+    /// event 不检测的假设 (智谱/Claude 撞窗在 HTTP 层拒绝, 不在 SSE 中;
+    /// spec §8 声明). 调用方只需 `if let Some(w) = &watch` 一行, 无额外条件.
+    ///
+    /// body 可能是截断字节 (record cap / 客户端断开后的部分累积) — JSON
+    /// parse 失败时 code 通道自然失效, status/header 通道不受影响
+    /// (best-effort, ROB-*).
+    ///
+    /// 日志节流: 每次命中打一条 INFO (而非仅状态翻转时) — 全耗尽期间 pick
+    /// 跳过该成员, 重复 INFO 的唯一来源是闹钟过期后探测请求再 429 (重挂闹钟,
+    /// 值得记录), 无洪水风险.
+    pub fn detect_and_mark(&self, status: StatusCode, headers: &HeaderMap, body: &[u8]) {
+        if !is_error(status) {
+            return;
+        }
+        let Some(hit) = detect_exhaustion(
+            &self.cfg.exhaust,
+            self.cfg.cooldown_secs,
+            status,
+            headers,
+            body,
+        ) else {
+            return;
+        };
+        let now = Instant::now();
+        // 兜底闹钟: checked_add 防极端 cooldown (≥ ~9.2e9s 超单调钟表示域)
+        // 溢出 panic — 与 clamp_resume 同型防御, 溢出按 7d 封顶 (ROB-*).
+        let until = hit.resume_at.unwrap_or_else(|| {
+            now.checked_add(Duration::from_secs(self.cfg.cooldown_secs))
+                .unwrap_or(now + RESUME_CAP)
+        });
+        self.states.mark_member_exhausted(
+            &self.pool_id,
+            &self.cfg.members,
+            self.member_idx,
+            Some(until),
+        );
+        let member = self
+            .cfg
+            .members
+            .get(self.member_idx)
+            .map(String::as_str)
+            .unwrap_or("?");
+        // saturating (非裸 duration_since): until 可能基于 detect_exhaustion 内部
+        // 更早的 now (cooldown_secs=0 + Retry-After: 0 时早于本行 now), 裸形态
+        // 对 "later time" panic — saturating 折叠为 0 (ROB-*).
+        tracing::info!(
+            pool = %self.pool_id,
+            member,
+            resume_in_secs = until.saturating_duration_since(now).as_secs(),
+            "pool member exhausted; subsequent requests will fail over"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1036,6 +1136,108 @@ mod tests {
         assert_eq!(
             slots_of(&pools, "pl")[1],
             MemberSlot::Exhausted { until: None }
+        );
+    }
+
+    // ─── PoolWatch: 响应侧检测编排 (短路 / mark / 兜底闹钟) ────────────────
+
+    fn watch(pools: &PoolStates, members: &[String], cooldown_secs: u64) -> PoolWatch {
+        PoolWatch::new(
+            &PoolHop {
+                pool_id: "pl".into(),
+                member_idx: 0,
+            },
+            PoolProvider {
+                members: members.to_vec(),
+                exhaust: ExhaustConfig::default(),
+                cooldown_secs,
+            },
+            pools,
+        )
+    }
+
+    #[test]
+    fn watch_marks_member_on_exhaust_signal_with_cooldown_fallback() {
+        // 命中 (纯 code 通道, 无恢复来源) → mark; resume 走 now+cooldown 兜底.
+        let pools = PoolStates::new();
+        let m = members(&["a", "b"]);
+        let w = watch(&pools, &m, 30);
+        w.detect_and_mark(
+            status(429),
+            &HeaderMap::new(),
+            br#"{"error":{"code":"1308"}}"#,
+        );
+        match slots_of(&pools, "pl")[0] {
+            MemberSlot::Exhausted { until: Some(t) } => {
+                let expect = Instant::now() + Duration::from_secs(30);
+                assert_instant_close(t, expect, "cooldown fallback alarm");
+            }
+            other => panic!("expected alarmed Exhausted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn watch_marks_member_with_parsed_resume_at() {
+        // 命中且 Retry-After 可解析 → 闹钟来自精确信号 (优先于 cooldown).
+        let pools = PoolStates::new();
+        let m = members(&["a", "b"]);
+        let w = watch(&pools, &m, 1);
+        w.detect_and_mark(
+            status(429),
+            &hdrs(&[("retry-after", "120")]),
+            br#"{"error":{"code":"1308"}}"#,
+        );
+        match slots_of(&pools, "pl")[0] {
+            MemberSlot::Exhausted { until: Some(t) } => {
+                let expect = Instant::now() + Duration::from_secs(120);
+                assert_instant_close(t, expect, "retry-after precise alarm");
+            }
+            other => panic!("expected alarmed Exhausted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn watch_fallback_alarm_with_absurd_cooldown_caps_at_7d_no_panic() {
+        // M1 回归锁: cooldown_secs = u64::MAX + 无恢复来源 → 兜底闹钟
+        // checked_add 溢出按 7d 封顶, 不 panic (裸 `now + duration` 会溢出).
+        let pools = PoolStates::new();
+        let m = members(&["a", "b"]);
+        let w = watch(&pools, &m, u64::MAX);
+        w.detect_and_mark(
+            status(429),
+            &HeaderMap::new(),
+            br#"{"error":{"code":"1308"}}"#,
+        );
+        match slots_of(&pools, "pl")[0] {
+            MemberSlot::Exhausted { until: Some(t) } => {
+                let expect = Instant::now() + RESUME_CAP;
+                assert_instant_close(t, expect, "overflow fallback capped at 7d");
+            }
+            other => panic!("expected alarmed Exhausted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn watch_short_circuits_on_success_and_non_signal_errors() {
+        // 2xx (含 mid-stream SSE 语义 — status 短路) 与非信号 429 都不动状态
+        // (以 pick 仍选中成员 0 观察 — 全程未 mark 时 pool 条目不存在, slots
+        // 快照不可用).
+        let pools = PoolStates::new();
+        let m = members(&["a", "b"]);
+        let w = watch(&pools, &m, 30);
+        for (status, body) in [
+            (status(200), &b"{\"error\":{\"code\":\"1308\"}}"[..]),
+            (status(204), b""),
+            (status(301), b"redirect"),
+            (status(429), b"{\"error\":{\"code\":\"1302\"}}"), // 瞬态码不在默认表
+            (status(502), b"bad gateway html"),
+        ] {
+            w.detect_and_mark(status, &HeaderMap::new(), body);
+        }
+        assert_eq!(
+            pools.pick_member("pl", &m, Instant::now()).unwrap(),
+            0,
+            "no signal → member 0 stays active (2xx short-circuit + non-signal errors)"
         );
     }
 
