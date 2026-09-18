@@ -2,7 +2,8 @@
 #
 # 覆盖:
 #   - 结构 round-trip: 生成物是合法 TOML (fromTOML), 字段名/嵌套与 src serde
-#     定义吻合 (provider sum type / routes / auth (含 secure_cookie) /
+#     定义吻合 (provider sum type (direct/router/pool) / routes / pool 的
+#     members+exhaust+cooldown_secs / auth (含 secure_cookie) /
 #     secrets.entries / redact.redacted_headers / usage 定价覆盖段)
 #   - 确定性: providers 按 id 字典序输出
 #   - 转义: 字符串值经 toJSON, 引号/反斜杠 round-trip 不损
@@ -10,8 +11,8 @@
 #     (无 LoadCredential 派生 — 与 nixos 侧原型的语义差异)
 #   - 布局: 文件单换行结尾, 头部注释存在
 #   - fail-fast: sum type 违规 / base_url 卫生 / id 卫生 / auth 互斥 /
-#     usage 键卫生与负价 / pricingUrl 形状 / 悬空 target / 环检测 /
-#     redactedHeaders 空白条目 全部 eval 期 throw
+#     usage 键卫生与负价 / pricingUrl 形状 / 悬空 target 与 pool member /
+#     环检测 (含 pool 边) / redactedHeaders 空白条目 全部 eval 期 throw
 #
 # 模块接线 (选项 → configFile 自动生成) 的冒烟在 nix/tests/module-eval.nix,
 # 本文件只测 render 纯函数. 语义断言 (priority null=禁用/并列列表序) 属上游
@@ -50,6 +51,17 @@ let
             target = "b-upstream";
           }
         ];
+      };
+      # pool 构造: members + exhaust 全三字段 + cooldownSecs (契约样例).
+      c-pool = {
+        kind = "pool";
+        members = [ "b-upstream" ];
+        exhaust = {
+          statuses = [ 429 ];
+          codes = [ "1308" ];
+          headers = [ "anthropic-ratelimit-unified-5h-status=blocked" ];
+        };
+        cooldownSecs = 120;
       };
     };
     secretsEntries = [
@@ -149,11 +161,72 @@ let
 
   assertions = [
     {
-      name = "结构 round-trip: 2 个 provider, 字段与上游 serde 吻合";
+      name = "结构 round-trip: 3 个 provider (direct/router/pool), 字段与上游 serde 吻合";
       ok =
-        builtins.length parsed.providers == 2
+        builtins.length parsed.providers == 3
         && byId.b-upstream.kind == "direct"
-        && byId.a-router.kind == "router";
+        && byId.a-router.kind == "router"
+        && byId.c-pool.kind == "pool";
+    }
+    {
+      # pool 字段 round-trip: members 数组 + cooldown_secs + exhaust 段三字段
+      # 全量渲染 (空数组 = 显式关闭, 由 fail-fast 用例覆盖渲染形态).
+      name = "pool: members/exhaust/cooldown_secs round-trip 与上游 serde 吻合";
+      ok =
+        byId.c-pool.members == [ "b-upstream" ]
+        && byId.c-pool.cooldown_secs == 120
+        && byId.c-pool.exhaust.statuses == [ 429 ]
+        && byId.c-pool.exhaust.codes == [ "1308" ]
+        && byId.c-pool.exhaust.headers == [ "anthropic-ratelimit-unified-5h-status=blocked" ];
+    }
+    {
+      name = "pool: 省略 exhaust 段与 cooldownSecs → 不渲染 (上游 serde default = 内置表/60)";
+      ok =
+        let
+          t = providerToml "c-pool" {
+            exhaust = null;
+            cooldownSecs = null;
+          };
+          p = (builtins.fromTOML t).providers;
+          pool = builtins.elemAt p 2;
+        in
+        !(pool ? exhaust) && !(pool ? cooldown_secs);
+    }
+    {
+      # 字段级三态 (M1): 只配 statuses → codes/headers 行省略 (上游字段级
+      # default = 内置表保留), statuses 显式渲染 — NixOS 路径与手写 toml
+      # 的字段级替换语义同构.
+      name = "pool: exhaust 字段级省略 — 只配 statuses, codes/headers 行不渲染";
+      ok =
+        let
+          t = providerToml "c-pool" {
+            exhaust = {
+              statuses = [ 402 ];
+              codes = null;
+              headers = null;
+            };
+          };
+          p = (builtins.fromTOML t).providers;
+          e = (builtins.elemAt p 2).exhaust;
+        in
+        e.statuses == [ 402 ] && !(e ? codes) && !(e ? headers);
+    }
+    {
+      # 字段级三态: [] = 显式关闭 (渲染空数组行, 与 null 省略行区分).
+      name = "pool: exhaust 字段 [] = 显式关闭通道 (渲染空数组)";
+      ok =
+        let
+          t = providerToml "c-pool" {
+            exhaust = {
+              statuses = [ ];
+              codes = [ ];
+              headers = [ ];
+            };
+          };
+          p = (builtins.fromTOML t).providers;
+          e = (builtins.elemAt p 2).exhaust;
+        in
+        e.statuses == [ ] && e.codes == [ ] && e.headers == [ ];
     }
     {
       name = "SEC-7: allowedDomains 默认不渲染 (空 = 拒绝所有域名, serde default 兜底)";
@@ -212,6 +285,7 @@ let
         map (p: p.id) parsed.providers == [
           "a-router"
           "b-upstream"
+          "c-pool"
         ];
     }
     {
@@ -862,6 +936,78 @@ let
                 priority = 1;
               }
             ];
+          };
+          a-router = baseArgs.providers.a-router;
+          b-upstream = baseArgs.providers.b-upstream;
+        };
+      };
+    }
+
+    # ── pool: fail-fast + 图校验 ───────────────────────────────────────
+    {
+      name = "fail-fast: pool members 为空 → throw (上游 validate 拒绝)";
+      ok = renderProviderFails "c-pool" { members = [ ]; };
+    }
+    {
+      name = "fail-fast: pool member id 非法 → throw";
+      ok = renderProviderFails "c-pool" { members = [ "has space" ]; };
+    }
+    {
+      name = "fail-fast: pool member 不存在 → throw (悬空即错误, 与 route target 同型)";
+      ok = renderProviderFails "c-pool" { members = [ "ghost" ]; };
+    }
+    {
+      name = "fail-fast: pool 带 direct 分支专属 baseUrl → throw";
+      ok = renderProviderFails "c-pool" { baseUrl = "https://x"; };
+    }
+    {
+      name = "fail-fast: pool 带 router 分支专属 routes → throw";
+      ok = renderProviderFails "c-pool" {
+        routes = [
+          {
+            modelPattern = "*";
+            target = "b-upstream";
+          }
+        ];
+      };
+    }
+    {
+      name = "fail-fast: pool 自环 (member 含自身 id) → throw (环检测含 pool 边)";
+      ok = renderFails {
+        providers.self-loop = {
+          kind = "pool";
+          members = [ "self-loop" ];
+        };
+      };
+    }
+    {
+      name = "fail-fast: router → pool → router 闭环 → throw (pool 边构成环)";
+      ok = renderFails {
+        providers = {
+          r1 = {
+            kind = "router";
+            routes = [
+              {
+                modelPattern = "*";
+                target = "pl";
+                priority = 1;
+              }
+            ];
+          };
+          pl = {
+            kind = "pool";
+            members = [ "r1" ];
+          };
+        };
+      };
+    }
+    {
+      name = "ok: pool → router → direct 链合法 (嵌套组合)";
+      ok = renderOk {
+        providers = {
+          pl = {
+            kind = "pool";
+            members = [ "a-router" ];
           };
           a-router = baseArgs.providers.a-router;
           b-upstream = baseArgs.providers.b-upstream;

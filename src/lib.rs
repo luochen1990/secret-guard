@@ -10,6 +10,7 @@
 //! - [`dto`]     —— WebUI 响应 DTO 的中立类型层 (域 B → 域 C wire shape, dag 构造 / web 序列化)
 //! - [`error`]   —— 统一应用错误类型 (转发链 + 鉴权层共用, 不反向依赖)
 //! - [`mock`]    —— Per-secret mock 策略 (两维度: 初始值 / 生成策略)
+//! - [`pool`]    —— Pool provider (套餐池) 运行时: 耗尽信号检测器 + 成员状态机
 //! - [`provider`]—— Provider 注册表 + Protocol 类型 (ingress / egress 抽象)
 //! - [`proxy`]   —— 透明反向代理 handler (axum + reqwest)
 //! - [`record`]  —— 转发记录 DTO (从 DAG Node 派生, 供 Web UI 序列化)
@@ -33,6 +34,7 @@ pub mod derive;
 pub mod dto;
 pub mod error;
 pub mod mock;
+pub mod pool;
 pub mod provider;
 pub mod proxy;
 pub mod record;

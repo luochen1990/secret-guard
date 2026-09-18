@@ -2531,6 +2531,7 @@ output = 0.5
             .map(|p| match &p.kind {
                 crate::provider::ProviderKind::Direct(_) => "direct",
                 crate::provider::ProviderKind::Router(_) => "router",
+                crate::provider::ProviderKind::Pool(_) => "pool",
             })
             .collect();
         assert_eq!(kinds, vec!["direct", "router"], "round-trip text:\n{text}");

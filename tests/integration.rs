@@ -217,6 +217,7 @@ async fn spawn_proxy_with_prefix(global_mock_prefix: &str) -> String {
     let secrets = test_secret_table();
     let _ = (decisions, persist_lock, state_path);
     let proxy = AppState {
+        pools: secret_guard::pool::PoolStates::new(),
         global_mock_prefix: std::sync::Arc::from(global_mock_prefix),
         ..base_app_state(
             reqwest::Client::new(),
@@ -259,6 +260,7 @@ async fn spawn_proxy_with_redacted_headers(
     let secrets = test_secret_table();
     let _ = (decisions, persist_lock, state_path);
     let proxy = AppState {
+        pools: secret_guard::pool::PoolStates::new(),
         redacted_headers: secret_guard::state::normalize_redacted_headers(&redacted_headers),
         ..base_app_state(
             reqwest::Client::new(),
@@ -290,6 +292,7 @@ fn base_app_state(
 ) -> AppState {
     let redact = secret_guard::config::RedactConfig::default();
     AppState {
+        pools: secret_guard::pool::PoolStates::new(),
         upstream,
         providers,
         dag,
@@ -342,6 +345,7 @@ async fn spawn_proxy_with_redact_gates(
     );
     let _ = (decisions, persist_lock, state_path);
     let proxy = AppState {
+        pools: secret_guard::pool::PoolStates::new(),
         on_probe_exhausted,
         on_unsupported_protocol,
         on_fallback_restore,
@@ -3268,6 +3272,7 @@ async fn spawn_proxy_with_timeouts_and_secrets(
     let _ = (decisions, persist_lock, state_path);
     let dag = ConversationDag::new(64, 500, 1);
     let proxy = AppState {
+        pools: secret_guard::pool::PoolStates::new(),
         upstream_timeouts,
         ..base_app_state(
             server::build_upstream_client(upstream_timeouts.connect).unwrap(),
@@ -9151,6 +9156,7 @@ async fn spawn_proxy_with_usage_store_and_secrets(
         std::sync::Arc::new(parking_lot::Mutex::new(())),
     );
     let proxy = AppState {
+        pools: secret_guard::pool::PoolStates::new(),
         usage,
         ..base_app_state(
             upstream_client,

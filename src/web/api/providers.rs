@@ -139,6 +139,10 @@ pub async fn update_provider(
                             payload.routes = Some(r.routes.clone());
                         }
                     }
+                    // Pool 旧值暂无回填字段 (UpsertProviderRequest 的 pool 构造
+                    // 字段 members/exhaust/cooldown_secs 属 T3 — WebUI/API 面
+                    // 扩展任务); 此处显式声明而非 `_` 通配, T3 落地时补回填.
+                    crate::provider::ProviderKind::Pool(_) => {}
                 }
             }
             // routes 回填兜底 + protocol 回填共用**一次** effective 快照 (单次取锁

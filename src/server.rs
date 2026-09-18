@@ -436,6 +436,7 @@ pub async fn serve(
             state_dir_artifact(&state_path, "pricing.json"),
             crate::usage::price_overrides_from_config(&usage_config.pricing_override),
         )),
+        pools: crate::pool::PoolStates::new(),
     };
 
     let addr: SocketAddr = format!("{host}:{port}")

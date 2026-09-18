@@ -292,8 +292,9 @@ in
               type = lib.types.enum [
                 "direct"
                 "router"
+                "pool"
               ];
-              description = "构造判别: direct=直连上游 (protocol/baseUrl/apiKey*) / router=虚拟路由表 (routes).";
+              description = "构造判别: direct=直连上游 (protocol/baseUrl/apiKey*) / router=虚拟路由表 (routes) / pool=套餐池 (members, 窗口限额耗尽自动 failover).";
             };
             protocol = lib.mkOption {
               type = lib.types.nullOr (
@@ -350,6 +351,44 @@ in
               );
               default = [ ];
               description = "kind=router 的路由表 (上游 validate 要求非空).";
+            };
+            members = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ ];
+              description = "kind=pool 的成员列表 (Direct provider id, 每成员 = 一份独立套餐凭证). 顺序 failover: 列表序即优先级, 正常全打第一个可用成员. render 层校验存在性 + 环检测 (上游 validate 拒绝空表/自环).";
+            };
+            exhaust = lib.mkOption {
+              type = lib.types.nullOr (
+                lib.types.submodule {
+                  options = {
+                    statuses = lib.mkOption {
+                      # nullOr + default null: null = 不渲染该行 (上游字段级
+                      # default 兜底), [] = 显式关闭 — nix 的 default = [] 无法
+                      # 区分 "没配" 与 "配空", 会静默吞掉内置默认表 (M1 修复).
+                      type = lib.types.nullOr (lib.types.listOf (lib.types.ints.between 0 65535));
+                      default = null;
+                      description = "status 触发线: 上游 HTTP status ∈ 此列表 → 耗尽. null = 省略行 (上游字段级默认 = 关闭); [] = 显式关闭通道 (与 null 等效但渲染为空数组); 非 null = 替换.";
+                    };
+                    codes = lib.mkOption {
+                      type = lib.types.nullOr (lib.types.listOf lib.types.str);
+                      default = null;
+                      description = "body 码触发线 (error.code/error.type/error.status/顶层 code 四位置的字符串码). null = 省略行 (上游字段级默认 = 内置智谱窗口限额表 [\"1308\",\"1310\"]); [] = 显式关闭通道; 非 null = 替换 (想删默认表某个码 = 重抄剩余码).";
+                    };
+                    headers = lib.mkOption {
+                      type = lib.types.nullOr (lib.types.listOf lib.types.str);
+                      default = null;
+                      description = "header 触发线 \"name=value\" 精确匹配 (name 大小写不敏感). null = 省略行 (上游字段级默认 = 内置 Claude 订阅 unified 两项); [] = 显式关闭通道; 非 null = 替换.";
+                    };
+                  };
+                }
+              );
+              default = null;
+              description = "kind=pool 的耗尽信号配置 (三通道 OR). null = 省略整段 = 上游内置窗口限额默认表; 非 null 时按字段渲染 — 字段 null 省略行 (保留上游该通道默认), 字段 [] 显式关闭, 字段非空替换.";
+            };
+            cooldownSecs = lib.mkOption {
+              type = lib.types.nullOr lib.types.ints.unsigned;
+              default = null;
+              description = "kind=pool 的兜底闹钟时长 (秒): 信号命中但解析不出精确恢复时刻时成员挂起 now+cooldown. null = 省略 = 上游默认 60.";
             };
           };
         }

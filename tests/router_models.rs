@@ -112,6 +112,7 @@ async fn spawn(providers: Vec<Provider>) -> String {
         ProviderTable::with_persist_lock(providers, vec![], decisions, state_path, persist_lock);
     let redact = secret_guard::config::RedactConfig::default();
     let proxy = AppState {
+        pools: secret_guard::pool::PoolStates::new(),
         upstream: reqwest::Client::new(),
         providers: provider_table,
         dag: secret_guard::dag::ConversationDag::new(64, 500, 1),

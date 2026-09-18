@@ -223,7 +223,10 @@ async fn dispatch(
     // 2.5 #196: router provider 的模型列表 GET 请求本地终结 (别名 ∪ 过滤后上游
     // 清单, N1-N6 语义见 src/proxy/models.rs 头部 + contracts.md FWD-7): 无 body
     // 收集 (GET 无 body), 无 route resolution, 无 DAG record (D5). Direct provider
-    // 不进此分支, /models 透传行为零变化 (D6). 非 GET / 非匹配路径落回原流程.
+    // 不进此分支, /models 透传行为零变化 (D6). Pool 同样不进此分支 (那是
+    // Router 专属) — pool 入口的 /models 落到 resolve_route → 打到当前成员 →
+    // Direct 透传语义, 零代码 (spec §7 语义决策; 成员耗尽的 failover 拨号
+    // 对 GET /models 同样生效). 非 GET / 非匹配路径落回原流程.
     if parts.method == Method::GET
         && matches!(provider.kind, ProviderKind::Router(_))
         && models::is_model_list_path(ingress, &fp.rest)
@@ -251,7 +254,10 @@ async fn dispatch(
     } else {
         String::new()
     };
-    let resolved = match state.providers.resolve_route(&provider, &request_model) {
+    let resolved = match state
+        .providers
+        .resolve_route(&provider, &request_model, &state.pools)
+    {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(router = %fp.name, error = %e, "route resolution failed");
@@ -264,6 +270,9 @@ async fn dispatch(
         id: upstream_id,
         provider,
         model_rewrite,
+        // Pool 跳归因锚点: 响应侧耗尽检测 (T2) 经此 mark_exhausted; 当前
+        // 转发路径不消费 (检测挂接是独立任务), 显式命名留给 T2。
+        pool: _pool_hop,
     } = resolved;
     if fp.name != upstream_id {
         tracing::info!(

@@ -1458,6 +1458,7 @@ async fn spawn_full_auth_router(secure_cookie: bool) -> (MockIdp, String) {
     );
     let redact = secret_guard::config::RedactConfig::default();
     let state = secret_guard::state::AppState {
+        pools: secret_guard::pool::PoolStates::new(),
         upstream: reqwest::Client::new(),
         providers,
         dag: secret_guard::dag::ConversationDag::new(8, 8, 1),

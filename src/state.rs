@@ -79,6 +79,12 @@ pub struct AppState {
     /// models.dev 定价缓存 (usage-stats §7): 惰性首拉 + TTL + serve-stale +
     /// single-flight; 只被 /api/usage 查询路径触碰, 不在转发链上.
     pub pricing: Arc<crate::usage::PricingCache>,
+    /// Pool provider (套餐池) 的进程级成员状态机: 顺序 failover pick + 耗尽
+    /// 闹钟 (内存态, 不持久化 — 真相在上游, 重启重新探测). 纯数据 + 派生层
+    /// store, 聚合先例同 `api_keys` / `model_lists` (state 聚合各 feature 模块
+    /// 的 store 类型); 消费点: proxy dispatch (`resolve_route` 注入 pick) 与
+    /// 响应侧耗尽检测 (T2)。契约见 `src/pool.rs` 头部。
+    pub pools: crate::pool::PoolStates,
 }
 
 // ─── HTTP 层共享常量 ────────────────────────────────────────────────────────

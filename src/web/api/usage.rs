@@ -42,7 +42,10 @@ pub async fn usage_summary(
         let p = state.providers.get_effective(pid)?;
         match &p.kind {
             crate::provider::ProviderKind::Direct(d) => crate::usage::extract_host(&d.base_url),
-            crate::provider::ProviderKind::Router(_) => None,
+            // 虚拟构造 (router/pool) 无 base_url → 无 domain hint.
+            crate::provider::ProviderKind::Router(_) | crate::provider::ProviderKind::Pool(_) => {
+                None
+            }
         }
     };
     let summary = build_summary(

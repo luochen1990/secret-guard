@@ -171,7 +171,7 @@ pub struct Provider {
     pub kind: ProviderKind,
 }
 
-/// Provider 的两种构造 (#187 sum type). serde internally tagged: `kind` 字段
+/// Provider 的构造 (#187 sum type, Pool 延伸). serde internally tagged: `kind` 字段
 /// 判别, variant 字段平铺 (见 [`Provider`] 文档的 TOML 示例).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -181,6 +181,11 @@ pub enum ProviderKind {
     /// 虚拟 endpoint: 不承载转发, 请求按请求 model 匹配 `routes` 路由链式
     /// 解析到链尾实体 (#179 多规则化).
     Router(RouterProvider),
+    /// 套餐池 (pool): 不承载转发, 有序成员列表 (= 一份独立凭证的 Direct
+    /// provider) + 耗尽信号配置. 顺序 failover — 正常全打第一个可用成员
+    /// (前缀缓存友好), 检测到窗口限额耗尽信号后自动切换下一个, 耗尽成员
+    /// 按恢复时刻自动回归. 运行时状态机见 [`crate::pool`].
+    Pool(PoolProvider),
 }
 
 /// 直连上游 provider 的构造负载 ([`ProviderKind::Direct`]).
@@ -261,6 +266,105 @@ impl RouterProvider {
                 Some(b) if r.priority <= b.priority => best,
                 _ => Some(r),
             })
+    }
+}
+
+// ─── Pool 构造 (套餐池): 类型与默认信号表 ─────────────────────────────────
+//
+// 默认信号表与类型同域 (serde default 函数天然在此), 语义 SSOT 引用见
+// `crate::pool` 头部 ("内置默认信号表" 段). 语义域 = 订阅窗口限额耗尽
+// (会自动恢复), 付费/账单类信号一律不进默认 — 用户 opt-in 自行配置.
+
+/// 内置默认 body 码表: 智谱 GLM Coding Plan 窗口限额 (429 + `error.code`
+/// = "1308" 5h 窗 / "1310" 周窗配额耗尽, 响应另带 `next_flush_time`).
+/// 故意不含瞬态 (1302 并发限流 / 1305 平台过载) 与付费/政策语义
+/// (1113 欠费 / 1309 套餐到期 / 1313 公平限流 / 1311 模型未开放) — 见
+/// `crate::pool` 头部 "故意不进默认" 清单.
+pub const DEFAULT_WINDOW_EXHAUST_CODES: [&str; 2] = ["1308", "1310"];
+
+/// 内置默认 header 表: Anthropic Claude Pro/Max 订阅 (OAuth 流量) 撞窗时
+/// 429 + 专属 header `anthropic-ratelimit-unified-{5h,weekly}-status: blocked`.
+pub const DEFAULT_WINDOW_EXHAUST_HEADERS: [&str; 2] = [
+    "anthropic-ratelimit-unified-5h-status=blocked",
+    "anthropic-ratelimit-unified-weekly-status=blocked",
+];
+
+/// serde default: `PoolProvider::cooldown_secs` = 60s (信号无精确恢复时刻的
+/// 兜底闹钟时长).
+fn default_pool_cooldown_secs() -> u64 {
+    60
+}
+
+/// serde default: `ExhaustConfig::codes` = 内置窗口限额码表.
+fn default_window_exhaust_codes() -> Vec<String> {
+    DEFAULT_WINDOW_EXHAUST_CODES
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// serde default: `ExhaustConfig::headers` = 内置 Claude 订阅 header 表.
+fn default_window_exhaust_headers() -> Vec<String> {
+    DEFAULT_WINDOW_EXHAUST_HEADERS
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// 套餐池 provider 的构造负载 ([`ProviderKind::Pool`]).
+///
+/// base_url / api_key 等直连字段**在此构造下不存在** (sum type); 成员各自是
+/// 独立的 Direct provider (一份独立凭证). pick 语义 (无游标列表序 / 闹钟回归
+/// / 全耗尽 Err) 与耗尽检测的 SSOT: [`crate::pool`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolProvider {
+    /// 有序成员列表 (Direct provider ids). 顺序 failover: 列表序即优先级
+    /// (`crate::pool::PoolStates::pick_member`), 正常全打第一个可用成员.
+    /// validate 拒绝空表 (空 members 的 pool 无法转发任何请求, 几乎肯定是
+    /// 配置残缺) 与自环 (member 含自身 id).
+    pub members: Vec<String>,
+    /// 耗尽信号配置 (三通道 OR: statuses / codes / headers). 省略 = 内置
+    /// 窗口限额默认表 (见上方常量). **字段级替换语义**: 显式配某字段 = 替换
+    /// 该字段默认值 (空数组 = 显式关闭该通道); 想 "删掉默认表里某个码" =
+    /// 重抄剩余码 — 有意保留删除能力.
+    #[serde(default)]
+    pub exhaust: ExhaustConfig,
+    /// 兜底闹钟时长 (秒). 信号命中但解析不出精确恢复时刻时, 成员挂起
+    /// now + cooldown (防探测风暴的下限也用它).
+    #[serde(default = "default_pool_cooldown_secs")]
+    pub cooldown_secs: u64,
+}
+
+/// 耗尽信号配置 (三通道 OR, 空通道 = 关闭). 匹配语义与恢复时刻解析的
+/// SSOT: `crate::pool::detect_exhaustion`.
+///
+/// `Default` = **内置窗口限额默认表** (手写而非 derive — derive 的全空形态
+/// 与 "省略 \[exhaust\] 段 = 内置表" 的 serde 语义冲突, 统一于此单一事实:
+/// `exhaust` 段整体缺席时 serde 走本 Default; 段内单字段缺席走字段级
+/// default, 两者产出一致)。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExhaustConfig {
+    /// status 触发线: 上游 HTTP status ∈ 此列表 → 耗尽. 默认空 (关闭 —
+    /// 无一家窗口限额可用纯 status 判别, 429 混杂瞬态限速).
+    #[serde(default)]
+    pub statuses: Vec<u16>,
+    /// body 码触发线: 从 body JSON 四个候选位置提取的字符串码 ∈ 此列表 →
+    /// 耗尽. 默认 = [`DEFAULT_WINDOW_EXHAUST_CODES`] (智谱窗口限额).
+    #[serde(default = "default_window_exhaust_codes")]
+    pub codes: Vec<String>,
+    /// header 触发线: `"name=value"` 精确匹配 (name 大小写不敏感).
+    /// 默认 = [`DEFAULT_WINDOW_EXHAUST_HEADERS`] (Claude 订阅 unified 两项).
+    #[serde(default = "default_window_exhaust_headers")]
+    pub headers: Vec<String>,
+}
+
+impl Default for ExhaustConfig {
+    fn default() -> Self {
+        Self {
+            statuses: Vec::new(),
+            codes: default_window_exhaust_codes(),
+            headers: default_window_exhaust_headers(),
+        }
     }
 }
 
@@ -449,6 +553,27 @@ impl DynamicEntry for Provider {
                     // 重复优先级合法 (tie 按列表序, select_route 锁定).
                 }
             }
+            ProviderKind::Pool(p) => {
+                // 空 members 拒绝: 空 pool 无法转发任何请求, 几乎肯定是配置
+                // 残缺 — 与 Router 空 routes 同型 fail-fast.
+                if p.members.is_empty() {
+                    return Err(format!(
+                        "provider {} must declare at least one pool member",
+                        self.id
+                    ));
+                }
+                for member in &p.members {
+                    // 成员 id 卫生 (与 Router target 同型先例).
+                    crate::secrets::validate_id(member)?;
+                    // 自环拒绝: member 指向自身 = 立即 Cycle, 配置残缺.
+                    // (运行时 visited-set 兜底手改 state.toml 漏网.)
+                    if member == &self.id {
+                        return Err(format!("provider {} lists itself as pool member", self.id));
+                    }
+                }
+                // 重复成员不拒绝: 同一 provider 出现两次, 第二次 pick 到它时
+                // 它已被标记耗尽, 行为无歧义 (与 Router 平行路由边先例一致).
+            }
         }
         Ok(())
     }
@@ -539,6 +664,13 @@ pub enum EffectiveProviderKind {
     Router {
         routes: Vec<Route>,
     },
+    /// Pool 构造 (spec §10 的 WebUI 面在 T3 扩展运行时状态观察; 本变体先落
+    /// 纯配置字段). 无 protocol — 与 Router 同理 (egress 由成员决定).
+    Pool {
+        members: Vec<String>,
+        exhaust: ExhaustConfig,
+        cooldown_secs: u64,
+    },
 }
 
 /// 对外返回时屏蔽真实 api_key. 仍保留长度提示 (便于排查"是否配置了 key").
@@ -564,6 +696,11 @@ impl From<Provider> for ProviderMasked {
                 }
             }
             ProviderKind::Router(r) => EffectiveProviderKind::Router { routes: r.routes },
+            ProviderKind::Pool(p) => EffectiveProviderKind::Pool {
+                members: p.members,
+                exhaust: p.exhaust,
+                cooldown_secs: p.cooldown_secs,
+            },
         };
         Self {
             id: p.id,
@@ -584,9 +721,11 @@ impl DynamicTable<Provider> {
             .collect()
     }
 
-    /// 解析路由 provider 的路由链 (#179 多规则化): 从 `entry` 出发, 按请求
-    /// model 逐跳匹配路由, 直到链尾的实体 provider, 并收集链上生效的 model
-    /// 重写值 (`Route::upstream_model`, #183 语义被路由吸收).
+    /// 解析路由 provider 的路由链 (#179 多规则化 + Pool 成员选择): 从 `entry`
+    /// 出发, 按请求 model 逐跳匹配路由 (Router 跳) / 按状态机选成员 (Pool 跳),
+    /// 直到链尾的实体 provider, 并收集链上生效的 model 重写值
+    /// (`Route::upstream_model`, #183 语义被路由吸收) 与经过的第一个 pool 跳
+    /// ([`PoolHop`], 响应侧耗尽检测的归因锚点).
     ///
     /// - **per-request 语义**: dispatch 每次转发前调用 (携带本请求的 model),
     ///   切换路由只影响新请求 (in-flight 请求已拿到解析结果, 按旧目标完成);
@@ -594,6 +733,12 @@ impl DynamicTable<Provider> {
     ///   链上每个 provider 必须存在且 entry-level enabled;
     /// - **路由选择** ([`RouterProvider::select_route`]): 启用路由中 model_pattern
     ///   匹配 **in-flight model** 的最大 priority 者, 并列按列表序; 无命中 → [`RouteError::NoMatch`];
+    /// - **Pool 分支** ([`PoolPicker`]): `pick_member` 无游标列表序选第一个可用
+    ///   成员; missing/disabled 成员 = 永久标记 (until=None) + 取下一个候选
+    ///   (不直接报错 — pool 的存在意义就是 failover); 全部不可用 →
+    ///   [`RouteError::AllMembersExhausted`]. 状态机实现 [`crate::pool::PoolStates`]
+    ///   由调用方注入 (接口倒置, 先例同 codec::StreamRestoreHook — 保持
+    ///   pool → provider 单向依赖);
     /// - **model 重写 pipeline 语义**: 路由的 `upstream_model` 为 Some 时改写**立即生效** —
     ///   后续 router 按改写后的 model 匹配, 多次改写后者覆盖前者 (与旧 #183
     ///   first-wins 不同: 改写值参与下一跳的路由匹配);
@@ -609,16 +754,21 @@ impl DynamicTable<Provider> {
     ///   owned 值;
     /// - `entry` 自身是 Direct 时原样返回 (实体 provider 快路径, 零路由匹配一跳).
     ///
-    /// 错误消息只含 provider id / model 名与 reason 枚举 (SEC-2 同型, 无 secret),
-    /// 经 `AppError::Unavailable` 原样回传客户端 503 body.
+    /// 错误消息只含 provider id / model 名与 reason 枚举 (SEC-2 同型, 无 secret,
+    /// AllMembersExhausted 亦不含上游 body 原文), 经 `AppError::Unavailable`
+    /// 原样回传客户端 503 body.
     pub fn resolve_route(
         &self,
         entry: &Provider,
         request_model: &str,
+        pools: &dyn PoolPicker,
     ) -> Result<ResolvedRoute, RouteError> {
         let mut visited = HashSet::from([entry.id.clone()]);
         let mut in_flight_model = request_model.to_string();
         let mut model_rewrite: Option<String> = None;
+        // 本请求经过的第一个 pool 跳 (嵌套多 pool 只记第一个 — 罕见场景,
+        // 响应侧耗尽检测只归因到最外层; spec §7 声明假设).
+        let mut pool_hop: Option<PoolHop> = None;
         // 借用语义经 Cow 表达: 首跳借用调用方 entry, 换跳才构造 owned —
         // 峰值至多保留一跳中间 Provider, 与原实现的 `cur = next` 一致.
         let mut cur = std::borrow::Cow::Borrowed(entry);
@@ -631,6 +781,7 @@ impl DynamicTable<Provider> {
                         id: cur.id.clone(),
                         provider: direct.clone(),
                         model_rewrite,
+                        pool: pool_hop,
                     });
                 }
                 ProviderKind::Router(router) => {
@@ -659,6 +810,46 @@ impl DynamicTable<Provider> {
                     }
                     cur = std::borrow::Cow::Owned(next);
                 }
+                ProviderKind::Pool(pool) => {
+                    // pick (无游标列表序) → 成员存在性/enabled 检查; missing 或
+                    // disabled 成员 = 永久标记 (until=None — disabled 是用户显式
+                    // 动作, 不做闹钟探测) + 回到 pick 取下一个候选 (内层 loop),
+                    // 与 Router 的 Missing/Disabled 503 语义不同: pool 的存在
+                    // 意义就是 failover. 内层 loop 有限步收敛 (每次 mark 后
+                    // pick 跳过该 slot, members 有限).
+                    //
+                    // members 直接借用 `cur.kind` (NLL: 最后使用点在内层 loop,
+                    // 此后 cur 被 move 合法) — 与 Router 臂的 route 借用同形态,
+                    // 零成员表 clone.
+                    let pool_id = cur.id.clone();
+                    let (member_idx, next) = loop {
+                        let member_idx = pools
+                            .pick_member(&pool_id, &pool.members, std::time::Instant::now())
+                            .map_err(RouteError::AllMembersExhausted)?;
+                        match self.get_effective(&pool.members[member_idx]) {
+                            Some(next) if next.enabled => break (member_idx, next),
+                            // 悬空 (被 decision 排除) / disabled → 永久标记后取下一个.
+                            // (裸索引依赖 PoolPicker 契约 "idx < members.len()" —
+                            // 违约 = 实现方编程错误, 不做运行时防御.)
+                            _ => pools.mark_member_exhausted(
+                                &pool_id,
+                                &pool.members,
+                                member_idx,
+                                None,
+                            ),
+                        }
+                    };
+                    if !visited.insert(next.id.clone()) {
+                        return Err(RouteError::Cycle(next.id));
+                    }
+                    // 嵌套多 pool 只记第一个遇到的 (get_or_insert 语义, 罕见场景
+                    // 声明见函数头).
+                    pool_hop.get_or_insert(PoolHop {
+                        pool_id,
+                        member_idx,
+                    });
+                    cur = std::borrow::Cow::Owned(next);
+                }
             }
         }
     }
@@ -677,6 +868,8 @@ impl DynamicTable<Provider> {
         let mut hops = self.route_graph();
         let entry_targets = match &entry.kind {
             ProviderKind::Router(r) => enabled_targets_of(&r.routes),
+            // Pool members 与 route target 同型构成图边 (无禁用语义 — 全算).
+            ProviderKind::Pool(p) => p.members.clone(),
             ProviderKind::Direct(..) => vec![],
         };
         hops.insert(entry.id.clone(), entry_targets);
@@ -687,10 +880,11 @@ impl DynamicTable<Provider> {
     }
 
     /// merged (static+dynamic+decision) 视图的路由邻接表: provider id → 启用
-    /// 路由的 target 列表. Direct 构造为空 (链终止); dangling target 不在键集
+    /// 路由的 target 列表 (Pool 构造 = members, 与 route target 同型的图边).
+    /// Direct 构造为空 (链终止); dangling target 不在键集
     /// (走到即止). [`Self::would_cycle`] 与 [`Self::find_cycles`] 的边集 SSOT:
     /// 禁用路由 (priority=None) 不构成边, decision-disabled 项被 effective
-    /// 视图排除; entry 级 `enabled=false` 的 router 仍贡献边 (潜伏环也值得
+    /// 视图排除; entry 级 `enabled=false` 的 router/pool 仍贡献边 (潜伏环也值得
     /// 启动时暴露 — 踏上它的请求实际以 Disabled 503 终止, 语义偏保守无害).
     fn route_graph(&self) -> HashMap<String, Vec<String>> {
         self.effective_snapshot()
@@ -698,6 +892,7 @@ impl DynamicTable<Provider> {
             .map(|e| {
                 let targets = match &e.kind {
                     EffectiveProviderKind::Router { routes } => enabled_targets_of(routes),
+                    EffectiveProviderKind::Pool { members, .. } => members.clone(),
                     EffectiveProviderKind::Direct { .. } => vec![],
                 };
                 (e.id.clone(), targets)
@@ -837,6 +1032,19 @@ pub enum RouteError {
     /// router 的启用路由中无 model_pattern 匹配当前请求 model 的路由.
     /// 字段 = 该 router 的 id + 当时的 in-flight model 名.
     NoMatch { id: String, model: String },
+    /// pool 的全部成员不可用 (耗尽 / missing / disabled).
+    AllMembersExhausted(AllMembersExhausted),
+}
+
+/// [`RouteError::AllMembersExhausted`] 的 payload: pool id + 最早到期闹钟.
+/// message 契约 (SEC-2): 只含 pool id + reason 枚举 + 恢复时刻, 绝不含
+/// 上游 body 原文 (可能含敏感信息) — 与其他 RouteError 变体同型.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllMembersExhausted {
+    pub pool_id: String,
+    /// 最早到期的闹钟 (`None` = 全部永久耗尽 — missing/disabled 成员无闹钟,
+    /// 无自动恢复, 需改配置 / 重启 / T3 复位端点).
+    pub earliest_resume: Option<std::time::Instant>,
 }
 
 impl std::fmt::Display for RouteError {
@@ -854,13 +1062,57 @@ impl std::fmt::Display for RouteError {
                 f,
                 "router provider '{id}' has no route matching model '{model}'"
             ),
+            RouteError::AllMembersExhausted(e) => match e.earliest_resume {
+                // 恢复时刻以剩余秒数呈现 (Instant 无墙钟表示; SEC-2 — 不含 body).
+                Some(t) => write!(
+                    f,
+                    "pool provider '{}' has no available member (all exhausted, missing or disabled; earliest resumes in ~{}s)",
+                    e.pool_id,
+                    t.saturating_duration_since(std::time::Instant::now())
+                        .as_secs()
+                ),
+                None => write!(
+                    f,
+                    "pool provider '{}' has no available member (all exhausted, missing or disabled; no scheduled recovery)",
+                    e.pool_id
+                ),
+            },
         }
     }
 }
 
 impl std::error::Error for RouteError {}
 
-/// 路由解析结果 (#179/#183): 链尾实体 provider + 链上生效的 model 重写值.
+/// Pool 成员状态机的消费接口 (**接口倒置**, 先例同 codec::StreamRestoreHook):
+/// [`DynamicTable::<Provider>::resolve_route`] 的图遍历需要驱动 pool 状态机
+/// (pick + 永久标记), 而状态机实现 [`crate::pool::PoolStates`] 又依赖
+/// provider 类型 — trait 定义在本模块 (被 resolve_route 消费), 生产实现由
+/// 调用方 (proxy dispatch / 测试) 注入, 保持 pool → provider 单向依赖.
+pub trait PoolPicker: Send + Sync {
+    /// 选成员: 无游标列表序 (顺序 failover) — 返回第一个 Active slot 的下标,
+    /// 闹钟已过的 slot 顺带清除 (成员回归列表头, 前缀缓存最大化); 全部
+    /// Exhausted → [`AllMembersExhausted`] (含最早到期闹钟). `members` 是当前
+    /// 配置快照 — 实现方每次调用先做配置对齐 (WebUI 可随时改配置).
+    fn pick_member(
+        &self,
+        pool_id: &str,
+        members: &[String],
+        now: std::time::Instant,
+    ) -> Result<usize, AllMembersExhausted>;
+
+    /// 标记成员耗尽 (幂等: 重复标记刷新 until). `until = None` = 永久
+    /// (missing/disabled 成员 — 不做闹钟探测). `members` 同上 (对齐基准).
+    fn mark_member_exhausted(
+        &self,
+        pool_id: &str,
+        members: &[String],
+        member_idx: usize,
+        until: Option<std::time::Instant>,
+    );
+}
+
+/// 路由解析结果 (#179/#183 + Pool): 链尾实体 provider + 链上生效的 model
+/// 重写值 + 经过的第一个 pool 跳.
 ///
 /// `model_rewrite` = 命中路由的 `upstream_model` 字段 (pipeline 语义, 多跳改写
 /// 后者覆盖前者; 全链路由均未配置 → None, 即透传).
@@ -872,6 +1124,18 @@ pub struct ResolvedRoute {
     pub provider: DirectProvider,
     /// 链上生效的 model 重写值 (路由 pipeline; None = 客户端 model 透传).
     pub model_rewrite: Option<String>,
+    /// 本请求经过的 (第一个) pool 跳 (响应侧耗尽检测的归因锚点: 检测命中时
+    /// `mark_member_exhausted(pool_id, member_idx, ...)`). 非 pool 流量为 None
+    /// (T2 挂接层据此零开销短路).
+    pub pool: Option<PoolHop>,
+}
+
+/// 一次解析经过的 pool 跳 (spec §7): pool id + 命中成员下标.
+/// 嵌套多 pool 只记第一个遇到的 (罕见场景, 声明见 `resolve_route` doc).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolHop {
+    pub pool_id: String,
+    pub member_idx: usize,
 }
 
 /// 给定 (static_ver, dynamic_ver, mode), 计算 effective provider 的合并视图.
@@ -918,6 +1182,7 @@ mod tests {
     use proptest::prelude::*;
 
     use crate::config::Decisions;
+    use crate::pool::PoolStates;
 
     fn p(id: &str, proto: Protocol, base: &str) -> Provider {
         Provider {
@@ -1626,7 +1891,9 @@ mod tests {
         // Direct provider 原样返回, 零额外跳; 无路由改写.
         let t = route_table();
         let real = t.get_effective("real").unwrap();
-        let out = t.resolve_route(&real, "any-model").unwrap();
+        let out = t
+            .resolve_route(&real, "any-model", &PoolStates::new())
+            .unwrap();
         assert_eq!(out.id, "real");
         assert_eq!(out.provider.base_url, "https://upstream");
         assert_eq!(
@@ -1641,7 +1908,7 @@ mod tests {
         // rt1 → rt2 → real: 解析到链尾实体, 携带其实体字段 (base_url/api_key).
         let t = route_table();
         let rt1 = t.get_effective("rt1").unwrap();
-        let out = t.resolve_route(&rt1, "gpt-4o").unwrap();
+        let out = t.resolve_route(&rt1, "gpt-4o", &PoolStates::new()).unwrap();
         assert_eq!(out.id, "real");
         assert_eq!(out.provider.base_url, "https://upstream");
         assert_eq!(out.provider.api_key, "sk-real");
@@ -1656,7 +1923,7 @@ mod tests {
             tempfile_path(),
         );
         let err = t
-            .resolve_route(&t.get_effective("rt").unwrap(), "m")
+            .resolve_route(&t.get_effective("rt").unwrap(), "m", &PoolStates::new())
             .unwrap_err();
         assert_eq!(err, RouteError::Missing("ghost".into()));
         assert!(err.to_string().contains("ghost"), "msg names the id: {err}");
@@ -1674,7 +1941,7 @@ mod tests {
         );
         // 入口 provider 自身 disabled 在 dispatch 层已挡 (503); 这里测链上中间跳.
         let err = t
-            .resolve_route(&t.get_effective("rt").unwrap(), "m")
+            .resolve_route(&t.get_effective("rt").unwrap(), "m", &PoolStates::new())
             .unwrap_err();
         assert_eq!(err, RouteError::Disabled("real".into()));
     }
@@ -1689,7 +1956,7 @@ mod tests {
             tempfile_path(),
         );
         let err = t
-            .resolve_route(&t.get_effective("a").unwrap(), "m")
+            .resolve_route(&t.get_effective("a").unwrap(), "m", &PoolStates::new())
             .unwrap_err();
         assert_eq!(err, RouteError::Cycle("a".into()));
 
@@ -1701,7 +1968,7 @@ mod tests {
             tempfile_path(),
         );
         assert!(matches!(
-            t2.resolve_route(&t2.get_effective("s").unwrap(), "m"),
+            t2.resolve_route(&t2.get_effective("s").unwrap(), "m", &PoolStates::new()),
             Err(RouteError::Cycle(_))
         ));
     }
@@ -1719,7 +1986,11 @@ mod tests {
             tempfile_path(),
         );
         let err = t
-            .resolve_route(&t.get_effective("rt").unwrap(), "claude-3")
+            .resolve_route(
+                &t.get_effective("rt").unwrap(),
+                "claude-3",
+                &PoolStates::new(),
+            )
             .unwrap_err();
         assert_eq!(
             err,
@@ -1741,7 +2012,7 @@ mod tests {
             tempfile_path(),
         );
         assert!(matches!(
-            t2.resolve_route(&t2.get_effective("rt").unwrap(), "m"),
+            t2.resolve_route(&t2.get_effective("rt").unwrap(), "m", &PoolStates::new()),
             Err(RouteError::NoMatch { .. })
         ));
     }
@@ -1772,7 +2043,11 @@ mod tests {
             tempfile_path(),
         );
         let err = t
-            .resolve_route(&t.get_effective("rt").unwrap(), &"x".repeat(100))
+            .resolve_route(
+                &t.get_effective("rt").unwrap(),
+                &"x".repeat(100),
+                &PoolStates::new(),
+            )
             .unwrap_err();
         match err {
             RouteError::NoMatch { model, .. } => {
@@ -1797,10 +2072,23 @@ mod tests {
             tempfile_path(),
         );
         let entry = t.get_effective("rt").unwrap();
-        assert_eq!(t.resolve_route(&entry, "gpt-4o").unwrap().id, "real1");
-        assert_eq!(t.resolve_route(&entry, "claude-3").unwrap().id, "real2");
+        assert_eq!(
+            t.resolve_route(&entry, "gpt-4o", &PoolStates::new())
+                .unwrap()
+                .id,
+            "real1"
+        );
+        assert_eq!(
+            t.resolve_route(&entry, "claude-3", &PoolStates::new())
+                .unwrap()
+                .id,
+            "real2"
+        );
         // 空 model (非 JSON / 无 model 字段请求): 只匹配 "*".
-        assert_eq!(t.resolve_route(&entry, "").unwrap().id, "real2");
+        assert_eq!(
+            t.resolve_route(&entry, "", &PoolStates::new()).unwrap().id,
+            "real2"
+        );
     }
 
     #[test]
@@ -1830,14 +2118,22 @@ mod tests {
             tempfile_path(),
         );
         let out = t
-            .resolve_route(&t.get_effective("rt1").unwrap(), "gpt-4o")
+            .resolve_route(
+                &t.get_effective("rt1").unwrap(),
+                "gpt-4o",
+                &PoolStates::new(),
+            )
             .unwrap();
         assert_eq!(out.id, "real", "rt2 matched rewritten model");
         assert_eq!(out.model_rewrite.as_deref(), Some("claude-3"));
 
         // 对照: 直入 rt2 (无改写) — 请求 model 自行匹配, 无 override.
         let out2 = t
-            .resolve_route(&t.get_effective("rt2").unwrap(), "claude-3")
+            .resolve_route(
+                &t.get_effective("rt2").unwrap(),
+                "claude-3",
+                &PoolStates::new(),
+            )
             .unwrap();
         assert_eq!(out2.id, "real");
         assert_eq!(out2.model_rewrite, None);
@@ -1873,7 +2169,11 @@ mod tests {
             tempfile_path(),
         );
         let out = t
-            .resolve_route(&t.get_effective("rt1").unwrap(), "gpt-4o")
+            .resolve_route(
+                &t.get_effective("rt1").unwrap(),
+                "gpt-4o",
+                &PoolStates::new(),
+            )
             .unwrap();
         assert_eq!(out.id, "real");
         assert_eq!(out.model_rewrite.as_deref(), Some("model-b"));
@@ -1894,7 +2194,11 @@ mod tests {
             tempfile_path(),
         );
         let out = t
-            .resolve_route(&t.get_effective("rt1").unwrap(), "gpt-4o")
+            .resolve_route(
+                &t.get_effective("rt1").unwrap(),
+                "gpt-4o",
+                &PoolStates::new(),
+            )
             .unwrap();
         assert_eq!(out.id, "real1", "no rewrite: next hop sees original model");
         assert_eq!(out.model_rewrite, None);
@@ -2276,7 +2580,7 @@ mod tests {
         let eff = t.get_effective("x").unwrap();
         assert!(matches!(eff.kind, ProviderKind::Direct(_)));
         // 路由解析直达自身 (实体快路径), 携带 override 的鉴权字段.
-        let r = t.resolve_route(&eff, "m").unwrap();
+        let r = t.resolve_route(&eff, "m", &PoolStates::new()).unwrap();
         assert_eq!(r.id, "x");
         assert_eq!(r.provider.base_url, "https://d");
         assert_eq!(r.provider.api_key, "sk-dyn");
@@ -2339,7 +2643,10 @@ mod tests {
             &eff.kind,
             ProviderKind::Router(r) if r.routes[0].target == "real1"
         ));
-        assert_eq!(t.resolve_route(&eff, "m").unwrap().id, "real1");
+        assert_eq!(
+            t.resolve_route(&eff, "m", &PoolStates::new()).unwrap().id,
+            "real1"
+        );
     }
 
     #[test]
@@ -2358,7 +2665,7 @@ mod tests {
         );
         t.set_decision("real", OverrideMode::Disabled).unwrap();
         let err = t
-            .resolve_route(&t.get_effective("rt").unwrap(), "m")
+            .resolve_route(&t.get_effective("rt").unwrap(), "m", &PoolStates::new())
             .unwrap_err();
         assert_eq!(err, RouteError::Missing("real".into()));
         assert!(err.to_string().contains("disabled by decision"));
@@ -2390,7 +2697,7 @@ mod tests {
                 if let Some(entry) = t.get_effective(id) {
                     // Err 分支 = 有限步返回明确错误 (同样满足终止性), 无需断言.
                     // Ok ⇒ 链尾必为 Direct (类型保证, 无需运行时断言); 有限步返回即满足终止性.
-                    let _ = t.resolve_route(&entry, "gpt-4o");
+                    let _ = t.resolve_route(&entry, "gpt-4o", &PoolStates::new());
                 }
             }
         }
@@ -2485,5 +2792,309 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ─── Pool 构造 (套餐池): serde / validate / resolve_route / 图校验 ────────
+    //
+    // 契约: spec-pool-provider (T1). 状态机的细粒度行为 (pick 顺序 / 闹钟回归 /
+    // 对齐重建) 见 src/pool.rs tests; 这里测 provider 集成面.
+
+    /// pool provider: 默认 exhaust (内置窗口限额表) + cooldown 60.
+    fn pool(id: &str, members: &[&str]) -> Provider {
+        Provider {
+            id: id.into(),
+            enabled: true,
+            name: Some(format!("name-{id}")),
+            kind: ProviderKind::Pool(PoolProvider {
+                members: members.iter().map(|s| s.to_string()).collect(),
+                exhaust: ExhaustConfig::default(),
+                cooldown_secs: default_pool_cooldown_secs(),
+            }),
+        }
+    }
+
+    #[test]
+    fn toml_pool_roundtrip_full_and_defaults() {
+        // 完整形态: members + exhaust 三通道 + cooldown_secs. (单条反序列化
+        // 上下文 — 完整 config 文件中这些行在 `[[providers]]` 内, 前缀剥掉;
+        // cooldown_secs 必须位于 [exhaust] 段头**之前**, TOML 表段后的键归属
+        // 该子表.)
+        let full = r#"
+            id = "glm-pool"
+            kind = "pool"
+            members = ["glm-acc1", "glm-acc2"]
+            cooldown_secs = 120
+
+            [exhaust]
+            statuses = [429]
+            codes = ["1308"]
+            headers = ["x-status=blocked"]
+        "#;
+        let p: Provider = toml::from_str(full).expect("pool parse");
+        let ProviderKind::Pool(pl) = &p.kind else {
+            panic!("kind tag must parse as Pool");
+        };
+        assert_eq!(
+            pl.members,
+            vec!["glm-acc1".to_string(), "glm-acc2".to_string()]
+        );
+        assert_eq!(pl.exhaust.statuses, vec![429]);
+        assert_eq!(pl.exhaust.codes, vec!["1308".to_string()]);
+        assert_eq!(pl.exhaust.headers, vec!["x-status=blocked".to_string()]);
+        assert_eq!(pl.cooldown_secs, 120);
+        assert!(p.validate().is_ok());
+
+        // 省略整个 [providers.exhaust] = 全默认 (内置窗口限额表, spec §4).
+        let minimal = r#"
+            id = "glm-pool"
+            kind = "pool"
+            members = ["glm-acc1"]
+        "#;
+        let p: Provider = toml::from_str(minimal).expect("minimal pool parse");
+        let ProviderKind::Pool(pl) = &p.kind else {
+            panic!("must stay Pool");
+        };
+        assert_eq!(
+            pl.exhaust,
+            ExhaustConfig {
+                statuses: vec![],
+                codes: default_window_exhaust_codes(),
+                headers: default_window_exhaust_headers(),
+            },
+            "omitted exhaust = built-in window-limit table"
+        );
+        assert_eq!(pl.cooldown_secs, 60, "omitted cooldown = 60s default");
+        assert!(p.validate().is_ok());
+
+        // 字段级替换: 显式配某字段 = 替换该字段默认 (空数组 = 显式关闭通道);
+        // 未配字段保持默认.
+        let partial = r#"
+            id = "glm-pool"
+            kind = "pool"
+            members = ["glm-acc1"]
+
+            [exhaust]
+            codes = []
+        "#;
+        let p: Provider = toml::from_str(partial).expect("partial pool parse");
+        let ProviderKind::Pool(pl) = &p.kind else {
+            panic!("must stay Pool");
+        };
+        assert!(
+            pl.exhaust.codes.is_empty(),
+            "explicit empty closes code channel"
+        );
+        assert_eq!(
+            pl.exhaust.headers,
+            default_window_exhaust_headers(),
+            "unconfigured channel keeps its default"
+        );
+        assert!(p.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_pool_rejects_empty_members_self_ref_and_bad_ids() {
+        // 空 members (配置残缺 fail-fast, 与空 routes 同型).
+        let err = pool("pl", &[]).validate().unwrap_err();
+        assert!(err.contains("at least one pool member"), "got: {err}");
+        // 自环 (member 含自身 id).
+        let err = pool("pl", &["pl", "real"]).validate().unwrap_err();
+        assert!(err.contains("lists itself"), "got: {err}");
+        // 成员 id 非法 (validate_id 同 Router target 先例).
+        assert!(pool("pl", &["has space"]).validate().is_err());
+        // 合法: 重复成员不拒绝 (第二次 pick 到时已耗尽, 行为无歧义).
+        assert!(pool("pl", &["a", "a"]).validate().is_ok());
+    }
+
+    #[test]
+    fn resolve_route_pool_picks_first_member() {
+        // pool → direct: 正常全打列表第一个成员 (顺序 failover), PoolHop 归因.
+        let t = ProviderTable::new(
+            vec![
+                pool("pl", &["m1", "m2"]),
+                p("m1", Protocol::OpenAI, "https://u1"),
+                p("m2", Protocol::OpenAI, "https://u2"),
+            ],
+            vec![],
+            empty_decisions(),
+            tempfile_path(),
+        );
+        let out = t
+            .resolve_route(&t.get_effective("pl").unwrap(), "m", &PoolStates::new())
+            .unwrap();
+        assert_eq!(out.id, "m1", "list order is the priority");
+        assert_eq!(out.provider.base_url, "https://u1");
+        assert_eq!(
+            out.pool,
+            Some(PoolHop {
+                pool_id: "pl".into(),
+                member_idx: 0,
+            })
+        );
+        assert_eq!(out.model_rewrite, None, "pool does not rewrite model");
+    }
+
+    #[test]
+    fn resolve_route_pool_skips_missing_and_disabled_members() {
+        // missing / disabled 成员 = 永久标记 + 取下一个候选 (不直接报错 —
+        // pool 的存在意义就是 failover); 标记的永久性经共享 PoolStates 的
+        // 后续 pick 观察 (m1 即使后来在表中补上, 也不再被 pick).
+        let pools = PoolStates::new();
+        let t = ProviderTable::new(
+            vec![
+                pool("pl", &["ghost", "off", "m2"]),
+                p("m2", Protocol::OpenAI, "https://u2"),
+            ],
+            vec![],
+            empty_decisions(),
+            tempfile_path(),
+        );
+        let mut disabled = p("off", Protocol::OpenAI, "https://u-off");
+        disabled.enabled = false;
+        t.upsert_dynamic(disabled).unwrap();
+
+        let out = t
+            .resolve_route(&t.get_effective("pl").unwrap(), "m", &pools)
+            .unwrap();
+        assert_eq!(out.id, "m2", "ghost (missing) + disabled skipped");
+        assert_eq!(out.pool.as_ref().unwrap().member_idx, 2);
+
+        // 永久标记可观察: 补上 ghost 为实体后再 pick — ghost/off 的永久标记
+        // (until=None, 不探测) 不因实体补上而失效, 仍被跳过, 落到 m2 (spec §6:
+        // "disabled 是用户显式动作"; 恢复途径 = 改 members 触发对齐重建 / 重启).
+        t.upsert_dynamic(p("ghost", Protocol::OpenAI, "https://u-ghost"))
+            .unwrap();
+        let out2 = t
+            .resolve_route(&t.get_effective("pl").unwrap(), "m", &pools)
+            .unwrap();
+        assert_eq!(
+            out2.id, "m2",
+            "re-added member stays skipped: permanent marks never expire"
+        );
+        assert_eq!(out2.pool.as_ref().unwrap().member_idx, 2);
+    }
+
+    #[test]
+    fn resolve_route_pool_all_unavailable_sanitized_message() {
+        // 全部成员 missing → AllMembersExhausted; message SEC-2 净化:
+        // 只含 pool id + reason 枚举, 不含任何成员 url / 上游形态.
+        let t = ProviderTable::new(
+            vec![pool("pl", &["ghost1", "ghost2"])],
+            vec![],
+            empty_decisions(),
+            tempfile_path(),
+        );
+        let err = t
+            .resolve_route(&t.get_effective("pl").unwrap(), "m", &PoolStates::new())
+            .unwrap_err();
+        let RouteError::AllMembersExhausted(e) = &err else {
+            panic!("expected AllMembersExhausted, got {err:?}");
+        };
+        assert_eq!(e.pool_id, "pl");
+        assert_eq!(
+            e.earliest_resume, None,
+            "all members missing = permanent, no alarm"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("pl"), "message names the pool: {msg}");
+        assert!(msg.contains("no available member"), "msg: {msg}");
+        assert!(!msg.contains("http"), "SEC-2: no upstream urls in message");
+    }
+
+    #[test]
+    fn resolve_route_router_to_pool_nesting() {
+        // Router → Pool → Direct 嵌套 (spec §7): 嵌套组合天然支持;
+        // PoolHop 记录经过的 pool.
+        let t = ProviderTable::new(
+            vec![
+                router_to("rt", "pl"),
+                pool("pl", &["m1"]),
+                p("m1", Protocol::OpenAI, "https://u1"),
+            ],
+            vec![],
+            empty_decisions(),
+            tempfile_path(),
+        );
+        let out = t
+            .resolve_route(&t.get_effective("rt").unwrap(), "m", &PoolStates::new())
+            .unwrap();
+        assert_eq!(out.id, "m1");
+        assert_eq!(
+            out.pool,
+            Some(PoolHop {
+                pool_id: "pl".into(),
+                member_idx: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_route_pool_cycle_detected() {
+        // pool 互指环 (绕过 validate 直接构造 — 模拟手改 state.toml 的运行时
+        // 兜底场景): visited-set 有限步终止.
+        let t = ProviderTable::new(
+            vec![pool("pa", &["pb"]), pool("pb", &["pa"])],
+            vec![],
+            empty_decisions(),
+            tempfile_path(),
+        );
+        let err = t
+            .resolve_route(&t.get_effective("pa").unwrap(), "m", &PoolStates::new())
+            .unwrap_err();
+        assert!(matches!(err, RouteError::Cycle(_)), "got: {err:?}");
+
+        // 成员自指 (member 指向自身 pool).
+        let t2 = ProviderTable::new(
+            vec![pool("s", &["s"])],
+            vec![],
+            empty_decisions(),
+            tempfile_path(),
+        );
+        assert!(matches!(
+            t2.resolve_route(&t2.get_effective("s").unwrap(), "m", &PoolStates::new()),
+            Err(RouteError::Cycle(_))
+        ));
+    }
+
+    #[test]
+    fn would_cycle_covers_pool_member_edges() {
+        // pool members 与 route target 同型构成环检查边 (spec §7).
+        let t = ProviderTable::new(
+            vec![
+                router_to("a", "b"),
+                pool("b", &["real"]),
+                p("real", Protocol::OpenAI, "https://u"),
+            ],
+            vec![],
+            empty_decisions(),
+            tempfile_path(),
+        );
+        // b 的成员改指 a → 闭合 a→b 环.
+        assert!(
+            t.would_cycle(&pool("b", &["a"])),
+            "pool member closes the cycle"
+        );
+        // 悬空成员不成环.
+        assert!(!t.would_cycle(&pool("b", &["ghost"])));
+        // pool 自环.
+        assert!(t.would_cycle(&pool("b", &["b"])));
+    }
+
+    #[test]
+    fn find_cycles_detects_pool_edges() {
+        // 启动诊断: router→pool→router 闭环被检出 (边集 = route target ∪ pool members).
+        let t = ProviderTable::new(
+            vec![
+                router_to("a", "b"),
+                pool("b", &["a"]),
+                p("real", Protocol::OpenAI, "https://u"),
+            ],
+            vec![],
+            empty_decisions(),
+            tempfile_path(),
+        );
+        let cycles = t.find_cycles();
+        assert_eq!(cycles.len(), 1);
+        assert_eq!(cycles[0], vec!["a", "b", "a"]);
     }
 }

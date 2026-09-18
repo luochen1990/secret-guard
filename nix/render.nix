@@ -12,6 +12,10 @@
 #     + direct: protocol / base_url / api_key? / api_key_file?
 #     + router: routes[] (model_pattern / target / upstream_model? / priority?,
 #       省略 = 透传 / 该路由禁用)
+#     + pool: members[] (Direct provider id) / cooldown_secs? (省略 = 60) /
+#       [providers.exhaust] (字段级三态: 字段 null = 省略行 = 上游 serde
+#       字段级 default (内置表/关闭); 字段 [] = 显式关闭该通道; 非空 = 替换.
+#       省略整段 = 上游内置窗口限额默认表)
 #   - SecretEntry (src/secrets.rs): id / category / value_file (本函数只渲染脱敏
 #     形态 value_file, 不支持内联 value)
 #   - AuthConfig (src/auth/mod.rs): enabled + oidc{issuer_url / client_id /
@@ -35,15 +39,15 @@
 # eval 期校验单点收敛 (历史原型散在 render 与 checkToml 两处, 此处合一):
 #   - 语法: 生成物 fromTOML round-trip, 非法 TOML 在 eval 期即 throw
 #   - sum type fail-fast: direct 缺 protocol/baseUrl、分支专属字段串用、kind 非法、
-#     router 空 routes、apiKey/apiKeyFile 互斥、tomlComment 多行
+#     router 空 routes、pool 空 members、apiKey/apiKeyFile 互斥、tomlComment 多行
 #   - base_url 卫生: 非空 + http(s):// 前缀 + 末尾不带 / (对齐上游 validate_base_url)
-#   - id 卫生: provider id / secrets entry id / route target 符合上游 validate_id
-#     (1..=64, 首字符字母数字, 其余 [A-Za-z0-9_-])
+#   - id 卫生: provider id / secrets entry id / route target / pool member
+#     符合上游 validate_id (1..=64, 首字符字母数字, 其余 [A-Za-z0-9_-])
 #   - auth fail-fast: enabled 但无 oidc、apiKeys 的 key/keyFile 恰一、redirect_url
 #     形状 (对齐上游 AuthConfig::validate)
-#   - 跨 provider: route target 存在性 (声明式静态配置中所有 id 已知, 悬空即配置
-#     错误, 比上游 WebUI upsert 语义更严) + 启用边环检测 (对齐上游 would_cycle,
-#     禁用路由不构成环检测的边)
+#   - 跨 provider: route target / pool member 存在性 (声明式静态配置中所有 id
+#     已知, 悬空即配置错误, 比上游 WebUI upsert 语义更严) + 启用边环检测
+#     (对齐上游 would_cycle — 路由的禁用边不算; pool members 全算)
 #
 # 与 nixos 侧原型的语义差异: apiKeyFile / clientSecretFile / keyFile / valueFile
 # 均为纯路径直通 (与上游 *_file 字段 1:1), 不做任何 sops-key → LoadCredential
@@ -56,7 +60,11 @@
   #   { <id> = { name ? str; enable ? bool; tomlComment ? [str];
   #              kind == "direct": protocol, baseUrl, apiKey ? "", apiKeyFile ? path
   #            | kind == "router": routes = [{ modelPattern, target,
-  #                                           upstreamModel ?, priority ? }] } }
+  #                                           upstreamModel ?, priority ? }]
+  #            | kind == "pool": members = [str],
+  #                              exhaust ? { statuses = [int]; codes = [str];
+  #                                           headers = [str]; } | null,
+  #                              cooldownSecs ? int | null } }
   providers,
   # [server] 上游超时四项: null = 全默认 → 不渲染 (serde default 兜底); 否则
   # { connectTimeoutSecs, responseHeaderTimeoutSecs,
@@ -152,8 +160,12 @@ let
         "id = ${q id}"
       ]
       ++ lib.optional ((p.name or null) != null) "name = ${q p.name}"
-      ++ [ "# kind: provider 构造判别 (direct=直连上游 / router=虚拟路由), sum type 必填." ]
+      ++ [ "# kind: provider 构造判别 (direct=直连上游 / router=虚拟路由 / pool=套餐池), sum type 必填." ]
     );
+
+  # toml 数组渲染: 字符串数组 (JSON 转义) / 整数数组 (toString).
+  qStrList = xs: "[${lib.concatMapStringsSep ", " q xs}]";
+  intList = xs: "[${lib.concatMapStringsSep ", " toString xs}]";
 
   # 单条路由: 省略 upstream_model / priority 行 = 上游 serde 的 None
   # (透传请求原 model / 该路由禁用).
@@ -231,6 +243,50 @@ let
             ))
           ]
           ++ map (renderRoute id) p.routes
+        )
+    else if p.kind == "pool" then
+      let
+        badMembers = lib.filter (m: !validId m) (p.members or [ ]);
+        # [providers.exhaust] 段: 传入时渲染. 字段级三态 (module 侧 nullOr 的
+        # 语义收敛): null = 不渲染该行 (上游 serde 字段级 default = 内置表/
+        # 关闭), [] = 渲染空数组 (显式关闭该通道 — 与 null 的区别是**显式**),
+        # 非空列表 = 替换. nix 的 default 无法区分 "没配" 与 "配空", 故用
+        # nullOr 把决策权交给配置者.
+        exhaustField = render-line: xs: lib.optional (xs != null) (render-line xs);
+        exhaustLines = lib.optionals ((p.exhaust or null) != null) (
+          [
+            ""
+            "[providers.exhaust]"
+          ]
+          ++ exhaustField (xs: "statuses = ${intList xs}") p.exhaust.statuses
+          ++ exhaustField (xs: "codes = ${qStrList xs}") p.exhaust.codes
+          ++ exhaustField (xs: "headers = ${qStrList xs}") p.exhaust.headers
+        );
+      in
+      if (p.members or [ ]) == [ ] then
+        throw "secret-guard render: pool provider '${id}' members 为空 (上游 validate 拒绝空成员表)"
+      else if badMembers != [ ] then
+        throw "secret-guard render: pool provider '${id}' 的 member id 非法 (须 1..=64, 首字符字母数字, 其余 [A-Za-z0-9_-]): ${toString badMembers}"
+      else if
+        (p.protocol or null) != null
+        || (p.baseUrl or null) != null
+        || (p.apiKeyFile or null) != null
+        || (p.apiKey or "") != ""
+        || (p.routes or [ ]) != [ ]
+      then
+        throw "secret-guard render: pool provider '${id}' 不该有 protocol/baseUrl/apiKey/apiKeyFile/routes (其他分支专属字段, 上游 sum type 下不存在)"
+      else
+        # cooldown_secs 行必须在 [providers.exhaust] 段头之前 (TOML 表段后的
+        # 键归属该子表); 省略 = 上游 serde default 60.
+        lib.concatStringsSep "\n" (
+          [ (providerHead id p) ]
+          ++ [
+            "kind = \"pool\""
+            "members = ${qStrList p.members}"
+          ]
+          ++ lib.optional ((p.cooldownSecs or null) != null) "cooldown_secs = ${toString p.cooldownSecs}"
+          ++ [ "enabled = ${lib.boolToString (p.enable or true)}" ]
+          ++ exhaustLines
         )
     else
       throw "secret-guard render: provider '${id}' kind 非法: ${toString p.kind}";
@@ -457,16 +513,29 @@ let
   # 跨 provider 校验 1: provider id 卫生 (attr 名即 id).
   badIds = lib.filter (id: !validId id) providerIds;
 
-  # 跨 provider 校验 2: route target 存在性 (含禁用路由 — 声明式配置中悬空即错误).
+  # 跨 provider 校验 2: route target / pool member 存在性 (含禁用路由 —
+  # 声明式配置中悬空即错误).
   dangling = lib.concatMap (
     id:
-    map (r: "${id} → ${r.target}") (
-      lib.filter (r: !providers ? ${r.target}) (providers.${id}.routes or [ ])
-    )
-  ) (lib.filter (id: providers.${id}.kind == "router") providerIds);
+    let
+      p = providers.${id};
+      routeDangling = map (r: "${id} → ${r.target}") (
+        lib.filter (r: !providers ? ${r.target}) (p.routes or [ ])
+      );
+      # pool members 全量校验 (无禁用语义 — 与上游 would_cycle 边集一致).
+      memberDangling = map (m: "${id} → ${m}") (lib.filter (m: !providers ? ${m}) (p.members or [ ]));
+    in
+    if p.kind == "router" then
+      routeDangling
+    else if p.kind == "pool" then
+      memberDangling
+    else
+      [ ]
+  ) providerIds;
 
-  # 跨 provider 校验 3: 启用路由边环检测 (对齐上游 would_cycle — priority=null 的
-  # 禁用路由不构成边; 悬空目标已由校验 2 拦截, 边只含存在的 id).
+  # 跨 provider 校验 3: 启用路由边 + pool 成员边环检测 (对齐上游 would_cycle
+  # — priority=null 的禁用路由不构成边; pool members 全算; 悬空目标已由校验 2
+  # 拦截, 边只含存在的 id).
   # 与上游的已知偏差: 入口级 enable=false 的 provider 仍算图节点 (上游
   # effective_snapshot 会排除) — 指向 disabled provider 的路由运行时必 503,
   # fail-fast 合理, 仅错误归因可能显示为 "成环" 而非 "指向 disabled".
@@ -474,6 +543,8 @@ let
     _: p:
     if p.kind == "router" then
       map (r: r.target) (lib.filter (r: (r.priority or null) != null) (p.routes or [ ]))
+    else if p.kind == "pool" then
+      p.members or [ ]
     else
       [ ]
   ) providers;
@@ -513,7 +584,7 @@ lib.throwIf (badIds != [ ])
       "secret-guard render: secrets.entries id 重复: ${toString dupSecretIds}"
       (
         lib.throwIf (dangling != [ ])
-          "secret-guard render: route target 不存在于 providers (声明式配置中悬空即错误): ${toString dangling}"
+          "secret-guard render: route target / pool member 不存在于 providers (声明式配置中悬空即错误): ${toString dangling}"
           (
             lib.throwIf (cyclicId != null)
               "secret-guard render: provider 路由成环, 沿启用路由边回到 '${cyclicId}' (禁用路由不构成边)"

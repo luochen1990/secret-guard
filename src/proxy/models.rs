@@ -92,7 +92,9 @@ use axum::http::{HeaderMap, HeaderValue, Response, StatusCode};
 use serde::Serialize;
 use serde_json::json;
 
-use crate::provider::{DirectProvider, Protocol, Provider, ProviderKind, ProviderTable};
+use crate::provider::{
+    DirectProvider, PoolPicker, Protocol, Provider, ProviderKind, ProviderTable,
+};
 use crate::state::AppState;
 
 /// 缓存 TTL (N4: 300s 常量, 不进配置).
@@ -272,13 +274,15 @@ fn needs_upstream_merge(entry: &Provider) -> bool {
             .routes
             .iter()
             .any(|route| route.priority.is_some() && route.model_pattern.contains('*')),
-        ProviderKind::Direct(_) => false,
+        // Direct 无路由; Pool 不进本地终结分支 (dispatch 只对 Router 拦截,
+        // Pool 入口的 /models 走 resolve_route → 打到当前成员 → Direct 透传).
+        ProviderKind::Direct(_) | ProviderKind::Pool(_) => false,
     }
 }
 
 /// N2 别名段: 启用路由中不含 `*` 的 model_pattern, 路由表序 + 去重;
 /// D2: 经 `resolve_route(entry, P)` 校验可解析才收录 (advertised ⇒ resolvable).
-fn alias_names(table: &ProviderTable, entry: &Provider) -> Vec<String> {
+fn alias_names(table: &ProviderTable, pools: &dyn PoolPicker, entry: &Provider) -> Vec<String> {
     let ProviderKind::Router(router) = &entry.kind else {
         return Vec::new();
     };
@@ -290,7 +294,9 @@ fn alias_names(table: &ProviderTable, entry: &Provider) -> Vec<String> {
         }
         // 去重短路: 重复 pattern 不再重复 resolve.
         if seen.insert(route.model_pattern.clone())
-            && table.resolve_route(entry, &route.model_pattern).is_ok()
+            && table
+                .resolve_route(entry, &route.model_pattern, pools)
+                .is_ok()
         {
             out.push(route.model_pattern.clone());
         }
@@ -303,33 +309,52 @@ fn alias_names(table: &ProviderTable, entry: &Provider) -> Vec<String> {
 /// 悬空 / disabled 的 target 分支直接跳过 (不贡献, 也不下钻).
 ///
 /// 顺序 = DFS preorder 按路由表序 (首达序), 决定 N2 合并段的 provider 序.
+///
+/// Pool 跳: 成员**全部**贡献可达集 (failover 目标集 — /models 广告不随成员
+/// 耗尽状态闪断; 悬空/disabled 成员分支自然终止, 与路由 target 同型)。
+/// 不走 PoolStates 的 pick (那是单请求视角的 failover 选择; 这里要的是
+/// "这个 router 名下理论上可达哪些上游" 的全量视角).
 fn walk_reachable_directs(
     table: &ProviderTable,
     entry: &Provider,
 ) -> Vec<(String, DirectProvider)> {
+    // 邻接统一: pool member 与启用路由的 route target 是同型的图边
+    // (与 route_graph / would_cycle 的边集语义呼应), 差异只在 targets 来源.
+    fn visit_edges<'a>(
+        table: &ProviderTable,
+        targets: impl Iterator<Item = &'a String>,
+        visited: &mut HashSet<String>,
+        out: &mut Vec<(String, DirectProvider)>,
+    ) {
+        for target in targets {
+            let Some(next) = table.get_effective(target) else {
+                continue; // 悬空 / decision-disabled: 分支终止
+            };
+            if !next.enabled || !visited.insert(next.id.clone()) {
+                continue; // entry-level disabled (不贡献也不下钻) / 已访问 (防环)
+            }
+            visit(table, &next, visited, out);
+        }
+    }
     fn visit(
         table: &ProviderTable,
         provider: &Provider,
         visited: &mut HashSet<String>,
         out: &mut Vec<(String, DirectProvider)>,
     ) {
-        let ProviderKind::Router(router) = &provider.kind else {
-            return;
-        };
-        for route in &router.routes {
-            if route.priority.is_none() {
-                continue;
-            }
-            let Some(next) = table.get_effective(&route.target) else {
-                continue; // 悬空 / decision-disabled: 分支终止
-            };
-            if !next.enabled || !visited.insert(next.id.clone()) {
-                continue; // entry-level disabled (不贡献也不下钻) / 已访问 (防环)
-            }
-            match next.kind {
-                ProviderKind::Direct(direct) => out.push((next.id, direct)),
-                ProviderKind::Router(_) => visit(table, &next, visited, out),
-            }
+        match &provider.kind {
+            ProviderKind::Router(router) => visit_edges(
+                table,
+                router
+                    .routes
+                    .iter()
+                    .filter(|r| r.priority.is_some())
+                    .map(|r| &r.target),
+                visited,
+                out,
+            ),
+            ProviderKind::Pool(pool) => visit_edges(table, pool.members.iter(), visited, out),
+            ProviderKind::Direct(direct) => out.push((provider.id.clone(), direct.clone())),
         }
     }
     let mut visited = HashSet::from([entry.id.clone()]);
@@ -357,14 +382,16 @@ fn union_from_cache<'a>(
 }
 
 /// N1 单点判定: `advertise(M) ⟺ resolve_route(M)=(T,E) ∧ E ∈ cached(T)`
-/// (E = model_rewrite ∨ M; 解析失败 — NoMatch / 悬空 / disabled / 环 — 不广告).
+/// (E = model_rewrite ∨ M; 解析失败 — NoMatch / 悬空 / disabled / 环 / pool
+/// 全耗尽 — 不广告).
 fn n1_accepts(
     table: &ProviderTable,
+    pools: &dyn PoolPicker,
     entry: &Provider,
     model: &str,
     cached: &HashMap<String, Vec<String>>,
 ) -> bool {
-    match table.resolve_route(entry, model) {
+    match table.resolve_route(entry, model, pools) {
         Ok(resolved) => {
             let egress = resolved.model_rewrite.unwrap_or_else(|| model.to_string());
             cached
@@ -379,7 +406,7 @@ fn n1_accepts(
 ///
 /// N6 gate 短路在 alias_names 之后、walk 之前 — exact-only router 零上游请求.
 pub(super) async fn advertised_names(state: &AppState, entry: &Provider) -> Vec<String> {
-    let aliases = alias_names(&state.providers, entry);
+    let aliases = alias_names(&state.providers, &state.pools, entry);
     if !needs_upstream_merge(entry) {
         return aliases;
     }
@@ -402,7 +429,9 @@ pub(super) async fn advertised_names(state: &AppState, entry: &Provider) -> Vec<
     let mut out = aliases;
     for model in union_from_cache(targets.iter().map(|t| t.id.as_str()), &cached) {
         // N2 去重: union 内部已去重, contains 只需挡与别名同名的上游模型.
-        if !seen.contains(&model) && n1_accepts(&state.providers, entry, &model, &cached) {
+        if !seen.contains(&model)
+            && n1_accepts(&state.providers, &state.pools, entry, &model, &cached)
+        {
             out.push(model);
         }
     }
@@ -1070,7 +1099,10 @@ mod tests {
             ),
         ]);
         let r = t.get_effective("r").unwrap();
-        assert_eq!(alias_names(&t, &r), strs(&["x", "y", "y-dup"]));
+        assert_eq!(
+            alias_names(&t, &crate::pool::PoolStates::new(), &r),
+            strs(&["x", "y", "y-dup"])
+        );
     }
 
     #[test]
@@ -1087,7 +1119,11 @@ mod tests {
             ),
         ]);
         let r = t.get_effective("r").unwrap();
-        assert_eq!(alias_names(&t, &r), strs(&["x"]), "重复 pattern 去重");
+        assert_eq!(
+            alias_names(&t, &crate::pool::PoolStates::new(), &r),
+            strs(&["x"]),
+            "重复 pattern 去重"
+        );
     }
 
     #[test]
@@ -1099,7 +1135,10 @@ mod tests {
             router("top", vec![route("foo", "mid", 30)]),
         ]);
         let top = t.get_effective("top").unwrap();
-        assert_eq!(alias_names(&t, &top), Vec::<String>::new());
+        assert_eq!(
+            alias_names(&t, &crate::pool::PoolStates::new(), &top),
+            Vec::<String>::new()
+        );
     }
 
     // ─── 可达集 walk ────────────────────────────────────────────────────
@@ -1180,11 +1219,29 @@ mod tests {
             ("fallback", &["qwen-3", "glm-4.7-air"]),
         ]);
         // 遮蔽: glm-4.7-air 匹配 glm-* (更高 priority) → main 无它 → 过滤.
-        assert!(!n1_accepts(&t, &r, "glm-4.7-air", &c));
+        assert!(!n1_accepts(
+            &t,
+            &crate::pool::PoolStates::new(),
+            &r,
+            "glm-4.7-air",
+            &c
+        ));
         // NoMatch 兜底: qwen-3 仅 * 命中 → fallback 有它 → 广告.
-        assert!(n1_accepts(&t, &r, "qwen-3", &c));
+        assert!(n1_accepts(
+            &t,
+            &crate::pool::PoolStates::new(),
+            &r,
+            "qwen-3",
+            &c
+        ));
         // 常规: glm-4.7 → main 有它 → 广告.
-        assert!(n1_accepts(&t, &r, "glm-4.7", &c));
+        assert!(n1_accepts(
+            &t,
+            &crate::pool::PoolStates::new(),
+            &r,
+            "glm-4.7",
+            &c
+        ));
         // 无 * 兜底的 router: union 里的未匹配名一律过滤.
         let t2 = table(vec![
             direct("main", "http://m"),
@@ -1192,7 +1249,10 @@ mod tests {
         ]);
         let r2 = t2.get_effective("r2").unwrap();
         let c2 = cached(&[("main", &["glm-4.7"])]);
-        assert!(!n1_accepts(&t2, &r2, "qwen-3", &c2), "NoMatch → 过滤");
+        assert!(
+            !n1_accepts(&t2, &crate::pool::PoolStates::new(), &r2, "qwen-3", &c2),
+            "NoMatch → 过滤"
+        );
     }
 
     /// 重写边界: 广告判定看 egress E (rewrite 值) 是否在目标清单, 不看 M 本身.
@@ -1212,10 +1272,22 @@ mod tests {
         let r = t.get_effective("r").unwrap();
         // main 有 M (glm-4.8-flash) 但没有 E (glm-4.8-air) → 过滤.
         let c = cached(&[("main", &["glm-4.8-flash"]), ("fallback", &[])]);
-        assert!(!n1_accepts(&t, &r, "glm-4.8-flash", &c));
+        assert!(!n1_accepts(
+            &t,
+            &crate::pool::PoolStates::new(),
+            &r,
+            "glm-4.8-flash",
+            &c
+        ));
         // main 有 E → 广告 (即便 E ≠ M).
         let c2 = cached(&[("main", &["glm-4.8-air"]), ("fallback", &[])]);
-        assert!(n1_accepts(&t, &r, "glm-4.8-flash", &c2));
+        assert!(n1_accepts(
+            &t,
+            &crate::pool::PoolStates::new(),
+            &r,
+            "glm-4.8-flash",
+            &c2
+        ));
     }
 
     /// N1: 解析失败 (悬空 target) 的候选不广告.
@@ -1224,7 +1296,13 @@ mod tests {
         let t = table(vec![router("r", vec![route("*", "missing", 10)])]);
         let r = t.get_effective("r").unwrap();
         let c = cached(&[]);
-        assert!(!n1_accepts(&t, &r, "anything", &c));
+        assert!(!n1_accepts(
+            &t,
+            &crate::pool::PoolStates::new(),
+            &r,
+            "anything",
+            &c
+        ));
     }
 
     // ─── 上游解析 / 响应构造 ────────────────────────────────────────────
@@ -1478,6 +1556,7 @@ mod tests {
         let decisions = Arc::new(RwLock::new(Decisions::default()));
         let redact = crate::config::RedactConfig::default();
         AppState {
+            pools: crate::pool::PoolStates::new(),
             upstream: reqwest::Client::new(),
             providers: ProviderTable::new(
                 providers,
