@@ -71,7 +71,7 @@ cargo install --git https://github.com/luochen1990/secret-guard
 ```toml
 [[providers]]
 id = "openai-main"
-kind = "direct"                         # 直连上游 (路由端点用 "router")
+kind = "direct"                         # 直连上游 (路由端点用 "router", 套餐池用 "pool")
 protocol = "openai"
 base_url = "https://api.openai.com"
 api_key = "sk-your-upstream-key"        # 转发时注入上游的 key
@@ -151,6 +151,8 @@ provider=...`), 命令行即可确认流量经过 secret-guard; 上游故障 (50
 - **上下文内不撞车**: Mock 绝不与请求中的其他内容重名, 响应不会被错误替换。
 - **多 Provider 路由**: 支持多 Provider 配置 (OpenAI / Anthropic / Gemini / Ollama /
   Responses), 按请求 model 通配符路由到不同上游。
+- **套餐池轮换 (Pool)**: 把多份编码订阅套餐 (各含独立凭证) 挂成一个入口, 一份套餐的
+  窗口限额用尽自动切换到下一份, 窗口恢复后自动切回 — 全程零人工干预。
 
 ## 协议支持
 

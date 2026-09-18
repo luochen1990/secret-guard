@@ -113,23 +113,24 @@ output = 2.0
 
 ## `[[providers]]` — 上游 LLM 端点 (平铺数组)
 
-每个 provider 是**两种构造之一** (#187 sum type): **直连** (Direct, 真实上游端点) 或
-**路由** (Router, 按请求 model 分流的路由端点)。由 **`kind` 字段判别** (`"direct"` /
-`"router"`, 必填 — 缺失时启动 fail-fast), 对应构造的字段写在同一个 `[[providers]]`
-表内。构造不匹配的字段会被**静默忽略** (serde flatten 无法拒绝未知字段): Router 条目
-写 base_url/api_key、Direct 条目写 routes 均不生效 — 请勿依赖, 配置以 `kind` 为准。
+每个 provider 是**三种构造之一** (#187 sum type + Pool 延伸): **直连** (Direct, 真实上游端点) /
+**路由** (Router, 按请求 model 分流的路由端点) / **套餐池** (Pool, 编码订阅窗口限额自动
+轮换)。由 **`kind` 字段判别** (`"direct"` / `"router"` / `"pool"`, 必填 — 缺失时启动
+fail-fast), 对应构造的字段写在同一个 `[[providers]]`
+表内。构造不匹配的字段会被**静默忽略** (serde flatten 无法拒绝未知字段): Router/Pool 条目
+写 base_url/api_key、Direct 条目写 routes/members 均不生效 — 请勿依赖, 配置以 `kind` 为准。
 
 > **旧字段迁移提示**: 旧版的 `kind = "virtual"` + 顶层 `route_to` / `model_override` 写法
 > 已删除 — `virtual` 变体不存在会启动报错, 残留的 `route_to` / `model_override` 字段
 > 会触发启动 WARN (#159 静态预检) 且不生效。请改写为 `kind = "router"` +
 > `[[providers.routes]]` (见下文)。
 
-**共享字段** (两种构造均可配):
+**共享字段** (三种构造均可配):
 
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `id` | string | (必填) | 唯一标识. 1..=64 字符, 以字母/数字开头, 只允许字母数字、`_`、`-`. 出现在转发 URL 中 (`/o/<id>/...`). |
-| `kind` | string | (必填) | 构造判别: `"direct"` (直连) 或 `"router"` (路由). |
+| `kind` | string | (必填) | 构造判别: `"direct"` (直连) / `"router"` (路由) / `"pool"` (套餐池). |
 | `enabled` | bool | `true` | `false` 时转发到该 provider 返回 503. |
 | `name` | string | — | 可选的人类可读名称 (仅 WebUI 显示). |
 
@@ -226,10 +227,128 @@ priority = 0
   省略 `routes` 字段 = 保留旧值, 空数组 `[]` = 改回 Direct 构造.
 - 路由 ↔ 实体切换 (#187 sum type / #190 表单构造分野): 对话框顶部 **Kind**
   选择器切换构造, 表单按构造显示对应字段组 (Direct: Protocol/Base URL/API Key;
-  Router: Routes 编辑器)。切换到 Direct 需填 Base URL (前置校验); static 基线下的
-  鉴权字段会从 static 继承复原。已知限制: **dynamic-only** 条目 Direct →
-  Router → Direct 往返会丢失 api_key (Router 构造无处存放, 切回时需重新填写 —
-  表单 placeholder 会显示 "(optional)" 而非 "unchanged" 作为提示)。
+  Router: Routes 编辑器; Pool: Members 编辑器 + Exhaust 高级配置)。切换到 Direct
+  需填 Base URL (前置校验); static 基线下的鉴权字段会从 static 继承复原。已知限制:
+  **dynamic-only** 条目 Direct ↔ Router/Pool 构造切换往返会丢失 api_key (虚拟构造
+  无处存放鉴权字段, 切回时需重新填写 — 表单 placeholder 会显示 "(optional)" 而非
+  "unchanged" 作为提示)。
+
+### 套餐池 endpoint (pool) — 编码订阅窗口限额自动轮换
+
+适用场景: 持有多份**编码订阅套餐** (智谱 GLM Coding Plan / Claude Pro/Max 等),
+每份套餐有窗口限额 (5h 滚动窗 / 周限 / 月限), 用完一个窗口该套餐会拒绝服务直到窗口
+恢复。把每份套餐配成一个 Direct provider (各自独立凭证), 再挂进一个 pool —
+secret-guard 检测到"窗口限额耗尽"信号后自动切换到下一个成员, 耗尽成员按恢复时刻
+自动回归, 全程零人工干预:
+
+- **顺序 failover, 不是轮转**: 正常时所有请求固定打列表第一个可用成员 (上游前缀
+  缓存友好); 闹钟到期后成员自然回归列表头。
+- **触发切换的那个请求原样透传错误** (FWD-1) — 靠客户端 SDK 对 429 的自动重试落到
+  新成员, 网关不做内部重发。
+- **全部成员耗尽 → 本地 503 快速失败** (零上游请求; 错误 message 只含 pool id +
+  reason + 最早恢复剩余秒)。
+- **运行时状态仅存内存**, 不持久化 — 重启重新探测 (窗口会自动恢复, 真相在上游)。
+
+**Pool 构造** (`kind = "pool"`) — 无 protocol / base_url / api_key 字段 (成员各自是
+完整的 Direct provider):
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `members` | string[] | (必填) | 有序成员列表 (Direct provider id, 每成员 = 一份独立套餐凭证). **列表序即 failover 优先级**. 空表 / 自环 (含自身 id) / 非法 id 启动报错; 悬空成员 (不存在) 写入放行, 请求时永久跳过 (重新启用后不自动回归 — 恢复途径: 删除后重加该成员 / 重启 / pool-reset 端点). 成员边参与环检测 (全部成员恒为边 — 与 route target 的 "仅启用路由构成边" 不同, 无禁用等价物). |
+| `exhaust` | table | (内置默认表) | 耗尽信号配置 (三通道 OR, 见下). 省略整段 = 内置窗口限额默认表. |
+| `exhaust.statuses` | u16[] | `[]` (关闭) | status 通道 (匹配语义见下). |
+| `exhaust.codes` | string[] | `["1308", "1310"]` | code 通道 (匹配语义见下). |
+| `exhaust.headers` | string[] | (Claude unified 两项, 见内置默认表) | header 通道 (匹配语义见下). 畸形条目 (无 `=` / 非法 header 名) 写入时 WARN, 永不匹配. |
+| `cooldown_secs` | u64 | `60` | 兜底闹钟时长 (秒): 信号命中但解析不出精确恢复时刻时, 成员挂起 now + cooldown. 也是闹钟下限 (防探测风暴; 解析出的时刻统一 clamp 到 [cooldown, 7d]). 请配在 7d (604800) 以内 — 超过时当前实现按下限 (闹钟可超过 7d, 见契约 POOL-3 现状注记). |
+
+> **字段级替换语义**: 显式配某字段 = **替换**该字段默认值 (空数组 = 显式关闭该通道);
+> 想"删掉默认表里某个码" = 重抄剩余码. 这是有意设计 (保留删除能力).
+
+**三通道匹配语义** (OR 关系, 任一命中即判定耗尽; 空数组 = 关闭该通道):
+
+1. **status 通道**: 上游 HTTP status ∈ `exhaust.statuses`;
+2. **header 通道**: 任一 `exhaust.headers` 条目 `"name=value"` 精确匹配 (name 大小写
+   不敏感; value 精确, 双侧容忍周边空白);
+3. **code 通道**: status 为 4xx/5xx 且 body 是合法 JSON, 从四个候选位置 —
+   `error.code` (OpenAI/智谱/DashScope 包装) / `error.type` (Anthropic) /
+   `error.status` (Gemini) / 顶层 `code` (DashScope) — 提取字符串码 (非字符串跳过),
+   与 `exhaust.codes` 有交集.
+
+**恢复闹钟** (命中后自动回归时刻): 按优先序取第一个可解析的 — `Retry-After` header
+(秒数 / HTTP-date) → 智谱 `next_flush_time` (body 的 `error` 内或顶层; RFC3339 / 本地
+时区无后缀两格式) → Anthropic `anthropic-ratelimit-*-reset` header 族 (RFC3339 /
+unix 秒, 多值取最晚). 全部失败 → `now + cooldown_secs` 兜底. 解析出的时刻统一 clamp
+到 `[now + cooldown_secs, +7d]`.
+
+```toml
+[[providers]]
+id = "glm-acc1"
+kind = "direct"
+protocol = "openai"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+api_key_file = "/run/credentials/glm-acc1.key"     # 每成员一份独立凭证
+
+[[providers]]
+id = "glm-acc2"
+kind = "direct"
+protocol = "openai"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+api_key_file = "/run/credentials/glm-acc2.key"
+
+[[providers]]
+id = "glm-pool"
+kind = "pool"
+name = "智谱编码套餐池"
+members = ["glm-acc1", "glm-acc2"]    # 列表序即 failover 优先级
+cooldown_secs = 60                    # 兜底闹钟 (秒); 须写在 [providers.exhaust] 段头之前
+
+# 可选: 耗尽信号 (三通道 OR). 省略整段 = 内置窗口限额默认表.
+[providers.exhaust]
+codes = ["1308", "1310"]              # 显式配置 = 替换默认 (重抄语义)
+# statuses = []                       # 默认即关闭
+# headers = []                        # 显式关闭 header 通道 (示例)
+```
+
+**内置默认信号表** (省略 `[providers.exhaust]` 时生效; 语义域 = **订阅窗口限额耗尽**,
+付费/账单/瞬态信号一律不进默认 — 误切成员会丢上游前缀缓存, 由用户 opt-in 自担):
+
+| 通道 | 默认值 | 来源 |
+|---|---|---|
+| `codes` | `["1308", "1310"]` | 智谱 GLM Coding Plan: 429 + body `error.code` = "1308" (5h 窗) / "1310" (周窗) 配额耗尽, 响应另带 `next_flush_time` |
+| `headers` | `["anthropic-ratelimit-unified-5h-status=blocked", "anthropic-ratelimit-unified-weekly-status=blocked"]` | Anthropic Claude Pro/Max 订阅 (OAuth 流量): 429 + 专属 header |
+| `statuses` | `[]` (关闭) | 无一家窗口限额可用纯 status 判别 (429 混杂瞬态限速) |
+
+**故意不进默认** (opt-in 姿势 — 按需抄进自己的 `exhaust` 配置):
+
+| 信号 | 配置 | 不进默认的原因 |
+|---|---|---|
+| 智谱 `1302` (并发限流) / `1305` (平台过载) | `codes = ["1308", "1310", "1302", "1305"]` | 瞬态 — 等一下就好, 切换反而丢前缀缓存 |
+| 智谱 `1113` (欠费) / `1309` (套餐到期) / `1313` (公平限流) / `1311` (模型未开放) | 同上抄进 codes | 付费/政策语义, 非窗口限额 (不会自动恢复) |
+| OpenAI `insufficient_quota` / `credit_balance_exhausted` / `*_spend_limit_exceeded` | `codes = [..., "insufficient_quota"]` | 付费语义 |
+| Codex `rate_limit_exceeded` 系 / Gemini `RESOURCE_EXHAUSTED` | `codes = [..., "RESOURCE_EXHAUSTED"]` | 与瞬态限速浅层不可区分, opt-in 自担误切风险 |
+| DeepSeek / Anthropic API 平台欠费 (HTTP 402) | `statuses = [402]` | 付费语义 |
+
+**运行时观察与复位** (WebUI / API):
+
+- Providers 页对 pool 条目显示每成员运行时徽章 (active / 耗尽至剩余秒 / 永久挂起);
+- `POST /api/providers/{id}/pool-reset` — 清空该 pool 全部成员闹钟 (知道续费了/
+  换窗了想立即恢复探测时用; 幂等, 只动内存态).
+
+**NixOS 结构化选项等价形态** (`services.secret-guard.providers.<id>`): `kind = "pool"`
++ `members` (列表) / `cooldownSecs` (null = 省略 = 默认 60) / `exhaust.statuses` /
+`exhaust.codes` / `exhaust.headers`. exhaust 的 nullOr 三态: `exhaust = null` (省略整段
+= 上游内置默认表) / 字段 `null` (省略该行, 保留上游该通道默认) / 字段 `[]` (显式关闭).
+render 层对 members 做存在性 + 环校验 (悬空即 eval 报错, 比 toml 更严格 — toml 悬空
+放行是创建顺序无关的 WebUI 语义). 示例:
+
+```nix
+services.secret-guard.providers.glm-pool = {
+  kind = "pool";
+  members = [ "glm-acc1" "glm-acc2" ];
+  cooldownSecs = 60;           # 可省略 (默认 60)
+  exhaust.codes = [ "1308" "1310" "1302" ];   # 显式配置 = 替换默认
+};
+```
 
 ## `[[secrets.entries]]` — 需要保护的 Secret (嵌套在 `[secrets]` 下)
 
@@ -325,8 +444,8 @@ key = "sg_ci_abc123..."
 
 | 症状 | 原因与解法 |
 |---|---|
-| ``TOML parse error ... [[providers]] missing field `kind``` | provider 条目缺少构造判别字段 (#187 起必填): 补 `kind = "direct"` (直连上游) 或 `kind = "router"` (路由). 报错行号指向对应 `[[providers]]` 表头. |
-| ``TOML parse error ... [[providers]] unknown variant `virtual`, expected `direct` or `router``` | 旧版 `kind = "virtual"` 已删除: 改为 `kind = "router"`, 原 `route_to` 指向改写为一条 `[[providers.routes]]` (`model_pattern = "*"` + `target = ...`), 原 `model_override` 改为路由的 `upstream_model` 字段. |
+| ``TOML parse error ... [[providers]] missing field `kind``` | provider 条目缺少构造判别字段 (#187 起必填): 补 `kind = "direct"` (直连上游) / `"router"` (路由) / `"pool"` (套餐池). 报错行号指向对应 `[[providers]]` 表头. |
+| ``TOML parse error ... [[providers]] unknown variant `virtual`, expected `direct`, `router`, or `pool``` | 旧版 `kind = "virtual"` 已删除: 改为 `kind = "router"`, 原 `route_to` 指向改写为一条 `[[providers.routes]]` (`model_pattern = "*"` + `target = ...`), 原 `model_override` 改为路由的 `upstream_model` 字段. |
 | 启动 WARN `unknown field route_to` / `unknown field model_override` | 这两个 providers 顶层字段已删除 (#159 静态预检对残留字段告警, 残留不生效): 改写为 `[[providers.routes]]` 子表 (见上文 Router 构造). |
 | `TOML parse error ... [[secrets]] invalid type: map, expected a sequence` | secret 必须写 `[[secrets.entries]]`, 不能写 `[[secrets]]`. 报错前会先输出一行 WARN `did you mean [[secrets.entries]]?` 指路. |
 | 启动 WARN `unknown field ... did you mean ...?` | 字段拼写错误. 可选字段拼错会被忽略不生效 (仅 WARN 提示), "以为配了实际没配", 须修正; 必填字段 (如 `protocol`) 拼错则 WARN 后再报 `missing field` 启动失败. `[[providers.routes]]` 内的未知字段同样会 WARN (定位含 entry 下标). |
@@ -334,7 +453,10 @@ key = "sg_ci_abc123..."
 | `secret value too short (min 3 bytes)` | secret 真值至少 3 字节. |
 | `key and key_file are mutually exclusive` / `api_key` 与 `api_key_file` 同时设置 | 二选一, 删掉其中一个. |
 | `provider ... must declare at least one route` | Router 构造的 `routes` 为空 — 空路由 router 无法转发任何请求, 启动即拒. 至少配一条 (兜底可用 `model_pattern = "*"`). |
+| `provider ... must declare at least one pool member` / `... lists itself as pool member` | Pool 构造的 `members` 为空或含自身 id — 空 pool 无法转发任何请求 / 自环必为 Cycle, 启动即拒. 成员应为 Direct provider id (指向 Router/Pool 也会链式解析, 非典型用法); 悬空成员 (不存在) 写入放行, 请求时永久跳过. |
+| 启动 WARN `pool exhaust header rules are malformed (expected 'name=value')` | `[providers.exhaust]` 的 headers 条目缺 `=` 或 header 名非法 — 该条目永远不匹配 (等于白配), 检查拼写. |
 | 请求返回 404 `not_found` | URL 里 provider id 不存在, 或 proto 前缀拼错 (见 README 路由表). |
 | 请求返回 503 `unavailable` | provider `enabled = false`, 或路由坏链: message 含 `router provider '...' has no route matching model '...'` (无匹配路由 — 检查 model_pattern 与 priority) / `route target '...' not found` (悬空目标) / `route target '...' is disabled` / `route cycle detected` (手改配置产生的环). |
+| 请求返回 503 `unavailable` (套餐池) | 全部成员耗尽/missing/disabled: message 含 `pool provider '...' has no available member (all exhausted, missing or disabled; earliest resumes in ~Ns)` (N 秒后最早成员恢复) 或 `... no scheduled recovery` (全部永久 — 检查成员 enabled / 用 pool-reset 复位). |
 
 配置文件缺失时进程仍可启动 (空配置 + 默认值, 但没有任何 provider 可转发, 启动日志有 WARN).

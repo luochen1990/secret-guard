@@ -88,7 +88,7 @@ all it takes):
 ```toml
 [[providers]]
 id = "openai-main"
-kind = "direct"                         # direct upstream (use "router" for routing endpoints)
+kind = "direct"                         # direct upstream (use "router" for routing endpoints, "pool" for plan pools)
 protocol = "openai"
 base_url = "https://api.openai.com"
 api_key = "sk-your-upstream-key"        # injected into upstream requests
@@ -178,6 +178,10 @@ end-to-end integration tests, fully verified on every release:
   so responses are never wrongly replaced.
 - **Multi-provider routing**: multiple providers (OpenAI / Anthropic / Gemini / Ollama /
   Responses) with per-request model-wildcard routing to different upstreams.
+- **Plan-pool failover (Pool)**: chain multiple coding-plan subscriptions (each with its
+  own credential) behind one endpoint; when one plan hits its usage-window limit, traffic
+  fails over to the next one automatically and switches back once the window resets —
+  zero manual intervention.
 
 ## Protocol Support
 
