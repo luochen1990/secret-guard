@@ -615,6 +615,14 @@ in
         Restart = "on-failure";
         RestartSec = "5s";
 
+        # 停机窗口契约 (#242): SIGTERM 后 axum graceful shutdown 无 drain 上限
+        # (等 in-flight LLM 流排空, 可达数分钟), 不设此值时 systemd 默认 90s 兜底
+        # → 停机窗口 ~96s, 超过消费方最小重试窗口 ~66s (opencode fork-retry:
+        # 初次 + 5 次重试, 退避 2/4/8/16/30s) → 重试耗尽, agent 任务全灭.
+        # LLM 网关的通用取舍: 新请求可用性 >> in-flight 完整性 (客户端对断流本就
+        # 整请求重试恢复), 15s 让停机窗口稳居最小重试窗口内. mkDefault 可覆写.
+        TimeoutStopSec = lib.mkDefault "15s";
+
         User = "secret-guard";
         Group = "secret-guard";
 

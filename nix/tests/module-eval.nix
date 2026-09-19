@@ -147,6 +147,27 @@ let
   ];
   timeoutsConfig = timeoutsEv.config.services.secret-guard.resolvedConfigFile;
 
+  # 停机窗口契约 (#242): 部署侧显式覆写 TimeoutStopSec 须胜出模块 mkDefault —
+  # 若模块侧被误改为 plain (同优先级) 或 mkForce, 本 host config 会 eval 冲突/
+  # 覆写失效, 断言即红 (默认值 15s 的接线由下方最小 config 断言锁定).
+  stopTimeoutOverrideEv = sgEv [
+    {
+      nixpkgs.hostPlatform = system;
+      services.secret-guard = {
+        enable = true;
+        providers."b-upstream" = {
+          kind = "direct";
+          protocol = "openai";
+          baseUrl = "https://up.example.com/v4";
+          apiKeyFile = "/run/secrets/upstream_key";
+        };
+      };
+      systemd.services.secret-guard.serviceConfig.TimeoutStopSec = "60s";
+    }
+  ];
+  stopTimeoutOverrideOk =
+    stopTimeoutOverrideEv.config.systemd.services.secret-guard.serviceConfig.TimeoutStopSec == "60s";
+
   # eval 失败/成功断言 (强制点: ExecStart 会连带强制 resolvedConfigFile 的三态解析)
   fails = e: !(builtins.tryEval e).success;
   unitOf = e: e.config.systemd.services.secret-guard.serviceConfig.ExecStart;
@@ -233,6 +254,14 @@ let
     {
       name = "ExecStart 接线: --config <resolvedConfigFile>";
       ok = execStartOk;
+    }
+    {
+      name = "停机窗口契约: 默认 TimeoutStopSec = 15s (#242)";
+      ok = ev.config.systemd.services.secret-guard.serviceConfig.TimeoutStopSec == "15s";
+    }
+    {
+      name = "停机窗口契约: 部署侧覆写 TimeoutStopSec 胜出 mkDefault (#242)";
+      ok = stopTimeoutOverrideOk;
     }
     {
       name = "configFile 互斥: 显式 + 结构化同设 → eval throw";
