@@ -116,17 +116,17 @@ pub async fn oauth_callback(
     let pkce_verifier = require_session_value(&session, SK_PKCE_VERIFIER, "PKCE verifier").await;
     let pkce_verifier: String = match pkce_verifier {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let nonce = require_session_value(&session, SK_NONCE, "nonce").await;
     let nonce: String = match nonce {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let old_state = require_session_value(&session, SK_CSRF_STATE, "CSRF state").await;
     let old_state: String = match old_state {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     // 清理 session 中的临时凭证 (一次性使用).
@@ -181,17 +181,19 @@ pub async fn me(auth_session: AuthSession) -> impl IntoResponse {
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
 /// 从 session 取出一个必须存在的值, 缺失则返回 400 error response.
+/// Err 侧 Box: axum Response ≥128B, 裸 `Result<T, Response>` 触发
+/// clippy::result_large_err (rust 1.98 stable 起; 1.96 尚未告警).
 async fn require_session_value<T: serde::de::DeserializeOwned>(
     session: &Session,
     key: &str,
     what: &str,
-) -> Result<T, Response> {
+) -> Result<T, Box<Response>> {
     match session.get::<T>(key).await {
         Ok(Some(v)) => Ok(v),
-        _ => Err(error_response(
+        _ => Err(Box::new(error_response(
             StatusCode::BAD_REQUEST,
             format!("missing {what} in session (session expired?)"),
-        )),
+        ))),
     }
 }
 
