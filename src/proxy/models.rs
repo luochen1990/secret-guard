@@ -42,7 +42,12 @@
 //! # 上游 fetch (ROB-*, best-effort 永不 fail 查询)
 //!
 //! 按目标 provider **自身 protocol** (非 ingress 协议) 请求:
-//! - OpenAI / Responses / Anthropic: `GET {base_url}/v1/models`, shape `{data:[{id}]}`
+//! - OpenAI / Responses / Anthropic: `GET {base_url}{common_uri}/models`, shape
+//!   `{data:[{id}]}`. common_uri 候选序 (懒回退 — 运行时要省请求, 与探测端
+//!   的并行双路径相对): `DirectProvider.common_uri` (detect 固化的布局断言,
+//!   fast path) > `CacheEntry.common_uri_hit` (运行时发现) > 默认序
+//!   `V1_COMMON_URIS` (["/v1", ""]). **仅 404|405 触发下一候选** (鉴权/连通/
+//!   parse 失败立即终止); 命中值记进 `CacheEntry` 供下轮 fast path.
 //! - Gemini: `GET {base_url}/v1beta/models`, shape `{models:[{name:"models/X"}]}`
 //!   (剥 `models/` 前缀)
 //! - Ollama: `GET {base_url}/api/tags`, shape `{models:[{name}]}`
@@ -68,11 +73,15 @@
 //! # Provider 协议探测 (`probe_provider_upstream`)
 //!
 //! `POST /api/providers/probe` 的核心 (handler 薄壳在 `web/api/providers.rs`,
-//! base_url 合法性校验在 handler 侧): 对任意 base_url 并行探测 3 个候选端点,
+//! base_url 合法性校验在 handler 侧): 对任意 base_url 并行探测 4 个候选端点,
 //! 输出固定 4 项 outcome (顺序 openai / anthropic / gemini / ollama) + 推荐.
 //! 判定规则:
-//! - `/v1/models` 一路判两族 (openai + anthropic 共用端点, 靠 data 条目的判别
-//!   字段分家, 见 `classify_v1_family`); 401|403 → 双 auth_failed, 404|405 →
+//! - v1 pair 双路径判两族 (openai + anthropic 共用端点, 靠 data 条目的判别
+//!   字段分家, 见 `classify_v1_family`): `/v1/models` (裸根布局, 官方
+//!   OpenAI/Anthropic 语义) 与 `/models` (版本前缀已含布局 — 智谱 coding
+//!   plan 实测 `base + /v1/models` 404 而 `base + /models` 200; DeepSeek /
+//!   Moonshot 等国产系同布局) 两路独立判定后按 ok > auth_failed > absent
+//!   合并 (见 `merge_v1_pair`); 401|403 → 双 auth_failed, 404|405 →
 //!   双 absent, 其余失败 (连接/超时/超大 body/非法 JSON/其他非 2xx) → 双 error.
 //! - `/v1beta/models` (gemini) / `/api/tags` (ollama) 独立判定: 2xx + shape
 //!   解析成功 → ok; 401|403 → auth_failed; 404|405 → absent; 其余 → error.
@@ -153,11 +162,16 @@ pub struct ModelListCache {
 /// 成功 — serve-stale 无数据, 该 provider 无贡献); `last_attempt` 记**尝试**
 /// 时间 (成功或失败, 失败退避窗口 `MODEL_FETCH_BACKOFF` 的起点). 条目只在首次
 /// 尝试后存在 — 无条目 = 从未尝试 = 懒加载必须试, 无退避约束.
+///
+/// `common_uri_hit`: v1 族上次**成功**命中的 common_uri (懒回退的运行时知识,
+/// 供下轮 refresh 优先序使用 — stored 配置缺席/失配时的 fast path). 与 models
+/// 同生命周期 (成功覆写 / 失败保留旧值 serve-stale). gemini/ollama 恒 None.
 #[derive(Debug, Clone)]
 struct CacheEntry {
     models: Vec<String>,
     fetched_at: Option<Instant>,
     last_attempt: Instant,
+    common_uri_hit: Option<String>,
 }
 
 impl ModelListCache {
@@ -201,8 +215,14 @@ impl ModelListCache {
                 }
             };
             if needs_refresh {
-                match fetch_model_list(client, api_key, direct).await {
-                    Ok(models) => {
+                // 候选优先序: stored 配置 (detect 固化) > 缓存命中 (运行时发现) >
+                // 默认序. base_url 变更后 stored 可能失配 — fetch 侧 404 回退兜底.
+                let preferred = direct
+                    .common_uri
+                    .as_deref()
+                    .or(map.get(id).and_then(|e| e.common_uri_hit.as_deref()));
+                match fetch_model_list(client, api_key, direct, preferred).await {
+                    Ok((models, common_uri_hit)) => {
                         tracing::debug!(
                             provider_id = %id,
                             count = models.len(),
@@ -215,6 +235,7 @@ impl ModelListCache {
                                 models,
                                 fetched_at: Some(now),
                                 last_attempt: now,
+                                common_uri_hit,
                             },
                         );
                     }
@@ -236,6 +257,7 @@ impl ModelListCache {
                                 models: Vec::new(),
                                 fetched_at: None,
                                 last_attempt: now,
+                                common_uri_hit: None,
                             });
                     }
                 }
@@ -457,34 +479,108 @@ pub(super) async fn handle_router_models(
         .expect("static response parts are valid")
 }
 
+/// 单端点 GET + parse 的错误 (结构化 — v1 族懒回退的触发判别不依赖错误串
+/// 文案, 见 [`fetch_model_list`]).
+enum FetchErr {
+    /// 404|405 — 端点不存在: v1 族候选可回退换路.
+    Absent(StatusCode),
+    /// 其余失败 (鉴权/连通/超时/parse/其他非 2xx) — 换路径无意义, 立即终止.
+    /// 错误串已净化 (不含 key/secret).
+    Fatal(String),
+}
+
+impl FetchErr {
+    /// 对外错误串 (日志/WARN 面): Absent 走 `status_detail` 冻结形态.
+    fn message(&self) -> String {
+        match self {
+            FetchErr::Absent(s) => status_detail(*s),
+            FetchErr::Fatal(r) => r.clone(),
+        }
+    }
+}
+
 /// 按 provider 自身 protocol fetch 模型清单 (best-effort, 错误消息只含 id + reason,
 /// 永不含 key/secret — reqwest 错误经 `upstream_error_brief` 净化, 剥 userinfo/query).
 ///
-/// `api_key` 由调用方在缓存锁外预解析传入 (见模块头部锁纪律).
+/// `api_key` 由调用方在缓存锁外预解析传入 (见模块头部锁纪律). `preferred` 是
+/// v1 族的 common_uri 候选优先 (stored 配置或缓存命中; None = 默认序).
+///
+/// 返回 (models, common_uri_hit): hit 是 v1 族实际命中的 common_uri (gemini/
+/// ollama 恒 None) — 调用方记进 `CacheEntry` 供下轮 fast path.
+///
+/// v1 族懒回退语义 (与 probe 的并行双路径相对 — 运行时要省请求): 依候选序
+/// 逐个尝试 `base + common_uri + "/models"`, **仅 404|405 (端点不存在,
+/// [`FetchErr::Absent`]) 触发下一候选**; 401|403/超时/网络错/parse 失败立即
+/// Err (鉴权与连通性问题换路径无意义). 全部候选 404 时错误串逐路拼接
+/// (排障时各路布局一目了然).
 async fn fetch_model_list(
     client: &reqwest::Client,
     api_key: &str,
     direct: &DirectProvider,
-) -> Result<Vec<String>, String> {
-    let path = match direct.protocol {
-        Protocol::OpenAI | Protocol::OpenAIResponses | Protocol::Anthropic => "/v1/models",
-        Protocol::Gemini => "/v1beta/models",
-        Protocol::Ollama => "/api/tags",
-    };
-    let url = super::helpers::build_upstream_url(&direct.base_url, path);
+    preferred: Option<&str>,
+) -> Result<(Vec<String>, Option<String>), String> {
+    match direct.protocol {
+        Protocol::OpenAI | Protocol::OpenAIResponses | Protocol::Anthropic => {
+            let candidates = common_uri_candidates(preferred);
+            let mut errs = Vec::new();
+            for cu in &candidates {
+                let url =
+                    super::helpers::build_upstream_url(&direct.base_url, &format!("{cu}/models"));
+                match fetch_and_parse(client, &url, api_key, direct.protocol).await {
+                    Ok(models) => return Ok((models, Some(cu.clone()))),
+                    Err(FetchErr::Absent(s)) => {
+                        errs.push(format!("common_uri {cu:?}: {}", status_detail(s)));
+                    }
+                    Err(e) => return Err(format!("common_uri {cu:?}: {}", e.message())),
+                }
+            }
+            Err(format!(
+                "no candidate endpoint hit ({}; tried common_uris {candidates:?})",
+                errs.join("; ")
+            ))
+        }
+        Protocol::Gemini | Protocol::Ollama => {
+            let path = match direct.protocol {
+                Protocol::Gemini => "/v1beta/models",
+                Protocol::Ollama => "/api/tags",
+                _ => unreachable!("matched arm excludes v1 family"),
+            };
+            let url = super::helpers::build_upstream_url(&direct.base_url, path);
+            let models = fetch_and_parse(client, &url, api_key, direct.protocol)
+                .await
+                .map_err(|e| e.message())?;
+            Ok((models, None))
+        }
+    }
+}
+
+/// 单端点 GET + parse (fetch_model_list 的无回退路径; probe 侧走
+/// `fetch_status_and_body` + judge 分层 — 两处判定语义不同, 不共用).
+/// 非 2xx 按 status 分桶到 [`FetchErr`] — 回退触发判别不依赖错误串文案.
+async fn fetch_and_parse(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: &str,
+    protocol: Protocol,
+) -> Result<Vec<String>, FetchErr> {
     let mut headers = HeaderMap::new();
-    super::auth::apply_provider_auth(&mut headers, api_key, direct.protocol);
-    if direct.protocol == Protocol::Anthropic {
+    super::auth::apply_provider_auth(&mut headers, api_key, protocol);
+    if protocol == Protocol::Anthropic {
         headers.insert(
             "anthropic-version",
             HeaderValue::from_static(super::auth::ANTHROPIC_VERSION),
         );
     }
-    let (status, body) = fetch_status_and_body(client, &url, headers).await?;
+    let (status, body) = fetch_status_and_body(client, url, headers)
+        .await
+        .map_err(FetchErr::Fatal)?;
     if !status.is_success() {
-        return Err(status_detail(status));
+        return Err(match status.as_u16() {
+            404 | 405 => FetchErr::Absent(status),
+            _ => FetchErr::Fatal(status_detail(status)),
+        });
     }
-    parse_model_ids(direct.protocol, &body)
+    parse_model_ids(protocol, &body).map_err(FetchErr::Fatal)
 }
 
 /// GET 上游 + 有界累积 body, **整体**超时覆盖全程 (send → 状态行 → body 读毕).
@@ -629,6 +725,32 @@ fn build_models_body(ingress: Protocol, names: &[String]) -> String {
 
 // ─── Provider 协议探测 (POST /api/providers/probe 的核心) ─────────────
 
+/// v1 族 (openai/anthropic/responses) 的 common_uri 候选 (SSOT — probe 双路径
+/// 探测与 fetch 懒回退共用同一对, 见 [`crate::provider::DirectProvider::common_uri`]):
+/// `"/v1"` = 裸根布局 (官方 OpenAI/Anthropic 形态), `""` = 版本前缀已含布局
+/// (智谱 coding plan / DeepSeek / Moonshot 等国产系, models 端点 = `base + /models`).
+/// 数组序 = 未探测 (stored/hit 均无) 时的尝试优先序 — 官方布局打头.
+pub(crate) const V1_COMMON_URIS: [&str; 2] = ["/v1", ""];
+
+/// fetch 侧的候选序: `preferred` (stored 配置或缓存命中, 任一) 合法 (validate
+/// 值域: `""` 或 `/` 开头) 即进候选头 — **自定义前缀** (如智谱老接口
+/// `/api/paas/v4`) 与二值候选一视同仁, 用户显式声明的知识永远参与出站 URL;
+/// 其余 `V1_COMMON_URIS` 候选殿后 (去重). preferred 非法 (手改 state.toml
+/// 绕过 validate) 跳过, 回落默认序 (ROB 不炸).
+fn common_uri_candidates(preferred: Option<&str>) -> Vec<String> {
+    let mut cs = Vec::new();
+    if let Some(p) = preferred.filter(|p| p.is_empty() || p.starts_with('/')) {
+        cs.push(p.to_string());
+    }
+    for c in V1_COMMON_URIS {
+        let c = c.to_string();
+        if !cs.contains(&c) {
+            cs.push(c);
+        }
+    }
+    cs
+}
+
 /// 双命中 (openai + ollama 同时 ok) 时的推荐理由 (wire 文案冻结于接口契约).
 const PROBE_NOTE_DUAL_OLLAMA: &str = "Ollama native endpoint also detected. The OpenAI-compatible endpoint is recommended because secret redaction requires a codec-covered protocol (OpenAI/Anthropic/Responses).";
 /// 无 codec 协议 (gemini / ollama) 被推荐时的理由 (同上, 冻结文案).
@@ -644,6 +766,10 @@ pub(crate) struct ProbeOutcome {
     pub models: Option<Vec<String>>,
     /// `status == ok` 时 null; 其余必有 (上游 status / 家族判别 / 净化后的错误串).
     pub detail: Option<String>,
+    /// 该族判定实际 GET 的完整 URL (探测发起顺序; openai/anthropic 共享
+    /// v1 pair 双路径的两个 URL). 回显给 WebUI — 探测不是黑盒, 全 404 时
+    /// 用户可对照 URL 自行调整 base_url (智谱布局案例的教训).
+    pub urls: Vec<String>,
 }
 
 impl ProbeOutcome {
@@ -654,6 +780,7 @@ impl ProbeOutcome {
             status: ProbeStatus::Ok,
             models: Some(models),
             detail: None,
+            urls: Vec::new(),
         }
     }
 
@@ -665,6 +792,7 @@ impl ProbeOutcome {
             status,
             models: None,
             detail: Some(detail),
+            urls: Vec::new(),
         }
     }
 }
@@ -692,9 +820,14 @@ pub(crate) struct ProbeResponse {
     pub recommended: Option<&'static str>,
     /// 推荐理由, 可为 null.
     pub note: Option<&'static str>,
+    /// recommended 是 openai/anthropic 时 = 胜出路的 common_uri (`"/v1"` 裸根 /
+    /// `""` 版本前缀已含) — detect 知识的载体, WebUI 暂存后随表单保存落盘到
+    /// `DirectProvider::common_uri` (fetch 侧 fast path). 其余 (gemini/ollama
+    /// 推荐 / 无推荐) null — 概念不适用或未知.
+    pub common_uri: Option<String>,
 }
 
-/// 探测请求的统一 headers (三路 GET 共用).
+/// 探测请求的统一 headers (四路 GET 共用).
 ///
 /// **不走 `apply_provider_auth`**: 它按单一已知协议剥离竞争 auth header (转发
 /// 路径的正确防御 — 防上游误识别), 而探测时协议未知, 三个候选协议的 auth
@@ -879,13 +1012,46 @@ fn recommend(probes: &[ProbeOutcome]) -> (Option<&'static str>, Option<&'static 
     }
 }
 
+/// 合并 v1 pair 双路径探测的结果, 附带胜出路的 common_uri (供
+/// `ProbeResponse.common_uri` — detect 知识的载体).
+///
+/// 优先级: pair 内任一 outcome 的 status 越优该 pair 越优 — `ok > auth_failed >
+/// absent > error`; 平分时取 `preferred` (官方裸根布局的 detail 更可预期).
+/// 无 ok 时 auth_failed 压过 absent 的理由: key 错误是用户可立即行动的信号
+/// (换 key), 而 absent 只说明路径不存在 — 两路布局各报各的会让用户误以为
+/// base_url 填错.
+fn merge_v1_pair(
+    preferred: (ProbeOutcome, ProbeOutcome),
+    fallback: (ProbeOutcome, ProbeOutcome),
+) -> ((ProbeOutcome, ProbeOutcome), &'static str) {
+    let rank = |pair: &(ProbeOutcome, ProbeOutcome)| {
+        [pair.0.status, pair.1.status]
+            .into_iter()
+            .map(|s| match s {
+                ProbeStatus::Ok => 3,
+                ProbeStatus::AuthFailed => 2,
+                ProbeStatus::Absent => 1,
+                ProbeStatus::Error => 0,
+            })
+            .max()
+            .expect("rank over non-empty array")
+    };
+    if rank(&fallback) > rank(&preferred) {
+        (fallback, "")
+    } else {
+        (preferred, V1_COMMON_URIS[0])
+    }
+}
+
 /// 对 base_url 并行探测 4 族协议端点 (base_url 合法性已由 handler 侧校验 —
 /// 集中式预处理; 此处不做重复校验, 非法 URL 的最坏结果是全 error outcome).
 ///
-/// 并行 3 个 GET (`tokio::join!`): `/v1/models` (判 openai/anthropic 两族),
-/// `/v1beta/models` (gemini), `/api/tags` (ollama). 每路复用
-/// `fetch_status_and_body` 防御 (整体超时 + 有界 body + 错误串净化 — detail
-/// 不含 api_key).
+/// 并行 4 个 GET (`tokio::join!`): v1 pair 双路径 (判 openai/anthropic 两族 —
+/// `/v1/models` 裸根布局, 官方 OpenAI/Anthropic 语义; `/models` 版本前缀已含
+/// 布局, 智谱 / DeepSeek / Moonshot 等国产系与 base 填 `.../v1` 的用户; 两路
+/// 各自 `judge_v1_pair` 后按 `merge_v1_pair` 优先级合并), `/v1beta/models`
+/// (gemini), `/api/tags` (ollama). 每路复用 `fetch_status_and_body` 防御
+/// (整体超时 + 有界 body + 错误串净化 — detail 不含 api_key).
 ///
 /// 永不 Err / 永不 panic (ROB-*): 探测失败是数据不是 HTTP 错误.
 pub(crate) async fn probe_provider_upstream(
@@ -895,25 +1061,44 @@ pub(crate) async fn probe_provider_upstream(
 ) -> ProbeResponse {
     let headers = probe_headers(api_key);
     // URL 先绑定再借用 (join! 的 future 存活到 .await 完成, 临时值撑不到).
-    let (v1_url, gemini_url, ollama_url) = (
+    let (v1_url, bare_url, gemini_url, ollama_url) = (
         super::helpers::build_upstream_url(base_url, "/v1/models"),
+        super::helpers::build_upstream_url(base_url, "/models"),
         super::helpers::build_upstream_url(base_url, "/v1beta/models"),
         super::helpers::build_upstream_url(base_url, "/api/tags"),
     );
-    let (v1, gemini, ollama) = tokio::join!(
+    let (v1, bare, gemini, ollama) = tokio::join!(
         fetch_status_and_body(client, &v1_url, headers.clone()),
+        fetch_status_and_body(client, &bare_url, headers.clone()),
         fetch_status_and_body(client, &gemini_url, headers.clone()),
         fetch_status_and_body(client, &ollama_url, headers),
     );
-    let (openai, anthropic) = judge_v1_pair(&v1);
-    let gemini = judge_single_endpoint(Protocol::Gemini, &gemini);
-    let ollama = judge_single_endpoint(Protocol::Ollama, &ollama);
+    let ((mut openai, mut anthropic), v1_winner) =
+        merge_v1_pair(judge_v1_pair(&v1), judge_v1_pair(&bare));
+    let mut gemini = judge_single_endpoint(Protocol::Gemini, &gemini);
+    let mut ollama = judge_single_endpoint(Protocol::Ollama, &ollama);
+    // urls 回显在编排层填充 (URL 集合是编排层知识, judge/merge 不感知):
+    // v1 pair 双路径两族共享, gemini/ollama 各自单路.
+    let v1_pair_urls = vec![v1_url, bare_url];
+    openai.urls = v1_pair_urls.clone();
+    anthropic.urls = v1_pair_urls;
+    gemini.urls = vec![gemini_url];
+    ollama.urls = vec![ollama_url];
     let probes = vec![openai, anthropic, gemini, ollama];
     let (recommended, note) = recommend(&probes);
+    // common_uri = recommended 对应胜出路的布局知识 (openai/anthropic 共用
+    // v1 pair, 胜者在 merge 时判定); gemini/ollama/无推荐 → None.
+    let common_uri = match recommended {
+        Some(r) if r == Protocol::OpenAI.name() || r == Protocol::Anthropic.name() => {
+            Some(v1_winner.to_string())
+        }
+        _ => None,
+    };
     ProbeResponse {
         probes,
         recommended,
         note,
+        common_uri,
     }
 }
 
@@ -960,6 +1145,7 @@ mod tests {
             base_url: base_url.to_string(),
             api_key: String::new(),
             api_key_file: None,
+            common_uri: None,
         }
     }
 
@@ -1500,10 +1686,10 @@ mod tests {
             std::future::pending::<()>().await;
         });
         let direct = direct_proto(Protocol::OpenAI, &format!("http://{addr}"));
-        let err = fetch_model_list(&reqwest::Client::new(), "", &direct)
+        let err = fetch_model_list(&reqwest::Client::new(), "", &direct, None)
             .await
             .unwrap_err();
-        assert_eq!(err, "timeout", "停滞上游必须被整体超时掐断");
+        assert!(err.contains("timeout"), "停滞上游必须被整体超时掐断: {err}");
     }
 
     /// 超大 body 上限: 超过 MAX_MODELS_BODY 的响应按该 provider fetch 失败处理
@@ -1519,7 +1705,7 @@ mod tests {
             .create_async()
             .await;
         let direct = direct_proto(Protocol::OpenAI, &server.url());
-        let err = fetch_model_list(&reqwest::Client::new(), "", &direct)
+        let err = fetch_model_list(&reqwest::Client::new(), "", &direct, None)
             .await
             .unwrap_err();
         assert!(err.contains("exceeds"), "超限 body 必须按失败处理: {err}");
@@ -1541,11 +1727,183 @@ mod tests {
         let mut direct = direct_proto(Protocol::Anthropic, &server.url());
         direct.api_key = "sk-ant-test".into();
         // key = direct.api_key 直配值 (预解析结果).
-        let models = fetch_model_list(&reqwest::Client::new(), "sk-ant-test", &direct)
+        let (models, hit) = fetch_model_list(&reqwest::Client::new(), "sk-ant-test", &direct, None)
             .await
             .unwrap();
         assert_eq!(models, strs(&["c1"]));
+        assert_eq!(hit.as_deref(), Some("/v1"), "v1 族默认序首选裸根布局");
         mock.assert_async().await;
+    }
+
+    // ─── fetch: v1 族 common_uri 懒回退 (detect 知识消费侧) ──────────────
+
+    /// 单端点 GET mock helper: (path, status, body, expect) — expect(0) 的负断言
+    /// 必须配合 `.assert_async()` (mockito 对未达预期的请求仍返回定义的响应,
+    /// 校验只在 assert 时发生, 否则负断言是摆设).
+    async fn mock_get(
+        server: &mut mockito::ServerGuard,
+        path: &str,
+        status: u16,
+        body: &str,
+        expect: usize,
+    ) -> mockito::Mock {
+        server
+            .mock("GET", path)
+            .with_status(status as usize)
+            .with_body(body)
+            .expect(expect)
+            .create_async()
+            .await
+    }
+
+    /// fetch_model_list 调用 wrapper (自建 client; api_key 显式传).
+    async fn fetch_direct(
+        api_key: &str,
+        direct: &DirectProvider,
+        preferred: Option<&str>,
+    ) -> Result<(Vec<String>, Option<String>), String> {
+        fetch_model_list(&reqwest::Client::new(), api_key, direct, preferred).await
+    }
+
+    /// 智谱式布局 (版本前缀已含): 默认序先 404 于 /v1/models, 回退 base+/models
+    /// 命中 — stored/hit 均缺席时 fetch 自行认路.
+    #[tokio::test]
+    async fn fetch_model_list_bare_layout_falls_back() {
+        let mut server = mockito::Server::new_async().await;
+        mock_get(&mut server, "/v1/models", 404, "", 1).await;
+        let bare = mock_get(
+            &mut server,
+            "/models",
+            200,
+            r#"{"object":"list","data":[{"id":"glm-4.6","object":"model"}]}"#,
+            1,
+        )
+        .await;
+        let direct = direct_proto(Protocol::OpenAI, &server.url());
+        let (models, hit) = fetch_direct("", &direct, None).await.unwrap();
+        assert_eq!(models, strs(&["glm-4.6"]));
+        assert_eq!(hit.as_deref(), Some(""), "版本前缀已含布局命中");
+        bare.assert_async().await;
+    }
+
+    /// stored common_uri (detect 固化) 是 fast path: 直接打 base + cu + /models,
+    /// 不先试默认序 (智谱场景零 404 往返 — detect 知识的收益所在).
+    #[tokio::test]
+    async fn fetch_model_list_stored_common_uri_is_fast_path() {
+        let mut server = mockito::Server::new_async().await;
+        let v1_never = mock_get(&mut server, "/v1/models", 404, "", 0).await;
+        let bare = mock_get(
+            &mut server,
+            "/models",
+            200,
+            r#"{"data":[{"id":"glm-4.6"}]}"#,
+            1,
+        )
+        .await;
+        let mut direct = direct_proto(Protocol::OpenAI, &server.url());
+        direct.common_uri = Some(String::new());
+        let (models, hit) = fetch_direct("", &direct, direct.common_uri.as_deref())
+            .await
+            .unwrap();
+        assert_eq!(models, strs(&["glm-4.6"]));
+        assert_eq!(hit.as_deref(), Some(""));
+        v1_never.assert_async().await;
+        bare.assert_async().await;
+    }
+
+    /// 自定义前缀 (validate 值域内但非二值候选, 如智谱老接口 /api/paas/v4):
+    /// 进候选头直接命中 — 用户显式声明的知识永远参与出站 URL (H1 修复回归).
+    #[tokio::test]
+    async fn fetch_model_list_custom_common_uri_is_first_candidate() {
+        let mut server = mockito::Server::new_async().await;
+        let custom = mock_get(
+            &mut server,
+            "/api/paas/v4/models",
+            200,
+            r#"{"data":[{"id":"glm-4v"}]}"#,
+            1,
+        )
+        .await;
+        // 显式挂 404 (不依赖 mockito 未匹配行为的隐式 404).
+        let never_a = mock_get(&mut server, "/v1/models", 404, "", 0).await;
+        let never_b = mock_get(&mut server, "/models", 404, "", 0).await;
+        let mut direct = direct_proto(Protocol::OpenAI, &server.url());
+        direct.common_uri = Some("/api/paas/v4".into());
+        let (models, hit) = fetch_direct("", &direct, direct.common_uri.as_deref())
+            .await
+            .unwrap();
+        assert_eq!(models, strs(&["glm-4v"]));
+        assert_eq!(hit.as_deref(), Some("/api/paas/v4"));
+        custom.assert_async().await;
+        never_a.assert_async().await;
+        never_b.assert_async().await;
+    }
+
+    /// stored 失配 (base_url 变更后残留旧知识): 404 回退候选序列纠正, 不静默.
+    #[tokio::test]
+    async fn fetch_model_list_stored_mismatch_falls_back() {
+        let mut server = mockito::Server::new_async().await;
+        mock_get(&mut server, "/v1/models", 404, "", 1).await;
+        mock_get(&mut server, "/models", 200, r#"{"data":[{"id":"m1"}]}"#, 1).await;
+        let mut direct = direct_proto(Protocol::OpenAI, &server.url());
+        direct.common_uri = Some("/v1".into());
+        let (models, hit) = fetch_direct("", &direct, direct.common_uri.as_deref())
+            .await
+            .unwrap();
+        assert_eq!(models, strs(&["m1"]));
+        assert_eq!(hit.as_deref(), Some(""), "回退纠正失配的 stored 值");
+    }
+
+    /// 全候选 404: 错误串逐路拼接 (各路布局都列出来, 排障不黑盒).
+    #[tokio::test]
+    async fn fetch_model_list_no_candidate_hits_reports_all() {
+        let mut server = mockito::Server::new_async().await;
+        mock_get(&mut server, "/v1/models", 404, "", 1).await;
+        mock_get(&mut server, "/models", 404, "", 1).await;
+        let direct = direct_proto(Protocol::OpenAI, &server.url());
+        let err = fetch_direct("", &direct, None).await.unwrap_err();
+        assert!(err.contains("common_uri \"/v1\""), "{err}");
+        assert!(err.contains("common_uri \"\""), "{err}");
+        assert!(err.contains("no candidate endpoint hit"), "{err}");
+    }
+
+    /// 鉴权失败 (401) 不触发回退 — 换路径无意义, 立即终止.
+    #[tokio::test]
+    async fn fetch_model_list_auth_error_does_not_fall_back() {
+        let mut server = mockito::Server::new_async().await;
+        mock_get(&mut server, "/v1/models", 401, "", 1).await;
+        let bare_never =
+            mock_get(&mut server, "/models", 200, r#"{"data":[{"id":"m1"}]}"#, 0).await;
+        let direct = direct_proto(Protocol::OpenAI, &server.url());
+        let err = fetch_direct("", &direct, None).await.unwrap_err();
+        assert!(err.contains("401"), "{err}");
+        assert!(err.contains("common_uri \"/v1\""), "{err}");
+        bare_never.assert_async().await;
+    }
+
+    /// CacheEntry 命中记忆: 首轮回退发现 bare 布局后, TTL 过期的下轮 refresh
+    /// 直接打记录的路径 (stored 缺席时的运行时 fast path).
+    #[tokio::test]
+    async fn snapshot_refreshing_reuses_discovered_common_uri() {
+        let mut server = mockito::Server::new_async().await;
+        let v1 = mock_get(&mut server, "/v1/models", 404, "", 1).await; // 仅首轮
+        let bare = mock_get(&mut server, "/models", 200, r#"{"data":[{"id":"m1"}]}"#, 2).await; // 两轮
+        let direct = direct_proto(Protocol::OpenAI, &server.url());
+        let targets = vec![FetchTarget {
+            id: "p1".into(),
+            api_key: String::new(),
+            direct,
+        }];
+        let client = reqwest::Client::new();
+        let cache = ModelListCache::new();
+        let s1 = cache.snapshot_refreshing(&client, &targets).await;
+        assert_eq!(s1.get("p1").unwrap(), &strs(&["m1"]));
+        // TTL (test 500ms) 过期 → refresh; common_uri_hit="" 优先 → 零 404 往返.
+        tokio::time::sleep(MODEL_LIST_TTL + MODEL_FETCH_BACKOFF).await;
+        let s2 = cache.snapshot_refreshing(&client, &targets).await;
+        assert_eq!(s2.get("p1").unwrap(), &strs(&["m1"]));
+        v1.assert_async().await;
+        bare.assert_async().await;
     }
 
     // ─── 完整 pipeline: exact-only gate 短路 (N6) ──────────────────────
@@ -1610,16 +1968,18 @@ mod tests {
 
     // ─── Provider 协议探测 ─────────────────────────────────────────────
 
-    /// 三端点探测 mock: (v1/models, v1beta/models, api/tags) 各挂一个
+    /// 四端点探测 mock: (v1/models, models, v1beta/models, api/tags) 各挂一个
     /// (status, body) — 全部显式挂载, 不留 mockito 未匹配的隐式行为.
     async fn probe_upstream(
         v1: (u16, &str),
+        bare_models: (u16, &str),
         v1beta: (u16, &str),
         tags: (u16, &str),
     ) -> mockito::ServerGuard {
         let mut server = mockito::Server::new_async().await;
         for (path, (status, body)) in [
             ("/v1/models", v1),
+            ("/models", bare_models),
             ("/v1beta/models", v1beta),
             ("/api/tags", tags),
         ] {
@@ -1646,6 +2006,7 @@ mod tests {
             ),
             (404, ""),
             (404, ""),
+            (404, ""),
         )
         .await;
         let resp = probe(&server, "").await;
@@ -1664,6 +2025,11 @@ mod tests {
         assert_eq!(resp.probes[2].status, ProbeStatus::Absent, "404 → absent");
         assert_eq!(resp.probes[3].status, ProbeStatus::Absent);
         assert_eq!(resp.recommended, Some("openai"));
+        assert_eq!(
+            resp.common_uri.as_deref(),
+            Some("/v1"),
+            "官方裸根布局: detect 知识 = /v1"
+        );
         assert!(resp.note.is_none());
     }
 
@@ -1675,6 +2041,7 @@ mod tests {
                 200,
                 r#"{"data":[{"type":"model","id":"claude-3-5","display_name":"Claude 3.5"}]}"#,
             ),
+            (404, ""),
             (404, ""),
             (404, ""),
         )
@@ -1698,6 +2065,7 @@ mod tests {
     async fn probe_gemini_happy() {
         let server = probe_upstream(
             (404, ""),
+            (404, ""),
             (
                 200,
                 r#"{"models":[{"name":"models/gem-1"},{"name":"models/gem-2"}]}"#,
@@ -1709,7 +2077,9 @@ mod tests {
         let g = &resp.probes[2];
         assert_eq!(g.status, ProbeStatus::Ok);
         assert_eq!(g.models.as_ref().unwrap(), &strs(&["gem-1", "gem-2"]));
+        assert_eq!(g.urls, vec![format!("{}/v1beta/models", server.url())]);
         assert_eq!(resp.recommended, Some("gemini"));
+        assert!(resp.common_uri.is_none(), "gemini 推荐: 布局概念不适用");
         // note 断言用冻结文案字面量 (与 detail 的字面量断言风格统一): 断言常量
         // 自身是同义反复, 文案漂移时恒绿, 起不到契约冻结作用.
         assert_eq!(
@@ -1723,6 +2093,7 @@ mod tests {
     #[tokio::test]
     async fn probe_ollama_happy() {
         let server = probe_upstream(
+            (404, ""),
             (404, ""),
             (404, ""),
             (200, r#"{"models":[{"name":"llama3:latest"}]}"#),
@@ -1747,6 +2118,7 @@ mod tests {
         let server = probe_upstream(
             (200, r#"{"data":[{"id":"gpt-4o","object":"model"}]}"#),
             (404, ""),
+            (404, ""),
             (200, r#"{"models":[{"name":"llama3:latest"}]}"#),
         )
         .await;
@@ -1766,7 +2138,7 @@ mod tests {
     /// 其余两族 absent → 无任何 ok → recommended null.
     #[tokio::test]
     async fn probe_v1_models_401_both_auth_failed() {
-        let server = probe_upstream((401, ""), (404, ""), (404, "")).await;
+        let server = probe_upstream((401, ""), (404, ""), (404, ""), (404, "")).await;
         let resp = probe(&server, "").await;
         for i in [0, 1] {
             assert_eq!(resp.probes[i].status, ProbeStatus::AuthFailed);
@@ -1779,16 +2151,93 @@ mod tests {
         assert_eq!(resp.note, None);
     }
 
+    /// 版本前缀已含布局 (智谱 / DeepSeek / Moonshot 等国产系 + base 填
+    /// `https://api.openai.com/v1` 的用户): `/v1/models` 404 但 `base + /models`
+    /// 200 — v1 pair 应回退到 bare 布局命中 (智谱 coding plan 实测案例).
+    #[tokio::test]
+    async fn probe_versioned_base_hits_bare_models_endpoint() {
+        let server = probe_upstream(
+            (404, ""),
+            (
+                200,
+                r#"{"object":"list","data":[{"id":"glm-4.6","object":"model","owned_by":"z-ai"}]}"#,
+            ),
+            (404, ""),
+            (404, ""),
+        )
+        .await;
+        let resp = probe(&server, "sk-valid").await;
+        let oa = &resp.probes[0];
+        assert_eq!(oa.status, ProbeStatus::Ok, "bare /models 命中回退");
+        assert_eq!(oa.models.as_ref().unwrap(), &strs(&["glm-4.6"]));
+        assert_eq!(
+            oa.urls,
+            vec![
+                format!("{}/v1/models", server.url()),
+                format!("{}/models", server.url())
+            ],
+            "v1 pair 双路径完整 URL 回显 (探测顺序)"
+        );
+        assert_eq!(resp.probes[1].status, ProbeStatus::Absent);
+        assert_eq!(
+            resp.probes[1].detail.as_deref(),
+            Some("endpoint speaks OpenAI family shape")
+        );
+        assert_eq!(resp.recommended, Some("openai"));
+        assert_eq!(
+            resp.common_uri.as_deref(),
+            Some(""),
+            "智谱布局: 胜出路 = bare, detect 知识 = 版本前缀已含"
+        );
+    }
+
+    /// 合并优先级: 无 ok 时 auth_failed (key 错, 用户可行动) 优先于 absent.
+    #[tokio::test]
+    async fn probe_bare_models_401_beats_v1_absent() {
+        let server = probe_upstream((404, ""), (401, ""), (404, ""), (404, "")).await;
+        let resp = probe(&server, "sk-bad").await;
+        for i in [0, 1] {
+            assert_eq!(resp.probes[i].status, ProbeStatus::AuthFailed);
+            assert_eq!(
+                resp.probes[i].detail.as_deref(),
+                Some("upstream returned 401")
+            );
+        }
+        assert_eq!(resp.recommended, None);
+    }
+
+    /// 合并优先级: bare 布局 ok 胜过 v1 路径 error (上游对未知路径 500).
+    #[tokio::test]
+    async fn probe_bare_models_200_beats_v1_error() {
+        let server = probe_upstream(
+            (500, ""),
+            (200, r#"{"data":[{"id":"m1","object":"model"}]}"#),
+            (404, ""),
+            (404, ""),
+        )
+        .await;
+        let resp = probe(&server, "").await;
+        assert_eq!(resp.probes[0].status, ProbeStatus::Ok);
+        assert_eq!(resp.probes[0].models.as_ref().unwrap(), &strs(&["m1"]));
+        assert_eq!(resp.recommended, Some("openai"));
+    }
+
     /// data 无判别字段 / data 空: 默认 OpenAI 家族 (models 可为空).
     #[tokio::test]
     async fn probe_v1_models_no_discriminator_defaults_openai() {
-        let server = probe_upstream((200, r#"{"data":[{"id":"m1"}]}"#), (404, ""), (404, "")).await;
+        let server = probe_upstream(
+            (200, r#"{"data":[{"id":"m1"}]}"#),
+            (404, ""),
+            (404, ""),
+            (404, ""),
+        )
+        .await;
         let resp = probe(&server, "").await;
         assert_eq!(resp.probes[0].status, ProbeStatus::Ok);
         assert_eq!(resp.probes[0].models.as_ref().unwrap(), &strs(&["m1"]));
         assert_eq!(resp.probes[1].status, ProbeStatus::Absent);
 
-        let server = probe_upstream((200, r#"{"data":[]}"#), (404, ""), (404, "")).await;
+        let server = probe_upstream((200, r#"{"data":[]}"#), (404, ""), (404, ""), (404, "")).await;
         let resp = probe(&server, "").await;
         assert_eq!(
             resp.probes[0].status,
@@ -1812,6 +2261,7 @@ mod tests {
             ),
             (404, ""),
             (404, ""),
+            (404, ""),
         )
         .await;
         let resp = probe(&server, "").await;
@@ -1830,6 +2280,7 @@ mod tests {
             ),
             (404, ""),
             (404, ""),
+            (404, ""),
         )
         .await;
         let resp = probe(&server, "").await;
@@ -1844,7 +2295,7 @@ mod tests {
     /// 200 但非法 JSON (gemini 路径) → error (detail 含 invalid JSON).
     #[tokio::test]
     async fn probe_gemini_invalid_json_errors() {
-        let server = probe_upstream((404, ""), (200, "not-json{{"), (404, "")).await;
+        let server = probe_upstream((404, ""), (404, ""), (200, "not-json{{"), (404, "")).await;
         let resp = probe(&server, "").await;
         assert_eq!(resp.probes[2].status, ProbeStatus::Error);
         let detail = resp.probes[2].detail.as_deref().unwrap();
@@ -1856,7 +2307,7 @@ mod tests {
     #[tokio::test]
     async fn probe_oversized_body_errors() {
         let huge = "x".repeat(MAX_MODELS_BODY + 1);
-        let server = probe_upstream((200, &huge), (200, &huge), (200, &huge)).await;
+        let server = probe_upstream((200, &huge), (200, &huge), (200, &huge), (200, &huge)).await;
         let resp = probe(&server, "").await;
         for p in &resp.probes {
             assert_eq!(p.status, ProbeStatus::Error);

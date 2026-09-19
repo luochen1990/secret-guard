@@ -210,6 +210,20 @@ pub struct DirectProvider {
     /// (在 `crate::proxy`) 决定是否跳过 auth header 注入.
     #[serde(default)]
     pub api_key_file: Option<std::path::PathBuf>,
+    /// secret-guard **自建请求** (fetch_model_list — router /models 本地合成拉上游
+    /// 清单) 的公共 URI 前缀, 亦即三段式 `base_url + common_uri + request_uri` 的
+    /// 中段. **不影响转发** — 转发的 request_uri 随客户端请求 rest 原样流过.
+    ///
+    /// 值语义: `"/v1"` = 裸根布局 (OpenAI/Anthropic 官方形态, base 不含版本前缀);
+    /// `""` = 版本前缀已含布局 (智谱 coding plan / DeepSeek / Moonshot 等国产系,
+    /// models 端点 = `base + /models`); `None` (字段缺席) = 未探测, fetch 侧用
+    /// 候选序列现场推导 (`proxy::models::V1_COMMON_URIS`).
+    ///
+    /// 知识来源: WebUI detect 探测 (`POST /api/providers/probe` 响应的
+    /// `common_uri`) 自动填充, 随表单保存落盘; 手写 toml 可显式声明. base_url
+    /// 变更后此值可能失配 — fetch 侧遇 404 回退候选序列兜底 (WARN), 不静默.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub common_uri: Option<String>,
 }
 
 /// 虚拟 endpoint (路由表) provider 的构造负载 ([`ProviderKind::Router`]).
@@ -526,6 +540,23 @@ impl DynamicEntry for Provider {
                         self.id
                     ));
                 }
+                // common_uri 值域: "" (版本前缀已含) 或以 '/' 开头的合法 path 片段
+                // (无尾斜杠 / 无 query-fragment 分隔符 / 长度上限). 拒绝怪值防止
+                // 手写 toml 的笔误悄悄改变 fetch 出站 URL.
+                if let Some(cu) = &d.common_uri {
+                    let valid = cu.is_empty()
+                        || (cu.starts_with('/')
+                            && !cu.ends_with('/')
+                            && !cu.contains(['?', '#', ' '])
+                            && cu.chars().count() <= 64);
+                    if !valid {
+                        return Err(format!(
+                            "provider {} common_uri must be \"\" or a '/'-prefixed path \
+                             segment without trailing '/', '?' or '#' (got {cu:?})",
+                            self.id
+                        ));
+                    }
+                }
             }
             ProviderKind::Router(r) => {
                 // 空 routes 拒绝: 空 router 无法转发任何请求 (NoMatch 恒真),
@@ -708,6 +739,10 @@ pub enum EffectiveProviderKind {
         /// 这里是空字符串 — 文件内容由 effective_api_key() 在转发时读取, 不进 effective 视图.
         api_key_masked: String,
         api_key_length: usize,
+        /// 自建请求的公共 URI 前缀 (detect 知识的持久化形态, 见
+        /// [`DirectProvider::common_uri`]). 非敏感直接透出 — WebUI 编辑表单
+        /// 回填原值, 防止未重跑 detect 的保存把它抹回 None.
+        common_uri: Option<String>,
     },
     Router {
         routes: Vec<Route>,
@@ -741,6 +776,7 @@ impl From<Provider> for ProviderMasked {
                     api_key_masked: crate::secrets::mask_value(&d.api_key),
                     api_key_length,
                     base_url: d.base_url,
+                    common_uri: d.common_uri,
                 }
             }
             ProviderKind::Router(r) => EffectiveProviderKind::Router { routes: r.routes },
@@ -1247,6 +1283,7 @@ mod tests {
                 base_url: base.into(),
                 api_key: format!("k-{id}"),
                 api_key_file: None,
+                common_uri: None,
             }),
         }
     }
@@ -1418,6 +1455,46 @@ mod tests {
         direct_mut(&mut both).api_key_file = Some(PathBuf::from("/run/secrets/whatever"));
         let err = both.validate().unwrap_err();
         assert!(err.contains("both api_key and api_key_file"), "got: {err}");
+    }
+
+    // ─── common_uri: 值域校验 (detect 知识的持久化形态) ────────────────────
+
+    #[test]
+    fn validate_common_uri_accepts_legal_forms() {
+        // 合法: None (未探测) / "" (版本前缀已含) / "/v1" (裸根) / 多级 / 有界长度.
+        let legal = [
+            None,
+            Some(""),
+            Some("/v1"),
+            Some("/api/paas/v4"),
+            Some(&"/a".repeat(30)),
+        ];
+        for cu in legal {
+            let mut prov = p("ok", Protocol::OpenAI, "https://x");
+            direct_mut(&mut prov).common_uri = cu.map(str::to_string);
+            assert!(prov.validate().is_ok(), "cu={cu:?} should be legal");
+        }
+    }
+
+    #[test]
+    fn validate_common_uri_rejects_malformed() {
+        let bad = [
+            Some("v1"),            // 缺前导 /
+            Some("/v1/"),          // 尾斜杠
+            Some("/v1?x"),         // query 分隔符
+            Some("/a#b"),          // fragment 分隔符
+            Some("/a b"),          // 空格
+            Some(&"/".repeat(65)), // 超长 (>64)
+            Some("/"),             // 仅斜杠 (等价空前缀但非规范形态)
+        ];
+        for cu in bad {
+            let mut prov = p("x", Protocol::OpenAI, "https://x");
+            direct_mut(&mut prov).common_uri = cu.map(str::to_string);
+            assert!(
+                prov.validate().unwrap_err().contains("common_uri"),
+                "cu={cu:?} should be rejected"
+            );
+        }
     }
 
     // ─── effective_api_key: api_key 直接值 vs api_key_file ──────────────────

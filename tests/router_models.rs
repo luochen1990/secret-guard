@@ -58,6 +58,7 @@ fn openai_provider(id: &str, base_url: &str) -> Provider {
             base_url: base_url.into(),
             api_key: String::new(),
             api_key_file: None,
+            common_uri: None,
         }),
     }
 }
@@ -69,6 +70,7 @@ fn anthropic_provider(id: &str, base_url: &str) -> Provider {
             base_url: base_url.into(),
             api_key: String::new(),
             api_key_file: None,
+            common_uri: None,
         }),
         ..openai_provider(id, base_url)
     }

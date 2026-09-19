@@ -397,6 +397,13 @@ pub(crate) struct UpsertProviderRequest {
     /// 时可用, 但通常只在 static config (sops 注入) 用.
     #[serde(default)]
     pub api_key_file: Option<String>,
+    /// 自建请求公共 URI 前缀 (detect 知识, 见 [`crate::provider::DirectProvider::common_uri`]).
+    /// **全量语义** (与 base_url 同型, 无 "省略=保留" 回填): null = 未探测 (fetch
+    /// 现场推导), `Some("/v1")` / `Some("")` = 显式布局断言. WebUI 编辑表单总是
+    /// 回填 effective 原值后整体提交 — "保留" 由前端实现, wire 保持无歧义
+    /// (避免 api_key 的 #157 null 歧义同型问题). Router/Pool 构造下忽略.
+    #[serde(default)]
+    pub common_uri: Option<String>,
     /// 路由列表 (#179 多规则化 / #187 sum type). 直接复用 [`Route`] 的
     /// 序列化 (model_pattern / target / upstream_model / priority). 三态语义:
     /// - 省略 (None): 保留旧值 (PUT) — 优先从 dynamic 旧条目回填, 无则从
@@ -513,6 +520,7 @@ impl UpsertProviderRequest {
                     base_url: self.base_url,
                     api_key: self.api_key.unwrap_or_default(),
                     api_key_file: self.api_key_file.map(std::path::PathBuf::from),
+                    common_uri: self.common_uri,
                 })
             }
         };

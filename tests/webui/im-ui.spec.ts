@@ -2874,8 +2874,12 @@ function startProbeUpstream(
 }
 
 test.describe("Provider Detect 协议探测", () => {
+  // badge 复制断言需要 clipboard 权限 (headless Chromium 默认拒绝 → 复制走
+  // catch 分支, flash 永不出现). 本 describe 顶层统一授予.
+  test.use({ permissions: ["clipboard-write"] });
   let fastUpstream: ProbeUpstream;
   let slowUpstream: ProbeUpstream;
+  let versionedUpstream: ProbeUpstream;
 
   test.beforeAll(async () => {
     // fast: /v1/models → openai shape (3 models, chips 数断言用); 其余端点 404
@@ -2909,11 +2913,26 @@ test.describe("Provider Detect 协议探测", () => {
       }
       return { status: 404, body: "{}" };
     });
+    // versioned (智谱式布局): base 已含版本前缀 — /models 200 openai shape,
+    // /v1/models 404. detect 应回退 bare 路径命中 + common_uri="" 徽标.
+    versionedUpstream = await startProbeUpstream((pathname) => {
+      if (pathname === "/models") {
+        return {
+          status: 200,
+          body: JSON.stringify({
+            object: "list",
+            data: [{ id: "glm-4.6", object: "model" }],
+          }),
+        };
+      }
+      return { status: 404, body: "{}" };
+    });
   });
 
   test.afterAll(async () => {
     await fastUpstream.close();
     await slowUpstream.close();
+    await versionedUpstream.close();
   });
 
   async function openNewProviderForm(page: Page): Promise<void> {
@@ -2960,5 +2979,53 @@ test.describe("Provider Detect 协议探测", () => {
     await expect(page.locator("#p-probe-result .probe-line")).toHaveCount(0);
     await expect(page.locator("#p-probe-result .hint")).toHaveCount(0);
     await expect(page.locator("#p-protocol")).toHaveValue("openai");
+  });
+
+  // ─── 智谱式布局 (版本前缀已含): bare /models 回退 + common_uri 知识链 ────
+
+  test("Detect: versioned 上游 → bare 回退命中 + URL 回显 + common_uri 徽标 + 保存回读", async ({ page }) => {
+    await page.goto("/");
+    await page.locator('a.tab[data-tab="providers"]').click();
+    await openNewProviderForm(page);
+    await page.locator("#p-id").fill("zhipu-coding");
+    await page.locator("#p-base-url").fill(versionedUpstream.url);
+    // 徽标初始隐藏 (未探测).
+    await expect(page.locator("#p-common-uri-badge")).toBeHidden();
+    await page.locator("#p-detect").click();
+    await expect(page.locator("#p-probe-result .probe-line-ok")).toContainText("Detected: openai");
+    // URL 回显: 胜出族 (openai) 的两路 GET URL 都可见 (不黑盒).
+    await expect(page.locator("#p-probe-result .probe-url")).toHaveCount(2);
+    await expect(page.locator("#p-probe-result .probe-url").last()).toContainText("/models");
+    // common_uri="" 徽标: 追加在 base_url 后, 显示 included 语义 (无可视前缀).
+    await expect(page.locator("#p-common-uri-badge")).toBeVisible();
+    await expect(page.locator("#p-common-uri-badge")).toHaveText("✓ included");
+    // 保存 → 知识落盘 (POST 带 common_uri: "").
+    await page.locator('#provider-form-el button[value="save"]').click();
+    await expect(page.locator("#provider-form")).not.toBeVisible();
+    // 重新打开: 徽标仍在 (存量 common_uri 回读, 未重跑 detect 不丢知识).
+    // data-id 精确定位 — 测试 server 的 state 跨用例共享, .first() 可能点到
+    // 其他用例创建的 provider (无 common_uri → 徽标 hidden 假失败).
+    await page.locator('button[data-action="edit"][data-id="zhipu-coding"]').click();
+    await expect(page.locator("#provider-form")).toBeVisible();
+    await expect(page.locator("#p-common-uri-badge")).toBeVisible();
+    await expect(page.locator("#p-common-uri-badge")).toHaveText("✓ included");
+  });
+
+  test("Detect: base_url 编辑作废 common_uri 徽标", async ({ page }) => {
+    await page.goto("/");
+    await page.locator('a.tab[data-tab="providers"]').click();
+    await openNewProviderForm(page);
+    await page.locator("#p-base-url").fill(fastUpstream.url);
+    await page.locator("#p-detect").click();
+    await expect(page.locator("#p-common-uri-badge")).toBeVisible();
+    await expect(page.locator("#p-common-uri-badge")).toHaveText("+/v1");
+    // 复制 flash 后 'copied' class 必须复位 (M-A 守卫: 反转色不得永久滞留).
+    await page.locator("#p-common-uri-badge").click();
+    await expect(page.locator("#p-common-uri-badge")).toHaveText("✓ copied");
+    await expect(page.locator("#p-common-uri-badge")).toHaveText("+/v1", { timeout: 3000 });
+    await expect(page.locator("#p-common-uri-badge")).not.toHaveClass(/copied/);
+    // 编辑 base_url → 探测结果对新 URL 不再成立, 徽标作废隐藏.
+    await page.locator("#p-base-url").fill("http://127.0.0.1:19996");
+    await expect(page.locator("#p-common-uri-badge")).toBeHidden();
   });
 });

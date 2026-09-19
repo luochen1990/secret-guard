@@ -58,9 +58,14 @@ PATCH  /api/providers/{id}/decision
 POST   /api/providers/probe          body: {base_url, api_key?} →
                                          {probes[4] (openai/anthropic/gemini/ollama,
                                           status: ok|auth_failed|absent|error,
-                                          models?, detail?), recommended?, note?}
+                                          models?, detail?, urls[]),
+                                          recommended?, note?, common_uri?}
                                          (协议自动探测; 失败是数据不是 HTTP 错误 — 恒 200,
-                                          仅非法 base_url → 400; 算法在 proxy::models)
+                                          仅非法 base_url → 400; 算法在 proxy::models.
+                                          urls = 该族实际 GET 的完整 URL (不黑盒回显);
+                                          common_uri = recommended 族的布局断言
+                                          ("/v1"|"" — detect 知识, 保存落盘为
+                                          DirectProvider.common_uri)
 PUT    /api/providers/probe          → 同 PUT /api/providers/{id}, 固定 id="probe"
 DELETE /api/providers/probe          → 同 DELETE /api/providers/{id}, 固定 id="probe"
                                           (静态段优先于 {id} 参数段, 该 id 的编辑/删除只能
@@ -244,9 +249,16 @@ API key CRUD **无条件挂载** (在 `web::router()`, 不依赖 `auth.enabled`)
   拦截, 不依赖后端 400). Direct 分支不发 `routes` / `members` — 构造切换的显式取消
   例外见上方 "构造切换的显式取消" 条.
 - **Detect 协议探测** (Direct 字段组): `POST /api/providers/probe` (base_url + 当前
-  api_key) 手动触发; recommended 只自动填入 `#p-protocol` (建议非命令, 用户可手改),
-  另附模型 chips 预览 (MVP 深度 = 浏览 + 点击复制). dialog 每次打开清空结果区; 表单
-  值变更后旧结果不自动清除 (下次点击以当前表单值覆盖).
+  api_key) 手动触发; recommended 只自动填入 `#p-protocol` (建议非命令, 用户可表单
+  底部的 Protocol select 手改 — 字段排在探测结果之后, detect → 结果 → protocol 的
+  视觉链), 另附模型 chips 预览 (MVP 深度 = 浏览 + 点击复制). 每行结果回显该族全部
+  探测 URL (`GET {url}` 子行 — 不黑盒, 全 404 时用户可对照调整 base_url); 无推荐时
+  附引导 hint. common_uri 知识链: detect → `state.probeCommonUri` 暂存 (badge 以
+  `+/v1` / `✓ included` 追加回显在 base_url 输入框后, 点击复制 base_url+common_uri
+  整体) → 保存 payload 全量携带 (PUT null = 未探测, 前端编辑回填 effective 原值
+  实现"保留") → 后端 `DirectProvider.common_uri` 落盘 → fetch_model_list fast path.
+  base_url 编辑作废暂存 (探测结果只对被探测 URL 成立). dialog 每次打开清空结果区
+  并重置暂存自 existing; 表单值变更后旧结果不自动清除 (下次点击以当前表单值覆盖).
 - **列表 router 行**: URL 列渲染路由摘要 `model_pattern → target · egress` (禁用路由主文本
   删除线; 超过 2 条折叠为首条 + "+N more", 全量在 td title). egress 是**展示近似** —
   从路由 target 出发 walk 链尾 Direct 的 protocol (中间 router 取最高优先级启用

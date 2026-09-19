@@ -79,6 +79,7 @@ fn openai_provider(id: &str, base_url: &str) -> Provider {
             base_url: base_url.into(),
             api_key: "sk-test-key".into(),
             api_key_file: None,
+            common_uri: None,
         }),
     }
 }
@@ -93,6 +94,7 @@ fn provider_with(id: &str, proto: Protocol, base_url: &str) -> Provider {
             base_url: base_url.into(),
             api_key: String::new(),
             api_key_file: None,
+            common_uri: None,
         }),
     }
 }
@@ -759,6 +761,7 @@ async fn provider_api_key_file_reads_secret_from_path() {
             base_url: upstream.url(),
             api_key: String::new(),
             api_key_file: Some(key_file.clone()),
+            common_uri: None,
         }),
     };
     let proxy_url = spawn_proxy_with_provider(provider).await;
@@ -798,6 +801,7 @@ async fn provider_api_key_file_missing_falls_through_to_no_auth() {
             base_url: upstream.url(),
             api_key: String::new(),
             api_key_file: Some(std::path::PathBuf::from("/nonexistent/secret-guard-test")),
+            common_uri: None,
         }),
     };
     let proxy_url = spawn_proxy_with_provider(provider).await;
@@ -834,6 +838,7 @@ async fn anthropic_provider_uses_x_api_key() {
             base_url: upstream.url(),
             api_key: "sk-ant-test".into(),
             api_key_file: None,
+            common_uri: None,
         }),
     };
     let proxy_url = spawn_proxy_with_provider(provider).await;
@@ -4490,7 +4495,7 @@ async fn providers_probe_api_end_to_end_openai() {
         .expect(1)
         .create_async()
         .await;
-    for path in ["/v1beta/models", "/api/tags"] {
+    for path in ["/models", "/v1beta/models", "/api/tags"] {
         upstream
             .mock("GET", path)
             .with_status(404)
@@ -4521,6 +4526,24 @@ async fn providers_probe_api_end_to_end_openai() {
     assert_eq!(names, ["openai", "anthropic", "gemini", "ollama"]);
     assert_eq!(body["probes"][0]["status"], "ok");
     assert_eq!(body["probes"][0]["models"][0], "gpt-4o");
+    // urls 回显: v1 pair 双路径两族共享, gemini/ollama 单路.
+    let urls: Vec<&str> = body["probes"][0]["urls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        urls,
+        [
+            format!("{}/v1/models", upstream.url()),
+            format!("{}/models", upstream.url())
+        ]
+    );
+    assert_eq!(
+        body["probes"][2]["urls"][0],
+        format!("{}/v1beta/models", upstream.url())
+    );
     assert_eq!(body["probes"][1]["status"], "absent");
     assert_eq!(body["probes"][2]["status"], "absent");
     assert_eq!(body["probes"][3]["status"], "absent");
@@ -4528,12 +4551,12 @@ async fn providers_probe_api_end_to_end_openai() {
     assert!(body["note"].is_null());
 }
 
-/// 探测全失败 (上游三个端点全部 500) 仍是 200 — 失败是数据不是 HTTP 错误,
+/// 探测全失败 (上游四个端点全部 500) 仍是 200 — 失败是数据不是 HTTP 错误,
 /// recommended 为 null.
 #[tokio::test]
 async fn providers_probe_api_all_failures_still_200() {
     let mut upstream = spawn_mock_upstream().await;
-    for path in ["/v1/models", "/v1beta/models", "/api/tags"] {
+    for path in ["/v1/models", "/models", "/v1beta/models", "/api/tags"] {
         upstream
             .mock("GET", path)
             .with_status(500)

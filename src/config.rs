@@ -1509,6 +1509,7 @@ fn serialized_full_sample_paths() -> Vec<String> {
                     base_url: "http://127.0.0.1:1".into(),
                     api_key: "sk-sample".into(),
                     api_key_file: Some("/dev/null".into()),
+                    common_uri: None,
                 }),
             },
             // Router 构造 (routes 全字段: model_pattern/target/upstream_model/priority 都序列化,
@@ -2498,6 +2499,7 @@ output = 0.5
                 base_url: "https://api.openai.com".into(),
                 api_key: "sk-test".into(),
                 api_key_file: None,
+                common_uri: None,
             }),
         });
         // #187 sum type 持久化守卫: Router (flatten + internally tagged + 嵌套
@@ -2601,6 +2603,7 @@ output = 0.5
                     base_url: "http://up".to_string(),
                     api_key: String::new(),
                     api_key_file: None,
+                    common_uri: None,
                 }),
             }
         }
@@ -3220,6 +3223,7 @@ mod proptests {
                 base_url: base_url.into(),
                 api_key: format!("k-{id}"),
                 api_key_file: None,
+                common_uri: None,
             }),
         }
     }

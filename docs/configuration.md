@@ -142,6 +142,7 @@ fail-fast), 对应构造的字段写在同一个 `[[providers]]`
 | `base_url` | string | (必填) | 上游 base URL. 必须以 `http://` 或 `https://` 开头, **末尾不带 `/`** (路径由 secret-guard 拼接). 如 `https://api.openai.com`. |
 | `api_key` | string | `""` | 上游 API key 明文. 与 `api_key_file` 互斥 (同时设置启动报错). |
 | `api_key_file` | path | — | 从文件读 API key (适合 sops-nix / systemd LoadCredential 等外部注入, 让 toml 本身不含敏感数据). 每次请求时读取, 读不到按空 key 处理并打 WARN. 文件内容自动去首尾空白. |
+| `common_uri` | string | — | secret-guard **自建请求** (拉取上游模型清单, 用于 router `/models` 合成) 的公共 URI 前缀, 即三段式 `base_url + common_uri + request_uri` 的中段. **不影响转发** (转发路径随客户端请求原样透传). `"/v1"` = 裸根布局 (OpenAI/Anthropic 官方形态); `""` = 版本前缀已含 (智谱 GLM coding plan / DeepSeek / Moonshot 等, models 端点 = `base + /models`); 任意 `/` 开头的自定义前缀 (如智谱老接口 `/api/paas/v4`) 也合法. 缺省 = 未探测, 运行时按 `"/v1"` → `""` 顺序自动推导. 通常无需手写 — WebUI 的 Detect 按钮探测后自动填充并随保存落盘 (badge 追加回显在 base_url 输入框后). 值域校验: `""` 或以 `/` 开头的 path 片段 (无尾斜杠, 不含 `?`/`#`/空格, ≤64 字符). **注意**: WebUI/API 的 PUT 是全量语义 — 请求不带此字段 (= null) 即清除为未探测; SDK 脚本编辑 provider 时请先读回原值再整体提交. |
 
 **Router 构造** (`kind = "router"`) — 无 protocol / base_url / api_key 字段:
 

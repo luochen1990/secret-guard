@@ -116,6 +116,7 @@ fn direct_provider(id: &str, proto: Protocol, base_url: &str) -> Provider {
             base_url: base_url.into(),
             api_key: "sk-test".into(),
             api_key_file: None,
+            common_uri: None,
         }),
     }
 }
