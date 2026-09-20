@@ -167,17 +167,50 @@ pub struct GenSpec {
 
 impl GenSpec {
     /// 从 real secret 推断默认 gen spec:
-    /// `prefix=global_prefix`, `charset=infer_from(real)`,
+    /// `prefix=global_prefix`, `charset=infer_from(real)` (**+ widen 兜底**),
     /// `length_range=(global_prefix.chars + n, ...)` (mock 总长 = global_prefix + real 等长 body).
     ///
     /// `global_prefix` 来自 `[redact] global_mock_prefix` 配置 (默认空串).
     /// 让 Auto 模式生成的 mock 带可配置的统一前缀, 便于在日志 / WebUI 中视觉辨识.
+    ///
+    /// # Auto widen 兜底 (2026-09, 生成器扩宽发现的老缺陷)
+    ///
+    /// 退化 real (全同字符, 如 `""""`) 推断出单字符 charset → 等长候选空间 = 1,
+    /// 唯一候选 == real 本身 → probing 必拒 → 耗尽 (fail_closed 下 503).
+    /// Auto 的产品语义是**开箱即用**, 不应要求用户懂 charset 配置, 故推断后
+    /// 候选空间 < [`MIN_CANDIDATE_SPACE_WARN`] 时逐级并入标准类
+    /// (lowercase → digits → uppercase), 直到达标或全部并入.
+    /// - 与 lint 阈值对齐 ⇒ Auto 模式永不落入弱配置区 (lint 只对手动配置有意义);
+    /// - widen 是 (real, prefix) 的纯函数 ⇒ C3 确定性保持;
+    /// - 空间充足的 secret 不触发 ⇒ 已生成的 mock 不变, 前缀缓存兼容;
+    /// - 并入只增不减 (charset ⊇ real 字符) ⇒ 仿真度单调不降;
+    /// - 极短 real (n ≤ 3: 全开标准类后 65³ ≈ 27 万仍 < 2^20) 兜到"最大可达"即停 —
+    ///   等长约束下空间上限 = charset_size^n, 属物理边界 (n ≥ 4 恒可达标: 62⁴ ≈ 1480 万),
+    ///   残余由 fail_closed 兜底.
     pub fn infer_default_for(real: &str, global_prefix: &str) -> Self {
         let n = real.chars().count();
         let prefix_len = global_prefix.chars().count();
+        let mut charset = Charset::infer_from(real);
+        // body 候选空间 = charset_size^n (等长, 与 candidate_space 的单区间项一致).
+        // saturating_pow: 空间封顶 u64::MAX, 溢出不 panic.
+        // 注: `n as u32` 对 >u32::MAX (≈4.3e9 chars, 需 ≥4GB secret) 截断 — 物理不可达.
+        let space_short = |cs: &Charset| {
+            (cs.enabled_chars().len() as u64).saturating_pow(n as u32) < MIN_CANDIDATE_SPACE_WARN
+        };
+        // 逐级并入: lowercase 可能已被 infer 开启 (如全小写 real) — 第一步 no-op,
+        // 由 recheck 驱动向 digits 推进, 自校正无需特判.
+        if space_short(&charset) {
+            charset.lowercase = true;
+        }
+        if space_short(&charset) {
+            charset.digits = true;
+        }
+        if space_short(&charset) {
+            charset.uppercase = true;
+        }
         Self {
             prefix: global_prefix.to_string(),
-            charset: Charset::infer_from(real),
+            charset,
             length_range: (prefix_len + n, prefix_len + n),
         }
     }
@@ -292,8 +325,14 @@ impl GenSpec {
 }
 
 impl MockStrategy {
-    /// 配置期 lint: Auto 模式下 gen spec 的候选空间 < [`MIN_CANDIDATE_SPACE_WARN`]
-    /// 时返回 `Some` (弱配置信号). **纯函数不直接打日志**, 由调用方 WARN — 便于单元测试.
+    /// 配置期 lint: gen spec 的候选空间 < [`MIN_CANDIDATE_SPACE_WARN`] 时返回
+    /// `Some` (弱配置信号). **纯函数不直接打日志**, 由调用方 WARN — 便于单元测试.
+    ///
+    /// # 语义边界 (Auto widen 后)
+    ///
+    /// Auto 推断路径经 [`GenSpec::infer_default_for`] 的 widen 兜底, resolve 后
+    /// 空间恒 ≥ 阈值 (极短 real 的物理边界除外) — Auto 场景实际不再触发本 lint;
+    /// lint 的有效对象是**用户手动配置**的 gen_spec (`lint_explicit_weak_spec_is_some`).
     ///
     /// # 调用前提 (无重复 resolve 副作用)
     ///
@@ -592,6 +631,47 @@ mod tests {
         assert!(cs.is_empty());
     }
 
+    /// widen 兜底: 退化 real 推断空间 1 → 拓宽到 ≥ 阈值 (机制与不变量见
+    /// `GenSpec::infer_default_for` doc; lint 有效范围见 `lint_candidate_space` doc).
+    #[test]
+    fn infer_default_widens_degenerate_charset() {
+        // real = 4 个双引号: infer 出 other=['"'] 单字符, 空间 1^4 = 1.
+        // 停在 lowercase+digits: (1+26+10)^4 = 37^4 ≈ 187 万 ≥ 2^20, uppercase 不开
+        // (最小拓宽断言 — 防"一刀切全开"回归静默扩大缓存失效面).
+        let spec = GenSpec::infer_default_for("\"\"\"\"", "");
+        assert!(spec.candidate_space() >= MIN_CANDIDATE_SPACE_WARN);
+        assert!(spec.charset.lowercase && spec.charset.digits && !spec.charset.uppercase);
+        // widen 只并入标准类, real 的字符仍在池中 (仿真度: charset ⊇ real 字符).
+        assert!(spec.charset.enabled_chars().contains(&'"'));
+    }
+
+    /// 空间充足的典型 secret 不触发 widen (行为/缓存兼容: 已生成的 mock 不变).
+    #[test]
+    fn infer_default_no_widen_when_space_sufficient() {
+        // 32 位混合 charset API key: 62^32 >> 2^20.
+        let real = "sk-A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6";
+        let spec = GenSpec::infer_default_for(real, "");
+        assert_eq!(spec.charset, Charset::infer_from(real));
+    }
+
+    /// 短 real 的固有边界 (n ≤ 3): 全开标准类也达不到阈值 — widen 兜到
+    /// "最大可达"即停 (等长约束下空间上限 = charset_size^n, 物理边界).
+    #[test]
+    fn infer_default_widen_stops_at_physical_limit() {
+        let spec = GenSpec::infer_default_for("a", "");
+        // 1 字符 body 全开 (62 标准字符) 候选 62 < 2^20: widen 并完全部标准类后停止.
+        assert!(spec.charset.lowercase && spec.charset.digits && spec.charset.uppercase);
+    }
+
+    /// unicode 退化 real: 4 个相同 CJK 字符 (other=['密'], 多字节按 char 计数 = 1)
+    /// 同样走 widen — charset 处理与 ASCII 无关 (enabled_chars 按 char, 非 byte).
+    #[test]
+    fn infer_default_widens_unicode_degenerate_charset() {
+        let spec = GenSpec::infer_default_for("密密密密", "");
+        assert!(spec.candidate_space() >= MIN_CANDIDATE_SPACE_WARN);
+        assert!(spec.charset.enabled_chars().contains(&'密'));
+    }
+
     #[test]
     fn charset_enabled_chars_order() {
         let cs = Charset {
@@ -665,7 +745,11 @@ mod tests {
     fn genspec_infer_default_empty_real() {
         let gen_spec = GenSpec::infer_default_for("", "");
         assert_eq!(gen_spec.length_range, (0, 0));
-        assert!(gen_spec.charset.is_empty());
+        // 空 real: n=0 时空间恒 1 < 阈值, widen 全开标准类 (空 real 在生产路径
+        // 被 redact_ir_inner 的 !value.is_empty() 过滤, 此形态仅测试可达).
+        assert!(
+            gen_spec.charset.lowercase && gen_spec.charset.digits && gen_spec.charset.uppercase
+        );
     }
 
     #[test]
@@ -876,24 +960,29 @@ mod tests {
     }
 
     #[test]
-    fn lint_auto_degenerate_real_is_some() {
-        // Auto + 退化 real "aaaa": infer 出 lowercase 类 (26 字符), 空间 26^4 = 456976
-        // 仍低于 2^20 → lint.
+    fn lint_auto_degenerate_real_widened_not_linted() {
+        // Auto + 退化 real (widen 后语义): n ≥ 4 的退化 real resolve 后恒不可 lint
+        // (widen 兜底; 机制见 GenSpec::infer_default_for, lint 有效范围见
+        // lint_candidate_space 语义边界段). n ≤ 3 物理边界除外 (见尾部).
+        // "aaaa": infer lowercase (26^4 = 456976 < 2^20) → widen 并入 digits →
+        // 36^4 = 1679616 ≥ 2^20 → 停.
         let mut s = MockStrategy::default();
         s.resolve_against("aaaa", "");
-        let lint = s
-            .lint_candidate_space()
-            .expect("degenerate real should lint");
-        assert_eq!(lint.charset_size, 26);
-        assert_eq!(lint.space, 456_976);
-        // 全 "other" 字符的退化 real: charset 退化为单字符 '!' → 空间 1.
+        assert!(s.lint_candidate_space().is_none());
+        // 全 "other" 字符的退化 real: infer 单字符 '!' (空间 1) → widen 并入
+        // lowercase+digits ((1+26+10)^4 = 37^4 ≈ 187 万 ≥ 2^20) → 停, uppercase 未开.
         let mut s = MockStrategy::default();
         s.resolve_against("!!!!", "");
+        assert!(s.lint_candidate_space().is_none());
+        // **n=3 物理边界**: "abc" 全小写无 other, 全开后 62³ = 238,328 仍 < 2^20 —
+        // (65³ ≈ 27.5 万是 n=3 含 other 的理论上界, 见 infer_default_for doc) —
+        // Auto 极短 real 在全开兜底后仍 lint (边界语义钉住, 防 widen/阈值漂移).
+        let mut s = MockStrategy::default();
+        s.resolve_against("abc", "");
         let lint = s
             .lint_candidate_space()
-            .expect("degenerate real should lint");
-        assert_eq!(lint.charset_size, 1);
-        assert_eq!(lint.space, 1);
+            .expect("n=3 real 全开仍低于阈值, 应 lint");
+        assert!(lint.space < MIN_CANDIDATE_SPACE_WARN);
     }
 
     #[test]

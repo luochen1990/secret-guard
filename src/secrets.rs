@@ -735,9 +735,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_and_resolve_auto_degenerate_real_lintable() {
-        // Auto + 退化 real "aaaa": infer 出 lowercase 类 (26 字符) × len 4 = 456976 候选,
-        // 仍低于 2^20 → validate_and_resolve 后 lint 可触发.
+    fn validate_and_resolve_auto_degenerate_real_not_lintable() {
+        // Auto + 退化 real "aaaa" (2026-09 widen 后的新语义): infer lowercase (26^4
+        // = 456976 < 2^20) → widen 并入 digits → 36^4 ≥ 2^20 → resolve 后恒不可
+        // lint (Auto 永不弱配置; lint 有效对象是手动配置的 gen_spec).
         let mut e = SecretEntry {
             id: "degenerate".into(),
             name: None,
@@ -747,12 +748,10 @@ mod tests {
             mock_strategy: crate::mock::MockStrategy::default(),
         };
         assert!(e.validate_and_resolve("").is_ok());
-        let lint = e
-            .mock_strategy
-            .lint_candidate_space()
-            .expect("degenerate real should be lintable after validate_and_resolve");
-        assert_eq!(lint.space, 456_976);
-        assert_eq!(lint.charset_size, 26);
+        assert!(
+            e.mock_strategy.lint_candidate_space().is_none(),
+            "Auto widen 兜底后退化 real 不再产生弱配置 lint"
+        );
     }
 
     #[test]

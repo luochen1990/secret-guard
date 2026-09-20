@@ -423,7 +423,7 @@ Pool 不进此本地终结分支 (Router 专属) — pool 入口的 /models 经 
 | `provider.rs` | Provider sum type (Direct 直连·多协议端点 `endpoints` + `select_endpoint` 端点选择 \| Router 路由 \| Pool 套餐池) + Route (model_pattern 通配 / priority / 路由级 upstream_model 重写) + PoolProvider/ExhaustConfig 与内置默认信号表常量 + Effective view + api_key 两来源 (Direct 条目级, 全端点共享) + `resolve_route` 路由链解析 (per-request; Router 跳按请求 model 匹配 + model 重写 pipeline, Pool 跳经 `PoolPicker` 状态机选成员) | 文件头部 `//!` |
 | `pool.rs` | Pool Provider 运行时: 成员状态机 `PoolStates` (顺序 failover pick + 耗尽闹钟 + 配置对齐重建, 内存态不持久化) + 三通道耗尽信号检测器 `detect_exhaustion` (纯函数, ROB) + `PoolWatch` 响应侧旁路检测编排 + 观察面 (member_status / reset) | 文件头部 `//!` (含内置默认信号表语义域 + "提取宽判别严" 设计依据) + contracts.md **POOL-*** |
 | `secrets.rs` | SecretEntry 实体 + Effective view + value 两来源 | 文件头部 `//!` |
-| `mock.rs` | MockStrategy 两维度 (初始值 + 生成策略) + 确定性 seed + `[redact] global_mock_prefix` 注入 + GenSpec 候选空间配置期 lint (WARN, 弱 mock 策略前置暴露) | 文件头部 `//!` (C3 根基) |
+| `mock.rs` | MockStrategy 两维度 (初始值 + 生成策略) + 确定性 seed + `[redact] global_mock_prefix` 注入 + Auto widen 兜底 (退化 charset 候选空间 < 2^20 时逐级拓宽, Auto 永不弱配置) + GenSpec 候选空间配置期 lint (WARN, 有效对象为手动配置) | 文件头部 `//!` (C3 根基) |
 | `dag/` (模块目录: mod/pool/types/view/timeline) | ConversationDAG 内容寻址存储 (BlockPool + Node + Merkle) | `src/dag/mod.rs` 头部 `//!` + `docs/design/conversation-dag.md` |
 | `derive.rs` | 从 request body 派生 preview/model/text 的字节级提取 + delta messages 切片 (域 B 派生链, ROB-1 永不 panic) | 文件头部 `//!` (含 "为什么不在 web::api" 归属论证) |
 | `dto.rs` | WebUI 响应 DTO 中立类型层 (SessionView/NodeView/.../SyncSnapshot, 域 B → 域 C wire shape; 构造逻辑留 dag) | 文件头部 `//!` (含 "为什么是顶层中立模块" 归属论证) |
@@ -847,9 +847,15 @@ CI runner VM 未预装 treefmt 时 check-fmt 降级 rust-only (见 justfile).
   WebUI timeline 仍能显示 preview / role, 但不渲染增量气泡 (与跨协议 ingress 的 delta 限制一致).
 - **Mock probing 耗尽 (默认 fail-closed 拒绝转发, SEC-10)**: 弱配置 (charset/length 仅产生
   极少候选) + 对抗性 IR 可能让 `redact_ir` 的 mock probing 耗尽 (`MOCK_PROBE_LIMIT`).
-  配置写入时 (static 加载 / WebUI upsert) 会对 GenSpec 候选空间做 lint WARN
+  两道前置防线: ① **Auto widen 兜底** (2026-09, `GenSpec::infer_default_for`):
+  推断 charset 候选空间 < 2^20 时逐级并入 lowercase → digits → uppercase —
+  Auto 模式 resolve 后空间恒 ≥ 阈值 (退化 real 如全同字符 `""""` 也不再耗尽);
+  极短 real (n ≤ 3: 全开后 65³ ≈ 27 万仍 < 2^20) 是等长约束下的物理边界,
+  兜到全开即停 — 该形态 Auto resolve 后仍会触发 lint WARN; ② 配置写入时
+  (static 加载 / WebUI upsert) 对 GenSpec 候选空间做 lint WARN
   (`MockStrategy::lint_candidate_space`, 阈值 `MIN_CANDIDATE_SPACE_WARN` = 2^20,
-  低于即 WARN, 不拒绝) — 把这类弱配置前置暴露.
+  低于即 WARN, 不拒绝) — widen 后 Auto 场景实际不触发, lint 的有效对象是
+  **用户手动配置**的 gen_spec.
   默认 `[redact] on_probe_exhausted = "fail_closed"` (**拒绝转发**, 返回 503, 防止
   secret 泄露到 LLM provider, SEC-10 降级偏安全 — 2026-09 自 fail_open 翻转; 配置期
   lint 已把弱配置拦截在写入时, 运行时残余正是对抗场景). 历史 fail-open 行为 (warn +

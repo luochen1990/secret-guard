@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 298e27e041747ce23e2cd5099341fb158749a91a792fef0592007163eb67c2e0 # shrinks to secret = "AaaaaAaA"
+cc 9d0d206585d139ea75703a1e6b4f211fd36bf82eb147c73aac8b2dafa4ae2306 # shrinks to secret = "\"\"\"\"", filler = ""
