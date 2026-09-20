@@ -327,6 +327,11 @@
     }
     .ep-gap { flex: 1; }
     .ep-url { display: flex; align-items: stretch; gap: 6px; margin-top: 8px; min-width: 0; }
+    /* direct 端点行 URL 行的 upstream ↤ entry 分隔箭头 (自对齐居中, 不随 code 拉伸). */
+    .ep-arrow {
+      flex: none; align-self: center;
+      color: var(--fg-faint); font-size: 12px;
+    }
     .ep-url > code {
       flex: 1; min-width: 0;
       font-size: 12px;
@@ -4955,14 +4960,15 @@
       }, null);
     }
 
-    // 从 provider id 出发 walk 到链尾 Direct 的 protocol (**展示近似**, #179):
-    // 中间 router 取其最高优先级启用路由的目标继续走 (忽略路由 upstream_model 重写
-    // 对后续跳匹配的影响 — 展示无需 per-model 精确解析); 中间 pool 取**首个成员**
-    // (配置序近似 — 运行时状态的耗尽切换不进此派生, 列表徽章才呈现运行时);
-    // 防环 seen set; 悬空 / 无启用路由 / 空成员 / 链尾非 Direct → null (调用方
-    // 渲染 '?' 或降级 'unsupported').
-    // 假设: providersList 已在手且与后端一致 (本地派生, 无额外 fetch).
-    function chainTailProtocol(startId) {
+    // 从 provider id 出发 walk 到链尾 Direct 的 **端点集合** (**展示近似**, #179 +
+    // multi-endpoint): 中间 router 取其最高优先级启用路由的目标继续走 (忽略路由
+    // upstream_model 重写对后续跳匹配的影响 — 展示无需 per-model 精确解析); 中间
+    // pool 取**首个成员** (配置序近似 — 运行时状态的耗尽切换不进此派生, 列表徽章
+    // 才呈现运行时); 防环 seen set; 悬空 / 无启用路由 / 空成员 / 链尾非 Direct →
+    // null (调用方渲染 '?' 或降级)。链尾 Direct 多端点时返回全部端点 (集合近似:
+    // 任一端点协议都可能是某 ingress 的 egress — D2 fallback 见 ingressMode)。
+    // 假设: providersList 已在手且与后端一致 (本地派生, 无额外 fetch)。
+    function chainTailEndpoints(startId) {
       let cur = state.providersList.find(x => x.id === startId);
       const seen = new Set();
       while (cur && !seen.has(cur.id)) {
@@ -4980,38 +4986,52 @@
           return null;
         }
       }
-      return cur && cur.kind === 'direct' ? cur.protocol : null;
+      return cur && cur.kind === 'direct' ? (cur.endpoints || []) : null;
     }
 
-    // 一组 provider id 的 egress pill 文本: 各 id (链尾近似) 的去重集合. 单一 →
-    // 该 protocol; 多个 → 短列表逗号连接, 放不下 (cell-short 溢出) → 'mixed';
-    // 悬空目标计入 '?'. router 行 (各 route target) 与 pool 行 (各 member) 共用.
-    function egressLabelOf(ids) {
-      const set = [...new Set(ids.map(t => chainTailProtocol(t) ?? '?'))];
+    // 端点数组的协议列表 (null 安全 — 各调用点的空值合并噪音收口于此).
+    const endpointProtocols = eps => (eps || []).map(e => e.protocol);
+
+    // protocol 集合 → pill/egress 文本: 空 → '?'; 单一 → 该 protocol; 多个 →
+    // 短列表逗号连接, 放不下 (cell-short 溢出) → 'mixed'. router/pool 行 egress
+    // pill 与 per-route egress 后缀共用 (multi-endpoint: 链尾 Direct 的端点集合
+    // 去重展示 — 集合近似, 不区分 ingress→端点的映射).
+    function protocolSetLabel(protos) {
+      const set = [...new Set(protos)];
       if (set.length === 0) return '?';
       if (set.length === 1) return set[0];
       const joined = set.join(', ');
       return joined.length <= 24 ? joined : 'mixed';
     }
 
+    // 一组 provider id 的 egress pill 文本: 各 id 链尾端点集合 (chainTailEndpoints
+    // 近似) 的协议并集. 悬空目标不计入 (全悬空 → protocolSetLabel 的 '?' 保底).
+    // router 行 (各 route target) 与 pool 行 (各 member) 共用.
+    function egressLabelOf(ids) {
+      return protocolSetLabel(
+        ids.flatMap(t => endpointProtocols(chainTailEndpoints(t))));
+    }
+
     // 摘要折叠阈值: 超过 2 条路由时只显示首条 + "+N more" (全量在 td title).
     const ROUTES_SUMMARY_MAX = 2;
 
-    // router 行的 URL 列: 路由摘要. 每条 "model_pattern → target · egress" (egress 为
-    // chainTailProtocol 近似, 悬空 → '?'); 禁用路由 (priority null) 主文本加 <s>
-    // 删除线. 沿用 cell-long + cell-ellipsis 溢出模式, td title 看全量.
+    // router 行的 URL 列: 路由摘要. 每条 "model_pattern → target · egress" (egress
+    // 为 chainTailEndpoints 近似的协议集合文案, 悬空 → '?'); 禁用路由 (priority
+    // null) 主文本加 <s> 删除线. 沿用 cell-long + cell-ellipsis 溢出模式, td title
+    // 看全量.
     function routerRoutesCell(routes) {
+      const egressOf = r =>
+        protocolSetLabel(endpointProtocols(chainTailEndpoints(r.target)));
       const renderRoute = (r) => {
-        const egress = chainTailProtocol(r.target) ?? '?';
         const main = `${escapeHtml(r.model_pattern)} → ${escapeHtml(r.target)}`;
         return (r.priority == null ? `<s>${main}</s>` : main)
-          + ` <span class="route-egress" title="${escapeHtml(EGRESS_CROSS_PROTO_TIP)}">· ${escapeHtml(egress)}</span>`;
+          + ` <span class="route-egress" title="${escapeHtml(EGRESS_CROSS_PROTO_TIP)}">· ${escapeHtml(egressOf(r))}</span>`;
       };
       const shown = routes.length > ROUTES_SUMMARY_MAX
         ? [renderRoute(routes[0]), `<span class="meta">+${routes.length - ROUTES_SUMMARY_MAX} more</span>`]
         : routes.map(renderRoute);
       const full = routes
-        .map(r => `${r.priority == null ? '(disabled) ' : ''}${r.model_pattern} → ${r.target} [${chainTailProtocol(r.target) ?? '?'}]`)
+        .map(r => `${r.priority == null ? '(disabled) ' : ''}${r.model_pattern} → ${r.target} [${egressOf(r)}]`)
         .join('; ');
       return `<td class="cell-long" title="${escapeHtml(full)}"><span class="cell-ellipsis"><code>${shown.join('; ')}</code></span></td>`;
     }
@@ -5070,14 +5090,29 @@
       return `<td class="cell-long" title="${escapeHtml(full)}"><span class="cell-ellipsis"><code>${shown.join('; ')}</code></span></td>`;
     }
 
+    // direct 行的 protocol/url 两格渲染 (有效行与 disabled 行共用 — 展示同型,
+    // 后者只是无行内 actions): 每端点一枚 protocol pill (集合展示, tooltip 附该
+    // 端点 base_url); URL cell 显示第一端点 base_url (声明序 = fallback 序) +
+    // "+N" 角标 (td title 全量 `protocol: base_url` 列表).
+    function directProviderCells(p) {
+      const eps = p.endpoints || [];
+      const full = eps.map(e => `${e.protocol}: ${e.base_url}`).join(' | ');
+      const protoCell = `<td class="cell-short">${eps.map(e =>
+        `<span class="pill" title="endpoint: ${escapeHtml(e.base_url)} (same-protocol passthrough)">${escapeHtml(e.protocol)}</span>`).join(' ')}</td>`;
+      const urlCell = `<td class="cell-long" title="${escapeHtml(full)}"><span class="cell-ellipsis"><code>${escapeHtml(eps[0]?.base_url || '')}</code></span>`
+        + (eps.length > 1 ? ` <span class="meta" title="${escapeHtml(`+${eps.length - 1} more endpoint(s) — full list in this tooltip`)}">+${eps.length - 1}</span>` : '')
+        + `</td>`;
+      return { protoCell, urlCell };
+    }
+
     function renderProviderRow(p) {
       const rowCls = rowClass(p.source);
-      // #179/#183/#187: sum type — kind 判别 ('direct' | 'router' | 'pool').
-      // router: 无 protocol 字段 — pill 显示路由 egress 去重集合 + router 徽标,
+      // #179/#183/#187 + multi-endpoint: sum type — kind 判别 ('direct' | 'router' | 'pool').
+      // router: 无 endpoints 字段 — pill 显示路由 egress 去重集合 + router 徽标,
       //   URL 列显示路由摘要 (per-route egress 近似, 见 routerRoutesCell);
       // pool: pill 显示成员 egress 去重集合 + pool 徽标, URL 列显示成员清单 +
       //   运行时状态徽章 (poolMembersCell), actions 附 reset 按钮;
-      // direct: protocol pill + base_url 原样展示.
+      // direct: 每端点一枚 pill + 第一端点 base_url (+N 角标, directProviderCells).
       const kind = p.kind;
       let protoCell;
       let urlCell;
@@ -5098,8 +5133,7 @@
           + `</td>`;
         urlCell = poolMembersCell(members, p.pool_status);
       } else {
-        protoCell = `<td class="cell-short"><span class="pill">${escapeHtml(p.protocol)}</span></td>`;
-        urlCell = `<td class="cell-long" title="${escapeHtml(p.base_url || '')}"><span class="cell-ellipsis"><code>${escapeHtml(p.base_url)}</code></span></td>`;
+        ({ protoCell, urlCell } = directProviderCells(p));
       }
       return `
         <tr class="${rowCls}" data-id="${escapeHtml(p.id)}">
@@ -5127,7 +5161,7 @@
     }
 
     // decision=Disabled 的 static provider 行 (数据 = ProviderMasked, JSON shape 与
-    // EffectiveProvider 的 kind 部分一致: kind 判别 + direct(protocol/base_url/
+    // EffectiveProvider 的 kind 部分一致: kind 判别 + direct(endpoints[]/
     // api_key_masked) | router(routes)). 灰色删除线 + decision 下拉恒 disabled
     // (可切回复活). actions 留空 — edit 走 update_flow 会 404 (不在 effective view),
     // delete 对 static 必 409; endpoints 对 404 的 id 无意义.
@@ -5146,8 +5180,8 @@
         protoCell = `<td class="cell-short"><span class="pill" title="${POOL_PILL_TIP}">pool</span></td>`;
         urlCell = `<td class="cell-long" title="${escapeHtml(members.join(' → '))}"><span class="cell-ellipsis"><code>${escapeHtml(members.join(' → '))}</code></span></td>`;
       } else {
-        protoCell = `<td class="cell-short"><span class="pill">${escapeHtml(p.protocol)}</span></td>`;
-        urlCell = `<td class="cell-long" title="${escapeHtml(p.base_url || '')}"><span class="cell-ellipsis"><code>${escapeHtml(p.base_url)}</code></span></td>`;
+        // direct 同有效行 (directProviderCells 共用).
+        ({ protoCell, urlCell } = directProviderCells(p));
       }
       return `
         <tr class="row-disabled" data-id="${escapeHtml(p.id)}">
@@ -5374,17 +5408,23 @@
     // 暴露 codec 支持信息, 应改为 fetch 派生以消除此 SSOT 漂移点.
     const CODEC_SUPPORTED = new Set(['openai', 'anthropic', 'openairesponses']);
 
-    // #187/#179: provider 的实际 egress = 链尾实体的 protocol (入口数据
-    // providersList 已在手, 本地解析). Direct → 自身 protocol; Router →
-    // chainTailProtocol 近似 (最高优先级启用路由的链尾). 环/悬空/无启用路由 →
-    // null (endpoints 对话框降级 'unsupported', 诚实降级不 panic).
-    function resolveEgressProtocol(p) {
-      return p.kind === 'direct' ? p.protocol : chainTailProtocol(p.id);
+    // #187/#179 + multi-endpoint: provider 的实际 egress = 链尾实体的端点集合
+    // (入口数据 providersList 已在手, 本地解析). Direct → 自身 endpoints; Router →
+    // chainTailEndpoints 近似 (最高优先级启用路由的链尾). 环/悬空/无启用路由 →
+    // null (endpoints 对话框降级 — 诚实降级不 panic). Router/Pool 的矩阵行按该
+    // 集合做 per-ingress 模式判定 (见 ingressMode); Direct 条目走 per 端点行形态.
+    function resolveTailEndpoints(p) {
+      return p.kind === 'direct' ? (p.endpoints || []) : chainTailEndpoints(p.id);
     }
 
-    function ingressMode(ingress, egress) {
-      if (ingress === egress) return 'direct';
-      if (CODEC_SUPPORTED.has(ingress) && CODEC_SUPPORTED.has(egress)) return 'translate';
+    // per-ingress 模式判定 (multi-endpoint D2 语义): 链尾端点集合含 ingress →
+    // direct (同协议透传); 否则 fallback 首端点跨协议 — 双方都 codec 覆盖 →
+    // translate; 否则 unsupported. 单端点集合退化为旧单 egress 语义.
+    function ingressMode(ingress, tailEndpoints) {
+      const eps = tailEndpoints || [];
+      if (eps.some(e => e.protocol === ingress)) return 'direct';
+      const first = eps[0];
+      if (first && CODEC_SUPPORTED.has(ingress) && CODEC_SUPPORTED.has(first.protocol)) return 'translate';
       return 'unsupported';
     }
 
@@ -5400,23 +5440,45 @@
       // 关闭时清理, 避免内容残留 (SEC-* 精神: 数据不残留).
       dlg.addEventListener('close', () => { body.innerHTML = ''; }, { once: true });
       const origin = window.location.origin;
-      const egress = resolveEgressProtocol(p);
-      // 主题行: provider id (code chip 强调) + name 去重 + egress 摘要
-      // (链尾实体协议 — 跨协议行的 translate 语义由它决定).
+      // 链尾端点集合 (direct = 自身 endpoints; router/pool = chainTailEndpoints
+      // 近似) — 三处消费 (direct 行 / 矩阵行 / 主题行 egress) 一次派生共用.
+      const tail = resolveTailEndpoints(p) || [];
+      let rowsHtml = '';
+      let tailHint = '';
+      if (p.kind === 'direct') {
+        // direct 条目: 行 UI 按端点组织 (multi-endpoint) — 每行 = 一个已配置端点
+        // (同协议透传入口, 无 translate/unsupported 形态; 端点行入口按定义同协议,
+        // 连 codec 都不需要). 其他 ingress 的 fallback 翻译语义由尾部 hint 说明.
+        rowsHtml = tail.map(e => {
+          // encodeURIComponent 是 defense-in-depth: 后端 validate_id 限制 [A-Za-z0-9_-].
+          const idx = state.providerProtocols.indexOf(e.protocol);
+          const short = idx >= 0 ? state.providerShorts[idx] : '?';
+          const url = `${origin}/${short}/${encodeURIComponent(p.id)}/`;
+          return directEndpointRow(e, short, url, p.id);
+        }).join('');
+        tailHint = 'Each configured endpoint serves its own protocol via byte-exact passthrough. '
+          + 'Ingress protocols without a configured endpoint fall back to the first endpoint '
+          + '(cross-protocol translation, codec-covered pairs only).';
+      } else {
+        // router/pool 条目: 保持 5 协议入口矩阵 (链尾端点集合近似, ingressMode 按
+        // D2 fallback 判定 per-ingress 模式).
+        rowsHtml = state.providerShorts.map((short, i) => {
+          const proto = state.providerProtocols[i];
+          const mode = ingressMode(proto, tail);
+          const url = mode === 'unsupported'
+            ? null
+            : `${origin}/${short}/${encodeURIComponent(p.id)}/`;
+          return endpointRow(proto, short, mode, url, endpointProtocols(tail), p.id);
+        }).join('');
+      }
+      // 主题行: provider id (code chip 强调) + name 去重 + egress 摘要 (链尾端点
+      // 集合的协议并集 — 集合文案见 protocolSetLabel, 空集 → '?').
       subject.innerHTML =
         `<span>Provider</span><code>${escapeHtml(p.id)}</code>` +
         (p.name && p.name !== p.id ? `<span>· ${escapeHtml(p.name)}</span>` : '') +
-        `<span>· egress</span><code>${escapeHtml(egress || '?')}</code>`;
-      const rows = state.providerShorts.map((short, i) => {
-        const proto = state.providerProtocols[i];
-        const mode = ingressMode(proto, egress);
-        // encodeURIComponent 是 defense-in-depth: 后端 validate_id 限制 [A-Za-z0-9_-].
-        const url = mode === 'unsupported'
-          ? null
-          : `${origin}/${short}/${encodeURIComponent(p.id)}/`;
-        return endpointRow(proto, short, mode, url, egress, p.id);
-      }).join('');
-      body.innerHTML = rows;
+        `<span>· egress</span><code>${escapeHtml(protocolSetLabel(endpointProtocols(tail)))}</code>`;
+      body.innerHTML = rowsHtml
+        + (tailHint ? `<div class="hint" style="margin-top: 8px;">${tailHint}</div>` : '');
       dlg.showModal();
     }
 
@@ -5438,16 +5500,19 @@
       }
     }
 
-    // 单行渲染 (行卡片): 头行 = 协议名 + short chip + 模式徽章 + Models 按钮;
-    // 次行 = endpoint URL (附 Copy 按钮) 或 not supported. models 面板初始隐藏,
-    // 由 toggleEndpointModels 惰性 fetch/展开. 三态分支拆为独立派生 (url 行 +
-    // badge), 避免嵌套三元: badge 走 mode→string 查表.
+    // 单行渲染 (矩阵行, router/pool 条目): 头行 = 协议名 + short chip + 模式徽章 +
+    // Models 按钮; 次行 = endpoint URL (附 Copy 按钮) 或 not supported. models 面板
+    // 初始隐藏, 由 toggleEndpointModels 惰性 fetch/展开. 三态分支拆为独立派生 (url
+    // 行 + badge), 避免嵌套三元: badge 走 mode→string 查表.
     // translate 的 tooltip 按 pair 分化 (M2 走查修复, 与 #183 后的实际行为对齐):
     // 含 Responses 任一侧 → 非流式 (stream=true → 501, Responses SSE 事件翻译未实现);
-    // 否则 (OpenAI⇄Anthropic) → 流式翻译已接入 (StreamTranslate).
-    function endpointRow(proto, short, mode, url, egress, providerId) {
+    // 否则 (OpenAI⇄Anthropic) → 流式翻译已接入 (StreamTranslate). egressProtos =
+    // 链尾端点协议集合 (multi-endpoint; 任一侧含 Responses 即非流式 — fallback
+    // 端点是集合首个, 集合近似下取并集保守标注).
+    function endpointRow(proto, short, mode, url, egressProtos, providerId) {
       const label = escapeHtml(proto);
-      const involvesResponses = proto === 'openairesponses' || egress === 'openairesponses';
+      const involvesResponses = proto === 'openairesponses'
+        || egressProtos.includes('openairesponses');
       const translateTip = involvesResponses
         ? 'Cross-protocol translation — non-streaming only (stream=true returns 501: Responses SSE event translation unimplemented)'
         : 'Cross-protocol translation (streaming included) — reasoning_content is dropped';
@@ -5471,6 +5536,23 @@
       </div>`;
     }
 
+    // direct 条目的端点行 (multi-endpoint): 每行 = 一个已配置端点 — 同协议透传入口
+    // (无 translate/unsupported 形态). 行结构对齐 endpointRow (头行 + URL 行 +
+    // models 面板, class 复用同一套事件委托), URL 行 = upstream base_url ↤ 本地入口
+    // URL + Copy (Copy 复制入口 URL). Models 按钮沿用条目级 preview API
+    // (后端统一 OpenAI 视角选端点 — preview 现状, 前端不补偿; 多端点行的面板各自
+    // 惰性展开, dataset.loaded 缓存 per 行).
+    function directEndpointRow(ep, short, url, providerId) {
+      const modelsBtn = `<button type="button" class="btn ep-models-btn" data-provider="${escapeHtml(providerId)}"
+           aria-expanded="false" title="Preview the model list this provider serves (fetched via its default endpoint)">Models</button>`;
+      return `<div class="ep-row" data-short="${short}">
+        <div class="ep-row-head"><span class="ep-proto">${escapeHtml(ep.protocol)}</span><code class="ep-short">/${short}/</code><span class="badge badge-stream" title="same-protocol passthrough (byte-exact)">direct</span><span class="ep-gap"></span>${modelsBtn}</div>
+        <div class="ep-url"><code title="upstream base URL">${escapeHtml(ep.base_url)}</code><span class="ep-arrow" title="upstream ↤ local entry URL">↤</span><code title="local entry URL">${escapeHtml(url)}</code>` +
+        `<button type="button" class="btn ep-copy" data-url="${escapeHtml(url)}" title="Copy endpoint URL">Copy</button></div>
+        <div class="ep-models" hidden></div>
+      </div>`;
+    }
+
     // ─── endpoints 弹窗的 Models 预览 (GET /api/providers/{id}/models) ─────
     //
     // 模型 chips 块 (与 Detect 探测共用同款渲染): 标题 = "Models (N)" + 可选
@@ -5482,7 +5564,7 @@
       return `<div class="probe-models"><div class="probe-models-title">Models (${models.length})${titleSuffix}</div>${chips}</div>`;
     }
 
-    // chip 点击复制的共享委托分支 (endpoints 弹窗与 #p-probe-result 两处挂载):
+    // chip 点击复制的共享委托分支 (endpoints 弹窗与端点行探测结果区两处挂载):
     // restore 时必须同步清掉 'copied' 反转色 (copyWithFlash 只加不减 — 漏清则
     // flash 色永久滞留, 同 common-uri-badge 的 M-A 教训).
     function chipCopyHandler(ev) {
