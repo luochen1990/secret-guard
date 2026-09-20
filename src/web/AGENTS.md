@@ -16,7 +16,10 @@
     providers.rs 另含 `POST /providers/probe` (协议自动探测): base_url 校验后的薄壳,
     探测算法 SSOT 在 `proxy::models::probe_provider_upstream` (与上游模型清单 fetch 同乡);
     以及 `PUT/DELETE /providers/probe` — 存量 id="probe" 条目的管理薄 wrapper
-    (固定 id 适配到 update/delete flow, 静态路由 405 阴影的补齐).
+    (固定 id 适配到 update/delete flow, 静态路由 405 阴影的补齐);
+    以及 `GET /providers/{id}/models` (模型清单预览, endpoints 弹窗的 Models 按钮):
+    存在性校验后的薄壳, 取数算法 SSOT 在 `proxy::models::provider_model_preview`
+    (Router 走 advertised_names 本地合成 / Direct+Pool 走 resolve_route + 上游现场 fetch).
   - `apikeys.rs` — API key CRUD (4 endpoints, 无条件挂载, "只认证, 不隔离").
   - `usage.rs` — `GET /usage/summary` 用量汇总查询 (usage-stats §8; 直读 UsageStore
     SQL 聚合, 派生走 `usage::summary::build_summary` 纯函数).
@@ -74,6 +77,15 @@ DELETE /api/providers/probe          → 同 DELETE /api/providers/{id}, 固定 
 POST   /api/providers/{id}/pool-reset → {id, reset} — 清空该 pool 全部成员闹钟
                                           (非 pool 条目 400 / 不存在含 decision-Disabled 404;
                                            只动运行时内存态, 不触碰配置)
+GET    /api/providers/{id}/models    → ModelPreview {models[], source: "router-synthesized"|"upstream",
+                                          upstream_id?, error?} — 模型清单预览 (endpoints 弹窗
+                                          的 Models 按钮): Router 走 advertised_names 本地合成
+                                          (与转发路径 GET /{short}/{router}/models 同源同值, 共享
+                                          TTL 缓存); Direct/Pool 经 resolve_route 后上游**现场**
+                                          fetch (不进缓存 — 与 Direct /models 逐请求透传一致).
+                                          失败是数据不是 HTTP 错误 (恒 200, fetch/解析失败落在
+                                          error 字段, SEC-2 净化); 仅条目不存在 → 404.
+                                          算法 SSOT 在 proxy::models::provider_model_preview.
 GET    /api/providers                → pool 条目平级附加 pool_status[] (每成员
                                           {id, active, resume_in_secs} —
                                           PoolStates 只读派生, 非 pool 条目该字段缺席)
@@ -269,6 +281,22 @@ API key CRUD **无条件挂载** (在 `web::router()`, 不依赖 `auth.enabled`)
   任一侧时 stream=true → 501 — M2 走查对齐实际行为). endpoints 对话框复用同一近似
   (`resolveEgressProtocol`), 其 translate 徽章 tooltip 按 pair 分化流式语义
   (`endpointRow`), 覆盖集 `CODEC_SUPPORTED` 与后端 `Protocol::codec_covered()` 同步.
+
+### Endpoints 弹窗 (行卡片 + Models 预览)
+
+- **行卡片布局** (重设计, 替代旧三列 table): 每协议一张卡 `.ep-row[data-short]` —
+  头行 = 协议名 + short chip + 模式徽章 (direct=info 软底 / translate=warn 软底 /
+  n/a=inactive) + Models 按钮; 次行 = URL code 块 + Copy 按钮, 或虚线 "not supported"
+  (unsupported 行无 Models/Copy 按钮 — 不引导不可用动作). 主题行
+  `#provider-endpoints-subject` 回显 provider id / name / egress.
+- **Models 预览** (`GET /api/providers/{id}/models`): 每行 Models 按钮惰性展开
+  `.ep-models` 面板 — 首次展开 fetch, 结果记 `panel.dataset.loaded` (弹窗生命周期内
+  的会话级缓存, 收起再展开不重复请求; fetch 失败**不**记 loaded, 再次展开即重试).
+  面板渲染复用 Detect 探测的通用件 (`.probe-models` / `.probe-chip` 点击复制 /
+  `.probe-line(-err)`), 标题附来源标注: `synthesized from routes` (Router 本地合成)
+  vs `upstream: {id}` (Direct/Pool 上游取数 — pool 即当前命中成员). 失败是数据:
+  面板内错误行, 不是 HTTP 错误弹窗. 事件委托挂 `#provider-endpoints-body`
+  (rows 动态生成), chip/Copy/Models 三类目标分流.
 
 ### Sidebar 分组渲染 (二级 + 三级小圆点)
 

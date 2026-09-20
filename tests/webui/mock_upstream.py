@@ -16,9 +16,15 @@ import json
 import os
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 
 DEFAULT_PORT = 19999
 STREAM_CHUNK_DELAY = 0.3  # seconds between SSE chunks
+
+# Mock model list (OpenAI /v1/models shape) — serves the endpoints-modal
+# "Models" preview (WebUI → GET /api/providers/{id}/models → secret-guard
+# fetches {base_url}/v1/models upstream).
+MOCK_MODELS = ["mock-model-a", "mock-model-b", "mock-model-c"]
 
 # Error-trigger markers → (status_code, error_type).
 # Presence of the marker substring in the user message triggers that error response.
@@ -122,7 +128,50 @@ def _handle_stream(wfile) -> None:
     wfile.flush()
 
 
+def _send_json(handler, status: int, body: bytes) -> None:
+    """Common JSON reply tail (status line + headers + body)."""
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
 class Handler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        """Model-list endpoint for the endpoints-modal Models preview.
+
+        Serves both v1-family candidate layouts (/v1/models wins first);
+        every other GET path is a JSON 404 (e.g. /v1beta/models for the
+        seeded gemini provider — exercises the preview error path).
+        """
+        path = urlparse(self.path).path
+        if path in ("/v1/models", "/models"):
+            _send_json(
+                self,
+                200,
+                json.dumps(
+                    {
+                        "object": "list",
+                        "data": [
+                            {
+                                "id": m,
+                                "object": "model",
+                                "created": 0,
+                                "owned_by": "mock",
+                            }
+                            for m in MOCK_MODELS
+                        ],
+                    }
+                ).encode(),
+            )
+            return
+        _send_json(
+            self,
+            404,
+            b'{"error": {"type": "not_found", "message": "mock upstream has no GET route here"}}',
+        )
+
     def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(length) if length > 0 else b"{}"

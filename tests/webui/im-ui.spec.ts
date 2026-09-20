@@ -2700,7 +2700,10 @@ test.describe("Provider 表单构造分野 (#190)", () => {
 
 });
 
-test.describe("Provider endpoints 弹窗 (M2 走查)", () => {
+test.describe("Provider endpoints 弹窗 (M2 走查 + 行卡片重设计)", () => {
+  // URL Copy / 模型 chip 复制断言需要 clipboard 权限 (headless Chromium 默认拒绝
+  // → 复制走 catch 分支, flash 永不出现). 本 describe 顶层统一授予.
+  test.use({ permissions: ["clipboard-write"] });
   test.beforeEach(async ({ page }) => {
     await page.goto("/");
     await page.locator('a.tab[data-tab="providers"]').click();
@@ -2719,8 +2722,11 @@ test.describe("Provider endpoints 弹窗 (M2 走查)", () => {
     const dlg = page.locator("#provider-endpoints");
     await expect(dlg).toBeVisible();
 
-    const rowOf = (short: string) => dlg.locator("tr", { hasText: `/${short}/)` });
+    const rowOf = (short: string) => dlg.locator(`.ep-row[data-short="${short}"]`);
     const badgeOf = (short: string) => rowOf(short).locator(".badge");
+
+    // 主题行回显 provider id (重设计新增).
+    await expect(dlg.locator("#provider-endpoints-subject")).toContainText("mock-openai");
 
     // /o/ 同协议 → direct.
     await expect(badgeOf("o")).toHaveText("direct");
@@ -2734,6 +2740,55 @@ test.describe("Provider endpoints 弹窗 (M2 走查)", () => {
     // /g/ /l/ 无 codec → not supported.
     await expect(rowOf("g").locator(".unsupported")).toHaveText("not supported");
     await expect(rowOf("l").locator(".unsupported")).toHaveText("not supported");
+
+    // 行卡片结构回归 (重设计): 支持行 = URL code + Copy + Models 按钮;
+    // 不支持行 = 三者皆无 (不引导不可用动作).
+    for (const short of ["o", "a", "r"]) {
+      await expect(rowOf(short).locator(".ep-url > code")).toBeVisible();
+      await expect(rowOf(short).locator(".ep-copy")).toBeVisible();
+      await expect(rowOf(short).locator(".ep-models-btn")).toBeVisible();
+    }
+    for (const short of ["g", "l"]) {
+      await expect(rowOf(short).locator(".ep-copy")).toHaveCount(0);
+      await expect(rowOf(short).locator(".ep-models-btn")).toHaveCount(0);
+    }
+  });
+
+  // Models 预览 (GET /api/providers/{id}/models): direct provider 现场 fetch
+  // 上游清单 → chips 渲染 + 点击复制 + 收起/展开命中会话级缓存 (不重复 fetch).
+  test("Models 预览: direct happy path + chip 复制 + 展开缓存", async ({ page }) => {
+    const row = page.locator("#providers-body tr", { hasText: "mock-openai" });
+    await row.locator('button[data-action="endpoints"]').click();
+    const dlg = page.locator("#provider-endpoints");
+    const oRow = dlg.locator('.ep-row[data-short="o"]');
+    const btn = oRow.locator(".ep-models-btn");
+
+    await btn.click();
+    await expect(oRow.locator(".probe-models-title")).toContainText("Models (3)");
+    // 来源标注: direct = 自身上游.
+    await expect(oRow.locator(".probe-models-title")).toContainText("upstream: mock-openai");
+    await expect(oRow.locator(".probe-chip")).toHaveCount(3);
+    // chip 点击复制 (与 Detect 探测同款交互).
+    await oRow.locator(".probe-chip").first().click();
+    await expect(oRow.locator(".probe-chip").first()).toHaveText("✓ copied");
+
+    // 收起 (active 态随之解除) → 再展开: dataset.loaded 缓存直接渲染.
+    await btn.click();
+    await expect(oRow.locator(".ep-models")).toBeHidden();
+    await expect(btn).not.toHaveClass(/active/);
+    await btn.click();
+    await expect(oRow.locator(".probe-models-title")).toContainText("Models (3)");
+  });
+
+  // 失败是数据 (与 probe 同姿态): 上游无该协议的清单端点 (seeded gemini provider
+  // 的上游不 serve /v1beta/models) → 面板内错误行, 不是 HTTP 错误弹窗.
+  test("Models 预览: 上游清单端点缺失 → 面板内错误行", async ({ page }) => {
+    const row = page.locator("#providers-body tr", { hasText: "mock-gemini" });
+    await row.locator('button[data-action="endpoints"]').click();
+    const dlg = page.locator("#provider-endpoints");
+    const gRow = dlg.locator('.ep-row[data-short="g"]');
+    await gRow.locator(".ep-models-btn").click();
+    await expect(gRow.locator(".probe-line-err")).toContainText("upstream returned 404");
   });
 });
 

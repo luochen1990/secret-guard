@@ -1,13 +1,15 @@
 //! providers CRUD: `GET/POST/PUT/DELETE /providers[/{id}]` + `PATCH /{id}/decision`
 //! + `POST /providers/probe` (协议自动探测) + `PUT/DELETE /providers/probe`
 //!   (存量 id="probe" 条目的管理薄 wrapper, 见 [`update_provider_probe`])
-//! + `POST /providers/{id}/pool-reset` (套餐池成员闹钟清空).
+//! + `POST /providers/{id}/pool-reset` (套餐池成员闹钟清空)
+//! + `GET /providers/{id}/models` (模型清单预览, endpoints 弹窗的 Models 按钮).
 //!
 //! 从 api.rs 单文件拆出 (见 #146 残留 1). CRUD 流程骨架在 [`super::crud`]
 //! (泛型, 与 secrets 共享), 本文件只承载 provider 特有的 entry 构造 / api_key
-//! 保留逻辑 / 列表附加字段 (protocols/shorts/pool 运行时状态). probe 是薄壳:
-//! 校验 base_url 后调 `crate::proxy::probe_provider_upstream` (探测算法 SSOT 在
-//! proxy 层, 与上游模型清单 fetch 同乡).
+//! 保留逻辑 / 列表附加字段 (protocols/shorts/pool 运行时状态). probe 与 models
+//! 预览都是薄壳: 校验后分别调 `crate::proxy::probe_provider_upstream` /
+//! `crate::proxy::provider_model_preview` (算法 SSOT 在 proxy 层, 与上游模型
+//! 清单 fetch 同乡).
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -318,6 +320,25 @@ pub async fn pool_reset(
 struct PoolResetAck {
     id: String,
     reset: bool,
+}
+
+/// `GET /api/providers/{id}/models`: 模型清单预览 (endpoints 弹窗的 Models 按钮)。
+///
+/// 薄壳: 存在性校验 (effective 视图, 含 decision=Disabled → 404, 与 pool_reset
+/// 同口径) 后调 [`crate::proxy::provider_model_preview`] — 取数语义与转发路径的
+/// /models 行为一致 (Router 本地合成 / Direct+Pool 上游 fetch, 详见其 doc)。
+/// fetch 失败是**数据不是 HTTP 错误** (与 probe 同姿态, 恒 200, 失败落在响应体
+/// `error` 字段); 仅条目不存在 → 404。响应无敏感值 (模型名 + 来源 + 净化错误串,
+/// SEC-1 天然满足)。
+pub async fn provider_models(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Some(entry) = state.providers.get_effective(&id) else {
+        return Err(ApiError::not_found(format!("provider {id} not found")));
+    };
+    let preview = crate::proxy::provider_model_preview(&state, &entry).await;
+    Ok((StatusCode::OK, NO_STORE, Json(preview)))
 }
 
 /// `POST /api/providers/probe` 的请求 body.

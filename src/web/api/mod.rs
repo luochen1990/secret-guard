@@ -44,7 +44,7 @@ pub(crate) mod usage;
 pub use apikeys::{create_api_key, delete_api_key, list_api_keys, toggle_api_key};
 pub use providers::{
     create_provider, delete_provider, delete_provider_probe, list_providers, pool_reset,
-    probe_provider, set_provider_decision, update_provider, update_provider_probe,
+    probe_provider, provider_models, set_provider_decision, update_provider, update_provider_probe,
 };
 pub use records::get_record;
 pub use secrets::{create_secret, delete_secret, list_secrets, set_secret_decision, update_secret};

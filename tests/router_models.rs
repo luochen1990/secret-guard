@@ -14,7 +14,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use secret_guard::provider::{
-    DirectProvider, Protocol, Provider, ProviderKind, ProviderTable, Route, RouterProvider,
+    DirectProvider, PoolProvider, Protocol, Provider, ProviderKind, ProviderTable, Route,
+    RouterProvider,
 };
 use secret_guard::proxy::ModelListCache;
 use secret_guard::server;
@@ -98,6 +99,19 @@ fn router_provider(id: &str, routes: Vec<Route>) -> Provider {
         enabled: true,
         name: Some(id.into()),
         kind: ProviderKind::Router(RouterProvider { routes }),
+    }
+}
+
+fn pool_provider(id: &str, members: Vec<String>) -> Provider {
+    Provider {
+        id: id.into(),
+        enabled: true,
+        name: Some(id.into()),
+        kind: ProviderKind::Pool(PoolProvider {
+            members,
+            exhaust: Default::default(),
+            cooldown_secs: 60,
+        }),
     }
 }
 
@@ -523,4 +537,151 @@ async fn router_models_single_flight_under_concurrency() {
         1,
         "single-flight: 并发查询对同一上游恰发起一次 fetch"
     );
+}
+
+// ─── GET /api/providers/{id}/models (endpoints 弹窗的模型清单预览) ──────────
+//
+// 覆盖: Direct 现场 fetch (不进缓存) / Router 本地合成 (与转发路径同源同值,
+// 共享 TTL 缓存) / Pool 命中当前成员 / 失败是数据 (恒 200) / 未知 id 404.
+
+async fn preview(proxy_url: &str, id: &str) -> (reqwest::StatusCode, serde_json::Value) {
+    let (status, body) = get(proxy_url, &format!("/api/providers/{id}/models")).await;
+    (status, serde_json::from_str(&body).unwrap())
+}
+
+#[tokio::test]
+async fn preview_models_direct_upstream_fresh_fetch() {
+    let mut upstream = spawn_mock_upstream().await;
+    let mock = upstream
+        .mock("GET", "/v1/models")
+        .with_status(200)
+        .with_body(r#"{"data":[{"id":"m-1"},{"id":"m-2"}]}"#)
+        // 现场语义: 不进缓存 — 与 Direct /models 逐请求透传一致, 每次预览都 fetch.
+        .expect(2)
+        .create_async()
+        .await;
+    let proxy = spawn(vec![openai_provider("direct-a", &upstream.url())]).await;
+
+    for _ in 0..2 {
+        let (status, v) = preview(&proxy, "direct-a").await;
+        assert_eq!(status, 200, "{v}");
+        assert_eq!(v["source"], "upstream");
+        assert_eq!(v["upstream_id"], "direct-a");
+        assert!(v["error"].is_null(), "{v}");
+        assert_eq!(v["models"], serde_json::json!(["m-1", "m-2"]));
+    }
+    mock.assert_async().await;
+}
+
+#[tokio::test]
+async fn preview_models_router_synthesized_matches_forward_path() {
+    let mut upstream = spawn_mock_upstream().await;
+    let mock = upstream
+        .mock("GET", "/v1/models")
+        .with_status(200)
+        .with_body(r#"{"data":[{"id":"g-1"},{"id":"g-2"}]}"#)
+        .expect(1) // 预览共享 TTL 缓存: 两次预览 + 一次转发路径, 上游恰 1 次.
+        .create_async()
+        .await;
+    let proxy = spawn(vec![
+        openai_provider("up-a", &upstream.url()),
+        router_provider(
+            "plan",
+            vec![route("alias", "up-a", 30), route("*", "up-a", 10)],
+        ),
+    ])
+    .await;
+
+    for _ in 0..2 {
+        let (status, v) = preview(&proxy, "plan").await;
+        assert_eq!(status, 200, "{v}");
+        assert_eq!(v["source"], "router-synthesized");
+        assert!(
+            v["upstream_id"].is_null(),
+            "合成清单横跨多上游, 无单一取数 id: {v}"
+        );
+        assert!(v["error"].is_null(), "{v}");
+        assert_eq!(
+            v["models"],
+            serde_json::json!(["alias", "g-1", "g-2"]),
+            "别名在前 + 上游合并段 (与 FWD-7 同序)"
+        );
+    }
+    // 同源同值: 预览与转发路径的 GET /models 完全一致.
+    let (_, body) = get(&proxy, "/o/plan/v1/models").await;
+    assert_eq!(model_ids(&body), ["alias", "g-1", "g-2"], "{body}");
+    mock.assert_async().await;
+}
+
+#[tokio::test]
+async fn preview_models_pool_hits_current_member() {
+    let mut up1 = spawn_mock_upstream().await;
+    let mut up2 = spawn_mock_upstream().await;
+    let _m1 = up1
+        .mock("GET", "/v1/models")
+        .with_status(200)
+        .with_body(r#"{"data":[{"id":"one"}]}"#)
+        .create_async()
+        .await;
+    // 零 failover 守卫: 列表序优先级下第二成员必须零调用 (expect(0) + 显式 assert).
+    let m2 = up2
+        .mock("GET", "/v1/models")
+        .with_status(200)
+        .with_body(r#"{"data":[{"id":"two"}]}"#)
+        .expect(0)
+        .create_async()
+        .await;
+    let proxy = spawn(vec![
+        openai_provider("mem-1", &up1.url()),
+        openai_provider("mem-2", &up2.url()),
+        pool_provider("plan-pool", vec!["mem-1".into(), "mem-2".into()]),
+    ])
+    .await;
+
+    let (status, v) = preview(&proxy, "plan-pool").await;
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(v["source"], "upstream");
+    assert_eq!(v["upstream_id"], "mem-1", "pool 预览打当前命中成员");
+    assert_eq!(v["models"], serde_json::json!(["one"]));
+    m2.assert_async().await;
+}
+
+#[tokio::test]
+async fn preview_models_fetch_failure_is_data_not_http_error() {
+    let mut upstream = spawn_mock_upstream().await;
+    upstream
+        .mock("GET", "/v1/models")
+        .with_status(500)
+        .with_body("internal error")
+        .create_async()
+        .await;
+    let proxy = spawn(vec![openai_provider("dead", &upstream.url())]).await;
+
+    let (status, v) = preview(&proxy, "dead").await;
+    assert_eq!(status, 200, "失败是数据不是 HTTP 错误 (probe 同姿态): {v}");
+    assert_eq!(v["models"], serde_json::json!([]));
+    let err = v["error"].as_str().expect("error 字段必有值");
+    assert!(err.contains("500"), "错误串含状态详情: {err}");
+}
+
+#[tokio::test]
+async fn preview_models_pool_unresolvable_is_data() {
+    // 悬空成员 (ghost 不存在) → AllMembersExhausted (无闹钟形态), 落在 error 字段.
+    let proxy = spawn(vec![pool_provider("broken-pool", vec!["ghost".into()])]).await;
+
+    let (status, v) = preview(&proxy, "broken-pool").await;
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(v["models"], serde_json::json!([]));
+    let err = v["error"].as_str().expect("error 字段必有值");
+    assert!(
+        err.contains("broken-pool") && err.contains("no available member"),
+        "错误串含 pool id + reason (SEC-2 同型): {err}"
+    );
+}
+
+#[tokio::test]
+async fn preview_models_unknown_provider_404() {
+    let proxy = spawn(vec![]).await;
+    let (status, body) = get(&proxy, "/api/providers/ghost/models").await;
+    assert_eq!(status, 404, "body: {body}");
 }

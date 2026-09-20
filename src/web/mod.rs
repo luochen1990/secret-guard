@@ -19,6 +19,8 @@
 //!   (静态段阴影 {id} 路由的 405 补齐, 见 `api::update_provider_probe`).
 //! - `POST /api/providers/{id}/pool-reset` —— pool 条目成员闹钟清空
 //!   (两段路径与 `{id}/decision` 同型, 见 `api::pool_reset`).
+//! - `GET /api/providers/{id}/models` —— 模型清单预览 (endpoints 弹窗;
+//!   算法在 `proxy::models`, 薄壳 handler 在 `api::provider_models`).
 //! - `GET/POST/DELETE/PATCH /api/api-keys[/{id}[/toggle]]` —— API key CRUD (无条件挂载, 见 api/apikeys.rs).
 //!
 //! 注 1: 旧的 `GET /api/records` (扁平分页) + `GET /api/nodes/{id}/timeline` (基于 node_id)
@@ -98,6 +100,10 @@ pub fn router() -> Router<AppState> {
         // pool 条目成员闹钟清空 (T3; 两段路径与 {id}/decision 同型 — 静态尾段
         // 优先于任何未来单段扩展, 无 "probe" 型阴影问题).
         .route("/api/providers/{id}/pool-reset", post(api::pool_reset))
+        // 模型清单预览 (endpoints 弹窗的 Models 按钮): Router 本地合成 /
+        // Direct+Pool 上游 fetch, 算法在 proxy::models (薄壳 handler, 见
+        // api/providers.rs). 失败是数据不是 HTTP 错误 (恒 200).
+        .route("/api/providers/{id}/models", get(api::provider_models))
         // API key CRUD: 无条件挂载 (不依赖 auth.enabled), 不做用户隔离.
         // 设计哲学: 只认证, 不隔离 — 见 src/web/api/apikeys.rs 头部注释.
         //

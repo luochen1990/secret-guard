@@ -149,7 +149,8 @@
     /* 代码 / 原始字节区统一用等宽 (语义需要, 非全局风格). 集中声明, 避免下方重复. */
     pre, code, .raw-pre, .resp-body, .bubble-tool, .bubble-tool-call, .xml-block,
     .full-body, .info-val, dialog#secret-form form textarea, textarea#apikey-reveal-value,
-    #p-probe-result .probe-chip, #p-probe-result .probe-url, #p-common-uri-badge {
+    .probe-chip, #p-probe-result .probe-url, #p-common-uri-badge,
+    .ep-short, .ep-url > code {
       font-family: "SF Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
     }
     /* 数字密集区统一 tabular-nums (时间戳/计数/表格), 避免数字宽窄跳动. */
@@ -276,22 +277,95 @@
       margin-left: 4px;
     }
     .badge-stream { background: var(--info-soft); color: var(--info); font-weight: 600; }
+    /* badge-warn: 需注意的中间态 (endpoints 弹窗的 translate 徽章 — 跨协议有代价,
+       与 direct 的 info 软底形成语义分色). */
+    .badge-warn { background: var(--warn-soft); color: var(--warn); font-weight: 600; }
     .badge-err { background: var(--err-soft); color: var(--err); font-weight: 600; }
     /* inactive: 服务端认证未启用, key 形同虚设 (灰色, 区别于 enabled/disabled). */
     .badge-inactive { background: var(--panel-hi); color: var(--fg-faint); }
     /* hint 内嵌的警告 (服务端认证未启用提示). err 色沿用旧版配色 (无软底, 区别于 banner 的 warn 软底). */
     .hint-warn { color: var(--err); }
-    /* provider endpoints 弹窗内的 URL 列表表格. */
-    .ep-table { width: 100%; border-collapse: collapse; font-size: 12px; }
-    .ep-table td { padding: 4px 8px 4px 0; vertical-align: top; }
-    .ep-table td:last-child { padding-right: 0; white-space: nowrap; }
-    .ep-table td.label { white-space: nowrap; }
-    .ep-table td.unsupported { color: var(--fg-faint); }
-    .ep-table td.url code { word-break: break-all; }
-    dialog#provider-endpoints { padding: 16px; width: 480px; }
-    dialog#provider-endpoints .actions {
-      display: flex; gap: 8px; justify-content: flex-end; margin-top: 8px;
+    /* provider endpoints 弹窗: endpoint 行卡片列表 (每协议一张卡: 头行 =
+       协议名 + short chip + 模式徽章 + Models 按钮; 次行 = URL 可复制 或
+       not supported; Models 面板内联展开). */
+    dialog#provider-endpoints { padding: 0; width: min(600px, calc(100vw - 32px)); }
+    dialog#provider-endpoints form {
+      display: flex; flex-direction: column; gap: 12px; padding: 20px;
     }
+    dialog#provider-endpoints .actions {
+      display: flex; gap: 8px; justify-content: flex-end;
+    }
+    .ep-dialog-head { display: grid; gap: 6px; }
+    .ep-dialog-head h3 { margin: 0; }
+    /* 弹窗主题行: provider id / name / egress 摘要 (id 用 code chip 强调). */
+    .ep-subject { font-size: 12.5px; color: var(--fg-muted); display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; }
+    .ep-subject code {
+      background: var(--panel-hi); color: var(--info);
+      padding: 1px 6px; border-radius: 4px; font-size: 11.5px;
+    }
+    .ep-list {
+      display: flex; flex-direction: column; gap: 8px;
+      max-height: min(56vh, 520px); overflow-y: auto; padding-right: 2px;
+    }
+    .ep-row {
+      border: 1px solid var(--border-faint);
+      border-radius: var(--radius-md);
+      background: var(--panel-hi);
+      padding: 10px 12px;
+    }
+    .ep-row-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
+    .ep-proto { font-weight: 600; font-size: 13px; }
+    /* 协议短前缀 chip (mono, 与 URL 的 /o/ 形态呼应; mono 字体并入上方全局等宽列表). */
+    .ep-short {
+      font-size: 11px;
+      color: var(--fg-muted);
+      background: var(--bg-sunken);
+      border: 1px solid var(--border-faint);
+      border-radius: 4px;
+      padding: 1px 6px;
+      white-space: nowrap;
+    }
+    .ep-gap { flex: 1; }
+    .ep-url { display: flex; align-items: stretch; gap: 6px; margin-top: 8px; min-width: 0; }
+    .ep-url > code {
+      flex: 1; min-width: 0;
+      font-size: 12px;
+      color: var(--fg-muted);
+      background: var(--bg-sunken);
+      border: 1px solid var(--border-faint);
+      border-radius: var(--radius-sm);
+      padding: 5px 8px;
+      word-break: break-all;
+      display: flex; align-items: center;
+    }
+    .ep-url.unsupported {
+      color: var(--fg-faint);
+      font-size: 12px;
+      align-items: center;
+      padding: 5px 8px;
+      background: var(--bg-sunken);
+      border: 1px dashed var(--border-faint);
+      border-radius: var(--radius-sm);
+    }
+    /* URL Copy 按钮: 组合 button.btn 基底 (class="btn ep-copy"), 只覆盖差异项.
+       特异性 button.btn.ep-x 高于 button.btn — 否则 btn 的 padding/font-size
+       无论源顺序都会赢 (历史: .ep-models-btn 单类选择器被 btn 静默压制). */
+    button.btn.ep-copy {
+      flex: none;
+      padding: 4px 9px;
+      font-size: 11px;
+      color: var(--fg-muted);
+      white-space: nowrap;
+    }
+    button.btn.ep-copy.copied { border-color: var(--ok); background: var(--ok-soft); color: var(--ok); }
+    button.btn.ep-models-btn { padding: 3px 10px; font-size: 11.5px; }
+    .ep-models-btn.active {
+      border-color: var(--accent);
+      color: var(--accent);
+      background: var(--accent-soft);
+    }
+    .ep-row-unsupported .ep-proto,
+    .ep-row-unsupported .ep-short { color: var(--fg-faint); }
     .tab-content { display: none; }
     .tab-content.active { display: flex; flex: 1; min-height: 0; }
 
@@ -606,9 +680,12 @@
     #p-detect { grid-column: 1 / -1; justify-self: start; }
     #p-probe-result { grid-column: 1 / -1; display: grid; gap: 4px; }
     #p-probe-result:empty { display: none; }
-    #p-probe-result .probe-line { font-size: 12px; color: var(--fg-muted); }
-    #p-probe-result .probe-line-ok { color: var(--ok); }
-    #p-probe-result .probe-line-err { color: var(--err); }
+    /* probe-line / probe-models / probe-chip 是探测与 endpoints 弹窗共用的
+       通用件 (状态行 / 可滚动 chips 容器 / 点击复制 chip) — 不限定在
+       #p-probe-result 下, endpoints 弹窗的 Models 面板复用同一套. */
+    .probe-line { font-size: 12px; color: var(--fg-muted); }
+    .probe-line-ok { color: var(--ok); }
+    .probe-line-err { color: var(--err); }
     /* 探测 URL 回显 (不黑盒): 每路 GET 的完整 URL, 缩进小字等宽 (字体并入上方
        全局等宽列表), 长地址可断行. */
     #p-probe-result .probe-url {
@@ -635,7 +712,7 @@
     }
     #p-common-uri-badge.copied { background: var(--ok); color: var(--panel); border-color: var(--ok); }
     /* 模型 chips 预览 (MVP 深度 = 浏览 + 点击复制): 可滚动容器, 标题随内容滚动. */
-    #p-probe-result .probe-models {
+    .probe-models {
       display: flex;
       flex-wrap: wrap;
       gap: 4px;
@@ -645,19 +722,20 @@
       padding: 6px;
       border: 1px solid var(--border-faint);
       border-radius: var(--radius-sm);
+      background: var(--bg-sunken);
     }
-    #p-probe-result .probe-models-title { flex-basis: 100%; font-size: 11px; color: var(--fg-faint); }
-    #p-probe-result .probe-chip {
+    .probe-models-title { flex-basis: 100%; font-size: 11px; color: var(--fg-faint); }
+    .probe-chip {
       padding: 2px 8px;
       border: 1px solid var(--border);
       border-radius: 999px;
-      background: var(--panel-hi);
+      background: var(--panel);
       color: var(--fg-muted);
       font-size: 11px;
       cursor: pointer;
     }
-    #p-probe-result .probe-chip:hover { border-color: var(--border-strong); color: var(--fg); }
-    #p-probe-result .probe-chip.copied { border-color: var(--ok); background: var(--ok-soft); color: var(--ok); }
+    .probe-chip:hover { border-color: var(--border-strong); color: var(--fg); }
+    .probe-chip.copied { border-color: var(--ok); background: var(--ok-soft); color: var(--ok); }
     dialog#provider-form .actions {
       grid-column: 2;
       display: flex;
@@ -1965,13 +2043,17 @@
 
   <dialog id="provider-endpoints">
     <form method="dialog">
-      <h3 style="margin: 0 0 8px 0;">Endpoints</h3>
-      <div class="hint" style="margin-bottom: 8px;">
-        URL pattern: <code>/{proto-short}/{provider-id}/*</code>. Same-protocol = direct; cross-protocol = translation
-        between OpenAI / Anthropic / Responses (streaming only for OpenAI⇄Anthropic; Responses pairs are non-streaming);
-        Gemini/Ollama ingress = not supported.
-      </div>
-      <div id="provider-endpoints-body"></div>
+      <header class="ep-dialog-head">
+        <h3>Endpoints</h3>
+        <div class="ep-subject" id="provider-endpoints-subject"></div>
+        <div class="hint">
+          Base pattern: <code>/{proto-short}/{provider-id}/*</code>. Same-protocol = direct;
+          cross-protocol = translation between OpenAI / Anthropic / Responses (streaming only for
+          OpenAI⇄Anthropic; Responses pairs are non-streaming); Gemini/Ollama ingress = not
+          supported. <b>Models</b> previews the model list the endpoint serves.
+        </div>
+      </header>
+      <div id="provider-endpoints-body" class="ep-list"></div>
       <div class="actions">
         <button class="btn" value="close">Close</button>
       </div>
@@ -5308,18 +5390,27 @@
       }
       const dlg = document.getElementById('provider-endpoints');
       const body = document.getElementById('provider-endpoints-body');
+      const subject = document.getElementById('provider-endpoints-subject');
       // 关闭时清理, 避免内容残留 (SEC-* 精神: 数据不残留).
       dlg.addEventListener('close', () => { body.innerHTML = ''; }, { once: true });
       const origin = window.location.origin;
       const egress = resolveEgressProtocol(p);
+      // 主题行: provider id (code chip 强调) + name 去重 + egress 摘要
+      // (链尾实体协议 — 跨协议行的 translate 语义由它决定).
+      subject.innerHTML =
+        `<span>Provider</span><code>${escapeHtml(p.id)}</code>` +
+        (p.name && p.name !== p.id ? `<span>· ${escapeHtml(p.name)}</span>` : '') +
+        `<span>· egress</span><code>${escapeHtml(egress || '?')}</code>`;
       const rows = state.providerShorts.map((short, i) => {
         const proto = state.providerProtocols[i];
         const mode = ingressMode(proto, egress);
         // encodeURIComponent 是 defense-in-depth: 后端 validate_id 限制 [A-Za-z0-9_-].
-        const url = `${origin}/${short}/${encodeURIComponent(p.id)}/`;
-        return endpointRow(proto, short, mode, url, egress);
+        const url = mode === 'unsupported'
+          ? null
+          : `${origin}/${short}/${encodeURIComponent(p.id)}/`;
+        return endpointRow(proto, short, mode, url, egress, p.id);
       }).join('');
-      body.innerHTML = `<table class="ep-table">${rows}</table>`;
+      body.innerHTML = rows;
       dlg.showModal();
     }
 
@@ -5341,26 +5432,125 @@
       }
     }
 
-    // 单行渲染. 三态分支拆为两个独立派生 (url 单元格 + badge 单元格),
-    // 避免嵌套三元: badge 走 mode→string 查表, url 用单层三元.
+    // 单行渲染 (行卡片): 头行 = 协议名 + short chip + 模式徽章 + Models 按钮;
+    // 次行 = endpoint URL (附 Copy 按钮) 或 not supported. models 面板初始隐藏,
+    // 由 toggleEndpointModels 惰性 fetch/展开. 三态分支拆为独立派生 (url 行 +
+    // badge), 避免嵌套三元: badge 走 mode→string 查表.
     // translate 的 tooltip 按 pair 分化 (M2 走查修复, 与 #183 后的实际行为对齐):
     // 含 Responses 任一侧 → 非流式 (stream=true → 501, Responses SSE 事件翻译未实现);
     // 否则 (OpenAI⇄Anthropic) → 流式翻译已接入 (StreamTranslate).
-    function endpointRow(proto, short, mode, url, egress) {
-      const label = escapeHtml(`${proto} (/${short}/)`);
-      const urlCell = mode === 'unsupported'
-        ? '<td class="unsupported">not supported</td>'
-        : `<td class="url"><code>${escapeHtml(url)}</code></td>`;
+    function endpointRow(proto, short, mode, url, egress, providerId) {
+      const label = escapeHtml(proto);
       const involvesResponses = proto === 'openairesponses' || egress === 'openairesponses';
       const translateTip = involvesResponses
         ? 'Cross-protocol translation — non-streaming only (stream=true returns 501: Responses SSE event translation unimplemented)'
         : 'Cross-protocol translation (streaming included) — reasoning_content is dropped';
-      const badgeCell = {
-        direct:      '<td><span class="badge badge-stream">direct</span></td>',
-        translate:   `<td><span class="badge" title="${translateTip}">translate</span></td>`,
-        unsupported: '<td><span class="badge badge-inactive">n/a</span></td>',
+      const badge = {
+        direct:      '<span class="badge badge-stream">direct</span>',
+        translate:   `<span class="badge badge-warn" title="${translateTip}">translate</span>`,
+        unsupported: '<span class="badge badge-inactive">n/a</span>',
       }[mode];
-      return `<tr><td class="label">${label}</td>${urlCell}${badgeCell}</tr>`;
+      const modelsBtn = mode === 'unsupported'
+        ? ''
+        : `<button type="button" class="btn ep-models-btn" data-provider="${escapeHtml(providerId)}"
+             aria-expanded="false" title="Preview the model list this endpoint serves">Models</button>`;
+      const urlLine = mode === 'unsupported'
+        ? '<div class="ep-url unsupported">not supported</div>'
+        : `<div class="ep-url"><code>${escapeHtml(url)}</code>` +
+          `<button type="button" class="btn ep-copy" data-url="${escapeHtml(url)}" title="Copy endpoint URL">Copy</button></div>`;
+      return `<div class="ep-row${mode === 'unsupported' ? ' ep-row-unsupported' : ''}" data-short="${short}">
+        <div class="ep-row-head"><span class="ep-proto">${label}</span><code class="ep-short">/${short}/</code>${badge}<span class="ep-gap"></span>${modelsBtn}</div>
+        ${urlLine}
+        <div class="ep-models" hidden></div>
+      </div>`;
+    }
+
+    // ─── endpoints 弹窗的 Models 预览 (GET /api/providers/{id}/models) ─────
+    //
+    // 模型 chips 块 (与 Detect 探测共用同款渲染): 标题 = "Models (N)" + 可选
+    // 来源后缀, chips 点击复制. 单一来源: "Models (N)" 文案与 chip 形态只在此
+    // 定义, renderProbeResult / renderEndpointModels 两处调用.
+    function modelsBlock(models, titleSuffix = '') {
+      const chips = models.map(m =>
+        `<button type="button" class="probe-chip" data-model="${escapeHtml(m)}" title="Copy model name">${escapeHtml(m)}</button>`).join('');
+      return `<div class="probe-models"><div class="probe-models-title">Models (${models.length})${titleSuffix}</div>${chips}</div>`;
+    }
+
+    // chip 点击复制的共享委托分支 (endpoints 弹窗与 #p-probe-result 两处挂载):
+    // restore 时必须同步清掉 'copied' 反转色 (copyWithFlash 只加不减 — 漏清则
+    // flash 色永久滞留, 同 common-uri-badge 的 M-A 教训).
+    function chipCopyHandler(ev) {
+      const chip = ev.target.closest('.probe-chip');
+      if (!chip) return false;
+      copyWithFlash(chip, chip.dataset.model, 'copied', () => {
+        chip.textContent = chip.dataset.model;
+        chip.classList.remove('copied');
+      });
+      return true;
+    }
+
+    // 事件委托 (rows 是动态生成): chip 复制 / URL Copy / Models 按钮切换面板.
+    document.getElementById('provider-endpoints-body').addEventListener('click', (ev) => {
+      if (chipCopyHandler(ev)) return;
+      const copyBtn = ev.target.closest('.ep-copy');
+      if (copyBtn) {
+        copyWithFlash(copyBtn, copyBtn.dataset.url, 'copied', () => {
+          copyBtn.textContent = 'Copy';
+          copyBtn.classList.remove('copied');
+        });
+        return;
+      }
+      const btn = ev.target.closest('.ep-models-btn');
+      if (btn) toggleEndpointModels(btn);
+    });
+
+    // 面板惰性加载: 首次展开 fetch, 结果记在 panel.dataset.loaded (弹窗生命周期
+    // 内的会话级缓存 — 收起再展开不重复请求; 弹窗关闭时 DOM 整体重建, 缓存随之
+    // 失效). fetch 失败**不**记 loaded — 再次展开即重试 (错误是暂态的常见形态).
+    async function toggleEndpointModels(btn) {
+      const panel = btn.closest('.ep-row').querySelector('.ep-models');
+      const willShow = panel.hidden;
+      panel.hidden = !willShow;
+      btn.setAttribute('aria-expanded', String(willShow));
+      btn.classList.toggle('active', willShow);
+      if (!willShow || panel.dataset.loaded === '1') return;
+      panel.innerHTML = '<div class="probe-line">Loading models…</div>';
+      // encodeURIComponent 同 endpointRow: defense-in-depth (id 词表受限).
+      const providerId = encodeURIComponent(btn.dataset.provider);
+      const failLine = msg =>
+        `<div class="probe-line probe-line-err">${escapeHtml('Failed to load models: ' + msg)}</div>`;
+      try {
+        const r = await fetch(`${API_PROVIDERS}/${providerId}/models`);
+        if (!r.ok) {
+          const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+          panel.innerHTML = failLine(err.error || r.status);
+          return;
+        }
+        const data = await r.json();
+        panel.dataset.loaded = '1';
+        renderEndpointModels(panel, data);
+      } catch (e) {
+        panel.innerHTML = failLine(e.message);
+      }
+    }
+
+    // 预览面板渲染: 错误行 (后端把 fetch 失败作为数据回传, error 必有值) /
+    // 空清单提示 / 模型 chips (标题附来源: router 本地合成 vs 上游直取 + 实际
+    // 取数 provider id — pool 场景即当前命中成员).
+    function renderEndpointModels(panel, data) {
+      if (data.error) {
+        panel.innerHTML = `<div class="probe-line probe-line-err">${escapeHtml(data.error)}</div>`;
+        return;
+      }
+      const models = data.models || [];
+      if (!models.length) {
+        panel.innerHTML = '<div class="probe-line">No models reported by this endpoint.</div>';
+        return;
+      }
+      const sourceLabel = data.source === 'router-synthesized'
+        ? 'synthesized from routes'
+        : `upstream: ${data.upstream_id || '?'}`;
+      panel.innerHTML = modelsBlock(models, ` · ${escapeHtml(sourceLabel)}`);
     }
 
     function openProviderForm(existing) {
@@ -5783,25 +5973,14 @@
         ? probes.find(pr => pr.protocol === data.recommended)
         : probes.find(pr => pr.status === 'ok');
       const models = source?.status === 'ok' ? (source.models || []) : [];
-      if (models.length) {
-        const chips = models.map(m =>
-          `<button type="button" class="probe-chip" data-model="${escapeHtml(m)}" title="Copy model name">${escapeHtml(m)}</button>`).join('');
-        parts.push(`<div class="probe-models"><div class="probe-models-title">Models (${models.length})</div>${chips}</div>`);
-      }
+      if (models.length) parts.push(modelsBlock(models));
       document.getElementById('p-probe-result').innerHTML = parts.join('');
     }
 
     document.getElementById('p-detect').addEventListener('click', runProviderProbe);
     // 模型 chip 点击复制 (事件委托: chips 是动态子元素, 同 #p-routes-list 模式;
-    // 复制 + 瞬时反馈骨架经 copyWithFlash 共用).
-    document.getElementById('p-probe-result').addEventListener('click', (ev) => {
-      const chip = ev.target.closest('.probe-chip');
-      if (!chip) return;
-      copyWithFlash(chip, chip.dataset.model, 'copied', () => {
-        chip.textContent = chip.dataset.model;
-        chip.classList.remove('copied');
-      });
-    });
+    // 复制 + 瞬时反馈骨架经 copyWithFlash 共用, handler 与 endpoints 弹窗共享).
+    document.getElementById('p-probe-result').addEventListener('click', chipCopyHandler);
 
     /// 编辑 static-only id 时, 提示 "此次会创建 dynamic override".
     function toggleOverrideBanner(dlg, existing) {

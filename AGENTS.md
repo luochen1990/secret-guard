@@ -182,10 +182,12 @@
   + proxy → auth::AuthenticatedTenant (v4b redact 审计归因: proxy 从 request
   extension 提取 API key label 注入 usage 采集, 纯类型依赖, 性质同 config→auth
   的 AuthConfig 纯数据边, 无 auth 行为依赖)
-  + web/api/providers → proxy::models (probe 端点复用上游模型清单探测基建;
-  行为借用 — `probe_provider_upstream` 执行出站 HTTP 探测, 非纯数据/纯函数,
-  但复用同款 fetch 防御 (整体超时/有界累积/错误净化) 且无转发链状态依赖,
-  handler 只是薄壳, 无独立实现 — 勿以此为先例扩张 web → proxy 的行为依赖)
+  + web/api/providers → proxy::models (probe 端点复用上游模型清单探测基建 +
+    models 预览端点复用模型清单 fetch/合成基建 — `provider_model_preview`;
+    行为借用 — `probe_provider_upstream` / `provider_model_preview` 均执行出站
+    HTTP 探测/fetch, 非纯数据/纯函数, 但复用同款 fetch 防御 (整体超时/有界累积/
+    错误净化) 且无转发链状态依赖, handler 只是薄壳, 无独立实现 — 勿以此为先例
+    扩张 web → proxy 的行为依赖)
   + proxy → pool (套餐池转发即状态机驱动: dispatch 经 `PoolPicker` 注入候选解析
   (active_members), 响应侧 `PoolWatch::detect_and_mark` 旁路检测 —
   同属域 A 转发链, 性质同 proxy → redact 的 "转发即改写")

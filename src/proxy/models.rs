@@ -90,8 +90,8 @@
 //!   note) > ollama (同 note); 无任何 ok → recommended null.
 //!
 //! 依赖方向: web/api/providers → 本模块 已在根 AGENTS.md "已接受的例外" 登记
-//! (probe 端点复用上游探测基建; 行为借用 — 探测执行出站 HTTP, 非纯数据/
-//! 纯函数, handler 只是薄壳无独立实现).
+//! (probe 端点复用上游探测基建 + `provider_model_preview` 复用模型清单 fetch/合成
+//! 基建; 行为借用 — 均执行出站 HTTP, 非纯数据/纯函数, handler 只是薄壳无独立实现).
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -477,6 +477,75 @@ pub(super) async fn handle_router_models(
     builder
         .body(Body::from(build_models_body(ingress, &names)))
         .expect("static response parts are valid")
+}
+
+/// 模型清单预览 (WebUI endpoints 弹窗的 "Models" 按钮, `GET /api/providers/{id}/models`,
+/// handler 薄壳在 `web/api/providers.rs`): 回答 "这个 provider 的 endpoint 现在能
+/// serve 哪些模型".
+///
+/// 取数语义与转发路径的 /models 行为一致 (同一套基建, 不另造轮子):
+/// - **Router** → [`advertised_names`] (本地合成: 别名 + N1 过滤后的上游合并清单,
+///   含 TTL 缓存 — 与 FWD-7 的 GET /{short}/{router}/models 同源同值).
+/// - **Direct / Pool** → [`resolve_route`] (pool = 当前命中成员, direct = 自身 —
+///   与 "pool 入口的 /models 打到当前成员" 契约同型) 后 [`fetch_model_list`]
+///   **现场 fetch** (不进缓存 — Direct 的 /models 透传本来就是逐请求 fresh,
+///   预览忠实于 "endpoint 现在返回什么"; 重复点击的代价是一次轻量 GET).
+///
+/// 失败是**数据不是 HTTP 错误** (与 probe 同姿态): fetch/解析/解析路由失败落在
+/// [`ModelPreview::error`] (已净化, 永不含 key/secret — fetch_model_list 的错误串
+/// 纪律 + `RouteError` Display 的 SEC-2 同型), `models` 为空.
+#[derive(Debug, Serialize)]
+pub(crate) struct ModelPreview {
+    pub models: Vec<String>,
+    /// 数据来源模式 (由构造决定, 取数成败无关): `"router-synthesized"` (本地
+    /// 合成) | `"upstream"` (链尾实体上游清单)。解析失败 (error 有值) 时 upstream
+    /// 模式的该字段仍是 `"upstream"` — 描述期望的取数模式, 而非本次是否取到;
+    /// 消费方应先短路 `error` 再读 `models`。
+    pub source: &'static str,
+    /// upstream 来源的实际取数 provider id (pool = 当前命中成员, direct = 自身;
+    /// router 来源缺席 — 合成清单横跨多个上游).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+pub(crate) async fn provider_model_preview(state: &AppState, entry: &Provider) -> ModelPreview {
+    match &entry.kind {
+        ProviderKind::Router(_) => ModelPreview {
+            models: advertised_names(state, entry).await,
+            source: "router-synthesized",
+            upstream_id: None,
+            error: None,
+        },
+        // Direct / Pool 共用一条解析路径: resolve_route 对 Direct 恒返回自身,
+        // 对 Pool 走状态机选当前命中成员 (契约同转发路径, 见函数 doc).
+        ProviderKind::Direct(_) | ProviderKind::Pool(_) => {
+            // request_model 传 "": 两构造的解析都不消费 model (Direct 链尾即返,
+            // Pool 无路由匹配), Router 已在上臂分流.
+            let (models, upstream_id, error) =
+                match state.providers.resolve_route(entry, "", &state.pools) {
+                    Ok(resolved) => {
+                        let direct = &resolved.provider;
+                        let api_key = direct.effective_api_key(&resolved.id);
+                        let preferred = direct.common_uri.as_deref();
+                        // fetch 失败是数据 (error 字段), models 恒空 — 两分支的
+                        // source/upstream_id 同值 (source 描述取数模式, 见 struct doc).
+                        match fetch_model_list(&state.upstream, &api_key, direct, preferred).await {
+                            Ok((models, _)) => (models, Some(resolved.id), None),
+                            Err(reason) => (Vec::new(), Some(resolved.id), Some(reason)),
+                        }
+                    }
+                    Err(e) => (Vec::new(), None, Some(e.to_string())),
+                };
+            ModelPreview {
+                models,
+                source: "upstream",
+                upstream_id,
+                error,
+            }
+        }
+    }
 }
 
 /// 单端点 GET + parse 的错误 (结构化 — v1 族懒回退的触发判别不依赖错误串

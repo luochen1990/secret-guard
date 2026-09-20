@@ -104,6 +104,8 @@ pub use models::ModelListCache;
 // (probe_provider_upstream 执行出站 HTTP 探测, 非纯数据/纯函数), 依赖方向
 // 例外已登记在根 AGENTS.md "已接受的例外".
 pub(crate) use models::probe_provider_upstream;
+/// 模型清单预览 (WebUI endpoints 弹窗; 取数 SSOT 与 router /models 合成同乡).
+pub(crate) use models::provider_model_preview;
 
 /// axum 路径参数: `/{proto}/{name}/{*rest}`.
 ///

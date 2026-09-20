@@ -89,6 +89,7 @@ forward 路由 (`/{proto}/{name}/...`) 首段必须是 proto 简写, 由
 | `/api/secrets` [+ `/{id}` [+ `/decision`]] | secret CRUD + OverrideMode |
 | `/api/providers` [+ `/{id}` [+ `/decision`]] + `/probe` | provider CRUD + OverrideMode + 协议自动探测 (静态段优先于 `{id}`: POST = 探测; PUT/DELETE `/probe` = 以固定 id="probe" 适配的编辑/删除薄 wrapper, 存量 "probe" 条目由此可管理 — 新建该 id 仍在 upsert 校验层拒绝, 纯防混淆) |
 | `/api/providers/{id}/pool-reset` | pool 条目成员闹钟清空 (POST; 两段路径与 `{id}/decision` 同型, 无单段阴影) |
+| `/api/providers/{id}/models` | 模型清单预览 (GET; endpoints 弹窗的 Models 按钮 — Router 本地合成 / Direct+Pool 上游现场 fetch, 失败是数据恒 200; 取数算法与转发路径 /models 同乡 `proxy::models`) |
 | `/api/api-keys` [+ `/{id}` [+ `/toggle`]] | API key CRUD |
 | `/api/usage/summary` | 模型用量统计汇总 (usage-stats, 定价经 models.dev 惰性拉取) |
 | `/api/me` | 当前登录用户信息 (公开, 未登录返回 `authenticated:false`; 仅 auth 启用时挂载, 单用户模式无此路由) |
