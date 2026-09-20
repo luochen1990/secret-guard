@@ -9,7 +9,8 @@
 `services.secret-guard` 的结构化选项 (`providers` / `secrets.entries` / `redact` /
 `auth` / `usage` / `upstreamTimeouts`) 在未显式设 `configFile` 时自动生成
 `secret-guard.toml` (渲染 SSOT:
-`nix/render.nix`, 字段校验 — sum type / base_url 卫生 / 路由悬空与环检测 — 全部 eval 期
+`nix/render.nix`, 字段校验 — sum type / endpoints 端点表 (至少一条, 每协议至多一条) /
+base_url 卫生 / 路由悬空与环检测 — 全部 eval 期
 fail-fast, 配错在 `nixos-rebuild` 时即报错而非部署后 crash-loop). 生成物暴露在只读选项
 `services.secret-guard.resolvedConfigFile`, 调试可直接
 `nix eval .#nixosConfigurations.<host>.config.services.secret-guard.resolvedConfigFile` 后 cat.
@@ -36,17 +37,24 @@ fail-fast, 配错在 `nixos-rebuild` 时即报错而非部署后 crash-loop). �
   services.secret-guard = {
     enable = true;
 
-    providers."zai-coding-plan" = {
-      name = "Zhipuai Coding Plan";
+    # 多协议端点 (multi-endpoint): 一份凭证 + 有序端点表, 渲染为
+    # [[providers.endpoints]] 段. 每协议至多一条; 数组序 = fallback 序 —
+    # 首条是默认端点, ingress 协议无精确匹配时兜底走跨协议翻译.
+    # 下例 (智谱 GLM): /o/zhipu → OpenAI 端点同协议透传,
+    # /a/zhipu → Anthropic 端点同协议透传, /r/zhipu → fallback 首条翻译.
+    providers."zhipu" = {
+      name = "Zhipuai GLM";
       kind = "direct";
-      protocol = "openai";
-      baseUrl = "https://open.bigmodel.cn/api/coding/paas/v4";
+      endpoints = [
+        { protocol = "openai"; baseUrl = "https://open.bigmodel.cn/api/paas/v4"; }
+        { protocol = "anthropic"; baseUrl = "https://open.bigmodel.cn/api/anthropic"; }
+      ];
       apiKeyFile = "/run/credentials/secret-guard.service/zai_key";
     };
     # router 形态 (虚拟端点, 按 model 通配符路由; attrsOf 跨模块可合并)
     providers."default-route" = {
       kind = "router";
-      routes = [{ modelPattern = "*"; target = "zai-coding-plan"; priority = 100; }];
+      routes = [{ modelPattern = "*"; target = "zhipu"; priority = 100; }];
     };
 
     # redact 保护清单 ([[secrets.entries]] 段)
@@ -91,12 +99,18 @@ systemd.services.secret-guard.serviceConfig.LoadCredential = [
 
 services.secret-guard.configFile = (pkgs.writeText "secret-guard.toml" ''
   [[providers]]
-  id = "zai-coding-plan"
+  id = "zhipu"
   kind = "direct"
-  protocol = "openai"
-  base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
   api_key_file = "/run/credentials/secret-guard.service/zai_key"
   enabled = true
+
+  [[providers.endpoints]]
+  protocol = "openai"
+  base_url = "https://open.bigmodel.cn/api/paas/v4"
+
+  [[providers.endpoints]]
+  protocol = "anthropic"
+  base_url = "https://open.bigmodel.cn/api/anthropic"
 '');
 ```
 
@@ -112,8 +126,8 @@ services.secret-guard.configFile = (pkgs.writeText "secret-guard.toml" ''
   [[providers]]
   id = "zai-coding-plan"
   kind = "direct"
-  protocol = "openai"
-  base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
+  # 单端点紧凑写法 (与 [[providers.endpoints]] 段等价, 多端点时用段形态)
+  endpoints = [ { protocol = "openai", base_url = "https://open.bigmodel.cn/api/coding/paas/v4" } ]
   api_key_file = "${config.sops.secrets."zai_api_key".path}"
   enabled = true
 '');

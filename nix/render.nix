@@ -9,7 +9,9 @@
 # 生成的 toml 字段名/嵌套必须与上游 serde 定义逐字段吻合 (选项 camelCase →
 # toml snake_case 的映射单源于本文件):
 #   - Provider (src/provider.rs, kind internally tagged): id / enabled / name?
-#     + direct: protocol / base_url / api_key? / api_key_file?
+#     + direct: endpoints[] (protocol / base_url / common_uri? — 多协议端点,
+#       每协议至多一条, 数组序 = fallback 序) + api_key? / api_key_file?
+#       (凭证 provider 级共享, 所有端点共用)
 #     + router: routes[] (model_pattern / target / upstream_model? / priority?,
 #       省略 = 透传 / 该路由禁用)
 #     + pool: members[] (Direct provider id) / cooldown_secs? (省略 = 60) /
@@ -38,9 +40,13 @@
 #
 # eval 期校验单点收敛 (历史原型散在 render 与 checkToml 两处, 此处合一):
 #   - 语法: 生成物 fromTOML round-trip, 非法 TOML 在 eval 期即 throw
-#   - sum type fail-fast: direct 缺 protocol/baseUrl、分支专属字段串用、kind 非法、
-#     router 空 routes、pool 空 members、apiKey/apiKeyFile 互斥、tomlComment 多行
-#   - base_url 卫生: 非空 + http(s):// 前缀 + 末尾不带 / (对齐上游 validate_base_url)
+#   - sum type fail-fast: direct 空/缺 endpoints、endpoints 内 protocol 重复、
+#     endpoint baseUrl/common_uri 卫生、旧单端点字段残留 (protocol/baseUrl/
+#     commonUri — multi-endpoint D1 直接切无兼容, 残留即指路 endpoints)、
+#     分支专属字段串用、kind 非法、router 空 routes、pool 空 members、
+#     apiKey/apiKeyFile 互斥、tomlComment 多行
+#   - base_url 卫生: 非空 + http(s):// 前缀 + 末尾不带 / (对齐上游 validate_base_url,
+#     per-endpoint)
 #   - id 卫生: provider id / secrets entry id / route target / pool member
 #     符合上游 validate_id (1..=64, 首字符字母数字, 其余 [A-Za-z0-9_-])
 #   - auth fail-fast: enabled 但无 oidc、apiKeys 的 key/keyFile 恰一、redirect_url
@@ -58,7 +64,9 @@
   port,
   # attrsOf provider, attr 名 = provider id:
   #   { <id> = { name ? str; enable ? bool; tomlComment ? [str];
-  #              kind == "direct": protocol, baseUrl, apiKey ? "", apiKeyFile ? path
+  #              kind == "direct": endpoints = [{ protocol, baseUrl,
+  #                                              commonUri ? str|null }],
+  #                              apiKey ? "", apiKeyFile ? path
   #            | kind == "router": routes = [{ modelPattern, target,
   #                                           upstreamModel ?, priority ? }]
   #            | kind == "pool": members = [str],
@@ -191,46 +199,103 @@ let
         ++ lib.optional ((r.priority or null) != null) "priority = ${toString r.priority}"
       );
 
+  # 上游 Endpoint validate 的 common_uri 值域 Nix 镜像: "" (版本前缀已含) 或
+  # 以 / 开头的合法 path 片段 — 无尾 /、无 ?/#/空格、≤64 字符 (长度按字节计,
+  # 同 validId 的 ASCII 等价注记).
+  commonUriOk =
+    cu:
+    cu == ""
+    || (
+      lib.hasPrefix "/" cu
+      && !lib.hasSuffix "/" cu
+      && !lib.hasInfix "?" cu
+      && !lib.hasInfix "#" cu
+      && !lib.hasInfix " " cu
+      && builtins.stringLength cu <= 64
+    );
+
+  # 旧单端点 schema (provider 级 protocol+baseUrl 原子字段) 的迁移残留检测:
+  # multi-endpoint schema 直接切换无兼容 (设计裁决 D1), 出现旧字段即指路
+  # endpoints[]. module 侧选项已删除 (eval 期即拦 "option不存在"), 此处兜底
+  # 绕过 module 直接调用 render 的手写 attrset (契约测试路径).
+  legacyDirectFields =
+    p:
+    lib.filter (f: (p.${f} or null) != null) [
+      "protocol"
+      "baseUrl"
+      "commonUri"
+    ];
+
+  # 单个端点 (multi-endpoint): common_uri 行省略 = 上游 serde None (未探测,
+  # fetch 侧候选序列现场推导); 显式 "" = 版本前缀已含布局 (与 None 语义不同,
+  # 必须渲染成空串行). 段序: endpoints 段块跟在 provider 键值块之后 (与
+  # routes 同型 — TOML 数组-of-tables 必须后置, 否则键会被吸进子表).
+  renderEndpoint =
+    id: e:
+    if !baseUrlOk e.baseUrl then
+      throw "secret-guard render: direct provider '${id}' 的 endpoint (${e.protocol}) baseUrl 非法: '${e.baseUrl}' (须 http(s):// 开头且末尾不带 /)"
+    else if (e.commonUri or null) != null && !commonUriOk e.commonUri then
+      throw "secret-guard render: direct provider '${id}' 的 endpoint (${e.protocol}) commonUri 非法: '${e.commonUri}' (须空串 (版本前缀已含) 或 / 开头的 path 片段, 无尾 /、?、#、空格, ≤64 字符)"
+    else
+      lib.concatStringsSep "\n" (
+        [
+          "[[providers.endpoints]]"
+          "protocol = ${q e.protocol}"
+          "base_url = ${q e.baseUrl}"
+        ]
+        ++ lib.optional ((e.commonUri or null) != null) "common_uri = ${q e.commonUri}"
+      );
+
   renderProvider =
     id: p:
-    if p.kind == "direct" then
-      if (p.protocol or null) == null || (p.baseUrl or null) == null then
-        throw "secret-guard render: direct provider '${id}' 缺 protocol/baseUrl (kind=direct 必填)"
-      else if !baseUrlOk p.baseUrl then
-        throw "secret-guard render: direct provider '${id}' 的 baseUrl 非法: '${p.baseUrl}' (须 http(s):// 开头且末尾不带 /)"
+    # 旧单端点字段残留守卫先于 kind dispatch (kind 无关, 单点): 迁移残留的用户
+    # 最先看到指路信息, 而非 "routes 为空" 之类的次生错误.
+    let
+      legacy = legacyDirectFields p;
+    in
+    if legacy != [ ] then
+      throw "secret-guard render: provider '${id}' 仍在用旧单端点字段 ${toString legacy} — multi-endpoint schema 已切换 (D1 直接切, 无兼容), 请改写为 endpoints = [ { protocol; baseUrl; commonUri ? null; } ]"
+    else if p.kind == "direct" then
+      let
+        eps = p.endpoints or [ ];
+        # 每协议至多一条 (上游 validate 拒绝重复; 报重复的 protocol 名便于定位)
+        dupProtos = dups (map (e: e.protocol) eps);
+      in
+      if eps == [ ] then
+        throw "secret-guard render: direct provider '${id}' 缺 endpoints (kind=direct 必填, 至少一条端点; 上游 validate 拒绝空端点表)"
+      else if dupProtos != [ ] then
+        throw "secret-guard render: direct provider '${id}' 的 endpoints 内 protocol 重复: ${toString dupProtos} (每协议至多一条, 上游 validate 拒绝)"
       else if (p.routes or [ ]) != [ ] then
         throw "secret-guard render: direct provider '${id}' 不该有 routes (router 分支专属字段; kind 改写后遗留的 stray 字段会被上游静默忽略, 此处 fail-fast)"
       else if (p.apiKeyFile or null) != null && (p.apiKey or "") != "" then
         throw "secret-guard render: direct provider '${id}' 不该同时设 apiKeyFile/apiKey (互斥, 上游 validate 拒绝同设)"
       else
-        lib.concatStringsSep "\n" (
-          [ (providerHead id p) ]
-          ++ [
-            "kind = \"direct\""
-            "protocol = ${q p.protocol}"
-            "base_url = ${q p.baseUrl}"
+        # provider 键值块 (id/kind/凭证/enabled) 在前, endpoints 段块在后 —
+        # TOML 数组-of-tables 后置 (与 routes 同型), 否则裸键会被吸进端点子表.
+        lib.concatStringsSep "\n\n" (
+          [
+            (lib.concatStringsSep "\n" (
+              [ (providerHead id p) ]
+              ++ [ "kind = \"direct\"" ]
+              ++ (
+                if (p.apiKeyFile or null) != null then
+                  [
+                    "# api_key 从文件读取: 每次转发时 read+trim (容忍换行), 读不到 → 空 key + warn."
+                    "api_key_file = ${q (absFile "direct provider '${id}' 的 apiKeyFile" p.apiKeyFile)}"
+                  ]
+                else
+                  lib.optional ((p.apiKey or "") != "") "api_key = ${q p.apiKey}"
+              )
+              ++ [ "enabled = ${lib.boolToString (p.enable or true)}" ]
+            ))
           ]
-          ++ (
-            if (p.apiKeyFile or null) != null then
-              [
-                "# api_key 从文件读取: 每次转发时 read+trim (容忍换行), 读不到 → 空 key + warn."
-                "api_key_file = ${q (absFile "direct provider '${id}' 的 apiKeyFile" p.apiKeyFile)}"
-              ]
-            else
-              lib.optional ((p.apiKey or "") != "") "api_key = ${q p.apiKey}"
-          )
-          ++ [ "enabled = ${lib.boolToString (p.enable or true)}" ]
+          ++ map (renderEndpoint id) eps
         )
     else if p.kind == "router" then
       if (p.routes or [ ]) == [ ] then
         throw "secret-guard render: router provider '${id}' routes 为空 (上游 validate 拒绝空路由表)"
-      else if
-        (p.protocol or null) != null
-        || (p.baseUrl or null) != null
-        || (p.apiKeyFile or null) != null
-        || (p.apiKey or "") != ""
-      then
-        throw "secret-guard render: router provider '${id}' 不该有 protocol/baseUrl/apiKey/apiKeyFile (direct 分支专属字段, 上游 sum type 下不存在)"
+      else if (p.endpoints or [ ]) != [ ] || (p.apiKeyFile or null) != null || (p.apiKey or "") != "" then
+        throw "secret-guard render: router provider '${id}' 不该有 endpoints/apiKey/apiKeyFile (direct 分支专属字段, 上游 sum type 下不存在)"
       else
         lib.concatStringsSep "\n\n" (
           [
@@ -268,13 +333,12 @@ let
       else if badMembers != [ ] then
         throw "secret-guard render: pool provider '${id}' 的 member id 非法 (须 1..=64, 首字符字母数字, 其余 [A-Za-z0-9_-]): ${toString badMembers}"
       else if
-        (p.protocol or null) != null
-        || (p.baseUrl or null) != null
+        (p.endpoints or [ ]) != [ ]
         || (p.apiKeyFile or null) != null
         || (p.apiKey or "") != ""
         || (p.routes or [ ]) != [ ]
       then
-        throw "secret-guard render: pool provider '${id}' 不该有 protocol/baseUrl/apiKey/apiKeyFile/routes (其他分支专属字段, 上游 sum type 下不存在)"
+        throw "secret-guard render: pool provider '${id}' 不该有 endpoints/apiKey/apiKeyFile/routes (其他分支专属字段, 上游 sum type 下不存在)"
       else
         # cooldown_secs 行必须在 [providers.exhaust] 段头之前 (TOML 表段后的
         # 键归属该子表); 省略 = 上游 serde default 60.

@@ -294,25 +294,48 @@ in
                 "router"
                 "pool"
               ];
-              description = "构造判别: direct=直连上游 (protocol/baseUrl/apiKey*) / router=虚拟路由表 (routes) / pool=套餐池 (members, 窗口限额耗尽自动 failover).";
+              description = "构造判别: direct=直连上游 (endpoints 多协议端点表 + 共享 apiKey*) / router=虚拟路由表 (routes) / pool=套餐池 (members, 窗口限额耗尽自动 failover).";
             };
-            protocol = lib.mkOption {
-              type = lib.types.nullOr (
-                lib.types.enum [
-                  "openai"
-                  "anthropic"
-                  "gemini"
-                  "ollama"
-                  "openairesponses"
-                ]
+            endpoints = lib.mkOption {
+              type = lib.types.listOf (
+                lib.types.submodule {
+                  options = {
+                    protocol = lib.mkOption {
+                      type = lib.types.enum [
+                        "openai"
+                        "anthropic"
+                        "gemini"
+                        "ollama"
+                        "openairesponses"
+                      ];
+                      description = "该端点的协议 (ingress 精确匹配 → 同协议透传; 其余 ingress 命中其它端点或 fallback 首条走跨协议翻译). 同一 provider 内每协议至多一条 (render 层 fail-fast, 对齐上游 validate).";
+                    };
+                    baseUrl = lib.mkOption {
+                      type = lib.types.str;
+                      description = "该端点的上游 base URL, 须 http(s):// 开头且末尾不带 / (render 层 fail-fast, 对齐上游 validate_base_url).";
+                    };
+                    commonUri = lib.mkOption {
+                      type = lib.types.nullOr lib.types.str;
+                      default = null;
+                      description = ''
+                        该端点自建请求 (模型清单合成 fetch) 的公共 URI 前缀, 不影响转发.
+                        null = 未探测 (fetch 侧候选序列现场推导); "" = 版本前缀已含
+                        (智谱等国产系, models 端点 = base + /models); "/v1" = 裸根布局
+                        (官方 OpenAI/Anthropic 形态). 值域校验 render 层 fail-fast
+                        (对齐上游 Endpoint validate).
+                      '';
+                    };
+                  };
+                }
               );
-              default = null;
-              description = "kind=direct 必填: 上游协议 (决定 egress protocol, 跨协议请求自动走 codec 翻译).";
-            };
-            baseUrl = lib.mkOption {
-              type = lib.types.nullOr lib.types.str;
-              default = null;
-              description = "kind=direct 必填: 上游 base URL, 须 http(s):// 开头且末尾不带 /.";
+              default = [ ];
+              description = ''
+                kind=direct 的有序端点表 (渲染为 [[providers.endpoints]] 段, 与
+                [[providers.routes]] 同型): 至少一条 (空表 render 层 throw, 对齐上游
+                validate "at least one endpoint"), 每协议至多一条; 数组序 = fallback
+                序 — 首条是默认端点, ingress 协议无精确匹配时兜底走跨协议翻译.
+                所有端点共享 provider 级 apiKey/apiKeyFile (一份凭证服务多协议).
+              '';
             };
             apiKey = lib.mkOption {
               type = lib.types.str;

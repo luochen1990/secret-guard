@@ -2,7 +2,8 @@
 #
 # 覆盖:
 #   - 结构 round-trip: 生成物是合法 TOML (fromTOML), 字段名/嵌套与 src serde
-#     定义吻合 (provider sum type (direct/router/pool) / routes / pool 的
+#     定义吻合 (provider sum type (direct/router/pool) / direct 的多端点
+#     endpoints[] (含 §5.2 逐字节锁定) / routes / pool 的
 #     members+exhaust+cooldown_secs / auth (含 secure_cookie) /
 #     secrets.entries / redact.redacted_headers / usage 定价覆盖段)
 #   - 确定性: providers 按 id 字典序输出
@@ -10,7 +11,8 @@
 #   - 路径直通: apiKeyFile / valueFile / clientSecretFile / keyFile 原样写入
 #     (无 LoadCredential 派生 — 与 nixos 侧原型的语义差异)
 #   - 布局: 文件单换行结尾, 头部注释存在
-#   - fail-fast: sum type 违规 / base_url 卫生 / id 卫生 / auth 互斥 /
+#   - fail-fast: sum type 违规 (含旧单端点字段残留, D1) / endpoints 卫生
+#     (空表 / protocol 重复 / base_url / common_uri 值域) / id 卫生 / auth 互斥 /
 #     usage 键卫生与负价 / pricingUrl 形状 / 悬空 target 与 pool member /
 #     环检测 (含 pool 边) / redactedHeaders 空白条目 全部 eval 期 throw
 #
@@ -30,11 +32,22 @@ let
     port = 18787;
     # attr 名故意非字母序, 验证输出按 id 字典序
     providers = {
+      # 双端点 direct (multi-endpoint 契约样例): commonUri 一有一无 —
+      # 覆盖 省略 (serde None, 未探测) 与 显式 "" (版本前缀已含) 两种形态
       b-upstream = {
         name = ''Z "quoted" \\ backslash'';
         kind = "direct";
-        protocol = "openai";
-        baseUrl = "https://open.example.com/v4";
+        endpoints = [
+          {
+            protocol = "openai";
+            baseUrl = "https://open.example.com/v4";
+          }
+          {
+            protocol = "anthropic";
+            baseUrl = "https://open.example.com/anthropic";
+            commonUri = "";
+          }
+        ];
         apiKeyFile = "/run/secrets/llm__k_api_key";
       };
       a-router = {
@@ -167,6 +180,78 @@ let
         && byId.b-upstream.kind == "direct"
         && byId.a-router.kind == "router"
         && byId.c-pool.kind == "pool";
+    }
+    {
+      # multi-endpoint round-trip: [[providers.endpoints]] 段 (internally-tagged
+      # 平铺, 非 providers.direct.endpoints), 键名 protocol/base_url/common_uri
+      # 与上游 Endpoint serde 吻合; 声明序保持 (数组序 = fallback 序).
+      name = "multi-endpoint: 双端点 round-trip — 段嵌套/键名/声明序与上游 serde 吻合";
+      ok =
+        let
+          eps = byId.b-upstream.endpoints;
+        in
+        builtins.length eps == 2
+        && (builtins.elemAt eps 0).protocol == "openai"
+        && (builtins.elemAt eps 0).base_url == "https://open.example.com/v4"
+        && !((builtins.elemAt eps 0) ? common_uri) # 省略 = serde None (未探测)
+        && (builtins.elemAt eps 1).protocol == "anthropic"
+        && (builtins.elemAt eps 1).base_url == "https://open.example.com/anthropic"
+        && (builtins.elemAt eps 1).common_uri == ""; # 显式 "" ≠ None, 必须渲染
+    }
+    {
+      # D1 直接切: 旧 provider 级 protocol/base_url/common_uri 键不再存在
+      # (字段已移入 endpoints); 若渲染残留旧键, 新 schema 的上游加载审计会 WARN.
+      name = "multi-endpoint: direct 顶层无 protocol/base_url/common_uri 键 (D1 直接切)";
+      ok =
+        !(byId.b-upstream ? protocol) && !(byId.b-upstream ? base_url) && !(byId.b-upstream ? common_uri);
+    }
+    {
+      # multi-endpoint TOML 目标形态 (特性设计 §5.2) 的逐字节锁定 — T4 终验断言
+      # 固化: 智谱双端点生成形态必须逐字段一致 (段头形态 / 键名 / 段序: provider
+      # 键值块在前, endpoints 段块在后). schema 权威 = src/provider.rs 的
+      # DirectProvider/Endpoint serde (round-trip 测试
+      # toml_multi_endpoint_roundtrip_preserves_order_and_common_uri 同源锁定).
+      # 假绿收口锚点: serde schema 切换而 nix 侧仍渲染旧形态时, 本断言红.
+      name = "multi-endpoint: 智谱双端点生成形态与 §5.2 目标形态逐字节一致";
+      ok =
+        let
+          t = render {
+            inherit lib;
+            host = "127.0.0.1";
+            port = 18787;
+            providers.zhipu = {
+              kind = "direct";
+              endpoints = [
+                {
+                  protocol = "openai";
+                  baseUrl = "https://open.bigmodel.cn/api/paas/v4";
+                }
+                {
+                  protocol = "anthropic";
+                  baseUrl = "https://open.bigmodel.cn/api/anthropic";
+                }
+              ];
+              apiKey = "sk-...";
+            };
+          };
+          expected = lib.concatStringsSep "\n" [
+            "[[providers]]"
+            ''id = "zhipu"''
+            "# kind: provider 构造判别 (direct=直连上游 / router=虚拟路由 / pool=套餐池), sum type 必填."
+            ''kind = "direct"''
+            ''api_key = "sk-..."''
+            "enabled = true"
+            ""
+            "[[providers.endpoints]]"
+            ''protocol = "openai"''
+            ''base_url = "https://open.bigmodel.cn/api/paas/v4"''
+            ""
+            "[[providers.endpoints]]"
+            ''protocol = "anthropic"''
+            ''base_url = "https://open.bigmodel.cn/api/anthropic"''
+          ];
+        in
+        lib.hasInfix expected t;
     }
     {
       # pool 字段 round-trip: members 数组 + cooldown_secs + exhaust 段三字段
@@ -586,26 +671,150 @@ let
         !lib.hasInfix "[usage]" t;
     }
 
-    # ── fail-fast: sum type / 字段卫生 ──────────────────────────────────
+    # ── fail-fast: multi-endpoint (direct) ──────────────────────────────
     {
-      name = "fail-fast: direct 缺 protocol → throw";
-      ok = renderProviderFails "b-upstream" { protocol = null; };
+      name = "fail-fast: direct 缺/空 endpoints → throw (上游 validate: at least one endpoint)";
+      ok = renderProviderFails "b-upstream" { endpoints = [ ]; };
     }
     {
-      name = "fail-fast: direct 缺 baseUrl → throw";
-      ok = renderProviderFails "b-upstream" { baseUrl = null; };
+      name = "fail-fast: endpoint baseUrl 空 → throw";
+      ok = renderProviderFails "b-upstream" {
+        endpoints = [
+          {
+            protocol = "openai";
+            baseUrl = "";
+          }
+        ];
+      };
     }
     {
-      name = "fail-fast: direct baseUrl 空 → throw";
-      ok = renderProviderFails "b-upstream" { baseUrl = ""; };
+      name = "fail-fast: endpoint baseUrl 非 http(s) → throw (对齐上游 validate_base_url)";
+      ok = renderProviderFails "b-upstream" {
+        endpoints = [
+          {
+            protocol = "openai";
+            baseUrl = "ftp://x";
+          }
+        ];
+      };
     }
     {
-      name = "fail-fast: baseUrl 非 http(s) → throw (对齐上游 validate_base_url)";
-      ok = renderProviderFails "b-upstream" { baseUrl = "ftp://x"; };
+      name = "fail-fast: endpoint baseUrl 尾带 / → throw (对齐上游 validate_base_url)";
+      ok = renderProviderFails "b-upstream" {
+        endpoints = [
+          {
+            protocol = "openai";
+            baseUrl = "https://x/";
+          }
+        ];
+      };
     }
     {
-      name = "fail-fast: baseUrl 尾带 / → throw (对齐上游 validate_base_url)";
-      ok = renderProviderFails "b-upstream" { baseUrl = "https://x/"; };
+      name = "fail-fast: endpoints 内 protocol 重复 → throw (上游 validate: 每协议至多一条)";
+      ok = renderProviderFails "b-upstream" {
+        endpoints = [
+          {
+            protocol = "openai";
+            baseUrl = "https://a.example.com";
+          }
+          {
+            protocol = "openai";
+            baseUrl = "https://b.example.com";
+          }
+        ];
+      };
+    }
+    {
+      name = "fail-fast: commonUri 值域 — 无 / 前缀 → throw (对齐上游 Endpoint validate)";
+      ok = renderProviderFails "b-upstream" {
+        endpoints = [
+          {
+            protocol = "openai";
+            baseUrl = "https://x";
+            commonUri = "v1";
+          }
+        ];
+      };
+    }
+    {
+      name = "fail-fast: commonUri 值域 — 尾 / → throw";
+      ok = renderProviderFails "b-upstream" {
+        endpoints = [
+          {
+            protocol = "openai";
+            baseUrl = "https://x";
+            commonUri = "/v1/";
+          }
+        ];
+      };
+    }
+    {
+      name = "fail-fast: commonUri 值域 — 含 ? → throw";
+      ok = renderProviderFails "b-upstream" {
+        endpoints = [
+          {
+            protocol = "openai";
+            baseUrl = "https://x";
+            commonUri = "/v1?q";
+          }
+        ];
+      };
+    }
+    {
+      name = "fail-fast: commonUri 值域 — 超 64 字符 → throw";
+      ok = renderProviderFails "b-upstream" {
+        endpoints = [
+          {
+            protocol = "openai";
+            baseUrl = "https://x";
+            commonUri = "/" + builtins.concatStringsSep "" (lib.genList (_: "a") 64);
+          }
+        ];
+      };
+    }
+    {
+      name = "multi-endpoint: commonUri = \"/v1\" 渲染 common_uri 行 (裸根布局形态)";
+      ok =
+        let
+          t = providerToml "b-upstream" {
+            endpoints = [
+              {
+                protocol = "openai";
+                baseUrl = "https://open.example.com";
+                commonUri = "/v1";
+              }
+            ];
+          };
+          eps = (builtins.elemAt (builtins.fromTOML t).providers 1).endpoints;
+        in
+        (builtins.elemAt eps 0).common_uri == "/v1";
+    }
+    {
+      # 正向边界 (对齐上游 validate_common_uri_accepts_legal_forms): 恰 64 字符
+      # 合法 — 与上方 "超 64 字符 → throw" 负向用例夹住边界.
+      name = "multi-endpoint: commonUri 恰 64 字符合法 (边界, 对齐上游 legal_forms)";
+      ok =
+        let
+          t = providerToml "b-upstream" {
+            endpoints = [
+              {
+                protocol = "openai";
+                baseUrl = "https://x";
+                commonUri = "/" + builtins.concatStringsSep "" (lib.genList (_: "a") 63);
+              }
+            ];
+          };
+          eps = (builtins.elemAt (builtins.fromTOML t).providers 1).endpoints;
+        in
+        builtins.stringLength (builtins.elemAt eps 0).common_uri == 64;
+    }
+    {
+      name = "fail-fast: direct 旧单端点字段残留 (protocol) → throw 指路 endpoints (D1 直接切)";
+      ok = renderProviderFails "b-upstream" { protocol = "openai"; };
+    }
+    {
+      name = "fail-fast: direct 旧单端点字段残留 (baseUrl) → throw 指路 endpoints (D1 直接切)";
+      ok = renderProviderFails "b-upstream" { baseUrl = "https://x"; };
     }
     {
       name = "fail-fast: direct 带路由分支专属 routes → throw";
@@ -631,12 +840,22 @@ let
       ok = renderProviderFails "a-router" { routes = [ ]; };
     }
     {
-      name = "fail-fast: router 带 direct 分支专属 baseUrl → throw";
-      ok = renderProviderFails "a-router" { baseUrl = "https://x"; };
+      name = "fail-fast: router 旧单端点字段残留 (protocol/baseUrl) → throw (D1, 任一 kind 均拦)";
+      ok = renderProviderFails "a-router" {
+        protocol = "openai";
+        baseUrl = "https://x";
+      };
     }
     {
-      name = "fail-fast: router 带 direct 分支专属 protocol → throw";
-      ok = renderProviderFails "a-router" { protocol = "openai"; };
+      name = "fail-fast: router 带 direct 分支专属 endpoints → throw";
+      ok = renderProviderFails "a-router" {
+        endpoints = [
+          {
+            protocol = "openai";
+            baseUrl = "https://x";
+          }
+        ];
+      };
     }
     {
       name = "fail-fast: router 带 direct 分支专属 apiKeyFile → throw";
@@ -957,8 +1176,19 @@ let
       ok = renderProviderFails "c-pool" { members = [ "ghost" ]; };
     }
     {
-      name = "fail-fast: pool 带 direct 分支专属 baseUrl → throw";
+      name = "fail-fast: pool 旧单端点字段残留 (baseUrl) → throw (D1, 任一 kind 均拦)";
       ok = renderProviderFails "c-pool" { baseUrl = "https://x"; };
+    }
+    {
+      name = "fail-fast: pool 带 direct 分支专属 endpoints → throw";
+      ok = renderProviderFails "c-pool" {
+        endpoints = [
+          {
+            protocol = "openai";
+            baseUrl = "https://x";
+          }
+        ];
+      };
     }
     {
       name = "fail-fast: pool 带 router 分支专属 routes → throw";

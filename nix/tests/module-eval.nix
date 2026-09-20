@@ -19,6 +19,20 @@ let
   # nixosSystem 脚手架: 主模块 + 额外 modules (hostPlatform 由各 config 自带)
   sgEv = extra: lib.nixosSystem { modules = [ secretGuardModule ] ++ extra; };
 
+  # 最小 direct provider fixture (单 openai 端点): 五处 host config 的被测对象
+  # 都在 endpoints 之外 (互斥/超时/停机窗口/旧选项删除), endpoints 纯属让
+  # config 合法的样板 — 单点声明, schema 再演进只改这里. (双端点 fixture 是
+  # assert-toml 的被测对象, 保持 minimalConfig 内显式 inline.)
+  directFixture = url: {
+    kind = "direct";
+    endpoints = [
+      {
+        protocol = "openai";
+        baseUrl = url;
+      }
+    ];
+  };
+
   # 结构化最小 host config: direct + router + secrets + auth + usage 全字段形态.
   minimalConfig = {
     nixpkgs.hostPlatform = system;
@@ -28,8 +42,19 @@ let
         "b-upstream" = {
           name = ''Z "quoted" \\ backslash'';
           kind = "direct";
-          protocol = "openai";
-          baseUrl = "https://open.example.com/v4";
+          # 双端点 (multi-endpoint): commonUri 一有一无 — e2e 覆盖 省略 (None)
+          # 与 显式 "" (版本前缀已含) 两种形态 (assert-toml 断言)
+          endpoints = [
+            {
+              protocol = "openai";
+              baseUrl = "https://open.example.com/v4";
+            }
+            {
+              protocol = "anthropic";
+              baseUrl = "https://open.example.com/anthropic";
+              commonUri = "";
+            }
+          ];
           apiKeyFile = "/run/secrets/upstream_key";
         };
         "a-router" = {
@@ -103,11 +128,8 @@ let
       services.secret-guard = {
         enable = true;
         providers = {
-          "b-upstream" = {
+          "b-upstream" = directFixture "https://up.example.com/v1" // {
             name = "Upstream B";
-            kind = "direct";
-            protocol = "openai";
-            baseUrl = "https://up.example.com/v1";
             apiKey = "test-inline-key";
           };
           "a-router" = {
@@ -135,10 +157,7 @@ let
       nixpkgs.hostPlatform = system;
       services.secret-guard = {
         enable = true;
-        providers."b-upstream" = {
-          kind = "direct";
-          protocol = "openai";
-          baseUrl = "https://up.example.com/v1";
+        providers."b-upstream" = directFixture "https://up.example.com/v1" // {
           apiKeyFile = "/run/secrets/upstream_key";
         };
         upstreamTimeouts.nonstreamResponseHeaderTimeoutSecs = 0;
@@ -155,10 +174,7 @@ let
       nixpkgs.hostPlatform = system;
       services.secret-guard = {
         enable = true;
-        providers."b-upstream" = {
-          kind = "direct";
-          protocol = "openai";
-          baseUrl = "https://up.example.com/v4";
+        providers."b-upstream" = directFixture "https://up.example.com/v4" // {
           apiKeyFile = "/run/secrets/upstream_key";
         };
       };
@@ -179,9 +195,7 @@ let
         services.secret-guard = {
           enable = true;
           configFile = "/etc/secret-guard.toml";
-          providers."x".kind = "direct";
-          providers."x".protocol = "openai";
-          providers."x".baseUrl = "https://x";
+          providers."x" = directFixture "https://x";
         };
       }
     ])
@@ -239,9 +253,11 @@ let
           [[providers]]
           id = "hand"
           kind = "direct"
+          enabled = true
+
+          [[providers.endpoints]]
           protocol = "openai"
           base_url = "https://hand.example.com"
-          enabled = true
         '';
       };
     }
@@ -249,6 +265,23 @@ let
   handWrittenOk =
     handWritten.config.services.secret-guard.resolvedConfigFile
     == handWritten.config.services.secret-guard.configFile;
+
+  # D1 直接切 (无兼容): 旧单端点原子选项 protocol/baseUrl 已删除 — 残留配置
+  # eval 期即报 "option 不存在", 而非静默渲染旧 schema 被 upstream validate 拒绝
+  # (T4 收口的 "假绿" 形态). commonUri 同属旧 provider 级字段清单.
+  legacyOptionFails = fails (
+    unitOf (sgEv [
+      {
+        nixpkgs.hostPlatform = system;
+        services.secret-guard = {
+          enable = true;
+          providers."x" = directFixture "https://x" // {
+            protocol = "openai";
+          };
+        };
+      }
+    ])
+  );
 
   assertions = [
     {
@@ -282,6 +315,10 @@ let
     {
       name = "手写 configFile (escape hatch) 原样透传";
       ok = handWrittenOk;
+    }
+    {
+      name = "D1 直接切: 旧原子选项 protocol 已删除 → 残留配置 eval throw";
+      ok = legacyOptionFails;
     }
   ];
   failed = builtins.filter (a: !a.ok) assertions;

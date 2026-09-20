@@ -29,15 +29,23 @@ if mode == "minimal":
     assert d["kind"] == "direct"
     assert d["enabled"] is True
     assert d["name"] == r'Z "quoted" \\ backslash', d["name"]
-    assert d["protocol"] == "openai"
-    assert d["base_url"] == "https://open.example.com/v4"
+    # D1 直接切: 旧 provider 级单端点字段已移入 endpoints (残留即 schema 漂移)
+    assert "protocol" not in d and "base_url" not in d and "common_uri" not in d
     assert d["api_key_file"] == "/run/secrets/upstream_key"
     assert "api_key" not in d  # 内联 key 未设 → 不生成行
+    eps = d["endpoints"]  # [[providers.endpoints]] 段 → 数组, 声明序保持
+    assert len(eps) == 2
+    assert eps[0]["protocol"] == "openai"
+    assert eps[0]["base_url"] == "https://open.example.com/v4"
+    assert "common_uri" not in eps[0]  # 省略 = serde None (未探测)
+    assert eps[1]["protocol"] == "anthropic"
+    assert eps[1]["base_url"] == "https://open.example.com/anthropic"
+    assert eps[1]["common_uri"] == ""  # 显式空串 = 版本前缀已含 (与 None skip 区分)
 
     r = by_id["a-router"]
     assert r["kind"] == "router"
     assert (
-        "base_url" not in r and "protocol" not in r
+        "base_url" not in r and "protocol" not in r and "endpoints" not in r
     )  # sum type: router 无 direct 字段
     assert len(r["routes"]) == 2
     rt0, rt1 = r["routes"]
@@ -93,8 +101,11 @@ elif mode == "inline":
     ]
     by_id = {p["id"]: p for p in cfg["providers"]}
     d = by_id["b-upstream"]
-    assert d["kind"] == "direct" and d["protocol"] == "openai"
-    assert d["base_url"] == "https://up.example.com/v1"
+    assert d["kind"] == "direct"
+    eps = d["endpoints"]  # 单端点 compact 形态同样渲染为 [[providers.endpoints]]
+    assert len(eps) == 1 and eps[0]["protocol"] == "openai"
+    assert eps[0]["base_url"] == "https://up.example.com/v1"
+    assert "common_uri" not in eps[0]
     assert d["api_key"] == "test-inline-key"
     assert "api_key_file" not in d  # 内联 key 形态 → 不生成 file 行
     assert d["enabled"] is True
