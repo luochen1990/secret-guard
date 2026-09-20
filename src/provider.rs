@@ -130,7 +130,7 @@ impl Protocol {
 
 /// 单个 provider 实例 — **sum type** (#187): 直连上游 (`Direct`) 或路由
 /// (`Router`) 两种构造, 配置项完全不同, 非法状态不可表示 (Router 根本没有
-/// base_url/api_key 字段)。
+/// endpoints/api_key 字段)。
 ///
 /// 共享字段: `id` / `name` / `enabled` (两种构造都可配)。出站 model 重写不再是
 /// provider 级字段 — 由 [`Route::upstream_model`] 承载 (路由命中即改写, #183 语义被
@@ -144,8 +144,21 @@ impl Protocol {
 /// [[providers]]
 /// id = "openai-main"
 /// kind = "direct"
+/// [[providers.endpoints]]
 /// protocol = "openai"
 /// base_url = "https://api.openai.com"
+///
+/// # 多协议端点 (单条目多端点, 共享 api_key):
+/// # [[providers]]
+/// # id = "zhipu"
+/// # kind = "direct"
+/// # api_key = "sk-..."
+/// # [[providers.endpoints]]
+/// # protocol = "openai"
+/// # base_url = "https://open.bigmodel.cn/api/paas/v4"
+/// # [[providers.endpoints]]
+/// # protocol = "anthropic"
+/// # base_url = "https://open.bigmodel.cn/api/anthropic"
 ///
 /// [[providers]]
 /// id = "router"
@@ -156,6 +169,9 @@ impl Protocol {
 /// upstream_model = "gpt-4o"   # 省略此字段 = 透传
 /// priority = 100        # 省略此字段 (或 null) = 该路由禁用
 /// ```
+///
+/// 单端点紧凑写法 (endpoints 内联数组): `endpoints = [ { protocol = "openai",
+/// base_url = "https://api.openai.com" } ]`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Provider {
     /// 唯一 id (slug). 同一份表 (static 或 dynamic) 中必须唯一.
@@ -188,31 +204,20 @@ pub enum ProviderKind {
     Pool(PoolProvider),
 }
 
-/// 直连上游 provider 的构造负载 ([`ProviderKind::Direct`]).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DirectProvider {
-    /// 协议: 决定上游的 egress protocol (跨协议请求自动走 codec 翻译).
+/// Direct provider 的一个协议端点 (multi-endpoint; 术语见根 AGENTS.md "Endpoint").
+///
+/// 同一 [`DirectProvider`] 内 [`Endpoint::protocol`] 唯一 (validate 拒绝重复);
+/// `base_url` / `common_uri` 语义与旧单端点 schema 的同名字段一致, 但 per-endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Endpoint {
+    /// 该端点的协议. 同一 DirectProvider 内 protocol 唯一 (validate 拒绝重复).
     pub protocol: Protocol,
-    /// 上游 base URL, 末尾**不带** `/`. 通过 [`validate_base_url`] 校验.
+    /// 该端点的上游 base URL, 末尾**不带** `/`. 通过 [`validate_base_url`] 校验.
     pub base_url: String,
-    /// API key 直接值. 明文存储在本地 config 文件中 (本地进程, 不通过网络暴露).
-    /// 与 [`DirectProvider::api_key_file`] 互斥 — 同时设置会在 validate 中报错.
-    /// skip 空串写出 (无 key 场景如 Ollama, 消 state.toml 噪音; 读回 default 等价).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub api_key: String,
-    /// 可选: 从文件路径读取 api_key. 优先级低于 [`DirectProvider::api_key`].
-    ///
-    /// 用法: 让 toml 本身不含敏感数据, secret 由外部机制 (sops-nix / systemd LoadCredential /
-    /// docker secrets / k8s secrets) 解密到独立路径, secret-guard 在请求时读取.
-    ///
-    /// 文件内容会被 `trim()` (容忍末尾换行符, 这是 sops / `echo | tee` 的常见副作用).
-    /// 文件读不到时按空 key 处理 (与 `api_key` 为空时一致), 由 `apply_provider_auth`
-    /// (在 `crate::proxy`) 决定是否跳过 auth header 注入.
-    #[serde(default)]
-    pub api_key_file: Option<std::path::PathBuf>,
-    /// secret-guard **自建请求** (fetch_model_list — router /models 本地合成拉上游
-    /// 清单) 的公共 URI 前缀, 亦即三段式 `base_url + common_uri + request_uri` 的
-    /// 中段. **不影响转发** — 转发的 request_uri 随客户端请求 rest 原样流过.
+    /// 该端点的 secret-guard **自建请求** (fetch_model_list — router /models 本地
+    /// 合成拉上游清单) 的公共 URI 前缀, 亦即三段式 `base_url + common_uri +
+    /// request_uri` 的中段. **不影响转发** — 转发的 request_uri 随客户端请求
+    /// rest 原样流过.
     ///
     /// 值语义: `"/v1"` = 裸根布局 (OpenAI/Anthropic 官方形态, base 不含版本前缀);
     /// `""` = 版本前缀已含布局 (智谱 coding plan / DeepSeek / Moonshot 等国产系,
@@ -224,6 +229,75 @@ pub struct DirectProvider {
     /// 变更后此值可能失配 — fetch 侧遇 404 回退候选序列兜底 (WARN), 不静默.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub common_uri: Option<String>,
+}
+
+impl Endpoint {
+    /// 测试便捷构造 (common_uri = None 未探测形态). 跨模块统一口径
+    /// (provider / proxy::models / config 的测试共用), 先例同
+    /// `mock::assert_no_c5_substring`.
+    #[cfg(test)]
+    pub(crate) fn new(protocol: Protocol, base_url: &str) -> Self {
+        Self {
+            protocol,
+            base_url: base_url.into(),
+            common_uri: None,
+        }
+    }
+}
+
+/// 直连上游 provider 的构造负载 ([`ProviderKind::Direct`]) — **多协议端点**:
+/// 一份共享凭证 (D3) + 有序端点列表. 同一上游的多协议兼容端点 (智谱/Kimi/
+/// DeepSeek 的 OpenAI + Anthropic 双端点) 收敛为单条目, 各 ingress 协议按
+/// [`DirectProvider::select_endpoint`] 选端点 (精确匹配 → 同协议透传; 无匹配
+/// → 首端点跨协议翻译, D2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectProvider {
+    /// 有序端点列表. 至少一条, 每协议至多一条 (validate 强制).
+    /// 数组序 = fallback 序 (第一条 = 默认端点, ingress 无精确匹配时兜底).
+    ///
+    /// 合并语义 (§5.6): **整体替换** — dynamic override 携带的 endpoints 整体
+    /// 覆盖 static (与 routes/members 的 Vec 整体提交先例一致); 鉴权字段的
+    /// #157 继承不触及本字段 (WebUI PUT 全量必填, "保留" 由前端回填后整体提交).
+    /// serde default 空 Vec 让 "字段缺席" 落到 validate 的语义化错误
+    /// ("at least one endpoint required"), 而非 serde 的 missing field 报错.
+    #[serde(default)]
+    pub endpoints: Vec<Endpoint>,
+    /// 共享凭证 (D3: 所有端点共用). 明文存储在本地 config 文件中 (本地进程,
+    /// 不通过网络暴露). 与 [`DirectProvider::api_key_file`] 互斥 — 同时设置会在
+    /// validate 中报错. skip 空串写出 (无 key 场景如 Ollama, 消 state.toml 噪音;
+    /// 读回 default 等价).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub api_key: String,
+    /// 可选: 从文件路径读取 api_key (所有端点共享). 优先级低于
+    /// [`DirectProvider::api_key`].
+    ///
+    /// 用法: 让 toml 本身不含敏感数据, secret 由外部机制 (sops-nix / systemd LoadCredential /
+    /// docker secrets / k8s secrets) 解密到独立路径, secret-guard 在请求时读取.
+    ///
+    /// 文件内容会被 `trim()` (容忍末尾换行符, 这是 sops / `echo | tee` 的常见副作用).
+    /// 文件读不到时按空 key 处理 (与 `api_key` 为空时一致), 由 `apply_provider_auth`
+    /// (在 `crate::proxy`) 决定是否跳过 auth header 注入.
+    #[serde(default)]
+    pub api_key_file: Option<std::path::PathBuf>,
+}
+
+impl DirectProvider {
+    /// 端点选择 (multi-endpoint 语义核心, D2): ingress 精确匹配 → `(该端点, true)`;
+    /// 无匹配 → `(第一个端点, false)` — 跨协议翻译 fallback, 单端点配置下自然
+    /// 退化为演进前行为. `endpoints` 为空是绕过 validate 的非法配置 → `None`
+    /// (dispatch 503, ROB 不 panic).
+    ///
+    /// 不变式: `exact == true` 时端点协议必等于 ingress, `exact == false` 时必
+    /// 不等 — 由 find 谓词结构直接保证 (不命中 ⟹ 全体端点协议 ≠ ingress,
+    /// 首端点亦然), 不依赖 validate 的唯一性; 唯一性仅让 "精确匹配" 语义无歧义
+    /// (重复协议时命中列表序先者). dispatch 以 `exact` 为 same/cross 分叉判据.
+    pub fn select_endpoint(&self, ingress: Protocol) -> Option<(&Endpoint, bool)> {
+        self.endpoints
+            .iter()
+            .find(|e| e.protocol == ingress)
+            .map(|e| (e, true))
+            .or_else(|| self.endpoints.first().map(|e| (e, false)))
+    }
 }
 
 /// 虚拟 endpoint (路由表) provider 的构造负载 ([`ProviderKind::Router`]).
@@ -530,7 +604,53 @@ impl DynamicEntry for Provider {
         crate::secrets::validate_id(&self.id)?;
         match &self.kind {
             ProviderKind::Direct(d) => {
-                validate_base_url(&d.base_url)?;
+                // 端点表三规则 (§5.5): 非空 / 每协议至多一条 / 每 endpoint 的
+                // base_url 过 validate_base_url (错误文案指明重复的 protocol 名 /
+                // 序号, 便于定位). 空 endpoints (字段缺席经 serde default 或显式
+                // 空数组) 的 Direct 无法转发任何请求, 几乎肯定是配置残缺 —
+                // 与 Router 空 routes / Pool 空 members 同型 fail-fast.
+                if d.endpoints.is_empty() {
+                    return Err(format!(
+                        "provider {} must declare at least one endpoint",
+                        self.id
+                    ));
+                }
+                let mut seen = HashSet::new();
+                for (idx, ep) in d.endpoints.iter().enumerate() {
+                    validate_base_url(&ep.base_url).map_err(|e| {
+                        format!(
+                            "provider {} endpoint #{} ({}): {e}",
+                            self.id, idx, ep.protocol
+                        )
+                    })?;
+                    if !seen.insert(ep.protocol) {
+                        return Err(format!(
+                            "provider {} declares multiple endpoints for protocol {}; \
+                             at most one endpoint per protocol is allowed",
+                            self.id,
+                            ep.protocol.name()
+                        ));
+                    }
+                    // common_uri 值域: "" (版本前缀已含) 或以 '/' 开头的合法 path
+                    // 片段 (无尾斜杠 / 无 query-fragment 分隔符 / 长度上限). 拒绝
+                    // 怪值防止手写 toml 的笔误悄悄改变 fetch 出站 URL.
+                    if let Some(cu) = &ep.common_uri {
+                        let valid = cu.is_empty()
+                            || (cu.starts_with('/')
+                                && !cu.ends_with('/')
+                                && !cu.contains(['?', '#', ' '])
+                                && cu.chars().count() <= 64);
+                        if !valid {
+                            return Err(format!(
+                                "provider {} endpoint {} common_uri must be \"\" or a \
+                                 '/'-prefixed path segment without trailing '/', '?' or \
+                                 '#' (got {cu:?})",
+                                self.id,
+                                ep.protocol.name()
+                            ));
+                        }
+                    }
+                }
                 // api_key 与 api_key_file 互斥: 同时设置时语义不明 (effective_api_key
                 // 会优先 api_key, 但这种配置几乎肯定是误操作 — 比如 toml 既填了
                 // api_key 又忘了删 api_key_file).
@@ -539,23 +659,6 @@ impl DynamicEntry for Provider {
                         "provider {} has both api_key and api_key_file set; pick one",
                         self.id
                     ));
-                }
-                // common_uri 值域: "" (版本前缀已含) 或以 '/' 开头的合法 path 片段
-                // (无尾斜杠 / 无 query-fragment 分隔符 / 长度上限). 拒绝怪值防止
-                // 手写 toml 的笔误悄悄改变 fetch 出站 URL.
-                if let Some(cu) = &d.common_uri {
-                    let valid = cu.is_empty()
-                        || (cu.starts_with('/')
-                            && !cu.ends_with('/')
-                            && !cu.contains(['?', '#', ' '])
-                            && cu.chars().count() <= 64);
-                    if !valid {
-                        return Err(format!(
-                            "provider {} common_uri must be \"\" or a '/'-prefixed path \
-                             segment without trailing '/', '?' or '#' (got {cu:?})",
-                            self.id
-                        ));
-                    }
                 }
             }
             ProviderKind::Router(r) => {
@@ -673,8 +776,10 @@ impl DynamicEntry for Provider {
     /// 继承. 让 "PUT api_key=null 保留旧值" 的 override 不落盘明文, 转发仍带旧 key.
     /// 已知限制 (static 基线下空串无法清空): 见根 AGENTS.md "#157 已知限制" 条目.
     ///
-    /// sum type 语义 (#187): 继承只在**同型构造**内发生 (Direct↔Direct 继承鉴权字段).
-    /// 跨型不继承 — override 的构造本身就是显式决策:
+    /// sum type 语义 (#187): 继承只在**同型构造**内发生 (Direct↔Direct 只继承
+    /// 鉴权字段; **endpoints 不继承** — WebUI PUT 全量必填, override 携带的
+    /// endpoints 整体替换 static, §5.6 合并语义). 跨型不继承 — override 的构造
+    /// 本身就是显式决策:
     /// - Direct override + Router static = **改回实体** (routes 无 None 歧义,
     ///   #179 登记的 "无法改回实体" 限制由类型系统根治);
     /// - Router override + Direct static = 切为路由 (Router static 无鉴权字段
@@ -733,16 +838,14 @@ pub struct EffectiveProvider {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EffectiveProviderKind {
     Direct {
-        protocol: Protocol,
-        base_url: String,
+        /// 有序端点列表 (非敏感直接透出 — 协议/base_url/common_uri 均无敏感面).
+        /// wire 形态与存储一致 (`[{protocol, base_url, common_uri?}]`),
+        /// WebUI 编辑表单全量回填后整体提交.
+        endpoints: Vec<Endpoint>,
         /// 直接值 (api_key 字段) 的 masked 视图. 若 provider 用 api_key_file,
         /// 这里是空字符串 — 文件内容由 effective_api_key() 在转发时读取, 不进 effective 视图.
         api_key_masked: String,
         api_key_length: usize,
-        /// 自建请求的公共 URI 前缀 (detect 知识的持久化形态, 见
-        /// [`DirectProvider::common_uri`]). 非敏感直接透出 — WebUI 编辑表单
-        /// 回填原值, 防止未重跑 detect 的保存把它抹回 None.
-        common_uri: Option<String>,
     },
     Router {
         routes: Vec<Route>,
@@ -769,16 +872,11 @@ pub struct ProviderMasked {
 impl From<Provider> for ProviderMasked {
     fn from(p: Provider) -> Self {
         let kind = match p.kind {
-            ProviderKind::Direct(d) => {
-                let api_key_length = d.api_key.chars().count();
-                EffectiveProviderKind::Direct {
-                    protocol: d.protocol,
-                    api_key_masked: crate::secrets::mask_value(&d.api_key),
-                    api_key_length,
-                    base_url: d.base_url,
-                    common_uri: d.common_uri,
-                }
-            }
+            ProviderKind::Direct(d) => EffectiveProviderKind::Direct {
+                endpoints: d.endpoints,
+                api_key_masked: crate::secrets::mask_value(&d.api_key),
+                api_key_length: d.api_key.chars().count(),
+            },
             ProviderKind::Router(r) => EffectiveProviderKind::Router { routes: r.routes },
             ProviderKind::Pool(p) => EffectiveProviderKind::Pool {
                 members: p.members,
@@ -1273,17 +1371,21 @@ mod tests {
     use crate::config::Decisions;
     use crate::pool::PoolStates;
 
+    /// 测试便捷: Direct 负载首端点的 base_url (p() 家族恒构造单端点;
+    /// 空表 panic = 测试构造 bug, 不是被测行为).
+    fn first_url(d: &DirectProvider) -> &str {
+        &d.endpoints[0].base_url
+    }
+
     fn p(id: &str, proto: Protocol, base: &str) -> Provider {
         Provider {
             id: id.into(),
             enabled: true,
             name: Some(format!("name-{id}")),
             kind: ProviderKind::Direct(DirectProvider {
-                protocol: proto,
-                base_url: base.into(),
+                endpoints: vec![Endpoint::new(proto, base)],
                 api_key: format!("k-{id}"),
                 api_key_file: None,
-                common_uri: None,
             }),
         }
     }
@@ -1385,6 +1487,106 @@ mod tests {
         assert!(validate_base_url("http://localhost:11434").is_ok());
     }
 
+    // ─── multi-endpoint: select_endpoint 三态 (D2 语义核心) ──────────────
+
+    /// 双端点 (openai 首, anthropic 次):
+    /// - ingress 精确匹配 → (该端点, exact=true) — 命中者与声明序无关;
+    /// - ingress 无匹配 → (首端点, exact=false) — fallback 走跨协议翻译.
+    #[test]
+    fn select_endpoint_exact_match_and_fallback() {
+        let mut d = direct(&p("x", Protocol::OpenAI, "https://openai-first")).clone();
+        d.endpoints.push(Endpoint::new(
+            Protocol::Anthropic,
+            "https://anthropic-second",
+        ));
+
+        let (e, exact) = d.select_endpoint(Protocol::Anthropic).unwrap();
+        assert!(exact);
+        assert_eq!(e.base_url, "https://anthropic-second");
+
+        let (e, exact) = d.select_endpoint(Protocol::OpenAI).unwrap();
+        assert!(exact, "首端点自身协议也是精确匹配");
+        assert_eq!(e.base_url, "https://openai-first");
+
+        // 未配置的协议 → 首端点 fallback (声明序).
+        let (e, exact) = d.select_endpoint(Protocol::OpenAIResponses).unwrap();
+        assert!(!exact);
+        assert_eq!(e.base_url, "https://openai-first");
+    }
+
+    /// 单端点退化 (D2: 单端点配置下行为与演进前逐字节一致): 匹配 → exact;
+    /// 不匹配 → 首端点 (即唯一端点) + exact=false, 与旧 "ingress != provider.protocol
+    /// 走跨协议翻译" 等价.
+    #[test]
+    fn select_endpoint_single_endpoint_degenerates() {
+        let d = direct(&p("x", Protocol::OpenAI, "https://only")).clone();
+        let (e, exact) = d.select_endpoint(Protocol::OpenAI).unwrap();
+        assert!(exact);
+        assert_eq!(e.base_url, "https://only");
+
+        let (e, exact) = d.select_endpoint(Protocol::Gemini).unwrap();
+        assert!(!exact, "单端点 + 异协议 ingress → 首端点 fallback");
+        assert_eq!(e.base_url, "https://only");
+    }
+
+    /// 空 endpoints 是绕过 validate 的非法配置 (serde default 容忍字段缺席) —
+    /// select 返回 None 而非 panic, dispatch 据此 503 (ROB).
+    #[test]
+    fn select_endpoint_empty_returns_none() {
+        let d = DirectProvider {
+            endpoints: vec![],
+            api_key: String::new(),
+            api_key_file: None,
+        };
+        assert!(d.select_endpoint(Protocol::OpenAI).is_none());
+    }
+
+    // ─── multi-endpoint: validate 三规则 (§5.5) ──────────────────────────
+
+    #[test]
+    fn validate_rejects_empty_endpoints() {
+        let mut prov = p("x", Protocol::OpenAI, "https://x");
+        direct_mut(&mut prov).endpoints.clear();
+        let err = prov.validate().unwrap_err();
+        assert!(err.contains("at least one endpoint"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_endpoint_protocol() {
+        let mut prov = p("x", Protocol::OpenAI, "https://x");
+        direct_mut(&mut prov)
+            .endpoints
+            .push(Endpoint::new(Protocol::OpenAI, "https://x2"));
+        let err = prov.validate().unwrap_err();
+        // message 指明重复的 protocol 名 (定位友好).
+        assert!(
+            err.contains("multiple endpoints") && err.contains("openai"),
+            "got: {err}"
+        );
+        // 不同协议的多端点合法.
+        let mut prov = p("x", Protocol::OpenAI, "https://x");
+        direct_mut(&mut prov)
+            .endpoints
+            .push(Endpoint::new(Protocol::Anthropic, "https://x2"));
+        assert!(prov.validate().is_ok());
+    }
+
+    /// 每 endpoint 的 base_url 过 validate_base_url (复用), 错误文案携带
+    /// endpoint 定位 (序号 + 协议名).
+    #[test]
+    fn validate_rejects_bad_endpoint_base_url_with_location() {
+        let mut prov = p("x", Protocol::OpenAI, "https://x");
+        direct_mut(&mut prov)
+            .endpoints
+            .push(Endpoint::new(Protocol::Anthropic, "not-a-url"));
+        let err = prov.validate().unwrap_err();
+        assert!(
+            err.contains("endpoint #1") && err.contains("anthropic"),
+            "got: {err}"
+        );
+        assert!(err.contains("base_url"), "got: {err}");
+    }
+
     // ─── toml 反序列化: api_key_file 字段必须能从 toml 正确解析为 PathBuf ──
     //
     // PathBuf 在 toml crate 中没有直接实现 Deserialize, 但 std::path::PathBuf
@@ -1396,14 +1598,13 @@ mod tests {
         let toml_text = r#"
             id = "test"
             kind = "direct"
-            protocol = "openai"
-            base_url = "https://api.example.com"
+            endpoints = [ { protocol = "openai", base_url = "https://api.example.com" } ]
             api_key_file = "/run/secrets/test-key"
             enabled = true
         "#;
         let p: Provider = toml::from_str(toml_text).expect("toml parse");
         let ProviderKind::Direct(d) = &p.kind else {
-            panic!("legacy direct provider must parse as Direct");
+            panic!("direct provider must parse as Direct");
         };
         assert_eq!(
             d.api_key_file.as_deref(),
@@ -1418,17 +1619,54 @@ mod tests {
         let toml_text = r#"
             id = "test"
             kind = "direct"
-            protocol = "openai"
-            base_url = "https://api.example.com"
+            endpoints = [ { protocol = "openai", base_url = "https://api.example.com" } ]
             api_key = "sk-legacy"
             enabled = true
         "#;
         let p: Provider = toml::from_str(toml_text).expect("toml parse");
         let ProviderKind::Direct(d) = &p.kind else {
-            panic!("legacy direct provider must parse as Direct");
+            panic!("direct provider must parse as Direct");
         };
         assert_eq!(d.api_key, "sk-legacy");
         assert!(d.api_key_file.is_none());
+    }
+
+    /// multi-endpoint TOML round-trip (§5.2 形态 SSOT): `[[providers.endpoints]]`
+    /// 平铺数组写出 → 读回, 端点序 / per-endpoint common_uri (含 None skip 形态)
+    /// / 共享 api_key 均无损存活.
+    #[test]
+    fn toml_multi_endpoint_roundtrip_preserves_order_and_common_uri() {
+        let mut prov = p(
+            "zhipu",
+            Protocol::OpenAI,
+            "https://open.bigmodel.cn/api/paas/v4",
+        );
+        direct_mut(&mut prov).endpoints.push(Endpoint {
+            protocol: Protocol::Anthropic,
+            base_url: "https://open.bigmodel.cn/api/anthropic".into(),
+            common_uri: Some(String::new()), // "" 显式布局断言必须写出 (非 None skip)
+        });
+        direct_mut(&mut prov).endpoints[0].common_uri = Some("/api/paas/v4".into());
+        direct_mut(&mut prov).api_key = "sk-shared".into();
+
+        let text = toml::to_string(&prov).unwrap();
+        let back: Provider = toml::from_str(&text).unwrap();
+        let d = direct(&back);
+        assert_eq!(d.endpoints.len(), 2);
+        // 数组序 = fallback 序, 必须无损.
+        assert_eq!(d.endpoints[0].protocol, Protocol::OpenAI);
+        assert_eq!(
+            d.endpoints[0].base_url,
+            "https://open.bigmodel.cn/api/paas/v4"
+        );
+        assert_eq!(d.endpoints[0].common_uri.as_deref(), Some("/api/paas/v4"));
+        assert_eq!(d.endpoints[1].protocol, Protocol::Anthropic);
+        assert_eq!(
+            d.endpoints[1].common_uri.as_deref(),
+            Some(""),
+            "空串 common_uri 是显式布局断言, 不与 None (skip) 混淆"
+        );
+        assert_eq!(d.api_key, "sk-shared", "api_key 共享于构造层 (D3)");
     }
 
     // ─── DynamicEntry impl: Provider 特有的 validate 钩子 ───────────────
@@ -1471,7 +1709,7 @@ mod tests {
         ];
         for cu in legal {
             let mut prov = p("ok", Protocol::OpenAI, "https://x");
-            direct_mut(&mut prov).common_uri = cu.map(str::to_string);
+            direct_mut(&mut prov).endpoints[0].common_uri = cu.map(str::to_string);
             assert!(prov.validate().is_ok(), "cu={cu:?} should be legal");
         }
     }
@@ -1489,7 +1727,7 @@ mod tests {
         ];
         for cu in bad {
             let mut prov = p("x", Protocol::OpenAI, "https://x");
-            direct_mut(&mut prov).common_uri = cu.map(str::to_string);
+            direct_mut(&mut prov).endpoints[0].common_uri = cu.map(str::to_string);
             assert!(
                 prov.validate().unwrap_err().contains("common_uri"),
                 "cu={cu:?} should be rejected"
@@ -1672,10 +1910,13 @@ mod tests {
 
         let ov = by_id.get("override-id").unwrap();
         assert_eq!(ov.source, EffectiveSource::DynamicOverride);
-        let EffectiveProviderKind::Direct { base_url, .. } = &ov.kind else {
+        let EffectiveProviderKind::Direct { endpoints, .. } = &ov.kind else {
             panic!("override-id must be Direct");
         };
-        assert_eq!(base_url, "https://dynamic-override");
+        assert_eq!(
+            endpoints.first().map(|e| (e.protocol, e.base_url.as_str())),
+            Some((Protocol::Gemini, "https://dynamic-override"))
+        );
         assert!(ov.static_version.is_some());
         assert!(ov.dynamic_version.is_some());
     }
@@ -1696,10 +1937,39 @@ mod tests {
         d.inherit_from_static(&s);
         assert_eq!(direct(&d).api_key, "sk-static");
         assert_eq!(
-            direct(&d).base_url,
+            first_url(direct(&d)),
             "https://d",
             "non-auth fields must stay from override"
         );
+    }
+
+    /// multi-endpoint 合并语义 (§5.6): `endpoints` **整体替换** — dynamic
+    /// override 携带的 endpoints 整个覆盖 static (不做按 protocol 键的字段级
+    /// 合并, 数组序是 fallback 序); #157 鉴权继承只触及 api_key/api_key_file,
+    /// endpoints 完全来自 override (无 "None → 继承 static" 的回填语义 —
+    /// wire 层全量必填, 由 integration 的 partial PUT 400 测试锁定).
+    #[test]
+    fn effective_endpoints_replaced_wholesale_and_auth_inherited() {
+        let tmp = tempfile_path();
+        let mut s = p("x", Protocol::OpenAI, "https://static-openai");
+        direct_mut(&mut s).endpoints.push(Endpoint::new(
+            Protocol::Anthropic,
+            "https://static-anthropic",
+        ));
+        direct_mut(&mut s).api_key = "sk-static".into();
+        // override 只带一个 anthropic 端点 (窄于 static), api_key 未记录 (#157).
+        let mut d = p("x", Protocol::Anthropic, "https://override-anthropic");
+        direct_mut(&mut d).api_key = String::new();
+        let t = ProviderTable::new(vec![s], vec![d], empty_decisions(), tmp);
+
+        let eff = t.get_effective("x").unwrap();
+        let d = direct(&eff);
+        // 整体替换: 恰是 override 的单端点列表 — 非 static 两端点的并集/子集.
+        assert_eq!(d.endpoints.len(), 1);
+        assert_eq!(d.endpoints[0].protocol, Protocol::Anthropic);
+        assert_eq!(first_url(d), "https://override-anthropic");
+        // 鉴权继承照常 (#157 语义不受 endpoints 影响).
+        assert_eq!(d.api_key, "sk-static");
     }
 
     #[test]
@@ -1736,13 +2006,13 @@ mod tests {
 
         // Default: dynamic 被选中 + 未记录 key → effective 从 static 继承.
         let eff = t.get_effective("x").unwrap();
-        assert_eq!(direct(&eff).base_url, "https://d");
+        assert_eq!(first_url(direct(&eff)), "https://d");
         assert_eq!(direct(&eff).api_key, "sk-static");
 
         // PreferStatic: static 本身被选中, 继承无意义但也无害.
         t.set_decision("x", OverrideMode::PreferStatic).unwrap();
         let eff = t.get_effective("x").unwrap();
-        assert_eq!(direct(&eff).base_url, "https://s");
+        assert_eq!(first_url(direct(&eff)), "https://s");
         assert_eq!(direct(&eff).api_key, "sk-static");
 
         // Disabled: 不存在 effective.
@@ -2025,7 +2295,7 @@ mod tests {
             .resolve_route(&real, "any-model", &PoolStates::new())
             .unwrap();
         assert_eq!(out.id, "real");
-        assert_eq!(out.provider.base_url, "https://upstream");
+        assert_eq!(first_url(&out.provider), "https://upstream");
         assert_eq!(
             out.provider.api_key, "sk-real",
             "resolved provider carries real key"
@@ -2040,7 +2310,7 @@ mod tests {
         let rt1 = t.get_effective("rt1").unwrap();
         let out = t.resolve_route(&rt1, "gpt-4o", &PoolStates::new()).unwrap();
         assert_eq!(out.id, "real");
-        assert_eq!(out.provider.base_url, "https://upstream");
+        assert_eq!(first_url(&out.provider), "https://upstream");
         assert_eq!(out.provider.api_key, "sk-real");
     }
 
@@ -2712,7 +2982,7 @@ mod tests {
         // 路由解析直达自身 (实体快路径), 携带 override 的鉴权字段.
         let r = t.resolve_route(&eff, "m", &PoolStates::new()).unwrap();
         assert_eq!(r.id, "x");
-        assert_eq!(r.provider.base_url, "https://d");
+        assert_eq!(first_url(&r.provider), "https://d");
         assert_eq!(r.provider.api_key, "sk-dyn");
     }
 
@@ -2741,7 +3011,7 @@ mod tests {
         let t2 = ProviderTable::new(vec![s], vec![back], empty_decisions(), tmp);
         let eff = t2.get_effective("x").unwrap();
         // Direct override 胜出 + key 从 static Direct 继承复原.
-        assert_eq!(direct(&eff).base_url, "https://d");
+        assert_eq!(first_url(direct(&eff)), "https://d");
         assert_eq!(direct(&eff).api_key, "sk-static");
     }
 
@@ -3104,7 +3374,7 @@ mod tests {
             .resolve_route(&t.get_effective("pl").unwrap(), "m", &PoolStates::new())
             .unwrap();
         assert_eq!(out.id, "m1", "list order is the priority");
-        assert_eq!(out.provider.base_url, "https://u1");
+        assert_eq!(first_url(&out.provider), "https://u1");
         assert_eq!(
             out.pool,
             Some(PoolHop {

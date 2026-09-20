@@ -143,8 +143,10 @@ pub async fn update_provider(
             // static (转发仍带旧 key, 行为不变).
             //
             // routes / members / exhaust / cooldown 回填则**可以**走 get_effective
-            // 兜底 (与 #190 protocol 回填同模式): 均非敏感, 无明文落盘顾虑 —
-            // static 条目的 PUT 即首次 override 场景也能 "省略 = 保留".
+            // 兜底: 均非敏感, 无明文落盘顾虑 — static 条目的 PUT 即首次 override
+            // 场景也能 "省略 = 保留" (endpoints 例外: Direct 构造全量必填不回填,
+            // 见下方 effective 快照处说明; 旧 protocol 字段的 #190 回填已随
+            // multi-endpoint schema 废除).
             //
             // 假设: 本地单用户场景, get_dynamic 与 upsert_dynamic 之间无并发修改.
             // 多用户/并发编辑场景下存在 TOCTOU (旧值可能过期), 但仅导致配置不一致, 无安全影响.
@@ -187,21 +189,18 @@ pub async fn update_provider(
                     }
                 }
             }
-            // routes 回填兜底 + protocol 回填 + pool 三字段回填兜底共用**一次**
+            // endpoints 回填兜底 + pool 三字段回填兜底共用**一次**
             // effective 快照 (单次取锁 + merge, 也消除两次快照间的漂移窗口)。
             // 各分支按 kind 变体互斥分派: effective 是 Router 时只有 routes 分支
-            // 可能命中, 是 Direct 时只有 protocol 分支可能命中, 是 Pool 时只有
-            // pool 分支可能命中。
+            // 可能命中, 是 Pool 时只有 pool 分支可能命中。
             //
             // routes 回填兜底: dynamic 无旧条目 (PUT 即首次 override) 时触发;
             // rationale (非敏感, "省略 = 保留") 见上方闭包注释。
             //
-            // protocol 回填 (#190 保留语义): 从 **effective** 的 Direct 负载回填 —
-            // 覆盖 static-only 条目 (get_dynamic 无旧值的场景)。非敏感字段, 无
-            // #157 明文落盘顾虑。回填只服务 Direct 意图 — Router 构造不消费
-            // protocol (无此字段), 回填了也会被 into_provider 忽略, 故无需按
-            // router 意图守卫; effective 为 Router 时无 Direct 负载可挖 → 不回填,
-            // 也不报错。
+            // Direct 构造**无回填分支**: endpoints 全量必填 (partial PUT 仍需完整
+            // Direct 字段, 缺失/空数组 400 — 旧的 protocol 回填 (#190) 随
+            // multi-endpoint schema 废除, "保留" 由前端回填 effective 后整体提交;
+            // 鉴权字段除外 — #157 明文落盘顾虑使其必须走 dynamic 旧值/继承路径)。
             //
             // pool 回填兜底 (T3, 同 routes rationale): static pool 条目的 PUT 即
             // 首次 override 场景; exhaust/cooldown 逐字段回填 — 即便 payload
@@ -211,9 +210,6 @@ pub async fn update_provider(
             match state.providers.get_effective(&id).map(|e| e.kind) {
                 Some(crate::provider::ProviderKind::Router(r)) => {
                     payload.backfill_routes(&r.routes, explicit_pool);
-                }
-                Some(crate::provider::ProviderKind::Direct(d)) if payload.protocol.is_none() => {
-                    payload.protocol = Some(d.protocol);
                 }
                 Some(crate::provider::ProviderKind::Pool(p)) => {
                     payload.backfill_pool(&p, explicit_router);
@@ -388,18 +384,19 @@ pub(crate) struct ListProvidersResponse {
 pub(crate) struct UpsertProviderRequest {
     pub id: Option<String>,
     pub name: Option<String>,
-    /// 协议. **仅 Direct 构造必填**: 缺失 → 400. Router 构造不存在 protocol
-    /// (ingress 由 per-request URL 决定, egress 由 per-route 链尾决定 — 无可
-    /// 陈述的事实, 见 `RouterProvider`); 请求里残留发送时被忽略, 不报错.
-    /// PUT 省略时若 effective 是 Direct → 回填其 protocol ("保留" 语义, 同
-    /// api_key; 注意 partial PUT 仍需完整 Direct 字段 — base_url 不回填,
-    /// 缺失 400).
+    /// 有序端点列表 (multi-endpoint). **仅 Direct 构造必填且全量** (参照 base_url
+    /// 现状 "partial PUT 仍需完整 Direct 字段"): 缺失 (None) 或空数组 → 400.
+    /// "保留" 由前端回填 effective 后整体提交实现 (与 common_uri 旧语义同型,
+    /// 无 #157 null 歧义; 数组序 = fallback 序, 整体替换语义见
+    /// [`crate::provider::DirectProvider::endpoints`]). Router/Pool 构造下
+    /// 残留发送时被忽略, 不报错 (同 protocol 旧字段在 Router 下的先例).
+    ///
+    /// 元素直接复用 [`crate::provider::Endpoint`] 的序列化
+    /// (`{protocol, base_url, common_uri?}`, 同 routes 复用 Route 的先例);
+    /// 结构合法性 (非空 / 每协议一条 / base_url / common_uri 值域) 收口在
+    /// crud 钩子的 `Provider::validate`.
     #[serde(default)]
-    pub protocol: Option<Protocol>,
-    /// 上游 base URL. 实体 provider 必填 (http(s) + 无末尾 `/`); 路由 provider
-    /// (routes 非空) 忽略, 可省略/为空 (#179).
-    #[serde(default)]
-    pub base_url: String,
+    pub endpoints: Option<Vec<crate::provider::Endpoint>>,
     /// API key 明文值. 语义因 endpoint 而异:
     /// - POST (create): 省略 (None) 或空串 = 不设置 (适用 Ollama 等本地无 auth 场景).
     /// - PUT (update): 省略 (None) = 保留旧值 — override **不记录**该字段 (不落盘明文,
@@ -418,13 +415,6 @@ pub(crate) struct UpsertProviderRequest {
     /// 时可用, 但通常只在 static config (sops 注入) 用.
     #[serde(default)]
     pub api_key_file: Option<String>,
-    /// 自建请求公共 URI 前缀 (detect 知识, 见 [`crate::provider::DirectProvider::common_uri`]).
-    /// **全量语义** (与 base_url 同型, 无 "省略=保留" 回填): null = 未探测 (fetch
-    /// 现场推导), `Some("/v1")` / `Some("")` = 显式布局断言. WebUI 编辑表单总是
-    /// 回填 effective 原值后整体提交 — "保留" 由前端实现, wire 保持无歧义
-    /// (避免 api_key 的 #157 null 歧义同型问题). Router/Pool 构造下忽略.
-    #[serde(default)]
-    pub common_uri: Option<String>,
     /// 路由列表 (#179 多规则化 / #187 sum type). 直接复用 [`Route`] 的
     /// 序列化 (model_pattern / target / upstream_model / priority). 三态语义:
     /// - 省略 (None): 保留旧值 (PUT) — 优先从 dynamic 旧条目回填, 无则从
@@ -533,15 +523,15 @@ impl UpsertProviderRequest {
                 crate::provider::ProviderKind::Router(crate::provider::RouterProvider { routes })
             }
             (None, None) => {
-                let protocol = self.protocol.ok_or_else(|| {
-                    ApiError::validation("protocol is required for direct providers")
+                let endpoints = self.endpoints.filter(|e| !e.is_empty()).ok_or_else(|| {
+                    ApiError::validation(
+                        "endpoints (at least one) are required for direct providers",
+                    )
                 })?;
                 crate::provider::ProviderKind::Direct(crate::provider::DirectProvider {
-                    protocol,
-                    base_url: self.base_url,
+                    endpoints,
                     api_key: self.api_key.unwrap_or_default(),
                     api_key_file: self.api_key_file.map(std::path::PathBuf::from),
-                    common_uri: self.common_uri,
                 })
             }
         };

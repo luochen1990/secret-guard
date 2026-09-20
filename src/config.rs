@@ -482,18 +482,22 @@ const KNOWN_FIELDS: &[(&str, &[&str])] = &[
             "id",
             "enabled",
             "name",
-            "kind",     // #187 sum type tag (internally tagged; variant 字段平铺)
-            "protocol", // Direct 构造字段 (Router 无 protocol; 清单按 section 平铺无法区分构造, 残留不告警)
-            "base_url",
+            "kind",      // #187 sum type tag (internally tagged; variant 字段平铺)
+            "endpoints", // Direct 构造的端点数组 ([[providers.endpoints]]); 字段见 providers.endpoints
             "api_key",
             "api_key_file",
-            "common_uri", // Direct 构造字段 (detect 固化的布局断言, 见 DirectProvider)
-            "routes",     // Router 构造的路由数组 ([[providers.routes]]); 字段见 providers.routes
-            // Pool 构造字段 (#187 延伸; 清单按 section 平铺无法区分构造, 残留不告警)
+            "routes", // Router 构造的路由数组 ([[providers.routes]]); 字段见 providers.routes
+            // Pool 构造字段 (#187 延伸; 清单按 section 平铺无法区分构造, 残留不告警;
+            // common_uri 已随 multi-endpoint schema 移入 providers.endpoints 子清单)
             "members",
             "exhaust",
             "cooldown_secs",
         ],
+    ),
+    // Direct 构造的端点 entry ([[providers.endpoints]], multi-endpoint)
+    (
+        "providers.endpoints",
+        &["protocol", "base_url", "common_uri"],
     ),
     // Router 构造的路由 entry ([[providers.routes]])
     (
@@ -1512,11 +1516,12 @@ fn serialized_full_sample_paths() -> Vec<String> {
                 enabled: true,
                 name: Some("sample".into()),
                 kind: crate::provider::ProviderKind::Direct(crate::provider::DirectProvider {
-                    protocol: crate::provider::Protocol::default(),
-                    base_url: "http://127.0.0.1:1".into(),
+                    endpoints: vec![crate::provider::Endpoint::new(
+                        crate::provider::Protocol::default(),
+                        "http://127.0.0.1:1",
+                    )],
                     api_key: "sk-sample".into(),
                     api_key_file: Some("/dev/null".into()),
-                    common_uri: None,
                 }),
             },
             // Router 构造 (routes 全字段: model_pattern/target/upstream_model/priority 都序列化,
@@ -1532,6 +1537,19 @@ fn serialized_full_sample_paths() -> Vec<String> {
                         upstream_model: Some("gpt-4o".into()),
                         priority: Some(100),
                     }],
+                }),
+            },
+            // Pool 构造 (members/exhaust/cooldown_secs 全序列化; exhaust 走
+            // serde default 恒全字段, 显式写出以锁定 providers.exhaust 子清单
+            // 的守卫覆盖 — 曾缺失导致手写 pool 条目被 audit 误报).
+            Provider {
+                id: "sample-pool".into(),
+                enabled: true,
+                name: Some("sample-pool".into()),
+                kind: crate::provider::ProviderKind::Pool(crate::provider::PoolProvider {
+                    members: vec!["sample".into()],
+                    exhaust: crate::provider::ExhaustConfig::default(),
+                    cooldown_secs: 60,
                 }),
             },
         ],
@@ -1641,7 +1659,9 @@ mod audit_tests {
         for expected in [
             "server.",
             "providers.",
+            "providers.endpoints.",
             "providers.routes.",
+            "providers.exhaust.",
             "secrets.entries.",
             "secrets.entries.mock_strategy",
             "redact.",
@@ -1679,6 +1699,7 @@ mod audit_tests {
 [[providers]]
 id = "m"
 kind = "direct"
+[[providers.endpoints]]
 protocol = "openai"
 base_url = "http://127.0.0.1:29804"
 
@@ -1697,21 +1718,26 @@ value = "abc"
 [[providers]]
 id = "m"
 kind = "direct"
+totally_unknown_field = "oops"
+[[providers.endpoints]]
 protocol = "openai"
 base_url = "http://127.0.0.1:29804"
-totally_unknown_field = "oops"
 protocl = "openai"
 "#;
         let ws = audit_static_config_text(text);
         let all = joined(&ws);
         assert!(all.contains("totally_unknown_field"), "got: {all}");
-        // 拼写建议: protocl → protocol (编辑距离 1).
+        // 拼写建议: protocl → protocol (编辑距离 1, endpoints entry 级递归审计).
         assert!(
             all.contains("protocl") && all.contains("did you mean 'protocol'"),
             "suggestion missing: {all}"
         );
         // 定位含数组下标.
         assert!(all.contains("providers[0]"), "got: {all}");
+        assert!(
+            all.contains("providers[0].endpoints[0]"),
+            "endpoint-level locate: {all}"
+        );
     }
 
     /// #159 深层嵌套: [[providers.routes]] 内的未知字段 / 拼写错误也要被观测
@@ -1758,8 +1784,7 @@ priority = 100
         let text = r#"
 [[provider]]
 id = "m"
-protocol = "openai"
-base_url = "http://127.0.0.1:29804"
+endpoints = [ { protocol = "openai", base_url = "http://127.0.0.1:29804" } ]
 "#;
         let ws = audit_static_config_text(text);
         let all = joined(&ws);
@@ -1789,7 +1814,7 @@ base_url = "http://127.0.0.1:29804"
     /// 空配置提示不应误报: 有 provider 时 (即使 secrets 为空) 不打"全空"提示.
     #[test]
     fn audit_no_empty_warning_when_providers_present() {
-        let text = "[[providers]]\nid = \"m\"\nprotocol = \"openai\"\nbase_url = \"http://x\"\n";
+        let text = "[[providers]]\nid = \"m\"\nendpoints = [ { protocol = \"openai\", base_url = \"http://x\" } ]\n";
         let ws = audit_static_config_text(text);
         assert!(
             !joined(&ws).contains("no providers and no secrets"),
@@ -1800,7 +1825,7 @@ base_url = "http://127.0.0.1:29804"
     /// #155 子项 3 (代码部分): `[[secrets]]` 数组写法 → 提示正确嵌套写法.
     #[test]
     fn audit_hints_secrets_array_misuse() {
-        let text = "[[providers]]\nid=\"m\"\nprotocol=\"openai\"\nbase_url=\"http://127.0.0.1:1\"\n[[secrets]]\nid=\"t\"\nvalue=\"abc\"\n";
+        let text = "[[providers]]\nid=\"m\"\nendpoints=[{protocol=\"openai\",base_url=\"http://127.0.0.1:1\"}]\n[[secrets]]\nid=\"t\"\nvalue=\"abc\"\n";
         let ws = audit_static_config_text(text);
         let all = joined(&ws);
         assert!(
@@ -1858,13 +1883,28 @@ base_url = "http://127.0.0.1:29804"
             "[[providers]]\n",
             "id = \"direct-1\"\n",
             "kind = \"direct\"\n",
-            "protocol = \"openai\"\n",
-            "base_url = \"https://api.example.com\"\n",
-            "common_uri = \"/v1\"\n",
+            // 内联 table 数组形态的 endpoints (与 [[providers.endpoints]] 展开形态
+            // 在 walker 眼中同构, 均经 check_table_array 下降).
+            "endpoints = [ { protocol = \"openai\", base_url = \"https://api.example.com\", common_uri = \"/v1\" } ]\n",
+            "\n",
+            "[[providers]]\n",
+            "id = \"direct-2\"\n",
+            "kind = \"direct\"\n",
+            "[[providers.endpoints]]\n",
+            "protocol = \"anthropic\"\n",
+            "base_url = \"https://api.anthropic.com\"\n",
+            "comon_uri = \"\"\n", // 拼写错误: endpoints entry 内也要可观测 (递归下降)
         );
         let ws = audit_static_config_text(text);
         let all = joined(&ws);
-        for known in ["members", "cooldown_secs", "exhaust", "codes", "common_uri"] {
+        for known in [
+            "members",
+            "cooldown_secs",
+            "exhaust",
+            "codes",
+            "endpoints",
+            "common_uri",
+        ] {
             assert!(
                 !all.contains(&format!("unknown field '{known}'")),
                 "legal field '{known}' must not warn: {all}"
@@ -1873,6 +1913,13 @@ base_url = "http://127.0.0.1:29804"
         assert!(
             all.contains("'totally_bogus'") && all.contains("providers[0].exhaust"),
             "unknown key inside exhaust still audited: {all}"
+        );
+        // endpoints entry 级递归: 拼写建议 + 定位含 endpoints[i] 下标.
+        assert!(
+            all.contains("'comon_uri'")
+                && all.contains("did you mean 'common_uri'")
+                && all.contains("providers[2].endpoints[0]"),
+            "typo inside endpoints entry audited: {all}"
         );
     }
 
@@ -2369,8 +2416,7 @@ output = 0.5
             [[providers]]
             id = "bad"
             kind = "direct"
-            protocol = "openai"
-            base_url = "https://api.example.com"
+            endpoints = [ { protocol = "openai", base_url = "https://api.example.com" } ]
             api_key = "sk-direct"
             api_key_file = "/run/secrets/whatever"
             enabled = true
@@ -2392,8 +2438,7 @@ output = 0.5
             [[providers]]
             id = "ok"
             kind = "direct"
-            protocol = "openai"
-            base_url = "https://api.example.com"
+            endpoints = [ { protocol = "openai", base_url = "https://api.example.com" } ]
             api_key_file = "/run/secrets/ok-key"
             enabled = true
             "#,
@@ -2410,8 +2455,7 @@ output = 0.5
             [[providers]]
             id = "bad"
             kind = "direct"
-            protocol = "openai"
-            base_url = "https://api.example.com"
+            endpoints = [ { protocol = "openai", base_url = "https://api.example.com" } ]
             api_key = "sk-direct"
             api_key_file = "/run/secrets/whatever"
             enabled = true
@@ -2539,11 +2583,12 @@ output = 0.5
             enabled: true,
             name: Some("P1".into()),
             kind: crate::provider::ProviderKind::Direct(crate::provider::DirectProvider {
-                protocol: crate::provider::Protocol::OpenAI,
-                base_url: "https://api.openai.com".into(),
+                endpoints: vec![crate::provider::Endpoint::new(
+                    crate::provider::Protocol::OpenAI,
+                    "https://api.openai.com",
+                )],
                 api_key: "sk-test".into(),
                 api_key_file: None,
-                common_uri: None,
             }),
         });
         // #187 sum type 持久化守卫: Router (flatten + internally tagged + 嵌套
@@ -2643,11 +2688,12 @@ output = 0.5
                 name: Some(format!("name-{id}")),
                 enabled: true,
                 kind: crate::provider::ProviderKind::Direct(crate::provider::DirectProvider {
-                    protocol: Protocol::OpenAI,
-                    base_url: "http://up".to_string(),
+                    endpoints: vec![crate::provider::Endpoint::new(
+                        Protocol::OpenAI,
+                        "http://up",
+                    )],
                     api_key: String::new(),
                     api_key_file: None,
-                    common_uri: None,
                 }),
             }
         }
@@ -3263,11 +3309,9 @@ mod proptests {
             enabled: true,
             name: Some(format!("name-{id}")),
             kind: crate::provider::ProviderKind::Direct(crate::provider::DirectProvider {
-                protocol: Protocol::OpenAI,
-                base_url: base_url.into(),
+                endpoints: vec![crate::provider::Endpoint::new(Protocol::OpenAI, base_url)],
                 api_key: format!("k-{id}"),
                 api_key_file: None,
-                common_uri: None,
             }),
         }
     }

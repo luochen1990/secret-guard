@@ -30,3 +30,7 @@ valeu = "valeu"
 inital = "inital"
 # prioroty = 同上的深层 fixture (providers.routes.prioroty → priority 建议, 多规则化).
 prioroty = "prioroty"
+# comon = 静态配置审计 (#159) 的拼写错误 fixture — providers.endpoints entry 内
+# 的 comon_uri (→ common_uri 建议), multi-endpoint schema 的端点级递归审计用,
+# 故意拼错, 不应被纠正.
+comon = "comon"

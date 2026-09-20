@@ -17,7 +17,7 @@ use std::time::Duration;
 use secret_guard::{
     dag::ConversationDag,
     provider::{
-        DirectProvider, ExhaustConfig, PoolProvider, Protocol, Provider, ProviderKind,
+        DirectProvider, Endpoint, ExhaustConfig, PoolProvider, Protocol, Provider, ProviderKind,
         ProviderTable,
     },
     secrets::{SecretCategory, SecretEntry, SecretTable},
@@ -112,11 +112,13 @@ fn direct_provider(id: &str, proto: Protocol, base_url: &str) -> Provider {
         enabled: true,
         name: Some(id.into()),
         kind: ProviderKind::Direct(DirectProvider {
-            protocol: proto,
-            base_url: base_url.into(),
+            endpoints: vec![Endpoint {
+                protocol: proto,
+                base_url: base_url.into(),
+                common_uri: None,
+            }],
             api_key: "sk-test".into(),
             api_key_file: None,
-            common_uri: None,
         }),
     }
 }

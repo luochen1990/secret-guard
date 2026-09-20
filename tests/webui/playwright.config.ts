@@ -94,16 +94,14 @@ fs.writeFileSync(
   `[[providers]]
 id = "mock-openai"
 kind = "direct"
-protocol = "openai"
-base_url = "http://127.0.0.1:${MOCK_PORT}"
+endpoints = [ { protocol = "openai", base_url = "http://127.0.0.1:${MOCK_PORT}" } ]
 enabled = true
 
 # 透传族存量条目 (webui_protocols 词表外): 编辑场景用例的种子.
 [[providers]]
 id = "mock-gemini"
 kind = "direct"
-protocol = "gemini"
-base_url = "http://127.0.0.1:${MOCK_PORT}"
+endpoints = [ { protocol = "gemini", base_url = "http://127.0.0.1:${MOCK_PORT}" } ]
 enabled = true
 
 [[secrets.entries]]

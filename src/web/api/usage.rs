@@ -37,12 +37,17 @@ pub async fn usage_summary(
     };
     let hours = q.hours.unwrap_or(168).max(1).min(cap);
     let (table, status) = state.pricing.table(&state.upstream).await;
-    // domain hint: 闭包借用 providers 表 (router 条目无 base_url → None).
+    // domain hint: 闭包借用 providers 表 (取**首端点**的 host — 多端点共享同一
+    // 凭证/供应商, 首端点 (= 默认端点) 的 host 足以消歧 models.dev vendor;
+    // router/pool 条目无端点 → None).
     let hint = |pid: &str| -> Option<String> {
         let p = state.providers.get_effective(pid)?;
         match &p.kind {
-            crate::provider::ProviderKind::Direct(d) => crate::usage::extract_host(&d.base_url),
-            // 虚拟构造 (router/pool) 无 base_url → 无 domain hint.
+            crate::provider::ProviderKind::Direct(d) => d
+                .endpoints
+                .first()
+                .and_then(|ep| crate::usage::extract_host(&ep.base_url)),
+            // 虚拟构造 (router/pool) 无端点 → 无 domain hint.
             crate::provider::ProviderKind::Router(_) | crate::provider::ProviderKind::Pool(_) => {
                 None
             }

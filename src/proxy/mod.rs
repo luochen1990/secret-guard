@@ -10,12 +10,15 @@
 //! # 路由策略
 //! URL = `/{proto_short}/{provider_id}/*path`, 由 [`ForwardPath`] 解析:
 //! - `proto_short` 决定 ingress 协议 (完整映射见 [`Protocol::ALL`], SSOT).
-//! - `provider_id` 决定目标 provider (含 egress 协议).
+//! - `provider_id` 决定目标 provider; egress 端点由 ingress 按
+//!   [`crate::provider::DirectProvider::select_endpoint`] 选择 (精确匹配 → 同协议, 无匹配 →
+//!   首端点跨协议翻译).
 //! - 若 provider 不存在 / 被禁用: 返回 404 / 503.
 //!
 //! # dispatch 路径选择 (`dispatch`)
 //!
-//! 根据 ingress == egress 与 SecretTable 是否空, 选择三条路径之一:
+//! 根据 ingress == egress (端点选择的 exact 位) 与 SecretTable 是否空, 选择三条
+//! 路径之一:
 //!
 //! | 场景 | 函数 | 路径 |
 //! |---|---|---|
@@ -164,8 +167,8 @@ pub(crate) use {cross_proto::cross_proto_forward, fan_out::fan_out_streaming_wit
 /// - `rest` = 上游 path (axum 0.8 `{*rest}` 捕获**不含前导 `/`**, 见 [`ForwardPath`]
 ///   注释; 消费方一律容错处理), query string 单独从 uri 拼回.
 ///
-/// MVP: 仅支持 ingress == provider.protocol (identity passthrough);
-/// 跨协议请求返回 501 Not Implemented.
+/// ingress 精确匹配端点 → 同协议 (identity passthrough); 无匹配端点 → 首端点
+/// 跨协议翻译 (multi-endpoint D2, 见 [`crate::provider::DirectProvider::select_endpoint`]).
 pub async fn forward(
     State(state): State<AppState>,
     Path(fp): Path<ForwardPath>,
@@ -298,7 +301,30 @@ async fn dispatch(
         tracing::debug!(router = %fp.name, model_rewrite = %m, "model rewrite active (route)");
     }
 
-    // 4. 协议匹配: 同协议走 IR / 字节透传; 跨协议走 codec 翻译.
+    // 4. 端点选择 (multi-endpoint, D2) + 协议匹配: ingress 精确匹配该协议的
+    //    端点 → (endpoint, exact=true) 走 same_proto (透传/IR, 与现状同);
+    //    无匹配 → 首端点 (声明序, exact=false) 走 cross_proto (跨协议翻译,
+    //    与现状同 — 单端点配置下 exact=false ⟺ 旧 ingress != provider.protocol,
+    //    行为逐字节一致). endpoints 为空是绕过 validate 的非法配置 → 503 (ROB).
+    //    分叉不变式由 find 谓词结构直接保证 (不命中 ⟹ 全体端点协议 ≠ ingress,
+    //    首端点亦然), 不依赖 validate 的唯一性; 唯一性仅让 "精确匹配" 语义无歧义.
+    let Some((endpoint, exact)) = provider.select_endpoint(ingress) else {
+        return Err(AppError::Unavailable(format!(
+            "provider '{}' has no endpoints (invalid config)",
+            upstream_id
+        )));
+    };
+    // 立即 owned 化: endpoint 借用 provider, 而下游签名各自 owned provider + endpoint.
+    let endpoint = endpoint.clone();
+    if !exact {
+        tracing::info!(
+            ingress = ingress.name(),
+            egress = endpoint.protocol.name(),
+            provider = %upstream_id,
+            "no endpoint for ingress protocol; falling back to first endpoint \
+             (cross-protocol translation)"
+        );
+    }
     let secrets_snapshot = state.secrets.effective_raw();
     // disabled secret 明文放行按请求 WARN (#161): 挂 dispatch 层 (raw bytes 扫描) 以
     // 覆盖透传快捷分支, 命中才告警. 挂载层级论证见 warn_disabled_secrets_in_body doc.
@@ -306,7 +332,7 @@ async fn dispatch(
     if !disabled_secrets.is_empty() {
         crate::redact::warn_disabled_secrets_in_body(&req_bytes, &disabled_secrets);
     }
-    if ingress != provider.protocol {
+    if !exact {
         return cross_proto_forward(
             state,
             fp,
@@ -314,6 +340,7 @@ async fn dispatch(
             req_bytes,
             ingress,
             provider,
+            endpoint,
             &upstream_id,
             model_rewrite,
             started,
@@ -322,6 +349,7 @@ async fn dispatch(
         )
         .await;
     }
+    // cross 分支已 return, endpoint 在此无后续使用 — 直接 move (零拷贝).
     same_proto::same_proto_forward(
         state,
         fp,
@@ -329,6 +357,7 @@ async fn dispatch(
         req_bytes,
         ingress,
         provider,
+        endpoint,
         &upstream_id,
         model_rewrite,
         started,

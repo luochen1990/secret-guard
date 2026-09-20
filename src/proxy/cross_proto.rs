@@ -26,7 +26,7 @@ use tracing::{debug, warn};
 
 use crate::dag::ResponseData;
 use crate::error::AppError;
-use crate::provider::{DirectProvider, Protocol};
+use crate::provider::{DirectProvider, Endpoint, Protocol};
 
 use super::auth::ANTHROPIC_VERSION;
 use super::auth::apply_provider_auth;
@@ -66,6 +66,7 @@ pub(crate) async fn cross_proto_forward(
     req_bytes: Bytes,
     ingress: Protocol,
     provider: DirectProvider,
+    endpoint: Endpoint,
     upstream_id: &str,
     model_rewrite: Option<String>,
     started: Instant,
@@ -74,6 +75,10 @@ pub(crate) async fn cross_proto_forward(
 ) -> Result<Response<Body>, AppError> {
     use crate::codec::Protocol as CodecProtocol;
 
+    // egress 协议 = 选定端点的协议 (multi-endpoint: fallback 时即首端点协议,
+    // 与 ingress 不同的语义前提由 dispatch 的 exact=false 保证).
+    let egress = endpoint.protocol;
+
     // 1. 检查 codec 是否支持此协议对.
     let Some(ingress_codec) = CodecProtocol::from_native(ingress) else {
         return Err(AppError::NotImplemented(format!(
@@ -81,10 +86,10 @@ pub(crate) async fn cross_proto_forward(
             ingress.name()
         )));
     };
-    let Some(egress_codec) = CodecProtocol::from_native(provider.protocol) else {
+    let Some(egress_codec) = CodecProtocol::from_native(egress) else {
         return Err(AppError::NotImplemented(format!(
             "egress protocol '{}' is not supported by codec (only openai/anthropic/openairesponses)",
-            provider.protocol.name()
+            egress.name()
         )));
     };
 
@@ -112,7 +117,7 @@ pub(crate) async fn cross_proto_forward(
             "streaming cross-protocol ({ingress} → {}) is not yet supported \
              (Responses SSE event translation unimplemented); disable stream=true \
              in the client request",
-            provider.protocol.name()
+            egress.name()
         )));
     }
 
@@ -154,8 +159,8 @@ pub(crate) async fn cross_proto_forward(
     let egress_bytes = serde_json::to_vec(&egress_body_value)
         .map_err(|e| AppError::Internal(format!("serialize egress body failed: {e}")))?;
 
-    // 10. 构造上游 URL (egress writer 的固定 path).
-    let upstream_url = format!("{}{}", provider.base_url, egress_writer.upstream_path());
+    // 10. 构造上游 URL (egress writer 的固定 path; base 来自选定端点).
+    let upstream_url = format!("{}{}", endpoint.base_url, egress_writer.upstream_path());
 
     // 11. 复制请求 headers + 应用 egress 协议的 auth.
     let mut fwd_headers = sanitize_request_headers(&parts.headers);
@@ -164,12 +169,12 @@ pub(crate) async fn cross_proto_forward(
     apply_provider_auth(
         &mut fwd_headers,
         &provider.effective_api_key(upstream_id),
-        provider.protocol,
+        egress,
     );
     // 跨协议时客户端不会自带 egress 协议的特定 header, 这里仅在缺失时注入默认.
     // 用 entry().or_insert() 而非 insert(), 保留客户端主动设置更新的版本的能力.
     // 版本值收口在 auth::ANTHROPIC_VERSION (与 models.rs 的 fetch 共享, M-C3).
-    if provider.protocol == Protocol::Anthropic {
+    if egress == Protocol::Anthropic {
         fwd_headers
             .entry("anthropic-version")
             .or_insert_with(|| HeaderValue::from_static(ANTHROPIC_VERSION));
@@ -182,7 +187,7 @@ pub(crate) async fn cross_proto_forward(
         fp.name,
         fp.rest.trim_start_matches('/'),
         ingress.name(),
-        provider.protocol.name()
+        egress.name()
     );
     // 用 redact 后的 IR 经 ingress writer 重序列化作为 record body (而非原始 req_bytes).
     // 理由与 same_proto_forward 一致: record 应保存 "redact 后的视图" (LLM 看到的版本),
@@ -235,7 +240,7 @@ pub(crate) async fn cross_proto_forward(
         method = %parts.method,
         url = %upstream_url,
         ingress = %ingress.name(),
-        egress = %provider.protocol.name(),
+        egress = %egress.name(),
         "cross-proto forwarding"
     );
 
@@ -401,7 +406,7 @@ pub(crate) async fn cross_proto_forward(
                     // #162: 协议错配 WARN (空 content + 零 usage 启发式, 共享 helper).
                     super::recorder::warn_if_protocol_mismatch(
                         record_id,
-                        provider.protocol.name(),
+                        egress.name(),
                         &ir_resp,
                         resp_status.is_success(),
                     );
@@ -425,7 +430,7 @@ pub(crate) async fn cross_proto_forward(
                     (resp_status, body)
                 }
                 Err(e) => {
-                    warn!(%record_id, error = %e.message, "failed to parse upstream response as {}; passing through verbatim", provider.protocol.name());
+                    warn!(%record_id, error = %e.message, "failed to parse upstream response as {}; passing through verbatim", egress.name());
                     // RED-8 / SEC-10: reader 拒绝但 body 仍是合法 JSON — 共享兜底
                     // 决策序列 (helpers SSOT, 与 fan_out_buffered_ir 对称;
                     // on_fallback_restore: withhold 保留 Mock / restore 兜底还原).

@@ -17,7 +17,8 @@ use std::time::Duration;
 use secret_guard::{
     dag::ConversationDag,
     provider::{
-        DirectProvider, Protocol, Provider, ProviderKind, ProviderTable, Route, RouterProvider,
+        DirectProvider, Endpoint, Protocol, Provider, ProviderKind, ProviderTable, Route,
+        RouterProvider,
     },
     record::ForwardRecord,
     secrets::{SecretCategory, SecretEntry, SecretTable},
@@ -75,11 +76,13 @@ fn openai_provider(id: &str, base_url: &str) -> Provider {
         enabled: true,
         name: Some(id.into()),
         kind: ProviderKind::Direct(DirectProvider {
-            protocol: Protocol::OpenAI,
-            base_url: base_url.into(),
+            endpoints: vec![Endpoint {
+                protocol: Protocol::OpenAI,
+                base_url: base_url.into(),
+                common_uri: None,
+            }],
             api_key: "sk-test-key".into(),
             api_key_file: None,
-            common_uri: None,
         }),
     }
 }
@@ -90,11 +93,13 @@ fn provider_with(id: &str, proto: Protocol, base_url: &str) -> Provider {
         enabled: true,
         name: Some(id.into()),
         kind: ProviderKind::Direct(DirectProvider {
-            protocol: proto,
-            base_url: base_url.into(),
+            endpoints: vec![Endpoint {
+                protocol: proto,
+                base_url: base_url.into(),
+                common_uri: None,
+            }],
             api_key: String::new(),
             api_key_file: None,
-            common_uri: None,
         }),
     }
 }
@@ -757,11 +762,13 @@ async fn provider_api_key_file_reads_secret_from_path() {
         enabled: true,
         name: None,
         kind: ProviderKind::Direct(DirectProvider {
-            protocol: Protocol::OpenAI,
-            base_url: upstream.url(),
+            endpoints: vec![Endpoint {
+                protocol: Protocol::OpenAI,
+                base_url: upstream.url(),
+                common_uri: None,
+            }],
             api_key: String::new(),
             api_key_file: Some(key_file.clone()),
-            common_uri: None,
         }),
     };
     let proxy_url = spawn_proxy_with_provider(provider).await;
@@ -797,11 +804,13 @@ async fn provider_api_key_file_missing_falls_through_to_no_auth() {
         enabled: true,
         name: None,
         kind: ProviderKind::Direct(DirectProvider {
-            protocol: Protocol::OpenAI,
-            base_url: upstream.url(),
+            endpoints: vec![Endpoint {
+                protocol: Protocol::OpenAI,
+                base_url: upstream.url(),
+                common_uri: None,
+            }],
             api_key: String::new(),
             api_key_file: Some(std::path::PathBuf::from("/nonexistent/secret-guard-test")),
-            common_uri: None,
         }),
     };
     let proxy_url = spawn_proxy_with_provider(provider).await;
@@ -834,11 +843,13 @@ async fn anthropic_provider_uses_x_api_key() {
         enabled: true,
         name: None,
         kind: ProviderKind::Direct(DirectProvider {
-            protocol: Protocol::Anthropic,
-            base_url: upstream.url(),
+            endpoints: vec![Endpoint {
+                protocol: Protocol::Anthropic,
+                base_url: upstream.url(),
+                common_uri: None,
+            }],
             api_key: "sk-ant-test".into(),
             api_key_file: None,
-            common_uri: None,
         }),
     };
     let proxy_url = spawn_proxy_with_provider(provider).await;
@@ -3600,8 +3611,7 @@ async fn providers_api_generated_id_is_signaled() {
     let resp = client
         .post(format!("{proxy_url}/api/providers"))
         .json(&serde_json::json!({
-            "protocol": "openai",
-            "base_url": upstream.url(),
+            "endpoints": [ { "protocol": "openai", "base_url": upstream.url() } ],
         }))
         .send()
         .await
@@ -3650,6 +3660,125 @@ async fn secrets_api_delete_missing_returns_404() {
 
 // ─── providers API ─────────────────────────────────────────────────────────
 
+/// multi-endpoint wire 契约: PUT/POST 的 `endpoints` 全量必填 + 全量 round-trip
+/// (wire → dynamic 落盘 → effective 回显), 数组序 (fallback 序) 无损.
+/// 同时验证双端点的**转发面**: /o 与 /a 入口各自打到自己的端点 (byte-exact 透传,
+/// 零翻译) — D2 精确匹配语义的端到端锚 (单测 select_endpoint 之外的行为了证).
+#[tokio::test]
+async fn providers_api_multi_endpoint_roundtrip_and_dual_ingress() {
+    let mut openai_upstream = spawn_mock_upstream().await;
+    let mut anthropic_upstream = spawn_mock_upstream().await;
+    let _o = openai_upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_body(r#"{"id":"chatcmpl-o"}"#)
+        .create_async()
+        .await;
+    let _a = anthropic_upstream
+        .mock("POST", "/v1/messages")
+        .with_status(200)
+        .with_body(r#"{"id":"msg-a"}"#)
+        .create_async()
+        .await;
+
+    // 1. POST create: 双端点全量提交.
+    let dual = serde_json::json!({
+        "id": "dual",
+        "name": "Dual Endpoint",
+        "endpoints": [
+            { "protocol": "openai", "base_url": openai_upstream.url() },
+            { "protocol": "anthropic", "base_url": anthropic_upstream.url() },
+        ],
+        "api_key": "sk-dual",
+    });
+    let proxy_url = spawn_proxy(&openai_upstream.url()).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{proxy_url}/api/providers"))
+        .json(&dual)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let created: serde_json::Value = resp.json().await.unwrap();
+    // 响应回显: 完整端点列表保序 (数组序 = fallback 序).
+    let eps = created["endpoints"].as_array().unwrap();
+    assert_eq!(eps.len(), 2);
+    assert_eq!(eps[0]["protocol"], "openai");
+    assert_eq!(eps[0]["base_url"], openai_upstream.url());
+    assert_eq!(eps[1]["protocol"], "anthropic");
+    assert_eq!(eps[1]["base_url"], anthropic_upstream.url());
+
+    // 2. /o 入口 → openai 端点 (同协议透传).
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/dual/v1/chat/completions",
+        r#"{"model":"m"}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "/o ingress hits openai endpoint"
+    );
+
+    // 3. /a 入口 → anthropic 端点 (同协议透传, 零跨协议翻译).
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/a/dual/v1/messages",
+        r#"{"model":"m"}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "/a ingress hits anthropic endpoint"
+    );
+
+    // 4. PUT 全量替换 endpoints (翻转序) → effective 回显新列表 (round-trip).
+    let resp = client
+        .put(format!("{proxy_url}/api/providers/dual"))
+        .json(&serde_json::json!({
+            "endpoints": [
+                { "protocol": "anthropic", "base_url": anthropic_upstream.url() },
+                { "protocol": "openai", "base_url": openai_upstream.url() },
+            ],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let updated: serde_json::Value = resp.json().await.unwrap();
+    let eps = updated["endpoints"].as_array().unwrap();
+    assert_eq!(eps.len(), 2);
+    assert_eq!(eps[0]["protocol"], "anthropic", "PUT 全量替换后序已翻转");
+    // PUT 省略 api_key → 保留旧值 (#157 不变).
+    assert_eq!(updated["api_key_length"], 7); // "sk-dual"
+
+    // 5. GET 回显: wire → 存储 → effective 一致.
+    let resp = client
+        .get(format!("{proxy_url}/api/providers"))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let dual_entry = body["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == "dual")
+        .unwrap();
+    assert_eq!(
+        dual_entry["endpoints"].as_array().unwrap().len(),
+        2,
+        "GET 回显完整端点列表"
+    );
+}
+
 #[tokio::test]
 async fn providers_api_lists_existing() {
     let upstream = spawn_mock_upstream().await;
@@ -3664,7 +3793,7 @@ async fn providers_api_lists_existing() {
     let providers = body.get("providers").and_then(|v| v.as_array()).unwrap();
     assert_eq!(providers.len(), 1);
     assert_eq!(providers[0]["id"], "oa-main");
-    assert_eq!(providers[0]["protocol"], "openai");
+    assert_eq!(providers[0]["endpoints"][0]["protocol"], "openai");
     assert_eq!(providers[0]["api_key_masked"], "s*********y"); // "sk-test-key" (11 chars)
     assert!(body.get("protocols").unwrap().as_array().unwrap().len() >= 4);
     assert!(body.get("shorts").unwrap().as_array().unwrap().len() >= 4);
@@ -3687,8 +3816,7 @@ async fn providers_api_create_update_delete() {
         .json(&serde_json::json!({
             "id": "an-main",
             "name": "Anthropic Main",
-            "protocol": "anthropic",
-            "base_url": "https://api.anthropic.com",
+            "endpoints": [ { "protocol": "anthropic", "base_url": "https://api.anthropic.com" } ],
             "api_key": "sk-ant-test-12345",
         }))
         .send()
@@ -3697,7 +3825,7 @@ async fn providers_api_create_update_delete() {
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
     let created: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(created["id"], "an-main");
-    assert_eq!(created["protocol"], "anthropic");
+    assert_eq!(created["endpoints"][0]["protocol"], "anthropic");
     assert_ne!(created["api_key_masked"], "sk-ant-test-12345");
     assert_eq!(created["api_key_length"], 17); // "sk-ant-test-12345"
 
@@ -3715,8 +3843,7 @@ async fn providers_api_create_update_delete() {
     let resp = client
         .put(format!("{proxy_url}/api/providers/an-main"))
         .json(&serde_json::json!({
-            "protocol": "anthropic",
-            "base_url": "https://api.anthropic.com/v2",
+            "endpoints": [ { "protocol": "anthropic", "base_url": "https://api.anthropic.com/v2" } ],
             "api_key": "sk-ant-new",
         }))
         .send()
@@ -3724,7 +3851,10 @@ async fn providers_api_create_update_delete() {
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let updated: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(updated["base_url"], "https://api.anthropic.com/v2");
+    assert_eq!(
+        updated["endpoints"][0]["base_url"],
+        "https://api.anthropic.com/v2"
+    );
 
     // Delete.
     let resp = client
@@ -3761,7 +3891,7 @@ async fn put_provider_omit_api_key(
         .put(format!("{proxy_url}/api/providers/{id}"))
         .header("Content-Type", "application/json")
         .body(format!(
-            r#"{{"protocol":"openai","base_url":"{base_url}"}}"#
+            r#"{{"endpoints":[{{"protocol":"openai","base_url":"{base_url}"}}]}}"#
         ))
         .send()
         .await
@@ -3780,8 +3910,7 @@ async fn providers_api_update_preserves_api_key_when_omitted() {
         .json(&serde_json::json!({
             "id": "oa-pres",
             "name": "OpenAI Preserve",
-            "protocol": "openai",
-            "base_url": upstream.url(),
+            "endpoints": [ { "protocol": "openai", "base_url": upstream.url() } ],
             "api_key": "sk-original-XYZ",
         }))
         .send()
@@ -3794,7 +3923,10 @@ async fn providers_api_update_preserves_api_key_when_omitted() {
         put_provider_omit_api_key(&client, &proxy_url, "oa-pres", "https://example.com/v2").await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let updated: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(updated["base_url"], "https://example.com/v2");
+    assert_eq!(
+        updated["endpoints"][0]["base_url"],
+        "https://example.com/v2"
+    );
     assert_eq!(updated["api_key_length"], 15); // "sk-original-XYZ" 保留
     assert!(updated["api_key_masked"].as_str().unwrap().contains('*'));
 
@@ -3802,8 +3934,7 @@ async fn providers_api_update_preserves_api_key_when_omitted() {
     let resp = client
         .put(format!("{proxy_url}/api/providers/oa-pres"))
         .json(&serde_json::json!({
-            "protocol": "openai",
-            "base_url": "https://example.com/v3",
+            "endpoints": [ { "protocol": "openai", "base_url": "https://example.com/v3" } ],
             "api_key": "",
         }))
         .send()
@@ -3828,7 +3959,10 @@ async fn providers_api_update_preserves_api_key_on_static_fork() {
             .await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let forked: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(forked["base_url"], "https://new.example.com");
+    assert_eq!(
+        forked["endpoints"][0]["base_url"],
+        "https://new.example.com"
+    );
     assert_eq!(forked["api_key_length"], 13); // "sk-static-key" 保留
     assert_eq!(forked["source"], "dynamic_override");
 }
@@ -3855,8 +3989,7 @@ async fn put_static_fork_null_api_key_does_not_persist_plaintext() {
     let resp = client
         .put(format!("{proxy_url}/api/providers/p1"))
         .json(&serde_json::json!({
-            "protocol": "openai",
-            "base_url": upstream.url(),
+            "endpoints": [ { "protocol": "openai", "base_url": upstream.url() } ],
             "api_key": null,
             "enabled": true,
         }))
@@ -3911,8 +4044,7 @@ async fn put_static_fork_new_api_key_persists_and_forwards() {
     let resp = client
         .put(format!("{proxy_url}/api/providers/p1"))
         .json(&serde_json::json!({
-            "protocol": "openai",
-            "base_url": upstream.url(),
+            "endpoints": [ { "protocol": "openai", "base_url": upstream.url() } ],
             "api_key": "sk-new-explicit-key",
             "enabled": true,
         }))
@@ -3965,8 +4097,7 @@ async fn put_static_fork_null_api_key_inherits_api_key_file() {
     let resp = client
         .put(format!("{proxy_url}/api/providers/pf"))
         .json(&serde_json::json!({
-            "protocol": "openai",
-            "base_url": upstream.url(),
+            "endpoints": [ { "protocol": "openai", "base_url": upstream.url() } ],
             "api_key": null,
             "api_key_file": null,
             "enabled": true,
@@ -4013,8 +4144,7 @@ async fn put_static_fork_empty_api_key_still_inherits_static() {
     let resp = client
         .put(format!("{proxy_url}/api/providers/pe"))
         .json(&serde_json::json!({
-            "protocol": "openai",
-            "base_url": upstream.url(),
+            "endpoints": [ { "protocol": "openai", "base_url": upstream.url() } ],
             "api_key": "",
             "enabled": true,
         }))
@@ -4047,8 +4177,7 @@ async fn providers_api_rejects_bad_base_url() {
         .post(format!("{proxy_url}/api/providers"))
         .json(&serde_json::json!({
             "id": "bad",
-            "protocol": "openai",
-            "base_url": "not-a-url",
+            "endpoints": [ { "protocol": "openai", "base_url": "not-a-url" } ],
         }))
         .send()
         .await
@@ -4184,8 +4313,7 @@ async fn providers_api_pool_switches_between_constructs() {
         .post(format!("{proxy_url}/api/providers"))
         .json(&serde_json::json!({
             "id": "oa-second",
-            "protocol": "openai",
-            "base_url": upstream.url(),
+            "endpoints": [ { "protocol": "openai", "base_url": upstream.url() } ],
         }))
         .send()
         .await
@@ -4209,8 +4337,7 @@ async fn providers_api_pool_switches_between_constructs() {
         .put(format!("{proxy_url}/api/providers/oa-main"))
         .json(&serde_json::json!({
             "members": [],
-            "protocol": "openai",
-            "base_url": upstream.url(),
+            "endpoints": [ { "protocol": "openai", "base_url": upstream.url() } ],
         }))
         .send()
         .await
@@ -4218,7 +4345,7 @@ async fn providers_api_pool_switches_between_constructs() {
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let entry = get_provider_entry(&client, &proxy_url, "oa-main").await;
     assert_eq!(entry["kind"], "direct");
-    assert_eq!(entry["base_url"], upstream.url());
+    assert_eq!(entry["endpoints"][0]["base_url"], upstream.url());
 
     // Direct → Router (基线路径): routes 非空.
     let resp = client
@@ -4468,8 +4595,7 @@ async fn providers_api_rejects_probe_reserved_id() {
         .post(format!("{proxy_url}/api/providers"))
         .json(&serde_json::json!({
             "id": "probe",
-            "protocol": "openai",
-            "base_url": upstream.url(),
+            "endpoints": [ { "protocol": "openai", "base_url": upstream.url() } ],
         }))
         .send()
         .await
@@ -4599,17 +4725,19 @@ async fn providers_probe_api_legacy_probe_id_editable_and_deletable() {
     .await;
     let client = reqwest::Client::new();
 
-    // PUT (改 base_url; 其余 Direct 字段走回填) → 200, effective base_url 已切换.
+    // PUT (改 base_url, endpoints 全量) → 200, effective base_url 已切换.
     let resp = client
         .put(format!("{proxy_url}/api/providers/probe"))
-        .json(&serde_json::json!({ "base_url": upstream_b.url() }))
+        .json(&serde_json::json!({
+            "endpoints": [ { "protocol": "openai", "base_url": upstream_b.url() } ]
+        }))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["id"], "probe");
-    assert_eq!(body["base_url"], upstream_b.url());
+    assert_eq!(body["endpoints"][0]["base_url"], upstream_b.url());
 
     // DELETE → 204; 列表再无该条目.
     let resp = client
@@ -5401,8 +5529,7 @@ async fn put_static_provider_forks_dynamic_override() {
     let resp = client
         .put(format!("{proxy_url}/api/providers/static-p"))
         .json(&serde_json::json!({
-            "protocol": "openai",
-            "base_url": upstream.url(),
+            "endpoints": [ { "protocol": "openai", "base_url": upstream.url() } ],
             "api_key": "forked-key",
         }))
         .send()
@@ -5411,7 +5538,7 @@ async fn put_static_provider_forks_dynamic_override() {
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let updated: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(updated["source"], "dynamic_override");
-    assert_eq!(updated["base_url"], upstream.url());
+    assert_eq!(updated["endpoints"][0]["base_url"], upstream.url());
     assert!(updated["static_version"].is_object());
     assert!(updated["dynamic_version"].is_object());
 
@@ -5541,8 +5668,7 @@ async fn create_post_rejects_conflict_with_static_id() {
         .post(format!("{proxy_url}/api/providers"))
         .json(&serde_json::json!({
             "id": "static-p",
-            "protocol": "openai",
-            "base_url": "https://other.example",
+            "endpoints": [ { "protocol": "openai", "base_url": "https://other.example" } ],
             "api_key": "x",
         }))
         .send()
@@ -5960,8 +6086,7 @@ async fn cross_table_shared_state_no_lost_update() {
             c1.post(format!("{url1}/api/providers"))
                 .json(&serde_json::json!({
                     "id": "p-concurrent",
-                    "protocol": "openai",
-                    "base_url": "https://api.openai.com",
+                    "endpoints": [ { "protocol": "openai", "base_url": "https://api.openai.com" } ],
                     "api_key": "k",
                 }))
                 .send()
@@ -8932,7 +9057,26 @@ async fn provider_create_router_ignores_protocol() {
     )
     .await;
     assert_eq!(status, reqwest::StatusCode::CREATED, "body: {body}");
+    // endpoints 残留 (Direct 构造专属字段) 在 Router 构造下同样静默忽略 —
+    // 与 protocol/base_url 残留先例同构 (UpsertProviderRequest 字段注释承诺).
+    let (status, body, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/api/providers",
+        r#"{"id":"rt-stray-eps","routes":[{"model_pattern":"*","target":"oa-main","priority":0}],"endpoints":[{"protocol":"openai","base_url":"https://stray.example"}],"enabled":true}"#,
+        &[("content-type", "application/json")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CREATED,
+        "stray endpoints ignored: {body}"
+    );
     let created: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        created.get("endpoints").is_none(),
+        "router view carries no endpoints: {body}"
+    );
     assert_eq!(created["kind"], "router", "created as router: {body}");
     assert!(
         created.get("protocol").is_none(),
@@ -8951,28 +9095,41 @@ async fn provider_create_router_ignores_protocol() {
 }
 
 #[tokio::test]
-async fn provider_create_direct_without_protocol_rejected() {
-    // Direct 构造 protocol 必填 — 缺失 → 400 (可行动消息), 非 serde 422.
+async fn provider_create_direct_without_endpoints_rejected() {
+    // Direct 构造 endpoints 必填 — 缺失 (或空数组) → 400 (可行动消息), 非 serde 422.
     let proxy_url =
         spawn_proxy_with_provider(openai_provider("oa-main", "https://u.invalid")).await;
-    let (status, body, _) = proxy_request(
-        &proxy_url,
-        "POST",
-        "/api/providers",
-        r#"{"id":"no-proto","base_url":"https://api.example.com","enabled":true}"#,
-        &[("content-type", "application/json")],
-    )
-    .await;
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "body: {body}");
-    assert!(
-        body.contains("protocol is required"),
-        "actionable message: {body}"
-    );
+    for body in [
+        // 缺失 (无 endpoints 字段; 旧单端点字段残留被忽略).
+        r#"{"id":"no-eps","base_url":"https://api.example.com","enabled":true}"#,
+        // 显式空数组.
+        r#"{"id":"no-eps","endpoints":[],"enabled":true}"#,
+    ] {
+        let (status, resp_body, _) = proxy_request(
+            &proxy_url,
+            "POST",
+            "/api/providers",
+            body,
+            &[("content-type", "application/json")],
+        )
+        .await;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::BAD_REQUEST,
+            "body: {resp_body}"
+        );
+        assert!(
+            resp_body.contains("endpoints"),
+            "actionable message: {resp_body}"
+        );
+    }
 }
 
 #[tokio::test]
-async fn provider_update_partial_put_keeps_protocol() {
-    // PUT 保留语义 (#190): 只改 name 不带 protocol → 从 Direct 旧值回填, 不 400.
+async fn provider_update_partial_put_requires_endpoints() {
+    // PUT 全量语义: 只改 name 不带 endpoints → 400 (Direct 字段不回填 — 与
+    // api_key 的 "省略=保留" 不同, endpoints 由前端回填 effective 后整体提交;
+    // 旧 protocol 回填 (#190) 随 multi-endpoint schema 废除).
     let upstream = spawn_mock_upstream().await;
     let real = openai_provider("oa-main", &upstream.url());
     let proxy_url = spawn_proxy_static_dynamic(
@@ -8984,22 +9141,16 @@ async fn provider_update_partial_put_keeps_protocol() {
     )
     .await
     .0;
-    // static 条目 → PUT 创建 dynamic override (protocol 省略 → 回填 static 的 openai;
-    // routes 省略 + effective 是 Direct → 不回填 → Direct 意图).
     let (status, body, _) = proxy_request(
         &proxy_url,
         "PUT",
         "/api/providers/oa-main",
-        r#"{"name":"renamed","base_url":"https://api.example.com","enabled":true}"#,
+        r#"{"name":"renamed","enabled":true}"#,
         &[("content-type", "application/json")],
     )
     .await;
-    assert_eq!(status, reqwest::StatusCode::OK, "body: {body}");
-    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(
-        v["protocol"], "openai",
-        "protocol backfilled from old direct value"
-    );
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "body: {body}");
+    assert!(body.contains("endpoints"), "actionable message: {body}");
 }
 
 // ─── 路由 (#179 多规则化): 按 model 分流 / priority / NoMatch / PUT 覆盖 ──
@@ -9398,13 +9549,13 @@ async fn router_routes_empty_array_switches_to_direct() {
     .await
     .0;
 
-    // PUT 空数组 + Direct 完整字段 (protocol + base_url): override 变实体.
+    // PUT 空数组 + Direct 完整字段 (endpoints): override 变实体.
     let (status, body, _) = proxy_request(
         &proxy_url,
         "PUT",
         "/api/providers/rt",
         &format!(
-            r#"{{"routes":[],"protocol":"openai","base_url":"{}","enabled":true}}"#,
+            r#"{{"routes":[],"endpoints":[{{"protocol":"openai","base_url":"{}"}}],"enabled":true}}"#,
             upstream.url()
         ),
         &[("content-type", "application/json")],
@@ -9414,7 +9565,7 @@ async fn router_routes_empty_array_switches_to_direct() {
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["kind"], "direct", "kind switched to direct: {body}");
     assert_eq!(
-        v["base_url"],
+        v["endpoints"][0]["base_url"],
         upstream.url(),
         "direct fields active: {body}"
     );
@@ -9622,8 +9773,9 @@ async fn usage_stats_redact_audit_and_retry_round_recorded() {
     .await;
     let client = reqwest::Client::new();
     let create = serde_json::json!({
-        "id": "oa-mock", "enabled": true, "protocol": "openai",
-        "base_url": server.url(), "api_key": "sk-x"
+        "id": "oa-mock", "enabled": true,
+        "endpoints": [ { "protocol": "openai", "base_url": server.url() } ],
+        "api_key": "sk-x"
     });
     let resp = client
         .post(format!("{base}/api/providers"))
@@ -9716,7 +9868,8 @@ async fn usage_stats_end_to_end_records_replayed_and_served() {
     let client = reqwest::Client::new();
     let create = serde_json::json!({
         "id": "oa-mock", "enabled": true, "name": "mock",
-        "protocol": "openai", "base_url": server.url(), "api_key": "sk-x"
+        "endpoints": [ { "protocol": "openai", "base_url": server.url() } ],
+        "api_key": "sk-x"
     });
     let resp = client
         .post(format!("{base}/api/providers"))
@@ -9822,8 +9975,9 @@ async fn usage_stats_streaming_include_usage_recorded() {
     let base = spawn_proxy_with_usage_store(store).await;
     let client = reqwest::Client::new();
     let create = serde_json::json!({
-        "id": "oa-mock", "enabled": true, "protocol": "openai",
-        "base_url": server.url(), "api_key": "sk-x"
+        "id": "oa-mock", "enabled": true,
+        "endpoints": [ { "protocol": "openai", "base_url": server.url() } ],
+        "api_key": "sk-x"
     });
     let resp = client
         .post(format!("{base}/api/providers"))
@@ -9882,8 +10036,9 @@ async fn usage_stats_cross_proto_recorded() {
     let base = spawn_proxy_with_usage_store(store).await;
     let client = reqwest::Client::new();
     let create = serde_json::json!({
-        "id": "oa-mock", "enabled": true, "protocol": "openai",
-        "base_url": server.url(), "api_key": "sk-x"
+        "id": "oa-mock", "enabled": true,
+        "endpoints": [ { "protocol": "openai", "base_url": server.url() } ],
+        "api_key": "sk-x"
     });
     let resp = client
         .post(format!("{base}/api/providers"))
@@ -9960,8 +10115,9 @@ async fn sec1_scan_setup(tag: &str) -> (reqwest::Client, String, std::path::Path
 
     // provider 显式带 api_key (明文落 state.toml, GET 必须返回 mask).
     let create = serde_json::json!({
-        "id": "oa-sec1", "enabled": true, "protocol": "openai",
-        "base_url": upstream.url(), "api_key": SEC1_API_KEY
+        "id": "oa-sec1", "enabled": true,
+        "endpoints": [ { "protocol": "openai", "base_url": upstream.url() } ],
+        "api_key": SEC1_API_KEY
     });
     let resp = client
         .post(format!("{base}/api/providers"))

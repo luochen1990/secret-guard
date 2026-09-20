@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use secret_guard::provider::{
-    DirectProvider, PoolProvider, Protocol, Provider, ProviderKind, ProviderTable, Route,
+    DirectProvider, Endpoint, PoolProvider, Protocol, Provider, ProviderKind, ProviderTable, Route,
     RouterProvider,
 };
 use secret_guard::proxy::ModelListCache;
@@ -55,11 +55,13 @@ fn openai_provider(id: &str, base_url: &str) -> Provider {
         enabled: true,
         name: Some(id.into()),
         kind: ProviderKind::Direct(DirectProvider {
-            protocol: Protocol::OpenAI,
-            base_url: base_url.into(),
+            endpoints: vec![Endpoint {
+                protocol: Protocol::OpenAI,
+                base_url: base_url.into(),
+                common_uri: None,
+            }],
             api_key: String::new(),
             api_key_file: None,
-            common_uri: None,
         }),
     }
 }
@@ -67,11 +69,13 @@ fn openai_provider(id: &str, base_url: &str) -> Provider {
 fn anthropic_provider(id: &str, base_url: &str) -> Provider {
     Provider {
         kind: ProviderKind::Direct(DirectProvider {
-            protocol: Protocol::Anthropic,
-            base_url: base_url.into(),
+            endpoints: vec![Endpoint {
+                protocol: Protocol::Anthropic,
+                base_url: base_url.into(),
+                common_uri: None,
+            }],
             api_key: String::new(),
             api_key_file: None,
-            common_uri: None,
         }),
         ..openai_provider(id, base_url)
     }
@@ -684,4 +688,27 @@ async fn preview_models_unknown_provider_404() {
     let proxy = spawn(vec![]).await;
     let (status, body) = get(&proxy, "/api/providers/ghost/models").await;
     assert_eq!(status, 404, "body: {body}");
+}
+
+/// multi-endpoint ROB: 空 endpoints (手改 state.toml 绕过 validate 的非法配置)
+/// → 数据化错误 (error 字段), 不 panic / 不 5xx — 与 dispatch 的 503 同源假设.
+#[tokio::test]
+async fn preview_models_empty_endpoints_is_data_not_panic() {
+    let broken = Provider {
+        id: "no-endpoints".into(),
+        enabled: true,
+        name: None,
+        kind: ProviderKind::Direct(DirectProvider {
+            endpoints: vec![],
+            api_key: String::new(),
+            api_key_file: None,
+        }),
+    };
+    let proxy = spawn(vec![broken]).await;
+    let (status, v) = preview(&proxy, "no-endpoints").await;
+    assert_eq!(status, 200, "失败是数据不是 HTTP 错误: {v}");
+    assert_eq!(v["models"], serde_json::json!([]));
+    let err = v["error"].as_str().expect("error 字段必有值");
+    assert!(err.contains("no endpoints"), "reason 明确: {err}");
+    assert_eq!(v["upstream_id"], "no-endpoints");
 }

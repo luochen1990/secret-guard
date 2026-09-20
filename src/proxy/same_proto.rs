@@ -29,7 +29,7 @@ use bytes::Bytes;
 use tracing::{debug, warn};
 
 use crate::error::AppError;
-use crate::provider::{DirectProvider, Protocol};
+use crate::provider::{DirectProvider, Endpoint, Protocol};
 
 use super::auth::apply_provider_auth;
 use super::helpers::{
@@ -55,6 +55,7 @@ pub(crate) async fn same_proto_forward(
     req_bytes: Bytes,
     ingress: Protocol,
     provider: DirectProvider,
+    endpoint: Endpoint,
     upstream_id: &str,
     model_rewrite: Option<String>,
     started: Instant,
@@ -73,6 +74,7 @@ pub(crate) async fn same_proto_forward(
             req_bytes,
             ingress,
             provider,
+            endpoint,
             upstream_id,
             started,
             &[],
@@ -131,6 +133,7 @@ pub(crate) async fn same_proto_forward(
             req_bytes,
             ingress,
             provider,
+            endpoint,
             upstream_id,
             started,
             &secrets_snapshot,
@@ -190,8 +193,10 @@ pub(crate) async fn same_proto_forward(
         .map_err(|e| AppError::Internal(format!("serialize redacted body failed: {e}")))?;
     let req_bytes_to_send = req_text_for_record.clone().into_bytes();
 
-    // 6. 构造上游 URL + record path (同协议两路径共享 helper).
-    let (upstream_url, path_for_record) = same_proto_upstream_url_and_path(&provider, &fp, &parts);
+    // 6. 构造上游 URL + record path (同协议两路径共享 helper). URL 用选定
+    //    端点的 base_url (same 路径下 endpoint.protocol == ingress, 等价旧
+    //    provider.base_url).
+    let (upstream_url, path_for_record) = same_proto_upstream_url_and_path(&endpoint, &fp, &parts);
 
     // 7. 复制请求 headers + 应用 auth. 删除客户端的 content-type/length (重新计算).
     let mut fwd_headers = sanitize_request_headers(&parts.headers);
@@ -343,13 +348,14 @@ async fn same_proto_passthrough(
     req_bytes: Bytes,
     ingress: Protocol,
     provider: DirectProvider,
+    endpoint: Endpoint,
     upstream_id: &str,
     started: Instant,
     secrets_snapshot: &[crate::secrets::SecretEntry],
     pool_watch: Option<crate::pool::PoolWatch>,
 ) -> Result<Response<Body>, AppError> {
     let req_text_for_record = utf8_view(&req_bytes);
-    let (upstream_url, path_for_record) = same_proto_upstream_url_and_path(&provider, &fp, &parts);
+    let (upstream_url, path_for_record) = same_proto_upstream_url_and_path(&endpoint, &fp, &parts);
 
     let mut fwd_headers = sanitize_request_headers(&parts.headers);
     apply_provider_auth(
@@ -434,14 +440,14 @@ async fn same_proto_passthrough(
 
 /// 同协议两路径 (forward / passthrough) 共享的上游 URL + record path 构造.
 ///
-/// - `upstream_url`: base_url + rest + query (query 可能携带客户端 key, 如 Gemini
-///   `?key=...`; 落日志前经 `safe_url_for_log` 脱敏, SEC-C4).
+/// - `upstream_url`: 端点 base_url + rest + query (query 可能携带客户端 key,
+///   如 Gemini `?key=...`; 落日志前经 `safe_url_for_log` 脱敏, SEC-C4).
 /// - `path_for_record`: 还原 ingress 侧的完整路径形态 `/{proto}/{name}/{rest}`.
 ///
 /// 刻意不合入 cross_proto: 其 URL 用 egress writer 的固定 `upstream_path()`,
 /// record path 带 `[a → b]` 协议尾注 (语义不同).
 fn same_proto_upstream_url_and_path(
-    provider: &DirectProvider,
+    endpoint: &Endpoint,
     fp: &super::ForwardPath,
     parts: &axum::http::request::Parts,
 ) -> (String, String) {
@@ -450,7 +456,7 @@ fn same_proto_upstream_url_and_path(
         .query()
         .map(|q| format!("?{q}"))
         .unwrap_or_default();
-    let upstream_url = build_upstream_url(&provider.base_url, &format!("{}{query}", fp.rest));
+    let upstream_url = build_upstream_url(&endpoint.base_url, &format!("{}{query}", fp.rest));
     let path_for_record = format!(
         "/{}/{}/{}",
         fp.proto,

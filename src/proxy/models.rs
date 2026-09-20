@@ -41,10 +41,12 @@
 //!
 //! # 上游 fetch (ROB-*, best-effort 永不 fail 查询)
 //!
-//! 按目标 provider **自身 protocol** (非 ingress 协议) 请求:
+//! 端点选择: 每个可达 Direct 用 `select_endpoint(ingress)` 选端点 (精确匹配
+//! ingress 协议的端点, 无匹配 fallback 首端点 — 与 dispatch 转发路径同一语义:
+//! 广告的模型必须真能被该入口的服务端点提供), 按选定端点的 protocol 请求:
 //! - OpenAI / Responses / Anthropic: `GET {base_url}{common_uri}/models`, shape
 //!   `{data:[{id}]}`. common_uri 候选序 (懒回退 — 运行时要省请求, 与探测端
-//!   的并行双路径相对): `DirectProvider.common_uri` (detect 固化的布局断言,
+//!   的并行双路径相对): `Endpoint.common_uri` (detect 固化的布局断言,
 //!   fast path) > `CacheEntry.common_uri_hit` (运行时发现) > 默认序
 //!   `V1_COMMON_URIS` (["/v1", ""]). **仅 404|405 触发下一候选** (鉴权/连通/
 //!   parse 失败立即终止); 命中值记进 `CacheEntry` 供下轮 fast path.
@@ -102,7 +104,7 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::provider::{
-    DirectProvider, PoolPicker, Protocol, Provider, ProviderKind, ProviderTable,
+    DirectProvider, Endpoint, PoolPicker, Protocol, Provider, ProviderKind, ProviderTable,
 };
 use crate::state::AppState;
 
@@ -138,11 +140,18 @@ const MODEL_FETCH_BACKOFF: Duration = Duration::from_millis(300);
 /// 不应能借 /models 查询撑爆内存; 超限按该 provider fetch 失败处理).
 const MAX_MODELS_BODY: usize = 4 * 1024 * 1024;
 
-/// 可达 Direct 目标: id + 构造快照 + 锁外预解析的 api_key (`advertised_names`
-/// 组装, 供 `snapshot_refreshing` 消费). 命名结构体防 id/api_key 位置错换.
+/// 可达 Direct 目标: id + **选定端点**快照 + 锁外预解析的 api_key
+/// (`advertised_names` 组装, 供 `snapshot_refreshing` 消费). 命名结构体防
+/// id/api_key 位置错换.
+///
+/// 端点选择 (T1 机械适配): `select_endpoint(ingress)` — 各 ingress 入口按自身
+/// 协议选端点 (精确匹配 > 首端点 fallback, 与 dispatch 同一语义)。select 返回
+/// None (空 endpoints, 绕过 validate 的非法配置) 的目标跳过 (无贡献, ROB 不
+/// panic)。缓存键控仍是裸 provider id — per-(id, egress) 键控属 T2 (FWD-7 增补),
+/// 此处不同 ingress 入口共享同 id 条目 (单端点配置下行为与演进前一致)。
 struct FetchTarget {
     id: String,
-    direct: DirectProvider,
+    endpoint: Endpoint,
     api_key: String,
 }
 
@@ -202,7 +211,7 @@ impl ModelListCache {
         let mut out = HashMap::new();
         for FetchTarget {
             id,
-            direct,
+            endpoint,
             api_key,
         } in targets
         {
@@ -217,11 +226,11 @@ impl ModelListCache {
             if needs_refresh {
                 // 候选优先序: stored 配置 (detect 固化) > 缓存命中 (运行时发现) >
                 // 默认序. base_url 变更后 stored 可能失配 — fetch 侧 404 回退兜底.
-                let preferred = direct
+                let preferred = endpoint
                     .common_uri
                     .as_deref()
                     .or(map.get(id).and_then(|e| e.common_uri_hit.as_deref()));
-                match fetch_model_list(client, api_key, direct, preferred).await {
+                match fetch_model_list(client, api_key, endpoint, preferred).await {
                     Ok((models, common_uri_hit)) => {
                         tracing::debug!(
                             provider_id = %id,
@@ -427,20 +436,33 @@ fn n1_accepts(
 /// 完整广告序 (别名段 + 合并段): FWD-7 的可测核心.
 ///
 /// N6 gate 短路在 alias_names 之后、walk 之前 — exact-only router 零上游请求.
-pub(super) async fn advertised_names(state: &AppState, entry: &Provider) -> Vec<String> {
+///
+/// `ingress` 决定 fetch 端点选择 (每个可达 Direct 用 `select_endpoint(ingress)`
+/// 选端点 — 广告的模型必须真能被该入口的服务端点提供; fallback 首端点语义与
+/// dispatch 转发路径一致)。
+pub(super) async fn advertised_names(
+    state: &AppState,
+    ingress: Protocol,
+    entry: &Provider,
+) -> Vec<String> {
     let aliases = alias_names(&state.providers, &state.pools, entry);
     if !needs_upstream_merge(entry) {
         return aliases;
     }
-    // 锁纪律 (模块头部): 快照 + api_key 预解析均在缓存锁外.
+    // 锁纪律 (模块头部): 快照 + api_key 预解析 + 端点选择均在缓存锁外.
     // 代价: api_key_file 配置的 provider 每次 /models 查询读一次文件 (锁外,
     // 通常 <1ms — 旧形态仅在 refresh 时读, 频率被 TTL/退避压低).
     let targets = walk_reachable_directs(&state.providers, entry)
         .into_iter()
-        .map(|(id, direct)| FetchTarget {
-            api_key: direct.effective_api_key(&id),
-            id,
-            direct,
+        // select None (空 endpoints, 非法配置绕过 validate) 跳过 — 无贡献, 不 panic.
+        .filter_map(|(id, direct)| {
+            direct
+                .select_endpoint(ingress)
+                .map(|(endpoint, _)| FetchTarget {
+                    api_key: direct.effective_api_key(&id),
+                    endpoint: endpoint.clone(),
+                    id,
+                })
         })
         .collect::<Vec<_>>();
     let cached = state
@@ -467,7 +489,7 @@ pub(super) async fn handle_router_models(
     ingress: Protocol,
     entry: Provider,
 ) -> Response<Body> {
-    let names = advertised_names(state, &entry).await;
+    let names = advertised_names(state, ingress, &entry).await;
     let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/json");
@@ -491,6 +513,12 @@ pub(super) async fn handle_router_models(
 ///   **现场 fetch** (不进缓存 — Direct 的 /models 透传本来就是逐请求 fresh,
 ///   预览忠实于 "endpoint 现在返回什么"; 重复点击的代价是一次轻量 GET).
 ///
+/// **multi-endpoint 端点选择 (T1 机械适配)**: preview API 无 ingress 上下文
+/// (WebUI 弹窗调用, 无 URL 首段), 取数统一用默认 ingress (OpenAI) 经
+/// [`DirectProvider::select_endpoint`] 选端点 — openai 端点 exact 命中, 无
+/// openai 端点的 provider fallback 首端点 (单端点配置行为与演进前一致);
+/// per-endpoint 预览 (per 行 ingress 参数) 属 WebUI 弹窗的后续演进。
+///
 /// 失败是**数据不是 HTTP 错误** (与 probe 同姿态): fetch/解析/解析路由失败落在
 /// [`ModelPreview::error`] (已净化, 永不含 key/secret — fetch_model_list 的错误串
 /// 纪律 + `RouteError` Display 的 SEC-2 同型), `models` 为空.
@@ -511,9 +539,13 @@ pub(crate) struct ModelPreview {
 }
 
 pub(crate) async fn provider_model_preview(state: &AppState, entry: &Provider) -> ModelPreview {
+    // 端点选择见函数 doc (T1 机械适配): preview 无 ingress 上下文, 统一用
+    // OpenAI 视角的端点选择 (显式拼写而非 Protocol::default() — 后者是 enum
+    // 定义的自由度, 不应与 preview 语义耦合)。
+    let preview_ingress = Protocol::OpenAI;
     match &entry.kind {
         ProviderKind::Router(_) => ModelPreview {
-            models: advertised_names(state, entry).await,
+            models: advertised_names(state, preview_ingress, entry).await,
             source: "router-synthesized",
             upstream_id: None,
             error: None,
@@ -527,11 +559,23 @@ pub(crate) async fn provider_model_preview(state: &AppState, entry: &Provider) -
                 match state.providers.resolve_route(entry, "", &state.pools) {
                     Ok(resolved) => {
                         let direct = &resolved.provider;
+                        // 空 endpoints (绕过 validate 的非法配置) → 数据化错误, ROB.
+                        // 判定先于 effective_api_key (api_key_file 是同步文件读,
+                        // 错误路径不做白工).
+                        let Some((endpoint, _)) = direct.select_endpoint(preview_ingress) else {
+                            return ModelPreview {
+                                models: Vec::new(),
+                                source: "upstream",
+                                upstream_id: Some(resolved.id),
+                                error: Some("provider has no endpoints (invalid config)".into()),
+                            };
+                        };
                         let api_key = direct.effective_api_key(&resolved.id);
-                        let preferred = direct.common_uri.as_deref();
+                        let preferred = endpoint.common_uri.as_deref();
                         // fetch 失败是数据 (error 字段), models 恒空 — 两分支的
                         // source/upstream_id 同值 (source 描述取数模式, 见 struct doc).
-                        match fetch_model_list(&state.upstream, &api_key, direct, preferred).await {
+                        match fetch_model_list(&state.upstream, &api_key, endpoint, preferred).await
+                        {
                             Ok((models, _)) => (models, Some(resolved.id), None),
                             Err(reason) => (Vec::new(), Some(resolved.id), Some(reason)),
                         }
@@ -568,7 +612,7 @@ impl FetchErr {
     }
 }
 
-/// 按 provider 自身 protocol fetch 模型清单 (best-effort, 错误消息只含 id + reason,
+/// 按选定端点的 protocol fetch 模型清单 (best-effort, 错误消息只含 id + reason,
 /// 永不含 key/secret — reqwest 错误经 `upstream_error_brief` 净化, 剥 userinfo/query).
 ///
 /// `api_key` 由调用方在缓存锁外预解析传入 (见模块头部锁纪律). `preferred` 是
@@ -585,17 +629,17 @@ impl FetchErr {
 async fn fetch_model_list(
     client: &reqwest::Client,
     api_key: &str,
-    direct: &DirectProvider,
+    endpoint: &Endpoint,
     preferred: Option<&str>,
 ) -> Result<(Vec<String>, Option<String>), String> {
-    match direct.protocol {
+    match endpoint.protocol {
         Protocol::OpenAI | Protocol::OpenAIResponses | Protocol::Anthropic => {
             let candidates = common_uri_candidates(preferred);
             let mut errs = Vec::new();
             for cu in &candidates {
                 let url =
-                    super::helpers::build_upstream_url(&direct.base_url, &format!("{cu}/models"));
-                match fetch_and_parse(client, &url, api_key, direct.protocol).await {
+                    super::helpers::build_upstream_url(&endpoint.base_url, &format!("{cu}/models"));
+                match fetch_and_parse(client, &url, api_key, endpoint.protocol).await {
                     Ok(models) => return Ok((models, Some(cu.clone()))),
                     Err(FetchErr::Absent(s)) => {
                         errs.push(format!("common_uri {cu:?}: {}", status_detail(s)));
@@ -609,13 +653,13 @@ async fn fetch_model_list(
             ))
         }
         Protocol::Gemini | Protocol::Ollama => {
-            let path = match direct.protocol {
+            let path = match endpoint.protocol {
                 Protocol::Gemini => "/v1beta/models",
                 Protocol::Ollama => "/api/tags",
                 _ => unreachable!("matched arm excludes v1 family"),
             };
-            let url = super::helpers::build_upstream_url(&direct.base_url, path);
-            let models = fetch_and_parse(client, &url, api_key, direct.protocol)
+            let url = super::helpers::build_upstream_url(&endpoint.base_url, path);
+            let models = fetch_and_parse(client, &url, api_key, endpoint.protocol)
                 .await
                 .map_err(|e| e.message())?;
             Ok((models, None))
@@ -1210,11 +1254,9 @@ mod tests {
 
     fn direct_proto(protocol: Protocol, base_url: &str) -> DirectProvider {
         DirectProvider {
-            protocol,
-            base_url: base_url.to_string(),
+            endpoints: vec![Endpoint::new(protocol, base_url)],
             api_key: String::new(),
             api_key_file: None,
-            common_uri: None,
         }
     }
 
@@ -1642,8 +1684,8 @@ mod tests {
             .await;
         let targets = vec![FetchTarget {
             id: "p1".to_string(),
-            direct: direct_proto(Protocol::OpenAI, &server.url()),
-            api_key: String::new(), // direct_proto 无 key 配置, 预解析恒为空串
+            endpoint: Endpoint::new(Protocol::OpenAI, &server.url()),
+            api_key: String::new(), // 端点构造无 key 字段, api_key 由 FetchTarget 显式携带 (空串)
         }];
         let cache = ModelListCache::new();
         let client = reqwest::Client::new();
@@ -1711,8 +1753,8 @@ mod tests {
             .await;
         let targets = vec![FetchTarget {
             id: "p1".to_string(),
-            direct: direct_proto(Protocol::OpenAI, &server.url()),
-            api_key: String::new(), // direct_proto 无 key 配置, 预解析恒为空串
+            endpoint: Endpoint::new(Protocol::OpenAI, &server.url()),
+            api_key: String::new(), // 端点构造无 key 字段, api_key 由 FetchTarget 显式携带 (空串)
         }];
         let cache = ModelListCache::new();
         let client = reqwest::Client::new();
@@ -1754,8 +1796,8 @@ mod tests {
             let (_conn, _) = listener.accept().await.unwrap();
             std::future::pending::<()>().await;
         });
-        let direct = direct_proto(Protocol::OpenAI, &format!("http://{addr}"));
-        let err = fetch_model_list(&reqwest::Client::new(), "", &direct, None)
+        let endpoint = Endpoint::new(Protocol::OpenAI, &format!("http://{addr}"));
+        let err = fetch_model_list(&reqwest::Client::new(), "", &endpoint, None)
             .await
             .unwrap_err();
         assert!(err.contains("timeout"), "停滞上游必须被整体超时掐断: {err}");
@@ -1773,8 +1815,8 @@ mod tests {
             .with_body(huge)
             .create_async()
             .await;
-        let direct = direct_proto(Protocol::OpenAI, &server.url());
-        let err = fetch_model_list(&reqwest::Client::new(), "", &direct, None)
+        let endpoint = Endpoint::new(Protocol::OpenAI, &server.url());
+        let err = fetch_model_list(&reqwest::Client::new(), "", &endpoint, None)
             .await
             .unwrap_err();
         assert!(err.contains("exceeds"), "超限 body 必须按失败处理: {err}");
@@ -1793,12 +1835,12 @@ mod tests {
             .expect(1)
             .create_async()
             .await;
-        let mut direct = direct_proto(Protocol::Anthropic, &server.url());
-        direct.api_key = "sk-ant-test".into();
-        // key = direct.api_key 直配值 (预解析结果).
-        let (models, hit) = fetch_model_list(&reqwest::Client::new(), "sk-ant-test", &direct, None)
-            .await
-            .unwrap();
+        // key = 直配值 (预解析结果, 等价 direct_proto + api_key).
+        let endpoint = Endpoint::new(Protocol::Anthropic, &server.url());
+        let (models, hit) =
+            fetch_model_list(&reqwest::Client::new(), "sk-ant-test", &endpoint, None)
+                .await
+                .unwrap();
         assert_eq!(models, strs(&["c1"]));
         assert_eq!(hit.as_deref(), Some("/v1"), "v1 族默认序首选裸根布局");
         mock.assert_async().await;
@@ -1828,10 +1870,10 @@ mod tests {
     /// fetch_model_list 调用 wrapper (自建 client; api_key 显式传).
     async fn fetch_direct(
         api_key: &str,
-        direct: &DirectProvider,
+        endpoint: &Endpoint,
         preferred: Option<&str>,
     ) -> Result<(Vec<String>, Option<String>), String> {
-        fetch_model_list(&reqwest::Client::new(), api_key, direct, preferred).await
+        fetch_model_list(&reqwest::Client::new(), api_key, endpoint, preferred).await
     }
 
     /// 智谱式布局 (版本前缀已含): 默认序先 404 于 /v1/models, 回退 base+/models
@@ -1848,8 +1890,8 @@ mod tests {
             1,
         )
         .await;
-        let direct = direct_proto(Protocol::OpenAI, &server.url());
-        let (models, hit) = fetch_direct("", &direct, None).await.unwrap();
+        let endpoint = Endpoint::new(Protocol::OpenAI, &server.url());
+        let (models, hit) = fetch_direct("", &endpoint, None).await.unwrap();
         assert_eq!(models, strs(&["glm-4.6"]));
         assert_eq!(hit.as_deref(), Some(""), "版本前缀已含布局命中");
         bare.assert_async().await;
@@ -1869,9 +1911,9 @@ mod tests {
             1,
         )
         .await;
-        let mut direct = direct_proto(Protocol::OpenAI, &server.url());
-        direct.common_uri = Some(String::new());
-        let (models, hit) = fetch_direct("", &direct, direct.common_uri.as_deref())
+        let mut endpoint = Endpoint::new(Protocol::OpenAI, &server.url());
+        endpoint.common_uri = Some(String::new());
+        let (models, hit) = fetch_direct("", &endpoint, endpoint.common_uri.as_deref())
             .await
             .unwrap();
         assert_eq!(models, strs(&["glm-4.6"]));
@@ -1896,9 +1938,9 @@ mod tests {
         // 显式挂 404 (不依赖 mockito 未匹配行为的隐式 404).
         let never_a = mock_get(&mut server, "/v1/models", 404, "", 0).await;
         let never_b = mock_get(&mut server, "/models", 404, "", 0).await;
-        let mut direct = direct_proto(Protocol::OpenAI, &server.url());
-        direct.common_uri = Some("/api/paas/v4".into());
-        let (models, hit) = fetch_direct("", &direct, direct.common_uri.as_deref())
+        let mut endpoint = Endpoint::new(Protocol::OpenAI, &server.url());
+        endpoint.common_uri = Some("/api/paas/v4".into());
+        let (models, hit) = fetch_direct("", &endpoint, endpoint.common_uri.as_deref())
             .await
             .unwrap();
         assert_eq!(models, strs(&["glm-4v"]));
@@ -1914,9 +1956,9 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         mock_get(&mut server, "/v1/models", 404, "", 1).await;
         mock_get(&mut server, "/models", 200, r#"{"data":[{"id":"m1"}]}"#, 1).await;
-        let mut direct = direct_proto(Protocol::OpenAI, &server.url());
-        direct.common_uri = Some("/v1".into());
-        let (models, hit) = fetch_direct("", &direct, direct.common_uri.as_deref())
+        let mut endpoint = Endpoint::new(Protocol::OpenAI, &server.url());
+        endpoint.common_uri = Some("/v1".into());
+        let (models, hit) = fetch_direct("", &endpoint, endpoint.common_uri.as_deref())
             .await
             .unwrap();
         assert_eq!(models, strs(&["m1"]));
@@ -1929,8 +1971,8 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         mock_get(&mut server, "/v1/models", 404, "", 1).await;
         mock_get(&mut server, "/models", 404, "", 1).await;
-        let direct = direct_proto(Protocol::OpenAI, &server.url());
-        let err = fetch_direct("", &direct, None).await.unwrap_err();
+        let endpoint = Endpoint::new(Protocol::OpenAI, &server.url());
+        let err = fetch_direct("", &endpoint, None).await.unwrap_err();
         assert!(err.contains("common_uri \"/v1\""), "{err}");
         assert!(err.contains("common_uri \"\""), "{err}");
         assert!(err.contains("no candidate endpoint hit"), "{err}");
@@ -1943,8 +1985,8 @@ mod tests {
         mock_get(&mut server, "/v1/models", 401, "", 1).await;
         let bare_never =
             mock_get(&mut server, "/models", 200, r#"{"data":[{"id":"m1"}]}"#, 0).await;
-        let direct = direct_proto(Protocol::OpenAI, &server.url());
-        let err = fetch_direct("", &direct, None).await.unwrap_err();
+        let endpoint = Endpoint::new(Protocol::OpenAI, &server.url());
+        let err = fetch_direct("", &endpoint, None).await.unwrap_err();
         assert!(err.contains("401"), "{err}");
         assert!(err.contains("common_uri \"/v1\""), "{err}");
         bare_never.assert_async().await;
@@ -1957,11 +1999,11 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let v1 = mock_get(&mut server, "/v1/models", 404, "", 1).await; // 仅首轮
         let bare = mock_get(&mut server, "/models", 200, r#"{"data":[{"id":"m1"}]}"#, 2).await; // 两轮
-        let direct = direct_proto(Protocol::OpenAI, &server.url());
+        let endpoint = Endpoint::new(Protocol::OpenAI, &server.url());
         let targets = vec![FetchTarget {
             id: "p1".into(),
             api_key: String::new(),
-            direct,
+            endpoint,
         }];
         let client = reqwest::Client::new();
         let cache = ModelListCache::new();
@@ -2029,7 +2071,7 @@ mod tests {
         ]);
         let r = state.providers.get_effective("r").unwrap();
         assert_eq!(
-            advertised_names(&state, &r).await,
+            advertised_names(&state, Protocol::OpenAI, &r).await,
             strs(&["ultra", "flash"]),
             "exact-only: 只返回别名, 不 fetch (N6)"
         );
