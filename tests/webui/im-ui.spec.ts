@@ -36,7 +36,7 @@
  *
  * 所有测试共享一个 browser context, 按声明顺序执行 (workers=1).
  */
-import { test, expect, type Page } from "@playwright/test";
+import { test, expect, type Locator, type Page } from "@playwright/test";
 import * as http from "http";
 import { TEST_SECRET_VALUE } from "./fixtures";
 
@@ -162,6 +162,12 @@ function autoAcceptAlerts(page: Page): string[] {
     await d.accept();
   });
   return alerts;
+}
+
+// provider 表单端点行 (multi-endpoint) 快捷定位: 默认第 0 行 (Detect 用例的
+// 探测目标 / 新建表单的首行).
+function endpointRow(page: Page, n = 0): Locator {
+  return page.locator(".endpoint-row").nth(n);
 }
 
 test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
@@ -2328,18 +2334,19 @@ test.describe("WebUI 表单失败保持 (#181)", () => {
 
   test("#181: provider 表单 409 冲突时对话框保持打开 + 字段保留", async ({ page }) => {
     await page.locator('a.tab[data-tab="providers"]').click();
-    // 等表格渲染 (refreshProviders 完成 → state.providerProtocols 已填充,
-    // 否则 protocol 下拉为空, selectOption 会失败).
+    // 等表格渲染 (refreshProviders 完成 → state.providerWebuiProtocols 已填充,
+    // 否则端点行的 protocol 下拉为空, selectOption 会失败).
     await expect(page.locator("#providers-body tr").first()).toBeVisible();
 
     await page.locator("button", { hasText: "+ new provider" }).click();
     const dlg = page.locator("#provider-form");
     await expect(dlg).toBeVisible();
     // 已存在的 static id (playwright.config.ts 预置) → POST 409.
+    // 端点行 (multi-endpoint): 新建默认 1 行, 填第 0 行.
     await page.locator("#p-id").fill("mock-openai");
     await page.locator("#p-name").fill("my precious name");
-    await page.locator("#p-protocol").selectOption("openai");
-    await page.locator("#p-base-url").fill("http://127.0.0.1:19999/v1");
+    await endpointRow(page).locator(".ep-protocol").selectOption("openai");
+    await endpointRow(page).locator(".ep-base-url").fill("http://127.0.0.1:19999/v1");
     await page.locator("#p-api-key").fill("sk-user-typed-key-123");
 
     const alerts = autoAcceptAlerts(page);
@@ -2349,7 +2356,7 @@ test.describe("WebUI 表单失败保持 (#181)", () => {
     await expect(dlg, "409 后对话框应保持打开").toBeVisible();
     await expect(page.locator("#p-id")).toHaveValue("mock-openai");
     await expect(page.locator("#p-name")).toHaveValue("my precious name");
-    await expect(page.locator("#p-base-url")).toHaveValue("http://127.0.0.1:19999/v1");
+    await expect(endpointRow(page).locator(".ep-base-url")).toHaveValue("http://127.0.0.1:19999/v1");
     await expect(page.locator("#p-api-key")).toHaveValue("sk-user-typed-key-123");
     // 失败 alert 确实弹出 (含 409 冲突语义).
     await expect
@@ -2409,8 +2416,8 @@ test.describe("WebUI 表单失败保持 (#181)", () => {
     const dlg = page.locator("#provider-form");
     await expect(dlg).toBeVisible();
     await page.locator("#p-id").fill("net-err-provider");
-    await page.locator("#p-protocol").selectOption("openai");
-    await page.locator("#p-base-url").fill("http://127.0.0.1:19999/v1");
+    await endpointRow(page).locator(".ep-protocol").selectOption("openai");
+    await endpointRow(page).locator(".ep-base-url").fill("http://127.0.0.1:19999/v1");
 
     const alerts = autoAcceptAlerts(page);
     await page.locator('#provider-form-el button[value="save"]').click();
@@ -2435,9 +2442,9 @@ test.describe("WebUI 表单失败保持 (#181)", () => {
     await page.locator("button", { hasText: "+ new provider" }).click();
     const dlg = page.locator("#provider-form");
     await expect(dlg).toBeVisible();
-    // 不填 base_url (Direct 默认构造) → builder 返回 null (#180 的前端拦截分支).
+    // 不填端点行 base_url (Direct 默认构造) → builder 返回 null (#180 的前端拦截分支).
     await page.locator("#p-id").fill("no-baseurl-provider");
-    await page.locator("#p-protocol").selectOption("openai");
+    await endpointRow(page).locator(".ep-protocol").selectOption("openai");
 
     const alerts = autoAcceptAlerts(page);
     await page.locator('#provider-form-el button[value="save"]').click();
@@ -2467,9 +2474,10 @@ test.describe("WebUI 表单失败保持 (#181)", () => {
     const dlg = page.locator("#provider-form");
     await expect(dlg).toBeVisible();
 
-    // gemini 不在新建词表 (webui_protocols 仅 codec 覆盖族) — 经
-    // setProtocolSelectValue 动态 append "(experimental)" 选项后选中.
-    const sel = page.locator("#p-protocol");
+    // gemini 不在新建词表 (webui_protocols 仅 codec 覆盖族) — 编辑回填时经
+    // setEndpointProtocolValue 动态 append "(experimental)" 选项后选中.
+    // multi-endpoint: 存量 gemini 条目的单端点回填为端点行 #0.
+    const sel = endpointRow(page).locator(".ep-protocol");
     await expect(sel).toHaveValue("gemini");
     await expect(sel.locator('option[value="gemini"]')).toHaveText("gemini (experimental)");
     // 新建词表三族仍在 (append 不挤掉既有选项).
@@ -2483,7 +2491,7 @@ test.describe("WebUI 表单失败保持 (#181)", () => {
     await expect(dlg).not.toBeVisible();
     await row.locator('button[data-action="edit"]').click();
     await expect(dlg).toBeVisible();
-    await expect(page.locator("#p-protocol")).toHaveValue("gemini");
+    await expect(endpointRow(page).locator(".ep-protocol")).toHaveValue("gemini");
     await page.locator('#provider-form-el button[value="cancel"]').click();
     await expect(dlg).not.toBeVisible();
   });
@@ -2498,8 +2506,8 @@ test.describe("WebUI 表单失败保持 (#181)", () => {
     const dlg = page.locator("#provider-form");
     await expect(dlg).toBeVisible();
     await page.locator("#p-id").fill(uid);
-    await page.locator("#p-protocol").selectOption("openai");
-    await page.locator("#p-base-url").fill("http://127.0.0.1:19999/v1");
+    await endpointRow(page).locator(".ep-protocol").selectOption("openai");
+    await endpointRow(page).locator(".ep-base-url").fill("http://127.0.0.1:19999/v1");
 
     await page.locator('#provider-form-el button[value="save"]').click();
 
@@ -2526,15 +2534,15 @@ test.describe("Provider 表单构造分野 (#190)", () => {
     const dlg = page.locator("#provider-form");
     await expect(dlg).toBeVisible();
 
-    // 默认 direct: Base URL / API Key / Protocol 可见; 路由编辑器隐藏.
+    // 默认 direct: 端点行 base_url / API Key 可见; 路由编辑器隐藏.
     // (断言组内代表字段而非 display:contents wrapper — 后者无盒, 可见性断言依赖浏览器实现细节.)
-    await expect(page.locator("#p-base-url")).toBeVisible();
+    await expect(page.locator(".endpoint-row .ep-base-url")).toBeVisible();
     await expect(page.locator("#p-routes-list")).not.toBeVisible();
 
     const uid = `direct-${Date.now()}`;
     await page.locator("#p-id").fill(uid);
-    await page.locator("#p-protocol").selectOption("openai");
-    await page.locator("#p-base-url").fill("http://127.0.0.1:19998");
+    await endpointRow(page).locator(".ep-protocol").selectOption("openai");
+    await endpointRow(page).locator(".ep-base-url").fill("http://127.0.0.1:19998");
 
     await page.locator('#provider-form-el button[value="save"]').click();
     await expect(dlg).not.toBeVisible();
@@ -2559,7 +2567,7 @@ test.describe("Provider 表单构造分野 (#190)", () => {
     // 切 router: 字段组对调.
     await page.locator("#p-kind").selectOption("router");
     await expect(page.locator("#p-routes-list")).toBeVisible();
-    await expect(page.locator("#p-base-url")).not.toBeVisible();
+    await expect(page.locator(".endpoint-row .ep-base-url")).not.toBeVisible();
 
     const uid = `router-${Date.now()}`;
     await page.locator("#p-id").fill(uid);
@@ -2624,7 +2632,7 @@ test.describe("Provider 表单构造分野 (#190)", () => {
     await expect(page.locator(".route-row")).toHaveCount(1);
     await expect(page.locator(".route-row .route-model-pattern")).toHaveValue("*");
 
-    // 切 Direct (#187 改回实体场景): base_url 空 → 前置校验拦截.
+    // 切 Direct (#187 改回实体场景): 端点行 base_url 空 → 前置校验拦截.
     const alerts = autoAcceptAlerts(page);
     await page.locator("#p-kind").selectOption("direct");
     await page.locator('#provider-form-el button[value="save"]').click();
@@ -2633,9 +2641,10 @@ test.describe("Provider 表单构造分野 (#190)", () => {
       .toBeGreaterThan(0);
     expect(alerts[0]).toContain("Base URL is required");
 
-    // 补上 base_url 后成功改回 Direct (kind 切换生效) — Direct 分支对 Router 旧条目
-    // 发空 routes 数组 ("显式改回实体"; PUT 省略 routes 会被后端回填旧路由停留在 Router).
-    await page.locator("#p-base-url").fill("http://127.0.0.1:19997");
+    // 补上端点行 base_url 后成功改回 Direct (kind 切换生效) — Direct 分支对 Router
+    // 旧条目发空 routes 数组 ("显式改回实体"; PUT 省略 routes 会被后端回填旧路由
+    // 停留在 Router).
+    await endpointRow(page).locator(".ep-base-url").fill("http://127.0.0.1:19997");
     await page.locator("#p-api-key").fill("sk-after-switch");
     await page.locator('#provider-form-el button[value="save"]').click();
     await expect(dlg).not.toBeVisible();
@@ -2700,6 +2709,132 @@ test.describe("Provider 表单构造分野 (#190)", () => {
 
 });
 
+test.describe("Provider 多端点表单 (multi-endpoint)", () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto("/");
+    await page.waitForLoadState("networkidle");
+    await page.waitForTimeout(500);
+    await page.locator('a.tab[data-tab="providers"]').click();
+    await expect(page.locator("#providers-body tr").first()).toBeVisible();
+  });
+
+  // multi-endpoint 主链路冒烟: 增删行 → 双端点保存 round-trip → 列表每端点一枚
+  // pill + 第一端点 base_url (+N 角标) → 编辑回填两行协议不漂移 (声明序 = fallback
+  // 序, 数据完整性). 途中覆盖 ≥1 行 / 重复协议两条前端前置拦截.
+  test("端点行增删 + ≥1/重复协议拦截 + 保存 round-trip + 每端点 pill", async ({ page }) => {
+    await page.locator("button", { hasText: "+ new provider" }).click();
+    const dlg = page.locator("#provider-form");
+    await expect(dlg).toBeVisible();
+    // 新建默认 1 行 (词表首项 openai 兜底).
+    await expect(page.locator(".endpoint-row")).toHaveCount(1);
+    const uid = `multi-${Date.now()}`;
+    await page.locator("#p-id").fill(uid);
+    // 行 1: openai (默认) + base_url.
+    await endpointRow(page).locator(".ep-base-url").fill("http://127.0.0.1:19999");
+    // + Add endpoint → 行 2: anthropic + base_url.
+    await page.locator("#p-endpoint-add").click();
+    await expect(page.locator(".endpoint-row")).toHaveCount(2);
+    await endpointRow(page, 1).locator(".ep-protocol").selectOption("anthropic");
+    await endpointRow(page, 1).locator(".ep-base-url").fill("http://127.0.0.1:19999/anthropic");
+
+    // 前置拦截 #1: 重复协议 (行 2 改回 openai → save → alert, 对话框保持).
+    await endpointRow(page, 1).locator(".ep-protocol").selectOption("openai");
+    const alerts = autoAcceptAlerts(page);
+    await page.locator('#provider-form-el button[value="save"]').click();
+    await expect.poll(() => alerts.length, { timeout: 3000 }).toBeGreaterThan(0);
+    expect(alerts[0]).toContain("duplicate protocol");
+    await expect(dlg, "重复协议拦截后对话框应保持打开").toBeVisible();
+
+    // 行删除冒烟: 增第三行再删掉, 回到 2 行 (行 2 改回 anthropic).
+    await endpointRow(page, 1).locator(".ep-protocol").selectOption("anthropic");
+    await page.locator("#p-endpoint-add").click();
+    await expect(page.locator(".endpoint-row")).toHaveCount(3);
+    await endpointRow(page, 2).locator(".ep-del").click();
+    await expect(page.locator(".endpoint-row")).toHaveCount(2);
+
+    await page.locator('#provider-form-el button[value="save"]').click();
+    await expect(dlg, "成功后对话框应关闭").not.toBeVisible();
+
+    // 列表渲染: 每端点一枚 protocol pill + URL cell = 第一端点 base_url (+1 角标).
+    const row = page.locator("#providers-body tr", { hasText: uid });
+    await expect(row).toBeVisible();
+    await expect(row.locator(".pill", { hasText: /^openai$/ })).toBeVisible();
+    await expect(row.locator(".pill", { hasText: /^anthropic$/ })).toBeVisible();
+    await expect(row).toContainText("127.0.0.1:19999");
+    await expect(row.locator("td.cell-long .meta")).toHaveText("+1");
+
+    // 编辑回填: 两行全量物化, 协议/base_url 不漂移 (声明序保持).
+    await row.locator('button[data-action="edit"]').click();
+    await expect(dlg).toBeVisible();
+    await expect(page.locator(".endpoint-row")).toHaveCount(2);
+    await expect(endpointRow(page).locator(".ep-protocol")).toHaveValue("openai");
+    await expect(endpointRow(page).locator(".ep-base-url")).toHaveValue("http://127.0.0.1:19999");
+    await expect(endpointRow(page, 1).locator(".ep-protocol")).toHaveValue("anthropic");
+    await expect(endpointRow(page, 1).locator(".ep-base-url")).toHaveValue("http://127.0.0.1:19999/anthropic");
+    await page.locator('#provider-form-el button[value="cancel"]').click();
+
+    // 清理 (dynamic-only 可删): 注册 dialog handler 接受 confirm.
+    await row.locator('button[data-action="delete"]').click();
+    await expect(row).not.toBeVisible();
+  });
+
+  test("≥1 行约束: 删到 0 行后保存被前端拦截", async ({ page }) => {
+    await page.locator("button", { hasText: "+ new provider" }).click();
+    const dlg = page.locator("#provider-form");
+    await expect(dlg).toBeVisible();
+    await page.locator("#p-id").fill(`empty-eps-${Date.now()}`);
+    await endpointRow(page).locator(".ep-base-url").fill("http://127.0.0.1:19999");
+    await endpointRow(page).locator(".ep-del").click();
+    await expect(page.locator(".endpoint-row")).toHaveCount(0);
+
+    const alerts = autoAcceptAlerts(page);
+    await page.locator('#provider-form-el button[value="save"]').click();
+    await expect.poll(() => alerts.length, { timeout: 3000 }).toBeGreaterThan(0);
+    expect(alerts[0]).toContain("At least one endpoint is required");
+    await expect(dlg, "0 行拦截后对话框应保持打开").toBeVisible();
+
+    await page.locator('#provider-form-el button[value="cancel"]').click();
+    await expect(dlg).not.toBeVisible();
+  });
+
+  test("direct 条目 endpoints 弹窗: 每端点一行 (upstream ↤ 入口 URL + Models)", async ({ page }) => {
+    // 动态建一个双端点 direct 条目 (复用上一用例的表单路径, 精简到最小).
+    await page.locator("button", { hasText: "+ new provider" }).click();
+    const uid = `eps-dlg-${Date.now()}`;
+    await page.locator("#p-id").fill(uid);
+    await endpointRow(page).locator(".ep-base-url").fill("http://127.0.0.1:19999");
+    await page.locator("#p-endpoint-add").click();
+    await endpointRow(page, 1).locator(".ep-protocol").selectOption("anthropic");
+    await endpointRow(page, 1).locator(".ep-base-url").fill("http://127.0.0.1:19999/anthropic");
+    await page.locator('#provider-form-el button[value="save"]').click();
+    const row = page.locator("#providers-body tr", { hasText: uid });
+    await expect(row).toBeVisible();
+
+    // 弹窗: 每端点一行, data-short = 该端点协议 short; 行内 upstream base_url +
+    // 入口 URL 并列, badge 恒 direct (同协议透传, 无 translate/unsupported 形态).
+    await row.locator('button[data-action="endpoints"]').click();
+    const dlg = page.locator("#provider-endpoints");
+    await expect(dlg).toBeVisible();
+    await expect(dlg.locator(".ep-row")).toHaveCount(2);
+    await expect(dlg.locator('.ep-row[data-short="o"] .ep-proto')).toHaveText("openai");
+    await expect(dlg.locator('.ep-row[data-short="o"] .badge')).toHaveText("direct");
+    await expect(dlg.locator('.ep-row[data-short="o"] .ep-url')).toContainText("http://127.0.0.1:19999");
+    await expect(dlg.locator('.ep-row[data-short="o"] .ep-url')).toContainText(`/${uid}`);
+    await expect(dlg.locator('.ep-row[data-short="a"] .ep-proto')).toHaveText("anthropic");
+    await expect(dlg.locator('.ep-row[data-short="a"] .badge')).toHaveText("direct");
+    // 每行 Models 按钮 + fallback hint (body 直接子元素, 不受 dialog header 的
+    // 静态 hint 干扰).
+    await expect(dlg.locator(".ep-models-btn")).toHaveCount(2);
+    await expect(dlg.locator("#provider-endpoints-body > .hint")).toContainText("fall back to the first endpoint");
+    await dlg.locator('button[value="close"]').click();
+    await expect(dlg).not.toBeVisible();
+
+    autoAcceptAlerts(page);
+    await row.locator('button[data-action="delete"]').click();
+    await expect(row).not.toBeVisible();
+  });
+});
+
 test.describe("Provider endpoints 弹窗 (M2 走查 + 行卡片重设计)", () => {
   // URL Copy / 模型 chip 复制断言需要 clipboard 权限 (headless Chromium 默认拒绝
   // → 复制走 catch 分支, flash 永不出现). 本 describe 顶层统一授予.
@@ -2716,9 +2851,12 @@ test.describe("Provider endpoints 弹窗 (M2 走查 + 行卡片重设计)", () =
   // (stream=true → 501). 历史缺陷: tooltip 写死 "Non-streaming only" (过时的
   // #183 前文案), 且 CODEC_SUPPORTED 缺 openairesponses (Responses 行误显示
   // "not supported" — Responses⇄Chat 非流式翻译实际可用).
-  test("openai provider: direct/translate 三态矩阵 + 流式 tooltip 按 pair 分化", async ({ page }) => {
-    const row = page.locator("#providers-body tr", { hasText: "mock-openai" });
-    await row.locator('button[data-action="endpoints"]').click();
+  // multi-endpoint 后 direct 条目的弹窗改为 per 端点行形态, 矩阵宿主 = mock-router
+  // (种子 router 条目, 链尾 = mock-openai 的 openai 单端点 — 三态断言不变);
+  // data-id 精确定位: mock-router 行 URL 列含 "mock-openai" 路由摘要, hasText
+  // 会双匹配.
+  test("router provider: direct/translate 三态矩阵 + 流式 tooltip 按 pair 分化", async ({ page }) => {
+    await page.locator('button[data-action="endpoints"][data-id="mock-router"]').click();
     const dlg = page.locator("#provider-endpoints");
     await expect(dlg).toBeVisible();
 
@@ -2726,7 +2864,7 @@ test.describe("Provider endpoints 弹窗 (M2 走查 + 行卡片重设计)", () =
     const badgeOf = (short: string) => rowOf(short).locator(".badge");
 
     // 主题行回显 provider id (重设计新增).
-    await expect(dlg.locator("#provider-endpoints-subject")).toContainText("mock-openai");
+    await expect(dlg.locator("#provider-endpoints-subject")).toContainText("mock-router");
 
     // /o/ 同协议 → direct.
     await expect(badgeOf("o")).toHaveText("direct");
@@ -2756,9 +2894,11 @@ test.describe("Provider endpoints 弹窗 (M2 走查 + 行卡片重设计)", () =
 
   // Models 预览 (GET /api/providers/{id}/models): direct provider 现场 fetch
   // 上游清单 → chips 渲染 + 点击复制 + 收起/展开命中会话级缓存 (不重复 fetch).
+  // multi-endpoint: direct 弹窗行 = 端点行 (data-short = 该端点协议 short),
+  // preview API 是条目级 (统一 OpenAI 视角选端点 — 后端 T1 微决策), 行内按钮
+  // 拉同一 API. data-id 精确定位 (mock-router 行含 "mock-openai" 文本, hasText 双匹配).
   test("Models 预览: direct happy path + chip 复制 + 展开缓存", async ({ page }) => {
-    const row = page.locator("#providers-body tr", { hasText: "mock-openai" });
-    await row.locator('button[data-action="endpoints"]').click();
+    await page.locator('button[data-action="endpoints"][data-id="mock-openai"]').click();
     const dlg = page.locator("#provider-endpoints");
     const oRow = dlg.locator('.ep-row[data-short="o"]');
     const btn = oRow.locator(".ep-models-btn");
@@ -2783,8 +2923,7 @@ test.describe("Provider endpoints 弹窗 (M2 走查 + 行卡片重设计)", () =
   // 失败是数据 (与 probe 同姿态): 上游无该协议的清单端点 (seeded gemini provider
   // 的上游不 serve /v1beta/models) → 面板内错误行, 不是 HTTP 错误弹窗.
   test("Models 预览: 上游清单端点缺失 → 面板内错误行", async ({ page }) => {
-    const row = page.locator("#providers-body tr", { hasText: "mock-gemini" });
-    await row.locator('button[data-action="endpoints"]').click();
+    await page.locator('button[data-action="endpoints"][data-id="mock-gemini"]').click();
     const dlg = page.locator("#provider-endpoints");
     const gRow = dlg.locator('.ep-row[data-short="g"]');
     await gRow.locator(".ep-models-btn").click();
@@ -3001,15 +3140,15 @@ test.describe("Provider Detect 协议探测", () => {
     await openNewProviderForm(page);
     // 预先把 select 改到非推荐值: 断言 "被 recommended 改写", 排除 "本来就是
     // openai" 的 vacuous 通过.
-    await page.locator("#p-protocol").selectOption("anthropic");
-    await page.locator("#p-base-url").fill(fastUpstream.url);
-    await page.locator("#p-detect").click();
-    await expect(page.locator("#p-probe-result .probe-line-ok")).toContainText("Detected: openai");
-    await expect(page.locator("#p-protocol")).toHaveValue("openai");
-    await expect(page.locator("#p-probe-result .probe-chip")).toHaveCount(3);
+    await endpointRow(page).locator(".ep-protocol").selectOption("anthropic");
+    await endpointRow(page).locator(".ep-base-url").fill(fastUpstream.url);
+    await endpointRow(page).locator(".ep-detect").click();
+    await expect(endpointRow(page).locator(".ep-probe-result .probe-line-ok")).toContainText("Detected: openai");
+    await expect(endpointRow(page).locator(".ep-protocol")).toHaveValue("openai");
+    await expect(endpointRow(page).locator(".ep-probe-result .probe-chip")).toHaveCount(3);
     // finally 恢复: 按钮可点且文案复位.
-    await expect(page.locator("#p-detect")).toBeEnabled();
-    await expect(page.locator("#p-detect")).toHaveText("Detect");
+    await expect(endpointRow(page).locator(".ep-detect")).toBeEnabled();
+    await expect(endpointRow(page).locator(".ep-detect")).toHaveText("Detect");
   });
 
   test("Detect: dialog 关闭重开后在途响应不落地 (probeEpoch 对账)", async ({ page }) => {
@@ -3021,8 +3160,8 @@ test.describe("Provider Detect 协议探测", () => {
     const staleResponse = page.waitForResponse(
       (r) => r.url().includes("/api/providers/probe") && r.request().method() === "POST"
     );
-    await page.locator("#p-base-url").fill(slowUpstream.url);
-    await page.locator("#p-detect").click();
+    await endpointRow(page).locator(".ep-base-url").fill(slowUpstream.url);
+    await endpointRow(page).locator(".ep-detect").click();
     // 立即关闭并重开 dialog (重开即 epoch bump; 新世界: 空 base_url, select 回
     // 默认 openai) — 800ms 延迟给 close+reopen 留足窗口.
     await page.locator('#provider-form-el button[value="cancel"]').click();
@@ -3031,9 +3170,9 @@ test.describe("Provider Detect 协议探测", () => {
     await staleResponse;
     // 旧响应已落地浏览器: 若无 epoch 守卫, 此刻会渲染 "Detected: anthropic" 并
     // 改写 select. 断言两者都没发生.
-    await expect(page.locator("#p-probe-result .probe-line")).toHaveCount(0);
-    await expect(page.locator("#p-probe-result .hint")).toHaveCount(0);
-    await expect(page.locator("#p-protocol")).toHaveValue("openai");
+    await expect(endpointRow(page).locator(".ep-probe-result .probe-line")).toHaveCount(0);
+    await expect(endpointRow(page).locator(".ep-probe-result .hint")).toHaveCount(0);
+    await expect(endpointRow(page).locator(".ep-protocol")).toHaveValue("openai");
   });
 
   // ─── 智谱式布局 (版本前缀已含): bare /models 回退 + common_uri 知识链 ────
@@ -3043,17 +3182,17 @@ test.describe("Provider Detect 协议探测", () => {
     await page.locator('a.tab[data-tab="providers"]').click();
     await openNewProviderForm(page);
     await page.locator("#p-id").fill("zhipu-coding");
-    await page.locator("#p-base-url").fill(versionedUpstream.url);
+    await endpointRow(page).locator(".ep-base-url").fill(versionedUpstream.url);
     // 徽标初始隐藏 (未探测).
-    await expect(page.locator("#p-common-uri-badge")).toBeHidden();
-    await page.locator("#p-detect").click();
-    await expect(page.locator("#p-probe-result .probe-line-ok")).toContainText("Detected: openai");
+    await expect(endpointRow(page).locator(".ep-common-uri-badge")).toBeHidden();
+    await endpointRow(page).locator(".ep-detect").click();
+    await expect(endpointRow(page).locator(".ep-probe-result .probe-line-ok")).toContainText("Detected: openai");
     // URL 回显: 胜出族 (openai) 的两路 GET URL 都可见 (不黑盒).
-    await expect(page.locator("#p-probe-result .probe-url")).toHaveCount(2);
-    await expect(page.locator("#p-probe-result .probe-url").last()).toContainText("/models");
+    await expect(endpointRow(page).locator(".ep-probe-result .probe-url")).toHaveCount(2);
+    await expect(endpointRow(page).locator(".ep-probe-result .probe-url").last()).toContainText("/models");
     // common_uri="" 徽标: 追加在 base_url 后, 显示 included 语义 (无可视前缀).
-    await expect(page.locator("#p-common-uri-badge")).toBeVisible();
-    await expect(page.locator("#p-common-uri-badge")).toHaveText("✓ included");
+    await expect(endpointRow(page).locator(".ep-common-uri-badge")).toBeVisible();
+    await expect(endpointRow(page).locator(".ep-common-uri-badge")).toHaveText("✓ included");
     // 保存 → 知识落盘 (POST 带 common_uri: "").
     await page.locator('#provider-form-el button[value="save"]').click();
     await expect(page.locator("#provider-form")).not.toBeVisible();
@@ -3062,25 +3201,25 @@ test.describe("Provider Detect 协议探测", () => {
     // 其他用例创建的 provider (无 common_uri → 徽标 hidden 假失败).
     await page.locator('button[data-action="edit"][data-id="zhipu-coding"]').click();
     await expect(page.locator("#provider-form")).toBeVisible();
-    await expect(page.locator("#p-common-uri-badge")).toBeVisible();
-    await expect(page.locator("#p-common-uri-badge")).toHaveText("✓ included");
+    await expect(endpointRow(page).locator(".ep-common-uri-badge")).toBeVisible();
+    await expect(endpointRow(page).locator(".ep-common-uri-badge")).toHaveText("✓ included");
   });
 
   test("Detect: base_url 编辑作废 common_uri 徽标", async ({ page }) => {
     await page.goto("/");
     await page.locator('a.tab[data-tab="providers"]').click();
     await openNewProviderForm(page);
-    await page.locator("#p-base-url").fill(fastUpstream.url);
-    await page.locator("#p-detect").click();
-    await expect(page.locator("#p-common-uri-badge")).toBeVisible();
-    await expect(page.locator("#p-common-uri-badge")).toHaveText("+/v1");
+    await endpointRow(page).locator(".ep-base-url").fill(fastUpstream.url);
+    await endpointRow(page).locator(".ep-detect").click();
+    await expect(endpointRow(page).locator(".ep-common-uri-badge")).toBeVisible();
+    await expect(endpointRow(page).locator(".ep-common-uri-badge")).toHaveText("+/v1");
     // 复制 flash 后 'copied' class 必须复位 (M-A 守卫: 反转色不得永久滞留).
-    await page.locator("#p-common-uri-badge").click();
-    await expect(page.locator("#p-common-uri-badge")).toHaveText("✓ copied");
-    await expect(page.locator("#p-common-uri-badge")).toHaveText("+/v1", { timeout: 3000 });
-    await expect(page.locator("#p-common-uri-badge")).not.toHaveClass(/copied/);
+    await endpointRow(page).locator(".ep-common-uri-badge").click();
+    await expect(endpointRow(page).locator(".ep-common-uri-badge")).toHaveText("✓ copied");
+    await expect(endpointRow(page).locator(".ep-common-uri-badge")).toHaveText("+/v1", { timeout: 3000 });
+    await expect(endpointRow(page).locator(".ep-common-uri-badge")).not.toHaveClass(/copied/);
     // 编辑 base_url → 探测结果对新 URL 不再成立, 徽标作废隐藏.
-    await page.locator("#p-base-url").fill("http://127.0.0.1:19996");
-    await expect(page.locator("#p-common-uri-badge")).toBeHidden();
+    await endpointRow(page).locator(".ep-base-url").fill("http://127.0.0.1:19996");
+    await expect(endpointRow(page).locator(".ep-common-uri-badge")).toBeHidden();
   });
 });

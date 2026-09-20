@@ -104,6 +104,20 @@ kind = "direct"
 endpoints = [ { protocol = "gemini", base_url = "http://127.0.0.1:${MOCK_PORT}" } ]
 enabled = true
 
+# router 条目: endpoints 弹窗矩阵形态 (5 协议入口 × direct/translate/unsupported
+# 三态) 用例的种子 — multi-endpoint 后 direct 条目的弹窗改为 per 端点行形态, 矩阵
+# 只剩 router/pool 宿主. 链尾 = mock-openai (openai 单端点), 三态断言与旧
+# direct 种子时代完全一致.
+[[providers]]
+id = "mock-router"
+kind = "router"
+enabled = true
+
+[[providers.routes]]
+model_pattern = "*"
+target = "mock-openai"
+priority = 0
+
 [[secrets.entries]]
 id = "test-key"
 value = "${TEST_SECRET_VALUE}"

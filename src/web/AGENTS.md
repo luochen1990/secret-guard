@@ -68,7 +68,7 @@ POST   /api/providers/probe          body: {base_url, api_key?} →
                                           urls = 该族实际 GET 的完整 URL (不黑盒回显);
                                           common_uri = recommended 族的布局断言
                                           ("/v1"|"" — detect 知识, 保存落盘为
-                                          DirectProvider.common_uri)
+                                          Endpoint.common_uri)
 PUT    /api/providers/probe          → 同 PUT /api/providers/{id}, 固定 id="probe"
 DELETE /api/providers/probe          → 同 DELETE /api/providers/{id}, 固定 id="probe"
                                           (静态段优先于 {id} 参数段, 该 id 的编辑/删除只能
@@ -223,18 +223,26 @@ API key CRUD **无条件挂载** (在 `web::router()`, 不依赖 `auth.enabled`)
 
 ### Provider 表单 (构造分野 + 路由编辑器) 与列表 router 行渲染
 
-- **协议词表两套** (2026-09 决策, 见根 AGENTS.md 已知限制段呈现策略): 新建表单
-  `#p-protocol` 下拉词表 = `GET /api/providers` 的 `webui_protocols` (仅 codec 覆盖族
+- **协议词表两套** (2026-09 决策, 见根 AGENTS.md 已知限制段呈现策略): 端点行的
+  protocol select 下拉词表 = `GET /api/providers` 的 `webui_protocols` (仅 codec 覆盖族
   openai/anthropic/openairesponses, 代码侧谓词 SSOT = `Protocol::codec_covered()`);
-  全量 `protocols`/`shorts` 仅供路由约定表格渲染. 存量 gemini/ollama 条目编辑与
-  Detect 探测推荐经 `setProtocolSelectValue` 动态 append "(experimental)" 选项
-  (每次 `populateProtocolSelect()` 重建 innerHTML 恰好清掉上一次的 append, 时序:
-  populate 先于 set) — 后端能力保留, 只是新建不引导.
+  全量 `protocols`/`shorts` 仅供路由约定表格渲染与 endpoints 弹窗的 short 映射. 存量
+  gemini/ollama 条目编辑与 Detect 探测推荐经 `setEndpointProtocolValue` 动态 append
+  "(experimental)" 选项 (词表灌入发生在 `addEndpointRow` 物化时 — "populate 先于
+  set" 时序由行生命周期天然保证) — 后端能力保留, 只是新建不引导.
 - 表单 `#p-kind` 是构造分野的唯一事实来源 (**三构造**: Direct / Router / Pool):
-  **Direct** (Protocol / Base URL / API Key 字段组) vs **Router** (路由编辑器字段组
-  `#p-router-fields`) vs **Pool** (成员编辑器 + exhaust 高级配置字段组
+  **Direct** (端点行编辑器 `#p-endpoints-list` + API Key 字段) vs **Router** (路由
+  编辑器字段组 `#p-router-fields`) vs **Pool** (成员编辑器 + exhaust 高级配置字段组
   `#p-pool-fields`). 切换只显隐字段组, **不清空已输入内容** — Direct↔Router↔Pool
   来回切不丢数据 (与 #181 的字段保留语义一致)。
+- **Direct 端点行编辑器** (multi-endpoint, D1-D3): 每行 = protocol select + base_url
+  input + common_uri 徽标 + Detect 按钮 + 行删除; "+ Add endpoint" 增行. 行数据
+  SSOT 是 DOM 本身 (同路由编辑器模式): common_uri 暂存存 `row.dataset.commonUri`
+  (null 态 = 无该属性), 行序 = 声明序 = fallback 序 (D2). ≥1 行约束在提交侧校验
+  (`collectEndpointsFromForm`: 0 行 / protocol 或 base_url 空 / 同 protocol 重复
+  三类前置拦截, 文案与 routes/members 同风格). 编辑回填 = `p.endpoints[]` 全量物化,
+  保存全量提交 endpoints (无 #157 null 歧义, "保留" 由回填实现). api_key 保持条目级
+  一份 (共享凭证, D3).
 - **Pool 构造** (spec-pool-provider §10): 成员编辑器 = 有序 Direct provider 下拉
   (行序 = failover 优先级, ↑/↓ 排序, 候选排除编辑对象自身 + 仅 Direct 条目, 悬空
   成员补 "(missing)" 选项); exhaust 三通道 + cooldown 在原生 `<details>` 高级区
@@ -260,43 +268,59 @@ API key CRUD **无条件挂载** (在 `web::router()`, 不依赖 `auth.enabled`)
 - **提交语义**: Router 分支全量发 `routes` (≥1 条; 每行 model_pattern / target 前端必填
   拦截, 不依赖后端 400). Direct 分支不发 `routes` / `members` — 构造切换的显式取消
   例外见上方 "构造切换的显式取消" 条.
-- **Detect 协议探测** (Direct 字段组): `POST /api/providers/probe` (base_url + 当前
-  api_key) 手动触发; recommended 只自动填入 `#p-protocol` (建议非命令, 用户可表单
-  底部的 Protocol select 手改 — 字段排在探测结果之后, detect → 结果 → protocol 的
-  视觉链), 另附模型 chips 预览 (MVP 深度 = 浏览 + 点击复制). 每行结果回显该族全部
-  探测 URL (`GET {url}` 子行 — 不黑盒, 全 404 时用户可对照调整 base_url); 无推荐时
-  附引导 hint. common_uri 知识链: detect → `state.probeCommonUri` 暂存 (badge 以
-  `+/v1` / `✓ included` 追加回显在 base_url 输入框后, 点击复制 base_url+common_uri
-  整体) → 保存 payload 全量携带 (PUT null = 未探测, 前端编辑回填 effective 原值
-  实现"保留") → 后端 `DirectProvider.common_uri` 落盘 → fetch_model_list fast path.
-  base_url 编辑作废暂存 (探测结果只对被探测 URL 成立). dialog 每次打开清空结果区
-  并重置暂存自 existing; 表单值变更后旧结果不自动清除 (下次点击以当前表单值覆盖).
+- **Detect 协议探测** (端点行内, per 行): `POST /api/providers/probe` (该行 base_url +
+  条目级 api_key 当前值) 手动触发; recommended 只自动填入**该行**的 protocol select
+  (建议非命令, 用户可手改 — 词表 = webui_protocols, 透传族动态 append), 另附模型
+  chips 预览 (MVP 深度 = 浏览 + 点击复制). 每行结果回显该族全部探测 URL (`GET {url}`
+  子行 — 不黑盒, 全 404 时用户可对照调整 base_url); 无推荐时附引导 hint.
+  common_uri 知识链 (per 行): detect → `row.dataset.commonUri` 暂存 (badge 以
+  `+/v1` / `✓ included` 追加回显在该行 base_url 输入框后, 点击复制 base_url+
+  common_uri 整体) → 保存 payload 全量携带 (null = 未探测, 前端编辑回填 effective
+  原值实现"保留") → 后端 `Endpoint.common_uri` 落盘 → fetch_model_list fast path.
+  base_url 编辑作废该行暂存 (探测结果只对被探测 URL 成立). 表单值变更后旧结果不
+  自动清除 (下次点击以当前表单值覆盖); probeEpoch 代数对账沿用 (dialog 重开即
+  丢弃在途结果), 行级追加行存活 (isConnected) 与该行 base_url 未变两个落地条件.
 - **列表 router 行**: URL 列渲染路由摘要 `model_pattern → target · egress` (禁用路由主文本
   删除线; 超过 2 条折叠为首条 + "+N more", 全量在 td title). egress 是**展示近似** —
-  从路由 target 出发 walk 链尾 Direct 的 protocol (中间 router 取最高优先级启用
-  路由的目标, 防环 seen set, 悬空 → `?`), 忽略路由 upstream_model 重写对后续跳匹配的影响
-  (展示无需 per-model 精确解析). protocol pill 显示路由 egress 的去重集合 (单一 →
-  该 protocol, 短列表逗号连接, 放不下 → `mixed`). egress 标记挂静态教育 tooltip
+  从路由 target 出发 walk 链尾 Direct 的**端点集合** (`chainTailEndpoints`: 中间 router
+  取最高优先级启用路由的目标, 防环 seen set, 悬空 → `?`; 链尾多端点时协议并集入
+  集合文案 `protocolSetLabel` — 单一 → 该 protocol, 短列表逗号连接, 放不下 →
+  `mixed`), 忽略路由 upstream_model 重写对后续跳匹配的影响 (展示无需 per-model
+  精确解析). protocol pill 显示路由 egress 的去重集合. egress 标记挂静态教育 tooltip
   (跨协议代价: reasoning_content 丢弃; 流式翻译仅 OpenAI⇄Anthropic, 含 Responses
-  任一侧时 stream=true → 501 — M2 走查对齐实际行为). endpoints 对话框复用同一近似
-  (`resolveEgressProtocol`), 其 translate 徽章 tooltip 按 pair 分化流式语义
-  (`endpointRow`), 覆盖集 `CODEC_SUPPORTED` 与后端 `Protocol::codec_covered()` 同步.
+  任一侧时 stream=true → 501 — M2 走查对齐实际行为).
+- **列表 direct 行** (multi-endpoint): 每端点一枚 protocol pill (集合展示, tooltip
+  附该端点 base_url); URL cell 显示第一端点 base_url (声明序 = fallback 序) +
+  "+N" 角标 (td title 全量 `protocol: base_url` 列表). disabled 行同型展示.
 
-### Endpoints 弹窗 (行卡片 + Models 预览)
+### Endpoints 弹窗 (direct 端点行 + router/pool 入口矩阵 + Models 预览)
 
-- **行卡片布局** (重设计, 替代旧三列 table): 每协议一张卡 `.ep-row[data-short]` —
-  头行 = 协议名 + short chip + 模式徽章 (direct=info 软底 / translate=warn 软底 /
-  n/a=inactive) + Models 按钮; 次行 = URL code 块 + Copy 按钮, 或虚线 "not supported"
-  (unsupported 行无 Models/Copy 按钮 — 不引导不可用动作). 主题行
-  `#provider-endpoints-subject` 回显 provider id / name / egress.
+- **direct 条目 = per 端点行形态** (multi-endpoint): 每行 = 一个已配置端点 —
+  `.ep-row[data-short]` 头行 = 协议名 + short chip + direct 徽章 (同协议透传, 无
+  translate/unsupported 形态 — 端点行入口按定义同协议, 连 codec 都不需要) +
+  Models 按钮; 次行 = upstream base_url ↤ 入口 URL 双 code 块 + Copy (复制入口
+  URL). 行列表尾部附 fallback hint (未配置端点的 ingress fallback 第一端点跨协议
+  翻译, codec 覆盖族限定).
+- **router/pool 条目 = 5 协议入口矩阵** (M2 走查重设计形态保留): 每协议一张卡
+  `.ep-row[data-short]` — 头行 = 协议名 + short chip + 模式徽章 (direct=info 软底 /
+  translate=warn 软底 / n/a=inactive) + Models 按钮; 次行 = URL code 块 + Copy 按钮,
+  或虚线 "not supported" (unsupported 行无 Models/Copy 按钮 — 不引导不可用动作).
+  per-ingress 模式判定 (`ingressMode`) 按**链尾端点集合** (D2 语义): 集合含 ingress →
+  direct; 否则 fallback 首端点 — 双方都 codec 覆盖 → translate; 否则 unsupported.
+  单端点集合退化为旧单 egress 语义. translate 徽章 tooltip 按 pair 分化流式语义,
+  覆盖集 `CODEC_SUPPORTED` 与后端 `Protocol::codec_covered()` 同步.
+- 主题行 `#provider-endpoints-subject` 回显 provider id / name / egress (链尾端点
+  集合的协议并集文案, `protocolSetLabel`).
 - **Models 预览** (`GET /api/providers/{id}/models`): 每行 Models 按钮惰性展开
   `.ep-models` 面板 — 首次展开 fetch, 结果记 `panel.dataset.loaded` (弹窗生命周期内
   的会话级缓存, 收起再展开不重复请求; fetch 失败**不**记 loaded, 再次展开即重试).
-  面板渲染复用 Detect 探测的通用件 (`.probe-models` / `.probe-chip` 点击复制 /
-  `.probe-line(-err)`), 标题附来源标注: `synthesized from routes` (Router 本地合成)
-  vs `upstream: {id}` (Direct/Pool 上游取数 — pool 即当前命中成员). 失败是数据:
-  面板内错误行, 不是 HTTP 错误弹窗. 事件委托挂 `#provider-endpoints-body`
-  (rows 动态生成), chip/Copy/Models 三类目标分流.
+  API 是条目级 (multi-endpoint 后端统一 OpenAI 视角选端点 — preview 现状, 前端
+  不补偿; direct 多端点行的面板各自惰性展开, 拉同一清单). 面板渲染复用 Detect
+  探测的通用件 (`.probe-models` / `.probe-chip` 点击复制 / `.probe-line(-err)`),
+  标题附来源标注: `synthesized from routes` (Router 本地合成) vs `upstream: {id}`
+  (Direct/Pool 上游取数 — pool 即当前命中成员). 失败是数据: 面板内错误行, 不是
+  HTTP 错误弹窗. 事件委托挂 `#provider-endpoints-body` (rows 动态生成), chip/Copy/
+  Models 三类目标分流.
 
 ### Sidebar 分组渲染 (二级 + 三级小圆点)
 
