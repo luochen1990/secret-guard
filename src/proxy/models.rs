@@ -14,7 +14,9 @@
 //! - **N2 列表序**: 别名 (exact pattern, 路由表序, 去重) 在前 ∪ 过滤后上游模型在后
 //!   (上游段 = provider walk 序 × 上游响应数组序; §3.2 验收用例锁定 — 故缓存条目
 //!   用 Vec 保序而非 BTreeSet).
-//! - **N3 缓存**: per-Direct-provider (`{models, fetched_at}`), union 查询时现算, 不做
+//! - **N3 缓存**: per-(Direct-provider, 选定端点 egress 协议) 条目
+//!   (`{models, fetched_at, common_uri_hit}` — multi-endpoint 键控: 不同 ingress
+//!   入口对同一 Direct 各自缓存各自清单, FWD-7), union 查询时现算, 不做
 //!   flat union 缓存.
 //! - **N4**: TTL 300s 常量 (不进配置); serve-stale-on-error (刷新失败保留旧数据);
 //!   single-flight (`snapshot_refreshing` 持锁串行 refresh, 等锁者随后读新鲜缓存);
@@ -43,7 +45,8 @@
 //!
 //! 端点选择: 每个可达 Direct 用 `select_endpoint(ingress)` 选端点 (精确匹配
 //! ingress 协议的端点, 无匹配 fallback 首端点 — 与 dispatch 转发路径同一语义:
-//! 广告的模型必须真能被该入口的服务端点提供), 按选定端点的 protocol 请求:
+//! 广告的模型必须真能被该入口的服务端点提供), 按选定端点的 protocol 请求,
+//! 缓存键 = (provider id, 选定端点 protocol):
 //! - OpenAI / Responses / Anthropic: `GET {base_url}{common_uri}/models`, shape
 //!   `{data:[{id}]}`. common_uri 候选序 (懒回退 — 运行时要省请求, 与探测端
 //!   的并行双路径相对): `Endpoint.common_uri` (detect 固化的布局断言,
@@ -144,24 +147,33 @@ const MAX_MODELS_BODY: usize = 4 * 1024 * 1024;
 /// (`advertised_names` 组装, 供 `snapshot_refreshing` 消费). 命名结构体防
 /// id/api_key 位置错换.
 ///
-/// 端点选择 (T1 机械适配): `select_endpoint(ingress)` — 各 ingress 入口按自身
-/// 协议选端点 (精确匹配 > 首端点 fallback, 与 dispatch 同一语义)。select 返回
-/// None (空 endpoints, 绕过 validate 的非法配置) 的目标跳过 (无贡献, ROB 不
-/// panic)。缓存键控仍是裸 provider id — per-(id, egress) 键控属 T2 (FWD-7 增补),
-/// 此处不同 ingress 入口共享同 id 条目 (单端点配置下行为与演进前一致)。
+/// 端点选择: `select_endpoint(ingress)` — 各 ingress 入口按自身协议选端点
+/// (精确匹配 > 首端点 fallback, 与 dispatch 同一语义; fallback 时 fetch 打首
+/// 端点, 缓存键亦用**该端点**的协议 — ingress 无精确端点的入口经跨协议翻译
+/// 打到首端点, 其广告清单取自首端点, 语义自洽)。select 返回 None (空
+/// endpoints, 绕过 validate 的非法配置) 的目标跳过 (无贡献, ROB 不 panic)。
+///
+/// `endpoint.protocol` 兼任缓存键的 egress 维度 — 条目键控 (id, egress)
+/// (FWD-7): 不同 ingress 入口对同一 Direct 各自缓存各自清单; 单端点配置下
+/// egress 恒一, 键退化为裸 id (与演进前行为一致)。
 struct FetchTarget {
     id: String,
     endpoint: Endpoint,
     api_key: String,
 }
 
-/// per-Direct-provider 的上游模型清单缓存 (AppState 持有 Arc, 所有 router 共享).
+/// 缓存键 = (provider id, 选定端点 egress 协议). 见 [`FetchTarget`] 文档与
+/// 模块头部 N3 — 键的 egress 维度让不同 ingress 入口的清单互不串台。
+type CacheKey = (String, Protocol);
+
+/// per-(Direct-provider, 选定端点 egress 协议) 的上游模型清单缓存
+/// (AppState 持有 Arc, 所有 router 共享).
 ///
 /// single-flight: `snapshot_refreshing` 持有内部 Mutex 串行执行过期项 refresh,
 /// 并发查询等锁者获得锁后直接读新鲜缓存, 不 stampede 上游.
 #[derive(Debug, Default)]
 pub struct ModelListCache {
-    inner: tokio::sync::Mutex<HashMap<String, CacheEntry>>,
+    inner: tokio::sync::Mutex<HashMap<CacheKey, CacheEntry>>,
 }
 
 /// 单个 provider 的缓存项. `models` 保持**上游响应数组序** (N2 合并段顺序的
@@ -190,7 +202,9 @@ impl ModelListCache {
         }
     }
 
-    /// 返回 per-provider 缓存清单, 顺带刷新过期项 (single-flight).
+    /// 返回 per-provider 缓存清单 (**按 id 投影** — 单次查询内每个 id 至多一个
+    /// target, walk 的 visited-set 保证; 键控的 egress 维度在 store 层, 见
+    /// [`CacheKey`]), 顺带刷新过期项 (single-flight).
     ///
     /// - `targets` 必须是**先行完成**的可达 Direct 快照, 且每项的 api_key 已在锁外
     ///   预解析 (锁纪律见模块头部; warn-once 语义在 `effective_api_key` 内, 与调用
@@ -215,7 +229,10 @@ impl ModelListCache {
             api_key,
         } in targets
         {
-            let needs_refresh = match map.get(id) {
+            // 键 = (id, 选定端点 egress 协议): 不同 ingress 入口对同一 Direct
+            // 各自条目 (FWD-7 multi-endpoint 键控).
+            let key: CacheKey = (id.clone(), endpoint.protocol);
+            let needs_refresh = match map.get(&key) {
                 // 无条目 = 从未尝试 (懒加载首查), 必须试.
                 None => true,
                 Some(e) => {
@@ -229,17 +246,18 @@ impl ModelListCache {
                 let preferred = endpoint
                     .common_uri
                     .as_deref()
-                    .or(map.get(id).and_then(|e| e.common_uri_hit.as_deref()));
+                    .or(map.get(&key).and_then(|e| e.common_uri_hit.as_deref()));
                 match fetch_model_list(client, api_key, endpoint, preferred).await {
                     Ok((models, common_uri_hit)) => {
                         tracing::debug!(
                             provider_id = %id,
+                            egress = endpoint.protocol.name(),
                             count = models.len(),
                             "model list refreshed"
                         );
                         let now = Instant::now();
                         map.insert(
-                            id.clone(),
+                            key.clone(),
                             CacheEntry {
                                 models,
                                 fetched_at: Some(now),
@@ -254,13 +272,14 @@ impl ModelListCache {
                         // key/secret (SEC 纪律).
                         tracing::warn!(
                             provider_id = %id,
+                            egress = endpoint.protocol.name(),
                             reason = %reason,
                             "model list fetch failed; serving stale entry if any"
                         );
                         // 存在则推进 last_attempt; 缺席则插入空贡献条目 (退避记账,
                         // 旧数据/旧成功时间在 Some 路径下原样保留).
                         let now = Instant::now();
-                        map.entry(id.clone())
+                        map.entry(key.clone())
                             .and_modify(|e| e.last_attempt = now)
                             .or_insert_with(|| CacheEntry {
                                 models: Vec::new(),
@@ -272,7 +291,7 @@ impl ModelListCache {
                 }
             }
             // 只有曾成功过的条目才有贡献 (从未成功 → 不出现在快照).
-            if let Some(entry) = map.get(id)
+            if let Some(entry) = map.get(&key)
                 && entry.fetched_at.is_some()
             {
                 out.insert(id.clone(), entry.models.clone());
@@ -513,7 +532,7 @@ pub(super) async fn handle_router_models(
 ///   **现场 fetch** (不进缓存 — Direct 的 /models 透传本来就是逐请求 fresh,
 ///   预览忠实于 "endpoint 现在返回什么"; 重复点击的代价是一次轻量 GET).
 ///
-/// **multi-endpoint 端点选择 (T1 机械适配)**: preview API 无 ingress 上下文
+/// **multi-endpoint 端点选择**: preview API 无 ingress 上下文
 /// (WebUI 弹窗调用, 无 URL 首段), 取数统一用默认 ingress (OpenAI) 经
 /// [`DirectProvider::select_endpoint`] 选端点 — openai 端点 exact 命中, 无
 /// openai 端点的 provider fallback 首端点 (单端点配置行为与演进前一致);
@@ -539,7 +558,7 @@ pub(crate) struct ModelPreview {
 }
 
 pub(crate) async fn provider_model_preview(state: &AppState, entry: &Provider) -> ModelPreview {
-    // 端点选择见函数 doc (T1 机械适配): preview 无 ingress 上下文, 统一用
+    // 端点选择见函数 doc: preview 无 ingress 上下文, 统一用
     // OpenAI 视角的端点选择 (显式拼写而非 Protocol::default() — 后者是 enum
     // 定义的自由度, 不应与 preview 语义耦合)。
     let preview_ingress = Protocol::OpenAI;
@@ -1780,6 +1799,74 @@ mod tests {
             .await;
         let s3 = cache.snapshot_refreshing(&client, &targets).await;
         assert_eq!(s3.get("p1").unwrap(), &strs(&["r1"]));
+    }
+
+    /// multi-endpoint (FWD-7 缓存键控): 同一 provider id 的两个不同 egress 端点
+    /// 是**两条独立缓存条目** (键 = (id, egress)) — (p1, openai) 命中缓存后
+    /// (p1, anthropic) 仍会 fetch 各自上游; 各自条目 TTL 内复用 (零新请求).
+    /// 旧裸 id 键控下第二次 openai 查询后 anthropic 端点会被误判 "p1 已缓存"
+    /// 而跳过 (零命中, 清单串台) — 本测试对彼时实现为红.
+    #[tokio::test]
+    async fn model_list_cache_keyed_by_id_and_egress_protocol() {
+        let mut openai_upstream = mockito::Server::new_async().await;
+        let mut anthropic_upstream = mockito::Server::new_async().await;
+        let o_mock = openai_upstream
+            .mock("GET", "/v1/models")
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"gpt-4o"}]}"#)
+            // (p1, openai) 生命周期内只 fetch 一次 (首查), 复查走缓存.
+            .expect(1)
+            .create_async()
+            .await;
+        let a_mock = anthropic_upstream
+            .mock("GET", "/v1/models")
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"claude-3-5"}]}"#)
+            // (p1, anthropic) 独立条目: 必须也 fetch 一次 (不被 openai 条目遮蔽).
+            .expect(1)
+            .create_async()
+            .await;
+
+        let target = |protocol: Protocol, base: String| FetchTarget {
+            id: "p1".to_string(),
+            endpoint: Endpoint::new(protocol, &base),
+            api_key: String::new(),
+        };
+        let cache = ModelListCache::new();
+        let client = reqwest::Client::new();
+
+        // (p1, openai): 首查 fetch, 复查命中缓存 (o_mock expect(1) 锁定零新请求).
+        let s1 = cache
+            .snapshot_refreshing(&client, &[target(Protocol::OpenAI, openai_upstream.url())])
+            .await;
+        assert_eq!(s1.get("p1").unwrap(), &strs(&["gpt-4o"]));
+        let s2 = cache
+            .snapshot_refreshing(&client, &[target(Protocol::OpenAI, openai_upstream.url())])
+            .await;
+        assert_eq!(s2.get("p1").unwrap(), &strs(&["gpt-4o"]));
+
+        // (p1, anthropic): 独立条目 — 必须发生自己的 fetch, 清单来自自己的端点.
+        let s3 = cache
+            .snapshot_refreshing(
+                &client,
+                &[target(Protocol::Anthropic, anthropic_upstream.url())],
+            )
+            .await;
+        assert_eq!(
+            s3.get("p1").unwrap(),
+            &strs(&["claude-3-5"]),
+            "不同 egress 端点各自的清单, 不串台"
+        );
+        // 复查命中 anthropic 条目 (a_mock expect(1) 锁定零新请求).
+        let s4 = cache
+            .snapshot_refreshing(
+                &client,
+                &[target(Protocol::Anthropic, anthropic_upstream.url())],
+            )
+            .await;
+        assert_eq!(s4.get("p1").unwrap(), &strs(&["claude-3-5"]));
+        o_mock.assert_async().await;
+        a_mock.assert_async().await;
     }
 
     // ─── fetch: 超时与超大 body 的降级路径 ─────────────────────────────
