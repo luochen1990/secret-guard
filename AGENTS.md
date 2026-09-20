@@ -23,13 +23,14 @@
 | **Restore** | 把 response body 中的 Mock 还原为 Secret 的反向操作 | 还原、反替换、恢复 | 全局 |
 | **Mock** | Redact 时替代 Secret 的占位值 (per-secret 稳定, 不含真 secret 子串) | 假值、替身、占位符 | 全局 |
 | **Provider** | 一个 provider 条目 (sum type: Direct 直连实体 \| Router 路由 \| Pool 套餐池, #187 + Pool 延伸) | 上游、后端、模型、服务商 | 全局 |
+| **Endpoint (端点)** | Direct provider 的一个 `(protocol, base_url, common_uri)` 三元组 (`endpoints` 有序数组, 每协议至多一条 — validate 强制; 多端点共享同一凭证)。数组序 = fallback 序: egress 端点由 ingress 经 `select_endpoint` 选定 — 精确匹配 → 同协议, 无匹配 → 首端点跨协议翻译 (multi-endpoint D2) | 协议端点、端点条目 | provider/proxy |
 | **Router Provider** | `ProviderKind::Router` 构造的路由端点 (`routes` 路由列表必填) — 自身不转发, 按请求 model 匹配路由链式解析到链尾实体 provider (per-request, WebUI 即席改路由, #179 多规则化; sum type 化 #187) | 虚拟 endpoint、virtual provider、路由 provider、别名 | provider/proxy |
 | **Pool Provider** | `ProviderKind::Pool` 构造的套餐池端点 (`members` 有序成员列表必填) — 自身不转发, 顺序 failover: 正常全打第一个可用成员, 检测到窗口限额耗尽信号后自动切下一个成员, 耗尽成员按恢复闹钟自动回归; 运行时状态内存态不持久化 (契约 POOL-*) | 套餐轮换、配额池、账号池、用完了切下一个 | provider/proxy/pool |
 | **Member (成员)** | Pool 的 `members[]` 指向的一个 Direct provider id (= 一份独立套餐凭证) | 池成员、成员账号 | pool |
 | **闹钟 (alarm)** | 成员耗尽时记录的恢复时刻 (`Exhausted{until}`) — 来自上游精确信号解析 (`resume_at`) 或 `now + cooldown_secs` 兜底 (恒有时刻, 无永久形态) | 恢复时间、冷却时间 | pool |
 | **三通道 (exhaust signal channels)** | 耗尽信号的三条独立匹配线 (HTTP status / body 码 / response header, OR 关系), 判定 SSOT = `pool::detect_exhaustion` | 信号通道、触发线 | pool |
 | **Route** | 路由四元组 (`model_pattern` model 通配符 / `target` 目标 / `upstream_model` 重写 / `priority` 优先级) — model_pattern 匹配请求 model 时路由到 target, priority 越大越优先 (None = 禁用) | 规则、路由规则 | provider/proxy |
-| **Common URI** | secret-guard 自建请求 (fetch_model_list) 的公共 URI 前缀 — 三段式 `base_url + common_uri + request_uri` 的中段. 值域: `"/v1"` 裸根布局 / `""` 版本前缀已含 (智谱等国产系) / 缺省未探测 (fetch 按 `V1_COMMON_URIS` 顺序懒回退现场推导). 持久化在 `DirectProvider.common_uri` (Detect 探测自动填充, WebUI badge 回显), **不影响转发** (转发 rest 原样流过). 运行时记忆在 `CacheEntry.common_uri_hit` | common_uri、版本前缀、布局前缀 | provider/proxy |
+| **Common URI** | secret-guard 自建请求 (fetch_model_list) 的公共 URI 前缀 — 三段式 `base_url + common_uri + request_uri` 的中段. 值域: `"/v1"` 裸根布局 / `""` 版本前缀已含 (智谱等国产系) / 缺省未探测 (fetch 按 `V1_COMMON_URIS` 顺序懒回退现场推导). 持久化在 `Endpoint.common_uri` (per-endpoint; Detect 探测自动填充, WebUI 端点行 badge 回显), **不影响转发** (转发 rest 原样流过). 运行时记忆在 `CacheEntry.common_uri_hit` | common_uri、版本前缀、布局前缀 | provider/proxy |
 | **Protocol** | LLM API 的协议族 (OpenAI / Anthropic / Gemini / Ollama / Responses) | 协议、格式 | 全局 |
 | **IR** | 协议无关的中间表示 (IrRequest / IrResponse / IrBlock) | 中间表示 | codec |
 | **RedactionMap** | 一次 Redact 产出的 Secret↔Mock 双向映射表 (per-request, 不持久化) | 映射表、redact map | redact |
@@ -389,9 +390,17 @@ URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标
   收窄; 见 "已知限制")
 - Gemini/Ollama 跨协议 → 501 (codec 未覆盖)
 
+**Direct provider 多协议端点 (multi-endpoint)**: Direct 条目持有有序 `endpoints` 数组
+(每协议至多一条, validate 强制), egress 端点由 ingress 经 `DirectProvider::select_endpoint`
+选定 — 精确匹配 → 同协议透传, 无匹配 → 首端点跨协议翻译 (fallback, 单端点配置下行为
+与演进前一致); 空 endpoints (绕过 validate 的非法配置) → 503。router 链尾与 pool 成员
+同型 (解析到链尾/成员 Direct 后按 ingress 选端点)。端点选择 property 与完整语义见
+contracts.md **FWD-5** 与 `src/provider.rs` 头部。
+
 **router provider 的模型列表 GET 请求本地终结 (#196)**: `GET /{o|a|g|l|r}/{router}` + 模型列表端点
 (o/r/a: `/models` 或 `/v1/models`; g 另含 `/v1beta/models`; l: `/api/tags`) 时, 响应本地合成 =
-别名清单 (exact pattern, 路由表序) ∪ 过滤后的上游模型清单 (per-Direct-provider 缓存,
+别名清单 (exact pattern, 路由表序) ∪ 过滤后的上游模型清单 (per-(Direct-provider, 选定端点
+egress 协议) 缓存, 各 ingress 入口经 `select_endpoint` 各自选 fetch 端点、各自缓存;
 TTL 300s + serve-stale-on-error + single-flight; exact-only router 零上游请求 — N6 gate),
 不进转发链 / 不记 DAG (D5); Direct provider 的 /models 透传行为不变 (D6)。
 Pool 不进此本地终结分支 (Router 专属) — pool 入口的 /models 经 resolve_route 打到当前
@@ -411,7 +420,7 @@ Pool 不进此本地终结分支 (Router 专属) — pool 入口的 /models 经 
 | `main.rs` / `cli.rs` / `lib.rs` | 二进制入口 + CLI 参数 schema | 文件头部 `//!` |
 | `auth/` (模块目录: mod/oidc/handlers/session/apikey/middleware) | OIDC 登录 (WebUI) + 本地 API key (SDK 转发) + session | `auth/mod.rs` 头部 `//!` |
 | `config.rs` | 双层配置 schema + `DynamicTable<T>` 泛型 + 持久化 + 静态配置预检审计 (未知 section/字段 → 启动 WARN, #159) | 文件头部 `//!` (覆盖 OverrideMode / CRUD / Effective source / 跨表并发) |
-| `provider.rs` | Provider sum type (Direct 直连 \| Router 路由 \| Pool 套餐池) + Route (model_pattern 通配 / priority / 路由级 upstream_model 重写) + PoolProvider/ExhaustConfig 与内置默认信号表常量 + Effective view + api_key 两来源 + `resolve_route` 路由链解析 (per-request; Router 跳按请求 model 匹配 + model 重写 pipeline, Pool 跳经 `PoolPicker` 状态机选成员) | 文件头部 `//!` |
+| `provider.rs` | Provider sum type (Direct 直连·多协议端点 `endpoints` + `select_endpoint` 端点选择 \| Router 路由 \| Pool 套餐池) + Route (model_pattern 通配 / priority / 路由级 upstream_model 重写) + PoolProvider/ExhaustConfig 与内置默认信号表常量 + Effective view + api_key 两来源 (Direct 条目级, 全端点共享) + `resolve_route` 路由链解析 (per-request; Router 跳按请求 model 匹配 + model 重写 pipeline, Pool 跳经 `PoolPicker` 状态机选成员) | 文件头部 `//!` |
 | `pool.rs` | Pool Provider 运行时: 成员状态机 `PoolStates` (顺序 failover pick + 耗尽闹钟 + 配置对齐重建, 内存态不持久化) + 三通道耗尽信号检测器 `detect_exhaustion` (纯函数, ROB) + `PoolWatch` 响应侧旁路检测编排 + 观察面 (member_status / reset) | 文件头部 `//!` (含内置默认信号表语义域 + "提取宽判别严" 设计依据) + contracts.md **POOL-*** |
 | `secrets.rs` | SecretEntry 实体 + Effective view + value 两来源 | 文件头部 `//!` |
 | `mock.rs` | MockStrategy 两维度 (初始值 + 生成策略) + 确定性 seed + `[redact] global_mock_prefix` 注入 + GenSpec 候选空间配置期 lint (WARN, 弱 mock 策略前置暴露) | 文件头部 `//!` (C3 根基) |
@@ -817,6 +826,7 @@ CI runner VM 未预装 treefmt 时 check-fmt 降级 rust-only (见 justfile).
   边界: 请求侧 assistant 历史的显式空串/null 由 `reasoning_content_form` wire 元数据保真;
   **响应侧** `IrResponse` 无对应元数据 — 上游非流式响应显式返回 `"reasoning_content": ""`
   时, redact 路径 round-trip 后该字段会变为缺席 (信息无损失, 形态有差异).
+  多端点 fallback (ingress 无精确匹配端点 → 首端点跨协议翻译) 场景同受此限.
 - **OpenAI Responses API 支持范围**: Responses 协议 (`/r/` proto_short) 已接入 codec,
   支持 Responses ⇄ Chat Completions / Anthropic 跨协议翻译 (非流式, 经通用 IR 路径,
   双向各有集成测试锁定) + Responses 同协议透传 + Redact (非流式).
@@ -831,6 +841,7 @@ CI runner VM 未预装 treefmt 时 check-fmt 降级 rust-only (见 justfile).
   的呈现形态与协议约束边界调研见 `docs/research/mcp-notes.md`); namespace tools
   flattening; `previous_response_id` 服务端状态 (secret-guard 是 stateless 代理);
   reasoning items 的 `encrypted_content` (同协议 round-trip 也会丢失, 会破坏 reasoning chain).
+  多端点 fallback (ingress 无精确匹配端点 → 首端点跨协议翻译) 场景同受上述跨协议限制.
 - **Responses 协议的 timeline delta 为空**: Responses ingress 的 `req_body_raw` 用 `input[]`
   (而非 `messages[]`), `extract_delta_messages_from_raw` 找不到 messages 字段, 返回空 Vec.
   WebUI timeline 仍能显示 preview / role, 但不渲染增量气泡 (与跨协议 ingress 的 delta 限制一致).
@@ -896,7 +907,7 @@ CI runner VM 未预装 treefmt 时 check-fmt 降级 rust-only (见 justfile).
   JSON / SSE-shaped 多帧 / 无命中) 才透传 + `mock not restored` WARN (同协议 #158;
   跨协议已对称补齐, 含此前静默的非 JSON 分支). 非 JSON 分支不受开关影响 (restore
   本就无意义).
-- **provider 协议与上游实际协议错配 → 静默空响应 (有 WARN)**: provider protocol=anthropic
+- **provider 端点协议与上游实际协议错配 → 静默空响应 (有 WARN)**: provider 端点 protocol=anthropic
   但上游实为 OpenAI shape 时, 2xx 响应被 reader 宽松解析为空 content + 全零 usage
   (reader 对缺字段 `unwrap_or_default` 降级, 不报错). 行为不变 (仍翻译返回), 但打 WARN
   (`parsed to empty content and zero usage; does the upstream actually speak ...`,
@@ -905,13 +916,15 @@ CI runner VM 未预装 treefmt 时 check-fmt 降级 rust-only (见 justfile).
 - **跨协议 ingress 的 timeline delta 切片可能错位**: OpenAI writer 会把 Anthropic 风格的
   混合 Text+ToolResult user 消息拆成 (1+N) 条 wire messages, 导致 `req_body_raw` 的
   messages 数 > IR messages 数. `extract_delta_messages_from_raw` 切片时跨协议路径的 start 偏小,
-  delta 可能包含前序轮消息. 同协议路径不受影响. 详见 `src/web/AGENTS.md`.
+  delta 可能包含前序轮消息. 同协议路径不受影响. 多端点 fallback (ingress 无精确匹配
+  端点 → 首端点跨协议翻译) 场景同受此限. 详见 `src/web/AGENTS.md`.
 - static config 的 `[server]` (含 `upstream_*_timeout_secs`) / `[redact]` / `[auth]` 段仅在启动时读取一次, WebUI 改不生效 (restart 才生效).
 - **router /models 合并清单的上游数据最旧可 stale 300s (#196, FWD-7)**: 上游清单缓存 TTL = 300s
   常量 (不进配置), TTL 内上游新增/下线的模型不会反映在 router /models 响应中; 刷新失败时继续
   serve 旧数据 (serve-stale-on-error), 且失败后 30s 退避窗口内不重试 (期间查询立即返回, 不被
   dead upstream 逐查询阻塞)。exact-only router 不 fetch (只返回别名, N6 gate)。
-  缓存按 provider id 键控: WebUI 修改 provider 的 base_url/protocol 后, 最长 300s 内继续 serve
+  缓存按 (provider id, 选定端点 egress 协议) 键控: WebUI 修改 provider 的端点 protocol 后
+  新键即时 miss 触发新 fetch; 仅修改 base_url 时键不变, 最长 300s 内继续 serve
   旧上游的清单 (TTL 到期自然收敛)。
 - **未声明域名 Host 一律 403 (SEC-7 Host guard)**: server 层对所有路由做 Host 白名单
   校验 (防 DNS rebinding, 语义见 "Host / Origin 校验" 段), 未声明的域名 Host 拒绝。

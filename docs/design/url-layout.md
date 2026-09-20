@@ -75,6 +75,11 @@ forward 路由 (`/{proto}/{name}/...`) 首段必须是 proto 简写, 由
 > dispatch 内**本地终结** — 响应本地合成 (别名 ∪ 过滤后上游清单), 不透传上游。
 > 这是同一 URL 上的行为分派 (按 provider kind), 不是新的 URL 分配; 语义 SSOT 见
 > FWD-7 (`docs/design/contracts.md`)。Direct provider 的同端点仍透传。
+>
+> **多端点注记 (multi-endpoint, URL 不变)**: Direct 条目的 `endpoints` 多协议端点
+> 不新增 URL 形态 — egress 由 ingress 经 `select_endpoint` 选定 (精确匹配 → 同协议;
+> 无匹配 → 首端点跨协议翻译)。Direct 的 /models GET 同走 dispatch 转发 (按 ingress
+> 对应端点透传); router 本地合成拉上游清单时亦按各 ingress 入口选端点 (FWD-7)。
 
 ## `/api/*` 子空间分配
 

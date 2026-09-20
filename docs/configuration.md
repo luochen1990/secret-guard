@@ -49,6 +49,7 @@ api_keys_disabled = []    # static API key 被禁用的 label 集合 (态度层,
 [[providers]]
 id = "openai-main"
 kind = "direct"
+[[providers.endpoints]]
 protocol = "openai"
 base_url = "https://api.openai.com"
 api_key = "sk-your-upstream-key"
@@ -124,6 +125,11 @@ fail-fast), 对应构造的字段写在同一个 `[[providers]]`
 > 已删除 — `virtual` 变体不存在会启动报错, 残留的 `route_to` / `model_override` 字段
 > 会触发启动 WARN (#159 静态预检) 且不生效。请改写为 `kind = "router"` +
 > `[[providers.routes]]` (见下文)。
+>
+> Direct 构造的旧平铺字段 `protocol` / `base_url` / `common_uri` 已被
+> `[[providers.endpoints]]` 子表数组取代 (multi-endpoint 直接切换, 不做兼容读取) —
+> 老配置把这三个字段原样搬进一条 `[[providers.endpoints]]` 即可; 残留平铺字段会触发
+> 启动 WARN 且不生效。旧 state.toml 直接删除重置 (WebUI 会按新 schema 重建)。
 
 **共享字段** (三种构造均可配):
 
@@ -134,15 +140,38 @@ fail-fast), 对应构造的字段写在同一个 `[[providers]]`
 | `enabled` | bool | `true` | `false` 时转发到该 provider 返回 503. |
 | `name` | string | — | 可选的人类可读名称 (仅 WebUI 显示). |
 
-**Direct 构造** (`kind = "direct"`):
+**Direct 构造** (`kind = "direct"`) — 多协议端点 (multi-endpoint):
+
+一个 Direct 条目 = **一份凭证** (`api_key`, 所有端点共享) + **有序端点列表** `endpoints`。
+同一上游的多协议兼容端点 (如智谱的 OpenAI + Anthropic 端点) 可收敛为单条目;
+egress 端点由 ingress 协议选定 — 精确匹配 → 同协议透传 (byte-exact),
+无匹配 → **首端点跨协议翻译** (fallback; 单端点配置下行为与单协议时代一致)。
 
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
-| `protocol` | string | (必填) | 上游协议: `openai` / `anthropic` / `gemini` / `ollama` / `openairesponses` (OpenAI Responses API). |
-| `base_url` | string | (必填) | 上游 base URL. 必须以 `http://` 或 `https://` 开头, **末尾不带 `/`** (路径由 secret-guard 拼接). 如 `https://api.openai.com`. |
-| `api_key` | string | `""` | 上游 API key 明文. 与 `api_key_file` 互斥 (同时设置启动报错). |
-| `api_key_file` | path | — | 从文件读 API key (适合 sops-nix / systemd LoadCredential 等外部注入, 让 toml 本身不含敏感数据). 每次请求时读取, 读不到按空 key 处理并打 WARN. 文件内容自动去首尾空白. |
-| `common_uri` | string | — | secret-guard **自建请求** (拉取上游模型清单, 用于 router `/models` 合成) 的公共 URI 前缀, 即三段式 `base_url + common_uri + request_uri` 的中段. **不影响转发** (转发路径随客户端请求原样透传). `"/v1"` = 裸根布局 (OpenAI/Anthropic 官方形态); `""` = 版本前缀已含 (智谱 GLM coding plan / DeepSeek / Moonshot 等, models 端点 = `base + /models`); 任意 `/` 开头的自定义前缀 (如智谱老接口 `/api/paas/v4`) 也合法. 缺省 = 未探测, 运行时按 `"/v1"` → `""` 顺序自动推导. 通常无需手写 — WebUI 的 Detect 按钮探测后自动填充并随保存落盘 (badge 追加回显在 base_url 输入框后). 值域校验: `""` 或以 `/` 开头的 path 片段 (无尾斜杠, 不含 `?`/`#`/空格, ≤64 字符). **注意**: WebUI/API 的 PUT 是全量语义 — 请求不带此字段 (= null) 即清除为未探测; SDK 脚本编辑 provider 时请先读回原值再整体提交. |
+| `endpoints` | 子表数组 | (必填) | 有序端点列表 (`[[providers.endpoints]]`): **至少一条**, **每协议至多一条** (违反均启动报错)。**数组序 = fallback 序** — 第一条是默认端点, ingress 无精确匹配端点时兜底走跨协议翻译。单端点可用内联紧凑写法: `endpoints = [ { protocol = "openai", base_url = "https://api.openai.com" } ]`。 |
+| `endpoints[].protocol` | string | (必填) | 该端点的上游协议: `openai` / `anthropic` / `gemini` / `ollama` / `openairesponses` (OpenAI Responses API)。 |
+| `endpoints[].base_url` | string | (必填) | 该端点的上游 base URL. 必须以 `http://` 或 `https://` 开头, **末尾不带 `/`** (路径由 secret-guard 拼接). 如 `https://api.openai.com`. |
+| `endpoints[].common_uri` | string | — | (per 端点) secret-guard **自建请求** (拉取上游模型清单, 用于 router `/models` 合成) 的公共 URI 前缀, 即三段式 `base_url + common_uri + request_uri` 的中段. **不影响转发** (转发路径随客户端请求原样透传). `"/v1"` = 裸根布局 (OpenAI/Anthropic 官方形态); `""` = 版本前缀已含 (智谱 GLM coding plan / DeepSeek / Moonshot 等, models 端点 = `base + /models`); 任意 `/` 开头的自定义前缀 (如智谱老接口 `/api/paas/v4`) 也合法. 缺省 = 未探测, 运行时按 `"/v1"` → `""` 顺序自动推导. 通常无需手写 — WebUI 端点行的 Detect 按钮探测后自动填充并随保存落盘 (badge 追加回显在该行 base_url 输入框后). 值域校验: `""` 或以 `/` 开头的 path 片段 (无尾斜杠, 不含 `?`/`#`/空格, ≤64 字符). **注意**: WebUI/API 的 PUT 对 `endpoints` 是**全量必填**语义 (缺失/空数组 → 400), 行内不带 `common_uri` (= null) 即清除为未探测; SDK 脚本编辑 provider 时请先读回原值再整体提交. |
+| `api_key` | string | `""` | 上游 API key 明文, **所有端点共享**. 与 `api_key_file` 互斥 (同时设置启动报错). |
+| `api_key_file` | path | — | 从文件读 API key (**所有端点共享**; 适合 sops-nix / systemd LoadCredential 等外部注入, 让 toml 本身不含敏感数据). 每次请求时读取, 读不到按空 key 处理并打 WARN. 文件内容自动去首尾空白. |
+
+双端点示例 — 智谱 GLM (同一凭证, `/o/zhipu` 与 `/a/zhipu` 两个入口各自同协议透传):
+
+```toml
+[[providers]]
+id = "zhipu"
+kind = "direct"
+api_key = "sk-..."
+
+[[providers.endpoints]]
+protocol = "openai"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+
+[[providers.endpoints]]
+protocol = "anthropic"
+base_url = "https://open.bigmodel.cn/api/anthropic"
+```
 
 **Router 构造** (`kind = "router"`) — 无 protocol / base_url / api_key 字段:
 
@@ -163,9 +192,10 @@ ingress 协议由请求 URL 决定, egress 协议由链尾实体决定 (不同�
 [[providers]]
 id = "anthropic-main"
 kind = "direct"
+[[providers.endpoints]]
 protocol = "anthropic"
 base_url = "https://api.anthropic.com"
-api_key_file = "/run/credentials/anthropic.key"   # 与 api_key 二选一
+api_key_file = "/run/credentials/anthropic.key"   # 与 api_key 二选一 (所有端点共享)
 ```
 
 ### 路由 endpoint (routes) — 按请求 model 的路由转发
@@ -178,6 +208,7 @@ api_key_file = "/run/credentials/anthropic.key"   # 与 api_key 二选一
 [[providers]]
 id = "openai-main"
 kind = "direct"
+[[providers.endpoints]]
 protocol = "openai"
 base_url = "https://api.openai.com"
 api_key = "sk-..."
@@ -185,6 +216,7 @@ api_key = "sk-..."
 [[providers]]
 id = "anthropic-main"
 kind = "direct"
+[[providers.endpoints]]
 protocol = "anthropic"
 base_url = "https://api.anthropic.com"
 api_key_file = "/run/credentials/anthropic.key"
@@ -285,6 +317,7 @@ unix 秒, 多值取最晚). 全部失败 → `now + cooldown_secs` 兜底. 解�
 [[providers]]
 id = "glm-acc1"
 kind = "direct"
+[[providers.endpoints]]
 protocol = "openai"
 base_url = "https://open.bigmodel.cn/api/paas/v4"
 api_key_file = "/run/credentials/glm-acc1.key"     # 每成员一份独立凭证
@@ -292,6 +325,7 @@ api_key_file = "/run/credentials/glm-acc1.key"     # 每成员一份独立凭证
 [[providers]]
 id = "glm-acc2"
 kind = "direct"
+[[providers.endpoints]]
 protocol = "openai"
 base_url = "https://open.bigmodel.cn/api/paas/v4"
 api_key_file = "/run/credentials/glm-acc2.key"
@@ -449,11 +483,13 @@ key = "sg_ci_abc123..."
 | ``TOML parse error ... [[providers]] unknown variant `virtual`, expected `direct`, `router`, or `pool``` | 旧版 `kind = "virtual"` 已删除: 改为 `kind = "router"`, 原 `route_to` 指向改写为一条 `[[providers.routes]]` (`model_pattern = "*"` + `target = ...`), 原 `model_override` 改为路由的 `upstream_model` 字段. |
 | 启动 WARN `unknown field route_to` / `unknown field model_override` | 这两个 providers 顶层字段已删除 (#159 静态预检对残留字段告警, 残留不生效): 改写为 `[[providers.routes]]` 子表 (见上文 Router 构造). |
 | `TOML parse error ... [[secrets]] invalid type: map, expected a sequence` | secret 必须写 `[[secrets.entries]]`, 不能写 `[[secrets]]`. 报错前会先输出一行 WARN `did you mean [[secrets.entries]]?` 指路. |
-| 启动 WARN `unknown field ... did you mean ...?` | 字段拼写错误. 可选字段拼错会被忽略不生效 (仅 WARN 提示), "以为配了实际没配", 须修正; 必填字段 (如 `protocol`) 拼错则 WARN 后再报 `missing field` 启动失败. `[[providers.routes]]` 内的未知字段同样会 WARN (定位含 entry 下标). |
+| 启动 WARN `unknown field ... did you mean ...?` | 字段拼写错误. 可选字段拼错会被忽略不生效 (仅 WARN 提示), "以为配了实际没配", 须修正; 必填字段 (如 `endpoints[].protocol`) 拼错则 WARN 后再报 `missing field` 启动失败. `[[providers.routes]]` 与 `[[providers.endpoints]]` 内的未知字段同样会 WARN (定位含 entry 下标). |
 | `base_url must not end with '/'` | 去掉末尾 `/`, 路径由 secret-guard 拼接. |
 | `secret value too short (min 3 bytes)` | secret 真值至少 3 字节. |
 | `key and key_file are mutually exclusive` / `api_key` 与 `api_key_file` 同时设置 | 二选一, 删掉其中一个. |
 | `provider ... must declare at least one route` | Router 构造的 `routes` 为空 — 空路由 router 无法转发任何请求, 启动即拒. 至少配一条 (兜底可用 `model_pattern = "*"`). |
+| `provider ... must declare at least one endpoint` | Direct 构造的 `endpoints` 为空或缺失 — 空端点 Direct 无法转发任何请求, 启动即拒. 至少配一条 `[[providers.endpoints]]` (单端点可用内联紧凑写法, 见上文 Direct 构造). |
+| `provider ... declares multiple endpoints for protocol ...; at most one endpoint per protocol is allowed` | 同一 Direct 条目配了两条同协议端点 — 每协议至多一条 (端点按 ingress 协议精确匹配, 重复会使命中歧义), 删掉重复条目. |
 | `provider ... must declare at least one pool member` / `... lists itself as pool member` | Pool 构造的 `members` 为空或含自身 id — 空 pool 无法转发任何请求 / 自环必为 Cycle, 启动即拒. 成员应为 Direct provider id (指向 Router/Pool 也会链式解析, 非典型用法); 悬空成员 (不存在) 写入放行, 请求时跳过 (成员补上后自动回归). |
 | 启动 WARN `pool exhaust header rules are malformed (expected 'name=value')` | `[providers.exhaust]` 的 headers 条目缺 `=` 或 header 名非法 — 该条目永远不匹配 (等于白配), 检查拼写. |
 | 请求返回 404 `not_found` | URL 里 provider id 不存在, 或 proto 前缀拼错 (见 README 路由表). |
