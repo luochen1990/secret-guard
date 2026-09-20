@@ -189,7 +189,7 @@ pub async fn update_provider(
                     }
                 }
             }
-            // endpoints 回填兜底 + pool 三字段回填兜底共用**一次**
+            // routes 回填兜底 + pool 三字段回填兜底共用**一次**
             // effective 快照 (单次取锁 + merge, 也消除两次快照间的漂移窗口)。
             // 各分支按 kind 变体互斥分派: effective 是 Router 时只有 routes 分支
             // 可能命中, 是 Pool 时只有 pool 分支可能命中。

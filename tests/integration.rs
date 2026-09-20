@@ -2432,20 +2432,23 @@ async fn multi_endpoint_fallback_uses_declaration_order_not_protocol_rank() {
     o_never.assert_async().await;
 }
 
-/// router 链尾为多端点条目: resolve_route 到链尾后按 **ingress** 选端点 —
-/// /a/{router} → 链尾的 anthropic 端点 (Exact body), openai 端点零命中.
-#[tokio::test]
-async fn router_tail_multi_endpoint_selects_endpoint_by_ingress() {
+/// 共享场景: 链尾/成员为多端点条目 (openai+anthropic 双 mock), /a 入口 →
+/// anthropic 端点同协议透传 (Exact body), openai 端点零命中. `wrapper` = 包裹
+/// "member-dual" 的路由层条目 (router 或 pool, 入口第二段 = wrapper.id);
+/// `label` = body 标记与断言措辞 (如 "router"/"pool").
+async fn multi_endpoint_via_wrapper_selects_endpoint_by_ingress(wrapper: Provider, label: &str) {
     let mut openai_upstream = spawn_mock_upstream().await;
     let mut anthropic_upstream = spawn_mock_upstream().await;
 
-    let anthropic_body = r#"{"model":"claude-3-5-sonnet","max_tokens":32,"messages":[{"role":"user","content":"via router"}]}"#;
+    let anthropic_body = format!(
+        r#"{{"model":"claude-3-5-sonnet","max_tokens":32,"messages":[{{"role":"user","content":"via {label}"}}]}}"#
+    );
     let a_mock = anthropic_upstream
         .mock("POST", "/v1/messages")
-        .match_body(mockito::Matcher::Exact(anthropic_body.to_string()))
+        .match_body(mockito::Matcher::Exact(anthropic_body.clone()))
         .with_status(200)
         .with_header("content-type", "application/json")
-        .with_body(r#"{"id":"msg-rt","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"claude-3-5-sonnet","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":2,"output_tokens":1}}"#)
+        .with_body(r#"{"id":"msg-mep","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"claude-3-5-sonnet","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":2,"output_tokens":1}}"#)
         .expect(1)
         .create_async()
         .await;
@@ -2457,6 +2460,7 @@ async fn router_tail_multi_endpoint_selects_endpoint_by_ingress() {
         .create_async()
         .await;
 
+    let path = format!("/a/{}/v1/messages", wrapper.id);
     let providers = vec![
         multi_endpoint_provider(
             "member-dual",
@@ -2465,7 +2469,7 @@ async fn router_tail_multi_endpoint_selects_endpoint_by_ingress() {
                 (Protocol::Anthropic, anthropic_upstream.url()),
             ],
         ),
-        router_provider("rt", vec![route("*", "member-dual")]),
+        wrapper,
     ];
     let proxy_url = spawn_proxy_full(
         providers,
@@ -2476,11 +2480,11 @@ async fn router_tail_multi_endpoint_selects_endpoint_by_ingress() {
     .await;
 
     let (status, resp_body, _) =
-        proxy_request(&proxy_url, "POST", "/a/rt/v1/messages", anthropic_body, &[]).await;
+        proxy_request(&proxy_url, "POST", &path, &anthropic_body, &[]).await;
     assert_eq!(
         status,
         reqwest::StatusCode::OK,
-        "/a ingress 经 router 链尾选 anthropic 端点: {resp_body}"
+        "/a ingress 经 {label} 选 anthropic 端点: {resp_body}"
     );
     assert!(
         resp_body.contains("\"type\":\"message\""),
@@ -2490,62 +2494,26 @@ async fn router_tail_multi_endpoint_selects_endpoint_by_ingress() {
     o_never.assert_async().await;
 }
 
+/// router 链尾为多端点条目: resolve_route 到链尾后按 **ingress** 选端点 —
+/// /a/{router} → 链尾的 anthropic 端点 (Exact body), openai 端点零命中.
+#[tokio::test]
+async fn router_tail_multi_endpoint_selects_endpoint_by_ingress() {
+    multi_endpoint_via_wrapper_selects_endpoint_by_ingress(
+        router_provider("rt", vec![route("*", "member-dual")]),
+        "router",
+    )
+    .await;
+}
+
 /// pool 成员为多端点条目: pick 成员后按 **ingress** 选端点 — /a/{pool} →
 /// 成员的 anthropic 端点 (Exact body), openai 端点零命中.
 #[tokio::test]
 async fn pool_member_multi_endpoint_selects_endpoint_by_ingress() {
-    let mut openai_upstream = spawn_mock_upstream().await;
-    let mut anthropic_upstream = spawn_mock_upstream().await;
-
-    let anthropic_body = r#"{"model":"claude-3-5-sonnet","max_tokens":32,"messages":[{"role":"user","content":"via pool"}]}"#;
-    let a_mock = anthropic_upstream
-        .mock("POST", "/v1/messages")
-        .match_body(mockito::Matcher::Exact(anthropic_body.to_string()))
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(r#"{"id":"msg-pl","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"claude-3-5-sonnet","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":2,"output_tokens":1}}"#)
-        .expect(1)
-        .create_async()
-        .await;
-    let o_never = openai_upstream
-        .mock("POST", "/v1/chat/completions")
-        .with_status(200)
-        .with_body("{}")
-        .expect(0)
-        .create_async()
-        .await;
-
-    let providers = vec![
-        multi_endpoint_provider(
-            "member-dual",
-            &[
-                (Protocol::OpenAI, openai_upstream.url()),
-                (Protocol::Anthropic, anthropic_upstream.url()),
-            ],
-        ),
+    multi_endpoint_via_wrapper_selects_endpoint_by_ingress(
         pool_provider("pl", &["member-dual"]),
-    ];
-    let proxy_url = spawn_proxy_full(
-        providers,
-        reqwest::Client::new(),
-        ConversationDag::new(64, 500, 1),
-        test_secret_table(),
+        "pool",
     )
     .await;
-
-    let (status, resp_body, _) =
-        proxy_request(&proxy_url, "POST", "/a/pl/v1/messages", anthropic_body, &[]).await;
-    assert_eq!(
-        status,
-        reqwest::StatusCode::OK,
-        "/a ingress 经 pool 成员选 anthropic 端点: {resp_body}"
-    );
-    assert!(
-        resp_body.contains("\"type\":\"message\""),
-        "同协议透传回 Anthropic 形态: {resp_body}"
-    );
-    a_mock.assert_async().await;
-    o_never.assert_async().await;
 }
 
 #[tokio::test]

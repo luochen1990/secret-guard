@@ -5544,7 +5544,7 @@
     // 惰性展开, dataset.loaded 缓存 per 行).
     function directEndpointRow(ep, short, url, providerId) {
       const modelsBtn = `<button type="button" class="btn ep-models-btn" data-provider="${escapeHtml(providerId)}"
-           aria-expanded="false" title="Preview the model list this provider serves (fetched via its default endpoint)">Models</button>`;
+           aria-expanded="false" title="Preview the model list this provider serves (fetched via this provider's OpenAI-view endpoint)">Models</button>`;
       return `<div class="ep-row" data-short="${short}">
         <div class="ep-row-head"><span class="ep-proto">${escapeHtml(ep.protocol)}</span><code class="ep-short">/${short}/</code><span class="badge badge-stream" title="same-protocol passthrough (byte-exact)">direct</span><span class="ep-gap"></span>${modelsBtn}</div>
         <div class="ep-url"><code title="upstream base URL">${escapeHtml(ep.base_url)}</code><span class="ep-arrow" title="upstream ↤ local entry URL">↤</span><code title="local entry URL">${escapeHtml(url)}</code>` +

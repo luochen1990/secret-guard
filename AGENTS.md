@@ -924,8 +924,9 @@ CI runner VM 未预装 treefmt 时 check-fmt 降级 rust-only (见 justfile).
   serve 旧数据 (serve-stale-on-error), 且失败后 30s 退避窗口内不重试 (期间查询立即返回, 不被
   dead upstream 逐查询阻塞)。exact-only router 不 fetch (只返回别名, N6 gate)。
   缓存按 (provider id, 选定端点 egress 协议) 键控: WebUI 修改 provider 的端点 protocol 后
-  新键即时 miss 触发新 fetch; 仅修改 base_url 时键不变, 最长 300s 内继续 serve
-  旧上游的清单 (TTL 到期自然收敛)。
+  新键通常即时 miss 触发新 fetch (例外: 删除某协议端点后在 ≤300s 内以不同 base_url
+  加回同协议端点, 新键命中旧 fresh 条目, 属下述 TTL 收敛同一类别); 仅修改 base_url 时
+  键不变, 最长 300s 内继续 serve 旧上游的清单 (TTL 到期自然收敛)。
 - **未声明域名 Host 一律 403 (SEC-7 Host guard)**: server 层对所有路由做 Host 白名单
   校验 (防 DNS rebinding, 语义见 "Host / Origin 校验" 段), 未声明的域名 Host 拒绝。
   经反向代理以域名 (如 `sg.example.com`) 暴露 secret-guard 的部署, 需在
