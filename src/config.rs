@@ -487,7 +487,12 @@ const KNOWN_FIELDS: &[(&str, &[&str])] = &[
             "base_url",
             "api_key",
             "api_key_file",
-            "routes", // Router 构造的路由数组 ([[providers.routes]]); 字段见 providers.routes
+            "common_uri", // Direct 构造字段 (detect 固化的布局断言, 见 DirectProvider)
+            "routes",     // Router 构造的路由数组 ([[providers.routes]]); 字段见 providers.routes
+            // Pool 构造字段 (#187 延伸; 清单按 section 平铺无法区分构造, 残留不告警)
+            "members",
+            "exhaust",
+            "cooldown_secs",
         ],
     ),
     // Router 构造的路由 entry ([[providers.routes]])
@@ -495,6 +500,8 @@ const KNOWN_FIELDS: &[(&str, &[&str])] = &[
         "providers.routes",
         &["model_pattern", "target", "upstream_model", "priority"],
     ),
+    // Pool 构造的耗尽信号 (providers[i].exhaust; 字段级替换语义见 ExhaustConfig)
+    ("providers.exhaust", &["statuses", "codes", "headers"]),
     // Config::secrets (SecretsConfig) — 表级仅 entries 一个键
     ("secrets", &["entries"]),
     // SecretEntry ([[secrets.entries]])
@@ -1829,6 +1836,43 @@ base_url = "http://127.0.0.1:29804"
         assert!(
             !all.contains("global_mock_prefix"),
             "known field must not warn: {all}"
+        );
+    }
+
+    /// Pool 构造字段 (members/exhaust/cooldown_secs, #187 延伸) 与 Direct 的
+    /// common_uri 是合法静态字段, 审计不得误报 (历史缺口: KNOWN_FIELDS 漏列,
+    /// 合法 pool 配置启动时被 WARN "unknown field 'members'"). exhaust 内层
+    /// 字段仍要审计 (子前缀清单的递归目标不变; 拼写建议由其他 audit 测试覆盖).
+    #[test]
+    fn audit_accepts_pool_and_common_uri_fields() {
+        let text = concat!(
+            "[[providers]]\n",
+            "id = \"pool-1\"\n",
+            "kind = \"pool\"\n",
+            "members = [\"a\", \"b\"]\n",
+            "cooldown_secs = 60\n",
+            "[providers.exhaust]\n",
+            "codes = [\"1308\"]\n",
+            "totally_bogus = 1\n", // 未知键: 深层仍要报 (递归下降可观测)
+            "\n",
+            "[[providers]]\n",
+            "id = \"direct-1\"\n",
+            "kind = \"direct\"\n",
+            "protocol = \"openai\"\n",
+            "base_url = \"https://api.example.com\"\n",
+            "common_uri = \"/v1\"\n",
+        );
+        let ws = audit_static_config_text(text);
+        let all = joined(&ws);
+        for known in ["members", "cooldown_secs", "exhaust", "codes", "common_uri"] {
+            assert!(
+                !all.contains(&format!("unknown field '{known}'")),
+                "legal field '{known}' must not warn: {all}"
+            );
+        }
+        assert!(
+            all.contains("'totally_bogus'") && all.contains("providers[0].exhaust"),
+            "unknown key inside exhaust still audited: {all}"
         );
     }
 
