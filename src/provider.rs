@@ -1541,6 +1541,78 @@ mod tests {
         assert!(d.select_endpoint(Protocol::OpenAI).is_none());
     }
 
+    // FWD-5 端点选择 property (multi-endpoint D2, contracts.md): 上方三个确定性
+    // 用例锁定具体边界, 本 property 对任意 (endpoints, ingress) 组合穷举性质 —
+    // 两者独立形式化 (§0.4 冗余覆盖: 单点定位 vs 全空间扫描).
+
+    /// 任意协议子集 (无重复 — 与 validate 的协议唯一约束同构) 的**随机排列**.
+    /// 覆盖度 (§0.3-3): 空集 (全假, "绕过 validate 的非法配置" → None 路径) /
+    /// 单协议 (恰 1 真) / 多协议 (≥2 真) 全空间, 且排列随机 — fallback 断言
+    /// (¬exact ⇒ 首端点) 能区分 "声明序首" 与 "固定协议偏好" (如 "openai 优先")
+    /// 两类回归 (生成器太窄的历史教训, §0.3-3).
+    fn arb_endpoint_protocols() -> impl Strategy<Value = Vec<Protocol>> {
+        proptest::collection::vec(any::<bool>(), Protocol::ALL.len())
+            .prop_map(|flags| {
+                Protocol::ALL
+                    .iter()
+                    .zip(flags)
+                    .filter_map(|((p, _, _), on)| on.then_some(*p))
+                    .collect::<Vec<_>>()
+            })
+            .prop_shuffle()
+    }
+
+    proptest! {
+        /// ∀ (endpoints, ingress): 空 → None; 否则 (e, exact) 满足
+        /// e ∈ endpoints ∧ exact ⟺ ∃ x.protocol == ingress (双向蕴含) ∧
+        /// exact ⇒ e 为列表序首个匹配者 ∧ ¬exact ⇒ e == 首端点 (fallback 序, D2).
+        #[test]
+        fn prop_select_endpoint_membership_exactness_fallback(
+            protocols in arb_endpoint_protocols(),
+            ingress in proptest::sample::select(
+                Protocol::ALL.iter().map(|(p, _, _)| *p).collect::<Vec<_>>(),
+            ),
+        ) {
+            // base_url 内嵌位置下标 (生成器内唯一) — 端点身份的判别依据
+            // (Endpoint 无 Ord, 用 base_url 比对位置).
+            let d = DirectProvider {
+                endpoints: protocols
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| Endpoint::new(*p, &format!("https://u-{i}")))
+                    .collect(),
+                api_key: String::new(),
+                api_key_file: None,
+            };
+            match d.select_endpoint(ingress) {
+                None => prop_assert!(
+                    protocols.is_empty(),
+                    "None 仅当空 endpoints (非法配置, ROB)"
+                ),
+                Some((e, exact)) => {
+                    let first_match = protocols.iter().position(|p| *p == ingress);
+                    prop_assert_eq!(
+                        exact,
+                        first_match.is_some(),
+                        "exact ⟺ ∃ endpoint.protocol == ingress"
+                    );
+                    match first_match {
+                        Some(i) => prop_assert_eq!(
+                            &e.base_url,
+                            &format!("https://u-{i}"),
+                            "exact: 列表序首个 (且唯一, validate 协议唯一) 匹配者"
+                        ),
+                        None => prop_assert_eq!(
+                            &e.base_url,
+                            "https://u-0",
+                            "无匹配 → 首端点 (fallback 序, D2)"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
     // ─── multi-endpoint: validate 三规则 (§5.5) ──────────────────────────
 
     #[test]
