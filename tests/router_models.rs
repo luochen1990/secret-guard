@@ -81,6 +81,28 @@ fn anthropic_provider(id: &str, base_url: &str) -> Provider {
     }
 }
 
+/// 多端点 provider (multi-endpoint, FWD-7 缓存键控测试用): endpoints 按传入序
+/// (数组序 = fallback 序, 第一项 = 默认端点, D2).
+fn multi_endpoint_provider(id: &str, endpoints: &[(Protocol, String)]) -> Provider {
+    Provider {
+        id: id.into(),
+        enabled: true,
+        name: Some(id.into()),
+        kind: ProviderKind::Direct(DirectProvider {
+            endpoints: endpoints
+                .iter()
+                .map(|(protocol, base_url)| Endpoint {
+                    protocol: *protocol,
+                    base_url: base_url.clone(),
+                    common_uri: None,
+                })
+                .collect(),
+            api_key: String::new(),
+            api_key_file: None,
+        }),
+    }
+}
+
 fn route(pattern: &str, target: &str, priority: i64) -> Route {
     Route {
         model_pattern: pattern.into(),
@@ -711,4 +733,78 @@ async fn preview_models_empty_endpoints_is_data_not_panic() {
     let err = v["error"].as_str().expect("error 字段必有值");
     assert!(err.contains("no endpoints"), "reason 明确: {err}");
     assert_eq!(v["upstream_id"], "no-endpoints");
+}
+
+// ─── multi-endpoint: FWD-7 缓存键控 (id, egress) + fetch 端点选择 ───────────
+
+/// 双端点 provider 挂 wildcard router — /o 与 /a 入口各自 fetch 各自端点并
+/// **独立缓存** (条目键 = (provider id, 选定端点 egress 协议), FWD-7):
+/// - 每个 ingress 的首次查询触发各自端点的 fetch (各自恰 1 次), TTL 内重复
+///   查询零新请求 (N4 复用);
+/// - 两入口的清单互不串台 (/o 只见 gpt-*, /a 只见 claude-*) — 旧裸 id 键控下
+///   /a 首查会命中 /o 的条目 (anthropic 上游零 fetch, 清单串台), 本测试为红;
+/// - anthropic 端点的 fetch 带 anthropic-version header (match_header 锁定) —
+///   fetch 走选定端点的 egress 方言 (与 dispatch 转发路径同一 `select_endpoint`
+///   语义: 广告的模型必须真能被该入口的服务端点提供).
+#[tokio::test]
+async fn router_models_multi_endpoint_cache_per_ingress() {
+    let mut openai_upstream = spawn_mock_upstream().await;
+    let mut anthropic_upstream = spawn_mock_upstream().await;
+    let o_mock = openai_upstream
+        .mock("GET", "/v1/models")
+        .with_status(200)
+        .with_body(r#"{"data":[{"id":"gpt-4o"},{"id":"gpt-4o-mini"}]}"#)
+        // (dual, openai) 生命周期内恰 1 次: /o 首查 fetch, 复查走缓存.
+        .expect(1)
+        .create_async()
+        .await;
+    let a_mock = anthropic_upstream
+        .mock("GET", "/v1/models")
+        // egress 方言锚: fetch 按选定端点 (anthropic) 的协议出站.
+        .match_header("anthropic-version", "2023-06-01")
+        .with_status(200)
+        .with_body(r#"{"data":[{"id":"claude-3-5-sonnet"},{"id":"claude-3-haiku"}]}"#)
+        // (dual, anthropic) 独立条目恰 1 次: /a 首查 fetch, 复查走缓存.
+        .expect(1)
+        .create_async()
+        .await;
+
+    let providers = vec![
+        multi_endpoint_provider(
+            "dual",
+            &[
+                (Protocol::OpenAI, openai_upstream.url()),
+                (Protocol::Anthropic, anthropic_upstream.url()),
+            ],
+        ),
+        // wildcard 路由开 N6 gate (fetch + merge); 别名段为空 (无 exact pattern).
+        router_provider("r", vec![route("*", "dual", 10)]),
+    ];
+    let proxy = spawn(providers).await;
+
+    // /o 入口 ×2: 首查 fetch openai 端点, 二查零新请求; 清单 = openai 端点的模型.
+    for i in 0..2 {
+        let (status, body) = get(&proxy, "/o/r/v1/models").await;
+        assert_eq!(status, 200, "第 {} 次查询: {body}", i + 1);
+        assert_eq!(
+            model_ids(&body),
+            ["gpt-4o", "gpt-4o-mini"],
+            "/o 入口清单来自 openai 端点 (第 {} 次): {body}",
+            i + 1
+        );
+    }
+    // /a 入口 ×2: 首查 fetch anthropic 端点 (独立缓存条目), 二查零新请求;
+    // 清单 = anthropic 端点的模型 (Anthropic 响应 shape, data[].id 同构).
+    for i in 0..2 {
+        let (status, body) = get(&proxy, "/a/r/v1/models").await;
+        assert_eq!(status, 200, "第 {} 次查询: {body}", i + 1);
+        assert_eq!(
+            model_ids(&body),
+            ["claude-3-5-sonnet", "claude-3-haiku"],
+            "/a 入口清单来自 anthropic 端点 (第 {} 次): {body}",
+            i + 1
+        );
+    }
+    o_mock.assert_async().await;
+    a_mock.assert_async().await;
 }

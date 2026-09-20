@@ -2200,6 +2200,354 @@ async fn cross_protocol_unknown_pair_returns_501() {
     assert!(body.contains("not supported by codec"));
 }
 
+// ─── multi-endpoint: ingress 端点选择 (FWD-5/FWD-7 增补, T2) ────────────────
+//
+// 契约 SSOT: `docs/design/contracts.md` FWD-5 (端点选择 property) + FWD-7
+// (缓存键控). 端点选择器本身的穷举性质由 `src/provider.rs` 的 proptest 守卫
+// (`prop_select_endpoint_membership_exactness_fallback`); 本节是 dispatch 层的
+// 端到端锚: 双端点 byte-exact / fallback 翻译到首端点 / router 链尾与 pool
+// 成员的按 ingress 选端点.
+
+/// 多端点 provider 构造 helper: endpoints 按传入序 (数组序 = fallback 序,
+/// 第一项 = 默认端点, D2).
+fn multi_endpoint_provider(id: &str, endpoints: &[(Protocol, String)]) -> Provider {
+    Provider {
+        id: id.into(),
+        enabled: true,
+        name: Some(id.into()),
+        kind: ProviderKind::Direct(DirectProvider {
+            endpoints: endpoints
+                .iter()
+                .map(|(protocol, base_url)| Endpoint {
+                    protocol: *protocol,
+                    base_url: base_url.clone(),
+                    common_uri: None,
+                })
+                .collect(),
+            api_key: String::new(),
+            api_key_file: None,
+        }),
+    }
+}
+
+/// 智谱式双端点 (openai 首 + anthropic 次): /o 与 /a 入口各自**同协议透传** —
+/// 请求体 byte-exact 到达各自上游 (`Matcher::Exact` 锁定), 响应体同样
+/// byte-exact (passthrough 家族, FWD-1 两个半段); 各端点恰命中一次.
+/// T1 的 `providers_api_multi_endpoint_roundtrip_and_dual_ingress` 只断言
+/// status 200, 本测试补 byte-exact 维度.
+#[tokio::test]
+async fn multi_endpoint_dual_ingress_same_proto_byte_exact() {
+    let mut openai_upstream = spawn_mock_upstream().await;
+    let mut anthropic_upstream = spawn_mock_upstream().await;
+
+    let openai_body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}]}"#;
+    let openai_resp = r#"{"id":"chatcmpl-dual","object":"chat.completion","created":1700000000,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"Hi from OpenAI endpoint"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}"#;
+    let o_mock = openai_upstream
+        .mock("POST", "/v1/chat/completions")
+        // Exact: 同协议无 secret 走字节透传, 上游收到的 body 必须逐字节等于客户端发出.
+        .match_body(mockito::Matcher::Exact(openai_body.to_string()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(openai_resp)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let anthropic_body = r#"{"model":"claude-3-5-sonnet","max_tokens":64,"messages":[{"role":"user","content":"Hello"}]}"#;
+    let anthropic_resp = r#"{"id":"msg-dual","type":"message","role":"assistant","content":[{"type":"text","text":"Hi from Anthropic endpoint"}],"model":"claude-3-5-sonnet","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":4,"output_tokens":3}}"#;
+    let a_mock = anthropic_upstream
+        .mock("POST", "/v1/messages")
+        // egress 方言锚: anthropic 端点收到客户端携带的 anthropic-version
+        // (header 透传 — 同协议路径不代为注入, 见下方请求侧注释).
+        .match_header("anthropic-version", "2023-06-01")
+        .match_body(mockito::Matcher::Exact(anthropic_body.to_string()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(anthropic_resp)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let provider = multi_endpoint_provider(
+        "dual",
+        &[
+            (Protocol::OpenAI, openai_upstream.url()),
+            (Protocol::Anthropic, anthropic_upstream.url()),
+        ],
+    );
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+
+    let (status, resp_body, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/dual/v1/chat/completions",
+        openai_body,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {resp_body}");
+    assert_eq!(
+        resp_body, openai_resp,
+        "/o 入口: 响应半段 byte-exact (同协议透传)"
+    );
+
+    let (status, resp_body, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/a/dual/v1/messages",
+        anthropic_body,
+        // anthropic-version 由客户端携带 (Anthropic SDK 恒发) — 同协议透传路径
+        // 不代为注入 (只有跨协议 egress 才注入), mock 以此锁定 header 透传.
+        &[("anthropic-version", "2023-06-01")],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {resp_body}");
+    assert_eq!(
+        resp_body, anthropic_resp,
+        "/a 入口: 响应半段 byte-exact (同协议透传)"
+    );
+
+    o_mock.assert_async().await;
+    a_mock.assert_async().await;
+}
+
+/// D2 fallback: /r ingress (未配 responses 端点) → 首端点 (openai) 跨协议翻译
+/// (Responses → Chat Completions, FWD-3 域 — 翻译重序列化不承诺 byte 形态,
+/// 用 PartialJson 断言语义字段); 次端点 (anthropic) 零命中.
+#[tokio::test]
+async fn multi_endpoint_fallback_cross_proto_to_first_endpoint() {
+    let mut openai_upstream = spawn_mock_upstream().await;
+    let mut anthropic_upstream = spawn_mock_upstream().await;
+
+    let o_mock = openai_upstream
+        .mock("POST", "/v1/chat/completions")
+        // 翻译后的 body: Responses input[] → IR → OpenAI messages[] (PartialJson
+        // 断言 user 消息语义保留).
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "Hello"}],
+        })))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"chatcmpl-fb","object":"chat.completion","created":1700000000,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"Hi from first endpoint"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}"#,
+        )
+        .expect(1)
+        .create_async()
+        .await;
+    // fallback 只取首端点: 次端点必须零命中.
+    let a_never = anthropic_upstream
+        .mock("POST", "/v1/messages")
+        .with_status(200)
+        .with_body("{}")
+        .expect(0)
+        .create_async()
+        .await;
+
+    let provider = multi_endpoint_provider(
+        "dual",
+        &[
+            (Protocol::OpenAI, openai_upstream.url()),
+            (Protocol::Anthropic, anthropic_upstream.url()),
+        ],
+    );
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+
+    let body = r#"{"model":"gpt-4o","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Hello"}]}]}"#;
+    let (status, resp_body, _) =
+        proxy_request(&proxy_url, "POST", "/r/dual/v1/responses", body, &[]).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "/r fallback 到首端点走跨协议翻译: {resp_body}"
+    );
+    assert!(
+        resp_body.contains("\"object\":\"response\""),
+        "响应翻译回 Responses 形态: {resp_body}"
+    );
+    o_mock.assert_async().await;
+    a_never.assert_async().await;
+}
+
+/// D2 fallback 按**声明序**取首端点 (非协议位阶): anthropic 声明在首的 provider,
+/// /r ingress (无 responses 端点) → fallback 打 **anthropic** 端点 (Responses →
+/// Anthropic 翻译, PartialJson 断言 messages + 注入的 max_tokens), openai 端点
+/// (声明序次) 零命中. 杀 "fallback = 固定协议偏好 (如 openai 优先)" 型回归 —
+/// 上方 fallback 测试的 openai-first 布局无法区分两者 (生成器侧由
+/// `prop_select_endpoint_membership_exactness_fallback` 的随机排列覆盖).
+#[tokio::test]
+async fn multi_endpoint_fallback_uses_declaration_order_not_protocol_rank() {
+    let mut openai_upstream = spawn_mock_upstream().await;
+    let mut anthropic_upstream = spawn_mock_upstream().await;
+
+    let a_mock = anthropic_upstream
+        .mock("POST", "/v1/messages")
+        // 翻译后的 body: Responses input[] → IR → Anthropic messages[]
+        // (content 升级为 text block 数组) + max_tokens 注入 (客户端未带, 默认 4096).
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "model": "gpt-4o",
+            "max_tokens": 4096,
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "Hello"}]}
+            ],
+        })))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"msg-flip","type":"message","role":"assistant","content":[{"type":"text","text":"Hi from declared-first endpoint"}],"model":"gpt-4o","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":3,"output_tokens":4}}"#,
+        )
+        .expect(1)
+        .create_async()
+        .await;
+    let o_never = openai_upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_body("{}")
+        .expect(0)
+        .create_async()
+        .await;
+
+    let provider = multi_endpoint_provider(
+        "flip",
+        &[
+            (Protocol::Anthropic, anthropic_upstream.url()),
+            (Protocol::OpenAI, openai_upstream.url()),
+        ],
+    );
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+
+    let body = r#"{"model":"gpt-4o","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Hello"}]}]}"#;
+    let (status, resp_body, _) =
+        proxy_request(&proxy_url, "POST", "/r/flip/v1/responses", body, &[]).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "/r fallback 到声明序首端点 (anthropic): {resp_body}"
+    );
+    assert!(
+        resp_body.contains("\"object\":\"response\""),
+        "响应翻译回 Responses 形态: {resp_body}"
+    );
+    a_mock.assert_async().await;
+    o_never.assert_async().await;
+}
+
+/// router 链尾为多端点条目: resolve_route 到链尾后按 **ingress** 选端点 —
+/// /a/{router} → 链尾的 anthropic 端点 (Exact body), openai 端点零命中.
+#[tokio::test]
+async fn router_tail_multi_endpoint_selects_endpoint_by_ingress() {
+    let mut openai_upstream = spawn_mock_upstream().await;
+    let mut anthropic_upstream = spawn_mock_upstream().await;
+
+    let anthropic_body = r#"{"model":"claude-3-5-sonnet","max_tokens":32,"messages":[{"role":"user","content":"via router"}]}"#;
+    let a_mock = anthropic_upstream
+        .mock("POST", "/v1/messages")
+        .match_body(mockito::Matcher::Exact(anthropic_body.to_string()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"msg-rt","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"claude-3-5-sonnet","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":2,"output_tokens":1}}"#)
+        .expect(1)
+        .create_async()
+        .await;
+    let o_never = openai_upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_body("{}")
+        .expect(0)
+        .create_async()
+        .await;
+
+    let providers = vec![
+        multi_endpoint_provider(
+            "member-dual",
+            &[
+                (Protocol::OpenAI, openai_upstream.url()),
+                (Protocol::Anthropic, anthropic_upstream.url()),
+            ],
+        ),
+        router_provider("rt", vec![route("*", "member-dual")]),
+    ];
+    let proxy_url = spawn_proxy_full(
+        providers,
+        reqwest::Client::new(),
+        ConversationDag::new(64, 500, 1),
+        test_secret_table(),
+    )
+    .await;
+
+    let (status, resp_body, _) =
+        proxy_request(&proxy_url, "POST", "/a/rt/v1/messages", anthropic_body, &[]).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "/a ingress 经 router 链尾选 anthropic 端点: {resp_body}"
+    );
+    assert!(
+        resp_body.contains("\"type\":\"message\""),
+        "同协议透传回 Anthropic 形态: {resp_body}"
+    );
+    a_mock.assert_async().await;
+    o_never.assert_async().await;
+}
+
+/// pool 成员为多端点条目: pick 成员后按 **ingress** 选端点 — /a/{pool} →
+/// 成员的 anthropic 端点 (Exact body), openai 端点零命中.
+#[tokio::test]
+async fn pool_member_multi_endpoint_selects_endpoint_by_ingress() {
+    let mut openai_upstream = spawn_mock_upstream().await;
+    let mut anthropic_upstream = spawn_mock_upstream().await;
+
+    let anthropic_body = r#"{"model":"claude-3-5-sonnet","max_tokens":32,"messages":[{"role":"user","content":"via pool"}]}"#;
+    let a_mock = anthropic_upstream
+        .mock("POST", "/v1/messages")
+        .match_body(mockito::Matcher::Exact(anthropic_body.to_string()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"msg-pl","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"claude-3-5-sonnet","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":2,"output_tokens":1}}"#)
+        .expect(1)
+        .create_async()
+        .await;
+    let o_never = openai_upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_body("{}")
+        .expect(0)
+        .create_async()
+        .await;
+
+    let providers = vec![
+        multi_endpoint_provider(
+            "member-dual",
+            &[
+                (Protocol::OpenAI, openai_upstream.url()),
+                (Protocol::Anthropic, anthropic_upstream.url()),
+            ],
+        ),
+        pool_provider("pl", &["member-dual"]),
+    ];
+    let proxy_url = spawn_proxy_full(
+        providers,
+        reqwest::Client::new(),
+        ConversationDag::new(64, 500, 1),
+        test_secret_table(),
+    )
+    .await;
+
+    let (status, resp_body, _) =
+        proxy_request(&proxy_url, "POST", "/a/pl/v1/messages", anthropic_body, &[]).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "/a ingress 经 pool 成员选 anthropic 端点: {resp_body}"
+    );
+    assert!(
+        resp_body.contains("\"type\":\"message\""),
+        "同协议透传回 Anthropic 形态: {resp_body}"
+    );
+    a_mock.assert_async().await;
+    o_never.assert_async().await;
+}
+
 #[tokio::test]
 async fn no_rest_segment_routes_to_root() {
     // /o/{name} 应当等价于 /o/{name}/ → 上游收到 GET /.
