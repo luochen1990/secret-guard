@@ -149,7 +149,7 @@
     /* 代码 / 原始字节区统一用等宽 (语义需要, 非全局风格). 集中声明, 避免下方重复. */
     pre, code, .raw-pre, .resp-body, .bubble-tool, .bubble-tool-call, .xml-block,
     .full-body, .info-val, dialog#secret-form form textarea, textarea#apikey-reveal-value,
-    .probe-chip, #p-probe-result .probe-url, #p-common-uri-badge,
+    .probe-chip, .probe-url, .common-uri-badge,
     .ep-short, .ep-url > code {
       font-family: "SF Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
     }
@@ -581,22 +581,25 @@
     dialog#provider-form .kind-fields.hidden {
       display: none;
     }
-    /* #179 路由编辑器 (Router 构造字段组): 路由行列表, 每行一条 Route.
-       routes-editor 跨整行 (grid-column 1/-1); 行内 6 列 = 启用/model_pattern/
-       target/upstream_model/priority/删除. */
-    #p-router-fields .routes-editor {
+    /* 三构造字段组共用的行编辑器骨架 (routes-editor + routes-head): router 路由 /
+       pool 成员 / direct 端点三种行编辑器同构 — 跨整行 + 纵向堆叠 + 头行两端对齐.
+       收敛为一条共享规则 (第三构造出现后不再 per-group 复制); 字段组整体显隐,
+       不带组前缀不会串扰. */
+    .kind-fields .routes-editor {
       grid-column: 1 / -1;
       display: flex;
       flex-direction: column;
       gap: 4px;
     }
-    #p-router-fields .routes-head {
+    .kind-fields .routes-head {
       display: flex;
       justify-content: space-between;
       align-items: center;
       font-size: 12px;
       color: var(--fg-muted);
     }
+    /* #179 路由编辑器 (Router 构造字段组): 路由行列表, 每行一条 Route.
+       行内 6 列 = 启用/model_pattern/target/upstream_model/priority/删除. */
     #p-router-fields .routes-colhead,
     #p-routes-list .route-row {
       display: grid;
@@ -623,21 +626,8 @@
       font-size: 11px;
     }
     /* Pool 构造字段组 (#179 同型的第三构造): members 编辑器复用 routes-editor
-       骨架; 成员行 = 下拉 + 上移/下移/删除 (顺序即 failover 优先级).
+       骨架 (共享规则见上); 成员行 = 下拉 + 上移/下移/删除 (顺序即 failover 优先级).
        exhaust 高级配置用原生 <details> 折叠 (默认收起, 显示默认策略提示). */
-    #p-pool-fields .routes-editor {
-      grid-column: 1 / -1;
-      display: flex;
-      flex-direction: column;
-      gap: 4px;
-    }
-    #p-pool-fields .routes-head {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      font-size: 12px;
-      color: var(--fg-muted);
-    }
     #p-members-list .member-row {
       display: grid;
       grid-template-columns: 1fr auto auto auto;
@@ -672,34 +662,47 @@
     .pm-dot.pm-on { color: var(--ok); }
     .pm-dot.pm-wait { color: var(--warn); }
     .pm-cur { color: var(--accent); font-weight: 700; }
-    /* Detect 协议探测 (#p-direct-fields 内, Direct 构造专属 — Router 下随组隐藏):
-       按钮 + 结果区各跨整行 (form grid 两列). 结果区由 renderProbeResult 填充
-       (状态行 / note hint / 模型 chips), 清空后由 :empty 折叠 (不残留空行).
-       容器用 grid 而非 flex column: 单列隐式行堆叠等价, 且全局 .hint { flex: 1 }
-       对 grid item 天然无效, 免去中和补偿规则. */
-    #p-detect { grid-column: 1 / -1; justify-self: start; }
-    #p-probe-result { grid-column: 1 / -1; display: grid; gap: 4px; }
-    #p-probe-result:empty { display: none; }
+    /* Detect 协议探测结果区 (per 端点行内, .ep-probe-result — 状态行 / note hint /
+       模型 chips), 清空后由 :empty 折叠 (不残留空行). 容器用 grid 而非 flex column:
+       单列隐式行堆叠等价, 且全局 .hint { flex: 1 } 对 grid item 天然无效, 免去中和
+       补偿规则. */
+    .ep-probe-result { grid-column: 1 / -1; display: grid; gap: 4px; }
+    .ep-probe-result:empty { display: none; }
     /* probe-line / probe-models / probe-chip 是探测与 endpoints 弹窗共用的
        通用件 (状态行 / 可滚动 chips 容器 / 点击复制 chip) — 不限定在
-       #p-probe-result 下, endpoints 弹窗的 Models 面板复用同一套. */
+       探测结果区下, endpoints 弹窗的 Models 面板复用同一套. */
     .probe-line { font-size: 12px; color: var(--fg-muted); }
     .probe-line-ok { color: var(--ok); }
     .probe-line-err { color: var(--err); }
     /* 探测 URL 回显 (不黑盒): 每路 GET 的完整 URL, 缩进小字等宽 (字体并入上方
        全局等宽列表), 长地址可断行. */
-    #p-probe-result .probe-url {
+    .probe-url {
       font-size: 11px;
       color: var(--fg-faint);
       word-break: break-all;
       padding-left: 12px;
     }
-    /* base_url 输入行: input + common_uri 徽标横向排布 (badge 紧跟其后 = 视觉上
-       追加到 base_url 尾部). 徽标 = detect 固化的布局知识: 绿色调区分输入内容,
-       点击复制 base_url + common_uri 整体 (cursor: copy). */
-    .p-base-url-wrap { display: flex; gap: 6px; align-items: stretch; }
-    .p-base-url-wrap #p-base-url { flex: 1; min-width: 0; }
-    #p-common-uri-badge {
+    /* 端点行编辑器 (Direct 构造字段组, multi-endpoint): 骨架复用 routes-editor
+       共享规则 (见上), 行 = protocol select + base_url + common_uri 徽标 +
+       Detect + 删除, 次行 = 探测结果区 (跨整行). */
+    #p-endpoints-list .endpoint-row {
+      display: grid;
+      grid-template-columns: 140px 1fr auto auto auto;
+      gap: 4px;
+      align-items: center;
+    }
+    #p-endpoints-list .endpoint-row .ep-del {
+      padding: 2px 4px;
+      font-size: 11px;
+    }
+    #p-endpoints-list .endpoint-row .ep-del:hover {
+      border-color: var(--err-line);
+      color: var(--err);
+      background: var(--err-soft);
+    }
+    /* base_url 旁的 common_uri 徽标 (per 行): detect 固化的布局知识, 绿色调区分
+       输入内容, 点击复制 base_url + common_uri 整体 (cursor: copy). */
+    .common-uri-badge {
       flex: none;
       padding: 2px 8px;
       border: 1px solid var(--ok);
@@ -710,7 +713,7 @@
       cursor: copy;
       white-space: nowrap;
     }
-    #p-common-uri-badge.copied { background: var(--ok); color: var(--panel); border-color: var(--ok); }
+    .common-uri-badge.copied { background: var(--ok); color: var(--panel); border-color: var(--ok); }
     /* 模型 chips 预览 (MVP 深度 = 浏览 + 点击复制): 可滚动容器, 标题随内容滚动. */
     .probe-models {
       display: flex;
@@ -2007,18 +2010,20 @@
         </details>
       </div>
       <div class="kind-fields" id="p-direct-fields">
-        <label for="p-base-url">Base URL</label>
-        <div class="p-base-url-wrap">
-          <input type="text" id="p-base-url" placeholder="https://api.openai.com (no trailing /)">
-          <button type="button" id="p-common-uri-badge" class="common-uri-badge" hidden
-            title="Common URI detected by Detect — the prefix secret-guard prepends to its own model-list requests. Click to copy base URL + common URI as a whole. Editing the base URL clears this.">+/v1</button>
+        <div class="routes-editor">
+          <div class="routes-head">
+            <span>Endpoints (one per protocol, shared API key)</span>
+            <button type="button" class="btn" id="p-endpoint-add">+ Add endpoint</button>
+          </div>
+          <div id="p-endpoints-list"></div>
+          <div class="hint" style="margin: 0 0 4px 0;">
+            Each endpoint serves its protocol via <code>/{proto-short}/{provider-id}/</code>
+            (byte-exact passthrough). Requests whose ingress protocol has no endpoint fall back to
+            the first endpoint (cross-protocol translation).
+          </div>
         </div>
         <label for="p-api-key">API Key</label>
         <input type="password" id="p-api-key" placeholder="(optional for local providers like Ollama)">
-        <button type="button" class="btn" id="p-detect" title="Probe the base URL to detect its protocol and list available models (does not save)">Detect</button>
-        <div id="p-probe-result"></div>
-        <label for="p-protocol" title="auto-filled by Detect when it recognizes the endpoint; adjust manually if needed">Protocol</label>
-        <select id="p-protocol"></select>
       </div>
       <label for="p-enabled">Enabled</label>
       <input type="checkbox" id="p-enabled" checked>
@@ -2127,14 +2132,15 @@
       providerDecisions: [],
       // provider 表单 Detect 探测代数 (镜像 timelineGen 模式): dialog 每次打开 bump;
       // 在途 probe 响应落地前对账, 代数不匹配即丢弃 — 防在途旧结果写入重开后的新
-      // 表单世界 (含静默改写 #p-protocol 导致存错协议的数据级后果).
+      // 表单世界 (含静默改写端点行 protocol select 导致存错协议的数据级后果).
       probeEpoch: 0,
-      // provider 表单 common_uri 暂存 (detect 知识 → 保存落盘的通道):
-      // null = 未探测 (保存落 null, fetch 侧现场推导); '/v1' | '' = detect 确认的
-      // 布局断言. 生命周期: 打开表单初始化自 existing (编辑回填原值, 防未重跑
-      // detect 的保存抹掉存量知识) → detect 成功覆盖 → base_url 编辑作废置 null
-      // (旧探测结果不适用于新 URL). 保存 payload 全量携带 (后端全量语义).
-      probeCommonUri: null,
+      // provider 表单 common_uri 暂存 (detect 知识 → 保存落盘的通道) 是 **per 端点行**
+      // 的 (multi-endpoint): 存在行的 `dataset.commonUri` 上 (行数据 SSOT 是 DOM 本身,
+      // 同路由编辑器模式), null 态 = 无该属性 (保存落 null, fetch 侧现场推导);
+      // '/v1' | '' = detect 确认的布局断言. 生命周期: 打开表单从 existing.endpoints
+      // 一次性物化 (编辑回填原值, 防未重跑 detect 的保存抹掉存量知识) → 该行 detect
+      // 成功覆盖 → 该行 base_url 编辑作废删除属性 (旧探测结果不适用于新 URL).
+      // 保存 payload 全量携带 (后端全量语义).
       // auth tab (static preset API keys)
       apiKeysList: [],
       authEnabled: false,
@@ -4276,7 +4282,7 @@
     // cfg 字段契约:
     //   api / list / disabledList / setList / bodyId / statsId / formDlgId / formElId /
     //   colspan / emptyText / kindParam / refresh / renderRow / renderDisabledRow /
-    //   populateSelects / openForm — 见各 cfg 项, 含义自明.
+    //   openForm — 见各 cfg 项, 含义自明.
     //   extraActions?: Record<actionName, (id: string) => void> — 可选.
     //     kind 特定的额外按钮动作 (如 provider 的 endpoints), 由 bindTableEvents 的
     //     click 委托在通用 edit/delete 之外分派. 仅在该 kind 的行渲染了对应
@@ -4298,7 +4304,6 @@
         refresh: () => refreshSecrets(),
         renderRow: renderSecretRow,
         renderDisabledRow: renderDisabledSecretRow,
-        populateSelects: populateCategorySelect,
         openForm: openSecretForm,
       },
       provider: {
@@ -4316,7 +4321,6 @@
         refresh: () => refreshProviders(),
         renderRow: renderProviderRow,
         renderDisabledRow: renderDisabledProviderRow,
-        populateSelects: populateProtocolSelect,
         openForm: openProviderForm,
         extraActions: { endpoints: openProviderEndpoints, 'pool-reset': resetPool },
       },
@@ -5168,22 +5172,24 @@
       sel.innerHTML = state.secretCategories.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
     }
 
-    function populateProtocolSelect() {
-      const sel = document.getElementById('p-protocol');
-      // 词表 = webui_protocols (仅 codec 覆盖族): Gemini/Ollama 无 codec, Redact
-      // 不可用且默认 fail_closed — 表单不引导创建; 存量/探测值经 setProtocolSelectValue
-      // 动态 append "(experimental)" 选项, 手写配置族仍可编辑. 无全量回退层:
-      // webui_protocols 与 protocols 同源同生 (同一响应体), 空即 fetch 未落地,
-      // 此时留空词表 + openai 兜底 (见 openProviderForm), 不静默降级回全量词表.
+    // 端点行 protocol select 词表 (multi-endpoint, per 行): 词表 = webui_protocols
+    // (仅 codec 覆盖族): Gemini/Ollama 无 codec, Redact 不可用且默认 fail_closed —
+    // 表单不引导创建; 存量/探测值经 setEndpointProtocolValue 动态 append
+    // "(experimental)" 选项, 手写配置族仍可编辑. 无全量回退层: webui_protocols 与
+    // protocols 同源同生 (同一响应体), 空即 fetch 未落地, 此时留空词表 (openProviderForm
+    // 对空白行兜底 openai), 不静默降级回全量词表. 行每次打开表单 / 新增行时物化,
+    // 词表取自当时的 state (addEndpointRow 读 state 即 "populate 先于 set" 时序).
+    function fillEndpointProtocolOptions(sel) {
       sel.innerHTML = state.providerWebuiProtocols.map(p => `<option value="${escapeHtml(p)}">${escapeHtml(p)}</option>`).join('');
     }
 
-    // 设置 protocol select 的值; 值不在词表 (透传族 gemini/ollama, 如存量条目编辑
-    // 或探测推荐) 时动态 append 一个 "(experimental)" 标注选项再选中 (策略见
-    // populateProtocolSelect 注释). 词表为空 (providers fetch 未落地, 首开竞态)
-    // 时不加后缀 — 此时 append 的是普通选项而非 experimental.
-    function setProtocolSelectValue(value) {
-      const sel = document.getElementById('p-protocol');
+    // 设置端点行 protocol select 的值; 值不在词表 (透传族 gemini/ollama, 如存量
+    // 条目编辑或探测推荐) 时动态 append 一个 "(experimental)" 标注选项再选中 (策略
+    // 见 fillEndpointProtocolOptions 注释). 词表为空 (providers fetch 未落地, 首开
+    // 竞态) 时不加后缀 — 此时 append 的是普通选项而非 experimental. 空值直接跳过
+    // (留空 = 提交时必填校验拦截).
+    function setEndpointProtocolValue(row, value) {
+      const sel = row.querySelector('.ep-protocol');
       if (!value) return;
       if (![...sel.options].some(o => o.value === value)) {
         const label = sel.options.length
@@ -5554,7 +5560,6 @@
     }
 
     function openProviderForm(existing) {
-      populateProtocolSelect();
       const dlg = document.getElementById('provider-form');
       const title = document.getElementById('provider-form-title');
       const saveBtn = document.getElementById('p-save');
@@ -5562,11 +5567,7 @@
       idInput.value = existing?.id || '';
       idInput.disabled = !!existing;
       document.getElementById('p-name').value = existing?.name || '';
-      // 存量 protocol 可能是透传族 (gemini/ollama, 手写配置) — 经 helper append
-      // "(experimental)" 选项; 新建默认取 webui 词表首项, 空词表 (fetch 未落地)
-      // 兜底 'openai'.
-      setProtocolSelectValue(existing?.protocol || state.providerWebuiProtocols[0] || 'openai');
-      // 构造选择 (#190): 按 kind 显隐字段组 — Direct: Protocol/Base URL/API Key;
+      // 构造选择 (#190): 按 kind 显隐字段组 — Direct: 端点行编辑器 + API Key;
       // Router: 路由编辑器; Pool: 成员编辑器 + exhaust 高级配置. 构造可切换
       // (编辑 static router/pool → Direct override = 改回实体 #187 根治, 需显式
       // 发空 routes/members — 见下方 payload builder; dynamic 条目切换的丢 key
@@ -5574,7 +5575,7 @@
       const kindSel = document.getElementById('p-kind');
       const kindHint = document.getElementById('p-kind-hint');
       const KIND_HINTS = {
-        direct: 'Forwards directly to a real LLM endpoint (base URL + API key).',
+        direct: 'Forwards directly to a real LLM endpoint (one endpoint per protocol, shared API key).',
         router: 'Route-based routing endpoint — the request model is matched against route model_patterns; the highest-priority enabled match routes the request. No base URL / API key of its own.',
         pool: 'Subscription pool — ordered members (direct providers); traffic goes to the first available member and fails over on window-quota exhaustion signals. No base URL / API key of its own.',
       };
@@ -5612,20 +5613,20 @@
       const routes = existing?.kind === 'router' ? (existing.routes || []) : [];
       if (routes.length) routes.forEach(r => addRouteRow(r));
       else addRouteRow();
-      document.getElementById('p-base-url').value = existing?.base_url || '';
-      // common_uri 暂存初始化: 编辑回填存量值 (未重跑 detect 的保存不丢知识);
-      // 新建 null. badge 随之同步 (存量值也展示 — 用户可见 provider 的布局知识).
-      state.probeCommonUri = existing?.common_uri ?? null;
-      syncCommonUriBadge();
-      // Detect 探测结果随 dialog 打开清空 (旧结果属于旧的表单世界; base_url/api_key
-      // 后续变更不自动清除 — 下次点击以当前表单值发请求并覆盖, 见 runProviderProbe).
-      // epoch bump 让在途 probe 响应落地时对账丢弃 (probeEpoch 注释); 按钮就地重置
-      // 覆盖 "关闭时 in-flight 卡在 Detecting…/disabled" 的窗口 (旧 finally 因代数
-      // 不匹配不再越世界恢复).
-      document.getElementById('p-probe-result').innerHTML = '';
+      // 端点行编辑器 (multi-endpoint): 同路由编辑器模式 — 行数据 SSOT 是 DOM,
+      // 打开表单时从 existing.endpoints 一次性全量物化 (声明序 = fallback 序, 编辑
+      // 回填原值 + "保存全量提交" 实现 #157 无歧义的保留语义); 非 Direct 条目
+      // (或新建) 给一行空白 (词表首项兜底). 构造切换只显隐字段组不清空行.
+      const epsList = document.getElementById('p-endpoints-list');
+      epsList.innerHTML = '';
+      const eps = existing?.kind === 'direct' ? (existing.endpoints || []) : [];
+      if (eps.length) eps.forEach(e => addEndpointRow(e));
+      else addEndpointRow();
+      // Detect 探测结果随 dialog 打开清空 (行是新建的, 旧结果天然不残留;
+      // base_url/api_key 后续变更不自动清除 — 下次点击以当前表单值发请求并覆盖,
+      // 见 runEndpointProbe). epoch bump 让在途 probe 响应落地时对账丢弃
+      // (probeEpoch 注释); 按钮态随新行物化, 无跨世界残留窗口.
       state.probeEpoch++;
-      document.getElementById('p-detect').disabled = false;
-      document.getElementById('p-detect').textContent = 'Detect';
       const apiKeyInput = document.getElementById('p-api-key');
       apiKeyInput.value = '';
       // 编辑模式下用 masked 旧值做 placeholder, 提示"留空将保留"; 创建模式保持原提示.
@@ -5640,6 +5641,122 @@
       saveBtn.textContent = existing ? 'Update' : 'Create';
       dlg.showModal();
     }
+
+    // ─── direct 端点行编辑器 (multi-endpoint) ────────────────────────────
+    //
+    // 每行一个端点 (protocol select + base_url + common_uri 徽标 + Detect + 删除),
+    // 行序 = 声明序 = fallback 序 (D2). 行数据 SSOT 是 DOM 本身 (同路由编辑器模式):
+    // common_uri 暂存存 `row.dataset.commonUri` (null 态 = 无该属性), 由该行的
+    // detect 写入 / base_url 编辑作废. ≥1 行约束在提交侧校验 (与 routes/members
+    // 的前置拦截风格一致 — 行删除不设下限, 保存时统一拦截).
+
+    // 物化一行端点输入. ep 形如 {protocol, base_url, common_uri}; 缺省 = 一行空白
+    // (新建, protocol 兜底词表首项 / openai — 词表空即 fetch 未落地竞态).
+    function addEndpointRow(ep) {
+      const row = document.createElement('div');
+      row.className = 'endpoint-row';
+      row.innerHTML = `
+        <select class="ep-protocol" title="Protocol of this endpoint — auto-filled by Detect when it recognizes the base URL; adjust manually if needed"></select>
+        <input type="text" class="ep-base-url" placeholder="https://api.openai.com (no trailing /)">
+        <button type="button" class="common-uri-badge ep-common-uri-badge" hidden
+          title="Common URI detected by Detect — the prefix secret-guard prepends to its own model-list requests. Click to copy base URL + common URI as a whole. Editing the base URL clears this.">+/v1</button>
+        <button type="button" class="btn ep-detect" title="Probe this base URL to detect its protocol and list available models (does not save)">Detect</button>
+        <button type="button" class="btn ep-del" title="Remove endpoint">✕</button>
+        <div class="ep-probe-result"></div>`;
+      fillEndpointProtocolOptions(row.querySelector('.ep-protocol'));
+      if (ep) {
+        setEndpointProtocolValue(row, ep.protocol);
+        row.querySelector('.ep-base-url').value = ep.base_url || '';
+        if (ep.common_uri != null) row.dataset.commonUri = ep.common_uri;
+      } else {
+        setEndpointProtocolValue(row, state.providerWebuiProtocols[0] || 'openai');
+      }
+      syncEndpointCommonUriBadge(row);
+      document.getElementById('p-endpoints-list').appendChild(row);
+    }
+
+    // 行 common_uri 徽标同步 (per 行): 暂存非 null
+    // 时显示, 文案 '+/v1' (裸根) / '✓ included' (版本前缀已含, 无可视前缀); null
+    // 隐藏 (未探测). 'copied' 清除: copyWithFlash 的 flash class 在每个 sync 点
+    // 复位 (restore 是本函数, 不清则反转色永久滞留 — M-A 教训).
+    function syncEndpointCommonUriBadge(row) {
+      const badge = row.querySelector('.ep-common-uri-badge');
+      badge.classList.remove('copied');
+      const cu = row.dataset.commonUri ?? null;
+      // 原生 hidden property (项目先例: nav.hidden) — .hidden class 无全局规则.
+      if (cu === null) {
+        badge.hidden = true;
+        return;
+      }
+      badge.hidden = false;
+      badge.textContent = cu === '' ? '✓ included' : `+${cu}`;
+    }
+
+    // 收集端点行 → Endpoint wire shape (提交用): common_uri null = 未探测 (fetch
+    // 现场推导); '/v1'|'' = 布局断言. ≥1 行 + 每行 protocol/base_url 必填 + 同
+    // protocol 唯一 (后端 validate 同规则, 前置拦截避免用户填完整个表单才收到
+    // 400). 校验失败 alert + 返回 null (调用方中止提交, 对话框保持打开).
+    // 注: 校验内聚在收集器内 (与 routes/members 的 "收集器纯 map + builder 侧
+    // 校验" 不同构, 有意 — 端点规则有三类, 内聚避免 builder 再膨胀).
+    function collectEndpointsFromForm() {
+      const rows = [...document.querySelectorAll('#p-endpoints-list .endpoint-row')];
+      if (rows.length === 0) {
+        alert('At least one endpoint is required for a direct provider.');
+        return null;
+      }
+      const endpoints = [];
+      const seen = new Set();
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i];
+        const protocol = row.querySelector('.ep-protocol').value;
+        const base_url = row.querySelector('.ep-base-url').value.trim();
+        if (!protocol) {
+          alert(`Endpoint #${i + 1}: protocol is required.`);
+          return null;
+        }
+        if (!base_url) {
+          alert(`Endpoint #${i + 1}: Base URL is required.`);
+          return null;
+        }
+        if (seen.has(protocol)) {
+          alert(`Endpoint #${i + 1}: duplicate protocol "${protocol}" — one endpoint per protocol (extra protocols would never match).`);
+          return null;
+        }
+        seen.add(protocol);
+        endpoints.push({ protocol, base_url, common_uri: row.dataset.commonUri ?? null });
+      }
+      return endpoints;
+    }
+
+    // 行容器与增行按钮 (兄弟节点, routes-head 模式) 各取一次, 委托挂行容器.
+    const pEndpointsList = document.getElementById('p-endpoints-list');
+    document.getElementById('p-endpoint-add').addEventListener('click', () => addEndpointRow());
+    pEndpointsList.addEventListener('click', (ev) => {
+      const row = ev.target.closest('.endpoint-row');
+      if (!row) return;
+      if (chipCopyHandler(ev)) return;
+      if (ev.target.closest('.ep-del')) {
+        row.remove();
+      } else if (ev.target.closest('.ep-detect')) {
+        runEndpointProbe(row);
+      } else {
+        const badge = ev.target.closest('.ep-common-uri-badge');
+        if (badge) {
+          const cu = row.dataset.commonUri;
+          if (cu == null) return;
+          const whole = row.querySelector('.ep-base-url').value.trim() + cu;
+          copyWithFlash(badge, whole, 'copied', () => syncEndpointCommonUriBadge(row));
+        }
+      }
+    });
+    // base_url 编辑作废该行暂存的 common_uri (探测结果只对被探测的那个 URL 成立).
+    pEndpointsList.addEventListener('input', (ev) => {
+      const row = ev.target.closest('.endpoint-row');
+      if (row && ev.target.classList.contains('ep-base-url')) {
+        delete row.dataset.commonUri;
+        syncEndpointCommonUriBadge(row);
+      }
+    });
 
     // ─── router 路由编辑器 (#179) ─────────────────────────────────────────
     //
@@ -5798,44 +5915,21 @@
       return { ok: true, exhaust: { statuses, codes: lines('p-exh-codes'), headers: lines('p-exh-headers') }, cooldown_secs: cooldown };
     }
 
-    // ─── provider Detect 协议探测 (Direct 字段组) ────────────────────────
+    // ─── provider Detect 协议探测 (端点行内, per 行) ─────────────────────
     //
     // POST /api/providers/probe {base_url, api_key} → {probes[], recommended, note,
-    // common_uri}. 手动触发, 建议非命令: recommended 只用于设置 #p-protocol select
-    // (用户仍可手改, 词表 = GET /api/providers 的 webui_protocols 数组, 透传族动态
-    // append), 绝不自动保存. common_uri 经 state.probeCommonUri 暂存 (badge 回显),
-    // 随保存 payload 落盘 — detect → 填表 → 保存 是一条知识链. 探测结果 DOM 派生
-    // 内容全部留在 #p-probe-result 内 (不进 state, 同表单其余字段惯例); 模型预览
-    // 深度 = 浏览 + 点击复制 (MVP).
-
-    // common_uri 徽标同步: 暂存非 null 时显示 (追加在 base_url 输入框后), 文案
-    // '+/v1' (裸根) / '✓ included' (版本前缀已含, 无可视前缀); null 隐藏 (未探测).
-    function syncCommonUriBadge() {
-      const badge = document.getElementById('p-common-uri-badge');
-      const cu = state.probeCommonUri;
-      // 原生 hidden property (项目先例: nav.hidden) — .hidden class 无全局规则.
-      // cu 只会是 null|string (初始化/覆盖/作废均经 ?? null 归一).
-      // 'copied' 清除: copyWithFlash 的 flash class 在每个 sync 点复位
-      // (badge 的 restore 是本函数, 不清则反转色永久滞留 — M-A).
-      badge.classList.remove('copied');
-      if (cu === null) {
-        badge.hidden = true;
-        return;
-      }
-      badge.hidden = false;
-      badge.textContent = cu === '' ? '✓ included' : `+${cu}`;
-    }
-
-    // base_url 编辑作废暂存的 common_uri (探测结果只对被探测的那个 URL 成立).
-    document.getElementById('p-base-url').addEventListener('input', () => {
-      state.probeCommonUri = null;
-      syncCommonUriBadge();
-    });
+    // common_uri}. 手动触发, 建议非命令: recommended 只用于设置**该行**的 protocol
+    // select (用户仍可手改, 词表 = GET /api/providers 的 webui_protocols 数组,
+    // 透传族动态 append), 绝不自动保存. common_uri 经 `row.dataset.commonUri` 暂存
+    // (badge 回显), 随保存 payload 落盘 — detect → 填表 → 保存 是一条知识链.
+    // 探测结果 DOM 派生内容全部留在该行的 .ep-probe-result 内 (不进 state, 同表单
+    // 其余字段惯例); 模型预览深度 = 浏览 + 点击复制 (MVP). api_key 是条目级共享
+    // 凭证 (D3), probe 输入取表单当前值.
 
     // 复制 + 瞬时反馈 (badge 与 probe-chip 共用骨架): 文案切 "✓ copied" 900ms 后
-    // 由 restore 重建 (badge 复用 syncCommonUriBadge; chip 恢复原文本). 重复点击
-    // 重置定时器不叠加. localhost 是 secure context, clipboard API 可用; 失败
-    // fallback 提示 (同 copyRevealedApiKey 惯例).
+    // 由 restore 重建 (badge 复用 syncEndpointCommonUriBadge; chip 恢复原文本).
+    // 重复点击重置定时器不叠加. localhost 是 secure context, clipboard API 可用;
+    // 失败 fallback 提示 (同 copyRevealedApiKey 惯例).
     function copyWithFlash(el, text, flashClass, restore) {
       navigator.clipboard.writeText(text).then(() => {
         el.textContent = '✓ copied';
@@ -5847,25 +5941,17 @@
       });
     }
 
-    // 徽标点击复制 base_url + common_uri 整体 (可观测性: 用户能拿到完整前缀形态).
-    // flashClass 'copied' 激活 #p-common-uri-badge.copied 反转色规则.
-    document.getElementById('p-common-uri-badge').addEventListener('click', () => {
-      const cu = state.probeCommonUri;
-      if (cu === null) return;
-      const whole = document.getElementById('p-base-url').value.trim() + cu;
-      copyWithFlash(document.getElementById('p-common-uri-badge'), whole, 'copied', syncCommonUriBadge);
-    });
-
-    async function runProviderProbe() {
-      const resultEl = document.getElementById('p-probe-result');
-      const baseUrl = document.getElementById('p-base-url').value.trim();
+    async function runEndpointProbe(row) {
+      const resultEl = row.querySelector('.ep-probe-result');
+      const baseUrl = row.querySelector('.ep-base-url').value.trim();
       if (!baseUrl) {
         resultEl.innerHTML = '<div class="probe-line">Enter a base URL first</div>';
         return;
       }
-      const btn = document.getElementById('p-detect');
+      const btn = row.querySelector('.ep-detect');
       // 代数捕获 (probeEpoch): 落地前对账, 世界已换 (dialog 重开) 则丢弃旧结果 —
       // 含 finally 的按钮恢复 (防旧 finally 解除新世界 in-flight 按钮的禁用).
+      // 行级对账: 行已被删除 (isConnected) 同样丢弃.
       const epoch = state.probeEpoch;
       const apiKey = document.getElementById('p-api-key').value;
       // 编辑态 key 留空: probe 按表单当前值发 (masked 旧值不可逆, 不复用存量 key),
@@ -5881,15 +5967,16 @@
       btn.disabled = true;
       btn.textContent = 'Detecting…';
       resultEl.innerHTML = '';
-      // 发起时捕获 baseUrl — 落地对账除 epoch 外再对账它: 在途期间用户改了
+      // 发起时捕获 baseUrl — 落地对账除 epoch 外再对账它: 在途期间用户改了该行
       // base_url (input listener 已作废暂存) 时, 旧响应的 common_uri 不得写入
       // (否则 A 的布局断言随 B 落盘 — M1 竞态). renderProbeResult 维持既有
-      // 宽松语义 (展示层建议, 同 setProtocolSelectValue 的在途改写先例).
+      // 宽松语义 (展示层建议, 同 setEndpointProtocolValue 的在途改写先例).
       const probedBaseUrl = baseUrl;
-      // 双条件落地判定: 世界没换 && 被探测的 URL 仍是当前表单值.
+      // 三条件落地判定: 世界没换 && 行还在 && 被探测的 URL 仍是该行当前值.
       const landed = () =>
         epoch === state.probeEpoch
-        && document.getElementById('p-base-url').value.trim() === probedBaseUrl;
+        && row.isConnected
+        && row.querySelector('.ep-base-url').value.trim() === probedBaseUrl;
       try {
         const r = await fetch(`${API_PROVIDERS}/probe`, {
           method: 'POST',
@@ -5899,29 +5986,28 @@
         if (!r.ok) {
           const fallback = 'HTTP ' + r.status;
           const err = await r.json().catch(() => ({ error: fallback }));
-          if (epoch === state.probeEpoch) renderProbeError(err.error || fallback);
+          if (landed()) renderProbeError(err.error || fallback, resultEl);
           return;
         }
         const data = await r.json();
-        if (epoch === state.probeEpoch) {
-          renderProbeResult(data);
-          // detect 知识暂存 (L1/M1): 有值 = 布局断言覆盖暂存 (随保存落盘);
-          // null (gemini/ollama 推荐 / 全失败) = **没探出事实** → 保留暂存现状
-          // (存量值或 null), 不抹知识. 双条件: base_url 在途被改 (input listener
-          // 已作废暂存) 则旧响应知识不落地 (防 A 的断言随 B 落盘).
-          if (landed() && data.common_uri != null) {
-            state.probeCommonUri = data.common_uri;
-          }
-          syncCommonUriBadge();
+        // 落地门控统一用 landed() (三条件对账): 展示 (renderProbeResult 会改写该行
+        // select) 与暂存 (common_uri) 共用同一对账谓词 — 世界已换 / 行已删 /
+        // base_url 已改 的在途旧响应一概不落地 (展示层宽松语义见 renderProbeResult
+        // 注释, 同 setEndpointProtocolValue 的在途改写先例).
+        if (landed()) {
+          renderProbeResult(data, row);
+          syncEndpointCommonUriBadge(row);
           if (keylessHint) {
             resultEl.insertAdjacentHTML('beforeend',
               '<div class="hint">Probed without an API key — the saved key is not reused; auth_failed may just mean the probe carried no key.</div>');
           }
         }
       } catch (e) {
-        if (epoch === state.probeEpoch) renderProbeError(e.message);
+        if (landed()) renderProbeError(e.message, resultEl);
       } finally {
-        if (epoch === state.probeEpoch) {
+        // 按钮恢复: 行被删除 (isConnected false) 时无需恢复; 世界已换 (epoch 不匹)
+        // 时该行属于旧世界, 旧 finally 不得解除新世界按钮的禁用.
+        if (epoch === state.probeEpoch && row.isConnected) {
           btn.disabled = false;
           btn.textContent = 'Detect';
         }
@@ -5929,18 +6015,23 @@
     }
 
     // 网络失败 / 非 200 → 结果区单行错误 (不弹窗打断表单填写).
-    function renderProbeError(msg) {
-      document.getElementById('p-probe-result').innerHTML =
+    function renderProbeError(msg, resultEl) {
+      resultEl.innerHTML =
         `<div class="probe-line probe-line-err">${escapeHtml(`Probe failed: ${msg}`)}</div>`;
     }
 
-    // 渲染探测结果. 三段式 (顺序固定): 状态行 (recommended 有无二选一) / note hint /
-    // 模型 chips (有可展示 models 才出现). 契约: probes[].status ok=有 models,
-    // 其余 (auth_failed/absent/error) detail 有值; recommended null = 无 ok 命中;
-    // probes[].urls = 该族实际 GET 的完整 URL (不黑盒 — 全 404 时用户可对照 URL
-    // 自行调整 base_url); common_uri = recommended 族的布局知识 (badge 暂存).
-    function renderProbeResult(data) {
+    // 渲染探测结果 (落点均 per 行: 结果区 / recommended 改写该行 select /
+    // common_uri 暂存该行 dataset). 三段式 (顺序固定): 状态行 (recommended 有无
+    // 二选一) / note hint / 模型 chips (有可展示 models 才出现). 契约: probes[]
+    // .status ok=有 models, 其余 (auth_failed/absent/error) detail 有值;
+    // recommended null = 无 ok 命中; probes[].urls = 该族实际 GET 的完整 URL
+    // (不黑盒 — 全 404 时用户可对照 URL 自行调整 base_url); common_uri =
+    // recommended 族的布局知识 (detect 知识暂存 L1/M1: null = 没探出事实 → 保留
+    // 该行暂存现状不抹知识, 有值 = 覆盖, 随保存落盘). 在途响应的落地对账
+    // (epoch / 行存活 / base_url 未变) 由调用方的 landed() 门控.
+    function renderProbeResult(data, row) {
       const probes = data.probes || [];
+      const resultEl = row.querySelector('.ep-probe-result');
       const parts = [];
       // URL 回显子行 (不黑盒): 两分支共用.
       const pushUrls = pr => {
@@ -5951,7 +6042,7 @@
       if (data.recommended) {
         // recommended 可能是透传族 (gemini/ollama, probe 对这两族也有探测端点) —
         // append "(experimental)" 选项后选中 (仍属建议非命令, 用户可手改).
-        setProtocolSelectValue(data.recommended);
+        setEndpointProtocolValue(row, data.recommended);
         parts.push(`<div class="probe-line probe-line-ok">Detected: <code>${escapeHtml(data.recommended)}</code></div>`);
         // 胜出族的探测 URL 回显 (确认 detect 结果时, 用户能看到命中了哪条路).
         pushUrls(probes.find(pr => pr.protocol === data.recommended && pr.status === 'ok'));
@@ -5974,13 +6065,9 @@
         : probes.find(pr => pr.status === 'ok');
       const models = source?.status === 'ok' ? (source.models || []) : [];
       if (models.length) parts.push(modelsBlock(models));
-      document.getElementById('p-probe-result').innerHTML = parts.join('');
+      resultEl.innerHTML = parts.join('');
+      if (data.common_uri != null) row.dataset.commonUri = data.common_uri;
     }
-
-    document.getElementById('p-detect').addEventListener('click', runProviderProbe);
-    // 模型 chip 点击复制 (事件委托: chips 是动态子元素, 同 #p-routes-list 模式;
-    // 复制 + 瞬时反馈骨架经 copyWithFlash 共用, handler 与 endpoints 弹窗共享).
-    document.getElementById('p-probe-result').addEventListener('click', chipCopyHandler);
 
     /// 编辑 static-only id 时, 提示 "此次会创建 dynamic override".
     function toggleOverrideBanner(dlg, existing) {
@@ -6040,12 +6127,14 @@
     }));
 
     bindFormSubmit('provider', 'provider-form-el', () => {
-      // #190/#179/#187: 按构造分野 payload — 表单 kind 选择器是唯一事实来源.
+      // #190/#179/#187 + multi-endpoint: 按构造分野 payload — 表单 kind 选择器是
+      // 唯一事实来源.
       // - Router: routes 全量发 (≥1 条, 每行 model_pattern/target 前端必填拦截);
-      //   protocol/base_url/api_key 不发 (构造上不存在, 残留发送也会被后端忽略).
+      //   endpoints/api_key 不发 (构造上不存在, 残留发送也会被后端忽略).
       // - Pool: members 全量发 (≥1 条, 每行选过 provider); exhaust/cooldown 仅在
       //   高级区改动过才发 (dirty 追踪 — 未改动 → 后端取默认/回填旧值).
-      // - Direct: protocol + base_url (+api_key).
+      // - Direct: endpoints 全量发 (≥1 条, 每行 protocol/base_url 必填 + 同协议
+      //   唯一前置拦截) + api_key (条目级共享凭证, D3).
       // 构造切换的**显式取消** (后端 PUT 省略 = 回填旧值的配对语义): 编辑对象是
       // router 而表单构造不是 → 发 routes: []; 编辑对象是 pool 而表单构造不是 →
       // 发 members: [] (空数组 = 后端定义的 "显式退出该构造" wire 语义).
@@ -6107,23 +6196,18 @@
         }
         return cancelSwitchedConstruct(payload);
       }
-      const baseUrl = document.getElementById('p-base-url').value.trim();
-      if (!baseUrl) {
-        alert('Base URL is required for a direct provider.');
-        return null;
-      }
+      const eps = collectEndpointsFromForm();
+      if (eps == null) return null;
       const apiKeyInput = document.getElementById('p-api-key').value;
       const payload = {
         id,
         name,
-        protocol: document.getElementById('p-protocol').value,
-        base_url: baseUrl,
+        // endpoints 全量必填 (multi-endpoint wire): 数组序 = fallback 序; "保留"
+        // 由编辑回填 effective 后全量提交实现, 无 #157 null 歧义.
+        endpoints: eps,
         enabled,
         // api_key 三态: Direct 编辑留空 = 保留 (null) / 其余发值.
         api_key: (editId && apiKeyInput === '') ? null : apiKeyInput,
-        // common_uri (detect 知识, 全量语义): null = 未探测 (fetch 现场推导);
-        // '/v1'|'' = 布局断言. base_url 编辑过则已被作废为 null.
-        common_uri: state.probeCommonUri,
       };
       return cancelSwitchedConstruct(payload);
     });
