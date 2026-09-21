@@ -1,0 +1,72 @@
+# 已知限制 (完整清单 SSOT)
+
+> 职责边界: 本文件是 secret-guard 限制项的**完整 SSOT** (面向维护者). README 不再维护负面清单,
+> 以 "协议支持矩阵 (正面) + Roadmap & 贡献 (机会框架)" 呈现同一事实 (`Protocol::codec_covered()`
+> 是代码侧谓词 SSOT). WebUI 新建 provider 表单的协议词表只引导 codec 覆盖族 (`webui_protocols`,
+> gemini/ollama 后端能力保留 — 存量编辑/探测推荐经前端 append "(experimental)" 选项).
+> 新增条目时同步评估: README 矩阵 / Roadmap 与 probe note (`PROBE_NOTE_*`) 是否需要联动.
+>
+> 维护约定: 条目按领域小节归位 (小节名见各 `##`, 字母序); 节内条目单行书写, 追加至末尾.
+> 根 `AGENTS.md` "已知限制 (MVP)" 段是指向本文件的冻结锚点 — src 代码注释 / tests 中的
+> "根 AGENTS.md '已知限制' 条目" 引用链经它到达这里.
+
+## auth (认证与会话)
+
+- **session cookie Secure flag 需手动配置 (`secure_cookie`, 无自动推断)**: HTTPS 反代部署需手动设 `[auth] secure_cookie = true` (NixOS 结构化选项 `services.secret-guard.auth.secureCookie`, 2026-09-16 已暴露 — 此前须 configFile escape hatch). 残余缺口: 无 `X-Forwarded-Proto` 动态推断 (见 `docs/deployment-nixos.md` "HTTPS 反向代理" 段). 忘设的缓解 = 反代 HTTP→HTTPS 301 重定向.
+- **auth 模块测试覆盖率 (OIDC 登录流程)**: auth 模块纯逻辑 (apikey / middleware / session / mod) 高覆盖, 含 require_api_key 的 Authorization 剥离断言 (SEC 红线) 与 build_session_layer 的 cookie 配置 (sg.sid + HttpOnly). OIDC 集成测试 (`tests/auth_oidc.rs`) 已通过本地 mock IdP server 覆盖 (起 axum server 模拟 discovery + token + jwks + RS256 签 id_token, 支持密钥轮换与 discovery 故障注入). `oidc.rs`: `OidcBackend::discover` (含 issuer 字符串校验 / JWKS 拉取) / `exchange_and_verify` happy + 5 个错误路径 (CSRF mismatch / token HTTP 4xx / NoIdToken / WrongSignature / WrongNonce) / `authorize_url` PKCE verifier round-trip / **JWKS 轮换恢复** (SEC-AUTH-3, #198: 轮换后无需重启登录成功 + 刷新失败返回原始错误且 IdP 恢复后自愈; 重验仍失败不放行坏签名由 WrongSignature 兼守). `handlers.rs`: `login_start` (重定向 + session 写入 + sanitize_next_url) / `oauth_callback` 错误路径 (IdP error 参数 / 缺 session 凭证 / PKCE 验证失败) / `logout` / `me` / **`oauth_callback` happy path 完整端到端 round-trip** (mock IdP `/authorize` 记录 nonce + code_challenge, code-绑定 `/token` 真实执行 PKCE S256 比对并用 stored nonce 签发 id_token; 测试经 sg.sid cookie 驱动 login → authorize → callback → /api/me 全链, PKCE 负对照 `oauth_callback_rejects_pkce_verification_failure` 守卫比对非摆设). (精确百分比是 `just coverage-html` 实时产物的职责, 此处不维护快照数字.)
+
+## codec (协议翻译与支持边界)
+
+- **协议支持范围未经真实上游实地测试** (2026-09 用户决策, 开源诚实边界): Gemini / Ollama (仅透传, 无 codec) 与 Anthropic 协议及其参与的跨协议翻译, 测试覆盖全部基于 mockito 模拟上游; 真实 Provider 上的实地验证尚未进行。README "协议支持" 与文档站已对用户声明此边界。后续实地验证时按协议逐族补集成测试 + 更新声明。
+- **reasoning_content (思考原文) 跨协议丢弃** (#176, 契约 STR-6): OpenAI 兼容 provider 的思考原文 (`delta.reasoning_content` 流式 / `message.reasoning_content` 非流式 / assistant 历史回传) 已建模为 `IrBlock::ReasoningContent`, 同协议路径 (含 Redact) 三路径 reader↔writer 对称 + 流式 restore 覆盖. **跨协议翻译时丢弃 (有 WARN)** — Anthropic thinking block 需要 signature (无法合法合成), Responses reasoning item 依赖 `encrypted_content` (rationale 见 `src/codec/AGENTS.md` 支持矩阵注记). 丢弃时 `cross_proto_forward` 按 block 计数打 WARN (请求侧历史 / 响应侧各一条, 只记计数不记内容, 见 `proxy/cross_proto.rs::count_reasoning_blocks` 的假设声明). 边界: 请求侧 assistant 历史的显式空串/null 由 `reasoning_content_form` wire 元数据保真; **响应侧** `IrResponse` 无对应元数据 — 上游非流式响应显式返回 `"reasoning_content": ""` 时, redact 路径 round-trip 后该字段会变为缺席 (信息无损失, 形态有差异). 多端点 fallback (ingress 无精确匹配端点 → 首端点跨协议翻译) 场景同受此限.
+- **OpenAI Responses API 支持范围**: Responses 协议 (`/r/` proto_short) 已接入 codec, 支持 Responses ⇄ Chat Completions / Anthropic 跨协议翻译 (非流式, 经通用 IR 路径, 双向各有集成测试锁定) + Responses 同协议透传 + Redact (非流式). **不支持**: Responses 流式 SSE 事件翻译 (Responses + **Redact 命中** (map 非空) + `stream=true` 返回 501, 防止 mock 静默外流; 仅路由 model 重写 (map 空, 响应无需 restore) 时流式放行 SSE 字节透传 — #183 D5 收窄, `resp_parsed` 因事件未解码降级 None, 前端占位; 跨协议 Responses 任一侧 + `stream=true` 同样 501 — 含 Responses⇄Anthropic pair); hosted tools (web_search/file_search/computer_use/mcp → reader 读取时丢弃并有 WARN (`dropping tool definition(s) not representable in IR`, responses reader 丢弃点 — 同协议 IR 重建路径同样丢弃, 仅纯字节透传不受影响; hosted tools 不进 IR 也不进 extra, tools 是 collect_extra 的 modeled 排除键); MCP 在客户端 LLM 请求中的呈现形态与协议约束边界调研见 `docs/research/mcp-notes.md`); namespace tools flattening; `previous_response_id` 服务端状态 (secret-guard 是 stateless 代理); reasoning items 的 `encrypted_content` (同协议 round-trip 也会丢失, 会破坏 reasoning chain). 多端点 fallback (ingress 无精确匹配端点 → 首端点跨协议翻译) 场景同受上述跨协议限制.
+- **Responses 协议的 timeline delta 为空**: Responses ingress 的 `req_body_raw` 用 `input[]` (而非 `messages[]`), `extract_delta_messages_from_raw` 找不到 messages 字段, 返回空 Vec. WebUI timeline 仍能显示 preview / role, 但不渲染增量气泡 (与跨协议 ingress 的 delta 限制一致).
+
+## config (配置模型)
+
+- static config 的 `[server]` (含 `upstream_*_timeout_secs`) / `[redact]` / `[auth]` 段仅在启动时读取一次, WebUI 改不生效 (restart 才生效; rationale = 转发核心路径零运行时配置开销, 见根 AGENTS.md 配置模型注记).
+- **static 基线下 PUT 空串 api_key 无法清空 key (#157 已知限制)**: dynamic override 的 `api_key` 落盘形态无法区分 "未记录" (PUT null → 空串, effective 继承 static) 与 "显式清空" (PUT `""` → 空串) — 两种空都会被 `inherit_from_static` 继承 static 旧 key. 停用 provider 请用 `PATCH .../decision {"mode":"disabled"}`. WebUI 编辑留空发 null (保留语义), 仅 SDK 显式发空串可见. 根治需 schema 演进 (请求字段 Option 化或 sentinel 值), 属后续工作.
+- **dynamic-only 条目 Direct ↔ Router/Pool 构造切换往返丢 api_key (#187 已知限制)**: sum type 下 Router/Pool 构造无处存放鉴权字段, 切回 Direct 时无恢复来源 (static 基线条目不受影响 — `inherit_from_static` Direct↔Direct 从 static 复原; Direct↔Pool 与 Direct↔Router 同型)。失败是静默的 (空 key 出站 → 上游 401 才暴露), WebUI 表单 placeholder 变化 ("(optional)" 而非 "unchanged") 是唯一提示。根治需虚拟构造携带被遮蔽的 Direct 字段 (违背 sum type 简洁性) 或 WebUI 本地暂存, 均不划算。
+
+## dag (内容寻址存储)
+
+- **DAG 孤儿节点降级**: parent 被 LRU 淘汰后, child 的 `full_request_messages` 返回 None (timeline 降级展示, 不 panic). 显式孤儿标记 `NodeView::is_orphan` 已实现 (CDAG-7, 读时纯派生: parent 有值但在 nodes 缺席); wire DTO (ForwardRecord / TimelineRound) 传播与前端徽章利用留后续 — 打通前该字段仅在 NodeView 层可见.
+
+## deploy (部署与安全面)
+
+- **未声明域名 Host 一律 403 (SEC-7 Host guard)**: server 层对所有路由做 Host 白名单校验 (防 DNS rebinding, 语义见根 AGENTS.md "Host / Origin 校验" 段), 未声明的域名 Host 拒绝。经反向代理以域名 (如 `sg.example.com`) 暴露 secret-guard 的部署, 需在 `[server] allowed_domains` 声明该域名 (反代保留原始 Host, 见 `docs/deployment-nixos.md` "HTTPS 反向代理" 段的推荐配置), 或直接用 IP / localhost 访问。声明域名端口宽松 (按名字精确匹配)。
+- **敏感落盘文件收紧为 0600 (SEC-8)**: state.toml / usage.sqlite3 (含 `-wal`/`-shm` 侧车, writer 线程每批落库后收紧) / pricing.json 在 unix 下创建即 owner-only, 启动加载时对旧版本残留文件 best-effort chmod 收紧 (helper `src/util.rs::tighten_file_permissions`, 设备文件与更严形态 (0400 等) 跳过)。依赖 group/other 读这些文件的部署 (如共享目录跑第三方读取器) 会受影响。
+
+## derive (派生与 WebUI 数据)
+
+- **跨协议 ingress 的 timeline delta 切片可能错位**: OpenAI writer 会把 Anthropic 风格的混合 Text+ToolResult user 消息拆成 (1+N) 条 wire messages, 导致 `req_body_raw` 的 messages 数 > IR messages 数. `extract_delta_messages_from_raw` 切片时跨协议路径的 start 偏小, delta 可能包含前序轮消息. 同协议路径不受影响. 多端点 fallback (ingress 无精确匹配端点 → 首端点跨协议翻译) 场景同受此限. 详见 `src/web/AGENTS.md`.
+
+## pool (套餐池)
+
+- **pool 成员 missing/disabled 在解析时跳过, 无持久标记**: resolve_route 对 missing/disabled 候选**跳过但不写状态机** (配置可用性不进耗尽闹钟 — GET /models 的可解析性探针复用同一解析路径, 无持久副作用); 成员重新启用/补建后下一次解析即自动回归列表头, 无需 reset / 重启。
+- **pool 耗尽检测不覆盖流式 2xx 的 mid-stream SSE 错误事件**: 检测挂在 "上游错误响应 (4xx/5xx, body 已缓冲)" 的位置, `PoolWatch` 对 2xx 直接短路 — 假设: 智谱/Claude 撞窗在 HTTP 层拒绝 (429 + 错误信封), 不在 SSE 流中 (假设声明见 `pool.rs::detect_and_mark`)。若某上游改为在 2xx SSE 流内报告窗口耗尽, 该信号不可见 (成员不会被标记, 不切换)。
+- **pool 内置默认信号表是发布时点快照**: 常量 `DEFAULT_WINDOW_EXHAUST_CODES/HEADERS` 编译进二进制 (智谱 1308/1310 + Claude unified headers), 各家可能新增/变更窗口限额错误码 — 网关不感知, 表现为该信号下不切换成员。用户可经 `[providers.exhaust]` 自行补码 (字段级替换语义, opt-in 姿势清单见 `docs/configuration.md`)。
+
+## redact (Redact / Mock / 脱敏面)
+
+- **Mock probing 耗尽 (默认 fail-closed 拒绝转发, SEC-10)**: 弱配置 (charset/length 仅产生极少候选) + 对抗性 IR 可能让 `redact_ir` 的 mock probing 耗尽 (`MOCK_PROBE_LIMIT`). 两道前置防线: ① **Auto widen 兜底** (2026-09, `GenSpec::infer_default_for`): 推断 charset 候选空间 < 2^20 时逐级并入 lowercase → digits → uppercase — Auto 模式 resolve 后空间恒 ≥ 阈值 (退化 real 如全同字符 `""""` 也不再耗尽); 极短 real (n ≤ 3: 全开后 65³ ≈ 27 万仍 < 2^20) 是等长约束下的物理边界, 兜到全开即停 — 该形态 Auto resolve 后仍会触发 lint WARN; ② 配置写入时 (static 加载 / WebUI upsert) 对 GenSpec 候选空间做 lint WARN (`MockStrategy::lint_candidate_space`, 阈值 `MIN_CANDIDATE_SPACE_WARN` = 2^20, 低于即 WARN, 不拒绝) — widen 后 Auto 场景实际不触发, lint 的有效对象是**用户手动配置**的 gen_spec. 默认 `[redact] on_probe_exhausted = "fail_closed"` (**拒绝转发**, 返回 503, 防止 secret 泄露到 LLM provider, SEC-10 降级偏安全 — 2026-09 自 fail_open 翻转; 配置期 lint 已把弱配置拦截在写入时, 运行时残余正是对抗场景). 历史 fail-open 行为 (warn + 跳过该 secret 原样转发) 需显式配 `"fail_open"` opt-in. 注意 fail_closed 拒绝时返回的 503 body 不含 secret 明文 (变量部分只含 secret id + reason 枚举, 语义由 SEC-2 契约锁定).
+- **显式 `fail_open` opt-in 的 WebUI 回显边界 (2026-09-15 走查明确)**: 被跳过的 secret 随请求原样转发, 该轮 record 的 `req_body_raw` 与派生 `preview` 含**未脱敏的真实 secret**, 经读端点族 (`GET /api/records/{id}` / `GET /api/sessions` timeline / `POST /api/sync`) 回显到 WebUI. 其中 GET 端点族与 SEC-1 契约 ("任意 GET 响应不含真实 secret", 其扫描测试只覆盖 redact 成功路径) 直接冲突; `POST /api/sync` 是读语义端点, 泄漏事实同源. **SEC-10 默认翻转后该边界仅影响显式 opt-in `fail_open` 的部署** (默认配置下 probing 耗尽走 503 拒绝, record 不含未脱敏 secret — 冲突面在默认配置下消失); 默认 Auto 模式下 probing 耗尽概率本身天文级小 (C5 重试链). 安全敏感部署应保持默认 `fail_closed`. SEC-1 契约例外条款是否为显式 opt-in 路径正式登记 (含陈述范围是否从 GET 扩到读端点族), 留待人工裁决 (contracts.md §0.5 流程; 默认已安全, 优先级低).
+- **C5 是实质确定性契约**: Auto 模式 mock 不含 real_secret 的 ≥`k(L)` 字符连续子串, 阈值 `k(L)` 随 secret 长度自适应 (短 secret 强保护, 长 secret 弱保护), 内部重试链使契约在 Auto 模式下实质等价于确定性 (失败概率天文级小). 完整数学定义 (`k(L)` 公式 / 信息泄露率上界 / 重试链 safety bound) 的 SSOT 在 `src/mock.rs` 头部 "C5" 段落 (= contracts.md **RED-5**), 此处不重述数字. `proptest-regressions/redact.txt` 记录历史失败种子.
+- **同协议 + Redact: normalize_json 相等, 非 byte-exact**: reader → redact_ir → writer 重序列化, 字段顺序 / 空白等无语义差异由 `normalize_json` 吸收, 语义信息通过 wire 形态元数据保留 (见 `src/codec/AGENTS.md` "wire fidelity"). 已知搁置: 多 system messages 合并 / message-level extra / block-level 未知 part / response 侧 usage 字段位置 (详见 codec/AGENTS.md). 同协议 + 无 Redact 路径仍 byte-exact.
+- **流式 + Redact + 非 2xx 上游错误**: SSE 错误流不是单个 JSON, parse 失败时 fallback 按 `[redact] on_fallback_restore` 分流 (SEC-10): 默认 withhold 保留 Mock 透传 (real 不还原 — 失败响应体高概率进客户端日志); 显式 `"restore"` opt-in 时先尝试 JSON 叶子级 restore 兜底 (RED-8, body 仍是单个 JSON error envelope 时可还原 mock), 仅当兜底也失败 (如 SSE-shaped 多帧 body) 才原样返回. 两形态都打 WARN (`mock not restored; client will see mock values`, #158 — WARN detail 的 opt-in 提示只在 reader-拒绝 + 单 JSON 臂出现 (restore 唯一有意义的地方); 非 JSON 臂 (含本条目的 SSE 多帧场景) 无提示, restore 本就无意义).
+- **流式 + Redact + 上游 Content-Type 非 text/event-stream**: 判型跳过流式 restore, 落入 buffered fallback. 该 fallback 同按 `on_fallback_restore` 分流 (SEC-10): 默认 withhold 保留 Mock 透传; 显式 `"restore"` 时 body 是单个 JSON Value 的 mock 可被还原 (RED-8), 仅当兜底也失败 (如 SSE-shaped 多帧 body, #158 发现的第三条逃逸路径) 才透传 (客户端看到 mock). 兜底失败时有两层 WARN: 判型处 (`non-SSE content-type for a stream=true request`) + parse 失败 fallback (`mock not restored`). 后续效应: 客户端把 mock 回传进下一轮历史时, 触发 RED-3 例外场景 (mock 跨轮变化, 见 contracts.md RED-3 例外裁决 / #143).
+- **同协议 + Redact + 非流式 2xx + 上游响应 parse 失败**: 上游返回的 body 不是合法 JSON 或 codec reader 无法 parse 时 (类型不符 / 空数组 / 越界), 转发路径 fallback 为透传含 mock 的字节, 无 restore, 客户端收到 mock. 同协议路径见 `src/proxy/fan_out.rs` (non-stream 分支), 跨协议路径见 `src/proxy/cross_proto.rs`. 均走 best-effort 鲁棒性原则 (ROB-*), parse 失败不 panic. **JSON 叶子级 restore 兜底 (RED-8, opt-in)**: 默认 `on_fallback_restore = "withhold"` (SEC-10) — reader-拒绝但 body 仍是单个合法 JSON 的分支**保留 Mock 透传** (real 不还原 + `mock not restored` WARN 含 opt-in 提示); 显式配 `"restore"` 时两路径的 fallback 分支才会先尝试 `redact::restore_json_leaves_fallback` (在字符串值叶子上还原 mock + `mocks restored via JSON leaf fallback` WARN), 且仅当兜底也失败 (非 JSON / SSE-shaped 多帧 / 无命中) 才透传 + `mock not restored` WARN (同协议 #158; 跨协议已对称补齐, 含此前静默的非 JSON 分支). 非 JSON 分支不受开关影响 (restore 本就无意义).
+- **redact_headers 名单 = 硬编码黑名单 ∪ `[redact] redacted_headers` (SEC-4)**: `proxy/helpers.rs::redact_headers` 的敏感 header 脱敏名单以硬编码黑名单为基础 (显式枚举主流 provider auth header + 含 "token" / "secret" 子串匹配, 完整名单以 `is_sensitive_header` 为 SSOT), 用户可用 `[redact] redacted_headers = [...]` 追加自定义 auth header (如 `x-my-service-key`) — 条目启动时归一化 (trim + lowercase, 空串跳过) 后按 lowercase header 名**精确匹配**, 并集生效; 默认空 = 行为不变。注意精确匹配非子串匹配 (`x-my-key` 不波及 `x-my-key-v2`)。
+- **Gemini/Ollama 同协议 + secrets: 无 codec 无法 Redact (默认 fail_closed 停损, SEC-10)**: codec 只覆盖 OpenAI/Anthropic/Responses; gemini/ollama provider 上配置了 secrets 时, 默认 `[redact] on_unsupported_protocol = "fail_closed"` (**拒绝转发** — 返回 503, message 只含协议名 + provider id + 出路提示, SEC-2 同型, 上游零请求; 2026-09 自 fail_open 翻转, SEC-10 降级偏安全). 历史 WARN + 降级字节透传行为 (secret 原样出站, 静默降级放行) 需显式配 `"fail_open"` opt-in. 仅 model 重写降级 (无 secret) 不受开关影响, 两模式都维持 WARN 透传.
+
+## routing (路由与转发)
+
+- **provider 端点协议与上游实际协议错配 → 静默空响应 (有 WARN)**: provider 端点 protocol=anthropic 但上游实为 OpenAI shape 时, 2xx 响应被 reader 宽松解析为空 content + 全零 usage (reader 对缺字段 `unwrap_or_default` 降级, 不报错). 行为不变 (仍翻译返回), 但打 WARN (`parsed to empty content and zero usage; does the upstream actually speak ...`, #162) — 配置错误可从日志发现. 后续效应同上 (RED-3 例外场景).
+- **router /models 合并清单的上游数据最旧可 stale 300s (#196, FWD-7)**: 上游清单缓存 TTL = 300s 常量 (不进配置), TTL 内上游新增/下线的模型不会反映在 router /models 响应中; 刷新失败时继续 serve 旧数据 (serve-stale-on-error), 且失败后 30s 退避窗口内不重试 (期间查询立即返回, 不被 dead upstream 逐查询阻塞)。exact-only router 不 fetch (只返回别名, N6 gate)。缓存按 (provider id, 选定端点 egress 协议) 键控: WebUI 修改 provider 的端点 protocol 后新键通常即时 miss 触发新 fetch (例外: 删除某协议端点后在 ≤300s 内以不同 base_url 加回同协议端点, 新键命中旧 fresh 条目, 属下述 TTL 收敛同一类别); 仅修改 base_url 时键不变, 最长 300s 内继续 serve 旧上游的清单 (TTL 到期自然收敛)。
+- **路由 model 重写生效时放弃 byte-exact (#183, FWD-1 修订; 规则级化 2026-08-25)**: 路由链命中了携带 `upstream_model` 的路由的请求, 其同协议无-secret 分支从字节直传降级为 IR 改写路径 (normalize 等价; 上游前缀缓存失效 — 用户主动选择的降级, 契约层面已由 FWD-1 修订授权, §99 登记). Gemini/Ollama + 重写无法改写: WARN + 原样透传 (body 不变).
+- **路由 provider 跨条目环的残余缺口仅剩启动后 TOCTOU 窗口 (#179)**: 自环在 `Provider::validate` (static 加载 fail-fast) 拒绝; 跨条目环的拦截点: WebUI upsert (`would_cycle`, 边集 = 启用路由的 target) / 运行时 (`resolve_route` visited-set, 503) / **启动诊断** (`ProviderTable::find_cycles`, `serve()` 对 merged 视图整体做环检查, 每个检测到的环一条 WARN 含环路径; 存在性完备 — 有环必有 WARN — 但不枚举全部简单环, 修复已报告环后重启暴露残余环 — 手改 state.toml 漏网的环在启动日志即暴露, 不必等首个请求 503; 不阻塞启动, 环只影响该 provider 的请求, state.toml 永远可删除重置, fail-fast 会把可恢复状态变成启动死锁). 残余缺口: 并发 upsert 的 TOCTOU (环检查与落库非同一临界区) — 启动后动态产生的环 (启动检查天然覆盖不到) 只有运行时 503 兜底 — 单用户本地工具的可接受假设, 与 #157 的 update TOCTOU 声明同型. pool 侧同型声明: dispatch 构造 `PoolWatch` 时对 pool 条目的二次 `get_effective` 与并发 pick/mark 交错的 TOCTOU 由 `PoolStates` 按位置对齐自愈 (stale 标记暂态, 下次耗尽信号纠正 — 见 `src/pool.rs` PoolStates 并发声明确认).
+
+## usage (用量统计)
+
+- **OpenAI 流式请求未开 `include_usage` 时无 token 统计** (usage-stats, USAGE-5): OpenAI 流式默认不回显 usage, 需客户端设 `stream_options.include_usage = true`; 网关不代为注入 (FWD-1 未授权). 此类请求在 Usage 页只计请求数 (`requests_without_usage` / `cost_coverage` 指标可见), 页面有提示文案. Gemini / Ollama (无 codec) 同样无 usage 回显提取 (P2 浅提取). 详见 `docs/design/usage-stats.md` §5.4.
+- **usage 成本恒为估算**: models.dev 价目表 ≠ 实际合同价; 未列 cache 价的模型按宽松近似回退 (cache_read → input 价, cache_write → 1.25×input); 历史成本按当前价目表实时重算 (会随价目表漂移, UI 明示). session 徽章 (Records tab) 是进程内口径, restart 归零; Usage tab 是持久账本 (SQLite) — 两套口径不同, 页脚说明.
