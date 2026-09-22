@@ -2547,7 +2547,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "secret-guard"
+name = "secret-guard-rs"
 version = "0.1.0"
 dependencies = [
  "anyhow",

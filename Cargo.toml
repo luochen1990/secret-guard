@@ -1,5 +1,10 @@
 [package]
-name = "secret-guard"
+# crates.io 发布名: `secret-guard` 已被第三方抢注 (owner bigdong89, 2026-09-09),
+# 定名 `secret-guard-rs` (2026-09-22 用户确认) — Rust 生态惯例后缀, 便于按 "secret
+# guard rust" 检索命中. 二进制名保持 `secret-guard` ([[bin]] name), nix 包名独立
+# (nix/pkgs/secret-guard.nix pname), 用户侧零感知差异:
+#   cargo install secret-guard-rs  →  $CARGO_HOME/bin/secret-guard
+name = "secret-guard-rs"
 version = "0.1.0"
 edition = "2024"
 # MSRV (issue #149-5): edition 2024 要求 rustc >= 1.85, 本项目按 devShell 实际工具链
@@ -8,9 +13,7 @@ edition = "2024"
 rust-version = "1.96"
 description = "A lightweight LLM gateway that prevents accidental secret leakage"
 license = "MIT"
-# crates.io 发布元数据 (2026-09 开源准备). 注: crates.io 名 `secret-guard` 已被第三方
-# 抢注 (owner bigdong89, 2026-09-09) — 若以本名发布需先协商转让; 备选 `secret-guard-rs`
-# (可用) + [[bin]] name 保持 "secret-guard" 二进制名不变. 发布名定夺见 issue #253.
+# crates.io 发布元数据 (2026-09 开源准备; 发布名定夺见文件头注释).
 repository = "https://github.com/luochen1990/secret-guard"
 homepage = "https://secret-guard.lambda.lc"
 # bin 型 crate 的 docs.rs 页面无意义, documentation 指向文档站 (crates.io 侧栏链接).
@@ -25,6 +28,12 @@ exclude = ["assets/*", "docs/*", "tests/webui/*", ".github/*", "nix/*"]
 [[bin]]
 name = "secret-guard"
 path = "src/main.rs"
+
+# lib target 名显式钉在 `secret_guard` (不带 _rs 后缀): package 更名 secret-guard-rs
+# 不改变 crate 内部路径 (`use secret_guard::...`) 与集成测试/文档引用 — 与 [[bin]]
+# name 同理, 发布名与代码标识符解耦, 单点声明.
+[lib]
+name = "secret_guard"
 
 [features]
 default = []
