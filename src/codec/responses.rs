@@ -31,8 +31,11 @@
 //! - namespace tools flattening (留作后续)
 //! - reasoning 的 `encrypted_content` (provider-specific opaque, 不可跨协议)
 //! - `previous_response_id` 服务端状态 (secret-guard 是 stateless 代理)
-//! - Responses 流式 SSE 翻译 (跨协议流式返回 501, 与现有跨协议流式一致;
-//!   同协议透传时由字节透传路径自然支持流式)
+//! - Responses 流式 SSE 的 **writer 侧** (`write_response_event`): 未实现 — 流式 +
+//!   Redact 命中 / 跨协议任一侧 Responses 仍 501 (流式事件翻译的映射表与状态机见
+//!   `read_responses_stream_event`). reader 侧 `read_response_events` 已实现,
+//!   流式 resp_parsed 经 StreamScan 自动生效; 同协议无 Redact 时由字节透传
+//!   路径自然支持流式
 //!
 //! # 同协议 round-trip (FWD-2)
 //!
@@ -42,11 +45,12 @@
 use serde_json::{Map, Value, json};
 
 use super::ir::{
-    IrBlock, IrImageSource, IrMessage, IrRequest, IrResponse, IrRole, blocks_has_text,
+    IrBlock, IrImageSource, IrMessage, IrRequest, IrResponse, IrRole, ResponsesDecodeState,
+    StreamItemState, blocks_has_text,
 };
 use super::{
-    IrError, IrStopReason, IrTool, IrToolChoice, IrUsage, Reader, Writer, blocks_to_text,
-    collect_extra, current_epoch, input_to_string, random_base62,
+    IrBlockMeta, IrDelta, IrError, IrStopReason, IrStreamEvent, IrTool, IrToolChoice, IrUsage,
+    Reader, Writer, blocks_to_text, collect_extra, current_epoch, input_to_string, random_base62,
 };
 
 // ─── Reader ────────────────────────────────────────────────────────────────
@@ -227,13 +231,11 @@ impl Reader for ResponsesReader {
 
     fn read_response_events(
         &self,
-        _event_type: &str,
-        _data: &Value,
-        _state: &mut super::ir::StreamDecodeState,
+        event_type: &str,
+        data: &Value,
+        state: &mut super::ir::StreamDecodeState,
     ) -> Vec<super::IrStreamEvent> {
-        // Responses 流式 SSE 事件翻译尚未实现 (MVP 范围外).
-        // 同协议透传路径不进入 codec, 流式自然工作; 跨协议流式返回 501.
-        Vec::new()
+        read_responses_stream_event(event_type, data, &mut state.responses)
     }
 }
 
@@ -741,6 +743,397 @@ fn read_output_item(item: &Value) -> Option<IrBlock> {
         // computer_call / file_search_call / web_search_call / image_generation_call / ... → 丢弃.
         _ => None,
     }
+}
+
+// ─── Helpers: read (streaming) ─────────────────────────────────────────────
+
+/// Responses 流式 SSE 事件 → IR 事件 (fan-out, 0..n), 实现规格 = Responses 流式
+/// 支持方案的 D2 映射表.
+///
+/// 核心映射决策 (rationale 见方案文档; 与非流式 `read_output_item` 的先例对称):
+/// - ir_index 全局递增, 按 BlockStart 发出顺序分配, 记录在 state (不可重算);
+/// - message item 的 BlockStart 延迟到 `content_part.added` (每 part 一个 IR Text
+///   block), BlockStop 在 `content_part.done` 对称配对; `output_item.done(message)`
+///   仅兜底关闭未关 part;
+/// - function_call / reasoning 的 BlockStart 在 `output_item.added` 即发, BlockStop
+///   在 `output_item.done`;
+/// - done 族事件 (output_text.done 等) 携带的全量内容不重放 (已由 delta 流入 IR),
+///   function_call 例外: 从未流式过 arguments 时用 done item 的全量兜底补发一条.
+///
+/// 输入假设: `event_type` 是 SSE 帧 `event:` 行的完整名 (`"response.output_text.delta"`
+/// 等), 是唯一的 dispatch 依据 — data JSON 里的冗余 `type` 字段不参与判定 (缺失或与
+/// event_type 不一致均不影响). Responses SSE 帧恒带 `event:` 行; event_type 为空
+/// (OpenAI 风格 bare data 帧) 或未知 → 忽略该事件 (ROB-1, 永不 panic).
+fn read_responses_stream_event(
+    event_type: &str,
+    data: &Value,
+    state: &mut ResponsesDecodeState,
+) -> Vec<IrStreamEvent> {
+    match event_type {
+        "response.created" => stream_message_start(data, state),
+        "response.output_item.added" => stream_item_added(data, state),
+        "response.content_part.added" => stream_part_added(data, state),
+        "response.content_part.done" => stream_part_done(data, state),
+        "response.output_text.delta" => stream_text_delta(data, state),
+        "response.function_call_arguments.delta" => stream_args_delta(data, state),
+        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+            stream_reasoning_delta(data, state)
+        }
+        "response.output_item.done" => stream_item_done(data, state),
+        "response.completed" => {
+            let stop = if state.saw_function_call {
+                IrStopReason::ToolUse
+            } else {
+                IrStopReason::EndTurn
+            };
+            stream_finished(data, stop)
+        }
+        "response.incomplete" => {
+            let resp = data.get("response").unwrap_or(data);
+            let stop = resp
+                .as_object()
+                .and_then(read_response_status)
+                .unwrap_or(IrStopReason::Other);
+            stream_finished(data, stop)
+        }
+        "response.failed" => vec![stream_failed(data)],
+        "error" => vec![stream_bare_error(data)],
+        // 其余全部忽略: 进度噪音 (queued/in_progress) / done 族 (内容已由 delta 流入
+        // IR, 含 output_text.done·content_part.done 的全量文本·arguments.done·
+        // reasoning 族 done / reasoning_summary_part.added|done) / refusal (无 IR
+        // 建模, 与非流式丢弃对称 — 见下方 refusal.delta 的 warn) / hosted tool 各自
+        // 的 delta 族 (item 已标 Dropped) / 未知事件.
+        "response.refusal.delta" => {
+            tracing::warn!(
+                count = 1,
+                "dropping stream refusal delta not representable in IR"
+            );
+            Vec::new()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// 分配下一个全局 IR block index (按 BlockStart 发出顺序递增, 持久记录不可重算).
+fn alloc_ir_index(state: &mut ResponsesDecodeState) -> usize {
+    let index = state.next_ir_index;
+    state.next_ir_index += 1;
+    index
+}
+
+/// 提取 message part 的 `(output_index, content_index)` 定位键; 缺任一 → None
+/// (该事件忽略, ROB-1).
+fn part_key(data: &Value) -> Option<(u64, u64)> {
+    Some((
+        data.get("output_index").and_then(Value::as_u64)?,
+        data.get("content_index").and_then(Value::as_u64)?,
+    ))
+}
+
+/// `response.created` → `MessageStart` (仅首个 — 后续重复/乱序忽略).
+///
+/// 假设: data 形如 `{"type":..., "response":{...}}`; response 对象缺失或字段类型
+/// 不符时对应字段降级 None, MessageStart 仍发出 (后续 block 事件需要流的头部).
+/// usage 恒 None: Responses 的完整 usage 只在 completed/incomplete 事件携带.
+fn stream_message_start(data: &Value, state: &mut ResponsesDecodeState) -> Vec<IrStreamEvent> {
+    if state.started {
+        return Vec::new();
+    }
+    state.started = true;
+    let resp = data.get("response").unwrap_or(data);
+    vec![IrStreamEvent::MessageStart {
+        usage: None,
+        id: resp.get("id").and_then(Value::as_str).map(String::from),
+        created: resp.get("created_at").and_then(Value::as_u64),
+        model: resp.get("model").and_then(Value::as_str).map(String::from),
+    }]
+}
+
+/// `response.output_item.added`: 按 item.type 分派.
+/// - message → 仅登记归属, 不发事件 (BlockStart 延迟到 content_part.added);
+/// - function_call → `BlockStart{ToolUse}` (id 取 call_id 优先, 无则 item.id —
+///   客户端以 call_id 关联 function_call_output, 与非流式 `read_function_call_block`
+///   一致);
+/// - reasoning → `BlockStart{ReasoningContent}`;
+/// - hosted tool / 未知 / item 畸形 → Dropped + warn (SEC: 只记计数不记内容,
+///   与非流式 read_tool_def / read_output_item 的丢弃点对称).
+///
+/// 假设: `output_index` 缺失或 added 重复 (病态) → 忽略, 首个登记为准.
+fn stream_item_added(data: &Value, state: &mut ResponsesDecodeState) -> Vec<IrStreamEvent> {
+    let Some(output_index) = data.get("output_index").and_then(Value::as_u64) else {
+        return Vec::new();
+    };
+    if state.items.contains_key(&output_index) {
+        return Vec::new();
+    }
+    let item = data.get("item");
+    let ty = item.and_then(|i| i.get("type")).and_then(Value::as_str);
+    match ty {
+        Some("message") => {
+            state.items.insert(output_index, StreamItemState::Message);
+            Vec::new()
+        }
+        Some("function_call") => {
+            let ir_index = alloc_ir_index(state);
+            let obj = item.and_then(Value::as_object);
+            let field = |k: &str| obj.and_then(|o| o.get(k)).and_then(Value::as_str);
+            // call_id 优先于 id (两者都可能出现).
+            let id = field("call_id").or_else(|| field("id")).unwrap_or_default();
+            let name = field("name").unwrap_or_default();
+            state.saw_function_call = true;
+            state.items.insert(
+                output_index,
+                StreamItemState::FunctionCall {
+                    ir_index,
+                    args_delta_seen: false,
+                },
+            );
+            vec![IrStreamEvent::BlockStart {
+                index: ir_index,
+                block: IrBlockMeta::ToolUse {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                },
+            }]
+        }
+        Some("reasoning") => {
+            let ir_index = alloc_ir_index(state);
+            state
+                .items
+                .insert(output_index, StreamItemState::Reasoning { ir_index });
+            vec![IrStreamEvent::BlockStart {
+                index: ir_index,
+                block: IrBlockMeta::ReasoningContent,
+            }]
+        }
+        _ => {
+            state.items.insert(output_index, StreamItemState::Dropped);
+            tracing::warn!(
+                count = 1,
+                "dropping stream output item not representable in IR \
+                 (hosted tools: web_search/file_search/computer/mcp/..., or unknown type)"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// `response.content_part.added`: output_text part → `BlockStart{Text}`;
+/// refusal / 未知 part 类型 / 父 item 非 message 的游离 part → 不登记 + warn
+/// (后续 delta/done 查不到映射自然忽略, ROB 降级 — content_part.done 对被跳过的
+/// part 也不发 BlockStop).
+/// 假设: 定位键缺失或重复 added (病态) → 忽略.
+fn stream_part_added(data: &Value, state: &mut ResponsesDecodeState) -> Vec<IrStreamEvent> {
+    let Some(key) = part_key(data) else {
+        return Vec::new();
+    };
+    // 仅当父 item 已登记为 message 时受理 (part 事件语义上隶属于 message item);
+    // 病态游离 part (父 item 缺席 / 归属 function_call 等) 忽略, 防止产出游离
+    // Text block 且条目滞留 part_ir_index (output_item.done 的兜底清扫只覆盖
+    // message arm).
+    if !matches!(state.items.get(&key.0), Some(StreamItemState::Message)) {
+        tracing::warn!(
+            count = 1,
+            "dropping stream content part not representable in IR (orphan part without message item)"
+        );
+        return Vec::new();
+    }
+    let is_text = data
+        .get("part")
+        .and_then(|p| p.get("type"))
+        .and_then(Value::as_str)
+        == Some("output_text");
+    if !is_text {
+        tracing::warn!(
+            count = 1,
+            "dropping stream content part not representable in IR (refusal or unknown part type)"
+        );
+        return Vec::new();
+    }
+    if state.part_ir_index.contains_key(&key) {
+        return Vec::new();
+    }
+    let ir_index = alloc_ir_index(state);
+    state.part_ir_index.insert(key, ir_index);
+    vec![IrStreamEvent::BlockStart {
+        index: ir_index,
+        block: IrBlockMeta::Text,
+    }]
+}
+
+/// `response.content_part.done`: 与 content_part.added 对称配对的 `BlockStop`.
+/// part 被跳过 (refusal 等) 或重复 done (病态) → 查不到映射, 不发.
+fn stream_part_done(data: &Value, state: &mut ResponsesDecodeState) -> Vec<IrStreamEvent> {
+    let Some(key) = part_key(data) else {
+        return Vec::new();
+    };
+    match state.part_ir_index.remove(&key) {
+        Some(ir_index) => vec![IrStreamEvent::BlockStop { index: ir_index }],
+        None => Vec::new(),
+    }
+}
+
+/// `response.output_text.delta` → `BlockDelta{TextDelta}`.
+/// 病态流 (未见 content_part.added / delta 缺失或空) → 忽略, 不 panic.
+fn stream_text_delta(data: &Value, state: &ResponsesDecodeState) -> Vec<IrStreamEvent> {
+    let Some(key) = part_key(data) else {
+        return Vec::new();
+    };
+    match (
+        state.part_ir_index.get(&key),
+        data.get("delta").and_then(Value::as_str),
+    ) {
+        (Some(&ir_index), Some(d)) if !d.is_empty() => vec![IrStreamEvent::BlockDelta {
+            index: ir_index,
+            delta: IrDelta::TextDelta(d.to_string()),
+        }],
+        _ => Vec::new(),
+    }
+}
+
+/// `response.function_call_arguments.delta` → `BlockDelta{InputJsonDelta}` + 标记
+/// args_delta_seen. 仅**非空** delta 标记 seen (空 delta 不构成"已流式"证据 —
+/// done 兜底补全量更安全). 病态 (未见 item.added / delta 缺失或空) → 忽略.
+fn stream_args_delta(data: &Value, state: &mut ResponsesDecodeState) -> Vec<IrStreamEvent> {
+    let Some(output_index) = data.get("output_index").and_then(Value::as_u64) else {
+        return Vec::new();
+    };
+    match (
+        state.items.get_mut(&output_index),
+        data.get("delta").and_then(Value::as_str),
+    ) {
+        (
+            Some(StreamItemState::FunctionCall {
+                ir_index,
+                args_delta_seen,
+            }),
+            Some(d),
+        ) if !d.is_empty() => {
+            *args_delta_seen = true;
+            vec![IrStreamEvent::BlockDelta {
+                index: *ir_index,
+                delta: IrDelta::InputJsonDelta(d.to_string()),
+            }]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// `response.reasoning_summary_text.delta` / `response.reasoning_text.delta` →
+/// `BlockDelta{ReasoningDelta}` (summary 与思考原文两种形态归一, IR 无区分维度 —
+/// 已知损失, 重合成侧事件类型可能变化但内容保留).
+/// 定位键是 output_index (item 级). 病态 (未见 item.added / delta 缺失或空) → 忽略.
+fn stream_reasoning_delta(data: &Value, state: &ResponsesDecodeState) -> Vec<IrStreamEvent> {
+    let Some(output_index) = data.get("output_index").and_then(Value::as_u64) else {
+        return Vec::new();
+    };
+    match (
+        state.items.get(&output_index),
+        data.get("delta").and_then(Value::as_str),
+    ) {
+        (Some(StreamItemState::Reasoning { ir_index }), Some(d)) if !d.is_empty() => {
+            vec![IrStreamEvent::BlockDelta {
+                index: *ir_index,
+                delta: IrDelta::ReasoningDelta(d.to_string()),
+            }]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// `response.output_item.done`: 按 item 状态收尾.
+/// - function_call → 兜底补发 (从未收到非空 args delta 且 done item 的 arguments
+///   非空 → 补一条全量 `InputJsonDelta`) + `BlockStop`;
+/// - reasoning → `BlockStop` (reasoning 无 part 级事件);
+/// - message → 兜底关闭仍未关闭的 part (正常路径已由 content_part.done 关闭, 无事件);
+/// - Dropped / 未见 added (病态) → 忽略.
+fn stream_item_done(data: &Value, state: &mut ResponsesDecodeState) -> Vec<IrStreamEvent> {
+    let Some(output_index) = data.get("output_index").and_then(Value::as_u64) else {
+        return Vec::new();
+    };
+    match state.items.remove(&output_index) {
+        Some(StreamItemState::FunctionCall {
+            ir_index,
+            args_delta_seen,
+        }) => {
+            let mut events = Vec::new();
+            let args = data
+                .get("item")
+                .and_then(|i| i.get("arguments"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if !args_delta_seen && !args.is_empty() {
+                events.push(IrStreamEvent::BlockDelta {
+                    index: ir_index,
+                    delta: IrDelta::InputJsonDelta(args.to_string()),
+                });
+            }
+            events.push(IrStreamEvent::BlockStop { index: ir_index });
+            events
+        }
+        Some(StreamItemState::Reasoning { ir_index }) => {
+            vec![IrStreamEvent::BlockStop { index: ir_index }]
+        }
+        Some(StreamItemState::Message) => {
+            let mut events = Vec::new();
+            let stale: Vec<(u64, u64)> = state
+                .part_ir_index
+                .range((output_index, u64::MIN)..=(output_index, u64::MAX))
+                .map(|(k, _)| *k)
+                .collect();
+            for key in stale {
+                if let Some(ir_index) = state.part_ir_index.remove(&key) {
+                    events.push(IrStreamEvent::BlockStop { index: ir_index });
+                }
+            }
+            events
+        }
+        Some(StreamItemState::Dropped) | None => Vec::new(),
+    }
+}
+
+/// `response.completed` / `response.incomplete` 的公共尾部:
+/// `MessageDelta{stop_reason, usage, usage_present}` + `MessageStop`.
+/// stop_reason 由调用方推断 (completed: 已见 function_call → ToolUse, 否则 EndTurn;
+/// incomplete: 复用非流式 `read_response_status` 的映射). usage 提取与非流式一致.
+fn stream_finished(data: &Value, stop_reason: IrStopReason) -> Vec<IrStreamEvent> {
+    let resp = data.get("response").unwrap_or(data);
+    let usage = resp.get("usage").filter(|v| v.is_object()).map(read_usage);
+    let usage_present = usage.is_some();
+    vec![
+        IrStreamEvent::MessageDelta {
+            stop_reason: Some(stop_reason),
+            stop_sequence: None,
+            usage: usage.unwrap_or_default(),
+            usage_present,
+        },
+        IrStreamEvent::MessageStop,
+    ]
+}
+
+/// `response.failed` 的错误消息: `response.error` 的 message 优先, 缺省 code, 再
+/// 缺省固定文案 (上游错误透传, 不含 secret-guard 侧内容).
+fn stream_failed(data: &Value) -> IrStreamEvent {
+    let error = data.get("response").and_then(|r| r.get("error"));
+    let msg = error
+        .and_then(|e| e.get("message"))
+        .and_then(Value::as_str)
+        .filter(|m| !m.is_empty())
+        .or_else(|| error.and_then(|e| e.get("code")).and_then(Value::as_str))
+        .unwrap_or("upstream response failed");
+    IrStreamEvent::Error(msg.to_string())
+}
+
+/// 裸 `error` 事件 (非标形态, 非 `response.` 前缀): `data.error.message` 优先,
+/// 缺省顶层 message (与 anthropic reader 的 error 事件处理同型).
+fn stream_bare_error(data: &Value) -> IrStreamEvent {
+    let msg = data
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .or_else(|| data.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("upstream stream error");
+    IrStreamEvent::Error(msg.to_string())
 }
 
 // ─── Helpers: write ────────────────────────────────────────────────────────
@@ -1574,5 +1967,889 @@ mod tests {
         // Chat 的 prompt_tokens → Responses 的 input_tokens.
         assert_eq!(usage.get("input_tokens").unwrap(), 10);
         assert_eq!(usage.get("output_tokens").unwrap(), 5);
+    }
+
+    // ─── read_response_events: 流式 SSE 事件 → IR ─────────────────────
+    //
+    // 场景 fixture 对齐官方 Responses 流式文档的事件序列 (event_type 完整名 +
+    // data 冗余 type). 断言用整体 assert_eq (IrStreamEvent: PartialEq) 锁定
+    // 事件序列与 index 分配, 避免逐字段 matches! 漏检顺序错位.
+
+    /// 把 (event_type, data) SSE 帧序列逐帧喂入 reader (跨帧共享 state), 收集 IR 事件.
+    fn feed_stream(frames: &[(&str, Value)]) -> Vec<IrStreamEvent> {
+        let mut state = crate::codec::ir::StreamDecodeState::default();
+        let mut out = Vec::new();
+        for (ty, data) in frames {
+            out.extend(reader().read_response_events(ty, data, &mut state));
+        }
+        out
+    }
+
+    /// 官方 text 场景的 response.created 帧.
+    fn created_frame() -> (&'static str, Value) {
+        (
+            "response.created",
+            json!({
+                "type": "response.created", "sequence_number": 0,
+                "response": {
+                    "id": "resp_1", "object": "response", "created_at": 1700000000,
+                    "model": "gpt-5", "status": "in_progress", "output": [], "usage": null,
+                },
+            }),
+        )
+    }
+
+    /// `created_frame()` 的期望投影 (期望向量的公共前缀, 与输入 fixture 配对).
+    fn expected_message_start() -> IrStreamEvent {
+        IrStreamEvent::MessageStart {
+            usage: None,
+            id: Some("resp_1".into()),
+            created: Some(1700000000),
+            model: Some("gpt-5".into()),
+        }
+    }
+
+    #[test]
+    fn stream_text_scenario_full_official_sequence() {
+        // 官方 text 场景: created → in_progress → item.added → part.added →
+        // text.delta×2 → done 族 → item.done → completed.
+        let frames = vec![
+            created_frame(),
+            (
+                "response.in_progress",
+                json!({"type": "response.in_progress",
+                        "response": {"id": "resp_1", "status": "in_progress"}}),
+            ),
+            (
+                "response.output_item.added",
+                json!({"type": "response.output_item.added", "output_index": 0,
+                        "item": {"id": "msg_1", "type": "message", "status": "in_progress",
+                                  "role": "assistant", "content": []}}),
+            ),
+            (
+                "response.content_part.added",
+                json!({"type": "response.content_part.added", "item_id": "msg_1",
+                        "output_index": 0, "content_index": 0,
+                        "part": {"type": "output_text", "text": "", "annotations": []}}),
+            ),
+            (
+                "response.output_text.delta",
+                json!({"type": "response.output_text.delta", "item_id": "msg_1",
+                        "output_index": 0, "content_index": 0, "delta": "Hel"}),
+            ),
+            (
+                "response.output_text.delta",
+                json!({"type": "response.output_text.delta", "item_id": "msg_1",
+                        "output_index": 0, "content_index": 0, "delta": "lo"}),
+            ),
+            (
+                "response.output_text.done",
+                json!({"type": "response.output_text.done", "item_id": "msg_1",
+                        "output_index": 0, "content_index": 0, "text": "Hello"}),
+            ),
+            (
+                "response.content_part.done",
+                json!({"type": "response.content_part.done", "item_id": "msg_1",
+                        "output_index": 0, "content_index": 0,
+                        "part": {"type": "output_text", "text": "Hello", "annotations": []}}),
+            ),
+            (
+                "response.output_item.done",
+                json!({"type": "response.output_item.done", "output_index": 0,
+                        "item": {"id": "msg_1", "type": "message", "status": "completed",
+                                  "role": "assistant",
+                                  "content": [{"type": "output_text", "text": "Hello"}]}}),
+            ),
+            (
+                "response.completed",
+                json!({"type": "response.completed",
+                        "response": {"id": "resp_1", "status": "completed",
+                                      "usage": {"input_tokens": 10, "output_tokens": 5,
+                                                 "total_tokens": 15}}}),
+            ),
+        ];
+        assert_eq!(
+            feed_stream(&frames),
+            vec![
+                expected_message_start(),
+                IrStreamEvent::BlockStart {
+                    index: 0,
+                    block: IrBlockMeta::Text,
+                },
+                IrStreamEvent::BlockDelta {
+                    index: 0,
+                    delta: IrDelta::TextDelta("Hel".into()),
+                },
+                IrStreamEvent::BlockDelta {
+                    index: 0,
+                    delta: IrDelta::TextDelta("lo".into()),
+                },
+                IrStreamEvent::BlockStop { index: 0 },
+                IrStreamEvent::MessageDelta {
+                    stop_reason: Some(IrStopReason::EndTurn),
+                    stop_sequence: None,
+                    usage: IrUsage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        ..Default::default()
+                    },
+                    usage_present: true,
+                },
+                IrStreamEvent::MessageStop,
+            ]
+        );
+    }
+
+    #[test]
+    fn stream_function_call_scenario_call_id_preferred_and_args_deltas() {
+        let frames = vec![
+            created_frame(),
+            (
+                "response.output_item.added",
+                json!({"output_index": 0, "item": {
+                    "id": "fc_1", "call_id": "call_9", "type": "function_call",
+                    "name": "get_weather", "arguments": "", "status": "in_progress",
+                }}),
+            ),
+            (
+                "response.function_call_arguments.delta",
+                json!({"item_id": "fc_1", "output_index": 0, "delta": "{\"city\":"}),
+            ),
+            (
+                "response.function_call_arguments.delta",
+                json!({"item_id": "fc_1", "output_index": 0, "delta": "\"SF\"}"}),
+            ),
+            (
+                "response.function_call_arguments.done",
+                json!({"item_id": "fc_1", "output_index": 0,
+                        "arguments": "{\"city\":\"SF\"}"}),
+            ),
+            (
+                "response.output_item.done",
+                json!({"output_index": 0, "item": {
+                    "id": "fc_1", "call_id": "call_9", "type": "function_call",
+                    "name": "get_weather", "arguments": "{\"city\":\"SF\"}",
+                    "status": "completed",
+                }}),
+            ),
+            (
+                "response.completed",
+                json!({"response": {"id": "resp_1", "status": "completed",
+                                     "usage": {"input_tokens": 7, "output_tokens": 3}}}),
+            ),
+        ];
+        assert_eq!(
+            feed_stream(&frames),
+            vec![
+                expected_message_start(),
+                // call_id 优先于 id.
+                IrStreamEvent::BlockStart {
+                    index: 0,
+                    block: IrBlockMeta::ToolUse {
+                        id: "call_9".into(),
+                        name: "get_weather".into(),
+                    },
+                },
+                IrStreamEvent::BlockDelta {
+                    index: 0,
+                    delta: IrDelta::InputJsonDelta("{\"city\":".into()),
+                },
+                IrStreamEvent::BlockDelta {
+                    index: 0,
+                    delta: IrDelta::InputJsonDelta("\"SF\"}".into()),
+                },
+                IrStreamEvent::BlockStop { index: 0 },
+                // 出现过 function_call → completed 推断 ToolUse.
+                IrStreamEvent::MessageDelta {
+                    stop_reason: Some(IrStopReason::ToolUse),
+                    stop_sequence: None,
+                    usage: IrUsage {
+                        input_tokens: 7,
+                        output_tokens: 3,
+                        ..Default::default()
+                    },
+                    usage_present: true,
+                },
+                IrStreamEvent::MessageStop,
+            ]
+        );
+    }
+
+    #[test]
+    fn stream_reasoning_then_message_mixed_scenario() {
+        // reasoning item (summary delta) + message item 混合: 两个独立 IR block,
+        // index 按 BlockStart 发出顺序 (reasoning 先 → 0, text → 1).
+        let frames = vec![
+            created_frame(),
+            (
+                "response.output_item.added",
+                json!({"output_index": 0, "item": {"id": "rs_1", "type": "reasoning",
+                                                     "summary": [], "status": "in_progress"}}),
+            ),
+            (
+                "response.reasoning_summary_part.added",
+                json!({"item_id": "rs_1", "output_index": 0, "summary_index": 0}),
+            ),
+            (
+                "response.reasoning_summary_text.delta",
+                json!({"item_id": "rs_1", "output_index": 0, "summary_index": 0,
+                        "delta": "Think "}),
+            ),
+            (
+                "response.reasoning_summary_text.done",
+                json!({"item_id": "rs_1", "output_index": 0, "summary_index": 0,
+                        "text": "Think "}),
+            ),
+            (
+                "response.output_item.done",
+                json!({"output_index": 0, "item": {"id": "rs_1", "type": "reasoning",
+                                                     "status": "completed",
+                                                     "summary": [{"type": "summary_text",
+                                                                   "text": "Think "}]}}),
+            ),
+            (
+                "response.output_item.added",
+                json!({"output_index": 1, "item": {"id": "msg_1", "type": "message",
+                                                     "status": "in_progress",
+                                                     "role": "assistant", "content": []}}),
+            ),
+            (
+                "response.content_part.added",
+                json!({"item_id": "msg_1", "output_index": 1, "content_index": 0,
+                        "part": {"type": "output_text", "text": ""}}),
+            ),
+            (
+                "response.output_text.delta",
+                json!({"item_id": "msg_1", "output_index": 1, "content_index": 0,
+                        "delta": "Answer"}),
+            ),
+            (
+                "response.content_part.done",
+                json!({"item_id": "msg_1", "output_index": 1, "content_index": 0,
+                        "part": {"type": "output_text", "text": "Answer"}}),
+            ),
+            (
+                "response.output_item.done",
+                json!({"output_index": 1, "item": {"id": "msg_1", "type": "message",
+                                                     "status": "completed", "role": "assistant",
+                                                     "content": [{"type": "output_text",
+                                                                   "text": "Answer"}]}}),
+            ),
+            (
+                "response.completed",
+                json!({"response": {"status": "completed", "usage": null}}),
+            ),
+        ];
+        assert_eq!(
+            feed_stream(&frames),
+            vec![
+                expected_message_start(),
+                IrStreamEvent::BlockStart {
+                    index: 0,
+                    block: IrBlockMeta::ReasoningContent,
+                },
+                IrStreamEvent::BlockDelta {
+                    index: 0,
+                    delta: IrDelta::ReasoningDelta("Think ".into()),
+                },
+                IrStreamEvent::BlockStop { index: 0 },
+                IrStreamEvent::BlockStart {
+                    index: 1,
+                    block: IrBlockMeta::Text,
+                },
+                IrStreamEvent::BlockDelta {
+                    index: 1,
+                    delta: IrDelta::TextDelta("Answer".into()),
+                },
+                IrStreamEvent::BlockStop { index: 1 },
+                // 无 function_call → EndTurn; usage 缺席 (null) → usage_present false.
+                IrStreamEvent::MessageDelta {
+                    stop_reason: Some(IrStopReason::EndTurn),
+                    stop_sequence: None,
+                    usage: IrUsage::default(),
+                    usage_present: false,
+                },
+                IrStreamEvent::MessageStop,
+            ]
+        );
+    }
+
+    #[test]
+    fn stream_hosted_tool_and_refusal_parts_dropped_without_panicking() {
+        // hosted tool item (web_search_call) 整族忽略 + refusal part 丢弃;
+        // IR 流的其余部分 (message) 完好.
+        let frames = vec![
+            created_frame(),
+            (
+                "response.output_item.added",
+                json!({"output_index": 0, "item": {"id": "ws_1", "type": "web_search_call",
+                                                     "status": "in_progress"}}),
+            ),
+            (
+                "response.web_search_call.in_progress",
+                json!({"output_index": 0, "item_id": "ws_1"}),
+            ),
+            (
+                "response.output_item.done",
+                json!({"output_index": 0, "item": {"id": "ws_1", "type": "web_search_call",
+                                                     "status": "completed"}}),
+            ),
+            (
+                "response.output_item.added",
+                json!({"output_index": 1, "item": {"id": "msg_1", "type": "message",
+                                                     "status": "in_progress",
+                                                     "role": "assistant", "content": []}}),
+            ),
+            (
+                "response.content_part.added",
+                json!({"item_id": "msg_1", "output_index": 1, "content_index": 0,
+                        "part": {"type": "output_text", "text": ""}}),
+            ),
+            (
+                "response.content_part.added",
+                json!({"item_id": "msg_1", "output_index": 1, "content_index": 1,
+                        "part": {"type": "refusal", "refusal": ""}}),
+            ),
+            (
+                "response.refusal.delta",
+                json!({"item_id": "msg_1", "output_index": 1, "content_index": 1,
+                        "delta": "cannot"}),
+            ),
+            (
+                "response.output_text.delta",
+                json!({"item_id": "msg_1", "output_index": 1, "content_index": 0,
+                        "delta": "ok"}),
+            ),
+            (
+                "response.refusal.done",
+                json!({"item_id": "msg_1", "output_index": 1, "content_index": 1,
+                        "refusal": "cannot"}),
+            ),
+            (
+                "response.content_part.done",
+                json!({"item_id": "msg_1", "output_index": 1, "content_index": 0,
+                        "part": {"type": "output_text", "text": "ok"}}),
+            ),
+            (
+                "response.content_part.done",
+                json!({"item_id": "msg_1", "output_index": 1, "content_index": 1,
+                        "part": {"type": "refusal", "refusal": "cannot"}}),
+            ),
+            (
+                "response.output_item.done",
+                json!({"output_index": 1, "item": {"id": "msg_1", "type": "message",
+                                                     "status": "completed",
+                                                     "role": "assistant", "content": []}}),
+            ),
+            (
+                "response.completed",
+                json!({"response": {"status": "completed",
+                                     "usage": {"input_tokens": 1, "output_tokens": 1}}}),
+            ),
+        ];
+        assert_eq!(
+            feed_stream(&frames),
+            vec![
+                expected_message_start(),
+                IrStreamEvent::BlockStart {
+                    index: 0,
+                    block: IrBlockMeta::Text,
+                },
+                IrStreamEvent::BlockDelta {
+                    index: 0,
+                    delta: IrDelta::TextDelta("ok".into()),
+                },
+                IrStreamEvent::BlockStop { index: 0 },
+                IrStreamEvent::MessageDelta {
+                    stop_reason: Some(IrStopReason::EndTurn),
+                    stop_sequence: None,
+                    usage: IrUsage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        ..Default::default()
+                    },
+                    usage_present: true,
+                },
+                IrStreamEvent::MessageStop,
+            ]
+        );
+    }
+
+    #[test]
+    fn stream_failed_emits_error_with_message_preferred() {
+        let frames = vec![
+            created_frame(),
+            (
+                "response.failed",
+                json!({"response": {"id": "resp_1", "status": "failed",
+                                     "error": {"code": "server_error",
+                                                "message": "The model is overloaded"}}}),
+            ),
+        ];
+        assert_eq!(
+            feed_stream(&frames),
+            vec![
+                expected_message_start(),
+                IrStreamEvent::Error("The model is overloaded".into()),
+            ]
+        );
+        // error.message 缺失 → 兜底 code.
+        let frames = vec![(
+            "response.failed",
+            json!({"response": {"status": "failed",
+                                 "error": {"code": "rate_limit_exceeded"}}}),
+        )];
+        assert_eq!(
+            feed_stream(&frames),
+            vec![IrStreamEvent::Error("rate_limit_exceeded".into())]
+        );
+    }
+
+    #[test]
+    fn stream_incomplete_maps_max_output_tokens_to_max_tokens_stop() {
+        let frames = vec![
+            created_frame(),
+            (
+                "response.incomplete",
+                json!({"response": {"id": "resp_1", "status": "incomplete",
+                                     "incomplete_details": {"reason": "max_output_tokens"},
+                                     "usage": {"input_tokens": 4, "output_tokens": 2}}}),
+            ),
+        ];
+        assert_eq!(
+            feed_stream(&frames),
+            vec![
+                expected_message_start(),
+                IrStreamEvent::MessageDelta {
+                    stop_reason: Some(IrStopReason::MaxTokens),
+                    stop_sequence: None,
+                    usage: IrUsage {
+                        input_tokens: 4,
+                        output_tokens: 2,
+                        ..Default::default()
+                    },
+                    usage_present: true,
+                },
+                IrStreamEvent::MessageStop,
+            ]
+        );
+        // content_filter → Safety; 未知 reason → Other (复用 read_response_status).
+        for (reason, expected) in [
+            ("content_filter", IrStopReason::Safety),
+            ("max_messages", IrStopReason::Other),
+        ] {
+            let frames = vec![(
+                "response.incomplete",
+                json!({"response": {"status": "incomplete",
+                                     "incomplete_details": {"reason": reason}}}),
+            )];
+            let events = feed_stream(&frames);
+            assert!(
+                matches!(events.as_slice(),
+                    [IrStreamEvent::MessageDelta { stop_reason: Some(r), .. }, IrStreamEvent::MessageStop]
+                    if *r == expected),
+                "for reason={reason}: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_function_call_done_only_arguments_backfills_full_input_json_delta() {
+        // 病态/兜底路径: 从未发 arguments.delta, done item 带全量 arguments →
+        // 补发一条 InputJsonDelta (再 BlockStop). 对照: 已流式过则不补发.
+        let frames = vec![
+            created_frame(),
+            (
+                "response.output_item.added",
+                json!({"output_index": 0, "item": {"id": "fc_1", "call_id": "call_2",
+                                                     "type": "function_call",
+                                                     "name": "ping", "arguments": ""}}),
+            ),
+            (
+                "response.output_item.done",
+                json!({"output_index": 0, "item": {"id": "fc_1", "call_id": "call_2",
+                                                     "type": "function_call", "name": "ping",
+                                                     "arguments": "{\"a\":1}",
+                                                     "status": "completed"}}),
+            ),
+            (
+                "response.completed",
+                json!({"response": {"status": "completed", "usage": null}}),
+            ),
+        ];
+        assert_eq!(
+            feed_stream(&frames),
+            vec![
+                expected_message_start(),
+                IrStreamEvent::BlockStart {
+                    index: 0,
+                    block: IrBlockMeta::ToolUse {
+                        id: "call_2".into(),
+                        name: "ping".into(),
+                    },
+                },
+                // 兜底补发: 全量 arguments 一条.
+                IrStreamEvent::BlockDelta {
+                    index: 0,
+                    delta: IrDelta::InputJsonDelta("{\"a\":1}".into()),
+                },
+                IrStreamEvent::BlockStop { index: 0 },
+                IrStreamEvent::MessageDelta {
+                    stop_reason: Some(IrStopReason::ToolUse),
+                    stop_sequence: None,
+                    usage: IrUsage::default(),
+                    usage_present: false,
+                },
+                IrStreamEvent::MessageStop,
+            ]
+        );
+    }
+
+    #[test]
+    fn stream_duplicate_created_emits_single_message_start() {
+        let frames = vec![created_frame(), created_frame()];
+        assert_eq!(feed_stream(&frames), vec![expected_message_start()]);
+    }
+
+    #[test]
+    fn stream_orphan_text_delta_without_part_added_is_ignored() {
+        // 病态流: output_text.delta 先于 content_part.added 到达 → 忽略, 不 panic;
+        // message 的 output_item.done 兜底也无未关 part 可关 (零事件).
+        let frames = vec![
+            created_frame(),
+            (
+                "response.output_text.delta",
+                json!({"item_id": "msg_x", "output_index": 0, "content_index": 0,
+                        "delta": "orphan"}),
+            ),
+            (
+                "response.output_item.done",
+                json!({"output_index": 0, "item": {"id": "msg_x", "type": "message",
+                                                     "status": "completed",
+                                                     "role": "assistant", "content": []}}),
+            ),
+            (
+                "response.completed",
+                json!({"response": {"status": "completed", "usage": null}}),
+            ),
+        ];
+        assert_eq!(
+            feed_stream(&frames),
+            vec![
+                expected_message_start(),
+                IrStreamEvent::MessageDelta {
+                    stop_reason: Some(IrStopReason::EndTurn),
+                    stop_sequence: None,
+                    usage: IrUsage::default(),
+                    usage_present: false,
+                },
+                IrStreamEvent::MessageStop,
+            ]
+        );
+    }
+
+    #[test]
+    fn stream_message_item_done_backfills_block_stop_for_open_part() {
+        // D2 兜底路径: content_part.done 缺席 (病态), output_item.done(message) 补发
+        // 未关 part 的 BlockStop.
+        let frames = vec![
+            created_frame(),
+            (
+                "response.output_item.added",
+                json!({"output_index": 0, "item": {"id": "msg_1", "type": "message",
+                                                     "status": "in_progress",
+                                                     "role": "assistant", "content": []}}),
+            ),
+            (
+                "response.content_part.added",
+                json!({"item_id": "msg_1", "output_index": 0, "content_index": 0,
+                        "part": {"type": "output_text", "text": ""}}),
+            ),
+            (
+                "response.output_text.delta",
+                json!({"item_id": "msg_1", "output_index": 0, "content_index": 0,
+                        "delta": "Hi"}),
+            ),
+            (
+                "response.output_item.done",
+                json!({"output_index": 0, "item": {"id": "msg_1", "type": "message",
+                                                     "status": "completed",
+                                                     "role": "assistant", "content": []}}),
+            ),
+            (
+                "response.completed",
+                json!({"response": {"status": "completed", "usage": null}}),
+            ),
+        ];
+        assert_eq!(
+            feed_stream(&frames),
+            vec![
+                expected_message_start(),
+                IrStreamEvent::BlockStart {
+                    index: 0,
+                    block: IrBlockMeta::Text,
+                },
+                IrStreamEvent::BlockDelta {
+                    index: 0,
+                    delta: IrDelta::TextDelta("Hi".into()),
+                },
+                // 兜底 BlockStop (正常路径应由 content_part.done 发出, 此处缺席).
+                IrStreamEvent::BlockStop { index: 0 },
+                IrStreamEvent::MessageDelta {
+                    stop_reason: Some(IrStopReason::EndTurn),
+                    stop_sequence: None,
+                    usage: IrUsage::default(),
+                    usage_present: false,
+                },
+                IrStreamEvent::MessageStop,
+            ]
+        );
+    }
+
+    #[test]
+    fn stream_part_added_with_non_message_parent_is_ignored() {
+        // 父 item 校验回归锁: content_part.added 只有在父 item 已登记为 message 时
+        // 才受理 — 挂在 function_call 父 / 父缺席 (病态) 的 part 一律忽略, 且后续
+        // 同 key 的 delta / part.done 查不到映射自然降级 (无游离 Text block).
+        let frames = vec![
+            created_frame(),
+            (
+                "response.output_item.added",
+                json!({"output_index": 0, "item": {"id": "fc_1", "call_id": "c1",
+                                                     "type": "function_call",
+                                                     "name": "f", "arguments": ""}}),
+            ),
+            // part 挂在 function_call 的 output_index 上 → 忽略.
+            (
+                "response.content_part.added",
+                json!({"output_index": 0, "content_index": 0,
+                        "part": {"type": "output_text", "text": ""}}),
+            ),
+            // 父缺席 (output_index 9 从未 added) → 忽略.
+            (
+                "response.content_part.added",
+                json!({"output_index": 9, "content_index": 0,
+                        "part": {"type": "output_text", "text": ""}}),
+            ),
+            // 同 key 后续事件查不到映射 → 零事件.
+            (
+                "response.output_text.delta",
+                json!({"output_index": 0, "content_index": 0, "delta": "x"}),
+            ),
+            (
+                "response.content_part.done",
+                json!({"output_index": 0, "content_index": 0, "part": {}}),
+            ),
+            (
+                "response.output_item.done",
+                json!({"output_index": 0, "item": {"id": "fc_1", "call_id": "c1",
+                                                     "type": "function_call", "name": "f",
+                                                     "arguments": "", "status": "completed"}}),
+            ),
+            (
+                "response.completed",
+                json!({"response": {"status": "completed", "usage": null}}),
+            ),
+        ];
+        assert_eq!(
+            feed_stream(&frames),
+            vec![
+                expected_message_start(),
+                // function_call 的 BlockStart (唯一的内容 block; 无游离 Text BlockStart).
+                IrStreamEvent::BlockStart {
+                    index: 0,
+                    block: IrBlockMeta::ToolUse {
+                        id: "c1".into(),
+                        name: "f".into(),
+                    },
+                },
+                IrStreamEvent::BlockStop { index: 0 },
+                IrStreamEvent::MessageDelta {
+                    stop_reason: Some(IrStopReason::ToolUse),
+                    stop_sequence: None,
+                    usage: IrUsage::default(),
+                    usage_present: false,
+                },
+                IrStreamEvent::MessageStop,
+            ]
+        );
+    }
+
+    #[test]
+    fn stream_bare_data_frame_ignores_redundant_type_field() {
+        // event_type 为空 (bare data 帧) 时以 event_type 为准: data 里的冗余 type
+        // 不参与判定 → 忽略 (Responses 流恒带 event: 行, 此为防御性锁定).
+        let frames = vec![(
+            "",
+            json!({"type": "response.output_text.delta", "output_index": 0,
+                    "content_index": 0, "delta": "x"}),
+        )];
+        assert_eq!(feed_stream(&frames), Vec::<IrStreamEvent>::new());
+    }
+
+    // ─── read_response_events: 病态流 property (ROB-1) ─────────────────
+    //
+    // 全新状态机 reader 的核心风险面是随机病态输入 (事件乱序 / 重复 / 孤儿事件 /
+    // 畸形字段). property 断言 (契约 ROB-* / 对齐 openai reader 的流式 property 先例):
+    // 1) 永不 panic; 2) BlockStart index 全局唯一; 3) 无悬空 BlockStop (每个 BlockStop
+    //    的 index 必有先行的 BlockStart). well-formed 序列的语义等价已由上方场景
+    //    测试整体 assert_eq 锁定, 此处不重复.
+
+    #[test]
+    fn prop_responses_stream_reader_survives_pathological_event_sequences() {
+        use proptest::prelude::*;
+
+        // 事件帧模板: (event_type, data JSON) — 覆盖全部 dispatch 分支.
+        fn frame_templates() -> Vec<(&'static str, Value)> {
+            vec![
+                (
+                    "response.created",
+                    json!({"response": {"id": "r", "created_at": 1, "model": "m"}}),
+                ),
+                ("response.in_progress", json!({"response": {}})),
+                ("response.queued", json!({})),
+                (
+                    "response.output_item.added",
+                    json!({"output_index": 0, "item": {"type": "message", "id": "msg_1"}}),
+                ),
+                (
+                    "response.output_item.added",
+                    json!({"output_index": 1, "item": {"type": "function_call", "id": "fc_1",
+                                                         "call_id": "c1", "name": "f"}}),
+                ),
+                (
+                    "response.output_item.added",
+                    json!({"output_index": 2, "item": {"type": "reasoning", "id": "rs_1"}}),
+                ),
+                (
+                    "response.output_item.added",
+                    json!({"output_index": 3, "item": {"type": "web_search_call", "id": "ws_1"}}),
+                ),
+                (
+                    "response.content_part.added",
+                    json!({"output_index": 0, "content_index": 0,
+                            "part": {"type": "output_text", "text": ""}}),
+                ),
+                (
+                    "response.content_part.added",
+                    json!({"output_index": 0, "content_index": 1,
+                            "part": {"type": "refusal", "refusal": ""}}),
+                ),
+                (
+                    "response.content_part.done",
+                    json!({"output_index": 0, "content_index": 0, "part": {}}),
+                ),
+                (
+                    "response.output_text.delta",
+                    json!({"output_index": 0, "content_index": 0, "delta": "d"}),
+                ),
+                (
+                    "response.output_text.delta",
+                    json!({"output_index": 9, "content_index": 9, "delta": "orphan"}),
+                ),
+                (
+                    "response.function_call_arguments.delta",
+                    json!({"output_index": 1, "delta": "{\"a\":1}"}),
+                ),
+                (
+                    "response.function_call_arguments.delta",
+                    json!({"output_index": 2, "delta": "wrong-item-type"}),
+                ),
+                (
+                    "response.reasoning_summary_text.delta",
+                    json!({"output_index": 2, "summary_index": 0, "delta": "th"}),
+                ),
+                (
+                    "response.reasoning_text.delta",
+                    json!({"output_index": 2, "content_index": 0, "delta": "ink"}),
+                ),
+                (
+                    "response.output_item.done",
+                    json!({"output_index": 1, "item": {"type": "function_call",
+                                                         "arguments": "{\"a\":1}"}}),
+                ),
+                (
+                    "response.output_item.done",
+                    json!({"output_index": 2, "item": {"type": "reasoning"}}),
+                ),
+                (
+                    "response.output_item.done",
+                    json!({"output_index": 3, "item": {"type": "web_search_call"}}),
+                ),
+                (
+                    "response.output_item.done",
+                    json!({"output_index": 0, "item": {"type": "message", "content": []}}),
+                ),
+                (
+                    "response.output_item.done",
+                    json!({"output_index": 7, "item": {"type": "message"}}),
+                ),
+                (
+                    "response.completed",
+                    json!({"response": {"status": "completed", "usage": {"input_tokens": 1, "output_tokens": 1}}}),
+                ),
+                (
+                    "response.incomplete",
+                    json!({"response": {"status": "incomplete",
+                                         "incomplete_details": {"reason": "max_output_tokens"}}}),
+                ),
+                (
+                    "response.failed",
+                    json!({"response": {"error": {"code": "x", "message": "boom"}}}),
+                ),
+                ("error", json!({"error": {"message": "bare"}})),
+                ("response.output_text.done", json!({"text": "full"})),
+                ("response.refusal.delta", json!({"delta": "no"})),
+                ("response.unknown.event", json!({"whatever": true})),
+                // 畸形字段形态: 缺定位键 / 类型突变 / 空值 (只走降级路径, 不产事件).
+                (
+                    "response.output_item.added",
+                    json!({"item": {"type": "message"}}),
+                ),
+                (
+                    "response.content_part.added",
+                    json!({"output_index": 0, "content_index": 0, "part": "not-an-object"}),
+                ),
+                (
+                    "response.output_text.delta",
+                    json!({"output_index": 0, "content_index": 0, "delta": 42}),
+                ),
+                (
+                    "response.output_text.delta",
+                    json!({"output_index": 0, "content_index": 0, "delta": ""}),
+                ),
+            ]
+        }
+
+        proptest!(|(n in 0usize..512)| {
+            let templates = frame_templates();
+            // 确定性伪随机选择 (避免 proptest strategy 与 Vec<(&str, Value)> 的
+            // borrow 纠缠: 用简单 LCG 展开种子).
+            let mut seed = n as u64 * 2654435761;
+            let mut next = move || {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (seed >> 33) as usize
+            };
+            let mut state = crate::codec::ir::StreamDecodeState::default();
+            let mut started_indices: std::collections::BTreeSet<usize> =
+                std::collections::BTreeSet::new();
+            for _ in 0..n {
+                let (ty, data) = &templates[next() % templates.len()];
+                let events = reader().read_response_events(ty, data, &mut state);
+                for ev in events {
+                    match ev {
+                        IrStreamEvent::BlockStart { index, .. } => {
+                            prop_assert!(started_indices.insert(index),
+                                "BlockStart index {index} must be globally unique");
+                        }
+                        IrStreamEvent::BlockStop { index } => {
+                            prop_assert!(started_indices.contains(&index),
+                                "BlockStop {index} without prior BlockStart");
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
     }
 }

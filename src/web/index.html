@@ -5399,7 +5399,7 @@
     //   ingress != egress 且两者 codec 都覆盖 (openai/anthropic/openairesponses,
     //     = 后端 `Protocol::codec_covered()`) → cross-protocol 翻译 — 经通用 IR
     //     路径, 任意覆盖族 pair 均可; **流式仅 OpenAI⇄Anthropic** (StreamTranslate),
-    //     含 Responses 任一侧时 stream=true → 501 (其 SSE 事件翻译未实现, #183);
+    //     含 Responses 任一侧时 stream=true → 501 (其流式 writer 未实现, #183);
     //   任一协议 codec 不覆盖 (gemini/ollama) → 不支持.
     //
     // codec 覆盖集与 `codec::Protocol::from_native` 的 Some 集合同一事实两处编码
@@ -5505,7 +5505,7 @@
     // 初始隐藏, 由 toggleEndpointModels 惰性 fetch/展开. 三态分支拆为独立派生 (url
     // 行 + badge), 避免嵌套三元: badge 走 mode→string 查表.
     // translate 的 tooltip 按 pair 分化 (M2 走查修复, 与 #183 后的实际行为对齐):
-    // 含 Responses 任一侧 → 非流式 (stream=true → 501, Responses SSE 事件翻译未实现);
+    // 含 Responses 任一侧 → 非流式 (stream=true → 501, Responses 流式 writer 未实现);
     // 否则 (OpenAI⇄Anthropic) → 流式翻译已接入 (StreamTranslate). egressProtos =
     // 链尾端点协议集合 (multi-endpoint; 任一侧含 Responses 即非流式 — fallback
     // 端点是集合首个, 集合近似下取并集保守标注).

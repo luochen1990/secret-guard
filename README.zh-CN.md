@@ -189,9 +189,10 @@ provider=...`), 命令行即可确认流量经过 secret-guard; 上游故障 (50
 - **Gemini / Ollama codec**: 补齐这两族的 Redact 与跨协议能力。新增协议只需实现
   Reader + Writer trait (~200 行), 不动 dispatch — 架构见 `src/codec/AGENTS.md`。
 - **Responses 流式 SSE 翻译**: Responses + Redact 命中 + `stream=true` 返回 501
-  (防止 mock 静默外流); 仅路由 model 重写 (无 Redact) 时流式放行, SSE 字节透传。
+  (流式 writer 侧未实现 — 放行会翻译出空流; 流式 reader 侧已实现, 流式
+  `resp_parsed` 照常派生); 仅路由 model 重写 (无 Redact) 时流式放行, SSE 字节透传。
 - **Responses 参与的跨协议流式**: OpenAI ⇄ Anthropic 流式翻译已支持, Responses
-  侧的流式事件翻译待实现; 跨协议翻译中 reasoning content / hosted tools 暂被
+  侧的流式 writer 待实现; 跨协议翻译中 reasoning content / hosted tools 暂被
   丢弃 (有 WARN)。
 - **真实 Provider 实地验证**: 为协议矩阵补真实上游的集成测试 profile。
 

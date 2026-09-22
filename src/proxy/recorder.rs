@@ -845,11 +845,10 @@ pub(super) struct ParsedSync {
 
 /// IrResponse "scan 零语义事件" 判定: 事件层的所有字段均未被观测过.
 ///
-/// Responses 协议的 `read_response_events` 未实现 (恒返回空事件), 流式 scan 永远
-/// 零事件; OpenAI/Anthropic 正常流的首个事件即携带 model/id 或 block. 零事件时
-/// `write_response` 会产出 "合成 id + 空 output + status completed" 的畸形 parsed
-/// view (凭空捏造响应元数据, DTO 派生纪律禁止) — 调用方据此降级为 `None`
-/// (前端降级占位).
+/// 病态流 (bare data 帧 / 纯噪音事件, 如 Responses 流式事件被代理剥掉 `event:` 行)
+/// 会让流式 scan 累积零事件; 零事件时 `write_response` 会产出 "合成 id + 空 output +
+/// status completed" 的畸形 parsed view (凭空捏造响应元数据, DTO 派生纪律禁止) —
+/// 调用方据此降级为 `None` (前端降级占位).
 fn scan_decoded_nothing(ir: &crate::codec::ir::IrResponse) -> bool {
     ir.content.is_empty()
         && ir.model.is_none()
@@ -1157,23 +1156,22 @@ mod tests {
 
     // ─── ParsedSync: 零语义事件流降级 None (DTO 派生纪律: 不捏造响应) ──────
     //
-    // Responses 的 read_response_events 未实现 (恒返回空事件): map 空 + stream 的
-    // Responses 请求放行 SSE 字节透传后 (#183 D5 收窄), ParsedSync 对这类流
-    // accumulate 零事件 — write_response 会捏造 "合成 id + 空 output + completed"
-    // 的畸形对象. 锁定: 零事件 → parsed None + echo 无回显; 有事件 → Some 照常.
+    // Responses 流式 reader 已实现: 正常 `event:` 帧流被解码为 IR 事件 → parsed
+    // Some (下个测试); bare data 帧 (无 `event:` 行, Responses 流被代理剥头) 的
+    // type 字段不参与 reader dispatch → 零事件 → parsed None + echo 无回显.
+    // 锁定: 零事件 → parsed None; 有事件 → Some 照常.
 
     #[test]
-    fn parsed_sync_responses_stream_decodes_to_none() {
+    fn parsed_sync_responses_bare_data_frames_decode_to_none() {
         let dag = ConversationDag::new(4, 8, 1);
         let mut ps = ParsedSync::new(
             crate::codec::Protocol::OpenAIResponses,
             dag.clone(),
             Uuid::nil(),
         );
-        // Responses 流式 SSE fixture (事件层语义真实, 但 reader 不解任何事件).
-        ps.feed(b"event: response.output_text.delta\n");
+        // bare data 帧 (无 event: 行): Responses reader 以 event_type 为 dispatch
+        // 依据, data.type 冗余字段不参与 → 零事件.
         ps.feed(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n");
-        ps.feed(b"event: response.completed\n");
         ps.feed(b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":5}}}\n\n");
         let (parsed, echo) = ps.finalize();
         assert!(
@@ -1187,6 +1185,39 @@ mod tests {
         assert!(echo.model.is_none());
         // feed 路径也不得把捏造对象写进 DAG (节点无 parsed 字段或 None).
         // (此 fixture 的 record_id 不存在于 dag, update 被吞 — 单独覆盖见下个测试.)
+    }
+
+    #[test]
+    fn parsed_sync_responses_stream_decodes_to_some() {
+        // 官方 Responses 流式事件序列 (event: 帧完整) → reader 解码 → parsed Some.
+        let dag = ConversationDag::new(4, 8, 1);
+        let mut ps = ParsedSync::new(crate::codec::Protocol::OpenAIResponses, dag, Uuid::nil());
+        ps.feed(b"event: response.created\n");
+        ps.feed(b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_9\",\"created_at\":1700000000,\"model\":\"gpt-5\",\"status\":\"in_progress\"}}\n\n");
+        ps.feed(b"event: response.output_item.added\n");
+        ps.feed(b"data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\n");
+        ps.feed(b"event: response.content_part.added\n");
+        ps.feed(b"data: {\"type\":\"response.content_part.added\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n");
+        ps.feed(b"event: response.output_text.delta\n");
+        ps.feed(b"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hi\"}\n\n");
+        ps.feed(b"event: response.content_part.done\n");
+        ps.feed(b"data: {\"type\":\"response.content_part.done\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"Hi\"}}\n\n");
+        ps.feed(b"event: response.completed\n");
+        ps.feed(b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_9\",\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":5}}}\n\n");
+        let (parsed, echo) = ps.finalize();
+        let parsed = parsed.expect("decoded Responses stream must yield Some parsed view");
+        // parsed 是 Responses wire 形态: output[0].content[0].text = 累积的 delta.
+        let text = parsed
+            .pointer("/output/0/content/0/text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert_eq!(text, "Hi", "parsed view carries decoded text: {parsed}");
+        assert_eq!(echo.model.as_deref(), Some("gpt-5"));
+        let usage = echo
+            .usage
+            .expect("usage must be echoed from completed event");
+        assert_eq!(usage.input_tokens, 3);
+        assert_eq!(usage.output_tokens, 5);
     }
 
     #[test]

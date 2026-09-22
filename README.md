@@ -223,10 +223,12 @@ the full development guide lives in [AGENTS.md](AGENTS.md):
   A new protocol only needs a Reader + Writer trait implementation (~200 lines) with no
   dispatch changes — see `src/codec/AGENTS.md` for the architecture.
 - **Responses streaming SSE translation**: Responses + Redact hit + `stream=true`
-  currently returns 501 (preventing silent Mock leakage); with model-rewrite-only (no
-  Redact), streaming is allowed via SSE byte pass-through.
+  currently returns 501 (the streaming writer side is unimplemented — passing through
+  would translate into an empty stream; the streaming reader side is implemented, so
+  streaming `resp_parsed` still works); with model-rewrite-only (no Redact), streaming
+  is allowed via SSE byte pass-through.
 - **Cross-protocol streaming with Responses**: OpenAI ⇄ Anthropic streaming translation
-  is supported; the Responses side awaits event translation. reasoning content / hosted
+  is supported; the Responses side awaits the streaming writer. reasoning content / hosted
   tools are currently dropped in cross-protocol translation (with a WARN).
 - **Unknown-secret detection (NER / regex / entropy) as an alerting layer**: flag
   suspected undeclared secrets in the WebUI without auto-redacting (zero false-positive

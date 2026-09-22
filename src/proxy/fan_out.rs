@@ -296,8 +296,8 @@ pub(crate) async fn fan_out_streaming(
         PassthroughPipe,
         move |parsed_sync, recorder| {
             // 最终 parsed: 流式用 ParsedSync 快照; 非流式一次性 codec parse.
-            // ParsedSync::finalize 对零语义事件流 (如 Responses, read_response_events
-            // 未实现) 返回 None — 前端降级占位, 不捏造空响应对象.
+            // ParsedSync::finalize 对零语义事件流 (病态流, 如 Responses 事件的
+            // `event:` 行被代理剥掉) 返回 None — 前端降级占位, 不捏造空响应对象.
             if streamed {
                 match parsed_sync {
                     Some(ps) => ps.finalize(),

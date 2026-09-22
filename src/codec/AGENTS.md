@@ -22,9 +22,11 @@
 - ✅ `reasoning_content` (思考原文, OpenAI 兼容 provider 非标字段) 同协议建模:
   请求 (assistant 历史回传) / 非流式响应 / 流式 delta 三路径 reader↔writer 对称
   (#176, 契约 STR-6). 跨协议丢弃 (见下).
-- ❌ Responses ⇄ Anthropic 跨协议的流式 → 501 (同下条: Responses SSE 事件翻译未实现).
-- ❌ Responses 流式 SSE 事件翻译 (`read_response_events` / `write_response_event` 返回空/None),
-  含跨协议 Responses 任一侧 + stream=true (501).
+- ❌ Responses ⇄ Anthropic 跨协议的流式 → 501 (同下条: Responses 流式 writer 未实现).
+- ❌ Responses 流式 SSE 事件翻译的 **writer 侧** (`write_response_event` 返回 None),
+  含跨协议 Responses 任一侧 + stream=true (501). reader 侧 (`read_response_events`)
+  已实现: SSE 事件 → IR 映射与状态机见 `responses.rs::read_responses_stream_event`
+  (流式 resp_parsed 经 StreamScan 自动生效).
 - ❌ 不在 MVP: Bedrock / Gemini / Cohere, reasoning `encrypted_content` (provider-specific opaque),
   Anthropic `thinking` blocks, citations, logprobs, prompt caching, Bedrock eventstream 二进制流.
 
@@ -61,7 +63,8 @@
   flat stream 一个 chunk 可能产生 0..n 个 IR 事件, 需 state 合成;
   流式 state 机实现细节见文件头部 `//!` 与各 helper doc).
 - `anthropic.rs` — Anthropic Messages 的 Reader/Writer (流式 1:1 映射).
-- `responses.rs` — OpenAI Responses API 的 Reader/Writer (非流式; 流式 SSE 事件翻译未实现).
+- `responses.rs` — OpenAI Responses API 的 Reader/Writer (流式 reader 已实现: SSE 事件
+  → IR 映射与状态机见 `read_responses_stream_event`; 流式 writer 未实现).
 - `stream/` (目录, 4 子模块) — SSE chunk-boundary 处理 (TCP 切片兼容, CRLF/LF 双兼容, MAX_BUF 溢出 abort). 子模块:
   - `mod.rs` — 共享 SSE utils (`find_frame_terminator` / `parse_sse_frame` / `reframe_sse`) + 常量 + 集中测试.
   - `reassembler.rs` — `SseReassembler` (StreamTranslate / StreamScan 共享的帧重组骨架, 私有).

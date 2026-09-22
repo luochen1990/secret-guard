@@ -2156,9 +2156,9 @@ async fn cross_protocol_streaming_responses_ingress_returns_501() {
 
 #[tokio::test]
 async fn cross_protocol_streaming_responses_egress_returns_501() {
-    // Responses egress + stream=true 仍 501 (read_response_events 未实现, 放行会
-    // 翻译出空流). 原 "跨协议流式一律 501" 的断言已随 dispatch 接入作废, 本测试
-    // 锁定 Responses 残留范围.
+    // Responses egress + stream=true 仍 501 (流式 writer 未实现 — egress 侧 reader
+    // 已实现但链路未接线, 放行会翻译出空流). 原 "跨协议流式一律 501" 的断言已随
+    // dispatch 接入作废, 本测试锁定 Responses 残留范围.
     let upstream = spawn_mock_upstream().await;
     let provider = provider_with("resp-main", Protocol::OpenAIResponses, &upstream.url());
     let proxy_url = spawn_proxy_with_provider(provider).await;
@@ -9142,7 +9142,7 @@ async fn model_rewrite_responses_streaming_passthrough() {
 }
 
 /// #183 D5 收窄: Responses 流式 + **Redact 命中** (secret 在 body 中) 仍 501 —
-/// 响应需要 restore 而 Responses 的 SSE 事件翻译未实现, 放行会让 mock 静默外流.
+/// 响应需要 restore 而 Responses 的流式 writer 未实现, 放行会翻译出空流.
 #[tokio::test]
 async fn responses_streaming_with_secret_hit_returns_501() {
     let real_secret = "sk-live-resp-secret";

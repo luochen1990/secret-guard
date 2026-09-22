@@ -14,7 +14,8 @@
 //! codec 覆盖族内 (openai/anthropic/openairesponses) 任意 pair 的非流式翻译均经通用
 //! IR 路径承载 (含 Responses 参与的 pair, 双向各有集成测试锁定). 流式翻译仅
 //! OpenAI ⇄ Anthropic (StreamTranslate); Responses (ingress 或 egress) 的流式返回
-//! 501 — 其 `read_response_events` 未实现, 放行会翻译出空流
+//! 501 — ingress 侧 Responses 流式 writer 未实现 (硬阻塞), egress 侧 reader 已实现
+//! 但链路未接线/未测试, 待 writer 侧完成后整体解除
 //! (同 same_proto 路径的 Responses 流式 501, #183 D5).
 
 use std::time::Instant;
@@ -53,8 +54,9 @@ use super::recorder::{
 ///
 /// - codec 覆盖族内 (openai/anthropic/responses) 任意 pair 均可翻译; gemini/ollama
 ///   任一侧 → 501 (`Protocol::from_native` 返回 None).
-/// - **Responses (ingress 或 egress) + stream=true → 501**: Responses 流式 SSE
-///   事件翻译未实现 (`read_response_events` 返回空), 放行会静默产出空流.
+/// - **Responses (ingress 或 egress) + stream=true → 501**: 保守门 — ingress 侧
+///   Responses 流式 writer (`write_response_event`) 未实现 (硬阻塞); egress 侧
+///   reader 已实现但链路未接线/未测试, 待 writer 侧完成后整体解除.
 /// - **应用 redact**: 跨协议 + redact 通过 [`crate::redact::redact_ir`] 在 IR 层做替换,
 ///   不会与 codec 翻译冲突. 响应侧: 非流式经 `restore_ir_response`, 流式经
 ///   StreamTranslate 的 restore hook (mock→real, RED-7).
@@ -106,8 +108,10 @@ pub(crate) async fn cross_proto_forward(
     )?;
 
     // 4. 流式: OpenAI ⇄ Anthropic 已接入 (StreamTranslate 跨协议模式 + 流式扇出);
-    //    Responses (ingress 或 egress) 仍 501 — 其 read_response_events 未实现
-    //    (返回空), 放行会静默翻译出空流. 文案与 same_proto 路径的 Responses 流式
+    //    Responses (ingress 或 egress) 仍 501 — 保守门, 按阻塞点分述:
+    //    ingress=Responses: 流式 writer (`write_response_event`) 未实现, 硬阻塞;
+    //    egress=Responses: reader 已实现, 翻译链理论可用, 但未接线/未集成测试,
+    //    与 writer 侧整体解除 (方案 T4). 文案与 same_proto 路径的 Responses 流式
     //    501 同风格 (#183 D5).
     if ir.stream
         && (ingress_codec == CodecProtocol::OpenAIResponses

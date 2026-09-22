@@ -519,9 +519,56 @@ pub enum IrDelta {
     ReasoningDelta(String),
 }
 
-/// reader 端的流式解码状态. 用于 OpenAI flat stream 的 block 边界合成.
+/// Responses 流式 reader 追踪的单个 output item 的解码状态 (key = output_index).
 ///
-/// Anthropic 流是 1:1 的 (事件自带 block index), 此 state 在 Anthropic reader 中不使用.
+/// 设计纪律 (与 [`StreamDecodeState::tool_ir_index`] 同): **记录映射而非可重算** —
+/// ir_index 分配一经随 BlockStart 发出即成为事件流的一部分, 无法事后从 wire 推回.
+#[derive(Debug, Clone)]
+pub enum StreamItemState {
+    /// message item: 自身不发事件 (BlockStart 延迟到 content_part.added, per part,
+    /// 映射在 [`ResponsesDecodeState::part_ir_index`]); 此处仅登记归属,
+    /// output_item.done(message) 的兜底关闭据此判定.
+    Message,
+    /// function_call: BlockStart 已在 output_item.added 发出.
+    /// `args_delta_seen`: 是否收到过非空 arguments delta — output_item.done 的
+    /// "补发全量 arguments" 兜底判定 (从未流式过 → done item 带全量 → 补一条).
+    FunctionCall {
+        ir_index: usize,
+        args_delta_seen: bool,
+    },
+    /// reasoning: BlockStart 已在 output_item.added 发出; summary/正文两种 delta
+    /// 归一为 ReasoningDelta, BlockStop 在 output_item.done (reasoning 无 part 级事件).
+    Reasoning { ir_index: usize },
+    /// hosted tool (web_search_call/file_search_call/computer_call/mcp_call/...) 或
+    /// 未知类型: 该 item 的整族事件 (added/delta/done) 全部忽略, 不进 IR.
+    Dropped,
+}
+
+/// Responses 流式 reader 的解码状态 (其余协议 reader 恒为默认值, 零开销).
+#[derive(Debug, Clone, Default)]
+pub struct ResponsesDecodeState {
+    /// 下一可用 IR block index (全局递增, 按 BlockStart 发出顺序 0,1,2,...).
+    pub next_ir_index: usize,
+    /// 是否已发 MessageStart (`response.created` 只处理首个, 重复/乱序忽略).
+    pub started: bool,
+    /// 流程中是否出现过 function_call item — `response.completed` 推断 stop_reason
+    /// (ToolUse vs EndTurn) 的依据. 单独记录而非查 `items`: output_item.done 会
+    /// 消费 `items` 条目, 终止事件到达时表已可能为空.
+    pub saw_function_call: bool,
+    /// 每个 output item 的状态 (key = output_index).
+    pub items: std::collections::BTreeMap<u64, StreamItemState>,
+    /// `(output_index, content_index) → ir_index` — message 的 output_text parts.
+    /// 条目存在 = part 已开未关 (`content_part.done` 移除条目, 与 BlockStart 在
+    /// content_part.added / BlockStop 在 content_part.done 的对称配对一致);
+    /// refusal 等被跳过的 part 不登记 — 后续 delta/done 查不到映射自然忽略.
+    pub part_ir_index: std::collections::BTreeMap<(u64, u64), usize>,
+}
+
+/// reader 端的流式解码状态. 用于 OpenAI flat stream 与 Responses 事件流的 block 边界合成.
+///
+/// Anthropic 流是 1:1 的 (事件自带 block index), 顶层字段在 Anthropic reader 中不使用;
+/// Responses reader 只使用 [`Self::responses`] 子状态 (事件映射表见
+/// `codec::responses::read_responses_stream_event` 头部).
 #[derive(Debug, Clone, Default)]
 pub struct StreamDecodeState {
     /// 是否已发 MessageStart.
@@ -541,6 +588,8 @@ pub struct StreamDecodeState {
     /// 每个 OpenAI tool_call index 在 IR 中对应的 block index.
     /// 必须持久化记录, 不能在 finish 时 recompute — 否则 text 后到会导致 index 偏移.
     pub tool_ir_index: std::collections::BTreeMap<usize, usize>,
+    /// Responses 流式 reader 的解码状态 (其余协议恒为默认值, 零开销).
+    pub responses: ResponsesDecodeState,
 }
 
 // ─── StreamEncodeState ─────────────────────────────────────────────────────

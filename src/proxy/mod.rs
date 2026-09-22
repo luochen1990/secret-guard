@@ -32,7 +32,7 @@
 //!
 //! - **跨协议 + `stream=true`** (OpenAI ⇄ Anthropic): StreamTranslate 跨协议流式翻译,
 //!   经流式扇出回传 (redact 场景响应侧 restore); **Responses 任一侧例外** → 501
-//!   (Responses 流式 SSE 事件翻译未实现, 放行会翻译出空流).
+//!   (流式 writer 未实现; egress 侧 reader 已实现, 保守门待整体解除).
 //! - **Gemini/Ollama 跨协议** → 501 (codec 未覆盖, `Protocol::from_native` 返回 None).
 //!
 //! # fan_out 四路径 (响应扇出)

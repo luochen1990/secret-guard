@@ -6,7 +6,8 @@
 //! 但大幅精简以匹配 secret-guard 的 MVP 范围:
 //! - 覆盖 **OpenAI ⇄ Anthropic** 双向流式/非流式 (StreamTranslate).
 //! - 覆盖 **Responses ⇄ Chat Completions / Anthropic** 非流式 (经通用 IR 路径;
-//!   Responses 的 SSE 事件翻译未实现, 流式 → 501, 见 `proxy::cross_proto_forward`).
+//!   Responses 流式 writer 未实现 — reader 侧已实现, 流式 → 501,
+//!   见 `proxy::cross_proto_forward`).
 //! - 不覆盖 embeddings/moderation/rerank.
 //! - **不做** prompt caching / citations / logprobs.
 //! - **不做** Bedrock eventstream 二进制流.
