@@ -70,4 +70,8 @@ jobs:
         uses: crate-ci/typos@v1
 
       - name: deny (licenses / bans / sources, offline)
-        run: just deny-offline
+        # cargo deny 走 cargo metadata 解析整个 Cargo.lock (含 wasm/android 等
+        # 非编译目标的 target-specific crate), rust-cache 只缓存编译实际用到的
+        # 依赖 — registry 不完整时 --offline 直接失败 (forgejo nix 环境预取了
+        # 全部依赖故无此问题). 先 fetch 补全 lock 全成员, deny 仍离线检查.
+        run: cargo fetch --locked && just deny-offline
