@@ -72,10 +72,10 @@ cargo install --git https://github.com/luochen1990/secret-guard
 [[providers]]
 id = "openai-main"
 kind = "direct"                         # 直连上游 (路由端点用 "router", 套餐池用 "pool")
+api_key = "sk-your-upstream-key"        # 条目级凭证, 全端点共享 — 必须写在 [[providers.endpoints]] 之前 (TOML 子表切换)
 [[providers.endpoints]]
-protocol = "openai"
-base_url = "https://api.openai.com"
-api_key = "sk-your-upstream-key"        # 转发时注入上游的 key (条目级, 全端点共享)
+protocol = "openai"                     # 每协议至多一条端点
+base_url = "https://api.openai.com"     # 入站协议无匹配端点时回退首端点
 
 [[secrets.entries]]
 id = "my-github-token"

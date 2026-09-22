@@ -89,10 +89,10 @@ all it takes):
 [[providers]]
 id = "openai-main"
 kind = "direct"                         # direct upstream (use "router" for routing endpoints, "pool" for plan pools)
+api_key = "sk-your-upstream-key"        # entry-level credential shared by all endpoints — must come BEFORE [[providers.endpoints]] (TOML sub-table switch)
 [[providers.endpoints]]
-protocol = "openai"                     # one [[providers.endpoints]] per protocol (same credential);
+protocol = "openai"                     # at most one [[providers.endpoints]] per protocol;
 base_url = "https://api.openai.com"     # unmatched ingress protocols fall back to the first endpoint
-api_key = "sk-your-upstream-key"        # injected into upstream requests
 
 [[secrets.entries]]
 id = "my-github-token"

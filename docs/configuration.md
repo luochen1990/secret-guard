@@ -49,10 +49,10 @@ api_keys_disabled = []    # static API key 被禁用的 label 集合 (态度层,
 [[providers]]
 id = "openai-main"
 kind = "direct"
+api_key = "sk-your-upstream-key"        # 凭证是条目级字段, 必须写在 [[providers.endpoints]] 之前 (见下文)
 [[providers.endpoints]]
 protocol = "openai"
 base_url = "https://api.openai.com"
-api_key = "sk-your-upstream-key"
 
 [[secrets.entries]]
 id = "my-github-token"
@@ -129,7 +129,9 @@ fail-fast), 对应构造的字段写在同一个 `[[providers]]`
 > Direct 构造的旧平铺字段 `protocol` / `base_url` / `common_uri` 已被
 > `[[providers.endpoints]]` 子表数组取代 (multi-endpoint 直接切换, 不做兼容读取) —
 > 老配置把这三个字段原样搬进一条 `[[providers.endpoints]]` 即可; 残留平铺字段会触发
-> 启动 WARN 且不生效。旧 state.toml 直接删除重置 (WebUI 会按新 schema 重建)。
+> 启动 WARN 且不生效。注意 `api_key` / `api_key_file` 本就是条目级字段无需搬动,
+> 但必须留在第一条 `[[providers.endpoints]]` **之前** (顺序陷阱见上方字段表)。
+> 旧 state.toml 直接删除重置 (WebUI 会按新 schema 重建)。
 
 **共享字段** (三种构造均可配):
 
@@ -153,8 +155,8 @@ egress 端点由 ingress 协议选定 — 精确匹配 → 同协议透传 (byte
 | `endpoints[].protocol` | string | (必填) | 该端点的上游协议: `openai` / `anthropic` / `gemini` / `ollama` / `openairesponses` (OpenAI Responses API)。 |
 | `endpoints[].base_url` | string | (必填) | 该端点的上游 base URL. 必须以 `http://` 或 `https://` 开头, **末尾不带 `/`** (路径由 secret-guard 拼接). 如 `https://api.openai.com`. |
 | `endpoints[].common_uri` | string | — | (per 端点) secret-guard **自建请求** (拉取上游模型清单, 用于 router `/models` 合成) 的公共 URI 前缀, 即三段式 `base_url + common_uri + request_uri` 的中段. **不影响转发** (转发路径随客户端请求原样透传). `"/v1"` = 裸根布局 (OpenAI/Anthropic 官方形态); `""` = 版本前缀已含 (智谱 GLM coding plan / DeepSeek / Moonshot 等, models 端点 = `base + /models`); 任意 `/` 开头的自定义前缀 (如智谱老接口 `/api/paas/v4`) 也合法. 缺省 = 未探测, 运行时按 `"/v1"` → `""` 顺序自动推导. 通常无需手写 — WebUI 端点行的 Detect 按钮探测后自动填充并随保存落盘 (badge 追加回显在该行 base_url 输入框后). 值域校验: `""` 或以 `/` 开头的 path 片段 (无尾斜杠, 不含 `?`/`#`/空格, ≤64 字符). **注意**: WebUI/API 的 PUT 对 `endpoints` 是**全量必填**语义 (缺失/空数组 → 400), 行内不带 `common_uri` (= null) 即清除为未探测; SDK 脚本编辑 provider 时请先读回原值再整体提交. |
-| `api_key` | string | `""` | 上游 API key 明文, **所有端点共享**. 与 `api_key_file` 互斥 (同时设置启动报错). |
-| `api_key_file` | path | — | 从文件读 API key (**所有端点共享**; 适合 sops-nix / systemd LoadCredential 等外部注入, 让 toml 本身不含敏感数据). 每次请求时读取, 读不到按空 key 处理并打 WARN. 文件内容自动去首尾空白. |
+| `api_key` | string | `""` | 上游 API key 明文, **所有端点共享**. 与 `api_key_file` 互斥 (同时设置启动报错). ⚠️ **TOML 顺序陷阱**: 凭证字段属于条目级, 必须写在 `[[providers.endpoints]]` **之前** — TOML 的 `[[子表数组]]` 头会切换"当前表", 写在其后的键归属 endpoint 而非条目, 会被 unknown-field WARN 忽略 (凭证静默丢失, 上游 401). 详见双端点示例. |
+| `api_key_file` | path | — | 从文件读 API key (**所有端点共享**; 适合 sops-nix / systemd LoadCredential 等外部注入, 让 toml 本身不含敏感数据). 每次请求时读取, 读不到按空 key 处理并打 WARN. 文件内容自动去首尾空白. 顺序陷阱同 `api_key`. |
 
 双端点示例 — 智谱 GLM (同一凭证, `/o/zhipu` 与 `/a/zhipu` 两个入口各自同协议透传):
 
@@ -192,10 +194,10 @@ ingress 协议由请求 URL 决定, egress 协议由链尾实体决定 (不同�
 [[providers]]
 id = "anthropic-main"
 kind = "direct"
+api_key_file = "/run/credentials/anthropic.key"   # 与 api_key 二选一 (所有端点共享); 同样是条目级字段, 须在 [[providers.endpoints]] 之前
 [[providers.endpoints]]
 protocol = "anthropic"
 base_url = "https://api.anthropic.com"
-api_key_file = "/run/credentials/anthropic.key"   # 与 api_key 二选一 (所有端点共享)
 ```
 
 ### 路由 endpoint (routes) — 按请求 model 的路由转发
@@ -208,18 +210,18 @@ api_key_file = "/run/credentials/anthropic.key"   # 与 api_key 二选一 (所�
 [[providers]]
 id = "openai-main"
 kind = "direct"
+api_key = "sk-..."
 [[providers.endpoints]]
 protocol = "openai"
 base_url = "https://api.openai.com"
-api_key = "sk-..."
 
 [[providers]]
 id = "anthropic-main"
 kind = "direct"
+api_key_file = "/run/credentials/anthropic.key"
 [[providers.endpoints]]
 protocol = "anthropic"
 base_url = "https://api.anthropic.com"
-api_key_file = "/run/credentials/anthropic.key"
 
 [[providers]]
 id = "my-model"
@@ -317,18 +319,18 @@ unix 秒, 多值取最晚). 全部失败 → `now + cooldown_secs` 兜底. 解�
 [[providers]]
 id = "glm-acc1"
 kind = "direct"
+api_key_file = "/run/credentials/glm-acc1.key"     # 每成员一份独立凭证; 同为条目级, 须在 [[providers.endpoints]] 之前
 [[providers.endpoints]]
 protocol = "openai"
 base_url = "https://open.bigmodel.cn/api/paas/v4"
-api_key_file = "/run/credentials/glm-acc1.key"     # 每成员一份独立凭证
 
 [[providers]]
 id = "glm-acc2"
 kind = "direct"
+api_key_file = "/run/credentials/glm-acc2.key"
 [[providers.endpoints]]
 protocol = "openai"
 base_url = "https://open.bigmodel.cn/api/paas/v4"
-api_key_file = "/run/credentials/glm-acc2.key"
 
 [[providers]]
 id = "glm-pool"
@@ -482,6 +484,7 @@ key = "sg_ci_abc123..."
 | ``TOML parse error ... [[providers]] missing field `kind``` | provider 条目缺少构造判别字段 (#187 起必填): 补 `kind = "direct"` (直连上游) / `"router"` (路由) / `"pool"` (套餐池). 报错行号指向对应 `[[providers]]` 表头. |
 | ``TOML parse error ... [[providers]] unknown variant `virtual`, expected `direct`, `router`, or `pool``` | 旧版 `kind = "virtual"` 已删除: 改为 `kind = "router"`, 原 `route_to` 指向改写为一条 `[[providers.routes]]` (`model_pattern = "*"` + `target = ...`), 原 `model_override` 改为路由的 `upstream_model` 字段. |
 | 启动 WARN `unknown field route_to` / `unknown field model_override` | 这两个 providers 顶层字段已删除 (#159 静态预检对残留字段告警, 残留不生效): 改写为 `[[providers.routes]]` 子表 (见上文 Router 构造). |
+| 启动 WARN `unknown field 'api_key' in providers[0].endpoints[0]` + **上游 401** | 凭证字段写到了 `[[providers.endpoints]]` 子表之后 — TOML 子表头切换"当前表", 其后的键归属 endpoint 被静默忽略, 凭证丢失. 把 `api_key` / `api_key_file` 移到条目级 (第一条 `[[providers.endpoints]]` 之前), 见上方字段表顺序陷阱. |
 | `TOML parse error ... [[secrets]] invalid type: map, expected a sequence` | secret 必须写 `[[secrets.entries]]`, 不能写 `[[secrets]]`. 报错前会先输出一行 WARN `did you mean [[secrets.entries]]?` 指路. |
 | 启动 WARN `unknown field ... did you mean ...?` | 字段拼写错误. 可选字段拼错会被忽略不生效 (仅 WARN 提示), "以为配了实际没配", 须修正; 必填字段 (如 `endpoints[].protocol`) 拼错则 WARN 后再报 `missing field` 启动失败. `[[providers.routes]]` 与 `[[providers.endpoints]]` 内的未知字段同样会 WARN (定位含 entry 下标). |
 | `base_url must not end with '/'` | 去掉末尾 `/`, 路径由 secret-guard 拼接. |
