@@ -2846,16 +2846,17 @@ test.describe("Provider endpoints 弹窗 (M2 走查 + 行卡片重设计)", () =
     await expect(page.locator("#providers-body tr").first()).toBeVisible();
   });
 
-  // M2 走查回归: translate 徽章的流式语义必须与实际行为一致 — OpenAI⇄Anthropic
-  // 流式翻译已接入 (StreamTranslate), 仅含 Responses 任一侧的 pair 是非流式
-  // (stream=true → 501). 历史缺陷: tooltip 写死 "Non-streaming only" (过时的
-  // #183 前文案), 且 CODEC_SUPPORTED 缺 openairesponses (Responses 行误显示
-  // "not supported" — Responses⇄Chat 非流式翻译实际可用).
+  // M2 走查回归: translate 徽章的流式语义必须与实际行为一致 — codec 覆盖族
+  // (openai/anthropic/openairesponses) 任意 pair 流式翻译均已接入 (StreamTranslate;
+  // Responses 流式 writer 落地后统一, 不再按 pair 分化). 历史缺陷: tooltip 写死
+  // "Non-streaming only" (过时的 #183 前文案), 且 CODEC_SUPPORTED 缺
+  // openairesponses (Responses 行误显示 "not supported" — Responses⇄Chat
+  // 翻译实际可用).
   // multi-endpoint 后 direct 条目的弹窗改为 per 端点行形态, 矩阵宿主 = mock-router
   // (种子 router 条目, 链尾 = mock-openai 的 openai 单端点 — 三态断言不变);
   // data-id 精确定位: mock-router 行 URL 列含 "mock-openai" 路由摘要, hasText
   // 会双匹配.
-  test("router provider: direct/translate 三态矩阵 + 流式 tooltip 按 pair 分化", async ({ page }) => {
+  test("router provider: direct/translate 三态矩阵 + 流式 tooltip 统一", async ({ page }) => {
     await page.locator('button[data-action="endpoints"][data-id="mock-router"]').click();
     const dlg = page.locator("#provider-endpoints");
     await expect(dlg).toBeVisible();
@@ -2872,9 +2873,11 @@ test.describe("Provider endpoints 弹窗 (M2 走查 + 行卡片重设计)", () =
     await expect(badgeOf("a")).toHaveText("translate");
     await expect(badgeOf("a")).toHaveAttribute("title", /streaming included/);
     await expect(badgeOf("a")).not.toHaveAttribute("title", /[Nn]on-streaming only/);
-    // /r/ 跨协议 (Responses⇄Chat) → translate (非 not supported), 非流式 tooltip.
+    // /r/ 跨协议 (Responses⇄Chat) → translate (非 not supported), 流式 tooltip
+    // 统一 (Responses 流式落地后与 /a/ 同文案).
     await expect(badgeOf("r")).toHaveText("translate");
-    await expect(badgeOf("r")).toHaveAttribute("title", /non-streaming only/);
+    await expect(badgeOf("r")).toHaveAttribute("title", /streaming included/);
+    await expect(badgeOf("r")).not.toHaveAttribute("title", /[Nn]on-streaming only/);
     // /g/ /l/ 无 codec → not supported.
     await expect(rowOf("g").locator(".unsupported")).toHaveText("not supported");
     await expect(rowOf("l").locator(".unsupported")).toHaveText("not supported");

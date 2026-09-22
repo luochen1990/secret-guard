@@ -34,8 +34,10 @@
 //!
 //! 流式: reader + writer 双侧已实现 — 事件→IR 映射表见 `read_responses_stream_event`,
 //! IR→事件合成规格见 `write_responses_stream_event` (done 族帧需要累积状态, 由
-//! `ResponsesEncodeState` 承载). proxy 层流式路径的 501 gate 解除与集成测试在
-//! 后续提交 (方案 D4).
+//! `ResponsesEncodeState` 承载). proxy 层流式接线: same_proto restore 路径
+//! (`proxy/same_proto.rs`) + 跨协议翻译路径 (`proxy/cross_proto.rs`), 端到端行为由
+//! 集成测试锁定 (`cross_protocol_streaming_translates_*` /
+//! `responses_streaming_with_secret_hit_restores_mock`, tests/integration.rs).
 //!
 //! # 同协议 round-trip (FWD-2)
 //!

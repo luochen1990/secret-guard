@@ -287,8 +287,8 @@ API key CRUD **无条件挂载** (在 `web::router()`, 不依赖 `auth.enabled`)
   集合文案 `protocolSetLabel` — 单一 → 该 protocol, 短列表逗号连接, 放不下 →
   `mixed`), 忽略路由 upstream_model 重写对后续跳匹配的影响 (展示无需 per-model
   精确解析). protocol pill 显示路由 egress 的去重集合. egress 标记挂静态教育 tooltip
-  (跨协议代价: reasoning_content 丢弃; 流式翻译仅 OpenAI⇄Anthropic, 含 Responses
-  任一侧时 stream=true → 501 — M2 走查对齐实际行为).
+  (跨协议代价: reasoning_content 丢弃; 流式翻译支持 — codec 覆盖族任意 pair 均可,
+  M2 走查的 Responses 非流式例外已随其流式 writer 落地移除).
 - **列表 direct 行** (multi-endpoint): 每端点一枚 protocol pill (集合展示, tooltip
   附该端点 base_url); URL cell 显示第一端点 base_url (声明序 = fallback 序) +
   "+N" 角标 (td title 全量 `protocol: base_url` 列表). disabled 行同型展示.
@@ -307,8 +307,9 @@ API key CRUD **无条件挂载** (在 `web::router()`, 不依赖 `auth.enabled`)
   或虚线 "not supported" (unsupported 行无 Models/Copy 按钮 — 不引导不可用动作).
   per-ingress 模式判定 (`ingressMode`) 按**链尾端点集合** (D2 语义): 集合含 ingress →
   direct; 否则 fallback 首端点 — 双方都 codec 覆盖 → translate; 否则 unsupported.
-  单端点集合退化为旧单 egress 语义. translate 徽章 tooltip 按 pair 分化流式语义,
-  覆盖集 `CODEC_SUPPORTED` 与后端 `Protocol::codec_covered()` 同步.
+  单端点集合退化为旧单 egress 语义. translate 徽章 tooltip 统一流式语义
+  (streaming included, 不再按 pair 分化), 覆盖集 `CODEC_SUPPORTED` 与后端
+  `Protocol::codec_covered()` 同步.
 - 主题行 `#provider-endpoints-subject` 回显 provider id / name / egress (链尾端点
   集合的协议并集文案, `protocolSetLabel`).
 - **Models 预览** (`GET /api/providers/{id}/models`): 每行 Models 按钮惰性展开

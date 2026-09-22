@@ -20,7 +20,9 @@
 //!   `redact_ir` + `StringLeafOps`, 已由 fwd_property.rs 的 openai/anthropic
 //!   FWD-1 property 覆盖 redact 核心逻辑. Responses 特有的字符串叶子 (reasoning
 //!   summary) 由 `redact_reasoning_summary_is_replaced` 单测守卫.
-//! - 流式翻译: Responses 流式 writer 未实现 (流式 → 501; reader 侧已实现).
+//! - 流式翻译的 property (STR-*/FWD-1 流式半段): Responses SSE 生成器待
+//!   fwd_streaming_property.rs 补齐; 端到端行为先由集成测试锁定
+//!   (同协议 restore / r⇄o / a→r, `tests/integration.rs`).
 use proptest::prelude::*;
 use serde_json::{Value, json};
 

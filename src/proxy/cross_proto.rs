@@ -11,12 +11,9 @@
 //!
 //! # 范围与限制
 //!
-//! codec 覆盖族内 (openai/anthropic/openairesponses) 任意 pair 的非流式翻译均经通用
-//! IR 路径承载 (含 Responses 参与的 pair, 双向各有集成测试锁定). 流式翻译仅
-//! OpenAI ⇄ Anthropic (StreamTranslate); Responses (ingress 或 egress) 的流式返回
-//! 501 — ingress 侧 Responses 流式 writer 未实现 (硬阻塞), egress 侧 reader 已实现
-//! 但链路未接线/未测试, 待 writer 侧完成后整体解除
-//! (同 same_proto 路径的 Responses 流式 501, #183 D5).
+//! codec 覆盖族内 (openai/anthropic/openairesponses) 任意 pair 的翻译 — 非流式经
+//! 通用 IR 路径, 流式经 StreamTranslate — 均已承载 (含 Responses 参与的 pair,
+//! 双向各有集成测试锁定).
 
 use std::time::Instant;
 
@@ -52,11 +49,8 @@ use super::recorder::{
 ///
 /// # 限制
 ///
-/// - codec 覆盖族内 (openai/anthropic/responses) 任意 pair 均可翻译; gemini/ollama
-///   任一侧 → 501 (`Protocol::from_native` 返回 None).
-/// - **Responses (ingress 或 egress) + stream=true → 501**: 保守门 — ingress 侧
-///   Responses 流式 writer (`write_response_event`) 未实现 (硬阻塞); egress 侧
-///   reader 已实现但链路未接线/未测试, 待 writer 侧完成后整体解除.
+/// - codec 覆盖族内 (openai/anthropic/responses) 任意 pair (流式与非流式) 均可翻译;
+///   gemini/ollama 任一侧 → 501 (`Protocol::from_native` 返回 None).
 /// - **应用 redact**: 跨协议 + redact 通过 [`crate::redact::redact_ir`] 在 IR 层做替换,
 ///   不会与 codec 翻译冲突. 响应侧: 非流式经 `restore_ir_response`, 流式经
 ///   StreamTranslate 的 restore hook (mock→real, RED-7).
@@ -107,30 +101,12 @@ pub(crate) async fn cross_proto_forward(
         model_rewrite.as_deref(),
     )?;
 
-    // 4. 流式: OpenAI ⇄ Anthropic 已接入 (StreamTranslate 跨协议模式 + 流式扇出);
-    //    Responses (ingress 或 egress) 仍 501 — 保守门, 按阻塞点分述:
-    //    ingress=Responses: 流式 writer (`write_response_event`) 未实现, 硬阻塞;
-    //    egress=Responses: reader 已实现, 翻译链理论可用, 但未接线/未集成测试,
-    //    与 writer 侧整体解除 (方案 T4). 文案与 same_proto 路径的 Responses 流式
-    //    501 同风格 (#183 D5).
-    if ir.stream
-        && (ingress_codec == CodecProtocol::OpenAIResponses
-            || egress_codec == CodecProtocol::OpenAIResponses)
-    {
-        return Err(AppError::NotImplemented(format!(
-            "streaming cross-protocol ({ingress} → {}) is not yet supported \
-             (Responses SSE event translation unimplemented); disable stream=true \
-             in the client request",
-            egress.name()
-        )));
-    }
-
-    // 5. 若 egress 要求 max_tokens 而 IR 缺失, 注入默认值.
+    // 4. 若 egress 要求 max_tokens 而 IR 缺失, 注入默认值.
     if egress_writer.requires_max_tokens() && ir.max_tokens.is_none() {
         ir.max_tokens = Some(crate::codec::DEFAULT_MAX_TOKENS);
     }
 
-    // 6. 清空 ingress-only 元数据:
+    // 5. 清空 ingress-only 元数据:
     //    - extra: ingress-only 字段会泄漏到 egress, 一并清空. (注: Responses 的
     //      hosted tools 不在 extra — tools 是 modeled 字段被 collect_extra 排除,
     //      丢弃发生在 reader 读取时并在该处 WARN, 见 responses.rs read_request)
@@ -138,10 +114,10 @@ pub(crate) async fn cross_proto_forward(
     ir.extra.clear();
     ir.clear_wire_fidelity();
 
-    // 7. 快照真实 messages (redact 前) 给 DAG.
+    // 6. 快照真实 messages (redact 前) 给 DAG.
     let real_messages = ir.messages.clone();
 
-    // 8. redact IR + derive redactions (共享 helper, 内含 consistency-check 守卫).
+    // 7. redact IR + derive redactions (共享 helper, 内含 consistency-check 守卫).
     //    FailClosed 模式下 probing 耗尽时 redact_and_derive 内部构造 503 并在此
     //    `?` 拒绝转发 (防 secret 泄露).
     let (redaction_map, redact_seed, redactions, redact_hits) = redact_and_derive(
@@ -151,8 +127,8 @@ pub(crate) async fn cross_proto_forward(
         "cross-proto",
     )?;
 
-    // 9. IR → egress body. (T5: 请求侧 ReasoningContent blocks 会被 egress writer
-    //    丢弃 (#176, 见 count_reasoning_blocks 假设声明) — 计数, WARN 在步骤 12 后
+    // 8. IR → egress body. (T5: 请求侧 ReasoningContent blocks 会被 egress writer
+    //    丢弃 (#176, 见 count_reasoning_blocks 假设声明) — 计数, WARN 在步骤 11 后
     //    record_id 就位时打.)
     let dropped_req_reasoning = count_reasoning_blocks(&ir.system)
         + ir.messages
@@ -163,10 +139,10 @@ pub(crate) async fn cross_proto_forward(
     let egress_bytes = serde_json::to_vec(&egress_body_value)
         .map_err(|e| AppError::Internal(format!("serialize egress body failed: {e}")))?;
 
-    // 10. 构造上游 URL (egress writer 的固定 path; base 来自选定端点).
+    // 9. 构造上游 URL (egress writer 的固定 path; base 来自选定端点).
     let upstream_url = format!("{}{}", endpoint.base_url, egress_writer.upstream_path());
 
-    // 11. 复制请求 headers + 应用 egress 协议的 auth.
+    // 10. 复制请求 headers + 应用 egress 协议的 auth.
     let mut fwd_headers = sanitize_request_headers(&parts.headers);
     fwd_headers.remove(axum::http::header::CONTENT_TYPE);
     fwd_headers.remove(axum::http::header::CONTENT_LENGTH);
@@ -184,7 +160,7 @@ pub(crate) async fn cross_proto_forward(
             .or_insert_with(|| HeaderValue::from_static(ANTHROPIC_VERSION));
     }
 
-    // 12. push 到 DAG.
+    // 11. push 到 DAG.
     let path_for_record = format!(
         "/{}/{}/{}  [{} → {}]",
         fp.proto,
@@ -227,10 +203,10 @@ pub(crate) async fn cross_proto_forward(
         &redact_hits,
     );
 
-    // T5: 跨协议丢弃可观测性 — 计数在丢弃点 (步骤 9 请求历史 / 步骤 15 响应) 已算,
+    // T5: 跨协议丢弃可观测性 — 计数在丢弃点 (步骤 8 请求历史 / 步骤 15 响应) 已算,
     // record_id 此刻才产生, WARN 延后到这里打 (只记计数, 绝不记内容).
     // reasoning = IrBlock::ReasoningContent (思考原文); hosted tools 的丢弃 WARN
-    // 不在此处 — 在 responses.rs reader 丢弃点 (见步骤 6 注释).
+    // 不在此处 — 在 responses.rs reader 丢弃点 (见步骤 5 注释).
     if dropped_req_reasoning > 0 {
         warn!(
             %record_id,
@@ -248,7 +224,7 @@ pub(crate) async fn cross_proto_forward(
         "cross-proto forwarding"
     );
 
-    // 13. 发送到上游. 响应头超时按流式语义选档 (#175): ir.stream 是 writer 产出的
+    // 12. 发送到上游. 响应头超时按流式语义选档 (#175): ir.stream 是 writer 产出的
     //     egress body 真实语义 (该 body 发往上游) — 流式请求走 TTFT 档, 非流式走
     //     整响应档, 与 same_proto 路径同构.
     let upstream_resp = super::recorder::send_upstream_or_fail(
@@ -266,7 +242,7 @@ pub(crate) async fn cross_proto_forward(
     )
     .await?;
 
-    // 14. 判型: 流式请求 + 2xx + SSE → 跨协议流式翻译扇出 (mpsc 管道, 不 buffer);
+    // 13. 判型: 流式请求 + 2xx + SSE → 跨协议流式翻译扇出 (mpsc 管道, 不 buffer);
     //     其余 (非流式请求 / 非 2xx / 非 SSE) 落入下方 buffered 翻译路径.
     //     假设: 上游对 stream=true 的 2xx 响应 Content-Type 是 text/event-stream;
     //     不成立时 (如上游不支持流式返回整 JSON) 走 buffered 翻译 + WARN 降级,
@@ -310,7 +286,7 @@ pub(crate) async fn cross_proto_forward(
         .await;
     }
 
-    // 15. 完整 buffer 上游响应 (非流式 / 非 2xx / 非 SSE 判型降级). 受 MAX_RESP_BODY_RECORD 上限保护.
+    // 14. 完整 buffer 上游响应 (非流式 / 非 2xx / 非 SSE 判型降级). 受 MAX_RESP_BODY_RECORD 上限保护.
     let resp_bytes: Bytes = {
         let mut acc: Vec<u8> = Vec::new();
         let mut stream = upstream_resp.bytes_stream();
@@ -337,9 +313,9 @@ pub(crate) async fn cross_proto_forward(
                 }
             }
         }
-        // 15.5 Pool 耗尽旁路检测 (T2): 上游原文 (resp_status / resp_headers /
+        // 14.5 Pool 耗尽旁路检测 (T2): 上游原文 (resp_status / resp_headers /
         // 已累积的 acc) 在翻译前检测 — 用原文而非翻译后的 ingress envelope;
-        // 只读副本, 翻译 (步骤 16) 与检测互不相干 (FWD-1). 位置在两个早退
+        // 只读副本, 翻译 (步骤 15) 与检测互不相干 (FWD-1). 位置在两个早退
         // return (stream_err / cap) **之前**: 流中断时 acc 是部分字节, code
         // 通道 best-effort 降级, status/header 通道不受影响 — 与同协议
         // buffered_ir 路径的 error_kind 场景行为对称。
@@ -396,7 +372,7 @@ pub(crate) async fn cross_proto_forward(
         Bytes::from(acc)
     };
 
-    // 16. 翻译响应: egress JSON → IR → (restore redact) → ingress JSON.
+    // 15. 翻译响应: egress JSON → IR → (restore redact) → ingress JSON.
     let egress_reader = egress_codec.reader();
     let ingress_writer = ingress_codec.writer();
     // parsed view: 记录 LLM 视角的 IR (restore 之前, 含 mock). 仅 2xx 成功响应.
@@ -482,7 +458,7 @@ pub(crate) async fn cross_proto_forward(
         (resp_status, body)
     };
 
-    // 17. attach 响应到 DAG.
+    // 16. attach 响应到 DAG.
     let elapsed = started.elapsed().as_millis() as u64;
     // 视图正确性守卫: resp_parsed (非流式) 是 resp_bytes (SSOT) 经 egress reader 的派生视图.
     // 仅在 2xx 成功响应时触发 — 非 2xx 错误响应即便 reader 能解析也不派生 parsed
@@ -527,7 +503,7 @@ pub(crate) async fn cross_proto_forward(
     // record 最终态写入后打摘要 (#160).
     super::recorder::log_forward_summary(&state.dag, record_id);
 
-    // 18. 构造响应.
+    // 17. 构造响应.
     let mut resp = Response::new(Body::from(resp_body_out));
     *resp.status_mut() = resp_status_out;
     let mut out_headers = build_response_headers(&resp_headers);

@@ -2058,8 +2058,8 @@
         <div class="ep-subject" id="provider-endpoints-subject"></div>
         <div class="hint">
           Base pattern: <code>/{proto-short}/{provider-id}/*</code>. Same-protocol = direct;
-          cross-protocol = translation between OpenAI / Anthropic / Responses (streaming only for
-          OpenAI⇄Anthropic; Responses pairs are non-streaming); Gemini/Ollama ingress = not
+          cross-protocol = translation between OpenAI / Anthropic / Responses (streaming
+          included for all codec-covered pairs); Gemini/Ollama ingress = not
           supported. <b>Models</b> previews the model list the endpoint serves.
         </div>
       </header>
@@ -4947,9 +4947,10 @@
     // ─── provider 行渲染: router 路由摘要 + per-route egress 近似 (#179) ──────
     //
     // 跨协议教育提示 (静态, 无条件挂在 egress 标记上): 入口协议 ≠ 出口时的代价.
-    // 流式限定 = 实际行为: 含 Responses 任一侧时 stream=true → 501 (M2 走查对齐).
+    // 流式 = 实际行为: codec 覆盖族 (openai/anthropic/openairesponses) 任意 pair
+    // 流式均翻译 (含 Responses 任一侧, M2 走查口径随 Responses 流式落地更新).
     const EGRESS_CROSS_PROTO_TIP =
-      'If the ingress protocol ≠ this egress: cross-protocol translation kicks in — reasoning_content is dropped (streaming translated only when neither side is Responses)';
+      'If the ingress protocol ≠ this egress: cross-protocol translation kicks in — reasoning_content is dropped (streaming included)';
 
     // 启用 (priority 非 null) 路由中 priority 最大者; 并列按列表序先者 — 与后端
     // `RouterProvider::select_route` 的确定性 tie-break 一致. 空/全禁用 → null.
@@ -5397,9 +5398,8 @@
     // 判定 SSOT: 与后端 `proxy/mod.rs::dispatch` 一致 —
     //   ingress == egress → direct (同协议透传/IR redact);
     //   ingress != egress 且两者 codec 都覆盖 (openai/anthropic/openairesponses,
-    //     = 后端 `Protocol::codec_covered()`) → cross-protocol 翻译 — 经通用 IR
-    //     路径, 任意覆盖族 pair 均可; **流式仅 OpenAI⇄Anthropic** (StreamTranslate),
-    //     含 Responses 任一侧时 stream=true → 501 (其流式 writer 未实现, #183);
+    //     = 后端 `Protocol::codec_covered()`) → cross-protocol 翻译 — 非流式经通用
+    //     IR 路径, 流式经 StreamTranslate, 任意覆盖族 pair 均可 (含 Responses);
     //   任一协议 codec 不覆盖 (gemini/ollama) → 不支持.
     //
     // codec 覆盖集与 `codec::Protocol::from_native` 的 Some 集合同一事实两处编码
@@ -5468,7 +5468,7 @@
           const url = mode === 'unsupported'
             ? null
             : `${origin}/${short}/${encodeURIComponent(p.id)}/`;
-          return endpointRow(proto, short, mode, url, endpointProtocols(tail), p.id);
+          return endpointRow(proto, short, mode, url, p.id);
         }).join('');
       }
       // 主题行: provider id (code chip 强调) + name 去重 + egress 摘要 (链尾端点
@@ -5504,18 +5504,12 @@
     // Models 按钮; 次行 = endpoint URL (附 Copy 按钮) 或 not supported. models 面板
     // 初始隐藏, 由 toggleEndpointModels 惰性 fetch/展开. 三态分支拆为独立派生 (url
     // 行 + badge), 避免嵌套三元: badge 走 mode→string 查表.
-    // translate 的 tooltip 按 pair 分化 (M2 走查修复, 与 #183 后的实际行为对齐):
-    // 含 Responses 任一侧 → 非流式 (stream=true → 501, Responses 流式 writer 未实现);
-    // 否则 (OpenAI⇄Anthropic) → 流式翻译已接入 (StreamTranslate). egressProtos =
-    // 链尾端点协议集合 (multi-endpoint; 任一侧含 Responses 即非流式 — fallback
-    // 端点是集合首个, 集合近似下取并集保守标注).
-    function endpointRow(proto, short, mode, url, egressProtos, providerId) {
+    // translate 的 tooltip 统一 (codec 覆盖族任意 pair 流式均翻译, 含 Responses —
+    // M2 走查的 Responses 非流式例外已随其流式 writer 落地移除).
+    function endpointRow(proto, short, mode, url, providerId) {
       const label = escapeHtml(proto);
-      const involvesResponses = proto === 'openairesponses'
-        || egressProtos.includes('openairesponses');
-      const translateTip = involvesResponses
-        ? 'Cross-protocol translation — non-streaming only (stream=true returns 501: Responses SSE event translation unimplemented)'
-        : 'Cross-protocol translation (streaming included) — reasoning_content is dropped';
+      const translateTip =
+        'Cross-protocol translation (streaming included) — reasoning_content is dropped';
       const badge = {
         direct:      '<span class="badge badge-stream">direct</span>',
         translate:   `<span class="badge badge-warn" title="${translateTip}">translate</span>`,

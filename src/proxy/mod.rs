@@ -30,9 +30,8 @@
 //! 模型列表端点 → `models::handle_router_models` 本地合成 (别名 ∪ 过滤后上游清单),
 //! 不收集 body / 不做路由解析 / 不记 DAG。Direct provider 不进该分支。
 //!
-//! - **跨协议 + `stream=true`** (OpenAI ⇄ Anthropic): StreamTranslate 跨协议流式翻译,
-//!   经流式扇出回传 (redact 场景响应侧 restore); **Responses 任一侧例外** → 501
-//!   (流式 writer 未实现; egress 侧 reader 已实现, 保守门待整体解除).
+//! - **跨协议 + `stream=true`** (codec 覆盖族内任意 pair, 含 Responses 任一侧):
+//!   StreamTranslate 跨协议流式翻译, 经流式扇出回传 (redact 场景响应侧 restore).
 //! - **Gemini/Ollama 跨协议** → 501 (codec 未覆盖, `Protocol::from_native` 返回 None).
 //!
 //! # fan_out 四路径 (响应扇出)
