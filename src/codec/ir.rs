@@ -607,10 +607,84 @@ pub struct StreamEncodeState {
     pub responses: ResponsesEncodeState,
 }
 
-/// Responses 流式 writer 的累积状态 (内容由 T3 填充; 本任务只立骨架).
+/// Responses 流式 writer 追踪的单个 output item 的累积状态 (key = IR block index,
+/// 即合成帧的 `output_index` — 一一对应, 跨协议 reasoning 跳过产生的空洞已有先例).
+#[derive(Debug, Clone)]
+pub struct ResponsesItemAccum {
+    /// item 类型 (决定 added/done 族帧与 `response.completed` 重建的全量 item 形态).
+    pub kind: ResponsesItemKind,
+    /// 确定性合成的 item id (`msg_{n}` / `fc_{n}` / `rs_{n}`, n = 全局 item 序号).
+    /// 确定性 (而非随机量) 是幂等契约的一半: 探测重复调用产出相同帧.
+    pub item_id: String,
+    /// function_call 专属: 客户端回传 `function_call_output` 的关联键 = IR ToolUse id
+    /// (round-trip 保真的关键; item.id/call_id 双字段是非流式 `write_response` 先例).
+    pub call_id: String,
+    /// function_call 专属: 工具名.
+    pub name: String,
+    /// 内容累积 (BlockDelta 追加, done 族帧与 `response.completed` 读全量):
+    /// message 的 output_text / reasoning 的 summary text / function_call 的
+    /// arguments JSON 串 — 按 kind 单一字段, 无混合形态.
+    pub content: String,
+}
+
+/// [`ResponsesItemAccum`] 的 item 类型维度 (IR block meta → Responses item 类型).
+#[derive(Debug, Clone, Copy)]
+pub enum ResponsesItemKind {
+    /// message item (IR Text block; content_part 级帧由 writer 合成, content_index 恒 0).
+    Message,
+    /// function_call item (IR ToolUse block).
+    FunctionCall,
+    /// reasoning item (IR ReasoningContent block, 以 summary_text 形态合成).
+    Reasoning,
+}
+
+impl ResponsesItemAccum {
+    /// 无 call_id/name 的 item 构造 (message / reasoning).
+    pub fn simple(kind: ResponsesItemKind, item_id: String) -> Self {
+        Self {
+            kind,
+            item_id,
+            call_id: String::new(),
+            name: String::new(),
+            content: String::new(),
+        }
+    }
+}
+
+/// Responses 流式 writer 的累积状态 (其余协议 writer 恒为默认值, 零开销).
+///
+/// # 幂等契约 (translate 层探测调用)
+///
+/// `StreamTranslate` 的跳过 block 配对过滤会对 **BlockStart** 事件调用两次 writer
+/// (第一次探测 `is_empty`, 非空则丢弃帧、随后 emit 时再次调用). 因此 [`Self::items`]
+/// 的注册点 (BlockStart 处理) 必须幂等: 同一 index 已存在则不重复注册/不覆盖,
+/// `next_item_seq` 不重复递增 — 两次调用返回的帧因 item_id 确定性合成而完全一致.
+/// 其余事件类型 (Delta/Stop/Message*) 的探测只发生在 BlockStart, writer 每事件至多
+/// 调用一次; 元信息捕获仍取 "首个为准" (仅 None 时写), 对手工重复调用同样安全.
 #[derive(Debug, Clone, Default)]
 pub struct ResponsesEncodeState {
-    // T3 将添加: response 元信息 / items 累积 / 终止缓存
+    /// response 元信息 (MessageStart 捕获, 首个为准). `id`/`created` 缺失时在首次
+    /// 合成 response 骨架帧处隐式初始化 (synth id / now) **并写回** — 保证
+    /// created 与 completed/failed 帧携带同一 id/created_at (MessageStart 缺席的
+    /// 病态流也能宽容闭合).
+    pub id: Option<String>,
+    pub created: Option<u64>,
+    pub model: Option<String>,
+    /// 下一全局 item 序号 (`msg_{n}`/`fc_{n}`/`rs_{n}` 的 n, 从 0 递增).
+    /// 仅在 BlockStart 注册**新** item 时递增 (幂等: 已注册 index 不递增).
+    pub next_item_seq: usize,
+    /// 按 IR block index (== output_index) 累积的 items. BlockStop **不移除**条目 —
+    /// `response.completed` 的 output 需要全量 items 按 index 升序重建.
+    pub items: std::collections::BTreeMap<usize, ResponsesItemAccum>,
+    /// MessageDelta 缓存的终止信息 (终止事件合成用; "带信息的 delta 获胜" —
+    /// stop_reason 仅 Some 时覆盖, usage 仅 present 或非零时覆盖, 防病态后续
+    /// 全零 delta 冲掉真值). 注意 `usage_present` 当前不被 terminal 合成消费
+    /// (无条件写全量 usage 对象, 与非流式 `write_response` 先例一致 — 代价是
+    /// round-trip 时 reader 侧 present false→true 单向漂移); 保留作为方案 D3
+    /// 声明的状态面与后续 presence-保真改进 (present=false → usage:null) 的判据.
+    pub stop_reason: Option<IrStopReason>,
+    pub usage: IrUsage,
+    pub usage_present: bool,
 }
 
 // ─── IrError ───────────────────────────────────────────────────────────────

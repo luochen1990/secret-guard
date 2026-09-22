@@ -31,11 +31,11 @@
 //! - namespace tools flattening (留作后续)
 //! - reasoning 的 `encrypted_content` (provider-specific opaque, 不可跨协议)
 //! - `previous_response_id` 服务端状态 (secret-guard 是 stateless 代理)
-//! - Responses 流式 SSE 的 **writer 侧** (`write_response_event`): 未实现 — 流式 +
-//!   Redact 命中 / 跨协议任一侧 Responses 仍 501 (流式事件翻译的映射表与状态机见
-//!   `read_responses_stream_event`). reader 侧 `read_response_events` 已实现,
-//!   流式 resp_parsed 经 StreamScan 自动生效; 同协议无 Redact 时由字节透传
-//!   路径自然支持流式
+//!
+//! 流式: reader + writer 双侧已实现 — 事件→IR 映射表见 `read_responses_stream_event`,
+//! IR→事件合成规格见 `write_responses_stream_event` (done 族帧需要累积状态, 由
+//! `ResponsesEncodeState` 承载). proxy 层流式路径的 501 gate 解除与集成测试在
+//! 后续提交 (方案 D4).
 //!
 //! # 同协议 round-trip (FWD-2)
 //!
@@ -46,7 +46,7 @@ use serde_json::{Map, Value, json};
 
 use super::ir::{
     IrBlock, IrImageSource, IrMessage, IrRequest, IrResponse, IrRole, ResponsesDecodeState,
-    StreamItemState, blocks_has_text,
+    ResponsesEncodeState, ResponsesItemAccum, ResponsesItemKind, StreamItemState, blocks_has_text,
 };
 use super::{
     IrBlockMeta, IrDelta, IrError, IrStopReason, IrStreamEvent, IrTool, IrToolChoice, IrUsage,
@@ -384,18 +384,14 @@ impl Writer for ResponsesWriter {
 
     fn write_response_event(
         &self,
-        _ev: &super::IrStreamEvent,
-        _state: &mut super::ir::StreamEncodeState,
+        ev: &super::IrStreamEvent,
+        state: &mut super::ir::StreamEncodeState,
     ) -> Vec<(String, Value)> {
-        // Responses 流式 SSE 翻译尚未实现 (stub).
-        // 同协议透传路径不进入 codec; 跨协议流式返回 501.
-        // T3 将按方案 D3 合成: 经 `_state.responses` 累积 items, 1 IR 事件 → 0..n 帧.
-        Vec::new()
+        write_responses_stream_event(ev, &mut state.responses)
     }
 
     fn emits_sse_done_terminator(&self) -> bool {
-        // Responses 流以 response.completed 事件终止, 不用 [DONE].
-        // (流式翻译未实现, 此 flag 仅在跨协议流式路径生效, 当前不会到达.)
+        // Responses 流以 response.completed / response.failed 事件终止, 不用 [DONE].
         false
     }
 
@@ -1326,17 +1322,21 @@ fn write_tool_choice(tc: &IrToolChoice) -> Value {
     }
 }
 
-/// IrStopReason → Responses status 字符串.
-fn write_status(reason: Option<IrStopReason>) -> Value {
+/// IrStopReason → Responses status 字符串 (str 形态 SSOT — 非流式 `write_response`
+/// 与流式 `response.completed` 骨架共用, 集中避免两处映射漂移).
+fn write_status_str(reason: Option<IrStopReason>) -> &'static str {
     match reason {
-        None | Some(IrStopReason::EndTurn) | Some(IrStopReason::StopSequence) => {
-            json!("completed")
-        }
-        Some(IrStopReason::MaxTokens) => json!("incomplete"),
-        Some(IrStopReason::ToolUse) => json!("completed"), // 工具调用也算 completed
-        Some(IrStopReason::Safety) | Some(IrStopReason::Refusal) => json!("incomplete"),
-        Some(IrStopReason::Other) => json!("failed"),
+        None | Some(IrStopReason::EndTurn) | Some(IrStopReason::StopSequence) => "completed",
+        Some(IrStopReason::MaxTokens) => "incomplete",
+        Some(IrStopReason::ToolUse) => "completed", // 工具调用也算 completed
+        Some(IrStopReason::Safety) | Some(IrStopReason::Refusal) => "incomplete",
+        Some(IrStopReason::Other) => "failed",
     }
+}
+
+/// IrStopReason → Responses status 字符串 (Value 形态, 非流式 `write_response` 用).
+fn write_status(reason: Option<IrStopReason>) -> Value {
+    json!(write_status_str(reason))
 }
 
 /// IR usage → Responses 风格 usage JSON ({input_tokens, output_tokens, total_tokens}).
@@ -1352,6 +1352,458 @@ fn responses_usage_json(u: &IrUsage) -> Value {
 /// 合成 response id (resp_ 前缀 + base62).
 fn synth_response_id() -> String {
     format!("resp_{}", random_base62(24))
+}
+
+// ─── Helpers: write (streaming) ─────────────────────────────────────────────
+
+/// IR 事件 → Responses SSE 帧序列 (fan-out, 0..n), 实现规格 = Responses 流式
+/// 支持方案的 D3 合成表 (与 reader 侧 `read_responses_stream_event` 对称的逆映射).
+///
+/// 核心合成决策 (rationale 见方案文档):
+/// - **有状态累积**: done 族帧 (`output_item.done` / 终止事件) 携带全量
+///   item/response, 内容由 `ResponsesEncodeState` 按 IR block index 累积;
+/// - **1 IR 事件 → 0..n 帧**: `BlockStart{Text}` 产出 item + part 两帧,
+///   `BlockStop` 产出 done 族 2-3 帧, `MessageDelta` 缓存不发帧;
+/// - **终止事件 type 按 status 分派**: completed / incomplete / failed 三分
+///   (incomplete_details 只随 incomplete 事件携带, 与 reader 侧分支对称);
+/// - **item_id 确定性合成**: `msg_{n}` / `fc_{n}` / `rs_{n}` (n = 全局 item 序号),
+///   ToolUse 的 `call_id` = IR id (round-trip 关联键);
+/// - **output_index = IR block index**, `content_index`/`summary_index` 恒 0
+///   (每 part 一个 block 的折叠逆操作), `sequence_number` 省略 (SDK 不依赖).
+///
+/// 幂等契约 (T1 移交): translate 层对 BlockStart 有探测调用 (非空 → 同一事件再次
+/// 调用), 注册点在 [`stream_write_block_start`] 内幂等 (详见 state 字段注释).
+/// 病态 IR 流 (BlockStart/Delta/Stop 先于 MessageStart / 孤儿 BlockStop /
+/// delta-kind 与 item-kind 错配) 全部宽容降级, 永不 panic (ROB-*).
+fn write_responses_stream_event(
+    ev: &IrStreamEvent,
+    state: &mut ResponsesEncodeState,
+) -> Vec<(String, Value)> {
+    match ev {
+        IrStreamEvent::MessageStart {
+            id, created, model, ..
+        } => stream_write_message_start(id, created, model, state),
+        IrStreamEvent::BlockStart { index, block } => {
+            stream_write_block_start(*index, block, state)
+        }
+        IrStreamEvent::BlockDelta { index, delta } => {
+            stream_write_block_delta(*index, delta, state)
+        }
+        IrStreamEvent::BlockStop { index } => stream_write_block_stop(*index, state),
+        IrStreamEvent::MessageDelta {
+            stop_reason,
+            usage,
+            usage_present,
+            ..
+        } => {
+            // 缓存终止信息, 不发帧 (汇总在 MessageStop 的终止事件).
+            // "带信息的 delta 获胜": stop_reason 仅 Some 时覆盖; usage 在
+            // present=true (显式回显, 即使全零) 或携带非零值时覆盖 — 防护
+            // 针对 present=false 的全零 delta (病态) 冲掉真值.
+            if stop_reason.is_some() {
+                state.stop_reason = *stop_reason;
+            }
+            if *usage_present || !usage.is_zero() {
+                state.usage = usage.clone();
+                state.usage_present = *usage_present;
+            }
+            Vec::new()
+        }
+        IrStreamEvent::MessageStop => {
+            // 终止事件 type = `response.{status}` (官方 wire 语义: incomplete/failed
+            // 状态用对应事件承载, 客户端 SDK 按事件 type 分派; 恒发 completed 会让
+            // incomplete_details 被 status-completed 处理路径忽略 — reader 侧同理,
+            // 只有 `response.incomplete` 分支读 incomplete_details).
+            let event_type = format!("response.{}", write_status_str(state.stop_reason));
+            vec![(
+                event_type.clone(),
+                json!({
+                    "type": event_type,
+                    "response": stream_write_terminal_response(state),
+                }),
+            )]
+        }
+        IrStreamEvent::Error(msg) => stream_write_error(msg, state),
+    }
+}
+
+/// `MessageStart` → `response.created` (response 骨架: status=in_progress,
+/// output=[], usage=null), 同时捕获元信息 (首个为准, 不覆盖 — 幂等安全).
+/// MessageStart 携带的 usage 忽略: Responses 的完整 usage 只在 completed 携带
+/// (translate 层的 terminal backfill 已保证 input_tokens 落到 terminal delta).
+fn stream_write_message_start(
+    id: &Option<String>,
+    created: &Option<u64>,
+    model: &Option<String>,
+    state: &mut ResponsesEncodeState,
+) -> Vec<(String, Value)> {
+    if state.id.is_none() {
+        state.id = id.clone();
+    }
+    if state.created.is_none() {
+        state.created = *created;
+    }
+    if state.model.is_none() {
+        state.model = model.clone();
+    }
+    vec![(
+        "response.created".to_string(),
+        json!({
+            "type": "response.created",
+            "response": response_skeleton(state, "in_progress"),
+        }),
+    )]
+}
+
+/// `BlockStart` → added 族帧 (message 额外产 part 帧).
+///
+/// 幂等契约落点: 已注册的 index 不重复注册/不覆盖、`next_item_seq` 不重复递增,
+/// 两次调用返回的帧因 item_id 确定性而完全一致 (探测调用的帧被丢弃也无害).
+fn stream_write_block_start(
+    index: usize,
+    block: &IrBlockMeta,
+    state: &mut ResponsesEncodeState,
+) -> Vec<(String, Value)> {
+    if !state.items.contains_key(&index) {
+        let seq = state.next_item_seq;
+        state.next_item_seq += 1;
+        let accum = match block {
+            IrBlockMeta::Text => {
+                ResponsesItemAccum::simple(ResponsesItemKind::Message, format!("msg_{seq}"))
+            }
+            IrBlockMeta::ToolUse { id, name } => ResponsesItemAccum {
+                kind: ResponsesItemKind::FunctionCall,
+                item_id: format!("fc_{seq}"),
+                call_id: id.clone(),
+                name: name.clone(),
+                content: String::new(),
+            },
+            IrBlockMeta::ReasoningContent => {
+                ResponsesItemAccum::simple(ResponsesItemKind::Reasoning, format!("rs_{seq}"))
+            }
+        };
+        state.items.insert(index, accum);
+    }
+    let accum = state
+        .items
+        .get(&index)
+        .expect("item registered immediately above");
+    let item_added = |item: Value| {
+        json!({
+            "type": "response.output_item.added",
+            "output_index": index,
+            "item": item,
+        })
+    };
+    match accum.kind {
+        ResponsesItemKind::Message => vec![
+            (
+                "response.output_item.added".to_string(),
+                item_added(json!({
+                    "id": accum.item_id,
+                    "type": "message",
+                    "status": "in_progress",
+                    "role": "assistant",
+                    "content": [],
+                })),
+            ),
+            (
+                "response.content_part.added".to_string(),
+                json!({
+                    "type": "response.content_part.added",
+                    "item_id": accum.item_id,
+                    "output_index": index,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": "", "annotations": []},
+                }),
+            ),
+        ],
+        ResponsesItemKind::FunctionCall => vec![(
+            "response.output_item.added".to_string(),
+            item_added(json!({
+                "id": accum.item_id,
+                "type": "function_call",
+                "status": "in_progress",
+                "call_id": accum.call_id,
+                "name": accum.name,
+                "arguments": "",
+            })),
+        )],
+        ResponsesItemKind::Reasoning => vec![
+            (
+                "response.output_item.added".to_string(),
+                item_added(json!({
+                    "id": accum.item_id,
+                    "type": "reasoning",
+                    "status": "in_progress",
+                    "summary": [],
+                })),
+            ),
+            // summary part 的 added/done 配对帧 (官方 reasoning 序列含此事件,
+            // 与 message 的 content_part.added 对称; reader 侧忽略之).
+            (
+                "response.reasoning_summary_part.added".to_string(),
+                json!({
+                    "type": "response.reasoning_summary_part.added",
+                    "item_id": accum.item_id,
+                    "output_index": index,
+                    "summary_index": 0,
+                    "part": {"type": "summary_text", "text": ""},
+                }),
+            ),
+        ],
+    }
+}
+
+/// `BlockDelta` → delta 族帧 + 内容累积到 `ItemAccum.content`.
+/// delta 类型与 item kind 错配 (病态 IR 流) / 未知 index (Delta 先于 Start) →
+/// 丢弃 (纵深防御, 不 panic).
+fn stream_write_block_delta(
+    index: usize,
+    delta: &IrDelta,
+    state: &mut ResponsesEncodeState,
+) -> Vec<(String, Value)> {
+    let Some(accum) = state.items.get_mut(&index) else {
+        return Vec::new();
+    };
+    match (delta, accum.kind) {
+        (IrDelta::TextDelta(d), ResponsesItemKind::Message) => {
+            accum.content.push_str(d);
+            vec![(
+                "response.output_text.delta".to_string(),
+                json!({
+                    "type": "response.output_text.delta",
+                    "item_id": accum.item_id,
+                    "output_index": index,
+                    "content_index": 0,
+                    "delta": d,
+                }),
+            )]
+        }
+        (IrDelta::InputJsonDelta(d), ResponsesItemKind::FunctionCall) => {
+            accum.content.push_str(d);
+            vec![(
+                "response.function_call_arguments.delta".to_string(),
+                json!({
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": accum.item_id,
+                    "output_index": index,
+                    "delta": d,
+                }),
+            )]
+        }
+        (IrDelta::ReasoningDelta(d), ResponsesItemKind::Reasoning) => {
+            accum.content.push_str(d);
+            vec![(
+                "response.reasoning_summary_text.delta".to_string(),
+                json!({
+                    "type": "response.reasoning_summary_text.delta",
+                    "item_id": accum.item_id,
+                    "output_index": index,
+                    "summary_index": 0,
+                    "delta": d,
+                }),
+            )]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// `BlockStop` → done 族帧 (全量内容, 从 `ItemAccum` 读取; 不移除条目 —
+/// 终止事件的 output 重建仍需要).
+/// 孤儿 BlockStop (无 ItemAccum 记录, 即 BlockStop 先于 BlockStart 的病态序列;
+/// Responses writer 自身的 BlockStart 恒产帧, 不会进 translate 层的配对过滤
+/// 跳过集合) → 空 Vec (纵深防御).
+fn stream_write_block_stop(index: usize, state: &mut ResponsesEncodeState) -> Vec<(String, Value)> {
+    let Some(accum) = state.items.get(&index) else {
+        return Vec::new();
+    };
+    let item_done = || {
+        json!({
+            "type": "response.output_item.done",
+            "output_index": index,
+            "item": completed_item_json(accum),
+        })
+    };
+    match accum.kind {
+        ResponsesItemKind::Message => vec![
+            (
+                "response.output_text.done".to_string(),
+                json!({
+                    "type": "response.output_text.done",
+                    "item_id": accum.item_id,
+                    "output_index": index,
+                    "content_index": 0,
+                    "text": accum.content,
+                }),
+            ),
+            (
+                "response.content_part.done".to_string(),
+                json!({
+                    "type": "response.content_part.done",
+                    "item_id": accum.item_id,
+                    "output_index": index,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": accum.content, "annotations": []},
+                }),
+            ),
+            ("response.output_item.done".to_string(), item_done()),
+        ],
+        ResponsesItemKind::FunctionCall => vec![
+            (
+                "response.function_call_arguments.done".to_string(),
+                json!({
+                    "type": "response.function_call_arguments.done",
+                    "item_id": accum.item_id,
+                    "output_index": index,
+                    "arguments": accum.content,
+                }),
+            ),
+            ("response.output_item.done".to_string(), item_done()),
+        ],
+        ResponsesItemKind::Reasoning => vec![
+            (
+                "response.reasoning_summary_text.done".to_string(),
+                json!({
+                    "type": "response.reasoning_summary_text.done",
+                    "item_id": accum.item_id,
+                    "output_index": index,
+                    "summary_index": 0,
+                    "text": accum.content,
+                }),
+            ),
+            (
+                "response.reasoning_summary_part.done".to_string(),
+                json!({
+                    "type": "response.reasoning_summary_part.done",
+                    "item_id": accum.item_id,
+                    "output_index": index,
+                    "summary_index": 0,
+                    "part": {"type": "summary_text", "text": accum.content},
+                }),
+            ),
+            ("response.output_item.done".to_string(), item_done()),
+        ],
+    }
+}
+
+/// `MessageStop` → 终止事件 (`response.completed` / `response.incomplete` /
+/// `response.failed`, type 由调用方按 status 分派) 的 response 全量对象:
+/// 骨架 + status (`write_status_str` 映射) + output 全量重建 (items 按 index 升序)
+/// + usage (cached, 无条件写全量对象 — 与非流式 `write_response` 一致)
+/// + incomplete_details (MaxTokens/Safety/Refusal 时给 reason, 其余 null).
+///
+/// 注意: stop_reason=Other 走 `response.failed` 但**不合成 error 对象** (IR 无
+/// 错误信息可编造, 与非流式 status=failed 无 error 的先例一致); reader 侧读到
+/// 后经 `stream_failed` 兜底文案转 Error 事件 — Other→Error 的往返漂移是已接受
+/// 的语义传达 (无法识别的终止 ≈ 失败).
+fn stream_write_terminal_response(state: &mut ResponsesEncodeState) -> Value {
+    let mut resp = response_skeleton(state, write_status_str(state.stop_reason));
+    let obj = resp.as_object_mut().expect("skeleton is always an object");
+    obj.insert(
+        "incomplete_details".to_string(),
+        match state.stop_reason {
+            Some(IrStopReason::MaxTokens) => json!({"reason": "max_output_tokens"}),
+            // Refusal 无官方 reason 对应, 归 content_filter (reader 读回 Safety —
+            // Refusal→Safety 的往返损失已知, Responses wire 无更精确的表达).
+            Some(IrStopReason::Safety) | Some(IrStopReason::Refusal) => {
+                json!({"reason": "content_filter"})
+            }
+            _ => Value::Null,
+        },
+    );
+    obj.insert(
+        "output".to_string(),
+        Value::Array(
+            state
+                .items
+                .values()
+                .map(completed_item_json)
+                .collect::<Vec<_>>(),
+        ),
+    );
+    obj.insert("usage".to_string(), responses_usage_json(&state.usage));
+    resp
+}
+
+/// `Error` → 两帧: 裸 `error` 事件 + `response.failed` (骨架 + status=failed +
+/// error 对象). message 截断 (char boundary 安全, 接收端可感知).
+fn stream_write_error(msg: &str, state: &mut ResponsesEncodeState) -> Vec<(String, Value)> {
+    let truncated = crate::util::truncate_chars_with_ellipsis(msg, 256);
+    let mut resp = response_skeleton(state, "failed");
+    resp.as_object_mut()
+        .expect("skeleton is always an object")
+        .insert(
+            "error".to_string(),
+            json!({"code": "upstream_error", "message": truncated}),
+        );
+    vec![
+        (
+            "error".to_string(),
+            json!({
+                "type": "error",
+                "code": "upstream_error",
+                "message": truncated,
+            }),
+        ),
+        (
+            "response.failed".to_string(),
+            json!({
+                "type": "response.failed",
+                "response": resp,
+            }),
+        ),
+    ]
+}
+
+/// response 骨架对象 (created / completed / failed 共用基础形态).
+///
+/// `id`/`created` 首次需要时隐式初始化 (synth id / now) **并写回 state** — 后续
+/// 帧复用同值, 保证整条流内 response 元信息一致 (MessageStart 缺席或字段为 None
+/// 的病态流也能闭合). `model` 缺省空串 (格式中立, 无随机量).
+fn response_skeleton(state: &mut ResponsesEncodeState, status: &str) -> Value {
+    let id = state.id.get_or_insert_with(synth_response_id).clone();
+    let created = state.created.get_or_insert_with(current_epoch);
+    let model = state.model.get_or_insert_with(String::new).clone();
+    json!({
+        "id": id,
+        "object": "response",
+        "created_at": created,
+        "status": status,
+        "error": null,
+        "incomplete_details": null,
+        "model": model,
+        "output": [],
+        "usage": null,
+    })
+}
+
+/// `ItemAccum` → 全量 item JSON (`output_item.done` 帧与 `response.completed` 的
+/// output 重建共用; status=completed, content/summary/arguments 均为累积全量).
+fn completed_item_json(accum: &ResponsesItemAccum) -> Value {
+    match accum.kind {
+        ResponsesItemKind::Message => json!({
+            "id": accum.item_id,
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": accum.content, "annotations": []}],
+        }),
+        ResponsesItemKind::FunctionCall => json!({
+            "id": accum.item_id,
+            "type": "function_call",
+            "status": "completed",
+            "call_id": accum.call_id,
+            "name": accum.name,
+            "arguments": accum.content,
+        }),
+        ResponsesItemKind::Reasoning => json!({
+            "id": accum.item_id,
+            "type": "reasoning",
+            "status": "completed",
+            "summary": [{"type": "summary_text", "text": accum.content}],
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -2009,11 +2461,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn stream_text_scenario_full_official_sequence() {
-        // 官方 text 场景: created → in_progress → item.added → part.added →
-        // text.delta×2 → done 族 → item.done → completed.
-        let frames = vec![
+    /// 官方 text 场景的完整输入帧序列 (reader 场景测试 + reader→writer round-trip
+    /// 测试共用的 fixture).
+    fn official_text_frames() -> Vec<(&'static str, Value)> {
+        vec![
             created_frame(),
             (
                 "response.in_progress",
@@ -2067,42 +2518,50 @@ mod tests {
                                       "usage": {"input_tokens": 10, "output_tokens": 5,
                                                  "total_tokens": 15}}}),
             ),
-        ];
-        assert_eq!(
-            feed_stream(&frames),
-            vec![
-                expected_message_start(),
-                IrStreamEvent::BlockStart {
-                    index: 0,
-                    block: IrBlockMeta::Text,
+        ]
+    }
+
+    /// text 场景 reader 期望的 IR 事件序列 (同时是 writer 镜像测试的输入 fixture).
+    fn official_text_ir() -> Vec<IrStreamEvent> {
+        vec![
+            expected_message_start(),
+            IrStreamEvent::BlockStart {
+                index: 0,
+                block: IrBlockMeta::Text,
+            },
+            IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: IrDelta::TextDelta("Hel".into()),
+            },
+            IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: IrDelta::TextDelta("lo".into()),
+            },
+            IrStreamEvent::BlockStop { index: 0 },
+            IrStreamEvent::MessageDelta {
+                stop_reason: Some(IrStopReason::EndTurn),
+                stop_sequence: None,
+                usage: IrUsage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    ..Default::default()
                 },
-                IrStreamEvent::BlockDelta {
-                    index: 0,
-                    delta: IrDelta::TextDelta("Hel".into()),
-                },
-                IrStreamEvent::BlockDelta {
-                    index: 0,
-                    delta: IrDelta::TextDelta("lo".into()),
-                },
-                IrStreamEvent::BlockStop { index: 0 },
-                IrStreamEvent::MessageDelta {
-                    stop_reason: Some(IrStopReason::EndTurn),
-                    stop_sequence: None,
-                    usage: IrUsage {
-                        input_tokens: 10,
-                        output_tokens: 5,
-                        ..Default::default()
-                    },
-                    usage_present: true,
-                },
-                IrStreamEvent::MessageStop,
-            ]
-        );
+                usage_present: true,
+            },
+            IrStreamEvent::MessageStop,
+        ]
     }
 
     #[test]
-    fn stream_function_call_scenario_call_id_preferred_and_args_deltas() {
-        let frames = vec![
+    fn stream_text_scenario_full_official_sequence() {
+        // 官方 text 场景: created → in_progress → item.added → part.added →
+        // text.delta×2 → done 族 → item.done → completed.
+        assert_eq!(feed_stream(&official_text_frames()), official_text_ir());
+    }
+
+    /// function_call 场景输入帧 (call_id 优先 + args 流式; 共用 fixture).
+    fn official_function_call_frames() -> Vec<(&'static str, Value)> {
+        vec![
             created_frame(),
             (
                 "response.output_item.added",
@@ -2137,49 +2596,56 @@ mod tests {
                 json!({"response": {"id": "resp_1", "status": "completed",
                                      "usage": {"input_tokens": 7, "output_tokens": 3}}}),
             ),
-        ];
-        assert_eq!(
-            feed_stream(&frames),
-            vec![
-                expected_message_start(),
-                // call_id 优先于 id.
-                IrStreamEvent::BlockStart {
-                    index: 0,
-                    block: IrBlockMeta::ToolUse {
-                        id: "call_9".into(),
-                        name: "get_weather".into(),
-                    },
+        ]
+    }
+
+    /// function_call 场景期望 IR (writer 镜像测试输入 fixture).
+    fn official_function_call_ir() -> Vec<IrStreamEvent> {
+        vec![
+            expected_message_start(),
+            // call_id 优先于 id.
+            IrStreamEvent::BlockStart {
+                index: 0,
+                block: IrBlockMeta::ToolUse {
+                    id: "call_9".into(),
+                    name: "get_weather".into(),
                 },
-                IrStreamEvent::BlockDelta {
-                    index: 0,
-                    delta: IrDelta::InputJsonDelta("{\"city\":".into()),
+            },
+            IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: IrDelta::InputJsonDelta("{\"city\":".into()),
+            },
+            IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: IrDelta::InputJsonDelta("\"SF\"}".into()),
+            },
+            IrStreamEvent::BlockStop { index: 0 },
+            // 出现过 function_call → completed 推断 ToolUse.
+            IrStreamEvent::MessageDelta {
+                stop_reason: Some(IrStopReason::ToolUse),
+                stop_sequence: None,
+                usage: IrUsage {
+                    input_tokens: 7,
+                    output_tokens: 3,
+                    ..Default::default()
                 },
-                IrStreamEvent::BlockDelta {
-                    index: 0,
-                    delta: IrDelta::InputJsonDelta("\"SF\"}".into()),
-                },
-                IrStreamEvent::BlockStop { index: 0 },
-                // 出现过 function_call → completed 推断 ToolUse.
-                IrStreamEvent::MessageDelta {
-                    stop_reason: Some(IrStopReason::ToolUse),
-                    stop_sequence: None,
-                    usage: IrUsage {
-                        input_tokens: 7,
-                        output_tokens: 3,
-                        ..Default::default()
-                    },
-                    usage_present: true,
-                },
-                IrStreamEvent::MessageStop,
-            ]
-        );
+                usage_present: true,
+            },
+            IrStreamEvent::MessageStop,
+        ]
     }
 
     #[test]
-    fn stream_reasoning_then_message_mixed_scenario() {
-        // reasoning item (summary delta) + message item 混合: 两个独立 IR block,
-        // index 按 BlockStart 发出顺序 (reasoning 先 → 0, text → 1).
-        let frames = vec![
+    fn stream_function_call_scenario_call_id_preferred_and_args_deltas() {
+        assert_eq!(
+            feed_stream(&official_function_call_frames()),
+            official_function_call_ir()
+        );
+    }
+
+    /// reasoning + message 混合场景输入帧 (共用 fixture).
+    fn official_reasoning_mixed_frames() -> Vec<(&'static str, Value)> {
+        vec![
             created_frame(),
             (
                 "response.output_item.added",
@@ -2239,38 +2705,48 @@ mod tests {
                 "response.completed",
                 json!({"response": {"status": "completed", "usage": null}}),
             ),
-        ];
+        ]
+    }
+
+    /// reasoning + message 混合场景期望 IR (writer 镜像测试输入 fixture):
+    /// 两个独立 IR block, index 按 BlockStart 发出顺序 (reasoning 先 → 0, text → 1).
+    fn official_reasoning_mixed_ir() -> Vec<IrStreamEvent> {
+        vec![
+            expected_message_start(),
+            IrStreamEvent::BlockStart {
+                index: 0,
+                block: IrBlockMeta::ReasoningContent,
+            },
+            IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: IrDelta::ReasoningDelta("Think ".into()),
+            },
+            IrStreamEvent::BlockStop { index: 0 },
+            IrStreamEvent::BlockStart {
+                index: 1,
+                block: IrBlockMeta::Text,
+            },
+            IrStreamEvent::BlockDelta {
+                index: 1,
+                delta: IrDelta::TextDelta("Answer".into()),
+            },
+            IrStreamEvent::BlockStop { index: 1 },
+            // 无 function_call → EndTurn; usage 缺席 (null) → usage_present false.
+            IrStreamEvent::MessageDelta {
+                stop_reason: Some(IrStopReason::EndTurn),
+                stop_sequence: None,
+                usage: IrUsage::default(),
+                usage_present: false,
+            },
+            IrStreamEvent::MessageStop,
+        ]
+    }
+
+    #[test]
+    fn stream_reasoning_then_message_mixed_scenario() {
         assert_eq!(
-            feed_stream(&frames),
-            vec![
-                expected_message_start(),
-                IrStreamEvent::BlockStart {
-                    index: 0,
-                    block: IrBlockMeta::ReasoningContent,
-                },
-                IrStreamEvent::BlockDelta {
-                    index: 0,
-                    delta: IrDelta::ReasoningDelta("Think ".into()),
-                },
-                IrStreamEvent::BlockStop { index: 0 },
-                IrStreamEvent::BlockStart {
-                    index: 1,
-                    block: IrBlockMeta::Text,
-                },
-                IrStreamEvent::BlockDelta {
-                    index: 1,
-                    delta: IrDelta::TextDelta("Answer".into()),
-                },
-                IrStreamEvent::BlockStop { index: 1 },
-                // 无 function_call → EndTurn; usage 缺席 (null) → usage_present false.
-                IrStreamEvent::MessageDelta {
-                    stop_reason: Some(IrStopReason::EndTurn),
-                    stop_sequence: None,
-                    usage: IrUsage::default(),
-                    usage_present: false,
-                },
-                IrStreamEvent::MessageStop,
-            ]
+            feed_stream(&official_reasoning_mixed_frames()),
+            official_reasoning_mixed_ir()
         );
     }
 
@@ -2851,5 +3327,588 @@ mod tests {
                 }
             }
         });
+    }
+
+    // ─── write_response_event: IR → 流式 SSE 帧 (D3 合成表镜像) ────────
+    //
+    // 镜像测试与 reader 场景 fixture 一一对应 (official_*_frames → reader →
+    // official_*_ir → writer → 帧断言); round-trip 测试断言语义等价闭环.
+
+    /// 把 IR 事件序列逐个喂入 writer (跨事件共享 encode state), 收集帧序列.
+    fn write_events(events: &[IrStreamEvent]) -> Vec<(String, Value)> {
+        let mut state = crate::codec::ir::StreamEncodeState::default();
+        let mut out = Vec::new();
+        for ev in events {
+            out.extend(writer().write_response_event(ev, &mut state));
+        }
+        out
+    }
+
+    /// 帧序列的 event type 投影 (断言可读性辅助).
+    fn frame_types(frames: &[(String, Value)]) -> Vec<&str> {
+        frames.iter().map(|(t, _)| t.as_str()).collect()
+    }
+
+    #[test]
+    fn stream_write_text_scenario_mirror() {
+        let frames = write_events(&official_text_ir());
+        assert_eq!(
+            frame_types(&frames),
+            vec![
+                "response.created",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+        // created 骨架: 元信息捕获 + in_progress + 空 output + null usage.
+        let created = &frames[0].1;
+        assert_eq!(created["type"], "response.created");
+        assert_eq!(created["response"]["id"], "resp_1");
+        assert_eq!(created["response"]["object"], "response");
+        assert_eq!(created["response"]["created_at"], 1700000000);
+        assert_eq!(created["response"]["model"], "gpt-5");
+        assert_eq!(created["response"]["status"], "in_progress");
+        assert_eq!(created["response"]["error"], Value::Null);
+        assert_eq!(created["response"]["incomplete_details"], Value::Null);
+        assert_eq!(created["response"]["output"], json!([]));
+        assert_eq!(created["response"]["usage"], Value::Null);
+        // item id 确定性合成 (msg_0, 全局序号从 0) + 定位键.
+        assert_eq!(frames[1].1["output_index"], 0);
+        assert_eq!(frames[1].1["item"]["id"], "msg_0");
+        assert_eq!(frames[1].1["item"]["type"], "message");
+        assert_eq!(frames[1].1["item"]["status"], "in_progress");
+        assert_eq!(frames[1].1["item"]["role"], "assistant");
+        assert_eq!(frames[1].1["item"]["content"], json!([]));
+        assert_eq!(frames[2].1["item_id"], "msg_0");
+        assert_eq!(frames[2].1["output_index"], 0);
+        assert_eq!(frames[2].1["content_index"], 0);
+        assert_eq!(
+            frames[2].1["part"],
+            json!({
+                "type": "output_text", "text": "", "annotations": []
+            })
+        );
+        // delta 帧带定位键 + 内容透传.
+        assert_eq!(frames[3].1["item_id"], "msg_0");
+        assert_eq!(frames[3].1["content_index"], 0);
+        assert_eq!(frames[3].1["delta"], "Hel");
+        assert_eq!(frames[4].1["delta"], "lo");
+        // done 族全量断言 (累积内容).
+        assert_eq!(frames[5].1["text"], "Hello");
+        assert_eq!(frames[6].1["part"]["text"], "Hello");
+        assert_eq!(frames[7].1["item"]["status"], "completed");
+        assert_eq!(frames[7].1["item"]["content"][0]["text"], "Hello");
+        // completed 全量重建: status / output / usage / 无 sequence_number.
+        assert_eq!(frames[8].1["type"], "response.completed");
+        let resp = &frames[8].1["response"];
+        assert_eq!(resp["id"], "resp_1");
+        assert_eq!(resp["status"], "completed");
+        assert_eq!(resp["incomplete_details"], Value::Null);
+        assert_eq!(resp["output"][0]["type"], "message");
+        assert_eq!(resp["output"][0]["content"][0]["text"], "Hello");
+        assert_eq!(
+            resp["usage"],
+            json!({"input_tokens": 10, "output_tokens": 5, "total_tokens": 15})
+        );
+        assert!(frames[8].1.get("sequence_number").is_none());
+    }
+
+    #[test]
+    fn stream_write_function_call_scenario_mirror() {
+        let frames = write_events(&official_function_call_ir());
+        assert_eq!(
+            frame_types(&frames),
+            vec![
+                "response.created",
+                "response.output_item.added",
+                "response.function_call_arguments.delta",
+                "response.function_call_arguments.delta",
+                "response.function_call_arguments.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+        // fc_0 合成 id + call_id = IR id (round-trip 关联键, 必须保真).
+        let added = &frames[1].1["item"];
+        assert_eq!(added["id"], "fc_0");
+        assert_eq!(added["type"], "function_call");
+        assert_eq!(added["call_id"], "call_9");
+        assert_eq!(added["name"], "get_weather");
+        assert_eq!(added["arguments"], "");
+        assert_eq!(frames[1].1["output_index"], 0);
+        // delta 流式透传.
+        assert_eq!(frames[2].1["delta"], "{\"city\":");
+        assert_eq!(frames[3].1["delta"], "\"SF\"}");
+        // done 族全量.
+        assert_eq!(frames[4].1["arguments"], "{\"city\":\"SF\"}");
+        let done = &frames[5].1["item"];
+        assert_eq!(done["status"], "completed");
+        assert_eq!(done["call_id"], "call_9");
+        assert_eq!(done["name"], "get_weather");
+        assert_eq!(done["arguments"], "{\"city\":\"SF\"}");
+        // completed 全量重建含 function_call item; ToolUse stop → status completed.
+        let resp = &frames[6].1["response"];
+        assert_eq!(resp["status"], "completed");
+        assert_eq!(resp["output"][0]["type"], "function_call");
+        assert_eq!(resp["output"][0]["call_id"], "call_9");
+        assert_eq!(resp["output"][0]["arguments"], "{\"city\":\"SF\"}");
+        assert_eq!(
+            resp["usage"],
+            json!({"input_tokens": 7, "output_tokens": 3, "total_tokens": 10})
+        );
+    }
+
+    #[test]
+    fn stream_write_reasoning_scenario_mirror() {
+        let frames = write_events(&official_reasoning_mixed_ir());
+        assert_eq!(
+            frame_types(&frames),
+            vec![
+                "response.created",
+                "response.output_item.added",
+                "response.reasoning_summary_part.added",
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_summary_text.done",
+                "response.reasoning_summary_part.done",
+                "response.output_item.done",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+        // rs_0 (首个 item) + summary_index 恒 0.
+        assert_eq!(frames[1].1["item"]["id"], "rs_0");
+        assert_eq!(frames[1].1["item"]["type"], "reasoning");
+        assert_eq!(frames[1].1["item"]["summary"], json!([]));
+        assert_eq!(
+            frames[2].1["part"],
+            json!({"type": "summary_text", "text": ""})
+        );
+        assert_eq!(frames[3].1["summary_index"], 0);
+        assert_eq!(frames[3].1["delta"], "Think ");
+        // reasoning done 族三帧全量.
+        assert_eq!(frames[4].1["text"], "Think ");
+        assert_eq!(
+            frames[5].1["part"],
+            json!({"type": "summary_text", "text": "Think "})
+        );
+        assert_eq!(frames[6].1["item"]["summary"][0]["text"], "Think ");
+        // 第二个 item 序号推进: msg_1 (rs_0 已占 seq 0).
+        assert_eq!(frames[7].1["item"]["id"], "msg_1");
+        assert_eq!(frames[9].1["delta"], "Answer");
+        assert_eq!(frames[10].1["text"], "Answer");
+        // 终止事件: output 按 index 升序重建 (reasoning → message).
+        let resp = &frames[13].1["response"];
+        assert_eq!(resp["output"][0]["type"], "reasoning");
+        assert_eq!(resp["output"][0]["summary"][0]["text"], "Think ");
+        assert_eq!(resp["output"][1]["type"], "message");
+        assert_eq!(resp["output"][1]["content"][0]["text"], "Answer");
+        // usage 缺席 (usage_present=false) → 全零 usage 对象 (与非流式 write_response
+        // 一致; round-trip 时 reader 侧 present 单向漂移, 见 round-trip 测试注).
+        assert_eq!(
+            resp["usage"],
+            json!({"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+        );
+    }
+
+    #[test]
+    fn stream_write_error_emits_error_and_response_failed() {
+        let frames = write_events(&[
+            expected_message_start(),
+            IrStreamEvent::Error("The model is overloaded".into()),
+        ]);
+        assert_eq!(
+            frame_types(&frames),
+            vec!["response.created", "error", "response.failed"]
+        );
+        assert_eq!(frames[1].1["type"], "error");
+        assert_eq!(frames[1].1["code"], "upstream_error");
+        assert_eq!(frames[1].1["message"], "The model is overloaded");
+        let resp = &frames[2].1["response"];
+        assert_eq!(frames[2].1["type"], "response.failed");
+        assert_eq!(resp["status"], "failed");
+        assert_eq!(resp["id"], "resp_1"); // 已捕获的元信息保留
+        assert_eq!(resp["error"]["code"], "upstream_error");
+        assert_eq!(resp["error"]["message"], "The model is overloaded");
+        // 超长 message 截断 (char boundary 安全, 接收端可感知).
+        let frames = write_events(&[IrStreamEvent::Error("x".repeat(300))]);
+        let msg = frames[0].1["message"].as_str().unwrap();
+        assert!(
+            msg.chars().count() < 300 && msg.ends_with('…'),
+            "truncated: {msg}"
+        );
+    }
+
+    #[test]
+    fn stream_write_message_stop_status_and_incomplete_details() {
+        let delta = |reason| IrStreamEvent::MessageDelta {
+            stop_reason: Some(reason),
+            stop_sequence: None,
+            usage: IrUsage {
+                input_tokens: 4,
+                output_tokens: 2,
+                ..Default::default()
+            },
+            usage_present: true,
+        };
+        // MaxTokens → response.incomplete 事件 + max_output_tokens reason
+        // (终止事件 type 按 status 分派, 官方 incomplete 语义).
+        let frames = write_events(&[
+            expected_message_start(),
+            delta(IrStopReason::MaxTokens),
+            IrStreamEvent::MessageStop,
+        ]);
+        assert_eq!(
+            frame_types(&frames),
+            vec!["response.created", "response.incomplete"]
+        );
+        let resp = &frames[1].1["response"];
+        assert_eq!(resp["status"], "incomplete");
+        assert_eq!(
+            resp["incomplete_details"],
+            json!({"reason": "max_output_tokens"})
+        );
+        assert_eq!(
+            resp["usage"],
+            json!({"input_tokens": 4, "output_tokens": 2, "total_tokens": 6})
+        );
+        // Safety/Refusal → content_filter (incomplete 事件); ToolUse/EndTurn →
+        // completed 事件无 details; Other → failed 事件.
+        for (reason, event, details) in [
+            (
+                IrStopReason::Safety,
+                "response.incomplete",
+                json!({"reason": "content_filter"}),
+            ),
+            (
+                IrStopReason::Refusal,
+                "response.incomplete",
+                json!({"reason": "content_filter"}),
+            ),
+            (IrStopReason::ToolUse, "response.completed", Value::Null),
+            (IrStopReason::EndTurn, "response.completed", Value::Null),
+            (IrStopReason::Other, "response.failed", Value::Null),
+        ] {
+            let frames = write_events(&[delta(reason), IrStreamEvent::MessageStop]);
+            assert_eq!(frames[0].0, event, "for reason {reason:?}");
+            let resp = &frames[0].1["response"];
+            assert_eq!(resp["incomplete_details"], details, "for reason {reason:?}");
+        }
+    }
+
+    #[test]
+    fn stream_write_message_stop_rebuilds_output_in_index_order() {
+        // 混合 items (text 在 0, tool_use 在 1) 的全量重建, 按 index 升序.
+        let frames = write_events(&[
+            expected_message_start(),
+            IrStreamEvent::BlockStart {
+                index: 0,
+                block: IrBlockMeta::Text,
+            },
+            IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: IrDelta::TextDelta("Let me check".into()),
+            },
+            IrStreamEvent::BlockStop { index: 0 },
+            IrStreamEvent::BlockStart {
+                index: 1,
+                block: IrBlockMeta::ToolUse {
+                    id: "call_1".into(),
+                    name: "search".into(),
+                },
+            },
+            IrStreamEvent::BlockDelta {
+                index: 1,
+                delta: IrDelta::InputJsonDelta("{\"q\":\"rust\"}".into()),
+            },
+            IrStreamEvent::BlockStop { index: 1 },
+            IrStreamEvent::MessageDelta {
+                stop_reason: Some(IrStopReason::ToolUse),
+                stop_sequence: None,
+                usage: IrUsage::default(),
+                usage_present: false,
+            },
+            IrStreamEvent::MessageStop,
+        ]);
+        let output = &frames.last().unwrap().1["response"]["output"];
+        assert_eq!(output.as_array().unwrap().len(), 2);
+        assert_eq!(output[0]["type"], "message");
+        assert_eq!(output[0]["content"][0]["text"], "Let me check");
+        assert_eq!(output[1]["type"], "function_call");
+        assert_eq!(output[1]["call_id"], "call_1");
+        assert_eq!(output[1]["arguments"], "{\"q\":\"rust\"}");
+    }
+
+    #[test]
+    fn stream_write_block_start_idempotent_under_probe_call() {
+        // translate 层配对过滤对 BlockStart 探测调用两次 (非空 → 帧丢弃后重调):
+        // 注册必须幂等 — items 不重复注册, next_item_seq 不重复递增, 两次帧一致.
+        let mut state = crate::codec::ir::StreamEncodeState::default();
+        let ev = IrStreamEvent::BlockStart {
+            index: 3,
+            block: IrBlockMeta::Text,
+        };
+        let first = writer().write_response_event(&ev, &mut state);
+        let second = writer().write_response_event(&ev, &mut state);
+        assert_eq!(first, second, "probe call must return identical frames");
+        assert_eq!(state.responses.items.len(), 1, "no re-registration");
+        assert_eq!(
+            state.responses.next_item_seq, 1,
+            "seq advances exactly once"
+        );
+        // 后续 delta 的 item_id 与 BlockStart 帧一致 (第二次调用不换 id).
+        let delta = IrStreamEvent::BlockDelta {
+            index: 3,
+            delta: IrDelta::TextDelta("x".into()),
+        };
+        let frames = writer().write_response_event(&delta, &mut state);
+        assert_eq!(frames[0].1["item_id"], first[1].1["item_id"]);
+        // 下一个不同 index 的 BlockStart 序号正常推进 (探测未消耗序号).
+        let ev2 = IrStreamEvent::BlockStart {
+            index: 4,
+            block: IrBlockMeta::Text,
+        };
+        let f2 = writer().write_response_event(&ev2, &mut state);
+        assert_eq!(f2[0].1["item"]["id"], "msg_1");
+    }
+
+    #[test]
+    fn stream_write_orphan_block_stop_returns_empty() {
+        // 孤儿 BlockStop (无 ItemAccum 记录): 纵深防御, 空帧不 panic.
+        let frames = write_events(&[IrStreamEvent::BlockStop { index: 42 }]);
+        assert!(frames.is_empty());
+    }
+
+    #[test]
+    fn stream_write_mismatched_or_unregistered_delta_dropped() {
+        // 病态 IR 流的 delta 防御 (ROB-*): delta 类型与 item kind 错配 / delta 先于
+        // BlockStart → 丢弃 (空帧), 不 panic, 不污染已注册 item 的内容累积.
+        let mut state = crate::codec::ir::StreamEncodeState::default();
+        writer().write_response_event(
+            &IrStreamEvent::BlockStart {
+                index: 0,
+                block: IrBlockMeta::ToolUse {
+                    id: "c1".into(),
+                    name: "f".into(),
+                },
+            },
+            &mut state,
+        );
+        // TextDelta 发到 function_call item → 错配丢弃.
+        let mismatch = writer().write_response_event(
+            &IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: IrDelta::TextDelta("wrong-kind".into()),
+            },
+            &mut state,
+        );
+        assert!(mismatch.is_empty());
+        // delta 先于 BlockStart (未知 index) → 丢弃.
+        let orphan = writer().write_response_event(
+            &IrStreamEvent::BlockDelta {
+                index: 7,
+                delta: IrDelta::InputJsonDelta("{\"a\":1}".into()),
+            },
+            &mut state,
+        );
+        assert!(orphan.is_empty());
+        // 内容未污染: 后续正确 delta 累积 + done 全量只含正确内容.
+        writer().write_response_event(
+            &IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: IrDelta::InputJsonDelta("{\"a\":1}".into()),
+            },
+            &mut state,
+        );
+        let done =
+            writer().write_response_event(&IrStreamEvent::BlockStop { index: 0 }, &mut state);
+        assert_eq!(done[0].1["arguments"], "{\"a\":1}");
+    }
+
+    #[test]
+    fn stream_write_survives_missing_message_start() {
+        // 病态 IR 流: block 事件先于 MessageStart / MessageStart 全程缺席 —
+        // 不 panic; 元信息缺省在首次合成骨架处隐式初始化 (synth id / now / "").
+        let events = vec![
+            IrStreamEvent::BlockStart {
+                index: 0,
+                block: IrBlockMeta::Text,
+            },
+            IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: IrDelta::TextDelta("hi".into()),
+            },
+            IrStreamEvent::BlockStop { index: 0 },
+            IrStreamEvent::MessageDelta {
+                stop_reason: Some(IrStopReason::EndTurn),
+                stop_sequence: None,
+                usage: IrUsage::default(),
+                usage_present: false,
+            },
+            IrStreamEvent::MessageStop,
+        ];
+        let frames = write_events(&events);
+        assert_eq!(
+            frame_types(&frames),
+            vec![
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.completed"
+            ]
+        );
+        let resp = &frames.last().unwrap().1["response"];
+        assert!(resp["id"].as_str().unwrap().starts_with("resp_"));
+        assert_eq!(resp["model"], "");
+        assert_eq!(resp["status"], "completed");
+        assert_eq!(resp["output"][0]["content"][0]["text"], "hi");
+    }
+
+    // ─── write_response_event: reader→writer 同协议 round-trip ──────────
+
+    /// 重组帧再次喂 reader (round-trip 第二跳辅助).
+    fn read_frames_back(frames: &[(String, Value)]) -> Vec<IrStreamEvent> {
+        let input: Vec<(&str, Value)> = frames
+            .iter()
+            .map(|(t, d)| (t.as_str(), d.clone()))
+            .collect();
+        feed_stream(&input)
+    }
+
+    /// 断言两个 IR 事件流语义等价 (round-trip 保真).
+    ///
+    /// 逐事件严格 assert_eq, 唯一放宽: MessageDelta 的 `usage_present` 允许
+    /// false→true 单向漂移 — writer 无条件写全零 usage 对象 (与非流式一致),
+    /// reader 观测到显式 usage 对象即置 present. item_id 变化不出现在此层
+    /// (IR 事件不含 item_id; BlockStart 的 ToolUse id 经 call_id 保真).
+    fn assert_stream_round_trip(first: &[IrStreamEvent], second: &[IrStreamEvent], ctx: &str) {
+        assert_eq!(first.len(), second.len(), "event count drift ({ctx})");
+        for (i, (a, b)) in first.iter().zip(second.iter()).enumerate() {
+            match (a, b) {
+                (
+                    IrStreamEvent::MessageDelta {
+                        stop_reason: ra,
+                        usage: ua,
+                        usage_present: pa,
+                        ..
+                    },
+                    IrStreamEvent::MessageDelta {
+                        stop_reason: rb,
+                        usage: ub,
+                        usage_present: pb,
+                        ..
+                    },
+                ) => {
+                    assert_eq!(ra, rb, "stop_reason (event {i}, {ctx})");
+                    assert_eq!(ua, ub, "usage (event {i}, {ctx})");
+                    assert!(
+                        !*pa || *pb,
+                        "usage_present must not regress true→false (event {i}, {ctx})"
+                    );
+                }
+                _ => assert_eq!(a, b, "event {i} ({ctx})"),
+            }
+        }
+    }
+
+    #[test]
+    fn stream_round_trip_text_scenario() {
+        let first = feed_stream(&official_text_frames());
+        let second = read_frames_back(&write_events(&first));
+        assert_stream_round_trip(&first, &second, "text");
+    }
+
+    #[test]
+    fn stream_round_trip_function_call_scenario() {
+        let first = feed_stream(&official_function_call_frames());
+        let second = read_frames_back(&write_events(&first));
+        assert_stream_round_trip(&first, &second, "function_call");
+        // 重点: 工具调用 round-trip 保真 (call_id / name / arguments 全量).
+        let tool_blocks: Vec<_> = second
+            .iter()
+            .filter_map(|ev| match ev {
+                IrStreamEvent::BlockStart {
+                    block: IrBlockMeta::ToolUse { id, name },
+                    ..
+                } => Some((id.clone(), name.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tool_blocks,
+            vec![("call_9".to_string(), "get_weather".to_string())]
+        );
+        let args: String = second
+            .iter()
+            .filter_map(|ev| match ev {
+                IrStreamEvent::BlockDelta {
+                    delta: IrDelta::InputJsonDelta(d),
+                    ..
+                } => Some(d.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(args, "{\"city\":\"SF\"}");
+    }
+
+    #[test]
+    fn stream_round_trip_reasoning_mixed_scenario() {
+        let first = feed_stream(&official_reasoning_mixed_frames());
+        let second = read_frames_back(&write_events(&first));
+        assert_stream_round_trip(&first, &second, "reasoning_mixed");
+        // 重点: 文本与思考内容保真 (事件类型 reasoning_summary_text 是归一形态,
+        // 两个方向都如此 — 见 D5 已知损失 4).
+        let texts: Vec<&str> = second
+            .iter()
+            .filter_map(|ev| match ev {
+                IrStreamEvent::BlockDelta {
+                    delta: IrDelta::TextDelta(d),
+                    ..
+                } => Some(d.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["Answer"]);
+        let reasoning: Vec<&str> = second
+            .iter()
+            .filter_map(|ev| match ev {
+                IrStreamEvent::BlockDelta {
+                    delta: IrDelta::ReasoningDelta(d),
+                    ..
+                } => Some(d.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoning, vec!["Think "]);
+    }
+
+    #[test]
+    fn stream_round_trip_incomplete_max_tokens_scenario() {
+        // MaxTokens stop_reason 的往返保真: incomplete + details → 读回 MaxTokens.
+        let frames = vec![
+            created_frame(),
+            (
+                "response.incomplete",
+                json!({"response": {"id": "resp_1", "status": "incomplete",
+                                     "incomplete_details": {"reason": "max_output_tokens"},
+                                     "usage": {"input_tokens": 4, "output_tokens": 2}}}),
+            ),
+        ];
+        let first = feed_stream(&frames);
+        let second = read_frames_back(&write_events(&first));
+        assert_stream_round_trip(&first, &second, "incomplete_max_tokens");
     }
 }
