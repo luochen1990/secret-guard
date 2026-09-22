@@ -46,14 +46,26 @@ impl Reader for AnthropicReader {
             .to_string();
 
         // system 顶层 (string 或 array of blocks).
-        let system = read_system_field(obj.get("system"));
+        let mut system = read_system_field(obj.get("system"));
 
         let raw_messages = obj
             .get("messages")
             .and_then(Value::as_array)
             .ok_or_else(|| IrError::new("Anthropic request must have 'messages' array"))?;
 
-        let messages: Vec<IrMessage> = raw_messages.iter().filter_map(read_message).collect();
+        // messages[] 内 role=system (非标准形态, claude code 实测发送) 提升合并进顶层
+        // system — writer 写回时假设 system 都在顶层而 filter 掉 System message, 不提升
+        // 会静默丢内容 (转发 body 丢 system + timeline delta 计数错位)。边界与代价详见
+        // src/codec/AGENTS.md "已知边界" 段。
+        let mut messages: Vec<IrMessage> = Vec::with_capacity(raw_messages.len());
+        for msg in raw_messages {
+            let Some(m) = read_message(msg) else { continue };
+            if m.role == IrRole::System {
+                system.extend(m.content);
+            } else {
+                messages.push(m);
+            }
+        }
 
         let tools = obj
             .get("tools")
@@ -1153,6 +1165,70 @@ mod tests {
         });
         let ir = reader().read_request(&body).unwrap();
         assert_eq!(ir.system.len(), 2);
+    }
+
+    /// messages[] 内 role=system 条目必须提升合并到顶层 system (与 OpenAI reader
+    /// 对称), 否则 AnthropicWriter 写回时 filter 掉 System message (它假设 system
+    /// 都在顶层) 会静默丢弃内容 — 既违反 FWD-1 请求半段 (转发 body 丢 system), 又让
+    /// req_delta.len 与写回 body messages.len 不匹配, timeline 气泡退化为
+    /// preview 截断文本 (2026-09-23 claude code `-p` 排查).
+    #[test]
+    fn read_request_promotes_system_role_message_to_top_level() {
+        // claude code 实测形态: 顶层 system (array) + messages[0]=system (billing
+        // header, string content) + messages[1]=user (array content).
+        let body = json!({
+            "model": "claude",
+            "system": [{"type": "text", "text": "agent intro"}],
+            "messages": [
+                {"role": "system", "content": "x-anthropic-billing-header: probe"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "<system-reminder>ctx</system-reminder>"},
+                    {"type": "text", "text": "你是谁?"}
+                ]},
+            ],
+            "max_tokens": 10
+        });
+        let ir = reader().read_request(&body).unwrap();
+        // system 条目提升: 顶层 block + 提升 block, 按出现顺序.
+        assert_eq!(ir.system.len(), 2, "顶层 + messages 内 system 合并");
+        match (&ir.system[0], &ir.system[1]) {
+            (IrBlock::Text { text: a }, IrBlock::Text { text: b }) => {
+                assert_eq!(a, "agent intro");
+                assert_eq!(b, "x-anthropic-billing-header: probe");
+            }
+            _ => panic!("system blocks 应均为 Text"),
+        }
+        // messages 不再含 system → 与 writer 写回的 body messages 数一致.
+        assert_eq!(ir.messages.len(), 1);
+        assert_eq!(ir.messages[0].role, IrRole::User);
+    }
+
+    /// 提升后 reader→writer 一致性 (timeline delta 切片的正确性前提):
+    /// 写回 body 的 messages 数 == ir.messages 数 (System 不再被 filter 丢弃).
+    #[test]
+    fn system_role_message_survives_round_trip_into_top_level() {
+        let body = json!({
+            "model": "claude",
+            "system": "base prompt",
+            "messages": [
+                {"role": "system", "content": "billing-header"},
+                {"role": "user", "content": "hi"},
+            ],
+            "max_tokens": 10
+        });
+        let ir = reader().read_request(&body).unwrap();
+        let rewritten = writer().write_request(&ir);
+        // 写回 body: system 为 2-block array (顶层 + 提升), 内容与顺序保真.
+        let sys_texts: Vec<&str> = rewritten["system"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect();
+        assert_eq!(sys_texts, vec!["base prompt", "billing-header"]);
+        // messages 与 ir.messages 等长 (System 不再被 filter 丢弃).
+        let msgs = rewritten.get("messages").unwrap().as_array().unwrap();
+        assert_eq!(msgs.len(), ir.messages.len());
     }
 
     #[test]

@@ -418,6 +418,12 @@ fn arb_anthropic_request_value() -> impl Strategy<Value = Value> {
 }
 
 fn arb_anthropic_message() -> impl Strategy<Value = Value> {
+    // NOTE: 不生成 role=system 的 message (Anthropic 非标准形态 — 官方 schema system
+    // 只在顶层)。该形态 2026-09-23 起被 reader 提升合并到顶层 system (normalize 不等
+    // 的声明例外, 见 codec/AGENTS.md "已知边界"), 进 FWD-1/FWD-2 byte-exact property
+    // 会红; 行为由 example 测试锁定 (anthropic.rs
+    // `read_request_promotes_system_role_message_to_top_level` +
+    // `system_role_message_survives_round_trip_into_top_level`)。
     prop_oneof![
         // user 消息 (content: string / 空字符串 / null / array)
         prop_oneof![

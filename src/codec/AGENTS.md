@@ -119,6 +119,17 @@ normalize(v) == normalize(Writer(Reader(v)))
 搁置项对应的 proptest 生成器分支已用 `// NOTE` 标注, 实现后恢复即可.
 response 路径的 2 个 property 标了 `#[ignore]`, 实现 L8 后启用.
 
+**已知边界 — Anthropic messages[] 内 role=system 条目 (2026-09-23)**: 非标准形态
+(官方 API system 只在顶层), 但 claude code 实测会把 billing header 作为 messages[0]
+(role=system) 发送。AnthropicReader 将其**提升合并**到顶层 `ir.system` (与 OpenAI reader
+对称, `read_request_promotes_system_role_message_to_top_level` 锁定), AnthropicWriter
+维持 filter (ir.messages 不再产出 System, 防御分支保留)。代价: 该形态的 round-trip
+**normalize 不等** — system 文本块从 messages[] 搬移到顶层 (位置搬移而非丢失; 非 Text
+block 仍按 writer 既有规则丢弃, 与跨协议来源的 system block 同型)。替代方案裁决
+(原样写回会被 schema 严格上游 400 拒绝) / 修复前静默丢弃行为 / 契约适用范围登记见
+contracts.md FWD-1 "Anthropic messages[].role=system 正规化" 注记 (待人工授权, §99);
+端到端回归 `anthropic_messages_system_role_survives_rewrite_path` (tests/integration.rs)。
+
 > **IR 字段建模路线图**: `extra` 字段的职责边界 (first-class vs extra 的机械化判定准则)、
 > 字段全景分类 (类别 A 应提升 / B 归 extra / 已 first-class)、以及 5 批实施路线图
 > 见 **`docs/design/ir-fields-roadmap.md`**. 任何修改 `IrRequest`/`IrResponse` 字段、

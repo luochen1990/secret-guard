@@ -9076,6 +9076,91 @@ async fn model_rewrite_no_secret_forces_ir_path() {
     );
 }
 
+/// Anthropic messages[] 内 role=system 条目 (claude code billing header 实测形态):
+/// reader 提升合并到顶层 system (转发内容不丢) + timeline 气泡完整
+/// (req_delta_messages 非空, 2026-09-23 claude code `-p` 排查回归).
+///
+/// 修复前: reader 把 System 留在 ir.messages, AnthropicWriter 写回时 filter 丢弃
+/// → 上游收不到 system 内容 + req_delta.len(2) > 写回 body messages.len(1) →
+/// timeline 气泡退化为 48 字符 preview 截断文本.
+#[tokio::test]
+async fn anthropic_messages_system_role_survives_rewrite_path() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/messages")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"msg_1","type":"message","role":"assistant","model":"m","content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#)
+        .create_async()
+        .await;
+
+    // Anthropic direct + 路由改写 (改写强制 IR 路径 — bug 的触发条件之一).
+    let real = provider_with("an-main", Protocol::Anthropic, &upstream.url());
+    let router = router_provider("virt", vec![rewrite_route("*", "an-main", "glm-x")]);
+    let dag = ConversationDag::new(64, 500, 1);
+    let dag_probe = dag.clone();
+    let proxy_url = spawn_proxy_static_dynamic(
+        vec![real, router],
+        vec![],
+        reqwest::Client::new(),
+        dag,
+        test_secret_table(),
+    )
+    .await
+    .0;
+
+    // claude code 实测形态: 顶层 system (array) + messages[0]=system (billing,
+    // string content) + messages[1]=user (array content, 双 text block).
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/a/virt/v1/messages",
+        r#"{"model":"ultra","max_tokens":16,"system":[{"type":"text","text":"agent intro"}],"messages":[{"role":"system","content":"x-billing-header: probe"},{"role":"user","content":[{"type":"text","text":"<system-reminder>ctx</system-reminder>"},{"type":"text","text":"你是谁?"}]}]}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+
+    let id = dag_probe
+        .list_node_ids_newest_first()
+        .first()
+        .copied()
+        .unwrap();
+
+    // 1. 转发内容不丢: 发给上游的 body (== req_body_raw, same_proto IR 路径同源)
+    //    顶层 system 为 2-block array (原顶层 1 段 + 提升 1 段), 内容与顺序保真.
+    let detail = dag_probe.get_node_detail(id).unwrap();
+    let sent: serde_json::Value = serde_json::from_str(&detail.req_body_raw).unwrap();
+    let sys_texts: Vec<&str> = sent["system"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
+        .collect();
+    assert_eq!(
+        sys_texts,
+        vec!["agent intro", "x-billing-header: probe"],
+        "system 内容须完整转发 (顶层 + messages 提升)"
+    );
+
+    // 2. timeline 气泡完整: req_delta_messages 与写回 body messages 等长且非空.
+    let node = dag_probe.get_node(id).unwrap();
+    let sid = node.session_id;
+    let page = dag_probe.timeline_view(sid, None, 10).unwrap();
+    let round = &page.rounds[0];
+    assert_eq!(round.round_kind, secret_guard::dag::RoundKind::Normal);
+    let stored_msgs = sent.get("messages").unwrap().as_array().unwrap();
+    assert_eq!(
+        round.req_delta_messages.len(),
+        stored_msgs.len(),
+        "req_delta_messages 与写回 body messages 数一致 (修复前: 前者被清空)"
+    );
+    assert!(!round.req_delta_messages.is_empty());
+    assert_eq!(round.req_delta_messages[0]["role"], "user");
+    let content = round.req_delta_messages[0]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 2, "user 气泡含双 text block");
+}
+
 #[tokio::test]
 async fn model_rewrite_switch_via_put() {
     // 即席切换模型: 路由 endpoint PUT 路由的 upstream_model 后, 新请求用新 model
