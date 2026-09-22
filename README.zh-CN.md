@@ -155,6 +155,9 @@ provider=...`), 命令行即可确认流量经过 secret-guard; 上游故障 (50
 - **套餐池轮换 (Pool)**: 把多份编码订阅套餐 (各含独立凭证) 挂成一个入口, 一份套餐的
   窗口限额用尽自动切换到下一份, 窗口恢复后自动切回 — 全程零人工干预。
 
+与 LiteLLM / LLM Guard / PasteGuard 的源码级对比 (敏感信息保护七维度, 含竞品强项如实标注):
+[docs/comparison.md](docs/comparison.md)。
+
 ## 协议支持
 
 | 协议 | 转发 | Secret Redact | 跨协议翻译 |
@@ -201,6 +204,7 @@ provider=...`), 命令行即可确认流量经过 secret-guard; 上游故障 (50
 - WebUI 各页面用法 → [站点·WebUI 指南](https://secret-guard.lambda.lc/zh-cn/manual-webui/)
 - NixOS 部署与凭据注入 → [docs/deployment-nixos.md](docs/deployment-nixos.md)
 - 架构设计与数据流契约 → [docs/design/](docs/design/) (contracts.md)
+- 与同类工具的源码级对比 → [docs/comparison.md](docs/comparison.md)
 - 开发流程 / 测试策略 / 模块契约 → [AGENTS.md](AGENTS.md)
 
 ## License

@@ -184,6 +184,10 @@ end-to-end integration tests, fully verified on every release:
   fails over to the next one automatically and switches back once the window resets —
   zero manual intervention.
 
+A source-level comparison with LiteLLM / LLM Guard / PasteGuard — seven
+secret-protection dimensions, including where the alternatives are stronger:
+[docs/comparison.md](docs/comparison.md).
+
 ## Protocol Support
 
 | Protocol | Forwarding | Secret Redact | Cross-protocol translation |
@@ -224,6 +228,9 @@ the full development guide lives in [AGENTS.md](AGENTS.md):
 - **Cross-protocol streaming with Responses**: OpenAI ⇄ Anthropic streaming translation
   is supported; the Responses side awaits event translation. reasoning content / hosted
   tools are currently dropped in cross-protocol translation (with a WARN).
+- **Unknown-secret detection (NER / regex / entropy) as an alerting layer**: flag
+  suspected undeclared secrets in the WebUI without auto-redacting (zero false-positive
+  replacements stay guaranteed). See [#252](https://git.lambda.lc/lc-studio/secret-guard/issues/252).
 - **Real-Provider field validation**: integration-test profiles against real upstreams
   for the protocol matrix.
 
@@ -236,6 +243,7 @@ You might be looking for:
 - WebUI page-by-page guide → [WebUI Guide (site)](https://secret-guard.lambda.lc/en/manual-webui/)
 - NixOS deployment and credential injection → [docs/deployment-nixos.md](docs/deployment-nixos.md)
 - Architecture and dataflow contracts → [docs/design/](docs/design/) (contracts.md)
+- Source-level comparison with alternatives → [docs/comparison.md](docs/comparison.md)
 - Development workflow / test strategy / module contracts → [AGENTS.md](AGENTS.md)
 
 ## License

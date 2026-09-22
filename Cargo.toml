@@ -8,6 +8,19 @@ edition = "2024"
 rust-version = "1.96"
 description = "A lightweight LLM gateway that prevents accidental secret leakage"
 license = "MIT"
+# crates.io 发布元数据 (2026-09 开源准备). 注: crates.io 名 `secret-guard` 已被第三方
+# 抢注 (owner bigdong89, 2026-09-09) — 若以本名发布需先协商转让; 备选 `secret-guard-rs`
+# (可用) + [[bin]] name 保持 "secret-guard" 二进制名不变. 发布名定夺见 issue #253.
+repository = "https://github.com/luochen1990/secret-guard"
+homepage = "https://secret-guard.lambda.lc"
+# bin 型 crate 的 docs.rs 页面无意义, documentation 指向文档站 (crates.io 侧栏链接).
+documentation = "https://secret-guard.lambda.lc/en/"
+readme = "README.md"
+keywords = ["llm", "security", "secrets", "proxy", "redaction"]
+categories = ["command-line-utilities", "web-programming"]
+# 大资产不进 crate 包 (demo.gif 2.1M / records-detail.webp); GitHub README 用相对路径
+# 引用它们 — crates.io 渲染 README 时图片不显示, 主战场是 Git 托管平台, 可接受.
+exclude = ["assets/*", "docs/*", "tests/webui/*", ".github/*", "nix/*"]
 
 [[bin]]
 name = "secret-guard"
