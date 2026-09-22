@@ -192,9 +192,9 @@ secret-protection dimensions, including where the alternatives are stronger:
 
 | Protocol | Forwarding | Secret Redact | Cross-protocol translation |
 |---|---|---|---|
-| OpenAI (Chat Completions) | ✅ | ✅ | ✅ ⇄ Anthropic (incl. streaming) / ⇄ Responses (non-streaming) |
-| Anthropic (claude) | ✅ | ✅ | ✅ ⇄ OpenAI (incl. streaming) / ⇄ Responses (non-streaming) |
-| OpenAI Responses | ✅ | ✅ (non-streaming) | ✅ ⇄ Chat Completions / Anthropic (non-streaming) |
+| OpenAI (Chat Completions) | ✅ | ✅ | ✅ ⇄ Anthropic (incl. streaming) / ⇄ Responses (incl. streaming) |
+| Anthropic (claude) | ✅ | ✅ | ✅ ⇄ OpenAI (incl. streaming) / ⇄ Responses (incl. streaming) |
+| OpenAI Responses | ✅ | ✅ (incl. streaming) | ✅ ⇄ Chat Completions / Anthropic (incl. streaming) |
 | Gemini / Ollama | ✅ byte pass-through | 🚧 [Roadmap](#roadmap--contributing) | 🚧 [Roadmap](#roadmap--contributing) |
 
 - Gemini / Ollama are transparent byte pass-through (forwarding itself fully works);
@@ -222,14 +222,11 @@ the full development guide lives in [AGENTS.md](AGENTS.md):
 - **Gemini / Ollama codec**: bring Redact and cross-protocol support to these families.
   A new protocol only needs a Reader + Writer trait implementation (~200 lines) with no
   dispatch changes — see `src/codec/AGENTS.md` for the architecture.
-- **Responses streaming SSE translation**: Responses + Redact hit + `stream=true`
-  currently returns 501 (the streaming writer side is unimplemented — passing through
-  would translate into an empty stream; the streaming reader side is implemented, so
-  streaming `resp_parsed` still works); with model-rewrite-only (no Redact), streaming
-  is allowed via SSE byte pass-through.
-- **Cross-protocol streaming with Responses**: OpenAI ⇄ Anthropic streaming translation
-  is supported; the Responses side awaits the streaming writer. reasoning content / hosted
-  tools are currently dropped in cross-protocol translation (with a WARN).
+- **Responses streaming fidelity**: close the residual known losses of Responses
+  streaming translation (hosted tools / refusal parts dropped with WARN, reasoning
+  delta event-type normalization, multi content part folding) — streaming itself,
+  including the Redact restore path, now works for every codec-covered pair; tracked
+  in [docs/known-limitations.md](docs/known-limitations.md).
 - **Unknown-secret detection (NER / regex / entropy) as an alerting layer**: flag
   suspected undeclared secrets in the WebUI without auto-redacting (zero false-positive
   replacements stay guaranteed). See [#252](https://git.lambda.lc/lc-studio/secret-guard/issues/252).

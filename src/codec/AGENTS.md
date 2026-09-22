@@ -14,19 +14,28 @@
 
 - ✅ OpenAI Chat Completions ⇄ Anthropic Messages 双向 (非流式 + 流式 SSE, 含 Redact
   场景 — 流式经 StreamTranslate 跨协议模式 + restore hook, 已接入 dispatch).
-- ✅ OpenAI Responses API 同协议透传 + Redact (非流式; 流式 + Redact 返回 501).
-- ✅ OpenAI Responses ⇄ OpenAI Chat Completions 跨协议翻译 (非流式).
-- ✅ Responses ⇄ Anthropic 跨协议翻译 (非流式, 经通用 IR 路径; r→a 接线由
-  `cross_proto_hosted_tools_drop_warns` 集成锁定, a→r 由
-  `cross_protocol_translates_anthropic_ingress_to_responses_upstream` 锁定).
+- ✅ OpenAI Responses API 同协议透传 + Redact (非流式 + 流式 — 流式经 StreamTranslate
+  同协议 restore 模式).
+- ✅ OpenAI Responses ⇄ OpenAI Chat Completions 跨协议翻译 (非流式 + 流式 — 流式
+  双向由 `cross_protocol_streaming_translates_responses_ingress_from_openai_upstream` +
+  `cross_protocol_streaming_translates_openai_ingress_from_responses_upstream` 锁定).
+- ✅ Responses ⇄ Anthropic 跨协议翻译 (非流式 + 流式. 非流式: Responses ingress ←
+  Anthropic upstream 由 `cross_proto_hosted_tools_drop_warns` 锁定, Anthropic ingress ←
+  Responses upstream 由 `cross_protocol_translates_anthropic_ingress_to_responses_upstream`
+  锁定. 流式: Anthropic ingress ← Responses upstream 由
+  `cross_protocol_streaming_translates_anthropic_ingress_from_responses_upstream` 锁定,
+  Responses ingress ← Anthropic upstream 走同一翻译路径但暂无专属测试).
 - ✅ `reasoning_content` (思考原文, OpenAI 兼容 provider 非标字段) 同协议建模:
   请求 (assistant 历史回传) / 非流式响应 / 流式 delta 三路径 reader↔writer 对称
   (#176, 契约 STR-6). 跨协议丢弃 (见下).
-- ❌ Responses ⇄ Anthropic 跨协议的流式 → 501 (同下条: Responses 流式 writer 未实现).
-- ❌ Responses 流式 SSE 事件翻译的 **writer 侧** (`write_response_event` 返回 None),
-  含跨协议 Responses 任一侧 + stream=true (501). reader 侧 (`read_response_events`)
-  已实现: SSE 事件 → IR 映射与状态机见 `responses.rs::read_responses_stream_event`
-  (流式 resp_parsed 经 StreamScan 自动生效).
+- ✅ Responses 流式 SSE 事件翻译 (2026-09-23 落地, reader + writer 双侧):
+  reader (`read_response_events`) 把 SSE 事件映射为 IR 事件流, writer
+  (`write_response_event`) 从 IR 事件序列合成合法 Responses SSE (done 族帧的全量
+  累积与 item_id 确定性合成规格见 `responses.rs::read_responses_stream_event` /
+  `write_responses_stream_event` 的实现注释). 同协议 Redact 场景流式 restore 由
+  `responses_streaming_with_secret_hit_restores_mock` 端到端锁定; 流式已知损失
+  (hosted tools / refusal 丢弃, reasoning delta 归一, 多 part 折叠等) 见
+  `docs/known-limitations.md` codec 节.
 - ❌ 不在 MVP: Bedrock / Gemini / Cohere, reasoning `encrypted_content` (provider-specific opaque),
   Anthropic `thinking` blocks, citations, logprobs, prompt caching, Bedrock eventstream 二进制流.
 
@@ -63,8 +72,8 @@
   flat stream 一个 chunk 可能产生 0..n 个 IR 事件, 需 state 合成;
   流式 state 机实现细节见文件头部 `//!` 与各 helper doc).
 - `anthropic.rs` — Anthropic Messages 的 Reader/Writer (流式 1:1 映射).
-- `responses.rs` — OpenAI Responses API 的 Reader/Writer (流式 reader 已实现: SSE 事件
-  → IR 映射与状态机见 `read_responses_stream_event`; 流式 writer 未实现).
+- `responses.rs` — OpenAI Responses API 的 Reader/Writer (非流式 + 流式双侧,
+  流式事件映射与合成规格的指针见上方支持矩阵).
 - `stream/` (目录, 4 子模块) — SSE chunk-boundary 处理 (TCP 切片兼容, CRLF/LF 双兼容, MAX_BUF 溢出 abort). 子模块:
   - `mod.rs` — 共享 SSE utils (`find_frame_terminator` / `parse_sse_frame` / `reframe_sse`) + 常量 + 集中测试.
   - `reassembler.rs` — `SseReassembler` (StreamTranslate / StreamScan 共享的帧重组骨架, 私有).

@@ -217,8 +217,8 @@ secret × 每非零位置分类; v4b 治理三问扩展)
   终结本就不进 DAG (#196 D5), 两类 /models 语义统一为"不计".
 - embeddings 等非 chat 的 POST **计入** (其响应同样回显 usage, 计费语义正确), 在
   契约注释中显式声明.
-- dispatch 前置拒绝 (404 未知 provider / 503 禁用 / 501 跨协议流式) 不产生
-  UsageEvent (未发生上游转发).
+- dispatch 前置拒绝 (404 未知 provider / 503 禁用 / 501 跨协议 codec 未覆盖 —
+  Gemini/Ollama) 不产生 UsageEvent (未发生上游转发).
 
 ### 5.4 OpenAI 流式 usage 可得性 (覆盖率预期管理)
 

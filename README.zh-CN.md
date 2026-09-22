@@ -162,9 +162,9 @@ provider=...`), 命令行即可确认流量经过 secret-guard; 上游故障 (50
 
 | 协议 | 转发 | Secret Redact | 跨协议翻译 |
 |---|---|---|---|
-| OpenAI (Chat Completions) | ✅ | ✅ | ✅ ⇄ Anthropic (含流式) / ⇄ Responses (非流式) |
-| Anthropic (claude) | ✅ | ✅ | ✅ ⇄ OpenAI (含流式) / ⇄ Responses (非流式) |
-| OpenAI Responses | ✅ | ✅ (非流式) | ✅ ⇄ Chat Completions / Anthropic (非流式) |
+| OpenAI (Chat Completions) | ✅ | ✅ | ✅ ⇄ Anthropic (含流式) / ⇄ Responses (含流式) |
+| Anthropic (claude) | ✅ | ✅ | ✅ ⇄ OpenAI (含流式) / ⇄ Responses (含流式) |
+| OpenAI Responses | ✅ | ✅ (含流式) | ✅ ⇄ Chat Completions / Anthropic (含流式) |
 | Gemini / Ollama | ✅ 字节透传 | 🚧 [Roadmap](#roadmap--贡献) | 🚧 [Roadmap](#roadmap--贡献) |
 
 - Gemini / Ollama 是透明字节透传 (转发本身完整可用); 由于 codec 尚未覆盖, Redact
@@ -188,12 +188,10 @@ provider=...`), 命令行即可确认流量经过 secret-guard; 上游故障 (50
 
 - **Gemini / Ollama codec**: 补齐这两族的 Redact 与跨协议能力。新增协议只需实现
   Reader + Writer trait (~200 行), 不动 dispatch — 架构见 `src/codec/AGENTS.md`。
-- **Responses 流式 SSE 翻译**: Responses + Redact 命中 + `stream=true` 返回 501
-  (流式 writer 侧未实现 — 放行会翻译出空流; 流式 reader 侧已实现, 流式
-  `resp_parsed` 照常派生); 仅路由 model 重写 (无 Redact) 时流式放行, SSE 字节透传。
-- **Responses 参与的跨协议流式**: OpenAI ⇄ Anthropic 流式翻译已支持, Responses
-  侧的流式 writer 待实现; 跨协议翻译中 reasoning content / hosted tools 暂被
-  丢弃 (有 WARN)。
+- **Responses 流式保真**: 收敛 Responses 流式翻译的残余已知损失 (hosted tools /
+  refusal parts 丢弃带 WARN、reasoning delta 事件类型归一、多 content part 折叠) —
+  流式翻译本体 (含 Redact restore 路径) 已在全部 codec 覆盖协议对上可用, 明细见
+  [docs/known-limitations.md](docs/known-limitations.md)。
 - **真实 Provider 实地验证**: 为协议矩阵补真实上游的集成测试 profile。
 
 ## 文档

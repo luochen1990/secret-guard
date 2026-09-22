@@ -297,8 +297,7 @@ URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标
 - 禁用 provider (`enabled = false`) → 503 `unavailable`
 - 路由 provider (routes) 坏路由: 无匹配路由 (NoMatch) / 目标缺失 / 目标 disabled / 成环 → 503 `unavailable` (message 只含 id + model 名 + reason 枚举, SEC-2 同型; 解析 per-request — body 收集后按请求 model 匹配路由, 切换只影响新请求 — FWD-5, #179)
 - 套餐池 provider (pool) 全耗尽: 全部成员耗尽/missing/disabled → 503 `unavailable`, **本地快速失败 (零上游请求)**, message 只含 pool id + reason 枚举 + 最早恢复剩余秒 (SEC-2 同型); 顺序 failover + 耗尽信号检测的语义见 contracts.md **POOL-*** 与 `src/pool.rs` 头部
-- **跨协议 + `stream=true`**: OpenAI ⇄ Anthropic 走 StreamTranslate 流式翻译 (含 Redact 场景的响应侧 restore); **Responses (任一侧) 例外** → 501 (Responses 流式 writer 未实现 — egress 侧 reader 已实现, 保守门待 writer 侧完成后整体解除, 放行会翻译出空流; 见 `docs/known-limitations.md`)
-- **Responses + Redact 命中 + `stream=true`** → 501 (Responses 流式 writer 未实现, 放行会翻译出空流 — 流式 reader 侧已实现, 流式 resp_parsed 经 StreamScan 自动生效; 仅路由 model 重写 (map 空, 响应无需 restore) 时流式放行 SSE 字节透传 — #183 D5 收窄; 见 `docs/known-limitations.md`)
+- **跨协议 + `stream=true`**: codec 覆盖族 (OpenAI ⇄ Anthropic ⇄ Responses) 任意 pair 走 StreamTranslate 流式翻译 (含 Redact 场景的响应侧 restore; Responses 流式已知损失见 `docs/known-limitations.md`)
 - Gemini/Ollama 跨协议 → 501 (codec 未覆盖)
 
 **Direct provider 多协议端点 (multi-endpoint)**: Direct 条目持有有序 `endpoints` 数组
