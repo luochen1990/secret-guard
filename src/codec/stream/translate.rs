@@ -7,7 +7,8 @@
 //!   → parse JSON
 //!   → egress.reader.read_response_events() → Vec<IrStreamEvent>
 //!   → (跨协议身份剥离 + usage backfill + post-stop guard)
-//!   → ingress.writer.write_response_event() → (event_type, JSON)
+//!   → ingress.writer.write_response_event() → Vec<(event_type, JSON)>
+//!     (一个 IR 事件可产出多帧, 如 Responses BlockStart → 2 帧)
 //!   → re-frame (重新封装为 ingress SSE 字节)
 //! → ingress SSE bytes
 //! ```
@@ -32,7 +33,7 @@ use super::reassembler::SseReassembler;
 use super::{SSE_DONE_FRAME, reframe_sse};
 use crate::codec::{
     Protocol, Reader, Writer,
-    ir::{IrDelta, IrStreamEvent, StreamDecodeState},
+    ir::{IrDelta, IrStreamEvent, StreamDecodeState, StreamEncodeState},
 };
 
 // ─── StreamRestoreHook: restore 能力的接口倒置 (codec 不依赖 redact) ──────────
@@ -103,11 +104,11 @@ impl DeltaKind {
 ///   mock→real 还原 (跨协议 + redact 场景; 无 redact 传 `None`).
 ///   跨协议模式额外启用两个 wire 合法性机制 (同协议模式**不启用**, 行为由现有
 ///   property 测试锁定):
-///   - **跳过 block 的配对过滤**: ingress writer 对 `BlockStart` 返回 None 的 index
+///   - **跳过 block 的配对过滤**: ingress writer 对 `BlockStart` 返回空 Vec 的 index
 ///     (如 Anthropic writer 对 `IrBlockMeta::ReasoningContent` — thinking block 需
 ///     signature 无法合成) 记入集合, 同 index 的 `BlockStop` 一并跳过 — 否则会 emit
 ///     未配对的 `content_block_stop` (协议违例). `BlockDelta` 不在过滤范围: OpenAI
-///     writer 对 Text/Reasoning 的 `BlockStart` 返回 None 是**结构性隐式** (delta 仍
+///     writer 对 Text/Reasoning 的 `BlockStart` 返回空 Vec 是**结构性隐式** (delta 仍
 ///     是内容, 必须照常 emit), 语义性整体跳过只发生在 Anthropic writer 对
 ///     ReasoningContent (其 `ReasoningDelta` 本就被 writer 跳过).
 ///   - **deferred message_stop**: OpenAI egress 开 `include_usage` 时末尾 usage chunk
@@ -123,6 +124,9 @@ pub struct StreamTranslate {
     ingress_writer: Box<dyn Writer>,
     egress_reader: Box<dyn Reader>,
     decode: StreamDecodeState,
+    /// writer 侧流式编码状态 (与 `decode` 对称): Responses writer 累积 items
+    /// 合成 done 类事件; OpenAI / Anthropic writer 恒空, 零开销.
+    encode: StreamEncodeState,
     /// SSE 帧 reassembly 骨架.
     reassembler: SseReassembler,
     /// 是否需要在 finish() 时追加 `[DONE]` (ingress 是 OpenAI 风格时为 true).
@@ -136,7 +140,7 @@ pub struct StreamTranslate {
     pending_stop: bool,
     /// 跨协议模式标志 (deferred stop + 配对过滤 仅跨协议启用; 同协议行为锁定).
     cross_proto: bool,
-    /// ingress writer 对 BlockStart 返回 None 的 block index 集合 (配对过滤, 见
+    /// ingress writer 对 BlockStart 返回空 Vec 的 block index 集合 (配对过滤, 见
     /// 结构体文档). 同协议模式恒空 (不启用过滤).
     skipped_block_starts: std::collections::HashSet<usize>,
     /// 同协议 restore 模式: 调用方注入的 restore hook (自持 per-block 状态).
@@ -170,6 +174,7 @@ impl StreamTranslate {
             ingress_writer: ingress.writer(),
             egress_reader: egress.reader(),
             decode: StreamDecodeState::default(),
+            encode: StreamEncodeState::default(),
             reassembler: SseReassembler::new(),
             emit_done: ingress.writer().emits_sse_done_terminator(),
             start_usage: None,
@@ -195,6 +200,7 @@ impl StreamTranslate {
             ingress_writer: proto.writer(),
             egress_reader: proto.reader(),
             decode: StreamDecodeState::default(),
+            encode: StreamEncodeState::default(),
             reassembler: SseReassembler::new(),
             emit_done: proto.writer().emits_sse_done_terminator(),
             start_usage: None,
@@ -347,13 +353,22 @@ impl StreamTranslate {
 
             // 跨协议模式的跳过 block 配对过滤 (仅对 writer 主动跳过 BlockStart 的
             // index 生效; 见结构体文档 "配对过滤" 段). BlockDelta 不在过滤范围:
-            // OpenAI writer 对 Text BlockStart 返回 None 是结构性隐式, delta 仍是
+            // OpenAI writer 对 Text BlockStart 返回空 Vec 是结构性隐式, delta 仍是
             // 内容 (由 writer 自行决定 emit); 语义性整体跳过 (Anthropic 对
             // ReasoningContent) 的 ReasoningDelta 本就被 writer 跳过.
             // 同协议模式不启用 (skipped_block_starts 恒空).
+            //
+            // 探测调用会传 `&mut self.encode` (writer 签名要求), 帧被丢弃:
+            // - OpenAI / Anthropic writer 不读 state, 探测零副作用, 安全.
+            // - 注意: 探测非空 → `continue` 不执行 → 同一事件在下方
+            //   `emit_ir_event` 会**再次**调用 writer. T3 的 Responses writer
+            //   若在 BlockStart 写累积 state, 必须对同一事件的重复调用幂等.
             if self.cross_proto {
                 if let IrStreamEvent::BlockStart { index, .. } = &ev
-                    && self.ingress_writer.write_response_event(&ev).is_none()
+                    && self
+                        .ingress_writer
+                        .write_response_event(&ev, &mut self.encode)
+                        .is_empty()
                 {
                     self.skipped_block_starts.insert(*index);
                     continue;
@@ -443,7 +458,7 @@ impl StreamTranslate {
     /// finish() 的 flush 入口: 冲刷所有 block 的窗口残余, 包装为 BlockDelta emit.
     ///
     /// 借用隔离: 先从 hook 收集 flush 结果 (hook 持 &mut self.restore), 释放借用后
-    /// 再走不可变的 emit_ir_event.
+    /// 再调 emit_ir_event (需 &mut self, 传 writer 的 encode state).
     ///
     /// 按 block index 升序 emit (由 hook 的 flush_all 保证), 避免违反客户端对 delta
     /// 时序的隐含假设 (eg OpenAI tool_call arguments partial JSON parser 假设按 index
@@ -463,11 +478,16 @@ impl StreamTranslate {
     }
 
     /// 把单个 IR 事件通过 ingress writer 序列化为 SSE 帧并追加到 out.
-    fn emit_ir_event(&self, ev: &IrStreamEvent, out: &mut Vec<u8>) {
-        let Some((event_type, data)) = self.ingress_writer.write_response_event(ev) else {
-            return; // writer 跳过此事件
-        };
-        out.extend_from_slice(&reframe_sse(&event_type, &data));
+    ///
+    /// 一个 IR 事件可产出多帧 (Responses writer), 逐帧 reframe; 空 Vec = writer
+    /// 跳过此事件. `&mut self` 仅为了传 writer 的 encode state.
+    fn emit_ir_event(&mut self, ev: &IrStreamEvent, out: &mut Vec<u8>) {
+        let frames = self
+            .ingress_writer
+            .write_response_event(ev, &mut self.encode);
+        for (event_type, data) in &frames {
+            out.extend_from_slice(&reframe_sse(event_type, data));
+        }
     }
 }
 
@@ -699,7 +719,7 @@ mod tests {
 
     /// H-1 回归 (OpenAI ingress + restore 方向): 配对过滤不得延迟 restore 的
     /// per-block 尾部 — text block 的 BlockStop 虽被跳过 (OpenAI writer 对
-    /// BlockStart{Text} 返回 None 是结构性隐式, index 在 skipped 集合内), hook
+    /// BlockStart{Text} 返回空 Vec 是结构性隐式, index 在 skipped 集合内), hook
     /// 持有的尾部字节仍必须在 finish_reason chunk **之前**发出. 修复前: 尾部
     /// 延迟到 finish() 的 flush_all, 落在 finish_reason 之后 (wire 顺序违例,
     /// 在 finish_reason 处停止读取的客户端丢尾部).

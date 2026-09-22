@@ -19,7 +19,8 @@ use super::ir::{ContentForm, ReasoningContentForm, StopForm};
 use super::{
     IrBlock, IrBlockMeta, IrDelta, IrError, IrImageSource, IrMessage, IrRequest, IrResponse,
     IrRole, IrStopReason, IrStreamEvent, IrTool, IrToolChoice, IrUsage, Reader, Writer,
-    blocks_to_text, collect_extra, current_epoch, input_to_string, ir::StreamDecodeState,
+    blocks_to_text, collect_extra, current_epoch, input_to_string,
+    ir::{StreamDecodeState, StreamEncodeState},
     random_base62,
 };
 
@@ -485,7 +486,12 @@ impl Writer for OpenAiWriter {
         Value::Object(out)
     }
 
-    fn write_response_event(&self, ev: &IrStreamEvent) -> Option<(String, Value)> {
+    fn write_response_event(
+        &self,
+        ev: &IrStreamEvent,
+        _state: &mut StreamEncodeState,
+    ) -> Vec<(String, Value)> {
+        // OpenAI writer 无需累积状态 (1 IR 事件 → 0/1 帧), `_state` 恒不读.
         let event_type = String::new(); // OpenAI 流用 bare `data:` (无 event: 行).
         let chunk = match ev {
             IrStreamEvent::MessageStart {
@@ -507,13 +513,13 @@ impl Writer for OpenAiWriter {
             IrStreamEvent::BlockStart { index, block } => match block {
                 IrBlockMeta::Text => {
                     // OpenAI 流的 text block start 是隐式的: 第一个 text delta chunk 自带 content.
-                    // 这里返回 None 避免发出空 chunk (与 BlockStop 同样跳过).
-                    return None;
+                    // 这里返回空 Vec 避免发出空 chunk (与 BlockStop 同样跳过).
+                    return Vec::new();
                 }
                 IrBlockMeta::ReasoningContent => {
                     // reasoning block start 同样隐式: 第一个 reasoning_content delta
                     // chunk 自带内容. 跳过空 chunk (与 Text 对称).
-                    return None;
+                    return Vec::new();
                 }
                 IrBlockMeta::ToolUse { id, name } => json!({
                     "choices": [{
@@ -561,7 +567,7 @@ impl Writer for OpenAiWriter {
             },
             IrStreamEvent::BlockStop { .. } => {
                 // OpenAI 没有 content_block_stop 的对应 event, 跳过.
-                return None;
+                return Vec::new();
             }
             IrStreamEvent::MessageDelta {
                 stop_reason, usage, ..
@@ -576,7 +582,7 @@ impl Writer for OpenAiWriter {
                 // 空 delta + 无 usage: 无意义, 跳过.
                 let has_usage = !usage.is_zero();
                 if stop_reason.is_none() && !has_usage {
-                    return None;
+                    return Vec::new();
                 }
 
                 let mut chunk = match stop_reason {
@@ -596,13 +602,13 @@ impl Writer for OpenAiWriter {
             }
             IrStreamEvent::MessageStop => {
                 // OpenAI 的 message_stop 由 emit_done_terminator 在 finish() 中追加.
-                return None;
+                return Vec::new();
             }
             IrStreamEvent::Error(msg) => json!({
                 "error": {"message": msg, "type": "upstream_error"}
             }),
         };
-        Some((event_type, chunk))
+        vec![(event_type, chunk)]
     }
 
     fn emits_sse_done_terminator(&self) -> bool {
@@ -2031,9 +2037,9 @@ mod tests {
             },
             usage_present: true,
         };
-        let (_, chunk) = writer()
-            .write_response_event(&ev)
-            .expect("should emit chunk");
+        let mut frames = writer().write_response_event(&ev, &mut StreamEncodeState::default());
+        assert_eq!(frames.len(), 1, "should emit exactly one chunk");
+        let (_, chunk) = frames.remove(0);
         let choices = chunk.get("choices").and_then(Value::as_array).unwrap();
         assert!(
             choices.is_empty(),
@@ -2059,9 +2065,9 @@ mod tests {
             },
             usage_present: true,
         };
-        let (_, chunk) = writer()
-            .write_response_event(&ev)
-            .expect("should emit chunk");
+        let mut frames = writer().write_response_event(&ev, &mut StreamEncodeState::default());
+        assert_eq!(frames.len(), 1, "should emit exactly one chunk");
+        let (_, chunk) = frames.remove(0);
         let choices = chunk.get("choices").and_then(Value::as_array).unwrap();
         assert_eq!(choices.len(), 1);
         assert_eq!(choices[0].get("finish_reason").unwrap(), "stop");
@@ -2071,14 +2077,18 @@ mod tests {
 
     #[test]
     fn writer_message_delta_with_no_usage_no_stop_reason_is_skipped() {
-        // 空 delta + 无 usage: writer 跳过 (返回 None).
+        // 空 delta + 无 usage: writer 跳过 (返回空 Vec).
         let ev = IrStreamEvent::MessageDelta {
             stop_reason: None,
             stop_sequence: None,
             usage: IrUsage::default(),
             usage_present: false,
         };
-        assert!(writer().write_response_event(&ev).is_none());
+        assert!(
+            writer()
+                .write_response_event(&ev, &mut StreamEncodeState::default())
+                .is_empty()
+        );
     }
 
     // ─── 多 tool_call 流式: index 唯一性 (回归测试) ──────────────────────
@@ -2122,20 +2132,22 @@ mod tests {
         ];
 
         // 收集所有 chunk 里 tool_calls[].index (直接用 BTreeSet 去重).
+        // OpenAI writer 每事件 0/1 帧, 遍历 Vec 与迁移前单帧语义等价.
         let mut seen_indices = std::collections::BTreeSet::new();
         for ev in &events {
-            if let Some((_, chunk)) = writer().write_response_event(ev)
-                && let Some(choices) = chunk.get("choices").and_then(Value::as_array)
+            for (_, chunk) in &writer().write_response_event(ev, &mut StreamEncodeState::default())
             {
-                for ch in choices {
-                    if let Some(tcs) = ch
-                        .get("delta")
-                        .and_then(|d| d.get("tool_calls"))
-                        .and_then(Value::as_array)
-                    {
-                        for tc in tcs {
-                            if let Some(idx) = tc.get("index").and_then(Value::as_u64) {
-                                seen_indices.insert(idx);
+                if let Some(choices) = chunk.get("choices").and_then(Value::as_array) {
+                    for ch in choices {
+                        if let Some(tcs) = ch
+                            .get("delta")
+                            .and_then(|d| d.get("tool_calls"))
+                            .and_then(Value::as_array)
+                        {
+                            for tc in tcs {
+                                if let Some(idx) = tc.get("index").and_then(Value::as_u64) {
+                                    seen_indices.insert(idx);
+                                }
                             }
                         }
                     }
@@ -2191,23 +2203,24 @@ mod tests {
         // 按 oai index 收集每个 tool_call 的 arguments delta, 验证 index→args 映射正确.
         let mut args_by_index: std::collections::BTreeMap<u64, String> = Default::default();
         for ev in &events {
-            if let Some((_, chunk)) = writer().write_response_event(ev)
-                && let Some(choices) = chunk.get("choices").and_then(Value::as_array)
+            for (_, chunk) in &writer().write_response_event(ev, &mut StreamEncodeState::default())
             {
-                for ch in choices {
-                    if let Some(tcs) = ch
-                        .get("delta")
-                        .and_then(|d| d.get("tool_calls"))
-                        .and_then(Value::as_array)
-                    {
-                        for tc in tcs {
-                            let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0);
-                            if let Some(args) = tc
-                                .get("function")
-                                .and_then(|f| f.get("arguments"))
-                                .and_then(Value::as_str)
-                            {
-                                args_by_index.entry(idx).or_default().push_str(args);
+                if let Some(choices) = chunk.get("choices").and_then(Value::as_array) {
+                    for ch in choices {
+                        if let Some(tcs) = ch
+                            .get("delta")
+                            .and_then(|d| d.get("tool_calls"))
+                            .and_then(Value::as_array)
+                        {
+                            for tc in tcs {
+                                let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0);
+                                if let Some(args) = tc
+                                    .get("function")
+                                    .and_then(|f| f.get("arguments"))
+                                    .and_then(Value::as_str)
+                                {
+                                    args_by_index.entry(idx).or_default().push_str(args);
+                                }
                             }
                         }
                     }
@@ -2536,18 +2549,20 @@ mod tests {
         let mut saw_reasoning = false;
         let mut saw_content = false;
         for ev in &all {
-            if let Some((_, chunk)) = writer().write_response_event(ev)
-                && let Some(delta) = chunk
+            for (_, chunk) in &writer().write_response_event(ev, &mut StreamEncodeState::default())
+            {
+                if let Some(delta) = chunk
                     .get("choices")
                     .and_then(Value::as_array)
                     .and_then(|c| c.first())
                     .and_then(|c| c.get("delta"))
-            {
-                if delta.get("reasoning_content").is_some() {
-                    saw_reasoning = true;
-                }
-                if delta.get("content").is_some() {
-                    saw_content = true;
+                {
+                    if delta.get("reasoning_content").is_some() {
+                        saw_reasoning = true;
+                    }
+                    if delta.get("content").is_some() {
+                        saw_content = true;
+                    }
                 }
             }
         }
@@ -2557,13 +2572,17 @@ mod tests {
 
     #[test]
     fn stream_reasoning_writer_block_start_is_implicit() {
-        // OpenAI writer 对 BlockStart{ReasoningContent} 返回 None (start 隐式在首个 delta 内),
-        // 与 Text 对称 — 不发空 chunk.
+        // OpenAI writer 对 BlockStart{ReasoningContent} 返回空 Vec (start 隐式在首个
+        // delta 内), 与 Text 对称 — 不发空 chunk.
         let ev = IrStreamEvent::BlockStart {
             index: 1,
             block: IrBlockMeta::ReasoningContent,
         };
-        assert!(writer().write_response_event(&ev).is_none());
+        assert!(
+            writer()
+                .write_response_event(&ev, &mut StreamEncodeState::default())
+                .is_empty()
+        );
     }
 
     // ─── ReasoningContent 跨协议丢弃 (FWD-3 范围外显式丢弃, #176) ──────────
@@ -2606,19 +2625,25 @@ mod tests {
         );
         assert!(
             AnthropicWriter
-                .write_response_event(&IrStreamEvent::BlockStart {
-                    index: 0,
-                    block: IrBlockMeta::ReasoningContent,
-                })
-                .is_none()
+                .write_response_event(
+                    &IrStreamEvent::BlockStart {
+                        index: 0,
+                        block: IrBlockMeta::ReasoningContent,
+                    },
+                    &mut StreamEncodeState::default(),
+                )
+                .is_empty()
         );
         assert!(
             AnthropicWriter
-                .write_response_event(&IrStreamEvent::BlockDelta {
-                    index: 0,
-                    delta: IrDelta::ReasoningDelta("cot".into()),
-                })
-                .is_none()
+                .write_response_event(
+                    &IrStreamEvent::BlockDelta {
+                        index: 0,
+                        delta: IrDelta::ReasoningDelta("cot".into()),
+                    },
+                    &mut StreamEncodeState::default(),
+                )
+                .is_empty()
         );
         // 丢弃后重读: Anthropic reader 不产出 ReasoningContent (round-trip 丢弃确认).
         let ir2 = AnthropicReader.read_request(&wire).unwrap();

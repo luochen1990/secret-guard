@@ -543,6 +543,27 @@ pub struct StreamDecodeState {
     pub tool_ir_index: std::collections::BTreeMap<usize, usize>,
 }
 
+// ─── StreamEncodeState ─────────────────────────────────────────────────────
+
+/// writer 侧流式编码状态 (与 reader 侧 [`StreamDecodeState`] 对称).
+///
+/// Responses writer 需要累积 block 内容以合成 done 类事件的全量 item
+/// (`output_item.done` / `response.completed`); OpenAI / Anthropic writer
+/// 不使用 (1 IR 事件 → 0/1 帧, 无需累积).
+///
+/// 生命周期: 由 caller (`StreamTranslate`) 持有, 跨事件复用, 流结束 (`finish`) 后丢弃.
+#[derive(Debug, Clone, Default)]
+pub struct StreamEncodeState {
+    /// Responses writer 的累积状态 (其余协议保持恒空, 零开销).
+    pub responses: ResponsesEncodeState,
+}
+
+/// Responses 流式 writer 的累积状态 (内容由 T3 填充; 本任务只立骨架).
+#[derive(Debug, Clone, Default)]
+pub struct ResponsesEncodeState {
+    // T3 将添加: response 元信息 / items 累积 / 终止缓存
+}
+
 // ─── IrError ───────────────────────────────────────────────────────────────
 
 /// codec 解析失败时返回的错误. 当前仅承载人类可读消息,

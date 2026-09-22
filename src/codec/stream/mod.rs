@@ -255,7 +255,7 @@ mod tests {
         let input = b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         let out = t.feed(input);
         let s_out = String::from_utf8_lossy(&out);
-        // OpenAI writer 在 IrStreamEvent::MessageStop 时返回 None, 所以 out 应为空.
+        // OpenAI writer 在 IrStreamEvent::MessageStop 时返回空 Vec, 所以 out 应为空.
         assert!(
             s_out.is_empty(),
             "MessageStop should produce no output, got: {s_out}"
@@ -463,11 +463,12 @@ mod tests {
     fn openai_same_proto_multi_tool_call_preserves_distinct_indices() {
         use crate::codec::Reader;
         use crate::codec::Writer;
-        use crate::codec::ir::StreamDecodeState;
+        use crate::codec::ir::{StreamDecodeState, StreamEncodeState};
 
         let reader = OpenAiReader;
         let writer = OpenAiWriter;
         let mut state = StreamDecodeState::default();
+        let mut encode = StreamEncodeState::default();
 
         // chunk 1: 开始两个 tool_call (index 0 和 1)
         let chunk1 = serde_json::json!({
@@ -500,23 +501,23 @@ mod tests {
             }]
         });
 
-        // reader → events → writer → chunks
+        // reader → events → writer → chunks (OpenAI writer 每事件 0/1 帧, 遍历 Vec)
         let mut seen_oai_indices = std::collections::BTreeSet::new();
         for chunk in [&chunk1, &chunk2] {
             let events = reader.read_response_events("", chunk, &mut state);
             for ev in &events {
-                if let Some((_, out)) = writer.write_response_event(ev)
-                    && let Some(choices) = out.get("choices").and_then(Value::as_array)
-                {
-                    for ch in choices {
-                        if let Some(tcs) = ch
-                            .get("delta")
-                            .and_then(|d| d.get("tool_calls"))
-                            .and_then(Value::as_array)
-                        {
-                            for tc in tcs {
-                                if let Some(idx) = tc.get("index").and_then(Value::as_u64) {
-                                    seen_oai_indices.insert(idx);
+                for (_, out) in &writer.write_response_event(ev, &mut encode) {
+                    if let Some(choices) = out.get("choices").and_then(Value::as_array) {
+                        for ch in choices {
+                            if let Some(tcs) = ch
+                                .get("delta")
+                                .and_then(|d| d.get("tool_calls"))
+                                .and_then(Value::as_array)
+                            {
+                                for tc in tcs {
+                                    if let Some(idx) = tc.get("index").and_then(Value::as_u64) {
+                                        seen_oai_indices.insert(idx);
+                                    }
                                 }
                             }
                         }

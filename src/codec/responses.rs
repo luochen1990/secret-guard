@@ -380,10 +380,15 @@ impl Writer for ResponsesWriter {
         Value::Object(out)
     }
 
-    fn write_response_event(&self, _ev: &super::IrStreamEvent) -> Option<(String, Value)> {
-        // Responses 流式 SSE 翻译尚未实现 (MVP 范围外).
+    fn write_response_event(
+        &self,
+        _ev: &super::IrStreamEvent,
+        _state: &mut super::ir::StreamEncodeState,
+    ) -> Vec<(String, Value)> {
+        // Responses 流式 SSE 翻译尚未实现 (stub).
         // 同协议透传路径不进入 codec; 跨协议流式返回 501.
-        None
+        // T3 将按方案 D3 合成: 经 `_state.responses` 累积 items, 1 IR 事件 → 0..n 帧.
+        Vec::new()
     }
 
     fn emits_sse_done_terminator(&self) -> bool {

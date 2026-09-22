@@ -20,7 +20,9 @@ use super::ir::ContentForm;
 use super::{
     DEFAULT_MAX_TOKENS, IrBlock, IrBlockMeta, IrDelta, IrError, IrImageSource, IrMessage,
     IrRequest, IrResponse, IrRole, IrStopReason, IrStreamEvent, IrTool, IrToolChoice, IrUsage,
-    Reader, Writer, collect_extra, ir::StreamDecodeState, random_base62,
+    Reader, Writer, collect_extra,
+    ir::{StreamDecodeState, StreamEncodeState},
+    random_base62,
 };
 
 // ─── Reader ────────────────────────────────────────────────────────────────
@@ -444,7 +446,12 @@ impl Writer for AnthropicWriter {
         Value::Object(out)
     }
 
-    fn write_response_event(&self, ev: &IrStreamEvent) -> Option<(String, Value)> {
+    fn write_response_event(
+        &self,
+        ev: &IrStreamEvent,
+        _state: &mut StreamEncodeState,
+    ) -> Vec<(String, Value)> {
+        // Anthropic writer 无需累积状态 (1 IR 事件 → 0/1 帧), `_state` 恒不读.
         match ev {
             IrStreamEvent::MessageStart {
                 id, model, usage, ..
@@ -463,29 +470,29 @@ impl Writer for AnthropicWriter {
                     "usage".to_string(),
                     write_usage(usage.as_ref().unwrap_or(&IrUsage::zero())),
                 );
-                Some((
+                vec![(
                     "message_start".to_string(),
                     json!({"type": "message_start", "message": Value::Object(message)}),
-                ))
+                )]
             }
             IrStreamEvent::BlockStart { index, block } => match block {
-                IrBlockMeta::Text => Some((
+                IrBlockMeta::Text => vec![(
                     "content_block_start".to_string(),
                     json!({
                         "type": "content_block_start",
                         "index": index,
                         "content_block": {"type": "text", "text": ""}
                     }),
-                )),
+                )],
                 IrBlockMeta::ReasoningContent => {
                     // 跳过: thinking block 需 signature, 无法合法合成 (伪造会被
                     // Anthropic API 拒收). 裁决 rationale 见 codec/AGENTS.md 支持矩阵.
                     // 同 index 的 BlockStop 由 StreamTranslate 的跳过 block 配对过滤
                     // 兜底 (跨协议模式, stream/translate.rs) — 不产生未配对的
                     // content_block_stop.
-                    None
+                    Vec::new()
                 }
-                IrBlockMeta::ToolUse { id, name } => Some((
+                IrBlockMeta::ToolUse { id, name } => vec![(
                     "content_block_start".to_string(),
                     json!({
                         "type": "content_block_start",
@@ -497,36 +504,36 @@ impl Writer for AnthropicWriter {
                             "input": {},
                         }
                     }),
-                )),
+                )],
             },
             IrStreamEvent::BlockDelta { index, delta } => match delta {
-                IrDelta::TextDelta(text) => Some((
+                IrDelta::TextDelta(text) => vec![(
                     "content_block_delta".to_string(),
                     json!({
                         "type": "content_block_delta",
                         "index": index,
                         "delta": {"type": "text_delta", "text": text}
                     }),
-                )),
+                )],
                 IrDelta::ReasoningDelta(_) => {
                     // thinking_delta 需要 BlockStart(thinking) 配对 (见 BlockStart 分支),
                     // 跳过 (配对 BlockStart 被 writer 跳过的 block, 其 delta 亦不 emit —
                     // StreamTranslate 的配对过滤跳过同 index BlockStop, 三者一致).
-                    None
+                    Vec::new()
                 }
-                IrDelta::InputJsonDelta(partial) => Some((
+                IrDelta::InputJsonDelta(partial) => vec![(
                     "content_block_delta".to_string(),
                     json!({
                         "type": "content_block_delta",
                         "index": index,
                         "delta": {"type": "input_json_delta", "partial_json": partial}
                     }),
-                )),
+                )],
             },
-            IrStreamEvent::BlockStop { index } => Some((
+            IrStreamEvent::BlockStop { index } => vec![(
                 "content_block_stop".to_string(),
                 json!({"type": "content_block_stop", "index": index}),
-            )),
+            )],
             IrStreamEvent::MessageDelta {
                 stop_reason,
                 stop_sequence,
@@ -545,25 +552,25 @@ impl Writer for AnthropicWriter {
                         .map(Value::String)
                         .unwrap_or(Value::Null),
                 );
-                Some((
+                vec![(
                     "message_delta".to_string(),
                     json!({
                         "type": "message_delta",
                         "delta": Value::Object(delta),
                         "usage": write_usage(usage),
                     }),
-                ))
+                )]
             }
             IrStreamEvent::MessageStop => {
-                Some(("message_stop".to_string(), json!({"type": "message_stop"})))
+                vec![("message_stop".to_string(), json!({"type": "message_stop"}))]
             }
-            IrStreamEvent::Error(msg) => Some((
+            IrStreamEvent::Error(msg) => vec![(
                 "error".to_string(),
                 json!({
                     "type": "error",
                     "error": {"type": "upstream_error", "message": msg}
                 }),
-            )),
+            )],
         }
     }
 

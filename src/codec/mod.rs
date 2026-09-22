@@ -137,11 +137,20 @@ pub trait Writer: Send + Sync {
     /// [`IrResponse`] → 非流式响应 body (JSON).
     fn write_response(&self, resp: &IrResponse) -> Value;
 
-    /// 单个 IR 事件 → SSE 事件 `(event_type, data)`, 或 `None` 表示该协议跳过此事件.
+    /// 单个 IR 事件 → SSE 事件序列 `Vec<(event_type, data)>`; 空 Vec 表示该协议跳过此事件.
     ///
-    /// 例如 OpenAI writer 看到 `IrStreamEvent::Error` 时不发独立 event (OpenAI 把错误内联在 chunk 里),
-    /// 返回 `None` 让 StreamTranslate 跳过.
-    fn write_response_event(&self, ev: &IrStreamEvent) -> Option<(String, Value)>;
+    /// 返回 Vec 是因为一个 IR 事件可能合成多个 SSE 帧 — Responses 的 `BlockStart{Text}`
+    /// 产出 `output_item.added` + `content_part.added` 两帧 (done 类事件需要累积状态,
+    /// 由 `state` 承载; OpenAI / Anthropic writer 不读 state).
+    ///
+    /// 例如 OpenAI writer 看到 `IrStreamEvent::MessageStop` 时不发对应 chunk
+    /// (OpenAI 流的终止符 `data: [DONE]` 由 caller 在 finish 时追加),
+    /// 返回空 Vec 让 StreamTranslate 跳过.
+    fn write_response_event(
+        &self,
+        ev: &IrStreamEvent,
+        state: &mut ir::StreamEncodeState,
+    ) -> Vec<(String, Value)>;
 
     /// 该协议的请求是否要求 `max_tokens` 字段.
     /// OpenAI 可选, Anthropic 必填. 跨协议翻译时若 IR 缺 `max_tokens` 且目标必填,
