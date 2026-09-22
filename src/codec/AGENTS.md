@@ -31,7 +31,7 @@
 - ✅ Responses 流式 SSE 事件翻译 (2026-09-23 落地, reader + writer 双侧):
   reader (`read_response_events`) 把 SSE 事件映射为 IR 事件流, writer
   (`write_response_event`) 从 IR 事件序列合成合法 Responses SSE (done 族帧的全量
-  累积与 item_id 确定性合成规格见 `responses.rs::read_responses_stream_event` /
+  累积与 item_id 确定性合成规格见 `responses/stream.rs::read_responses_stream_event` /
   `write_responses_stream_event` 的实现注释). 同协议 Redact 场景流式 restore 由
   `responses_streaming_with_secret_hit_restores_mock` 端到端锁定; 流式已知损失
   (hosted tools / refusal 丢弃, reasoning delta 归一, 多 part 折叠等) 见
@@ -72,8 +72,10 @@
   flat stream 一个 chunk 可能产生 0..n 个 IR 事件, 需 state 合成;
   流式 state 机实现细节见文件头部 `//!` 与各 helper doc).
 - `anthropic.rs` — Anthropic Messages 的 Reader/Writer (流式 1:1 映射).
-- `responses.rs` — OpenAI Responses API 的 Reader/Writer (非流式 + 流式双侧,
-  流式事件映射与合成规格的指针见上方支持矩阵).
+- `responses/` (目录, 2 子模块) — OpenAI Responses API 的 Reader/Writer (非流式 + 流式双侧,
+  流式事件映射与合成规格的指针见上方支持矩阵). 子模块:
+  - `mod.rs` — 非流式: Reader/Writer trait 实现 (流式方法委托 stream) + 共享 helpers + 非流式测试.
+  - `stream.rs` — 流式: SSE 事件 ↔ IR 事件双向状态机 (reader 映射表 / writer 合成累积 / 探测幂等).
 - `stream/` (目录, 4 子模块) — SSE chunk-boundary 处理 (TCP 切片兼容, CRLF/LF 双兼容, MAX_BUF 溢出 abort). 子模块:
   - `mod.rs` — 共享 SSE utils (`find_frame_terminator` / `parse_sse_frame` / `reframe_sse`) + 常量 + 集中测试.
   - `reassembler.rs` — `SseReassembler` (StreamTranslate / StreamScan 共享的帧重组骨架, 私有).

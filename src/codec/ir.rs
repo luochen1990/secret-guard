@@ -568,7 +568,7 @@ pub struct ResponsesDecodeState {
 ///
 /// Anthropic 流是 1:1 的 (事件自带 block index), 顶层字段在 Anthropic reader 中不使用;
 /// Responses reader 只使用 [`Self::responses`] 子状态 (事件映射表见
-/// `codec::responses::read_responses_stream_event` 头部).
+/// `codec::responses::stream::read_responses_stream_event` 头部).
 #[derive(Debug, Clone, Default)]
 pub struct StreamDecodeState {
     /// 是否已发 MessageStart.

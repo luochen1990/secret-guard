@@ -113,6 +113,72 @@ pub fn reframe_sse(event_type: &str, data: &serde_json::Value) -> Vec<u8> {
     }
 }
 
+// ─── 测试共享: SSE volatile 字段归一化 ──────────────────────────────────────
+
+/// 把 SSE 输出里 writer 合成的时敏/随机字段归一化, 使输出可做字节级比较.
+/// (M-S2 合一: OpenAI 版与 Responses 版仅 id 前缀 / created 键名两个常量不同,
+/// 算法体单一来源于此; 调用方 = 本模块 tests + `codec::fwd_streaming_property`.)
+///
+/// - Pass 1 (`id_prefix` 命中处到闭合 `"` 的整段 → `id_norm`): 如
+///   `"id":"chatcmpl-<base62>"` → `"id":"<n>` — writer 的 synth id 每次随机
+///   (`synth_id` / `synth_response_id`).
+/// - Pass 2 (`created_key` 命中处起的 ASCII 数字段 → `<n>`): 如
+///   `"created":<digits>` → `"created":<n>` — writer `current_epoch` 时敏,
+///   baseline 与 chunked 两次 `.feed()` 间可能跨整秒边界.
+///
+/// 两个前缀互不为子串, 不会在同一偏移同时命中, 因此分两趟独立 find-replace
+/// 语义等价且更清晰. 仅替换 writer 合成路径产出的字段: id 前缀用于识别合成 id,
+/// 区分上游透传的业务 id; 其他字段 (含可能的 UTF-8 content) 原样保留.
+/// 用 str::find + 切片, 避免逐字节 as char 破坏 UTF-8.
+#[cfg(test)]
+pub(crate) fn normalize_sse_volatile(
+    input: &str,
+    id_prefix: &str,
+    id_norm: &str,
+    created_key: &str,
+) -> String {
+    // Pass 1: `id_prefix` 命中处到闭合 `"` 的整段 → `id_norm`.
+    // 假设: writer 用 synth id 合成, base62 payload 不含 `"`.
+    // 不成立时 (截断 JSON 无闭合 `"`) 直接追加剩余, 不报错.
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find(id_prefix) {
+        out.push_str(&rest[..start]);
+        out.push_str(id_norm);
+        let after = &rest[start + id_prefix.len()..];
+        match after.find('"') {
+            // end 是闭合 '"' 的位置, 保留它交由下一轮处理.
+            Some(end) => rest = &after[end..],
+            None => {
+                out.push_str(after);
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+
+    // Pass 2: `created_key` 命中处起的 ASCII 数字段 → `<n>`.
+    // 假设: writer 序列化为 compact ASCII 数字 (json!(u64)), 不带空格.
+    // writer 契约保证 created 后必有 ≥1 数字, position 返回 Some(0) 不会发生;
+    // 即便发生, end=0 会让 rest 不推进 → 死循环. unwrap_or 兜底到 after.len() 避免之.
+    let mut out2 = String::with_capacity(out.len());
+    let mut rest = out.as_str();
+    while let Some(start) = rest.find(created_key) {
+        out2.push_str(&rest[..start]);
+        out2.push_str(created_key);
+        out2.push_str("<n>");
+        let after = &rest[start + created_key.len()..];
+        let end = after
+            .bytes()
+            .position(|b| !b.is_ascii_digit())
+            .unwrap_or(after.len());
+        rest = &after[end..];
+    }
+    out2.push_str(rest);
+    out2
+}
+
 // ─── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1565,57 +1631,10 @@ mod tests {
         assert_eq!(baseline, chunked);
     }
 
-    /// 把 SSE 输出里两类 writer 合成的时敏/随机字段归一化, 使输出可做字节级比较:
-    ///
-    /// - `"id":"chatcmpl-<base62>"` → `"id":"<n>`  (OpenAI writer `synth_id` 每次随机)
-    /// - `"created":<digits>`       → `"created":<n>` (writer `current_epoch` 取自
-    ///   `SystemTime::now()`, baseline 与 chunked 两次 `.feed()` 间可能跨整秒边界)
-    ///
-    /// 两个前缀互不为子串, 不会在同一偏移同时命中, 因此分两趟独立 find-replace 语义等价且更清晰.
-    /// 仅替换 writer 合成路径产出的字段: chatcmpl- 前缀用于识别合成 id, 区分上游透传的业务 id
-    /// (如 fixture 的 `cmpl-x`); 其他字段 (含可能的 UTF-8 content) 原样保留.
-    /// 用 str::find + 切片, 避免逐字节 as char 破坏 UTF-8.
+    /// OpenAI 版 volatile 常量: 合成 id 前缀 `chatcmpl-` (识别 writer 合成的 id,
+    /// 区分上游透传的业务 id 如 fixture 的 `cmpl-x`) + `created` 键.
+    /// 算法体见上级 [`normalize_sse_volatile`] (M-S2 合一).
     fn normalize_sse_volatile_fields(input: &str) -> String {
-        // Pass 1: `"id":"chatcmpl-<base62>"` → `"id":"<n>`.
-        // 假设: writer 用 synth_id 合成, base62 payload 不含 `"`.
-        // 不成立时 (截断 JSON 无闭合 `"`) 直接追加剩余, 不报错.
-        const ID_PREFIX: &str = "\"id\":\"chatcmpl-";
-        let mut out = String::with_capacity(input.len());
-        let mut rest = input;
-        while let Some(start) = rest.find(ID_PREFIX) {
-            out.push_str(&rest[..start]);
-            out.push_str("\"id\":\"<n>");
-            let after = &rest[start + ID_PREFIX.len()..];
-            match after.find('"') {
-                // end 是闭合 '"' 的位置, 保留它交由下一轮处理.
-                Some(end) => rest = &after[end..],
-                None => {
-                    out.push_str(after);
-                    rest = "";
-                    break;
-                }
-            }
-        }
-        out.push_str(rest);
-
-        // Pass 2: `"created":<digits>` → `"created":<n>`.
-        // 假设: writer 序列化为 compact ASCII 数字 (json!(u64)), 不带空格.
-        // writer 契约保证 created 后必有 ≥1 数字, 此处 position 返回 Some(0) 不会发生;
-        // 即便发生, end=0 会让 rest 不推进 → 死循环. unwrap_or 兜底到 after.len() 避免之.
-        const CREATED_PREFIX: &str = "\"created\":";
-        let mut out2 = String::with_capacity(out.len());
-        let mut rest = out.as_str();
-        while let Some(start) = rest.find(CREATED_PREFIX) {
-            out2.push_str(&rest[..start]);
-            out2.push_str("\"created\":<n>");
-            let after = &rest[start + CREATED_PREFIX.len()..];
-            let end = after
-                .bytes()
-                .position(|b| !b.is_ascii_digit())
-                .unwrap_or(after.len());
-            rest = &after[end..];
-        }
-        out2.push_str(rest);
-        out2
+        normalize_sse_volatile(input, "\"id\":\"chatcmpl-", "\"id\":\"<n>", "\"created\":")
     }
 }

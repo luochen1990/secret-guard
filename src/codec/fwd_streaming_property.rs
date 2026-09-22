@@ -111,7 +111,7 @@ use proptest::prelude::*;
 use serde_json::{Value, json};
 
 use crate::codec::ir::{IrBlock, IrStopReason, IrUsage};
-use crate::codec::stream::{StreamScan, StreamTranslate, parse_sse_frame};
+use crate::codec::stream::{StreamScan, StreamTranslate, normalize_sse_volatile, parse_sse_frame};
 use crate::codec::{IrResponse, Protocol};
 use crate::redact::RedactionMap;
 
@@ -314,24 +314,36 @@ fn run_same_proto_restore(
 
 /// 按 `splits` 切分点序列把 `upstream` 分段喂给 translator, 收集所有输出 (含 finish()).
 ///
-/// 切分点语义 (与 stream/mod.rs `scan_chunked` 一致): 切分点把 [0,len) 切成 |splits|+1 段,
-/// 越界 / 乱序由 clamp + 单调化兜底. 两个 caller (same-proto restore / cross-proto
-/// translate) 共用此逻辑, 仅 translator 构造方式不同.
+/// 切分点语义 (与 stream/mod.rs `scan_chunked` 一致, 由 [`for_each_split_chunk`]
+/// 单一实现): 切分点把 [0,len) 切成 |splits|+1 段, 越界 / 乱序由 clamp + 单调化
+/// 兜底. 两个 caller (same-proto restore / cross-proto translate) 共用此逻辑,
+/// 仅 translator 构造方式不同.
 fn feed_split_translator(t: &mut StreamTranslate, upstream: &[u8], splits: &[usize]) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
+    for_each_split_chunk(splits, upstream, |chunk| {
+        out.extend_from_slice(&t.feed(chunk))
+    });
+    out.extend_from_slice(&t.finish());
+    out
+}
+
+/// 把 `full` 按 `splits` 切分点序列分段回调 `f` (每段一个非空 chunk).
+///
+/// 切分点语义 (M-S3 合一, 原本在 `feed_split_translator` / `scan_responses_chunked`
+/// 两处逐字重复): 切分点把 [0,len) 切成 |splits|+1 段; 越界 clamp 到 len,
+/// 乱序由单调化 (≥ prev) 兜底; 产生的空段跳过, 尾段剩余字节一次性回调.
+fn for_each_split_chunk(splits: &[usize], full: &[u8], mut f: impl FnMut(&[u8])) {
     let mut prev = 0usize;
     for &sp in splits {
-        let sp = sp.min(upstream.len()).max(prev);
+        let sp = sp.min(full.len()).max(prev);
         if sp > prev {
-            out.extend_from_slice(&t.feed(&upstream[prev..sp]));
+            f(&full[prev..sp]);
         }
         prev = sp;
     }
-    if prev < upstream.len() {
-        out.extend_from_slice(&t.feed(&upstream[prev..]));
+    if prev < full.len() {
+        f(&full[prev..]);
     }
-    out.extend_from_slice(&t.finish());
-    out
 }
 
 /// 手造一个 RedactionMap { real → mock }. 不走 redact_ir 的 mock 生成路径,
@@ -1237,67 +1249,31 @@ proptest! {
 // ─── Responses STR-1/STR-2 辅助 ─────────────────────────────────────────────
 
 /// 把字节流按切分点序列分段喂入 StreamScan(Responses), 返回最终 snapshot
-/// (与 stream/mod.rs `scan_chunked` 同一切分语义 — 那里硬编码 OpenAI, 这里
-/// Responses 版本留在本模块避免跨 test 模块引用).
+/// (切分语义单一实现于 [`for_each_split_chunk`], 与 stream/mod.rs `scan_chunked`
+/// 一致 — 那里硬编码 OpenAI, 这里 Responses 版本留在本模块避免跨 test 模块引用).
 fn scan_responses_chunked(splits: &[usize], full: &[u8]) -> IrResponse {
     let mut scan = StreamScan::new(Protocol::OpenAIResponses);
-    let mut prev = 0usize;
-    for &sp in splits {
-        let sp = sp.min(full.len()).max(prev);
-        if sp > prev {
-            scan.feed(&full[prev..sp]);
-        }
-        prev = sp;
-    }
-    if prev < full.len() {
-        scan.feed(&full[prev..]);
-    }
+    for_each_split_chunk(splits, full, |chunk| {
+        scan.feed(chunk);
+    });
     scan.snapshot()
 }
 
 /// 把 Responses SSE 输出里 writer 合成的时敏/随机字段归一化, 使输出可做字节级比较
-/// (与 stream/mod.rs `normalize_sse_volatile_fields` 同型, 字段集换为 Responses 的):
+/// (算法体与 stream/mod.rs 的 OpenAI 版合一于 `normalize_sse_volatile`, M-S2;
+/// 常量差异 = Responses 的合成 id 前缀 `resp_` / `created_at` 键):
 ///
 /// - `"id":"resp_<base62>"` → `"id":"resp_<n>` (writer `synth_response_id` 每次随机;
 ///   MessageStart 的 id 被 translate 层剥离后由 writer 合成, fixture 的 resp_1 不会
 ///   出现在输出 — 但统一归一化无害: 归一化函数是输入的确定性函数)
 /// - `"created_at":<digits>` → `"created_at":<n>` (writer `current_epoch` 时敏)
 fn normalize_responses_sse_volatile(input: &str) -> String {
-    // Pass 1: `"id":"resp_<payload>"` → `"id":"resp_<n>`.
-    const ID_PREFIX: &str = "\"id\":\"resp_";
-    let mut out = String::with_capacity(input.len());
-    let mut rest = input;
-    while let Some(start) = rest.find(ID_PREFIX) {
-        out.push_str(&rest[..start]);
-        out.push_str("\"id\":\"resp_<n>");
-        let after = &rest[start + ID_PREFIX.len()..];
-        match after.find('"') {
-            Some(end) => rest = &after[end..],
-            None => {
-                out.push_str(after);
-                rest = "";
-                break;
-            }
-        }
-    }
-    out.push_str(rest);
-
-    // Pass 2: `"created_at":<digits>` → `"created_at":<n>`.
-    const CREATED_PREFIX: &str = "\"created_at\":";
-    let mut out2 = String::with_capacity(out.len());
-    let mut rest = out.as_str();
-    while let Some(start) = rest.find(CREATED_PREFIX) {
-        out2.push_str(&rest[..start]);
-        out2.push_str("\"created_at\":<n>");
-        let after = &rest[start + CREATED_PREFIX.len()..];
-        let end = after
-            .bytes()
-            .position(|b| !b.is_ascii_digit())
-            .unwrap_or(after.len());
-        rest = &after[end..];
-    }
-    out2.push_str(rest);
-    out2
+    normalize_sse_volatile(
+        input,
+        "\"id\":\"resp_",
+        "\"id\":\"resp_<n>",
+        "\"created_at\":",
+    )
 }
 
 // ─── 跨协议流式翻译 property (STR-1 × FWD-3, RED-7 交集) ────────────────
