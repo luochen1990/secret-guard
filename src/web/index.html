@@ -4950,7 +4950,7 @@
     // 流式 = 实际行为: codec 覆盖族 (openai/anthropic/openairesponses) 任意 pair
     // 流式均翻译 (含 Responses 任一侧, M2 走查口径随 Responses 流式落地更新).
     const EGRESS_CROSS_PROTO_TIP =
-      'If the ingress protocol ≠ this egress: cross-protocol translation kicks in — reasoning_content is dropped (streaming included)';
+      'If the ingress protocol ≠ this egress: cross-protocol translation kicks in — reasoning_content is dropped, except Responses egress streaming keeps it (as reasoning summary events)';
 
     // 启用 (priority 非 null) 路由中 priority 最大者; 并列按列表序先者 — 与后端
     // `RouterProvider::select_route` 的确定性 tie-break 一致. 空/全禁用 → null.
@@ -5509,7 +5509,7 @@
     function endpointRow(proto, short, mode, url, providerId) {
       const label = escapeHtml(proto);
       const translateTip =
-        'Cross-protocol translation (streaming included) — reasoning_content is dropped';
+        'Cross-protocol translation (streaming included) — reasoning_content is dropped, except Responses egress streaming keeps it (as reasoning summary events)';
       const badge = {
         direct:      '<span class="badge badge-stream">direct</span>',
         translate:   `<span class="badge badge-warn" title="${translateTip}">translate</span>`,
