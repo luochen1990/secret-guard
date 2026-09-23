@@ -67,12 +67,13 @@
 //! # 扫描覆盖范围
 //!
 //! [`redact_ir`] 扫描以下字段:
-//! - `IrRequest::system` (system prompt blocks)
-//! - `IrRequest::messages[].content[]` (所有 block 递归, 含 ToolUse input JSON 字符串叶子)
-//! - `IrRequest::tools[].{name, description, input_schema}` (工具元数据)
+//! - `IrRequest::system` (system prompt blocks, 含 block 级 extra)
+//! - `IrRequest::messages[].content[]` (所有 block 递归, 含 ToolUse input JSON 字符串叶子
+//!   与 block 级 extra) 及 `IrRequest::messages[].extra` (消息级 extra, #269)
+//! - `IrRequest::tools[].{name, description, input_schema}` (工具元数据) 及工具级 extra (#269)
 //! - `IrRequest::stop` (stop sequences)
 //! - `IrRequest::user` (user id)
-//! - `IrRequest.extra` (未建模字段, JSON 字符串叶子)
+//! - `IrRequest.extra` (顶层未建模字段, JSON 字符串叶子)
 //!
 //! **不扫描**: `IrRequest::model` (模型名不应该是 secret), `IrRequest.tools[].input_schema` 的非字符串叶子
 //! (eg JSON Schema 的 type / properties 结构).
@@ -1224,6 +1225,12 @@ fn count_hit_locations(ir: &IrRequest, needle: &str) -> crate::codec::ir::HitLoc
     };
     for msg in &ir.messages {
         let n: u64 = msg.content.iter().map(|b| leaf_hits(b, needle)).sum();
+        // 消息级 extra (#269) 命中与该消息内容同桶归因.
+        let n: u64 = n + msg
+            .extra
+            .values()
+            .map(|v| leaf_hits(v, needle))
+            .sum::<u64>();
         if n > 0 {
             if msg.role == IrRole::System {
                 // messages[] 内 role=system 条目 (Anthropic 中途 system 消息) 归 system 桶
@@ -1475,17 +1482,44 @@ mod tests {
     #[test]
     fn collect_leaves_matches_for_each_str_leaf() {
         use crate::codec::ir::{IrImageSource, IrTool};
+        // 新增层级 extra (#269) 填充非空样本: 双轨守卫必须真正覆盖 block/message/tool
+        // 级 extra 的字符串叶子 — fixture 恒空的话, 任一侧遍历遗漏新层级时测试仍绿
+        // (守卫恰好在其新增的最需要守护的叶子上失效).
+        let block_extra = {
+            let mut m = serde_json::Map::new();
+            m.insert(
+                "cache_control".to_string(),
+                serde_json::json!({"type": "ephemeral", "note": "block-extra-leaf"}),
+            );
+            m
+        };
+        let msg_extra = {
+            let mut m = serde_json::Map::new();
+            m.insert(
+                "output_config".to_string(),
+                serde_json::json!({"effort": "msg-extra-leaf"}),
+            );
+            m
+        };
+        let tool_extra = {
+            let mut m = serde_json::Map::new();
+            m.insert(
+                "cache_control".to_string(),
+                serde_json::json!({"type": "ephemeral", "note": "tool-extra-leaf"}),
+            );
+            m
+        };
         let ir = IrRequest {
             system: vec![IrBlock::Text {
                 text: "system-prompt".to_string(),
-                extra: Default::default(),
+                extra: block_extra.clone(),
             }],
             messages: vec![IrMessage {
                 role: IrRole::User,
                 content: vec![
                     IrBlock::Text {
                         text: "msg-text".to_string(),
-                        extra: Default::default(),
+                        extra: block_extra.clone(),
                     },
                     IrBlock::ToolUse {
                         id: "tu-id".to_string(),
@@ -1497,11 +1531,11 @@ mod tests {
                         tool_use_id: "tr-id".to_string(),
                         content: vec![IrBlock::Text {
                             text: "tr-content".to_string(),
-                            extra: Default::default(),
+                            extra: block_extra.clone(),
                         }],
                         is_error: None,
                         content_form: None,
-                        extra: Default::default(),
+                        extra: block_extra.clone(),
                     },
                     IrBlock::Image {
                         source: IrImageSource::Url("img-url".to_string()),
@@ -1514,13 +1548,14 @@ mod tests {
                         text: "reasoning-content".to_string(),
                     },
                 ],
+                extra: msg_extra,
                 ..Default::default()
             }],
             tools: vec![IrTool {
                 name: "tool-name".to_string(),
                 description: Some("tool-desc".to_string()),
                 input_schema: serde_json::json!({"type": "object", "title": "schema-title"}),
-                extra: Default::default(),
+                extra: tool_extra,
             }],
             stop: vec!["stop1".to_string()],
             user: Some("user-id".to_string()),
@@ -2528,14 +2563,14 @@ mod tests {
             let mut ir = IrRequest {
                 system: vec![IrBlock::Text {
                     text: format!("sys-pre {secret} {body_suffix}"),
-                extra: Default::default(),
+                    extra: Default::default(),
                 }],
                 messages: vec![
                     IrMessage {
                         role: IrRole::User,
                         content: vec![IrBlock::Text {
                             text: format!("{body_prefix} {secret} {body_suffix}"),
-                extra: Default::default(),
+                            extra: Default::default(),
                         }],
                         ..Default::default()
                     },
@@ -2615,6 +2650,46 @@ mod tests {
                 "mock must appear in redacted IR (extra string leaves rewritten)"
             );
             // restore: 与生产 restore_ir_response 相同的叶子遍历 + 替换.
+            ir.for_each_str_leaf_mut(&mut |s| restore_str(s, &map));
+            prop_assert_eq!(ir, original);
+        }
+
+        /// (#269 评审补充) secret 藏在 message/block/tool 级 extra 的 redact→restore
+        /// round-trip: 三级 extra 的字符串叶子必须被扫描与还原 — 任一级遗漏即泄漏.
+        #[test]
+        fn prop_round_trip_identity_nested_extras(
+            secret in "[A-Z]{4,12}"
+        ) {
+            let block_extra = serde_json::json!({
+                "cache_control": {"type": "ephemeral", "note": format!("blk {secret}")},
+            });
+            let msg_extra = serde_json::json!({
+                "output_config": {"effort": format!("xhigh {secret}")},
+            });
+            let tool_extra = serde_json::json!({
+                "cache_control": {"type": "ephemeral", "note": format!("tool {secret}")},
+            });
+            let mut ir = sample_ir_with_text("unrelated message body");
+            ir.messages[0].extra = msg_extra.as_object().unwrap().clone();
+            ir.messages[0].content[0] = IrBlock::Text {
+                text: "payload".to_string(),
+                extra: block_extra.as_object().unwrap().clone(),
+            };
+            ir.tools.push(IrTool {
+                name: "tool-x".to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                extra: tool_extra.as_object().unwrap().clone(),
+            });
+            let original = ir.clone();
+            let (map, _) = redact_ir(&mut ir, &[entry(&secret)]);
+            let mock = map
+                .mock_for(&secret)
+                .expect("secret in nested extras must be redacted");
+            prop_assert!(
+                ir_request_contains(&ir, mock),
+                "mock must appear in redacted IR (block/message/tool extra leaves rewritten)"
+            );
             ir.for_each_str_leaf_mut(&mut |s| restore_str(s, &map));
             prop_assert_eq!(ir, original);
         }
@@ -2846,7 +2921,7 @@ mod tests {
                 role: IrRole::Assistant,
                 content: vec![IrBlock::Text {
                     text: format!("ok {r2_reply}"),
-                extra: Default::default(),
+                    extra: Default::default(),
                 }],
                 ..Default::default()
             });
@@ -2854,7 +2929,7 @@ mod tests {
                 role: IrRole::User,
                 content: vec![IrBlock::Text {
                     text: format!("again {secret} please"),
-                extra: Default::default(),
+                    extra: Default::default(),
                 }],
                 ..Default::default()
             });
@@ -2912,7 +2987,7 @@ mod tests {
                 role: IrRole::Assistant,
                 content: vec![IrBlock::Text {
                     text: format!("ok {r2_reply}"),
-                extra: Default::default(),
+                    extra: Default::default(),
                 }],
                 ..Default::default()
             });
@@ -2920,7 +2995,7 @@ mod tests {
                 role: IrRole::User,
                 content: vec![IrBlock::Text {
                     text: format!("use {s1} and {s2} again"),
-                extra: Default::default(),
+                    extra: Default::default(),
                 }],
                 ..Default::default()
             });

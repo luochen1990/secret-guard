@@ -22,7 +22,7 @@ use super::ir::ContentForm;
 use super::{
     DEFAULT_MAX_TOKENS, IrBlock, IrBlockMeta, IrDelta, IrError, IrImageSource, IrMessage,
     IrRequest, IrResponse, IrRole, IrStopReason, IrStreamEvent, IrTool, IrToolChoice, IrUsage,
-    Reader, Writer, collect_extra,
+    Reader, Writer, blocks_to_text, collect_extra,
     ir::{StreamDecodeState, StreamEncodeState},
     random_base62,
 };
@@ -327,7 +327,7 @@ impl Writer for AnthropicWriter {
 
         // system 字段 (顶层 string 或 array of blocks). 形态保真 (#269):
         // Some(String) → string; Some(Array) → 恒 array (含单 block — 不折叠);
-        // None (跨协议 / 内部构造) → 既有启发式 (单 Text → string).
+        // None (跨协议 / 内部构造) → 既有启发式 (全裸 Text 折叠, 混合形态 array).
         if !req.system.is_empty() || req.system_form.is_some() {
             let blocks: Vec<Value> = req
                 .system
@@ -344,25 +344,14 @@ impl Writer for AnthropicWriter {
             let emit_string = match req.system_form {
                 Some(super::ir::SystemForm::String) => true,
                 Some(super::ir::SystemForm::Array) => false,
-                None => {
-                    blocks.len() == 1
-                        && blocks
-                            .first()
-                            .is_some_and(|v| v.as_object().is_some_and(|m| m.len() == 2))
-                }
+                // None 启发式: 全部为裸 Text 时折叠 join (与 blocks_to_text 惯例一致);
+                // 混合形态走 array 零丢失 (非 Text / 带 extra 块不被静默丢弃, #269 评审 L1).
+                None => !blocks.is_empty() && blocks.iter().all(is_bare_text_block),
             };
             if emit_string {
                 // string 形态: reader 对 string ingress 恒产单 Text block; 多 Text
                 // (不可能形态) 时按 blocks_to_text 惯例用 \n join 兜底.
-                let text = req
-                    .system
-                    .iter()
-                    .filter_map(|b| match b {
-                        IrBlock::Text { text, .. } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let text = blocks_to_text(&req.system);
                 out.insert("system".to_string(), Value::String(text));
             } else if !blocks.is_empty() || req.system_form == Some(super::ir::SystemForm::Array) {
                 // array 形态恒写回 (含空数组与单 block — 形态保真优先于折叠启发式);
@@ -896,9 +885,7 @@ fn write_message(msg: &IrMessage) -> Value {
     obj.insert("role".to_string(), Value::String(role_str.to_string()));
     obj.insert("content".to_string(), content_value);
     // L4 保真 (#269): 消息级未建模字段原样回写 (跨协议路径已被 clear_wire_fidelity 清空).
-    for (k, v) in &msg.extra {
-        obj.insert(k.clone(), v.clone());
-    }
+    merge_extra_into(&mut obj, &msg.extra);
     Value::Object(obj)
 }
 
@@ -912,10 +899,7 @@ fn serialize_content_with_form(blocks: Vec<Value>, form: Option<ContentForm>) ->
     match form {
         Some(ContentForm::String) => match blocks.as_slice() {
             [] => Value::String(String::new()),
-            [single]
-                if single.get("text").is_some()
-                    && single.as_object().is_some_and(|m| m.len() == 2) =>
-            {
+            [single] if is_bare_text_block(single) => {
                 Value::String(single["text"].as_str().unwrap_or("").to_string())
             }
             _ => Value::Array(blocks),
@@ -979,9 +963,7 @@ fn write_block(b: &IrBlock) -> Option<Value> {
             if let Some(e) = is_error {
                 obj.insert("is_error".to_string(), json!(e));
             }
-            for (k, v) in extra {
-                obj.insert(k.clone(), v.clone());
-            }
+            merge_extra_into(&mut obj, extra);
             Some(Value::Object(obj))
         }
         IrBlock::Image { source, extra } => {
@@ -1016,10 +998,25 @@ fn write_block(b: &IrBlock) -> Option<Value> {
 /// 把 block 级 `extra` 合并回已构造的 wire block object (#269, L5 回写).
 fn merge_block_extra(obj: &mut Value, extra: &serde_json::Map<String, Value>) {
     if let Some(map) = obj.as_object_mut() {
-        for (k, v) in extra {
-            map.insert(k.clone(), v.clone());
-        }
+        merge_extra_into(map, extra);
     }
+}
+
+/// 把 `extra` 的键值合并进目标 Map (同名覆盖 — 回写优先级契约的唯一定义点;
+/// L4/L5/工具级 extra 的回写共用, 跨协议路径已被 `clear_wire_fidelity` 清空).
+fn merge_extra_into(target: &mut Map<String, Value>, extra: &Map<String, Value>) {
+    for (k, v) in extra {
+        target.insert(k.clone(), v.clone());
+    }
+}
+
+/// 序列化后的 wire block 是否为"裸 Text block" (恰好只含 type + text 两键).
+///
+/// 编码 L5 折叠契约 (#269): 携带任何 block 级 extra 字段的 Text 不得折叠为裸
+/// string (否则丢 cache_control) — system 折叠启发式与 message content 折叠
+/// (`serialize_content_with_form`) 共用此谓词, 保证两处折叠行为一致.
+fn is_bare_text_block(v: &Value) -> bool {
+    v.get("text").is_some() && v.as_object().is_some_and(|m| m.len() == 2)
 }
 
 /// 写 tool 定义 (Anthropic 顶层 name/description/input_schema + 工具级 extra 回写).
@@ -1030,9 +1027,7 @@ fn write_tool_def(tool: &IrTool) -> Value {
         obj.insert("description".to_string(), Value::String(desc.clone()));
     }
     obj.insert("input_schema".to_string(), tool.input_schema.clone());
-    for (k, v) in &tool.extra {
-        obj.insert(k.clone(), v.clone());
-    }
+    merge_extra_into(&mut obj, &tool.extra);
     Value::Object(obj)
 }
 

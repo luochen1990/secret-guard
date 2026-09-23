@@ -51,6 +51,15 @@ use crate::codec::{Reader, Writer};
 
 // ─── 公共 proptest 入口 ─────────────────────────────────────────────────────
 
+/// 递归判断 JSON 树的任何深度是否存在某 key (FWD-3 深度清空守卫用).
+fn json_has_key(v: &Value, key: &str) -> bool {
+    match v {
+        Value::Object(m) => m.contains_key(key) || m.values().any(|x| json_has_key(x, key)),
+        Value::Array(a) => a.iter().any(|x| json_has_key(x, key)),
+        _ => false,
+    }
+}
+
 proptest! {
     /// FWD-3 `prop_cross_proto_extra_cleared`: 跨协议路径下, ingress IR 的 extra 字段
     /// 必须清空, 不允许源协议独有字段泄漏到 egress.
@@ -215,6 +224,51 @@ proptest! {
 
         assert_modeled_fields_equivalent(&ir_in, &ir_out, "Anthropic → OpenAI");
     }
+}
+
+/// (#269 评审补充) block/message/tool 级 extra 的跨协议深度清空守卫: Anthropic
+/// ingress 的 system block / 消息 block / 工具定义上的 `cache_control` (M1 wire
+/// fidelity 保真的字段) 在跨协议 egress 中**任何深度**都不得出现 — 既有 FWD-3
+/// 守卫只查 egress 顶层 key, 清空 SSOT 若漏清某一层级 (如 `ir.system`) 则不设防.
+#[test]
+fn prop_cross_proto_block_level_extra_cleared_recursively_anthropic_to_openai() {
+    let wire = json!({
+        "model": "claude",
+        "max_tokens": 10,
+        "system": [{"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}],
+        "tools": [
+            {"name": "t", "description": "d", "input_schema": {"type": "object"},
+             "cache_control": {"type": "ephemeral"}},
+        ],
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}},
+            ]},
+        ],
+    });
+    let mut ir = AnthropicReader
+        .read_request(&wire)
+        .expect("合法 Anthropic wire");
+    // 预断言 (reader 侧): M1 保真确实收集了各级 extra — 否则本测试空转.
+    assert!(
+        !ir.system[0].block_extra().unwrap().is_empty(),
+        "system block extra 已收集"
+    );
+    assert!(
+        !ir.messages[0].content[0].block_extra().unwrap().is_empty(),
+        "消息 block extra 已收集"
+    );
+    assert!(!ir.tools[0].extra.is_empty(), "工具级 extra 已收集");
+    // 与生产 cross_proto_forward 一致: 清空 extra + wire_fidelity.
+    ir.extra.clear();
+    ir.clear_wire_fidelity();
+    let egress = OpenAiWriter.write_request(&ir);
+    // 递归全深度断言 (非仅顶层): 任何深度出现 cache_control 即泄漏.
+    assert!(
+        !json_has_key(&egress, "cache_control"),
+        "FWD-3 违反: block/tool 级 cache_control 跨协议泄漏到 OpenAI egress. egress = {}",
+        normalize_json(&egress),
+    );
 }
 
 /// FWD-3 `prop_documented_semantic_loss_list` (人工审查项, 非随机 property):

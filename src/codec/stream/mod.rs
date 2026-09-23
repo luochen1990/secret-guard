@@ -1281,7 +1281,7 @@ mod tests {
                         id: tc_id,
                         name: tool_name,
                         input: tool_input,
-                extra: Default::default(),
+                        extra: Default::default(),
                     });
                     let expected = crate::codec::IrResponse {
                         content: expected_blocks,

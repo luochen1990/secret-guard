@@ -77,6 +77,9 @@ impl IrRequest {
         self.stop_form = None;
         self.tools_present = false;
         self.system_form = None;
+        // 顶层 system blocks 的 extra 同样清空 (#269 评审补充): Anthropic 顶层
+        // system 数组的 block 可携带 cache_control, 跨协议时不得泄漏进 egress wire.
+        clear_block_extras(&mut self.system);
         for m in &mut self.messages {
             m.content_form = None;
             m.reasoning_content_form = None;
@@ -119,6 +122,10 @@ pub struct IrMessage {
     /// `output_config` / provider 扩展). 同协议 round-trip 时原样回写
     /// (#269, L4); 跨协议翻译前由 `clear_wire_fidelity` 清空 (防泄漏, 与
     /// 顶层 `extra` 契约同型). 空 Map = 无.
+    ///
+    /// 注意: 此字段在 `MessageRef`/`resolve_message` 中**不保留** (MessageRef 只存
+    /// role + block hash, 同 `contains_user_text` 的既有限制) — 影响面仅 WebUI
+    /// timeline 重建 (非 egress 路径), egress wire 序列化走原始 `ir.messages`.
     pub extra: serde_json::Map<String, Value>,
     /// wire 形态元数据: 原始 wire 中 `content` 是 string 还是 array 还是 null.
     /// - `None`: 跨协议路径 / 内部构造 (writer 用协议默认形态)
@@ -320,6 +327,20 @@ pub enum IrRole {
 }
 
 /// 消息内容块 (chat completion 中所有协议都支持 block-based content).
+impl IrBlock {
+    /// 该 block 的 wire 级 `extra` (L5, #269) — 仅四个有 wire 来源的 variant 携带,
+    /// 跨协议合成产物 (Reasoning / ReasoningContent) 返回 None.
+    pub fn block_extra(&self) -> Option<&serde_json::Map<String, Value>> {
+        match self {
+            IrBlock::Text { extra, .. }
+            | IrBlock::ToolUse { extra, .. }
+            | IrBlock::ToolResult { extra, .. }
+            | IrBlock::Image { extra, .. } => Some(extra),
+            IrBlock::Reasoning { .. } | IrBlock::ReasoningContent { .. } => None,
+        }
+    }
+}
+
 ///
 /// # block 级 `extra` (#269, L5)
 ///
