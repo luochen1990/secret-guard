@@ -28,6 +28,11 @@ pub struct IrRequest {
     /// 同协议 round-trip 时填充, 跨协议翻译前清空.
     /// 区分 "tools: []" (显式空) 与缺失 tools 字段.
     pub tools_present: bool,
+    /// wire 形态元数据: Anthropic 顶层 `system` 字段原始形态 (string / array).
+    /// 区分 `"system": "x"` 与 `"system": [{"type":"text","text":"x"}]` — 单 Text block
+    /// 的 array 形态若被折叠启发式改写成 string, 破坏 FWD-1 字面等式 (#269).
+    /// 仅 Anthropic codec 填充; 跨协议翻译前清空.
+    pub system_form: Option<SystemForm>,
     /// 最大输出 token 数. OpenAI 可选, Anthropic 必填.
     pub max_tokens: Option<u32>,
     /// 采样温度. JSON 数字是 f64, 用 f64 避免 0.7→0.699999988 的精度损失.
@@ -71,6 +76,7 @@ impl IrRequest {
     pub fn clear_wire_fidelity(&mut self) {
         self.stop_form = None;
         self.tools_present = false;
+        self.system_form = None;
         for m in &mut self.messages {
             m.content_form = None;
             m.reasoning_content_form = None;
@@ -239,6 +245,31 @@ pub enum StopForm {
 
 impl StopForm {
     /// 从 wire `stop` 字段值推断形态. 缺失 / 非预期类型 → None.
+    pub fn classify(value: Option<&Value>) -> Option<Self> {
+        match value {
+            Some(Value::String(_)) => Some(Self::String),
+            Some(Value::Array(_)) => Some(Self::Array),
+            _ => None,
+        }
+    }
+}
+
+/// wire 中 Anthropic 顶层 `system` 字段的原始形态 (L1 同型保真, #269).
+///
+/// 背景: writer 曾对单 Text block 一律折叠为 string 形态 — ingress 为 array 形态
+/// (claude code 实测, block 可携带 `cache_control`) 时写回会改变形态, 破坏 FWD-1
+/// 字面等式. 与 [`StopForm`] / [`ContentForm`] 同型: 同协议 round-trip 填充,
+/// 跨协议翻译前清空.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemForm {
+    /// 单字符串: `"system": "abc"`
+    String,
+    /// 数组: `"system": [{"type":"text",...}]` (含单 block — 形态保真优先于折叠启发式)
+    Array,
+}
+
+impl SystemForm {
+    /// 从 wire `system` 字段值推断形态. 缺失 / 非预期类型 → None.
     pub fn classify(value: Option<&Value>) -> Option<Self> {
         match value {
             Some(Value::String(_)) => Some(Self::String),

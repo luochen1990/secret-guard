@@ -200,6 +200,8 @@ impl Reader for OpenAiReader {
 
         Ok(IrRequest {
             system,
+            // system_form 是 Anthropic wire 形态元数据, OpenAI 无此字段 (writer 不消费).
+            system_form: None,
             messages: ir_messages,
             tools,
             tools_present,

@@ -9181,7 +9181,7 @@ async fn model_rewrite_no_secret_forces_ir_path() {
 /// → 上游收不到 system 内容 + req_delta.len(2) > 写回 body messages.len(1) →
 /// timeline 气泡退化为 48 字符 preview 截断文本.
 #[tokio::test]
-async fn anthropic_messages_system_role_survives_rewrite_path() {
+async fn anthropic_messages_system_role_position_fidelity() {
     let mut upstream = spawn_mock_upstream().await;
     let _m = upstream
         .mock("POST", "/v1/messages")
@@ -9224,8 +9224,8 @@ async fn anthropic_messages_system_role_survives_rewrite_path() {
         .copied()
         .unwrap();
 
-    // 1. 转发内容不丢: 发给上游的 body (== req_body_raw, same_proto IR 路径同源)
-    //    顶层 system 为 2-block array (原顶层 1 段 + 提升 1 段), 内容与顺序保真.
+    // 1. 转发内容不丢 + 位置保真 (2026-09-23 修正, #269): 顶层 system 保持 1 block;
+    //    messages[0] 的 role=system 条目原位保留 (不再提升合并).
     let detail = dag_probe.get_node_detail(id).unwrap();
     let sent: serde_json::Value = serde_json::from_str(&detail.req_body_raw).unwrap();
     let sys_texts: Vec<&str> = sent["system"]
@@ -9234,10 +9234,14 @@ async fn anthropic_messages_system_role_survives_rewrite_path() {
         .iter()
         .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
         .collect();
+    assert_eq!(sys_texts, vec!["agent intro"], "顶层 system 不混入提升内容");
+    let stored_msgs = sent.get("messages").unwrap().as_array().unwrap();
+    assert_eq!(stored_msgs.len(), 2, "messages 全量保真 (system 条目不删减)");
+    assert_eq!(stored_msgs[0]["role"], "system");
     assert_eq!(
-        sys_texts,
-        vec!["agent intro", "x-billing-header: probe"],
-        "system 内容须完整转发 (顶层 + messages 提升)"
+        stored_msgs[0]["content"],
+        serde_json::json!("x-billing-header: probe"),
+        "billing header 原位保留在 messages[0]"
     );
 
     // 2. timeline 气泡完整: req_delta_messages 与写回 body messages 等长且非空.
@@ -9246,15 +9250,14 @@ async fn anthropic_messages_system_role_survives_rewrite_path() {
     let page = dag_probe.timeline_view(sid, None, 10).unwrap();
     let round = &page.rounds[0];
     assert_eq!(round.round_kind, secret_guard::dag::RoundKind::Normal);
-    let stored_msgs = sent.get("messages").unwrap().as_array().unwrap();
     assert_eq!(
         round.req_delta_messages.len(),
         stored_msgs.len(),
-        "req_delta_messages 与写回 body messages 数一致 (修复前: 前者被清空)"
+        "req_delta_messages 与写回 body messages 数一致"
     );
     assert!(!round.req_delta_messages.is_empty());
-    assert_eq!(round.req_delta_messages[0]["role"], "user");
-    let content = round.req_delta_messages[0]["content"].as_array().unwrap();
+    assert_eq!(round.req_delta_messages[0]["role"], "system");
+    let content = round.req_delta_messages[1]["content"].as_array().unwrap();
     assert_eq!(content.len(), 2, "user 气泡含双 text block");
 }
 

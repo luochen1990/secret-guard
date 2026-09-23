@@ -179,6 +179,8 @@ impl Reader for ResponsesReader {
 
         Ok(IrRequest {
             system,
+            // system_form 是 Anthropic wire 形态元数据, Responses 无此字段 (writer 不消费).
+            system_form: None,
             messages: ir_messages,
             tools,
             tools_present,
@@ -820,8 +822,26 @@ fn read_reasoning_block(obj: &Map<String, Value>) -> Option<IrBlock> {
 fn write_input_items(msg: &IrMessage) -> Vec<Value> {
     match msg.role {
         IrRole::System => {
-            // system 已在 instructions 输出, 这里跳过 (避免重复).
-            Vec::new()
+            // system 消息按原位输出为 role=system 的 message item (2026-09-23 修正,
+            // 与 Anthropic reader 的位置保真对称 — 旧实现跳过, 会静默丢 Anthropic
+            // ingress 的中途 system 消息, issue #269)。Text 块 → input_text parts;
+            // 其他块类型在 system 消息中不出现, 跳过 (与 user 臂同型)。
+            let mut items = Vec::new();
+            let mut content_parts: Vec<Value> = Vec::new();
+            for b in &msg.content {
+                if let IrBlock::Text { text } = b
+                    && !text.is_empty()
+                {
+                    content_parts.push(json!({"type": "input_text", "text": text}));
+                }
+            }
+            // 显式空 system 消息也输出空 content item — 保位比省字节优先.
+            items.push(json!({
+                "type": "message",
+                "role": "system",
+                "content": content_parts,
+            }));
+            items
         }
         IrRole::User => {
             // user 消息可能含 Text / Image / ToolResult 块.

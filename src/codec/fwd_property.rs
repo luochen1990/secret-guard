@@ -418,12 +418,10 @@ fn arb_anthropic_request_value() -> impl Strategy<Value = Value> {
 }
 
 fn arb_anthropic_message() -> impl Strategy<Value = Value> {
-    // NOTE: 不生成 role=system 的 message (Anthropic 非标准形态 — 官方 schema system
-    // 只在顶层)。该形态 2026-09-23 起被 reader 提升合并到顶层 system (normalize 不等
-    // 的声明例外, 见 codec/AGENTS.md "已知边界"), 进 FWD-1/FWD-2 byte-exact property
-    // 会红; 行为由 example 测试锁定 (anthropic.rs
-    // `read_request_promotes_system_role_message_to_top_level` +
-    // `system_role_message_survives_round_trip_into_top_level`)。
+    // role=system 条目 (Anthropic 中途 system 消息, claude code 实测发送) 参与生成:
+    // 2026-09-23 修正 (#269) 后 reader/writer 按原位保留, round-trip normalize 相等,
+    // 因此可以被 FWD-1/FWD-2 property 机械锁定 (旧实现提升合并到顶层 system, 生成器
+    // 曾被迫排除该形态)。
     prop_oneof![
         // user 消息 (content: string / 空字符串 / null / array)
         prop_oneof![
@@ -443,6 +441,10 @@ fn arb_anthropic_message() -> impl Strategy<Value = Value> {
             }
             json!({"role":"assistant","content":blocks})
         }),
+        // 中途 system 消息 (string 或 array content 两种形态; 位置保真锁定)
+        "[a-z ]{1,25}".prop_map(|s| json!({"role":"system","content":s})),
+        prop::collection::vec(arb_anthropic_block(), 1..2)
+            .prop_map(|blocks| json!({"role":"system","content":blocks})),
     ]
 }
 

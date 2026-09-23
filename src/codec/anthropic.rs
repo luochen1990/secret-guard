@@ -8,7 +8,9 @@
 //!
 //! # 字段映射要点
 //!
-//! - `system` 是**顶层字段** (string 或 array of blocks), 不在 `messages[]` 中.
+//! - `system` 主指令是**顶层字段** (string 或 array of blocks); `messages[]` 内也可出现
+//!   `role=system` 条目 (2026 起官方支持的中途指令形态, claude code 实测发送) — 按原位
+//!   保留与写回, 不做提升/合并 (issue #269 修正).
 //! - `content` 永远是 array of blocks: text / thinking / tool_use / tool_result / image.
 //! - `max_tokens` **必填** (writer 侧若缺失需注入 [`super::DEFAULT_MAX_TOKENS`]).
 //! - `temperature` 必须 clamp 到 [0, 1] (writer 侧若超出, log warn 并 clamp).
@@ -45,27 +47,23 @@ impl Reader for AnthropicReader {
             .unwrap_or("")
             .to_string();
 
-        // system 顶层 (string 或 array of blocks).
-        let mut system = read_system_field(obj.get("system"));
+        // system 顶层 (string 或 array of blocks). 形态元数据供 writer 按原形态
+        // 写回 (#269: 单 block array 不折叠为 string).
+        let system = read_system_field(obj.get("system"));
+        let system_form = super::ir::SystemForm::classify(obj.get("system"));
 
         let raw_messages = obj
             .get("messages")
             .and_then(Value::as_array)
             .ok_or_else(|| IrError::new("Anthropic request must have 'messages' array"))?;
 
-        // messages[] 内 role=system (非标准形态, claude code 实测发送) 提升合并进顶层
-        // system — writer 写回时假设 system 都在顶层而 filter 掉 System message, 不提升
-        // 会静默丢内容 (转发 body 丢 system + timeline delta 计数错位)。边界与代价详见
-        // src/codec/AGENTS.md "已知边界" 段。
-        let mut messages: Vec<IrMessage> = Vec::with_capacity(raw_messages.len());
-        for msg in raw_messages {
-            let Some(m) = read_message(msg) else { continue };
-            if m.role == IrRole::System {
-                system.extend(m.content);
-            } else {
-                messages.push(m);
-            }
-        }
+        // messages[] 内 role=system 条目**按原位保留** (2026-09-23 修正, 取代早前的
+        // "提升合并到顶层 system" 决策 — 该形态已被 Anthropic 官方正式支持, 且是官方
+        // 推荐的缓存友好指令注入方式; 提升会改变语义生效位置并破坏缓存前缀, 见
+        // contracts.md FWD-1 注记与 issue #269)。writer 同样按原位写回 role=system。
+        // 边界: 不支持该形态的上游/模型 (如 Claude Sonnet 5) 会 400 — 形态是客户端
+        // 自选的, 网关不代为改写 (字节透明原则); passthrough 路径行为不变。
+        let messages: Vec<IrMessage> = raw_messages.iter().filter_map(read_message).collect();
 
         let tools = obj
             .get("tools")
@@ -119,6 +117,7 @@ impl Reader for AnthropicReader {
 
         Ok(IrRequest {
             system,
+            system_form,
             messages,
             tools,
             max_tokens,
@@ -326,8 +325,10 @@ impl Writer for AnthropicWriter {
         let mut out = Map::new();
         out.insert("model".to_string(), Value::String(req.model.clone()));
 
-        // system 字段 (顶层 string 或 array of blocks).
-        if !req.system.is_empty() {
+        // system 字段 (顶层 string 或 array of blocks). 形态保真 (#269):
+        // Some(String) → string; Some(Array) → 恒 array (含单 block — 不折叠);
+        // None (跨协议 / 内部构造) → 既有启发式 (单 Text → string).
+        if !req.system.is_empty() || req.system_form.is_some() {
             let blocks: Vec<Value> = req
                 .system
                 .iter()
@@ -336,23 +337,34 @@ impl Writer for AnthropicWriter {
                     _ => None, // 跨协议来源: 非文本 system block 静默 drop
                 })
                 .collect();
-            // 单一 text block 用 string 形式 (更原生).
-            if blocks.len() == 1 {
-                if let Some(text) = blocks[0].get("text").cloned() {
-                    out.insert("system".to_string(), text);
-                }
-            } else if !blocks.is_empty() {
+            let emit_string = match req.system_form {
+                Some(super::ir::SystemForm::String) => true,
+                Some(super::ir::SystemForm::Array) => false,
+                None => blocks.len() == 1,
+            };
+            if emit_string {
+                // string 形态: reader 对 string ingress 恒产单 Text block; 多 Text
+                // (不可能形态) 时按 blocks_to_text 惯例用 \n join 兜底.
+                let text = req
+                    .system
+                    .iter()
+                    .filter_map(|b| match b {
+                        IrBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                out.insert("system".to_string(), Value::String(text));
+            } else if !blocks.is_empty() || req.system_form == Some(super::ir::SystemForm::Array) {
+                // array 形态恒写回 (含空数组与单 block — 形态保真优先于折叠启发式);
+                // None + 空 blocks (跨协议无 system) 不写字段.
                 out.insert("system".to_string(), Value::Array(blocks));
             }
         }
 
-        // messages: 过滤掉 system 角色 (已在顶层 system 中), 转换其他角色.
-        let messages: Vec<Value> = req
-            .messages
-            .iter()
-            .filter(|m| m.role != IrRole::System)
-            .map(write_message)
-            .collect();
+        // messages: 全量写回, role=system 条目按原位输出 (2026-09-23 修正, 与 reader
+        // 的位置保真对称 — 见 read_request 注记; 不再 filter 提升到顶层 system)。
+        let messages: Vec<Value> = req.messages.iter().map(write_message).collect();
         out.insert("messages".to_string(), Value::Array(messages));
 
         // max_tokens: Anthropic 必填, 缺失时注入默认值.
@@ -835,7 +847,7 @@ fn read_usage(usage: &Value) -> IrUsage {
 /// IR message → Anthropic wire message.
 fn write_message(msg: &IrMessage) -> Value {
     let role_str = match msg.role {
-        IrRole::System => "user", // 防御性: 理论上 system 已在顶层, 不应走到这里
+        IrRole::System => "system", // messages[] 内 role=system 按原位写回 (2026-09-23 修正)
         IrRole::Assistant => "assistant",
         IrRole::User => "user",
         IrRole::Tool => "user", // tool 消息在 Anthropic 中也是 user
@@ -1173,9 +1185,11 @@ mod tests {
     /// req_delta.len 与写回 body messages.len 不匹配, timeline 气泡退化为
     /// preview 截断文本 (2026-09-23 claude code `-p` 排查).
     #[test]
-    fn read_request_promotes_system_role_message_to_top_level() {
+    fn read_request_keeps_system_role_message_in_place() {
         // claude code 实测形态: 顶层 system (array) + messages[0]=system (billing
         // header, string content) + messages[1]=user (array content).
+        // 2026-09-23 修正 (#269): role=system 条目按原位保留, 不再提升合并到顶层
+        // system (该形态官方已支持; 提升会改变语义生效位置并破坏缓存前缀).
         let body = json!({
             "model": "claude",
             "system": [{"type": "text", "text": "agent intro"}],
@@ -1189,46 +1203,51 @@ mod tests {
             "max_tokens": 10
         });
         let ir = reader().read_request(&body).unwrap();
-        // system 条目提升: 顶层 block + 提升 block, 按出现顺序.
-        assert_eq!(ir.system.len(), 2, "顶层 + messages 内 system 合并");
-        match (&ir.system[0], &ir.system[1]) {
-            (IrBlock::Text { text: a }, IrBlock::Text { text: b }) => {
-                assert_eq!(a, "agent intro");
-                assert_eq!(b, "x-anthropic-billing-header: probe");
-            }
-            _ => panic!("system blocks 应均为 Text"),
+        // 顶层 system 独立保留, 不混入提升内容.
+        assert_eq!(ir.system.len(), 1, "顶层 system 不受 messages 内 system 影响");
+        // messages[] 位置保真: system 条目原位保留, 计数与顺序同 ingress wire.
+        assert_eq!(ir.messages.len(), 2);
+        assert_eq!(ir.messages[0].role, IrRole::System);
+        assert_eq!(ir.messages[0].content_form, Some(ContentForm::String));
+        match &ir.messages[0].content[0] {
+            IrBlock::Text { text } => assert_eq!(text, "x-anthropic-billing-header: probe"),
+            other => panic!("expected Text, got {other:?}"),
         }
-        // messages 不再含 system → 与 writer 写回的 body messages 数一致.
-        assert_eq!(ir.messages.len(), 1);
-        assert_eq!(ir.messages[0].role, IrRole::User);
+        assert_eq!(ir.messages[1].role, IrRole::User);
     }
 
-    /// 提升后 reader→writer 一致性 (timeline delta 切片的正确性前提):
-    /// 写回 body 的 messages 数 == ir.messages 数 (System 不再被 filter 丢弃).
+    /// reader→writer round-trip 对 role=system 条目的位置保真 (FWD-1 字面等式的
+    /// 前提): 写回 body 的 messages 数与位置 == ir.messages, system 顶层字段不变.
     #[test]
-    fn system_role_message_survives_round_trip_into_top_level() {
+    fn system_role_message_round_trips_in_place() {
         let body = json!({
             "model": "claude",
             "system": "base prompt",
             "messages": [
                 {"role": "system", "content": "billing-header"},
                 {"role": "user", "content": "hi"},
+                {"role": "system", "content": [{"type": "text", "text": "mid-way note"}]},
+                {"role": "assistant", "content": "ok"},
             ],
             "max_tokens": 10
         });
         let ir = reader().read_request(&body).unwrap();
+        assert_eq!(ir.messages.len(), 4);
         let rewritten = writer().write_request(&ir);
-        // 写回 body: system 为 2-block array (顶层 + 提升), 内容与顺序保真.
-        let sys_texts: Vec<&str> = rewritten["system"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|b| b.get("text").and_then(Value::as_str))
-            .collect();
-        assert_eq!(sys_texts, vec!["base prompt", "billing-header"]);
-        // messages 与 ir.messages 等长 (System 不再被 filter 丢弃).
+        // 顶层 system 字段原样 (string 形态保真).
+        assert_eq!(rewritten["system"], json!("base prompt"));
+        // messages 按原位写回: role=system 条目保留在原位置.
         let msgs = rewritten.get("messages").unwrap().as_array().unwrap();
-        assert_eq!(msgs.len(), ir.messages.len());
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[0]["content"], json!("billing-header"));
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[2]["role"], "system");
+        assert_eq!(
+            msgs[2]["content"],
+            json!([{"type": "text", "text": "mid-way note"}])
+        );
+        assert_eq!(msgs[3]["role"], "assistant");
     }
 
     #[test]

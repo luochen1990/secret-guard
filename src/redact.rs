@@ -89,7 +89,7 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::codec::ir::{IrBlock, IrRequest, IrResponse, IrTool};
+use crate::codec::ir::{IrBlock, IrRequest, IrResponse, IrRole, IrTool};
 use crate::config::OnProbeExhausted;
 use crate::secrets::SecretEntry;
 
@@ -1142,7 +1142,11 @@ fn count_hit_locations(ir: &IrRequest, needle: &str) -> crate::codec::ir::HitLoc
     for msg in &ir.messages {
         let n: u64 = msg.content.iter().map(|b| leaf_hits(b, needle)).sum();
         if n > 0 {
-            if msg.contains_user_text {
+            if msg.role == IrRole::System {
+                // messages[] 内 role=system 条目 (Anthropic 中途 system 消息) 归 system 桶
+                // — 语义上仍是 "系统提示词污染", 与 ir.system 命中同属 (2026-09-23, #269).
+                h.system += n;
+            } else if msg.contains_user_text {
                 h.user += n;
             } else {
                 h.history += n;
