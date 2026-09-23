@@ -13,7 +13,9 @@
 }:
 rustPlatform.buildRustPackage {
   pname = "secret-guard";
-  version = "0.1.0";
+  # version SSOT = Cargo.toml [package].version (importTOML 单点读取, 保持发布
+  # 归档名 secret-guard-<version>-<triple> 与 git tag 对齐, 杜绝双处手抄漂移)。
+  version = (lib.importTOML ../../Cargo.toml).package.version;
 
   # src 过滤策略: nix-gitignore 的 .gitignore 基线 + 显式黑名单叠加.
   #   - .gitignore 基线: 自动排除 git-untracked 项 (敏感数据 / 构建产物等), 单一事实来源.
@@ -29,6 +31,7 @@ rustPlatform.buildRustPackage {
     "/.cargo"
     "/.envrc"
     "/.forgejo"
+    "/.github"
     "/.gitignore"
     "/AGENTS.md"
     "/docs"

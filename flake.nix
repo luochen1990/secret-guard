@@ -8,7 +8,12 @@
   };
 
   outputs =
-    inputs@{ flake-fhs, ... }:
+    inputs@{
+      self,
+      flake-fhs,
+      nixpkgs,
+      ...
+    }:
     let
       # overlay SSOT 在 nix/overlay.nix (module 内注入与 packages 共用同一份).
       overlay = import ./nix/overlay.nix;
@@ -16,8 +21,9 @@
       fhs = flake-fhs.lib.mkFlake { inherit inputs; } {
         # embed 布局: nix 文件全部收在 nix/ 下, 与项目根的 Rust 源码隔离.
         # 目录树即 flake: nix/pkgs -> packages, nix/modules -> nixosModules,
-        # nix/shells -> devShells, nix/checks -> checks (辅助库 nix/module.nix,
-        # nix/render.nix, nix/tests/ 在扫描名单目录之外, 不被收集).
+        # nix/shells -> devShells, nix/checks -> checks (散件 nix/module.nix,
+        # nix/render.nix, nix/release.nix, nix/tests/ 在扫描名单目录之外,
+        # 不被收集 — 各自有本仓内显式消费方, 如下方 release 的手动挂载).
         layout.roots = [ "/nix" ];
         # 支持 x86_64-linux 与 aarch64-linux (本地 devShell 主要场景).
         # 需要扩展时显式添加 system, 避免隐式全平台抽象.
@@ -37,9 +43,23 @@
       # flake-fhs 不生成 overlays output, 手动补 (消费方: 手动加 overlay 的部署).
       overlays.default = overlay;
 
-      # packages.default 别名: flake-fhs 不生成, 消费方 (secret-guard-flake
-      # 发布归档等) 习惯 nix build .#default.
-      packages = builtins.mapAttrs (_: ps: ps // { default = ps.secret-guard; }) fhs.packages;
+      # packages.default 别名: flake-fhs 不生成, 消费方 (overlay / nixosModule
+      # 接入者) 习惯 nix build .#default。
+      # release: 二进制发布聚合 (linux×2 musl 归档 + SHA256SUMS), 构建主机钉
+      # x86_64-linux — 只在该槽位挂载; nix/release.nix 在 nix/ 根 (flake-fhs
+      # 扫描名单目录之外), 与上面 default 同款手法手动补。
+      packages = builtins.mapAttrs (
+        system: ps:
+        ps
+        // {
+          default = ps.secret-guard;
+        }
+        // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          release = import ./nix/release.nix {
+            inherit self overlay nixpkgs;
+          };
+        }
+      ) fhs.packages;
       # nixosModules 由框架生成 (含 default, = imports 所有 modules), 无需手动补;
       # 组装层语义见 nix/modules/secret-guard.nix 头注.
     };

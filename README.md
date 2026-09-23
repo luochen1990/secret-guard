@@ -64,8 +64,10 @@ detail, with Secret locations highlighted as the Mock — i.e. exactly what the 
 ### 1. Install
 
 ```bash
-# Binary archives (Linux x86_64 / ARM64, fully static musl, with SHA256 checksums) — see:
-#   https://secret-guard.lambda.lc/en/download/
+# Binary archives (Linux x86_64 / ARM64, fully static musl, with SHA256 checksums):
+#   https://github.com/luochen1990/secret-guard/releases
+#   archive name pattern: secret-guard-<version>-<triple>.tar.gz
+#   (e.g. secret-guard-0.1.0-x86_64-linux-musl.tar.gz)
 
 # Nix (flake):
 nix run github:luochen1990/secret-guard -- --help

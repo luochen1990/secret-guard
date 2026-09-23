@@ -49,8 +49,10 @@ Mock 呈现, 即 LLM 所见):
 ### 1. 安装
 
 ```bash
-# 二进制归档 (Linux x86_64 / ARM64, musl 全静态, 附 SHA256 校验) — 见下载页:
-#   https://secret-guard.lambda.lc/zh-cn/download/
+# 二进制归档 (Linux x86_64 / ARM64, musl 全静态, 附 SHA256 校验):
+#   https://github.com/luochen1990/secret-guard/releases
+#   归档命名: secret-guard-<version>-<triple>.tar.gz
+#   (如 secret-guard-0.1.0-x86_64-linux-musl.tar.gz)
 
 # Nix (flake):
 nix run github:luochen1990/secret-guard -- --help

@@ -579,7 +579,8 @@ devShell 内可用 (treefmt 调用的 nixfmt/taplo/ruff 需在 PATH; devShell �
 全仓格式化 SSOT = 根 `treefmt.toml` (覆盖 nix/rust/toml/py; 排除 md/yaml/ts
 的理由见其头部), devShell `treefmt` 与 CI `just check-fmt` 读同一份配置;
 CI runner VM 未预装 treefmt 时 check-fmt 降级 rust-only (见 justfile).
-扫描名单目录之外的散件 (`nix/module.nix` / `nix/render.nix` / `nix/tests/`) 不被
+扫描名单目录之外的散件 (`nix/module.nix` / `nix/render.nix` / `nix/release.nix` /
+`nix/tests/`) 不被
 收集 — 测试辅助库因此必须留在 `nix/tests/` (checks 目录内的裸 .nix 会被当 check).
 `nix/modules/secret-guard.nix` 是薄组装层 (imports `nix/module.nix` 本体 + overlay
 注入), 保持 `nixosModules.secret-guard` 的 "module + overlay" 语义.
@@ -595,6 +596,25 @@ CI runner VM 未预装 treefmt 时 check-fmt 降级 rust-only (见 justfile).
 
 > 路径约定见上方"路由策略"表格; `/api/*` 子路由细节 (未匹配 404 no-forward)
 > 见 `src/web/AGENTS.md`; 完整 URI 分配规划见 `docs/design/url-layout.md`.
+
+## 发布流程 (tag → GitHub Releases)
+
+二进制发布自包含在本仓 (历史独立仓库 secret-guard-flake 已废弃): `nix/release.nix`
+产出 linux×2 musl 全静态归档 + SHA256SUMS, 挂载在 `packages."x86_64-linux".release`
+(构建主机钉 x86_64-linux); `.github/workflows/release.yml` 在 `v*` tag push 时
+`nix build .#release` 并上传到 GitHub Releases。归档矩阵只此两档, 不做
+windows/darwin。
+
+流程 (version SSOT = Cargo.toml `[package].version`, nix package 经 `importTOML`
+单点读取 — 归档名与 tag 的对齐由这条链路保证):
+
+1. bump `Cargo.toml` version → commit → merge master;
+2. `git tag v<ver>` (必须与 Cargo.toml version 相等 — 归档名 = tag 是命名契约);
+3. `git push origin <branch+tag>` **再** `git push github <branch+tag>` —
+   forgejo 侧不解析 `.github/workflows` (实例只认 `.forgejo/workflows/`,
+   2026-09 实证, 见 workflow 头注), 双宿顺序仅保证 forgejo 先收不动作;
+4. GitHub Actions 自动构建发布; 提醒: website 仓 `src/data/downloads.ts` 的
+   版本/归档清单同步更新。
 
 ## 已知限制 (MVP)
 

@@ -3,6 +3,9 @@
 > **职责**: `.forgejo/workflows/{ci-merge,ci-deploy,ci-periodic}.yml` 三档 workflow 的
 > 实现细节 SSOT (checkout 策略 / 缓存复用 / 并发假设 / 评论写回), 面向 CI 维护者.
 > **受众**: 修改 CI 配置 / 需要调整 workflow 的人.
+> GitHub 侧 workflow (`.github/workflows/`: ci.yml 镜像 + release.yml 二进制发布,
+> forgejo 不解析该目录, 2026-09 实证) 不在本文件 scope — 发布管道见根 `AGENTS.md`
+> "发布流程" 段.
 > **接口性质的高层概述** (配置位置 / 触发条件 / CI 做了什么) 在根 `AGENTS.md`
 > "## 开发流程 → ### CI (Forgejo Actions)" 段, 改 CI 配置前先读那段了解整体定位.
 > 与 workflow 文件不一致时以 workflow 文件为准 (P0 = ci-merge.yml).

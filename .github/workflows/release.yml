@@ -1,0 +1,57 @@
+# 二进制发布: v* tag push → nix build .#release → GitHub Releases。
+#
+# forgejo 误触发防双跑 (2026-09 实证): 本仓双宿 (origin=forgejo, github=GitHub),
+# forgejo 实例 (git.lambda.lc) 在仓库存在 .forgejo/workflows/ 时只解析该目录,
+# .github/workflows/* 不在 forgejo 侧触发 — 同目录 ci.yml 为活体先例 (master
+# push 在 forgejo 只有 ci-merge/ci-deploy 两个 run, 从无 "ci" run)。
+# tag 双推顺序约定: 先 push origin (forgejo 侧无动作) 再 push github (触发发布)。
+#
+# 产物矩阵: linux×2 musl 全静态 (x86_64 / aarch64) + SHA256SUMS;
+# 静态链接 fail-closed 断言在 nix/release.nix 的 tarball 构建内。
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # 命名契约守卫 (fail-fast): 归档名 secret-guard-<version>-<triple> 的 version
+      # 读自 Cargo.toml, tag 必须与之相等 — 不等则发布名与归档名静默漂移。
+      # tag 经 env 传入 shell (不直接插值, 消除注入告警类别)。
+      - name: Assert tag matches Cargo.toml version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          ver="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml)"
+          if [ "v$ver" != "$TAG" ]; then
+            echo "::error::tag $TAG != v$ver (Cargo.toml version)"
+            exit 1
+          fi
+
+      - uses: DeterminateSystems/nix-installer-action@v23
+
+      - uses: DeterminateSystems/magic-nix-cache-action@v15
+
+      - name: Build release archives
+        run: nix build .#release
+
+      # 上传前冒烟: 校验和逐项核对 (SHA256SUMS 内是裸文件名, 需在 result/ 内执行)
+      - name: Verify checksums
+        run: cd result && sha256sum -c SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          fail_on_unmatched_files: true
+          files: |
+            result/secret-guard-*.tar.gz
+            result/SHA256SUMS
