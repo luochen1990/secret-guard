@@ -226,7 +226,7 @@ pub(super) fn blocks_to_text(blocks: &[ir::IrBlock]) -> String {
     blocks
         .iter()
         .filter_map(|b| match b {
-            ir::IrBlock::Text { text } => Some(text.as_str()),
+            ir::IrBlock::Text { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()

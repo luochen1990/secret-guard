@@ -823,25 +823,45 @@ impl StringLeafOps for serde_json::Value {
 impl StringLeafOps for IrBlock {
     fn for_each_str_leaf(&self, f: &mut impl FnMut(&str)) {
         match self {
-            IrBlock::Text { text } => f(text),
-            IrBlock::ToolUse { id, name, input } => {
+            IrBlock::Text { text, extra } => {
+                f(text);
+                for v in extra.values() {
+                    v.for_each_str_leaf(f);
+                }
+            }
+            IrBlock::ToolUse {
+                id,
+                name,
+                input,
+                extra,
+            } => {
                 f(id);
                 f(name);
                 input.for_each_str_leaf(f);
+                for v in extra.values() {
+                    v.for_each_str_leaf(f);
+                }
             }
             IrBlock::ToolResult {
                 tool_use_id,
                 content,
+                extra,
                 ..
             } => {
                 f(tool_use_id);
                 for c in content {
                     c.for_each_str_leaf(f);
                 }
+                for v in extra.values() {
+                    v.for_each_str_leaf(f);
+                }
             }
-            IrBlock::Image { source } => {
+            IrBlock::Image { source, extra } => {
                 if let crate::codec::ir::IrImageSource::Url(u) = source {
                     f(u);
+                }
+                for v in extra.values() {
+                    v.for_each_str_leaf(f);
                 }
             }
             IrBlock::Reasoning { summary } => {
@@ -855,25 +875,45 @@ impl StringLeafOps for IrBlock {
 
     fn for_each_str_leaf_mut(&mut self, f: &mut impl FnMut(&mut String)) {
         match self {
-            IrBlock::Text { text } => f(text),
-            IrBlock::ToolUse { id, name, input } => {
+            IrBlock::Text { text, extra } => {
+                f(text);
+                for v in extra.values_mut() {
+                    v.for_each_str_leaf_mut(f);
+                }
+            }
+            IrBlock::ToolUse {
+                id,
+                name,
+                input,
+                extra,
+            } => {
                 f(id);
                 f(name);
                 input.for_each_str_leaf_mut(f);
+                for v in extra.values_mut() {
+                    v.for_each_str_leaf_mut(f);
+                }
             }
             IrBlock::ToolResult {
                 tool_use_id,
                 content,
+                extra,
                 ..
             } => {
                 f(tool_use_id);
                 for c in content.iter_mut() {
                     c.for_each_str_leaf_mut(f);
                 }
+                for v in extra.values_mut() {
+                    v.for_each_str_leaf_mut(f);
+                }
             }
-            IrBlock::Image { source } => {
+            IrBlock::Image { source, extra } => {
                 if let crate::codec::ir::IrImageSource::Url(u) = source {
                     f(u);
+                }
+                for v in extra.values_mut() {
+                    v.for_each_str_leaf_mut(f);
                 }
             }
             IrBlock::Reasoning { summary } => {
@@ -892,12 +932,16 @@ impl StringLeafOps for IrTool {
             name,
             description,
             input_schema,
+            extra,
         } = self;
         f(name);
         if let Some(d) = description {
             f(d);
         }
         input_schema.for_each_str_leaf(f);
+        for v in extra.values() {
+            v.for_each_str_leaf(f);
+        }
     }
 
     fn for_each_str_leaf_mut(&mut self, f: &mut impl FnMut(&mut String)) {
@@ -905,12 +949,16 @@ impl StringLeafOps for IrTool {
             name,
             description,
             input_schema,
+            extra,
         } = self;
         f(name);
         if let Some(d) = description {
             f(d);
         }
         input_schema.for_each_str_leaf_mut(f);
+        for v in extra.values_mut() {
+            v.for_each_str_leaf_mut(f);
+        }
     }
 }
 
@@ -922,6 +970,10 @@ impl StringLeafOps for IrRequest {
         for msg in &self.messages {
             for block in &msg.content {
                 block.for_each_str_leaf(f);
+            }
+            // 消息级 extra (#269, L4): 消息上未建模字段同样可能携带 secret 文本.
+            for v in msg.extra.values() {
+                v.for_each_str_leaf(f);
             }
         }
         for tool in &self.tools {
@@ -947,6 +999,9 @@ impl StringLeafOps for IrRequest {
         for msg in &mut self.messages {
             for block in &mut msg.content {
                 block.for_each_str_leaf_mut(f);
+            }
+            for v in msg.extra.values_mut() {
+                v.for_each_str_leaf_mut(f);
             }
         }
         for tool in &mut self.tools {
@@ -1009,6 +1064,10 @@ fn collect_ir_str_leaves(ir: &IrRequest) -> Vec<&str> {
         for block in &msg.content {
             collect_block_leaves(block, &mut leaves);
         }
+        // 消息级 extra (#269, L4) — 与 StringLeafOps for IrRequest 保持同覆盖.
+        for v in msg.extra.values() {
+            collect_value_leaves(v, &mut leaves);
+        }
     }
     for tool in &ir.tools {
         leaves.push(&tool.name);
@@ -1016,6 +1075,10 @@ fn collect_ir_str_leaves(ir: &IrRequest) -> Vec<&str> {
             leaves.push(d);
         }
         collect_value_leaves(&tool.input_schema, &mut leaves);
+        // 工具级 extra (#269) — 同上, 双轨覆盖一致.
+        for v in tool.extra.values() {
+            collect_value_leaves(v, &mut leaves);
+        }
     }
     for s in &ir.stop {
         leaves.push(s);
@@ -1032,25 +1095,45 @@ fn collect_ir_str_leaves(ir: &IrRequest) -> Vec<&str> {
 /// [`collect_ir_str_leaves`] 的 IrBlock 递归辅助.
 fn collect_block_leaves<'a>(block: &'a IrBlock, leaves: &mut Vec<&'a str>) {
     match block {
-        IrBlock::Text { text } => leaves.push(text),
-        IrBlock::ToolUse { id, name, input } => {
+        IrBlock::Text { text, extra } => {
+            leaves.push(text);
+            for v in extra.values() {
+                collect_value_leaves(v, leaves);
+            }
+        }
+        IrBlock::ToolUse {
+            id,
+            name,
+            input,
+            extra,
+        } => {
             leaves.push(id);
             leaves.push(name);
             collect_value_leaves(input, leaves);
+            for v in extra.values() {
+                collect_value_leaves(v, leaves);
+            }
         }
         IrBlock::ToolResult {
             tool_use_id,
             content,
+            extra,
             ..
         } => {
             leaves.push(tool_use_id);
             for c in content {
                 collect_block_leaves(c, leaves);
             }
+            for v in extra.values() {
+                collect_value_leaves(v, leaves);
+            }
         }
-        IrBlock::Image { source } => {
+        IrBlock::Image { source, extra } => {
             if let crate::codec::ir::IrImageSource::Url(u) = source {
                 leaves.push(u);
+            }
+            for v in extra.values() {
+                collect_value_leaves(v, leaves);
             }
         }
         IrBlock::Reasoning { summary } => {
@@ -1189,6 +1272,7 @@ fn sample_ir_with_text(text: &str) -> IrRequest {
             role: IrRole::User,
             content: vec![IrBlock::Text {
                 text: text.to_string(),
+                extra: Default::default(),
             }],
             ..Default::default()
         }],
@@ -1204,6 +1288,7 @@ fn sample_ir_response_with_text(text: &str) -> IrResponse {
     IrResponse {
         content: vec![IrBlock::Text {
             text: text.to_string(),
+            extra: Default::default(),
         }],
         ..Default::default()
     }
@@ -1393,28 +1478,34 @@ mod tests {
         let ir = IrRequest {
             system: vec![IrBlock::Text {
                 text: "system-prompt".to_string(),
+                extra: Default::default(),
             }],
             messages: vec![IrMessage {
                 role: IrRole::User,
                 content: vec![
                     IrBlock::Text {
                         text: "msg-text".to_string(),
+                        extra: Default::default(),
                     },
                     IrBlock::ToolUse {
                         id: "tu-id".to_string(),
                         name: "tu-name".to_string(),
                         input: serde_json::json!({"key": "tu-input-val", "n": 42}),
+                        extra: Default::default(),
                     },
                     IrBlock::ToolResult {
                         tool_use_id: "tr-id".to_string(),
                         content: vec![IrBlock::Text {
                             text: "tr-content".to_string(),
+                            extra: Default::default(),
                         }],
-                        is_error: false,
+                        is_error: None,
                         content_form: None,
+                        extra: Default::default(),
                     },
                     IrBlock::Image {
                         source: IrImageSource::Url("img-url".to_string()),
+                        extra: Default::default(),
                     },
                     IrBlock::Reasoning {
                         summary: vec!["reasoning-summary".to_string()],
@@ -1429,6 +1520,7 @@ mod tests {
                 name: "tool-name".to_string(),
                 description: Some("tool-desc".to_string()),
                 input_schema: serde_json::json!({"type": "object", "title": "schema-title"}),
+                extra: Default::default(),
             }],
             stop: vec!["stop1".to_string()],
             user: Some("user-id".to_string()),
@@ -1485,11 +1577,13 @@ mod tests {
         let build_ir = || IrRequest {
             system: vec![IrBlock::Text {
                 text: "system context mentions sk-sys-secret here".to_string(),
+                extra: Default::default(),
             }],
             messages: vec![IrMessage {
                 role: IrRole::User,
                 content: vec![IrBlock::Text {
                     text: "user msg embeds sk-user-secret-xyz".to_string(),
+                    extra: Default::default(),
                 }],
                 ..Default::default()
             }],
@@ -1552,7 +1646,7 @@ mod tests {
         let (map, _) = redact_ir(&mut ir, &secrets);
         // 验证 redact 确实替换了.
         let redacted_text = match &ir.messages[0].content[0] {
-            IrBlock::Text { text } => text.clone(),
+            IrBlock::Text { text, .. } => text.clone(),
             _ => panic!("expected Text"),
         };
         assert!(!redacted_text.contains("sk-test-123"));
@@ -1561,7 +1655,7 @@ mod tests {
         let mut restored_ir = sample_ir_response_with_text(&redacted_text);
         restore_ir_response(&mut restored_ir, &map);
         let restored_text = match &restored_ir.content[0] {
-            IrBlock::Text { text } => text.clone(),
+            IrBlock::Text { text, .. } => text.clone(),
             _ => panic!("expected Text"),
         };
         assert_eq!(restored_text, text, "round-trip must restore original text");
@@ -1582,22 +1676,27 @@ mod tests {
         let blocks: Vec<IrBlock> = vec![
             IrBlock::Text {
                 text: format!("prefix-{marker}-suffix"),
+                extra: Default::default(),
             },
             IrBlock::ToolUse {
                 id: format!("call-{marker}"),
                 name: "tool".into(),
                 input: json!({"key": format!("val-{marker}")}),
+                extra: Default::default(),
             },
             IrBlock::ToolResult {
                 tool_use_id: format!("call-{marker}"),
                 content: vec![IrBlock::Text {
                     text: format!("nested-{marker}"),
+                    extra: Default::default(),
                 }],
-                is_error: false,
+                is_error: None,
                 content_form: None,
+                extra: Default::default(),
             },
             IrBlock::Image {
                 source: IrImageSource::Url(format!("https://example.com/{marker}.png")),
+                extra: Default::default(),
             },
             // Base64 image source: 不含 secret (与非 Url 变体的扫描语义一致), 跳过 marker 注入.
             IrBlock::Image {
@@ -1605,6 +1704,7 @@ mod tests {
                     media_type: "image/png".into(),
                     data: "iVBOR".into(),
                 },
+                extra: Default::default(),
             },
         ];
 
@@ -1670,7 +1770,7 @@ mod tests {
             map.real_to_mock.len()
         );
         let redacted_text = match &ir.messages[0].content[0] {
-            IrBlock::Text { text } => text.as_str(),
+            IrBlock::Text { text, .. } => text.as_str(),
             _ => panic!("expected Text block"),
         };
         assert!(
@@ -1722,7 +1822,7 @@ mod tests {
 
         // IR 仍保留 real secret (未替换, 原样转发 — 这是 fail_open 的语义代价).
         let text = match &ir.messages[0].content[0] {
-            IrBlock::Text { text } => text.as_str(),
+            IrBlock::Text { text, .. } => text.as_str(),
             _ => panic!("expected Text block"),
         };
         assert!(
@@ -1786,7 +1886,7 @@ mod tests {
         assert_ne!(seed, 0, "seed must be non-zero when a secret was hit");
         // IR 中 real secret 已被替换为 mock.
         let text = match &ir.messages[0].content[0] {
-            IrBlock::Text { text } => text.as_str(),
+            IrBlock::Text { text, .. } => text.as_str(),
             _ => panic!("expected Text block"),
         };
         assert!(!text.contains("sk-test-123"));
@@ -1826,7 +1926,7 @@ mod tests {
         assert_eq!(map.real_to_mock.len(), 1);
         let mock = map.mock_for("sk-test-123").unwrap();
         let redacted_text = match &ir.messages[0].content[0] {
-            IrBlock::Text { text } => text.clone(),
+            IrBlock::Text { text, .. } => text.clone(),
             _ => panic!("expected Text block"),
         };
         assert!(redacted_text.contains(mock));
@@ -1863,6 +1963,7 @@ mod tests {
                     id: "call_1".to_string(),
                     name: "search".to_string(),
                     input: json!({"api_key": "sk-secret-value", "other": "text"}),
+                    extra: Default::default(),
                 }],
                 ..Default::default()
             }],
@@ -1890,9 +1991,11 @@ mod tests {
                     tool_use_id: "call_1".to_string(),
                     content: vec![IrBlock::Text {
                         text: "result with sk-secret".to_string(),
+                        extra: Default::default(),
                     }],
-                    is_error: false,
+                    is_error: None,
                     content_form: None,
+                    extra: Default::default(),
                 }],
                 ..Default::default()
             }],
@@ -1902,7 +2005,7 @@ mod tests {
         assert_eq!(map.real_to_mock.len(), 1);
         match &ir.messages[0].content[0] {
             IrBlock::ToolResult { content, .. } => match &content[0] {
-                IrBlock::Text { text } => assert!(!text.contains("sk-secret")),
+                IrBlock::Text { text, .. } => assert!(!text.contains("sk-secret")),
                 _ => panic!("expected Text"),
             },
             _ => panic!("expected ToolResult"),
@@ -1915,12 +2018,13 @@ mod tests {
         let mut ir = IrRequest {
             system: vec![IrBlock::Text {
                 text: "system with sk-secret".to_string(),
+                extra: Default::default(),
             }],
             ..sample_ir_with_text("")
         };
         let _ = redact_ir(&mut ir, &[entry("sk-secret")]);
         match &ir.system[0] {
-            IrBlock::Text { text } => assert!(!text.contains("sk-secret")),
+            IrBlock::Text { text, .. } => assert!(!text.contains("sk-secret")),
             _ => panic!("expected Text"),
         }
     }
@@ -1976,6 +2080,7 @@ mod tests {
         let mut ir = IrResponse {
             content: vec![IrBlock::Text {
                 text: "result MOCKABCDEF12345 end".to_string(),
+                extra: Default::default(),
             }],
             ..Default::default()
         };
@@ -1988,7 +2093,7 @@ mod tests {
         .unwrap();
         restore_ir_response(&mut ir, &map);
         match &ir.content[0] {
-            IrBlock::Text { text } => {
+            IrBlock::Text { text, .. } => {
                 assert!(text.contains("sk-real-secret"));
                 assert!(!text.contains("MOCKABCDEF12345"));
             }
@@ -2205,6 +2310,7 @@ mod tests {
         IrResponse {
             content: vec![IrBlock::Text {
                 text: text.to_string(),
+                extra: Default::default(),
             }],
             ..Default::default()
         }
@@ -2218,6 +2324,7 @@ mod tests {
                 id: id.to_string(),
                 name: name.to_string(),
                 input: serde_json::json!({ "token": input_mock }),
+                extra: Default::default(),
             }],
             ..Default::default()
         }
@@ -2386,7 +2493,7 @@ mod tests {
             let (map, _) = redact_ir(&mut ir, &[entry(&secret)]);
             // 取 redact 后的 text.
             let redacted_text = match &ir.messages[0].content[0] {
-                IrBlock::Text { text } => text.clone(),
+                IrBlock::Text { text, .. } => text.clone(),
                 _ => panic!("expected Text"),
             };
             // restore.
@@ -2421,12 +2528,14 @@ mod tests {
             let mut ir = IrRequest {
                 system: vec![IrBlock::Text {
                     text: format!("sys-pre {secret} {body_suffix}"),
+                extra: Default::default(),
                 }],
                 messages: vec![
                     IrMessage {
                         role: IrRole::User,
                         content: vec![IrBlock::Text {
                             text: format!("{body_prefix} {secret} {body_suffix}"),
+                extra: Default::default(),
                         }],
                         ..Default::default()
                     },
@@ -2438,18 +2547,22 @@ mod tests {
                             content: vec![
                                 IrBlock::Text {
                                     text: format!("outer-result {secret} {body_suffix}"),
+                                    extra: Default::default(),
                                 },
                                 IrBlock::ToolResult {
                                     tool_use_id: "call-nested".to_string(),
                                     content: vec![IrBlock::Text {
                                         text: format!("nested-result {body_prefix} {secret}"),
+                                        extra: Default::default(),
                                     }],
-                                    is_error: false,
+                                    is_error: None,
                                     content_form: None,
+                                    extra: Default::default(),
                                 },
                             ],
-                            is_error: false,
+                            is_error: None,
                             content_form: None,
+                            extra: Default::default(),
                         }],
                         ..Default::default()
                     },
@@ -2554,7 +2667,7 @@ mod tests {
             let original = body.clone();
             let (map, _) = redact_ir(&mut ir, &secrets);
             let mut redacted_text = match &ir.messages[0].content[0] {
-                IrBlock::Text { text } => text.clone(),
+                IrBlock::Text { text, .. } => text.clone(),
                 _ => panic!("expected Text"),
             };
             for (mock, real) in &map.mock_to_real {
@@ -2579,7 +2692,7 @@ mod tests {
             let original = body.clone();
             let (map, _) = redact_ir(&mut ir, &[entry(&secret)]);
             let mut redacted_text = match &ir.messages[0].content[0] {
-                IrBlock::Text { text } => text.clone(),
+                IrBlock::Text { text, .. } => text.clone(),
                 _ => panic!("expected Text"),
             };
             for (mock, real) in &map.mock_to_real {
@@ -2733,6 +2846,7 @@ mod tests {
                 role: IrRole::Assistant,
                 content: vec![IrBlock::Text {
                     text: format!("ok {r2_reply}"),
+                extra: Default::default(),
                 }],
                 ..Default::default()
             });
@@ -2740,6 +2854,7 @@ mod tests {
                 role: IrRole::User,
                 content: vec![IrBlock::Text {
                     text: format!("again {secret} please"),
+                extra: Default::default(),
                 }],
                 ..Default::default()
             });
@@ -2797,6 +2912,7 @@ mod tests {
                 role: IrRole::Assistant,
                 content: vec![IrBlock::Text {
                     text: format!("ok {r2_reply}"),
+                extra: Default::default(),
                 }],
                 ..Default::default()
             });
@@ -2804,6 +2920,7 @@ mod tests {
                 role: IrRole::User,
                 content: vec![IrBlock::Text {
                     text: format!("use {s1} and {s2} again"),
+                extra: Default::default(),
                 }],
                 ..Default::default()
             });
@@ -2917,7 +3034,7 @@ mod tests {
             // 不变量 3 (RED-6): redact 后 real 已替换, 历史旧 mock 原样保留;
             // replace 回 real 后与 body2 恒等 (charset 论证保证 replace 无错位).
             let text2 = match &ir2.messages[0].content[0] {
-                IrBlock::Text { text } => text.clone(),
+                IrBlock::Text { text, .. } => text.clone(),
                 _ => panic!("expected Text"),
             };
             prop_assert!(!text2.contains(secret.as_str()), "real 已被替换");
@@ -3030,7 +3147,7 @@ mod tests {
             restore_ir_response(&mut resp, &map);
             // 比对唯一 Text 叶子.
             let restored_text = match &resp.content[0] {
-                IrBlock::Text { text } => text.clone(),
+                IrBlock::Text { text, .. } => text.clone(),
                 _ => panic!("expected Text"),
             };
             prop_assert_eq!(restored_text, expected);
@@ -3089,7 +3206,7 @@ mod tests {
             let expected = format!("{prefix}{reals_joined}{suffix}");
             restore_ir_response(&mut resp, &map);
             let restored_text = match &resp.content[0] {
-                IrBlock::Text { text } => text.clone(),
+                IrBlock::Text { text, .. } => text.clone(),
                 _ => panic!("expected Text"),
             };
             prop_assert_eq!(restored_text, expected);
@@ -3112,7 +3229,7 @@ mod tests {
             restore_ir_response(&mut resp, &map);
             // 验证 ToolUse.input.token 已还原为 real.
             match &resp.content[0] {
-                IrBlock::ToolUse { id, name, input } => {
+                IrBlock::ToolUse { id, name, input, .. } => {
                     prop_assert_eq!(id, "call_1");
                     prop_assert_eq!(name, &tool_name);
                     let token = input
@@ -3152,7 +3269,7 @@ mod tests {
             let mut resp = mock_response_with_text(&mocks_text);
             restore_ir_response(&mut resp, &map);
             let restored = match &resp.content[0] {
-                IrBlock::Text { text } => text.clone(),
+                IrBlock::Text { text, .. } => text.clone(),
                 _ => panic!("expected Text"),
             };
             // 严格双射断言: split restored, 与预期 real 列表逐位相等.
@@ -3362,6 +3479,7 @@ mod hit_location_tests {
             role,
             content: vec![IrBlock::Text {
                 text: text.to_string(),
+                extra: Default::default(),
             }],
             contains_user_text: user_text,
             ..Default::default()
@@ -3374,6 +3492,7 @@ mod hit_location_tests {
         let ir = IrRequest {
             system: vec![IrBlock::Text {
                 text: format!("preamble {needle} here"),
+                extra: Default::default(),
             }],
             messages: vec![
                 msg(IrRole::User, &format!("user pasted {needle}"), true),
@@ -3388,6 +3507,7 @@ mod hit_location_tests {
                 name: format!("tool_{needle}"),
                 description: None,
                 input_schema: serde_json::Value::Null,
+                extra: Default::default(),
             }],
             stop: vec![format!("stop-{needle}")],
             ..Default::default()

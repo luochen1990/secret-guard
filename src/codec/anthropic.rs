@@ -333,14 +333,23 @@ impl Writer for AnthropicWriter {
                 .system
                 .iter()
                 .filter_map(|b| match b {
-                    IrBlock::Text { text } => Some(json!({"type": "text", "text": text})),
+                    IrBlock::Text { text, extra } => {
+                        let mut v = json!({"type": "text", "text": text});
+                        merge_block_extra(&mut v, extra);
+                        Some(v)
+                    }
                     _ => None, // 跨协议来源: 非文本 system block 静默 drop
                 })
                 .collect();
             let emit_string = match req.system_form {
                 Some(super::ir::SystemForm::String) => true,
                 Some(super::ir::SystemForm::Array) => false,
-                None => blocks.len() == 1,
+                None => {
+                    blocks.len() == 1
+                        && blocks
+                            .first()
+                            .is_some_and(|v| v.as_object().is_some_and(|m| m.len() == 2))
+                }
             };
             if emit_string {
                 // string 形态: reader 对 string ingress 恒产单 Text block; 多 Text
@@ -349,7 +358,7 @@ impl Writer for AnthropicWriter {
                     .system
                     .iter()
                     .filter_map(|b| match b {
-                        IrBlock::Text { text } => Some(text.as_str()),
+                        IrBlock::Text { text, .. } => Some(text.as_str()),
                         _ => None,
                     })
                     .collect::<Vec<_>>()
@@ -623,7 +632,10 @@ fn read_system_field(val: Option<&Value>) -> Vec<IrBlock> {
             if s.is_empty() {
                 Vec::new()
             } else {
-                vec![IrBlock::Text { text: s.clone() }]
+                vec![IrBlock::Text {
+                    text: s.clone(),
+                    extra: Default::default(),
+                }]
             }
         }
         Value::Array(arr) => arr.iter().filter_map(read_block).collect(),
@@ -645,7 +657,12 @@ fn read_message(msg: &Value) -> Option<IrMessage> {
     let raw = obj.get("content");
     let content_form = ContentForm::classify(raw);
     let content = match raw {
-        Some(Value::String(s)) if !s.is_empty() => vec![IrBlock::Text { text: s.clone() }],
+        Some(Value::String(s)) if !s.is_empty() => {
+            vec![IrBlock::Text {
+                text: s.clone(),
+                extra: Default::default(),
+            }]
+        }
         Some(Value::Array(arr)) => arr.iter().filter_map(read_block).collect(),
         _ => Vec::new(),
     };
@@ -656,10 +673,15 @@ fn read_message(msg: &Value) -> Option<IrMessage> {
         content_form,
         // Anthropic wire 无 reasoning_content 字段, 恒缺席.
         reasoning_content_form: None,
+        // L4 保真 (#269): 消息级未建模字段 (如消息级 output_config) 原样保留.
+        extra: collect_extra(obj, &["role", "content"]),
     })
 }
 
 /// 解析 Anthropic content block → [`IrBlock`].
+///
+/// 各类型的已建模字段之外的 key 全部进 `extra` (L5 保真, #269) — 典型: block 级
+/// `cache_control` 缓存断点; 也覆盖未来新增的官方字段 (防止再度静默丢失).
 fn read_block(b: &Value) -> Option<IrBlock> {
     let obj = b.as_object()?;
     let ty = obj.get("type").and_then(Value::as_str)?;
@@ -671,6 +693,7 @@ fn read_block(b: &Value) -> Option<IrBlock> {
             } else {
                 Some(IrBlock::Text {
                     text: text.to_string(),
+                    extra: collect_extra(obj, &["type", "text"]),
                 })
             }
         }
@@ -692,7 +715,12 @@ fn read_block(b: &Value) -> Option<IrBlock> {
             if name.is_empty() {
                 None
             } else {
-                Some(IrBlock::ToolUse { id, name, input })
+                Some(IrBlock::ToolUse {
+                    id,
+                    name,
+                    input,
+                    extra: collect_extra(obj, &["type", "id", "name", "input"]),
+                })
             }
         }
         "tool_result" => {
@@ -701,17 +729,17 @@ fn read_block(b: &Value) -> Option<IrBlock> {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let is_error = obj
-                .get("is_error")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
+            let is_error = obj.get("is_error").and_then(Value::as_bool);
             // content 可能是 string 或 array of blocks.
             // L1 保真: 记录原始形态 (string / array).
             let raw = obj.get("content");
             let content_form = ContentForm::classify(raw);
             let content = match raw {
                 Some(Value::String(s)) if !s.is_empty() => {
-                    vec![IrBlock::Text { text: s.clone() }]
+                    vec![IrBlock::Text {
+                        text: s.clone(),
+                        extra: Default::default(),
+                    }]
                 }
                 Some(Value::Array(arr)) => arr.iter().filter_map(read_block).collect(),
                 _ => Vec::new(),
@@ -721,6 +749,7 @@ fn read_block(b: &Value) -> Option<IrBlock> {
                 content,
                 is_error,
                 content_form,
+                extra: collect_extra(obj, &["type", "tool_use_id", "content", "is_error"]),
             })
         }
         "image" => {
@@ -752,6 +781,7 @@ fn read_block(b: &Value) -> Option<IrBlock> {
             };
             Some(IrBlock::Image {
                 source: image_source,
+                extra: collect_extra(obj, &["type", "source"]),
             })
         }
         _ => None, // thinking / redacted_thinking 等不在 MVP
@@ -780,6 +810,12 @@ fn read_tool_def(tool: &Value) -> Option<IrTool> {
         name,
         description,
         input_schema,
+        // 工具级未建模字段 (cache_control / defer_loading / type 等) 原样保留 (#269):
+        // claude code 常把缓存断点放在最后一个工具定义上, 丢失 = 工具段缓存失效.
+        extra: tool
+            .as_object()
+            .map(|m| collect_extra(m, &["name", "description", "input_schema"]))
+            .unwrap_or_default(),
     })
 }
 
@@ -856,19 +892,30 @@ fn write_message(msg: &IrMessage) -> Value {
 
     // L1 保真: 按 wire 原始形态输出 content (string / array / null).
     let content_value = serialize_content_with_form(blocks, msg.content_form);
-    json!({"role": role_str, "content": content_value})
+    let mut obj = Map::new();
+    obj.insert("role".to_string(), Value::String(role_str.to_string()));
+    obj.insert("content".to_string(), content_value);
+    // L4 保真 (#269): 消息级未建模字段原样回写 (跨协议路径已被 clear_wire_fidelity 清空).
+    for (k, v) in &msg.extra {
+        obj.insert(k.clone(), v.clone());
+    }
+    Value::Object(obj)
 }
 
 /// 按 [`ContentForm`] 把已序列化的 wire content blocks 折叠回 wire 形态 (L1 保真).
 ///
-/// - `String` 形态: 0 block → `""`; 1 个 Text → 裸 string; 其他 → 回退 array.
+/// - `String` 形态: 0 block → `""`; 1 个仅含 type+text 的 Text → 裸 string
+///   (携带任何 block 级 extra 字段时折叠会丢信息, 回退 array — #269); 其他 → array.
 /// - `Null` 形态 + 0 block → `null`.
 /// - `Array` / `None` / 其他 → 始终 array.
 fn serialize_content_with_form(blocks: Vec<Value>, form: Option<ContentForm>) -> Value {
     match form {
         Some(ContentForm::String) => match blocks.as_slice() {
             [] => Value::String(String::new()),
-            [single] if single.get("text").is_some() => {
+            [single]
+                if single.get("text").is_some()
+                    && single.as_object().is_some_and(|m| m.len() == 2) =>
+            {
                 Value::String(single["text"].as_str().unwrap_or("").to_string())
             }
             _ => Value::Array(blocks),
@@ -879,20 +926,37 @@ fn serialize_content_with_form(blocks: Vec<Value>, form: Option<ContentForm>) ->
 }
 
 /// IR block → Anthropic content block (用于 message 数组内).
+///
+/// L5 保真 (#269): 各 variant 的 `extra` 字段原样合并回 block object (典型:
+/// block 级 `cache_control` 缓存断点).
 fn write_block(b: &IrBlock) -> Option<Value> {
     match b {
-        IrBlock::Text { text } => Some(json!({"type": "text", "text": text})),
-        IrBlock::ToolUse { id, name, input } => Some(json!({
-            "type": "tool_use",
-            "id": id,
-            "name": name,
-            "input": input,
-        })),
+        IrBlock::Text { text, extra } => {
+            let mut obj = json!({"type": "text", "text": text});
+            merge_block_extra(&mut obj, extra);
+            Some(obj)
+        }
+        IrBlock::ToolUse {
+            id,
+            name,
+            input,
+            extra,
+        } => {
+            let mut obj = json!({
+                "type": "tool_use",
+                "id": id,
+                "name": name,
+                "input": input,
+            });
+            merge_block_extra(&mut obj, extra);
+            Some(obj)
+        }
         IrBlock::ToolResult {
             tool_use_id,
             content,
             is_error,
             content_form,
+            extra,
         } => {
             // tool_result 内的 content. L1 保真: 按 wire 原始形态输出 (string / array).
             let inner: Vec<Value> = content.iter().filter_map(write_block).collect();
@@ -911,12 +975,16 @@ fn write_block(b: &IrBlock) -> Option<Value> {
             if should_emit {
                 obj.insert("content".to_string(), content_value);
             }
-            if *is_error {
-                obj.insert("is_error".to_string(), json!(true));
+            // is_error 按显式形态回写: None (缺席) 不写, Some(true/false) 原样写 (#269).
+            if let Some(e) = is_error {
+                obj.insert("is_error".to_string(), json!(e));
+            }
+            for (k, v) in extra {
+                obj.insert(k.clone(), v.clone());
             }
             Some(Value::Object(obj))
         }
-        IrBlock::Image { source } => {
+        IrBlock::Image { source, extra } => {
             let src = match source {
                 IrImageSource::Base64 { media_type, data } => json!({
                     "type": "base64",
@@ -928,7 +996,9 @@ fn write_block(b: &IrBlock) -> Option<Value> {
                     "url": url,
                 }),
             };
-            Some(json!({"type": "image", "source": src}))
+            let mut obj = json!({"type": "image", "source": src});
+            merge_block_extra(&mut obj, extra);
+            Some(obj)
         }
         IrBlock::Reasoning { .. } => {
             // Anthropic Messages 协议无 reasoning item 的直接对应 (有 thinking blocks, 但结构不同).
@@ -943,7 +1013,16 @@ fn write_block(b: &IrBlock) -> Option<Value> {
     }
 }
 
-/// 写 tool 定义 (Anthropic 顶层 name/description/input_schema).
+/// 把 block 级 `extra` 合并回已构造的 wire block object (#269, L5 回写).
+fn merge_block_extra(obj: &mut Value, extra: &serde_json::Map<String, Value>) {
+    if let Some(map) = obj.as_object_mut() {
+        for (k, v) in extra {
+            map.insert(k.clone(), v.clone());
+        }
+    }
+}
+
+/// 写 tool 定义 (Anthropic 顶层 name/description/input_schema + 工具级 extra 回写).
 fn write_tool_def(tool: &IrTool) -> Value {
     let mut obj = Map::new();
     obj.insert("name".to_string(), Value::String(tool.name.clone()));
@@ -951,6 +1030,9 @@ fn write_tool_def(tool: &IrTool) -> Value {
         obj.insert("description".to_string(), Value::String(desc.clone()));
     }
     obj.insert("input_schema".to_string(), tool.input_schema.clone());
+    for (k, v) in &tool.extra {
+        obj.insert(k.clone(), v.clone());
+    }
     Value::Object(obj)
 }
 
@@ -1204,13 +1286,17 @@ mod tests {
         });
         let ir = reader().read_request(&body).unwrap();
         // 顶层 system 独立保留, 不混入提升内容.
-        assert_eq!(ir.system.len(), 1, "顶层 system 不受 messages 内 system 影响");
+        assert_eq!(
+            ir.system.len(),
+            1,
+            "顶层 system 不受 messages 内 system 影响"
+        );
         // messages[] 位置保真: system 条目原位保留, 计数与顺序同 ingress wire.
         assert_eq!(ir.messages.len(), 2);
         assert_eq!(ir.messages[0].role, IrRole::System);
         assert_eq!(ir.messages[0].content_form, Some(ContentForm::String));
         match &ir.messages[0].content[0] {
-            IrBlock::Text { text } => assert_eq!(text, "x-anthropic-billing-header: probe"),
+            IrBlock::Text { text, .. } => assert_eq!(text, "x-anthropic-billing-header: probe"),
             other => panic!("expected Text, got {other:?}"),
         }
         assert_eq!(ir.messages[1].role, IrRole::User);
@@ -1250,6 +1336,76 @@ mod tests {
         assert_eq!(msgs[3]["role"], "assistant");
     }
 
+    /// M1 保真示例锚点 (#269, FWD-2 property 的可读性文档): block 级/工具级
+    /// `cache_control` 与显式 `is_error: false` 全部原样保留 — claude code 每请求
+    /// 2-4 个缓存断点, 丢失 = 上游前缀缓存彻底失效.
+    #[test]
+    fn cache_control_and_is_error_survive_round_trip() {
+        let body = json!({
+            "model": "claude",
+            "system": [
+                {"type": "text", "text": "sys-a"},
+                {"type": "text", "text": "sys-b", "cache_control": {"type": "ephemeral"}},
+            ],
+            "tools": [
+                {"name": "t1", "description": "d", "input_schema": {"type": "object"}},
+                {"name": "t2", "description": "d", "input_schema": {"type": "object"},
+                 "cache_control": {"type": "ephemeral"}},
+            ],
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_x",
+                     "content": "result", "cache_control": {"type": "ephemeral"}},
+                    {"type": "tool_result", "tool_use_id": "toolu_y",
+                     "content": "ok", "is_error": false},
+                ]},
+            ],
+            "max_tokens": 10
+        });
+        let ir = reader().read_request(&body).unwrap();
+        let rewritten = writer().write_request(&ir);
+        // system: array 形态 + 末位 block 的 cache_control 保留.
+        let sys = rewritten["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 2, "array 形态不折叠 (含 cache_control)");
+        assert_eq!(sys[0], json!({"type": "text", "text": "sys-a"}));
+        assert_eq!(
+            sys[1]["cache_control"],
+            json!({"type": "ephemeral"}),
+            "system block 级缓存断点保留"
+        );
+        // tools: 末位工具的 cache_control 保留.
+        let tools = rewritten["tools"].as_array().unwrap();
+        assert_eq!(tools[1]["cache_control"], json!({"type": "ephemeral"}));
+        // messages: tool_result 的 cache_control 与显式 is_error:false 保留.
+        let blocks = rewritten["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["cache_control"], json!({"type": "ephemeral"}));
+        assert_eq!(blocks[1]["is_error"], json!(false), "显式 false 不省略");
+        assert!(blocks[0].get("is_error").is_none(), "缺席形态不凭空生成");
+    }
+
+    /// M1 示例锚点 (#269): 消息级未建模字段 (claude code 的消息级 output_config)
+    /// 原样保留; 跨协议路径由 clear_wire_fidelity 清空 (见 fwd_cross_proto tests).
+    #[test]
+    fn message_level_extra_survives_round_trip() {
+        let body = json!({
+            "model": "claude",
+            "messages": [
+                {"role": "system", "content": "note",
+                 "output_config": {"effort": "xhigh"}},
+                {"role": "user", "content": "hi"},
+            ],
+            "max_tokens": 10
+        });
+        let ir = reader().read_request(&body).unwrap();
+        assert_eq!(ir.messages[0].extra.len(), 1, "消息级字段进 extra");
+        let rewritten = writer().write_request(&ir);
+        assert_eq!(
+            rewritten["messages"][0]["output_config"],
+            json!({"effort": "xhigh"}),
+            "消息级 extra 原样回写"
+        );
+    }
+
     #[test]
     fn read_request_tool_use_block() {
         let body = json!({
@@ -1268,7 +1424,9 @@ mod tests {
         let ir = reader().read_request(&body).unwrap();
         assert_eq!(ir.messages[0].content.len(), 1);
         match &ir.messages[0].content[0] {
-            IrBlock::ToolUse { id, name, input } => {
+            IrBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "toolu_abc");
                 assert_eq!(name, "search");
                 assert_eq!(input, &json!({"q": "rust"}));
@@ -1297,10 +1455,13 @@ mod tests {
                 tool_use_id,
                 content,
                 is_error,
-                content_form: _,
+                ..
             } => {
                 assert_eq!(tool_use_id, "toolu_abc");
-                assert_eq!(*is_error, false);
+                assert_eq!(
+                    *is_error, None,
+                    "is_error 缺席 → None (显式形态由 round-trip 锁定)"
+                );
                 assert_eq!(content.len(), 1);
             }
             other => panic!("expected ToolResult, got {other:?}"),
@@ -1384,7 +1545,7 @@ mod tests {
         assert_eq!(ir.usage.input_tokens, 10);
         assert_eq!(ir.usage.output_tokens, 5);
         match &ir.content[0] {
-            IrBlock::Text { text } => assert_eq!(text, "Hi there!"),
+            IrBlock::Text { text, .. } => assert_eq!(text, "Hi there!"),
             other => panic!("expected Text, got {other:?}"),
         }
     }
@@ -1417,10 +1578,14 @@ mod tests {
         let ir = IrRequest {
             system: vec![IrBlock::Text {
                 text: "Be helpful".into(),
+                extra: Default::default(),
             }],
             messages: vec![IrMessage {
                 role: IrRole::User,
-                content: vec![IrBlock::Text { text: "Hi".into() }],
+                content: vec![IrBlock::Text {
+                    text: "Hi".into(),
+                    extra: Default::default(),
+                }],
                 ..Default::default()
             }],
             model: "claude".into(),
@@ -1440,7 +1605,10 @@ mod tests {
         let ir = IrRequest {
             messages: vec![IrMessage {
                 role: IrRole::User,
-                content: vec![IrBlock::Text { text: "x".into() }],
+                content: vec![IrBlock::Text {
+                    text: "x".into(),
+                    extra: Default::default(),
+                }],
                 ..Default::default()
             }],
             model: "claude".into(),
@@ -1456,7 +1624,10 @@ mod tests {
         let ir = IrRequest {
             messages: vec![IrMessage {
                 role: IrRole::User,
-                content: vec![IrBlock::Text { text: "x".into() }],
+                content: vec![IrBlock::Text {
+                    text: "x".into(),
+                    extra: Default::default(),
+                }],
                 ..Default::default()
             }],
             model: "claude".into(),
@@ -1473,7 +1644,10 @@ mod tests {
         let ir = IrRequest {
             messages: vec![IrMessage {
                 role: IrRole::User,
-                content: vec![IrBlock::Text { text: "x".into() }],
+                content: vec![IrBlock::Text {
+                    text: "x".into(),
+                    extra: Default::default(),
+                }],
                 ..Default::default()
             }],
             model: "claude".into(),
@@ -1484,6 +1658,7 @@ mod tests {
                 name: "w".into(),
                 description: None,
                 input_schema: json!({"type": "object"}),
+                extra: Default::default(),
             }],
             ..Default::default()
         };
@@ -1499,7 +1674,10 @@ mod tests {
         let ir = IrRequest {
             messages: vec![IrMessage {
                 role: IrRole::User,
-                content: vec![IrBlock::Text { text: "x".into() }],
+                content: vec![IrBlock::Text {
+                    text: "x".into(),
+                    extra: Default::default(),
+                }],
                 ..Default::default()
             }],
             model: "claude".into(),
@@ -1520,7 +1698,10 @@ mod tests {
     #[test]
     fn write_response_envelope_shape() {
         let ir = IrResponse {
-            content: vec![IrBlock::Text { text: "Hi".into() }],
+            content: vec![IrBlock::Text {
+                text: "Hi".into(),
+                extra: Default::default(),
+            }],
             stop_reason: Some(IrStopReason::EndTurn),
             usage: IrUsage {
                 input_tokens: 10,
@@ -1545,7 +1726,10 @@ mod tests {
     #[test]
     fn write_response_synthesizes_id_when_missing() {
         let ir = IrResponse {
-            content: vec![IrBlock::Text { text: "Hi".into() }],
+            content: vec![IrBlock::Text {
+                text: "Hi".into(),
+                extra: Default::default(),
+            }],
             stop_reason: Some(IrStopReason::EndTurn),
             usage: IrUsage::default(),
             usage_present: false,
@@ -1724,7 +1908,7 @@ mod tests {
         });
         let ir = reader().read_request(&body).unwrap();
         match &ir.messages[0].content[0] {
-            IrBlock::Image { source } => match source {
+            IrBlock::Image { source, .. } => match source {
                 IrImageSource::Base64 { media_type, data } => {
                     assert_eq!(media_type, "image/png");
                     assert_eq!(data, "iVBORw0KGgo=");
@@ -1751,7 +1935,7 @@ mod tests {
         });
         let ir = reader().read_request(&body).unwrap();
         match &ir.messages[0].content[0] {
-            IrBlock::Image { source } => {
+            IrBlock::Image { source, .. } => {
                 assert_eq!(
                     source,
                     &IrImageSource::Url("https://example.com/dog.jpg".into())
@@ -1772,6 +1956,7 @@ mod tests {
                         media_type: "image/png".into(),
                         data: "abc==".into(),
                     },
+                    extra: Default::default(),
                 }],
                 ..Default::default()
             }],
@@ -1796,6 +1981,7 @@ mod tests {
                 role: IrRole::User,
                 content: vec![IrBlock::Image {
                     source: IrImageSource::Url("https://example.com/img.png".into()),
+                    extra: Default::default(),
                 }],
                 ..Default::default()
             }],

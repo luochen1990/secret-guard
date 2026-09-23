@@ -825,7 +825,7 @@ mod tests {
         let mid = scan.snapshot();
         assert_eq!(mid.content.len(), 1);
         match &mid.content[0] {
-            crate::codec::IrBlock::Text { text } => assert_eq!(text, "两者都可以"),
+            crate::codec::IrBlock::Text { text, .. } => assert_eq!(text, "两者都可以"),
             other => panic!("expected Text block, got {other:?}"),
         }
         // 流末尾: finish_reason + [DONE].
@@ -833,7 +833,7 @@ mod tests {
         scan.feed(b"data: [DONE]\n\n");
         let final_ir = scan.snapshot();
         match &final_ir.content[0] {
-            crate::codec::IrBlock::Text { text } => assert_eq!(text, "两者都可以工作"),
+            crate::codec::IrBlock::Text { text, .. } => assert_eq!(text, "两者都可以工作"),
             other => panic!("expected Text block, got {other:?}"),
         }
         assert_eq!(final_ir.model.as_deref(), Some("gpt-4"));
@@ -860,7 +860,7 @@ mod tests {
         scan.feed(b"lo\"}}]}\n\n");
         let ir = scan.snapshot();
         match &ir.content[0] {
-            crate::codec::IrBlock::Text { text } => assert_eq!(text, "hello"),
+            crate::codec::IrBlock::Text { text, .. } => assert_eq!(text, "hello"),
             other => panic!("expected Text, got {other:?}"),
         }
     }
@@ -883,7 +883,9 @@ mod tests {
         let ir = scan.snapshot();
         assert_eq!(ir.content.len(), 1, "should have one tool_use block");
         match &ir.content[0] {
-            crate::codec::IrBlock::ToolUse { id, name, input } => {
+            crate::codec::IrBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "call_1");
                 assert_eq!(name, "get_weather");
                 assert_eq!(input.get("city").and_then(|v| v.as_str()), Some("北京"));
@@ -919,7 +921,7 @@ mod tests {
         let ir = scan.snapshot();
         assert_eq!(ir.content.len(), 1);
         match &ir.content[0] {
-            crate::codec::IrBlock::Text { text } => assert_eq!(text, "你好世界"),
+            crate::codec::IrBlock::Text { text, .. } => assert_eq!(text, "你好世界"),
             other => panic!("expected Text, got {other:?}"),
         }
         assert_eq!(ir.model.as_deref(), Some("claude-3"));
@@ -1213,7 +1215,8 @@ mod tests {
                         "id":id,"object":"chat.completion.chunk","created":created,"model":model,
                         "choices":[{"index":0,"delta":{"content":format!(" {t2}")},"finish_reason":Value::Null}]
                     })));
-                    expected_blocks.push(IrBlock::Text { text: full_text });
+                    expected_blocks.push(IrBlock::Text { text: full_text,
+                extra: Default::default(), });
                     // 帧 3: tool_call 开始 (index=0, id+name, BlockStart{ToolUse}).
                     // 用 oai tool_calls[].index=0 (与 text 的 IR index 不同: text index 由
                     // next_free_block_index 分配, 无思考阶段时 text=1 tool=2; 有思考阶段
@@ -1278,6 +1281,7 @@ mod tests {
                         id: tc_id,
                         name: tool_name,
                         input: tool_input,
+                extra: Default::default(),
                     });
                     let expected = crate::codec::IrResponse {
                         content: expected_blocks,
@@ -1345,7 +1349,7 @@ mod tests {
             let got = scan.snapshot();
             let find_text = |blocks: &[crate::codec::IrBlock]| {
                 blocks.iter().find_map(|b| match b {
-                    crate::codec::IrBlock::Text { text } => Some(text.clone()),
+                    crate::codec::IrBlock::Text { text, .. } => Some(text.clone()),
                     _ => None,
                 })
             };
@@ -1370,7 +1374,7 @@ mod tests {
             let got = scan.snapshot();
             let find_tool = |blocks: &[crate::codec::IrBlock]| {
                 blocks.iter().find_map(|b| match b {
-                    crate::codec::IrBlock::ToolUse { id, name, input } => {
+                    crate::codec::IrBlock::ToolUse { id, name, input, .. } => {
                         Some((id.clone(), name.clone(), input.clone()))
                     }
                     _ => None,

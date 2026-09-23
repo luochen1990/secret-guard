@@ -9236,7 +9236,11 @@ async fn anthropic_messages_system_role_position_fidelity() {
         .collect();
     assert_eq!(sys_texts, vec!["agent intro"], "顶层 system 不混入提升内容");
     let stored_msgs = sent.get("messages").unwrap().as_array().unwrap();
-    assert_eq!(stored_msgs.len(), 2, "messages 全量保真 (system 条目不删减)");
+    assert_eq!(
+        stored_msgs.len(),
+        2,
+        "messages 全量保真 (system 条目不删减)"
+    );
     assert_eq!(stored_msgs[0]["role"], "system");
     assert_eq!(
         stored_msgs[0]["content"],

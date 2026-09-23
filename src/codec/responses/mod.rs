@@ -100,7 +100,10 @@ impl Reader for ResponsesReader {
                     if !s.is_empty() {
                         ir_messages.push(IrMessage {
                             role: IrRole::User,
-                            content: vec![IrBlock::Text { text: s.clone() }],
+                            content: vec![IrBlock::Text {
+                                text: s.clone(),
+                                extra: Default::default(),
+                            }],
                             contains_user_text: true,
                             ..Default::default()
                         });
@@ -335,12 +338,14 @@ impl Writer for ResponsesWriter {
         };
         for block in &resp.content {
             match block {
-                IrBlock::Text { text } => {
+                IrBlock::Text { text, .. } => {
                     if !text.is_empty() {
                         text_acc.push_str(text);
                     }
                 }
-                IrBlock::ToolUse { id, name, input } => {
+                IrBlock::ToolUse {
+                    id, name, input, ..
+                } => {
                     flush_text(&mut text_acc, &mut output);
                     output.push(json!({
                         "type": "function_call",
@@ -426,7 +431,10 @@ impl Writer for ResponsesWriter {
 /// 假设: instructions 主要是文本; 复杂形态降级为 Text 块.
 fn read_instructions(instr: &Value) -> Vec<IrBlock> {
     match instr {
-        Value::String(s) if !s.is_empty() => vec![IrBlock::Text { text: s.clone() }],
+        Value::String(s) if !s.is_empty() => vec![IrBlock::Text {
+            text: s.clone(),
+            extra: Default::default(),
+        }],
         Value::Array(arr) => arr
             .iter()
             .filter_map(|item| {
@@ -450,6 +458,7 @@ fn read_instructions(instr: &Value) -> Vec<IrBlock> {
                         } else {
                             Some(IrBlock::Text {
                                 text: texts.join("\n"),
+                                extra: Default::default(),
                             })
                         }
                     })
@@ -519,8 +528,9 @@ fn read_input_item(item: &Value) -> Option<Vec<IrMessage>> {
                 content: vec![IrBlock::ToolResult {
                     tool_use_id,
                     content,
-                    is_error: false,
+                    is_error: None, // Responses 协议无 is_error 概念
                     content_form: None,
+                    extra: Default::default(),
                 }],
                 ..Default::default()
             }])
@@ -551,7 +561,10 @@ fn read_message_content(content: Option<&Value>) -> Vec<IrBlock> {
             if s.is_empty() {
                 Vec::new()
             } else {
-                vec![IrBlock::Text { text: s.clone() }]
+                vec![IrBlock::Text {
+                    text: s.clone(),
+                    extra: Default::default(),
+                }]
             }
         }
         Value::Array(arr) => arr.iter().filter_map(read_content_part).collect(),
@@ -571,6 +584,7 @@ fn read_content_part(part: &Value) -> Option<IrBlock> {
             } else {
                 Some(IrBlock::Text {
                     text: text.to_string(),
+                    extra: Default::default(),
                 })
             }
         }
@@ -579,6 +593,7 @@ fn read_content_part(part: &Value) -> Option<IrBlock> {
             .and_then(Value::as_str)
             .map(|url| IrBlock::Image {
                 source: IrImageSource::Url(url.to_string()),
+                extra: Default::default(),
             }),
         "image_url" => {
             // OpenAI 风格 image_url (object {url: ...}).
@@ -587,6 +602,7 @@ fn read_content_part(part: &Value) -> Option<IrBlock> {
                 .and_then(Value::as_str)
                 .map(|url| IrBlock::Image {
                     source: IrImageSource::Url(url.to_string()),
+                    extra: Default::default(),
                 })
         }
         "refusal" => {
@@ -597,6 +613,7 @@ fn read_content_part(part: &Value) -> Option<IrBlock> {
             } else {
                 Some(IrBlock::Text {
                     text: text.to_string(),
+                    extra: Default::default(),
                 })
             }
         }
@@ -642,6 +659,7 @@ fn read_tool_def(tool: &Value) -> Option<IrTool> {
         name,
         description,
         input_schema,
+        extra: Default::default(),
     })
 }
 
@@ -756,7 +774,7 @@ fn read_output_item(item: &Value) -> Option<IrBlock> {
             let text: String = blocks
                 .iter()
                 .filter_map(|b| {
-                    if let IrBlock::Text { text } = b {
+                    if let IrBlock::Text { text, .. } = b {
                         Some(text.as_str())
                     } else {
                         None
@@ -767,7 +785,10 @@ fn read_output_item(item: &Value) -> Option<IrBlock> {
             if text.is_empty() {
                 None
             } else {
-                Some(IrBlock::Text { text })
+                Some(IrBlock::Text {
+                    text,
+                    extra: Default::default(),
+                })
             }
         }
         "function_call" => Some(read_function_call_block(obj)),
@@ -800,7 +821,12 @@ fn read_function_call_block(obj: &Map<String, Value>) -> IrBlock {
         .get("arguments")
         .and_then(|v| serde_json::from_str::<Value>(v.as_str().unwrap_or("null")).ok())
         .unwrap_or(Value::Null);
-    IrBlock::ToolUse { id, name, input }
+    IrBlock::ToolUse {
+        id,
+        name,
+        input,
+        extra: Default::default(),
+    }
 }
 
 /// 解析 reasoning item 的 summary → IrBlock::Reasoning (空 summary 返回 None).
@@ -829,7 +855,7 @@ fn write_input_items(msg: &IrMessage) -> Vec<Value> {
             let mut items = Vec::new();
             let mut content_parts: Vec<Value> = Vec::new();
             for b in &msg.content {
-                if let IrBlock::Text { text } = b
+                if let IrBlock::Text { text, .. } = b
                     && !text.is_empty()
                 {
                     content_parts.push(json!({"type": "input_text", "text": text}));
@@ -850,12 +876,12 @@ fn write_input_items(msg: &IrMessage) -> Vec<Value> {
             let mut content_parts: Vec<Value> = Vec::new();
             for b in &msg.content {
                 match b {
-                    IrBlock::Text { text } => {
+                    IrBlock::Text { text, .. } => {
                         if !text.is_empty() {
                             content_parts.push(json!({"type": "input_text", "text": text}));
                         }
                     }
-                    IrBlock::Image { source } => {
+                    IrBlock::Image { source, .. } => {
                         if let IrImageSource::Url(u) = source {
                             content_parts.push(json!({"type": "input_image", "image_url": u}));
                         }
@@ -876,7 +902,7 @@ fn write_input_items(msg: &IrMessage) -> Vec<Value> {
                             content_parts.clear();
                         }
                         let text = blocks_to_text(content);
-                        let output_val = if *is_error {
+                        let output_val = if is_error.unwrap_or(false) {
                             json!(format!("[error] {text}"))
                         } else {
                             Value::String(text)
@@ -921,12 +947,14 @@ fn write_input_items(msg: &IrMessage) -> Vec<Value> {
             };
             for b in &msg.content {
                 match b {
-                    IrBlock::Text { text } => {
+                    IrBlock::Text { text, .. } => {
                         if !text.is_empty() {
                             text_parts.push(json!({"type": "output_text", "text": text}));
                         }
                     }
-                    IrBlock::ToolUse { id, name, input } => {
+                    IrBlock::ToolUse {
+                        id, name, input, ..
+                    } => {
                         flush_text(&mut text_parts, &mut items);
                         items.push(json!({
                             "type": "function_call",
@@ -1098,7 +1126,7 @@ mod tests {
         assert_eq!(ir.messages.len(), 1);
         assert_eq!(ir.messages[0].role, IrRole::User);
         match &ir.messages[0].content[0] {
-            IrBlock::Text { text } => assert_eq!(text, "Hello"),
+            IrBlock::Text { text, .. } => assert_eq!(text, "Hello"),
             other => panic!("expected Text, got {other:?}"),
         }
     }
@@ -1118,7 +1146,9 @@ mod tests {
         assert_eq!(ir.messages.len(), 2);
         assert_eq!(ir.messages[1].role, IrRole::Assistant);
         match &ir.messages[1].content[0] {
-            IrBlock::ToolUse { id, name, input } => {
+            IrBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "call_1");
                 assert_eq!(name, "get_weather");
                 assert_eq!(input, &json!({"city": "SF"}));
@@ -1250,7 +1280,7 @@ mod tests {
         assert_eq!(ir.usage.input_tokens, 10);
         assert_eq!(ir.usage.output_tokens, 5);
         match &ir.content[0] {
-            IrBlock::Text { text } => assert_eq!(text, "Hi there!"),
+            IrBlock::Text { text, .. } => assert_eq!(text, "Hi there!"),
             other => panic!("expected Text, got {other:?}"),
         }
     }
@@ -1269,7 +1299,9 @@ mod tests {
         });
         let ir = reader().read_response(&body).unwrap();
         match &ir.content[0] {
-            IrBlock::ToolUse { id, name, input } => {
+            IrBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "call_1");
                 assert_eq!(name, "get_weather");
                 assert_eq!(input, &json!({"city": "SF"}));
@@ -1326,10 +1358,14 @@ mod tests {
         let ir = IrRequest {
             system: vec![IrBlock::Text {
                 text: "Be helpful".into(),
+                extra: Default::default(),
             }],
             messages: vec![IrMessage {
                 role: IrRole::User,
-                content: vec![IrBlock::Text { text: "Hi".into() }],
+                content: vec![IrBlock::Text {
+                    text: "Hi".into(),
+                    extra: Default::default(),
+                }],
                 contains_user_text: true,
                 ..Default::default()
             }],
@@ -1356,11 +1392,13 @@ mod tests {
                 content: vec![
                     IrBlock::Text {
                         text: "Let me check".into(),
+                        extra: Default::default(),
                     },
                     IrBlock::ToolUse {
                         id: "call_1".into(),
                         name: "search".into(),
                         input: json!({"q": "rust"}),
+                        extra: Default::default(),
                     },
                 ],
                 ..Default::default()
@@ -1388,9 +1426,11 @@ mod tests {
                     tool_use_id: "call_1".into(),
                     content: vec![IrBlock::Text {
                         text: "Sunny".into(),
+                        extra: Default::default(),
                     }],
-                    is_error: false,
+                    is_error: None,
                     content_form: None,
+                    extra: Default::default(),
                 }],
                 ..Default::default()
             }],
@@ -1410,7 +1450,10 @@ mod tests {
         let ir = IrRequest {
             messages: vec![IrMessage {
                 role: IrRole::User,
-                content: vec![IrBlock::Text { text: "x".into() }],
+                content: vec![IrBlock::Text {
+                    text: "x".into(),
+                    extra: Default::default(),
+                }],
                 contains_user_text: true,
                 ..Default::default()
             }],
@@ -1419,6 +1462,7 @@ mod tests {
                 name: "search".into(),
                 description: Some("Search".into()),
                 input_schema: json!({"type": "object"}),
+                extra: Default::default(),
             }],
             ..Default::default()
         };
@@ -1436,7 +1480,10 @@ mod tests {
     #[test]
     fn write_response_basic() {
         let ir = IrResponse {
-            content: vec![IrBlock::Text { text: "Hi".into() }],
+            content: vec![IrBlock::Text {
+                text: "Hi".into(),
+                extra: Default::default(),
+            }],
             stop_reason: Some(IrStopReason::EndTurn),
             usage: IrUsage {
                 input_tokens: 10,
@@ -1470,11 +1517,13 @@ mod tests {
             content: vec![
                 IrBlock::Text {
                     text: "Let me search".into(),
+                    extra: Default::default(),
                 },
                 IrBlock::ToolUse {
                     id: "call_1".into(),
                     name: "search".into(),
                     input: json!({"q": "rust"}),
+                    extra: Default::default(),
                 },
             ],
             stop_reason: Some(IrStopReason::ToolUse),
@@ -1504,6 +1553,7 @@ mod tests {
         let ir = IrResponse {
             content: vec![IrBlock::Text {
                 text: "done".into(),
+                extra: Default::default(),
             }],
             stop_reason: Some(IrStopReason::Other),
             usage: IrUsage::default(),
@@ -1520,7 +1570,10 @@ mod tests {
     #[test]
     fn write_response_synthesizes_id_when_missing() {
         let ir = IrResponse {
-            content: vec![IrBlock::Text { text: "Hi".into() }],
+            content: vec![IrBlock::Text {
+                text: "Hi".into(),
+                extra: Default::default(),
+            }],
             stop_reason: Some(IrStopReason::EndTurn),
             usage: IrUsage::default(),
             usage_present: false,

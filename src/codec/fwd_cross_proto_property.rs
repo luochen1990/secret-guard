@@ -280,7 +280,7 @@ fn assert_modeled_fields_equivalent(
         .system
         .iter()
         .filter_map(|b| match b {
-            IrBlock::Text { text } => Some(text.as_str()),
+            IrBlock::Text { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect();
@@ -288,7 +288,7 @@ fn assert_modeled_fields_equivalent(
         .system
         .iter()
         .filter_map(|b| match b {
-            IrBlock::Text { text } => Some(text.as_str()),
+            IrBlock::Text { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect();
@@ -326,7 +326,7 @@ fn assert_modeled_fields_equivalent(
         );
         for (j, (b_in, b_out)) in m_in.content.iter().zip(m_out.content.iter()).enumerate() {
             match (b_in, b_out) {
-                (IrBlock::Text { text: t_in }, IrBlock::Text { text: t_out }) => {
+                (IrBlock::Text { text: t_in, .. }, IrBlock::Text { text: t_out, .. }) => {
                     assert_eq!(
                         t_in, t_out,
                         "{direction}: messages[{i}].content[{j}] Text 损失",
@@ -337,11 +337,13 @@ fn assert_modeled_fields_equivalent(
                         id: id_in,
                         name: n_in,
                         input: v_in,
+                        ..
                     },
                     IrBlock::ToolUse {
                         id: id_out,
                         name: n_out,
                         input: v_out,
+                        ..
                     },
                 ) => {
                     assert_eq!(
@@ -384,14 +386,14 @@ fn assert_modeled_fields_equivalent(
                     let in_texts: Vec<String> = c_in
                         .iter()
                         .filter_map(|b| match b {
-                            IrBlock::Text { text } => Some(text.clone()),
+                            IrBlock::Text { text, .. } => Some(text.clone()),
                             _ => None,
                         })
                         .collect();
                     let out_texts: Vec<String> = c_out
                         .iter()
                         .filter_map(|b| match b {
-                            IrBlock::Text { text } => Some(text.clone()),
+                            IrBlock::Text { text, .. } => Some(text.clone()),
                             _ => None,
                         })
                         .collect();

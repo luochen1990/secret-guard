@@ -1076,6 +1076,7 @@ fn arb_responses_sse_stream_with_mock()
                     ));
                     expected_blocks.push(IrBlock::Text {
                         text: full_text.clone(),
+                extra: Default::default(),
                     });
                 }
                 // done 族全量帧 (text="" 时也发 — 覆盖空内容 block 的关闭路径;
@@ -1144,6 +1145,7 @@ fn arb_responses_sse_stream_with_mock()
                     id: call_id,
                     name: tool_name,
                     input: tool_input,
+                extra: Default::default(),
                 });
 
                 // 终止: response.completed (usage 可选; has_usage=false 时 null —

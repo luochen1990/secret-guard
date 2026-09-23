@@ -141,6 +141,7 @@ fn make_ir_with_secrets(target_bytes: usize, secrets: &[SecretEntry]) -> IrReque
                 role: IrRole::User,
                 content: vec![IrBlock::Text {
                     text: format!("{padding} auth_token={secret} end_marker_{i}"),
+                    extra: Default::default(),
                 }],
                 ..Default::default()
             }
@@ -219,7 +220,7 @@ fn bench_redact_ir(c: &mut Criterion) {
                 m.content
                     .iter()
                     .map(|b| match b {
-                        IrBlock::Text { text } => text.len(),
+                        IrBlock::Text { text, .. } => text.len(),
                         _ => 0,
                     })
                     .sum::<usize>()

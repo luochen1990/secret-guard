@@ -778,6 +778,7 @@ mod tests {
             role: IrRole::User,
             content: vec![IrBlock::Text {
                 text: "hi".to_string(),
+                extra: Default::default(),
             }],
             ..Default::default()
         }];

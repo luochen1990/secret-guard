@@ -589,6 +589,7 @@ mod tests {
             role,
             content: vec![IrBlock::Text {
                 text: text.to_string(),
+                extra: Default::default(),
             }],
             ..Default::default()
         }
@@ -771,7 +772,10 @@ mod tests {
         let _id_c = dag.push_messages(vec![text_msg(IrRole::User, "c")], dummy_event());
 
         let g = dag.inner.read();
-        let sys_hash = super::pool::hash_block(&IrBlock::Text { text: "sys".into() });
+        let sys_hash = super::pool::hash_block(&IrBlock::Text {
+            text: "sys".into(),
+            extra: Default::default(),
+        });
         // A 已被淘汰 (释放了它持有的 sys refcount). B 不持有 sys (前缀已释放).
         // C 不含 sys. 所以 sys 应被完全 GC.
         let sys_refcount = g.blocks.refcount.get(&sys_hash).copied().unwrap_or(0);
@@ -1279,8 +1283,10 @@ mod tests {
                 tool_use_id: "call_1".to_string(),
                 content: vec![IrBlock::Text {
                     text: "result".to_string(),
+                    extra: Default::default(),
                 }],
-                is_error: false,
+                extra: Default::default(),
+                is_error: None,
                 content_form: None,
             }],
             ..Default::default()
@@ -1334,6 +1340,7 @@ mod tests {
                 id: "call_1".to_string(),
                 name: name.to_string(),
                 input: serde_json::json!({}),
+                extra: Default::default(),
             }],
             ..Default::default()
         }
@@ -1998,7 +2005,10 @@ mod tests {
     fn arb_text_message() -> impl Strategy<Value = IrMessage> {
         (arb_role(), "[a-z0-9 ]{1,20}").prop_map(|(role, text)| IrMessage {
             role,
-            content: vec![IrBlock::Text { text }],
+            content: vec![IrBlock::Text {
+                text,
+                extra: Default::default(),
+            }],
             ..Default::default()
         })
     }
@@ -2085,7 +2095,8 @@ mod tests {
             for (role, text) in &ops {
                 let msg = IrMessage {
                     role: *role,
-                    content: vec![IrBlock::Text { text: text.clone() }],
+                    content: vec![IrBlock::Text { text: text.clone(),
+                extra: Default::default(), }],
                     ..Default::default()
                 };
                 // 不 panic 即通过 (push 内含淘汰 + GC cascade).
@@ -2124,7 +2135,8 @@ mod tests {
             let mut pool = BlockPool::default();
             let msg = IrMessage {
                 role,
-                content: vec![IrBlock::Text { text: text.clone() }],
+                content: vec![IrBlock::Text { text: text.clone(),
+                extra: Default::default(), }],
                 ..Default::default()
             };
             // 同一 message intern 两次 → 同一 MessageRef (role + 相同 blocks hash).
@@ -2186,7 +2198,10 @@ mod tests {
                     system: vec![],
                     messages: vec![IrMessage {
                         role: IrRole::User,
-                        content: vec![IrBlock::Text { text }],
+                        content: vec![IrBlock::Text {
+                            text,
+                            extra: Default::default(),
+                        }],
                         ..Default::default()
                     }],
                     model: "test-model".to_string(),

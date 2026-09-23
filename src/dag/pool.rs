@@ -55,15 +55,39 @@ pub type BlockHash = u64;
 /// `MessageRef::hash` 已直接 hash `Vec<BlockHash>` (u64) 而非重调本函数, Merkle
 /// 累积路径 (`find_parent` / `accumulate_hash`) 不重复 walk block 内容.
 /// profiling 与 follow-up 选项见 AGENTS.md "已知搁置".
+/// block 级 `extra` (Map<String, Value>, #269) 参与内容寻址: 两个仅差
+/// cache_control 的 block 必须是不同池条目 (intern 正确性前提).
+/// canonical 依赖同 `input`: serde_json 无 preserve_order 时 key 有序.
+fn hash_extra(
+    extra: &serde_json::Map<String, serde_json::Value>,
+    h: &mut std::collections::hash_map::DefaultHasher,
+) {
+    use std::hash::Hash;
+    if extra.is_empty() {
+        // 空与 "无字段" 同哈希: 语义等价 (空 Map 是填充默认, 非信息).
+        0u8.hash(h);
+        return;
+    }
+    1u8.hash(h);
+    let s = serde_json::to_string(extra).unwrap_or_default();
+    s.hash(h);
+}
+
 pub(super) fn hash_block(block: &IrBlock) -> BlockHash {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     std::mem::discriminant(block).hash(&mut h);
     match block {
-        IrBlock::Text { text } => {
+        IrBlock::Text { text, extra } => {
             text.hash(&mut h);
+            hash_extra(extra, &mut h);
         }
-        IrBlock::ToolUse { id, name, input } => {
+        IrBlock::ToolUse {
+            id,
+            name,
+            input,
+            extra,
+        } => {
             id.hash(&mut h);
             name.hash(&mut h);
             // serde_json::Value 不 impl Hash; 用 canonical JSON string 做 hash.
@@ -71,28 +95,36 @@ pub(super) fn hash_block(block: &IrBlock) -> BlockHash {
             // key 按字母排序 → canonical. 若未来启用 preserve_order, 需改手动 canonical 序列化.
             let input_str = serde_json::to_string(input).unwrap_or_default();
             input_str.hash(&mut h);
+            hash_extra(extra, &mut h);
         }
         IrBlock::ToolResult {
             tool_use_id,
             content,
             is_error,
             content_form: _,
+            extra,
         } => {
             tool_use_id.hash(&mut h);
+            // Option<bool> 参与 hash: None (缺席) 与 Some(false) (显式) 是不同 wire 形态,
+            // intern 必须区分 (#269 is_error 保真).
             is_error.hash(&mut h);
             for c in content {
                 hash_block(c).hash(&mut h);
             }
+            hash_extra(extra, &mut h);
         }
-        IrBlock::Image { source } => match source {
-            IrImageSource::Base64 { media_type, data } => {
-                media_type.hash(&mut h);
-                data.hash(&mut h);
+        IrBlock::Image { source, extra } => {
+            match source {
+                IrImageSource::Base64 { media_type, data } => {
+                    media_type.hash(&mut h);
+                    data.hash(&mut h);
+                }
+                IrImageSource::Url(url) => {
+                    url.hash(&mut h);
+                }
             }
-            IrImageSource::Url(url) => {
-                url.hash(&mut h);
-            }
-        },
+            hash_extra(extra, &mut h);
+        }
         IrBlock::Reasoning { summary } => {
             for s in summary {
                 s.hash(&mut h);
@@ -238,6 +270,7 @@ mod tests {
         let mut pool = BlockPool::default();
         let b = IrBlock::Text {
             text: "hello".to_string(),
+            extra: Default::default(),
         };
         let h1 = pool.intern(b.clone());
         let h2 = pool.intern(b.clone());
@@ -251,6 +284,7 @@ mod tests {
         let mut pool = BlockPool::default();
         let b = IrBlock::Text {
             text: "hello".to_string(),
+            extra: Default::default(),
         };
         let h = pool.intern(b);
         assert_eq!(pool.len(), 1);
@@ -265,6 +299,7 @@ mod tests {
         let mut pool = BlockPool::default();
         let b = IrBlock::Text {
             text: "hello".to_string(),
+            extra: Default::default(),
         };
         let h = pool.intern(b);
         pool.release(h);
@@ -287,9 +322,11 @@ mod tests {
             content: vec![
                 IrBlock::Text {
                     text: "a".to_string(),
+                    extra: Default::default(),
                 },
                 IrBlock::Text {
                     text: "b".to_string(),
+                    extra: Default::default(),
                 },
             ],
             ..Default::default()
@@ -307,6 +344,7 @@ mod tests {
             role: IrRole::Assistant,
             content: vec![IrBlock::Text {
                 text: "hi".to_string(),
+                extra: Default::default(),
             }],
             ..Default::default()
         };
@@ -315,7 +353,7 @@ mod tests {
         assert_eq!(resolved.role, IrRole::Assistant);
         assert_eq!(resolved.content.len(), 1);
         match &resolved.content[0] {
-            IrBlock::Text { text } => assert_eq!(text, "hi"),
+            IrBlock::Text { text, .. } => assert_eq!(text, "hi"),
             other => panic!("expected Text, got {other:?}"),
         }
     }
@@ -326,6 +364,7 @@ mod tests {
         let mut pool = BlockPool::default();
         let shared = IrBlock::Text {
             text: "shared".to_string(),
+            extra: Default::default(),
         };
         let m1 = IrMessage {
             role: IrRole::User,
@@ -357,11 +396,14 @@ mod tests {
             id: "call_1".to_string(),
             name: "read_file".to_string(),
             input: input.clone(),
+            extra: Default::default(),
         };
         let h = pool.intern(block.clone());
         let got = pool.get(h).expect("interned");
         match &*got {
-            IrBlock::ToolUse { id, name, input: i } => {
+            IrBlock::ToolUse {
+                id, name, input: i, ..
+            } => {
                 assert_eq!(id, "call_1");
                 assert_eq!(name, "read_file");
                 assert_eq!(i, &input);
@@ -378,11 +420,13 @@ mod tests {
             id: "x".into(),
             name: "n".into(),
             input: input.clone(),
+            extra: Default::default(),
         };
         let b2 = IrBlock::ToolUse {
             id: "x".into(),
             name: "n".into(),
             input,
+            extra: Default::default(),
         };
         let h1 = pool.intern(b1);
         let h2 = pool.intern(b2);
@@ -398,11 +442,13 @@ mod tests {
             id: "x".into(),
             name: "n".into(),
             input: serde_json::json!({"a": 1, "b": 2}),
+            extra: Default::default(),
         };
         let b2 = IrBlock::ToolUse {
             id: "x".into(),
             name: "n".into(),
             input: serde_json::json!({"b": 2, "a": 1}),
+            extra: Default::default(),
         };
         let h1 = pool.intern(b1);
         let h2 = pool.intern(b2);
@@ -416,11 +462,13 @@ mod tests {
             id: "x".into(),
             name: "n".into(),
             input: serde_json::json!({"k": 1}),
+            extra: Default::default(),
         };
         let b2 = IrBlock::ToolUse {
             id: "x".into(),
             name: "n".into(),
             input: serde_json::json!({"k": 2}),
+            extra: Default::default(),
         };
         let h1 = pool.intern(b1);
         let h2 = pool.intern(b2);
@@ -434,9 +482,11 @@ mod tests {
             tool_use_id: "call_1".to_string(),
             content: vec![IrBlock::Text {
                 text: "result".to_string(),
+                extra: Default::default(),
             }],
-            is_error: false,
+            is_error: None,
             content_form: None,
+            extra: Default::default(),
         };
         let h = pool.intern(block.clone());
         let got = pool.get(h).expect("interned");
@@ -448,7 +498,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(tool_use_id, "call_1");
-                assert!(!is_error);
+                assert_eq!(is_error, &None);
                 assert_eq!(content.len(), 1);
             }
             other => panic!("expected ToolResult, got {other:?}"),
@@ -466,9 +516,11 @@ mod tests {
                 id: "child_call".to_string(),
                 name: "parse".to_string(),
                 input: serde_json::json!({"raw": "data"}),
+                extra: Default::default(),
             }],
-            is_error: false,
+            is_error: None,
             content_form: None,
+            extra: Default::default(),
         };
         let h = pool.intern(nested.clone());
         let resolved = pool.get(h).expect("interned");
@@ -480,9 +532,13 @@ mod tests {
         let mut pool = BlockPool::default();
         let mk = |err: bool| IrBlock::ToolResult {
             tool_use_id: "c".into(),
-            content: vec![IrBlock::Text { text: "x".into() }],
-            is_error: err,
+            content: vec![IrBlock::Text {
+                text: "x".into(),
+                extra: Default::default(),
+            }],
+            is_error: Some(err),
             content_form: None,
+            extra: Default::default(),
         };
         let h_ok = pool.intern(mk(false));
         let h_err = pool.intern(mk(true));
@@ -496,12 +552,14 @@ mod tests {
         let mut pool = BlockPool::default();
         let child = IrBlock::Text {
             text: "child".into(),
+            extra: Default::default(),
         };
         let parent = IrBlock::ToolResult {
             tool_use_id: "c1".into(),
             content: vec![child],
-            is_error: false,
+            is_error: None,
             content_form: None,
+            extra: Default::default(),
         };
         let _h = pool.intern(parent);
         assert_eq!(pool.len(), 1, "嵌套子 block 不单独入池 (顶层原子单元)");
@@ -515,12 +573,14 @@ mod tests {
                 media_type: "image/png".to_string(),
                 data: "iVBORw0KGgo=".to_string(),
             },
+            extra: Default::default(),
         };
         let h = pool.intern(block);
         let got = pool.get(h).expect("interned");
         match &*got {
             IrBlock::Image {
                 source: IrImageSource::Base64 { media_type, data },
+                ..
             } => {
                 assert_eq!(media_type, "image/png");
                 assert_eq!(data, "iVBORw0KGgo=");
@@ -534,12 +594,14 @@ mod tests {
         let mut pool = BlockPool::default();
         let block = IrBlock::Image {
             source: IrImageSource::Url("https://example.com/x.png".to_string()),
+            extra: Default::default(),
         };
         let h = pool.intern(block);
         let got = pool.get(h).expect("interned");
         match &*got {
             IrBlock::Image {
                 source: IrImageSource::Url(u),
+                ..
             } => assert_eq!(u, "https://example.com/x.png"),
             other => panic!("expected Image Url, got {other:?}"),
         }
@@ -553,9 +615,11 @@ mod tests {
                 media_type: "image/png".into(),
                 data: "data".into(),
             },
+            extra: Default::default(),
         };
         let b2 = IrBlock::Image {
             source: IrImageSource::Url("data".into()),
+            extra: Default::default(),
         };
         let h1 = pool.intern(b1);
         let h2 = pool.intern(b2);
@@ -566,11 +630,15 @@ mod tests {
     fn dag_block_cross_variant_no_collision() {
         // 不同 variant 的 block 即便字段值相同 (例如 Text "x" vs ToolUse id="x"), hash 必须不同.
         let mut pool = BlockPool::default();
-        let text = IrBlock::Text { text: "x".into() };
+        let text = IrBlock::Text {
+            text: "x".into(),
+            extra: Default::default(),
+        };
         let tool = IrBlock::ToolUse {
             id: "x".into(),
             name: "x".into(),
             input: serde_json::json!("x"),
+            extra: Default::default(),
         };
         let ht = pool.intern(text);
         let hu = pool.intern(tool);
@@ -585,11 +653,13 @@ mod tests {
             content: vec![
                 IrBlock::Text {
                     text: "thinking".into(),
+                    extra: Default::default(),
                 },
                 IrBlock::ToolUse {
                     id: "c1".into(),
                     name: "do".into(),
                     input: serde_json::json!({"x": 1}),
+                    extra: Default::default(),
                 },
             ],
             ..Default::default()
@@ -598,7 +668,7 @@ mod tests {
         let resolved = pool.resolve_message(&r).expect("should resolve");
         assert_eq!(resolved.content.len(), 2);
         match &resolved.content[0] {
-            IrBlock::Text { text } => assert_eq!(text, "thinking"),
+            IrBlock::Text { text, .. } => assert_eq!(text, "thinking"),
             other => panic!("expected Text, got {other:?}"),
         }
     }

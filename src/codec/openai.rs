@@ -119,8 +119,9 @@ impl Reader for OpenAiReader {
                         content: vec![IrBlock::ToolResult {
                             tool_use_id,
                             content: blocks,
-                            is_error: false,
+                            is_error: None,     // OpenAI tool message 无 is_error 概念
                             content_form: None, // OpenAI tool message content 总是 string
+                            extra: Default::default(),
                         }],
                         ..Default::default()
                     });
@@ -144,6 +145,8 @@ impl Reader for OpenAiReader {
                 content: blocks,
                 content_form,
                 reasoning_content_form,
+                // OpenAI codec 暂不收集消息级 extra (M1 范围 = Anthropic codec, #269).
+                extra: Default::default(),
             };
             if role == IrRole::System {
                 // 提升到 system.
@@ -341,10 +344,10 @@ impl Writer for OpenAiWriter {
                         tool_use_id,
                         content,
                         is_error,
-                        content_form: _,
+                        ..
                     } = b
                     {
-                        let text = if *is_error {
+                        let text = if is_error.unwrap_or(false) {
                             format!("[error] {}", blocks_to_text(content))
                         } else {
                             blocks_to_text(content)
@@ -423,10 +426,12 @@ impl Writer for OpenAiWriter {
         let mut tool_calls: Vec<Value> = Vec::new();
         for block in &resp.content {
             match block {
-                IrBlock::Text { text } => {
+                IrBlock::Text { text, .. } => {
                     content_parts.push(Value::String(text.clone()));
                 }
-                IrBlock::ToolUse { id, name, input } => {
+                IrBlock::ToolUse {
+                    id, name, input, ..
+                } => {
                     tool_calls.push(json!({
                         "id": id,
                         "type": "function",
@@ -641,7 +646,10 @@ fn read_openai_content(content: Option<&Value>) -> Vec<IrBlock> {
             if s.is_empty() {
                 Vec::new()
             } else {
-                vec![IrBlock::Text { text: s.clone() }]
+                vec![IrBlock::Text {
+                    text: s.clone(),
+                    extra: Default::default(),
+                }]
             }
         }
         Value::Array(arr) => arr.iter().filter_map(read_content_part).collect(),
@@ -666,6 +674,7 @@ fn read_content_part(part: &Value) -> Option<IrBlock> {
         }
         return Some(IrBlock::Text {
             text: s.to_string(),
+            extra: Default::default(),
         });
     }
     let part = part.as_object()?;
@@ -678,6 +687,7 @@ fn read_content_part(part: &Value) -> Option<IrBlock> {
             } else {
                 Some(IrBlock::Text {
                     text: text.to_string(),
+                    extra: Default::default(),
                 })
             }
         }
@@ -688,6 +698,7 @@ fn read_content_part(part: &Value) -> Option<IrBlock> {
                 .and_then(Value::as_str)?;
             Some(IrBlock::Image {
                 source: parse_image_url(url),
+                extra: Default::default(),
             })
         }
         _ => None, // 未知类型 (audio 等), 静默 drop.
@@ -715,7 +726,12 @@ fn read_tool_call(tc: &Value) -> Option<IrBlock> {
     if name.is_empty() {
         None
     } else {
-        Some(IrBlock::ToolUse { id, name, input })
+        Some(IrBlock::ToolUse {
+            id,
+            name,
+            input,
+            extra: Default::default(),
+        })
     }
 }
 
@@ -774,6 +790,7 @@ fn read_tool_def(tool: &Value) -> Option<IrTool> {
         name,
         description,
         input_schema,
+        extra: Default::default(),
     })
 }
 
@@ -1108,7 +1125,7 @@ fn write_message(msg: &IrMessage) -> Value {
             //   - Array / 其他            → array
             //   - None (内部构造 / 跨协议) → 按默认约定 (单文本 string, 多块 array)
             let single_text: Option<&String> = match msg.content.as_slice() {
-                [IrBlock::Text { text }] => Some(text),
+                [IrBlock::Text { text, .. }] => Some(text),
                 _ => None,
             };
 
@@ -1142,7 +1159,7 @@ fn write_message(msg: &IrMessage) -> Value {
             let mut reasoning_content: Option<String> = None;
             for b in &msg.content {
                 match b {
-                    IrBlock::Text { text } => {
+                    IrBlock::Text { text, .. } => {
                         if !text.is_empty() {
                             content_parts.push(Value::String(text.clone()));
                         }
@@ -1152,7 +1169,9 @@ fn write_message(msg: &IrMessage) -> Value {
                             reasoning_content = Some(text.clone());
                         }
                     }
-                    IrBlock::ToolUse { id, name, input } => {
+                    IrBlock::ToolUse {
+                        id, name, input, ..
+                    } => {
                         tool_calls.push(json!({
                             "id": id,
                             "type": "function",
@@ -1214,14 +1233,14 @@ fn write_message(msg: &IrMessage) -> Value {
 /// 写 user 消息的 block (text / image / tool_result).
 fn write_user_block(b: &IrBlock) -> Option<Value> {
     match b {
-        IrBlock::Text { text } => {
+        IrBlock::Text { text, .. } => {
             if text.is_empty() {
                 None
             } else {
                 Some(json!({"type": "text", "text": text}))
             }
         }
-        IrBlock::Image { source } => {
+        IrBlock::Image { source, .. } => {
             let url = match source {
                 IrImageSource::Url(u) => u.clone(),
                 IrImageSource::Base64 { media_type, data } => {
@@ -1237,12 +1256,12 @@ fn write_user_block(b: &IrBlock) -> Option<Value> {
             tool_use_id,
             content,
             is_error,
-            content_form: _,
+            ..
         } => {
             // OpenAI 的 tool 消息必须独立成一条, 但 caller 可能把它放在 user 消息内
             // (跨协议从 Anthropic 来的). 这里退化为 text 内容, 配合 write_message 的 Tool 分支
             // 通常不会走到这里.
-            let text = if *is_error {
+            let text = if is_error.unwrap_or(false) {
                 format!("[error] {}", blocks_to_text(content))
             } else {
                 blocks_to_text(content)
@@ -1460,7 +1479,9 @@ mod tests {
         assert_eq!(ir.messages.len(), 1);
         assert_eq!(ir.messages[0].content.len(), 1);
         match &ir.messages[0].content[0] {
-            IrBlock::ToolUse { id, name, input } => {
+            IrBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "call_abc");
                 assert_eq!(name, "get_weather");
                 assert_eq!(input, &json!({"city": "SF"}));
@@ -1523,7 +1544,7 @@ mod tests {
         assert_eq!(ir.usage.output_tokens, 5);
         assert_eq!(ir.usage.cache_read_input_tokens, None);
         match &ir.content[0] {
-            IrBlock::Text { text } => assert_eq!(text, "Hello!"),
+            IrBlock::Text { text, .. } => assert_eq!(text, "Hello!"),
             other => panic!("expected Text, got {other:?}"),
         }
     }
@@ -1597,10 +1618,14 @@ mod tests {
         let ir = IrRequest {
             system: vec![IrBlock::Text {
                 text: "Be nice".into(),
+                extra: Default::default(),
             }],
             messages: vec![IrMessage {
                 role: IrRole::User,
-                content: vec![IrBlock::Text { text: "Hi".into() }],
+                content: vec![IrBlock::Text {
+                    text: "Hi".into(),
+                    extra: Default::default(),
+                }],
                 ..Default::default()
             }],
             model: "gpt-4o".into(),
@@ -1620,7 +1645,10 @@ mod tests {
         let ir = IrRequest {
             messages: vec![IrMessage {
                 role: IrRole::User,
-                content: vec![IrBlock::Text { text: "x".into() }],
+                content: vec![IrBlock::Text {
+                    text: "x".into(),
+                    extra: Default::default(),
+                }],
                 ..Default::default()
             }],
             model: "gpt-4o".into(),
@@ -1639,7 +1667,10 @@ mod tests {
     #[test]
     fn write_response_prompt_tokens_adds_cached_back() {
         let ir = IrResponse {
-            content: vec![IrBlock::Text { text: "hi".into() }],
+            content: vec![IrBlock::Text {
+                text: "hi".into(),
+                extra: Default::default(),
+            }],
             stop_reason: Some(IrStopReason::EndTurn),
             usage: IrUsage {
                 input_tokens: 70,
@@ -1740,7 +1771,7 @@ mod tests {
             );
             for (j, (ab, bb)) in am.content.iter().zip(bm.content.iter()).enumerate() {
                 match (ab, bb) {
-                    (IrBlock::Text { text: at }, IrBlock::Text { text: bt }) => {
+                    (IrBlock::Text { text: at, .. }, IrBlock::Text { text: bt, .. }) => {
                         assert_eq!(at, bt, "{ctx}: msg[{i}].block[{j}] text");
                     }
                     (
@@ -1748,11 +1779,13 @@ mod tests {
                             id: aid,
                             name: an,
                             input: ain,
+                            ..
                         },
                         IrBlock::ToolUse {
                             id: bid,
                             name: bn,
                             input: bin,
+                            ..
                         },
                     ) => {
                         assert_eq!(aid, bid, "{ctx}: msg[{i}].block[{j}] tool id");
@@ -1906,7 +1939,9 @@ mod tests {
         // 专门验证 ToolUse id 透传 (断裂会导致 tool_result 关联失败).
         let asst_ir3 = &ir3.messages[1];
         match &asst_ir3.content[0] {
-            IrBlock::ToolUse { id, name, input } => {
+            IrBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "call_42", "tool_use id must be verbatim preserved");
                 assert_eq!(name, "get_weather");
                 assert_eq!(input, &json!({"city": "SF"}));
@@ -1923,7 +1958,7 @@ mod tests {
                 assert_eq!(tool_use_id, "call_42");
                 assert_eq!(content.len(), 1);
                 match &content[0] {
-                    IrBlock::Text { text } => assert_eq!(text, "Sunny, 20C"),
+                    IrBlock::Text { text, .. } => assert_eq!(text, "Sunny, 20C"),
                     other => panic!("expected Text in tool_result content, got {other:?}"),
                 }
             }
@@ -2274,7 +2309,7 @@ mod tests {
         let ir = reader().read_request(&body).unwrap();
         assert_eq!(ir.messages[0].content.len(), 2);
         match &ir.messages[0].content[1] {
-            IrBlock::Image { source } => {
+            IrBlock::Image { source, .. } => {
                 assert_eq!(
                     source,
                     &IrImageSource::Url("https://example.com/cat.png".into())
@@ -2299,7 +2334,7 @@ mod tests {
         });
         let ir = reader().read_request(&body).unwrap();
         match &ir.messages[0].content[0] {
-            IrBlock::Image { source } => match source {
+            IrBlock::Image { source, .. } => match source {
                 IrImageSource::Base64 { media_type, data } => {
                     assert_eq!(media_type, "image/png");
                     assert_eq!(data, "iVBORw0KGgo=");
@@ -2319,9 +2354,11 @@ mod tests {
                 content: vec![
                     IrBlock::Text {
                         text: "what is this?".into(),
+                        extra: Default::default(),
                     },
                     IrBlock::Image {
                         source: IrImageSource::Url("https://example.com/cat.png".into()),
+                        extra: Default::default(),
                     },
                 ],
                 ..Default::default()
@@ -2353,6 +2390,7 @@ mod tests {
                         media_type: "image/jpeg".into(),
                         data: "abc123".into(),
                     },
+                    extra: Default::default(),
                 }],
                 ..Default::default()
             }],
@@ -2396,7 +2434,7 @@ mod tests {
         ));
         assert!(matches!(
             &ir.content[1],
-            IrBlock::Text { text } if text == "the answer is 3"
+            IrBlock::Text { text, .. } if text == "the answer is 3"
         ));
     }
 
@@ -2410,6 +2448,7 @@ mod tests {
                 },
                 IrBlock::Text {
                     text: "answer".into(),
+                    extra: Default::default(),
                 },
             ],
             stop_reason: Some(IrStopReason::EndTurn),

@@ -407,17 +407,74 @@ fn arb_anthropic_request_value() -> impl Strategy<Value = Value> {
         "[a-z0-9-]{3,15}",
         prop::collection::vec(arb_anthropic_message(), 1..4),
         arb_max_tokens_opt(),
+        // 顶层 system: 缺席 / string / array (array block 可带 cache_control, #269).
+        prop::option::of(prop_oneof![
+            "[a-z ]{1,30}".prop_map(|s| json!(s)),
+            prop::collection::vec(arb_anthropic_system_block(), 1..3)
+                .prop_map(|blocks| json!(blocks)),
+        ]),
+        // tools: 缺席 / 工具数组 (工具可带 cache_control / defer_loading 等 extra, #269).
+        prop::option::of(prop::collection::vec(arb_anthropic_tool_def(), 1..2)),
     )
-        .prop_map(|(model, messages, max_tokens)| {
+        .prop_map(|(model, messages, max_tokens, system, tools)| {
             let mut req = serde_json::Map::new();
             req.insert("model".to_string(), json!(model));
             req.insert("messages".to_string(), Value::Array(messages));
             req.insert("max_tokens".to_string(), json!(max_tokens.unwrap_or(100)));
+            if let Some(system) = system {
+                req.insert("system".to_string(), system);
+            }
+            if let Some(tools) = tools {
+                req.insert("tools".to_string(), Value::Array(tools));
+            }
             Value::Object(req)
         })
 }
 
-fn arb_anthropic_message() -> impl Strategy<Value = Value> {
+/// 顶层 system array 的 block (text + 可选 cache_control).
+fn arb_anthropic_system_block() -> impl Strategy<Value = Value> {
+    ("[a-z ]{1,30}", prop::option::of(arb_cache_control())).prop_map(|(s, cc)| {
+        let mut b = json!({"type": "text", "text": s});
+        if let Some(cc) = cc {
+            b["cache_control"] = cc;
+        }
+        b
+    })
+}
+
+/// Anthropic 工具定义 (含 L5 工具级 extra: cache_control / defer_loading, #269).
+fn arb_anthropic_tool_def() -> impl Strategy<Value = Value> {
+    (
+        "[a-z]{3,10}",
+        "[a-z ]{1,30}",
+        prop::option::of(arb_cache_control()),
+        prop::option::of(Just(true)),
+    )
+        .prop_map(|(name, desc, cc, defer)| {
+            let mut t = json!({
+                "name": name,
+                "description": desc,
+                "input_schema": {"type": "object", "properties": {}},
+            });
+            if let Some(cc) = cc {
+                t["cache_control"] = cc;
+            }
+            if let Some(d) = defer {
+                t["defer_loading"] = json!(d);
+            }
+            t
+        })
+}
+
+/// block 级 `cache_control` 的合法 wire 值 (#269): ephemeral 是当前唯一支持的 type.
+pub(crate) fn arb_cache_control() -> impl Strategy<Value = Value> {
+    prop_oneof![
+        Just(json!({"type": "ephemeral"})),
+        Just(json!({"type": "ephemeral", "ttl": "1h"})),
+    ]
+}
+
+fn arb_anthropic_message_base() -> impl Strategy<Value = Value> {
     // role=system 条目 (Anthropic 中途 system 消息, claude code 实测发送) 参与生成:
     // 2026-09-23 修正 (#269) 后 reader/writer 按原位保留, round-trip normalize 相等,
     // 因此可以被 FWD-1/FWD-2 property 机械锁定 (旧实现提升合并到顶层 system, 生成器
@@ -448,13 +505,45 @@ fn arb_anthropic_message() -> impl Strategy<Value = Value> {
     ]
 }
 
+/// 消息级 extra 包装 (L4, #269): 部分消息携带消息级未建模字段 (实测形态:
+/// claude code 的消息级 `output_config.effort`), round-trip 须原样保留.
+fn arb_anthropic_message() -> impl Strategy<Value = Value> {
+    (arb_anthropic_message_base(), prop::option::of("[a-z]{4,8}")).prop_map(|(mut m, effort)| {
+        if let Some(e) = effort {
+            m["output_config"] = json!({"effort": e});
+        }
+        m
+    })
+}
+
 fn arb_anthropic_block() -> impl Strategy<Value = Value> {
     prop_oneof![
-        "[a-z ]{1,20}".prop_map(|s| json!({"type":"text","text":s})),
-        // tool_result (含空字符串 content 的 P0-4 守卫)
-        ("toolu_[a-z0-9]{5,10}", arb_anthropic_tool_result_content()).prop_map(|(id, content)| {
-            json!({"type":"tool_result","tool_use_id":id,"content":content})
+        // L5 (#269): text block 可携带 cache_control (claude code 的 system/末尾消息断点).
+        ("[a-z ]{1,20}", prop::option::of(arb_cache_control())).prop_map(|(s, cc)| {
+            let mut b = json!({"type": "text", "text": s});
+            if let Some(cc) = cc {
+                b["cache_control"] = cc;
+            }
+            b
         }),
+        // tool_result (含空字符串 content 的 P0-4 守卫) + cache_control + is_error 形态.
+        (
+            "toolu_[a-z0-9]{5,10}",
+            arb_anthropic_tool_result_content(),
+            prop::option::of(arb_cache_control()),
+            prop::option::of(Just(false)),
+        )
+            .prop_map(|(id, content, cc, is_error)| {
+                let mut b = json!({"type": "tool_result", "tool_use_id": id, "content": content});
+                if let Some(cc) = cc {
+                    b["cache_control"] = cc;
+                }
+                // is_error: false 显式形态与 true 一样合法 (writer 须按原样保留, 省略非保真).
+                if let Some(e) = is_error {
+                    b["is_error"] = json!(e);
+                }
+                b
+            }),
     ]
 }
 
@@ -502,7 +591,14 @@ fn arb_anthropic_response_value() -> impl Strategy<Value = Value> {
 
 fn arb_anthropic_response_block() -> impl Strategy<Value = Value> {
     prop_oneof![
-        "[a-z ]{1,30}".prop_map(|s| json!({"type":"text","text":s})),
+        // L5 (#269): 响应侧 block 未知字段同样保真 (read_block/write_block 与请求侧共享).
+        ("[a-z ]{1,30}", prop::option::of(arb_cache_control())).prop_map(|(s, cc)| {
+            let mut b = json!({"type": "text", "text": s});
+            if let Some(cc) = cc {
+                b["cache_control"] = cc;
+            }
+            b
+        }),
         (
             "toolu_[a-z0-9]{5,10}",
             "[a-z]{3,10}",

@@ -571,7 +571,7 @@ fn assert_responses_chat_modeled_fields_equivalent(
         .system
         .iter()
         .filter_map(|b| match b {
-            IrBlock::Text { text } => Some(text.as_str()),
+            IrBlock::Text { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect();
@@ -579,7 +579,7 @@ fn assert_responses_chat_modeled_fields_equivalent(
         .system
         .iter()
         .filter_map(|b| match b {
-            IrBlock::Text { text } => Some(text.as_str()),
+            IrBlock::Text { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect();
@@ -626,7 +626,7 @@ fn assert_responses_chat_modeled_fields_equivalent(
         );
         for (j, (b_in, b_out)) in blocks_in.iter().zip(blocks_out.iter()).enumerate() {
             match (b_in, b_out) {
-                (IrBlock::Text { text: t_in }, IrBlock::Text { text: t_out }) => {
+                (IrBlock::Text { text: t_in, .. }, IrBlock::Text { text: t_out, .. }) => {
                     prop_assert_eq!(
                         t_in,
                         t_out,
@@ -677,14 +677,14 @@ fn assert_responses_chat_modeled_fields_equivalent(
                     let in_texts: Vec<String> = c_in
                         .iter()
                         .filter_map(|b| match b {
-                            IrBlock::Text { text } => Some(text.clone()),
+                            IrBlock::Text { text, .. } => Some(text.clone()),
                             _ => None,
                         })
                         .collect();
                     let out_texts: Vec<String> = c_out
                         .iter()
                         .filter_map(|b| match b {
-                            IrBlock::Text { text } => Some(text.clone()),
+                            IrBlock::Text { text, .. } => Some(text.clone()),
                             _ => None,
                         })
                         .collect();
@@ -751,7 +751,7 @@ fn assert_responses_chat_response_modeled_equivalent(
     );
     for (i, (b_in, b_out)) in ir_in.content.iter().zip(ir_out.content.iter()).enumerate() {
         match (b_in, b_out) {
-            (IrBlock::Text { text: t_in }, IrBlock::Text { text: t_out }) => {
+            (IrBlock::Text { text: t_in, .. }, IrBlock::Text { text: t_out, .. }) => {
                 prop_assert_eq!(t_in, t_out, "{}: content[{}] Text 损失", direction, i,);
             }
             (IrBlock::ToolUse { .. }, IrBlock::ToolUse { .. }) => {
@@ -812,11 +812,13 @@ fn assert_tool_use_equivalent(
             id: id_in,
             name: n_in,
             input: v_in,
+            ..
         },
         IrBlock::ToolUse {
             id: id_out,
             name: n_out,
             input: v_out,
+            ..
         },
     ) = (b_in, b_out)
     else {

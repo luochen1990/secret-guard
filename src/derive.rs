@@ -124,7 +124,7 @@ pub(crate) fn extract_preview_and_model_from_ir(
                 .content
                 .iter()
                 .filter_map(|b| match b {
-                    crate::codec::ir::IrBlock::Text { text } if !text.is_empty() => {
+                    crate::codec::ir::IrBlock::Text { text, .. } if !text.is_empty() => {
                         Some(text.as_str())
                     }
                     _ => None,
@@ -563,11 +563,13 @@ mod tests {
                     id: "c1".into(),
                     name: "read_file".into(),
                     input: serde_json::json!({}),
+                    extra: Default::default(),
                 },
                 crate::codec::ir::IrBlock::ToolUse {
                     id: "c2".into(),
                     name: "write_file".into(),
                     input: serde_json::json!({}),
+                    extra: Default::default(),
                 },
             ],
             ..Default::default()
@@ -591,6 +593,7 @@ mod tests {
             role: crate::codec::ir::IrRole::User,
             content: vec![crate::codec::ir::IrBlock::Text {
                 text: "hello".into(),
+                extra: Default::default(),
             }],
             ..Default::default()
         }];
@@ -606,6 +609,7 @@ mod tests {
                 id: "c1".into(),
                 name: long,
                 input: serde_json::json!({}),
+                extra: Default::default(),
             }],
             ..Default::default()
         }];
@@ -685,6 +689,7 @@ mod tests {
                 role: IrRole::System,
                 content: vec![IrBlock::Text {
                     text: "sys-only-msg".to_string(),
+                    extra: Default::default(),
                 }],
                 ..Default::default()
             }],
@@ -705,6 +710,7 @@ mod tests {
                 role: IrRole::Tool,
                 content: vec![IrBlock::Text {
                     text: "tool-only-msg".to_string(),
+                    extra: Default::default(),
                 }],
                 ..Default::default()
             }],

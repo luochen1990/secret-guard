@@ -215,6 +215,7 @@ fn fold_scan_block(b: &ScanBlock) -> Option<crate::codec::IrBlock> {
                 id: id.clone(),
                 name: name.clone(),
                 input,
+                extra: Default::default(),
             })
         }
         Some(IrBlockMeta::ReasoningContent) => {
@@ -233,6 +234,7 @@ fn fold_scan_block(b: &ScanBlock) -> Option<crate::codec::IrBlock> {
             } else {
                 Some(crate::codec::IrBlock::Text {
                     text: b.text.clone(),
+                    extra: Default::default(),
                 })
             }
         }

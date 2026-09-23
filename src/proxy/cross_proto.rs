@@ -650,6 +650,7 @@ mod tests {
         let blocks = vec![
             IrBlock::Text {
                 text: "user text".into(),
+                extra: Default::default(),
             },
             IrBlock::ReasoningContent {
                 text: "thinking...".into(),
@@ -659,13 +660,17 @@ mod tests {
             },
             IrBlock::ToolResult {
                 tool_use_id: "tu_1".into(),
+                extra: Default::default(),
                 content: vec![
-                    IrBlock::Text { text: "ok".into() },
+                    IrBlock::Text {
+                        text: "ok".into(),
+                        extra: Default::default(),
+                    },
                     IrBlock::ReasoningContent {
                         text: "nested thinking".into(),
                     },
                 ],
-                is_error: false,
+                is_error: None,
                 content_form: None,
             },
             IrBlock::ReasoningContent {

@@ -80,11 +80,32 @@ impl IrRequest {
         for m in &mut self.messages {
             m.content_form = None;
             m.reasoning_content_form = None;
-            for b in &mut m.content {
-                if let IrBlock::ToolResult { content_form, .. } = b {
-                    *content_form = None;
-                }
-            }
+            // block/message 级 extra (#269): 与顶层 extra 同契约 — 同协议透传,
+            // 跨协议清空 (防止 Anthropic 独有字段如 cache_control 泄漏进 egress wire).
+            m.extra.clear();
+            clear_block_extras(&mut m.content);
+        }
+        for t in &mut self.tools {
+            t.extra.clear();
+        }
+    }
+}
+
+/// 递归清空 block 的 extra 字段 (含 ToolResult.content 嵌套块).
+///
+/// 与 [`IrRequest::clear_wire_fidelity`] 同属 SSOT 清空点: 新增带 extra 的
+/// IrBlock variant 时只需改这里.
+fn clear_block_extras(blocks: &mut [IrBlock]) {
+    for b in blocks {
+        match b {
+            IrBlock::Text { extra, .. }
+            | IrBlock::ToolUse { extra, .. }
+            | IrBlock::ToolResult { extra, .. }
+            | IrBlock::Image { extra, .. } => extra.clear(),
+            IrBlock::Reasoning { .. } | IrBlock::ReasoningContent { .. } => {}
+        }
+        if let IrBlock::ToolResult { content, .. } = b {
+            clear_block_extras(content);
         }
     }
 }
@@ -94,6 +115,11 @@ impl IrRequest {
 pub struct IrMessage {
     pub role: IrRole,
     pub content: Vec<IrBlock>,
+    /// wire 形态元数据: 消息级未建模字段的逃生舱 (如 Anthropic 消息级
+    /// `output_config` / provider 扩展). 同协议 round-trip 时原样回写
+    /// (#269, L4); 跨协议翻译前由 `clear_wire_fidelity` 清空 (防泄漏, 与
+    /// 顶层 `extra` 契约同型). 空 Map = 无.
+    pub extra: serde_json::Map<String, Value>,
     /// wire 形态元数据: 原始 wire 中 `content` 是 string 还是 array 还是 null.
     /// - `None`: 跨协议路径 / 内部构造 (writer 用协议默认形态)
     /// - `Some(ContentForm::String)`: 原始是裸 string (Anthropic 单文本消息常见)
@@ -172,7 +198,7 @@ impl HitLocations {
 pub fn blocks_has_text(blocks: &[IrBlock]) -> bool {
     blocks
         .iter()
-        .any(|b| matches!(b, IrBlock::Text { text } if !text.is_empty()))
+        .any(|b| matches!(b, IrBlock::Text { text, .. } if !text.is_empty()))
 }
 
 /// wire 中 message content 的原始形态. 用于同协议 round-trip 时保留 wire 形态.
@@ -294,30 +320,53 @@ pub enum IrRole {
 }
 
 /// 消息内容块 (chat completion 中所有协议都支持 block-based content).
+///
+/// # block 级 `extra` (#269, L5)
+///
+/// 四个有 wire 来源的 variant (Text / ToolUse / ToolResult / Image) 均携带
+/// `extra: Map<String, Value>` — 该 block 上未建模字段的逃生舱 (典型: Anthropic
+/// block 级 `cache_control` 缓存断点, claude code 每请求 2-4 个). 同协议
+/// round-trip 时 reader 收集 / writer 原样回写; 跨协议翻译前由
+/// `clear_wire_fidelity` 清空 (与顶层 `IrRequest.extra` 契约同型).
+/// `Reasoning` / `ReasoningContent` 是跨协议合成产物, 无 wire 来源, 不携带.
 #[derive(Debug, Clone, PartialEq)]
 pub enum IrBlock {
     /// 文本块.
-    Text { text: String },
+    Text {
+        text: String,
+        /// 未建模字段 (如 `cache_control`). 空 Map = 无.
+        extra: serde_json::Map<String, Value>,
+    },
     /// 工具调用 (assistant 发起).
     /// `id` 必须 verbatim 透传, 否则下一轮 tool_result 引用断裂.
     ToolUse {
         id: String,
         name: String,
         input: Value,
+        /// 未建模字段. 空 Map = 无.
+        extra: serde_json::Map<String, Value>,
     },
     /// 工具结果 (user 回复 assistant 的 ToolUse).
     /// OpenAI 用独立 `role:"tool"` 消息承载; Anthropic 用 user 消息内的 tool_result 块.
     ToolResult {
         tool_use_id: String,
         content: Vec<IrBlock>,
-        is_error: bool,
+        /// wire 保真 (#269): `None` = 字段缺席 (API 语义 false); `Some(true/false)` =
+        /// 显式形态, writer 按原样回写 (显式 false 不能静默省略 — 破坏 FWD-1 字面等式).
+        is_error: Option<bool>,
         /// wire 形态元数据: Anthropic tool_result.content 可能是 string 或 array.
         /// OpenAI 的 tool message content 永远是 string, 此字段 None.
         /// 同协议 round-trip 时填充, 跨协议翻译前清空.
         content_form: Option<ContentForm>,
+        /// 未建模字段 (如 `cache_control`). 空 Map = 无.
+        extra: serde_json::Map<String, Value>,
     },
     /// 图片块. 跨协议唯一无歧义形式是 Base64; URL 引用也保留.
-    Image { source: IrImageSource },
+    Image {
+        source: IrImageSource,
+        /// 未建模字段 (如 `cache_control`). 空 Map = 无.
+        extra: serde_json::Map<String, Value>,
+    },
     /// 推理块 (Responses API 的 `reasoning` output item).
     ///
     /// 仅承载 `summary` 文本数组 (可被 Redact 扫描是否有 secret 子串).
@@ -354,6 +403,11 @@ pub struct IrTool {
     pub description: Option<String>,
     /// JSON Schema 描述工具参数.
     pub input_schema: Value,
+    /// wire 形态元数据: 工具级未建模字段的逃生舱 (如 Anthropic 工具上的
+    /// `cache_control` / `defer_loading` / `type`). 同协议 round-trip 原样回写
+    /// (#269, claude code 常把缓存断点放在最后一个工具定义上); 跨协议翻译前
+    /// 由 `clear_wire_fidelity` 清空. 空 Map = 无.
+    pub extra: serde_json::Map<String, Value>,
 }
 
 /// 工具选择策略. 取并集: 每个协议都能表达这 4 种.
