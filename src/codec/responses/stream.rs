@@ -567,6 +567,9 @@ fn stream_write_block_start(
                 content: String::new(),
             },
             IrBlockMeta::ReasoningContent => {
+                // 分叉声明: 流式**保留** ReasoningContent (合成为 reasoning_summary
+                // 事件族), 与非流式 write_response 的跳过 (lossy-by-target) 行为分叉
+                // — 见 docs/known-limitations.md codec 节 #176 流式例外 (STR-6 待裁决).
                 ResponsesItemAccum::simple(ResponsesItemKind::Reasoning, format!("rs_{seq}"))
             }
         };

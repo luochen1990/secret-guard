@@ -537,21 +537,9 @@ mod tests {
     use super::*;
 
     /// 把完整 SSE 字节解析为 (event_type, data JSON) 帧序列 (测试辅助).
-    /// 假设: 输入是已 reassembled 的完整 SSE, LF 行尾, 帧以空行分隔.
+    /// 委托共享实现 `iter_sse_frames` (R3 合一), 假设声明见该函数.
     fn parse_frames(sse: &str) -> Vec<(String, serde_json::Value)> {
-        sse.split("\n\n")
-            .filter_map(|frame| {
-                let mut padded = frame.as_bytes().to_vec();
-                padded.extend_from_slice(b"\n\n");
-                let (et, data) = super::super::parse_sse_frame(&padded)?;
-                if data.is_empty() || data == "[DONE]" {
-                    return None;
-                }
-                serde_json::from_str::<serde_json::Value>(&data)
-                    .ok()
-                    .map(|v| (et, v))
-            })
-            .collect()
+        super::super::iter_sse_frames(sse.as_bytes())
     }
 
     /// OpenAI egress 的 reasoning 流 fixture: 思考 chunk → 文本 chunk → finish →

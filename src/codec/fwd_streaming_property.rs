@@ -111,7 +111,9 @@ use proptest::prelude::*;
 use serde_json::{Value, json};
 
 use crate::codec::ir::{IrBlock, IrStopReason, IrUsage};
-use crate::codec::stream::{StreamScan, StreamTranslate, normalize_sse_volatile, parse_sse_frame};
+use crate::codec::stream::{
+    StreamScan, StreamTranslate, for_each_split_chunk, iter_sse_frames, normalize_sse_volatile,
+};
 use crate::codec::{IrResponse, Protocol};
 use crate::redact::RedactionMap;
 
@@ -314,10 +316,10 @@ fn run_same_proto_restore(
 
 /// 按 `splits` 切分点序列把 `upstream` 分段喂给 translator, 收集所有输出 (含 finish()).
 ///
-/// 切分点语义 (与 stream/mod.rs `scan_chunked` 一致, 由 [`for_each_split_chunk`]
-/// 单一实现): 切分点把 [0,len) 切成 |splits|+1 段, 越界 / 乱序由 clamp + 单调化
-/// 兜底. 两个 caller (same-proto restore / cross-proto translate) 共用此逻辑,
-/// 仅 translator 构造方式不同.
+/// 切分点语义由 [`for_each_split_chunk`] 单一实现 (stream/mod.rs 测试共享,
+/// S1 合一 — 与本模块 `scan_responses_chunked` / stream/mod.rs `scan_chunked`
+/// 共用同一份). 两个 caller (same-proto restore / cross-proto translate) 共用
+/// 此逻辑, 仅 translator 构造方式不同.
 fn feed_split_translator(t: &mut StreamTranslate, upstream: &[u8], splits: &[usize]) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
     for_each_split_chunk(splits, upstream, |chunk| {
@@ -325,25 +327,6 @@ fn feed_split_translator(t: &mut StreamTranslate, upstream: &[u8], splits: &[usi
     });
     out.extend_from_slice(&t.finish());
     out
-}
-
-/// 把 `full` 按 `splits` 切分点序列分段回调 `f` (每段一个非空 chunk).
-///
-/// 切分点语义 (M-S3 合一, 原本在 `feed_split_translator` / `scan_responses_chunked`
-/// 两处逐字重复): 切分点把 [0,len) 切成 |splits|+1 段; 越界 clamp 到 len,
-/// 乱序由单调化 (≥ prev) 兜底; 产生的空段跳过, 尾段剩余字节一次性回调.
-fn for_each_split_chunk(splits: &[usize], full: &[u8], mut f: impl FnMut(&[u8])) {
-    let mut prev = 0usize;
-    for &sp in splits {
-        let sp = sp.min(full.len()).max(prev);
-        if sp > prev {
-            f(&full[prev..sp]);
-        }
-        prev = sp;
-    }
-    if prev < full.len() {
-        f(&full[prev..]);
-    }
 }
 
 /// 手造一个 RedactionMap { real → mock }. 不走 redact_ir 的 mock 生成路径,
@@ -586,29 +569,12 @@ fn collect_usage_output_tokens(sse_bytes: &[u8]) -> u64 {
     max
 }
 
-/// 遍历 SSE 字节流, 逐帧解析出 data JSON payload.
+/// 遍历 SSE 字节流, 逐帧解析出 data JSON payload (丢弃 event 名的投影).
 ///
-/// 用 [`StreamTranslate`] 的内部 de-frame 逻辑不可 (private), 这里用 `parse_sse_frame`
-/// 配合简单的"按空行切分". 假设: 输入是完整 SSE (已 reassembled), 不含跨 chunk 半帧.
-/// 非法 JSON 静默跳过 (best-effort, 不 panic — 契约 ROB-1).
+/// de-frame 逻辑委托共享实现 [`crate::codec::stream::iter_sse_frames`] (R3 合一);
+/// 假设声明 (完整 SSE / LF / 非法 JSON 跳过) 见该函数.
 fn iter_sse_data_payloads(sse_bytes: &[u8]) -> impl Iterator<Item = Value> {
-    // 按 `\n\n` 切帧 (LF; 测试生成的 SSE 都是 LF).
-    let text = String::from_utf8_lossy(sse_bytes);
-    text.split("\n\n")
-        .filter_map(|frame| {
-            // 解析帧为 (event_type, data_str).
-            let frame_bytes = frame.as_bytes();
-            // 补齐末尾 \n\n 让 parse_sse_frame 能识别 (它要求帧以空行结尾; split 已剥).
-            let mut padded = frame_bytes.to_vec();
-            padded.extend_from_slice(b"\n\n");
-            let (_event_type, data_str) = parse_sse_frame(&padded)?;
-            if data_str.is_empty() || data_str == "[DONE]" {
-                return None;
-            }
-            serde_json::from_str::<Value>(&data_str).ok()
-        })
-        .collect::<Vec<_>>()
-        .into_iter()
+    iter_sse_frames(sse_bytes).into_iter().map(|(_, v)| v)
 }
 
 // ─── 生成器: 含 mock 的 OpenAI SSE 流 ───────────────────────────────────────
@@ -1249,8 +1215,9 @@ proptest! {
 // ─── Responses STR-1/STR-2 辅助 ─────────────────────────────────────────────
 
 /// 把字节流按切分点序列分段喂入 StreamScan(Responses), 返回最终 snapshot
-/// (切分语义单一实现于 [`for_each_split_chunk`], 与 stream/mod.rs `scan_chunked`
-/// 一致 — 那里硬编码 OpenAI, 这里 Responses 版本留在本模块避免跨 test 模块引用).
+/// (切分语义由 [`for_each_split_chunk`] 单一实现 (stream/mod.rs 测试共享, S1 合一);
+/// 本函数与 stream/mod.rs `scan_chunked` 各自留存仅因协议常量不同 — 那里硬编码
+/// OpenAI, 这里 Responses).
 fn scan_responses_chunked(splits: &[usize], full: &[u8]) -> IrResponse {
     let mut scan = StreamScan::new(Protocol::OpenAIResponses);
     for_each_split_chunk(splits, full, |chunk| {
@@ -1610,6 +1577,107 @@ proptest! {
     }
 }
 
+// ─── Responses ingress restore tail × done 族帧序 (R2 Review L1, 确定性单测) ──
+//
+// 场景: OpenAI egress 流式 + restore (mock→real), 最后一个 text delta 以 mock
+// 前缀 "MOC" 结尾 — StreamingRestorer 的 hold 窗口 (max_mock_len-1 字节) 扣住尾部
+// 字节, BlockStop 到达时 flush_delta 把 tail 包装回 TextDelta emit (translate.rs:
+// flush 产物先于 BlockStop 事件本身 emit). Responses ingress writer 是有状态合成
+// (done 族帧从 ItemAccum 全量重建), 该时序若颠倒, done 帧的全量 text 会缺 tail.
+
+/// Responses ingress 的 restore tail 帧序: tail (`output_text.delta`) 帧必须位于
+/// `output_text.done` 之前, 且 done 族帧 (output_text.done / content_part.done /
+/// output_item.done / response.completed) 的全量 text 含 tail 字节.
+#[test]
+fn responses_ingress_restore_tail_precedes_done_family_frames() {
+    let real = "sk-real-secret12345".to_string();
+    let mock = "MOCKsecret".to_string(); // 10 字节 → hold 窗口 = 9 字节
+    let map = build_redaction_map(&real, &mock);
+
+    // OpenAI egress SSE: 两个 text delta + finish_reason + [DONE].
+    // push 轨迹 (block 0 restorer, hold = max_mock_len-1 = 9):
+    //   push("The key is ")   → 11B, safe_end = 11-9 = 2 → emit "Th", buffer "e key is " (9B)
+    //   push("MOCKsecretMOC") → combined "e key is MOCKsecretMOC" (22B), mock 命中区
+    //                            [9,19), safe_end = max(22-9, 19) = 19 → emit 前 19B
+    //                            ("e key is MOCKsecret" → restore 后 real), buffer "MOC"
+    //   BlockStop → flush tail "MOC" → tail delta 帧 → 之后才是 done 族帧.
+    let upstream_sse: Vec<u8> = [
+        openai_chunk_frame(&json!({
+            "id":"chatcmpl-x","object":"chat.completion.chunk","created":1700000000,
+            "model":"gpt-4o",
+            "choices":[{"index":0,"delta":{"role":"assistant","content":"The key is "},"finish_reason":Value::Null}]
+        })),
+        openai_chunk_frame(&json!({
+            "id":"chatcmpl-x","object":"chat.completion.chunk","created":1700000000,
+            "model":"gpt-4o",
+            "choices":[{"index":0,"delta":{"content":"MOCKsecretMOC"},"finish_reason":Value::Null}]
+        })),
+        openai_chunk_frame(&json!({
+            "id":"chatcmpl-x","object":"chat.completion.chunk","created":1700000000,
+            "model":"gpt-4o",
+            "choices":[{"index":0,"delta":{},"finish_reason":"stop"}]
+        })),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .concat()
+    .into_bytes();
+
+    // 单次 feed (确定性): 本测守卫帧序, chunk 边界由 STR-1 property 族守卫.
+    let client_sse = run_cross_proto_restore(
+        Protocol::OpenAIResponses, // ingress
+        Protocol::OpenAI,          // egress
+        map,
+        &upstream_sse,
+        &[],
+    );
+
+    // 解析客户端 SSE 为 (event, json) 帧序列 (共享 de-frame 实现, 保留 event 名).
+    let frames: Vec<(String, Value)> = iter_sse_frames(&client_sse);
+    let event_names: Vec<&str> = frames.iter().map(|(e, _)| e.as_str()).collect();
+    let pos_of = |name: &str| {
+        event_names
+            .iter()
+            .position(|&e| e == name)
+            .unwrap_or_else(|| panic!("应产出 {name} 帧, 实际 events: {event_names:?}"))
+    };
+
+    // 1. tail ("MOC") 以 output_text.delta 帧产出, 且位于 output_text.done 之前.
+    let tail_delta_pos = frames
+        .iter()
+        .position(|(e, v)| e == "response.output_text.delta" && v["delta"] == "MOC")
+        .expect("restore tail (\"MOC\") 应作为 output_text.delta 帧产出 (BlockStop flush)");
+    let done_pos = pos_of("response.output_text.done");
+    assert!(
+        tail_delta_pos < done_pos,
+        "帧序违反: restore tail 的 delta 帧 (#{tail_delta_pos}) 应先于 \
+         output_text.done (#{done_pos})\nevents: {event_names:?}"
+    );
+
+    // 2. done 族帧的全量 text 均含 tail 字节 (flush 先于 BlockStop → 累积含 "MOC").
+    let full_text = format!("The key is {real}MOC");
+    assert_eq!(
+        frames[done_pos].1["text"].as_str(),
+        Some(full_text.as_str()),
+        "output_text.done 全量 text 应含 tail 字节"
+    );
+    assert_eq!(
+        frames[pos_of("response.content_part.done")].1["part"]["text"].as_str(),
+        Some(full_text.as_str()),
+        "content_part.done 的 part.text 应含 tail 字节"
+    );
+    assert_eq!(
+        frames[pos_of("response.output_item.done")].1["item"]["content"][0]["text"].as_str(),
+        Some(full_text.as_str()),
+        "output_item.done 的 item.content[0].text 应含 tail 字节"
+    );
+    assert_eq!(
+        frames[pos_of("response.completed")].1["response"]["output"][0]["content"][0]["text"]
+            .as_str(),
+        Some(full_text.as_str()),
+        "response.completed 的 output[0].content[0].text 应含 tail 字节"
+    );
+}
+
 // ─── 辅助: 跑 StreamTranslate 跨协议翻译 ──────────────────────────────────
 
 /// 用跨协议翻译模式跑一次 StreamTranslate, 返回客户端收到的完整 SSE 字节.
@@ -1852,6 +1920,24 @@ fn prop_max_buf_overflow_aborts_anthropic_ingress() {
     assert!(
         tail_str.contains("event: error") && tail_str.contains("upstream_error"),
         "STR-4 违反: Anthropic ingress finish() 应含 error event 帧 (event: error + upstream_error), 实际: {tail_str}"
+    );
+}
+
+/// STR-4 `prop_max_buf_overflow_aborts` (Responses ingress, R2 Review L2).
+#[test]
+fn prop_max_buf_overflow_aborts_responses_ingress() {
+    let tail_str = run_str4_cross_proto_abort(Protocol::OpenAIResponses, Protocol::OpenAI);
+    // Responses writer 把 IrStreamEvent::Error 写成两帧 (`stream_write_error`):
+    // 裸 `error` 事件 + `response.failed` (骨架 status=failed + error 对象).
+    // 两者都断言 — 只断其一漏掉另一帧的降级 ("response.failed" 不是 "event: error"
+    // 的子串, 两个精确 event 名匹配互不掩盖).
+    assert!(
+        tail_str.contains("event: error") && tail_str.contains("upstream_error"),
+        "STR-4 违反: Responses ingress finish() 应含裸 error 事件帧 (event: error + upstream_error), 实际: {tail_str}"
+    );
+    assert!(
+        tail_str.contains("event: response.failed") && tail_str.contains("\"status\":\"failed\""),
+        "STR-4 违反: Responses ingress finish() 应含 response.failed 帧 (status=failed), 实际: {tail_str}"
     );
 }
 

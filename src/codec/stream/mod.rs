@@ -179,6 +179,63 @@ pub(crate) fn normalize_sse_volatile(
     out2
 }
 
+// ─── 测试共享: 切分点喂入循环 ───────────────────────────────────────────────
+
+/// 把 `full` 按 `splits` 切分点序列分段回调 `f` (每段一个非空 chunk).
+///
+/// (S1 合一: 全仓 3 份逐字重复的切分循环 — 本模块 `scan_chunked` /
+/// `prop_stream_translate_chunk_split_equivalence` 与 `codec::fwd_streaming_property`
+/// 的原 `for_each_split_chunk` 函数体 — 的单一实现, 4 个 caller 全部改经本函数.
+/// 与 [`normalize_sse_volatile`] 同型先例: cfg(test) 测试共享.)
+///
+/// 切分点语义: 切分点把 [0,len) 切成 |splits|+1 段; 越界 clamp 到 len, 乱序由
+/// 单调化 (≥ prev) 兜底; 产生的空段跳过, 尾段剩余字节一次性回调.
+#[cfg(test)]
+pub(crate) fn for_each_split_chunk(splits: &[usize], full: &[u8], mut f: impl FnMut(&[u8])) {
+    let mut prev = 0usize;
+    for &sp in splits {
+        let sp = sp.min(full.len()).max(prev);
+        if sp > prev {
+            f(&full[prev..sp]);
+        }
+        prev = sp;
+    }
+    if prev < full.len() {
+        f(&full[prev..]);
+    }
+}
+
+// ─── 测试共享: SSE de-frame 迭代 ────────────────────────────────────────────
+
+/// 把完整 SSE 字节解析为 `(event_type, data JSON)` 帧序列 (测试辅助).
+///
+/// (R3 合一: 全仓 3 份逐字重复的 de-frame 循环 — 本模块 tests 的 `parse_frames` /
+/// `codec::fwd_streaming_property` 的 `iter_sse_data_payloads` 与 R2 tail 帧序测试的
+/// 内联闭包 — 的单一实现. 与 [`normalize_sse_volatile`] / [`for_each_split_chunk`]
+/// 同型先例: cfg(test) 测试共享.)
+///
+/// 假设: 输入是已 reassembled 的完整 SSE, LF 行尾, 帧以空行分隔 (测试生成的 SSE
+/// 均满足). 非法 JSON / 空帧 / `[DONE]` 终止符帧静默跳过 (best-effort, 不 panic —
+/// 契约 ROB-1).
+#[cfg(test)]
+pub(crate) fn iter_sse_frames(sse_bytes: &[u8]) -> Vec<(String, serde_json::Value)> {
+    String::from_utf8_lossy(sse_bytes)
+        .split("\n\n")
+        .filter_map(|frame| {
+            // 补齐末尾 \n\n 让 parse_sse_frame 能识别 (它要求帧以空行结尾; split 已剥).
+            let mut padded = frame.as_bytes().to_vec();
+            padded.extend_from_slice(b"\n\n");
+            let (event_type, data) = parse_sse_frame(&padded)?;
+            if data.is_empty() || data == "[DONE]" {
+                return None;
+            }
+            serde_json::from_str::<serde_json::Value>(&data)
+                .ok()
+                .map(|v| (event_type, v))
+        })
+        .collect()
+}
+
 // ─── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -971,21 +1028,10 @@ mod tests {
     }
 
     /// 把字节流按给定的切分点序列切成多个 chunk 喂入 StreamScan, 返回最终 snapshot().
-    /// 切分点序列语义: split_points 把 [0, len) 区间切成 |splits|+1 段.
+    /// 切分点序列语义 (clamp + 单调化兜底) 见 [`for_each_split_chunk`] 单一实现.
     fn scan_chunked(splits: &[usize], full: &[u8]) -> crate::codec::IrResponse {
         let mut scan = StreamScan::new(Protocol::OpenAI);
-        let mut prev = 0usize;
-        for &sp in splits {
-            // clamp 到合法范围并保证单调不减 (防 proptest 生成乱序/越界值).
-            let sp = sp.min(full.len()).max(prev);
-            if sp > prev {
-                scan.feed(&full[prev..sp]);
-            }
-            prev = sp;
-        }
-        if prev < full.len() {
-            scan.feed(&full[prev..]);
-        }
+        for_each_split_chunk(splits, full, |chunk| scan.feed(chunk));
         scan.snapshot()
     }
 
@@ -996,7 +1042,8 @@ mod tests {
         ///
         /// proptest 生成任意数量的切分点 (1..=16 个, 位置范围覆盖整个流长度).
         /// 无论 TCP 把流切成什么样的 chunk 序列, reassembly buffer 必须重组出相同语义.
-        /// scan_chunked 内部对切分点做 clamp + 单调化, 容忍 proptest 生成的乱序/越界值.
+        /// scan_chunked (经 [`for_each_split_chunk`]) 对切分点做 clamp + 单调化,
+        /// 容忍 proptest 生成的乱序/越界值.
         #[test]
         fn prop_arbitrary_chunk_split_equivalence(
             // 1..=16 个切分点, 位置范围 [0, 2048) 覆盖整个流长度 (~998 字节).
@@ -1052,17 +1099,9 @@ mod tests {
                 Box::new(crate::redact::StreamingRestorerSet::new(RedactionMap::default())),
             );
             let mut chunked: Vec<u8> = Vec::new();
-            let mut prev = 0usize;
-            for &sp in &splits {
-                let sp = sp.min(full.len()).max(prev);
-                if sp > prev {
-                    chunked.extend_from_slice(&chunked_t.feed(&full[prev..sp]));
-                }
-                prev = sp;
-            }
-            if prev < full.len() {
-                chunked.extend_from_slice(&chunked_t.feed(&full[prev..]));
-            }
+            for_each_split_chunk(&splits, &full, |chunk| {
+                chunked.extend_from_slice(&chunked_t.feed(chunk))
+            });
             // 两者都未调用 finish (baseline 也没调用), 仅比较 feed 期间的累积输出.
             // 消除随机 id 和时敏 created 后字节级比较.
             let baseline_str = String::from_utf8_lossy(&baseline);
