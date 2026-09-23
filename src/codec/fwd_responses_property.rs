@@ -212,7 +212,7 @@ proptest! {
         prop_assert_eq!(
             normalize_json(&v),
             normalize_json(&out),
-            "wire 语义损失: 见 responses.rs 头部 lossy 清单"
+            "wire 语义损失: 见 responses/mod.rs 头部 lossy 清单"
         );
     }
 }
@@ -474,23 +474,25 @@ fn prop_responses_to_chat_hosted_tools_dropped_cross_proto() {
     assert_eq!(tool_fn.get("name").unwrap(), "f1");
 }
 
-/// FWD-3 已知语义损失守卫: Chat → Responses 响应跨协议时, stop_reason 粒度变粗.
+/// FWD-3 stop_reason 精确保真守卫: Chat → Responses 响应跨协议时, tool_calls 的
+/// ToolUse 粒度经 round-trip 保持.
 ///
 /// Chat 的 `finish_reason` 区分 `"stop"` (自然结束, → IR EndTurn) 和 `"tool_calls"`
-/// (工具调用结束, → IR ToolUse). Responses 的 `status` 只有 `completed`/`incomplete`/
-/// `failed` 三态, 不区分 "自然结束" 和 "工具调用结束" (write_status 把 ToolUse 也写
-/// `completed`). 故 Chat → Responses → IR' round-trip 后, `tool_calls` 的 ToolUse
-/// 降级为 EndTurn (语义损失, 已知).
+/// (工具调用结束, → IR ToolUse). Responses 的 `status` 虽只有三态, 但 reader 按
+/// output 推断 (有 function_call item → ToolUse, 否则 EndTurn, `read_response_status`
+/// — 2026-09-23 统一裁决, 非流式对齐流式; 原 "completed 恒 EndTurn" 的粒度损失
+/// 已消除).
 ///
-/// 此单测**精确锁定**当前降级行为, 防止 write_status / read_response_status 映射逻辑
-/// 静默回归 (例如某天 completed 被映射成 MaxTokens, 应被此测试抓住). 与
-/// `prop_chat_to_responses_response_preserves_modeled_fields` 的弱 stop_reason 断言
-/// (只比较 Some vs None) 配合, 形成完整覆盖.
+/// 此单测**精确锁定**保真行为, 防止 write_status / read_response_status 映射逻辑
+/// 静默回归 (例如某天 completed 被映射成 MaxTokens, 或推断被移除, 应被此测试
+/// 抓住). 与 `prop_chat_to_responses_response_preserves_modeled_fields` 的弱
+/// stop_reason 断言 (只比较 Some vs None) 配合, 形成完整覆盖.
 #[test]
-fn responses_stop_reason_granularity_loss_cross_proto() {
+fn responses_stop_reason_tool_use_preserved_cross_proto() {
     use crate::codec::ir::IrStopReason;
 
-    // 场景 1: finish_reason="tool_calls" → IR ToolUse → Responses "completed" → IR' EndTurn.
+    // 场景 1: finish_reason="tool_calls" → IR ToolUse → Responses "completed"
+    // (output 含 function_call) → IR' ToolUse (精确保真).
     let tool_calls_resp = json!({
         "id": "chatcmpl-1",
         "object": "chat.completion",
@@ -514,11 +516,12 @@ fn responses_stop_reason_granularity_loss_cross_proto() {
     // write_status(ToolUse) → "completed".
     assert_eq!(responses_wire.get("status").unwrap(), "completed");
     let ir_out = responses_reader().read_response(&responses_wire).unwrap();
-    // 已知损失: ToolUse → EndTurn (Responses status 粒度粗).
+    // 精确保真: output 含 function_call → reader 推断 ToolUse (粒度损失已消除,
+    // 2026-09-23 统一).
     assert_eq!(
         ir_out.stop_reason,
-        Some(IrStopReason::EndTurn),
-        "Chat tool_calls 经 Responses round-trip 后 stop_reason 应回退为 EndTurn (已知语义损失)"
+        Some(IrStopReason::ToolUse),
+        "Chat tool_calls 经 Responses round-trip 后 stop_reason 应保持 ToolUse (精确保真)"
     );
 
     // 场景 2: finish_reason="stop" → IR EndTurn → Responses "completed" → IR' EndTurn (无损).

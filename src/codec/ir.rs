@@ -678,10 +678,9 @@ pub struct ResponsesEncodeState {
     pub items: std::collections::BTreeMap<usize, ResponsesItemAccum>,
     /// MessageDelta 缓存的终止信息 (终止事件合成用; "带信息的 delta 获胜" —
     /// stop_reason 仅 Some 时覆盖, usage 仅 present 或非零时覆盖, 防病态后续
-    /// 全零 delta 冲掉真值). 注意 `usage_present` 当前不被 terminal 合成消费
-    /// (无条件写全量 usage 对象, 与非流式 `write_response` 先例一致 — 代价是
-    /// round-trip 时 reader 侧 present false→true 单向漂移); 保留作为方案 D3
-    /// 声明的状态面与后续 presence-保真改进 (present=false → usage:null) 的判据.
+    /// 全零 delta 冲掉真值). `usage_present` 由 terminal 合成消费 (present=false
+    /// → usage:null, 2026-09-23 诚实化裁决 — round-trip presence 保真, 不再
+    /// 伪造全零对象).
     pub stop_reason: Option<IrStopReason>,
     pub usage: IrUsage,
     pub usage_present: bool,

@@ -37,7 +37,7 @@ use super::super::ir::{
 };
 use super::super::{IrBlockMeta, IrDelta, IrStopReason, IrStreamEvent, current_epoch};
 use super::{
-    read_response_status, read_usage, responses_usage_json, synth_response_id, write_status_str,
+    read_response_status, read_usage, responses_usage_or_null, synth_response_id, write_status_str,
 };
 
 // ─── Helpers: read (streaming) ─────────────────────────────────────────────
@@ -500,7 +500,7 @@ pub(super) fn write_responses_stream_event(
             Vec::new()
         }
         IrStreamEvent::MessageStop => {
-            // 终止事件 type = `response.{status}` (官方 wire 语义: incomplete/failed
+            // 终止事件 type = `response.{status}` (官方 wire 语义: incomplete
             // 状态用对应事件承载, 客户端 SDK 按事件 type 分派; 恒发 completed 会让
             // incomplete_details 被 status-completed 处理路径忽略 — reader 侧同理,
             // 只有 `response.incomplete` 分支读 incomplete_details).
@@ -763,16 +763,17 @@ fn stream_write_block_stop(index: usize, state: &mut ResponsesEncodeState) -> Ve
     }
 }
 
-/// `MessageStop` → 终止事件 (`response.completed` / `response.incomplete` /
-/// `response.failed`, type 由调用方按 status 分派) 的 response 全量对象:
-/// 骨架 + status (`write_status_str` 映射) + output 全量重建 (items 按 index 升序)
-/// + usage (cached, 无条件写全量对象 — 与非流式 `write_response` 一致)
+/// `MessageStop` → 终止事件 (`response.completed` / `response.incomplete`,
+/// type 由 `write_status_str` 分派) 的 response 全量对象:
+/// 骨架 + status + output 全量重建 (items 按 index 升序)
+/// + usage (cached; present=false 时 null — 与非流式 `write_response` 一致)
 /// + incomplete_details (MaxTokens/Safety/Refusal 时给 reason, 其余 null).
 ///
-/// 注意: stop_reason=Other 走 `response.failed` 但**不合成 error 对象** (IR 无
-/// 错误信息可编造, 与非流式 status=failed 无 error 的先例一致); reader 侧读到
-/// 后经 `stream_failed` 兜底文案转 Error 事件 — Other→Error 的往返漂移是已接受
-/// 的语义传达 (无法识别的终止 ≈ 失败).
+/// stop_reason=Other 也走 `response.completed` (2026-09-23 裁决: 未知停止原因
+/// 大多是正常结束的变体, 伪装成 failed 会触发客户端错误处理路径 — "未知不
+/// 伪装成确定错误"); reader 读回 completed 按 output 推断 ToolUse/EndTurn,
+/// Other→(ToolUse|EndTurn) 的往返损失是该折衷的已知代价. `response.failed`
+/// 仅由 `stream_write_error` (真错误路径, 携带 error 对象) 产生.
 fn stream_write_terminal_response(state: &mut ResponsesEncodeState) -> Value {
     let mut resp = response_skeleton(state, write_status_str(state.stop_reason));
     let obj = resp.as_object_mut().expect("skeleton is always an object");
@@ -798,7 +799,10 @@ fn stream_write_terminal_response(state: &mut ResponsesEncodeState) -> Value {
                 .collect::<Vec<_>>(),
         ),
     );
-    obj.insert("usage".to_string(), responses_usage_json(&state.usage));
+    obj.insert(
+        "usage".to_string(),
+        responses_usage_or_null(&state.usage, state.usage_present),
+    );
     resp
 }
 
@@ -1987,12 +1991,9 @@ mod tests {
         assert_eq!(resp["output"][0]["summary"][0]["text"], "Think ");
         assert_eq!(resp["output"][1]["type"], "message");
         assert_eq!(resp["output"][1]["content"][0]["text"], "Answer");
-        // usage 缺席 (usage_present=false) → 全零 usage 对象 (与非流式 write_response
-        // 一致; round-trip 时 reader 侧 present 单向漂移, 见 round-trip 测试注).
-        assert_eq!(
-            resp["usage"],
-            json!({"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
-        );
+        // usage 缺席 (usage_present=false) → null (诚实呈现缺失, 与非流式
+        // write_response 一致; round-trip 时 reader 侧 present 不再漂移).
+        assert_eq!(resp["usage"], Value::Null);
     }
 
     #[test]
@@ -2057,7 +2058,8 @@ mod tests {
             json!({"input_tokens": 4, "output_tokens": 2, "total_tokens": 6})
         );
         // Safety/Refusal → content_filter (incomplete 事件); ToolUse/EndTurn →
-        // completed 事件无 details; Other → failed 事件.
+        // completed 事件无 details; Other → completed 事件 (2026-09-23 裁决:
+        // 未知停止原因大多是正常结束的变体, 不伪装成 failed 触发客户端错误路径).
         for (reason, event, details) in [
             (
                 IrStopReason::Safety,
@@ -2071,7 +2073,7 @@ mod tests {
             ),
             (IrStopReason::ToolUse, "response.completed", Value::Null),
             (IrStopReason::EndTurn, "response.completed", Value::Null),
-            (IrStopReason::Other, "response.failed", Value::Null),
+            (IrStopReason::Other, "response.completed", Value::Null),
         ] {
             let frames = write_events(&[delta(reason), IrStreamEvent::MessageStop]);
             assert_eq!(frames[0].0, event, "for reason {reason:?}");
@@ -2262,40 +2264,13 @@ mod tests {
         feed_stream(&input)
     }
 
-    /// 断言两个 IR 事件流语义等价 (round-trip 保真).
-    ///
-    /// 逐事件严格 assert_eq, 唯一放宽: MessageDelta 的 `usage_present` 允许
-    /// false→true 单向漂移 — writer 无条件写全零 usage 对象 (与非流式一致),
-    /// reader 观测到显式 usage 对象即置 present. item_id 变化不出现在此层
-    /// (IR 事件不含 item_id; BlockStart 的 ToolUse id 经 call_id 保真).
+    /// 断言两个 IR 事件流语义等价 (round-trip 保真): 逐事件严格 assert_eq.
+    /// (历史放宽: MessageDelta 的 `usage_present` 允许 false→true 单向漂移 —
+    /// writer 曾无条件写全零 usage 对象; 2026-09-23 诚实化裁决后 usage 缺席
+    /// 写 null, presence 往返保真, 特判收紧为完全一致.) item_id 变化不出现在
+    /// 此层 (IR 事件不含 item_id; BlockStart 的 ToolUse id 经 call_id 保真).
     fn assert_stream_round_trip(first: &[IrStreamEvent], second: &[IrStreamEvent], ctx: &str) {
-        assert_eq!(first.len(), second.len(), "event count drift ({ctx})");
-        for (i, (a, b)) in first.iter().zip(second.iter()).enumerate() {
-            match (a, b) {
-                (
-                    IrStreamEvent::MessageDelta {
-                        stop_reason: ra,
-                        usage: ua,
-                        usage_present: pa,
-                        ..
-                    },
-                    IrStreamEvent::MessageDelta {
-                        stop_reason: rb,
-                        usage: ub,
-                        usage_present: pb,
-                        ..
-                    },
-                ) => {
-                    assert_eq!(ra, rb, "stop_reason (event {i}, {ctx})");
-                    assert_eq!(ua, ub, "usage (event {i}, {ctx})");
-                    assert!(
-                        !*pa || *pb,
-                        "usage_present must not regress true→false (event {i}, {ctx})"
-                    );
-                }
-                _ => assert_eq!(a, b, "event {i} ({ctx})"),
-            }
-        }
+        assert_eq!(first, second, "round-trip drift ({ctx})");
     }
 
     #[test]

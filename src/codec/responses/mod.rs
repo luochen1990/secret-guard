@@ -388,8 +388,10 @@ impl Writer for ResponsesWriter {
         );
         out.insert("status".to_string(), write_status(resp.stop_reason));
         out.insert("output".to_string(), Value::Array(output));
-        // usage: IR → Responses 风格 (input_tokens/output_tokens).
-        out.insert("usage".to_string(), responses_usage_json(&resp.usage));
+        out.insert(
+            "usage".to_string(),
+            responses_usage_or_null(&resp.usage, resp.usage_present),
+        );
         Value::Object(out)
     }
 
@@ -696,10 +698,31 @@ fn read_usage(usage: &Value) -> IrUsage {
 }
 
 /// 解析 Responses response 的 status → IrStopReason.
+/// "completed" 按 output 推断 (有 function_call → ToolUse, 否则 EndTurn — 与流式
+/// reader 对齐); incomplete 由 incomplete_details.reason 精确化; failed/cancelled/
+/// expired 归 Other (IR 无错误信息载体, 读侧保持 — 写侧 Other 已映射 completed).
 fn read_response_status(obj: &Map<String, Value>) -> Option<IrStopReason> {
     let status = obj.get("status").and_then(Value::as_str)?;
     match status {
-        "completed" => Some(IrStopReason::EndTurn),
+        "completed" => {
+            // 按 output 推断 (2026-09-23 统一裁决): 有 function_call item → ToolUse,
+            // 否则 EndTurn — 与流式 reader 的 `saw_function_call` 推断对齐, 消除
+            // 流式/非流式的粒度分叉 (原恒 EndTurn 是 status 三态表达力不足的
+            // 实现阶段折衷).
+            let has_function_call =
+                obj.get("output")
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| {
+                        items.iter().any(|it| {
+                            it.get("type").and_then(Value::as_str) == Some("function_call")
+                        })
+                    });
+            Some(if has_function_call {
+                IrStopReason::ToolUse
+            } else {
+                IrStopReason::EndTurn
+            })
+        }
         "incomplete" => {
             // incomplete_details.reason 给精确原因.
             let reason = obj
@@ -950,7 +973,11 @@ fn write_status_str(reason: Option<IrStopReason>) -> &'static str {
         Some(IrStopReason::MaxTokens) => "incomplete",
         Some(IrStopReason::ToolUse) => "completed", // 工具调用也算 completed
         Some(IrStopReason::Safety) | Some(IrStopReason::Refusal) => "incomplete",
-        Some(IrStopReason::Other) => "failed",
+        // Other (未知停止原因) → completed (2026-09-23 裁决): 未知大多是正常结束的
+        // 变体, 映射 failed 会触发客户端错误处理路径 (弹错/重试), 误导性强 —
+        // "未知不伪装成确定错误". 读侧 "failed"→Other 保持 (read_response_status),
+        // round-trip failed→Other→completed 有损, 是该折衷的已知代价.
+        Some(IrStopReason::Other) => "completed",
     }
 }
 
@@ -967,6 +994,18 @@ fn responses_usage_json(u: &IrUsage) -> Value {
         "output_tokens": u.output_tokens,
         "total_tokens": input_total + u.output_tokens,
     })
+}
+
+/// usage 呈现值 (非流式 `write_response` 与流式终止事件共用 SSOT):
+/// present → Responses 风格对象; 缺失 → null (诚实呈现, 2026-09-23 裁决) —
+/// 上游没报用量时合成全零对象会伪装成 "网关报了 0", null 保留 "缺失" 语义,
+/// reader 读回 usage_present=false (round-trip presence 保真).
+fn responses_usage_or_null(u: &IrUsage, present: bool) -> Value {
+    if present {
+        responses_usage_json(u)
+    } else {
+        Value::Null
+    }
 }
 
 /// 合成 response id (resp_ 前缀 + base62).
@@ -1221,15 +1260,22 @@ mod tests {
 
     #[test]
     fn read_response_status_variants() {
+        // (status, output items, expected) — completed 按 output 推断 (2026-09-23
+        // 统一): 有 function_call → ToolUse, 无 → EndTurn (与流式 reader 对齐).
+        let fc_item = json!({
+            "type": "function_call", "id": "fc_1", "call_id": "c1",
+            "name": "f", "arguments": "{}"
+        });
         let cases = [
-            ("completed", IrStopReason::EndTurn),
-            ("incomplete", IrStopReason::Other), // 无 incomplete_details 时归 Other (m2 修复)
-            ("failed", IrStopReason::Other),
+            ("completed", json!([]), IrStopReason::EndTurn),
+            ("completed", json!([fc_item]), IrStopReason::ToolUse),
+            ("incomplete", json!([]), IrStopReason::Other), // 无 incomplete_details 时归 Other (m2 修复)
+            ("failed", json!([]), IrStopReason::Other),
         ];
-        for (status, expected) in cases {
+        for (status, output, expected) in cases {
             let body = json!({
                 "id": "x", "model": "m", "status": status,
-                "output": [],
+                "output": output,
                 "usage": {"input_tokens": 0, "output_tokens": 0}
             });
             let ir = reader().read_response(&body).unwrap();
@@ -1426,6 +1472,29 @@ mod tests {
         assert_eq!(output[0].get("type").unwrap(), "message");
         assert_eq!(output[1].get("type").unwrap(), "function_call");
         assert_eq!(output[1].get("call_id").unwrap(), "call_1");
+        // usage_present=false → null (诚实呈现缺失, 不伪造全零对象).
+        assert_eq!(v.get("usage").unwrap(), &Value::Null);
+    }
+
+    #[test]
+    fn write_response_other_maps_to_completed() {
+        // Other (未知停止原因) → "completed" (2026-09-23 裁决): 伪装 failed 会触发
+        // 客户端错误处理路径. 读侧 "failed"→Other 保持, round-trip
+        // failed→Other→completed 有损 — 已知折衷 (见 write_status_str 注释).
+        let ir = IrResponse {
+            content: vec![IrBlock::Text {
+                text: "done".into(),
+            }],
+            stop_reason: Some(IrStopReason::Other),
+            usage: IrUsage::default(),
+            usage_present: false,
+            model: Some("gpt-4o".into()),
+            id: None,
+            created: None,
+            stop_sequence: None,
+        };
+        let v = writer().write_response(&ir);
+        assert_eq!(v.get("status").unwrap(), "completed");
     }
 
     #[test]
@@ -1488,6 +1557,32 @@ mod tests {
         let ir = reader().read_request(&original).unwrap();
         let rewritten = writer().write_request(&ir);
         let ir2 = reader().read_request(&rewritten).unwrap();
+        assert_eq!(ir, ir2);
+    }
+
+    #[test]
+    fn round_trip_response_usage_absent_stays_absent() {
+        // usage 缺席 → usage_present=false → writer 写 null (不伪造全零) →
+        // reader 读回 absent — 诚实呈现的非流式 round-trip 保真 (2026-09-23).
+        let original = json!({
+            "id": "resp_1",
+            "object": "response",
+            "created_at": 1700000000,
+            "model": "gpt-4o",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "id": "msg_1",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "Hi"}]
+            }],
+        });
+        let ir = reader().read_response(&original).unwrap();
+        assert!(!ir.usage_present);
+        let rewritten = writer().write_response(&ir);
+        assert_eq!(rewritten.get("usage").unwrap(), &Value::Null);
+        let ir2 = reader().read_response(&rewritten).unwrap();
         assert_eq!(ir, ir2);
     }
 

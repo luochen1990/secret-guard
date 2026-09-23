@@ -88,24 +88,26 @@
 //! ## 已声明缺口 (不放宽断言掩盖, 维度从生成器排除)
 //!
 //! 1. **STR-2 字面形式 (scan ≡ 非流式 `read_response`) 在 Responses 侧不成立**,
-//!    有两个已知建模分歧 (与 `docs/known-limitations.md` / 方案 D5 一致):
-//!    - stop_reason 推断不对称: 流式 reader 由 `saw_function_call` 推断 ToolUse,
-//!      非流式 `read_response_status("completed")` 恒 EndTurn (status 粒度粗);
+//!    有一个已知建模分歧 (与 `docs/known-limitations.md` / 方案 D5 一致):
 //!    - reasoning 双变体: 流式产 `IrBlock::ReasoningContent{text}` (summary delta
 //!      与思考原文归一), 非流式产 `IrBlock::Reasoning{summary}` (仅 summary).
 //!
+//!    (历史另一分歧 — stop_reason 推断不对称 — 已于 2026-09-23 消除: 非流式
+//!    `read_response_status` 的 "completed" 分支统一为按 output 推断, 与流式
+//!    reader 的 `saw_function_call` 对齐.)
 //!    故 STR-2 取生成器预期形式 (与 stream/mod.rs 的 OpenAI 实现
 //!    `arb_openai_sse_with_expected` 同型 — 那里的字面形式同样以语义等价回避).
-//! 2. **usage_present false→true 单向漂移** (T3 移交, 方案 D5): Responses writer
-//!    无条件写全零 usage 对象 — upstream `usage:null` 经 restore 重合成后成为
-//!    `{"input_tokens":0,...}`. 本模块的 usage 断言只比较 `output_tokens` 值
-//!    (0==0 两边恒等), **不断言 usage presence 的字节形态**.
-//! 3. **stop_reason=Other 往返漂移为 failed** (T3 移交, 方案 D5): 生成器只产
-//!    `response.completed` 终止事件, 不产 incomplete/failed 终止形态 — 该维度的
-//!    往返行为由 responses.rs 的确定性单测
-//!    (`stream_round_trip_incomplete_max_tokens_scenario` 等) 锁定. 生成器内
-//!    function_call 恒出现 → 流式 stop_reason 恒 ToolUse (EndTurn 分支同由
-//!    responses.rs 单测覆盖, 与 openai/anthropic 生成器恒含 tool 段同款偏差).
+//! 2. **(已消除, 2026-09-23 诚实化裁决) usage_present false→true 单向漂移**:
+//!    Responses writer 曾无条件写全零 usage 对象; 现在 present=false → `"usage":
+//!    null` (流式/非流式一致), Responses egress 的 property 已收紧为断言 usage
+//!    presence 往返保真 (`collect_responses_terminal_usage`).
+//! 3. **(已消除, 2026-09-23 裁决) stop_reason=Other 往返漂移为 failed**: writer
+//!    的 Other 映射改为 "completed" (未知停止原因大多是正常结束的变体, 不伪装成
+//!    确定错误). 生成器维度偏差保持: 只产 `response.completed` 终止事件, 不产
+//!    incomplete/failed 终止形态 — 该维度的往返行为由 responses stream.rs 的
+//!    确定性单测 (`stream_round_trip_incomplete_max_tokens_scenario` 等) 锁定.
+//!    生成器内 function_call 恒出现 → 流式 stop_reason 恒 ToolUse (EndTurn 分支
+//!    同由 responses 单测覆盖, 与 openai/anthropic 生成器恒含 tool 段同款偏差).
 
 use proptest::prelude::*;
 use serde_json::{Value, json};
@@ -163,7 +165,7 @@ proptest! {
     /// Responses 的 done 族帧 (output_text.done / output_item.done /
     /// response.completed) 携带**全量**内容 — 由 writer 从 restore 后的 IR delta
     /// 重合成, 全量文本中的 mock 同样被 restore (no-mock-leak 扫描整条客户端字节流
-    /// 已覆盖此路径).
+    /// 已覆盖此路径). 另断言 usage presence 往返保真 (诚实化裁决: 缺失 → null).
     #[test]
     fn prop_streaming_response_half_byte_exact_responses(
         case in arb_responses_sse_stream_with_mock(),
@@ -175,6 +177,11 @@ proptest! {
             run_same_proto_restore(Protocol::OpenAIResponses, map, &upstream_sse, &splits);
 
         assert_streaming_restore_fidelity(&upstream_sse, &client_sse, &real, &mock)?;
+        assert_responses_usage_presence_fidelity(
+            Protocol::OpenAIResponses,
+            &upstream_sse,
+            &client_sse,
+        )?;
     }
 
     /// FWD-1 极端切分: 1-byte 切分 (退化情形, 每个 feed 只推进 1 字节).
@@ -211,7 +218,8 @@ proptest! {
     /// FWD-1 极端切分: 1-byte 切分 (Responses).
     ///
     /// Responses 帧是双行形态 (event: + data:), 1-byte 切分覆盖两类行的跨 chunk
-    /// 重组 + StreamingRestorer 滑窗在最小 chunk 下的 mock 边界处理.
+    /// 重组 + StreamingRestorer 滑窗在最小 chunk 下的 mock 边界处理
+    /// (+ usage presence 往返保真).
     #[test]
     fn prop_streaming_response_byte_by_byte_responses(
         case in arb_responses_sse_stream_with_mock()
@@ -223,6 +231,11 @@ proptest! {
             run_same_proto_restore(Protocol::OpenAIResponses, map, &upstream_sse, &splits);
 
         assert_streaming_restore_fidelity(&upstream_sse, &client_sse, &real, &mock)?;
+        assert_responses_usage_presence_fidelity(
+            Protocol::OpenAIResponses,
+            &upstream_sse,
+            &client_sse,
+        )?;
     }
 
     /// STR-6 `prop_streaming_reasoning_restored_like_text` (#176):
@@ -577,6 +590,72 @@ fn iter_sse_data_payloads(sse_bytes: &[u8]) -> impl Iterator<Item = Value> {
     iter_sse_frames(sse_bytes).into_iter().map(|(_, v)| v)
 }
 
+/// 提取 Responses SSE 流终止事件 (`response.completed` / `response.incomplete`)
+/// 的 `response.usage` 原始 Value — presence 维度 (对象 → `Some`, null/缺席 →
+/// `None`). 2026-09-23 诚实化裁决后 Responses writer 对缺失 usage 写 null (不
+/// 伪造全零对象), 该 helper 支撑 usage presence 的往返保真断言. 按 `event:` 行
+/// 识别终止事件 (与被测 reader 的分派口径一致 — data.type 不参与判定).
+fn collect_responses_terminal_usage(sse_bytes: &[u8]) -> Option<Value> {
+    for (event, data) in iter_sse_frames(sse_bytes) {
+        if matches!(event.as_str(), "response.completed" | "response.incomplete")
+            && let Some(usage) = data.get("response").and_then(|r| r.get("usage"))
+        {
+            return usage.is_object().then(|| usage.clone());
+        }
+    }
+    None
+}
+
+/// 提取上游流的 terminal usage presence (per-protocol, 与各 reader 的
+/// `usage_present` 语义对齐; 有 event 行的协议按行分派, OpenAI 是 bare data
+/// 帧 (无 event 行), 按其协议形态直接判 data):
+/// - Responses: 终止事件 `response.usage` 为对象;
+/// - OpenAI: 任一 chunk 顶层 `usage` 为对象 (include_usage chunk);
+/// - Anthropic: `message_delta` 的 `usage` 为对象 (message_start 的 usage 是
+///   input 预置, 不构成 terminal presence — translate backfill 只填值不改位).
+fn collect_upstream_usage_present(protocol: Protocol, sse_bytes: &[u8]) -> bool {
+    match protocol {
+        Protocol::OpenAIResponses => collect_responses_terminal_usage(sse_bytes).is_some(),
+        Protocol::OpenAI => {
+            iter_sse_data_payloads(sse_bytes).any(|d| d.get("usage").is_some_and(Value::is_object))
+        }
+        Protocol::Anthropic => iter_sse_frames(sse_bytes).into_iter().any(|(event, data)| {
+            event == "message_delta" && data.get("usage").is_some_and(Value::is_object)
+        }),
+    }
+}
+
+/// 断言 Responses writer 的 usage presence 诚实呈现 (诚实化裁决的机械守卫):
+/// 客户端 (Responses wire) 终止事件的 usage 形态与上游的 terminal usage
+/// presence 一致 (对象↔对象 / null↔缺失); presence 对象时 token 数值的保真
+/// 由共享 fidelity 断言的 `collect_usage_output_tokens` 维度承担, 此处只补守
+/// 对象形态的完整性. 适用于 Responses ingress (客户端是 Responses wire) 的
+/// 任意组合.
+fn assert_responses_usage_presence_fidelity(
+    upstream_proto: Protocol,
+    upstream: &[u8],
+    client: &[u8],
+) -> Result<(), proptest::test_runner::TestCaseError> {
+    let upstream_present = collect_upstream_usage_present(upstream_proto, upstream);
+    let client_usage = collect_responses_terminal_usage(client);
+    prop_assert_eq!(
+        client_usage.is_some(),
+        upstream_present,
+        "Responses usage presence fidelity 违反: 上游 present={:?}, 客户端 usage={:?}\nupstream={:?}\nclient={:?}",
+        upstream_present,
+        client_usage,
+        String::from_utf8_lossy(upstream),
+        String::from_utf8_lossy(client),
+    );
+    if let Some(c) = &client_usage {
+        prop_assert!(
+            c.get("output_tokens").is_some(),
+            "Responses usage 对象缺 output_tokens: {c:?}"
+        );
+    }
+    Ok(())
+}
+
 // ─── 生成器: 含 mock 的 OpenAI SSE 流 ───────────────────────────────────────
 
 /// 生成 OpenAI SSE 流 (含 mock), 覆盖契约要求的流形态.
@@ -696,7 +775,10 @@ fn arb_openai_sse_stream_with_mock() -> impl Strategy<Value = (Vec<u8>, String, 
 ///
 /// 流形态: message_start → content_block_start(text) → text_delta(含 mock) →
 /// content_block_stop → content_block_start(tool_use) → input_json_delta(含 mock) →
-/// content_block_stop → message_delta(stop_reason+usage) → message_stop.
+/// content_block_stop → message_delta(stop_reason; usage 可选) → message_stop.
+///
+/// message_delta 的 usage 维度覆盖 terminal usage presence 的两态: 携带 →
+/// Responses ingress 终止事件写对象; 缺席 → 写 null (诚实呈现, 2026-09-23).
 fn arb_anthropic_sse_stream_with_mock() -> impl Strategy<Value = (Vec<u8>, String, String)> {
     (
         "[a-z]{4,12}",          // mock 的非空主体
@@ -704,9 +786,10 @@ fn arb_anthropic_sse_stream_with_mock() -> impl Strategy<Value = (Vec<u8>, Strin
         "[a-z]{3,8}",           // tool name
         "toolu_[a-z0-9]{5,10}", // tool_use id
         any::<bool>(),          // 是否有第二个 text delta
+        any::<bool>(),          // message_delta 是否携带 usage (terminal presence)
     )
         .prop_map(
-            |(mock_body, text_prefix, tool_name, tu_id, has_second_text)| {
+            |(mock_body, text_prefix, tool_name, tu_id, has_second_text, has_usage)| {
                 let mock = format!("MOCK{mock_body}");
                 let real = format!("sk-real-{mock_body}");
 
@@ -786,15 +869,16 @@ fn arb_anthropic_sse_stream_with_mock() -> impl Strategy<Value = (Vec<u8>, Strin
                     }),
                 ));
 
-                // message_delta (stop_reason + usage).
-                frames.push(anthropic_frame(
-                    "message_delta",
-                    &json!({
-                        "type":"message_delta",
-                        "delta":{"stop_reason":"tool_use","stop_sequence":Value::Null},
-                        "usage":{"output_tokens":42}
-                    }),
-                ));
+                // message_delta (stop_reason; usage 可选 — 缺席时 reader 产
+                // usage_present=false, 翻译到 Responses 时终止事件诚实写 null).
+                let mut delta_data = json!({
+                    "type":"message_delta",
+                    "delta":{"stop_reason":"tool_use","stop_sequence":Value::Null},
+                });
+                if has_usage {
+                    delta_data["usage"] = json!({"output_tokens":42});
+                }
+                frames.push(anthropic_frame("message_delta", &delta_data));
 
                 // message_stop.
                 frames.push(anthropic_frame(
@@ -822,7 +906,7 @@ fn anthropic_frame(event_type: &str, data: &Value) -> String {
 
 // ─── 生成器: 含 mock 的 Responses SSE 流 (T5) ───────────────────────────────
 //
-// 形态对齐官方 Responses 流式文档 + responses.rs tests 的 official_*_frames fixture
+// 形态对齐官方 Responses 流式文档 + responses/stream.rs tests 的 official_*_frames fixture
 // (双行帧 `event: <type>\ndata: <json>\n\n`). 流骨架:
 //
 //   response.created
@@ -847,10 +931,10 @@ fn anthropic_frame(event_type: &str, data: &Value) -> String {
 /// 是否有 usage / 是否有文本 / 是否有 reasoning.
 ///
 /// 已排除维度 (模块头 "已声明缺口"): 终止事件只产 response.completed — incomplete/
-/// failed 形态不进生成器 (stop_reason=Other 往返漂移, 由 responses.rs 确定性单测锁定).
+/// failed 形态不进生成器 (维度偏差, 由 responses/stream.rs 确定性单测锁定).
 /// 注: 只产 summary delta 变体 (`reasoning_summary_text.delta`), 不产思考原文变体
 /// (`reasoning_text.delta`) — 两者共享同一 reader 分支 (归一为 ReasoningDelta),
-/// 变体差异由 responses.rs 单测覆盖.
+/// 变体差异由 responses/stream.rs 单测覆盖.
 fn arb_responses_sse_stream_with_mock()
 -> impl Strategy<Value = (Vec<u8>, String, String, IrResponse)> {
     (
@@ -1063,7 +1147,7 @@ fn arb_responses_sse_stream_with_mock()
                 });
 
                 // 终止: response.completed (usage 可选; has_usage=false 时 null —
-                // usage presence 的字节形态不在断言范围, 见模块头已声明缺口 2).
+                // presence 往返保真由 assert_responses_usage_presence_fidelity 断言).
                 // 常量单一来源 (wire JSON 与 expected IrUsage 共用, 与
                 // arb_openai_sse_with_expected 的 usage_input/output 派生同型).
                 let (u_in, u_out) = (15u64, 7u64);
@@ -1517,7 +1601,8 @@ proptest! {
 
     /// RED-7 (T5): OpenAI egress → Responses ingress + restore — Responses writer
     /// 的 done 族帧 (output_text.done / response.completed) 携带 restore 后的全量
-    /// 内容, no-mock-leak 扫描整条客户端字节流覆盖该重合成路径.
+    /// 内容, no-mock-leak 扫描整条客户端字节流覆盖该重合成路径. 另断言 usage
+    /// presence 诚实呈现 (include_usage 缺席 → 终止事件 usage:null, 不伪造全零).
     #[test]
     fn prop_cross_proto_streaming_no_mock_leak_responses_ingress(
         case in arb_openai_sse_stream_with_mock(),
@@ -1534,6 +1619,7 @@ proptest! {
         );
 
         assert_cross_proto_restore_fidelity(&upstream_sse, &client_sse, &real, &mock)?;
+        assert_responses_usage_presence_fidelity(Protocol::OpenAI, &upstream_sse, &client_sse)?;
     }
 
     /// RED-7 (T5): Responses egress → Anthropic ingress + restore — reasoning 块
@@ -1558,6 +1644,7 @@ proptest! {
     }
 
     /// RED-7 (T5): Anthropic egress → Responses ingress + restore (反向).
+    /// 另断言 usage presence 诚实呈现 (message_delta usage 缺席 → null).
     #[test]
     fn prop_cross_proto_streaming_no_mock_leak_anthropic_to_responses(
         case in arb_anthropic_sse_stream_with_mock(),
@@ -1574,6 +1661,7 @@ proptest! {
         );
 
         assert_cross_proto_restore_fidelity(&upstream_sse, &client_sse, &real, &mock)?;
+        assert_responses_usage_presence_fidelity(Protocol::Anthropic, &upstream_sse, &client_sse)?;
     }
 }
 
