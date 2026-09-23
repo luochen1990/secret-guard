@@ -321,45 +321,6 @@ pub(super) fn warn_mock_not_restored(
     }
 }
 
-/// wire 内是否存在任何 `cache_control` key (递归遍历, M3 注入守卫).
-///
-/// 守卫动机 (#269): Anthropic 限制显式缓存断点最多 4 个; 客户端已带任何
-/// cache_control (block 级由 M1 wire-fidelity 保真, 或顶层 automatic) 时再注入
-/// 顶层标记, 断点满 4 时上游 400. 保守起见: 存在即不注入.
-fn wire_has_cache_control(v: &serde_json::Value) -> bool {
-    match v {
-        serde_json::Value::Object(map) => {
-            map.contains_key("cache_control") || map.values().any(wire_has_cache_control)
-        }
-        serde_json::Value::Array(arr) => arr.iter().any(wire_has_cache_control),
-        _ => false,
-    }
-}
-
-/// Anthropic egress 请求注入顶层自动缓存标记 (`cache_control: {"type":"ephemeral"}`,
-/// automatic caching 模式 — 断点自动落在最后一个可缓存 block 并随会话增长前移).
-///
-/// 契约 (#269 M3, FWD-1 合法修改第三类, `[redact] inject_cache_control` 显式 opt-in):
-/// - 仅当 body 内不存在**任何** cache_control 时注入 (4 断点槽守卫, 见上).
-/// - 仅 Anthropic 协议 egress 调用 (caller gate); 顶层字段是 Anthropic automatic
-///   caching 的官方形态, 无 beta header 要求.
-/// - 返回是否实际注入 (调用方记日志).
-pub(super) fn inject_auto_cache_control(body: &mut serde_json::Value) -> bool {
-    if wire_has_cache_control(body) {
-        return false;
-    }
-    match body.as_object_mut() {
-        Some(obj) => {
-            obj.insert(
-                "cache_control".to_string(),
-                serde_json::json!({"type": "ephemeral"}),
-            );
-            true
-        }
-        None => false, // 非 object body (理论不可达: Anthropic 请求恒为 object), 保守不注入
-    }
-}
-
 /// RED-8 reader 拒绝分支的共享兜底决策序列 (fan_out_buffered_ir / cross_proto_forward
 /// 的 SSOT): 在外层**已 parse** 的 `v` 上尝试 JSON 叶子级 restore (零二次 parse) —
 /// 成功 → restored WARN + 重序列化字节; 未命中/无 redaction → mock-not-restored WARN
@@ -406,45 +367,6 @@ mod tests {
     use super::*;
     use axum::http::HeaderName;
     use proptest::prelude::*;
-
-    #[test]
-    fn inject_auto_cache_control_clean_body_injects() {
-        let mut body = serde_json::json!({"model": "m", "messages": []});
-        assert!(inject_auto_cache_control(&mut body));
-        assert_eq!(
-            body["cache_control"],
-            serde_json::json!({"type": "ephemeral"})
-        );
-    }
-
-    #[test]
-    fn inject_auto_cache_control_skips_when_any_marker_exists() {
-        // block 级 (M1 保真后常见形态) — 4 断点槽守卫.
-        let mut body = serde_json::json!({
-            "model": "m",
-            "system": [{"type": "text", "text": "s", "cache_control": {"type": "ephemeral"}}],
-            "messages": [],
-        });
-        assert!(!inject_auto_cache_control(&mut body));
-        assert!(body.get("cache_control").is_none());
-        // 顶层已有 (客户端自发的 automatic) — 同样跳过.
-        let mut body = serde_json::json!({"model": "m", "cache_control": {"type": "ephemeral"}});
-        assert!(!inject_auto_cache_control(&mut body));
-        // 深层嵌套 (tool_result content 内) 也被递归守卫捕获.
-        let mut body = serde_json::json!({
-            "model": "m",
-            "messages": [{"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": "t", "content": "x",
-                 "cache_control": {"type": "ephemeral"}}]}],
-        });
-        assert!(!inject_auto_cache_control(&mut body));
-    }
-
-    #[test]
-    fn inject_auto_cache_control_non_object_body_noop() {
-        let mut body = serde_json::json!([]);
-        assert!(!inject_auto_cache_control(&mut body));
-    }
 
     #[test]
     fn build_upstream_url_handles_trailing_slash() {

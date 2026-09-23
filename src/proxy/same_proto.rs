@@ -172,16 +172,7 @@ pub(crate) async fn same_proto_forward(
     // 5. IR → 请求 body (同协议 writer 重序列化). writer 输出恒为合法 UTF-8,
     //    直接产 String 按值 move 进 record (req_body_raw); 出站仅一次
     //    clone().into_bytes() (消除 to_vec → lossy copy → to_string 三段拷贝链).
-    let mut new_body = writer.write_request(&ir);
-    // M3 (#269): Anthropic egress + opt-in 时, 对无任何缓存标记的请求注入顶层
-    // 自动缓存标记 (IR 路径上客户端自带的 block 级标记已由 M1 wire-fidelity 保真,
-    // 守卫确保不与之冲突).
-    if codec_proto == CodecProtocol::Anthropic
-        && state.inject_cache_control
-        && super::helpers::inject_auto_cache_control(&mut new_body)
-    {
-        debug!(%upstream_id, "injected top-level automatic cache_control (anthropic egress, [redact] inject_cache_control)");
-    }
+    let new_body = writer.write_request(&ir);
     let req_text_for_record = serde_json::to_string(&new_body)
         .map_err(|e| AppError::Internal(format!("serialize redacted body failed: {e}")))?;
     let req_bytes_to_send = req_text_for_record.clone().into_bytes();

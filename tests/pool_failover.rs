@@ -67,7 +67,6 @@ fn base_app_state(
         on_unsupported_protocol: redact.on_unsupported_protocol,
         on_fallback_restore: redact.on_fallback_restore,
         redacted_headers: secret_guard::state::normalize_redacted_headers(&redact.redacted_headers),
-        inject_cache_control: redact.inject_cache_control,
         upstream_timeouts: secret_guard::config::UpstreamTimeouts::default(),
         model_lists: Arc::new(secret_guard::proxy::ModelListCache::new()),
         usage: Arc::new(secret_guard::usage::UsageStore::in_memory()),

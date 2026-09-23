@@ -168,9 +168,9 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 - **响应半段** (upstream → client): secret-guard 收到上游响应 wire 后经 restore 返回客户端, 要求
   `normalize(返回客户端的 wire) == normalize(上游响应 wire).replace(mock, real)`.
 
-> **原始形状保持是高优先契约** (2026-09-23 用户裁决, issue #269 评审): 同协议转发时, **保持请求的原始形状是高优先契约** — 客户端发什么, 发往上游的就是什么 (在 real↔mock 替换与已授权修改的等式约束下). 上方枚举的三种合法修改是**显式列举的例外**, 每一种都必须: ① 有明确的授权记录; ② 例外类别中"主动添加客户端未发送内容"的注入类 (M3) 必须**默认关闭 + 显式 opt-in** — 默认配置下原始形状保持字面成立, 注入永远不得成为默认行为. 修复方向是"把破坏形状的 bug 修回形状保持" (如 #269 的 M1/M2), 而非新增形状改写.
+> **原始形状保持是高优先契约** (2026-09-23 用户裁决, issue #269): 同协议转发时, **保持请求的原始形状是高优先契约** — 客户端发什么, 发往上游的就是什么 (在 real↔mock 替换与已授权修改的等式约束下). 上方枚举的两种合法修改是**显式列举的例外**, 均有明确的授权记录; **不引入任何"主动添加客户端未发送内容"的功能** — 客户端发的请求上游不认可就让其失败 (用户绕过 secret-guard 直连同样失败, 网关不代为兜底或增强), 修复方向永远是"把破坏形状的 bug 修回形状保持" (如 #269 的 M1/M2), 而非新增形状改写或差异. (同日曾短暂实现的顶层缓存标记注入方案被此裁决否决并移除.)
 
-等价表述: **secret-guard 对 wire 的合法修改有且仅有三种: real↔mock 替换; model 字段重写 (仅当路由链上命中了携带 `upstream_model` 的路由); 以及 Anthropic egress 的顶层自动缓存标记注入 (仅当 `[redact] inject_cache_control = true` 显式 opt-in, 且请求内不存在任何 cache_control — 见下方 M3 注记)**, 除此之外的任何字节差异 (字段丢失 / 顺序错乱 / 重序列化改变 / 任意字段值变化) 都是 bug.
+等价表述: **secret-guard 对 wire 的合法修改有且仅有两种: real↔mock 替换, 以及 model 字段重写 (仅当路由链上命中了携带 `upstream_model` 的路由)**, 除此之外的任何字节差异 (字段丢失 / 顺序错乱 / 重序列化改变 / 任意字段值变化) 都是 bug.
 
 > **路由 model 重写代价明示** (2026-08-24 修订 / 2026-08-25 措辞随多规则化同步, §99 登记): 重写生效时,
 > 同协议无-secret 请求从字节直传 (passthrough) 降级为 IR 改写路径 — 前者对无 redact 请求是 byte-exact
@@ -204,8 +204,8 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 > 跨协议路径 (Anthropic ingress → 非 Anthropic egress) system 消息按 egress 协议惯例
 > 原位落位 (OpenAI messages[].system / Responses message item, FWD-3 语义保留管辖).
 
-> **Anthropic 缓存友好性保真** (2026-09-23 登记, issue #269, FWD-2 wire-fidelity 扩展 +
-> M3 注入): IR 路径不得损失请求的缓存相关信息 —
+> **Anthropic 缓存友好性保真** (2026-09-23 登记, issue #269, FWD-2 wire-fidelity 扩展):
+> IR 路径不得损失请求的缓存相关信息 —
 > ① **block 级/工具级 `cache_control`** (claude code 每请求 2-4 个缓存断点): 经 wire-fidelity
 > extra (message/tool/block 级) 原样保真, FWD-2 生成器锁定; ② **显式 `is_error: false`**:
 > Option<bool> 建模, 显式形态不省略; ③ **顶层 `system` 字段形态** (string/array): `system_form`
@@ -214,18 +214,9 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 > automatic `cache_control`) 既有透传不变. 以上均系"不丢客户端已有的信息", 非 FWD-1 合法
 > 修改类别 (等式约束成立).
 >
-> **M3 注入** (合法修改第三类, 显式 opt-in, **唯一"主动添加客户端未发送内容"的例外 —
-> 与"原始形状保持"高优先契约的张力由 默认关闭 + opt-in 化解**, 见上方形状保持注记):
-> `[redact] inject_cache_control = true` (默认 false) 时, Anthropic egress (same-proto IR
-> 路径 + cross-proto) 对**不存在任何 cache_control** 的请求注入顶层
-> `cache_control: {"type":"ephemeral"}` (automatic caching 模式). 守卫: body
-> 内已有任何 cache_control 时不注入 (Anthropic 显式断点上限 4 个, 满槽时顶层标记 400).
-> 目的: 不发缓存标记的客户端经 IR 路径后仍能吃到前缀缓存 (Anthropic 缓存为显式 opt-in,
-> 无标记 = 不写不读; IR 路径若无此注入, 长 agent 会话 input 成本约放大一个数量级).
-> 实现与测试锚点: `src/proxy/helpers.rs` inject_auto_cache_control +
-> `anthropic_ir_path_injects_top_level_cache_control_when_enabled` /
-> `anthropic_ir_path_no_cache_injection_by_default` (tests/integration.rs).
-> 已知边界: 对顶层 cache_control 返 400 的旧版 Bedrock 集成 (Opus 4.6 及更早) 需保持默认关闭.
+> 缓存标记的"不丢失"以上述 wire-fidelity 保真为限 — 网关**不代客户端注入**任何缓存标记
+> (原始形状保持, 见上方注记); 不发缓存标记的客户端经 IR 路径后仍无缓存命中, 属客户端
+> 自身行为, 与直连一致.
 
 `normalize` = canonical JSON (BTreeMap key 排序 + 紧凑序列化 + 无空白). 消除对语义无影响的字节差异, 剩下的差异全部是真正的信息差异.
 
@@ -1312,5 +1303,4 @@ chars (char boundary 安全); 其余事件字段为受控类型, 天然无 secre
 | 2026-09-23 | FWD-1 | **适用范围澄清 (用户授权, 2026-09-23)**: FWD-1 等式约束协议合法 wire; Anthropic 非法形态 `messages[].role=system` (claude code billing header 实测) 在 IR 路径被 reader 提升合并到顶层 system (与 OpenAI reader 对称), 该形态的 system 内容从 messages[] 搬移到顶层 — 字面 byte-exact 对其不成立 (位置搬移非丢失). 修复前 writer 静默丢弃该条目 (真信息丢失: 上游收不到 system 内容 + req_delta 计数与写回 body 错位致 timeline 气泡退化为 preview 截断). 原样写回替代方案会被 schema 严格上游 400 拒绝 | 用户报告 claude code `-p` 请求 timeline 只显示 48 字符 preview (2026-09-23 排查): AnthropicReader/Writer 对 messages[] 内 system 条目不对称 (reader 留在 ir.messages / writer filter 丢弃) — reader 提升为唯一既保内容又保可用性的选项 |
 | 2026-09-23 | FWD-1 (修正) | **推翻同日"正规化"决策 (用户裁决, issue #269): Anthropic `messages[].role=system` 按原位保留写回** — 该形态是官方已正式支持的合法 wire (官方文档明言其为缓存友好的指令注入方式), "提升合并到顶层 system" 改变指令生效位置 + 顶层 system 增长使缓存前缀整体失效 + 消息级字段丢失, 三重损害均系错误; FWD-1 等式恢复无例外, reader/writer 位置保真, FWD-2 生成器解除 role=system 排除机械锁定; 同日登记的"适用范围澄清"行随之作废 (历史记录保留于上, 行为以本行 + FWD-1 注记为准) | issue #269 评估 (截图分析经代码与官方文档逐项核实属实): 同日 "原样写回会被 400" 的判断对当前旗舰模型已过时; 兼容边界 (Sonnet 5 等不支持该形态) 由客户端按目标上游自选形态, 网关不代改写 |
 | 2026-09-23 | FWD-2 (wire-fidelity 扩展, L4/L5) | **wire fidelity 下沉到 message/tool/block 级 (#269 M1)**: `IrMessage`/`IrTool`/四个 wire 来源 `IrBlock` variant 增 `extra` 字段 (未建模字段逃生舱, 同协议透传/跨协议清空契约与顶层 extra 同型, `clear_wire_fidelity` 统一清空); Anthropic codec 收集/回写 block 级+工具级 `cache_control`、消息级 `output_config` 等; `tool_result.is_error` 改 `Option<bool>` (显式 false 不再静默省略); 顶层 `system` 字段形态元数据 `system_form` (单 block array 不折叠); dag BlockPool 内容寻址 hash 纳入 extra; redact 双轨遍历 (StringLeafOps + collect_ir_str_leaves) 同步覆盖 extra 叶子 (SEC 扫描无新盲区); FWD-2 生成器扩展 (system 形态+cache_control / tools extra / 消息级 output_config / block cache_control / is_error 显式 false / 响应侧 block extra) 机械锁定 | issue #269: Anthropic 缓存是显式 opt-in, IR 路径剥离缓存标记 = 长 agent 会话 input 成本约放大一个数量级; 仓库 C3 契约 (mock 确定性) 的缓存友好投入因此被完全抵消, 本修复是补完既有设计目标而非新特性 |
-| 2026-09-23 | FWD-1 (M3) | **合法修改第三类: Anthropic egress 顶层自动缓存标记注入 (显式 opt-in, issue #269)**: `[redact] inject_cache_control = true` (默认 false) 时, same-proto IR 路径与 cross-proto 的 Anthropic egress 对不存在任何 cache_control 的请求注入顶层 `cache_control: {"type":"ephemeral"}` (automatic caching); 守卫: body 内已有任何缓存标记时不注入 (显式断点上限 4, 满槽顶层标记 400); 对顶层标记返 400 的旧版 Bedrock 集成保持默认关闭. 等价表述从"两种"修订为"三种" (见 FWD-1) | 同上 (#269): claude code 等自带 block 标记的客户端由 M1 保真, 本项服务不发标记的客户端; 注入是主动改写 wire 故走 opt-in, 默认关闭下 FWD-1 等式字面成立 |
-| 2026-09-23 | FWD-1 (原则显式化) | **"原始形状保持"登记为同协议转发的高优先契约 (用户裁决)**: 客户端发什么, 发往上游的就是什么; 三种合法修改是显式列举的例外, 注入类 (M3) 必须默认关闭 + opt-in, 永不成为默认行为; 修复方向是"把破坏形状的 bug 修回形状保持"而非新增形状改写. 注记落于 FWD-1 "原始形状保持"段 + 根 AGENTS.md 工程纪律小节 | issue #269 PR #272 评审讨论: 用户对 M3 注入与形状保持契约的张力提出原则性澄清 |
+| 2026-09-23 | FWD-1 (原则显式化 + M3 否决) | **"原始形状保持"登记为同协议转发的高优先契约; 注入方案否决并移除 (用户二次裁决)**: ① 客户端发什么, 发往上游的就是什么; 两种合法修改 (mock 替换 / model 重写) 是显式列举的例外; ② **不引入任何"主动添加客户端未发送内容"的功能** — 客户端请求上游不认可就让其失败 (直连同样失败, 网关不兜底), 尽量少引入差异; ③ 同日曾实现的顶层自动缓存标记注入 (`inject_cache_control`, 合法修改"第三类"方案) 被此裁决否决, 已整体移除 (等价表述回归"两种"), changelog 留此记录供未来检索关键词: inject_cache_control / automatic caching 注入 / 顶层 cache_control | issue #269 PR #272 评审讨论: 用户先对 M3 注入与形状保持的张力提出原则性澄清, 随后裁决不引入该功能 |
