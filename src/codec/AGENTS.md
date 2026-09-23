@@ -37,7 +37,10 @@
   (hosted tools / refusal 丢弃, reasoning delta 归一, 多 part 折叠等) 见
   `docs/known-limitations.md` codec 节.
 - ❌ 不在 MVP: Bedrock / Gemini / Cohere, reasoning `encrypted_content` (provider-specific opaque),
-  Anthropic `thinking` blocks, citations, logprobs, prompt caching, Bedrock eventstream 二进制流.
+  Anthropic `thinking` blocks, citations 语义建模 (响应侧 block 未知字段已按 extra 保真), logprobs,
+  Bedrock eventstream 二进制流. prompt caching **跨协议归一化** (A8 first-class) 暂缓 — 跨协议
+  路径 cache_control 照旧丢弃 (clear_wire_fidelity, FWD-3); 同协议保真已由 wire-fidelity extra +
+  system_form 覆盖 (#269), 见 ir-fields-roadmap.md A8.
 
 > **reasoning_content 跨协议丢弃 rationale** (#176, FWD-3 已知损失): Anthropic thinking
 > block 必须携带 signature (加密签名, secret-guard 无法合成 — 伪造会被 Anthropic API 拒收);
@@ -102,33 +105,41 @@ normalize(v) == normalize(Writer(Reader(v)))
 |---|---|---|
 | `IrRequest.stop_form: Option<StopForm>` | ir.rs | stop 字段形态 (String/Array), 区分 `"stop":"x"` vs `"stop":["x"]` |
 | `IrRequest.tools_present: bool` | ir.rs | tools 字段是否存在 (区分 `"tools":[]` vs 缺失) |
+| `IrRequest.system_form: Option<SystemForm>` | ir.rs | Anthropic 顶层 system 字段形态 (String/Array), 单 block array 不折叠 (#269) |
 | `IrMessage.content_form: Option<ContentForm>` | ir.rs | message content 形态 (String/Array/Null) |
 | `IrMessage.reasoning_content_form: Option<ReasoningContentForm>` | ir.rs | assistant 消息 `reasoning_content` 显式空/null 形态 (#176), 区分 `""`/`null` vs 缺失 |
 | `IrBlock::ToolResult.content_form: Option<ContentForm>` | ir.rs | tool_result 内 content 形态 (Anthropic 特有) |
+| `IrMessage.extra: Map` / `IrTool.extra: Map` / 四个 wire 来源 `IrBlock` variant 的 `extra: Map` | ir.rs | 未建模字段逃生舱 (L4/L5, #269): 消息级 `output_config`、block 级/工具级 `cache_control`、`defer_loading` 等原样保真; 跨协议经 `clear_wire_fidelity` 清空 (含 ToolResult.content 嵌套递归); block extra 参与 dag 内容寻址 hash |
+| `IrBlock::ToolResult.is_error: Option<bool>` | ir.rs | 显式形态保真 (#269): None = 字段缺席 (API 语义 false), Some = 显式 true/false 原样回写 |
 
 **清空 SSOT**: `IrRequest::clear_wire_fidelity()` 集中清空所有 wire_fidelity 字段
-(含嵌套 ToolResult), 跨协议路径 (`proxy/cross_proto.rs::cross_proto_forward`) 调用之.
-新增 wire_fidelity 字段时只需改这一处.
+(含嵌套 ToolResult 与全部 extra, `clear_block_extras` 递归), 跨协议路径
+(`proxy/cross_proto.rs::cross_proto_forward`) 调用之. 新增 wire_fidelity 字段时只需改这一处.
 
 **当前覆盖与搁置**:
 
 - ✅ 已覆盖 (request): content 形态 (L1) / stop 形态 (L7) / tools 显式空 (L6) / tool_use input round-trip / 裸 string content part /
-  reasoning_content 三路径对称 + 显式空/null 形态 (#176, `reasoning_content_form`)
-- ⏸️ 搁置 (待后续): 多 system messages 合并 (L2) / message-level extra (L4) / block-level 未知 part (L5) / usage 字段位置与计算 (L8, response 路径)
+  reasoning_content 三路径对称 + 显式空/null 形态 (#176, `reasoning_content_form`) /
+  system 字段形态 + message/tool/block 级未建模字段 (L4/L5, #269) / is_error 显式形态 (#269)
+- ⏸️ 搁置 (待后续): 多 system messages 合并 (L2, **OpenAI/Responses codec 侧仍提升** —
+  Anthropic 已按位保留) / usage 字段位置与计算 (L8, response 路径)
 
 搁置项对应的 proptest 生成器分支已用 `// NOTE` 标注, 实现后恢复即可.
 response 路径的 2 个 property 标了 `#[ignore]`, 实现 L8 后启用.
 
-**已知边界 — Anthropic messages[] 内 role=system 条目 (2026-09-23)**: 非标准形态
-(官方 API system 只在顶层), 但 claude code 实测会把 billing header 作为 messages[0]
-(role=system) 发送。AnthropicReader 将其**提升合并**到顶层 `ir.system` (与 OpenAI reader
-对称, `read_request_promotes_system_role_message_to_top_level` 锁定), AnthropicWriter
-维持 filter (ir.messages 不再产出 System, 防御分支保留)。代价: 该形态的 round-trip
-**normalize 不等** — system 文本块从 messages[] 搬移到顶层 (位置搬移而非丢失; 非 Text
-block 仍按 writer 既有规则丢弃, 与跨协议来源的 system block 同型)。替代方案裁决
-(原样写回会被 schema 严格上游 400 拒绝) / 修复前静默丢弃行为 / 契约适用范围登记见
-contracts.md FWD-1 "Anthropic messages[].role=system 正规化" 注记 (待人工授权, §99);
-端到端回归 `anthropic_messages_system_role_survives_rewrite_path` (tests/integration.rs)。
+**已知边界 — Anthropic messages[] 内 role=system 条目 (2026-09-23 修正, #269)**: 该形态
+(中途 system 消息, claude code 实测发送 billing header / 消息级 effort 切换) 是**官方已正式
+支持的合法 wire**. AnthropicReader 将其**按原位保留**在 `ir.messages` (IrRole::System),
+AnthropicWriter 按原位写回 role=system (不再提升合并到顶层 system — 同日早前的"正规化"
+决策定性为错误: 提升改变指令生效位置 + 破坏缓存前缀 + 丢消息级字段, 见 contracts.md
+FWD-1 修正注记); round-trip **normalize 相等**, FWD-2 生成器已解除 role=system 排除
+(`arb_anthropic_message` 生成 string/array 两种形态). 兼容边界: 不支持该形态的上游/模型
+(如 Claude Sonnet 5) 会 400 — 形态由客户端按目标上游自选, 网关不代改写. 端到端回归
+`anthropic_messages_system_role_position_fidelity` (tests/integration.rs).
+跨协议侧: a→o 由 OpenAI writer 原位输出 role=system (既有能力), a→r 由 Responses writer
+原位输出 message item (`write_input_items` System 臂, 2026-09-23 从"跳过"修正 — 旧实现
+静默丢内容); o→a / r→a 的 reader 仍提升到 `ir.system` (OpenAI/Responses codec 既有行为,
+L2 搁置项).
 
 > **IR 字段建模路线图**: `extra` 字段的职责边界 (first-class vs extra 的机械化判定准则)、
 > 字段全景分类 (类别 A 应提升 / B 归 extra / 已 first-class)、以及 5 批实施路线图

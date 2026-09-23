@@ -218,7 +218,7 @@ pub struct RedactConfig {
     ///
     /// 守卫: 改写后 body 内已存在任何 `cache_control` (顶层或 block 级) 时不注入 —
     /// Anthropic 限制显式断点最多 4 个, 全占时顶层标记会 400. 默认 `false`
-    /// (主动改写 wire 属显式 opt-in, 与 [redact] 其余开关的降级偏安全取向一致).
+    /// (主动改写 wire 属显式 opt-in, 与 `[redact]` 其余开关的降级偏安全取向一致).
     ///
     /// 配置示例 (`secret-guard.toml`):
     /// ```toml

@@ -388,9 +388,16 @@ reader 同时填 `expected_usage_in_stream` 派生字段.
 仅 OpenAI Chat (`logprobs: bool` + `top_logprobs: n`) 和 Responses (顶层 `top_logprobs` + `include: ["message.output_text.logprobs"]`) 有,
 Anthropic 不支持. 形态差异大. **暂留 extra**, 同 A5/A6 加 warning.
 
-### A8 — prompt cache 控制 (P3)
+### A8 — prompt cache 控制 (P3; 同协议保真已落地 #269)
 
 `prompt_cache_options` (OpenAI Chat + Responses) vs `cache_control` (Anthropic) — 两协议都有但语义形态差异大 (request 级 vs block 级), 归一化设计复杂. **暂留 extra**.
+
+> **2026-09-23 同协议保真落地 (#269, wire-fidelity 扩展)**: Anthropic 同协议路径的
+> `cache_control` (block 级 + 工具级) 经 message/tool/block 级 wire-fidelity `extra`
+> **原样保真** (FWD-2 生成器锁定), 不再在 IR 路径静默剥离; 另有 `[redact]
+> inject_cache_control` 顶层 automatic 标记注入 (M3, 显式 opt-in, contracts.md FWD-1
+> 合法修改第三类). 本条目的**跨协议归一化设计** (OpenAI request 级 ↔ Anthropic block 级
+> 语义映射) 仍为 P3 待办 — 与同协议保真正交, 前者是"翻译", 后者是"不丢".
 
 ### A9 — metadata (P3)
 
@@ -490,3 +497,4 @@ OpenAI `metadata: map(16 KV)` vs Anthropic `metadata: {user_id}` — 这两个�
 |---|---|---|
 | 2026-08-05 | 初版 (基于三阶段调研: 前人工作 / 字段全景 / 使用统计) | opencode-bot |
 | 2026-08-23 | `reasoning_content` (思考原文, #176) 按 §2.2 准则判定: 出现在 OpenAI Chat 的请求 (assistant 历史回传) / 非流式响应 / 流式 delta 三路径, 但另两协议无合法合成形态 (Anthropic thinking 需 signature / Responses reasoning 需 encrypted_content) → **步骤 2 不满足, 建 first-class block (`IrBlock::ReasoningContent`) 但跨协议丢弃**. 这是 §2.2 准则的边界案例: "无跨协议映射"通常归 extra, 但 extra 是顶层字段逃生舱, 无法表达 message-level / stream delta 的同协议保真, 故建独立 block variant (契约 STR-6). 与 A1 (reasoning **配置**) 正交: A1 是请求侧 effort/budget 参数, 本条是响应侧思考原文. | opencode-bot |
+| 2026-09-23 | **wire fidelity 下沉到 message/tool/block 级 (L4/L5 实施, #269)**: `IrMessage`/`IrTool`/四个 wire 来源 `IrBlock` variant 增 `extra` (未建模字段逃生舱, 与顶层 extra 同契约: 同协议透传/跨协议 `clear_wire_fidelity` 清空), `IrBlock::ToolResult.is_error` 改 `Option<bool>` (显式形态保真), 新增 `IrRequest.system_form` (顶层 system string/array 形态, 单 block array 不折叠). 按 §2.2 准则: cache_control/defer_loading 等在 Anthropic 为 block/tool 级载体, 顶层 extra 逃生舱无法表达 (同 2026-08-23 reasoning_content 判定的边界案例逻辑), 故下沉到对应层级; 跨协议归一化 (A8) 仍 P3 待办 — extra 契约 = "跨协议该丢", 与本条 "同协议不丢" 正交. redact 双轨遍历 (StringLeafOps + collect_ir_str_leaves) 同步扩展, dag BlockPool 内容寻址 hash 纳入 extra (intern 正确性). Anthropic codec 先行 (OpenAI/Responses 的 message/block extra 收集待后续, 字段已就位). FWD-2 生成器扩展机械锁定 (system 形态 / cache_control / defer_loading / output_config / is_error 显式 false / 响应侧 block extra). | issue #269 (缓存友好性评估 → 用户裁决 M1+M2+M3 全做) |
