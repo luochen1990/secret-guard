@@ -109,25 +109,43 @@ pub(crate) fn extract_preview_and_model_from_ir(
         Some(ir.model.clone())
     };
 
-    // 收集候选: 遍历 messages, 提取每条的 (role, 首个文本块文本).
+    // 收集候选: 遍历 messages, 提取每条的 (role, 全部文本块 join).
     // IrMessage.content 是 Vec<IrBlock>, 文本块是 IrBlock::Text { text }.
-    let candidates: Vec<(&str, &str)> = ir
+    // 多 Text block 用 " " join + preview_head 截断 — 与字符串入口 `message_text`
+    // 的 join 语义逐字对齐 (consistency-check 的 assert_preview_model_match_source
+    // 以字符串提取为 SSOT 断言两入口一致; 2026-09-23 前本入口只取首个 block,
+    // 多 block user message (claude code 的 system-reminder + 问题) 下两入口漂移,
+    // 被新集成测试在 consistency-check 下首次踩中).
+    let joined: Vec<(String, String)> = ir
         .messages
         .iter()
         .filter_map(|m| {
-            let text = m.content.iter().find_map(|b| match b {
-                crate::codec::ir::IrBlock::Text { text } if !text.is_empty() => Some(text.as_str()),
-                _ => None,
-            })?;
+            let texts: Vec<&str> = m
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    crate::codec::ir::IrBlock::Text { text } if !text.is_empty() => {
+                        Some(text.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            if texts.is_empty() {
+                return None;
+            }
             // IrRole → 字符串 (与 wire JSON 的 role 值一致: lowercase).
             let role = match m.role {
-                crate::codec::ir::IrRole::System => "system",
-                crate::codec::ir::IrRole::User => "user",
-                crate::codec::ir::IrRole::Assistant => "assistant",
-                crate::codec::ir::IrRole::Tool => "tool",
+                crate::codec::ir::IrRole::System => "system".to_string(),
+                crate::codec::ir::IrRole::User => "user".to_string(),
+                crate::codec::ir::IrRole::Assistant => "assistant".to_string(),
+                crate::codec::ir::IrRole::Tool => "tool".to_string(),
             };
-            Some((role, text))
+            Some((role, preview_head(&texts.join(" "))))
         })
+        .collect();
+    let candidates: Vec<(&str, &str)> = joined
+        .iter()
+        .map(|(r, t)| (r.as_str(), t.as_str()))
         .collect();
 
     let preview = select_and_truncate_preview(&candidates);
