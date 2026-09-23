@@ -103,6 +103,13 @@
 1. 编码人员 (含 AI agent) 修代码使其符合契约, commit msg 引用契约 ID.
 2. 若认为契约本身过时, **必须先报告人工 (项目维护者) 审批**, 批准后才能改契约. 改契约的 commit msg 注明 "docs(contracts): <ID> 因为 <原因> 调整", 重大调整 (语义变化) 在 [§99 变更日志](#99-变更日志) 记录.
 
+**免授权例外 (2026-09-23 用户授权, 政策依据 = 根 AGENTS.md "契约演进原则")**:
+两类方向的契约修订**免人工授权** (同步更新契约正文与 property 断言即可, 重大调整
+仍在 §99 记录) — ① **诚实化**: 诚实呈现数据的缺失/来源/粒度 (如 usage 缺失时写
+null 而非伪造全零对象); ② **精确化**: 协议间互译把粗粒度映射改精确、消除信息损失
+(如 stop_reason 按 output 推断). 契约锁定的断言可能只是之前实现阶段的折衷, 这两类
+演进不受其阻碍. 其余方向 (行为弱化、语义收窄等) 仍走人工授权.
+
 ### 0.6 Property 落地状态标注 + traceability lint (#144)
 
 每条 property 行尾**必须**带三种落地状态标注之一, 由 `just check-contracts` (进 `just check`
@@ -450,7 +457,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 - `prop_stream_scan_accumulates_tool_use`: tool_use input JSON 部分片段跨 chunk 累积正确. ✅
 - `prop_stream_scan_include_usage_chunk`: OpenAI include_usage chunk 正确更新 usage (terminal delta input_tokens=0 时 backfill). ✅
 - `prop_stream_scan_ignores_post_stop_noise`: stop event 后的噪声 chunk 被忽略. ✅
-- `prop_responses_stream_scan_matches_expected_ir` (2026-09-23, T5): Responses SSE 流 (reasoning summary / text / function_call args delta / 可选 usage) 经 StreamScan 累积的 snapshot == 生成器同步构造的预期 IrResponse. 字面 "scan ≡ 非流式 read_response" 在 Responses 侧不成立 — 两个已知建模分歧: ① stop_reason 推断不对称 (流式 `saw_function_call`→ToolUse vs 非流式 status→EndTurn), ② reasoning 双变体 (流式 ReasoningContent vs 非流式 Reasoning{summary}); 故取生成器预期形式 (与 OpenAI 实现同型, 见 `src/codec/fwd_streaming_property.rs` 头部 "已声明缺口"). ✅
+- `prop_responses_stream_scan_matches_expected_ir` (2026-09-23, T5): Responses SSE 流 (reasoning summary / text / function_call args delta / 可选 usage) 经 StreamScan 累积的 snapshot == 生成器同步构造的预期 IrResponse. 字面 "scan ≡ 非流式 read_response" 在 Responses 侧不成立 — 一个已知建模分歧: reasoning 双变体 (流式 ReasoningContent vs 非流式 Reasoning{summary}) (历史另一分歧 stop_reason 推断不对称已于 2026-09-23 消除: 非流式 "completed" 统一为按 output 推断); 故取生成器预期形式 (与 OpenAI 实现同型, 见 `src/codec/fwd_streaming_property.rs` 头部 "已声明缺口"). ✅
 
 ### STR-3 流式错误降级 (best-effort, 不泄漏)
 
@@ -1252,3 +1259,5 @@ chars (char boundary 安全); 其余事件字段为受控类型, 天然无 secre
 | 2026-09-19 | POOL-1..6 (新增, 待人工授权) | 新增套餐池 failover 契约域: POOL-1 顺序 failover (无游标列表序 + 闹钟回归列表头 + 位置对齐重建 + missing/disabled 跳过无持久标记 — 配置可用性不进状态机) / POOL-2 三通道信号判定纯函数性 (status/header/code OR + 四位置字符串码 + ROB 零 panic) / POOL-3 闹钟自愈 (Retry-After → next_flush_time → anthropic reset 优先序, clamp [cooldown, 7d], cooldown 兜底) / POOL-4 全耗尽本地 503 快速失败 (零上游请求 + SEC-2 净化) / POOL-5 检测旁路性 (不改转发响应任何字节, FWD-1 附属) / POOL-6 默认表窗口限额语义域 (付费/瞬态不进默认) + 字段级替换配置语义. 全部 property 挂现有测试 (`src/pool.rs` / `src/provider.rs` / `tests/pool_failover.rs`), 1 条 ✅ + 22 条 🔁 | Pool Provider 特性 (编码订阅套餐窗口限额轮换, spec 已与用户确认 2026-09-18); 本段为 T4 文档同步的契约起草, 按 §0.5 流程待用户登记授权 |
 | 2026-09-23 | FWD-5 + RED-7 | **Responses 流式 501 解除**: Responses 流式 writer 落地 (T3) 后解除 proxy 层 501 门 (same_proto 的 redact+stream 门 + cross_proto 的 Responses 任一侧门) — 同协议 + redact 命中 + stream 走 StreamTranslate 同协议 restore 模式, 跨协议 Responses 任一侧走跨协议翻译模式 (codec 覆盖族内任意 pair 流式均翻译); FWD-5 的 `prop_cross_proto_streaming_responses_returns_501` 作废, 翻转为 `prop_cross_proto_streaming_responses_translates`; RED-7 新增 `prop_same_proto_streaming_responses_restore_no_leak` (同协议端到端). Responses 流式已知损失 (D5: hosted tools/refusal 丢弃, reasoning delta 归一, 多 content part 折叠等) 的 known-limitations 登记待 T6 | Responses 流式 SSE 完整支持方案 T4 (前置: codec 流式 reader T2 / writer T3) |
 | 2026-09-23 | STR-1/STR-2 + FWD-1/FWD-3 + RED-7 (T5) | **Responses 流式纳入 property 机械验证**: 新增 `arb_responses_sse_stream_with_mock` 生成器 (reasoning summary / text / function_call args 三类 mock 载体 + 同步构造 STR-2 oracle); STR-1 新增 r→r 同协议 restore 字节级切分等价 (`resp_` id/`created_at` 归一化) + StreamScan(Responses) 切分等价 + 跨协议四组合 (r⇄o / r⇄a) 断言锚点; STR-2 新增生成器预期形式 (字面 scan≡非流式在 Responses 侧有两个建模分歧 — stop_reason 推断不对称 + reasoning 双变体, 显式登记为缺口而非放宽断言); FWD-1 流式半段 + RED-7 跨协议 restore 扩至 Responses 组合. T3 移交的两个已知漂移 (usage_present false→true / stop_reason=Other→failed) 按方案 D5 从生成器排除 (终止事件只产 response.completed; usage 只断言 output_tokens 值), 登记于 fwd_streaming_property.rs 头部供后续裁决 | Responses 流式 SSE 完整支持方案 T5 (前置: T4 proxy 解除) |
+| 2026-09-23 | FWD-3 (Responses stop_reason) | **精确化演进 (免授权, §0.5 例外①)**: Responses 非流式 `read_response_status` 的 "completed" 分支从恒 EndTurn 改为按 output 推断 (有 function_call item → ToolUse, 无 → EndTurn), 与流式 reader 的 `saw_function_call` 推断对齐 — 流式/非流式粒度分叉消除, Chat tool_calls 经 Responses round-trip 精确保真; 单测 `responses_stop_reason_granularity_loss_cross_proto` 更名 `responses_stop_reason_tool_use_preserved_cross_proto` (断言从锁定降级翻转为锁定保真) | 用户裁决 (2026-09-23): 互译精确化是无需授权的演进方向, 契约锁定断言只是之前实现阶段的折衷 |
+| 2026-09-23 | FWD-3 (Responses usage presence + Other 映射) | **诚实化 + 误导消除演进 (用户裁决)**: ① Responses writer (非流式 `write_response` + 流式终止事件) 对 `usage_present=false` 写 `"usage": null` 而非合成全零对象 — 上游未报用量不再被翻译成 "网关报了 0", round-trip presence 保真 (流式 round-trip 断言收紧为完全一致, Responses ingress 组合新增 `assert_responses_usage_presence_fidelity`); ② `write_status_str(Other)` 从 "failed" 改 "completed" — 未知停止原因大多是正常结束的变体, 伪装 failed 会触发客户端错误处理路径 (弹错/重试); 读侧 "failed"→Other 保持, round-trip failed→Other→completed 有损 (已知折衷: 未知不伪装成确定错误) | 用户裁决 (2026-09-23): 尊重事实是通用原则 (usage 缺失不伪造), 误导性错误信号必须消除 |

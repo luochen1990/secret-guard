@@ -204,6 +204,11 @@ Redact 不应无必要地改变 request body 的字节内容, 避免破坏 LLM P
 测试: 单元 (`src/server_host_guard.rs::tests`) + 集成 (`tests/integration.rs`
 SEC-7 段); 可测 property 见 `docs/design/contracts.md` **SEC-7**。
 
+### 契约演进原则 (2026-09-23 用户授权)
+
+- **尊重事实** (诚实呈现数据的缺失/来源/粒度 — 如 usage 缺失时不伪造全零对象) 是通用原则, 向此方向演进**无需人工授权**.
+- 协议间互译的**精确化** (把粗粒度映射改精确、消除信息损失 — 如 stop_reason 按 output 推断) 同样无需授权 — 契约锁定的断言可能只是之前实现阶段的折衷, 精确化演进不受其阻碍 (同步更新契约正文与 property 断言即可). 政策落点: `docs/design/contracts.md` §0.5.
+
 ## 降级偏安全原则 (fail-safe degradation) → SEC-10 契约
 
 secret-guard 在无法维持核心保证 (real secret 不出现在未授权位置) 的降级路径上,
