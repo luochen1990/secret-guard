@@ -321,27 +321,29 @@ pub struct ServerConfig {
     /// 是"收到响应头", response body 由后续 `bytes_stream()` 读. 这个超时只约束
     /// "响应头到达", 不影响流式 body 的总时长 (流式可能持续几分钟, 是正常的).
     ///
-    /// 历史 bug: 上游网络异常时 send().await 永久阻塞 → record 永远 pending.
-    ///
-    /// #175 后本字段只约束显式 `stream=true` 的请求 (响应头在首 token 生成后即返回,
-    /// TTFT 量纲); 非流式请求 (响应头要等整个响应生成完) 用
-    /// [`ServerConfig::upstream_nonstream_response_header_timeout_secs`] (整响应量纲).
+    /// 角色定位 (2026-09-23 裁决): **防挂兜底, 不是 TTFT 上界**. 深度思考 / 大上下文
+    /// prefill / relay 伪流式下响应头可远超旧默认 60s 才到, 误杀代价 = 3 倍账单
+    /// (上游已付 + 客户端零产出 + 重试重付). 连接活性检测归 TCP keepalive
+    /// (`build_upstream_client`, 亚分钟级判死 → 502); 本超时只兜 "进程活着
+    /// 但死锁" 的极端残留, 保证 record 最终有终态 (客户端 SDK 普遍 10min 先超时).
+    /// #175 后本字段只约束显式 `stream=true` 的请求; 非流式请求用
+    /// [`ServerConfig::upstream_nonstream_response_header_timeout_secs`].
     pub upstream_response_header_timeout_secs: u64,
     /// 上游响应头到达超时 (秒), **非流式请求档** (整响应语义). 0 = 无限 (向后兼容).
     ///
-    /// 非流式请求的响应头要等**整个响应生成完**才返回 (LLM 生成 N token 的总时长),
-    /// 与流式请求的 TTFT 是不同量纲 — 大上下文 (几十 k token prefill) 晚高峰下
-    /// 整响应耗时轻松超过 60s, 用 TTFT 量纲的超时约束它会结构性误杀合法请求
-    /// (#175: hermes cron 9 连续 504 事故). 默认 300s 覆盖 74k token 上下文的
-    /// 整响应生成; 判定语义 ("显式顶层布尔 true 才算流式") 的实现有两处且须保持
-    /// 等价: `proxy::helpers::requests_stream` (passthrough) 与 codec reader
-    /// (IR 路径用 `ir.stream`).
+    /// 非流式请求的响应头要等**整个响应生成完**才返回 (prefill + 深度思考 + 全部
+    /// 生成, #175: 74k token 晚高峰整响应 > 60s), 与流式请求的 TTFT 是不同量纲.
+    /// 角色定位同流式档: 防挂兜底 (默认 3600s), 活性检测归 TCP keepalive;
+    /// #175 的 300s 在思考时间增长曲线下误杀窗口重新打开. 判定语义 ("显式顶层
+    /// 布尔 true 才算流式") 的实现有两处且须保持等价: `proxy::helpers::requests_stream`
+    /// (passthrough) 与 codec reader (IR 路径用 `ir.stream`).
     pub upstream_nonstream_response_header_timeout_secs: u64,
     /// 上游流式响应 chunk 空闲超时 (秒). 0 = 无限 (向后兼容).
     ///
-    /// 流式响应两个 chunk 之间的最大间隔. LLM 正常流式 chunk 间隔 < 1s;
-    /// reasoning model "思考"阶段会有较长静默但通常有心跳 chunk. 超过此间隔
-    /// 视为上游 hang, 标记 record 为 incomplete + 返回客户端错误.
+    /// 流式响应两个 chunk 之间的最大间隔. 角色定位 (2026-09-23 裁决): **防挂兜底**,
+    /// 不是正常间隔上界 — "连接活着但无数据"不构成 hang 证据: 思考期静默 /
+    /// relay 攒批是合法的慢 (杀 = 3 倍账单), 真死连接由 TCP keepalive 探测判死
+    /// (NAT 黑洞场景探测包被丢弃 → 502). 默认 3600s 只保证 record 最终有终态.
     pub upstream_stream_idle_timeout_secs: u64,
     /// 显式声明信任的**域名** (SEC-7 Host guard 白名单, 反代 + 域名部署形态).
     ///
@@ -363,12 +365,13 @@ pub struct ServerConfig {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UpstreamTimeouts {
     pub connect: Option<Duration>,
-    /// 流式请求 (显式 `stream=true`) 的响应头超时 — TTFT 语义 (默认 60s).
+    /// 流式请求 (显式 `stream=true`) 的响应头超时 — TTFT 语义 (默认 3600s 防挂兜底).
     pub response_header: Option<Duration>,
-    /// 非流式请求的响应头超时 — 整响应语义 (默认 300s, #175).
+    /// 非流式请求的响应头超时 — 整响应语义 (默认 3600s 防挂兜底, #175 → 2026-09-23 再放宽).
     ///
     /// 量纲论证见 `ServerConfig::upstream_nonstream_response_header_timeout_secs`.
     pub nonstream_response_header: Option<Duration>,
+    /// 流式 chunk 空闲超时 (默认 3600s 防挂兜底; 活性检测归 TCP keepalive).
     pub stream_idle: Option<Duration>,
 }
 
@@ -407,18 +410,13 @@ impl Default for ServerConfig {
             host: "127.0.0.1".to_string(),
             port: 8787,
             records_capacity: 1024,
-            // 15s: DNS+TCP+TLS 握手正常 < 3s, 15s 是宽松兜底.
+            // 15s: 建连是唯一有明确完成信号、量纲自信的阶段 (对比: 一切 "等多久"
+            // 型超时均为防挂兜底, rationale 见各字段 doc).
             upstream_connect_timeout_secs: 15,
-            // 60s: 流式请求 (TTFT) — 响应头在首 token 生成后即返回, 60s 覆盖
-            // 大上下文 prefill + 首 token. reasoning model 的"长思考"发生在 body 流,
-            // 不影响响应头到达.
-            upstream_response_header_timeout_secs: 60,
-            // 300s: 非流式请求 (整响应) — 响应头要等整个响应生成完才返回,
-            // 大上下文 (74k token) 晚高峰整响应可超 60s, 300s 是 TTFT 量纲 60s 的
-            // 整响应量纲对应值 (#175).
-            upstream_nonstream_response_header_timeout_secs: 300,
-            // 120s: 流式 chunk 空闲. 正常 < 1s, reasoning 静默可能较长, 120s 宽松.
-            upstream_stream_idle_timeout_secs: 120,
+            // 3600s: 三档统一防挂兜底, rationale 见各字段 doc + contracts.md FWD-4.
+            upstream_response_header_timeout_secs: 3600,
+            upstream_nonstream_response_header_timeout_secs: 3600,
+            upstream_stream_idle_timeout_secs: 3600,
             // 空: 默认拒绝所有域名 Host (SEC-7). 见字段 doc 注释.
             allowed_domains: Vec::new(),
         }
@@ -4432,14 +4430,14 @@ mod proptests {
     // 契约 (docs/design/contracts.md FWD-4): 响应头超时按请求 stream 语义分档.
     // 固定值断言 (配置 schema 是确定性的, 故 #[test] 而非 proptest!).
 
-    /// 默认值锁定: 流式档 60s (TTFT 量纲) / 非流式档 300s (整响应量纲).
-    /// 非流式默认从 60s 放宽到 300s 的 rationale 见 issue #175 (74k token 上下文
-    /// 晚高峰整响应 > 60s, 旧单一 60s 档结构性误杀非流式大请求).
+    /// 锁定 2026-09-23 裁决默认档: 三档统一 3600s 防挂兜底 (rationale 见
+    /// `ServerConfig` 各字段 doc + contracts.md FWD-4 "超时职责分工"; 历史: 60/300/120).
     #[test]
     fn prop_nonstream_header_timeout_default_tiers() {
         let t = UpstreamTimeouts::from(&ServerConfig::default());
-        assert_eq!(t.response_header, Some(Duration::from_secs(60)));
-        assert_eq!(t.nonstream_response_header, Some(Duration::from_secs(300)));
+        assert_eq!(t.response_header, Some(Duration::from_secs(3600)));
+        assert_eq!(t.nonstream_response_header, Some(Duration::from_secs(3600)));
+        assert_eq!(t.stream_idle, Some(Duration::from_secs(3600)));
     }
 
     /// 分档选择: header_timeout(stream) 按 stream 语义选档 (FWD-4 核心 property).
@@ -4477,7 +4475,7 @@ upstream_nonstream_response_header_timeout_secs = 0
         let cfg: ServerConfig =
             toml::from_str("upstream_nonstream_response_header_timeout_secs = 120").unwrap();
         let t = UpstreamTimeouts::from(&cfg);
-        assert_eq!(t.response_header, Some(Duration::from_secs(60))); // 未配 → 默认
+        assert_eq!(t.response_header, Some(Duration::from_secs(3600))); // 未配 → 默认
         assert_eq!(t.nonstream_response_header, Some(Duration::from_secs(120))); // 显式覆盖
     }
 }

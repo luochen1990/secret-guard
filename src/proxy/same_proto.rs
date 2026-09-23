@@ -383,7 +383,8 @@ async fn same_proto_passthrough(
 
     // 响应头超时按请求 body 的流式语义选档 (#175): passthrough 无 codec 解析,
     // 用 requests_stream 对原始字节做顶层 "stream" 检测 (保守判定: 只有显式
-    // stream=true 才用流式短超时, rationale 见该函数 doc).
+    // stream=true 才用流式档, rationale 见该函数 doc; 两档默认同为 3600s
+    // 防挂兜底, 差异仅在用户显式配置时体现).
     let stream_requested = requests_stream(&req_bytes);
     let upstream_resp = super::recorder::send_upstream_or_fail(
         &state.dag,

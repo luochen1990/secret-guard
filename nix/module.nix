@@ -66,9 +66,9 @@ let
   # 超时行, serde default 兜底).
   upstreamTimeoutsDefaults = {
     connectTimeoutSecs = 15;
-    responseHeaderTimeoutSecs = 60;
-    nonstreamResponseHeaderTimeoutSecs = 300;
-    streamIdleTimeoutSecs = 120;
+    responseHeaderTimeoutSecs = 3600;
+    nonstreamResponseHeaderTimeoutSecs = 3600;
+    streamIdleTimeoutSecs = 3600;
   };
 
   # 超时段是否被使用 (任一字段偏离默认). 不参与 structuredUsed: 单设超时而无
@@ -236,9 +236,10 @@ in
         default = upstreamTimeoutsDefaults.responseHeaderTimeoutSecs;
         description = ''
           流式请求 (显式 stream=true) 的响应头到达超时秒 ([server]
-          upstream_response_header_timeout_secs), TTFT 量纲 — 响应头在首 token
-          生成后即返回, 长思考发生在 body 流不受此限. 0 = 无限 (向后兼容,
-          不建议 — 上游 hang 时该超时是唯一的活性检测).
+          upstream_response_header_timeout_secs). 防挂兜底量纲 (2026-09-23 裁决),
+          非时长上界 — 深度思考 / 大上下文 prefill / relay 伪流式下响应头可远超
+          旧默认 60s. 连接活性检测归 TCP keepalive (reqwest 默认参数, 分区 /
+          NAT 黑洞亚分钟级判死 → 502). 0 = 无限.
         '';
       };
 
@@ -248,13 +249,14 @@ in
         description = ''
           非流式请求的响应头到达超时秒 ([server]
           upstream_nonstream_response_header_timeout_secs), 整响应量纲 — 非流式
-          响应头要等整个响应生成完才返回, 该值实际是单次生成时长上限.
+          响应头要等整个响应生成完才返回.
 
-          默认 300 覆盖 74k token 上下文的整响应生成 (#175). 注意: 非流式请求
-          在生成完成前零字节流动, 网关侧无法区分"慢生成"与"hang 死", 任何墙钟
-          都会误杀超过它的合法慢生成 (agent-service#130: 思考模型大首轮 >300s
-          被掐断 → 消费方重试风暴). 若所有消费方都有自身超时预算兜底 (客户端
-          断连会取消上游请求), 可设 0 (无限) 拆墙 — 让"慢"的判定权归消费方/上游.
+          防挂兜底量纲 (2026-09-23 裁决): 生成完成前零字节流动, 网关侧无法区分
+          "慢生成"与"hang 死", 任何墙钟都会误杀超过它的合法慢生成 (#175 与
+          agent-service#130: 思考模型大首轮 >300s 被掐断 → 消费方重试风暴;
+          误杀 = 3 倍账单), 故默认 3600 只兜终态. 连接活性检测归 TCP keepalive;
+          若所有消费方都有自身超时预算兜底 (客户端断连会取消上游请求), 可设
+          0 (无限) 拆墙 — 让"慢"的判定权归消费方/上游.
         '';
       };
 
@@ -262,9 +264,10 @@ in
         type = lib.types.ints.unsigned;
         default = upstreamTimeoutsDefaults.streamIdleTimeoutSecs;
         description = ''
-          流式响应相邻 chunk 空闲超时秒 ([server] upstream_stream_idle_timeout_secs).
-          正常 chunk 间隔 < 1s; reasoning model 思考静默可能较长 (通常有心跳
-          chunk). 超过视为上游 hang. 0 = 无限.
+          流式响应相邻 chunk 空闲超时秒 ([server]
+          upstream_stream_idle_timeout_secs). 防挂兜底量纲 — "连接活着但无数据"
+          不构成 hang 证据 (思考静默 / relay 攒批是合法慢, 2026-09-23 裁决);
+          NAT 黑洞由 TCP keepalive 判死. 0 = 无限.
         '';
       };
     };

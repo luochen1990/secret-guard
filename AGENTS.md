@@ -388,9 +388,11 @@ Secret / Provider 的两种 value 来源 (`value`/`value_file`、`api_key`/`api_
 - `on_probe_exhausted`: 实现指针 `src/redact.rs::redact_ir_checked` + `src/config.rs::OnProbeExhausted`; 默认 `fail_closed` 是 SEC-10 2026-09 翻转 (历史 `fail_open` 需显式 opt-in); 配置显式写出便于审计.
 - `on_unsupported_protocol`: 实现指针 `src/proxy/same_proto.rs` from_native-None 分支 + `src/config.rs::OnUnsupportedProtocol`; 默认 `fail_closed` 同为 SEC-10 2026-09 翻转.
 - `redacted_headers`: 归一化实现 `state.rs::normalize_redacted_headers`; 脱敏名单 = 硬编码黑名单 (`proxy::helpers::is_sensitive_header` 为 SSOT) ∪ 本配置, 请求/响应两侧 record 记录点统一取 `AppState::redacted_headers`.
-- `upstream_connect_timeout_secs`: `0` = 无限 (向后兼容, 不建议); 覆盖 reqwest `connect_timeout`.
-- `upstream_nonstream_response_header_timeout_secs`: 非流式档默认 300s 的量纲依据 = #175 事故 (74k token 上下文被 9 连续 504 误杀, 60s 对非流式是错误量纲); "流式" 判定 SSOT = 显式顶层布尔 `true` 才算流式 (实现 `proxy::helpers::requests_stream` + codec reader, 两处等价).
-- `upstream_response_header_timeout_secs`: 流式请求档为 TTFT 语义 (响应头在首 token 后到达); 超时记 504 record (防 `send().await` 永久阻塞).
+- TCP keepalive (非配置, 内置): `server.rs::build_upstream_client` 显式钉住 reqwest 0.12.28 默认参数 (idle 15s + interval 15s + retries 3 + Linux TCP_USER_TIMEOUT 30s) — 全局 "活性判官" (亚分钟级 ~45s 判死 → 502). 注: reqwest 0.12.x 默认已开启 keepalive, 钉住是防升级静默漂移 (应用层超时放宽为 3600s 兜底后, keepalive 是死连接的唯一快速检测). 职责分工完整陈述见 contracts.md **FWD-4** "超时职责分工" 段.
+- `upstream_connect_timeout_secs`: `0` = 无限 (向后兼容, 不建议); 覆盖 reqwest `connect_timeout`. 建连是唯一量纲自信的阶段, 15s 保持设紧.
+- `upstream_nonstream_response_header_timeout_secs`: 非流式档默认 3600s = 防挂兜底量纲 (2026-09-23 裁决: #175 的 300s 在深度思考增长下误杀窗口重新打开; 活性检测归 TCP keepalive); "流式" 判定 SSOT = 显式顶层布尔 `true` 才算流式 (实现 `proxy::helpers::requests_stream` + codec reader, 两处等价).
+- `upstream_response_header_timeout_secs`: 流式请求档为 TTFT 语义 (响应头在首 token 后到达), 默认 3600s 防挂兜底 (旧 60s 误杀大上下文 prefill / relay 伪流式); 超时记 504 record.
+- `upstream_stream_idle_timeout_secs`: 流式 chunk 空闲档, 2026-09-23 裁决随三档统一 3600s 防挂兜底 (rationale 见 contracts.md FWD-4 "超时职责分工").
 
 ## 开发流程
 

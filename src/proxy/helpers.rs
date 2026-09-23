@@ -188,10 +188,12 @@ fn top_level_field<T: serde::de::DeserializeOwned>(body: &[u8], key: &str) -> Op
 ///
 /// # 为什么保守方向是"缺省算非流式"
 ///
-/// 超时选错档的两种代价不对称: 非流式大上下文请求 (响应头要等整个响应生成完,
-/// 74k token 可轻松超 60s) 被流式短超时误杀 = **合法请求结构性失败** (#175 事故);
-/// 反方向 (流式请求吃到非流式长超时) 只是 hang 的流式请求晚一点超时 (且仍有
-/// `stream_idle` 超时兜底). 故缺字段 / 解析失败一律落到非流式长超时档.
+/// 超时选错档的两种代价不对称 (当两档配置相异时显现; 生产默认同为 3600s
+/// 防挂兜底, 见 `UpstreamTimeouts::header_timeout`): 非流式大上下文请求
+/// (响应头要等整个响应生成完, 74k token 可轻松超 60s) 被流式档 (用户配的
+/// 较短值) 误杀 = **合法请求结构性失败** (#175 事故); 反方向 (流式请求吃到
+/// 非流式档的较长配置) 只是 hang 的流式请求晚一点超时 (且仍有 `stream_idle`
+/// 超时兜底). 故缺字段 / 解析失败一律落到非流式档.
 ///
 /// # 与 codec reader 的等价性 (语义 SSOT)
 ///
@@ -560,7 +562,7 @@ mod tests {
 
     #[test]
     fn requests_stream_malformed_bodies_fall_back_to_nonstream() {
-        // ROB-1: 任何解析异常 → false (非流式 = 长超时, 保守方向见 doc).
+        // ROB-1: 任何解析异常 → false (非流式档, 保守方向见 doc).
         assert!(!requests_stream(b"")); // 空 body (GET / 非聊天端点)
         assert!(!requests_stream(b"not json at all"));
         assert!(!requests_stream(b"[1,2,3]")); // 顶层非对象

@@ -545,8 +545,10 @@ let
   # fallback/调试参考); 超时四项仅在 upstreamTimeouts 非 null (任一字段偏离
   # serde 默认, module 层深比较判定) 时全量渲染, records_capacity 仍由上游
   # serde default 兜底 (与 host/port 一样是无需暴露的部署细节).
-  # 量纲: connect=握手 / response_header=流式 TTFT / nonstream_response_header=
-  # 非流式整响应 (单次生成时长上限) / stream_idle=chunk 空闲; 0 = 无限.
+  # 量纲 (2026-09-23 裁决): connect=握手 (量纲自信, 设紧) / response_header=
+  # 流式 TTFT 档 / nonstream_response_header=非流式整响应档 / stream_idle=
+  # chunk 空闲 — 后三者为防挂兜底 (默认 3600s, 活性检测归 TCP keepalive);
+  # 0 = 无限.
   timeoutLines = lib.optionals (upstreamTimeouts != null) [
     "# 上游超时 (services.secret-guard.upstreamTimeouts, 偏离默认时全量渲染): 0 = 无限."
     "upstream_connect_timeout_secs = ${toString upstreamTimeouts.connectTimeoutSecs}"

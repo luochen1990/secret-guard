@@ -70,10 +70,10 @@ value = "ghp_0123456789abcdefghijklmnopqrstuvwxyz"
 | `host` | string | `"127.0.0.1"` | 监听地址. 默认只监听本机回环, 防止意外暴露到局域网. |
 | `port` | u16 | `8787` | 监听端口. 也可用 `--port` / 环境变量 `SG_PORT` 覆盖. |
 | `records_capacity` | usize | `1024` | 内存中保留的转发记录条数上限 (超出按 FIFO 淘汰). |
-| `upstream_connect_timeout_secs` | u64 | `15` | 连上游的 TCP+TLS 握手超时 (秒). `0` = 不限时. |
-| `upstream_response_header_timeout_secs` | u64 | `60` | 等上游响应头到达的超时 (秒), **流式请求档**: 只对显式 `stream: true` 的请求生效 (流式响应头在首 token 生成后即返回, 60s 覆盖大上下文 prefill). 超时返回 504. `0` = 不限时. |
-| `upstream_nonstream_response_header_timeout_secs` | u64 | `300` | 等上游响应头到达的超时 (秒), **非流式请求档**: 对其余所有请求生效 (缺 `stream` 字段也算非流式). 非流式响应头要等**整个响应生成完**才返回, 大上下文 (几十 k token) 下总时长轻松超 60s, 默认放宽到 300s. 超时返回 504. `0` = 不限时. |
-| `upstream_stream_idle_timeout_secs` | u64 | `120` | 流式响应两个 chunk 之间的最大空闲 (秒). `0` = 不限时. |
+| `upstream_connect_timeout_secs` | u64 | `15` | 连上游的 TCP+TLS 握手超时 (秒). `0` = 不限时. 建连是唯一有明确完成信号、量纲自信的阶段, 保持设紧. |
+| `upstream_response_header_timeout_secs` | u64 | `3600` | 等上游响应头到达的超时 (秒), **流式请求档**: 只对显式 `stream: true` 的请求生效. **防挂兜底, 不是 TTFT 上界** — 深度思考 / 大上下文 prefill / relay 伪流式下首响应可远超旧默认 60s, 误杀代价 = 3 倍账单 (上游已付 + 零产出 + 重试重付). 连接真死 (分区 / NAT 黑洞) 由 TCP keepalive 亚分钟级判死 → 502, 不依赖本值. 超时返回 504. `0` = 不限时. |
+| `upstream_nonstream_response_header_timeout_secs` | u64 | `3600` | 等上游响应头到达的超时 (秒), **非流式请求档**: 对其余所有请求生效 (缺 `stream` 字段也算非流式). 非流式响应头要等**整个响应生成完**才返回 (prefill + 深度思考 + 全部生成), 与流式档同为防挂兜底量纲 (300s 时代在思考时间增长下误杀窗口重新打开). 超时返回 504. `0` = 不限时. |
+| `upstream_stream_idle_timeout_secs` | u64 | `3600` | 流式响应两个 chunk 之间的最大空闲 (秒), **防挂兜底**: 思考期静默 / relay 攒批是合法的慢, "连接活着但无数据" 不构成 hang 证据; 真死连接由 TCP keepalive 判死. `0` = 不限时. |
 | `allowed_domains` | string[] | `[]` | SEC-7 Host guard 信任域名, **反代 + 域名部署形态用**. 经反向代理以域名 (如 `sg.example.com`) 暴露 secret-guard 时, 反代保留原始 Host (`proxy_set_header Host $host`) 并在此声明该域名 — 命中按名字精确匹配 (大小写不敏感) 且**端口宽松** (反代转发的 Host 形态不可穷举). 未声明的域名形式 Host 一律 403 (防 DNS rebinding: 攻击者的域名进不了这份你手写的名单). 含 `:` 的形态 (host:port / 裸 IPv6)、IP 字面量、`localhost`、空串条目无意义, 启动时 WARN 跳过. 示例: `allowed_domains = ["sg.example.com"]` |
 
 ## `[redact]` — 脱敏行为 (改动需重启)

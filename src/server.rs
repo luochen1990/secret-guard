@@ -279,9 +279,24 @@ fn build_router_with_auth_layers(
 ///
 /// `connect_timeout`: DNS+TCP+TLS 握手超时. `None` = 无限 (向后兼容, 不建议;
 /// 上游网络异常时会永久 hang). 由 `[server] upstream_connect_timeout_secs` 配置.
+///
+/// TCP keepalive: 上游连接的**活性判官** (2026-09-23 裁决, 与应用层超时的职责分工).
+/// prefill / 思考期连接完全空闲, 恰是探测的理想战场 — 网络分区 / NAT 黑洞下
+/// 探测包无响应, 内核在亚分钟级 (~45s: idle 15s + Linux TCP_USER_TIMEOUT 30s)
+/// 判死连接 → `send()`/读流返回网络错误 → 502; 活着的慢连接永不误伤. 顺带
+/// keepalive 流量刷新 NAT 表项, 防 prefill 期间被中间设备静默淘汰. 应用层超时
+/// (响应头两档 / stream_idle) 只兜 "进程活着但死锁" 的极端残留 (keepalive 探测
+/// 的是对端内核协议栈, 探测不了应用层), 默认已放宽为 3600s 兜底.
+/// 显式钉住 reqwest 0.12.28 的默认参数 (而非省略依赖默认): 应用层超时放宽后
+/// keepalive 是死连接的唯一快速检测, reqwest 升级若翻转此默认会静默退化到
+/// 1 小时才 504 — 钉住让漂移在编译期可见 (参数值即默认值, 零行为变化).
 pub fn build_upstream_client(connect_timeout: Option<Duration>) -> anyhow::Result<reqwest::Client> {
-    let mut builder =
-        reqwest::Client::builder().user_agent(concat!("secret-guard/", env!("CARGO_PKG_VERSION")));
+    let mut builder = reqwest::Client::builder()
+        .user_agent(concat!("secret-guard/", env!("CARGO_PKG_VERSION")))
+        .tcp_keepalive(Duration::from_secs(15))
+        .tcp_keepalive_interval(Duration::from_secs(15))
+        .tcp_keepalive_retries(3)
+        .tcp_user_timeout(Duration::from_secs(30));
     if let Some(t) = connect_timeout {
         builder = builder.connect_timeout(t);
     }

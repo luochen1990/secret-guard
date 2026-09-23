@@ -127,15 +127,15 @@ elif mode == "timeouts":
     assert [p["id"] for p in cfg["providers"]] == ["b-upstream"], cfg["providers"]
     s = cfg["server"]
     assert s["host"] == "127.0.0.1" and s["port"] == 18787
-    # 任一字段偏离默认 (nonstream 300→0) → 四行全量渲染 (module 层 timeoutsUsed
+    # 任一字段偏离默认 (nonstream 3600→0) → 四行全量渲染 (module 层 timeoutsUsed
     # 深比较判定): 锁定 "nix options defaults ↔ upstreamTimeoutsDefaults 镜像 ↔
     # render 全量" 的端到端一致性 — 任一侧默认值漂移都会让未显式设的三项断言失败
     assert s["upstream_connect_timeout_secs"] == 15  # 未显式设 → option default
-    assert s["upstream_response_header_timeout_secs"] == 60
+    assert s["upstream_response_header_timeout_secs"] == 3600
     assert (
         s["upstream_nonstream_response_header_timeout_secs"] == 0
     )  # 拆墙: 无限 (agent-service#130)
-    assert s["upstream_stream_idle_timeout_secs"] == 120
+    assert s["upstream_stream_idle_timeout_secs"] == 3600
     # 其余段不受超时调参影响
     assert "usage" not in cfg and "auth" not in cfg and "secrets" not in cfg
     assert "redact" not in cfg

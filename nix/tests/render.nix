@@ -535,7 +535,7 @@ let
         && s.upstream_stream_idle_timeout_secs == 180;
     }
     {
-      # 拆墙场景 (agent-service#130): 非流式整响应超时 300 → 0 (无限), 慢判定权
+      # 拆墙场景 (agent-service#130): 非流式整响应超时 3600 → 0 (无限), 慢判定权
       # 交消费方预算; 0 是合法值 (上游 serde 语义: 0 = None = reqwest 无限)
       name = "server 段: nonstream=0 拆墙形态 → 合法渲染 (0 = 无限)";
       ok =
@@ -545,9 +545,9 @@ let
             // {
               upstreamTimeouts = {
                 connectTimeoutSecs = 15;
-                responseHeaderTimeoutSecs = 60;
+                responseHeaderTimeoutSecs = 3600;
                 nonstreamResponseHeaderTimeoutSecs = 0;
-                streamIdleTimeoutSecs = 120;
+                streamIdleTimeoutSecs = 3600;
               };
             }
           );

@@ -3322,7 +3322,8 @@ async fn upstream_response_header_timeout_marks_record_504() {
 //
 // 验证按请求 stream 字段动态选超时档: 非流式慢上游 (响应头晚于流式档超时到达)
 // 应等到响应; 流式请求仍受流式档快超时保护 (回归守卫). 超时值压到 1s/5s 控制
-// 测试时长 (语义与 60s/300s 同构, 无需真等).
+// 测试时长 (语义与显式配置分档值同构; 生产默认两档同为 3600s 防挂兜底,
+// 分档差异仅显式配置时可见).
 
 /// 起一个 sleep `delay` 后才返回响应头的上游 (response body 为普通 JSON).
 async fn spawn_slow_upstream(delay: Duration) -> String {

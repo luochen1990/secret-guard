@@ -15,9 +15,9 @@ fail-fast, 配错在 `nixos-rebuild` 时即报错而非部署后 crash-loop). �
 `services.secret-guard.resolvedConfigFile`, 调试可直接
 `nix eval .#nixosConfigurations.<host>.config.services.secret-guard.resolvedConfigFile` 后 cat.
 
-上游超时 (`upstreamTimeouts`) 随部署网络环境差异大 — 本地 ollama vs 公网高延迟上游的合理
-取值不同, 非流式整响应超时 (`nonstreamResponseHeaderTimeoutSecs`, 默认 300s = 单次生成
-时长上限) 在消费方都有自身超时预算时可设 0 (无限) 拆墙, 见 option description.
+上游超时 (`upstreamTimeouts`) 的应用层默认值统一为 3600s 防挂兜底量纲 (2026-09-23
+裁决, 连接活性检测归 TCP keepalive) — 在消费方都有自身超时预算时可设 0 (无限)
+拆墙 (如 `nonstreamResponseHeaderTimeoutSecs`), 见 option description.
 
 ```nix
 # flake.nix:

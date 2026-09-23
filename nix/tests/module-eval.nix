@@ -149,7 +149,7 @@ let
   inlineConfig = inlineEv.config.services.secret-guard.resolvedConfigFile;
 
   # 超时调参形态 (独立 host config): 验证 upstreamTimeouts 选项 → [server] 超时行
-  # 的模块接线. 场景取拆墙形态 (agent-service#130: 非流式整响应 300 → 0), 只显式设
+  # 的模块接线. 场景取拆墙形态 (agent-service#130: 非流式整响应 3600 → 0), 只显式设
   # nonstream 一项 — 锁定 "任一偏离默认 → 四行全量渲染 (未设字段带 option
   # default)" 的 e2e 镜像链 (assert-toml 断言).
   timeoutsEv = sgEv [
