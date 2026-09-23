@@ -103,6 +103,10 @@ PUT    /api/settings                body {audit_capture: bool} → 200 同 shape
                                            原子 (push 快照, 在途请求不受切换影响); 原子
                                            持久化 state.toml; 非法 body 统一 400。语义 SSOT
                                            见 src/state.rs::AuditCapture)
+                                           前端入口 (B3): header 工具栏「详细日志」checkbox
+                                           (#audit-capture) — 服务端状态的镜像 (GET 初始化
+                                           + PUT 乐观更新/失败回滚/在途 disabled), 不入
+                                           state 对象 (auto-refresh checkbox 同型, DOM 即状态)
 GET    /api/usage/summary[?hours=N]  → UsageSummary {range, pricing_status, totals,
                                                  by_bucket[], by_model[], by_provider[],
                                                  unpriced_models[], zero_priced_models[],
@@ -141,6 +145,9 @@ GET    /api/usage/summary[?hours=N]  → UsageSummary {range, pricing_status, to
 `?view=parsed` 返回 `parsed_request` (从 `req_body` 按需用 ingress codec 解析) +
 `parsed_response` (直接取自 `record.resp_parsed`, 由 proxy 层的 `StreamScan` 在流过程中
 增量累积, 非流式路径在响应完成时一次性计算). Gemini/Ollama 无 codec → `parse_error` + fallback raw.
+audit_capture off 的请求 (B2/B3) parsed_request 恒 null + `record.audit_capture_off = true`
+(`parse_error` 报 "req_body not captured...") — WebUI 审计溯源弹窗 (`data-audit-node`,
+判 `record.audit_capture_off`) 与 raw 弹窗同占位文案.
 
 ### Record preview / model 提取 (push 时一次性)
 
@@ -363,7 +370,10 @@ timeline 每轮 header 含两个按钮:
 - `raw`: 弹窗展示原始 req_body / resp_body / req_headers / resp_headers (按需懒拉
   `GET /api/records/{id}`). body 是 LLM 视角 (已 redact, 安全展示); headers 已脱敏
   (auth/cookie 等 = `<redacted>`; 名单 = 硬编码黑名单 ∪ `[redact] redacted_headers`,
-  SEC-4). 流式响应的 resp_body 为空 (不保留 SSE 字节), 显示提示.
+  SEC-4). 流式响应的 resp_body 为空 (不保留 SSE 字节), 显示提示. audit_capture off
+  期间的请求 (`record.audit_capture_off`, B2/B3) req/resp body 区段显示未捕获占位
+  (文案 SSOT `NOT_CAPTURED_NOTE`, 判据统一为该结构化字段; 优先级高于 streamed 空态
+  提示 — off 下非流式 body 同样未存; headers 照常展示).
 
 ### Response 气泡渲染
 

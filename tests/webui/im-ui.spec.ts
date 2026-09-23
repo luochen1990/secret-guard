@@ -63,6 +63,26 @@ async function sendChat(
 }
 
 /**
+ * 开/关详细日志 (B2 `PUT /api/settings`)。依赖 raw body 捕获的用例在 sendChat 前
+ * 开启 (B2 起默认 off — 未捕获的 record 无 req_body/resp_body 可断言)。
+ */
+async function setAuditCapture(page: Page, on: boolean): Promise<void> {
+  const r = await page.request.put(`${SG_API}/settings`, {
+    data: { audit_capture: on },
+    headers: { "Content-Type": "application/json" },
+    timeout: 10_000,
+  });
+  if (!r.ok()) throw new Error(`setAuditCapture(${on}) failed: HTTP ${r.status()}`);
+}
+
+// 测试间状态卫生: 任何用例开启详细日志后, afterEach 恢复默认 off (B2 生产默认).
+// workers=1 共享同一 server 进程, 开启泄漏到后续用例会让 "off 占位" 类断言失败.
+// server 不可达时静默 (此时测试自身已失败, 卫生钩子不叠加噪音).
+test.afterEach(async ({ page }) => {
+  await setAuditCapture(page, false).catch(() => {});
+});
+
+/**
  * 等待 sidebar 出现包含指定 preview 子串的会话 (session-item), 返回其 session_id.
  *
  * 用 Playwright locator 的 auto-retrying polling (不 reload 全页),
@@ -739,6 +759,8 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
   //   4. response 窗口内只有一个 assistant 气泡 (不再因 tool_calls 拆分多个).
 
   test("info icon + raw 按钮: 弹窗展示传输层信息和原始 body", async ({ page }) => {
+    // B2 起默认 off — 本用例断言 req_body 内容, 需先开启捕获.
+    await setAuditCapture(page, true);
     await sendChat(page, [{ role: "user", content: "info-raw-marker" }]);
     const sid = await findSessionLeafByPreview(page, "info-raw-marker");
     await clickSessionByLeaf(page, sid);
@@ -2259,6 +2281,8 @@ test.describe("WebUI 打磨 (#161 + #164)", () => {
   });
 
   test("#164-1: raw 弹窗 Response Body 带 (LLM view) 标注", async ({ page }) => {
+    // B2 起默认 off — 标注分支只在捕获开启 (resp_body 有内容) 时出现.
+    await setAuditCapture(page, true);
     await sendChat(page, [{ role: "user", content: "raw-llm-view-marker" }]);
     const sid = await findSessionLeafByPreview(page, "raw-llm-view-marker");
     await clickSessionByLeaf(page, sid);
@@ -2309,6 +2333,82 @@ test.describe("WebUI 打磨 (#161 + #164)", () => {
       });
     });
     expect(stillConnected, "数据静止时 tr 引用不应被刷新打断").toBe(true);
+  });
+});
+
+// ─── B3: 详细日志开关 (audit capture) + 未捕获占位 ────────────────────────
+//
+// B2 契约: audit_capture 默认 off (省内存) — off 期间的请求 req_body/resp_body
+// 为空, record DTO 带 audit_capture_off=true; UI 开关在 header 工具栏
+// (#audit-capture checkbox, GET/PUT /api/settings). 覆盖:
+//   1. toggle 双向切换 + 初始化同步 (GET → checkbox 镜像服务端值)
+//   2. off 时 raw 弹窗占位 (优先级高于 streamed 空态 — 非流式请求也占位)
+//   3. off 时 usage 审计溯源弹窗占位 (parsed view, 判据与 raw 弹窗同字段)
+test.describe("B3: 详细日志开关 (audit capture)", () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto("/");
+    await page.waitForLoadState("networkidle");
+  });
+
+  test("开关初始化同步 + 双向切换反馈", async ({ page }) => {
+    // 暂停 3s 自动刷新 (sync 成功会清空 #status) — toggle 反馈是一次性文本,
+    // 否则断言与轮询 tick 存在负载相关的清空竞态 (CI 慢机 ~3% flake).
+    await page.locator("#auto").uncheck();
+    // 初始 unchecked 的保证: grep 单跑 = state 全新 (mkdtemp) 默认 off; 全量跑 =
+    // 文件级 afterEach 卫生钩子恢复 off. 两种场景下 checkbox 都镜像服务端 off.
+    const cb = page.locator("#audit-capture");
+    await expect(cb).not.toBeChecked();
+    // 点击 → PUT 成功 → 状态更新 + #status 轻反馈.
+    await cb.check();
+    await expect(cb).toBeChecked();
+    await expect(page.locator("#status")).toContainText("详细日志已开启");
+    // 双向: 再点回 off (PUT false 路径).
+    await cb.uncheck();
+    await expect(cb).not.toBeChecked();
+    await expect(page.locator("#status")).toContainText("详细日志已关闭");
+  });
+
+  test("audit_capture off 时 raw 弹窗显示未捕获占位", async ({ page }) => {
+    // 默认 off (不上 setAuditCapture) + 非流式请求 — 占位优先于 streamed 空态:
+    // 非流式下旧 UI 会显示 "(empty)", B3 起必须显示未捕获占位.
+    await sendChat(page, [{ role: "user", content: "audit-off-marker" }]);
+    const sid = await findSessionLeafByPreview(page, "audit-off-marker");
+    await clickSessionByLeaf(page, sid);
+    await page.waitForTimeout(500);
+
+    await page.locator("#detail .tl-actions button[data-action='raw']").click();
+    await page.waitForTimeout(500); // 等待懒拉 record.
+    const rawText = await page.locator("dialog.round-dialog").textContent();
+    // req + resp 两个 body 区段均占位 (headers 照常展示).
+    expect(rawText).toContain("详细日志已关闭");
+    expect(rawText).toContain("Request Headers");
+    // 占位分支不携带 "LLM view" 标注 (那是捕获开启时的语义).
+    expect(rawText).not.toContain("LLM view");
+    await page.locator("dialog.round-dialog .dialog-close").click();
+  });
+
+  test("audit_capture off 时 usage 审计溯源弹窗同样占位", async ({ page }) => {
+    // 审计弹窗 (data-audit-node) 消费 parsed view (?view=parsed) — 判据与 raw
+    // 弹窗统一为 record.audit_capture_off (见 index.html 注释), 本用例守卫该分支.
+    await sendChat(page, [
+      { role: "user", content: `audit-off-recent-marker secret=${TEST_SECRET_VALUE}` },
+    ]);
+    await page.locator('a.tab[data-tab="usage"]').click();
+    // 等 redact recent 落库 (store writer 批量事务, poll 表格出现数据行).
+    await expect
+      .poll(
+        async () =>
+          page.locator("#redact-recent-body tr:not(:has(td.empty))").count(),
+        { timeout: 15_000 }
+      )
+      .toBeGreaterThan(0);
+    // 点行内 view → 弹窗显示占位 (而非 dump 空 record 的 JSON).
+    await page.locator("#redact-recent-body button[data-audit-node]").first().click();
+    const auditBody = page.locator("#audit-record-body");
+    await expect(auditBody).toContainText("详细日志已关闭");
+    await expect(auditBody).not.toContainText('"req_body"');
+    // 关闭 (form method=dialog 的 submit 按钮).
+    await page.locator("#audit-record-dialog form button.btn").click();
   });
 });
 
