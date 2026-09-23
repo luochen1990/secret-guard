@@ -161,6 +161,11 @@ pub struct MessageRef {
     pub content_form: Option<ContentForm>,
     /// assistant 消息 `reasoning_content` 字段的显式空/null 形态 (#176).
     pub reasoning_content_form: Option<ReasoningContentForm>,
+    /// message 级未建模字段 (#269 M1/L4, 仅 Anthropic reader 收集; 如 future-proof
+    /// 的 message 顶层字段). `None` = 空 — 避免绝大多数无 extra 消息的 Arc 分配.
+    /// 语义同 content_form: 随 ref 保存, resolve 恢复, **不参与 hash** (prefix 匹配
+    /// 语义 = 内容相等, 同 blocks 不同 wire 元数据的重发视为前缀命中).
+    pub extra: Option<Arc<serde_json::Map<String, serde_json::Value>>>,
 }
 
 impl MessageRef {
@@ -168,9 +173,10 @@ impl MessageRef {
     ///
     /// 用于 Merkle prefix hash 的累积计算.
     ///
-    /// **wire 形态元数据不参与 hash**: prefix 匹配的语义是 "内容相等"
-    /// (相同 role + 相同 block 内容); 同内容不同 wire 形态 (string vs array)
-    /// 的重发视为前缀命中, 与 hash 语义一致 (历史行为保持).
+    /// **wire 形态元数据不参与 hash** (content_form / reasoning_content_form /
+    /// message extra 同立场): prefix 匹配的语义是 "内容相等" (相同 role + 相同
+    /// block 内容); 同内容不同 wire 形态 (string vs array) 的重发视为前缀命中,
+    /// 与 hash 语义一致 (历史行为保持).
     pub(super) fn hash(&self) -> u64 {
         // tuple Hash: 先 role 再走 [BlockHash] 的 Hash (len + 每个元素), 与原增量实现等价.
         crate::util::hash64(&(&self.role, &self.blocks))
@@ -245,6 +251,7 @@ impl BlockPool {
             role: msg.role,
             content_form: msg.content_form,
             reasoning_content_form: msg.reasoning_content_form,
+            extra: (!msg.extra.is_empty()).then(|| Arc::new(msg.extra.clone())),
             blocks: msg.content.iter().map(|b| self.intern(b.clone())).collect(),
         }
     }
@@ -263,6 +270,14 @@ impl BlockPool {
             content: blocks,
             content_form: msg_ref.content_form,
             reasoning_content_form: msg_ref.reasoning_content_form,
+            // message 级 extra 恢复 (#269): resolve 重建必须与 push 时的原始
+            // IrMessage 字节级等价 — 丢弃会让 Anthropic 请求侧 timeline 派生
+            // 缺字段, 破坏 DTO-5 (B1 rebase #269 复核 FAIL-2).
+            extra: msg_ref
+                .extra
+                .as_ref()
+                .map(|a| (**a).clone())
+                .unwrap_or_default(),
             ..Default::default()
         })
     }

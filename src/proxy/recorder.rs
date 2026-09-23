@@ -1391,7 +1391,7 @@ mod tests {
             .content
             .iter()
             .find_map(|b| match b {
-                crate::codec::ir::IrBlock::Text { text } => Some(text.as_str()),
+                crate::codec::ir::IrBlock::Text { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .unwrap_or_default();
@@ -1460,7 +1460,7 @@ mod tests {
             .content
             .iter()
             .find_map(|b| match b {
-                crate::codec::ir::IrBlock::Text { text } => Some(text.as_str()),
+                crate::codec::ir::IrBlock::Text { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .unwrap_or_default();

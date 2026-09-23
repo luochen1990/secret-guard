@@ -1910,6 +1910,7 @@ mod tests {
         let ir_resp = crate::codec::ir::IrResponse {
             content: vec![IrBlock::Text {
                 text: "Hi there".into(),
+                extra: serde_json::Map::new(),
             }],
             stop_reason: Some(crate::codec::ir::IrStopReason::EndTurn),
             id: Some("chatcmpl-1".into()),

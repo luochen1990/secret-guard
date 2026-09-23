@@ -1271,6 +1271,15 @@ pub(crate) fn apply_real_to_mock_messages(msgs: &mut [IrMessage], pairs: &[(Stri
     // 互不相交, 跨 message 顺序无关), 不再并行维护第二份双层循环.
     for msg in &mut *msgs {
         apply_real_to_mock_blocks(&mut msg.content, pairs);
+        // message 级 extra (#269 M1/L4): 叶子集与 `IrRequest::for_each_str_leaf_mut`
+        // 逐点对齐 (msg.extra.values_mut 同款遍历) — 旧路径 (req_body_raw 生产侧)
+        // 经 ir_request_replace_all 覆盖 msg.extra 的 secret, 新派生路径必须同样
+        // 覆盖, 否则 extra 中的 real secret 未经替换进入 timeline (SEC-1).
+        for (real, mock) in pairs {
+            for v in msg.extra.values_mut() {
+                v.for_each_str_leaf_mut(&mut |s| replace_in_place(s, real, mock));
+            }
+        }
     }
 }
 
@@ -1446,12 +1455,14 @@ mod tests {
         let mut ir = IrRequest {
             system: vec![IrBlock::Text {
                 text: "sys mentions sk-mid-bbb once".into(),
+                extra: serde_json::Map::new(),
             }],
             messages: vec![
                 IrMessage {
                     role: IrRole::User,
                     content: vec![IrBlock::Text {
                         text: "use k9 and sk-long-secret-aaaaaaaa please".into(),
+                        extra: serde_json::Map::new(),
                     }],
                     ..Default::default()
                 },
@@ -1461,6 +1472,7 @@ mod tests {
                         id: "t1".into(),
                         name: "get".into(),
                         input: serde_json::json!({"key": "sk-mid-bbb", "nested": ["k9"]}),
+                        extra: serde_json::Map::new(),
                     }],
                     ..Default::default()
                 },
@@ -1470,9 +1482,11 @@ mod tests {
                         tool_use_id: "t1".into(),
                         content: vec![IrBlock::Text {
                             text: "done with sk-mid-bbb".into(),
+                            extra: serde_json::Map::new(),
                         }],
-                        is_error: false,
+                        is_error: Some(false),
                         content_form: None,
+                        extra: serde_json::Map::new(),
                     }],
                     ..Default::default()
                 },

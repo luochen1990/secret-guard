@@ -471,9 +471,10 @@ pub(crate) fn extract_delta_messages_from_blocks(
     };
     // 每条 IR message 展开为 ≥1 条 wire 消息, 故 arr.len() ≥ count;
     // saturating_sub 为防御性写法 (池损坏时不 panic).
-    // 前提 (不变式): 两个 reader 都把 System 消息提升出 ir.messages — 故
-    // Anthropic writer 的 System filter (1:N 收缩) 生产不可达; 若未来 reader
-    // 放开 System-in-messages, 此处与旧切片路径 (count > len 早退空 Vec) 将分歧.
+    // 前提 (post-#269 事实): OpenAI reader 把 System 消息提升出 ir.messages
+    // (writer 反向 1:N 展开 — ToolResult 拆分同族); Anthropic reader 对
+    // messages[] 内 role=system **原位保留** (#269 M2, writer 同步移除 System
+    // filter) — 两侧 reader/writer 均严格对称, arr.len() ≥ count 恒成立.
     let start = arr.len().saturating_sub(count);
     let mut result: Vec<serde_json::Value> = arr[start..].to_vec();
 
@@ -517,6 +518,7 @@ fn placeholder_delta_messages(
                 role: r.role,
                 content: vec![IrBlock::Text {
                     text: DRIFT_PLACEHOLDER.to_string(),
+                    extra: serde_json::Map::new(),
                 }],
                 ..Default::default()
             };
@@ -616,14 +618,16 @@ pub(crate) fn assert_delta_view_matches_raw(node: &crate::dag::Node, pool: &crat
     if node.event.ingress_protocol.is_none() || !node.event.audit_captured {
         return;
     }
-    // 畸形边界跳过 (known-limitations "derive" 节): 请求含多条 role=system 消息时
-    // 新旧路径的 system 注入形态分歧 (旧: 克隆 messages[0]; 新: reader 合并提升后
-    // 单条 system, 见 read_request 的 system.extend). 畸形输入非等价性目标 —
-    // drift assert 跳过该节点, 只 debug 记录.
-    if count_system_roles(&node.event.req_body_raw) > 1 {
+    // 畸形边界跳过 (known-limitations "derive" 节, 仅 OpenAI): OpenAI 请求含多条
+    // role=system 消息时 reader system.extend 合并提升 → 新旧路径注入形态分歧
+    // (旧: 克隆 messages[0]; 新: 合并后单条). Anthropic 多 system post-#269
+    // (M2 原位保留) 两路径等价 — **不**跳过, 保持 shadow 覆盖.
+    if node.event.ingress_protocol == Some(crate::codec::Protocol::OpenAI)
+        && count_system_roles(&node.event.req_body_raw) > 1
+    {
         tracing::debug!(
             node = %node.id,
-            "skip delta drift assert: malformed multi-system request (documented divergence)"
+            "skip delta drift assert: malformed multi-system OpenAI request (documented divergence)"
         );
         return;
     }
@@ -1186,6 +1190,7 @@ mod tests {
             blocks: Vec::new(),
             content_form: None,
             reasoning_content_form: None,
+            extra: None,
         };
         let req_delta: Arc<[crate::dag::MessageRef]> = if count == 0 {
             Arc::from([])
@@ -1542,6 +1547,9 @@ mod tests {
     //     block, 可嵌 secret) / 显式空串 (form=Empty) / 显式 null (form=Null) —
     //     覆盖 MessageRef.reasoning_content_form 的 reader→ref→resolve→writer
     //     保真路径 (仅 OpenAI 渲染; Anthropic wire 无此概念)
+    //   × message 级 extra 轴 (#269 M1/L4, rebase 复核 FAIL-2 修复): 缺席 /
+    //     Anthropic 消息顶层未建模字段 (值可嵌 secret — 覆盖 MessageRef.extra 的
+    //     intern→resolve 保真 + apply_real_to_mock 的 extra 叶子替换)
     //   × secret 命中: 0 条 (seed=0) / 1..=3 条命中 (seed≠0, 含 tool input /
     //     tool_result 深处命中) / 另加 1 条未命中
     //   × 根 / 非根节点 (prefix 延续 push)
@@ -1605,6 +1613,10 @@ mod tests {
             parts: Vec<EqPart>,
             /// 仅 OpenAI 渲染 (wire 顶层字段); Anthropic 渲染忽略 (无此概念).
             reasoning: Option<EqReasoning>,
+            /// message 级未建模字段 (#269 M1/L4, 仅 Anthropic reader 收集):
+            /// Some → Anthropic wire 消息顶层插入 "x-meta": <可嵌 secret 文本>;
+            /// OpenAI 渲染忽略 (reader 不收集, 两路径都无该字段, 天然等价).
+            extra_field: Option<MaybeSecretText>,
         },
         /// assistant 发起工具调用 (arguments 是 JSON object 源码串, 内含文本叶子).
         ToolUse {
@@ -1613,10 +1625,12 @@ mod tests {
             args_text: MaybeSecretText,
         },
         /// 工具结果回传 (OpenAI: role=tool 独立消息; Anthropic: user 内 tool_result).
+        /// `is_error` 三态 (#269 wire 保真): None = 字段缺席 / Some(b) = 显式
+        /// (显式 false 不能静默省略 — FWD-1 字面等式, reader/writer Option 直通).
         ToolResult {
             tool_use_id: String,
             text: MaybeSecretText,
-            is_error: bool,
+            is_error: Option<bool>,
         },
     }
 
@@ -1676,6 +1690,9 @@ mod tests {
                 null_form,
                 parts,
                 reasoning,
+                // extra_field 忽略: OpenAI reader 不收集 message 级 extra (#269
+                // M1 范围 = Anthropic), 两路径都无该字段.
+                ..
             } => {
                 let mut v = render_chat_msg(
                     *assistant,
@@ -1717,12 +1734,17 @@ mod tests {
                 tool_use_id,
                 text,
                 is_error,
-            } => serde_json::json!({
-                "role": "tool",
-                "tool_call_id": tool_use_id,
-                "content": render_text(text, pool),
-                "is_error": is_error,
-            }),
+            } => {
+                let mut v = serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": tool_use_id,
+                    "content": render_text(text, pool),
+                });
+                if let Some(b) = is_error {
+                    v["is_error"] = serde_json::Value::Bool(*b);
+                }
+                v
+            }
         }
     }
 
@@ -1734,17 +1756,32 @@ mod tests {
                 str_form,
                 null_form,
                 parts,
+                extra_field,
                 // reasoning 忽略: Anthropic wire 无 reasoning_content 概念,
                 // reader 不遇 → 两路径 (blocks vs raw) 都无该字段, 天然等价.
                 ..
-            } => render_chat_msg(
-                *assistant,
-                *str_form,
-                *null_form,
-                parts,
-                pool,
-                |url| serde_json::json!({"type": "image", "source": {"type": "url", "url": url}}),
-            ),
+            } => {
+                let mut v = render_chat_msg(
+                    *assistant,
+                    *str_form,
+                    *null_form,
+                    parts,
+                    pool,
+                    |url| serde_json::json!({"type": "image", "source": {"type": "url", "url": url}}),
+                );
+                // message 级未建模字段 (#269 M1/L4): reader collect_extra 收集 →
+                // MessageRef.extra 保真 → writer 原样回写; 值可嵌 secret — 覆盖
+                // apply_real_to_mock 的 extra 叶子替换轴.
+                if let Some(t) = extra_field {
+                    v.as_object_mut()
+                        .expect("render_chat_msg yields object")
+                        .insert(
+                            "x-meta".into(),
+                            serde_json::Value::String(render_text(t, pool)),
+                        );
+                }
+                v
+            }
             EqMsg::ToolUse {
                 id,
                 name,
@@ -1769,8 +1806,8 @@ mod tests {
                     "tool_use_id": tool_use_id,
                     "content": render_text(text, pool)
                 });
-                if *is_error {
-                    tr["is_error"] = serde_json::Value::Bool(true);
+                if let Some(b) = is_error {
+                    tr["is_error"] = serde_json::Value::Bool(*b);
                 }
                 serde_json::json!({"role": "user", "content": [tr]})
             }
@@ -1900,6 +1937,40 @@ mod tests {
         Some((dag.push_messages(real_messages, event), raw))
     }
 
+    /// #269 M1/L4 message 级 extra 的确定性锁定 (rebase 复核 FAIL-2/FAIL-3 修复
+    /// 的专项): Anthropic 消息顶层未建模字段 (值嵌 secret) — 全链
+    /// (reader collect_extra → MessageRef.extra intern → resolve 恢复 → writer
+    /// 原样回写 + apply_real_to_mock 的 extra 叶子替换) 与旧 raw 切片逐字节等价.
+    /// 检出力: MessageRef 缺 extra 字段 / apply 不走 extra 叶子 任一回归都会红.
+    #[test]
+    fn blocks_derivation_anthropic_message_extra_roundtrip() {
+        let case = EqCase {
+            proto: CodecProtocol::Anthropic,
+            system: EqSystem::None,
+            msgs: vec![
+                EqMsg::Chat {
+                    assistant: false,
+                    str_form: true,
+                    null_form: false,
+                    parts: vec![EqPart::Text(("q".into(), None))],
+                    reasoning: None,
+                    extra_field: Some(("meta ".into(), Some(0))),
+                },
+                EqMsg::Chat {
+                    assistant: true,
+                    str_form: true,
+                    null_form: false,
+                    parts: vec![EqPart::Text(("a".into(), None))],
+                    reasoning: None,
+                    extra_field: None,
+                },
+            ],
+            prefix_len: 0,
+            secrets: vec![eq_secret_entry("sk-extra-secret-99")],
+        };
+        eq_run_case(&case).expect("equivalence holds for message-level extra");
+    }
+
     /// 运行用例: push (prefix 根 + full 子) → timeline_view 全链比对新派生 vs oracle.
     fn eq_run_case(c: &EqCase) -> Result<(), String> {
         let dag = ConversationDag::new(32, 128, 4);
@@ -1993,8 +2064,10 @@ mod tests {
                 prop::bool::ANY,
                 prop::collection::vec(part.clone(), 1..=3),
                 reasoning,
+                prop::option::of(text.clone()),
             )
-                .prop_map(|(assistant, str_form, null_form, parts, reasoning)| EqMsg::Chat {
+                .prop_map(
+                    |(assistant, str_form, null_form, parts, reasoning, extra_field)| EqMsg::Chat {
                     assistant,
                     // null_form 只对 assistant 有意义 (reader 把 user 的 null 读成空 vec,
                     // 同样保留 — 覆盖空 content 消息形态).
@@ -2002,19 +2075,24 @@ mod tests {
                     null_form: null_form && assistant,
                     parts,
                     reasoning: if assistant { reasoning } else { None },
-                }),
+                    extra_field,
+                },
+                ),
             2 => (any::<u16>(), text.clone()).prop_map(|(n, t)| EqMsg::ToolUse {
                 id: format!("tu-{n}"),
                 name: format!("tool_{}", n % 17),
                 args_text: t,
             }),
-            2 => (any::<u16>(), text.clone(), prop::bool::ANY).prop_map(
-                |(n, t, is_error)| EqMsg::ToolResult {
+            2 => (
+                any::<u16>(),
+                text.clone(),
+                prop::option::of(prop::bool::ANY),
+            )
+                .prop_map(|(n, t, is_error)| EqMsg::ToolResult {
                     tool_use_id: format!("tu-{}", n % 3), // 与 ToolUse id 弱关联
                     text: t,
                     is_error,
-                },
-            ),
+                }),
         ];
         (
             proto,
