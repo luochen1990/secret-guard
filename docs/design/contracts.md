@@ -182,7 +182,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 > (别名 + 可含缓存的上游清单, 非实时中继, 最旧可 stale 300s), 不存在 "发往上游的 wire" 半段.
 > Direct provider 的 /models 仍受 FWD-1 约束 (透传, 见 FWD-7 的 D6 回归守卫). #196.
 
-> **Anthropic messages[].role=system 正规化** (2026-09-23 登记, **待人工授权** — §99): FWD-1 的
+> **Anthropic messages[].role=system 正规化** (2026-09-23 登记, **用户已授权** — §99): FWD-1 的
 > "唯一合法修改" 等式约束的是**协议合法 wire** (符合官方 schema 的请求). 对 Anthropic 协议的
 > **非法形态** — `messages[]` 数组内出现 `role=system` 条目 (官方 schema system 只在顶层, 但
 > claude code 实测会把 billing header 作为 messages[0] 发送) — IR 路径 (redact / model 重写强制)
@@ -195,8 +195,9 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 > 影响 (字节透传, 原样转发该形态). 实现与测试锚点: `src/codec/anthropic.rs` read_request 提升
 > 循环 + `read_request_promotes_system_role_message_to_top_level` / 端到端
 > `anthropic_messages_system_role_survives_rewrite_path` (tests/integration.rs).
-> 授权定性: 代码修复消除了静默丢弃 (信息保全方向), 但本登记是 FWD-1 字面保证的
-> **适用范围收窄** — 非 §0.5 免授权例外①② (诚实化/精确化) 所辖, 故走人工授权.
+> 授权定性 (2026-09-23 用户裁决): 代码修复消除静默丢弃是必要的, 适用范围澄清随
+> 修复一并授权定稿; 本登记属 FWD-1 字面保证的适用范围收窄, 非 §0.5 免授权例外①②
+> (诚实化/精确化) 所辖.
 
 `normalize` = canonical JSON (BTreeMap key 排序 + 紧凑序列化 + 无空白). 消除对语义无影响的字节差异, 剩下的差异全部是真正的信息差异.
 
@@ -1277,4 +1278,4 @@ chars (char boundary 安全); 其余事件字段为受控类型, 天然无 secre
 | 2026-09-23 | STR-1/STR-2 + FWD-1/FWD-3 + RED-7 (T5) | **Responses 流式纳入 property 机械验证**: 新增 `arb_responses_sse_stream_with_mock` 生成器 (reasoning summary / text / function_call args 三类 mock 载体 + 同步构造 STR-2 oracle); STR-1 新增 r→r 同协议 restore 字节级切分等价 (`resp_` id/`created_at` 归一化) + StreamScan(Responses) 切分等价 + 跨协议四组合 (r⇄o / r⇄a) 断言锚点; STR-2 新增生成器预期形式 (字面 scan≡非流式在 Responses 侧有两个建模分歧 — stop_reason 推断不对称 + reasoning 双变体, 显式登记为缺口而非放宽断言); FWD-1 流式半段 + RED-7 跨协议 restore 扩至 Responses 组合. T3 移交的两个已知漂移 (usage_present false→true / stop_reason=Other→failed) 按方案 D5 从生成器排除 (终止事件只产 response.completed; usage 只断言 output_tokens 值), 登记于 fwd_streaming_property.rs 头部供后续裁决 | Responses 流式 SSE 完整支持方案 T5 (前置: T4 proxy 解除) |
 | 2026-09-23 | FWD-3 (Responses stop_reason) | **精确化演进 (免授权, §0.5 例外①)**: Responses 非流式 `read_response_status` 的 "completed" 分支从恒 EndTurn 改为按 output 推断 (有 function_call item → ToolUse, 无 → EndTurn), 与流式 reader 的 `saw_function_call` 推断对齐 — 流式/非流式粒度分叉消除, Chat tool_calls 经 Responses round-trip 精确保真; 单测 `responses_stop_reason_granularity_loss_cross_proto` 更名 `responses_stop_reason_tool_use_preserved_cross_proto` (断言从锁定降级翻转为锁定保真) | 用户裁决 (2026-09-23): 互译精确化是无需授权的演进方向, 契约锁定断言只是之前实现阶段的折衷 |
 | 2026-09-23 | FWD-3 (Responses usage presence + Other 映射) | **诚实化 + 误导消除演进 (用户裁决)**: ① Responses writer (非流式 `write_response` + 流式终止事件) 对 `usage_present=false` 写 `"usage": null` 而非合成全零对象 — 上游未报用量不再被翻译成 "网关报了 0", round-trip presence 保真 (流式 round-trip 断言收紧为完全一致, Responses ingress 组合新增 `assert_responses_usage_presence_fidelity`); ② `write_status_str(Other)` 从 "failed" 改 "completed" — 未知停止原因大多是正常结束的变体, 伪装 failed 会触发客户端错误处理路径 (弹错/重试); 读侧 "failed"→Other 保持, round-trip failed→Other→completed 有损 (已知折衷: 未知不伪装成确定错误) | 用户裁决 (2026-09-23): 尊重事实是通用原则 (usage 缺失不伪造), 误导性错误信号必须消除 |
-| 2026-09-23 | FWD-1 | **适用范围澄清 (待人工授权)**: FWD-1 等式约束协议合法 wire; Anthropic 非法形态 `messages[].role=system` (claude code billing header 实测) 在 IR 路径被 reader 提升合并到顶层 system (与 OpenAI reader 对称), 该形态的 system 内容从 messages[] 搬移到顶层 — 字面 byte-exact 对其不成立 (位置搬移非丢失). 修复前 writer 静默丢弃该条目 (真信息丢失: 上游收不到 system 内容 + req_delta 计数与写回 body 错位致 timeline 气泡退化为 preview 截断). 原样写回替代方案会被 schema 严格上游 400 拒绝 | 用户报告 claude code `-p` 请求 timeline 只显示 48 字符 preview (2026-09-23 排查): AnthropicReader/Writer 对 messages[] 内 system 条目不对称 (reader 留在 ir.messages / writer filter 丢弃) — reader 提升为唯一既保内容又保可用性的选项 |
+| 2026-09-23 | FWD-1 | **适用范围澄清 (用户授权, 2026-09-23)**: FWD-1 等式约束协议合法 wire; Anthropic 非法形态 `messages[].role=system` (claude code billing header 实测) 在 IR 路径被 reader 提升合并到顶层 system (与 OpenAI reader 对称), 该形态的 system 内容从 messages[] 搬移到顶层 — 字面 byte-exact 对其不成立 (位置搬移非丢失). 修复前 writer 静默丢弃该条目 (真信息丢失: 上游收不到 system 内容 + req_delta 计数与写回 body 错位致 timeline 气泡退化为 preview 截断). 原样写回替代方案会被 schema 严格上游 400 拒绝 | 用户报告 claude code `-p` 请求 timeline 只显示 48 字符 preview (2026-09-23 排查): AnthropicReader/Writer 对 messages[] 内 system 条目不对称 (reader 留在 ir.messages / writer filter 丢弃) — reader 提升为唯一既保内容又保可用性的选项 |
