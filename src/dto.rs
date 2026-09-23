@@ -113,8 +113,8 @@ pub struct SessionView {
 /// 不含 messages body 与 resp_body / req_body_raw (避免 clone 大量数据);
 /// 含 list 场景需要的所有元数据 (preview / model / redactions / 响应状态等).
 ///
-/// `parsed_response`: timeline 路径用 (前端不再 N+1 拉 /records/{id}?view=parsed).
-/// 从 node.response.parsed clone (仅在有解析结果时), 避免前端再发请求.
+/// `parsed_response`: B1 双态派生 (`derive::parsed_view`) — 流式进行中读 stored
+/// 节流快照, finalize 后从 message + 元字段派生.
 #[derive(Debug, Clone)]
 pub struct NodeView {
     pub id: Uuid,
@@ -212,9 +212,10 @@ pub struct RoundBrief {
 ///
 /// 与 RoundBrief 的区别: 多了 redactions + req_delta_messages (前端渲染气泡用).
 /// `req_delta_messages` B1 起从 BlockPool 结构化派生 (resolve + real→mock 投影替换
-/// + ingress writer 序列化, `derive::extract_delta_messages_from_blocks`), 与旧
+///   经 ingress writer 序列化, `derive::extract_delta_messages_from_blocks`), 与旧
 /// req_body_raw 末尾切片逐字节等价 (consistency-check shadow 守卫); OpenAI writer
-/// 的 ToolResult 拆分场景保持与旧切片一致的尾部对齐 (DTO-6 的错位行为不变).
+/// 的 ToolResult 拆分场景保持与旧切片一致的尾部对齐 — delta 可能丢失本轮展开的头部
+/// (user text 气泡与部分 tool 消息, 不混入前序轮; DTO-6 的错位行为不变).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TimelineRound {
     pub id: Uuid,

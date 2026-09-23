@@ -9276,7 +9276,11 @@ async fn anthropic_messages_system_role_position_fidelity() {
 /// 测试内手工复刻的旧路径 oracle: 从 req_body_raw 末尾切 count 条 + OpenAI 根节点
 /// system 注入 (与 `derive::extract_delta_messages_from_raw` 逐分支一致, 但不经
 /// 生产代码 — 端到端锁定的意义正在于比对两条**独立实现**).
-fn legacy_raw_slice_oracle(req_body_raw: &str, count: usize, is_root: bool) -> Vec<serde_json::Value> {
+fn legacy_raw_slice_oracle(
+    req_body_raw: &str,
+    count: usize,
+    is_root: bool,
+) -> Vec<serde_json::Value> {
     if count == 0 {
         return Vec::new();
     }
@@ -9371,16 +9375,25 @@ async fn timeline_blocks_derivation_e2e_openai_secret() {
 
     // ② system 注入在首位 + secret 呈 mock (LLM 视角).
     assert_eq!(round_root.req_delta_messages[0]["role"], "system");
-    assert_eq!(round_root.req_delta_messages[0]["content"], "you are strict");
+    assert_eq!(
+        round_root.req_delta_messages[0]["content"],
+        "you are strict"
+    );
     let user_bubble = &round_root.req_delta_messages[1];
     let mock = round_root.redactions[0].0.clone();
     let bubble_text = user_bubble["content"].as_str().unwrap();
     assert!(bubble_text.contains(&mock), "bubble 含 mock: {bubble_text}");
-    assert!(!bubble_text.contains("sk-live-abcdef123456"), "bubble 不得含 real");
+    assert!(
+        !bubble_text.contains("sk-live-abcdef123456"),
+        "bubble 不得含 real"
+    );
 
     // ③ tail 派生: stored parsed 已清除, message + 元字段 → ingress writer.
     let resp = dag_probe.get_response(child_id).unwrap();
-    assert!(resp.parsed.is_none(), "finalize 后 stored parsed 已清除 (B1)");
+    assert!(
+        resp.parsed.is_none(),
+        "finalize 后 stored parsed 已清除 (B1)"
+    );
     let tail = &page.tail;
     assert!(tail.resp_complete);
     let parsed = tail.parsed.as_ref().expect("tail parsed 派生");
@@ -9401,8 +9414,7 @@ async fn timeline_blocks_derivation_e2e_openai_secret() {
 async fn timeline_tail_derived_parsed_keeps_llm_view_anthropic() {
     let entry = secret("tok2", "sk-live-zzz123456789");
     let seed = secret_guard::redact::init_seed(std::slice::from_ref(&entry));
-    let mock =
-        secret_guard::mock::gen_candidate(&entry.value, &entry.mock_strategy, seed, 0);
+    let mock = secret_guard::mock::gen_candidate(&entry.value, &entry.mock_strategy, seed, 0);
 
     let mut upstream = spawn_mock_upstream().await;
     let _m = upstream
@@ -9443,17 +9455,26 @@ async fn timeline_tail_derived_parsed_keeps_llm_view_anthropic() {
     assert!(resp.parsed.is_none(), "stored parsed 已清除");
 
     // 客户端侧: restore 后的响应含真 secret (mock → real).
-    assert!(resp_body.contains("sk-live-zzz123456789"), "client got real");
+    assert!(
+        resp_body.contains("sk-live-zzz123456789"),
+        "client got real"
+    );
 
     // tail 派生: LLM 视角 (含 mock), 不含真 secret.
     let node = dag_probe.get_node(id).unwrap();
     let page = dag_probe.timeline_view(node.session_id, None, 10).unwrap();
     let parsed = page.tail.parsed.as_ref().expect("tail parsed derived");
     let parsed_str = parsed.to_string();
-    assert!(!parsed_str.contains("sk-live-zzz123456789"), "tail 是 LLM 视角 (mock)");
+    assert!(
+        !parsed_str.contains("sk-live-zzz123456789"),
+        "tail 是 LLM 视角 (mock)"
+    );
     let redactions = &page.rounds[0].redactions;
     let mock = &redactions[0].0;
-    assert!(parsed_str.contains(mock.as_str()), "tail 含 mock: {parsed_str}");
+    assert!(
+        parsed_str.contains(mock.as_str()),
+        "tail 含 mock: {parsed_str}"
+    );
 }
 
 #[tokio::test]

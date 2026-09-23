@@ -92,16 +92,10 @@ pub(super) fn node_view(inner: &DagInner, node_id: Uuid) -> Option<NodeView> {
         resp_complete: resp.as_ref().map(|r| r.resp_complete).unwrap_or(false),
         error: resp.as_ref().and_then(|r| r.error.clone()),
         redactions: Arc::clone(&node.event.redactions),
-        // B1: 流式进行中读 stored parsed (节流快照); finalize 后 parsed 已清除,
-        // 从 message + 元字段派生 (与 timeline tail 同一 SSOT 派生函数).
-        parsed_response: resp.as_ref().and_then(|r| {
-            r.parsed.clone().or_else(|| {
-                let message = r.message.as_ref()?;
-                node.event.ingress_protocol.and_then(|protocol| {
-                    crate::derive::response_parsed_from_parts(protocol, &inner.blocks, message, r)
-                })
-            })
-        }),
+        // B1 双态单点 (derive::parsed_view): 流式中读 stored, finalize 后派生.
+        parsed_response: resp
+            .as_ref()
+            .and_then(|r| crate::derive::parsed_view(node, &inner.blocks, r)),
         // list_page 路径不填 (避免 O(n) 全量 resolve); timeline 路径单独填.
         req_delta_messages: Vec::new(),
     })

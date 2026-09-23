@@ -399,11 +399,9 @@ pub(crate) async fn cross_proto_forward(
     // 15. 翻译响应: egress JSON → IR → (restore redact) → ingress JSON.
     let egress_reader = egress_codec.reader();
     let ingress_writer = ingress_codec.writer();
-    // parsed view: 记录 LLM 视角的 IR (restore 之前, 含 mock). 仅 2xx 成功响应.
-    // B1: finalize 统一产出 (message + 元字段; parsed 渲染派生, 不再长期存 Value).
+    // B1: finalize 统一产出 (message + 元字段 + 回显摘要, restore 前提取; parsed
+    // 渲染派生, 不再长期存 Value) — 语义同 fan_out_buffered_ir.
     let mut resp_finality = super::recorder::RespFinality::empty();
-    // usage-stats 回显摘要 (restore 前提取, 语义同 fan_out_buffered_ir).
-    let mut resp_echo = super::recorder::ResponseEcho::default();
     let (resp_status_out, resp_body_out): (StatusCode, Vec<u8>) = if resp_status.is_success() {
         match serde_json::from_slice::<serde_json::Value>(&resp_bytes) {
             Ok(v) => match egress_reader.read_response(&v) {
@@ -426,12 +424,7 @@ pub(crate) async fn cross_proto_forward(
                         );
                     }
                     // record 接线走 LLM 视角 (restore 之前, 含 mock) 的 finality.
-                    resp_echo = super::recorder::ResponseEcho::from_ir(&ir_resp);
-                    resp_finality = super::recorder::RespFinality::from_ir(
-                        ingress_codec,
-                        &ir_resp,
-                        ingress_writer.as_ref(),
-                    );
+                    resp_finality = super::recorder::RespFinality::from_ir(ingress_codec, &ir_resp);
                     // restore: mock → real (跨协议 + redact 时, 客户端看到的应该是真 secret).
                     crate::redact::restore_ir_response(&mut ir_resp, &redaction_map);
                     let translated = ingress_writer.write_response(&ir_resp);
@@ -500,44 +493,33 @@ pub(crate) async fn cross_proto_forward(
             egress_reader.as_ref(),
         );
     }
-    let resp_data = ResponseData {
-        resp_status: resp_status_out.as_u16(),
-        resp_headers: redact_headers(&resp_headers, &state.redacted_headers),
-        // 视角语义注意: 与 fan_out_buffered_ir ("LLM 视角, 含 mock") 不同, 这里
-        // raw_resp_body 沿用 master 起的客户端视角 (翻译 + restore 后的出站字节) —
-        // DAG OriginRecord 本就按真值存储, 无安全边界问题, 仅为两条路径语义
-        // 不一致的显式声明 (WebUI raw view 在 cross-proto 下展示真 secret).
-        raw_resp_body: utf8_view(&resp_body_out),
-        // B1: message intern + parsed 清除 (渲染时经 ingress writer 派生),
-        // 元字段接线 — 与 fan_out 家族同型.
-        parsed: None,
-        message: resp_finality
-            .message
-            .as_ref()
-            .map(|m| state.dag.intern_message(m)),
-        stop_reason: resp_finality.stop_reason,
-        stop_sequence: resp_finality.stop_sequence.clone(),
-        id: resp_finality.id.clone(),
-        created: resp_finality.created,
-        elapsed_ms: elapsed,
-        // 判型结果 (上游响应是否 SSE-shaped) — 客户端实际收到的是 buffered 翻译
-        // (非流式回传), 但 record 的 streamed 语义与 same_proto 家族一致: 记录
-        // 上游响应形态 (非 2xx SSE 错误体落在此路径时为 true).
-        streamed,
-        resp_complete: true,
-        error: None,
-        usage: resp_echo.usage.clone(),
-        model: resp_echo.model.clone(),
-    };
-    #[cfg(feature = "consistency-check")]
-    super::recorder::assert_finalize_parsed_matches_stored(&state.dag, &resp_finality, &resp_data);
-    state.dag.attach_response(record_id, resp_data);
+    // B1 接线收口: message intern + parsed 清除 + 元字段 + 守卫 + attach.
+    // raw_resp_body 视角语义注意: 与 fan_out_buffered_ir ("LLM 视角, 含 mock") 不同,
+    // 这里沿用 master 起的客户端视角 (翻译 + restore 后的出站字节) — DAG OriginRecord
+    // 本就按真值存储, 无安全边界问题, 仅为两条路径语义不一致的显式声明 (WebUI raw
+    // view 在 cross-proto 下展示真 secret). streamed = 判型结果 (上游是否 SSE-shaped)
+    // — 客户端实际收到 buffered 翻译, 但 record 语义与 same_proto 家族一致.
+    super::recorder::attach_finality(
+        &state.dag,
+        record_id,
+        &resp_finality,
+        ResponseData {
+            resp_status: resp_status_out.as_u16(),
+            resp_headers: redact_headers(&resp_headers, &state.redacted_headers),
+            raw_resp_body: utf8_view(&resp_body_out),
+            elapsed_ms: elapsed,
+            streamed,
+            resp_complete: true,
+            error: None,
+            ..Default::default()
+        },
+    );
     // usage-stats 落账 (USAGE-5 计入判据在 ctx 内统一执行).
     usage_ctx.record_response(
         resp_status_out.as_u16(),
         true,
-        resp_echo.usage,
-        resp_echo.model,
+        resp_finality.echo.usage,
+        resp_finality.echo.model,
     );
     // record 最终态写入后打摘要 (#160).
     super::recorder::log_forward_summary(&state.dag, record_id);

@@ -133,8 +133,9 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 1. **待裁决 / 架构受限 (3 条)** — 补齐前需先做实现路线裁决或架构改动:
    STR-3 `prop_non_2xx_sse_no_mock_to_client` (已知实现 gap, 见 STR-3 "理想 vs 现状" 注记,
    出路与 SEC-10 opt-in 哲学纠缠, 需维护者拍板); DTO-6
-   `prop_cross_proto_delta_no_silent_misalignment` (理想方案需在 web 层重建 redactMap,
-   有 secret 泄露顾虑, 见 web/AGENTS.md TODO); VIEW-2 流式 `resp_parsed`
+   `prop_cross_proto_delta_no_silent_misalignment` (B1 已把行为定义为 "尾部对齐,
+   丢失本轮头部" 并锁定等价; 残留 ⏳ = 前端拆分场景的显式降级标记, 需 UI-1 渲染
+   语义配合演进, 见 DTO-6 正文); VIEW-2 流式 `resp_parsed`
    (Phase A 已物理删除源字节, 需 Phase B 或 consistency-check 双累积).
 2. **UI e2e 类 (5 条: DTO-4 + UI-3×3 + UI-7)** — 后端半边多已覆盖, 缺 Playwright
    专项 e2e (fallback 占位 / prepend / replace / 乱序自愈 / 重复 append 幂等);
@@ -669,12 +670,12 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 ### DTO-6 跨协议 delta 切片行为定义
 
-**陈述**: 跨协议路径下, OpenAI writer 把 Anthropic 风格的混合 Text+ToolResult user 消息拆成 (1+N) 条 wire messages, 导致 req_body_raw messages 数 > IR messages 数. 此场景下 delta 切片的**期望行为**必须被定义 (而非静默错位).
+**陈述**: 跨协议路径下, OpenAI writer 把 Anthropic 风格的混合 Text+ToolResult user 消息拆成 (1+N) 条 wire messages, 使 delta 的 wire 展开多于 IR message 数. B1 起生产切片是 BlockPool 派生 (`derive::extract_delta_messages_from_blocks`, 即本条原始 "理想目标" 的实现), 与旧 raw 切片逐字节等价.
 
-> **理想 vs 现状**: 当前实现 delta 可能包含前序轮消息 (静默错位), 是已知 gap. 理想目标是从 IR req_delta resolve + ingress writer 重序列化.
+> **B1 后的残留 gap**: 拆分场景下尾部对齐 (取尾 `count` 条, 与旧切片等价) 使 delta 可能**丢失本轮展开的头部** (user text 气泡与部分 tool 消息), 不混入前序轮消息 — 受 UI-1 (气泡数 == req_delta 长度) 约束, 不能直接输出全量展开; 修复需要前端渲染语义配合 (DTO-9/UI-1 演进), 见 `docs/known-limitations.md` derive 节.
 
 **Properties**:
-- `prop_cross_proto_delta_no_silent_misalignment`: 跨协议路径下 delta 切片要么正确, 要么显式标记降级 (不静默错位). ⏳
+- `prop_cross_proto_delta_no_silent_misalignment`: 拆分场景下 delta 切片行为必须被定义且不静默错位 — B1 已把行为定义为 "尾部对齐, 丢失本轮头部" 并由 `prop_blocks_derivation_matches_raw` (DTO-5) 锁定与旧路径等价; 前端显式标记降级 (如拆分提示) 仍 ⏳.
 
 ### DTO-7 session title 取根 node
 

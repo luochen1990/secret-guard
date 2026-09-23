@@ -553,12 +553,47 @@ impl ConversationDag {
     ///
     /// 响应元数据 (`resp_status` / `resp_headers` / `elapsed_ms`) 只写
     /// `node.response`, `NodeView` / `SessionView` 读它们时也走 response 锁.
+    /// 响应收尾: 整体替换 node 的 [`ResponseData`], 并收口 message 的 block
+    /// refcount 生命周期 (B1 后 attach 是 response.message refcount 的唯一
+    /// 写入侧管理者):
+    ///
+    /// - 节点已被淘汰 (理论窗口: 长流式响应进行中, 本 session 的 latest_at 停留
+    ///   在 push 时刻, 并发 push 的 LRU 淘汰可选中它) → 同步**释放**调用方 intern
+    ///   好的 message refcount (调用方 intern 与本方法分属两个临界区, 不回收则
+    ///   block 永久滞留池中 — 内存泄漏), 仅 warn。
+    /// - 覆盖已有 response (API 允许二次 attach, 仅测试触达) → 释放旧 message 的
+    ///   refcount (被覆盖即无人再引用)。
+    ///
+    /// 锁取舍: 全程持 `inner.write()` (而非历史的两级锁) — message 释放需要
+    /// `&mut blocks`, 且 refcount 生命周期必须与节点写入/淘汰判定在**同一临界区**
+    /// 内闭环 (读锁下收集旧 ref 再升级写锁会重新打开淘汰窗口)。attach 是低频
+    /// 路径 (每响应一次), 与并发 push 互斥的代价可忽略; push/evict 本就全写锁。
     pub fn attach_response(&self, node_id: Uuid, response: ResponseData) {
-        let g = self.inner.read();
-        let Some(node) = g.nodes.get(&node_id) else {
-            tracing::warn!(%node_id, "attach_response: node not found (evicted?)");
+        // 全程持写锁 (单一临界区, 见函数 doc); guard 经 DerefMut 借用整个
+        // DagInner, nodes/blocks 不能按字段分裂 — 借用分两阶段, 原子性不受影响
+        // (同一临界区内).
+        let mut g = self.inner.write();
+        if !g.nodes.contains_key(&node_id) {
+            if let Some(m) = &response.message {
+                g.blocks.release_message(m);
+            }
+            tracing::warn!(%node_id, "attach_response: node not found (evicted?); released response message blocks");
             return;
+        }
+        // Phase 1: 收集被覆盖的旧 message (借用在本阶段内结束).
+        let old_message = {
+            let node = g.nodes.get(&node_id).expect("checked above (write lock)");
+            let resp_lock = node.response.read();
+            resp_lock.as_ref().and_then(|r| r.message.clone())
         };
+        if let Some(old) = &old_message {
+            g.blocks.release_message(old);
+        }
+        // Phase 2: 写入新 response.
+        let node = g
+            .nodes
+            .get_mut(&node_id)
+            .expect("checked above (write lock)");
         *node.response.write() = Some(response);
     }
 
@@ -567,29 +602,28 @@ impl ConversationDag {
     /// 与 push_messages 的 intern 同一池/同一 refcount 语义; 单独暴露是因为响应
     /// 到达时 node 已存在, 不能再走 push. refcount 由 gc_cascade 的既有
     /// `resp.message` 释放路径回收.
-    pub fn intern_message(&self, msg: &crate::codec::ir::IrMessage) -> MessageRef {
+    pub(crate) fn intern_message(&self, msg: &crate::codec::ir::IrMessage) -> MessageRef {
         let mut g = self.inner.write();
         g.blocks.intern_message(msg)
     }
 
     /// tail parsed 派生 (B1, records parsed view 等外部消费点的便捷入口).
     ///
-    /// 派生核心 SSOT 是 [`crate::derive::response_parsed_from_parts`]; 本方法在
-    /// 单个读锁内取齐 (protocol, blocks, message, resp) 后委托. message 缺失
-    /// (流式进行中 / 错误响应) → None, 调用方走 stored parsed / raw fallback.
+    /// B1 双态单点语义 (`derive::parsed_view`): 流式进行中 → stored 节流 parsed;
+    /// finalize 后 → message + 元字段派生. 两者皆缺 (错误响应 / 无 codec) → None,
+    /// 调用方走 raw fallback.
     pub fn derive_response_parsed(&self, node_id: Uuid) -> Option<serde_json::Value> {
         let g = self.inner.read();
         let node = g.nodes.get(&node_id)?;
-        let protocol = node.event.ingress_protocol?;
         let resp_lock = node.response.read();
         let resp = resp_lock.as_ref()?;
-        let message = resp.message.as_ref()?;
-        crate::derive::response_parsed_from_parts(protocol, &g.blocks, message, resp)
+        crate::derive::parsed_view(node, &g.blocks, resp)
     }
 
     /// [`Self::derive_response_parsed`] 的分件入口 (finalize 守卫用): parts 由
     /// 调用方持有 (attach 前的构造值), 只借池做 resolve. 生产渲染路径不经此方法.
-    pub fn derive_response_parsed_parts(
+    #[cfg(feature = "consistency-check")]
+    pub(crate) fn derive_response_parsed_parts(
         &self,
         protocol: crate::codec::Protocol,
         message: &MessageRef,
@@ -616,8 +650,9 @@ impl ConversationDag {
     /// 若 node 尚无 ResponseData (流过程中尚未 attach), 自动创建一个 default 占位
     /// (resp_complete=false), 仅写 parsed 字段; 最终的 `attach_response` 会整体替换.
     ///
-    /// 两级锁 (perf): 与 `attach_response` 同. 这是高频路径 (流式 ~500ms 一次),
-    /// 改 read lock + node.response.write() 后并发多路流式不再串行化在全局锁.
+    /// 两级锁 (perf, 高频路径 — 流式 ~500ms 一次): read lock + node.response.write()
+    /// 让并发多路流式不串行化在全局锁 (`attach_response` 因 message refcount 收口
+    /// 已改持全写锁, 见其 doc; 本低频写入维持轻量两级锁).
     pub fn update_parsed_response(&self, node_id: Uuid, parsed: serde_json::Value) {
         let g = self.inner.read();
         let Some(node) = g.nodes.get(&node_id) else {
@@ -1893,7 +1928,10 @@ mod tests {
         let sid = sid_of(&dag, a);
         let page = dag.timeline_view(sid, None, 10).expect("page exists");
         let tail = &page.tail;
-        let parsed = tail.parsed.as_ref().expect("tail parsed derived after finalize");
+        let parsed = tail
+            .parsed
+            .as_ref()
+            .expect("tail parsed derived after finalize");
         // 与直接 writer 序列化同一 IrResponse 逐字节相等.
         let expected = crate::codec::Protocol::OpenAI
             .writer()
@@ -1918,6 +1956,69 @@ mod tests {
         let page = dag.timeline_view(sid, None, 10).expect("page exists");
         assert_eq!(page.tail.parsed.as_ref(), Some(&interim));
         assert!(!page.tail.resp_complete);
+    }
+
+    // ─── B1: attach_response 的 message refcount 生命周期收口 ─────────────
+
+    /// 长流式响应进行中节点被 LRU 淘汰 → finalize 的 attach 落空 → 调用方 intern 的
+    /// message block refcount 必须由 attach 同步释放 (防 block 永久滞留池中).
+    #[test]
+    fn attach_response_on_evicted_node_releases_message_refcount() {
+        let dag = ConversationDag::new(2, 50, 1); // max_nodes=2 → 第 3 个 push 淘汰最旧 session
+        let a = dag.push_messages(vec![text_msg(IrRole::User, "u1")], dummy_event());
+        let msg_ref = dag.intern_message(&text_msg(IrRole::Assistant, "late-reply"));
+        let block_hash = msg_ref.blocks[0];
+
+        let _b = dag.push_messages(vec![text_msg(IrRole::User, "x2")], dummy_event());
+        let _c = dag.push_messages(vec![text_msg(IrRole::User, "x3")], dummy_event());
+        assert!(dag.get_node(a).is_none(), "a 已被 LRU 淘汰");
+
+        dag.attach_response(
+            a,
+            ResponseData {
+                message: Some(msg_ref),
+                ..Default::default()
+            },
+        );
+        // intern 的 block 已被释放: 池中不可再取 (refcount 归零即删除).
+        let g = dag.inner.read();
+        assert!(
+            g.blocks.get(block_hash).is_none(),
+            "evicted attach 必须释放 message refcount (防泄漏)"
+        );
+    }
+
+    /// 二次 attach 覆盖 (API 允许, 测试触达) → 旧 message 的 refcount 必须释放.
+    #[test]
+    fn attach_response_overwrite_releases_old_message_refcount() {
+        let dag = ConversationDag::new(8, 500, 1);
+        let a = dag.push_messages(vec![text_msg(IrRole::User, "u")], dummy_event());
+        let m1 = dag.intern_message(&text_msg(IrRole::Assistant, "first-reply"));
+        let h1 = m1.blocks[0];
+        dag.attach_response(
+            a,
+            ResponseData {
+                message: Some(m1),
+                ..Default::default()
+            },
+        );
+        assert!(dag.inner.read().blocks.get(h1).is_some());
+
+        let m2 = dag.intern_message(&text_msg(IrRole::Assistant, "second-reply"));
+        let h2 = m2.blocks[0];
+        dag.attach_response(
+            a,
+            ResponseData {
+                message: Some(m2),
+                ..Default::default()
+            },
+        );
+        let g = dag.inner.read();
+        assert!(
+            g.blocks.get(h1).is_none(),
+            "覆盖 attach 必须释放旧 message refcount"
+        );
+        assert!(g.blocks.get(h2).is_some(), "新 message 存活");
     }
 
     // ─── 并发测试 ──────────────────────────────────────────────────────────

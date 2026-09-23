@@ -9,7 +9,7 @@
 //!   `round_role = Tool` 时调用, 覆盖 `extract_preview` 的 fallback 结果.
 //! - timeline delta messages (B1 数据源: `extract_delta_messages_from_blocks`):
 //!   从 BlockPool 结构化派生 (resolve → real→mock 投影替换 → ingress writer 序列化
-//!   + 根节点 system 注入); 旧 raw 切片实现 (`extract_delta_messages_from_raw`)
+//!   以及根节点 system 注入); 旧 raw 切片实现 (`extract_delta_messages_from_raw`)
 //!   保留为 consistency-check shadow 对照 + 等价性 oracle.
 //! - timeline tail parsed (B1: `response_parsed_from_parts`): response.message +
 //!   元字段 → ingress writer 序列化 (finalize 后 stored parsed 已清除的渲染派生).
@@ -305,8 +305,8 @@ pub(crate) fn extract_text_blocks(arr: &[serde_json::Value]) -> Option<Vec<Strin
 ///
 /// # 已知限制
 ///
-/// 跨协议 writer 拆分场景切片 start 偏小, delta 可能含前序轮消息 (同协议不受影响).
-/// 详见 AGENTS.md "已知限制" + src/web/AGENTS.md.
+/// OpenAI writer 的 ToolResult 拆分场景下尾部对齐使 delta 可能丢失本轮展开的头部
+/// (不混入前序轮消息; 同协议不受影响). 详见 AGENTS.md "已知限制" + src/web/AGENTS.md.
 ///
 /// # 鲁棒性 (ROB-1 契约)
 ///
@@ -459,6 +459,9 @@ pub(crate) fn extract_delta_messages_from_blocks(
     };
     // 每条 IR message 展开为 ≥1 条 wire 消息, 故 arr.len() ≥ count;
     // saturating_sub 为防御性写法 (池损坏时不 panic).
+    // 前提 (不变式): 两个 reader 都把 System 消息提升出 ir.messages — 故
+    // Anthropic writer 的 System filter (1:N 收缩) 生产不可达; 若未来 reader
+    // 放开 System-in-messages, 此处与旧切片路径 (count > len 早退空 Vec) 将分歧.
     let start = arr.len().saturating_sub(count);
     let mut result: Vec<serde_json::Value> = arr[start..].to_vec();
 
@@ -533,6 +536,23 @@ pub(crate) fn response_parsed_from_parts(
     Some(protocol.writer().write_response(&ir_resp))
 }
 
+/// B1 双态 parsed 的**单点语义** (四个渲染消费点共享: timeline tail /
+/// NodeView.parsed_response / records parsed view / dag 便捷入口):
+/// 流式进行中 → stored 节流 parsed (StreamScan 快照, 前端实时进度) 优先;
+/// finalize 后 (stored 已清除) → `response.message` + 元字段渲染派生.
+pub(crate) fn parsed_view(
+    node: &crate::dag::Node,
+    pool: &crate::dag::BlockPool,
+    resp: &crate::dag::ResponseData,
+) -> Option<serde_json::Value> {
+    resp.parsed.clone().or_else(|| {
+        let message = resp.message.as_ref()?;
+        node.event
+            .ingress_protocol
+            .and_then(|protocol| response_parsed_from_parts(protocol, pool, message, resp))
+    })
+}
+
 /// 视图正确性守卫 (CI 用, 需 `--features consistency-check`): blocks 派生 (新,
 /// 生产路径) 与 req_body_raw 切片 (旧, 保留 oracle) 的输出逐元素相等.
 ///
@@ -545,20 +565,20 @@ pub(crate) fn response_parsed_from_parts(
 /// count>0 + 无协议是 fixture-only 的矛盾态, 两路径对它的输出定义不同
 /// (blocks 路径返回空更安全: passthrough raw 是未 redact 的客户端原始字节).
 #[cfg(feature = "consistency-check")]
-pub(crate) fn assert_delta_view_matches_raw(
-    node: &crate::dag::Node,
-    pool: &crate::dag::BlockPool,
-) {
+pub(crate) fn assert_delta_view_matches_raw(node: &crate::dag::Node, pool: &crate::dag::BlockPool) {
     if node.event.ingress_protocol.is_none() {
         return;
     }
     let derived = extract_delta_messages_from_blocks(node, pool);
     let oracle = extract_delta_messages_from_raw(node);
     debug_assert_eq!(
-        derived, oracle,
+        derived,
+        oracle,
         "timeline delta drift: blocks-derived view != req_body_raw slice \
          (node={}, proto={:?}, count={})",
-        node.id, node.event.ingress_protocol, node.req_delta.len()
+        node.id,
+        node.event.ingress_protocol,
+        node.req_delta.len()
     );
 }
 
@@ -1475,6 +1495,14 @@ mod tests {
     /// 可嵌 secret 的文本: `(基串, secret 池索引)`.
     type MaybeSecretText = (String, Option<usize>);
 
+    /// Chat 消息 content array 的 part: 文本 / 图片 (url 可嵌 secret — Image 的
+    /// url 是 StringLeafOps 叶子, redact 覆盖, matrix 轴之一).
+    #[derive(Clone, Debug)]
+    enum EqPart {
+        Text(MaybeSecretText),
+        Image(MaybeSecretText),
+    }
+
     /// 协议无关的 message 抽象 (渲染层按 proto 输出 wire 形态).
     #[derive(Clone, Debug)]
     enum EqMsg {
@@ -1483,7 +1511,7 @@ mod tests {
             assistant: bool,
             str_form: bool,
             null_form: bool,
-            parts: Vec<MaybeSecretText>,
+            parts: Vec<EqPart>,
         },
         /// assistant 发起工具调用 (arguments 是 JSON object 源码串, 内含文本叶子).
         ToolUse {
@@ -1508,6 +1536,44 @@ mod tests {
         }
     }
 
+    /// Chat 消息的协议共享渲染 (两协议仅 Image part 的 wire 形态分叉):
+    /// role + content 三态 (null / 裸 string (仅单 Text part 合法) / array).
+    fn render_chat_msg(
+        assistant: bool,
+        str_form: bool,
+        null_form: bool,
+        parts: &[EqPart],
+        pool: &[SecretEntry],
+        render_image: impl Fn(&str) -> serde_json::Value,
+    ) -> serde_json::Value {
+        let role = if assistant { "assistant" } else { "user" };
+        // 裸 string 形态仅对 "单 Text part" 合法 (图片无 string 形态);
+        // 生成器的 str_form 对非该形态自动回退 array (两侧 reader 对称归一).
+        let single_text = match parts {
+            [EqPart::Text(t)] => Some(render_text(t, pool)),
+            _ => None,
+        };
+        let content = if null_form {
+            serde_json::Value::Null
+        } else if str_form && let Some(t) = single_text {
+            // 裸 string content (reader 归一化为单 Text block + String 形态).
+            serde_json::Value::String(t)
+        } else {
+            serde_json::Value::Array(
+                parts
+                    .iter()
+                    .map(|p| match p {
+                        EqPart::Text(t) => serde_json::json!({
+                            "type": "text", "text": render_text(t, pool)
+                        }),
+                        EqPart::Image(url) => render_image(&render_text(url, pool)),
+                    })
+                    .collect(),
+            )
+        };
+        serde_json::json!({"role": role, "content": content})
+    }
+
     /// 把协议无关 message 渲染为 OpenAI wire 形态.
     fn render_msg_openai(m: &EqMsg, pool: &[SecretEntry]) -> serde_json::Value {
         match m {
@@ -1516,24 +1582,19 @@ mod tests {
                 str_form,
                 null_form,
                 parts,
-            } => {
-                let role = if *assistant { "assistant" } else { "user" };
-                let content = if *null_form {
-                    serde_json::Value::Null
-                } else if *str_form {
-                    // 裸 string content (reader 归一化为单 Text block + String 形态).
-                    serde_json::Value::String(render_text(&parts[0], pool))
-                } else {
-                    serde_json::Value::Array(
-                        parts
-                            .iter()
-                            .map(|p| serde_json::json!({"type": "text", "text": render_text(p, pool)}))
-                            .collect(),
-                    )
-                };
-                serde_json::json!({"role": role, "content": content})
-            }
-            EqMsg::ToolUse { id, name, args_text } => serde_json::json!({
+            } => render_chat_msg(
+                *assistant,
+                *str_form,
+                *null_form,
+                parts,
+                pool,
+                |url| serde_json::json!({"type": "image_url", "image_url": {"url": url}}),
+            ),
+            EqMsg::ToolUse {
+                id,
+                name,
+                args_text,
+            } => serde_json::json!({
                 "role": "assistant",
                 "content": null,
                 "tool_calls": [{
@@ -1563,23 +1624,19 @@ mod tests {
                 str_form,
                 null_form,
                 parts,
-            } => {
-                let role = if *assistant { "assistant" } else { "user" };
-                let content = if *null_form {
-                    serde_json::Value::Null
-                } else if *str_form {
-                    serde_json::Value::String(render_text(&parts[0], pool))
-                } else {
-                    serde_json::Value::Array(
-                        parts
-                            .iter()
-                            .map(|p| serde_json::json!({"type": "text", "text": render_text(p, pool)}))
-                            .collect(),
-                    )
-                };
-                serde_json::json!({"role": role, "content": content})
-            }
-            EqMsg::ToolUse { id, name, args_text } => serde_json::json!({
+            } => render_chat_msg(
+                *assistant,
+                *str_form,
+                *null_form,
+                parts,
+                pool,
+                |url| serde_json::json!({"type": "image", "source": {"type": "url", "url": url}}),
+            ),
+            EqMsg::ToolUse {
+                id,
+                name,
+                args_text,
+            } => serde_json::json!({
                 "role": "assistant",
                 "content": [{
                     "type": "tool_use",
@@ -1630,24 +1687,15 @@ mod tests {
         secrets: Vec<SecretEntry>,
     }
 
+    /// system 文本块渲染 (InMessages / TopLevelArray 共用).
+    fn render_text_blocks(t: &[MaybeSecretText], pool: &[SecretEntry]) -> Vec<serde_json::Value> {
+        t.iter()
+            .map(|p| serde_json::json!({"type": "text", "text": render_text(p, pool)}))
+            .collect()
+    }
+
     /// 渲染完整请求 body (per proto). `msgs` 为消息切片 (prefix 请求 / full 请求).
     fn render_body(c: &EqCase, msgs: &[EqMsg]) -> serde_json::Value {
-        let sys_texts = |s: &EqSystem| -> Vec<serde_json::Value> {
-            match s {
-                EqSystem::None | EqSystem::InMessages(_) => vec![],
-                EqSystem::TopLevelString(t) | EqSystem::TopLevelArray(t) => t
-                    .iter()
-                    .map(|p| serde_json::json!({"type": "text", "text": render_text(p, &c.secrets)}))
-                    .collect(),
-            }
-        };
-        let sys_msg = |texts: &[serde_json::Value], str_form: bool| {
-            if str_form {
-                serde_json::json!({"role": "system", "content": texts[0]["text"].clone()})
-            } else {
-                serde_json::json!({"role": "system", "content": texts})
-            }
-        };
         let mut wire_msgs: Vec<serde_json::Value> = msgs
             .iter()
             .map(|m| match c.proto {
@@ -1658,11 +1706,13 @@ mod tests {
         match &c.system {
             EqSystem::None => {}
             EqSystem::InMessages(t) => {
-                let texts: Vec<_> = t
-                    .iter()
-                    .map(|p| serde_json::json!({"type": "text", "text": render_text(p, &c.secrets)}))
-                    .collect();
-                wire_msgs.insert(0, sys_msg(&texts, false));
+                wire_msgs.insert(
+                    0,
+                    serde_json::json!({
+                        "role": "system",
+                        "content": render_text_blocks(t, &c.secrets)
+                    }),
+                );
             }
             EqSystem::TopLevelString(t) if c.proto == CodecProtocol::OpenAI => {
                 // OpenAI 无顶层 system 字段 — 生产客户端把它放 messages[0],
@@ -1683,8 +1733,11 @@ mod tests {
                         serde_json::json!(render_text(&t[0], &c.secrets)),
                     );
                 }
-                EqSystem::TopLevelArray(_) => {
-                    body.insert("system".into(), serde_json::Value::Array(sys_texts(&c.system)));
+                EqSystem::TopLevelArray(t) => {
+                    body.insert(
+                        "system".into(),
+                        serde_json::Value::Array(render_text_blocks(t, &c.secrets)),
+                    );
                 }
                 _ => {}
             }
@@ -1708,7 +1761,7 @@ mod tests {
         // 生产路径是 redact_ir_checked(FailClosed 默认); 测试用 redact_ir (FailOpen)
         // — 对能通过的生成用例两者产出相同 map.
         let (map, seed) = crate::redact::redact_ir(&mut llm, &c.secrets);
-        let redactions = crate::proxy::recorder::derive_redactions(&map, &c.secrets);
+        let redactions = crate::proxy::derive_redactions(&map, &c.secrets);
         let raw = serde_json::to_string(&c.proto.writer().write_request(&llm)).ok()?;
         let event = CallEvent {
             created_at: chrono::Utc::now(),
@@ -1739,8 +1792,8 @@ mod tests {
         let mut raw_of: std::collections::HashMap<uuid::Uuid, String> =
             std::collections::HashMap::new();
         let mut push = |body: &serde_json::Value| -> Result<uuid::Uuid, String> {
-            let (id, raw) = eq_push_request(&dag, c, body)
-                .ok_or_else(|| "reader rejected body".to_string())?;
+            let (id, raw) =
+                eq_push_request(&dag, c, body).ok_or_else(|| "reader rejected body".to_string())?;
             raw_of.insert(id, raw);
             Ok(id)
         };
@@ -1767,10 +1820,7 @@ mod tests {
             .ok_or_else(|| "timeline_view none".to_string())?;
         for round in &page.rounds {
             let nv = dag.get_node(round.id).unwrap();
-            let mut shim = fixture_node(
-                nv.req_delta_count,
-                raw_of.get(&round.id).unwrap().clone(),
-            );
+            let mut shim = fixture_node(nv.req_delta_count, raw_of.get(&round.id).unwrap().clone());
             shim.parent = nv.parent;
             let oracle = extract_delta_messages_from_raw(&shim);
             if round.req_delta_messages != oracle {
@@ -1798,12 +1848,17 @@ mod tests {
             }
         });
         // 文本基串: 短字母数字 (与 secret 值字符集重叠, 让替换有区分度).
-        let text: proptest::strategy::BoxedStrategy<MaybeSecretText> = (
-            any::<u16>(),
-            prop::option::of(0usize..4),
-        )
-            .prop_map(|(n, idx)| (format!("t{}", n % 977), idx))
-            .boxed();
+        let text: proptest::strategy::BoxedStrategy<MaybeSecretText> =
+            (any::<u16>(), prop::option::of(0usize..4))
+                .prop_map(|(n, idx)| (format!("t{}", n % 977), idx))
+                .boxed();
+        // Chat parts: 文本为主, 混入 image (url 可嵌 secret — Image 的 url 是
+        // StringLeafOps 叶子, matrix 轴之一).
+        let part: proptest::strategy::BoxedStrategy<EqPart> = prop_oneof![
+            3 => text.clone().prop_map(EqPart::Text),
+            1 => text.clone().prop_map(EqPart::Image),
+        ]
+        .boxed();
         let texts = prop::collection::vec(text.clone(), 1..=3);
         let system = prop::option::of(prop_oneof![
             3 => texts.clone().prop_map(EqSystem::TopLevelString),
@@ -1815,7 +1870,7 @@ mod tests {
                 prop::bool::ANY,
                 prop::bool::ANY,
                 prop::bool::ANY,
-                prop::collection::vec(text.clone(), 1..=3),
+                prop::collection::vec(part.clone(), 1..=3),
             )
                 .prop_map(|(assistant, str_form, null_form, parts)| EqMsg::Chat {
                     assistant,
@@ -1879,13 +1934,15 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(128))]
 
         /// DTO-5 核心: blocks 派生 == raw 切片 (全 matrix, 128 cases).
+        ///
+        /// skip 策略: 仅 reader 拒绝的形态走 prop_assume (生成器产出无效);
+        /// "child unexpectedly became root" 属**结构性意外** (prefix 匹配回归 /
+        /// 生成器 bug) — 直接 fail, 不静默降级为 skip (防部分掩盖 prefix 回归).
         #[test]
         fn prop_blocks_derivation_matches_raw(case in arb_eq_case()) {
-            // reader 拒绝 / 子节点未接前缀等结构性跳过: 视为生成器产出无效,
-            // 计数控制 (prop_assume 比例过高时 proptest 会 panic 提示).
             match eq_run_case(&case) {
                 Ok(()) => {}
-                Err(e) if e.starts_with("reader rejected") || e.contains("unexpectedly became root") => {
+                Err(e) if e.starts_with("reader rejected") => {
                     proptest::prop_assume!(false, "skip structurally invalid case: {}", e);
                 }
                 Err(e) => panic!("equivalence violated: {e}"),

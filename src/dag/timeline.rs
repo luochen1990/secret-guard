@@ -141,15 +141,9 @@ fn build_timeline_tail(inner: &DagInner, node_id: Uuid) -> Option<TimelineTail> 
     let Some(resp) = resp_lock.as_ref() else {
         return Some(empty_tail(node_id));
     };
-    // finalize 后: 派生 parsed (message + 元字段 → ingress writer).
-    let derived = resp.message.as_ref().and_then(|message| {
-        node.event
-            .ingress_protocol
-            .and_then(|protocol| {
-                crate::derive::response_parsed_from_parts(protocol, &inner.blocks, message, resp)
-            })
-    });
-    let parsed = derived.or_else(|| resp.parsed.clone());
+    // B1 双态单点 (derive::parsed_view): 流式中读 stored 节流快照, finalize 后
+    // 从 message + 元字段派生 (两态互斥, 优先序单点定义).
+    let parsed = crate::derive::parsed_view(node, &inner.blocks, resp);
     let length = parsed
         .as_ref()
         .map(|v| v.to_string().len())

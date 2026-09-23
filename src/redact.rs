@@ -1242,20 +1242,12 @@ pub(crate) fn rebuild_real_to_mock_pairs(
     }
     // 重放 redact_ir_inner 的排序: snapshot 序 → 稳定 sort len desc → 相邻去重
     // (同 value 只处理首个 entry) → 只留有映射的 (即当时命中的) secret.
-    let mut ordered: Vec<&SecretEntry> =
-        secrets.iter().filter(|e| !e.value.is_empty()).collect();
+    let mut ordered: Vec<&SecretEntry> = secrets.iter().filter(|e| !e.value.is_empty()).collect();
     ordered.sort_by_key(|e| std::cmp::Reverse(e.value.len()));
     ordered.dedup_by(|a, b| a.value == b.value);
-    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     ordered
         .into_iter()
         .filter_map(|e| {
-            // seen 兜底防御: dedup 后同 value entry 只剩一个, 但若上游 pair 集
-            // 含重复 value (理论外), 也不重复发射 (重复替换对幂等替换无害, 显式
-            // 去重保持与 map 一一对应).
-            if !seen.insert(e.value.as_str()) {
-                return None;
-            }
             let mock = *mock_of.get(e.value.as_str())?;
             Some((e.value.to_string(), mock.to_string()))
         })
@@ -1268,10 +1260,7 @@ pub(crate) fn rebuild_real_to_mock_pairs(
 /// 与 [`rebuild_real_to_mock_pairs`] 配对使用; 替换序 = pairs 序 (即 redact
 /// 当时的处理序), 与 `ir_request_replace_all` 的逐叶子 `replace_in_place`
 /// 完全同一实现 — 对相同输入产相同字节.
-pub(crate) fn apply_real_to_mock_messages(
-    msgs: &mut [IrMessage],
-    pairs: &[(String, String)],
-) {
+pub(crate) fn apply_real_to_mock_messages(msgs: &mut [IrMessage], pairs: &[(String, String)]) {
     for (real, mock) in pairs {
         for msg in &mut *msgs {
             for b in &mut msg.content {
@@ -1445,7 +1434,11 @@ mod tests {
     #[test]
     fn rebuild_pairs_replay_matches_redact_ir_replacement() {
         // 3 条 secret (长度互异, 覆盖排序) + 1 条未命中 (不在任何 message 中).
-        let secrets = [entry("sk-long-secret-aaaaaaaa"), entry("sk-mid-bbb"), entry("k9")];
+        let secrets = [
+            entry("sk-long-secret-aaaaaaaa"),
+            entry("sk-mid-bbb"),
+            entry("k9"),
+        ];
         let mut ir = IrRequest {
             system: vec![IrBlock::Text {
                 text: "sys mentions sk-mid-bbb once".into(),
@@ -1489,7 +1482,7 @@ mod tests {
         let (map, _seed) = redact_ir(&mut ir, &secrets);
         assert_eq!(map.real_to_mock.len(), 3, "3 secrets hit (k9/sk-mid/long)");
         // 生产投影: derive_redactions 是 redactions 字段的唯一派生入口.
-        let redactions = crate::proxy::recorder::derive_redactions(&map, &secrets);
+        let redactions = crate::proxy::derive_redactions(&map, &secrets);
         assert_eq!(redactions.len(), 3);
         // 重建 + 替换 real 快照.
         let pairs = rebuild_real_to_mock_pairs(&redactions, &secrets);

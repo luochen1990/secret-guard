@@ -911,20 +911,16 @@ impl ParsedSync {
         }
     }
 
-    /// 流结束时的最终快照 (parsed 派生所需全部信息 + 回显摘要).
+    /// 流结束时的最终快照 (parsed 派生所需全部信息).
     ///
-    /// 返回 `(Option<最终 LLM 视角 IrResponse>, echo)`: 序列化 (writer) 与
-    /// response.message 的 intern 由调用方 (fanout 收尾) 统一接线 — B1 起
-    /// ResponseData 不再长期存 parsed Value, 改存 message ref + 元字段
-    /// (`RespFinality`), parsed 在渲染时经 `derive::response_parsed_from_parts`
-    /// 派生. 零语义事件时 ir 为 `None` (前端降级占位, 不捏造空响应对象).
-    pub(super) fn finalize(self) -> (Option<crate::codec::ir::IrResponse>, ResponseEcho) {
+    /// 返回最终 LLM 视角 IrResponse: 序列化 (writer) 与 response.message 的
+    /// intern 由 [`RespFinality`] 统一接线 — B1 起 ResponseData 不再长期存
+    /// parsed Value, 改存 message ref + 元字段, parsed 在渲染时经
+    /// `derive::response_parsed_from_parts` 派生. 零语义事件时 `None`
+    /// (前端降级占位, 不捏造空响应对象).
+    pub(super) fn finalize(self) -> Option<crate::codec::ir::IrResponse> {
         let ir = self.scan.snapshot();
-        let echo = ResponseEcho::from_ir(&ir);
-        if scan_decoded_nothing(&ir) {
-            return (None, echo);
-        }
-        (Some(ir), echo)
+        (!scan_decoded_nothing(&ir)).then_some(ir)
     }
 }
 
@@ -975,13 +971,10 @@ impl RespFinality {
     }
 
     /// 从最终 LLM 视角 IrResponse 派生 (message 含空 content 亦保留 — envelope
-    /// 语义完整, 与旧 stored parsed 行为一致). `writer` 用于 consistency-check
-    /// 构建下的 stored_parsed 对照值 (与旧路径的 write_response 同调用形态).
-    #[cfg_attr(not(feature = "consistency-check"), allow(unused_variables))]
+    /// 语义完整, 与旧 stored parsed 行为一致).
     pub(super) fn from_ir(
         protocol: crate::codec::Protocol,
         ir: &crate::codec::ir::IrResponse,
-        writer: &dyn crate::codec::Writer,
     ) -> Self {
         Self {
             protocol: Some(protocol),
@@ -995,10 +988,55 @@ impl RespFinality {
             stop_sequence: ir.stop_sequence.clone(),
             id: ir.id.clone(),
             created: ir.created,
+            // 旧路径将写入的 stored parsed (writer 直接序列化同一 ir). 仅
+            // consistency-check 构建计算, 供 "先断言后删除" 守卫比对, 不落存储.
             #[cfg(feature = "consistency-check")]
-            stored_parsed: Some(writer.write_response(ir)),
+            stored_parsed: Some(protocol.writer().write_response(ir)),
         }
     }
+
+    /// 流式收尾入口: `ParsedSync::finalize` 的 Option 快照 → finality
+    /// (None = 零语义事件流 → empty 占位).
+    pub(super) fn from_scan(
+        protocol: crate::codec::Protocol,
+        ir: Option<crate::codec::ir::IrResponse>,
+    ) -> Self {
+        ir.map(|ir| Self::from_ir(protocol, &ir))
+            .unwrap_or_else(Self::empty)
+    }
+}
+
+/// finalize 接线收口 (B1): `finality` 的共同字段 (message intern / parsed 清除 /
+/// 元字段 / 回显) 填入 `base` (per-path 差异字段: status / headers / raw body /
+/// elapsed / streamed / complete / error, 由调用方构造), 含 consistency-check
+/// "先断言后删除" 守卫, 最后整体替换写入。三处 finalize 调用点
+/// (fanout_stream_task / buffered_ir / cross_proto 非流式) 的单点接线 —
+/// B2 再增元字段时只改这里。
+pub(super) fn attach_finality(
+    dag: &ConversationDag,
+    node_id: Uuid,
+    finality: &RespFinality,
+    base: ResponseData,
+) {
+    let resp_data = ResponseData {
+        // B1: 稳态不再长期存 parsed Value — 渲染时从 message + 元字段派生
+        // (derive::response_parsed_from_parts). 流式进行中的节流 parsed
+        // (update_parsed_response) 被本次整体替换清除.
+        parsed: None,
+        message: finality.message.as_ref().map(|m| dag.intern_message(m)),
+        stop_reason: finality.stop_reason,
+        stop_sequence: finality.stop_sequence.clone(),
+        id: finality.id.clone(),
+        created: finality.created,
+        usage: finality.echo.usage.clone(),
+        model: finality.echo.model.clone(),
+        ..base
+    };
+    // 视图正确性守卫 (B1 "先断言后删除"): 丢弃 stored parsed 前验证
+    // message + 元字段能无损重建它 (id/created 缺失时的合成归一化, 见守卫 doc).
+    #[cfg(feature = "consistency-check")]
+    assert_tail_parsed_matches_stored(dag, finality, &resp_data);
+    dag.attach_response(node_id, resp_data);
 }
 
 /// 视图正确性守卫 (CI 用, 需 `--features consistency-check`): tail parsed 派生
@@ -1010,39 +1048,11 @@ impl RespFinality {
 /// 缺失时 writer 合成随机 id / 当前 epoch — 比对前对这两字段归一化 (剔除).
 #[cfg(feature = "consistency-check")]
 pub(crate) fn assert_tail_parsed_matches_stored(
-    derived: Option<&serde_json::Value>,
-    stored: Option<&serde_json::Value>,
-    id_missing: bool,
-    created_missing: bool,
-) {
-    use serde_json::Value;
-    let normalize = |v: &Value| -> Value {
-        let mut v = v.clone();
-        if let Some(obj) = v.as_object_mut() {
-            if id_missing {
-                obj.remove("id");
-            }
-            if created_missing {
-                obj.remove("created");
-            }
-        }
-        v
-    };
-    debug_assert_eq!(
-        derived.map(normalize),
-        stored.map(normalize),
-        "tail parsed drift: derived-from-message != stored parsed (pre-clear)"
-    );
-}
-
-/// [`assert_tail_parsed_matches_stored`] 的 finalize 现场组合 (proxy → dag 依赖,
-/// BlockPool 访问经 dag 只读派生入口): intern 后、attach 前调用.
-#[cfg(feature = "consistency-check")]
-pub(super) fn assert_finalize_parsed_matches_stored(
     dag: &ConversationDag,
     finality: &RespFinality,
     resp_data: &ResponseData,
 ) {
+    use serde_json::Value;
     let Some(message) = resp_data.message.as_ref() else {
         return;
     };
@@ -1050,11 +1060,22 @@ pub(super) fn assert_finalize_parsed_matches_stored(
         return;
     };
     let derived = dag.derive_response_parsed_parts(protocol, message, resp_data);
-    assert_tail_parsed_matches_stored(
-        derived.as_ref(),
-        finality.stored_parsed.as_ref(),
-        resp_data.id.is_none(),
-        resp_data.created.is_none(),
+    let normalize = |v: &Value| -> Value {
+        let mut v = v.clone();
+        if let Some(obj) = v.as_object_mut() {
+            if resp_data.id.is_none() {
+                obj.remove("id");
+            }
+            if resp_data.created.is_none() {
+                obj.remove("created");
+            }
+        }
+        v
+    };
+    debug_assert_eq!(
+        derived.as_ref().map(normalize),
+        finality.stored_parsed.as_ref().map(normalize),
+        "tail parsed drift: derived-from-message != stored parsed (pre-clear)"
     );
 }
 
@@ -1312,16 +1333,14 @@ mod tests {
         // 依据, data.type 冗余字段不参与 → 零事件.
         ps.feed(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n");
         ps.feed(b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":5}}}\n\n");
-        let (parsed, echo) = ps.finalize();
+        // B1: finalize 收敛为 Option<IrResponse> — None 即 "零语义事件, 不捏造
+        // echo/parsed" (ResponseEcho::from_ir 只读 model/usage_present, 零事件流
+        // 下两者恒缺席, None 与 echo=default 等价).
+        let parsed = ps.finalize();
         assert!(
             parsed.is_none(),
             "zero-event scan must degrade to None, got {parsed:?}"
         );
-        assert!(
-            echo.usage.is_none(),
-            "usage must not be fabricated from undecoded events"
-        );
-        assert!(echo.model.is_none());
         // feed 路径也不得把捏造对象写进 DAG (节点无 parsed 字段或 None).
         // (此 fixture 的 record_id 不存在于 dag, update 被吞 — 单独覆盖见下个测试.)
     }
@@ -1343,8 +1362,10 @@ mod tests {
         ps.feed(b"data: {\"type\":\"response.content_part.done\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"Hi\"}}\n\n");
         ps.feed(b"event: response.completed\n");
         ps.feed(b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_9\",\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":5}}}\n\n");
-        let (ir, echo) = ps.finalize();
-        let ir = ir.expect("decoded Responses stream must yield Some parsed view");
+        let ir = ps
+            .finalize()
+            .expect("decoded Responses stream must yield Some parsed view");
+        let echo = ResponseEcho::from_ir(&ir);
         // B1: finalize 返回 IrResponse; 文本断言走 content blocks (渲染侧由
         // Responses writer 写回 output[].content[].text, 与旧 parsed view 同源).
         let text = ir
@@ -1409,8 +1430,10 @@ mod tests {
         // OpenAI 流式 chunk (带 model/id), reader 会解码出 MessageStart + 增量.
         ps.feed(b"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"}}]}\n\n");
         ps.feed(b"data: [DONE]\n\n");
-        let (ir, echo) = ps.finalize();
-        let ir = ir.expect("decoded OpenAI stream must yield Some parsed view");
+        let ir = ps
+            .finalize()
+            .expect("decoded OpenAI stream must yield Some parsed view");
+        let echo = ResponseEcho::from_ir(&ir);
         // B1: finalize 返回 IrResponse (message + 元字段); 文本断言走 content blocks
         // (渲染侧由 writer 序列化, 与旧 parsed view 同源).
         let content = ir

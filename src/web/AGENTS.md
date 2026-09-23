@@ -166,8 +166,9 @@ GET    /api/usage/summary[?hours=N]  → UsageSummary {range, pricing_status, to
 与旧 req_body_raw 末尾切片**逐字节等价**: 常驻 proptest `prop_blocks_derivation_matches_raw`
 (生成器矩阵) + consistency-check shadow `assert_delta_view_matches_raw` (渲染点) 双重守卫.
 旧实现 (`extract_delta_messages_from_raw`) 保留为 oracle, 生产路径不再调用.
-已知限制 (行为保持, 未修复): OpenAI writer 的 ToolResult 拆分场景切片 start 偏小, delta 可能含
-前序轮消息 (同协议不受影响; 修复属 DTO-6 ⏳).
+已知限制 (行为保持, 未修复): OpenAI writer 的 ToolResult 拆分场景 (混合 Text+ToolResult 的 user
+消息拆为 1+N 条 wire 消息) 下, 尾部对齐使 delta 可能**丢失本轮展开的头部** (伴随的 user text 气泡
+与部分 tool 消息), 不会混入前序轮消息; 修复属 DTO-6 ⏳.
 
 **tail (response 抽屉)**: 末轮 (链中最新) 的 response 内容. B1 双态: finalize 后从
 `response.message` + 元字段渲染派生 (`derive::response_parsed_from_parts`); 流式进行中

@@ -28,8 +28,8 @@ pub async fn get_record(
     let view = state.dag.get_node(id).ok_or(StatusCode::NOT_FOUND)?;
     let detail = state.dag.get_node_detail(id).ok_or(StatusCode::NOT_FOUND)?;
     let mut resp = state.dag.get_response(id);
-    // B1: finalize 后 stored parsed 已清除 — 从 message + 元字段派生回填
-    // (流式进行中的节流 parsed 原样保留; 与 timeline tail 同一 SSOT 派生).
+    // B1 双态单点 (dag.derive_response_parsed → derive::parsed_view): 流式中读
+    // stored 节流 parsed, finalize 后从 message + 元字段派生.
     if let Some(r) = resp.as_mut()
         && r.parsed.is_none()
     {
