@@ -562,6 +562,43 @@ impl ConversationDag {
         *node.response.write() = Some(response);
     }
 
+    /// 把单条 IrMessage intern 进池 (B1: 响应 finalize 时 response.message 用).
+    ///
+    /// 与 push_messages 的 intern 同一池/同一 refcount 语义; 单独暴露是因为响应
+    /// 到达时 node 已存在, 不能再走 push. refcount 由 gc_cascade 的既有
+    /// `resp.message` 释放路径回收.
+    pub fn intern_message(&self, msg: &crate::codec::ir::IrMessage) -> MessageRef {
+        let mut g = self.inner.write();
+        g.blocks.intern_message(msg)
+    }
+
+    /// tail parsed 派生 (B1, records parsed view 等外部消费点的便捷入口).
+    ///
+    /// 派生核心 SSOT 是 [`crate::derive::response_parsed_from_parts`]; 本方法在
+    /// 单个读锁内取齐 (protocol, blocks, message, resp) 后委托. message 缺失
+    /// (流式进行中 / 错误响应) → None, 调用方走 stored parsed / raw fallback.
+    pub fn derive_response_parsed(&self, node_id: Uuid) -> Option<serde_json::Value> {
+        let g = self.inner.read();
+        let node = g.nodes.get(&node_id)?;
+        let protocol = node.event.ingress_protocol?;
+        let resp_lock = node.response.read();
+        let resp = resp_lock.as_ref()?;
+        let message = resp.message.as_ref()?;
+        crate::derive::response_parsed_from_parts(protocol, &g.blocks, message, resp)
+    }
+
+    /// [`Self::derive_response_parsed`] 的分件入口 (finalize 守卫用): parts 由
+    /// 调用方持有 (attach 前的构造值), 只借池做 resolve. 生产渲染路径不经此方法.
+    pub fn derive_response_parsed_parts(
+        &self,
+        protocol: crate::codec::Protocol,
+        message: &MessageRef,
+        resp: &ResponseData,
+    ) -> Option<serde_json::Value> {
+        let g = self.inner.read();
+        crate::derive::response_parsed_from_parts(protocol, &g.blocks, message, resp)
+    }
+
     /// 读取 node 的 [`RoundKind`] (usage-stats 采集用: proxy 在 push 后立即回读,
     /// 与 `attach_response` 同型的 "刚 push 节点" 安全窗口 — LRU 淘汰按
     /// session.latest_at 挑最旧会话, 刚 push 节点所属 session 的 latest_at ≈ now
@@ -1800,6 +1837,87 @@ mod tests {
             1,
             "leaf round has 1 delta message"
         );
+    }
+
+    // ─── B1: timeline tail 派生 (finalize 后 message + 元字段) ─────────────
+
+    #[test]
+    fn timeline_tail_derives_parsed_after_finalize() {
+        // finalize 后 (message 已 intern, parsed 已清除): tail.parsed 从
+        // message + 元字段经 ingress writer 派生, 与直接 writer 序列化同一
+        // IrResponse 的结果逐字节相等.
+        let body = r#"{"model":"m","messages":[{"role":"user","content":"hello"}]}"#;
+        let dag = ConversationDag::new(8, 500, 1);
+        let mut ev = event_with_body("/o/test/v1/chat", body);
+        ev.ingress_protocol = Some(crate::codec::Protocol::OpenAI);
+        let a = dag.push_messages(vec![text_msg(IrRole::User, "hello")], ev);
+
+        // 生产 finalize 接线的等价模拟: LLM 视角 IrResponse → intern message + 元字段.
+        let ir_resp = crate::codec::ir::IrResponse {
+            content: vec![IrBlock::Text {
+                text: "Hi there".into(),
+            }],
+            stop_reason: Some(crate::codec::ir::IrStopReason::EndTurn),
+            id: Some("chatcmpl-1".into()),
+            created: Some(1700000000),
+            model: Some("gpt-4o".into()),
+            usage: crate::codec::ir::IrUsage {
+                input_tokens: 3,
+                output_tokens: 5,
+                ..Default::default()
+            },
+            usage_present: true,
+            stop_sequence: None,
+        };
+        let msg_ref = dag.intern_message(&crate::codec::ir::IrMessage {
+            role: IrRole::Assistant,
+            content: ir_resp.content.clone(),
+            ..Default::default()
+        });
+        dag.attach_response(
+            a,
+            ResponseData {
+                resp_status: 200,
+                raw_resp_body: String::new(),
+                resp_complete: true,
+                message: Some(msg_ref),
+                stop_reason: ir_resp.stop_reason,
+                id: ir_resp.id.clone(),
+                created: ir_resp.created,
+                model: ir_resp.model.clone(),
+                usage: Some(ir_resp.usage.clone()),
+                ..Default::default()
+            },
+        );
+
+        let sid = sid_of(&dag, a);
+        let page = dag.timeline_view(sid, None, 10).expect("page exists");
+        let tail = &page.tail;
+        let parsed = tail.parsed.as_ref().expect("tail parsed derived after finalize");
+        // 与直接 writer 序列化同一 IrResponse 逐字节相等.
+        let expected = crate::codec::Protocol::OpenAI
+            .writer()
+            .write_response(&ir_resp);
+        assert_eq!(parsed, &expected);
+        assert_eq!(tail.length, parsed.to_string().len());
+        assert_eq!(tail.resp_status, 200);
+    }
+
+    #[test]
+    fn timeline_tail_streams_read_stored_parsed_until_finalize() {
+        // 流式进行中 (message 未写, ParsedSync 节流 parsed 在): tail 沿用 stored
+        // parsed (前端实时进度), 不强行派生.
+        let body = r#"{"model":"m","messages":[{"role":"user","content":"hello"}]}"#;
+        let dag = ConversationDag::new(8, 500, 1);
+        let mut ev = event_with_body("/o/test/v1/chat", body);
+        ev.ingress_protocol = Some(crate::codec::Protocol::OpenAI);
+        let a = dag.push_messages(vec![text_msg(IrRole::User, "hello")], ev);
+        let interim = serde_json::json!({"partial": true});
+        dag.update_parsed_response(a, interim.clone());
+        let sid = sid_of(&dag, a);
+        let page = dag.timeline_view(sid, None, 10).expect("page exists");
+        assert_eq!(page.tail.parsed.as_ref(), Some(&interim));
+        assert!(!page.tail.resp_complete);
     }
 
     // ─── 并发测试 ──────────────────────────────────────────────────────────

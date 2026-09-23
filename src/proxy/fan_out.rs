@@ -129,8 +129,8 @@ struct FanoutStreamCtx {
 ///
 /// 差异 (闭包注入):
 /// - `pipe`: chunk 变换 (透传 / restore).
-/// - `finalize_parsed`: 最终 parsed view + 回显摘要 (流式 ParsedSync 快照 /
-///   非流式一次性 parse). 回显摘要喂 ResponseData.usage/model (usage-stats).
+/// - `finalize_parsed`: 响应 finalize 统一产出 (message + 元字段 + 回显摘要,
+///   [`RespFinality`]; 流式 = ParsedSync 最终快照, 非流式 = 一次性 parse).
 /// - `finalize_body`: record 的 raw_resp_body (banner / 空 / utf8_view 策略).
 async fn fanout_stream_task(
     ctx: FanoutStreamCtx,
@@ -141,7 +141,7 @@ async fn fanout_stream_task(
     finalize_parsed: impl FnOnce(
         Option<ParsedSync>,
         &RecordAccumulator,
-    ) -> (Option<serde_json::Value>, ResponseEcho)
+    ) -> super::recorder::RespFinality
     + Send
     + 'static,
     finalize_body: impl FnOnce(&RecordAccumulator) -> String + Send + 'static,
@@ -211,29 +211,52 @@ async fn fanout_stream_task(
     }
 
     let elapsed = started.elapsed().as_millis() as u64;
-    let (final_parsed, echo) = finalize_parsed(parsed_sync, &recorder);
+    let finality = finalize_parsed(parsed_sync, &recorder);
     let body = finalize_body(&recorder);
     // resp_complete 在 error_kind move 进 ResponseData 前先取 (usage 落账同用).
     let resp_complete = recorder.complete();
-    dag.attach_response(
-        record_id,
-        ResponseData {
-            resp_status: status_u16,
-            resp_headers: redact_headers(&resp_headers_for_record, &redacted_headers),
-            raw_resp_body: body,
-            parsed: final_parsed,
-            elapsed_ms: elapsed,
-            streamed,
-            resp_complete,
-            error: recorder.error_kind,
-            usage: echo.usage.clone(),
-            model: echo.model.clone(),
-            ..Default::default()
-        },
+    // B1: message intern (LLM 视角 assistant content) — tail parsed 的派生源.
+    let message_ref = finality
+        .message
+        .as_ref()
+        .map(|m| dag.intern_message(m));
+    let resp_data = ResponseData {
+        resp_status: status_u16,
+        resp_headers: redact_headers(&resp_headers_for_record, &redacted_headers),
+        raw_resp_body: body,
+        // B1: 稳态不再长期存 parsed Value — 渲染时从 message + 元字段派生
+        // (derive::response_parsed_from_parts). 流式进行中的节流 parsed
+        // (update_parsed_response) 被本次整体替换清除.
+        parsed: None,
+        message: message_ref,
+        stop_reason: finality.stop_reason,
+        stop_sequence: finality.stop_sequence.clone(),
+        id: finality.id.clone(),
+        created: finality.created,
+        elapsed_ms: elapsed,
+        streamed,
+        resp_complete,
+        error: recorder.error_kind,
+        usage: finality.echo.usage.clone(),
+        model: finality.echo.model.clone(),
+    };
+    // 视图正确性守卫 (B1 "先断言后删除"): 丢弃 stored parsed 前验证
+    // message + 元字段能无损重建它 (id/created 缺失时的合成归一化, 见守卫 doc).
+    #[cfg(feature = "consistency-check")]
+    super::recorder::assert_finalize_parsed_matches_stored(
+        &dag,
+        &finality,
+        &resp_data,
     );
+    dag.attach_response(record_id, resp_data);
     // usage-stats 落账 (USAGE-5 计入判据在 ctx 内统一执行; 与 DAG 无耦合,
     // 节点被淘汰不影响).
-    usage.record_response(status_u16, resp_complete, echo.usage, echo.model);
+    usage.record_response(
+        status_u16,
+        resp_complete,
+        finality.echo.usage,
+        finality.echo.model,
+    );
     // record 最终态写入后再打摘要 (#160): status/elapsed 覆盖完整流时长,
     // error (client disconnect / upstream error / overflow) 已就位.
     super::recorder::log_forward_summary(&dag, record_id);
@@ -295,25 +318,33 @@ pub(crate) async fn fan_out_streaming(
         parsed_sync,
         PassthroughPipe,
         move |parsed_sync, recorder| {
-            // 最终 parsed: 流式用 ParsedSync 快照; 非流式一次性 codec parse.
-            // ParsedSync::finalize 对零语义事件流 (病态流, 如 Responses 事件的
-            // `event:` 行被代理剥掉) 返回 None — 前端降级占位, 不捏造空响应对象.
+            // 响应 finalize 统一产出 (B1: message + 元字段; 见 RespFinality).
+            // 流式用 ParsedSync 最终快照; 非流式一次性 codec parse.
+            // 零语义事件流 (病态流, 如 Responses 事件的 `event:` 行被代理剥掉)
+            // 降级 empty (message=None), 前端占位, 不捏造空响应对象.
             if streamed {
-                match parsed_sync {
-                    Some(ps) => ps.finalize(),
+                match (parsed_sync, codec_proto) {
+                    (Some(ps), Some(cp)) => {
+                        let writer = cp.writer();
+                        let (ir, _echo) = ps.finalize();
+                        ir.map(|ir| {
+                            super::recorder::RespFinality::from_ir(cp, &ir, writer.as_ref())
+                        })
+                        .unwrap_or_else(super::recorder::RespFinality::empty)
+                    }
                     // 无 ParsedSync = 无 codec 协议 (Gemini/Ollama): 无回显可提取.
-                    None => (None, ResponseEcho::default()),
+                    _ => super::recorder::RespFinality::empty(),
                 }
-            } else if let Some(cp) = codec_proto {
+            } else {
+                let Some(cp) = codec_proto else {
+                    return super::recorder::RespFinality::empty();
+                };
                 let reader = cp.reader();
                 let writer = cp.writer();
                 let parsed_ir = serde_json::from_slice::<serde_json::Value>(&recorder.acc)
                     .ok()
                     .and_then(|v| reader.read_response(&v).ok());
-                // 视图正确性守卫 (同协议 fan_out 路径): parsed 派生与 SSOT 在同一作用域内,
-                // 派生源 drift 风险低; 此处主要抽查 codec writer→reader 的 model 字段对称性
-                // (reader/writer 来自同一 codec, 守卫等价于 codec 内部 round-trip 测试的运行时抽查).
-                let (parsed, echo) = match parsed_ir {
+                match parsed_ir {
                     Some(ir) => {
                         // #162: 协议错配 WARN (空 content + 零 usage 启发式, 共享 helper).
                         // parse 失败 (None) 不调: 无 IR 对象可查, 透传降级已有自身语义.
@@ -323,20 +354,21 @@ pub(crate) async fn fan_out_streaming(
                             &ir,
                             resp_status.is_success(),
                         );
-                        let echo = ResponseEcho::from_ir(&ir);
-                        (Some(writer.write_response(&ir)), echo)
+                        let finality =
+                            super::recorder::RespFinality::from_ir(cp, &ir, writer.as_ref());
+                        // 视图正确性守卫 (同协议 fan_out 非流式路径): reader 解析与
+                        // raw bytes 的 round-trip 抽查 (与 B1 前同一语义 — 比对值从
+                        // stored parsed 换成 finality 的同源对照值).
+                        #[cfg(feature = "consistency-check")]
+                        assert_resp_parsed_matches_source_nonstream(
+                            finality.stored_parsed.as_ref(),
+                            &recorder.acc,
+                            reader.as_ref(),
+                        );
+                        finality
                     }
-                    None => (None, ResponseEcho::default()),
-                };
-                #[cfg(feature = "consistency-check")]
-                assert_resp_parsed_matches_source_nonstream(
-                    parsed.as_ref(),
-                    &recorder.acc,
-                    reader.as_ref(),
-                );
-                (parsed, echo)
-            } else {
-                (None, ResponseEcho::default())
+                    None => super::recorder::RespFinality::empty(),
+                }
             }
         },
         move |recorder| {
@@ -433,7 +465,8 @@ pub(crate) async fn fan_out_buffered_ir(
     // 这种情况返回错误响应 (而非截断 JSON 的 200), 让客户端知道响应不完整.
     let reader = codec_proto.reader();
     let writer = codec_proto.writer();
-    let mut resp_parsed_for_record: Option<serde_json::Value> = None;
+    // B1: finalize 统一产出 (message + 元字段; parsed 渲染派生, 不再长期存 Value).
+    let mut finality = super::recorder::RespFinality::empty();
     // usage-stats 回显摘要: parse 成功时从 IrResponse 提取 (restore 只改字符串叶子,
     // 不触碰 usage 数字, 但在 restore 前提取保持 "LLM 原始回显" 语义清晰).
     let mut resp_echo = ResponseEcho::default();
@@ -457,9 +490,10 @@ pub(crate) async fn fan_out_buffered_ir(
                         &ir,
                         resp_status.is_success(),
                     );
-                    // record 存 LLM 视角 (restore 之前, 含 mock).
+                    // record 接线走 LLM 视角 (restore 之前, 含 mock) 的 finality.
                     resp_echo = ResponseEcho::from_ir(&ir);
-                    resp_parsed_for_record = Some(writer.write_response(&ir));
+                    finality =
+                        super::recorder::RespFinality::from_ir(codec_proto, &ir, writer.as_ref());
                     crate::redact::restore_ir_response(&mut ir, &redaction_map);
                     let restored = writer.write_response(&ir);
                     serde_json::to_vec(&restored).unwrap_or_else(|_| recorder.acc.clone())
@@ -501,12 +535,12 @@ pub(crate) async fn fan_out_buffered_ir(
     // 注: buffered_ir 在 overflow 时保留部分累积 (而非 truncated banner),
     // 因为 client_bytes 也是从同一 acc 派生 — 保持一致.
     let acc_text = utf8_view(&recorder.acc);
-    // 视图正确性守卫 (同协议 buffered_ir 路径): parsed 派生与 SSOT 在同一作用域内,
-    // 派生源 drift 风险低; 此处主要抽查 codec writer→reader 的 model 字段对称性.
+    // 视图正确性守卫 (同协议 buffered_ir 路径): reader 解析与 raw bytes 的
+    // round-trip 抽查 (比对值 = finality 的同源对照值, B1 前 = stored parsed).
     // 守卫内部按 reader 解析结果比对 (失败时 expected=None, 与 fallback 路径一致).
     #[cfg(feature = "consistency-check")]
     assert_resp_parsed_matches_source_nonstream(
-        resp_parsed_for_record.as_ref(),
+        finality.stored_parsed.as_ref(),
         &recorder.acc,
         reader.as_ref(),
     );
@@ -523,22 +557,28 @@ pub(crate) async fn fan_out_buffered_ir(
     } else {
         resp_status
     };
-    dag.attach_response(
-        record_id,
-        ResponseData {
-            resp_status: status_u16,
-            resp_headers: redact_headers(&resp_headers_for_record, &redacted_headers),
-            raw_resp_body: acc_text,
-            parsed: resp_parsed_for_record,
-            elapsed_ms: elapsed,
-            streamed,
-            resp_complete,
-            error: recorder.error_kind,
-            usage: resp_echo.usage.clone(),
-            model: resp_echo.model.clone(),
-            ..Default::default()
-        },
-    );
+    // B1: message intern + parsed 清除 (渲染时派生), 元字段接线.
+    let message_ref = finality.message.as_ref().map(|m| dag.intern_message(m));
+    let resp_data = ResponseData {
+        resp_status: status_u16,
+        resp_headers: redact_headers(&resp_headers_for_record, &redacted_headers),
+        raw_resp_body: acc_text,
+        parsed: None,
+        message: message_ref,
+        stop_reason: finality.stop_reason,
+        stop_sequence: finality.stop_sequence.clone(),
+        id: finality.id.clone(),
+        created: finality.created,
+        elapsed_ms: elapsed,
+        streamed,
+        resp_complete,
+        error: recorder.error_kind,
+        usage: resp_echo.usage.clone(),
+        model: resp_echo.model.clone(),
+    };
+    #[cfg(feature = "consistency-check")]
+    super::recorder::assert_finalize_parsed_matches_stored(&dag, &finality, &resp_data);
+    dag.attach_response(record_id, resp_data);
     // usage-stats 落账 (同 fanout_stream_task; USAGE-5 计入判据在 ctx 内统一执行).
     usage.record_response(status_u16, resp_complete, resp_echo.usage, resp_echo.model);
     // record 最终态写入后打摘要 (#160). 注意: client_status (错误中断时 502/504)
@@ -591,6 +631,7 @@ pub(crate) async fn fan_out_streaming_with_restore(
         redacted_headers,
         translate,
         parsed_sync,
+        codec_proto,
         stream_idle_timeout,
         usage,
     )
@@ -648,6 +689,7 @@ pub(crate) async fn fan_out_streaming_cross_proto(
         redacted_headers,
         translate,
         parsed_sync,
+        ingress,
         stream_idle_timeout,
         usage,
     )
@@ -667,6 +709,7 @@ fn spawn_restore_fanout(
     redacted_headers: std::sync::Arc<[String]>,
     translate: crate::codec::stream::StreamTranslate,
     parsed_sync: ParsedSync,
+    writer_proto: crate::codec::Protocol,
     stream_idle_timeout: Option<std::time::Duration>,
     usage: crate::usage::UsageCtx,
 ) -> Result<Response<Body>, AppError> {
@@ -693,13 +736,16 @@ fn spawn_restore_fanout(
         tx,
         Some(parsed_sync),
         RestorePipe { translate },
-        |parsed_sync, _recorder| {
-            // 最终 parsed 快照 + 回显摘要. 即使 error_kind (client disconnect /
+        move |parsed_sync, _recorder| {
+            // 最终快照 + 回显摘要. 即使 error_kind (client disconnect /
             // upstream error), 也保留截至断流时的累积内容 — 用户能看到部分响应比
             // 看到空白更有价值. (overflow 时同理: 截至 Overflow 前的内容比 truncate
-            // banner 更有用.) 零语义事件流 (畸形 SSE) 降级 None, 同 fan_out_streaming.
+            // banner 更有用.) 零语义事件流 (畸形 SSE) 降级 empty, 同 fan_out_streaming.
             let ps = parsed_sync.expect("StreamTranslate 流式路径恒有 ParsedSync");
-            ps.finalize()
+            let writer = writer_proto.writer();
+            let (ir, _echo) = ps.finalize();
+            ir.map(|ir| super::recorder::RespFinality::from_ir(writer_proto, &ir, writer.as_ref()))
+                .unwrap_or_else(super::recorder::RespFinality::empty)
         },
         |recorder| {
             if recorder.overflow {

@@ -27,7 +27,14 @@ pub async fn get_record(
     // 从 DAG 派生 ForwardRecord DTO.
     let view = state.dag.get_node(id).ok_or(StatusCode::NOT_FOUND)?;
     let detail = state.dag.get_node_detail(id).ok_or(StatusCode::NOT_FOUND)?;
-    let resp = state.dag.get_response(id);
+    let mut resp = state.dag.get_response(id);
+    // B1: finalize 后 stored parsed 已清除 — 从 message + 元字段派生回填
+    // (流式进行中的节流 parsed 原样保留; 与 timeline tail 同一 SSOT 派生).
+    if let Some(r) = resp.as_mut()
+        && r.parsed.is_none()
+    {
+        r.parsed = state.dag.derive_response_parsed(id);
+    }
     let record = build_forward_record(view, detail, resp);
     // 我们总是返回 GetRecordResponse envelope, 让前端 shape 固定.
     // raw view: parsed_*/parse_error 全 None.

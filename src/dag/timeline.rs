@@ -121,21 +121,36 @@ fn build_timeline_round(inner: &DagInner, node_id: Uuid) -> Option<TimelineRound
     })
 }
 
-/// 构造一个 TimelineTail (从 node.response 读 parsed + 元数据).
+/// 构造一个 TimelineTail (response 抽屉数据).
 ///
-/// `length` = parsed 序列化字节数; parsed 为 None 时 fallback 到 raw_resp_body.len().
+/// B1 双态数据源:
+/// - **finalize 后** (`response.message` 存在): parsed 从 message ref + 元字段
+///   经 ingress writer 派生 (`derive::response_parsed_from_parts`), `length` =
+///   派生序列化字节数 — 稳态不再依赖 stored parsed (attach 时已清除, B2 的前置).
+/// - **流式进行中** (message 尚缺, ParsedSync 节流写入的 parsed 仍在): 沿用旧
+///   行为读 stored parsed (前端实时进度依赖它), `length` = parsed 序列化字节数,
+///   fallback 到 raw_resp_body.len().
 ///
 /// # 持锁不变式 + ROB-* 降级
 ///
-/// 同 [`build_timeline_round`]: node 查找失败返回 `None` 而非 panic.
+/// 同 [`build_timeline_round`]: node 查找失败返回 `None` 而非 panic. 派生内部
+/// resolve 失败 (池损坏, 理论不变式下不可达) → fallback stored parsed / raw len.
 fn build_timeline_tail(inner: &DagInner, node_id: Uuid) -> Option<TimelineTail> {
     let node = inner.nodes.get(&node_id)?;
     let resp_lock = node.response.read();
     let Some(resp) = resp_lock.as_ref() else {
         return Some(empty_tail(node_id));
     };
-    let length = resp
-        .parsed
+    // finalize 后: 派生 parsed (message + 元字段 → ingress writer).
+    let derived = resp.message.as_ref().and_then(|message| {
+        node.event
+            .ingress_protocol
+            .and_then(|protocol| {
+                crate::derive::response_parsed_from_parts(protocol, &inner.blocks, message, resp)
+            })
+    });
+    let parsed = derived.or_else(|| resp.parsed.clone());
+    let length = parsed
         .as_ref()
         .map(|v| v.to_string().len())
         .unwrap_or(resp.raw_resp_body.len());
@@ -147,7 +162,7 @@ fn build_timeline_tail(inner: &DagInner, node_id: Uuid) -> Option<TimelineTail> 
         streamed: resp.streamed,
         resp_complete: resp.resp_complete,
         error: resp.error.clone(),
-        parsed: resp.parsed.clone(),
+        parsed,
     })
 }
 

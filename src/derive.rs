@@ -478,6 +478,54 @@ pub(crate) fn extract_delta_messages_from_blocks(
     result
 }
 
+/// tail parsed 派生 (B1): response.message (LLM 视角 blocks, MessageRef) +
+/// [`ResponseData`] 元字段 → ingress writer 序列化的响应 envelope.
+///
+/// # 数据源与视角
+///
+/// `response.message` 存的是 **LLM 原始返回** (含 mock, 未 restore) — 与清除前的
+/// stored `parsed` (writer 序列化的同一 IrResponse) 视角一致. 元字段
+/// (usage / stop_reason / stop_sequence / id / created / model) 在响应 finalize
+/// 时从最终 IrResponse 一并快照进 [`ResponseData`] (此前为空, B1 接通).
+///
+/// # 等价性与已知非确定点
+///
+/// 派生 = `writer(IrResponse { content: resolve(message), 元字段 })`, stored =
+/// `writer(同一 IrResponse)` — resolve 的 blocks 与元字段逐项相同 → 字节级相等,
+/// 例外是 writer 对缺失字段的**合成是非确定的**:
+/// - `id == None` → writer 合成随机 id (`chatcmpl-{random}`);
+/// - `created == None` → writer 取当前 epoch 秒.
+///
+/// 上游响应缺这两个字段时 (病态场景), 每次派生的 id/created 值不同 (长度恒定,
+/// 不影响前端 length 判定); consistency-check 守卫比对时对这两字段归一化.
+///
+/// # 返回 None 的条件 (调用方走 stored parsed / raw fallback)
+///
+/// - `message` 缺失: 流式进行中 (finalize 前) / 错误响应 / 无 codec 协议;
+/// - 任一 block resolve 失败 (池损坏, ROB-*);
+/// - `usage_present` 等 wire 形态位: writer 不读, 不参与.
+pub(crate) fn response_parsed_from_parts(
+    protocol: crate::codec::Protocol,
+    pool: &crate::dag::BlockPool,
+    message: &crate::dag::MessageRef,
+    resp: &crate::dag::ResponseData,
+) -> Option<serde_json::Value> {
+    let content = pool.resolve_message(message)?.content;
+    let ir_resp = crate::codec::ir::IrResponse {
+        content,
+        stop_reason: resp.stop_reason,
+        stop_sequence: resp.stop_sequence.clone(),
+        usage: resp.usage.clone().unwrap_or_default(),
+        // writer 不读此位 (见 IrResponse::usage_present 文档); 语义上与
+        // usage 的 Option-ness 对齐即可.
+        usage_present: resp.usage.is_some(),
+        id: resp.id.clone(),
+        created: resp.created,
+        model: resp.model.clone(),
+    };
+    Some(protocol.writer().write_response(&ir_resp))
+}
+
 /// 视图正确性守卫 (CI 用, 需 `--features consistency-check`): blocks 派生 (新,
 /// 生产路径) 与 req_body_raw 切片 (旧, 保留 oracle) 的输出逐元素相等.
 ///

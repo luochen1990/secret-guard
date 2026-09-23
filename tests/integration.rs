@@ -527,6 +527,12 @@ fn dag_list_forward_records(dag: &ConversationDag) -> Vec<ForwardRecord> {
             let view = dag.get_node(id)?;
             let detail = dag.get_node_detail(id)?;
             let resp = dag.get_response(id);
+            // B1: finalize 后 stored parsed 已清除 — 与 records API 同型, 从
+            // message + 元字段派生 (流式进行中的节流 parsed 原样优先).
+            let resp_parsed = resp
+                .as_ref()
+                .and_then(|r| r.parsed.clone())
+                .or_else(|| dag.derive_response_parsed(id));
             Some(ForwardRecord {
                 id: view.id,
                 created_at: view.created_at,
@@ -546,7 +552,7 @@ fn dag_list_forward_records(dag: &ConversationDag) -> Vec<ForwardRecord> {
                     .as_ref()
                     .map(|r| r.raw_resp_body.clone())
                     .unwrap_or_default(),
-                resp_parsed: resp.as_ref().and_then(|r| r.parsed.clone()),
+                resp_parsed,
                 elapsed_ms: view.elapsed_ms,
                 streamed: view.streamed,
                 resp_complete: view.resp_complete,
