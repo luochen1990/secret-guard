@@ -330,6 +330,16 @@ fn base_app_state(
         model_lists: std::sync::Arc::new(secret_guard::proxy::ModelListCache::new()),
         usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),
         pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::for_tests()),
+        // B2: 详细日志开关. 存量测试的 req_body / resp_body 断言是"捕获开启"
+        // 行为的契约守卫, 故 harness 默认 **on** (历史行为). 注意: 生产默认是
+        // off (DynamicState.audit_capture serde default false, 省内存新默认) —
+        // harness 与生产默认的这处差异是**有意**的; off 语义由 audit_capture
+        // 集成测试段显式构造覆盖 (经 PUT /api/settings 切换).
+        audit_capture: secret_guard::state::AuditCapture::new(
+            true,
+            tmp_state_path("audit-capture"),
+            std::sync::Arc::new(parking_lot::Mutex::new(())),
+        ),
     }
 }
 
@@ -558,6 +568,7 @@ fn dag_list_forward_records(dag: &ConversationDag) -> Vec<ForwardRecord> {
                 resp_complete: view.resp_complete,
                 error: view.error,
                 redactions: view.redactions.to_vec(),
+                audit_capture_off: !view.audit_captured,
             })
         })
         .collect()
@@ -10007,6 +10018,425 @@ async fn model_rewrite_response_stays_byte_exact_streaming() {
     assert_eq!(
         text, sse_body,
         "response must be byte-exact when rewrite-only (map empty)"
+    );
+}
+
+// ─── B2: audit_capture 动态开关 (详细日志) ─────────────────────────────────
+//
+// 覆盖: ① off 时转发零变化 + timeline 不受影响 + record 未捕获标记;
+// ② PUT /api/settings 切换对新请求生效, 在途请求沿用 push 时决策 (无半捕获撕裂);
+// ③ settings API shape / 400 校验 / state.toml 持久化 (重启恢复的文件层).
+
+/// 启动 secret-guard, audit_capture 开关初始状态显式可配 (base_app_state 默认
+/// on = 存量行为守卫). 返回 (proxy_url, state.toml 路径) — 后者供持久化断言;
+/// AuditCapture 与 provider table 共享同一 state 文件 (模拟生产装配).
+/// `dag` 由调用方传入 (clone 保留 probe handle 供 DAG 层断言).
+async fn spawn_proxy_with_audit_capture(
+    enabled: bool,
+    providers: Vec<Provider>,
+    secrets: SecretTable,
+    dag: ConversationDag,
+) -> (String, std::path::PathBuf) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state_path = tmp_state_path("sg-state-audit");
+    let decisions = std::sync::Arc::new(parking_lot::RwLock::new(
+        secret_guard::config::Decisions::default(),
+    ));
+    let persist_lock = std::sync::Arc::new(parking_lot::Mutex::new(()));
+    let provider_table = ProviderTable::with_persist_lock(
+        providers,
+        vec![],
+        decisions,
+        state_path.clone(),
+        persist_lock.clone(),
+    );
+    let proxy = AppState {
+        audit_capture: secret_guard::state::AuditCapture::new(
+            enabled,
+            state_path.clone(),
+            persist_lock,
+        ),
+        ..base_app_state(reqwest::Client::new(), provider_table, dag, secrets)
+    };
+    let app = server::build_router(
+        proxy,
+        secret_guard::server_host_guard::HostGuard::new("127.0.0.1", addr.port()),
+    );
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}"), state_path)
+}
+
+/// ① off: 转发字节零变化 + timeline bubbles (B1 blocks 派生) 不受影响 +
+/// record 未捕获标记 (req_body / resp_body 空, preview / model / redactions /
+/// parsed 照常) + GET /records 的 parsed view 显式报告 "not captured".
+#[tokio::test]
+async fn audit_capture_off_still_forwards_and_marks_uncaptured() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"cc-1","object":"chat.completion","created":1700000000,"model":"gpt-x","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}"#)
+        .create_async()
+        .await;
+
+    // secret 命中 → same_proto IR 路径 (redact + fan_out_buffered_ir): 请求与
+    // 响应两侧的 raw 存储决策都在本测试覆盖内.
+    let dag = ConversationDag::new(64, 500, 1);
+    let dag_probe = dag.clone();
+    let (proxy_url, _state_path) = spawn_proxy_with_audit_capture(
+        false,
+        vec![openai_provider("oa", &upstream.url())],
+        test_secret_table_with(vec![secret("tok", "sk-live-abcdef123456")]),
+        dag,
+    )
+    .await;
+
+    let req_body = r#"{"model":"gpt-x","messages":[{"role":"user","content":"run with sk-live-abcdef123456 now"}]}"#;
+    let (status, resp_body, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa/v1/chat/completions",
+        req_body,
+        &[],
+    )
+    .await;
+    // 转发零变化: 2xx + 客户端响应内容与开关无关 (此处无 secret 回显, 原样).
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert!(
+        resp_body.contains("\"content\":\"OK\""),
+        "client body intact"
+    );
+
+    let id = dag_probe.list_node_ids_newest_first()[0];
+    let detail = dag_probe.get_node_detail(id).unwrap();
+    let view = dag_probe.get_node(id).unwrap();
+    let resp = dag_probe.get_response(id).unwrap();
+
+    // 未捕获: raw 双侧为空 + 标记 true.
+    assert!(!view.audit_captured, "audit_captured snapshot is false");
+    assert!(
+        detail.req_body_raw.is_empty(),
+        "req_body_raw not stored when off"
+    );
+    assert!(
+        resp.raw_resp_body.is_empty(),
+        "raw_resp_body not stored when off"
+    );
+
+    // 决策与派生不受影响: preview / model / redactions 照常 (push 时派生).
+    assert_eq!(view.model.as_deref(), Some("gpt-x"));
+    assert!(view.preview.is_some(), "preview derived before discard");
+    assert_eq!(view.redactions.len(), 1, "redaction still recorded");
+    // parsed 照常 (B1 派生, 不依赖 raw).
+    assert!(
+        dag_probe.derive_response_parsed(id).is_some(),
+        "parsed view derived from message + meta (B1), independent of raw"
+    );
+
+    // timeline bubbles (B1 blocks 派生) 不受影响: mock 视角的 user 气泡仍在.
+    let page = dag_probe.timeline_view(view.session_id, None, 10).unwrap();
+    let round = &page.rounds[0];
+    assert!(!round.req_delta_messages.is_empty(), "bubbles intact");
+    let bubble_text = round.req_delta_messages[0]["content"].as_str().unwrap();
+    let mock = &round.redactions[0].0;
+    assert!(bubble_text.contains(mock.as_str()), "bubble shows mock");
+    assert!(!bubble_text.contains("sk-live-abcdef123456"));
+
+    // GET /records/{id}: record 层未捕获标记 + parsed view 显式报告原因.
+    let v = api_get_json(&proxy_url, &format!("/api/records/{id}?view=parsed")).await;
+    assert_eq!(v["record"]["audit_capture_off"], serde_json::json!(true));
+    assert_eq!(v["record"]["req_body"], serde_json::json!(""));
+    assert_eq!(v["record"]["resp_body"], serde_json::json!(""));
+    assert!(v["parsed_request"].is_null(), "no raw to parse");
+    let err = v["parse_error"].as_str().unwrap();
+    assert!(
+        err.contains("not captured"),
+        "parse_error explains uncaptured, got: {err}"
+    );
+    // parsed_response 不受影响 (message + 元字段派生).
+    assert!(v["parsed_response"]["choices"].is_array(), "parsed intact");
+}
+
+/// ① 流式补充: off + stream=true (fanout_stream_task 骨架路径) — 客户端 SSE
+/// byte-exact, parsed 照常累积, record 未捕获标记.
+#[tokio::test]
+async fn audit_capture_off_streaming_still_forwards() {
+    let sse_body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse_body)
+        .create_async()
+        .await;
+
+    let (proxy_url, _state_path) = spawn_proxy_with_audit_capture(
+        false,
+        vec![openai_provider("oa-main", &upstream.url())],
+        test_secret_table(),
+        ConversationDag::new(64, 500, 1),
+    )
+    .await;
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/o/oa-main/v1/chat/completions"))
+        .body(r#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"Hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let text = resp.text().await.unwrap();
+    assert_eq!(text, sse_body, "streaming bytes byte-exact when off");
+}
+
+/// ① 跨协议补充: off + cross_proto 非流式 — 翻译照常, resp_body 未存储.
+#[tokio::test]
+async fn audit_capture_off_cross_proto_marks_uncaptured() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"cc-2","object":"chat.completion","created":1700000001,"model":"gpt-x","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}"#)
+        .create_async()
+        .await;
+
+    // Anthropic ingress → OpenAI egress (端点数组仅 OpenAI 一条, 与 ingress 不同
+    // → select_endpoint 无精确匹配 → 首端点跨协议翻译).
+    let dag = ConversationDag::new(64, 500, 1);
+    let dag_probe = dag.clone();
+    let (proxy_url, _state_path) = spawn_proxy_with_audit_capture(
+        false,
+        vec![provider_with("xa", Protocol::OpenAI, &upstream.url())],
+        test_secret_table(),
+        dag,
+    )
+    .await;
+
+    let (status, resp_body, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/a/xa/v1/messages",
+        r#"{"model":"claude-x","max_tokens":32,"messages":[{"role":"user","content":"hi"}]}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&resp_body).unwrap();
+    assert_eq!(
+        v["content"][0]["text"], "hi",
+        "translated anthropic body delivered: {resp_body}"
+    );
+    assert_eq!(v["type"], "message");
+
+    let id = dag_probe.list_node_ids_newest_first()[0];
+    let view = dag_probe.get_node(id).unwrap();
+    let resp = dag_probe.get_response(id).unwrap();
+    assert!(!view.audit_captured);
+    assert!(
+        dag_probe
+            .get_node_detail(id)
+            .unwrap()
+            .req_body_raw
+            .is_empty()
+    );
+    assert!(resp.raw_resp_body.is_empty(), "cross-proto raw not stored");
+}
+
+/// B2 段内小 helper: PUT /api/settings (断言 200 + 回显新值).
+async fn put_settings(proxy_url: &str, v: bool) {
+    let (s, body, _) = proxy_request(
+        proxy_url,
+        "PUT",
+        "/api/settings",
+        &format!(r#"{{"audit_capture": {v}}}"#),
+        &[("content-type", "application/json")],
+    )
+    .await;
+    assert_eq!(s, reqwest::StatusCode::OK);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["audit_capture"],
+        serde_json::json!(v)
+    );
+}
+
+/// B2 段内小 helper: GET 任意 /api/* JSON (断言 200).
+async fn api_get_json(proxy_url: &str, path: &str) -> serde_json::Value {
+    let (s, body, _) = proxy_request(proxy_url, "GET", path, "", &[]).await;
+    assert_eq!(s, reqwest::StatusCode::OK, "GET {path}");
+    serde_json::from_str(&body).unwrap()
+}
+
+/// ② per-request 原子性: 请求在途时切换开关, 在途请求沿用 **push 时**的决策 —
+/// 反向场景 (push off → 切 on → attach 完成): req/resp 双侧都未存储, 无
+/// "req 空 + resp 存了" 的半捕获撕裂; 随后的新请求按新状态 (on) 捕获.
+#[tokio::test]
+async fn audit_capture_toggle_inflight_request_keeps_push_decision() {
+    // 慢上游 (600ms): 保证请求在途窗口内完成 PUT 切换.
+    // 带 secret 表 → same_proto IR 路径 (messages 推 DAG — passthrough 路径推
+    // 空 messages, 第二请求无法前缀扩展).
+    let upstream_url = spawn_slow_upstream(Duration::from_millis(600)).await;
+    let dag = ConversationDag::new(64, 500, 1);
+    let dag_probe = dag.clone();
+    let (proxy_url, _state_path) = spawn_proxy_with_audit_capture(
+        false,
+        vec![openai_provider("oa-main", &upstream_url)],
+        test_secret_table_with(vec![secret("tok-i", "sk-live-inflight12345")]),
+        dag,
+    )
+    .await;
+
+    // 在途请求 (push 发生在 PUT 之前 → 决策 off). spawn 到后台.
+    let inflight = {
+        let url = proxy_url.clone();
+        tokio::spawn(async move {
+            proxy_request(
+                &url,
+                "POST",
+                "/o/oa-main/v1/chat/completions",
+                r#"{"model":"gpt-4","messages":[{"role":"user","content":"inflight sk-live-inflight12345"}]}"#,
+                &[],
+            )
+            .await
+        })
+    };
+    // 等 push 完成 (请求已发出, 在途), 再切换开关 on.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    put_settings(&proxy_url, true).await;
+
+    let (inflight_status, _, _) = inflight.await.unwrap();
+    assert_eq!(inflight_status, reqwest::StatusCode::OK);
+
+    // 在途请求的 record: 沿用 push 时 off 决策 (req + resp 双侧未捕获).
+    let inflight_id = dag_probe.list_node_ids_newest_first()[0];
+    let v = api_get_json(&proxy_url, &format!("/api/records/{inflight_id}")).await;
+    assert_eq!(
+        v["record"]["audit_capture_off"],
+        serde_json::json!(true),
+        "inflight request keeps push-time (off) decision"
+    );
+    assert_eq!(v["record"]["req_body"], serde_json::json!(""));
+    assert_eq!(v["record"]["resp_body"], serde_json::json!(""));
+
+    // 开关已 on: 新请求按新状态捕获 (现状行为).
+    let (s2, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        r#"{"model":"gpt-4","messages":[{"role":"user","content":"inflight sk-live-inflight12345"},{"role":"user","content":"second"}]}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(s2, reqwest::StatusCode::OK);
+    let new_id = dag_probe.list_node_ids_newest_first()[0];
+    let v = api_get_json(&proxy_url, &format!("/api/records/{new_id}")).await;
+    assert_eq!(v["record"]["audit_capture_off"], serde_json::json!(false));
+    assert!(
+        !v["record"]["req_body"].as_str().unwrap().is_empty(),
+        "new request captures req_body after toggle on"
+    );
+}
+
+/// ② 补充 (对称闭合): 反向在途场景 — push 时 on → 在途切换 off → attach 沿用
+/// push 决策: req/resp **双侧照存** (attach 不读 attach 时刻的开关值).
+#[tokio::test]
+async fn audit_capture_toggle_off_inflight_still_captures_both_sides() {
+    let upstream_url = spawn_slow_upstream(Duration::from_millis(600)).await;
+    let dag = ConversationDag::new(64, 500, 1);
+    let dag_probe = dag.clone();
+    let (proxy_url, _state_path) = spawn_proxy_with_audit_capture(
+        true,
+        vec![openai_provider("oa-main", &upstream_url)],
+        test_secret_table_with(vec![secret("tok-r", "sk-live-reverse99999")]),
+        dag,
+    )
+    .await;
+
+    let inflight = {
+        let url = proxy_url.clone();
+        tokio::spawn(async move {
+            proxy_request(
+                &url,
+                "POST",
+                "/o/oa-main/v1/chat/completions",
+                r#"{"model":"gpt-4","messages":[{"role":"user","content":"go sk-live-reverse99999"}]}"#,
+                &[],
+            )
+            .await
+        })
+    };
+    // push 已发生 (on), 请求在途 — 切换 off.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    put_settings(&proxy_url, false).await;
+
+    let (inflight_status, _, _) = inflight.await.unwrap();
+    assert_eq!(inflight_status, reqwest::StatusCode::OK);
+
+    // buffered (非流式) 路径 attach 先于客户端响应返回, 此刻 record 已终态.
+    let id = dag_probe.list_node_ids_newest_first()[0];
+    let v = api_get_json(&proxy_url, &format!("/api/records/{id}")).await;
+    assert_eq!(
+        v["record"]["audit_capture_off"],
+        serde_json::json!(false),
+        "inflight request keeps push-time (on) decision"
+    );
+    assert!(
+        !v["record"]["req_body"].as_str().unwrap().is_empty(),
+        "req captured per push decision"
+    );
+    // 非流式响应: on 时 resp_body = 累积 body (慢上游返回 {"choices":[]}).
+    assert!(
+        !v["record"]["resp_body"].as_str().unwrap().is_empty(),
+        "resp captured per push decision (no half-capture)"
+    );
+}
+
+/// ③ settings API: GET shape / PUT 非法 body 400 / PUT 持久化 state.toml
+/// (重启恢复的文件层断言: load_or_empty 读回 — 进程级重启装配由单元测试
+/// `audit_capture_set_enabled_persists_and_round_trips` 覆盖).
+#[tokio::test]
+async fn audit_capture_settings_api_shape_validation_and_persistence() {
+    let upstream = spawn_mock_upstream().await;
+    let (proxy_url, state_path) = spawn_proxy_with_audit_capture(
+        false,
+        vec![openai_provider("oa-main", &upstream.url())],
+        test_secret_table(),
+        ConversationDag::new(64, 500, 1),
+    )
+    .await;
+
+    // GET: 初始 off.
+    assert_eq!(
+        api_get_json(&proxy_url, "/api/settings").await["audit_capture"],
+        serde_json::json!(false)
+    );
+
+    // PUT 非法 body → 400 (非 JSON / 类型错 / 缺字段).
+    for bad in ["not json{", r#"{"audit_capture": "yes"}"#, "{}"] {
+        let (s, _, _) = proxy_request(
+            &proxy_url,
+            "PUT",
+            "/api/settings",
+            bad,
+            &[("content-type", "application/json")],
+        )
+        .await;
+        assert_eq!(s, reqwest::StatusCode::BAD_REQUEST, "body {bad:?} → 400");
+    }
+
+    // PUT 合法: 200 返回新值 + state.toml 持久化 (重启路径读回同值).
+    put_settings(&proxy_url, true).await;
+    let state = secret_guard::config::DynamicState::load_or_empty(&state_path, "").unwrap();
+    assert!(
+        state.audit_capture,
+        "state.toml persists audit_capture=true"
     );
 }
 
