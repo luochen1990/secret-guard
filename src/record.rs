@@ -86,6 +86,11 @@ pub struct ForwardRecord {
     /// `#[serde(default)]` 让旧版序列化数据 (无此字段) 仍能反序列化为空 vec.
     #[serde(default)]
     pub redactions: Vec<(String, String)>,
+    /// 本请求是否在 "详细日志关闭" 下记录 (派生自 `NodeView.audit_captured`
+    /// 的反相): true = `req_body` / `resp_body` 为空是**未捕获**所致, 而非
+    /// 请求/响应本身为空. 语义 SSOT 见 `state::AuditCapture`.
+    #[serde(default)]
+    pub audit_capture_off: bool,
 }
 
 impl ForwardRecord {
@@ -114,6 +119,8 @@ impl ForwardRecord {
             resp_complete: false,
             error: None,
             redactions: Vec::new(),
+            // 测试构造默认捕获 (与历史行为一致); 测试未捕获语义时显式覆盖.
+            audit_capture_off: false,
         }
     }
 }

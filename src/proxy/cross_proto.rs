@@ -215,6 +215,7 @@ pub(crate) async fn cross_proto_forward(
         Some(&secrets_snapshot),
         redactions,
         real_system,
+        state.audit_capture.enabled(),
     );
     let (record_id, usage_ctx) = push_event_and_wire_usage(
         &state,
@@ -499,6 +500,12 @@ pub(crate) async fn cross_proto_forward(
     // 本就按真值存储, 无安全边界问题, 仅为两条路径语义不一致的显式声明 (WebUI raw
     // view 在 cross-proto 下展示真 secret). streamed = 判型结果 (上游是否 SSE-shaped)
     // — 客户端实际收到 buffered 翻译, 但 record 语义与 same_proto 家族一致.
+    // B2: audit_capture off 时存空串 (决策沿用 push 快照, 与 fan_out 家族同型).
+    let resp_body_text = if state.dag.audit_captured_of(record_id) {
+        utf8_view(&resp_body_out)
+    } else {
+        String::new()
+    };
     super::recorder::attach_finality(
         &state.dag,
         record_id,
@@ -506,7 +513,7 @@ pub(crate) async fn cross_proto_forward(
         ResponseData {
             resp_status: resp_status_out.as_u16(),
             resp_headers: redact_headers(&resp_headers, &state.redacted_headers),
-            raw_resp_body: utf8_view(&resp_body_out),
+            raw_resp_body: resp_body_text,
             elapsed_ms: elapsed,
             streamed,
             resp_complete: true,

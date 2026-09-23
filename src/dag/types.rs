@@ -259,6 +259,12 @@ pub struct CallEvent {
     /// "本轮被改写" 的信号). `event.model` 保持 egress 视角派生
     /// (req_body_raw SSOT), 改写生效时两者同值.
     pub upstream_model: Option<Arc<str>>,
+    /// 本轮 push 时 audit_capture 开关的快照. `false` = 该请求未捕获 raw
+    /// (req_body_raw 为空串, 响应侧 attach 沿用**本快照**决定 raw_resp_body
+    /// 去留 — per-request 原子, 语义 SSOT 见 `state::AuditCapture`).
+    /// WebUI 经 `ForwardRecord.audit_capture_off` 消费 (区分 "空 body" vs
+    /// "未捕获").
+    pub audit_captured: bool,
 }
 
 /// LLM 返回的 response 数据 (message content + 元数据).

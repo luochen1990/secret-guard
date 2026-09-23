@@ -865,6 +865,12 @@ pub struct DynamicState {
     /// 静态 API key 中被用户 disable 的 label 集合 (持久化跨重启).
     #[serde(default)]
     pub api_keys_disabled: std::collections::HashSet<String>,
+
+    /// 详细日志 (audit capture) 开关, 默认 **false** (省内存). 开 = 新请求记录
+    /// 完整 req_body_raw / raw_resp_body; 关 = 不存 (timeline 不受影响, B1 派生).
+    /// 运行时语义 (per-request 原子) 与切换 API 的 SSOT 见 `state::AuditCapture`.
+    #[serde(default)]
+    pub audit_capture: bool,
 }
 
 impl DynamicState {

@@ -22,6 +22,8 @@
 //! - `GET /api/providers/{id}/models` —— 模型清单预览 (endpoints 弹窗;
 //!   算法在 `proxy::models`, 薄壳 handler 在 `api::provider_models`).
 //! - `GET/POST/DELETE/PATCH /api/api-keys[/{id}[/toggle]]` —— API key CRUD (无条件挂载, 见 api/apikeys.rs).
+//! - `GET/PUT /api/settings` —— 全局设置 (当前仅 `audit_capture` 详细日志开关,
+//!   B2; 即时生效 + 持久化 state.toml, 见 api/settings.rs).
 //!
 //! 注 1: 旧的 `GET /api/records` (扁平分页) + `GET /api/nodes/{id}/timeline` (基于 node_id)
 //! 已删除, 由 session-aware sync API 替代.
@@ -122,6 +124,13 @@ pub fn router() -> Router<AppState> {
             axum::routing::delete(api::delete_api_key),
         )
         .route("/api/api-keys/{id}/toggle", patch(api::toggle_api_key))
+        // 全局设置 (B2: audit_capture 详细日志开关). GET 读当前值, PUT 原子切换
+        // (持久化 + 内存, 见 api/settings.rs). PUT 受 SEC-7 Origin 校验覆盖
+        // (最外层 middleware, 非 /api/* 安全方法统一校验).
+        .route(
+            "/api/settings",
+            get(api::get_settings).put(api::update_settings),
+        )
 }
 
 /// `/api/*` 未匹配子路径的 404 handler (SEC-6: 内部 URL 绝不进入 forward).

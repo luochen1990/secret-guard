@@ -90,6 +90,8 @@ pub(super) fn node_view(inner: &DagInner, node_id: Uuid) -> Option<NodeView> {
         upstream_model: node.event.upstream_model.clone(),
         streamed: resp.as_ref().map(|r| r.streamed).unwrap_or(false),
         resp_complete: resp.as_ref().map(|r| r.resp_complete).unwrap_or(false),
+        // push 时开关快照 (B2): WebUI 经 ForwardRecord.audit_capture_off 消费.
+        audit_captured: node.event.audit_captured,
         error: resp.as_ref().and_then(|r| r.error.clone()),
         redactions: Arc::clone(&node.event.redactions),
         // B1 双态单点 (derive::parsed_view): 流式中读 stored, finalize 后派生.

@@ -451,6 +451,14 @@ pub async fn serve(
             crate::usage::price_overrides_from_config(&usage_config.pricing_override),
         )),
         pools: crate::pool::PoolStates::new(),
+        // B2 详细日志开关: 初始值来自 state.toml (DynamicState.audit_capture),
+        // 与两表 / apikey store 共享同一把 persist_lock (PUT /api/settings 的
+        // RMW 持久化与其他写者互斥).
+        audit_capture: crate::state::AuditCapture::new(
+            dyn_state.audit_capture,
+            state_path.clone(),
+            persist_lock.clone(),
+        ),
     };
 
     let addr: SocketAddr = format!("{host}:{port}")

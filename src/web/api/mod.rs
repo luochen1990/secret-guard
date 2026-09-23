@@ -38,6 +38,7 @@ pub(crate) mod providers;
 pub(crate) mod records;
 pub(crate) mod secrets;
 pub(crate) mod sessions;
+pub(crate) mod settings;
 pub(crate) mod usage;
 
 // handler re-export: 保持 `web::api::<handler>` 路径稳定 (web/mod.rs router 直接引用).
@@ -49,4 +50,5 @@ pub use providers::{
 pub use records::get_record;
 pub use secrets::{create_secret, delete_secret, list_secrets, set_secret_decision, update_secret};
 pub use sessions::{list_sessions, session_timeline, sync};
+pub use settings::{get_settings, update_settings};
 pub use usage::usage_summary;

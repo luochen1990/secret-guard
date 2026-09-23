@@ -195,7 +195,8 @@ pub(crate) async fn same_proto_forward(
         ingress,
     );
 
-    // 8. push 到 DAG (真实 messages + CallEvent 元数据).
+    // 8. push 到 DAG (真实 messages + CallEvent 元数据). audit_capture 开关
+    //    per-request 读一次 (快照进 event, 响应侧 attach 沿用).
     let event = build_call_event(
         &parts,
         &path_for_record,
@@ -210,6 +211,7 @@ pub(crate) async fn same_proto_forward(
         Some(&secrets_snapshot),
         redactions,
         real_system,
+        state.audit_capture.enabled(),
     );
     let (record_id, usage_ctx) = push_event_and_wire_usage(
         &state,
@@ -355,6 +357,7 @@ async fn same_proto_passthrough(
     // passthrough 路径无 IR 解析 (字节透传). DAG node 存空 messages (孤立节点) +
     // req_body_raw (原始字节) 作为 WebUI req_body 权威来源. Gemini/Ollama 无 codec
     // 协议也走此路径 (parsed view 不可用, 与旧行为一致).
+    // audit_capture off 时 req_body_raw 存空串 (preview 已派生, B2).
     let event = build_call_event(
         &parts,
         &path_for_record,
@@ -369,6 +372,7 @@ async fn same_proto_passthrough(
         None,
         vec![],
         vec![],
+        state.audit_capture.enabled(),
     );
     // usage 接线 (SSOT helper, 接线契约见其函数 doc). secrets_snapshot: 入口 1
     // (无 secret) 为空; 入口 2 (secrets 非空但无 codec 降级透传) 为全量快照 —

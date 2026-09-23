@@ -117,6 +117,12 @@ struct FanoutStreamCtx {
     /// 缓冲完毕, 流结束后消费; None (非 pool 流量) 零开销. spawn task 无法回读
     /// AppState, 随 ctx 携带 (PoolStates 内部是 Arc, clone 共享).
     pool_watch: Option<crate::pool::PoolWatch>,
+    /// audit_capture 决策快照 (B2): push 时经 `dag.audit_captured_of` 读回 —
+    /// 响应侧 raw_resp_body 的去留沿用 push 时的决策 (per-request 原子, 不读
+    /// attach 时刻的开关值). false 时 finalize_body 的产出被丢弃 (存空串);
+    /// RecordAccumulator 的累积**不受影响** (pool 检测 / ParsedSync / 错误回显
+    /// 仍需要瞬时字节, 只是不再长期持有进 DAG).
+    capture: bool,
 }
 
 /// 两条流式扇出路径的共享骨架: spawn task 内的 chunk 循环 + 记录 + 收尾.
@@ -157,6 +163,7 @@ async fn fanout_stream_task(
         stream_idle_timeout,
         usage,
         pool_watch,
+        capture,
     } = ctx;
 
     let mut stream = upstream_resp.bytes_stream();
@@ -212,7 +219,13 @@ async fn fanout_stream_task(
 
     let elapsed = started.elapsed().as_millis() as u64;
     let finality = finalize_parsed(parsed_sync, &recorder);
-    let body = finalize_body(&recorder);
+    // B2 audit_capture: off 时丢弃 record body (存空串) — 决策沿用 push 快照
+    // (ctx.capture), 非流式/错误回显分支也一并丢弃 (无 "部分捕获" 形态).
+    let body = if capture {
+        finalize_body(&recorder)
+    } else {
+        String::new()
+    };
     // resp_complete 在 error_kind move 进 ResponseData 前先取 (usage 落账同用).
     let resp_complete = recorder.complete();
     // B1 接线收口: message intern + parsed 清除 + 元字段 + 守卫 + attach.
@@ -284,7 +297,7 @@ pub(crate) async fn fan_out_streaming(
 
     tokio::spawn(fanout_stream_task(
         FanoutStreamCtx {
-            dag,
+            dag: dag.clone(),
             record_id,
             started,
             resp_headers_for_record,
@@ -294,6 +307,7 @@ pub(crate) async fn fan_out_streaming(
             stream_idle_timeout,
             usage,
             pool_watch,
+            capture: dag.audit_captured_of(record_id),
         },
         upstream_resp,
         tx,
@@ -506,7 +520,13 @@ pub(crate) async fn fan_out_buffered_ir(
     // record 存储的是 LLM 视角 (含 mock) 的版本.
     // 注: buffered_ir 在 overflow 时保留部分累积 (而非 truncated banner),
     // 因为 client_bytes 也是从同一 acc 派生 — 保持一致.
-    let acc_text = utf8_view(&recorder.acc);
+    // B2: audit_capture off 时 (决策沿用 push 快照) 存空串 — acc 的瞬时累积
+    // 不受影响 (pool 检测 / client_bytes 派生照常), 只是不再长期持有进 DAG.
+    let acc_text = if dag.audit_captured_of(record_id) {
+        utf8_view(&recorder.acc)
+    } else {
+        String::new()
+    };
     // 视图正确性守卫 (同协议 buffered_ir 路径): reader 解析与 raw bytes 的
     // round-trip 抽查 (比对值 = finality 的同源对照值, B1 前 = stored parsed).
     // 守卫内部按 reader 解析结果比对 (失败时 expected=None, 与 fallback 路径一致).
@@ -690,7 +710,7 @@ fn spawn_restore_fanout(
 
     tokio::spawn(fanout_stream_task(
         FanoutStreamCtx {
-            dag,
+            dag: dag.clone(),
             record_id,
             started,
             resp_headers_for_record,
@@ -702,6 +722,7 @@ fn spawn_restore_fanout(
             // restore 家族 (with_restore / cross_proto 流式) 仅承载 2xx SSE 成功
             // 响应 — 检测的 status 短路恒成立, 恒 None (不构造, 死参数).
             pool_watch: None,
+            capture: dag.audit_captured_of(record_id),
         },
         upstream_resp,
         tx,
@@ -813,6 +834,7 @@ mod tests {
             redactions: Arc::from(Vec::new()),
             upstream_model: None,
             upstream_id: Arc::from("test"),
+            audit_captured: true,
         };
         let record_id = dag.push_messages(msgs, event);
 

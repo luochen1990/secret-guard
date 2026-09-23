@@ -2148,6 +2148,12 @@ mod tests {
             model_lists: Arc::new(ModelListCache::new()),
             usage: std::sync::Arc::new(crate::usage::UsageStore::in_memory()),
             pricing: std::sync::Arc::new(crate::usage::PricingCache::for_tests()),
+            // B2: 详细日志开关 (存量行为守卫, 默认 on; 本 harness 不触详细日志语义).
+            audit_capture: crate::state::AuditCapture::new(
+                true,
+                tmp_path("audit-capture"),
+                Arc::new(Mutex::new(())),
+            ),
         }
     }
 

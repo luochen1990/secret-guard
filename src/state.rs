@@ -13,7 +13,11 @@
 //! 各字段的来源与语义注释见结构体定义; 装配点在 `server.rs::serve`
 //! (双层配置 → 两张表 + ApiKeyStore + DAG + 超时快照 → AppState).
 
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use parking_lot::Mutex;
 
 use crate::auth::ApiKeyStore;
 use crate::config::{OnFallbackRestore, OnProbeExhausted, OnUnsupportedProtocol};
@@ -86,6 +90,66 @@ pub struct AppState {
     /// 响应侧耗尽检测 (T2) / web 观察面 (`list_providers` 的成员状态 +
     /// `pool-reset`, T3)。契约见 `src/pool.rs` 头部。
     pub pools: crate::pool::PoolStates,
+    /// 详细日志 (audit capture) 运行时开关: push 路径 per-request 读一次快照
+    /// (建议值 `CallEvent.audit_captured`), WebUI 经 `PUT /api/settings` 即时切换.
+    /// 语义与持久化见 [`AuditCapture`] 文档; 装配点 `server.rs::serve`.
+    pub audit_capture: AuditCapture,
+}
+
+// ─── AuditCapture 开关 (详细日志) ───────────────────────────────────────────
+
+/// 详细日志 (audit capture) 的运行时开关 + state.toml 持久化.
+///
+/// # 职责边界
+///
+/// - 读 (`enabled`): 转发链 push 路径 per-request 调用一次, 决定本请求是否
+///   存储 `req_body_raw` / `raw_resp_body`. 决策快照进 `CallEvent.audit_captured`,
+///   响应侧 attach 沿用快照 (不重读本开关) — 保证 per-request 原子性:
+///   请求在途时切换开关不产生 "req 空 + resp 存了" 的半捕获撕裂.
+/// - 写 (`set_enabled`): WebUI `PUT /api/settings`. RMW 持久化 state.toml
+///   (与 provider/secret/apikey 表共享 `persist_lock`, 防并发互覆) +
+///   更新内存 AtomicBool. 遵循 "先持久化, 再更新内存" 契约: 持久化失败时
+///   内存保持旧值 (与 `DynamicTable::set_decision` 同型).
+///
+/// # Ordering 说明
+///
+/// 读用 `Relaxed`: 开关无跨字段的同步语义依赖 (每请求独立读取, 切换仅需
+/// "尽快对新请求可见", 单变量 load/store 在任何 Ordering 下都满足).
+#[derive(Clone, Debug)]
+pub struct AuditCapture {
+    enabled: Arc<AtomicBool>,
+    state_path: Arc<PathBuf>,
+    persist_lock: Arc<Mutex<()>>,
+}
+
+impl AuditCapture {
+    /// 构造: `initial` 来自启动时加载的 `DynamicState.audit_capture`.
+    pub fn new(initial: bool, state_path: PathBuf, persist_lock: Arc<Mutex<()>>) -> Self {
+        Self {
+            enabled: Arc::new(AtomicBool::new(initial)),
+            state_path: Arc::new(state_path),
+            persist_lock,
+        }
+    }
+
+    /// 当前开关状态 (转发链 push 路径 per-request 读一次).
+    pub fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    /// 切换开关: RMW 持久化 state.toml + 更新内存 (先持久化再更新, 见类型文档).
+    /// 返回落库后的实际值.
+    pub fn set_enabled(&self, v: bool) -> anyhow::Result<()> {
+        let _guard = self.persist_lock.lock();
+        // 持久化 RMW: 与 set_decision 同型 — 只为改一个字段, secret 早已
+        // validate 过, 用空 prefix 跳过 re-validate.
+        let mut state = crate::config::DynamicState::load_or_empty(&self.state_path, "")?;
+        state.audit_capture = v;
+        let text = state.to_toml()?;
+        crate::config::atomic_write(&self.state_path, &text)?;
+        self.enabled.store(v, Ordering::Relaxed);
+        Ok(())
+    }
 }
 
 // ─── HTTP 层共享常量 ────────────────────────────────────────────────────────
@@ -145,5 +209,74 @@ mod tests {
     fn normalize_empty_input_yields_empty_list() {
         // 默认配置 (空名单) 归一化后仍为空 — 默认行为不变的契约前提.
         assert!(normalize_redacted_headers(&[]).is_empty());
+    }
+
+    // ─── AuditCapture: 持久化 round-trip + 内存契约 ───────────────────────
+
+    fn tmp_path(label: &str) -> PathBuf {
+        // 专属子目录 (而非 /tmp/opencode/tmp 直下): rollback 测试会把**父目录**
+        // 设为只读 — 必须只影响本测试自己的目录, 不干扰并发的其他测试.
+        let dir = PathBuf::from(format!(
+            "/tmp/opencode/tmp/test-audit-capture-{label}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("state.toml")
+    }
+
+    #[test]
+    fn audit_capture_set_enabled_persists_and_round_trips() {
+        // 契约: set_enabled 持久化到 state.toml, 重启路径 (load_or_empty → new)
+        // 读回同一状态 — "重启恢复" 的单元层覆盖 (集成层见 tests/integration.rs).
+        let path = tmp_path("roundtrip");
+        let sw = AuditCapture::new(false, path.clone(), Arc::new(Mutex::new(())));
+        assert!(!sw.enabled(), "initial false");
+
+        sw.set_enabled(true).unwrap();
+        assert!(sw.enabled(), "memory updated after persist");
+
+        // "重启": 从磁盘重新加载 DynamicState 构造新开关.
+        let state = crate::config::DynamicState::load_or_empty(&path, "").unwrap();
+        let sw2 = AuditCapture::new(state.audit_capture, path.clone(), Arc::new(Mutex::new(())));
+        assert!(sw2.enabled(), "state survives restart path");
+
+        // 关回去也持久化.
+        sw2.set_enabled(false).unwrap();
+        let state3 = crate::config::DynamicState::load_or_empty(&path, "").unwrap();
+        assert!(!state3.audit_capture);
+    }
+
+    #[test]
+    fn audit_capture_set_enabled_failure_keeps_old_memory() {
+        // 契约 (先持久化再更新内存): 持久化失败时内存保持旧值 — 与
+        // DynamicTable::set_decision 的回滚语义同型.
+        let path = tmp_path("rollback");
+        // 预写一个合法 state, 让 load_or_empty 成功、atomic_write 失败 (目录只读).
+        crate::config::atomic_write(&path, "").unwrap();
+        let dir = path.parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o500))
+            .unwrap();
+
+        let sw = AuditCapture::new(false, path, Arc::new(Mutex::new(())));
+        let err = sw
+            .set_enabled(true)
+            .expect_err("persist into read-only dir must fail");
+        assert!(!err.to_string().is_empty());
+        // 核心断言: 内存未变 (回滚生效).
+        assert!(!sw.enabled(), "memory must roll back on persist failure");
+
+        // 恢复权限 (Drop 语义手动补齐, tmp 目录复用 /tmp/opencode/tmp).
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+    }
+
+    #[test]
+    fn audit_capture_old_state_toml_without_field_defaults_false() {
+        // 契约: 旧版 state.toml 无 audit_capture 字段 → serde default false
+        // (升级兼容: 不存在 "缺字段启动失败" 或意外开启).
+        let path = tmp_path("legacy");
+        std::fs::write(&path, "api_keys_disabled = []\n").unwrap();
+        let state = crate::config::DynamicState::load_or_empty(&path, "").unwrap();
+        assert!(!state.audit_capture);
     }
 }

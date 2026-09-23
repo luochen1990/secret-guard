@@ -155,6 +155,9 @@ pub struct NodeView {
     pub streamed: bool,
     /// 响应是否完整 (上游错误 / 客户端断开 → false).
     pub resp_complete: bool,
+    /// push 时 audit_capture 开关快照 (语义 SSOT 见 `state::AuditCapture`;
+    /// `ForwardRecord.audit_capture_off` 的派生源).
+    pub audit_captured: bool,
     /// 错误诊断.
     pub error: Option<String>,
     /// (mock, secret_id) 投影. 永不含真实 secret value.

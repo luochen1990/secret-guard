@@ -91,6 +91,9 @@ fn build_forward_record(
         streamed: view.streamed,
         resp_complete: view.resp_complete,
         error: view.error,
+        // B2: 未捕获标记 (audit_capture off 下的请求) — 前端区分 "空 body"
+        // vs "未捕获" 的契约字段 (off 时 req_body / resp_body 均为空).
+        audit_capture_off: !view.audit_captured,
         // ForwardRecord 持有 Vec (需 Deserialize); 此处从 NodeView 的 Arc 切片
         // 实化一次. build_forward_record 仅用于 GET /records/{id} 详情路径 (非高频).
         redactions: view.redactions.to_vec(),
@@ -132,9 +135,22 @@ pub(crate) struct GetRecordResponse {
 /// - codec 不支持此协议 (Gemini/Ollama) → 同上
 /// - body 不是合法 JSON → `invalid JSON: <err>`
 /// - codec reader 解析失败 → `<reader error message>`
+/// - audit_capture off (未捕获, req_body 为空) → `req_body not captured ...`
+///   (B2: 显式区分 "未捕获" 与 "空 body 解析失败" 两种 None 语义)
 fn build_parsed_response(record: ForwardRecord) -> GetRecordResponse {
     // parsed_response 直接取 record 内的累积结果.
     let parsed_response = record.resp_parsed.clone();
+
+    // B2: 未捕获的请求无 raw 可算 — parsed_request 恒 None, parse_error 给出
+    // 明确原因 (前端区分于解析失败).
+    if record.audit_capture_off {
+        return GetRecordResponse {
+            record,
+            parsed_request: None,
+            parsed_response,
+            parse_error: Some("req_body not captured (audit_capture off)".to_string()),
+        };
+    }
 
     // parsed_request: 从 req_body 计算.
     let proto_short = record
