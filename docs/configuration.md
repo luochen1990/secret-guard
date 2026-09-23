@@ -152,7 +152,7 @@ egress 端点由 ingress 协议选定 — 精确匹配 → 同协议透传 (byte
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `endpoints` | 子表数组 | (必填) | 有序端点列表 (`[[providers.endpoints]]`): **至少一条**, **每协议至多一条** (违反均启动报错)。**数组序 = fallback 序** — 第一条是默认端点, ingress 无精确匹配端点时兜底走跨协议翻译。单端点可用内联紧凑写法: `endpoints = [ { protocol = "openai", base_url = "https://api.openai.com" } ]`。 |
-| `endpoints[].protocol` | string | (必填) | 该端点的上游协议: `openai` / `anthropic` / `gemini` / `ollama` / `openairesponses` (OpenAI Responses API)。 |
+| `endpoints[].protocol` | string | (必填) | 该端点的上游协议: `openai` / `anthropic` / `gemini` / `ollama` / `openai-responses` (OpenAI Responses API)。 |
 | `endpoints[].base_url` | string | (必填) | 该端点的上游 base URL. 必须以 `http://` 或 `https://` 开头, **末尾不带 `/`** (路径由 secret-guard 拼接). 如 `https://api.openai.com`. |
 | `endpoints[].common_uri` | string | — | (per 端点) secret-guard **自建请求** (拉取上游模型清单, 用于 router `/models` 合成) 的公共 URI 前缀, 即三段式 `base_url + common_uri + request_uri` 的中段. **不影响转发** (转发路径随客户端请求原样透传). `"/v1"` = 裸根布局 (OpenAI/Anthropic 官方形态); `""` = 版本前缀已含 (智谱 GLM coding plan / DeepSeek / Moonshot 等, models 端点 = `base + /models`); 任意 `/` 开头的自定义前缀 (如智谱老接口 `/api/paas/v4`) 也合法. 缺省 = 未探测, 运行时按 `"/v1"` → `""` 顺序自动推导. 通常无需手写 — WebUI 端点行的 Detect 按钮探测后自动填充并随保存落盘 (badge 追加回显在该行 base_url 输入框后). 值域校验: `""` 或以 `/` 开头的 path 片段 (无尾斜杠, 不含 `?`/`#`/空格, ≤64 字符). **注意**: WebUI/API 的 PUT 对 `endpoints` 是**全量必填**语义 (缺失/空数组 → 400), 行内不带 `common_uri` (= null) 即清除为未探测; SDK 脚本编辑 provider 时请先读回原值再整体提交. |
 | `api_key` | string | `""` | 上游 API key 明文, **所有端点共享**. 与 `api_key_file` 互斥 (同时设置启动报错). ⚠️ **TOML 顺序陷阱**: 凭证字段属于条目级, 必须写在 `[[providers.endpoints]]` **之前** — TOML 的 `[[子表数组]]` 头会切换"当前表", 写在其后的键归属 endpoint 而非条目, 会被 unknown-field WARN 忽略 (凭证静默丢失, 上游 401). 详见双端点示例. |

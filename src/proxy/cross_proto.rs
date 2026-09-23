@@ -11,7 +11,7 @@
 //!
 //! # 范围与限制
 //!
-//! codec 覆盖族内 (openai/anthropic/openairesponses) 任意 pair 的翻译 — 非流式经
+//! codec 覆盖族内 (openai/anthropic/openai-responses) 任意 pair 的翻译 — 非流式经
 //! 通用 IR 路径, 流式经 StreamTranslate — 均已承载 (含 Responses 参与的 pair,
 //! 双向各有集成测试锁定).
 
@@ -76,15 +76,17 @@ pub(crate) async fn cross_proto_forward(
     let egress = endpoint.protocol;
 
     // 1. 检查 codec 是否支持此协议对.
+    // 注: 消息内覆盖族清单是 codec_covered 集合的手写副本 (第三处编码, 另两处 =
+    // codec_covered() 与前端 CODEC_SUPPORTED, 均有同步自认) — 增删覆盖族时同步.
     let Some(ingress_codec) = CodecProtocol::from_native(ingress) else {
         return Err(AppError::NotImplemented(format!(
-            "ingress protocol '{}' is not supported by codec (only openai/anthropic/openairesponses)",
+            "ingress protocol '{}' is not supported by codec (only openai/anthropic/openai-responses)",
             ingress.name()
         )));
     };
     let Some(egress_codec) = CodecProtocol::from_native(egress) else {
         return Err(AppError::NotImplemented(format!(
-            "egress protocol '{}' is not supported by codec (only openai/anthropic/openairesponses)",
+            "egress protocol '{}' is not supported by codec (only openai/anthropic/openai-responses)",
             egress.name()
         )));
     };

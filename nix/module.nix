@@ -309,7 +309,7 @@ in
                         "anthropic"
                         "gemini"
                         "ollama"
-                        "openairesponses"
+                        "openai-responses"
                       ];
                       description = "该端点的协议 (ingress 精确匹配 → 同协议透传; 其余 ingress 命中其它端点或 fallback 首条走跨协议翻译). 同一 provider 内每协议至多一条 (render 层 fail-fast, 对齐上游 validate).";
                     };

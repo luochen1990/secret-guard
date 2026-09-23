@@ -4947,7 +4947,7 @@
     // ─── provider 行渲染: router 路由摘要 + per-route egress 近似 (#179) ──────
     //
     // 跨协议教育提示 (静态, 无条件挂在 egress 标记上): 入口协议 ≠ 出口时的代价.
-    // 流式 = 实际行为: codec 覆盖族 (openai/anthropic/openairesponses) 任意 pair
+    // 流式 = 实际行为: codec 覆盖族 (openai/anthropic/openai-responses) 任意 pair
     // 流式均翻译 (含 Responses 任一侧, M2 走查口径随 Responses 流式落地更新).
     const EGRESS_CROSS_PROTO_TIP =
       'If the ingress protocol ≠ this egress: cross-protocol translation kicks in — reasoning_content is dropped, except Responses egress streaming keeps it (as reasoning summary events)';
@@ -5397,7 +5397,7 @@
     // 展示某个 provider 在各 ingress 协议下的入口 URL 和支持状态.
     // 判定 SSOT: 与后端 `proxy/mod.rs::dispatch` 一致 —
     //   ingress == egress → direct (同协议透传/IR redact);
-    //   ingress != egress 且两者 codec 都覆盖 (openai/anthropic/openairesponses,
+    //   ingress != egress 且两者 codec 都覆盖 (openai/anthropic/openai-responses,
     //     = 后端 `Protocol::codec_covered()`) → cross-protocol 翻译 — 非流式经通用
     //     IR 路径, 流式经 StreamTranslate, 任意覆盖族 pair 均可 (含 Responses);
     //   任一协议 codec 不覆盖 (gemini/ollama) → 不支持.
@@ -5406,7 +5406,7 @@
     // (后端守卫: provider.rs `test_codec_covered_matches_codec_from_native`).
     // 这是 codec 内部性质, 后端无 API 暴露, 硬编码在渲染层作为派生真相; 若未来后端
     // 暴露 codec 支持信息, 应改为 fetch 派生以消除此 SSOT 漂移点.
-    const CODEC_SUPPORTED = new Set(['openai', 'anthropic', 'openairesponses']);
+    const CODEC_SUPPORTED = new Set(['openai', 'anthropic', 'openai-responses']);
 
     // #187/#179 + multi-endpoint: provider 的实际 egress = 链尾实体的端点集合
     // (入口数据 providersList 已在手, 本地解析). Direct → 自身 endpoints; Router →

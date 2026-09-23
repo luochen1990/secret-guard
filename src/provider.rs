@@ -49,8 +49,10 @@ static WARNED_API_KEY_FILE: LazyLock<Mutex<HashSet<String>>> =
 
 /// 支持的 LLM 协议.
 ///
-/// `serde(rename_all = "lowercase")` 与 [`Protocol::ALL`] 中的 `name` 字段保持同步,
-/// 后者是单一事实来源 (`from_name` / `from_short` 都从 `ALL` 派生).
+/// serde 名与 [`Protocol::ALL`] 中的 `name` 字段保持同步, 后者是单一事实来源
+/// (`from_name` / `from_short` 都从 `ALL` 派生). 各变体经 enum 级
+/// `rename_all = "lowercase"` 从变体名派生 serde 名, 唯 `OpenAIResponses` 显式
+/// `rename` 覆盖 — lowercase 派生会得到无分隔符的 `openairesponses`, 不可读.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {
@@ -65,6 +67,7 @@ pub enum Protocol {
     /// 字段结构差异显著 (input/instructions vs messages, output items vs choices,
     /// typed SSE events vs flat chunks), 故独立为一个 protocol 变体.
     /// proto_short = `r` (Responses).
+    #[serde(rename = "openai-responses")]
     OpenAIResponses,
 }
 
@@ -82,7 +85,7 @@ impl Protocol {
         (Self::Anthropic, "anthropic", "a"),
         (Self::Gemini, "gemini", "g"),
         (Self::Ollama, "ollama", "l"),
-        (Self::OpenAIResponses, "openairesponses", "r"),
+        (Self::OpenAIResponses, "openai-responses", "r"),
     ];
 
     pub fn short(self) -> &'static str {
@@ -1616,6 +1619,18 @@ mod tests {
             assert_eq!(proto.name(), name);
         }
         assert_eq!(Protocol::from_name("xxx"), None);
+    }
+
+    /// serde wire 名与 `ALL` 的 name 同一事实两处编码 (变体级 `rename` 属性
+    /// 漂移/漏写会静默回退 lowercase 派生, 不报编译错) — 本测试双向锁死,
+    /// 形态同 `test_codec_covered_matches_codec_from_native`.
+    #[test]
+    fn test_serde_names_match_all() {
+        for (proto, name, _) in Protocol::ALL {
+            let json = format!("\"{name}\"");
+            assert_eq!(serde_json::to_string(&proto).unwrap(), json);
+            assert_eq!(serde_json::from_str::<Protocol>(&json).unwrap(), proto);
+        }
     }
 
     /// `codec_covered` 与 `codec::Protocol::from_native` 的 Some 集合同一事实两处

@@ -225,7 +225,7 @@ API key CRUD **无条件挂载** (在 `web::router()`, 不依赖 `auth.enabled`)
 
 - **协议词表两套** (2026-09 决策, 见根 AGENTS.md 已知限制段呈现策略): 端点行的
   protocol select 下拉词表 = `GET /api/providers` 的 `webui_protocols` (仅 codec 覆盖族
-  openai/anthropic/openairesponses, 代码侧谓词 SSOT = `Protocol::codec_covered()`);
+  openai/anthropic/openai-responses, 代码侧谓词 SSOT = `Protocol::codec_covered()`);
   全量 `protocols`/`shorts` 仅供路由约定表格渲染与 endpoints 弹窗的 short 映射. 存量
   gemini/ollama 条目编辑与 Detect 探测推荐经 `setEndpointProtocolValue` 动态 append
   "(experimental)" 选项 (词表灌入发生在 `addEndpointRow` 物化时 — "populate 先于

@@ -2481,7 +2481,7 @@ test.describe("WebUI 表单失败保持 (#181)", () => {
     await expect(sel).toHaveValue("gemini");
     await expect(sel.locator('option[value="gemini"]')).toHaveText("gemini (experimental)");
     // 新建词表三族仍在 (append 不挤掉既有选项).
-    for (const p of ["openai", "anthropic", "openairesponses"]) {
+    for (const p of ["openai", "anthropic", "openai-responses"]) {
       await expect(sel.locator(`option[value="${p}"]`)).toBeAttached();
     }
 
@@ -2847,10 +2847,10 @@ test.describe("Provider endpoints 弹窗 (M2 走查 + 行卡片重设计)", () =
   });
 
   // M2 走查回归: translate 徽章的流式语义必须与实际行为一致 — codec 覆盖族
-  // (openai/anthropic/openairesponses) 任意 pair 流式翻译均已接入 (StreamTranslate;
+  // (openai/anthropic/openai-responses) 任意 pair 流式翻译均已接入 (StreamTranslate;
   // Responses 流式 writer 落地后统一, 不再按 pair 分化). 历史缺陷: tooltip 写死
   // "Non-streaming only" (过时的 #183 前文案), 且 CODEC_SUPPORTED 缺
-  // openairesponses (Responses 行误显示 "not supported" — Responses⇄Chat
+  // openai-responses (Responses 行误显示 "not supported" — Responses⇄Chat
   // 翻译实际可用).
   // multi-endpoint 后 direct 条目的弹窗改为 per 端点行形态, 矩阵宿主 = mock-router
   // (种子 router 条目, 链尾 = mock-openai 的 openai 单端点 — 三态断言不变);
