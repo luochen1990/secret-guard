@@ -72,11 +72,7 @@ fn base_app_state(
         usage: Arc::new(secret_guard::usage::UsageStore::in_memory()),
         pricing: Arc::new(secret_guard::usage::PricingCache::for_tests()),
         // B2: 详细日志开关 (存量行为守卫, 默认 on; 需要开启的测试用 struct-update 覆盖).
-        audit_capture: secret_guard::state::AuditCapture::new(
-            true,
-            tmp_state_path("audit-capture"),
-            Arc::new(parking_lot::Mutex::new(())),
-        ),
+        audit_capture: secret_guard::state::AuditCapture::for_tests(true),
     }
 }
 

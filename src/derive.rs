@@ -646,11 +646,12 @@ pub(crate) fn assert_delta_view_matches_raw(node: &crate::dag::Node, pool: &crat
 fn count_system_roles(req_body_raw: &str) -> usize {
     serde_json::from_str::<serde_json::Value>(req_body_raw)
         .ok()
-        .and_then(|v| v.get("messages").and_then(|m| m.as_array()).cloned())
-        .map(|msgs| {
-            msgs.iter()
-                .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
-                .count()
+        .and_then(|v| {
+            v.get("messages").and_then(|m| m.as_array()).map(|msgs| {
+                msgs.iter()
+                    .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
+                    .count()
+            })
         })
         .unwrap_or(0)
 }

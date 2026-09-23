@@ -1244,9 +1244,6 @@ pub(crate) fn rebuild_real_to_mock_pairs(
         let entry = secrets.iter().find(|s| s.id == *sid)?;
         mock_of.insert(entry.value.as_str(), mock.as_str());
     }
-    if mock_of.is_empty() {
-        return Some(Vec::new());
-    }
     // 重放 redact_ir_inner 的排序: snapshot 序 → 稳定 sort len desc → 相邻去重
     // (同 value 只处理首个 entry) → 只留有映射的 (即当时命中的) secret.
     let mut ordered: Vec<&SecretEntry> = secrets.iter().filter(|e| !e.value.is_empty()).collect();
@@ -1270,12 +1267,10 @@ pub(crate) fn rebuild_real_to_mock_pairs(
 /// 当时的处理序), 与 `ir_request_replace_all` 的逐叶子 `replace_in_place`
 /// 完全同一实现 — 对相同输入产相同字节.
 pub(crate) fn apply_real_to_mock_messages(msgs: &mut [IrMessage], pairs: &[(String, String)]) {
-    for (real, mock) in pairs {
-        for msg in &mut *msgs {
-            for b in &mut msg.content {
-                b.for_each_str_leaf_mut(&mut |s| replace_in_place(s, real, mock));
-            }
-        }
+    // 委托 blocks 变体: 与 `ir_request_replace_all` 的同一实现按构造成立 (叶子
+    // 互不相交, 跨 message 顺序无关), 不再并行维护第二份双层循环.
+    for msg in &mut *msgs {
+        apply_real_to_mock_blocks(&mut msg.content, pairs);
     }
 }
 

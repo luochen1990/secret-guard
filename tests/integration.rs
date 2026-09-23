@@ -335,11 +335,7 @@ fn base_app_state(
         // off (DynamicState.audit_capture serde default false, 省内存新默认) —
         // harness 与生产默认的这处差异是**有意**的; off 语义由 audit_capture
         // 集成测试段显式构造覆盖 (经 PUT /api/settings 切换).
-        audit_capture: secret_guard::state::AuditCapture::new(
-            true,
-            tmp_state_path("audit-capture"),
-            std::sync::Arc::new(parking_lot::Mutex::new(())),
-        ),
+        audit_capture: secret_guard::state::AuditCapture::for_tests(true),
     }
 }
 

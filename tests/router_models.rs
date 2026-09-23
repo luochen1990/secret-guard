@@ -173,11 +173,7 @@ async fn spawn(providers: Vec<Provider>) -> String {
         usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),
         pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::for_tests()),
         // B2: 详细日志开关 (存量行为守卫, 默认 on; 本 harness 不触详细日志语义).
-        audit_capture: secret_guard::state::AuditCapture::new(
-            true,
-            tmp_state_path("audit-capture"),
-            Arc::new(parking_lot::Mutex::new(())),
-        ),
+        audit_capture: secret_guard::state::AuditCapture::for_tests(true),
     };
     let app = server::build_router(
         proxy,

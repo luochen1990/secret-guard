@@ -132,6 +132,19 @@ impl AuditCapture {
         }
     }
 
+    /// AppState fixture 用构造 (与 `PricingCache::for_tests` / `UsageStore::in_memory`
+    /// 模式对称): 自管临时 state 路径 + 独立 lock, 不落真实 state.toml. 常编译
+    /// `pub fn` — integration tests 是独立 crate, 看不到 lib 的 `#[cfg(test)]` 项.
+    /// 需要与 provider table 共享 lock 模拟生产装配的场景 (如 spawn_proxy_with_
+    /// audit_capture) 不适用本构造, 仍用 [`AuditCapture::new`].
+    pub fn for_tests(enabled: bool) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "sg-audit-capture-test-{}.toml",
+            uuid::Uuid::new_v4()
+        ));
+        Self::new(enabled, path, Arc::new(Mutex::new(())))
+    }
+
     /// 当前开关状态 (转发链 push 路径 per-request 读一次).
     pub fn enabled(&self) -> bool {
         self.enabled.load(Ordering::Relaxed)
