@@ -304,11 +304,12 @@ pub(super) fn assert_redactions_match_map(
 /// 捕获的 drift: writer 改变了 messages 顺序/结构导致 IR 提取与字符串提取不一致.
 /// 详见 AGENTS.md "视图正确性确保机制".
 ///
-/// 跳过 (B2): `audit_captured = false` 的请求 — req_body_raw 未存储 (空串),
+/// 跳过 (B2): req_body_raw 未存储 (空串) 的请求 — off 档 / errors 档成功回收,
 /// 无对照物可比; on 的请求行为不变.
 #[cfg(feature = "consistency-check")]
 pub(super) fn assert_preview_model_match_source(event: &CallEvent) {
-    if !event.audit_captured {
+    // gate = raw 是否在场 (off 档 / errors 档成功回收后均为空串, 无对照物).
+    if event.req_body_raw.is_empty() {
         return;
     }
     let (rederived_preview, rederived_model) =
@@ -659,10 +660,11 @@ pub(super) fn stream_err_label(e: &std::io::Error) -> &'static str {
 /// / 无 codec 降级路径恒 None, #183 D4 — 非 None-ness 即 "本轮被 override" 的信号).
 /// `redacted_headers`: 追加脱敏名单 (`AppState::redacted_headers`, 来自
 /// `[redact] redacted_headers`, SEC-4) — 与硬编码黑名单并集, 见 `helpers::redact_headers`.
-/// `audit_capture`: 详细日志开关的 per-request 快照 (调用方从
-/// `AppState::audit_capture.enabled()` 读一次). `false` 时 `req_body_raw` 存空串
-/// (省内存) — preview/model 已在上方从 `req_text`/`ir` 派生完毕, 不受丢弃影响;
-/// 决策记录进 `CallEvent.audit_captured`, 响应侧 attach 沿用 (per-request 原子).
+/// `capture_mode`: 详细日志三态的 per-request 快照 (调用方从
+/// `AppState::audit_capture.mode()` 读一次). `Off` 时 `req_body_raw` 存空串;
+/// `Errors` 在途暂存 (成功后由 `dag::attach_response` 回收) — preview/model
+/// 已在上方从 `req_text`/`ir` 派生完毕, 不受影响; 决策记录进
+/// `CallEvent.capture_mode`, 响应侧 attach 沿用 (per-request 原子).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_call_event(
     parts: &axum::http::request::Parts,
@@ -678,7 +680,7 @@ pub(super) fn build_call_event(
     secrets_snapshot: Option<&[crate::secrets::SecretEntry]>,
     redactions: Vec<(String, String)>,
     real_system: Vec<crate::codec::ir::IrBlock>,
-    audit_capture: bool,
+    capture_mode: crate::config::AuditCaptureMode,
 ) -> CallEvent {
     let (preview, model) = match ir {
         Some(ir) => crate::derive::extract_preview_and_model_from_ir(ir),
@@ -710,11 +712,13 @@ pub(super) fn build_call_event(
         // round_kind 占位值 (Normal); push_messages 内按 split_at 修正 (全前缀重复 → Retry).
         round_kind: crate::dag::RoundKind::Normal,
         redactions: std::sync::Arc::from(redactions),
-        // B2 audit_capture: off 时不保留请求 body 快照 (内存主因) — 决策记录
-        // 在案, 响应侧 attach + WebUI "未捕获" 标记都读这个快照.
-        audit_captured: audit_capture,
-        // off → 空串 (preview/model 已派生, req_text 就地丢弃); on → 完整快照.
-        req_body_raw: if audit_capture {
+        // B2 audit_capture: 三态快照记录在案 — 响应侧 attach 决策
+        // (errors 回收) + WebUI "未捕获" 标记都读这个快照.
+        capture_mode,
+        // Off → 空串 (preview/model 已派生, req_text 就地丢弃); Errors → 在途
+        // 暂存 (成功后 attach 回收); Full → 完整快照. 决策 SSOT:
+        // `AuditCaptureMode::capture_req`.
+        req_body_raw: if capture_mode.capture_req() {
             req_text
         } else {
             String::new()
@@ -1425,7 +1429,7 @@ mod tests {
             upstream_id: std::sync::Arc::from("test"),
             redactions: std::sync::Arc::from([]),
             upstream_model: None,
-            audit_captured: true,
+            capture_mode: crate::config::AuditCaptureMode::Full,
         };
         let id = dag.push_messages(vec![], event);
         let mut ps = ParsedSync::new(crate::codec::Protocol::OpenAIResponses, dag.clone(), id);

@@ -1689,7 +1689,13 @@
     <span class="toolbar">
       <span><span id="count">0</span> <span id="count-label">sessions</span></span>
       <span id="status"></span>
-      <label title="开启后新请求将记录完整请求/响应内容, 便于排障; 关闭时节省内存。仅影响开启后的新请求。"><input type="checkbox" id="audit-capture"> 详细日志</label>
+      <label title="详细日志: 关闭=极致省内存; 仅错误=只保留失败请求的完整 body (排障推荐); 全部=全量保留。仅影响之后的新请求。">详细日志
+        <select id="audit-capture">
+          <option value="off">关闭</option>
+          <option value="errors">仅错误</option>
+          <option value="full">全部</option>
+        </select>
+      </label>
       <div class="theme-switch" id="theme-switch" role="group" aria-label="主题">
         <button type="button" data-theme-val="auto" title="跟随系统主题">🌓</button>
         <button type="button" data-theme-val="light" title="亮色">☀</button>
@@ -6421,21 +6427,22 @@
     //   setStatus 错误 + checkbox 回滚 (服务端 "先持久化再更新内存" 契约保证
     //   PUT 失败 = 状态未变); 请求在途 disabled, 天然串行化连点.
     (async function initAuditCapture() {
-      const cb = document.getElementById('audit-capture');
-      if (!cb) return;
-      // change listener 必须在初始 GET 之后注册: 若提前, GET 在途时的点击会触发
-      // 并发 PUT, GET 响应 (携带点击前的旧值) 晚于 PUT ack 落地时会把 UI 覆写回
+      const sel = document.getElementById('audit-capture');
+      if (!sel) return;
+      const MODE_LABEL = { off: '关闭', errors: '仅错误', full: '全部' };
+      // change listener 必须在初始 GET 之后注册: 若提前, GET 在途时的切换会触发
+      // 并发 PUT, GET 响应 (携带切换前的旧值) 晚于 PUT ack 落地时会把 UI 覆写回
       // 旧值 → 与服务端错位. 后注册的代价仅是 GET 在途 (~ms 级, 本地不可达窗口)
-      // 的点击被吞并回弹到服务端真值 — 一致性优先.
+      // 的切换被吞并回弹到服务端真值 — 一致性优先.
       try {
         const r = await fetch(API_SETTINGS, { cache: 'no-store' });
-        if (r.ok) cb.checked = (await r.json()).audit_capture === true;
+        if (r.ok) sel.value = (await r.json()).audit_capture;
       } catch (e) {
         console.error('audit-capture init failed:', e);
       }
-      cb.addEventListener('change', async () => {
-        const want = cb.checked;  // 乐观值 (浏览器已切换)
-        cb.disabled = true;
+      sel.addEventListener('change', async () => {
+        const want = sel.value;  // 乐观值 (浏览器已切换)
+        sel.disabled = true;
         try {
           const r = await fetch(API_SETTINGS, {
             method: 'PUT',
@@ -6444,14 +6451,16 @@
           });
           if (!r.ok) throw new Error('HTTP ' + r.status);
           const ack = await r.json();
-          cb.checked = ack.audit_capture === true;
-          setStatus(ack.audit_capture ? '详细日志已开启' : '详细日志已关闭');
+          sel.value = ack.audit_capture;
+          setStatus('详细日志: ' + (MODE_LABEL[ack.audit_capture] || ack.audit_capture));
         } catch (e) {
-          cb.checked = !want;  // 回滚 (服务端内存未变, 见类型文档)
+          // 回滚到切换前的值 (服务端内存未变, 见类型文档)
+          const prev = [...sel.options].find(o => o.defaultSelected)?.value || 'off';
+          sel.value = prev;
           setStatus('详细日志切换失败', 'status-err');
           console.error('audit-capture toggle failed:', e);
         } finally {
-          cb.disabled = false;
+          sel.disabled = false;
         }
       });
     })();

@@ -710,7 +710,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 ### DTO-10 audit_capture_off 标记与未捕获 body 一致性 (B2)
 
-**陈述**: `NodeView.audit_captured` (push 时开关快照) 与 body 存储状态一致: `false` → `req_body_raw` 为空串且 `raw_resp_body` 为空串 (反向不必然 — 流式响应本就不保留 SSE 字节, 与开关正交); `true` → `req_body_raw` 为完整快照 (半捕获撕裂被 CFG-7 的 per-request 原子性排除). 派生消费面: `ForwardRecord.audit_capture_off = !audit_captured` (WebUI raw 弹窗与 usage 审计溯源弹窗的 "未捕获" 占位判据, 优先级高于 streamed 空态提示); `GET /api/records/{id}?view=parsed` 对 off 请求恒 `parsed_request = null` + `parse_error = "req_body not captured (audit_capture off)"` (诚实呈现缺失, 不伪造空对象 — 尊重事实原则). timeline (req_delta_messages / tail) 内容不受开关影响 — B1 起从 BlockPool 派生 (DTO-5), raw body 不是其内容数据源 (唯一残留: `tail.length` 的末级 fallback 在 parsed 缺失场景读 `raw_resp_body.len()`, off 下为 0 — 仅影响 length 数字, 不影响内容渲染).
+**陈述**: `NodeView.audit_retained` (三态决策的最终结果: off 恒 false / full 恒 true / errors = 错误请求 true, 在途未定按 true — 暂存可看) 与 body 存储状态一致: `false` → `req_body_raw` 为空串且 `raw_resp_body` 为空串 (反向不必然 — 流式响应本就不保留 SSE 字节, 与开关正交); `true` → `req_body_raw` 为完整快照 (半捕获撕裂被 CFG-7 的 per-request 原子性排除; errors 档在途窗口的暂存属例外 — attach 时回收). 派生消费面: `ForwardRecord.audit_capture_off = !audit_retained` (WebUI raw 弹窗与 usage 审计溯源弹窗的 "未捕获" 占位判据, 优先级高于 streamed 空态提示); `GET /api/records/{id}?view=parsed` 对未保留请求恒 `parsed_request = null` + `parse_error = "req_body not captured (audit_capture off)"` (诚实呈现缺失, 不伪造空对象 — 尊重事实原则). timeline (req_delta_messages / tail) 内容不受档位影响 — B1 起从 BlockPool 派生 (DTO-5), raw body 不是其内容数据源 (唯一残留: `tail.length` 的末级 fallback 在 parsed 缺失场景读 `raw_resp_body.len()`, 未保留下为 0 — 仅影响 length 数字, 不影响内容渲染).
 
 **Properties**:
 - `prop_audit_capture_off_body_empty_and_marked`: off 请求 (同协议 / 跨协议 / 流式) 转发行为不受影响, record 两侧 body 为空 + `audit_capture_off = true`; on 请求 `audit_capture_off = false`. 🔁→`audit_capture_off_still_forwards_and_marks_uncaptured` + `audit_capture_off_streaming_still_forwards` + `audit_capture_off_cross_proto_marks_uncaptured` (`tests/integration.rs`)
@@ -791,17 +791,19 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 - `prop_prune_dangling_decisions`: 任意 (id 池 × static 存活子集 × 子表归属 × mode) 组合下, prune 清除的恰是全部悬空条目 (有非 Default decision 且不在对应 static 集合), 存活 id 的 decision (mode + 归属) 原样保留. ✅
 - 场景回归: `prune_disabled_secret_id_revive_no_longer_shadowed` (`src/config.rs`) — static id 复活后查询回退 Default (未被残留条目遮蔽). ✅
 
-### CFG-7 audit_capture 持久化与恢复 (B2)
+### CFG-7 audit_capture 持久化与恢复 (B2; 三态扩展 2026-09-24 #273)
 
-**陈述**: 详细日志开关 `audit_capture` 是 DynamicState 顶层动态字段 (state.toml, serde default `false`; **非** `[server]` 静态段, WebUI 经 `PUT /api/settings` 即时切换):
+**陈述**: 详细日志三态开关 `audit_capture` (`off`/`errors`/`full`) 是 DynamicState 顶层动态字段 (state.toml, serde default `off`; 反序列化兼容旧 bool: `false`→off / `true`→full; **非** `[server]` 静态段, WebUI 经 `PUT /api/settings` 即时切换):
 - **写序**: `set_enabled` 先持久化 state.toml (RMW, 与 provider/secret/apikey 表共享 persist_lock) 再更新内存 AtomicBool; 持久化失败时内存保持旧值 (回滚, 与 `DynamicTable::set_decision` 同型 — CFG-4 语义在动态标量字段上的实例).
 - **重启恢复**: 启动时从 state.toml 加载初值; 旧版 state.toml 无此字段 → serde default `false` (不存在 "缺字段启动失败" 或意外开启).
-- **per-request 原子**: push 路径读一次快照进 `CallEvent.audit_captured`, 响应侧 4 个 attach 路径经 `dag.audit_captured_of` 沿用快照 (不重读开关) — 请求在途时切换开关不产生 "req 存了 + resp 空" 或反向的半捕获撕裂.
+- **per-request 原子**: push 路径读一次快照进 `CallEvent.capture_mode`, attach 决策统一收口在 `dag::attach_response` (调用方照填 raw, 不 retain 时在此清除 — 含 errors 档成功请求的在途暂存回收) — 请求在途时切换开关不产生 "req 存了 + resp 空" 或反向的半捕获撕裂. 决策 SSOT: `config::AuditCaptureMode::capture_req` (push) / `retain(is_error)` (attach); 错误判定 `ResponseData::is_error` (error 字段非空或 HTTP 非 2xx).
 
 **Properties**:
-- `prop_audit_capture_persist_failure_keeps_old_memory`: 持久化失败 (目录只读) 时内存保持旧值, 不留半提交状态. 🔁→`audit_capture_set_enabled_failure_keeps_old_memory` (`src/state.rs`)
-- `prop_audit_capture_restart_round_trip`: set_enabled 落盘后, 重启路径 (`load_or_empty` → `new`) 读回同一状态; `PUT /api/settings` 后 state.toml 含新值, 非法 body (非 JSON / 字段类型错 / 缺字段) 统一 400. 🔁→`audit_capture_set_enabled_persists_and_round_trips` (`src/state.rs`) + `audit_capture_settings_api_shape_validation_and_persistence` (`tests/integration.rs`)
-- `prop_audit_capture_legacy_state_defaults_false`: 旧版 state.toml 无 audit_capture 字段 → 加载为 false. 🔁→`audit_capture_old_state_toml_without_field_defaults_false` (`src/state.rs`)
+- `prop_audit_capture_errors_mode_retains_only_failed`: errors 档成功请求 attach 后双侧 body 回收 (未捕获标记 true), 失败请求保留 req_body (排障主力语义). 🔁→`audit_capture_errors_mode_retains_only_failed_requests` (`tests/integration.rs`)
+- `prop_audit_capture_legacy_bool_migrates`: 旧 bool 形态的 state.toml 无损迁移 (false→off / true→full), 不炸启动. 🔁→`audit_capture_legacy_bool_state_toml_migrates` (`src/state.rs`)
+- `prop_audit_capture_persist_failure_keeps_old_memory`: 持久化失败 (目录只读) 时内存保持旧值, 不留半提交状态. 🔁→`audit_capture_set_mode_failure_keeps_old_memory` (`src/state.rs`)
+- `prop_audit_capture_restart_round_trip`: set_mode 落盘后, 重启路径 (`load_or_empty` → `new`) 读回同一档位; `PUT /api/settings` 后 state.toml 含新值 (string 三态), 非法 body (非 JSON / 未知档位 / 缺字段) 统一 400. 🔁→`audit_capture_set_mode_persists_and_round_trips` (`src/state.rs`) + `audit_capture_settings_api_shape_validation_and_persistence` (`tests/integration.rs`)
+- `prop_audit_capture_legacy_state_defaults_false`: 旧版 state.toml 无 audit_capture 字段 → 加载为 off. 🔁→`audit_capture_old_state_toml_without_field_defaults_off` (`src/state.rs`)
 - `prop_audit_capture_inflight_request_keeps_push_decision`: 在途请求的捕获行为由 push 时快照决定 — off→on 切换后, 已 push 的请求仍两侧不捕获; on→off 切换后, 已 push 的请求仍两侧完整捕获. 🔁→`audit_capture_toggle_inflight_request_keeps_push_decision` + `audit_capture_toggle_off_inflight_still_captures_both_sides` (`tests/integration.rs`)
 
 ---

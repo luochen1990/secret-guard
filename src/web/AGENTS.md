@@ -95,8 +95,8 @@ POST   /api/api-keys
 DELETE /api/api-keys/{id}
 PATCH  /api/api-keys/{id}/toggle
 
-GET    /api/settings                → {audit_capture: bool} — 全局设置当前值
-PUT    /api/settings                body {audit_capture: bool} → 200 同 shape
+GET    /api/settings                → {audit_capture: "off"|"errors"|"full"} — 全局设置当前值
+PUT    /api/settings                body {audit_capture: 同上三态 string} (兼容旧 bool) → 200 同 shape
                                           (详细日志开关: 开 = 新请求记录完整
                                            req_body_raw / raw_resp_body; 关 = 极致省内存
                                            (timeline 不受影响, B1 blocks 派生)。per-request
@@ -145,7 +145,7 @@ GET    /api/usage/summary[?hours=N]  → UsageSummary {range, pricing_status, to
 `?view=parsed` 返回 `parsed_request` (从 `req_body` 按需用 ingress codec 解析) +
 `parsed_response` (直接取自 `record.resp_parsed`, 由 proxy 层的 `StreamScan` 在流过程中
 增量累积, 非流式路径在响应完成时一次性计算). Gemini/Ollama 无 codec → `parse_error` + fallback raw.
-audit_capture off 的请求 (B2/B3) parsed_request 恒 null + `record.audit_capture_off = true`
+audit_capture 未保留的请求 (off 档全部 / errors 档成功请求, B2/B3) parsed_request 恒 null + `record.audit_capture_off = true`
 (`parse_error` 报 "req_body not captured...") — WebUI 审计溯源弹窗 (`data-audit-node`,
 判 `record.audit_capture_off`) 与 raw 弹窗同占位文案.
 

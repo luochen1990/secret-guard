@@ -90,8 +90,12 @@ pub(super) fn node_view(inner: &DagInner, node_id: Uuid) -> Option<NodeView> {
         upstream_model: node.event.upstream_model.clone(),
         streamed: resp.as_ref().map(|r| r.streamed).unwrap_or(false),
         resp_complete: resp.as_ref().map(|r| r.resp_complete).unwrap_or(false),
-        // push 时开关快照 (B2): WebUI 经 ForwardRecord.audit_capture_off 消费.
-        audit_captured: node.event.audit_captured,
+        // audit_capture 三态的最终结果 (B2/#273 errors 档): 响应已落地 →
+        // retain(mode, is_error); 在途 (response 未 attach) → 暂存可看, 按 true
+        // (errors 档的回收发生在 attach, 之前的窗口 body 在场).
+        audit_retained: resp
+            .as_ref()
+            .is_none_or(|r| node.event.capture_mode.retain(r.is_error())),
         error: resp.as_ref().and_then(|r| r.error.clone()),
         redactions: Arc::clone(&node.event.redactions),
         // B1 双态单点 (derive::parsed_view): 流式中读 stored, finalize 后派生.

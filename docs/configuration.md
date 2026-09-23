@@ -25,7 +25,7 @@ providers = []            # WebUI fork 出的 dynamic override / dynamic-only �
 secrets = []
 api_keys = []             # WebUI 签发的 API key (存 hash)
 api_keys_disabled = []    # static API key 被禁用的 label 集合 (态度层, 一维)
-audit_capture = false     # 详细日志开关 (WebUI「详细日志」checkbox 写入, 见下方说明)
+audit_capture = "off"     # 详细日志三态 "off"|"errors"|"full" (WebUI「详细日志」下拉写入, 兼容旧 bool)
 
 [decisions.providers]     # 对 static provider id 的三态决策 (态度层):
 "openai-main" = "disabled"   # default (不入表) | prefer_static | disabled
@@ -33,10 +33,12 @@ audit_capture = false     # 详细日志开关 (WebUI「详细日志」checkbox 
 [decisions.secrets]       # 对 static secret id 的三态决策, 同上
 ```
 
-- `audit_capture` (顶层 bool, 默认 `false`): 详细日志开关 — WebUI header 工具栏「详细日志」
-  checkbox 即时切换 (`PUT /api/settings`), 重启保持. off (默认) 时新请求不保留
-  req/resp body 明文 (极致省内存, 会话 timeline 视图不受影响); on 时保留完整 body
-  供 Records 页排障. 旧版 state.toml 无此字段视为 off.
+- `audit_capture` (顶层三态, 默认 `"off"`): 详细日志档位 — WebUI header 工具栏
+  「详细日志」下拉即时切换 (`PUT /api/settings`), 重启保持. off (默认) 时新请求
+  不保留 req/resp body 明文 (极致省内存, 会话 timeline 视图不受影响); errors 时
+  仅**失败请求**保留完整 body (成功请求在途暂存、响应落地后回收 — 排障推荐档);
+  full 时全量保留. 旧版 state.toml 的 bool 形态 (`true`/`false`) 无损迁移为
+  full/off; 无此字段视为 off.
 - 条目**内容**与对条目的**态度**分离存储: disabled 的 static 条目不在上面的
   `providers = []` 数组里 (那里只有 dynamic 层), 它的禁用状态只记录在 `[decisions]` 表.
 - decision=disabled 的条目在 WebUI 的 Secrets / Providers 页以**灰色删除线行**显示,

@@ -66,7 +66,8 @@ async function sendChat(
  * 开/关详细日志 (B2 `PUT /api/settings`)。依赖 raw body 捕获的用例在 sendChat 前
  * 开启 (B2 起默认 off — 未捕获的 record 无 req_body/resp_body 可断言)。
  */
-async function setAuditCapture(page: Page, on: boolean): Promise<void> {
+async function setAuditCapture(page: Page, on: boolean | string): Promise<void> {
+  // `on` 接受 bool (旧调用点, 服务端兼容反序列化) 或三态 string ("off"/"errors"/"full").
   const r = await page.request.put(`${SG_API}/settings`, {
     data: { audit_capture: on },
     headers: { "Content-Type": "application/json" },
@@ -2338,10 +2339,10 @@ test.describe("WebUI 打磨 (#161 + #164)", () => {
 
 // ─── B3: 详细日志开关 (audit capture) + 未捕获占位 ────────────────────────
 //
-// B2 契约: audit_capture 默认 off (省内存) — off 期间的请求 req_body/resp_body
-// 为空, record DTO 带 audit_capture_off=true; UI 开关在 header 工具栏
-// (#audit-capture checkbox, GET/PUT /api/settings). 覆盖:
-//   1. toggle 双向切换 + 初始化同步 (GET → checkbox 镜像服务端值)
+// B2 契约: audit_capture 三态 (off/errors/full, 默认 off 省内存) — 未保留 body 的
+// 请求 req_body/resp_body 为空, record DTO 带 audit_capture_off=true; UI 三态
+// 下拉在 header 工具栏 (#audit-capture select, GET/PUT /api/settings). 覆盖:
+//   1. 三态切换 + 初始化同步 (GET → select 镜像服务端值)
 //   2. off 时 raw 弹窗占位 (优先级高于 streamed 空态 — 非流式请求也占位)
 //   3. off 时 usage 审计溯源弹窗占位 (parsed view, 判据与 raw 弹窗同字段)
 test.describe("B3: 详细日志开关 (audit capture)", () => {
@@ -2350,22 +2351,25 @@ test.describe("B3: 详细日志开关 (audit capture)", () => {
     await page.waitForLoadState("networkidle");
   });
 
-  test("开关初始化同步 + 双向切换反馈", async ({ page }) => {
-    // 暂停 3s 自动刷新 (sync 成功会清空 #status) — toggle 反馈是一次性文本,
+  test("三态切换 + 初始化同步反馈", async ({ page }) => {
+    // 暂停 3s 自动刷新 (sync 成功会清空 #status) — 切换反馈是一次性文本,
     // 否则断言与轮询 tick 存在负载相关的清空竞态 (CI 慢机 ~3% flake).
     await page.locator("#auto").uncheck();
-    // 初始 unchecked 的保证: grep 单跑 = state 全新 (mkdtemp) 默认 off; 全量跑 =
-    // 文件级 afterEach 卫生钩子恢复 off. 两种场景下 checkbox 都镜像服务端 off.
-    const cb = page.locator("#audit-capture");
-    await expect(cb).not.toBeChecked();
-    // 点击 → PUT 成功 → 状态更新 + #status 轻反馈.
-    await cb.check();
-    await expect(cb).toBeChecked();
-    await expect(page.locator("#status")).toContainText("详细日志已开启");
-    // 双向: 再点回 off (PUT false 路径).
-    await cb.uncheck();
-    await expect(cb).not.toBeChecked();
-    await expect(page.locator("#status")).toContainText("详细日志已关闭");
+    // 初始 off 的保证: grep 单跑 = state 全新 (mkdtemp) 默认 off; 全量跑 =
+    // 文件级 afterEach 卫生钩子恢复 off. 两种场景下 select 都镜像服务端 off.
+    const sel = page.locator("#audit-capture");
+    await expect(sel).toHaveValue("off");
+    // 切 errors → PUT 成功 → 状态更新 + #status 轻反馈 (#273 评论需求档).
+    await sel.selectOption("errors");
+    await expect(sel).toHaveValue("errors");
+    await expect(page.locator("#status")).toContainText("详细日志: 仅错误");
+    // 切 full 再回 off (双向 + 全值域).
+    await sel.selectOption("full");
+    await expect(sel).toHaveValue("full");
+    await expect(page.locator("#status")).toContainText("详细日志: 全部");
+    await sel.selectOption("off");
+    await expect(sel).toHaveValue("off");
+    await expect(page.locator("#status")).toContainText("详细日志: 关闭");
   });
 
   test("audit_capture off 时 raw 弹窗显示未捕获占位", async ({ page }) => {

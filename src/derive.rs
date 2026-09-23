@@ -611,11 +611,12 @@ pub(crate) fn parsed_view(
 /// req_delta 恒空 (same_proto_passthrough / 无 codec 降级均推 `vec![]`),
 /// count>0 + 无协议是 fixture-only 的矛盾态, 两路径对它的输出定义不同
 /// (blocks 路径返回空更安全: passthrough raw 是未 redact 的客户端原始字节).
-/// 跳过 (B2): `audit_captured == false` 的请求 — req_body_raw 未存储 (空串),
+/// 跳过 (B2): req_body_raw 未存储 (空串) 的请求 — off 档 / errors 档成功回收,
 /// oracle 无数据源; on 的请求守卫行为不变.
 #[cfg(feature = "consistency-check")]
 pub(crate) fn assert_delta_view_matches_raw(node: &crate::dag::Node, pool: &crate::dag::BlockPool) {
-    if node.event.ingress_protocol.is_none() || !node.event.audit_captured {
+    // gate = raw 是否在场 (off 档 / errors 档成功回收后均为空串, oracle 无源).
+    if node.event.ingress_protocol.is_none() || node.event.req_body_raw.is_empty() {
         return;
     }
     // 畸形边界跳过 (known-limitations "derive" 节, 仅 OpenAI): OpenAI 请求含多条
@@ -1182,7 +1183,7 @@ mod tests {
             upstream_id: Arc::from("test"),
             redactions: Arc::from([]),
             upstream_model: None,
-            audit_captured: true,
+            capture_mode: crate::config::AuditCaptureMode::Full,
         };
         // req_delta 用任意 MessageRef 填充到 count 长度 — 内容不重要, 只用 len().
         let dummy_ref = crate::dag::MessageRef {
@@ -1932,7 +1933,7 @@ mod tests {
             upstream_id: Arc::from("eq"),
             redactions: Arc::from(redactions),
             upstream_model: None,
-            audit_captured: true,
+            capture_mode: crate::config::AuditCaptureMode::Full,
         };
         Some((dag.push_messages(real_messages, event), raw))
     }

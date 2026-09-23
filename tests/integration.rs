@@ -14,6 +14,7 @@
 
 use std::time::Duration;
 
+use secret_guard::config::AuditCaptureMode;
 use secret_guard::{
     dag::ConversationDag,
     provider::{
@@ -335,7 +336,9 @@ fn base_app_state(
         // off (DynamicState.audit_capture serde default false, 省内存新默认) —
         // harness 与生产默认的这处差异是**有意**的; off 语义由 audit_capture
         // 集成测试段显式构造覆盖 (经 PUT /api/settings 切换).
-        audit_capture: secret_guard::state::AuditCapture::for_tests(true),
+        audit_capture: secret_guard::state::AuditCapture::for_tests(
+            secret_guard::config::AuditCaptureMode::Full,
+        ),
     }
 }
 
@@ -564,7 +567,7 @@ fn dag_list_forward_records(dag: &ConversationDag) -> Vec<ForwardRecord> {
                 resp_complete: view.resp_complete,
                 error: view.error,
                 redactions: view.redactions.to_vec(),
-                audit_capture_off: !view.audit_captured,
+                audit_capture_off: !view.audit_retained,
             })
         })
         .collect()
@@ -10028,7 +10031,7 @@ async fn model_rewrite_response_stays_byte_exact_streaming() {
 /// AuditCapture 与 provider table 共享同一 state 文件 (模拟生产装配).
 /// `dag` 由调用方传入 (clone 保留 probe handle 供 DAG 层断言).
 async fn spawn_proxy_with_audit_capture(
-    enabled: bool,
+    mode: secret_guard::config::AuditCaptureMode,
     providers: Vec<Provider>,
     secrets: SecretTable,
     dag: ConversationDag,
@@ -10049,7 +10052,7 @@ async fn spawn_proxy_with_audit_capture(
     );
     let proxy = AppState {
         audit_capture: secret_guard::state::AuditCapture::new(
-            enabled,
+            mode,
             state_path.clone(),
             persist_lock,
         ),
@@ -10084,7 +10087,7 @@ async fn audit_capture_off_still_forwards_and_marks_uncaptured() {
     let dag = ConversationDag::new(64, 500, 1);
     let dag_probe = dag.clone();
     let (proxy_url, _state_path) = spawn_proxy_with_audit_capture(
-        false,
+        secret_guard::config::AuditCaptureMode::Off,
         vec![openai_provider("oa", &upstream.url())],
         test_secret_table_with(vec![secret("tok", "sk-live-abcdef123456")]),
         dag,
@@ -10113,7 +10116,10 @@ async fn audit_capture_off_still_forwards_and_marks_uncaptured() {
     let resp = dag_probe.get_response(id).unwrap();
 
     // 未捕获: raw 双侧为空 + 标记 true.
-    assert!(!view.audit_captured, "audit_captured snapshot is false");
+    assert!(
+        !view.audit_retained,
+        "audit_retained is false for off-mode request"
+    );
     assert!(
         detail.req_body_raw.is_empty(),
         "req_body_raw not stored when off"
@@ -10153,8 +10159,93 @@ async fn audit_capture_off_still_forwards_and_marks_uncaptured() {
         err.contains("not captured"),
         "parse_error explains uncaptured, got: {err}"
     );
+
     // parsed_response 不受影响 (message + 元字段派生).
     assert!(v["parsed_response"]["choices"].is_array(), "parsed intact");
+}
+
+/// ①-bis (#273 errors 档): 在途暂存语义 — 成功请求 attach 后回收 (双侧空 +
+/// 未捕获标记), 失败请求保留 (req_body_raw 至少保留; 上游错误 body 若被记录
+/// 也保留), 决策沿用 push 快照 (在途切 off 不影响已 push 的请求).
+#[tokio::test]
+async fn audit_capture_errors_mode_retains_only_failed_requests() {
+    // 双 upstream 双 provider (免 body matcher — mockito Matcher 不入 json! 宏):
+    // oa-ok 恒 200, oa-err 恒 500 (带错误响应体, 排障线索).
+    let mut ok_upstream = spawn_mock_upstream().await;
+    let _ok = ok_upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"cc-ok","object":"chat.completion","created":1700000000,"model":"gpt-x","choices":[{"index":0,"message":{"role":"assistant","content":"fine"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}"#)
+        .create_async()
+        .await;
+    let mut err_upstream = spawn_mock_upstream().await;
+    let _err = err_upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(500)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"error":{"message":"upstream exploded","type":"server_error"}}"#)
+        .create_async()
+        .await;
+
+    let dag = ConversationDag::new(64, 500, 1);
+    let dag_probe = dag.clone();
+    let (proxy_url, _sp) = spawn_proxy_with_audit_capture(
+        AuditCaptureMode::Errors,
+        vec![
+            openai_provider("oa-ok", &ok_upstream.url()),
+            openai_provider("oa-err", &err_upstream.url()),
+        ],
+        test_secret_table(),
+        dag,
+    )
+    .await;
+
+    // 成功请求: attach 后在途暂存被回收.
+    let (s, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-ok/v1/chat/completions",
+        r#"{"model":"gpt-x","messages":[{"role":"user","content":"ok-marker"}]}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(s, reqwest::StatusCode::OK);
+    let ok_id = dag_probe.list_node_ids_newest_first()[0];
+    let ok_detail = dag_probe.get_node_detail(ok_id).unwrap();
+    let ok_view = dag_probe.get_node(ok_id).unwrap();
+    assert!(
+        ok_detail.req_body_raw.is_empty(),
+        "errors mode recycles req body of successful request at attach"
+    );
+    assert!(!ok_view.audit_retained, "successful request not retained");
+    assert!(ok_view.preview.is_some(), "preview still derived at push");
+
+    // 失败请求: 保留 (排障主力场景).
+    let (s, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-err/v1/chat/completions",
+        r#"{"model":"gpt-x","messages":[{"role":"user","content":"err-marker"}]}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(s, reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+    let err_id = dag_probe.list_node_ids_newest_first()[0];
+    let err_detail = dag_probe.get_node_detail(err_id).unwrap();
+    let err_view = dag_probe.get_node(err_id).unwrap();
+    assert!(
+        !err_detail.req_body_raw.is_empty(),
+        "failed request keeps req body for troubleshooting"
+    );
+    assert!(err_view.audit_retained, "failed request retained");
+    // GET /records: 失败请求未带 off 标记 (有内容可看).
+    let v = api_get_json(&proxy_url, &format!("/api/records/{err_id}")).await;
+    assert_eq!(v["record"]["audit_capture_off"], serde_json::json!(false));
+    assert!(
+        !v["record"]["req_body"].as_str().unwrap().is_empty(),
+        "record detail exposes captured req body"
+    );
 }
 
 /// ① 流式补充: off + stream=true (fanout_stream_task 骨架路径) — 客户端 SSE
@@ -10175,7 +10266,7 @@ async fn audit_capture_off_streaming_still_forwards() {
         .await;
 
     let (proxy_url, _state_path) = spawn_proxy_with_audit_capture(
-        false,
+        secret_guard::config::AuditCaptureMode::Off,
         vec![openai_provider("oa-main", &upstream.url())],
         test_secret_table(),
         ConversationDag::new(64, 500, 1),
@@ -10209,7 +10300,7 @@ async fn audit_capture_off_cross_proto_marks_uncaptured() {
     let dag = ConversationDag::new(64, 500, 1);
     let dag_probe = dag.clone();
     let (proxy_url, _state_path) = spawn_proxy_with_audit_capture(
-        false,
+        secret_guard::config::AuditCaptureMode::Off,
         vec![provider_with("xa", Protocol::OpenAI, &upstream.url())],
         test_secret_table(),
         dag,
@@ -10235,7 +10326,7 @@ async fn audit_capture_off_cross_proto_marks_uncaptured() {
     let id = dag_probe.list_node_ids_newest_first()[0];
     let view = dag_probe.get_node(id).unwrap();
     let resp = dag_probe.get_response(id).unwrap();
-    assert!(!view.audit_captured);
+    assert!(!view.audit_retained);
     assert!(
         dag_probe
             .get_node_detail(id)
@@ -10261,21 +10352,27 @@ async fn wait_for_push(dag: &ConversationDag, at_least: usize) {
     }
 }
 
-/// B2 段内小 helper: PUT /api/settings (断言 200 + 回显新值).
-async fn put_settings(proxy_url: &str, v: bool) {
-    let (s, body, _) = proxy_request(
+/// B2 段内小 helper: PUT /api/settings 三态档位 (断言 200 + 回显新值).
+async fn put_settings(proxy_url: &str, m: AuditCaptureMode) {
+    let wire = match m {
+        AuditCaptureMode::Off => r#""off""#,
+        AuditCaptureMode::Errors => r#""errors""#,
+        AuditCaptureMode::Full => r#""full""#,
+    };
+    put_settings_raw(proxy_url, wire).await;
+}
+
+/// [`put_settings`] 的原始 body 变体 (兼容 bool 输入 / 任意 JSON 文本的注入点).
+async fn put_settings_raw(proxy_url: &str, body_val: &str) {
+    let (s, _body, _) = proxy_request(
         proxy_url,
         "PUT",
         "/api/settings",
-        &format!(r#"{{"audit_capture": {v}}}"#),
+        &format!(r#"{{"audit_capture": {body_val}}}"#),
         &[("content-type", "application/json")],
     )
     .await;
     assert_eq!(s, reqwest::StatusCode::OK);
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&body).unwrap()["audit_capture"],
-        serde_json::json!(v)
-    );
 }
 
 /// B2 段内小 helper: GET 任意 /api/* JSON (断言 200).
@@ -10297,7 +10394,7 @@ async fn audit_capture_toggle_inflight_request_keeps_push_decision() {
     let dag = ConversationDag::new(64, 500, 1);
     let dag_probe = dag.clone();
     let (proxy_url, _state_path) = spawn_proxy_with_audit_capture(
-        false,
+        secret_guard::config::AuditCaptureMode::Off,
         vec![openai_provider("oa-main", &upstream_url)],
         test_secret_table_with(vec![secret("tok-i", "sk-live-inflight12345")]),
         dag,
@@ -10321,7 +10418,7 @@ async fn audit_capture_toggle_inflight_request_keeps_push_decision() {
     // 等 push 落地 (node 出现) 再切换 — 轮询而非固定 sleep (CI 负载下 push 可
     // 能 >150ms; PUT 若先于 push 落地, 决策取新值, 断言语义被翻转 → flake).
     wait_for_push(&dag_probe, 0).await;
-    put_settings(&proxy_url, true).await;
+    put_settings(&proxy_url, AuditCaptureMode::Full).await;
 
     let (inflight_status, _, _) = inflight.await.unwrap();
     assert_eq!(inflight_status, reqwest::StatusCode::OK);
@@ -10364,7 +10461,7 @@ async fn audit_capture_toggle_off_inflight_still_captures_both_sides() {
     let dag = ConversationDag::new(64, 500, 1);
     let dag_probe = dag.clone();
     let (proxy_url, _state_path) = spawn_proxy_with_audit_capture(
-        true,
+        secret_guard::config::AuditCaptureMode::Full,
         vec![openai_provider("oa-main", &upstream_url)],
         test_secret_table_with(vec![secret("tok-r", "sk-live-reverse99999")]),
         dag,
@@ -10386,7 +10483,7 @@ async fn audit_capture_toggle_off_inflight_still_captures_both_sides() {
     };
     // push 已落地 (on), 请求在途 — 切换 off (轮询而非 sleep, 防决策翻转 flake).
     wait_for_push(&dag_probe, 0).await;
-    put_settings(&proxy_url, false).await;
+    put_settings(&proxy_url, AuditCaptureMode::Off).await;
 
     let (inflight_status, _, _) = inflight.await.unwrap();
     assert_eq!(inflight_status, reqwest::StatusCode::OK);
@@ -10412,22 +10509,22 @@ async fn audit_capture_toggle_off_inflight_still_captures_both_sides() {
 
 /// ③ settings API: GET shape / PUT 非法 body 400 / PUT 持久化 state.toml
 /// (重启恢复的文件层断言: load_or_empty 读回 — 进程级重启装配由单元测试
-/// `audit_capture_set_enabled_persists_and_round_trips` 覆盖).
+/// `audit_capture_set_mode_persists_and_round_trips` 覆盖).
 #[tokio::test]
 async fn audit_capture_settings_api_shape_validation_and_persistence() {
     let upstream = spawn_mock_upstream().await;
     let (proxy_url, state_path) = spawn_proxy_with_audit_capture(
-        false,
+        secret_guard::config::AuditCaptureMode::Off,
         vec![openai_provider("oa-main", &upstream.url())],
         test_secret_table(),
         ConversationDag::new(64, 500, 1),
     )
     .await;
 
-    // GET: 初始 off.
+    // GET: 初始 off (string 三态 wire 形态).
     assert_eq!(
         api_get_json(&proxy_url, "/api/settings").await["audit_capture"],
-        serde_json::json!(false)
+        serde_json::json!("off")
     );
 
     // PUT 非法 body → 400 (非 JSON / 类型错 / 缺字段).
@@ -10443,12 +10540,15 @@ async fn audit_capture_settings_api_shape_validation_and_persistence() {
         assert_eq!(s, reqwest::StatusCode::BAD_REQUEST, "body {bad:?} → 400");
     }
 
-    // PUT 合法: 200 返回新值 + state.toml 持久化 (重启路径读回同值).
-    put_settings(&proxy_url, true).await;
+    // PUT 合法 (三态): 200 返回新值 + state.toml 持久化 (重启路径读回同值).
+    // 顺带覆盖旧 bool 输入的兼容反序列化 (true → full).
+    put_settings_raw(&proxy_url, "true").await;
+    put_settings(&proxy_url, AuditCaptureMode::Errors).await;
     let state = secret_guard::config::DynamicState::load_or_empty(&state_path, "").unwrap();
-    assert!(
+    assert_eq!(
         state.audit_capture,
-        "state.toml persists audit_capture=true"
+        AuditCaptureMode::Errors,
+        "state.toml persists audit_capture=errors"
     );
 }
 

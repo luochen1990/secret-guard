@@ -91,9 +91,9 @@ fn build_forward_record(
         streamed: view.streamed,
         resp_complete: view.resp_complete,
         error: view.error,
-        // B2: 未捕获标记 (audit_capture off 下的请求) — 前端区分 "空 body"
-        // vs "未捕获" 的契约字段 (off 时 req_body / resp_body 均为空).
-        audit_capture_off: !view.audit_captured,
+        // B2: 未捕获标记 (off 档 / errors 档成功请求) — 前端区分 "空 body"
+        // vs "未捕获" 的契约字段.
+        audit_capture_off: !view.audit_retained,
         // ForwardRecord 持有 Vec (需 Deserialize); 此处从 NodeView 的 Arc 切片
         // 实化一次. build_forward_record 仅用于 GET /records/{id} 详情路径 (非高频).
         redactions: view.redactions.to_vec(),

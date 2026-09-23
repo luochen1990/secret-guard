@@ -211,7 +211,7 @@ pub(crate) async fn same_proto_forward(
         Some(&secrets_snapshot),
         redactions,
         real_system,
-        state.audit_capture.enabled(),
+        state.audit_capture.mode(),
     );
     let (record_id, usage_ctx) = push_event_and_wire_usage(
         &state,
@@ -372,7 +372,7 @@ async fn same_proto_passthrough(
         None,
         vec![],
         vec![],
-        state.audit_capture.enabled(),
+        state.audit_capture.mode(),
     );
     // usage 接线 (SSOT helper, 接线契约见其函数 doc). secrets_snapshot: 入口 1
     // (无 secret) 为空; 入口 2 (secrets 非空但无 codec 降级透传) 为全量快照 —

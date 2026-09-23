@@ -52,6 +52,7 @@
 - **codec → provider**: 仅 Protocol 枚举做 from_native 映射, 纯类型依赖; 长期归宿: 若 codec/provider 拆 crate, Protocol 全局枚举应下沉基础层, 桥接函数自然消失.
 - **config → {auth, provider, secrets}**: AuthConfig/ApiKeyEntry 与 Provider/SecretEntry 均是配置 schema 的组成部分 — static 加载期组合 + validate 钩子调用, 纯数据依赖; provider/secrets 同 auth 型, 走查补登记.
 - **dag → codec**: IrBlock 是内容寻址单元, 纯类型依赖; 另 dag/types 的 `ingress_protocol` 字段引用 codec::Protocol 枚举, 同性质.
+- **dag → config (类型)**: #273 errors 档 — `CallEvent.capture_mode` 引用 `config::AuditCaptureMode` (纯数据 enum + 纯函数决策 capture_req/retain, 无 config schema/机制依赖); 与既有 dag→codec 纯类型边同性质.
 - **derive → redact**: B1 timeline blocks 派生 — `rebuild_real_to_mock_pairs` / `apply_real_to_mock_messages(_blocks)` 纯函数借用 (real→mock 替换原语 `replace_in_place` 与 redact_ir_inner 同一实现, 保证派生与当年改写字节等价), 无 redact 状态依赖; 域 B 派生链内横向边, 拒绝以此为先例引入 derive → redact 的行为依赖 (如 StreamingRestorer).
 - **mock ↔ secrets 对称引用**: SecretEntry 持 MockStrategy, mock 校验钩子被 SecretEntry 调用, 纯数据/校验层, 无业务行为.
 - **provider → secrets**: 仅 validate_id/mask_value 两个校验/脱敏工具函数复用, 纯函数借用, 无实体耦合.

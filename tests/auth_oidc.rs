@@ -1477,7 +1477,9 @@ async fn spawn_full_auth_router(secure_cookie: bool) -> (MockIdp, String) {
         usage: std::sync::Arc::new(secret_guard::usage::UsageStore::in_memory()),
         pricing: std::sync::Arc::new(secret_guard::usage::PricingCache::for_tests()),
         // B2: 详细日志开关 (存量行为守卫, 默认 on; 本 harness 不触详细日志语义).
-        audit_capture: secret_guard::state::AuditCapture::for_tests(true),
+        audit_capture: secret_guard::state::AuditCapture::for_tests(
+            secret_guard::config::AuditCaptureMode::Full,
+        ),
     };
 
     // 与生产 serve() 同构: 先 bind listener 拿到实际 port, 再用该 port 构造

@@ -866,11 +866,97 @@ pub struct DynamicState {
     #[serde(default)]
     pub api_keys_disabled: std::collections::HashSet<String>,
 
-    /// 详细日志 (audit capture) 开关, 默认 **false** (省内存). 开 = 新请求记录
-    /// 完整 req_body_raw / raw_resp_body; 关 = 不存 (timeline 不受影响, B1 派生).
-    /// 运行时语义 (per-request 原子) 与切换 API 的 SSOT 见 `state::AuditCapture`.
+    /// 详细日志 (audit capture) 三态, 默认 **off** (省内存). 值域与语义见
+    /// [`AuditCaptureMode`]; 运行时语义 (per-request 原子) 与切换 API 的 SSOT
+    /// 见 `state::AuditCapture`.
     #[serde(default)]
-    pub audit_capture: bool,
+    pub audit_capture: AuditCaptureMode,
+}
+
+/// 详细日志 (audit capture) 的三态档位 (#273 评论需求, 2026-09-24).
+///
+/// - `Off`: 不存 req_body_raw / raw_resp_body (内存最优, timeline 不受影响 —
+///   B1 blocks 派生).
+/// - `Errors`: **在途暂存** — push 时照存 req_body_raw, 响应落地后成功请求
+///   清除、**仅错误请求保留** (req + resp 双侧). 排障场景 90% 只关心失败请求,
+///   正常请求的巨型 agent 上下文不占稳态内存. 稳态 = 在途 + 错误请求的 body.
+/// - `Full`: 全量保留 (原 bool `true` 语义).
+///
+/// 决策函数 ([`Self::capture_req`] / [`Self::retain`]) 是 push / attach 两侧的
+/// SSOT; 错误判定 (`ResponseData::is_error`) 在 dag 层.
+///
+/// serde: 序列化输出规范 string (`"off"/"errors"/"full"`); 反序列化**兼容旧 bool**
+/// (`false` → Off, `true` → Full) — 升级前写入 state.toml 的 bool 值无缝迁移,
+/// 不炸启动 (state.toml "永远可删除重置", 但能便宜兼容就不强迫用户删).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AuditCaptureMode {
+    #[default]
+    Off,
+    Errors,
+    Full,
+}
+
+impl AuditCaptureMode {
+    /// push 侧决策: 请求 body 是否入存储. Off 丢弃; Errors 暂存 (成败未知);
+    /// Full 保留.
+    pub fn capture_req(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// attach 侧决策 (响应落地后): body 是否最终保留. Errors 档仅错误请求保留 —
+    /// 成功请求的在途暂存在此回收 (清空).
+    pub fn retain(self, is_error: bool) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Errors => is_error,
+            Self::Full => true,
+        }
+    }
+
+    /// serde 输入 (state.toml / PUT /api/settings): string 三态或旧 bool.
+    fn parse_de<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = AuditCaptureMode;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(r#""off" / "errors" / "full" (兼容旧 bool)"#)
+            }
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
+                Ok(if v {
+                    AuditCaptureMode::Full
+                } else {
+                    AuditCaptureMode::Off
+                })
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                match v {
+                    "off" => Ok(AuditCaptureMode::Off),
+                    "errors" => Ok(AuditCaptureMode::Errors),
+                    "full" => Ok(AuditCaptureMode::Full),
+                    other => Err(E::custom(format!(
+                        "unknown audit_capture mode '{other}' (expect off/errors/full)"
+                    ))),
+                }
+            }
+        }
+        de.deserialize_any(V)
+    }
+}
+
+impl Serialize for AuditCaptureMode {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(match self {
+            Self::Off => "off",
+            Self::Errors => "errors",
+            Self::Full => "full",
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for AuditCaptureMode {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        Self::parse_de(de)
+    }
 }
 
 impl DynamicState {
