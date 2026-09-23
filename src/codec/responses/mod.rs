@@ -260,7 +260,7 @@ impl Writer for ResponsesWriter {
     }
 
     fn upstream_path(&self) -> &'static str {
-        "/v1/responses"
+        "/responses"
     }
 
     fn write_request(&self, req: &IrRequest) -> Value {

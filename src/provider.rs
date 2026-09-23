@@ -214,15 +214,17 @@ pub struct Endpoint {
     pub protocol: Protocol,
     /// 该端点的上游 base URL, 末尾**不带** `/`. 通过 [`validate_base_url`] 校验.
     pub base_url: String,
-    /// 该端点的 secret-guard **自建请求** (fetch_model_list — router /models 本地
-    /// 合成拉上游清单) 的公共 URI 前缀, 亦即三段式 `base_url + common_uri +
-    /// request_uri` 的中段. **不影响转发** — 转发的 request_uri 随客户端请求
-    /// rest 原样流过.
+    /// 该端点的公共 URI 前缀 — 三段式 `base_url + common_uri + request_uri`
+    /// 的中段, 两个消费面: ① secret-guard 自建请求 (fetch_model_list —
+    /// router /models 本地合成拉上游清单); ② **跨协议翻译的出站 URL**
+    /// (`effective_common_uri`, #260 — 版本前缀已含的上游不再拼出双版本段).
+    /// 同协议透传不受影响 — 转发的 request_uri 随客户端请求 rest 原样流过.
     ///
     /// 值语义: `"/v1"` = 裸根布局 (OpenAI/Anthropic 官方形态, base 不含版本前缀);
     /// `""` = 版本前缀已含布局 (智谱 coding plan / DeepSeek / Moonshot 等国产系,
-    /// models 端点 = `base + /models`); `None` (字段缺席) = 未探测, fetch 侧用
-    /// 候选序列现场推导 (`proxy::models::V1_COMMON_URIS`).
+    /// models 端点 = `base + /models`); `None` (字段缺席) = 未探测 — fetch 侧用
+    /// 候选序列现场推导 (`proxy::models::V1_COMMON_URIS`), 翻译侧用 base 尾段
+    /// 启发式 (`effective_common_uri` 的兜底分支).
     ///
     /// 知识来源: WebUI detect 探测 (`POST /api/providers/probe` 响应的
     /// `common_uri`) 自动填充, 随表单保存落盘; 手写 toml 可显式声明. base_url
@@ -232,6 +234,31 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
+    /// 翻译出站三段式 (`base_url + common_uri + request_uri`) 的**中段**:
+    /// 跨协议翻译构造上游 URL 时使用 (同协议透传不经过此方法 — rest 原样语义).
+    ///
+    /// 推导序: 显式 [`Endpoint::common_uri`] (detect 探测/手写固化的布局断言)
+    /// 直通; 非法值 (手改 state.toml 绕过 validate, 与 `proxy::models` 的
+    /// `common_uri_candidates` 同款防御) 与缺省 (None, 未探测) 落启发式 —
+    /// base_url path 尾段形如 `/vN` (纯数字版本号) 视为**版本前缀已含**布局
+    /// (智谱 coding plan / DeepSeek / Moonshot / opencode zen), 否则按
+    /// OpenAI/Anthropic 官方**裸根**布局补 `"/v1"`.
+    ///
+    /// 为何启发式而非试错: fetch 侧 (models.rs) 拉清单有懒回退候选序
+    /// (`V1_COMMON_URIS`), 但翻译路径一次请求只能打一个 URL, 不能试错 —
+    /// 取最优单点猜测. **刻意不消费** `CacheEntry.common_uri_hit` (fetch 域
+    /// 的 TTL 运行时知识, 不耦合转发链 — 行为分叉的残余场景: base 尾段
+    /// `/vN` 但上游实际挂载在 `base + /v1/...` 的罕见网关形态, 显式
+    /// common_uri 是稳定逃生口). 首选永远是显式声明 (detect 或手写),
+    /// 启发式仅兜底未探测端点 (旧行为恒 `"/v1"`, 对版本段已含的国产系
+    /// 上游拼出双版本段 404, #260).
+    pub(crate) fn effective_common_uri(&self) -> &str {
+        self.common_uri
+            .as_deref()
+            .filter(|cu| is_valid_common_uri_shape(cu))
+            .unwrap_or_else(|| heuristic_common_uri(&self.base_url))
+    }
+
     /// 测试便捷构造 (common_uri = None 未探测形态). 跨模块统一口径
     /// (provider / proxy::models / config 的测试共用), 先例同
     /// `mock::assert_no_c5_substring`.
@@ -242,6 +269,28 @@ impl Endpoint {
             base_url: base_url.into(),
             common_uri: None,
         }
+    }
+}
+
+/// common_uri 值域形状判定 (合法: `""` 或 `/` 开头) — validate 的运行时
+/// 防御面 SSOT, 消费点: [`Endpoint::effective_common_uri`] (翻译出站) 与
+/// `proxy::models::common_uri_candidates` (fetch 候选头) 必须共用同一谓词,
+/// 单侧演进会静默分叉 (先例: 本仓 AGENTS.md 对 tools.dns 管线的同款治理).
+pub(crate) fn is_valid_common_uri_shape(cu: &str) -> bool {
+    cu.is_empty() || cu.starts_with('/')
+}
+
+/// base_url 未声明 common_uri 时的布局启发: 尾段 (最后一个 path 段) 是纯
+/// 数字版本号 (`v1` / `v4` / `v2` …) → 版本前缀已含 (`""`); 其余 (裸根 /
+/// `anthropic` / `zen` 后跟无版本 / `v1beta` 非纯数字 / 带端口 host) →
+/// 官方裸根布局 (`"/v1"`). 供 [`Endpoint::effective_common_uri`] 兜底.
+fn heuristic_common_uri(base_url: &str) -> &'static str {
+    let last_seg = base_url.rsplit('/').next().unwrap_or("");
+    let version = last_seg.strip_prefix('v').unwrap_or("");
+    if !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit()) {
+        ""
+    } else {
+        "/v1"
     }
 }
 
@@ -1370,6 +1419,84 @@ mod tests {
 
     use crate::config::Decisions;
     use crate::pool::PoolStates;
+
+    /// #260: effective_common_uri — 翻译出站三段式中段的推导矩阵.
+    /// 显式值直通 (detect/手写的布局断言); 非法值 (手改 state.toml 绕过
+    /// validate, 与 models.rs 的 common_uri_candidates 同款防御) 回退启发式;
+    /// 缺省按 base_url 尾段启发: `/vN` 结尾 = 版本前缀已含 (""), 否则按
+    /// OpenAI/Anthropic 官方裸根布局 ("/v1").
+    #[test]
+    fn effective_common_uri_matrix() {
+        let cases: &[(Protocol, &str, Option<&str>, &str)] = &[
+            // 显式布局断言直通 (三种合法值)
+            (
+                Protocol::OpenAI,
+                "https://api.openai.com",
+                Some("/v1"),
+                "/v1",
+            ),
+            (
+                Protocol::OpenAI,
+                "https://open.bigmodel.cn/api/coding/paas/v4",
+                Some(""),
+                "",
+            ),
+            (
+                Protocol::OpenAI,
+                "https://example.com",
+                Some("/api/paas/v4"),
+                "/api/paas/v4",
+            ),
+            // 显式值非法 (无前导 '/', 绕过 validate 的脏 state) → 回退启发式
+            (
+                Protocol::OpenAI,
+                "https://api.openai.com",
+                Some("v1"),
+                "/v1",
+            ),
+            // 缺省 (None) 启发式: 尾段 /vN → 版本已含
+            (Protocol::OpenAI, "https://opencode.ai/zen/v1", None, ""),
+            (
+                Protocol::OpenAI,
+                "https://open.bigmodel.cn/api/coding/paas/v4",
+                None,
+                "",
+            ),
+            (Protocol::OpenAI, "https://api.deepseek.com/v1", None, ""),
+            (Protocol::OpenAI, "https://api.moonshot.cn/v1", None, ""),
+            (
+                Protocol::Anthropic,
+                "https://api.anthropic.com",
+                None,
+                "/v1",
+            ),
+            (
+                Protocol::Anthropic,
+                "https://open.bigmodel.cn/api/anthropic",
+                None,
+                "/v1",
+            ),
+            (Protocol::OpenAI, "https://api.openai.com/v1", None, ""),
+            // 启发式边界: 尾段非纯数字版本 (v1beta / v / host / 带端口) → "/v1"
+            (
+                Protocol::OpenAI,
+                "https://gemini.example.com/v1beta",
+                None,
+                "/v1",
+            ),
+            (Protocol::OpenAI, "https://api.openai.com/v", None, "/v1"),
+            (Protocol::OpenAI, "https://api.openai.com", None, "/v1"),
+            (Protocol::OpenAI, "http://localhost:8080", None, "/v1"),
+        ];
+        for (proto, base, cu, want) in cases {
+            let ep = Endpoint {
+                protocol: *proto,
+                base_url: (*base).into(),
+                common_uri: cu.map(str::to_string),
+            };
+            assert_eq!(ep.effective_common_uri(), *want, "base={base} cu={cu:?}");
+        }
+    }
 
     /// 测试便捷: Direct 负载首端点的 base_url (p() 家族恒构造单端点;
     /// 空表 panic = 测试构造 bug, 不是被测行为).

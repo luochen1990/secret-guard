@@ -128,7 +128,10 @@ pub trait Writer: Send + Sync {
     /// 协议名 (用于日志与错误消息).
     fn name(&self) -> &'static str;
 
-    /// 上游 path (OpenAI `/v1/chat/completions`, Anthropic `/v1/messages`).
+    /// 上游 request_uri (三段式 `base_url + common_uri + request_uri` 的尾段,
+    /// 不含版本前缀: OpenAI `/chat/completions`, Anthropic `/messages`,
+    /// Responses `/responses`) — 版本前缀由端点布局决定 (端点的
+    /// `effective_common_uri` 推导, 见 `provider::Endpoint`, #260).
     fn upstream_path(&self) -> &'static str;
 
     /// [`IrRequest`] → 请求 body (JSON).

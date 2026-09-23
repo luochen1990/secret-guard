@@ -298,7 +298,7 @@ impl Writer for OpenAiWriter {
     }
 
     fn upstream_path(&self) -> &'static str {
-        "/v1/chat/completions"
+        "/chat/completions"
     }
 
     fn write_request(&self, req: &IrRequest) -> Value {

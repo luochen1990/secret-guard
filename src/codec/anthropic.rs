@@ -319,7 +319,7 @@ impl Writer for AnthropicWriter {
     }
 
     fn upstream_path(&self) -> &'static str {
-        "/v1/messages"
+        "/messages"
     }
 
     fn write_request(&self, req: &IrRequest) -> Value {

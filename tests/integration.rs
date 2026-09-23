@@ -1196,6 +1196,102 @@ async fn cross_protocol_translates_tools_and_tool_use_round_trip() {
     assert!(resp_body.contains("It's sunny in SF"), "got: {resp_body}");
 }
 
+/// #260: 跨协议翻译出站 URL 必须感知端点布局 — base_url 已含版本段时
+/// (智谱 coding plan / DeepSeek / Moonshot / opencode zen 等 "版本前缀已含"
+/// 布局), 不能再追加硬编码的 "/v1" (双版本段 404). 三段式
+/// `base + common_uri + request_uri` 的中段来源:
+///   ① 显式 `Endpoint.common_uri` (detect 探测/手写固化的布局断言);
+///   ② 缺省 (None, 未探测) 时启发式 — base_url path 尾段形如 `/vN` 视为
+///      版本前缀已含 (""), 否则按 OpenAI/Anthropic 官方裸根布局 ("/v1").
+/// 同协议透传不受影响 (rest 原样语义), 现有裸根 mock 测试即其回归.
+async fn cross_protocol_url_layout_case(
+    common_uri: Option<&str>,
+    base_suffix: &str,
+    expected_path: &str,
+) {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", expected_path)
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"x","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+        )
+        .create_async()
+        .await;
+    let mut provider = provider_with(
+        "ver-main",
+        Protocol::OpenAI,
+        &format!("{}{}", upstream.url(), base_suffix),
+    );
+    if let ProviderKind::Direct(d) = &mut provider.kind {
+        d.endpoints[0].common_uri = common_uri.map(str::to_string);
+    }
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+    // anthropic 入口 (egress 端点无 anthropic → 首端点跨协议翻译)
+    let body =
+        r#"{"model":"claude-x","max_tokens":16,"messages":[{"role":"user","content":"Hi"}]}"#;
+    let (status, resp_body, _) =
+        proxy_request(&proxy_url, "POST", "/a/ver-main/v1/messages", body, &[]).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {resp_body}");
+}
+
+#[tokio::test]
+async fn cross_protocol_url_versioned_base_uses_heuristic() {
+    // common_uri=None (未探测) + base 尾段 /v1 → 启发式判 "版本前缀已含",
+    // 出站 = base + /chat/completions (旧行为 base + /v1/chat/completions 双版本段 404).
+    cross_protocol_url_layout_case(None, "/zen/v1", "/zen/v1/chat/completions").await;
+}
+
+#[tokio::test]
+async fn cross_protocol_url_explicit_empty_common_uri_wins() {
+    // 显式 "" (布局断言) 直通 — 出站不追加任何版本前缀.
+    cross_protocol_url_layout_case(
+        Some(""),
+        "/api/coding/paas/v4",
+        "/api/coding/paas/v4/chat/completions",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn cross_protocol_url_explicit_custom_prefix_common_uri_wins() {
+    // 自定义前缀 (智谱老接口 /api/paas/v4 形态): 裸根 base + 前缀 + request_uri.
+    cross_protocol_url_layout_case(Some("/api/paas/v4"), "", "/api/paas/v4/chat/completions").await;
+}
+
+#[tokio::test]
+async fn cross_protocol_url_versioned_base_anthropic_egress() {
+    // anthropic-egress 方向的版本段 base (三 codec 尾段化各有集成锚点):
+    // openai ingress → anthropic egress, base 尾段 /v1 → base + /messages.
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/zen/v1/messages")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"msg_x","type":"message","role":"assistant","content":[{"type":"text","text":"OK"}],"model":"claude","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}"#,
+        )
+        .create_async()
+        .await;
+    let provider = provider_with(
+        "ver-anth",
+        Protocol::Anthropic,
+        &format!("{}/zen/v1", upstream.url()),
+    );
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+    let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"}]}"#;
+    let (status, resp_body, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/ver-anth/v1/chat/completions",
+        body,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {resp_body}");
+}
+
 #[tokio::test]
 async fn cross_protocol_translates_upstream_error_to_ingress_envelope() {
     // 上游错误响应应通过 codec 翻译为 ingress 协议 envelope (不泄漏内部细节).

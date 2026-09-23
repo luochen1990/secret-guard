@@ -428,8 +428,9 @@ async fn same_proto_passthrough(
 ///   如 Gemini `?key=...`; 落日志前经 `safe_url_for_log` 脱敏, SEC-C4).
 /// - `path_for_record`: 还原 ingress 侧的完整路径形态 `/{proto}/{name}/{rest}`.
 ///
-/// 刻意不合入 cross_proto: 其 URL 用 egress writer 的固定 `upstream_path()`,
-/// record path 带 `[a → b]` 协议尾注 (语义不同).
+/// 刻意不合入 cross_proto: 其 URL 用三段式布局推导
+/// (`base + effective_common_uri + upstream_path()`), record path 带
+/// `[a → b]` 协议尾注 (语义不同).
 fn same_proto_upstream_url_and_path(
     endpoint: &Endpoint,
     fp: &super::ForwardPath,

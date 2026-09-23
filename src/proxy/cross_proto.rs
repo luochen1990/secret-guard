@@ -139,8 +139,17 @@ pub(crate) async fn cross_proto_forward(
     let egress_bytes = serde_json::to_vec(&egress_body_value)
         .map_err(|e| AppError::Internal(format!("serialize egress body failed: {e}")))?;
 
-    // 9. 构造上游 URL (egress writer 的固定 path; base 来自选定端点).
-    let upstream_url = format!("{}{}", endpoint.base_url, egress_writer.upstream_path());
+    // 9. 构造上游 URL: 三段式 `base + effective_common_uri + request_uri`
+    //    (egress writer 的 request_uri 不含版本前缀; 中段由端点布局决定 —
+    //    显式 common_uri 优先, 缺省按 base 尾段启发式, #260: 旧行为硬编码
+    //    "/v1" 前缀对版本段已含的上游 (智谱 coding plan / DeepSeek /
+    //    opencode zen 等) 拼出双版本段 404).
+    let upstream_url = format!(
+        "{}{}{}",
+        endpoint.base_url,
+        endpoint.effective_common_uri(),
+        egress_writer.upstream_path()
+    );
 
     // 10. 复制请求 headers + 应用 egress 协议的 auth.
     let mut fwd_headers = sanitize_request_headers(&parts.headers);

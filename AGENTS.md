@@ -28,7 +28,7 @@
 | 规范术语 | 定义 | 常见异名 | 归属层 |
 |---|---|---|---|
 | **Bubble** | 前端 timeline 中渲染的单条消息气泡 (= 1 个 IR message) | 气泡、消息块、消息项 | web/index.html |
-| **Common URI** | secret-guard 自建请求 (fetch_model_list) 的公共 URI 前缀 — 三段式 `base_url + common_uri + request_uri` 的中段. 值域: `"/v1"` 裸根布局 / `""` 版本前缀已含 (智谱等国产系) / 缺省未探测 (fetch 按 `V1_COMMON_URIS` 顺序懒回退现场推导). 持久化在 `Endpoint.common_uri` (per-endpoint; Detect 探测自动填充, WebUI 端点行 badge 回显), **不影响转发** (转发 rest 原样流过). 运行时记忆在 `CacheEntry.common_uri_hit` | common_uri、版本前缀、布局前缀 | provider/proxy |
+| **Common URI** | 端点的公共 URI 前缀 — 三段式 `base_url + common_uri + request_uri` 的中段, 两个消费面: ① fetch_model_list (router /models 本地合成拉上游清单); ② 跨协议翻译的出站 URL (`Endpoint::effective_common_uri`, #260 — 显式值直通, 缺省按 base 尾段启发式). 同协议透传不受影响 (转发 rest 原样流过). 值域: `"/v1"` 裸根布局 / `""` 版本前缀已含 (智谱等国产系) / 缺省未探测 (fetch 按 `V1_COMMON_URIS` 顺序懒回退现场推导). 持久化在 `Endpoint.common_uri` (per-endpoint; Detect 探测自动填充, WebUI 端点行 badge 回显), 运行时记忆在 `CacheEntry.common_uri_hit` | common_uri、版本前缀、布局前缀 | provider/proxy |
 | **Effective view** | 合并 static + dynamic + decision 后的生效配置 | 生效配置、最终配置、合并视图 | config |
 | **Endpoint (端点)** | Direct provider 的一个 `(protocol, base_url, common_uri)` 三元组 (`endpoints` 有序数组, 每协议至多一条 — validate 强制; 多端点共享同一凭证)。数组序 = fallback 序: egress 端点由 ingress 经 `select_endpoint` 选定 — 精确匹配 → 同协议, 无匹配 → 首端点跨协议翻译 (multi-endpoint D2) | 协议端点、端点条目 | provider/proxy |
 | **ForwardRecord** | 一次 HTTP 转发的完整记录 (web 层 DTO, 从 DAG Node 派生) | 请求记录、record、转发记录 | web |

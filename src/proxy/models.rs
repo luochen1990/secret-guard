@@ -871,7 +871,8 @@ pub(crate) const V1_COMMON_URIS: [&str; 2] = ["/v1", ""];
 /// 绕过 validate) 跳过, 回落默认序 (ROB 不炸).
 fn common_uri_candidates(preferred: Option<&str>) -> Vec<String> {
     let mut cs = Vec::new();
-    if let Some(p) = preferred.filter(|p| p.is_empty() || p.starts_with('/')) {
+    // 值域形状判定 SSOT (provider::is_valid_common_uri_shape, 两消费点共用)
+    if let Some(p) = preferred.filter(|p| crate::provider::is_valid_common_uri_shape(p)) {
         cs.push(p.to_string());
     }
     for c in V1_COMMON_URIS {
