@@ -318,10 +318,14 @@ in
                       type = lib.types.nullOr lib.types.str;
                       default = null;
                       description = ''
-                        该端点自建请求 (模型清单合成 fetch) 的公共 URI 前缀, 不影响转发.
-                        null = 未探测 (fetch 侧候选序列现场推导); "" = 版本前缀已含
-                        (智谱等国产系, models 端点 = base + /models); "/v1" = 裸根布局
-                        (官方 OpenAI/Anthropic 形态). 值域校验 render 层 fail-fast
+                        端点布局断言 (三段式 base + common_uri + request_uri 的中段),
+                        两个消费面: 模型清单合成 fetch, 以及跨协议翻译的出站 URL
+                        (effective_common_uri, #260 — 版本前缀已含的上游不再拼出
+                        双版本段). 同协议透传不受影响 (rest 原样流过).
+                        null = 未探测 (fetch 侧候选序列现场推导, 翻译侧启发式
+                        兜底并打 INFO 提示); "" = 版本前缀已含 (智谱等国产系,
+                        models 端点 = base + /models); "/v1" = 裸根布局 (官方
+                        OpenAI/Anthropic 形态). 值域校验 render 层 fail-fast
                         (对齐上游 Endpoint validate).
                       '';
                     };

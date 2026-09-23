@@ -20,7 +20,7 @@ use std::time::Instant;
 use axum::body::Body;
 use axum::http::{HeaderValue, Response, StatusCode};
 use bytes::Bytes;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::dag::ResponseData;
 use crate::error::AppError;
@@ -144,6 +144,17 @@ pub(crate) async fn cross_proto_forward(
     //    显式 common_uri 优先, 缺省按 base 尾段启发式, #260: 旧行为硬编码
     //    "/v1" 前缀对版本段已含的上游 (智谱 coding plan / DeepSeek /
     //    opencode zen 等) 拼出双版本段 404).
+    //    缺口显性化: 端点未被 detect 探测 (手写 toml 无创建期探测环节) 时
+    //    每请求一条 INFO, 提示补显式声明 (生产端点的稳态应是显式 common_uri,
+    //    启发式仅为存量兜底 — 每请求打与 route resolved 同节奏, 不降噪隐藏).
+    if !endpoint.common_uri_is_explicit() {
+        info!(
+            provider = %upstream_id,
+            base_url = %endpoint.base_url,
+            "endpoint common_uri unset/invalid; heuristic layout fallback for \
+             translation egress — run WebUI detect or declare common_uri explicitly"
+        );
+    }
     let upstream_url = format!(
         "{}{}{}",
         endpoint.base_url,

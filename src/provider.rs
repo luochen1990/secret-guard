@@ -259,6 +259,15 @@ impl Endpoint {
             .unwrap_or_else(|| heuristic_common_uri(&self.base_url))
     }
 
+    /// [`Endpoint::common_uri`] 是否为显式合法值 (detect 落盘或手写声明) —
+    /// `false` 表示翻译出站将走启发式兜底 (未探测 / 脏 state 的非法值),
+    /// 消费点 `cross_proto` 据此打 INFO 提示补探测 (缺口显性化).
+    pub(crate) fn common_uri_is_explicit(&self) -> bool {
+        self.common_uri
+            .as_deref()
+            .is_some_and(is_valid_common_uri_shape)
+    }
+
     /// 测试便捷构造 (common_uri = None 未探测形态). 跨模块统一口径
     /// (provider / proxy::models / config 的测试共用), 先例同
     /// `mock::assert_no_c5_substring`.
@@ -1496,6 +1505,25 @@ mod tests {
             };
             assert_eq!(ep.effective_common_uri(), *want, "base={base} cu={cu:?}");
         }
+    }
+
+    /// #260: common_uri_is_explicit — cross_proto 缺口显性化 INFO 的判定
+    /// (显式合法值 true; None 与非法值 false → 启发式兜底被使用).
+    #[test]
+    fn common_uri_is_explicit_matrix() {
+        let mk = |cu: Option<&str>| Endpoint {
+            protocol: Protocol::OpenAI,
+            base_url: "https://api.openai.com".into(),
+            common_uri: cu.map(str::to_string),
+        };
+        assert!(mk(Some("/v1")).common_uri_is_explicit());
+        assert!(mk(Some("")).common_uri_is_explicit());
+        assert!(mk(Some("/api/paas/v4")).common_uri_is_explicit());
+        assert!(!mk(None).common_uri_is_explicit(), "未探测 → 启发式兜底");
+        assert!(
+            !mk(Some("v1")).common_uri_is_explicit(),
+            "非法值 → 启发式兜底"
+        );
     }
 
     /// 测试便捷: Direct 负载首端点的 base_url (p() 家族恒构造单端点;
