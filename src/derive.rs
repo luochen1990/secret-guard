@@ -282,8 +282,12 @@ pub(crate) fn extract_text_blocks(arr: &[serde_json::Value]) -> Option<Vec<Strin
     if texts.is_empty() { None } else { Some(texts) }
 }
 
-/// (fallback) 从 node.req_body_raw 末尾截取 req_delta.len() 条 messages (wire JSON),
-/// 用于 timeline 渲染本轮新增气泡. 属于域 B 派生链 (从 req_body_raw 字节派生 WebUI 视图).
+/// (legacy oracle) 从 node.req_body_raw 末尾截取 req_delta.len() 条 messages (wire JSON).
+///
+/// **B1 后生产路径已切换到 [`extract_delta_messages_from_blocks`]** (BlockPool 结构化
+/// 派生); 本函数保留作两用途: ① consistency-check feature 的 shadow 对照 (VIEW-2
+/// 守卫 [`assert_delta_view_matches_raw`]); ② 等价性 proptest 的 oracle. 两者之外
+/// 禁止新增生产调用点.
 ///
 /// # system 处理
 ///
@@ -301,6 +305,7 @@ pub(crate) fn extract_text_blocks(arr: &[serde_json::Value]) -> Option<Vec<Strin
 ///
 /// 接收 HTTP body 派生数据, 任何 panic 都能让单个恶意请求崩溃进程. 对非 JSON /
 /// 字段缺失 / count 与 messages 数不匹配一律返回空 Vec, 不 panic.
+#[cfg_attr(not(any(test, feature = "consistency-check")), allow(dead_code))]
 pub(crate) fn extract_delta_messages_from_raw(node: &crate::dag::Node) -> Vec<serde_json::Value> {
     let count = node.req_delta.len();
     if count == 0 {
@@ -353,6 +358,153 @@ pub(crate) fn extract_delta_messages_from_raw(node: &crate::dag::Node) -> Vec<se
     }
 
     result
+}
+
+/// 从 BlockPool 结构化派生 timeline 的 req_delta_messages (B1 数据源).
+///
+/// 数据流: `req_delta` (MessageRef, **real 视角含真 secret**) → resolve →
+/// real→mock 替换 (投影重建的映射, 见 [`crate::redact::rebuild_real_to_mock_pairs`])
+/// → ingress writer 序列化 → 取尾 `count` 条 wire messages (+ 根节点 system 注入).
+/// 输出与 legacy [`extract_delta_messages_from_raw`] (req_body_raw 切片) **逐字节
+/// 等价**, 由 `prop_blocks_derivation_matches_raw` (常驻) +
+/// [`assert_delta_view_matches_raw`] (consistency-check shadow) 双重守卫.
+///
+/// # 等价性要点 (为什么字节级成立)
+///
+/// - 推送的 real messages 与产出 req_body_raw 的 redact 后 IR 出自同一 reader 解析
+///   (clone 快照), block 内容 + wire 形态元数据 (content_form 等, MessageRef 保存)
+///   完全一致; 同一 ingress writer 序列化 → 相同字节.
+/// - mock 替换: 旧路径的 text 叶子 = redact_ir_inner 逐 secret `replace_in_place`
+///   的产物; 新路径用同一 `replace_in_place` 按同一处理序 (见
+///   `rebuild_real_to_mock_pairs` 文档) 重放 → 相同字节.
+/// - 尾部切片: delta 是 messages 的后缀, writer 的 message 展开是逐消息的
+///   (OpenAI 含 ToolResult 拆分), delta 的 wire 展开 = 全量 wire 数组的后缀;
+///   取尾 `count` 条与旧路径 `messages[len-count..]` 同元素.
+/// - system 注入: 见下方 "system 注入等价".
+///
+/// # system 注入等价
+///
+/// 旧路径条件 `parent.is_none() && start > 0` + 形态分支, 在 codec 路径上等价于:
+/// **根节点 && OpenAI ingress && system 文本非空** → 注入
+/// `{"role":"system","content": <blocks_to_text(system)>}` (与旧路径克隆的
+/// messages[0] = OpenAI writer 的 system 输出同形). Anthropic writer 对 messages
+/// 1:1 不膨胀 (根节点恒 start==0, 旧路径的 Anthropic 分支在生产不可达 — 顶层
+/// system 从不进 messages 数组), Responses wire 无 messages 字段 (下方早退) —
+/// 两协议均不注入, 与旧行为一致. 根节点 system blocks 来自 `Node.system_refs`
+/// (real 视角), 同样过 real→mock 替换后 join — 与 writer 写入 req_body_raw 的
+/// system 文本 (替换后 blocks_to_text) 相同.
+///
+/// # passthrough / 空协议节点
+///
+/// `ingress_protocol == None` (字节透传) 或 `req_delta` 空 (count==0) → 空 Vec,
+/// 与旧路径行为一致 (passthrough 节点 timeline 本就是 preview-only).
+///
+/// # 鲁棒性 (ROB-1 契约)
+///
+/// resolve 失败 = 池状态损坏 (节点自持 refcount, 理论不变式下 block 不会被
+/// evict) — 返回空 Vec 而非 panic, 前端降级 preview-only.
+pub(crate) fn extract_delta_messages_from_blocks(
+    node: &crate::dag::Node,
+    pool: &crate::dag::BlockPool,
+) -> Vec<serde_json::Value> {
+    use crate::codec::ir::{IrBlock, IrMessage, IrRequest};
+
+    let count = node.req_delta.len();
+    if count == 0 {
+        return Vec::new();
+    }
+    let Some(protocol) = node.event.ingress_protocol else {
+        return Vec::new();
+    };
+    // Responses ingress: wire 是 input[] 而非 messages[], 旧路径恒返回空
+    // (已知限制, DTO-5) — 等价复刻, 不趁机"修复".
+    if protocol == crate::codec::Protocol::OpenAIResponses {
+        return Vec::new();
+    }
+
+    // resolve req_delta → real 视角 IrMessage.
+    let mut msgs: Vec<IrMessage> = Vec::with_capacity(count);
+    for r in node.req_delta.iter() {
+        let Some(m) = pool.resolve_message(r) else {
+            return Vec::new();
+        };
+        msgs.push(m);
+    }
+
+    // real → mock (视角对齐: 旧路径 req_body_raw 是 LLM 视角含 mock).
+    let pairs = crate::redact::rebuild_real_to_mock_pairs(
+        &node.event.redactions,
+        &node.event.policy.secrets,
+    );
+    if !pairs.is_empty() {
+        crate::redact::apply_real_to_mock_messages(&mut msgs, &pairs);
+    }
+
+    // ingress writer 序列化: 经合成 IrRequest 复用 write_request 的 message 展开
+    // 逻辑 (含 OpenAI ToolResult 拆分为 1+N 条 wire 消息), 只取 messages 数组.
+    let writer = protocol.writer();
+    let wire = writer.write_request(&IrRequest {
+        messages: msgs,
+        ..Default::default()
+    });
+    let Some(arr) = wire.get("messages").and_then(|m| m.as_array()) else {
+        return Vec::new();
+    };
+    // 每条 IR message 展开为 ≥1 条 wire 消息, 故 arr.len() ≥ count;
+    // saturating_sub 为防御性写法 (池损坏时不 panic).
+    let start = arr.len().saturating_sub(count);
+    let mut result: Vec<serde_json::Value> = arr[start..].to_vec();
+
+    // 根节点 system 注入 (等价推导见函数头 "system 注入等价"; 仅 OpenAI 可达).
+    if node.parent.is_none() && protocol == crate::codec::Protocol::OpenAI {
+        let mut sys_blocks: Vec<IrBlock> = Vec::with_capacity(node.system_refs.len());
+        for &h in node.system_refs.iter() {
+            let Some(b) = pool.get(h) else {
+                return Vec::new();
+            };
+            sys_blocks.push((*b).clone());
+        }
+        if !pairs.is_empty() {
+            crate::redact::apply_real_to_mock_blocks(&mut sys_blocks, &pairs);
+        }
+        let text = crate::codec::blocks_to_text(&sys_blocks);
+        // 与旧路径等价的 gate: OpenAI writer 仅在 text 非空时写 system message
+        // (messages[0] 存在且 role=system), 注入才可能触发.
+        if !text.is_empty() {
+            result.insert(0, serde_json::json!({"role": "system", "content": text}));
+        }
+    }
+
+    result
+}
+
+/// 视图正确性守卫 (CI 用, 需 `--features consistency-check`): blocks 派生 (新,
+/// 生产路径) 与 req_body_raw 切片 (旧, 保留 oracle) 的输出逐元素相等.
+///
+/// B1 数据源切换的 shadow 断言 — "先断言后删除" 纪律: req_body_raw 仍是 SSOT
+/// 存储 (B2 才引入不存储开关), 在它被任何 timeline 路径放弃前, 每次渲染都
+/// 验证两条派生路径等价. 详见 AGENTS.md "视图正确性确保机制" (VIEW-2 表).
+///
+/// 跳过: `ingress_protocol == None` (passthrough) 节点 — 生产不变式下其
+/// req_delta 恒空 (same_proto_passthrough / 无 codec 降级均推 `vec![]`),
+/// count>0 + 无协议是 fixture-only 的矛盾态, 两路径对它的输出定义不同
+/// (blocks 路径返回空更安全: passthrough raw 是未 redact 的客户端原始字节).
+#[cfg(feature = "consistency-check")]
+pub(crate) fn assert_delta_view_matches_raw(
+    node: &crate::dag::Node,
+    pool: &crate::dag::BlockPool,
+) {
+    if node.event.ingress_protocol.is_none() {
+        return;
+    }
+    let derived = extract_delta_messages_from_blocks(node, pool);
+    let oracle = extract_delta_messages_from_raw(node);
+    debug_assert_eq!(
+        derived, oracle,
+        "timeline delta drift: blocks-derived view != req_body_raw slice \
+         (node={}, proto={:?}, count={})",
+        node.id, node.event.ingress_protocol, node.req_delta.len()
+    );
 }
 
 #[cfg(test)]
@@ -1224,5 +1376,485 @@ mod tests {
             result[0].get("content").and_then(|v| v.as_str()),
             Some("u2")
         );
+    }
+
+    // ─── prop_blocks_derivation_matches_raw (B1 等价性质, DTO-5) ──────────
+    //
+    // 契约: docs/design/contracts.md §5 DTO-5 — timeline 的 req_delta_messages
+    // 从 BlockPool 派生 (B1 数据源) 与旧 req_body_raw 尾部切片 (oracle) **逐字节
+    // 等价**. 生成器覆盖 matrix (覆盖度是契约要求, 见 §0.4):
+    //   × ingress 协议 wire 形态: OpenAI / Anthropic
+    //   × system 形态: 无 / 顶层 string / 顶层 array / messages[0] role=system
+    //   × delta 规模: 1..=6 条 message (全链最多 8)
+    //   × block 种类: Text / 裸 string content / array content / null content /
+    //     ToolUse (含嵌套 input JSON) / ToolResult (含 is_error) / Image
+    //   × secret 命中: 0 条 (seed=0) / 1..=3 条命中 (seed≠0, 含 tool input /
+    //     tool_result 深处命中) / 另加 1 条未命中
+    //   × 根 / 非根节点 (prefix 延续 push)
+    //
+    // 管线 = 生产管线镜像: wire body → ingress reader → clone real 快照 →
+    // redact_ir (LLM 视角) → derive_redactions (投影) → ingress writer 序列化
+    // → req_body_raw → dag.push_messages (+ 根节点 system_refs).
+    // 比对: dag.timeline_view 的 req_delta_messages (新生产路径) vs
+    // extract_delta_messages_from_raw (oracle, 经最小 Node shim 喂入同 raw).
+
+    use crate::codec::Protocol as CodecProtocol;
+    use crate::dag::ConversationDag;
+    use crate::secrets::{SecretCategory, SecretEntry};
+
+    /// 与 redact 测试同型的 secret entry 构造 (Auto 策略经 resolve_against infer,
+    /// 与生产 validate_and_resolve 路径一致).
+    fn eq_secret_entry(value: &str) -> SecretEntry {
+        let mut e = SecretEntry {
+            id: format!("sid-{value}"),
+            name: None,
+            category: SecretCategory::ApiKey,
+            value: value.into(),
+            value_file: None,
+            mock_strategy: crate::mock::MockStrategy::default(),
+        };
+        e.mock_strategy.resolve_against(&e.value, "");
+        e
+    }
+
+    /// 可嵌 secret 的文本: `(基串, secret 池索引)`.
+    type MaybeSecretText = (String, Option<usize>);
+
+    /// 协议无关的 message 抽象 (渲染层按 proto 输出 wire 形态).
+    #[derive(Clone, Debug)]
+    enum EqMsg {
+        /// user / assistant 的普通消息, content 形态三选一 (L1 保真轴).
+        Chat {
+            assistant: bool,
+            str_form: bool,
+            null_form: bool,
+            parts: Vec<MaybeSecretText>,
+        },
+        /// assistant 发起工具调用 (arguments 是 JSON object 源码串, 内含文本叶子).
+        ToolUse {
+            id: String,
+            name: String,
+            args_text: MaybeSecretText,
+        },
+        /// 工具结果回传 (OpenAI: role=tool 独立消息; Anthropic: user 内 tool_result).
+        ToolResult {
+            tool_use_id: String,
+            text: MaybeSecretText,
+            is_error: bool,
+        },
+    }
+
+    fn render_text(t: &MaybeSecretText, pool: &[SecretEntry]) -> String {
+        // 索引越界 (生成器索引 0..4, 实际 secrets 0..=3) 视为不嵌 — 兼作
+        // "0 命中" 轴的来源.
+        match t.1.and_then(|i| pool.get(i)) {
+            Some(e) => format!("{}{}{}", t.0, e.value, t.0),
+            None => t.0.clone(),
+        }
+    }
+
+    /// 把协议无关 message 渲染为 OpenAI wire 形态.
+    fn render_msg_openai(m: &EqMsg, pool: &[SecretEntry]) -> serde_json::Value {
+        match m {
+            EqMsg::Chat {
+                assistant,
+                str_form,
+                null_form,
+                parts,
+            } => {
+                let role = if *assistant { "assistant" } else { "user" };
+                let content = if *null_form {
+                    serde_json::Value::Null
+                } else if *str_form {
+                    // 裸 string content (reader 归一化为单 Text block + String 形态).
+                    serde_json::Value::String(render_text(&parts[0], pool))
+                } else {
+                    serde_json::Value::Array(
+                        parts
+                            .iter()
+                            .map(|p| serde_json::json!({"type": "text", "text": render_text(p, pool)}))
+                            .collect(),
+                    )
+                };
+                serde_json::json!({"role": role, "content": content})
+            }
+            EqMsg::ToolUse { id, name, args_text } => serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": render_text(args_text, pool)}
+                }]
+            }),
+            EqMsg::ToolResult {
+                tool_use_id,
+                text,
+                is_error,
+            } => serde_json::json!({
+                "role": "tool",
+                "tool_call_id": tool_use_id,
+                "content": render_text(text, pool),
+                "is_error": is_error,
+            }),
+        }
+    }
+
+    /// 把协议无关 message 渲染为 Anthropic wire 形态.
+    fn render_msg_anthropic(m: &EqMsg, pool: &[SecretEntry]) -> serde_json::Value {
+        match m {
+            EqMsg::Chat {
+                assistant,
+                str_form,
+                null_form,
+                parts,
+            } => {
+                let role = if *assistant { "assistant" } else { "user" };
+                let content = if *null_form {
+                    serde_json::Value::Null
+                } else if *str_form {
+                    serde_json::Value::String(render_text(&parts[0], pool))
+                } else {
+                    serde_json::Value::Array(
+                        parts
+                            .iter()
+                            .map(|p| serde_json::json!({"type": "text", "text": render_text(p, pool)}))
+                            .collect(),
+                    )
+                };
+                serde_json::json!({"role": role, "content": content})
+            }
+            EqMsg::ToolUse { id, name, args_text } => serde_json::json!({
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": id,
+                    "name": name,
+                    // input: JSON object (文本叶子内嵌 secret).
+                    "input": {"q": render_text(args_text, pool), "n": 1}
+                }]
+            }),
+            EqMsg::ToolResult {
+                tool_use_id,
+                text,
+                is_error,
+            } => {
+                let mut tr = serde_json::json!({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": render_text(text, pool)
+                });
+                if *is_error {
+                    tr["is_error"] = serde_json::Value::Bool(true);
+                }
+                serde_json::json!({"role": "user", "content": [tr]})
+            }
+        }
+    }
+
+    /// system 形态 (matrix 轴).
+    #[derive(Clone, Debug)]
+    enum EqSystem {
+        None,
+        /// 顶层 system: string 形态 (OpenAI 渲染为 messages[0]; Anthropic 为 "system": "...").
+        TopLevelString(Vec<MaybeSecretText>),
+        /// 顶层 system: array-of-text-blocks 形态.
+        TopLevelArray(Vec<MaybeSecretText>),
+        /// messages[0] role=system (OpenAI 原生形态; Anthropic 非标准但 reader 支持).
+        InMessages(Vec<MaybeSecretText>),
+    }
+
+    /// 完整等价性测试用例.
+    #[derive(Clone, Debug)]
+    struct EqCase {
+        proto: CodecProtocol,
+        system: EqSystem,
+        /// 全链 messages (prefix = 前 `prefix_len` 条; delta = 其余, ≥1).
+        msgs: Vec<EqMsg>,
+        prefix_len: usize,
+        secrets: Vec<SecretEntry>,
+    }
+
+    /// 渲染完整请求 body (per proto). `msgs` 为消息切片 (prefix 请求 / full 请求).
+    fn render_body(c: &EqCase, msgs: &[EqMsg]) -> serde_json::Value {
+        let sys_texts = |s: &EqSystem| -> Vec<serde_json::Value> {
+            match s {
+                EqSystem::None | EqSystem::InMessages(_) => vec![],
+                EqSystem::TopLevelString(t) | EqSystem::TopLevelArray(t) => t
+                    .iter()
+                    .map(|p| serde_json::json!({"type": "text", "text": render_text(p, &c.secrets)}))
+                    .collect(),
+            }
+        };
+        let sys_msg = |texts: &[serde_json::Value], str_form: bool| {
+            if str_form {
+                serde_json::json!({"role": "system", "content": texts[0]["text"].clone()})
+            } else {
+                serde_json::json!({"role": "system", "content": texts})
+            }
+        };
+        let mut wire_msgs: Vec<serde_json::Value> = msgs
+            .iter()
+            .map(|m| match c.proto {
+                CodecProtocol::OpenAI => render_msg_openai(m, &c.secrets),
+                _ => render_msg_anthropic(m, &c.secrets),
+            })
+            .collect();
+        match &c.system {
+            EqSystem::None => {}
+            EqSystem::InMessages(t) => {
+                let texts: Vec<_> = t
+                    .iter()
+                    .map(|p| serde_json::json!({"type": "text", "text": render_text(p, &c.secrets)}))
+                    .collect();
+                wire_msgs.insert(0, sys_msg(&texts, false));
+            }
+            EqSystem::TopLevelString(t) if c.proto == CodecProtocol::OpenAI => {
+                // OpenAI 无顶层 system 字段 — 生产客户端把它放 messages[0],
+                // reader 提升进 ir.system, writer 写回 messages[0].
+                let text = render_text(&t[0], &c.secrets);
+                wire_msgs.insert(0, serde_json::json!({"role": "system", "content": text}));
+            }
+            _ => {}
+        }
+        let mut body = serde_json::Map::new();
+        body.insert("model".into(), serde_json::json!("eq-model"));
+        if c.proto == CodecProtocol::Anthropic {
+            body.insert("max_tokens".into(), serde_json::json!(64));
+            match &c.system {
+                EqSystem::TopLevelString(t) => {
+                    body.insert(
+                        "system".into(),
+                        serde_json::json!(render_text(&t[0], &c.secrets)),
+                    );
+                }
+                EqSystem::TopLevelArray(_) => {
+                    body.insert("system".into(), serde_json::Value::Array(sys_texts(&c.system)));
+                }
+                _ => {}
+            }
+        }
+        body.insert("messages".into(), serde_json::Value::Array(wire_msgs));
+        serde_json::Value::Object(body)
+    }
+
+    /// 生产管线镜像: parse → redact → 投影 → writer 序列化 → push.
+    /// 返回 (node_id, req_body_raw).
+    fn eq_push_request(
+        dag: &ConversationDag,
+        c: &EqCase,
+        body: &serde_json::Value,
+    ) -> Option<(uuid::Uuid, String)> {
+        let reader = c.proto.reader();
+        let ir = reader.read_request(body).ok()?;
+        let real_system = ir.system.clone();
+        let real_messages = ir.messages.clone();
+        let mut llm = ir.clone();
+        // 生产路径是 redact_ir_checked(FailClosed 默认); 测试用 redact_ir (FailOpen)
+        // — 对能通过的生成用例两者产出相同 map.
+        let (map, seed) = crate::redact::redact_ir(&mut llm, &c.secrets);
+        let redactions = crate::proxy::recorder::derive_redactions(&map, &c.secrets);
+        let raw = serde_json::to_string(&c.proto.writer().write_request(&llm)).ok()?;
+        let event = CallEvent {
+            created_at: chrono::Utc::now(),
+            method: "POST".to_string(),
+            path: "/o/eq/v1/chat".to_string(),
+            req_headers: vec![],
+            ingress_protocol: Some(c.proto),
+            redact_seed: seed,
+            req_system: real_system,
+            policy: Arc::new(PolicySnapshot {
+                secrets: Arc::from(c.secrets.clone()),
+            }),
+            req_body_raw: raw.clone(),
+            round_role: IrRole::User,
+            round_kind: crate::dag::RoundKind::Normal,
+            preview: None,
+            model: None,
+            upstream_id: Arc::from("eq"),
+            redactions: Arc::from(redactions),
+            upstream_model: None,
+        };
+        Some((dag.push_messages(real_messages, event), raw))
+    }
+
+    /// 运行用例: push (prefix 根 + full 子) → timeline_view 全链比对新派生 vs oracle.
+    fn eq_run_case(c: &EqCase) -> Result<(), String> {
+        let dag = ConversationDag::new(32, 128, 4);
+        let mut raw_of: std::collections::HashMap<uuid::Uuid, String> =
+            std::collections::HashMap::new();
+        let mut push = |body: &serde_json::Value| -> Result<uuid::Uuid, String> {
+            let (id, raw) = eq_push_request(&dag, c, body)
+                .ok_or_else(|| "reader rejected body".to_string())?;
+            raw_of.insert(id, raw);
+            Ok(id)
+        };
+
+        let sid = if c.prefix_len == 0 {
+            // 单根场景: full body 一次 push.
+            let id = push(&render_body(c, &c.msgs))?;
+            dag.get_node(id).unwrap().session_id
+        } else {
+            // 两跳场景: 根 = prefix body, 子 = full body (生产: 客户端每轮重发全量).
+            let prefix: Vec<EqMsg> = c.msgs[..c.prefix_len].to_vec();
+            push(&render_body(c, &prefix))?;
+            let cid = push(&render_body(c, &c.msgs))?;
+            let nv = dag.get_node(cid).unwrap();
+            if nv.parent.is_none() {
+                return Err("child unexpectedly became root (prefix mismatch)".into());
+            }
+            nv.session_id
+        };
+
+        // 全链 timeline (新生产路径) vs oracle (旧 raw 切片, 经最小 Node shim).
+        let page = dag
+            .timeline_view(sid, None, 32)
+            .ok_or_else(|| "timeline_view none".to_string())?;
+        for round in &page.rounds {
+            let nv = dag.get_node(round.id).unwrap();
+            let mut shim = fixture_node(
+                nv.req_delta_count,
+                raw_of.get(&round.id).unwrap().clone(),
+            );
+            shim.parent = nv.parent;
+            let oracle = extract_delta_messages_from_raw(&shim);
+            if round.req_delta_messages != oracle {
+                return Err(format!(
+                    "node {} (root={}, count={}) mismatch:\n  blocks: {}\n  raw:    {}",
+                    round.id,
+                    nv.parent.is_none(),
+                    nv.req_delta_count,
+                    serde_json::to_string(&round.req_delta_messages).unwrap_or_default(),
+                    serde_json::to_string(&oracle).unwrap_or_default(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// matrix 生成器: 见本段头部注释的轴清单.
+    fn arb_eq_case() -> impl proptest::prelude::Strategy<Value = EqCase> {
+        use proptest::prelude::*;
+        let proto = prop::bool::ANY.prop_map(|b| {
+            if b {
+                CodecProtocol::Anthropic
+            } else {
+                CodecProtocol::OpenAI
+            }
+        });
+        // 文本基串: 短字母数字 (与 secret 值字符集重叠, 让替换有区分度).
+        let text: proptest::strategy::BoxedStrategy<MaybeSecretText> = (
+            any::<u16>(),
+            prop::option::of(0usize..4),
+        )
+            .prop_map(|(n, idx)| (format!("t{}", n % 977), idx))
+            .boxed();
+        let texts = prop::collection::vec(text.clone(), 1..=3);
+        let system = prop::option::of(prop_oneof![
+            3 => texts.clone().prop_map(EqSystem::TopLevelString),
+            2 => texts.clone().prop_map(EqSystem::TopLevelArray),
+            2 => texts.prop_map(EqSystem::InMessages),
+        ]);
+        let msg = prop_oneof![
+            4 => (
+                prop::bool::ANY,
+                prop::bool::ANY,
+                prop::bool::ANY,
+                prop::collection::vec(text.clone(), 1..=3),
+            )
+                .prop_map(|(assistant, str_form, null_form, parts)| EqMsg::Chat {
+                    assistant,
+                    // null_form 只对 assistant 有意义 (reader 把 user 的 null 读成空 vec,
+                    // 同样保留 — 覆盖空 content 消息形态).
+                    str_form: str_form && !null_form,
+                    null_form: null_form && assistant,
+                    parts,
+                }),
+            2 => (any::<u16>(), text.clone()).prop_map(|(n, t)| EqMsg::ToolUse {
+                id: format!("tu-{n}"),
+                name: format!("tool_{}", n % 17),
+                args_text: t,
+            }),
+            2 => (any::<u16>(), text.clone(), prop::bool::ANY).prop_map(
+                |(n, t, is_error)| EqMsg::ToolResult {
+                    tool_use_id: format!("tu-{}", n % 3), // 与 ToolUse id 弱关联
+                    text: t,
+                    is_error,
+                },
+            ),
+        ];
+        (
+            proto,
+            system,
+            prop::collection::vec(msg, 1..8),
+            any::<u64>(),
+        )
+            .prop_flat_map(move |(proto, system, msgs, salt)| {
+                // secrets 数量 0..=3 (2/5 概率 0 条 = seed=0 轴); 长度互异覆盖替换序;
+                // 偶数 salt 再加一条恒未命中 secret (只进 policy 快照, 不进文本).
+                let n_secrets = ((salt % 5) as usize).saturating_sub(1);
+                let mut secrets: Vec<SecretEntry> = (0..n_secrets)
+                    .map(|i| {
+                        let ch = char::from(b'a' + ((salt as usize + i * 7) % 26) as u8);
+                        let value: String = std::iter::repeat_n(ch, 8 + i * 5).collect();
+                        eq_secret_entry(&format!("{value}-sk{i}"))
+                    })
+                    .collect();
+                if salt % 2 == 0 {
+                    secrets.push(eq_secret_entry("zzz-unhit-secret-value"));
+                }
+                // prefix_len: salt%3==0 → 根场景; 否则 1..=msgs.len()-1 (delta ≥1).
+                let max_prefix = msgs.len().saturating_sub(1);
+                let prefix_len = if salt % 3 == 0 {
+                    0
+                } else {
+                    (salt as usize) % (max_prefix + 1)
+                };
+                Just(EqCase {
+                    proto,
+                    system: system.unwrap_or(EqSystem::None),
+                    msgs,
+                    prefix_len,
+                    secrets,
+                })
+            })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// DTO-5 核心: blocks 派生 == raw 切片 (全 matrix, 128 cases).
+        #[test]
+        fn prop_blocks_derivation_matches_raw(case in arb_eq_case()) {
+            // reader 拒绝 / 子节点未接前缀等结构性跳过: 视为生成器产出无效,
+            // 计数控制 (prop_assume 比例过高时 proptest 会 panic 提示).
+            match eq_run_case(&case) {
+                Ok(()) => {}
+                Err(e) if e.starts_with("reader rejected") || e.contains("unexpectedly became root") => {
+                    proptest::prop_assume!(false, "skip structurally invalid case: {}", e);
+                }
+                Err(e) => panic!("equivalence violated: {e}"),
+            }
+        }
+    }
+
+    /// 边界 (固定用例): passthrough 节点 (ingress=None) — 新路径空 Vec
+    /// (count==0 早退; 生产 passthrough 恒推空 messages, 见 same_proto_passthrough).
+    #[test]
+    fn blocks_derivation_passthrough_node_returns_empty() {
+        let node = fixture_node(0, r#"{"messages":[{"role":"user","content":"x"}]}"#.into());
+        let pool = crate::dag::BlockPool::default();
+        assert!(extract_delta_messages_from_blocks(&node, &pool).is_empty());
+    }
+
+    /// 边界 (固定用例): Responses ingress — wire 无 messages 字段, 新旧路径恒空
+    /// (已知限制的等价复刻, DTO-5).
+    #[test]
+    fn blocks_derivation_responses_ingress_returns_empty() {
+        let node = fixture_node(1, r#"{"model":"m","input":[]}"#.into());
+        let pool = crate::dag::BlockPool::default();
+        assert!(extract_delta_messages_from_blocks(&node, &pool).is_empty());
+        // oracle 同样为空 (无 messages 字段).
+        assert!(extract_delta_messages_from_raw(&node).is_empty());
     }
 }

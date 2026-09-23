@@ -1776,10 +1776,22 @@ mod tests {
 
     #[test]
     fn timeline_round_carries_req_delta_messages_for_leaf() {
-        // leaf 节点的 TimelineRound 应携带 req_delta_messages (从 req_body_raw 切片).
-        let body = r#"{"messages":[{"role":"user","content":"hello"}]}"#;
+        // leaf 节点的 TimelineRound 应携带 req_delta_messages (B1: BlockPool 派生;
+        // fixture 需带 ingress 协议 + OpenAI wire 形态 body — 派生走 writer 序列化).
+        let body = r#"{"model":"m","messages":[{"role":"user","content":"hello"}]}"#;
         let dag = ConversationDag::new(8, 500, 1);
-        let a = push_with_response(&dag, vec![text_msg(IrRole::User, "hello")], body);
+        let mut ev = event_with_body("/o/test/v1/chat", body);
+        ev.ingress_protocol = Some(crate::codec::Protocol::OpenAI);
+        let a = dag.push_messages(vec![text_msg(IrRole::User, "hello")], ev);
+        dag.attach_response(
+            a,
+            ResponseData {
+                resp_status: 200,
+                raw_resp_body: body.to_string(),
+                resp_complete: true,
+                ..Default::default()
+            },
+        );
         let sid = sid_of(&dag, a);
         let page = dag.timeline_view(sid, None, 10).expect("page exists");
         let round = &page.rounds[0];

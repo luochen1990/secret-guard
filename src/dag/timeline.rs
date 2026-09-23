@@ -84,9 +84,12 @@ fn build_round_briefs(inner: &DagInner, chain: &[Uuid]) -> Vec<RoundBrief> {
 
 /// 构造一个 TimelineRound (含 req_delta_messages).
 ///
-/// req_delta_messages 从 `node.req_body_raw` 末尾切片 (已 redact, LLM 视角, 安全).
-/// 不走 BlockPool + codec writer 路径 (BlockPool 存真实内容, 未 apply redactMap 会泄露 secret);
-/// 跨协议切片错位是可接受的已知限制. TODO: 后续在 web 层 lazy redact.
+/// req_delta_messages 从 BlockPool 结构化派生 (B1): req_delta (MessageRef, real
+/// 视角) → resolve → real→mock (投影重建映射) → ingress writer 序列化 (+ 根节点
+/// system 注入). 与旧 req_body_raw 切片路径逐字节等价 — consistency-check 下由
+/// [`crate::derive::assert_delta_view_matches_raw`] shadow 守卫 (VIEW-2),
+/// 常驻等价性质 `prop_blocks_derivation_matches_raw` (derive.rs) 守卫.
+/// 详见 `derive::extract_delta_messages_from_blocks`.
 ///
 /// # 持锁不变式 + ROB-* 降级
 ///
@@ -102,6 +105,8 @@ fn build_timeline_round(inner: &DagInner, node_id: Uuid) -> Option<TimelineRound
         .as_ref()
         .and_then(|r| r.usage.as_ref())
         .map(crate::dto::UsageView::from_ir);
+    #[cfg(feature = "consistency-check")]
+    crate::derive::assert_delta_view_matches_raw(node, &inner.blocks);
     Some(TimelineRound {
         id: node.id,
         round_role: node.event.round_role,
@@ -111,7 +116,7 @@ fn build_timeline_round(inner: &DagInner, node_id: Uuid) -> Option<TimelineRound
         // 实际承载转发的 provider id (#179, 虚拟 endpoint 切换的可观测性).
         upstream_id: std::sync::Arc::clone(&node.event.upstream_id),
         redactions: std::sync::Arc::clone(&node.event.redactions),
-        req_delta_messages: crate::derive::extract_delta_messages_from_raw(node),
+        req_delta_messages: crate::derive::extract_delta_messages_from_blocks(node, &inner.blocks),
         usage,
     })
 }
