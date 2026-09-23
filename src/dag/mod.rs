@@ -232,6 +232,21 @@ impl ConversationDag {
             RoundKind::Retry
         };
 
+        // 3.7 消费 CallEvent.req_system (瞬态载荷): 根节点 intern 进 system_refs
+        //     (timeline 根节点 system 气泡的派生源, B1); 非根直接丢弃 — system
+        //     注入只在根发生 (与旧 raw 切片路径的注入条件等价). 两种情况都清空
+        //     event 字段, 保证稳态 Node.event 不持有这份载荷.
+        let system_refs: Arc<[BlockHash]> = if lookup.parent.is_none() {
+            event
+                .req_system
+                .drain(..)
+                .map(|b| g.blocks.intern(b))
+                .collect()
+        } else {
+            event.req_system.clear();
+            Arc::from([])
+        };
+
         // 4. 计算 own_hash + prefix_hash (只基于 req_delta, response 不参与).
         //
         // 持锁不变式: push_messages 持 write lock, evict 也需 write lock, 故 parent 不会被
@@ -269,6 +284,7 @@ impl ConversationDag {
             session_id: sid,
             child_count: 0,
             req_delta: delta_refs,
+            system_refs,
             own_hash,
             prefix_hash,
             event,
@@ -499,6 +515,10 @@ impl ConversationDag {
         for r in node.req_delta.iter() {
             inner.blocks.release_message(r);
         }
+        // 释放根节点 system_refs 的 block refcount (B1).
+        for &h in node.system_refs.iter() {
+            inner.blocks.release(h);
+        }
         // 释放 response 的 block refcount (若有).
         if let Some(resp) = node.response.read().as_ref()
             && let Some(msg) = &resp.message
@@ -603,6 +623,7 @@ mod tests {
             req_headers: vec![],
             ingress_protocol: None,
             redact_seed: 0,
+            req_system: vec![],
             policy: Arc::new(PolicySnapshot::default()),
             req_body_raw: String::new(),
             round_role: IrRole::User,
@@ -625,6 +646,7 @@ mod tests {
             req_headers: vec![("authorization".into(), "<redacted>".into())],
             ingress_protocol: None,
             redact_seed: 0,
+            req_system: vec![],
             policy: Arc::new(PolicySnapshot::default()),
             req_body_raw: req_body.to_string(),
             round_role: IrRole::User,

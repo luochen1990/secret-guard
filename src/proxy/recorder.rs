@@ -667,6 +667,7 @@ pub(super) fn build_call_event(
     redact_seed: u64,
     secrets_snapshot: Option<&[crate::secrets::SecretEntry]>,
     redactions: Vec<(String, String)>,
+    real_system: Vec<crate::codec::ir::IrBlock>,
 ) -> CallEvent {
     let (preview, model) = match ir {
         Some(ir) => crate::derive::extract_preview_and_model_from_ir(ir),
@@ -685,6 +686,9 @@ pub(super) fn build_call_event(
         req_headers: redact_headers(fwd_headers, redacted_headers),
         ingress_protocol,
         redact_seed,
+        // real 视角 (pre-redact) 的 system blocks: push_messages 消费进根节点的
+        // system_refs (瞬态载荷, 见 CallEvent::req_system 文档).
+        req_system: real_system,
         policy,
         req_body_raw: req_text,
         preview: preview.map(std::sync::Arc::<str>::from),
@@ -1231,6 +1235,7 @@ mod tests {
             req_headers: vec![],
             ingress_protocol: None,
             redact_seed: 0,
+            req_system: vec![],
             policy: std::sync::Arc::new(PolicySnapshot::default()),
             req_body_raw: String::new(),
             round_role: crate::codec::ir::IrRole::User,

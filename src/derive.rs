@@ -867,6 +867,7 @@ mod tests {
             req_headers: vec![],
             ingress_protocol: None,
             redact_seed: 0,
+            req_system: vec![],
             policy: Arc::new(PolicySnapshot::default()),
             req_body_raw,
             round_role: IrRole::User,
@@ -881,6 +882,8 @@ mod tests {
         let dummy_ref = crate::dag::MessageRef {
             role: IrRole::User,
             blocks: Vec::new(),
+            content_form: None,
+            reasoning_content_form: None,
         };
         let req_delta: Arc<[crate::dag::MessageRef]> = if count == 0 {
             Arc::from([])
@@ -893,6 +896,7 @@ mod tests {
             session_id: SessionId::new(),
             child_count: 0,
             req_delta,
+            system_refs: Arc::from([]),
             own_hash: 0,
             prefix_hash: 0,
             event,

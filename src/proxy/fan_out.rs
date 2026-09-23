@@ -789,6 +789,7 @@ mod tests {
             req_headers: vec![],
             ingress_protocol: None,
             redact_seed: 0,
+            req_system: vec![],
             policy: Arc::new(PolicySnapshot::default()),
             req_body_raw: String::new(),
             preview: None,

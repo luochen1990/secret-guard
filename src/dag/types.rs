@@ -139,6 +139,17 @@ pub struct Node {
     ///
     /// 冗余通过 BlockPool 内容寻址自然消化 (相同 block 物理共享).
     pub req_delta: Arc<[MessageRef]>,
+    /// 根节点 (parent=None) 请求的 system blocks (real 视角, 内容寻址引用).
+    ///
+    /// 仅根节点持有 (非根节点的 system 属于根的上下文, timeline 只在根注入 —
+    /// 与旧 `extract_delta_messages_from_raw` 的注入条件 `parent.is_none() && start > 0`
+    /// 等价, 见 `derive::extract_delta_messages_from_blocks`). block 经
+    /// [`super::BlockPool::intern`] 入池 (跨节点 system 文本相同则物理共享),
+    /// evict 时随 node 一起 release refcount.
+    ///
+    /// 消费方: `derive::extract_delta_messages_from_blocks` (B1, timeline 根节点
+    /// system 气泡派生 — req_body_raw 不再是 system 的唯一存储位置).
+    pub system_refs: Arc<[super::pool::BlockHash]>,
     /// 本 node 自身 req_delta 的 hash (不含祖先).
     pub own_hash: u64,
     /// 从根到本 node 的累积 hash: 逐条 req_delta message 累积.
@@ -183,6 +194,15 @@ pub struct CallEvent {
     /// - 0 = passthrough (无 secret 命中 / SecretTable 为空).
     /// - 非 0 = derive(policy, OriginRecord, seed) 可重建 redactMap.
     pub redact_seed: u64,
+    /// **瞬态载荷**: redact 前 (real 视角) 快照的请求 system blocks.
+    ///
+    /// 由 `build_call_event` 从 pre-redact IR 填入, `push_messages` 消费:
+    /// 根节点 → intern 进 [`Node::system_refs`] 后**清空本字段**; 非根 → 直接
+    /// 丢弃 (清空). 稳态下 Node.event 内本字段恒为空 vec, 不占运行内存.
+    ///
+    /// 放 CallEvent 而非 push 参数: 与 `req_body_raw` 同属 "请求侧快照",
+    /// 由同一构造器收口, push 签名不变 (测试调用点零改动).
+    pub req_system: Vec<crate::codec::ir::IrBlock>,
     /// redact 时使用的 policy 快照 (Arc COW 共享).
     /// redact_seed=0 时此字段可为 default (空 secrets).
     pub policy: Arc<PolicySnapshot>,

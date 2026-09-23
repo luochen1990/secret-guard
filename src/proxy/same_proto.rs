@@ -153,10 +153,13 @@ pub(crate) async fn same_proto_forward(
         model_rewrite.as_deref(),
     )?;
 
-    // 3. 快照真实 messages (redact 前) 给 DAG — 仅用于内容寻址 / parent 增量计算
-    //    (req_delta 切片). WebUI 读的是 redact 后的 req_body_raw (LLM 视角), 永不
-    //    触碰这份真实快照 (见 src/web/AGENTS.md "req_delta_messages 实现" 段).
+    // 3. 快照真实 messages + system (redact 前) 给 DAG — messages 仅用于内容寻址 /
+    //    parent 增量计算 (req_delta 切片); system 在 push 时 intern 进根节点
+    //    system_refs (B1: timeline 根节点 system 气泡的派生源). WebUI 读的是
+    //    redact 后的 req_body_raw (LLM 视角), 永不触碰这份真实快照
+    //    (见 src/web/AGENTS.md "req_delta_messages 实现" 段).
     let real_messages = ir.messages.clone();
+    let real_system = ir.system.clone();
 
     // 4. redact IR + derive redactions (共享 helper; FailClosed 模式下 probing 耗尽
     //    时 redact_and_derive 内部构造 503 并在此 `?` 拒绝转发, 防止 secret 泄露).
@@ -206,6 +209,7 @@ pub(crate) async fn same_proto_forward(
         redact_seed,
         Some(&secrets_snapshot),
         redactions,
+        real_system,
     );
     let (record_id, usage_ctx) = push_event_and_wire_usage(
         &state,
@@ -363,6 +367,7 @@ async fn same_proto_passthrough(
         None, // passthrough 未改写 model (override 配置了也到此为止, 见 D2 降级)
         0,
         None,
+        vec![],
         vec![],
     );
     // usage 接线 (SSOT helper, 接线契约见其函数 doc). secrets_snapshot: 入口 1

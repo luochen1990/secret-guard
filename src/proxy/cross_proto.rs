@@ -116,8 +116,9 @@ pub(crate) async fn cross_proto_forward(
     ir.extra.clear();
     ir.clear_wire_fidelity();
 
-    // 6. 快照真实 messages (redact 前) 给 DAG.
+    // 6. 快照真实 messages + system (redact 前) 给 DAG (system 用途见 same_proto 同型注释).
     let real_messages = ir.messages.clone();
+    let real_system = ir.system.clone();
 
     // 7. redact IR + derive redactions (共享 helper, 内含 consistency-check 守卫).
     //    FailClosed 模式下 probing 耗尽时 redact_and_derive 内部构造 503 并在此
@@ -213,6 +214,7 @@ pub(crate) async fn cross_proto_forward(
         redact_seed,
         Some(&secrets_snapshot),
         redactions,
+        real_system,
     );
     let (record_id, usage_ctx) = push_event_and_wire_usage(
         &state,

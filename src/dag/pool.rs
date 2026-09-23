@@ -22,7 +22,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::codec::ir::{IrBlock, IrImageSource, IrMessage, IrRole};
+use crate::codec::ir::{
+    ContentForm, IrBlock, IrImageSource, IrMessage, IrRole, ReasoningContentForm,
+};
 
 // ─── BlockHash ──────────────────────────────────────────────────────────────
 
@@ -139,20 +141,36 @@ pub(super) fn hash_block(block: &IrBlock) -> BlockHash {
 
 // ─── MessageRef ────────────────────────────────────────────────────────────
 
-/// 内容寻址的 message 引用 (role + block hash 列表).
+/// 内容寻址的 message 引用 (role + block hash 列表 + wire 形态元数据).
 ///
 /// 不直接持 IrBlock, 而是持 BlockHash 引用 BlockPool 中的 block.
 /// 相同内容的 message (相同 role + 相同 block 序列) 物理上共享 block.
+///
+/// # wire 形态元数据 (content_form / reasoning_content_form)
+///
+/// 随 message 原样存储, 让 `resolve_message` 重建的 IrMessage 与原始
+/// IrMessage **字节级等价** (经同协议 writer 重序列化后一致) — timeline
+/// delta 派生 (`derive::extract_delta_messages_from_blocks`) 的等价性根基.
+/// 若不存, resolve 后 content 形态回退 None (array), 裸 string content
+/// (`"content":"hi"`) 会变成 array 形态, 破坏与 req_body_raw 切片的等价.
 #[derive(Debug, Clone)]
 pub struct MessageRef {
     pub role: IrRole,
     pub blocks: Vec<BlockHash>,
+    /// 原始 wire 的 content 形态 (string / array / null). 见 `IrMessage::content_form`.
+    pub content_form: Option<ContentForm>,
+    /// assistant 消息 `reasoning_content` 字段的显式空/null 形态 (#176).
+    pub reasoning_content_form: Option<ReasoningContentForm>,
 }
 
 impl MessageRef {
     /// 计算本 message 的 hash (role + blocks 序列).
     ///
     /// 用于 Merkle prefix hash 的累积计算.
+    ///
+    /// **wire 形态元数据不参与 hash**: prefix 匹配的语义是 "内容相等"
+    /// (相同 role + 相同 block 内容); 同内容不同 wire 形态 (string vs array)
+    /// 的重发视为前缀命中, 与 hash 语义一致 (历史行为保持).
     pub(super) fn hash(&self) -> u64 {
         // tuple Hash: 先 role 再走 [BlockHash] 的 Hash (len + 每个元素), 与原增量实现等价.
         crate::util::hash64(&(&self.role, &self.blocks))
@@ -220,15 +238,21 @@ impl BlockPool {
 
     /// 把一个 IrMessage 拆解为 MessageRef, 所有 block 入池.
     ///
-    /// 返回的 MessageRef 的 blocks 全部已 intern (refcount 已 ++).
+    /// 返回的 MessageRef 的 blocks 全部已 intern (refcount 已 ++),
+    /// wire 形态元数据 (content_form / reasoning_content_form) 随 ref 保存.
     pub fn intern_message(&mut self, msg: &IrMessage) -> MessageRef {
         MessageRef {
             role: msg.role,
+            content_form: msg.content_form,
+            reasoning_content_form: msg.reasoning_content_form,
             blocks: msg.content.iter().map(|b| self.intern(b.clone())).collect(),
         }
     }
 
     /// 按 MessageRef 重建 IrMessage (从池中 deref 所有 block).
+    ///
+    /// wire 形态元数据从 ref 恢复 (B1); `contains_user_text` 不保留
+    /// (push 时一次性消耗, 见 `IrMessage` 文档), 重建后恒 false.
     pub fn resolve_message(&self, msg_ref: &MessageRef) -> Option<IrMessage> {
         let mut blocks = Vec::with_capacity(msg_ref.blocks.len());
         for &h in &msg_ref.blocks {
@@ -237,6 +261,8 @@ impl BlockPool {
         Some(IrMessage {
             role: msg_ref.role,
             content: blocks,
+            content_form: msg_ref.content_form,
+            reasoning_content_form: msg_ref.reasoning_content_form,
             ..Default::default()
         })
     }
