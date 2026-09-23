@@ -161,7 +161,8 @@ pub struct NodeView {
     /// `Arc<[(String,String)]>`: 共享切片而非 clone Vec.
     pub redactions: Arc<[(String, String)]>,
     /// parsed view (ingress codec writer 序列化的 IrResponse, LLM 视角含 mock).
-    /// timeline 路径直接消费, 前端不再 N+1 拉 /records/{id}?view=parsed.
+    /// B1 双态: 流式进行中 = stored 节流 parsed; finalize 后 = message + 元字段
+    /// 渲染派生 (`derive::response_parsed_from_parts`).
     pub parsed_response: Option<serde_json::Value>,
     /// 本轮 request delta (相对 parent 的增量 messages, 协议无关 wire JSON).
     ///
@@ -210,9 +211,10 @@ pub struct RoundBrief {
 /// timeline 每轮的完整数据 (含 request delta messages 的 wire JSON).
 ///
 /// 与 RoundBrief 的区别: 多了 redactions + req_delta_messages (前端渲染气泡用).
-/// `req_delta_messages` 通过 ingress codec writer 序列化 (BlockPool resolve → IR → wire),
-/// 保证同协议路径正确; 跨协议 / codec 缺失时 fallback 到 req_body_raw 末尾切片
-/// (旧实现, 已知有跨协议切片错位 bug, 见 AGENTS.md "已知限制").
+/// `req_delta_messages` B1 起从 BlockPool 结构化派生 (resolve + real→mock 投影替换
+/// + ingress writer 序列化, `derive::extract_delta_messages_from_blocks`), 与旧
+/// req_body_raw 末尾切片逐字节等价 (consistency-check shadow 守卫); OpenAI writer
+/// 的 ToolResult 拆分场景保持与旧切片一致的尾部对齐 (DTO-6 的错位行为不变).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TimelineRound {
     pub id: Uuid,
@@ -229,6 +231,8 @@ pub struct TimelineRound {
     /// 每个 tuple = (mock_value, secret_id), **永不**含真实 secret.
     pub redactions: Arc<[(String, String)]>,
     /// 本轮 request delta (相对 parent 的增量 messages, wire JSON).
+    /// B1: 从 BlockPool 结构化派生 (`derive::extract_delta_messages_from_blocks`,
+    /// 与旧 req_body_raw 切片逐字节等价 — 见 contracts.md DTO-5).
     /// 前端按 role 渲染气泡 (system/user/tool), 与末轮 response 抽屉互补.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub req_delta_messages: Vec<serde_json::Value>,
@@ -249,6 +253,7 @@ pub struct TimelineTail {
     pub round_id: Uuid,
     /// response 内容的字节长度 (前端用它判定是否需要更新抽屉).
     /// = parsed 序列化字节数 (parsed 为 None 时 fallback 到 raw_resp_body.len()).
+    /// B1: finalize 后 parsed 为派生值 (见下), length 语义不变 (派生序列化字节数).
     pub length: usize,
     pub resp_status: u16,
     pub elapsed_ms: u64,
@@ -257,7 +262,9 @@ pub struct TimelineTail {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// parsed view (ingress codec writer 序列化的 IrResponse, LLM 视角含 mock).
-    /// 流式响应由 StreamScan 累积; 非流式在响应完成时一次性计算.
+    /// B1 双态: 流式进行中 = stored 节流 parsed (StreamScan 快照); finalize 后 =
+    /// `response.message` + 元字段渲染派生 (`derive::response_parsed_from_parts`,
+    /// stored Value 已在 finalize 时清除).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parsed: Option<serde_json::Value>,
 }

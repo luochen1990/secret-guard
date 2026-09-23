@@ -9271,6 +9271,191 @@ async fn anthropic_messages_system_role_position_fidelity() {
     assert_eq!(content.len(), 2, "user 气泡含双 text block");
 }
 
+// ─── B1: timeline blocks 派生端到端 (DTO-5 等价 + tail 派生) ────────────────
+
+/// 测试内手工复刻的旧路径 oracle: 从 req_body_raw 末尾切 count 条 + OpenAI 根节点
+/// system 注入 (与 `derive::extract_delta_messages_from_raw` 逐分支一致, 但不经
+/// 生产代码 — 端到端锁定的意义正在于比对两条**独立实现**).
+fn legacy_raw_slice_oracle(req_body_raw: &str, count: usize, is_root: bool) -> Vec<serde_json::Value> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let body: serde_json::Value = serde_json::from_str(req_body_raw).unwrap();
+    let messages = body.get("messages").and_then(|m| m.as_array()).unwrap();
+    assert!(messages.len() >= count);
+    let start = messages.len() - count;
+    let mut result: Vec<serde_json::Value> = messages[start..].to_vec();
+    if is_root && start > 0 && messages[0].get("role").and_then(|r| r.as_str()) == Some("system") {
+        result.insert(0, messages[0].clone());
+    }
+    result
+}
+
+/// B1 e2e (OpenAI ingress + secret 命中 + 根 system + 子轮延续):
+/// ① timeline bubbles 与旧路径 oracle (req_body_raw 末尾切片, 测试内独立复刻)
+///    逐字节一致 — DTO-5 等价性的端到端锁定;
+/// ② secret 在 bubbles 中呈 mock (LLM 视角, 与 redactions 投影一致);
+/// ③ finalize 后 stored parsed 已清除, tail.parsed 从 message + 元字段派生.
+#[tokio::test]
+async fn timeline_blocks_derivation_e2e_openai_secret() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"cc-1","object":"chat.completion","created":1700000000,"model":"gpt-x","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}"#)
+        .create_async()
+        .await;
+
+    let real = openai_provider("oa", &upstream.url());
+    let dag = ConversationDag::new(64, 500, 1);
+    let dag_probe = dag.clone();
+    let proxy_url = spawn_proxy_static_dynamic(
+        vec![real],
+        vec![],
+        reqwest::Client::new(),
+        dag,
+        test_secret_table_with(vec![secret("tok", "sk-live-abcdef123456")]),
+    )
+    .await
+    .0;
+
+    // 第 1 轮 (根): system + user (text 内嵌 secret).
+    let (s1, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa/v1/chat/completions",
+        r#"{"model":"gpt-x","messages":[{"role":"system","content":"you are strict"},{"role":"user","content":"run with sk-live-abcdef123456 now"}]}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(s1, reqwest::StatusCode::OK);
+    // 第 2 轮 (子): 前缀重发 + assistant 回复 + 新 user.
+    let (s2, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa/v1/chat/completions",
+        r#"{"model":"gpt-x","messages":[{"role":"system","content":"you are strict"},{"role":"user","content":"run with sk-live-abcdef123456 now"},{"role":"assistant","content":"OK"},{"role":"user","content":"thanks, done"}]}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(s2, reqwest::StatusCode::OK);
+
+    let ids = dag_probe.list_node_ids_newest_first();
+    let child_id = ids[0];
+    let root_id = ids[1];
+    let root_view = dag_probe.get_node(root_id).unwrap();
+    let child_view = dag_probe.get_node(child_id).unwrap();
+    assert!(root_view.parent.is_none() && child_view.parent.is_some());
+
+    let sid = root_view.session_id;
+    let page = dag_probe.timeline_view(sid, None, 10).unwrap();
+    assert_eq!(page.rounds.len(), 2);
+    let round_root = &page.rounds[0];
+    let round_child = &page.rounds[1];
+    assert_eq!(round_root.id, root_id);
+
+    // ① bubbles == 旧路径 oracle (逐字节).
+    let root_raw = dag_probe.get_node_detail(root_id).unwrap().req_body_raw;
+    let child_raw = dag_probe.get_node_detail(child_id).unwrap().req_body_raw;
+    let oracle_root = legacy_raw_slice_oracle(&root_raw, root_view.req_delta_count, true);
+    let oracle_child = legacy_raw_slice_oracle(&child_raw, child_view.req_delta_count, false);
+    assert_eq!(
+        round_root.req_delta_messages, oracle_root,
+        "root bubbles (blocks 派生) == 旧 raw 切片 oracle (含 system 注入)"
+    );
+    assert_eq!(
+        round_child.req_delta_messages, oracle_child,
+        "child bubbles (blocks 派生) == 旧 raw 切片 oracle"
+    );
+
+    // ② system 注入在首位 + secret 呈 mock (LLM 视角).
+    assert_eq!(round_root.req_delta_messages[0]["role"], "system");
+    assert_eq!(round_root.req_delta_messages[0]["content"], "you are strict");
+    let user_bubble = &round_root.req_delta_messages[1];
+    let mock = round_root.redactions[0].0.clone();
+    let bubble_text = user_bubble["content"].as_str().unwrap();
+    assert!(bubble_text.contains(&mock), "bubble 含 mock: {bubble_text}");
+    assert!(!bubble_text.contains("sk-live-abcdef123456"), "bubble 不得含 real");
+
+    // ③ tail 派生: stored parsed 已清除, message + 元字段 → ingress writer.
+    let resp = dag_probe.get_response(child_id).unwrap();
+    assert!(resp.parsed.is_none(), "finalize 后 stored parsed 已清除 (B1)");
+    let tail = &page.tail;
+    assert!(tail.resp_complete);
+    let parsed = tail.parsed.as_ref().expect("tail parsed 派生");
+    assert_eq!(parsed["choices"][0]["message"]["content"], "OK");
+    assert_eq!(parsed["id"], "cc-1");
+    assert_eq!(parsed["model"], "gpt-x");
+    assert_eq!(tail.length, parsed.to_string().len());
+}
+
+/// B1 e2e (Anthropic ingress + secret, buffered_ir 路径): tail.parsed 派生的是
+/// **LLM 视角** (含 mock) — 与发给客户端的 restored 响应 (真 secret) 分离,
+/// 与旧行为 (stored parsed 存 pre-restore 快照) 语义一致.
+///
+/// mock 预测: mock 生成是 seed 确定性的 (C3), 上游回显 mock (生产中 LLM 只见过
+/// mock); 测试用 init_seed + gen_candidate(counter=0) 预测同一 mock (与
+/// redact::tests::predict_mock 同型 — 随机 mock 不会撞 IR 内容, probing 不推进).
+#[tokio::test]
+async fn timeline_tail_derived_parsed_keeps_llm_view_anthropic() {
+    let entry = secret("tok2", "sk-live-zzz123456789");
+    let seed = secret_guard::redact::init_seed(std::slice::from_ref(&entry));
+    let mock =
+        secret_guard::mock::gen_candidate(&entry.value, &entry.mock_strategy, seed, 0);
+
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/messages")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(format!(
+            r#"{{"id":"msg-9","type":"message","role":"assistant","model":"claude-x","content":[{{"type":"text","text":"echo {mock}"}}],"stop_reason":"end_turn","usage":{{"input_tokens":1,"output_tokens":2}}}}"#
+        ))
+        .create_async()
+        .await;
+
+    let real = provider_with("an", Protocol::Anthropic, &upstream.url());
+    let dag = ConversationDag::new(64, 500, 1);
+    let dag_probe = dag.clone();
+    let proxy_url = spawn_proxy_static_dynamic(
+        vec![real],
+        vec![],
+        reqwest::Client::new(),
+        dag,
+        test_secret_table_with(vec![secret("tok2", "sk-live-zzz123456789")]),
+    )
+    .await
+    .0;
+
+    let (status, resp_body, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/a/an/v1/messages",
+        r#"{"model":"claude-x","max_tokens":32,"messages":[{"role":"user","content":"use sk-live-zzz123456789 here"}]}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+
+    let id = dag_probe.list_node_ids_newest_first()[0];
+    let resp = dag_probe.get_response(id).unwrap();
+    assert!(resp.parsed.is_none(), "stored parsed 已清除");
+
+    // 客户端侧: restore 后的响应含真 secret (mock → real).
+    assert!(resp_body.contains("sk-live-zzz123456789"), "client got real");
+
+    // tail 派生: LLM 视角 (含 mock), 不含真 secret.
+    let node = dag_probe.get_node(id).unwrap();
+    let page = dag_probe.timeline_view(node.session_id, None, 10).unwrap();
+    let parsed = page.tail.parsed.as_ref().expect("tail parsed derived");
+    let parsed_str = parsed.to_string();
+    assert!(!parsed_str.contains("sk-live-zzz123456789"), "tail 是 LLM 视角 (mock)");
+    let redactions = &page.rounds[0].redactions;
+    let mock = &redactions[0].0;
+    assert!(parsed_str.contains(mock.as_str()), "tail 含 mock: {parsed_str}");
+}
+
 #[tokio::test]
 async fn model_rewrite_switch_via_put() {
     // 即席切换模型: 路由 endpoint PUT 路由的 upstream_model 后, 新请求用新 model

@@ -160,13 +160,19 @@ GET    /api/usage/summary[?hours=N]  → UsageSummary {range, pricing_status, to
 - `timeline_diff(sid, after, tail_length)`: sync 轮询的 diff.
   返回 `Option<TimelineDiffData { new_rounds, tail }>`, None = 无变化 (304 等价).
 
-**req_delta_messages 实现**: 当前从 `req_body_raw` 末尾切片 (已 redact, LLM 视角, 安全).
-不走 BlockPool + codec writer 路径 (会泄露真实 secret, 需在 web 层重建 redactMap — TODO).
-已知限制: 跨协议 writer 拆分场景切片 start 偏小, delta 可能含前序轮消息 (同协议不受影响).
-详见 `derive.rs::extract_delta_messages_from_raw`.
+**req_delta_messages 实现** (B1): 从 BlockPool 结构化派生 (`derive::extract_delta_messages_from_blocks`)
+— `req_delta` (MessageRef, real 视角) resolve → real→mock 替换 (`redactions` 投影重建, 不含真
+实 secret 输出) → ingress writer 序列化 + 根节点 system 注入 (system 来自根节点 `system_refs`).
+与旧 req_body_raw 末尾切片**逐字节等价**: 常驻 proptest `prop_blocks_derivation_matches_raw`
+(生成器矩阵) + consistency-check shadow `assert_delta_view_matches_raw` (渲染点) 双重守卫.
+旧实现 (`extract_delta_messages_from_raw`) 保留为 oracle, 生产路径不再调用.
+已知限制 (行为保持, 未修复): OpenAI writer 的 ToolResult 拆分场景切片 start 偏小, delta 可能含
+前序轮消息 (同协议不受影响; 修复属 DTO-6 ⏳).
 
-**tail (response 抽屉)**: 末轮 (链中最新) 的 response 内容. `length` = parsed 序列化字节数
-(parsed=None 时 fallback 到 raw_resp_body.len()). 前端用它判定是否需要更新抽屉.
+**tail (response 抽屉)**: 末轮 (链中最新) 的 response 内容. B1 双态: finalize 后从
+`response.message` + 元字段渲染派生 (`derive::response_parsed_from_parts`); 流式进行中
+沿用 stored 节流 parsed (前端实时进度). `length` = parsed 序列化字节数 (parsed 为 None
+时 fallback 到 raw_resp_body.len()). 前端用它判定是否需要更新抽屉.
 非末轮的 response 内容已被下一轮 delta 的 assistant message 包含 (Phase A 决策), 故 tail
 只代表"最新尚未被 delta 消费的 response".
 

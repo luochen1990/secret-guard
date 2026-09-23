@@ -30,11 +30,12 @@
                                           ▼ (proxy 层 fan_out 累积)
 ┌─────────────────────── 信任域 B: 派生链 (derivation pipeline) ───────────────────┐
 │                                                                                   │
-│   upstream bytes ──► StreamScan ──► resp_parsed                                   │
-│   upstream bytes ──► DAG Node (req_delta + response)                              │
+│   upstream bytes ──► StreamScan ──► resp_parsed (流式进行中)                       │
+│   upstream bytes ──► DAG Node (req_delta + response.message)                      │
 │   RedactionMap    ──► redactions 字段                                              │
 │   req_body        ──► preview / model                                              │
-│   req_body_raw    ──► req_delta_messages                                           │
+│   req_delta (B1)  ──► req_delta_messages (BlockPool 派生 + 投影替换 + writer)      │
+│   response.message (B1) ──► resp_parsed (finalize 后渲染派生)                      │
 │                                                                                   │
 └───────────────────────────────────────────────────────────────────────────────────┘
                                           │
@@ -635,12 +636,13 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 ### DTO-3 resp_parsed 从 StreamScan 派生
 
-**陈述**: 流式响应的 `resp_parsed` 必须从 StreamScan 累积派生. 非流式响应从 reader.read_response(raw_body) 计算.
+**陈述**: 流式响应的 `resp_parsed` 必须从 StreamScan 累积派生. 非流式响应从 reader.read_response(raw_body) 计算. B1 起稳态 parsed 不再长期存 Value: finalize 时 intern `response.message` (LLM 视角) + 元字段 (usage/stop_reason/stop_sequence/id/created) 进 [`ResponseData`] 并清除 stored parsed; 渲染点 (timeline tail / NodeView / records view) 从 message + 元字段经 ingress writer 派生 (`derive::response_parsed_from_parts`). **流式进行中** (message 未写) 保留 stored 节流 parsed (前端实时进度).
 
 **Properties**:
 - `prop_streaming_resp_parsed_equals_stream_scan_snapshot`: 流式 resp_parsed == StreamScan snapshot. 🔁→`streaming_parsed_view_accumulates_text` (`tests/integration.rs`; 仅 text 累积维度)
 - `prop_non_streaming_resp_parsed_equals_reader_parse`: 非流式 resp_parsed == reader.read_response(raw_resp_body). 🔁→`assert_resp_parsed_matches_source_nonstream` (`src/proxy/recorder.rs`, consistency-check) + `web_api_records_view_parsed_openai_returns_structured`
 - `prop_resp_parsed_consistency_check`: resp_parsed 字段必须能通过 consistency-check 断言 (与原始数据视图一致). 🔁→`assert_resp_parsed_matches_source_nonstream` (`src/proxy/recorder.rs`, CI `just check-features` 执行)
+- `prop_resp_parsed_derived_matches_stored_pre_clear`: B1 派生 (message + 元字段 → writer) == 清除前 stored parsed (同 ir 直接 writer 序列化); finalize 处 "先断言后删除" (id/created 缺失时 writer 合成非确定, 归一化比对). 🔁→`assert_tail_parsed_matches_stored` (`src/proxy/recorder.rs`, consistency-check)
 
 ### DTO-4 preview 提取 best-effort
 
@@ -655,13 +657,15 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 ### DTO-5 req_delta_messages 切片正确
 
-**陈述**: timeline 路径的 `req_delta_messages` 必须是本轮新增的 messages (从 req_body_raw 末尾截取), 同协议路径下与 IR req_delta 一致.
+**陈述**: timeline 路径的 `req_delta_messages` 从 **BlockPool 结构化派生** (B1): `req_delta` (MessageRef, real 视角) → resolve → real→mock 替换 (redactions 投影重建, `redact::rebuild_real_to_mock_pairs`) → ingress writer 序列化 → 尾 `count` 条 (+ 根节点 system 注入, 仅 OpenAI ingress 可达 — Anthropic writer 对 messages 1:1, 根节点恒 start==0). 与旧实现 (req_body_raw 末尾切片, 保留为 oracle) **逐字节等价** — `req_body_raw` 不再是 timeline 渲染的数据源 (B2 "详细日志" 开关的硬前置).
 
 **Properties**:
-- `prop_delta_slice_correct_same_proto`: 同协议路径下, req_delta_messages 与 IR req_delta (resolve + ingress writer 重序列化) 一致. ✅
+- `prop_blocks_derivation_matches_raw`: blocks 派生 == 旧 raw 切片, 生成器矩阵覆盖 OpenAI/Anthropic × system 四形态 × delta 规模 × ToolUse/ToolResult/Image/content 形态 × secret 0..3 命中+未命中 × 根/非根. ✅
+- `prop_delta_slice_correct_same_proto`: 同协议路径下, req_delta_messages 与 IR req_delta (resolve + ingress writer 重序列化) 一致. ✅ (即上条的语义陈述, 由 blocks 派生按构造成立)
 - `prop_delta_includes_system_at_root`: 根节点 (start > 0) 的 delta 补回 system prompt. ✅
 - `prop_delta_handles_non_json_body`: 非 JSON body 时返回空 vec (不 panic). ✅
 - `prop_delta_handles_count_mismatch`: messages 数 < req_delta_count 时返回空 vec. ✅
+- shadow 守卫 (渲染点, 每次 timeline 构造比对新旧两路径): `assert_delta_view_matches_raw` (`src/derive.rs`, consistency-check, VIEW-2 表). 🔁→`assert_delta_view_matches_raw`
 
 ### DTO-6 跨协议 delta 切片行为定义
 
@@ -955,7 +959,8 @@ real 还原进去等于精准投放泄露. 故默认"偏安全", 暴露侧行为
 | `preview` / `model` | extract_preview_and_model | ✅ `proxy/recorder.rs::assert_preview_model_match_source` ¹ |
 | `resp_parsed` (非流式) | reader.read_response | ✅ `proxy/recorder.rs::assert_resp_parsed_matches_source_nonstream` |
 | `resp_parsed` (流式) | StreamScan snapshot | ⏳ Phase A 已删除原始 SSE 字节, 派生与源物理分离, 暂无法守卫 |
-| `req_delta_messages` | extract_delta_messages_from_raw (derive.rs) | (每次 timeline 请求重算, 无 drift 风险) |
+| `resp_parsed` (B1 渲染派生) | response.message + 元字段 → writer | ✅ `proxy/recorder.rs::assert_tail_parsed_matches_stored` (finalize 处, 先断言后删除) |
+| `req_delta_messages` | BlockPool 派生 (B1): resolve + 投影替换 + writer | ✅ `derive.rs::prop_blocks_derivation_matches_raw` (常驻) + `assert_delta_view_matches_raw` (shadow, consistency-check) |
 | `session.title` | find_root_title | ✅ `dag/mod.rs::assert_session_title_matches_root_preview` |
 
 > ¹ `preview` 守卫只覆盖 `build_call_event` 阶段 (event 构造时). `push_messages` 在

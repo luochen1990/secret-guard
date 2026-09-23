@@ -160,6 +160,10 @@
 `preview`/`model` 从 `req_body_raw` 派生 (`proxy/recorder.rs::assert_preview_model_match_source`)、
 `resp_parsed` (非流式) 从上游响应字节经 codec reader 派生 (`proxy/recorder.rs::assert_resp_parsed_matches_source_nonstream`)、
 `session.title` 从 root node preview 派生 (`dag/mod.rs::assert_session_title_matches_root_preview`)、
+`req_delta_messages` 从 BlockPool 派生 (B1, 与旧 raw 切片等价 — 渲染点 shadow `derive.rs::assert_delta_view_matches_raw`
++ 常驻 proptest `prop_blocks_derivation_matches_raw`)、
+`resp_parsed` finalize 后从 `response.message` + 元字段渲染派生 (B1, finalize 处先断言后删除
+`proxy/recorder.rs::assert_tail_parsed_matches_stored`; 流式进行中仍读 stored 节流 parsed)、
 `resp_parsed` (流式) 从 StreamScan 累积 (`proxy/fan_out.rs`, Phase A 已删除原始 SSE 字节, 派生与源物理分离, 暂不守卫).
 后续 Phase B 删除 parent.response 时必须走此流程.
 
@@ -347,7 +351,7 @@ Pool 不进此本地终结分支 (Router 专属) — pool 入口的 /models 经 
 | `codec/` | 跨协议 IR + Reader/Writer trait + StreamTranslate (OpenAI / Anthropic / Responses) | **`src/codec/AGENTS.md`** + `docs/design/ir-fields-roadmap.md` (IR 字段建模路线图: extra 边界 + 字段提升判定准则 + 实施批次) |
 | `config.rs` | 双层配置 schema + `DynamicTable<T>` 泛型 + 持久化 + 静态配置预检审计 (未知 section/字段 → 启动 WARN, #159) | 文件头部 `//!` (覆盖 OverrideMode / CRUD / Effective source / 跨表并发) |
 | `dag/` (模块目录: mod/pool/types/view/timeline) | ConversationDAG 内容寻址存储 (BlockPool + Node + Merkle) | `src/dag/mod.rs` 头部 `//!` + `docs/design/conversation-dag.md` |
-| `derive.rs` | 从 request body 派生 preview/model/text 的字节级提取 + delta messages 切片 (域 B 派生链, ROB-1 永不 panic) | 文件头部 `//!` (含 "为什么不在 web::api" 归属论证) |
+| `derive.rs` | 从 request body / DAG 结构化存储派生 WebUI 轻量视图: preview/model/text 字节级提取 + delta messages (B1: BlockPool 派生 `extract_delta_messages_from_blocks`, 与旧 raw 切片逐字节等价) + tail parsed 渲染派生 (`response_parsed_from_parts`) (域 B 派生链, ROB-1 永不 panic) | 文件头部 `//!` (含 "为什么不在 web::api" 归属论证) |
 | `dto.rs` | WebUI 响应 DTO 中立类型层 (SessionView/NodeView/.../SyncSnapshot, 域 B → 域 C wire shape; 构造逻辑留 dag) | 文件头部 `//!` (含 "为什么是顶层中立模块" 归属论证) |
 | `error.rs` | 统一应用错误类型 `AppError` (转发链 + 鉴权层共用, 不反向依赖) | 文件头部 `//!` (含与 `web::api::ApiError` 分工 + Upstream/UpstreamTimeout message 净化回传契约) |
 | `main.rs` / `cli.rs` / `lib.rs` | 二进制入口 + CLI 参数 schema | 文件头部 `//!` |

@@ -2,16 +2,23 @@
 //!
 //! # 职责边界
 //!
-//! 本模块提供协议无关的派生函数, 从 request body 提取:
+//! 本模块提供协议无关的派生函数, 从 request body / DAG 结构化存储提取:
 //! - sidebar 标题 preview + model 名 + message 文本片段 (`extract_preview_and_model` /
 //!   `extract_preview_and_model_from_ir` / `extract_text_blocks`).
 //! - 工具轮次 preview = tool name (`extract_tool_use_name`): DAG push_messages 在
 //!   `round_role = Tool` 时调用, 覆盖 `extract_preview` 的 fallback 结果.
-//! - timeline delta messages 切片 (`extract_delta_messages_from_raw`): 从 req_body_raw
-//!   末尾截取 req_delta.len() 条 messages, 含根节点 system prompt 注入.
+//! - timeline delta messages (B1 数据源: `extract_delta_messages_from_blocks`):
+//!   从 BlockPool 结构化派生 (resolve → real→mock 投影替换 → ingress writer 序列化
+//!   + 根节点 system 注入); 旧 raw 切片实现 (`extract_delta_messages_from_raw`)
+//!   保留为 consistency-check shadow 对照 + 等价性 oracle.
+//! - timeline tail parsed (B1: `response_parsed_from_parts`): response.message +
+//!   元字段 → ingress writer 序列化 (finalize 后 stored parsed 已清除的渲染派生).
 //!
 //! 这些派生属于 **域 B (派生链)**: 从原始字节 (域 A 透明中继产出的 `req_body_raw`)
-//! 或已解析的 IR 派生 WebUI 需要的轻量视图.
+//! 或 DAG 内容寻址存储 (`req_delta` / `response.message`, real 视角) 派生 WebUI
+//! 需要的轻量视图. 视角纪律: 出 web 层的派生结果一律为 **LLM 视角** (含 mock,
+//! real→mock 替换经 redactions 投影重建, 不经 seed 重放 — 见
+//! `redact::rebuild_real_to_mock_pairs` 文档的论证).
 //!
 //! # 为什么不在 `web::api`
 //!

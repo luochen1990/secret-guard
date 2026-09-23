@@ -288,8 +288,10 @@ pub struct ResponseData {
     pub resp_complete: bool,
     pub error: Option<String>,
     /// parsed view (ingress codec writer 序列化的 IrResponse, LLM 视角含 mock).
-    /// 流式响应由 StreamScan 增量累积; 非流式在响应完成时一次性计算.
-    /// `None` 表示尚未有解析结果 (流刚开始 / codec 不支持此协议 / 解析失败).
+    /// B1 双态: **流式进行中** = ParsedSync 节流写入的快照 (前端实时进度, 经
+    /// `update_parsed_response`); **finalize 后被清除** (set None) — 渲染点从
+    /// `message` + 元字段派生 (`derive::response_parsed_from_parts`, 稳态不再
+    /// 长期存 Value — B2 "详细日志" 开关的硬前置).
     pub parsed: Option<serde_json::Value>,
     /// 上游响应状态码 (attach 时填入; 也镜像到 CallEvent 供 NodeView).
     pub resp_status: u16,
