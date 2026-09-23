@@ -339,6 +339,7 @@ pub async fn serve(
         on_unsupported_protocol,
         on_fallback_restore,
         redacted_headers,
+        inject_cache_control,
     } = redact_config;
     auth_config.validate().map_err(|e| anyhow::anyhow!(e))?;
 
@@ -438,6 +439,7 @@ pub async fn serve(
         on_unsupported_protocol,
         on_fallback_restore,
         redacted_headers: crate::state::normalize_redacted_headers(&redacted_headers),
+        inject_cache_control,
         upstream_timeouts,
         model_lists: Arc::new(crate::proxy::ModelListCache::new()),
         usage: Arc::new(crate::usage::UsageStore::open(

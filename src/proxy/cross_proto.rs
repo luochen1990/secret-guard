@@ -135,7 +135,19 @@ pub(crate) async fn cross_proto_forward(
             .iter()
             .map(|m| count_reasoning_blocks(&m.content))
             .sum::<usize>();
-    let egress_body_value = egress_writer.write_request(&ir);
+    let egress_body_value = {
+        let mut v = egress_writer.write_request(&ir);
+        // M3 (#269): Anthropic egress + opt-in 时注入顶层自动缓存标记 (与 same-proto
+        // IR 路径同契约; OpenAI/Responses ingress 无 block 级缓存概念可透传, 自动
+        // 模式让跨协议用户同样吃到前缀缓存).
+        if egress_codec == CodecProtocol::Anthropic
+            && state.inject_cache_control
+            && super::helpers::inject_auto_cache_control(&mut v)
+        {
+            debug!(provider = %upstream_id, "injected top-level automatic cache_control (cross-proto anthropic egress)");
+        }
+        v
+    };
     let egress_bytes = serde_json::to_vec(&egress_body_value)
         .map_err(|e| AppError::Internal(format!("serialize egress body failed: {e}")))?;
 

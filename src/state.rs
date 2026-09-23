@@ -62,6 +62,11 @@ pub struct AppState {
     /// `proxy::helpers::redact_headers` — 与硬编码黑名单并集生效 (SEC-4),
     /// 请求/响应两侧所有 record 记录点统一取本字段.
     pub redacted_headers: Arc<[String]>,
+    /// 来自 `[redact] inject_cache_control` (默认 false, 显式 opt-in). 开启后,
+    /// Anthropic egress 的 IR 路径 (same-proto IR + cross-proto) 对无任何缓存
+    /// 标记的请求注入顶层自动缓存标记 (automatic caching, #269 M3). 守卫与
+    /// 消费点见 `proxy::helpers::inject_auto_cache_control`.
+    pub inject_cache_control: bool,
     /// 来自 `[server] upstream_*_timeout_secs` 的上游超时配置.
     /// forward 路径用它给 send().await / stream chunk 加超时保护.
     pub upstream_timeouts: crate::config::UpstreamTimeouts,

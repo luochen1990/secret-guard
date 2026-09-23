@@ -207,6 +207,28 @@ pub struct RedactConfig {
     /// 与硬编码黑名单 (`proxy::helpers::is_sensitive_header`) 并集生效 (SEC-4).
     /// 默认空 = 行为不变. 归一化见 `state.rs::normalize_redacted_headers`.
     pub redacted_headers: Vec<String>,
+    /// 同协议/跨协议 IR 路径的 Anthropic egress 请求注入顶层自动缓存标记
+    /// `cache_control: {"type":"ephemeral"}` (Anthropic automatic caching, #269 M3).
+    ///
+    /// 背景: IR 路径 (配置了 secrets 或 model 改写) 上, 客户端自带的 block 级
+    /// `cache_control` 由 M1 wire-fidelity 保真; 但不发缓存标记的客户端 (curl 脚本、
+    /// 未启用缓存的 agent 框架) 经 IR 路径后请求无任何缓存标记 → 上游前缀缓存彻底
+    /// 失效, 长 agent 会话 input 成本放大约一个数量级. 本开关开启后注入顶层标记
+    /// 启用 automatic caching (断点自动跟随会话末尾, 与 block 级显式断点互补).
+    ///
+    /// 守卫: 改写后 body 内已存在任何 `cache_control` (顶层或 block 级) 时不注入 —
+    /// Anthropic 限制显式断点最多 4 个, 全占时顶层标记会 400. 默认 `false`
+    /// (主动改写 wire 属显式 opt-in, 与 [redact] 其余开关的降级偏安全取向一致).
+    ///
+    /// 配置示例 (`secret-guard.toml`):
+    /// ```toml
+    /// [redact]
+    /// inject_cache_control = true
+    /// ```
+    ///
+    /// 边界: 对顶层 `cache_control` 返回 400 的旧版 Bedrock 集成 (Opus 4.6 及更早)
+    /// 需保持默认关闭; 第三方 Anthropic 兼容上游若严格拒绝未知顶层字段同理.
+    pub inject_cache_control: bool,
 }
 
 /// Mock probing 耗尽时 (弱配置 + 对抗性 IR 无法生成唯一 mock) 的处理策略.
@@ -548,6 +570,7 @@ const KNOWN_FIELDS: &[(&str, &[&str])] = &[
             "on_unsupported_protocol",
             "on_fallback_restore",
             "redacted_headers",
+            "inject_cache_control",
         ],
     ),
     // Config::usage (UsageConfig, usage-stats)
