@@ -2023,7 +2023,8 @@ mod tests {
         )
             .prop_flat_map(move |(proto, system, msgs, salt)| {
                 // secrets 数量 0..=3 (2/5 概率 0 条 = seed=0 轴); 长度互异覆盖替换序;
-                // 偶数 salt 再加一条恒未命中 secret (只进 policy 快照, 不进文本).
+                // 偶数 salt 再加一条未命中 secret (只进 policy 快照, 生成器文本索引
+                // 0..4 在 n_secrets==3 时可指到它 — 命中亦无妨, 等价性对任意组合成立).
                 let n_secrets = ((salt % 5) as usize).saturating_sub(1);
                 let mut secrets: Vec<SecretEntry> = (0..n_secrets)
                     .map(|i| {

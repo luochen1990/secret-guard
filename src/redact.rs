@@ -1545,9 +1545,10 @@ mod tests {
         let secrets = [entry("real-x")];
         let ghost = vec![("m".to_string(), "no-such-id".to_string())];
         assert!(rebuild_real_to_mock_pairs(&ghost, &secrets).is_none());
-        // 混合: 一条可解析 + 一条漂移 → 整体 None (部分映射不可用即不可用)
+        // 混合: 一条可解析 (entry() 的 id 格式是 id-{value}) + 一条漂移 →
+        // 整体 None (部分映射不可用即不可用).
         let mixed = vec![
-            ("m1".to_string(), "real-x".to_string()),
+            ("m1".to_string(), "id-real-x".to_string()),
             ("m2".to_string(), "no-such-id".to_string()),
         ];
         assert!(rebuild_real_to_mock_pairs(&mixed, &secrets).is_none());
