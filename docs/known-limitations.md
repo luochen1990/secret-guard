@@ -44,6 +44,7 @@
 ## derive (派生与 WebUI 数据)
 
 - **跨协议 ingress 的 timeline delta 切片可能丢失本轮头部**: OpenAI writer 会把 Anthropic 风格的混合 Text+ToolResult user 消息拆成 (1+N) 条 wire messages, 使 delta 的 wire 展开多于 IR message 数. B1 起生产切片是 BlockPool 派生 (`extract_delta_messages_from_blocks`), 尾部对齐语义与旧 raw 切片逐字节等价 — 拆分场景下 delta 可能**丢失本轮展开的头部** (伴随的 user text 气泡与部分 tool 消息), 不会混入前序轮消息. 同协议路径不受影响. 多端点 fallback (ingress 无精确匹配端点 → 首端点跨协议翻译) 场景同受此限. 详见 `src/web/AGENTS.md`.
+- **畸形多 system 请求的注入形态分歧 (等价性边界外)**: 请求含多条 role=system 消息 (畸形输入, 协议语义外) 时, 旧 raw 切片路径注入 messages[0] 首条, 新 BlockPool 派生路径注入 reader 合并提升后的单条 system — 两路径输出不同. 该形态非等价性目标, consistency-check shadow (`assert_delta_view_matches_raw`) 对其跳过; 生成器不覆盖此轴 (补轴需先统一行为, 属 DTO-6 框架的后续工作).
 
 ## pool (套餐池)
 

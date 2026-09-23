@@ -10250,6 +10250,21 @@ async fn audit_capture_off_cross_proto_marks_uncaptured() {
     assert!(resp.raw_resp_body.is_empty(), "cross-proto raw not stored");
 }
 
+/// B2 段内小 helper: 轮询等待 DAG node 数超过 `at_least` (push 落地信号).
+/// 用于在途切换测试: 保证 PUT 开关发生在 push **之后** (决策语义不被翻转),
+/// 消除固定 sleep 在 CI 负载下的时序假设. 5s 未落地按断言失败处理.
+async fn wait_for_push(dag: &ConversationDag, at_least: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while dag.node_count() <= at_least {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "push not landed within 5s (node_count={})",
+            dag.node_count()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// B2 段内小 helper: PUT /api/settings (断言 200 + 回显新值).
 async fn put_settings(proxy_url: &str, v: bool) {
     let (s, body, _) = proxy_request(
@@ -10307,8 +10322,9 @@ async fn audit_capture_toggle_inflight_request_keeps_push_decision() {
             .await
         })
     };
-    // 等 push 完成 (请求已发出, 在途), 再切换开关 on.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // 等 push 落地 (node 出现) 再切换 — 轮询而非固定 sleep (CI 负载下 push 可
+    // 能 >150ms; PUT 若先于 push 落地, 决策取新值, 断言语义被翻转 → flake).
+    wait_for_push(&dag_probe, 0).await;
     put_settings(&proxy_url, true).await;
 
     let (inflight_status, _, _) = inflight.await.unwrap();
@@ -10372,8 +10388,8 @@ async fn audit_capture_toggle_off_inflight_still_captures_both_sides() {
             .await
         })
     };
-    // push 已发生 (on), 请求在途 — 切换 off.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // push 已落地 (on), 请求在途 — 切换 off (轮询而非 sleep, 防决策翻转 flake).
+    wait_for_push(&dag_probe, 0).await;
     put_settings(&proxy_url, false).await;
 
     let (inflight_status, _, _) = inflight.await.unwrap();

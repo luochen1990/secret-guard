@@ -348,6 +348,13 @@ pub(crate) async fn fan_out_streaming(
                         // 视图正确性守卫 (同协议 fan_out 非流式路径): reader 解析与
                         // raw bytes 的 round-trip 抽查 (与 B1 前同一语义 — 比对值从
                         // stored parsed 换成 finality 的同源对照值).
+                        //
+                        // 与 buffered_ir 路径 (守卫在 match 外恒调用) 的不对称是
+                        // 有意的: 此处 reader 即本分支的解析器 (parsed_ir None =
+                        // 守卫内 reader 也会 None, 无信息量); buffered_ir 的守卫
+                        // reader 与分支判定独立, 故恒调用有意义. 若未来 reader 出现
+                        // "本处 parse 失败但守卫 parse 成功" 的分裂形态, 应将本守卫
+                        // 提出 match 恢复恒调用.
                         #[cfg(feature = "consistency-check")]
                         assert_resp_parsed_matches_source_nonstream(
                             finality.stored_parsed.as_ref(),

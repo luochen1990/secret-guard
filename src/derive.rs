@@ -439,10 +439,22 @@ pub(crate) fn extract_delta_messages_from_blocks(
     }
 
     // real → mock (视角对齐: 旧路径 req_body_raw 是 LLM 视角含 mock).
-    let pairs = crate::redact::rebuild_real_to_mock_pairs(
+    // 漂移 (None): redactions 有条目无法从 policy 快照解析 — 降级偏安全
+    // (SEC-10): 该 delta 内容一律占位, 绝不让 real secret 因映射缺失泄入
+    // timeline (旧路径 raw 是 redact 后字节, 同场景不泄).
+    let pairs = match crate::redact::rebuild_real_to_mock_pairs(
         &node.event.redactions,
         &node.event.policy.secrets,
-    );
+    ) {
+        Some(pairs) => pairs,
+        None => {
+            tracing::warn!(
+                node = %node.id,
+                "redaction projection drift: redactions unresolvable from policy snapshot; timeline delta degraded to placeholders"
+            );
+            return placeholder_delta_messages(node, protocol);
+        }
+    };
     if !pairs.is_empty() {
         crate::redact::apply_real_to_mock_messages(&mut msgs, &pairs);
     }
@@ -486,6 +498,39 @@ pub(crate) fn extract_delta_messages_from_blocks(
     }
 
     result
+}
+
+/// 投影漂移降级的占位渲染 (M1, SEC-10 降级偏安全): 每条 req_delta 渲染为一条
+/// 占位消息 (role 保真, 文本统一占位), 经 writer 的 Text 1:1 展开保证条数不变
+/// (UI-1 气泡数 == req_delta 长度). 根节点不注入 system (占位语义下无增量信息).
+fn placeholder_delta_messages(
+    node: &crate::dag::Node,
+    protocol: crate::codec::Protocol,
+) -> Vec<serde_json::Value> {
+    use crate::codec::ir::{IrBlock, IrMessage, IrRequest};
+    const DRIFT_PLACEHOLDER: &str = "[secret-guard] 内容已抑制: redaction 映射漂移";
+    let writer = protocol.writer();
+    node.req_delta
+        .iter()
+        .filter_map(|r| {
+            let m = IrMessage {
+                role: r.role,
+                content: vec![IrBlock::Text {
+                    text: DRIFT_PLACEHOLDER.to_string(),
+                }],
+                ..Default::default()
+            };
+            writer
+                .write_request(&IrRequest {
+                    messages: vec![m],
+                    ..Default::default()
+                })
+                .get("messages")?
+                .as_array()?
+                .first()
+                .cloned()
+        })
+        .collect()
 }
 
 /// tail parsed 派生 (B1): response.message (LLM 视角 blocks, MessageRef) +
@@ -571,6 +616,17 @@ pub(crate) fn assert_delta_view_matches_raw(node: &crate::dag::Node, pool: &crat
     if node.event.ingress_protocol.is_none() || !node.event.audit_captured {
         return;
     }
+    // 畸形边界跳过 (known-limitations "derive" 节): 请求含多条 role=system 消息时
+    // 新旧路径的 system 注入形态分歧 (旧: 克隆 messages[0]; 新: reader 合并提升后
+    // 单条 system, 见 read_request 的 system.extend). 畸形输入非等价性目标 —
+    // drift assert 跳过该节点, 只 debug 记录.
+    if count_system_roles(&node.event.req_body_raw) > 1 {
+        tracing::debug!(
+            node = %node.id,
+            "skip delta drift assert: malformed multi-system request (documented divergence)"
+        );
+        return;
+    }
     let derived = extract_delta_messages_from_blocks(node, pool);
     let oracle = extract_delta_messages_from_raw(node);
     debug_assert_eq!(
@@ -582,6 +638,21 @@ pub(crate) fn assert_delta_view_matches_raw(node: &crate::dag::Node, pool: &crat
         node.event.ingress_protocol,
         node.req_delta.len()
     );
+}
+
+/// 数 wire messages 中 role=system 的条数 (consistency-check 跳过判定用;
+/// parse 失败返回 0 — 该节点 delta 派生也会因无 messages 而空, 无需跳过).
+#[cfg(feature = "consistency-check")]
+fn count_system_roles(req_body_raw: &str) -> usize {
+    serde_json::from_str::<serde_json::Value>(req_body_raw)
+        .ok()
+        .and_then(|v| v.get("messages").and_then(|m| m.as_array()).cloned())
+        .map(|msgs| {
+            msgs.iter()
+                .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1466,6 +1537,10 @@ mod tests {
     //   × delta 规模: 1..=6 条 message (全链最多 8)
     //   × block 种类: Text / 裸 string content / array content / null content /
     //     ToolUse (含嵌套 input JSON) / ToolResult (含 is_error) / Image
+    //   × assistant reasoning_content 轴 (L3, #176): 缺席 / 非空 (ReasoningContent
+    //     block, 可嵌 secret) / 显式空串 (form=Empty) / 显式 null (form=Null) —
+    //     覆盖 MessageRef.reasoning_content_form 的 reader→ref→resolve→writer
+    //     保真路径 (仅 OpenAI 渲染; Anthropic wire 无此概念)
     //   × secret 命中: 0 条 (seed=0) / 1..=3 条命中 (seed≠0, 含 tool input /
     //     tool_result 深处命中) / 另加 1 条未命中
     //   × 根 / 非根节点 (prefix 延续 push)
@@ -1506,15 +1581,29 @@ mod tests {
         Image(MaybeSecretText),
     }
 
+    /// assistant `reasoning_content` 的 wire 三态 (L3 轴): 非空 string (reader 建
+    /// ReasoningContent block, 可嵌 secret 覆盖替换轴) / 显式空串 (form=Empty) /
+    /// 显式 null (form=Null). 缺席轴 = reasoning: None.
+    #[derive(Clone, Debug)]
+    enum EqReasoning {
+        Present(MaybeSecretText),
+        Empty,
+        Null,
+    }
+
     /// 协议无关的 message 抽象 (渲染层按 proto 输出 wire 形态).
     #[derive(Clone, Debug)]
     enum EqMsg {
-        /// user / assistant 的普通消息, content 形态三选一 (L1 保真轴).
+        /// user / assistant 的普通消息, content 形态三选一 (L1 保真轴) +
+        /// assistant 顶层 `reasoning_content` 轴 (L3, #176 form 保真路径:
+        /// reader → MessageRef.reasoning_content_form → resolve → writer).
         Chat {
             assistant: bool,
             str_form: bool,
             null_form: bool,
             parts: Vec<EqPart>,
+            /// 仅 OpenAI 渲染 (wire 顶层字段); Anthropic 渲染忽略 (无此概念).
+            reasoning: Option<EqReasoning>,
         },
         /// assistant 发起工具调用 (arguments 是 JSON object 源码串, 内含文本叶子).
         ToolUse {
@@ -1585,14 +1674,31 @@ mod tests {
                 str_form,
                 null_form,
                 parts,
-            } => render_chat_msg(
-                *assistant,
-                *str_form,
-                *null_form,
-                parts,
-                pool,
-                |url| serde_json::json!({"type": "image_url", "image_url": {"url": url}}),
-            ),
+                reasoning,
+            } => {
+                let mut v = render_chat_msg(
+                    *assistant,
+                    *str_form,
+                    *null_form,
+                    parts,
+                    pool,
+                    |url| serde_json::json!({"type": "image_url", "image_url": {"url": url}}),
+                );
+                // assistant 顶层 reasoning_content (L3 轴): Present 可嵌 secret
+                // (reader 建块 → 同样过 real→mock 替换); Empty/Null 覆盖 form
+                // 元数据保真 (writer 据此逐字写回).
+                if *assistant && let Some(r) = reasoning {
+                    let field = match r {
+                        EqReasoning::Present(t) => serde_json::Value::String(render_text(t, pool)),
+                        EqReasoning::Empty => serde_json::Value::String(String::new()),
+                        EqReasoning::Null => serde_json::Value::Null,
+                    };
+                    v.as_object_mut()
+                        .expect("render_chat_msg yields object")
+                        .insert("reasoning_content".into(), field);
+                }
+                v
+            }
             EqMsg::ToolUse {
                 id,
                 name,
@@ -1627,6 +1733,9 @@ mod tests {
                 str_form,
                 null_form,
                 parts,
+                // reasoning 忽略: Anthropic wire 无 reasoning_content 概念,
+                // reader 不遇 → 两路径 (blocks vs raw) 都无该字段, 天然等价.
+                ..
             } => render_chat_msg(
                 *assistant,
                 *str_form,
@@ -1869,20 +1978,29 @@ mod tests {
             2 => texts.clone().prop_map(EqSystem::TopLevelArray),
             2 => texts.prop_map(EqSystem::InMessages),
         ]);
+        // reasoning 轴 (仅 assistant 消费; user 时 None): 缺席为主, 三低频形态
+        // 覆盖 block 路径 (Present, 可嵌 secret) 与 form 保真路径 (Empty/Null).
+        let reasoning = prop::option::of(prop_oneof![
+            3 => text.clone().prop_map(EqReasoning::Present),
+            1 => proptest::prelude::Just(EqReasoning::Empty),
+            1 => proptest::prelude::Just(EqReasoning::Null),
+        ]);
         let msg = prop_oneof![
             4 => (
                 prop::bool::ANY,
                 prop::bool::ANY,
                 prop::bool::ANY,
                 prop::collection::vec(part.clone(), 1..=3),
+                reasoning,
             )
-                .prop_map(|(assistant, str_form, null_form, parts)| EqMsg::Chat {
+                .prop_map(|(assistant, str_form, null_form, parts, reasoning)| EqMsg::Chat {
                     assistant,
                     // null_form 只对 assistant 有意义 (reader 把 user 的 null 读成空 vec,
                     // 同样保留 — 覆盖空 content 消息形态).
                     str_form: str_form && !null_form,
                     null_form: null_form && assistant,
                     parts,
+                    reasoning: if assistant { reasoning } else { None },
                 }),
             2 => (any::<u16>(), text.clone()).prop_map(|(n, t)| EqMsg::ToolUse {
                 id: format!("tu-{n}"),
@@ -1972,5 +2090,32 @@ mod tests {
         assert!(extract_delta_messages_from_blocks(&node, &pool).is_empty());
         // oracle 同样为空 (无 messages 字段).
         assert!(extract_delta_messages_from_raw(&node).is_empty());
+    }
+
+    /// M1 (SEC-10 降级偏安全): 投影漂移 (redactions 指向 policy 快照解析不出的
+    /// secret_id, 生产不可达的 ROB 防御场景) → 占位降级 — 条数保持 (UI-1),
+    /// 内容不含任何 real 文本, 含占位标记 (绝不静默以 real 视角渲染).
+    #[test]
+    fn blocks_derivation_drift_degrades_to_placeholder() {
+        let mut node = fixture_node(
+            2,
+            r#"{"messages":[{"role":"user","content":"real-secret-value"},{"role":"user","content":"b"}]}"#
+                .into(),
+        );
+        node.event.ingress_protocol = Some(CodecProtocol::OpenAI);
+        node.event.redactions = Arc::from([("mock-x".to_string(), "no-such-id".to_string())]);
+        let pool = crate::dag::BlockPool::default();
+        let out = extract_delta_messages_from_blocks(&node, &pool);
+        assert_eq!(out.len(), 2, "placeholder keeps bubble count (UI-1)");
+        let joined = serde_json::to_string(&out).expect("placeholder is serializable");
+        assert!(
+            !joined.contains("real-secret-value"),
+            "no real leak on drift"
+        );
+        // serde_json 会把非 ASCII 转义为 \uXXXX, 断 ASCII 前缀 (占位符恒含).
+        assert!(
+            joined.contains("[secret-guard]"),
+            "placeholder marker present"
+        );
     }
 }

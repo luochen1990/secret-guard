@@ -1219,39 +1219,48 @@ fn ir_request_replace_all(ir: &mut IrRequest, from: &str, to: &str) {
 /// 去重" 的顺序逐个替换. 本函数在 policy 快照上重放同一排序, 只保留有映射的
 /// 命中项 — 与当时的处理序完全一致, 保证替换的**复合效果** (前一个 mock 内含
 /// 后一个 real 子串的边角场景) 也逐字节复现.
+///
+/// # 返回 `None` = 投影漂移 (SEC-10 降级偏安全)
+///
+/// `redactions` 中存在 secret_id 在 policy 快照里解析不出的 pair (投影与快照
+/// 不一致 — 生产不可达, ROB 防御的理论外状态) 时返回 `None`, 由调用方降级到
+/// 安全侧 (不渲染内容), **绝不**静默跳过该 pair — 否则该 secret 以 real 视角
+/// 泄入渲染层 (旧路径 raw 是 redact 后字节, 同场景不泄, 会构成等价性破绽).
 pub(crate) fn rebuild_real_to_mock_pairs(
     redactions: &[(String, String)],
     secrets: &[SecretEntry],
-) -> Vec<(String, String)> {
-    if redactions.is_empty() || secrets.is_empty() {
-        return Vec::new();
+) -> Option<Vec<(String, String)>> {
+    if redactions.is_empty() {
+        return Some(Vec::new());
     }
+    // redactions 非空而快照为空 = 投影漂移的一种 (有命中记录却无任何可解析
+    // 快照) — 落入下方逐条 find, 首条即 ? 返回 None, 不在此特判.
     // (mock, secret_id) → (real, mock): redactions 的 pair 由 derive_redactions 从
     // map.real_to_mock join snapshot 产出 (map 按 real value 去重 ⇒ 每个 distinct
-    // real 恰一条), secret_id 必在快照内; find 失败 (理论外的漂移, ROB-*) 跳过
-    // 该 pair 而非 panic.
-    let mock_of: std::collections::HashMap<&str, &str> = redactions
-        .iter()
-        .filter_map(|(mock, sid)| {
-            let entry = secrets.iter().find(|s| s.id == *sid)?;
-            Some((entry.value.as_str(), mock.as_str()))
-        })
-        .collect();
+    // real 恰一条), secret_id 必在快照内; find 失败 = 投影漂移 → None (见上).
+    let mut mock_of: std::collections::HashMap<&str, &str> =
+        std::collections::HashMap::with_capacity(redactions.len());
+    for (mock, sid) in redactions {
+        let entry = secrets.iter().find(|s| s.id == *sid)?;
+        mock_of.insert(entry.value.as_str(), mock.as_str());
+    }
     if mock_of.is_empty() {
-        return Vec::new();
+        return Some(Vec::new());
     }
     // 重放 redact_ir_inner 的排序: snapshot 序 → 稳定 sort len desc → 相邻去重
     // (同 value 只处理首个 entry) → 只留有映射的 (即当时命中的) secret.
     let mut ordered: Vec<&SecretEntry> = secrets.iter().filter(|e| !e.value.is_empty()).collect();
     ordered.sort_by_key(|e| std::cmp::Reverse(e.value.len()));
     ordered.dedup_by(|a, b| a.value == b.value);
-    ordered
-        .into_iter()
-        .filter_map(|e| {
-            let mock = *mock_of.get(e.value.as_str())?;
-            Some((e.value.to_string(), mock.to_string()))
-        })
-        .collect()
+    Some(
+        ordered
+            .into_iter()
+            .filter_map(|e| {
+                let mock = *mock_of.get(e.value.as_str())?;
+                Some((e.value.to_string(), mock.to_string()))
+            })
+            .collect(),
+    )
 }
 
 /// 把 (real → mock) 有序对应用到 messages 的全部字符串叶子 (timeline blocks
@@ -1485,7 +1494,8 @@ mod tests {
         let redactions = crate::proxy::derive_redactions(&map, &secrets);
         assert_eq!(redactions.len(), 3);
         // 重建 + 替换 real 快照.
-        let pairs = rebuild_real_to_mock_pairs(&redactions, &secrets);
+        let pairs = rebuild_real_to_mock_pairs(&redactions, &secrets)
+            .expect("production projection is drift-free");
         assert_eq!(pairs.len(), 3);
         let mut replay_messages = real_messages.clone();
         apply_real_to_mock_messages(&mut replay_messages, &pairs);
@@ -1507,19 +1517,40 @@ mod tests {
             ("mock-b".to_string(), "id-bbb-2".to_string()),
             ("mock-a".to_string(), "id-aaa-1".to_string()),
         ];
-        let pairs = rebuild_real_to_mock_pairs(&redactions, &secrets);
+        let pairs = rebuild_real_to_mock_pairs(&redactions, &secrets)
+            .expect("hand-built projection is drift-free");
         let reals: Vec<&str> = pairs.iter().map(|(r, _)| r.as_str()).collect();
         // len desc: zz-longer-3 (11) > aaa-1 == bbb-2 (5, 同长保 snapshot 序: aaa-1 在前).
         assert_eq!(reals, vec!["zz-longer-3", "aaa-1", "bbb-2"]);
     }
 
-    /// 空投影 / 未知 secret_id (理论外漂移) → 空结果 (ROB: 不 panic, 不替换).
+    /// 空投影 → Some(空) (无命中, 无需替换). 快照空 + redactions 非空 → 漂移
+    /// (有命中记录却无可解析快照).
     #[test]
-    fn rebuild_pairs_empty_or_unknown_yields_empty() {
+    fn rebuild_pairs_empty_inputs_yield_some_empty() {
         let secrets = [entry("real-x")];
-        assert!(rebuild_real_to_mock_pairs(&[], &secrets).is_empty());
+        assert!(
+            rebuild_real_to_mock_pairs(&[], &secrets)
+                .expect("empty redactions is not drift")
+                .is_empty()
+        );
+        assert!(rebuild_real_to_mock_pairs(&[("m".into(), "x".into())], &[]).is_none());
+    }
+
+    /// 未知 secret_id (理论外漂移) → **None** (SEC-10 降级偏安全信号):
+    /// 调用方必须停止渲染内容而非静默跳过该 pair — 否则该 secret 以 real
+    /// 视角泄入渲染层 (等价性破绽, M1).
+    #[test]
+    fn rebuild_pairs_ghost_secret_id_yields_drift_none() {
+        let secrets = [entry("real-x")];
         let ghost = vec![("m".to_string(), "no-such-id".to_string())];
-        assert!(rebuild_real_to_mock_pairs(&ghost, &secrets).is_empty());
+        assert!(rebuild_real_to_mock_pairs(&ghost, &secrets).is_none());
+        // 混合: 一条可解析 + 一条漂移 → 整体 None (部分映射不可用即不可用)
+        let mixed = vec![
+            ("m1".to_string(), "real-x".to_string()),
+            ("m2".to_string(), "no-such-id".to_string()),
+        ];
+        assert!(rebuild_real_to_mock_pairs(&mixed, &secrets).is_none());
     }
 
     /// 构造一个"探测必耗尽"的 SecretEntry: Auto + digits-only + length_range=(1,1)
