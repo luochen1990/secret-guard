@@ -61,6 +61,7 @@
 - **proxy → redact**: 转发即改写, 同属域 A.
 - **redact → config**: 仅 `OnProbeExhausted` 枚举 — `[redact] on_probe_exhausted` 的消费点, 纯数据枚举.
 - **redact → secrets**: 探测 secret 需读 entry.
+- **state → config (行为)**: B2 — AuditCapture 的开关持久化复用 config 的 DynamicState RMW 机制 (load_or_empty + to_toml + atomic_write), 与 provider/secret/apikey 表的 set_decision 同型 (纯机制复用, 无 config schema 之外的行为依赖); 基线已有的 `OnProbeExhausted` 等纯类型枚举边为存量走查补登 (性质同 usage→config / proxy→config, 因 state 位于基础层而升级为例外).
 - **state → pool**: AppState.pools 聚合 `PoolStates` 纯数据+状态机 store, 组合根先例同 state → usage 的 UsageStore / state → auth 的 ApiKeyStore — 见 `src/state.rs` 字段注释; web 观察面 list_providers 的 pool_status 与 pool-reset 端点经 AppState 读同一份.
 - **state → proxy::ModelListCache**: #196 — AppState 聚合 router /models 的上游清单缓存, 纯数据 store 无 proxy 行为依赖, 组合根先例同 state → auth 的 ApiKeyStore — 见 `src/state.rs` 字段注释.
 - **state → usage**: usage-stats — AppState 聚合 UsageStore / PricingCache 两个纯数据 store, 同一先例; usage 模块未画入图 (聚合根旁的纯数据+派生层, 主干外), 图外另有 web/api/usage.rs → usage (GET /api/usage/summary 直读 UsageStore 聚合 + summary 纯函数派生, 域 B 派生链消费). usage 模块自身仅依赖 codec::ir / secrets / dag::RoundKind 纯类型 / config schema 纯数据类型, 见 `src/usage/` 头部 — usage→config 是向下合法边, 非例外, 性质同 provider→config; usage→dag 仅引用 RoundKind 枚举, 同 dto→dag 的纯类型依赖先例.

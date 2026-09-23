@@ -95,6 +95,14 @@ POST   /api/api-keys
 DELETE /api/api-keys/{id}
 PATCH  /api/api-keys/{id}/toggle
 
+GET    /api/settings                → {audit_capture: bool} — 全局设置当前值
+PUT    /api/settings                body {audit_capture: bool} → 200 同 shape
+                                          (详细日志开关: 开 = 新请求记录完整
+                                           req_body_raw / raw_resp_body; 关 = 极致省内存
+                                           (timeline 不受影响, B1 blocks 派生)。per-request
+                                           原子 (push 快照, 在途请求不受切换影响); 原子
+                                           持久化 state.toml; 非法 body 统一 400。语义 SSOT
+                                           见 src/state.rs::AuditCapture)
 GET    /api/usage/summary[?hours=N]  → UsageSummary {range, pricing_status, totals,
                                                  by_bucket[], by_model[], by_provider[],
                                                  unpriced_models[], zero_priced_models[],
