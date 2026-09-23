@@ -90,7 +90,7 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::codec::ir::{IrBlock, IrRequest, IrResponse, IrRole, IrTool};
+use crate::codec::ir::{IrBlock, IrMessage, IrRequest, IrResponse, IrRole, IrTool};
 use crate::config::OnProbeExhausted;
 use crate::secrets::SecretEntry;
 
@@ -1194,6 +1194,102 @@ fn ir_request_replace_all(ir: &mut IrRequest, from: &str, to: &str) {
     ir.for_each_str_leaf_mut(&mut |s| replace_in_place(s, from, to));
 }
 
+// ─── RedactionMap 重建 (timeline blocks 派生, B1) ───────────────────────────
+
+/// 从 `CallEvent.redactions` 投影 + policy 快照重建 **(real → mock) 有序映射对**.
+///
+/// # 为什么从投影重建而不是重放 seed 生成
+///
+/// mock 生成的确定性是 "同 policy + 同 seed + **同 input** → 同 map" (C3): 其中
+/// input 是 redact 当时的**完整 IrRequest** — `gen_mock_for_ir` 的 probing 会检查
+/// 候选是否出现在 IR 的**全部**字符串叶子 (含 system / tools / extra / model 等),
+/// 而 DAG 只持久化 messages (+ 根节点 system), probing 环境不可完整复原; 重放会
+/// 在 "counter-0 候选恰好出现在 system/tools-only" 的场景产出不同 counter → 不同
+/// mock. 投影 (`redactions` = `(mock, secret_id)`) 是 redact **实际产出**的忠实
+/// 记录 (map.insert 与 IR 改写原子成对发生), 从它 + policy 快照 (secret_id →
+/// real value) 逆推的映射**按构造精确** — 无 probing 环境依赖.
+///
+/// FailOpen 降级语义同步保持: probing 耗尽 / insert collision 被 skip 的 secret
+/// 不在 map → 不在 redactions → 不在重建结果 → messages 中该 secret 保持 real
+/// 原样 — 与旧路径 (req_body_raw 切片, 该 secret 也未被替换) 语义一致.
+///
+/// # 替换序 (与 redact_ir_inner 逐序等价)
+///
+/// `redact_ir_inner` 按 "value 长度降序 (稳定排序, 同长保持 snapshot 序) + 相邻
+/// 去重" 的顺序逐个替换. 本函数在 policy 快照上重放同一排序, 只保留有映射的
+/// 命中项 — 与当时的处理序完全一致, 保证替换的**复合效果** (前一个 mock 内含
+/// 后一个 real 子串的边角场景) 也逐字节复现.
+pub(crate) fn rebuild_real_to_mock_pairs(
+    redactions: &[(String, String)],
+    secrets: &[SecretEntry],
+) -> Vec<(String, String)> {
+    if redactions.is_empty() || secrets.is_empty() {
+        return Vec::new();
+    }
+    // (mock, secret_id) → (real, mock): redactions 的 pair 由 derive_redactions 从
+    // map.real_to_mock join snapshot 产出 (map 按 real value 去重 ⇒ 每个 distinct
+    // real 恰一条), secret_id 必在快照内; find 失败 (理论外的漂移, ROB-*) 跳过
+    // 该 pair 而非 panic.
+    let mock_of: std::collections::HashMap<&str, &str> = redactions
+        .iter()
+        .filter_map(|(mock, sid)| {
+            let entry = secrets.iter().find(|s| s.id == *sid)?;
+            Some((entry.value.as_str(), mock.as_str()))
+        })
+        .collect();
+    if mock_of.is_empty() {
+        return Vec::new();
+    }
+    // 重放 redact_ir_inner 的排序: snapshot 序 → 稳定 sort len desc → 相邻去重
+    // (同 value 只处理首个 entry) → 只留有映射的 (即当时命中的) secret.
+    let mut ordered: Vec<&SecretEntry> =
+        secrets.iter().filter(|e| !e.value.is_empty()).collect();
+    ordered.sort_by_key(|e| std::cmp::Reverse(e.value.len()));
+    ordered.dedup_by(|a, b| a.value == b.value);
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    ordered
+        .into_iter()
+        .filter_map(|e| {
+            // seen 兜底防御: dedup 后同 value entry 只剩一个, 但若上游 pair 集
+            // 含重复 value (理论外), 也不重复发射 (重复替换对幂等替换无害, 显式
+            // 去重保持与 map 一一对应).
+            if !seen.insert(e.value.as_str()) {
+                return None;
+            }
+            let mock = *mock_of.get(e.value.as_str())?;
+            Some((e.value.to_string(), mock.to_string()))
+        })
+        .collect()
+}
+
+/// 把 (real → mock) 有序对应用到 messages 的全部字符串叶子 (timeline blocks
+/// 派生用, real 视角 → LLM 视角).
+///
+/// 与 [`rebuild_real_to_mock_pairs`] 配对使用; 替换序 = pairs 序 (即 redact
+/// 当时的处理序), 与 `ir_request_replace_all` 的逐叶子 `replace_in_place`
+/// 完全同一实现 — 对相同输入产相同字节.
+pub(crate) fn apply_real_to_mock_messages(
+    msgs: &mut [IrMessage],
+    pairs: &[(String, String)],
+) {
+    for (real, mock) in pairs {
+        for msg in &mut *msgs {
+            for b in &mut msg.content {
+                b.for_each_str_leaf_mut(&mut |s| replace_in_place(s, real, mock));
+            }
+        }
+    }
+}
+
+/// [`apply_real_to_mock_messages`] 的 blocks 变体 (system blocks 用).
+pub(crate) fn apply_real_to_mock_blocks(blocks: &mut [IrBlock], pairs: &[(String, String)]) {
+    for (real, mock) in pairs {
+        for b in &mut *blocks {
+            b.for_each_str_leaf_mut(&mut |s| replace_in_place(s, real, mock));
+        }
+    }
+}
+
 // ─── 位置统计 (redact 审计, USAGE-7 治理归因) ──────────────────────────────
 
 /// 只读统计 needle 在单个字符串叶子的出现次数.
@@ -1337,6 +1433,101 @@ mod tests {
     use super::*;
     use crate::codec::ir::{IrMessage, IrResponse, IrRole};
     use pretty_assertions::assert_eq;
+
+    // ─── rebuild_real_to_mock_pairs (B1: timeline blocks 派生的映射重建) ─────
+
+    /// 端到端等价: redact_ir 改写后的 messages 与 "real 快照 + 重建 pairs 替换"
+    /// 的结果逐字节相等 (含嵌套叶子: ToolUse.input / ToolResult.content).
+    ///
+    /// 这是 timeline blocks 派生等价性的映射层根基: 只要本性质成立,
+    /// derive::extract_delta_messages_from_blocks 的 real→mock 步骤就与
+    /// 当年 redact_ir 改写 req_body_raw 的效果等价.
+    #[test]
+    fn rebuild_pairs_replay_matches_redact_ir_replacement() {
+        // 3 条 secret (长度互异, 覆盖排序) + 1 条未命中 (不在任何 message 中).
+        let secrets = [entry("sk-long-secret-aaaaaaaa"), entry("sk-mid-bbb"), entry("k9")];
+        let mut ir = IrRequest {
+            system: vec![IrBlock::Text {
+                text: "sys mentions sk-mid-bbb once".into(),
+            }],
+            messages: vec![
+                IrMessage {
+                    role: IrRole::User,
+                    content: vec![IrBlock::Text {
+                        text: "use k9 and sk-long-secret-aaaaaaaa please".into(),
+                    }],
+                    ..Default::default()
+                },
+                IrMessage {
+                    role: IrRole::Assistant,
+                    content: vec![IrBlock::ToolUse {
+                        id: "t1".into(),
+                        name: "get".into(),
+                        input: serde_json::json!({"key": "sk-mid-bbb", "nested": ["k9"]}),
+                    }],
+                    ..Default::default()
+                },
+                IrMessage {
+                    role: IrRole::User,
+                    content: vec![IrBlock::ToolResult {
+                        tool_use_id: "t1".into(),
+                        content: vec![IrBlock::Text {
+                            text: "done with sk-mid-bbb".into(),
+                        }],
+                        is_error: false,
+                        content_form: None,
+                    }],
+                    ..Default::default()
+                },
+            ],
+            model: "m".into(),
+            ..Default::default()
+        };
+        let real_messages = ir.messages.clone();
+        let real_system = ir.system.clone();
+        // 生产路径: redact_ir 改写 (FailOpen 单测入口, 行为与 inner 一致).
+        let (map, _seed) = redact_ir(&mut ir, &secrets);
+        assert_eq!(map.real_to_mock.len(), 3, "3 secrets hit (k9/sk-mid/long)");
+        // 生产投影: derive_redactions 是 redactions 字段的唯一派生入口.
+        let redactions = crate::proxy::recorder::derive_redactions(&map, &secrets);
+        assert_eq!(redactions.len(), 3);
+        // 重建 + 替换 real 快照.
+        let pairs = rebuild_real_to_mock_pairs(&redactions, &secrets);
+        assert_eq!(pairs.len(), 3);
+        let mut replay_messages = real_messages.clone();
+        apply_real_to_mock_messages(&mut replay_messages, &pairs);
+        let mut replay_system = real_system.clone();
+        apply_real_to_mock_blocks(&mut replay_system, &pairs);
+        // 逐字节等价 (messages + system).
+        assert_eq!(replay_messages, ir.messages, "messages real→mock replay");
+        assert_eq!(replay_system, ir.system, "system real→mock replay");
+    }
+
+    /// 替换序重放: 同长 secret 的处理序 = snapshot 序 (稳定排序), 重建 pairs
+    /// 保持同一序 (与 redact_ir_inner 的 sorted 顺序一致).
+    #[test]
+    fn rebuild_pairs_orders_by_len_desc_then_snapshot_order() {
+        let secrets = [entry("aaa-1"), entry("bbb-2"), entry("zz-longer-3")];
+        // 手工构造投影 (不跑 redact): mock 值任意, 只验证序.
+        let redactions = vec![
+            ("mock-z".to_string(), "id-zz-longer-3".to_string()),
+            ("mock-b".to_string(), "id-bbb-2".to_string()),
+            ("mock-a".to_string(), "id-aaa-1".to_string()),
+        ];
+        let pairs = rebuild_real_to_mock_pairs(&redactions, &secrets);
+        let reals: Vec<&str> = pairs.iter().map(|(r, _)| r.as_str()).collect();
+        // len desc: zz-longer-3 (11) > aaa-1 == bbb-2 (5, 同长保 snapshot 序: aaa-1 在前).
+        assert_eq!(reals, vec!["zz-longer-3", "aaa-1", "bbb-2"]);
+    }
+
+    /// 空投影 / 未知 secret_id (理论外漂移) → 空结果 (ROB: 不 panic, 不替换).
+    #[test]
+    fn rebuild_pairs_empty_or_unknown_yields_empty() {
+        let secrets = [entry("real-x")];
+        assert!(rebuild_real_to_mock_pairs(&[], &secrets).is_empty());
+        let ghost = vec![("m".to_string(), "no-such-id".to_string())];
+        assert!(rebuild_real_to_mock_pairs(&ghost, &secrets).is_empty());
+    }
 
     /// 构造一个"探测必耗尽"的 SecretEntry: Auto + digits-only + length_range=(1,1)
     /// → 仅 10 个候选 "0".."9". 配合 [`EXHAUSTING_IR_TEXT_TEMPLATE`] (含全部 10 个候选)

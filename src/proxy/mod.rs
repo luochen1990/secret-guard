@@ -82,7 +82,9 @@ mod cross_proto;
 mod fan_out;
 mod helpers;
 mod models;
-mod recorder;
+// pub(crate): recorder::derive_redactions 是 redactions 投影的唯一实现 (SSOT),
+// dag timeline 的 blocks 派生 (B1) 与其等价性测试需要直接复用同一 join.
+pub(crate) mod recorder;
 mod same_proto;
 
 use std::time::Instant;

@@ -90,7 +90,7 @@ pub(super) const ERR_RESP_CAP_EXCEEDED: &str = "response exceeds record cap";
 /// 匹配规则与去重语义见 [`derive_redact_hits`] 的共享 join (两投影同源,
 /// mock↔secret_id 关联一致性由 `redaction_projections_agree_on_mock_secret_pairing`
 /// 测试守卫; consistency-check 守卫 [`assert_redactions_match_map`] 只覆盖本投影).
-pub(super) fn derive_redactions(
+pub(crate) fn derive_redactions(
     redaction_map: &RedactionMap,
     secrets_snapshot: &[crate::secrets::SecretEntry],
 ) -> Vec<(String, String)> {
