@@ -185,6 +185,9 @@ end-to-end integration tests, fully verified on every release:
   own credential) behind one endpoint; when one plan hits its usage-window limit, traffic
   fails over to the next one automatically and switches back once the window resets —
   zero manual intervention.
+- **On-demand verbose logging**: by default the gateway stays memory-lean (the session
+  timeline keeps working); flip one toggle in the WebUI and subsequent requests capture
+  full request/response bodies for troubleshooting.
 
 A source-level comparison with LiteLLM / LLM Guard / PasteGuard — seven
 secret-protection dimensions, including where the alternatives are stronger:

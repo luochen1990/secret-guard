@@ -708,6 +708,15 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 - `prop_round_kind_no_messages_on_empty`: msgs 为空 → `no_messages`. 🔁→`round_kind_no_messages_on_empty_messages` (`src/dag/mod.rs`)
 - `prop_round_kind_carried_by_dtos`: TimelineRound 与 RoundBrief 均携带 round_kind. 🔁→`timeline_and_brief_carry_round_kind` (`src/dag/mod.rs`)
 
+### DTO-10 audit_capture_off 标记与未捕获 body 一致性 (B2)
+
+**陈述**: `NodeView.audit_captured` (push 时开关快照) 与 body 存储状态一致: `false` → `req_body_raw` 为空串且 `raw_resp_body` 为空串 (反向不必然 — 流式响应本就不保留 SSE 字节, 与开关正交); `true` → `req_body_raw` 为完整快照 (半捕获撕裂被 CFG-7 的 per-request 原子性排除). 派生消费面: `ForwardRecord.audit_capture_off = !audit_captured` (WebUI raw 弹窗与 usage 审计溯源弹窗的 "未捕获" 占位判据, 优先级高于 streamed 空态提示); `GET /api/records/{id}?view=parsed` 对 off 请求恒 `parsed_request = null` + `parse_error = "req_body not captured (audit_capture off)"` (诚实呈现缺失, 不伪造空对象 — 尊重事实原则). timeline (req_delta_messages / tail) 内容不受开关影响 — B1 起从 BlockPool 派生 (DTO-5), raw body 不是其内容数据源 (唯一残留: `tail.length` 的末级 fallback 在 parsed 缺失场景读 `raw_resp_body.len()`, off 下为 0 — 仅影响 length 数字, 不影响内容渲染).
+
+**Properties**:
+- `prop_audit_capture_off_body_empty_and_marked`: off 请求 (同协议 / 跨协议 / 流式) 转发行为不受影响, record 两侧 body 为空 + `audit_capture_off = true`; on 请求 `audit_capture_off = false`. 🔁→`audit_capture_off_still_forwards_and_marks_uncaptured` + `audit_capture_off_streaming_still_forwards` + `audit_capture_off_cross_proto_marks_uncaptured` (`tests/integration.rs`)
+- `prop_audit_capture_off_parsed_view_reports_uncaptured`: off 请求的 parsed view 恒 `parsed_request = null` + 显式 parse_error 未捕获文案. 🔁→`audit_capture_off_still_forwards_and_marks_uncaptured` (`tests/integration.rs`)
+- `prop_audit_capture_off_ui_placeholder_shown`: WebUI raw 弹窗与 usage 审计溯源弹窗对 off 请求显示未捕获占位 (判据统一为 `audit_capture_off` 结构化字段, 非空 body 探测). 🔁→`audit_capture off 时 raw 弹窗显示未捕获占位` + `audit_capture off 时 usage 审计溯源弹窗同样占位` (`tests/webui/im-ui.spec.ts`)
+
 ---
 
 ## 6. CFG: 双层配置
@@ -781,6 +790,19 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 **Properties**:
 - `prop_prune_dangling_decisions`: 任意 (id 池 × static 存活子集 × 子表归属 × mode) 组合下, prune 清除的恰是全部悬空条目 (有非 Default decision 且不在对应 static 集合), 存活 id 的 decision (mode + 归属) 原样保留. ✅
 - 场景回归: `prune_disabled_secret_id_revive_no_longer_shadowed` (`src/config.rs`) — static id 复活后查询回退 Default (未被残留条目遮蔽). ✅
+
+### CFG-7 audit_capture 持久化与恢复 (B2)
+
+**陈述**: 详细日志开关 `audit_capture` 是 DynamicState 顶层动态字段 (state.toml, serde default `false`; **非** `[server]` 静态段, WebUI 经 `PUT /api/settings` 即时切换):
+- **写序**: `set_enabled` 先持久化 state.toml (RMW, 与 provider/secret/apikey 表共享 persist_lock) 再更新内存 AtomicBool; 持久化失败时内存保持旧值 (回滚, 与 `DynamicTable::set_decision` 同型 — CFG-4 语义在动态标量字段上的实例).
+- **重启恢复**: 启动时从 state.toml 加载初值; 旧版 state.toml 无此字段 → serde default `false` (不存在 "缺字段启动失败" 或意外开启).
+- **per-request 原子**: push 路径读一次快照进 `CallEvent.audit_captured`, 响应侧 4 个 attach 路径经 `dag.audit_captured_of` 沿用快照 (不重读开关) — 请求在途时切换开关不产生 "req 存了 + resp 空" 或反向的半捕获撕裂.
+
+**Properties**:
+- `prop_audit_capture_persist_failure_keeps_old_memory`: 持久化失败 (目录只读) 时内存保持旧值, 不留半提交状态. 🔁→`audit_capture_set_enabled_failure_keeps_old_memory` (`src/state.rs`)
+- `prop_audit_capture_restart_round_trip`: set_enabled 落盘后, 重启路径 (`load_or_empty` → `new`) 读回同一状态; `PUT /api/settings` 后 state.toml 含新值, 非法 body (非 JSON / 字段类型错 / 缺字段) 统一 400. 🔁→`audit_capture_set_enabled_persists_and_round_trips` (`src/state.rs`) + `audit_capture_settings_api_shape_validation_and_persistence` (`tests/integration.rs`)
+- `prop_audit_capture_legacy_state_defaults_false`: 旧版 state.toml 无 audit_capture 字段 → 加载为 false. 🔁→`audit_capture_old_state_toml_without_field_defaults_false` (`src/state.rs`)
+- `prop_audit_capture_inflight_request_keeps_push_decision`: 在途请求的捕获行为由 push 时快照决定 — off→on 切换后, 已 push 的请求仍两侧不捕获; on→off 切换后, 已 push 的请求仍两侧完整捕获. 🔁→`audit_capture_toggle_inflight_request_keeps_push_decision` + `audit_capture_toggle_off_inflight_still_captures_both_sides` (`tests/integration.rs`)
 
 ---
 
@@ -968,6 +990,9 @@ real 还原进去等于精准投放泄露. 故默认"偏安全", 暴露侧行为
 > `round_role = Tool` 时会用 `extract_tool_use_name` 覆盖 preview 为首个 ToolUse 的 name
 > (前端 sidebar 三级菜单 tooltip + 颜色哈希依赖 tool name). 覆盖后的 preview 不等于
 > `extract_preview_and_model(req_body_raw)` 的结果 — 此 drift 是预期的修正, 不属于守卫失败.
+> 另: AuditCapture off 的请求 (`audit_captured = false`, B2) `req_body_raw` 未存储为空串,
+> 无对照物可比 — `assert_preview_model_match_source` 与 `assert_delta_view_matches_raw`
+> (表中 req_delta_messages 的 shadow) 对其跳过, on 的请求守卫行为不变 (CFG-7 / DTO-10).
 
 **Properties**:
 - `prop_each_derived_field_has_consistency_check`: 上表中每个"待补"字段最终都有 consistency-check 断言. 🔁→`assert_redactions_match_map` 守卫状态表 (本节 VIEW-2 表格即 SSOT, 派生字段增删走表)

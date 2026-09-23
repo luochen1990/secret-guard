@@ -14,6 +14,7 @@
 > | 数据结构 | `struct ConversationDag { nodes, prefix_index, order, max, blocks }` (第 3 节) | 外层包 `Arc<RwLock<DagInner>>`, 新增 `sessions` 表 + `max_sessions` + `min_sessions`; **`order` 字段移除**, 改用 `sessions.leaf_id` + LRU |
 > | 淘汰策略 | FIFO (第 7 节, 假设单会话线性) | 进化为 **LRU session 淘汰 + child_count 级联 GC** (leaf 先删, 递减 parent, 级联到 child_count=0) |
 > | 实施进度 | "步骤 5-10 是后续 PR 范围" (第 6 节) | 核心已全量落地 (步骤 1-9 完成, proxy/web/codec 全部接入), 仅 "完整 lazy redact 重建" (步骤 5 的 derive_redact_map 含 system/tools) 待定 |
+> | timeline 数据源 | 第 6 节步骤 5 注: "timeline 用 push 时预存 req_body_raw 截取 delta" | B1 起 req_delta_messages 从 BlockPool 派生 (MessageRef resolve → redactions 投影重建 real→mock 替换 → ingress writer, 与旧 raw 切片逐字节等价, contracts.md DTO-5), tail 从 `response.message` + 元字段派生; `req_body_raw` / `raw_resp_body` 仅详细日志开关 audit_capture on 时保留 (B2, 默认 off 存空串 — CFG-7/DTO-10), 不再是 timeline 的内容数据源 (`tail.length` 末级 fallback 除外 — parsed 缺失时读 `raw_resp_body.len()`) |
 > | migration 提示 | "config schema ... 需 migration 提示" (第 5 节) | **未实现** TODO: sticky 字段删除未提供运行时 migration 提示, 静默忽略未知字段 |
 >
 > 下文保留原始设计叙述 (历史价值). 上述偏差点在正文中以 `📌` 内联标注.
@@ -211,7 +212,7 @@ struct CallEvent {
     policy: Arc<PolicySnapshot>,    // 重建 redactMap 用
     req_envelope: serde_json::Value, // 请求侧非 message 字段
     ingress_protocol: Option<codec::Protocol>,
-    req_body_raw: String,           // LLM 视角的请求 body 快照 (WebUI 权威来源)
+    req_body_raw: String,           // LLM 视角的请求 body 快照 (📌 B2 起 audit_capture off 存空串; timeline 数据源已由 BlockPool 派生取代, 见顶部偏差表)
     preview: Option<Arc<str>>,      // 首条 user msg 截断, list 路径 Arc::clone 免拷贝
     model: Option<Arc<str>>,        // 顶层 model 字段, list 路径 Arc::clone 免拷贝
     redactions: Arc<[(String, String)]>, // (mock, secret_id) 投影, list 路径免拷贝
@@ -277,8 +278,10 @@ struct ConversationDag {
 > 步骤 5-10 是后续 PR 范围 (完整 DAG 接入).
 >
 > 📌 实施演进 (2026-07-24): 步骤 6-9 已全量落地 (proxy/web/codec 全部接入 DAG),
-> 仅步骤 5 "完整 lazy redact 重建" 待定. 当前 timeline 用 push 时预存 req_body_raw
-> 截取 delta (非 lazy redact).
+> 仅步骤 5 "完整 lazy redact 重建" 待定.
+> 📌 实施演进 (2026-09-24, B1/B2): timeline 数据源已切换 — req_delta_messages 从
+> BlockPool 派生 (redactions 投影重建 + ingress writer, 见顶部偏差表), 不再从
+> req_body_raw 切片; req_body_raw 仅详细日志 (audit_capture) on 时保留.
 
 ## 7. 已知限制: 孤儿节点 (FIFO 淘汰 parent)
 

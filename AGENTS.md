@@ -27,6 +27,7 @@
 
 | 规范术语 | 定义 | 常见异名 | 归属层 |
 |---|---|---|---|
+| **AuditCapture** | 详细日志的动态开关, per-request 决策: off (默认) 不存 `req_body_raw` / `raw_resp_body` (timeline 由 BlockPool 派生不受影响, B1), on 记录完整 body 供排障; 持久化在 state.toml 动态层, WebUI 经 `GET/PUT /api/settings` 即时切换, push 时快照进 `CallEvent.audit_captured` 保证在途请求原子 | 详细日志开关、详细日志、审计开关 | config/web |
 | **Bubble** | 前端 timeline 中渲染的单条消息气泡 (= 1 个 IR message) | 气泡、消息块、消息项 | web/index.html |
 | **Common URI** | 端点的公共 URI 前缀 — 三段式 `base_url + common_uri + request_uri` 的中段, 两个消费面: ① fetch_model_list (router /models 本地合成拉上游清单); ② 跨协议翻译的出站 URL (`Endpoint::effective_common_uri`, #260 — 显式值直通, 缺省按 base 尾段启发式). 同协议透传不受影响 (转发 rest 原样流过). 值域: `"/v1"` 裸根布局 / `""` 版本前缀已含 (智谱等国产系) / 缺省未探测 (fetch 按 `V1_COMMON_URIS` 顺序懒回退现场推导). 持久化在 `Endpoint.common_uri` (per-endpoint; Detect 探测自动填充, WebUI 端点行 badge 回显), 运行时记忆在 `CacheEntry.common_uri_hit` | common_uri、版本前缀、布局前缀 | provider/proxy |
 | **Effective view** | 合并 static + dynamic + decision 后的生效配置 | 生效配置、最终配置、合并视图 | config |
@@ -165,6 +166,7 @@
 `resp_parsed` finalize 后从 `response.message` + 元字段渲染派生 (B1, finalize 处先断言后删除
 `proxy/recorder.rs::assert_tail_parsed_matches_stored`; 流式进行中仍读 stored 节流 parsed)、
 `resp_parsed` (流式) 从 StreamScan 累积 (`proxy/fan_out.rs`, Phase A 已删除原始 SSE 字节, 派生与源物理分离, 暂不守卫).
+(AuditCapture off 的请求 `req_body_raw` 未存储为空串, 无对照物可比 — `assert_preview_model_match_source` / `assert_delta_view_matches_raw` 两个 shadow 对其跳过, on 的请求守卫行为不变; 语义契约 contracts.md CFG-7 / DTO-10.)
 后续 Phase B 删除 parent.response 时必须走此流程.
 
 ### 原始形状保持 (同协议转发的高优先契约) → FWD-1 契约
@@ -396,6 +398,7 @@ Secret / Provider 的两种 value 来源 (`value`/`value_file`、`api_key`/`api_
 
 - `[auth]` 行为注记: `enabled = true` 时浏览器 WebUI 走 OIDC, SDK 转发走本地 API key (`Authorization: Bearer sg_...`); ApiKeyStore 与 `/api/api-keys` CRUD 无认证也总是可用 ("只认证, 不隔离" 哲学, 见 `src/auth/mod.rs` 头部); `oidc.issuer_url` 启动时 Discovery 拉取端点 (fail-fast); `oidc.client_secret_file` 可缺省 (public client + PKCE 场景); `[[auth.api_keys]]` 启动时 hash 后注入 ApiKeyStore 与 WebUI 签发 key 共用同一池, 静态 key 不可删除只能 disable/enable (`label` 唯一标识; `key`/`key_file` 二选一互斥, 语义同 `src/secrets.rs` 的 `value`/`value_file`).
 - `allowed_domains`: Host 白名单完整语义 (端口宽松规则 / 归一化 / WARN 跳过条目) 见本文 "Host / Origin 校验 (SEC-7)" 段.
+- `audit_capture`: state.toml 动态字段 (**非** `[server]` 静态段, WebUI 即时切换无需重启) — 详细日志开关, 实现指针 `src/state.rs::AuditCapture` (运行时开关 + RMW 持久化) + `src/config.rs::DynamicState` (serde schema, 默认 false) + `src/web/api/settings.rs` (GET/PUT 端点); 默认 off 极致省内存 (timeline 不受影响 — B1 起 blocks 派生), on 记录完整 req/resp body 供排障; per-request 原子 (push 快照进 `CallEvent.audit_captured`); PUT 先持久化再更新内存 (失败回滚, 与 set_decision 同型); 重启从 state.toml 恢复; 升级注意: 旧 state.toml 无此字段 → off (存量用户详细日志静默关闭, 需要时 WebUI 重新开启). 语义契约 contracts.md CFG-7 / DTO-10.
 - `global_mock_prefix`: Auto 模式 mock 统一前缀, 注入每个 secret 的 `gen_spec.prefix`; 详见 `src/redact.rs` C5 契约.
 - `host`: 默认 `127.0.0.1` 回环是 SEC-6 契约 (本地监听, 防意外暴露到 LAN/WAN).
 - `on_fallback_restore`: 实现指针 `src/proxy/helpers.rs::restore_via_json_leaf_fallback` + `src/config.rs::OnFallbackRestore`; 行为契约 RED-8 / SEC-10 (降级偏安全).
