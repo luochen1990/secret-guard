@@ -168,6 +168,8 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 - **响应半段** (upstream → client): secret-guard 收到上游响应 wire 后经 restore 返回客户端, 要求
   `normalize(返回客户端的 wire) == normalize(上游响应 wire).replace(mock, real)`.
 
+> **原始形状保持是高优先契约** (2026-09-23 用户裁决, issue #269 评审): 同协议转发时, **保持请求的原始形状是高优先契约** — 客户端发什么, 发往上游的就是什么 (在 real↔mock 替换与已授权修改的等式约束下). 上方枚举的三种合法修改是**显式列举的例外**, 每一种都必须: ① 有明确的授权记录; ② 例外类别中"主动添加客户端未发送内容"的注入类 (M3) 必须**默认关闭 + 显式 opt-in** — 默认配置下原始形状保持字面成立, 注入永远不得成为默认行为. 修复方向是"把破坏形状的 bug 修回形状保持" (如 #269 的 M1/M2), 而非新增形状改写.
+
 等价表述: **secret-guard 对 wire 的合法修改有且仅有三种: real↔mock 替换; model 字段重写 (仅当路由链上命中了携带 `upstream_model` 的路由); 以及 Anthropic egress 的顶层自动缓存标记注入 (仅当 `[redact] inject_cache_control = true` 显式 opt-in, 且请求内不存在任何 cache_control — 见下方 M3 注记)**, 除此之外的任何字节差异 (字段丢失 / 顺序错乱 / 重序列化改变 / 任意字段值变化) 都是 bug.
 
 > **路由 model 重写代价明示** (2026-08-24 修订 / 2026-08-25 措辞随多规则化同步, §99 登记): 重写生效时,
@@ -212,9 +214,11 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 > automatic `cache_control`) 既有透传不变. 以上均系"不丢客户端已有的信息", 非 FWD-1 合法
 > 修改类别 (等式约束成立).
 >
-> **M3 注入** (合法修改第三类, 显式 opt-in): `[redact] inject_cache_control = true` (默认
-> false) 时, Anthropic egress (same-proto IR 路径 + cross-proto) 对**不存在任何 cache_control**
-> 的请求注入顶层 `cache_control: {"type":"ephemeral"}` (automatic caching 模式). 守卫: body
+> **M3 注入** (合法修改第三类, 显式 opt-in, **唯一"主动添加客户端未发送内容"的例外 —
+> 与"原始形状保持"高优先契约的张力由 默认关闭 + opt-in 化解**, 见上方形状保持注记):
+> `[redact] inject_cache_control = true` (默认 false) 时, Anthropic egress (same-proto IR
+> 路径 + cross-proto) 对**不存在任何 cache_control** 的请求注入顶层
+> `cache_control: {"type":"ephemeral"}` (automatic caching 模式). 守卫: body
 > 内已有任何 cache_control 时不注入 (Anthropic 显式断点上限 4 个, 满槽时顶层标记 400).
 > 目的: 不发缓存标记的客户端经 IR 路径后仍能吃到前缀缓存 (Anthropic 缓存为显式 opt-in,
 > 无标记 = 不写不读; IR 路径若无此注入, 长 agent 会话 input 成本约放大一个数量级).
@@ -1309,3 +1313,4 @@ chars (char boundary 安全); 其余事件字段为受控类型, 天然无 secre
 | 2026-09-23 | FWD-1 (修正) | **推翻同日"正规化"决策 (用户裁决, issue #269): Anthropic `messages[].role=system` 按原位保留写回** — 该形态是官方已正式支持的合法 wire (官方文档明言其为缓存友好的指令注入方式), "提升合并到顶层 system" 改变指令生效位置 + 顶层 system 增长使缓存前缀整体失效 + 消息级字段丢失, 三重损害均系错误; FWD-1 等式恢复无例外, reader/writer 位置保真, FWD-2 生成器解除 role=system 排除机械锁定; 同日登记的"适用范围澄清"行随之作废 (历史记录保留于上, 行为以本行 + FWD-1 注记为准) | issue #269 评估 (截图分析经代码与官方文档逐项核实属实): 同日 "原样写回会被 400" 的判断对当前旗舰模型已过时; 兼容边界 (Sonnet 5 等不支持该形态) 由客户端按目标上游自选形态, 网关不代改写 |
 | 2026-09-23 | FWD-2 (wire-fidelity 扩展, L4/L5) | **wire fidelity 下沉到 message/tool/block 级 (#269 M1)**: `IrMessage`/`IrTool`/四个 wire 来源 `IrBlock` variant 增 `extra` 字段 (未建模字段逃生舱, 同协议透传/跨协议清空契约与顶层 extra 同型, `clear_wire_fidelity` 统一清空); Anthropic codec 收集/回写 block 级+工具级 `cache_control`、消息级 `output_config` 等; `tool_result.is_error` 改 `Option<bool>` (显式 false 不再静默省略); 顶层 `system` 字段形态元数据 `system_form` (单 block array 不折叠); dag BlockPool 内容寻址 hash 纳入 extra; redact 双轨遍历 (StringLeafOps + collect_ir_str_leaves) 同步覆盖 extra 叶子 (SEC 扫描无新盲区); FWD-2 生成器扩展 (system 形态+cache_control / tools extra / 消息级 output_config / block cache_control / is_error 显式 false / 响应侧 block extra) 机械锁定 | issue #269: Anthropic 缓存是显式 opt-in, IR 路径剥离缓存标记 = 长 agent 会话 input 成本约放大一个数量级; 仓库 C3 契约 (mock 确定性) 的缓存友好投入因此被完全抵消, 本修复是补完既有设计目标而非新特性 |
 | 2026-09-23 | FWD-1 (M3) | **合法修改第三类: Anthropic egress 顶层自动缓存标记注入 (显式 opt-in, issue #269)**: `[redact] inject_cache_control = true` (默认 false) 时, same-proto IR 路径与 cross-proto 的 Anthropic egress 对不存在任何 cache_control 的请求注入顶层 `cache_control: {"type":"ephemeral"}` (automatic caching); 守卫: body 内已有任何缓存标记时不注入 (显式断点上限 4, 满槽顶层标记 400); 对顶层标记返 400 的旧版 Bedrock 集成保持默认关闭. 等价表述从"两种"修订为"三种" (见 FWD-1) | 同上 (#269): claude code 等自带 block 标记的客户端由 M1 保真, 本项服务不发标记的客户端; 注入是主动改写 wire 故走 opt-in, 默认关闭下 FWD-1 等式字面成立 |
+| 2026-09-23 | FWD-1 (原则显式化) | **"原始形状保持"登记为同协议转发的高优先契约 (用户裁决)**: 客户端发什么, 发往上游的就是什么; 三种合法修改是显式列举的例外, 注入类 (M3) 必须默认关闭 + opt-in, 永不成为默认行为; 修复方向是"把破坏形状的 bug 修回形状保持"而非新增形状改写. 注记落于 FWD-1 "原始形状保持"段 + 根 AGENTS.md 工程纪律小节 | issue #269 PR #272 评审讨论: 用户对 M3 注入与形状保持契约的张力提出原则性澄清 |
