@@ -7,19 +7,25 @@
 //! # 路由策略
 //! - `/`                —— Web UI 入口 (单页 HTML).
 //! - `/api/*`           —— Web UI JSON API (未匹配子路径 404, 绝不进 forward).
-//! - `/login`, `/oauth2/callback`, `/logout` —— OIDC 认证 (auth 启用时).
+//! - `/login`, `/oauth2/callback`, `/logout` —— OIDC 认证 (auth 启用 + feature `oidc`).
 //! - `/{proto}/{name}`        —— forward (`rest = "/"`).
 //! - `/{proto}/{name}/{*rest}`—— forward (含 sub-path).
 //! - 其他 —— 404 (不再 catch-all 透传, 避免误转发 + 明确契约).
 //!
 //! 完整的 URI 分配规划 (顶级保留字 / 命名空间不相交论证) 见 `docs/design/url-layout.md`.
 //!
-//! # 认证 (可选, 由 `[auth] enabled` 控制)
+//! # 认证 (可选, 由 `[auth] enabled` 控制; OIDC 部分另受 cargo feature `oidc` 门控, #276)
 //!
 //! `auth.enabled = false` (默认): 单用户模式, 所有路由无认证 (向后兼容).
 //! `auth.enabled = true`: 双轨认证 —
 //! - 浏览器 WebUI (`/`, `/api/*`): OIDC Authorization Code + PKCE → cookie session.
 //! - SDK 转发 (`/{proto_short}/{name}/*`, proto_short ∈ o/a/g/l/r): 本地 API key (`Authorization: Bearer sg_...`).
+//!
+//! feature `oidc` (默认关闭) 控制 OIDC 编译: 关闭时 `/login` `/oauth2/callback`
+//! `/logout` `/api/me` 路由与 AuthManagerLayer 装配 (`AuthStack` /
+//! `build_router_with_auth`) 不存在, `enabled = true` 启动即报错 (提示 rebuild
+//! with --features oidc); API key 路径与 `[auth]` 配置解析不受影响. 详见
+//! `src/auth/mod.rs` 头部.
 //!
 //! ApiKeyStore 总是构造 (与 `auth.enabled` 无关), 让 WebUI 在单用户模式下也能
 //! 管理和预配置 key. `/api/api-keys` CRUD 路由在 `web::router()` 里无条件挂载
@@ -70,17 +76,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use axum::Router;
 use axum::middleware;
-use axum::{
-    Router,
-    routing::{any, get, post},
-};
+use axum::routing::any;
+#[cfg(feature = "oidc")]
+use axum::routing::{get, post};
 use parking_lot::{Mutex, RwLock};
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
-use crate::auth::{ApiKeyStore, AuthConfig, OidcBackend};
+#[cfg(feature = "oidc")]
+use crate::auth::OidcBackend;
+use crate::auth::{ApiKeyStore, AuthConfig};
 use crate::dag::ConversationDag;
 use crate::provider::{Provider, ProviderTable};
 use crate::proxy::{forward, forward_no_rest};
@@ -127,19 +135,42 @@ macro_rules! trace_layer {
 
 /// 构建 axum Router (单用户模式, 无认证).
 ///
-/// 这是 `auth.enabled = false` 时的入口, 与旧版完全兼容.
+/// 这是 `auth.enabled = false` 时的入口, 与旧版完全兼容; **无 `oidc` feature 的
+/// 二进制中这是唯一装配路径** (feature gate, #276 — `enabled = true` 在
+/// `AuthConfig::validate` 就被 fail-fast 拒绝, 见 `src/auth/mod.rs` 头部).
 /// `guard`: Host/Origin 校验白名单 (SEC-7, 由 [`crate::server_host_guard`] 定义;
 /// 调用方需用与实际监听 port 一致的 [`HostGuard::new`] 构造 — 测试 spawn 时
 /// 从已 bind 的 listener 取 port).
 pub fn build_router(state: AppState, guard: HostGuard) -> Router {
-    build_router_inner(state, None, guard)
+    finish_router(
+        Router::new()
+            .merge(web::router())
+            .route("/api/{*rest}", any(web::not_found))
+            .merge(forward_router())
+            .with_state(state),
+        guard,
+    )
 }
 
 /// 构建 axum Router (带认证).
 ///
 /// `auth_stack` 由 [`serve`] 在启用认证时构造.
+#[cfg(feature = "oidc")]
 pub fn build_router_with_auth(state: AppState, auth_stack: AuthStack, guard: HostGuard) -> Router {
-    build_router_inner(state, Some(auth_stack), guard)
+    finish_router(
+        build_router_with_auth_layers(state, auth_stack, forward_router()),
+        guard,
+    )
+}
+
+/// Forward router: proto 简写参数路由 (两档装配共用).
+///
+/// 首段 proto 简写 (o/a/g/l/r) 由 dispatch 校验; 顶级保留字 (api/login/logout/oauth2)
+/// 的静态路由优先于本参数路由, 二者天然不相交 (见 docs/design/url-layout.md).
+fn forward_router() -> Router<AppState> {
+    Router::new()
+        .route("/{proto}/{name}", any(forward_no_rest))
+        .route("/{proto}/{name}/{*rest}", any(forward))
 }
 
 /// state 目录内的运行时工件路径 (**固定名**, 不带 config stem): usage SQLite 库
@@ -163,30 +194,12 @@ fn state_dir_artifact(state_path: &Path, file_name: &str) -> PathBuf {
     state_path.parent().unwrap_or(Path::new("")).join(file_name)
 }
 
-/// 内部: 根据 auth_stack 是否存在, 条件化装配认证 layer.
+/// 内部: 无认证装配的公共收尾 — trace + Host/Origin guard 统一叠加 (后挂者为最外层).
 ///
-/// trace + Host/Origin guard 在两个分支的结果上**统一**叠加 (后挂者为最外层):
-/// guard 对任何装配分支恒为最外层是 SEC-7 不变量, 结构性保证而非各分支自行记得.
+/// guard 对任何装配分支 (本函数与 [`build_router_with_auth_layers`] 的结果) 恒为
+/// 最外层是 SEC-7 不变量, 结构性保证而非各分支自行记得.
 /// 403 拒绝发生在认证 / trace 之前 (guard 内自带 WARN 日志, 保证可观测).
-fn build_router_inner(state: AppState, auth_stack: Option<AuthStack>, guard: HostGuard) -> Router {
-    // Forward router: 使用 AppState, 在 merge 前不调用 with_state.
-    // 首段 proto 简写 (o/a/g/l/r) 由 dispatch 校验; 顶级保留字 (api/login/logout/oauth2)
-    // 的静态路由优先于本参数路由, 二者天然不相交 (见 docs/design/url-layout.md).
-    let forward_router: Router<AppState> = Router::new()
-        .route("/{proto}/{name}", any(forward_no_rest))
-        .route("/{proto}/{name}/{*rest}", any(forward));
-
-    let router = match auth_stack {
-        None => {
-            // 单用户模式: 所有路由无认证.
-            Router::new()
-                .merge(web::router())
-                .route("/api/{*rest}", any(web::not_found))
-                .merge(forward_router)
-                .with_state(state)
-        }
-        Some(auth) => build_router_with_auth_layers(state, auth, forward_router),
-    };
+fn finish_router(router: Router, guard: HostGuard) -> Router {
     router
         .layer(trace_layer!())
         .layer(middleware::from_fn_with_state(
@@ -196,6 +209,7 @@ fn build_router_inner(state: AppState, auth_stack: Option<AuthStack>, guard: Hos
 }
 
 /// 认证层的完整装配状态 (启用认证时由 serve 构造).
+#[cfg(feature = "oidc")]
 pub struct AuthStack {
     pub backend: OidcBackend,
     pub api_keys: ApiKeyStore,
@@ -203,12 +217,13 @@ pub struct AuthStack {
     pub secure_cookie: bool,
 }
 
-/// 构建带认证的 router.
+/// 构建带认证的 router (feature `oidc`, #276 — 默认档无此函数).
 ///
 /// - WebUI 路由: OIDC session guard (login_required).
 /// - 转发路由: API key middleware (require_api_key).
 /// - 登录路由 (/login, /callback, /logout): 公开 (不需要认证).
-/// - trace / Host guard 由 build_router_inner 在本函数结果之外统一叠加.
+/// - trace / Host guard 由 finish_router 在本函数结果之外统一叠加.
+#[cfg(feature = "oidc")]
 fn build_router_with_auth_layers(
     state: AppState,
     auth: AuthStack,
@@ -474,6 +489,10 @@ pub async fn serve(
     let host_guard = HostGuard::new(host, listen_port).allow_domains(&allowed_domains);
 
     // 条件化: 启用认证时构造 AuthStack, 否则单用户模式.
+    // 无 oidc feature 的二进制只有单用户路径 — `auth_config.validate()` 已在
+    // 函数入口把 `enabled = true` fail-fast 拒绝 (feature gate, #276), 到这里
+    // enabled 恒为 false.
+    #[cfg(feature = "oidc")]
     let app = if auth_config.enabled {
         let oidc_cfg = auth_config
             .oidc
@@ -526,11 +545,18 @@ pub async fn serve(
         build_router(proxy, host_guard)
     };
 
+    // 默认档 (无 oidc feature) 的唯一装配路径.
+    #[cfg(not(feature = "oidc"))]
+    let app = build_router(proxy, host_guard);
+
+    #[cfg(feature = "oidc")]
     let auth_mode = if auth_config.enabled {
         "OIDC"
     } else {
         "single-user"
     };
+    #[cfg(not(feature = "oidc"))]
+    let auth_mode = "single-user";
     info!(%addr, %auth_mode, ?state_path, "secret-guard listening (Ctrl-C to stop)");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

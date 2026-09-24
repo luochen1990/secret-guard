@@ -31,6 +31,11 @@
 //!   登录 (验签失败 → 刷新 JWKS → 有界重验一次). #198: rauthy 月度自动轮换后,
 //!   新 kid 的 id_token 在启动时抓取的 JWKS 快照中查无此 key, 登录永久 500.
 
+// feature gate (#276): OIDC 登录链默认不编译 (openidconnect / tower-sessions /
+// axum-login 三依赖 optional 化), 本测试文件的依赖 (含 dev-deps rsa/base64) 只在
+// `--features oidc` 下可用 — 全量档 (just check / check-features 的 oidc 矩阵) 运行.
+#![cfg(feature = "oidc")]
+
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 

@@ -1,5 +1,20 @@
 //! 认证骨架: OIDC 登录 (浏览器 WebUI) + 本地 API key (SDK 转发路径).
 //!
+//! # cargo feature `oidc` (#276)
+//!
+//! OIDC 登录链是可选编译的 (feature `oidc`, 默认关闭 — 默认构建图收缩 ~90 crates):
+//! - **gate 范围**: `oidc` / `handlers` / `session` 三个子模块 + server.rs 的
+//!   `/login` `/oauth2/callback` `/logout` `/api/me` 路由与 AuthManagerLayer 装配
+//!   (`AuthStack` / `build_router_with_auth`, 同样 cfg 门控).
+//! - **不 gate**: `apikey.rs` + `ApiKeyStore` (本地 API key 路径永远在 — 静态 key
+//!   预配与 WebUI key 管理与 OIDC 无关); `middleware.rs` (require_api_key);
+//!   `AuthConfig` / `OidcConfig` 的 `[auth]` 配置段解析 (schema 保留, 手写 OIDC
+//!   配置在默认档仍能解析).
+//! - **fail-fast 组合语义**: cfg 开关与运行时 `enabled` 开关正交 — 无 feature 时
+//!   `enabled` 只能 false; `enabled = true` + 默认档 → `AuthConfig::validate`
+//!   启动报错退出 (先例: oidc.issuer_url Discovery fail-fast), 信息含
+//!   "rebuild with --features oidc".
+//!
 //! # "只认证, 不隔离" 哲学
 //!
 //! ApiKeyStore 在 server.rs 中**无条件构造** (与 `auth.enabled` 无关), 让 WebUI
@@ -20,9 +35,12 @@
 //! ```
 
 pub mod apikey;
+#[cfg(feature = "oidc")]
 pub mod handlers;
 pub mod middleware;
+#[cfg(feature = "oidc")]
 pub mod oidc;
+#[cfg(feature = "oidc")]
 pub mod session;
 
 use std::path::{Path, PathBuf};
@@ -31,7 +49,9 @@ use serde::{Deserialize, Serialize};
 
 pub use apikey::{ApiKeyEntry, ApiKeyStore};
 pub use middleware::{AuthenticatedTenant, require_api_key};
+#[cfg(feature = "oidc")]
 pub use oidc::{OidcBackend, OidcCredentials, OidcError, User};
+#[cfg(feature = "oidc")]
 pub use session::build_session_layer;
 
 /// 认证配置 (static config 的 `[auth]` 段).
@@ -107,34 +127,47 @@ pub struct OidcConfig {
 impl AuthConfig {
     pub fn validate(&self) -> Result<(), String> {
         if self.enabled {
-            let oidc = self
-                .oidc
-                .as_ref()
-                .ok_or_else(|| "[auth] enabled = true but [auth.oidc] is missing".to_string())?;
-            if oidc.issuer_url.trim().is_empty() {
-                return Err("[auth.oidc] issuer_url must not be empty".into());
+            // feature gate fail-fast (#276): cfg 开关与运行时 enabled 正交组合,
+            // 无 oidc feature 的二进制只能跑单用户模式. 优于 "静默忽略 enabled"
+            // (配置明确要求认证却拿到无认证网关, 是安全语义静默降级).
+            #[cfg(not(feature = "oidc"))]
+            {
+                return Err(
+                    "[auth] enabled = true but this binary was built without OIDC support \
+                     (cargo feature `oidc` is off); rebuild with --features oidc"
+                        .to_string(),
+                );
             }
-            if oidc.client_id.trim().is_empty() {
-                return Err("[auth.oidc] client_id must not be empty".into());
-            }
-            // redirect_url 校验前置到启动时 (集中式预处理), 避免错误延迟到 OIDC
-            // Discovery 阶段才暴露. 不引入 url crate 作直接依赖, 只做最小校验:
-            // 必须是 http/https scheme + path 必须是 /oauth2/callback (与 axum 路由一致).
-            if let Some(ru) = oidc.redirect_url.as_ref() {
-                let trimmed = ru.trim();
-                if trimmed.is_empty() {
-                    return Err("[auth.oidc] redirect_url must not be empty".into());
+            #[cfg(feature = "oidc")]
+            {
+                let oidc = self.oidc.as_ref().ok_or_else(|| {
+                    "[auth] enabled = true but [auth.oidc] is missing".to_string()
+                })?;
+                if oidc.issuer_url.trim().is_empty() {
+                    return Err("[auth.oidc] issuer_url must not be empty".into());
                 }
-                if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
-                    return Err(format!(
-                        "[auth.oidc] redirect_url '{trimmed}' must start with http:// or https://"
-                    ));
+                if oidc.client_id.trim().is_empty() {
+                    return Err("[auth.oidc] client_id must not be empty".into());
                 }
-                if !trimmed.ends_with("/oauth2/callback") {
-                    return Err(format!(
-                        "[auth.oidc] redirect_url '{trimmed}' must end with /oauth2/callback \
-                         (axum callback route, only scheme/host/port can vary)"
-                    ));
+                // redirect_url 校验前置到启动时 (集中式预处理), 避免错误延迟到 OIDC
+                // Discovery 阶段才暴露. 不引入 url crate 作直接依赖, 只做最小校验:
+                // 必须是 http/https scheme + path 必须是 /oauth2/callback (与 axum 路由一致).
+                if let Some(ru) = oidc.redirect_url.as_ref() {
+                    let trimmed = ru.trim();
+                    if trimmed.is_empty() {
+                        return Err("[auth.oidc] redirect_url must not be empty".into());
+                    }
+                    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+                        return Err(format!(
+                            "[auth.oidc] redirect_url '{trimmed}' must start with http:// or https://"
+                        ));
+                    }
+                    if !trimmed.ends_with("/oauth2/callback") {
+                        return Err(format!(
+                            "[auth.oidc] redirect_url '{trimmed}' must end with /oauth2/callback \
+                             (axum callback route, only scheme/host/port can vary)"
+                        ));
+                    }
                 }
             }
         }
@@ -164,7 +197,11 @@ mod tests {
     }
 
     #[test]
-    fn enabled_without_oidc_fails() {
+    fn enabled_without_oidc_section_fails() {
+        // enabled=true 但 [auth.oidc] 段缺失 → 两档都报错 (全量档报 "missing",
+        // 默认档报 feature 缺失 — 本测试只断言 err, 消息级断言由下方
+        // enabled_true_without_oidc_feature_fails_fast (默认档) 与
+        // redirect_url_validate 模块 (全量档) 分别锁定).
         assert!(
             AuthConfig {
                 enabled: true,
@@ -172,6 +209,35 @@ mod tests {
             }
             .validate()
             .is_err()
+        );
+    }
+
+    // ─── feature `oidc` 关闭时: enabled=true 的 fail-fast (#276) ────────────
+    //
+    // cfg 开关与运行时 enabled 开关正交: 默认档 (无 oidc feature) 下 enabled=true
+    // 必须启动报错, 信息含 "rebuild with --features oidc" (质量纪律: fail-fast
+    // 行为要有测试). 全量档的对称行为 (enabled=true + oidc 配置齐 → ok) 由
+    // redirect_url_validate 模块的既有测试覆盖.
+
+    #[cfg(not(feature = "oidc"))]
+    #[test]
+    fn enabled_true_without_oidc_feature_fails_fast() {
+        let cfg = AuthConfig {
+            enabled: true,
+            // oidc 段故意配齐合法值: 证明错误源于 feature 缺失而非配置缺失 —
+            // 二进制没有 OIDC 代码时, 配置再完整也不能启用认证.
+            oidc: Some(OidcConfig {
+                issuer_url: "https://idp.example.com".into(),
+                client_id: "sg".into(),
+                client_secret_file: None,
+                redirect_url: None,
+            }),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.contains("rebuild with --features oidc"),
+            "error must tell user how to rebuild, got: {err}"
         );
     }
 
@@ -232,68 +298,77 @@ mod tests {
     // 与 issuer_url/client_id 对齐: 把"明显误配"在启动时 fail-fast, 而非延迟到
     // OIDC Discovery 阶段才暴露. 校验两条契约: (1) http/https scheme;
     // (2) path 结尾 /oauth2/callback (与 axum callback 路由一致).
+    //
+    // 整段 cfg 门控 (feature `oidc`, #276): 这些测试以 enabled=true 为前提走
+    // [auth.oidc] 字段校验, 而默认档下 enabled=true 在进入字段校验前就被
+    // feature fail-fast 拦截 — 断言目标 (redirect_url 语义) 只有全量档存在.
 
-    /// 辅助: 构造一个 enabled=true 的 AuthConfig, oidc 必填字段已填合法值,
-    /// 只留 redirect_url 给调用方覆盖.
-    fn auth_enabled_cfg(redirect_url: Option<&str>) -> AuthConfig {
-        AuthConfig {
-            enabled: true,
-            oidc: Some(OidcConfig {
-                issuer_url: "https://idp.example.com".into(),
-                client_id: "sg".into(),
-                client_secret_file: None,
-                redirect_url: redirect_url.map(str::to_string),
-            }),
-            api_keys: vec![],
-            secure_cookie: false,
+    #[cfg(feature = "oidc")]
+    mod redirect_url_validate {
+        use super::*;
+
+        /// 辅助: 构造一个 enabled=true 的 AuthConfig, oidc 必填字段已填合法值,
+        /// 只留 redirect_url 给调用方覆盖.
+        fn auth_enabled_cfg(redirect_url: Option<&str>) -> AuthConfig {
+            AuthConfig {
+                enabled: true,
+                oidc: Some(OidcConfig {
+                    issuer_url: "https://idp.example.com".into(),
+                    client_id: "sg".into(),
+                    client_secret_file: None,
+                    redirect_url: redirect_url.map(str::to_string),
+                }),
+                api_keys: vec![],
+                secure_cookie: false,
+            }
         }
-    }
 
-    #[test]
-    fn validate_redirect_url_none_passes() {
-        // enabled=true 且 redirect_url 留空: 与历史行为兼容, 必须 ok.
-        assert!(auth_enabled_cfg(None).validate().is_ok());
-    }
+        #[test]
+        fn validate_redirect_url_none_passes() {
+            // enabled=true 且 redirect_url 留空: 与历史行为兼容, 必须 ok.
+            assert!(auth_enabled_cfg(None).validate().is_ok());
+        }
 
-    #[test]
-    fn validate_redirect_url_valid_https_passes() {
-        // 合法 https + 正确 path: ok.
-        assert!(
-            auth_enabled_cfg(Some("https://sg.example.com/oauth2/callback"))
+        #[test]
+        fn validate_redirect_url_valid_https_passes() {
+            // 合法 https + 正确 path: ok.
+            assert!(
+                auth_enabled_cfg(Some("https://sg.example.com/oauth2/callback"))
+                    .validate()
+                    .is_ok()
+            );
+        }
+
+        #[test]
+        fn validate_redirect_url_rejects_empty() {
+            let err = auth_enabled_cfg(Some("   ")).validate().unwrap_err();
+            assert!(err.contains("redirect_url must not be empty"), "got: {err}");
+        }
+
+        #[test]
+        fn validate_redirect_url_rejects_non_http_scheme() {
+            let err = auth_enabled_cfg(Some("ftp://sg.example.com/oauth2/callback"))
                 .validate()
-                .is_ok()
-        );
-    }
+                .unwrap_err();
+            assert!(err.contains("must start with http"), "got: {err}");
+        }
 
-    #[test]
-    fn validate_redirect_url_rejects_empty() {
-        let err = auth_enabled_cfg(Some("   ")).validate().unwrap_err();
-        assert!(err.contains("redirect_url must not be empty"), "got: {err}");
-    }
+        #[test]
+        fn validate_redirect_url_rejects_wrong_path() {
+            // scheme 对但 path 不是 /oauth2/callback → 会被 IdP 回跳后 404, 前置拒绝.
+            let err = auth_enabled_cfg(Some("https://sg.example.com/callback"))
+                .validate()
+                .unwrap_err();
+            assert!(err.contains("/oauth2/callback"), "got: {err}");
+        }
 
-    #[test]
-    fn validate_redirect_url_rejects_non_http_scheme() {
-        let err = auth_enabled_cfg(Some("ftp://sg.example.com/oauth2/callback"))
-            .validate()
-            .unwrap_err();
-        assert!(err.contains("must start with http"), "got: {err}");
-    }
-
-    #[test]
-    fn validate_redirect_url_rejects_wrong_path() {
-        // scheme 对但 path 不是 /oauth2/callback → 会被 IdP 回跳后 404, 前置拒绝.
-        let err = auth_enabled_cfg(Some("https://sg.example.com/callback"))
-            .validate()
-            .unwrap_err();
-        assert!(err.contains("/oauth2/callback"), "got: {err}");
-    }
-
-    #[test]
-    fn validate_redirect_url_skipped_when_auth_disabled() {
-        // enabled=false 时 redirect_url 校验必须跳过 (与 issuer_url/client_id 行为一致).
-        let mut cfg = auth_enabled_cfg(Some("not-a-url"));
-        cfg.enabled = false;
-        assert!(cfg.validate().is_ok());
+        #[test]
+        fn validate_redirect_url_skipped_when_auth_disabled() {
+            // enabled=false 时 redirect_url 校验必须跳过 (与 issuer_url/client_id 行为一致).
+            let mut cfg = auth_enabled_cfg(Some("not-a-url"));
+            cfg.enabled = false;
+            assert!(cfg.validate().is_ok());
+        }
     }
 
     // ─── StaticApiKey::resolve: 三条纯逻辑分支 ──────────────────────────────

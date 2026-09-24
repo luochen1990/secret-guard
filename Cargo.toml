@@ -40,6 +40,14 @@ default = []
 # 视图正确性热路径断言 (CI 守卫, 默认关闭避免生产开销).
 # 详见 AGENTS.md "视图正确性确保机制".
 consistency-check = []
+# OIDC 登录链 (浏览器 WebUI 认证) 的编译开关 (#276): 默认构建不含 OIDC — 三依赖
+# (openidconnect / tower-sessions / axum-login, ~90 crate 闭包) 仅在此 feature 开启
+# 时进入构建图. gate 范围: src/auth/ 的 oidc/handlers/session 子模块 + server.rs 的
+# /login /oauth2/callback /logout 路由与 AuthManagerLayer 装配. **不 gate**: apikey.rs
+# (本地 API key 路径) 与 [auth] 配置段解析; `[auth] enabled = true` + 默认档 →
+# 启动 fail-fast (AuthConfig::validate, 提示 rebuild with --features oidc).
+# 详见 src/auth/mod.rs 头部.
+oidc = ["dep:openidconnect", "dep:tower-sessions", "dep:axum-login"]
 
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }
@@ -56,7 +64,11 @@ reqwest = { version = "0.12", default-features = false, features = [
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 tower-http = { version = "0.7", features = ["trace"] }
-serde = { version = "1", features = ["derive"] }
+# serde "rc" 显式开启: dag/web 的 DTO 持有 Arc<str> / Arc<[(String,String)]> 并
+# derive Serialize — 依赖 serde 的 rc feature. 历史上由 tower-sessions 等旧必选
+# 依赖经 feature 统一传递启用, oidc optional 化 (#276) 后默认档构建图无人开启它,
+# 故显式声明 (依赖自身用到的 feature 而非指望传递统一, 是正确姿势).
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 bytes = "1"
 futures = "0.3"
@@ -73,13 +85,17 @@ sha2 = "0.10"
 rand = "0.10"
 
 # 认证: OIDC (浏览器 WebUI) + 本地 API key (SDK 转发路径).
-# axum-login re-export tower-sessions core, 但 MemoryStore 需要 memory-store feature.
-tower-sessions = { version = "0.14", features = ["memory-store"] }
-axum-login = "0.18"
+# OIDC 三依赖 optional 化 (feature `oidc`, #276): 默认构建只保留 API key 路径,
+# 默认档构建图显著收缩 (双口径快照见 docs/dependency-watch.md). axum-login
+# re-export tower-sessions core, 但 MemoryStore 需要 memory-store feature.
+tower-sessions = { version = "0.14", features = [
+  "memory-store",
+], optional = true }
+axum-login = { version = "0.18", optional = true }
 openidconnect = { version = "4", default-features = false, features = [
   "reqwest",
   "rustls-tls",
-] }
+], optional = true }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 # 子串搜索 (memmem::Finder): warn_disabled_secrets_in_body 对 raw body 的多 needle
 # 扫描, 替代朴素 O(n·m) 窗口比较. 已是 lock 中传递依赖 (axum / futures 等), 显式化
@@ -92,9 +108,10 @@ mockito = "1"
 pretty_assertions = "1"
 proptest = "1"
 criterion = { version = "0.8", features = ["html_reports"] }
-# OIDC mock IdP 集成测试 (tests/auth_oidc.rs):
-# 这些 crate 都已在依赖树中 (经 openidconnect / rustls 传递), 此处仅显式化以便测试
-# 直接用于生成 RSA 密钥对 + 手签 RS256 id_token. 不引入新传递依赖.
+# OIDC mock IdP 集成测试 (tests/auth_oidc.rs, feature `oidc` 门控):
+# 这些 crate 都已在全量档依赖树中 (rsa 经 openidconnect 传递, 其余经 rustls 链),
+# 此处仅显式化以便测试直接用于生成 RSA 密钥对 + 手签 RS256 id_token. 不引入新
+# 传递依赖; 默认档下 dev-deps 不进 normal 构建图 (rsa 在默认档仅因此处而存在).
 # license 全部已在 deny.toml allow 列表.
 rsa = "0.9"
 sha2 = "0.10"
