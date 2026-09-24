@@ -642,7 +642,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 **Properties**:
 - `prop_streaming_resp_parsed_equals_stream_scan_snapshot`: 流式 resp_parsed == StreamScan snapshot. 🔁→`streaming_parsed_view_accumulates_text` (`tests/integration.rs`; 仅 text 累积维度)
 - `prop_non_streaming_resp_parsed_equals_reader_parse`: 非流式 resp_parsed == reader.read_response(raw_resp_body). 🔁→`assert_resp_parsed_matches_source_nonstream` (`src/proxy/recorder.rs`, consistency-check) + `web_api_records_view_parsed_openai_returns_structured`
-- `prop_resp_parsed_consistency_check`: resp_parsed 字段必须能通过 consistency-check 断言 (与原始数据视图一致). 🔁→`assert_resp_parsed_matches_source_nonstream` (`src/proxy/recorder.rs`, CI `just check-features` 执行)
+- `prop_resp_parsed_consistency_check`: resp_parsed 字段必须能通过 consistency-check 断言 (与原始数据视图一致). 🔁→`assert_resp_parsed_matches_source_nonstream` (`src/proxy/recorder.rs`, CI 全量档 `just check` 执行)
 - `prop_resp_parsed_derived_matches_stored_pre_clear`: B1 派生 (message + 元字段 → writer) == 清除前 stored parsed (同 ir 直接 writer 序列化); finalize 处 "先断言后删除" (id/created 缺失时 writer 合成非确定, 归一化比对). 🔁→`assert_tail_parsed_matches_stored` (`src/proxy/recorder.rs`, consistency-check)
 
 ### DTO-4 preview 提取 best-effort
@@ -835,7 +835,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 **陈述**: 任何 assert / panic / log 消息不得包含 secret 明文.
 
 **Properties**:
-- `prop_assert_messages_no_secret`: assert/panic 消息中不含 secret.value (即使用于诊断). ✅ (consistency-check feature gate, CI `just check-features` 执行)
+- `prop_assert_messages_no_secret`: assert/panic 消息中不含 secret.value (即使用于诊断). ✅ (consistency-check feature gate, CI 全量档 `just check` 执行)
 - `prop_log_messages_no_secret`: tracing log 不输出 secret.value. ✅
 - `prop_trace_span_no_query_string`: HTTP trace span 只记 path 不记 query — query 可能携带 key/token 类敏感参数 (SEC-C4a, 2026-09 扩展边界). 🔁→`trace_span_no_query_string` + `trace_span_omits_query_string` (`src/server.rs` / `tests/integration.rs`)
 
@@ -972,7 +972,7 @@ real 还原进去等于精准投放泄露. 故默认"偏安全", 暴露侧行为
 
 **Properties** (人工审查项 + feature flag):
 - `prop_view_deletion_has_assertion`: 任何"删除原始数据改用派生视图"的重构 commit 必须含 consistency-check 断言. 🔁→人工审查项 + 既有断言 `assert_redactions_match_map` 等 (`src/proxy/recorder.rs`, VIEW-2 表)
-- `prop_consistency_check_feature_runs_in_ci`: consistency-check feature flag 在 CI 中独立运行. 🔁→CI step `feature matrix guard (consistency-check + 默认档)` (`.forgejo/workflows/ci-merge.yml`) + `just check-features`
+- `prop_consistency_check_feature_runs_in_ci`: consistency-check 断言在 CI 主链全量档 (oidc,consistency-check 合并) 中执行 (tier-collapse, 见 docs/ci.md "双宿主验证分工"). 🔁→CI step `Quality gate (just ci-merge)` (`.forgejo/workflows/ci-merge.yml`) + `FULL_TIER`
 
 ### VIEW-2 派生字段 consistency-check 覆盖
 

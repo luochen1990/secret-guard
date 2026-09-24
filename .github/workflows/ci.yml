@@ -10,6 +10,10 @@
 #     justfile 内建的预期行为, 非 hack)
 #   - 工具链: rustup stable (rust-toolchain.toml 钉 stable; MSRV 下界 SSOT =
 #     Cargo.toml rust-version) vs forgejo 的 nixpkgs 1.96 — 两条非 Nix 贡献者路径一致.
+# feature 分工 (tier-collapse): 本文件是**默认档 (无 OIDC) 验证矩阵的唯一宿主** —
+#   forgejo 侧只跑全量档 (oidc,consistency-check 合并, 消除档位翻转的重复编译);
+#   默认档的编译 + 全量测试在此覆盖, 与发布二进制同档 (nix/release.nix 默认档),
+#   守卫 feature gate 不破坏默认构建 (fail-fast / 冒烟见 tests/auth_feature_gate.rs).
 name: ci
 
 on:
@@ -60,9 +64,7 @@ jobs:
       - name: contracts.md property lint
         run: just check-contracts
 
-      - name: clippy + tests (consistency-check feature)
-        run: just check-features
-
+      # tests (默认档 — 本 workflow 的 feature 分工职责, 见文件头)
       - name: tests
         run: cargo nextest run --locked --no-fail-fast
 

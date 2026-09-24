@@ -1,16 +1,18 @@
 # secret-guard — justfile
 # 一键命令集合, 覆盖开发 / 检查 / 测试 / 运行.
 #
-# 约定: 验证类 cargo 命令 (check/clippy/test/check-features/coverage*/bench/bench-ci)
+# 约定: 验证类 cargo 命令 (check/clippy/test/coverage*/bench/bench-ci)
 # 统一带 --locked — Cargo.toml 改动而 Cargo.lock 未提交时直接失败, 防 CI 静默重
 # resolve 导致 "CI 测试的依赖集 ≠ 提交的 lockfile ≠ nix 发布产物" 三元漂移 (issue #142).
 # 本地手改 Cargo.toml 后碰到一次 "lock file needs to be updated" 报错属预期提醒,
 # 跑一次 `cargo build` 更新 lockfile 后提交即可; 开发内环 recipe (build/run/dev*) 不带.
 #
-# 全量档 feature 参数 SSOT (#276): 验证/测试/覆盖率入口 (check / clippy / test /
-# coverage*) 统一走全量档 (带 OIDC 编译), 默认档矩阵在 check-features — 档位切换
-# 只改这一处.
-FULL_TIER := "--features oidc"
+# 全量档 feature 参数 SSOT (#276 + tier-collapse): 验证/测试/覆盖率入口 (check /
+# clippy / test / coverage*) 统一走全量档 (oidc + consistency-check 合并 — feature
+# 正交可加, 一轮 codegen 同时覆盖 OIDC 登录链与视图正确性断言, 消除档位翻转的
+# 重复编译); 默认档 (无 oidc) 的编译+测试矩阵由 GitHub 镜像 CI 承担
+# (.github/workflows/ci.yml, 与 forgejo 分工) — 档位切换只改这一处.
+FULL_TIER := "--features oidc,consistency-check"
 
 default:
     @just --list
@@ -43,9 +45,10 @@ dev-test:
     cargo watch -x 'nextest run'
 
 # 一次跑完: fmt + clippy + machete + doc + test + typos + deny.
-# **全量档 (--features oidc, #276)**: 主链带 oidc feature — 本地全绿 = 全量绿.
-# 默认档 (无 oidc) 的编译 + 测试矩阵由 check-features 覆盖 (两 recipe 共同构成
-# feature 矩阵; dev/watch 类内环 recipe 不带 feature, 追求最快反馈).
+# **全量档 (--features oidc,consistency-check, #276 + tier-collapse)**: 主链一轮
+# codegen 同时覆盖 OIDC 登录链 + 视图正确性断言 — 本地全绿 = 全量绿.
+# 默认档 (无 oidc) 的编译 + 测试矩阵由 GitHub 镜像 CI 承担 (.github/workflows/ci.yml;
+# dev/watch 类内环 recipe 不带 feature, 追求最快反馈).
 # --coverage: 测试阶段改用插桩编译 (cargo llvm-cov nextest), 产出覆盖率数据到
 # ${CARGO_TARGET_DIR}/llvm-cov-target/, 后续 just coverage-gate / coverage-html 直接消费, 无需重跑测试.
 # 默认不带 (本地开发追求快速反馈, 无需插桩开销).
@@ -60,10 +63,10 @@ dev-test:
 # doctest 暂时禁用: 当前唯一的 doctest (auth::middleware) 被标为 ```ignore, 测试价值为零.
 # 需要时取消下行注释即可恢复 (增量开销 <1s, 复用 clippy 的 debug/ 产物).
 #
-# consistency-check feature 守卫: 默认关闭的视图正确性断言. v3.0 起不再内嵌于本
-# recipe 的非覆盖率分支 (由 ci-merge recipe 的 all 档聚合; CI 侧在 ci-merge.yml
-# 单独成步 — contracts.md prop_consistency_check_feature_runs_in_ci 的锚点),
-# 确保守卫断言持续可用且不漂移, 复用同一 target/debug, 不影响磁盘峰值控制.
+# consistency-check feature 守卫: 默认关闭的视图正确性断言, 经 FULL_TIER 并入
+# 本 recipe 的 clippy/test 全量档 (tier-collapse, 曾为独立 recipe + CI step —
+# 动机见 docs/ci.md "双宿主验证分工"; 契约锚点 contracts.md
+# prop_consistency_check_feature_runs_in_ci), 复用同一 target/debug, 不影响磁盘峰值控制.
 #
 # doc 检查: cargo doc --no-deps -D warnings 验证 rustdoc 能编译 (含跨文件 doc 链接).
 # 项目大量使用 //! 头部文档 + contracts.md 链接, doc 链接写错 (路径错/跨 crate 错) 在 CI 不会
@@ -95,19 +98,6 @@ check *ARGS:
     just typos
     just deny-offline
     just nix-check
-
-# feature 矩阵守卫 (CI 用): 非 default feature 组合的 clippy + nextest.
-# 两段矩阵 (#276):
-#   1. consistency-check: 默认关闭的视图正确性断言 (详见 AGENTS.md "视图正确性确保机制",
-#      contracts.md prop_consistency_check_feature_runs_in_ci 契约的锚点).
-#   2. 默认档 (无 oidc): OIDC 登录链 cfg 掉后的编译 + 全量测试 — 守卫 feature gate
-#      不破坏默认构建 (fail-fast / 冒烟见 tests/auth_feature_gate.rs). 共享依赖在两档
-#      间指纹一致, 本段增量编译只是 crate 本体 (~分钟级).
-check-features:
-    cargo clippy --locked --all-targets --features consistency-check -- -D warnings
-    cargo nextest run --locked --no-fail-fast --features consistency-check
-    cargo clippy --locked --all-targets -- -D warnings
-    cargo nextest run --locked --no-fail-fast
 
 # 内嵌 JS 语法检查 (秒级, 阻塞式).
 # 从 src/web/index.html 提取 <script>...</script> 块, 用 node --check 验证语法.
@@ -188,20 +178,20 @@ check-all: check _kill-orphans
 
 # org ci 契约 recipe (阻塞级门禁入口, 见 lc-studio/forgejo-actions README「CI 分级」)。
 # v3.0 三档: 本仓 thin 形态 (SSOT 骨架 + 本地 skip-if-passed action), 质量链拆三档 —
-#   P0 ci-merge    (ci-merge.yml)   合入时刻: check-features + check 主链 + file-size
+#   P0 ci-merge    (ci-merge.yml)   合入时刻: check 主链 (全量档) + file-size
 #   P1 ci-deploy   (ci-deploy.yml)  部署时刻: audit + bench 基线 (nix build 留 workflow 层)
 #   P2 ci-periodic (ci-periodic.yml) 周期兜底: check --coverage + coverage-gate
 # stage 语义 (CI 编排与本地复现逐段等价、无重复执行):
-#   all (默认, 本地) = check-features + 主链 (just check) + file-size
+#   all (默认, 本地) = 主链 (just check, 全量档含 consistency 断言) + file-size
 #                      —— "本地全绿 ⇒ CI 阻塞项必绿" 的锚点在本档
-#   main (CI gate)   = 仅 check 主链 (check-features / file-size 由 workflow 独立
-#                      step 执行, Diagnose 表按 step 定位失败)
+#   main (CI gate)   = 仅 check 主链 (file-size 由 workflow 独立 step 执行,
+#                      Diagnose 表按 step 定位失败)
 ci-merge *stage:
     #!/usr/bin/env bash
     set -euo pipefail
     case "{{ stage }}" in
       main) just check ;;
-      ""|all) just check-features; just check; just check-file-size ;;
+      ""|all) just check; just check-file-size ;;
       *) echo "ci-merge: 未知 stage '{{ stage }}' (main | all)" >&2; exit 2 ;;
     esac
 
@@ -239,11 +229,11 @@ check-fmt:
         cargo fmt -- --check; \
     fi
 
-# 仅 clippy (全量档 --features oidc, 与 check 主链同档; 默认档入口见 check-features).
+# 仅 clippy (全量档, 与 check 主链同档; 默认档验证归 GitHub 镜像 CI).
 clippy:
     cargo clippy --locked --all-targets {{ FULL_TIER }} -- -D warnings
 
-# 仅 test (全量档 --features oidc, 与 check 主链同档; 默认档入口见 check-features).
+# 仅 test (全量档, 与 check 主链同档; 默认档验证归 GitHub 镜像 CI).
 test:
     cargo nextest run --locked {{ FULL_TIER }} --no-fail-fast
 

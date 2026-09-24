@@ -17,6 +17,9 @@
 #   各仓库内联拷贝的漂移面; 单 job 形态同时消除 "pre job 级故障 → check 被静默 skip →
 #   CI 绿但零测试" 的 silent-green-CI 窗口。改名后新 workflow 无历史 success 记录, 下一次
 #   push 全量跑一次属预期 (一次性代价)。
+# [tier-collapse] #276 双档化后的独立 consistency step (feature matrix guard) 撤销:
+#   consistency-check 并入主链全量档 (FULL_TIER), 默认档验证移交 GitHub 镜像 CI
+#   (动机与分工见 docs/ci.md "双宿主验证分工").
 #
 # runner label: vm-nix (microvm, 由 git.lambda.lc 管理员注册).
 # Rust 工具链直接装在 VM 里 (forgejo-runner-vm.mod.nix),
@@ -100,14 +103,14 @@ jobs:
     # pull_request.draft = forgejo IsWorkInProgress(), 阻塞合并的同一 SSOT;
     # 全 skip 时 run 结论 skipped 非 success, 不污染 skip-if-passed)
     if: ${{ (github.event_name != 'push' || github.ref == 'refs/heads/master') && (github.event_name != 'pull_request' || github.event.pull_request.draft != true) }}
-    # 冷启动预算 (v3.0 重算, 接替旧 ci.yml 的 75min 单预算): P0 最坏冷链 (持久卷全清)
-    # = debug 编译 (clippy+nextest, ~20min, issue #149-1 实测) + check-features 增量
-    # (~2min) + diff/toolchain/filesize (~2min) ≈ 24min; 已不含移出档的最坏耗时
-    # (插桩 llvm-cov 编译 / release LTO bench 编译 10-20min / playwright / audit /
-    # nix 全量 vendor ≤30min — 分摊到 ci-deploy 60min 与 ci-periodic 45min 预算).
-    # 取 40min 留 ~65% 余量 (job timeout 是硬上限, 超时算 failure 阻塞合并,
-    # continue-on-error 救不了). 正常热路径 ~6-9min (旧全链实测 15-19min40s 减去
-    # 移出档份额).
+    # 冷启动预算 (tier-collapse 重算): P0 最坏冷链 (持久卷全清) = 一轮全量档 debug
+    # 编译 (clippy + nextest, ~20min, issue #149-1 实测) + diff/toolchain/filesize
+    # (~2min) ≈ 22min; 已不含移出档的最坏耗时 (插桩 llvm-cov 编译 / release LTO bench
+    # 编译 10-20min / playwright / audit / nix 全量 vendor ≤30min — 分摊到 ci-deploy
+    # 60min 与 ci-periodic 45min 预算).
+    # 取 40min 留 ~80% 余量 (job timeout 是硬上限, 超时算 failure 阻塞合并,
+    # continue-on-error 救不了). 正常热路径 ~8-9min (deps 缓存命中时一轮 crate 本体
+    # codegen ~5min + 测试执行 ~2.5min + 静态链 ~1.5min).
     timeout-minutes: 40
     # 不声明 permissions: (Forgejo 不支持, 见文件头) — 迁移 GitHub 恢复 actions: read + pull-requests: write
     #
@@ -289,25 +292,17 @@ jobs:
       # 旧版 CI 内嵌 Reclaim step 只清 profraw 且全清阈值 1G 过低, 挡不住 cargo
       # 陈旧依赖产物的无界累积.)
 
-      # feature 矩阵守卫: clippy + nextest 带 feature flag 跑 (#276 起两段矩阵):
-      #   1. consistency-check: 默认关闭的视图正确性断言 (详见 AGENTS.md "视图正确性
-      #      确保机制"), 也是 contracts.md prop_consistency_check_feature_runs_in_ci
-      #      契约的锚点 (check-contracts lint 核验).
-      #   2. 默认档 (无 oidc): OIDC 登录链 cfg 掉后的编译 + 全量测试 — 守卫 feature
-      #      gate 不破坏默认构建. 主 gate 步跑全量档 (--features oidc), 本步与它
-      #      共享依赖编译缓存, 增量开销仅 crate 本体重编.
-      - name: feature matrix guard (consistency-check + 默认档)
-        id: consistency
-        if: success() && steps.skip.outputs.should_skip != 'true'
-        run: just check-features
+      # consistency-check 断言经 FULL_TIER 并入下方 gate 主链; 默认档 (无 oidc) 验证
+      # 归 GitHub 镜像 CI — 分工与动机见 docs/ci.md "双宿主验证分工".
 
       # P0 质量门禁主链 — 契约层入口 (`just ci-merge`, org v3.0 必须契约).
       # ci-merge recipe 的 main 档 = 普通 check 主链 (fmt + clippy + machete + doc 门禁
       # + 测试 + typos + deny-offline + check-webui-syntax + check-contracts + nix-check,
       # 不带 --coverage — 插桩编译与 coverage-gate 已下沉 P2 ci-periodic).
-      # consistency 与 file-size 在本 workflow 独立成步 (紧邻前后, Diagnose 表按 step
-      # 定位失败), 故 gate 只跑主链段 — recipe 的默认档 (本地 `just ci-merge`) 则聚合
-      # 全链三段, 与本 job 编排逐段等价、无重复执行 (判定细节见 justfile ci-merge recipe).
+      # 主链即全量档 (oidc + consistency-check, FULL_TIER 单点切换); file-size 在本
+      # workflow 独立成步 (Diagnose 表按 step 定位失败), 故 gate 只跑主链段 — recipe
+      # 的默认档 (本地 `just ci-merge`) 聚合全链两段, 与本 job 编排逐段等价、无重复
+      # 执行 (判定细节见 justfile ci-merge recipe).
       # success() 显式默认门: checkout 失败时不进空 workspace 跑 just, 避免次级噪音.
       - name: Quality gate (just ci-merge)
         id: gate
@@ -348,8 +343,7 @@ jobs:
             echo "| Step | id | Outcome |"
             echo "|------|----|---------|"
             echo "| Guard lock | lock | ${{ steps.lock.outcome }} |"
-            echo "| feature matrix (consistency-check + 默认档) | consistency | ${{ steps.consistency.outcome }} |"
-            echo "| Quality gate (check 主链全量档 --features oidc: fmt/clippy/machete/doc/--locked/typos/deny-offline/check-contracts) | gate | ${{ steps.gate.outcome }} |"
+            echo "| Quality gate (check 主链全量档 --features oidc,consistency-check: fmt/clippy/machete/doc/nextest/typos/deny-offline/check-contracts) | gate | ${{ steps.gate.outcome }} |"
             echo "| File size | filesize | ${{ steps.filesize.outcome }} |"
             echo ""
             echo "(coverage-gate/WebUI/bench/audit/nix 不在本 job — v3.0 三档拆分后分别归"

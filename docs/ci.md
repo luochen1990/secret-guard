@@ -67,28 +67,25 @@ single-job runner 上串行占位, 延迟最新 push 的反馈. workflow 级
    upsert 机制见下文"评论写回机制"。
 7. **Record toolchain version** (`if: always()`): 把 `rustc --version` 写入 step output,
    由 Diagnose 评论携带留痕 (CI 工具链由 VM nixpkgs 决定, 三源漂移事后可追溯)。
-8. **feature matrix guard (consistency-check + 默认档)** (`just check-features`): 两段
-   feature 矩阵 (#276) — ① clippy + nextest 带 `consistency-check` feature 跑一次
-   (视图正确性断言, 详见根 AGENTS.md "视图正确性确保机制"; 也是 contracts.md
-   `prop_consistency_check_feature_runs_in_ci` 的锚点); ② 默认档 (无 `oidc`) 的编译 +
-   全量测试, 守卫 OIDC feature gate 不破坏默认构建 (fail-fast / 冒烟见
-   `tests/auth_feature_gate.rs`)。
-9. **Quality gate (just ci-merge main)** — P0 阻塞主链: `just check` 全量档
-   (`--features oidc`, #276; fmt + clippy + machete + doc 门禁 + 测试 + typos +
-   deny-offline + check-webui-syntax + check-contracts + nix-check, **不带 --coverage** —
-   插桩与 coverage-gate 已归 P2)。
-   cargo 命令均带 `--locked`。全量测试集在本档与步骤 8 的默认档各跑一次。stage 机制见
-   justfile `ci-merge` recipe (CI 拆 step / 本地 all 档聚合, 逐段等价无重复)。
-10. **File size gate** (`just check-file-size`): `rust-diff-analyzer` 对每个 .rs 做 AST
+8. **Quality gate (just ci-merge main)** — P0 阻塞主链: `just check` 全量档
+   (`FULL_TIER` = `--features oidc,consistency-check`; fmt + clippy + machete + doc 门禁 +
+   测试 + typos + deny-offline + check-webui-syntax + check-contracts + nix-check,
+   **不带 --coverage** — 插桩与 coverage-gate 已归 P2)。
+    cargo 命令均带 `--locked`。consistency-check (视图正确性断言, 详见根 AGENTS.md
+    "视图正确性确保机制"; contracts.md `prop_consistency_check_feature_runs_in_ci` 的
+    锚点) 经全量档并入主链, 一轮 codegen 同时覆盖 OIDC 登录链与断言 (tier-collapse,
+    不再独立成步 — 见 "双宿主验证分工")。
+    stage 机制见 justfile `ci-merge` recipe (CI 拆 step / 本地 all 档聚合, 逐段等价无重复)。
+9. **File size gate** (`just check-file-size`): `rust-diff-analyzer` 对每个 .rs 做 AST
     分类, 只统计 prod 行数 (排除 test), 双阈值 (WARN 500 软提醒 / MAX 1600 硬阻断,
     fail-closed)。
-11. **Diagnose failure** (仅 PR + job 失败时, `continue-on-error`): 阻塞 step outcomes
+10. **Diagnose failure** (仅 PR + job 失败时, `continue-on-error`): 阻塞 step outcomes
     汇总表 + 工具链版本贴到 PR 评论 (无日志权限 contributor 的 fallback)。
-12. **Guard single-job assumption (verify)** (`if: always()`): 校验 acquire step 写入的
+11. **Guard single-job assumption (verify)** (`if: always()`): 校验 acquire step 写入的
     锁文件未被覆盖; 被覆盖则显式失败并指向 "并发互斥假设" 段的应对预案。
 
 > **流程顺序原则**: 真正非阻塞的附加检查 (diff 报告 / Diagnose) 用 `continue-on-error`
-> 兜底, 即使抽风也不影响 `check` job 状态; 阻塞门禁 (consistency-check / check 主链
+> 兜底, 即使抽风也不影响 `check` job 状态; 阻塞门禁 (check 主链全量档
 > 含 doc/--locked/typos/deny-offline/check-contracts / file-size / lock 校验) 失败则
 > job 失败。
 
@@ -129,8 +126,8 @@ artifacts on failure (截图/trace/报告, retention 14 天) / Guard verify。
 | Guard acquire/verify, Checkout, Cleanup key | P0 (三档各自保留, 逐字节同构) |
 | pre job (内联探针) | 删除 — 换共享本地 action (三档各自接线, workflow_file 自指) |
 | diff breakdown + Upsert 评论, toolchain 留痕, Diagnose | P0 保留 |
-| consistency-check feature guard | P0 保留 (独立 step, contracts.md 锚点) |
-| Check + coverage data (`--coverage` 插桩) | 拆分: 普通主链留 P0 (step 9); 插桩归 P2 |
+| consistency-check feature guard | P0 并入主链全量档 (tier-collapse; contracts.md 锚点同步) |
+| Check + coverage data (`--coverage` 插桩) | 拆分: 普通主链留 P0 (step 8); 插桩归 P2 |
 | Coverage gate | **P2** (rubric: 覆盖率防倒退 = 质量债, 不卡合入) |
 | Performance benchmark + bench PR 评论 | **P1** (compare-save 单模式; PR 评论随 PR 事件消失) |
 | WebUI regression + 评论 + artifact | **P2** (评论随 PR 事件消失 → 日志摘要 + artifact) |
@@ -223,12 +220,34 @@ concurrency=1 或 single-job mode, 配置在 nixos 仓库 `forgejo-runner-vm.mod
 旧单 workflow 75min 预算按三档重算 (issue #149-1 的冷启动实测口径; timeout 算 job
 failure, continue-on-error 救不了 — P0 超时会阻塞合并):
 
-- `ci-merge` 40min: 冷链 = debug 编译 ~20min + check-features + diff/filesize ≈ 24min,
-  正常热路径 ~6-9min (旧全链实测 15-19min40s 减移出档份额).
+- `ci-merge` 40min: 冷链 = 一轮全量档 debug 编译 ~20min + diff/filesize ≈ 22min,
+  正常热路径 ~8-9min (一轮 crate codegen ~5min + 测试 ~2.5min + 静态链 ~1.5min).
+  (tier-collapse 前双档矩阵实测 ~20min, 动机详见 "双宿主验证分工".)
 - `ci-deploy` 60min: release LTO bench 编译 10-20min + bench 运行 + audit + nix build
   (step 自身硬上限 30min), 正常热路径 ~8-12min.
 - `ci-periodic` 45min: 插桩编译 20-25min + 测试 + report + Playwright ~3-5min,
   正常热路径 ~8-12min.
+
+## 双宿主验证分工 (forgejo 全量档 / GitHub 默认档)
+
+仓双宿 (origin = forgejo, github = GitHub 镜像), feature 验证矩阵按宿主分工
+(tier-collapse 裁决, 2026-09-24):
+
+| 宿主 | 档位 | 覆盖 |
+|---|---|---|
+| forgejo P0 (ci-merge.yml) | 全量档 `oidc,consistency-check` | OIDC 登录链 + 视图正确性断言 + 全量测试, 一轮 codegen |
+| GitHub 镜像 (ci.yml) | 默认档 (无 OIDC) | feature gate 不破坏默认构建 (编译 + 全量测试; fail-fast 冒烟见 `tests/auth_feature_gate.rs`) |
+| 发布归档 (release.yml → nix/release.nix) | 默认档 (与 overlay package 默认 `buildFeatures = []` 同档) | 发布二进制与 GitHub CI 同档; NixOS module 部署形态才 override 开 oidc |
+
+分工动机: 单宿主跑双档 = feature 档位翻转触发重复 codegen (实测 P0 ~20min, 其中
+~13min 纯编译); 双宿主各跑一档 = 各一轮 codegen, P0 回到 ~8-9min。forgejo 是门禁
+SSOT (合入阻塞), GitHub 是绿勾门面 — 默认档红会阻塞 GitHub 侧绿勾而非 forgejo 合入,
+与两宿主的角色定位一致 (发布产物 = 默认档, 其验证失败理应阻塞发布门面).
+
+> coverage 基线注记 (P2): consistency-check 并入 FULL_TIER 后, `just check --coverage`
+> 的插桩代码集随之扩大 (consistency 断言的 panic/失败分支新增少量未覆盖行)。
+> coverage-gate 阈值若在下次 nightly 出现小幅波动, 第一排查点是此处基线漂移,
+> 而非真实的测试删减。
 
 ## commit status context (workflow name / job_id 禁改)
 

@@ -419,12 +419,12 @@ Secret / Provider 的两种 value 来源 (`value`/`value_file`、`api_key`/`api_
 nix develop --impure      # 进入 devShell (工具链全家桶; nix fmt 仅 devShell 内可用)
 
 # 验证链 (命令全集见 justfile / `just --list`, 此处只列高频入口)
-just check                # 一键 check (全量档 --features oidc, #276): fmt + clippy + machete + doc + nextest + typos + deny-offline
+just check                # 一键 check (全量档 --features oidc,consistency-check): fmt + clippy + machete + doc + nextest + typos + deny-offline
                           #   链内含 check-webui-syntax (index.html 内嵌 JS 语法) 与
                           #   check-contracts (contracts.md property 落地标注 lint, #144);
                           #   doctest 当前禁用 (唯一 doctest 被 ignored, 需要时在 justfile 取消注释)
-just check-features       # feature 矩阵 (consistency-check 档 + 默认档无 oidc 的编译+测试)
-just ci-merge             # 一键复现 CI P0 门禁全链 (check-features + check 主链 + file-size; "本地全绿 ⇒ CI 必绿" 的锚)
+                          #   默认档 (无 oidc) 的验证矩阵归 GitHub 镜像 CI (双宿主分工, 见 docs/ci.md)
+just ci-merge             # 一键复现 CI P0 门禁全链 (check 主链全量档 + file-size; "本地全绿 ⇒ CI 必绿" 的锚)
 just check --coverage     # check 含覆盖率插桩 (P2 ci-periodic 档内容; 本地按需)
 just check-webui          # WebUI 回归测试 (Playwright)
 
@@ -451,7 +451,7 @@ v3.0 三档 (org 分级契约, 见 lc-studio/forgejo-actions README; 命名即�
 
 | 档 | workflow | 触发 | 阻塞 | 内容 |
 |---|---|---|---|---|
-| P0 | `ci-merge.yml` | PR + master push + 手动 | PR 合入 | feature 矩阵 (consistency-check + 默认档) + check 主链全量档 `--features oidc` (fmt/clippy/machete/doc/测试/typos/deny-offline/check-contracts) + file-size |
+| P0 | `ci-merge.yml` | PR + master push + 手动 | PR 合入 | check 主链全量档 `--features oidc,consistency-check` (fmt/clippy/machete/doc/测试+一致性断言/typos/deny-offline/check-contracts) + file-size; 默认档验证归 GitHub 镜像 CI (双宿主分工, 见 docs/ci.md) |
 | P1 | `ci-deploy.yml` | master push + nightly + 手动 | 部署 | audit (CVE, 阻塞) + bench compare-save + nix build cargoHash (canary 探针, runner 无 nix-daemon 恒失败) (**非超集**偏差, 见 workflow 头声明) |
 | P2 | `ci-periodic.yml` | nightly per-SHA 去重 + 手动 (无 push) | 无 | check --coverage + coverage-gate + WebUI Playwright |
 

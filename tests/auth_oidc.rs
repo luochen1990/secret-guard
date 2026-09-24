@@ -33,7 +33,7 @@
 
 // feature gate (#276): OIDC 登录链默认不编译 (openidconnect / tower-sessions /
 // axum-login 三依赖 optional 化), 本测试文件的依赖 (含 dev-deps rsa/base64) 只在
-// `--features oidc` 下可用 — 全量档 (just check / check-features 的 oidc 矩阵) 运行.
+// `--features oidc` 下可用 — 全量档 (`just check`) 运行.
 #![cfg(feature = "oidc")]
 
 use std::collections::HashMap;
