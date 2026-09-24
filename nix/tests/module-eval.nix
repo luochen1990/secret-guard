@@ -120,6 +120,13 @@ let
   execStartOk = lib.hasPrefix "${ev.config.services.secret-guard.package}/bin/secret-guard run --config " execStart;
   generatedConfig = ev.config.services.secret-guard.resolvedConfigFile;
 
+  # package 默认开 oidc feature (#276): 断言走 drvAttrs.cargoBuildFeatures
+  # (buildRustPackage 把 buildFeatures 参数透传为该 derivation 属性 — nixpkgs
+  # 内部名, 改名时此断言红, 同步点即此处). 若默认档化回归 (override 丢失),
+  # auth.enable = true 的 minimalConfig 会拿到无 OIDC 二进制 → 启动 fail-fast.
+  defaultPackageOidc =
+    (ev.config.services.secret-guard.package.drvAttrs.cargoBuildFeatures or null) == [ "oidc" ];
+
   # 内联 key 合成组合 (独立 host config): 验证非文件凭据形态 (apiKey 直值) 的
   # provider 组合同样走 render 链路 — direct + 默认路由 router
   inlineEv = sgEv [
@@ -287,6 +294,10 @@ let
     {
       name = "ExecStart 接线: --config <resolvedConfigFile>";
       ok = execStartOk;
+    }
+    {
+      name = "package 默认开 oidc feature (buildFeatures = [oidc], #276)";
+      ok = defaultPackageOidc;
     }
     {
       name = "停机窗口契约: 默认 TimeoutStopSec = 15s (#242)";

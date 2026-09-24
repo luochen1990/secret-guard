@@ -133,11 +133,16 @@ in
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = pkgs.secret-guard;
-      defaultText = lib.literalExpression "pkgs.secret-guard";
+      # 默认档二进制 + oidc feature override (#276): NixOS 部署形态默认带完整
+      # 认证功能 (部署侧 [auth] 随时可启用, 无需换二进制). 基线 package
+      # (pkgs.secret-guard, release 归档同源) 保持默认档 — 默认档构建图收缩的
+      # 收益留给最小化场景 (overlay / release 用户自行 override 同款).
+      default = pkgs.secret-guard.override { buildFeatures = [ "oidc" ]; };
+      defaultText = lib.literalExpression "pkgs.secret-guard.override { buildFeatures = [ \"oidc\" ]; }";
       description = ''
         secret-guard 二进制 package. 默认取 nixpkgs overlay 暴露的 `pkgs.secret-guard`
-        (该 overlay 由本 flake 的 `nixosModules.default` 自动注入).
+        并开启 cargo feature `oidc` (OIDC 登录链编译进二进制 — NixOS 部署形态默认
+        完整功能; 该 overlay 由本 flake 的 `nixosModules.default` 自动注入).
         若要在非本 flake 的环境中使用, 可手动通过 flake 的 packages output 引用.
       '';
     };

@@ -6,10 +6,15 @@
 #
 # 无需 openssl / pkg-config: reqwest 用 rustls-tls (Cargo.toml 显式 default-features=false),
 # 整个依赖树没有 native TLS / 系统库需求.
+#
+# buildFeatures (#276): 默认 [] = 默认档 (无 OIDC, 与 release 归档同档);
+# NixOS module 的 package option 默认传 [ "oidc" ] (部署形态完整功能,
+# 见 nix/module.nix package 选项注释).
 {
   lib,
   rustPlatform,
   nix-gitignore,
+  buildFeatures ? [ ],
 }:
 rustPlatform.buildRustPackage {
   pname = "secret-guard";
@@ -48,6 +53,9 @@ rustPlatform.buildRustPackage {
     # 若未来引入 git dep, 在此处追加 outputHashes; 当前所有 crate 都来自 crates.io.
     outputHashes = { };
   };
+
+  # cargo --features 透传 (默认档 = []; OIDC 编译由 module 侧传 [ "oidc" ]).
+  inherit buildFeatures;
 
   # secret-guard 是 binary-only, 不产出 .so / .a, 无需 configure/检查 stages.
   doCheck = false; # cargo-nextest 在 devShell 中跑 (just check), nix 构建跳过以提速.
