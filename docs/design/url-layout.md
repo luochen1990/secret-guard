@@ -37,13 +37,14 @@
 
 以下**首段**被内部功能占用. 反之, 新增内部路由只能从这些保留字 (或按下述规则
 新增保留字) 中取; **`login` / `logout` / `oauth2` 仅在 `[auth] enabled = true`
-时挂载** (单用户模式下: 单段路径无路由匹配 → axum 默认 404; `/login/foo` 等
+且二进制带 cargo feature `oidc` 时挂载** (#276 默认档不编译; 单用户模式下:
+单段路径无路由匹配 → axum 默认 404; `/login/foo` 等
 多段路径落 forward 参数路由后因首段非 proto 简写 → 404):
 
 | 保留字 | 用途 | 挂载条件 |
 |---|---|---|
 | `api` | WebUI JSON API 根 | 总是 |
-| `login` / `logout` / `oauth2` | OIDC 认证流程 | 仅 auth 启用时 |
+| `login` / `logout` / `oauth2` | OIDC 认证流程 | auth 启用 + feature `oidc` |
 
 **当前活跃保留字集合 = `api` + `login` + `logout` + `oauth2`, 共 4 个.**
 (退役的 `__sg` 见 "历史" 一节, 不在集合内.)

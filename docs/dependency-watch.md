@@ -14,12 +14,40 @@
 - 默认触发条件 = CVE / 解 duplicate / 需要 feature, 各子项仅标注例外.
 - 2026-09 已完成: CVE 批量 update (rustls 0.23.45, RUSTSEC-2026-0285) / rand 0.10 / criterion 0.8.
 
-## 当前重复清单 (2026-09 实测, 两个口径)
+## 当前重复清单 (2026-09-24 实测, feature `oidc` 双档后口径分层)
 
-- linux 构建图 (`cargo tree -d`): **11 个家族** — base64 / cpufeatures / getrandom (3 版) / itertools / rand (3 版) / rand_chacha / rand_core (3 版) / syn / thiserror + thiserror-impl / tower-http.
-- Cargo.lock 全平台口径: **17 个家族** — 上述 11 个再加 bitflags / hashbrown / indexmap / r-efi / schemars / windows-sys.
+- linux 构建图 (`cargo tree -d`, 含 dev edges): **默认档 (无 `oidc`) 7 个家族** —
+  cpufeatures / getrandom / rand / rand_chacha / rand_core / syn / tower-http
+  (openidconnect 闭包移出后, base64 / itertools / thiserror 簇随之消失);
+  **全量档 (`--features oidc`) 11 个家族** — 再加 base64 / itertools / thiserror +
+  thiserror-impl. 评估 duplicate 时先确认档位 — 发布二进制 (默认档) 只看前 7 个.
+- Cargo.lock 全平台口径: **17 个家族** — 全量档 11 个再加 bitflags / hashbrown /
+  indexmap / r-efi / schemars / windows-sys (optional 依赖仍留在 lockfile, 档位不
+  改变此口径).
+
+## 构建图快照 (feature `oidc` 双档, #276)
+
+OIDC 登录链 optional 化后的双档口径 (2026-09-24 实测, 快照仅供感知量级, 实时以
+`cargo tree` / `cargo metadata` 为准; 两口径各自同源可比):
+
+| 口径 | 默认档 (无 `oidc`) | 全量档 (`--features oidc`) |
+|---|---|---|
+| linux 构建图 (`cargo tree -e normal,build --prefix none --no-dedupe \| sort -u`) | 184 | 253 |
+| `cargo metadata` 非 dev 可达节点 (BFS 含根, normal+build+全平台 target 边) | 232 | 329 |
+
+- openidconnect / tower-sessions / axum-login 及其独占闭包 (metadata 口径 ~97
+  crates) 不在默认档图内.
+- 档位分配: release 归档与 `cargo install` 走默认档; NixOS module 默认 package 与
+  dev 验证主链 (`just check`) 走全量档.
+- 附带发现: 默认档曾编译失败 — 我方 DTO 的 `Arc<str>` 序列化一直**隐式依赖**
+  tower-sessions 等旧必选依赖传递开启的 serde `rc` feature; optional 化后在
+  Cargo.toml 显式声明 `serde = { features = ["derive", "rc"] }` (依赖自身用到的
+  feature 而非指望传递统一, 是正确姿势).
 
 ## 归因 (三类)
+
+> 口径: 本节归因以**全量档**构建图为基准 (默认档是其子集 — openidconnect /
+> tower-sessions 相关链条在默认档不存在, 对应 duplicate 随之消失).
 
 - **rand 簇** (rand / rand_core / rand_chacha / getrandom / cpufeatures): 我方 rand 0.8→0.10 (2026-09) 后的固有 spread — openidconnect / oauth2 钉 0.8, proptest / mockito (dev) 用 0.9, 我方 0.10; rand 0.10 的 default feature 链 (default → `std_rng` / `thread_rng` → chacha20) 把 chacha20 + cpufeatures 0.3 带进构建图 (ThreadRng 以 chacha20 为核心, 无法在保留 thread_rng 的前提下裁掉), cpufeatures 0.2 来自 sha2 0.10 时代 crypto 链. 消解时点 = rand 0.8 侧持有者 (openidconnect / oauth2 / tower-sessions-core / rsa→num-bigint-dig 链) 集体升级.
 - **itertools**: criterion 0.8 (dev) 用 0.13 vs openidconnect 钉 0.10 (2026-09 criterion 0.5→0.8 引入), dev-only, 发布二进制无感.

@@ -66,6 +66,13 @@ cargo install --git https://github.com/luochen1990/secret-guard
 > NixOS 用户推荐 `services.secret-guard.*` 结构化选项部署 (eval 期校验配置,
 > 凭据走文件注入), 见 [docs/deployment-nixos.md](docs/deployment-nixos.md)。
 
+> **可选认证 (OIDC 登录) 是 cargo feature**: 默认构建不含 OIDC 登录链 (依赖图更小),
+> 二进制归档与 `cargo install` 默认即单用户模式 — 此时设 `[auth] enabled = true`
+> 会在启动时直接报错并提示 `rebuild with --features oidc`。需要 OIDC: 源码构建加
+> `cargo install --path . --features oidc`, 或用 NixOS module (默认 package 已带该
+> feature)。本地 API key 路径两档都可用, 详见
+> [docs/configuration.md](docs/configuration.md) `[auth]` 段。
+
 ### 2. 最小配置
 
 在某个目录创建 `secret-guard.toml` (1 个上游 provider + 1 个要保护的 secret 即可跑通):

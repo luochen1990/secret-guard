@@ -305,7 +305,7 @@ URL = `/{proto_short}/{provider_id}/*path`. 同时编码 ingress 协议与目标
 |---|---|
 | `/` | Web UI (主入口) |
 | `/api/*` | Web UI JSON API (未匹配子路径 404, 绝不进 forward) |
-| `/login`, `/oauth2/callback`, `/logout` | OIDC 认证 (auth 启用时) |
+| `/login`, `/oauth2/callback`, `/logout` | OIDC 认证 (auth 启用 + cargo feature `oidc`, #276 — 默认档不编译此路由, 请求落 404) |
 | `/{o\|a\|g\|l\|r}/{name}` | forward, rest = "/" |
 | `/{o\|a\|g\|l\|r}/{name}/{*rest}` | forward, rest 为子路径 ({*rest} 捕获不含前导 `/`, 消费方容错处理, 见 `ForwardPath` 注释) |
 | 其他 | 404 (不再 catch-all 透传) |
@@ -350,7 +350,7 @@ Pool 不进此本地终结分支 (Router 专属) — pool 入口的 /models 经 
 
 | 模块 | 职责 (一句话) | 详尽契约位置 |
 |---|---|---|
-| `auth/` (模块目录: mod/oidc/handlers/session/apikey/middleware) | OIDC 登录 (WebUI) + 本地 API key (SDK 转发) + session | `auth/mod.rs` 头部 `//!` |
+| `auth/` (模块目录: mod/oidc/handlers/session/apikey/middleware) | OIDC 登录 (WebUI, **cargo feature `oidc` 门控** — oidc/handlers/session 子模块默认不编译, apikey 路径永远在) + 本地 API key (SDK 转发) + session | `auth/mod.rs` 头部 `//!` |
 | `codec/` | 跨协议 IR + Reader/Writer trait + StreamTranslate (OpenAI / Anthropic / Responses) | **`src/codec/AGENTS.md`** + `docs/design/ir-fields-roadmap.md` (IR 字段建模路线图: extra 边界 + 字段提升判定准则 + 实施批次) |
 | `config.rs` | 双层配置 schema + `DynamicTable<T>` 泛型 + 持久化 + 静态配置预检审计 (未知 section/字段 → 启动 WARN, #159) | 文件头部 `//!` (覆盖 OverrideMode / CRUD / Effective source / 跨表并发) |
 | `dag/` (模块目录: mod/pool/types/view/timeline) | ConversationDAG 内容寻址存储 (BlockPool + Node + Merkle) | `src/dag/mod.rs` 头部 `//!` + `docs/design/conversation-dag.md` |
@@ -397,7 +397,7 @@ Secret / Provider 的两种 value 来源 (`value`/`value_file`、`api_key`/`api_
 > `[server]` / `[redact]` / `[auth]` 段仅在启动时读取一次, WebUI 修改不生效 (restart
 > 才生效). 这是为了保持转发核心路径的零运行时配置开销.
 
-- `[auth]` 行为注记: `enabled = true` 时浏览器 WebUI 走 OIDC, SDK 转发走本地 API key (`Authorization: Bearer sg_...`); ApiKeyStore 与 `/api/api-keys` CRUD 无认证也总是可用 ("只认证, 不隔离" 哲学, 见 `src/auth/mod.rs` 头部); `oidc.issuer_url` 启动时 Discovery 拉取端点 (fail-fast); `oidc.client_secret_file` 可缺省 (public client + PKCE 场景); `[[auth.api_keys]]` 启动时 hash 后注入 ApiKeyStore 与 WebUI 签发 key 共用同一池, 静态 key 不可删除只能 disable/enable (`label` 唯一标识; `key`/`key_file` 二选一互斥, 语义同 `src/secrets.rs` 的 `value`/`value_file`).
+- `[auth]` 行为注记: `enabled = true` 时浏览器 WebUI 走 OIDC, SDK 转发走本地 API key (`Authorization: Bearer sg_...`); ApiKeyStore 与 `/api/api-keys` CRUD 无认证也总是可用 ("只认证, 不隔离" 哲学, 见 `src/auth/mod.rs` 头部); `oidc.issuer_url` 启动时 Discovery 拉取端点 (fail-fast); `oidc.client_secret_file` 可缺省 (public client + PKCE 场景); `[[auth.api_keys]]` 启动时 hash 后注入 ApiKeyStore 与 WebUI 签发 key 共用同一池, 静态 key 不可删除只能 disable/enable (`label` 唯一标识; `key`/`key_file` 二选一互斥, 语义同 `src/secrets.rs` 的 `value`/`value_file`). feature gate (#276): OIDC 登录链受 cargo feature `oidc` 门控 (默认档不编译), 默认档下 `enabled = true` 启动 fail-fast (报错含 "rebuild with --features oidc", 判定 SSOT = `AuthConfig::validate`, 测试 `tests/auth_feature_gate.rs`); release 归档保持默认档, NixOS module 默认 package 带 oidc (`nix/module.nix` package 选项).
 - `allowed_domains`: Host 白名单完整语义 (端口宽松规则 / 归一化 / WARN 跳过条目) 见本文 "Host / Origin 校验 (SEC-7)" 段.
 - `audit_capture`: state.toml 动态字段 (**非** `[server]` 静态段, WebUI 即时切换无需重启) — 详细日志三态 `off`/`errors`/`full` (serde 反序列化兼容旧 bool: false→off / true→full), 实现指针 `src/config.rs::AuditCaptureMode` (三态 + 决策函数 `capture_req`/`retain` SSOT) + `src/state.rs::AuditCapture` (运行时档位 + RMW 持久化) + `src/web/api/settings.rs` (GET/PUT 端点); off 极致省内存 / errors 仅错误请求保留 (在途暂存, 成功 attach 回收 — 排障主力档) / full 全量; timeline 不受影响 (B1 起 blocks 派生); per-request 原子 (push 快照进 `CallEvent.capture_mode`, attach 决策统一收口在 `dag::attach_response`); PUT 先持久化再更新内存 (失败回滚, 与 set_decision 同型); 重启从 state.toml 恢复; 升级注意: 旧 state.toml 无此字段 → off (存量用户详细日志静默关闭, 需要时 WebUI 重新开启). 语义契约 contracts.md CFG-7 / DTO-10.
 - `global_mock_prefix`: Auto 模式 mock 统一前缀, 注入每个 secret 的 `gen_spec.prefix`; 详见 `src/redact.rs` C5 契约.
@@ -419,10 +419,11 @@ Secret / Provider 的两种 value 来源 (`value`/`value_file`、`api_key`/`api_
 nix develop --impure      # 进入 devShell (工具链全家桶; nix fmt 仅 devShell 内可用)
 
 # 验证链 (命令全集见 justfile / `just --list`, 此处只列高频入口)
-just check                # 一键 check: fmt + clippy + machete + doc + nextest + typos + deny-offline
+just check                # 一键 check (全量档 --features oidc, #276): fmt + clippy + machete + doc + nextest + typos + deny-offline
                           #   链内含 check-webui-syntax (index.html 内嵌 JS 语法) 与
                           #   check-contracts (contracts.md property 落地标注 lint, #144);
                           #   doctest 当前禁用 (唯一 doctest 被 ignored, 需要时在 justfile 取消注释)
+just check-features       # feature 矩阵 (consistency-check 档 + 默认档无 oidc 的编译+测试)
 just ci-merge             # 一键复现 CI P0 门禁全链 (check-features + check 主链 + file-size; "本地全绿 ⇒ CI 必绿" 的锚)
 just check --coverage     # check 含覆盖率插桩 (P2 ci-periodic 档内容; 本地按需)
 just check-webui          # WebUI 回归测试 (Playwright)
@@ -450,7 +451,7 @@ v3.0 三档 (org 分级契约, 见 lc-studio/forgejo-actions README; 命名即�
 
 | 档 | workflow | 触发 | 阻塞 | 内容 |
 |---|---|---|---|---|
-| P0 | `ci-merge.yml` | PR + master push + 手动 | PR 合入 | check-features + check 主链 (fmt/clippy/machete/doc/测试/typos/deny-offline/check-contracts) + file-size |
+| P0 | `ci-merge.yml` | PR + master push + 手动 | PR 合入 | feature 矩阵 (consistency-check + 默认档) + check 主链全量档 `--features oidc` (fmt/clippy/machete/doc/测试/typos/deny-offline/check-contracts) + file-size |
 | P1 | `ci-deploy.yml` | master push + nightly + 手动 | 部署 | audit (CVE, 阻塞) + bench compare-save + nix build cargoHash (canary 探针, runner 无 nix-daemon 恒失败) (**非超集**偏差, 见 workflow 头声明) |
 | P2 | `ci-periodic.yml` | nightly per-SHA 去重 + 手动 (无 push) | 无 | check --coverage + coverage-gate + WebUI Playwright |
 

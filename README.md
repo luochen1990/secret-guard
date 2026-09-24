@@ -82,6 +82,14 @@ cargo install --git https://github.com/luochen1990/secret-guard
 > (config validated at eval time, credentials injected via files) — see
 > [docs/deployment-nixos.md](docs/deployment-nixos.md).
 
+> **Optional authentication (OIDC login) is a cargo feature**: the default build ships
+> without the OIDC login chain (smaller dependency graph). Binary archives and
+> `cargo install` therefore default to single-user mode; setting `[auth] enabled = true`
+> there fails at startup with a "rebuild with --features oidc" hint. To get OIDC:
+> build from source with `cargo install --path . --features oidc`, or use the NixOS
+> module (its default package enables the feature). The local API-key path is always
+> compiled in. See [docs/configuration.md](docs/configuration.md) `[auth]`.
+
 ### 2. Minimal configuration
 
 Create `secret-guard.toml` somewhere (one upstream provider + one secret to protect is

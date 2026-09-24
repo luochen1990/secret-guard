@@ -15,6 +15,10 @@ fail-fast, 配错在 `nixos-rebuild` 时即报错而非部署后 crash-loop). �
 `services.secret-guard.resolvedConfigFile`, 调试可直接
 `nix eval .#nixosConfigurations.<host>.config.services.secret-guard.resolvedConfigFile` 后 cat.
 
+module 的默认 package 自带 cargo feature `oidc` (#276 — `buildFeatures = ["oidc"]`
+override, `auth.enable = true` 可直接启用); 基线 `pkgs.secret-guard` 与 release 归档
+保持默认档 (无 OIDC)。
+
 上游超时 (`upstreamTimeouts`) 的应用层默认值统一为 3600s 防挂兜底量纲 (2026-09-23
 裁决, 连接活性检测归 TCP keepalive) — 在消费方都有自身超时预算时可设 0 (无限)
 拆墙 (如 `nonstreamResponseHeaderTimeoutSecs`), 见 option description.

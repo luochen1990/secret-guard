@@ -441,9 +441,16 @@ WebUI 保存) 会打 WARN 提示运行时探测可能耗尽 (此时由 `[redact]
 默认 `enabled = false`: 所有路由无认证, 适合个人本机使用. 需要多用户 / 暴露给
 局域网时启用 OIDC 登录 + API key:
 
+> **编译前提 (cargo feature `oidc`, #276)**: OIDC 登录链默认**不编译** (缩小默认
+> 构建图). 启用 `enabled = true` 前确认二进制带该 feature — release 归档与
+> `cargo install` 默认档**不含** OIDC, 启动会直接报错并提示
+> `rebuild with --features oidc`; NixOS module 的默认 package 已带 (`buildFeatures =
+> ["oidc"]`); 源码构建用 `cargo build --features oidc`. API key 路径 (静态 key 预配
+> + WebUI 签发) 不受 feature 影响, 两档都可用.
+
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
-| `enabled` | bool | `false` | `true` 时: WebUI 需 OIDC 登录, 转发路径需 API key. |
+| `enabled` | bool | `false` | `true` 时: WebUI 需 OIDC 登录, 转发路径需 API key. 需二进制带 `oidc` feature (见上方注记). |
 | `oidc` | table | — | OIDC Provider 配置 (enabled = true 时必填). |
 | `api_keys` | array | `[]` | 静态预设 API key (也可在 WebUI 的 API Keys 页签发). |
 | `secure_cookie` | bool | `false` | session cookie 是否带 Secure flag. 经反向代理以 HTTPS 暴露时应设 `true` (本地 HTTP dev 必须 `false` — `true` 时浏览器不回传 cookie). |

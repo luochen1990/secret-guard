@@ -33,7 +33,8 @@
 - `GET /` —— 单页 HTML (唯一 WebUI 入口; 旧 `/__sg` 前缀已移除, 历史 `git log -S "__sg"`).
 - `/api/*` 未匹配子路径 —— 404, **绝不**进入 forward (否则会泄漏内部 URL 到上游).
 - OIDC 认证路由 (`/login`, `/oauth2/callback`, `/logout`, 公开的 `/api/me`) 由
-  `server.rs` 装配 (不在本模块, 仅 auth 启用时挂载).
+  `server.rs` 装配 (不在本模块; auth 启用 **且** cargo feature `oidc` 编译时挂载,
+  #276 — 默认档无这些路由, `/login` 落 404).
 
 ## API endpoints
 
