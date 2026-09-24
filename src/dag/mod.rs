@@ -657,24 +657,6 @@ impl ConversationDag {
         g.nodes.get(&node_id).map(|n| n.event.round_kind)
     }
 
-    /// 读取 node 的 audit_capture 档位快照 (B2: 响应侧 attach 路径用).
-    ///
-    /// 与 [`Self::round_kind_of`] 同型的 "刚 push 节点" 安全窗口读回: attach 决策
-    /// **沿用 push 时的档位**而非 attach 时刻的开关值, 保证 per-request 原子性
-    /// (无半捕获撕裂).
-    ///
-    /// 节点不存在 (理论外的极端并发淘汰, 同 `round_kind_of`) → `Full` 兜底
-    /// (保守 = 历史行为: 宁可多存不丢数据; 且该路径 attach 本身也是 no-op).
-    pub fn capture_mode_of(&self, node_id: Uuid) -> crate::config::AuditCaptureMode {
-        let g = self.inner.read();
-        // 节点缺失 → Full 兜底 (保守 = 历史行为, 与函数 doc 一致).
-        g.nodes
-            .get(&node_id)
-            .map_or(crate::config::AuditCaptureMode::Full, |n| {
-                n.event.capture_mode
-            })
-    }
-
     /// 增量更新 node 的 parsed view (流式节流写入专用).
     ///
     /// 若 node 尚无 ResponseData (流过程中尚未 attach), 自动创建一个 default 占位

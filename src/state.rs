@@ -91,31 +91,13 @@ pub struct AppState {
     /// `pool-reset`, T3)。契约见 `src/pool.rs` 头部。
     pub pools: crate::pool::PoolStates,
     /// 详细日志 (audit capture) 运行时开关: push 路径 per-request 读一次快照
-    /// (建议值 `CallEvent.audit_captured`), WebUI 经 `PUT /api/settings` 即时切换.
+    /// (建议值 `CallEvent.capture_mode`), WebUI 经 `PUT /api/settings` 即时切换.
     /// 语义与持久化见 [`AuditCapture`] 文档; 装配点 `server.rs::serve`.
     pub audit_capture: AuditCapture,
 }
 
 // ─── AuditCapture 开关 (详细日志) ───────────────────────────────────────────
 
-/// 详细日志 (audit capture) 的运行时开关 + state.toml 持久化.
-///
-/// # 职责边界
-///
-/// - 读 (`enabled`): 转发链 push 路径 per-request 调用一次, 决定本请求是否
-///   存储 `req_body_raw` / `raw_resp_body`. 决策快照进 `CallEvent.audit_captured`,
-///   响应侧 attach 沿用快照 (不重读本开关) — 保证 per-request 原子性:
-///   请求在途时切换开关不产生 "req 空 + resp 存了" 的半捕获撕裂.
-/// - 写 (`set_enabled`): WebUI `PUT /api/settings`. RMW 持久化 state.toml
-///   (与 provider/secret/apikey 表共享 `persist_lock`, 防并发互覆) +
-///   更新内存 AtomicU8. 遵循 "先持久化, 再更新内存" 契约: 持久化失败时
-///   内存保持旧值 (与 `DynamicTable::set_decision` 同型).
-///
-/// # Ordering 说明
-///
-/// 读用 `Relaxed`: 开关无跨字段的同步语义依赖 (每请求独立读取, 切换仅需
-/// "尽快对新请求可见", 单变量 load/store 在任何 Ordering 下都满足).
-/// mode ↔ u8 编码 (AtomicU8 持有; 越界值防御性回 Off — ROB).
 fn mode_to_u8(m: crate::config::AuditCaptureMode) -> u8 {
     match m {
         crate::config::AuditCaptureMode::Off => 0,
@@ -132,8 +114,28 @@ fn u8_to_mode(v: u8) -> crate::config::AuditCaptureMode {
     }
 }
 
+/// 详细日志 (audit capture) 的运行时档位 + state.toml 持久化.
+///
+/// # 职责边界
+///
+/// - 读 (`mode`): 转发链 push 路径 per-request 调用一次, 三态决策 SSOT 见
+///   `config::AuditCaptureMode` (off 不存 / errors 在途暂存仅错误保留 / full
+///   全量). 决策快照进 `CallEvent.capture_mode`, 响应侧 attach 沿用快照
+///   (不重读本档位) — 保证 per-request 原子性: 请求在途时切换档位不产生
+///   "req 空 + resp 存了" 的半捕获撕裂.
+/// - 写 (`set_mode`): WebUI `PUT /api/settings`. RMW 持久化 state.toml
+///   (与 provider/secret/apikey 表共享 `persist_lock`, 防并发互覆) +
+///   更新内存 AtomicU8. 遵循 "先持久化, 再更新内存" 契约: 持久化失败时
+///   内存保持旧值 (与 `DynamicTable::set_decision` 同型).
+///
+/// # Ordering 说明
+///
+/// 读用 `Relaxed`: 档位无跨字段的同步语义依赖 (每请求独立读取, 切换仅需
+/// "尽快对新请求可见", 单变量 load/store 在任何 Ordering 下都满足).
 #[derive(Clone, Debug)]
 pub struct AuditCapture {
+    /// 三态档位的 AtomicU8 编码; 编解码见下方 `mode_to_u8` / `u8_to_mode`
+    /// (解码越界回 Off, ROB).
     mode: Arc<AtomicU8>,
     state_path: Arc<PathBuf>,
     persist_lock: Arc<Mutex<()>>,

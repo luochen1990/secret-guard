@@ -97,13 +97,14 @@ PATCH  /api/api-keys/{id}/toggle
 
 GET    /api/settings                → {audit_capture: "off"|"errors"|"full"} — 全局设置当前值
 PUT    /api/settings                body {audit_capture: 同上三态 string} (兼容旧 bool) → 200 同 shape
-                                          (详细日志开关: 开 = 新请求记录完整
-                                           req_body_raw / raw_resp_body; 关 = 极致省内存
-                                           (timeline 不受影响, B1 blocks 派生)。per-request
-                                           原子 (push 快照, 在途请求不受切换影响); 原子
-                                           持久化 state.toml; 非法 body 统一 400。语义 SSOT
+                                          (详细日志三态: off = 极致省内存 / errors =
+                                           仅失败请求保留 body (在途暂存, 成功回收) /
+                                           full = 全量; timeline 不受影响 (B1 blocks 派
+                                           生)。per-request 原子 (push 快照, 在途请求不
+                                           受切换影响); 原子持久化 state.toml; 非法 body
+                                           统一 400。语义 SSOT
                                            见 src/state.rs::AuditCapture)
-                                           前端入口 (B3): header 工具栏「详细日志」checkbox
+                                           前端入口 (B3): header 工具栏「详细日志」select
                                            (#audit-capture) — 服务端状态的镜像 (GET 初始化
                                            + PUT 乐观更新/失败回滚/在途 disabled), 不入
                                            state 对象 (auto-refresh checkbox 同型, DOM 即状态)

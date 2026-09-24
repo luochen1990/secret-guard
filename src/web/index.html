@@ -2115,11 +2115,11 @@
     // change 确认弹窗. (PATCH 响应的兜底 alert 展示服务端 ack.warning — 后端 SSOT:
     // src/web/api/crud.rs SECRET_DISABLED_WARNING, 文案与前端这份语义配对.)
     const SECRET_DISABLED_HINT = 'Disabled: protection OFF — the real secret value will be forwarded in plaintext to upstream providers.';
-    // B3: audit_capture off 期间请求的 body 未捕获 (req/resp 均 empty, headers 照常
+    // B3: audit_capture 未保留 (off 全部 / errors 成功) 请求的 body 未捕获 (req/resp 均 empty, headers 照常
     // 记录). raw 弹窗与 usage 审计弹窗共用的占位文案 SSOT — wire 判据统一为
     // record.audit_capture_off === true (raw 与 parsed 两个 view 的 envelope 均携带,
     // 契约见 src/web/api/records.rs).
-    const NOT_CAPTURED_NOTE = '详细日志已关闭, 此请求未捕获内容。可在右上角「详细日志」开关开启 (仅影响新请求)。';
+    const NOT_CAPTURED_NOTE = '此请求 body 未被详细日志保留 (关闭档不保留任何请求; 仅错误档不保留成功请求)。右上角「详细日志」可调整档位 (仅影响之后的请求)。';
     const SOURCE_LABELS = {
       static: 'static',
       dynamic: 'dynamic',
@@ -6424,19 +6424,25 @@
     // - 初始化: 页面加载 GET /api/settings 同步 checkbox (失败保持默认 off,
     //   console.error 但不阻塞页面 — 与 fetchRecordDetail 的静默降级一致).
     // - 交互 (乐观更新 + 失败回滚): change → PUT /api/settings → 失败:
-    //   setStatus 错误 + checkbox 回滚 (服务端 "先持久化再更新内存" 契约保证
+    //   setStatus 错误 + select 回滚到 lastKnown (服务端 "先持久化再更新内存" 契约保证
     //   PUT 失败 = 状态未变); 请求在途 disabled, 天然串行化连点.
     (async function initAuditCapture() {
       const sel = document.getElementById('audit-capture');
       if (!sel) return;
       const MODE_LABEL = { off: '关闭', errors: '仅错误', full: '全部' };
+      // 服务端档位的最后已知值: GET/PUT ack 时更新, PUT 失败时回滚到它.
+      // (不能用 option.defaultSelected — markup 无 selected attribute, 恒 undefined.)
+      let lastKnown = 'off';
       // change listener 必须在初始 GET 之后注册: 若提前, GET 在途时的切换会触发
       // 并发 PUT, GET 响应 (携带切换前的旧值) 晚于 PUT ack 落地时会把 UI 覆写回
       // 旧值 → 与服务端错位. 后注册的代价仅是 GET 在途 (~ms 级, 本地不可达窗口)
       // 的切换被吞并回弹到服务端真值 — 一致性优先.
       try {
         const r = await fetch(API_SETTINGS, { cache: 'no-store' });
-        if (r.ok) sel.value = (await r.json()).audit_capture;
+        if (r.ok) {
+          const m = (await r.json()).audit_capture;
+          if (MODE_LABEL[m]) { sel.value = m; lastKnown = m; }
+        }
       } catch (e) {
         console.error('audit-capture init failed:', e);
       }
@@ -6452,11 +6458,11 @@
           if (!r.ok) throw new Error('HTTP ' + r.status);
           const ack = await r.json();
           sel.value = ack.audit_capture;
+          lastKnown = ack.audit_capture;
           setStatus('详细日志: ' + (MODE_LABEL[ack.audit_capture] || ack.audit_capture));
         } catch (e) {
-          // 回滚到切换前的值 (服务端内存未变, 见类型文档)
-          const prev = [...sel.options].find(o => o.defaultSelected)?.value || 'off';
-          sel.value = prev;
+          // 回滚到服务端最后已知值 (PUT 失败 = 服务端内存未变, 见类型文档)
+          sel.value = lastKnown;
           setStatus('详细日志切换失败', 'status-err');
           console.error('audit-capture toggle failed:', e);
         } finally {

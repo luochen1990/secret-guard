@@ -135,7 +135,7 @@ pub(crate) struct GetRecordResponse {
 /// - codec 不支持此协议 (Gemini/Ollama) → 同上
 /// - body 不是合法 JSON → `invalid JSON: <err>`
 /// - codec reader 解析失败 → `<reader error message>`
-/// - audit_capture off (未捕获, req_body 为空) → `req_body not captured ...`
+/// - audit_capture 未保留 (off 全部 / errors 档成功; req_body 为空) → `req_body not captured ...`
 ///   (B2: 显式区分 "未捕获" 与 "空 body 解析失败" 两种 None 语义)
 fn build_parsed_response(record: ForwardRecord) -> GetRecordResponse {
     // parsed_response 直接取 record 内的累积结果.
@@ -148,7 +148,7 @@ fn build_parsed_response(record: ForwardRecord) -> GetRecordResponse {
             record,
             parsed_request: None,
             parsed_response,
-            parse_error: Some("req_body not captured (audit_capture off)".to_string()),
+            parse_error: Some("req_body not captured (audit_capture not retained)".to_string()),
         };
     }
 

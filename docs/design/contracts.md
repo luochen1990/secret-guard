@@ -710,7 +710,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 ### DTO-10 audit_capture_off 标记与未捕获 body 一致性 (B2)
 
-**陈述**: `NodeView.audit_retained` (三态决策的最终结果: off 恒 false / full 恒 true / errors = 错误请求 true, 在途未定按 true — 暂存可看) 与 body 存储状态一致: `false` → `req_body_raw` 为空串且 `raw_resp_body` 为空串 (反向不必然 — 流式响应本就不保留 SSE 字节, 与开关正交); `true` → `req_body_raw` 为完整快照 (半捕获撕裂被 CFG-7 的 per-request 原子性排除; errors 档在途窗口的暂存属例外 — attach 时回收). 派生消费面: `ForwardRecord.audit_capture_off = !audit_retained` (WebUI raw 弹窗与 usage 审计溯源弹窗的 "未捕获" 占位判据, 优先级高于 streamed 空态提示); `GET /api/records/{id}?view=parsed` 对未保留请求恒 `parsed_request = null` + `parse_error = "req_body not captured (audit_capture off)"` (诚实呈现缺失, 不伪造空对象 — 尊重事实原则). timeline (req_delta_messages / tail) 内容不受档位影响 — B1 起从 BlockPool 派生 (DTO-5), raw body 不是其内容数据源 (唯一残留: `tail.length` 的末级 fallback 在 parsed 缺失场景读 `raw_resp_body.len()`, 未保留下为 0 — 仅影响 length 数字, 不影响内容渲染).
+**陈述**: `NodeView.audit_retained` (三态决策的最终结果: off 恒 false / full 恒 true / errors = 错误请求 true, 在途未定按 true — 暂存可看) 与 body 存储状态一致: `false` → `req_body_raw` 为空串且 `raw_resp_body` 为空串 (反向不必然 — 流式响应本就不保留 SSE 字节, 与开关正交); `true` → `req_body_raw` 为完整快照 (半捕获撕裂被 CFG-7 的 per-request 原子性排除; errors 档在途窗口的暂存属例外 — attach 时回收). 派生消费面: `ForwardRecord.audit_capture_off = !audit_retained` (WebUI raw 弹窗与 usage 审计溯源弹窗的 "未捕获" 占位判据, 优先级高于 streamed 空态提示); `GET /api/records/{id}?view=parsed` 对未保留请求恒 `parsed_request = null` + `parse_error = "req_body not captured (audit_capture not retained)"` (诚实呈现缺失, 不伪造空对象 — 尊重事实原则). timeline (req_delta_messages / tail) 内容不受档位影响 — B1 起从 BlockPool 派生 (DTO-5), raw body 不是其内容数据源 (唯一残留: `tail.length` 的末级 fallback 在 parsed 缺失场景读 `raw_resp_body.len()`, 未保留下为 0 — 仅影响 length 数字, 不影响内容渲染).
 
 **Properties**:
 - `prop_audit_capture_off_body_empty_and_marked`: off 请求 (同协议 / 跨协议 / 流式) 转发行为不受影响, record 两侧 body 为空 + `audit_capture_off = true`; on 请求 `audit_capture_off = false`. 🔁→`audit_capture_off_still_forwards_and_marks_uncaptured` + `audit_capture_off_streaming_still_forwards` + `audit_capture_off_cross_proto_marks_uncaptured` (`tests/integration.rs`)
@@ -992,7 +992,7 @@ real 还原进去等于精准投放泄露. 故默认"偏安全", 暴露侧行为
 > `round_role = Tool` 时会用 `extract_tool_use_name` 覆盖 preview 为首个 ToolUse 的 name
 > (前端 sidebar 三级菜单 tooltip + 颜色哈希依赖 tool name). 覆盖后的 preview 不等于
 > `extract_preview_and_model(req_body_raw)` 的结果 — 此 drift 是预期的修正, 不属于守卫失败.
-> 另: AuditCapture off 的请求 (`audit_captured = false`, B2) `req_body_raw` 未存储为空串,
+> 另: AuditCapture off 的请求 (`capture_mode = off` (现为三态 `CallEvent.capture_mode`), B2) `req_body_raw` 未存储为空串,
 > 无对照物可比 — `assert_preview_model_match_source` 与 `assert_delta_view_matches_raw`
 > (表中 req_delta_messages 的 shadow) 对其跳过, on 的请求守卫行为不变 (CFG-7 / DTO-10).
 

@@ -312,6 +312,11 @@ impl ResponseData {
     /// 显式 error 字段 (超时/连接失败/流中断等) 或 HTTP 状态非 2xx.
     /// `resp_status == 0` 且无 error (理论外的空态) 按错误处理 — 偏保留
     /// (排障语义下宁可多留一条, 与 Off 的偏丢弃不对称是有意的).
+    ///
+    /// 隐式依赖 (调整 status=0 分支前必读): 在途 partial ResponseData
+    /// (update_parsed_response 建的 default) 走此分支 → `retain(Errors, true)`
+    /// = true — 这正是 "在途未定按保留 (暂存可看)" 语义 (NodeView.audit_retained)
+    /// 的实现载体, 改动此分支会让在途窗口的 retained 静默翻转.
     pub fn is_error(&self) -> bool {
         self.error.is_some() || !(200..300).contains(&self.resp_status)
     }
