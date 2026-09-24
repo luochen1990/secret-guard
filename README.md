@@ -12,25 +12,25 @@ the LLM never touches a real Secret, while your Agent tools keep working.**
 
 ## Why Secret Guard?
 
-Agent tools (claude-code / opencode / hermes-agent and friends) do your work by stuffing
-material wholesale into the prompt — code, configuration, terminal output, along with the
-passwords, private keys, tokens, and cookies in them, all delivered to the LLM Provider's
-servers. Once that data leaves your machine, it is out of your control: it may end up in
-Provider logs, be used for model training, or leak in a breach.
+The local Agent Harness (claude-code / opencode / hermes-agent and friends) does your work
+by stuffing material wholesale into the prompt — code, configuration, terminal output,
+along with the passwords, private keys, tokens, and cookies in them, all delivered to the
+LLM vendor's servers. Once that data leaves your machine, it is out of your control: it
+may end up in LLM vendor logs, be used for model training, or leak in a breach.
 
 And "never put Secrets in the context" is simply not viable in Agent workflows —
-credentials are exactly what an Agent needs to act on real systems on your behalf.
-Secret Guard resolves this tension: **your Agent keeps working with your Secrets, while
-the LLM never touches a real value.**
+credentials are exactly what an Agent tool needs to act on real systems on your behalf.
+Secret Guard resolves this tension: **your Agent tools keep working with your Secrets,
+while the LLM never touches a real value.**
 
 ## How it works
 
 The only integration cost is one line: point your Agent tool's API base URL at the local
-gateway, and traffic flows through it to the Provider:
+gateway, and traffic flows through it to the LLM vendor:
 
 ```text
-Outbound:  Agent tool ──real Secret──►  secret-guard  ──realistic Mock──►  LLM Provider
-Return:    local tools ◄──real Secret──  secret-guard  ◄──Mock reply────  LLM Provider
+Outbound:  Agent tool ──real Secret──►  secret-guard  ──realistic Mock──►  LLM vendor
+Return:    local tools ◄──real Secret──  secret-guard  ◄──Mock reply────  LLM vendor
                         (Redact / Restore both happen locally, transparent in both directions)
 ```
 
@@ -45,8 +45,8 @@ The same request, before and after it leaves the machine (captured from a real r
 the token value is fictional):
 
 ```text
-Agent sends:       GITHUB_TOKEN=ghp_0123456789abcdefghijklmnopqrstuvwxyz
-Provider receives: GITHUB_TOKEN=2_9rr_61dr1lmv2wf15aotyyt262l3t9_2pt4uih
+Agent Harness sends:  GITHUB_TOKEN=ghp_0123456789abcdefghijklmnopqrstuvwxyz
+LLM vendor receives:  GITHUB_TOKEN=2_9rr_61dr1lmv2wf15aotyyt262l3t9_2pt4uih
 ```
 
 A quick tour of the WebUI — session timeline, the LLM's-eye request view with the Mock
@@ -114,7 +114,7 @@ curl http://127.0.0.1:18787/o/openai-main/v1/chat/completions \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"My token is ghp_0123456789abcdefghijklmnopqrstuvwxyz, please summarize."}]}'
 ```
 
-The upstream receives a realistic Mock — `redactions=1` in the forward-completion log is
+The LLM vendor receives a realistic Mock — `redactions=1` in the forward-completion log is
 the replacement count; open `http://127.0.0.1:18787/` in a browser to review the request
 in the Records page.
 
@@ -174,8 +174,8 @@ end-to-end integration tests, fully verified on every release:
   order) — behavior is indistinguishable from a direct connection.
 - **Strictly reversible**: every Mock maps one-to-one to a real value, and Restore is the
   exact inverse of Redact — tool calls carrying Secrets are never corrupted.
-- **Deterministic Mocks**: a Secret's Mock is stable across turns, preserving Provider
-  prefix-cache hits — token cost is unaffected in normal sessions (the
+- **Deterministic Mocks**: a Secret's Mock is stable across turns, preserving the LLM
+  vendor's prefix-cache hits — token cost is unaffected in normal sessions (the
   mock-escaped-and-replayed exception is documented).
 - **No collisions in context**: a Mock never coincides with other content in the request,
   so responses are never wrongly replaced.

@@ -10,17 +10,17 @@
 
 ## 为什么需要 Secret Guard?
 
-claude-code / opencode / hermes-agent 这类 Agent 工具替你干活的方式, 就是把材料整段塞进提示词 — 代码、配置、终端输出, 连同其中的 password、private key、token、cookies, 全部送到了 LLM Provider 的服务器上。这些数据一旦离开本机就不再受你控制: 可能进入 Provider 日志、用于模型训练、或随一次泄露事件曝光。
+claude-code / opencode / hermes-agent 这类 Agent 工具 (即本地的 Agent Harness) 替你干活的方式, 就是把材料整段塞进提示词 — 代码、配置、终端输出, 连同其中的 password、private key、token、cookies, 全部送到了 LLM 厂商的服务器上。这些数据一旦离开本机就不再受你控制: 可能进入 LLM 厂商日志、用于模型训练、或随一次泄露事件曝光。
 
-而 "不要把 Secret 放进上下文" 在 Agent 工作流里并不现实 — 凭证恰恰是 Agent 替你操作真实系统时要用的东西。Secret Guard 化解的正是这个矛盾: **Agent 继续用你的 Secret 干活, LLM 却永远接触不到真值。**
+而 "不要把 Secret 放进上下文" 在 Agent 工作流里并不现实 — 凭证恰恰是 Agent 工具替你操作真实系统时要用的东西。Secret Guard 化解的正是这个矛盾: **Agent 工具继续用你的 Secret 干活, LLM 却永远接触不到真值。**
 
 ## 工作原理
 
-接入成本只有一行: 把 Agent 工具的 API base URL 指向本地网关, 流量经它转发到 Provider:
+接入成本只有一行: 把 Agent 工具的 API base URL 指向本地网关, 流量经它转发到 LLM 厂商:
 
 ```text
-请求出站:  Agent 工具 ──真 Secret──►  secret-guard  ──仿真 Mock──►  LLM Provider
-响应回传:  本地工具   ◄──真 Secret──  secret-guard  ◄──Mock 应答──  LLM Provider
+请求出站:  Agent 工具 ──真 Secret──►  secret-guard  ──仿真 Mock──►  LLM 厂商
+响应回传:  本地工具   ◄──真 Secret──  secret-guard  ◄──Mock 应答──  LLM 厂商
                            (Redact / Restore 均发生在本地, 双向透明)
 ```
 
@@ -31,8 +31,8 @@ claude-code / opencode / hermes-agent 这类 Agent 工具替你干活的方式, 
 一笔真实请求出站前后的样子 (截自真实运行, 仅 token 值为虚构):
 
 ```text
-Agent 发出的:     GITHUB_TOKEN=ghp_0123456789abcdefghijklmnopqrstuvwxyz
-Provider 收到的:  GITHUB_TOKEN=2_9rr_61dr1lmv2wf15aotyyt262l3t9_2pt4uih
+Agent Harness 发出的:  GITHUB_TOKEN=ghp_0123456789abcdefghijklmnopqrstuvwxyz
+LLM 厂商收到的:        GITHUB_TOKEN=2_9rr_61dr1lmv2wf15aotyyt262l3t9_2pt4uih
 ```
 
 WebUI 快速导览 — 会话时间线、LLM 视角的请求视图 (Mock 高亮)、响应侧还原后的真值:
@@ -96,7 +96,7 @@ curl http://127.0.0.1:18787/o/openai-main/v1/chat/completions \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"My token is ghp_0123456789abcdefghijklmnopqrstuvwxyz, please summarize."}]}'
 ```
 
-上游收到的是仿真 Mock — 转发完成日志的 `redactions=1` 即替换计数;
+LLM 厂商收到的是仿真 Mock — 转发完成日志的 `redactions=1` 即替换计数;
 浏览器打开 `http://127.0.0.1:18787/` 可在 Records 页回看这笔请求。
 
 > 示例统一用端口 `18787`; 默认监听 `127.0.0.1:8787`, 可用 `[server] port`
@@ -149,7 +149,7 @@ provider=...`), 命令行即可确认流量经过 secret-guard; 上游故障 (50
   不变 (仅字段顺序等无语义的序列化差异) — 行为与直连无异。
 - **严格可逆**: 每个 Mock 与真值一一对应, Restore 是 Redact 的精确逆运算 — 含 Secret
   的工具调用不会因替换而损坏。
-- **确定性 Mock**: 同一 Secret 的 Mock 跨轮保持稳定, 不破坏 Provider 的前缀缓存 —
+- **确定性 Mock**: 同一 Secret 的 Mock 跨轮保持稳定, 不破坏 LLM 厂商的前缀缓存 —
   正常会话中命中率与 token 成本不受影响 (mock 意外逃逸并被回传的例外见下)。
 - **上下文内不撞车**: Mock 绝不与请求中的其他内容重名, 响应不会被错误替换。
 - **多 Provider 路由**: 支持多 Provider 配置 (OpenAI / Anthropic / Gemini / Ollama /

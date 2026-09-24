@@ -27,6 +27,7 @@
 
 | 规范术语 | 定义 | 常见异名 | 归属层 |
 |---|---|---|---|
+| **Agent Harness** | 驱动 LLM 干活的本地工具框架 (claude-code / opencode / hermes-agent 等) — 流量进入 secret-guard 前的发起方; 对比叙事 (谁发出/谁收到) 的规范主体词, 中文叙述同义用 "Agent 工具" (首段挂钩一次) | Agent 工具、agent 工具、AI 客户端 | 文档 (README/website) |
 | **AuditCapture** | 详细日志的三态动态开关 (`off`/`errors`/`full`, per-request 决策): off (默认) 不存 `req_body_raw`/`raw_resp_body`; errors 仅错误请求保留 (在途暂存, 成功 attach 后回收 — 排障主力档); full 全量. timeline 由 BlockPool 派生不受影响 (B1); 决策 SSOT = `config::AuditCaptureMode::capture_req/retain`, push 时快照进 `CallEvent.capture_mode` 保证在途原子, attach 统一收口在 `dag::attach_response`; 持久化 state.toml (反序列化兼容旧 bool), WebUI 经 `GET/PUT /api/settings` 即时切换 | 详细日志开关、详细日志、审计开关 | config/web |
 | **Bubble** | 前端 timeline 中渲染的单条消息气泡 (= 1 个 IR message) | 气泡、消息块、消息项 | web/index.html |
 | **Common URI** | 端点的公共 URI 前缀 — 三段式 `base_url + common_uri + request_uri` 的中段, 两个消费面: ① fetch_model_list (router /models 本地合成拉上游清单); ② 跨协议翻译的出站 URL (`Endpoint::effective_common_uri`, #260 — 显式值直通, 缺省按 base 尾段启发式). 同协议透传不受影响 (转发 rest 原样流过). 值域: `"/v1"` 裸根布局 / `""` 版本前缀已含 (智谱等国产系) / 缺省未探测 (fetch 按 `V1_COMMON_URIS` 顺序懒回退现场推导). 持久化在 `Endpoint.common_uri` (per-endpoint; Detect 探测自动填充, WebUI 端点行 badge 回显), 运行时记忆在 `CacheEntry.common_uri_hit` | common_uri、版本前缀、布局前缀 | provider/proxy |
@@ -41,7 +42,7 @@
 | **Node** | ConversationDAG 中的一个节点 = 一次 API 调用 | 轮次、round、节点 | dag/web |
 | **Pool Provider** | `ProviderKind::Pool` 构造的套餐池端点 (`members` 有序成员列表必填) — 自身不转发, 顺序 failover: 正常全打第一个可用成员, 检测到窗口限额耗尽信号后自动切下一个成员, 耗尽成员按恢复闹钟自动回归; 运行时状态内存态不持久化 (契约 POOL-*) | 套餐轮换、配额池、账号池、用完了切下一个 | provider/proxy/pool |
 | **Protocol** | LLM API 的协议族 (OpenAI / Anthropic / Gemini / Ollama / Responses) | 协议、格式 | 全局 |
-| **Provider** | 一个 provider 条目 (sum type: Direct 直连实体 \| Router 路由 \| Pool 套餐池, #187 + Pool 延伸) | 上游、后端、模型、服务商 | 全局 |
+| **Provider** | 一个 provider 条目 (sum type: Direct 直连实体 \| Router 路由 \| Pool 套餐池, #187 + Pool 延伸) | 上游、后端、模型、服务商、LLM 厂商 (面向用户文案的通俗指代; 对比轴禁用 — 易误读为网关自身) | 全局 |
 | **Redact** | 把 request body 中的 Secret 替换为 Mock 的正向操作 | 脱敏、过滤、打码、替换 | 全局 |
 | **RedactionMap** | 一次 Redact 产出的 Secret↔Mock 双向映射表 (per-request, 不持久化) | 映射表、redact map | redact |
 | **req_delta** | 一个 Node 相对其 parent 新增的 messages | 增量、本轮新增、delta | dag/web |
