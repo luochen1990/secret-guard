@@ -28,6 +28,6 @@
 ## 升级等待队列 (按依赖名字母序)
 
 - **parking_lot 0.12.5** (当前最新): 长期可评估迁移到 `std::sync::Mutex/RwLock` (Rust 1.62+ 后 std 锁性能已接近 parking_lot, 可减少一个依赖). 触发条件 = 解 duplicate / 减少依赖数.
-- **reqwest 0.12 → 0.13**: **被 oauth2 上游阻塞** — oauth2 5.0.0 (2025-01, 仍是最新) 的 reqwest 集成 (openidconnect 的 `reqwest` feature 所启用) 钉 `^0.12`; 单独升我方会形成双 HTTP 栈 (OIDC 走 0.12 / 转发走 0.13, hyper 连接池与 TLS 各两套), 解 tower-http duplicate 的收益不抵双栈成本. 升级时点 = oauth2 上游支持 0.13. 届时注意 0.13 breaking 较多 (`rustls-tls` feature 改名 `rustls`, rustls roots 改用 `rustls-platform-verifier`, 需验证行为).
+- **reqwest 0.12 → 0.13**: **被 oauth2 上游阻塞** — oauth2 5.0.0 (2025-01, 仍是最新) 的 reqwest 集成 (openidconnect 的 `reqwest` feature 所启用) 钉 `^0.12`; 单独升我方会形成双 HTTP 栈 (OIDC 走 0.12 / 转发走 0.13, hyper 连接池与 TLS 各两套), 解 tower-http duplicate 的收益不抵双栈成本. 升级时点 = oauth2 上游支持 0.13. 届时注意 0.13 breaking 较多 (`rustls-tls` feature 改名 `rustls`, rustls roots 改用 `rustls-platform-verifier`, 需验证行为), 并复核 Linux TCP_USER_TIMEOUT 平台默认值 (FWD-4 活性判官; 0.12.28 为 30s, 现依赖平台默认而非显式钉住 — GitHub PR #1 / #268).
 - **sha2 0.10 → 0.11**: 注意 openidconnect 4.0.1 **直接**依赖 `sha2 ^0.10.6`, 且经 oauth2 5.0.0 再依赖 `sha2 ^0.10` (双重阻塞), **升级主依赖也无法解 duplicate**, 直到 openidconnect 上游升级.
 - **tower-sessions 0.14 → 0.15**: **需与 axum-login 同步升级** (axum-login 0.18 当前硬依赖 tower-sessions 0.14, 单独升会 duplicate).
