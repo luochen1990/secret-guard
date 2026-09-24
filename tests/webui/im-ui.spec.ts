@@ -2384,7 +2384,7 @@ test.describe("B3: 详细日志开关 (audit capture)", () => {
     await page.waitForTimeout(500); // 等待懒拉 record.
     const rawText = await page.locator("dialog.round-dialog").textContent();
     // req + resp 两个 body 区段均占位 (headers 照常展示).
-    expect(rawText).toContain("详细日志已关闭");
+    expect(rawText).toContain("未被详细日志保留");
     expect(rawText).toContain("Request Headers");
     // 占位分支不携带 "LLM view" 标注 (那是捕获开启时的语义).
     expect(rawText).not.toContain("LLM view");
@@ -2409,7 +2409,7 @@ test.describe("B3: 详细日志开关 (audit capture)", () => {
     // 点行内 view → 弹窗显示占位 (而非 dump 空 record 的 JSON).
     await page.locator("#redact-recent-body button[data-audit-node]").first().click();
     const auditBody = page.locator("#audit-record-body");
-    await expect(auditBody).toContainText("详细日志已关闭");
+    await expect(auditBody).toContainText("未被详细日志保留");
     await expect(auditBody).not.toContainText('"req_body"');
     // 关闭 (form method=dialog 的 submit 按钮).
     await page.locator("#audit-record-dialog form button.btn").click();
