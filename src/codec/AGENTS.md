@@ -31,7 +31,7 @@
 - ✅ Responses 流式 SSE 事件翻译 (2026-09-23 落地, reader + writer 双侧):
   reader (`read_response_events`) 把 SSE 事件映射为 IR 事件流, writer
   (`write_response_event`) 从 IR 事件序列合成合法 Responses SSE (done 族帧的全量
-  累积与 item_id 确定性合成规格见 `responses/stream.rs::read_responses_stream_event` /
+  累积与 item_id 确定性合成规格见 `codec/responses/stream.rs::read_responses_stream_event` /
   `write_responses_stream_event` 的实现注释). 同协议 Redact 场景流式 restore 由
   `responses_streaming_with_secret_hit_restores_mock` 端到端锁定; 流式已知损失
   (hosted tools / refusal 丢弃, reasoning delta 归一, 多 part 折叠等) 见
