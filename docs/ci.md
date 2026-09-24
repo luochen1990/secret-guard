@@ -67,14 +67,18 @@ single-job runner 上串行占位, 延迟最新 push 的反馈. workflow 级
    upsert 机制见下文"评论写回机制"。
 7. **Record toolchain version** (`if: always()`): 把 `rustc --version` 写入 step output,
    由 Diagnose 评论携带留痕 (CI 工具链由 VM nixpkgs 决定, 三源漂移事后可追溯)。
-8. **consistency-check feature guard** (`just check-features`): clippy + nextest 带
-   `consistency-check` feature 跑一次 (视图正确性断言, 详见根 AGENTS.md "视图正确性确保
-   机制"; 也是 contracts.md `prop_consistency_check_feature_runs_in_ci` 的锚点)。
-9. **Quality gate (just ci-merge main)** — P0 阻塞主链: `just check` 普通档 (fmt +
-   clippy + machete + doc 门禁 + 测试 + typos + deny-offline + check-webui-syntax +
-   check-contracts + nix-check, **不带 --coverage** — 插桩与 coverage-gate 已归 P2)。
-   cargo 命令均带 `--locked`。测试集只跑这一次。stage 机制见 justfile `ci-merge`
-   recipe (CI 拆 step / 本地 all 档聚合, 逐段等价无重复)。
+8. **feature matrix guard (consistency-check + 默认档)** (`just check-features`): 两段
+   feature 矩阵 (#276) — ① clippy + nextest 带 `consistency-check` feature 跑一次
+   (视图正确性断言, 详见根 AGENTS.md "视图正确性确保机制"; 也是 contracts.md
+   `prop_consistency_check_feature_runs_in_ci` 的锚点); ② 默认档 (无 `oidc`) 的编译 +
+   全量测试, 守卫 OIDC feature gate 不破坏默认构建 (fail-fast / 冒烟见
+   `tests/auth_feature_gate.rs`)。
+9. **Quality gate (just ci-merge main)** — P0 阻塞主链: `just check` 全量档
+   (`--features oidc`, #276; fmt + clippy + machete + doc 门禁 + 测试 + typos +
+   deny-offline + check-webui-syntax + check-contracts + nix-check, **不带 --coverage** —
+   插桩与 coverage-gate 已归 P2)。
+   cargo 命令均带 `--locked`。全量测试集在本档与步骤 8 的默认档各跑一次。stage 机制见
+   justfile `ci-merge` recipe (CI 拆 step / 本地 all 档聚合, 逐段等价无重复)。
 10. **File size gate** (`just check-file-size`): `rust-diff-analyzer` 对每个 .rs 做 AST
     分类, 只统计 prod 行数 (排除 test), 双阈值 (WARN 500 软提醒 / MAX 1600 硬阻断,
     fail-closed)。

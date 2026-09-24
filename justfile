@@ -6,6 +6,11 @@
 # resolve 导致 "CI 测试的依赖集 ≠ 提交的 lockfile ≠ nix 发布产物" 三元漂移 (issue #142).
 # 本地手改 Cargo.toml 后碰到一次 "lock file needs to be updated" 报错属预期提醒,
 # 跑一次 `cargo build` 更新 lockfile 后提交即可; 开发内环 recipe (build/run/dev*) 不带.
+#
+# 全量档 feature 参数 SSOT (#276): 验证/测试/覆盖率入口 (check / clippy / test /
+# coverage*) 统一走全量档 (带 OIDC 编译), 默认档矩阵在 check-features — 档位切换
+# 只改这一处.
+FULL_TIER := "--features oidc"
 
 default:
     @just --list
@@ -38,6 +43,9 @@ dev-test:
     cargo watch -x 'nextest run'
 
 # 一次跑完: fmt + clippy + machete + doc + test + typos + deny.
+# **全量档 (--features oidc, #276)**: 主链带 oidc feature — 本地全绿 = 全量绿.
+# 默认档 (无 oidc) 的编译 + 测试矩阵由 check-features 覆盖 (两 recipe 共同构成
+# feature 矩阵; dev/watch 类内环 recipe 不带 feature, 追求最快反馈).
 # --coverage: 测试阶段改用插桩编译 (cargo llvm-cov nextest), 产出覆盖率数据到
 # ${CARGO_TARGET_DIR}/llvm-cov-target/, 后续 just coverage-gate / coverage-html 直接消费, 无需重跑测试.
 # 默认不带 (本地开发追求快速反馈, 无需插桩开销).
@@ -72,28 +80,34 @@ dev-test:
 # --locked: 见文件头 "约定" 段 (SSOT).
 check *ARGS:
     just check-fmt
-    cargo clippy --locked --all-targets -- -D warnings
+    cargo clippy --locked --all-targets {{ FULL_TIER }} -- -D warnings
     cargo machete
-    RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
+    RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps {{ FULL_TIER }}
     just check-webui-syntax
     just check-contracts
     # cargo test --doc
     @if echo "{{ ARGS }}" | grep -q -- "--coverage"; then \
         cargo llvm-cov clean --workspace; \
-        cargo llvm-cov nextest --locked --no-fail-fast --no-report; \
+        cargo llvm-cov nextest --locked {{ FULL_TIER }} --no-fail-fast --no-report; \
     else \
-        cargo nextest run --locked --no-fail-fast; \
+        cargo nextest run --locked {{ FULL_TIER }} --no-fail-fast; \
     fi
     just typos
     just deny-offline
     just nix-check
 
-# consistency-check feature 守卫 (CI 用): clippy + nextest 带 feature flag.
-# 该 feature 默认关闭, 包含视图正确性断言 (proxy/recorder.rs::assert_redactions_match_map).
-# 详见 AGENTS.md "视图正确性确保机制". CI workflow 单独成步运行本目标.
+# feature 矩阵守卫 (CI 用): 非 default feature 组合的 clippy + nextest.
+# 两段矩阵 (#276):
+#   1. consistency-check: 默认关闭的视图正确性断言 (详见 AGENTS.md "视图正确性确保机制",
+#      contracts.md prop_consistency_check_feature_runs_in_ci 契约的锚点).
+#   2. 默认档 (无 oidc): OIDC 登录链 cfg 掉后的编译 + 全量测试 — 守卫 feature gate
+#      不破坏默认构建 (fail-fast / 冒烟见 tests/auth_feature_gate.rs). 共享依赖在两档
+#      间指纹一致, 本段增量编译只是 crate 本体 (~分钟级).
 check-features:
     cargo clippy --locked --all-targets --features consistency-check -- -D warnings
     cargo nextest run --locked --no-fail-fast --features consistency-check
+    cargo clippy --locked --all-targets -- -D warnings
+    cargo nextest run --locked --no-fail-fast
 
 # 内嵌 JS 语法检查 (秒级, 阻塞式).
 # 从 src/web/index.html 提取 <script>...</script> 块, 用 node --check 验证语法.
@@ -225,13 +239,13 @@ check-fmt:
         cargo fmt -- --check; \
     fi
 
-# 仅 clippy.
+# 仅 clippy (全量档 --features oidc, 与 check 主链同档; 默认档入口见 check-features).
 clippy:
-    cargo clippy --locked --all-targets -- -D warnings
+    cargo clippy --locked --all-targets {{ FULL_TIER }} -- -D warnings
 
-# 仅 test.
+# 仅 test (全量档 --features oidc, 与 check 主链同档; 默认档入口见 check-features).
 test:
-    cargo nextest run --locked --no-fail-fast
+    cargo nextest run --locked {{ FULL_TIER }} --no-fail-fast
 
 # 仅运行 ignored 测试 (TDD 红灯循环用, 详见 AGENTS.md "TDD 与可选测试").
 # 子串按测试名过滤 (非 ignore reason): just test-ignored gemini
@@ -255,9 +269,9 @@ test-ignored *ARGS:
 COVERAGE_MIN_LINES := "84"
 COVERAGE_MAX_UNCOVERED := "1450"
 
-# 覆盖率摘要 (终端表格).
+# 覆盖率摘要 (终端表格). 全量档 (--features oidc, 与 check --coverage 同档).
 coverage:
-    cargo llvm-cov nextest --locked --no-fail-fast --no-report
+    cargo llvm-cov nextest --locked {{ FULL_TIER }} --no-fail-fast --no-report
     cargo llvm-cov report --summary-only
 
 # 覆盖率门禁 (CI 用): 双阈值, 任一不满足则非零退出.
@@ -268,16 +282,16 @@ coverage-gate:
       --fail-under-lines {{ COVERAGE_MIN_LINES }} \
       --fail-uncovered-lines {{ COVERAGE_MAX_UNCOVERED }}
 
-# HTML 报告 (浏览器打开 coverage/html/index.html).
+# HTML 报告 (浏览器打开 coverage/html/index.html). 全量档 (同 coverage).
 coverage-html:
-    cargo llvm-cov nextest --locked --no-fail-fast --no-report
+    cargo llvm-cov nextest --locked {{ FULL_TIER }} --no-fail-fast --no-report
     cargo llvm-cov report --output-dir coverage --html
     @echo "HTML report: coverage/html/index.html"
 
-# LCOV 报告 (CI / IDE 集成).
+# LCOV 报告 (CI / IDE 集成). 全量档 (同 coverage).
 coverage-lcov:
     mkdir -p coverage
-    cargo llvm-cov nextest --locked --no-fail-fast --lcov --output-path coverage/lcov.info
+    cargo llvm-cov nextest --locked {{ FULL_TIER }} --no-fail-fast --lcov --output-path coverage/lcov.info
     @echo "LCOV report: coverage/lcov.info"
 
 # 启动 mock 上游 (用于本地集成测试; 占位).
