@@ -36,8 +36,12 @@ use crate::provider::Protocol;
 use crate::redact::{RedactError, RedactionMap, redact_ir_checked};
 
 /// 流式 parsed view (StreamScan snapshot) 的节流写入间隔.
-/// 太短 → DAG 写锁竞争; 太长 → WebUI 看不到流式进度. 500ms 是 UX 与锁竞争的折中.
-pub(super) const PARSED_SYNC_INTERVAL: Duration = Duration::from_millis(500);
+/// 太短 → DAG 写锁竞争; 太长 → WebUI 看不到流式进度. 250ms (原 500ms,
+/// rt-push 调优): SSE 失效通知 (/api/events) 下前端消费节奏提升, 步进更密
+/// 一倍. update_parsed_response 是轻量两级锁 (inner read + node.response
+/// write) — 并发流式更新之间共享读锁不串行化, 与 push/attach 写锁的互斥
+/// 窗口仅纳秒级临界区, 加密步进无竞争压力.
+pub(super) const PARSED_SYNC_INTERVAL: Duration = Duration::from_millis(250);
 
 // ─── usage-stats 采集: 响应回显摘要 (M0 收口) ───────────────────────────────
 
