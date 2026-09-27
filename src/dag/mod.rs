@@ -32,6 +32,15 @@
 //! - `crate::derive` 的 `extract_delta_messages_from_raw`: 从 req_body_raw 切片 delta
 //!   messages (域 B 派生链, 与 extract_preview_and_model 同源).
 //!
+//! # 变更通知 (SSE 失效通知后端)
+//!
+//! 存储"内容已变更"是存储层的天然职责 (而非 web 层轮询比对): 三个写入方法
+//! (push_messages / attach_response / update_parsed_response) 末尾经内部
+//! `notify_change` 推进 watch 计数. web 层 (`GET /api/events`) 经
+//! [`ConversationDag::subscribe_changes`] 消费 — 域 B 不依赖 web. 事件仅作
+//! invalidation 信号 (不携带数据, 数据以 /api/sync 为 SSOT, 契约编号 UI-8 —
+//! contracts.md 登记随 rt-push 文档任务 T5 落位); 事件丢失无害 (前端有兜底轮询).
+//!
 //! # 详尽设计见 `docs/design/conversation-dag.md`
 
 mod pool;
@@ -83,6 +92,14 @@ pub struct ConversationDag {
     /// `pub(super)` 让 view / timeline 子模块的读路径方法直接访问 (避免每个方法
     /// 都加 thin wrapper). 子模块都在 `crate::dag::*` 路径下, 不泄漏到 crate 外.
     pub(super) inner: Arc<RwLock<DagInner>>,
+    /// 变更通知通道 (SSE 失效通知后端): 每次内容写入计数 +1, 见模块文档
+    /// "变更通知" 节. `None` = 通知关闭 (默认 — 测试 fixture 零影响: 不订阅
+    /// 不发送, 写入路径零开销).
+    ///
+    /// Clone 语义: `watch::Sender` 内部是 Arc, derived Clone 让所有 DAG clone
+    /// (与 `inner` 同源) 共享同一通知通道 — clone 视图的写入与本体同源通知;
+    /// 全部 clone drop 后 channel 关闭, 订阅流自然结束 (进程退出路径).
+    notify: Option<tokio::sync::watch::Sender<u64>>,
 }
 
 #[derive(Debug)]
@@ -135,6 +152,40 @@ impl ConversationDag {
                 max_sessions: max_sessions.max(1),
                 min_sessions: min_sessions.max(1),
             })),
+            notify: None,
+        }
+    }
+
+    // ─── 变更通知 (SSE 失效通知后端) ─────────────────────────────────────────
+
+    /// 安装变更通知通道 (builder, 链式).
+    ///
+    /// 生产装配点: `server.rs::serve` — `GET /api/events` 的 SSE 流经
+    /// [`Self::subscribe_changes`] 消费. 不安装 (默认) 时订阅恒 `None`,
+    /// 写入路径零通知开销 (测试 fixture 不受影响).
+    pub fn with_notifier(mut self, tx: tokio::sync::watch::Sender<u64>) -> Self {
+        self.notify = Some(tx);
+        self
+    }
+
+    /// 订阅 DAG 变更: 每次内容写入 (push_messages / attach_response /
+    /// update_parsed_response) 后计数 +1. `None` = 未安装 notifier.
+    ///
+    /// 从 Sender 现建 Receiver (`subscribe`): 不依赖 channel 创建时的初始
+    /// Receiver (它可能早已 drop), 新订阅者从当前计数起观察后续变更.
+    pub fn subscribe_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        self.notify.as_ref().map(|tx| tx.subscribe())
+    }
+
+    /// 内容已变更 → 计数 +1 并唤醒订阅者.
+    ///
+    /// `send_modify` (而非 `send`) 的取舍: `send` 对"值未变"与"无订阅者"返回
+    /// Err (调用方需处理); `send_modify` 无返回值且总是标记 changed —
+    /// 无订阅者时静默正确, 有订阅者时计数严格递增不触发值去重.
+    /// 同步非阻塞, 可在持有 inner write lock 的写入路径末尾直接调用.
+    fn notify_change(&self) {
+        if let Some(tx) = &self.notify {
+            tx.send_modify(|v| *v += 1);
         }
     }
 
@@ -348,6 +399,9 @@ impl ConversationDag {
 
         // 8. LRU session 淘汰 (两个条件, min 保底).
         Self::evict_if_needed(&mut g);
+
+        // 9. 内容已变更 → 通知订阅者 (SSE 失效通知, 见模块文档 "变更通知" 节).
+        self.notify_change();
 
         node_id
     }
@@ -607,6 +661,9 @@ impl ConversationDag {
             node.event.req_body_raw = String::new();
         }
         *node.response.write() = Some(response);
+        // 内容已变更 → 通知订阅者. (node not found 的提前 return 分支不通知:
+        // 数据未变, 通知会造成前端无效 sync.)
+        self.notify_change();
     }
 
     /// 把单条 IrMessage intern 进池 (B1: 响应 finalize 时 response.message 用).
@@ -674,6 +731,9 @@ impl ConversationDag {
         let mut resp_lock = node.response.write();
         let resp = resp_lock.get_or_insert_with(ResponseData::default);
         resp.parsed = Some(parsed);
+        // 内容已变更 → 通知订阅者. (node not found 的提前 return 分支不通知:
+        // 数据未变.) notify_change 不取锁, 持 response write lock 调用无死锁风险.
+        self.notify_change();
     }
 }
 
@@ -1041,6 +1101,84 @@ mod tests {
         let id_a = dag.push_messages(vec![text_msg(IrRole::User, "a")], dummy_event());
         let _id_b = dag.push_messages(vec![text_msg(IrRole::User, "b")], dummy_event());
         dag.update_parsed_response(id_a, serde_json::json!({}));
+    }
+
+    // ─── 变更通知 (SSE 失效通知后端) ─────────────────────────────────────────
+    //
+    // watch 计数的观察方式: borrow_and_update 读当前值并标记已读 — 后续断言
+    // "写入后值递增" 即 "标记已读之后又有新值" 的机械表达, 无时序歧义.
+
+    /// 读当前计数并标记已读 (测试断言 helper).
+    fn current_count(rx: &mut tokio::sync::watch::Receiver<u64>) -> u64 {
+        *rx.borrow_and_update()
+    }
+
+    #[test]
+    fn notifier_counts_each_write_point() {
+        // 三个写入点 (push / attach / update_parsed) 各自计数 +1.
+        let (tx, _) = tokio::sync::watch::channel(0u64);
+        let dag = ConversationDag::new(8, 500, 1).with_notifier(tx);
+        let mut rx = dag.subscribe_changes().expect("notifier installed");
+        assert_eq!(current_count(&mut rx), 0, "初始计数 = channel 初值");
+
+        let id = dag.push_messages(vec![text_msg(IrRole::User, "u")], dummy_event());
+        assert_eq!(current_count(&mut rx), 1, "push_messages → +1");
+
+        dag.attach_response(
+            id,
+            ResponseData {
+                resp_status: 200,
+                ..Default::default()
+            },
+        );
+        assert_eq!(current_count(&mut rx), 2, "attach_response → +1");
+
+        dag.update_parsed_response(id, serde_json::json!({"k": 1}));
+        assert_eq!(current_count(&mut rx), 3, "update_parsed_response → +1");
+    }
+
+    #[test]
+    fn notifier_skips_noop_write_paths() {
+        // node 不存在的提前 return 路径 (attach / update_parsed) 数据未变 → 不通知.
+        let (tx, _) = tokio::sync::watch::channel(0u64);
+        let dag = ConversationDag::new(1, 500, 1).with_notifier(tx);
+        let mut rx = dag.subscribe_changes().expect("notifier installed");
+        let a = dag.push_messages(vec![text_msg(IrRole::User, "a")], dummy_event());
+        assert_eq!(current_count(&mut rx), 1);
+        // 第二次 push 淘汰 a 的 session (max=1).
+        let _b = dag.push_messages(vec![text_msg(IrRole::User, "b")], dummy_event());
+        assert_eq!(current_count(&mut rx), 2);
+        dag.attach_response(a, ResponseData::default());
+        dag.update_parsed_response(a, serde_json::json!({}));
+        assert_eq!(
+            current_count(&mut rx),
+            2,
+            "no-op 写入 (node 已淘汰) 不推进计数"
+        );
+    }
+
+    #[test]
+    fn notifier_none_is_default_and_writes_never_panic() {
+        // 默认 (无 notifier): 订阅 None; 全部写入路径正常.
+        // (存量测试天然覆盖 None 路径, 此处显式断言契约.)
+        let dag = ConversationDag::new(8, 500, 1);
+        assert!(dag.subscribe_changes().is_none(), "默认不装 notifier");
+        let id = dag.push_messages(vec![text_msg(IrRole::User, "u")], dummy_event());
+        dag.attach_response(id, ResponseData::default());
+        dag.update_parsed_response(id, serde_json::json!({}));
+        assert!(dag.get_node(id).is_some(), "写入路径全部正常");
+    }
+
+    #[test]
+    fn notifier_without_subscribers_does_not_panic() {
+        // Receiver 全部 drop 后写入: 不报错不 panic (send_modify 无订阅者语义,
+        // 见 notify_change 注释); 后续订阅仍能从 Sender 读到递增后的计数.
+        let (tx, rx) = tokio::sync::watch::channel(0u64);
+        let dag = ConversationDag::new(8, 500, 1).with_notifier(tx);
+        drop(rx); // channel 构造时的初始 Receiver 也 drop
+        let _ = dag.push_messages(vec![text_msg(IrRole::User, "u")], dummy_event());
+        let mut rx2 = dag.subscribe_changes().expect("notifier installed");
+        assert_eq!(current_count(&mut rx2), 1, "无订阅者期间的写入仍被计数");
     }
 
     #[test]
