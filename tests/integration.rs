@@ -12060,7 +12060,7 @@ async fn trace_span_omits_query_string() {
 // keepalive (15s 空注释帧) 难以在测试窗口内断言, 不覆盖 — 间隔与注释帧形态由
 // axum KeepAlive 保证, "注释帧不触发前端 onmessage" 的语义见 api/events.rs.
 
-/// SSE 测试专用 spawn: 调用方提供 DAG (带/不带 notifier), shutdown flag 常开
+/// SSE 测试专用 spawn: 调用方提供 DAG, shutdown flag 常开
 /// (返回 sender 由测试持有, 模拟生产 serve() 的 graceful-shutdown 装配 —
 /// sender 存活则 SSE 流不会因 channel 关闭而提前结束).
 async fn spawn_proxy_with_events_dag(
@@ -12134,9 +12134,8 @@ async fn sse_events_pushes_dag_change_counter() {
         .create_async()
         .await;
 
-    // 带 notifier 的 DAG (生产装配形态).
-    let (notify_tx, _) = tokio::sync::watch::channel(0u64);
-    let dag = ConversationDag::new(64, 500, 1).with_notifier(notify_tx);
+    // DAG (通知通道由 new 内建, 生产同型).
+    let dag = ConversationDag::new(64, 500, 1);
     let (proxy_url, _shutdown_tx) = spawn_proxy_with_events_dag(&upstream.url(), dag).await;
 
     // Host guard: reqwest 自动带 Host: 127.0.0.1:<port> (loopback + port 匹配, 放行).
@@ -12203,42 +12202,13 @@ async fn sse_events_pushes_dag_change_counter() {
 }
 
 #[tokio::test]
-async fn sse_events_without_notifier_degrades_to_keepalive_stream() {
-    // 无 notifier 的 DAG (普通 fixture): 仍 200 + text/event-stream, 但无数据帧
-    // (只有 KeepAlive — 15s 间隔, 测试窗口内等不到). 断言 300ms 内零帧到达.
-    let dag = ConversationDag::new(64, 500, 1);
-    // base_url 指向不可达地址即可: 本测试无转发, provider 仅满足路由装配.
-    let (proxy_url, _shutdown_tx) = spawn_proxy_with_events_dag("http://127.0.0.1:9", dag).await;
-
-    let resp = reqwest::Client::new()
-        .get(format!("{proxy_url}/api/events"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    assert_eq!(
-        resp.headers().get("content-type").unwrap(),
-        "text/event-stream"
-    );
-
-    let mut stream = Box::pin(resp.bytes_stream());
-    use futures::StreamExt as _;
-    let tried = tokio::time::timeout(Duration::from_millis(300), stream.next()).await;
-    assert!(
-        tried.is_err(),
-        "无 notifier 的流不应推送任何数据帧 (仅 KeepAlive, 15s 间隔)"
-    );
-}
-
-#[tokio::test]
 async fn sse_events_stream_ends_on_shutdown_flag() {
     // graceful shutdown 语义: shutdown flag 置 true → SSE 流立即结束 (服务端
     // 正常收尾, 客户端读到 EOF), 不等 KeepAlive 间隔 — 这是
     // with_graceful_shutdown 不被无限 SSE 流挂起的守卫 (模块文档 §生命周期
     // 路径 a). 覆盖 "连接建立后 flag 才置位" 的主路径; "连接建立前已置位"
     // 由 shutdown_once 的 wait_for (而非 changed) 实现保证, 见其注释.
-    let (notify_tx, _) = tokio::sync::watch::channel(0u64);
-    let dag = ConversationDag::new(64, 500, 1).with_notifier(notify_tx);
+    let dag = ConversationDag::new(64, 500, 1);
     let (proxy_url, shutdown_tx) = spawn_proxy_with_events_dag("http://127.0.0.1:9", dag).await;
 
     let resp = reqwest::Client::new()

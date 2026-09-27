@@ -23,14 +23,8 @@
 //! `with_graceful_shutdown` 会等在途连接完成, SSE 无限流必须可被唤醒终止,
 //! 否则 shutdown 挂起; (b) DAG drop → watch channel 关闭 → WatchStream 自然
 //! 结束 (进程退出路径); (c) 客户端断开 → hyper 取消 → 流被 drop。
-//!
-//! # 降级 (ROB)
-//!
-//! 无 notifier 的 DAG (测试 fixture 默认): 返回只有 KeepAlive 的空流 (仍
-//! 200, 不 500) — 端点存在性与流形状稳定, 前端走兜底轮询即可。
 
 use std::convert::Infallible;
-use std::pin::Pin;
 
 use axum::extract::State;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -39,26 +33,15 @@ use tokio_stream::wrappers::WatchStream;
 
 use crate::state::{AppState, NO_STORE};
 
-/// SSE 事件流的 erased 类型 (订阅流 / 降级空流两分支的公共返回形态).
-type ChangeStream = Pin<Box<dyn futures::Stream<Item = Result<Event, Infallible>> + Send>>;
-
 /// GET /api/events handler: DAG 变更计数的 SSE 流.
 pub async fn events(State(state): State<AppState>) -> impl axum::response::IntoResponse {
-    // shutdown 感知先于数据分支构造: 两个分支都要能被 shutdown 终止.
+    // shutdown 感知: graceful shutdown 置 flag 后流在此终止 (见模块文档).
     let shutdown = shutdown_once(state.shutdown.clone());
-    let stream: ChangeStream = match state.dag.subscribe_changes() {
-        Some(rx) => Box::pin(
-            // WatchStream::new (而非 from_changes): 初值即推当前计数 —
-            // 连接建立/重连自动对账一轮, 消费幂等 (见模块文档).
-            WatchStream::new(rx)
-                .map(|count| Ok(Event::default().data(count.to_string())))
-                .take_until(shutdown),
-        ),
-        None => Box::pin(
-            // 无 notifier (测试 fixture): 只有 KeepAlive 的空流, 降级语义见模块文档.
-            futures::stream::pending::<Result<Event, Infallible>>().take_until(shutdown),
-        ),
-    };
+    // WatchStream::new (而非 from_changes): 初值即推当前计数 — 连接建立/重连
+    // 自动对账一轮, 消费幂等 (见模块文档).
+    let stream = WatchStream::new(state.dag.subscribe_changes())
+        .map(|count| Ok::<_, Infallible>(Event::default().data(count.to_string())))
+        .take_until(shutdown);
     (
         NO_STORE,
         [("x-accel-buffering", "no")],

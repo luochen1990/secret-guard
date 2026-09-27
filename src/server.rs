@@ -359,12 +359,10 @@ pub async fn serve(
     auth_config.validate().map_err(|e| anyhow::anyhow!(e))?;
 
     let upstream = build_upstream_client(upstream_timeouts.connect)?;
-    // rt-push 装配: ① DAG 变更通知 (`GET /api/events` 的数据源, 见 dag 模块
-    // "变更通知" 节) — channel 的初始 Receiver 直接 drop, 订阅者经
-    // `dag.subscribe_changes()` 从 Sender 现建; ② shutdown flag — 置 true 时
-    // SSE 等无限长流经 take_until 结束 (见下方 with_graceful_shutdown).
-    let (notify_tx, _) = tokio::sync::watch::channel(0u64);
-    let dag = ConversationDag::new(records_capacity, 500, 1).with_notifier(notify_tx);
+    // rt-push: ① DAG 变更通知通道由 `ConversationDag::new` 内建 (always-on,
+    // `GET /api/events` 的数据源, 见 dag 模块 "变更通知" 节); ② shutdown flag —
+    // 置 true 时 SSE 等无限长流经 take_until 结束 (见下方 with_graceful_shutdown).
+    let dag = ConversationDag::new(records_capacity, 500, 1);
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     // 跨表共享: persist_lock 串行整个 RMW, decisions 是同一份 mutable map.

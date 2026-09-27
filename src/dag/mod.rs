@@ -93,13 +93,12 @@ pub struct ConversationDag {
     /// 都加 thin wrapper). 子模块都在 `crate::dag::*` 路径下, 不泄漏到 crate 外.
     pub(super) inner: Arc<RwLock<DagInner>>,
     /// 变更通知通道 (SSE 失效通知后端): 每次内容写入计数 +1, 见模块文档
-    /// "变更通知" 节. `None` = 通知关闭 (默认 — 测试 fixture 零影响: 不订阅
-    /// 不发送, 写入路径零开销).
+    /// "变更通知" 节. always-on (`new` 内建, 无装配维度).
     ///
     /// Clone 语义: `watch::Sender` 内部是 Arc, derived Clone 让所有 DAG clone
     /// (与 `inner` 同源) 共享同一通知通道 — clone 视图的写入与本体同源通知;
     /// 全部 clone drop 后 channel 关闭, 订阅流自然结束 (进程退出路径).
-    notify: Option<tokio::sync::watch::Sender<u64>>,
+    notify: tokio::sync::watch::Sender<u64>,
 }
 
 #[derive(Debug)]
@@ -152,29 +151,23 @@ impl ConversationDag {
                 max_sessions: max_sessions.max(1),
                 min_sessions: min_sessions.max(1),
             })),
-            notify: None,
+            notify: tokio::sync::watch::channel(0).0,
         }
     }
 
     // ─── 变更通知 (SSE 失效通知后端) ─────────────────────────────────────────
 
-    /// 安装变更通知通道 (builder, 链式).
-    ///
-    /// 生产装配点: `server.rs::serve` — `GET /api/events` 的 SSE 流经
-    /// [`Self::subscribe_changes`] 消费. 不安装 (默认) 时订阅恒 `None`,
-    /// 写入路径零通知开销 (测试 fixture 不受影响).
-    pub fn with_notifier(mut self, tx: tokio::sync::watch::Sender<u64>) -> Self {
-        self.notify = Some(tx);
-        self
-    }
-
     /// 订阅 DAG 变更: 每次内容写入 (push_messages / attach_response /
-    /// update_parsed_response) 后计数 +1. `None` = 未安装 notifier.
+    /// update_parsed_response) 后计数 +1.
+    ///
+    /// 通道 always-on (`new` 内建): 写入路径开销 = 无订阅者时一次原子递增
+    /// (可忽略), 换取零装配维度 — 任何装配点 (含测试 fixture) 的 DAG 都可
+    /// 订阅, 不存在 "漏装 notifier → SSE 静默降级" 的装配 bug 类别.
     ///
     /// 从 Sender 现建 Receiver (`subscribe`): 不依赖 channel 创建时的初始
     /// Receiver (它可能早已 drop), 新订阅者从当前计数起观察后续变更.
-    pub fn subscribe_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
-        self.notify.as_ref().map(|tx| tx.subscribe())
+    pub fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.notify.subscribe()
     }
 
     /// 内容已变更 → 计数 +1 并唤醒订阅者.
@@ -184,9 +177,7 @@ impl ConversationDag {
     /// 无订阅者时静默正确, 有订阅者时计数严格递增不触发值去重.
     /// 同步非阻塞, 可在持有 inner write lock 的写入路径末尾直接调用.
     fn notify_change(&self) {
-        if let Some(tx) = &self.notify {
-            tx.send_modify(|v| *v += 1);
-        }
+        self.notify.send_modify(|v| *v += 1);
     }
 
     /// 把一段 messages 推入 DAG.
@@ -1116,9 +1107,8 @@ mod tests {
     #[test]
     fn notifier_counts_each_write_point() {
         // 三个写入点 (push / attach / update_parsed) 各自计数 +1.
-        let (tx, _) = tokio::sync::watch::channel(0u64);
-        let dag = ConversationDag::new(8, 500, 1).with_notifier(tx);
-        let mut rx = dag.subscribe_changes().expect("notifier installed");
+        let dag = ConversationDag::new(8, 500, 1);
+        let mut rx = dag.subscribe_changes();
         assert_eq!(current_count(&mut rx), 0, "初始计数 = channel 初值");
 
         let id = dag.push_messages(vec![text_msg(IrRole::User, "u")], dummy_event());
@@ -1140,9 +1130,8 @@ mod tests {
     #[test]
     fn notifier_skips_noop_write_paths() {
         // node 不存在的提前 return 路径 (attach / update_parsed) 数据未变 → 不通知.
-        let (tx, _) = tokio::sync::watch::channel(0u64);
-        let dag = ConversationDag::new(1, 500, 1).with_notifier(tx);
-        let mut rx = dag.subscribe_changes().expect("notifier installed");
+        let dag = ConversationDag::new(1, 500, 1);
+        let mut rx = dag.subscribe_changes();
         let a = dag.push_messages(vec![text_msg(IrRole::User, "a")], dummy_event());
         assert_eq!(current_count(&mut rx), 1);
         // 第二次 push 淘汰 a 的 session (max=1).
@@ -1158,26 +1147,13 @@ mod tests {
     }
 
     #[test]
-    fn notifier_none_is_default_and_writes_never_panic() {
-        // 默认 (无 notifier): 订阅 None; 全部写入路径正常.
-        // (存量测试天然覆盖 None 路径, 此处显式断言契约.)
-        let dag = ConversationDag::new(8, 500, 1);
-        assert!(dag.subscribe_changes().is_none(), "默认不装 notifier");
-        let id = dag.push_messages(vec![text_msg(IrRole::User, "u")], dummy_event());
-        dag.attach_response(id, ResponseData::default());
-        dag.update_parsed_response(id, serde_json::json!({}));
-        assert!(dag.get_node(id).is_some(), "写入路径全部正常");
-    }
-
-    #[test]
     fn notifier_without_subscribers_does_not_panic() {
         // Receiver 全部 drop 后写入: 不报错不 panic (send_modify 无订阅者语义,
         // 见 notify_change 注释); 后续订阅仍能从 Sender 读到递增后的计数.
-        let (tx, rx) = tokio::sync::watch::channel(0u64);
-        let dag = ConversationDag::new(8, 500, 1).with_notifier(tx);
-        drop(rx); // channel 构造时的初始 Receiver 也 drop
+        let dag = ConversationDag::new(8, 500, 1);
+        drop(dag.subscribe_changes()); // 订阅后立即 drop 模拟无订阅者
         let _ = dag.push_messages(vec![text_msg(IrRole::User, "u")], dummy_event());
-        let mut rx2 = dag.subscribe_changes().expect("notifier installed");
+        let mut rx2 = dag.subscribe_changes();
         assert_eq!(current_count(&mut rx2), 1, "无订阅者期间的写入仍被计数");
     }
 

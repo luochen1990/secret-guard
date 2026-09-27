@@ -92,7 +92,7 @@ forward 路由 (`/{proto}/{name}/...`) 首段必须是 proto 简写, 由
 | `/api/records/{id}` | 单条 record raw/parsed view (WebUI 弹窗按需拉) |
 | `/api/sessions` [+ `/{sid}/timeline`] | 会话列表 + session-aware timeline 分页 |
 | `/api/sync` | WebUI 刷新统一入口 (sidebar + timeline diff; 消费节奏 = SSE 事件驱动 + 兜底轮询, 见 `/api/events`) |
-| `/api/events` | SSE 失效通知流 (DAG 变更计数 poke; 事件仅作 invalidation 信号, 数据以 `/api/sync` 为 SSOT — 契约 UI-8; 无 notifier 时降级为 keepalive 空流) |
+| `/api/events` | SSE 失效通知流 (DAG 变更计数 poke; 事件仅作 invalidation 信号, 数据以 `/api/sync` 为 SSOT — 契约 UI-8) |
 | `/api/secrets` [+ `/{id}` [+ `/decision`]] | secret CRUD + OverrideMode |
 | `/api/providers` [+ `/{id}` [+ `/decision`]] + `/probe` | provider CRUD + OverrideMode + 协议自动探测 (静态段优先于 `{id}`: POST = 探测; PUT/DELETE `/probe` = 以固定 id="probe" 适配的编辑/删除薄 wrapper, 存量 "probe" 条目由此可管理 — 新建该 id 仍在 upsert 校验层拒绝, 纯防混淆) |
 | `/api/providers/{id}/pool-reset` | pool 条目成员闹钟清空 (POST; 两段路径与 `{id}/decision` 同型, 无单段阴影) |
