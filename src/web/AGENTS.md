@@ -21,6 +21,7 @@
     存在性校验后的薄壳, 取数算法 SSOT 在 `proxy::models::provider_model_preview`
     (Router 走 advertised_names 本地合成 / Direct+Pool 走 resolve_route + 上游现场 fetch).
   - `apikeys.rs` — API key CRUD (4 endpoints, 无条件挂载, "只认证, 不隔离").
+  - `events.rs` — `GET /api/events` SSE 失效通知流 (DAG 变更计数 poke, rt-push; 事件只说"变了", 数据以 /api/sync 为 SSOT — wire 契约见文件头部).
   - `usage.rs` — `GET /usage/summary` 用量汇总查询 (usage-stats §8; 直读 UsageStore
     SQL 聚合, 派生走 `usage::summary::build_summary` 纯函数).
 - `dto.rs` (已移至顶层 `src/dto.rs`): WebUI 响应序列化 DTO (SessionView / NodeView / RoundBrief / TimelineRound / TimelineTail / TimelinePage / TimelineDiffData / SyncSnapshot). 构造逻辑留 dag 模块 (持读锁访问私有字段). 中立化理由见 `src/dto.rs` 头部 (dag 域 B 不再反向依赖 web 域 C).
@@ -46,7 +47,15 @@ GET    /api/sessions/{sid}/timeline[?before=UUID&limit=N]
                                                → TimelinePage {rounds, tail, has_more}
                                                  (session-aware timeline 分页, oldest-first)
 POST   /api/sync   body: {selected?, expanded[]}  → {sessions, rounds, timeline?}
-                                                 (WebUI 3s 轮询统一入口: sidebar + timeline diff 一次采集)
+                                                  (WebUI 统一轮询入口: SSE poke 触发
+                                                  + 动态兜底轮询 (SSE 健康 30s / 断开
+                                                  3s), 见 "实时刷新" 段; sidebar +
+                                                  timeline diff 一次采集)
+GET    /api/events                      → text/event-stream, 未命名事件, data = DAG
+                                                  变更计数 (u64 十进制); KeepAlive 15s
+                                                  注释帧 (不触发 onmessage); WatchStream
+                                                  初值即推当前计数 — 连接建立/重连自动
+                                                  对账一轮 (SSE 失效通知, rt-push)
 GET    /api/secrets
 POST   /api/secrets
 PUT    /api/secrets/{id}
@@ -194,7 +203,7 @@ audit_capture 未保留的请求 (off 档全部 / errors 档成功请求, B2/B3)
 非末轮的 response 内容已被下一轮 delta 的 assistant message 包含 (Phase A 决策), 故 tail
 只代表"最新尚未被 delta 消费的 response".
 
-### sync API (POST /api/sync, WebUI 3s 轮询统一入口)
+### sync API (POST /api/sync, WebUI 统一轮询入口)
 
 `sync_snapshot(expanded, selected)` 在 DAG 层单个 `inner.read()` 锁内一次性采集三部分
 (避免新 push 在两次锁之间漂移):
@@ -244,6 +253,23 @@ API key CRUD **无条件挂载** (在 `web::router()`, 不依赖 `auth.enabled`)
 > == HTTP 请求数) / I3 (timeline 轮次 DOM 顺序 == 数据顺序 oldest-first) 见根目录
 > AGENTS.md. 回归守卫: `tests/webui/im-ui.spec.ts`. round_kind 派生语义 SSOT =
 > contracts.md DTO-9.
+
+### 实时刷新 (SSE poke + 动态兜底轮询, rt-push T3 / UI-8)
+
+- **poke 只是触发器**: `GET /api/events` (SSE) 事件到达 → `currentRefreshAction() === 'sync'`
+  时经 200ms trailing debounce 触发既有 `sync()` (合并后端 250ms 节流 × N 路流式的
+  poke 风暴); 数据以 `POST /api/sync` 为 SSOT, 事件体不解析 (契约 contracts.md UI-8).
+- **`currentRefreshAction()`**: 旧 setInterval 回调内联暂停/分 tab 条件的纯决策提取
+  (#164-3), 返回 `'sync' | 'usage' | 'secrets' | 'providers' | 'apikeys' | null`
+  (null = auto 关闭 / 弹窗开启 / 表格焦点); 兜底 tick 与 SSE poke 共用同一决策 SSOT —
+  暂停语义对两路入口一致, 无旁路.
+- **动态兜底轮询**: 自调度 `setTimeout` 链 (单例 guard), 间隔每次 tick 重读
+  `sseHealthy` (onopen/onerror 维护): SSE 健康 30s (事件丢失对账兜底) / 断开 3s
+  (退化为旧 setInterval 行为). EventSource 原生自动重连, 前端不手动重建.
+- **auto-refresh 开关联动**: 关闭 → `es.close()` 断开 SSE (推送无意义, 省长连接);
+  重新开启 → 重建订阅 (重连即对账). 轮询链不因开关启停 (tick 内自检 checkbox).
+- **tab 返回对账**: 点击 records tab 即时 `sync()` (与其他 tab 点击即刷对称) —
+  其他 tab 期间到达的 poke 被 onmessage 跳过, 不补则最长等 30s 兜底 tick.
 
 ### Provider 表单 (构造分野 + 路由编辑器) 与列表 router 行渲染
 

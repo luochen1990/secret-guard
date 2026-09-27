@@ -34,6 +34,9 @@
  *
  * 错误状态渲染: 上游 502/429 时 WebUI 不崩溃 + record 显示错误状态.
  *
+ * SSE 失效通知消费 (rt-push T3 / UI-8): poke → 200ms debounce → sync; SSE 断开
+ * 退化为兜底轮询; #164-3 弹窗暂停语义覆盖 poke 路径 (文件尾 describe).
+ *
  * 所有测试共享一个 browser context, 按声明顺序执行 (workers=1).
  */
 import { test, expect, type Locator, type Page } from "@playwright/test";
@@ -81,6 +84,27 @@ async function setAuditCapture(page: Page, on: boolean | string): Promise<void> 
 // server 不可达时静默 (此时测试自身已失败, 卫生钩子不叠加噪音).
 test.afterEach(async ({ page }) => {
   await setAuditCapture(page, false).catch(() => {});
+});
+
+// SSE 静音 route (file-level 默认, rt-push T3): 前端 bootstrap 会订阅
+// GET /api/events (SSE 长连接). 默认拦截的两个理由:
+//   1. 长连接持续 inflight 会让 page.waitForLoadState("networkidle") (各 describe
+//      的 beforeEach 都在用) 永不满足 — "0 inflight 500ms" 的空闲判据被钉死.
+//   2. 既有用例的时序假设建立在 3s 兜底轮询节奏上 (findSessionLeafByPreview 的
+//      轮询回填 / #164-3 的 "2 个 3s 周期"); 静音后连接立即关闭 → sseHealthy 恒
+//      false → 兜底间隔恒 3s, 与 SSE 引入前的行为逐字一致 (零回归面).
+// 静音形态: 200 + text/event-stream 一次性 body "retry: 900000\n\n" — 只设重连
+// 间隔不投递事件 (SSE 规范: 空 data 的 blank line 不 dispatch), 连接随即关闭 →
+// EventSource 15min 内不重连, 每页恰好一次请求. SSE 专项用例在 test 体内
+// page.unroute 本默认后自装受控 route (见文件尾 "SSE 失效通知" describe).
+test.beforeEach(async ({ page }) => {
+  await page.route("**/api/events", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "text/event-stream",
+      body: "retry: 900000\n\n",
+    });
+  });
 });
 
 /**
@@ -3328,5 +3352,83 @@ test.describe("Provider Detect 协议探测", () => {
     // 编辑 base_url → 探测结果对新 URL 不再成立, 徽标作废隐藏.
     await endpointRow(page).locator(".ep-base-url").fill("http://127.0.0.1:19996");
     await expect(endpointRow(page).locator(".ep-common-uri-badge")).toBeHidden();
+  });
+});
+
+// ─── SSE 失效通知消费 (rt-push T3, UI-8) ──────────────────────────────────
+//
+// 前端契约 (index.html "SSE 失效通知 + 动态兜底轮询" 段; wire 契约见
+// src/web/api/events.rs 头部): SSE 事件只是触发器 — 收到 poke (records tab +
+// 无 #164-3 暂停) → 200ms trailing debounce → 既有 sync(); POST /api/sync 仍是
+// 数据 SSOT. EventSource 原生自动重连; sseHealthy 驱动兜底轮询间隔 (健康 30s /
+// 断开 3s).
+//
+// mock 手法 (Playwright 1.61 的 route.fulfill 不支持流式 body — 只接受一次性
+// string/Buffer): 用 "retry: N" 控制重连节奏 + 每次重连投递一帧事件的一次性
+// body 模拟受控事件流; body 结束连接关闭, 天然覆盖 onerror 路径. file-level
+// 静音 route (见文件头) 由各用例 page.unroute 后覆盖.
+test.describe("SSE 失效通知 (rt-push T3)", () => {
+  /** 计数页面发出的 POST /api/sync (纯观察不拦截 — 不改变被测行为). */
+  function countSyncRequests(page: Page): () => number {
+    let n = 0;
+    page.on("request", (r) => {
+      if (r.method() === "POST" && new URL(r.url()).pathname === "/api/sync") n++;
+    });
+    return () => n;
+  }
+
+  /** 卸下 file-level 静音默认, 装受控事件流: 一次性 body ("retry: N" + 一帧事件),
+   * body 结束连接关闭 → 天然覆盖 onerror 路径. retry 值是各用例唯一的控制变量
+   * (重连节奏: 900000 = 单次事件后静默 / 300 = poke 以 300ms 节奏持续到达). */
+  async function mockSseEvents(page: Page, body: string): Promise<void> {
+    await page.unroute("**/api/events");
+    await page.route("**/api/events", (route) =>
+      route.fulfill({ status: 200, contentType: "text/event-stream", body }));
+  }
+
+  test("SSE poke 触发 sync (debounce 后, 3s 兜底 tick 前)", async ({ page }) => {
+    // 受控事件流: 首次连接立即投递一帧事件后关闭; retry 15min → 不再重连.
+    // 事件链: onmessage → 200ms debounce → sync (第 2 次). 对照: 无 poke 时下一
+    // 次 sync 最早在首条兜底 tick (bootstrap+3s — EventSource 关闭 → sseHealthy
+    // =false → 3s 档; 第 1 次是 bootstrap 首拉).
+    await mockSseEvents(page, "retry: 900000\n\ndata: 1\n\n");
+    const syncCount = countSyncRequests(page);
+    await page.goto("/");
+    // 断言窗口 2s < 3s: load 后 2s 内出现第 2 次 sync 只能由 poke 达成.
+    await expect.poll(syncCount, { timeout: 2000 }).toBeGreaterThanOrEqual(2);
+  });
+
+  test("SSE 不可用时退化为轮询 (兜底 tick 持续拉 sync)", async ({ page }) => {
+    // 全部 /api/events 请求 abort → onerror 恒触发 → sseHealthy 恒 false → 兜底
+    // 轮询 3s 档. 只断言 "仍在轮询" 不断言精确间隔 (防计时 flaky): 9s 窗口内
+    // ≥3 次 POST (bootstrap 首拉 + ~3s + ~6s 两记 tick).
+    // 反向检测: 前端若把断连误判为健康 (30s 档) 或彻底停轮询, 计数停在 1 → 红.
+    await page.unroute("**/api/events");
+    await page.route("**/api/events", (route) => route.abort("failed"));
+    const syncCount = countSyncRequests(page);
+    await page.goto("/");
+    await expect.poll(syncCount, { timeout: 9000 }).toBeGreaterThanOrEqual(3);
+  });
+
+  test("弹窗开启时 SSE poke 不触发 sync, 关闭后恢复 (#164-3)", async ({ page }) => {
+    // 受控事件流: retry 300ms → EventSource 每 300ms 重连一次各收一帧事件,
+    // poke 以 ~300ms 节奏持续到达 (debounce 200ms 只折叠, 不吞末次).
+    await mockSseEvents(page, "retry: 300\n\ndata: 1\n\n");
+    const syncCount = countSyncRequests(page);
+    await page.goto("/");
+    // 先证正向链路通: 无弹窗时 poke 应在 ~0.5s 内触发第 2 次 sync.
+    await expect.poll(syncCount, { timeout: 2000 }).toBeGreaterThanOrEqual(2);
+    // 开弹窗 (#164-3 暂停) + 排空在途 debounce (200ms) 后取冻结基线.
+    await page.evaluate(() => document.getElementById("secret-form")!.showModal());
+    await page.waitForTimeout(800);
+    const frozen = syncCount();
+    // ≥4 个 poke 周期 (1.5s) 无一触发 sync — 暂停语义必须覆盖 SSE poke 路径
+    // (兜底 tick 同被暂停; 若暂停失效, 300ms 节奏的 poke 在窗口内必增计数).
+    await page.waitForTimeout(1500);
+    expect(syncCount(), "弹窗开启期间 poke 不得触发 sync").toBe(frozen);
+    // 关闭弹窗 → 下一个 poke (≤300ms) + debounce (200ms) 恢复触发 — 证明跳过
+    // 确因弹窗暂停, 而非事件流 mock 失效.
+    await page.evaluate(() => document.getElementById("secret-form")!.close());
+    await expect.poll(syncCount, { timeout: 2000 }).toBeGreaterThan(frozen);
   });
 });

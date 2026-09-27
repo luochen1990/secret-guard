@@ -1701,7 +1701,8 @@
         <button type="button" data-theme-val="light" title="亮色">☀</button>
         <button type="button" data-theme-val="dark" title="暗色">☾</button>
       </div>
-      <label><input type="checkbox" id="auto" checked> auto-refresh (3s)</label>
+      <!-- 间隔不再固定 3s: SSE 健康时兜底轮询 30s, 详见 bootstrap 段 rt-push T3 注释. -->
+      <label><input type="checkbox" id="auto" checked> auto-refresh</label>
       <button class="refresh" onclick="sync()">refresh</button>
     </span>
   </header>
@@ -2242,6 +2243,10 @@
         document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
         tab.classList.add('active');
         document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
+        // 显式用户动作 = 即时刷新 (与其他 tab 对称): 返回 records tab 补一次对账 —
+        // 其他 tab 期间到达的 poke 被 onmessage 跳过 (SSE 事件只覆盖 timeline 世界),
+        // 不补则要等兜底 tick (SSE 健康时 30s, rt-push T3 前为 3s).
+        if (tab.dataset.tab === 'records') sync();
         if (tab.dataset.tab === 'secrets') refreshSecrets();
         if (tab.dataset.tab === 'providers') refreshProviders();
         if (tab.dataset.tab === 'apikeys') refreshApiKeys();
@@ -2568,8 +2573,10 @@
     // 然后全量加载 timeline (GET /sessions/{sid}/timeline?limit=TIMELINE_PAGE) 并滚到底.
     // 不再先拉 sessionRounds 再 selectRound — timeline 全量加载是进入会话的主路径.
     //
-    // UI-7: 立即触发一次 sync (不等 3s tick) 回填 sidebar 三级菜单 — 否则
-    // "Loading rounds…" 占位符要等下一次轮询 (最长 3s; auto-refresh 关闭时无限期).
+    // UI-7: 立即触发一次 sync (不等兜底轮询 tick) 回填 sidebar 三级菜单 — 否则
+    // "Loading rounds…" 占位符要等下一次兜底轮询 (SSE 健康时 DAG 变化经 poke
+    // ~300ms 到达; 静止数据最长等兜底间隔 — SSE 断开 3s / 健康 30s; auto-refresh
+    // 关闭时无限期).
     // 此时 loadTimeline 在途, timelineSession 尚未指向新会话 → sync 的游标守卫
     // 自动发 null 游标 (sidebar-only), 不产生矛盾游标, 无竞态.
     async function toggleSession(sessionId) {
@@ -4428,7 +4435,7 @@
     }
 
     /// 数据未变化时跳过 tbody 重建 (#164-3): 行级 reconciliation 的最小替代 —
-    /// auto-refresh (3s) 空轮询 (数据静止) 不再打断自动化工具持有的 <tr> 引用
+    /// auto-refresh 空轮询 (数据静止) 不再打断自动化工具持有的 <tr> 引用
     /// (isConnected 反复失效). 返回是否实际写入 (调用方据此决定 stats 等联动更新).
     function replaceTbodyIfChanged(body, html) {
       if (body.dataset.renderedHtml === html) return false;
@@ -4487,7 +4494,7 @@
     // ─── usage tab: 模型用量统计 (usage-stats 设计 M4) ────────────────────
     //
     // 数据流: GET /api/usage/summary?days=N (tab 激活时 5s 节流轮询 — summary 载荷
-    // 比 sync diff 重, 不进 3s 主循环). 渲染: 汇总卡 / 按天堆叠 SVG 柱状图 /
+    // 比 sync diff 重, 不进 sync 主循环). 渲染: 汇总卡 / 按天堆叠 SVG 柱状图 /
     // by model / by provider 表. cost 恒为估算 ("~", P-4), 无价显示 "—".
 
     let usageHours = 168;
@@ -6356,31 +6363,113 @@
       }
     }
 
+    // ─── 刷新分派: currentRefreshAction (#164-3 暂停语义提取, tick 与 SSE poke 共用) ──
+    // 旧 setInterval 回调的内联暂停/分 tab 条件提取为纯决策函数, 行为完全不变
+    // (纯重构, rt-push T3): 返回本轮应执行的刷新动作 —
+    //   'sync'     records tab (或无 tab 激活): 统一轮询 POST /api/sync (timeline 世界).
+    //   'usage'    usage tab: 独立 5s 节流轮询 (refreshUsage 内部节流), 不进 sync 主循环.
+    //   'secrets' / 'providers' / 'apikeys': 各表格 tab 的独立刷新.
+    //   null       跳过本轮: auto-refresh 关闭 / 弹窗开启 / 表格内有焦点元素.
+    // SSE poke 侧只消费 === 'sync' (见下方 onmessage), tick 侧消费全部返回值 —
+    // 两路入口共用同一决策 SSOT, #164-3 暂停语义对 poke 同样生效.
+    function currentRefreshAction() {
+      if (!document.getElementById('auto').checked) return null;
+      // 交互进行中暂停刷新 (#164-3): 弹窗开启 (编辑/创建/endpoints/reveal) 时跳过,
+      // 避免 fetch+渲染打断交互. 历史行为: modal 开启时也刷新, 但 renderKind 不碰
+      // dialog 内容, 用户感知不到 — 受害者主要是后台 tbody 重建打断自动化工具引用,
+      // 现由 renderKind 的 renderedHtml 短路 + 此处暂停双保险覆盖.
+      const tableDialogOpen = ['secret-form', 'provider-form', 'apikey-form',
+        'provider-endpoints', 'apikey-reveal'].some(d => document.getElementById(d)?.open);
+      if (tableDialogOpen) return null;
+      const activeTab = document.querySelector('.tab-content.active')?.id;
+      if (activeTab === 'tab-usage') return 'usage';
+      const tableHasFocus = ['tab-secrets', 'tab-providers', 'tab-apikeys'].includes(activeTab)
+        && document.getElementById(activeTab)?.contains(document.activeElement);
+      if (tableHasFocus) return null;
+      if (activeTab === 'tab-secrets') return 'secrets';
+      if (activeTab === 'tab-providers') return 'providers';
+      if (activeTab === 'tab-apikeys') return 'apikeys';
+      return 'sync';
+    }
+
+    // currentRefreshAction 的配套分派: 动作名 → 实际刷新调用. null 静默跳过.
+    function runRefreshAction(action) {
+      if (action === 'usage') refreshUsage();
+      else if (action === 'secrets') refreshSecrets();
+      else if (action === 'providers') refreshProviders();
+      else if (action === 'apikeys') refreshApiKeys();
+      else if (action === 'sync') sync();
+    }
+
+    // ─── SSE 失效通知 + 动态兜底轮询 (rt-push T3) ──────────────────────────
+    // 设计哲学: 推送只说"变了" — GET /api/events (SSE, 未命名事件, data = DAG
+    // 变更计数) 只是触发器, 数据以 POST /api/sync 为 SSOT (UI-8): onmessage 不
+    // 解析事件体, 只触发既有 sync(). 事件丢失无害: 兜底轮询吸收 (见下).
+    let es = null;             // EventSource 单例 (null = 未订阅: 初始未连接 / auto 关闭).
+    let sseHealthy = false;    // 最近一次 onopen/onerror 的健康度; 仅驱动兜底轮询间隔.
+    let syncDebounceTimer = 0; // poke → sync 的 200ms trailing debounce 句柄.
+    let refreshTimer = 0;      // 兜底轮询自调度链的 setTimeout 句柄 (单例 guard).
+
+    // poke → 200ms trailing debounce → sync().
+    // 为什么 trailing 200ms: 后端 250ms 节流 × N 路并发流式 → 最坏每 250ms 一记
+    // poke; trailing 窗口把连续 poke 折叠为"末次变化后"的单次 sync — 不丢更新
+    // (trailing 保证末次变化必触发) 也不放大请求 (leading 会连发).
+    // fire 时二次校验: 判定发生在事件到达时刻, 而 sync 在 200ms 后执行 — 窗口内
+    // 弹窗开启/auto 关闭/切 tab 时放弃本次触发 (UI-8 暂停语义无 200ms 旁路).
+    function scheduleSyncSoon() {
+      clearTimeout(syncDebounceTimer);
+      syncDebounceTimer = setTimeout(() => {
+        syncDebounceTimer = 0;
+        if (currentRefreshAction() !== 'sync') return;
+        sync();
+      }, 200);
+    }
+
+    // 订阅 /api/events (相对路径, 同源). 未命名事件 → es.onmessage 直收 (wire
+    // 契约见 src/web/api/events.rs 头部). EventSource 原生自动重连 (断开后浏览器
+    // 默认 ~3s 重试), onerror 只更新 sseHealthy 驱动兜底间隔, 不手动重建 — 服务端
+    // WatchStream 初值即推当前计数, 重连自动"对账"一轮, 重复触发 sync 幂等无害.
+    function subscribeEvents() {
+      if (es) return;  // 单例: 已订阅则不重复建连 (防多调用点叠加长连接).
+      es = new EventSource('/api/events');
+      es.onopen = () => { sseHealthy = true; };
+      es.onerror = () => { sseHealthy = false; };
+      // 事件 = "DAG 变了". 只加速 timeline 世界 (records tab → sync); 其他 tab 的
+      // 刷新仍由兜底 tick 分派 (SSE 事件语义只覆盖 DAG 变更, 表格数据无对应推送).
+      es.onmessage = () => {
+        if (currentRefreshAction() === 'sync') scheduleSyncSoon();
+      };
+    }
+
+    // 兜底轮询: 自调度 setTimeout 链 (替代旧 setInterval 3000), 间隔随 SSE 健康度
+    // 动态切换 — 每次 tick 重读 sseHealthy, SSE 断开/恢复无需通知轮询链:
+    //   sseHealthy === true  → 30000ms: SSE 已实时推送, 轮询降级为"事件丢失对账"
+    //     兜底 (30s 吸收窗: SSE 断连但 onerror 尚未触发的极端场景也能收敛).
+    //   sseHealthy === false → 3000ms: 退化为纯轮询, 与旧 setInterval 行为一致.
+    // tick 内容不变 (currentRefreshAction 分派); refreshTimer 非零不重入 (单例
+    // guard), 防 bootstrap 重复调用起双链.
+    function scheduleRefreshTick() {
+      if (refreshTimer) return;
+      refreshTimer = setTimeout(() => {
+        refreshTimer = 0;
+        runRefreshAction(currentRefreshAction());
+        scheduleRefreshTick();
+      }, sseHealthy ? 30000 : 3000);
+    }
+
     // ─── bootstrap ────────────────────────────────────────────────────────
     // 初始加载: 首次 sync 拉 sidebar (无 selected → timeline 为 null).
     sync();
-    setInterval(() => {
-      if (document.getElementById('auto').checked) {
-        // 交互进行中暂停刷新 (#164-3): 弹窗开启 (编辑/创建/endpoints/reveal) 或表格内
-        // 有焦点元素 (下拉展开 / focus 未blur) 时跳过本轮 tick, 避免 fetch+渲染
-        // 打断交互. 历史行为: modal 开启时也刷新, 但 renderKind 不碰 dialog 内容,
-        // 用户感知不到 — 受害者主要是后台 tbody 重建打断自动化工具引用, 现由
-        // renderKind 的 renderedHtml 短路 + 此处暂停双保险覆盖.
-        const tableDialogOpen = ['secret-form', 'provider-form', 'apikey-form',
-          'provider-endpoints', 'apikey-reveal'].some(d => document.getElementById(d)?.open);
-        if (tableDialogOpen) return;
-        const activeTab = document.querySelector('.tab-content.active')?.id;
-        // usage tab: 走独立的 5s 节流轮询 (refreshUsage 内部节流), 不进 sync 主循环.
-        if (activeTab === 'tab-usage') { refreshUsage(); return; }
-        const tableHasFocus = ['tab-secrets', 'tab-providers', 'tab-apikeys'].includes(activeTab)
-          && document.getElementById(activeTab)?.contains(document.activeElement);
-        if (tableHasFocus) return;
-        if (activeTab === 'tab-secrets') refreshSecrets();
-        else if (activeTab === 'tab-providers') refreshProviders();
-        else if (activeTab === 'tab-apikeys') refreshApiKeys();
-        else sync();
-      }
-    }, 3000);
+    // SSE 订阅 (auto-refresh 开启时) + 兜底轮询链启动.
+    if (document.getElementById('auto').checked) subscribeEvents();
+    scheduleRefreshTick();
+    // auto-refresh 开关联动 SSE: 关闭 → 断开订阅 ("用户不要刷新"语义下推送无意义,
+    // 省一条长连接); 重新开启 → 重建 (重连即对账, 见 subscribeEvents 注释).
+    // 轮询链不因开关启停 (tick 内部自检 checkbox, 关闭时为 no-op) — 与旧行为一致.
+    document.getElementById('auto').addEventListener('change', () => {
+      if (document.getElementById('auto').checked) subscribeEvents();
+      else if (es) { es.close(); es = null; sseHealthy = false; }
+    });
     // 窗口尺寸变化时重算 Response 抽屉布局 (高度依赖视口尺寸) (issue #36).
     // 用 requestAnimationFrame 节流 (state.resizeRaf 跟踪 raf 句柄), 避免 resize 高频
     // 触发 getBoundingClientRect (强制 layout).

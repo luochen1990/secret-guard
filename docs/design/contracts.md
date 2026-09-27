@@ -1089,6 +1089,15 @@ real 还原进去等于精准投放泄露. 故默认"偏安全", 暴露侧行为
 - `prop_stale_sync_diff_dropped`: 出发合法但迟到的 sync diff, 在世界切换后落地, timeline 段被丢弃, records 不被污染. 🔁→`UI-7: 在途 sync 的迟到 diff 不污染已切换的 timeline (gen 对账)` (`tests/webui/im-ui.spec.ts`)
 - `prop_rounds_append_idempotent`: 相同 new_rounds 重复 append 后 records 无重复 id. ⏳ (由 gen 对账 + Set 去重共同保证, 专项 e2e 待补)
 
+### UI-8 SSE 失效通知消费 (poke → sync, /api/sync 为 SSOT)
+
+**陈述**: SSE 事件 (`GET /api/events`, 未命名事件, data = DAG 变更计数, wire 契约见 `src/web/api/events.rs`) 是**纯触发器**: 前端 `es.onmessage` 不解析事件体, 只在 timeline 世界可刷新时 (`currentRefreshAction() === 'sync'` — records tab + auto-refresh 开启 + 无 #164-3 暂停) 经 200ms trailing debounce 触发既有 `sync()`. 数据以 `POST /api/sync` 为唯一事实来源; 事件丢失无害 — 兜底轮询吸收 (间隔随 SSE 健康度动态切换: 健康 30s / 断开 3s, 每次 tick 重读 `sseHealthy`). #164-3 暂停语义 (弹窗开启 / 表格焦点 / auto 关闭) 对 poke 与兜底 tick 同一份决策 SSOT (`currentRefreshAction`), 不存在 "poke 绕过暂停" 的旁路. auto-refresh 关闭 → 断开 SSE 订阅 (`es.close()`), 重新开启 → 重建 (EventSource 原生自动重连, 无需手动重建).
+
+**Properties**:
+- `prop_sse_poke_triggers_sync`: records tab + 无暂停时, SSE 事件到达后 200ms debounce 内触发 sync — 快于首条兜底 tick (bootstrap+3s), 事件只触发不携带数据. 🔁→`SSE poke 触发 sync (debounce 后, 3s 兜底 tick 前)` (`tests/webui/im-ui.spec.ts`)
+- `prop_sse_unavailable_degrades_to_polling`: SSE 连接持续失败 (sseHealthy 恒 false) 时兜底轮询维持 ~3s 节奏持续拉 sync (只断言 "仍在轮询", 不断言精确间隔). 🔁→`SSE 不可用时退化为轮询 (兜底 tick 持续拉 sync)` (`tests/webui/im-ui.spec.ts`)
+- `prop_sse_poke_skipped_while_dialog_open`: 弹窗开启期间到达的 poke 不触发 sync (计数冻结), 关闭后下一个 poke 恢复触发 — 证明跳过源于暂停语义而非事件流失效. 🔁→`弹窗开启时 SSE poke 不触发 sync, 关闭后恢复 (#164-3)` (`tests/webui/im-ui.spec.ts`)
+
 ---
 
 ## 11. USAGE: 模型用量统计

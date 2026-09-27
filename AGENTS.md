@@ -236,13 +236,13 @@ rationale 是不对称性: 可用性损失可重试恢复, 机密性损失不可
 2026-09 起默认全部安全侧) 是本原则的配置面; 完整陈述与 property 见
 `docs/design/contracts.md` **SEC-10**.
 
-## 前端不变量 (UI Invariants) → UI-1..UI-7 契约
+## 前端不变量 (UI Invariants) → UI-1..UI-8 契约
 
 > 以下条目是**跨 web/dag/index.html 的强不变量**, 任何渲染优化或内存重构不得违反.
 >
 > **编号映射**: AGENTS.md 的 `I*` 是 contracts.md `UI-*` 的前身 (历史编号).
 > `I1=UI-1`, `I2=UI-2`, `I3=UI-3`, `I4=UI-6 的 selectedRound 子属性`, `I5=UI-6`, `I6=UI-7`.
-> contracts.md 收录并扩展为 UI-1..UI-7, 以 contracts.md 为 SSOT; 此处保留 I* 编号便于历史 grep.
+> contracts.md 收录并扩展为 UI-1..UI-8 (UI-8 = SSE 失效通知消费), 以 contracts.md 为 SSOT; 此处保留 I* 编号便于历史 grep.
 ### I1 — 气泡数 == req_delta messages 长度
 
 会话详情页 (timeline) 渲染的 Bubble 数量, 必须等于该 Node 的 req_delta messages
@@ -473,7 +473,7 @@ v3.0 三档 (org 分级契约, 见 lc-studio/forgejo-actions README; 命名即�
 | 单元 (纯函数) | `#[test]` | `provider::tests::protocol_short_roundtrip` |
 | Property-based | `proptest` | `redact::tests::prop_round_trip_identity` |
 | 集成 (端到端) | `mockito` + `axum::serve` | `tests/integration.rs::forwards_streaming_sse` |
-| WebUI 回归 | Playwright (TypeScript) | `tests/webui/im-ui.spec.ts` (守卫前端不变量 UI-1..UI-7) |
+| WebUI 回归 | Playwright (TypeScript) | `tests/webui/im-ui.spec.ts` (守卫前端不变量 UI-1..UI-8) |
 | 性能基线 | criterion | `benches/redact.rs` (redact_ir / StreamingRestorer 3 场景) |
 | 覆盖率 | cargo-llvm-cov (LLVM source-based) | `just coverage-html` |
 
