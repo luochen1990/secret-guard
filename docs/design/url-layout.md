@@ -24,7 +24,7 @@
 | 路径 | 用途 | 挂载点 | 认证 (auth 启用时) |
 |---|---|---|---|
 | `/` | WebUI 单页 HTML | `web::router()` (`web/mod.rs`) | OIDC login_required |
-| `/api/*` | WebUI JSON API (sessions / sync / records / secrets / providers / api-keys / usage / me) | `web::router()` + `server.rs` (`/api/me`) | OIDC login_required (`/api/me` 例外: 公开) |
+| `/api/*` | WebUI JSON API (sessions / sync / events / records / secrets / providers / api-keys / usage / me) | `web::router()` + `server.rs` (`/api/me`) | OIDC login_required (`/api/me` 例外: 公开) |
 | `/login`, `/oauth2/callback`, `/logout` | OIDC 认证流程 | `server.rs` `build_router_with_auth_layers` | 公开 (login_required 之外) |
 | `/{o\|a\|g\|l\|r}/{name}` | forward, rest = `/` | `server.rs` forward_router | API key (`require_api_key` middleware) |
 | `/{o\|a\|g\|l\|r}/{name}/{*rest}` | forward, 含 sub-path | 同上 | 同上 |
@@ -91,7 +91,8 @@ forward 路由 (`/{proto}/{name}/...`) 首段必须是 proto 简写, 由
 |---|---|
 | `/api/records/{id}` | 单条 record raw/parsed view (WebUI 弹窗按需拉) |
 | `/api/sessions` [+ `/{sid}/timeline`] | 会话列表 + session-aware timeline 分页 |
-| `/api/sync` | WebUI 3s 轮询统一入口 (sidebar + timeline diff) |
+| `/api/sync` | WebUI 刷新统一入口 (sidebar + timeline diff; 消费节奏 = SSE 事件驱动 + 兜底轮询, 见 `/api/events`) |
+| `/api/events` | SSE 失效通知流 (DAG 变更计数 poke; 事件仅作 invalidation 信号, 数据以 `/api/sync` 为 SSOT — 契约 UI-8; 无 notifier 时降级为 keepalive 空流) |
 | `/api/secrets` [+ `/{id}` [+ `/decision`]] | secret CRUD + OverrideMode |
 | `/api/providers` [+ `/{id}` [+ `/decision`]] + `/probe` | provider CRUD + OverrideMode + 协议自动探测 (静态段优先于 `{id}`: POST = 探测; PUT/DELETE `/probe` = 以固定 id="probe" 适配的编辑/删除薄 wrapper, 存量 "probe" 条目由此可管理 — 新建该 id 仍在 upsert 校验层拒绝, 纯防混淆) |
 | `/api/providers/{id}/pool-reset` | pool 条目成员闹钟清空 (POST; 两段路径与 `{id}/decision` 同型, 无单段阴影) |
