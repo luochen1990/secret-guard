@@ -6411,9 +6411,12 @@
     let refreshTimer = 0;      // 兜底轮询自调度链的 setTimeout 句柄 (单例 guard).
 
     // poke → 200ms trailing debounce → sync().
-    // 为什么 trailing 200ms: 后端 250ms 节流 × N 路并发流式 → 最坏每 250ms 一记
-    // poke; trailing 窗口把连续 poke 折叠为"末次变化后"的单次 sync — 不丢更新
-    // (trailing 保证末次变化必触发) 也不放大请求 (leading 会连发).
+    // 速率不变量: sync 速率 ≤ max(poke 间隔, debounce) — 单路活跃流式 (后端
+    // PARSED_SYNC_INTERVAL = 250ms) 即 ~4/s 的连续节奏. 200ms 刻意 < 250ms:
+    // debounce ≥ poke 间隔会让 trailing 在流式期间被无限推迟 (sync 饿死) —
+    // 该饿死机制在多路并发下同样可达 (N≥2 路聚合 poke 间隔可持续 < 200ms,
+    // trailing 连续重置至出现 ≥200ms 空隙; 行为无害 — 快照式补齐无丢失,
+    // 兜底 tick 照常), 本设计最 non-obvious 的约束.
     // fire 时二次校验: 判定发生在事件到达时刻, 而 sync 在 200ms 后执行 — 窗口内
     // 弹窗开启/auto 关闭/切 tab 时放弃本次触发 (UI-8 暂停语义无 200ms 旁路).
     function scheduleSyncSoon() {
@@ -6429,11 +6432,20 @@
     // 契约见 src/web/api/events.rs 头部). EventSource 原生自动重连 (断开后浏览器
     // 默认 ~3s 重试), onerror 只更新 sseHealthy 驱动兜底间隔, 不手动重建 — 服务端
     // WatchStream 初值即推当前计数, 重连自动"对账"一轮, 重复触发 sync 幂等无害.
+    // 已知边界: 协议级致命错误 (如反代回非 event-stream 的 502) 会置 readyState=
+    // CLOSED 且浏览器不再重连, es 非 null 使订阅哑火 (直至用户 toggle
+    // auto-refresh off/on 或刷新页面重建) — 期间退化为 3s 纯轮询
+    // (旧行为, UI-8 仍满足); 主动重建自愈留给后续需要时再加.
     function subscribeEvents() {
       if (es) return;  // 单例: 已订阅则不重复建连 (防多调用点叠加长连接).
       es = new EventSource('/api/events');
       es.onopen = () => { sseHealthy = true; };
-      es.onerror = () => { sseHealthy = false; };
+      es.onerror = () => {
+        sseHealthy = false;
+        // 健康→断开转换时, 在途的 30s tick 立即降档为 3s: 不重 arm 的话首个降级
+        // tick 最长还要等 ~30s (间隔在 arm 时求值, fire 时才重读 sseHealthy).
+        if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = 0; scheduleRefreshTick(); }
+      };
       // 事件 = "DAG 变了". 只加速 timeline 世界 (records tab → sync); 其他 tab 的
       // 刷新仍由兜底 tick 分派 (SSE 事件语义只覆盖 DAG 变更, 表格数据无对应推送).
       es.onmessage = () => {
@@ -6442,9 +6454,11 @@
     }
 
     // 兜底轮询: 自调度 setTimeout 链 (替代旧 setInterval 3000), 间隔随 SSE 健康度
-    // 动态切换 — 每次 tick 重读 sseHealthy, SSE 断开/恢复无需通知轮询链:
+    // 动态切换 (fire 时重读 sseHealthy; 断开转换由 onerror 主动重 arm 立即降档):
     //   sseHealthy === true  → 30000ms: SSE 已实时推送, 轮询降级为"事件丢失对账"
-    //     兜底 (30s 吸收窗: SSE 断连但 onerror 尚未触发的极端场景也能收敛).
+    //     兜底. 30s 吸收窗已知边界: 反代缓冲吞 SSE 事件的"假健康"(onopen 成功但
+    //     onmessage 永不到达)下数据最旧 30s (tab 点击/交互仍即时刷) — 有界自愈,
+    //     满足 UI-8 "事件丢失无害", 不做 poke 活性判定 (复杂度/收益不成比例).
     //   sseHealthy === false → 3000ms: 退化为纯轮询, 与旧 setInterval 行为一致.
     // tick 内容不变 (currentRefreshAction 分派); refreshTimer 非零不重入 (单例
     // guard), 防 bootstrap 重复调用起双链.

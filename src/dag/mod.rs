@@ -719,7 +719,7 @@ impl ConversationDag {
     /// 若 node 尚无 ResponseData (流过程中尚未 attach), 自动创建一个 default 占位
     /// (resp_complete=false), 仅写 parsed 字段; 最终的 `attach_response` 会整体替换.
     ///
-    /// 两级锁 (perf, 高频路径 — 流式 ~500ms 一次): read lock + node.response.write()
+    /// 两级锁 (perf, 高频路径 — 流式 ~250ms 一次, 见 `PARSED_SYNC_INTERVAL`): read lock + node.response.write()
     /// 让并发多路流式不串行化在全局锁 (`attach_response` 因 message refcount 收口
     /// 已改持全写锁, 见其 doc; 本低频写入维持轻量两级锁).
     pub fn update_parsed_response(&self, node_id: Uuid, parsed: serde_json::Value) {
