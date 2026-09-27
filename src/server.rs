@@ -37,7 +37,8 @@
 //!
 //! # Shutdown
 //! 默认监听 SIGTERM / Ctrl-C, axum 进入 graceful shutdown 期间不再接受新连接,
-//! 已建立的连接会等到完成或超时.
+//! 已建立的连接会等到完成或超时. 信号到达时先置 shutdown flag (watch channel,
+//! 见 [`serve`] 装配) 唤醒 `/api/events` 等无限长流, 否则它们会让 drain 挂起.
 //!
 //! # 双层状态装配
 //! [`serve`] 接收 static + dynamic 两份配置, 在内部:
@@ -358,7 +359,13 @@ pub async fn serve(
     auth_config.validate().map_err(|e| anyhow::anyhow!(e))?;
 
     let upstream = build_upstream_client(upstream_timeouts.connect)?;
-    let dag = ConversationDag::new(records_capacity, 500, 1);
+    // rt-push 装配: ① DAG 变更通知 (`GET /api/events` 的数据源, 见 dag 模块
+    // "变更通知" 节) — channel 的初始 Receiver 直接 drop, 订阅者经
+    // `dag.subscribe_changes()` 从 Sender 现建; ② shutdown flag — 置 true 时
+    // SSE 等无限长流经 take_until 结束 (见下方 with_graceful_shutdown).
+    let (notify_tx, _) = tokio::sync::watch::channel(0u64);
+    let dag = ConversationDag::new(records_capacity, 500, 1).with_notifier(notify_tx);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     // 跨表共享: persist_lock 串行整个 RMW, decisions 是同一份 mutable map.
     let persist_lock = Arc::new(Mutex::new(()));
@@ -474,6 +481,7 @@ pub async fn serve(
             state_path.clone(),
             persist_lock.clone(),
         ),
+        shutdown: shutdown_rx,
     };
 
     let addr: SocketAddr = format!("{host}:{port}")
@@ -558,8 +566,14 @@ pub async fn serve(
     #[cfg(not(feature = "oidc"))]
     let auth_mode = "single-user";
     info!(%addr, %auth_mode, ?state_path, "secret-guard listening (Ctrl-C to stop)");
+    // graceful shutdown 两段: 信号到达 → 置 shutdown flag (唤醒 /api/events
+    // 等无限长流, 见 api/events.rs) → 进入 drain。不先唤醒的话, 存活的 SSE
+    // 连接会让 with_graceful_shutdown 永等 (挂起).
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            let _ = shutdown_tx.send(true);
+        })
         .await
         .context("axum serve failed")?;
     Ok(())

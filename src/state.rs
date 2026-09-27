@@ -94,6 +94,13 @@ pub struct AppState {
     /// (建议值 `CallEvent.capture_mode`), WebUI 经 `PUT /api/settings` 即时切换.
     /// 语义与持久化见 [`AuditCapture`] 文档; 装配点 `server.rs::serve`.
     pub audit_capture: AuditCapture,
+    /// graceful shutdown flag: `true` = 进程进入 shutdown. serve() 装配 (sender
+    /// 随 `with_graceful_shutdown` future 持有, 信号到达后置 true) — SSE 等无限
+    /// 长流 (`GET /api/events`) take_until 此 flag, 保证 drain 不被挂起.
+    /// 测试 fixture: 常用 `watch::channel(false).1` (sender 立即 drop → 视同
+    /// shutdown → SSE 流立即结束; 不消费 /api/events 的测试无感知, 消费它的
+    /// 专用测试持有 sender).
+    pub shutdown: tokio::sync::watch::Receiver<bool>,
 }
 
 // ─── AuditCapture 开关 (详细日志) ───────────────────────────────────────────

@@ -11,6 +11,7 @@
 //! - 转发记录被持久化.
 //! - 上游不可达时返回 502 + record 标记 incomplete.
 //! - Web UI: `/` 根路径 HTML; `/api/*` JSON.
+//! - SSE 失效通知 (`GET /api/events`): 转发 → DAG 写入 → 事件递增 (rt-push).
 
 use std::time::Duration;
 
@@ -339,6 +340,10 @@ fn base_app_state(
         audit_capture: secret_guard::state::AuditCapture::for_tests(
             secret_guard::config::AuditCaptureMode::Full,
         ),
+        // shutdown flag: sender 立即 drop → channel 关闭 → SSE 流视同 shutdown
+        // 立即结束 — 本 harness 的测试不消费 /api/events, 无感知; SSE 专用测试
+        // (spawn_proxy_with_events) 持有 sender 模拟生产装配.
+        shutdown: tokio::sync::watch::channel(false).1,
     }
 }
 
@@ -12047,4 +12052,219 @@ async fn trace_span_omits_query_string() {
         !text.contains("sk-probe-secret"),
         "span must not carry query string, got: {text}"
     );
+}
+
+// ─── RT-PUSH: SSE 失效通知 (/api/events) ────────────────────────────────────
+//
+// 端到端: 真实转发请求 (mockito 上游) → DAG 写入 → SSE 流推送递增计数.
+// keepalive (15s 空注释帧) 难以在测试窗口内断言, 不覆盖 — 间隔与注释帧形态由
+// axum KeepAlive 保证, "注释帧不触发前端 onmessage" 的语义见 api/events.rs.
+
+/// SSE 测试专用 spawn: 调用方提供 DAG (带/不带 notifier), shutdown flag 常开
+/// (返回 sender 由测试持有, 模拟生产 serve() 的 graceful-shutdown 装配 —
+/// sender 存活则 SSE 流不会因 channel 关闭而提前结束).
+async fn spawn_proxy_with_events_dag(
+    upstream_base: &str,
+    dag: ConversationDag,
+) -> (String, tokio::sync::watch::Sender<bool>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state_path = tmp_state_path("sg-state-events");
+    let decisions = std::sync::Arc::new(parking_lot::RwLock::new(
+        secret_guard::config::Decisions::default(),
+    ));
+    let persist_lock = std::sync::Arc::new(parking_lot::Mutex::new(()));
+    let provider_table = ProviderTable::with_persist_lock(
+        vec![openai_provider("oa-main", upstream_base)],
+        vec![],
+        decisions.clone(),
+        state_path.clone(),
+        persist_lock.clone(),
+    );
+    let _ = (decisions, persist_lock, state_path);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let proxy = AppState {
+        shutdown: shutdown_rx,
+        ..base_app_state(
+            reqwest::Client::new(),
+            provider_table,
+            dag,
+            test_secret_table(),
+        )
+    };
+    let app = server::build_router(
+        proxy,
+        secret_guard::server_host_guard::HostGuard::new("127.0.0.1", addr.port()),
+    );
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}"), shutdown_tx)
+}
+
+/// 从 SSE 字节流读下一帧 (以空行 "\n\n" 收尾), 返回完整帧文本.
+/// 限时 2s: 读不到帧即 panic (测试挂死劣于显式失败); `Ok(None)` = 流正常结束.
+async fn next_sse_frame<S>(stream: &mut S, buf: &mut String) -> Option<String>
+where
+    S: futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin + ?Sized,
+{
+    use futures::StreamExt as _;
+    loop {
+        if let Some(pos) = buf.find("\n\n") {
+            let frame: String = buf.drain(..pos + 2).collect();
+            return Some(frame);
+        }
+        match tokio::time::timeout(Duration::from_secs(2), stream.next()).await {
+            Ok(Some(Ok(chunk))) => buf.push_str(&String::from_utf8_lossy(&chunk)),
+            Ok(Some(Err(e))) => panic!("sse stream error: {e}"),
+            Ok(None) => return None,
+            Err(_) => panic!("timed out waiting for next SSE frame, buf={buf:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn sse_events_pushes_dag_change_counter() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"chatcmpl-1","choices":[]}"#)
+        .create_async()
+        .await;
+
+    // 带 notifier 的 DAG (生产装配形态).
+    let (notify_tx, _) = tokio::sync::watch::channel(0u64);
+    let dag = ConversationDag::new(64, 500, 1).with_notifier(notify_tx);
+    let (proxy_url, _shutdown_tx) = spawn_proxy_with_events_dag(&upstream.url(), dag).await;
+
+    // Host guard: reqwest 自动带 Host: 127.0.0.1:<port> (loopback + port 匹配, 放行).
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{proxy_url}/api/events"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    // 响应头契约: SSE content-type + NO_STORE 组 + 反代禁缓冲.
+    let h = resp.headers();
+    assert_eq!(h.get("content-type").unwrap(), "text/event-stream");
+    assert_eq!(
+        h.get("cache-control").unwrap(),
+        "no-store, no-cache, must-revalidate"
+    );
+    assert_eq!(h.get("x-accel-buffering").unwrap(), "no");
+
+    let mut stream = Box::pin(resp.bytes_stream());
+    let mut buf = String::new();
+
+    // 初值推送: 连接建立即收到当前计数 (WatchStream::new 语义, 重连自动对账).
+    let frame = next_sse_frame(&mut stream, &mut buf)
+        .await
+        .expect("initial frame");
+    assert_eq!(frame, "data: 0\n\n", "未命名事件 + data = 计数十进制");
+
+    // 触发一次真实转发: push_messages (+1) 与 attach_response (+1) 各应通知.
+    // watch "最新值" 语义下极端窗口可能合并中间值 (合并无害 — 前端幂等触发
+    // sync), 故断言 "计数到达 2 且逐帧严格递增", 不硬性要求恰好两帧.
+    let fwd = client
+        .post(format!("{proxy_url}/o/oa-main/v1/chat/completions"))
+        .body(r#"{"model":"gpt-4"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(fwd.status(), reqwest::StatusCode::OK);
+    let _ = fwd.text().await.unwrap(); // 读完响应确保 attach 已收尾
+
+    let mut last = 0u64;
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "did not see counter reach 2 in 2s"
+        );
+        let frame = next_sse_frame(&mut stream, &mut buf)
+            .await
+            .expect("frame before counter reaches 2");
+        let count: u64 = frame
+            .strip_prefix("data: ")
+            .and_then(|d| d.trim().parse().ok())
+            .unwrap_or_else(|| panic!("unexpected frame shape: {frame:?}"));
+        assert!(
+            count > last,
+            "counter must strictly increase: {last} → {count}"
+        );
+        last = count;
+        if last >= 2 {
+            break;
+        }
+    }
+}
+
+#[tokio::test]
+async fn sse_events_without_notifier_degrades_to_keepalive_stream() {
+    // 无 notifier 的 DAG (普通 fixture): 仍 200 + text/event-stream, 但无数据帧
+    // (只有 KeepAlive — 15s 间隔, 测试窗口内等不到). 断言 300ms 内零帧到达.
+    let dag = ConversationDag::new(64, 500, 1);
+    // base_url 指向不可达地址即可: 本测试无转发, provider 仅满足路由装配.
+    let (proxy_url, _shutdown_tx) = spawn_proxy_with_events_dag("http://127.0.0.1:9", dag).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{proxy_url}/api/events"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "text/event-stream"
+    );
+
+    let mut stream = Box::pin(resp.bytes_stream());
+    use futures::StreamExt as _;
+    let tried = tokio::time::timeout(Duration::from_millis(300), stream.next()).await;
+    assert!(
+        tried.is_err(),
+        "无 notifier 的流不应推送任何数据帧 (仅 KeepAlive, 15s 间隔)"
+    );
+}
+
+#[tokio::test]
+async fn sse_events_stream_ends_on_shutdown_flag() {
+    // graceful shutdown 语义: shutdown flag 置 true → SSE 流立即结束 (服务端
+    // 正常收尾, 客户端读到 EOF), 不等 KeepAlive 间隔 — 这是
+    // with_graceful_shutdown 不被无限 SSE 流挂起的守卫 (模块文档 §生命周期
+    // 路径 a). 覆盖 "连接建立后 flag 才置位" 的主路径; "连接建立前已置位"
+    // 由 shutdown_once 的 wait_for (而非 changed) 实现保证, 见其注释.
+    let (notify_tx, _) = tokio::sync::watch::channel(0u64);
+    let dag = ConversationDag::new(64, 500, 1).with_notifier(notify_tx);
+    let (proxy_url, shutdown_tx) = spawn_proxy_with_events_dag("http://127.0.0.1:9", dag).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{proxy_url}/api/events"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let mut stream = Box::pin(resp.bytes_stream());
+    let mut buf = String::new();
+    let frame = next_sse_frame(&mut stream, &mut buf)
+        .await
+        .expect("initial frame");
+    assert_eq!(frame, "data: 0\n\n");
+
+    shutdown_tx.send(true).unwrap();
+    // 限时等流结束: next_sse_frame Ok(None) = EOF (服务端收尾), 超时即失败
+    // (drain 挂起风险回归为显式红灯).
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "SSE stream did not end within 2s after shutdown flag"
+        );
+        if next_sse_frame(&mut stream, &mut buf).await.is_none() {
+            break; // EOF — 流被 shutdown flag 终止
+        }
+    }
 }

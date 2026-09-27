@@ -1485,6 +1485,9 @@ async fn spawn_full_auth_router(secure_cookie: bool) -> (MockIdp, String) {
         audit_capture: secret_guard::state::AuditCapture::for_tests(
             secret_guard::config::AuditCaptureMode::Full,
         ),
+        // shutdown flag: 本 harness 不消费 /api/events (sender drop 语义见
+        // integration.rs::base_app_state 同字段注释).
+        shutdown: tokio::sync::watch::channel(false).1,
     };
 
     // 与生产 serve() 同构: 先 bind listener 拿到实际 port, 再用该 port 构造

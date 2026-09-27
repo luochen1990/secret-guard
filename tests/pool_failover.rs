@@ -75,6 +75,9 @@ fn base_app_state(
         audit_capture: secret_guard::state::AuditCapture::for_tests(
             secret_guard::config::AuditCaptureMode::Full,
         ),
+        // shutdown flag: 本 harness 不消费 /api/events (sender drop 语义见
+        // integration.rs::base_app_state 同字段注释).
+        shutdown: tokio::sync::watch::channel(false).1,
     }
 }
 

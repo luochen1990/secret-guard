@@ -34,6 +34,7 @@
 pub(crate) mod apikeys;
 pub(crate) mod crud;
 pub(crate) mod error;
+pub(crate) mod events;
 pub(crate) mod providers;
 pub(crate) mod records;
 pub(crate) mod secrets;
@@ -43,6 +44,7 @@ pub(crate) mod usage;
 
 // handler re-export: 保持 `web::api::<handler>` 路径稳定 (web/mod.rs router 直接引用).
 pub use apikeys::{create_api_key, delete_api_key, list_api_keys, toggle_api_key};
+pub use events::events;
 pub use providers::{
     create_provider, delete_provider, delete_provider_probe, list_providers, pool_reset,
     probe_provider, provider_models, set_provider_decision, update_provider, update_provider_probe,

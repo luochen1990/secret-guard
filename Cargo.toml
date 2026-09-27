@@ -62,7 +62,10 @@ reqwest = { version = "0.12", default-features = false, features = [
   "deflate",
 ] }
 tokio = { version = "1", features = ["full"] }
-tokio-stream = "0.1"
+# "sync" feature: 启用 wrappers::WatchStream (GET /api/events 的 SSE 失效通知
+# 流消费 DAG watch 计数, rt-push). 只 gate tokio-stream 自身的 wrapper 模块,
+# 不新增构建图 crate (tokio/sync 已由 tokio full 开启).
+tokio-stream = { version = "0.1", features = ["sync"] }
 tower-http = { version = "0.7", features = ["trace"] }
 # serde "rc" 显式开启: dag/web 的 DTO 持有 Arc<str> / Arc<[(String,String)]> 并
 # derive Serialize — 依赖 serde 的 rc feature. 历史上由 tower-sessions 等旧必选
