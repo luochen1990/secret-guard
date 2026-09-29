@@ -122,10 +122,14 @@ normalize(v) == normalize(Writer(Reader(v)))
   reasoning_content 三路径对称 + 显式空/null 形态 (#176, `reasoning_content_form`) /
   system 字段形态 + message/tool/block 级未建模字段 (L4/L5, #269) / is_error 显式形态 (#269)
 - ⏸️ 搁置 (待后续): 多 system messages 合并 (L2, **OpenAI/Responses codec 侧仍提升** —
-  Anthropic 已按位保留) / usage 字段位置与计算 (L8, response 路径)
+  Anthropic 已按位保留) / usage 字段位置 (L8, **Anthropic response 路径** — 顶层
+  input_tokens vs usage.input_tokens)
+- ✅ L8 的 OpenAI response 半面已消除 (#284): usage `prompt_tokens_details.cached_tokens`
+  双向保真 (reader 归一化 + writer 写回), input 总和收敛 `openai_prompt_tokens` SSOT;
+  `openai_response_preserves_wire_semantics` property 已转正常驻
 
 搁置项对应的 proptest 生成器分支已用 `// NOTE` 标注, 实现后恢复即可.
-response 路径的 2 个 property 标了 `#[ignore]`, 实现 L8 后启用.
+response 路径的 1 个 property (Anthropic) 标了 `#[ignore]`, 实现 L8 后启用.
 
 **已知边界 — Anthropic messages[] 内 role=system 条目 (2026-09-23 修正, #269)**: 该形态
 (中途 system 消息, claude code 实测发送 billing header / 消息级 effort 切换) 是**官方已正式

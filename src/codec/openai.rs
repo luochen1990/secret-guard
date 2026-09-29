@@ -2113,6 +2113,34 @@ mod tests {
     }
 
     #[test]
+    fn writer_message_delta_usage_writes_cache_details() {
+        // 流式 chunk 与非流式 write_response 共用 openai_usage_json (#284):
+        // 总和含 cache_creation + cache_read 经 details.cached_tokens 上 wire.
+        let ev = IrStreamEvent::MessageDelta {
+            stop_reason: None,
+            stop_sequence: None,
+            usage: IrUsage {
+                input_tokens: 100,
+                output_tokens: 10,
+                cache_read_input_tokens: Some(50),
+                cache_creation_input_tokens: Some(30),
+            },
+            usage_present: true,
+        };
+        let mut frames = writer().write_response_event(&ev, &mut StreamEncodeState::default());
+        assert_eq!(frames.len(), 1, "should emit exactly one chunk");
+        let (_, chunk) = frames.remove(0);
+        let usage = chunk.get("usage").expect("usage must be present");
+        assert_eq!(usage.get("prompt_tokens").unwrap(), 180);
+        assert_eq!(
+            usage
+                .get("prompt_tokens_details")
+                .and_then(|d| d.get("cached_tokens")),
+            Some(&json!(50))
+        );
+    }
+
+    #[test]
     fn writer_message_delta_with_no_usage_no_stop_reason_is_skipped() {
         // 空 delta + 无 usage: writer 跳过 (返回空 Vec).
         let ev = IrStreamEvent::MessageDelta {

@@ -10,7 +10,7 @@
 //!   (字段顺序可能不同; 空文本块 / 空 content 等价性可能轻微变化, 但对 LLM 而言无差异).
 //!   不追求严格 byte-exact (字段顺序 / 空字符串归一化可能让 wire 字节略变).
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 // ─── 请求侧 ────────────────────────────────────────────────────────────────
 
@@ -544,17 +544,31 @@ impl IrUsage {
             .saturating_add(self.cache_creation_input_tokens.unwrap_or(0))
     }
 
-    /// 序列化为 OpenAI wire 格式的 `usage` 对象 (`{prompt_tokens, completion_tokens, total_tokens}`).
+    /// 序列化为 OpenAI wire 格式的 `usage` 对象.
     ///
     /// 单一事实来源: 非流式响应与流式 MessageDelta 都用同一个 wire 形态,
-    /// 集中在此避免两处手写 JSON shape (新增字段如 `prompt_tokens_details` 时只改一处).
+    /// 集中在此避免两处手写 JSON shape (新增字段时只改此处).
+    /// `prompt_tokens` 总和经 [`IrUsage::openai_prompt_tokens`] (SSOT, 禁止手算);
+    /// `cache_read` 经 `prompt_tokens_details.cached_tokens` 写回 (#284) — 条件写
+    /// 判据与 Anthropic writer 的双 cache 字段一致 (`Some` 即写, 含 `Some(0)`,
+    /// 保持 round-trip presence 保真); `cache_creation` 无 OpenAI 对应字段,
+    /// 只计入总和.
     pub fn openai_usage_json(&self) -> Value {
         let prompt_tokens = self.openai_prompt_tokens();
-        json!({
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": self.output_tokens,
-            "total_tokens": prompt_tokens.saturating_add(self.output_tokens),
-        })
+        let mut obj = Map::new();
+        obj.insert("prompt_tokens".to_string(), json!(prompt_tokens));
+        obj.insert("completion_tokens".to_string(), json!(self.output_tokens));
+        obj.insert(
+            "total_tokens".to_string(),
+            json!(prompt_tokens.saturating_add(self.output_tokens)),
+        );
+        if let Some(cached) = self.cache_read_input_tokens {
+            obj.insert(
+                "prompt_tokens_details".to_string(),
+                json!({ "cached_tokens": cached }),
+            );
+        }
+        Value::Object(obj)
     }
 }
 
@@ -945,5 +959,28 @@ mod tests {
             ..Default::default()
         };
         assert!(!u.is_zero());
+    }
+
+    // ─── IrUsage::openai_usage_json: cache 归类 (#284) ──────────────────
+    //
+    // B3b 回归: cache_read 经 prompt_tokens_details.cached_tokens 上 wire;
+    // 总和口径由 openai_prompt_tokens SSOT 保证 (对照断言).
+
+    #[test]
+    fn openai_usage_json_writes_cached_tokens_details() {
+        let u = IrUsage {
+            input_tokens: 100,
+            output_tokens: 10,
+            cache_read_input_tokens: Some(50),
+            cache_creation_input_tokens: Some(30),
+        };
+        let v = u.openai_usage_json();
+        assert_eq!(v.get("prompt_tokens"), Some(&json!(180)));
+        assert_eq!(
+            v.get("prompt_tokens_details")
+                .and_then(|d| d.get("cached_tokens")),
+            Some(&json!(50)),
+            "缺 prompt_tokens_details.cached_tokens (cache_read 不上 wire)"
+        );
     }
 }

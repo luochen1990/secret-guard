@@ -98,10 +98,10 @@ proptest! {
 
     /// FWD-2 (OpenAI 响应): wire → IR → wire' 语义保留.
     ///
-    /// 当前已知失败: L8 (usage `prompt_tokens_details.cached_tokens` 丢失).
-    /// 等 IrUsage 增加 extra 字段后启用.
+    /// usage `prompt_tokens_details.cached_tokens` 已双向保真 (#284 — IrUsage 走
+    /// first-class `cache_read_input_tokens` 路线而非 extra, L8 的 OpenAI response
+    /// 半面消除, 本 property 转正常驻).
     #[test]
-    #[ignore = "L8: usage prompt_tokens_details 字段丢失, 待 IrUsage.extra 实现"]
     fn openai_response_preserves_wire_semantics(v in arb_openai_response_value()) {
         let ir = OpenAiReader.read_response(&v).unwrap();
         let out = OpenAiWriter.write_response(&ir);
@@ -361,17 +361,19 @@ fn arb_openai_response_choice() -> impl Strategy<Value = Value> {
         })
 }
 
-/// L8: usage details 字段.
+/// L8: usage details 字段. cached 维度三形态 — 缺席 / `cached_tokens: 0` /
+/// `cached_tokens: n>0` — 显式生成 0 值形态是 presence 保真轴 (#284 review 裁决):
+/// writer 对 `Some(0)` 写回 `cached_tokens: 0` (而非坍缩为无 details 键) 的行为
+/// 必须被 round-trip 断言覆盖, 防止未来被 "简化" 为 `if c > 0` 静默回退.
 fn arb_openai_usage() -> impl Strategy<Value = Value> {
     (
         0u32..1_000_000,
         0u32..1_000_000,
-        prop::option::of(0u32..1_000_000),
+        prop::option::of(prop_oneof![Just(0u32), 1u32..1_000_000]),
     )
         .prop_map(|(prompt, completion, cached)| {
             let mut usage = serde_json::Map::new();
-            let cached = cached.unwrap_or(0);
-            let prompt = prompt.max(cached); // prompt >= cached
+            let prompt = prompt.max(cached.unwrap_or(0)); // prompt >= cached
             usage.insert("prompt_tokens".to_string(), json!(prompt));
             usage.insert("completion_tokens".to_string(), json!(completion));
             // saturating_add 避免生成器自身溢出 panic
@@ -379,7 +381,7 @@ fn arb_openai_usage() -> impl Strategy<Value = Value> {
                 "total_tokens".to_string(),
                 json!(prompt.saturating_add(completion)),
             );
-            if cached > 0 {
+            if let Some(cached) = cached {
                 usage.insert(
                     "prompt_tokens_details".to_string(),
                     json!({

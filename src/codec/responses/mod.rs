@@ -1035,13 +1035,28 @@ fn write_status(reason: Option<IrStopReason>) -> Value {
 }
 
 /// IR usage → Responses 风格 usage JSON ({input_tokens, output_tokens, total_tokens}).
+///
+/// `input_tokens` 与 OpenAI `prompt_tokens` 同语义 (含 cached 总和), 总和复用
+/// [`IrUsage::openai_prompt_tokens`] SSOT (#284 修复前手算漏加 cache_creation);
+/// `cache_read` 经 `input_tokens_details.cached_tokens` 写回 — 条件写判据与
+/// Anthropic writer 的双 cache 字段一致 (`Some` 即写); `cache_creation` 无
+/// Responses 对应字段, 只计入总和.
 fn responses_usage_json(u: &IrUsage) -> Value {
-    let input_total = u.input_tokens + u.cache_read_input_tokens.unwrap_or(0);
-    json!({
-        "input_tokens": input_total,
-        "output_tokens": u.output_tokens,
-        "total_tokens": input_total + u.output_tokens,
-    })
+    let input_total = u.openai_prompt_tokens();
+    let mut obj = Map::new();
+    obj.insert("input_tokens".to_string(), json!(input_total));
+    obj.insert("output_tokens".to_string(), json!(u.output_tokens));
+    obj.insert(
+        "total_tokens".to_string(),
+        json!(input_total.saturating_add(u.output_tokens)),
+    );
+    if let Some(cached) = u.cache_read_input_tokens {
+        obj.insert(
+            "input_tokens_details".to_string(),
+            json!({ "cached_tokens": cached }),
+        );
+    }
+    Value::Object(obj)
 }
 
 /// usage 呈现值 (非流式 `write_response` 与流式终止事件共用 SSOT):
@@ -1349,6 +1364,62 @@ mod tests {
         let ir = reader().read_response(&body).unwrap();
         assert_eq!(ir.usage.input_tokens, 70); // 100 - 30
         assert_eq!(ir.usage.cache_read_input_tokens, Some(30));
+    }
+
+    // ─── responses_usage_json: cache 归类 (#284) ────────────────────────
+    //
+    // B3a 回归: input 总和含 cache_creation (SSOT = IrUsage::openai_prompt_tokens,
+    // 手算漂移正是根因) + cache_read 经 input_tokens_details.cached_tokens 上 wire.
+
+    #[test]
+    fn responses_usage_input_total_includes_cache_creation() {
+        let u = IrUsage {
+            input_tokens: 100,
+            output_tokens: 10,
+            cache_read_input_tokens: Some(50),
+            cache_creation_input_tokens: Some(30),
+        };
+        let v = responses_usage_json(&u);
+        assert_eq!(
+            v.get("input_tokens"),
+            Some(&json!(180)),
+            "input_tokens 漏加 cache_creation (期望 100+50+30=180)"
+        );
+        assert_eq!(
+            v.get("input_tokens_details")
+                .and_then(|d| d.get("cached_tokens")),
+            Some(&json!(50)),
+            "缺 input_tokens_details.cached_tokens (cache_read 不上 wire)"
+        );
+    }
+
+    // 一致性守卫 (#284 长期避免机制): 两个 usage 序列化函数对同一 IrUsage 的
+    // input 总和与 details.cached_tokens 必须一致 — writer 手算 cache 加法被禁止,
+    // 总和口径只能经 openai_prompt_tokens SSOT.
+    #[test]
+    fn usage_json_serializations_agree_on_input_total_and_cached_details() {
+        let u = IrUsage {
+            input_tokens: 100,
+            output_tokens: 10,
+            cache_read_input_tokens: Some(50),
+            cache_creation_input_tokens: Some(30),
+        };
+        let openai = u.openai_usage_json();
+        let responses = responses_usage_json(&u);
+        assert_eq!(
+            openai.get("prompt_tokens"),
+            responses.get("input_tokens"),
+            "OpenAI prompt_tokens 与 Responses input_tokens 总和口径漂移"
+        );
+        assert_eq!(
+            openai
+                .get("prompt_tokens_details")
+                .and_then(|d| d.get("cached_tokens")),
+            responses
+                .get("input_tokens_details")
+                .and_then(|d| d.get("cached_tokens")),
+            "两协议 details.cached_tokens 漂移"
+        );
     }
 
     // ─── write_request ─────────────────────────────────────────────────
