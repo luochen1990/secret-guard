@@ -188,6 +188,9 @@ impl Reader for ResponsesReader {
             tools,
             tools_present,
             max_tokens,
+            // max_tokens_form 是 OpenAI Chat 双读别名的 wire 形态元数据, Responses
+            // 单字段 (max_output_tokens) 无名可记 (writer 不消费).
+            max_tokens_form: None,
             temperature,
             top_p,
             top_k: None, // Responses 无 top_k

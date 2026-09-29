@@ -10,12 +10,13 @@
 //!
 //! - `system` 消息在 `messages[].role=="system"` 中, 可出现在任意位置 (reader 提升到 [`IrRequest::system`]).
 //! - assistant 的工具调用在 `tool_calls[]` 顶层字段 (不在 content 里); tool 结果在独立 `role:"tool"` 消息中.
-//! - `max_tokens` 和 `max_completion_tokens` 都映射到 [`IrRequest::max_tokens`] (后者是 o1/o3 reasoning 模型用).
+//! - `max_tokens` 和 `max_completion_tokens` 都映射到 [`IrRequest::max_tokens`] (后者是 o1/o3 reasoning 模型用),
+//!   来源字段名记入 [`IrRequest::max_tokens_form`], writer 按原字段名回写 (#283).
 //! - 流式 chunk `choices[0].delta` 是 flat 的 (text / tool_calls / reasoning_content 同时可能出现), 需要 [`StreamDecodeState`] 合成 block 边界.
 
 use serde_json::{Map, Value, json};
 
-use super::ir::{ContentForm, ReasoningContentForm, StopForm};
+use super::ir::{ContentForm, MaxTokensForm, ReasoningContentForm, StopForm};
 use super::{
     IrBlock, IrBlockMeta, IrDelta, IrError, IrImageSource, IrMessage, IrRequest, IrResponse,
     IrRole, IrStopReason, IrStreamEvent, IrTool, IrToolChoice, IrUsage, Reader, Writer,
@@ -159,12 +160,24 @@ impl Reader for OpenAiReader {
         // sampling 参数.
         let temperature = obj.get("temperature").and_then(Value::as_f64);
         let top_p = obj.get("top_p").and_then(Value::as_f64);
-        let max_tokens = obj
+        // 双读别名 (#283): max_tokens 优先, 字段选择后解析 (存在但非法不回退到别名),
+        // 来源字段名记入 form — writer 按原字段名回写, o-series 上游拒收改写.
+        let max_tokens_entry = obj
             .get("max_tokens")
-            .or_else(|| obj.get("max_completion_tokens"))
-            .and_then(Value::as_u64)
-            .and_then(|n| u32::try_from(n).ok())
-            .filter(|&n| n > 0);
+            .map(|v| (v, MaxTokensForm::MaxTokens))
+            .or_else(|| {
+                obj.get("max_completion_tokens")
+                    .map(|v| (v, MaxTokensForm::MaxCompletionTokens))
+            });
+        let (max_tokens, max_tokens_form) = match max_tokens_entry {
+            Some((v, form)) => (
+                v.as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .filter(|&n| n > 0),
+                Some(form),
+            ),
+            None => (None, None),
+        };
         let stop = super::ir::read_stop_sequences(obj.get("stop"));
         // L7 保真: 记录 stop 原始形态 (string / array). 区分 "stop":"" / "stop":[] 与缺失.
         let stop_form = StopForm::classify(obj.get("stop"));
@@ -209,6 +222,7 @@ impl Reader for OpenAiReader {
             tools,
             tools_present,
             max_tokens,
+            max_tokens_form,
             temperature,
             top_p,
             top_k: None, // OpenAI 没有 top_k
@@ -369,7 +383,13 @@ impl Writer for OpenAiWriter {
         out.insert("messages".to_string(), Value::Array(messages));
 
         if let Some(t) = req.max_tokens {
-            out.insert("max_tokens".to_string(), json!(t));
+            // 字段名保真 (#283): 按来源字段名回写; form 缺省 (跨协议 / 内部构造)
+            // 写默认 max_tokens (o-series 模型名嗅探待裁决, 见 known-limitations).
+            let key = match req.max_tokens_form {
+                Some(MaxTokensForm::MaxCompletionTokens) => "max_completion_tokens",
+                Some(MaxTokensForm::MaxTokens) | None => "max_tokens",
+            };
+            out.insert(key.to_string(), json!(t));
         }
         if let Some(t) = req.temperature {
             out.insert("temperature".to_string(), json!(t));
@@ -1459,6 +1479,70 @@ mod tests {
         });
         let ir = reader().read_request(&body).unwrap();
         assert_eq!(ir.max_tokens, Some(1000));
+    }
+
+    // ─── max_tokens 字段名别名保真 (#283) ────────────────────────────────
+
+    #[test]
+    fn max_completion_tokens_field_name_round_trip() {
+        // o-series 模型要求 max_completion_tokens 字段名; 官方 OpenAI 对 o-series
+        // 拒收 max_tokens (400 "Unsupported parameter"). 同协议 redact round-trip
+        // (reader→writer) 不得改写字段名 — 字段名是 wire 形态的一部分 (FWD-1).
+        let body = json!({
+            "model": "o3",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_completion_tokens": 100,
+        });
+        let ir = reader().read_request(&body).unwrap();
+        assert_eq!(ir.max_tokens, Some(100));
+        let out = writer().write_request(&ir);
+        assert_eq!(out.get("max_completion_tokens"), Some(&json!(100)));
+        assert!(
+            out.get("max_tokens").is_none(),
+            "o-series 上游拒收 max_tokens, 字段名不得改写: {out}"
+        );
+    }
+
+    #[test]
+    fn read_request_max_tokens_form_records_source_field() {
+        // reader 双读的两个来源字段各自记录 form; 两字段都缺席时 form 为 None
+        // (与 stop_form 同型: 形态元数据缺失 = writer 用协议默认).
+        let mk = |field: &str| {
+            json!({
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "x"}],
+                field: 50,
+            })
+        };
+        let ir = reader().read_request(&mk("max_tokens")).unwrap();
+        assert_eq!(ir.max_tokens_form, Some(MaxTokensForm::MaxTokens));
+        let ir = reader().read_request(&mk("max_completion_tokens")).unwrap();
+        assert_eq!(ir.max_tokens_form, Some(MaxTokensForm::MaxCompletionTokens));
+        let ir = reader()
+            .read_request(&json!({
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "x"}],
+            }))
+            .unwrap();
+        assert_eq!(ir.max_tokens_form, None);
+    }
+
+    #[test]
+    fn write_request_max_tokens_form_default_writes_max_tokens() {
+        // form 缺省 (跨协议 / 内部构造) 时 writer 写默认 max_tokens —
+        // 已裁决: 不做 o-series 模型名嗅探, 跨协议 egress 恒 max_tokens.
+        let mut ir = reader()
+            .read_request(&json!({
+                "model": "o3",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_completion_tokens": 100,
+            }))
+            .unwrap();
+        // 模拟跨协议路径: clear_wire_fidelity 清掉 ingress 字段名形态.
+        ir.clear_wire_fidelity();
+        let out = writer().write_request(&ir);
+        assert_eq!(out.get("max_tokens"), Some(&json!(100)));
+        assert!(out.get("max_completion_tokens").is_none());
     }
 
     #[test]

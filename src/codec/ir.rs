@@ -35,6 +35,16 @@ pub struct IrRequest {
     pub system_form: Option<SystemForm>,
     /// 最大输出 token 数. OpenAI 可选, Anthropic 必填.
     pub max_tokens: Option<u32>,
+    /// wire 形态元数据: `max_tokens` 值的来源字段名 (OpenAI 双读别名, #283).
+    /// - `None`: 缺失 / 跨协议路径 / 内部构造 (writer 写默认 `max_tokens`)
+    /// - `Some(MaxTokensForm::MaxTokens)`: 原始 wire 用 `max_tokens`
+    /// - `Some(MaxTokensForm::MaxCompletionTokens)`: 原始 wire 用
+    ///   `max_completion_tokens` (o-series reasoning 模型字段; 官方 OpenAI 对
+    ///   o-series 拒收 `max_tokens`, 字段名改写即 400)
+    ///
+    /// 仅 OpenAI codec 填充 (Responses/Anthropic 单字段无名可记); 跨协议翻译前清空
+    /// (egress 恒写 `max_tokens`, o-series 检测待裁决 — known-limitations codec 节).
+    pub max_tokens_form: Option<MaxTokensForm>,
     /// 采样温度. JSON 数字是 f64, 用 f64 避免 0.7→0.699999988 的精度损失.
     pub temperature: Option<f64>,
     /// nucleus sampling 截止. 两个协议都有.
@@ -77,6 +87,7 @@ impl IrRequest {
         self.stop_form = None;
         self.tools_present = false;
         self.system_form = None;
+        self.max_tokens_form = None;
         // 顶层 system blocks 的 extra 同样清空 (#269 评审补充): Anthropic 顶层
         // system 数组的 block 可携带 cache_control, 跨协议时不得泄漏进 egress wire.
         clear_block_extras(&mut self.system);
@@ -285,6 +296,18 @@ impl StopForm {
             _ => None,
         }
     }
+}
+
+/// wire 中 max_tokens 值的来源字段名 (OpenAI 双读别名). 用于同协议 round-trip 时
+/// 保留字段名 (`max_tokens` / `max_completion_tokens`, #283) — o-series 上游对
+/// 字段名敏感, 改写即 400. 与 `StopForm` 不同, 形态由**键名**区分 (值恒为数字),
+/// 故无 `classify` (按值推断) — 由 OpenAI reader 双读处内联记录.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaxTokensForm {
+    /// `"max_tokens": N`
+    MaxTokens,
+    /// `"max_completion_tokens": N` (o-series reasoning 模型字段)
+    MaxCompletionTokens,
 }
 
 /// wire 中 Anthropic 顶层 `system` 字段的原始形态 (L1 同型保真, #269).

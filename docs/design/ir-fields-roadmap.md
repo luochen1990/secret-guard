@@ -173,6 +173,11 @@ secret-guard 的 IR (中间表示) 有一个 `extra: Map<String, Value>` 字段�
 
 共 15 个语义槽位, IR 现状已正确建模.
 
+> `max_tokens` 写侧别名保真 (#283): OpenAI reader 双读 `max_tokens` / `max_completion_tokens`,
+> 来源字段名记入 `IrRequest.max_tokens_form` (wire-fidelity form 家族, 同型 `stop_form`),
+> 同协议 writer 按原字段名回写 (o-series 上游拒收 `max_tokens`); 跨协议 egress 恒写
+> `max_tokens` (o-series 嗅探待裁决, 见 known-limitations codec 节).
+
 ## 4. 使用频率数据 (优先级依据)
 
 > 来源: 真实运行服务 (10 sessions / 54 records, 100% OpenAI 协议) + 测试 fixture 扫描 (16 个 .rs 文件).

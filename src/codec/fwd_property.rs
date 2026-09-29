@@ -141,11 +141,12 @@ proptest! {
 /// - L6 tool_use input 嵌套 JSON
 /// - L7 stop string vs array
 /// - L8 usage details (不在请求里, 不覆盖)
+/// - max_tokens 双读别名字段名 (max_tokens / max_completion_tokens, #283)
 fn arb_openai_request_value() -> impl Strategy<Value = Value> {
     (
         arb_model_name(),
         arb_openai_messages(1..5),
-        arb_max_tokens_opt(),
+        arb_openai_max_tokens_field(),
         arb_temperature_opt(),
         arb_stop_opt(), // L7
         arb_tools_opt(0..3),
@@ -156,8 +157,8 @@ fn arb_openai_request_value() -> impl Strategy<Value = Value> {
                 let mut req = serde_json::Map::new();
                 req.insert("model".to_string(), json!(model));
                 req.insert("messages".to_string(), Value::Array(messages));
-                if let Some(mt) = max_tokens {
-                    req.insert("max_tokens".to_string(), json!(mt));
+                if let Some((field, mt)) = max_tokens {
+                    req.insert(field.to_string(), json!(mt));
                 }
                 if let Some(t) = temperature {
                     req.insert("temperature".to_string(), json!(t));
@@ -796,6 +797,15 @@ fn arb_model_name() -> impl Strategy<Value = String> {
 
 fn arb_max_tokens_opt() -> impl Strategy<Value = Option<u32>> {
     prop::option::of(1u32..8000)
+}
+
+/// OpenAI 的 max_tokens 双读别名字段名 (#283): 二选一 (normalize 不做键名改写,
+/// FWD-2 round-trip 必须按原字段名回写才相等). Anthropic 单字段, 不用此轴.
+fn arb_openai_max_tokens_field() -> impl Strategy<Value = Option<(&'static str, u32)>> {
+    prop::option::of((
+        prop_oneof![Just("max_tokens"), Just("max_completion_tokens")],
+        1u32..8000,
+    ))
 }
 
 fn arb_temperature_opt() -> impl Strategy<Value = Option<f64>> {

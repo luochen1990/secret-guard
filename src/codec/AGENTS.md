@@ -106,6 +106,7 @@ normalize(v) == normalize(Writer(Reader(v)))
 | `IrRequest.stop_form: Option<StopForm>` | ir.rs | stop 字段形态 (String/Array), 区分 `"stop":"x"` vs `"stop":["x"]` |
 | `IrRequest.tools_present: bool` | ir.rs | tools 字段是否存在 (区分 `"tools":[]` vs 缺失) |
 | `IrRequest.system_form: Option<SystemForm>` | ir.rs | Anthropic 顶层 system 字段形态 (String/Array), 单 block array 不折叠 (#269) |
+| `IrRequest.max_tokens_form: Option<MaxTokensForm>` | ir.rs | max_tokens 值来源字段名 (`max_tokens`/`max_completion_tokens` 双读别名, #283), 同协议 writer 按原字段名回写 (o-series 拒收改写); 仅 OpenAI codec 填充 |
 | `IrMessage.content_form: Option<ContentForm>` | ir.rs | message content 形态 (String/Array/Null) |
 | `IrMessage.reasoning_content_form: Option<ReasoningContentForm>` | ir.rs | assistant 消息 `reasoning_content` 显式空/null 形态 (#176), 区分 `""`/`null` vs 缺失 |
 | `IrBlock::ToolResult.content_form: Option<ContentForm>` | ir.rs | tool_result 内 content 形态 (Anthropic 特有) |
@@ -120,7 +121,8 @@ normalize(v) == normalize(Writer(Reader(v)))
 
 - ✅ 已覆盖 (request): content 形态 (L1) / stop 形态 (L7) / tools 显式空 (L6) / tool_use input round-trip / 裸 string content part /
   reasoning_content 三路径对称 + 显式空/null 形态 (#176, `reasoning_content_form`) /
-  system 字段形态 + message/tool/block 级未建模字段 (L4/L5, #269) / is_error 显式形态 (#269)
+  system 字段形态 + message/tool/block 级未建模字段 (L4/L5, #269) / is_error 显式形态 (#269) /
+  max_tokens 双读别名字段名 (#283, `max_tokens_form`)
 - ⏸️ 搁置 (待后续): 多 system messages 合并 (L2, **OpenAI/Responses codec 侧仍提升** —
   Anthropic 已按位保留) / usage 字段位置 (L8, **Anthropic response 路径** — 顶层
   input_tokens vs usage.input_tokens)
