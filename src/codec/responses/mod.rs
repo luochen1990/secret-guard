@@ -63,7 +63,6 @@ use super::ir::{
 use super::{
     IrError, IrStopReason, IrTool, IrToolChoice, IrUsage, Reader, Writer, blocks_to_text,
     collect_extra, current_epoch, image_source_to_url, input_to_string, random_base62,
-    tool_result_content_text,
 };
 
 // ─── Reader ────────────────────────────────────────────────────────────────
@@ -933,8 +932,9 @@ fn write_input_items(msg: &IrMessage) -> Vec<Value> {
                             }));
                             content_parts.clear();
                         }
-                        // T8: 媒体块丢弃的 WARN 在 helper 内 (SSOT).
-                        let text = tool_result_content_text(content);
+                        // function_call_output 的 output 只承载文本 — 非 Text 块
+                        // (Image 等媒体) 折叠丢弃, WARN 在 proxy egress 写出点 (T8).
+                        let text = blocks_to_text(content);
                         let output_val = if is_error.unwrap_or(false) {
                             json!(format!("[error] {text}"))
                         } else {

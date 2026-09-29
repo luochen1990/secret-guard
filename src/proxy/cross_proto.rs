@@ -30,6 +30,7 @@ use super::auth::ANTHROPIC_VERSION;
 use super::auth::apply_provider_auth;
 use super::helpers::{
     build_response_headers, is_streaming, redact_headers, sanitize_request_headers, utf8_view,
+    warn_tool_result_media_drop,
 };
 #[cfg(feature = "consistency-check")]
 use super::recorder::assert_resp_parsed_matches_source_nonstream;
@@ -242,6 +243,9 @@ pub(crate) async fn cross_proto_forward(
             "dropping reasoning block(s) from request history in cross-protocol translation"
         );
     }
+    // T8: tool_result 媒体丢弃 — egress 为折叠型 (o/r) 时 per-request 聚合一条
+    // (统计 SSOT 在 codec::dropped_tool_result_media, 语义与 rationale 见 helper doc).
+    warn_tool_result_media_drop(record_id, egress_codec, &ir);
 
     debug!(
         %record_id,

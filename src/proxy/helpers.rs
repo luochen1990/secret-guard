@@ -292,6 +292,38 @@ fn is_sensitive_header(name: &str) -> bool {
 
 // ─── parse-失败 fallback 可观测性 (#158 + RED-8, fan_out / cross_proto 共享) ──
 
+/// T8: tool_result 媒体丢弃 WARN (cross_proto / same_proto 的 **egress 写出点**
+/// 共享, record_id 就位后调用 — 模式对齐 cross_proto 的 reasoning 丢弃 WARN).
+///
+/// 丢弃语义: egress 为折叠型 (OpenAI / Responses — tool 载体只承载文本) 时,
+/// tool_result content 内的非 Text 块 (Image 等媒体) 被折叠丢弃, 无占位标记.
+/// 统计 SSOT = `codec::dropped_tool_result_media` (纯函数). WARN 只在此处打:
+/// codec 的 write_request 还被多个非 egress 消费面复用 (cross_proto 的 ingress
+/// 视图 record body / derive.rs 的 timeline 派生 / records parsed view), 内嵌
+/// WARN 会在无损方向 (egress=Anthropic, 原样写回 blocks) 误报、在轮询的视图
+/// 路径放大 (M1/M2). 只记计数不记内容.
+pub(super) fn warn_tool_result_media_drop(
+    record_id: uuid::Uuid,
+    egress: crate::codec::Protocol,
+    ir: &crate::codec::IrRequest,
+) {
+    if !matches!(
+        egress,
+        crate::codec::Protocol::OpenAI | crate::codec::Protocol::OpenAIResponses
+    ) {
+        return;
+    }
+    if let Some((count, kinds)) = crate::codec::dropped_tool_result_media(ir) {
+        tracing::warn!(
+            %record_id,
+            count,
+            kinds = %kinds,
+            "dropping non-text block(s) from tool_result content \
+             (egress tool message carries text only; no placeholder emitted)"
+        );
+    }
+}
+
 /// 上游响应 parse 失败 (codec reader 拒绝 / 非 JSON) 但 JSON 叶子级兜底 restore
 /// **成功**还原了 mock (RED-8). 客户端拿到的是真 secret, 但 body 经过了非 codec 的
 /// 改写路径 (重序列化), 记 WARN 保持可观测 (风格仿照 #158 的 mock-not-restored).

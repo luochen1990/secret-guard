@@ -235,49 +235,50 @@ pub(super) fn blocks_to_text(blocks: &[ir::IrBlock]) -> String {
         .join("\n")
 }
 
-/// tool_result content → 纯文本 (T8 丢弃可观测化).
+/// 请求级聚合: `req.messages` 中全部 ToolResult content 内将被文本折叠丢弃的
+/// 非 Text 块 (T8).
 ///
-/// 与 [`blocks_to_text`] 的区别: 面向 tool_result 的写出 — OpenAI/Responses 的
-/// tool 载体 (role:"tool" 消息 content / `function_call_output` 的 output) wire 上
-/// 只能承载文本, 非 Text 块 (Image 等媒体) 折叠丢弃时打 WARN (count + 块类型分布,
-/// 只记计数不记内容 — SEC 纪律, 措辞风格对齐 `proxy/cross_proto.rs::count_reasoning_blocks`
-/// 的 reasoning 丢弃先例). 消费点 = OpenAI writer 与 Responses writer 的
-/// tool_result 写出分支 (本函数是 SSOT, 两消费点共享).
+/// 返回 `(count, kinds)` — kinds 如 `"image:2,reasoning:1"` (BTreeMap 字母序稳定,
+/// 类型名用 wire 词形 snake_case); 无丢弃 → `None`. WARN 消费点是 proxy 的
+/// **egress 写出路径** (`proxy/helpers.rs::warn_tool_result_media_drop`,
+/// cross_proto / same_proto 共享).
 ///
-/// # 触发面与假设声明
+/// # 为什么是纯函数 (不在 codec 内打日志)
 ///
-/// 丢弃本身是**既有折叠行为** (本次仅可观测化), 触发面:
-/// - 跨协议翻译 (典型 a→o / a→r: Anthropic ingress 的 tool_result 含 Image 块);
-/// - 同协议 redact 的非标准 content array 形态 (o→o: `role:"tool"` 消息 content 为
-///   array 且含 image_url part — OpenAI computer-use 参考客户端的真实回传形态;
-///   r→r: `function_call_output.output` array 含 input_image part). 两家 reader 均能
-///   读入 Image (通用 content part 解析), writer 只能文本折叠.
+/// codec 的 `write_request` 还被多个非 egress 消费面复用 (生产面 ≥3 处):
+/// ① cross_proto 的 ingress 视图序列化 (record body 构造, egress 可能是
+/// Anthropic — 实际无损); ② DAG timeline 派生 (`derive.rs`, WebUI 3s 轮询
+/// 反复触发); ③ records parsed view (`web/api/records.rs`). WARN 内嵌 codec
+/// 会在这些路径误报/放大 (M1/M2), 可观测化必须在真正发生丢弃的 egress 调用点.
 ///
-/// Anthropic egress 不经此 helper (writer 原样写回 blocks, 媒体无损). WARN 粒度是
-/// per-tool_result 一条 (codec 无状态纯函数拿不到 record_id, 不做 per-request
-/// 聚合 — 与 reasoning 先例的差距是刻意的最小档取舍). 完整媒体搬运方案 (占位标记 +
-/// 搬到 user 消息) 是 P3 待办 (known-limitations codec 节).
-pub(super) fn tool_result_content_text(blocks: &[ir::IrBlock]) -> String {
-    let dropped = count_dropped_tool_result_blocks(blocks);
-    if !dropped.is_empty() {
-        let count: usize = dropped.values().sum();
-        let kinds = dropped
-            .iter()
-            .map(|(kind, n)| format!("{kind}:{n}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        tracing::warn!(
-            count,
-            kinds = %kinds,
-            "dropping non-text block(s) from tool_result content (target protocol \
-             tool message carries text only; no placeholder emitted)"
-        );
+/// # 口径假设
+///
+/// ToolResult 只出现在 messages (system 不含 — 三协议 reader 均不产出到 system);
+/// 嵌套 ToolResult 整体记 1 (`tool_result` kind, 与块级统计口径一致).
+pub(crate) fn dropped_tool_result_media(req: &ir::IrRequest) -> Option<(usize, String)> {
+    let mut dropped = std::collections::BTreeMap::new();
+    for msg in &req.messages {
+        for b in &msg.content {
+            if let ir::IrBlock::ToolResult { content, .. } = b {
+                for (kind, n) in count_dropped_tool_result_blocks(content) {
+                    *dropped.entry(kind).or_insert(0) += n;
+                }
+            }
+        }
     }
-    blocks_to_text(blocks)
+    if dropped.is_empty() {
+        return None;
+    }
+    let count: usize = dropped.values().sum();
+    let kinds = dropped
+        .iter()
+        .map(|(kind, n)| format!("{kind}:{n}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    Some((count, kinds))
 }
 
-/// 统计 blocks 中将被 [`tool_result_content_text`] 丢弃的非 Text 块 (类型 → 计数).
-/// 类型名用 wire 词形 (snake_case); BTreeMap 字母序保证 WARN kinds 字段稳定.
+/// 统计一个 ToolResult content 中将被文本折叠丢弃的非 Text 块 (类型 → 计数).
 fn count_dropped_tool_result_blocks(
     blocks: &[ir::IrBlock],
 ) -> std::collections::BTreeMap<&'static str, usize> {
@@ -326,8 +327,8 @@ pub(super) fn input_to_string(input: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{count_dropped_tool_result_blocks, tool_result_content_text};
-    use crate::codec::ir::{IrBlock, IrImageSource};
+    use super::{count_dropped_tool_result_blocks, dropped_tool_result_media};
+    use crate::codec::ir::{IrBlock, IrImageSource, IrMessage, IrRequest, IrRole};
 
     fn text(s: &str) -> IrBlock {
         IrBlock::Text {
@@ -336,15 +337,29 @@ mod tests {
         }
     }
 
-    /// T8 丢弃统计: 非 Text 块按类型计数 (WARN 的 count/kinds 数据源), Text 不计.
+    fn image() -> IrBlock {
+        IrBlock::Image {
+            source: IrImageSource::Url("https://example.com/cat.png".into()),
+            extra: Default::default(),
+        }
+    }
+
+    fn tool_result(content: Vec<IrBlock>) -> IrBlock {
+        IrBlock::ToolResult {
+            tool_use_id: "call_1".into(),
+            content,
+            is_error: None,
+            content_form: None,
+            extra: Default::default(),
+        }
+    }
+
+    /// T8 块级统计: 非 Text 块按类型计数 (WARN count/kinds 的数据源), Text 不计.
     #[test]
     fn count_dropped_tool_result_blocks_classifies_by_kind() {
         let blocks = vec![
             text("screenshot saved"),
-            IrBlock::Image {
-                source: IrImageSource::Url("https://example.com/cat.png".into()),
-                extra: Default::default(),
-            },
+            image(),
             IrBlock::Image {
                 source: IrImageSource::Base64 {
                     media_type: "image/png".into(),
@@ -361,29 +376,135 @@ mod tests {
         assert_eq!(dropped.len(), 2);
         assert_eq!(dropped.get("image"), Some(&2));
         assert_eq!(dropped.get("reasoning_content"), Some(&1));
-        // 纯 Text / 空输入 → 无丢弃 (无 WARN).
+        // 纯 Text / 空输入 → 无丢弃.
         assert!(count_dropped_tool_result_blocks(&[text("a"), text("b")]).is_empty());
         assert!(count_dropped_tool_result_blocks(&[]).is_empty());
     }
 
-    /// T8 文本折叠: 与 blocks_to_text 同型 (Text join '\n'), 纯图片 tool_result → 空串
-    /// (丢弃场景, WARN 行为不在此断言 — 对齐 count_reasoning_blocks 先例).
+    /// T8 请求级聚合: 跨 message 的 ToolResult 统计合并为 (count, kinds),
+    /// kinds 字母序稳定; 无 ToolResult / 纯 Text → None.
     #[test]
-    fn tool_result_content_text_joins_text_only() {
-        let blocks = vec![
-            text("screenshot saved"),
-            IrBlock::Image {
-                source: IrImageSource::Url("https://example.com/cat.png".into()),
-                extra: Default::default(),
+    fn dropped_tool_result_media_aggregates_across_messages() {
+        let ir = IrRequest {
+            messages: vec![
+                IrMessage {
+                    role: IrRole::User,
+                    content: vec![text("weather?")],
+                    ..Default::default()
+                },
+                IrMessage {
+                    role: IrRole::User,
+                    content: vec![tool_result(vec![text("screenshot saved"), image()])],
+                    ..Default::default()
+                },
+                IrMessage {
+                    role: IrRole::User,
+                    content: vec![tool_result(vec![image()])],
+                    ..Default::default()
+                },
+            ],
+            model: "gpt-4o".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            dropped_tool_result_media(&ir),
+            Some((2, "image:2".to_string()))
+        );
+        // system 内的 Image 不参与 (口径假设: ToolResult 只在 messages).
+        let ir_system_image = IrRequest {
+            system: vec![image()],
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![text("hi")],
+                ..Default::default()
+            }],
+            model: "gpt-4o".into(),
+            ..Default::default()
+        };
+        assert_eq!(dropped_tool_result_media(&ir_system_image), None);
+        // 无丢弃 → None.
+        let ir_plain = IrRequest {
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![text("hi")],
+                ..Default::default()
+            }],
+            model: "gpt-4o".into(),
+            ..Default::default()
+        };
+        assert_eq!(dropped_tool_result_media(&ir_plain), None);
+    }
+
+    /// M1/M2 回归守卫: codec writer 是纯序列化 — write_request 被非 egress 消费面
+    /// (cross_proto 的 ingress 视图 / derive.rs 的 timeline 派生) 复用时**不得**发出
+    /// 任何 tracing 事件 (首轮实现的 codec 内 WARN 在 ingress=Anthropic 方向事实性
+    /// 误报、在 3s 轮询的视图路径日志放大). 丢弃可观测化在 proxy egress 写出点
+    /// (`proxy/helpers.rs::warn_tool_result_media_drop`).
+    ///
+    /// 捕获方式仿 `redact.rs::CapturingMakeWriter` 先例: 线程局部 fmt subscriber
+    /// 写入 Mutex sink, 不引入新 dev-dependency.
+    #[test]
+    fn write_request_with_media_tool_result_emits_no_log() {
+        use crate::codec::Writer;
+        use crate::codec::openai::OpenAiWriter;
+        use crate::codec::responses::ResponsesWriter;
+
+        struct CapturingMakeWriter {
+            sink: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingMakeWriter {
+            type Writer = CapturingWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                CapturingWriter {
+                    sink: self.sink.clone(),
+                }
+            }
+        }
+        struct CapturingWriter {
+            sink: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        }
+        impl std::io::Write for CapturingWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.sink.lock().expect("sink poisoned").write(buf)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let ir = IrRequest {
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![tool_result(vec![text("screenshot saved"), image()])],
+                ..Default::default()
+            }],
+            model: "gpt-4o".into(),
+            ..Default::default()
+        };
+
+        let sink: std::sync::Arc<std::sync::Mutex<Vec<u8>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        tracing::dispatcher::with_default(
+            &tracing::dispatcher::Dispatch::new(
+                tracing_subscriber::fmt()
+                    .with_env_filter(tracing_subscriber::EnvFilter::new("trace"))
+                    .with_writer(CapturingMakeWriter { sink: sink.clone() })
+                    .with_ansi(false)
+                    .finish(),
+            ),
+            || {
+                let _ = OpenAiWriter.write_request(&ir);
+                let _ = ResponsesWriter.write_request(&ir);
+                // 无损 writer (Anthropic 原样写回 blocks) 同样零日志 (M1 的
+                // ingress=Anthropic 误报方向).
+                let _ = crate::codec::anthropic::AnthropicWriter.write_request(&ir);
             },
-            text("done"),
-        ];
-        assert_eq!(tool_result_content_text(&blocks), "screenshot saved\ndone");
-        let pure_image = vec![IrBlock::Image {
-            source: IrImageSource::Url("https://example.com/cat.png".into()),
-            extra: Default::default(),
-        }];
-        assert_eq!(tool_result_content_text(&pure_image), "");
-        assert_eq!(tool_result_content_text(&[]), "");
+        );
+        let buf = sink.lock().expect("sink poisoned").clone();
+        assert!(
+            buf.is_empty(),
+            "codec writer 必须零 tracing 输出 (M1/M2), 实际捕获: {}",
+            String::from_utf8_lossy(&buf)
+        );
     }
 }

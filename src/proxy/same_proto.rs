@@ -36,6 +36,7 @@ use crate::provider::{DirectProvider, Endpoint, Protocol};
 use super::auth::apply_provider_auth;
 use super::helpers::{
     build_upstream_url, is_streaming, requests_stream, sanitize_request_headers, utf8_view,
+    warn_tool_result_media_drop,
 };
 use super::recorder::{
     build_call_event, parse_request_ir, push_event_and_wire_usage, redact_and_derive,
@@ -225,6 +226,11 @@ pub(crate) async fn same_proto_forward(
         &secrets_snapshot,
         &redact_hits,
     );
+
+    // T8: o/r 同协议 redact 重序列化 (步骤 5) 会折叠 tool_result 内媒体
+    // (computer-use 的 content array 形态) — per-request 聚合一条 WARN,
+    // 与 cross_proto 同型 (统计 SSOT 在 codec::dropped_tool_result_media).
+    warn_tool_result_media_drop(record_id, codec_proto, &ir);
 
     // url 脱敏 (SEC-C4): query 可能携带客户端 key (如 Gemini ?key=...).
     debug!(%record_id, method = %parts.method, url = %safe_url_for_log(&upstream_url), "forwarding redacted same-proto request");

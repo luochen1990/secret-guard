@@ -24,7 +24,7 @@ use super::{
     IrRole, IrStopReason, IrStreamEvent, IrTool, IrToolChoice, IrUsage, Reader, Writer,
     blocks_to_text, collect_extra, current_epoch, image_source_to_url, input_to_string,
     ir::{StreamDecodeState, StreamEncodeState},
-    random_base62, tool_result_content_text,
+    random_base62,
 };
 
 /// OpenAI Chat Completions stream 的 `tool_calls[].index` 字段实际上界.
@@ -372,11 +372,12 @@ impl Writer for OpenAiWriter {
                         ..
                     } = b
                     {
-                        // T8: 媒体块丢弃的 WARN 在 helper 内 (SSOT).
+                        // tool 消息 content 只承载文本 — 非 Text 块 (Image 等媒体)
+                        // 折叠丢弃, WARN 在 proxy egress 写出点 (T8).
                         let text = if is_error.unwrap_or(false) {
-                            format!("[error] {}", tool_result_content_text(content))
+                            format!("[error] {}", blocks_to_text(content))
                         } else {
-                            tool_result_content_text(content)
+                            blocks_to_text(content)
                         };
                         messages.push(json!({
                             "role": "tool",
@@ -1258,8 +1259,8 @@ fn write_message(msg: &IrMessage) -> Value {
                     ..
                 } = b
                 {
-                    // T8: 媒体块丢弃的 WARN 在 helper 内 (SSOT).
-                    let text = tool_result_content_text(content);
+                    // 非 Text 块折叠丢弃, WARN 在 proxy egress 写出点 (T8).
+                    let text = blocks_to_text(content);
                     return json!({
                         "role": "tool",
                         "tool_call_id": tool_use_id,
@@ -1297,11 +1298,11 @@ fn write_user_block(b: &IrBlock) -> Option<Value> {
         } => {
             // OpenAI 的 tool 消息必须独立成一条, 但 caller 可能把它放在 user 消息内
             // (跨协议从 Anthropic 来的). 这里退化为 text 内容, 配合 write_message 的 Tool 分支
-            // 通常不会走到这里. T8: 媒体块丢弃的 WARN 在 helper 内 (SSOT).
+            // 通常不会走到这里. 非 Text 块折叠丢弃, WARN 在 proxy egress 写出点 (T8).
             let text = if is_error.unwrap_or(false) {
-                format!("[error] {}", tool_result_content_text(content))
+                format!("[error] {}", blocks_to_text(content))
             } else {
-                tool_result_content_text(content)
+                blocks_to_text(content)
             };
             Some(json!({
                 "type": "text",
