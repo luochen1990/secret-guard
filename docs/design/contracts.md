@@ -290,7 +290,11 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 - 请求侧 reasoning **配置** 已建模并跨协议翻译 (roadmap A1 批次 1, 2026-09-29 精确化:
   `reasoning_effort` / `thinking` / `reasoning.effort` ↔ `IrRequest.reasoning`,
   投影有损 — Budget 连续→6档离散 / Adaptive→o 投影 Medium / Disabled→o 无字段);
-  响应侧思考原文 (reasoning_content / thinking blocks) 仍不建模, 跨协议丢弃.
+  响应侧思考上下文 (reasoning_content / thinking blocks / reasoning items) 已建模
+  (T7, 2026-09-29): 同协议保真 + a⇄r 经 sg-envelope 搬运 (细节见 STR-6 跨协议处置);
+  剩余损失: o-origin 思考原文跨到 Anthropic 丢弃 (o 无 opaque 容器), 任何 origin 的
+  thinking/opaque 跨到 OpenAI Chat 时 opaque 丢弃 (o 无容器, 正文保留为
+  reasoning_content) — 均有 WARN 计数 (`cross_proto.rs::count_reasoning_blocks`).
 - citations / logprobs 不建模, 丢弃.
 - prompt caching 字段不建模, 丢弃.
 - usage 只保留 input/output 总数 + cache_read/cache_creation 4 个字段, 细分字段丢弃.
@@ -299,7 +303,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 **Properties**:
 - `prop_cross_proto_modeled_fields_preserved`: 建模范围内的字段 (messages/tools/tool_use/tool_result/usage 总数/stop_reason) 跨协议 round-trip 后保留. 🔁→`prop_cross_proto_modeled_fields_preserved_openai_to_anthropic` + `prop_cross_proto_modeled_fields_preserved_anthropic_to_openai` (`src/codec/fwd_cross_proto_property.rs`)
 - `prop_cross_proto_stream_content_fidelity` (2026-09-15, 流式半段; 2026-09-23 起覆盖 Responses 任一侧): 跨协议流式翻译 (StreamTranslate 跨协议模式, 任意 chunk 切分含 1-byte) 内容保真 — text / tool input 拼接相等, tool_use id/name 保真, usage output_tokens 透传; wire 帧顺序合法性由确定性单测守卫 (双方向: Anthropic ingress 的 message_delta-before-message_stop + 跳过 block 配对, OpenAI ingress 的 content-before-finish_reason + restore 尾部及时冲刷). Responses 组合 (r→o / o→r / r→a / a→r + r→o 1-byte) 覆盖 Responses reader 状态机跨 chunk 稳定性 + Responses writer 有状态合成 (item+part 两帧 / done 族全量帧 / deferred stop). 🔁→`prop_cross_proto_stream_openai_to_anthropic` + `prop_cross_proto_stream_byte_by_byte_openai_to_anthropic` + `prop_cross_proto_stream_byte_by_byte_anthropic_to_openai` + `prop_cross_proto_stream_responses_to_openai` + `prop_cross_proto_stream_openai_to_responses` + `prop_cross_proto_stream_responses_to_anthropic` + `prop_cross_proto_stream_anthropic_to_responses` + `prop_cross_proto_stream_byte_by_byte_responses_to_openai` + `cross_proto_reasoning_block_yields_no_unpaired_block_stop` + `cross_proto_defers_message_stop_until_post_stop_usage` + `cross_proto_flushes_pending_stop_at_finish_without_usage_chunk` + `cross_proto_openai_ingress_flushes_skipped_block_tail_before_finish_reason`
-- `prop_cross_proto_unmodeled_fields_explicitly_dropped`: 范围外字段 (如 reasoning_content) 不出现在 egress wire. ✅
+- `prop_cross_proto_unmodeled_fields_explicitly_dropped`: 范围外字段 (如 reasoning_content) 不出现在 egress wire (T7 精确化: 仅 o→a 方向 — o-origin 思考原文在 Anthropic egress 丢弃; o→r 方向经 envelope 保留属 STR-6 建模范围). ✅
 - `prop_cross_proto_extra_cleared`: 跨协议路径下 ingress IR 的 extra 字段必须清空, 不允许源协议独有字段泄漏到 egress. ✅
 - `prop_documented_semantic_loss_list`: 所有已知的语义损失点必须在 `src/codec/AGENTS.md` 显式列出 (人工审查项). ✅
 
@@ -394,6 +398,8 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 ### RED-1 mock 非空性
 
 **陈述**: 每个 mock 必须非空, 且满足其 `GenSpec` 的 prefix/charset/length 约束.
+
+> **叶子定义注记 (T7, 2026-09-29)**: redact 扫描的 "字符串叶子" 按设计**排除** thinking 族 provider opaque (`Reasoning.opaque` / `ReasoningContent.opaque` — signature/密文非明文, 见 `src/codec/thinking.rs` 安全链注记: envelope 打包在 writer 侧 post-redact, 解包在 reader 侧 pre-redact, 解包文本以 text/summary 叶子身份进入本扫描集)。这不是遗漏, 勿 "修复"。
 
 **Properties**:
 - `prop_mock_non_empty`: 对任意 (secret, strategy), 生成的 mock 非空. ✅
@@ -549,14 +555,20 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 > **历史 bug** (#176): reader 不解码 `delta.reasoning_content` → redact 流式路径 (IR 重建) 思考期零字节 → 客户端空闲看门狗超时断连 (Chatbox 30s, 生产 499 事故). 非流式路径的 `message.reasoning_content` 与请求侧 assistant 历史回传同因丢失 (违反 FWD-1: redact 路径除 real↔mock 外不得改 wire).
 
-**跨协议处置** (FWD-3 "范围外显式丢弃" 的新条目): ReasoningContent block 跨协议翻译时, 按目标协议能力区分 — Anthropic egress **丢弃** (thinking block 需要 signature, secret-guard 无法合法合成, 伪造会被 Anthropic API 拒收); Responses egress **流式保留** (2026-09-23 用户裁决授权: 合成为 reasoning item 的 `reasoning_summary_text.delta` 事件族 — 合法 Responses wire 形态, 语义降档为 summary 字段承载思考原文; 覆盖 property 见 o→r 组合的 `prop_cross_proto_streaming_no_mock_leak_responses_ingress` has_reasoning 分支), **非流式仍丢弃** (lossy-by-target, `write_response` 跳过 — 统一为 summary 合成留后续跟进). 不发明非法 wire 形态.
+**跨协议处置** (T7 精确化, 2026-09-29 — 契约演进原则 §0.5 例外① "互译精确化消除信息损失", 同步改写 2026-09-23 裁决的分叉文本): 思考上下文按 origin × 目标协议能力分派 —
+
+- **a⇄r 双向搬运 (sg-envelope, cc-switch 模式)**: `IrBlock::ReasoningContent` (a thinking/redacted_thinking, 携 `opaque`) 跨到 Responses → reasoning item (summary 承载正文, `encrypted_content` = envelope); `IrBlock::Reasoning` (r reasoning item, 携 `encrypted_content`) 跨到 Anthropic → thinking block (`signature` = envelope)。envelope (`sg-thinking-v1:` + base64 版本化 JSON) **不合成只搬运** provider opaque; 解包在 reader (pre-redact — 解包文本成为叶子必然流经扫描), 打包在 writer (post-redact / post-restore — envelope 不含未脱敏文本)。回传识别前缀解包还原原生块, stateless tool loop 闭合 (流式 r→a 由 a writer 在 BlockStop 合成 envelope signature; 流式 a→r 由 r writer 在 done 族帧打包; a-origin 真 signature 经 `SignatureDelta` verbatim 直通不重打包)。
+- **o-origin (reasoning_content, 无 opaque 容器)**: 跨到 Anthropic 丢弃 + WARN (o 协议无容器, 不发明 wire 形态 — 旧裁决 "无法合法合成 signature" 的保留部分); 跨到 Responses 保留 (summary 承载正文, 无 envelope — 消除 2026-09-23 "流式保留/非流式丢弃" 分叉)。
+- **o 为目标**: thinking/opaque (signature / encrypted_content / redacted data) 丢弃 + WARN (o 无容器); 思考正文保留为 `reasoning_content` (既有 #176 行为)。
 
 **Properties**:
 - `prop_streaming_reasoning_restored_like_text`: 任意 chunk 切分下, 客户端 reasoning 拼接 == 上游拼接.replace(mock, real) + 无 mock 泄漏 + 思考期非零字节. ✅
 - `prop_stream_scan_accumulates_reasoning`: StreamScan 把 reasoning delta 累积为 ReasoningContent block (与预期 IrResponse 一致). ✅
 - `prop_stream_reader_reasoning_text_tool_indices_correct`: reasoning / text / tool 三类 block 的 IR index 互不冲突. ✅
+- `prop_redact_thinking_scans_text_not_opaque` (T7): thinking **原文**含 secret 时被 redact mock 化 (文本叶子必须扫描); signature / redacted_thinking.data (签名/密文非明文) verbatim 透传不进扫描; block 类型保真 (thinking ≠ redacted_thinking). ✅
+- `prop_envelope_packs_redacted_text_never_real` (T7): a→r 请求方向打包的 envelope 内文本是 mock 不是 real (打包点在 writer = post-redact); 恶意构造含 real 的 envelope 经 reader 解包 (pre-redact) 后再 redact, real 不泄漏到 egress. ✅
 
-**生成器覆盖** (§0.3 第 3 条): reasoning delta (含 mock, 跨 chunk 累积) 已加入 `arb_openai_sse_with_expected` (stream/mod.rs, has_reasoning 分支) 与 `arb_openai_sse_stream_with_mock` (fwd_streaming_property.rs); Responses 侧的 reasoning summary delta (含 mock) 由 `arb_responses_sse_stream_with_mock` (fwd_streaming_property.rs, has_reasoning 分支) 覆盖, r→r 同协议 restore 的 reasoning fidelity 断言随共享断言集生效; 非流式 `message.reasoning_content` / 请求侧 assistant 历史回传由 openai.rs 单测覆盖.
+**生成器覆盖** (§0.3 第 3 条): reasoning delta (含 mock, 跨 chunk 累积) 已加入 `arb_openai_sse_with_expected` (stream/mod.rs, has_reasoning 分支) 与 `arb_openai_sse_stream_with_mock` (fwd_streaming_property.rs); Responses 侧的 reasoning summary delta (含 mock) 由 `arb_responses_sse_stream_with_mock` (fwd_streaming_property.rs, has_reasoning 分支) 覆盖, r→r 同协议 restore 的 reasoning fidelity 断言随共享断言集生效; 非流式 `message.reasoning_content` / 请求侧 assistant 历史回传由 openai.rs 单测覆盖。T7 增补: Anthropic thinking/redacted_thinking block (signature/data 用 `[A-Z0-9]` charset — 结构上排除 sg-envelope 前缀, envelope 解包路径由专项 golden 测试覆盖) 已加入 `arb_anthropic_message` assistant 臂 (FWD-2 round-trip property 随之覆盖); a⇄r envelope 四组 golden (非流式 a→r→a / r→a→r / r→a 响应 echo / 流式 r→a) 与 r 流式 encrypted_content round-trip 由确定性单测锁定 (`cross_proto_thinking_golden_a_to_r_to_a` 等)。
 
 ---
 
@@ -1362,3 +1374,4 @@ chars (char boundary 安全); 其余事件字段为受控类型, 天然无 secre
 | 2026-09-23 | FWD-1 (修正) | **推翻同日"正规化"决策 (用户裁决, issue #269): Anthropic `messages[].role=system` 按原位保留写回** — 该形态是官方已正式支持的合法 wire (官方文档明言其为缓存友好的指令注入方式), "提升合并到顶层 system" 改变指令生效位置 + 顶层 system 增长使缓存前缀整体失效 + 消息级字段丢失, 三重损害均系错误; FWD-1 等式恢复无例外, reader/writer 位置保真, FWD-2 生成器解除 role=system 排除机械锁定; 同日登记的"适用范围澄清"行随之作废 (历史记录保留于上, 行为以本行 + FWD-1 注记为准) | issue #269 评估 (截图分析经代码与官方文档逐项核实属实): 同日 "原样写回会被 400" 的判断对当前旗舰模型已过时; 兼容边界 (Sonnet 5 等不支持该形态) 由客户端按目标上游自选形态, 网关不代改写 |
 | 2026-09-23 | FWD-2 (wire-fidelity 扩展, L4/L5) | **wire fidelity 下沉到 message/tool/block 级 (#269 M1)**: `IrMessage`/`IrTool`/四个 wire 来源 `IrBlock` variant 增 `extra` 字段 (未建模字段逃生舱, 同协议透传/跨协议清空契约与顶层 extra 同型, `clear_wire_fidelity` 统一清空); Anthropic codec 收集/回写 block 级+工具级 `cache_control`、消息级 `output_config` 等; `tool_result.is_error` 改 `Option<bool>` (显式 false 不再静默省略); 顶层 `system` 字段形态元数据 `system_form` (单 block array 不折叠); dag BlockPool 内容寻址 hash 纳入 extra; redact 双轨遍历 (StringLeafOps + collect_ir_str_leaves) 同步覆盖 extra 叶子 (SEC 扫描无新盲区); FWD-2 生成器扩展 (system 形态+cache_control / tools extra / 消息级 output_config / block cache_control / is_error 显式 false / 响应侧 block extra) 机械锁定 | issue #269: Anthropic 缓存是显式 opt-in, IR 路径剥离缓存标记 = 长 agent 会话 input 成本约放大一个数量级; 仓库 C3 契约 (mock 确定性) 的缓存友好投入因此被完全抵消, 本修复是补完既有设计目标而非新特性 |
 | 2026-09-23 | FWD-1 (原则显式化 + M3 否决) | **"原始形状保持"登记为同协议转发的高优先契约; 注入方案否决并移除 (用户二次裁决)**: ① 客户端发什么, 发往上游的就是什么; 两种合法修改 (mock 替换 / model 重写) 是显式列举的例外; ② **不引入任何"主动添加客户端未发送内容"的功能** — 客户端请求上游不认可就让其失败 (直连同样失败, 网关不兜底), 尽量少引入差异; ③ 同日曾实现的顶层自动缓存标记注入 (`inject_cache_control`, 合法修改"第三类"方案) 被此裁决否决, 已整体移除 (等价表述回归"两种"), changelog 留此记录供未来检索关键词: inject_cache_control / automatic caching 注入 / 顶层 cache_control | issue #269 PR #272 评审讨论: 用户先对 M3 注入与形状保持的张力提出原则性澄清, 随后裁决不引入该功能 |
+| 2026-09-29 | STR-6 + FWD-3 (T7 thinking/encrypted_content passthrough) | **思考上下文容器 first-class 建模 + a⇄r envelope 搬运 (契约演进原则 §0.5 例外① "互译精确化消除信息损失", 同步改写 2026-09-23 分叉裁决文本)**: ① `IrBlock::Reasoning{summary}` 增 `opaque` (encrypted_content), `IrBlock::ReasoningContent{text}` 增 `opaque: ThinkingOpaque` (Signature/RedactedData) — 同协议 round-trip 完整保真 (修复 a+a redact 历史 thinking 丢失 → tool-use 会话 400 的机制性根因, 与 r reasoning chain 断裂); ② 流式: `IrBlockMeta::Thinking`/`RedactedThinking{data}` + `IrDelta::SignatureDelta`/`ReasoningOpaqueDelta` (origin 区分 = verbatim 直通 vs envelope 打包的分派依据), a writer 有限累积 (`AnthropicEncodeState`, BlockStop 合成 envelope signature 且延迟 emit 保证 thinking_delta→signature_delta→stop 顺序), r writer done 族帧写回 encrypted_content; ③ 跨协议 a⇄r 经 `sg-thinking-v1:` envelope (cc-switch 模式, 打包在 writer=post-redact/restore, 解包在 reader=pre-redact/restore — RED 安全链闭合, `prop_envelope_packs_redacted_text_never_real` 守卫); o-origin 跨 a 丢弃 + WARN (o 无容器, 旧裁决保留部分), o 为目标 opaque 丢弃 + WARN, o→r 保留 (分叉消解); ④ FWD-3 损失清单 + `count_reasoning_blocks` 按 egress 能力精确化; ⑤ 生成器: thinking 族加入 `arb_anthropic_message` assistant 臂 (FWD-2 随之覆盖, signature/data 用 `[A-Z0-9]` charset 结构性排除 envelope 前缀), envelope 路径由四组 golden 单测锁定; `dropped_block_starts` 防线保留给仍未建模类型 (#282 测试以 image 为例精确化) | T7: cc-switch codec gap 审计维度 1 — thinking signature/encrypted_content 跨协议往返是盲区, 同协议 redact 也丢 (stateless tool loop 断裂); §2.2 判定: ≥2 协议 (a+r) + 语义对应 (回传载体) + 归一化 = 不合成只搬运 → first-class (roadmap 变更记录同步登记) |
