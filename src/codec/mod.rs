@@ -235,6 +235,81 @@ pub(super) fn blocks_to_text(blocks: &[ir::IrBlock]) -> String {
         .join("\n")
 }
 
+/// tool_result content → 纯文本 (T8 丢弃可观测化).
+///
+/// 与 [`blocks_to_text`] 的区别: 面向 tool_result 的写出 — OpenAI/Responses 的
+/// tool 载体 (role:"tool" 消息 content / `function_call_output` 的 output) wire 上
+/// 只能承载文本, 非 Text 块 (Image 等媒体) 折叠丢弃时打 WARN (count + 块类型分布,
+/// 只记计数不记内容 — SEC 纪律, 措辞风格对齐 `proxy/cross_proto.rs::count_reasoning_blocks`
+/// 的 reasoning 丢弃先例). 消费点 = OpenAI writer 与 Responses writer 的
+/// tool_result 写出分支 (本函数是 SSOT, 两消费点共享).
+///
+/// # 触发面与假设声明
+///
+/// 丢弃本身是**既有折叠行为** (本次仅可观测化), 触发面:
+/// - 跨协议翻译 (典型 a→o / a→r: Anthropic ingress 的 tool_result 含 Image 块);
+/// - 同协议 redact 的非标准 content array 形态 (o→o: `role:"tool"` 消息 content 为
+///   array 且含 image_url part — OpenAI computer-use 参考客户端的真实回传形态;
+///   r→r: `function_call_output.output` array 含 input_image part). 两家 reader 均能
+///   读入 Image (通用 content part 解析), writer 只能文本折叠.
+///
+/// Anthropic egress 不经此 helper (writer 原样写回 blocks, 媒体无损). WARN 粒度是
+/// per-tool_result 一条 (codec 无状态纯函数拿不到 record_id, 不做 per-request
+/// 聚合 — 与 reasoning 先例的差距是刻意的最小档取舍). 完整媒体搬运方案 (占位标记 +
+/// 搬到 user 消息) 是 P3 待办 (known-limitations codec 节).
+pub(super) fn tool_result_content_text(blocks: &[ir::IrBlock]) -> String {
+    let dropped = count_dropped_tool_result_blocks(blocks);
+    if !dropped.is_empty() {
+        let count: usize = dropped.values().sum();
+        let kinds = dropped
+            .iter()
+            .map(|(kind, n)| format!("{kind}:{n}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        tracing::warn!(
+            count,
+            kinds = %kinds,
+            "dropping non-text block(s) from tool_result content (target protocol \
+             tool message carries text only; no placeholder emitted)"
+        );
+    }
+    blocks_to_text(blocks)
+}
+
+/// 统计 blocks 中将被 [`tool_result_content_text`] 丢弃的非 Text 块 (类型 → 计数).
+/// 类型名用 wire 词形 (snake_case); BTreeMap 字母序保证 WARN kinds 字段稳定.
+fn count_dropped_tool_result_blocks(
+    blocks: &[ir::IrBlock],
+) -> std::collections::BTreeMap<&'static str, usize> {
+    let mut dropped = std::collections::BTreeMap::new();
+    for b in blocks {
+        let kind = match b {
+            ir::IrBlock::Text { .. } => continue,
+            ir::IrBlock::Image { .. } => "image",
+            ir::IrBlock::ToolUse { .. } => "tool_use",
+            ir::IrBlock::ToolResult { .. } => "tool_result",
+            ir::IrBlock::Reasoning { .. } => "reasoning",
+            ir::IrBlock::ReasoningContent { .. } => "reasoning_content",
+        };
+        *dropped.entry(kind).or_insert(0) += 1;
+    }
+    dropped
+}
+
+/// IR 图片来源 → URL 字符串 (Url 直通; Base64 → `data:<mime>;base64,<payload>`).
+///
+/// 共享 helper, 避免 openai.rs / responses.rs 各定义一份 — Responses writer 曾因
+/// 独立演化只支持 Url source (Base64 静默丢弃, 审计 T8 附带 bug), 提取共享后
+/// data URL 格式由构造保证对称. data URL 是两家协议图片字段的合法值.
+pub(super) fn image_source_to_url(source: &ir::IrImageSource) -> String {
+    match source {
+        ir::IrImageSource::Url(u) => u.clone(),
+        ir::IrImageSource::Base64 { media_type, data } => {
+            format!("data:{media_type};base64,{data}")
+        }
+    }
+}
+
 /// IR ToolUse 的 input Value → function.arguments 字符串.
 ///
 /// OpenAI Chat 与 Responses 的 arguments 字段都是 **JSON 字符串** (而非裸 JSON 值),
@@ -247,4 +322,68 @@ pub(super) fn blocks_to_text(blocks: &[ir::IrBlock]) -> String {
 ///     (假设 input 已是去引号字符串). 见 commit ccb8769 (IR wire fidelity).
 pub(super) fn input_to_string(input: &Value) -> String {
     serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{count_dropped_tool_result_blocks, tool_result_content_text};
+    use crate::codec::ir::{IrBlock, IrImageSource};
+
+    fn text(s: &str) -> IrBlock {
+        IrBlock::Text {
+            text: s.to_string(),
+            extra: Default::default(),
+        }
+    }
+
+    /// T8 丢弃统计: 非 Text 块按类型计数 (WARN 的 count/kinds 数据源), Text 不计.
+    #[test]
+    fn count_dropped_tool_result_blocks_classifies_by_kind() {
+        let blocks = vec![
+            text("screenshot saved"),
+            IrBlock::Image {
+                source: IrImageSource::Url("https://example.com/cat.png".into()),
+                extra: Default::default(),
+            },
+            IrBlock::Image {
+                source: IrImageSource::Base64 {
+                    media_type: "image/png".into(),
+                    data: "iVBORw0KGgo=".into(),
+                },
+                extra: Default::default(),
+            },
+            IrBlock::ReasoningContent {
+                text: "thinking...".into(),
+            },
+            text("done"),
+        ];
+        let dropped = count_dropped_tool_result_blocks(&blocks);
+        assert_eq!(dropped.len(), 2);
+        assert_eq!(dropped.get("image"), Some(&2));
+        assert_eq!(dropped.get("reasoning_content"), Some(&1));
+        // 纯 Text / 空输入 → 无丢弃 (无 WARN).
+        assert!(count_dropped_tool_result_blocks(&[text("a"), text("b")]).is_empty());
+        assert!(count_dropped_tool_result_blocks(&[]).is_empty());
+    }
+
+    /// T8 文本折叠: 与 blocks_to_text 同型 (Text join '\n'), 纯图片 tool_result → 空串
+    /// (丢弃场景, WARN 行为不在此断言 — 对齐 count_reasoning_blocks 先例).
+    #[test]
+    fn tool_result_content_text_joins_text_only() {
+        let blocks = vec![
+            text("screenshot saved"),
+            IrBlock::Image {
+                source: IrImageSource::Url("https://example.com/cat.png".into()),
+                extra: Default::default(),
+            },
+            text("done"),
+        ];
+        assert_eq!(tool_result_content_text(&blocks), "screenshot saved\ndone");
+        let pure_image = vec![IrBlock::Image {
+            source: IrImageSource::Url("https://example.com/cat.png".into()),
+            extra: Default::default(),
+        }];
+        assert_eq!(tool_result_content_text(&pure_image), "");
+        assert_eq!(tool_result_content_text(&[]), "");
+    }
 }

@@ -22,9 +22,9 @@ use super::ir::{
 use super::{
     IrBlock, IrBlockMeta, IrDelta, IrError, IrImageSource, IrMessage, IrRequest, IrResponse,
     IrRole, IrStopReason, IrStreamEvent, IrTool, IrToolChoice, IrUsage, Reader, Writer,
-    blocks_to_text, collect_extra, current_epoch, input_to_string,
+    blocks_to_text, collect_extra, current_epoch, image_source_to_url, input_to_string,
     ir::{StreamDecodeState, StreamEncodeState},
-    random_base62,
+    random_base62, tool_result_content_text,
 };
 
 /// OpenAI Chat Completions stream 的 `tool_calls[].index` 字段实际上界.
@@ -372,10 +372,11 @@ impl Writer for OpenAiWriter {
                         ..
                     } = b
                     {
+                        // T8: 媒体块丢弃的 WARN 在 helper 内 (SSOT).
                         let text = if is_error.unwrap_or(false) {
-                            format!("[error] {}", blocks_to_text(content))
+                            format!("[error] {}", tool_result_content_text(content))
                         } else {
-                            blocks_to_text(content)
+                            tool_result_content_text(content)
                         };
                         messages.push(json!({
                             "role": "tool",
@@ -1257,7 +1258,8 @@ fn write_message(msg: &IrMessage) -> Value {
                     ..
                 } = b
                 {
-                    let text = blocks_to_text(content);
+                    // T8: 媒体块丢弃的 WARN 在 helper 内 (SSOT).
+                    let text = tool_result_content_text(content);
                     return json!({
                         "role": "tool",
                         "tool_call_id": tool_use_id,
@@ -1281,12 +1283,7 @@ fn write_user_block(b: &IrBlock) -> Option<Value> {
             }
         }
         IrBlock::Image { source, .. } => {
-            let url = match source {
-                IrImageSource::Url(u) => u.clone(),
-                IrImageSource::Base64 { media_type, data } => {
-                    format!("data:{media_type};base64,{data}")
-                }
-            };
+            let url = image_source_to_url(source);
             Some(json!({
                 "type": "image_url",
                 "image_url": {"url": url}
@@ -1300,11 +1297,11 @@ fn write_user_block(b: &IrBlock) -> Option<Value> {
         } => {
             // OpenAI 的 tool 消息必须独立成一条, 但 caller 可能把它放在 user 消息内
             // (跨协议从 Anthropic 来的). 这里退化为 text 内容, 配合 write_message 的 Tool 分支
-            // 通常不会走到这里.
+            // 通常不会走到这里. T8: 媒体块丢弃的 WARN 在 helper 内 (SSOT).
             let text = if is_error.unwrap_or(false) {
-                format!("[error] {}", blocks_to_text(content))
+                format!("[error] {}", tool_result_content_text(content))
             } else {
-                blocks_to_text(content)
+                tool_result_content_text(content)
             };
             Some(json!({
                 "type": "text",
@@ -1685,6 +1682,72 @@ mod tests {
             IrBlock::ToolResult { tool_use_id, .. } => assert_eq!(tool_use_id, "call_1"),
             other => panic!("expected ToolResult, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn write_request_tool_result_media_dropped_to_text() {
+        // T8: 跨协议 a→o 的 tool_result 折叠 — Image 块被丢弃 (无占位标记, WARN 由
+        // helper 打 — 可观测化单测见 codec::tests), Text join 保留到 tool 消息 content.
+        let image = IrBlock::Image {
+            source: IrImageSource::Url("https://example.com/cat.png".into()),
+            extra: Default::default(),
+        };
+        let ir = IrRequest {
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![IrBlock::ToolResult {
+                    tool_use_id: "call_1".into(),
+                    content: vec![
+                        IrBlock::Text {
+                            text: "screenshot saved".into(),
+                            extra: Default::default(),
+                        },
+                        image,
+                        IrBlock::Text {
+                            text: "done".into(),
+                            extra: Default::default(),
+                        },
+                    ],
+                    is_error: None,
+                    content_form: None,
+                    extra: Default::default(),
+                }],
+                ..Default::default()
+            }],
+            model: "gpt-4o".into(),
+            ..Default::default()
+        };
+        let v = writer().write_request(&ir);
+        let msgs = v.get("messages").unwrap().as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].get("role").unwrap(), "tool");
+        assert_eq!(msgs[0].get("tool_call_id").unwrap(), "call_1");
+        assert_eq!(msgs[0].get("content").unwrap(), "screenshot saved\ndone");
+
+        // is_error=true → "[error] " 前缀拼接 (消费点拼接行为锁定).
+        let ir_err = IrRequest {
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![IrBlock::ToolResult {
+                    tool_use_id: "call_1".into(),
+                    content: vec![IrBlock::Text {
+                        text: "boom".into(),
+                        extra: Default::default(),
+                    }],
+                    is_error: Some(true),
+                    content_form: None,
+                    extra: Default::default(),
+                }],
+                ..Default::default()
+            }],
+            model: "gpt-4o".into(),
+            ..Default::default()
+        };
+        let v_err = writer().write_request(&ir_err);
+        assert_eq!(
+            v_err["messages"][0]["content"].as_str().unwrap(),
+            "[error] boom"
+        );
     }
 
     // ─── read_response: 基础映射 ─────────────────────────────────────────

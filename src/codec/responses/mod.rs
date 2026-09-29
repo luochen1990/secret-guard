@@ -62,7 +62,8 @@ use super::ir::{
 };
 use super::{
     IrError, IrStopReason, IrTool, IrToolChoice, IrUsage, Reader, Writer, blocks_to_text,
-    collect_extra, current_epoch, input_to_string, random_base62,
+    collect_extra, current_epoch, image_source_to_url, input_to_string, random_base62,
+    tool_result_content_text,
 };
 
 // ─── Reader ────────────────────────────────────────────────────────────────
@@ -910,9 +911,12 @@ fn write_input_items(msg: &IrMessage) -> Vec<Value> {
                         }
                     }
                     IrBlock::Image { source, .. } => {
-                        if let IrImageSource::Url(u) = source {
-                            content_parts.push(json!({"type": "input_image", "image_url": u}));
-                        }
+                        // Url 直通; Base64 → data URL (与 OpenAI writer 共享 helper,
+                        // data URL 是 input_image 的合法值; 修复前 Base64 被静默丢弃).
+                        content_parts.push(json!({
+                            "type": "input_image",
+                            "image_url": image_source_to_url(source)
+                        }));
                     }
                     IrBlock::ToolResult {
                         tool_use_id,
@@ -929,7 +933,8 @@ fn write_input_items(msg: &IrMessage) -> Vec<Value> {
                             }));
                             content_parts.clear();
                         }
-                        let text = blocks_to_text(content);
+                        // T8: 媒体块丢弃的 WARN 在 helper 内 (SSOT).
+                        let text = tool_result_content_text(content);
                         let output_val = if is_error.unwrap_or(false) {
                             json!(format!("[error] {text}"))
                         } else {
@@ -1631,6 +1636,58 @@ mod tests {
     }
 
     #[test]
+    fn write_request_tool_result_media_dropped_to_text() {
+        // T8: tool_result 内 Image 块被丢弃 (无占位标记, WARN 由 helper 打 —
+        // 可观测化单测见 codec::tests), Text join 保留; 纯图片 → 空串.
+        let tool_result = |content: Vec<IrBlock>| IrBlock::ToolResult {
+            tool_use_id: "call_1".into(),
+            content,
+            is_error: None,
+            content_form: None,
+            extra: Default::default(),
+        };
+        let image = IrBlock::Image {
+            source: IrImageSource::Url("https://example.com/cat.png".into()),
+            extra: Default::default(),
+        };
+        let text = |s: &str| IrBlock::Text {
+            text: s.into(),
+            extra: Default::default(),
+        };
+        let ir = IrRequest {
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![tool_result(vec![
+                    text("screenshot saved"),
+                    image.clone(),
+                    text("done"),
+                ])],
+                ..Default::default()
+            }],
+            model: "gpt-4o".into(),
+            ..Default::default()
+        };
+        let v = writer().write_request(&ir);
+        let input = v.get("input").unwrap().as_array().unwrap();
+        assert_eq!(input[0].get("type").unwrap(), "function_call_output");
+        assert_eq!(input[0].get("output").unwrap(), "screenshot saved\ndone");
+
+        // 纯图片 tool_result → 空串 (极端场景锁定).
+        let ir_pure = IrRequest {
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![tool_result(vec![image])],
+                ..Default::default()
+            }],
+            model: "gpt-4o".into(),
+            ..Default::default()
+        };
+        let v_pure = writer().write_request(&ir_pure);
+        let input_pure = v_pure.get("input").unwrap().as_array().unwrap();
+        assert_eq!(input_pure[0].get("output").unwrap(), "");
+    }
+
+    #[test]
     fn write_request_tools_flat() {
         let ir = IrRequest {
             messages: vec![IrMessage {
@@ -2031,6 +2088,40 @@ mod tests {
         assert_eq!(messages[0].get("role").unwrap(), "system");
         assert_eq!(messages[1].get("role").unwrap(), "user");
         assert_eq!(chat_body.get("max_tokens").unwrap(), 100);
+    }
+
+    #[test]
+    fn write_request_user_image_base64_data_url() {
+        // IR Image{Base64} → Responses input_image.image_url = "data:<mime>;base64,<payload>".
+        // 修复前 writer 只支持 Url source, Base64 被静默丢弃 (与 OpenAI writer 不对称);
+        // data URL 是 Responses input_image 的合法值 (官方 API 接受 URL 或 data URL).
+        let ir = IrRequest {
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![IrBlock::Image {
+                    source: IrImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data: "iVBORw0KGgo=".into(),
+                    },
+                    extra: Default::default(),
+                }],
+                ..Default::default()
+            }],
+            model: "gpt-4o".into(),
+            ..Default::default()
+        };
+        let v = writer().write_request(&ir);
+        let items = v["input"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["type"], "message");
+        let content = items[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1, "Base64 image 不得被丢弃");
+        let part = &content[0];
+        assert_eq!(part["type"], "input_image");
+        assert_eq!(
+            part["image_url"].as_str().unwrap(),
+            "data:image/png;base64,iVBORw0KGgo="
+        );
     }
 
     #[test]
