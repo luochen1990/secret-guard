@@ -10,11 +10,11 @@
 > master (PRs #286-#289, 各含回归守卫测试 + review 记录); 正文与 TL;DR 保留审计时点
 > (`8c8337e`) 的发现描述, **现状以汇总表与任务清单的状态标记为准**; T5-T10 待办。
 >
-> **状态更新 (2026-09-30)**: **T5-T8 已全部实施** — T5 合成 SSE (#291) / T6 reasoning
-> 配置映射 (#290) / T8 媒体可观测化 (#292) 已合入 master; T7 thinking passthrough
-> (#293) 已实施待合并 (**该 PR 的 approve 即 STR-6 语义改写与 FWD-1 envelope 例外的
-> 授权记录**, 见 contracts.md FWD-1 注记)。仅剩 T9 (billing header 剥离) 与 T10
-> (反向嗅探聚合) 待裁决。
+> **状态更新 (2026-09-30)**: **T1-T8 已全部实施并合入 master** — T5 合成 SSE (#291) /
+> T6 reasoning 配置映射 (#290) / T7 thinking passthrough (#293) / T8 媒体可观测化
+> (#292)。T7 的 STR-6 语义改写与 FWD-1 envelope 例外**已经用户 approve 授权**
+> (授权记录见 contracts.md FWD-1 注记与 STR-6 changelog)。仅剩 T9 (billing header
+> 剥离) 与 T10 (反向嗅探聚合) 待裁决。
 
 | | |
 |---|---|
@@ -447,7 +447,7 @@ JSON 形态错配**" 的客户端影响未登记。
 | T4 | **Responses writer 补 `incomplete_details.reason`** (维度 5): `write_status_str` 升级为返回 (status, Option<reason>) 或并列 helper; 非流式 `write_response` 与流式终止事件 (stream.rs) 同步; round-trip 测试从 Other 恢复 MaxTokens/Safety | `src/codec/responses/mod.rs` + `src/codec/responses/stream.rs` | ~40 | ✅ **已修** (#289 / issue #285) | known-limitations line 26 ("Responses 流式方案 T2/T3" 条目) 扩充 |
 | T5 | **伪流式上游 → 合成 SSE 生命周期** (维度 9 前半): buffered 判型分支 (cross_proto + same_proto redact) 在 `ir.stream=true` 且翻译成功时, 把 IrResponse 重放为事件序列喂 ingress 流式 writer, 以 `text/event-stream` 返回; 失败路径回落现状 | `src/proxy/cross_proto.rs` + `src/proxy/same_proto.rs` + `src/proxy/fan_out.rs` (新 helper) | ~80-120 | ✅ **已实施** (#291, T5) | known-limitations 新条目 (形态适配行为 + same-proto 无 redact 路径仍透传的边界) |
 | T6 | **A1 reasoning 配置跨协议映射** (维度 3): 按 roadmap A1 既有方案实施 (typed enum + 投影表 + golden); 档位表可交叉验证 cc-switch 的 budget 阈值 (4000/16000) 与 adaptive→xhigh | `src/codec/ir.rs` + 三协议 reader/writer (按 roadmap §A1) | ~150 | ✅ **已实施** (#290, T6) | roadmap "实施进度" 章节更新 |
-| T7 | **thinking / encrypted_content passthrough 建模** (维度 1.1/1.2): 走 roadmap §2.2 判定 (boundary case, 参照 #176 先例登记); 方案 A = 新 `IrBlock::Thinking { thinking, signature_or_data }` 原样搬运 (cc-switch 证明可行, redact 需扫描 thinking 文本叶子), 方案 B = 至少同协议 redact 路径保真 (reader 收进 block 级 extra) | `docs/design/ir-fields-roadmap.md` (先登记) + `src/codec/ir.rs` + `src/codec/anthropic.rs` + `src/codec/responses/` | ~200-300 | ✅ **已实施** (#293, T7 — approve 即 STR-6/FWD-1 envelope 授权; 实际 prod ~700 LOC, 三层全落地含流式 origin 分派) | roadmap 新 boundary-case 条目; known-limitations #176 条目升级 |
+| T7 | **thinking / encrypted_content passthrough 建模** (维度 1.1/1.2): 走 roadmap §2.2 判定 (boundary case, 参照 #176 先例登记); 方案 A = 新 `IrBlock::Thinking { thinking, signature_or_data }` 原样搬运 (cc-switch 证明可行, redact 需扫描 thinking 文本叶子), 方案 B = 至少同协议 redact 路径保真 (reader 收进 block 级 extra) | `docs/design/ir-fields-roadmap.md` (先登记) + `src/codec/ir.rs` + `src/codec/anthropic.rs` + `src/codec/responses/` | ~200-300 | ✅ **已合入** (#293, T7 — STR-6/FWD-1 envelope 授权已随 approve 完成; 实际 prod ~700 LOC, 三层全落地含流式 origin 分派) | roadmap 新 boundary-case 条目; known-limitations #176 条目升级 |
 | T8 | **tool_result 媒体丢弃可观测化** (维度 2): 最小 = `blocks_to_text` 丢弃非 Text 块时计数 WARN (对齐 reasoning 丢弃先例) + known-limitations 条目; 完整 = 媒体搬运到下一条 user 消息 + 占位标记 (抄 tool_media 思路, Chat/Responses user content 均可承载); 顺带修 Responses writer Base64 image 丢弃 (:884-888 → data URL) | `src/codec/mod.rs` (blocks_to_text) 或各 writer; 完整版 `src/codec/openai.rs` + `responses/mod.rs` | 最小 ~20 / 完整 ~120 | ✅ **最小档已实施** (#292, T8; 完整搬运仍 P3) | known-limitations codec 节新条目 |
 | T9 | **billing header 剥离** (维度 8): **等裁决**。若授权: a→o / a→r 翻译点的 system 折叠处剥头部首现行 + 配置开关 (默认 off); 抄 cc-switch 的 "只剥首次 + 保留后续" 边界 | `src/proxy/cross_proto.rs` (或 codec writer 层) + `src/config.rs` | ~60 | 待裁决 | 裁决后 known-limitations / configuration.md 同步 |
 | T10 | **非流式请求收 SSE 的嗅探聚合** (维度 9 反向): JSON parse 失败臂先 `body_looks_like_sse` 嗅探, 命中则用 `StreamScan` 聚合成 IrResponse 再走 writer; 未命中维持透传 | `src/proxy/cross_proto.rs` + `src/codec/stream/scan.rs` 复用 | ~100 | **P3** (罕见场景, 可只登记) | known-limitations (若不做则登记透传行为) |
