@@ -370,6 +370,8 @@ mod tests {
             },
             IrBlock::ReasoningContent {
                 text: "thinking...".into(),
+                opaque: None,
+                extra: Default::default(),
             },
             text("done"),
         ];

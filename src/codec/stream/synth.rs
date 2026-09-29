@@ -28,19 +28,33 @@
 //! # 与 StreamTranslate 的机制对齐
 //!
 //! - **跳过 block 配对过滤**: writer 对 `BlockStart` 返回空 Vec 的 index (如 Anthropic
-//!   writer 对 `IrBlockMeta::ReasoningContent` — thinking block 无法合法合成), 其
+//!   writer 对 o-origin 的 `IrBlockMeta::ReasoningContent` — o 协议无 opaque 容器,
+//!   T7 裁决不为 o 发明 wire 形态), 其
 //!   `BlockStop` 一并跳过, 否则产出未配对 `content_block_stop` (协议违例, #282 同型).
 //!   与 `StreamTranslate` 跨协议模式的 `skipped_block_starts` 机制语义一致 (探测调用
 //!   的幂等性由 writer 的幂等契约保证, 见 [`crate::codec::ir::ResponsesEncodeState`]).
 //! - **终止符**: `emits_sse_done_terminator()` 为真的协议 (OpenAI) 在末尾追加
 //!   `data: [DONE]`, 与 `StreamTranslate::finish` 同源.
 //!
-//! # 不可承载 block 的丢弃 (假设声明)
+//! # 不可承载 block 的丢弃 与 thinking 族 origin 分派 (假设声明)
 //!
-//! 响应侧 [`crate::codec::IrBlock`] 中 Text / ToolUse / ReasoningContent 三类有流式
-//! 事件对应物; ToolResult (属于下一轮 user 消息) / Image (assistant 一般不发) /
-//! Reasoning (Responses 摘要, 无流式对应物) 不 emit 任何事件 — 与各 writer 非流式
-//! `write_response` 的跳过行为对齐 (lossy-by-target, 跨协议丢弃先例 #176).
+//! 响应侧 [`crate::codec::IrBlock`] 的流式 emit 分派 (T7 后按 origin):
+//! - Text / ToolUse: 各协议均有事件对应物, 全量单块 emit.
+//! - `ReasoningContent{opaque: Some(Signature)}` (**a-origin** thinking): Thinking
+//!   meta + 正文 ReasoningDelta + `SignatureDelta` — a writer verbatim 回写 signature
+//!   (M1 修复的保真不因 synth 路径破坏), o writer 丢 signature + WARN, r writer 经
+//!   envelope 搬进 encrypted_content (T7 origin 机制分派, 本模块零协议知识).
+//! - `ReasoningContent{opaque: Some(RedactedData)}`: `RedactedThinking{data}` meta
+//!   携全量数据, **无 delta** (与 Anthropic 真实流同型); o writer 跳过 (配对过滤
+//!   兜住), r writer 经 envelope.
+//! - `ReasoningContent{opaque: None}` (**o-origin**): 维持 T5 形态 (ReasoningContent
+//!   meta + ReasoningDelta); a writer 不承载 (o 无容器, 配对过滤跳过整块).
+//! - `Reasoning{summary, opaque}` (**r-origin** reasoning item): T5 曾整块跳过;
+//!   T7 后 r/a 流式 writer 均可承载 — Thinking meta + summary 正文 delta +
+//!   `ReasoningOpaqueDelta`(ec) (r writer verbatim 写回 done 帧; a writer 在 stop
+//!   合成 envelope signature)。零信息 (空 summary + 无 ec) 跳过。
+//! - ToolResult (属于下一轮 user 消息) / Image (assistant 一般不发) 不 emit 任何
+//!   事件 — 与各 writer 非流式 `write_response` 的跳过行为对齐 (lossy-by-target).
 //!
 //! 调用方: `proxy::cross_proto` (buffered 翻译成功臂) 与 `proxy::fan_out` 的
 //! `fan_out_buffered_ir` (same-proto + redact + 判型降级臂), 触发条件均为
@@ -50,7 +64,7 @@
 use super::{SSE_DONE_FRAME, reframe_sse};
 use crate::codec::Protocol;
 use crate::codec::ir::{
-    IrBlock, IrBlockMeta, IrDelta, IrResponse, IrStreamEvent, StreamEncodeState,
+    IrBlock, IrBlockMeta, IrDelta, IrResponse, IrStreamEvent, StreamEncodeState, ThinkingOpaque,
 };
 
 /// MessageStart 携带的 id/created 处理策略 (wire 形态合法性).
@@ -125,10 +139,14 @@ fn response_to_events(resp: &IrResponse, identity: SynthIdentity) -> Vec<IrStrea
         model: resp.model.clone(),
     });
     for (index, block) in resp.content.iter().enumerate() {
-        // 可承载 block → (meta, 全量 delta); 不可承载 (ToolResult / Image / Reason
-        // 摘要) 不 emit 任何事件 (见模块文档 "不可承载 block 的丢弃")。
-        let (block, delta) = match block {
-            IrBlock::Text { text, .. } => (IrBlockMeta::Text, IrDelta::TextDelta(text.clone())),
+        // 可承载 block → (meta, deltas); 不可承载 (ToolResult / Image) 不 emit
+        // 任何事件。deltas 数量可变: redacted 零 delta (数据在 start meta), a-origin
+        // thinking 两个 (正文 + signature) — thinking 族按 origin 分派, 见模块文档
+        // "不可承载 block 的丢弃 与 thinking 族 origin 分派"。
+        let (block, deltas): (IrBlockMeta, Vec<IrDelta>) = match block {
+            IrBlock::Text { text, .. } => {
+                (IrBlockMeta::Text, vec![IrDelta::TextDelta(text.clone())])
+            }
             IrBlock::ToolUse {
                 id, name, input, ..
             } => (
@@ -138,18 +156,60 @@ fn response_to_events(resp: &IrResponse, identity: SynthIdentity) -> Vec<IrStrea
                 },
                 // 全量 arguments 一次性流出 (单块 emit, 见模块文档); input_to_string
                 // 与非流式 writer 的 function.arguments 序列化同源 (JSON 字符串形态).
-                IrDelta::InputJsonDelta(crate::codec::input_to_string(input)),
+                vec![IrDelta::InputJsonDelta(crate::codec::input_to_string(
+                    input,
+                ))],
             ),
-            IrBlock::ReasoningContent { text } => (
-                IrBlockMeta::ReasoningContent,
-                IrDelta::ReasoningDelta(text.clone()),
-            ),
-            IrBlock::ToolResult { .. } | IrBlock::Image { .. } | IrBlock::Reasoning { .. } => {
+            IrBlock::ReasoningContent { text, opaque, .. } => match opaque {
+                // a-origin thinking: Thinking meta (有合法 opaque 容器) + 正文 +
+                // signature — writer 侧 verbatim / envelope 分派由 T7 origin 机制
+                // 处理, 本模块只按 origin 选 meta/delta 形态。
+                Some(ThinkingOpaque::Signature(sig)) => (
+                    IrBlockMeta::Thinking,
+                    vec![
+                        IrDelta::ReasoningDelta(text.clone()),
+                        IrDelta::SignatureDelta(sig.clone()),
+                    ],
+                ),
+                // redacted_thinking: 纯密文, data 在 start 事件整体携带, 无 delta
+                // (与 Anthropic 真实流的该 block 形态同型)。
+                Some(ThinkingOpaque::RedactedData(data)) => (
+                    IrBlockMeta::RedactedThinking { data: data.clone() },
+                    Vec::new(),
+                ),
+                // o-origin: 维持 T5 形态 (a writer 不承载 o-origin, 配对过滤跳过)。
+                None => (
+                    IrBlockMeta::ReasoningContent,
+                    vec![IrDelta::ReasoningDelta(text.clone())],
+                ),
+            },
+            IrBlock::Reasoning {
+                summary, opaque, ..
+            } => {
+                // r-origin reasoning item: T5 曾整块跳过; T7 后可承载 (r 原生 /
+                // a envelope)。零信息 (空 summary + 无 ec) 跳过 — 与 T7 的退化
+                // 丢弃规则 (thinking.rs::unpack) 一致。
+                if summary.is_empty() && opaque.is_none() {
+                    continue;
+                }
+                let text = summary.join("\n");
+                let mut deltas = Vec::new();
+                if !text.is_empty() {
+                    deltas.push(IrDelta::ReasoningDelta(text));
+                }
+                if let Some(ec) = opaque {
+                    deltas.push(IrDelta::ReasoningOpaqueDelta(ec.clone()));
+                }
+                (IrBlockMeta::Thinking, deltas)
+            }
+            IrBlock::ToolResult { .. } | IrBlock::Image { .. } => {
                 continue;
             }
         };
         events.push(IrStreamEvent::BlockStart { index, block });
-        events.push(IrStreamEvent::BlockDelta { index, delta });
+        for delta in deltas {
+            events.push(IrStreamEvent::BlockDelta { index, delta });
+        }
         events.push(IrStreamEvent::BlockStop { index });
     }
     events.push(IrStreamEvent::MessageDelta {
@@ -328,6 +388,10 @@ mod tests {
             content: vec![
                 IrBlock::ReasoningContent {
                     text: "chain of thought".into(),
+                    // o-origin (opaque=None): 本测试的 T5 覆盖面; a-origin 分派由
+                    // synth_anthropic_thinking_signature_preserved 锁定。
+                    opaque: None,
+                    extra: Default::default(),
                 },
                 IrBlock::Text {
                     text: "final answer".into(),
@@ -365,7 +429,10 @@ mod tests {
                     "{proto:?}/{identity:?}: reasoning + text both delivered: {back:?}"
                 );
                 match (&back.content[0], &back.content[1]) {
-                    (IrBlock::ReasoningContent { text: rt }, IrBlock::Text { text: tt, .. }) => {
+                    (
+                        IrBlock::ReasoningContent { text: rt, .. },
+                        IrBlock::Text { text: tt, .. },
+                    ) => {
                         assert_eq!(rt, "chain of thought", "{proto:?}");
                         assert_eq!(tt, "final answer", "{proto:?}");
                     }
@@ -386,6 +453,10 @@ mod tests {
             content: vec![
                 IrBlock::ReasoningContent {
                     text: "thinking...".into(),
+                    // o-origin: a writer 不承载 (无 opaque 容器), 配对过滤跳过整块
+                    // — 本测试的 T5 覆盖面 (reasoning 不泄漏断言)。
+                    opaque: None,
+                    extra: Default::default(),
                 },
                 IrBlock::Text {
                     text: "answer".into(),
@@ -491,6 +562,167 @@ mod tests {
         assert!(
             r_text.contains("event: response.output_item.added"),
             "{r_text}"
+        );
+    }
+    /// T5×T7 语义交互 ①: a-origin thinking 块 (含 signature) 经 synth 的同协议
+    /// (Anthropic) round-trip 不丢 signature — 修复前 synth 无条件用
+    /// ReasoningContent meta (o-origin 路径), a writer 跳过整块或丢 signature,
+    /// M1 修复的保真被 synth 路径破坏。修复后: Thinking meta + ReasoningDelta +
+    /// SignatureDelta → a writer verbatim 回写; StreamScan 折叠回带 signature 的块。
+    #[test]
+    fn synth_anthropic_thinking_signature_preserved() {
+        let resp = IrResponse {
+            content: vec![
+                IrBlock::ReasoningContent {
+                    text: "internal deliberation".into(),
+                    opaque: Some(ThinkingOpaque::Signature("SIGsynth01".into())),
+                    extra: Default::default(),
+                },
+                IrBlock::Text {
+                    text: "answer".into(),
+                    extra: Default::default(),
+                },
+            ],
+            stop_reason: Some(IrStopReason::EndTurn),
+            stop_sequence: None,
+            usage: IrUsage {
+                input_tokens: 3,
+                output_tokens: 7,
+                ..Default::default()
+            },
+            usage_present: true,
+            model: Some("claude-x".into()),
+            id: Some("msg_1".into()),
+            created: None,
+        };
+        let sse = synthesize_sse(Protocol::Anthropic, &resp, SynthIdentity::Keep);
+        let client = String::from_utf8_lossy(&sse);
+        // wire: thinking block 完整生命周期, signature verbatim 到达。
+        assert!(
+            client.contains("\"type\":\"thinking\""),
+            "thinking start frame missing: {client}"
+        );
+        assert!(
+            client.contains("\"thinking\":\"internal deliberation\""),
+            "thinking text missing: {client}"
+        );
+        assert!(
+            client.contains("\"signature\":\"SIGsynth01\""),
+            "signature lost in synth path: {client}"
+        );
+        // StreamScan round-trip: 折叠回 ReasoningContent{text, Signature}。
+        let mut scan = StreamScan::new(Protocol::Anthropic);
+        scan.feed(&sse);
+        let back = scan.snapshot();
+        assert!(
+            matches!(
+                &back.content[0],
+                IrBlock::ReasoningContent {
+                    text,
+                    opaque: Some(ThinkingOpaque::Signature(sig)),
+                    ..
+                } if text == "internal deliberation" && sig == "SIGsynth01"
+            ),
+            "scan fold must carry text + signature: {:?}",
+            back.content
+        );
+        // redacted_thinking: data 在 start 事件整体携带, 无 delta, wire 上原样到达。
+        let redacted = IrResponse {
+            content: vec![IrBlock::ReasoningContent {
+                text: String::new(),
+                opaque: Some(ThinkingOpaque::RedactedData("RDEXTRACT9".into())),
+                extra: Default::default(),
+            }],
+            ..resp.clone()
+        };
+        let sse2 = synthesize_sse(Protocol::Anthropic, &redacted, SynthIdentity::Keep);
+        let client2 = String::from_utf8_lossy(&sse2);
+        assert!(
+            client2.contains("\"type\":\"redacted_thinking\"")
+                && client2.contains("\"data\":\"RDEXTRACT9\""),
+            "redacted_thinking data missing: {client2}"
+        );
+        // 配对完整 (redacted 无 delta 也必须有 stop)。
+        let frames = super::super::iter_sse_frames(sse2.as_slice());
+        assert!(
+            frames
+                .iter()
+                .any(|(et, d)| et == "content_block_stop" && d["index"].as_u64() == Some(0)),
+            "redacted block must close: {client2}"
+        );
+    }
+
+    /// T5×T7 语义交互 ②: r-origin reasoning 块 (含 ec) 经 synth 不再整块消失 —
+    /// 同协议 (Responses) round-trip ec verbatim; 跨协议 (Anthropic ingress) 经
+    /// a writer 的 stop-time envelope 打包 (stateless tool loop 闭合到 synth 路径)。
+    #[test]
+    fn synth_responses_reasoning_ec_preserved() {
+        let resp = IrResponse {
+            content: vec![IrBlock::Reasoning {
+                summary: vec!["summary text".into()],
+                opaque: Some("ECsynth02".into()),
+                extra: Default::default(),
+            }],
+            stop_reason: Some(IrStopReason::EndTurn),
+            stop_sequence: None,
+            usage: IrUsage {
+                input_tokens: 5,
+                output_tokens: 9,
+                ..Default::default()
+            },
+            usage_present: true,
+            model: Some("gpt-5".into()),
+            id: Some("resp_1".into()),
+            created: Some(1700000000),
+        };
+
+        // 同协议 r: done 族帧携带 ec verbatim (T5 曾整块跳过)。
+        let sse = synthesize_sse(Protocol::OpenAIResponses, &resp, SynthIdentity::Keep);
+        let client = String::from_utf8_lossy(&sse);
+        assert!(
+            client.contains("\"delta\":\"summary text\""),
+            "summary delta missing: {client}"
+        );
+        assert!(
+            client.contains("\"encrypted_content\":\"ECsynth02\""),
+            "ec must be written verbatim into done frames: {client}"
+        );
+        // StreamScan 折叠: opaque 存活。
+        let mut scan = StreamScan::new(Protocol::OpenAIResponses);
+        scan.feed(&sse);
+        let back = scan.snapshot();
+        assert!(
+            matches!(
+                &back.content[0],
+                IrBlock::ReasoningContent { text, opaque, .. }
+                    if text == "summary text"
+                        && matches!(opaque, Some(ThinkingOpaque::Signature(ec)) if ec == "ECsynth02")
+            ),
+            "scan fold must carry summary + ec: {:?}",
+            back.content
+        );
+
+        // 跨协议 a ingress: thinking 块 + envelope signature (解包还原原生 r 块)。
+        let sse_a = synthesize_sse(Protocol::Anthropic, &resp, SynthIdentity::Synthesize);
+        let client_a = String::from_utf8_lossy(&sse_a);
+        assert!(
+            client_a.contains("\"thinking\":\"summary text\""),
+            "thinking text (from summary) missing: {client_a}"
+        );
+        let frames_a = super::super::iter_sse_frames(sse_a.as_slice());
+        let sig = frames_a
+            .iter()
+            .find(|(et, d)| et == "content_block_delta" && d["delta"]["type"] == "signature_delta")
+            .map(|(_, d)| d["delta"]["signature"].as_str().unwrap().to_string())
+            .unwrap_or_else(|| panic!("envelope signature_delta missing: {client_a}"));
+        assert!(
+            crate::codec::thinking::unpack(&sig).is_some_and(|b| matches!(
+                &b,
+                IrBlock::Reasoning { summary, opaque, .. }
+                    if summary == &vec!["summary text".to_string()]
+                        && opaque.as_deref() == Some("ECsynth02")
+            )),
+            "envelope must unpack to native Reasoning block: {sig}"
         );
     }
 }
