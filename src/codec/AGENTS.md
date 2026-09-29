@@ -28,6 +28,14 @@
 - ✅ `reasoning_content` (思考原文, OpenAI 兼容 provider 非标字段) 同协议建模:
   请求 (assistant 历史回传) / 非流式响应 / 流式 delta 三路径 reader↔writer 对称
   (#176, 契约 STR-6). 跨协议丢弃 (见下).
+- ✅ reasoning **配置** (请求侧深度思考参数) 跨协议映射 (roadmap A1 批次 1, 2026-09-29):
+  OpenAI `reasoning_effort` / Anthropic `thinking` / Responses `reasoning.effort` ↔ IR
+  first-class `IrRequest.reasoning` (`IrReasoning`: Disabled / Effort(6档) / Budget /
+  Adaptive), effort↔budget 绝对值投影表 [1024..32768] (`nearest_budget` 反查).
+  跨协议 golden `cross_proto_reasoning_golden_o_to_a_to_o` + 投影 property
+  (`fwd_property.rs`). 已知有损: Budget 连续→6档离散 / Adaptive→o 投影 Medium /
+  Disabled→o 无字段; Anthropic writer budget clamp 到 `max_tokens-1`
+  (`clamp_thinking_budget`). 响应侧思考原文 (reasoning_content) 不在此列 (见上条).
 - ✅ Responses 流式 SSE 事件翻译 (2026-09-23 落地, reader + writer 双侧):
   reader (`read_response_events`) 把 SSE 事件映射为 IR 事件流, writer
   (`write_response_event`) 从 IR 事件序列合成合法 Responses SSE (done 族帧的全量
@@ -122,7 +130,9 @@ normalize(v) == normalize(Writer(Reader(v)))
 - ✅ 已覆盖 (request): content 形态 (L1) / stop 形态 (L7) / tools 显式空 (L6) / tool_use input round-trip / 裸 string content part /
   reasoning_content 三路径对称 + 显式空/null 形态 (#176, `reasoning_content_form`) /
   system 字段形态 + message/tool/block 级未建模字段 (L4/L5, #269) / is_error 显式形态 (#269) /
-  max_tokens 双读别名字段名 (#283, `max_tokens_form`)
+  max_tokens 双读别名字段名 (#283, `max_tokens_form`) /
+  reasoning 配置三 wire 形态 (`reasoning_effort`/`thinking`/`reasoning`, A1 — 未知档位值与
+  `display`/`summary` 子字段经 extra 兜底; first-class 注入仅在 extra 无对应 key 时发生, 无双写)
 - ⏸️ 搁置 (待后续): 多 system messages 合并 (L2, **OpenAI/Responses codec 侧仍提升** —
   Anthropic 已按位保留) / usage 字段位置 (L8, **Anthropic response 路径** — 顶层
   input_tokens vs usage.input_tokens)

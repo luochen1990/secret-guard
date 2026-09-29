@@ -274,7 +274,10 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 **为什么不要求 byte-exact**: 跨协议时 ingress wire 与 egress wire 是不同协议格式 (OpenAI Chat Completions JSON vs Anthropic Messages JSON), 字节层面本就不同. 契约只能落在"建模范围内语义保留".
 
 **语义损失的显式清单** (人工审查项, 维护在 `src/codec/AGENTS.md`):
-- reasoning / thinking 字段不建模, 丢弃.
+- 请求侧 reasoning **配置** 已建模并跨协议翻译 (roadmap A1 批次 1, 2026-09-29 精确化:
+  `reasoning_effort` / `thinking` / `reasoning.effort` ↔ `IrRequest.reasoning`,
+  投影有损 — Budget 连续→6档离散 / Adaptive→o 投影 Medium / Disabled→o 无字段);
+  响应侧思考原文 (reasoning_content / thinking blocks) 仍不建模, 跨协议丢弃.
 - citations / logprobs 不建模, 丢弃.
 - prompt caching 字段不建模, 丢弃.
 - usage 只保留 input/output 总数 + cache_read/cache_creation 4 个字段, 细分字段丢弃.

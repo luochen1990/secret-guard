@@ -118,7 +118,7 @@ secret-guard 的 IR (中间表示) 有一个 `extra: Map<String, Value>` 字段�
 
 | # | 语义 | OpenAI Chat | Anthropic | OpenAI Responses | 真实用量 | fixture | 优先级 | 备注 |
 |---|---|---|---|---|---:|---:|:-:|---|
-| A1 | **reasoning 配置** | `reasoning_effort: enum` | `thinking: {budget_tokens, type, display}` | `reasoning: {effort, ...}` | 94% (thinking) + 2% (effort) | 0 | **P0** | 真实用量最高, Busbar/Vercel/OpenRouter 一致推荐优先; 归一化:`IrReasoning::{Effort, Budget, Dynamic}` typed enum + budget 表 |
+| A1 | **reasoning 配置** | `reasoning_effort: enum` | `thinking: {budget_tokens, type, display}` | `reasoning: {effort, ...}` | 94% (thinking) + 2% (effort) | 0 | **P0** (已实施 2026-09-29, T6) | 真实用量最高, Busbar/Vercel/OpenRouter 一致推荐优先; 归一化:`IrReasoning::{Disabled, Effort, Budget, Adaptive}` typed enum + budget 表 (比 §A1 草案的 `Dynamic` 更名 `Adaptive`, 对齐 Anthropic wire 的 `type:"adaptive"`) |
 | A2 | **response_format / 结构化输出** | `response_format: {type, json_schema?}` | `output_config.format: {schema, type}` | `text.format: {schema, type}` | 0% | 0 | **P1** | 三协议都有, Busbar 注释明确说该字段曾是 "Value→每 writer 修一次 bug" 的重灾区; 归一化:`IrResponseFormat::{Text, JsonSchema, JsonObject}` typed enum |
 | A3 | **service_tier** | `service_tier: enum(6档)` | `service_tier: enum(2档)` | 同 Chat | 0% | 0 | **P1** | 两协议都有, 枚举值不对等需要降级映射 (Anthropic 无 flex/scale → auto); 简单 enum |
 | A4 | **stream_options.include_usage** | `stream_options: {include_usage}` | (Anthropic 流式默认带 usage) | `stream_options: {include_obfuscation}` | 96% | 0 | **P1** | 真实用量第二高. **归类别 A 但实施形态特殊**: 目标协议 (Anthropic) 无对应字段, 但有"默认行为等价"的对应 — Anthropic 流式天然带 usage. 详见 §6.A4 |
@@ -318,7 +318,7 @@ OpenRouter 用 ratio 公式 (max_tokens × 0.1/0.2/0.5/0.8/0.95), 自适应 max_
 - `fwd_property.rs` 加 round-trip test: `normalize(reasoning_effort wire) == normalize(writer(reader(wire)))`
 - 跨协议 golden: OpenAI `reasoning_effort: "high"` → Anthropic `thinking: {type:"enabled", budget_tokens: 8192}` → 回 OpenAI 应得 `reasoning_effort: "high"`
 
-**与 extra 共存**: 提升后, Anthropic reader 的 known 列表**仍保留 `thinking`** (拿原始 object 进 extra), 让用户保留 `display` 字段等 first-class 不覆盖的精细控制. writer 优先读 first-class, extra 只用于回写 same-proto round-trip.
+**与 extra 共存** (与 §2.4 纪律一致): 提升后, Anthropic reader 的 collect_extra 排除清单**不添加 `thinking`** (原始 object 继续进 extra), 让用户保留 `display` 字段等 first-class 不覆盖的精细控制, 未知档位值也靠 extra 兜底 (reader 建不出 enum 时 same-proto 不丢). writer **优先读 extra** (检测到对应 key 时跳过 first-class 注入, 避免双写), first-class 仅驱动跨协议翻译 (seam 上 extra 已清空). 三协议 (o `reasoning_effort` / r `reasoning`) 同型处理. [2026-09-29 实施注: 本段原文曾写 "writer 优先读 first-class", 与 §2.4 及实现相反, 已修正.]
 
 **已知限制**: OpenAI `reasoning_effort: "max"` 在 Anthropic 侧 budget 表只到 32768, 可能不够; 真实场景按 ratio 更准, 后续优化.
 
@@ -424,7 +424,7 @@ OpenAI `metadata: map(16 KV)` vs Anthropic `metadata: {user_id}` — 同名但�
 
 | 批次 | 字段 | 优先级依据 | 解阻塞 | 预计工作量 |
 |---|---|---|---|---|
-| **批次 1** | A1 (reasoning) | 真实用量 94%+2% | — | 中 (typed enum + budget 表 + 跨协议 golden) |
+| **批次 1** | A1 (reasoning) — **已完成** (2026-09-29, T6) | 真实用量 94%+2% | — | 中 (typed enum + budget 表 + 跨协议 golden) |
 | **批次 2** | A2 (response_format) + A3 (service_tier) | Busbar 重灾区 + 简单 enum | L8 partial | 中 (A2 复杂, A3 简单, 合并批) |
 | **批次 3** | A4 (stream_options) | 真实用量 96% | L8 partial | 小 (派生字段, 不复杂) |
 | **批次 4** | A7 (logprobs) + warnings 机制 | 中优先级, 配套 warnings 基础设施 | — | 中 |
@@ -503,3 +503,4 @@ OpenAI `metadata: map(16 KV)` vs Anthropic `metadata: {user_id}` — 这两个�
 | 2026-08-05 | 初版 (基于三阶段调研: 前人工作 / 字段全景 / 使用统计) | opencode-bot |
 | 2026-08-23 | `reasoning_content` (思考原文, #176) 按 §2.2 准则判定: 出现在 OpenAI Chat 的请求 (assistant 历史回传) / 非流式响应 / 流式 delta 三路径, 但另两协议无合法合成形态 (Anthropic thinking 需 signature / Responses reasoning 需 encrypted_content) → **步骤 2 不满足, 建 first-class block (`IrBlock::ReasoningContent`) 但跨协议丢弃**. 这是 §2.2 准则的边界案例: "无跨协议映射"通常归 extra, 但 extra 是顶层字段逃生舱, 无法表达 message-level / stream delta 的同协议保真, 故建独立 block variant (契约 STR-6). 与 A1 (reasoning **配置**) 正交: A1 是请求侧 effort/budget 参数, 本条是响应侧思考原文. | opencode-bot |
 | 2026-09-23 | **wire fidelity 下沉到 message/tool/block 级 (L4/L5 实施, #269)**: `IrMessage`/`IrTool`/四个 wire 来源 `IrBlock` variant 增 `extra` (未建模字段逃生舱, 与顶层 extra 同契约: 同协议透传/跨协议 `clear_wire_fidelity` 清空), `IrBlock::ToolResult.is_error` 改 `Option<bool>` (显式形态保真), 新增 `IrRequest.system_form` (顶层 system string/array 形态, 单 block array 不折叠). 按 §2.2 准则: cache_control/defer_loading 等在 Anthropic 为 block/tool 级载体, 顶层 extra 逃生舱无法表达 (同 2026-08-23 reasoning_content 判定的边界案例逻辑), 故下沉到对应层级; 跨协议归一化 (A8) 仍 P3 待办 — extra 契约 = "跨协议该丢", 与本条 "同协议不丢" 正交. redact 双轨遍历 (StringLeafOps + collect_ir_str_leaves) 同步扩展, dag BlockPool 内容寻址 hash 纳入 extra (intern 正确性). Anthropic codec 先行 (OpenAI/Responses 的 message/block extra 收集待后续, 字段已就位). FWD-2 生成器扩展机械锁定 (system 形态 / cache_control / defer_loading / output_config / is_error 显式 false / 响应侧 block extra). | issue #269 (缓存友好性评估 → 用户裁决 M1+M2+M3 全做) |
+| 2026-09-29 | **批次 1 实施 (A1 reasoning 配置, T6)**: `IrRequest` 增 `reasoning: Option<IrReasoning>` (Disabled/Effort/Budget/Adaptive) + `IrReasoningEffort` 6 档 + effort↔budget 绝对值投影表 [1024..32768] (`nearest_budget` 反查, 等距平局取较高档). 三协议 reader (o `reasoning_effort` / a `thinking` / r `reasoning.effort`) + writer (a writer budget clamp 到 max_tokens-1) 按本文件 §A1 方案落地. **与 extra 共存** (§2.4): 三字段均**保留**在 collect_extra 捕获范围 — same-proto 由 extra 原样回写 (writer 检测 extra 有 key 时跳过 first-class 注入, 无双写), 未知档位值靠 extra 兜底不丢; 跨协议 seam extra 清空后 first-class 驱动翻译. `reasoning` 是语义字段, `clear_wire_fidelity` 不清. property: `arb_ir_reasoning` + 跨协议 golden (o→a→o) + effort round-trip + Budget nearest 幂等 (fwd_property.rs). 已知损失: Budget 连续→离散投影有损 / Adaptive→o 投影 Medium / Disabled→o 无字段 (known-limitations codec 节). | T6 任务 (cc-switch gap 审计 维度 3) |
