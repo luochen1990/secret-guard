@@ -193,6 +193,19 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 > 官方模型清单 — Claude Sonnet 5 等部分模型不支持, 由客户端按目标上游自行选择形态).
 > IR 路径 (redact / model 重写强制) 对该形态**按原位保留与写回**: reader 不再提升合并到顶层
 > system, writer 按原位输出 role=system — FWD-1 字面等式对该形态成立 (无位置搬移).
+
+> **伪流式上游的合成 SSE 形态适配** (2026-09-29 登记, 审计 T5 / PR #291): 当三元组条件成立 —
+> ① 客户端请求显式顶层 `stream=true` ② 上游 2xx ③ 判型为非 SSE (响应走 buffered 翻译: 跨协议
+> 翻译或同协议 redact 重序列化, 两 seam 本已授权经 IR 改写) — 响应半段不再以 `application/json`
+> 单块返回, 而是 restore 之后的 IrResponse **重放 (synthesize) 为 ingress 协议的完整 SSE 事件流**
+> (`text/event-stream`). FWD-1 响应半段的字面等式对该场景**不适用**: 替代不变式为 **合成流经
+> ingress 协议流式 reader (StreamScan) 解析回的 IrResponse 与 buffered 翻译产出语义等价**
+> (message 内容 / stop_reason / usage), 且 restore (mock→real) 严格先于合成 (mock 不泄漏,
+> RED-7 延伸). 定位: 这是 "客户端要 SSE 却拿到单块 JSON" (伪流式上游违约) 的**形态履约修复**,
+> 非新增改写类别; same-proto 无 redact 的字节透传路径 (FWD-1 铁域) 不受影响. 回归守卫:
+> `tests/integration.rs` 的 `pseudo_streaming_*` 族 (5 测试: o/a/r 三 ingress 合成 round-trip +
+> same-proto redact 安全序 + parse 失败回落 JSON 兜底); 行为边界细则见 known-limitations.md
+> codec 节 T5 条目.
 >
 > **修正记录**: 同日早前的"正规化"决策 (reader 提升合并 + 契约例外注记) 定性为错误 —
 > ① 提升改变指令生效位置 (从中途变为开头), ② 顶层 system 增长使缓存前缀从该点整体失效

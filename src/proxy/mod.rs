@@ -43,7 +43,9 @@
 //! - `fan_out_streaming_cross_proto`: 跨协议流式翻译 (可选 restore), 用于 cross-proto +
 //!   stream=true + 2xx SSE. egress SSE → IR event → (restore) → ingress SSE.
 //! - `fan_out_buffered_ir`: 非流式 + IR restore, 用于 same-proto + Redact + 非流式 / cross-proto.
-//!   完整累积响应, restore, 一次性返回.
+//!   完整累积响应, restore, 一次性返回. T5: 客户端 stream=true + 上游 2xx 单块 JSON
+//!   (伪流式上游) 且 parse 成功时, 出站合成完整 SSE 生命周期 (`codec::stream::synthesize_sse`)
+//!   而非单块 JSON — SDK 流式解析器需要事件流 shape; cross_proto 的 buffered 分支同型.
 //! - **客户端响应永远无大小上限**; 只有 record 累积受 `MAX_RESP_BODY_RECORD` (32 MiB) 约束.
 //!
 //! # 流式响应处理

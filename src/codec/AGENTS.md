@@ -87,11 +87,13 @@
   流式事件映射与合成规格的指针见上方支持矩阵). 子模块:
   - `mod.rs` — 非流式: Reader/Writer trait 实现 (流式方法委托 stream) + 共享 helpers + 非流式测试.
   - `stream.rs` — 流式: SSE 事件 ↔ IR 事件双向状态机 (reader 映射表 / writer 合成累积 / 探测幂等).
-- `stream/` (目录, 4 子模块) — SSE chunk-boundary 处理 (TCP 切片兼容, CRLF/LF 双兼容, MAX_BUF 溢出 abort). 子模块:
+- `stream/` (目录, 5 子模块) — SSE chunk-boundary 处理 (TCP 切片兼容, CRLF/LF 双兼容, MAX_BUF 溢出 abort). 子模块:
   - `mod.rs` — 共享 SSE utils (`find_frame_terminator` / `parse_sse_frame` / `reframe_sse`) + 常量 + 集中测试.
   - `reassembler.rs` — `SseReassembler` (StreamTranslate / StreamScan 共享的帧重组骨架, 私有).
   - `translate.rs` — `StreamTranslate` (egress SSE → ingress SSE, 跨协议翻译 + 同协议 restore).
   - `scan.rs` — `StreamScan` (egress SSE → IrResponse 累积器, 供 WebUI parsed view).
+  - `synth.rs` — `synthesize_sse` (IrResponse → 完整 SSE 生命周期, 伪流式上游形态适配 T5;
+    IrResponse → IrStreamEvent 序列 → 各协议 writer 既有流式序列化, 无新协议形态知识).
   核心 de-frame 逻辑抽出共享骨架 `SseReassembler`, 由 `StreamTranslate` / `StreamScan` 各持一个实例, 避免 reassembly 循环重复 + 行为漂移.
 
 ## wire fidelity (wire 形态元数据)

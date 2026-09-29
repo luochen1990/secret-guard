@@ -321,6 +321,38 @@ pub(super) fn warn_mock_not_restored(
     }
 }
 
+/// T5 伪流式形态适配的合成点 (cross_proto / `fan_out_buffered_ir` 两接线的 SSOT,
+/// 与 `restore_via_json_leaf_fallback` 同族 — 同一对消费点的共享 helper 先例):
+/// 打 WARN (伪流式上游被形态适配, 措辞对齐 "falling back" 家族) 后, 把 (restore 后的)
+/// IrResponse 重放为 ingress 协议的完整 SSE 生命周期 (`codec::stream::synthesize_sse`).
+///
+/// 身份策略由调用方传入: cross-proto = [`SynthIdentity::Synthesize`] (剥离 egress
+/// 格式 id, 由 writer 合成本地格式); same-proto = [`SynthIdentity::Keep`] (id 本就是
+/// 本协议格式, 与非流式 `write_response` 保留 id 一致).
+///
+/// 日志的 ingress 协议名对齐 native `Protocol::name` 口径 (Responses =
+/// "openai-responses"), 与 proxy 层其余日志一致 (codec writer 的 name 是 "responses",
+/// 两口径在 r 协议上有别, 此处选 native 口径).
+pub(super) fn synth_sse_for_stream_client(
+    record_id: uuid::Uuid,
+    proto: crate::codec::Protocol,
+    resp: &crate::codec::ir::IrResponse,
+    identity: crate::codec::stream::SynthIdentity,
+) -> Vec<u8> {
+    let ingress_name = match proto {
+        crate::codec::Protocol::OpenAI => "openai",
+        crate::codec::Protocol::Anthropic => "anthropic",
+        crate::codec::Protocol::OpenAIResponses => "openai-responses",
+    };
+    tracing::warn!(
+        %record_id,
+        ingress = ingress_name,
+        "pseudo-streaming upstream returned a single JSON body; \
+         synthesizing SSE lifecycle for stream=true client"
+    );
+    crate::codec::stream::synthesize_sse(proto, resp, identity)
+}
+
 /// RED-8 reader 拒绝分支的共享兜底决策序列 (fan_out_buffered_ir / cross_proto_forward
 /// 的 SSOT): 在外层**已 parse** 的 `v` 上尝试 JSON 叶子级 restore (零二次 parse) —
 /// 成功 → restored WARN + 重序列化字节; 未命中/无 redaction → mock-not-restored WARN

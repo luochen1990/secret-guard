@@ -7,7 +7,9 @@
 //! - [`same_proto_forward`] (有 secret 或 override): IR 路径 (reader → [model 注入] →
 //!   redact_ir → writer). 请求侧经 IR 改写 (FWD-1 修订授权: model 重写 / redact).
 //!   响应侧按 redaction map 分流 — map 非空才需要 restore: 流式 2xx 走 StreamTranslate
-//!   同协议 restore 模式 (openai/anthropic/responses 三协议族均支持), 其余走 buffered_ir;
+//!   同协议 restore 模式 (openai/anthropic/responses 三协议族均支持), 其余走 buffered_ir
+//!   (T5: 客户端 stream=true + 上游 2xx 单块 JSON 且 parse 成功时, buffered_ir 出站合成
+//!   完整 SSE 生命周期, 见 `codec::stream::synthesize_sse`);
 //!   **map 为空 (override-only / secret 未命中) 响应保持字节透传** (fan_out_streaming,
 //!   byte-exact + 流式 UX; parsed view 按协议累积 — Responses 由流式 reader
 //!   `read_response_events` 解码事件派生, 见 ParsedSync::finalize).
@@ -303,6 +305,9 @@ pub(crate) async fn same_proto_forward(
                 codec_proto,
                 redaction_map,
                 state.on_fallback_restore,
+                // T5: 客户端是否显式声明 stream=true — 判型降级 (上游非 SSE) 且
+                // parse 成功时由 buffered_ir 合成 SSE 生命周期 (形态适配)。
+                ir.stream,
                 state.upstream_timeouts.stream_idle,
                 usage_ctx.clone(),
                 pool_watch,

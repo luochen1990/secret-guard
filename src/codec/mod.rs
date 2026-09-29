@@ -24,7 +24,8 @@
 //! - [`openai`]     —— OpenAI Chat Completions 的 Reader / Writer
 //! - [`anthropic`]  —— Anthropic Messages 的 Reader / Writer
 //! - [`responses`]  —— OpenAI Responses API 的 Reader / Writer
-//! - [`stream`]     —— SSE 流式响应的 chunk-boundary 处理 (StreamTranslate)
+//! - [`stream`]     —— SSE 流式响应的 chunk-boundary 处理 (StreamTranslate /
+//!   StreamScan / 伪流式形态适配 synthesize_sse)
 
 pub mod anthropic;
 pub mod ir;

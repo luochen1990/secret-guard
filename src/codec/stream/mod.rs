@@ -4,6 +4,7 @@
 //!
 //! - [`StreamTranslate`]: 跨协议 SSE 翻译器 + 同协议 restore 模式 (实现在 `translate` 子模块).
 //! - [`StreamScan`]:      流式 parsed view 累积器 (egress SSE → IrResponse, 实现在 `scan` 子模块).
+//! - [`synthesize_sse`]:  伪流式上游的形态适配 (IrResponse → 完整 SSE 生命周期, 实现在 `synth` 子模块).
 //! - `SseReassembler`:    StreamTranslate / StreamScan 共享的帧重组骨架 (实现在 `reassembler` 子模块, 私有不导出).
 //! - 本模块 (根):         共享 SSE 工具函数 + 上述类型的 re-export + 集中测试.
 //!
@@ -27,6 +28,7 @@
 
 mod reassembler;
 mod scan;
+mod synth;
 mod translate;
 
 // 私有引入 SseReassembler 供本模块的 tests 访问 (reassembler.rs 用 pub(super) 暴露).
@@ -34,6 +36,7 @@ mod translate;
 use reassembler::SseReassembler;
 
 pub use scan::StreamScan;
+pub use synth::{SynthIdentity, synthesize_sse};
 pub use translate::{DeltaKind, StreamRestoreHook, StreamTranslate};
 
 /// SSE 流终止符 sentinel (OpenAI 约定).

@@ -43,8 +43,11 @@ use super::recorder::{
 ///
 /// - `ir.stream == true` + 2xx + Content-Type 是 SSE: 流式翻译扇出
 ///   (`fan_out_streaming_cross_proto`), redact 场景注入 restore hook.
-/// - 其余 (非流式请求 / 非 2xx / 非 SSE): 完整 buffer 后一次性翻译 (非流式语义).
-///   流式请求但上游返回非 SSE 时打 WARN (与 same_proto 判型处对称).
+/// - `ir.stream == true` + 2xx + 非 SSE (伪流式上游返回单块 JSON): buffer 后翻译,
+///   成功 parse 为 IrResponse 时**合成 SSE 生命周期**返回 (T5 形态适配 — 客户端
+///   的 SDK 流式解析器需要事件流 shape, 单块 JSON 大概率报错; 见
+///   `codec::stream::synthesize_sse`); parse 失败回落 buffered JSON 现状.
+/// - 其余 (非流式请求 / 非 2xx): 完整 buffer 后一次性翻译 (非流式语义).
 /// - 上游错误响应 (4xx/5xx) 也通过 codec 翻译为 ingress 协议的原生错误 envelope.
 ///
 /// # 限制
@@ -403,6 +406,9 @@ pub(crate) async fn cross_proto_forward(
     // B1: finalize 统一产出 (message + 元字段 + 回显摘要, restore 前提取; parsed
     // 渲染派生, 不再长期存 Value) — 语义同 fan_out_buffered_ir.
     let mut resp_finality = super::recorder::RespFinality::empty();
+    // T5 形态适配标志: 客户端声明 stream=true 且响应成功 parse 为 IR → 出站以合成
+    // SSE 生命周期替代单块 JSON (步骤 17 据此切换 content-type).
+    let mut client_resp_is_sse = false;
     let (resp_status_out, resp_body_out): (StatusCode, Vec<u8>) = if resp_status.is_success() {
         match serde_json::from_slice::<serde_json::Value>(&resp_bytes) {
             Ok(v) => match egress_reader.read_response(&v) {
@@ -428,9 +434,27 @@ pub(crate) async fn cross_proto_forward(
                     resp_finality = super::recorder::RespFinality::from_ir(ingress_codec, &ir_resp);
                     // restore: mock → real (跨协议 + redact 时, 客户端看到的应该是真 secret).
                     crate::redact::restore_ir_response(&mut ir_resp, &redaction_map);
-                    let translated = ingress_writer.write_response(&ir_resp);
-                    let body = serde_json::to_vec(&translated).unwrap_or_default();
-                    (resp_status, body)
+                    if ir.stream {
+                        // T5 伪流式上游形态适配 (SSOT helper, WARN 在彼处): 客户端要
+                        // SSE 却拿到单块 JSON — 把 restore 后的 IrResponse 重放为
+                        // ingress 协议完整 SSE 生命周期; 身份剥离 (Synthesize) 与
+                        // 流式翻译路径同裁决。合成是全函数, parse 失败在其余分支
+                        // 回落 buffered JSON 现状.
+                        client_resp_is_sse = true;
+                        (
+                            resp_status,
+                            super::helpers::synth_sse_for_stream_client(
+                                record_id,
+                                ingress_codec,
+                                &ir_resp,
+                                crate::codec::stream::SynthIdentity::Synthesize,
+                            ),
+                        )
+                    } else {
+                        let translated = ingress_writer.write_response(&ir_resp);
+                        let body = serde_json::to_vec(&translated).unwrap_or_default();
+                        (resp_status, body)
+                    }
                 }
                 Err(e) => {
                     warn!(%record_id, error = %e.message, "failed to parse upstream response as {}; passing through verbatim", egress.name());
@@ -528,13 +552,18 @@ pub(crate) async fn cross_proto_forward(
     // record 最终态写入后打摘要 (#160).
     super::recorder::log_forward_summary(&state.dag, record_id);
 
-    // 17. 构造响应.
+    // 17. 构造响应. content-type: 合成 SSE (T5) → text/event-stream; 其余 (buffered
+    //     JSON / 错误 envelope / 透传) → application/json.
     let mut resp = Response::new(Body::from(resp_body_out));
     *resp.status_mut() = resp_status_out;
     let mut out_headers = build_response_headers(&resp_headers);
     out_headers.insert(
         axum::http::header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
+        HeaderValue::from_static(if client_resp_is_sse {
+            "text/event-stream"
+        } else {
+            "application/json"
+        }),
     );
     out_headers.remove(axum::http::header::CONTENT_LENGTH);
     *resp.headers_mut() = out_headers;

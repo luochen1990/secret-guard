@@ -382,6 +382,12 @@ pub(crate) async fn fan_out_streaming(
 ///
 /// 用于: 同协议 + redact + 非流式响应; 同协议 + redact + 流式响应但上游出错 (非 2xx).
 ///
+/// **T5 形态适配**: `client_requested_stream = true` (客户端显式 stream=true) 且
+/// 上游 2xx 且 codec 成功 parse 时, 出站不以 application/json 返回, 而是把 restore
+/// 后的 IrResponse 重放为 ingress 协议的完整 SSE 生命周期 (`synthesize_sse`,
+/// 身份 Keep — 同协议 id 本就是本协议格式)。伪流式上游 (无视 stream=true 返回单块
+/// JSON) 下 SDK 流式解析器拿到期望的事件流 shape; parse 失败 / 非 2xx 回落现状。
+///
 /// `on_fallback_restore` = `[redact] on_fallback_restore` (SEC-10): reader-拒绝
 /// fallback 臂是否 restore (withhold 保留 Mock / restore 还原), 见
 /// `helpers::restore_via_json_leaf_fallback`.
@@ -403,6 +409,7 @@ pub(crate) async fn fan_out_buffered_ir(
     codec_proto: crate::codec::Protocol,
     redaction_map: RedactionMap,
     on_fallback_restore: crate::config::OnFallbackRestore,
+    client_requested_stream: bool,
     stream_idle_timeout: Option<std::time::Duration>,
     usage: crate::usage::UsageCtx,
     pool_watch: Option<crate::pool::PoolWatch>,
@@ -459,6 +466,9 @@ pub(crate) async fn fan_out_buffered_ir(
     let warn_mock_not_restored = |detail: &str| {
         super::helpers::warn_mock_not_restored(record_id, detail, &redaction_map);
     };
+    // T5 形态适配标志: 客户端要 SSE 却拿到单块 JSON 且 parse 成功 → 出站合成 SSE
+    // (下方响应构造据此切换 content-type)。
+    let mut client_resp_is_sse = false;
     let client_bytes: Vec<u8> = if recorder.error_kind.is_some() {
         // stream 中途中断 → 不 parse, 返回空 body (状态码下方调整为 502/504).
         Vec::new()
@@ -476,8 +486,22 @@ pub(crate) async fn fan_out_buffered_ir(
                     // record 接线走 LLM 视角 (restore 之前, 含 mock) 的 finality.
                     finality = super::recorder::RespFinality::from_ir(codec_proto, &ir);
                     crate::redact::restore_ir_response(&mut ir, &redaction_map);
-                    let restored = writer.write_response(&ir);
-                    serde_json::to_vec(&restored).unwrap_or_else(|_| recorder.acc.clone())
+                    if client_requested_stream && resp_status.is_success() {
+                        // T5 伪流式上游形态适配 (SSOT helper, WARN 在彼处): restore 后的
+                        // IrResponse 重放为完整 SSE 生命周期 (同协议 → 身份 Keep, 与
+                        // 非流式 write_response 保留 id 一致)。合成是全函数, parse
+                        // 失败分支回落 buffered JSON 现状 (best-effort, ROB-*).
+                        client_resp_is_sse = true;
+                        super::helpers::synth_sse_for_stream_client(
+                            record_id,
+                            codec_proto,
+                            &ir,
+                            crate::codec::stream::SynthIdentity::Keep,
+                        )
+                    } else {
+                        let restored = writer.write_response(&ir);
+                        serde_json::to_vec(&restored).unwrap_or_else(|_| recorder.acc.clone())
+                    }
                 }
                 Err(e) => {
                     // RED-8 / SEC-10: reader 拒绝 (eg choices 类型错配) 但 body 仍是
@@ -570,7 +594,16 @@ pub(crate) async fn fan_out_buffered_ir(
 
     let mut resp = Response::new(Body::from(client_bytes));
     *resp.status_mut() = client_status;
-    *resp.headers_mut() = build_response_headers(&resp_headers);
+    let mut out_headers = build_response_headers(&resp_headers);
+    if client_resp_is_sse {
+        // T5: 出站是合成 SSE — content-type 切换为 text/event-stream (上游声明的
+        // application/json 描述的是未适配的形态, 不再成立)。
+        out_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("text/event-stream"),
+        );
+    }
+    *resp.headers_mut() = out_headers;
     Ok(resp)
 }
 

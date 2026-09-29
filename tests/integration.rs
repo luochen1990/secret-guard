@@ -8149,6 +8149,327 @@ async fn forward_summary_for_streaming_logs_after_stream_end() {
     );
 }
 
+// ─── 伪流式上游 → 合成 SSE 生命周期 (T5, 审计维度 9 前半) ────────────────────
+//
+// 场景: 客户端显式 stream=true, 上游 (伪流式中转 / 不支持流式的网关) 对 2xx 返回
+// 单块 JSON。判型降级 buffered 翻译成功产出 IrResponse 后, 不再以 application/json
+// 返回, 而是把 IrResponse 重放为 ingress 协议的完整 SSE 事件流 (text/event-stream),
+// SDK 流式解析器拿到期望的 wire 形态。失败路径 (codec 无法 parse) 回落 buffered JSON
+// 现状。same-proto 无 redact 的字节透传路径不受影响 (FWD-1 铁域, 不在本节范围)。
+//
+// round-trip 断言复用 codec 的 StreamScan: 合成 SSE 经对应协议流式 reader 累积回的
+// IrResponse 与上游原文语义等价 (message 内容 / stop_reason / usage)。
+
+/// 把完整 SSE body 喂入对应协议的 StreamScan, 返回累积的 IrResponse (round-trip 器).
+fn scan_sse_response(
+    proto: secret_guard::codec::Protocol,
+    sse: &str,
+) -> secret_guard::codec::IrResponse {
+    let mut scan = secret_guard::codec::stream::StreamScan::new(proto);
+    scan.feed(sse.as_bytes());
+    scan.snapshot()
+}
+
+/// 响应 content-type (裸 media type; 缺失 → 空串, T5 节内判型断言共用).
+fn resp_content_type(headers: &reqwest::header::HeaderMap) -> String {
+    headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// 断言 IrResponse 首个 content block 是指定文本 (T5 节内 round-trip 共用).
+fn assert_first_text(ir: &secret_guard::codec::IrResponse, expected: &str) {
+    match ir.content.first() {
+        Some(secret_guard::codec::IrBlock::Text { text, .. }) => {
+            assert_eq!(text, expected);
+        }
+        other => panic!("expected Text block {expected:?}, got {other:?}; ir: {ir:?}"),
+    }
+}
+
+/// o ingress (跨协议): Anthropic 上游无视 stream=true 返回单块 JSON → 客户端收到
+/// 合成 OpenAI SSE 生命周期 (首块 role delta → content → finish_reason → [DONE]),
+/// round-trip 与上游原文语义等价。
+#[tokio::test]
+async fn pseudo_streaming_cross_proto_synthesizes_openai_sse_lifecycle() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/messages")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"msg_01t5","type":"message","role":"assistant","content":[{"type":"text","text":"Hi from Claude"}],"model":"claude-3-5-sonnet","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":5}}"#,
+        )
+        .create_async()
+        .await;
+    let provider = provider_with("an-main", Protocol::Anthropic, &upstream.url());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+
+    let (status, body, headers) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/an-main/v1/chat/completions",
+        r#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"Hello"}]}"#,
+        &[],
+    )
+    .await;
+
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {body}");
+    let ct = resp_content_type(&headers);
+    assert!(
+        ct.starts_with("text/event-stream"),
+        "client asked for SSE but got content-type {ct:?}; body: {body}"
+    );
+    // OpenAI 生命周期: [DONE] 终止符 + finish_reason chunk.
+    assert!(
+        body.ends_with("data: [DONE]\n\n"),
+        "synthesized OpenAI stream must end with [DONE]: {body}"
+    );
+    assert!(
+        body.contains("\"finish_reason\":\"stop\""),
+        "finish_reason chunk missing: {body}"
+    );
+
+    // round-trip: 合成流经 OpenAI 流式 reader 累积, 与上游原文语义等价.
+    let ir = scan_sse_response(secret_guard::codec::Protocol::OpenAI, &body);
+    assert_first_text(&ir, "Hi from Claude");
+    assert_eq!(
+        ir.stop_reason,
+        Some(secret_guard::codec::IrStopReason::EndTurn)
+    );
+    // usage: OpenAI reader 归一化 prompt_tokens (含 cached 总和) → input_tokens = 10.
+    assert_eq!(ir.usage.input_tokens, 10);
+    assert_eq!(ir.usage.output_tokens, 5);
+}
+
+/// a ingress (跨协议): OpenAI 上游无视 stream=true 返回单块 JSON → 客户端收到合成
+/// Anthropic SSE 生命周期 (message_start → 配对的 content_block 族 → message_delta →
+/// message_stop), round-trip 语义等价。
+#[tokio::test]
+async fn pseudo_streaming_cross_proto_synthesizes_anthropic_sse_lifecycle() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"chatcmpl-t5","object":"chat.completion","created":1700000000,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"Hi from GPT"},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":4,"total_tokens":16}}"#,
+        )
+        .create_async()
+        .await;
+    let provider = provider_with("oa-main", Protocol::OpenAI, &upstream.url());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+
+    let (status, body, headers) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/a/oa-main/v1/messages",
+        r#"{"model":"claude","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":50}"#,
+        &[],
+    )
+    .await;
+
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {body}");
+    let ct = resp_content_type(&headers);
+    assert!(
+        ct.starts_with("text/event-stream"),
+        "client asked for SSE but got content-type {ct:?}; body: {body}"
+    );
+    // Anthropic 生命周期: message_start 首 / message_stop 末 / block 配对完整.
+    assert!(
+        body.starts_with("event: message_start\n"),
+        "must open with message_start: {body}"
+    );
+    let frames: Vec<&str> = body.split("\n\n").filter(|f| !f.is_empty()).collect();
+    assert_eq!(
+        frames.last(),
+        Some(&"event: message_stop\ndata: {\"type\":\"message_stop\"}"),
+        "must close with message_stop: {body}"
+    );
+
+    // round-trip 语义等价.
+    let ir = scan_sse_response(secret_guard::codec::Protocol::Anthropic, &body);
+    assert_first_text(&ir, "Hi from GPT");
+    assert_eq!(
+        ir.stop_reason,
+        Some(secret_guard::codec::IrStopReason::EndTurn)
+    );
+    assert_eq!(ir.usage.input_tokens, 12);
+    assert_eq!(ir.usage.output_tokens, 4);
+}
+
+/// r ingress (跨协议): OpenAI 上游无视 stream=true 返回单块 JSON → 客户端收到合成
+/// Responses SSE 生命周期 (response.created → output_item/content_part/delta →
+/// response.completed), round-trip 语义等价。
+#[tokio::test]
+async fn pseudo_streaming_cross_proto_synthesizes_responses_sse_lifecycle() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"chatcmpl-t5r","object":"chat.completion","created":1700000000,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"Hi from GPT"},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":4,"total_tokens":16}}"#,
+        )
+        .create_async()
+        .await;
+    let provider = provider_with("oa-main", Protocol::OpenAI, &upstream.url());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+
+    let (status, body, headers) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/r/oa-main/v1/responses",
+        r#"{"model":"gpt-4o","stream":true,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Hello"}]}]}"#,
+        &[],
+    )
+    .await;
+
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {body}");
+    let ct = resp_content_type(&headers);
+    assert!(
+        ct.starts_with("text/event-stream"),
+        "client asked for SSE but got content-type {ct:?}; body: {body}"
+    );
+    // Responses 生命周期: created 开场 + completed 收尾, 无 [DONE].
+    assert!(
+        body.contains("event: response.created\n"),
+        "missing response.created: {body}"
+    );
+    assert!(
+        body.contains("event: response.completed\n"),
+        "missing response.completed: {body}"
+    );
+    assert!(!body.contains("[DONE]"), "Responses has no [DONE]: {body}");
+
+    // round-trip 语义等价.
+    let ir = scan_sse_response(secret_guard::codec::Protocol::OpenAIResponses, &body);
+    assert_first_text(&ir, "Hi from GPT");
+    assert_eq!(
+        ir.stop_reason,
+        Some(secret_guard::codec::IrStopReason::EndTurn)
+    );
+    assert_eq!(ir.usage.input_tokens, 12);
+    assert_eq!(ir.usage.output_tokens, 4);
+}
+
+/// a ingress (同协议 + redact): 判型降级 buffered_ir 的 parse 成功臂同样合成 SSE;
+/// 且 restore (mock→real) 先于合成 — 上游 echo 的 mock 在客户端流中已被还原为真值
+/// (RED-7 在合成路径同样成立)。
+#[tokio::test]
+async fn pseudo_streaming_same_proto_redact_synthesizes_anthropic_sse_lifecycle() {
+    let real_secret = "sk-live-t5pseudo99";
+    let expected_mock = predict_mock(real_secret);
+    let mut upstream = spawn_mock_upstream().await;
+    // 伪流式上游: 200 + application/json + 完整 Anthropic message (echo 了 mock).
+    let resp_body = format!(
+        concat!(
+            r#"{{"id":"msg_01t5s","type":"message","role":"assistant","content":[{{"type":"text","text":"saw {mock}"}}],"model":"claude-3-5-sonnet","stop_reason":"end_turn","stop_sequence":null,"usage":{{"input_tokens":9,"output_tokens":2}}}}"#
+        ),
+        mock = expected_mock,
+    );
+    let _m = upstream
+        .mock("POST", "/v1/messages")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(resp_body)
+        .create_async()
+        .await;
+
+    let entries = vec![secret("api-key", real_secret)];
+    let secrets = test_secret_table_with(entries);
+    let provider = provider_with("an-main", Protocol::Anthropic, &upstream.url());
+    let proxy_url = spawn_proxy_full(
+        vec![provider],
+        reqwest::Client::new(),
+        ConversationDag::new(64, 500, 1),
+        secrets,
+    )
+    .await;
+
+    let body = format!(
+        r#"{{"model":"claude","stream":true,"messages":[{{"role":"user","content":"keep {real_secret}"}}],"max_tokens":50}}"#
+    );
+    let (status, resp_body, headers) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/a/an-main/v1/messages",
+        &body,
+        &[("content-type", "application/json")],
+    )
+    .await;
+
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {resp_body}");
+    let ct = resp_content_type(&headers);
+    assert!(
+        ct.starts_with("text/event-stream"),
+        "client asked for SSE but got content-type {ct:?}; body: {resp_body}"
+    );
+    assert!(
+        resp_body.starts_with("event: message_start\n"),
+        "must open with message_start: {resp_body}"
+    );
+    // restore 先于合成: 真值到达, mock 不泄漏.
+    assert!(
+        resp_body.contains(&format!("saw {real_secret}")),
+        "real secret must be restored into synthesized stream: {resp_body}"
+    );
+    assert!(
+        !resp_body.contains(&expected_mock),
+        "mock must not leak into synthesized stream: {resp_body}"
+    );
+
+    // round-trip 语义等价 (restore 后的内容).
+    let ir = scan_sse_response(secret_guard::codec::Protocol::Anthropic, &resp_body);
+    assert_first_text(&ir, &format!("saw {real_secret}"));
+    assert_eq!(
+        ir.stop_reason,
+        Some(secret_guard::codec::IrStopReason::EndTurn)
+    );
+    assert_eq!(ir.usage.input_tokens, 9);
+    assert_eq!(ir.usage.output_tokens, 2);
+}
+
+/// 失败回落: 伪流式上游的 body 是合法 JSON 但 codec reader 拒绝 (choices 空数组) →
+/// 不合成, 回落现状 (buffered JSON / 透传, content-type 保持 application/json) —
+/// best-effort 永不让请求失败 (ROB-*), 与既有 fallback 家族行为一致。
+#[tokio::test]
+async fn pseudo_streaming_parse_failure_keeps_buffered_json_fallback() {
+    let mut upstream = spawn_mock_upstream().await;
+    // choices 空数组: serde 可 parse, OpenAI reader 拒绝 ("must have at least one choice").
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"object":"chat.completion","choices":[]}"#)
+        .create_async()
+        .await;
+    let provider = provider_with("oa-main", Protocol::OpenAI, &upstream.url());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+
+    let (status, body, headers) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/a/oa-main/v1/messages",
+        r#"{"model":"claude","stream":true,"messages":[{"role":"user","content":"Hello"}],"max_tokens":50}"#,
+        &[],
+    )
+    .await;
+
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {body}");
+    let ct = resp_content_type(&headers);
+    assert!(
+        ct.starts_with("application/json"),
+        "reader-rejected body must keep buffered JSON fallback (content-type {ct:?}): {body}"
+    );
+    assert_eq!(
+        body, r#"{"object":"chat.completion","choices":[]}"#,
+        "reader-rejected body must pass through verbatim (no synthesis): {body}"
+    );
+}
+
 // ─── 转发链可观测性 (#158 / #160 / #162 / #163) ────────────────────────────
 //
 // 四条可观测性增强的集成锁定. 日志断言设施 (`capture_tracing` / `CaptureLog`)
