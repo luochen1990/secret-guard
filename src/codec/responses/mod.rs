@@ -379,7 +379,11 @@ impl Writer for ResponsesWriter {
                         "status": "completed",
                     }));
                 }
-                IrBlock::Reasoning { summary, opaque } => {
+                IrBlock::Reasoning {
+                    summary,
+                    opaque,
+                    extra,
+                } => {
                     // provider opaque 原样写回 (T7: 同协议 fidelity / a-origin
                     // envelope 由 reader 侧解包, 这里只会是 r 原生 blob)。
                     flush_text(&mut text_acc, &mut output);
@@ -389,9 +393,14 @@ impl Writer for ResponsesWriter {
                             .map(|s| json!({"type": "summary_text", "text": s}))
                             .collect(),
                         opaque.clone(),
+                        extra,
                     ));
                 }
-                IrBlock::ReasoningContent { text, opaque } => {
+                IrBlock::ReasoningContent {
+                    text,
+                    opaque,
+                    extra,
+                } => {
                     // T7: a-origin thinking 族正文以 summary 形态承载 (语义降档,
                     // 与流式保留裁决同型), opaque 经 sg-envelope 搬进 encrypted_content
                     // — stateless tool loop 回传时 reader 侧解包还原 (codec/thinking.rs)。
@@ -410,7 +419,7 @@ impl Writer for ResponsesWriter {
                     let ec = opaque
                         .as_ref()
                         .map(|op| super::thinking::pack_reasoning_content(text, &Some(op.clone())));
-                    output.push(reasoning_item_json(summary_items, ec));
+                    output.push(reasoning_item_json(summary_items, ec, extra));
                 }
                 IrBlock::ToolResult { .. } | IrBlock::Image { .. } => {
                     // 响应里通常不出现, 跳过.
@@ -877,13 +886,21 @@ fn read_function_call_block(obj: &Map<String, Value>) -> IrBlock {
 }
 
 /// 构造 reasoning item 的 wire JSON (T7 SSOT — `write_response` 与
-/// `write_input_items` 共用, summary items + 可选 `encrypted_content`)。
-fn reasoning_item_json(summary_items: Vec<Value>, encrypted: Option<String>) -> Value {
+/// `write_input_items` 共用, summary items + 可选 `encrypted_content` + L5 extra
+/// 原样回写; 同名覆盖优先级: modeled 字段 > extra, 与 merge_extra_into 契约一致)。
+fn reasoning_item_json(
+    summary_items: Vec<Value>,
+    encrypted: Option<String>,
+    extra: &Map<String, Value>,
+) -> Value {
     let mut item = Map::new();
     item.insert("type".to_string(), json!("reasoning"));
     item.insert("summary".to_string(), Value::Array(summary_items));
     if let Some(ec) = encrypted {
         item.insert("encrypted_content".to_string(), json!(ec));
+    }
+    for (k, v) in extra {
+        item.insert(k.clone(), v.clone());
     }
     Value::Object(item)
 }
@@ -903,16 +920,33 @@ fn read_reasoning_block(obj: &Map<String, Value>) -> Option<IrBlock> {
         .get("encrypted_content")
         .and_then(Value::as_str)
         .map(str::to_string);
+    // L5 (T7 修复轮): 未建模字段 (item id 等) 收集 — envelope 载荷不携带 extra,
+    // 解包后与本跳 wire 现收值合并 (同 anthropic.rs::merge_wire_extra 语义)。
+    let extra: Map<String, Value> = obj
+        .iter()
+        .filter(|(k, _)| !matches!(k.as_str(), "type" | "summary" | "encrypted_content"))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     if let Some(env) = &opaque
-        && let Some(block) = super::thinking::unpack(env)
+        && let Some(mut block) = super::thinking::unpack(env)
     {
-        // sg-envelope: 权威源 (我们上一跳自己打包的块), wire summary 是其投影。
+        // sg-envelope: 权威源 (我们上一跳自己打包的块), wire summary 是其投影;
+        // extra 以本跳 wire 为准 (envelope 不携带)。
+        match &mut block {
+            IrBlock::Reasoning { extra: dst, .. }
+            | IrBlock::ReasoningContent { extra: dst, .. } => *dst = extra,
+            _ => {}
+        }
         return Some(block);
     }
     if summary.is_empty() && opaque.is_none() {
         None
     } else {
-        Some(IrBlock::Reasoning { summary, opaque })
+        Some(IrBlock::Reasoning {
+            summary,
+            opaque,
+            extra,
+        })
     }
 }
 
@@ -1042,7 +1076,11 @@ fn write_input_items(msg: &IrMessage) -> Vec<Value> {
                             "arguments": input_to_string(input),
                         }));
                     }
-                    IrBlock::Reasoning { summary, opaque } => {
+                    IrBlock::Reasoning {
+                        summary,
+                        opaque,
+                        extra,
+                    } => {
                         flush_text(&mut text_parts, &mut items);
                         items.push(reasoning_item_json(
                             summary
@@ -1050,9 +1088,14 @@ fn write_input_items(msg: &IrMessage) -> Vec<Value> {
                                 .map(|s| json!({"type": "summary_text", "text": s}))
                                 .collect(),
                             opaque.clone(),
+                            extra,
                         ));
                     }
-                    IrBlock::ReasoningContent { text, opaque } => {
+                    IrBlock::ReasoningContent {
+                        text,
+                        opaque,
+                        extra,
+                    } => {
                         // T7: 请求侧 assistant 历史 (a-origin thinking 回传) 同样以
                         // summary + envelope 搬运 (与 write_response 同型; o-origin
                         // 正文保留、不发 envelope)。回传方向 reader 解包 → a writer
@@ -1069,7 +1112,7 @@ fn write_input_items(msg: &IrMessage) -> Vec<Value> {
                         let ec = opaque.as_ref().map(|op| {
                             super::thinking::pack_reasoning_content(text, &Some(op.clone()))
                         });
-                        items.push(reasoning_item_json(summary_items, ec));
+                        items.push(reasoning_item_json(summary_items, ec, extra));
                     }
                     IrBlock::ToolResult { .. } | IrBlock::Image { .. } => {
                         // assistant 消息里通常不出现, 跳过.

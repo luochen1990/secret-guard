@@ -862,7 +862,8 @@ fn read_message(msg: &Value) -> Option<IrMessage> {
 /// 解析 Anthropic content block → [`IrBlock`].
 ///
 /// 各类型的已建模字段之外的 key 全部进 `extra` (L5 保真, #269) — 典型: block 级
-/// `cache_control` 缓存断点; 也覆盖未来新增的官方字段 (防止再度静默丢失).
+/// `cache_control` 缓存断点 (thinking 族同收, T7 修复轮); 也覆盖未来新增的官方字段
+/// (防止再度静默丢失).
 fn read_block(b: &Value) -> Option<IrBlock> {
     let obj = b.as_object()?;
     let ty = obj.get("type").and_then(Value::as_str)?;
@@ -972,14 +973,18 @@ fn read_block(b: &Value) -> Option<IrBlock> {
             // 权威源; wire body 文本丢弃 — 恶意不一致时丢弃 = over-redaction 安全
             // 方向)。空 body + 无 signature 的退化块 → None (与空 text block 规则
             // 一致, FWD-2 生成器不生成该形态)。
+            // L5 (T7 修复轮): 未建模字段 (cache_control 等) 收集 — 扩展思考场景
+            // 官方推荐断点恰在 thinking block, 丢失 = 前缀缓存失效 (#269 同型)。
             let text = obj.get("thinking").and_then(Value::as_str).unwrap_or("");
             let signature = obj
                 .get("signature")
                 .and_then(Value::as_str)
                 .map(str::to_string);
+            let extra = collect_extra(obj, &["type", "thinking", "signature"]);
             if let Some(sig) = &signature
-                && let Some(block) = super::thinking::unpack(sig)
+                && let Some(mut block) = super::thinking::unpack(sig)
             {
+                merge_wire_extra(&mut block, extra);
                 return Some(block);
             }
             if text.is_empty() && signature.is_none() {
@@ -988,6 +993,7 @@ fn read_block(b: &Value) -> Option<IrBlock> {
                 Some(IrBlock::ReasoningContent {
                     text: text.to_string(),
                     opaque: signature.map(ThinkingOpaque::Signature),
+                    extra,
                 })
             }
         }
@@ -995,15 +1001,41 @@ fn read_block(b: &Value) -> Option<IrBlock> {
             // T7: 纯密文无原文 — text 恒空 + opaque 携带 data; writer 据此写回
             // redacted_thinking wire 形态。data 带 sg- 前缀 → envelope 解包 (权威源)。
             let data = obj.get("data").and_then(Value::as_str).map(str::to_string);
+            let extra = collect_extra(obj, &["type", "data"]);
             match data {
-                Some(d) => super::thinking::unpack(&d).or(Some(IrBlock::ReasoningContent {
-                    text: String::new(),
-                    opaque: Some(ThinkingOpaque::RedactedData(d)),
-                })),
+                Some(d) => match super::thinking::unpack(&d) {
+                    Some(mut block) => {
+                        merge_wire_extra(&mut block, extra);
+                        Some(block)
+                    }
+                    None => Some(IrBlock::ReasoningContent {
+                        text: String::new(),
+                        opaque: Some(ThinkingOpaque::RedactedData(d)),
+                        extra,
+                    }),
+                },
                 None => None,
             }
         }
         _ => None, // image 等未建模类型 (流式侧经 dropped_block_starts 配对跳过)
+    }
+}
+
+/// 把 wire 侧收集的 extra 合并进 envelope 解包出的块 (T7 修复轮)。
+///
+/// envelope 载荷不携带 extra (打包点在跨协议 seam 之后, extra 已被清空恒空);
+/// 解包后块的 extra 由**当前 wire item** 现收 — 权威源语义只覆盖已建模字段
+/// (text/summary/opaque), 兄弟字段 (cache_control 等) 以本跳 wire 为准。
+fn merge_wire_extra(block: &mut IrBlock, extra: serde_json::Map<String, Value>) {
+    if extra.is_empty() {
+        return;
+    }
+    match block {
+        IrBlock::Reasoning { extra: dst, .. } | IrBlock::ReasoningContent { extra: dst, .. } => {
+            *dst = extra;
+        }
+        // envelope 合法载荷只有这两种块 (thinking.rs unpack 的返回域)。
+        _ => {}
     }
 }
 
@@ -1212,34 +1244,55 @@ fn write_block(b: &IrBlock) -> Option<Value> {
             merge_block_extra(&mut obj, extra);
             Some(obj)
         }
-        IrBlock::Reasoning { summary, opaque } => {
+        IrBlock::Reasoning {
+            summary,
+            opaque,
+            extra,
+        } => {
             // T7 (envelope 搬运, r→a): Responses reasoning item 无法在 Anthropic
             // 原生表达 — 把整个块打包 sg-envelope 藏进 signature (cc-switch 模式),
             // thinking 正文承载 summary 拼接 (展示用; 回传方向以 envelope 为权威源
             // 解包)。不合成签名 — 只搬运 (打包点在 writer = post-redact/post-restore,
             // envelope 不含未脱敏文本, 安全链见 codec/thinking.rs)。
+            // L5 (T7 修复轮): extra 原样回写 (跨协议路径已被 clear_wire_fidelity
+            // 清空, 同协议 r→r 之外的 a writer 到达路径 extra 恒空 — merge 是纵深)。
             let text = summary.join("\n");
             let signature = super::thinking::pack_reasoning(summary, opaque);
-            Some(json!({
+            let mut obj = json!({
                 "type": "thinking",
                 "thinking": text,
                 "signature": signature,
-            }))
+            });
+            merge_block_extra(&mut obj, extra);
+            Some(obj)
         }
-        IrBlock::ReasoningContent { text, opaque } => match opaque {
+        IrBlock::ReasoningContent {
+            text,
+            opaque,
+            extra,
+        } => match opaque {
             // T7: a-origin thinking 族原生写回 — signature/redacted data 是搬运的
             // provider opaque, 不是合成 (同协议 a→a fidelity 锚点; text 若含
             // secret 已被 redact mock 化 — signature 失配风险是 "安全优先于签名
-            // 有效性" 的已接受折衷, 见 known-limitations)。
-            Some(ThinkingOpaque::Signature(sig)) => Some(json!({
-                "type": "thinking",
-                "thinking": text,
-                "signature": sig,
-            })),
-            Some(ThinkingOpaque::RedactedData(data)) => Some(json!({
-                "type": "redacted_thinking",
-                "data": data,
-            })),
+            // 有效性" 的已接受折衷, 见 known-limitations)。L5: extra (cache_control)
+            // 原样回写 (T7 修复轮 — 扩展思考断点不丢)。
+            Some(ThinkingOpaque::Signature(sig)) => {
+                let mut obj = json!({
+                    "type": "thinking",
+                    "thinking": text,
+                    "signature": sig,
+                });
+                merge_block_extra(&mut obj, extra);
+                Some(obj)
+            }
+            Some(ThinkingOpaque::RedactedData(data)) => {
+                let mut obj = json!({
+                    "type": "redacted_thinking",
+                    "data": data,
+                });
+                merge_block_extra(&mut obj, extra);
+                Some(obj)
+            }
             // o-origin (reasoning_content, 无 opaque 容器): o 协议无载体可搬 —
             // 丢弃 + WARN (T7 裁决: envelope 仅 a⇄r, 不为 o 发明 wire 形态;
             // 对齐 count_reasoning_blocks 显式丢弃先例)。
@@ -2304,6 +2357,93 @@ mod tests {
     /// BlockStart{Thinking} / thinking_delta → ReasoningDelta / signature_delta →
     /// SignatureDelta / stop; redacted_thinking 的 data 在 start 事件整体到达。
     /// 修复前: start/delta 全部被 reader 丢弃 (层丢弃 → a+a redact 历史丢失)。
+    /// T7 修复轮 (M1): thinking 族 block 的 L5 extra (cache_control 等) 同协议
+    /// round-trip 保真 — 扩展思考场景官方推荐断点恰在 thinking block, 丢失 =
+    /// 前缀缓存失效 (#269 同型问题在 T7 新模块的复发修复)。修复前: read_block
+    /// 两臂不收集 extra → 每跳静默剥离。
+    #[test]
+    fn thinking_block_extra_roundtrip_preserved() {
+        let body = json!({
+            "model": "claude-x",
+            "max_tokens": 4096,
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "deliberate",
+                     "signature": "SIGextra01",
+                     "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+                    {"type": "redacted_thinking", "data": "RDEXTRA02",
+                     "cache_control": {"type": "ephemeral"}},
+                    {"type": "text", "text": "answer"},
+                ]},
+            ],
+        });
+        let ir = reader().read_request(&body).unwrap();
+        let out = writer().write_request(&ir);
+        let blocks = out["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(
+            blocks[0]["cache_control"],
+            json!({"type": "ephemeral", "ttl": "1h"}),
+            "thinking block cache_control lost: {out}"
+        );
+        assert_eq!(blocks[0]["signature"], "SIGextra01");
+        assert_eq!(
+            blocks[1]["cache_control"],
+            json!({"type": "ephemeral"}),
+            "redacted_thinking cache_control lost: {out}"
+        );
+        assert_eq!(blocks[1]["type"], "redacted_thinking");
+    }
+
+    /// T7 修复轮 (M1): redact 扫描覆盖 thinking 族 extra 的字符串叶子 (与四臂
+    /// 同型 — extra 可携带任意未建模字符串字段)。
+    #[test]
+    fn redact_scans_thinking_extra_leaves() {
+        use crate::redact::{StringLeafOps, redact_ir};
+        use crate::secrets::SecretEntry;
+        let body = json!({
+            "model": "claude-x",
+            "max_tokens": 4096,
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "plain",
+                     "signature": "SIGleaf01",
+                     "note": "key is sk-t7-extra-leaf-99 here"},
+                ]},
+            ],
+        });
+        let mut ir = reader().read_request(&body).unwrap();
+        let mut entry = SecretEntry {
+            id: "sec-extra".into(),
+            name: None,
+            category: crate::secrets::SecretCategory::ApiKey,
+            value: "sk-t7-extra-leaf-99".into(),
+            value_file: None,
+            mock_strategy: Default::default(),
+        };
+        // 模拟生产: resolve_against 让 Auto 模式 infer gen spec (同 fwd_property
+        // 的 make_secret_entry)。
+        entry.mock_strategy.resolve_against(&entry.value, "");
+        let (map, _) = redact_ir(&mut ir, std::slice::from_ref(&entry));
+        let mock = map
+            .mock_for("sk-t7-extra-leaf-99")
+            .expect("must map")
+            .to_string();
+        // IR 内 extra 叶子被替换 (双轨遍历的一致性 — 直接检查叶子)。
+        let mut leaked = false;
+        ir.for_each_str_leaf(&mut |s: &str| {
+            if s.contains("sk-t7-extra-leaf-99") {
+                leaked = true;
+            }
+        });
+        assert!(!leaked, "secret in thinking extra leaf not redacted");
+        // writer 回写后 wire 上 extra 是 mock。
+        let out = writer().write_request(&ir);
+        let out_str = serde_json::to_string(&out).unwrap();
+        assert!(!out_str.contains("sk-t7-extra-leaf-99"), "leak: {out_str}");
+        assert!(out_str.contains(mock.as_str()), "mock missing: {out_str}");
+    }
+
     #[test]
     fn stream_thinking_block_full_lifecycle() {
         let mut state = StreamDecodeState::default();

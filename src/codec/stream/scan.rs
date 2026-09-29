@@ -247,6 +247,9 @@ fn fold_scan_block(b: &ScanBlock) -> Option<crate::codec::IrBlock> {
                 Some(crate::codec::IrBlock::ReasoningContent {
                     text: b.reasoning.clone(),
                     opaque,
+                    // 流式 IR 事件不携带 block 级 extra (全体 block 类型的既有限制,
+                    // 见 fold_scan_block 头注)。
+                    extra: Default::default(),
                 })
             }
         }
@@ -257,6 +260,7 @@ fn fold_scan_block(b: &ScanBlock) -> Option<crate::codec::IrBlock> {
                 Some(crate::codec::IrBlock::ReasoningContent {
                     text: String::new(),
                     opaque: Some(ThinkingOpaque::RedactedData(data.clone())),
+                    extra: Default::default(),
                 })
             }
         }

@@ -109,6 +109,9 @@ pub fn unpack(s: &str) -> Option<IrBlock> {
             Some(IrBlock::ReasoningContent {
                 text: text.to_string(),
                 opaque,
+                // envelope 载荷不携带 extra (打包点在跨协议 seam 之后 extra 已清空,
+                // 恒空); 解包侧的 extra 由 reader 从本跳 wire item 现收合并。
+                extra: Default::default(),
             })
         }
         "r" => {
@@ -125,7 +128,11 @@ pub fn unpack(s: &str) -> Option<IrBlock> {
             if summary.is_empty() && opaque.is_none() {
                 return None;
             }
-            Some(IrBlock::Reasoning { summary, opaque })
+            Some(IrBlock::Reasoning {
+                summary,
+                opaque,
+                extra: Default::default(),
+            })
         }
         _ => None,
     }
@@ -142,28 +149,37 @@ mod tests {
             IrBlock::ReasoningContent {
                 text: "think about sk-live".into(),
                 opaque: Some(ThinkingOpaque::Signature("SIGabc123".into())),
+                extra: Default::default(),
             },
             IrBlock::ReasoningContent {
                 text: "".into(),
                 opaque: Some(ThinkingOpaque::RedactedData("REDACTEDblob".into())),
+                extra: Default::default(),
             },
             IrBlock::ReasoningContent {
                 text: "o-origin plain".into(),
                 opaque: None,
+                extra: Default::default(),
             },
             IrBlock::Reasoning {
                 summary: vec!["sum-a".into(), "sum-b".into()],
                 opaque: Some("enc-blob".into()),
+                extra: Default::default(),
             },
             IrBlock::Reasoning {
                 summary: vec![],
                 opaque: Some("enc-only".into()),
+                extra: Default::default(),
             },
         ];
         for block in cases {
             let packed = match &block {
-                IrBlock::ReasoningContent { text, opaque } => pack_reasoning_content(text, opaque),
-                IrBlock::Reasoning { summary, opaque } => pack_reasoning(summary, opaque),
+                IrBlock::ReasoningContent { text, opaque, .. } => {
+                    pack_reasoning_content(text, opaque)
+                }
+                IrBlock::Reasoning {
+                    summary, opaque, ..
+                } => pack_reasoning(summary, opaque),
                 _ => unreachable!("fixture 只含两种块"),
             };
             assert!(packed.starts_with(ENVELOPE_PREFIX));

@@ -424,7 +424,7 @@ fn prop_envelope_packs_redacted_text_never_real(
     // 解包验证: 内文本是 mock (不是 real)。
     let unpacked = crate::codec::thinking::unpack(ec).expect("envelope must unpack");
     match &unpacked {
-        crate::codec::ir::IrBlock::ReasoningContent { text, opaque } => {
+        crate::codec::ir::IrBlock::ReasoningContent { text, opaque, .. } => {
             assert!(text.contains(mock.as_str()), "envelope text must be mock: {text}");
             assert!(!text.contains(&secret), "envelope text must not contain real");
             assert_eq!(
@@ -1074,22 +1074,41 @@ fn arb_anthropic_tool_use() -> impl Strategy<Value = Value> {
 }
 
 /// Anthropic thinking 族 block (T7): thinking{thinking 原文, signature} /
-/// redacted_thinking{data}。signature/data 用 `[A-Z0-9]` charset — 结构上
+/// redacted_thinking{data}; T7 修复轮补 L5 轴 — 可携带 cache_control (扩展思考
+/// 场景官方推荐断点恰在此, FWD-2 round-trip property 机械锁定收集/回写)。
+/// signature/data 用 `[A-Z0-9]` charset — 结构上
 /// 排除小写 `sg-thinking-v1:` envelope 前缀 (envelope 路径会解包改写 block,
 /// 与 FWD-2 的 verbatim 断言不兼容, 由专项 golden 测试覆盖; 见生成处注释)。
 fn arb_anthropic_thinking_block() -> impl Strategy<Value = Value> {
     use proptest::prelude::prop_oneof;
     prop_oneof![
-        ("[a-z ]{1,25}", "[A-Z0-9]{8,40}").prop_map(|(text, sig)| json!({
-            "type": "thinking", "thinking": text, "signature": sig
-        })),
+        (
+            "[a-z ]{1,25}",
+            "[A-Z0-9]{8,40}",
+            prop::option::of(arb_cache_control()),
+        )
+            .prop_map(|(text, sig, cc)| {
+                let mut b = json!({"type": "thinking", "thinking": text, "signature": sig});
+                if let Some(cc) = cc {
+                    b["cache_control"] = cc;
+                }
+                b
+            }),
         // 空 thinking 原文 + signature (redact 后的退化形态 / 官方允许)。
-        "[A-Z0-9]{8,40}".prop_map(|sig| json!({
-            "type": "thinking", "thinking": "", "signature": sig
-        })),
-        "[A-Z0-9]{16,48}".prop_map(|data| json!({
-            "type": "redacted_thinking", "data": data
-        })),
+        ("[A-Z0-9]{8,40}", prop::option::of(arb_cache_control())).prop_map(|(sig, cc)| {
+            let mut b = json!({"type": "thinking", "thinking": "", "signature": sig});
+            if let Some(cc) = cc {
+                b["cache_control"] = cc;
+            }
+            b
+        }),
+        ("[A-Z0-9]{16,48}", prop::option::of(arb_cache_control())).prop_map(|(data, cc)| {
+            let mut b = json!({"type": "redacted_thinking", "data": data});
+            if let Some(cc) = cc {
+                b["cache_control"] = cc;
+            }
+            b
+        }),
     ]
 }
 

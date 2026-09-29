@@ -95,8 +95,10 @@ impl Reader for OpenAiReader {
                     0,
                     IrBlock::ReasoningContent {
                         text: rc.to_string(),
-                        // o 协议无 opaque 容器 (T7), 恒 None。
+                        // o 协议无 opaque 容器 (T7), 恒 None; 消息级 extra 已由
+                        // read_message 收集, 此处无 block 级 extra 来源。
                         opaque: None,
+                        extra: Default::default(),
                     },
                 );
             }
@@ -276,6 +278,7 @@ impl Reader for OpenAiReader {
                     text: rc.to_string(),
                     // o 协议无 opaque 容器 (T7), 恒 None。
                     opaque: None,
+                    extra: Default::default(),
                 });
             }
             // 文本内容: content 可能是 string 或 array of parts.
@@ -498,7 +501,7 @@ impl Writer for OpenAiWriter {
                     // 跨协议翻译时静默丢弃 (lossy-by-target); 同协议路径不会到达 Chat writer.
                     // r→o 的 opaque (encrypted_content) 一并丢失 (T7: o 无容器)。
                 }
-                IrBlock::ReasoningContent { text, opaque } => {
+                IrBlock::ReasoningContent { text, opaque, .. } => {
                     // 思考型模型的非标 reasoning_content 字段 (#176). 同协议 redact
                     // 路径 round-trip 用; 跨协议来源 (a thinking) 的正文照写,
                     // opaque 无容器可搬 — 丢弃 + WARN (T7: envelope 仅 a⇄r, o 不发明)。
@@ -2737,6 +2740,7 @@ mod tests {
                 IrBlock::ReasoningContent {
                     text: "thinking...".into(),
                     opaque: None,
+                    extra: Default::default(),
                 },
                 IrBlock::Text {
                     text: "answer".into(),
@@ -2935,6 +2939,7 @@ mod tests {
                 content: vec![IrBlock::ReasoningContent {
                     text: "hidden chain of thought".into(),
                     opaque: None,
+                    extra: Default::default(),
                 }],
                 ..Default::default()
             }],
@@ -2952,6 +2957,7 @@ mod tests {
             content: vec![IrBlock::ReasoningContent {
                 text: "cot".into(),
                 opaque: None,
+                extra: Default::default(),
             }],
             ..Default::default()
         };
@@ -3008,6 +3014,7 @@ mod tests {
                 content: vec![IrBlock::ReasoningContent {
                     text: "hidden chain of thought".into(),
                     opaque: None,
+                    extra: Default::default(),
                 }],
                 ..Default::default()
             }],
@@ -3032,6 +3039,7 @@ mod tests {
             content: vec![IrBlock::ReasoningContent {
                 text: "cot".into(),
                 opaque: Some(ThinkingOpaque::Signature("SIG-x".into())),
+                extra: Default::default(),
             }],
             ..Default::default()
         };
@@ -3049,6 +3057,7 @@ mod tests {
             Some(IrBlock::ReasoningContent {
                 text,
                 opaque: Some(ThinkingOpaque::Signature(sig)),
+                ..
             }) if text == "cot" && sig == "SIG-x"
         ));
     }

@@ -706,10 +706,12 @@ mod tests {
         let plain = |t: &str| IrBlock::ReasoningContent {
             text: t.into(),
             opaque: None,
+            extra: Default::default(),
         };
         let opaque_rc = |t: &str| IrBlock::ReasoningContent {
             text: t.into(),
             opaque: Some(ThinkingOpaque::Signature("sig".into())),
+            extra: Default::default(),
         };
         let blocks = vec![
             IrBlock::Text {
@@ -721,6 +723,7 @@ mod tests {
             IrBlock::Reasoning {
                 summary: vec!["summary 不是思考原文".into()],
                 opaque: None,
+                extra: Default::default(),
             },
             IrBlock::ToolResult {
                 tool_use_id: "tu_1".into(),

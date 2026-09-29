@@ -141,7 +141,7 @@ normalize(v) == normalize(Writer(Reader(v)))
 | `IrMessage.content_form: Option<ContentForm>` | ir.rs | message content 形态 (String/Array/Null) |
 | `IrMessage.reasoning_content_form: Option<ReasoningContentForm>` | ir.rs | assistant 消息 `reasoning_content` 显式空/null 形态 (#176), 区分 `""`/`null` vs 缺失 |
 | `IrBlock::ToolResult.content_form: Option<ContentForm>` | ir.rs | tool_result 内 content 形态 (Anthropic 特有) |
-| `IrMessage.extra: Map` / `IrTool.extra: Map` / 四个 wire 来源 `IrBlock` variant 的 `extra: Map` | ir.rs | 未建模字段逃生舱 (L4/L5, #269): 消息级 `output_config`、block 级/工具级 `cache_control`、`defer_loading` 等原样保真; 跨协议经 `clear_wire_fidelity` 清空 (含 ToolResult.content 嵌套递归); block extra 参与 dag 内容寻址 hash |
+| `IrMessage.extra: Map` / `IrTool.extra: Map` / 六个 wire 来源 `IrBlock` variant 的 `extra: Map` (T7 修复轮扩至 Reasoning/ReasoningContent — thinking block 的 `cache_control` 是扩展思考官方推荐断点) | ir.rs | 未建模字段逃生舱 (L4/L5, #269): 消息级 `output_config`、block 级/工具级 `cache_control`、`defer_loading` 等原样保真; 跨协议经 `clear_wire_fidelity` 清空 (含 ToolResult.content 嵌套递归); block extra 参与 dag 内容寻址 hash; sg-thinking envelope 不携带 extra (打包点在 seam 后恒空, 解包侧由 reader 现收) |
 | `IrBlock::ToolResult.is_error: Option<bool>` | ir.rs | 显式形态保真 (#269): None = 字段缺席 (API 语义 false), Some = 显式 true/false 原样回写 |
 
 **清空 SSOT**: `IrRequest::clear_wire_fidelity()` 集中清空所有 wire_fidelity 字段

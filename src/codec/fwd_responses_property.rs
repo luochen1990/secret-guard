@@ -278,7 +278,9 @@ fn responses_reasoning_encrypted_content_roundtrip() {
     let ir = responses_reader().read_request(&body).unwrap();
     assert_eq!(ir.messages.len(), 1);
     match &ir.messages[0].content[0] {
-        crate::codec::ir::IrBlock::Reasoning { summary, opaque } => {
+        crate::codec::ir::IrBlock::Reasoning {
+            summary, opaque, ..
+        } => {
             assert_eq!(summary, &vec!["thinking step 1".to_string()]);
             // opaque 原样保留 (非明文, 不进 redact 扫描 — 见 ir.rs 安全链注记)。
             assert_eq!(
@@ -367,6 +369,7 @@ fn redact_reasoning_summary_is_replaced() {
             content: vec![IrBlock::Reasoning {
                 summary: vec![format!("I should use {secret_value} here")],
                 opaque: None,
+                extra: Default::default(),
             }],
             ..Default::default()
         }],

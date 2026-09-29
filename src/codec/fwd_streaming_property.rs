@@ -1027,6 +1027,7 @@ fn arb_responses_sse_stream_with_mock()
                     expected_blocks.push(IrBlock::ReasoningContent {
                         text: reasoning_text,
                         opaque: None,
+                        extra: Default::default(),
                     });
                     out_idx += 1;
                 }
@@ -2329,7 +2330,7 @@ fn cross_proto_anthropic_thinking_block_no_orphan_events() {
             |e| crate::codec::thinking::unpack(e).is_some_and(|b| matches!(
                 &b,
                 crate::codec::ir::IrBlock::ReasoningContent {
-                    text, opaque: Some(crate::codec::ir::ThinkingOpaque::Signature(sig)),
+                    text, opaque: Some(crate::codec::ir::ThinkingOpaque::Signature(sig)), ..
                 } if text == "internal reasoning... key is sk-b1-live-secret ok"
                     && sig == "SIGb1thnking0x"
             ))
@@ -2416,7 +2417,7 @@ fn cross_proto_streaming_r_to_a_thinking_envelope_golden() {
     assert!(
         crate::codec::thinking::unpack(&sig).is_some_and(|b| matches!(
             &b,
-            crate::codec::ir::IrBlock::Reasoning { summary, opaque }
+            crate::codec::ir::IrBlock::Reasoning { summary, opaque, .. }
                 if summary == &vec!["deliberation".to_string()]
                     && opaque.as_deref() == Some("EC-stream-r2a")
         )),

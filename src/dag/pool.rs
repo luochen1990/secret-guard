@@ -128,16 +128,26 @@ pub(super) fn hash_block(block: &IrBlock) -> BlockHash {
             hash_extra(extra, &mut h);
         }
         // opaque 参与 hash (内容寻址含 T7 的 passthrough 载荷; 签名/密文变化 =
-        // 不同对话上下文)。
-        IrBlock::Reasoning { summary, opaque } => {
+        // 不同对话上下文); extra 同 hash (T7 修复轮, 与四臂同型)。
+        IrBlock::Reasoning {
+            summary,
+            opaque,
+            extra,
+        } => {
             for s in summary {
                 s.hash(&mut h);
             }
             opaque.hash(&mut h);
+            hash_extra(extra, &mut h);
         }
-        IrBlock::ReasoningContent { text, opaque } => {
+        IrBlock::ReasoningContent {
+            text,
+            opaque,
+            extra,
+        } => {
             text.hash(&mut h);
             opaque.hash(&mut h);
+            hash_extra(extra, &mut h);
         }
     }
     h.finish()

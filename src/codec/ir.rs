@@ -119,8 +119,9 @@ fn clear_block_extras(blocks: &mut [IrBlock]) {
             IrBlock::Text { extra, .. }
             | IrBlock::ToolUse { extra, .. }
             | IrBlock::ToolResult { extra, .. }
-            | IrBlock::Image { extra, .. } => extra.clear(),
-            IrBlock::Reasoning { .. } | IrBlock::ReasoningContent { .. } => {}
+            | IrBlock::Image { extra, .. }
+            | IrBlock::Reasoning { extra, .. }
+            | IrBlock::ReasoningContent { extra, .. } => extra.clear(),
         }
         if let IrBlock::ToolResult { content, .. } = b {
             clear_block_extras(content);
@@ -476,28 +477,31 @@ pub enum IrRole {
 
 /// 消息内容块 (chat completion 中所有协议都支持 block-based content).
 impl IrBlock {
-    /// 该 block 的 wire 级 `extra` (L5, #269) — 仅四个有 wire 来源的 variant 携带,
-    /// 跨协议合成产物 (Reasoning / ReasoningContent) 返回 None.
+    /// 该 block 的 wire 级 `extra` (L5, #269; T7 扩至 thinking 族 — 全部六个
+    /// wire 来源 variant 携带).
     pub fn block_extra(&self) -> Option<&serde_json::Map<String, Value>> {
         match self {
             IrBlock::Text { extra, .. }
             | IrBlock::ToolUse { extra, .. }
             | IrBlock::ToolResult { extra, .. }
-            | IrBlock::Image { extra, .. } => Some(extra),
-            IrBlock::Reasoning { .. } | IrBlock::ReasoningContent { .. } => None,
+            | IrBlock::Image { extra, .. }
+            | IrBlock::Reasoning { extra, .. }
+            | IrBlock::ReasoningContent { extra, .. } => Some(extra),
         }
     }
 }
 
 ///
-/// # block 级 `extra` (#269, L5)
+/// # block 级 `extra` (#269, L5; T7 扩至 thinking 族)
 ///
-/// 四个有 wire 来源的 variant (Text / ToolUse / ToolResult / Image) 均携带
-/// `extra: Map<String, Value>` — 该 block 上未建模字段的逃生舱 (典型: Anthropic
-/// block 级 `cache_control` 缓存断点, claude code 每请求 2-4 个). 同协议
-/// round-trip 时 reader 收集 / writer 原样回写; 跨协议翻译前由
+/// 全部六个 wire 来源 variant (Text / ToolUse / ToolResult / Image / Reasoning /
+/// ReasoningContent) 均携带 `extra: Map<String, Value>` — 该 block 上未建模字段
+/// 的逃生舱 (典型: Anthropic block 级 `cache_control` 缓存断点, claude code
+/// 每请求 2-4 个; 扩展思考场景官方推荐断点恰在 thinking block — T7 补齐).
+/// 同协议 round-trip 时 reader 收集 / writer 原样回写; 跨协议翻译前由
 /// `clear_wire_fidelity` 清空 (与顶层 `IrRequest.extra` 契约同型).
-/// `Reasoning` / `ReasoningContent` 是跨协议合成产物, 无 wire 来源, 不携带.
+/// 注意: sg-thinking envelope **不携带** extra — 打包点在 writer = 跨协议 seam
+/// 之后 (extra 已被清空, 恒空 Map), 解包侧的 extra 由 reader 从 wire item 现收.
 #[derive(Debug, Clone, PartialEq)]
 pub enum IrBlock {
     /// 文本块.
@@ -547,6 +551,9 @@ pub enum IrBlock {
         /// Responses reasoning item 的 `encrypted_content` (provider opaque).
         /// None = wire 缺席。跨协议到 Anthropic 时被 envelope 打包进 signature。
         opaque: Option<String>,
+        /// 未建模字段 (L5, T7 — 与 Text 等四臂同型; reasoning item 的 id 等未知
+        /// 字段逃生舱)。跨协议经 `clear_wire_fidelity` 清空。
+        extra: serde_json::Map<String, Value>,
     },
     /// 思考原文块 (OpenAI Chat 兼容 provider 的 `reasoning_content` 字段 / Anthropic
     /// `thinking` / `redacted_thinking` block, 思考型模型的思考阶段原文).
@@ -566,6 +573,9 @@ pub enum IrBlock {
         /// provider opaque: Anthropic thinking.signature / redacted_thinking.data。
         /// `RedactedData` 形态时 `text` 恒空 (redacted_thinking 无原文)。
         opaque: Option<ThinkingOpaque>,
+        /// 未建模字段 (L5, T7 — 典型: thinking block 的 `cache_control` 缓存断点,
+        /// 扩展思考场景官方推荐断点恰在此)。跨协议经 `clear_wire_fidelity` 清空。
+        extra: serde_json::Map<String, Value>,
     },
 }
 

@@ -290,10 +290,12 @@ mod tests {
                 IrBlock::ReasoningContent {
                     text: "deep thought".into(),
                     opaque: Some(ThinkingOpaque::Signature("SIGscan01".into())),
+                    extra: Default::default(),
                 },
                 IrBlock::ReasoningContent {
                     text: String::new(),
                     opaque: Some(ThinkingOpaque::RedactedData("RDATAscan02".into())),
+                    extra: Default::default(),
                 },
             ]
         );
@@ -1244,6 +1246,7 @@ mod tests {
                         expected_blocks.push(IrBlock::ReasoningContent {
                             text: format!("{r1} {r2}"),
                             opaque: None,
+                            extra: Default::default(),
                         });
                     }
 

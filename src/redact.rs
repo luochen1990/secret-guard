@@ -868,13 +868,22 @@ impl StringLeafOps for IrBlock {
             // opaque (signature/encrypted_content) 是签名/密文非明文, 有意不进
             // 叶子扫描 — 其跨协议搬运安全性由 envelope 打包/解包位置保证
             // (writer 侧打包 = post-redact, reader 侧解包 = pre-redact, 见
-            // codec/thinking.rs 安全链注记)。
-            IrBlock::Reasoning { summary, .. } => {
+            // codec/thinking.rs 安全链注记)。extra 里的字符串叶子照扫 (T7 修复轮:
+            // 与四臂同型, extra 可携带任意未建模字符串字段)。
+            IrBlock::Reasoning { summary, extra, .. } => {
                 for s in summary {
                     f(s);
                 }
+                for v in extra.values() {
+                    v.for_each_str_leaf(f);
+                }
             }
-            IrBlock::ReasoningContent { text, .. } => f(text),
+            IrBlock::ReasoningContent { text, extra, .. } => {
+                f(text);
+                for v in extra.values() {
+                    v.for_each_str_leaf(f);
+                }
+            }
         }
     }
 
@@ -921,12 +930,20 @@ impl StringLeafOps for IrBlock {
                     v.for_each_str_leaf_mut(f);
                 }
             }
-            IrBlock::Reasoning { summary, .. } => {
+            IrBlock::Reasoning { summary, extra, .. } => {
                 for s in summary {
                     f(s);
                 }
+                for v in extra.values_mut() {
+                    v.for_each_str_leaf_mut(f);
+                }
             }
-            IrBlock::ReasoningContent { text, .. } => f(text),
+            IrBlock::ReasoningContent { text, extra, .. } => {
+                f(text);
+                for v in extra.values_mut() {
+                    v.for_each_str_leaf_mut(f);
+                }
+            }
         }
     }
 }
@@ -1143,13 +1160,21 @@ fn collect_block_leaves<'a>(block: &'a IrBlock, leaves: &mut Vec<&'a str>) {
         }
         // opaque (签名/密文) 非明文, 不进叶子收集 — 与 StringLeafOps 的扫描集
         // 保持一致 (C1 安全链: envelope 内文本经 reader 解包后以 text/summary
-        // 叶子身份进入本扫描)。
-        IrBlock::Reasoning { summary, .. } => {
+        // 叶子身份进入本扫描)。extra 的 Value 叶子照收 (T7 修复轮, 双轨一致)。
+        IrBlock::Reasoning { summary, extra, .. } => {
             for s in summary {
                 leaves.push(s);
             }
+            for v in extra.values() {
+                collect_value_leaves(v, leaves);
+            }
         }
-        IrBlock::ReasoningContent { text, .. } => leaves.push(text),
+        IrBlock::ReasoningContent { text, extra, .. } => {
+            leaves.push(text);
+            for v in extra.values() {
+                collect_value_leaves(v, leaves);
+            }
+        }
     }
 }
 
@@ -1776,10 +1801,12 @@ mod tests {
                     IrBlock::Reasoning {
                         summary: vec!["reasoning-summary".to_string()],
                         opaque: None,
+                        extra: Default::default(),
                     },
                     IrBlock::ReasoningContent {
                         text: "reasoning-content".to_string(),
                         opaque: None,
+                        extra: Default::default(),
                     },
                 ],
                 extra: msg_extra,
