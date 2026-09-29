@@ -7,9 +7,15 @@
 //!
 //! 1. **建模范围内语义保留**: 在 chat completion 建模范围 (messages / tools / tool_use /
 //!    tool_result / usage 总数 / stop_reason) 内, 翻译保留语义.
-//! 2. **范围外显式丢弃**: 建模范围外的字段 (reasoning / thinking / citations / logprobs /
-//!    prompt caching / usage 细分如 cache_hit_input_tokens 等) **必须显式丢弃**, 不允许
-//!    源协议独有字段以 `extra` 形式泄漏到 egress.
+//! 2. **范围外显式丢弃**: 建模范围外的字段 (思考原文 reasoning_content / citations /
+//!    logprobs / prompt caching / usage 细分如 cache_hit_input_tokens 等) **必须显式丢弃**,
+//!    不允许源协议独有字段以 `extra` 形式泄漏到 egress.
+//!
+//! 注 (2026-09-29, roadmap A1 批次 1): 请求侧 reasoning **配置** (`reasoning_effort` /
+//! `thinking` / `reasoning.effort`) 已提升为 first-class (`IrRequest.reasoning`) 并跨协议
+//! **翻译** (o `high` ⇄ a `thinking:{budget_tokens:8192}`, 见 `fwd_property.rs` 的
+//! cross_proto_reasoning_* 系列) — 不再属于 "范围外丢弃"; 响应侧思考原文
+//! (`reasoning_content` block) 仍丢弃 (见下).
 //!
 //! # 生产路径 (与 [`crate::proxy::cross_proto_forward`] 完全一致)
 //!
@@ -23,7 +29,8 @@
 //!
 //! `extra.clear()` 是 FWD-3 的核心安全操作: [`crate::codec::collect_extra`] 把 reader 未
 //! 建模的字段塞进 `extra`, 同协议路径会透传 extra (FWD-1/FWD-2), 但跨协议路径必须清空
-//! (否则源协议独有字段如 OpenAI `reasoning_effort` 会污染 Anthropic egress wire).
+//! (否则源协议独有字段如 OpenAI `response_format` 会污染 Anthropic egress wire;
+//! reasoning 配置经 first-class 翻译, 不受此清空影响).
 //!
 //! 注: `reasoning_content` (思考原文) 已建模为 first-class block (#176:
 //! `IrBlock::ReasoningContent`), 但**跨协议仍丢弃** (Anthropic thinking 需 signature /
@@ -36,7 +43,8 @@
 //! - OpenAI ingress 独有字段: `reasoning_content` (顶层弃用形态) / `logprobs` / `logit_bias` /
 //!   `response_format` / `seed` / `store` / `metadata` (顶层) / `n` / `presence_penalty` /
 //!   `frequency_penalty`
-//! - Anthropic ingress 独有字段: `thinking` / `citations` / `cache_control` /
+//! - Anthropic ingress 独有字段: `thinking` (A1 起经 first-class 翻译为 o 侧
+//!   `reasoning_effort`, 断言仅守原生形态不泄漏) / `citations` / `cache_control` /
 //!   `service_tier` / `top_k` (OpenAI 无) / `metadata`(顶层)
 //! - 建模范围内字段: messages (user/assistant/system/tool) / tools / tool_choice /
 //!   max_tokens / temperature / top_p / stop / stream / user
@@ -145,6 +153,11 @@ proptest! {
     }
 
     /// FWD-3 `prop_cross_proto_unmodeled_fields_explicitly_dropped` (反向): Anthropic → OpenAI.
+    ///
+    /// 注 (A1, 2026-09-29): `thinking` 已 first-class 化并翻译为 o 侧
+    /// `reasoning_effort` (`fwd_property.rs::cross_proto_reasoning_*` 系列) — 本测试
+    /// 对 thinking 断言的是**原生形态 key 不泄漏** (翻译产物 reasoning_effort 是
+    /// 合法 OpenAI 字段, 不在断言范围); 其余条目仍是未建模字段的原样丢弃守卫.
     #[test]
     fn prop_cross_proto_unmodeled_fields_explicitly_dropped_anthropic_to_openai(
         wire in arb_anthropic_ingress_with_known_unmodeled_fields()

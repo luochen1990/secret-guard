@@ -71,6 +71,10 @@ pub struct IrRequest {
     pub parallel_tool_calls: Option<bool>,
     /// 是否流式响应.
     pub stream: bool,
+    /// reasoning (深度思考) 配置 (roadmap A1, 跨协议 first-class). None = 请求无
+    /// reasoning 配置. 同协议路径不消费本字段 (extra 原样回写), 跨协议 seam 上
+    /// extra 被清空后由它驱动翻译. 详见 [`IrReasoning`] 头部注释.
+    pub reasoning: Option<IrReasoning>,
     /// 模型 id (从原始请求透传, 写入 egress 请求).
     pub model: String,
     /// 未建模字段的逃生舱. 同协议 round-trip 时透传; 跨协议时清空 (防泄漏).
@@ -322,6 +326,127 @@ pub enum SystemForm {
     String,
     /// 数组: `"system": [{"type":"text",...}]` (含单 block — 形态保真优先于折叠启发式)
     Array,
+}
+
+/// reasoning (深度思考) 配置的协议无关表示 (roadmap A1, 批次 1).
+///
+/// 归一化三协议的两种 API 风格: "档位 (effort)" vs "精确预算 (budget_tokens)":
+/// - OpenAI Chat: `reasoning_effort: "minimal"|"low"|...` (档位)
+/// - OpenAI Responses: `reasoning: {effort: "..."}` (档位)
+/// - Anthropic: `thinking: {type, budget_tokens?}` (精确预算 / adaptive / disabled)
+///
+/// **与 extra 的共存纪律** (roadmap §2.4): 三协议 reader 均**不**把对应 wire 字段
+/// (`reasoning_effort` / `thinking` / `reasoning`) 从 `collect_extra` 排除 — 原始
+/// 对象 (含 `display` / `summary` 等未建模子字段) 留在 extra: 同协议 round-trip
+/// 由 extra 原样回写 (writer 检测到 extra 有对应 key 时跳过 first-class 注入,
+/// 避免双写), 未知档位值 (enum 建不出) 也靠 extra 兜底不丢 (ROB); 跨协议 seam
+/// (`cross_proto_forward`) extra 被清空, 本字段驱动翻译.
+///
+/// 本字段是**语义字段**而非 wire 形态元数据: `clear_wire_fidelity` **不清空**它 —
+/// 这正是跨协议保留 reasoning 语义的机制 (对照: `stop_form` 等只服务同协议保真).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrReasoning {
+    /// 关闭 reasoning (Anthropic `thinking: {type: "disabled"}`).
+    /// OpenAI 系无对应字段 (writer 不写), lossy-by-target.
+    Disabled,
+    /// 档位模式 (OpenAI `reasoning_effort` / Responses `reasoning.effort`).
+    Effort(IrReasoningEffort),
+    /// 精确预算模式 (Anthropic `thinking: {type: "enabled", budget_tokens: N}`).
+    Budget(u32),
+    /// 自适应 (Anthropic `thinking: {type: "adaptive"}`).
+    /// OpenAI 系无对应档位 (writer 投影到 Medium).
+    Adaptive,
+}
+
+/// reasoning 档位 (OpenAI effort 枚举, 6 档).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrReasoningEffort {
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+/// effort ↔ budget 双向投影表 (绝对值, roadmap A1 裁决: 简单优先, 不随 max_tokens
+/// 自适应 — 真实场景出现 "max_tokens 很大但 reasoning 不够用" 再切 ratio 公式).
+/// **表序 == [`IrReasoningEffort`] 判别式序** (`budget_tokens` 按 `self as usize`
+/// 直查) — 重排变体声明序会静默错位 (由 `effort_budget_table_values_locked` 拦截).
+const EFFORT_BUDGETS: [u32; 6] = [1024, 2048, 4096, 8192, 16384, 32768];
+
+impl IrReasoningEffort {
+    /// wire 字符串形态 (OpenAI effort 枚举名, 全小写单词无分隔符).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    /// wire 字符串 → enum. 未知档位返回 None (ROB-1: 不 panic; same-proto 由
+    /// extra 兜底保真, 跨协议按无配置处理).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "minimal" => Some(Self::Minimal),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" => Some(Self::Xhigh),
+            "max" => Some(Self::Max),
+            _ => None,
+        }
+    }
+
+    /// effort → budget 投影 (表 SSOT, 与 [`Self::nearest_budget`] 互为逆).
+    pub fn budget_tokens(self) -> u32 {
+        EFFORT_BUDGETS[self as usize]
+    }
+
+    /// budget → effort 反查 (nearest: `|表值 − budget|` 最小的档位; 等距平局取
+    /// 较高档, 如 1536 距 1024/2048 等距 → Low). 精确预算 (连续) 投影到 6 档
+    /// 离散枚举必损精度 — 本函数是 o/r writer 对 `Budget(n)` 的统一降维规则,
+    /// 表值精确命中时无损 (`nearest_budget(e.budget_tokens()) == e`).
+    pub fn nearest_budget(budget: u32) -> Self {
+        let mut best = 0usize;
+        let mut best_dist = u64::MAX;
+        for (i, table) in EFFORT_BUDGETS.iter().enumerate() {
+            // u64 距离避免 u32 溢出 (budget 很大时).
+            let dist = (*table as u64).abs_diff(budget as u64);
+            // 等距平局取较高档 (i 更大): `<=` 使后面的等距候选胜出.
+            if dist <= best_dist {
+                best = i;
+                best_dist = dist;
+            }
+        }
+        match best {
+            0 => Self::Minimal,
+            1 => Self::Low,
+            2 => Self::Medium,
+            3 => Self::High,
+            4 => Self::Xhigh,
+            _ => Self::Max,
+        }
+    }
+}
+
+impl IrReasoning {
+    /// 投影到 OpenAI 系 (o/r) effort 档位:
+    /// - `Effort(e)` → e; `Budget(n)` → nearest 档; `Adaptive` → Medium (无档位
+    ///   对应, 取中档默认);
+    /// - `Disabled` → None (OpenAI 系无 "关闭" 字段, writer 不写 — lossy-by-target).
+    pub fn to_effort(self) -> Option<IrReasoningEffort> {
+        match self {
+            Self::Disabled => None,
+            Self::Effort(e) => Some(e),
+            Self::Budget(n) => Some(IrReasoningEffort::nearest_budget(n)),
+            Self::Adaptive => Some(IrReasoningEffort::Medium),
+        }
+    }
 }
 
 impl SystemForm {
@@ -919,6 +1044,94 @@ mod tests {
             IrToolChoice::Tool { name: "x".into() },
             IrToolChoice::Tool { name: "y".into() }
         );
+    }
+
+    // ─── IrReasoning: effort ↔ budget 双向投影 (roadmap A1) ──────────────
+    //
+    // 投影表是三协议 reader/writer 翻译的 SSOT, 表值与 nearest 语义在此锁定.
+
+    #[test]
+    fn effort_budget_table_values_locked() {
+        // roadmap A1 绝对值表 (Minimal..Max).
+        assert_eq!(IrReasoningEffort::Minimal.budget_tokens(), 1024);
+        assert_eq!(IrReasoningEffort::Low.budget_tokens(), 2048);
+        assert_eq!(IrReasoningEffort::Medium.budget_tokens(), 4096);
+        assert_eq!(IrReasoningEffort::High.budget_tokens(), 8192);
+        assert_eq!(IrReasoningEffort::Xhigh.budget_tokens(), 16384);
+        assert_eq!(IrReasoningEffort::Max.budget_tokens(), 32768);
+    }
+
+    #[test]
+    fn nearest_budget_inverts_table_exactly() {
+        // 表值精确命中 → 无损 (effort → budget → effort 恒等).
+        for e in [
+            IrReasoningEffort::Minimal,
+            IrReasoningEffort::Low,
+            IrReasoningEffort::Medium,
+            IrReasoningEffort::High,
+            IrReasoningEffort::Xhigh,
+            IrReasoningEffort::Max,
+        ] {
+            assert_eq!(IrReasoningEffort::nearest_budget(e.budget_tokens()), e);
+        }
+    }
+
+    #[test]
+    fn nearest_budget_midpoints_and_ties() {
+        // 区间中点归较高档 (平局裁决: 1536 距 1024/2048 等距 → Low).
+        assert_eq!(
+            IrReasoningEffort::nearest_budget(1536),
+            IrReasoningEffort::Low
+        );
+        assert_eq!(
+            IrReasoningEffort::nearest_budget(3072),
+            IrReasoningEffort::Medium
+        );
+        // 边界内采样.
+        assert_eq!(
+            IrReasoningEffort::nearest_budget(1),
+            IrReasoningEffort::Minimal
+        );
+        assert_eq!(
+            IrReasoningEffort::nearest_budget(10000),
+            IrReasoningEffort::High
+        );
+        assert_eq!(
+            IrReasoningEffort::nearest_budget(u32::MAX),
+            IrReasoningEffort::Max
+        );
+    }
+
+    #[test]
+    fn effort_parse_round_trips_and_rejects_unknown() {
+        for e in [
+            IrReasoningEffort::Minimal,
+            IrReasoningEffort::Low,
+            IrReasoningEffort::Medium,
+            IrReasoningEffort::High,
+            IrReasoningEffort::Xhigh,
+            IrReasoningEffort::Max,
+        ] {
+            assert_eq!(IrReasoningEffort::parse(e.as_str()), Some(e));
+        }
+        // 未知档位 None (ROB-1), 不 panic.
+        assert_eq!(IrReasoningEffort::parse("banana"), None);
+        assert_eq!(IrReasoningEffort::parse(""), None);
+    }
+
+    #[test]
+    fn reasoning_to_effort_projection() {
+        use IrReasoning::*;
+        assert_eq!(
+            Effort(IrReasoningEffort::High).to_effort(),
+            Some(IrReasoningEffort::High)
+        );
+        // Budget → nearest (10000 → High, 距 8192 近).
+        assert_eq!(Budget(10000).to_effort(), Some(IrReasoningEffort::High));
+        assert_eq!(Budget(0).to_effort(), Some(IrReasoningEffort::Minimal));
+        // Adaptive → Medium 默认档; Disabled → None (OpenAI 无关闭字段).
+        assert_eq!(Adaptive.to_effort(), Some(IrReasoningEffort::Medium));
+        assert_eq!(Disabled.to_effort(), None);
     }
 
     // ─── IrUsage::is_zero ──────────────────────────────────────────────

@@ -47,8 +47,9 @@ use serde_json::Value;
 use crate::provider::Protocol as NativeProtocol;
 
 pub use ir::{
-    IrBlock, IrBlockMeta, IrDelta, IrError, IrImageSource, IrMessage, IrRequest, IrResponse,
-    IrRole, IrStopReason, IrStreamEvent, IrTool, IrToolChoice, IrUsage,
+    IrBlock, IrBlockMeta, IrDelta, IrError, IrImageSource, IrMessage, IrReasoning,
+    IrReasoningEffort, IrRequest, IrResponse, IrRole, IrStopReason, IrStreamEvent, IrTool,
+    IrToolChoice, IrUsage,
 };
 
 /// codec 层使用的 protocol 标识.

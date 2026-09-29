@@ -16,7 +16,9 @@
 
 use serde_json::{Map, Value, json};
 
-use super::ir::{ContentForm, MaxTokensForm, ReasoningContentForm, StopForm};
+use super::ir::{
+    ContentForm, IrReasoning, IrReasoningEffort, MaxTokensForm, ReasoningContentForm, StopForm,
+};
 use super::{
     IrBlock, IrBlockMeta, IrDelta, IrError, IrImageSource, IrMessage, IrRequest, IrResponse,
     IrRole, IrStopReason, IrStreamEvent, IrTool, IrToolChoice, IrUsage, Reader, Writer,
@@ -185,6 +187,14 @@ impl Reader for OpenAiReader {
         let parallel_tool_calls = obj.get("parallel_tool_calls").and_then(Value::as_bool);
         let stream = obj.get("stream").and_then(Value::as_bool).unwrap_or(false);
         let tool_choice = obj.get("tool_choice").and_then(read_tool_choice);
+        // reasoning 配置 (A1): reasoning_effort → Effort. 未知档位 → None (ROB),
+        // same-proto 由 extra 兜底 (reasoning_effort 不进 collect_extra 排除清单,
+        // reader 侧原始值原样保留).
+        let reasoning = obj
+            .get("reasoning_effort")
+            .and_then(Value::as_str)
+            .and_then(IrReasoningEffort::parse)
+            .map(IrReasoning::Effort);
 
         let tools = obj
             .get("tools")
@@ -232,6 +242,7 @@ impl Reader for OpenAiReader {
             user,
             parallel_tool_calls,
             stream,
+            reasoning,
             model,
             extra,
         })
@@ -408,6 +419,15 @@ impl Writer for OpenAiWriter {
         }
         if req.stream {
             out.insert("stream".to_string(), Value::Bool(true));
+        }
+        // reasoning 配置 (A1): 跨协议注入 reasoning_effort (to_effort 投影:
+        // Budget → nearest, Adaptive → Medium, Disabled → 无对应字段不写).
+        // same-proto round-trip 时 extra 携带原始 reasoning_effort (reader 不从
+        // collect_extra 排除), 跳过注入由 extra 原样回写 — 无双写, 未知档位值不丢.
+        if let Some(effort) = req.reasoning.and_then(IrReasoning::to_effort)
+            && !req.extra.contains_key("reasoning_effort")
+        {
+            out.insert("reasoning_effort".to_string(), json!(effort.as_str()));
         }
         if let Some(u) = &req.user {
             out.insert("user".to_string(), Value::String(u.clone()));
@@ -1543,6 +1563,74 @@ mod tests {
         let out = writer().write_request(&ir);
         assert_eq!(out.get("max_tokens"), Some(&json!(100)));
         assert!(out.get("max_completion_tokens").is_none());
+    }
+
+    // ─── reasoning 配置 (A1) ────────────────────────────────────────────
+
+    #[test]
+    fn read_request_reasoning_effort_known_and_unknown() {
+        use crate::codec::ir::{IrReasoning, IrReasoningEffort};
+        let mk = |effort: &str| {
+            json!({
+                "model": "gpt-5",
+                "messages": [{"role": "user", "content": "x"}],
+                "reasoning_effort": effort,
+            })
+        };
+        // 已知档位 → first-class Effort.
+        let ir = reader().read_request(&mk("high")).unwrap();
+        assert_eq!(
+            ir.reasoning,
+            Some(IrReasoning::Effort(IrReasoningEffort::High))
+        );
+        // 未知档位 → None (ROB), extra 兜底 (same-proto 不丢).
+        let ir = reader().read_request(&mk("banana")).unwrap();
+        assert_eq!(ir.reasoning, None);
+        assert_eq!(ir.extra.get("reasoning_effort"), Some(&json!("banana")));
+        // 缺失 → None.
+        let ir = reader()
+            .read_request(&json!({
+                "model": "gpt-5",
+                "messages": [{"role": "user", "content": "x"}],
+            }))
+            .unwrap();
+        assert_eq!(ir.reasoning, None);
+    }
+
+    #[test]
+    fn write_request_reasoning_effort_projection_and_extra_priority() {
+        use crate::codec::ir::{IrReasoning, IrReasoningEffort};
+        // 跨协议 (extra 空): Effort 直写; Budget → nearest; Adaptive → Medium;
+        // Disabled → 不写.
+        let mk = |reasoning| IrRequest {
+            model: "m".into(),
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![IrBlock::Text {
+                    text: "hi".into(),
+                    extra: Default::default(),
+                }],
+                ..Default::default()
+            }],
+            reasoning,
+            ..Default::default()
+        };
+        let out = writer().write_request(&mk(Some(IrReasoning::Effort(IrReasoningEffort::Xhigh))));
+        assert_eq!(out.get("reasoning_effort"), Some(&json!("xhigh")));
+        // 10000 → nearest High (距 8192 近).
+        let out = writer().write_request(&mk(Some(IrReasoning::Budget(10000))));
+        assert_eq!(out.get("reasoning_effort"), Some(&json!("high")));
+        let out = writer().write_request(&mk(Some(IrReasoning::Adaptive)));
+        assert_eq!(out.get("reasoning_effort"), Some(&json!("medium")));
+        let out = writer().write_request(&mk(Some(IrReasoning::Disabled)));
+        assert!(out.get("reasoning_effort").is_none());
+
+        // same-proto (extra 有 reasoning_effort): extra 优先回写, 跳过注入 —
+        // 未知值不丢 (FWD-1).
+        let mut ir = mk(Some(IrReasoning::Effort(IrReasoningEffort::High)));
+        ir.extra.insert("reasoning_effort".into(), json!("banana"));
+        let out = writer().write_request(&ir);
+        assert_eq!(out.get("reasoning_effort"), Some(&json!("banana")));
     }
 
     #[test]

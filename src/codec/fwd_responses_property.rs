@@ -167,9 +167,26 @@ fn arb_responses_request_value() -> impl Strategy<Value = Value> {
         arb_temperature_opt(),
         arb_tools_opt(0..3),
         any::<bool>(),
+        // reasoning (A1): 缺失 / 已知档位 (可带 summary) / 未知档位 / 非 object
+        // (ROB — extra 兜底).
+        prop::option::of(prop_oneof![
+            Just(json!({"effort": "low"})),
+            Just(json!({"effort": "high", "summary": "auto"})),
+            Just(json!({"effort": "banana"})),
+            Just(json!("not-an-object")),
+        ]),
     )
         .prop_map(
-            |(model, instructions, input_items, max_tokens, temperature, tools, stream)| {
+            |(
+                model,
+                instructions,
+                input_items,
+                max_tokens,
+                temperature,
+                tools,
+                stream,
+                reasoning,
+            )| {
                 // tool_choice 仅在 tools 非空时才有意义 (tools 为空时 writer 会跳过, 不 round-trip).
                 let tool_choice = tools
                     .as_ref()
@@ -195,6 +212,9 @@ fn arb_responses_request_value() -> impl Strategy<Value = Value> {
                 }
                 if stream {
                     req.insert("stream".to_string(), json!(true));
+                }
+                if let Some(r) = reasoning {
+                    req.insert("reasoning".to_string(), r);
                 }
                 Value::Object(req)
             },

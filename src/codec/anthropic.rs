@@ -18,7 +18,7 @@
 
 use serde_json::{Map, Value, json};
 
-use super::ir::ContentForm;
+use super::ir::{ContentForm, IrReasoning};
 use super::{
     DEFAULT_MAX_TOKENS, IrBlock, IrBlockMeta, IrDelta, IrError, IrImageSource, IrMessage,
     IrRequest, IrResponse, IrRole, IrStopReason, IrStreamEvent, IrTool, IrToolChoice, IrUsage,
@@ -97,6 +97,27 @@ impl Reader for AnthropicReader {
             .map(read_tool_choice)
             .unwrap_or((None, None));
 
+        // reasoning 配置 (A1): thinking {type, budget_tokens?} → Disabled / Budget /
+        // Adaptive. 非法形态 (enabled 无 budget_tokens / type 未知 / 非 object) →
+        // None (ROB-1), same-proto 由 extra 兜底 (thinking 不进 collect_extra 排除
+        // 清单, display 等子字段靠 extra 保真).
+        // 假设: adaptive 形态不携带 budget_tokens (官方 adaptive 是无参档); 若上游
+        // 扩展出带预算的 adaptive, 该预算跨协议被忽略 (投影 Medium, known-limitations
+        // codec 节条目②), same-proto 仍由 extra 保真.
+        let reasoning = obj.get("thinking").and_then(|t| {
+            let thinking = t.as_object()?;
+            match thinking.get("type").and_then(Value::as_str)? {
+                "disabled" => Some(IrReasoning::Disabled),
+                "enabled" => thinking
+                    .get("budget_tokens")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| u32::try_from(n).ok())
+                    .map(IrReasoning::Budget),
+                "adaptive" => Some(IrReasoning::Adaptive),
+                _ => None,
+            }
+        });
+
         let extra = collect_extra(
             obj,
             &[
@@ -129,6 +150,7 @@ impl Reader for AnthropicReader {
             user,
             parallel_tool_calls,
             stream,
+            reasoning,
             model,
             extra,
             ..Default::default()
@@ -408,6 +430,31 @@ impl Writer for AnthropicWriter {
         }
         if req.stream {
             out.insert("stream".to_string(), Value::Bool(true));
+        }
+        // reasoning 配置 (A1): thinking. same-proto 时 extra 携带原始 thinking
+        // (含 display 等子字段), 跳过注入由 extra 原样回写; 跨协议 first-class
+        // 驱动翻译 (Effort 查表 → budget). clamp: Anthropic 要求
+        // budget_tokens < max_tokens — 查表值超出时压到 max_tokens-1.
+        // 注: Disabled 分支在生产跨协议路径不可达 (o/r 请求无"关闭"形态可读,
+        // IR Disabled 仅 a reader 产生, 而 a→a same-proto 走 extra) — 仅测试与
+        // 防御性可达.
+        if let Some(reasoning) = req.reasoning
+            && !req.extra.contains_key("thinking")
+        {
+            let max_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+            let thinking = match reasoning {
+                IrReasoning::Disabled => json!({"type": "disabled"}),
+                IrReasoning::Adaptive => json!({"type": "adaptive"}),
+                IrReasoning::Effort(e) => json!({
+                    "type": "enabled",
+                    "budget_tokens": clamp_thinking_budget(e.budget_tokens(), max_tokens),
+                }),
+                IrReasoning::Budget(n) => json!({
+                    "type": "enabled",
+                    "budget_tokens": clamp_thinking_budget(n, max_tokens),
+                }),
+            };
+            out.insert("thinking".to_string(), thinking);
         }
         if let Some(u) = &req.user {
             out.insert("metadata".to_string(), json!({"user_id": u}));
@@ -1082,6 +1129,16 @@ fn write_usage(u: &IrUsage) -> Value {
     Value::Object(obj)
 }
 
+/// Clamp thinking budget_tokens 到 Anthropic 约束 `budget_tokens < max_tokens`.
+///
+/// Anthropic 另要求 budget_tokens ≥ 1024; 当 max_tokens ≤ 1024 时两个约束不可
+/// 能同时满足 — 此时仍取 min(budget, max_tokens-1) (max_tokens 是更硬的约束,
+/// 违反必 400), 把矛盾显式透传给上游拒绝, 而非静默丢 thinking 语义 (对齐
+/// "明确丢弃优于静默丢" 纪律, 见 codec/AGENTS.md 语义损失清单).
+fn clamp_thinking_budget(budget: u32, max_tokens: u32) -> u32 {
+    budget.min(max_tokens.saturating_sub(1))
+}
+
 /// Clamp temperature 到 [0, 1], 返回 (clamped, was_clamped).
 fn clamp_temperature(t: f64) -> (f64, bool) {
     if !t.is_finite() {
@@ -1646,6 +1703,123 @@ mod tests {
         };
         let v = writer().write_request(&ir);
         assert_eq!(v.get("temperature").unwrap(), 1.0);
+    }
+
+    // ─── reasoning 配置 (A1) ────────────────────────────────────────────
+
+    #[test]
+    fn read_request_thinking_variants() {
+        use crate::codec::ir::IrReasoning;
+        let mk = |thinking: Value| {
+            json!({
+                "model": "claude-x",
+                "messages": [{"role": "user", "content": "x"}],
+                "max_tokens": 40000,
+                "thinking": thinking,
+            })
+        };
+        let ir = reader()
+            .read_request(&mk(json!({"type": "enabled", "budget_tokens": 10000})))
+            .unwrap();
+        assert_eq!(ir.reasoning, Some(IrReasoning::Budget(10000)));
+        let ir = reader()
+            .read_request(&mk(json!({"type": "disabled"})))
+            .unwrap();
+        assert_eq!(ir.reasoning, Some(IrReasoning::Disabled));
+        let ir = reader()
+            .read_request(&mk(json!({"type": "adaptive"})))
+            .unwrap();
+        assert_eq!(ir.reasoning, Some(IrReasoning::Adaptive));
+
+        // 非法形态 → None (ROB), extra 兜底 (same-proto 不丢).
+        let ir = reader()
+            .read_request(&mk(json!({"type": "enabled"})))
+            .unwrap();
+        assert_eq!(ir.reasoning, None);
+        let ir = reader()
+            .read_request(&mk(json!({"type": "banana"})))
+            .unwrap();
+        assert_eq!(ir.reasoning, None);
+        let ir = reader().read_request(&mk(json!("not-an-object"))).unwrap();
+        assert_eq!(ir.reasoning, None);
+        // 缺失 → None.
+        let ir = reader()
+            .read_request(&json!({
+                "model": "claude-x",
+                "messages": [{"role": "user", "content": "x"}],
+                "max_tokens": 40000,
+            }))
+            .unwrap();
+        assert_eq!(ir.reasoning, None);
+    }
+
+    #[test]
+    fn write_request_thinking_forms_clamp_and_extra_priority() {
+        use crate::codec::ir::{IrReasoning, IrReasoningEffort};
+        let mk = |reasoning, max_tokens: Option<u32>| IrRequest {
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![IrBlock::Text {
+                    text: "hi".into(),
+                    extra: Default::default(),
+                }],
+                ..Default::default()
+            }],
+            model: "claude".into(),
+            max_tokens,
+            reasoning,
+            ..Default::default()
+        };
+        // Effort 查表: High → 8192 (max_tokens 足够大, 无 clamp).
+        let v = writer().write_request(&mk(
+            Some(IrReasoning::Effort(IrReasoningEffort::High)),
+            Some(40000),
+        ));
+        assert_eq!(
+            v.get("thinking"),
+            Some(&json!({"type": "enabled", "budget_tokens": 8192}))
+        );
+        // clamp: 查表 8192 > max_tokens 5000 → 压到 4999 (< max_tokens).
+        let v = writer().write_request(&mk(
+            Some(IrReasoning::Effort(IrReasoningEffort::High)),
+            Some(5000),
+        ));
+        assert_eq!(
+            v.get("thinking"),
+            Some(&json!({"type": "enabled", "budget_tokens": 4999}))
+        );
+        // Budget 直接值同样受 clamp.
+        let v = writer().write_request(&mk(Some(IrReasoning::Budget(6000)), Some(5000)));
+        assert_eq!(
+            v.get("thinking"),
+            Some(&json!({"type": "enabled", "budget_tokens": 4999}))
+        );
+        // 病态: max_tokens ≤ 1024 (两个约束不可同满足) → 透传矛盾 (max_tokens-1).
+        let v = writer().write_request(&mk(
+            Some(IrReasoning::Effort(IrReasoningEffort::Max)),
+            Some(1000),
+        ));
+        assert_eq!(
+            v.get("thinking"),
+            Some(&json!({"type": "enabled", "budget_tokens": 999}))
+        );
+        // Disabled / Adaptive 形态.
+        let v = writer().write_request(&mk(Some(IrReasoning::Disabled), Some(40000)));
+        assert_eq!(v.get("thinking"), Some(&json!({"type": "disabled"})));
+        let v = writer().write_request(&mk(Some(IrReasoning::Adaptive), Some(40000)));
+        assert_eq!(v.get("thinking"), Some(&json!({"type": "adaptive"})));
+
+        // same-proto (extra 有 thinking): extra 优先回写 (display 等子字段不丢).
+        let mut ir = mk(Some(IrReasoning::Disabled), Some(40000));
+        ir.extra.insert(
+            "thinking".into(),
+            json!({"type": "enabled", "budget_tokens": 2048, "display": "on"}),
+        );
+        let v = writer().write_request(&ir);
+        assert_eq!(
+            v.get("thinking"),
+            Some(&json!({"type": "enabled", "budget_tokens": 2048, "display": "on"}))
+        );
     }
 
     #[test]

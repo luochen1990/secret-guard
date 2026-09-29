@@ -57,7 +57,8 @@ mod stream;
 use serde_json::{Map, Value, json};
 
 use super::ir::{
-    IrBlock, IrImageSource, IrMessage, IrRequest, IrResponse, IrRole, blocks_has_text,
+    IrBlock, IrImageSource, IrMessage, IrReasoning, IrReasoningEffort, IrRequest, IrResponse,
+    IrRole, blocks_has_text,
 };
 use super::{
     IrError, IrStopReason, IrTool, IrToolChoice, IrUsage, Reader, Writer, blocks_to_text,
@@ -137,6 +138,15 @@ impl Reader for ResponsesReader {
         let stream = obj.get("stream").and_then(Value::as_bool).unwrap_or(false);
         let tool_choice = obj.get("tool_choice").and_then(read_tool_choice);
         let parallel_tool_calls = obj.get("parallel_tool_calls").and_then(Value::as_bool);
+        // reasoning 配置 (A1): reasoning.effort → Effort. reasoning 对象整体留在
+        // extra (不进 collect_extra 排除清单) — summary 等未建模子字段靠 extra
+        // 同协议保真, 这里只投影 effort 档位; 未知档位 → None (ROB).
+        let reasoning = obj
+            .get("reasoning")
+            .and_then(|r| r.get("effort"))
+            .and_then(Value::as_str)
+            .and_then(IrReasoningEffort::parse)
+            .map(IrReasoning::Effort);
 
         // tools: Responses 的 tools 是平铺数组, 每个有 type.
         // function 类型: {type:"function", name, parameters, description, strict?}
@@ -200,6 +210,7 @@ impl Reader for ResponsesReader {
             user: None, // Responses 无 user 字段
             parallel_tool_calls,
             stream,
+            reasoning,
             model,
             extra,
         })
@@ -299,6 +310,14 @@ impl Writer for ResponsesWriter {
         }
         if req.stream {
             out.insert("stream".to_string(), Value::Bool(true));
+        }
+        // reasoning 配置 (A1): 跨协议注入 reasoning {effort} (to_effort 投影,
+        // Disabled → 无对应字段不写). same-proto 时 extra 携带原始 reasoning
+        // 对象 (含 summary 等子字段), 跳过注入由 extra 原样回写 (无双写 / 无损失).
+        if let Some(effort) = req.reasoning.and_then(IrReasoning::to_effort)
+            && !req.extra.contains_key("reasoning")
+        {
+            out.insert("reasoning".to_string(), json!({"effort": effort.as_str()}));
         }
         // tools: 仅 function 类型. Responses 平铺形态 (name/parameters 在 top-level).
         if !req.tools.is_empty() {
@@ -1274,6 +1293,79 @@ mod tests {
         let ir = reader().read_request(&body).unwrap();
         assert_eq!(ir.tools.len(), 1); // 只剩 function
         assert_eq!(ir.tools[0].name, "f1");
+    }
+
+    // ─── reasoning 配置 (A1) ────────────────────────────────────────────
+
+    #[test]
+    fn read_request_reasoning_effort_and_summary_in_extra() {
+        use crate::codec::ir::{IrReasoning, IrReasoningEffort};
+        // reasoning.effort → first-class Effort; summary 等子字段靠 extra
+        // (reasoning 对象不进 collect_extra 排除清单) same-proto 保真.
+        let body = json!({
+            "model": "gpt-5",
+            "input": "hi",
+            "reasoning": {"effort": "low", "summary": "auto"},
+        });
+        let ir = reader().read_request(&body).unwrap();
+        assert_eq!(
+            ir.reasoning,
+            Some(IrReasoning::Effort(IrReasoningEffort::Low))
+        );
+        assert_eq!(
+            ir.extra.get("reasoning"),
+            Some(&json!({"effort": "low", "summary": "auto"}))
+        );
+        // 未知档位 → None (ROB), extra 兜底.
+        let body = json!({
+            "model": "gpt-5",
+            "input": "hi",
+            "reasoning": {"effort": "banana"},
+        });
+        let ir = reader().read_request(&body).unwrap();
+        assert_eq!(ir.reasoning, None);
+        assert_eq!(
+            ir.extra.get("reasoning"),
+            Some(&json!({"effort": "banana"}))
+        );
+    }
+
+    #[test]
+    fn write_request_reasoning_effort_and_extra_priority() {
+        use crate::codec::ir::{IrReasoning, IrReasoningEffort};
+        let mk = |reasoning| IrRequest {
+            model: "m".into(),
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![IrBlock::Text {
+                    text: "hi".into(),
+                    extra: Default::default(),
+                }],
+                ..Default::default()
+            }],
+            reasoning,
+            ..Default::default()
+        };
+        // 跨协议 (extra 空): Effort 直写; Budget → nearest; Disabled → 不写.
+        let v = writer().write_request(&mk(Some(IrReasoning::Effort(IrReasoningEffort::Medium))));
+        assert_eq!(v.get("reasoning"), Some(&json!({"effort": "medium"})));
+        let v = writer().write_request(&mk(Some(IrReasoning::Budget(2000))));
+        // 2000 → nearest Low (2048).
+        assert_eq!(v.get("reasoning"), Some(&json!({"effort": "low"})));
+        let v = writer().write_request(&mk(Some(IrReasoning::Disabled)));
+        assert!(v.get("reasoning").is_none());
+
+        // same-proto (extra 有 reasoning): extra 优先回写 (summary 不丢).
+        let mut ir = mk(Some(IrReasoning::Effort(IrReasoningEffort::Low)));
+        ir.extra.insert(
+            "reasoning".into(),
+            json!({"effort": "low", "summary": "detailed"}),
+        );
+        let v = writer().write_request(&ir);
+        assert_eq!(
+            v.get("reasoning"),
+            Some(&json!({"effort": "low", "summary": "detailed"}))
+        );
     }
 
     #[test]

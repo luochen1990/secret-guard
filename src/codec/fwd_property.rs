@@ -36,7 +36,7 @@ use serde_json::{Value, json};
 use crate::codec::anthropic::{AnthropicReader, AnthropicWriter};
 use crate::codec::normalize::normalize_json;
 use crate::codec::openai::{OpenAiReader, OpenAiWriter};
-use crate::codec::{Reader, Writer};
+use crate::codec::{IrReasoning, IrReasoningEffort, Reader, Writer};
 use crate::redact::StringLeafOps;
 use crate::redact::redact_ir;
 use crate::secrets::{SecretCategory, SecretEntry};
@@ -126,9 +126,207 @@ proptest! {
             normalize_json(&out)
         );
     }
+
+    /// reasoning 投影 round-trip (roadmap A1 property): 任意 effort 档位经
+    /// o → a → o 跨协议往返后恢复原档位 (表值精确命中, nearest 无损).
+    #[test]
+    fn cross_proto_reasoning_effort_round_trips_through_budget(
+        effort in arb_ir_reasoning_effort()
+    ) {
+        let mut ir = OpenAiReader
+            .read_request(&json!({
+                "model": "gpt-5",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": effort.as_str(),
+                // 足够大, 不触发 budget clamp (clamp 语义由 anthropic 单测锁定).
+                "max_tokens": 65536,
+            }))
+            .unwrap();
+        ir.extra.clear();
+        ir.clear_wire_fidelity();
+
+        let a_wire = AnthropicWriter.write_request(&ir);
+        let budget = a_wire
+            .get("thinking")
+            .and_then(|t| t.get("budget_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| panic!("thinking.budget_tokens 缺失: {}", normalize_json(&a_wire)));
+        prop_assert_eq!(budget, u64::from(effort.budget_tokens()));
+
+        let mut ir2 = AnthropicReader.read_request(&a_wire).unwrap();
+        ir2.extra.clear();
+        ir2.clear_wire_fidelity();
+        let o_wire = OpenAiWriter.write_request(&ir2);
+        prop_assert_eq!(o_wire.get("reasoning_effort"), Some(&json!(effort.as_str())));
+    }
+
+    /// IrReasoning 4 variant 全域 → 三协议 writer wire 形态 (roadmap A1):
+    /// o writer 恒写 `to_effort()` 投影 (Disabled 不写); r writer 同投影写
+    /// `reasoning {effort}`; a writer 按 variant 写 disabled / adaptive /
+    /// enabled+budget (max_tokens 足够大, 无 clamp — clamp 语义由 anthropic.rs
+    /// 单测锁定).
+    #[test]
+    fn cross_proto_reasoning_ir_writes_both_wire_forms(reasoning in arb_ir_reasoning()) {
+        let ir = crate::codec::ir::IrRequest {
+            model: "m".to_string(),
+            messages: vec![crate::codec::ir::IrMessage {
+                role: crate::codec::ir::IrRole::User,
+                content: vec![crate::codec::ir::IrBlock::Text {
+                    text: "hi".to_string(),
+                    extra: Default::default(),
+                }],
+                ..Default::default()
+            }],
+            max_tokens: Some(65536),
+            reasoning: Some(reasoning),
+            ..Default::default()
+        };
+
+        // o writer: to_effort 投影 (Disabled → 不写字段).
+        let o_wire = OpenAiWriter.write_request(&ir);
+        match reasoning.to_effort() {
+            Some(e) => assert_eq!(o_wire.get("reasoning_effort"), Some(&json!(e.as_str()))),
+            None => assert!(o_wire.get("reasoning_effort").is_none()),
+        }
+
+        // r writer: 同投影, 载体为 reasoning {effort}.
+        let r_wire = crate::codec::responses::ResponsesWriter.write_request(&ir);
+        match reasoning.to_effort() {
+            Some(e) => assert_eq!(
+                r_wire.get("reasoning"),
+                Some(&json!({"effort": e.as_str()}))
+            ),
+            None => assert!(r_wire.get("reasoning").is_none()),
+        }
+
+        // a writer: variant → 三形态.
+        let a_wire = AnthropicWriter.write_request(&ir);
+        let thinking = a_wire.get("thinking").cloned().unwrap_or(Value::Null);
+        match reasoning {
+            IrReasoning::Disabled => {
+                assert_eq!(thinking, json!({"type": "disabled"}));
+            }
+            IrReasoning::Adaptive => {
+                assert_eq!(thinking, json!({"type": "adaptive"}));
+            }
+            IrReasoning::Budget(n) => {
+                assert_eq!(
+                    thinking,
+                    json!({"type": "enabled", "budget_tokens": n.min(65535)})
+                );
+            }
+            IrReasoning::Effort(e) => {
+                assert_eq!(
+                    thinking,
+                    json!({"type": "enabled", "budget_tokens": e.budget_tokens().min(65535)})
+                );
+            }
+        }
+    }
+
+    /// Budget → effort 降维幂等性 (roadmap A1 nearest 语义): 任意精确预算 n,
+    /// o writer 注入 nearest(n) 档位; 该档位再经 a writer 查表回到
+    /// nearest(n).budget_tokens() — 投影一次后进入不动点, 二次往返不再变化
+    /// (连续 → 离散的信息损失一次性发生, 不随跳数放大).
+    #[test]
+    fn cross_proto_reasoning_budget_nearest_projection_idempotent(budget in any::<u32>()) {
+        let mut ir = AnthropicReader
+            .read_request(&json!({
+                "model": "claude-x",
+                "messages": [{"role": "user", "content": "hi"}],
+                "thinking": {"type": "enabled", "budget_tokens": budget},
+                "max_tokens": 65536,
+            }))
+            .unwrap();
+        ir.extra.clear();
+        ir.clear_wire_fidelity();
+
+        let o_wire = OpenAiWriter.write_request(&ir);
+        let projected = IrReasoningEffort::nearest_budget(budget);
+        prop_assert_eq!(
+            o_wire.get("reasoning_effort"),
+            Some(&json!(projected.as_str())),
+            "budget {} 应投影到 nearest 档位 {}",
+            budget,
+            projected.as_str()
+        );
+
+        // 投影后的 effort 再查表 (≤ 32768 < max_tokens, 无 clamp), round-trip 不动点.
+        let mut ir2 = OpenAiReader.read_request(&o_wire).unwrap();
+        ir2.extra.clear();
+        ir2.clear_wire_fidelity();
+        let a_wire = AnthropicWriter.write_request(&ir2);
+        prop_assert_eq!(
+            a_wire.get("thinking").and_then(|t| t.get("budget_tokens")),
+            Some(&json!(projected.budget_tokens()))
+        );
+    }
+}
+
+/// IrReasoning 生成器 (roadmap A1): 4 variant × Budget 宽域 (0 / 1024..40000 /
+/// u32 边界), 供跨协议投影 property 消费.
+fn arb_ir_reasoning() -> impl Strategy<Value = IrReasoning> {
+    prop_oneof![
+        Just(IrReasoning::Disabled),
+        arb_ir_reasoning_effort().prop_map(IrReasoning::Effort),
+        prop_oneof![Just(0u32), 1024u32..40000, Just(u32::MAX),].prop_map(IrReasoning::Budget),
+        Just(IrReasoning::Adaptive),
+    ]
+}
+
+/// IrReasoningEffort 生成器: 6 档全覆盖.
+fn arb_ir_reasoning_effort() -> impl Strategy<Value = IrReasoningEffort> {
+    prop_oneof![
+        Just(IrReasoningEffort::Minimal),
+        Just(IrReasoningEffort::Low),
+        Just(IrReasoningEffort::Medium),
+        Just(IrReasoningEffort::High),
+        Just(IrReasoningEffort::Xhigh),
+        Just(IrReasoningEffort::Max),
+    ]
 }
 
 // ─── 生成器: OpenAI 请求 (覆盖 L1-L8) ──────────────────────────────────────
+
+/// reasoning 配置跨协议 golden (roadmap A1): OpenAI `reasoning_effort:"high"`
+/// → 跨协议 → Anthropic `thinking:{type:"enabled",budget_tokens:8192}` →
+/// 回 OpenAI 恢复 `reasoning_effort:"high"` (投影表精确命中, 无损往返).
+///
+/// 步骤与生产 `cross_proto_forward` 一致 (extra.clear + clear_wire_fidelity).
+/// (定值测试, 不进 proptest! 块 — 宏只接受参数化形态.)
+#[test]
+fn cross_proto_reasoning_golden_o_to_a_to_o() {
+    let wire = json!({
+        "model": "gpt-5",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "high",
+        "max_tokens": 40000,
+    });
+    let mut ir = OpenAiReader.read_request(&wire).unwrap();
+    assert_eq!(
+        ir.reasoning,
+        Some(IrReasoning::Effort(IrReasoningEffort::High))
+    );
+    // 跨协议 seam (与生产一致).
+    ir.extra.clear();
+    ir.clear_wire_fidelity();
+
+    // → Anthropic egress: high 查表 8192 (< max_tokens 40000, 无 clamp).
+    let a_wire = AnthropicWriter.write_request(&ir);
+    assert_eq!(
+        a_wire.get("thinking"),
+        Some(&json!({"type": "enabled", "budget_tokens": 8192})),
+        "golden: effort high → thinking budget 8192, got {}",
+        normalize_json(&a_wire)
+    );
+
+    // → 回 OpenAI: budget 8192 反查精确命中 high.
+    let mut ir2 = AnthropicReader.read_request(&a_wire).unwrap();
+    ir2.extra.clear();
+    ir2.clear_wire_fidelity();
+    let o_wire = OpenAiWriter.write_request(&ir2);
+    assert_eq!(o_wire.get("reasoning_effort"), Some(&json!("high")));
+}
 
 /// OpenAI Chat Completions 请求生成器.
 ///
@@ -142,6 +340,7 @@ proptest! {
 /// - L7 stop string vs array
 /// - L8 usage details (不在请求里, 不覆盖)
 /// - max_tokens 双读别名字段名 (max_tokens / max_completion_tokens, #283)
+/// - reasoning_effort (A1): 已知 6 档 + 未知档位值 (extra 兜底) + 缺失
 fn arb_openai_request_value() -> impl Strategy<Value = Value> {
     (
         arb_model_name(),
@@ -151,9 +350,10 @@ fn arb_openai_request_value() -> impl Strategy<Value = Value> {
         arb_stop_opt(), // L7
         arb_tools_opt(0..3),
         any::<bool>(),
+        arb_openai_reasoning_effort_wire(),
     )
         .prop_map(
-            |(model, messages, max_tokens, temperature, stop, tools, stream)| {
+            |(model, messages, max_tokens, temperature, stop, tools, stream, reasoning_effort)| {
                 let mut req = serde_json::Map::new();
                 req.insert("model".to_string(), json!(model));
                 req.insert("messages".to_string(), Value::Array(messages));
@@ -172,9 +372,29 @@ fn arb_openai_request_value() -> impl Strategy<Value = Value> {
                 if stream {
                     req.insert("stream".to_string(), json!(true));
                 }
+                if let Some(effort) = reasoning_effort {
+                    req.insert("reasoning_effort".to_string(), json!(effort));
+                }
                 Value::Object(req)
             },
         )
+}
+
+/// OpenAI wire 的 reasoning_effort 值 (A1): None (缺失) / 已知 6 档 / 未知档位值 /
+/// 显式 null (ROB — reader 建不出 enum, extra 兜底原样回写, FWD-2 同协议不丢).
+fn arb_openai_reasoning_effort_wire() -> impl Strategy<Value = Option<Value>> {
+    prop::option::of(prop_oneof![
+        Just(json!("minimal")),
+        Just(json!("low")),
+        Just(json!("medium")),
+        Just(json!("high")),
+        Just(json!("xhigh")),
+        Just(json!("max")),
+        // 未知档位: same-proto round-trip 靠 extra 保真 (ROB-1).
+        Just(json!("banana-effort")),
+        // 显式 null: 非法类型, 同样靠 extra 兜底.
+        Just(Value::Null),
+    ])
 }
 
 /// L2: 生成 system 消息 (暂只 0 或 1 条; 多 system 待 L2 实现后恢复).
@@ -418,8 +638,10 @@ fn arb_anthropic_request_value() -> impl Strategy<Value = Value> {
         ]),
         // tools: 缺席 / 工具数组 (工具可带 cache_control / defer_loading 等 extra, #269).
         prop::option::of(prop::collection::vec(arb_anthropic_tool_def(), 1..2)),
+        // thinking (A1): 缺席 / 三合法形态 / 未知 type (extra 兜底).
+        prop::option::of(arb_anthropic_thinking_wire()),
     )
-        .prop_map(|(model, messages, max_tokens, system, tools)| {
+        .prop_map(|(model, messages, max_tokens, system, tools, thinking)| {
             let mut req = serde_json::Map::new();
             req.insert("model".to_string(), json!(model));
             req.insert("messages".to_string(), Value::Array(messages));
@@ -430,8 +652,25 @@ fn arb_anthropic_request_value() -> impl Strategy<Value = Value> {
             if let Some(tools) = tools {
                 req.insert("tools".to_string(), Value::Array(tools));
             }
+            if let Some(t) = thinking {
+                req.insert("thinking".to_string(), t);
+            }
             Value::Object(req)
         })
+}
+
+/// Anthropic wire 的 thinking 对象 (A1): 合法三形态 (disabled / enabled+budget /
+/// adaptive, budget 取宽域含 clamp 边界) + 未知 type / enabled 缺 budget / null
+/// (非法形态, reader 建不出 → extra 兜底保真).
+fn arb_anthropic_thinking_wire() -> impl Strategy<Value = Value> {
+    prop_oneof![
+        Just(json!({"type": "disabled"})),
+        (1024u32..40000).prop_map(|n| json!({"type": "enabled", "budget_tokens": n})),
+        Just(json!({"type": "adaptive"})),
+        Just(json!({"type": "banana", "budget_tokens": 4096})),
+        Just(json!({"type": "enabled"})),
+        Just(Value::Null),
+    ]
 }
 
 /// 顶层 system array 的 block (text + 可选 cache_control).
