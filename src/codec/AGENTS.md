@@ -13,9 +13,8 @@
 > **改 codec 前必读** — 外部参照与已知盲区 SSOT:
 > `docs/research/cc-switch-codec-notes.md` (cc-switch 协议转换架构调研, 2026-09:
 > 其点对点矩阵 vs 本模块 IR 枢纽的对比, 可吸收的互操作语义知识分级) +
-> `docs/research/cc-switch-codec-gap-audit.md` (9 维度差距审计: T1-T10 补齐任务清单,
-> 含 3 个 P0 bug 级发现 — 孤儿 content_block_stop / max_tokens 字段名 /
-> usage cache_creation 漏加). 领取 codec 任务或评估 "某字段跨协议怎么处理" 时先查审计报告.
+> `docs/research/cc-switch-codec-gap-audit.md` (9 维度差距审计: T1-T4 bug 级发现
+> 已修 #286-#289, T5-T10 待办清单). 领取 codec 任务或评估 "某字段跨协议怎么处理" 时先查审计报告.
 
 > **调研指针**: cc-switch 的协议转换测试资产盘点 (场景矩阵 + 已吸收项 A4/A12 的
 > attribution 溯源 + 未吸收项处置) 见 `docs/research/cc-switch-test-assets.md` —

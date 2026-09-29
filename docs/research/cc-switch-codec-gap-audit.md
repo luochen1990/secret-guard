@@ -5,6 +5,10 @@
 > 组件、只差胶水" 的便宜修复 (T2 o-series 字段名 / T3 usage cache 细节 / T4 Responses
 > incomplete_details), 一个是同协议 redact 流式路径的**孤儿 content_block_stop** wire
 > 违例 (T1, 新发现, 比单纯丢 thinking 更严重)。
+>
+> **状态更新 (2026-09-29 晚)**: T1-T4 已全部实测验证 (issues #282-#285) 并修复合入
+> master (PRs #286-#289, 各含回归守卫测试 + review 记录); 正文与 TL;DR 保留审计时点
+> (`8c8337e`) 的发现描述, **现状以汇总表与任务清单的状态标记为准**; T5-T10 待办。
 
 | | |
 |---|---|
@@ -21,7 +25,7 @@
 **评级分布**: 盲区 ×7 (维度 1/2/3/4/5/6/9) · 有意忽略 ×1 (维度 7) · 需裁决 ×1 (维度 8,
 维度 9 的反向子项另计低优先裁决) · 无 gap ×0。
 
-**最重要的三个盲区**:
+**最重要的三个盲区** (状态: 第 1/2 项已修 #286/#287, 第 3 项 = T5 待办):
 
 1. **同协议 + Redact 流式路径的孤儿 `content_block_stop`** (维度 1 子发现): Anthropic
    流式 reader 丢弃 thinking block 的 BlockStart (anthropic.rs:232) 却无条件透传其
@@ -43,12 +47,12 @@
 
 | # | 维度 | secret-guard 现状 | 评级 | 一句话 |
 |---|---|---|---|---|
-| 1 | thinking signature / reasoning 往返 | **无** (IR 无 signature/encrypted_content; Anthropic thinking reader 层丢弃) | **盲区** | 同协议 redact 也丢 thinking, 流式还产生孤儿 content_block_stop; cc-switch 的 base64 envelope 证明 passthrough 建模可行 |
+| 1 | thinking signature / reasoning 往返 | **无** (IR 无 signature/encrypted_content; Anthropic thinking reader 层丢弃) | **盲区** | 同协议 redact 也丢 thinking, 流式还产生孤儿 content_block_stop; cc-switch 的 base64 envelope 证明 passthrough 建模可行。**状态**: 孤儿帧子项已修 (#286); thinking passthrough (T7) 待办 |
 | 2 | tool 媒体搬运 | **部分** (同协议无损; 跨协议 `blocks_to_text` 静默丢 Image) | **盲区** | tool_result 里的图片无占位标记无 WARN 直接消失, 连 "已知损失" 都未登记 |
 | 3 | reasoning effort 档位映射 | **部分** (thinking/effort 落 extra: 同协议保真, 跨协议 clear 全丢) | **盲区** (已规划) | roadmap A1 (P0) 有完整方案未实施; 跨协议时思考档位静默蒸发 |
-| 4 | o-series `max_completion_tokens` | **部分** (reader 双读, writer 恒写 `max_tokens`) | **盲区** | o-series 上游拒收 `max_tokens`; 同协议 redact round-trip 连字段名都改了 |
-| 5 | stop_reason 双向映射 | **部分** (typed enum 优; Responses writer 半截) | **盲区** | Responses writer 不写 `incomplete_details.reason`, 自己的 reader 把它读回 Other — MaxTokens round-trip 有损 |
-| 6 | usage cache 字段归类 | **部分** (IR 建模 + 三 reader 全对齐; OpenAI/Responses writer 丢 details) | **盲区** | `responses_usage_json` 还漏加 cache_creation (内部 SSOT 不一致); o/r ingress 客户端缓存核算失真 |
+| 4 | o-series `max_completion_tokens` | **部分** (reader 双读, writer 恒写 `max_tokens`) | **盲区** | o-series 上游拒收 `max_tokens`; 同协议 redact round-trip 连字段名都改了。**状态**: 已修 (#287, MaxTokensForm); 跨协议恒写 max_tokens 为已裁决已知限制, o-series 嗅探待 mini-裁决 |
+| 5 | stop_reason 双向映射 | **部分** (typed enum 优; Responses writer 半截) | **盲区** | Responses writer 不写 `incomplete_details.reason`, 自己的 reader 把它读回 Other — MaxTokens round-trip 有损。**状态**: 已修 (#289, status+reason 收敛单一 SSOT) |
+| 6 | usage cache 字段归类 | **部分** (IR 建模 + 三 reader 全对齐; OpenAI/Responses writer 丢 details) | **盲区** | `responses_usage_json` 还漏加 cache_creation (内部 SSOT 不一致); o/r ingress 客户端缓存核算失真。**状态**: 已修 (#288, details 写回 + 总和收敛 openai_prompt_tokens SSOT) |
 | 7 | 图片降级 (纯文本模型) | **无** | **有意忽略** | FWD-1 "上游不认可就让它失败, 网关不兜底" 明文裁决; 降级机制同 body_filter 属 body 改写不参考 (姊妹篇 §4.3/§4.2-A 已区分 "名单知识可吸收, 机制不吸收") |
 | 8 | billing header 剥离 | **无** (有认知: #269 测试明示该形态, 裁决按原位保留) | **需裁决** | 剥 = 删客户端字节 (撞 FWD-1 + 2026-09-23 cache_control 注入否决先例); 不剥 = 目标侧前缀缓存每轮全 miss (#2350 实证真实成本) |
 | 9 | 流/非流互通兜底 | **部分** (有 buffered 降级不崩; 无形态适配) | **盲区** + 需裁决-低 (反向) | stream=true 客户端最终拿到 JSON; 反向 (非流式收 SSE) 原样透传 — cc-switch 双向兜底, secret-guard 单向降级 |
@@ -56,6 +60,9 @@
 ---
 
 ## 1. thinking signature / reasoning 跨协议往返
+
+> **状态 (2026-09-29 晚)**: 本维度 1.3 的孤儿帧子项已修 (PR #286); thinking /
+> encrypted_content passthrough 建模 (T7) 待办。以下描述保留审计时点 (`8c8337e`) 现状。
 
 **(a) cc-switch 的做法**
 
@@ -180,6 +187,10 @@ round-trip / golden 测试 (:312-314) + "extra 共存" 纪律 (:91-95, :316 — 
 
 ## 4. o-series 模型检测 (max_completion_tokens vs max_tokens)
 
+> **状态 (2026-09-29 晚)**: 已修 (PR #287, `MaxTokensForm` wire-fidelity 元数据,
+> 同协议 round-trip 按原字段名回写); 跨协议恒写 `max_tokens` 为已裁决的已知限制
+> (o-series 嗅探不做, 见 known-limitations #283 条目)。以下描述保留审计时点现状。
+
 **(a) cc-switch 的做法**
 
 - `transform.rs:56-62` `is_openai_o_series`: `o` + 数字前缀 (o1/o3/o4-mini...)。
@@ -209,6 +220,10 @@ round-trip / golden 测试 (:312-314) + "extra 共存" 纪律 (:91-95, :316 — 
 :112, :170 — "合并 same-protocol 的 deprecated 别名"), 但**写侧别名还原**问题未登记。
 
 ## 5. stop_reason / finish 双向映射
+
+> **状态 (2026-09-29 晚)**: 已修 (PR #289, `write_status_and_reason` 整块 SSOT —
+> status 与 reason 一体产出, 非流式/流式两消费面共享, 表驱动测试逐臂锁定)。
+> 以下描述保留审计时点现状。
 
 **(a) cc-switch 的做法**
 
@@ -247,6 +262,10 @@ AGENTS.md "契约演进原则"; known-limitations line 26 的 "Responses 流式�
 与 stop_reason 流式/非流式统一, 但 incomplete_details 缺失未登记。
 
 ## 6. usage 映射细节 (cache 字段归类)
+
+> **状态 (2026-09-29 晚)**: 已修 (PR #288 — input 总和收敛 `openai_prompt_tokens`
+> SSOT + 双协议 `*.tokens_details.cached_tokens` 写回, 流式/非流式共用函数双向生效;
+> L8 property 转正常驻)。以下描述保留审计时点现状。
 
 **(a) cc-switch 的做法**
 
@@ -399,10 +418,10 @@ JSON 形态错配**" 的客户端影响未登记。
 
 | # | 任务 | 改动落点 | 规模 (LOC) | 优先级 | 关联 |
 |---|---|---|---|---|---|
-| T1 | **修复孤儿 content_block_stop** (维度 1.3): Anthropic 流式 reader 记录 "未产出 BlockStart 的 index" (可放 `StreamDecodeState`), `content_block_stop` 查表跳过; 或同协议模式复用 `skipped_block_starts` 过滤 (来源改为 reader 侧) | `src/codec/anthropic.rs` (read_response_events) + `src/codec/stream/translate.rs` | ~40 | **P0** (wire 违例 bug) | known-limitations codec 节新条目 (同协议 redact + thinking 流式的孤儿帧) |
-| T2 | **max_tokens 字段名保真** (维度 4): 新增 `MaxTokensForm` wire-fidelity 元数据 (与 `StopForm` 同型), OpenAI reader 记录 / writer 按原字段名回写 (同协议); 跨协议 o-egress 的 o-series 检测另议 (可抄 cc-switch 前缀嗅探, 或保守双发不兼容 — 需 mini-裁决) | `src/codec/ir.rs` + `src/codec/openai.rs` | ~50-70 | **P0** | roadmap §3 全景表加写侧别名注记; known-limitations codec 节新条目 (同协议 redact 改写字段名) |
-| T3 | **usage cache 细节补齐** (维度 6): `responses_usage_json` 修 input_total 漏加 cache_creation + 写 `input_tokens_details.cached_tokens`; `openai_usage_json` 写 `prompt_tokens_details.cached_tokens` (= cache_read) | `src/codec/ir.rs` + `src/codec/responses/mod.rs` | ~25 | **P0** (含准 bug) | known-limitations line 24 扩充至非流式 writer |
-| T4 | **Responses writer 补 `incomplete_details.reason`** (维度 5): `write_status_str` 升级为返回 (status, Option<reason>) 或并列 helper; 非流式 `write_response` 与流式终止事件 (stream.rs) 同步; round-trip 测试从 Other 恢复 MaxTokens/Safety | `src/codec/responses/mod.rs` + `src/codec/responses/stream.rs` | ~40 | **P1** | known-limitations line 26 ("Responses 流式方案 T2/T3" 条目) 扩充 |
+| T1 | **修复孤儿 content_block_stop** (维度 1.3): Anthropic 流式 reader 记录 "未产出 BlockStart 的 index" (可放 `StreamDecodeState`), `content_block_stop` 查表跳过; 或同协议模式复用 `skipped_block_starts` 过滤 (来源改为 reader 侧) | `src/codec/anthropic.rs` (read_response_events) + `src/codec/stream/translate.rs` | ~40 | ✅ **已修** (#286 / issue #282) | known-limitations codec 节新条目 (同协议 redact + thinking 流式的孤儿帧) |
+| T2 | **max_tokens 字段名保真** (维度 4): 新增 `MaxTokensForm` wire-fidelity 元数据 (与 `StopForm` 同型), OpenAI reader 记录 / writer 按原字段名回写 (同协议); 跨协议 o-egress 的 o-series 检测另议 (可抄 cc-switch 前缀嗅探, 或保守双发不兼容 — 需 mini-裁决) | `src/codec/ir.rs` + `src/codec/openai.rs` | ~50-70 | ✅ **已修** (#287 / issue #283; 嗅探已裁决不做) | roadmap §3 全景表加写侧别名注记; known-limitations codec 节新条目 (同协议 redact 改写字段名) |
+| T3 | **usage cache 细节补齐** (维度 6): `responses_usage_json` 修 input_total 漏加 cache_creation + 写 `input_tokens_details.cached_tokens`; `openai_usage_json` 写 `prompt_tokens_details.cached_tokens` (= cache_read) | `src/codec/ir.rs` + `src/codec/responses/mod.rs` | ~25 | ✅ **已修** (#288 / issue #284) | known-limitations line 24 扩充至非流式 writer |
+| T4 | **Responses writer 补 `incomplete_details.reason`** (维度 5): `write_status_str` 升级为返回 (status, Option<reason>) 或并列 helper; 非流式 `write_response` 与流式终止事件 (stream.rs) 同步; round-trip 测试从 Other 恢复 MaxTokens/Safety | `src/codec/responses/mod.rs` + `src/codec/responses/stream.rs` | ~40 | ✅ **已修** (#289 / issue #285) | known-limitations line 26 ("Responses 流式方案 T2/T3" 条目) 扩充 |
 | T5 | **伪流式上游 → 合成 SSE 生命周期** (维度 9 前半): buffered 判型分支 (cross_proto + same_proto redact) 在 `ir.stream=true` 且翻译成功时, 把 IrResponse 重放为事件序列喂 ingress 流式 writer, 以 `text/event-stream` 返回; 失败路径回落现状 | `src/proxy/cross_proto.rs` + `src/proxy/same_proto.rs` + `src/proxy/fan_out.rs` (新 helper) | ~80-120 | **P1** | known-limitations 新条目 (形态适配行为 + same-proto 无 redact 路径仍透传的边界) |
 | T6 | **A1 reasoning 配置跨协议映射** (维度 3): 按 roadmap A1 既有方案实施 (typed enum + 投影表 + golden); 档位表可交叉验证 cc-switch 的 budget 阈值 (4000/16000) 与 adaptive→xhigh | `src/codec/ir.rs` + 三协议 reader/writer (按 roadmap §A1) | ~150 | **P1** (roadmap 已定 P0 批次) | roadmap "实施进度" 章节更新 |
 | T7 | **thinking / encrypted_content passthrough 建模** (维度 1.1/1.2): 走 roadmap §2.2 判定 (boundary case, 参照 #176 先例登记); 方案 A = 新 `IrBlock::Thinking { thinking, signature_or_data }` 原样搬运 (cc-switch 证明可行, redact 需扫描 thinking 文本叶子), 方案 B = 至少同协议 redact 路径保真 (reader 收进 block 级 extra) | `docs/design/ir-fields-roadmap.md` (先登记) + `src/codec/ir.rs` + `src/codec/anthropic.rs` + `src/codec/responses/` | ~200-300 | **P2** (功能, 契约级) | roadmap 新 boundary-case 条目; known-limitations #176 条目升级 |
