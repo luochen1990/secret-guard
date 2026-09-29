@@ -18,7 +18,7 @@
 
 use serde_json::{Map, Value, json};
 
-use super::ir::{ContentForm, IrReasoning};
+use super::ir::{ContentForm, IrReasoning, ThinkingOpaque};
 use super::{
     DEFAULT_MAX_TOKENS, IrBlock, IrBlockMeta, IrDelta, IrError, IrImageSource, IrMessage,
     IrRequest, IrResponse, IrRole, IrStopReason, IrStreamEvent, IrTool, IrToolChoice, IrUsage,
@@ -251,13 +251,24 @@ impl Reader for AnthropicReader {
                                     name: name.to_string(),
                                 })
                             }
-                            _ => None, // thinking / image 等不在 MVP
+                            // T7: thinking 族全量建模 (正文经 thinking_delta 流入
+                            // ReasoningDelta, signature 经 signature_delta 流入
+                            // SignatureDelta; redacted 的 data 在 start 事件整体到达)。
+                            "thinking" => Some(IrBlockMeta::Thinking),
+                            "redacted_thinking" => Some(IrBlockMeta::RedactedThinking {
+                                data: cb
+                                    .get("data")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string(),
+                            }),
+                            _ => None, // image 等未建模类型
                         }
                     });
                 if let Some(block) = block_meta {
                     vec![IrStreamEvent::BlockStart { index, block }]
                 } else {
-                    // 未建模 block 类型 (thinking / image / ...): 登记 index, 供
+                    // 未建模 block 类型 (image / ...): 登记 index, 供
                     // content_block_stop 配对跳过 (#282, 见 stop 分支).
                     state.dropped_block_starts.insert(index);
                     Vec::new()
@@ -280,7 +291,17 @@ impl Reader for AnthropicReader {
                             .get("partial_json")
                             .and_then(Value::as_str)
                             .map(|s| IrDelta::InputJsonDelta(s.to_string())),
-                        _ => None, // thinking_delta / signature_delta 不在 MVP
+                        // T7: thinking 正文 (纯文本流, 与 o reasoning_content 归一,
+                        // 走同一 redact/restore 扫描) 与 signature (opaque 直通)。
+                        "thinking_delta" => d
+                            .get("thinking")
+                            .and_then(Value::as_str)
+                            .map(|s| IrDelta::ReasoningDelta(s.to_string())),
+                        "signature_delta" => d
+                            .get("signature")
+                            .and_then(Value::as_str)
+                            .map(|s| IrDelta::SignatureDelta(s.to_string())),
+                        _ => None, // 未知 delta 类型
                     }
                 });
                 if let Some(delta) = delta {
@@ -529,9 +550,10 @@ impl Writer for AnthropicWriter {
     fn write_response_event(
         &self,
         ev: &IrStreamEvent,
-        _state: &mut StreamEncodeState,
+        state: &mut StreamEncodeState,
     ) -> Vec<(String, Value)> {
-        // Anthropic writer 无需累积状态 (1 IR 事件 → 0/1 帧), `_state` 恒不读.
+        // T7: thinking 族 block 引入有限累积 (`state.anthropic`, 见 ir.rs
+        // AnthropicEncodeState 的幂等契约) — 其余事件类型仍是 1 IR 事件 → 0/1 帧。
         match ev {
             IrStreamEvent::MessageStart {
                 id, model, usage, ..
@@ -564,15 +586,39 @@ impl Writer for AnthropicWriter {
                         "content_block": {"type": "text", "text": ""}
                     }),
                 )],
+                // T7: thinking 族完整产出。Thinking 的 opaque (signature/envelope)
+                // 经 delta 或 BlockStop 合成到达, start 帧只开空块 (与 Anthropic
+                // 官方流的 thinking start 形态一致)。幂等: 已注册 index 不覆盖
+                // (探测重复调用, 见 ir.rs AnthropicEncodeState)。
+                IrBlockMeta::Thinking => {
+                    state.anthropic.thinking.entry(*index).or_default();
+                    vec![(
+                        "content_block_start".to_string(),
+                        json!({
+                            "type": "content_block_start",
+                            "index": index,
+                            "content_block": {"type": "thinking", "thinking": ""}
+                        }),
+                    )]
+                }
+                IrBlockMeta::RedactedThinking { data } => {
+                    state.anthropic.thinking.entry(*index).or_default().redacted = true;
+                    vec![(
+                        "content_block_start".to_string(),
+                        json!({
+                            "type": "content_block_start",
+                            "index": index,
+                            "content_block": {"type": "redacted_thinking", "data": data}
+                        }),
+                    )]
+                }
                 IrBlockMeta::ReasoningContent => {
-                    // 跳过: thinking block 需 signature, 无法合法合成 (伪造会被
-                    // Anthropic API 拒收). 裁决 rationale 见 codec/AGENTS.md 支持矩阵.
-                    // 同 index BlockStop 的配对一致性由两个**不同机制**保证 (勿混淆):
-                    // - 跨协议 (o→a / r→a): StreamTranslate 的跳过 block 配对过滤
-                    //   (writer 侧, stream/translate.rs skipped_block_starts);
-                    // - 同协议 a→a restore: 本分支不可达 — Anthropic reader 对
-                    //   thinking BlockStart 根本不产 IR 事件 (read 侧丢弃, 其 stop
-                    //   由 reader 侧 dropped_block_starts 同步跳过, #282).
+                    // o-origin (reasoning_content): o 协议无 opaque 容器, 无法构造
+                    // 合法 thinking block (signature 无法合成/搬运) — 跳过。
+                    // 跨协议模式的配对一致性由 StreamTranslate 的跳过 block 配对
+                    // 过滤保证 (writer 侧 skipped_block_starts, 本分支返回空 Vec
+                    // 即触发登记); 同协议 o→o 不经本 writer。o→a 的 reasoning
+                    // 丢弃是 T7 裁决的已知损失 (known-limitations)。
                     Vec::new()
                 }
                 IrBlockMeta::ToolUse { id, name } => vec![(
@@ -598,10 +644,48 @@ impl Writer for AnthropicWriter {
                         "delta": {"type": "text_delta", "text": text}
                     }),
                 )],
-                IrDelta::ReasoningDelta(_) => {
-                    // thinking_delta 需要 BlockStart(thinking) 配对 (见 BlockStart 分支),
-                    // 跳过 (配对 BlockStart 被 writer 跳过的 block, 其 delta 亦不 emit —
-                    // StreamTranslate 的配对过滤跳过同 index BlockStop, 三者一致).
+                IrDelta::ReasoningDelta(text) => {
+                    // T7: thinking 正文 — 仅对已注册的 Thinking 族 block 产出
+                    // (o-origin ReasoningContent 的 block 被跳过, 无 start 配对,
+                    // 其 delta 一并吞掉; 未注册 index = 病态流, 纵深防御跳过)。
+                    // 正文同时累积进 encode state (BlockStop 合成 envelope 用)。
+                    if let Some(accum) = state.anthropic.thinking.get_mut(index) {
+                        accum.text.push_str(text);
+                        vec![(
+                            "content_block_delta".to_string(),
+                            json!({
+                                "type": "content_block_delta",
+                                "index": index,
+                                "delta": {"type": "thinking_delta", "thinking": text}
+                            }),
+                        )]
+                    } else {
+                        Vec::new()
+                    }
+                }
+                IrDelta::SignatureDelta(sig) => {
+                    // T7: a-origin 真 signature — **累积**后到 BlockStop 时 verbatim
+                    // emit (真实 Anthropic 单帧送达, 但兼容上游可能分片 — 分片拼接
+                    // 与 StreamScan 的 push_str 语义对齐)。延迟 emit 保证 wire 顺序:
+                    // signature_delta 必须是 stop 前最后一个 delta, restore 滑窗的
+                    // 尾部 flush 会在 BlockStop 前补发 thinking_delta, 提前 emit 会
+                    // 把尾巴挤到 signature 之后。同协议 a→a fidelity 锚点, 绝不重打包。
+                    // 未注册 index = 病态流, 纵深防御丢弃。
+                    if let Some(accum) = state.anthropic.thinking.get_mut(index) {
+                        accum
+                            .native_signature
+                            .get_or_insert_with(String::new)
+                            .push_str(sig);
+                    }
+                    Vec::new()
+                }
+                IrDelta::ReasoningOpaqueDelta(op) => {
+                    // T7: r-origin encrypted_content — 不发帧, 累积为 envelope 的
+                    // opaque (BlockStop 合成 signature 时打包整个 Reasoning block;
+                    // 回传方向 reader 解包 → r writer 原生写回, stateless loop 闭合)。
+                    if let Some(accum) = state.anthropic.thinking.get_mut(index) {
+                        accum.opaque = Some(op.clone());
+                    }
                     Vec::new()
                 }
                 IrDelta::InputJsonDelta(partial) => vec![(
@@ -613,10 +697,57 @@ impl Writer for AnthropicWriter {
                     }),
                 )],
             },
-            IrStreamEvent::BlockStop { index } => vec![(
-                "content_block_stop".to_string(),
-                json!({"type": "content_block_stop", "index": index}),
-            )],
+            IrStreamEvent::BlockStop { index } => {
+                // T7: Thinking 族 block 关闭时补发 signature_delta (stop 前最后
+                // 一个 delta, Anthropic wire 顺序 — 延迟 emit 的理由见
+                // SignatureDelta 分支):
+                // - 原生签名 (a-origin) → verbatim (fidelity 锚点);
+                // - 无原生签名且非 redacted → 合成 envelope signature (打包整个
+                //   Reasoning block {summary: 累积正文, opaque: r-origin ec};
+                //   回传方向 reader 解包 → r writer 原生写回, stateless loop 闭合;
+                //   a-origin 无 signature 的退化流 (真实 Anthropic 不产生) 被注入
+                //   envelope — 回传经解包还原为无 signature 形态, 可逆,
+                //   known-limitations 登记的边界)。
+                let mut frames: Vec<(String, Value)> = Vec::new();
+                if let Some(accum) = state.anthropic.thinking.remove(index)
+                    && !accum.redacted
+                {
+                    let signature = match &accum.native_signature {
+                        Some(sig) => Some(sig.clone()),
+                        None if accum.text.is_empty() && accum.opaque.is_none() => {
+                            // 零信息块 (无正文/无 opaque/无原生签名 — 退化空 reasoning
+                            // item): 不合成 signature (空 envelope 零增益且回传必然
+                            // 失配, 与 unpack 的退化丢弃规则对称)。
+                            None
+                        }
+                        None => {
+                            // text 空时 summary 为空数组 (envelope 解包回 s:[] —
+                            // 忠实往返 "有 ec 无 summary" 的 r-origin 真实形态)。
+                            let summary: Vec<String> = if accum.text.is_empty() {
+                                Vec::new()
+                            } else {
+                                vec![accum.text.clone()]
+                            };
+                            Some(super::thinking::pack_reasoning(&summary, &accum.opaque))
+                        }
+                    };
+                    if let Some(signature) = signature {
+                        frames.push((
+                            "content_block_delta".to_string(),
+                            json!({
+                                "type": "content_block_delta",
+                                "index": index,
+                                "delta": {"type": "signature_delta", "signature": signature}
+                            }),
+                        ));
+                    }
+                }
+                frames.push((
+                    "content_block_stop".to_string(),
+                    json!({"type": "content_block_stop", "index": index}),
+                ));
+                frames
+            }
             IrStreamEvent::MessageDelta {
                 stop_reason,
                 stop_sequence,
@@ -834,7 +965,45 @@ fn read_block(b: &Value) -> Option<IrBlock> {
                 extra: collect_extra(obj, &["type", "source"]),
             })
         }
-        _ => None, // thinking / redacted_thinking 等不在 MVP
+        "thinking" => {
+            // T7: thinking block 全量读入 (原文 + signature opaque) — 同协议
+            // redact 路径不再丢 history thinking (stateless tool loop 400 修复)。
+            // signature 带 sg- 前缀 → envelope 解包 (我们自己上一跳打包的对侧块,
+            // 权威源; wire body 文本丢弃 — 恶意不一致时丢弃 = over-redaction 安全
+            // 方向)。空 body + 无 signature 的退化块 → None (与空 text block 规则
+            // 一致, FWD-2 生成器不生成该形态)。
+            let text = obj.get("thinking").and_then(Value::as_str).unwrap_or("");
+            let signature = obj
+                .get("signature")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if let Some(sig) = &signature
+                && let Some(block) = super::thinking::unpack(sig)
+            {
+                return Some(block);
+            }
+            if text.is_empty() && signature.is_none() {
+                None
+            } else {
+                Some(IrBlock::ReasoningContent {
+                    text: text.to_string(),
+                    opaque: signature.map(ThinkingOpaque::Signature),
+                })
+            }
+        }
+        "redacted_thinking" => {
+            // T7: 纯密文无原文 — text 恒空 + opaque 携带 data; writer 据此写回
+            // redacted_thinking wire 形态。data 带 sg- 前缀 → envelope 解包 (权威源)。
+            let data = obj.get("data").and_then(Value::as_str).map(str::to_string);
+            match data {
+                Some(d) => super::thinking::unpack(&d).or(Some(IrBlock::ReasoningContent {
+                    text: String::new(),
+                    opaque: Some(ThinkingOpaque::RedactedData(d)),
+                })),
+                None => None,
+            }
+        }
+        _ => None, // image 等未建模类型 (流式侧经 dropped_block_starts 配对跳过)
     }
 }
 
@@ -1043,16 +1212,45 @@ fn write_block(b: &IrBlock) -> Option<Value> {
             merge_block_extra(&mut obj, extra);
             Some(obj)
         }
-        IrBlock::Reasoning { .. } => {
-            // Anthropic Messages 协议无 reasoning item 的直接对应 (有 thinking blocks, 但结构不同).
-            // 跨协议翻译时静默丢弃 (lossy-by-target); 同协议路径不会到达 Anthropic writer.
-            None
+        IrBlock::Reasoning { summary, opaque } => {
+            // T7 (envelope 搬运, r→a): Responses reasoning item 无法在 Anthropic
+            // 原生表达 — 把整个块打包 sg-envelope 藏进 signature (cc-switch 模式),
+            // thinking 正文承载 summary 拼接 (展示用; 回传方向以 envelope 为权威源
+            // 解包)。不合成签名 — 只搬运 (打包点在 writer = post-redact/post-restore,
+            // envelope 不含未脱敏文本, 安全链见 codec/thinking.rs)。
+            let text = summary.join("\n");
+            let signature = super::thinking::pack_reasoning(summary, opaque);
+            Some(json!({
+                "type": "thinking",
+                "thinking": text,
+                "signature": signature,
+            }))
         }
-        IrBlock::ReasoningContent { .. } => {
-            // thinking block 需要 signature (无法合法合成) — 同 BlockStart{ReasoningContent}
-            // 分支的裁决, 静默丢弃 (lossy-by-target, 见 codec/AGENTS.md).
-            None
-        }
+        IrBlock::ReasoningContent { text, opaque } => match opaque {
+            // T7: a-origin thinking 族原生写回 — signature/redacted data 是搬运的
+            // provider opaque, 不是合成 (同协议 a→a fidelity 锚点; text 若含
+            // secret 已被 redact mock 化 — signature 失配风险是 "安全优先于签名
+            // 有效性" 的已接受折衷, 见 known-limitations)。
+            Some(ThinkingOpaque::Signature(sig)) => Some(json!({
+                "type": "thinking",
+                "thinking": text,
+                "signature": sig,
+            })),
+            Some(ThinkingOpaque::RedactedData(data)) => Some(json!({
+                "type": "redacted_thinking",
+                "data": data,
+            })),
+            // o-origin (reasoning_content, 无 opaque 容器): o 协议无载体可搬 —
+            // 丢弃 + WARN (T7 裁决: envelope 仅 a⇄r, 不为 o 发明 wire 形态;
+            // 对齐 count_reasoning_blocks 显式丢弃先例)。
+            None => {
+                tracing::warn!(
+                    "dropping reasoning_content block in translation to Anthropic: \
+                     OpenAI Chat has no opaque container for thinking signature"
+                );
+                None
+            }
+        },
     }
 }
 
@@ -2066,30 +2264,24 @@ mod tests {
         assert!(events.is_empty());
     }
 
-    /// #282: 未建模 block 类型 (thinking / image / ...) 的 content_block_start 不产
-    /// BlockStart 事件, 其后同 index 的 content_block_stop 必须同步跳过 — 否则 IR
-    /// 事件流携带孤儿 BlockStop (同协议 restore 模式下直通 wire 成未配对
-    /// content_block_stop). 按 index 登记, 类型无关.
+    /// #282: 未建模 block 类型的 content_block_start 不产 BlockStart 事件, 其后同
+    /// index 的 content_block_stop 必须同步跳过 — 否则 IR 事件流携带孤儿 BlockStop
+    /// (同协议 restore 模式下直通 wire 成未配对 content_block_stop). 按 index 登记,
+    /// 类型无关. (T7 精确化: thinking 族已建模离开 dropped 集合, 防线语义保留给
+    /// "仍未建模的类型" — 此处以 image 为例; thinking 的完整产出由
+    /// `stream_thinking_block_full_lifecycle` 锁定.)
     #[test]
     fn stream_skipped_block_start_pairs_its_stop() {
         let mut state = StreamDecodeState::default();
-        // thinking block 的 start/delta 均不产事件 (未建模类型).
+        // image block 的 start 不产事件 (流式侧未建模类型; 非流式 read_block 虽
+        // 建模 image, 但流式 BlockStart 无 IrBlockMeta::Image 变体).
         let start = json!({
             "type": "content_block_start", "index": 0,
-            "content_block": {"type": "thinking", "thinking": ""}
+            "content_block": {"type": "image", "source": {"type": "url", "url": "https://x"}}
         });
         assert!(
             reader()
                 .read_response_events("content_block_start", &start, &mut state)
-                .is_empty()
-        );
-        let delta = json!({
-            "type": "content_block_delta", "index": 0,
-            "delta": {"type": "thinking_delta", "thinking": "..."}
-        });
-        assert!(
-            reader()
-                .read_response_events("content_block_delta", &delta, &mut state)
                 .is_empty()
         );
         // 同 index 的 stop 同步跳过 (修复前无条件产出 → 孤儿 BlockStop).
@@ -2104,6 +2296,86 @@ mod tests {
         let stop_other = json!({"type": "content_block_stop", "index": 1});
         assert_eq!(
             reader().read_response_events("content_block_stop", &stop_other, &mut state),
+            vec![IrStreamEvent::BlockStop { index: 1 }]
+        );
+    }
+
+    /// T7 核心 (同协议保真, 流式): thinking block 的生命周期事件完整产出 —
+    /// BlockStart{Thinking} / thinking_delta → ReasoningDelta / signature_delta →
+    /// SignatureDelta / stop; redacted_thinking 的 data 在 start 事件整体到达。
+    /// 修复前: start/delta 全部被 reader 丢弃 (层丢弃 → a+a redact 历史丢失)。
+    #[test]
+    fn stream_thinking_block_full_lifecycle() {
+        let mut state = StreamDecodeState::default();
+
+        // thinking block: start → 两个 thinking delta → signature delta → stop。
+        let start = json!({
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "thinking", "thinking": ""}
+        });
+        assert_eq!(
+            reader().read_response_events("content_block_start", &start, &mut state),
+            vec![IrStreamEvent::BlockStart {
+                index: 0,
+                block: IrBlockMeta::Thinking
+            }]
+        );
+        let d1 = json!({
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": "let me "}
+        });
+        let d2 = json!({
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": "think"}
+        });
+        assert_eq!(
+            reader().read_response_events("content_block_delta", &d1, &mut state),
+            vec![IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: IrDelta::ReasoningDelta("let me ".into()),
+            }]
+        );
+        assert_eq!(
+            reader().read_response_events("content_block_delta", &d2, &mut state),
+            vec![IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: IrDelta::ReasoningDelta("think".into()),
+            }]
+        );
+        let sig = json!({
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "signature_delta", "signature": "SIG-abc-123"}
+        });
+        assert_eq!(
+            reader().read_response_events("content_block_delta", &sig, &mut state),
+            vec![IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: IrDelta::SignatureDelta("SIG-abc-123".into()),
+            }]
+        );
+        let stop = json!({"type": "content_block_stop", "index": 0});
+        assert_eq!(
+            reader().read_response_events("content_block_stop", &stop, &mut state),
+            vec![IrStreamEvent::BlockStop { index: 0 }]
+        );
+
+        // redacted_thinking: data 在 start 事件整体到达, 无 delta, 直接 stop。
+        let rstart = json!({
+            "type": "content_block_start", "index": 1,
+            "content_block": {"type": "redacted_thinking", "data": "REDACTED-blob"}
+        });
+        assert_eq!(
+            reader().read_response_events("content_block_start", &rstart, &mut state),
+            vec![IrStreamEvent::BlockStart {
+                index: 1,
+                block: IrBlockMeta::RedactedThinking {
+                    data: "REDACTED-blob".into()
+                }
+            }]
+        );
+        let rstop = json!({"type": "content_block_stop", "index": 1});
+        assert_eq!(
+            reader().read_response_events("content_block_stop", &rstop, &mut state),
             vec![IrStreamEvent::BlockStop { index: 1 }]
         );
     }

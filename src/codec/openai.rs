@@ -95,6 +95,8 @@ impl Reader for OpenAiReader {
                     0,
                     IrBlock::ReasoningContent {
                         text: rc.to_string(),
+                        // o 协议无 opaque 容器 (T7), 恒 None。
+                        opaque: None,
                     },
                 );
             }
@@ -272,6 +274,8 @@ impl Reader for OpenAiReader {
             {
                 blocks.push(IrBlock::ReasoningContent {
                     text: rc.to_string(),
+                    // o 协议无 opaque 容器 (T7), 恒 None。
+                    opaque: None,
                 });
             }
             // 文本内容: content 可能是 string 或 array of parts.
@@ -492,11 +496,18 @@ impl Writer for OpenAiWriter {
                 IrBlock::Reasoning { .. } => {
                     // OpenAI Chat 协议无 reasoning item 的标准对应 (有非标 reasoning_content, 但结构不同).
                     // 跨协议翻译时静默丢弃 (lossy-by-target); 同协议路径不会到达 Chat writer.
+                    // r→o 的 opaque (encrypted_content) 一并丢失 (T7: o 无容器)。
                 }
-                IrBlock::ReasoningContent { text } => {
+                IrBlock::ReasoningContent { text, opaque } => {
                     // 思考型模型的非标 reasoning_content 字段 (#176). 同协议 redact
-                    // 路径 round-trip 用; 跨协议来源不会出现 (Anthropic thinking /
-                    // Responses reasoning 不映射到本 block).
+                    // 路径 round-trip 用; 跨协议来源 (a thinking) 的正文照写,
+                    // opaque 无容器可搬 — 丢弃 + WARN (T7: envelope 仅 a⇄r, o 不发明)。
+                    if opaque.is_some() {
+                        tracing::warn!(
+                            "dropping thinking opaque (signature/redacted_data) in translation \
+                             to OpenAI Chat: protocol has no opaque container"
+                        );
+                    }
                     message.insert("reasoning_content".to_string(), Value::String(text.clone()));
                 }
             }
@@ -565,9 +576,15 @@ impl Writer for OpenAiWriter {
                     // 这里返回空 Vec 避免发出空 chunk (与 BlockStop 同样跳过).
                     return Vec::new();
                 }
-                IrBlockMeta::ReasoningContent => {
+                IrBlockMeta::ReasoningContent | IrBlockMeta::Thinking => {
                     // reasoning block start 同样隐式: 第一个 reasoning_content delta
-                    // chunk 自带内容. 跳过空 chunk (与 Text 对称).
+                    // chunk 自带内容. 跳过空 chunk (与 Text 对称). Thinking (a/r-origin)
+                    // 与 o-origin 同样处理 — o 流的 block 边界全隐式 (T7)。
+                    return Vec::new();
+                }
+                IrBlockMeta::RedactedThinking { .. } => {
+                    // redacted_thinking 纯密文无文本, o 流无载体 — 跳过 (配对的
+                    // BlockStop 也隐式, 无孤儿帧风险; T7)。
                     return Vec::new();
                 }
                 IrBlockMeta::ToolUse { id, name } => json!({
@@ -613,6 +630,16 @@ impl Writer for OpenAiWriter {
                         "finish_reason": Value::Null,
                     }]
                 }),
+                // opaque 增量 (真 signature / encrypted_content): o 无容器可搬,
+                // 丢弃 + WARN (T7 — 对齐 count_reasoning_blocks 的显式丢弃先例;
+                // 密文非明文, 丢弃无泄漏面)。
+                IrDelta::SignatureDelta(_) | IrDelta::ReasoningOpaqueDelta(_) => {
+                    tracing::warn!(
+                        "dropping thinking opaque delta in translation to OpenAI Chat stream: \
+                         protocol has no opaque container"
+                    );
+                    return Vec::new();
+                }
             },
             IrStreamEvent::BlockStop { .. } => {
                 // OpenAI 没有 content_block_stop 的对应 event, 跳过.
@@ -1206,7 +1233,7 @@ fn write_message(msg: &IrMessage) -> Value {
                             content_parts.push(Value::String(text.clone()));
                         }
                     }
-                    IrBlock::ReasoningContent { text } => {
+                    IrBlock::ReasoningContent { text, .. } => {
                         if !text.is_empty() {
                             reasoning_content = Some(text.clone());
                         }
@@ -2694,7 +2721,7 @@ mod tests {
         assert_eq!(ir.content.len(), 2);
         assert!(matches!(
             &ir.content[0],
-            IrBlock::ReasoningContent { text } if text == "let me think..."
+            IrBlock::ReasoningContent { text, .. } if text == "let me think..."
         ));
         assert!(matches!(
             &ir.content[1],
@@ -2709,6 +2736,7 @@ mod tests {
             content: vec![
                 IrBlock::ReasoningContent {
                     text: "thinking...".into(),
+                    opaque: None,
                 },
                 IrBlock::Text {
                     text: "answer".into(),
@@ -2748,7 +2776,7 @@ mod tests {
         let ir = reader().read_request(&body).unwrap();
         assert!(matches!(
             &ir.messages[1].content[0],
-            IrBlock::ReasoningContent { text } if text == "trivial arithmetic"
+            IrBlock::ReasoningContent { text, .. } if text == "trivial arithmetic"
         ));
         let out = writer().write_request(&ir);
         let msg = &out["messages"][1];
@@ -2890,12 +2918,12 @@ mod tests {
         );
     }
 
-    // ─── ReasoningContent 跨协议丢弃 (FWD-3 范围外显式丢弃, #176) ──────────
+    // ─── ReasoningContent 跨协议处置 (T7: o-origin 精确化) ─────────────────
     //
-    // Anthropic thinking block 需 signature / Responses reasoning item 依赖
-    // encrypted_content, 均无法从思考原文合法合成 → writer 跳过 (lossy-by-target).
-    // 这里锁定该裁决: 防未来 "好心" 合成非法 wire 形态 (伪造 signature 会被
-    // Anthropic API 拒收). rationale SSOT 见 src/codec/AGENTS.md 支持矩阵注记.
+    // T7 后: o→a 仍丢弃 (o 无 opaque 容器, 不发明 wire 形态 — signature 只能搬运
+    // 不能合成); o→r 经 sg-envelope 保留 (消除 "流式保留/非流式丢弃" 分叉, 契约
+    // 演进原则的精确化)。本组测试锁定 o-origin (opaque=None) 的行为; a/r-origin
+    // 的搬运由 anthropic/responses 侧的 envelope 测试锁定。
 
     #[test]
     fn reasoning_content_block_dropped_by_anthropic_writer() {
@@ -2906,6 +2934,7 @@ mod tests {
                 role: IrRole::Assistant,
                 content: vec![IrBlock::ReasoningContent {
                     text: "hidden chain of thought".into(),
+                    opaque: None,
                 }],
                 ..Default::default()
             }],
@@ -2920,7 +2949,10 @@ mod tests {
         );
         // 响应侧: write_block / BlockStart meta / ReasoningDelta 全部跳过.
         let resp = IrResponse {
-            content: vec![IrBlock::ReasoningContent { text: "cot".into() }],
+            content: vec![IrBlock::ReasoningContent {
+                text: "cot".into(),
+                opaque: None,
+            }],
             ..Default::default()
         };
         let resp_wire = serde_json::to_string(&AnthropicWriter.write_response(&resp)).unwrap();
@@ -2962,13 +2994,20 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_content_block_dropped_by_responses_writer() {
+    fn reasoning_content_carried_by_responses_writer_envelope() {
+        // T7: ReasoningContent → Responses egress (请求 + 响应两侧) —
+        // o-origin (opaque=None): 正文以 summary 保留, **不**发 envelope (零信息
+        // 增益且外来 ec 有上游拒收风险; o→r→o 身份回传因 r→o 丢弃本就不可达);
+        // a-origin (opaque=Some): opaque 经 sg-envelope 搬进 encrypted_content,
+        // 回传 r reader 解包 → 原块还原 (stateless loop)。
+        use crate::codec::ir::ThinkingOpaque;
         use crate::codec::responses::ResponsesWriter;
         let ir = IrRequest {
             messages: vec![IrMessage {
                 role: IrRole::Assistant,
                 content: vec![IrBlock::ReasoningContent {
                     text: "hidden chain of thought".into(),
+                    opaque: None,
                 }],
                 ..Default::default()
             }],
@@ -2976,19 +3015,41 @@ mod tests {
             ..Default::default()
         };
         let wire = ResponsesWriter.write_request(&ir);
-        let wire_str = serde_json::to_string(&wire).unwrap();
-        assert!(
-            !wire_str.contains("encrypted_content") && !wire_str.contains("hidden chain"),
-            "Responses egress must not synthesize reasoning item: {wire_str}"
+        assert_eq!(
+            wire["input"][0]["type"], "reasoning",
+            "Responses egress must carry reasoning item: {wire}"
         );
+        assert_eq!(
+            wire["input"][0]["summary"][0]["text"], "hidden chain of thought",
+            "thinking text must survive as summary: {wire}"
+        );
+        assert!(
+            wire["input"][0].get("encrypted_content").is_none(),
+            "o-origin must NOT emit zero-information envelope: {wire}"
+        );
+        // 响应侧同型: write_response 对 a-origin 产出 reasoning item + envelope。
         let resp = IrResponse {
-            content: vec![IrBlock::ReasoningContent { text: "cot".into() }],
+            content: vec![IrBlock::ReasoningContent {
+                text: "cot".into(),
+                opaque: Some(ThinkingOpaque::Signature("SIG-x".into())),
+            }],
             ..Default::default()
         };
-        let resp_wire = serde_json::to_string(&ResponsesWriter.write_response(&resp)).unwrap();
-        assert!(
-            !resp_wire.contains("\"reasoning\"") && !resp_wire.contains("cot"),
-            "Responses output must not contain reasoning item: {resp_wire}"
-        );
+        let resp_wire = ResponsesWriter.write_response(&resp);
+        assert_eq!(resp_wire["output"][0]["type"], "reasoning");
+        assert_eq!(resp_wire["output"][0]["summary"][0]["text"], "cot");
+        let resp_ec = resp_wire["output"][0]["encrypted_content"]
+            .as_str()
+            .expect("response envelope must be present");
+        assert!(resp_ec.starts_with(crate::codec::thinking::ENVELOPE_PREFIX));
+        // a-origin opaque 经 envelope 携带: 解包还原 thinking 块 (含 signature),
+        // 回传请求侧 r reader 解包 → 原块还原。
+        assert!(matches!(
+            crate::codec::thinking::unpack(resp_ec),
+            Some(IrBlock::ReasoningContent {
+                text,
+                opaque: Some(ThinkingOpaque::Signature(sig)),
+            }) if text == "cot" && sig == "SIG-x"
+        ));
     }
 }

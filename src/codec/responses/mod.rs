@@ -27,7 +27,8 @@
 //! **覆盖**:
 //! - `input: string` → 单条 user message; `input: array` → items list
 //! - items: `message` (含 input_text/output_text/input_image content parts) /
-//!   `function_call` / `function_call_output` / `reasoning` (仅 summary 文本)
+//!   `function_call` / `function_call_output` / `reasoning` (summary + encrypted_content,
+//!   T7 passthrough)
 //! - `instructions` → system 消息
 //! - tools: `function` 类型 (平铺 `{name, parameters, description}` ↔ Chat 嵌套
 //!   `{type:"function", function:{...}}`); 其他 type 静默丢弃
@@ -38,7 +39,7 @@
 //! 与跨协议翻译同受影响; 纯字节透传路径不受影响; 丢弃点打 WARN):
 //! - hosted tools (web_search / file_search / computer_use / mcp / image_generation)
 //! - namespace tools flattening (留作后续)
-//! - reasoning 的 `encrypted_content` (provider-specific opaque, 不可跨协议)
+//! - reasoning 的 `encrypted_content` 已建模保留 (T7, 同协议 + 跨协议 a⇄r envelope)
 //! - `previous_response_id` 服务端状态 (secret-guard 是 stateless 代理)
 //!
 //! 流式: reader + writer 双侧已实现 (实现整体在 `stream.rs`) — proxy 层流式接线:
@@ -378,21 +379,38 @@ impl Writer for ResponsesWriter {
                         "status": "completed",
                     }));
                 }
-                IrBlock::Reasoning { summary } => {
+                IrBlock::Reasoning { summary, opaque } => {
+                    // provider opaque 原样写回 (T7: 同协议 fidelity / a-origin
+                    // envelope 由 reader 侧解包, 这里只会是 r 原生 blob)。
                     flush_text(&mut text_acc, &mut output);
-                    let summary_items: Vec<Value> = summary
-                        .iter()
-                        .map(|s| json!({"type": "summary_text", "text": s}))
-                        .collect();
-                    output.push(json!({
-                        "type": "reasoning",
-                        "summary": summary_items,
-                    }));
+                    output.push(reasoning_item_json(
+                        summary
+                            .iter()
+                            .map(|s| json!({"type": "summary_text", "text": s}))
+                            .collect(),
+                        opaque.clone(),
+                    ));
                 }
-                IrBlock::ReasoningContent { .. } => {
-                    // Responses reasoning item 依赖 encrypted_content (provider-opaque),
-                    // 无法从思考原文合法合成 — 跳过不产出 (lossy-by-target, FWD-3 已知
-                    // 损失, 见 codec/AGENTS.md; 与 Reasoning{summary} 的降级同族).
+                IrBlock::ReasoningContent { text, opaque } => {
+                    // T7: a-origin thinking 族正文以 summary 形态承载 (语义降档,
+                    // 与流式保留裁决同型), opaque 经 sg-envelope 搬进 encrypted_content
+                    // — stateless tool loop 回传时 reader 侧解包还原 (codec/thinking.rs)。
+                    // o-origin (opaque=None) 保留正文、**不**发 envelope (零信息增益
+                    // 且外来 ec 有上游拒收风险 — o→r→o 的身份回传本就因 r→o 丢弃
+                    // 不可达); 消除 "流式保留/非流式丢弃" 分叉 (契约演进原则的精确化)。
+                    flush_text(&mut text_acc, &mut output);
+                    if text.is_empty() && opaque.is_none() {
+                        continue; // 零信息块 (与 unpack 的退化丢弃规则对称)。
+                    }
+                    let summary_items = if text.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![json!({"type": "summary_text", "text": text})]
+                    };
+                    let ec = opaque
+                        .as_ref()
+                        .map(|op| super::thinking::pack_reasoning_content(text, &Some(op.clone())));
+                    output.push(reasoning_item_json(summary_items, ec));
                 }
                 IrBlock::ToolResult { .. } | IrBlock::Image { .. } => {
                     // 响应里通常不出现, 跳过.
@@ -508,7 +526,8 @@ fn is_system_input_item(item: &Value) -> bool {
 /// 解析 input array 中的一个 item → 0..n 条 IR messages.
 ///
 /// 假设: item 是对象且有 type 字段. 未知 type 返回 None (静默丢弃).
-/// 降级: reasoning item 的 encrypted_content 忽略, 仅保留 summary 文本.
+/// 降级: reasoning item 的 summary 空且无 encrypted_content 时丢弃
+/// (T7 起 encrypted_content 已保留, 见 read_reasoning_block).
 /// 注意: system/developer message 由 caller (read_request) 提前提升到 system blocks,
 ///       不会进入本函数.
 fn read_input_item(item: &Value) -> Option<Vec<IrMessage>> {
@@ -857,16 +876,43 @@ fn read_function_call_block(obj: &Map<String, Value>) -> IrBlock {
     }
 }
 
-/// 解析 reasoning item 的 summary → IrBlock::Reasoning (空 summary 返回 None).
+/// 构造 reasoning item 的 wire JSON (T7 SSOT — `write_response` 与
+/// `write_input_items` 共用, summary items + 可选 `encrypted_content`)。
+fn reasoning_item_json(summary_items: Vec<Value>, encrypted: Option<String>) -> Value {
+    let mut item = Map::new();
+    item.insert("type".to_string(), json!("reasoning"));
+    item.insert("summary".to_string(), Value::Array(summary_items));
+    if let Some(ec) = encrypted {
+        item.insert("encrypted_content".to_string(), json!(ec));
+    }
+    Value::Object(item)
+}
+
+/// 解析 reasoning item → [`IrBlock`] (T7: 含 encrypted_content opaque 搬运).
 ///
 /// request input items 和 response output items 都用此 helper.
-/// `encrypted_content` 不保留 (见 ir.rs IrBlock::Reasoning 注释).
+/// - `encrypted_content` 带 `sg-thinking-v1:` 前缀 → envelope 解包 (reader 侧
+///   pre-redact 位置 — 解包文本成为叶子, 必然流经扫描; envelope 块为权威源,
+///   wire 上的 summary 丢弃, 见 codec/thinking.rs 安全链注记)。
+/// - 无前缀 → 视为 r 原生 provider opaque, 原样保留 (同协议 round-trip 不丢,
+///   修复 reasoning chain 断裂已知限制)。
+/// - 空 summary 且无 opaque → None (无信息量, 与既有退化规则一致)。
 fn read_reasoning_block(obj: &Map<String, Value>) -> Option<IrBlock> {
     let summary = read_reasoning_summary(obj.get("summary"));
-    if summary.is_empty() {
+    let opaque = obj
+        .get("encrypted_content")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if let Some(env) = &opaque
+        && let Some(block) = super::thinking::unpack(env)
+    {
+        // sg-envelope: 权威源 (我们上一跳自己打包的块), wire summary 是其投影。
+        return Some(block);
+    }
+    if summary.is_empty() && opaque.is_none() {
         None
     } else {
-        Some(IrBlock::Reasoning { summary })
+        Some(IrBlock::Reasoning { summary, opaque })
     }
 }
 
@@ -996,17 +1042,34 @@ fn write_input_items(msg: &IrMessage) -> Vec<Value> {
                             "arguments": input_to_string(input),
                         }));
                     }
-                    IrBlock::Reasoning { summary } => {
+                    IrBlock::Reasoning { summary, opaque } => {
                         flush_text(&mut text_parts, &mut items);
-                        let summary_items: Vec<Value> = summary
-                            .iter()
-                            .map(|s| json!({"type": "summary_text", "text": s}))
-                            .collect();
-                        items.push(json!({"type": "reasoning", "summary": summary_items}));
+                        items.push(reasoning_item_json(
+                            summary
+                                .iter()
+                                .map(|s| json!({"type": "summary_text", "text": s}))
+                                .collect(),
+                            opaque.clone(),
+                        ));
                     }
-                    IrBlock::ReasoningContent { .. } => {
-                        // 跳过: Responses reasoning item 依赖 encrypted_content, 无法从
-                        // 思考原文合法合成 (见 write_response 同款分支).
+                    IrBlock::ReasoningContent { text, opaque } => {
+                        // T7: 请求侧 assistant 历史 (a-origin thinking 回传) 同样以
+                        // summary + envelope 搬运 (与 write_response 同型; o-origin
+                        // 正文保留、不发 envelope)。回传方向 reader 解包 → a writer
+                        // 原生写回。
+                        flush_text(&mut text_parts, &mut items);
+                        if text.is_empty() && opaque.is_none() {
+                            continue; // 零信息块 (与 unpack 的退化丢弃规则对称)。
+                        }
+                        let summary_items = if text.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![json!({"type": "summary_text", "text": text})]
+                        };
+                        let ec = opaque.as_ref().map(|op| {
+                            super::thinking::pack_reasoning_content(text, &Some(op.clone()))
+                        });
+                        items.push(reasoning_item_json(summary_items, ec));
                     }
                     IrBlock::ToolResult { .. } | IrBlock::Image { .. } => {
                         // assistant 消息里通常不出现, 跳过.
@@ -1256,7 +1319,7 @@ mod tests {
         let ir = reader().read_request(&body).unwrap();
         assert_eq!(ir.messages.len(), 1);
         match &ir.messages[0].content[0] {
-            IrBlock::Reasoning { summary } => {
+            IrBlock::Reasoning { summary, .. } => {
                 assert_eq!(summary, &vec!["thinking...".to_string()]);
             }
             other => panic!("expected Reasoning, got {other:?}"),

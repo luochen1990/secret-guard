@@ -245,7 +245,8 @@ pub(crate) fn iter_sse_frames(sse_bytes: &[u8]) -> Vec<(String, serde_json::Valu
 mod tests {
     use super::*;
     use crate::codec::{
-        Protocol, anthropic::AnthropicReader, openai::OpenAiReader, openai::OpenAiWriter,
+        IrBlock, Protocol, anthropic::AnthropicReader, ir::ThinkingOpaque, openai::OpenAiReader,
+        openai::OpenAiWriter,
     };
     use proptest::prelude::*;
     use serde_json::Value;
@@ -259,6 +260,43 @@ mod tests {
         let (off, len) = find_frame_terminator(buf).unwrap();
         assert_eq!(off, 7);
         assert_eq!(len, 2);
+    }
+
+    /// T7: StreamScan 把 thinking 流 (start + thinking_delta×2 + signature_delta +
+    /// stop) 折叠为 ReasoningContent{text, opaque: Signature}; redacted_thinking
+    /// 的 data 从 BlockStart meta 折叠为 {text:"", opaque: RedactedData}。
+    #[test]
+    fn stream_scan_folds_thinking_with_signature_and_redacted() {
+        let frame = |ev: &str, data: &str| format!("event: {ev}\ndata: {data}\n\n");
+        let sse = [
+            frame("message_start", r#"{"type":"message_start","message":{"id":"m1","role":"assistant","content":[],"model":"c","usage":{"input_tokens":1,"output_tokens":1}}}"#),
+            frame("content_block_start", r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#),
+            frame("content_block_delta", r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"deep "}}"#),
+            frame("content_block_delta", r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"thought"}}"#),
+            frame("content_block_delta", r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"SIGscan01"}}"#),
+            frame("content_block_stop", r#"{"type":"content_block_stop","index":0}"#),
+            frame("content_block_start", r#"{"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"RDATAscan02"}}"#),
+            frame("content_block_stop", r#"{"type":"content_block_stop","index":1}"#),
+            frame("message_delta", r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#),
+            frame("message_stop", r#"{"type":"message_stop"}"#),
+        ]
+        .concat();
+        let mut scan = StreamScan::new(Protocol::Anthropic);
+        scan.feed(sse.as_bytes());
+        let got = scan.snapshot();
+        assert_eq!(
+            got.content,
+            vec![
+                IrBlock::ReasoningContent {
+                    text: "deep thought".into(),
+                    opaque: Some(ThinkingOpaque::Signature("SIGscan01".into())),
+                },
+                IrBlock::ReasoningContent {
+                    text: String::new(),
+                    opaque: Some(ThinkingOpaque::RedactedData("RDATAscan02".into())),
+                },
+            ]
+        );
     }
 
     #[test]
@@ -1205,6 +1243,7 @@ mod tests {
                         })));
                         expected_blocks.push(IrBlock::ReasoningContent {
                             text: format!("{r1} {r2}"),
+                            opaque: None,
                         });
                     }
 
@@ -1441,11 +1480,11 @@ mod tests {
             scan.feed(&sse);
             let got = scan.snapshot();
             let got_first = got.content.first().and_then(|b| match b {
-                crate::codec::IrBlock::ReasoningContent { text } => Some(text.clone()),
+                crate::codec::IrBlock::ReasoningContent { text, .. } => Some(text.clone()),
                 _ => None,
             });
             let want_first = expected.content.first().and_then(|b| match b {
-                crate::codec::IrBlock::ReasoningContent { text } => Some(text.clone()),
+                crate::codec::IrBlock::ReasoningContent { text, .. } => Some(text.clone()),
                 _ => None,
             });
             prop_assert_eq!(

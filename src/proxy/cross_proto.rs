@@ -134,13 +134,13 @@ pub(crate) async fn cross_proto_forward(
         "cross-proto",
     )?;
 
-    // 8. IR → egress body. (T5: 请求侧 ReasoningContent blocks 会被 egress writer
-    //    丢弃 (#176, 见 count_reasoning_blocks 假设声明) — 计数, WARN 在步骤 11 后
-    //    record_id 就位时打.)
-    let dropped_req_reasoning = count_reasoning_blocks(&ir.system)
+    // 8. IR → egress body. (T5 引入 / T7 精确化: reasoning 族 block 的跨协议
+    //    损失按 egress 能力计数 — 见 count_reasoning_blocks 假设声明; WARN 在
+    //    步骤 11 后 record_id 就位时打.)
+    let dropped_req_reasoning = count_reasoning_blocks(&ir.system, egress_codec)
         + ir.messages
             .iter()
-            .map(|m| count_reasoning_blocks(&m.content))
+            .map(|m| count_reasoning_blocks(&m.content, egress_codec))
             .sum::<usize>();
     let egress_body_value = egress_writer.write_request(&ir);
     let egress_bytes = serde_json::to_vec(&egress_body_value)
@@ -240,7 +240,8 @@ pub(crate) async fn cross_proto_forward(
         warn!(
             %record_id,
             count = dropped_req_reasoning,
-            "dropping reasoning block(s) from request history in cross-protocol translation"
+        "reasoning block(s) lossy in cross-protocol request history translation \
+             (dropped or opaque-stripped by target protocol capability)"
         );
     }
     // T8: tool_result 媒体丢弃 — egress 为折叠型 (o/r) 时 per-request 聚合一条
@@ -424,14 +425,17 @@ pub(crate) async fn cross_proto_forward(
                         &ir_resp,
                         resp_status.is_success(),
                     );
-                    // T5: 响应侧 ReasoningContent blocks 会被 ingress writer 丢弃
-                    // (#176), 计数告警 (同请求侧, 只记计数不记内容).
-                    let dropped_resp_reasoning = count_reasoning_blocks(&ir_resp.content);
+                    // T5 引入 / T7 精确化: 响应侧 reasoning 族 block 的跨协议损失
+                    // 按 ingress (即响应侧写出协议) 能力计数 (同请求侧, 只记计数
+                    // 不记内容).
+                    let dropped_resp_reasoning =
+                        count_reasoning_blocks(&ir_resp.content, ingress_codec);
                     if dropped_resp_reasoning > 0 {
                         warn!(
                             %record_id,
                             count = dropped_resp_reasoning,
-                            "dropping reasoning block(s) from response in cross-protocol translation"
+                            "reasoning block(s) lossy in cross-protocol response translation \
+                             (dropped or opaque-stripped by target protocol capability)"
                         );
                     }
                     // record 接线走 LLM 视角 (restore 之前, 含 mock) 的 finality.
@@ -597,28 +601,40 @@ fn raw_error_snippet(resp_bytes: &[u8]) -> String {
     crate::util::truncate_str_on_char_boundary(raw, super::MAX_ERROR_MSG_LEN).to_string()
 }
 
-/// 统计 block 切片中 [`IrBlock::ReasoningContent`] (思考原文, #176) 的数量,
-/// 递归含 ToolResult.content (writer 的 block 写出对任何位置统一跳过, 计数同构).
-/// 请求侧调用点: `ir.system` + 各 `ir.messages[].content`; 响应侧: `ir_resp.content`.
+/// 统计 block 切片中跨协议翻译会**损失信息**的 reasoning 族 block 数 (T7 精确化:
+/// 按 egress 协议能力计数, 只记计数不记内容), 递归含 ToolResult.content
+/// (writer 的 block 写出对任何位置统一分派, 计数同构). 请求侧调用点:
+/// `ir.system` + 各 `ir.messages[].content`; 响应侧: `ir_resp.content`。
 ///
-/// # 假设声明 (计数 ⇒ 实际丢弃)
+/// # 假设声明 (egress 能力 SSOT)
 ///
-/// 跨协议时 egress/ingress writer 对 ReasoningContent 返回 None (Anthropic thinking
-/// block 需要 signature / Responses reasoning item 依赖 encrypted_content, 均无法从
-/// 思考原文合法合成). 当前支持矩阵下会**生产**此 block 的 ingress 只有 OpenAI
-/// (assistant 历史回传 / 响应的 `reasoning_content` 字段), 其跨协议目标
-/// (anthropic / responses writer) 均丢弃 — count > 0 ⇒ 实际丢弃. OpenAI writer 虽
-/// 保留 (assistant message / response), 但 anthropic / responses ingress 不生产此
-/// block, 不构成误报; 新增协议 reader 时需复核此假设 (届时应把 "egress 是否丢弃"
-/// 提为 Writer capability 而非在本模块硬编码).
-fn count_reasoning_blocks(blocks: &[crate::codec::ir::IrBlock]) -> usize {
+/// - egress = Anthropic: `ReasoningContent{opaque: None}` (o-origin, 思考原文无
+///   opaque 容器可搬) 丢弃; 带 opaque 的 (a/r-origin) 原生写回 / envelope 搬运。
+/// - egress = OpenAI: `Reasoning` (r summary item) 整块丢弃; `ReasoningContent`
+///   正文保留但 opaque 丢弃 (o 无容器)。
+/// - egress = Responses: 无损失 (envelope 搬运, T7)。
+///
+/// 新增协议 reader 时需复核此假设 (届时应把 "egress 是否丢弃" 提为 Writer
+/// capability 而非在本模块硬编码)。
+fn count_reasoning_blocks(
+    blocks: &[crate::codec::ir::IrBlock],
+    egress: crate::codec::Protocol,
+) -> usize {
+    use crate::codec::Protocol;
+    use crate::codec::ir::IrBlock;
     blocks
         .iter()
         .map(|b| match b {
-            crate::codec::ir::IrBlock::ReasoningContent { .. } => 1,
-            crate::codec::ir::IrBlock::ToolResult { content, .. } => {
-                count_reasoning_blocks(content)
-            }
+            IrBlock::ReasoningContent { opaque, .. } => match egress {
+                Protocol::Anthropic => usize::from(opaque.is_none()),
+                Protocol::OpenAI => usize::from(opaque.is_some()),
+                Protocol::OpenAIResponses => 0,
+            },
+            IrBlock::Reasoning { .. } => match egress {
+                Protocol::OpenAI => 1,
+                _ => 0,
+            },
+            IrBlock::ToolResult { content, .. } => count_reasoning_blocks(content, egress),
             _ => 0,
         })
         .sum()
@@ -681,20 +697,30 @@ mod tests {
 
     // ─── T5 纯函数: 跨协议丢弃计数 ────────────────────────────────────────
 
-    /// count_reasoning_blocks: 只计 ReasoningContent (思考原文), 不计 Reasoning
-    /// (Responses summary) / Text 等其他 variant; 递归 ToolResult.content.
+    /// count_reasoning_blocks (T7 语义): 按 egress 协议能力计数信息损失的
+    /// reasoning 族 block, 递归 ToolResult.content。
     #[test]
-    fn count_reasoning_blocks_counts_only_reasoning_content_recursively() {
+    fn count_reasoning_blocks_counts_by_egress_capability() {
+        use crate::codec::Protocol;
+        use crate::codec::ir::ThinkingOpaque;
+        let plain = |t: &str| IrBlock::ReasoningContent {
+            text: t.into(),
+            opaque: None,
+        };
+        let opaque_rc = |t: &str| IrBlock::ReasoningContent {
+            text: t.into(),
+            opaque: Some(ThinkingOpaque::Signature("sig".into())),
+        };
         let blocks = vec![
             IrBlock::Text {
                 text: "user text".into(),
                 extra: Default::default(),
             },
-            IrBlock::ReasoningContent {
-                text: "thinking...".into(),
-            },
+            plain("thinking..."),
+            opaque_rc("a-origin thinking"),
             IrBlock::Reasoning {
                 summary: vec!["summary 不是思考原文".into()],
+                opaque: None,
             },
             IrBlock::ToolResult {
                 tool_use_id: "tu_1".into(),
@@ -704,19 +730,21 @@ mod tests {
                         text: "ok".into(),
                         extra: Default::default(),
                     },
-                    IrBlock::ReasoningContent {
-                        text: "nested thinking".into(),
-                    },
+                    plain("nested thinking"),
                 ],
                 is_error: None,
                 content_form: None,
             },
-            IrBlock::ReasoningContent {
-                text: "trailing".into(),
-            },
         ];
-        // 顶层 2 个 + ToolResult 嵌套 1 个 = 3; Reasoning(summary) 不计.
-        assert_eq!(count_reasoning_blocks(&blocks), 3);
-        assert_eq!(count_reasoning_blocks(&[]), 0);
+        // Anthropic egress: 只计 plain (o-origin 无容器) — 顶层 1 + 嵌套 1 = 2。
+        assert_eq!(count_reasoning_blocks(&blocks, Protocol::Anthropic), 2);
+        // OpenAI egress: Reasoning 整块 1 + opaque_rc 的 opaque 损失 1 = 2。
+        assert_eq!(count_reasoning_blocks(&blocks, Protocol::OpenAI), 2);
+        // Responses egress: 无损失 (envelope 搬运)。
+        assert_eq!(
+            count_reasoning_blocks(&blocks, Protocol::OpenAIResponses),
+            0
+        );
+        assert_eq!(count_reasoning_blocks(&[], Protocol::OpenAI), 0);
     }
 }

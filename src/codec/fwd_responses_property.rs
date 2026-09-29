@@ -11,8 +11,9 @@
 //! # 生成器覆盖
 //!
 //! 生成器只覆盖 **可 round-trip 的字段子集** (MVP 范围). 已知 lossy 场景
-//! (hosted tools 丢弃 / reasoning encrypted_content 丢弃 / previous_response_id
-//! 服务端状态) 由独立的 `responses_lossy_fields_dropped_correctly` 测试守卫.
+//! (hosted tools 丢弃 / previous_response_id 服务端状态) 由独立测试守卫;
+//! reasoning encrypted_content 已 passthrough (T7, round-trip 由
+//! `responses_reasoning_encrypted_content_roundtrip` 锁定).
 //!
 //! # 不覆盖
 //!
@@ -52,7 +53,7 @@ fn arb_instructions_opt() -> impl Strategy<Value = Option<String>> {
 /// 生成 Responses input items 数组 (可 round-trip 子集).
 ///
 /// 覆盖的 item type: message (user/assistant) / function_call / function_call_output.
-/// 不覆盖: reasoning (encrypted_content 丢失, 但 summary 可 round-trip — 单独测) /
+/// 不覆盖: reasoning (encrypted_content 已 passthrough, 由专项测试锁定 — T7) /
 /// hosted tool items (computer_call 等, 静默丢弃 — 单独测).
 fn arb_input_items(count: std::ops::Range<usize>) -> impl Strategy<Value = Vec<Value>> {
     prop::collection::vec(arb_input_item(), count)
@@ -262,9 +263,10 @@ fn responses_lossy_hosted_tools_dropped() {
     assert!(ir.tools_present);
 }
 
-/// reasoning item 的 encrypted_content 应被丢弃, 仅保留 summary 文本.
+/// T7: reasoning item 的 encrypted_content 同协议 round-trip 完整保留
+/// (修复 "reasoning chain 断裂" 已知限制 — provider opaque passthrough)。
 #[test]
-fn responses_lossy_reasoning_encrypted_content_dropped() {
+fn responses_reasoning_encrypted_content_roundtrip() {
     let body = json!({
         "model": "o1",
         "input": [{
@@ -276,14 +278,40 @@ fn responses_lossy_reasoning_encrypted_content_dropped() {
     let ir = responses_reader().read_request(&body).unwrap();
     assert_eq!(ir.messages.len(), 1);
     match &ir.messages[0].content[0] {
-        crate::codec::ir::IrBlock::Reasoning { summary } => {
+        crate::codec::ir::IrBlock::Reasoning { summary, opaque } => {
             assert_eq!(summary, &vec!["thinking step 1".to_string()]);
+            // opaque 原样保留 (非明文, 不进 redact 扫描 — 见 ir.rs 安全链注记)。
+            assert_eq!(
+                opaque.as_deref(),
+                Some("opaque-encrypted-bytes-should-not-leak")
+            );
         }
         other => panic!("expected Reasoning, got {other:?}"),
     }
-    // encrypted_content 位于 input[].encrypted_content (嵌套字段), collect_extra 只捕获顶层 key,
-    // 故 encrypted_content 在 reader 解析时即丢失, 同协议 round-trip 也不保留.
-    // 这里验证 IR first-class 字段不含 encrypted_content (符合预期).
+    // writer 写回: encrypted_content 原样输出 (FWD-2 同协议 fidelity)。
+    let out = responses_writer().write_request(&ir);
+    assert_eq!(
+        out["input"][0]["encrypted_content"],
+        json!("opaque-encrypted-bytes-should-not-leak")
+    );
+    // 空 summary + 有 opaque: 块保留 (旧行为丢弃 — ec 单独存在即有信息量)。
+    let body2 = json!({
+        "model": "o1",
+        "input": [{
+            "type": "reasoning",
+            "summary": [],
+            "encrypted_content": "ec-only"
+        }]
+    });
+    let ir2 = responses_reader().read_request(&body2).unwrap();
+    assert!(
+        matches!(
+            &ir2.messages[0].content[0],
+            crate::codec::ir::IrBlock::Reasoning { opaque: Some(e), .. } if e == "ec-only"
+        ),
+        "empty summary + opaque must keep block: {:?}",
+        ir2.messages[0].content
+    );
 }
 
 /// 未知 input item type 应被静默丢弃 (ROB-1).
@@ -338,6 +366,7 @@ fn redact_reasoning_summary_is_replaced() {
             role: IrRole::Assistant,
             content: vec![IrBlock::Reasoning {
                 summary: vec![format!("I should use {secret_value} here")],
+                opaque: None,
             }],
             ..Default::default()
         }],

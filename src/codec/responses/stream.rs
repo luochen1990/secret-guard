@@ -32,8 +32,8 @@
 use serde_json::{Value, json};
 
 use super::super::ir::{
-    ResponsesDecodeState, ResponsesEncodeState, ResponsesItemAccum, ResponsesItemKind,
-    StreamItemState,
+    ResponsesDecodeState, ResponsesEncodeState, ResponsesEncrypted, ResponsesItemAccum,
+    ResponsesItemKind, StreamItemState, ThinkingOpaque,
 };
 use super::super::{IrBlockMeta, IrDelta, IrStopReason, IrStreamEvent, current_epoch};
 use super::{
@@ -154,7 +154,9 @@ fn stream_message_start(data: &Value, state: &mut ResponsesDecodeState) -> Vec<I
 /// - function_call → `BlockStart{ToolUse}` (id 取 call_id 优先, 无则 item.id —
 ///   客户端以 call_id 关联 function_call_output, 与非流式 `read_function_call_block`
 ///   一致);
-/// - reasoning → `BlockStart{ReasoningContent}`;
+/// - reasoning → `BlockStart{Thinking}` (T7: r-origin reasoning item 有合法
+///   opaque 容器 — a writer 可完整产出 / envelope 搬运; 与 o-origin 的
+///   `ReasoningContent` meta 区分是 writer 能力分派依据, 见 ir.rs);
 /// - hosted tool / 未知 / item 畸形 → Dropped + warn (SEC: 只记计数不记内容;
 ///   与非流式响应侧 `read_output_item` 的丢弃对称 — 非流式静默, 流式带 WARN;
 ///   请求侧 `read_tool_def` 的丢弃是同族先例).
@@ -204,7 +206,7 @@ fn stream_item_added(data: &Value, state: &mut ResponsesDecodeState) -> Vec<IrSt
                 .insert(output_index, StreamItemState::Reasoning { ir_index });
             vec![IrStreamEvent::BlockStart {
                 index: ir_index,
-                block: IrBlockMeta::ReasoningContent,
+                block: IrBlockMeta::Thinking,
             }]
         }
         _ => {
@@ -373,7 +375,24 @@ fn stream_item_done(data: &Value, state: &mut ResponsesDecodeState) -> Vec<IrStr
             events
         }
         Some(StreamItemState::Reasoning { ir_index }) => {
-            vec![IrStreamEvent::BlockStop { index: ir_index }]
+            // T7: done item 可携带 encrypted_content (include
+            // ["reasoning.encrypted_content"] 时) — 以 ReasoningOpaqueDelta 整体
+            // 发出 (BlockStop 前)。同协议 r writer verbatim 写回 done 族帧;
+            // 跨协议到 a 由 a writer 在 BlockStop 时打包进 envelope signature。
+            let ec = data
+                .get("item")
+                .and_then(|i| i.get("encrypted_content"))
+                .and_then(Value::as_str);
+            match ec.filter(|s| !s.is_empty()) {
+                Some(ec) => vec![
+                    IrStreamEvent::BlockDelta {
+                        index: ir_index,
+                        delta: IrDelta::ReasoningOpaqueDelta(ec.to_string()),
+                    },
+                    IrStreamEvent::BlockStop { index: ir_index },
+                ],
+                None => vec![IrStreamEvent::BlockStop { index: ir_index }],
+            }
         }
         Some(StreamItemState::Message) => {
             let mut events = Vec::new();
@@ -566,12 +585,27 @@ fn stream_write_block_start(
                 call_id: id.clone(),
                 name: name.clone(),
                 content: String::new(),
+                encrypted: None,
             },
-            IrBlockMeta::ReasoningContent => {
-                // 分叉声明: 流式**保留** ReasoningContent (合成为 reasoning_summary
-                // 事件族), 与非流式 write_response 的跳过 (lossy-by-target) 行为分叉
-                // — 见 docs/known-limitations.md codec 节 #176 流式例外 (STR-6 待裁决).
+            // T7: ReasoningContent (o-origin) 与 Thinking (a/r-origin) 都合成
+            // reasoning item — thinking 正文以 summary 形态承载 (2026-09-23 裁决
+            // 的语义降档), a-origin opaque 经 envelope 搬运 (见 delta/stop 分支)。
+            IrBlockMeta::ReasoningContent | IrBlockMeta::Thinking => {
                 ResponsesItemAccum::simple(ResponsesItemKind::Reasoning, format!("rs_{seq}"))
+            }
+            IrBlockMeta::RedactedThinking { data } => {
+                // redacted_thinking: 纯密文无正文, 直接以 envelope 形态登记 —
+                // done 族帧写出的 encrypted_content 解包可还原 redacted_thinking。
+                ResponsesItemAccum {
+                    kind: ResponsesItemKind::Reasoning,
+                    item_id: format!("rs_{seq}"),
+                    call_id: String::new(),
+                    name: String::new(),
+                    content: String::new(),
+                    encrypted: Some(ResponsesEncrypted::Foreign(ThinkingOpaque::RedactedData(
+                        data.clone(),
+                    ))),
+                }
             }
         };
         state.items.insert(index, accum);
@@ -684,6 +718,37 @@ fn stream_write_block_delta(
                     "delta": d,
                 }),
             )]
+        }
+        // T7: r-origin encrypted_content (同协议 fidelity — verbatim 累积, done
+        // 族帧写出)。Verbatim 优先 (覆盖病态先到的 Foreign — 两 delta 由不同 origin
+        // reader 互斥生产, 共存仅手工构造流可达)。不发 delta 帧 (Responses wire 无
+        // 对应 delta 事件, ec 在 done item 整体到达)。
+        (IrDelta::ReasoningOpaqueDelta(d), ResponsesItemKind::Reasoning) => {
+            accum.encrypted = Some(ResponsesEncrypted::Verbatim(d.clone()));
+            Vec::new()
+        }
+        // T7: a-origin 真 signature — 累积为 Foreign (分片拼接, 与 a writer 的
+        // push_str 语义对称), done 时打包 envelope 进 encrypted_content (stateless
+        // tool loop 回传经 reader 解包还原); 已有 Verbatim (r-origin) 时不覆盖。
+        (IrDelta::SignatureDelta(d), ResponsesItemKind::Reasoning) => {
+            match &mut accum.encrypted {
+                Some(ResponsesEncrypted::Verbatim(_)) => {}
+                Some(ResponsesEncrypted::Foreign(ThinkingOpaque::Signature(sig))) => {
+                    sig.push_str(d);
+                }
+                Some(ResponsesEncrypted::Foreign(ThinkingOpaque::RedactedData(_))) => {
+                    // 病态混流 (redacted meta + signature delta): 后者覆盖。
+                    accum.encrypted = Some(ResponsesEncrypted::Foreign(ThinkingOpaque::Signature(
+                        d.clone(),
+                    )));
+                }
+                None => {
+                    accum.encrypted = Some(ResponsesEncrypted::Foreign(ThinkingOpaque::Signature(
+                        d.clone(),
+                    )));
+                }
+            }
+            Vec::new()
         }
         _ => Vec::new(),
     }
@@ -873,12 +938,29 @@ fn completed_item_json(accum: &ResponsesItemAccum) -> Value {
             "name": accum.name,
             "arguments": accum.content,
         }),
-        ResponsesItemKind::Reasoning => json!({
-            "id": accum.item_id,
-            "type": "reasoning",
-            "status": "completed",
-            "summary": [{"type": "summary_text", "text": accum.content}],
-        }),
+        ResponsesItemKind::Reasoning => {
+            let mut item = json!({
+                "id": accum.item_id,
+                "type": "reasoning",
+                "status": "completed",
+                "summary": [{"type": "summary_text", "text": accum.content}],
+            });
+            // T7: encrypted_content 按 origin 分派 — Verbatim (r 原生) 原样写回;
+            // Foreign (a thinking 族) 打包 sg-envelope (解包还原路径见 reader 侧)。
+            if let Some(enc) = &accum.encrypted {
+                let value = match enc {
+                    ResponsesEncrypted::Verbatim(ec) => json!(ec),
+                    ResponsesEncrypted::Foreign(op) => {
+                        json!(super::super::thinking::pack_reasoning_content(
+                            &accum.content,
+                            &Some(op.clone())
+                        ))
+                    }
+                };
+                item["encrypted_content"] = value;
+            }
+            item
+        }
     }
 }
 
@@ -1186,12 +1268,13 @@ mod tests {
 
     /// reasoning + message 混合场景期望 IR (writer 镜像测试输入 fixture):
     /// 两个独立 IR block, index 按 BlockStart 发出顺序 (reasoning 先 → 0, text → 1).
+    /// (T7: r-origin reasoning item 的 meta 是 Thinking — 有合法 opaque 容器。)
     fn official_reasoning_mixed_ir() -> Vec<IrStreamEvent> {
         vec![
             expected_message_start(),
             IrStreamEvent::BlockStart {
                 index: 0,
-                block: IrBlockMeta::ReasoningContent,
+                block: IrBlockMeta::Thinking,
             },
             IrStreamEvent::BlockDelta {
                 index: 0,
@@ -1223,6 +1306,90 @@ mod tests {
         assert_eq!(
             feed_stream(&official_reasoning_mixed_frames()),
             official_reasoning_mixed_ir()
+        );
+    }
+
+    /// T7: reasoning item 的 `encrypted_content` 在 output_item.done 整体到达 →
+    /// `ReasoningOpaqueDelta`(BlockStop 前); writer 对称 — Verbatim 累积后写回
+    /// done 族帧的 encrypted_content (r→r 同协议流式 fidelity)。
+    #[test]
+    fn stream_reasoning_encrypted_content_roundtrip() {
+        // reader: done item 携带 encrypted_content。
+        let frames = vec![
+            created_frame(),
+            (
+                "response.output_item.added",
+                json!({"output_index": 0, "item": {"id": "rs_1", "type": "reasoning",
+                                                     "summary": [], "status": "in_progress"}}),
+            ),
+            (
+                "response.reasoning_summary_text.delta",
+                json!({"item_id": "rs_1", "output_index": 0, "summary_index": 0,
+                        "delta": "Think "}),
+            ),
+            (
+                "response.output_item.done",
+                json!({"output_index": 0, "item": {"id": "rs_1", "type": "reasoning",
+                                                     "status": "completed",
+                                                     "encrypted_content": "EC-stream-01",
+                                                     "summary": [{"type": "summary_text",
+                                                                   "text": "Think "}]}}),
+            ),
+            (
+                "response.completed",
+                json!({"response": {"status": "completed", "usage": null}}),
+            ),
+        ];
+        let events = feed_stream(&frames);
+        assert_eq!(
+            events,
+            vec![
+                expected_message_start(),
+                IrStreamEvent::BlockStart {
+                    index: 0,
+                    block: IrBlockMeta::Thinking,
+                },
+                IrStreamEvent::BlockDelta {
+                    index: 0,
+                    delta: IrDelta::ReasoningDelta("Think ".into()),
+                },
+                IrStreamEvent::BlockDelta {
+                    index: 0,
+                    delta: IrDelta::ReasoningOpaqueDelta("EC-stream-01".into()),
+                },
+                IrStreamEvent::BlockStop { index: 0 },
+                IrStreamEvent::MessageDelta {
+                    stop_reason: Some(crate::codec::ir::IrStopReason::EndTurn),
+                    stop_sequence: None,
+                    usage: Default::default(),
+                    usage_present: false,
+                },
+                IrStreamEvent::MessageStop,
+            ]
+        );
+
+        // writer: ReasoningOpaqueDelta 累积 → done 族帧 + response.completed 重建
+        // 均携带 encrypted_content (Verbatim)。
+        let mut wframes = Vec::new();
+        let mut state = crate::codec::ir::StreamEncodeState::default();
+        for ev in &events {
+            wframes.extend(writer().write_response_event(ev, &mut state));
+        }
+        let done_frame = wframes
+            .iter()
+            .find(|(t, _)| t == "response.output_item.done")
+            .expect("output_item.done frame");
+        assert_eq!(
+            done_frame.1["item"]["encrypted_content"],
+            json!("EC-stream-01")
+        );
+        let completed = wframes
+            .iter()
+            .find(|(t, _)| t == "response.completed")
+            .expect("response.completed frame");
+        assert_eq!(
+            completed.1["response"]["output"][0]["encrypted_content"],
+            json!("EC-stream-01")
         );
     }
 

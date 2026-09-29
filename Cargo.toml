@@ -104,6 +104,9 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 # 扫描, 替代朴素 O(n·m) 窗口比较. 已是 lock 中传递依赖 (axum / futures 等), 显式化
 # 不新增构建图 crate. license MIT OR UNLICENSE, deny allow 列表已覆盖.
 memchr = "2.8.3"
+# sg-thinking envelope 的 base64 编解码 (codec/thinking.rs, T7). 已是 lock 中传递
+# 依赖 (rsa/rustls 链), 显式化不新增构建图 crate. license MIT OR Apache-2.0.
+base64 = "0.22"
 
 [dev-dependencies]
 tokio-test = "0.4"

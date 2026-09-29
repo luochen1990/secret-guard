@@ -127,13 +127,17 @@ pub(super) fn hash_block(block: &IrBlock) -> BlockHash {
             }
             hash_extra(extra, &mut h);
         }
-        IrBlock::Reasoning { summary } => {
+        // opaque 参与 hash (内容寻址含 T7 的 passthrough 载荷; 签名/密文变化 =
+        // 不同对话上下文)。
+        IrBlock::Reasoning { summary, opaque } => {
             for s in summary {
                 s.hash(&mut h);
             }
+            opaque.hash(&mut h);
         }
-        IrBlock::ReasoningContent { text } => {
+        IrBlock::ReasoningContent { text, opaque } => {
             text.hash(&mut h);
+            opaque.hash(&mut h);
         }
     }
     h.finish()

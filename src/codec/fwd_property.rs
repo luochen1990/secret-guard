@@ -328,6 +328,260 @@ fn cross_proto_reasoning_golden_o_to_a_to_o() {
     assert_eq!(o_wire.get("reasoning_effort"), Some(&json!("high")));
 }
 
+// ─── T7: thinking / encrypted_content passthrough (同协议保真 + a⇄r envelope) ─
+//
+// 契约: STR-6 跨协议处置的 T7 精确化 (envelope 搬运消除 a⇄r 信息损失);
+// 安全链: RED-1/2 (envelope 打包在 writer 侧 = post-redact, 解包在 reader 侧
+// = pre-redact — 见 codec/thinking.rs 头注)。
+
+// redact 安全链 property: thinking 原文是文本叶子必须扫描 (secret 被 mock),
+// opaque (signature / redacted data) 是签名/密文不扫描 (verbatim 透传),
+// redacted_thinking 的 data 同样不受 redact 影响。
+proptest! {
+#[test]
+fn prop_redact_thinking_scans_text_not_opaque(
+    secret in "sk-live-[a-z0-9]{8,16}",
+    sig in "[A-Z0-9]{8,40}",
+    prefix in "[a-z ]{1,10}",
+    suffix in "[a-z ]{1,10}",
+) {
+    let ir = json!({
+        "model": "claude-x",
+        "max_tokens": 1024,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": format!("{prefix}{secret}{suffix}"),
+                 "signature": sig},
+                {"type": "redacted_thinking", "data": format!("DATA{sig}")},
+                {"type": "text", "text": "answer"}
+            ]},
+        ],
+    });
+    let mut parsed = AnthropicReader.read_request(&ir).unwrap();
+    let entry = make_secret_entry(&secret);
+    let (map, _) = redact_ir(&mut parsed, &[entry]);
+
+    let out = AnthropicWriter.write_request(&parsed);
+    let blocks = out["messages"][1]["content"].as_array().unwrap();
+    // 1. thinking 原文中的 secret 被 mock 化 (C1: 明文叶子必须扫描)。
+    let out_str = serde_json::to_string(&out).unwrap();
+    assert!(!out_str.contains(&secret), "secret leaked in thinking text");
+    let mock = map.mock_for(&secret).expect("secret must be mapped").to_string();
+    assert!(
+        blocks[0]["thinking"].as_str().unwrap().contains(mock.as_str()),
+        "thinking text must contain mock: {}",
+        blocks[0]["thinking"]
+    );
+    // 2. signature verbatim 透传 (签名非明文, 不在扫描集 — 同协议 fidelity)。
+    assert_eq!(blocks[0]["signature"].as_str().unwrap(), sig);
+    // 3. redacted_thinking data verbatim 透传。
+    assert_eq!(blocks[1]["data"].as_str().unwrap(), format!("DATA{sig}"));
+    // 4. block 类型保真 (thinking ≠ redacted_thinking, 形态标记不漂移)。
+    assert_eq!(blocks[0]["type"], "thinking");
+    assert_eq!(blocks[1]["type"], "redacted_thinking");
+}
+}
+
+// envelope 安全链 (请求方向): a→r 跨协议时打包的 envelope 不含 real secret
+// (打包点在 writer = post-redact) — 构造 thinking 原文含 secret 的请求, redact
+// 后经 r writer 打包, 解包 envelope 断言文本是 mock; 解包发生在 reader =
+// pre-redact 的对偶验证 (再读回 + 再 redact 后 secret 仍被 mock)。
+proptest! {
+#[test]
+fn prop_envelope_packs_redacted_text_never_real(
+    secret in "sk-live-[a-z0-9]{8,16}",
+    sig in "[A-Z0-9]{8,40}",
+) {
+    use crate::codec::responses::ResponsesReader;
+    use crate::codec::responses::ResponsesWriter;
+    let ir = json!({
+        "model": "claude-x",
+        "max_tokens": 1024,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": format!("key is {secret} here"),
+                 "signature": sig},
+            ]},
+        ],
+    });
+    let mut parsed = AnthropicReader.read_request(&ir).unwrap();
+    let entry = make_secret_entry(&secret);
+    let (map, _) = redact_ir(&mut parsed, std::slice::from_ref(&entry));
+    let mock = map.mock_for(&secret).unwrap().to_string();
+
+    // a→r: r writer 打包 envelope (post-redact — 文本已是 mock)。
+    let r_wire = ResponsesWriter.write_request(&parsed);
+    let ec = r_wire["input"][1]["encrypted_content"]
+        .as_str()
+        .expect("envelope present");
+    // envelope 是 base64(明文 JSON): raw secret 不得以任何形态出现。
+    assert!(
+        !ec.contains(&secret) && !ec.contains(&mock),
+        "envelope is base64 — neither real nor mock should appear verbatim: {ec}"
+    );
+    // 解包验证: 内文本是 mock (不是 real)。
+    let unpacked = crate::codec::thinking::unpack(ec).expect("envelope must unpack");
+    match &unpacked {
+        crate::codec::ir::IrBlock::ReasoningContent { text, opaque } => {
+            assert!(text.contains(mock.as_str()), "envelope text must be mock: {text}");
+            assert!(!text.contains(&secret), "envelope text must not contain real");
+            assert_eq!(
+                opaque.as_ref().unwrap(),
+                &crate::codec::ir::ThinkingOpaque::Signature(sig.clone())
+            );
+        }
+        other => panic!("expected ReasoningContent, got {other:?}"),
+    }
+
+    // 回传方向 (r client echo): r reader 解包 (pre-redact) → 内文本以叶子身份
+    // 进入扫描 → 再 redact 后 secret (若解包内容是 real) 会被 mock。构造 real
+    // 文本的 envelope 模拟恶意/异常上游, 验证解包路径的扫描闭环。
+    let malicious_ec = crate::codec::thinking::pack_reasoning_content(
+        &format!("key is {secret} here"),
+        &Some(crate::codec::ir::ThinkingOpaque::Signature(sig.clone())),
+    );
+    let echo = json!({
+        "model": "o1",
+        "input": [
+            {"type": "message", "role": "user", "content": "hi"},
+            {"type": "reasoning", "summary": [], "encrypted_content": malicious_ec},
+        ],
+    });
+    let mut parsed2 = ResponsesReader.read_request(&echo).unwrap();
+    let _ = redact_ir(&mut parsed2, &[entry]);
+    let out2 = AnthropicWriter.write_request(&parsed2);
+    let out2_str = serde_json::to_string(&out2).unwrap();
+    assert!(
+        !out2_str.contains(&secret),
+        "secret inside envelope must be redacted after reader-side unpack: {out2_str}"
+    );
+}
+}
+
+/// T7 golden (a→r→a, 非流式请求): a 客户端回传 thinking+signature history →
+/// r egress (envelope 搬运) → r 客户端原样 echo 回来 → r reader 解包 → a egress
+/// 原生写回 — thinking 原文与 signature 双双恢复 (stateless tool loop 闭合)。
+#[test]
+fn cross_proto_thinking_golden_a_to_r_to_a() {
+    use crate::codec::responses::{ResponsesReader, ResponsesWriter};
+    let wire = json!({
+        "model": "claude-x",
+        "max_tokens": 4096,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "internal deliberation", "signature": "SIGgolden01"},
+                {"type": "text", "text": "answer"},
+            ]},
+        ],
+    });
+    let mut ir = AnthropicReader.read_request(&wire).unwrap();
+    ir.extra.clear();
+    ir.clear_wire_fidelity();
+
+    // → r egress: envelope 搬运 (正文 + signature 都不丢)。
+    let r_wire = ResponsesWriter.write_request(&ir);
+    let item = &r_wire["input"][1];
+    assert_eq!(item["type"], "reasoning");
+    assert_eq!(item["summary"][0]["text"], "internal deliberation");
+
+    // → r 客户端 echo (原样回传, codex 形态) → r reader 解包 → a egress 原生写回。
+    // (r reader 按 item 粒度产 message — thinking 与 text 分属两条 assistant
+    // 消息, 与 r input item 扁平结构一致, 属既有跨协议粒度而非 T7 行为。)
+    let mut ir2 = ResponsesReader.read_request(&r_wire).unwrap();
+    ir2.extra.clear();
+    ir2.clear_wire_fidelity();
+    let a_wire = AnthropicWriter.write_request(&ir2);
+    let blocks0 = a_wire["messages"][1]["content"].as_array().unwrap();
+    assert_eq!(blocks0[0]["type"], "thinking");
+    assert_eq!(blocks0[0]["thinking"], "internal deliberation");
+    assert_eq!(blocks0[0]["signature"], "SIGgolden01");
+    let blocks1 = a_wire["messages"][2]["content"].as_array().unwrap();
+    assert_eq!(blocks1[0]["type"], "text");
+    assert_eq!(blocks1[0]["text"], "answer");
+}
+
+/// T7 golden (r→a→r, 非流式请求): r 客户端回传 reasoning+encrypted_content →
+/// a egress (envelope 搬进 signature) → a 客户端 echo → a reader 解包 → r egress
+/// 原生写回 — summary 与 encrypted_content 双双恢复。
+#[test]
+fn cross_proto_reasoning_golden_r_to_a_to_r() {
+    use crate::codec::responses::{ResponsesReader, ResponsesWriter};
+    let wire = json!({
+        "model": "gpt-5",
+        "input": [
+            {"type": "message", "role": "user", "content": "hi"},
+            {"type": "reasoning",
+             "summary": [{"type": "summary_text", "text": "summary text"}],
+             "encrypted_content": "ECgolden-opaque-0123456789"},
+        ],
+    });
+    let mut ir = ResponsesReader.read_request(&wire).unwrap();
+    ir.extra.clear();
+    ir.clear_wire_fidelity();
+
+    // → a egress: envelope 搬进 signature (thinking 正文承载 summary)。
+    let a_wire = AnthropicWriter.write_request(&ir);
+    let blocks = a_wire["messages"][1]["content"].as_array().unwrap();
+    assert_eq!(blocks[0]["type"], "thinking");
+    assert_eq!(blocks[0]["thinking"], "summary text");
+    let sig = blocks[0]["signature"].as_str().unwrap();
+    assert!(sig.starts_with(crate::codec::thinking::ENVELOPE_PREFIX));
+
+    // → a 客户端 echo → a reader 解包 → r egress 原生写回 (ec verbatim 恢复)。
+    let mut ir2 = AnthropicReader.read_request(&a_wire).unwrap();
+    ir2.extra.clear();
+    ir2.clear_wire_fidelity();
+    let r_wire = ResponsesWriter.write_request(&ir2);
+    let item = &r_wire["input"][1];
+    assert_eq!(item["type"], "reasoning");
+    assert_eq!(item["summary"][0]["text"], "summary text");
+    assert_eq!(item["encrypted_content"], "ECgolden-opaque-0123456789");
+}
+
+/// T7 golden (r→a 响应侧, 非流式): 上游 r 响应 reasoning item → a ingress 合成
+/// thinking block (signature=envelope); a 客户端 echo 回来 → 解包 → 原生恢复。
+#[test]
+fn cross_proto_reasoning_response_golden_r_to_a_echo() {
+    use crate::codec::responses::ResponsesReader;
+    let resp = json!({
+        "id": "resp_1", "object": "response", "created_at": 1700000000,
+        "model": "gpt-5", "status": "completed",
+        "output": [
+            {"type": "reasoning", "id": "rs_1",
+             "summary": [{"type": "summary_text", "text": "deliberation"}],
+             "encrypted_content": "EC-resp-golden"},
+        ],
+        "usage": {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8},
+    });
+    let ir = ResponsesReader.read_response(&resp).unwrap();
+    let a_resp = AnthropicWriter.write_response(&ir);
+    let blocks = a_resp["content"].as_array().unwrap();
+    assert_eq!(blocks[0]["type"], "thinking");
+    assert_eq!(blocks[0]["thinking"], "deliberation");
+    // 客户端把该响应 block 回传进下一轮请求 history → 解包 → 原生 r item 恢复。
+    let echo_req = json!({
+        "model": "claude-x", "max_tokens": 4096,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [
+                blocks[0].clone(),
+                {"type": "text", "text": "answer"},
+            ]},
+        ],
+    });
+    let mut ir2 = AnthropicReader.read_request(&echo_req).unwrap();
+    ir2.extra.clear();
+    ir2.clear_wire_fidelity();
+    let r_wire = crate::codec::responses::ResponsesWriter.write_request(&ir2);
+    let item = &r_wire["input"][1];
+    assert_eq!(item["type"], "reasoning");
+    assert_eq!(item["summary"][0]["text"], "deliberation");
+    assert_eq!(item["encrypted_content"], "EC-resp-golden");
+}
+
 /// OpenAI Chat Completions 请求生成器.
 ///
 /// 覆盖已知信息损失场景:
@@ -732,14 +986,26 @@ fn arb_anthropic_message_base() -> impl Strategy<Value = Value> {
             prop::collection::vec(arb_anthropic_block(), 1..3)
                 .prop_map(|blocks| { json!({"role":"user","content":blocks}) }),
         ],
-        // assistant 消息 (含 tool_use)
-        ("[a-z ]{1,20}", prop::option::of(arb_anthropic_tool_use())).prop_map(|(text, tu)| {
-            let mut blocks = vec![json!({"type":"text","text":text})];
-            if let Some(t) = tu {
-                blocks.push(t);
-            }
-            json!({"role":"assistant","content":blocks})
-        }),
+        // assistant 消息 (thinking / text / tool_use — T7: thinking 族参与
+        // round-trip property; signature/data 用大写数字 charset, 结构上不可能
+        // 产生小写 `sg-thinking-v1:` 前缀 — envelope 解包路径由专项测试覆盖,
+        // 生成器只生成 plain opaque 保证 FWD-2 的 verbatim 断言可机械验证)
+        (
+            "[a-z ]{1,20}",
+            prop::option::of(arb_anthropic_thinking_block()),
+            prop::option::of(arb_anthropic_tool_use()),
+        )
+            .prop_map(|(text, thinking, tu)| {
+                let mut blocks = Vec::new();
+                if let Some(t) = thinking {
+                    blocks.push(t);
+                }
+                blocks.push(json!({"type":"text","text":text}));
+                if let Some(t) = tu {
+                    blocks.push(t);
+                }
+                json!({"role":"assistant","content":blocks})
+            }),
         // 中途 system 消息 (string 或 array content 两种形态; 位置保真锁定)
         "[a-z ]{1,25}".prop_map(|s| json!({"role":"system","content":s})),
         prop::collection::vec(arb_anthropic_block(), 1..2)
@@ -805,6 +1071,26 @@ fn arb_anthropic_tool_use() -> impl Strategy<Value = Value> {
         arb_nested_json_value(),
     )
         .prop_map(|(id, name, input)| json!({"type":"tool_use","id":id,"name":name,"input":input}))
+}
+
+/// Anthropic thinking 族 block (T7): thinking{thinking 原文, signature} /
+/// redacted_thinking{data}。signature/data 用 `[A-Z0-9]` charset — 结构上
+/// 排除小写 `sg-thinking-v1:` envelope 前缀 (envelope 路径会解包改写 block,
+/// 与 FWD-2 的 verbatim 断言不兼容, 由专项 golden 测试覆盖; 见生成处注释)。
+fn arb_anthropic_thinking_block() -> impl Strategy<Value = Value> {
+    use proptest::prelude::prop_oneof;
+    prop_oneof![
+        ("[a-z ]{1,25}", "[A-Z0-9]{8,40}").prop_map(|(text, sig)| json!({
+            "type": "thinking", "thinking": text, "signature": sig
+        })),
+        // 空 thinking 原文 + signature (redact 后的退化形态 / 官方允许)。
+        "[A-Z0-9]{8,40}".prop_map(|sig| json!({
+            "type": "thinking", "thinking": "", "signature": sig
+        })),
+        "[A-Z0-9]{16,48}".prop_map(|data| json!({
+            "type": "redacted_thinking", "data": data
+        })),
+    ]
 }
 
 fn arb_anthropic_response_value() -> impl Strategy<Value = Value> {

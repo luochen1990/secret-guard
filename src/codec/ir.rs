@@ -538,22 +538,54 @@ pub enum IrBlock {
     },
     /// 推理块 (Responses API 的 `reasoning` output item).
     ///
-    /// 仅承载 `summary` 文本数组 (可被 Redact 扫描是否有 secret 子串).
-    /// `encrypted_content` 是 provider-specific opaque blob, **当前实现不保留**
-    /// (同协议 round-trip 也会丢失); 这会破坏依赖 reasoning chain 的链式调用
-    /// (如 `previous_response_id` + reasoning context compression). 这是已知限制.
-    Reasoning { summary: Vec<String> },
-    /// 思考原文块 (OpenAI Chat 兼容 provider 的 `reasoning_content` 字段,
-    /// 思考型模型如 glm / deepseek-r1 的思考阶段原文).
+    /// `summary` 文本数组可被 Redact 扫描是否有 secret 子串 (叶子);
+    /// `encrypted_content` 是 provider opaque blob (密文, **不进 redact 扫描** —
+    /// 见 [`ThinkingOpaque`] 的安全链注记), 同协议 round-trip 与 a⇄r 跨协议
+    /// envelope 搬运均完整保留 (T7, 修复 "reasoning chain 断裂" 已知限制).
+    Reasoning {
+        summary: Vec<String>,
+        /// Responses reasoning item 的 `encrypted_content` (provider opaque).
+        /// None = wire 缺席。跨协议到 Anthropic 时被 envelope 打包进 signature。
+        opaque: Option<String>,
+    },
+    /// 思考原文块 (OpenAI Chat 兼容 provider 的 `reasoning_content` 字段 / Anthropic
+    /// `thinking` / `redacted_thinking` block, 思考型模型的思考阶段原文).
     ///
     /// 与 [`IrBlock::Reasoning`] 的区别: 后者是 Responses API 的**摘要列表**
     /// (`summary_text[]`), 本块是思考**原文连续文本** (非流式 message 字段 /
     /// 流式 ReasoningDelta 累积). 两者语义不同, 不合并 (#176).
     ///
-    /// Redact 覆盖: `text` 是 IR 字符串叶子 (secret 可能泄漏进思考流).
-    /// 跨协议: Anthropic writer 跳过 (thinking block 需要 signature, 无法合法
-    /// 合成); Responses writer 跳过 (reasoning item 依赖 encrypted_content).
-    ReasoningContent { text: String },
+    /// Redact 覆盖: `text` 是 IR 字符串叶子 (secret 可能泄漏进思考流)。
+    /// `opaque` 是签名/密文**非明文**, 不进扫描; 其跨协议搬运的安全性由
+    /// envelope 的打包/解包位置保证 (writer 侧打包 = post-redact, reader 侧
+    /// 解包 = pre-redact — 解包文本以叶子身份进入扫描, 见 `codec/thinking.rs`).
+    /// 跨协议: a→r 经 envelope 搬进 encrypted_content; o-origin (opaque=None)
+    /// 到 a 丢弃 + WARN (o 无 opaque 容器, 不发明 wire 形态)。
+    ReasoningContent {
+        text: String,
+        /// provider opaque: Anthropic thinking.signature / redacted_thinking.data。
+        /// `RedactedData` 形态时 `text` 恒空 (redacted_thinking 无原文)。
+        opaque: Option<ThinkingOpaque>,
+    },
+}
+
+/// Anthropic thinking 族 block 的 provider opaque 容器 (T7)。
+///
+/// **安全链注记**: signature / data 是 Anthropic 的加密签名/密文, **不是明文** —
+/// 不进 redact 的字符串叶子扫描 (`redact.rs::StringLeafOps`)。secret-guard 只
+/// **搬运**不合成 (旧 "无法合法合成 signature" 裁决只否定合成, 不否定搬运 —
+/// cc-switch 的 envelope passthrough 是第三条路)。
+/// 跨协议 a⇄r 搬运经 `sg-thinking-v1:` envelope (base64 明文 JSON), 打包点在
+/// writer (post-redact / post-restore), 解包点在 reader (pre-redact / pre-restore)
+/// — 保证 envelope 内文本要么已脱敏 (请求方向), 要么本就该交付客户端 (响应方向)。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ThinkingOpaque {
+    /// `thinking.signature` (加密签名; 覆盖 thinking 文本 — redact mock 文本后
+    /// signature 可能失配, 属 "安全优先于签名有效性" 的已接受折衷, 见
+    /// known-limitations)。
+    Signature(String),
+    /// `redacted_thinking.data` (纯密文无原文, 承载块 `text` 恒空)。
+    RedactedData(String),
 }
 
 /// 图片来源 (跨协议中立的图片表达).
@@ -773,7 +805,24 @@ pub enum IrBlockMeta {
     /// 命名配对规律: meta 名 == 折叠 block 名 (Text↔Text / ToolUse↔ToolUse /
     /// 本变体 ↔ [`IrBlock::ReasoningContent`]). 注意 **不是** [`IrBlock::Reasoning`]
     /// (后者是 Responses API 摘要列表语义, 无流式对应物).
+    ///
+    /// **o-origin 专用** (OpenAI 流 `delta.reasoning_content`): 无 provider opaque
+    /// 容器 — Anthropic writer 对本变体跳过 (o 协议无容器可搬, T7 裁决: envelope
+    /// 仅 a⇄r)。有容器的 thinking 族流 (a/r-origin) 用 [`Self::Thinking`]。
     ReasoningContent,
+    /// thinking 族 block (有合法 opaque 容器: a `thinking`/`redacted_thinking`,
+    /// r reasoning item) 的流式起点 (T7)。生产者: a 流式 reader (thinking start)
+    /// 与 r 流式 reader (reasoning item added)。折叠目标仍是
+    /// [`IrBlock::ReasoningContent`] (StreamScan) — meta 表达的是流式 origin 能力
+    /// (a writer 可完整产出 / 可 envelope 搬运), 不是折叠 block 类型; 与
+    /// [`Self::ReasoningContent`] 的区分是 writer 能力分派依据。
+    Thinking,
+    /// `redacted_thinking` 的流式起点 (T7): 纯 opaque 无原文无 delta — Anthropic
+    /// 实际流把完整 `data` 放在 content_block_start, 随后直接 content_block_stop。
+    RedactedThinking {
+        /// provider opaque 密文 (content_block_start 携带的全量 data)。
+        data: String,
+    },
 }
 
 /// 内容块增量 (BlockDelta 携带).
@@ -783,8 +832,19 @@ pub enum IrDelta {
     TextDelta(String),
     /// 工具调用参数的 JSON 片段 (流式 partial JSON).
     InputJsonDelta(String),
-    /// 思考原文增量 (OpenAI 兼容流式 `delta.reasoning_content`). #176.
+    /// 思考原文增量 (OpenAI 兼容流式 `delta.reasoning_content` / Anthropic
+    /// `thinking_delta` / Responses reasoning summary delta 归一). #176.
+    /// 纯文本流, secret 可能泄漏, 走与 Text 相同的 redact/restore 扫描。
     ReasoningDelta(String),
+    /// Anthropic `signature_delta`: thinking block 的**原生**加密签名增量 (T7)。
+    /// a-origin 专用 — 同协议 a→a 由 writer **verbatim 写回** (fidelity 锚点,
+    /// 绝不 envelope 重打包); 签名非明文, 不进 redact/restore 扫描 (直通)。
+    SignatureDelta(String),
+    /// Responses reasoning item 的 `encrypted_content` (在 `output_item.done`
+    /// 整体到达, T7)。r-origin 专用 — 同协议 r→r writer verbatim 写回 done 族帧;
+    /// 跨协议到 a 由 a writer 在 BlockStop 时打包进 envelope signature。
+    /// 密文非明文, 不进 redact/restore 扫描 (直通)。
+    ReasoningOpaqueDelta(String),
 }
 
 /// Responses 流式 reader 追踪的单个 output item 的解码状态 (key = output_index).
@@ -858,7 +918,8 @@ pub struct StreamDecodeState {
     /// 必须持久化记录, 不能在 finish 时 recompute — 否则 text 后到会导致 index 偏移.
     pub tool_ir_index: std::collections::BTreeMap<usize, usize>,
     /// Anthropic reader: `content_block_start` 未产出 IR BlockStart 的 block index
-    /// 集合 (thinking / image 等未建模类型, 按 index 记录与类型无关). 对应 index 的
+    /// 集合 (image 等未建模类型, 按 index 记录与类型无关; thinking 族已建模为
+    /// BlockStart, T7 后离开本集合). 对应 index 的
     /// `content_block_stop` 查表同步跳过 (remove 语义, stop 后清除), 防止孤儿
     /// BlockStop 进入 IR 事件流 — 同协议 restore 模式下会直通 wire 成未配对的
     /// content_block_stop (#282). 与 translate.rs 的 `skipped_block_starts`
@@ -881,6 +942,41 @@ pub struct StreamDecodeState {
 pub struct StreamEncodeState {
     /// Responses writer 的累积状态 (其余协议保持恒空, 零开销).
     pub responses: ResponsesEncodeState,
+    /// Anthropic writer 的累积状态 (T7: thinking 族 block 的 envelope 合成;
+    /// 其余协议保持恒空, 零开销).
+    pub anthropic: AnthropicEncodeState,
+}
+
+/// Anthropic 流式 writer 的 thinking 族 block 累积状态 (T7)。
+///
+/// Anthropic writer 历史上无状态 (1 IR 事件 → 0/1 帧); T7 引入唯一的累积需求:
+/// 跨协议 (r|a)→a 时, 若流中未出现原生 [`IrDelta::SignatureDelta`] (a-origin 真
+/// 签名), 须在 BlockStop **合成** envelope signature (`sg-thinking-v1:` 前缀,
+/// 内容 = 打包整个 Reasoning block) — 此时需要该 block 的完整 thinking 文本,
+/// 只能从 ReasoningDelta 累积。同协议 a→a 原生签名 verbatim 直通, 不触发合成。
+///
+/// 幂等契约: 与 [`ResponsesEncodeState`] 同型 — BlockStart 的探测重复调用只注册
+/// 一次 (only-if-absent), delta/stop 每事件至多调用一次。
+#[derive(Debug, Clone, Default)]
+pub struct AnthropicEncodeState {
+    /// IR block index → thinking 族累积状态 (BlockStart 注册, BlockStop 移除).
+    pub thinking: std::collections::BTreeMap<usize, AnthropicThinkingAccum>,
+}
+
+/// 单个 thinking 族 block 的累积条目 (T7)。
+#[derive(Debug, Clone, Default)]
+pub struct AnthropicThinkingAccum {
+    /// redacted_thinking (数据在 BlockStart meta 携带; stop 时不再合成 signature)。
+    pub redacted: bool,
+    /// ReasoningDelta 累积 (envelope 的 summary/正文来源; post-restore 内容)。
+    pub text: String,
+    /// ReasoningOpaqueDelta 累积 (r-origin encrypted_content, envelope 的 opaque)。
+    pub opaque: Option<String>,
+    /// 原生 SignatureDelta 的签名值 — **延迟到 BlockStop emit** (Anthropic wire
+    /// 规范顺序: signature_delta 是 stop 前最后一个 delta; restore 滑窗的尾部
+    /// flush 会在 BlockStop 前补发 thinking_delta, 提前 emit signature 会把
+    /// thinking 尾巴挤到 signature 之后, 违反顺序)。
+    pub native_signature: Option<String>,
 }
 
 /// Responses 流式 writer 追踪的单个 output item 的累积状态 (key = IR block index,
@@ -901,6 +997,22 @@ pub struct ResponsesItemAccum {
     /// message 的 output_text / reasoning 的 summary text / function_call 的
     /// arguments JSON 串 — 按 kind 单一字段, 无混合形态.
     pub content: String,
+    /// reasoning item 专属 (T7): done 族帧写出的 `encrypted_content`。
+    /// `Verbatim` = r-origin ([`IrDelta::ReasoningOpaqueDelta`], 同协议 fidelity
+    /// 直通); `Foreign` = a-origin thinking 族 opaque ([`IrDelta::SignatureDelta`] /
+    /// RedactedThinking meta), done 时打包 sg-envelope。两者由不同 origin 的
+    /// reader 互斥生产; 病态共存时 **Verbatim 优先** (r writer 的 ReasoningOpaqueDelta
+    /// 分支覆盖, SignatureDelta 分支不覆盖已有 Verbatim)。
+    pub encrypted: Option<ResponsesEncrypted>,
+}
+
+/// [`ResponsesItemAccum::encrypted`] 的来源形态 (T7)。
+#[derive(Debug, Clone)]
+pub enum ResponsesEncrypted {
+    /// r-origin `encrypted_content` 原文 (fidelity: 原样写回)。
+    Verbatim(String),
+    /// a-origin thinking 族 opaque (writer 侧打包 envelope)。
+    Foreign(ThinkingOpaque),
 }
 
 /// [`ResponsesItemAccum`] 的 item 类型维度 (IR block meta → Responses item 类型).
@@ -923,6 +1035,7 @@ impl ResponsesItemAccum {
             call_id: String::new(),
             name: String::new(),
             content: String::new(),
+            encrypted: None,
         }
     }
 }

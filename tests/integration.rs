@@ -8958,8 +8958,8 @@ async fn cross_proto_request_reasoning_history_drop_warns() {
     assert_eq!(status, reqwest::StatusCode::OK);
     let log_text = log.text();
     assert!(
-        log_text.contains("dropping reasoning block(s) from request history"),
-        "T5: request-side reasoning drop WARN missing; log: {log_text}"
+        log_text.contains("reasoning block(s) lossy in cross-protocol request history"),
+        "T5/T7: request-side reasoning lossy WARN missing; log: {log_text}"
     );
 }
 
@@ -8988,8 +8988,8 @@ async fn cross_proto_response_reasoning_drop_warns() {
     assert_eq!(status, reqwest::StatusCode::OK);
     let log_text = log.text();
     assert!(
-        log_text.contains("dropping reasoning block(s) from response"),
-        "T5: response-side reasoning drop WARN missing; log: {log_text}"
+        log_text.contains("reasoning block(s) lossy in cross-protocol response translation"),
+        "T5/T7: response-side reasoning lossy WARN missing; log: {log_text}"
     );
 }
 

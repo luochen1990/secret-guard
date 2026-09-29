@@ -865,12 +865,16 @@ impl StringLeafOps for IrBlock {
                     v.for_each_str_leaf(f);
                 }
             }
-            IrBlock::Reasoning { summary } => {
+            // opaque (signature/encrypted_content) 是签名/密文非明文, 有意不进
+            // 叶子扫描 — 其跨协议搬运安全性由 envelope 打包/解包位置保证
+            // (writer 侧打包 = post-redact, reader 侧解包 = pre-redact, 见
+            // codec/thinking.rs 安全链注记)。
+            IrBlock::Reasoning { summary, .. } => {
                 for s in summary {
                     f(s);
                 }
             }
-            IrBlock::ReasoningContent { text } => f(text),
+            IrBlock::ReasoningContent { text, .. } => f(text),
         }
     }
 
@@ -917,12 +921,12 @@ impl StringLeafOps for IrBlock {
                     v.for_each_str_leaf_mut(f);
                 }
             }
-            IrBlock::Reasoning { summary } => {
+            IrBlock::Reasoning { summary, .. } => {
                 for s in summary {
                     f(s);
                 }
             }
-            IrBlock::ReasoningContent { text } => f(text),
+            IrBlock::ReasoningContent { text, .. } => f(text),
         }
     }
 }
@@ -1137,12 +1141,15 @@ fn collect_block_leaves<'a>(block: &'a IrBlock, leaves: &mut Vec<&'a str>) {
                 collect_value_leaves(v, leaves);
             }
         }
-        IrBlock::Reasoning { summary } => {
+        // opaque (签名/密文) 非明文, 不进叶子收集 — 与 StringLeafOps 的扫描集
+        // 保持一致 (C1 安全链: envelope 内文本经 reader 解包后以 text/summary
+        // 叶子身份进入本扫描)。
+        IrBlock::Reasoning { summary, .. } => {
             for s in summary {
                 leaves.push(s);
             }
         }
-        IrBlock::ReasoningContent { text } => leaves.push(text),
+        IrBlock::ReasoningContent { text, .. } => leaves.push(text),
     }
 }
 
@@ -1768,9 +1775,11 @@ mod tests {
                     },
                     IrBlock::Reasoning {
                         summary: vec!["reasoning-summary".to_string()],
+                        opaque: None,
                     },
                     IrBlock::ReasoningContent {
                         text: "reasoning-content".to_string(),
+                        opaque: None,
                     },
                 ],
                 extra: msg_extra,

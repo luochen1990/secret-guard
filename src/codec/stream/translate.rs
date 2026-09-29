@@ -514,6 +514,10 @@ fn restore_event_inplace(hook: &mut dyn StreamRestoreHook, ev: &mut IrStreamEven
                 IrDelta::TextDelta(s) => (DeltaKind::Text, s),
                 IrDelta::InputJsonDelta(s) => (DeltaKind::InputJson, s),
                 IrDelta::ReasoningDelta(s) => (DeltaKind::Reasoning, s),
+                // opaque 增量 (真 signature / encrypted_content): 签名/密文非明文,
+                // 有意不进 restore 滑窗 — verbatim 直通 (T7 安全链: envelope 的
+                // 文本内容经 reader 解包后以 ReasoningDelta 形态走上面的扫描路径)。
+                IrDelta::SignatureDelta(_) | IrDelta::ReasoningOpaqueDelta(_) => return,
             };
             *s = hook.restore_delta(*index, kind, std::mem::take(s));
         }

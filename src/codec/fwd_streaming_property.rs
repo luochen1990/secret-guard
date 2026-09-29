@@ -1026,6 +1026,7 @@ fn arb_responses_sse_stream_with_mock()
                     // Reasoning{summary} 双变体, 见模块头已声明缺口 1).
                     expected_blocks.push(IrBlock::ReasoningContent {
                         text: reasoning_text,
+                        opaque: None,
                     });
                     out_idx += 1;
                 }
@@ -2115,10 +2116,11 @@ fn prop_max_buf_abort_no_mock_leak_same_proto_restore() {
 // 同型, 但方向互补: 那是 o→a writer 侧跳过, 这是 a→a reader 侧丢弃): 每个
 // content_block_stop 都有同 index 的前置 content_block_start.
 
-/// #282 测试公共 fixture: thinking block (index=0, reader 未建模) 后跟 text block
-/// (index=1) 的 9 帧 Anthropic SSE 流; `terminal_usage` 控制 message_delta 是否
-/// 携带 usage 字段 (确定性单测版, 与 `arb_anthropic_sse_stream_with_mock` 的
-/// `has_usage` 生成轴同型).
+/// #282/T7 测试公共 fixture: thinking block (index=0, 原文含 mock — LLM 视角,
+/// restore 后应还原 real) + signature, 后跟 text block (index=1) 的 Anthropic SSE
+/// 流; `terminal_usage` 控制 message_delta 是否携带 usage 字段 (确定性单测版,
+/// 与 `arb_anthropic_sse_stream_with_mock` 的 `has_usage` 生成轴同型).
+/// mock/real 对: `MOCKb1live` ↔ `sk-b1-live-secret` (两测试共用 build_redaction_map).
 fn anthropic_thinking_then_text_stream(terminal_usage: bool) -> String {
     let message_delta = if terminal_usage {
         json!({
@@ -2151,7 +2153,14 @@ fn anthropic_thinking_then_text_stream(terminal_usage: bool) -> String {
             "content_block_delta",
             &json!({
                 "type":"content_block_delta","index":0,
-                "delta":{"type":"thinking_delta","thinking":"internal reasoning..."}
+                "delta":{"type":"thinking_delta","thinking":"internal reasoning... key is MOCKb1live ok"}
+            }),
+        ),
+        anthropic_frame(
+            "content_block_delta",
+            &json!({
+                "type":"content_block_delta","index":0,
+                "delta":{"type":"signature_delta","signature":"SIGb1thnking0x"}
             }),
         ),
         anthropic_frame(
@@ -2186,13 +2195,14 @@ fn anthropic_thinking_then_text_stream(terminal_usage: bool) -> String {
     .concat()
 }
 
-/// 同协议 restore (a→a): thinking block 的 start/delta/stop 整段静默 — 客户端
-/// wire 的 content_block_start/stop 配对完整, text 内容保真.
+/// 同协议 restore (a→a, T7): thinking block 完整 passthrough — 原文经
+/// thinking_delta 流经 restore 滑窗 (mock 命中时与 text 同算法), signature
+/// verbatim 直通 (opaque 非明文不进扫描), start/stop 配对完整。
 #[test]
-fn same_proto_restore_thinking_block_no_orphan_stop() {
+fn same_proto_restore_thinking_block_full_fidelity() {
     let upstream = anthropic_thinking_then_text_stream(false);
-    // real/mock 不出现在流中 → restore hook 直通, 排除 restore 逻辑干扰。
-    let map = build_redaction_map("sk-b1-absent-real", "MOCKb1absent");
+    // thinking 原文含 mock (LLM 视角) → restore 后必须还原 real (与 text 同算法)。
+    let map = build_redaction_map("sk-b1-live-secret", "MOCKb1live");
     let client = run_same_proto_restore(Protocol::Anthropic, map, upstream.as_bytes(), &[]);
 
     let client_str = String::from_utf8_lossy(&client);
@@ -2212,8 +2222,7 @@ fn same_proto_restore_thinking_block_no_orphan_stop() {
                 let idx = index.expect("content_block_stop has index");
                 assert!(
                     open.remove(&idx),
-                    "unpaired content_block_stop (index={idx}) — thinking 的 BlockStart \
-                     被 reader 丢弃但 BlockStop 仍 emit (#282): {client_str}"
+                    "unpaired content_block_stop (index={idx}): {client_str}"
                 );
             }
             _ => {}
@@ -2223,19 +2232,46 @@ fn same_proto_restore_thinking_block_no_orphan_stop() {
         open.is_empty(),
         "unclosed content_block_start: {client_str}"
     );
-    // text 内容保真: thinking 静默是预期, 但后续 text block 不受牵连.
+    // T7 核心: thinking 原文 + signature 都必须原样到达 (修复前 reader 层整段丢弃)。
+    // 原文断言用 thinking_delta 拼接 (restore 滑窗会拆 chunk — 与 text 断言的
+    // 拼接惯例一致, chunk 划分不是契约)。
+    let thinking_joined = parsed
+        .iter()
+        .filter_map(|(_, d)| {
+            let delta = d.get("delta")?.as_object()?;
+            if delta.get("type").and_then(Value::as_str) == Some("thinking_delta") {
+                delta.get("thinking").and_then(Value::as_str)
+            } else {
+                None
+            }
+        })
+        .collect::<String>();
+    assert_eq!(
+        thinking_joined, "internal reasoning... key is sk-b1-live-secret ok",
+        "thinking text lost or mock not restored in same-proto restore: {client_str}"
+    );
+    assert!(
+        !client_str.contains("MOCKb1live"),
+        "mock leaked in thinking text: {client_str}"
+    );
+    assert!(
+        client_str.contains("SIGb1thnking0x"),
+        "thinking signature lost in same-proto restore: {client_str}"
+    );
+    // text 内容保真 (后续 block 不受牵连)。
     assert!(
         client_str.contains("\"text\":\"answer\""),
-        "text content lost while dropping thinking block: {client_str}"
+        "text content lost: {client_str}"
     );
 }
 
-/// 跨协议 (a→r): thinking block 整段静默后, Responses ingress 输出流的 item
-/// added/done 配对完整 — 无孤儿 done 族事件, text 内容到达, thinking 不泄漏.
+/// 跨协议 (a→r, T7): thinking block 经 envelope 搬运 — thinking 原文以
+/// reasoning_summary_text 事件族到达, signature 打包进 encrypted_content
+/// (sg-envelope, 回传解包可还原), item added/done 配对完整。
 #[test]
 fn cross_proto_anthropic_thinking_block_no_orphan_events() {
     let upstream = anthropic_thinking_then_text_stream(true);
-    let map = build_redaction_map("sk-b1-absent-real", "MOCKb1absent");
+    let map = build_redaction_map("sk-b1-live-secret", "MOCKb1live");
     let client = run_cross_proto_restore(
         Protocol::OpenAIResponses, // ingress (客户端收到 Responses 事件流)
         Protocol::Anthropic,       // egress (上游 Anthropic SSE)
@@ -2247,7 +2283,8 @@ fn cross_proto_anthropic_thinking_block_no_orphan_events() {
     let client_str = String::from_utf8_lossy(&client);
     // 配对追踪: output_item.added 登记 output_index, done 族事件必须命中登记.
     let mut added: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
-    for (et, data) in iter_sse_frames(&client) {
+    let parsed = iter_sse_frames(&client);
+    for (et, data) in &parsed {
         let out_index = data.get("output_index").and_then(Value::as_u64);
         if et == "response.output_item.added" {
             assert!(
@@ -2263,14 +2300,134 @@ fn cross_proto_anthropic_thinking_block_no_orphan_events() {
             );
         }
     }
-    // text 内容保真 + thinking 增量不泄漏 (Responses ingress 丢弃 thinking 是
-    // STR-6 裁决的预期行为).
+    // text 内容保真。
     assert!(
         client_str.contains("\"text\":\"answer\""),
-        "text content lost while dropping thinking block: {client_str}"
+        "text content lost: {client_str}"
+    );
+    // T7: thinking 原文到达 (summary 形态承载 — 语义降档与流式裁决一致),
+    // 其中的 mock 被 restore 为 real。
+    assert!(
+        client_str.contains("key is sk-b1-live-secret ok"),
+        "thinking text must be carried (restored) via reasoning summary events: {client_str}"
     );
     assert!(
-        !client_str.contains("internal reasoning..."),
-        "thinking delta leaked to Responses ingress: {client_str}"
+        !client_str.contains("MOCKb1live"),
+        "mock leaked in carried thinking text: {client_str}"
+    );
+    // T7: signature 经 sg-envelope 搬进 encrypted_content (done 族帧), 解包还原。
+    let ec = parsed
+        .iter()
+        .filter_map(|(_, d)| {
+            d.get("item")?
+                .get("encrypted_content")
+                .and_then(Value::as_str)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        ec.iter().any(
+            |e| crate::codec::thinking::unpack(e).is_some_and(|b| matches!(
+                &b,
+                crate::codec::ir::IrBlock::ReasoningContent {
+                    text, opaque: Some(crate::codec::ir::ThinkingOpaque::Signature(sig)),
+                } if text == "internal reasoning... key is sk-b1-live-secret ok"
+                    && sig == "SIGb1thnking0x"
+            ))
+        ),
+        "signature must be carried via sg-envelope in encrypted_content: {client_str}\nec={ec:?}"
+    );
+}
+
+/// T7 golden (r→a 流式): r egress 流的 reasoning item (summary delta + done 携带
+/// encrypted_content) → a ingress 合成 thinking block 完整生命周期 —
+/// content_block_start(thinking) / thinking_delta / signature_delta(envelope) /
+/// content_block_stop; envelope 解包还原 Reasoning{summary, ec}, 客户端把该
+/// block 回传后 r egress 原生恢复 (stateless tool loop 闭合, 流式方向)。
+#[test]
+fn cross_proto_streaming_r_to_a_thinking_envelope_golden() {
+    let upstream = [
+        responses_frame(
+            "response.created",
+            &json!({"response": {"id": "resp_t7", "status": "in_progress",
+                                  "output": [], "usage": null}}),
+        ),
+        responses_frame(
+            "response.output_item.added",
+            &json!({"output_index": 0, "item": {"id": "rs_1", "type": "reasoning",
+                                                  "summary": [], "status": "in_progress"}}),
+        ),
+        responses_frame(
+            "response.reasoning_summary_text.delta",
+            &json!({"item_id": "rs_1", "output_index": 0, "summary_index": 0,
+                     "delta": "deliberation"}),
+        ),
+        responses_frame(
+            "response.output_item.done",
+            &json!({"output_index": 0, "item": {"id": "rs_1", "type": "reasoning",
+                                                  "status": "completed",
+                                                  "encrypted_content": "EC-stream-r2a",
+                                                  "summary": [{"type": "summary_text",
+                                                                "text": "deliberation"}]}}),
+        ),
+        responses_frame(
+            "response.completed",
+            &json!({"response": {"status": "completed", "usage": null}}),
+        ),
+    ]
+    .concat();
+    let map = build_redaction_map("sk-t7-absent-real", "MOCKt7absent");
+    let client = run_cross_proto_restore(
+        Protocol::Anthropic,       // ingress (客户端收到 Anthropic SSE)
+        Protocol::OpenAIResponses, // egress (上游 Responses SSE)
+        map,
+        upstream.as_bytes(),
+        &[],
+    );
+    let client_str = String::from_utf8_lossy(&client);
+    let parsed = iter_sse_frames(&client);
+
+    // thinking 生命周期完整: start(thinking) → thinking_delta → signature_delta → stop。
+    let start = parsed
+        .iter()
+        .find(|(et, d)| et == "content_block_start" && d["content_block"]["type"] == "thinking")
+        .unwrap_or_else(|| panic!("thinking content_block_start missing: {client_str}"));
+    assert_eq!(start.1["content_block"]["thinking"], json!(""));
+    // thinking_delta 拼接断言 (restore 滑窗会拆 chunk — chunk 划分不是契约)。
+    let thinking_joined = parsed
+        .iter()
+        .filter_map(|(et, d)| {
+            if et == "content_block_delta" && d["delta"]["type"] == "thinking_delta" {
+                d["delta"]["thinking"].as_str()
+            } else {
+                None
+            }
+        })
+        .collect::<String>();
+    assert_eq!(
+        thinking_joined, "deliberation",
+        "thinking_delta missing: {client_str}"
+    );
+    let sig = parsed
+        .iter()
+        .find(|(et, d)| et == "content_block_delta" && d["delta"]["type"] == "signature_delta")
+        .map(|(_, d)| d["delta"]["signature"].as_str().unwrap().to_string())
+        .unwrap_or_else(|| panic!("signature_delta missing: {client_str}"));
+    // envelope 解包 → Reasoning{summary, ec} (回传后 r egress 原生恢复的权威源)。
+    assert!(
+        crate::codec::thinking::unpack(&sig).is_some_and(|b| matches!(
+            &b,
+            crate::codec::ir::IrBlock::Reasoning { summary, opaque }
+                if summary == &vec!["deliberation".to_string()]
+                    && opaque.as_deref() == Some("EC-stream-r2a")
+        )),
+        "signature envelope must unpack to Reasoning{{summary, ec}}: {sig}"
+    );
+    // 配对完整: start 的 index 有对应 stop。
+    let idx = start.1["index"].as_u64().unwrap();
+    assert!(
+        parsed
+            .iter()
+            .any(|(et, d)| et == "content_block_stop" && d["index"].as_u64() == Some(idx)),
+        "unpaired thinking block stop: {client_str}"
     );
 }

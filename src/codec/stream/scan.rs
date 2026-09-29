@@ -25,6 +25,10 @@ struct ScanBlock {
     json_input: String,
     /// ReasoningDelta 累积 (reasoning block only, #176).
     reasoning: String,
+    /// SignatureDelta 累积 (a-origin 真 signature, T7).
+    signature: String,
+    /// ReasoningOpaqueDelta 累积 (r-origin encrypted_content, T7).
+    reasoning_opaque: String,
     /// block 元信息 (BlockStart 时记录, 用于 finish 时构造 IrBlock).
     meta: Option<IrBlockMeta>,
 }
@@ -135,6 +139,12 @@ impl StreamScan {
                     crate::codec::ir::IrDelta::TextDelta(s) => entry.text.push_str(s),
                     crate::codec::ir::IrDelta::InputJsonDelta(s) => entry.json_input.push_str(s),
                     crate::codec::ir::IrDelta::ReasoningDelta(s) => entry.reasoning.push_str(s),
+                    // opaque 增量: 签名/密文非明文, 仅累积 (T7, 不进 restore —
+                    // parsed view 呈现 LLM 视角, 与 record 语义一致)。
+                    crate::codec::ir::IrDelta::SignatureDelta(s) => entry.signature.push_str(s),
+                    crate::codec::ir::IrDelta::ReasoningOpaqueDelta(s) => {
+                        entry.reasoning_opaque.push_str(s)
+                    }
                 }
             }
             IrStreamEvent::BlockStop { index: _ } => {
@@ -204,10 +214,13 @@ impl StreamScan {
 
 /// 把 ScanBlock (累积状态) 折叠为最终 IrBlock.
 /// - meta=ToolUse → ToolUse block (input JSON parse, 失败则用空 object)
-/// - meta=ReasoningContent → ReasoningContent block (思考原文, 空内容不产出)
+/// - meta=ReasoningContent (o-origin) / Thinking (a/r-origin) → ReasoningContent
+///   block (思考原文 + 可选 opaque, T7; 空内容不产出 — opaque 独立存在时保留)
+/// - meta=RedactedThinking → ReasoningContent{text:"", opaque:RedactedData} (T7)
 /// - meta=Text 或缺失 (上游漏发 BlockStart) → Text block
-/// - 空内容 (text+json_input+reasoning 均空) → None (不产出空气泡)
+/// - 空内容 (text+json_input+reasoning+opaque 均空) → None (不产出空气泡)
 fn fold_scan_block(b: &ScanBlock) -> Option<crate::codec::IrBlock> {
+    use crate::codec::ir::ThinkingOpaque;
     match &b.meta {
         Some(IrBlockMeta::ToolUse { id, name }) => {
             let input = serde_json::from_str(&b.json_input).unwrap_or_default();
@@ -218,12 +231,32 @@ fn fold_scan_block(b: &ScanBlock) -> Option<crate::codec::IrBlock> {
                 extra: Default::default(),
             })
         }
-        Some(IrBlockMeta::ReasoningContent) => {
-            if b.reasoning.is_empty() {
+        Some(IrBlockMeta::ReasoningContent) | Some(IrBlockMeta::Thinking) => {
+            let opaque = if !b.signature.is_empty() {
+                Some(ThinkingOpaque::Signature(b.signature.clone()))
+            } else if !b.reasoning_opaque.is_empty() {
+                // r-origin ec 无本地容器语义, 以 Signature 形态承载 (parsed view
+                // 只需呈现 opaque 存在; 跨协议重打包由 codec 主路径处理)。
+                Some(ThinkingOpaque::Signature(b.reasoning_opaque.clone()))
+            } else {
+                None
+            };
+            if b.reasoning.is_empty() && opaque.is_none() {
                 None
             } else {
                 Some(crate::codec::IrBlock::ReasoningContent {
                     text: b.reasoning.clone(),
+                    opaque,
+                })
+            }
+        }
+        Some(IrBlockMeta::RedactedThinking { data }) => {
+            if data.is_empty() {
+                None
+            } else {
+                Some(crate::codec::IrBlock::ReasoningContent {
+                    text: String::new(),
+                    opaque: Some(ThinkingOpaque::RedactedData(data.clone())),
                 })
             }
         }

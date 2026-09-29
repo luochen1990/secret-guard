@@ -27,7 +27,7 @@
   Responses ingress ← Anthropic upstream 走同一翻译路径但暂无专属测试).
 - ✅ `reasoning_content` (思考原文, OpenAI 兼容 provider 非标字段) 同协议建模:
   请求 (assistant 历史回传) / 非流式响应 / 流式 delta 三路径 reader↔writer 对称
-  (#176, 契约 STR-6). 跨协议丢弃 (见下).
+  (#176, 契约 STR-6). 跨协议处置见下方 T7 条 (o-origin 跨 a 仍丢弃, 跨 r 保留)。
 - ✅ reasoning **配置** (请求侧深度思考参数) 跨协议映射 (roadmap A1 批次 1, 2026-09-29):
   OpenAI `reasoning_effort` / Anthropic `thinking` / Responses `reasoning.effort` ↔ IR
   first-class `IrRequest.reasoning` (`IrReasoning`: Disabled / Effort(6档) / Budget /
@@ -44,22 +44,40 @@
   `responses_streaming_with_secret_hit_restores_mock` 端到端锁定; 流式已知损失
   (hosted tools / refusal 丢弃, reasoning delta 归一, 多 part 折叠等) 见
   `docs/known-limitations.md` codec 节.
-- ❌ 不在 MVP: Bedrock / Gemini / Cohere, reasoning `encrypted_content` (provider-specific opaque),
-  Anthropic `thinking` blocks, citations 语义建模 (响应侧 block 未知字段已按 extra 保真), logprobs,
+- ✅ thinking / encrypted_content **passthrough** (provider opaque 思考上下文容器, T7
+  2026-09-29): Anthropic `thinking`{thinking, signature} / `redacted_thinking`{data} /
+  Responses reasoning item `encrypted_content` 经 IR `opaque` 字段 (`Reasoning.opaque` /
+  `ReasoningContent.opaque: ThinkingOpaque`) 同协议 round-trip + Redact 完整保真
+  (非流式请求/响应 + 流式 BlockStart/delta/stop 全生命周期, 流式 origin 经
+  `IrBlockMeta::Thinking`/`RedactedThinking` 与 `IrDelta::SignatureDelta`/
+  `ReasoningOpaqueDelta` 区分); 跨协议 a⇄r 经 sg-envelope 搬运 (`codec/thinking.rs`,
+  cc-switch 模式 — 打包在 writer 侧 post-redact/restore, 解包在 reader 侧
+  pre-redact/restore, stateless tool loop 回传闭合)。剩余损失: o-origin 跨 a 丢弃 +
+  WARN (o 无 opaque 容器); 任何 opaque 跨 o 丢弃 + WARN (正文保留为 reasoning_content);
+  o→r 保留正文 (2026-09-23 "流式保留/非流式丢弃" 分叉消解)。
+- ❌ 不在 MVP: Bedrock / Gemini / Cohere, citations 语义建模 (响应侧 block 未知字段已按 extra 保真), logprobs,
   Bedrock eventstream 二进制流. prompt caching **跨协议归一化** (A8 first-class) 暂缓 — 跨协议
   路径 cache_control 照旧丢弃 (clear_wire_fidelity, FWD-3); 同协议保真已由 wire-fidelity extra +
   system_form 覆盖 (#269), 见 ir-fields-roadmap.md A8.
 
-> **reasoning_content 跨协议丢弃 rationale** (#176, FWD-3 已知损失): Anthropic thinking
-> block 必须携带 signature (加密签名, secret-guard 无法合成 — 伪造会被 Anthropic API 拒收);
-> Responses reasoning item 依赖 `encrypted_content` (provider-opaque). 两者都无法从思考
-> 原文合法合成, writer 跳过 (返回 None) 而非发明非法 wire 形态. 流式路径由
-> StreamTranslate 的跳过 block 配对过滤兜底 (writer 跳过 BlockStart 的 index, 其
-> BlockStop 一并跳过, 不产生未配对的 content_block_stop), 见 `stream/translate.rs`.
-> 已知次生损失: 跨协议流式跳过 reasoning block 后, Anthropic ingress 客户端看到的
-> block index 序列出现**空洞** (如首个 content_block_start 是 index=1 而非 0) —
+> **thinking/encrypted_content 跨协议搬运 rationale** (T7, 改写 #176 旧裁决): 旧裁决
+> "无法合法合成 signature → 跨协议丢弃" 只否定了**合成**, 未否定**搬运** — cc-switch 的
+> envelope passthrough 证明第三条路存在。secret-guard 不合成任何签名/密文, 只把己方
+> block 完整序列化 base64 (`sg-thinking-v1:` 前缀) 藏进对方协议的 opaque 容器
+> (a 的 signature / r 的 encrypted_content), 回传方向识别前缀解包还原原生块。
+> redact 安全链: envelope 是 base64(明文 JSON), 安全性由打包/解包位置保证 — 打包点
+> 全部在 writer (请求侧 post-redact / 响应侧 post-restore), 解包点全部在 reader
+> (pre-redact / pre-restore, 解包文本成为 IR 叶子必然流经扫描)。o (Chat) 无 opaque
+> 容器: o-origin 跨 a 丢弃 + WARN, opaque 跨 o 丢弃 + WARN — 不为 o 发明 envelope
+> wire 形态 (正文仍按 #176 保留为 reasoning_content)。
+> 已知次生损失: ① 跨协议流式跳过 o-origin reasoning block 后, Anthropic ingress 客户端
+> 看到的 block index 序列出现**空洞** (如首个 content_block_start 是 index=1 而非 0) —
 > Anthropic 官方流恒从 0 连续递增, 按 index 做 map key 的 SDK 无碍, 按位置预分配
-> 数组的严格客户端可能错位 (IR index 原样透传, 不做重映射; 仅跨协议 + reasoning 场景).
+> 数组的严格客户端可能错位 (IR index 原样透传, 不做重映射; 仅 o→a + reasoning 场景)。
+> ② a-origin thinking 文本被 redact mock 后 signature 可能与文本失配 (signature 覆盖
+> 原文) — 安全优先于签名有效性的已接受折衷 (常态: thinking 无 secret 时零差异);
+> ③ 同协议 a→a 的退化 signature-less thinking 流 (真实 Anthropic 不产生) 会被注入
+> envelope signature, 回传经解包可逆还原 (known-limitations 登记)。
 
 ## 核心抽象
 
@@ -95,6 +113,9 @@
   - `synth.rs` — `synthesize_sse` (IrResponse → 完整 SSE 生命周期, 伪流式上游形态适配 T5;
     IrResponse → IrStreamEvent 序列 → 各协议 writer 既有流式序列化, 无新协议形态知识).
   核心 de-frame 逻辑抽出共享骨架 `SseReassembler`, 由 `StreamTranslate` / `StreamScan` 各持一个实例, 避免 reassembly 循环重复 + 行为漂移.
+- `thinking.rs` — sg-thinking envelope (T7): provider opaque 思考上下文容器的跨协议搬运格式
+  (`sg-thinking-v1:` + base64 版本化 JSON, cc-switch 模式). 打包/解包位置的安全链契约
+  (writer 侧打包 = post-redact/restore, reader 侧解包 = pre-redact/restore) 见文件头注.
 
 ## wire fidelity (wire 形态元数据)
 

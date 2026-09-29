@@ -33,6 +33,7 @@ pub mod normalize;
 pub mod openai;
 pub mod responses;
 pub mod stream;
+pub mod thinking;
 
 #[cfg(test)]
 mod fwd_cross_proto_property;
@@ -50,7 +51,7 @@ use crate::provider::Protocol as NativeProtocol;
 pub use ir::{
     IrBlock, IrBlockMeta, IrDelta, IrError, IrImageSource, IrMessage, IrReasoning,
     IrReasoningEffort, IrRequest, IrResponse, IrRole, IrStopReason, IrStreamEvent, IrTool,
-    IrToolChoice, IrUsage,
+    IrToolChoice, IrUsage, ThinkingOpaque,
 };
 
 /// codec 层使用的 protocol 标识.
