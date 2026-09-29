@@ -179,6 +179,10 @@
 破坏形状的 bug 修回形状保持" (如 #269 M1/M2), 而非新增形状改写. 曾实现的顶层缓存标记
 注入方案 (`inject_cache_control`) 被此裁决否决移除 (2026-09-23). 详见
 `docs/design/contracts.md` FWD-1 "原始形状保持"注记.
+**已登记例外 (T7, 2026-09-29)**: sg-thinking envelope 的三类偏离 (跨协议 egress
+envelope 工件 / reader 解包时 envelope 权威源 / ec 载荷的 real↔mock 发生在 base64
+解码层) 已按同款 "显式列举的例外" 格式登记在 contracts.md **FWD-1 "sg-thinking
+envelope 例外注记"** — 授权记录 = PR #293 用户 approve; 修改 envelope 行为前先读它.
 
 ### C3 前缀缓存友好性 (经济性契约) → RED-3 契约
 
