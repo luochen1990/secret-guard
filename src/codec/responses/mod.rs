@@ -396,7 +396,13 @@ impl Writer for ResponsesWriter {
             "model".to_string(),
             Value::String(resp.model.clone().unwrap_or_default()),
         );
-        out.insert("status".to_string(), write_status(resp.stop_reason));
+        let (status, incomplete_reason) = write_status_and_reason(resp.stop_reason);
+        out.insert("status".to_string(), json!(status));
+        // incomplete 时写 reason, reader 才能精确化读回 (round-trip 保真, #285);
+        // completed 不写该键 (最小 wire 差异).
+        if let Some(reason) = incomplete_reason {
+            out.insert("incomplete_details".to_string(), json!({"reason": reason}));
+        }
         out.insert("output".to_string(), Value::Array(output));
         out.insert(
             "usage".to_string(),
@@ -1016,25 +1022,38 @@ fn write_tool_choice(tc: &IrToolChoice) -> Value {
     }
 }
 
-/// IrStopReason → Responses status 字符串 (str 形态 SSOT — 非流式 `write_response`
-/// 与流式 `response.completed` 骨架共用, 集中避免两处映射漂移).
-fn write_status_str(reason: Option<IrStopReason>) -> &'static str {
+/// IrStopReason → (Responses status 字符串, incomplete_details.reason 值) 一体产出.
+///
+/// status 与 reason 的 IrStopReason 映射收敛为单一 SSOT — 非流式 `write_response`
+/// 与流式终止事件 `stream_write_terminal_response` **整块**共享 (#285: 此前 status
+/// 共用而 reason 仅流式手写, 半截 SSOT 分叉致非流式 incomplete 轮次丢 reason,
+/// MaxTokens round-trip 降级 Other). reason 仅 incomplete 变体为 Some:
+/// MaxTokens→max_output_tokens; Safety/Refusal→content_filter (Refusal 无官方
+/// reason 对应, 归 content_filter — reader 读回 Safety, Refusal→Safety 的往返
+/// 损失已知, Responses wire 无更精确的表达).
+fn write_status_and_reason(reason: Option<IrStopReason>) -> (&'static str, Option<&'static str>) {
     match reason {
-        None | Some(IrStopReason::EndTurn) | Some(IrStopReason::StopSequence) => "completed",
-        Some(IrStopReason::MaxTokens) => "incomplete",
-        Some(IrStopReason::ToolUse) => "completed", // 工具调用也算 completed
-        Some(IrStopReason::Safety) | Some(IrStopReason::Refusal) => "incomplete",
+        None | Some(IrStopReason::EndTurn) | Some(IrStopReason::StopSequence) => {
+            ("completed", None)
+        }
+        Some(IrStopReason::MaxTokens) => ("incomplete", Some("max_output_tokens")),
+        Some(IrStopReason::ToolUse) => ("completed", None), // 工具调用也算 completed
+        Some(IrStopReason::Safety) | Some(IrStopReason::Refusal) => {
+            ("incomplete", Some("content_filter"))
+        }
         // Other (未知停止原因) → completed (2026-09-23 裁决): 未知大多是正常结束的
         // 变体, 映射 failed 会触发客户端错误处理路径 (弹错/重试), 误导性强 —
         // "未知不伪装成确定错误". 读侧 "failed"→Other 保持 (read_response_status),
         // round-trip failed→Other→completed 有损, 是该折衷的已知代价.
-        Some(IrStopReason::Other) => "completed",
+        Some(IrStopReason::Other) => ("completed", None),
     }
 }
 
-/// IrStopReason → Responses status 字符串 (Value 形态, 非流式 `write_response` 用).
-fn write_status(reason: Option<IrStopReason>) -> Value {
-    json!(write_status_str(reason))
+/// IrStopReason → Responses status 字符串 (str 形态 — 流式事件名用,
+/// `write_status_and_reason` 的 status 投影; 需要伴随 reason 的消费面一律走
+/// `write_status_and_reason`, 避免半截消费 #285 反模式复发).
+fn write_status_str(reason: Option<IrStopReason>) -> &'static str {
+    write_status_and_reason(reason).0
 }
 
 /// IR usage → Responses 风格 usage JSON ({input_tokens, output_tokens, total_tokens}).
@@ -1623,7 +1642,7 @@ mod tests {
     fn write_response_other_maps_to_completed() {
         // Other (未知停止原因) → "completed" (2026-09-23 裁决): 伪装 failed 会触发
         // 客户端错误处理路径. 读侧 "failed"→Other 保持, round-trip
-        // failed→Other→completed 有损 — 已知折衷 (见 write_status_str 注释).
+        // failed→Other→completed 有损 — 已知折衷 (见 write_status_and_reason 注释).
         let ir = IrResponse {
             content: vec![IrBlock::Text {
                 text: "done".into(),
@@ -1774,6 +1793,125 @@ mod tests {
             "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
         });
         let ir = reader().read_response(&original).unwrap();
+        let rewritten = writer().write_response(&ir);
+        let ir2 = reader().read_response(&rewritten).unwrap();
+        assert_eq!(ir, ir2);
+    }
+
+    #[test]
+    fn max_tokens_round_trip_via_responses_nonstream() {
+        // #285: 非流式 writer 必须写 incomplete_details.reason — MaxTokens 经
+        // write→read round-trip 保真 (此前只写 status=incomplete, 读回归 Other).
+        let ir = IrResponse {
+            content: vec![IrBlock::Text {
+                text: "partial".into(),
+                extra: Default::default(),
+            }],
+            stop_reason: Some(IrStopReason::MaxTokens),
+            model: Some("gpt-4o".into()),
+            ..Default::default()
+        };
+        let wire = writer().write_response(&ir);
+        assert_eq!(wire.get("status").unwrap(), "incomplete");
+        let back = reader().read_response(&wire).unwrap();
+        assert_eq!(
+            back.stop_reason,
+            Some(IrStopReason::MaxTokens),
+            "#285: MaxTokens round-trip 降级为 {:?} (incomplete 无 reason → Other)",
+            back.stop_reason
+        );
+    }
+
+    #[test]
+    fn round_trip_response_incomplete_max_tokens_scenario() {
+        // 照流式 stream_round_trip_incomplete_max_tokens_scenario 对齐非流式维度:
+        // 上游 wire 带 incomplete_details.reason → IR MaxTokens → 写回保真.
+        let original = json!({
+            "id": "resp_1",
+            "object": "response",
+            "created_at": 1700000000,
+            "model": "gpt-4o",
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [{
+                "type": "message",
+                "id": "msg_1",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "partial"}]
+            }],
+        });
+        let ir = reader().read_response(&original).unwrap();
+        assert_eq!(ir.stop_reason, Some(IrStopReason::MaxTokens));
+        let rewritten = writer().write_response(&ir);
+        let ir2 = reader().read_response(&rewritten).unwrap();
+        assert_eq!(ir, ir2);
+    }
+
+    // ─── write_status_and_reason SSOT 映射表 (#285 review 中等问题补钉) ───
+    // property 生成器不生成 incomplete 族 finish_reason (fwd_responses_property
+    // 的 arb_chat_response_value 只有 stop/tool_calls), SSOT 映射表此前无钉死
+    // 测试 — 本表驱动单测把 8 个臂 (None + 7 变体) 逐臂锁定, 防止未来重构
+    // 悄悄改映射 (流式/非流式两消费面共享此表, 一处锁定双向守护).
+    #[test]
+    fn write_status_and_reason_maps_every_variant() {
+        let cases: &[(Option<IrStopReason>, &str, Option<&str>)] = &[
+            (None, "completed", None),
+            (Some(IrStopReason::EndTurn), "completed", None),
+            (Some(IrStopReason::StopSequence), "completed", None),
+            (Some(IrStopReason::ToolUse), "completed", None),
+            (Some(IrStopReason::Other), "completed", None),
+            (
+                Some(IrStopReason::MaxTokens),
+                "incomplete",
+                Some("max_output_tokens"),
+            ),
+            (
+                Some(IrStopReason::Safety),
+                "incomplete",
+                Some("content_filter"),
+            ),
+            (
+                Some(IrStopReason::Refusal),
+                "incomplete",
+                Some("content_filter"),
+            ),
+        ];
+        for (input, status, reason) in cases {
+            assert_eq!(
+                write_status_and_reason(*input),
+                (*status, *reason),
+                "SSOT 映射分叉: {input:?} 期望 ({status}, {reason:?})"
+            );
+        }
+        // 结构性不变式: incomplete 必带 reason — helper 无法产出 ("incomplete", None),
+        // 自家 round-trip 不依赖 reader 的病态 wire 容错 (无 reason → Other).
+        for (input, ..) in cases {
+            let (status, reason) = write_status_and_reason(*input);
+            assert_ne!((status, reason), ("incomplete", None), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn round_trip_response_incomplete_content_filter_scenario() {
+        // Safety 变体: content_filter reason 经写回保真 (读回归 Safety).
+        let original = json!({
+            "id": "resp_1",
+            "object": "response",
+            "created_at": 1700000000,
+            "model": "gpt-4o",
+            "status": "incomplete",
+            "incomplete_details": {"reason": "content_filter"},
+            "output": [{
+                "type": "message",
+                "id": "msg_1",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "blocked"}]
+            }],
+        });
+        let ir = reader().read_response(&original).unwrap();
+        assert_eq!(ir.stop_reason, Some(IrStopReason::Safety));
         let rewritten = writer().write_response(&ir);
         let ir2 = reader().read_response(&rewritten).unwrap();
         assert_eq!(ir, ir2);

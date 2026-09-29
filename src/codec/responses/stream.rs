@@ -37,7 +37,8 @@ use super::super::ir::{
 };
 use super::super::{IrBlockMeta, IrDelta, IrStopReason, IrStreamEvent, current_epoch};
 use super::{
-    read_response_status, read_usage, responses_usage_or_null, synth_response_id, write_status_str,
+    read_response_status, read_usage, responses_usage_or_null, synth_response_id,
+    write_status_and_reason, write_status_str,
 };
 
 // ─── Helpers: read (streaming) ─────────────────────────────────────────────
@@ -764,10 +765,11 @@ fn stream_write_block_stop(index: usize, state: &mut ResponsesEncodeState) -> Ve
 }
 
 /// `MessageStop` → 终止事件 (`response.completed` / `response.incomplete`,
-/// type 由 `write_status_str` 分派) 的 response 全量对象:
+/// type 由 `write_status_and_reason` 一体分派) 的 response 全量对象:
 /// 骨架 + status + output 全量重建 (items 按 index 升序)
 /// + usage (cached; present=false 时 null — 与非流式 `write_response` 一致)
-/// + incomplete_details (MaxTokens/Safety/Refusal 时给 reason, 其余 null).
+/// + incomplete_details (reason 与 status 同一 SSOT 产出 — #285 整块收敛,
+///   映射见 `write_status_and_reason`; 其余变体 null).
 ///
 /// stop_reason=Other 也走 `response.completed` (2026-09-23 裁决: 未知停止原因
 /// 大多是正常结束的变体, 伪装成 failed 会触发客户端错误处理路径 — "未知不
@@ -775,18 +777,14 @@ fn stream_write_block_stop(index: usize, state: &mut ResponsesEncodeState) -> Ve
 /// Other→(ToolUse|EndTurn) 的往返损失是该折衷的已知代价. `response.failed`
 /// 仅由 `stream_write_error` (真错误路径, 携带 error 对象) 产生.
 fn stream_write_terminal_response(state: &mut ResponsesEncodeState) -> Value {
-    let mut resp = response_skeleton(state, write_status_str(state.stop_reason));
+    let (status, incomplete_reason) = write_status_and_reason(state.stop_reason);
+    let mut resp = response_skeleton(state, status);
     let obj = resp.as_object_mut().expect("skeleton is always an object");
     obj.insert(
         "incomplete_details".to_string(),
-        match state.stop_reason {
-            Some(IrStopReason::MaxTokens) => json!({"reason": "max_output_tokens"}),
-            // Refusal 无官方 reason 对应, 归 content_filter (reader 读回 Safety —
-            // Refusal→Safety 的往返损失已知, Responses wire 无更精确的表达).
-            Some(IrStopReason::Safety) | Some(IrStopReason::Refusal) => {
-                json!({"reason": "content_filter"})
-            }
-            _ => Value::Null,
+        match incomplete_reason {
+            Some(reason) => json!({"reason": reason}),
+            None => Value::Null,
         },
     );
     obj.insert(

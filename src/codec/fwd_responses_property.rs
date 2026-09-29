@@ -483,7 +483,7 @@ fn prop_responses_to_chat_hosted_tools_dropped_cross_proto() {
 /// — 2026-09-23 统一裁决, 非流式对齐流式; 原 "completed 恒 EndTurn" 的粒度损失
 /// 已消除).
 ///
-/// 此单测**精确锁定**保真行为, 防止 write_status / read_response_status 映射逻辑
+/// 此单测**精确锁定**保真行为, 防止 write_status_and_reason / read_response_status 映射逻辑
 /// 静默回归 (例如某天 completed 被映射成 MaxTokens, 或推断被移除, 应被此测试
 /// 抓住). 与 `prop_chat_to_responses_response_preserves_modeled_fields` 的弱
 /// stop_reason 断言 (只比较 Some vs None) 配合, 形成完整覆盖.
@@ -513,7 +513,7 @@ fn responses_stop_reason_tool_use_preserved_cross_proto() {
     let ir_in = OpenAiReader.read_response(&tool_calls_resp).unwrap();
     assert_eq!(ir_in.stop_reason, Some(IrStopReason::ToolUse));
     let responses_wire = responses_writer().write_response(&ir_in);
-    // write_status(ToolUse) → "completed".
+    // write_status_and_reason(ToolUse) → "completed".
     assert_eq!(responses_wire.get("status").unwrap(), "completed");
     let ir_out = responses_reader().read_response(&responses_wire).unwrap();
     // 精确保真: output 含 function_call → reader 推断 ToolUse (粒度损失已消除,
@@ -766,7 +766,7 @@ fn assert_responses_chat_response_modeled_equivalent(
 
     // stop_reason: Responses wire 的 status 粒度粗 (只有 completed/incomplete/failed),
     // 不区分 Chat 的 "stop" vs "tool_calls". Chat 的 tool_calls → IR ToolUse → Responses
-    // write_status 写 "completed" → read_response_status 读回 EndTurn (语义损失, 已知).
+    // write_status_and_reason 写 "completed" → read_response_status 读回 EndTurn (语义损失, 已知).
     // 这里只比较 "都终止" 的弱语义 (Some vs None), 不强求 stop_reason 枚举值 1:1.
     if ir_in.stop_reason.is_some() {
         prop_assert!(
