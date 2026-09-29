@@ -672,7 +672,8 @@ pub struct ResponsesDecodeState {
 
 /// reader 端的流式解码状态. 用于 OpenAI flat stream 与 Responses 事件流的 block 边界合成.
 ///
-/// Anthropic 流是 1:1 的 (事件自带 block index), 顶层字段在 Anthropic reader 中不使用;
+/// Anthropic 流基本是 1:1 的 (事件自带 block index), reader 仅使用
+/// [`Self::dropped_block_starts`] (跳过 block 的配对 stop, #282);
 /// Responses reader 只使用 [`Self::responses`] 子状态 (事件映射表见
 /// `codec::responses::stream::read_responses_stream_event` 头部).
 #[derive(Debug, Clone, Default)]
@@ -694,6 +695,13 @@ pub struct StreamDecodeState {
     /// 每个 OpenAI tool_call index 在 IR 中对应的 block index.
     /// 必须持久化记录, 不能在 finish 时 recompute — 否则 text 后到会导致 index 偏移.
     pub tool_ir_index: std::collections::BTreeMap<usize, usize>,
+    /// Anthropic reader: `content_block_start` 未产出 IR BlockStart 的 block index
+    /// 集合 (thinking / image 等未建模类型, 按 index 记录与类型无关). 对应 index 的
+    /// `content_block_stop` 查表同步跳过 (remove 语义, stop 后清除), 防止孤儿
+    /// BlockStop 进入 IR 事件流 — 同协议 restore 模式下会直通 wire 成未配对的
+    /// content_block_stop (#282). 与 translate.rs 的 `skipped_block_starts`
+    /// (writer 侧机制) 是两个不同机制. 其余协议 reader 恒空, 零开销.
+    pub dropped_block_starts: std::collections::BTreeSet<usize>,
     /// Responses 流式 reader 的解码状态 (其余协议恒为默认值, 零开销).
     pub responses: ResponsesDecodeState,
 }

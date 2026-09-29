@@ -2102,3 +2102,175 @@ fn prop_max_buf_abort_no_mock_leak_same_proto_restore() {
         "STR-4 违反: abort 后 finish() flush 产物含 mock (泄漏): {tail_str}"
     );
 }
+
+// ─── Anthropic thinking block 配对 stop (确定性单测, #282) ──────────────────
+//
+// 场景: Anthropic egress 流式响应含 thinking block (extended thinking). reader 对
+// 未建模 block 类型 (thinking / image / ...) 的 `content_block_start` 不产 IR
+// BlockStart 事件; 修复前其 `content_block_stop` 仍无条件产出 → 同协议 restore
+// 模式 (a→a) 下孤儿 content_block_stop 直通客户端 wire, 且实测是流的第一个内容
+// 事件 (先于任何 content_block_start), 严格客户端可能直接报错.
+//
+// 不变式 (与 translate.rs `cross_proto_reasoning_block_yields_no_unpaired_block_stop`
+// 同型, 但方向互补: 那是 o→a writer 侧跳过, 这是 a→a reader 侧丢弃): 每个
+// content_block_stop 都有同 index 的前置 content_block_start.
+
+/// #282 测试公共 fixture: thinking block (index=0, reader 未建模) 后跟 text block
+/// (index=1) 的 9 帧 Anthropic SSE 流; `terminal_usage` 控制 message_delta 是否
+/// 携带 usage 字段 (确定性单测版, 与 `arb_anthropic_sse_stream_with_mock` 的
+/// `has_usage` 生成轴同型).
+fn anthropic_thinking_then_text_stream(terminal_usage: bool) -> String {
+    let message_delta = if terminal_usage {
+        json!({
+            "type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},
+            "usage":{"input_tokens":10,"output_tokens":5}
+        })
+    } else {
+        json!({
+            "type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null}
+        })
+    };
+    [
+        anthropic_frame(
+            "message_start",
+            &json!({
+                "type":"message_start",
+                "message":{"id":"msg_01t","type":"message","role":"assistant","content":[],
+                    "model":"claude-3-7-sonnet","stop_reason":null,"stop_sequence":null,
+                    "usage":{"input_tokens":10,"output_tokens":1}}
+            }),
+        ),
+        anthropic_frame(
+            "content_block_start",
+            &json!({
+                "type":"content_block_start","index":0,
+                "content_block":{"type":"thinking","thinking":""}
+            }),
+        ),
+        anthropic_frame(
+            "content_block_delta",
+            &json!({
+                "type":"content_block_delta","index":0,
+                "delta":{"type":"thinking_delta","thinking":"internal reasoning..."}
+            }),
+        ),
+        anthropic_frame(
+            "content_block_stop",
+            &json!({
+                "type":"content_block_stop","index":0
+            }),
+        ),
+        anthropic_frame(
+            "content_block_start",
+            &json!({
+                "type":"content_block_start","index":1,
+                "content_block":{"type":"text","text":""}
+            }),
+        ),
+        anthropic_frame(
+            "content_block_delta",
+            &json!({
+                "type":"content_block_delta","index":1,
+                "delta":{"type":"text_delta","text":"answer"}
+            }),
+        ),
+        anthropic_frame(
+            "content_block_stop",
+            &json!({
+                "type":"content_block_stop","index":1
+            }),
+        ),
+        anthropic_frame("message_delta", &message_delta),
+        anthropic_frame("message_stop", &json!({"type":"message_stop"})),
+    ]
+    .concat()
+}
+
+/// 同协议 restore (a→a): thinking block 的 start/delta/stop 整段静默 — 客户端
+/// wire 的 content_block_start/stop 配对完整, text 内容保真.
+#[test]
+fn same_proto_restore_thinking_block_no_orphan_stop() {
+    let upstream = anthropic_thinking_then_text_stream(false);
+    // real/mock 不出现在流中 → restore hook 直通, 排除 restore 逻辑干扰。
+    let map = build_redaction_map("sk-b1-absent-real", "MOCKb1absent");
+    let client = run_same_proto_restore(Protocol::Anthropic, map, upstream.as_bytes(), &[]);
+
+    let client_str = String::from_utf8_lossy(&client);
+    let parsed = iter_sse_frames(&client);
+    // 配对追踪: open 集合内的 index 才允许 stop (与 translate.rs 配对测试同型)。
+    let mut open: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    for (et, data) in &parsed {
+        let index = data.get("index").and_then(Value::as_u64);
+        match et.as_str() {
+            "content_block_start" => {
+                assert!(
+                    open.insert(index.expect("content_block_start has index")),
+                    "duplicate content_block_start: {client_str}"
+                );
+            }
+            "content_block_stop" => {
+                let idx = index.expect("content_block_stop has index");
+                assert!(
+                    open.remove(&idx),
+                    "unpaired content_block_stop (index={idx}) — thinking 的 BlockStart \
+                     被 reader 丢弃但 BlockStop 仍 emit (#282): {client_str}"
+                );
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        open.is_empty(),
+        "unclosed content_block_start: {client_str}"
+    );
+    // text 内容保真: thinking 静默是预期, 但后续 text block 不受牵连.
+    assert!(
+        client_str.contains("\"text\":\"answer\""),
+        "text content lost while dropping thinking block: {client_str}"
+    );
+}
+
+/// 跨协议 (a→r): thinking block 整段静默后, Responses ingress 输出流的 item
+/// added/done 配对完整 — 无孤儿 done 族事件, text 内容到达, thinking 不泄漏.
+#[test]
+fn cross_proto_anthropic_thinking_block_no_orphan_events() {
+    let upstream = anthropic_thinking_then_text_stream(true);
+    let map = build_redaction_map("sk-b1-absent-real", "MOCKb1absent");
+    let client = run_cross_proto_restore(
+        Protocol::OpenAIResponses, // ingress (客户端收到 Responses 事件流)
+        Protocol::Anthropic,       // egress (上游 Anthropic SSE)
+        map,
+        upstream.as_bytes(),
+        &[],
+    );
+
+    let client_str = String::from_utf8_lossy(&client);
+    // 配对追踪: output_item.added 登记 output_index, done 族事件必须命中登记.
+    let mut added: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    for (et, data) in iter_sse_frames(&client) {
+        let out_index = data.get("output_index").and_then(Value::as_u64);
+        if et == "response.output_item.added" {
+            assert!(
+                added.insert(out_index.expect("output_item.added has output_index")),
+                "duplicate output_item.added: {client_str}"
+            );
+        } else if out_index.is_some() {
+            let idx = out_index.expect("checked above");
+            assert!(
+                added.contains(&idx),
+                "orphan event {et} (output_index={idx}) without prior \
+                 response.output_item.added (#282 reader 侧孤儿 BlockStop): {client_str}"
+            );
+        }
+    }
+    // text 内容保真 + thinking 增量不泄漏 (Responses ingress 丢弃 thinking 是
+    // STR-6 裁决的预期行为).
+    assert!(
+        client_str.contains("\"text\":\"answer\""),
+        "text content lost while dropping thinking block: {client_str}"
+    );
+    assert!(
+        !client_str.contains("internal reasoning..."),
+        "thinking delta leaked to Responses ingress: {client_str}"
+    );
+}

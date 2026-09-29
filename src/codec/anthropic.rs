@@ -183,9 +183,9 @@ impl Reader for AnthropicReader {
         &self,
         event_type: &str,
         data: &Value,
-        _state: &mut StreamDecodeState,
+        state: &mut StreamDecodeState,
     ) -> Vec<IrStreamEvent> {
-        // Anthropic 流 1:1, 不需要 state (state 由 caller 持有但 ignored).
+        // Anthropic 流事件映射基本 1:1; state 仅用于跳过 block 的配对 stop (#282).
         match event_type {
             "message_start" => {
                 let message = data.get("message");
@@ -235,6 +235,9 @@ impl Reader for AnthropicReader {
                 if let Some(block) = block_meta {
                     vec![IrStreamEvent::BlockStart { index, block }]
                 } else {
+                    // 未建模 block 类型 (thinking / image / ...): 登记 index, 供
+                    // content_block_stop 配对跳过 (#282, 见 stop 分支).
+                    state.dropped_block_starts.insert(index);
                     Vec::new()
                 }
             }
@@ -270,7 +273,15 @@ impl Reader for AnthropicReader {
                     .and_then(Value::as_u64)
                     .map(|n| (n as usize).min(1023))
                     .unwrap_or(0);
-                vec![IrStreamEvent::BlockStop { index }]
+                // reader 侧配对过滤 (#282): BlockStart 被跳过的 index (见 start 分支
+                // 登记) 其 stop 同步跳过 — 否则孤儿 BlockStop 在同协议 restore 模式下
+                // 直通 wire 成未配对 content_block_stop (流头部即违约). remove 而非
+                // contains: stop 后清除, 状态不累积 (index 在单消息内不复用).
+                if state.dropped_block_starts.remove(&index) {
+                    Vec::new()
+                } else {
+                    vec![IrStreamEvent::BlockStop { index }]
+                }
             }
             "message_delta" => {
                 let delta = data.get("delta");
@@ -509,9 +520,12 @@ impl Writer for AnthropicWriter {
                 IrBlockMeta::ReasoningContent => {
                     // 跳过: thinking block 需 signature, 无法合法合成 (伪造会被
                     // Anthropic API 拒收). 裁决 rationale 见 codec/AGENTS.md 支持矩阵.
-                    // 同 index 的 BlockStop 由 StreamTranslate 的跳过 block 配对过滤
-                    // 兜底 (跨协议模式, stream/translate.rs) — 不产生未配对的
-                    // content_block_stop.
+                    // 同 index BlockStop 的配对一致性由两个**不同机制**保证 (勿混淆):
+                    // - 跨协议 (o→a / r→a): StreamTranslate 的跳过 block 配对过滤
+                    //   (writer 侧, stream/translate.rs skipped_block_starts);
+                    // - 同协议 a→a restore: 本分支不可达 — Anthropic reader 对
+                    //   thinking BlockStart 根本不产 IR 事件 (read 侧丢弃, 其 stop
+                    //   由 reader 侧 dropped_block_starts 同步跳过, #282).
                     Vec::new()
                 }
                 IrBlockMeta::ToolUse { id, name } => vec![(
@@ -1876,6 +1890,48 @@ mod tests {
         let mut state = StreamDecodeState::default();
         let events = reader().read_response_events("ping", &data, &mut state);
         assert!(events.is_empty());
+    }
+
+    /// #282: 未建模 block 类型 (thinking / image / ...) 的 content_block_start 不产
+    /// BlockStart 事件, 其后同 index 的 content_block_stop 必须同步跳过 — 否则 IR
+    /// 事件流携带孤儿 BlockStop (同协议 restore 模式下直通 wire 成未配对
+    /// content_block_stop). 按 index 登记, 类型无关.
+    #[test]
+    fn stream_skipped_block_start_pairs_its_stop() {
+        let mut state = StreamDecodeState::default();
+        // thinking block 的 start/delta 均不产事件 (未建模类型).
+        let start = json!({
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "thinking", "thinking": ""}
+        });
+        assert!(
+            reader()
+                .read_response_events("content_block_start", &start, &mut state)
+                .is_empty()
+        );
+        let delta = json!({
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": "..."}
+        });
+        assert!(
+            reader()
+                .read_response_events("content_block_delta", &delta, &mut state)
+                .is_empty()
+        );
+        // 同 index 的 stop 同步跳过 (修复前无条件产出 → 孤儿 BlockStop).
+        let stop = json!({"type": "content_block_stop", "index": 0});
+        assert!(
+            reader()
+                .read_response_events("content_block_stop", &stop, &mut state)
+                .is_empty(),
+            "skipped BlockStart must also skip its BlockStop (#282 orphan stop)"
+        );
+        // 非 dropped index 的 stop 不受影响 (1:1 产出, 与既有行为一致).
+        let stop_other = json!({"type": "content_block_stop", "index": 1});
+        assert_eq!(
+            reader().read_response_events("content_block_stop", &stop_other, &mut state),
+            vec![IrStreamEvent::BlockStop { index: 1 }]
+        );
     }
 
     // ─── Image block: 多模态唯一通路 (read + write) ─────────────────────
