@@ -35,7 +35,15 @@
   跨协议 golden `cross_proto_reasoning_golden_o_to_a_to_o` + 投影 property
   (`fwd_property.rs`). 已知有损: Budget 连续→6档离散 / Adaptive→o 投影 Medium /
   Disabled→o 无字段; Anthropic writer budget clamp 到 `max_tokens-1`
-  (`clamp_thinking_budget`). 响应侧思考原文 (reasoning_content) 不在此列 (见上条).
+  (`clamp_thinking_budget`, 仅显式小 max_tokens 场景). **thinking 注入联动**
+  (T6 两项用户裁决, 2026-09-30; `codec::apply_thinking_linkage`, cross_proto
+  seam extra 清空后调用, 同协议路径不经此): ① 注入 thinking (Effort/Budget/
+  Adaptive 写出到 Anthropic) 时采样参数 (temperature/top_p/top_k) 不翻译 +
+  forced tool_choice 优先于 thinking (冲突时跳过注入 + WARN, 采样参数恢复翻译);
+  ② 缺省 max_tokens 正交预算合成 = `thinking_budget + 4096` (Adaptive/Disabled/
+  缺省维持 4096); property `prop_cross_proto_thinking_budget_always_below_max_tokens`.
+  决策依据与边界详见 `docs/known-limitations.md` codec 节采样联动条目.
+  响应侧思考原文 (reasoning_content) 不在此列 (见上条).
 - ✅ Responses 流式 SSE 事件翻译 (2026-09-23 落地, reader + writer 双侧):
   reader (`read_response_events`) 把 SSE 事件映射为 IR 事件流, writer
   (`write_response_event`) 从 IR 事件序列合成合法 Responses SSE (done 族帧的全量

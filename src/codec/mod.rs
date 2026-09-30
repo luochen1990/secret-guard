@@ -178,7 +178,105 @@ pub trait Writer: Send + Sync {
 
 /// 跨协议时若目标协议要求 max_tokens 而 IR 缺失, 注入的默认值.
 /// 4096 是所有主流 chat 模型都能接受的输出上限 (Anthropic 文档示例值).
+/// 在正交预算模型 (T6 裁决②, 2026-09-30) 中语义细化为 "**非思考**输出的默认
+/// 长度" — 注入 thinking 预算时缺省 max_tokens = thinking_budget + 本值
+/// (见 [`apply_thinking_linkage`]).
 pub const DEFAULT_MAX_TOKENS: u32 = 4096;
+
+/// 跨协议 seam 的 thinking 注入联动 (T6 两项用户裁决, 2026-09-30; 竞品先例
+/// cc-switch `transform_codex_anthropic.rs:369-376` / LiteLLM 2025 同款修复).
+///
+/// 仅 egress = Anthropic 时生效 (其他协议 no-op); 由 `proxy/cross_proto.rs`
+/// seam 在 extra 清空**之后**调用 (依赖 "extra 不含 thinking" 的后置条件 —
+/// first-class 注入必然发生, 与 anthropic writer 的注入判定一致); 同协议路径
+/// (same_proto redact) **不经此函数**, 采样参数经 first-class round-trip
+/// 原样保真 (FWD-1 同协议零触碰).
+///
+/// # 裁决① 采样参数联动
+///
+/// 网关**注入** thinking (IrReasoning 以 Effort/Budget/Adaptive 形态写出到
+/// Anthropic) 时: `temperature` / `top_p` / `top_k` 不写入 egress 请求 —
+/// Anthropic 对 "thinking × 非默认采样参数" 历史上执行 400 (模型版本松紧不同,
+/// 现状证据见 known-limitations codec 节采样联动条目). 不做值域判断 (如
+/// top_p ≥ 0.95 放行) — 缺省形态恒合法且前缀缓存等价, 分支逻辑无收益.
+/// forced tool_choice (`Required` / `Tool` — 客户端显式意图, 且 tools 非空
+/// 才会上 egress wire) **优先于** thinking (网关增值注入): 冲突时跳过注入
+/// (`reasoning` 置 None) + WARN, 且采样参数随 thinking 关闭恢复翻译 —
+/// 宁可关思考, 保 tool 语义.
+/// (边界注记: 官方文档 adaptive × forced tool use 兼容, 仅 enabled 形态冲突 —
+/// 本函数对 Adaptive 同样保守跳过, 不依赖模型版本差异的兼容面; 该分支当前
+/// **生产不可达** (o/r reader 只产 Effort, Adaptive 仅 a reader 产生且 a→a
+/// same-proto 不经本函数), 现实影响为零; 若未来 reader 读出跨协议可达的
+/// adaptive 形态, 再评估收窄到 Effort/Budget.)
+///
+/// # 裁决② max_tokens 正交预算合成
+///
+/// 思考预算 ⊥ 输出长度预算, `max_tokens = 两者之和`; 4096 (非思考输出的默认
+/// 长度) = [`DEFAULT_MAX_TOKENS`]. 缺省注入值 = `thinking_budget + 4096`
+/// (Effort 查表值 / Budget 原值; `saturating_add` 吸收 `Budget(u32::MAX)`
+/// 病态值); 无 thinking 预算 (Disabled / 缺省 / Adaptive — adaptive 自管预算
+/// 无 budget_tokens 字段, 不受 budget < max 约束) 时维持 4096 不变.
+/// 显式 max_tokens 不在此路径 — anthropic writer 的 `clamp_thinking_budget`
+/// 硬校验 (budget = min(budget, max-1)) 保留不动: 用户显式约束了总和,
+/// 思考预算装不下就夹紧 (病态透传 400 的既有语义).
+///
+/// # 职责分工 (seam vs writer)
+///
+/// 合成规则 + 联动清理是**翻译语义** → 本函数 (seam 调用, 供 property test
+/// 复用同一 SSOT); anthropic writer 只做硬校验 clamp. 本函数对 `ir` 的修改
+/// (reasoning/采样参数置 None, max_tokens 合成) 会随后的 ingress 视图序列化
+/// 一并反映 — record 是 "LLM 看到的版本" (egress 真实语义), 与此一致.
+pub fn apply_thinking_linkage(ir: &mut IrRequest, egress: Protocol) {
+    if egress != Protocol::Anthropic {
+        return;
+    }
+    // thinking 会被注入为 Anthropic thinking 字段的形态 (Disabled 只写显式关闭,
+    // 不构成 "注入" — 与采样参数无冲突).
+    let injects_thinking = matches!(
+        ir.reasoning,
+        Some(IrReasoning::Effort(_)) | Some(IrReasoning::Budget(_)) | Some(IrReasoning::Adaptive)
+    );
+    // ① forced tool_choice 优先: tools 非空才会上 egress wire (writer gate 同型),
+    // 空 tools 请求的 tool_choice 本就被丢弃, 不构成冲突.
+    let forced_tool_choice = !ir.tools.is_empty()
+        && matches!(
+            ir.tool_choice,
+            Some(IrToolChoice::Required) | Some(IrToolChoice::Tool { .. })
+        );
+    if injects_thinking && forced_tool_choice {
+        tracing::warn!(
+            tool_choice = ?ir.tool_choice,
+            "forced tool_choice conflicts with cross-protocol thinking injection; \
+             skipping thinking injection to preserve tool semantics \
+             (sampling params translate normally with thinking off)"
+        );
+        ir.reasoning = None;
+    } else if injects_thinking {
+        // ② 注入 thinking → 采样参数不翻译 (Anthropic "thinking × 非默认采样" 400).
+        // 日志级别取舍: 这是联动后的**常态行为** (非异常信号, 缺省形态是上游最稳
+        // 形态且前缀缓存等价), 用 debug! 避免 per-request 噪音; 排障另有 record
+        // (ingress 视图与 egress 语义一致, 采样参数消失如实可见)。此处早于
+        // record push, 无 record_id 可关联 — 与 writer 侧 clamp WARN 同型的取舍.
+        if ir.temperature.is_some() || ir.top_p.is_some() || ir.top_k.is_some() {
+            tracing::debug!(
+                "dropping sampling params (temperature/top_p/top_k) alongside \
+                 injected thinking for Anthropic egress (T6 裁决①)"
+            );
+        }
+        ir.temperature = None;
+        ir.top_p = None;
+        ir.top_k = None;
+    }
+    // ③ 缺省 max_tokens 正交预算合成 (显式值不动, writer clamp 兜底).
+    if ir.max_tokens.is_none() {
+        let thinking_budget = match ir.reasoning {
+            Some(IrReasoning::Effort(e)) => e.budget_tokens(),
+            Some(IrReasoning::Budget(n)) => n,
+            _ => 0,
+        };
+        ir.max_tokens = Some(thinking_budget.saturating_add(DEFAULT_MAX_TOKENS));
+    }
+}
 
 // ─── 内部共享 helpers (供 OpenAI / Anthropic reader/writer 复用) ────────────
 

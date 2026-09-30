@@ -1177,6 +1177,125 @@ async fn cross_protocol_anthropic_requires_max_tokens_injected() {
     assert_eq!(status, reqwest::StatusCode::OK);
 }
 
+// ─── T6 裁决 (2026-09-30): 生产 seam 接线的端到端锁定 (M1 集成守卫) ─────────
+//
+// codec 层的联动测试 (fwd_property.rs) 手动调 `apply_thinking_linkage` (镜像),
+// 不经过生产 seam — 删除/错序 cross_proto_forward 里的调用会让 codec 测试依然
+// 全绿而生产行为回退。本组测试经真实 dispatch 路径锁定接线本身 (调用存在且在
+// extra 清空之后)。变异自验已于 2026-09-30 执行 (注释掉 seam 调用 → 本组红;
+// 恢复 → 绿), 记录见 PR #295 评论.
+
+/// 捕获上游收到的请求 body (JSON) 并回放固定 Anthropic 非流式响应 — mockito 的
+/// `PartialJson` 只能正向子集匹配, "字段缺席" 断言 (如联动 drop 的 temperature)
+/// 需要拿到真实 body; 自建 axum upstream 先例见 pool_failover / router_models.
+/// 返回 (base_url, 捕获句柄) — handler 先 push 再回响应, proxy_request 返回时
+/// 捕获已就位.
+async fn spawn_capturing_anthropic_upstream() -> (
+    String,
+    std::sync::Arc<parking_lot::Mutex<Vec<serde_json::Value>>>,
+) {
+    let captured = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let sink = captured.clone();
+    let app = axum::Router::new().route(
+        "/v1/messages",
+        axum::routing::post(move |body: String| {
+            let sink = sink.clone();
+            async move {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                    sink.lock().push(v);
+                }
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    r#"{"id":"msg_x","type":"message","role":"assistant","content":[{"type":"text","text":"OK"}],"model":"claude","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}"#,
+                )
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}"), captured)
+}
+
+/// 裁决① + 裁决② 端到端 (o ingress → a egress): 客户端带 `reasoning_effort:"high"`
+/// + `temperature` (无显式 max_tokens) → 上游收到的 body **无 temperature** (联动
+/// drop) / `thinking` budget 8192 足额 / `max_tokens` = 8192 + 4096 = 12288
+/// (正交预算合成 — 旧行为 4096 + budget 被 clamp 到 4095).
+#[tokio::test]
+async fn cross_protocol_thinking_linkage_drops_sampling_and_synth_max_tokens() {
+    let (base, captured) = spawn_capturing_anthropic_upstream().await;
+    let provider = provider_with("an-main", Protocol::Anthropic, &base);
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+    let body = r#"{"model":"gpt-5","messages":[{"role":"user","content":"Hi"}],"reasoning_effort":"high","temperature":0.7}"#;
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/an-main/v1/chat/completions",
+        body,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let upstream_body = captured
+        .lock()
+        .first()
+        .cloned()
+        .expect("上游应收到一个请求");
+    assert!(
+        upstream_body.get("temperature").is_none(),
+        "裁决①: 注入 thinking 时 temperature 不得上 egress wire: {upstream_body}"
+    );
+    assert_eq!(
+        upstream_body.get("max_tokens"),
+        Some(&serde_json::json!(12288))
+    );
+    assert_eq!(
+        upstream_body.get("thinking"),
+        Some(&serde_json::json!({"type": "enabled", "budget_tokens": 8192})),
+        "裁决②: budget 必须足额 (旧行为被 clamp 到 4095)"
+    );
+}
+
+/// 裁决① forced tool_choice 优先 (端到端): `tool_choice:"required"` + effort →
+/// thinking 缺席 (跳过注入), `tool_choice:{"type":"any"}` 上 wire, temperature
+/// 随 thinking 关闭恢复翻译.
+#[tokio::test]
+async fn cross_protocol_forced_tool_choice_skips_thinking_end_to_end() {
+    let (base, captured) = spawn_capturing_anthropic_upstream().await;
+    let provider = provider_with("an-main", Protocol::Anthropic, &base);
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+    let body = r#"{"model":"gpt-5","messages":[{"role":"user","content":"Hi"}],"reasoning_effort":"high","temperature":0.7,"tools":[{"type":"function","function":{"name":"t","parameters":{"type":"object"}}}],"tool_choice":"required"}"#;
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/an-main/v1/chat/completions",
+        body,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let upstream_body = captured
+        .lock()
+        .first()
+        .cloned()
+        .expect("上游应收到一个请求");
+    assert!(
+        upstream_body.get("thinking").is_none(),
+        "forced tool_choice 优先: thinking 必须缺席: {upstream_body}"
+    );
+    assert_eq!(
+        upstream_body.get("tool_choice"),
+        Some(&serde_json::json!({"type": "any"}))
+    );
+    assert_eq!(
+        upstream_body.get("temperature"),
+        Some(&serde_json::json!(0.7)),
+        "thinking 关闭后采样参数恢复翻译: {upstream_body}"
+    );
+}
+
 #[tokio::test]
 async fn cross_protocol_translates_tools_and_tool_use_round_trip() {
     // OpenAI tools/tool_calls/tool messages → Anthropic tools/tool_use/tool_result 完整往返.

@@ -320,6 +320,15 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
   剩余损失: o-origin 思考原文跨到 Anthropic 丢弃 (o 无 opaque 容器), 任何 origin 的
   thinking/opaque 跨到 OpenAI Chat 时 opaque 丢弃 (o 无容器, 正文保留为
   reasoning_content) — 均有 WARN 计数 (`cross_proto.rs::count_reasoning_blocks`).
+- **thinking 注入联动** (T6 用户裁决, 2026-09-30; 损失清单精确化, 不改 FWD-3 语义框架 —
+  属第 1 层 "建模范围内语义保留" 的显式登记例外): 跨协议翻译**注入** thinking
+  (IrReasoning 以 Effort/Budget/Adaptive 写出到 Anthropic) 时, 已建模的采样参数
+  (`temperature`/`top_p`/`top_k`) **不翻译** (Anthropic "thinking × 非默认采样" 上游 400,
+  网关增值注入不得引入回归); forced tool_choice (客户端显式意图) 优先 — 冲突时跳过
+  thinking 注入 + WARN, 采样参数恢复翻译。同协议路径零触碰 (FWD-1 管辖, 等式不受影响)。
+  配套缺省 max_tokens 合成 (正交预算: `thinking_budget + 4096`) 是注入语义的组成部分,
+  非 "不算损失" 的缺省注入扩展。语义 SSOT 与决策依据 (竞品先例 cc-switch/LiteLLM) 见
+  `docs/known-limitations.md` codec 节采样联动条目与 `codec::apply_thinking_linkage` 头注。
 - citations / logprobs 不建模, 丢弃.
 - prompt caching 字段不建模, 丢弃.
 - usage 只保留 input/output 总数 + cache_read/cache_creation 4 个字段, 细分字段丢弃.
@@ -329,6 +338,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 - `prop_cross_proto_modeled_fields_preserved`: 建模范围内的字段 (messages/tools/tool_use/tool_result/usage 总数/stop_reason) 跨协议 round-trip 后保留. 🔁→`prop_cross_proto_modeled_fields_preserved_openai_to_anthropic` + `prop_cross_proto_modeled_fields_preserved_anthropic_to_openai` (`src/codec/fwd_cross_proto_property.rs`)
 - `prop_cross_proto_stream_content_fidelity` (2026-09-15, 流式半段; 2026-09-23 起覆盖 Responses 任一侧): 跨协议流式翻译 (StreamTranslate 跨协议模式, 任意 chunk 切分含 1-byte) 内容保真 — text / tool input 拼接相等, tool_use id/name 保真, usage output_tokens 透传; wire 帧顺序合法性由确定性单测守卫 (双方向: Anthropic ingress 的 message_delta-before-message_stop + 跳过 block 配对, OpenAI ingress 的 content-before-finish_reason + restore 尾部及时冲刷). Responses 组合 (r→o / o→r / r→a / a→r + r→o 1-byte) 覆盖 Responses reader 状态机跨 chunk 稳定性 + Responses writer 有状态合成 (item+part 两帧 / done 族全量帧 / deferred stop). 🔁→`prop_cross_proto_stream_openai_to_anthropic` + `prop_cross_proto_stream_byte_by_byte_openai_to_anthropic` + `prop_cross_proto_stream_byte_by_byte_anthropic_to_openai` + `prop_cross_proto_stream_responses_to_openai` + `prop_cross_proto_stream_openai_to_responses` + `prop_cross_proto_stream_responses_to_anthropic` + `prop_cross_proto_stream_anthropic_to_responses` + `prop_cross_proto_stream_byte_by_byte_responses_to_openai` + `cross_proto_reasoning_block_yields_no_unpaired_block_stop` + `cross_proto_defers_message_stop_until_post_stop_usage` + `cross_proto_flushes_pending_stop_at_finish_without_usage_chunk` + `cross_proto_openai_ingress_flushes_skipped_block_tail_before_finish_reason`
 - `prop_cross_proto_unmodeled_fields_explicitly_dropped`: 范围外字段 (如 reasoning_content) 不出现在 egress wire (T7 精确化: 仅 o→a 方向 — o-origin 思考原文在 Anthropic egress 丢弃; o→r 方向经 envelope 保留属 STR-6 建模范围). ✅
+- `prop_cross_proto_thinking_budget_always_below_max_tokens` (T6 裁决②, 2026-09-30): 任意 IrReasoning × max_tokens 显隐组合, 经 seam 联动 (`codec::apply_thinking_linkage`, 与生产同一 SSOT) + Anthropic writer 后, egress wire 恒满足 `max_tokens ≥ 1` 且 `budget_tokens < max_tokens` (当 budget 存在) — 缺省路径由正交合成保证, 显式路径由 writer clamp 保证, `Budget(u32::MAX)` 病态值由 saturating_add + clamp 联合吸收; 域排除: 显式 max_tokens=0 (三协议 reader 均按 `n>0` 过滤视为缺省, 仅内部构造可达的 GIGO 病态输入) 不在生成域. ✅
 - `prop_cross_proto_extra_cleared`: 跨协议路径下 ingress IR 的 extra 字段必须清空, 不允许源协议独有字段泄漏到 egress. ✅
 - `prop_documented_semantic_loss_list`: 所有已知的语义损失点必须在 `src/codec/AGENTS.md` 显式列出 (人工审查项). ✅
 

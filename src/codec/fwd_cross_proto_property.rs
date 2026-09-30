@@ -215,7 +215,9 @@ proptest! {
         // 与生产一致: 清空 extra + wire_fidelity.
         ir_in.extra.clear();
         ir_in.clear_wire_fidelity();
-        // 写 egress + max_tokens 注入 (Anthropic 必填).
+        // 与生产一致: thinking 联动 (含缺省 max_tokens 正交预算合成, T6 裁决②;
+        // 本测试生成器无 reasoning → 恒 4096) + 必填协议通用兜底.
+        crate::codec::apply_thinking_linkage(&mut ir_in, crate::codec::Protocol::Anthropic);
         if ir_in.max_tokens.is_none() {
             ir_in.max_tokens = Some(crate::codec::DEFAULT_MAX_TOKENS);
         }

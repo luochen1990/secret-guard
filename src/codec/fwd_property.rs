@@ -167,20 +167,7 @@ proptest! {
     /// 单测锁定).
     #[test]
     fn cross_proto_reasoning_ir_writes_both_wire_forms(reasoning in arb_ir_reasoning()) {
-        let ir = crate::codec::ir::IrRequest {
-            model: "m".to_string(),
-            messages: vec![crate::codec::ir::IrMessage {
-                role: crate::codec::ir::IrRole::User,
-                content: vec![crate::codec::ir::IrBlock::Text {
-                    text: "hi".to_string(),
-                    extra: Default::default(),
-                }],
-                ..Default::default()
-            }],
-            max_tokens: Some(65536),
-            reasoning: Some(reasoning),
-            ..Default::default()
-        };
+        let ir = ir_with(Some(reasoning), Some(65536));
 
         // o writer: to_effort 投影 (Disabled → 不写字段).
         let o_wire = OpenAiWriter.write_request(&ir);
@@ -261,6 +248,40 @@ proptest! {
             Some(&json!(projected.budget_tokens()))
         );
     }
+
+    /// T6 裁决② (2026-09-30) 的 property 守卫: 任意 IrReasoning × max_tokens
+    /// 显隐组合, 经 seam 联动 + Anthropic writer 后的 egress wire 恒满足
+    /// Anthropic 约束 — max_tokens 恒存在且 ≥ 1; thinking 带 budget_tokens 时
+    /// 恒有 budget < max_tokens (缺省路径由正交合成保证; 显式路径由 writer
+    /// clamp 保证; Budget(u32::MAX) 病态值由 saturating_add + clamp 联合吸收).
+    /// 域排除: 显式 max_tokens=0 不在生成域 — 三协议 reader 均按 `n > 0` 过滤
+    /// (0 视为缺省), Some(0) 只能由内部构造产生, 属 GIGO 病态输入.
+    #[test]
+    fn prop_cross_proto_thinking_budget_always_below_max_tokens(
+        reasoning in arb_ir_reasoning(),
+        max_tokens in prop_oneof![
+            Just(None),
+            Just(Some(1u32)),
+            Just(Some(1024u32)),
+            Just(Some(1025u32)),
+            (2u32..100_000).prop_map(Some),
+            Just(Some(u32::MAX)),
+        ],
+    ) {
+        let wire = a_egress(ir_with(Some(reasoning), max_tokens));
+        let mt = wire
+            .get("max_tokens")
+            .and_then(Value::as_u64)
+            .expect("Anthropic egress 恒有 max_tokens");
+        prop_assert!(mt >= 1, "max_tokens 必须 ≥ 1, got {mt}");
+        if let Some(budget) = wire
+            .get("thinking")
+            .and_then(|t| t.get("budget_tokens"))
+            .and_then(Value::as_u64)
+        {
+            prop_assert!(budget < mt, "budget {budget} 必须 < max_tokens {mt}");
+        }
+    }
 }
 
 /// IrReasoning 生成器 (roadmap A1): 4 variant × Budget 宽域 (0 / 1024..40000 /
@@ -326,6 +347,255 @@ fn cross_proto_reasoning_golden_o_to_a_to_o() {
     ir2.clear_wire_fidelity();
     let o_wire = OpenAiWriter.write_request(&ir2);
     assert_eq!(o_wire.get("reasoning_effort"), Some(&json!("high")));
+}
+
+// ─── T6 裁决 (2026-09-30): thinking 注入联动 + max_tokens 正交预算 ──────────
+//
+// 契约: FWD-3 "thinking 注入联动" 注记 (用户裁决 2026-09-30, T6 遗留两项;
+// 竞品先例 cc-switch transform_codex_anthropic.rs:369-376 / LiteLLM 2025
+// 同款修复). 联动 SSOT = `codec::apply_thinking_linkage` — 生产 seam
+// (`cross_proto_forward`) 与本组测试共用同一函数, 无镜像漂移.
+
+/// 模拟生产 cross_proto seam 的请求侧变换 (o ingress → a egress): 与
+/// `cross_proto_forward` 一致地执行 extra 清空 + wire_fidelity 清空 + thinking
+/// 联动 (步骤 4-5), 再走 egress writer 写出 (步骤 8; seam 的其余步骤是
+/// redact / record / 上游发送, 不影响 egress wire 形态).
+fn o_to_a_egress(wire: Value) -> Value {
+    let ir = OpenAiReader.read_request(&wire).unwrap();
+    a_egress(ir)
+}
+
+/// 直接 IR 形态的 a-egress seam 模拟 (与 [`o_to_a_egress`] 同型, 入口是 IR 而非
+/// wire; fresh IR 的 clear 是 no-op, 保留以与生产 seam 步骤严格同形).
+fn a_egress(mut ir: crate::codec::ir::IrRequest) -> Value {
+    ir.extra.clear();
+    ir.clear_wire_fidelity();
+    crate::codec::apply_thinking_linkage(&mut ir, crate::codec::Protocol::Anthropic);
+    AnthropicWriter.write_request(&ir)
+}
+
+/// 最小 IR 骨架 (直接构造 — Adaptive/Budget 两个 variant 的 o reader 产不出,
+/// top_k 亦为 Anthropic 独有).
+fn ir_with(reasoning: Option<IrReasoning>, max_tokens: Option<u32>) -> crate::codec::ir::IrRequest {
+    crate::codec::ir::IrRequest {
+        messages: vec![crate::codec::ir::IrMessage {
+            role: crate::codec::ir::IrRole::User,
+            content: vec![crate::codec::ir::IrBlock::Text {
+                text: "hi".to_string(),
+                extra: Default::default(),
+            }],
+            ..Default::default()
+        }],
+        model: "m".to_string(),
+        max_tokens,
+        reasoning,
+        ..Default::default()
+    }
+}
+
+/// 裁决② 缺省合成 (正交预算模型): 思考预算 ⊥ 输出长度预算,
+/// max_tokens = thinking_budget + 4096 (4096 = 非思考输出的默认长度);
+/// 无 thinking (缺省) 时维持 4096 不变.
+/// (回归锚点: 旧行为注入 4096 会把 High 档 budget clamp 到 4095 — 本测试
+/// 锁定其不再发生.)
+#[test]
+fn cross_proto_thinking_linkage_default_max_tokens_orthogonal_budget() {
+    // 缺省 + reasoning_effort "high" → max_tokens = 8192 + 4096 = 12288, budget 足额.
+    let egress = o_to_a_egress(json!({
+        "model": "gpt-5",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "high",
+    }));
+    assert_eq!(
+        egress.get("max_tokens"),
+        Some(&json!(8192 + 4096)),
+        "got {}",
+        normalize_json(&egress)
+    );
+    assert_eq!(
+        egress.get("thinking"),
+        Some(&json!({"type": "enabled", "budget_tokens": 8192})),
+        "budget 必须足额 (旧行为被 clamp 到 4095)"
+    );
+    // 缺省 + 无 reasoning → 维持 4096, 无 thinking 字段.
+    let egress = o_to_a_egress(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "hi"}],
+    }));
+    assert_eq!(egress.get("max_tokens"), Some(&json!(4096)));
+    assert!(egress.get("thinking").is_none());
+}
+
+/// 裁决② 缺省合成的 Adaptive / Budget 形态 (直接 IR): Adaptive 自管预算
+/// (无 budget_tokens 字段, 不受 budget<max 约束) → 维持 4096; Budget(n) → n+4096.
+#[test]
+fn cross_proto_thinking_linkage_adaptive_and_budget_forms() {
+    let wire = a_egress(ir_with(Some(IrReasoning::Adaptive), None));
+    assert_eq!(wire.get("max_tokens"), Some(&json!(4096)));
+    assert_eq!(wire.get("thinking"), Some(&json!({"type": "adaptive"})));
+
+    let wire = a_egress(ir_with(Some(IrReasoning::Budget(6000)), None));
+    assert_eq!(wire.get("max_tokens"), Some(&json!(6000 + 4096)));
+    assert_eq!(
+        wire.get("thinking"),
+        Some(&json!({"type": "enabled", "budget_tokens": 6000}))
+    );
+}
+
+/// 裁决② 显式路径: 客户端显式给了 max_tokens → 尊重显式值, writer 的
+/// `clamp_thinking_budget` 硬校验 (budget = min(budget, max-1)) 保留不动 —
+/// 用户显式约束了总和, 思考预算装不下就夹紧.
+#[test]
+fn cross_proto_thinking_linkage_explicit_max_tokens_keeps_clamp() {
+    let egress = o_to_a_egress(json!({
+        "model": "gpt-5",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "high",
+        "max_tokens": 5000,
+    }));
+    assert_eq!(egress.get("max_tokens"), Some(&json!(5000)));
+    assert_eq!(
+        egress.get("thinking"),
+        Some(&json!({"type": "enabled", "budget_tokens": 4999}))
+    );
+}
+
+/// 裁决① 采样参数联动: 跨协议注入 thinking 时 temperature/top_p/top_k 不上
+/// egress wire (Anthropic 对 "thinking × 非默认采样参数" 400, 模型版本松紧不同);
+/// 未注入 thinking (无 reasoning) 时采样参数翻译行为完全不变 (clamp 语义照旧).
+#[test]
+fn cross_proto_thinking_injection_drops_sampling_params() {
+    // 注入 thinking → 采样参数不上 egress wire.
+    let egress = o_to_a_egress(json!({
+        "model": "gpt-5",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "high",
+        "temperature": 0.7,
+        "top_p": 0.9,
+    }));
+    assert!(
+        egress.get("temperature").is_none(),
+        "temperature 不得上 egress wire: {}",
+        normalize_json(&egress)
+    );
+    assert!(egress.get("top_p").is_none());
+    // 反例 (未注入): 无 reasoning → 采样参数照常翻译.
+    let egress = o_to_a_egress(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "hi"}],
+        "temperature": 0.7,
+        "top_p": 0.9,
+    }));
+    assert_eq!(egress.get("temperature"), Some(&json!(0.7)));
+    assert_eq!(egress.get("top_p"), Some(&json!(0.9)));
+    // top_k (Anthropic 独有, o reader 不产 — 直接 IR): 注入时同样不上 wire,
+    // 未注入时保真.
+    let mut ir = ir_with(Some(IrReasoning::Effort(IrReasoningEffort::High)), None);
+    ir.top_k = Some(40);
+    assert!(a_egress(ir).get("top_k").is_none());
+    let mut ir = ir_with(None, None);
+    ir.top_k = Some(40);
+    assert_eq!(a_egress(ir).get("top_k"), Some(&json!(40)));
+    // Disabled 边界: 只写显式关闭, 不构成 "注入" — 采样参数照常翻译 (与
+    // Auto/none 的 tool_choice 同为 "无冲突" 判定的反例锚点).
+    let mut ir = ir_with(Some(IrReasoning::Disabled), None);
+    ir.temperature = Some(0.7);
+    let wire = a_egress(ir);
+    assert_eq!(wire.get("thinking"), Some(&json!({"type": "disabled"})));
+    assert_eq!(wire.get("temperature"), Some(&json!(0.7)));
+}
+
+/// 裁决① 同协议守卫: a→a redact 路径不经 seam 联动, 采样参数 + thinking
+/// (extra 原样回写) normalize round-trip 相等 — 同协议零触碰.
+#[test]
+fn same_proto_anthropic_sampling_params_round_trip_with_thinking() {
+    let wire = json!({
+        "model": "claude-x",
+        "max_tokens": 40000,
+        "temperature": 0.5,
+        "top_p": 0.95,
+        "top_k": 40,
+        "thinking": {"type": "enabled", "budget_tokens": 8192},
+        "messages": [{"role": "user", "content": "hi"}],
+    });
+    // same_proto 路径形状: reader → writer (无 extra 清空 / 无联动; redact 只动
+    // 字符串叶子, 此处无 secret 等价直通).
+    let ir = AnthropicReader.read_request(&wire).unwrap();
+    let out = AnthropicWriter.write_request(&ir);
+    assert_eq!(
+        normalize_json(&wire),
+        normalize_json(&out),
+        "a→a redact 路径采样参数/thinking 必须原样保真"
+    );
+    // 显式断言关键字段在 wire 上 (防 normalize 相等掩盖双双丢失).
+    assert_eq!(out.get("temperature"), Some(&json!(0.5)));
+    assert_eq!(out.get("top_p"), Some(&json!(0.95)));
+    assert_eq!(out.get("top_k"), Some(&json!(40)));
+    assert_eq!(
+        out.get("thinking"),
+        Some(&json!({"type": "enabled", "budget_tokens": 8192}))
+    );
+}
+
+/// 裁决① forced tool_choice 优先于 thinking: 强制 tool_choice (required /
+/// 指定函数 — 客户端显式意图) 与注入 thinking 冲突时跳过注入 (宁可关思考,
+/// 保 tool 语义), 且采样参数随 thinking 关闭恢复翻译 (cc-switch 同款);
+/// auto / none 不构成冲突, thinking 照常注入.
+#[test]
+fn cross_proto_forced_tool_choice_wins_over_thinking_injection() {
+    let tools = json!([{
+        "type": "function",
+        "function": {"name": "t", "parameters": {"type": "object"}}
+    }]);
+    let base = json!({
+        "model": "gpt-5",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": tools,
+        "reasoning_effort": "high",
+        "temperature": 0.7,
+    });
+    let with_tc = |tc: Value| {
+        let mut w = base.clone();
+        w["tool_choice"] = tc;
+        o_to_a_egress(w)
+    };
+    // required → 跳过 thinking, 采样参数恢复.
+    let egress = with_tc(json!("required"));
+    assert_eq!(egress.get("tool_choice"), Some(&json!({"type": "any"})));
+    assert!(
+        egress.get("thinking").is_none(),
+        "{}",
+        normalize_json(&egress)
+    );
+    assert_eq!(egress.get("temperature"), Some(&json!(0.7)));
+    // 指定函数 (Tool) 同型.
+    let egress = with_tc(json!({"type": "function", "function": {"name": "t"}}));
+    assert_eq!(
+        egress.get("tool_choice"),
+        Some(&json!({"type": "tool", "name": "t"}))
+    );
+    assert!(egress.get("thinking").is_none());
+    // auto / none 不触发跳过 (thinking 照常注入, 采样参数联动照常生效).
+    for tc in [json!("auto"), json!("none")] {
+        let egress = with_tc(tc);
+        assert!(
+            egress.get("thinking").is_some(),
+            "auto/none 不是 forced, thinking 必须照常注入: {}",
+            normalize_json(&egress)
+        );
+        assert!(egress.get("temperature").is_none());
+    }
+    // forced 但请求本无 reasoning → 无 thinking 可跳, 行为同无联动.
+    let egress = o_to_a_egress(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": tools,
+        "tool_choice": "required",
+        "temperature": 0.7,
+    }));
+    assert_eq!(egress.get("tool_choice"), Some(&json!({"type": "any"})));
+    assert!(egress.get("thinking").is_none());
+    assert_eq!(egress.get("temperature"), Some(&json!(0.7)));
 }
 
 // ─── T7: thinking / encrypted_content passthrough (同协议保真 + a⇄r envelope) ─

@@ -107,18 +107,28 @@ pub(crate) async fn cross_proto_forward(
         model_rewrite.as_deref(),
     )?;
 
-    // 4. 若 egress 要求 max_tokens 而 IR 缺失, 注入默认值.
-    if egress_writer.requires_max_tokens() && ir.max_tokens.is_none() {
-        ir.max_tokens = Some(crate::codec::DEFAULT_MAX_TOKENS);
-    }
-
-    // 5. 清空 ingress-only 元数据:
+    // 4. 清空 ingress-only 元数据 (联动前移的前提 — 见步骤 5 注释):
     //    - extra: ingress-only 字段会泄漏到 egress, 一并清空. (注: Responses 的
     //      hosted tools 不在 extra — tools 是 modeled 字段被 collect_extra 排除,
     //      丢弃发生在 reader 读取时并在该处 WARN, 见 responses.rs read_request)
     //    - wire_fidelity (stop_form / content_form / tools_present): ingress wire 形态
     ir.extra.clear();
     ir.clear_wire_fidelity();
+
+    // 5. thinking 注入联动 (T6 两项用户裁决 2026-09-30, 实现收口在 codec 供
+    //    property test 复用同一 SSOT, 语义注记见函数头): egress=Anthropic 时
+    //    ① forced tool_choice 优先 — 冲突时跳过 thinking 注入 + WARN;
+    //    ② 注入 thinking 时采样参数 (temperature/top_p/top_k) 不翻译;
+    //    ③ 缺省 max_tokens 正交预算合成 (thinking_budget + DEFAULT_MAX_TOKENS,
+    //    无 thinking 预算时维持 4096). 必须在 extra 清空**之后**调用 — 联动的
+    //    "thinking 会被注入" 判定依赖 "extra 不含 thinking" 的后置条件 (与
+    //    anthropic writer 的注入判定一致). 同协议路径不经此 (FWD-1 零触碰).
+    crate::codec::apply_thinking_linkage(&mut ir, egress_codec);
+    // 通用兜底: 其余 "必填 max_tokens" 协议的缺省注入 (当前 codec 覆盖族内仅
+    // Anthropic, 已被 linkage 覆盖 — 保留 Writer trait 语义给未来协议).
+    if egress_writer.requires_max_tokens() && ir.max_tokens.is_none() {
+        ir.max_tokens = Some(crate::codec::DEFAULT_MAX_TOKENS);
+    }
 
     // 5.5 T9 (2026-09-30 用户裁决): Anthropic ingress 剥离 system 首 block 的
     //     billing 计费标记行 (源协议计费元数据, 对目标协议无语义对应; `cch=` 轮换值
