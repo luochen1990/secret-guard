@@ -10,6 +10,12 @@
 > master (PRs #286-#289, 各含回归守卫测试 + review 记录); 正文与 TL;DR 保留审计时点
 > (`8c8337e`) 的发现描述, **现状以汇总表与任务清单的状态标记为准**; T5-T10 待办。
 >
+> **状态更新 (2026-09-30 晚)**: T9 (billing header 剥离, #294) 已合入 master; T6 两项
+> 用户裁决 (采样联动 + max_tokens 正交预算, #295) 已实施 (审查 + M1 集成守卫 + 冲突
+> 解决, CI 中); T10 按裁决暂不实施保留观察。**审计任务的可执行部分 (T1-T9) 至此全部
+> 落地**, 剩余差距全景 (可领取 / 待裁决 / 观察 / 已接受边界 四类) 见文末「剩余差距
+> 全景 (2026-09-30 终评)」。
+>
 > **状态更新 (2026-09-30)**: **T1-T8 已全部实施并合入 master** — T5 合成 SSE (#291) /
 > T6 reasoning 配置映射 (#290) / T7 thinking passthrough (#293) / T8 媒体可观测化
 > (#292)。T7 的 STR-6 语义改写与 FWD-1 envelope 例外**已经用户 approve 授权**
@@ -60,7 +66,7 @@
 | 5 | stop_reason 双向映射 | **部分** (typed enum 优; Responses writer 半截) | **盲区** | Responses writer 不写 `incomplete_details.reason`, 自己的 reader 把它读回 Other — MaxTokens round-trip 有损。**状态**: 已修 (#289, status+reason 收敛单一 SSOT) |
 | 6 | usage cache 字段归类 | **部分** (IR 建模 + 三 reader 全对齐; OpenAI/Responses writer 丢 details) | **盲区** | `responses_usage_json` 还漏加 cache_creation (内部 SSOT 不一致); o/r ingress 客户端缓存核算失真。**状态**: 已修 (#288, details 写回 + 总和收敛 openai_prompt_tokens SSOT) |
 | 7 | 图片降级 (纯文本模型) | **无** | **有意忽略** | FWD-1 "上游不认可就让它失败, 网关不兜底" 明文裁决; 降级机制同 body_filter 属 body 改写不参考 (姊妹篇 §4.3/§4.2-A 已区分 "名单知识可吸收, 机制不吸收") |
-| 8 | billing header 剥离 | **无** (有认知: #269 测试明示该形态, 裁决按原位保留) | **需裁决** | 剥 = 删客户端字节 (撞 FWD-1 + 2026-09-23 cache_control 注入否决先例); 不剥 = 目标侧前缀缓存每轮全 miss (#2350 实证真实成本) |
+| 8 | billing header 剥离 | **无** (有认知: #269 测试明示该形态, 裁决按原位保留) | **需裁决** | 剥 = 删客户端字节 (撞 FWD-1 + 2026-09-23 cache_control 注入否决先例); 不剥 = 目标侧前缀缓存每轮全 miss (#2350 实证真实成本)。**状态**: 已裁决实施 (#294, T9 — 仅跨协议剥离, 定性为源协议计费元数据对齐 extra 丢弃精神; 同协议零触碰) |
 | 9 | 流/非流互通兜底 | **部分** (有 buffered 降级不崩; 无形态适配) | **盲区** + 需裁决-低 (反向) | stream=true 客户端最终拿到 JSON; 反向 (非流式收 SSE) 原样透传 — cc-switch 双向兜底, secret-guard 单向降级。**状态**: 前半已实施 (#291, T5 — 伪流式上游合成 SSE 生命周期, o/a/r 三 ingress + 同协议 redact; FWD-1 例外已登记); 反向 (= T10) 维持裁决-低 |
 
 ---
@@ -446,11 +452,40 @@ JSON 形态错配**" 的客户端影响未登记。
 | T3 | **usage cache 细节补齐** (维度 6): `responses_usage_json` 修 input_total 漏加 cache_creation + 写 `input_tokens_details.cached_tokens`; `openai_usage_json` 写 `prompt_tokens_details.cached_tokens` (= cache_read) | `src/codec/ir.rs` + `src/codec/responses/mod.rs` | ~25 | ✅ **已修** (#288 / issue #284) | known-limitations line 24 扩充至非流式 writer |
 | T4 | **Responses writer 补 `incomplete_details.reason`** (维度 5): `write_status_str` 升级为返回 (status, Option<reason>) 或并列 helper; 非流式 `write_response` 与流式终止事件 (stream.rs) 同步; round-trip 测试从 Other 恢复 MaxTokens/Safety | `src/codec/responses/mod.rs` + `src/codec/responses/stream.rs` | ~40 | ✅ **已修** (#289 / issue #285) | known-limitations line 26 ("Responses 流式方案 T2/T3" 条目) 扩充 |
 | T5 | **伪流式上游 → 合成 SSE 生命周期** (维度 9 前半): buffered 判型分支 (cross_proto + same_proto redact) 在 `ir.stream=true` 且翻译成功时, 把 IrResponse 重放为事件序列喂 ingress 流式 writer, 以 `text/event-stream` 返回; 失败路径回落现状 | `src/proxy/cross_proto.rs` + `src/proxy/same_proto.rs` + `src/proxy/fan_out.rs` (新 helper) | ~80-120 | ✅ **已实施** (#291, T5) | known-limitations 新条目 (形态适配行为 + same-proto 无 redact 路径仍透传的边界) |
-| T6 | **A1 reasoning 配置跨协议映射** (维度 3): 按 roadmap A1 既有方案实施 (typed enum + 投影表 + golden); 档位表可交叉验证 cc-switch 的 budget 阈值 (4000/16000) 与 adaptive→xhigh | `src/codec/ir.rs` + 三协议 reader/writer (按 roadmap §A1) | ~150 | ✅ **已实施** (#290, T6) | roadmap "实施进度" 章节更新 |
+| T6 | **A1 reasoning 配置跨协议映射** (维度 3): 按 roadmap A1 既有方案实施 (typed enum + 投影表 + golden); 档位表可交叉验证 cc-switch 的 budget 阈值 (4000/16000) 与 adaptive→xhigh | `src/codec/ir.rs` + 三协议 reader/writer (按 roadmap §A1) | ~150 | ✅ **已实施** (#290, T6; + 用户裁决①采样联动 ②max_tokens 正交预算 = #295) | roadmap "实施进度" 章节更新 |
 | T7 | **thinking / encrypted_content passthrough 建模** (维度 1.1/1.2): 走 roadmap §2.2 判定 (boundary case, 参照 #176 先例登记); 方案 A = 新 `IrBlock::Thinking { thinking, signature_or_data }` 原样搬运 (cc-switch 证明可行, redact 需扫描 thinking 文本叶子), 方案 B = 至少同协议 redact 路径保真 (reader 收进 block 级 extra) | `docs/design/ir-fields-roadmap.md` (先登记) + `src/codec/ir.rs` + `src/codec/anthropic.rs` + `src/codec/responses/` | ~200-300 | ✅ **已合入** (#293, T7 — STR-6/FWD-1 envelope 授权已随 approve 完成; 实际 prod ~700 LOC, 三层全落地含流式 origin 分派) | roadmap 新 boundary-case 条目; known-limitations #176 条目升级 |
 | T8 | **tool_result 媒体丢弃可观测化** (维度 2): 最小 = `blocks_to_text` 丢弃非 Text 块时计数 WARN (对齐 reasoning 丢弃先例) + known-limitations 条目; 完整 = 媒体搬运到下一条 user 消息 + 占位标记 (抄 tool_media 思路, Chat/Responses user content 均可承载); 顺带修 Responses writer Base64 image 丢弃 (:884-888 → data URL) | `src/codec/mod.rs` (blocks_to_text) 或各 writer; 完整版 `src/codec/openai.rs` + `responses/mod.rs` | 最小 ~20 / 完整 ~120 | ✅ **最小档已实施** (#292, T8; 完整搬运仍 P3) | known-limitations codec 节新条目 |
-| T9 | **billing header 剥离** (维度 8): **等裁决**。若授权: a→o / a→r 翻译点的 system 折叠处剥头部首现行 + 配置开关 (默认 off); 抄 cc-switch 的 "只剥首次 + 保留后续" 边界 | `src/proxy/cross_proto.rs` (或 codec writer 层) + `src/config.rs` | ~60 | 待裁决 | 裁决后 known-limitations / configuration.md 同步 |
+| T9 | **billing header 剥离** (维度 8): **等裁决**。若授权: a→o / a→r 翻译点的 system 折叠处剥头部首现行 + 配置开关 (默认 off); 抄 cc-switch 的 "只剥首次 + 保留后续" 边界 | `src/proxy/cross_proto.rs` (或 codec writer 层) + `src/config.rs` | ~60 | ✅ **已裁决实施** (#294, 2026-09-30 — 仅跨协议 / 无配置开关 / cc-switch 识别边界) | 裁决后 known-limitations / configuration.md 同步 |
 | T10 | **非流式请求收 SSE 的嗅探聚合** (维度 9 反向): JSON parse 失败臂先 `body_looks_like_sse` 嗅探, 命中则用 `StreamScan` 聚合成 IrResponse 再走 writer; 未命中维持透传 | `src/proxy/cross_proto.rs` + `src/codec/stream/scan.rs` 复用 | ~100 | ⏸ **2026-09-30 用户裁决: 暂不实施, 保留观察** — 遇实际案例 (真实伪流式上游对非流式请求回 SSE) 时重新决策; 当前透传行为已登记 known-limitations | known-limitations (若不做则登记透传行为) |
+
+## 剩余差距全景 (2026-09-30 终评)
+
+> 前提: T1-T9 全部实施 (#294 已合入, #295 CI 中) + T10 按裁决观察。以下按可行动性四类归纳, 证据指针均为 known-limitations.md 当前条目。
+
+**A. 可领取的实施项** (有明确方案, 无裁决障碍):
+
+- **T8 完整档 — tool_result 媒体搬运**: 占位标记 + 媒体搬到紧随的合成 user 消息 (cc-switch `tool_media` 思路, ~120 LOC, P3)。
+- **流式 block 级 extra 保真**: 流式 IR 事件流不携带 block 级 extra (全体 block 类型的既有限制) — 同协议流式 restore 路径的 `cache_control` 丢失 (T7 修复轮登记的相邻边界; 扩展思考官方推荐断点恰在 thinking block, 流式 redact 用户对此有真实缓存损失)。
+- **Responses 流式 refusal parts**: 非流式降级 Text 保留, 流式整族丢弃 (形态不对称, D5 登记)。
+
+**B. 待裁决项** (有价值张力, 需用户拍板):
+
+- **L2 — 新模型 thinking 投影**: Opus 4.7+/5.x 对 `thinking.type:"enabled"` 直接 400 (需 `adaptive`), 修复需模型能力判断 (模型名嗅探 / 能力表 / 配置面) — 与 B2 既有 "不做模型名嗅探" 裁决相抵。调研: `/tmp/opencode/t6-m1-research.md` (临时) + known-limitations L2 条目。
+- **T9 的 `messages[]` 边界**: role=system 条目形态的 billing 标记目前不剥 (保守边界; 实际形态出现时再裁决, known-limitations 已声明条件)。
+- **姊妹篇 §4.2-C 缓存友好族** (审计范围外的相邻差距): `cache_control` 断点注入 / `prompt_cache_key` 注入 — FWD-1 冲突面已在姊妹篇论证, 均需裁决。
+- **新模型级采样约束**: 4.7+ 模型上任何非默认 temperature/top_p 请求 400 (与 thinking 无关, L3 登记) — 若实际命中, 需裁决网关是否代为归一。
+
+**C. 观察项** (已裁决暂不动 / 等外部触发):
+
+- **T10** 反向嗅探聚合: 用户裁决 2026-09-30 暂不实施, 遇实际伪流式上游案例再决策。
+- **真实上游实证**: 全部 codec 行为 (T6 联动 / T7 envelope / T9 剥离) 基于 mockito, 真实 Provider 实地验证未做 (仓库既有声明边界) — 建议首个真实部署时按协议族补集成测试。
+- envelope 外来 ec 上游拒收 (跨 provider 混用历史) / adaptive 携带 budget 假设 — 假设性风险, 已登记。
+
+**D. 已接受的协议能力边界** (非差距, 防误解列出):
+
+- OpenAI Chat 无 opaque 容器 → 思考上下文跨 o 丢失 (协议本质, T7 登记 ①②)。
+- Budget 连续值 → 6 档 effort 离散投影有损 (幂等, T6 登记); o/r 无 "关闭" 字段。
+- `previous_response_id` / hosted tools / namespace flattening 不支持 (stateless 代理本质 + D5 登记)。
 
 ### 与既有流程的衔接
 
