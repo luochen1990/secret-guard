@@ -1923,6 +1923,188 @@ async fn cross_protocol_translates_anthropic_ingress_to_openai_upstream() {
     );
 }
 
+/// claude code 实测形态的 billing 计费标记行样本 (cc-switch #2350 同款).
+const BILLING_HEADER_LINE: &str =
+    "x-anthropic-billing-header: cc_version=2.1.119.47e; cc_entrypoint=sdk-cli; cch=a7754;";
+
+/// a→o happy-path 响应 body (T9 billing header 测试族共用, 断言只看 status;
+/// 复用 idiom 同 `RESPONSES_OK_BODY` — 同一 body 多测试共享走 section-local const).
+const CHAT_COMPLETIONS_OK_BODY: &str = r#"{"id":"chatcmpl-test","object":"chat.completion","created":1700000000,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"Hi from GPT"},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":4,"total_tokens":16}}"#;
+
+/// a→o: system 首部的 billing 计费标记行被剥, 其余 system 文本原样翻过去 (T9).
+///
+/// PartialJson 精确匹配 system 内容 == 剥离后的剩余 prompt — 若剥离未发生,
+/// content 以标记行开头, matcher 不命中 → 上游无 mock → 请求失败 → status 断言红.
+/// system 用 array 形态且首 block 是纯标记行 (claude code 实测形态, cc-switch
+/// `strips_billing_header_from_system_array_parts` 同款) — 同时覆盖 "剥空整块
+/// 移除" 的端到端链路 (read_system_field → strip → blocks_to_text join).
+#[tokio::test]
+async fn cross_protocol_strips_leading_anthropic_billing_header_to_openai() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "Hello"}
+            ]
+        })))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(CHAT_COMPLETIONS_OK_BODY)
+        .create_async()
+        .await;
+    let provider = provider_with("oa-main", Protocol::OpenAI, &upstream.url());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+    // body 经 json! 构造: 标记行含真实换行, 字符串拼接会产出非法 JSON.
+    let body = serde_json::json!({
+        "model": "claude",
+        "max_tokens": 50,
+        "system": [
+            {"type": "text", "text": format!("{BILLING_HEADER_LINE}\n")},
+            {"type": "text", "text": "You are a helpful assistant."}
+        ],
+        "messages": [{"role": "user", "content": "Hello"}]
+    })
+    .to_string();
+    let (status, resp_body, _) =
+        proxy_request(&proxy_url, "POST", "/a/oa-main/v1/messages", &body, &[]).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {resp_body}");
+}
+
+/// a→r: 同一剥离语义的 Responses 方向 — system 首部标记行被剥, 剩余 prompt 进
+/// `instructions` (T9 裁决点名的两个方向之一).
+#[tokio::test]
+async fn cross_protocol_strips_leading_anthropic_billing_header_to_responses() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/responses")
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "instructions": "You are a helpful assistant."
+        })))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(RESPONSES_OK_BODY)
+        .create_async()
+        .await;
+    let provider = provider_with("resp-main", Protocol::OpenAIResponses, &upstream.url());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+    let body = serde_json::json!({
+        "model": "gpt-4o",
+        "max_tokens": 50,
+        "system": format!("{BILLING_HEADER_LINE}\n\nYou are a helpful assistant."),
+        "messages": [{"role": "user", "content": "Hello"}]
+    })
+    .to_string();
+    let (status, resp_body, _) =
+        proxy_request(&proxy_url, "POST", "/a/resp-main/v1/messages", &body, &[]).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {resp_body}");
+}
+
+/// 识别边界: 标记的**非首部**出现保留 — 用户正文引用的标记文本一字不动翻过去
+/// (只剥 system 首部首次出现; cc-switch 对齐).
+#[tokio::test]
+async fn cross_protocol_keeps_non_leading_billing_header_text_in_messages() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "Keep this literal:\nx-anthropic-billing-header: example"}
+            ]
+        })))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(CHAT_COMPLETIONS_OK_BODY)
+        .create_async()
+        .await;
+    let provider = provider_with("oa-main", Protocol::OpenAI, &upstream.url());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+    let body = r#"{"model":"claude","max_tokens":50,"messages":[{"role":"user","content":"Keep this literal:\nx-anthropic-billing-header: example"}]}"#;
+    let (status, resp_body, _) =
+        proxy_request(&proxy_url, "POST", "/a/oa-main/v1/messages", body, &[]).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {resp_body}");
+}
+
+/// 识别边界: system 不以标记开头 (标记在 system 正文中部) → 整个 system 原样翻译,
+/// 零影响 (不匹配绝不动).
+#[tokio::test]
+async fn cross_protocol_keeps_system_with_midtext_billing_header_verbatim() {
+    let mut upstream = spawn_mock_upstream().await;
+    let expected_system = "Intro:\nx-anthropic-billing-header: example\nTail";
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "messages": [
+                {"role": "system", "content": expected_system},
+                {"role": "user", "content": "Hello"}
+            ]
+        })))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(CHAT_COMPLETIONS_OK_BODY)
+        .create_async()
+        .await;
+    let provider = provider_with("oa-main", Protocol::OpenAI, &upstream.url());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+    let body = serde_json::json!({
+        "model": "claude",
+        "max_tokens": 50,
+        "system": expected_system,
+        "messages": [{"role": "user", "content": "Hello"}]
+    })
+    .to_string();
+    let (status, resp_body, _) =
+        proxy_request(&proxy_url, "POST", "/a/oa-main/v1/messages", &body, &[]).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {resp_body}");
+}
+
+/// 守卫 (恒绿): 同协议 a→a + redact 的 billing 标记**原样 round-trip** — 剥离只属于
+/// 跨协议翻译语义 (同协议上游是 Anthropic 本尊, 原生处理自家计费标记, 缓存语义与
+/// 直连一致; 2026-09-30 T9 裁决的 "同协议零触碰" 条款).
+#[tokio::test]
+async fn same_proto_redact_keeps_anthropic_billing_header_verbatim() {
+    let mut upstream = spawn_mock_upstream().await;
+    let expected_system = format!("{BILLING_HEADER_LINE}\n\nYou are a helpful assistant.");
+    let _m = upstream
+        .mock("POST", "/v1/messages")
+        // PartialJson 精确匹配 system == 原始字符串 (标记行在, 一字不差);
+        // user 消息含 secret 会被 redact 成 mock, 不在断言范围.
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "system": expected_system,
+        })))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"msg_x","type":"message","role":"assistant","content":[{"type":"text","text":"OK"}],"model":"claude","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
+        )
+        .create_async()
+        .await;
+    let provider = provider_with("an-main", Protocol::Anthropic, &upstream.url());
+    // 配置一个 secret 强制走 IR redact 路径 (同协议字节透传不经 codec, 无剥离面;
+    // 需要守卫的是 reader → IR → writer 重序列化路径). secret 在 user 消息里,
+    // redact 后 user content 变 mock — matcher 只精确断言 system (标记行原样在).
+    let proxy_url = spawn_proxy_static_dynamic(
+        vec![provider],
+        vec![],
+        reqwest::Client::new(),
+        ConversationDag::new(64, 500, 1),
+        test_secret_table_with(vec![secret("s1", "sk-live-secret-123")]),
+    )
+    .await
+    .0;
+    let body = serde_json::json!({
+        "model": "claude",
+        "max_tokens": 50,
+        "system": expected_system,
+        "messages": [{"role": "user", "content": "My key is sk-live-secret-123"}]
+    })
+    .to_string();
+    let (status, resp_body, _) =
+        proxy_request(&proxy_url, "POST", "/a/an-main/v1/messages", &body, &[]).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {resp_body}");
+}
+
 /// Responses 上游的 happy-path 响应 body (a→r / o→r 两测试共用, 仅 ingress 不同;
 /// 复用 idiom 同 `CHAT_REQ_BODY` — 同一 body 多测试共享走 section-local const).
 const RESPONSES_OK_BODY: &str = r#"{"id":"resp_abc","object":"response","created_at":1700000000,"model":"gpt-4o","status":"completed","output":[{"type":"message","id":"msg_1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Hi from Responses"}]}],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}"#;

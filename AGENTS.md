@@ -183,6 +183,10 @@
 envelope 工件 / reader 解包时 envelope 权威源 / ec 载荷的 real↔mock 发生在 base64
 解码层) 已按同款 "显式列举的例外" 格式登记在 contracts.md **FWD-1 "sg-thinking
 envelope 例外注记"** — 授权记录 = PR #293 用户 approve; 修改 envelope 行为前先读它.
+**已登记例外 (T9, 2026-09-30)**: 跨协议翻译 (a→o / a→r) 剥离 Anthropic 源请求 system
+首部的 billing 计费标记行 — 源协议计费元数据不入目标 wire (同协议 a→a 含 redact 零
+触碰), 详见 contracts.md **FWD-1 "跨协议翻译剥离 Anthropic billing header"** 注记;
+授权记录 = 2026-09-30 用户裁决.
 
 ### C3 前缀缓存友好性 (经济性契约) → RED-3 契约
 

@@ -824,6 +824,73 @@ fn read_system_field(val: Option<&Value>) -> Vec<IrBlock> {
     }
 }
 
+/// Claude Code billing 计费标记行的精确前缀 (大小写敏感; cc-switch 同款识别, T9).
+///
+/// 形态: `x-anthropic-billing-header: cc_version=...; cc_entrypoint=...; cch=<轮换值>`
+/// — 以**嵌在 system 文本首部的行**存在的 Anthropic 协议特定计费层元数据 (非 prompt
+/// 内容). 其 `cch=` 值每轮轮换, 翻译到其他协议会击穿目标侧前缀缓存 (cc-switch #2350
+/// 实证成本放大一个数量级).
+const BILLING_HEADER_LINE_PREFIX: &str = "x-anthropic-billing-header:";
+
+/// 剥离 system 文本**首部**的 billing 计费标记行 (T9, 2026-09-30 用户裁决).
+///
+/// 算法抄 cc-switch `strip_leading_anthropic_billing_header` (保守):
+/// - 仅当文本以 [`BILLING_HEADER_LINE_PREFIX`] 开头才动; 不匹配绝不动.
+/// - 剥掉首行 (至首个 `\n`/`\r`, CRLF 视为一个行终止) + 紧随的**一个**空行
+///   (claude code 形态 header 行后带一个空行); 行后无换行 = 整段都是标记 → 剥成空.
+fn strip_leading_billing_header_line(text: &str) -> &str {
+    if !text.starts_with(BILLING_HEADER_LINE_PREFIX) {
+        return text;
+    }
+    let Some(line_end) = text.find(['\n', '\r']) else {
+        return "";
+    };
+    let mut rest_start = line_end + 1;
+    if text[line_end..].starts_with("\r\n") {
+        rest_start += 1;
+    }
+    let rest = &text[rest_start..];
+    // 紧随的一个空行一并剥掉 (cc-switch 对齐: `header 行\n\nbody` → `body`).
+    if let Some(s) = rest.strip_prefix("\r\n") {
+        s
+    } else if let Some(s) = rest.strip_prefix('\n') {
+        s
+    } else if let Some(s) = rest.strip_prefix('\r') {
+        s
+    } else {
+        rest
+    }
+}
+
+/// 跨协议翻译 seam 的 system 首 block billing header 剥离 (T9).
+///
+/// 识别边界 (保守, 2026-09-30 裁决 + cc-switch 对齐):
+/// - 只处理 system **首 block**: `system[0]` 是 Text 且文本以标记前缀开头才剥 —
+///   后续 block 的同标记首部 (折叠后非 system 首部) 与 `messages[]` 的任何内容
+///   (含 role=system 条目里的标记) 都不动, 用户正文引用零误伤.
+/// - 首 block 剥后文本为空 → 整块移除 (折叠产出对齐 cc-switch 跳过空 part —
+///   留空块会在 `\n` join 折叠时多出前导换行).
+/// - 首 block 非 Text / 不匹配 → 零改动 (不匹配绝不动).
+///
+/// 只在 proxy 的跨协议 seam 调用 (egress ≠ Anthropic 才剥; 同协议 a→a 含 redact
+/// 绝不调用 — 同协议上游是 Anthropic 本尊原生处理自家标记). FWD-1 例外登记见
+/// contracts.md "跨协议翻译剥离 Anthropic billing header" 注记.
+///
+/// 返回剥离计数 (0 或 1), 供 seam 打 WARN (只记计数不记内容).
+pub(crate) fn strip_system_billing_header(system: &mut Vec<IrBlock>) -> usize {
+    let remove_block = match system.first_mut() {
+        Some(IrBlock::Text { text, .. }) if text.starts_with(BILLING_HEADER_LINE_PREFIX) => {
+            *text = strip_leading_billing_header_line(text).to_string();
+            text.is_empty()
+        }
+        _ => return 0,
+    };
+    if remove_block {
+        system.remove(0);
+    }
+    1
+}
+
 /// 解析 Anthropic 单个消息.
 fn read_message(msg: &Value) -> Option<IrMessage> {
     let obj = msg.as_object()?;
@@ -1576,6 +1643,73 @@ mod tests {
         });
         let ir = reader().read_request(&body).unwrap();
         assert_eq!(ir.system.len(), 2);
+    }
+
+    /// T9 字符串算法: 剥首行 + 紧随一个空行 (LF / CRLF / 无换行 / 不匹配 四臂).
+    #[test]
+    fn strip_leading_billing_header_line_variants() {
+        let header = "x-anthropic-billing-header: cc_version=2.1.119.47e; cch=a7754;";
+        // LF + 空行 (claude code 实测形态).
+        assert_eq!(
+            strip_leading_billing_header_line(&format!("{header}\n\nYou are helpful.")),
+            "You are helpful."
+        );
+        // CRLF + 空行.
+        assert_eq!(
+            strip_leading_billing_header_line(&format!("{header}\r\n\r\nYou are helpful.")),
+            "You are helpful."
+        );
+        // 行后无空行, 剩余文本直接跟随.
+        assert_eq!(
+            strip_leading_billing_header_line(&format!("{header}\nYou are helpful.")),
+            "You are helpful."
+        );
+        // 无换行 = 整段都是标记行 → 剥成空 (messages[] 形态的纯标记条目).
+        assert_eq!(strip_leading_billing_header_line(header), "");
+        // 不以标记开头 → 绝不动 (非首部出现的标记是用户正文).
+        assert_eq!(
+            strip_leading_billing_header_line("Keep:\nx-anthropic-billing-header: example"),
+            "Keep:\nx-anthropic-billing-header: example"
+        );
+    }
+
+    /// T9 block 级: 只剥 system 首 block; 剥空的整块移除; 后续 block 的同标记不动.
+    #[test]
+    fn strip_system_billing_header_block_boundaries() {
+        let mk_system = |texts: &[&str]| {
+            texts
+                .iter()
+                .map(|t| IrBlock::Text {
+                    text: t.to_string(),
+                    extra: Default::default(),
+                })
+                .collect::<Vec<_>>()
+        };
+        // 首剥空 → 整块移除, 后续 block 保留 (折叠产出对齐 cc-switch 跳过空 part).
+        let mut sys = mk_system(&["x-anthropic-billing-header: cch=a7754;\n", "Stable prompt"]);
+        assert_eq!(strip_system_billing_header(&mut sys), 1);
+        assert_eq!(sys, mk_system(&["Stable prompt"]));
+        // 同一 block 内标记行后有剩余 prompt → 保留剩余.
+        let mut sys = mk_system(&["x-anthropic-billing-header: cch=a7754;\n\nPart 1", "Part 2"]);
+        assert_eq!(strip_system_billing_header(&mut sys), 1);
+        assert_eq!(sys, mk_system(&["Part 1", "Part 2"]));
+        // 后续 block 的同标记首部不动 (非 system 首部).
+        let mut sys = mk_system(&["Intro", "x-anthropic-billing-header: example"]);
+        assert_eq!(strip_system_billing_header(&mut sys), 0);
+        assert_eq!(
+            sys,
+            mk_system(&["Intro", "x-anthropic-billing-header: example"])
+        );
+        // 不匹配 / 空系统 → 零改动零计数.
+        let mut sys = mk_system(&["You are helpful."]);
+        assert_eq!(strip_system_billing_header(&mut sys), 0);
+        let mut empty: Vec<IrBlock> = Vec::new();
+        assert_eq!(strip_system_billing_header(&mut empty), 0);
+        // 幂等: 剥过一次后再剥是 no-op.
+        let mut sys = mk_system(&["x-anthropic-billing-header: cch=x;\nStable"]);
+        assert_eq!(strip_system_billing_header(&mut sys), 1);
+        assert_eq!(strip_system_billing_header(&mut sys), 0);
+        assert_eq!(sys, mk_system(&["Stable"]));
     }
 
     /// messages[] 内 role=system 条目必须提升合并到顶层 system (与 OpenAI reader

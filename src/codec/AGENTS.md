@@ -59,6 +59,12 @@
   Bedrock eventstream 二进制流. prompt caching **跨协议归一化** (A8 first-class) 暂缓 — 跨协议
   路径 cache_control 照旧丢弃 (clear_wire_fidelity, FWD-3); 同协议保真已由 wire-fidelity extra +
   system_form 覆盖 (#269), 见 ir-fields-roadmap.md A8.
+- ✅ **Anthropic billing header 跨协议剥离** (T9, 2026-09-30 用户裁决): a→o / a→r 翻译时
+  剥离源请求顶层 system 首 block 的 `x-anthropic-billing-header:` 计费标记行
+  (`codec::anthropic::strip_system_billing_header` 纯函数; 调用点在 proxy seam
+  `cross_proto_forward` — codec reader/writer 自身不做, 同协议 a→a 含 redact 零触碰).
+  识别边界 / 误剥风险 / 记录面细则见 `docs/known-limitations.md` codec 节 T9 条目;
+  FWD-1 例外登记见 contracts.md.
 
 > **thinking/encrypted_content 跨协议搬运 rationale** (T7, 改写 #176 旧裁决): 旧裁决
 > "无法合法合成 signature → 跨协议丢弃" 只否定了**合成**, 未否定**搬运** — cc-switch 的

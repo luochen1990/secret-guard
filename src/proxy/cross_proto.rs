@@ -120,6 +120,20 @@ pub(crate) async fn cross_proto_forward(
     ir.extra.clear();
     ir.clear_wire_fidelity();
 
+    // 5.5 T9 (2026-09-30 用户裁决): Anthropic ingress 剥离 system 首 block 的
+    //     billing 计费标记行 (源协议计费元数据, 对目标协议无语义对应; `cch=` 轮换值
+    //     击穿目标侧前缀缓存, cc-switch #2350). 落点在 proxy seam 而非 a reader:
+    //     同协议 a→a (含 redact) 也走 reader → IR → writer, 而剥离只属于跨协议翻译
+    //     (同协议上游是 Anthropic 本尊 — 零触碰); codec 层拿不到 ingress/egress
+    //     判定. 识别边界与算法见 `codec::anthropic::strip_system_billing_header`
+    //     doc; FWD-1 例外登记见 contracts.md "跨协议翻译剥离 Anthropic billing
+    //     header" 注记.
+    let stripped_billing_headers = if ingress == Protocol::Anthropic {
+        crate::codec::anthropic::strip_system_billing_header(&mut ir.system)
+    } else {
+        0
+    };
+
     // 6. 快照真实 messages + system (redact 前) 给 DAG (system 用途见 same_proto 同型注释).
     let real_messages = ir.messages.clone();
     let real_system = ir.system.clone();
@@ -242,6 +256,18 @@ pub(crate) async fn cross_proto_forward(
             count = dropped_req_reasoning,
         "reasoning block(s) lossy in cross-protocol request history translation \
              (dropped or opaque-stripped by target protocol capability)"
+        );
+    }
+    // T9: billing header 剥离可观测性 — 计数在步骤 5.5 已算, record_id 此刻才产生,
+    // WARN 延后到这里打 (对齐 dropped_req_reasoning 先例; 只记计数不记内容).
+    if stripped_billing_headers > 0 {
+        warn!(
+            %record_id,
+            count = stripped_billing_headers,
+            ingress = %ingress.name(),
+            egress = %egress.name(),
+            "anthropic billing header line stripped from system head in cross-protocol \
+             translation (source-protocol billing metadata keeps target prefix cache stable)"
         );
     }
     // T8: tool_result 媒体丢弃 — egress 为折叠型 (o/r) 时 per-request 聚合一条

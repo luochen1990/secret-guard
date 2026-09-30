@@ -238,6 +238,26 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 > (原始形状保持, 见上方注记); 不发缓存标记的客户端经 IR 路径后仍无缓存命中, 属客户端
 > 自身行为, 与直连一致.
 
+> **跨协议翻译剥离 Anthropic billing header** (T9, 2026-09-30 登记, **用户授权 —
+> 2026-09-30 裁决**): 触发条件 = ① 跨协议翻译路径 (a→o / a→r, dispatch 后
+> `cross_proto_forward` seam — 该 seam 恒 ingress != egress) ② Anthropic 源请求的
+> **顶层 system 首 block** 文本以精确标记 `x-anthropic-billing-header:` 开头. 满足时
+> 首 block 的标记行 (含紧随的一个空行) 被剥除, 剥空的 block 整块移除. **定性**: 该标记
+> 是 Anthropic 协议特定的**计费层元数据** (以嵌在 system 文本首部的形态存在), 对目标
+> 协议无语义对应 — 剥离是翻译语义的组成部分, 对齐 extra 契约 "源协议特有、无跨协议
+> 映射的字段跨协议时该丢" 的精神 (属 FWD-3 管辖的跨协议路径, 登记于此因 "不删客户端
+> 字节" 的原则表述按字面覆盖它), 非 "删用户 prompt 内容". 依据: cc-switch #2350 实证
+> 标记行的 `cch=` 值每轮轮换, 翻译到目标协议使前缀缓存每轮全 miss, 成本放大一个
+> 数量级 (C3 经济性精神在翻译路径的延伸). **同协议零触碰**: a→a (含 redact 的
+> reader → IR → writer 重序列化路径) 的 system 文本原样流过 — 同协议上游是
+> Anthropic 本尊, 原生处理自家计费标记, 缓存语义与直连一致. **识别边界** (保守,
+> cc-switch 对齐): 只剥 system 首部**首次出现**; 后续 block / `messages[]` 内 (含
+> role=system 条目) 的同标记文本不动 (用户正文引用零误伤); 不匹配绝不动. 回归守卫:
+> `tests/integration.rs` 的 `cross_protocol_strips_leading_anthropic_billing_header_*`
+> (a→o / a→r 剥离 + 非首部保留 + 无标记零影响) + 恒绿守卫
+> `same_proto_redact_keeps_anthropic_billing_header_verbatim` (同协议原样 round-trip);
+> 行为边界细则见 known-limitations.md codec 节 T9 条目.
+
 `normalize` = canonical JSON (BTreeMap key 排序 + 紧凑序列化 + 无空白). 消除对语义无影响的字节差异, 剩下的差异全部是真正的信息差异.
 
 **适用范围**: 同协议路径. 非流式 wire JSON + 流式 SSE wire.
@@ -1380,3 +1400,4 @@ chars (char boundary 安全); 其余事件字段为受控类型, 天然无 secre
 | 2026-09-23 | FWD-2 (wire-fidelity 扩展, L4/L5) | **wire fidelity 下沉到 message/tool/block 级 (#269 M1)**: `IrMessage`/`IrTool`/四个 wire 来源 `IrBlock` variant 增 `extra` 字段 (未建模字段逃生舱, 同协议透传/跨协议清空契约与顶层 extra 同型, `clear_wire_fidelity` 统一清空); Anthropic codec 收集/回写 block 级+工具级 `cache_control`、消息级 `output_config` 等; `tool_result.is_error` 改 `Option<bool>` (显式 false 不再静默省略); 顶层 `system` 字段形态元数据 `system_form` (单 block array 不折叠); dag BlockPool 内容寻址 hash 纳入 extra; redact 双轨遍历 (StringLeafOps + collect_ir_str_leaves) 同步覆盖 extra 叶子 (SEC 扫描无新盲区); FWD-2 生成器扩展 (system 形态+cache_control / tools extra / 消息级 output_config / block cache_control / is_error 显式 false / 响应侧 block extra) 机械锁定 | issue #269: Anthropic 缓存是显式 opt-in, IR 路径剥离缓存标记 = 长 agent 会话 input 成本约放大一个数量级; 仓库 C3 契约 (mock 确定性) 的缓存友好投入因此被完全抵消, 本修复是补完既有设计目标而非新特性 |
 | 2026-09-23 | FWD-1 (原则显式化 + M3 否决) | **"原始形状保持"登记为同协议转发的高优先契约; 注入方案否决并移除 (用户二次裁决)**: ① 客户端发什么, 发往上游的就是什么; 两种合法修改 (mock 替换 / model 重写) 是显式列举的例外; ② **不引入任何"主动添加客户端未发送内容"的功能** — 客户端请求上游不认可就让其失败 (直连同样失败, 网关不兜底), 尽量少引入差异; ③ 同日曾实现的顶层自动缓存标记注入 (`inject_cache_control`, 合法修改"第三类"方案) 被此裁决否决, 已整体移除 (等价表述回归"两种"), changelog 留此记录供未来检索关键词: inject_cache_control / automatic caching 注入 / 顶层 cache_control | issue #269 PR #272 评审讨论: 用户先对 M3 注入与形状保持的张力提出原则性澄清, 随后裁决不引入该功能 |
 | 2026-09-29 | STR-6 + FWD-3 (T7 thinking/encrypted_content passthrough) | **思考上下文容器 first-class 建模 + a⇄r envelope 搬运 — PR review 授权 (PR #293 用户 approve 即授权记录; 依据契约演进原则 §0.5 例外① "互译精确化消除信息损失", 同步改写 2026-08-23 与 2026-09-23 两次裁决的丢弃/分叉文本)**: ① `IrBlock::Reasoning{summary}` 增 `opaque` (encrypted_content), `IrBlock::ReasoningContent{text}` 增 `opaque: ThinkingOpaque` (Signature/RedactedData) — 同协议 round-trip 完整保真 (修复 a+a redact 历史 thinking 丢失 → tool-use 会话 400 的机制性根因, 与 r reasoning chain 断裂); ② 流式: `IrBlockMeta::Thinking`/`RedactedThinking{data}` + `IrDelta::SignatureDelta`/`ReasoningOpaqueDelta` (origin 区分 = verbatim 直通 vs envelope 打包的分派依据), a writer 有限累积 (`AnthropicEncodeState`, BlockStop 合成 envelope signature 且延迟 emit 保证 thinking_delta→signature_delta→stop 顺序), r writer done 族帧写回 encrypted_content; ③ 跨协议 a⇄r 经 `sg-thinking-v1:` envelope (cc-switch 模式, 打包在 writer=post-redact/restore, 解包在 reader=pre-redact/restore — RED 安全链闭合, `prop_envelope_packs_redacted_text_never_real` 守卫); o-origin 跨 a 丢弃 + WARN (o 无容器, 旧裁决保留部分), o 为目标 opaque 丢弃 + WARN, o→r 保留 (分叉消解); ④ FWD-3 损失清单 + `count_reasoning_blocks` 按 egress 能力精确化; ⑤ 生成器: thinking 族加入 `arb_anthropic_message` assistant 臂 (FWD-2 随之覆盖, signature/data 用 `[A-Z0-9]` charset 结构性排除 envelope 前缀), envelope 路径由四组 golden 单测锁定; `dropped_block_starts` 防线保留给仍未建模类型 (#282 测试以 image 为例精确化) | T7: cc-switch codec gap 审计维度 1 — thinking signature/encrypted_content 跨协议往返是盲区, 同协议 redact 也丢 (stateless tool loop 断裂); §2.2 判定: ≥2 协议 (a+r) + 语义对应 (回传载体) + 归一化 = 不合成只搬运 → first-class (roadmap 变更记录同步登记) |
+| 2026-09-30 | FWD-1 + FWD-3 (T9 billing header 剥离) | **跨协议翻译剥离 Anthropic billing header — 用户授权 (2026-09-30 裁决)**: a→o / a→r 翻译路径 (proxy seam `cross_proto_forward`, 落点在 codec `strip_system_billing_header` 纯函数) 剥离 Anthropic 源请求顶层 system 首 block 的 `x-anthropic-billing-header:` 计费标记行 (含紧随空行, 剥空整块移除) — 定性为源协议计费层元数据 (对齐 extra "无跨协议映射该丢" 精神, FWD-3 管辖; 登记于 FWD-1 因 "不删客户端字节" 原则字面覆盖), 依据 cc-switch #2350 (`cch=` 轮换值击穿目标侧前缀缓存, 成本放大一个数量级). 识别边界保守: 只剥 system 首部首次出现, 后续 block / messages[] (含 role=system 条目) 的同标记文本与用户正文引用不动, 不匹配绝不动; **同协议 a→a (含 redact) 零触碰** (上游是 Anthropic 本尊原生处理自家标记, 缓存语义与直连一致). 剥离打 WARN (计数, record_id 关联); 回归守卫: `cross_protocol_strips_leading_anthropic_billing_header_{to_openai,to_responses}` + 边界三测 + 恒绿 `same_proto_redact_keeps_anthropic_billing_header_verbatim` + codec 单测两臂 | T9: cc-switch codec gap 审计维度 8 "需裁决" 项, 2026-09-30 用户裁决授权 (剥离仅跨协议翻译路径) |

@@ -32,6 +32,12 @@
 //! (否则源协议独有字段如 OpenAI `response_format` 会污染 Anthropic egress wire;
 //! reasoning 配置经 first-class 翻译, 不受此清空影响).
 //!
+//! 注 (T9, 2026-09-30): 生产 seam 在 `clear_wire_fidelity()` 后另有 Anthropic billing
+//! header 剥离 (`strip_system_billing_header`, 仅 a-ingress) — 本管线**不复刻**:
+//! 本文件生成器不生成 system 字段 (剥离输入恒空), 且 message content 的 `[a-z ]`
+//! charset 亦结构性生成不了 `x-anthropic-billing-header:` 前缀, 剥离对生成输入恒
+//! no-op; 扩生成器 (补 system 或扩 charset) 前先读 contracts.md FWD-1 的 T9 例外注记.
+//!
 //! 注: `reasoning_content` (思考原文) 已建模为 first-class block (#176:
 //! `IrBlock::ReasoningContent`), 但**跨协议仍丢弃** (Anthropic thinking 需 signature /
 //! Responses reasoning 依赖 encrypted_content, 无法合法合成) — 属 FWD-3
