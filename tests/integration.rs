@@ -2788,6 +2788,229 @@ async fn cross_protocol_streaming_translates_anthropic_ingress_from_responses_up
     _m.assert_async().await;
 }
 
+/// 解析 SSE 字节流为 (event, data) 序列 — 集成测试侧断言辅助 (帧序列 + 精确字段值,
+/// 免 substring 断言的 key 序/前缀歧义; 解析语义与 codec `stream/mod.rs::iter_sse_frames` 对齐).
+fn parse_sse_frames(body: &str) -> Vec<(String, serde_json::Value)> {
+    let mut out = Vec::new();
+    for frame in body.split("\n\n") {
+        let mut event = None;
+        let mut data = String::new();
+        for line in frame.lines() {
+            if let Some(e) = line.strip_prefix("event: ") {
+                event = Some(e.to_string());
+            } else if let Some(d) = line.strip_prefix("data: ") {
+                data.push_str(d);
+            }
+        }
+        if let (Some(event), Ok(v)) = (event, serde_json::from_str(&data)) {
+            out.push((event, v));
+        }
+    }
+    out
+}
+
+/// Anthropic 上游 thinking 流 fixture — a→r 流式翻译的输入侧 (A12).
+/// 搬运自 cc-switch (MIT, https://github.com/farion1231/cc-switch) @ 846de29c
+/// `streaming_codex_anthropic.rs` 的 `test_thinking_stream` (1044) +
+/// `test_thinking_signature_is_preserved` (1069) 合并; 适配偏差: thinking 扩为
+/// 2 delta 分帧覆盖累积, message_start 补 usage.input_tokens (锁 terminal backfill), id 改名.
+const ANTHROPIC_SSE_THINKING_FLOW: &str = concat!(
+    "event: message_start\n",
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_t7\",\"model\":\"claude\",\"usage\":{\"input_tokens\":9}}}\n\n",
+    "event: content_block_start\n",
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+    "event: content_block_delta\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"hmm\"}}\n\n",
+    "event: content_block_delta\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" indeed\"}}\n\n",
+    "event: content_block_delta\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig_abc\"}}\n\n",
+    "event: content_block_stop\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "event: message_delta\n",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n",
+    "event: message_stop\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
+);
+
+/// Anthropic 上游 tool_use 流 fixture — a→r 流式翻译的输入侧 (A12).
+/// 搬运自 cc-switch (MIT, https://github.com/farion1231/cc-switch) @ 846de29c
+/// `streaming_codex_anthropic.rs` 的 `test_tool_use_stream` (994), partial_json 拆 2 片覆盖增量.
+const ANTHROPIC_SSE_TOOL_USE_FLOW: &str = concat!(
+    "event: message_start\n",
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_2\",\"model\":\"claude\",\"usage\":{\"input_tokens\":5}}}\n\n",
+    "event: content_block_start\n",
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"get_weather\"}}\n\n",
+    "event: content_block_delta\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"city\\\":\\\"Tok\"}}\n\n",
+    "event: content_block_delta\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"yo\\\"}\"}}\n\n",
+    "event: content_block_stop\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "event: message_delta\n",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":7}}\n\n",
+    "event: message_stop\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
+);
+
+/// a→r 流式方向 ①: thinking + signature 分帧流 (A12, 补 codec 支持矩阵自认的
+/// "Responses ingress ← Anthropic upstream 暂无专属测试" 空洞). 断言 r 侧 egress
+/// 帧序列完整生命周期 + T7 envelope (signature 经 encrypted_content 搬运, 解包可还原).
+#[tokio::test]
+async fn cross_protocol_streaming_translates_responses_ingress_from_anthropic_upstream_thinking() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/messages")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(ANTHROPIC_SSE_THINKING_FLOW)
+        .create_async()
+        .await;
+    let provider = provider_with("an-main", Protocol::Anthropic, &upstream.url());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+    let body = r#"{"model":"claude-sonnet-4","input":"Hi","stream":true}"#;
+    let (status, resp_body, resp_headers) =
+        proxy_request(&proxy_url, "POST", "/r/an-main/v1/responses", body, &[]).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {resp_body}");
+    assert_eq!(
+        resp_headers.get("content-type").unwrap(),
+        "text/event-stream",
+        "client must receive SSE content-type"
+    );
+
+    let frames = parse_sse_frames(&resp_body);
+    let types: Vec<&str> = frames.iter().map(|(t, _)| t.as_str()).collect();
+    assert_eq!(
+        types,
+        vec![
+            "response.created",
+            "response.output_item.added",
+            "response.reasoning_summary_part.added",
+            "response.reasoning_summary_text.delta",
+            "response.reasoning_summary_text.delta",
+            "response.reasoning_summary_text.done",
+            "response.reasoning_summary_part.done",
+            "response.output_item.done",
+            "response.completed",
+        ],
+        "thinking 流的 r 侧 egress 帧序列 (reasoning item 全生命周期): {resp_body}"
+    );
+    assert!(!resp_body.contains("[DONE]"), "got: {resp_body}");
+
+    // added: reasoning item 骨架 (summary 空, in_progress). rs_0 是本实现的确定性
+    // 合成 id 方案 (非官方 wire 契约), 作为 golden 锁定 — 改 id 方案时此断言需联动.
+    let added_item = &frames[1].1["item"];
+    assert_eq!(added_item["type"], "reasoning");
+    assert_eq!(added_item["id"], "rs_0");
+    assert_eq!(added_item["status"], "in_progress");
+    assert_eq!(added_item["summary"], serde_json::json!([]));
+
+    // thinking 分帧逐 delta 保真 + done 全量累积.
+    assert_eq!(frames[3].1["delta"], "hmm");
+    assert_eq!(frames[4].1["delta"], " indeed");
+    assert_eq!(frames[5].1["text"], "hmm indeed");
+
+    // done item: status completed + summary 全量 + T7 envelope (signature 经
+    // encrypted_content 搬运 — stateless tool loop 回传闭合的前提).
+    let done_item = &frames[7].1["item"];
+    assert_eq!(done_item["type"], "reasoning");
+    assert_eq!(done_item["status"], "completed");
+    assert_eq!(done_item["summary"][0]["text"], "hmm indeed");
+    let ec = done_item["encrypted_content"]
+        .as_str()
+        .unwrap_or_else(|| panic!("encrypted_content missing: {resp_body}"));
+    match secret_guard::codec::thinking::unpack(ec) {
+        Some(secret_guard::codec::IrBlock::ReasoningContent { text, opaque, .. }) => {
+            assert_eq!(text, "hmm indeed", "envelope thinking text: {ec}");
+            assert_eq!(
+                opaque,
+                Some(secret_guard::codec::ThinkingOpaque::Signature(
+                    "sig_abc".to_string()
+                )),
+                "envelope signature: {ec}"
+            );
+        }
+        other => panic!("envelope must unpack to ReasoningContent: {other:?} ({ec})"),
+    }
+
+    // 终止事件: output 重建含 reasoning item; usage = start input 9 (backfill) + delta output 3.
+    let resp = &frames[8].1["response"];
+    assert_eq!(resp["status"], "completed");
+    assert_eq!(resp["output"][0]["type"], "reasoning");
+    assert_eq!(resp["usage"]["input_tokens"], 9);
+    assert_eq!(resp["usage"]["output_tokens"], 3);
+    _m.assert_async().await;
+}
+
+/// a→r 流式方向 ②: tool_use partial_json 流 (A12). 断言 function_call item 全生命
+/// 周期 (call_id/name 身份 + 增量 arguments + done 全量) 与 usage 透传.
+#[tokio::test]
+async fn cross_protocol_streaming_translates_responses_ingress_from_anthropic_upstream_tool_use() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/messages")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(ANTHROPIC_SSE_TOOL_USE_FLOW)
+        .create_async()
+        .await;
+    let provider = provider_with("an-main", Protocol::Anthropic, &upstream.url());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+    let body = r#"{"model":"claude-sonnet-4","input":"Weather in Tokyo?","stream":true}"#;
+    let (status, resp_body, resp_headers) =
+        proxy_request(&proxy_url, "POST", "/r/an-main/v1/responses", body, &[]).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {resp_body}");
+    assert_eq!(
+        resp_headers.get("content-type").unwrap(),
+        "text/event-stream",
+        "client must receive SSE content-type"
+    );
+
+    let frames = parse_sse_frames(&resp_body);
+    let types: Vec<&str> = frames.iter().map(|(t, _)| t.as_str()).collect();
+    assert_eq!(
+        types,
+        vec![
+            "response.created",
+            "response.output_item.added",
+            "response.function_call_arguments.delta",
+            "response.function_call_arguments.delta",
+            "response.function_call_arguments.done",
+            "response.output_item.done",
+            "response.completed",
+        ],
+        "tool_use 流的 r 侧 egress 帧序列 (function_call 全生命周期): {resp_body}"
+    );
+    assert!(!resp_body.contains("[DONE]"), "got: {resp_body}");
+
+    // added: function_call item 身份 (toolu id → call_id, name 保留, arguments 空).
+    let added_item = &frames[1].1["item"];
+    assert_eq!(added_item["type"], "function_call");
+    assert_eq!(added_item["call_id"], "toolu_1");
+    assert_eq!(added_item["name"], "get_weather");
+    assert_eq!(added_item["arguments"], "");
+
+    // partial_json 分片逐 delta 保真 + done 全量累积.
+    assert_eq!(frames[2].1["delta"], "{\"city\":\"Tok");
+    assert_eq!(frames[3].1["delta"], "yo\"}");
+    assert_eq!(frames[4].1["arguments"], "{\"city\":\"Tokyo\"}");
+
+    // done item: status completed + arguments 全量.
+    let done_item = &frames[5].1["item"];
+    assert_eq!(done_item["type"], "function_call");
+    assert_eq!(done_item["status"], "completed");
+    assert_eq!(done_item["call_id"], "toolu_1");
+    assert_eq!(done_item["arguments"], "{\"city\":\"Tokyo\"}");
+
+    // 终止事件: output 重建含 function_call; usage = start input 5 + delta output 7.
+    let resp = &frames[6].1["response"];
+    assert_eq!(resp["status"], "completed");
+    assert_eq!(resp["output"][0]["type"], "function_call");
+    assert_eq!(resp["usage"]["input_tokens"], 5);
+    assert_eq!(resp["usage"]["output_tokens"], 7);
+    _m.assert_async().await;
+}
+
 #[tokio::test]
 async fn cross_protocol_unknown_pair_returns_501() {
     // Gemini/Ollama 在 codec 中尚未支持, 跨协议到这些仍应返回 501.
