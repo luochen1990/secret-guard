@@ -1182,14 +1182,21 @@ dag `push_messages` 判定值的真值透传 (proxy 经 `round_kind_of` 回读�
 ### USAGE-2 回显保真 (presence + 归一化)
 
 **陈述**: 存储的 usage 四元组 == 上游回显经 codec reader 归一化的值 (OpenAI
-`prompt_tokens` 含 cached 总和, reader `saturating_sub`; cr/cw 的 `None` 按
-`unwrap_or(0)` 落盘). presence 位忠实区分 "wire 无 usage 对象" 与 "显式全零回显"
-(P-3 缺失显式): 非流式由 reader 判定, 流式由 MessageDelta.usage_present 位精确传递
-(与 STR-2 scan ≡ 非流式 parse 的等价性联动).
+`prompt_tokens` 含 cached 总和, reader `checked_sub` — 下溢回退全额 prompt; cr/cw 的
+`None` 按 `unwrap_or(0)` 落盘). DeepSeek 系方言字段双读 (A4, 2026-10-01, cc-switch MIT
+@846de29c 语义对照): 标准 `prompt_tokens_details.cached_tokens` 缺席时
+`prompt_cache_hit_tokens` 兜底为 cache_read (presence 权威 — 标准字段同现时
+标准优先, 含显式 0), 映射与标准字段完全同型 (prompt 已含 hit+miss, input =
+prompt - hit), 总和收敛 `openai_prompt_tokens` SSOT 不变; `prompt_cache_miss_tokens`
+仅是 miss 计数 (隐含于 input), IrUsage 无独立承载, 读侧忽略. presence 位忠实区分
+"wire 无 usage 对象" 与 "显式全零回显" (P-3 缺失显式): 非流式由 reader 判定,
+流式由 MessageDelta.usage_present 位精确传递 (与 STR-2 scan ≡ 非流式 parse 的
+等价性联动).
 
 **Properties**:
 - `prop_usage_presence_distinguishes_absent_and_zero`: 三 reader (openai/anthropic/responses) 非流式 + anthropic 流式 message_delta: usage 对象缺席 → present=false; 显式全零 → present=true. 🔁→`read_response_usage_present_true_when_usage_object_in_wire` (`src/codec/openai.rs` + `src/codec/anthropic.rs`; 同名两处) + `stream_message_delta_usage_presence_distinguishes_absent_and_zero` (`src/codec/anthropic.rs`)
 - `prop_usage_echo_fidelity_openai_normalization`: 端到端: 上游回显 prompt_tokens=100 + cached=30 → 存储与聚合 input=70 / cr=30 / output=50; 回显 model 优先于请求 model 作为聚合键. 🔁→`usage_stats_end_to_end_records_replayed_and_served` (`tests/integration.rs`)
+- `prop_usage_echo_fidelity_deepseek_dual_read` (A4): DeepSeek 方言字段双读语义 — hit 兜底填 cache_read / 标准字段 presence 优先 (含显式 0, 不可解析 null 按缺席回退 hit) / null 或非数值按缺席 / writer 收敛到 canonical 方言 (DeepSeek 字段不上 wire, 有效 hit 经标准 details 写回); 生成器覆盖 hit/miss/标准字段的 presence × 真值正交 (缺席/null/0/n>0) + 标准字段共存分支; 流式路径经共享 read_usage 接线 (chunk example 锁定). 流式 cache pair 累积策略现状 (terminal delta 非零值全胜, 仅缺失字段从 message_start backfill) 由探针锁定 — 与 cc-switch 的 "delta 更大时保留 start" (min 语义) 分歧是已记录的后续项, 行为未改. 🔁→`read_response_deepseek_hit_fills_cache_read` + `read_response_prefers_standard_cached_tokens_over_deepseek_hit` + `read_response_deepseek_null_or_missing_hit_treated_as_absent` + `read_response_standard_null_cached_falls_back_to_deepseek_hit` + `stream_chunk_deepseek_usage_extracts_hit` + `openai_deepseek_usage_dual_read_converges_to_canonical` + `cross_proto_stream_usage_pair_accumulation_probe` (`src/codec/openai.rs` / `src/codec/fwd_property.rs` / `src/codec/fwd_streaming_property.rs`)
 - `prop_usage_quanta_none_cache_normalized`: IrUsage 的 cr/cw None 落盘归一为 0. 🔁→`quanta_from_ir_normalizes_none_cache_fields` (`src/usage/store.rs`)
 
 ### USAGE-3 成本纯函数与可复算

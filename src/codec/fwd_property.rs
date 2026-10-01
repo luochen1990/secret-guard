@@ -111,6 +111,50 @@ proptest! {
         );
     }
 
+    /// A4 (DeepSeek usage 方言双读, USAGE-2): DeepSeek 系上游把缓存计数单列在
+    /// `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` (标准 details 字段
+    /// 缺席). 语义契约 (cc-switch MIT @846de29c 语义对照):
+    /// 1. IrUsage: cache_read = 有效 hit (标准字段同现时标准优先, presence 权威),
+    ///    input = prompt - 有效 hit (与标准字段完全同型, 总和收敛 SSOT 不变);
+    /// 2. writer 收敛到 canonical 方言: DeepSeek 字段不上 wire, 有效 hit 经
+    ///    `prompt_tokens_details.cached_tokens` 写回 (方言归一化, 非损失).
+    #[test]
+    fn openai_deepseek_usage_dual_read_converges_to_canonical(
+        v in arb_openai_response_value_with_deepseek_usage()
+    ) {
+        let (wire_usage, standard, hit) = deepseek_usage_expectation(&v);
+        let effective = standard.or(hit); // 标准字段优先 (presence 权威)
+        let ir = OpenAiReader.read_response(&v).unwrap();
+        prop_assert_eq!(ir.usage.cache_read_input_tokens, effective);
+        let prompt = wire_usage.get("prompt_tokens").and_then(Value::as_u64).unwrap();
+        prop_assert_eq!(
+            ir.usage.input_tokens,
+            effective.and_then(|c| prompt.checked_sub(c)).unwrap_or(prompt)
+        );
+        prop_assert_eq!(
+            ir.usage.output_tokens,
+            wire_usage.get("completion_tokens").and_then(Value::as_u64).unwrap()
+        );
+        // writer 收敛: 读回再写出, usage 是 canonical 方言 (DeepSeek 字段消失, 标准
+        // details 按有效 hit 写回 — 机械推导的期望形态, 不依赖被测实现).
+        let out = OpenAiWriter.write_response(&ir);
+        let mut canonical = wire_usage.clone();
+        canonical.as_object_mut().unwrap().remove("prompt_cache_hit_tokens");
+        canonical.as_object_mut().unwrap().remove("prompt_cache_miss_tokens");
+        match effective {
+            Some(c) => canonical["prompt_tokens_details"] = json!({"cached_tokens": c}),
+            None => {
+                canonical.as_object_mut().unwrap().remove("prompt_tokens_details");
+            }
+        }
+        prop_assert_eq!(
+            normalize_json(&out["usage"]),
+            normalize_json(&canonical),
+            "DeepSeek 方言必须收敛到 canonical 形态: wire={:?}",
+            wire_usage
+        );
+    }
+
     /// FWD-2 (Anthropic 响应): wire → IR → wire' 语义保留.
     ///
     /// 当前已知失败: L8 (usage 字段位置: 顶层 input_tokens vs usage.input_tokens;
@@ -1136,6 +1180,91 @@ fn arb_openai_usage() -> impl Strategy<Value = Value> {
             }
             Value::Object(usage)
         })
+}
+
+/// A4: DeepSeek 系 usage 方言生成器 (cc-switch MIT @846de29c 场景对照).
+/// hit/miss 各自 presence × 真值正交 (缺席 / null / 0 / n>0 — hit 的 0 值形态锁
+/// presence 权威不坍缩), 标准字段共存分支独立正交 (双读优先级覆盖).
+/// 约束同型: prompt 抬升到 >= 各有效值 (不截断生成值, canonical 期望可机械推导).
+fn arb_openai_usage_deepseek() -> impl Strategy<Value = Value> {
+    (
+        1u32..1_000_000,
+        0u32..1_000_000,
+        prop::option::of(prop_oneof![
+            Just(json!(null)),
+            Just(json!(0u32)),
+            (1u32..1_000_000).prop_map(|n| json!(n)),
+        ]),
+        prop::option::of(prop_oneof![
+            Just(json!(null)),
+            (0u32..1_000_000).prop_map(|n| json!(n)),
+        ]),
+        // 标准字段共存: 缺席 / null / 0 / n>0 — null 变体锁 "标准字段不可解析按
+        // 缺席 → 回退 hit" (presence 权威按可解析值定义, 非字段出现与否).
+        prop::option::of(prop_oneof![
+            Just(json!(null)),
+            Just(json!(0u32)),
+            (1u32..1_000_000).prop_map(|n| json!(n)),
+        ]),
+    )
+        .prop_map(|(prompt, completion, hit, miss, standard)| {
+            let hit_val = hit.as_ref().and_then(Value::as_u64).unwrap_or(0) as u32;
+            let standard_val = standard.as_ref().and_then(Value::as_u64).unwrap_or(0) as u32;
+            let prompt = prompt.max(hit_val).max(standard_val);
+            let mut usage = serde_json::Map::new();
+            usage.insert("prompt_tokens".to_string(), json!(prompt));
+            usage.insert("completion_tokens".to_string(), json!(completion));
+            usage.insert(
+                "total_tokens".to_string(),
+                json!(prompt.saturating_add(completion)),
+            );
+            if let Some(h) = hit {
+                usage.insert("prompt_cache_hit_tokens".to_string(), h);
+            }
+            if let Some(m) = miss {
+                usage.insert("prompt_cache_miss_tokens".to_string(), m);
+            }
+            if let Some(s) = standard {
+                usage.insert(
+                    "prompt_tokens_details".to_string(),
+                    json!({"cached_tokens": s}),
+                );
+            }
+            Value::Object(usage)
+        })
+}
+
+/// A4 property 的响应包装: 与 `arb_openai_response_value` 同形, 仅 usage 换 DeepSeek
+/// 方言生成器.
+fn arb_openai_response_value_with_deepseek_usage() -> impl Strategy<Value = Value> {
+    (
+        "chatcmpl-[a-z0-9]{6,12}",
+        "[a-z0-9-]{3,15}",
+        prop::collection::vec(arb_openai_response_choice(), 1..2),
+        arb_openai_usage_deepseek(),
+    )
+        .prop_map(|(id, model, choices, usage)| {
+            json!({
+                "id": id,
+                "object": "chat.completion",
+                "created": 1234567890_u64,
+                "model": model,
+                "choices": choices,
+                "usage": usage,
+            })
+        })
+}
+
+/// A4 property 的期望提取 (纯机械, 与 reader 的双读链同型的测试侧重述):
+/// (usage 对象, 标准 cached, DeepSeek hit) — 两者按 presence 交由 property 合成优先级.
+fn deepseek_usage_expectation(v: &Value) -> (&Value, Option<u64>, Option<u64>) {
+    let usage = v.get("usage").expect("generator always emits usage");
+    let standard = usage
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(Value::as_u64);
+    let hit = usage.get("prompt_cache_hit_tokens").and_then(Value::as_u64);
+    (usage, standard, hit)
 }
 
 fn arb_stop_reason_openai() -> impl Strategy<Value = Value> {

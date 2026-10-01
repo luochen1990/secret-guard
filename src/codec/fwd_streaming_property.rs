@@ -2432,3 +2432,87 @@ fn cross_proto_streaming_r_to_a_thinking_envelope_golden() {
         "unpaired thinking block stop: {client_str}"
     );
 }
+
+/// A4 探针 (吸收报告 §7.2 不确定项落定): 流式 usage pair 累积策略**现状锁定**.
+///
+/// 对照 cc-switch (MIT @846de29c `usage/parser.rs`) 的三场景矩阵
+/// (`test_claude_stream_prefers_smaller_delta_input_and_cache_pair` /
+/// `test_claude_stream_keeps_start_when_delta_is_larger` /
+/// `test_native_claude_stream_parsing`):
+/// - delta input 更小 (中转修正值) / delta 无 input (原生 Anthropic) 两场景:
+///   我们与 cc-switch 同值;
+/// - **分歧场景**: delta input 更大时 cc-switch 保留 message_start 值 (min 语义,
+///   "start 对原生 Anthropic 可信"), 我们现状是 terminal delta 非零值全胜
+///   (translate.rs 的 field-wise backfill 只补缺失字段)。
+///
+/// 按任务纪律不擅自改行为 — 本测试锁我们现状, 分歧作为后续项记录于吸收实施报告。
+#[test]
+fn cross_proto_stream_usage_pair_accumulation_probe() {
+    // (start usage, delta usage, 期望 completed 帧 usage JSON)
+    let cases: Vec<(Value, Value, Value)> = vec![
+        // delta input 更小 (cc-switch 同值场景 — IR/累积策略层同值; wire 形态按
+        // Responses 求和惯例 input = input+cr+cc, cc-switch 的 Anthropic 形态不同):
+        // delta 全字段胜。
+        (
+            json!({"input_tokens": 200_000, "cache_read_input_tokens": 180_000,
+                    "cache_creation_input_tokens": 2_000}),
+            json!({"input_tokens": 80_000, "output_tokens": 1_000,
+                    "cache_read_input_tokens": 120_000, "cache_creation_input_tokens": 500}),
+            json!({"input_tokens": 200_500, "output_tokens": 1_000, "total_tokens": 201_500,
+                    "input_tokens_details": {"cached_tokens": 120_000}}),
+        ),
+        // delta input 更大 (cc-switch 分歧场景): 我们取 delta (cc-switch 保留 start)。
+        (
+            json!({"input_tokens": 100, "cache_read_input_tokens": 20}),
+            json!({"input_tokens": 150, "output_tokens": 75, "cache_read_input_tokens": 30}),
+            json!({"input_tokens": 180, "output_tokens": 75, "total_tokens": 255,
+                    "input_tokens_details": {"cached_tokens": 30}}),
+        ),
+        // delta 无 input/cache (原生 Anthropic 形态): start 字段 backfill。
+        (
+            json!({"input_tokens": 200, "cache_read_input_tokens": 50}),
+            json!({"output_tokens": 100}),
+            json!({"input_tokens": 250, "output_tokens": 100, "total_tokens": 350,
+                    "input_tokens_details": {"cached_tokens": 50}}),
+        ),
+    ];
+    for (start, delta, expected) in cases {
+        let upstream = [
+            anthropic_frame(
+                "message_start",
+                &json!({"message": {"id": "msg_u", "model": "qwen-max", "usage": start}}),
+            ),
+            anthropic_frame(
+                "content_block_start",
+                &json!({"index": 0, "content_block": {"type": "text", "text": ""}}),
+            ),
+            anthropic_frame(
+                "content_block_delta",
+                &json!({"index": 0, "delta": {"type": "text_delta", "text": "ok"}}),
+            ),
+            anthropic_frame("content_block_stop", &json!({"index": 0})),
+            anthropic_frame(
+                "message_delta",
+                &json!({"delta": {"stop_reason": "end_turn"}, "usage": delta}),
+            ),
+            anthropic_frame("message_stop", &json!({})),
+        ]
+        .concat();
+        let mut t = StreamTranslate::new_cross_proto(
+            Protocol::OpenAIResponses, // ingress (completed 帧聚合 usage)
+            Protocol::Anthropic,       // egress (Anthropic SSE 上游)
+            None,
+        )
+        .expect("ingress != egress required for cross-proto translate");
+        let client = feed_split_translator(&mut t, upstream.as_bytes(), &[40, 90]);
+        let client_str = String::from_utf8_lossy(&client);
+        let completed = iter_sse_frames(&client)
+            .into_iter()
+            .find(|(et, _)| et == "response.completed")
+            .unwrap_or_else(|| panic!("response.completed missing: {client_str}"));
+        assert_eq!(
+            completed.1["response"]["usage"], expected,
+            "start={start} delta={delta}: {client_str}"
+        );
+    }
+}

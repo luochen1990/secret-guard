@@ -902,10 +902,17 @@ fn read_usage(usage: &Value) -> IrUsage {
         .get("prompt_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    // cached 双读: 标准 `prompt_tokens_details.cached_tokens` 优先 (presence 权威,
+    // 含显式 0), DeepSeek 系文档化字段 `prompt_cache_hit_tokens` 兜底 (A4, cc-switch
+    // MIT @846de29c usage/parser.rs 语义对照). DeepSeek 的 prompt_tokens 同样已含
+    // hit+miss, hit 直接作 cache_read — 与标准字段的处理完全同型, 保持 input 总和
+    // 收敛 SSOT (#284 `openai_prompt_tokens`). `prompt_cache_miss_tokens` 仅是 miss
+    // 计数 (隐含于 input = prompt - hit), IrUsage 无独立承载必要, 读侧忽略.
     let cached = usage
         .get("prompt_tokens_details")
         .and_then(|d| d.get("cached_tokens"))
-        .and_then(Value::as_u64);
+        .and_then(Value::as_u64)
+        .or_else(|| usage.get("prompt_cache_hit_tokens").and_then(Value::as_u64));
     let input_tokens = cached
         .and_then(|c| prompt_tokens.checked_sub(c))
         .unwrap_or(prompt_tokens);
@@ -1863,6 +1870,121 @@ mod tests {
         let ir = reader().read_response(&body).unwrap();
         assert_eq!(ir.usage.input_tokens, 70, "uncached input = 100 - 30");
         assert_eq!(ir.usage.cache_read_input_tokens, Some(30));
+    }
+
+    // ─── DeepSeek cache 字段双读 (A4, cc-switch MIT @846de29c usage/parser.rs 语义对照) ──
+    //
+    // DeepSeek 系上游 (DeepSeek/Kimi/GLM 官方端点及中转) 把缓存计数单列在文档化的
+    // `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`, prompt_tokens 已含
+    // hit+miss; reader 缺双读时 hit 静默丢失 (USAGE-2 回显保真违反, 计费按全价虚高).
+
+    #[test]
+    fn read_response_deepseek_hit_fills_cache_read() {
+        // DeepSeek-only 形态: hit 直接作 cache_read, input = prompt - hit (与标准
+        // 字段完全同型); miss 计数隐含于 input (= 1000 - 600 = 400), IrUsage 无独立
+        // 承载必要 (对照 cc-switch: "miss 仅作参考、无需扣减").
+        let body = json!({
+            "id": "x", "model": "deepseek-v4-flash",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 100,
+                "prompt_cache_hit_tokens": 600,
+                "prompt_cache_miss_tokens": 400,
+            }
+        });
+        let ir = reader().read_response(&body).unwrap();
+        assert_eq!(ir.usage.input_tokens, 400, "uncached input = 1000 - 600");
+        assert_eq!(ir.usage.cache_read_input_tokens, Some(600));
+    }
+
+    #[test]
+    fn read_response_prefers_standard_cached_tokens_over_deepseek_hit() {
+        // 两套字段同现时标准字段权威 (含显式 0 — presence 短路, 非真值判断):
+        // 某中转硬编码 cached_tokens: 0 又透传 hit 时不误读 hit.
+        let body = json!({
+            "id": "x", "model": "deepseek-v4-flash",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 10,
+                "prompt_tokens_details": {"cached_tokens": 0},
+                "prompt_cache_hit_tokens": 600,
+            }
+        });
+        let ir = reader().read_response(&body).unwrap();
+        assert_eq!(ir.usage.cache_read_input_tokens, Some(0));
+        assert_eq!(ir.usage.input_tokens, 1000);
+    }
+
+    #[test]
+    fn read_response_deepseek_null_or_missing_hit_treated_as_absent() {
+        // null / 非数值 hit → 按缺席处理 (ROB: 不 panic, cache_read=None).
+        for hit in [serde_json::json!(null), serde_json::json!("600")] {
+            let body = json!({
+                "id": "x", "model": "deepseek-v4-flash",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+                "usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 10,
+                    "prompt_cache_hit_tokens": hit,
+                }
+            });
+            let ir = reader().read_response(&body).unwrap();
+            assert_eq!(ir.usage.cache_read_input_tokens, None, "hit={hit}");
+            assert_eq!(ir.usage.input_tokens, 100, "hit={hit}");
+        }
+    }
+
+    #[test]
+    fn read_response_standard_null_cached_falls_back_to_deepseek_hit() {
+        // 标准字段 null (不可解析) + hit 同现: presence 权威按**可解析值**定义
+        // (非字段出现与否) — 标准缺席语义, 回退 hit.
+        let body = json!({
+            "id": "x", "model": "deepseek-v4-flash",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 10,
+                "prompt_tokens_details": {"cached_tokens": null},
+                "prompt_cache_hit_tokens": 600,
+            }
+        });
+        let ir = reader().read_response(&body).unwrap();
+        assert_eq!(ir.usage.cache_read_input_tokens, Some(600));
+        assert_eq!(ir.usage.input_tokens, 400);
+    }
+
+    #[test]
+    fn stream_chunk_deepseek_usage_extracts_hit() {
+        // 流式路径 (cc-switch test_openai_stream_deepseek_cache_hit_fields 对照):
+        // usage 在末尾 include_usage chunk 上, DeepSeek hit 同样提取 — read_response
+        // 与流式 chunk 共享 read_usage (openai.rs:970), 此处锁接线不断.
+        let chunk = json!({
+            "id": "chatcmpl-ds",
+            "object": "chat.completion.chunk",
+            "model": "deepseek-v4-flash",
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 800,
+                "completion_tokens": 50,
+                "prompt_cache_hit_tokens": 512,
+                "prompt_cache_miss_tokens": 288,
+            }
+        });
+        let mut state = StreamDecodeState::default();
+        let events = reader().read_response_events("", &chunk, &mut state);
+        let IrStreamEvent::MessageDelta {
+            usage,
+            usage_present,
+            ..
+        } = events.last().expect("usage chunk must emit MessageDelta")
+        else {
+            panic!("expected MessageDelta, got: {events:?}");
+        };
+        assert!(usage_present);
+        assert_eq!(usage.input_tokens, 288, "uncached input = 800 - 512");
+        assert_eq!(usage.cache_read_input_tokens, Some(512));
     }
 
     // ─── single_or_array: 纯函数全分支覆盖 ────────────────────────────────
