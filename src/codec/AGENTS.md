@@ -10,6 +10,10 @@
 (`GetBusbar/busbar`, Apache-2.0) 的 superset IR + Reader/Writer trait 设计,
 大幅精简以匹配 secret-guard 的 MVP 范围.
 
+> **调研指针**: cc-switch 的协议转换测试资产盘点 (场景矩阵 + 已吸收项 A4/A12 的
+> attribution 溯源 + 未吸收项处置) 见 `docs/research/cc-switch-test-assets.md` —
+> 扩 STR/USAGE 契约测试覆盖或评估 wire 边角形态 (BOM/CRLF/截断/错误信封) 时先读它.
+
 ## 支持矩阵
 
 - ✅ OpenAI Chat Completions ⇄ Anthropic Messages 双向 (非流式 + 流式 SSE, 含 Redact
@@ -24,7 +28,9 @@
   Responses upstream 由 `cross_protocol_translates_anthropic_ingress_to_responses_upstream`
   锁定. 流式: Anthropic ingress ← Responses upstream 由
   `cross_protocol_streaming_translates_anthropic_ingress_from_responses_upstream` 锁定,
-  Responses ingress ← Anthropic upstream 走同一翻译路径但暂无专属测试).
+  Responses ingress ← Anthropic upstream 由
+  `cross_protocol_streaming_translates_responses_ingress_from_anthropic_upstream_thinking`
+  + `..._tool_use` 锁定 — fixture 搬运自 cc-switch, A12, 2026-10-01).
 - ✅ `reasoning_content` (思考原文, OpenAI 兼容 provider 非标字段) 同协议建模:
   请求 (assistant 历史回传) / 非流式响应 / 流式 delta 三路径 reader↔writer 对称
   (#176, 契约 STR-6). 跨协议处置见下方 T7 条 (o-origin 跨 a 仍丢弃, 跨 r 保留)。
@@ -73,6 +79,11 @@
   `cross_proto_forward` — codec reader/writer 自身不做, 同协议 a→a 含 redact 零触碰).
   识别边界 / 误剥风险 / 记录面细则见 `docs/known-limitations.md` codec 节 T9 条目;
   FWD-1 例外登记见 contracts.md.
+- ✅ **DeepSeek usage 方言双读** (A4, 2026-10-01, cc-switch 测试资产吸收): OpenAI reader
+  的 usage 双读 `prompt_cache_hit_tokens` 兜底填 cache_read (标准字段 presence 优先,
+  与标准字段完全同型 — input 总和收敛 SSOT 不变); `prompt_cache_miss_tokens` 隐含于
+  input 无独立承载. 方言归一化边界与流式 pair 累积分歧见 `docs/known-limitations.md`
+  codec 节 A4 条目; 契约 USAGE-2.
 
 > **thinking/encrypted_content 跨协议搬运 rationale** (T7, 改写 #176 旧裁决): 旧裁决
 > "无法合法合成 signature → 跨协议丢弃" 只否定了**合成**, 未否定**搬运** — cc-switch 的
