@@ -3154,6 +3154,41 @@ test.describe("usage-stats (模型用量统计)", () => {
       `td 内容溢出盒子 (= 文字重叠): ${JSON.stringify(overflows, null, 2)}`
     ).toEqual([]);
   });
+
+  // ─── #244: 首拉失败后不切 range 也能自愈 (节流例外回归) ──────────────────
+  //
+  // 走查现象 (未复现): 首次进入 Usage tab 显示 "no data", 切 range 后恢复。
+  // 机制: 旧 refreshUsage 在 fetch 前消耗节流配额, 首拉失败 (瞬时网络/服务未
+  // 就绪) 后 4.5s 内所有触发被吞 — 再点 tab 无效, 只有 range 按钮 (重置节流)
+  // 生效。修复: 从未成功渲染过节流不生效。
+  //
+  // 复现: 关 auto-refresh (文件级 beforeEach 已静音 SSE → 兜底 tick 3s, auto on
+  // 时旧代码 ~6s 越过节流窗被 tick 自愈会遮蔽红灯; 关掉后 tick 分派为 no-op
+  // (轮询链仍跳), 无自愈路径 — 也是 "auto off 永不自愈" 的最坏场景) → route
+  // abort 首个 summary 请求 → 再点一次 tab (非 range 按钮)。旧代码该触发被
+  // 节流吞 (不再发请求, no data 滞留); 新代码立即重发并渲染。全程不碰 #usage-range。
+  test("usage-stats: 首拉失败后再点 tab 即恢复, 不需切 range (#244)", async ({ page }) => {
+    await page.goto("/");
+    await sendChat(page, [{ role: "user", content: "hi for usage retry" }]);
+    await page.locator("#auto").uncheck();
+    let usageFetches = 0;
+    await page.route("**/api/usage/summary**", async (route) => {
+      usageFetches += 1;
+      if (usageFetches === 1) await route.abort("connectionfailed");
+      else await route.continue();
+    });
+    await page.locator('a.tab[data-tab="usage"]').click();
+    // 首拉失败落地 (setStatus 走 status-err class, 语言无关的确定性信号) —
+    // 保证随后的 tab 再点击落在 "配额已耗" 窗口内 (旧代码红灯的确定性前提)。
+    await expect(page.locator("#status.status-err")).toBeVisible({ timeout: 5_000 });
+    // 用户动作 = 再点一次 tab (非 range 切换), 新代码绕过节流立即重发。
+    await page.locator('a.tab[data-tab="usage"]').click();
+    await expect
+      .poll(async () => page.locator("#usage-by-model-body tr:not(:has(td.empty))").count(), { timeout: 8_000 })
+      .toBeGreaterThan(0);
+    // 重试真实发生 (≥2 个 summary 请求), 数据到达非 "no data" 占位。
+    expect(usageFetches).toBeGreaterThanOrEqual(2);
+  });
 });
 
 // ─── Provider Detect 协议探测 (POST /api/providers/probe) ─────────────────

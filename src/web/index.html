@@ -5451,12 +5451,14 @@
 
     // ─── usage tab: 模型用量统计 (usage-stats 设计 M4) ────────────────────
     //
-    // 数据流: GET /api/usage/summary?days=N (tab 激活时 5s 节流轮询 — summary 载荷
+    // 数据流: GET /api/usage/summary?hours=N (tab 激活时 5s 节流轮询 — summary 载荷
     // 比 sync diff 重, 不进 sync 主循环). 渲染: 汇总卡 / 按天堆叠 SVG 柱状图 /
     // by model / by provider 表. cost 恒为估算 ("~", P-4), 无价显示 "—".
 
     let usageHours = 168;
     let usageLastFetch = 0;
+    // #244: 首次成功渲染前节流不生效 — rationale 见 refreshUsage.
+    let usageRenderedOnce = false;
 
     function setUsageHours(hours, btn) {
       usageHours = hours;
@@ -5468,9 +5470,14 @@
     }
 
     async function refreshUsage() {
-      // 节流: 手动切换 tab / 点击 range 立即拉, 轮询路径 5s 间隔.
+      // 节流: 手动切换 tab / 点击 range 立即拉, 轮询路径 ≥4.5s 间隔.
+      // 两个防御例外 (#244, 未复现的 "首次进入 no data" 走查):
+      //   1. 从未成功渲染过 → 放行任何触发: 首拉失败 (瞬时网络/服务未就绪) 不留
+      //      "no data 占位 + 节流配额已耗" 的空窗, 后续触发立即重试;
+      //   2. now < usageLastFetch (时钟回拨, 如沙箱 NTP 校正) → 放行: 负间隔恒
+      //      < 4500, 会被判 "未到间隔" 吞掉刷新直到时钟追平.
       const now = Date.now();
-      if (now - usageLastFetch < 4500) return;
+      if (usageRenderedOnce && now >= usageLastFetch && now - usageLastFetch < 4500) return;
       usageLastFetch = now;
       let data;
       try {
@@ -5482,6 +5489,7 @@
         return;
       }
       renderUsage(data);
+      usageRenderedOnce = true;
     }
 
     /** cost 紧凑格式: $12.41 / $0.0021 (<$0.01 用 4 位小数). */

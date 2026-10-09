@@ -125,7 +125,10 @@ GET    /api/usage/summary[?hours=N]  → UsageSummary {range, pricing_status, to
                                                  (模型用量统计: hours 缺省 168 (7d), 0→1,
                                                   上限 min(retention_days×24, 9600);
                                                   ≤14d hour 粒度, 更长 day 折叠;
-                                                  usage tab 5s 节流轮询)
+                                                  usage tab 5s 节流轮询; 节流例外
+                                                  (#244): 从未成功渲染过 → 放行任何
+                                                  触发 + 时钟回拨放行, 防首拉失败/
+                                                  时钟校正留下不自愈空态)
 ```
 
 > **探测假设 (best-effort 已知边界)**: 探测假设 base_url 是裸 origin/base (不带
