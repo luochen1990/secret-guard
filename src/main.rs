@@ -54,6 +54,7 @@ async fn main() -> Result<()> {
         on_probe_exhausted = ?static_cfg.redact.on_probe_exhausted,
         on_unsupported_protocol = ?static_cfg.redact.on_unsupported_protocol,
         on_fallback_restore = ?static_cfg.redact.on_fallback_restore,
+        privacy_scan = ?static_cfg.privacy_scan.mode,
         "starting secret-guard"
     );
 
@@ -70,6 +71,7 @@ async fn main() -> Result<()> {
         static_cfg.redact,
         upstream_timeouts,
         static_cfg.usage,
+        static_cfg.privacy_scan,
         static_cfg.server.allowed_domains,
     )
     .await

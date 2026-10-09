@@ -3534,3 +3534,69 @@ test.describe("i18n: 语言自动选择 + 切换 + 持久化 (#298)", () => {
     await expect(page.locator("#detail .request-pane .chat-bubble")).toContainText("i18n-round-marker");
   });
 });
+
+// ─── #257 S0.5: 隐私旁路扫描 (疑似未登记面板 + 登记预填闭环) ────────────────
+//
+// server 配置 (playwright.config.ts) 开 [privacy_scan] mode = "batch".
+// 覆盖: ① 未登记 AWS 形状 key → 面板出现 + 行内容 (value/pattern/context);
+// ② 「登记」→ add-secret 表单预填 value + 建议 name (pattern + 日期);
+// ③ 提交 (POST /api/secrets) 后告警行经视图过滤消失 — 「告警→登记」人回路闭环.
+// 已登记 test-key (sk- 开头, 命中 openai pattern 形状) 不产生告警 (排除规则 +
+// 视图过滤双层) — 由 ① 的 "AWS 行存在 + 面板不含 test-key 真值" 断言顺带守卫.
+test.describe("#257 S0.5: privacy scan (unregistered candidates)", () => {
+  const AWS_KEY = "AKIA" + "UIE2E5E7TESTKEY9";
+
+  test.beforeEach(async ({ page }) => {
+    await page.goto("/");
+    await page.waitForLoadState("networkidle");
+  });
+
+  test("未登记 token 告警出现 → 登记预填 → 提交后告警消失", async ({ page }) => {
+    // ① 发送含未登记 AWS 形状 key 的请求. secrets 表含已登记 test-key (非空)
+    //    → same-proto 走 IR 路径, 扫描捕获挂在 redact seam (透传分支的旁路扫描
+    //    由 Rust 集成测试 privacy_scan_batch_alerts_unregistered_key_in_passthrough
+    //    单独覆盖 — 那里 secrets 表为空).
+    await sendChat(page, [
+      { role: "user", content: `privacy-scan-marker leaking ${AWS_KEY} in prose` },
+    ]);
+
+    // ② Secrets tab: 面板出现 (enabled) + 告警行 (value/pattern/context).
+    await page.locator('a.tab[data-tab="secrets"]').click();
+    const row = page.locator(
+      `#privacy-alerts-body tr:has(td.mono-cell:text-is("${AWS_KEY}"))`
+    );
+    await expect(row).toBeVisible({ timeout: 10_000 });
+    await expect(row).toContainText("AWS Access Key ID");
+    await expect(row).toContainText("privacy-scan-marker");
+
+    // 面板中不出现已登记 test-key 的值 (排除规则 + 视图过滤).
+    const panelText = await page.locator("#privacy-scan-panel").textContent();
+    expect(panelText).not.toContain(TEST_SECRET_VALUE);
+
+    // ③ 「登记」→ 既有 add-secret 表单打开, value/name 预填 (建议 name =
+    //    pattern + 日期). 显式填 id (便于末尾清理; 不填则服务端生成 UUID).
+    await row.locator('button[data-action="register"]').click();
+    const dlg = page.locator("dialog#secret-form");
+    await expect(dlg).toBeVisible();
+    await expect(dlg.locator("#f-value")).toHaveValue(AWS_KEY);
+    const today = new Date().toISOString().slice(0, 10);
+    await expect(dlg.locator("#f-name")).toHaveValue(`AWS Access Key ID ${today}`);
+    await dlg.locator("#f-id").fill("privacy-scan-registered");
+
+    // ④ 提交 → POST /api/secrets 成功 → 表单关闭 + 告警行经视图过滤消失
+    //    (登记后人回路收口; 服务端已登记值被 alerts 视图过滤).
+    await dlg.locator("#f-save").click();
+    await expect(dlg).not.toBeVisible({ timeout: 10_000 });
+    await expect(
+      page.locator(`#privacy-alerts-body td.mono-cell:text-is("${AWS_KEY}")`)
+    ).toHaveCount(0, { timeout: 10_000 });
+
+  });
+
+  // 清理: 删除本用例登记的 dynamic secret (workers=1 共享 state, 防泄漏到其他
+  // 用例的 secrets 表断言 — 断言中途失败也能恢复; DELETE 对已删条目 404, 幂等
+  // 判定只要求请求完成). 仿 B3 describe 的文件级 afterEach 卫生钩子先例.
+  test.afterEach(async ({ request }) => {
+    await request.delete(`${SG_API}/secrets/privacy-scan-registered`);
+  });
+});

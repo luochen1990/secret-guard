@@ -150,7 +150,7 @@
     pre, code, .raw-pre, .resp-body, .bubble-tool, .bubble-tool-call, .xml-block,
     .full-body, .info-val, dialog#secret-form form textarea, textarea#apikey-reveal-value,
     .probe-chip, .probe-url, .common-uri-badge,
-    .ep-short, .ep-url > code {
+    .ep-short, .ep-url > code, #privacy-scan-panel td.mono-cell {
       font-family: "SF Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
     }
     /* 数字密集区统一 tabular-nums (时间戳/计数/表格), 避免数字宽窄跳动. */
@@ -435,6 +435,17 @@
     }
     table.secrets td.actions { white-space: nowrap; }
     table.secrets tr.row-disabled td { color: var(--fg-faint); text-decoration: line-through; }
+    /* privacy scan 告警行 (#257 S0.5): value 等宽 (font 家族见上方集中声明) +
+       溢出省略 (title 全量); context 摘要同省略行为, muted 收窄. */
+    #privacy-scan-panel td.mono-cell,
+    #privacy-scan-panel td.ctx-cell {
+      max-width: 280px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 11.5px;
+    }
+    #privacy-scan-panel td.ctx-cell { color: var(--fg-muted); }
     /* 行级背景提示用半透明染色 (软染在明暗两底上都不刺眼). */
     table.secrets tr.row-override { background: var(--tint-override); }
     table.secrets tr.row-preferred { background: var(--tint-preferred); }
@@ -1771,6 +1782,34 @@
             <tr><td colspan="9" class="empty" data-i18n="secrets.empty">No secrets configured</td></tr>
           </tbody>
         </table>
+        <!-- #257 S0.5: 疑似未登记候选 (privacy scan 告警, mode=off 时整个面板隐藏 —
+             enabled 标志驱动, 见 refreshPrivacyAlerts). 登记走既有 add-secret 表单
+             (预填 value + 建议 name), 永不自动登记. -->
+        <div id="privacy-scan-panel" hidden style="margin-top: 24px;">
+          <div class="secrets-toolbar">
+            <h3 style="margin: 0;" data-i18n="privacy.title">Unregistered candidates</h3>
+          </div>
+          <div class="hint" style="margin-bottom: 8px;" data-i18n-html="privacy.hint">
+            Token-shaped values spotted in request bodies that no registered secret
+            manages. Review and register the real ones — registering never happens
+            automatically.
+          </div>
+          <table class="secrets">
+            <thead>
+              <tr>
+                <th data-i18n="privacy.th.value">Value</th>
+                <th data-i18n="privacy.th.pattern">Pattern</th>
+                <th data-i18n="privacy.th.hits">Hits</th>
+                <th data-i18n="privacy.th.lastSeen">Last seen</th>
+                <th data-i18n="privacy.th.context">Context</th>
+                <th class="actions" data-i18n="privacy.th.actions">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="privacy-alerts-body">
+              <tr><td colspan="6" class="empty" data-i18n="privacy.empty">No unregistered candidates so far</td></tr>
+            </tbody>
+          </table>
+        </div>
       </div>
     </section>
     <section id="tab-providers" class="tab-content">
@@ -2288,6 +2327,20 @@
         'secrets.new': '+ new dynamic secret',
         'secrets.empty': 'No secrets configured',
         'secrets.hint': 'Static (declarative) items come from <code>secret-guard.toml</code>; dynamic items from <code>secret-guard.state.toml</code>. Edit a static item to fork a dynamic override. Use the <b>decision</b> dropdown to disable a static id or force-prefer its static value.',
+        // ── privacy scan (疑似未登记, #257 S0.5) ──
+        'privacy.title': 'Unregistered candidates',
+        'privacy.hint': 'Token-shaped values spotted in request bodies that no registered secret manages. Review and register the real ones — registering never happens automatically.',
+        'privacy.empty': 'No unregistered candidates so far',
+        'privacy.th.value': 'Value',
+        'privacy.th.pattern': 'Pattern',
+        'privacy.th.hits': 'Hits',
+        'privacy.th.lastSeen': 'Last seen',
+        'privacy.th.context': 'Context',
+        'privacy.th.actions': 'Actions',
+        'privacy.register': 'Register',
+        'privacy.registerTitle': 'Open the new-secret form prefilled with this value',
+        'privacy.nameSuggestion': '{pattern} {date}',
+        'privacy.loadFailed': 'Failed to load unregistered candidates',
         'th.id': 'ID',
         'th.name': 'Name',
         'th.category': 'Category',
@@ -2706,6 +2759,20 @@
         'secrets.new': '+ 新建动态 secret',
         'secrets.empty': '尚未配置 secret',
         'secrets.hint': '静态 (声明式) 条目来自 <code>secret-guard.toml</code>; 动态条目来自 <code>secret-guard.state.toml</code>。编辑静态条目会派生一个动态覆盖。使用<b>决策</b>下拉可禁用某个静态 id 或强制优先其静态值。',
+        // ── privacy scan (疑似未登记, #257 S0.5) ──
+        'privacy.title': '疑似未登记',
+        'privacy.hint': '在请求体中发现、但没有任何已登记 secret 管理的 token 形状值。确认真的就该管起来就登记 — 登记永远不会自动发生。',
+        'privacy.empty': '暂未发现疑似未登记的候选',
+        'privacy.th.value': '值',
+        'privacy.th.pattern': '模式',
+        'privacy.th.hits': '命中',
+        'privacy.th.lastSeen': '最近出现',
+        'privacy.th.context': '上下文',
+        'privacy.th.actions': '操作',
+        'privacy.register': '登记',
+        'privacy.registerTitle': '打开预填该值的新建 secret 表单',
+        'privacy.nameSuggestion': '{pattern} {date}',
+        'privacy.loadFailed': '加载疑似未登记候选失败',
         'th.id': 'ID',
         'th.name': '名称',
         'th.category': '类别',
@@ -3019,6 +3086,7 @@
       renderKind('secret');
       renderKind('provider');
       renderApiKeys();
+      renderPrivacyAlerts();
       // count-label 是静态词条 + 动态 [mode] 后缀的合成 (updateCountDisplay),
       // applyI18nStaticTexts 已把它重置为纯词条 — 补一次动态合成 (review m4)。
       updateCountDisplay();
@@ -5433,8 +5501,78 @@
 
     // ─── secrets / providers tab (薄壳, 只保留类型特定的部分) ─────────────
 
-    async function refreshSecrets() { await refreshKind('secret'); }
+    async function refreshSecrets() {
+      await refreshKind('secret');
+      // #257 S0.5: 告警与 secrets 同 tab, 顺带刷新 (登记提交后的 cfg.refresh()
+      // 也走这里 → 告警行经视图过滤自然消失).
+      refreshPrivacyAlerts();
+    }
     async function refreshProviders() { await refreshKind('provider'); }
+
+    // ─── privacy scan (疑似未登记候选, #257 S0.5) ─────────────────────────
+    //
+    // 数据流: GET /api/privacy-scan/alerts (enabled 标志 + 服务端已过滤已登记值),
+    // 与 secrets 表同 tab 但独立数据源 — 挂在 refreshSecrets 之后 (tab 激活 /
+    // CRUD 后刷新自然带动: 登记提交 → cfg.refresh() → 本函数 refetch → 告警行
+    // 消失, "refetch 更新" 语义, 不做乐观删除). off 档 (enabled:false) 隐藏面板.
+
+    let privacyAlertsData = { enabled: false, alerts: [] };
+
+    async function refreshPrivacyAlerts() {
+      try {
+        const r = await fetch('/api/privacy-scan/alerts', { cache: 'no-store' });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        privacyAlertsData = await r.json();
+      } catch (e) {
+        console.error(e);
+        // 加载失败不阻塞 secrets 表; 面板曾开启过才提示 (off 档静默).
+        if (privacyAlertsData.enabled) setStatus(t('privacy.loadFailed'), 'status-err');
+        return;
+      }
+      renderPrivacyAlerts();
+    }
+
+    function renderPrivacyAlerts() {
+      const panel = document.getElementById('privacy-scan-panel');
+      if (!privacyAlertsData.enabled) {
+        panel.hidden = true;
+        return;
+      }
+      panel.hidden = false;
+      const body = document.getElementById('privacy-alerts-body');
+      const alerts = privacyAlertsData.alerts || [];
+      const html = alerts.length === 0
+        ? `<tr><td colspan="6" class="empty">${escapeHtml(t('privacy.empty'))}</td></tr>`
+        : alerts.map(privacyAlertRow).join('');
+      replaceTbodyIfChanged(body, html);
+    }
+
+    function privacyAlertRow(a) {
+      const value = escapeHtml(a.value);
+      const label = escapeHtml(a.pattern_label || a.pattern_id);
+      const btn = `<button class="btn" data-action="register" `
+        + `data-value="${value}" data-label="${label}" `
+        + `title="${escapeHtml(t('privacy.registerTitle'))}">`
+        + `${escapeHtml(t('privacy.register'))}</button>`;
+      return `<tr>`
+        + `<td class="mono-cell" title="${value}">${value}</td>`
+        + `<td>${label}</td>`
+        + `<td>${a.hit_count}</td>`
+        + `<td>${fmtTsShort(a.last_seen)}</td>`
+        + `<td class="ctx-cell" title="${escapeHtml(a.context || '')}">${escapeHtml(a.context || '')}</td>`
+        + `<td class="actions">${btn}</td>`
+        + `</tr>`;
+    }
+
+    // 「登记」按钮 → 既有 add-secret 表单预填 (value + 建议 name = pattern + 日期).
+    // 人回路红线: 仅预填, 提交仍走用户确认的 POST /api/secrets.
+    function registerPrivacyAlert(value, patternLabel) {
+      const date = new Date().toISOString().slice(0, 10);
+      openSecretForm(null, {
+        prefillValue: value,
+        prefillName: t('privacy.nameSuggestion', { pattern: patternLabel, date }),
+      });
+    }
 
     // ─── API keys tab ─────────────────────────────────────────────────────
 
@@ -6209,6 +6347,14 @@
     bindTableEvents('secret');
     bindTableEvents('provider');
 
+    // privacy scan 告警行的「登记」按钮 (事件委托, 同 bindTableEvents 模式 —
+    // 行由 replaceTbodyIfChanged 动态重建, 不能逐按钮绑定).
+    document.getElementById('privacy-alerts-body').addEventListener('click', (e) => {
+      const btn = e.target.closest('button[data-action="register"]');
+      if (!btn) return;
+      registerPrivacyAlert(btn.dataset.value || '', btn.dataset.label || '');
+    });
+
     function populateCategorySelect() {
       const sel = document.getElementById('f-category');
       sel.innerHTML = state.secretCategories.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
@@ -6241,7 +6387,10 @@
       sel.value = value;
     }
 
-    function openSecretForm(existing) {
+    // prefill (可选): privacy scan 告警的「登记」入口 (#257 S0.5) — 预填 value +
+    // 建议 name. 仅用于新建 (existing 为 null); 编辑路径强制重输 value 的语义
+    // 不变 (服务端从不回传真实值, 预填无从谈起).
+    function openSecretForm(existing, prefill) {
       populateCategorySelect();
       const dlg = document.getElementById('secret-form');
       const title = document.getElementById('secret-form-title');
@@ -6250,9 +6399,11 @@
       idInput.value = existing?.id || '';
       // 编辑模式下 ID 不可改 (PUT 路径以 URL 中的 id 为准).
       idInput.disabled = !!existing;
-      document.getElementById('f-name').value = existing?.name || '';
+      document.getElementById('f-name').value = existing?.name || prefill?.prefillName || '';
       document.getElementById('f-category').value = existing?.category || state.secretCategories[0] || 'apikey';
-      document.getElementById('f-value').value = ''; // 强制重输, 避免泄露.
+      // 编辑: 强制重输 value (避免泄露 — 服务端不回传真实值);
+      // 预填 (privacy scan 登记): value 已在告警行明文可见, 预填无新增暴露面.
+      document.getElementById('f-value').value = (!existing && prefill?.prefillValue) || '';
       // Mock strategy: 加载 existing 或默认值.
       loadMockStrategyIntoForm(existing?.mock_strategy);
       title.textContent = existing ? t('form.secret.editTitle', { id: existing.id }) : t('form.secret.newTitle');

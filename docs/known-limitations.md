@@ -62,6 +62,16 @@
 - **pool 耗尽检测不覆盖流式 2xx 的 mid-stream SSE 错误事件**: 检测挂在 "上游错误响应 (4xx/5xx, body 已缓冲)" 的位置, `PoolWatch` 对 2xx 直接短路 — 假设: 智谱/Claude 撞窗在 HTTP 层拒绝 (429 + 错误信封), 不在 SSE 流中 (假设声明见 `pool.rs::detect_and_mark`)。若某上游改为在 2xx SSE 流内报告窗口耗尽, 该信号不可见 (成员不会被标记, 不切换)。
 - **pool 内置默认信号表是发布时点快照**: 常量 `DEFAULT_WINDOW_EXHAUST_CODES/HEADERS` 编译进二进制 (智谱 1308/1310 + Claude unified headers), 各家可能新增/变更窗口限额错误码 — 网关不感知, 表现为该信号下不切换成员。用户可经 `[providers.exhaust]` 自行补码 (字段级替换语义, opt-in 姿势清单见 `docs/configuration.md`)。
 
+## privacy-scan (隐私旁路扫描, #257 S0.5)
+
+- **告警为内存态, 重启清空**: `AlertStore` 是 `VecDeque` (cap 256, FIFO 淘汰), 不落盘 — 规避 SEC-8 落盘收紧问题, 一次会话内验证「告警→登记」闭环足够; 重启后告警从零累积 (已登记值天然不会再告警, 无需迁移).
+- **Gemini/Ollama 字节透传族不扫描**: 扫描数据源是 codec IR 的字符串叶子 (pre-redact 视图); gemini/ollama 无 codec (透传路径无 IR 解析, 降级透传分支亦然), 该两族的请求体不产生告警. 覆盖 o/a/r 三族 (透传分支做 best-effort 只读解析).
+- **正则形状判定有误报可能 (告警非定罪)**: pattern 是常见 token 形状的启发式 (如 40+ word 字符的 `sk-` 串), 误报 worst case = 面板多一行告警 — 永不拦截转发, 登记永远经人回路确认. 通用 high-entropy 长串**刻意不做** (误报不可控, 留给 Laya S1+).
+- **扫描覆盖面上限 (内存自保)**: 每请求捕获预算 1 MiB (叶子粒度扣减, 累计首超后剩余叶子跳过) + 单叶上限 2 MiB (超过整体跳过) + 在途 channel 32 job — 超限内容不产生告警 (转发不受任何影响; 单条消息 > 2 MiB 已属病理性粘贴).
+- **AlertStore 存储侧 value 尺寸无截断 (有意)**: 告警 value 存**完整**命中串 (最长可达单叶上限) — 截断会破坏「登记预填需要完整真值」的产品闭环 (截断值登记后 redact 永不匹配). 理论最坏存储 = 256 个互异巨型 token ≈ 数百 MiB, 触发需病理性输入且 batch 为显式 opt-in, 接受该残余 (pattern 形状的最长命中是 JWT, 常规尺寸远低于上限).
+- **`realtime` 档位未实现不预留**: `[privacy_scan] mode` 值域只有 `off`/`batch`; `realtime` 属 Laya S2 (待 #257 五个开放问题拍板), 写入该值启动 fail-fast (不静默降级).
+- **disabled secret 的值不受排除保护**: 排除集 = effective secrets 值 (Disabled 条目不在 effective view), disabled secret 真值若匹配 pattern 会告警 — 语义上它是 "已登记但保护被关闭", 告警可视为提示用户该值正在无保护地流向上游 (与 #161 明文放行 WARN 同向).
+
 ## redact (Redact / Mock / 脱敏面)
 
 - **Mock probing 耗尽 (默认 fail-closed 拒绝转发, SEC-10)**: 弱配置 (charset/length 仅产生极少候选) + 对抗性 IR 可能让 `redact_ir` 的 mock probing 耗尽 (`MOCK_PROBE_LIMIT`). 两道前置防线: ① **Auto widen 兜底** (2026-09, `GenSpec::infer_default_for`): 推断 charset 候选空间 < 2^20 时逐级并入 lowercase → digits → uppercase — Auto 模式 resolve 后空间恒 ≥ 阈值 (退化 real 如全同字符 `""""` 也不再耗尽); 极短 real (n ≤ 3: 全开后 65³ ≈ 27 万仍 < 2^20) 是等长约束下的物理边界, 兜到全开即停 — 该形态 Auto resolve 后仍会触发 lint WARN; ② 配置写入时 (static 加载 / WebUI upsert) 对 GenSpec 候选空间做 lint WARN (`MockStrategy::lint_candidate_space`, 阈值 `MIN_CANDIDATE_SPACE_WARN` = 2^20, 低于即 WARN, 不拒绝) — widen 后 Auto 场景实际不触发, lint 的有效对象是**用户手动配置**的 gen_spec. 默认 `[redact] on_probe_exhausted = "fail_closed"` (**拒绝转发**, 返回 503, 防止 secret 泄露到 LLM provider, SEC-10 降级偏安全 — 2026-09 自 fail_open 翻转; 配置期 lint 已把弱配置拦截在写入时, 运行时残余正是对抗场景). 历史 fail-open 行为 (warn + 跳过该 secret 原样转发) 需显式配 `"fail_open"` opt-in. 注意 fail_closed 拒绝时返回的 503 body 不含 secret 明文 (变量部分只含 secret id + reason 枚举, 语义由 SEC-2 契约锁定).

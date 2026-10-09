@@ -178,6 +178,8 @@ async fn spawn(providers: Vec<Provider>) -> String {
         ),
         // shutdown flag: 本 harness 不消费 /api/events (sender drop 语义见
         // integration.rs::base_app_state 同字段注释).
+        // #257 S0.5: 默认 off (本 harness 不触隐私扫描语义).
+        privacy_scan: secret_guard::privacy::PrivacyScanner::disabled(),
         shutdown: tokio::sync::watch::channel(false).1,
     };
     let app = server::build_router(

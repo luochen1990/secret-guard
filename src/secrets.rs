@@ -299,6 +299,17 @@ pub(crate) fn mask_value(v: &str) -> String {
     format!("{head}{stars}{tail}")
 }
 
+/// effective 快照 → 非空真值集合 (#257 S0.5 隐私扫描的排除集投影 SSOT:
+/// proxy 两条 redact seam 的 `PrivacyScanner::submit` 与 web alerts API 的
+/// 视图过滤共用 — 空值跳过的预处理在此一次收口, 消费方不再重复过滤).
+pub fn non_empty_values(entries: &[SecretEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|e| !e.value.is_empty())
+        .map(|e| e.value.clone())
+        .collect()
+}
+
 // ─── DynamicEntry impl: 把 SecretEntry 接入泛型 DynamicTable ──────────────
 
 impl DynamicEntry for SecretEntry {

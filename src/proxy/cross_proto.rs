@@ -151,12 +151,16 @@ pub(crate) async fn cross_proto_forward(
     // 7. redact IR + derive redactions (共享 helper, 内含 consistency-check 守卫).
     //    FailClosed 模式下 probing 耗尽时 redact_and_derive 内部构造 503 并在此
     //    `?` 拒绝转发 (防 secret 泄露).
+    //    #257 S0.5: 与 same_proto 同型 — redact 前 capture, redact 后携带已登记
+    //    值集合提交 (`?` 短路跳过提交: 请求已拒绝, 无需告警).
+    let privacy_job = state.privacy_scan.capture(&ir);
     let (redaction_map, redact_seed, redactions, redact_hits) = redact_and_derive(
         &mut ir,
         &secrets_snapshot,
         state.on_probe_exhausted,
         "cross-proto",
     )?;
+    state.privacy_scan.submit(privacy_job, &secrets_snapshot);
 
     // 8. IR → egress body. (T5 引入 / T7 精确化: reasoning 族 block 的跨协议
     //    损失按 egress 能力计数 — 见 count_reasoning_blocks 假设声明; WARN 在

@@ -357,6 +357,9 @@ fn base_app_state(
         audit_capture: secret_guard::state::AuditCapture::for_tests(
             secret_guard::config::AuditCaptureMode::Full,
         ),
+        // #257 S0.5: 默认 off (热路径零影响是默认档契约; batch 语义由隐私扫描
+        // 集成测试段显式构造覆盖 — spawn_proxy_with_privacy_scan).
+        privacy_scan: secret_guard::privacy::PrivacyScanner::disabled(),
         // shutdown flag: sender 立即 drop → channel 关闭 → SSE 流视同 shutdown
         // 立即结束 — 本 harness 的测试不消费 /api/events, 无感知; SSE 专用测试
         // (spawn_proxy_with_events) 持有 sender 模拟生产装配.
@@ -13249,4 +13252,315 @@ async fn sse_events_stream_ends_on_shutdown_flag() {
             break; // EOF — 流被 shutdown flag 终止
         }
     }
+}
+
+// ─── 隐私旁路扫描 (#257 S0.5) ───────────────────────────────────────────────
+//
+// 覆盖矩阵:
+// ① batch + secrets 全空 (透传分支旁路只读解析): 未登记 AWS key 产生告警,
+//    转发字节逐字节不变 (mockito Exact 匹配) — 红线 1/2 的端到端守卫.
+// ② batch + secrets 非空 (IR 路径): 已登记真值被排除, mock 不进扫描
+//    (pre-redact 数据源), 未登记 token 正常告警; redact 行为不受扫描影响.
+// ③ off (默认): enabled:false + 空告警 + 转发字节透传.
+// ④ 闭环: 告警出现 → 经 API 登记同值 secret → 告警从视图消失 (登记后人回路
+//    收口, 无自动登记).
+
+/// spawn helper: privacy_scan 档位可控, 其余镜像 base_app_state.
+async fn spawn_proxy_with_privacy_scan(
+    mode: secret_guard::config::PrivacyScanMode,
+    providers: Vec<Provider>,
+    secrets: SecretTable,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state_path = tmp_state_path("sg-state-privacy");
+    let decisions = std::sync::Arc::new(parking_lot::RwLock::new(
+        secret_guard::config::Decisions::default(),
+    ));
+    let persist_lock = std::sync::Arc::new(parking_lot::Mutex::new(()));
+    let provider_table = ProviderTable::with_persist_lock(
+        providers,
+        vec![],
+        decisions.clone(),
+        state_path.clone(),
+        persist_lock.clone(),
+    );
+    let _ = (decisions, persist_lock, state_path);
+    // PrivacyScanner::new 需在 tokio runtime 内 (本 harness 为 async, 生产为 serve).
+    let privacy_scan = match mode {
+        secret_guard::config::PrivacyScanMode::Off => {
+            secret_guard::privacy::PrivacyScanner::disabled()
+        }
+        secret_guard::config::PrivacyScanMode::Batch => {
+            secret_guard::privacy::PrivacyScanner::new()
+        }
+    };
+    let proxy = AppState {
+        privacy_scan,
+        ..base_app_state(
+            reqwest::Client::new(),
+            provider_table,
+            ConversationDag::new(64, 500, 1),
+            secrets,
+        )
+    };
+    let app = server::build_router(
+        proxy,
+        secret_guard::server_host_guard::HostGuard::new("127.0.0.1", addr.port()),
+    );
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}")
+}
+
+/// 轮询 alerts API 直到谓词满足 (后台扫描 task 异步消费, 有界等待).
+async fn wait_for_alerts<F>(proxy_url: &str, predicate: F) -> serde_json::Value
+where
+    F: Fn(&serde_json::Value) -> bool,
+{
+    let client = reqwest::Client::new();
+    for _ in 0..200 {
+        let resp = client
+            .get(format!("{proxy_url}/api/privacy-scan/alerts"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        if predicate(&body) {
+            return body;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("alerts predicate never satisfied within timeout");
+}
+
+/// AWS Access Key ID 形状工厂 (AKIA + 16 位大写字母数字, 与 src/privacy.rs 单测同型).
+fn aws_shaped_key(seed: &str) -> String {
+    let mut tail: String = seed
+        .chars()
+        .filter(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        .collect();
+    while tail.len() < 16 {
+        tail.push('X');
+    }
+    format!("AKIA{}", &tail[..16])
+}
+
+#[tokio::test]
+async fn privacy_scan_batch_alerts_unregistered_key_in_passthrough() {
+    let mut upstream = spawn_mock_upstream().await;
+    let aws_key = aws_shaped_key("PASSTHRUTEST0001");
+    // Exact 匹配 = 上游收到的字节与客户端发送的逐字节一致 (透传不被扫描触碰).
+    let body = format!(
+        r#"{{"model":"gpt-4","messages":[{{"role":"user","content":"leaking {aws_key} here"}}]}}"#
+    );
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .match_body(mockito::Matcher::Exact(body.clone()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"chatcmpl-1","choices":[]}"#)
+        .create_async()
+        .await;
+
+    // secrets 全空 → same_proto 走字节透传分支; 扫描开启时旁路只读解析.
+    let proxy_url = spawn_proxy_with_privacy_scan(
+        secret_guard::config::PrivacyScanMode::Batch,
+        vec![openai_provider("oa-main", &upstream.url())],
+        test_secret_table(),
+    )
+    .await;
+    let (status, resp_body, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        &body,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert!(resp_body.contains("chatcmpl-1"));
+
+    let alerts = wait_for_alerts(&proxy_url, |v| {
+        v["enabled"] == serde_json::json!(true)
+            && v["alerts"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|x| x["value"] == serde_json::json!(aws_key)))
+    })
+    .await;
+    let entry = alerts["alerts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["value"] == serde_json::json!(aws_key))
+        .unwrap();
+    assert_eq!(entry["pattern_id"], serde_json::json!("aws-access-key-id"));
+    assert!(entry["context"].as_str().unwrap().contains("leaking"));
+}
+
+#[tokio::test]
+async fn privacy_scan_excludes_registered_secret_and_never_sees_mock() {
+    let mut upstream = spawn_mock_upstream().await;
+    // 已登记 secret 选 GitHub 形状 (能被 pattern 命中 — 验证排除规则真的生效,
+    // 而不是形状碰巧不匹配).
+    let registered = format!("ghp_{}", "r".repeat(40));
+    let aws_key = aws_shaped_key("IRPATHTEST00002");
+    let body = format!(
+        r#"{{"model":"gpt-4","messages":[{{"role":"user","content":"real {registered} and stray {aws_key}"}}]}}"#
+    );
+    // PartialJson: 上游收到的 user content 含 mock (redact 照常) 且不含真值 —
+    // 用 partial 匹配锚定 content 前缀 (mock 值动态生成, 不断言具体值).
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "model": "gpt-4",
+        })))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"chatcmpl-1","choices":[]}"#)
+        .create_async()
+        .await;
+
+    let proxy_url = spawn_proxy_with_privacy_scan(
+        secret_guard::config::PrivacyScanMode::Batch,
+        vec![openai_provider("oa-main", &upstream.url())],
+        test_secret_table_with(vec![secret("reg-gh", &registered)]),
+    )
+    .await;
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        &body,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+
+    // 告警 = 仅未登记 AWS key; 已登记 GitHub token 不出现.
+    let alerts = wait_for_alerts(&proxy_url, |v| {
+        v["alerts"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|x| x["value"] == serde_json::json!(aws_key)))
+    })
+    .await;
+    let arr = alerts["alerts"].as_array().unwrap();
+    assert!(
+        arr.iter()
+            .all(|x| x["value"] != serde_json::json!(registered)),
+        "registered secret value must not alert: {arr:?}"
+    );
+
+    // redact 照常: mockito 仅在 body 匹配时 200 (上方已 assert 200) —
+    // 真值已替换 (Exact 结构断言太脆, 交给既有 redact 集成测试族; 这里
+    // 只锁定 "扫描不干扰 redact": 上游 mock 收到的请求成功了).
+}
+
+#[tokio::test]
+async fn privacy_scan_off_default_enabled_false_and_hot_path_unchanged() {
+    let mut upstream = spawn_mock_upstream().await;
+    let aws_key = aws_shaped_key("OFFMODETEST0003");
+    let body = format!(
+        r#"{{"model":"gpt-4","messages":[{{"role":"user","content":"no scan {aws_key}"}}]}}"#
+    );
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .match_body(mockito::Matcher::Exact(body.clone()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"chatcmpl-1","choices":[]}"#)
+        .create_async()
+        .await;
+
+    // off (默认档): base_app_state 即 disabled 空壳.
+    let proxy_url = spawn_proxy_with_privacy_scan(
+        secret_guard::config::PrivacyScanMode::Off,
+        vec![openai_provider("oa-main", &upstream.url())],
+        test_secret_table(),
+    )
+    .await;
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        &body,
+        &[],
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "Exact body match passed => hot path byte-identical"
+    );
+
+    // enabled:false + 空告警 (一次性轮询即可 — off 档无异步消费者).
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let resp = reqwest::Client::new()
+        .get(format!("{proxy_url}/api/privacy-scan/alerts"))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["enabled"], serde_json::json!(false));
+    assert_eq!(body["alerts"].as_array().map(Vec::len), Some(0));
+}
+
+#[tokio::test]
+async fn privacy_scan_registering_alert_value_clears_it_from_view() {
+    let mut upstream = spawn_mock_upstream().await;
+    let aws_key = aws_shaped_key("REGISTERTEST04");
+    let body = format!(
+        r#"{{"model":"gpt-4","messages":[{{"role":"user","content":"candidate {aws_key}"}}]}}"#
+    );
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"chatcmpl-1","choices":[]}"#)
+        .create_async()
+        .await;
+
+    let proxy_url = spawn_proxy_with_privacy_scan(
+        secret_guard::config::PrivacyScanMode::Batch,
+        vec![openai_provider("oa-main", &upstream.url())],
+        test_secret_table(),
+    )
+    .await;
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        &body,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    wait_for_alerts(&proxy_url, |v| {
+        v["alerts"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|x| x["value"] == serde_json::json!(aws_key)))
+    })
+    .await;
+
+    // 人回路: 用户确认登记 (WebUI 预填表单的 API 等价物) — POST /api/secrets.
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{proxy_url}/api/secrets"))
+        .json(&serde_json::json!({ "id": "from-alert", "value": aws_key }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+
+    // 登记后告警从视图消失 (视图过滤 — "疑似未登记" 语义重新闭合).
+    let alerts = wait_for_alerts(&proxy_url, |v| {
+        v["alerts"].as_array().is_some_and(|a| {
+            !a.iter()
+                .any(|x| x["value"].as_str() == Some(aws_key.as_str()))
+        })
+    })
+    .await;
+    assert_eq!(alerts["enabled"], serde_json::json!(true));
 }

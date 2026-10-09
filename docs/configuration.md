@@ -119,6 +119,29 @@ output = 2.0
 已知限制: OpenAI 流式请求仅在客户端设置 `stream_options.include_usage = true`
 时上游才回显 usage — 此类请求在 Usage 页只计请求数, 无 token 统计 (页面有提示).
 
+## `[privacy_scan]` — 隐私旁路扫描 (改动需重启)
+
+纯模式化 PII 正则旁路扫描器 (#257 S0.5 切片): 对请求体做固定 pattern 集
+(常见 token 形状: AWS / GitHub / GitLab / Slack / OpenAI / Anthropic / Google
+key / JWT / PEM 私钥头 / AWS secret label 组合形态) 的旁路扫描, 在 WebUI
+Secrets tab 的「疑似未登记 / Unregistered candidates」面板产出告警, 引导
+用户经预填表单**人工确认登记**。仅标注, 永不拦截/改写转发字节; 告警永不
+自动登记 (登记必须经人回路提交)。
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `mode` | `"off"` \| `"batch"` | `"off"` | `off` = 不扫描 (热路径零开销); `batch` = 后台 task 批量扫描 (有界队列, 满则丢弃告警捕获, 不影响转发). `realtime` 属 Laya S2 档位, 未实现 — 写入会启动 fail-fast. |
+
+排除规则: 命中值等于任何**已登记** secret 真值时不告警 (告警语义 = 「未被
+登记管理的 token 形状」); 登记后对应告警行立即从面板消失, 删除该 secret 后
+自然重现。告警为内存态 (cap 256, 重启清空), 不落盘。Gemini/Ollama 字节透传
+族无 codec IR, 不扫描 (known-limitations 登记)。
+
+```toml
+[privacy_scan]
+mode = "batch"
+```
+
 ## `[[providers]]` — 上游 LLM 端点 (平铺数组)
 
 每个 provider 是**三种构造之一** (#187 sum type + Pool 延伸): **直连** (Direct, 真实上游端点) /

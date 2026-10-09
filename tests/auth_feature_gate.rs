@@ -51,6 +51,7 @@ async fn serve_rejects_auth_enabled_without_oidc_feature() {
         secret_guard::config::RedactConfig::default(),
         secret_guard::config::UpstreamTimeouts::default(),
         secret_guard::config::UsageConfig::default(),
+        secret_guard::config::PrivacyScanConfig::default(),
         vec![],
     )
     .await
@@ -102,6 +103,8 @@ fn minimal_app_state(upstream: reqwest::Client, providers: ProviderTable) -> App
         ),
         // shutdown flag: 本 harness 不消费 /api/events (sender drop 语义见
         // integration.rs::base_app_state 同字段注释).
+        // #257 S0.5: 默认 off (本 harness 不触隐私扫描语义).
+        privacy_scan: secret_guard::privacy::PrivacyScanner::disabled(),
         shutdown: tokio::sync::watch::channel(false).1,
     }
 }

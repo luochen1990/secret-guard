@@ -339,6 +339,9 @@ pub fn build_upstream_client(connect_timeout: Option<Duration>) -> anyhow::Resul
 /// - `upstream_timeouts`: 来自 static config 的 `[server] upstream_*_timeout_secs`,
 ///   存入 AppState 供 forward 路径给 send().await / stream chunk 加超时保护
 ///   (防上游网络异常时 record 永久 pending).
+/// - `privacy_scan_config`: 来自 static config 的 `[privacy_scan]` 段 (#257 S0.5,
+///   静态档位 — `batch` 时在此构造扫描器并 spawn 后台 task; 语义见
+///   `src/privacy.rs` 头部).
 #[allow(clippy::too_many_arguments)]
 pub async fn serve(
     host: &str,
@@ -353,6 +356,7 @@ pub async fn serve(
     redact_config: crate::config::RedactConfig,
     upstream_timeouts: crate::config::UpstreamTimeouts,
     usage_config: crate::config::UsageConfig,
+    privacy_scan_config: crate::config::PrivacyScanConfig,
     allowed_domains: Vec<String>,
 ) -> anyhow::Result<()> {
     let crate::config::RedactConfig {
@@ -485,6 +489,12 @@ pub async fn serve(
             state_path.clone(),
             persist_lock.clone(),
         ),
+        // #257 S0.5: 静态档位装配. batch → 构造扫描器 + spawn 后台 task
+        // (serve 是 async fn, tokio runtime 在场); off → 零开销空壳.
+        privacy_scan: match privacy_scan_config.mode {
+            crate::config::PrivacyScanMode::Off => crate::privacy::PrivacyScanner::disabled(),
+            crate::config::PrivacyScanMode::Batch => crate::privacy::PrivacyScanner::new(),
+        },
         shutdown: shutdown_rx,
     };
 

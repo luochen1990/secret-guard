@@ -113,6 +113,10 @@ pub struct Config {
     /// 模型用量统计配置 (usage-stats, docs/design/usage-stats.md). 进程内只读.
     #[serde(default)]
     pub usage: UsageConfig,
+
+    /// 隐私旁路扫描配置 (#257 S0.5). 进程内只读 (static 语义, 同 `[redact]`).
+    #[serde(default)]
+    pub privacy_scan: PrivacyScanConfig,
 }
 
 /// Usage-stats 配置 (静态, 仅 `[usage]` 段, 启动读一次 — 同 `[redact]/[auth]` 模式).
@@ -156,6 +160,32 @@ impl Default for UsageConfig {
             pricing_override: std::collections::HashMap::new(),
         }
     }
+}
+
+/// 隐私旁路扫描档位 (#257 S0.5 切片, 纯模式化 PII 正则扫描器).
+///
+/// - `Off` (默认): 不扫描 (`PrivacyScanner::disabled` 空壳, 热路径零开销).
+/// - `Batch`: 后台 task 批量扫描 (有界 channel, 满则丢弃).
+/// - `realtime` 属 Laya S2 档位, **不实现不预留** (写入该值 = 未知变体,
+///   serde 反序列化失败 → 启动 fail-fast).
+///
+/// 语义契约 (五条红线: 不进转发链 / 永不拦截 / 零新依赖 / 默认关闭 /
+/// 告警永不自动登记) 见 `src/privacy.rs` 头部.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivacyScanMode {
+    #[default]
+    Off,
+    Batch,
+}
+
+/// `[privacy_scan]` 静态段 (启动读一次, 同 `[server]`/`[redact]` 哲学 —
+/// WebUI 修改不生效, 重启才生效; 保持转发核心路径零运行时配置开销).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrivacyScanConfig {
+    /// 扫描档位, 默认 `off`. 值域与语义见 [`PrivacyScanMode`].
+    pub mode: PrivacyScanMode,
 }
 
 /// Redact 相关配置 (静态, 仅 `[redact]` 段).
@@ -448,7 +478,15 @@ pub struct SecretsConfig {
 // 负责逐行 tracing::warn, 单测直接对返回值断言 (项目无日志捕获设施).
 
 /// 已知顶层 section 名 (与 [`Config`] 的字段一一对应).
-const KNOWN_SECTIONS: [&str; 6] = ["server", "providers", "secrets", "redact", "auth", "usage"];
+const KNOWN_SECTIONS: [&str; 7] = [
+    "server",
+    "providers",
+    "secrets",
+    "redact",
+    "auth",
+    "usage",
+    "privacy_scan",
+];
 
 /// 各配置表的已知字段清单 (含数组 entry 级与嵌套 struct 字段), 键为 TOML 路径前缀.
 ///
@@ -566,6 +604,8 @@ const KNOWN_FIELDS: &[(&str, &[&str])] = &[
         "usage.pricing_override",
         &["input", "output", "cache_read", "cache_write"],
     ),
+    // Config::privacy_scan (PrivacyScanConfig, #257 S0.5)
+    ("privacy_scan", &["mode"]),
     // Config::auth (AuthConfig)
     ("auth", &["enabled", "oidc", "api_keys", "secure_cookie"]),
     // auth.oidc (OidcConfig)
@@ -732,6 +772,11 @@ pub(crate) fn audit_static_config_text(text: &str) -> Vec<String> {
         // entries 子数组同样由 check_table_keys 的递归下降审计 (定位
         // "[secrets].entries[i]"), 不在此显式调用 (同 auth.api_keys 理由).
         check_table_keys(v, "[secrets]", "secrets", &mut warnings);
+    }
+    if let Some(v) = table.get("privacy_scan").and_then(|v| v.as_table()) {
+        // #257 S0.5: 键全静态 (mode), 安全递归审计. (usage 段刻意不进本通道 —
+        // pricing_override 的键是动态 model 名, 盲审会误 WARN.)
+        check_table_keys(v, "[privacy_scan]", "privacy_scan", &mut warnings);
     }
 
     // ── 组合提示: 空配置 (#159 第三梯度) ──
@@ -1674,6 +1719,11 @@ fn serialized_full_sample_paths() -> Vec<String> {
             ..RedactConfig::default()
         },
         usage: UsageConfig::default(),
+        // privacy_scan: 非默认档填充 (off 是默认, 序列化仍输出 — 锁定
+        // `privacy_scan.mode` 的 KNOWN_FIELDS 同步).
+        privacy_scan: PrivacyScanConfig {
+            mode: PrivacyScanMode::Batch,
+        },
         auth: crate::auth::AuthConfig {
             enabled: false,
             oidc: Some(crate::auth::OidcConfig {
@@ -1758,6 +1808,7 @@ mod audit_tests {
             "auth.",
             "auth.oidc.",
             "auth.api_keys.",
+            "privacy_scan.",
         ] {
             assert!(
                 paths.iter().any(|p| p.starts_with(expected)),
@@ -2825,6 +2876,65 @@ output = 0.5
         let cfg = Config::load_or_default(&path).expect("missing file → default, not error");
         assert!(cfg.providers.is_empty(), "default has no providers");
         assert!(cfg.secrets.entries.is_empty(), "default has no secrets");
+    }
+
+    // ─── [privacy_scan] (#257 S0.5) ────────────────────────────────────────
+
+    #[test]
+    fn privacy_scan_defaults_off_and_parses_batch() {
+        // 缺省段 → off (默认关闭, 红线 4).
+        let p = write_config_tmp("");
+        assert_eq!(
+            Config::load_or_default(&p).unwrap().privacy_scan.mode,
+            PrivacyScanMode::Off
+        );
+        // 显式 batch.
+        let p = write_config_tmp("[privacy_scan]\nmode = \"batch\"\n");
+        assert_eq!(
+            Config::load_or_default(&p).unwrap().privacy_scan.mode,
+            PrivacyScanMode::Batch
+        );
+        // 显式 off.
+        let p = write_config_tmp("[privacy_scan]\nmode = \"off\"\n");
+        assert_eq!(
+            Config::load_or_default(&p).unwrap().privacy_scan.mode,
+            PrivacyScanMode::Off
+        );
+    }
+
+    #[test]
+    fn privacy_scan_unknown_mode_fails_fast() {
+        // realtime (Laya S2 档位) 与任意未知值: serde 拒绝 → 启动 fail-fast,
+        // 不静默降级 (档位拼错不能悄悄变成 off).
+        for bad in ["realtime", "always", "on"] {
+            let p = write_config_tmp(&format!("[privacy_scan]\nmode = \"{bad}\"\n"));
+            let err = Config::load_or_default(&p).expect_err("unknown mode must fail fast");
+            assert!(
+                err.to_string().contains(bad),
+                "error mentions '{bad}': {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn privacy_scan_audit_known_section_and_field() {
+        // 非空骨架 (避开 "空配置" 组合提示) + [privacy_scan] 是已知 section,
+        // mode 是已知字段 → 零 WARN; 段内拼写错误 (mod) → WARN + 建议
+        // (与 #159 审计通道对齐).
+        let skeleton = "[[providers]]\nid = \"m\"\nkind = \"direct\"\n\
+             [[providers.endpoints]]\nprotocol = \"openai\"\nbase_url = \"http://127.0.0.1:29804\"\n";
+        let clean = format!("{skeleton}[privacy_scan]\nmode = \"batch\"\n");
+        assert!(
+            audit_static_config_text(&clean).is_empty(),
+            "known privacy_scan config must not warn"
+        );
+        let typo = format!("{skeleton}[privacy_scan]\nmod = \"batch\"\n");
+        let ws = audit_static_config_text(&typo);
+        let all = ws.join("; ");
+        assert!(
+            all.contains("mod") && all.contains("did you mean 'mode'"),
+            "got: {all}"
+        );
     }
 }
 

@@ -14,6 +14,11 @@
 //!   byte-exact + 流式 UX; parsed view 按协议累积 — Responses 由流式 reader
 //!   `read_response_events` 解码事件派生, 见 ParsedSync::finalize).
 //! - [`same_proto_passthrough`] (无 secret 且无改写): 字节透传 (零回归, 最热路径).
+//!   `[privacy_scan] mode != "off"` 时透传分支入口做一次**只读** best-effort IR 解析
+//!   供旁路扫描 (#257 S0.5 — 未登记侦测最有价值的场景恰是没登记几个 secret 的
+//!   透传路径; parse 失败静默跳过, 恒不影响透传字节与请求成败, 红线见
+//!   `crate::privacy` 头部). IR 路径的扫描捕获挂在 redact seam (capture 前置 /
+//!   submit 后置, 与 cross_proto 同型).
 //!
 //! codec 不覆盖的协议 (Gemini/Ollama) 走 [`same_proto_forward`] 时受
 //! `[redact] on_unsupported_protocol` 停损开关管约 (fail_closed + secrets → 503):
@@ -65,9 +70,24 @@ pub(crate) async fn same_proto_forward(
     secrets_snapshot: Vec<crate::secrets::SecretEntry>,
     pool_watch: Option<crate::pool::PoolWatch>,
 ) -> Result<Response<Body>, AppError> {
+    // codec 覆盖族判定在透传分支 (隐私旁路扫描) 与 IR 路径都要用, 提前引入.
+    use crate::codec::Protocol as CodecProtocol;
     // 字节直传仅当 "无 secret 且无 model 改写" (#183): 改写需要作用在
     // egress IR 的 model 字段上, 强制走 IR 路径 (FWD-1 修订的契约代价).
     if secrets_snapshot.is_empty() && model_rewrite.is_none() {
+        // #257 S0.5 隐私旁路扫描: 透传分支无 IR 解析, 扫描开启时做一次
+        // **只读** best-effort 解析 (codec 覆盖族限定; parse 失败静默跳过 —
+        // 扫描是尽力而为增强, 绝不影响透传字节与请求成败). 未登记侦测最有
+        // 价值的场景恰是 "没登记几个 secret" 的透传路径, 捕获必须在此发生.
+        // excluded 传空切片: 本分支前提即全局 secrets 表为空.
+        if state.privacy_scan.enabled()
+            && let Some(codec_proto) = CodecProtocol::from_native(ingress)
+            && let Ok(ir) =
+                parse_request_ir(&req_bytes, ingress, codec_proto.reader().as_ref(), None)
+        {
+            let job = state.privacy_scan.capture(&ir);
+            state.privacy_scan.submit(job, &[]);
+        }
         // 字节透传: 不进入 codec, 不做 redact. 这是最热路径 (多数 provider 无 secret).
         // secrets_snapshot 此分支前提即为空, 传空.
         return same_proto_passthrough(
@@ -87,7 +107,6 @@ pub(crate) async fn same_proto_forward(
     }
 
     // IR 路径 (启用 redact / model 改写).
-    use crate::codec::Protocol as CodecProtocol;
     let Some(codec_proto) = CodecProtocol::from_native(ingress) else {
         // codec 不支持此协议 (Gemini/Ollama), 但同协议 + SecretTable 非空时本应做 redact.
         // `[redact] on_unsupported_protocol` 停损开关 (SEC-10 降级偏安全, 与
@@ -168,12 +187,16 @@ pub(crate) async fn same_proto_forward(
     //    时 redact_and_derive 内部构造 503 并在此 `?` 拒绝转发, 防止 secret 泄露).
     //    流式响应里的 TextDelta / InputJsonDelta 都会经 StreamingRestorer 做 sliding-window
     //    restore (在 StreamTranslate::new_same_proto_restore 中), 不再需要 warn.
+    //    #257 S0.5: redact 前 capture pre-redact 叶子 (只读), redact 后携带已登记值
+    //    集合提交 (fail_closed 503 时 `?` 短路跳过提交 — 请求已被拒绝, 无需告警).
+    let privacy_job = state.privacy_scan.capture(&ir);
     let (redaction_map, redact_seed, redactions, redact_hits) = redact_and_derive(
         &mut ir,
         &secrets_snapshot,
         state.on_probe_exhausted,
         "same-proto",
     )?;
+    state.privacy_scan.submit(privacy_job, &secrets_snapshot);
 
     // 5. IR → 请求 body (同协议 writer 重序列化). writer 输出恒为合法 UTF-8,
     //    直接产 String 按值 move 进 record (req_body_raw); 出站仅一次

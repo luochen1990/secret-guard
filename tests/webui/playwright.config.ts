@@ -122,6 +122,12 @@ priority = 0
 id = "test-key"
 value = "${TEST_SECRET_VALUE}"
 category = "apikey"
+
+# #257 S0.5: 隐私旁路扫描 batch 档 (面板出现 + 登记预填用例依赖; 告警含疑似
+# 明文 value — 本地测试信任域). test-key 是已登记值, 会被排除规则/视图过滤
+# 双层跳过, 不污染其他用例的 secrets tab 断言.
+[privacy_scan]
+mode = "batch"
 `
 );
 

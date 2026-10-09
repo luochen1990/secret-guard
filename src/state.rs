@@ -94,6 +94,11 @@ pub struct AppState {
     /// (建议值 `CallEvent.capture_mode`), WebUI 经 `PUT /api/settings` 即时切换.
     /// 语义与持久化见 [`AuditCapture`] 文档; 装配点 `server.rs::serve`.
     pub audit_capture: AuditCapture,
+    /// 隐私旁路扫描器 (#257 S0.5): `[privacy_scan] mode` 静态档位装配 —
+    /// `off` (默认) = `PrivacyScanner::disabled` 空壳 (capture/submit 零开销
+    /// no-op), `batch` = spawn 后台扫描 task (构造需在 tokio runtime 内,
+    /// 装配点 `server.rs::serve`). 语义红线与数据流见 `src/privacy.rs` 头部.
+    pub privacy_scan: crate::privacy::PrivacyScanner,
     /// graceful shutdown flag: `true` = 进程进入 shutdown. serve() 装配 (sender
     /// 随 `with_graceful_shutdown` future 持有, 信号到达后置 true) — SSE 等无限
     /// 长流 (`GET /api/events`) take_until 此 flag, 保证 drain 不被挂起.

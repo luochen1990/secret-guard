@@ -41,6 +41,7 @@
 | **MockStrategy** | 每个 Secret 的 Mock 生成策略 (初始值 + 生成策略两维度) | mock 策略、生成策略 | mock/redact |
 | **Node** | ConversationDAG 中的一个节点 = 一次 API 调用 | 轮次、round、节点 | dag/web |
 | **Pool Provider** | `ProviderKind::Pool` 构造的套餐池端点 (`members` 有序成员列表必填) — 自身不转发, 顺序 failover: 正常全打第一个可用成员, 检测到窗口限额耗尽信号后自动切下一个成员, 耗尽成员按恢复闹钟自动回归; 运行时状态内存态不持久化 (契约 POOL-*) | 套餐轮换、配额池、账号池、用完了切下一个 | provider/proxy/pool |
+| **PrivacyScan** | 纯模式化 PII 旁路扫描器 (#257 S0.5 切片): `[privacy_scan] mode` (off 默认 / batch) 静态档位; 对请求侧 pre-redact IR 字符串叶子做固定 pattern 集 (常见 token 形状, 手写字节扫描零新依赖) 的旁路扫描, 告警 = 「未被登记管理的 token 形状」(已登记值排除), WebUI Secrets tab「疑似未登记」面板引导人回路登记; 五条红线: 不进转发链 / 永不拦截 / 零新依赖 / 默认关闭 / 告警永不自动登记 | 隐私扫描、PII 扫描、未登记侦测 | privacy/web |
 | **Protocol** | LLM API 的协议族 (OpenAI / Anthropic / Gemini / Ollama / Responses) | 协议、格式 | 全局 |
 | **Provider** | 一个 provider 条目 (sum type: Direct 直连实体 \| Router 路由 \| Pool 套餐池, #187 + Pool 延伸) | 上游、后端、模型、服务商、LLM 厂商 (面向用户文案的通俗指代; 对比轴禁用 — 易误读为网关自身) | 全局 |
 | **Redact** | 把 request body 中的 Secret 替换为 Mock 的正向操作 | 脱敏、过滤、打码、替换 | 全局 |
@@ -368,6 +369,7 @@ Pool 不进此本地终结分支 (Router 专属) — pool 入口的 /models 经 
 | `main.rs` / `cli.rs` / `lib.rs` | 二进制入口 + CLI 参数 schema | 文件头部 `//!` |
 | `mock.rs` | MockStrategy 两维度 (初始值 + 生成策略) + 确定性 seed + `[redact] global_mock_prefix` 注入 + Auto widen 兜底 (退化 charset 候选空间 < 2^20 时逐级拓宽, Auto 永不弱配置) + GenSpec 候选空间配置期 lint (WARN, 有效对象为手动配置) | 文件头部 `//!` (C3 根基) |
 | `pool.rs` | Pool Provider 运行时: 成员状态机 `PoolStates` (顺序 failover pick + 耗尽闹钟 + 配置对齐重建, 内存态不持久化) + 三通道耗尽信号检测器 `detect_exhaustion` (纯函数, ROB) + `PoolWatch` 响应侧旁路检测编排 + 观察面 (member_status / reset) | 文件头部 `//!` (含内置默认信号表语义域 + "提取宽判别严" 设计依据) + contracts.md **POOL-*** |
+| `privacy.rs` | 纯模式化 PII 旁路扫描器 (#257 S0.5): 手写 pattern 表 (常见 token 形状, 零新依赖) + redact seam 旁路捕获 (pre-redact 视图) + 有界 channel 后台扫描 + 内存告警存储 (cap 256 FIFO, 已登记值双层排除) + alerts API 视图; 五条红线见文件头 | 文件头部 `//!` |
 | `provider.rs` | Provider sum type (Direct 直连·多协议端点 `endpoints` + `select_endpoint` 端点选择 \| Router 路由 \| Pool 套餐池) + Route (model_pattern 通配 / priority / 路由级 upstream_model 重写) + PoolProvider/ExhaustConfig 与内置默认信号表常量 + Effective view + api_key 两来源 (Direct 条目级, 全端点共享) + `resolve_route` 路由链解析 (per-request; Router 跳按请求 model 匹配 + model 重写 pipeline, Pool 跳经 `PoolPicker` 状态机选成员) | 文件头部 `//!` |
 | `proxy/` | dispatch 路径选择 + fan_out 四路径 + Provider 鉴权 + router GET /models 本地合成 + provider 协议探测 (拆分为 mod/helpers/auth/models/recorder/same_proto/cross_proto/fan_out 子模块) | `src/proxy/mod.rs` 头部 `//!` |
 | `record.rs` | ForwardRecord (web 层 DTO, GET /records/{id} 响应 shape) | 文件头部 `//!` |
@@ -411,6 +413,7 @@ Secret / Provider 的两种 value 来源 (`value`/`value_file`、`api_key`/`api_
 - `audit_capture`: state.toml 动态字段 (**非** `[server]` 静态段, WebUI 即时切换无需重启) — 详细日志三态 `off`/`errors`/`full` (serde 反序列化兼容旧 bool: false→off / true→full), 实现指针 `src/config.rs::AuditCaptureMode` (三态 + 决策函数 `capture_req`/`retain` SSOT) + `src/state.rs::AuditCapture` (运行时档位 + RMW 持久化) + `src/web/api/settings.rs` (GET/PUT 端点); off 极致省内存 / errors 仅错误请求保留 (在途暂存, 成功 attach 回收 — 排障主力档) / full 全量; timeline 不受影响 (B1 起 blocks 派生); per-request 原子 (push 快照进 `CallEvent.capture_mode`, attach 决策统一收口在 `dag::attach_response`); PUT 先持久化再更新内存 (失败回滚, 与 set_decision 同型); 重启从 state.toml 恢复; 升级注意: 旧 state.toml 无此字段 → off (存量用户详细日志静默关闭, 需要时 WebUI 重新开启). 语义契约 contracts.md CFG-7 / DTO-10.
 - `global_mock_prefix`: Auto 模式 mock 统一前缀, 注入每个 secret 的 `gen_spec.prefix`; 详见 `src/redact.rs` C5 契约.
 - `host`: 默认 `127.0.0.1` 回环是 SEC-6 契约 (本地监听, 防意外暴露到 LAN/WAN).
+- `mode` (`[privacy_scan]`): static 静态段 secret-guard.toml (**非** state.toml 动态字段, 重启生效) — 实现指针 `src/config.rs::PrivacyScanMode` + `src/privacy.rs::PrivacyScanner` (batch 时 serve() 构造 + spawn 后台 task) + `src/web/api/privacy_scan.rs` (GET /api/privacy-scan/alerts, enabled 标志 + 已登记值视图过滤); 告警内存态 cap 256 重启清空; 疑似明文回显与 req_body_raw 同信任域 (SEC-1 例外裁决挂 PR 描述); pattern 表/排除规则/红线完整语义见 `src/privacy.rs` 头部; known-limitations "privacy-scan" 节登记限制集.
 - `on_fallback_restore`: 实现指针 `src/proxy/helpers.rs::restore_via_json_leaf_fallback` + `src/config.rs::OnFallbackRestore`; 行为契约 RED-8 / SEC-10 (降级偏安全).
 - `on_probe_exhausted`: 实现指针 `src/redact.rs::redact_ir_checked` + `src/config.rs::OnProbeExhausted`; 默认 `fail_closed` 是 SEC-10 2026-09 翻转 (历史 `fail_open` 需显式 opt-in); 配置显式写出便于审计.
 - `on_unsupported_protocol`: 实现指针 `src/proxy/same_proto.rs` from_native-None 分支 + `src/config.rs::OnUnsupportedProtocol`; 默认 `fail_closed` 同为 SEC-10 2026-09 翻转.

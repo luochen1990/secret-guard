@@ -24,6 +24,8 @@
   - `events.rs` — `GET /api/events` SSE 失效通知流 (DAG 变更计数 poke, rt-push; 事件只说"变了", 数据以 /api/sync 为 SSOT — wire 契约见文件头部).
   - `usage.rs` — `GET /usage/summary` 用量汇总查询 (usage-stats §8; 直读 UsageStore
     SQL 聚合, 派生走 `usage::summary::build_summary` 纯函数).
+  - `privacy_scan.rs` — `GET /privacy-scan/alerts` 隐私扫描告警视图 (#257 S0.5;
+    enabled 标志 + 已登记值过滤, 疑似明文回显的安全语义见该文件头).
 - `dto.rs` (已移至顶层 `src/dto.rs`): WebUI 响应序列化 DTO (SessionView / NodeView / RoundBrief / TimelineRound / TimelineTail / TimelinePage / TimelineDiffData / SyncSnapshot). 构造逻辑留 dag 模块 (持读锁访问私有字段). 中立化理由见 `src/dto.rs` 头部 (dag 域 B 不再反向依赖 web 域 C).
 - `index.html`: 单页 UI (IM 风格: 会话折叠 sidebar + timeline 对话流, 内嵌 CSS + vanilla JS, 零外部依赖).
 
@@ -119,16 +121,28 @@ PUT    /api/settings                body {audit_capture: 同上三态 string} (�
                                            + PUT 乐观更新/失败回滚/在途 disabled), 不入
                                            state 对象 (auto-refresh checkbox 同型, DOM 即状态)
 GET    /api/usage/summary[?hours=N]  → UsageSummary {range, pricing_status, totals,
-                                                 by_bucket[], by_model[], by_provider[],
-                                                 unpriced_models[], zero_priced_models[],
-                                                 redactions{by_secret[], recent[]}}
-                                                 (模型用量统计: hours 缺省 168 (7d), 0→1,
-                                                  上限 min(retention_days×24, 9600);
-                                                  ≤14d hour 粒度, 更长 day 折叠;
-                                                  usage tab 5s 节流轮询; 节流例外
-                                                  (#244): 从未成功渲染过 → 放行任何
-                                                  触发 + 时钟回拨放行, 防首拉失败/
-                                                  时钟校正留下不自愈空态)
+                                                  by_bucket[], by_model[], by_provider[],
+                                                  unpriced_models[], zero_priced_models[],
+                                                  redactions{by_secret[], recent[]}}
+                                                  (模型用量统计: hours 缺省 168 (7d), 0→1,
+                                                   上限 min(retention_days×24, 9600);
+                                                   ≤14d hour 粒度, 更长 day 折叠;
+                                                   usage tab 5s 节流轮询; 节流例外
+                                                   (#244): 从未成功渲染过 → 放行任何
+                                                   触发 + 时钟回拨放行, 防首拉失败/
+                                                   时钟校正留下不自愈空态)
+GET    /api/privacy-scan/alerts     → {enabled, alerts[{value, pattern_id,
+                                                  pattern_label, first_seen, last_seen,
+                                                  hit_count, context}]}
+                                                  (#257 S0.5 隐私旁路扫描告警视图;
+                                                   enabled:false = mode off → 前端隐藏
+                                                   整个面板; 已登记值被视图过滤 —
+                                                   登记后告警行消失, 无 dismiss 写端点;
+                                                   档位是静态配置, 无 PUT. 告警含疑似
+                                                   明文 value, 与 req_body_raw 回显同
+                                                   信任域同先例 — SEC-1 例外裁决挂 PR
+                                                   描述; 安全语义见 api/privacy_scan.rs
+                                                   头部)
 ```
 
 > **探测假设 (best-effort 已知边界)**: 探测假设 base_url 是裸 origin/base (不带
@@ -533,6 +547,21 @@ loadTimeline) 才重置 selected 到最新轮 (`.selected` 持续高亮; 不触�
 - 气泡颜色 + sender icon 分类.
 - 气泡间微小间距 (margin-bottom, 避免视觉粘连).
 - tool round 预览: 直接消费后端预计算的 `round_role` + `preview` 字段 (前端不做 best-effort 推断).
+
+### 隐私扫描面板 (#257 S0.5)
+
+Secrets tab 内 `#privacy-scan-panel`「疑似未登记」区段 (mode=off 时整面板
+`hidden` — 判据 = 告警 API 的 `enabled` 标志, 不让空面板误导排查):
+- 数据流: `refreshPrivacyAlerts` 挂在 `refreshSecrets` 之后 (tab 激活 / CRUD
+  后刷新 / auto-refresh tick 自然带动); 行渲染走 `replaceTbodyIfChanged`
+  fingerprint (与 secrets 表同模式, auto-refresh 空轮询不打断 DOM 引用).
+- 告警行: value (等宽 + ellipsis, title 全量) + pattern label + hit_count +
+  last_seen + context 摘要 (muted + ellipsis) + 「登记」按钮.
+- **人回路红线**: 「登记」仅打开既有 add-secret 表单并预填 value + 建议
+  name (`{pattern} {date}`) — 提交仍走用户确认的 `POST /api/secrets`;
+  登记成功后告警行经服务端视图过滤自然消失 (refetch 更新, 非乐观删除).
+- i18n: 全部文案走 `privacy.*` 命名空间 (en/zh 双语); 语言切换经
+  `rerenderDynamicForLang` → `renderPrivacyAlerts` 重放 (缓存数据 + t() 重渲染).
 
 ### 主题系统 (双主题 + 自动跟随系统)
 

@@ -26,6 +26,8 @@
 //! - `GET/POST/DELETE/PATCH /api/api-keys[/{id}[/toggle]]` —— API key CRUD (无条件挂载, 见 api/apikeys.rs).
 //! - `GET/PUT /api/settings` —— 全局设置 (当前仅 `audit_capture` 详细日志开关,
 //!   B2; 即时生效 + 持久化 state.toml, 见 api/settings.rs).
+//! - `GET /api/privacy-scan/alerts` —— 隐私旁路扫描告警 (#257 S0.5; enabled
+//!   标志 + 已登记值过滤, 见 api/privacy_scan.rs).
 //!
 //! 注 1: 旧的 `GET /api/records` (扁平分页) + `GET /api/nodes/{id}/timeline` (基于 node_id)
 //! 已删除, 由 session-aware sync API 替代.
@@ -136,6 +138,10 @@ pub fn router() -> Router<AppState> {
             "/api/settings",
             get(api::get_settings).put(api::update_settings),
         )
+        // 隐私旁路扫描告警 (#257 S0.5): GET 视图 (enabled 标志 + 已登记值过滤,
+        // 登记后告警消失; 无写端点 — 档位是静态配置). 安全语义 (疑似明文回显
+        // 与 req_body_raw 同信任域) 见 api/privacy_scan.rs 头部.
+        .route("/api/privacy-scan/alerts", get(api::list_alerts))
 }
 
 /// `/api/*` 未匹配子路径的 404 handler (SEC-6: 内部 URL 绝不进入 forward).
