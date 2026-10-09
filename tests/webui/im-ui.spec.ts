@@ -2386,14 +2386,14 @@ test.describe("B3: 详细日志开关 (audit capture)", () => {
     // 切 errors → PUT 成功 → 状态更新 + #status 轻反馈 (#273 评论需求档).
     await sel.selectOption("errors");
     await expect(sel).toHaveValue("errors");
-    await expect(page.locator("#status")).toContainText("详细日志: 仅错误");
+    await expect(page.locator("#status")).toContainText("Audit log: Errors only");
     // 切 full 再回 off (双向 + 全值域).
     await sel.selectOption("full");
     await expect(sel).toHaveValue("full");
-    await expect(page.locator("#status")).toContainText("详细日志: 全部");
+    await expect(page.locator("#status")).toContainText("Audit log: Full");
     await sel.selectOption("off");
     await expect(sel).toHaveValue("off");
-    await expect(page.locator("#status")).toContainText("详细日志: 关闭");
+    await expect(page.locator("#status")).toContainText("Audit log: Off");
   });
 
   test("audit_capture off 时 raw 弹窗显示未捕获占位", async ({ page }) => {
@@ -2408,7 +2408,7 @@ test.describe("B3: 详细日志开关 (audit capture)", () => {
     await page.waitForTimeout(500); // 等待懒拉 record.
     const rawText = await page.locator("dialog.round-dialog").textContent();
     // req + resp 两个 body 区段均占位 (headers 照常展示).
-    expect(rawText).toContain("未被详细日志保留");
+    expect(rawText).toContain("not retained by the audit log");
     expect(rawText).toContain("Request Headers");
     // 占位分支不携带 "LLM view" 标注 (那是捕获开启时的语义).
     expect(rawText).not.toContain("LLM view");
@@ -2433,7 +2433,7 @@ test.describe("B3: 详细日志开关 (audit capture)", () => {
     // 点行内 view → 弹窗显示占位 (而非 dump 空 record 的 JSON).
     await page.locator("#redact-recent-body button[data-audit-node]").first().click();
     const auditBody = page.locator("#audit-record-body");
-    await expect(auditBody).toContainText("未被详细日志保留");
+    await expect(auditBody).toContainText("not retained by the audit log");
     await expect(auditBody).not.toContainText('"req_body"');
     // 关闭 (form method=dialog 的 submit 按钮).
     await page.locator("#audit-record-dialog form button.btn").click();
@@ -3430,5 +3430,72 @@ test.describe("SSE 失效通知 (rt-push T3)", () => {
     // 确因弹窗暂停, 而非事件流 mock 失效.
     await page.evaluate(() => document.getElementById("secret-form")!.close());
     await expect.poll(syncCount, { timeout: 2000 }).toBeGreaterThan(frozen);
+  });
+});
+
+// ─── i18n: 语言自动选择 + 切换 + 持久化 (#298) ────────────────────────────
+//
+// 契约 (index.html i18n 段):
+//   1. 默认 auto = 跟随浏览器: Playwright Chromium 默认 locale en-US → 英文界面.
+//   2. 页头 #lang-switch 切到 zh → 关键文案即时变化 (不整页刷新), <html lang> 同步.
+//   3. localStorage['sg-lang'] 持久化: 刷新后仍是中文.
+// Playwright 每用例独立 context (localStorage 隔离), 无跨用例泄漏.
+test.describe("i18n: 语言自动选择 + 切换 + 持久化 (#298)", () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto("/");
+    await page.waitForLoadState("networkidle");
+  });
+
+  test("默认跟随浏览器 (en-US → 英文界面)", async ({ page }) => {
+    await expect(page.locator("nav.tabs a.tab[data-tab='secrets']")).toHaveText("Secrets");
+    await expect(page.locator("nav.tabs a.tab[data-tab='usage']")).toHaveText("Usage");
+    // 触发本 issue 的 "详细日志" 族在 en 下必须是英文 (不再混中文).
+    const label = page.locator("label:has(#audit-capture) > span");
+    await expect(label).toHaveText("Audit log");
+    await expect(page.locator("#audit-capture option[value='off']")).toHaveText("Off");
+    await expect(page.locator("html")).toHaveAttribute("lang", "en");
+    // 静态文案 (data-i18n): filter 按钮 + 未选会话的 detail 空态.
+    // (不用 #record-list 空态 — 全量跑时前置用例已产生 session, 空 div 不存在.)
+    await expect(page.locator("#filter-all > span[data-i18n]")).toHaveText("All");
+    await expect(page.locator("#detail .empty")).toHaveText("Select a session on the left");
+  });
+
+  test("切换 zh 即时生效 + 刷新后持久化", async ({ page }) => {
+    // 切到中文 → tab / filter / audit 标签 / detail 空态即时变化 (不刷新).
+    await page.locator("#lang-switch").selectOption("zh");
+    await expect(page.locator("nav.tabs a.tab[data-tab='secrets']")).toHaveText("密钥");
+    await expect(page.locator("#filter-all > span[data-i18n]")).toHaveText("全部");
+    await expect(page.locator("#detail .empty")).toHaveText("在左侧选择一个会话");
+    const label = page.locator("label:has(#audit-capture) > span");
+    await expect(label).toHaveText("详细日志");
+    await expect(page.locator("html")).toHaveAttribute("lang", "zh");
+    // select 值不受 option 文案替换影响.
+    await expect(page.locator("#audit-capture")).toHaveValue("off");
+    // 刷新后持久化 (localStorage) + 仍中文.
+    await page.reload();
+    await page.waitForLoadState("networkidle");
+    await expect(page.locator("nav.tabs a.tab[data-tab='secrets']")).toHaveText("密钥");
+    await expect(page.locator("html")).toHaveAttribute("lang", "zh");
+    // 切回 en 显式档 (非 auto) 同样即时生效.
+    await page.locator("#lang-switch").selectOption("en");
+    await expect(page.locator("nav.tabs a.tab[data-tab='secrets']")).toHaveText("Secrets");
+  });
+
+  test("切换语言后已渲染轮次的动态文案跟随 (keyed 复用不残留)", async ({ page }) => {
+    // 回归守卫 (review M1): keyed reconciliation 的复用分支不重绘已有轮次内容,
+    // 若语言切换只失效 fingerprint, 轮内烙进 DOM 的文案 (raw 按钮 title 等)
+    // 会残留旧语言 — 契约: 切换后全量重建 timeline。
+    await sendChat(page, [{ role: "user", content: "i18n-round-marker" }]);
+    const sid = await findSessionLeafByPreview(page, "i18n-round-marker");
+    await clickSessionByLeaf(page, sid);
+    const rawBtn = page.locator("#detail .tl-actions button[data-action='raw']").first();
+    await expect(rawBtn).toHaveAttribute("title", "Raw data");
+    await expect(page.locator("#detail > .detail-header")).toContainText("Timeline (");
+    // 切 zh → 轮内按钮 title + timeline header 都换语言 (不刷新页面).
+    await page.locator("#lang-switch").selectOption("zh");
+    await expect(rawBtn).toHaveAttribute("title", "原始数据");
+    await expect(page.locator("#detail > .detail-header")).toContainText("时间线 (");
+    // 轮次内容本体 (气泡) 不受重建影响。
+    await expect(page.locator("#detail .request-pane .chat-bubble")).toContainText("i18n-round-marker");
   });
 });

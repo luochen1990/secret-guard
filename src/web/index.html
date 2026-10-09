@@ -1687,53 +1687,58 @@
       Secret Guard
     </span>
     <span class="toolbar">
-      <span><span id="count">0</span> <span id="count-label">sessions</span></span>
+      <span><span id="count">0</span> <span id="count-label" data-i18n="header.sessions">sessions</span></span>
       <span id="status"></span>
-      <label title="详细日志: 关闭=极致省内存; 仅错误=只保留失败请求的完整 body (排障推荐); 全部=全量保留。仅影响之后的新请求。">详细日志
+      <label data-i18n-title="header.auditLogTitle"><span data-i18n="header.auditLog">Audit log</span>
         <select id="audit-capture">
-          <option value="off">关闭</option>
-          <option value="errors">仅错误</option>
-          <option value="full">全部</option>
+          <option value="off" data-i18n="audit.mode.off">Off</option>
+          <option value="errors" data-i18n="audit.mode.errors">Errors only</option>
+          <option value="full" data-i18n="audit.mode.full">Full</option>
         </select>
       </label>
-      <div class="theme-switch" id="theme-switch" role="group" aria-label="主题">
-        <button type="button" data-theme-val="auto" title="跟随系统主题">🌓</button>
-        <button type="button" data-theme-val="light" title="亮色">☀</button>
-        <button type="button" data-theme-val="dark" title="暗色">☾</button>
+      <select id="lang-switch" data-i18n-aria-label="header.langAria">
+        <option value="auto" data-i18n="lang.auto">Auto (browser)</option>
+        <option value="en">English</option>
+        <option value="zh">中文</option>
+      </select>
+      <div class="theme-switch" id="theme-switch" role="group" data-i18n-aria-label="header.themeAria">
+        <button type="button" data-theme-val="auto" title="Follow system theme" data-i18n-title="header.themeAuto">🌓</button>
+        <button type="button" data-theme-val="light" title="Light" data-i18n-title="header.themeLight">☀</button>
+        <button type="button" data-theme-val="dark" title="Dark" data-i18n-title="header.themeDark">☾</button>
       </div>
       <!-- 间隔不再固定 3s: SSE 健康时兜底轮询 30s, 详见 bootstrap 段 rt-push T3 注释. -->
-      <label><input type="checkbox" id="auto" checked> auto-refresh</label>
-      <button class="refresh" onclick="sync()">refresh</button>
+      <label><input type="checkbox" id="auto" checked> <span data-i18n="header.autoRefresh">auto-refresh</span></label>
+      <button class="refresh" onclick="sync()" data-i18n="header.refresh">refresh</button>
     </span>
   </header>
-  <nav class="tabs">
-    <a class="tab active" data-tab="records">Records</a>
-    <a class="tab" data-tab="secrets">Secrets</a>
-    <a class="tab" data-tab="providers">Providers</a>
-    <a class="tab" data-tab="apikeys">API Keys</a>
-    <a class="tab" data-tab="usage">Usage</a>
+   <nav class="tabs">
+    <a class="tab active" data-tab="records" data-i18n="tab.records">Records</a>
+    <a class="tab" data-tab="secrets" data-i18n="tab.secrets">Secrets</a>
+    <a class="tab" data-tab="providers" data-i18n="tab.providers">Providers</a>
+    <a class="tab" data-tab="apikeys" data-i18n="tab.apikeys">API Keys</a>
+    <a class="tab" data-tab="usage" data-i18n="tab.usage">Usage</a>
   </nav>
   <main>
     <section id="tab-records" class="tab-content active">
       <aside id="sidebar">
         <div class="filter-bar">
-          <button id="filter-all" class="active" type="button" onclick="setFilter('all')">All (<span id="filter-all-count">0</span>)</button>
-          <button id="filter-hits" type="button" onclick="setFilter('hits')">Hits (<span id="filter-hits-count">0</span>)</button>
+          <button id="filter-all" class="active" type="button" onclick="setFilter('all')"><span data-i18n="sidebar.all">All</span> (<span id="filter-all-count">0</span>)</button>
+          <button id="filter-hits" type="button" onclick="setFilter('hits')"><span data-i18n="sidebar.hits">Hits</span> (<span id="filter-hits-count">0</span>)</button>
         </div>
-        <div id="record-list"><div class="empty">No sessions yet</div></div>
+        <div id="record-list"><div class="empty" data-i18n="sidebar.noSessions">No sessions yet</div></div>
       </aside>
       <article id="detail-wrap" style="position: relative;">
-        <div id="detail"><div class="empty">Select a session on the left</div></div>
+        <div id="detail"><div class="empty" data-i18n="timeline.selectSession">Select a session on the left</div></div>
         <!-- Response 抽屉 + 悬浮导航: 都是 detail 的兄弟元素, 不随 #detail 内容滚动 (issue #36). -->
         <div class="response-drawer" id="response-drawer" hidden>
-          <div class="resp-header"><span class="resp-title">Response</span><span class="resp-status"></span></div>
+          <div class="resp-header"><span class="resp-title" data-i18n="timeline.response">Response</span><span class="resp-status"></span></div>
           <div class="resp-body"></div>
         </div>
         <div class="scroll-nav" id="scroll-nav" hidden>
-          <button type="button" id="scroll-top-btn" title="回到顶部" onclick="scrollTimelineToTop()">↑</button>
+          <button type="button" id="scroll-top-btn" title="Back to top" data-i18n-title="timeline.backToTop" onclick="scrollTimelineToTop()">↑</button>
           <!-- unread badge: pinned 期间累积未读时浮出, 点击 = 跳到最新 (重置 selected + 进入 follow). -->
-          <button type="button" id="unread-badge" hidden title="跳到最新"></button>
-          <button type="button" id="scroll-bottom-btn" title="回到底部" onclick="scrollTimelineToBottom()">↓</button>
+          <button type="button" id="unread-badge" hidden title="Jump to latest" data-i18n-title="timeline.jumpToLatest"></button>
+          <button type="button" id="scroll-bottom-btn" title="Back to bottom" data-i18n-title="timeline.backToBottom" onclick="scrollTimelineToBottom()">↓</button>
         </div>
       </article>
     </section>
@@ -1741,9 +1746,9 @@
       <div class="secrets-main">
         <div class="secrets-toolbar">
           <div class="stats" id="secrets-stats"></div>
-          <button class="btn" onclick="openSecretForm()">+ new dynamic secret</button>
+          <button class="btn" onclick="openSecretForm()" data-i18n="secrets.new">+ new dynamic secret</button>
         </div>
-        <div class="hint" style="margin-bottom: 8px;">
+        <div class="hint" style="margin-bottom: 8px;" data-i18n-html="secrets.hint">
           Static (declarative) items come from <code>secret-guard.toml</code>; dynamic items
           from <code>secret-guard.state.toml</code>. Edit a static item to fork a dynamic override.
           Use the <b>decision</b> dropdown to disable a static id or force-prefer its static value.
@@ -1751,19 +1756,19 @@
         <table class="secrets">
           <thead>
             <tr>
-              <th>ID</th>
-              <th>Name</th>
-              <th>Category</th>
-              <th>Value (masked)</th>
-              <th>Length</th>
-              <th>Mock Strategy</th>
-              <th>Source</th>
-              <th>Decision</th>
-              <th class="actions">Actions</th>
+              <th data-i18n="th.id">ID</th>
+              <th data-i18n="th.name">Name</th>
+              <th data-i18n="th.category">Category</th>
+              <th data-i18n="th.value">Value (masked)</th>
+              <th data-i18n="th.length">Length</th>
+              <th data-i18n="th.mockStrategy">Mock Strategy</th>
+              <th data-i18n="th.source">Source</th>
+              <th data-i18n="th.decision">Decision</th>
+              <th class="actions" data-i18n="th.actions">Actions</th>
             </tr>
           </thead>
           <tbody id="secrets-body">
-            <tr><td colspan="9" class="empty">No secrets configured</td></tr>
+            <tr><td colspan="9" class="empty" data-i18n="secrets.empty">No secrets configured</td></tr>
           </tbody>
         </table>
       </div>
@@ -1772,25 +1777,25 @@
       <div class="secrets-main">
         <div class="secrets-toolbar">
           <div class="stats" id="providers-stats"></div>
-          <span class="hint">URL pattern: <code>/{proto-short}/{provider-id}/*</code> · a direct provider may serve multiple protocols — click <strong>endpoints</strong> in a row for details</span>
-          <button class="btn" onclick="openProviderForm()">+ new provider</button>
+          <span class="hint" data-i18n-html="providers.urlHint">URL pattern: <code>/{proto-short}/{provider-id}/*</code> · a direct provider may serve multiple protocols — click <strong>endpoints</strong> in a row for details</span>
+          <button class="btn" onclick="openProviderForm()" data-i18n="providers.new">+ new provider</button>
         </div>
         <table class="secrets">
           <thead>
             <tr>
-              <th>ID</th>
-              <th>Name</th>
-              <th>Protocol</th>
-              <th>Base URL / Routes</th>
-              <th>API Key (masked)</th>
-              <th>Enabled</th>
-              <th>Source</th>
-              <th>Decision</th>
-              <th class="actions">Actions</th>
+              <th data-i18n="th.id">ID</th>
+              <th data-i18n="th.name">Name</th>
+              <th data-i18n="th.protocol">Protocol</th>
+              <th data-i18n="th.baseUrl">Base URL / Routes</th>
+              <th data-i18n="th.apiKey">API Key (masked)</th>
+              <th data-i18n="th.enabled">Enabled</th>
+              <th data-i18n="th.source">Source</th>
+              <th data-i18n="th.decision">Decision</th>
+              <th class="actions" data-i18n="th.actions">Actions</th>
             </tr>
           </thead>
           <tbody id="providers-body">
-            <tr><td colspan="9" class="empty">No providers configured</td></tr>
+            <tr><td colspan="9" class="empty" data-i18n="providers.empty">No providers configured</td></tr>
           </tbody>
         </table>
       </div>
@@ -1799,12 +1804,16 @@
       <div class="secrets-main">
         <div class="secrets-toolbar">
           <div class="stats" id="apikeys-stats"></div>
-          <button class="btn" onclick="openApiKeyForm()">+ new API key</button>
+          <button class="btn" onclick="openApiKeyForm()" data-i18n="apikeys.new">+ new API key</button>
         </div>
         <div class="hint" style="margin-bottom: 8px;">
-          API keys authenticate SDK forwarding requests (<code>Authorization: Bearer sg_...</code>).
-          Static keys come from <code>secret-guard.toml</code>; dynamic keys are issued via WebUI.
-          <div id="apikeys-auth-warn" hidden style="margin-top: 6px;">
+          <!-- data-i18n-html 挂在内层 span: 挂外层 .hint 会 innerHTML 重写抹掉嵌套的
+               #apikeys-auth-warn (renderApiKeys 依赖该节点). -->
+          <span data-i18n-html="apikeys.hint">
+            API keys authenticate SDK forwarding requests (<code>Authorization: Bearer sg_...</code>).
+            Static keys come from <code>secret-guard.toml</code>; dynamic keys are issued via WebUI.
+          </span>
+          <div id="apikeys-auth-warn" hidden style="margin-top: 6px;" data-i18n-html="apikeys.authWarn">
             <strong class="hint-warn">Server authentication is disabled</strong> — all forwarding
             requests are accepted without a key, so listed keys are <em>inactive</em>. To activate
             them, set <code>[auth] enabled = true</code> (with an <code>[auth.oidc]</code> section)
@@ -1814,16 +1823,16 @@
         <table class="secrets">
           <thead>
             <tr>
-              <th>Label</th>
-              <th>Key Prefix</th>
-              <th>Source</th>
-              <th>Status</th>
-              <th>Created</th>
-              <th class="actions">Actions</th>
+              <th data-i18n="apikeys.th.label">Label</th>
+              <th data-i18n="apikeys.th.prefix">Key Prefix</th>
+              <th data-i18n="th.source">Source</th>
+              <th data-i18n="apikeys.th.status">Status</th>
+              <th data-i18n="apikeys.th.created">Created</th>
+              <th class="actions" data-i18n="th.actions">Actions</th>
             </tr>
           </thead>
           <tbody id="apikeys-body">
-            <tr><td colspan="6" class="empty">No API keys configured</td></tr>
+            <tr><td colspan="6" class="empty" data-i18n="apikeys.empty">No API keys configured</td></tr>
           </tbody>
         </table>
       </div>
@@ -1831,55 +1840,55 @@
     <section id="tab-usage" class="tab-content">
       <div class="usage-main">
         <div class="usage-toolbar">
-          <div class="range-switch" id="usage-range" role="group" aria-label="时间范围">
+          <div class="range-switch" id="usage-range" role="group" aria-label="Time range" data-i18n-aria-label="usage.aria">
             <button type="button" data-hours="24">24h</button>
             <button type="button" data-hours="168" class="active">7d</button>
             <button type="button" data-hours="720">30d</button>
-            <button type="button" data-hours="9600">All</button>
+            <button type="button" data-hours="9600" data-i18n="usage.all">All</button>
           </div>
           <span id="usage-pricing-status" class="usage-pricing-status"></span>
         </div>
         <div class="usage-cards" id="usage-cards"></div>
         <div class="usage-chart-wrap">
           <h3><span id="usage-chart-title">tokens</span> <span class="usage-legend" id="usage-legend"></span></h3>
-          <div id="usage-chart"><div class="empty">no data</div></div>
+          <div id="usage-chart"><div class="empty" data-i18n="usage.noData">no data</div></div>
         </div>
         <div class="usage-tables">
           <div class="usage-table-block">
-            <h3>By model</h3>
+            <h3 data-i18n="usage.byModel">By model</h3>
             <div class="usage-table-scroll">
               <table class="secrets usage-table">
-                <thead><tr><th>Model</th><th>Provider</th><th>Reqs</th><th>Retries</th><th>429</th><th>In</th><th>Cache R</th><th>Cache W</th><th>Out</th><th>~Cost</th><th>Share</th></tr></thead>
-                <tbody id="usage-by-model-body"><tr><td colspan="11" class="empty">no data</td></tr></tbody>
+                <thead><tr><th data-i18n="usage.th.model">Model</th><th data-i18n="usage.th.provider">Provider</th><th data-i18n="usage.th.reqs">Reqs</th><th data-i18n="usage.th.retries">Retries</th><th>429</th><th data-i18n="usage.th.in">In</th><th data-i18n="usage.th.cacheR">Cache R</th><th data-i18n="usage.th.cacheW">Cache W</th><th data-i18n="usage.th.out">Out</th><th data-i18n="usage.th.cost">~Cost</th><th data-i18n="usage.th.share">Share</th></tr></thead>
+                <tbody id="usage-by-model-body"><tr><td colspan="11" class="empty" data-i18n="usage.noData">no data</td></tr></tbody>
               </table>
             </div>
           </div>
           <div class="usage-table-block">
-            <h3>By provider</h3>
+            <h3 data-i18n="usage.byProvider">By provider</h3>
             <div class="usage-table-scroll">
               <table class="secrets usage-table">
-                <thead><tr><th>Provider</th><th>Reqs</th><th>Retries</th><th>429</th><th>In</th><th>Cache R</th><th>Cache W</th><th>Out</th><th>~Cost</th></tr></thead>
-                <tbody id="usage-by-provider-body"><tr><td colspan="9" class="empty">no data</td></tr></tbody>
+                <thead><tr><th data-i18n="usage.th.provider">Provider</th><th data-i18n="usage.th.reqs">Reqs</th><th data-i18n="usage.th.retries">Retries</th><th>429</th><th data-i18n="usage.th.in">In</th><th data-i18n="usage.th.cacheR">Cache R</th><th data-i18n="usage.th.cacheW">Cache W</th><th data-i18n="usage.th.out">Out</th><th data-i18n="usage.th.cost">~Cost</th></tr></thead>
+                <tbody id="usage-by-provider-body"><tr><td colspan="9" class="empty" data-i18n="usage.noData">no data</td></tr></tbody>
               </table>
             </div>
           </div>
         </div>
         <div class="usage-tables" style="margin-top: 14px;">
           <div class="usage-table-block">
-            <h3>Redactions · by secret</h3>
+            <h3 data-i18n="usage.redactBySecret">Redactions · by secret</h3>
             <div class="usage-table-scroll">
               <table class="secrets usage-table">
-                <thead><tr><th>Secret</th><th>Mock</th><th>Hits</th><th>Where</th><th>First seen</th><th>Last seen</th></tr></thead>
-                <tbody id="redact-by-secret-body"><tr><td colspan="6" class="empty">no data</td></tr></tbody>
+                <thead><tr><th data-i18n="usage.th.secret">Secret</th><th data-i18n="usage.th.mock">Mock</th><th data-i18n="usage.th.hits">Hits</th><th data-i18n="usage.th.where">Where</th><th data-i18n="usage.th.firstSeen">First seen</th><th data-i18n="usage.th.lastSeen">Last seen</th></tr></thead>
+                <tbody id="redact-by-secret-body"><tr><td colspan="6" class="empty" data-i18n="usage.noData">no data</td></tr></tbody>
               </table>
             </div>
           </div>
           <div class="usage-table-block">
-            <h3>Redactions · recent</h3>
+            <h3 data-i18n="usage.redactRecent">Redactions · recent</h3>
             <div class="usage-table-scroll">
               <table class="secrets usage-table">
-                <thead><tr><th>Time</th><th>Secret</th><th>Mock</th><th>Where</th><th>Key</th><th>Provider</th><th>Model</th><th>Record</th></tr></thead>
-                <tbody id="redact-recent-body"><tr><td colspan="8" class="empty">no data</td></tr></tbody>
+                <thead><tr><th data-i18n="usage.th.time">Time</th><th data-i18n="usage.th.secret">Secret</th><th data-i18n="usage.th.mock">Mock</th><th data-i18n="usage.th.where">Where</th><th data-i18n="usage.th.key">Key</th><th data-i18n="usage.th.provider">Provider</th><th data-i18n="usage.th.model">Model</th><th data-i18n="usage.th.record">Record</th></tr></thead>
+                <tbody id="redact-recent-body"><tr><td colspan="8" class="empty" data-i18n="usage.noData">no data</td></tr></tbody>
               </table>
             </div>
           </div>
@@ -1890,99 +1899,99 @@
   </main>
 
   <dialog id="audit-record-dialog">
-    <h3 style="margin: 0 0 8px 0;">Redacted request (LLM view)</h3>
+    <h3 style="margin: 0 0 8px 0;" data-i18n="audit.dialogTitle">Redacted request (LLM view)</h3>
     <div class="hint" id="audit-record-meta" style="margin-bottom: 8px;"></div>
     <pre id="audit-record-body" style="max-width: 720px; max-height: 60vh; overflow: auto; font-size: 11.5px; white-space: pre-wrap;"></pre>
     <form method="dialog" style="margin-top: 10px; text-align: right;">
-      <button type="submit" class="btn">Close</button>
+      <button type="submit" class="btn" data-i18n="common.closeBtn">Close</button>
     </form>
   </dialog>
   <dialog id="secret-form">
     <form method="dialog" id="secret-form-el">
-      <h3 style="grid-column: 1 / -1; margin: 0 0 8px 0;" id="secret-form-title">New secret</h3>
+      <h3 style="grid-column: 1 / -1; margin: 0 0 8px 0;" id="secret-form-title" data-i18n="form.secret.newTitle">New secret</h3>
       <div id="secret-form-banner" class="banner" style="grid-column: 1 / -1; display: none;"></div>
-      <label for="f-id">ID</label>
-      <input type="text" id="f-id" placeholder="(auto-generated if blank)">
-      <label for="f-name">Name</label>
-      <input type="text" id="f-name" placeholder="(optional)">
-      <label for="f-category">Category</label>
+      <label for="f-id" data-i18n="form.id">ID</label>
+      <input type="text" id="f-id" placeholder="(auto-generated if blank)" data-i18n-placeholder="form.idPlaceholder">
+      <label for="f-name" data-i18n="form.name">Name</label>
+      <input type="text" id="f-name" placeholder="(optional)" data-i18n-placeholder="form.namePlaceholder">
+      <label for="f-category" data-i18n="form.category">Category</label>
       <select id="f-category"></select>
-      <label for="f-value">Value</label>
-      <textarea id="f-value" placeholder="the real secret"></textarea>
+      <label for="f-value" data-i18n="form.value">Value</label>
+      <textarea id="f-value" placeholder="the real secret" data-i18n-placeholder="form.valuePlaceholder"></textarea>
 
       <fieldset style="grid-column: 1 / -1; border: 1px solid var(--border); padding: 8px; margin: 4px 0;">
-        <legend>Mock Strategy</legend>
+        <legend data-i18n="form.mockStrategy">Mock Strategy</legend>
         <div style="display: grid; grid-template-columns: auto 1fr; gap: 6px 10px; align-items: center;">
-          <label>Initial</label>
+          <label data-i18n="form.initial">Initial</label>
           <div>
-            <label style="margin-right: 12px;"><input type="radio" name="f-ms-initial" value="auto" checked>Auto (generate)</label>
-            <label><input type="radio" name="f-ms-initial" value="fixed">Fixed:</label>
-            <input type="text" id="f-ms-fixed" placeholder="custom mock value" style="width: 60%; margin-left: 4px;">
-            <button type="button" class="btn" id="f-ms-generate" title="Generate a candidate from the gen spec below" style="margin-left: 4px;">Generate</button>
+            <label style="margin-right: 12px;"><input type="radio" name="f-ms-initial" value="auto" checked><span data-i18n="form.autoGenerate">Auto (generate)</span></label>
+            <label><input type="radio" name="f-ms-initial" value="fixed"><span data-i18n="form.fixed">Fixed:</span></label>
+            <input type="text" id="f-ms-fixed" placeholder="custom mock value" data-i18n-placeholder="form.mockPlaceholder" style="width: 60%; margin-left: 4px;">
+            <button type="button" class="btn" id="f-ms-generate" title="Generate a candidate from the gen spec below" data-i18n-title="form.generateTitle" data-i18n="form.generate" style="margin-left: 4px;">Generate</button>
           </div>
 
-          <label>Prefix</label>
-          <input type="text" id="f-ms-prefix" placeholder="(empty = no prefix)">
+          <label data-i18n="form.prefix">Prefix</label>
+          <input type="text" id="f-ms-prefix" placeholder="(empty = no prefix)" data-i18n-placeholder="form.prefixPlaceholder">
 
-          <label>Charset</label>
+          <label data-i18n="form.charset">Charset</label>
           <div>
             <label style="margin-right: 8px;"><input type="checkbox" class="f-ms-charset" data-charclass="digits"> 0-9</label>
             <label style="margin-right: 8px;"><input type="checkbox" class="f-ms-charset" data-charclass="lowercase"> a-z</label>
             <label style="margin-right: 8px;"><input type="checkbox" class="f-ms-charset" data-charclass="uppercase"> A-Z</label>
             <label style="margin-right: 8px;"><input type="checkbox" class="f-ms-charset" data-charclass="underscore"> _</label>
             <label style="margin-right: 8px;"><input type="checkbox" class="f-ms-charset" data-charclass="hyphen"> -</label>
-            <label>other: <input type="text" id="f-ms-other" placeholder="!@#$" style="width: 80px;"></label>
+            <label><span data-i18n="form.other">other:</span> <input type="text" id="f-ms-other" placeholder="!@#$" style="width: 80px;"></label>
           </div>
 
-          <label>Length</label>
+          <label data-i18n="form.length">Length</label>
           <div>
-            min <input type="number" id="f-ms-lenmin" min="1" style="width: 70px;">
-            max <input type="number" id="f-ms-lenmax" min="1" style="width: 70px;">
-            <button type="button" class="btn" id="f-ms-infer" title="Infer charset/length from the real value (if known)" style="margin-left: 4px;">Infer from value</button>
+            <span data-i18n="form.min">min</span> <input type="number" id="f-ms-lenmin" min="1" style="width: 70px;">
+            <span data-i18n="form.max">max</span> <input type="number" id="f-ms-lenmax" min="1" style="width: 70px;">
+            <button type="button" class="btn" id="f-ms-infer" title="Infer charset/length from the real value (if known)" data-i18n-title="form.inferTitle" data-i18n="form.infer" style="margin-left: 4px;">Infer from value</button>
           </div>
         </div>
       </fieldset>
 
       <div class="actions">
-        <button class="btn" value="cancel">Cancel</button>
-        <button class="btn" value="save" id="f-save">Save</button>
+        <button class="btn" value="cancel" data-i18n="common.cancel">Cancel</button>
+        <button class="btn" value="save" id="f-save" data-i18n="common.create">Save</button>
       </div>
     </form>
   </dialog>
 
   <dialog id="provider-form">
     <form method="dialog" id="provider-form-el">
-      <h3 style="grid-column: 1 / -1; margin: 0 0 8px 0;" id="provider-form-title">New provider</h3>
+      <h3 style="grid-column: 1 / -1; margin: 0 0 8px 0;" id="provider-form-title" data-i18n="form.provider.newTitle">New provider</h3>
       <div id="provider-form-banner" class="banner" style="grid-column: 1 / -1; display: none;"></div>
-      <label for="p-kind">Kind</label>
+      <label for="p-kind" data-i18n="providers.kind">Kind</label>
       <select id="p-kind">
-        <option value="direct">Direct — real upstream</option>
-        <option value="router">Router — route-based routing</option>
-        <option value="pool">Pool — subscription failover</option>
+        <option value="direct" data-i18n="providers.kind.direct">Direct — real upstream</option>
+        <option value="router" data-i18n="providers.kind.router">Router — route-based routing</option>
+        <option value="pool" data-i18n="providers.kind.pool">Pool — subscription failover</option>
       </select>
       <div class="hint" id="p-kind-hint" style="grid-column: 1 / -1; margin: 0 0 4px 0;">
         Forwards directly to a real LLM endpoint (base URL + API key).
       </div>
-      <label for="p-id">ID</label>
-      <input type="text" id="p-id" placeholder="unique slug, e.g. openai-main">
-      <label for="p-name">Name</label>
-      <input type="text" id="p-name" placeholder="(optional)">
+      <label for="p-id" data-i18n="form.id">ID</label>
+      <input type="text" id="p-id" placeholder="unique slug, e.g. openai-main" data-i18n-placeholder="providers.idPlaceholder">
+      <label for="p-name" data-i18n="form.name">Name</label>
+      <input type="text" id="p-name" placeholder="(optional)" data-i18n-placeholder="form.namePlaceholder">
       <div class="kind-fields hidden" id="p-router-fields">
         <div class="routes-editor">
           <div class="routes-head">
-            <span>Routes</span>
-            <button type="button" class="btn" id="p-route-add">+ Add route</button>
+            <span data-i18n="providers.routes">Routes</span>
+            <button type="button" class="btn" id="p-route-add" data-i18n="providers.addRoute">+ Add route</button>
           </div>
           <div class="routes-colhead">
-            <span title="enabled — uncheck to keep the route without matching">on</span>
-            <span title="model name pattern ('*' wildcard)">model_pattern</span>
-            <span>target</span>
-            <span title="rewrite model (optional — overrides the client's model when this route wins)">upstream_model</span>
-            <span title="priority — higher wins, ties by list order">prio</span>
+            <span title="enabled — uncheck to keep the route without matching" data-i18n-title="providers.col.onTitle" data-i18n="providers.col.on">on</span>
+            <span title="model name pattern ('*' wildcard)" data-i18n-title="providers.col.modelPatternTitle">model_pattern</span>
+            <span data-i18n="providers.col.target">target</span>
+            <span title="rewrite model (optional — overrides the client's model when this route wins)" data-i18n-title="providers.col.upstreamModelTitle">upstream_model</span>
+            <span title="priority — higher wins, ties by list order" data-i18n-title="providers.col.prioTitle">prio</span>
             <span></span>
           </div>
           <div id="p-routes-list"></div>
-          <div class="hint" style="margin: 0 0 4px 0;">
+          <div class="hint" style="margin: 0 0 4px 0;" data-i18n-html="providers.routesHint">
             The highest-priority enabled route whose model_pattern matches the request model routes the
             request (ties: list order). model_pattern supports the '<code>*</code>' wildcard. Uncheck a
             row to disable it — it is kept but never matched.
@@ -1992,32 +2001,32 @@
       <div class="kind-fields hidden" id="p-pool-fields">
         <div class="routes-editor">
           <div class="routes-head">
-            <span>Members (ordered failover)</span>
-            <button type="button" class="btn" id="p-member-add">+ Add member</button>
+            <span data-i18n="providers.members">Members (ordered failover)</span>
+            <button type="button" class="btn" id="p-member-add" data-i18n="providers.addMember">+ Add member</button>
           </div>
           <div id="p-members-list"></div>
-          <div class="hint" style="margin: 0 0 4px 0;">
+          <div class="hint" style="margin: 0 0 4px 0;" data-i18n-html="providers.membersHint">
             Requests always go to the first available member (list order = failover priority); on
             window-quota exhaustion the member is suspended until its alarm expires and traffic moves
             to the next. Members are direct providers.
           </div>
         </div>
         <details id="p-exhaust-details">
-          <summary>Exhaust signals (advanced) — default: built-in subscription window-quota table</summary>
-          <div class="hint" style="margin: 6px 0 0 0;">
+          <summary data-i18n="providers.exhaustSummary">Exhaust signals (advanced) — default: built-in subscription window-quota table</summary>
+          <div class="hint" style="margin: 6px 0 0 0;" data-i18n-html="providers.exhaustHint">
             Three OR channels; a hit suspends the member. Explicit values replace the default table
             per channel (empty = channel off). Codes are matched loosely from body
             <code>error.code</code>/<code>error.type</code>/<code>error.status</code>/top-level
             <code>code</code>; headers match <code>name=value</code> exactly (case-insensitive name).
           </div>
           <div class="exhaust-grid">
-            <label for="p-exh-statuses">Statuses</label>
-            <input type="text" id="p-exh-statuses" placeholder="e.g. 402, 429 (empty = channel off)">
-            <label for="p-exh-codes">Codes</label>
-            <textarea id="p-exh-codes" rows="2" placeholder="one per line, e.g. 1308"></textarea>
-            <label for="p-exh-headers">Headers</label>
-            <textarea id="p-exh-headers" rows="2" placeholder="name=value, one per line"></textarea>
-            <label for="p-cooldown">Cooldown (s)</label>
+            <label for="p-exh-statuses" data-i18n="providers.exh.statuses">Statuses</label>
+            <input type="text" id="p-exh-statuses" placeholder="e.g. 402, 429 (empty = channel off)" data-i18n-placeholder="providers.exh.statusesPlaceholder">
+            <label for="p-exh-codes" data-i18n="providers.exh.codes">Codes</label>
+            <textarea id="p-exh-codes" rows="2" placeholder="one per line, e.g. 1308" data-i18n-placeholder="providers.exh.codesPlaceholder"></textarea>
+            <label for="p-exh-headers" data-i18n="providers.exh.headers">Headers</label>
+            <textarea id="p-exh-headers" rows="2" placeholder="name=value, one per line" data-i18n-placeholder="providers.exh.headersPlaceholder"></textarea>
+            <label for="p-cooldown" data-i18n="providers.exh.cooldown">Cooldown (s)</label>
             <input type="number" id="p-cooldown" min="0" step="1" placeholder="60">
           </div>
         </details>
@@ -2025,36 +2034,36 @@
       <div class="kind-fields" id="p-direct-fields">
         <div class="routes-editor">
           <div class="routes-head">
-            <span>Endpoints (one per protocol, shared API key)</span>
-            <button type="button" class="btn" id="p-endpoint-add">+ Add endpoint</button>
+            <span data-i18n="providers.endpoints">Endpoints (one per protocol, shared API key)</span>
+            <button type="button" class="btn" id="p-endpoint-add" data-i18n="providers.addEndpoint">+ Add endpoint</button>
           </div>
           <div id="p-endpoints-list"></div>
-          <div class="hint" style="margin: 0 0 4px 0;">
+          <div class="hint" style="margin: 0 0 4px 0;" data-i18n-html="providers.endpointsHint">
             Each endpoint serves its protocol via <code>/{proto-short}/{provider-id}/</code>
             (byte-exact passthrough). Requests whose ingress protocol has no endpoint fall back to
             the first endpoint (cross-protocol translation).
           </div>
         </div>
-        <label for="p-api-key">API Key</label>
-        <input type="password" id="p-api-key" placeholder="(optional for local providers like Ollama)">
+        <label for="p-api-key" data-i18n="providers.apiKey">API Key</label>
+        <input type="password" id="p-api-key" placeholder="(optional for local providers like Ollama)" data-i18n-placeholder="providers.apiKeyPlaceholder">
       </div>
-      <label for="p-enabled">Enabled</label>
+      <label for="p-enabled" data-i18n="providers.enabled">Enabled</label>
       <input type="checkbox" id="p-enabled" checked>
       <div class="actions">
-        <button class="btn" value="cancel">Cancel</button>
-        <button class="btn" value="save" id="p-save">Save</button>
+        <button class="btn" value="cancel" data-i18n="common.cancel">Cancel</button>
+        <button class="btn" value="save" id="p-save" data-i18n="common.create">Save</button>
       </div>
     </form>
   </dialog>
 
   <dialog id="apikey-form">
     <form method="dialog" id="apikey-form-el">
-      <h3 style="grid-column: 1 / -1; margin: 0 0 8px 0;">New API Key</h3>
-      <label for="ak-label">Label</label>
-      <input type="text" id="ak-label" placeholder="e.g. ci-pipeline">
+      <h3 style="grid-column: 1 / -1; margin: 0 0 8px 0;" data-i18n="apikeys.formTitle">New API Key</h3>
+      <label for="ak-label" data-i18n="apikeys.label">Label</label>
+      <input type="text" id="ak-label" placeholder="e.g. ci-pipeline" data-i18n-placeholder="apikeys.labelPlaceholder">
       <div class="actions">
-        <button class="btn" value="cancel">Cancel</button>
-        <button class="btn" value="save" id="ak-save">Create</button>
+        <button class="btn" value="cancel" data-i18n="common.cancel">Cancel</button>
+        <button class="btn" value="save" id="ak-save" data-i18n="common.create">Create</button>
       </div>
     </form>
   </dialog>
@@ -2062,9 +2071,9 @@
   <dialog id="provider-endpoints">
     <form method="dialog">
       <header class="ep-dialog-head">
-        <h3>Endpoints</h3>
+        <h3 data-i18n="prov.endpointsTitle">Endpoints</h3>
         <div class="ep-subject" id="provider-endpoints-subject"></div>
-        <div class="hint">
+        <div class="hint" data-i18n-html="prov.endpointsHint">
           Base pattern: <code>/{proto-short}/{provider-id}/*</code>. Same-protocol = direct;
           cross-protocol = translation between OpenAI / Anthropic / Responses (streaming
           included for all codec-covered pairs); Gemini/Ollama ingress = not
@@ -2073,7 +2082,7 @@
       </header>
       <div id="provider-endpoints-body" class="ep-list"></div>
       <div class="actions">
-        <button class="btn" value="close">Close</button>
+        <button class="btn" value="close" data-i18n="common.closeBtn">Close</button>
       </div>
     </form>
   </dialog>
@@ -2081,20 +2090,964 @@
   <dialog id="apikey-reveal">
     <form method="dialog">
       <div style="min-width: 400px;">
-        <h3 style="margin: 0 0 8px 0;">API Key Created</h3>
-        <div class="hint" style="margin-bottom: 8px;">
+        <h3 style="margin: 0 0 8px 0;" data-i18n="apikeys.revealTitle">API Key Created</h3>
+        <div class="hint" style="margin-bottom: 8px;" data-i18n="apikeys.revealHint">
           Copy this key now — it will not be shown again.
         </div>
         <textarea id="apikey-reveal-value" readonly style="width: 100%; font-size: 13px; padding: 8px; word-break: break-all;" rows="3"></textarea>
         <div class="actions" style="margin-top: 8px;">
-          <button class="btn" type="button" onclick="copyRevealedApiKey()">Copy</button>
-          <button class="btn" value="close">Close</button>
+          <button class="btn" type="button" onclick="copyRevealedApiKey()" data-i18n="apikeys.copy">Copy</button>
+          <button class="btn" value="close" data-i18n="common.closeBtn">Close</button>
         </div>
       </div>
     </form>
   </dialog>
 
   <script>
+    // ─── i18n (issue #298) ─────────────────────────────────────────────────
+    //
+    // 单文件 i18n 机制 (零外部依赖, 无构建步骤):
+    // - 字典 SSOT: 下方 I18N 对象 (en + zh), key = 稳定语义 ID (点分命名空间,
+    //   按 UI 区域分组). en 词条 = 既有英文文案逐字保留; zh 为中文翻译.
+    // - t(key, params): 取词 + {name} 插值. 当前语言缺 key 时回退 en; en 也缺时
+    //   返回 key 本身 + console.warn (开发期可见的缺词信号).
+    // - 静态 HTML 文案: data-i18n (textContent) / data-i18n-html (innerHTML —
+    //   仅字典作者可控的富文本 hint, 无用户输入插值面) / data-i18n-title /
+    //   data-i18n-placeholder / data-i18n-aria-label 标注, 由
+    //   applyI18nStaticTexts 一次性应用, 语言切换时重放.
+    // - 语言选择: 三态偏好 auto/en/zh 持久化 localStorage['sg-lang'] (默认 auto
+    //   = 跟随浏览器: (navigator.language || navigator.languages[0] || 'en')
+    //   小写前缀 zh → zh, 否则 en). 页头 #lang-switch 切换, 即时生效 — 重放静态
+    //   标注 + 重渲染当前动态区域 (rerenderDynamicForLang), 不整页刷新.
+    // - 刻意不翻译 (两种语言同形): 品牌 "Secret Guard" / 协议·模型·id 等用户数据 /
+    //   与 toml 配置字段一一对应的技术标签 (model_pattern, target, prio, auto,
+    //   fixed, prefix=…, raw 按钮) — 译出会与配置字段失去对应. / 纯符号 (↓, ✓,
+    //   ERR, ..., Σ, —).
+    // - 静态 markup 的默认文案一律写英文 (en 是回退语言): 主脚本在 body 尾部执行,
+    //   applyLanguage 前的首帧默认值不应让 en 用户闪现中文 (zh 用户 en→zh 的重放
+    //   发生在首帧渲染前, 无感知).
+    const LANG_STORAGE_KEY = 'sg-lang';
+    let currentLang = 'en';
+    const I18N = {
+      en: {
+        // ── common ──
+        'common.close': 'close',
+        'common.closeBtn': 'Close',
+        'common.cancel': 'Cancel',
+        'common.create': 'Create',
+        'common.update': 'Update',
+        'common.edit': 'edit',
+        'common.delete': 'delete',
+        'common.copy': 'Copy',
+        'common.copied': '✓ copied',
+        'common.copyFailed': 'Copy failed — select the text manually.',
+        'common.loading': 'Loading…',
+        'common.empty': '(empty)',
+        'common.none': '(none)',
+        'common.unknown': '(unknown)',
+        'common.more': '+{n} more',
+        'common.alertFailed': 'Failed: {msg}',
+        'common.alertError': 'Error: {msg}',
+        // ── header / 语言 ──
+        'header.sessions': 'sessions',
+        'header.sessionsFiltered': 'sessions [{mode}]',
+        'header.auditLog': 'Audit log',
+        'header.auditLogTitle': 'Audit log: Off = minimal memory; Errors only = keep the full body of failed requests only (recommended for troubleshooting); Full = keep everything. Affects new requests only.',
+        'header.langAria': 'Language',
+        'lang.auto': 'Auto (browser)',
+        'header.themeAria': 'Theme',
+        'header.themeAuto': 'Follow system theme',
+        'header.themeLight': 'Light',
+        'header.themeDark': 'Dark',
+        'header.autoRefresh': 'auto-refresh',
+        'header.refresh': 'refresh',
+        // ── audit capture (B3) ──
+        'audit.mode.off': 'Off',
+        'audit.mode.errors': 'Errors only',
+        'audit.mode.full': 'Full',
+        'audit.modeLabel': 'Audit log: {mode}',
+        'audit.modeSetFailed': 'Failed to switch audit log mode',
+        'audit.dialogTitle': 'Redacted request (LLM view)',
+        'audit.notCapturedNote': 'This request body was not retained by the audit log (the Off mode keeps no requests; Errors only does not keep successful ones). Use the "Audit log" selector in the top-right corner to change the mode (affects subsequent requests only).',
+        // ── tabs ──
+        'tab.records': 'Records',
+        'tab.secrets': 'Secrets',
+        'tab.providers': 'Providers',
+        'tab.apikeys': 'API Keys',
+        'tab.usage': 'Usage',
+        // ── sidebar ──
+        'sidebar.all': 'All',
+        'sidebar.hits': 'Hits',
+        'sidebar.noSessions': 'No sessions yet',
+        'sidebar.noHitsSessions': 'No sessions with redactions',
+        'sidebar.loadingRounds': 'Loading rounds…',
+        'sidebar.noPreview': '(no preview)',
+        'sidebar.tip.session': 'session: {id}',
+        'sidebar.tip.rounds': 'rounds: {n}',
+        'sidebar.tip.model': 'model: {m}',
+        'sidebar.tip.status': 'status: {s}',
+        'sidebar.tip.latest': 'latest: {t}',
+        'sidebar.tip.started': 'started: {t}',
+        'sidebar.tip.tokens': 'tokens (this process): ↑{in} ↓{out} (cache r:{cr} w:{cw})',
+        'sidebar.redactionHits': '{n} redaction(s)',
+        'sidebar.roundsCount': '{n} rounds',
+        // ── timeline ──
+        'timeline.selectSession': 'Select a session on the left',
+        'timeline.noRounds': 'No rounds in this session',
+        'timeline.sessionGone': 'Session no longer exists',
+        'timeline.loadFailed': 'Failed to load timeline: {msg}',
+        'timeline.header': 'Timeline ({rounds} rounds{user})',
+        'timeline.headerUser': ', {n} user',
+        'timeline.infoTitle': 'Transport info',
+        'timeline.rawTitle': 'Raw data',
+        'timeline.retryBadge': '↻ retry — identical messages',
+        'timeline.noContent': '(no content)',
+        'timeline.streamed': 'streamed',
+        'timeline.viaTip': 'actual upstream provider (router-resolved chain tail)',
+        'timeline.via': 'via {id}',
+        'timeline.pending': '(pending)',
+        'timeline.backToTop': 'Back to top',
+        'timeline.jumpToLatest': 'Jump to latest',
+        'timeline.backToBottom': 'Back to bottom',
+        'timeline.response': 'Response',
+        'timeline.streaming': 'Streaming in progress…',
+        'timeline.parsedUnavailable': 'Parsed view not available for this streamed response.',
+        'timeline.errorBanner': 'Error: {msg}',
+        'timeline.statusLine': 'status: ',
+        'timeline.usageTitle': 'tokens — in: {i}  out: {o}  cache read: {r}  cache write: {w}',
+        'timeline.expand': 'expand ▾',
+        'timeline.collapse': 'collapse ▴',
+        'timeline.viewFull': 'view full ▾',
+        'timeline.reasoningTip': 'reasoning_content (raw thinking)',
+        // ── roles (气泡 icon title / 全文弹窗标题) ──
+        'role.user': 'user',
+        'role.assistant': 'assistant',
+        'role.system': 'system',
+        'role.tool': 'tool',
+        // ── info 弹窗 ──
+        'info.roundId': 'Round ID',
+        'info.role': 'Role',
+        'info.kind': 'Kind',
+        'info.time': 'Time',
+        'info.method': 'Method',
+        'info.path': 'Path',
+        'info.status': 'Status',
+        'info.elapsed': 'Elapsed',
+        'info.streamed': 'Streamed',
+        'info.complete': 'Complete',
+        'info.model': 'Model',
+        'info.error': 'Error',
+        'info.redactions': 'Redactions',
+        'info.upstream': 'Upstream',
+        'info.upstreamModel': 'Upstream Model',
+        'info.loadingValue': '(loading…)',
+        'info.historyRound': '(history round)',
+        'info.yes': 'yes',
+        'info.no': 'no',
+        'info.noneValue': 'none',
+        'info.normal': 'normal',
+        'info.hitsValue': '{n} hit(s)',
+        // ── raw 弹窗 ──
+        'raw.requestHeaders': 'Request Headers',
+        'raw.requestBody': 'Request Body',
+        'raw.responseHeaders': 'Response Headers',
+        'raw.responseBody': 'Response Body',
+        'raw.llmViewReq': '(LLM view, secrets redacted)',
+        'raw.llmViewResp': '(LLM view, values may contain mocks)',
+        'raw.streamedNote': '(streamed response — raw SSE bytes not retained)',
+        'raw.empty': '(empty)',
+        'raw.noHeaders': '(no headers)',
+        'raw.failedLoad': 'Failed to load record.',
+        // ── status / alert / confirm ──
+        'status.syncFailed': 'sync failed',
+        'status.loadOlderFailed': 'load older failed',
+        'status.refreshFailed': '{kind} refresh failed',
+        'status.apikeyRefreshFailed': 'apikey refresh failed',
+        'status.usageError': 'usage: {msg}',
+        'status.apiKeyCopied': 'API key copied to clipboard',
+        // ── stats / source / decision ──
+        'stats.total': '<strong>{n}</strong> total',
+        'stats.static': '<strong>{n}</strong> static',
+        'stats.dynamic': '<strong>{n}</strong> dynamic',
+        'stats.overrides': '<strong>{n}</strong> overrides',
+        'source.static': 'static',
+        'source.dynamic': 'dynamic',
+        'source.dynamic_override': 'override',
+        'source.static_preferred': 'static (forced)',
+        'decision.default': 'Default (dynamic wins)',
+        'decision.prefer_static': 'Prefer static',
+        'decision.disabled': 'Disabled',
+        'decision.disabledHint': 'Disabled: protection OFF — the real secret value will be forwarded in plaintext to upstream providers.',
+        'decision.confirmSecretDisabled': 'Set secret {id} to Disabled?',
+        'decision.updateFailed': 'Decision update failed: {msg}',
+        'decision.warningFor': 'Warning for {id}: {msg}',
+        'action.override': 'override',
+        'action.editDyn': 'edit dyn',
+        'confirm.deleteItem': 'Delete dynamic {kind} {id}?',
+        // ── secrets tab ──
+        'secrets.new': '+ new dynamic secret',
+        'secrets.empty': 'No secrets configured',
+        'secrets.hint': 'Static (declarative) items come from <code>secret-guard.toml</code>; dynamic items from <code>secret-guard.state.toml</code>. Edit a static item to fork a dynamic override. Use the <b>decision</b> dropdown to disable a static id or force-prefer its static value.',
+        'th.id': 'ID',
+        'th.name': 'Name',
+        'th.category': 'Category',
+        'th.value': 'Value (masked)',
+        'th.length': 'Length',
+        'th.mockStrategy': 'Mock Strategy',
+        'th.source': 'Source',
+        'th.decision': 'Decision',
+        'th.actions': 'Actions',
+        // ── secret 表单 ──
+        'form.secret.newTitle': 'New secret',
+        'form.secret.editTitle': 'Edit secret {id}',
+        'form.id': 'ID',
+        'form.name': 'Name',
+        'form.category': 'Category',
+        'form.value': 'Value',
+        'form.idPlaceholder': '(auto-generated if blank)',
+        'form.namePlaceholder': '(optional)',
+        'form.valuePlaceholder': 'the real secret',
+        'form.mockStrategy': 'Mock Strategy',
+        'form.initial': 'Initial',
+        'form.autoGenerate': 'Auto (generate)',
+        'form.fixed': 'Fixed:',
+        'form.mockPlaceholder': 'custom mock value',
+        'form.generate': 'Generate',
+        'form.generateTitle': 'Generate a candidate from the gen spec below',
+        'form.prefix': 'Prefix',
+        'form.prefixPlaceholder': '(empty = no prefix)',
+        'form.charset': 'Charset',
+        'form.other': 'other:',
+        'form.length': 'Length',
+        'form.min': 'min',
+        'form.max': 'max',
+        'form.infer': 'Infer from value',
+        'form.inferTitle': 'Infer charset/length from the real value (if known)',
+        'alert.valueRequired': 'Please fill in the real value first.',
+        'alert.charsetEmpty': 'Charset is empty. Enable at least one character class.',
+        'banner.staticOverride': 'This id is declared statically. Saving will create a dynamic override; the static baseline is preserved.',
+        // ── providers tab / 表单 ──
+        'providers.new': '+ new provider',
+        'providers.empty': 'No providers configured',
+        'providers.urlHint': 'URL pattern: <code>/{proto-short}/{provider-id}/*</code> · a direct provider may serve multiple protocols — click <strong>endpoints</strong> in a row for details',
+        'th.protocol': 'Protocol',
+        'th.baseUrl': 'Base URL / Routes',
+        'th.apiKey': 'API Key (masked)',
+        'th.enabled': 'Enabled',
+        'providers.kind': 'Kind',
+        'providers.kind.direct': 'Direct — real upstream',
+        'providers.kind.router': 'Router — route-based routing',
+        'providers.kind.pool': 'Pool — subscription failover',
+        'providers.kindHint.direct': 'Forwards directly to a real LLM endpoint (one endpoint per protocol, shared API key).',
+        'providers.kindHint.router': 'Route-based routing endpoint — the request model is matched against route model_patterns; the highest-priority enabled match routes the request. No base URL / API key of its own.',
+        'providers.kindHint.pool': 'Subscription pool — ordered members (direct providers); traffic goes to the first available member and fails over on window-quota exhaustion signals. No base URL / API key of its own.',
+        'providers.idPlaceholder': 'unique slug, e.g. openai-main',
+        'providers.routes': 'Routes',
+        'providers.addRoute': '+ Add route',
+        'providers.col.on': 'on',
+        'providers.col.target': 'target',
+        'providers.col.onTitle': 'enabled — uncheck to keep the route without matching',
+        'providers.col.modelPatternTitle': "model name pattern ('*' wildcard)",
+        'providers.col.upstreamModelTitle': "rewrite model (optional — overrides the client's model when this route wins)",
+        'providers.col.prioTitle': 'priority — higher wins, ties by list order',
+        'providers.routesHint': "The highest-priority enabled route whose model_pattern matches the request model routes the request (ties: list order). model_pattern supports the '<code>*</code>' wildcard. Uncheck a row to disable it — it is kept but never matched.",
+        'providers.members': 'Members (ordered failover)',
+        'providers.addMember': '+ Add member',
+        'providers.membersHint': 'Requests always go to the first available member (list order = failover priority); on window-quota exhaustion the member is suspended until its alarm expires and traffic moves to the next. Members are direct providers.',
+        'providers.exhaustSummary': 'Exhaust signals (advanced) — default: built-in subscription window-quota table',
+        'providers.exhaustHint': 'Three OR channels; a hit suspends the member. Explicit values replace the default table per channel (empty = channel off). Codes are matched loosely from body <code>error.code</code>/<code>error.type</code>/<code>error.status</code>/top-level <code>code</code>; headers match <code>name=value</code> exactly (case-insensitive name).',
+        'providers.exh.statuses': 'Statuses',
+        'providers.exh.statusesPlaceholder': 'e.g. 402, 429 (empty = channel off)',
+        'providers.exh.codes': 'Codes',
+        'providers.exh.codesPlaceholder': 'one per line, e.g. 1308',
+        'providers.exh.headers': 'Headers',
+        'providers.exh.headersPlaceholder': 'name=value, one per line',
+        'providers.exh.cooldown': 'Cooldown (s)',
+        'providers.endpoints': 'Endpoints (one per protocol, shared API key)',
+        'providers.addEndpoint': '+ Add endpoint',
+        'providers.endpointsHint': 'Each endpoint serves its protocol via <code>/{proto-short}/{provider-id}/</code> (byte-exact passthrough). Requests whose ingress protocol has no endpoint fall back to the first endpoint (cross-protocol translation).',
+        'providers.apiKey': 'API Key',
+        'providers.apiKeyPlaceholder': '(optional for local providers like Ollama)',
+        'providers.apiKeyKeep': 'unchanged ({masked}) — leave blank to keep',
+        'providers.enabled': 'Enabled',
+        'providers.targetPlaceholder': '(target)',
+        'providers.memberPlaceholder': '(member)',
+        'providers.upstreamModelPlaceholder': 'rewrite model (optional)',
+        'providers.removeRoute': 'Remove route',
+        'providers.memberUpTitle': 'Move up (higher failover priority)',
+        'providers.memberDownTitle': 'Move down',
+        'providers.removeMember': 'Remove member',
+        'providers.missing': '(missing)',
+        'providers.notDirect': '(not a direct provider)',
+        'providers.epProtocolTitle': 'Protocol of this endpoint — auto-filled by Detect when it recognizes the base URL; adjust manually if needed',
+        'providers.baseUrlPlaceholder': 'https://api.openai.com (no trailing /)',
+        'providers.commonUriTitle': 'Common URI detected by Detect — the prefix secret-guard prepends to its own model-list requests. Click to copy base URL + common URI as a whole. Editing the base URL clears this.',
+        'providers.detect': 'Detect',
+        'providers.detectTitle': 'Probe this base URL to detect its protocol and list available models (does not save)',
+        'providers.detecting': 'Detecting…',
+        'providers.removeEndpoint': 'Remove endpoint',
+        'providers.commonUriIncluded': '✓ included',
+        'providers.experimental': '{proto} (experimental)',
+        'alert.noEndpoints': 'At least one endpoint is required for a direct provider.',
+        'alert.endpointProtocolRequired': 'Endpoint #{n}: protocol is required.',
+        'alert.endpointUrlRequired': 'Endpoint #{n}: Base URL is required.',
+        'alert.endpointDupProtocol': 'Endpoint #{n}: duplicate protocol "{proto}" — one endpoint per protocol (extra protocols would never match).',
+        'alert.noRoutes': 'At least one route is required for a router provider.',
+        'alert.routePatternRequired': 'Route #{n}: model_pattern is required (e.g. gpt-*).',
+        'alert.routeTargetRequired': 'Route #{n}: route target is required (pick a provider, or create one first).',
+        'alert.noMembers': 'At least one member is required for a pool provider.',
+        'alert.memberRequired': 'Member #{n}: pick a direct provider (or create one first).',
+        'alert.invalidStatus': 'Invalid HTTP status "{tok}" — use integers in 100..599, comma-separated.',
+        'alert.invalidCooldown': 'Cooldown must be a non-negative integer (seconds).',
+        'alert.poolResetFailed': 'Pool reset failed: {msg}',
+        'form.provider.newTitle': 'New provider',
+        'form.provider.editTitle': 'Edit provider {id}',
+        // ── provider 行渲染 / endpoints 弹窗 / pool ──
+        'prov.router': 'router',
+        'prov.routerTip': 'route-based routing endpoint — forwards by route model_pattern (no base URL / API key of its own)',
+        'prov.pool': 'pool',
+        'prov.poolTip': 'subscription pool — ordered failover across member direct providers (no base URL / API key of its own)',
+        'prov.egressRoutesTip': 'egress protocol(s) resolved from route targets (approximation: highest-priority enabled route)',
+        'prov.egressMembersTip': 'egress protocol(s) resolved from members (approximation: per-member chain-tail walk)',
+        'prov.endpointPillTip': 'endpoint: {url} (same-protocol passthrough)',
+        'prov.moreEndpointsTip': '+{n} more endpoint(s) — full list in this tooltip',
+        'prov.reset': 'reset',
+        'prov.resetTitle': 'Clear all member exhaustion alarms (resume probing now)',
+        'prov.endpointsBtn': 'endpoints',
+        'prov.endpointsBtnTitle': 'View endpoint URLs for each protocol',
+        'prov.crossProtoTip': 'If the ingress protocol ≠ this egress: cross-protocol translation kicks in — reasoning_content is dropped, except Responses egress streaming keeps it (as reasoning summary events)',
+        'prov.translateTip': 'Cross-protocol translation (streaming included) — reasoning_content is dropped, except Responses egress streaming keeps it (as reasoning summary events)',
+        'prov.direct': 'direct',
+        'prov.directTip': 'same-protocol passthrough (byte-exact)',
+        'prov.translate': 'translate',
+        'prov.na': 'n/a',
+        'prov.notSupported': 'not supported',
+        'prov.copyUrlTitle': 'Copy endpoint URL',
+        'prov.upstreamBaseUrl': 'upstream base URL',
+        'prov.localEntryUrl': 'local entry URL',
+        'prov.arrowTip': 'upstream ↤ local entry URL',
+        'prov.directTailHint': 'Each configured endpoint serves its own protocol via byte-exact passthrough. Ingress protocols without a configured endpoint fall back to the first endpoint (cross-protocol translation, codec-covered pairs only).',
+        'prov.endpointsTitle': 'Endpoints',
+        'prov.endpointsHint': 'Base pattern: <code>/{proto-short}/{provider-id}/*</code>. Same-protocol = direct; cross-protocol = translation between OpenAI / Anthropic / Responses (streaming included for all codec-covered pairs); Gemini/Ollama ingress = not supported. <b>Models</b> previews the model list the endpoint serves.',
+        'prov.subjectProvider': 'Provider',
+        'prov.subjectEgress': 'egress',
+        'prov.activeTip': 'active',
+        'prov.exhaustedTip': 'window-quota exhausted — suspended until its alarm expires',
+        'prov.curTip': 'requests go to the first available member (list order)',
+        'prov.activeState': 'active',
+        'prov.exhaustedState': 'exhausted',
+        'prov.untilTime': 'until {t}',
+        'prov.resumeSecs': '{n}s',
+        'prov.disabledPrefix': '(disabled) ',
+        // ── Models 预览 ──
+        'models.btn': 'Models',
+        'models.btnTitle': 'Preview the model list this endpoint serves',
+        'models.btnTitleDirect': "Preview the model list this provider serves (fetched via this provider's OpenAI-view endpoint)",
+        'models.title': 'Models ({n})',
+        'models.synth': 'synthesized from routes',
+        'models.upstreamLabel': 'upstream',
+        'models.loading': 'Loading models…',
+        'models.failed': 'Failed to load models: {msg}',
+        'models.none': 'No models reported by this endpoint.',
+        'models.copyTip': 'Copy model name',
+        // ── Detect 探测 ──
+        'probe.detected': 'Detected',
+        'probe.noProbes': 'No probes returned',
+        'probe.noEndpointHint': "No endpoint recognized — compare the GET URLs above with your provider's documented models endpoint; its base URL prefix layout may differ.",
+        'probe.keylessHint': 'Probed without an API key — the saved key is not reused; auth_failed may just mean the probe carried no key.',
+        'probe.enterUrl': 'Enter a base URL first',
+        'probe.failed': 'Probe failed: {msg}',
+        // ── apikeys tab ──
+        'apikeys.new': '+ new API key',
+        'apikeys.empty': 'No API keys configured',
+        'apikeys.hint': 'API keys authenticate SDK forwarding requests (<code>Authorization: Bearer sg_...</code>). Static keys come from <code>secret-guard.toml</code>; dynamic keys are issued via WebUI.',
+        'apikeys.authWarn': '<strong class="hint-warn">Server authentication is disabled</strong> — all forwarding requests are accepted without a key, so listed keys are <em>inactive</em>. To activate them, set <code>[auth] enabled = true</code> (with an <code>[auth.oidc]</code> section) in <code>secret-guard.toml</code> and restart.',
+        'apikeys.th.label': 'Label',
+        'apikeys.th.prefix': 'Key Prefix',
+        'apikeys.th.status': 'Status',
+        'apikeys.th.created': 'Created',
+        'apikeys.formTitle': 'New API Key',
+        'apikeys.label': 'Label',
+        'apikeys.labelPlaceholder': 'e.g. ci-pipeline',
+        'apikeys.revealTitle': 'API Key Created',
+        'apikeys.revealHint': 'Copy this key now — it will not be shown again.',
+        'apikeys.copy': 'Copy',
+        'apikeys.inactive': 'inactive',
+        'apikeys.inactiveTip': 'Server authentication is disabled — all requests are accepted without a key. Enable [auth] in secret-guard.toml to activate.',
+        'apikeys.enabledBadge': 'enabled',
+        'apikeys.disabledBadge': 'disabled',
+        'apikeys.enable': 'Enable',
+        'apikeys.disable': 'Disable',
+        'apikeys.enableAuthFirst': 'Enable server auth first',
+        'apikeys.delete': 'Delete',
+        'apikeys.staticMeta': '(static)',
+        'apikeys.statTotal': '{n} total',
+        'apikeys.statStatic': '{n} static',
+        'apikeys.statEnabled': '{n} enabled',
+        'apikeys.statInactive': 'auth off — keys inactive',
+        'apikeys.confirmDelete': 'Delete API key {id}?',
+        'apikeys.labelRequired': 'Label is required',
+        // ── usage tab ──
+        'usage.aria': 'Time range',
+        'usage.all': 'All',
+        'usage.noData': 'no data',
+        'usage.noDataInRange': 'no data in range',
+        'usage.byModel': 'By model',
+        'usage.byProvider': 'By provider',
+        'usage.redactBySecret': 'Redactions · by secret',
+        'usage.redactRecent': 'Redactions · recent',
+        'usage.th.model': 'Model',
+        'usage.th.provider': 'Provider',
+        'usage.th.reqs': 'Reqs',
+        'usage.th.retries': 'Retries',
+        'usage.th.in': 'In',
+        'usage.th.cacheR': 'Cache R',
+        'usage.th.cacheW': 'Cache W',
+        'usage.th.out': 'Out',
+        'usage.th.cost': '~Cost',
+        'usage.th.share': 'Share',
+        'usage.th.secret': 'Secret',
+        'usage.th.mock': 'Mock',
+        'usage.th.hits': 'Hits',
+        'usage.th.where': 'Where',
+        'usage.th.firstSeen': 'First seen',
+        'usage.th.lastSeen': 'Last seen',
+        'usage.th.time': 'Time',
+        'usage.th.key': 'Key',
+        'usage.th.record': 'Record',
+        'usage.pricing.loading': 'pricing: loading…',
+        'usage.pricing.stale': 'pricing: stale (refresh failed, using old table)',
+        'usage.pricing.offline': 'pricing: offline (no price data)',
+        'usage.card.requests': 'requests',
+        'usage.card.retries': 'retries',
+        'usage.card.rateLimited': '429 rate-limited',
+        'usage.card.input': 'input',
+        'usage.card.output': 'output',
+        'usage.card.cacheRead': 'cache read',
+        'usage.card.cacheWrite': 'cache write',
+        'usage.card.cacheHit': 'cache hit',
+        'usage.card.cost': '~ cost',
+        'usage.pricedPct': '{n}% priced',
+        'usage.noUsage': '{n} no usage',
+        'usage.err5xx': '{n} 5xx',
+        'usage.chartPerDay': 'tokens per day',
+        'usage.chartPerHour': 'tokens per hour',
+        'usage.legend.in': 'in',
+        'usage.legend.cacheR': 'cache r',
+        'usage.legend.cacheW': 'cache w',
+        'usage.legend.out': 'out',
+        'usage.footnote.cost': '<b>~cost</b> is an estimate from the <a href="https://models.dev" target="_blank" rel="noreferrer">models.dev</a> price table (always recomputed with the current table; add <code>[usage.pricing_override]</code> in <code>secret-guard.toml</code> for custom models).',
+        'usage.footnote.ledger': 'Session badges on the Records tab are per-process and reset on restart; this page is a persistent ledger (SQLite, retention via <code>[usage] retention_days</code>). <b>Retries</b> are IR-equivalent re-sends — gateway view, each retry is real upstream spend.',
+        'usage.footnote.unpriced': 'No price found for: {models} — requests still count toward tokens, cost shows "—".',
+        'usage.footnote.zeroPriced': 'Priced at $0 (free tier or subscription-plan vendor): {models} — costs above are metered estimates; use <code>[usage.pricing_override]</code> to pin exact plan pricing.',
+        'usage.footnote.includeUsage': 'OpenAI streaming requests only report usage when the client sets <code>stream_options.include_usage = true</code> — such requests appear here without token counts.',
+        'usage.view': 'view',
+        'usage.viewTitle': 'View the redacted request body (in-memory; not retrievable after restart)',
+        'usage.nodeLoading': 'node {id} — loading…',
+        'usage.nodeLabel': 'node {id}',
+        'usage.recordEvicted': 'record no longer in memory (restarted or evicted)',
+      },
+      zh: {
+        // ── common ──
+        'common.close': '关闭',
+        'common.closeBtn': '关闭',
+        'common.cancel': '取消',
+        'common.create': '创建',
+        'common.update': '更新',
+        'common.edit': '编辑',
+        'common.delete': '删除',
+        'common.copy': '复制',
+        'common.copied': '✓ 已复制',
+        'common.copyFailed': '复制失败 — 请手动选择文本复制。',
+        'common.loading': '加载中…',
+        'common.empty': '(空)',
+        'common.none': '(无)',
+        'common.unknown': '(未知)',
+        'common.more': '+{n} 更多',
+        'common.alertFailed': '失败: {msg}',
+        'common.alertError': '错误: {msg}',
+        // ── header / 语言 ──
+        'header.sessions': '会话',
+        'header.sessionsFiltered': '会话 [{mode}]',
+        'header.auditLog': '详细日志',
+        'header.auditLogTitle': '详细日志: 关闭=极致省内存; 仅错误=只保留失败请求的完整 body (排障推荐); 全部=全量保留。仅影响之后的新请求。',
+        'header.langAria': '语言',
+        'lang.auto': '跟随浏览器',
+        'header.themeAria': '主题',
+        'header.themeAuto': '跟随系统主题',
+        'header.themeLight': '亮色',
+        'header.themeDark': '暗色',
+        'header.autoRefresh': '自动刷新',
+        'header.refresh': '刷新',
+        // ── audit capture (B3) ──
+        'audit.mode.off': '关闭',
+        'audit.mode.errors': '仅错误',
+        'audit.mode.full': '全部',
+        'audit.modeLabel': '详细日志: {mode}',
+        'audit.modeSetFailed': '详细日志切换失败',
+        'audit.dialogTitle': '脱敏后的请求 (LLM 视角)',
+        'audit.notCapturedNote': '此请求 body 未被详细日志保留 (关闭档不保留任何请求; 仅错误档不保留成功请求)。右上角「详细日志」可调整档位 (仅影响之后的请求)。',
+        // ── tabs ──
+        'tab.records': '记录',
+        'tab.secrets': '密钥',
+        'tab.providers': '服务商',
+        'tab.apikeys': 'API 密钥',
+        'tab.usage': '用量',
+        // ── sidebar ──
+        'sidebar.all': '全部',
+        'sidebar.hits': '命中',
+        'sidebar.noSessions': '暂无会话',
+        'sidebar.noHitsSessions': '暂无命中的会话',
+        'sidebar.loadingRounds': '轮次加载中…',
+        'sidebar.noPreview': '(无预览)',
+        'sidebar.tip.session': '会话: {id}',
+        'sidebar.tip.rounds': '轮数: {n}',
+        'sidebar.tip.model': '模型: {m}',
+        'sidebar.tip.status': '状态: {s}',
+        'sidebar.tip.latest': '最新: {t}',
+        'sidebar.tip.started': '开始: {t}',
+        'sidebar.tip.tokens': 'tokens (本进程): ↑{in} ↓{out} (缓存读:{cr} 写:{cw})',
+        'sidebar.redactionHits': '{n} 次脱敏命中',
+        'sidebar.roundsCount': '{n} 轮',
+        // ── timeline ──
+        'timeline.selectSession': '在左侧选择一个会话',
+        'timeline.noRounds': '此会话无轮次',
+        'timeline.sessionGone': '会话已不存在',
+        'timeline.loadFailed': '时间线加载失败: {msg}',
+        'timeline.header': '时间线 ({rounds} 轮{user})',
+        'timeline.headerUser': '，{n} 用户轮',
+        'timeline.infoTitle': '传输层信息',
+        'timeline.rawTitle': '原始数据',
+        'timeline.retryBadge': '↻ 重试 — 消息完全相同',
+        'timeline.noContent': '(无内容)',
+        'timeline.streamed': '流式',
+        'timeline.viaTip': '实际转发到的上游 provider (路由解析的链尾)',
+        'timeline.via': '经 {id}',
+        'timeline.pending': '(等待中)',
+        'timeline.backToTop': '回到顶部',
+        'timeline.jumpToLatest': '跳到最新',
+        'timeline.backToBottom': '回到底部',
+        'timeline.response': '响应',
+        'timeline.streaming': '流式响应进行中…',
+        'timeline.parsedUnavailable': '该流式响应暂无解析视图。',
+        'timeline.errorBanner': '错误: {msg}',
+        'timeline.statusLine': '状态: ',
+        'timeline.usageTitle': 'tokens — 输入: {i}  输出: {o}  缓存读: {r}  缓存写: {w}',
+        'timeline.expand': '展开 ▾',
+        'timeline.collapse': '收起 ▴',
+        'timeline.viewFull': '查看全文 ▾',
+        'timeline.reasoningTip': 'reasoning_content (思考原文)',
+        // ── roles ──
+        'role.user': '用户',
+        'role.assistant': '助手',
+        'role.system': '系统',
+        'role.tool': '工具',
+        // ── info 弹窗 ──
+        'info.roundId': '轮次 ID',
+        'info.role': '角色',
+        'info.kind': '类别',
+        'info.time': '时间',
+        'info.method': '方法',
+        'info.path': '路径',
+        'info.status': '状态',
+        'info.elapsed': '耗时',
+        'info.streamed': '流式',
+        'info.complete': '完整',
+        'info.model': '模型',
+        'info.error': '错误',
+        'info.redactions': '脱敏',
+        'info.upstream': '上游',
+        'info.upstreamModel': '上游模型',
+        'info.loadingValue': '(加载中…)',
+        'info.historyRound': '(历史轮次)',
+        'info.yes': '是',
+        'info.no': '否',
+        'info.noneValue': '无',
+        'info.normal': '常规',
+        'info.hitsValue': '{n} 次命中',
+        // ── raw 弹窗 ──
+        'raw.requestHeaders': '请求 Headers',
+        'raw.requestBody': '请求 Body',
+        'raw.responseHeaders': '响应 Headers',
+        'raw.responseBody': '响应 Body',
+        'raw.llmViewReq': '(LLM 视角, 已脱敏)',
+        'raw.llmViewResp': '(LLM 视角, 值可能含 mock)',
+        'raw.streamedNote': '(流式响应 — 未保留原始 SSE 字节)',
+        'raw.empty': '(空)',
+        'raw.noHeaders': '(无 headers)',
+        'raw.failedLoad': '记录加载失败。',
+        // ── status / alert / confirm ──
+        'status.syncFailed': '同步失败',
+        'status.loadOlderFailed': '加载更早轮次失败',
+        'status.refreshFailed': '{kind} 刷新失败',
+        'status.apikeyRefreshFailed': 'API key 刷新失败',
+        'status.usageError': '用量: {msg}',
+        'status.apiKeyCopied': 'API key 已复制到剪贴板',
+        // ── stats / source / decision ──
+        'stats.total': '共 <strong>{n}</strong> 条',
+        'stats.static': '<strong>{n}</strong> 静态',
+        'stats.dynamic': '<strong>{n}</strong> 动态',
+        'stats.overrides': '<strong>{n}</strong> 覆盖',
+        'source.static': '静态',
+        'source.dynamic': '动态',
+        'source.dynamic_override': '覆盖',
+        'source.static_preferred': '静态 (强制)',
+        'decision.default': '默认 (动态优先)',
+        'decision.prefer_static': '优先静态',
+        'decision.disabled': '已禁用',
+        'decision.disabledHint': '已禁用: 保护关闭 — 真实 secret 值将明文转发到上游 provider。',
+        'decision.confirmSecretDisabled': '确定将 secret {id} 设为已禁用?',
+        'decision.updateFailed': '决策更新失败: {msg}',
+        'decision.warningFor': '{id} 的警告: {msg}',
+        'action.override': '覆盖',
+        'action.editDyn': '编辑动态',
+        'confirm.deleteItem': '删除动态 {kind} {id}?',
+        // ── secrets tab ──
+        'secrets.new': '+ 新建动态 secret',
+        'secrets.empty': '尚未配置 secret',
+        'secrets.hint': '静态 (声明式) 条目来自 <code>secret-guard.toml</code>; 动态条目来自 <code>secret-guard.state.toml</code>。编辑静态条目会派生一个动态覆盖。使用<b>决策</b>下拉可禁用某个静态 id 或强制优先其静态值。',
+        'th.id': 'ID',
+        'th.name': '名称',
+        'th.category': '类别',
+        'th.value': '值 (掩码)',
+        'th.length': '长度',
+        'th.mockStrategy': 'Mock 策略',
+        'th.source': '来源',
+        'th.decision': '决策',
+        'th.actions': '操作',
+        // ── secret 表单 ──
+        'form.secret.newTitle': '新建 secret',
+        'form.secret.editTitle': '编辑 secret {id}',
+        'form.id': 'ID',
+        'form.name': '名称',
+        'form.category': '类别',
+        'form.value': '值',
+        'form.idPlaceholder': '(留空自动生成)',
+        'form.namePlaceholder': '(可选)',
+        'form.valuePlaceholder': '真实 secret 值',
+        'form.mockStrategy': 'Mock 策略',
+        'form.initial': '初始值',
+        'form.autoGenerate': '自动 (生成)',
+        'form.fixed': '固定值:',
+        'form.mockPlaceholder': '自定义 mock 值',
+        'form.generate': '生成',
+        'form.generateTitle': '按下方生成规格生成一个候选值',
+        'form.prefix': '前缀',
+        'form.prefixPlaceholder': '(空 = 无前缀)',
+        'form.charset': '字符集',
+        'form.other': '其他:',
+        'form.length': '长度',
+        'form.min': '最小',
+        'form.max': '最大',
+        'form.infer': '从值推断',
+        'form.inferTitle': '从真实值推断字符集/长度 (若已知)',
+        'alert.valueRequired': '请先填写真实值。',
+        'alert.charsetEmpty': '字符集为空。请至少勾选一个字符类别。',
+        'banner.staticOverride': '此 id 为静态声明。保存将创建动态覆盖; 静态基线保持不变。',
+        // ── providers tab / 表单 ──
+        'providers.new': '+ 新建 provider',
+        'providers.empty': '尚未配置 provider',
+        'providers.urlHint': 'URL 模式: <code>/{proto-short}/{provider-id}/*</code> · direct provider 可服务多种协议 — 点击行内 <strong>端点</strong> 查看详情',
+        'th.protocol': '协议',
+        'th.baseUrl': 'Base URL / 路由',
+        'th.apiKey': 'API Key (掩码)',
+        'th.enabled': '启用',
+        'providers.kind': '构造',
+        'providers.kind.direct': 'Direct — 直连真实上游',
+        'providers.kind.router': 'Router — 基于路由规则转发',
+        'providers.kind.pool': 'Pool — 套餐池顺序故障转移',
+        'providers.kindHint.direct': '直接转发到真实 LLM 端点 (每协议一个端点, 共享 API key)。',
+        'providers.kindHint.router': '基于路由的转发端点 — 请求的 model 与路由 model_pattern 匹配, 优先级最高的启用匹配胜出。自身无 base URL / API key。',
+        'providers.kindHint.pool': '套餐池 — 有序成员 (direct provider); 流量发给首个可用成员, 窗口限额耗尽信号触发时故障转移到下一个。自身无 base URL / API key。',
+        'providers.idPlaceholder': '唯一 slug, 如 openai-main',
+        'providers.routes': '路由',
+        'providers.addRoute': '+ 添加路由',
+        'providers.col.on': '启用',
+        'providers.col.target': '目标',
+        'providers.col.onTitle': '启用 — 取消勾选则保留路由但不参与匹配',
+        'providers.col.modelPatternTitle': "model 通配 pattern ('*' 通配符)",
+        'providers.col.upstreamModelTitle': '改写 model (可选 — 该路由胜出时覆盖客户端的 model)',
+        'providers.col.prioTitle': '优先级 — 大者胜出, 并列按列表序',
+        'providers.routesHint': "请求的 model 匹配优先级最高的启用路由后转发 (并列按列表序)。model_pattern 支持 '<code>*</code>' 通配符。取消勾选某行即禁用 — 路由保留但永不匹配。",
+        'providers.members': '成员 (顺序故障转移)',
+        'providers.addMember': '+ 添加成员',
+        'providers.membersHint': '请求总是发给首个可用成员 (列表序 = 故障转移优先级); 窗口限额耗尽时该成员暂停至恢复闹钟到期, 流量切到下一个。成员是 direct provider。',
+        'providers.exhaustSummary': '耗尽信号 (高级) — 默认: 内置套餐窗口限额表',
+        'providers.exhaustHint': '三条 OR 通道; 任一命中即暂停该成员。显式值按通道替换默认表 (空 = 关闭该通道)。错误码从 body <code>error.code</code>/<code>error.type</code>/<code>error.status</code>/顶层 <code>code</code> 宽松匹配; 响应头按 <code>name=value</code> 精确匹配 (name 大小写不敏感)。',
+        'providers.exh.statuses': '状态码',
+        'providers.exh.statusesPlaceholder': '如 402, 429 (空 = 关闭该通道)',
+        'providers.exh.codes': '错误码',
+        'providers.exh.codesPlaceholder': '每行一个, 如 1308',
+        'providers.exh.headers': '响应头',
+        'providers.exh.headersPlaceholder': 'name=value, 每行一条',
+        'providers.exh.cooldown': '冷却 (秒)',
+        'providers.endpoints': '端点 (每协议一条, 共享 API Key)',
+        'providers.addEndpoint': '+ 添加端点',
+        'providers.endpointsHint': '每个端点经 <code>/{proto-short}/{provider-id}/</code> 服务其协议 (字节级透传)。入口协议无对应端点时回退到首个端点 (跨协议翻译)。',
+        'providers.apiKey': 'API Key',
+        'providers.apiKeyPlaceholder': '(本地 provider 如 Ollama 可留空)',
+        'providers.apiKeyKeep': '不变 ({masked}) — 留空即保留',
+        'providers.enabled': '启用',
+        'providers.targetPlaceholder': '(目标)',
+        'providers.memberPlaceholder': '(成员)',
+        'providers.upstreamModelPlaceholder': '改写 model (可选)',
+        'providers.removeRoute': '移除路由',
+        'providers.memberUpTitle': '上移 (更高故障转移优先级)',
+        'providers.memberDownTitle': '下移',
+        'providers.removeMember': '移除成员',
+        'providers.missing': '(缺失)',
+        'providers.notDirect': '(非 direct provider)',
+        'providers.epProtocolTitle': '该端点的协议 — Detect 识别 base URL 后自动填入; 如有需要可手动调整',
+        'providers.baseUrlPlaceholder': 'https://api.openai.com (末尾不加 /)',
+        'providers.commonUriTitle': 'Detect 探测到的 Common URI — secret-guard 发起自身模型清单请求时拼接的前缀。点击复制 base URL + common URI 整体。编辑 base URL 会作废该值。',
+        'providers.detect': '探测',
+        'providers.detectTitle': '探测该 base URL, 识别协议并列出可用模型 (不会保存)',
+        'providers.detecting': '探测中…',
+        'providers.removeEndpoint': '移除端点',
+        'providers.commonUriIncluded': '✓ 已含',
+        'providers.experimental': '{proto} (实验性)',
+        'alert.noEndpoints': 'direct provider 至少需要一个端点。',
+        'alert.endpointProtocolRequired': '端点 #{n}: 协议必填。',
+        'alert.endpointUrlRequired': '端点 #{n}: Base URL 必填。',
+        'alert.endpointDupProtocol': '端点 #{n}: 协议 "{proto}" 重复 — 每协议至多一个端点 (多余协议永远不会匹配)。',
+        'alert.noRoutes': 'router provider 至少需要一条路由。',
+        'alert.routePatternRequired': '路由 #{n}: model_pattern 必填 (如 gpt-*)。',
+        'alert.routeTargetRequired': '路由 #{n}: 目标必填 (选择一个 provider, 或先创建)。',
+        'alert.noMembers': 'pool provider 至少需要一个成员。',
+        'alert.memberRequired': '成员 #{n}: 请选择一个 direct provider (或先创建)。',
+        'alert.invalidStatus': '非法 HTTP 状态码 "{tok}" — 需 100..599 的整数, 逗号分隔。',
+        'alert.invalidCooldown': '冷却时间须为非负整数 (秒)。',
+        'alert.poolResetFailed': '套餐池重置失败: {msg}',
+        'form.provider.newTitle': '新建 provider',
+        'form.provider.editTitle': '编辑 provider {id}',
+        // ── provider 行渲染 / endpoints 弹窗 / pool ──
+        'prov.router': '路由',
+        'prov.routerTip': '基于路由的转发端点 — 按路由 model_pattern 转发 (自身无 base URL / API key)',
+        'prov.pool': '套餐池',
+        'prov.poolTip': '套餐池 — 成员 direct provider 间顺序故障转移 (自身无 base URL / API key)',
+        'prov.egressRoutesTip': '从路由目标解析的出口协议 (近似: 最高优先级启用路由)',
+        'prov.egressMembersTip': '从成员解析的出口协议 (近似: 逐成员链尾 walk)',
+        'prov.endpointPillTip': '端点: {url} (同协议透传)',
+        'prov.moreEndpointsTip': '+{n} 个更多端点 — 完整列表见此 tooltip',
+        'prov.reset': '重置',
+        'prov.resetTitle': '清除全部成员耗尽闹钟 (立即恢复探测)',
+        'prov.endpointsBtn': '端点',
+        'prov.endpointsBtnTitle': '查看各协议的端点 URL',
+        'prov.crossProtoTip': '若入口协议 ≠ 此出口协议: 触发跨协议翻译 — reasoning_content 会被丢弃, 例外: Responses 出口的流式会保留 (以 reasoning summary 事件形式)',
+        'prov.translateTip': '跨协议翻译 (含流式) — reasoning_content 会被丢弃, 例外: Responses 出口的流式会保留 (以 reasoning summary 事件形式)',
+        'prov.direct': '直连',
+        'prov.directTip': '同协议透传 (字节级)',
+        'prov.translate': '翻译',
+        'prov.na': '不可用',
+        'prov.notSupported': '不支持',
+        'prov.copyUrlTitle': '复制端点 URL',
+        'prov.upstreamBaseUrl': '上游 base URL',
+        'prov.localEntryUrl': '本地入口 URL',
+        'prov.arrowTip': '上游 ↤ 本地入口 URL',
+        'prov.directTailHint': '每个已配置端点经字节级透传服务其自身协议。无对应端点的入口协议回退到首个端点 (跨协议翻译, 仅 codec 覆盖对)。',
+        'prov.endpointsTitle': '端点',
+        'prov.endpointsHint': '基础模式: <code>/{proto-short}/{provider-id}/*</code>。同协议 = 直连; 跨协议 = OpenAI / Anthropic / Responses 间翻译 (所有 codec 覆盖对均含流式); Gemini/Ollama 入口 = 不支持。<b>模型</b>预览该端点服务的模型清单。',
+        'prov.subjectProvider': 'Provider',
+        'prov.subjectEgress': '出口',
+        'prov.activeTip': '可用',
+        'prov.exhaustedTip': '窗口限额耗尽 — 暂停至恢复闹钟到期',
+        'prov.curTip': '请求发给首个可用成员 (列表序)',
+        'prov.activeState': '可用',
+        'prov.exhaustedState': '已耗尽',
+        'prov.untilTime': '至 {t}',
+        'prov.resumeSecs': '{n}秒',
+        'prov.disabledPrefix': '(已禁用) ',
+        // ── Models 预览 ──
+        'models.btn': '模型',
+        'models.btnTitle': '预览该端点服务的模型清单',
+        'models.btnTitleDirect': '预览该 provider 服务的模型清单 (经此 provider 的 OpenAI 视角端点拉取)',
+        'models.title': '模型 ({n})',
+        'models.synth': '由路由合成',
+        'models.upstreamLabel': '上游',
+        'models.loading': '模型加载中…',
+        'models.failed': '模型加载失败: {msg}',
+        'models.none': '该端点未上报模型。',
+        'models.copyTip': '复制模型名',
+        // ── Detect 探测 ──
+        'probe.detected': '已识别',
+        'probe.noProbes': '未返回任何探测',
+        'probe.noEndpointHint': "未识别到端点 — 将上方 GET URL 与你的 provider 文档中的 models 端点对照; 其 base URL 前缀布局可能不同。",
+        'probe.keylessHint': '探测未携带 API key — 已保存的 key 不会被复用; auth_failed 可能只是因为探测请求没带 key。',
+        'probe.enterUrl': '请先填写 base URL',
+        'probe.failed': '探测失败: {msg}',
+        // ── apikeys tab ──
+        'apikeys.new': '+ 新建 API key',
+        'apikeys.empty': '尚未配置 API key',
+        'apikeys.hint': 'API key 用于 SDK 转发请求的认证 (<code>Authorization: Bearer sg_...</code>)。静态 key 来自 <code>secret-guard.toml</code>; 动态 key 经 WebUI 签发。',
+        'apikeys.authWarn': '<strong class="hint-warn">服务端认证未启用</strong> — 所有转发请求无需 key 即被接受, 列表中的 key 处于<em>未生效</em>状态。要激活它们, 在 <code>secret-guard.toml</code> 中设置 <code>[auth] enabled = true</code> (含 <code>[auth.oidc]</code> 段) 并重启。',
+        'apikeys.th.label': '标签',
+        'apikeys.th.prefix': 'Key 前缀',
+        'apikeys.th.status': '状态',
+        'apikeys.th.created': '创建时间',
+        'apikeys.formTitle': '新建 API Key',
+        'apikeys.label': '标签',
+        'apikeys.labelPlaceholder': '如 ci-pipeline',
+        'apikeys.revealTitle': 'API Key 已创建',
+        'apikeys.revealHint': '请立即复制此 key — 之后将不再显示。',
+        'apikeys.copy': '复制',
+        'apikeys.inactive': '未生效',
+        'apikeys.inactiveTip': '服务端认证未启用 — 所有请求无需 key 即被接受。在 secret-guard.toml 中启用 [auth] 以激活。',
+        'apikeys.enabledBadge': '已生效',
+        'apikeys.disabledBadge': '已禁用',
+        'apikeys.enable': '启用',
+        'apikeys.disable': '禁用',
+        'apikeys.enableAuthFirst': '请先启用服务端认证',
+        'apikeys.delete': '删除',
+        'apikeys.staticMeta': '(静态)',
+        'apikeys.statTotal': '共 {n} 个',
+        'apikeys.statStatic': '{n} 静态',
+        'apikeys.statEnabled': '{n} 已生效',
+        'apikeys.statInactive': '认证关闭 — key 未生效',
+        'apikeys.confirmDelete': '删除 API key {id}?',
+        'apikeys.labelRequired': '标签必填',
+        // ── usage tab ──
+        'usage.aria': '时间范围',
+        'usage.all': '全部',
+        'usage.noData': '暂无数据',
+        'usage.noDataInRange': '范围内暂无数据',
+        'usage.byModel': '按模型',
+        'usage.byProvider': '按服务商',
+        'usage.redactBySecret': '脱敏 · 按 secret',
+        'usage.redactRecent': '脱敏 · 最近',
+        'usage.th.model': '模型',
+        'usage.th.provider': '服务商',
+        'usage.th.reqs': '请求数',
+        'usage.th.retries': '重试',
+        'usage.th.in': '入',
+        'usage.th.cacheR': '缓存读',
+        'usage.th.cacheW': '缓存写',
+        'usage.th.out': '出',
+        'usage.th.cost': '~成本',
+        'usage.th.share': '占比',
+        'usage.th.secret': 'Secret',
+        'usage.th.mock': 'Mock',
+        'usage.th.hits': '命中',
+        'usage.th.where': '位置',
+        'usage.th.firstSeen': '首次出现',
+        'usage.th.lastSeen': '最近出现',
+        'usage.th.time': '时间',
+        'usage.th.key': 'Key',
+        'usage.th.record': '记录',
+        'usage.pricing.loading': '定价: 加载中…',
+        'usage.pricing.stale': '定价: 已过期 (刷新失败, 使用旧表)',
+        'usage.pricing.offline': '定价: 离线 (无定价数据)',
+        'usage.card.requests': '请求数',
+        'usage.card.retries': '重试',
+        'usage.card.rateLimited': '429 限流',
+        'usage.card.input': '输入',
+        'usage.card.output': '输出',
+        'usage.card.cacheRead': '缓存读',
+        'usage.card.cacheWrite': '缓存写',
+        'usage.card.cacheHit': '缓存命中',
+        'usage.card.cost': '~ 成本',
+        'usage.pricedPct': '{n}% 有价',
+        'usage.noUsage': '{n} 无回显',
+        'usage.err5xx': '{n} 次 5xx',
+        'usage.chartPerDay': '每日 tokens',
+        'usage.chartPerHour': '每小时 tokens',
+        'usage.legend.in': '入',
+        'usage.legend.cacheR': '缓存读',
+        'usage.legend.cacheW': '缓存写',
+        'usage.legend.out': '出',
+        'usage.footnote.cost': '<b>~成本</b>由 <a href="https://models.dev" target="_blank" rel="noreferrer">models.dev</a> 价目表估算 (始终按当前表重算; 自定义模型可在 <code>secret-guard.toml</code> 中添加 <code>[usage.pricing_override]</code>)。',
+        'usage.footnote.ledger': '记录页的会话徽章是进程级的, 重启即重置; 本页是持久账本 (SQLite, 保留期由 <code>[usage] retention_days</code> 配置)。<b>重试</b>是 IR 等价重发 — 网关视角下, 每次重试都是真实的上游开销。',
+        'usage.footnote.unpriced': '以下模型未找到价格: {models} — 请求仍计入 tokens, 成本显示 "—"。',
+        'usage.footnote.zeroPriced': '定价为 $0 (免费档或套餐制厂商): {models} — 上方成本为按量估算; 可用 <code>[usage.pricing_override]</code> 钉住套餐确切价格。',
+        'usage.footnote.includeUsage': 'OpenAI 流式请求仅当客户端设置 <code>stream_options.include_usage = true</code> 时才回报 usage — 此类请求在此不显示 token 计数。',
+        'usage.view': '查看',
+        'usage.viewTitle': '查看 redact 后的请求原文 (内存态, 重启后不可回查)',
+        'usage.nodeLoading': 'node {id} — 加载中…',
+        'usage.nodeLabel': 'node {id}',
+        'usage.recordEvicted': '记录已不在内存中 (已重启或被淘汰)',
+      },
+    };
+
+    // 取词: 当前语言 → en 回退 → key 本身 (缺词信号).
+    function t(key, params) {
+      let s = I18N[currentLang][key];
+      if (s === undefined) s = I18N.en[key];
+      if (s === undefined) { console.warn('i18n: missing key:', key); return key; }
+      if (params) {
+        for (const [k, v] of Object.entries(params)) s = s.replaceAll(`{${k}}`, String(v));
+      }
+      return s;
+    }
+
+    // 三态偏好 (auto/en/zh) 的读取与解析.
+    function currentLangPref() {
+      const v = localStorage.getItem(LANG_STORAGE_KEY);
+      return v === 'en' || v === 'zh' ? v : 'auto';
+    }
+    function resolveLang(pref) {
+      if (pref === 'en' || pref === 'zh') return pref;
+      const nav = navigator.language || (navigator.languages && navigator.languages[0]) || 'en';
+      return String(nav).toLowerCase().startsWith('zh') ? 'zh' : 'en';
+    }
+
+    // 静态标注重放: data-i18n* 五类属性 → 对应 DOM property.
+    function applyI18nStaticTexts() {
+      document.querySelectorAll('[data-i18n]').forEach(el => { el.textContent = t(el.dataset.i18n); });
+      document.querySelectorAll('[data-i18n-html]').forEach(el => { el.innerHTML = t(el.dataset.i18nHtml); });
+      document.querySelectorAll('[data-i18n-title]').forEach(el => { el.title = t(el.dataset.i18nTitle); });
+      document.querySelectorAll('[data-i18n-placeholder]').forEach(el => { el.placeholder = t(el.dataset.i18nPlaceholder); });
+      document.querySelectorAll('[data-i18n-aria-label]').forEach(el => { el.setAttribute('aria-label', t(el.dataset.i18nAriaLabel)); });
+    }
+
+    // 语言切换时重渲染动态区域 (全部 state 驱动, 无需 refetch).
+    // usage 是唯一需要数据的例外 → 置节流后重拉 (低频用户动作, 代价可接受).
+    function rerenderDynamicForLang() {
+      state.lastSidebarFingerprint = '';
+      renderSidebar();
+      if (state.timelineRecords.length > 0 || state.selectedSession) {
+        // timeline 走**全量重建**而非 fingerprint 失效重画: keyed reconciliation
+        // 的复用分支刻意不重绘已有轮次内容 (滚动/折叠保持), 已有轮次内烙进 DOM
+        // 的文案 (expand toggle / retry 徽章 / ℹ·raw 按钮 title / role label)
+        // 会残留旧语言 — 清空后由 reconcile 全新构建 (review M1)。
+        state.lastTimelineFingerprint = '';
+        document.getElementById('detail').innerHTML = '';
+        renderTimeline();
+      } else if (!document.querySelector('#detail .status-err')) {
+        // 无选中会话的空态由 clearTimeline/初始 HTML 写入, renderTimeline 不覆盖
+        // 该形态; loadTimeline 的错误信息 (status-err) 不覆盖 — 保留排障线索。
+        document.getElementById('detail').innerHTML = `<div class="empty">${t('timeline.selectSession')}</div>`;
+      }
+      renderKind('secret');
+      renderKind('provider');
+      renderApiKeys();
+      // count-label 是静态词条 + 动态 [mode] 后缀的合成 (updateCountDisplay),
+      // applyI18nStaticTexts 已把它重置为纯词条 — 补一次动态合成 (review m4)。
+      updateCountDisplay();
+      usageLastFetch = 0;
+      refreshUsage();
+    }
+
+    // 应用语言: passive (rerender=false) 用于脚本初始化 — 此时 bootstrap 渲染尚未
+    // 开始, 动态区域由正常数据流填充, 提前渲染反而会踩 KINDS 等后置 const 的 TDZ.
+    function applyLanguage(rerender) {
+      const pref = currentLangPref();
+      currentLang = resolveLang(pref);
+      document.documentElement.lang = currentLang;
+      const sel = document.getElementById('lang-switch');
+      if (sel) sel.value = pref;
+      applyI18nStaticTexts();
+      if (rerender) rerenderDynamicForLang();
+    }
+
+    (function initLangSwitch() {
+      const sel = document.getElementById('lang-switch');
+      if (!sel) return;
+      sel.addEventListener('change', () => {
+        localStorage.setItem(LANG_STORAGE_KEY, sel.value);
+        applyLanguage(true);
+      });
+    })();
+    applyLanguage(false);
+
     // 集中管理 API URL.
     // 注: 旧的 GET /api/records (扁平分页) + GET /api/nodes/{id}/timeline 已删除,
     // 由 session-aware 的 POST /api/sync + GET /api/sessions/{sid}/timeline 替代.
@@ -2106,27 +3059,21 @@
     const API_PROVIDERS = '/api/providers';
     const API_API_KEYS = '/api/api-keys';
     const API_SETTINGS = '/api/settings';        // GET/PUT 全局设置 (当前仅 audit_capture)
-    const DECISION_LABELS = {
-      default: 'Default (dynamic wins)',
-      prefer_static: 'Prefer static',
-      disabled: 'Disabled',
-    };
+    // decision 模式清单 (下拉选项序); 文案 SSOT 在 I18N ('decision.*' 词条).
+    const DECISION_MODES = ['default', 'prefer_static', 'disabled'];
+    const decisionLabel = mode => t(`decision.${mode}`);
     // secret decision=Disabled 的后果提示 (#161): Disabled = 关闭对该 secret 的保护,
     // 其真实值将明文转发到上游 provider (不是"从列表忽略"). 两处使用: option tooltip +
     // change 确认弹窗. (PATCH 响应的兜底 alert 展示服务端 ack.warning — 后端 SSOT:
     // src/web/api/crud.rs SECRET_DISABLED_WARNING, 文案与前端这份语义配对.)
-    const SECRET_DISABLED_HINT = 'Disabled: protection OFF — the real secret value will be forwarded in plaintext to upstream providers.';
+    const secretDisabledHint = () => t('decision.disabledHint');
     // B3: audit_capture 未保留 (off 全部 / errors 成功) 请求的 body 未捕获 (req/resp 均 empty, headers 照常
     // 记录). raw 弹窗与 usage 审计弹窗共用的占位文案 SSOT — wire 判据统一为
     // record.audit_capture_off === true (raw 与 parsed 两个 view 的 envelope 均携带,
     // 契约见 src/web/api/records.rs).
-    const NOT_CAPTURED_NOTE = '此请求 body 未被详细日志保留 (关闭档不保留任何请求; 仅错误档不保留成功请求)。右上角「详细日志」可调整档位 (仅影响之后的请求)。';
-    const SOURCE_LABELS = {
-      static: 'static',
-      dynamic: 'dynamic',
-      dynamic_override: 'override',
-      static_preferred: 'static (forced)',
-    };
+    const notCapturedNote = () => t('audit.notCapturedNote');
+    // source 值域枚举 (域外值原样透传, 见 srcBadge); 文案 SSOT 在 I18N ('source.*').
+    const SOURCE_KINDS = new Set(['static', 'dynamic', 'dynamic_override', 'static_preferred']);
 
     // ─── 全局可变状态 (集中收敛) ────────────────────────────────────────────
     //
@@ -2239,7 +3186,7 @@
     // ─── tabs ──────────────────────────────────────────────────────────────
     document.querySelectorAll('nav.tabs a.tab').forEach(tab => {
       tab.addEventListener('click', () => {
-        document.querySelectorAll('nav.tabs a.tab').forEach(t => t.classList.remove('active'));
+        document.querySelectorAll('nav.tabs a.tab').forEach(el => el.classList.remove('active'));
         document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
         tab.classList.add('active');
         document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
@@ -2374,7 +3321,7 @@
         setStatus('');
       } catch (e) {
         console.error(e);
-        setStatus('sync failed', 'status-err');
+        setStatus(t('status.syncFailed'), 'status-err');
       }
     }
 
@@ -2400,7 +3347,7 @@
       const lbl = document.getElementById('count-label');
       const total = state.filterMode === 'hits' ? state.hitsTotal : state.sessionsTotal;
       cnt.textContent = total;
-      lbl.textContent = `sessions [${state.filterMode}]`;
+      lbl.textContent = t('header.sessionsFiltered', { mode: state.filterMode });
     }
 
     function updateFilterCounts() {
@@ -2437,7 +3384,7 @@
       const list = filteredSessions();
       if (list.length === 0) {
         state.lastSidebarFingerprint = '';
-        listEl.innerHTML = `<div class="empty">${state.filterMode === 'hits' ? 'No sessions with redactions' : 'No sessions yet'}</div>`;
+        listEl.innerHTML = `<div class="empty">${state.filterMode === 'hits' ? t('sidebar.noHitsSessions') : t('sidebar.noSessions')}</div>`;
         return;
       }
       // 指纹: session_id + record_count + preview + status + state.selectedSession + expandedSessions.
@@ -2453,24 +3400,24 @@
       listEl.innerHTML = list.map(s => {
         const { proto, id: pid } = parsePath(s.path);
         const iconHtml = providerIcon(pid, proto);
-        const preview = s.preview || s.path || '(no preview)';
+        const preview = s.preview || s.path || t('sidebar.noPreview');
         const status = escapeHtml(sessionStatusText(s));
         const statusCls = sessionStatusClass(s);
         const hitN = (s.redactions || []).length;
-        const hitBadge = hitN > 0 ? `<span class="badge-hit" title="${hitN} redaction(s)">${hitN}</span>` : '';
-        const countBadge = s.record_count > 1 ? `<span class="badge-count" title="${s.record_count} rounds">${s.record_count}</span>` : '';
+        const hitBadge = hitN > 0 ? `<span class="badge-hit" title="${escapeHtml(t('sidebar.redactionHits', { n: hitN }))}">${hitN}</span>` : '';
+        const countBadge = s.record_count > 1 ? `<span class="badge-count" title="${escapeHtml(t('sidebar.roundsCount', { n: s.record_count }))}">${s.record_count}</span>` : '';
         const isExpanded = expandedSessions.has(s.session_id);
         const isActive = s.session_id === state.selectedSession;
         const line2Model = s.model || s.session_id.slice(0, 8);
         const line2 = `${escapeHtml(formatTime(s.latest_at))} · ${escapeHtml(line2Model)}`;
         const title = [
-          `session: ${s.session_id}`,
-          `rounds: ${s.record_count}`,
-          `model: ${s.model || '(unknown)'}`,
-          `status: ${sessionStatusText(s)}`,
-          `latest: ${formatTime(s.latest_at)}`,
-          `started: ${formatTime(s.created_at)}`,
-          s.usage_total ? `tokens (this process): ↑${s.usage_total.input} ↓${s.usage_total.output} (cache r:${s.usage_total.cache_read} w:${s.usage_total.cache_write})` : '',
+          t('sidebar.tip.session', { id: s.session_id }),
+          t('sidebar.tip.rounds', { n: s.record_count }),
+          t('sidebar.tip.model', { m: s.model || t('common.unknown') }),
+          t('sidebar.tip.status', { s: sessionStatusText(s) }),
+          t('sidebar.tip.latest', { t: formatTime(s.latest_at) }),
+          t('sidebar.tip.started', { t: formatTime(s.created_at) }),
+          s.usage_total ? t('sidebar.tip.tokens', { in: s.usage_total.input, out: s.usage_total.output, cr: s.usage_total.cache_read, cw: s.usage_total.cache_write }) : '',
         ].filter(Boolean).join('\n');
         return `
           <div class="session-item ${isActive ? 'active' : ''} ${isExpanded ? 'expanded' : ''}" data-sid="${escapeHtml(s.session_id)}" title="${escapeHtml(title)}">
@@ -2513,11 +3460,11 @@
       const rounds = sessionRounds.get(sessionId);
       if (!rounds) {
         // 缓存未就绪 (仍在 sync), 显示 loading.
-        wrap.innerHTML = '<div class="empty" style="padding:8px;font-size:11px;">Loading rounds…</div>';
+        wrap.innerHTML = `<div class="empty" style="padding:8px;font-size:11px;">${t('sidebar.loadingRounds')}</div>`;
         return;
       }
       if (rounds.length === 0) {
-        wrap.innerHTML = '<div class="empty" style="padding:8px;font-size:11px;">(empty)</div>';
+        wrap.innerHTML = `<div class="empty" style="padding:8px;font-size:11px;">${t('common.empty')}</div>`;
         return;
       }
       // 分组: 每个组 = [headRound, [toolRound...]]. headRound 是用户轮次 (或首个非 user
@@ -2535,8 +3482,8 @@
         // RoundBrief 不含 method/path; fallback 到 '(no preview)'.
         // retry 轮加 ↻ 前缀: preview 与原轮相同, 无前缀时两个条目无法区分 (歧义).
         const preview = r.round_kind === 'retry'
-          ? `↻ ${r.preview || '(no preview)'}`
-          : (r.preview || '(no preview)');
+          ? `↻ ${r.preview || t('sidebar.noPreview')}`
+          : (r.preview || t('sidebar.noPreview'));
         const isActive = r.id === state.selectedRound;
         const headHtml = `
           <div class="round-item ${isActive ? 'active' : ''}" data-sid="${escapeHtml(sessionId)}" data-rid="${escapeHtml(r.id)}">
@@ -2893,7 +3840,7 @@
             if (gen !== state.timelineGen) return;
             clearTimeline();
             document.getElementById('detail').innerHTML =
-              '<div class="empty">Session no longer exists</div>';
+              `<div class="empty">${t('timeline.sessionGone')}</div>`;
             renderSidebar();  // 清 selectedSession 后同步 .active 态 (与 eviction 路径一致)
           }
           return;
@@ -2925,7 +3872,7 @@
         if (gen !== state.timelineGen) return;
         clearTimeline();
         document.getElementById('detail').innerHTML =
-          `<div class="empty status-err">Failed to load timeline: ${escapeHtml(e.message)}</div>`;
+          `<div class="empty status-err">${t('timeline.loadFailed', { msg: escapeHtml(e.message) })}</div>`;
       }
     }
 
@@ -2944,7 +3891,7 @@
       state.timelineFollow = true;
       state.unreadCount = 0;
       document.getElementById('detail').innerHTML =
-        '<div class="empty">Select a session on the left</div>';
+        `<div class="empty">${t('timeline.selectSession')}</div>`;
       // 清空时隐藏悬浮导航按钮 + Response 抽屉.
       const nav = document.getElementById('scroll-nav');
       if (nav) nav.hidden = true;
@@ -3010,7 +3957,7 @@
         }
       } catch (e) {
         console.error(e);
-        setStatus('load older failed', 'status-err');
+        setStatus(t('status.loadOlderFailed'), 'status-err');
       } finally {
         state.loadingOlder = false;
       }
@@ -3035,7 +3982,7 @@
       const el = document.getElementById('detail');
       if (state.timelineRecords.length === 0) {
         state.lastTimelineFingerprint = '';
-        el.innerHTML = '<div class="empty">No rounds in this session</div>';
+        el.innerHTML = `<div class="empty">${t('timeline.noRounds')}</div>`;
         return;
       }
       // 指纹: node id 序列 + state.selectedRound + reachedTop.
@@ -3168,7 +4115,7 @@
         const toggle = document.createElement('button');
         toggle.className = 'bubble-toggle';
         toggle.type = 'button';
-        toggle.textContent = 'expand ▾';
+        toggle.textContent = t('timeline.expand');
         toggle.addEventListener('click', () => onBubbleToggle(bubble, toggle, expandThreshold));
         actions.appendChild(toggle);
         bubble.appendChild(actions);
@@ -3350,80 +4297,81 @@
       if (!r) return;
       const redactionN = (r.redactions || []).length;
       // 末轮 tail 字段: 仅当 id 是末轮时取 state.tail (round_id 匹配).
+      // (局部变量命名 tail — t 已被 i18n 取词函数占用, 勿再缩写为 t.)
       const isLastRound = state.timelineRecords.length > 0
         && state.timelineRecords[state.timelineRecords.length - 1].id === id;
-      const t = isLastRound ? state.tail : null;
-      const HIST = '(history round)';
+      const tail = isLastRound ? state.tail : null;
+      const HIST = t('info.historyRound');
       // Time 与 sidebar/timeline 同一格式化函数 (SSOT, #164-2); 原始 UTC RFC3339
       // 放 title tooltip (开发者向 hover 可见).
       let rows = {
-        'Round ID': r.id,
-        'Role': r.round_role || '(unknown)',
-        'Kind': r.round_kind || 'normal',
-        'Time': r.created_at,
-        'Method': '(loading…)',
-        'Path': '(loading…)',
-        'Status': t ? (t.resp_status === 0 ? '(pending)' : String(t.resp_status)) : HIST,
-        'Elapsed': t ? `${t.elapsed_ms} ms` : HIST,
-        'Streamed': t ? (t.streamed ? 'yes' : 'no') : HIST,
-        'Complete': t ? (t.resp_complete ? 'yes' : 'no') : HIST,
-        'Model': '(loading…)',
-        'Error': t?.error || '(none)',
-        'Redactions': redactionN > 0 ? `${redactionN} hit(s)` : 'none',
+        [t('info.roundId')]: r.id,
+        [t('info.role')]: r.round_role || t('common.unknown'),
+        [t('info.kind')]: r.round_kind || t('info.normal'),
+        [t('info.time')]: r.created_at,
+        [t('info.method')]: t('info.loadingValue'),
+        [t('info.path')]: t('info.loadingValue'),
+        [t('info.status')]: tail ? (tail.resp_status === 0 ? t('timeline.pending') : String(tail.resp_status)) : HIST,
+        [t('info.elapsed')]: tail ? `${tail.elapsed_ms} ms` : HIST,
+        [t('info.streamed')]: tail ? (tail.streamed ? t('info.yes') : t('info.no')) : HIST,
+        [t('info.complete')]: tail ? (tail.resp_complete ? t('info.yes') : t('info.no')) : HIST,
+        [t('info.model')]: t('info.loadingValue'),
+        [t('info.error')]: tail?.error || t('info.noneValue'),
+        [t('info.redactions')]: redactionN > 0 ? t('info.hitsValue', { n: redactionN }) : t('info.noneValue'),
       };
       const renderRows = () => `<table class="info-table">${Object.entries(rows).map(([k, v]) => {
         // Time 行: 本地时间 (formatTime, 与 sidebar 一致) + title 保留原始 UTC.
-        if (k === 'Time') {
+        if (k === t('info.time')) {
           return `<tr><td class="info-key">${escapeHtml(k)}</td><td class="info-val" title="${escapeHtml(v)}">${escapeHtml(formatTime(v))}</td></tr>`;
         }
         return `<tr><td class="info-key">${escapeHtml(k)}</td><td class="info-val">${escapeHtml(v)}</td></tr>`;
       }).join('')}</table>`;
-      openRoundDialog('传输层信息', renderRows(), id);
+      openRoundDialog(t('timeline.infoTitle'), renderRows(), id);
       // 异步补全 method/path/model (ForwardRecord 字段, 不在 TimelineRound 中).
       const rec = await fetchRecordDetail(id);
       const dlg = document.getElementById('round-dialog');
       if (!dlg || dlg.dataset.rid !== id) return;  // 用户已切换/关闭.
       if (!rec) return;  // 加载失败保留现有信息.
-      rows['Method'] = rec.method || '(unknown)';
-      rows['Path'] = rec.path || '(unknown)';
-      rows['Upstream'] = rec.upstream_id || '(unknown)';
+      rows[t('info.method')] = rec.method || t('common.unknown');
+      rows[t('info.path')] = rec.path || t('common.unknown');
+      rows[t('info.upstream')] = rec.upstream_id || t('common.unknown');
       // #183: 仅 override 实际改写时显示 (None = 透传, 不加行以免噪音).
-      if (rec.upstream_model) rows['Upstream Model'] = rec.upstream_model;
-      rows['Model'] = rec.model || '(unknown)';
+      if (rec.upstream_model) rows[t('info.upstreamModel')] = rec.upstream_model;
+      rows[t('info.model')] = rec.model || t('common.unknown');
       dlg.querySelector('.dialog-body').innerHTML = renderRows();
     }
 
     // 打开 raw view 弹窗: 按需懒拉 ForwardRecord, 展示 req_body / resp_body / headers.
     async function openRoundRaw(id) {
-      openRoundDialog('Raw data', '<div class="raw-loading">Loading…</div>', id);
+      openRoundDialog(t('timeline.rawTitle'), `<div class="raw-loading">${t('common.loading')}</div>`, id);
       const rec = await fetchRecordDetail(id);
       const dlg = document.getElementById('round-dialog');
       if (!dlg || dlg.dataset.rid !== id) return;  // 用户已切换/关闭
       if (!rec) {
-        dlg.querySelector('.dialog-body').innerHTML = '<div class="raw-loading">Failed to load record.</div>';
+        dlg.querySelector('.dialog-body').innerHTML = `<div class="raw-loading">${t('raw.failedLoad')}</div>`;
         return;
       }
       // 标注语义 (#164-1): req/resp body 存的都是 LLM 视角原文 — request 已 redact
       // (含 mock), response 含 mock (restore 前的上游原文). 无标注会误导用户以为
       // response 就是客户端收到的内容 (实为 restore 后版本).
       const respBodyNote = rec.streamed
-        ? '(streamed response — raw SSE bytes not retained)'
-        : '(LLM view, values may contain mocks)';
+        ? t('raw.streamedNote')
+        : t('raw.llmViewResp');
       // B2/B3: audit_capture off 的请求未捕获 body (req/resp 均空, headers 照常记录)
       // — 占位优先级高于 streamed 空态: off 下非流式 body 同样未存, "SSE bytes
       // not retained" 的说法对 off 请求是误导, 未捕获才是真实原因. 分支只产出
       // 两个 body 行的 (note, content), headers 骨架单份声明.
       const [reqBody, respBody] = rec.audit_capture_off
-        ? [['', NOT_CAPTURED_NOTE], ['', NOT_CAPTURED_NOTE]]
+        ? [['', notCapturedNote()], ['', notCapturedNote()]]
         : [
-            ['(LLM view, secrets redacted)', rec.req_body || '(empty)'],
-            [respBodyNote, rec.resp_body || (rec.streamed ? '' : '(empty)')],
+            [t('raw.llmViewReq'), rec.req_body || t('raw.empty')],
+            [respBodyNote, rec.resp_body || (rec.streamed ? '' : t('raw.empty'))],
           ];
       const sections = [
-        ['Request Headers', '', formatHeaders(rec.req_headers)],
-        ['Request Body', ...reqBody],
-        ['Response Headers', '', formatHeaders(rec.resp_headers)],
-        ['Response Body', ...respBody],
+        [t('raw.requestHeaders'), '', formatHeaders(rec.req_headers)],
+        [t('raw.requestBody'), ...reqBody],
+        [t('raw.responseHeaders'), '', formatHeaders(rec.resp_headers)],
+        [t('raw.responseBody'), ...respBody],
       ];
       const bodyHtml = sections.map(([label, note, body]) => `
         <div class="raw-section">
@@ -3443,7 +4391,7 @@
         dlg.innerHTML = `
           <div class="dialog-header">
             <span class="dialog-title"></span>
-            <button type="button" class="btn dialog-close">close</button>
+            <button type="button" class="btn dialog-close">${t('common.close')}</button>
           </div>
           <div class="dialog-body"></div>
         `;
@@ -3463,7 +4411,10 @@
     function timelineHeaderText() {
       const userCount = state.timelineRecords
         .filter(r => r.round_role === 'user' && r.round_kind !== 'retry').length;
-      return `Timeline (${state.timelineRecords.length} rounds${userCount > 0 ? `, ${userCount} user` : ''})`;
+      return t('timeline.header', {
+        rounds: state.timelineRecords.length,
+        user: userCount > 0 ? t('timeline.headerUser', { n: userCount }) : '',
+      });
     }
 
     // 渲染整个 timeline 的 HTML (每轮 = request bubble + response 打字框).
@@ -3504,7 +4455,7 @@
 
     function upstreamChip(r, pathId) {
       if (!r.upstream_id || !pathId || r.upstream_id === pathId) return '';
-      return `<span class="meta" title="actual upstream provider (router-resolved chain tail)">via ${escapeHtml(r.upstream_id)}</span>`;
+      return `<span class="meta" title="${escapeHtml(t('timeline.viaTip'))}">${escapeHtml(t('timeline.via', { id: r.upstream_id }))}</span>`;
     }
 
     // ─── usage-stats 徽章 (usage-stats 设计 M1) ────────────────────────────
@@ -3522,7 +4473,7 @@
 
     /** 四维用量的 hover title 文本 (cache 细分展开). */
     function usageTitle(u) {
-      return `tokens — in: ${u.input}  out: ${u.output}  cache read: ${u.cache_read}  cache write: ${u.cache_write}`;
+      return t('timeline.usageTitle', { i: u.input, o: u.output, r: u.cache_read, w: u.cache_write });
     }
 
     /**
@@ -3553,8 +4504,8 @@
           ${upstreamChip(r, pathId)}
         </span>
         <span class="tl-actions">
-          <button type="button" data-action="info" data-rid="${escapeHtml(r.id)}" title="传输层信息">ℹ</button>
-          <button type="button" data-action="raw" data-rid="${escapeHtml(r.id)}" title="原始数据">raw</button>
+          <button type="button" data-action="info" data-rid="${escapeHtml(r.id)}" title="${escapeHtml(t('timeline.infoTitle'))}">ℹ</button>
+          <button type="button" data-action="raw" data-rid="${escapeHtml(r.id)}" title="${escapeHtml(t('timeline.rawTitle'))}">raw</button>
         </span>
       </div>`;
       // request-pane: 渲染本轮完整 delta (含 assistant 作为无源气泡).
@@ -3606,7 +4557,7 @@
         const hasBadge = streamed.classList.contains('badge-stream');
         if (shouldHave && !hasBadge) {
           streamed.className = 'badge badge-stream';
-          streamed.textContent = 'streamed';
+          streamed.textContent = t('timeline.streamed');
         } else if (!shouldHave && hasBadge) {
           streamed.className = '';
           streamed.textContent = '';
@@ -3616,11 +4567,11 @@
 
     // tail status 辅助: TimelineTail 直接复用 statusClassOf/statusTextOf
     // (与 SessionView.latest_* 同源, 字段名不同但语义一致).
-    function tailStatusClass(t) {
-      return t ? statusClassOf(t.resp_status, t.error) : '';
+    function tailStatusClass(tail) {
+      return tail ? statusClassOf(tail.resp_status, tail.error) : '';
     }
-    function tailStatusText(t) {
-      return t ? statusTextOf(t.resp_status, t.error) : '';
+    function tailStatusText(tail) {
+      return tail ? statusTextOf(tail.resp_status, tail.error) : '';
     }
 
     // 渲染本轮 request delta 的所有 messages 为独立气泡 (含 assistant).
@@ -3638,10 +4589,10 @@
     //                  undefined 兼容旧后端数据).
     function renderRequestDelta(r, redactions) {
       if (r.round_kind === 'retry') {
-        return `<div class="retry-badge">↻ retry — identical messages</div>`;
+        return `<div class="retry-badge">${t('timeline.retryBadge')}</div>`;
       }
       const deltas = r.req_delta_messages || [];
-      const fallback = () => renderBubble('user', r.preview || '(no content)', redactions, 'user');
+      const fallback = () => renderBubble('user', r.preview || t('timeline.noContent'), redactions, 'user');
       if (deltas.length === 0) return fallback();
       let html = '';
       for (const msg of deltas) {
@@ -3657,20 +4608,20 @@
     // tail.streamed / resp_complete / error 决定 banner 提示.
     // redactions 取末轮 TimelineRound 的 redactions (tail 不重复携带).
     function renderTailBody() {
-      const t = state.tail;
-      if (!t) return '<empty>';
+      const tail = state.tail;
+      if (!tail) return '<empty>';
       // 末轮 redactions (mock 高亮用): 从 timelineRecords 末轮取.
       const lastRound = state.timelineRecords[state.timelineRecords.length - 1];
       const redactions = lastRound ? normalizeRedactions(lastRound.redactions) : [];
-      const respJson = t.parsed || null;
+      const respJson = tail.parsed || null;
       if (respJson) {
         return renderResponseText(respJson, redactions);
-      } else if (t.error) {
-        return `<div class="banner status-err">Error: ${escapeHtml(t.error)}</div>`;
-      } else if (t.streamed && !t.resp_complete) {
-        return '<div class="banner">Streaming in progress…</div>';
-      } else if (t.streamed) {
-        return '<div class="banner">Parsed view not available for this streamed response.</div>';
+      } else if (tail.error) {
+        return `<div class="banner status-err">${t('timeline.errorBanner', { msg: escapeHtml(tail.error) })}</div>`;
+      } else if (tail.streamed && !tail.resp_complete) {
+        return `<div class="banner">${t('timeline.streaming')}</div>`;
+      } else if (tail.streamed) {
+        return `<div class="banner">${t('timeline.parsedUnavailable')}</div>`;
       }
       return '<empty>';
     }
@@ -3936,11 +4887,11 @@
 
     // tail status 行模板 (抽屉用, SSOT).
     // 替代旧 renderStatusLine (接收 RecordSummary); 新 API 抽屉从 TimelineTail 渲染.
-    function renderTailStatusLine(t) {
-      if (!t) return '';
-      const cls = tailStatusClass(t);
-      const txt = t.resp_status === 0 ? '(pending)' : escapeHtml(t.resp_status);
-      return `status: <span class="${cls}">${txt}</span> · ${escapeHtml(t.elapsed_ms)}ms`;
+    function renderTailStatusLine(tail) {
+      if (!tail) return '';
+      const cls = tailStatusClass(tail);
+      const txt = tail.resp_status === 0 ? t('timeline.pending') : escapeHtml(tail.resp_status);
+      return `${t('timeline.statusLine')}<span class="${cls}">${txt}</span> · ${escapeHtml(tail.elapsed_ms)}ms`;
     }
 
     // redactions 数组归一化: 后端返回 [[mock, secret_id], ...], 前端统一转为
@@ -3953,7 +4904,7 @@
     }
 
     function formatHeaders(hs) {
-      if (!hs || hs.length === 0) return '(no headers)';
+      if (!hs || hs.length === 0) return t('raw.noHeaders');
       return hs.map(([k, v]) => k + ': ' + v).join('\n');
     }
 
@@ -3992,7 +4943,7 @@
       const segments = [];
       const reasoning = msg.reasoning_content;
       if (typeof reasoning === 'string' && reasoning !== '') {
-        segments.push(`<div class="bubble-tool-call" title="reasoning_content (思考原文)">${renderTextWithXmlBlocks(reasoning, redactions)}</div>`);
+        segments.push(`<div class="bubble-tool-call" title="${escapeHtml(t('timeline.reasoningTip'))}">${renderTextWithXmlBlocks(reasoning, redactions)}</div>`);
       }
       const text = messageToText(msg);
       if (text !== null) {
@@ -4037,12 +4988,15 @@
     // 把 sender 映射为 {cls (用于 .chat-row.row-<x> + .sender-icon.s-<x>),
     // letter (icon 内字母), label (hover title)}.
     // user 靠右 (IM 风格), 其他靠左.
+    // tool 系 wire role 集合 (senderMeta 的 label 判定: 集合内译 "工具", 集合外的
+    // 自定义 role 原样透传 — 它是上游数据, 不属于词表).
+    const TOOL_ROLES = new Set(['tool', 'tool_call', 'tool_use']);
     function senderMeta(role) {
-      if (role === 'user') return { cls: 'user', letter: 'U', label: 'user' };
-      if (role === 'assistant') return { cls: 'assistant', letter: 'A', label: 'assistant' };
-      if (role === 'system') return { cls: 'system', letter: 'S', label: 'system' };
-      // tool / tool_call / tool_use 都归到 tool.
-      return { cls: 'tool', letter: 'T', label: role || 'tool' };
+      if (role === 'user') return { cls: 'user', letter: 'U', label: t('role.user') };
+      if (role === 'assistant') return { cls: 'assistant', letter: 'A', label: t('role.assistant') };
+      if (role === 'system') return { cls: 'system', letter: 'S', label: t('role.system') };
+      // tool / tool_call / tool_use 都归到 tool; 其余自定义 role 原样透传.
+      return { cls: 'tool', letter: 'T', label: TOOL_ROLES.has(role) ? t('role.tool') : (role || t('role.tool')) };
     }
 
     // renderBubble: 纯文本内容 (自动 escape + mock 高亮 + XML 块区块化).
@@ -4086,14 +5040,14 @@
       if (isCollapsed) {
         // collapsed → expanded.
         bubble.classList.replace('collapsed', 'expanded');
-        toggle.textContent = 'collapse ▴';
+        toggle.textContent = t('timeline.collapse');
         // 若标记了可查看全文, 注入浮动按钮到 .bubble-actions (只注入一次).
         const actions = bubble.querySelector('.bubble-actions');
         if (bubble.dataset.canViewFull === '1' && actions && !actions.querySelector('.view-full-btn')) {
           const fullBtn = document.createElement('button');
           fullBtn.className = 'view-full-btn';
           fullBtn.type = 'button';
-          fullBtn.textContent = 'view full ▾';
+          fullBtn.textContent = t('timeline.viewFull');
           fullBtn.addEventListener('click', (ev) => {
             ev.stopPropagation();
             openBubbleFullDialog(bubble);
@@ -4103,7 +5057,7 @@
       } else {
         // expanded → collapsed.
         bubble.classList.replace('expanded', 'collapsed');
-        toggle.textContent = 'expand ▾';
+        toggle.textContent = t('timeline.expand');
       }
     }
 
@@ -4117,7 +5071,7 @@
         dlg.innerHTML = `
           <div class="full-header">
             <span class="full-title"></span>
-            <button type="button" class="btn full-close">close</button>
+            <button type="button" class="btn full-close">${t('common.close')}</button>
           </div>
           <div class="full-body"></div>
         `;
@@ -4129,7 +5083,8 @@
         });
       }
       const role = bubble.dataset.role || 'message';
-      dlg.querySelector('.full-title').textContent = role;
+      // 标题用本地化 role label (senderMeta 对未知 role 原样透传).
+      dlg.querySelector('.full-title').textContent = senderMeta(role).label;
       // 取内容层 (.bubble-content, 纯文本 + mock 高亮, 不含按钮), 直接复用 innerHTML.
       const content = bubble.querySelector('.bubble-content');
       dlg.querySelector('.full-body').innerHTML = content ? content.innerHTML : '';
@@ -4285,25 +5240,28 @@
     function renderStats(elId, list) {
       const c = countSources(list);
       const el = document.getElementById(elId);
+      // 词条自带 <strong> 包裹 (zh 语序把数字放中间, 尾词拼接无法表达; n 恒为数字,
+      // 无转义面 — 同 data-i18n-html 的作者可控 HTML 约定).
       el.innerHTML = `
-        <span><strong>${list.length}</strong> total</span>
-        <span><strong>${c.static + c.static_preferred}</strong> static</span>
-        <span><strong>${c.dynamic + c.dynamic_override}</strong> dynamic</span>
-        <span><strong>${c.dynamic_override + c.static_preferred}</strong> overrides</span>
+        <span>${t('stats.total', { n: list.length })}</span>
+        <span>${t('stats.static', { n: c.static + c.static_preferred })}</span>
+        <span>${t('stats.dynamic', { n: c.dynamic + c.dynamic_override })}</span>
+        <span>${t('stats.overrides', { n: c.dynamic_override + c.static_preferred })}</span>
       `;
     }
     function srcBadge(source) {
-      const label = SOURCE_LABELS[source] || source;
+      // SOURCE_KINDS 充当 source 值域枚举; 域外 (后端新增 source) 原样透传.
+      const label = SOURCE_KINDS.has(source) ? t(`source.${source}`) : source;
       return `<span class="src-badge src-${source}">${escapeHtml(label)}</span>`;
     }
     function decisionCell(kind, id, current, isStatic) {
       // 仅 static id 显示 decision 控件. dynamic-only 不可选.
       if (!isStatic) return '<span class="meta">—</span>';
-      const opts = Object.keys(DECISION_LABELS)
+      const opts = DECISION_MODES
         .map(k => {
           // Disabled option: 悬停提示后果 (仅 secret — provider 的 Disabled 是禁转发, 无泄密).
-          const title = kind === 'secret' && k === 'disabled' ? ` title="${escapeHtml(SECRET_DISABLED_HINT)}"` : '';
-          return `<option value="${k}"${title}${k === current ? ' selected' : ''}>${escapeHtml(DECISION_LABELS[k])}</option>`;
+          const title = kind === 'secret' && k === 'disabled' ? ` title="${escapeHtml(secretDisabledHint())}"` : '';
+          return `<option value="${k}"${title}${k === current ? ' selected' : ''}>${escapeHtml(decisionLabel(k))}</option>`;
         })
         .join('');
       return `<select class="decision-select" data-kind="${kind}" data-id="${escapeHtml(id)}">${opts}</select>`;
@@ -4334,7 +5292,7 @@
         formDlgId: 'secret-form',
         formElId: 'secret-form-el',
         colspan: 9,
-        emptyText: 'No secrets configured',
+        emptyText: () => t('secrets.empty'),
         kindParam: 'secret', // decision endpoint URL 用
         refresh: () => refreshSecrets(),
         renderRow: renderSecretRow,
@@ -4351,7 +5309,7 @@
         formDlgId: 'provider-form',
         formElId: 'provider-form-el',
         colspan: 9,
-        emptyText: 'No providers configured',
+        emptyText: () => t('providers.empty'),
         kindParam: 'provider',
         refresh: () => refreshProviders(),
         renderRow: renderProviderRow,
@@ -4368,16 +5326,16 @@
       const id = escapeHtml(item.id);
       const s = item.source;
       if (s === 'static') {
-        return `<button class="btn" data-action="edit" data-id="${id}">override</button>`;
+        return `<button class="btn" data-action="edit" data-id="${id}">${escapeHtml(t('action.override'))}</button>`;
       }
       if (s === 'static_preferred') {
-        return `<button class="btn" data-action="edit" data-id="${id}">edit dyn</button>`;
+        return `<button class="btn" data-action="edit" data-id="${id}">${escapeHtml(t('action.editDyn'))}</button>`;
       }
       if (s === 'dynamic_override') {
-        return `<button class="btn" data-action="edit" data-id="${id}">edit</button>`;
+        return `<button class="btn" data-action="edit" data-id="${id}">${escapeHtml(t('common.edit'))}</button>`;
       }
-      return `<button class="btn" data-action="edit" data-id="${id}">edit</button>`
-           + `<button class="btn btn-danger" data-action="delete" data-id="${id}">delete</button>`;
+      return `<button class="btn" data-action="edit" data-id="${id}">${escapeHtml(t('common.edit'))}</button>`
+           + `<button class="btn btn-danger" data-action="delete" data-id="${id}">${escapeHtml(t('common.delete'))}</button>`;
     }
 
     // 通用表格事件委托 (click + decision change).
@@ -4401,7 +5359,7 @@
         const disablingSecret = kind === 'secret' && sel.value === 'disabled';
         // 取消时数据未变 → renderedHtml 短路不重渲染, 必须显式还原可见值.
         if (disablingSecret
-            && !confirm(`${SECRET_DISABLED_HINT}\n\nSet secret ${sel.dataset.id} to Disabled?`)) {
+            && !confirm(`${secretDisabledHint()}\n\n${t('decision.confirmSecretDisabled', { id: sel.dataset.id })}`)) {
           restoreDecisionSelect(sel);
           return;
         }
@@ -4430,7 +5388,7 @@
         renderKind(kind);
       } catch (e) {
         console.error(e);
-        setStatus(`${kind} refresh failed`, 'status-err');
+        setStatus(t('status.refreshFailed', { kind }), 'status-err');
       }
     }
 
@@ -4454,7 +5412,7 @@
       // stats 口径 = effective view (仅有效行), 不计 disabled 行 — 与转发/脱敏生效集一致.
       const disabledRows = cfg.disabledList().map(item => cfg.renderDisabledRow(item));
       const html = list.length === 0 && disabledRows.length === 0
-        ? `<tr><td colspan="${cfg.colspan}" class="empty">${cfg.emptyText}</td></tr>`
+        ? `<tr><td colspan="${cfg.colspan}" class="empty">${cfg.emptyText()}</td></tr>`
         : list.map(item => cfg.renderRow(item)).join('') + disabledRows.join('');
       if (replaceTbodyIfChanged(body, html)) renderStats(cfg.statsId, list);
     }
@@ -4463,11 +5421,11 @@
     // 存在时后端 409, 错误消息含 decision 指引, 由下方 !r.ok 分支 alert 提示.
     async function deleteItem(kind, id) {
       const cfg = KINDS[kind];
-      if (!confirm(`Delete dynamic ${kind} ${id}?`)) return;
+      if (!confirm(t('confirm.deleteItem', { kind, id }))) return;
       const r = await fetch(`${cfg.api}/${encodeURIComponent(id)}`, { method: 'DELETE' });
       if (!r.ok) {
         const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
-        alert('Failed: ' + (err.error || r.status));
+        alert(t('common.alertFailed', { msg: err.error || r.status }));
         return;
       }
       await cfg.refresh();
@@ -4486,9 +5444,9 @@
     //   inactive — auth off             (灰色, 服务端未启用认证, key 无消费方)
     // 三态定义的 SSOT 在 src/web/api/apikeys.rs 头部注释; 此函数仅负责视觉映射.
     function apiKeyStatusBadge(authEnabled, disabled) {
-      if (!authEnabled) return '<span class="badge badge-inactive" title="Server authentication is disabled — all requests are accepted without a key. Enable [auth] in secret-guard.toml to activate.">inactive</span>';
-      if (disabled) return '<span class="badge badge-err">disabled</span>';
-      return '<span class="badge badge-stream">enabled</span>';
+      if (!authEnabled) return `<span class="badge badge-inactive" title="${escapeHtml(t('apikeys.inactiveTip'))}">${escapeHtml(t('apikeys.inactive'))}</span>`;
+      if (disabled) return `<span class="badge badge-err">${escapeHtml(t('apikeys.disabledBadge'))}</span>`;
+      return `<span class="badge badge-stream">${escapeHtml(t('apikeys.enabledBadge'))}</span>`;
     }
 
     // ─── usage tab: 模型用量统计 (usage-stats 设计 M4) ────────────────────
@@ -4520,7 +5478,7 @@
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         data = await r.json();
       } catch (e) {
-        setStatus(`usage: ${e.message}`, 'err');
+        setStatus(t('status.usageError', { msg: e.message }), 'status-err');
         return;
       }
       renderUsage(data);
@@ -4547,28 +5505,33 @@
     }
 
     function renderUsage(d) {
-      const t = d.totals || {};
+      const totals = d.totals || {};
       // pricing 状态徽标.
       const ps = document.getElementById('usage-pricing-status');
-      const psMap = { ok: '', loading: 'pricing: loading…', stale: 'pricing: stale (refresh failed, using old table)', offline: 'pricing: offline (no price data)' };
+      const psMap = {
+        ok: '',
+        loading: t('usage.pricing.loading'),
+        stale: t('usage.pricing.stale'),
+        offline: t('usage.pricing.offline'),
+      };
       ps.textContent = psMap[d.pricing_status] ?? '';
 
       // 汇总卡: requests / retries / 429 (+err 5xx 尾注) / token 四维 / hit / cost.
-      const hitRate = t.cache_hit_rate == null ? '—' : (t.cache_hit_rate * 100).toFixed(0) + '%';
-      const cov = t.cost_coverage == null ? '' :
-        `<small> · ${(t.cost_coverage * 100).toFixed(0)}% priced</small>`;
-      const noUsage = t.requests_without_usage ? `<small> · ${t.requests_without_usage} no usage</small>` : '';
-      const err5 = (t.errors_5xx || 0) > 0 ? `<small> · ${t.errors_5xx} 5xx</small>` : '';
+      const hitRate = totals.cache_hit_rate == null ? '—' : (totals.cache_hit_rate * 100).toFixed(0) + '%';
+      const cov = totals.cost_coverage == null ? '' :
+        `<small> · ${t('usage.pricedPct', { n: (totals.cost_coverage * 100).toFixed(0) })}</small>`;
+      const noUsage = totals.requests_without_usage ? `<small> · ${t('usage.noUsage', { n: totals.requests_without_usage })}</small>` : '';
+      const err5 = (totals.errors_5xx || 0) > 0 ? `<small> · ${t('usage.err5xx', { n: totals.errors_5xx })}</small>` : '';
       document.getElementById('usage-cards').innerHTML = [
-        usageCard('requests', String(t.requests ?? 0), noUsage),
-        usageCard('retries', String(t.retries ?? 0)),
-        usageCard('429 rate-limited', String(t.rate_limited_429 ?? 0), err5),
-        usageCard('input', fmtTokens(t.input ?? 0)),
-        usageCard('output', fmtTokens(t.output ?? 0)),
-        usageCard('cache read', fmtTokens(t.cache_read ?? 0)),
-        usageCard('cache write', fmtTokens(t.cache_write ?? 0)),
-        usageCard('cache hit', hitRate),
-        usageCard('~ cost', fmtCost(t.est_cost_usd), cov),
+        usageCard(t('usage.card.requests'), String(totals.requests ?? 0), noUsage),
+        usageCard(t('usage.card.retries'), String(totals.retries ?? 0)),
+        usageCard(t('usage.card.rateLimited'), String(totals.rate_limited_429 ?? 0), err5),
+        usageCard(t('usage.card.input'), fmtTokens(totals.input ?? 0)),
+        usageCard(t('usage.card.output'), fmtTokens(totals.output ?? 0)),
+        usageCard(t('usage.card.cacheRead'), fmtTokens(totals.cache_read ?? 0)),
+        usageCard(t('usage.card.cacheWrite'), fmtTokens(totals.cache_write ?? 0)),
+        usageCard(t('usage.card.cacheHit'), hitRate),
+        usageCard(t('usage.card.cost'), fmtCost(totals.est_cost_usd), cov),
       ].join('');
 
       renderUsageChart(d.by_bucket || [], d.range ? d.range.granularity : 'hour');
@@ -4579,14 +5542,14 @@
       // 脚注: 估算语义 + 口径 + 无价提示 (include_usage 教育位).
       const unpriced = (d.unpriced_models || []);
       const parts = [
-        `<b>~cost</b> is an estimate from the <a href="https://models.dev" target="_blank" rel="noreferrer">models.dev</a> price table (always recomputed with the current table; add <code>[usage.pricing_override]</code> in <code>secret-guard.toml</code> for custom models).`,
-        `Session badges on the Records tab are per-process and reset on restart; this page is a persistent ledger (SQLite, retention via <code>[usage] retention_days</code>). <b>Retries</b> are IR-equivalent re-sends — gateway view, each retry is real upstream spend.`,
+        t('usage.footnote.cost'),
+        t('usage.footnote.ledger'),
       ];
-      if (unpriced.length) parts.push(`No price found for: ${unpriced.map(escapeHtml).join(', ')} — requests still count toward tokens, cost shows "—".`);
+      if (unpriced.length) parts.push(t('usage.footnote.unpriced', { models: unpriced.map(escapeHtml).join(', ') }));
       const zeroPriced = (d.zero_priced_models || []);
-      if (zeroPriced.length) parts.push(`Priced at $0 (free tier or subscription-plan vendor): ${zeroPriced.map(escapeHtml).join(', ')} — costs above are metered estimates; use <code>[usage.pricing_override]</code> to pin exact plan pricing.`);
-      if ((t.cost_coverage != null && t.cost_coverage < 0.9) || (t.requests_without_usage || 0) > 0) {
-        parts.push(`OpenAI streaming requests only report usage when the client sets <code>stream_options.include_usage = true</code> — such requests appear here without token counts.`);
+      if (zeroPriced.length) parts.push(t('usage.footnote.zeroPriced', { models: zeroPriced.map(escapeHtml).join(', ') }));
+      if ((totals.cost_coverage != null && totals.cost_coverage < 0.9) || (totals.requests_without_usage || 0) > 0) {
+        parts.push(t('usage.footnote.includeUsage'));
       }
       document.getElementById('usage-footnote').innerHTML = parts.join('<br>');
     }
@@ -4597,17 +5560,17 @@
       const el = document.getElementById('usage-chart');
       const legend = document.getElementById('usage-legend');
       document.getElementById('usage-chart-title').textContent =
-        'tokens per ' + (granularity === 'day' ? 'day' : 'hour');
+        t(granularity === 'day' ? 'usage.chartPerDay' : 'usage.chartPerHour');
       if (!buckets.length || buckets.every(x => (x.requests || 0) === 0)) {
-        el.innerHTML = '<div class="empty">no data in range</div>';
+        el.innerHTML = `<div class="empty">${t('usage.noDataInRange')}</div>`;
         legend.innerHTML = '';
         return;
       }
       legend.innerHTML =
-        '<i style="background:var(--accent)"></i>in' +
-        '<i style="background:#2dd4bf"></i>cache r' +
-        '<i style="background:#f5b83d"></i>cache w' +
-        '<i style="background:#a78bfa"></i>out';
+        `<i style="background:var(--accent)"></i>${escapeHtml(t('usage.legend.in'))}` +
+        `<i style="background:#2dd4bf"></i>${escapeHtml(t('usage.legend.cacheR'))}` +
+        `<i style="background:#f5b83d"></i>${escapeHtml(t('usage.legend.cacheW'))}` +
+        `<i style="background:#a78bfa"></i>${escapeHtml(t('usage.legend.out'))}`;
       const W = 24, H = 140, GAP = 8, AXIS = 34;
       const max = Math.max(...buckets.map(x => (x.input || 0) + (x.cache_read || 0) + (x.cache_write || 0) + (x.output || 0)), 1);
       const totalW = AXIS + buckets.length * (W + GAP);
@@ -4645,7 +5608,7 @@
     /** usage 页表格渲染收口: 空态 colspan + 行渲染器 (4 表共享). */
     function tbodyHtml(tbodyId, rows, colspan, renderRow) {
       const body = document.getElementById(tbodyId);
-      if (!rows.length) { body.innerHTML = `<tr><td colspan="${colspan}" class="empty">no data</td></tr>`; return; }
+      if (!rows.length) { body.innerHTML = `<tr><td colspan="${colspan}" class="empty">${t('usage.noData')}</td></tr>`; return; }
       body.innerHTML = rows.map(renderRow).join('');
     }
 
@@ -4662,7 +5625,7 @@
 
     function renderUsageModelTable(rows) {
       tbodyHtml('usage-by-model-body', rows, 11, r => `<tr>
-        <td>${ellCell(r.model || '(unknown)')}</td>
+        <td>${ellCell(r.model || t('common.unknown'))}</td>
         <td>${ellCell(r.provider)}</td>
         <td>${r.requests}</td>
         <td>${r.retries ?? 0}</td>
@@ -4718,7 +5681,7 @@
         <td>${ellCell(r.api_key_label || '—')}</td>
         <td>${ellCell(r.provider)}</td>
         <td>${ellCell(r.model_req || '—')}</td>
-        <td><button type="button" class="btn btn-small" data-audit-node="${escapeHtml(r.node || '')}" title="查看 redact 后的请求原文 (内存态, 重启后不可回查)">view</button></td>
+        <td><button type="button" class="btn btn-small" data-audit-node="${escapeHtml(r.node || '')}" title="${escapeHtml(t('usage.viewTitle'))}">${escapeHtml(t('usage.view'))}</button></td>
       </tr>`);
     }
 
@@ -4731,25 +5694,25 @@
       const dlg = document.getElementById('audit-record-dialog');
       const meta = document.getElementById('audit-record-meta');
       const body = document.getElementById('audit-record-body');
-      meta.textContent = `node ${node} — loading…`;
+      meta.textContent = t('usage.nodeLoading', { id: node });
       body.textContent = '';
       dlg.showModal();
       try {
         const r = await fetch(`/api/records/${encodeURIComponent(node)}?view=parsed`, { cache: 'no-store' });
-        if (!r.ok) throw new Error(r.status === 404 ? 'record no longer in memory (restarted or evicted)' : `HTTP ${r.status}`);
+        if (!r.ok) throw new Error(r.status === 404 ? t('usage.recordEvicted') : `HTTP ${r.status}`);
         const data = await r.json();
-        meta.textContent = `node ${node}`;
+        meta.textContent = t('usage.nodeLabel', { id: node });
         // B3: audit_capture off → parsed_request 恒 null (records.rs early-return
         // 同时置 record.audit_capture_off 与 parse_error "not captured", 同一条件)
         // — 判结构化字段 (与 raw 弹窗同判据, 不耦合错误文案), 占位替代 JSON dump
         // (off 时 record 里的空 body 无信息量, dump 整个 record 反而误导).
         if (data.record?.audit_capture_off === true) {
-          body.textContent = NOT_CAPTURED_NOTE;
+          body.textContent = notCapturedNote();
           return;
         }
         body.textContent = JSON.stringify(data.parsed_request ?? data.record ?? data, null, 2);
       } catch (err) {
-        meta.textContent = `node ${node}`;
+        meta.textContent = t('usage.nodeLabel', { id: node });
         body.textContent = `⚠ ${err.message}`;
       }
     });
@@ -4771,7 +5734,7 @@
         // /api/api-keys 路由无条件挂载 (不依赖 auth.enabled), 失败 = 真 bug, 不静默.
         // 保留上次列表 (与 refreshKind 一致, 避免 transient 错误让 UI 突然空白).
         console.error(e);
-        setStatus('apikey refresh failed', 'status-err');
+        setStatus(t('status.apikeyRefreshFailed'), 'status-err');
       }
     }
 
@@ -4783,33 +5746,33 @@
       const enabled = state.apiKeysList.filter(k => !k.disabled).length;
       const staticCount = state.apiKeysList.filter(k => k.source === 'static').length;
       const enabledStat = state.authEnabled
-        ? `<span><strong>${enabled}</strong> enabled</span>`
-        : `<span class="meta">auth off — keys inactive</span>`;
+        ? `<span>${t('apikeys.statEnabled', { n: `<strong>${enabled}</strong>` })}</span>`
+        : `<span class="meta">${escapeHtml(t('apikeys.statInactive'))}</span>`;
       statsEl.innerHTML = `
-        <span><strong>${total}</strong> total</span>
+        <span>${t('apikeys.statTotal', { n: `<strong>${total}</strong>` })}</span>
         ${enabledStat}
-        <span><strong>${staticCount}</strong> static</span>
+        <span>${t('apikeys.statStatic', { n: `<strong>${staticCount}</strong>` })}</span>
       `;
       warnEl.hidden = state.authEnabled;
       const html = total === 0
-        ? `<tr><td colspan="6" class="empty">No API keys configured</td></tr>`
+        ? `<tr><td colspan="6" class="empty">${t('apikeys.empty')}</td></tr>`
         : state.apiKeysList.map(k => {
-        const srcBadge = `<span class="src-badge src-${escapeHtml(k.source)}">${escapeHtml(k.source)}</span>`;
+        const srcBadgeHtml = srcBadge(k.source);
         const statusBadge = apiKeyStatusBadge(state.authEnabled, k.disabled);
         // auth 关闭时 toggle 无实际效果 (请求被无条件接受), 按钮禁用以免误导.
         const toggleDisabled = !state.authEnabled;
-        const toggleLabel = k.disabled ? 'Enable' : 'Disable';
+        const toggleLabel = k.disabled ? t('apikeys.enable') : t('apikeys.disable');
         const toggleTarget = k.disabled ? 'false' : 'true';
         const canDelete = k.source === 'dynamic';
         const created = k.source === 'static'
-          ? '<span class="meta">(static)</span>'
+          ? `<span class="meta">${escapeHtml(t('apikeys.staticMeta'))}</span>`
           : escapeHtml(new Date(k.created_at).toLocaleString());
         const toggleBtn = toggleDisabled
-          ? `<button class="btn" disabled title="Enable server auth first">${escapeHtml(toggleLabel)}</button>`
+          ? `<button class="btn" disabled title="${escapeHtml(t('apikeys.enableAuthFirst'))}">${escapeHtml(toggleLabel)}</button>`
           : `<button class="btn" data-action="toggle" data-id="${escapeHtml(k.id)}" data-target="${toggleTarget}">${escapeHtml(toggleLabel)}</button>`;
         const actions = [
           toggleBtn,
-          canDelete ? `<button class="btn btn-danger" data-action="delete" data-id="${escapeHtml(k.id)}">Delete</button>` : '',
+          canDelete ? `<button class="btn btn-danger" data-action="delete" data-id="${escapeHtml(k.id)}">${escapeHtml(t('apikeys.delete'))}</button>` : '',
         ].join('');
         // auth 关闭时 row-disabled 视觉与 inactive 冲突, 不挂该类.
         const rowClass = !state.authEnabled ? '' : (k.disabled ? 'row-disabled' : '');
@@ -4817,7 +5780,7 @@
           <tr class="${rowClass}" data-id="${escapeHtml(k.id)}">
             <td title="${escapeHtml(k.label)}"><span class="cell-ellipsis">${escapeHtml(k.label)}</span></td>
             <td><code>${escapeHtml(k.key_prefix)}…</code></td>
-            <td>${srcBadge}</td>
+            <td>${srcBadgeHtml}</td>
             <td>${statusBadge}</td>
             <td class="cell-short">${created}</td>
             <td class="actions">${actions}</td>
@@ -4855,7 +5818,7 @@
       if (!btn || btn.value !== 'save') return;
       e.preventDefault();
       const label = document.getElementById('ak-label').value.trim();
-      if (!label) { alert('Label is required'); return; }
+      if (!label) { alert(t('apikeys.labelRequired')); return; }
       try {
         const r = await fetch(API_API_KEYS, {
           method: 'POST',
@@ -4864,7 +5827,7 @@
         });
         if (!r.ok) {
           const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
-          alert('Failed: ' + (err.error || r.status));
+          alert(t('common.alertFailed', { msg: err.error || r.status }));
           return;
         }
         const issued = await r.json();
@@ -4874,16 +5837,16 @@
         document.getElementById('apikey-reveal').showModal();
         await refreshApiKeys();
       } catch (e) {
-        alert('Error: ' + e.message);
+        alert(t('common.alertError', { msg: e.message }));
       }
     });
 
     function copyRevealedApiKey() {
       const val = document.getElementById('apikey-reveal-value').value;
       navigator.clipboard.writeText(val).then(() => {
-        setStatus('API key copied to clipboard');
+        setStatus(t('status.apiKeyCopied'));
       }).catch(() => {
-        alert('Copy failed — select the text manually.');
+        alert(t('common.copyFailed'));
       });
     }
 
@@ -4895,18 +5858,18 @@
       });
       if (!r.ok) {
         const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
-        alert('Failed: ' + (err.error || r.status));
+        alert(t('common.alertFailed', { msg: err.error || r.status }));
         return;
       }
       await refreshApiKeys();
     }
 
     async function deleteApiKey(id) {
-      if (!confirm(`Delete API key ${id}?`)) return;
+      if (!confirm(t('apikeys.confirmDelete', { id }))) return;
       const r = await fetch(`${API_API_KEYS}/${encodeURIComponent(id)}`, { method: 'DELETE' });
       if (!r.ok) {
         const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
-        alert('Failed: ' + (err.error || r.status));
+        alert(t('common.alertFailed', { msg: err.error || r.status }));
         return;
       }
       await refreshApiKeys();
@@ -4987,8 +5950,7 @@
     // 跨协议教育提示 (静态, 无条件挂在 egress 标记上): 入口协议 ≠ 出口时的代价.
     // 流式 = 实际行为: codec 覆盖族 (openai/anthropic/openai-responses) 任意 pair
     // 流式均翻译 (含 Responses 任一侧, M2 走查口径随 Responses 流式落地更新).
-    const EGRESS_CROSS_PROTO_TIP =
-      'If the ingress protocol ≠ this egress: cross-protocol translation kicks in — reasoning_content is dropped, except Responses egress streaming keeps it (as reasoning summary events)';
+    const EGRESS_CROSS_PROTO_TIP = () => t('prov.crossProtoTip');
 
     // 启用 (priority 非 null) 路由中 priority 最大者; 并列按列表序先者 — 与后端
     // `RouterProvider::select_route` 的确定性 tie-break 一致. 空/全禁用 → null.
@@ -5064,13 +6026,13 @@
       const renderRoute = (r) => {
         const main = `${escapeHtml(r.model_pattern)} → ${escapeHtml(r.target)}`;
         return (r.priority == null ? `<s>${main}</s>` : main)
-          + ` <span class="route-egress" title="${escapeHtml(EGRESS_CROSS_PROTO_TIP)}">· ${escapeHtml(egressOf(r))}</span>`;
+          + ` <span class="route-egress" title="${escapeHtml(EGRESS_CROSS_PROTO_TIP())}">· ${escapeHtml(egressOf(r))}</span>`;
       };
       const shown = routes.length > ROUTES_SUMMARY_MAX
-        ? [renderRoute(routes[0]), `<span class="meta">+${routes.length - ROUTES_SUMMARY_MAX} more</span>`]
+        ? [renderRoute(routes[0]), `<span class="meta">${escapeHtml(t('common.more', { n: routes.length - ROUTES_SUMMARY_MAX }))}</span>`]
         : routes.map(renderRoute);
       const full = routes
-        .map(r => `${r.priority == null ? '(disabled) ' : ''}${r.model_pattern} → ${r.target} [${egressOf(r)}]`)
+        .map(r => `${r.priority == null ? t('prov.disabledPrefix') : ''}${r.model_pattern} → ${r.target} [${egressOf(r)}]`)
         .join('; ');
       return `<td class="cell-long" title="${escapeHtml(full)}"><span class="cell-ellipsis"><code>${shown.join('; ')}</code></span></td>`;
     }
@@ -5089,14 +6051,13 @@
         const d = new Date(Date.now() + secs * 1000);
         const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
         const sameDay = d.toDateString() === new Date().toDateString();
-        return sameDay ? `until ${hm}` : `until ${d.getMonth() + 1}/${d.getDate()} ${hm}`;
+        return sameDay ? t('prov.untilTime', { t: hm }) : t('prov.untilTime', { t: `${d.getMonth() + 1}/${d.getDate()} ${hm}` });
       }
-      return `${secs}s`;
+      return t('prov.resumeSecs', { n: secs });
     }
 
     const POOL_SUMMARY_MAX = 2;
-    const POOL_PILL_TIP =
-      'subscription pool — ordered failover across member direct providers (no base URL / API key of its own)';
+    const POOL_PILL_TIP = () => t('prov.poolTip');
 
     function poolMembersCell(members, status) {
       const stat = i => (status && status[i]) || { id: members[i], active: true };
@@ -5109,22 +6070,22 @@
         const st = stat(i);
         let dot, extra = '';
         if (stateOf(st) === 'active') {
-          dot = '<span class="pm-dot pm-on" title="active">●</span>';
+          dot = `<span class="pm-dot pm-on" title="${escapeHtml(t('prov.activeTip'))}">●</span>`;
         } else {
-          dot = '<span class="pm-dot pm-wait" title="window-quota exhausted — suspended until its alarm expires">◐</span>';
+          dot = `<span class="pm-dot pm-wait" title="${escapeHtml(t('prov.exhaustedTip'))}">◐</span>`;
           extra = ` <span class="meta">${escapeHtml(fmtResume(st.resume_in_secs))}</span>`;
         }
         const cur = i === firstActive
-          ? '<span class="pm-cur" title="requests go to the first available member (list order)">▸</span>' : '';
+          ? `<span class="pm-cur" title="${escapeHtml(t('prov.curTip'))}">▸</span>` : '';
         return `${cur}${dot} ${escapeHtml(m)}${extra}`;
       };
       const shown = members.length > POOL_SUMMARY_MAX
-        ? [renderMember(members[0], 0), `<span class="meta">+${members.length - POOL_SUMMARY_MAX} more</span>`]
+        ? [renderMember(members[0], 0), `<span class="meta">${escapeHtml(t('common.more', { n: members.length - POOL_SUMMARY_MAX }))}</span>`]
         : members.map(renderMember);
       const full = members.map((m, i) => {
         const st = stat(i);
         const s = stateOf(st);
-        return `${m} [${s}${s === 'exhausted' ? ' ' + fmtResume(st.resume_in_secs) : ''}]`;
+        return `${m} [${t(`prov.${s}State`)}${s === 'exhausted' ? ' ' + fmtResume(st.resume_in_secs) : ''}]`;
       }).join('; ');
       return `<td class="cell-long" title="${escapeHtml(full)}"><span class="cell-ellipsis"><code>${shown.join('; ')}</code></span></td>`;
     }
@@ -5137,9 +6098,9 @@
       const eps = p.endpoints || [];
       const full = eps.map(e => `${e.protocol}: ${e.base_url}`).join(' | ');
       const protoCell = `<td class="cell-short">${eps.map(e =>
-        `<span class="pill" title="endpoint: ${escapeHtml(e.base_url)} (same-protocol passthrough)">${escapeHtml(e.protocol)}</span>`).join(' ')}</td>`;
+        `<span class="pill" title="${escapeHtml(t('prov.endpointPillTip', { url: e.base_url }))}">${escapeHtml(e.protocol)}</span>`).join(' ')}</td>`;
       const urlCell = `<td class="cell-long" title="${escapeHtml(full)}"><span class="cell-ellipsis"><code>${escapeHtml(eps[0]?.base_url || '')}</code></span>`
-        + (eps.length > 1 ? ` <span class="meta" title="${escapeHtml(`+${eps.length - 1} more endpoint(s) — full list in this tooltip`)}">+${eps.length - 1}</span>` : '')
+        + (eps.length > 1 ? ` <span class="meta" title="${escapeHtml(t('prov.moreEndpointsTip', { n: eps.length - 1 }))}">+${eps.length - 1}</span>` : '')
         + `</td>`;
       return { protoCell, urlCell };
     }
@@ -5159,16 +6120,16 @@
         const routes = p.routes || [];
         const egressLabel = egressLabelOf(routes.map(r => r.target));
         protoCell = `<td class="cell-short">`
-          + `<span class="pill" title="egress protocol(s) resolved from route targets (approximation: highest-priority enabled route)">${escapeHtml(egressLabel)}</span>`
-          + ` <span class="pill" title="route-based routing endpoint — forwards by route model_pattern (no base URL / API key of its own)">router</span>`
+          + `<span class="pill" title="${escapeHtml(t('prov.egressRoutesTip'))}">${escapeHtml(egressLabel)}</span>`
+          + ` <span class="pill" title="${escapeHtml(t('prov.routerTip'))}">${escapeHtml(t('prov.router'))}</span>`
           + `</td>`;
         urlCell = routerRoutesCell(routes);
       } else if (kind === 'pool') {
         const members = p.members || [];
         const egressLabel = egressLabelOf(members);
         protoCell = `<td class="cell-short">`
-          + `<span class="pill" title="egress protocol(s) resolved from members (approximation: per-member chain-tail walk)">${escapeHtml(egressLabel)}</span>`
-          + ` <span class="pill" title="${POOL_PILL_TIP}">pool</span>`
+          + `<span class="pill" title="${escapeHtml(t('prov.egressMembersTip'))}">${escapeHtml(egressLabel)}</span>`
+          + ` <span class="pill" title="${escapeHtml(POOL_PILL_TIP())}">${escapeHtml(t('prov.pool'))}</span>`
           + `</td>`;
         urlCell = poolMembersCell(members, p.pool_status);
       } else {
@@ -5180,13 +6141,13 @@
           <td title="${escapeHtml(p.name || '')}"><span class="cell-ellipsis">${escapeHtml(p.name || '')}</span></td>
           ${protoCell}
           ${urlCell}
-          <td class="cell-long" title="${escapeHtml(p.api_key_masked || '')}"><span class="cell-ellipsis"><code>${escapeHtml(p.api_key_masked || '(none)')}</code></span></td>
+          <td class="cell-long" title="${escapeHtml(p.api_key_masked || '')}"><span class="cell-ellipsis"><code>${escapeHtml(p.api_key_masked || t('common.none'))}</code></span></td>
           <td class="cell-short">${p.enabled ? '✓' : '<span class="status-err">✗</span>'}</td>
           <td>${srcBadge(p.source)}</td>
           <td>${decisionCell('provider', p.id, p.decision, !!p.static_version)}</td>
           <td class="actions">
-            ${kind === 'pool' ? `<button class="btn" data-action="pool-reset" data-id="${escapeHtml(p.id)}" title="Clear all member exhaustion alarms (resume probing now)">reset</button>` : ''}
-            <button class="btn" data-action="endpoints" data-id="${escapeHtml(p.id)}" title="View endpoint URLs for each protocol">endpoints</button>
+            ${kind === 'pool' ? `<button class="btn" data-action="pool-reset" data-id="${escapeHtml(p.id)}" title="${escapeHtml(t('prov.resetTitle'))}">${escapeHtml(t('prov.reset'))}</button>` : ''}
+            <button class="btn" data-action="endpoints" data-id="${escapeHtml(p.id)}" title="${escapeHtml(t('prov.endpointsBtnTitle'))}">${escapeHtml(t('prov.endpointsBtn'))}</button>
             ${rowActions(p)}
           </td>
         </tr>
@@ -5210,13 +6171,13 @@
       let urlCell;
       if (kind === 'router') {
         const routes = p.routes || [];
-        protoCell = `<td class="cell-short"><span class="pill" title="route-based routing endpoint — forwards by route model_pattern (no base URL / API key of its own)">router</span></td>`;
+        protoCell = `<td class="cell-short"><span class="pill" title="${escapeHtml(t('prov.routerTip'))}">${escapeHtml(t('prov.router'))}</span></td>`;
         urlCell = routerRoutesCell(routes);
       } else if (kind === 'pool') {
         // disabled pool: 纯配置展示 (ProviderMasked 无运行时数据 — 不转发的条目
         // 无状态可观察), 成员以 "→" 串联表达 failover 序.
         const members = p.members || [];
-        protoCell = `<td class="cell-short"><span class="pill" title="${POOL_PILL_TIP}">pool</span></td>`;
+        protoCell = `<td class="cell-short"><span class="pill" title="${escapeHtml(POOL_PILL_TIP())}">${escapeHtml(t('prov.pool'))}</span></td>`;
         urlCell = `<td class="cell-long" title="${escapeHtml(members.join(' → '))}"><span class="cell-ellipsis"><code>${escapeHtml(members.join(' → '))}</code></span></td>`;
       } else {
         // direct 同有效行 (directProviderCells 共用).
@@ -5228,7 +6189,7 @@
           <td title="${escapeHtml(p.name || '')}"><span class="cell-ellipsis">${escapeHtml(p.name || '')}</span></td>
           ${protoCell}
           ${urlCell}
-          <td class="cell-long" title="${escapeHtml(p.api_key_masked || '')}"><span class="cell-ellipsis"><code>${escapeHtml(p.api_key_masked || '(none)')}</code></span></td>
+          <td class="cell-long" title="${escapeHtml(p.api_key_masked || '')}"><span class="cell-ellipsis"><code>${escapeHtml(p.api_key_masked || t('common.none'))}</code></span></td>
           <td class="cell-short">${p.enabled ? '✓' : '<span class="status-err">✗</span>'}</td>
           <td>${srcBadge('static')}</td>
           <td>${decisionCell('provider', p.id, 'disabled', true)}</td>
@@ -5266,7 +6227,7 @@
       if (!value) return;
       if (![...sel.options].some(o => o.value === value)) {
         const label = sel.options.length
-          ? `${escapeHtml(value)} (experimental)` : escapeHtml(value);
+          ? escapeHtml(t('providers.experimental', { proto: value })) : escapeHtml(value);
         sel.insertAdjacentHTML('beforeend', `<option value="${escapeHtml(value)}">${label}</option>`);
       }
       sel.value = value;
@@ -5286,10 +6247,10 @@
       document.getElementById('f-value').value = ''; // 强制重输, 避免泄露.
       // Mock strategy: 加载 existing 或默认值.
       loadMockStrategyIntoForm(existing?.mock_strategy);
-      title.textContent = existing ? `Edit secret ${existing.id}` : 'New secret';
+      title.textContent = existing ? t('form.secret.editTitle', { id: existing.id }) : t('form.secret.newTitle');
       toggleOverrideBanner(dlg, existing);
       dlg.dataset.editId = existing ? existing.id : '';
-      saveBtn.textContent = existing ? 'Update' : 'Create';
+      saveBtn.textContent = existing ? t('common.update') : t('common.create');
       dlg.showModal();
     }
 
@@ -5388,7 +6349,7 @@
       if (inferBtn) {
         inferBtn.addEventListener('click', () => {
           const value = document.getElementById('f-value').value;
-          if (!value) { alert('Please fill in the real value first.'); return; }
+          if (!value) { alert(t('alert.valueRequired')); return; }
           const cs = inferCharsetFromValue(value);
           document.querySelectorAll('input.f-ms-charset').forEach(cb => {
             cb.checked = !!cs[cb.dataset.charclass];
@@ -5418,7 +6379,7 @@
           if (cs.underscore) pool.push('_');
           if (cs.hyphen) pool.push('-');
           pool.push(...cs.other);
-          if (pool.length === 0) { alert('Charset is empty. Enable at least one character class.'); return; }
+          if (pool.length === 0) { alert(t('alert.charsetEmpty')); return; }
           // 用 Math.random 生成候选 (前端只需一个示例, 不需确定).
           const bodyLen = lenmin + Math.floor(Math.random() * (lenmax - lenmin + 1));
           let body = '';
@@ -5494,9 +6455,7 @@
           const url = `${origin}/${short}/${encodeURIComponent(p.id)}/`;
           return directEndpointRow(e, short, url, p.id);
         }).join('');
-        tailHint = 'Each configured endpoint serves its own protocol via byte-exact passthrough. '
-          + 'Ingress protocols without a configured endpoint fall back to the first endpoint '
-          + '(cross-protocol translation, codec-covered pairs only).';
+        tailHint = t('prov.directTailHint');
       } else {
         // router/pool 条目: 保持 5 协议入口矩阵 (链尾端点集合近似, ingressMode 按
         // D2 fallback 判定 per-ingress 模式).
@@ -5512,9 +6471,9 @@
       // 主题行: provider id (code chip 强调) + name 去重 + egress 摘要 (链尾端点
       // 集合的协议并集 — 集合文案见 protocolSetLabel, 空集 → '?').
       subject.innerHTML =
-        `<span>Provider</span><code>${escapeHtml(p.id)}</code>` +
+        `<span>${escapeHtml(t('prov.subjectProvider'))}</span><code>${escapeHtml(p.id)}</code>` +
         (p.name && p.name !== p.id ? `<span>· ${escapeHtml(p.name)}</span>` : '') +
-        `<span>· egress</span><code>${escapeHtml(protocolSetLabel(endpointProtocols(tail)))}</code>`;
+        `<span>· ${escapeHtml(t('prov.subjectEgress'))}</span><code>${escapeHtml(protocolSetLabel(endpointProtocols(tail)))}</code>`;
       body.innerHTML = rowsHtml
         + (tailHint ? `<div class="hint" style="margin-top: 8px;">${tailHint}</div>` : '');
       dlg.showModal();
@@ -5529,12 +6488,12 @@
         const r = await fetch(`${API_PROVIDERS}/${encodeURIComponent(id)}/pool-reset`, { method: 'POST' });
         if (!r.ok) {
           const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
-          alert('Pool reset failed: ' + (err.error || r.status));
+          alert(t('alert.poolResetFailed', { msg: err.error || r.status }));
           return;
         }
         await refreshProviders();
       } catch (e) {
-        alert('Error: ' + e.message);
+        alert(t('common.alertError', { msg: e.message }));
       }
     }
 
@@ -5546,21 +6505,19 @@
     // M2 走查的 Responses 非流式例外已随其流式 writer 落地移除).
     function endpointRow(proto, short, mode, url, providerId) {
       const label = escapeHtml(proto);
-      const translateTip =
-        'Cross-protocol translation (streaming included) — reasoning_content is dropped, except Responses egress streaming keeps it (as reasoning summary events)';
       const badge = {
-        direct:      '<span class="badge badge-stream">direct</span>',
-        translate:   `<span class="badge badge-warn" title="${translateTip}">translate</span>`,
-        unsupported: '<span class="badge badge-inactive">n/a</span>',
+        direct:      `<span class="badge badge-stream">${escapeHtml(t('prov.direct'))}</span>`,
+        translate:   `<span class="badge badge-warn" title="${escapeHtml(t('prov.translateTip'))}">${escapeHtml(t('prov.translate'))}</span>`,
+        unsupported: `<span class="badge badge-inactive">${escapeHtml(t('prov.na'))}</span>`,
       }[mode];
       const modelsBtn = mode === 'unsupported'
         ? ''
         : `<button type="button" class="btn ep-models-btn" data-provider="${escapeHtml(providerId)}"
-             aria-expanded="false" title="Preview the model list this endpoint serves">Models</button>`;
+             aria-expanded="false" title="${escapeHtml(t('models.btnTitle'))}">${escapeHtml(t('models.btn'))}</button>`;
       const urlLine = mode === 'unsupported'
-        ? '<div class="ep-url unsupported">not supported</div>'
+        ? `<div class="ep-url unsupported">${escapeHtml(t('prov.notSupported'))}</div>`
         : `<div class="ep-url"><code>${escapeHtml(url)}</code>` +
-          `<button type="button" class="btn ep-copy" data-url="${escapeHtml(url)}" title="Copy endpoint URL">Copy</button></div>`;
+          `<button type="button" class="btn ep-copy" data-url="${escapeHtml(url)}" title="${escapeHtml(t('prov.copyUrlTitle'))}">${escapeHtml(t('common.copy'))}</button></div>`;
       return `<div class="ep-row${mode === 'unsupported' ? ' ep-row-unsupported' : ''}" data-short="${short}">
         <div class="ep-row-head"><span class="ep-proto">${label}</span><code class="ep-short">/${short}/</code>${badge}<span class="ep-gap"></span>${modelsBtn}</div>
         ${urlLine}
@@ -5576,11 +6533,11 @@
     // 惰性展开, dataset.loaded 缓存 per 行).
     function directEndpointRow(ep, short, url, providerId) {
       const modelsBtn = `<button type="button" class="btn ep-models-btn" data-provider="${escapeHtml(providerId)}"
-           aria-expanded="false" title="Preview the model list this provider serves (fetched via this provider's OpenAI-view endpoint)">Models</button>`;
+           aria-expanded="false" title="${escapeHtml(t('models.btnTitleDirect'))}">${escapeHtml(t('models.btn'))}</button>`;
       return `<div class="ep-row" data-short="${short}">
-        <div class="ep-row-head"><span class="ep-proto">${escapeHtml(ep.protocol)}</span><code class="ep-short">/${short}/</code><span class="badge badge-stream" title="same-protocol passthrough (byte-exact)">direct</span><span class="ep-gap"></span>${modelsBtn}</div>
-        <div class="ep-url"><code title="upstream base URL">${escapeHtml(ep.base_url)}</code><span class="ep-arrow" title="upstream ↤ local entry URL">↤</span><code title="local entry URL">${escapeHtml(url)}</code>` +
-        `<button type="button" class="btn ep-copy" data-url="${escapeHtml(url)}" title="Copy endpoint URL">Copy</button></div>
+        <div class="ep-row-head"><span class="ep-proto">${escapeHtml(ep.protocol)}</span><code class="ep-short">/${short}/</code><span class="badge badge-stream" title="${escapeHtml(t('prov.directTip'))}">${escapeHtml(t('prov.direct'))}</span><span class="ep-gap"></span>${modelsBtn}</div>
+        <div class="ep-url"><code title="${escapeHtml(t('prov.upstreamBaseUrl'))}">${escapeHtml(ep.base_url)}</code><span class="ep-arrow" title="${escapeHtml(t('prov.arrowTip'))}">↤</span><code title="${escapeHtml(t('prov.localEntryUrl'))}">${escapeHtml(url)}</code>` +
+        `<button type="button" class="btn ep-copy" data-url="${escapeHtml(url)}" title="${escapeHtml(t('prov.copyUrlTitle'))}">${escapeHtml(t('common.copy'))}</button></div>
         <div class="ep-models" hidden></div>
       </div>`;
     }
@@ -5592,8 +6549,8 @@
     // 定义, renderProbeResult / renderEndpointModels 两处调用.
     function modelsBlock(models, titleSuffix = '') {
       const chips = models.map(m =>
-        `<button type="button" class="probe-chip" data-model="${escapeHtml(m)}" title="Copy model name">${escapeHtml(m)}</button>`).join('');
-      return `<div class="probe-models"><div class="probe-models-title">Models (${models.length})${titleSuffix}</div>${chips}</div>`;
+        `<button type="button" class="probe-chip" data-model="${escapeHtml(m)}" title="${escapeHtml(t('models.copyTip'))}">${escapeHtml(m)}</button>`).join('');
+      return `<div class="probe-models"><div class="probe-models-title">${escapeHtml(t('models.title', { n: models.length }))}${titleSuffix}</div>${chips}</div>`;
     }
 
     // chip 点击复制的共享委托分支 (endpoints 弹窗与端点行探测结果区两处挂载):
@@ -5615,7 +6572,7 @@
       const copyBtn = ev.target.closest('.ep-copy');
       if (copyBtn) {
         copyWithFlash(copyBtn, copyBtn.dataset.url, 'copied', () => {
-          copyBtn.textContent = 'Copy';
+          copyBtn.textContent = t('common.copy');
           copyBtn.classList.remove('copied');
         });
         return;
@@ -5634,11 +6591,11 @@
       btn.setAttribute('aria-expanded', String(willShow));
       btn.classList.toggle('active', willShow);
       if (!willShow || panel.dataset.loaded === '1') return;
-      panel.innerHTML = '<div class="probe-line">Loading models…</div>';
+      panel.innerHTML = `<div class="probe-line">${escapeHtml(t('models.loading'))}</div>`;
       // encodeURIComponent 同 endpointRow: defense-in-depth (id 词表受限).
       const providerId = encodeURIComponent(btn.dataset.provider);
       const failLine = msg =>
-        `<div class="probe-line probe-line-err">${escapeHtml('Failed to load models: ' + msg)}</div>`;
+        `<div class="probe-line probe-line-err">${escapeHtml(t('models.failed', { msg }))}</div>`;
       try {
         const r = await fetch(`${API_PROVIDERS}/${providerId}/models`);
         if (!r.ok) {
@@ -5664,12 +6621,12 @@
       }
       const models = data.models || [];
       if (!models.length) {
-        panel.innerHTML = '<div class="probe-line">No models reported by this endpoint.</div>';
+        panel.innerHTML = `<div class="probe-line">${escapeHtml(t('models.none'))}</div>`;
         return;
       }
       const sourceLabel = data.source === 'router-synthesized'
-        ? 'synthesized from routes'
-        : `upstream: ${data.upstream_id || '?'}`;
+        ? t('models.synth')
+        : `${t('models.upstreamLabel')}: ${data.upstream_id || '?'}`;
       panel.innerHTML = modelsBlock(models, ` · ${escapeHtml(sourceLabel)}`);
     }
 
@@ -5689,9 +6646,9 @@
       const kindSel = document.getElementById('p-kind');
       const kindHint = document.getElementById('p-kind-hint');
       const KIND_HINTS = {
-        direct: 'Forwards directly to a real LLM endpoint (one endpoint per protocol, shared API key).',
-        router: 'Route-based routing endpoint — the request model is matched against route model_patterns; the highest-priority enabled match routes the request. No base URL / API key of its own.',
-        pool: 'Subscription pool — ordered members (direct providers); traffic goes to the first available member and fails over on window-quota exhaustion signals. No base URL / API key of its own.',
+        direct: t('providers.kindHint.direct'),
+        router: t('providers.kindHint.router'),
+        pool: t('providers.kindHint.pool'),
       };
       const syncKind = () => {
         const kind = kindSel.value;
@@ -5746,13 +6703,13 @@
       // 编辑模式下用 masked 旧值做 placeholder, 提示"留空将保留"; 创建模式保持原提示.
       // Router 旧值无 api_key_masked (构造上不存在) → (optional) 即 "需重新填写" 的提示.
       apiKeyInput.placeholder = existing?.api_key_masked
-        ? `unchanged (${existing.api_key_masked}) — leave blank to keep`
-        : '(optional for local providers like Ollama)';
+        ? t('providers.apiKeyKeep', { masked: existing.api_key_masked })
+        : t('providers.apiKeyPlaceholder');
       document.getElementById('p-enabled').checked = existing ? existing.enabled : true;
-      title.textContent = existing ? `Edit provider ${existing.id}` : 'New provider';
+      title.textContent = existing ? t('form.provider.editTitle', { id: existing.id }) : t('form.provider.newTitle');
       toggleOverrideBanner(dlg, existing);
       dlg.dataset.editId = existing ? existing.id : '';
-      saveBtn.textContent = existing ? 'Update' : 'Create';
+      saveBtn.textContent = existing ? t('common.update') : t('common.create');
       dlg.showModal();
     }
 
@@ -5770,12 +6727,12 @@
       const row = document.createElement('div');
       row.className = 'endpoint-row';
       row.innerHTML = `
-        <select class="ep-protocol" title="Protocol of this endpoint — auto-filled by Detect when it recognizes the base URL; adjust manually if needed"></select>
-        <input type="text" class="ep-base-url" placeholder="https://api.openai.com (no trailing /)">
+        <select class="ep-protocol" title="${escapeHtml(t('providers.epProtocolTitle'))}"></select>
+        <input type="text" class="ep-base-url" placeholder="${escapeHtml(t('providers.baseUrlPlaceholder'))}">
         <button type="button" class="common-uri-badge ep-common-uri-badge" hidden
-          title="Common URI detected by Detect — the prefix secret-guard prepends to its own model-list requests. Click to copy base URL + common URI as a whole. Editing the base URL clears this.">+/v1</button>
-        <button type="button" class="btn ep-detect" title="Probe this base URL to detect its protocol and list available models (does not save)">Detect</button>
-        <button type="button" class="btn ep-del" title="Remove endpoint">✕</button>
+          title="${escapeHtml(t('providers.commonUriTitle'))}">+/v1</button>
+        <button type="button" class="btn ep-detect" title="${escapeHtml(t('providers.detectTitle'))}">${escapeHtml(t('providers.detect'))}</button>
+        <button type="button" class="btn ep-del" title="${escapeHtml(t('providers.removeEndpoint'))}">✕</button>
         <div class="ep-probe-result"></div>`;
       fillEndpointProtocolOptions(row.querySelector('.ep-protocol'));
       if (ep) {
@@ -5803,7 +6760,7 @@
         return;
       }
       badge.hidden = false;
-      badge.textContent = cu === '' ? '✓ included' : `+${cu}`;
+      badge.textContent = cu === '' ? t('providers.commonUriIncluded') : `+${cu}`;
     }
 
     // 收集端点行 → Endpoint wire shape (提交用): common_uri null = 未探测 (fetch
@@ -5815,7 +6772,7 @@
     function collectEndpointsFromForm() {
       const rows = [...document.querySelectorAll('#p-endpoints-list .endpoint-row')];
       if (rows.length === 0) {
-        alert('At least one endpoint is required for a direct provider.');
+        alert(t('alert.noEndpoints'));
         return null;
       }
       const endpoints = [];
@@ -5825,15 +6782,15 @@
         const protocol = row.querySelector('.ep-protocol').value;
         const base_url = row.querySelector('.ep-base-url').value.trim();
         if (!protocol) {
-          alert(`Endpoint #${i + 1}: protocol is required.`);
+          alert(t('alert.endpointProtocolRequired', { n: i + 1 }));
           return null;
         }
         if (!base_url) {
-          alert(`Endpoint #${i + 1}: Base URL is required.`);
+          alert(t('alert.endpointUrlRequired', { n: i + 1 }));
           return null;
         }
         if (seen.has(protocol)) {
-          alert(`Endpoint #${i + 1}: duplicate protocol "${protocol}" — one endpoint per protocol (extra protocols would never match).`);
+          alert(t('alert.endpointDupProtocol', { n: i + 1, proto: protocol }));
           return null;
         }
         seen.add(protocol);
@@ -5889,21 +6846,21 @@
       const target = route.target || '';
       const candidates = state.providersList.filter(x => x.id !== editId);
       const missingOpt = target && !state.providersList.some(x => x.id === target)
-        ? `<option value="${escapeHtml(target)}">${escapeHtml(target)} (missing)</option>`
+        ? `<option value="${escapeHtml(target)}">${escapeHtml(target)} ${escapeHtml(t('providers.missing'))}</option>`
         : '';
       const row = document.createElement('div');
       row.className = 'route-row';
       row.innerHTML = `
-        <input type="checkbox" class="route-enabled" title="enabled — uncheck to keep this route without matching">
+        <input type="checkbox" class="route-enabled" title="${escapeHtml(t('providers.col.onTitle'))}">
         <input type="text" class="route-model-pattern" placeholder="gpt-*">
         <select class="route-target">
-          <option value="" ${target ? '' : 'selected'} disabled>(target)</option>
+          <option value="" ${target ? '' : 'selected'} disabled>${escapeHtml(t('providers.targetPlaceholder'))}</option>
           ${candidates.map(x => `<option value="${escapeHtml(x.id)}">${escapeHtml(x.id)}</option>`).join('')}
           ${missingOpt}
         </select>
-        <input type="text" class="route-upstream-model" placeholder="rewrite model (optional)">
+        <input type="text" class="route-upstream-model" placeholder="${escapeHtml(t('providers.upstreamModelPlaceholder'))}">
         <input type="number" class="route-priority" step="1" placeholder="0">
-        <button type="button" class="btn route-del" title="Remove route">✕</button>`;
+        <button type="button" class="btn route-del" title="${escapeHtml(t('providers.removeRoute'))}">✕</button>`;
       row.querySelector('.route-model-pattern').value = route.model_pattern || '';
       row.querySelector('.route-upstream-model').value = route.upstream_model || '';
       row.querySelector('.route-priority').value = route.priority ?? '';
@@ -5956,21 +6913,21 @@
       const tagOpt = memberId && !candidates.some(x => x.id === memberId)
         ? (() => {
             const known = state.providersList.some(x => x.id === memberId);
-            const tag = known ? '(not a direct provider)' : '(missing)';
-            return `<option value="${escapeHtml(memberId)}">${escapeHtml(memberId)} ${tag}</option>`;
+            const tag = known ? t('providers.notDirect') : t('providers.missing');
+            return `<option value="${escapeHtml(memberId)}">${escapeHtml(memberId)} ${escapeHtml(tag)}</option>`;
           })()
         : '';
       const row = document.createElement('div');
       row.className = 'member-row';
       row.innerHTML = `
         <select class="member-select">
-          <option value="" ${memberId ? '' : 'selected'} disabled>(member)</option>
+          <option value="" ${memberId ? '' : 'selected'} disabled>${escapeHtml(t('providers.memberPlaceholder'))}</option>
           ${candidates.map(x => `<option value="${escapeHtml(x.id)}">${escapeHtml(x.id)}</option>`).join('')}
           ${tagOpt}
         </select>
-        <button type="button" class="btn member-up" title="Move up (higher failover priority)">↑</button>
-        <button type="button" class="btn member-down" title="Move down">↓</button>
-        <button type="button" class="btn member-del" title="Remove member">✕</button>`;
+        <button type="button" class="btn member-up" title="${escapeHtml(t('providers.memberUpTitle'))}">↑</button>
+        <button type="button" class="btn member-down" title="${escapeHtml(t('providers.memberDownTitle'))}">↓</button>
+        <button type="button" class="btn member-del" title="${escapeHtml(t('providers.removeMember'))}">✕</button>`;
       if (memberId) row.querySelector('.member-select').value = memberId;
       document.getElementById('p-members-list').appendChild(row);
     }
@@ -6016,7 +6973,7 @@
       for (const tok of document.getElementById('p-exh-statuses').value.split(/[\s,]+/).filter(Boolean)) {
         const n = Number(tok);
         if (!Number.isInteger(n) || n < 100 || n > 599) {
-          return { ok: false, error: `Invalid HTTP status "${tok}" — use integers in 100..599, comma-separated.` };
+          return { ok: false, error: t('alert.invalidStatus', { tok }) };
         }
         statuses.push(n);
       }
@@ -6024,7 +6981,7 @@
       const cooldownRaw = document.getElementById('p-cooldown').value.trim();
       const cooldown = cooldownRaw === '' ? 60 : Number(cooldownRaw);
       if (!Number.isInteger(cooldown) || cooldown < 0) {
-        return { ok: false, error: 'Cooldown must be a non-negative integer (seconds).' };
+        return { ok: false, error: t('alert.invalidCooldown') };
       }
       return { ok: true, exhaust: { statuses, codes: lines('p-exh-codes'), headers: lines('p-exh-headers') }, cooldown_secs: cooldown };
     }
@@ -6046,12 +7003,12 @@
     // 失败 fallback 提示 (同 copyRevealedApiKey 惯例).
     function copyWithFlash(el, text, flashClass, restore) {
       navigator.clipboard.writeText(text).then(() => {
-        el.textContent = '✓ copied';
+        el.textContent = t('common.copied');
         if (flashClass) el.classList.add(flashClass);
         clearTimeout(el._copyTimer);
         el._copyTimer = setTimeout(restore, 900);
       }).catch(() => {
-        alert('Copy failed — select the text manually.');
+        alert(t('common.copyFailed'));
       });
     }
 
@@ -6059,7 +7016,7 @@
       const resultEl = row.querySelector('.ep-probe-result');
       const baseUrl = row.querySelector('.ep-base-url').value.trim();
       if (!baseUrl) {
-        resultEl.innerHTML = '<div class="probe-line">Enter a base URL first</div>';
+        resultEl.innerHTML = `<div class="probe-line">${escapeHtml(t('probe.enterUrl'))}</div>`;
         return;
       }
       const btn = row.querySelector('.ep-detect');
@@ -6079,7 +7036,7 @@
         .flat().find(x => x.id === editId)?.api_key_masked;
       const keylessHint = editId && apiKey === '' && !!savedKeyMasked;
       btn.disabled = true;
-      btn.textContent = 'Detecting…';
+      btn.textContent = t('providers.detecting');
       resultEl.innerHTML = '';
       // 发起时捕获 baseUrl — 落地对账除 epoch 外再对账它: 在途期间用户改了该行
       // base_url (input listener 已作废暂存) 时, 旧响应的 common_uri 不得写入
@@ -6108,14 +7065,14 @@
         // select) 与暂存 (common_uri) 共用同一对账谓词 — 世界已换 / 行已删 /
         // base_url 已改 的在途旧响应一概不落地 (展示层宽松语义见 renderProbeResult
         // 注释, 同 setEndpointProtocolValue 的在途改写先例).
-        if (landed()) {
-          renderProbeResult(data, row);
-          syncEndpointCommonUriBadge(row);
-          if (keylessHint) {
-            resultEl.insertAdjacentHTML('beforeend',
-              '<div class="hint">Probed without an API key — the saved key is not reused; auth_failed may just mean the probe carried no key.</div>');
+          if (landed()) {
+            renderProbeResult(data, row);
+            syncEndpointCommonUriBadge(row);
+            if (keylessHint) {
+              resultEl.insertAdjacentHTML('beforeend',
+                `<div class="hint">${escapeHtml(t('probe.keylessHint'))}</div>`);
+            }
           }
-        }
       } catch (e) {
         if (landed()) renderProbeError(e.message, resultEl);
       } finally {
@@ -6123,7 +7080,7 @@
         // 时该行属于旧世界, 旧 finally 不得解除新世界按钮的禁用.
         if (epoch === state.probeEpoch && row.isConnected) {
           btn.disabled = false;
-          btn.textContent = 'Detect';
+          btn.textContent = t('providers.detect');
         }
       }
     }
@@ -6131,7 +7088,7 @@
     // 网络失败 / 非 200 → 结果区单行错误 (不弹窗打断表单填写).
     function renderProbeError(msg, resultEl) {
       resultEl.innerHTML =
-        `<div class="probe-line probe-line-err">${escapeHtml(`Probe failed: ${msg}`)}</div>`;
+        `<div class="probe-line probe-line-err">${escapeHtml(t('probe.failed', { msg }))}</div>`;
     }
 
     // 渲染探测结果 (落点均 per 行: 结果区 / recommended 改写该行 select /
@@ -6157,20 +7114,20 @@
         // recommended 可能是透传族 (gemini/ollama, probe 对这两族也有探测端点) —
         // append "(experimental)" 选项后选中 (仍属建议非命令, 用户可手改).
         setEndpointProtocolValue(row, data.recommended);
-        parts.push(`<div class="probe-line probe-line-ok">Detected: <code>${escapeHtml(data.recommended)}</code></div>`);
+        parts.push(`<div class="probe-line probe-line-ok">${escapeHtml(t('probe.detected'))}: <code>${escapeHtml(data.recommended)}</code></div>`);
         // 胜出族的探测 URL 回显 (确认 detect 结果时, 用户能看到命中了哪条路).
         pushUrls(probes.find(pr => pr.protocol === data.recommended && pr.status === 'ok'));
       } else {
         // 无推荐: 逐行列出各 probe (基类 + 状态色: ok 行弱化, 失败行错误色调) +
         // 每族全部探测 URL (不黑盒) + 引导 hint (对照文档端点调整 base_url).
-        if (probes.length === 0) parts.push('<div class="probe-line probe-line-err">No probes returned</div>');
+        if (probes.length === 0) parts.push(`<div class="probe-line probe-line-err">${escapeHtml(t('probe.noProbes'))}</div>`);
         for (const pr of probes) {
           const cls = pr.status === 'ok' ? 'probe-line' : 'probe-line probe-line-err';
           const detail = pr.detail ? ` — ${pr.detail}` : '';
           parts.push(`<div class="${cls}">${escapeHtml(`${pr.protocol} — ${pr.status}${detail}`)}</div>`);
           pushUrls(pr);
         }
-        parts.push('<div class="hint">No endpoint recognized — compare the GET URLs above with your provider\'s documented models endpoint; its base URL prefix layout may differ.</div>');
+        parts.push(`<div class="hint">${escapeHtml(t('probe.noEndpointHint'))}</div>`);
       }
       if (data.note) parts.push(`<div class="hint">${escapeHtml(data.note)}</div>`);
       // 模型预览来源: recommended 对应 probe; recommended 为 null 时退到首个 ok probe.
@@ -6187,7 +7144,7 @@
     function toggleOverrideBanner(dlg, existing) {
       const banner = dlg.querySelector('.banner');
       if (existing && existing.source === 'static') {
-        banner.textContent = `This id is declared statically. Saving will create a dynamic override; the static baseline is preserved.`;
+        banner.textContent = t('banner.staticOverride');
         banner.style.display = 'block';
       } else {
         banner.style.display = 'none';
@@ -6221,13 +7178,13 @@
           });
           if (!r.ok) {
             const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
-            alert('Failed: ' + (err.error || r.status));
+            alert(t('common.alertFailed', { msg: err.error || r.status }));
             return;
           }
           await cfg.refresh();
           dlg.close();
         } catch (e) {
-          alert('Error: ' + e.message);
+          alert(t('common.alertError', { msg: e.message }));
         }
       });
     }
@@ -6271,16 +7228,16 @@
         const routes = collectRoutesFromForm();
         // 构造内必填前置拦截 (避免用户填完整个表单才收到后端 400).
         if (routes.length === 0) {
-          alert('At least one route is required for a router provider.');
+          alert(t('alert.noRoutes'));
           return null;
         }
         for (let i = 0; i < routes.length; i++) {
           if (!routes[i].model_pattern) {
-            alert(`Route #${i + 1}: model_pattern is required (e.g. gpt-*).`);
+            alert(t('alert.routePatternRequired', { n: i + 1 }));
             return null;
           }
           if (!routes[i].target) {
-            alert(`Route #${i + 1}: route target is required (pick a provider, or create one first).`);
+            alert(t('alert.routeTargetRequired', { n: i + 1 }));
             return null;
           }
         }
@@ -6289,12 +7246,12 @@
       if (formKind === 'pool') {
         const members = collectMembersFromForm();
         if (members.length === 0) {
-          alert('At least one member is required for a pool provider.');
+          alert(t('alert.noMembers'));
           return null;
         }
         for (let i = 0; i < members.length; i++) {
           if (!members[i]) {
-            alert(`Member #${i + 1}: pick a direct provider (or create one first).`);
+            alert(t('alert.memberRequired', { n: i + 1 }));
             return null;
           }
         }
@@ -6346,18 +7303,18 @@
         });
         if (!r.ok) {
           const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
-          alert('Decision update failed: ' + (err.error || r.status));
+          alert(t('decision.updateFailed', { msg: err.error || r.status }));
           rollbackSelect();
         } else {
           // 后端在 mode=disabled + secret 时返回 warning 字段 (#161). UI 正常路径已有
           // 前置 confirm (warnedInline), 这里兜底展示 (脚本绕过 UI / 其他调用方).
           const ack = await r.json().catch(() => null);
-          if (ack?.warning && !warnedInline) alert(`Warning for ${id}: ${ack.warning}`);
+          if (ack?.warning && !warnedInline) alert(t('decision.warningFor', { id, msg: ack.warning }));
         }
         // 无论成败都刷新: 成功则更新视图, 失败则回滚下拉.
         await cfg.refresh();
       } catch (e) {
-        alert('Error: ' + e.message);
+        alert(t('common.alertError', { msg: e.message }));
         rollbackSelect();
         await cfg.refresh().catch(() => {});
       }
@@ -6532,7 +7489,8 @@
     (async function initAuditCapture() {
       const sel = document.getElementById('audit-capture');
       if (!sel) return;
-      const MODE_LABEL = { off: '关闭', errors: '仅错误', full: '全部' };
+      const AUDIT_MODES = ['off', 'errors', 'full'];
+      const auditModeLabel = m => (AUDIT_MODES.includes(m) ? t(`audit.mode.${m}`) : m);
       // 服务端档位的最后已知值: GET/PUT ack 时更新, PUT 失败时回滚到它.
       // (不能用 option.defaultSelected — markup 无 selected attribute, 恒 undefined.)
       let lastKnown = 'off';
@@ -6544,7 +7502,7 @@
         const r = await fetch(API_SETTINGS, { cache: 'no-store' });
         if (r.ok) {
           const m = (await r.json()).audit_capture;
-          if (MODE_LABEL[m]) { sel.value = m; lastKnown = m; }
+          if (AUDIT_MODES.includes(m)) { sel.value = m; lastKnown = m; }
         }
       } catch (e) {
         console.error('audit-capture init failed:', e);
@@ -6562,11 +7520,11 @@
           const ack = await r.json();
           sel.value = ack.audit_capture;
           lastKnown = ack.audit_capture;
-          setStatus('详细日志: ' + (MODE_LABEL[ack.audit_capture] || ack.audit_capture));
+          setStatus(t('audit.modeLabel', { mode: auditModeLabel(ack.audit_capture) }));
         } catch (e) {
           // 回滚到服务端最后已知值 (PUT 失败 = 服务端内存未变, 见类型文档)
           sel.value = lastKnown;
-          setStatus('详细日志切换失败', 'status-err');
+          setStatus(t('audit.modeSetFailed'), 'status-err');
           console.error('audit-capture toggle failed:', e);
         } finally {
           sel.disabled = false;

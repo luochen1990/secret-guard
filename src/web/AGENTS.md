@@ -548,3 +548,39 @@ accent 色条); 徽标分两类 — 计数/未读等可扫读徽标用实心 acc
 - **语义层 vs 调色板层**: 组件只引用语义变量 (`--fg/--fg-muted/--fg-faint/--panel/--border/--accent` 等), 不直接引用色相名. 改色相只动 `:root`, 调对比度只动语义映射.
 - **对比度**: `--fg` / `--fg-muted` 在对应底色上达 WCAG AA (≥4.5:1); `--fg-faint` 用于 placeholder / disabled / 占位提示 (非阅读重点, 可低于 AA).
 - **JS inline-style 例外**: `PROVIDER_PALETTE` 拼进 `style` 属性, 无法用 CSS var 跟随主题, 故 JS 端用单个 2D 数组 `[{light, dark}, ...]` (成对结构防亮/暗漂移), 由 `currentColorScheme()` (读 `data-effective-theme`) 选对应半边. 主题切换时主脚本注册的 `window.__onThemeChange` 回调失效 sidebar fingerprint 后直接 `renderSidebar()` 重画 (因 renderSidebar 的 fingerprint 不含主题, 不失效会短路 → icon 不更新).
+
+### i18n (en/zh 双语, #298)
+
+> 读者 scope: 任何往 `index.html` 添加/修改**用户可见文案**的人 (静态 HTML 文本 /
+> title·placeholder·aria-label / JS 中的 status 提示 / alert·confirm / 动态模板
+> 字符串)。只改逻辑不动文案可跳过本节。
+
+- **字典 SSOT**: 主脚本顶部 `const I18N = { en: {...}, zh: {...} }`, key = 稳定语义
+  ID (点分命名空间, 按 UI 区域分组: `header.*` / `sidebar.*` / `timeline.*` /
+  `prov.*` / `usage.*` ...)。**新增文案必须在 en 和 zh 两边同时加 key** — 缺 zh
+  会静默回退 en, 缺 en 运行时 console.warn 并显示 key 本身。
+- **取词**: `t(key, params)` — `{name}` 插值; 当前语言缺 key 回退 en。**en 词条 =
+  既有英文文案逐字保留** (历史契约, 改 en 文案 = 改产品文案, 需同步测试断言)。
+- **静态 HTML**: 用属性标注, `applyI18nStaticTexts()` 一次性应用 (语言切换时重放):
+  `data-i18n` (textContent) / `data-i18n-html` (innerHTML, **仅**字典作者可控的
+  富文本 hint — 含 `<code>` 的段落; 禁止把用户数据拼进此类 key 的参数) /
+  `data-i18n-title` / `data-i18n-placeholder` / `data-i18n-aria-label`。label 内
+  混排控件时文本节点须包 `<span data-i18n>` (直接挂 label 会 textContent 抹掉
+  内嵌 select/input)。
+- **动态字符串**: JS 模板/alert/confirm 一律 `t()`。进 HTML 上下文的插值参数由
+  **调用方**先 `escapeHtml` (如 `t('timeline.loadFailed', { msg: escapeHtml(e) })`)。
+- **语言选择**: 三态偏好 `auto|en|zh` 持久化 `localStorage['sg-lang']` (默认 auto =
+  跟随浏览器, `navigator.language` 小写前缀 `zh` → zh)。页头 `#lang-switch` 切换,
+  **即时生效**: 重放静态标注 + `rerenderDynamicForLang()` 重渲染动态区域 — sidebar /
+  表格走指纹/renderedHtml 差异重画; **timeline 清空 `#detail` 后全量重建** (keyed
+  reconciliation 的复用分支不重绘已有轮次, 只失效 fingerprint 会让轮内文案残留旧
+  语言, review M1); usage 置节流后重拉。
+- **刻意不翻译** (两语言同形, 勿"补全"): 品牌 "Secret Guard" / 协议·模型·id 等用户
+  数据 / 与 toml 配置字段一一对应的技术标签 (`model_pattern`, `prio`, `auto`,
+  `fixed`, `prefix="..."`, raw 按钮字样) / 纯符号 (↓ ✓ ERR Σ —) / `mockStrategyTooltip`
+  的 gen-spec 摘要。判据: 译出后与配置字段失去对应 = 不译。
+- **局部变量命名红线**: `t` 是全局取词函数 — 新代码**禁止**用 `t` 作局部变量名
+  (历史代码中的 `const t = state.tail` 等已在 #298 全部改名 tail/totals)。
+- 回归守卫: `tests/webui/im-ui.spec.ts` "i18n" describe (默认 en 渲染 / 切换即时
+  生效 / 刷新持久化 / 已渲染轮次文案跟随)。Playwright 默认 locale en-US — 断言英文
+  文案; 需要 zh 行为的测试须显式操作 `#lang-switch`。
