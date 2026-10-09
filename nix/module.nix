@@ -83,6 +83,18 @@ let
   # 结构化选项是否被使用 (任一非默认).
   structuredUsed = cfg.providers != { } || cfg.secrets.entries != [ ] || authUsed || usageUsed;
 
+  # socket activation (#242 建议②) 是否整体生效 (服务启用且开关打开).
+  socketActivated = cfg.enable && cfg.socketActivation.enable;
+
+  # ListenStream 地址: host 为 IPv6 字面量 (含冒号) 时按 systemd ListenStream 语法
+  # 包 [] — 裸 IPv6 的冒号会被 systemd 解析为 host:port 分隔歧义; hostname 与
+  # IPv4 字面量不含冒号, 直拼.
+  listenStreamAddr =
+    if lib.hasInfix ":" cfg.host then
+      "[${cfg.host}]:${toString cfg.port}"
+    else
+      "${cfg.host}:${toString cfg.port}";
+
   # render 的 auth 入参: auth 全默认时传 null (跳过 [auth] 段), 否则传完整结构
   # (选项 enable → toml enabled 的命名映射在此完成).
   authArg =
@@ -219,6 +231,24 @@ in
       type = lib.types.bool;
       default = false;
       description = "是否在防火墙开放端口 (仅 host != 127.0.0.1 时有意义).";
+    };
+
+    socketActivation = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          systemd socket activation (#242 建议②, 默认关闭): 由 systemd 持有监听
+          socket (同名 `secret-guard.socket` unit, ListenStream = host:port),
+          服务经 LISTEN_FDS 从 fd 接管端口. 收益: 服务重启 (nixos-rebuild switch)
+          期间新连接在 socket backlog 排队而非被 RST — 停机窗口不再受
+          "消费方最小重试窗口" 约束, `TimeoutStopSec` 也可放心调长让 in-flight
+          LLM 流跑完再退 (默认 15s 是无 socket activation 时的妥协, 开启后可
+          覆写更长). service 侧自动接线 requires/after socket unit; 上游 Rust
+          侧检测环境变量自动接管, 无环境变量的常规部署行为零变化 (fail-open).
+          详见 docs/deployment-nixos.md "socket activation" 段.
+        '';
+      };
     };
 
     # 上游超时四项: 合理取值随部署网络环境差异大 (本地 ollama vs 公网高延迟
@@ -631,7 +661,13 @@ in
     systemd.services.secret-guard = lib.mkIf cfg.enable {
       description = "secret-guard: lightweight LLM gateway that prevents secret leakage";
       wantedBy = [ "multi-user.target" ];
-      after = [ "network.target" ];
+      # socket activation (#242 建议②): requires+after socket unit — 保证 service
+      # 启动时 socket unit 已持有端口, systemd 对同名 active socket 自动注入
+      # LISTEN_FDS 供服务接管 (服务自身不 bind, 无端口冲突). 保留
+      # wantedBy multi-user.target: 开机即启动 (不 lazy start) — socket activation
+      # 的收益集中在 restart 窗口的 backlog 缓冲; 需要 lazy start 可自行覆写.
+      after = [ "network.target" ] ++ lib.optionals socketActivated [ "secret-guard.socket" ];
+      requires = lib.optionals socketActivated [ "secret-guard.socket" ];
 
       serviceConfig = {
         ExecStart = lib.concatStringsSep " " [
@@ -692,6 +728,16 @@ in
         CapabilityBoundingSet = "";
         AmbientCapabilities = "";
       };
+    };
+
+    # socket activation (#242 建议②): systemd 持有监听 socket, 服务重启期间新连接
+    # 进 backlog 排队而非被 RST (停机窗口语义与 TimeoutStopSec 的配合见
+    # docs/deployment-nixos.md "socket activation" 段). socket unit 与 service 同名
+    # (secret-guard.socket ↔ secret-guard.service) — systemd 自动关联传 fd.
+    systemd.sockets.secret-guard = lib.mkIf socketActivated {
+      description = "secret-guard socket (socket activation, #242)";
+      wantedBy = [ "sockets.target" ];
+      listenStreams = [ listenStreamAddr ];
     };
 
     networking.firewall.allowedTCPPorts = lib.mkIf (cfg.enable && cfg.openFirewall) [ cfg.port ];

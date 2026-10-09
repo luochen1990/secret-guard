@@ -140,6 +140,37 @@ services.secret-guard.configFile = (pkgs.writeText "secret-guard.toml" ''
 **不推荐**: `sops.templates` 渲染整个 toml 把 api_key 嵌入明文 — toml 无法进 nix
 store, 调试不便, 与 nixos 生态主流模式 (hermes-agent / bazarr) 不一致.
 
+## socket activation: 停机窗口与平滑重启 (#242)
+
+**何时用**: 部署机上频繁 `nixos-rebuild switch` (comin 等) 重启 secret-guard, 且
+重启期间不希望消费方 (opencode 等 agent 工具) 的在途请求被 RST 掉。
+
+**默认行为 (不开启)**: 服务自行 bind 端口, 重启窗口 = stop 时间 + start 时间,
+期间新连接直接被内核 RST。停机窗口由 `TimeoutStopSec = 15s` (module 默认,
+`mkDefault` 可覆写) 封顶 — SIGTERM 后 graceful shutdown 等 in-flight LLM 流
+排空, 15s 到点 SIGKILL, 停机窗口稳居消费方最小重试窗口 (~66s) 内。
+
+**开启后语义变化**: systemd 持有监听 socket (同名 `secret-guard.socket` unit),
+服务经 `LISTEN_FDS` 从 fd 接管端口。服务重启期间新连接在 socket backlog **排队**
+而非被 RST — 服务起来后照常 accept。由此:
+
+- 停机窗口不再受 "消费方最小重试窗口" 约束 (新连接不失败, 排队窗口 ≈ 服务恢复
+  时长 — 含 drain 期, 调长 `TimeoutStopSec` 时排队也随之变长; backlog 上限默认
+  128, 满后内核丢 SYN 走客户端重传, 需更大可经 socket unit `Backlog=` 调整);
+- `TimeoutStopSec` 可放心调长, 让 in-flight LLM 流跑完再退 (客户端无感):
+
+```nix
+services.secret-guard.socketActivation.enable = true;
+# 可选: drain 上限放宽 (默认 15s 是无 socket activation 时的妥协)
+systemd.services.secret-guard.serviceConfig.TimeoutStopSec = "300s";
+```
+
+接线细节: socket unit 的 `ListenStream` 自动由 `host`/`port` 选项联动 (IPv6
+字面量按 systemd 语法包 `[]`); service 自动 `requires`/`after` socket unit,
+且保持开机即启动 (不 lazy start — 收益集中在 restart 窗口的 backlog 缓冲)。
+上游 Rust 侧检测 `LISTEN_PID`/`LISTEN_FDS` 环境变量自动接管, 无环境变量的
+常规部署 (含手动 `cargo run`) 行为零变化 (fail-open)。
+
 ## HTTPS 反向代理: session cookie 的 Secure flag
 
 `secret-guard` 的 session cookie Secure flag 由 `[auth] secure_cookie` 控制, **默认

@@ -375,6 +375,7 @@ Pool 不进此本地终结分支 (Router 专属) — pool 入口的 /models 经 
 | `secrets.rs` | SecretEntry 实体 + Effective view + value 两来源 | 文件头部 `//!` |
 | `server.rs` | router 装配 + 双层状态注入 + graceful shutdown + Host/Origin guard 最外层挂载 | 文件头部 `//!` |
 | `server_host_guard.rs` | Host 白名单 + Origin/Sec-Fetch-Site 校验 middleware (SEC-7: 防 DNS rebinding + CSRF 纵深; 白名单语义见文件头) | 文件头部 `//!` |
+| `socket_activation.rs` | systemd socket activation 的 LISTEN_FDS 接管 (#242 建议②: 手写最小协议, fail-open 回退正常 bind) | 文件头部 `//!` |
 | `state.rs` | 进程级共享状态 `AppState` (原 ProxyState, 上移见 #145) + HTTP 共享常量 `NO_STORE` | 文件头部 `//!` |
 | `usage/` (模块目录: mod/store/pricing/summary) | 模型用量统计 + redact 审计: 上游回显 usage 采集 (UsageCtx, rounds 三态 + status 原始码) + SQLite 持久化 (writer 线程批量事务) + SQL 聚合 (hour 粒度) + models.dev 定价 + summary 派生 (设计 `docs/design/usage-stats.md`, 契约 USAGE-*) | `src/usage/mod.rs` 头部 `//!` |
 | `util.rs` | 集中的哈希工具 + 文件权限收紧 (SEC-8) + 字符串截断族 (char boundary 安全, ROB-1) | 文件头部 `//!` |

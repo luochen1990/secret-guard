@@ -40,6 +40,12 @@
 //! 已建立的连接会等到完成或超时. 信号到达时先置 shutdown flag (watch channel,
 //! 见 [`serve`] 装配) 唤醒 `/api/events` 等无限长流, 否则它们会让 drain 挂起.
 //!
+//! # Socket activation (可选, #242 建议②)
+//! systemd 环境传入 `LISTEN_FDS` 时, [`serve`] 从 fd 3 接管 systemd 持有的
+//! listener 替代自行 bind (服务重启期间新连接在 socket backlog 排队而非被
+//! RST). 协议实现与 fail-open 语义见 [`crate::socket_activation`]; 未激活
+//! (无环境变量) 的常规部署行为零变化.
+//!
 //! # 双层状态装配
 //! [`serve`] 接收 static + dynamic 两份配置, 在内部:
 //! 1. 共享一把 `persist_lock` 给 ProviderTable / SecretTable / ApiKeyStore
@@ -485,13 +491,43 @@ pub async fn serve(
     let addr: SocketAddr = format!("{host}:{port}")
         .parse()
         .with_context(|| format!("invalid listen address {host}:{port}"))?;
-    let listener = bind_listener(addr).await?;
-    // 实际监听 port (bind 后取 — 配置 port=0 时 OS 分配临时端口, 配置值不可用):
-    // 供 SEC-7 Host guard 白名单与 OIDC redirect_url 派生共用.
-    let listen_port = listener
-        .local_addr()
-        .expect("bound listener has addr")
-        .port();
+    // listener 来源二选一 (#242 建议②): systemd socket activation 传入的 listener
+    // (服务重启期间 systemd 持有端口, 新连接进 backlog 排队而非被 RST — 详见
+    // `crate::socket_activation` 头部) 优先接管; 未激活时正常 bind (fail-open,
+    // 无环境变量的常规部署行为零变化).
+    let listener = match crate::socket_activation::take_systemd_listener() {
+        Some((std_listener, laddr)) => {
+            // 配置漂移 WARN (SEC-6 纵深): port 不等, 或配置 host 为 IP 字面量且与
+            // 实际监听 IP 不等 (如 socket unit ListenStream 省略 host 时 systemd 绑
+            // 通配地址, 意外暴露 LAN — "配置意图 vs 实际" 需显式对照才能发现);
+            // hostname 形态不比较 (解析语义超出此处职责).
+            if laddr.port() != port
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip != laddr.ip())
+            {
+                tracing::warn!(
+                    configured = format!("{host}:{port}"),
+                    actual = %laddr,
+                    "socket activation: listener addr differs from configured; using actual listener (ListenStream drift?)"
+                );
+            }
+            info!(
+                addr = %laddr,
+                "socket activation: using systemd-passed listener (#242)"
+            );
+            TcpListener::from_std(std_listener).with_context(|| {
+                format!("failed to register systemd listener {laddr} with tokio")
+            })?
+        }
+        None => bind_listener(addr).await?,
+    };
+    // 实际监听 addr (bind 后取 — 配置 port=0 时 OS 分配临时端口, 配置值不可用;
+    // socket activation 时为 systemd 传入 listener 的实际 addr): shadow 配置推导
+    // 值, 让下方 listening 日志与 Host guard / OIDC redirect 派生 (listen_port)
+    // 共用同一事实源.
+    let addr = listener.local_addr().expect("bound listener has addr");
+    let listen_port = addr.port();
     let host_guard = HostGuard::new(host, listen_port).allow_domains(&allowed_domains);
 
     // 条件化: 启用认证时构造 AuthStack, 否则单用户模式.

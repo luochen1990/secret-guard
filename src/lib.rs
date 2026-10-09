@@ -18,6 +18,7 @@
 //! - [`secrets`] —— Secret 注册表 + 内存状态 + 配置持久化
 //! - [`server`]  —— axum router 装配与服务启动
 //! - [`server_host_guard`] —— Host/Origin 校验 middleware (SEC-7, 防 DNS rebinding)
+//! - [`socket_activation`] —— systemd socket activation 的 LISTEN_FDS 接管 (#242, fail-open)
 //! - [`state`]   —— 进程级共享状态 AppState + HTTP 共享常量 (NO_STORE)
 //! - [`web`]     —— `/` + `/api/*` Web UI 与 JSON API
 //!
@@ -42,6 +43,7 @@ pub mod redact;
 pub mod secrets;
 pub mod server;
 pub mod server_host_guard;
+pub mod socket_activation;
 pub mod state;
 pub mod usage;
 pub mod util;

@@ -2560,6 +2560,7 @@ dependencies = [
  "criterion",
  "flate2",
  "futures",
+ "libc",
  "memchr",
  "mockito",
  "openidconnect",

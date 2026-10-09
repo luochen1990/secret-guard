@@ -107,6 +107,10 @@ memchr = "2.8.3"
 # sg-thinking envelope 的 base64 编解码 (codec/thinking.rs, T7). 已是 lock 中传递
 # 依赖 (rsa/rustls 链), 显式化不新增构建图 crate. license MIT OR Apache-2.0.
 base64 = "0.22"
+# systemd socket activation 的 fd 协议 (socket_activation.rs, #242): fcntl 置
+# FD_CLOEXEC + getsockopt 校验 listening TCP. 已是 lock 中传递依赖 (tokio/reqwest
+# 链), 显式化不新增构建图 crate. license MIT OR Apache-2.0.
+libc = "0.2"
 
 [dev-dependencies]
 tokio-test = "0.4"

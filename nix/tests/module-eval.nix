@@ -191,6 +191,51 @@ let
   stopTimeoutOverrideOk =
     stopTimeoutOverrideEv.config.systemd.services.secret-guard.serviceConfig.TimeoutStopSec == "60s";
 
+  # socket activation (#242 建议②): enable=true → socket unit 存在且 ListenStream
+  # 正确接线 (host/port 选项联动), service requires/after socket unit.
+  socketEv = sgEv [
+    {
+      nixpkgs.hostPlatform = system;
+      services.secret-guard = {
+        enable = true;
+        socketActivation.enable = true;
+        providers."b-upstream" = directFixture "https://up.example.com/v1" // {
+          apiKeyFile = "/run/secrets/upstream_key";
+        };
+      };
+    }
+  ];
+  socketUnit = socketEv.config.systemd.sockets.secret-guard;
+  socketListenStreamOk = socketUnit.listenStreams == [ "127.0.0.1:18787" ];
+  socketWantedByOk = builtins.elem "sockets.target" socketUnit.wantedBy;
+  socketServiceWiredOk =
+    builtins.elem "secret-guard.socket" socketEv.config.systemd.services.secret-guard.requires
+    && builtins.elem "secret-guard.socket" socketEv.config.systemd.services.secret-guard.after;
+  # 决策锁定: sa 开启时 service 仍开机即启动 (收益集中在 restart backlog, 非 lazy
+  # start) — 未来误删 wantedBy 会让部署形态静默漂移成 lazy, 本断言即红.
+  socketServiceWantedByUnchangedOk = builtins.elem "multi-user.target" socketEv.config.systemd.services.secret-guard.wantedBy;
+
+  # 默认 (socketActivation.enable=false, opt-in): 不生成 socket unit — 现有部署
+  # 零变化 (主 ev 的 minimalConfig 未设该开关).
+  socketAbsentByDefaultOk = !builtins.hasAttr "secret-guard" ev.config.systemd.sockets;
+
+  # IPv6 host: ListenStream 按 systemd 语法包 [] (裸 IPv6 冒号有 host:port 歧义).
+  socketV6Ev = sgEv [
+    {
+      nixpkgs.hostPlatform = system;
+      services.secret-guard = {
+        enable = true;
+        host = "::1";
+        socketActivation.enable = true;
+        providers."b-upstream" = directFixture "https://up.example.com/v1" // {
+          apiKeyFile = "/run/secrets/upstream_key";
+        };
+      };
+    }
+  ];
+  socketV6ListenStreamOk =
+    socketV6Ev.config.systemd.sockets.secret-guard.listenStreams == [ "[::1]:18787" ];
+
   # eval 失败/成功断言 (强制点: ExecStart 会连带强制 resolvedConfigFile 的三态解析)
   fails = e: !(builtins.tryEval e).success;
   unitOf = e: e.config.systemd.services.secret-guard.serviceConfig.ExecStart;
@@ -306,6 +351,30 @@ let
     {
       name = "停机窗口契约: 部署侧覆写 TimeoutStopSec 胜出 mkDefault (#242)";
       ok = stopTimeoutOverrideOk;
+    }
+    {
+      name = "socket activation: enable → socket unit ListenStream = host:port 接线 (#242)";
+      ok = socketListenStreamOk;
+    }
+    {
+      name = "socket activation: socket unit wantedBy sockets.target (#242)";
+      ok = socketWantedByOk;
+    }
+    {
+      name = "socket activation: service requires/after socket unit (#242)";
+      ok = socketServiceWiredOk;
+    }
+    {
+      name = "socket activation: service 保持开机即启动 (非 lazy start, #242)";
+      ok = socketServiceWantedByUnchangedOk;
+    }
+    {
+      name = "socket activation: 默认关闭 → 无 socket unit (opt-in, #242)";
+      ok = socketAbsentByDefaultOk;
+    }
+    {
+      name = "socket activation: IPv6 host 的 ListenStream 包 [] (#242)";
+      ok = socketV6ListenStreamOk;
     }
     {
       name = "configFile 互斥: 显式 + 结构化同设 → eval throw";
