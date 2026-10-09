@@ -2333,6 +2333,149 @@ async fn cross_protocol_translates_responses_ingress_to_openai_upstream() {
     );
 }
 
+/// #260 精确场景锚点: r→o 非流式 + 智谱式 base (版本段 v4 已含在 base 尾部,
+/// codex CLI 的 OpenAI 兼容上游布局). 现有 URL 布局测试族
+/// (`cross_protocol_url_layout_case` 家族) 的 ingress 都是 /a/, r→o 翻译测试
+/// 又全是裸根 base — 本测试补齐 issue 报告的组合: `/r/` ingress + 尾段版本 base,
+/// 断言出站 path 是 `<base>/chat/completions` (**无** 硬编码 `/v1` 双版本段).
+/// common_uri=None 走启发式 (手写 toml 未经 WebUI detect 的真实形态);
+/// 若回归为双版本段, mockito 无匹配 mock → 404 → 断言失败.
+#[tokio::test]
+async fn cross_protocol_url_versioned_base_responses_ingress() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/api/coding/paas/v4/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"chatcmpl-x","object":"chat.completion","created":1700000000,"model":"glm-4.6","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+        )
+        .create_async()
+        .await;
+    let provider = provider_with(
+        "glm-main",
+        Protocol::OpenAI,
+        &format!("{}/api/coding/paas/v4", upstream.url()),
+    );
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+    let body = r#"{"model":"glm-4.6","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Hello"}]}]}"#;
+    let (status, resp_body, _) =
+        proxy_request(&proxy_url, "POST", "/r/glm-main/v1/responses", body, &[]).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {resp_body}");
+    // 响应翻译回 Responses 形态 (envelope + output_text) — 排除透传假绿.
+    assert!(
+        resp_body.contains("\"object\":\"response\""),
+        "got: {resp_body}"
+    );
+    assert!(
+        resp_body.contains("\"type\":\"output_text\""),
+        "got: {resp_body}"
+    );
+    _m.assert_async().await; // 命中的正是无 /v1 的单版本段 path
+}
+
+/// #260 codex 形态工具定义 round-trip: r→o 流式 (codex CLI 的真实请求形态 =
+/// stream:true + 平铺 function tools) + 智谱式尾段版本 base. SSE 序列断言与
+/// `cross_protocol_streaming_translates_responses_ingress_from_openai_upstream`
+/// 同型 (本测试增量在 tools wire 断言 + 版本段 base, 不重复其 usage 断言).
+/// codex 0.146 调研 (rust-v0.146.0 源码): shell_command / exec_command /
+/// write_stdin / update_plan 全部是 Responses 平铺 function tool
+/// (`{type:"function",name,description,strict:false,parameters}`, parameters 必带),
+/// 经 IR 翻译到 OpenAI 嵌套形态 (`{"type":"function","function":{...}}`) 后
+/// name/description/parameters 必须完整; `strict:false` 与 OpenAI 缺省值等价,
+/// 翻译丢弃无害 (egress 期望不含 strict 字段 — 子集匹配不锁定其缺席). custom/freeform tool
+/// (`apply_patch`, 仅用户自定义 model family 时发送) 与 hosted tools 共用
+/// `read_tool_def` 的丢弃分支 (见 `cross_proto_hosted_tools_drop_warns`).
+#[tokio::test]
+async fn cross_protocol_streaming_responses_ingress_codex_tools_round_trip() {
+    let mut upstream = spawn_mock_upstream().await;
+    let sse_body = concat!(
+        "data: {\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ls output\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"glm-4.6\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"glm-4.6\",\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":4,\"total_tokens\":16}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let shell_parameters: serde_json::Value = serde_json::from_str(
+        r#"{"type":"object","properties":{"command":{"type":"string","description":"Shell script to run in the user's default shell."},"workdir":{"type":"string","description":"Working directory for the command."},"timeout_ms":{"type":"number","description":"Maximum command runtime."}},"required":["command"],"additionalProperties":false}"#,
+    )
+    .expect("test fixture JSON");
+    let plan_parameters: serde_json::Value = serde_json::from_str(
+        r#"{"type":"object","properties":{"plan":{"type":"array","items":{"type":"object","properties":{"step":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed"]}},"required":["step","status"],"additionalProperties":false}}},"required":["plan"],"additionalProperties":false}"#,
+    )
+    .expect("test fixture JSON");
+    // codex 平铺 function tool (ingress wire) — strict:false 是 codex 恒发值.
+    let tools_flat = serde_json::json!([
+        {"type": "function", "name": "shell_command",
+         "description": "Runs a shell command and returns its output.",
+         "strict": false, "parameters": shell_parameters},
+        {"type": "function", "name": "update_plan",
+         "description": "Updates the task plan.",
+         "strict": false, "parameters": plan_parameters},
+    ]);
+    // 期望 egress wire (OpenAI 嵌套形态, 参数 schema 原样透传; strict 丢弃).
+    let expected_body = serde_json::json!({
+        "stream": true,
+        "tools": [
+            {"type": "function", "function": {
+                "name": "shell_command",
+                "description": "Runs a shell command and returns its output.",
+                "parameters": shell_parameters}},
+            {"type": "function", "function": {
+                "name": "update_plan",
+                "description": "Updates the task plan.",
+                "parameters": plan_parameters}},
+        ],
+    });
+    let _m = upstream
+        .mock("POST", "/api/coding/paas/v4/chat/completions")
+        .match_body(mockito::Matcher::PartialJson(expected_body))
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse_body)
+        .create_async()
+        .await;
+    let provider = provider_with(
+        "glm-main",
+        Protocol::OpenAI,
+        &format!("{}/api/coding/paas/v4", upstream.url()),
+    );
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+    let body = serde_json::json!({
+        "model": "glm-4.6",
+        "stream": true,
+        "input": [{"type": "message", "role": "user",
+                   "content": [{"type": "input_text", "text": "list files"}]}],
+        "tools": tools_flat,
+    })
+    .to_string();
+    let (status, resp_body, _) =
+        proxy_request(&proxy_url, "POST", "/r/glm-main/v1/responses", &body, &[]).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {resp_body}");
+    // 翻译后的 Responses SSE 事件序列 (代表性断言): created 开头 → item/content_part
+    // → delta 文本保真 → completed 终态.
+    assert!(
+        resp_body.starts_with("event: response.created\n"),
+        "stream must open with response.created: {resp_body}"
+    );
+    assert!(
+        resp_body.contains("event: response.output_item.added"),
+        "got: {resp_body}"
+    );
+    assert!(
+        resp_body.contains("\"delta\":\"ls output\""),
+        "text must survive translation: {resp_body}"
+    );
+    let completed_pos = resp_body
+        .rfind("event: response.completed")
+        .expect("response.completed must be present");
+    assert_eq!(
+        resp_body[completed_pos..].matches("event: ").count(),
+        1,
+        "response.completed must be the final event: {resp_body}"
+    );
+    _m.assert_async().await; // egress path 无双版本段 + tools wire 形态匹配
+}
+
 #[tokio::test]
 async fn cross_protocol_streaming_translates_openai_ingress_from_anthropic_upstream() {
     // 跨协议流式: OpenAI ingress → Anthropic upstream (SSE) → 翻译回 OpenAI SSE.
@@ -9520,6 +9663,10 @@ async fn cross_proto_response_reasoning_drop_warns() {
 /// Responses 入站的 hosted tools (web_search 等非 function 类型) 不进 IR
 /// (reader 的 filter_map 丢弃, 也不进 extra — tools 是 modeled 字段) → 读取点 WARN.
 /// 该 choke point 同时覆盖同协议 IR 重建路径与跨协议路径, 故用 r→a 场景锁接线.
+/// #260 调研补充: codex 0.146 的 custom/freeform tool (apply_patch 的
+/// `{"type":"custom",...,"format":{...}}` 形态, 仅用户自定义 model family 时发送)
+/// 与 hosted tools 共用此丢弃分支 — body 中一并锁定现状 (custom 支持需 IR
+/// 自由文本工具建模, 超出 #260 范围).
 #[tokio::test]
 async fn cross_proto_hosted_tools_drop_warns() {
     let mut upstream = spawn_mock_upstream().await;
@@ -9536,7 +9683,7 @@ async fn cross_proto_hosted_tools_drop_warns() {
     let proxy_url = spawn_proxy_with_provider(provider).await;
 
     let (log, _log_guard) = capture_tracing(tracing::Level::WARN);
-    let body = r#"{"model":"gpt-4o","input":"hi","tools":[{"type":"function","name":"f","parameters":{"type":"object"}},{"type":"web_search"}]}"#;
+    let body = r#"{"model":"gpt-4o","input":"hi","tools":[{"type":"function","name":"f","parameters":{"type":"object"}},{"type":"custom","name":"apply_patch","description":"freeform","format":{"type":"grammar","syntax":"lark","definition":"start: x"}},{"type":"web_search"}]}"#;
     let (status, _, _) =
         proxy_request(&proxy_url, "POST", "/r/an-main/v1/responses", body, &[]).await;
     assert_eq!(status, reqwest::StatusCode::OK);
@@ -9544,6 +9691,13 @@ async fn cross_proto_hosted_tools_drop_warns() {
     assert!(
         log_text.contains("dropping tool definition(s) not representable in IR"),
         "T5: hosted tools drop WARN missing; log: {log_text}"
+    );
+    // 计数锁: custom + web_search 恰好 2 个被丢 (fmt subscriber 渲染结构化字段
+    // 为 `count=N`) — 若 custom 开始进 IR (count=1), 该断言变红, 防止 contains-
+    // 消息断言在形态演进下静默失去判别力.
+    assert!(
+        log_text.contains("count=2"),
+        "custom + web_search must both be dropped; log: {log_text}"
     );
 }
 
