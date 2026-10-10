@@ -12706,6 +12706,11 @@ async fn sec1_read_all_endpoints(client: &reqwest::Client, base: &str) -> Vec<(S
         fetch(client, base, "/api/providers").await,
         fetch(client, base, "/api/api-keys").await,
         fetch(client, base, "/api/usage/summary?hours=24").await,
+        // privacy-scan 两读端点 (context 遮盖面; 本测试 privacy off 档下返回
+        // enabled:false 空表 — 端点进穷举网的意义是防未来回归把泄密面加进来
+        // 而网不感知, context 的专项守卫在 src/privacy.rs 单测).
+        fetch(client, base, "/api/privacy-scan/alerts").await,
+        fetch(client, base, "/api/privacy-scan/settings").await,
     ];
     let (sessions_label, sessions_body) = fetch(client, base, "/api/sessions").await;
     let sessions: serde_json::Value = serde_json::from_str(&sessions_body).unwrap();

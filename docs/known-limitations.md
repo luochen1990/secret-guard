@@ -75,6 +75,8 @@
 - **AlertStore 存储侧 value 尺寸无截断 (有意)**: 告警 value 存**完整**命中串 (最长可达单叶上限) — 截断会破坏「登记预填需要完整真值」的产品闭环 (截断值登记后 redact 永不匹配). 理论最坏存储 = 256 个互异巨型 token ≈ 数百 MiB, 触发需病理性输入且 batch 为显式 opt-in, 接受该残余 (pattern 形状的最长命中是 JWT, 常规尺寸远低于上限).
 - **`realtime` 档位未实现不预留**: `[privacy_scan] mode` 值域只有 `off`/`batch`; `realtime` 属 Laya S2 (待 #257 五个开放问题拍板), 写入该值启动 fail-fast (不静默降级).
 - **disabled secret 的值不受排除保护**: 排除集 = effective secrets 值 (Disabled 条目不在 effective view), disabled secret 真值若匹配 pattern 会告警 — 语义上它是 "已登记但保护被关闭", 告警可视为提示用户该值正在无保护地流向上游 (与 #161 明文放行 WARN 同向).
+- **告警 context 遮盖的同语义残余 (SEC-1, 2026-10-10)**: context 生成时登记值经 `MaskedLeaf` 先遮盖后取窗 (`[managed]` 占位), 三种形态不被覆盖: (i) 源文本含登记值的**截断片段** 与 (ii) 周期值的 tiling 残余 (v=`ab`×20 在 `ab`×25 叶中非重叠匹配后尾部周期前缀存活) — 与 redact 管道 `replace_all` 同语义, context 回显不差于 wire 侧; (iii) 登记值恰为 `[managed]` 占位符子串的病态配置 — context 侧独有 (wire 的 mock 按契约不含 secret 子串), 但占位符是公开常量, 出现不携带 secret 信息增量, 独立成立可接受.
+- **疑似值内嵌登记值时 value 列回显登记值子串 (理论 case)**: 疑似值 (pattern 命中) 整体含某登记值为子串时, 扫描侧精确等值排除不命中 (值不等), 告警 value 列按疑似值完整明文回显 (SEC-1 裁决允许疑似值) — 其中自然含登记值片段; context 字段则如实呈现占位符 (`ghp_[managed]tail` 形态, `src/privacy.rs` 测试 `context_presents_placeholder_inside_suspect_value`).
 
 ## redact (Redact / Mock / 脱敏面)
 

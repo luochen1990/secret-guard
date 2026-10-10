@@ -32,8 +32,11 @@
 //! 纵深校验 (与 records 端点一致). **SEC-1 裁决 (2026-10-10, PR #303 review):
 //! 告警回显疑似明文不构成 SEC-1 破坏 — 疑似值非登记 secret, SEC-1 的保护
 //! 对象不在回显面内, 无需例外条款.** (告警必须携带完整 value 才能支撑
-//! 「一键登记预填」闭环 — mask 会使产品形态失效.) OIDC 模式下本端点随整个
-//! `web::router()` 受 login_required 保护 (同 records).
+//! 「一键登记预填」闭环 — mask 会使产品形态失效.) 裁决前提的技术保证
+//! (2026-10-10 验收补): context 窗口内的**登记值**经 [`crate::privacy`]
+//! 的 `MaskedLeaf` 遮盖为 `[managed]` 占位 (先遮盖后取窗口), 登记值的完整
+//! 出现不进回显面 (同语义残余例外见 docs/known-limitations.md privacy-scan 节).
+//! OIDC 模式下本端点随整个 `web::router()` 受 login_required 保护 (同 records).
 //!
 //! mode 是静态档位 (启动读一次), 无 PUT — 切换需改 `secret-guard.toml` 重启
 //! (与 `[redact]`/`[server]` 同哲学, 保持转发核心路径零运行时配置开销).

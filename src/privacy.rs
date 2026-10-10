@@ -49,6 +49,14 @@
 //! 替换) 的值永不告警 — pre-redact 视图保证 mock 替身永不进入扫描输入,
 //! "post-redact 不扫" 由数据源选择结构性保证.
 //!
+//! **context 字段对登记值遮盖 (SEC-1 裁决前提的技术保证, 2026-10-10)**:
+//! 告警 context 是 pre-redact 原文的 ±40 char 窗口, 窗口内可能含已登记
+//! secret 明文 — 登记值的**完整出现**经遮盖不进回显面: 生成时先在完整叶子
+//! 上把所有登记值遮盖为 `[managed]` 占位符再取窗口 (实现 = 模块内
+//! `MaskedLeaf`, 顺序不可倒 — 先截后盖会半截泄漏; 与 redact 管道同语义的
+//! 截断片段等残余例外见 docs/known-limitations.md). 疑似值明文回显是裁决
+//! 明确允许的, 不遮.
+//!
 //! # 告警状态机 (R2, PR #303 review)
 //!
 //! 扫描点在 redact seam (pre-redact) — 每条告警背后是一次**疑似已发生的
@@ -113,6 +121,10 @@ const MAX_LEAF_BYTES: usize = 2 * 1024 * 1024;
 /// 上下文摘要的前后字符预算 (per 侧, char 计数, 截断走 util 族保证
 /// char-boundary 安全).
 const CONTEXT_CHARS: usize = 40;
+
+/// context 窗口内**已登记** secret 值的遮盖占位符 (SEC-1: 登记值的完整
+/// 出现不进回显面 — 见 [`MaskedLeaf`] 文档. 数据常量, 非 UI 文案, i18n 无关).
+const MANAGED_PLACEHOLDER: &str = "[managed]";
 
 // ─── pattern 集 (手写字节扫描, 零依赖) ─────────────────────────────────────
 
@@ -735,11 +747,16 @@ impl PrivacyScanner {
 /// 后台 task 的单 job 处理: 每叶子 × 每启用 pattern 匹配 → 排除已登记 →
 /// 记录. 关组 (`mask` 位清零) 的 pattern 跳过 — 组过滤的扫描侧落点.
 /// 匹配阶段无锁 (大 job 不阻塞 alerts API 读), 仅落账时短临界区.
+/// context 生成走 [`MaskedLeaf`] (先遮盖登记值再取窗口, SEC-1), 匹配本身
+/// 仍在**原始叶子**上进行 (遮盖不得影响疑似值的检出).
 fn scan_job(job: &ScanJob, store: &Mutex<AlertStore>, groups_mask: u32) {
     let now = Utc::now();
     // (value, pattern_id, context) — 先算后锁.
     let mut hits: Vec<(String, &'static str, String)> = Vec::new();
     for leaf in &job.leaves {
+        // 遮盖视图 lazy 构建: 首个非排除命中时才建 (无命中叶子占绝对多数,
+        // 零遮盖开销); 每叶至多一次.
+        let mut masked: Option<MaskedLeaf> = None;
         for pattern in PATTERNS {
             if !pattern.group.enabled_in(groups_mask) {
                 continue;
@@ -753,11 +770,8 @@ fn scan_job(job: &ScanJob, store: &Mutex<AlertStore>, groups_mask: u32) {
                 if job.excluded.iter().any(|x| x == value) {
                     continue;
                 }
-                hits.push((
-                    value.to_string(),
-                    pattern.id,
-                    context_around(leaf, start, end, value),
-                ));
+                let m = masked.get_or_insert_with(|| MaskedLeaf::new(leaf, &job.excluded));
+                hits.push((value.to_string(), pattern.id, m.context_around(start, end)));
             }
         }
     }
@@ -767,19 +781,125 @@ fn scan_job(job: &ScanJob, store: &Mutex<AlertStore>, groups_mask: u32) {
     }
 }
 
-/// 命中点上下文摘要: `…{before}{value}{after}…` — 前后各 ≤CONTEXT_CHARS 字符
-/// (char 计数截断, 复用 util 截断族), 发生截断的侧加 `…` 标记. value 原样内嵌
-/// (等宽字体展示 "它出现在什么话里"; 行内 value 与 value 列重复是有意的 —
-/// 摘要自成一体, 不要求读行时横向对齐). best-effort: 区间越界 (不可达) 时
-/// 回退空串.
-fn context_around(leaf: &str, start: usize, end: usize, value: &str) -> String {
-    let before = leaf.get(..start).unwrap_or("");
-    let after = leaf.get(end..).unwrap_or("");
-    let b = crate::util::truncate_chars(before, CONTEXT_CHARS);
-    let a = crate::util::truncate_chars(after, CONTEXT_CHARS);
-    let b_mark = if b.len() < before.len() { "…" } else { "" };
-    let a_mark = if a.len() < after.len() { "…" } else { "" };
-    format!("{b_mark}{b}{value}{a}{a_mark}")
+/// 叶子的**登记值遮盖视图**: 先在完整叶子上把所有 `excluded` (已登记值,
+/// 与匹配排除集同源 SSOT) 的出现区间遮盖为 [`MANAGED_PLACEHOLDER`], 再在
+/// 遮盖文本上取 context 窗口 — **顺序不可倒** (SEC-1, 2026-10-10 验收缺口).
+///
+/// # 为什么先遮盖后取窗口
+///
+/// 若先截 ±40 char 窗口再替换, 窗口边界与登记值交叉会把值截成两半, 完整值
+/// 匹配永远命不中, 半截明文前缀直接回显 (验收实录: 39-char 登记值被右边界
+/// 截出 30-char 前缀). 先遮盖后取窗口: 窗口边界最多截到占位符中间, 登记值
+/// 的完整出现不出现在窗口文本中.
+///
+/// # 重叠处理 (区间并集)
+///
+/// 多个登记值互为子串 / 区间交叠时 (长值含短值, 值 A 尾接值 B 头), 逐值独立
+/// 替换会留残留 (短值先替换, 长值匹配失败, 尾巴泄漏). 收集全部出现区间后做
+/// **并集合并**, 每个连通区间整体替换为一个占位符 — 遮盖文本中不含任何登记
+/// 值的**完整出现**. 三种已接受的例外形态: (i) 源文本含登记值的**截断片段**
+/// 与 (ii) 周期值的 tiling 残余 — 与 redact 管道 `replace_all` 同语义, context
+/// 回显不差于 wire 侧; (iii) 登记值恰为占位符 `[managed]` 子串的病态配置 —
+/// context 侧独有 (wire 的 mock 按契约不含 secret 子串), 但占位符是公开
+/// 常量, 出现不携带 secret 信息增量, 独立成立可接受. 三者详见
+/// docs/known-limitations.md privacy-scan 节.
+///
+/// # 与疑似值的关系 (如实呈现)
+///
+/// 疑似值的**匹配**在原始叶子完成 (遮盖不参与检出); context 展示时疑似值
+/// 取遮盖文本中的对应片段 — 若疑似值内嵌登记值 (理论 case: ghp_ 串里含
+/// sk- 值), 该处呈现为占位符, 疑似值的完整性让位于登记值不泄漏 (裁决允许
+/// 疑似值明文, 但不允许登记值明文; span 平移见 [`MaskedLeaf::map_pos`]).
+struct MaskedLeaf {
+    /// 遮盖后的叶子文本 (登记值区间已替换为 [`MANAGED_PLACEHOLDER`]).
+    text: String,
+    /// 遮盖区间表 (原始叶子坐标系, 有序不重叠): 每项是**合并后**的连通区间.
+    edits: Vec<Span>,
+}
+
+impl MaskedLeaf {
+    /// 构建遮盖视图. `excluded` 与匹配排除集同源 ([`ScanJob::excluded`]);
+    /// 空值跳过 — `match_indices` 对空串不死循环, 但会在每个 char boundary
+    /// 产出 (i, i) 空区间, 重建产物逐 boundary 穿插占位符 (垃圾 context);
+    /// 相邻空区间不满足合并条件 `s <= last.1`, 并集不会吞并它们 (防御;
+    /// 上游 `non_empty_values` 本就不产空值, 此分支是双保险).
+    fn new(leaf: &str, excluded: &[String]) -> Self {
+        // 1. 收集全部出现区间 (`match_indices` = 非重叠顺序匹配, 标准库
+        //    保证终止 — 本模块手写推进循环有死循环前科, 能替代就替代;
+        //    跨值重叠交给合并步).
+        let mut spans: Vec<Span> = Vec::new();
+        for v in excluded {
+            if v.is_empty() {
+                continue;
+            }
+            for (start, _) in leaf.match_indices(v.as_str()) {
+                spans.push((start, start + v.len()));
+            }
+        }
+        // 2. 并集合并 (同起点时长值覆盖短值由 max 端点达成).
+        spans.sort_unstable();
+        let mut edits: Vec<Span> = Vec::new();
+        for (s, e) in spans {
+            match edits.last_mut() {
+                Some(last) if s <= last.1 => last.1 = last.1.max(e),
+                _ => edits.push((s, e)),
+            }
+        }
+        // 3. 逐段重建 (boundary 安全: str::find 的匹配端点天然在 char
+        //    boundary — needle 是合法 UTF-8 序列, 自同步性保证).
+        let mut text = String::with_capacity(leaf.len());
+        let mut cursor = 0;
+        for &(os, oe) in &edits {
+            text.push_str(&leaf[cursor..os]);
+            text.push_str(MANAGED_PLACEHOLDER);
+            cursor = oe;
+        }
+        text.push_str(&leaf[cursor..]);
+        Self { text, edits }
+    }
+
+    /// 原始叶子偏移 → 遮盖文本偏移 (span 平移). edit 完全在左 → 累积长度
+    /// 差 (占位符 9 字节可短于被遮盖值, 差值可负 — 用 isize 累积; 和恒
+    /// ≥ 0, 因 pos 必在全部左侧 edit 的右侧, 左侧 edits 总长 ≤ pos);
+    /// `pos` 落在 edit 区间内部 (疑似值与登记值边界重叠的防御形态) →
+    /// 钳到该 edit 在遮盖文本中的起点 (就近端点, 如实呈现语义下可接受);
+    /// edit 在右 → 后续更靠右, 提前退出.
+    fn map_pos(&self, pos: usize) -> usize {
+        let mut delta: isize = 0;
+        for &(os, oe) in &self.edits {
+            if oe <= pos {
+                delta += MANAGED_PLACEHOLDER.len() as isize - (oe - os) as isize;
+            } else if os < pos {
+                return (os as isize + delta) as usize;
+            } else {
+                break;
+            }
+        }
+        (pos as isize + delta) as usize
+    }
+
+    /// 命中点上下文摘要 (遮盖文本坐标系): `…{before}{疑似值片段}{after}…` —
+    /// 前后各 ≤CONTEXT_CHARS 字符 (char 计数截断, 复用 util 截断族), 发生
+    /// 截断的侧加 `…` 标记. 疑似值片段取遮盖文本 (内嵌登记值处为占位符,
+    /// 见类型文档 "如实呈现"; 极端形态 — 疑似值完全落在单个登记值内部 —
+    /// 片段为空, context 呈现为占位符邻接). best-effort: 区间越界 (不可达)
+    /// 时回退空串.
+    fn context_around(&self, start: usize, end: usize) -> String {
+        let (ms, me) = (self.map_pos(start), self.map_pos(end));
+        let (before, mid, after) = match (
+            self.text.get(..ms),
+            self.text.get(ms..me),
+            self.text.get(me..),
+        ) {
+            (Some(b), Some(m), Some(a)) => (b, m, a),
+            _ => ("", "", ""),
+        };
+        let b = crate::util::truncate_chars(before, CONTEXT_CHARS);
+        let a = crate::util::truncate_chars(after, CONTEXT_CHARS);
+        let b_mark = if b.len() < before.len() { "…" } else { "" };
+        let a_mark = if a.len() < after.len() { "…" } else { "" };
+        format!("{b_mark}{b}{mid}{a}{a_mark}")
+    }
 }
 
 /// `GET /api/privacy-scan/alerts` 的响应条目 (wire shape). `id` 是用户动作
@@ -1190,15 +1310,35 @@ mod tests {
         ));
     }
 
-    // ─── context 截断 (char-boundary) ────────────────────────────────────
+    // ─── context 截断 (char-boundary) + 登记值遮盖 (SEC-1) ────────────────
+
+    /// 防假绿断言: 登记值的任意 ≥8 字符前缀不得残留在 context. 定向于前缀
+    /// 是完备的 — 窗口截断 (`truncate_chars`) 取前缀, before/after 两侧的
+    /// 截断留下的都是登记值前缀 (头部保留/尾部丢弃), "替换了但被窗口边界
+    /// 截断残留" 的半截泄漏必是前缀形态. 阈值 8: 更短的前缀 ("sk-"/"ghp_"
+    /// 等公共词干) 会误伤正常文本造成假红. `&registered[..n]` 切片假设
+    /// registered 为 ASCII (当前调用点全部满足; 多字节值需 char_indices).
+    #[track_caller]
+    fn assert_no_registered_prefix_leak(ctx: &str, registered: &str, label: &str) {
+        for n in 8..=registered.len() {
+            assert!(
+                !ctx.contains(&registered[..n]),
+                "{label}: leaks registered prefix ({} chars): {}",
+                n,
+                ctx
+            );
+        }
+    }
 
     #[test]
     fn context_truncates_on_char_boundary() {
-        // 前后各塞 100 个 CJK 字符 (3 bytes each), 命中点居中.
+        // 前后各塞 100 个 CJK 字符 (3 bytes each), 命中点居中. excluded 为空
+        // (edits 空 → 遮盖文本 == 原文, 平移恒等) — 行为与遮盖前逐字节一致.
         let pad: String = "汉".repeat(100);
         let leaf = format!("{pad}TOKEN{pad}");
         let start = leaf.find("TOKEN").unwrap();
-        let ctx = context_around(&leaf, start, start + 5, "TOKEN");
+        let masked = MaskedLeaf::new(&leaf, &[]);
+        let ctx = masked.context_around(start, start + 5);
         assert!(ctx.starts_with('…'), "head truncation marker");
         assert!(ctx.ends_with('…'), "tail truncation marker");
         assert!(ctx.contains("TOKEN"), "value embedded inline");
@@ -1207,8 +1347,155 @@ mod tests {
         assert!(side[0].chars().count() <= 41, "before side within budget");
         assert!(side[1].chars().count() <= 41, "after side within budget");
         // 短上下文 (无截断) 不加 marker.
-        let short = context_around("a TOKEN b", 2, 7, "TOKEN");
+        let short = MaskedLeaf::new("a TOKEN b", &[]).context_around(2, 7);
         assert_eq!(short, "a TOKEN b");
+        // 防御: excluded 含空串不得挂死 (空串 find 恒命中起点, 推进死循环).
+        let _ = MaskedLeaf::new("a TOKEN b", &[String::new()]).context_around(2, 7);
+    }
+
+    /// SEC-1 遮盖: 登记值与 ±40 char 窗口边界的三种交叉形态, 全部不得在
+    /// context 中留下登记值明文 (任意 ≥8 字符前缀扫描, 防半截残留假绿).
+    /// 命中值用 ghp_ token (Vcs 组, 独立于登记值形状).
+    #[test]
+    fn context_masks_registered_secret_across_window_boundaries() {
+        let registered = "sk-registered-SECRET-do-not-leak-000000"; // 39 chars
+        let gh = format!("ghp_{}", "F".repeat(44));
+        let gh_span = |leaf: &str| {
+            let s = leaf.find(&gh).expect("token in leaf");
+            (s, s + gh.len())
+        };
+        // 跨左边界: before = "My key is {39 chars} and also " (59 chars > 40),
+        // 截断点落在登记值内部 (2026-10-10 验收复现形态).
+        let left = format!("My key is {registered} and also {gh}");
+        // 跨右边界: after = " t "(3) + pad(17) + 登记值, 截断点 40 落在
+        // 登记值内部 (3 + 17 = 20 < 40 < 20 + 39).
+        let right = format!("{gh} t {}{registered}", "p".repeat(17));
+        // 恰好填满: before = "x" + 登记值 = 40 chars, 不截断, 整值在窗口内.
+        let fills = format!("x{registered} {gh}");
+        for (name, leaf) in [
+            ("crosses-left-boundary", &left),
+            ("crosses-right-boundary", &right),
+            ("fills-window-exactly", &fills),
+        ] {
+            let (s, e) = gh_span(leaf);
+            let masked = MaskedLeaf::new(leaf, &[registered.to_string()]);
+            let ctx = masked.context_around(s, e);
+            assert!(
+                ctx.contains("[managed]"),
+                "{name}: placeholder present: {ctx}"
+            );
+            assert!(ctx.contains(&gh), "{name}: suspect value intact: {ctx}");
+            assert_no_registered_prefix_leak(&ctx, registered, name);
+        }
+    }
+
+    /// SEC-1 遮盖的重叠防御: 同一段文本被两个登记值交叠命中 (值 A = 前缀段,
+    /// 值 B = 后缀段, 区间交叠) — 并集合并整段遮盖, 逐值独立替换会留尾巴
+    /// (A 先替换后 B 匹配不到, B 的独有尾部残留). 全子串扫描一网打尽.
+    /// 另覆盖包含形态 (值 A 整体含值 B, B 仅在 A 内出现).
+    #[test]
+    fn context_masks_overlapping_registered_values_union() {
+        // T 同时含 A (头部 20 chars) 与 B (第 13 字符起到尾) 为子串, 区间交叠.
+        let t = "sk-overlap-long-value-0000000011111";
+        let a = &t[..20];
+        let b = &t[12..];
+        let gh = format!("ghp_{}", "F".repeat(44));
+        let leaf = format!("found {t} then {gh}");
+        let s = leaf.find(&gh).unwrap();
+        // 交叠形态: [A, B] — 并集 = T 的整段区间.
+        let masked = MaskedLeaf::new(&leaf, &[a.to_string(), b.to_string()]);
+        let ctx = masked.context_around(s, s + gh.len());
+        // 并集整段遮盖: T 的位置呈现单个占位符.
+        assert!(
+            ctx.contains("found [managed] then"),
+            "union masked as one placeholder: {ctx}"
+        );
+        // T 的任意 ≥8 字符子串 (含 B 独有尾部) 不得残留.
+        for i in 0..t.len() {
+            for j in (i + 8)..=t.len() {
+                assert!(
+                    !ctx.contains(&t[i..j]),
+                    "overlap union leaves residue {:?}: {}",
+                    &t[i..j],
+                    ctx
+                );
+            }
+        }
+        // 包含形态: 值 super 整体含值 sub, sub 仅在 super 内出现 —
+        // 并集吞并 sub 的 span, 单占位符, sub 无独立残留.
+        let super_val = "sk-container-of-a-shorter-value-000001";
+        let sub_val = &super_val[3..25];
+        let leaf2 = format!("k {super_val} t {gh}");
+        let s2 = leaf2.find(&gh).unwrap();
+        let masked2 = MaskedLeaf::new(&leaf2, &[super_val.to_string(), sub_val.to_string()]);
+        let ctx2 = masked2.context_around(s2, s2 + gh.len());
+        assert!(
+            ctx2.contains("k [managed] t"),
+            "containment union masked as one placeholder: {ctx2}"
+        );
+        assert_no_registered_prefix_leak(&ctx2, super_val, "containment");
+    }
+
+    /// 如实呈现 (防御形态): 疑似值内嵌登记值为子串 (理论 case: ghp_ 串里含
+    /// sk- 值) — 匹配在原始文本完成 (检出不受遮盖影响), context 中疑似值
+    /// 的该处呈现为占位符, 两端片段保留; 疑似值整体仍在 value 字段明文
+    /// 回显 (SEC-1 裁决允许疑似值). 登记值取纯 alnum (含 `-`/`_` 会截断
+    /// github-token 的 run 形状, 干扰检出断言).
+    #[test]
+    fn context_presents_placeholder_inside_suspect_value() {
+        let registered = "skembedSECRETvalue00000000000000000000"; // 38 chars alnum
+        let suspect = format!("ghp_{registered}tail123"); // run 45 ≥ 36 ✓
+        let leaf = format!("leak: {suspect} end");
+        let s = leaf.find(&suspect).unwrap();
+        let e = s + suspect.len();
+        // 匹配在原始叶子: pattern 必须能检出疑似值 (遮盖不参与检出).
+        assert_eq!(
+            hits("github-token", &leaf),
+            vec![suspect.clone()],
+            "matching runs on raw leaf"
+        );
+        let masked = MaskedLeaf::new(&leaf, &[registered.to_string()]);
+        let ctx = masked.context_around(s, e);
+        // 疑似值片段中登记值位置呈现占位符, 两端片段保留.
+        assert!(
+            ctx.contains("ghp_[managed]tail123"),
+            "suspect fragment shows placeholder in place of registered: {ctx}"
+        );
+        assert_no_registered_prefix_leak(&ctx, registered, "embedded");
+    }
+
+    /// `map_pos` 钳制分支 (review 补): 疑似值**完全落在单个登记值内部**
+    /// (登记值 = 长 token 形状串, 内嵌 AKIA 命中) — span 双端都落在同一
+    /// edit 内, 双侧钳到同点 → mid 为空, context 呈现占位符邻接. 检出
+    /// 仍在原始叶子发生 (span 不因遮盖丢失), 展示让位于登记值不泄漏.
+    #[test]
+    fn context_hit_entirely_inside_registered_value_clamps_to_placeholder() {
+        // 登记值内嵌可检出的 AKIA 形状: '[' 非 alnum 满足左边界, ']' 不在
+        // charset 内截断 run 恰 16.
+        let registered = "[AKIAQQQQQQQQQQQQQQQQ]key-secret-value-0000";
+        let suspect = "AKIAQQQQQQQQQQQQQQQQ";
+        let leaf = format!("leak {registered} end");
+        // 检出在原始叶子: AKIA pattern 必须命中 (span ⊂ 登记值).
+        assert_eq!(
+            hits("aws-access-key-id", &leaf),
+            vec![suspect.to_string()],
+            "matching runs on raw leaf even inside a registered value"
+        );
+        let s = leaf.find(suspect).unwrap();
+        let e = s + suspect.len();
+        let masked = MaskedLeaf::new(&leaf, &[registered.to_string()]);
+        let ctx = masked.context_around(s, e);
+        // mid 收缩为空: 登记值整体呈现为占位符, 疑似值不内嵌 (它本就是
+        // 登记值的内部片段, value 列已回显完整明文 — 裁决允许).
+        assert!(
+            ctx.contains("[managed]"),
+            "registered value shown as placeholder: {ctx}"
+        );
+        assert!(
+            !ctx.contains(suspect),
+            "suspect inline fragment is empty: {ctx}"
+        );
+        assert_no_registered_prefix_leak(&ctx, registered, "clamped");
     }
 
     // ─── 后台 task: 排除规则 + 端到端 (tokio) ─────────────────────────────
@@ -1264,6 +1551,38 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("alert for unregistered key never appeared");
+    }
+
+    /// SEC-1 (context 遮盖): 告警 context 是 pre-redact 原文的 ±40 char 窗口,
+    /// 窗口内可能含**已登记** secret 明文 (复现: 2026-10-10 验收, 窗口右边界
+    /// 把 39-char 登记值截成 30-char 前缀回显). 裁决前提是 "回显的是疑似值,
+    /// 不是登记 secret" — context 必须把窗口内登记值遮盖为占位符.
+    /// 防假绿: 除断言占位符在场, 还对登记值做 **≥8 字符前缀全扫描** (防
+    /// "替换了但被窗口边界截断残留" 的半截泄漏).
+    #[tokio::test]
+    async fn alert_context_masks_registered_secret_in_window() {
+        let scanner = PrivacyScanner::new(test_mask());
+        let registered = "sk-registered-SECRET-do-not-leak-000000"; // 39 chars
+        let gh = format!("ghp_{}", "F".repeat(44));
+        // before 窗口 = "My key is {registered} and also " (59 chars > 40):
+        // 截断点落在 registered 内部 (左边界交叉形态, 即验收复现).
+        let ir = sample_ir_with(&format!("My key is {registered} and also {gh}"));
+        let job = scanner.capture(&ir).unwrap();
+        scanner.submit(Some(job), &[registered_secret(registered)]);
+        for _ in 0..100 {
+            let (_, alerts) = scanner.alerts_view(&[]);
+            if let Some(a) = alerts.iter().find(|a| a.value == gh) {
+                assert!(
+                    a.context.contains("[managed]"),
+                    "context must mask registered value, got: {}",
+                    a.context
+                );
+                assert_no_registered_prefix_leak(&a.context, registered, "e2e");
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("github-token alert never appeared");
     }
 
     #[tokio::test]
