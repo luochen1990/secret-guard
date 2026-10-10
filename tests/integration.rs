@@ -55,6 +55,23 @@ async fn spawn_mock_upstream() -> mockito::ServerGuard {
     mockito::Server::new_async().await
 }
 
+/// 竞态安全的 "上游不可达" 地址: `127.0.0.1:1` (tcpmux, 特权端口).
+///
+/// 旧构造 (bind `127.0.0.1:0` 后立刻 drop 取临时端口) 有时间窗: 端口回到内核池后可被
+/// 并行的其他测试进程 bind (本套件的 proxy / mockito 监听都用 bind(:0) 抽端口), 高负载下
+/// 偶发 "假死上游" 被真实监听顶替 → 连接成功 → 502 断言失败 (2026-10-10 默认档首轮
+/// flake, load ~13-24 / 32 核). 改用特权端口 1 根除: 非 root 测试进程无法 bind 特权端口,
+/// bind(:0) 的临时端口分配也永不落在特权区间 → 该地址上恒无监听, connect 恒得
+/// ECONNREFUSED (loopback 快路径, 不涉连接超时档).
+///
+/// 假设声明 (ROB 纪律): 本机 / CI 环境无服务监听 port 1 (tcpmux 为废弃协议, 2026-10-10
+/// 实测未监听), 亦无防火墙对 loopback dport 1 DROP 的病态配置 (该场景呈**稳定的**超时
+/// 失败, 与本修复要消灭的竞态 flake 不同类). 若极端环境 port 1 有服务, 使用方测试会以
+/// 明确的断言消息失败而非静默误判.
+fn dead_upstream_addr() -> std::net::SocketAddr {
+    "127.0.0.1:1".parse().unwrap()
+}
+
 /// 启动 secret-guard, 单 provider (默认 OpenAI 协议, base_url = mock 上游).
 async fn spawn_proxy_with_provider(provider: Provider) -> String {
     spawn_proxy_full(
@@ -981,9 +998,7 @@ async fn upstream_non_2xx_is_forwarded() {
 
 #[tokio::test]
 async fn upstream_unreachable_returns_502_and_marks_record_incomplete() {
-    let dummy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let bad_addr = dummy_listener.local_addr().unwrap();
-    drop(dummy_listener);
+    let bad_addr = dead_upstream_addr();
 
     let upstream_client = reqwest::Client::new();
     let records = ConversationDag::new(64, 500, 1);
@@ -8645,9 +8660,7 @@ mod sec6_proptests {
 /// #160 (交叉): 错误终态 (502) 也必须有 forward 摘要行 (不只成功路径).
 #[tokio::test]
 async fn upstream_unreachable_502_body_carries_readable_cause() {
-    let dummy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let bad_addr = dummy_listener.local_addr().unwrap();
-    drop(dummy_listener);
+    let bad_addr = dead_upstream_addr();
 
     // provider 带非空 api_key: 断言它不出现在 502 body (issue 明确要求).
     let mut provider = openai_provider("oa-dead", &format!("http://{bad_addr}"));
