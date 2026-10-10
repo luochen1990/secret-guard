@@ -461,6 +461,7 @@ fn secret(id: &str, value: &str) -> SecretEntry {
         value: value.into(),
         value_file: None,
         mock_strategy: secret_guard::mock::MockStrategy::default(),
+        strategy: secret_guard::secrets::SecretStrategy::default(),
     };
     // 模拟生产 validate_and_resolve 路径: 让 Auto 模式的 gen spec 被 infer.
     // 测试用空 global_prefix (与原固定无前缀语义对齐).
@@ -6274,6 +6275,7 @@ fn weak_secret(id: &str, value: &str) -> SecretEntry {
                 length_range: (1, 1), // 仅 10 个可能值 "0".."9"
             }),
         },
+        strategy: secret_guard::secrets::SecretStrategy::default(),
     };
     e.mock_strategy.resolve_against(value, "");
     e
@@ -6381,7 +6383,7 @@ async fn fail_open_mode_remains_forwarding_when_probing_exhausted() {
 }
 
 /// fail_closed 的 503 拒绝在 **cross_proto 路径**同样生效 (M-C1 守卫: 错误映射
-/// 收口到 probe_exhausted_error 后, same-proto / cross-proto 两路径行为一致).
+/// 收口到 redact_refusal_error (原 probe_exhausted_error, #305 批1 更名) 后, same-proto / cross-proto 两路径行为一致).
 /// 上游 provider 是 openai, ingress 用 anthropic (`/a/`) → 跨协议翻译路径.
 #[tokio::test]
 async fn fail_closed_mode_returns_503_when_probing_exhausted_cross_proto() {
@@ -6425,7 +6427,7 @@ async fn fail_closed_mode_returns_503_when_probing_exhausted_cross_proto() {
     );
     let text = resp.text().await.unwrap();
     // M-C1 守卫: pin 503 message 全文 (客户端可见契约面, SEC-2 同型 — 两路径
-    // 共享 probe_exhausted_error, 文案漂移在此立即暴露). message 无引号/反斜杠,
+    // 共享 redact_refusal_error, 文案漂移在此立即暴露). message 无引号/反斜杠,
     // JSON 转义不影响子串形态.
     let expected_msg = "redact probe exhausted, secret forwarding refused by policy \
          (on_probe_exhausted=fail_closed); check secret mock_strategy config \
@@ -6439,6 +6441,106 @@ async fn fail_closed_mode_returns_503_when_probing_exhausted_cross_proto() {
         "FailClosed 503 body must not leak real secret; got: {text}"
     );
     mock.assert();
+}
+
+// ─── per-secret strategy = "reject" 端到端 (#305 批1, RED-9) ────────────────
+//
+// 与 fail_closed 族的关键差异: reject 是显式策略, 与 on_probe_exhausted 档位正交
+// (用 fail_open 启动以断言 "降级档位全开仍拒绝"); 503 message 含 secret id 且
+// 不含真值 (SEC-2 同型); mockito 零上游请求.
+
+#[tokio::test]
+async fn prop_reject_strategy_503_zero_upstream_sec2_message() {
+    let real_secret = "super-secret-reject-strategy-DO-NOT-LEAK";
+    let mut upstream = spawn_mock_upstream().await;
+    // expect(0) + assert 守卫 "上游未被调用" (与 fail_closed 族同型, RED-4 子句).
+    let mock = upstream
+        .mock("POST", "/v1/chat/completions")
+        .expect(0)
+        .with_status(200)
+        .with_body(r#"{"id":"should-not-reach"}"#)
+        .create_async()
+        .await;
+
+    let mut reject_entry = secret("reject-api-key", real_secret);
+    reject_entry.strategy = secret_guard::secrets::SecretStrategy::Reject;
+    let secrets = test_secret_table_with(vec![reject_entry]);
+    // 用 fail_open 启动: reject 不受降级档位豁免 — 比 fail_closed 更强的断言
+    // (若实现误把 reject 归入降级类, 本测试立即红灯).
+    let proxy_url = spawn_proxy_with_probe_mode(
+        secret_guard::config::OnProbeExhausted::FailOpen,
+        secrets,
+        &upstream.url(),
+    )
+    .await;
+
+    let body = format!(
+        r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"use {real_secret} now"}}]}}"#
+    );
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/o/oa-main/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "strategy=reject must return 503 when the secret value hits"
+    );
+    let text = resp.text().await.unwrap();
+    // message 含 secret id + reason 语义 (SEC-2 同型 hint), 不含真值.
+    assert!(
+        text.contains("reject-api-key"),
+        "503 body should name the secret id; got: {text}"
+    );
+    assert!(
+        text.contains("strategy=reject"),
+        "503 body should explain the reject refusal; got: {text}"
+    );
+    assert!(
+        !text.contains(real_secret),
+        "reject 503 body must not leak real secret; got: {text}"
+    );
+    mock.assert();
+}
+
+#[tokio::test]
+async fn prop_reject_strategy_unhit_forwards_normally() {
+    // 回归: reject secret 存在但请求未含其真值 → 正常转发 (策略只在命中时生效).
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"chatcmpl-1"}"#)
+        .create_async()
+        .await;
+
+    let mut reject_entry = secret("reject-api-key", "reject-unhit-secret-value-xyz");
+    reject_entry.strategy = secret_guard::secrets::SecretStrategy::Reject;
+    let secrets = test_secret_table_with(vec![reject_entry]);
+    let proxy_url = spawn_proxy_with_probe_mode(
+        secret_guard::config::OnProbeExhausted::FailClosed,
+        secrets,
+        &upstream.url(),
+    )
+    .await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/o/oa-main/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-4o","messages":[{"role":"user","content":"no secret here"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "unhit reject secret must not affect forwarding"
+    );
 }
 
 #[tokio::test]

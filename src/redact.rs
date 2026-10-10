@@ -119,6 +119,10 @@ pub enum RedactReason {
     ProbingExhausted,
     /// 内部一致性错误 (C4 单射性违反, 仅在防御性检查触发).
     MockCollision,
+    /// per-secret reject 策略命中 (#305, 契约 RED-9): secret 真值出现于请求,
+    /// strategy=reject 显式拒绝转发. **与 probing 降级无关** — 是用户声明的策略
+    /// 而非资源耗尽的降级, 不受 `on_probe_exhausted` fail_open/closed 模式影响.
+    StrategyReject,
 }
 
 /// 改写映射: real ↔ mock 双向索引.
@@ -297,7 +301,10 @@ pub fn redact_ir(ir: &mut IrRequest, secrets: &[SecretEntry]) -> (RedactionMap, 
     // 历史行为: FailOpen. 遇 Err 仍降级跳过 (与旧实现语义完全一致, 向后兼容).
     match redact_ir_inner(ir, secrets, OnProbeExhausted::FailOpen) {
         Ok(out) => out,
-        // FailOpen 模式下 inner 永不返回 Err (内部已 warn+skip). 此分支防御性 unreachable.
+        // FailOpen 模式下 probing 降级在 inner 内部已 warn+skip, 不会走到这里.
+        // 唯一例外是 strategy=reject (#305): 显式策略不受 mode 豁免, inner 无条件
+        // 返回 Err. 本历史 API 无 Err 通道 (签名返回 tuple), 只能降级 warn + 空 map;
+        // 生产路径全部经 redact_ir_checked (reject 在那里正确拒绝转发), 本 API 仅供单测.
         Err(e) => {
             warn!(
                 secret_id = %e.secret_id,
@@ -333,8 +340,9 @@ pub fn redact_ir_checked(
 
 /// redact 内部共享实现. `mode` 控制 probing 耗尽时的策略.
 ///
-/// FailOpen 模式下永不返回 Err (内部 warn+skip, 与旧 `redact_ir` 语义一致).
+/// FailOpen 模式下 probing 降级不返回 Err (内部 warn+skip, 与旧 `redact_ir` 语义一致);
 /// FailClosed 模式下首次遇到 probing 耗尽或 insert collision 即返回 Err.
+/// 例外: strategy=reject (#305) 是显式策略, 两种模式下都返回 Err (见循环内检查).
 fn redact_ir_inner(
     ir: &mut IrRequest,
     secrets: &[SecretEntry],
@@ -358,6 +366,16 @@ fn redact_ir_inner(
             continue;
         }
         hit_any = true;
+        // strategy=reject (#305, RED-9): 真值出现于请求即整请求拒绝, 位于位置统计与
+        // mock 生成之前. **无条件 return Err** — reject 是用户显式声明的策略而非降级,
+        // 不受 mode (on_probe_exhausted fail_open/closed) 影响: fail_open 只豁免 probing
+        // 降级类失败, 不豁免显式拒绝策略.
+        if secret.strategy == crate::secrets::SecretStrategy::Reject {
+            return Err(RedactError {
+                secret_id: secret.id.clone(),
+                reason: RedactReason::StrategyReject,
+            });
+        }
         // 位置统计 (替换前, 只读): 仅对命中的 secret 执行, 与替换遍历同阶
         // (USAGE-7 治理归因 — 哪个环节把 secret 塞进来).
         let locations = count_hit_locations(ir, &secret.value);
@@ -1443,6 +1461,7 @@ fn entry(value: &str) -> SecretEntry {
         value: value.into(),
         value_file: None,
         mock_strategy: crate::mock::MockStrategy::default(),
+        strategy: crate::secrets::SecretStrategy::default(),
     };
     // 测试 helper 模拟生产路径: validate_and_resolve 会调用 resolve_against,
     // 让 Auto 模式的 gen spec 被 infer 出来 (否则 gen_candidate 会 panic).
@@ -1619,6 +1638,7 @@ mod tests {
                     length_range: (1, 1), // 仅 10 个可能值
                 }),
             },
+            strategy: crate::secrets::SecretStrategy::default(),
         };
         e.mock_strategy.resolve_against(secret, "");
         e
@@ -2198,6 +2218,71 @@ mod tests {
                 .expect("no secrets → Ok with empty map");
         assert!(map.is_empty());
         assert_eq!(seed, 0);
+    }
+
+    // ─── strategy=reject (#305 批1, RED-9): 显式拒绝, 与 mode 正交 ──────────
+
+    #[test]
+    fn prop_reject_strategy_hits_refuse_regardless_of_mode() {
+        // reject 是显式策略: 真值命中即整请求拒绝, FailOpen 下同样 Err —
+        // on_probe_exhausted 只管 probing 降级类失败, 不豁免显式拒绝.
+        // 注: id 用固定串 (不用 entry() 的 id-{value} 派生), 否则 Debug 输出的
+        // secret_id 天然含真值子串, SEC-2 断言会假阳性 (与既有 weak-secret 同型).
+        let real_secret = "reject-me-secret-value";
+        let mut reject_entry = entry(real_secret);
+        reject_entry.id = "reject-entry".into();
+        reject_entry.strategy = crate::secrets::SecretStrategy::Reject;
+        for mode in [
+            crate::config::OnProbeExhausted::FailOpen,
+            crate::config::OnProbeExhausted::FailClosed,
+        ] {
+            let mut ir = sample_ir_with_text(&format!("uses {real_secret} here"));
+            let err = redact_ir_checked(&mut ir, std::slice::from_ref(&reject_entry), mode)
+                .expect_err("strategy=reject must refuse regardless of mode");
+            assert_eq!(err.reason, RedactReason::StrategyReject);
+            assert_eq!(err.secret_id, "reject-entry");
+            // SEC-2: Err 不得含 real secret 明文.
+            let err_dbg = format!("{err:?}");
+            assert!(
+                !err_dbg.contains(real_secret),
+                "reject Err must not leak real secret: {err_dbg}"
+            );
+        }
+    }
+
+    #[test]
+    fn prop_reject_strategy_miss_passes_through() {
+        // reject secret 存在但请求未含其真值 → 不触发, passthrough 语义不变 (回归).
+        let mut reject_entry = entry("reject-unhit-secret-value");
+        reject_entry.strategy = crate::secrets::SecretStrategy::Reject;
+        let mut ir = sample_ir_with_text("plain message without any secret");
+        let (map, seed) = redact_ir_checked(
+            &mut ir,
+            std::slice::from_ref(&reject_entry),
+            crate::config::OnProbeExhausted::FailClosed,
+        )
+        .expect("unhit reject secret must not affect the request");
+        assert!(map.is_empty());
+        assert_eq!(seed, 0, "seed must be 0 when nothing was hit");
+    }
+
+    #[test]
+    fn prop_reject_strategy_miss_preserves_other_secrets_redact() {
+        // 混合策略: reject secret 未命中 + 另一个 redact secret 命中 → 正常 redact.
+        let mut reject_entry = entry("reject-unhit-secret-value");
+        reject_entry.strategy = crate::secrets::SecretStrategy::Reject;
+        let redact_entry = entry("sk-normal-redact-123");
+        let secrets = vec![reject_entry, redact_entry];
+        let mut ir = sample_ir_with_text("please use sk-normal-redact-123 now");
+        let (map, seed) = redact_ir_checked(
+            &mut ir,
+            &secrets,
+            crate::config::OnProbeExhausted::FailClosed,
+        )
+        .expect("redact-strategy hit must redact normally");
+        assert_eq!(map.real_to_mock.len(), 1);
+        assert!(map.mock_for("sk-normal-redact-123").is_some());
+        assert_ne!(seed, 0, "seed must be non-zero when the redact secret hit");
     }
 
     #[test]
@@ -3884,6 +3969,7 @@ mod hit_location_tests {
             value: value.to_string(),
             value_file: None,
             mock_strategy: crate::mock::MockStrategy::default(),
+            strategy: crate::secrets::SecretStrategy::default(),
         };
         e.mock_strategy.resolve_against(&e.value, "");
         e

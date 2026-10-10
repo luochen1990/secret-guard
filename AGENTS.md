@@ -53,6 +53,7 @@
 | **Route** | 路由四元组 (`model_pattern` model 通配符 / `target` 目标 / `upstream_model` 重写 / `priority` 优先级) — model_pattern 匹配请求 model 时路由到 target, priority 越大越优先 (None = 禁用) | 规则、路由规则 | provider/proxy |
 | **Router Provider** | `ProviderKind::Router` 构造的路由端点 (`routes` 路由列表必填) — 自身不转发, 按请求 model 匹配路由链式解析到链尾实体 provider (per-request, WebUI 即席改路由, #179 多规则化; sum type 化 #187) | 虚拟 endpoint、virtual provider、路由 provider、别名 | provider/proxy |
 | **Secret** | 需要从 LLM 视野中隐藏的真实敏感值 (API key / token / 密码等) | 密钥、敏感信息、真实值、真值 | 全局 |
+| **SecretStrategy** | per-secret 处理策略 (`[[secrets.entries]] strategy`, serde snake_case 枚举, 默认 redact): redact = 现状透明替换 (RED-1..8 既有管辖) \| reject = 真值命中请求 → 整请求 503 拒绝转发, 零上游外发, message 只含 id + reason (SEC-2 同型, 契约 RED-9, #305 批1 已交付) \| protect + placeholder = 计划中 (配置即 validate 报错 fail-fast; 批2/批3 交付, 预留 RED-10/RED-11) | 策略、处理策略、secret 策略 | secrets/redact |
 | **Session** | 由 Merkle 前缀哈希聚类的一组 Node 链 | 会话、对话、conversation | dag/web |
 | **三通道 (exhaust signal channels)** | 耗尽信号的三条独立匹配线 (HTTP status / body 码 / response header, OR 关系), 判定 SSOT = `pool::detect_exhaustion` | 信号通道、触发线 | pool |
 | **闹钟 (alarm)** | 成员耗尽时记录的恢复时刻 (`Exhausted{until}`) — 来自上游精确信号解析 (`resume_at`) 或 `now + cooldown_secs` 兜底 (恒有时刻, 无永久形态) | 恢复时间、冷却时间 | pool |
@@ -374,7 +375,7 @@ Pool 不进此本地终结分支 (Router 专属) — pool 入口的 /models 经 
 | `proxy/` | dispatch 路径选择 + fan_out 四路径 + Provider 鉴权 + router GET /models 本地合成 + provider 协议探测 (拆分为 mod/helpers/auth/models/recorder/same_proto/cross_proto/fan_out 子模块) | `src/proxy/mod.rs` 头部 `//!` |
 | `record.rs` | ForwardRecord (web 层 DTO, GET /records/{id} 响应 shape) | 文件头部 `//!` |
 | `redact.rs` | RedactionMap + redact/restore pipeline + 形式化契约 C1-C7 | 文件头部 `//!` |
-| `secrets.rs` | SecretEntry 实体 + Effective view + value 两来源 | 文件头部 `//!` |
+| `secrets.rs` | SecretEntry 实体 + SecretStrategy 处理策略 (RED-9) + Effective view + value 两来源 | 文件头部 `//!` |
 | `server.rs` | router 装配 + 双层状态注入 + graceful shutdown + Host/Origin guard 最外层挂载 | 文件头部 `//!` |
 | `server_host_guard.rs` | Host 白名单 + Origin/Sec-Fetch-Site 校验 middleware (SEC-7: 防 DNS rebinding + CSRF 纵深; 白名单语义见文件头) | 文件头部 `//!` |
 | `socket_activation.rs` | systemd socket activation 的 LISTEN_FDS 接管 (#242 建议②: 手写最小协议, fail-open 回退正常 bind) | 文件头部 `//!` |
@@ -419,6 +420,7 @@ Secret / Provider 的两种 value 来源 (`value`/`value_file`、`api_key`/`api_
 - `on_unsupported_protocol`: 实现指针 `src/proxy/same_proto.rs` from_native-None 分支 + `src/config.rs::OnUnsupportedProtocol`; 默认 `fail_closed` 同为 SEC-10 2026-09 翻转.
 - `privacy_scan_groups`: state.toml 动态字段 (**非** static toml; R3 = PR #303 review) — 隐私扫描 pattern 语义分组 (cloud/ai/vcs/chat/crypto, SSOT = `src/privacy.rs::PatternGroup`) 的组开关 map, **只存关掉的组** (缺省/空 = 全组开, serde default 兼容旧 state.toml); 运行时态 = `src/state.rs::PrivacyScanGroups` (AtomicU32 位掩码 + RMW 持久化, 完整镜像 audit_capture 先例), 扫描 task 与 alerts 视图经共享 mask 读 (组开关只收窄 pattern 面, 不能越过 static `[privacy_scan] mode=off`); API = `GET/PUT /api/privacy-scan/settings` (PUT 全量替换, 未知名 400, off 档拒绝), alerts 响应内嵌 groups.
 - `redacted_headers`: 归一化实现 `state.rs::normalize_redacted_headers`; 脱敏名单 = 硬编码黑名单 (`proxy::helpers::is_sensitive_header` 为 SSOT) ∪ 本配置, 请求/响应两侧 record 记录点统一取 `AppState::redacted_headers`.
+- `strategy` (`[[secrets.entries]]` 字段): per-secret 处理策略四值 — redact (默认, 现状) / reject (真值命中 → 整请求 503 + 零上游外发, #305 批1) / protect + placeholder (计划中, 配置即 validate 报错 fail-fast, 批2/批3 交付); 实现指针 `src/secrets.rs` (`SecretStrategy` enum + `SecretEntry::validate_and_resolve` choke point, static/dynamic/upsert 三条进入路径统一挡未实现值) + `src/redact.rs` (`RedactReason::StrategyReject`, 判定先于 mock 生成且不受 on_probe_exhausted 模式影响) + `src/proxy/recorder.rs::redact_refusal_error` (503 文案, SEC-2 净化); 契约 contracts.md **RED-9**.
 - TCP keepalive (非配置, 内置): `server.rs::build_upstream_client` 显式设置跨平台三项参数 (idle 15s + interval 15s + retries 3); Linux TCP_USER_TIMEOUT 30s 来自锁定的 reqwest 0.12.28 默认值 (macOS 的 reqwest 无此选项) — 全局 "活性判官" (Linux 亚分钟级 ~45s 判死 → 502). 升级 reqwest 时须复核 Linux 默认值; 应用层超时放宽为 3600s 兜底后, keepalive 是死连接的唯一快速检测. 职责分工完整陈述见 contracts.md **FWD-4** "超时职责分工" 段.
 - `upstream_connect_timeout_secs`: `0` = 无限 (向后兼容, 不建议); 覆盖 reqwest `connect_timeout`. 建连是唯一量纲自信的阶段, 15s 保持设紧.
 - `upstream_nonstream_response_header_timeout_secs`: 非流式档默认 3600s = 防挂兜底量纲 (2026-09-23 裁决: #175 的 300s 在深度思考增长下误杀窗口重新打开; 活性检测归 TCP keepalive); "流式" 判定 SSOT = 显式顶层布尔 `true` 才算流式 (实现 `proxy::helpers::requests_stream` + codec reader, 两处等价).

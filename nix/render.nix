@@ -18,7 +18,10 @@
 #       [providers.exhaust] (字段级三态: 字段 null = 省略行 = 上游 serde
 #       字段级 default (内置表/关闭); 字段 [] = 显式关闭该通道; 非空 = 替换.
 #       省略整段 = 上游内置窗口限额默认表)
-#   - SecretEntry (src/secrets.rs): id / category / value_file (本函数只渲染脱敏
+#   - SecretEntry (src/secrets.rs): id / category / strategy (per-secret 处理
+#     策略 #305, 四值 redact|protect|placeholder|reject, 恒显式渲染 — 省略 =
+#     "redact"; protect/placeholder 透传给上游, 由 rust validate 启动 fail-fast
+#     报错 — 单一事实源在上游, nix eval 期不挡) / value_file (本函数只渲染脱敏
 #     形态 value_file, 不支持内联 value)
 #   - AuthConfig (src/auth/mod.rs): enabled + oidc{issuer_url / client_id /
 #     client_secret_file? / redirect_url?} + api_keys[]{label / key? / key_file?}
@@ -450,6 +453,8 @@ let
         "[[secrets.entries]]"
         "id = ${q e.id}"
         "category = ${q (e.category or "apikey")}"
+        # strategy 恒显式渲染 (显式优于隐式, 省略 = "redact")
+        "strategy = ${q (e.strategy or "redact")}"
         "value_file = ${q (absFile "secrets.entries '${e.id}' 的 valueFile" e.valueFile)}"
       ];
 

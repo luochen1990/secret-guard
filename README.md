@@ -40,6 +40,10 @@ Return:    local tools ◄──real Secret──  secret-guard  ◄──Mock r
 - **Return Restore**: when LLM responses come back (tool-call arguments included), Mocks
   are restored to real values — a curl command carrying a Secret lands on your machine
   with authentication passing as usual.
+- **Per-secret strategy**: redact/restore above is the default; a secret can instead be
+  configured `strategy = "reject"` to refuse forwarding (503) the moment it appears in a
+  request — for credentials that must never leave the machine. More strategies are on
+  the way (#305).
 
 The same request, before and after it leaves the machine (captured from a real run; only
 the token value is fictional):

@@ -554,6 +554,7 @@ const KNOWN_FIELDS: &[(&str, &[&str])] = &[
             "value",
             "value_file",
             "mock_strategy",
+            "strategy", // #305 per-secret 处理策略 (redact/protect/placeholder/reject)
         ],
     ),
     // SecretEntry.mock_strategy (MockStrategy; gen_spec 在 wire 上名为 gen)
@@ -1718,6 +1719,7 @@ fn serialized_full_sample_paths() -> Vec<String> {
                         length_range: (8, 12),
                     }),
                 },
+                strategy: crate::secrets::SecretStrategy::default(),
             }],
         },
         // redacted_headers 显式填非空样本 (SEC-4): 与本函数 "全字段填充防盲区"
@@ -2966,6 +2968,7 @@ mod table_tests {
             value: value.into(),
             value_file: None,
             mock_strategy: crate::mock::MockStrategy::default(),
+            strategy: crate::secrets::SecretStrategy::default(),
         }
     }
 
@@ -3188,6 +3191,7 @@ mod table_tests {
             value: "x".into(), // 太短 (< 3 字节) → validate_value 失败.
             value_file: None,
             mock_strategy: crate::mock::MockStrategy::default(),
+            strategy: crate::secrets::SecretStrategy::default(),
         };
         assert!(t.upsert_dynamic(bad).is_err());
     }

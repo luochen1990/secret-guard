@@ -349,6 +349,7 @@ mod tests {
             value: v.to_string(),
             value_file: None,
             mock_strategy: crate::mock::MockStrategy::default(),
+            strategy: crate::secrets::SecretStrategy::default(),
         }
     }
 

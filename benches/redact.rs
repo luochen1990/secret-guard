@@ -113,6 +113,7 @@ fn make_secrets(num: usize) -> Vec<SecretEntry> {
                 value: value.clone(),
                 value_file: None,
                 mock_strategy: MockStrategy::default(),
+                strategy: secret_guard::secrets::SecretStrategy::default(),
             };
             // 与生产路径一致: resolve_against 把 Auto 模式的 gen_spec infer 出来
             // (否则 gen_candidate 会 panic). 空 global_prefix.

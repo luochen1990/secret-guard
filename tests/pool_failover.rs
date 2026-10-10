@@ -154,6 +154,7 @@ fn secret(id: &str, value: &str) -> SecretEntry {
         value: value.into(),
         value_file: None,
         mock_strategy: secret_guard::mock::MockStrategy::default(),
+        strategy: secret_guard::secrets::SecretStrategy::default(),
     };
     e.mock_strategy.resolve_against(&e.value, "");
     e

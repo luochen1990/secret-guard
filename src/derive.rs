@@ -1575,6 +1575,7 @@ mod tests {
             value: value.into(),
             value_file: None,
             mock_strategy: crate::mock::MockStrategy::default(),
+            strategy: crate::secrets::SecretStrategy::default(),
         };
         e.mock_strategy.resolve_against(&e.value, "");
         e

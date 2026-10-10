@@ -1,4 +1,5 @@
-//! Secret 类型定义 + 校验 + [`DynamicEntry`] 实现 + effective 视图.
+//! Secret 类型定义 + 校验 + [`DynamicEntry`] 实现 + effective 视图 + 处理策略
+//! ([`SecretStrategy`]: redact 默认 / reject / protect·placeholder 预留 fail-fast).
 //!
 //! # 三层数据模型 (与 [`crate::provider`] 完全对称)
 //!
@@ -94,6 +95,20 @@ pub struct SecretEntry {
     /// redact 路径 (见 [`crate::redact`]) 通过 [`crate::mock::gen_candidate`] 消费此策略.
     #[serde(default)]
     pub mock_strategy: MockStrategy,
+
+    /// per-secret 处理策略 (#305): 该 secret 真值命中请求时的处置方式.
+    ///
+    /// - `redact` (默认): 替换为 mock — 既有行为, 全部 RED-* 契约逐字不变.
+    /// - `reject`: 真值出现于请求 → 整请求拒绝转发 (503, 零上游外发, message 只含
+    ///   secret id + reason, SEC-2 同型). **显式策略, 不受 `on_probe_exhausted`
+    ///   fail_open/closed 模式影响** (契约 RED-9).
+    /// - `protect` / `placeholder`: 预留值 (批2/批3 交付), 配置即 validate 报错
+    ///   fail-fast (防静默按 redact 处理), 见 [`SecretEntry::validate`] 的检查.
+    ///
+    /// 注: `strategy` 不参与 [`crate::redact::init_seed`] 的哈希 — 翻转策略不应
+    /// 改变其他 secret 的 mock (C3 前缀缓存友好).
+    #[serde(default)]
+    pub strategy: SecretStrategy,
 }
 
 impl SecretEntry {
@@ -227,6 +242,45 @@ impl SecretCategory {
     }
 }
 
+/// per-secret 处理策略 (#305): secret 真值命中请求时 redact pipeline 的处置方式.
+///
+/// 语义总览见 [`SecretEntry::strategy`] 字段文档; reject 行为契约 = contracts.md **RED-9**.
+/// `protect` / `placeholder` 已定义但行为未交付 (批2/批3), 由 [`SecretEntry::validate`]
+/// fail-fast 拒绝 (防静默失效).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretStrategy {
+    /// 默认: 真值替换为 mock (既有 C1-C7 行为).
+    #[default]
+    Redact,
+    /// 全响应 placeholder 替换 (批3 预留, 配置即 validate 报错).
+    Protect,
+    /// 占位符替换 (批2 预留, 配置即 validate 报错).
+    Placeholder,
+    /// 真值出现于请求 → 整请求拒绝转发 (503, 零上游外发).
+    Reject,
+}
+
+impl SecretStrategy {
+    /// 所有变体及其字符串名 (与 `#[serde(rename_all = "snake_case")]` 同步).
+    /// 值域 SSOT: as_str / validate 的 fail-fast 判定消费此表; 前端 strategy
+    /// 选择器硬编码已实现值 (redact/reject), 不从本表派生 (批2/3 落地时同步).
+    pub const ALL: [(Self, &'static str); 4] = [
+        (Self::Redact, "redact"),
+        (Self::Protect, "protect"),
+        (Self::Placeholder, "placeholder"),
+        (Self::Reject, "reject"),
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        Self::ALL
+            .into_iter()
+            .find(|(s, _)| *s == self)
+            .map(|(_, s)| s)
+            .expect("ALL covers every variant")
+    }
+}
+
 /// 校验 secret id (slug). 允许: 字母/数字开头, 长度 1-64, 仅含 `[A-Za-z0-9_-]`.
 /// 防止 XSS / 路径冲突 / 路由切段问题.
 ///
@@ -340,6 +394,21 @@ impl DynamicEntry for SecretEntry {
         // mock_strategy 基础校验 (Fixed 非空 / Auto+gen 配置合法). 依赖 real value 的
         // C5 检查由 validate_against_real 在 resolve 后执行, 不在这里 (兼容 value_file 模式).
         self.mock_strategy.validate()?;
+        // strategy 值域 fail-fast (#305 批1): protect / placeholder 已定义但行为未交付
+        // (批2/批3), 接受该配置会静默按 redact 处理 — 显式报错. 放在本 validate 而非
+        // validate_and_resolve 专属步骤: validate_and_resolve 第一步就是 self.validate(),
+        // 且 upsert_dynamic (WebUI CRUD 的底层) 独立调用本方法 — 一处检查同时覆盖
+        // static 加载 / dynamic 加载 / WebUI upsert 全部入口路径.
+        if matches!(
+            self.strategy,
+            SecretStrategy::Protect | SecretStrategy::Placeholder
+        ) {
+            return Err(format!(
+                "secret {}: strategy '{}' is not implemented yet (planned; see #305)",
+                self.id,
+                self.strategy.as_str()
+            ));
+        }
         Ok(())
     }
 
@@ -374,6 +443,7 @@ pub struct EffectiveSecret {
     pub value_masked: String,
     pub value_length: usize,
     pub mock_strategy: MockStrategy,
+    pub strategy: SecretStrategy,
 
     pub source: EffectiveSource,
     pub decision: OverrideMode,
@@ -390,6 +460,7 @@ pub struct SecretMasked {
     pub value_masked: String,
     pub value_length: usize,
     pub mock_strategy: MockStrategy,
+    pub strategy: SecretStrategy,
 }
 
 impl From<SecretEntry> for SecretMasked {
@@ -401,6 +472,7 @@ impl From<SecretEntry> for SecretMasked {
             name: e.name,
             category: e.category,
             mock_strategy: e.mock_strategy,
+            strategy: e.strategy,
         }
     }
 }
@@ -435,6 +507,7 @@ fn compute_effective_secret(
         name: raw.name,
         category: raw.category,
         mock_strategy: raw.mock_strategy,
+        strategy: raw.strategy,
         source,
         decision: mode,
         static_version: static_masked,
@@ -461,6 +534,7 @@ mod tests {
             value: value.into(),
             value_file: None,
             mock_strategy: MockStrategy::default(),
+            strategy: SecretStrategy::default(),
         }
     }
 
@@ -540,6 +614,88 @@ mod tests {
         }
         // 其他类型转换正确.
         assert_eq!(SecretCategory::default(), SecretCategory::ApiKey);
+    }
+
+    // ─── SecretStrategy (#305 批1): serde 兼容 + validate fail-fast ─────────
+
+    #[test]
+    fn secret_strategy_defaults_to_redact_for_legacy_config() {
+        // 旧配置不带 strategy 字段 → Redact (零行为变化锚, RED-9 向后兼容).
+        let e: SecretEntry = toml::from_str(
+            r#"
+            id = "legacy"
+            value = "sk-legacy-secret-value"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(e.strategy, SecretStrategy::Redact);
+        assert_eq!(SecretStrategy::default(), SecretStrategy::Redact);
+    }
+
+    #[test]
+    fn secret_strategy_reject_parses_from_toml() {
+        let e: SecretEntry = toml::from_str(
+            r#"
+            id = "r"
+            value = "sk-rejectable-secret-value"
+            strategy = "reject"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(e.strategy, SecretStrategy::Reject);
+        // 未知值被 serde 拒绝 (fail-fast, 不静默 fallback).
+        assert!(
+            toml::from_str::<SecretEntry>(
+                r#"
+            id = "bad"
+            value = "sk-some-secret-value-xx"
+            strategy = "bogus"
+        "#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn secret_strategy_all_roundtrip_str() {
+        for (s, name) in SecretStrategy::ALL {
+            assert_eq!(s.as_str(), name);
+            // serde 字符串名与 as_str 一致 (ALL 是单一事实来源).
+            let json = serde_json::to_string(&s).unwrap();
+            assert_eq!(json, format!("{name:?}"));
+        }
+    }
+
+    #[test]
+    fn validate_rejects_unimplemented_strategy_values() {
+        // protect / placeholder 已定义但行为未交付 → validate fail-fast (#305 批1).
+        // 两条入口路径都挡: 直接 validate() (upsert_dynamic 底层独立调用) 与
+        // validate_and_resolve() (static/dynamic 加载 + WebUI handler 的 choke point).
+        for bad in [SecretStrategy::Protect, SecretStrategy::Placeholder] {
+            let mut e = entry("unimpl", "sk-unimplemented-strategy");
+            e.strategy = bad;
+            let err = e.validate().unwrap_err();
+            assert!(
+                err.contains("not implemented yet"),
+                "validate() should reject {bad:?}: {err}"
+            );
+            assert!(
+                err.contains("planned; see #305"),
+                "err should point to the plan: {err}"
+            );
+            let mut e2 = entry("unimpl", "sk-unimplemented-strategy");
+            e2.strategy = bad;
+            assert!(
+                e2.validate_and_resolve("").is_err(),
+                "validate_and_resolve() must also reject {bad:?}"
+            );
+        }
+        // 可用值 (redact / reject) 不被 validate 挡 — 行为约束在 redact pipeline.
+        for ok in [SecretStrategy::Redact, SecretStrategy::Reject] {
+            let mut e = entry("ok-strategy", "sk-usable-strategy-value");
+            e.strategy = ok;
+            assert!(e.validate().is_ok(), "{ok:?} should pass validate");
+        }
     }
 
     // ─── effective_snapshot: 类型特定的 masked 视图 ─────────────────────
@@ -631,6 +787,7 @@ mod tests {
             value: String::new(),
             value_file: Some(path),
             mock_strategy: crate::mock::MockStrategy::default(),
+            strategy: SecretStrategy::default(),
         };
         assert!(e.resolve_value().is_ok());
         assert_eq!(e.value, "sk-test-secret-value"); // 末尾换行被 trim 掉.
@@ -647,6 +804,7 @@ mod tests {
             value: "direct-value".into(),
             value_file: None,
             mock_strategy: crate::mock::MockStrategy::default(),
+            strategy: SecretStrategy::default(),
         };
         assert!(e.resolve_value().is_ok());
         assert_eq!(e.value, "direct-value");
@@ -661,6 +819,7 @@ mod tests {
             value: String::new(),
             value_file: Some(PathBuf::from("/nonexistent/secret-guard-test/no-such-file")),
             mock_strategy: crate::mock::MockStrategy::default(),
+            strategy: SecretStrategy::default(),
         };
         let err = e.resolve_value().unwrap_err();
         // 错误信息含 id + path 便于排查.
@@ -684,6 +843,7 @@ mod tests {
             value: "some-direct-value".into(),
             value_file: Some(PathBuf::from("/etc/passwd")),
             mock_strategy: crate::mock::MockStrategy::default(),
+            strategy: SecretStrategy::default(),
         };
         let err = e.validate().unwrap_err();
         assert!(
@@ -702,6 +862,7 @@ mod tests {
             value: String::new(),
             value_file: Some(PathBuf::from("/some/path")),
             mock_strategy: crate::mock::MockStrategy::default(),
+            strategy: SecretStrategy::default(),
         };
         assert!(e.validate().is_ok());
     }
@@ -735,6 +896,7 @@ mod tests {
                     length_range: (4, 4),
                 }),
             },
+            strategy: SecretStrategy::default(),
         };
         assert!(e.validate_and_resolve("").is_ok());
         let lint = e
@@ -757,6 +919,7 @@ mod tests {
             value: "aaaa".into(),
             value_file: None,
             mock_strategy: crate::mock::MockStrategy::default(),
+            strategy: SecretStrategy::default(),
         };
         assert!(e.validate_and_resolve("").is_ok());
         assert!(
@@ -815,6 +978,7 @@ mod tests {
                 value: value.clone(),
                 value_file: None,
                 mock_strategy: MockStrategy::default(),
+                strategy: SecretStrategy::default(),
             };
             let table = SecretTable::new(
                 vec![s],

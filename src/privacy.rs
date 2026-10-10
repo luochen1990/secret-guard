@@ -1519,6 +1519,7 @@ mod tests {
             value: value.into(),
             value_file: None,
             mock_strategy: Default::default(),
+            strategy: crate::secrets::SecretStrategy::default(),
         }
     }
 

@@ -9,7 +9,7 @@ use axum::response::{IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 
 use crate::config::OverrideMode;
-use crate::secrets::{EffectiveSecret, SecretCategory, SecretEntry, SecretMasked};
+use crate::secrets::{EffectiveSecret, SecretCategory, SecretEntry, SecretMasked, SecretStrategy};
 use crate::state::{AppState, NO_STORE};
 
 use super::crud::{Created, DecisionRequest, create_flow, decision_flow, delete_flow, update_flow};
@@ -137,6 +137,11 @@ pub(crate) struct CreateSecretRequest {
     /// (Auto + resolve 时 infer gen spec).
     #[serde(default)]
     pub mock_strategy: Option<crate::mock::MockStrategy>,
+    /// 可选: per-secret 处理策略 (#305). 省略时后端用 [`SecretStrategy::default`]
+    /// (Redact). protect / placeholder 已定义但未实现, 提交会被 validate 拒绝
+    /// (fail-fast, 防止以为受保护而实际静默失效).
+    #[serde(default)]
+    pub strategy: Option<SecretStrategy>,
 }
 
 impl CreateSecretRequest {
@@ -155,6 +160,7 @@ impl CreateSecretRequest {
             value: self.value,
             value_file: self.value_file.map(std::path::PathBuf::from),
             mock_strategy: self.mock_strategy.unwrap_or_default(),
+            strategy: self.strategy.unwrap_or_default(),
         })
     }
 }
@@ -172,6 +178,7 @@ mod tests {
             value: String::new(),
             value_file: None,
             mock_strategy: None,
+            strategy: None,
         };
         assert!(req.into_entry().is_err());
     }
@@ -188,6 +195,7 @@ mod tests {
             value: "direct-value".into(),
             value_file: Some("/some/path".into()),
             mock_strategy: None,
+            strategy: None,
         };
         let entry = req.into_entry().expect("into_entry skips mutex check");
         // 但 SecretEntry::validate_and_resolve 必须拒绝此组合.

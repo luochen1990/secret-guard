@@ -483,6 +483,16 @@ in
                 default = "apikey";
                 description = "类别 (影响 mock 生成策略, 对齐上游 SecretCategory serde lowercase 命名).";
               };
+              strategy = lib.mkOption {
+                type = lib.types.enum [
+                  "redact"
+                  "protect"
+                  "placeholder"
+                  "reject"
+                ];
+                default = "redact";
+                description = "per-secret 处理策略 (对齐上游 SecretStrategy): redact = 替换为 mock (默认); reject = 请求中检测到即拒绝整个请求 (503, 零上游外发). protect / placeholder 尚未实现 — nix 侧接受四值透传 (单一事实源: 值合法性由 rust validate 启动时报错挡下, 而非 eval 期), 选中会在启动时 fail-fast.";
+              };
               valueFile = lib.mkOption {
                 type = lib.types.path;
                 description = "secret 明文文件路径 (与上游 value_file 1:1; 启动时一次性 resolve, 读不到 → fail-fast 启动失败). 保持 toml 脱敏的推荐通道.";

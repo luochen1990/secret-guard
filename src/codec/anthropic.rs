@@ -2554,6 +2554,7 @@ mod tests {
             value: "sk-t7-extra-leaf-99".into(),
             value_file: None,
             mock_strategy: Default::default(),
+            strategy: crate::secrets::SecretStrategy::default(),
         };
         // 模拟生产: resolve_against 让 Auto 模式 infer gen spec (同 fwd_property
         // 的 make_secret_entry)。

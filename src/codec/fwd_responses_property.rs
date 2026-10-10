@@ -361,6 +361,7 @@ fn redact_reasoning_summary_is_replaced() {
         value: secret_value.to_string(),
         value_file: None,
         mock_strategy,
+        strategy: crate::secrets::SecretStrategy::default(),
     };
 
     let mut ir = IrRequest {

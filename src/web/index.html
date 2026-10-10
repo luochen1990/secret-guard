@@ -495,6 +495,9 @@
     .pill.cookie { background: var(--info-soft); color: var(--info); }
     .pill.privatekey { background: var(--err-soft); color: var(--err); font-weight: 700; }
     .pill.other { background: var(--panel-hi); color: var(--fg-muted); }
+    /* strategy 徽标 (#305 批1): reject = 拒绝语义 (err 柔底); redact 用默认 pill
+       (accent). class 名与 category 值域无交集, 共用 .pill 命名空间安全. */
+    .pill.reject { background: var(--err-soft); color: var(--err); }
 
     /* source badge — 区分 static / dynamic / override / preferred (软底同风格). */
     .src-badge {
@@ -1801,6 +1804,7 @@
               <th data-i18n="th.category">Category</th>
               <th data-i18n="th.value">Value (masked)</th>
               <th data-i18n="th.length">Length</th>
+              <th data-i18n="th.strategy" data-i18n-title="form.strategy.tip">Strategy</th>
               <th data-i18n="th.mockStrategy">Mock Strategy</th>
               <th data-i18n="th.source">Source</th>
               <th data-i18n="th.decision">Decision</th>
@@ -1808,7 +1812,7 @@
             </tr>
           </thead>
           <tbody id="secrets-body">
-            <tr><td colspan="9" class="empty" data-i18n="secrets.empty">No secrets configured</td></tr>
+            <tr><td colspan="10" class="empty" data-i18n="secrets.empty">No secrets configured</td></tr>
           </tbody>
         </table>
         <!-- #257 S0.5: 疑似未登记候选 (privacy scan 告警, mode=off 时整个面板隐藏 —
@@ -2008,6 +2012,12 @@
       <select id="f-category"></select>
       <label for="f-value" data-i18n="form.value">Value</label>
       <textarea id="f-value" placeholder="the real secret" data-i18n-placeholder="form.valuePlaceholder"></textarea>
+      <label for="f-strategy" data-i18n="form.strategy" data-i18n-title="form.strategy.tip">Strategy</label>
+      <select id="f-strategy">
+        <!-- 只列已实现的两个值 (protect/placeholder 由后端 validate fail-fast, 不入库不展示) -->
+        <option value="redact" data-i18n="form.strategy.redact">Redact — transparent replacement (default)</option>
+        <option value="reject" data-i18n="form.strategy.reject">Reject — refuse forwarding</option>
+      </select>
 
       <fieldset style="grid-column: 1 / -1; border: 1px solid var(--border); padding: 8px; margin: 4px 0;">
         <legend data-i18n="form.mockStrategy">Mock Strategy</legend>
@@ -2419,6 +2429,7 @@
         'th.category': 'Category',
         'th.value': 'Value (masked)',
         'th.length': 'Length',
+        'th.strategy': 'Strategy',
         'th.mockStrategy': 'Mock Strategy',
         'th.source': 'Source',
         'th.decision': 'Decision',
@@ -2433,6 +2444,10 @@
         'form.idPlaceholder': '(auto-generated if blank)',
         'form.namePlaceholder': '(optional)',
         'form.valuePlaceholder': 'the real secret',
+        'form.strategy': 'Strategy',
+        'form.strategy.redact': 'Redact — transparent replacement (default)',
+        'form.strategy.reject': 'Reject — refuse forwarding',
+        'form.strategy.tip': 'How this secret is handled when spotted in a request: redact replaces it with a mock (restored on the way back); reject refuses the whole request (503, zero upstream calls).',
         'form.mockStrategy': 'Mock Strategy',
         'form.initial': 'Initial',
         'form.autoGenerate': 'Auto (generate)',
@@ -2873,6 +2888,7 @@
         'th.category': '类别',
         'th.value': '值 (掩码)',
         'th.length': '长度',
+        'th.strategy': '策略',
         'th.mockStrategy': 'Mock 策略',
         'th.source': '来源',
         'th.decision': '决策',
@@ -2887,6 +2903,10 @@
         'form.idPlaceholder': '(留空自动生成)',
         'form.namePlaceholder': '(可选)',
         'form.valuePlaceholder': '真实 secret 值',
+        'form.strategy': '策略',
+        'form.strategy.redact': 'Redact — 透明替换 (默认)',
+        'form.strategy.reject': 'Reject — 拒绝转发',
+        'form.strategy.tip': '在请求中发现该 secret 时的处理方式: redact 替换为 mock (响应回传时还原); reject 拒绝整个请求 (503, 零上游外发)。',
         'form.mockStrategy': 'Mock 策略',
         'form.initial': '初始值',
         'form.autoGenerate': '自动 (生成)',
@@ -5454,7 +5474,7 @@
         statsId: 'secrets-stats',
         formDlgId: 'secret-form',
         formElId: 'secret-form-el',
-        colspan: 9,
+        colspan: 10,
         emptyText: () => t('secrets.empty'),
         kindParam: 'secret', // decision endpoint URL 用
         refresh: () => refreshSecrets(),
@@ -6253,6 +6273,7 @@
           <td class="cell-short"><span class="pill ${escapeHtml(s.category)}">${escapeHtml(s.category)}</span></td>
           <td class="cell-long" title="${escapeHtml(s.value_masked || '')}"><span class="cell-ellipsis"><code>${escapeHtml(s.value_masked)}</code></span></td>
           <td class="cell-short">${escapeHtml(s.value_length)}</td>
+          <td class="cell-short" title="${escapeHtml(strategyTooltip(s.strategy))}"><span class="cell-ellipsis">${strategyBadge(s.strategy)}</span></td>
           <td class="cell-short" title="${escapeHtml(mockStrategyTooltip(s.mock_strategy))}"><span class="cell-ellipsis">${mockStrategyBadge(s.mock_strategy)}</span></td>
           <td>${srcBadge(s.source)}</td>
           <td>${decisionCell('secret', s.id, s.decision, !!s.static_version)}</td>
@@ -6272,12 +6293,29 @@
           <td class="cell-short"><span class="pill ${escapeHtml(s.category)}">${escapeHtml(s.category)}</span></td>
           <td class="cell-long" title="${escapeHtml(s.value_masked || '')}"><span class="cell-ellipsis"><code>${escapeHtml(s.value_masked)}</code></span></td>
           <td class="cell-short">${escapeHtml(s.value_length)}</td>
+          <td class="cell-short" title="${escapeHtml(strategyTooltip(s.strategy))}"><span class="cell-ellipsis">${strategyBadge(s.strategy)}</span></td>
           <td class="cell-short" title="${escapeHtml(mockStrategyTooltip(s.mock_strategy))}"><span class="cell-ellipsis">${mockStrategyBadge(s.mock_strategy)}</span></td>
           <td>${srcBadge('static')}</td>
           <td>${decisionCell('secret', s.id, 'disabled', true)}</td>
           <td class="actions"></td>
         </tr>
       `;
+    }
+
+    // ─── strategy 渲染 (per-secret 处理策略, #305 批1) ─────────────────────
+    //
+    // redact = 替换为 mock (缺省); reject = 检测到即拒绝整个请求 (503 零外发).
+    // 后端 strategy 字段未上线时 s.strategy 为 undefined → 容错按 redact (serde
+    // 缺省值) 显示. badge 配色照 category pill 模式 (策略值作 class).
+
+    function strategyBadge(st) {
+      const v = st || 'redact';
+      return `<span class="pill ${escapeHtml(v)}">${escapeHtml(v)}</span>`;
+    }
+
+    // tooltip 复用表单选项词条 (form.strategy.redact / form.strategy.reject).
+    function strategyTooltip(st) {
+      return t(`form.strategy.${st || 'redact'}`);
     }
 
     // ─── mock strategy 渲染 (摘要 + tooltip) ──────────────────────────────
@@ -6644,6 +6682,9 @@
       // 编辑: 强制重输 value (避免泄露 — 服务端不回传真实值);
       // 预填 (privacy scan 登记): value 已在告警行明文可见, 预填无新增暴露面.
       document.getElementById('f-value').value = (!existing && prefill?.prefillValue) || '';
+      // Strategy: 加载 existing 或默认 redact (下拉词表外的值回退默认 — 后端
+      // fail-fast 保证 protect/placeholder 不入库, 此处纯容错).
+      loadStrategyIntoForm(existing?.strategy);
       // Mock strategy: 加载 existing 或默认值.
       loadMockStrategyIntoForm(existing?.mock_strategy);
       title.textContent = existing ? t('form.secret.editTitle', { id: existing.id }) : t('form.secret.newTitle');
@@ -6656,6 +6697,13 @@
     // ─── mock strategy form helpers ──────────────────────────────────────
     //
     // 与后端 MockStrategy JSON shape 对齐. 省略 gen 字段让后端 infer (Auto + 无 gen).
+
+    // strategy select 回填: 值在下拉词表 (redact/reject) 外 (undefined /
+    // protect / placeholder 等未实现值) 时回退 redact (serde 缺省).
+    function loadStrategyIntoForm(st) {
+      const sel = document.getElementById('f-strategy');
+      sel.value = st && [...sel.options].some(o => o.value === st) ? st : 'redact';
+    }
 
     function loadMockStrategyIntoForm(ms) {
       const initial = (ms && ms.initial && ms.initial.kind) || 'auto';
@@ -7593,6 +7641,8 @@
       name: document.getElementById('f-name').value.trim() || null,
       category: document.getElementById('f-category').value,
       value: document.getElementById('f-value').value,
+      // strategy 值域受 select 限制 (redact/reject); 旧后端 (无该字段) 忽略未知键, 无害.
+      strategy: document.getElementById('f-strategy').value,
       mock_strategy: collectMockStrategyFromForm(),
     }));
 

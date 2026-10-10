@@ -370,6 +370,7 @@ mod tests {
                 value: "sk-live-qwerty987654".into(),
                 value_file: None,
                 mock_strategy: crate::mock::MockStrategy::default(),
+                strategy: crate::secrets::SecretStrategy::default(),
             }],
             vec![],
             std::sync::Arc::new(parking_lot::RwLock::new(crate::config::Decisions::default())),

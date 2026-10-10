@@ -426,6 +426,20 @@ services.secret-guard.providers.glm-pool = {
 | `value` | string | `""` | secret 明文. 最少 3 字节; 不允许包含 `global_mock_prefix`; 不允许包含 Unicode 私用区字符 (U+E000..U+F8FF). 与 `value_file` 互斥. |
 | `value_file` | path | — | 启动时一次性从文件读取 (适合 sops-nix 等外部注入), 读取失败会**拒绝启动** (fail-fast: secret 缺失会让保护静默失效, 必须在部署时暴露). 文件内容自动去首尾空白. |
 | `mock_strategy` | table | (见下) | 替身 (mock) 的生成策略. 缺省时自动按真值推断: 等长、同字符集的确定性随机值. |
+| `strategy` | string | `"redact"` | 该 secret 命中后的处理策略, 四值语义见下. |
+
+**`strategy` 四值语义**:
+
+- `redact` (默认): 现状行为 — 真值命中请求时透明替换为 mock, 响应回传时还原. 缺省零改动.
+- `reject`: 真值命中请求 → **整请求拒绝转发** — 客户端收 503, 错误信息只含 secret id 不含真值, 且**零上游外发** (适合 "绝不允许离开本机" 的高危值, 如生产数据库密码).
+- `protect` / `placeholder`: 计划中 (后续批次交付) — 配置即启动报错 (`not implemented yet`), 防止以为受保护而实际静默失效.
+
+```toml
+[[secrets.entries]]
+id = "prod-db-password"
+value = "..."
+strategy = "reject"        # 命中即拒绝转发; 缺省 redact 可省略
+```
 
 ### `mock_strategy` 子表
 

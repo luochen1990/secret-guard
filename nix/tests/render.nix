@@ -420,11 +420,32 @@ let
         == "glm-4.7";
     }
     {
-      name = "secrets.entries: id/category 默认/valueFile 直通";
+      name = "secrets.entries: id/category 默认/strategy 默认/valueFile 直通";
       ok =
         (builtins.elemAt parsed.secrets.entries 0).id == "llm__k_api_key"
         && (builtins.elemAt parsed.secrets.entries 0).category == "apikey"
+        # strategy 未显式设 → 恒显式渲染缺省值 "redact" (显式优于隐式)
+        && (builtins.elemAt parsed.secrets.entries 0).strategy == "redact"
         && (builtins.elemAt parsed.secrets.entries 0).value_file == "/run/secrets/llm__k_api_key";
+    }
+    {
+      name = "secrets.entries: strategy 显式 reject 透传";
+      ok =
+        let
+          t = render (
+            baseArgs
+            // {
+              secretsEntries = [
+                {
+                  id = "k";
+                  valueFile = "/x";
+                  strategy = "reject";
+                }
+              ];
+            }
+          );
+        in
+        (builtins.elemAt (builtins.fromTOML t).secrets.entries 0).strategy == "reject";
     }
     {
       name = "auth 段: enabled + oidc 字段 + clientSecretFile 直通 + apiKeys keyFile";

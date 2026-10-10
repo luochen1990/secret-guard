@@ -27,6 +27,9 @@ claude-code / opencode / hermes-agent 这类 Agent 工具 (即本地的 Agent Ha
 - **出站 Redact**: 发往 LLM 的请求中, Secret 被替换为等长、同字符集的仿真 Mock
   (默认策略) — LLM 拿着它照常干活, 浑然不觉。
 - **回传 Restore**: LLM 响应回传时 (包括工具调用参数), Mock 被反向还原为真值 — 含 Secret 的 curl 命令落到你机器上时认证照常通过。
+- **per-secret 策略**: 上述 redact/restore 是默认行为; 也可对单个 secret 配置
+  `strategy = "reject"`, 请求一旦含该真值立即拒绝转发 (503) — 适用于绝不允许离开
+  本机的凭证。更多策略在路上 (#305)。
 
 一笔真实请求出站前后的样子 (截自真实运行, 仅 token 值为虚构):
 

@@ -173,7 +173,7 @@ fn derive_redact_hits(
 /// `redact_and_derive` 的返回类型别名 (避免 clippy::type_complexity 误报).
 ///
 /// 四元组语义: `(redaction_map, redact_seed, redactions, redact_hits)`.
-/// Err 是已构造好的客户端错误 (fail_closed 503, 见 [`probe_exhausted_error`]),
+/// Err 是已构造好的客户端错误 (拒绝转发 503, 见 [`redact_refusal_error`]),
 /// 调用方用 `?` 直接传播.
 type RedactOutcome = Result<
     (
@@ -189,9 +189,11 @@ type RedactOutcome = Result<
 ///
 /// `mode` 控制 probing 耗尽时的策略:
 /// - [`OnProbeExhausted::FailClosed`] (默认, SEC-10): 耗尽时返回 `Err(AppError)`
-///   (503, 由 [`probe_exhausted_error`] 构造), 调用方 `?` 传播拒绝转发.
+///   (503, 由 [`redact_refusal_error`] 构造), 调用方 `?` 传播拒绝转发.
 /// - [`OnProbeExhausted::FailOpen`] (显式 opt-in, 历史行为): 耗尽时 warn+skip
 ///   (向后兼容, 永不 Err).
+///
+/// 例外: strategy=reject (#305) 是显式策略, 与 mode 正交, 两种模式下都拒绝转发.
 ///
 /// 返回 `(redaction_map, redact_seed, redactions, redact_hits)`. redaction_map 非空时 debug 日志记录命中数.
 ///
@@ -205,9 +207,9 @@ pub(super) fn redact_and_derive(
 ) -> RedactOutcome {
     let (redaction_map, redact_seed) = match redact_ir_checked(ir, secrets_snapshot, mode) {
         Ok(ok) => ok,
-        // fail_closed 拒绝转发: 503 错误构造收口在此 (两路径共用同一 log_tag,
-        // 消除调用方镜像 match 与 tag 字面量的双写漂移面).
-        Err(e) => return Err(probe_exhausted_error(&e, log_tag)),
+        // redact 拒绝转发 (fail_closed 降级 / strategy=reject): 503 错误构造收口在此
+        // (两路径共用同一 log_tag, 消除调用方镜像 match 与 tag 字面量的双写漂移面).
+        Err(e) => return Err(redact_refusal_error(&e, log_tag)),
     };
     if !redaction_map.is_empty() {
         debug!(
@@ -226,25 +228,50 @@ pub(super) fn redact_and_derive(
     Ok((redaction_map, redact_seed, redactions, redact_hits))
 }
 
-/// fail_closed 拒绝转发时的 WARN + 客户端 503 错误构造 (redact_and_derive 内部使用).
+/// redact 拒绝转发时的 WARN + 客户端 503 错误构造 (redact_and_derive 内部使用).
+///
+/// 两个拒绝来源 (按 `e.reason` 分支文案):
+/// - ProbingExhausted / MockCollision: fail_closed 降级 (SEC-10) — 提示检查
+///   mock_strategy 配置与 on_probe_exhausted 档位.
+/// - StrategyReject (#305, RED-9): per-secret reject 策略命中 — 显式策略,
+///   与降级档位无关.
 ///
 /// 该 503 文案是客户端可见错误 body (SEC-2 同型契约面: 变量部分只含 secret id +
 /// reason, 不含 secret 明文) — same_proto / cross_proto 两路径经同一
 /// `redact_and_derive` 调用点触达, 文案单点维护. `log_tag` 与
 /// [`redact_and_derive`] 的同名参数一致 ("same-proto" / "cross-proto"),
-/// 仅用于 WARN 日志的路径归因.
-fn probe_exhausted_error(e: &RedactError, log_tag: &str) -> AppError {
+/// 仅用于 WARN 日志的路径归因. 仍返回 `AppError::Unavailable` (503,
+/// 项目现有 "拒绝转发" 语义家族).
+fn redact_refusal_error(e: &RedactError, log_tag: &str) -> AppError {
+    let (warn_msg, client_msg) = match e.reason {
+        crate::redact::RedactReason::ProbingExhausted
+        | crate::redact::RedactReason::MockCollision => (
+            format!("redact probe exhausted in {log_tag} path; refusing to forward (fail_closed)"),
+            format!(
+                "redact probe exhausted, secret forwarding refused by policy \
+                     (on_probe_exhausted=fail_closed); check secret mock_strategy config \
+                     (secret_id hint: {}, reason: {:?})",
+                e.secret_id, e.reason
+            ),
+        ),
+        crate::redact::RedactReason::StrategyReject => (
+            format!(
+                "secret rejected by strategy (strategy=reject) in {log_tag} path; \
+                 refusing to forward"
+            ),
+            format!(
+                "secret rejected by strategy (strategy=reject); forwarding refused \
+                 (secret_id hint: {})",
+                e.secret_id
+            ),
+        ),
+    };
     warn!(
         secret_id = %e.secret_id,
         reason = ?e.reason,
-        "redact probe exhausted in {log_tag} path; refusing to forward (fail_closed)"
+        "{warn_msg}"
     );
-    AppError::Unavailable(format!(
-        "redact probe exhausted, secret forwarding refused by policy \
-             (on_probe_exhausted=fail_closed); check secret mock_strategy config \
-             (secret_id hint: {}, reason: {:?})",
-        e.secret_id, e.reason
-    ))
+    AppError::Unavailable(client_msg)
 }
 
 // ─── 视图正确性守卫 (CI 用, 需 `--features consistency-check`) ─────────────
@@ -1130,6 +1157,7 @@ mod tests {
                 value: value.into(),
                 value_file: None,
                 mock_strategy: crate::mock::MockStrategy::default(),
+                strategy: crate::secrets::SecretStrategy::default(),
             }
         }
 
@@ -1522,6 +1550,7 @@ mod tests {
                 value: secret.clone(),
                 value_file: None,
                 mock_strategy: crate::mock::MockStrategy::default(),
+                strategy: crate::secrets::SecretStrategy::default(),
             }];
 
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

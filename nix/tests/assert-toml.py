@@ -60,6 +60,8 @@ if mode == "minimal":
 
     e = cfg["secrets"]["entries"][0]
     assert e["id"] == "llm__k_api_key" and e["category"] == "apikey"
+    # strategy 未显式设 → module 默认 "redact" 恒显式渲染 (默认值 e2e 镜像锁)
+    assert e["strategy"] == "redact"
     assert e["value_file"] == "/run/secrets/llm__k_api_key"
 
     rd = cfg["redact"]
