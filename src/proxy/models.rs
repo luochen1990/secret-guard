@@ -2154,6 +2154,7 @@ mod tests {
             ),
             // #257 S0.5: 默认 off (本 harness 不触隐私扫描语义).
             privacy_scan: crate::privacy::PrivacyScanner::disabled(),
+            privacy_scan_groups: crate::state::PrivacyScanGroups::for_tests(),
             // shutdown flag: 本 harness 不消费 /api/events (sender drop 语义见
             // integration.rs::base_app_state 同字段注释).
             shutdown: tokio::sync::watch::channel(false).1,

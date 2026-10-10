@@ -15,7 +15,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 use parking_lot::Mutex;
 
@@ -99,6 +99,11 @@ pub struct AppState {
     /// no-op), `batch` = spawn 后台扫描 task (构造需在 tokio runtime 内,
     /// 装配点 `server.rs::serve`). 语义红线与数据流见 `src/privacy.rs` 头部.
     pub privacy_scan: crate::privacy::PrivacyScanner,
+    /// 隐私扫描 pattern 组开关 (R3, PR #303 review) 运行时态: state.toml
+    /// RMW 持久化 + `AtomicU32` 位掩码内存 (写侧); 扫描 task 与 alerts 视图
+    /// 经 `mask_handle()` 共享读 (读多写少零锁竞争). 语义与持久化见
+    /// [`PrivacyScanGroups`] 文档; 装配点 `server.rs::serve`.
+    pub privacy_scan_groups: PrivacyScanGroups,
     /// graceful shutdown flag: `true` = 进程进入 shutdown. serve() 装配 (sender
     /// 随 `with_graceful_shutdown` future 持有, 信号到达后置 true) — SSE 等无限
     /// 长流 (`GET /api/events`) take_until 此 flag, 保证 drain 不被挂起.
@@ -195,6 +200,106 @@ impl AuditCapture {
         let text = state.to_toml()?;
         crate::config::atomic_write(&self.state_path, &text)?;
         self.mode.store(mode_to_u8(m), Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+// ─── PrivacyScanGroups 开关 (隐私扫描 pattern 组, R3) ───────────────────────
+
+/// 隐私扫描 pattern 组开关 (R3, PR #303 review) 的运行时态 + state.toml 持久化.
+/// 完整复制 `AuditCapture` 先例: RMW 持久化 (与 provider/secret/apikey 表共享
+/// `persist_lock`, 防并发互覆) + "先持久化, 再更新内存" (失败回滚) + 重启恢复
+/// (`DynamicState.privacy_scan_groups`, 缺省空 map = 全组启用, 旧 state.toml
+/// 无缝兼容).
+///
+/// 内存态是 5-bit 位掩码 (`AtomicU32`, bit ↔ `crate::privacy::PatternGroup`
+/// 索引位); 写侧在本类型 (`set_groups`, PUT /api/privacy-scan/settings), 读侧
+/// 经 [`Self::mask_handle`] 共享同一 `Arc<AtomicU32>` — 扫描后台 task (每 job
+/// 一次快照) 与 alerts 视图过滤, 读多写少, 单原子 load 零锁竞争.
+#[derive(Clone, Debug)]
+pub struct PrivacyScanGroups {
+    mask: Arc<AtomicU32>,
+    state_path: Arc<PathBuf>,
+    persist_lock: Arc<Mutex<()>>,
+}
+
+impl PrivacyScanGroups {
+    /// 构造: `initial` 来自启动时加载的 `DynamicState.privacy_scan_groups`.
+    /// 未知名条目**忽略** (手编 state.toml 容错 — state 永远可丢弃重置; 写侧
+    /// PUT 端点才是严格校验面).
+    pub fn new(
+        initial: &std::collections::BTreeMap<String, bool>,
+        state_path: PathBuf,
+        persist_lock: Arc<Mutex<()>>,
+    ) -> Self {
+        Self {
+            mask: Arc::new(AtomicU32::new(Self::mask_of(initial))),
+            state_path: Arc::new(state_path),
+            persist_lock,
+        }
+    }
+
+    /// AppState fixture 用构造 (与 `AuditCapture::for_tests` 模式对称): 全组
+    /// 启用 + 自管临时 state 路径. 常编译 `pub` — integration tests 是独立
+    /// crate.
+    pub fn for_tests() -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "sg-privacy-groups-test-{}.toml",
+            uuid::Uuid::new_v4()
+        ));
+        Self::new(&Default::default(), path, Arc::new(Mutex::new(())))
+    }
+
+    /// map → 位掩码 (未知名忽略; false = 清位).
+    fn mask_of(map: &std::collections::BTreeMap<String, bool>) -> u32 {
+        let mut mask = crate::privacy::PatternGroup::ALL_MASK;
+        for (name, on) in map {
+            if !on && let Some(g) = crate::privacy::PatternGroup::from_name(name) {
+                mask &= !g.bit();
+            }
+        }
+        mask
+    }
+
+    /// 共享位掩码句柄 (喂给 `PrivacyScanner::new`; 读侧快照消费).
+    pub fn mask_handle(&self) -> Arc<AtomicU32> {
+        self.mask.clone()
+    }
+
+    /// 当前生效组态 (规范序快照, wire/回显用): `(组名, 是否启用)` 列表.
+    pub fn enabled_groups(&self) -> Vec<(&'static str, bool)> {
+        let mask = self.mask.load(Ordering::Relaxed);
+        crate::privacy::PatternGroup::ALL
+            .iter()
+            .map(|g| (g.name(), g.enabled_in(mask)))
+            .collect()
+    }
+
+    /// 全量替换组态 (PUT 语义): `map` 中未出现的组 = 启用 (缺省态). 未知名 →
+    /// Err (fail-fast, 调用方 400). RMW 持久化 (归一化为只存 false 条目) +
+    /// 更新内存位掩码; 持久化失败时内存保持旧值 (与 `AuditCapture::set_mode`
+    /// 同型).
+    pub fn set_groups(&self, map: &std::collections::BTreeMap<String, bool>) -> anyhow::Result<()> {
+        // 校验先于持久化: 未知名 fail-fast.
+        for name in map.keys() {
+            if crate::privacy::PatternGroup::from_name(name).is_none() {
+                anyhow::bail!("unknown privacy-scan pattern group '{name}'");
+            }
+        }
+        let new_mask = Self::mask_of(map);
+        // 归一化持久化形态: 只存关掉的组 (缺省 = 开).
+        let disabled: std::collections::BTreeMap<String, bool> = map
+            .iter()
+            .filter(|(_, on)| !**on)
+            .map(|(k, _)| (k.clone(), false))
+            .collect();
+
+        let _guard = self.persist_lock.lock();
+        let mut state = crate::config::DynamicState::load_or_empty(&self.state_path, "")?;
+        state.privacy_scan_groups = disabled;
+        let text = state.to_toml()?;
+        crate::config::atomic_write(&self.state_path, &text)?;
+        self.mask.store(new_mask, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -358,5 +463,108 @@ mod tests {
         std::fs::write(&path, "api_keys_disabled = []\n").unwrap();
         let state = crate::config::DynamicState::load_or_empty(&path, "").unwrap();
         assert_eq!(state.audit_capture, crate::config::AuditCaptureMode::Off);
+    }
+
+    // ─── PrivacyScanGroups: 持久化 round-trip + 校验 + 回滚 ────────────────
+
+    /// 契约: set_groups 持久化 (归一化只存 false 条目), 重启路径 (load_or_empty
+    /// → new) 恢复同一组态 — "重启恢复" 的单元层覆盖; 未知名 Err; 空 map =
+    /// 全组开 (缺省等价).
+    #[test]
+    fn privacy_groups_set_persists_and_round_trips() {
+        let path = tmp_path("groups-roundtrip");
+        let sw =
+            PrivacyScanGroups::new(&Default::default(), path.clone(), Arc::new(Mutex::new(())));
+        // 缺省: 全组启用.
+        assert!(sw.enabled_groups().iter().all(|(_, on)| *on));
+
+        // 关 vcs + chat (显式 true 的 cloud 条目归一化掉 — 缺省即开).
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("vcs".to_string(), false);
+        map.insert("chat".to_string(), false);
+        map.insert("cloud".to_string(), true);
+        sw.set_groups(&map).unwrap();
+
+        // 内存即时生效.
+        assert_eq!(
+            sw.enabled_groups(),
+            vec![
+                ("cloud", true),
+                ("ai", true),
+                ("vcs", false),
+                ("chat", false),
+                ("crypto", true)
+            ]
+        );
+        // 持久化形态: 只存 false 条目 (读回无歧义; 显式 true 归一化掉).
+        let state = crate::config::DynamicState::load_or_empty(&path, "").unwrap();
+        assert_eq!(state.privacy_scan_groups.get("vcs"), Some(&false));
+        assert_eq!(state.privacy_scan_groups.get("chat"), Some(&false));
+        assert_eq!(state.privacy_scan_groups.get("cloud"), None);
+
+        // "重启": 新实例读回同一组态.
+        let sw2 = PrivacyScanGroups::new(
+            &state.privacy_scan_groups,
+            path.clone(),
+            Arc::new(Mutex::new(())),
+        );
+        assert_eq!(sw2.enabled_groups(), sw.enabled_groups());
+
+        // 空 map 全量替换 → 全组开 + 持久化清空.
+        sw2.set_groups(&Default::default()).unwrap();
+        let state2 = crate::config::DynamicState::load_or_empty(&path, "").unwrap();
+        assert!(state2.privacy_scan_groups.is_empty());
+        assert!(sw2.enabled_groups().iter().all(|(_, on)| *on));
+    }
+
+    #[test]
+    fn privacy_groups_unknown_name_rejected_and_rollback_on_failure() {
+        let path = tmp_path("groups-rollback");
+        crate::config::atomic_write(&path, "").unwrap();
+
+        // 未知名 fail-fast (先于持久化 — 磁盘不被污染).
+        let sw =
+            PrivacyScanGroups::new(&Default::default(), path.clone(), Arc::new(Mutex::new(())));
+        let mut bad = std::collections::BTreeMap::new();
+        bad.insert("typo-group".to_string(), false);
+        let err = sw.set_groups(&bad).expect_err("unknown group must 400");
+        assert!(err.to_string().contains("typo-group"));
+
+        // 持久化失败回滚: 目录只读, 内存保持旧值.
+        let mut first = std::collections::BTreeMap::new();
+        first.insert("ai".to_string(), false);
+        let dir = path.parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o500))
+            .unwrap();
+        let err = sw
+            .set_groups(&first)
+            .expect_err("persist into read-only dir must fail");
+        assert!(!err.to_string().is_empty());
+        assert!(
+            sw.enabled_groups().iter().all(|(_, on)| *on),
+            "memory must roll back on persist failure"
+        );
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+    }
+
+    /// 手编 state.toml 的未知名条目: 加载忽略 (ROB), 合名条目生效.
+    #[test]
+    fn privacy_groups_hand_edited_unknown_names_ignored_at_load() {
+        let path = tmp_path("groups-legacy");
+        crate::config::atomic_write(&path, "[privacy_scan_groups]\nvcs = false\ntypo = false\n")
+            .unwrap();
+        let state = crate::config::DynamicState::load_or_empty(&path, "").unwrap();
+        let sw = PrivacyScanGroups::new(&state.privacy_scan_groups, path, Arc::new(Mutex::new(())));
+        assert_eq!(
+            sw.enabled_groups(),
+            vec![
+                ("cloud", true),
+                ("ai", true),
+                ("vcs", false),
+                ("chat", true),
+                ("crypto", true)
+            ]
+        );
     }
 }

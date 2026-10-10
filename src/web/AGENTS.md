@@ -548,7 +548,7 @@ loadTimeline) 才重置 selected 到最新轮 (`.selected` 持续高亮; 不触�
 - 气泡间微小间距 (margin-bottom, 避免视觉粘连).
 - tool round 预览: 直接消费后端预计算的 `round_role` + `preview` 字段 (前端不做 best-effort 推断).
 
-### 隐私扫描面板 (#257 S0.5; R2 状态机 = PR #303 review)
+### 隐私扫描面板 (#257 S0.5; R2 状态机 / R3 组开关 = PR #303 review)
 
 Secrets tab 内 `#privacy-scan-panel`「疑似未登记」区段 (mode=off 时整面板
 `hidden` — 判据 = 告警 API 的 `enabled` 标志, 不让空面板误导排查):
@@ -571,6 +571,12 @@ Secrets tab 内 `#privacy-scan-panel`「疑似未登记」区段 (mode=off 时�
   (active = "疑似已外发"/warn, rotated = stream, ignored = inactive) +
   hit_count + last_seen + context 摘要 (muted + ellipsis) + 动作组
   (已轮换 / 忽略 / 登记; 已处置行保留另一处置动作 + 登记).
+- **组开关行** (`#privacy-group-toggles`, R3): 5 个 pattern 语义组的 checkbox
+  (数据源 = alerts 响应内嵌 `groups`, 免二次 RTT); 切换即
+  `PUT /api/privacy-scan/settings` 全量替换 (乐观更新 + 失败回滚提示;
+  `privacyGroupsPending` 挂起在途期间的重渲染防轮询覆盖). 关组后该组告警
+  **隐藏** (服务端闸门: 扫描与视图双层; 重开自然重现 — "这个维度整体不打扰"
+  语义, 不做置灰残行).
 - **人回路红线**: 「登记」仅打开既有 add-secret 表单并预填 value + 建议
   name (`{pattern} {date}`) — 提交仍走用户确认的 `POST /api/secrets`;
   登记成功后告警行经服务端视图过滤自然消失 (refetch 更新, 非乐观删除).

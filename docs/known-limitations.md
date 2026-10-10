@@ -66,6 +66,9 @@
 
 - **告警为内存态, 重启清空**: `AlertStore` 是 `VecDeque` (cap 256, FIFO 淘汰), 不落盘 — 规避 SEC-8 落盘收紧问题, 一次会话内验证「告警→登记」闭环足够; 重启后告警从零累积 (已登记值天然不会再告警, 无需迁移). R2 状态机的 rotated/ignored 标记同样随重启丢失 (同值再命中回到 active; 无 "已处置值" 的持久化名单).
 - **R2 状态机无 "回退 active" 动作**: rotated/ignored 是处置终态, 后续命中只静默累计 hit_count (防打扰语义, `src/privacy.rs` 头部); 标错可通过另一处置动作纠正 (rotated ↔ ignored), 但无显式撤销 — FIFO 容量淘汰或重启后同值自然回 active.
+- **用户自定义 pattern 不做 (R3 有意识的不做)**: regex crate 不进产线依赖 (红线 3), 手写匹配器只支持内置形状; 需要新形状 = 改 `src/privacy.rs` PATTERNS 表 (加一行 + 单测正/负例).
+- **pattern 组的增删不做 (R3)**: 组集内置 5 组 (`PatternGroup`: cloud/ai/vcs/chat/crypto), 组开关 (`/api/privacy-scan/settings`) 只切换内置组的启停; 增删组 = 改枚举 + PATTERNS 表.
+- **组开关不越过 mode=off**: `[privacy_scan] mode` 是静态档位 (启动读一次), 组开关只收窄 batch 档的 pattern 生效面; off 档下 PUT 组开关 400 (无从生效), GET 回显 enabled:false.
 - **Gemini/Ollama 字节透传族不扫描**: 扫描数据源是 codec IR 的字符串叶子 (pre-redact 视图); gemini/ollama 无 codec (透传路径无 IR 解析, 降级透传分支亦然), 该两族的请求体不产生告警. 覆盖 o/a/r 三族 (透传分支做 best-effort 只读解析).
 - **正则形状判定有误报可能 (告警非定罪)**: pattern 是常见 token 形状的启发式 (如 40+ word 字符的 `sk-` 串), 误报 worst case = 面板多一行告警 — 永不拦截转发, 登记永远经人回路确认. 通用 high-entropy 长串**刻意不做** (误报不可控, 留给 Laya S1+).
 - **扫描覆盖面上限 (内存自保)**: 每请求捕获预算 1 MiB (叶子粒度扣减, 累计首超后剩余叶子跳过) + 单叶上限 2 MiB (超过整体跳过) + 在途 channel 32 job — 超限内容不产生告警 (转发不受任何影响; 单条消息 > 2 MiB 已属病理性粘贴).

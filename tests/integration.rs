@@ -360,6 +360,8 @@ fn base_app_state(
         // #257 S0.5: 默认 off (热路径零影响是默认档契约; batch 语义由隐私扫描
         // 集成测试段显式构造覆盖 — spawn_proxy_with_privacy_scan).
         privacy_scan: secret_guard::privacy::PrivacyScanner::disabled(),
+        // R3 组开关: fixture 全组启用 (自管临时路径, 与 AuditCapture::for_tests 对称).
+        privacy_scan_groups: secret_guard::state::PrivacyScanGroups::for_tests(),
         // shutdown flag: sender 立即 drop → channel 关闭 → SSE 流视同 shutdown
         // 立即结束 — 本 harness 的测试不消费 /api/events, 无感知; SSE 专用测试
         // (spawn_proxy_with_events) 持有 sender 模拟生产装配.
@@ -13287,16 +13289,19 @@ async fn spawn_proxy_with_privacy_scan(
     );
     let _ = (decisions, persist_lock, state_path);
     // PrivacyScanner::new 需在 tokio runtime 内 (本 harness 为 async, 生产为 serve).
+    // R3: scanner 与 AppState.privacy_scan_groups 共享同一位掩码 (镜像生产装配).
+    let privacy_scan_groups = secret_guard::state::PrivacyScanGroups::for_tests();
     let privacy_scan = match mode {
         secret_guard::config::PrivacyScanMode::Off => {
             secret_guard::privacy::PrivacyScanner::disabled()
         }
         secret_guard::config::PrivacyScanMode::Batch => {
-            secret_guard::privacy::PrivacyScanner::new()
+            secret_guard::privacy::PrivacyScanner::new(privacy_scan_groups.mask_handle())
         }
     };
     let proxy = AppState {
         privacy_scan,
+        privacy_scan_groups,
         ..base_app_state(
             reqwest::Client::new(),
             provider_table,
@@ -13746,4 +13751,272 @@ async fn privacy_scan_ignored_endpoint_and_off_mode_404() {
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+// ─── 隐私旁路扫描: R3 pattern 组开关 (PR #303 review) ───────────────────────
+
+/// 组开关端到端: 关 vcs → GitHub/GitLab pattern 不再产告警 (aws 仍报) →
+/// 全关 → 无告警 → 重开 vcs → 后续命中恢复告警. 同时守卫 alerts 响应的
+/// groups 内嵌与 PUT round-trip.
+#[tokio::test]
+async fn privacy_scan_group_toggles_gate_patterns_end_to_end() {
+    let mut upstream = spawn_mock_upstream().await;
+    let aws_key = aws_shaped_key("GROUPGATE00001");
+    let gh_token = format!("ghp_{}", "t".repeat(40));
+    let body_for = |content: &str| {
+        format!(r#"{{"model":"gpt-4","messages":[{{"role":"user","content":"{content}"}}]}}"#)
+    };
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"chatcmpl-1","choices":[]}"#)
+        .create_async()
+        .await;
+
+    let proxy_url = spawn_proxy_with_privacy_scan(
+        secret_guard::config::PrivacyScanMode::Batch,
+        vec![openai_provider("oa-main", &upstream.url())],
+        test_secret_table(),
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    // ① 缺省全组开: 两族 pattern 都告警; alerts 响应内嵌 groups 全 true.
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        &body_for(&format!("leak {aws_key} and {gh_token}")),
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let alerts = wait_for_alerts(&proxy_url, |v| {
+        v["alerts"].as_array().is_some_and(|a| {
+            a.iter().any(|x| x["value"] == serde_json::json!(aws_key))
+                && a.iter().any(|x| x["value"] == serde_json::json!(gh_token))
+        })
+    })
+    .await;
+    assert_eq!(alerts["groups"]["cloud"], serde_json::json!(true));
+    assert_eq!(alerts["groups"]["vcs"], serde_json::json!(true));
+
+    // ② PUT 关 vcs (全量替换: 未出现的组保持开).
+    let resp = client
+        .put(format!("{proxy_url}/api/privacy-scan/settings"))
+        .json(&serde_json::json!({ "groups": { "vcs": false } }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["enabled"], serde_json::json!(true));
+    assert_eq!(body["groups"]["vcs"], serde_json::json!(false));
+    assert_eq!(body["groups"]["cloud"], serde_json::json!(true));
+
+    // ③ 再命中两族: github (vcs) 不告警, aws (cloud) 仍报.
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        &body_for(&format!("again {aws_key} and {gh_token}")),
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let _ = wait_for_alerts(&proxy_url, |v| {
+        v["alerts"].as_array().is_some_and(|a| {
+            a.iter().any(|x| {
+                x["value"] == serde_json::json!(aws_key) && x["hit_count"] == serde_json::json!(2)
+            })
+        })
+    })
+    .await;
+    // vcs 关闭后已有 gh 告警也从视图消失 (组开关对历史告警同闸门).
+    let alerts = wait_for_alerts(&proxy_url, |v| {
+        v["alerts"]
+            .as_array()
+            .is_some_and(|a| !a.iter().any(|x| x["value"] == serde_json::json!(gh_token)))
+    })
+    .await;
+    assert!(
+        alerts["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["value"] == serde_json::json!(aws_key)),
+        "cloud alert still visible with vcs off"
+    );
+
+    // ④ 全关 → 零告警.
+    let resp = client
+        .put(format!("{proxy_url}/api/privacy-scan/settings"))
+        .json(&serde_json::json!({ "groups": { "cloud": false, "ai": false, "vcs": false, "chat": false, "crypto": false } }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let alerts = wait_for_alerts(&proxy_url, |v| {
+        v["alerts"].as_array().is_some_and(|a| a.is_empty())
+    })
+    .await;
+    assert_eq!(alerts["alerts"].as_array().map(Vec::len), Some(0));
+}
+
+/// settings API 校验语义: 未知组名 400 (fail-fast); 重开 vcs 后新命中恢复
+/// 告警 (关组期间 store 不清, 语义只闸门).
+#[tokio::test]
+async fn privacy_scan_settings_validation_and_reopen() {
+    let mut upstream = spawn_mock_upstream().await;
+    let gh_token = format!("ghp_{}", "u".repeat(40));
+    let body_for = |content: &str| {
+        format!(r#"{{"model":"gpt-4","messages":[{{"role":"user","content":"{content}"}}]}}"#)
+    };
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"chatcmpl-1","choices":[]}"#)
+        .create_async()
+        .await;
+    let proxy_url = spawn_proxy_with_privacy_scan(
+        secret_guard::config::PrivacyScanMode::Batch,
+        vec![openai_provider("oa-main", &upstream.url())],
+        test_secret_table(),
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    // 未知组名 → 400 (不静默忽略), 原组态不受影响.
+    let resp = client
+        .put(format!("{proxy_url}/api/privacy-scan/settings"))
+        .json(&serde_json::json!({ "groups": { "typo": false } }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    // 非 bool 值 → 400 (JsonRejection 收敛).
+    let resp = client
+        .put(format!("{proxy_url}/api/privacy-scan/settings"))
+        .json(&serde_json::json!({ "groups": { "vcs": "off" } }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    // 缺 groups 字段 → 400.
+    let resp = client
+        .put(format!("{proxy_url}/api/privacy-scan/settings"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let resp = client
+        .get(format!("{proxy_url}/api/privacy-scan/settings"))
+        .send()
+        .await
+        .unwrap();
+    let get: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(get["enabled"], serde_json::json!(true));
+    assert!(
+        get["groups"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|v| v == &serde_json::json!(true)),
+        "rejected PUTs must not mutate state: {get}"
+    );
+
+    // 关 vcs → 命中无告警; 重开 → 同值后续命中恢复 (本例重开后才发第一次).
+    client
+        .put(format!("{proxy_url}/api/privacy-scan/settings"))
+        .json(&serde_json::json!({ "groups": { "vcs": false } }))
+        .send()
+        .await
+        .unwrap();
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        &body_for(&format!("silent {gh_token}")),
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let alerts = wait_for_alerts(&proxy_url, |v| {
+        v["alerts"].as_array().is_some_and(|a| a.is_empty())
+    })
+    .await;
+    let _ = alerts;
+
+    client
+        .put(format!("{proxy_url}/api/privacy-scan/settings"))
+        .json(&serde_json::json!({ "groups": {} }))
+        .send()
+        .await
+        .unwrap();
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        &body_for(&format!("reopen {gh_token}")),
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let _ = wait_for_alerts(&proxy_url, |v| {
+        v["alerts"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|x| x["value"] == serde_json::json!(gh_token)))
+    })
+    .await;
+}
+
+/// mode=off: settings GET 返回 enabled:false (组态回显), PUT 拒绝 400 —
+/// 组开关不能越过静态档位 (off 时一切不发生).
+#[tokio::test]
+async fn privacy_scan_settings_off_mode_behavior() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"chatcmpl-1","choices":[]}"#)
+        .create_async()
+        .await;
+    let proxy_url = spawn_proxy_with_privacy_scan(
+        secret_guard::config::PrivacyScanMode::Off,
+        vec![openai_provider("oa-main", &upstream.url())],
+        test_secret_table(),
+    )
+    .await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{proxy_url}/api/privacy-scan/settings"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let get: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(get["enabled"], serde_json::json!(false));
+    assert_eq!(
+        get["groups"]["cloud"],
+        serde_json::json!(true),
+        "默认组态仍回显"
+    );
+
+    let resp = client
+        .put(format!("{proxy_url}/api/privacy-scan/settings"))
+        .json(&serde_json::json!({ "groups": { "vcs": false } }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "off mode rejects group config (nothing can take effect)"
+    );
 }

@@ -916,6 +916,14 @@ pub struct DynamicState {
     /// 见 `state::AuditCapture`.
     #[serde(default)]
     pub audit_capture: AuditCaptureMode,
+
+    /// 隐私扫描 pattern 组开关 (R3, PR #303 review): 组名 → 是否启用.
+    /// 语义: **只存关掉的组** (false 条目); 空/缺省 = 全组启用 (缺省态与
+    /// "未写该字段的旧 state.toml" 同形, serde default). 未知名条目加载时
+    /// 忽略 (state.toml 永远可丢弃重置, ROB); 写侧 (PUT /api/privacy-scan/
+    /// settings) 校验严格 400. 运行时态 SSOT = `state::PrivacyScanGroups`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub privacy_scan_groups: std::collections::BTreeMap<String, bool>,
 }
 
 /// 详细日志 (audit capture) 的三态档位 (#273 评论需求, 2026-09-24).

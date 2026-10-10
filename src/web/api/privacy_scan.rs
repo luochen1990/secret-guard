@@ -1,14 +1,21 @@
-//! `/api/privacy-scan/*`: 隐私旁路扫描的告警视图 + 状态机动作 (#257 S0.5;
-//! R2 扩展见 PR #303 review).
+//! `/api/privacy-scan/*`: 隐私旁路扫描的告警视图 + 状态机动作 + 组开关
+//! (#257 S0.5; R2/R3 扩展见 PR #303 review).
 //!
 //! # 端点
 //!
-//! - `GET  /api/privacy-scan/alerts`: `{enabled, alerts: [AlertDto…]}` —
+//! - `GET  /api/privacy-scan/alerts`: `{enabled, groups, alerts: [AlertDto…]}` —
 //!   `enabled: false` (mode=off) 时 alerts 恒空, 前端据此**隐藏整个面板**
-//!   (显式 enabled 标志区分 "没扫到" 与 "没开启", 不让空面板误导用户排查).
+//!   (显式 enabled 标志区分 "没扫到" 与 "没开启", 不让空面板误导用户排查);
+//!   `groups` 内嵌当前生效组态 (面板组开关行一次拉全, 免二次 RTT).
 //! - `POST /api/privacy-scan/alerts/{id}/rotated`: 标记用户已在平台侧
 //!   吊销/轮换 (R2 状态机; id 为 hash 形态 — 疑似明文不进 URL path).
 //! - `POST /api/privacy-scan/alerts/{id}/ignored`: 标记误报.
+//! - `GET  /api/privacy-scan/settings`: `{enabled, groups}` — 组开关读端点
+//!   (off 档返回 enabled:false + 持久化组态, 供 UI 回显).
+//! - `PUT  /api/privacy-scan/settings`: body `{groups: {cloud: true, …}}`
+//!   **全量替换** (未出现的组 = 启用); 未知名/形态错误 → 400 (fail-fast 不
+//!   静默忽略). **off 档拒绝** (400 — mode=off 时一切不发生, 组开关无从
+//!   生效; 开启扫描须改 static toml 重启, 不在本端点的职责内).
 //!
 //! # 视图过滤 (登记后告警消失)
 //!
@@ -31,20 +38,35 @@
 //! mode 是静态档位 (启动读一次), 无 PUT — 切换需改 `secret-guard.toml` 重启
 //! (与 `[redact]`/`[server]` 同哲学, 保持转发核心路径零运行时配置开销).
 
-use axum::extract::{Path, State};
+use std::collections::BTreeMap;
+
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{Json, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json as JsonResponse};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::state::{AppState, NO_STORE};
 
 use super::error::ApiError;
 
-/// `GET /api/privacy-scan/alerts` 响应 (`alerts_view` 的 wire 包装).
+/// `GET /api/privacy-scan/alerts` 响应 (`alerts_view` 的 wire 包装). `groups`
+/// 是当前生效组态 (规范序; 面板组开关行的数据源 — 与 settings 端点同源,
+/// 内嵌省一次 RTT).
 #[derive(Serialize)]
 pub(crate) struct AlertsResponse {
     pub enabled: bool,
+    pub groups: BTreeMap<&'static str, bool>,
     pub alerts: Vec<crate::privacy::AlertDto>,
+}
+
+/// 组态 map 的公共构造 (alerts 内嵌与 settings 响应共用, 序一致).
+fn groups_map(state: &AppState) -> BTreeMap<&'static str, bool> {
+    state
+        .privacy_scan_groups
+        .enabled_groups()
+        .into_iter()
+        .collect()
 }
 
 pub async fn list_alerts(State(state): State<AppState>) -> impl IntoResponse {
@@ -53,7 +75,14 @@ pub async fn list_alerts(State(state): State<AppState>) -> impl IntoResponse {
     let registered = state.secrets.effective_raw();
     let values = crate::secrets::non_empty_values(&registered);
     let (enabled, alerts) = state.privacy_scan.alerts_view(&values);
-    (NO_STORE, JsonResponse(AlertsResponse { enabled, alerts }))
+    (
+        NO_STORE,
+        JsonResponse(AlertsResponse {
+            enabled,
+            groups: groups_map(&state),
+            alerts,
+        }),
+    )
 }
 
 /// 状态机动作 ack (轻量 — 状态明细走随后的 GET /api/privacy-scan/alerts,
@@ -102,4 +131,70 @@ pub async fn mark_ignored(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     mark_alert(state, id, crate::privacy::AlertStatus::Ignored).await
+}
+
+// ─── R3: 组开关 settings 端点 ───────────────────────────────────────────────
+
+/// `GET/PUT /api/privacy-scan/settings` 的统一响应 shape (两端点共用, 前端
+/// shape 固定 — 与 `/api/settings` 同风格).
+#[derive(Serialize)]
+pub(crate) struct PrivacySettingsResponse {
+    pub enabled: bool,
+    pub groups: BTreeMap<&'static str, bool>,
+}
+
+/// `PUT` 请求 body: `groups` 全量替换 (未出现的组 = 启用; 未知名 → 400).
+#[derive(Deserialize)]
+pub(crate) struct UpdatePrivacySettingsRequest {
+    pub groups: BTreeMap<String, bool>,
+}
+
+pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
+    (
+        NO_STORE,
+        JsonResponse(PrivacySettingsResponse {
+            enabled: state.privacy_scan.enabled(),
+            groups: groups_map(&state),
+        }),
+    )
+}
+
+/// 全量替换组态: 持久化 state.toml + 更新内存位掩码 (原子, 见
+/// [`crate::state::PrivacyScanGroups::set_groups`]). off 档 (mode=off) → 400:
+/// 组开关无从生效 (扫描器空壳), 引导用户改 static toml. 非法 body (非 JSON /
+/// 非 bool 值 / 缺字段 / 未知名) → 统一 400.
+pub async fn update_settings(
+    State(state): State<AppState>,
+    body: Result<Json<UpdatePrivacySettingsRequest>, JsonRejection>,
+) -> Result<impl IntoResponse, ApiError> {
+    if !state.privacy_scan.enabled() {
+        return Err(ApiError::validation(
+            "privacy scan is off ([privacy_scan] mode = \"off\"); nothing to configure",
+        ));
+    }
+    let Json(payload) =
+        body.map_err(|e| ApiError::validation(format!("invalid privacy settings body: {e}")))?;
+    // 未知名在 API 层 fail-fast (400) — set_groups 的同名防线兜底 direct 调用方;
+    // 其余持久化类失败经 from_any 收敛 500 (与 settings.rs 同型).
+    if let Some(name) = payload
+        .groups
+        .keys()
+        .find(|n| crate::privacy::PatternGroup::from_name(n).is_none())
+    {
+        return Err(ApiError::validation(format!(
+            "unknown privacy-scan pattern group '{name}' (expect cloud/ai/vcs/chat/crypto)"
+        )));
+    }
+    state
+        .privacy_scan_groups
+        .set_groups(&payload.groups)
+        .map_err(ApiError::from_any)?;
+    // 返回服务端实际落库值 (严格反映服务端状态, 而非回声请求).
+    Ok((
+        NO_STORE,
+        JsonResponse(PrivacySettingsResponse {
+            enabled: state.privacy_scan.enabled(),
+            groups: groups_map(&state),
+        }),
+    ))
 }

@@ -446,6 +446,25 @@
       font-size: 11.5px;
     }
     #privacy-scan-panel td.ctx-cell { color: var(--fg-muted); }
+    /* R3 组开关行: 紧凑 inline checkbox 组 (读多写少的低频控制, 不占表格列). */
+    .privacy-groups {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px 14px;
+      margin-bottom: 10px;
+      font-size: 12px;
+      color: var(--fg-muted);
+      align-items: center;
+    }
+    .privacy-groups label {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      cursor: pointer;
+      user-select: none;
+    }
+    .privacy-groups input[type="checkbox"] { margin: 0; }
+    .privacy-groups .privacy-groups-label { color: var(--fg-faint); }
     /* R2 警示横幅: 软染警示底 (明暗两主题均可读), 与 badge-warn 同色系. */
     .privacy-banner {
       background: var(--warn-soft);
@@ -1807,6 +1826,9 @@
             manages. Review and register the real ones — registering never happens
             automatically.
           </div>
+          <!-- R3 组开关行 (检测分组, 动态设置 — 切换即 PUT /api/privacy-scan/settings,
+               state.toml 持久化; 数据源 = alerts 响应内嵌 groups) -->
+          <div id="privacy-group-toggles" class="privacy-groups" hidden></div>
           <!-- 常驻警示横幅 (仅当存在 active 告警时显示, renderPrivacyAlerts 控制) -->
           <div id="privacy-exposed-banner" class="privacy-banner" hidden data-i18n="privacy.banner">
             These suspected credentials have already been sent upstream with your
@@ -2384,6 +2406,14 @@
         'privacy.nameSuggestion': '{pattern} {date}',
         'privacy.loadFailed': 'Failed to load unregistered candidates',
         'privacy.markFailed': 'Failed to update alert status',
+        // ── R3 组开关 (检测分组) ──
+        'privacy.group.cloud': 'Cloud',
+        'privacy.group.ai': 'AI providers',
+        'privacy.group.vcs': 'Code hosting',
+        'privacy.group.chat': 'Chat',
+        'privacy.group.crypto': 'Crypto',
+        'privacy.groupTip': 'Toggle which pattern groups are scanned; changes are saved and survive restarts',
+        'privacy.groupsSaveFailed': 'Failed to save pattern group toggles',
         'th.id': 'ID',
         'th.name': 'Name',
         'th.category': 'Category',
@@ -2830,6 +2860,14 @@
         'privacy.nameSuggestion': '{pattern} {date}',
         'privacy.loadFailed': '加载疑似未登记候选失败',
         'privacy.markFailed': '告警状态更新失败',
+        // ── R3 组开关 (检测分组) ──
+        'privacy.group.cloud': '云平台',
+        'privacy.group.ai': 'AI 服务',
+        'privacy.group.vcs': '代码托管',
+        'privacy.group.chat': '聊天平台',
+        'privacy.group.crypto': '加密凭据',
+        'privacy.groupTip': '切换参与扫描的检测分组; 变更即时保存并跨重启生效',
+        'privacy.groupsSaveFailed': '检测分组开关保存失败',
         'th.id': 'ID',
         'th.name': '名称',
         'th.category': '类别',
@@ -5579,8 +5617,11 @@
     // 服务端静默累计 hit_count (状态不回退). 动作组语义: 已轮换 = 处置完成 /
     // 忽略 = 误报 / 登记 = 防未来外发 (仅预填, 人回路确认提交).
 
-    let privacyAlertsData = { enabled: false, alerts: [] };
+    let privacyAlertsData = { enabled: false, groups: {}, alerts: [] };
     let privacyShowResolved = false;
+    // PUT 在途时挂起组开关重渲染 (防 auto-refresh 轮询用服务端旧组态覆盖
+    // 乐观状态 — 响应落地后统一以服务端真值重放).
+    let privacyGroupsPending = false;
 
     async function refreshPrivacyAlerts() {
       try {
@@ -5594,6 +5635,46 @@
         return;
       }
       renderPrivacyAlerts();
+    }
+
+    // 组开关的规范渲染序 (与后端 PatternGroup::ALL 同序; 后端是 SSOT, 前端
+    // 只负责展示顺序稳定).
+    const PRIVACY_GROUP_ORDER = ['cloud', 'ai', 'vcs', 'chat', 'crypto'];
+
+    function renderPrivacyGroupToggles() {
+      const wrap = document.getElementById('privacy-group-toggles');
+      wrap.innerHTML = PRIVACY_GROUP_ORDER.map(g => {
+        const on = (privacyAlertsData.groups || {})[g] !== false;
+        return `<label title="${escapeHtml(t('privacy.groupTip'))}">`
+          + `<input type="checkbox" data-group="${g}" ${on ? 'checked' : ''}>`
+          + `${escapeHtml(t('privacy.group.' + g))}</label>`;
+      }).join('');
+    }
+
+    // 切换即 PUT (全量替换): 乐观更新 → 服务端真值回放 → 重拉 alerts (关组
+    // 告警的面变化由服务端闸门决定); 失败回滚到切换前组态 + 状态栏提示.
+    async function privacyToggleGroup(group, checked) {
+      const prev = { ...(privacyAlertsData.groups || {}) };
+      privacyAlertsData.groups = { ...prev, [group]: checked };
+      privacyGroupsPending = true;
+      try {
+        const r = await fetch('/api/privacy-scan/settings', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ groups: privacyAlertsData.groups }),
+        });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const body = await r.json();
+        privacyAlertsData.groups = body.groups || privacyAlertsData.groups;
+      } catch (e) {
+        console.error(e);
+        privacyAlertsData.groups = prev;
+        setStatus(t('privacy.groupsSaveFailed'), 'status-err');
+      } finally {
+        privacyGroupsPending = false;
+      }
+      renderPrivacyAlerts();
+      await refreshPrivacyAlerts();
     }
 
     function privacyActiveAlerts() {
@@ -5610,6 +5691,11 @@
         return;
       }
       panel.hidden = false;
+      // 组开关行 (PUT 在途时跳过 — 保乐观状态, 见 privacyGroupsPending 注).
+      const toggles = document.getElementById('privacy-group-toggles');
+      toggles.hidden = false;
+      if (!privacyGroupsPending) renderPrivacyGroupToggles();
+
       const active = privacyActiveAlerts();
       const resolved = privacyResolvedAlerts();
 
@@ -6473,7 +6559,8 @@
 
     // privacy scan 告警行的动作按钮 (事件委托, 同 bindTableEvents 模式 —
     // 行由 replaceTbodyIfChanged 动态重建, 不能逐按钮绑定). 委托挂在面板级:
-    // active 与 resolved 两个 tbody 的行统一分发.
+    // active 与 resolved 两个 tbody 的行统一分发; 组开关行 (checkbox) 的
+    // change 事件同面板挂载.
     document.getElementById('privacy-scan-panel').addEventListener('click', (e) => {
       const toggle = e.target.closest('#privacy-resolved-btn');
       if (toggle) {
@@ -6490,6 +6577,11 @@
       } else if (btn.dataset.action === 'ignore') {
         privacyMark(btn.dataset.id || '', 'ignored');
       }
+    });
+    document.getElementById('privacy-group-toggles').addEventListener('change', (e) => {
+      const cb = e.target.closest('input[type="checkbox"][data-group]');
+      if (!cb) return;
+      privacyToggleGroup(cb.dataset.group, cb.checked);
     });
 
     function populateCategorySelect() {

@@ -3666,4 +3666,42 @@ test.describe("#257 S0.5: privacy scan (unregistered candidates)", () => {
     await expect(dlg.locator("#f-value")).toHaveValue(KEY);
     await page.keyboard.press("Escape");
   });
+
+  // ── R3: 组开关 (检测分组) ──
+  // 覆盖: ① 面板组开关行渲染 (5 组 checkbox); ② 关 vcs (代码托管) → 该组
+  // 告警隐藏 (AWS/cloud 组仍报 — 关组只闸对应组); ③ 持久化: 刷新页面后
+  // 组态保持 (state.toml); ④ 收尾恢复全开 (组态是 server 共享态, 防泄漏到
+  // 其他用例). KEY 工厂注意 AKIA + 恰 16 位尾串.
+  test("R3: 组开关切换 → 告警面变化 + 刷新持久化", async ({ page, request }) => {
+    const KEY = "AKIA" + "GROUPUI" + "0".repeat(8) + "A"; // cloud 组 (aws-access-key-id, 尾串恰 16 位)
+    await sendChat(page, [{ role: "user", content: `r3-group-marker ${KEY} in prose` }]);
+    await page.locator('a.tab[data-tab="secrets"]').click();
+
+    // ① 组开关行在场, 5 组全开.
+    const toggles = page.locator("#privacy-group-toggles input[type='checkbox'][data-group]");
+    await expect(toggles).toHaveCount(5, { timeout: 10_000 });
+    for (const g of ["cloud", "ai", "vcs", "chat", "crypto"]) {
+      await expect(page.locator(`#privacy-group-toggles input[data-group="${g}"]`)).toBeChecked();
+    }
+
+    // cloud 行在场 (本用例 KEY).
+    await expect(activeRowOf(page, KEY)).toBeVisible({ timeout: 10_000 });
+
+    // ② 关 vcs → 本用例 cloud 行不受影响 (关组只闸对应组).
+    await page.locator('#privacy-group-toggles input[data-group="vcs"]').uncheck();
+    await expect(activeRowOf(page, KEY)).toBeVisible({ timeout: 10_000 });
+    await expect(page.locator('#privacy-group-toggles input[data-group="vcs"]')).not.toBeChecked();
+
+    // ③ 刷新后组态保持 (state.toml 持久化), cloud 行经扫描重现.
+    await page.reload();
+    await page.waitForLoadState("networkidle");
+    await page.locator('a.tab[data-tab="secrets"]').click();
+    await expect(page.locator('#privacy-group-toggles input[data-group="vcs"]')).not.toBeChecked({ timeout: 10_000 });
+    await expect(activeRowOf(page, KEY)).toBeVisible({ timeout: 10_000 });
+
+    // ④ 收尾: 恢复全开 (组开关是 server 持久化共享态).
+    await request.put(`${SG_API}/privacy-scan/settings`, {
+      data: { groups: {} },
+    });
+  });
 });

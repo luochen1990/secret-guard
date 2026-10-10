@@ -46,7 +46,10 @@ pub(crate) mod usage;
 // handler re-export: 保持 `web::api::<handler>` 路径稳定 (web/mod.rs router 直接引用).
 pub use apikeys::{create_api_key, delete_api_key, list_api_keys, toggle_api_key};
 pub use events::events;
-pub use privacy_scan::{list_alerts, mark_ignored, mark_rotated};
+pub use privacy_scan::{
+    get_settings as get_privacy_settings, list_alerts, mark_ignored, mark_rotated,
+    update_settings as update_privacy_settings,
+};
 pub use providers::{
     create_provider, delete_provider, delete_provider_probe, list_providers, pool_reset,
     probe_provider, provider_models, set_provider_decision, update_provider, update_provider_probe,

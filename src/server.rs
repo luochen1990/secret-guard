@@ -456,6 +456,21 @@ pub async fn serve(
         );
     }
 
+    // #257 S0.5 + R3 组开关: 运行时态先构造 (state.toml 恢复 + 与两表共享
+    // persist_lock); batch 档把位掩码句柄喂给扫描器 (后台 task 与 alerts
+    // 视图共享读, 读多写少零锁竞争). off → 零开销空壳 (组开关读端点仍可用).
+    let privacy_scan_groups = crate::state::PrivacyScanGroups::new(
+        &dyn_state.privacy_scan_groups,
+        state_path.clone(),
+        persist_lock.clone(),
+    );
+    let privacy_scan = match privacy_scan_config.mode {
+        crate::config::PrivacyScanMode::Off => crate::privacy::PrivacyScanner::disabled(),
+        crate::config::PrivacyScanMode::Batch => {
+            crate::privacy::PrivacyScanner::new(privacy_scan_groups.mask_handle())
+        }
+    };
+
     let proxy = AppState {
         upstream,
         providers: provider_table,
@@ -489,12 +504,10 @@ pub async fn serve(
             state_path.clone(),
             persist_lock.clone(),
         ),
-        // #257 S0.5: 静态档位装配. batch → 构造扫描器 + spawn 后台 task
-        // (serve 是 async fn, tokio runtime 在场); off → 零开销空壳.
-        privacy_scan: match privacy_scan_config.mode {
-            crate::config::PrivacyScanMode::Off => crate::privacy::PrivacyScanner::disabled(),
-            crate::config::PrivacyScanMode::Batch => crate::privacy::PrivacyScanner::new(),
-        },
+        // #257 S0.5: 静态档位装配 (scanner + 组开关在上面构造; batch 档后台
+        // task 已 spawn, off 档空壳).
+        privacy_scan,
+        privacy_scan_groups,
         shutdown: shutdown_rx,
     };
 

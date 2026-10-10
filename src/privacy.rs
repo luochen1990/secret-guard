@@ -60,6 +60,18 @@
 //! (旧工具还在用死值) 是重要诊断信号, 用 hit_count 保留; 重新打扰用户的
 //! 唯一途径是 FIFO 容量淘汰后同值再命中 (新建 Active, 见已知限制).
 //!
+//! # pattern 分组与组开关 (R3, PR #303 review)
+//!
+//! 10 条 pattern 归入 5 个语义组 (`PatternGroup`: cloud / ai / vcs / chat /
+//! crypto), 组开关是**动态设置** (state.toml 持久化, WebUI 即时切换, 运行时
+//! 态 SSOT = `state::PrivacyScanGroups`) — 经共享 `Arc<AtomicU32>` 位掩码
+//! 送达本模块: 后台 task 每次 scan_job 读一次快照 (关组 pattern 不扫描),
+//! alerts 视图同闸门 (关组的历史告警隐藏, 重开自然重现; store 不清).
+//! 组开关只收窄 pattern 生效面, **不能越过 mode=off** (off 时扫描器是空壳,
+//! 一切不发生; settings 端点 GET 返回 enabled:false, PUT 拒绝).
+//! 不做的边界 (如实登记): 用户自定义正则 pattern 不做 (regex crate 不进
+//! 产线依赖); 组的增删不做 (内置 5 组).
+//!
 //! # 已知限制 (best-effort, 详见 docs/known-limitations.md privacy-scan 节)
 //!
 //! - 告警为内存态, 重启清空 (不落盘, 一次会话内验证闭环足够) — status /
@@ -71,7 +83,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
@@ -103,6 +115,62 @@ const MAX_LEAF_BYTES: usize = 2 * 1024 * 1024;
 const CONTEXT_CHARS: usize = 40;
 
 // ─── pattern 集 (手写字节扫描, 零依赖) ─────────────────────────────────────
+
+/// pattern 的语义分组 (R3, PR #303 review): 组开关 (`/api/privacy-scan/settings`)
+/// 的控制粒度. 组名是 wire/存储/i18n 的稳定 id; 组集**内置固定** (增删组 =
+/// 改本枚举 + PATTERNS 表, 不支持用户自定义).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PatternGroup {
+    /// 云平台凭据 (AWS key id / AWS secret / Google API key).
+    Cloud,
+    /// AI 服务商凭据 (OpenAI / Anthropic).
+    Ai,
+    /// 代码托管 token (GitHub / GitLab).
+    Vcs,
+    /// 聊天平台 token (Slack).
+    Chat,
+    /// 加密凭据形状 (JWT / PEM 私钥).
+    Crypto,
+}
+
+impl PatternGroup {
+    /// 规范序全集 (wire/存储遍历序; mask bit = 索引位).
+    pub(crate) const ALL: [PatternGroup; 5] = [
+        PatternGroup::Cloud,
+        PatternGroup::Ai,
+        PatternGroup::Vcs,
+        PatternGroup::Chat,
+        PatternGroup::Crypto,
+    ];
+
+    /// 全组启用的位掩码 (缺省态).
+    pub(crate) const ALL_MASK: u32 = 0b1_1111;
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            PatternGroup::Cloud => "cloud",
+            PatternGroup::Ai => "ai",
+            PatternGroup::Vcs => "vcs",
+            PatternGroup::Chat => "chat",
+            PatternGroup::Crypto => "crypto",
+        }
+    }
+
+    /// 组名 → 枚举 (PUT body / state.toml 的 key 校验; 未知名 = None).
+    pub(crate) fn from_name(name: &str) -> Option<PatternGroup> {
+        Self::ALL.iter().copied().find(|g| g.name() == name)
+    }
+
+    /// 该组在 mask 中的启用位.
+    pub(crate) const fn bit(self) -> u32 {
+        1 << (self as u32)
+    }
+
+    /// mask 下该组是否启用.
+    pub(crate) const fn enabled_in(self, mask: u32) -> bool {
+        mask & self.bit() != 0
+    }
+}
 
 /// 单条 pattern 的命中 (字节区间, ASCII 锚定 ⇒ 区间端点必在 char boundary).
 type Span = (usize, usize);
@@ -283,10 +351,12 @@ fn find_pem(hay: &str) -> Vec<Span> {
     out
 }
 
-/// 内置 pattern 表 (const, 添加新形状 = 加一行 + 单测正/负例).
+/// 内置 pattern 表 (const, 添加新形状 = 加一行 + 单测正/负例). `group` 是
+/// R3 组开关的控制粒度 (见 [`PatternGroup`]).
 pub(crate) struct PatternDef {
     pub id: &'static str,
     pub label: &'static str,
+    pub group: PatternGroup,
     find: fn(&str) -> Vec<Span>,
 }
 
@@ -294,6 +364,7 @@ pub(crate) const PATTERNS: &[PatternDef] = &[
     PatternDef {
         id: "aws-access-key-id",
         label: "AWS Access Key ID",
+        group: PatternGroup::Cloud,
         find: |s| {
             find_prefixed(
                 s,
@@ -306,11 +377,13 @@ pub(crate) const PATTERNS: &[PatternDef] = &[
     PatternDef {
         id: "aws-secret-access-key",
         label: "AWS Secret Access Key",
+        group: PatternGroup::Cloud,
         find: find_aws_secret,
     },
     PatternDef {
         id: "github-token",
         label: "GitHub token",
+        group: PatternGroup::Vcs,
         find: |s| {
             find_prefixed(
                 s,
@@ -323,11 +396,13 @@ pub(crate) const PATTERNS: &[PatternDef] = &[
     PatternDef {
         id: "gitlab-token",
         label: "GitLab token",
+        group: PatternGroup::Vcs,
         find: |s| find_prefixed(s, &["glpat-"], is_wordish, RunLen::AtLeast(20)),
     },
     PatternDef {
         id: "slack-token",
         label: "Slack token",
+        group: PatternGroup::Chat,
         find: |s| {
             find_prefixed(
                 s,
@@ -340,26 +415,31 @@ pub(crate) const PATTERNS: &[PatternDef] = &[
     PatternDef {
         id: "openai-api-key",
         label: "OpenAI API key",
+        group: PatternGroup::Ai,
         find: find_openai,
     },
     PatternDef {
         id: "anthropic-api-key",
         label: "Anthropic API key",
+        group: PatternGroup::Ai,
         find: |s| find_prefixed(s, &["sk-ant-"], is_wordish, RunLen::AtLeast(20)),
     },
     PatternDef {
         id: "google-api-key",
         label: "Google API key",
+        group: PatternGroup::Cloud,
         find: |s| find_prefixed(s, &["AIza"], is_wordish, RunLen::Exact(35)),
     },
     PatternDef {
         id: "jwt",
         label: "JWT",
+        group: PatternGroup::Crypto,
         find: find_jwt,
     },
     PatternDef {
         id: "pem-private-key",
         label: "PEM private key",
+        group: PatternGroup::Crypto,
         find: find_pem,
     },
 ];
@@ -474,8 +554,12 @@ pub(crate) struct ScanJob {
 /// 内壳并 spawn 后台扫描 task (构造点必须在 tokio runtime 内 — 生产装配在
 /// `server::serve`, 测试装配在 async harness, 均满足).
 ///
-/// Clone 语义: 内壳 Arc 共享 (sender + store), 与 `PoolStates` / `ModelListCache`
-/// 的 "state 聚合各 feature store" 先例同型.
+/// `groups_mask` 是组开关 (`PatternGroup`) 的共享位掩码 — 与
+/// `state::PrivacyScanGroups` (写侧: PUT 持久化 + 内存) 共享同一 `Arc<AtomicU32>`
+/// (读侧: 后台 task 每次扫描 + alerts 视图过滤, 读多写少零锁竞争).
+///
+/// Clone 语义: 内壳 Arc 共享 (sender + store + mask), 与 `PoolStates` /
+/// `ModelListCache` 的 "state 聚合各 feature store" 先例同型.
 #[derive(Clone, Debug)]
 pub struct PrivacyScanner {
     inner: Option<Arc<ScannerInner>>,
@@ -485,6 +569,8 @@ pub struct PrivacyScanner {
 struct ScannerInner {
     tx: tokio::sync::mpsc::Sender<ScanJob>,
     store: Arc<Mutex<AlertStore>>,
+    /// 组开关位掩码 (写侧 = state::PrivacyScanGroups; 1 = 组启用).
+    groups_mask: Arc<AtomicU32>,
     /// try_send 满丢弃计数 (热路径只做原子自增; WARN 由后台 task 消费侧发出,
     /// 保持发送闭包零 IO).
     dropped: Arc<AtomicU64>,
@@ -499,16 +585,22 @@ impl Default for PrivacyScanner {
 }
 
 impl PrivacyScanner {
-    /// `mode = batch`: spawn 后台 task. 需在 tokio runtime 内调用.
-    pub fn new() -> Self {
+    /// `mode = batch`: spawn 后台 task. 需在 tokio runtime 内调用. `groups_mask`
+    /// 通常来自 `state::PrivacyScanGroups::mask_handle` (与写侧共享); 测试可用
+    /// `Arc::new(AtomicU32::new(PatternGroup::ALL_MASK))`.
+    pub fn new(groups_mask: Arc<AtomicU32>) -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ScanJob>(CHANNEL_CAP);
         let store = Arc::new(Mutex::new(AlertStore::default()));
         let dropped = Arc::new(AtomicU64::new(0));
         let task_store = store.clone();
         let task_dropped = dropped.clone();
+        let task_mask = groups_mask.clone();
         tokio::spawn(async move {
             while let Some(job) = rx.recv().await {
-                scan_job(&job, &task_store);
+                // 组态快照: 每 job 读一次 (关组的 pattern 不参与扫描 — 热路径
+                // 侧 capture 不感知组, 组过滤集中在后台消费侧).
+                let mask = task_mask.load(Ordering::Relaxed);
+                scan_job(&job, &task_store, mask);
                 // 丢弃计数消费: 每次 recv 后观察累计增量, 有丢弃才 WARN (一次性,
                 // 不逐条刷屏; 热路径侧零日志开销).
                 let d = task_dropped.swap(0, Ordering::Relaxed);
@@ -521,7 +613,12 @@ impl PrivacyScanner {
             }
         });
         Self {
-            inner: Some(Arc::new(ScannerInner { tx, store, dropped })),
+            inner: Some(Arc::new(ScannerInner {
+                tx,
+                store,
+                groups_mask,
+                dropped,
+            })),
         }
     }
 
@@ -582,35 +679,37 @@ impl PrivacyScanner {
         }
     }
 
-    /// API 视图: 告警快照过滤当前已登记值 (`registered` = effective secrets
-    /// 值集), 映射为 DTO (附 pattern label + 稳定 id + status). 返回
-    /// (enabled, alerts) — enabled 让前端隐藏整个面板, 区分 "没扫到" 与
-    /// "没开启".
+    /// API 视图: 告警快照过滤 ① 当前已登记值 (`registered` = effective
+    /// secrets 值集) ② 当前关组的 pattern (组开关对已有告警同样生效 — 关组
+    /// = "这个维度整体不要打扰", 旧告警隐藏; 重开组后经快照自然重现).
+    /// 返回 (enabled, alerts) — enabled 让前端隐藏整个面板, 区分 "没扫到"
+    /// 与 "没开启".
     pub(crate) fn alerts_view(&self, registered: &[String]) -> (bool, Vec<AlertDto>) {
         let Some(inner) = &self.inner else {
             return (false, Vec::new());
         };
+        let mask = inner.groups_mask.load(Ordering::Relaxed);
         let snapshot = inner.store.lock().snapshot();
         let alerts = snapshot
             .into_iter()
             .filter(|a| !registered.iter().any(|r| r == &a.value))
-            .map(|a| {
-                let label = PATTERNS
-                    .iter()
-                    .find(|p| p.id == a.pattern_id)
-                    .map(|p| p.label)
-                    .unwrap_or(a.pattern_id);
-                AlertDto {
+            .filter_map(|a| {
+                let p = PATTERNS.iter().find(|p| p.id == a.pattern_id)?;
+                if !p.group.enabled_in(mask) {
+                    return None;
+                }
+                Some(AlertDto {
                     id: alert_id(&a.value, a.pattern_id),
                     value: a.value,
                     pattern_id: a.pattern_id.to_string(),
-                    pattern_label: label.to_string(),
+                    pattern_label: p.label.to_string(),
+                    group: p.group.name(),
                     status: a.status,
                     first_seen: a.first_seen,
                     last_seen: a.last_seen,
                     hit_count: a.hit_count,
                     context: a.context,
-                }
+                })
             })
             .collect();
         (true, alerts)
@@ -624,14 +723,18 @@ impl PrivacyScanner {
     }
 }
 
-/// 后台 task 的单 job 处理: 每叶子 × 每 pattern 匹配 → 排除已登记 → 记录.
+/// 后台 task 的单 job 处理: 每叶子 × 每启用 pattern 匹配 → 排除已登记 →
+/// 记录. 关组 (`mask` 位清零) 的 pattern 跳过 — 组过滤的扫描侧落点.
 /// 匹配阶段无锁 (大 job 不阻塞 alerts API 读), 仅落账时短临界区.
-fn scan_job(job: &ScanJob, store: &Mutex<AlertStore>) {
+fn scan_job(job: &ScanJob, store: &Mutex<AlertStore>, groups_mask: u32) {
     let now = Utc::now();
     // (value, pattern_id, context) — 先算后锁.
     let mut hits: Vec<(String, &'static str, String)> = Vec::new();
     for leaf in &job.leaves {
         for pattern in PATTERNS {
+            if !pattern.group.enabled_in(groups_mask) {
+                continue;
+            }
             for (start, end) in (pattern.find)(leaf) {
                 let value = match leaf.get(start..end) {
                     Some(v) => v,
@@ -671,13 +774,15 @@ fn context_around(leaf: &str, start: usize, end: usize, value: &str) -> String {
 }
 
 /// `GET /api/privacy-scan/alerts` 的响应条目 (wire shape). `id` 是用户动作
-/// 端点的路径参数 (hash 形态, 见 [`alert_id`]).
+/// 端点的路径参数 (hash 形态, 见 [`alert_id`]); `group` 是 pattern 语义组名
+/// (前端组开关回显 + 关组置灰标注).
 #[derive(Debug, Serialize)]
 pub(crate) struct AlertDto {
     pub id: String,
     pub value: String,
     pub pattern_id: String,
     pub pattern_label: String,
+    pub group: &'static str,
     pub status: AlertStatus,
     pub first_seen: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
@@ -688,6 +793,119 @@ pub(crate) struct AlertDto {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 测试用全组启用 mask (生产 mask 来自 state::PrivacyScanGroups 共享 Arc).
+    fn test_mask() -> Arc<AtomicU32> {
+        Arc::new(AtomicU32::new(PatternGroup::ALL_MASK))
+    }
+
+    // ─── R3 分组: 表完整性 + mask 消费 ───────────────────────────────────
+
+    #[test]
+    fn pattern_groups_cover_all_patterns_and_names_unique() {
+        // 每条 pattern 都有归属组; 组名 (wire id) 互异; from_name 与 name 互逆.
+        let mut names = std::collections::BTreeSet::new();
+        for g in PatternGroup::ALL {
+            assert!(names.insert(g.name()), "duplicate group name");
+            assert_eq!(PatternGroup::from_name(g.name()), Some(g));
+        }
+        assert_eq!(names.len(), 5);
+        assert!(PATTERNS.iter().all(|p| names.contains(p.group.name())));
+        // 逐组断言归属 (分组即契约 — 调整分组应显式改这里).
+        let ids_of = |g: PatternGroup| {
+            PATTERNS
+                .iter()
+                .filter(|p| p.group == g)
+                .map(|p| p.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids_of(PatternGroup::Cloud),
+            [
+                "aws-access-key-id",
+                "aws-secret-access-key",
+                "google-api-key"
+            ]
+        );
+        assert_eq!(
+            ids_of(PatternGroup::Ai),
+            ["openai-api-key", "anthropic-api-key"]
+        );
+        assert_eq!(ids_of(PatternGroup::Vcs), ["github-token", "gitlab-token"]);
+        assert_eq!(ids_of(PatternGroup::Chat), ["slack-token"]);
+        assert_eq!(ids_of(PatternGroup::Crypto), ["jwt", "pem-private-key"]);
+        assert_eq!(
+            PATTERNS.len(),
+            10,
+            "10 patterns across 5 groups (per-group id lists above are the contract)"
+        );
+        assert_eq!(PatternGroup::from_name("nope"), None);
+    }
+
+    /// mask 消费: 关 vcs → github/gitlab pattern 不产告警, aws (cloud) 仍报;
+    /// alerts 视图对关组的历史告警同样过滤 (重开自然重现).
+    #[tokio::test]
+    async fn group_mask_gates_scanning_and_view() {
+        let mask = test_mask();
+        let scanner = PrivacyScanner::new(mask.clone());
+        let aws = aws_key("GROUPMASKTEST01");
+        let gh = format!("ghp_{}", "g".repeat(40));
+        let ir = sample_ir_with(&format!("keys: {aws} {gh}"));
+
+        // 关 vcs (github/gitlab 所在组).
+        mask.store(
+            PatternGroup::ALL_MASK & !PatternGroup::Vcs.bit(),
+            Ordering::Relaxed,
+        );
+        let job = scanner.capture(&ir).unwrap();
+        scanner.submit(Some(job), &[]);
+        for _ in 0..100 {
+            let (_, alerts) = scanner.alerts_view(&[]);
+            if alerts.iter().any(|a| a.value == aws) {
+                assert!(
+                    alerts.iter().all(|a| a.value != gh),
+                    "vcs-group (github) value must not alert while group off"
+                );
+                assert_eq!(
+                    alerts.iter().find(|a| a.value == aws).unwrap().group,
+                    "cloud",
+                    "DTO carries group name"
+                );
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("cloud-group alert never appeared with vcs off");
+    }
+
+    /// 全关 → 无告警; 已有告警在重开组后经视图自然重现 (store 仍在).
+    #[tokio::test]
+    async fn all_groups_off_then_reopen_recovers_view() {
+        let mask = test_mask();
+        let scanner = PrivacyScanner::new(mask.clone());
+        let aws = aws_key("ALLMASKTEST0002");
+
+        // 先全开扫一枪 → 告警在场.
+        let ir = sample_ir_with(&aws);
+        scanner.submit(Some(scanner.capture(&ir).unwrap()), &[]);
+        for _ in 0..100 {
+            let (_, alerts) = scanner.alerts_view(&[]);
+            if alerts.iter().any(|a| a.value == aws) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // 全关: 视图为空 (扫描侧与视图侧双层闸门).
+        mask.store(0, Ordering::Relaxed);
+        let (_, alerts) = scanner.alerts_view(&[]);
+        assert!(alerts.is_empty(), "all groups off hides everything");
+
+        // 重开 cloud: 告警自然重现 (store 未清 — 组开关只是视图/扫描闸门).
+        mask.store(PatternGroup::Cloud.bit(), Ordering::Relaxed);
+        let (_, alerts) = scanner.alerts_view(&[]);
+        assert!(alerts.iter().any(|a| a.value == aws));
+    }
 
     /// AWS Access Key ID 形状工厂 (AKIA + 16 位大写字母数字).
     fn aws_key(seed: &str) -> String {
@@ -1010,7 +1228,7 @@ mod tests {
 
     #[tokio::test]
     async fn scanner_end_to_end_excludes_registered_values() {
-        let scanner = PrivacyScanner::new();
+        let scanner = PrivacyScanner::new(test_mask());
         assert!(scanner.enabled());
 
         let unregistered = aws_key("ZZZZYYYYXXXXWWWW");
@@ -1053,7 +1271,7 @@ mod tests {
 
     #[tokio::test]
     async fn same_value_multiple_occurrences_increments_hits() {
-        let scanner = PrivacyScanner::new();
+        let scanner = PrivacyScanner::new(test_mask());
         let k = aws_key("MULTIHIT00000001");
         let ir = sample_ir_with(&format!("{k} and again {k}"));
         let job = scanner.capture(&ir).unwrap();
@@ -1072,7 +1290,7 @@ mod tests {
     /// 字节预算: 超大叶子不 panic; 预算内叶子仍被扫描; 单叶超上限被跳过.
     #[tokio::test]
     async fn capture_respects_byte_budget() {
-        let scanner = PrivacyScanner::new();
+        let scanner = PrivacyScanner::new(test_mask());
         // 单叶 1.2MB (超 1MB 预算但 < 2MB 单叶上限): 整体扫描 (budget 叶子粒度).
         // 注: token 与填充之间必须分隔 (左边界检查把 "xxxAKIA..." 判为 mid-token
         // 跳过 — 那是产品行为, 早期版本焊死相邻曾让本断言静默丢失).

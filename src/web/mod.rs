@@ -140,8 +140,9 @@ pub fn router() -> Router<AppState> {
         )
         // 隐私旁路扫描 (#257 S0.5): GET 告警视图 (enabled 标志 + 已登记值过滤,
         // 登记后告警消失) + R2 状态机动作 (rotated/ignored, PR #303 review —
-        // id 为 hash 形态, 疑似明文不进 URL). 安全语义 (疑似明文回显与
-        // req_body_raw 同信任域) 见 api/privacy_scan.rs 头部.
+        // id 为 hash 形态, 疑似明文不进 URL) + R3 组开关 (pattern 语义分组的
+        // 动态启停, state.toml 持久化). 安全语义 (疑似明文回显与 req_body_raw
+        // 同信任域) 见 api/privacy_scan.rs 头部.
         .route("/api/privacy-scan/alerts", get(api::list_alerts))
         .route(
             "/api/privacy-scan/alerts/{id}/rotated",
@@ -150,6 +151,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/privacy-scan/alerts/{id}/ignored",
             post(api::mark_ignored),
+        )
+        .route(
+            "/api/privacy-scan/settings",
+            get(api::get_privacy_settings).put(api::update_privacy_settings),
         )
 }
 
