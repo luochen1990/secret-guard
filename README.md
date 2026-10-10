@@ -242,7 +242,7 @@ the full development guide lives in [AGENTS.md](AGENTS.md):
   in [docs/known-limitations.md](docs/known-limitations.md).
 - **Unknown-secret detection (NER / regex / entropy) as an alerting layer**: flag
   suspected undeclared secrets in the WebUI without auto-redacting (zero false-positive
-  replacements stay guaranteed). See [#252](https://git.lambda.lc/lc-studio/secret-guard/issues/252).
+  replacements stay guaranteed). See [#257](https://git.lambda.lc/lc-studio/secret-guard/issues/257).
 - **Real-Provider field validation**: integration-test profiles against real upstreams
   for the protocol matrix.
 

@@ -203,6 +203,9 @@ provider=...`), 命令行即可确认流量经过 secret-guard; 上游故障 (50
   refusal parts 丢弃带 WARN、reasoning delta 事件类型归一、多 content part 折叠) —
   流式翻译本体 (含 Redact restore 路径) 已在全部 codec 覆盖协议对上可用, 明细见
   [docs/known-limitations.md](docs/known-limitations.md)。
+- **未知值检测 (NER / regex / entropy) 告警层**: 在 WebUI 标记疑似未声明的 secret,
+  不自动 redact (零误报替换的保证不变)。见
+  [#257](https://git.lambda.lc/lc-studio/secret-guard/issues/257)。
 - **真实 Provider 实地验证**: 为协议矩阵补真实上游的集成测试 profile。
 
 ## 文档

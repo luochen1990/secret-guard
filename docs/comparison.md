@@ -24,7 +24,7 @@ competitors' strengths — including where they beat us — as plainly as our ow
 | Response restore (incl. tool-call args) | ✅ exact inverse | ✅ exact inverse | ✅ exact + fuzzy tolerance | ✅ exact inverse |
 | Streaming restore | ✅ per-chunk | ✅ per-chunk | ❌ | ⚠️ mixed (per-block / buffered) |
 | **Gateway** | | | | |
-| Cross-protocol translation | ✅ OpenAI ⇄ Anthropic ⇄ Responses (O⇄A incl. streaming) | ❌ same-protocol only | ❌ (library, not a proxy) | ✅ 100+ LLM providers (**their core strength**) |
+| Cross-protocol translation | ✅ OpenAI ⇄ Anthropic ⇄ Responses (all codec pairs, incl. streaming) | ❌ same-protocol only | ❌ (library, not a proxy) | ✅ 100+ LLM providers (**their core strength**) |
 | Multi-provider routing | ✅ model wildcards + plan pools | — | — | ✅ (**their core strength**) |
 | Deployment form | local transparent proxy (change `base_url`) | local proxy + browser extension | embeddable library / REST sidecar | server gateway + SDK |
 | **Observability** | | | | |
@@ -131,6 +131,7 @@ Honest score, so you can pick the right tool:
   as an alerting layer is on the [roadmap](../README.md#roadmap--contributing).
 - Codec covers OpenAI / Anthropic / Responses; Gemini / Ollama are forwarded as
   transparent byte pass-through without Redact (rejected by default when secrets are
-  configured). Streaming on the Responses side returns 501 whenever Redact is involved —
-  same- or cross-protocol — rather than risking silent Mock leaks.
+  configured). Streaming works for every codec-covered pair, including the Redact
+  response-side restore path; residual known losses of streaming translation are
+  listed in [docs/known-limitations.md](known-limitations.md).
 - Binaries published for Linux only (macOS/Windows: build from source / WSL).

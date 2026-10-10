@@ -39,6 +39,9 @@
   Responses ingress ← Anthropic upstream 由
   `cross_protocol_streaming_translates_responses_ingress_from_anthropic_upstream_thinking`
   + `..._tool_use` 锁定 — fixture 搬运自 cc-switch, A12, 2026-10-01).
+- ⚠️ Responses 请求侧 tools 的非 function 形态 (hosted tools + custom/freeform,
+  codex apply_patch) 不进 IR — IR 路径 (redact / 跨协议) 读取点丢弃 + WARN, 字节
+  透传不受影响; 详见 `docs/known-limitations.md` codec 节 custom/freeform 条目.
 - ✅ `reasoning_content` (思考原文, OpenAI 兼容 provider 非标字段) 同协议建模:
   请求 (assistant 历史回传) / 非流式响应 / 流式 delta 三路径 reader↔writer 对称
   (#176, 契约 STR-6). 跨协议处置见下方 T7 条 (o-origin 跨 a 仍丢弃, 跨 r 保留)。

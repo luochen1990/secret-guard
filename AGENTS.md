@@ -655,7 +655,7 @@ windows/darwin。
 
 ## 后续工作 (非 MVP 范围)
 
-- **更多协议**: Gemini / Ollama / Bedrock / Cohere / OpenAI Responses API.
+- **更多协议**: Gemini / Ollama / Bedrock / Cohere.
   新增协议只需实现 Reader + Writer trait (~200 行), 不动 dispatch.
 - mock_secret 的 category-aware 默认生成 (Password/ApiKey/Cookie 等格式感知).
 - 配置热加载; 测试覆盖率自动上报 + fuzzing (cargo-fuzz).
