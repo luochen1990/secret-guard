@@ -460,9 +460,18 @@ pub(crate) enum AlertStatus {
 
 /// 告警的稳定短 id: hash(value, pattern_id) 的 hex 前 16 字符. 用 hash 而非
 /// 原值作 URL path 参数, 避免疑似明文裸进 URL (access log / 浏览器历史).
-/// 同进程内确定 (DefaultHasher), 256 容量下 64-bit 碰撞概率可忽略.
+/// **进程内**确定 (per-process 随机 key 的 `RandomState`, 见 `alert_id` 实现 —
+/// 无键 `DefaultHasher` 会让 URL 观察者可对候选 secret 值做离线穷举确认,
+/// 随机 key 消除该 oracle; 跨进程本就无需稳定 — 告警是内存态). 256 容量下
+/// 64-bit 碰撞概率可忽略.
 pub(crate) fn alert_id(value: &str, pattern_id: &str) -> String {
-    format!("{:016x}", crate::util::hash64(&(value, pattern_id)))
+    use std::hash::BuildHasher;
+    static KEYS: std::sync::OnceLock<std::collections::hash_map::RandomState> =
+        std::sync::OnceLock::new();
+    let h = KEYS
+        .get_or_init(std::collections::hash_map::RandomState::new)
+        .hash_one((value, pattern_id));
+    format!("{h:016x}")
 }
 
 /// 一条告警 (同 value+pattern 去重合并: hit_count / last_seen / context 更新,
@@ -775,7 +784,7 @@ fn context_around(leaf: &str, start: usize, end: usize, value: &str) -> String {
 
 /// `GET /api/privacy-scan/alerts` 的响应条目 (wire shape). `id` 是用户动作
 /// 端点的路径参数 (hash 形态, 见 [`alert_id`]); `group` 是 pattern 语义组名
-/// (前端组开关回显 + 关组置灰标注).
+/// (API 可见性/调试 — 前端组开关回显走响应级 `groups` map, 不消费行级字段).
 #[derive(Debug, Serialize)]
 pub(crate) struct AlertDto {
     pub id: String,

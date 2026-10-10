@@ -3596,8 +3596,10 @@ test.describe("#257 S0.5: privacy scan (unregistered candidates)", () => {
   // 清理: 删除本用例登记的 dynamic secret (workers=1 共享 state, 防泄漏到其他
   // 用例的 secrets 表断言 — 断言中途失败也能恢复; DELETE 对已删条目 404, 幂等
   // 判定只要求请求完成). 仿 B3 describe 的文件级 afterEach 卫生钩子先例.
+  // R3 补充: 组开关恢复全开 (PUT 是 server 持久化共享态, 中途断言失败也不泄漏).
   test.afterEach(async ({ request }) => {
     await request.delete(`${SG_API}/secrets/privacy-scan-registered`);
+    await request.put(`${SG_API}/privacy-scan/settings`, { data: { groups: {} } });
   });
 
   // ── R2 (PR #303 review): 告警状态机 + 「疑似已外发」语义 ──
@@ -3672,7 +3674,7 @@ test.describe("#257 S0.5: privacy scan (unregistered candidates)", () => {
   // 告警隐藏 (AWS/cloud 组仍报 — 关组只闸对应组); ③ 持久化: 刷新页面后
   // 组态保持 (state.toml); ④ 收尾恢复全开 (组态是 server 共享态, 防泄漏到
   // 其他用例). KEY 工厂注意 AKIA + 恰 16 位尾串.
-  test("R3: 组开关切换 → 告警面变化 + 刷新持久化", async ({ page, request }) => {
+  test("R3: 组开关切换 → 告警面变化 + 刷新持久化", async ({ page }) => {
     const KEY = "AKIA" + "GROUPUI" + "0".repeat(8) + "A"; // cloud 组 (aws-access-key-id, 尾串恰 16 位)
     await sendChat(page, [{ role: "user", content: `r3-group-marker ${KEY} in prose` }]);
     await page.locator('a.tab[data-tab="secrets"]').click();
@@ -3698,10 +3700,6 @@ test.describe("#257 S0.5: privacy scan (unregistered candidates)", () => {
     await page.locator('a.tab[data-tab="secrets"]').click();
     await expect(page.locator('#privacy-group-toggles input[data-group="vcs"]')).not.toBeChecked({ timeout: 10_000 });
     await expect(activeRowOf(page, KEY)).toBeVisible({ timeout: 10_000 });
-
-    // ④ 收尾: 恢复全开 (组开关是 server 持久化共享态).
-    await request.put(`${SG_API}/privacy-scan/settings`, {
-      data: { groups: {} },
-    });
+    // ④ 组态恢复全开由 describe 级 afterEach 统一收口 (防中途失败泄漏共享态).
   });
 });

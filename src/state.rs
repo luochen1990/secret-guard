@@ -13,6 +13,7 @@
 //! 各字段的来源与语义注释见结构体定义; 装配点在 `server.rs::serve`
 //! (双层配置 → 两张表 + ApiKeyStore + DAG + 超时快照 → AppState).
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
@@ -228,7 +229,7 @@ impl PrivacyScanGroups {
     /// 未知名条目**忽略** (手编 state.toml 容错 — state 永远可丢弃重置; 写侧
     /// PUT 端点才是严格校验面).
     pub fn new(
-        initial: &std::collections::BTreeMap<String, bool>,
+        initial: &BTreeMap<String, bool>,
         state_path: PathBuf,
         persist_lock: Arc<Mutex<()>>,
     ) -> Self {
@@ -251,7 +252,7 @@ impl PrivacyScanGroups {
     }
 
     /// map → 位掩码 (未知名忽略; false = 清位).
-    fn mask_of(map: &std::collections::BTreeMap<String, bool>) -> u32 {
+    fn mask_of(map: &BTreeMap<String, bool>) -> u32 {
         let mut mask = crate::privacy::PatternGroup::ALL_MASK;
         for (name, on) in map {
             if !on && let Some(g) = crate::privacy::PatternGroup::from_name(name) {
@@ -279,7 +280,7 @@ impl PrivacyScanGroups {
     /// Err (fail-fast, 调用方 400). RMW 持久化 (归一化为只存 false 条目) +
     /// 更新内存位掩码; 持久化失败时内存保持旧值 (与 `AuditCapture::set_mode`
     /// 同型).
-    pub fn set_groups(&self, map: &std::collections::BTreeMap<String, bool>) -> anyhow::Result<()> {
+    pub fn set_groups(&self, map: &BTreeMap<String, bool>) -> anyhow::Result<()> {
         // 校验先于持久化: 未知名 fail-fast.
         for name in map.keys() {
             if crate::privacy::PatternGroup::from_name(name).is_none() {
@@ -288,7 +289,7 @@ impl PrivacyScanGroups {
         }
         let new_mask = Self::mask_of(map);
         // 归一化持久化形态: 只存关掉的组 (缺省 = 开).
-        let disabled: std::collections::BTreeMap<String, bool> = map
+        let disabled: BTreeMap<String, bool> = map
             .iter()
             .filter(|(_, on)| !**on)
             .map(|(k, _)| (k.clone(), false))
@@ -479,7 +480,7 @@ mod tests {
         assert!(sw.enabled_groups().iter().all(|(_, on)| *on));
 
         // 关 vcs + chat (显式 true 的 cloud 条目归一化掉 — 缺省即开).
-        let mut map = std::collections::BTreeMap::new();
+        let mut map = BTreeMap::new();
         map.insert("vcs".to_string(), false);
         map.insert("chat".to_string(), false);
         map.insert("cloud".to_string(), true);
@@ -525,13 +526,13 @@ mod tests {
         // 未知名 fail-fast (先于持久化 — 磁盘不被污染).
         let sw =
             PrivacyScanGroups::new(&Default::default(), path.clone(), Arc::new(Mutex::new(())));
-        let mut bad = std::collections::BTreeMap::new();
+        let mut bad = BTreeMap::new();
         bad.insert("typo-group".to_string(), false);
         let err = sw.set_groups(&bad).expect_err("unknown group must 400");
         assert!(err.to_string().contains("typo-group"));
 
         // 持久化失败回滚: 目录只读, 内存保持旧值.
-        let mut first = std::collections::BTreeMap::new();
+        let mut first = BTreeMap::new();
         first.insert("ai".to_string(), false);
         let dir = path.parent().unwrap().to_path_buf();
         std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o500))

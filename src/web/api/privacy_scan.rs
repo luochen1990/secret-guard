@@ -51,8 +51,8 @@ use crate::state::{AppState, NO_STORE};
 use super::error::ApiError;
 
 /// `GET /api/privacy-scan/alerts` 响应 (`alerts_view` 的 wire 包装). `groups`
-/// 是当前生效组态 (规范序; 面板组开关行的数据源 — 与 settings 端点同源,
-/// 内嵌省一次 RTT).
+/// 是当前生效组态 (数据源; 面板组开关行按前端规范序重排展示 — map 序列化
+/// 走字典序, 非规范序).
 #[derive(Serialize)]
 pub(crate) struct AlertsResponse {
     pub enabled: bool,
@@ -60,7 +60,23 @@ pub(crate) struct AlertsResponse {
     pub alerts: Vec<crate::privacy::AlertDto>,
 }
 
-/// 组态 map 的公共构造 (alerts 内嵌与 settings 响应共用, 序一致).
+/// `GET/PUT /api/privacy-scan/settings` 的统一响应 shape (两端点共用, 前端
+/// shape 固定 — 与 `/api/settings` 同风格).
+#[derive(Serialize)]
+pub(crate) struct PrivacySettingsResponse {
+    pub enabled: bool,
+    pub groups: BTreeMap<&'static str, bool>,
+}
+
+/// settings 视图构造 (GET/PUT 两端点共用 — 响应形状单点维护).
+fn settings_view(state: &AppState) -> PrivacySettingsResponse {
+    PrivacySettingsResponse {
+        enabled: state.privacy_scan.enabled(),
+        groups: groups_map(state),
+    }
+}
+
+/// 组态 map 的公共构造 (alerts 内嵌与 settings 响应共用).
 fn groups_map(state: &AppState) -> BTreeMap<&'static str, bool> {
     state
         .privacy_scan_groups
@@ -86,11 +102,12 @@ pub async fn list_alerts(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// 状态机动作 ack (轻量 — 状态明细走随后的 GET /api/privacy-scan/alerts,
-/// 与 pool_reset 同风格).
+/// 与 pool_reset 同风格). `status` 直接用 [`AlertStatus`] (serde lowercase
+/// = wire 串的 SSOT, 不另手抄映射).
 #[derive(Serialize)]
 struct MarkAck {
     id: String,
-    status: &'static str,
+    status: crate::privacy::AlertStatus,
 }
 
 /// `POST /api/privacy-scan/alerts/{id}/rotated` / `…/{id}/ignored` 的共享
@@ -105,14 +122,7 @@ async fn mark_alert(
         Some(true) => Ok((
             StatusCode::OK,
             NO_STORE,
-            JsonResponse(MarkAck {
-                id,
-                status: match status {
-                    crate::privacy::AlertStatus::Active => "active",
-                    crate::privacy::AlertStatus::Rotated => "rotated",
-                    crate::privacy::AlertStatus::Ignored => "ignored",
-                },
-            }),
+            JsonResponse(MarkAck { id, status }),
         )),
         // off 档 (None) 与未知 id (Some(false)) 同语义: 对象不存在.
         _ => Err(ApiError::not_found(format!("alert {id} not found"))),
@@ -135,14 +145,6 @@ pub async fn mark_ignored(
 
 // ─── R3: 组开关 settings 端点 ───────────────────────────────────────────────
 
-/// `GET/PUT /api/privacy-scan/settings` 的统一响应 shape (两端点共用, 前端
-/// shape 固定 — 与 `/api/settings` 同风格).
-#[derive(Serialize)]
-pub(crate) struct PrivacySettingsResponse {
-    pub enabled: bool,
-    pub groups: BTreeMap<&'static str, bool>,
-}
-
 /// `PUT` 请求 body: `groups` 全量替换 (未出现的组 = 启用; 未知名 → 400).
 #[derive(Deserialize)]
 pub(crate) struct UpdatePrivacySettingsRequest {
@@ -150,13 +152,7 @@ pub(crate) struct UpdatePrivacySettingsRequest {
 }
 
 pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
-    (
-        NO_STORE,
-        JsonResponse(PrivacySettingsResponse {
-            enabled: state.privacy_scan.enabled(),
-            groups: groups_map(&state),
-        }),
-    )
+    (NO_STORE, JsonResponse(settings_view(&state)))
 }
 
 /// 全量替换组态: 持久化 state.toml + 更新内存位掩码 (原子, 见
@@ -190,11 +186,5 @@ pub async fn update_settings(
         .set_groups(&payload.groups)
         .map_err(ApiError::from_any)?;
     // 返回服务端实际落库值 (严格反映服务端状态, 而非回声请求).
-    Ok((
-        NO_STORE,
-        JsonResponse(PrivacySettingsResponse {
-            enabled: state.privacy_scan.enabled(),
-            groups: groups_map(&state),
-        }),
-    ))
+    Ok((NO_STORE, JsonResponse(settings_view(&state))))
 }

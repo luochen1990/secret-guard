@@ -13341,6 +13341,11 @@ where
     panic!("alerts predicate never satisfied within timeout");
 }
 
+/// 隐私扫描用例的最小 chat 请求 body (OpenAI 形状; content = 待扫描文本).
+fn privacy_chat_body(content: &str) -> String {
+    format!(r#"{{"model":"gpt-4","messages":[{{"role":"user","content":"{content}"}}]}}"#)
+}
+
 /// AWS Access Key ID 形状工厂 (AKIA + 16 位大写字母数字, 与 src/privacy.rs 单测同型).
 fn aws_shaped_key(seed: &str) -> String {
     let mut tail: String = seed
@@ -13578,9 +13583,6 @@ async fn privacy_scan_registering_alert_value_clears_it_from_view() {
 async fn privacy_scan_alert_status_lifecycle_and_no_regress() {
     let mut upstream = spawn_mock_upstream().await;
     let aws_key = aws_shaped_key("ROTATEDTEST005");
-    let body_for = |content: &str| {
-        format!(r#"{{"model":"gpt-4","messages":[{{"role":"user","content":"{content}"}}]}}"#)
-    };
     let _m = upstream
         .mock("POST", "/v1/chat/completions")
         .with_status(200)
@@ -13602,7 +13604,7 @@ async fn privacy_scan_alert_status_lifecycle_and_no_regress() {
         &proxy_url,
         "POST",
         "/o/oa-main/v1/chat/completions",
-        &body_for(&format!("leak {aws_key} once")),
+        &privacy_chat_body(&format!("leak {aws_key} once")),
         &[],
     )
     .await;
@@ -13625,7 +13627,7 @@ async fn privacy_scan_alert_status_lifecycle_and_no_regress() {
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    let alerts = wait_for_alerts(&proxy_url, |v| {
+    wait_for_alerts(&proxy_url, |v| {
         v["alerts"].as_array().is_some_and(|a| {
             a.iter().any(|x| {
                 x["value"] == serde_json::json!(aws_key)
@@ -13640,7 +13642,7 @@ async fn privacy_scan_alert_status_lifecycle_and_no_regress() {
         &proxy_url,
         "POST",
         "/o/oa-main/v1/chat/completions",
-        &body_for(&format!("leak {aws_key} again")),
+        &privacy_chat_body(&format!("leak {aws_key} again")),
         &[],
     )
     .await;
@@ -13667,7 +13669,6 @@ async fn privacy_scan_alert_status_lifecycle_and_no_regress() {
             .unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND, "{action}");
     }
-    let _ = alerts;
 }
 
 /// ignored 端点 + off 档下动作端点恒 404 (off 时无告警对象存在).
@@ -13763,9 +13764,6 @@ async fn privacy_scan_group_toggles_gate_patterns_end_to_end() {
     let mut upstream = spawn_mock_upstream().await;
     let aws_key = aws_shaped_key("GROUPGATE00001");
     let gh_token = format!("ghp_{}", "t".repeat(40));
-    let body_for = |content: &str| {
-        format!(r#"{{"model":"gpt-4","messages":[{{"role":"user","content":"{content}"}}]}}"#)
-    };
     let _m = upstream
         .mock("POST", "/v1/chat/completions")
         .with_status(200)
@@ -13787,7 +13785,7 @@ async fn privacy_scan_group_toggles_gate_patterns_end_to_end() {
         &proxy_url,
         "POST",
         "/o/oa-main/v1/chat/completions",
-        &body_for(&format!("leak {aws_key} and {gh_token}")),
+        &privacy_chat_body(&format!("leak {aws_key} and {gh_token}")),
         &[],
     )
     .await;
@@ -13820,7 +13818,7 @@ async fn privacy_scan_group_toggles_gate_patterns_end_to_end() {
         &proxy_url,
         "POST",
         "/o/oa-main/v1/chat/completions",
-        &body_for(&format!("again {aws_key} and {gh_token}")),
+        &privacy_chat_body(&format!("again {aws_key} and {gh_token}")),
         &[],
     )
     .await;
@@ -13857,11 +13855,11 @@ async fn privacy_scan_group_toggles_gate_patterns_end_to_end() {
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    let alerts = wait_for_alerts(&proxy_url, |v| {
+    // 全组关 → 告警面清空 (谓词即断言; 等待收口处理滞后).
+    wait_for_alerts(&proxy_url, |v| {
         v["alerts"].as_array().is_some_and(|a| a.is_empty())
     })
     .await;
-    assert_eq!(alerts["alerts"].as_array().map(Vec::len), Some(0));
 }
 
 /// settings API 校验语义: 未知组名 400 (fail-fast); 重开 vcs 后新命中恢复
@@ -13870,9 +13868,6 @@ async fn privacy_scan_group_toggles_gate_patterns_end_to_end() {
 async fn privacy_scan_settings_validation_and_reopen() {
     let mut upstream = spawn_mock_upstream().await;
     let gh_token = format!("ghp_{}", "u".repeat(40));
-    let body_for = |content: &str| {
-        format!(r#"{{"model":"gpt-4","messages":[{{"role":"user","content":"{content}"}}]}}"#)
-    };
     let _m = upstream
         .mock("POST", "/v1/chat/completions")
         .with_status(200)
@@ -13928,28 +13923,34 @@ async fn privacy_scan_settings_validation_and_reopen() {
         "rejected PUTs must not mutate state: {get}"
     );
 
-    // 关 vcs → 命中无告警; 重开 → 同值后续命中恢复 (本例重开后才发第一次).
+    // 关 vcs → vcs 命中无告警; 重开 → 同值后续命中恢复 (本例重开后才发第一次).
     client
         .put(format!("{proxy_url}/api/privacy-scan/settings"))
         .json(&serde_json::json!({ "groups": { "vcs": false } }))
         .send()
         .await
         .unwrap();
+    // 正向锚点: 同一请求携带 cloud 组哨兵 (aws key) — 等它的告警出现即证明
+    // 后台 task 已消费本请求 (排除 "job 尚未处理故空告警" 的误判通过),
+    // 届时 gh (vcs) 缺席才是关组语义的真断言.
+    let aws_sentinel = aws_shaped_key("VCSSENTINEL001");
     let (status, _, _) = proxy_request(
         &proxy_url,
         "POST",
         "/o/oa-main/v1/chat/completions",
-        &body_for(&format!("silent {gh_token}")),
+        &privacy_chat_body(&format!("silent {gh_token} plus {aws_sentinel}")),
         &[],
     )
     .await;
     assert_eq!(status, reqwest::StatusCode::OK);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let alerts = wait_for_alerts(&proxy_url, |v| {
-        v["alerts"].as_array().is_some_and(|a| a.is_empty())
+    wait_for_alerts(&proxy_url, |v| {
+        v["alerts"].as_array().is_some_and(|a| {
+            a.iter()
+                .any(|x| x["value"] == serde_json::json!(aws_sentinel))
+                && !a.iter().any(|x| x["value"] == serde_json::json!(gh_token))
+        })
     })
     .await;
-    let _ = alerts;
 
     client
         .put(format!("{proxy_url}/api/privacy-scan/settings"))
@@ -13961,7 +13962,7 @@ async fn privacy_scan_settings_validation_and_reopen() {
         &proxy_url,
         "POST",
         "/o/oa-main/v1/chat/completions",
-        &body_for(&format!("reopen {gh_token}")),
+        &privacy_chat_body(&format!("reopen {gh_token}")),
         &[],
     )
     .await;

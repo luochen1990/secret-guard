@@ -5619,15 +5619,17 @@
 
     let privacyAlertsData = { enabled: false, groups: {}, alerts: [] };
     let privacyShowResolved = false;
-    // PUT 在途时挂起组开关重渲染 (防 auto-refresh 轮询用服务端旧组态覆盖
-    // 乐观状态 — 响应落地后统一以服务端真值重放).
-    let privacyGroupsPending = false;
+    // PUT 在途计数 (非布尔: 快速连点两个开关时, 先落地者的 finally 不得解除
+    // 后发者的挂起): >0 期间挂起组开关重渲染, 防轮询用服务端旧组态覆盖乐观
+    // 状态 — 响应全部落地后统一以服务端真值重放.
+    let privacyGroupsPending = 0;
 
     async function refreshPrivacyAlerts() {
       try {
         const r = await fetch('/api/privacy-scan/alerts', { cache: 'no-store' });
         if (!r.ok) throw new Error('HTTP ' + r.status);
-        privacyAlertsData = await r.json();
+        // 集中预处理: 落地处归一化 shape (缺字段补默认), 下游不再散布守卫.
+        privacyAlertsData = { enabled: false, groups: {}, alerts: [], ...await r.json() };
       } catch (e) {
         console.error(e);
         // 加载失败不阻塞 secrets 表; 面板曾开启过才提示 (off 档静默).
@@ -5643,20 +5645,25 @@
 
     function renderPrivacyGroupToggles() {
       const wrap = document.getElementById('privacy-group-toggles');
-      wrap.innerHTML = PRIVACY_GROUP_ORDER.map(g => {
-        const on = (privacyAlertsData.groups || {})[g] !== false;
+      const html = PRIVACY_GROUP_ORDER.map(g => {
+        const on = privacyAlertsData.groups[g] !== false;
         return `<label title="${escapeHtml(t('privacy.groupTip'))}">`
           + `<input type="checkbox" data-group="${g}" ${on ? 'checked' : ''}>`
           + `${escapeHtml(t('privacy.group.' + g))}</label>`;
       }).join('');
+      // fingerprint 守护 (与 replaceTbodyIfChanged 同纪律): auto-refresh tick
+      // 未变化不重建 — 防 tick 落在点击中途吞掉 checkbox 状态.
+      if (wrap.dataset.renderedHtml === html) return;
+      wrap.dataset.renderedHtml = html;
+      wrap.innerHTML = html;
     }
 
     // 切换即 PUT (全量替换): 乐观更新 → 服务端真值回放 → 重拉 alerts (关组
     // 告警的面变化由服务端闸门决定); 失败回滚到切换前组态 + 状态栏提示.
     async function privacyToggleGroup(group, checked) {
-      const prev = { ...(privacyAlertsData.groups || {}) };
+      const prev = { ...privacyAlertsData.groups };
       privacyAlertsData.groups = { ...prev, [group]: checked };
-      privacyGroupsPending = true;
+      privacyGroupsPending += 1;
       try {
         const r = await fetch('/api/privacy-scan/settings', {
           method: 'PUT',
@@ -5669,19 +5676,23 @@
       } catch (e) {
         console.error(e);
         privacyAlertsData.groups = prev;
+        // 回滚态 HTML 与 fingerprint 相同会被短路跳过重建 — 显式失效, 强制
+        // checkbox 可见值还原到服务端真值 (同 restoreDecisionSelect 先例:
+        // "fingerprint 短路下数据未变不会重渲染, 必须显式还原").
+        delete document.getElementById('privacy-group-toggles').dataset.renderedHtml;
         setStatus(t('privacy.groupsSaveFailed'), 'status-err');
       } finally {
-        privacyGroupsPending = false;
+        privacyGroupsPending -= 1;
       }
       renderPrivacyAlerts();
       await refreshPrivacyAlerts();
     }
 
     function privacyActiveAlerts() {
-      return (privacyAlertsData.alerts || []).filter(a => (a.status || 'active') === 'active');
+      return privacyAlertsData.alerts.filter(a => (a.status || 'active') === 'active');
     }
     function privacyResolvedAlerts() {
-      return (privacyAlertsData.alerts || []).filter(a => a.status === 'rotated' || a.status === 'ignored');
+      return privacyAlertsData.alerts.filter(a => a.status === 'rotated' || a.status === 'ignored');
     }
 
     function renderPrivacyAlerts() {
@@ -5694,7 +5705,7 @@
       // 组开关行 (PUT 在途时跳过 — 保乐观状态, 见 privacyGroupsPending 注).
       const toggles = document.getElementById('privacy-group-toggles');
       toggles.hidden = false;
-      if (!privacyGroupsPending) renderPrivacyGroupToggles();
+      if (privacyGroupsPending === 0) renderPrivacyGroupToggles();
 
       const active = privacyActiveAlerts();
       const resolved = privacyResolvedAlerts();
