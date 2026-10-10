@@ -3599,4 +3599,71 @@ test.describe("#257 S0.5: privacy scan (unregistered candidates)", () => {
   test.afterEach(async ({ request }) => {
     await request.delete(`${SG_API}/secrets/privacy-scan-registered`);
   });
+
+  // ── R2 (PR #303 review): 告警状态机 + 「疑似已外发」语义 ──
+  // 覆盖: ① active 告警存在时顶部警示横幅 + 行内 "Likely exposed" 徽章;
+  // ② 「已轮换」动作 → 行移入折叠的 "resolved" 区 (徽章 Rotated), active 面
+  //    下线; ③ 「忽略 (误报)」动作同型 (Ignored 徽章);
+  // ④ 已处理行内「登记」仍可用 (预填闭环不因处置状态失效).
+  // 注 1: 告警是 server 内存态且 workers=1 跨用例共享 — 断言一律锚定本用例
+  // 的专属 KEY 行, 不做全局计数; 横幅断言用 "横幅可见 ⟺ active 行存在"
+  // 不变式 (对残留告警免疫).
+  // 注 2: resolved tbody 的 DOM 节点折叠时即存在 (仅 hidden), "从 active 消失"
+  // 断言必须锚定 #privacy-alerts-body.
+
+  // AKIA + 恰好 16 位大写字母数字尾串 (Exact(16) 形状; "ROTATEUI000000" = 14 + 2 位随机 = 16).
+  const rotateKey = () => "AKIA" + "ROTATEUI000000" + String(Math.floor(Math.random() * 90 + 10));
+  const activeRowOf = (page: Page, key: string) =>
+    page.locator(`#privacy-alerts-body tr:has(td.mono-cell:text-is("${key}"))`);
+  const anyRowOf = (page: Page, key: string) =>
+    page.locator(`#privacy-scan-panel tr:has(td.mono-cell:text-is("${key}"))`);
+
+  test("R2: 横幅 + 已轮换动作 → 行折叠进 resolved 区", async ({ page }) => {
+    const KEY = rotateKey();
+    await sendChat(page, [{ role: "user", content: `r2-rotate-marker ${KEY} in prose` }]);
+    await page.locator('a.tab[data-tab="secrets"]').click();
+
+    // ① active 行 + "Likely exposed" 徽章 + 顶部警示横幅.
+    const row = activeRowOf(page, KEY);
+    await expect(row).toBeVisible({ timeout: 10_000 });
+    await expect(row.locator(".badge")).toHaveText("Likely exposed");
+    await expect(page.locator("#privacy-exposed-banner")).toBeVisible();
+
+    // ② 「已轮换」→ active 行消失; 横幅走不变式 (可见 ⟺ active 行 ≥1,
+    //    对前序用例的残留告警免疫).
+    await row.locator('button[data-action="rotate"]').click();
+    await expect(activeRowOf(page, KEY)).toHaveCount(0, { timeout: 10_000 });
+    const activeCount = await page.locator("#privacy-alerts-body tr:has(td.mono-cell)").count();
+    const bannerVisible = await page.locator("#privacy-exposed-banner").isVisible();
+    expect(bannerVisible).toBe(activeCount > 0);
+
+    // ③ resolved 折叠区: 默认隐藏, 展开后行在场 + Rotated 徽章.
+    await page.locator("#privacy-resolved-btn").click();
+    await expect(anyRowOf(page, KEY)).toBeVisible();
+    await expect(anyRowOf(page, KEY).locator(".badge")).toHaveText("Rotated");
+  });
+
+  test("R2: 忽略 (误报) 动作 + 已处理行内登记仍可用", async ({ page }) => {
+    const KEY = rotateKey();
+    await sendChat(page, [{ role: "user", content: `r2-ignore-marker ${KEY} in prose` }]);
+    await page.locator('a.tab[data-tab="secrets"]').click();
+
+    const row = activeRowOf(page, KEY);
+    await expect(row).toBeVisible({ timeout: 10_000 });
+
+    // ① 「忽略」→ active 行消失, resolved 区内 Ignored 徽章.
+    await row.locator('button[data-action="ignore"]').click();
+    await expect(activeRowOf(page, KEY)).toHaveCount(0, { timeout: 10_000 });
+    await page.locator("#privacy-resolved-btn").click();
+    const resolvedRow = anyRowOf(page, KEY);
+    await expect(resolvedRow).toBeVisible();
+    await expect(resolvedRow.locator(".badge")).toHaveText("Ignored");
+
+    // ② 已处理行的「登记」仍打开预填表单 (与 active 行同闭环).
+    await resolvedRow.locator('button[data-action="register"]').click();
+    const dlg = page.locator("dialog#secret-form");
+    await expect(dlg).toBeVisible();
+    await expect(dlg.locator("#f-value")).toHaveValue(KEY);
+    await page.keyboard.press("Escape");
+  });
 });

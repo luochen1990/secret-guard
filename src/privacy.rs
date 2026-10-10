@@ -49,9 +49,21 @@
 //! 替换) 的值永不告警 — pre-redact 视图保证 mock 替身永不进入扫描输入,
 //! "post-redact 不扫" 由数据源选择结构性保证.
 //!
+//! # 告警状态机 (R2, PR #303 review)
+//!
+//! 扫描点在 redact seam (pre-redact) — 每条告警背后是一次**疑似已发生的
+//! 外发** (除非 fail_closed 拒绝). 因此告警带三态 status (`Active` 默认 /
+//! `Rotated` 用户已在平台侧吊销轮换 / `Ignored` 误报), 由用户经
+//! `POST /api/privacy-scan/alerts/{id}/rotated|ignored` 显式流转.
+//! 防打扰语义: 同 (value, pattern) 的后续命中**只静默累计** hit_count /
+//! last_seen / context, **永不回退 status** — "已轮换的值仍在请求中出现"
+//! (旧工具还在用死值) 是重要诊断信号, 用 hit_count 保留; 重新打扰用户的
+//! 唯一途径是 FIFO 容量淘汰后同值再命中 (新建 Active, 见已知限制).
+//!
 //! # 已知限制 (best-effort, 详见 docs/known-limitations.md privacy-scan 节)
 //!
-//! - 告警为内存态, 重启清空 (不落盘, 一次会话内验证闭环足够).
+//! - 告警为内存态, 重启清空 (不落盘, 一次会话内验证闭环足够) — status /
+//!   Rotated/Ignored 标记同样随重启丢失.
 //! - Gemini/Ollama 字节透传族无 codec IR, 不扫描.
 //! - 正则形状判定有误报可能 (告警非定罪); 通用 high-entropy 长串**刻意不做**
 //!   (误报不可控, 留给 Laya S1+).
@@ -354,8 +366,28 @@ pub(crate) const PATTERNS: &[PatternDef] = &[
 
 // ─── 告警存储 ───────────────────────────────────────────────────────────────
 
+/// 告警处置状态 (R2 状态机, 见模块头「告警状态机」节; 序列化 wire = 小写串).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum AlertStatus {
+    /// 未处置 (默认). 背后是一次疑似已发生的外发, 待用户轮换/登记/忽略.
+    Active,
+    /// 用户已在对应平台吊销/轮换该值 — 处置完成, 后续命中只静默累计.
+    Rotated,
+    /// 用户判定误报 — 不再打扰, 后续命中只静默累计.
+    Ignored,
+}
+
+/// 告警的稳定短 id: hash(value, pattern_id) 的 hex 前 16 字符. 用 hash 而非
+/// 原值作 URL path 参数, 避免疑似明文裸进 URL (access log / 浏览器历史).
+/// 同进程内确定 (DefaultHasher), 256 容量下 64-bit 碰撞概率可忽略.
+pub(crate) fn alert_id(value: &str, pattern_id: &str) -> String {
+    format!("{:016x}", crate::util::hash64(&(value, pattern_id)))
+}
+
 /// 一条告警 (同 value+pattern 去重合并: hit_count / last_seen / context 更新,
-/// first_seen 保留首次). `pattern_id` 恒来自 [`PATTERNS`] 的 `&'static str`.
+/// first_seen 保留首次, status 只经用户动作端点流转 — 见 [`AlertStatus`]).
+/// `pattern_id` 恒来自 [`PATTERNS`] 的 `&'static str`.
 #[derive(Debug, Clone)]
 pub(crate) struct Alert {
     pub value: String,
@@ -364,6 +396,7 @@ pub(crate) struct Alert {
     pub last_seen: DateTime<Utc>,
     pub hit_count: u64,
     pub context: String,
+    pub status: AlertStatus,
 }
 
 /// 内存告警存储: `VecDeque` + 容量 FIFO 淘汰. 不落盘 (重启清空, 见模块头
@@ -374,7 +407,8 @@ pub(crate) struct AlertStore {
 }
 
 impl AlertStore {
-    /// 记录一次命中: 已存在 (value, pattern_id) 则合并, 否则插入; 超容从队头淘汰.
+    /// 记录一次命中: 已存在 (value, pattern_id) 则合并 (status 不回退, 见
+    /// 模块头防打扰语义), 否则插入 Active 新告警; 超容从队头淘汰.
     pub(crate) fn record(
         &mut self,
         value: String,
@@ -402,12 +436,27 @@ impl AlertStore {
             last_seen: now,
             hit_count: 1,
             context,
+            status: AlertStatus::Active,
         });
     }
 
     /// 当前告警快照 (新→旧, 最近的在前 — 面板默认最关心最新命中).
     pub(crate) fn snapshot(&self) -> Vec<Alert> {
         self.alerts.iter().rev().cloned().collect()
+    }
+
+    /// 用户动作端点的落点: 按 id 流转 status. 返回是否命中 (未知 id = false,
+    /// 调用方回 404). 对 Active 告警重复标记同状态是幂等 no-op.
+    pub(crate) fn set_status(&mut self, id: &str, status: AlertStatus) -> bool {
+        let Some(a) = self
+            .alerts
+            .iter_mut()
+            .find(|a| alert_id(&a.value, a.pattern_id) == id)
+        else {
+            return false;
+        };
+        a.status = status;
+        true
     }
 }
 
@@ -534,8 +583,9 @@ impl PrivacyScanner {
     }
 
     /// API 视图: 告警快照过滤当前已登记值 (`registered` = effective secrets
-    /// 值集), 映射为 DTO (附 pattern label). 返回 (enabled, alerts) — enabled
-    /// 让前端隐藏整个面板, 区分 "没扫到" 与 "没开启".
+    /// 值集), 映射为 DTO (附 pattern label + 稳定 id + status). 返回
+    /// (enabled, alerts) — enabled 让前端隐藏整个面板, 区分 "没扫到" 与
+    /// "没开启".
     pub(crate) fn alerts_view(&self, registered: &[String]) -> (bool, Vec<AlertDto>) {
         let Some(inner) = &self.inner else {
             return (false, Vec::new());
@@ -551,9 +601,11 @@ impl PrivacyScanner {
                     .map(|p| p.label)
                     .unwrap_or(a.pattern_id);
                 AlertDto {
+                    id: alert_id(&a.value, a.pattern_id),
                     value: a.value,
                     pattern_id: a.pattern_id.to_string(),
                     pattern_label: label.to_string(),
+                    status: a.status,
                     first_seen: a.first_seen,
                     last_seen: a.last_seen,
                     hit_count: a.hit_count,
@@ -562,6 +614,13 @@ impl PrivacyScanner {
             })
             .collect();
         (true, alerts)
+    }
+
+    /// 用户动作 (R2 状态机流转): 按 id 标记 Rotated/Ignored. `None` = 扫描器
+    /// 关闭 (off 档无告警可标, 调用方回 404 同语义); `Some(false)` = 未知 id.
+    pub(crate) fn mark_alert(&self, id: &str, status: AlertStatus) -> Option<bool> {
+        let inner = self.inner.as_ref()?;
+        Some(inner.store.lock().set_status(id, status))
     }
 }
 
@@ -611,12 +670,15 @@ fn context_around(leaf: &str, start: usize, end: usize, value: &str) -> String {
     format!("{b_mark}{b}{value}{a}{a_mark}")
 }
 
-/// `GET /api/privacy-scan/alerts` 的响应条目 (wire shape).
+/// `GET /api/privacy-scan/alerts` 的响应条目 (wire shape). `id` 是用户动作
+/// 端点的路径参数 (hash 形态, 见 [`alert_id`]).
 #[derive(Debug, Serialize)]
 pub(crate) struct AlertDto {
+    pub id: String,
     pub value: String,
     pub pattern_id: String,
     pub pattern_label: String,
+    pub status: AlertStatus,
     pub first_seen: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
     pub hit_count: u64,
@@ -837,6 +899,68 @@ mod tests {
         // 最新的在前; 队头 (v0..v9) 已被淘汰.
         assert!(snap.iter().all(|a| a.value != "v0" && a.value != "v9"));
         assert_eq!(snap[0].value, format!("v{}", ALERT_CAP + 9));
+    }
+
+    // ─── R2 状态机: id 稳定性 + 流转 + 防打扰 ────────────────────────────
+
+    #[test]
+    fn alert_id_is_stable_and_pattern_sensitive() {
+        let a = alert_id("some-value", "jwt");
+        assert_eq!(a.len(), 16, "16-hex short id");
+        assert_eq!(alert_id("some-value", "jwt"), a, "same input → same id");
+        assert_ne!(alert_id("some-value", "openai-api-key"), a);
+        assert_ne!(alert_id("other-value", "jwt"), a);
+    }
+
+    #[test]
+    fn set_status_transitions_and_unknown_id_misses() {
+        let mut s = AlertStore::default();
+        let t0 = Utc::now();
+        s.record("v1".into(), "jwt", String::new(), t0);
+        let id = alert_id("v1", "jwt");
+        assert!(matches!(s.snapshot()[0].status, AlertStatus::Active));
+        assert!(s.set_status(&id, AlertStatus::Rotated));
+        assert!(matches!(s.snapshot()[0].status, AlertStatus::Rotated));
+        // 幂等重复标记.
+        assert!(s.set_status(&id, AlertStatus::Rotated));
+        assert!(!s.set_status("deadbeefdeadbeef", AlertStatus::Ignored));
+    }
+
+    /// 防打扰语义 (R2 核心): Rotated/Ignored 后同 (value, pattern) 的后续命中
+    /// 只静默累计 hit_count/last_seen, **status 永不回退 Active** — 保留
+    /// "已轮换的值仍在请求中出现" 的诊断信号而不重新打扰用户.
+    #[test]
+    fn subsequent_hits_never_regress_terminal_status() {
+        let mut s = AlertStore::default();
+        let t0 = Utc::now();
+        s.record("v1".into(), "jwt", "ctx-1".into(), t0);
+        s.set_status(&alert_id("v1", "jwt"), AlertStatus::Rotated);
+        s.record(
+            "v1".into(),
+            "jwt",
+            "ctx-2".into(),
+            t0 + chrono::Duration::seconds(30),
+        );
+        let a = &s.snapshot()[0];
+        assert!(matches!(a.status, AlertStatus::Rotated), "status kept");
+        assert_eq!(a.hit_count, 2, "hit_count silently accumulates");
+        assert_eq!(a.last_seen, t0 + chrono::Duration::seconds(30));
+        assert_eq!(a.context, "ctx-2", "context keeps latest sighting");
+        // Ignored 同型.
+        s.set_status(&alert_id("v1", "jwt"), AlertStatus::Ignored);
+        s.record("v1".into(), "jwt", String::new(), t0);
+        assert!(matches!(s.snapshot()[0].status, AlertStatus::Ignored));
+        // 不同 pattern 的同值是独立告警, 不受流转影响.
+        s.record("v1".into(), "openai-api-key", String::new(), t0);
+        assert_eq!(s.snapshot().len(), 2);
+        assert!(matches!(
+            s.snapshot()
+                .iter()
+                .find(|a| a.pattern_id == "openai-api-key")
+                .unwrap()
+                .status,
+            AlertStatus::Active
+        ));
     }
 
     // ─── context 截断 (char-boundary) ────────────────────────────────────

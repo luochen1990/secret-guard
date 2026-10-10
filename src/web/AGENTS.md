@@ -548,15 +548,29 @@ loadTimeline) 才重置 selected 到最新轮 (`.selected` 持续高亮; 不触�
 - 气泡间微小间距 (margin-bottom, 避免视觉粘连).
 - tool round 预览: 直接消费后端预计算的 `round_role` + `preview` 字段 (前端不做 best-effort 推断).
 
-### 隐私扫描面板 (#257 S0.5)
+### 隐私扫描面板 (#257 S0.5; R2 状态机 = PR #303 review)
 
 Secrets tab 内 `#privacy-scan-panel`「疑似未登记」区段 (mode=off 时整面板
 `hidden` — 判据 = 告警 API 的 `enabled` 标志, 不让空面板误导排查):
 - 数据流: `refreshPrivacyAlerts` 挂在 `refreshSecrets` 之后 (tab 激活 / CRUD
   后刷新 / auto-refresh tick 自然带动); 行渲染走 `replaceTbodyIfChanged`
   fingerprint (与 secrets 表同模式, auto-refresh 空轮询不打断 DOM 引用).
-- 告警行: value (等宽 + ellipsis, title 全量) + pattern label + hit_count +
-  last_seen + context 摘要 (muted + ellipsis) + 「登记」按钮.
+- **警示横幅** (`#privacy-exposed-banner`): 仅当存在 active 告警时显示 —
+  扫描点在 pre-redact, 每条 active 告警背后是一次疑似已发生的外发;
+  横幅如实提示 "登记只防未来, 已外发的应先吊销/轮换" (处置优先级: 轮换 >
+  登记 > 忽略, 行内动作组按此序排列).
+- **告警状态机** (R2): 每条告警带 `id` (hash, 疑似明文不进 URL) + `status`
+  (`active`/`rotated`/`ignored`). active 默认显示 (`#privacy-alerts-body`);
+  rotated/ignored 折叠在 "已处理" 区 (`#privacy-resolved-body`,
+  `privacyShowResolved` 控制展开, 刷新间保持), 状态流转走
+  `POST /api/privacy-scan/alerts/{id}/rotated|ignored` (事件委托挂在面板级,
+  两个 tbody 统一分发; 成功后 refetch — 服务端是 SSOT, 不做乐观切换).
+  防打扰语义: 后续命中只静默累计 hit_count, 状态不回退 (服务端契约, 见
+  `src/privacy.rs` 头部 "告警状态机" 节).
+- 告警行: value (等宽 + ellipsis, title 全量) + pattern label + status 徽章
+  (active = "疑似已外发"/warn, rotated = stream, ignored = inactive) +
+  hit_count + last_seen + context 摘要 (muted + ellipsis) + 动作组
+  (已轮换 / 忽略 / 登记; 已处置行保留另一处置动作 + 登记).
 - **人回路红线**: 「登记」仅打开既有 add-secret 表单并预填 value + 建议
   name (`{pattern} {date}`) — 提交仍走用户确认的 `POST /api/secrets`;
   登记成功后告警行经服务端视图过滤自然消失 (refetch 更新, 非乐观删除).

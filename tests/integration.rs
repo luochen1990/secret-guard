@@ -13564,3 +13564,186 @@ async fn privacy_scan_registering_alert_value_clears_it_from_view() {
     .await;
     assert_eq!(alerts["enabled"], serde_json::json!(true));
 }
+
+// ─── 隐私旁路扫描: R2 告警状态机 (PR #303 review) ──────────────────────────
+
+/// 状态机端到端: 告警出现 (active) → POST rotated → 视图 status=rotated →
+/// 同值再命中 → status 不回退 (防打扰) 且 hit_count 静默累计 → 未知 id 404.
+#[tokio::test]
+async fn privacy_scan_alert_status_lifecycle_and_no_regress() {
+    let mut upstream = spawn_mock_upstream().await;
+    let aws_key = aws_shaped_key("ROTATEDTEST005");
+    let body_for = |content: &str| {
+        format!(r#"{{"model":"gpt-4","messages":[{{"role":"user","content":"{content}"}}]}}"#)
+    };
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"chatcmpl-1","choices":[]}"#)
+        .create_async()
+        .await;
+
+    let proxy_url = spawn_proxy_with_privacy_scan(
+        secret_guard::config::PrivacyScanMode::Batch,
+        vec![openai_provider("oa-main", &upstream.url())],
+        test_secret_table(),
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    // ① 首次命中 → active 告警, 携带 id.
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        &body_for(&format!("leak {aws_key} once")),
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let alerts = wait_for_alerts(&proxy_url, |v| {
+        v["alerts"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|x| x["value"] == serde_json::json!(aws_key)))
+    })
+    .await;
+    let entry = &alerts["alerts"].as_array().unwrap()[0];
+    assert_eq!(entry["status"], serde_json::json!("active"));
+    let id = entry["id"].as_str().unwrap().to_string();
+    assert!(!id.is_empty() && id != aws_key, "id is hash, not raw value");
+
+    // ② 用户标记 rotated → 200 + 视图 status=rotated.
+    let resp = client
+        .post(format!("{proxy_url}/api/privacy-scan/alerts/{id}/rotated"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let alerts = wait_for_alerts(&proxy_url, |v| {
+        v["alerts"].as_array().is_some_and(|a| {
+            a.iter().any(|x| {
+                x["value"] == serde_json::json!(aws_key)
+                    && x["status"] == serde_json::json!("rotated")
+            })
+        })
+    })
+    .await;
+
+    // ③ 同值再命中: status 不回退 active, hit_count 静默累计 2.
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        &body_for(&format!("leak {aws_key} again")),
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let _ = wait_for_alerts(&proxy_url, |v| {
+        v["alerts"].as_array().is_some_and(|a| {
+            a.iter().any(|x| {
+                x["value"] == serde_json::json!(aws_key)
+                    && x["status"] == serde_json::json!("rotated")
+                    && x["hit_count"] == serde_json::json!(2)
+            })
+        })
+    })
+    .await;
+
+    // ④ 未知 id → 404 (两个动作端点同语义).
+    for action in ["rotated", "ignored"] {
+        let resp = client
+            .post(format!(
+                "{proxy_url}/api/privacy-scan/alerts/00000000deadbeef/{action}"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND, "{action}");
+    }
+    let _ = alerts;
+}
+
+/// ignored 端点 + off 档下动作端点恒 404 (off 时无告警对象存在).
+#[tokio::test]
+async fn privacy_scan_ignored_endpoint_and_off_mode_404() {
+    let mut upstream = spawn_mock_upstream().await;
+    let aws_key = aws_shaped_key("IGNORETEST0006");
+    let body =
+        format!(r#"{{"model":"gpt-4","messages":[{{"role":"user","content":"fp {aws_key}"}}]}}"#);
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"chatcmpl-1","choices":[]}"#)
+        .create_async()
+        .await;
+
+    // batch: 告警出现 → ignored 端点流转.
+    let proxy_url = spawn_proxy_with_privacy_scan(
+        secret_guard::config::PrivacyScanMode::Batch,
+        vec![openai_provider("oa-main", &upstream.url())],
+        test_secret_table(),
+    )
+    .await;
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        &body,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let alerts = wait_for_alerts(&proxy_url, |v| {
+        v["alerts"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|x| x["value"] == serde_json::json!(aws_key)))
+    })
+    .await;
+    let id = alerts["alerts"].as_array().unwrap()[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{proxy_url}/api/privacy-scan/alerts/{id}/ignored"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let _ = wait_for_alerts(&proxy_url, |v| {
+        v["alerts"].as_array().is_some_and(|a| {
+            a.iter().any(|x| {
+                x["value"] == serde_json::json!(aws_key)
+                    && x["status"] == serde_json::json!("ignored")
+            })
+        })
+    })
+    .await;
+
+    // off 档: 动作端点恒 404 (没有告警对象, 与 GET enabled:false 一致).
+    let mut upstream2 = spawn_mock_upstream().await;
+    let _m2 = upstream2
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"chatcmpl-2","choices":[]}"#)
+        .create_async()
+        .await;
+    let proxy_url_off = spawn_proxy_with_privacy_scan(
+        secret_guard::config::PrivacyScanMode::Off,
+        vec![openai_provider("oa-main2", &upstream2.url())],
+        test_secret_table(),
+    )
+    .await;
+    let resp = client
+        .post(format!(
+            "{proxy_url_off}/api/privacy-scan/alerts/{id}/rotated"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+}

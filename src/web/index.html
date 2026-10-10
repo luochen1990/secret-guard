@@ -446,6 +446,16 @@
       font-size: 11.5px;
     }
     #privacy-scan-panel td.ctx-cell { color: var(--fg-muted); }
+    /* R2 警示横幅: 软染警示底 (明暗两主题均可读), 与 badge-warn 同色系. */
+    .privacy-banner {
+      background: var(--warn-soft);
+      color: var(--warn);
+      font-size: 12px;
+      font-weight: 600;
+      padding: 8px 12px;
+      border-radius: 6px;
+      margin-bottom: 10px;
+    }
     /* 行级背景提示用半透明染色 (软染在明暗两底上都不刺眼). */
     table.secrets tr.row-override { background: var(--tint-override); }
     table.secrets tr.row-preferred { background: var(--tint-preferred); }
@@ -1784,7 +1794,10 @@
         </table>
         <!-- #257 S0.5: 疑似未登记候选 (privacy scan 告警, mode=off 时整个面板隐藏 —
              enabled 标志驱动, 见 refreshPrivacyAlerts). 登记走既有 add-secret 表单
-             (预填 value + 建议 name), 永不自动登记. -->
+             (预填 value + 建议 name), 永不自动登记.
+             R2 (PR #303 review): 告警状态机 (active/rotated/ignored) — 扫描点在
+             pre-redact, 每条 active 告警背后是一次疑似已发生的外发, 顶部横幅如实
+             提示; 处置优先级 = 轮换 > 登记 > 忽略 (动作组按此序排列). -->
         <div id="privacy-scan-panel" hidden style="margin-top: 24px;">
           <div class="secrets-toolbar">
             <h3 style="margin: 0;" data-i18n="privacy.title">Unregistered candidates</h3>
@@ -1794,20 +1807,36 @@
             manages. Review and register the real ones — registering never happens
             automatically.
           </div>
+          <!-- 常驻警示横幅 (仅当存在 active 告警时显示, renderPrivacyAlerts 控制) -->
+          <div id="privacy-exposed-banner" class="privacy-banner" hidden data-i18n="privacy.banner">
+            These suspected credentials have already been sent upstream with your
+            requests — registering only prevents future leaks; revoke/rotate the
+            exposed ones at the provider as soon as possible.
+          </div>
           <table class="secrets">
             <thead>
               <tr>
                 <th data-i18n="privacy.th.value">Value</th>
                 <th data-i18n="privacy.th.pattern">Pattern</th>
+                <th data-i18n="privacy.th.status">Status</th>
                 <th data-i18n="privacy.th.hits">Hits</th>
                 <th data-i18n="privacy.th.lastSeen">Last seen</th>
                 <th data-i18n="privacy.th.context">Context</th>
                 <th class="actions" data-i18n="privacy.th.actions">Actions</th>
               </tr>
             </thead>
+            <!-- active 告警 (默认视图); 空时占位行 -->
             <tbody id="privacy-alerts-body">
-              <tr><td colspan="6" class="empty" data-i18n="privacy.empty">No unregistered candidates so far</td></tr>
+              <tr><td colspan="7" class="empty" data-i18n="privacy.empty">No unregistered candidates so far</td></tr>
             </tbody>
+            <!-- 折叠区开关行 (存在 rotated/ignored 告警时显示) -->
+            <tbody id="privacy-resolved-toggle" hidden>
+              <tr><td colspan="7" class="empty" style="text-align:left;">
+                <button id="privacy-resolved-btn" class="btn btn-small"></button>
+              </td></tr>
+            </tbody>
+            <!-- rotated/ignored 告警 (默认折叠, privacyShowResolved 控制) -->
+            <tbody id="privacy-resolved-body" hidden></tbody>
           </table>
         </div>
       </div>
@@ -2327,20 +2356,34 @@
         'secrets.new': '+ new dynamic secret',
         'secrets.empty': 'No secrets configured',
         'secrets.hint': 'Static (declarative) items come from <code>secret-guard.toml</code>; dynamic items from <code>secret-guard.state.toml</code>. Edit a static item to fork a dynamic override. Use the <b>decision</b> dropdown to disable a static id or force-prefer its static value.',
-        // ── privacy scan (疑似未登记, #257 S0.5) ──
+        // ── privacy scan (疑似未登记, #257 S0.5; R2 状态机 = PR #303 review) ──
         'privacy.title': 'Unregistered candidates',
         'privacy.hint': 'Token-shaped values spotted in request bodies that no registered secret manages. Review and register the real ones — registering never happens automatically.',
+        'privacy.banner': 'These suspected credentials have already been sent upstream with your requests — registering only prevents future leaks; revoke/rotate the exposed ones at the provider as soon as possible.',
         'privacy.empty': 'No unregistered candidates so far',
+        'privacy.noActive': 'No open alerts — new sightings will show up here',
         'privacy.th.value': 'Value',
         'privacy.th.pattern': 'Pattern',
+        'privacy.th.status': 'Status',
         'privacy.th.hits': 'Hits',
         'privacy.th.lastSeen': 'Last seen',
         'privacy.th.context': 'Context',
         'privacy.th.actions': 'Actions',
+        'privacy.badge.active': 'Likely exposed',
+        'privacy.badge.activeTitle': 'Scanned before redaction — this value was most likely already sent upstream (see Last seen)',
+        'privacy.badge.rotated': 'Rotated',
+        'privacy.badge.ignored': 'Ignored',
+        'privacy.markRotated': 'Rotated',
+        'privacy.markRotatedTitle': 'Mark as revoked/rotated at the provider — remediation done, keep counting hits silently',
+        'privacy.markIgnored': 'Ignore',
+        'privacy.markIgnoredTitle': 'Mark as false positive — stop nagging about it',
+        'privacy.showResolved': 'Show resolved ({count})',
+        'privacy.hideResolved': 'Hide resolved',
         'privacy.register': 'Register',
-        'privacy.registerTitle': 'Open the new-secret form prefilled with this value',
+        'privacy.registerTitle': 'Open the new-secret form prefilled with this value — prevents future leaks only',
         'privacy.nameSuggestion': '{pattern} {date}',
         'privacy.loadFailed': 'Failed to load unregistered candidates',
+        'privacy.markFailed': 'Failed to update alert status',
         'th.id': 'ID',
         'th.name': 'Name',
         'th.category': 'Category',
@@ -2762,17 +2805,31 @@
         // ── privacy scan (疑似未登记, #257 S0.5) ──
         'privacy.title': '疑似未登记',
         'privacy.hint': '在请求体中发现、但没有任何已登记 secret 管理的 token 形状值。确认真的就该管起来就登记 — 登记永远不会自动发生。',
+        'privacy.banner': '这些疑似凭据已随请求发往上游 — 登记只能防止未来外发; 已外发的凭据应尽快到对应平台吊销/轮换。',
         'privacy.empty': '暂未发现疑似未登记的候选',
+        'privacy.noActive': '暂无未处理告警 — 新出现会显示在这里',
         'privacy.th.value': '值',
         'privacy.th.pattern': '模式',
+        'privacy.th.status': '状态',
         'privacy.th.hits': '命中',
         'privacy.th.lastSeen': '最近出现',
         'privacy.th.context': '上下文',
         'privacy.th.actions': '操作',
+        'privacy.badge.active': '疑似已外发',
+        'privacy.badge.activeTitle': '扫描发生在脱敏之前 — 该值大概率已随本次请求发往上游 (见「最近出现」)',
+        'privacy.badge.rotated': '已轮换',
+        'privacy.badge.ignored': '已忽略',
+        'privacy.markRotated': '已轮换',
+        'privacy.markRotatedTitle': '标记该值已在提供方侧吊销/轮换 — 处置完成, 后续命中只静默计数',
+        'privacy.markIgnored': '忽略',
+        'privacy.markIgnoredTitle': '标记为误报 — 不再就此打扰',
+        'privacy.showResolved': '展开已处理 ({count})',
+        'privacy.hideResolved': '收起已处理',
         'privacy.register': '登记',
-        'privacy.registerTitle': '打开预填该值的新建 secret 表单',
+        'privacy.registerTitle': '打开预填该值的新建 secret 表单 — 仅防止未来外发',
         'privacy.nameSuggestion': '{pattern} {date}',
         'privacy.loadFailed': '加载疑似未登记候选失败',
+        'privacy.markFailed': '告警状态更新失败',
         'th.id': 'ID',
         'th.name': '名称',
         'th.category': '类别',
@@ -5509,14 +5566,21 @@
     }
     async function refreshProviders() { await refreshKind('provider'); }
 
-    // ─── privacy scan (疑似未登记候选, #257 S0.5) ─────────────────────────
+    // ─── privacy scan (疑似未登记候选, #257 S0.5; R2 状态机 = PR #303 review) ──
     //
-    // 数据流: GET /api/privacy-scan/alerts (enabled 标志 + 服务端已过滤已登记值),
-    // 与 secrets 表同 tab 但独立数据源 — 挂在 refreshSecrets 之后 (tab 激活 /
-    // CRUD 后刷新自然带动: 登记提交 → cfg.refresh() → 本函数 refetch → 告警行
-    // 消失, "refetch 更新" 语义, 不做乐观删除). off 档 (enabled:false) 隐藏面板.
+    // 数据流: GET /api/privacy-scan/alerts (enabled 标志 + 服务端已过滤已登记值,
+    // 每条告警携带 id + status), 与 secrets 表同 tab 但独立数据源 — 挂在
+    // refreshSecrets 之后 (tab 激活 / CRUD 后刷新自然带动: 登记提交 →
+    // cfg.refresh() → 本函数 refetch → 告警行消失, "refetch 更新" 语义, 不做
+    // 乐观删除). off 档 (enabled:false) 隐藏面板.
+    //
+    // R2 状态机视图: active 默认显示 (存在时顶部警示横幅常驻); rotated/ignored
+    // 折叠在 "已处理" 区 (privacyShowResolved 控制, 刷新间保持), 后续命中由
+    // 服务端静默累计 hit_count (状态不回退). 动作组语义: 已轮换 = 处置完成 /
+    // 忽略 = 误报 / 登记 = 防未来外发 (仅预填, 人回路确认提交).
 
     let privacyAlertsData = { enabled: false, alerts: [] };
+    let privacyShowResolved = false;
 
     async function refreshPrivacyAlerts() {
       try {
@@ -5532,6 +5596,13 @@
       renderPrivacyAlerts();
     }
 
+    function privacyActiveAlerts() {
+      return (privacyAlertsData.alerts || []).filter(a => (a.status || 'active') === 'active');
+    }
+    function privacyResolvedAlerts() {
+      return (privacyAlertsData.alerts || []).filter(a => a.status === 'rotated' || a.status === 'ignored');
+    }
+
     function renderPrivacyAlerts() {
       const panel = document.getElementById('privacy-scan-panel');
       if (!privacyAlertsData.enabled) {
@@ -5539,29 +5610,82 @@
         return;
       }
       panel.hidden = false;
+      const active = privacyActiveAlerts();
+      const resolved = privacyResolvedAlerts();
+
+      // 警示横幅: 仅当存在 active 告警 (事实陈述 — 它们大概率已外发).
+      document.getElementById('privacy-exposed-banner').hidden = active.length === 0;
+
+      // active 表: 空态文案区分 "从没扫到" (resolved 也空) 与 "都处理完了".
       const body = document.getElementById('privacy-alerts-body');
-      const alerts = privacyAlertsData.alerts || [];
-      const html = alerts.length === 0
-        ? `<tr><td colspan="6" class="empty">${escapeHtml(t('privacy.empty'))}</td></tr>`
-        : alerts.map(privacyAlertRow).join('');
+      const emptyKey = resolved.length === 0 ? 'privacy.empty' : 'privacy.noActive';
+      const html = active.length === 0
+        ? `<tr><td colspan="7" class="empty">${escapeHtml(t(emptyKey))}</td></tr>`
+        : active.map(privacyAlertRow).join('');
       replaceTbodyIfChanged(body, html);
+
+      // 折叠区: 开关行 (有 resolved 时才出现) + 内容.
+      document.getElementById('privacy-resolved-toggle').hidden = resolved.length === 0;
+      const btn = document.getElementById('privacy-resolved-btn');
+      btn.textContent = privacyShowResolved
+        ? t('privacy.hideResolved')
+        : t('privacy.showResolved', { count: resolved.length });
+      const rbody = document.getElementById('privacy-resolved-body');
+      rbody.hidden = !privacyShowResolved || resolved.length === 0;
+      replaceTbodyIfChanged(
+        rbody,
+        resolved.map(privacyAlertRow).join('')
+      );
+    }
+
+    function privacyStatusBadge(a) {
+      if (a.status === 'rotated') {
+        return `<span class="badge badge-stream">${escapeHtml(t('privacy.badge.rotated'))}</span>`;
+      }
+      if (a.status === 'ignored') {
+        return `<span class="badge badge-inactive">${escapeHtml(t('privacy.badge.ignored'))}</span>`;
+      }
+      return `<span class="badge badge-warn" title="${escapeHtml(t('privacy.badge.activeTitle'))}">${escapeHtml(t('privacy.badge.active'))}</span>`;
     }
 
     function privacyAlertRow(a) {
       const value = escapeHtml(a.value);
       const label = escapeHtml(a.pattern_label || a.pattern_id);
-      const btn = `<button class="btn" data-action="register" `
+      const id = escapeHtml(a.id || '');
+      // 动作组 (处理优先级排序): 已轮换 → 忽略 → 登记; 已处置行仍保留登记
+      // (死值登记与否由用户定) 与另一处置动作 (误标可纠正), 但不提供回退
+      // active (服务端状态机亦无此端点 — 防打扰语义).
+      const mk = (action, labelKey, titleKey) =>
+        `<button class="btn" data-action="${action}" data-id="${id}" `
         + `data-value="${value}" data-label="${label}" `
-        + `title="${escapeHtml(t('privacy.registerTitle'))}">`
-        + `${escapeHtml(t('privacy.register'))}</button>`;
+        + `title="${escapeHtml(t(titleKey))}">${escapeHtml(t(labelKey))}</button>`;
+      const btns = [];
+      if (a.status !== 'rotated') btns.push(mk('rotate', 'privacy.markRotated', 'privacy.markRotatedTitle'));
+      if (a.status !== 'ignored') btns.push(mk('ignore', 'privacy.markIgnored', 'privacy.markIgnoredTitle'));
+      btns.push(mk('register', 'privacy.register', 'privacy.registerTitle'));
       return `<tr>`
         + `<td class="mono-cell" title="${value}">${value}</td>`
         + `<td>${label}</td>`
+        + `<td>${privacyStatusBadge(a)}</td>`
         + `<td>${a.hit_count}</td>`
         + `<td>${fmtTsShort(a.last_seen)}</td>`
         + `<td class="ctx-cell" title="${escapeHtml(a.context || '')}">${escapeHtml(a.context || '')}</td>`
-        + `<td class="actions">${btn}</td>`
+        + `<td class="actions">${btns.join(' ')}</td>`
         + `</tr>`;
+    }
+
+    // 状态机动作 (rotated/ignored): POST 端点 → 成功后 refetch (服务端是 SSOT,
+    // 不做乐观状态切换 — 行会移入/移出折叠区, 全量重渲染更简单可靠).
+    async function privacyMark(id, action) {
+      try {
+        const r = await fetch(`/api/privacy-scan/alerts/${encodeURIComponent(id)}/${action}`, { method: 'POST' });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+      } catch (e) {
+        console.error(e);
+        setStatus(t('privacy.markFailed'), 'status-err');
+        return;
+      }
+      await refreshPrivacyAlerts();
     }
 
     // 「登记」按钮 → 既有 add-secret 表单预填 (value + 建议 name = pattern + 日期).
@@ -6347,12 +6471,25 @@
     bindTableEvents('secret');
     bindTableEvents('provider');
 
-    // privacy scan 告警行的「登记」按钮 (事件委托, 同 bindTableEvents 模式 —
-    // 行由 replaceTbodyIfChanged 动态重建, 不能逐按钮绑定).
-    document.getElementById('privacy-alerts-body').addEventListener('click', (e) => {
-      const btn = e.target.closest('button[data-action="register"]');
+    // privacy scan 告警行的动作按钮 (事件委托, 同 bindTableEvents 模式 —
+    // 行由 replaceTbodyIfChanged 动态重建, 不能逐按钮绑定). 委托挂在面板级:
+    // active 与 resolved 两个 tbody 的行统一分发.
+    document.getElementById('privacy-scan-panel').addEventListener('click', (e) => {
+      const toggle = e.target.closest('#privacy-resolved-btn');
+      if (toggle) {
+        privacyShowResolved = !privacyShowResolved;
+        renderPrivacyAlerts();
+        return;
+      }
+      const btn = e.target.closest('button[data-action]');
       if (!btn) return;
-      registerPrivacyAlert(btn.dataset.value || '', btn.dataset.label || '');
+      if (btn.dataset.action === 'register') {
+        registerPrivacyAlert(btn.dataset.value || '', btn.dataset.label || '');
+      } else if (btn.dataset.action === 'rotate') {
+        privacyMark(btn.dataset.id || '', 'rotated');
+      } else if (btn.dataset.action === 'ignore') {
+        privacyMark(btn.dataset.id || '', 'ignored');
+      }
     });
 
     function populateCategorySelect() {

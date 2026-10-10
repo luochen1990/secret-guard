@@ -138,10 +138,19 @@ pub fn router() -> Router<AppState> {
             "/api/settings",
             get(api::get_settings).put(api::update_settings),
         )
-        // 隐私旁路扫描告警 (#257 S0.5): GET 视图 (enabled 标志 + 已登记值过滤,
-        // 登记后告警消失; 无写端点 — 档位是静态配置). 安全语义 (疑似明文回显
-        // 与 req_body_raw 同信任域) 见 api/privacy_scan.rs 头部.
+        // 隐私旁路扫描 (#257 S0.5): GET 告警视图 (enabled 标志 + 已登记值过滤,
+        // 登记后告警消失) + R2 状态机动作 (rotated/ignored, PR #303 review —
+        // id 为 hash 形态, 疑似明文不进 URL). 安全语义 (疑似明文回显与
+        // req_body_raw 同信任域) 见 api/privacy_scan.rs 头部.
         .route("/api/privacy-scan/alerts", get(api::list_alerts))
+        .route(
+            "/api/privacy-scan/alerts/{id}/rotated",
+            post(api::mark_rotated),
+        )
+        .route(
+            "/api/privacy-scan/alerts/{id}/ignored",
+            post(api::mark_ignored),
+        )
 }
 
 /// `/api/*` 未匹配子路径的 404 handler (SEC-6: 内部 URL 绝不进入 forward).
