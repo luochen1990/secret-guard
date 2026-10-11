@@ -61,9 +61,15 @@
 //! - **C8 JSON 叶子级兜底 restore (fallback restorability)**: codec 无法 parse 上游
 //!   响应时 (reader 拒绝 / 非 JSON body), [`restore_json_leaves_fallback`] 以
 //!   "parse 为 JSON Value + 字符串值叶子替换" 兜底还原 mock, 尽力不让 mock 逃逸到
-//!   客户端; 未命中/parse 失败返回 None 保持原字节透传 (byte-exact 优先).
+//!   客户端; 未命中/parse 失败返回 `None` 保持原字节透传 (byte-exact 优先).
 //!   契约编号: contracts.md **RED-8**.
-//!
+//! - **C9 placeholder 策略 (明示假值 + 蜜罐检测, #305 批2)**: strategy=placeholder 的
+//!   secret 真值替换为确定性假值 `[REDACTED:{secret_id}]` ([`placeholder_for`]),
+//!   **不走 probing** (值固定) 且**不参与 restore** — 响应侧原样保留明示假值.
+//!   响应 finalize 时对 LLM 视角 message 做蜜罐检测 ([`detect_response_leaks`]):
+//!   该请求配置的全部 placeholder secrets 真值出现于响应 → WARN (只含 secret ids)
+//!   以及 record `leak_alerts` 打标; 检测不干预转发 (透传 + 报警, best-effort 漏报
+//!   面见 contracts.md RED-10). 行为契约: contracts.md **RED-10**.
 //! # 扫描覆盖范围
 //!
 //! [`redact_ir`] 扫描以下字段:
@@ -138,11 +144,39 @@ pub struct RedactionMap {
     /// 形态 [`crate::codec::ir::HitLocations`] (IR 位置语义归 codec 域,
     /// redact 与 usage 均可依赖, 无横向边).
     pub hits: HashMap<String, crate::codec::ir::HitLocations>,
+    /// 请求侧被 placeholder 策略替换过的 real 集合 (C9, RED-10): 这些条目的 mock
+    /// (明示假值) **不参与 restore 投影** — 响应中原样保留. 含 real 明文,
+    /// `#[serde(skip)]` 防意外序列化泄漏 (SEC-3; 消费面全在内存 per-request 管线).
+    #[serde(skip)]
+    pub placeholder_reals: HashSet<String>,
+    /// 蜜罐检测观察名单 (C9, RED-10): 该请求配置的**全部** placeholder 策略
+    /// `(secret_id, real)` 对 (非仅请求命中者 — LLM 从未见过真值, 响应中出现
+    /// 即为异常), redact pipeline 入口预计算, 响应侧 finalize 时经
+    /// [`detect_response_leaks`] 消费. 含 real 明文, `#[serde(skip)]` 同上.
+    #[serde(skip)]
+    pub leak_watch: Vec<(String, String)>,
 }
 
 impl RedactionMap {
     pub fn is_empty(&self) -> bool {
         self.real_to_mock.is_empty()
+    }
+
+    /// 是否存在需要 restore 的条目 (C9, RED-10): placeholder 条目不还原, 不算.
+    /// 响应侧路径选择 (restore 家族 vs 字节透传) 的判据 — 仅有 placeholder
+    /// 命中时响应走透传 (FWD-1 byte-exact 优先, 无合法修改需求), 蜜罐检测
+    /// 经独立的 leak_watch 通道接线.
+    pub fn has_restorable(&self) -> bool {
+        self.restorable_entries().next().is_some()
+    }
+
+    /// 可还原条目迭代器 (mock → real, 排除 placeholder 条目 — C9, RED-10).
+    /// restore 投影的统一数据面: `restore_str_inplace` 的替换遍历 /
+    /// `StreamingRestorer` 的 hold 计算与 `find_safe_end` 扫描均从此迭代.
+    fn restorable_entries(&self) -> impl Iterator<Item = (&String, &String)> + '_ {
+        self.mock_to_real
+            .iter()
+            .filter(|(_, real)| !self.placeholder_reals.contains(*real))
     }
 
     /// 插入映射. 若 mock 已映射到**不同** real (C4 单射性违反), 返回 `RedactError`
@@ -182,6 +216,17 @@ impl RedactionMap {
 }
 
 // ─── 内部算法 ──────────────────────────────────────────────────────────────
+
+/// placeholder 策略 (C9, RED-10) 的明示假值形态: `[REDACTED:{secret_id}]`.
+///
+/// 契约: 确定性 (同 id 恒同值, 不依赖 seed — 与 mock 的 probing 模型正交);
+/// 唯一性 (secret id 唯一 ⇒ placeholder 唯一, validate_id 保证 id 非空且
+/// 字符集受限, 不同 id 必产生不同形态); 不含真值子串 (id 来自受控字符集,
+/// 与 real 无交集保证由 [`crate::secrets::validate_value`] 的最小长度与
+/// 用户配置语义承担).
+pub fn placeholder_for(id: &str) -> String {
+    format!("[REDACTED:{id}]")
+}
 
 /// 计算 policy 的 init seed (per-request seed 链的起点).
 ///
@@ -353,6 +398,19 @@ fn redact_ir_inner(
         return Ok((map, 0));
     }
 
+    // 蜜罐观察名单 (C9, RED-10): 该请求配置的**全部** placeholder 策略 secrets
+    // (非仅请求命中者 — LLM 从未见过真值, 响应中出现即为异常, 覆盖 "模型凭空
+    // 说出真值" 的最强蜜罐场景). 响应侧 finalize 时消费 (detect_response_leaks);
+    // 请求未命中任何 placeholder secret 时 map.real_to_mock 为空但 leak_watch
+    // 仍非空 (检测照常, 与 restore 路径选择解耦).
+    map.leak_watch = secrets
+        .iter()
+        .filter(|s| {
+            s.strategy == crate::secrets::SecretStrategy::Placeholder && !s.value.is_empty()
+        })
+        .map(|s| (s.id.clone(), s.value.clone()))
+        .collect();
+
     let mut sorted: Vec<&SecretEntry> = secrets.iter().filter(|e| !e.value.is_empty()).collect();
     sorted.sort_by_key(|e| std::cmp::Reverse(e.value.len()));
     sorted.dedup_by(|a, b| a.value == b.value);
@@ -379,6 +437,26 @@ fn redact_ir_inner(
         // 位置统计 (替换前, 只读): 仅对命中的 secret 执行, 与替换遍历同阶
         // (USAGE-7 治理归因 — 哪个环节把 secret 塞进来).
         let locations = count_hit_locations(ir, &secret.value);
+        // strategy=placeholder (C9, RED-10, #305 批2): 真值 → 明示假值
+        // `[REDACTED:{id}]` (确定性, 不走 probing — mock 生成跳过), 响应侧不还原
+        // (placeholder_reals 标记, restore 投影跳过). IR 已含 placeholder
+        // (上轮 echo 回传) 是幂等正常态: 命中判定只看真值, 不构成冲突.
+        if secret.strategy == crate::secrets::SecretStrategy::Placeholder {
+            let ph = placeholder_for(&secret.id);
+            match map.insert(secret.value.clone(), ph.clone(), &secret.id) {
+                Ok(()) => {
+                    ir_request_replace_all(ir, &secret.value, &ph);
+                    map.placeholder_reals.insert(secret.value.clone());
+                    map.hits.insert(secret.value.clone(), locations);
+                }
+                Err(e) => {
+                    // insert collision (防御性检查触发) 的降级与 redact 分支共用
+                    // (SEC-10 语义单一来源).
+                    degrade_on_insert_collision(mode, e, "placeholder")?;
+                }
+            }
+            continue;
+        }
         match gen_mock_for_ir(ir, secret, seed, &allocated) {
             Ok(mock) => {
                 // 先 insert 到 map (防御性 C4 检查); 成功后再改写 IR + allocated,
@@ -392,19 +470,7 @@ fn redact_ir_inner(
                     Err(e) => {
                         // insert 的 collision 在防御性检查中触发时, 同样降级跳过 (不 panic).
                         // 不改写 IR: secret 原样发往上游 (与探测耗尽的降级语义一致).
-                        match mode {
-                            OnProbeExhausted::FailOpen => {
-                                warn!(
-                                    secret_id = %e.secret_id,
-                                    reason = ?e.reason,
-                                    "redact insert failed; skipping this secret (forwarded unredacted)"
-                                );
-                            }
-                            OnProbeExhausted::FailClosed => {
-                                // FailClosed: 拒绝转发, 返回错误信号. 不 warn (caller 决定日志策略).
-                                return Err(e);
-                            }
-                        }
+                        degrade_on_insert_collision(mode, e, "redact")?;
                     }
                 }
             }
@@ -437,6 +503,31 @@ fn redact_ir_inner(
     Ok((map, final_seed))
 }
 
+/// insert collision (防御性 C4 检查触发) 的降级分发 — redact 与 placeholder
+/// (C9) 两分支共用, SEC-10 降级语义的单一来源:
+/// - FailOpen: warn (只记 secret id, 不含 value) + 跳过该 secret (原样发往上游);
+/// - FailClosed: 返回 `Err` 拒绝转发 (不 warn, caller 决定日志策略).
+///
+/// `label` 仅插入 warn 文案的归因标签 ("redact" / "placeholder"), 输出形态两
+/// 分支逐字一致.
+fn degrade_on_insert_collision(
+    mode: OnProbeExhausted,
+    e: RedactError,
+    label: &str,
+) -> Result<(), RedactError> {
+    match mode {
+        OnProbeExhausted::FailOpen => {
+            warn!(
+                secret_id = %e.secret_id,
+                reason = ?e.reason,
+                "{label} insert failed; skipping this secret (forwarded unredacted)"
+            );
+            Ok(())
+        }
+        OnProbeExhausted::FailClosed => Err(e),
+    }
+}
+
 /// 在 [`IrResponse`] 中反向替换 mock 为真实 secret.
 ///
 /// 非流式响应的 restore 路径. 遍历结构由 [`StringLeafOps for IrResponse`] 提供,
@@ -446,6 +537,43 @@ pub fn restore_ir_response(ir: &mut IrResponse, map: &RedactionMap) {
         return;
     }
     ir.for_each_str_leaf_mut(&mut |s| restore_str(s, map));
+}
+
+/// 蜜罐泄露检测 (C9, RED-10): 扫描 LLM 视角 (**restore 前**) 的响应 message
+/// 文本叶子, 返回真值出现于响应中的 placeholder 策略 secret id 列表 (排序去重).
+///
+/// 契约:
+/// - 检测面 = `leak_watch` 全部条目 (该请求配置的全部 placeholder secrets,
+///   非仅请求命中者 — 覆盖 "模型凭空说出真值" 的最强蜜罐场景).
+/// - 扫描对象是 message content 的字符串叶子 (与 restore 的投影面差异:
+///   restore 额外覆盖 `stop_sequence` 等 IrResponse 元字段, 检测不扫 —
+///   终止符是极短 token, 真值出现在其中的概率可忽略); 扫描发生在 unescape
+///   后的 IR 叶子上, 无 JSON escape 盲区.
+/// - **不干预转发**: 本函数纯检测 (只读), 替换/拦截均不做 — 检测到真值意味着
+///   泄露已发生, 客户端看到真值 = 用户立即看到证据; 流式字节已流出, 替换会
+///   造成流式/非流式行为不一致.
+/// - best-effort (ROB-*): 永不 panic; `leak_watch` 空或 message 无 content 时
+///   返回空 vec (调用方对 message 为 None 的场景直接跳过).
+/// - real 空串防御性跳过 (`contains("")` 恒 true 会全量误报).
+///
+/// 返回的 id 列表供调用方 WARN (只含 id, SEC-3) 与 record `leak_alerts` 打标.
+pub fn detect_response_leaks(message: &IrMessage, leak_watch: &[(String, String)]) -> Vec<String> {
+    if leak_watch.is_empty() {
+        return Vec::new();
+    }
+    let mut hit_ids: HashSet<String> = HashSet::new();
+    for block in &message.content {
+        block.for_each_str_leaf(&mut |leaf| {
+            for (id, real) in leak_watch {
+                if !real.is_empty() && leaf.contains(real.as_str()) {
+                    hit_ids.insert(id.clone());
+                }
+            }
+        });
+    }
+    let mut out: Vec<String> = hit_ids.into_iter().collect();
+    out.sort();
+    out
 }
 
 /// 兜底 restore (C8): 把 bytes parse 为单个 JSON Value, 遍历所有字符串**值叶子**,
@@ -592,8 +720,15 @@ pub struct StreamingRestorer {
 
 impl StreamingRestorer {
     /// 构造. `map` 为空时所有 push 直接透传 (zero overhead).
+    ///
+    /// hold 计算排除 placeholder 条目 (C9, RED-10): 它们不被 restore, 无需为
+    /// 其防跨 chunk 而缓冲尾部字节.
     pub fn new(map: RedactionMap) -> Self {
-        let max_mock_len = map.mock_to_real.keys().map(|m| m.len()).max().unwrap_or(0);
+        let max_mock_len = map
+            .restorable_entries()
+            .map(|(mock, _)| mock.len())
+            .max()
+            .unwrap_or(0);
         Self {
             map,
             hold: max_mock_len.saturating_sub(1),
@@ -658,7 +793,8 @@ impl StreamingRestorer {
             return 0;
         }
         let mut max_mock_end = 0usize;
-        for mock in self.map.mock_to_real.keys() {
+        // 只扫描可还原 mock (placeholder 条目不被 restore, 不构成 hold 依据 — C9).
+        for mock in self.map.restorable_entries().map(|(m, _)| m) {
             if mock.len() > len {
                 continue;
             }
@@ -753,12 +889,15 @@ impl crate::codec::stream::StreamRestoreHook for StreamingRestorerSet {
 /// [`restore_str`] 的纯函数版本 (in-place), 复用同一段 find-and-replace 逻辑.
 /// 返回是否发生了至少一次替换 — 供 [`restore_json_value_fallback`] 判断
 /// "未命中则保持原字节" (避免每个叶子 clone 比对).
+///
+/// placeholder 条目不参与 (C9, RED-10): 经 [`RedactionMap::restorable_entries`]
+/// 排除, 响应中 `[REDACTED:{id}]` 原样保留.
 pub(crate) fn restore_str_inplace(s: &mut String, map: &RedactionMap) -> bool {
     if map.is_empty() || s.is_empty() {
         return false;
     }
     let mut replaced = false;
-    for (mock, real) in &map.mock_to_real {
+    for (mock, real) in map.restorable_entries() {
         if s.contains(mock) {
             *s = s.replace(mock, real);
             replaced = true;
@@ -2283,6 +2422,258 @@ mod tests {
         assert_eq!(map.real_to_mock.len(), 1);
         assert!(map.mock_for("sk-normal-redact-123").is_some());
         assert_ne!(seed, 0, "seed must be non-zero when the redact secret hit");
+    }
+
+    // ─── strategy=placeholder (#305 批2, RED-10): 明示假值 + 蜜罐检测 ────────
+
+    /// 构造 placeholder 策略 entry (id 用固定串, 避免 entry() 的 id-{value} 派生
+    /// 让 SEC 断言对 id 与真值子串假阳性 — 与 reject 测试同型).
+    fn placeholder_entry(id: &str, value: &str) -> SecretEntry {
+        let mut e = entry(value);
+        e.id = id.into();
+        e.strategy = crate::secrets::SecretStrategy::Placeholder;
+        e
+    }
+
+    #[test]
+    fn prop_placeholder_for_deterministic_unique_no_real_substring() {
+        // C9 形态契约: 确定性 (同 id 恒同值) / 唯一性 (id 唯一 ⇒ 假值唯一) /
+        // 形态 = `[REDACTED:{id}]` / 不含真值子串 (示例真值).
+        assert_eq!(placeholder_for("api-key"), "[REDACTED:api-key]");
+        assert_eq!(placeholder_for("api-key"), placeholder_for("api-key"));
+        assert_ne!(placeholder_for("api-key"), placeholder_for("api-key-2"));
+        let real = "super-secret-value-DO-NOT-LEAK";
+        assert!(
+            !placeholder_for("api-key").contains(real),
+            "placeholder must not contain the real secret substring"
+        );
+    }
+
+    #[test]
+    fn prop_placeholder_strategy_replaces_real_with_marker() {
+        let real = "placeholder-secret-value-xyz";
+        let ph_entry = placeholder_entry("ph-one", real);
+        let mut ir = sample_ir_with_text(&format!("please use {real} now"));
+        let (map, seed) = redact_ir_checked(
+            &mut ir,
+            std::slice::from_ref(&ph_entry),
+            crate::config::OnProbeExhausted::FailClosed,
+        )
+        .expect("placeholder strategy must not refuse");
+        // map: real → [REDACTED:id], placeholder_reals 标记, leak_watch 预计算.
+        assert_eq!(map.mock_for(real), Some(placeholder_for("ph-one").as_str()));
+        assert!(map.placeholder_reals.contains(real));
+        assert_eq!(
+            map.leak_watch,
+            vec![("ph-one".to_string(), real.to_string())]
+        );
+        // 命中算 hit_any (final_seed 语义不变).
+        assert_ne!(seed, 0, "placeholder hit counts toward final_seed");
+        // IR 文本: 真值消失, 假值在场.
+        let text = match &ir.messages[0].content[0] {
+            IrBlock::Text { text, .. } => text.clone(),
+            _ => panic!("expected Text block"),
+        };
+        assert!(
+            !text.contains(real),
+            "real secret must be replaced; got: {text}"
+        );
+        assert!(text.contains(&placeholder_for("ph-one")));
+        // has_restorable: placeholder 条目不算 → 响应走透传路径 (dispatch 判据).
+        assert!(!map.has_restorable());
+        assert!(!map.is_empty(), "map carries the placeholder mapping");
+    }
+
+    #[test]
+    fn prop_placeholder_idempotent_when_marker_echoed_back() {
+        // 上轮 LLM echo 回传 [REDACTED:id] 进历史 → 本轮 redact 是幂等正常态:
+        // 假值不含真值 → 不命中 → 不替换不冲突; leak_watch 照常在场.
+        let real = "placeholder-echo-secret-value";
+        let ph_entry = placeholder_entry("ph-echo", real);
+        let mut ir = sample_ir_with_text(&format!(
+            "echo was {} and nothing else",
+            placeholder_for("ph-echo")
+        ));
+        let (map, seed) = redact_ir_checked(
+            &mut ir,
+            std::slice::from_ref(&ph_entry),
+            crate::config::OnProbeExhausted::FailClosed,
+        )
+        .expect("echoed placeholder must not conflict");
+        assert!(map.is_empty(), "no real hit → no replacement this round");
+        assert_eq!(seed, 0, "no hit → passthrough seed");
+        assert_eq!(
+            map.leak_watch,
+            vec![("ph-echo".to_string(), real.to_string())],
+            "leak_watch covers unhit placeholder secrets too (detection scope)"
+        );
+    }
+
+    #[test]
+    fn prop_placeholder_not_restored_in_response() {
+        // restore 投影跳过 placeholder 条件: 响应中的 [REDACTED:id] 原样保留
+        // (不被还原成真值 — 明示假值语义), redact 条目照常 round-trip.
+        let real = "placeholder-restore-secret-value";
+        let ph_entry = placeholder_entry("ph-restore", real);
+        let mut ir = sample_ir_with_text(&format!("use {real} here"));
+        let (map, _) = redact_ir_checked(
+            &mut ir,
+            std::slice::from_ref(&ph_entry),
+            crate::config::OnProbeExhausted::FailClosed,
+        )
+        .expect("placeholder redact must succeed");
+        let marker = placeholder_for("ph-restore");
+        let mut resp = sample_ir_response_with_text(&format!("the marker is {marker} indeed"));
+        restore_ir_response(&mut resp, &map);
+        let text = match &resp.content[0] {
+            IrBlock::Text { text, .. } => text.clone(),
+            _ => panic!("expected Text block"),
+        };
+        assert_eq!(
+            text,
+            format!("the marker is {marker} indeed"),
+            "placeholder must survive restore untouched"
+        );
+    }
+
+    #[test]
+    fn prop_placeholder_and_redact_mixed_round_trip() {
+        // 混合策略: redact 条目照常 C6 round-trip, placeholder 条目不还原.
+        let ph_real = "mixed-placeholder-secret-value";
+        let rd_real = "sk-mixed-redact-456";
+        let secrets = vec![placeholder_entry("ph-mixed", ph_real), entry(rd_real)];
+        let mut ir = sample_ir_with_text(&format!("keys: {ph_real} and {rd_real}"));
+        let (map, _) = redact_ir(&mut ir, &secrets);
+        assert_eq!(map.real_to_mock.len(), 2, "both strategies replace");
+        assert!(
+            map.has_restorable(),
+            "redact entry keeps the map restorable"
+        );
+        // 响应 echo 两者 (LLM 视角): redact mock → real; placeholder 原样.
+        let rd_mock = map.mock_for(rd_real).unwrap().to_string();
+        let marker = placeholder_for("ph-mixed");
+        let mut resp = sample_ir_response_with_text(&format!("echo {rd_mock} and {marker}"));
+        restore_ir_response(&mut resp, &map);
+        let text = match &resp.content[0] {
+            IrBlock::Text { text, .. } => text.clone(),
+            _ => panic!("expected Text block"),
+        };
+        assert!(text.contains(rd_real), "redact mock must restore to real");
+        assert!(text.contains(&marker), "placeholder marker must stay as-is");
+        assert!(!text.contains(rd_mock.as_str()));
+    }
+
+    #[test]
+    fn prop_streaming_restorer_excludes_placeholder_from_hold() {
+        // hold 计算排除 placeholder 条目: placeholder-only map → hold = 0 →
+        // push 直接全量 emit (无尾部缓冲), 且内容原样透传 (无替换).
+        let real = "placeholder-hold-secret-value";
+        let ph_entry = placeholder_entry("ph-hold", real);
+        let mut ir = sample_ir_with_text(&format!("use {real} now"));
+        let (map, _) = redact_ir(&mut ir, std::slice::from_ref(&ph_entry));
+        let mut restorer = StreamingRestorer::new(map);
+        let marker = placeholder_for("ph-hold");
+        // chunk 切在 marker 中间: hold=0 时也无损 (placeholder 不需要跨 chunk 防御).
+        let out1 = restorer.push(format!("the value is {marker}"));
+        assert_eq!(out1, format!("the value is {marker}"));
+        let (kind, tail) = restorer.flush();
+        assert!(tail.is_empty(), "no hold → no residual tail");
+        assert_eq!(kind, DeltaKind::Text);
+    }
+
+    #[test]
+    fn prop_detect_response_leaks_hit_miss_partial() {
+        // 检测命中 / 未命中 / 部分命中 + 排序去重 + 空 real 防御.
+        let msg = |text: &str| IrMessage {
+            role: IrRole::Assistant,
+            content: vec![IrBlock::Text {
+                text: text.to_string(),
+                extra: Default::default(),
+            }],
+            ..Default::default()
+        };
+        let watch = vec![
+            ("secret-a".to_string(), "alpha-real-value".to_string()),
+            ("secret-b".to_string(), "beta-real-value".to_string()),
+        ];
+        // 命中单个.
+        assert_eq!(
+            detect_response_leaks(&msg("leaked alpha-real-value here"), &watch),
+            vec!["secret-a".to_string()]
+        );
+        // 命中两个 (乱序输入, 输出排序).
+        assert_eq!(
+            detect_response_leaks(&msg("beta-real-value and alpha-real-value"), &watch),
+            vec!["secret-a".to_string(), "secret-b".to_string()]
+        );
+        // 未命中.
+        assert!(detect_response_leaks(&msg("clean response"), &watch).is_empty());
+        // 部分子串不算命中 (contains 是完整子串语义, 前缀片段不触发).
+        assert!(detect_response_leaks(&msg("alpha-real-val fragment"), &watch).is_empty());
+        // 空 watch 短路.
+        assert!(detect_response_leaks(&msg("alpha-real-value"), &[]).is_empty());
+        // 空 real 防御性跳过 (contains("") 恒 true 会全量误报).
+        let bad_watch = vec![("secret-empty".to_string(), String::new())];
+        assert!(detect_response_leaks(&msg("anything"), &bad_watch).is_empty());
+        // 同一 real 多次出现 → 去重单条.
+        assert_eq!(
+            detect_response_leaks(&msg("alpha-real-value twice alpha-real-value"), &watch),
+            vec!["secret-a".to_string()]
+        );
+    }
+
+    #[test]
+    fn prop_redaction_map_serde_skips_plaintext_watch_fields() {
+        // SEC-3: leak_watch / placeholder_reals 含 real 明文, serde skip 防
+        // 意外序列化泄漏. 断言面用**未命中**的 placeholder secret — 其 real 只会
+        // 进入 leak_watch (不进 real_to_mock; 后者的 key 本就是 real 明文,
+        // 属既有行为非本批契约), 从而 skip 是否生效可被精确观测.
+        let real = "serde-skip-secret-value";
+        let ph_entry = placeholder_entry("ph-serde", real);
+        // 请求不含 real → 未命中: map 仅 leak_watch 携带明文.
+        let mut ir = sample_ir_with_text("no secret in this request body");
+        let (map, _) = redact_ir(&mut ir, std::slice::from_ref(&ph_entry));
+        assert!(map.real_to_mock.is_empty());
+        assert_eq!(
+            map.leak_watch,
+            vec![("ph-serde".to_string(), real.to_string())]
+        );
+        let json = serde_json::to_string(&map).expect("RedactionMap serializes");
+        assert!(
+            !json.contains(real),
+            "serialized map must not carry leak_watch real secret: {json}"
+        );
+        assert!(
+            !json.contains("leak_watch") && !json.contains("placeholder_reals"),
+            "skip fields must be absent from serialization: {json}"
+        );
+        // 反序列化 round-trip: skip 字段丢弃 (补默认空), 既有三字段保持等价.
+        let back: RedactionMap = serde_json::from_str(&json).expect("RedactionMap deserializes");
+        let mut expected = map.clone();
+        expected.leak_watch = Vec::new();
+        expected.placeholder_reals = HashSet::new();
+        assert_eq!(back, expected);
+        assert!(back.leak_watch.is_empty() && back.placeholder_reals.is_empty());
+    }
+
+    #[test]
+    fn prop_leak_watch_covers_all_placeholder_secrets() {
+        // 检测面 = 全部 placeholder 策略 secrets (非仅请求命中者): 配置了
+        // placeholder + redact 各一条, 请求只命中 redact → leak_watch 仍含
+        // placeholder 条目 ("模型凭空说出真值" 的最强蜜罐场景).
+        let ph_real = "unhit-placeholder-secret-value";
+        let secrets = vec![
+            placeholder_entry("ph-unhit", ph_real),
+            entry("sk-hit-redact-789"),
+        ];
+        let mut ir = sample_ir_with_text("only uses sk-hit-redact-789 here");
+        let (map, _) = redact_ir(&mut ir, &secrets);
+        assert_eq!(
+            map.leak_watch,
+            vec![("ph-unhit".to_string(), ph_real.to_string())],
+            "leak_watch must list every configured placeholder secret"
+        );
+        assert!(map.has_restorable(), "redact hit keeps restore path");
     }
 
     #[test]

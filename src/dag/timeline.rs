@@ -98,13 +98,15 @@ fn build_round_briefs(inner: &DagInner, chain: &[Uuid]) -> Vec<RoundBrief> {
 /// 路径永不 panic, 即便理论不变式被未来 bug 打破也只少一条 round, 不 500.
 fn build_timeline_round(inner: &DagInner, node_id: Uuid) -> Option<TimelineRound> {
     let node = inner.nodes.get(&node_id)?;
-    // usage 徽章数据 (usage-stats): 上游回显的 token 用量, None = 无回显.
-    let usage = node
-        .response
-        .read()
-        .as_ref()
-        .and_then(|r| r.usage.as_ref())
-        .map(crate::dto::UsageView::from_ir);
+    // usage 徽章数据 (usage-stats) + 蜜罐检测命中 (RED-10): 同一把 response 读锁
+    // 内一次采集 (usage = 上游回显的 token 用量, None = 无回显).
+    let (usage, leak_alerts) = match node.response.read().as_ref() {
+        Some(r) => (
+            r.usage.as_ref().map(crate::dto::UsageView::from_ir),
+            r.leak_alerts.clone(),
+        ),
+        None => (None, Vec::new()),
+    };
     #[cfg(feature = "consistency-check")]
     crate::derive::assert_delta_view_matches_raw(node, &inner.blocks);
     Some(TimelineRound {
@@ -118,6 +120,8 @@ fn build_timeline_round(inner: &DagInner, node_id: Uuid) -> Option<TimelineRound
         redactions: std::sync::Arc::clone(&node.event.redactions),
         req_delta_messages: crate::derive::extract_delta_messages_from_blocks(node, &inner.blocks),
         usage,
+        // 蜜罐检测命中 (RED-10): timeline 轮次警示徽章数据源.
+        leak_alerts,
     })
 }
 

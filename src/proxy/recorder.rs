@@ -1066,12 +1066,33 @@ impl RespFinality {
 /// "先断言后删除" 守卫, 最后整体替换写入。三处 finalize 调用点
 /// (fanout_stream_task / buffered_ir / cross_proto 非流式) 的单点接线 —
 /// B2 再增元字段时只改这里。
+///
+/// `leak_watch` (RED-10, #305 批2): 蜜罐检测观察名单 (来自请求侧 RedactionMap,
+/// 透传路径无 redact 时为空 vec → 检测零开销短路). 对 `finality.message`
+/// (LLM 视角, restore 前) 的文本叶子扫描 placeholder 策略真值: 命中 →
+/// WARN (只含 record_id + secret_ids, SEC-3 — 永不含真值) + `leak_alerts`
+/// 打标进 ResponseData. best-effort: message 为 None (无 codec / parse 失败 /
+/// overflow / 零语义事件) 时跳过 (漏报可接受, ROB-*). 检测不干预转发.
 pub(super) fn attach_finality(
     dag: &ConversationDag,
     node_id: Uuid,
     finality: &RespFinality,
+    leak_watch: &[(String, String)],
     base: ResponseData,
 ) {
+    let leak_alerts = finality
+        .message
+        .as_ref()
+        .map(|m| crate::redact::detect_response_leaks(m, leak_watch))
+        .unwrap_or_default();
+    if !leak_alerts.is_empty() {
+        warn!(
+            record_id = %node_id,
+            secret_ids = ?leak_alerts,
+            "honeypot leak detected: placeholder-strategy secret real value found in \
+             LLM response (detection only; forwarding untouched)"
+        );
+    }
     let resp_data = ResponseData {
         // B1: 稳态不再长期存 parsed Value — 渲染时从 message + 元字段派生
         // (derive::response_parsed_from_parts). 流式进行中的节流 parsed
@@ -1084,6 +1105,7 @@ pub(super) fn attach_finality(
         created: finality.created,
         usage: finality.echo.usage.clone(),
         model: finality.echo.model.clone(),
+        leak_alerts,
         ..base
     };
     // 视图正确性守卫 (B1 "先断言后删除"): 丢弃 stored parsed 前验证

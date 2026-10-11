@@ -64,7 +64,7 @@
 | 段前缀 | 域 | 现有编号 → 新编号 | 原位置 |
 |---|---|---|---|
 | `FWD-*` | 转发忠实性 (域 A) | codec INV-1/2/5 → FWD-1/2/5; proxy DoD → FWD-4/6 | `src/proxy/mod.rs` 头部 + `src/codec/AGENTS.md` |
-| `RED-*` | Redact/Restore (域 A) | C1→RED-1, C2→RED-2, C3→RED-3, C4→RED-4, C5→RED-5, C6→RED-6, C7→RED-7, C8→RED-8, RED-9 (新增, #305 批1) | `src/redact.rs` + `src/mock.rs` 头部 |
+| `RED-*` | Redact/Restore (域 A) | C1→RED-1, C2→RED-2, C3→RED-3, C4→RED-4, C5→RED-5, C6→RED-6, C7→RED-7, C8→RED-8, RED-9 (新增, #305 批1), RED-10 (新增, #305 批2) | `src/redact.rs` + `src/mock.rs` 头部 |
 | `STR-*` | 流式 SSE (域 A) | codec INV-4 → STR-5 | `src/codec/stream/` (目录, 拆分见 `src/codec/AGENTS.md`) |
 | `CDAG-*` | Conversation DAG (域 B) | INV-1→CDAG-1, INV-2→CDAG-2, INV-3→CDAG-3, INV-4→CDAG-4, INV-5→CDAG-5 | `src/dag/mod.rs` 头部 + `docs/design/conversation-dag.md` |
 | `DTO-*` | WebUI DTO 派生 (域 B) | (新增) | `src/web/AGENTS.md` + `src/record.rs` 头部 |
@@ -128,7 +128,7 @@ null 而非伪造全零对象); ② **精确化**: 协议间互译把粗粒度�
 UI 段的 Playwright 测试用中文标题, 锚点即标题子串 (须避开反引号; 可含空格与括号 —
 lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
-**⏳ 项补齐优先级** (按风险排序, 排期依据 — 剩 10 条 = 9 条 property (lint 口径) + VIEW-2 表格注记, 2026-09-17; 原始 23 条见 2026-08-15 版变更日志):
+**⏳ 项补齐优先级** (按风险排序, 排期依据 — 剩 10 条 = 9 条 property (lint 口径) + VIEW-2 表格注记 = 2026-09-17 走查稳态集; RED-10 (#305 批2) 的 3 条暂态 ⏳ 已于 2026-10-11 合并时按 T1 实名翻转为 6 条 ✅; 原始 23 条见 2026-08-15 版变更日志):
 
 1. **待裁决 / 架构受限 (3 条)** — 补齐前需先做实现路线裁决或架构改动:
    STR-3 `prop_non_2xx_sse_no_mock_to_client` (已知实现 gap, 见 STR-3 "理想 vs 现状" 注记,
@@ -526,13 +526,14 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 - `prop_json_leaf_fallback_wired_in_fallback_branches`: 同协议 reader 拒绝 / 跨协议 reader 拒绝的端到端场景 (显式 `restore` 配置), 客户端收到还原后的 JSON + restored-via-fallback WARN (不带 secret 明文). 🔁→`buffered_reader_reject_restores_mock_via_json_leaf_fallback` + `cross_proto_reader_reject_restores_mock_via_json_leaf_fallback` (`tests/integration.rs`)
 - `prop_json_leaf_fallback_keys_untouched`: 只遍历字符串**值**叶子, Object key 不被改写. 🔁→`restore_json_leaves_fallback_leaves_object_keys_untouched` (`src/redact.rs`)
 
-### RED-9 per-secret 处理策略 (strategy: redact / reject; protect / placeholder 预留)
+### RED-9 per-secret 处理策略 (strategy: redact / reject / placeholder; protect 预留)
 
 **陈述**: `[[secrets.entries]]` 的 `strategy` 字段 (serde snake_case 枚举, 缺省 `redact` — 旧配置零改动) 定义该 Secret 真值在请求侧命中后的处理策略:
 
 - **redact (缺省, 现状)**: 透明替换 (real→mock), 行为由既有 RED-1..RED-8 管辖, 本契约对其零触碰.
 - **reject (#305 批1)**: 该 Secret 的真值出现于请求 IR 的任一字符串叶子 (扫描面与 RED-2 的 redact 遍历同源, 含 extra 叶子) → **整请求拒绝转发**: 客户端收 503 (`AppError::Unavailable`, 与 RED-4 fail_closed 同型), message 只含 secret id + reason 枚举, 不含 secret 明文 (SEC-2 同型); **零上游请求** (判定先于 mock 生成, 上游零命中). reject 是**显式策略而非降级** — 不受 `[redact] on_probe_exhausted` 模式影响 (fail_open 下同样拒绝, 与探测耗尽正交, SEC-10 的降级开关族不适用).
-- **protect / placeholder (值域预留, fail-fast)**: serde 值域已定义但行为未交付 — static 加载 / dynamic 加载 / WebUI upsert 凡遇此二值, validate 报错拒绝 ("not implemented yet", 防止以为受保护而实际静默失效); 行为契约由批2 (placeholder, 形式 `[REDACTED:{id}]` + 蜜罐报警) / 批3 (protect, 全响应 placeholder) 各自新增 RED-10 / RED-11 补充, 不在本批虚构.
+- **placeholder (#305 批2 → RED-10)**: 请求侧命中替换为**明示假值** `[REDACTED:{secret_id}]`, 响应侧**不还原** + 蜜罐检测报警 (不干预转发) — 完整行为契约见 **RED-10**, 本条不重复陈述.
+- **protect (值域预留, fail-fast)**: serde 值域已定义但行为未交付 — static 加载 / dynamic 加载 / WebUI upsert 凡遇此值, validate 报错拒绝 ("not implemented yet", 防止以为受保护而实际静默失效); 行为契约由批3 (protect, 全响应 placeholder) 新增 RED-11 补充, 不在本批虚构.
 
 **向后兼容锚**: 缺省 `strategy = "redact"` 时, 全部既有 RED-* 契约 (RED-1..RED-8) 逐字不变 — 不加 strategy 的旧配置与旧请求行为零变化.
 
@@ -542,6 +543,41 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 - `prop_reject_strategy_503_zero_upstream_sec2_message`: 端到端 — reject secret 的真值出现于请求 → 客户端 503 + message 含 secret id 不含真值 (SEC-2 同型) + 上游零请求 (mockito 零命中). ✅ `tests/integration.rs::prop_reject_strategy_503_zero_upstream_sec2_message`
 - `prop_reject_strategy_hits_refuse_regardless_of_mode`: 单元 — 命中 → `Err(RedactError { reason: StrategyReject })`, 且 fail_open / fail_closed 两种 on_probe_exhausted 模式下同样拒绝 (显式策略不受降级配置影响). ✅ `src/redact.rs::prop_reject_strategy_hits_refuse_regardless_of_mode`
 - `prop_reject_strategy_miss_passes_through`: 单元 — reject secret 存在但未命中 (请求不含其真值) → 不触发拒绝, 其余 secret 正常 redact (`prop_reject_strategy_miss_preserves_other_secrets_redact`) / 请求正常转发 (集成回归 `prop_reject_strategy_unhit_forwards_normally`) (缺省路径零行为变化的回归面). ✅ `src/redact.rs::prop_reject_strategy_miss_passes_through` + `tests/integration.rs::prop_reject_strategy_unhit_forwards_normally`
+
+### RED-10 placeholder 策略 (明示假值 + 蜜罐检测)
+
+**陈述**: `strategy = "placeholder"` (#305 批2) 的 Secret, 请求侧命中后替换为**明示假值**
+`[REDACTED:{secret_id}]` (LLM 可识别 "此处已脱敏", 非仿真 mock), 响应侧**不还原**
+(placeholder 原样到达客户端), 并对该类 Secret 的真值做**蜜罐检测** — LLM 响应中出现
+真值 → 日志 WARN + record 打标 (WebUI timeline 轮次警示徽章), **不干预转发**.
+
+**请求侧 (替换语义)**:
+
+- **形态与生成**: `redact::placeholder_for(id)` 产出 `[REDACTED:{id}]`. **确定性**: 同 id 恒同值, 不依赖 per-request seed, 无 probing (值固定); **唯一性**: id 唯一 ⇒ placeholder 唯一 (RED-4 单射检查天然覆盖); **不含真值子串** (明示假值, 天然满足 RED-5).
+- **幂等**: `[REDACTED:{id}]` 已在 IR 中 (客户端把上轮含 placeholder 的响应 echo 回传) 是正常态而非冲突 — 再替换结果不变 (对比 redact 的旧 mock 例外 (RED-3 裁决): placeholder 值固定, 无该例外).
+- **usage 审计同源**: 命中计入 `map.hits`, `derive_redact_hits` 天然涵盖 (mock 字段装 placeholder 值), 无需单独统计口径.
+
+**响应侧 (不还原 + 蜜罐检测)**:
+
+- **不还原**: placeholder 条目从一切 restore 投影中排除 (`restore_str_inplace` / `restore_ir_response` / `StreamingRestorer` 的 hold 计算) — 混合策略 (placeholder + redact 并存) 下 redact 条目照常 round-trip (RED-6/7), placeholder 条目原样保留.
+- **检测面 = 该请求配置的全部 placeholder 策略 secrets** (`RedactionMap.leak_watch`, redact 入口从 secrets 快照预计算, 策略为 Placeholder 且 value 非空), **非仅请求命中者** — LLM 从未见过真值, 响应中出现即为异常, 覆盖 "模型凭空说出真值" 的最强蜜罐场景.
+- **检测时点 = 响应 finalize** (事后扫全量文本, 不做在线滑窗): 流式复用 StreamScan 累积的 LLM 视角 blocks (resp_parsed 派生同源), 非流式 IR parse 后 restore 前同构; 收口在 `proxy::recorder::attach_finality` (`redact::detect_response_leaks`, 签名带 leak_watch — 流式/非流式/cross_proto 调用方单点全覆盖, 编译器暴露遗漏).
+- **检测不干预转发** (透传 + 报警, 裁决 2026-10-11): 检测到真值时**不替换、不拦截** — 与 privacy_scan "永不拦截" 红线同型哲学. rationale: 真值出现在 LLM 响应意味着泄露已发生在模型侧/请求侧 (这正是报警要揭示的), 客户端看到真值 = 用户立即看到证据; 流式场景字节已流出, 替换会造成流式/非流式行为不一致.
+- **best-effort 漏报面** (漏报可接受, 误报不可接受): StreamScan overflow / parse 失败 / 无 codec 路径 (finality.message 为 None) 跳过检测; JSON escape 盲区不存在 (扫描在 unescape 后的 IR 字符串叶子上, 与 redact 遍历同构).
+- **报警数据不含真值** (SEC-1/SEC-3 同型): `leak_alerts` 只存 secret_id (排序去重); WARN 日志只含 record_id + secret_ids; 呈现 = record 打标 (`ResponseData.leak_alerts` → NodeView / TimelineRound / ForwardRecord 同名透传) + WebUI timeline 轮次警示徽章.
+
+**遍历顺序边界** (同型引用 RED-9): ① 同值多 entry: `sort + dedup` 先者胜出, strategy 随先者; ② 嵌套子串: 长 secret 先行整体替换可遮蔽短 secret 的命中. 另登记 placeholder 特有边界 (登记不防护): 某 secret 真值恰为另一 secret 的 id (或其子串) 时, 短值后替换可能改写长值 placeholder 内的 id 文本 (形态变形, 不泄真值) — 概率极低.
+
+**Properties** (✅ 实名对齐 T1 实现, 2026-10-11 合并时翻转):
+
+- `prop_placeholder_for_deterministic_unique_no_real_substring`: 生成不变式 — `placeholder_for` 同 id 恒同值 (确定性) + 不同 id 不同值 (唯一性) + 不含真值子串. ✅ `src/redact.rs::prop_placeholder_for_deterministic_unique_no_real_substring`
+- `prop_placeholder_strategy_replaces_real_with_marker` (单元) + `prop_placeholder_strategy_upstream_sees_marker_client_keeps_it` (集成): 请求侧替换 — 请求含真值 → 上游视角 body 含 `[REDACTED:{id}]` 且不含真值; 幂等 (IR 已含 placeholder 时再替换不变) 另由 `prop_placeholder_idempotent_when_marker_echoed_back` 锁定. ✅ `src/redact.rs` + `tests/integration.rs`
+- `prop_placeholder_not_restored_in_response` + `prop_placeholder_and_redact_mixed_round_trip`: 不还原 — 响应中的 placeholder 原样到达客户端 (restore 投影跳过; LLM echo placeholder 场景 `leak_alerts` 为空); 混合策略下 redact 条目照常 round-trip (流式变体 `prop_placeholder_and_redact_mixed_stream_roundtrip`; hold 排除 `prop_streaming_restorer_excludes_placeholder_from_hold`). ✅ `src/redact.rs` + `tests/integration.rs`
+- `prop_placeholder_honeypot_marks_record_nonstream_sec3_log` + `prop_placeholder_honeypot_marks_record_stream` (集成): 蜜罐触发 — 上游响应回显真值 → 客户端透传该真值 (不替换不拦截) + record `leak_alerts` 打标 secret_id + WARN 日志不含真值 (SEC-3 同型). ✅ `tests/integration.rs`
+- `prop_leak_watch_covers_all_placeholder_secrets`: 检测面 — leak_watch 涵盖全部 placeholder 策略 secrets (含请求未命中者); 检测器命中/未命中/部分命中另由 `prop_detect_response_leaks_hit_miss_partial` 锁定. ✅ `src/redact.rs`
+- `prop_redaction_map_serde_skips_plaintext_watch_fields`: RedactionMap 新字段 (placeholder_reals / leak_watch 含真值明文) serde skip — 序列化面永不携带. ✅ `src/redact.rs`
+
+**timeline 呈现时序边界**: `leak_alerts` 随响应 finalize 填充 (晚于节点 push), 前端经下次 timeline 拉取 (loadTimeline / 换会话) 可见 — sync 增量不重发既有轮次, 与 usage 徽章同型的既有先例时序; live 轮次的即时呈现留待后续 (TimelineTail 携带 leak_alerts 通路), 不影响打标数据的完整性.
 
 ---
 
@@ -1436,3 +1472,4 @@ chars (char boundary 安全); 其余事件字段为受控类型, 天然无 secre
 | 2026-09-29 | STR-6 + FWD-3 (T7 thinking/encrypted_content passthrough) | **思考上下文容器 first-class 建模 + a⇄r envelope 搬运 — PR review 授权 (PR #293 用户 approve 即授权记录; 依据契约演进原则 §0.5 例外① "互译精确化消除信息损失", 同步改写 2026-08-23 与 2026-09-23 两次裁决的丢弃/分叉文本)**: ① `IrBlock::Reasoning{summary}` 增 `opaque` (encrypted_content), `IrBlock::ReasoningContent{text}` 增 `opaque: ThinkingOpaque` (Signature/RedactedData) — 同协议 round-trip 完整保真 (修复 a+a redact 历史 thinking 丢失 → tool-use 会话 400 的机制性根因, 与 r reasoning chain 断裂); ② 流式: `IrBlockMeta::Thinking`/`RedactedThinking{data}` + `IrDelta::SignatureDelta`/`ReasoningOpaqueDelta` (origin 区分 = verbatim 直通 vs envelope 打包的分派依据), a writer 有限累积 (`AnthropicEncodeState`, BlockStop 合成 envelope signature 且延迟 emit 保证 thinking_delta→signature_delta→stop 顺序), r writer done 族帧写回 encrypted_content; ③ 跨协议 a⇄r 经 `sg-thinking-v1:` envelope (cc-switch 模式, 打包在 writer=post-redact/restore, 解包在 reader=pre-redact/restore — RED 安全链闭合, `prop_envelope_packs_redacted_text_never_real` 守卫); o-origin 跨 a 丢弃 + WARN (o 无容器, 旧裁决保留部分), o 为目标 opaque 丢弃 + WARN, o→r 保留 (分叉消解); ④ FWD-3 损失清单 + `count_reasoning_blocks` 按 egress 能力精确化; ⑤ 生成器: thinking 族加入 `arb_anthropic_message` assistant 臂 (FWD-2 随之覆盖, signature/data 用 `[A-Z0-9]` charset 结构性排除 envelope 前缀), envelope 路径由四组 golden 单测锁定; `dropped_block_starts` 防线保留给仍未建模类型 (#282 测试以 image 为例精确化) | T7: cc-switch codec gap 审计维度 1 — thinking signature/encrypted_content 跨协议往返是盲区, 同协议 redact 也丢 (stateless tool loop 断裂); §2.2 判定: ≥2 协议 (a+r) + 语义对应 (回传载体) + 归一化 = 不合成只搬运 → first-class (roadmap 变更记录同步登记) |
 | 2026-09-30 | FWD-1 + FWD-3 (T9 billing header 剥离) | **跨协议翻译剥离 Anthropic billing header — 用户授权 (2026-09-30 裁决)**: a→o / a→r 翻译路径 (proxy seam `cross_proto_forward`, 落点在 codec `strip_system_billing_header` 纯函数) 剥离 Anthropic 源请求顶层 system 首 block 的 `x-anthropic-billing-header:` 计费标记行 (含紧随空行, 剥空整块移除) — 定性为源协议计费层元数据 (对齐 extra "无跨协议映射该丢" 精神, FWD-3 管辖; 登记于 FWD-1 因 "不删客户端字节" 原则字面覆盖), 依据 cc-switch #2350 (`cch=` 轮换值击穿目标侧前缀缓存, 成本放大一个数量级). 识别边界保守: 只剥 system 首部首次出现, 后续 block / messages[] (含 role=system 条目) 的同标记文本与用户正文引用不动, 不匹配绝不动; **同协议 a→a (含 redact) 零触碰** (上游是 Anthropic 本尊原生处理自家标记, 缓存语义与直连一致). 剥离打 WARN (计数, record_id 关联); 回归守卫: `cross_protocol_strips_leading_anthropic_billing_header_{to_openai,to_responses}` + 边界三测 + 恒绿 `same_proto_redact_keeps_anthropic_billing_header_verbatim` + codec 单测两臂 | T9: cc-switch codec gap 审计维度 8 "需裁决" 项, 2026-09-30 用户裁决授权 (剥离仅跨协议翻译路径) |
 | 2026-10-11 | RED-9 (新增) | **per-secret 处理策略 (strategy) 契约化 (#305 批1)**: `[[secrets.entries]]` 新增 `strategy` 字段 (serde snake_case 枚举, 默认 redact, 旧配置零改动) — redact = 现状透明替换 (RED-1..8 管辖逐字不变, 向后兼容锚); reject = 真值命中请求 → 整请求 503 + 零上游外发 + SEC-2 同型 message, 显式策略不受 on_probe_exhausted 模式影响 (与 SEC-10 降级开关族正交); protect / placeholder 值域预留 fail-fast (validate 拒绝 "not implemented yet"), 行为契约留待批2 (placeholder, 预留 RED-10) / 批3 (protect, 预留 RED-11). 3 条 property 挂 T1 测试 (端到端 `tests/integration.rs` + 单元 `src/redact.rs` ×2) | issue #305 批1 + 用户三项裁决 (protect = 全响应 placeholder / 报警挂 record + WARN / placeholder 形式 `[REDACTED:{id}]`) |
+| 2026-10-11 | RED-10 (新增) + RED-9 (微调) | **placeholder 策略 (明示假值 + 蜜罐检测) 契约化 (#305 批2)**: `strategy = "placeholder"` — 请求侧命中替换为确定性明示假值 `[REDACTED:{secret_id}]` (`placeholder_for(id)`: 同 id 恒同值不依赖 seed / id 唯一 ⇒ placeholder 唯一 / 幂等, IR 已含上轮 echo 的 placeholder 是正常态), 响应侧**不还原** (restore 投影排除 placeholder 条目); 响应 finalize 蜜罐检测 (检测面 = 该请求配置的全部 placeholder secrets (`RedactionMap.leak_watch`), 事后扫 LLM 视角文本, `attach_finality` 单点收口 + `detect_response_leaks`) — **检测不干预转发** (透传 + 报警), best-effort 漏报面 (StreamScan overflow / parse 失败 / 无 codec 跳过), 报警数据不含真值 (`leak_alerts` 只存 secret_id, SEC-1/SEC-3 同型) + WebUI timeline 徽章; RED-9 的 validate fail-fast 名单移除 placeholder (仅剩 protect, RED-9 陈述同步微调 — 编号与锚点不动). 6 条 property 按实现实名 ✅ (3 条暂态 ⏳ 合并时已拆分对齐) | issue #305 批2 + "检测不干预转发" 裁决 (2026-10-11: 真值出现在 LLM 响应意味着泄露已发生 — 正是报警要揭示的; 客户端看到真值 = 用户立即看到证据; 流式场景字节已流出, 替换会造成流式/非流式行为不一致) |

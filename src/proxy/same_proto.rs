@@ -5,14 +5,17 @@
 //! 同协议下按 "SecretTable 非空 **或 model 改写生效 (路由规则)**" 分两路 (#183 判据):
 //!
 //! - [`same_proto_forward`] (有 secret 或 override): IR 路径 (reader → [model 注入] →
-//!   redact_ir → writer). 请求侧经 IR 改写 (FWD-1 修订授权: model 重写 / redact).
-//!   响应侧按 redaction map 分流 — map 非空才需要 restore: 流式 2xx 走 StreamTranslate
+//!   redact_ir → writer). 请求侧经 IR 改写 (FWD-1 修订授权: model 重写 / redact /
+//!   placeholder 替换, #305). 响应侧按 "存在可还原条目" (`has_restorable`, #305 批2 —
+//!   placeholder-only 命中的 map 非空但无可还原条目) 分流: 流式 2xx 走 StreamTranslate
 //!   同协议 restore 模式 (openai/anthropic/responses 三协议族均支持), 其余走 buffered_ir
 //!   (T5: 客户端 stream=true + 上游 2xx 单块 JSON 且 parse 成功时, buffered_ir 出站合成
 //!   完整 SSE 生命周期, 见 `codec::stream::synthesize_sse`);
-//!   **map 为空 (override-only / secret 未命中) 响应保持字节透传** (fan_out_streaming,
-//!   byte-exact + 流式 UX; parsed view 按协议累积 — Responses 由流式 reader
-//!   `read_response_events` 解码事件派生, 见 ParsedSync::finalize).
+//!   **无可还原条目 (map 空 / override-only / secret 未命中 / 仅 placeholder 命中)
+//!   响应保持字节透传** (fan_out_streaming, byte-exact + 流式 UX; parsed view
+//!   按协议累积 — Responses 由流式 reader `read_response_events` 解码事件派生,
+//!   见 ParsedSync::finalize; placeholder 的蜜罐检测经 leak_watch 独立通道,
+//!   与透传分支正交).
 //! - [`same_proto_passthrough`] (无 secret 且无改写): 字节透传 (零回归, 最热路径).
 //!   `[privacy_scan] mode != "off"` 时透传分支入口做一次**只读** best-effort IR 解析
 //!   供旁路扫描 (#257 S0.5 — 未登记侦测最有价值的场景恰是没登记几个 secret 的
@@ -52,9 +55,9 @@ use super::recorder::{
 ///
 /// **同协议 + 无 redact 无改写**: 字节透传, 保留流式 UX. 这条路径零回归.
 /// **同协议 + redact / model 改写 (路由规则, #183)**: 请求侧走 IR (reader → model 注入 →
-///   redact_ir → writer); 响应侧仅 redaction map 非空时需要 restore
-///   (流式 2xx: StreamTranslate restore 模式; 其余: buffered_ir), map 为空时响应
-///   字节透传 (byte-exact 不受 override 影响).
+///   redact_ir → writer); 响应侧仅存在可还原条目 (`has_restorable`, #305 批2) 时需要
+///   restore (流式 2xx: StreamTranslate restore 模式; 其余: buffered_ir), 无可还原
+///   条目时响应字节透传 (byte-exact 不受 override 影响; placeholder-only 命中归此).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn same_proto_forward(
     state: crate::state::AppState,
@@ -190,7 +193,7 @@ pub(crate) async fn same_proto_forward(
     //    #257 S0.5: redact 前 capture pre-redact 叶子 (只读), redact 后携带已登记值
     //    集合提交 (fail_closed 503 时 `?` 短路跳过提交 — 请求已被拒绝, 无需告警).
     let privacy_job = state.privacy_scan.capture(&ir);
-    let (redaction_map, redact_seed, redactions, redact_hits) = redact_and_derive(
+    let (mut redaction_map, redact_seed, redactions, redact_hits) = redact_and_derive(
         &mut ir,
         &secrets_snapshot,
         state.on_probe_exhausted,
@@ -285,7 +288,9 @@ pub(crate) async fn same_proto_forward(
     // Content-Type 非 text/event-stream 时, 下方会落入 fan_out_buffered_ir 的
     // parse-失败 fallback — mock 不被 restore, 客户端拿到假 secret. 该 fallback
     // 内的 WARN 是逃逸点日志; 此处补充上游侧信号 (实际收到的 content-type).
-    if ir.stream && !streamed && !redaction_map.is_empty() {
+    // 判据用 has_restorable (RED-10): placeholder-only 命中本就不还原 (设计如此),
+    // 不构成 mock 逃逸, 不在此告警.
+    if ir.stream && !streamed && redaction_map.has_restorable() {
         warn!(
             %record_id,
             provider = %upstream_id,
@@ -297,15 +302,16 @@ pub(crate) async fn same_proto_forward(
 
     debug!(%record_id, status = %resp_status, streamed, "upstream responded");
 
-    // 11. 响应处理 — 仅 redaction map 非空才需要 restore (#183: override 只改写
+    // 11. 响应处理 — 仅存在可还原映射才需要 restore 家族 (#183: override 只改写
     //     **请求半段** 的 model, 响应半段不受 FWD-1 修订授权):
-    //     - map 非空 + 流式 2xx: StreamTranslate 同协议 restore 模式 (per-event restore).
-    //     - map 非空 + 其余: buffered_ir (parse 失败 fallback 透传, 见 #158).
-    //     - map 空 (override-only / secret 未命中): 字节透传 fan_out_streaming —
-    //       响应 byte-exact + 流式 UX, parsed view 照常累积/计算.
+    //     - 有 restorable + 流式 2xx: StreamTranslate 同协议 restore 模式 (per-event restore).
+    //     - 有 restorable + 其余: buffered_ir (parse 失败 fallback 透传, 见 #158).
+    //     - 无 restorable (map 空 / 仅 placeholder 命中): 字节透传 fan_out_streaming
+    //       — 响应 byte-exact + 流式 UX, parsed view 照常累积/计算; placeholder-only
+    //       时 leak_watch 非空, 检测经透传路径接线 (RED-10).
     //     pool_watch: with_restore 分支恒 2xx (检测短路), 不传; 其余两分支
     //     传给 fan_out 层的非 2xx body 缓冲点旁路检测 (T2).
-    if !redaction_map.is_empty() {
+    if redaction_map.has_restorable() {
         if streamed && resp_status.is_success() {
             super::fan_out::fan_out_streaming_with_restore(
                 state.dag.clone(),
@@ -344,6 +350,9 @@ pub(crate) async fn same_proto_forward(
             .await
         }
     } else {
+        // 蜜罐观察名单 (RED-10): map 无可还原条目 (纯透传 / placeholder-only /
+        // 配置了 placeholder 但请求未命中) — 检测在透传路径照常接线, map 随即丢弃.
+        let leak_watch = std::mem::take(&mut redaction_map.leak_watch);
         super::fan_out::fan_out_streaming(
             state.dag.clone(),
             record_id,
@@ -357,6 +366,7 @@ pub(crate) async fn same_proto_forward(
             state.upstream_timeouts.stream_idle,
             usage_ctx,
             pool_watch,
+            leak_watch,
         )
         .await
     }
@@ -462,6 +472,11 @@ async fn same_proto_passthrough(
         state.upstream_timeouts.stream_idle,
         usage_ctx,
         pool_watch,
+        // 蜜罐观察名单 (RED-10): 两个调用点中仅热路径 (secrets_snapshot 为空)
+        // 保证无观察对象; fail_open 降级调用点 snapshot 非空, 但该分支无 codec
+        // → ParsedSync 不构造 → 无 message 可扫, 检测无法进行 (方案 §0.1 登记
+        // 的漏报面), 故同样传空.
+        Vec::new(),
     )
     .await
 }

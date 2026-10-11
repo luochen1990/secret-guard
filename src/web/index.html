@@ -496,8 +496,10 @@
     .pill.privatekey { background: var(--err-soft); color: var(--err); font-weight: 700; }
     .pill.other { background: var(--panel-hi); color: var(--fg-muted); }
     /* strategy 徽标 (#305 批1): reject = 拒绝语义 (err 柔底); redact 用默认 pill
-       (accent). class 名与 category 值域无交集, 共用 .pill 命名空间安全. */
+       (accent); placeholder = 明示假值语义 (info 柔底, 中性 — 区别 reject 的 err 底,
+       #305 批2). class 名与 category 值域无交集, 共用 .pill 命名空间安全. */
     .pill.reject { background: var(--err-soft); color: var(--err); }
+    .pill.placeholder { background: var(--info-soft); color: var(--info); }
 
     /* source badge — 区分 static / dynamic / override / preferred (软底同风格). */
     .src-badge {
@@ -827,6 +829,21 @@
       font-size: 12px;
       font-style: italic;
       display: inline-block;
+    }
+
+    /* 泄露警示徽章 (#305 批2): placeholder 策略蜜罐检测命中 (leak_alerts 非空) 的
+       轮次 header 渲染. 响应侧事后信号, round header 内的纯增量元素 — 不触碰
+       气泡数等式 (UI-1) 与 .tl-round 顺序/数量语义 (I2/I3). warn 色系 + help
+       光标 (原生 title tooltip 列 secret ids, 报警数据不含真值 — SEC-1 同型). */
+    .leak-badge {
+      background: var(--warn-soft);
+      border: 1px solid var(--warn-line);
+      color: var(--warn);
+      padding: 1px 8px;
+      border-radius: 999px;
+      font-size: 10.5px;
+      font-weight: 600;
+      cursor: help;
     }
 
     /* ─── F1: table cell ellipsis + hover tooltip ─────────────────────────── */
@@ -2014,9 +2031,11 @@
       <textarea id="f-value" placeholder="the real secret" data-i18n-placeholder="form.valuePlaceholder"></textarea>
       <label for="f-strategy" data-i18n="form.strategy" data-i18n-title="form.strategy.tip">Strategy</label>
       <select id="f-strategy">
-        <!-- 只列已实现的两个值 (protect/placeholder 由后端 validate fail-fast, 不入库不展示) -->
+        <!-- 只列已实现的三个值 (#305 批1: redact/reject, 批2: placeholder; protect
+             仍由后端 validate fail-fast, 不入库不展示 — 合入时序 T1 先于本批) -->
         <option value="redact" data-i18n="form.strategy.redact">Redact — transparent replacement (default)</option>
         <option value="reject" data-i18n="form.strategy.reject">Reject — refuse forwarding</option>
+        <option value="placeholder" data-i18n="form.strategy.placeholder">Placeholder — explicit fake value + leak detection</option>
       </select>
 
       <fieldset style="grid-column: 1 / -1; border: 1px solid var(--border); padding: 8px; margin: 4px 0;">
@@ -2301,6 +2320,8 @@
         'timeline.infoTitle': 'Transport info',
         'timeline.rawTitle': 'Raw data',
         'timeline.retryBadge': '↻ retry — identical messages',
+        'timeline.leakBadge': '⚠ leak',
+        'timeline.leakTip': 'Suspected leak: the model response contained the real value of secret(s): {ids}',
         'timeline.noContent': '(no content)',
         'timeline.streamed': 'streamed',
         'timeline.viaTip': 'actual upstream provider (router-resolved chain tail)',
@@ -2347,6 +2368,7 @@
         'info.noneValue': 'none',
         'info.normal': 'normal',
         'info.hitsValue': '{n} hit(s)',
+        'info.leakBanner': '⚠ Suspected leak — the model response contained the real value of secret(s): {ids}',
         // ── raw 弹窗 ──
         'raw.requestHeaders': 'Request Headers',
         'raw.requestBody': 'Request Body',
@@ -2447,7 +2469,8 @@
         'form.strategy': 'Strategy',
         'form.strategy.redact': 'Redact — transparent replacement (default)',
         'form.strategy.reject': 'Reject — refuse forwarding',
-        'form.strategy.tip': 'How this secret is handled when spotted in a request: redact replaces it with a mock (restored on the way back); reject refuses the whole request (503, zero upstream calls).',
+        'form.strategy.placeholder': 'Placeholder — explicit fake value + leak detection',
+        'form.strategy.tip': 'How this secret is handled when spotted in a request: redact replaces it with a mock (restored on the way back); reject refuses the whole request (503, zero upstream calls); placeholder replaces it with an explicit [REDACTED:id] marker (not restored) and raises a leak alert when the real value shows up in a response.',
         'form.mockStrategy': 'Mock Strategy',
         'form.initial': 'Initial',
         'form.autoGenerate': 'Auto (generate)',
@@ -2760,6 +2783,8 @@
         'timeline.infoTitle': '传输层信息',
         'timeline.rawTitle': '原始数据',
         'timeline.retryBadge': '↻ 重试 — 消息完全相同',
+        'timeline.leakBadge': '⚠ 疑似泄露',
+        'timeline.leakTip': '疑似泄露: 模型响应中出现了以下 secret 的真值: {ids}',
         'timeline.noContent': '(无内容)',
         'timeline.streamed': '流式',
         'timeline.viaTip': '实际转发到的上游 provider (路由解析的链尾)',
@@ -2806,6 +2831,7 @@
         'info.noneValue': '无',
         'info.normal': '常规',
         'info.hitsValue': '{n} 次命中',
+        'info.leakBanner': '⚠ 疑似泄露 — 模型响应中出现了以下 secret 的真值: {ids}',
         // ── raw 弹窗 ──
         'raw.requestHeaders': '请求 Headers',
         'raw.requestBody': '请求 Body',
@@ -2906,7 +2932,8 @@
         'form.strategy': '策略',
         'form.strategy.redact': 'Redact — 透明替换 (默认)',
         'form.strategy.reject': 'Reject — 拒绝转发',
-        'form.strategy.tip': '在请求中发现该 secret 时的处理方式: redact 替换为 mock (响应回传时还原); reject 拒绝整个请求 (503, 零上游外发)。',
+        'form.strategy.placeholder': 'Placeholder — 明示假值 + 泄露检测',
+        'form.strategy.tip': '在请求中发现该 secret 时的处理方式: redact 替换为 mock (响应回传时还原); reject 拒绝整个请求 (503, 零上游外发); placeholder 替换为明示假值 [REDACTED:id] (不还原), 响应中出现真值时告警。',
         'form.mockStrategy': 'Mock 策略',
         'form.initial': '初始值',
         'form.autoGenerate': '自动 (生成)',
@@ -4161,6 +4188,8 @@
     //   (末轮从 state.tail 渲染), 由 updateLastRoundHeader() 定点刷新末轮.
     //   非末轮 header 的这些字段保持空 (TimelineRound 不含 response 字段).
     //   末轮 response 在独立的 .response-drawer 中, 不在 .tl-round 内.
+    //   leak_alerts (#305 批2) 同为 push 后可变字段 (finalize 填充), 经 header 的
+    //   [data-hdr="leak"] 占位 span + updateLeakBadges() 按 records 对账刷新.
     function renderTimeline() {
       const el = document.getElementById('detail');
       if (state.timelineRecords.length === 0) {
@@ -4174,6 +4203,7 @@
       if (fp === state.lastTimelineFingerprint) {
         // 策略 1: fingerprint 一致 → 只刷 response body (流式渐进) + 末轮 header.
         updateTimelineResponses();
+        updateLeakBadges();  // records 可能被同 session loadTimeline 原地替换 (fp 不变), 徽章需按新数据对账.
         return;
       }
       state.lastTimelineFingerprint = fp;
@@ -4185,6 +4215,7 @@
       // 填充 Response 抽屉内容 + 末轮 header + 计算布局.
       renderDrawer();
       updateLastRoundHeader();
+      updateLeakBadges();  // 新建/复用的轮次节点统一按 records 填充 leak 徽章 (占位 span 单点消费).
       updateResponseDrawerLayout();
       updateScrollNavVisibility();
     }
@@ -4485,6 +4516,11 @@
         && state.timelineRecords[state.timelineRecords.length - 1].id === id;
       const tail = isLastRound ? state.tail : null;
       const HIST = t('info.historyRound');
+      // 泄露警示块 (#305 批2): leak_alerts 非空 → 表格上方 warn banner 列 secret ids
+      // (报警数据不含真值, SEC-1 同型). ids 经 escapeHtml 后插值 (innerHTML 路径).
+      const leakBannerHtml = ids => (ids && ids.length > 0)
+        ? `<div class="banner" style="margin: 0 0 8px 0;">${t('info.leakBanner', { ids: escapeHtml(ids.join(', ')) })}</div>`
+        : '';
       // Time 与 sidebar/timeline 同一格式化函数 (SSOT, #164-2); 原始 UTC RFC3339
       // 放 title tooltip (开发者向 hover 可见).
       let rows = {
@@ -4502,7 +4538,10 @@
         [t('info.error')]: tail?.error || t('info.noneValue'),
         [t('info.redactions')]: redactionN > 0 ? t('info.hitsValue', { n: redactionN }) : t('info.noneValue'),
       };
-      const renderRows = () => `<table class="info-table">${Object.entries(rows).map(([k, v]) => {
+      // 泄漏 ids 数据源两态: 初渲染取 TimelineRound.leak_alerts (本地, 可能滞后),
+      // 异步补全时以 ForwardRecord.leak_alerts (实时 GET) 为准.
+      let leakIds = r.leak_alerts || [];
+      const renderRows = () => leakBannerHtml(leakIds) + `<table class="info-table">${Object.entries(rows).map(([k, v]) => {
         // Time 行: 本地时间 (formatTime, 与 sidebar 一致) + title 保留原始 UTC.
         if (k === t('info.time')) {
           return `<tr><td class="info-key">${escapeHtml(k)}</td><td class="info-val" title="${escapeHtml(v)}">${escapeHtml(formatTime(v))}</td></tr>`;
@@ -4521,6 +4560,7 @@
       // #183: 仅 override 实际改写时显示 (None = 透传, 不加行以免噪音).
       if (rec.upstream_model) rows[t('info.upstreamModel')] = rec.upstream_model;
       rows[t('info.model')] = rec.model || t('common.unknown');
+      leakIds = rec.leak_alerts || [];
       dlg.querySelector('.dialog-body').innerHTML = renderRows();
     }
 
@@ -4684,6 +4724,7 @@
           <span data-hdr="status"></span>
           <span class="meta" data-hdr="elapsed"></span>
           <span data-hdr="streamed"></span>
+          <span data-hdr="leak"></span>
           ${upstreamChip(r, pathId)}
         </span>
         <span class="tl-actions">
@@ -4755,6 +4796,52 @@
     }
     function tailStatusText(tail) {
       return tail ? statusTextOf(tail.resp_status, tail.error) : '';
+    }
+
+    // ─── 泄露警示徽章 (#305 批2, placeholder 策略蜜罐检测) ─────────────────
+    //
+    // 数据源: TimelineRound.leak_alerts (secret ids 数组, 后端响应 finalize 时
+    // 填充). 报警数据不含真值 (SEC-1 同型), title tooltip 只列 secret ids.
+    //
+    // 为什么不直接在 renderTimelineRound 模板里渲染: keyed reconciliation 复用
+    // 既有轮次节点不重绘 header, 而 leak_alerts 在响应 finalize 时才填充 (晚于
+    // 轮次 push) — 同 session 重载 (loadTimeline 原地替换 records 但 id 序列不变,
+    // fingerprint 短路) 时数据到达但节点已存在. 故模板只渲染空占位 span
+    // ([data-hdr="leak"], 同 status/elapsed/streamed 模式), 由 updateLeakBadges
+    // 按当前 state.timelineRecords 对账刷新 — 填充逻辑单点 (SSOT).
+    //
+    // 时序边界 (与 T1 契约的协调点): sync 的 timeline diff 只 append 新 round +
+    // 替换 tail, 不重发既有轮次 — 流式轮次 finalize 填充的 leak_alerts 要等下次
+    // loadTimeline (重进 session / 页面重载) 才随 records 到达, 徽章相应延迟出现
+    // (非流式快响应无此延迟: finalize 早于下个 sync tick, new_rounds 自带数据).
+    // 若后端未来提供既有轮次的 leak 更新通路 (如 tail 携带), sync 的 else 分支
+    // 补一次幂等 updateLeakBadges() 即可.
+    //
+    // 属性赋值 (textContent/title) 而非 innerHTML: ids 是用户输入的 secret id,
+    // 属性赋值天然免转义 (与 updateLastRoundHeader 的 status span 同型).
+    //
+    // 容错: 后端字段未上线 / 旧数据 → undefined → 按 [] 清空 (ROB).
+    function setLeakBadge(span, ids) {
+      if (ids && ids.length > 0) {
+        span.className = 'leak-badge';
+        span.textContent = t('timeline.leakBadge');
+        span.title = t('timeline.leakTip', { ids: ids.join(', ') });
+      } else {
+        span.className = '';
+        span.textContent = '';
+        span.removeAttribute('title');
+      }
+    }
+
+    // 对账刷新所有轮次 header 的 leak 徽章 (renderTimeline 两条路径统一调用).
+    function updateLeakBadges() {
+      const byId = new Map(state.timelineRecords.map(r => [r.id, r]));
+      document.querySelectorAll('#detail > .tl-round').forEach(el => {
+        const span = el.querySelector('[data-hdr="leak"]');
+        if (!span) return; // 防御: 非本轮次模板结构 (ROB).
+        const r = byId.get(el.dataset.rid);
+        setLeakBadge(span, r ? (r.leak_alerts || []) : []);
+      });
     }
 
     // 渲染本轮 request delta 的所有 messages 为独立气泡 (含 assistant).
@@ -6302,9 +6389,10 @@
       `;
     }
 
-    // ─── strategy 渲染 (per-secret 处理策略, #305 批1) ─────────────────────
+    // ─── strategy 渲染 (per-secret 处理策略, #305 批1 + 批2) ────────────────
     //
-    // redact = 替换为 mock (缺省); reject = 检测到即拒绝整个请求 (503 零外发).
+    // redact = 替换为 mock (缺省); reject = 检测到即拒绝整个请求 (503 零外发);
+    // placeholder = 替换为明示假值 [REDACTED:id] + 响应侧蜜罐泄露检测 (批2).
     // 后端 strategy 字段未上线时 s.strategy 为 undefined → 容错按 redact (serde
     // 缺省值) 显示. badge 配色照 category pill 模式 (策略值作 class).
 
@@ -6313,7 +6401,7 @@
       return `<span class="pill ${escapeHtml(v)}">${escapeHtml(v)}</span>`;
     }
 
-    // tooltip 复用表单选项词条 (form.strategy.redact / form.strategy.reject).
+    // tooltip 复用表单选项词条 (form.strategy.redact / reject / placeholder).
     function strategyTooltip(st) {
       return t(`form.strategy.${st || 'redact'}`);
     }
@@ -6698,8 +6786,8 @@
     //
     // 与后端 MockStrategy JSON shape 对齐. 省略 gen 字段让后端 infer (Auto + 无 gen).
 
-    // strategy select 回填: 值在下拉词表 (redact/reject) 外 (undefined /
-    // protect / placeholder 等未实现值) 时回退 redact (serde 缺省).
+    // strategy select 回填: 值在下拉词表 (redact/reject/placeholder) 外 (undefined /
+    // protect 等未实现值) 时回退 redact (serde 缺省).
     function loadStrategyIntoForm(st) {
       const sel = document.getElementById('f-strategy');
       sel.value = st && [...sel.options].some(o => o.value === st) ? st : 'redact';

@@ -91,6 +91,11 @@ pub struct ForwardRecord {
     /// 请求/响应本身为空. 三态语义 SSOT 见 `config::AuditCaptureMode`.
     #[serde(default)]
     pub audit_capture_off: bool,
+    /// 蜜罐泄露检测命中 (#305 批2, RED-10): 本轮 LLM 响应中出现真值的
+    /// placeholder 策略 secret id 列表 (排序去重, **永不**包含真实 secret 值,
+    /// 可直接序列化到 GET API 响应). 空 vec = 无命中 / 未检测 (best-effort).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub leak_alerts: Vec<String>,
 }
 
 impl ForwardRecord {
@@ -121,6 +126,7 @@ impl ForwardRecord {
             redactions: Vec::new(),
             // 测试构造默认捕获 (与历史行为一致); 测试未捕获语义时显式覆盖.
             audit_capture_off: false,
+            leak_alerts: Vec::new(),
         }
     }
 }

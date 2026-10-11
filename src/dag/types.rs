@@ -305,6 +305,10 @@ pub struct ResponseData {
     pub resp_headers: Vec<(String, String)>,
     /// 端到端耗时 (毫秒).
     pub elapsed_ms: u64,
+    /// 蜜罐泄露检测命中 (#305 批2, RED-10): LLM 视角 (restore 前) 响应中出现
+    /// 真值的 placeholder 策略 secret id 列表 (排序去重). 空 = 无命中 / 未检测
+    /// (best-effort 漏报面见 contracts.md RED-10). **永不**包含真实 secret 值.
+    pub leak_alerts: Vec<String>,
 }
 
 impl ResponseData {

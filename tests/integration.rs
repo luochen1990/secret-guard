@@ -596,6 +596,7 @@ fn dag_list_forward_records(dag: &ConversationDag) -> Vec<ForwardRecord> {
                 error: view.error,
                 redactions: view.redactions.to_vec(),
                 audit_capture_off: !view.audit_retained,
+                leak_alerts: view.leak_alerts,
             })
         })
         .collect()
@@ -6541,6 +6542,354 @@ async fn prop_reject_strategy_unhit_forwards_normally() {
         reqwest::StatusCode::OK,
         "unhit reject secret must not affect forwarding"
     );
+}
+
+// ─── per-secret strategy = "placeholder" 端到端 (#305 批2, RED-10) ──────────
+//
+// 三条链路: ① 请求侧替换 (上游见 [REDACTED:id] 不见真值) + 响应 echo placeholder
+// 原样保留; ② 蜜罐触发 (非流式): 上游回显真值 → 客户端透传 + record leak_alerts
+// 打标 + WARN 不含真值 (SEC-3); ③ 蜜罐触发 (流式 SSE): 同语义.
+
+/// 构造 placeholder 策略 secret entry (集成测试用, 与 `secret` helper 同型).
+fn placeholder_secret(id: &str, value: &str) -> SecretEntry {
+    let mut e = secret(id, value);
+    e.strategy = secret_guard::secrets::SecretStrategy::Placeholder;
+    e
+}
+
+#[tokio::test]
+async fn prop_placeholder_strategy_upstream_sees_marker_client_keeps_it() {
+    let real_secret = "the-placeholder-secret-value-DO-NOT-LEAK";
+    let marker = "[REDACTED:ph-key]";
+    let mut upstream = spawn_mock_upstream().await;
+    // LLM echo placeholder (正常轮次: 明示假值回传客户端, 不还原).
+    let upstream_body = format!(
+        r#"{{"id":"chatcmpl-ph","object":"chat.completion","created":1700000000,"model":"gpt-4o","choices":[{{"index":0,"message":{{"role":"assistant","content":"echo {marker} back"}},"finish_reason":"stop"}}]}}"#
+    );
+    // 上游必须收到 placeholder (Regex matcher 命中才算此 mock 生效 — 若替换
+    // 失败, mock 不匹配 → 上游 404 → 测试红).
+    let mock = upstream
+        .mock("POST", "/v1/chat/completions")
+        .match_body(mockito::Matcher::Regex(r"\[REDACTED:ph-key\]".to_string()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(upstream_body)
+        .create_async()
+        .await;
+
+    let secrets = test_secret_table_with(vec![placeholder_secret("ph-key", real_secret)]);
+    let records = ConversationDag::new(64, 500, 1);
+    let records_handle = records.clone();
+    let proxy_url = spawn_proxy_full(
+        vec![openai_provider("oa-main", &upstream.url())],
+        reqwest::Client::new(),
+        records,
+        secrets,
+    )
+    .await;
+
+    let (status, text, _headers) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        &format!(r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"use {real_secret} now"}}]}}"#),
+        &[("content-type", "application/json")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "placeholder round must forward: {text}"
+    );
+    // 客户端响应: placeholder 原样保留 (不还原为真值), 不含真值.
+    assert!(
+        text.contains(marker),
+        "client must see the placeholder marker: {text}"
+    );
+    assert!(
+        !text.contains(real_secret),
+        "client response must not contain real secret: {text}"
+    );
+
+    // record: req_body (audit Full) 含 placeholder 不含真值; leak_alerts 空 (无泄露).
+    let list = wait_until_or_timeout(
+        &records_handle,
+        |l| l.first().map(|r| r.resp_complete).unwrap_or(false),
+        Duration::from_secs(2),
+    )
+    .await;
+    let rec = &list[0];
+    assert!(
+        rec.req_body.contains(marker),
+        "upstream-bound body must carry the marker: {}",
+        rec.req_body
+    );
+    assert!(
+        !rec.req_body.contains(real_secret),
+        "upstream-bound body must not leak real secret: {}",
+        rec.req_body
+    );
+    assert!(rec.leak_alerts.is_empty(), "no honeypot hit in this round");
+    mock.assert();
+}
+
+#[tokio::test]
+async fn prop_placeholder_honeypot_marks_record_nonstream_sec3_log() {
+    let real_secret = "honeypot-secret-value-DO-NOT-LEAK";
+    let mut upstream = spawn_mock_upstream().await;
+    // 蜜罐触发: LLM 响应凭空回显**真值** (请求侧只发过 marker).
+    let upstream_body = format!(
+        r#"{{"id":"chatcmpl-hp","object":"chat.completion","created":1700000000,"model":"gpt-4o","choices":[{{"index":0,"message":{{"role":"assistant","content":"leaked {real_secret} somehow"}},"finish_reason":"stop"}}]}}"#
+    );
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(upstream_body)
+        .create_async()
+        .await;
+
+    let secrets = test_secret_table_with(vec![placeholder_secret("ph-key", real_secret)]);
+    let records = ConversationDag::new(64, 500, 1);
+    let records_handle = records.clone();
+    let proxy_url = spawn_proxy_full(
+        vec![openai_provider("oa-main", &upstream.url())],
+        reqwest::Client::new(),
+        records,
+        secrets,
+    )
+    .await;
+
+    // SEC-3: 捕获 WARN 日志, 断言含 secret_id 但永不含真值.
+    let (log, _guard) = capture_tracing(tracing::Level::WARN);
+
+    let (status, text, _headers) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        r#"{"model":"gpt-4o","messages":[{"role":"user","content":"harmless question"}]}"#,
+        &[("content-type", "application/json")],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    // 检测不干预转发: 客户端透传真值 (不替换/不拦截 — 用户立即看到证据).
+    assert!(
+        text.contains(real_secret),
+        "honeypot detection must NOT alter forwarding (verbatim passthrough): {text}"
+    );
+
+    // record: leak_alerts 打标 (请求未命中真值也检测 — 检测面 = 全部 placeholder secrets).
+    let list = wait_until_or_timeout(
+        &records_handle,
+        |l| l.first().map(|r| r.resp_complete).unwrap_or(false),
+        Duration::from_secs(2),
+    )
+    .await;
+    let rec = &list[0];
+    assert_eq!(
+        rec.leak_alerts,
+        vec!["ph-key".to_string()],
+        "record must be marked with the leaked secret id"
+    );
+    assert!(
+        !rec.req_body.contains(real_secret),
+        "request side is clean (only the response leaked)"
+    );
+
+    // WARN: 含蜜罐语义 + secret id, 不含真值 (SEC-3).
+    let log_text = log.text();
+    assert!(
+        log_text.contains("honeypot leak detected"),
+        "WARN must fire; log: {log_text}"
+    );
+    assert!(
+        log_text.contains("ph-key"),
+        "WARN must name the secret id; log: {log_text}"
+    );
+    assert!(
+        !log_text.contains(real_secret),
+        "WARN must never contain the real secret (SEC-3); log: {log_text}"
+    );
+}
+
+#[tokio::test]
+async fn prop_placeholder_honeypot_marks_record_stream() {
+    // 流式变体: SSE 上游回显真值 → 客户端收到真值字节 (SSE 透传) + leak_alerts
+    // 打标 (检测在流结束 finalize 时对累积的 LLM 视角 message 执行).
+    let real_secret = "honeypot-stream-secret-DO-NOT-LEAK";
+    let mut upstream = spawn_mock_upstream().await;
+    // 模板用 __REAL__ 占位再 replace (避免 format! 对 JSON brace 的双重转义陷阱).
+    let sse_body = concat!(
+        r#"data: {"id":"x","created":0,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"leaked __REAL__ "},"finish_reason":null}]}"#,
+        "\n\n",
+        r#"data: {"id":"x","created":0,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"to you"},"finish_reason":"stop"}]}"#,
+        "\n\n",
+        "data: [DONE]\n\n"
+    )
+    .replace("__REAL__", real_secret);
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse_body)
+        .create_async()
+        .await;
+
+    let secrets = test_secret_table_with(vec![placeholder_secret("ph-key", real_secret)]);
+    let records = ConversationDag::new(64, 500, 1);
+    let records_handle = records.clone();
+    let proxy_url = spawn_proxy_full(
+        vec![openai_provider("oa-main", &upstream.url())],
+        reqwest::Client::new(),
+        records,
+        secrets,
+    )
+    .await;
+
+    let (status, text, _headers) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        r#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+        &[("content-type", "application/json")],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert!(
+        text.contains(real_secret),
+        "streamed honeypot bytes must flow to the client verbatim: {text}"
+    );
+
+    let list = wait_until_or_timeout(
+        &records_handle,
+        |l| l.first().map(|r| r.resp_complete).unwrap_or(false),
+        Duration::from_secs(2),
+    )
+    .await;
+    assert_eq!(
+        list[0].leak_alerts,
+        vec!["ph-key".to_string()],
+        "streamed record must be marked with the leaked secret id"
+    );
+}
+
+#[tokio::test]
+async fn prop_placeholder_and_redact_mixed_stream_roundtrip() {
+    // 混合策略端到端 (流式 restore 家族): placeholder 条目不还原 (marker 原样到
+    // 客户端), redact 条目照常 C7 流式 round-trip (mock → real). has_restorable
+    // = true → 走 fan_out_streaming_with_restore (RestorePipe), placeholder 在
+    // StreamingRestorer 投影中被跳过.
+    let ph_real = "mixed-ph-secret-value-DO-NOT-LEAK";
+    let rd_real = "sk-mixed-redact-value-42";
+    let marker = "[REDACTED:ph-key]";
+    // redact 条目用 Fixed mock (与 per-request seed 无关 — 多 secret 场景下
+    // init_seed 把全部条目哈希在一起, predict_mock 的单 secret seed 不可用),
+    // mock 值由此可预知以构造上游 SSE fixture.
+    let expected_mock = "fixed-mock-mxd-42";
+    let mut rd_entry = secret("rd-key", rd_real);
+    rd_entry.mock_strategy.initial = secret_guard::mock::InitialValue::Fixed {
+        value: expected_mock.to_string(),
+    };
+    let mut upstream = spawn_mock_upstream().await;
+    let sse_body = concat!(
+        r#"data: {"id":"mx","created":0,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"echo __MOCK__ and __MARKER__"},"finish_reason":"stop"}]}"#,
+        "\n\n",
+        "data: [DONE]\n\n"
+    )
+    .replace("__MOCK__", expected_mock)
+    .replace("__MARKER__", marker);
+    let mock = upstream
+        .mock("POST", "/v1/chat/completions")
+        .match_body(mockito::Matcher::Regex(r"\[REDACTED:ph-key\]".to_string()))
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse_body)
+        .create_async()
+        .await;
+
+    let secrets = test_secret_table_with(vec![placeholder_secret("ph-key", ph_real), rd_entry]);
+    let records = ConversationDag::new(64, 500, 1);
+    let records_handle = records.clone();
+    let proxy_url = spawn_proxy_full(
+        vec![openai_provider("oa-main", &upstream.url())],
+        reqwest::Client::new(),
+        records,
+        secrets,
+    )
+    .await;
+
+    let (status, text, _headers) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        &format!(
+            r#"{{"model":"gpt-4o","stream":true,"messages":[{{"role":"user","content":"use {ph_real} and {rd_real}"}}]}}"#
+        ),
+        &[("content-type", "application/json")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "mixed stream must forward: {text}"
+    );
+    // 字节级: redact mock 已还原为 real (restore 生效); marker 的 tail 完整在场
+    // (marker 可能被流式 hold 滑窗切在 chunk 边界 — 内容级重组由下方 parsed 断言)。
+    assert!(
+        text.contains(rd_real),
+        "redact entry must restore to real in stream: {text}"
+    );
+    assert!(
+        text.contains("REDACTED:ph-key]"),
+        "placeholder marker must flow through the restore path: {text}"
+    );
+    assert!(
+        !text.contains(expected_mock),
+        "redact mock must not escape to the client: {text}"
+    );
+    assert!(
+        !text.contains(ph_real),
+        "placeholder real must never reach the client: {text}"
+    );
+
+    let list = wait_until_or_timeout(
+        &records_handle,
+        |l| l.first().map(|r| r.resp_complete).unwrap_or(false),
+        Duration::from_secs(2),
+    )
+    .await;
+    let rec = &list[0];
+    assert!(
+        rec.req_body.contains(marker) && !rec.req_body.contains(ph_real),
+        "upstream-bound body: marker in, real out: {}",
+        rec.req_body
+    );
+    assert!(
+        rec.leak_alerts.is_empty(),
+        "no real value in response → no alert"
+    );
+    // 内容级 — LLM 视角 (record parsed = restore 前的完整重组 message, 亦是
+    // 蜜罐检测的数据源; helper 已含 stored → derive fallback): marker 跨 chunk
+    // 边界被 hold 切开时, 重组后必须完整; redact 条目在此视角保持 mock 形态
+    // (客户端视角的 real 还原已由上方字节级断言覆盖)。
+    let parsed = rec
+        .resp_parsed
+        .as_ref()
+        .expect("parsed view must exist for a 2xx stream");
+    let parsed_text = parsed.to_string();
+    assert!(
+        parsed_text.contains(marker),
+        "LLM-view reassembled message must contain the intact marker: {parsed_text}"
+    );
+    assert!(
+        parsed_text.contains(expected_mock) && !parsed_text.contains(rd_real),
+        "LLM-view must carry the mock (not the real): {parsed_text}"
+    );
+    assert!(
+        !parsed_text.contains(ph_real),
+        "neither view may surface the placeholder real: {parsed_text}"
+    );
+    mock.assert();
 }
 
 #[tokio::test]

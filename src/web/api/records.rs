@@ -97,6 +97,8 @@ fn build_forward_record(
         // ForwardRecord 持有 Vec (需 Deserialize); 此处从 NodeView 的 Arc 切片
         // 实化一次. build_forward_record 仅用于 GET /records/{id} 详情路径 (非高频).
         redactions: view.redactions.to_vec(),
+        // 蜜罐检测命中 (RED-10): 永不含真值 (id 列表), 空 = 无命中/未检测.
+        leak_alerts: view.leak_alerts,
     }
 }
 

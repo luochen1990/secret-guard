@@ -42,8 +42,12 @@ Return:    local tools ◄──real Secret──  secret-guard  ◄──Mock r
   with authentication passing as usual.
 - **Per-secret strategy**: redact/restore above is the default; a secret can instead be
   configured `strategy = "reject"` to refuse forwarding (503) the moment it appears in a
-  request — for credentials that must never leave the machine. More strategies are on
-  the way (#305).
+  request — for credentials that must never leave the machine — or `strategy =
+  "placeholder"` to swap it for an explicit `[REDACTED:{id}]` token that is never
+  restored. Every placeholder secret doubles as a canary: if its real value ever shows
+  up in an LLM response, you get an alert (WARN log + WebUI timeline badge, no secret
+  values in the alert) while the response itself passes through untouched. A `protect`
+  strategy is on the way (#305).
 
 The same request, before and after it leaves the machine (captured from a real run; only
 the token value is fictional):

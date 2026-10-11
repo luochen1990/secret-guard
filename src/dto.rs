@@ -178,6 +178,10 @@ pub struct NodeView {
     /// 每个元素是 message 的 wire JSON (OpenAI / Anthropic 原生格式),
     /// 前端按 role 分发气泡样式, 与 response 气泡区分.
     pub req_delta_messages: Vec<serde_json::Value>,
+    /// 蜜罐泄露检测命中 (#305 批2, RED-10): 该轮 LLM 响应中出现真值的
+    /// placeholder 策略 secret id 列表 (排序去重, 永不含真值). 空 = 无命中 /
+    /// 未检测. 数据源 = ResponseData.leak_alerts (响应侧 attach 时检测).
+    pub leak_alerts: Vec<String>,
 }
 
 /// Node 的请求侧详情 (GET /records/{id} 按需拉取).
@@ -246,6 +250,11 @@ pub struct TimelineRound {
     /// (非 2xx / parse 失败 / OpenAI 流式未开 include_usage / 无 codec 协议).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageView>,
+    /// 蜜罐泄露检测命中 (#305 批2, RED-10): 该轮 LLM 响应中出现真值的
+    /// placeholder 策略 secret id 列表 (timeline 轮次警示徽章数据源,
+    /// 永不含真值). 空 = 无命中 / 未检测.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub leak_alerts: Vec<String>,
 }
 
 /// timeline 抽屉 (视图级, 当前末轮的 response 内容).

@@ -336,14 +336,15 @@ pub(super) fn warn_mocks_restored_via_json_leaf_fallback(record_id: uuid::Uuid) 
 }
 
 /// 上游响应 parse 失败且 JSON 叶子级兜底也失败 → mock 逃逸到客户端 (#158).
-/// 仅当本请求做过 redact (`map` 非空) 时打 — 无 redaction 在途的 parse 失败只是
-/// 普通透传, 无 mock 可逃.
+/// 仅当本请求有可还原条目在途 (`map.has_restorable()`) 时打 — 无 redaction 在途
+/// 的 parse 失败只是普通透传, 无 mock 可逃; placeholder-only 命中 (RED-10) 的
+/// marker 本就不该还原, 客户端看到它是设计行为, 不构成逃逸信号.
 pub(super) fn warn_mock_not_restored(
     record_id: uuid::Uuid,
     detail: &str,
     map: &crate::redact::RedactionMap,
 ) {
-    if !map.is_empty() {
+    if map.has_restorable() {
         tracing::warn!(
             %record_id,
             detail,

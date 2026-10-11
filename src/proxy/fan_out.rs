@@ -117,6 +117,11 @@ struct FanoutStreamCtx {
     /// 缓冲完毕, 流结束后消费; None (非 pool 流量) 零开销. spawn task 无法回读
     /// AppState, 随 ctx 携带 (PoolStates 内部是 Arc, clone 共享).
     pool_watch: Option<crate::pool::PoolWatch>,
+    /// 蜜罐检测观察名单 (RED-10, #305 批2): `(secret_id, real)` 对, 来自请求侧
+    /// RedactionMap.leak_watch (restore 家族在 map move 进 hook 前提取; 纯透传
+    /// 路径由 dispatch 从 map 提取传入 — 配置了 placeholder secret 但请求未命中
+    /// 时仍要检测). 空 vec = 无 placeholder 策略 → attach_finality 检测零开销短路.
+    leak_watch: Vec<(String, String)>,
 }
 
 /// 两条流式扇出路径的共享骨架: spawn task 内的 chunk 循环 + 记录 + 收尾.
@@ -157,6 +162,7 @@ async fn fanout_stream_task(
         stream_idle_timeout,
         usage,
         pool_watch,
+        leak_watch,
     } = ctx;
 
     let mut stream = upstream_resp.bytes_stream();
@@ -218,10 +224,12 @@ async fn fanout_stream_task(
     // resp_complete 在 error_kind move 进 ResponseData 前先取 (usage 落账同用).
     let resp_complete = recorder.complete();
     // B1 接线收口: message intern + parsed 清除 + 元字段 + 守卫 + attach.
+    // leak_watch (RED-10): 蜜罐检测在 attach_finality 内统一执行 (空 = 零开销).
     super::recorder::attach_finality(
         &dag,
         record_id,
         &finality,
+        &leak_watch,
         ResponseData {
             resp_status: status_u16,
             resp_headers: redact_headers(&resp_headers_for_record, &redacted_headers),
@@ -255,6 +263,11 @@ async fn fanout_stream_task(
 /// `redacted_headers`: 追加脱敏名单 (`AppState::redacted_headers`, SEC-4) —
 /// record 的 resp_headers 脱敏用 (下同, 四条扇出路径同源).
 ///
+/// `leak_watch` (RED-10, #305 批2): 蜜罐检测观察名单 — 本路径是 "map 无可还原
+/// 条目" 的响应出口 (纯透传 / placeholder-only 命中), placeholder-only 场景的
+/// 检测必须在此接线 (响应 byte-exact 透传, 检测只读). 无 redact 的 dispatch
+/// 快捷分支传空 vec (零开销).
+///
 /// `pool_watch`: pool 耗尽检测上下文 (T2, 旁路) — 非 2xx 响应在骨架 chunk 循环
 /// 缓冲后检测. 2xx 流式路径 (restore 家族) 恒短路, 不接受此参数.
 #[allow(clippy::too_many_arguments)]
@@ -271,6 +284,7 @@ pub(crate) async fn fan_out_streaming(
     stream_idle_timeout: Option<std::time::Duration>,
     usage: crate::usage::UsageCtx,
     pool_watch: Option<crate::pool::PoolWatch>,
+    leak_watch: Vec<(String, String)>,
 ) -> Result<Response<Body>, AppError> {
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(32);
     let resp_headers_for_record = resp_headers.clone();
@@ -296,6 +310,7 @@ pub(crate) async fn fan_out_streaming(
             stream_idle_timeout,
             usage,
             pool_watch,
+            leak_watch,
         },
         upstream_resp,
         tx,
@@ -566,10 +581,13 @@ pub(crate) async fn fan_out_buffered_ir(
         resp_status
     };
     // B1 接线收口: message intern + parsed 清除 + 元字段 + 守卫 + attach.
+    // leak_watch (RED-10): 从请求侧 map 透传 (placeholder 条目含于 map, 但
+    // restore 投影已跳过 — 检测与 restore 正交).
     super::recorder::attach_finality(
         &dag,
         record_id,
         &finality,
+        &redaction_map.leak_watch,
         ResponseData {
             resp_status: status_u16,
             resp_headers: redact_headers(&resp_headers_for_record, &redacted_headers),
@@ -623,12 +641,14 @@ pub(crate) async fn fan_out_streaming_with_restore(
     resp_headers: HeaderMap,
     redacted_headers: std::sync::Arc<[String]>,
     codec_proto: crate::codec::Protocol,
-    redaction_map: RedactionMap,
+    mut redaction_map: RedactionMap,
     stream_idle_timeout: Option<std::time::Duration>,
     usage: crate::usage::UsageCtx,
 ) -> Result<Response<Body>, AppError> {
     // 同协议 + restore 模式: ingress == egress, 但 IR re-serialize 用于 restore.
     // restore hook 由本层 (proxy) 注入 — codec::stream 不依赖 redact (解环 #145).
+    // leak_watch (RED-10) 在 map move 进 hook 前提取 (hook 内只做 restore, 不消费).
+    let leak_watch = std::mem::take(&mut redaction_map.leak_watch);
     let translate = crate::codec::stream::StreamTranslate::new_same_proto_restore(
         codec_proto,
         Box::new(crate::redact::StreamingRestorerSet::new(redaction_map)),
@@ -650,6 +670,7 @@ pub(crate) async fn fan_out_streaming_with_restore(
         codec_proto,
         stream_idle_timeout,
         usage,
+        leak_watch,
     )
 }
 
@@ -675,7 +696,7 @@ pub(crate) async fn fan_out_streaming_cross_proto(
     redacted_headers: std::sync::Arc<[String]>,
     ingress: crate::codec::Protocol,
     egress: crate::codec::Protocol,
-    redaction_map: RedactionMap,
+    mut redaction_map: RedactionMap,
     stream_idle_timeout: Option<std::time::Duration>,
     usage: crate::usage::UsageCtx,
 ) -> Result<Response<Body>, AppError> {
@@ -683,10 +704,14 @@ pub(crate) async fn fan_out_streaming_cross_proto(
     // codec::stream 不依赖 redact, 解环 #145 — 与同协议 restore 路径同一先例).
     // ingress != egress 由 caller (cross_proto_forward) 的路径前提保证 — 该函数只在
     // 跨协议 dispatch 分支被调用, expect 是内部不变式断言而非外部输入校验.
+    // leak_watch (RED-10) 在 map move 进 hook 前提取 (检测与 restore 正交).
+    // hook 注入判据与 same_proto dispatch 对称 (has_restorable): placeholder-only
+    // 时不注入全空转的 restorer hook.
+    let leak_watch = std::mem::take(&mut redaction_map.leak_watch);
     let translate = crate::codec::stream::StreamTranslate::new_cross_proto(
         ingress,
         egress,
-        (!redaction_map.is_empty()).then(|| {
+        redaction_map.has_restorable().then(|| {
             Box::new(crate::redact::StreamingRestorerSet::new(redaction_map))
                 as Box<dyn crate::codec::stream::StreamRestoreHook>
         }),
@@ -708,6 +733,7 @@ pub(crate) async fn fan_out_streaming_cross_proto(
         ingress,
         stream_idle_timeout,
         usage,
+        leak_watch,
     )
 }
 
@@ -728,6 +754,7 @@ fn spawn_restore_fanout(
     writer_proto: crate::codec::Protocol,
     stream_idle_timeout: Option<std::time::Duration>,
     usage: crate::usage::UsageCtx,
+    leak_watch: Vec<(String, String)>,
 ) -> Result<Response<Body>, AppError> {
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(32);
     let resp_headers_for_record = resp_headers.clone();
@@ -747,6 +774,7 @@ fn spawn_restore_fanout(
             // restore 家族 (with_restore / cross_proto 流式) 仅承载 2xx SSE 成功
             // 响应 — 检测的 status 短路恒成立, 恒 None (不构造, 死参数).
             pool_watch: None,
+            leak_watch,
         },
         upstream_resp,
         tx,
@@ -887,7 +915,8 @@ mod tests {
                 None,
                 std::sync::Arc::from(Vec::new().into_boxed_slice()),
             ),
-            None, // pool_watch: 非 pool 流量 (检测短路路径)
+            None,       // pool_watch: 非 pool 流量 (检测短路路径)
+            Vec::new(), // leak_watch: 透传测试无 placeholder 策略 (检测零开销)
         )
         .await
         .expect("fan_out_streaming must not error on large body");

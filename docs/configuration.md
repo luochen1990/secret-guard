@@ -432,13 +432,15 @@ services.secret-guard.providers.glm-pool = {
 
 - `redact` (默认): 现状行为 — 真值命中请求时透明替换为 mock, 响应回传时还原. 缺省零改动.
 - `reject`: 真值命中请求 → **整请求拒绝转发** — 客户端收 503, 错误信息只含 secret id 不含真值, 且**零上游外发** (适合 "绝不允许离开本机" 的高危值, 如生产数据库密码).
-- `protect` / `placeholder`: 计划中 (后续批次交付) — 配置即启动报错 (`not implemented yet`), 防止以为受保护而实际静默失效.
+- `placeholder`: 真值命中请求时替换为**明示假值** `[REDACTED:{secret_id}]` — LLM 能看出该值已被脱敏 (非仿真替身); 响应回传时**不还原** (placeholder 原样保留), 同时开启**蜜罐检测**: 本请求配置的全部 placeholder secret 真值一旦出现在 LLM 响应中, 立即报警 — 日志 WARN + 记录打标, WebUI 时间线轮次显示警示徽章 (列出 secret id), 但**不拦截转发** (客户端透传看到真值 = 立即看到泄露证据); 报警内容只含 secret id, 不含真值. 适合 "希望模型知道此处有敏感值 + 想知道是否已泄露" 的蜜罐场景.
+- `protect`: 计划中 (后续批次交付) — 配置即启动报错 (`not implemented yet`), 防止以为受保护而实际静默失效.
 
 ```toml
 [[secrets.entries]]
 id = "prod-db-password"
 value = "..."
 strategy = "reject"        # 命中即拒绝转发; 缺省 redact 可省略
+# strategy = "placeholder" # 命中替换为 [REDACTED:{id}] 明示假值 + 响应侧蜜罐检测
 ```
 
 ### `mock_strategy` 子表

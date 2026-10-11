@@ -104,6 +104,11 @@ pub(super) fn node_view(inner: &DagInner, node_id: Uuid) -> Option<NodeView> {
             .and_then(|r| crate::derive::parsed_view(node, &inner.blocks, r)),
         // list_page 路径不填 (避免 O(n) 全量 resolve); timeline 路径单独填.
         req_delta_messages: Vec::new(),
+        // 蜜罐检测命中 (RED-10): 响应侧字段, attach 时检测 (通常空 vec, clone 廉价).
+        leak_alerts: resp
+            .as_ref()
+            .map(|r| r.leak_alerts.clone())
+            .unwrap_or_default(),
     })
 }
 

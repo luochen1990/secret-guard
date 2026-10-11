@@ -575,10 +575,12 @@ pub(crate) async fn cross_proto_forward(
     // B2: resp_body_text 照填 — audit_capture 三态的去留决策统一收口在
     // `dag::attach_response` (与 fan_out 家族同型).
     let resp_body_text = utf8_view(&resp_body_out);
+    // leak_watch (RED-10): 请求侧 map 透传 (placeholder 检测与 restore 正交).
     super::recorder::attach_finality(
         &state.dag,
         record_id,
         &resp_finality,
+        &redaction_map.leak_watch,
         ResponseData {
             resp_status: resp_status_out.as_u16(),
             resp_headers: redact_headers(&resp_headers, &state.redacted_headers),

@@ -203,6 +203,14 @@ audit_capture 未保留的请求 (off 档全部 / errors 档成功请求, B2/B3)
 - `timeline_diff(sid, after, tail_length)`: sync 轮询的 diff.
   返回 `Option<TimelineDiffData { new_rounds, tail }>`, None = 无变化 (304 等价).
 
+**leak_alerts (placeholder 蜜罐打标, #305 批2)**: TimelineRound 携带 `leak_alerts`
+(secret ids), 前端两处消费 — timeline 轮次 header 的 ⚠ 徽章 (`updateLeakBadges`
+单点对账: 模板渲染空占位 `span[data-hdr=leak]`, 按 `state.timelineRecords` Map
+填充/清空 — reconcile 复用节点与 fingerprint 短路两条渲染路径都调用) + info 弹窗
+warn banner. 时序边界: leak_alerts 随响应 finalize 填充 (晚于 push), sync diff 不
+重发既有轮次 — 复用节点场景徽章由下次 loadTimeline 数据驱动更新, 与 usage 徽章
+同型先例; 弹窗经 GET 实时. 语义契约 contracts.md RED-10.
+
 **req_delta_messages 实现** (B1): 从 BlockPool 结构化派生 (`derive::extract_delta_messages_from_blocks`)
 — `req_delta` (MessageRef, real 视角) resolve → real→mock 替换 (`redactions` 投影重建, 不含真
 实 secret 输出) → ingress writer 序列化 + 根节点 system 注入 (system 来自根节点 `system_refs`).
@@ -407,9 +415,10 @@ API key CRUD **无条件挂载** (在 `web::router()`, 不依赖 `auth.enabled`)
 
 timeline 每轮 header 含两个按钮:
 - `ℹ` info: 弹窗展示传输层元数据. 字段两路来源: 本地即时渲染 (TimelineRound 的
-  id/round_role/created_at/redactions + 末轮 TimelineTail 的 status/elapsed/streamed/
+  id/round_role/created_at/redactions/leak_alerts (placeholder 蜜罐打标非空时顶部
+  warn banner, #305 批2) + 末轮 TimelineTail 的 status/elapsed/streamed/
   complete/error — 非末轮显示 "(history round)") + 异步懒拉补全 (`GET /api/records/{id}`
-  的 method/path/model/upstream_id; model 是 **egress 视角** — 路由改写生效时与
+  的 method/path/model/upstream_id/leak_alerts (实时覆盖初渲染); model 是 **egress 视角** — 路由改写生效时与
   upstream_model 同值 (改写轮次两行显示相同值), 无改写时 = 客户端原值 — M1 走查
   修复: record DTO 补 model 字段, 弹窗 Model 行不再恒 "(unknown)").
 - `raw`: 弹窗展示原始 req_body / resp_body / req_headers / resp_headers (按需懒拉

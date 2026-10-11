@@ -1,5 +1,6 @@
 //! Secret 类型定义 + 校验 + [`DynamicEntry`] 实现 + effective 视图 + 处理策略
-//! ([`SecretStrategy`]: redact 默认 / reject / protect·placeholder 预留 fail-fast).
+//! ([`SecretStrategy`]: redact 默认 / reject (RED-9) / placeholder (RED-10, 批2) /
+//! protect 预留 fail-fast).
 //!
 //! # 三层数据模型 (与 [`crate::provider`] 完全对称)
 //!
@@ -102,8 +103,11 @@ pub struct SecretEntry {
     /// - `reject`: 真值出现于请求 → 整请求拒绝转发 (503, 零上游外发, message 只含
     ///   secret id + reason, SEC-2 同型). **显式策略, 不受 `on_probe_exhausted`
     ///   fail_open/closed 模式影响** (契约 RED-9).
-    /// - `protect` / `placeholder`: 预留值 (批2/批3 交付), 配置即 validate 报错
-    ///   fail-fast (防静默按 redact 处理), 见 [`SecretEntry::validate`] 的检查.
+    /// - `placeholder` (批2): 替换为明示假值 `[REDACTED:{id}]`, 响应不还原 +
+    ///   蜜罐泄露检测 (响应中出现真值 → WARN + record 打标, 不干预转发).
+    ///   契约 RED-10, 实现见 [`crate::redact`] C9 段.
+    /// - `protect`: 预留值 (批3 交付), 配置即 validate 报错 fail-fast,
+    ///   见 [`SecretEntry::validate`] 的检查.
     ///
     /// 注: `strategy` 不参与 [`crate::redact::init_seed`] 的哈希 — 翻转策略不应
     /// 改变其他 secret 的 mock (C3 前缀缓存友好).
@@ -244,8 +248,9 @@ impl SecretCategory {
 
 /// per-secret 处理策略 (#305): secret 真值命中请求时 redact pipeline 的处置方式.
 ///
-/// 语义总览见 [`SecretEntry::strategy`] 字段文档; reject 行为契约 = contracts.md **RED-9**.
-/// `protect` / `placeholder` 已定义但行为未交付 (批2/批3), 由 [`SecretEntry::validate`]
+/// 语义总览见 [`SecretEntry::strategy`] 字段文档; reject 行为契约 = contracts.md
+/// **RED-9**, placeholder 行为契约 = contracts.md **RED-10** (批2 交付).
+/// `protect` 已定义但行为未交付 (批3), 由 [`SecretEntry::validate`]
 /// fail-fast 拒绝 (防静默失效).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -255,7 +260,8 @@ pub enum SecretStrategy {
     Redact,
     /// 全响应 placeholder 替换 (批3 预留, 配置即 validate 报错).
     Protect,
-    /// 占位符替换 (批2 预留, 配置即 validate 报错).
+    /// 明示假值替换 + 蜜罐泄露检测 (批2, RED-10): 请求侧真值 →
+    /// `[REDACTED:{id}]`, 响应不还原; 检测到真值出现于 LLM 响应则 WARN + 打标.
     Placeholder,
     /// 真值出现于请求 → 整请求拒绝转发 (503, 零上游外发).
     Reject,
@@ -394,15 +400,13 @@ impl DynamicEntry for SecretEntry {
         // mock_strategy 基础校验 (Fixed 非空 / Auto+gen 配置合法). 依赖 real value 的
         // C5 检查由 validate_against_real 在 resolve 后执行, 不在这里 (兼容 value_file 模式).
         self.mock_strategy.validate()?;
-        // strategy 值域 fail-fast (#305 批1): protect / placeholder 已定义但行为未交付
-        // (批2/批3), 接受该配置会静默按 redact 处理 — 显式报错. 放在本 validate 而非
+        // strategy 值域 fail-fast (#305): protect 已定义但行为未交付 (批3), 接受
+        // 该配置会静默按 redact 处理 — 显式报错. 放在本 validate 而非
         // validate_and_resolve 专属步骤: validate_and_resolve 第一步就是 self.validate(),
         // 且 upsert_dynamic (WebUI CRUD 的底层) 独立调用本方法 — 一处检查同时覆盖
         // static 加载 / dynamic 加载 / WebUI upsert 全部入口路径.
-        if matches!(
-            self.strategy,
-            SecretStrategy::Protect | SecretStrategy::Placeholder
-        ) {
+        // placeholder 已在批2 交付 (明示假值 + 蜜罐检测, RED-10).
+        if matches!(self.strategy, SecretStrategy::Protect) {
             return Err(format!(
                 "secret {}: strategy '{}' is not implemented yet (planned; see #305)",
                 self.id,
@@ -668,30 +672,34 @@ mod tests {
 
     #[test]
     fn validate_rejects_unimplemented_strategy_values() {
-        // protect / placeholder 已定义但行为未交付 → validate fail-fast (#305 批1).
+        // protect 已定义但行为未交付 (批3) → validate fail-fast (#305).
         // 两条入口路径都挡: 直接 validate() (upsert_dynamic 底层独立调用) 与
         // validate_and_resolve() (static/dynamic 加载 + WebUI handler 的 choke point).
-        for bad in [SecretStrategy::Protect, SecretStrategy::Placeholder] {
-            let mut e = entry("unimpl", "sk-unimplemented-strategy");
-            e.strategy = bad;
-            let err = e.validate().unwrap_err();
-            assert!(
-                err.contains("not implemented yet"),
-                "validate() should reject {bad:?}: {err}"
-            );
-            assert!(
-                err.contains("planned; see #305"),
-                "err should point to the plan: {err}"
-            );
-            let mut e2 = entry("unimpl", "sk-unimplemented-strategy");
-            e2.strategy = bad;
-            assert!(
-                e2.validate_and_resolve("").is_err(),
-                "validate_and_resolve() must also reject {bad:?}"
-            );
-        }
-        // 可用值 (redact / reject) 不被 validate 挡 — 行为约束在 redact pipeline.
-        for ok in [SecretStrategy::Redact, SecretStrategy::Reject] {
+        let bad = SecretStrategy::Protect;
+        let mut e = entry("unimpl", "sk-unimplemented-strategy");
+        e.strategy = bad;
+        let err = e.validate().unwrap_err();
+        assert!(
+            err.contains("not implemented yet"),
+            "validate() should reject {bad:?}: {err}"
+        );
+        assert!(
+            err.contains("planned; see #305"),
+            "err should point to the plan: {err}"
+        );
+        let mut e2 = entry("unimpl", "sk-unimplemented-strategy");
+        e2.strategy = bad;
+        assert!(
+            e2.validate_and_resolve("").is_err(),
+            "validate_and_resolve() must also reject {bad:?}"
+        );
+        // 可用值 (redact / reject / placeholder — 批2 交付, RED-10) 不被 validate
+        // 挡 — 行为约束在 redact pipeline.
+        for ok in [
+            SecretStrategy::Redact,
+            SecretStrategy::Reject,
+            SecretStrategy::Placeholder,
+        ] {
             let mut e = entry("ok-strategy", "sk-usable-strategy-value");
             e.strategy = ok;
             assert!(e.validate().is_ok(), "{ok:?} should pass validate");
