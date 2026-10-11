@@ -912,7 +912,8 @@ pub struct DynamicState {
     #[serde(default)]
     pub api_keys_disabled: std::collections::HashSet<String>,
 
-    /// 详细日志 (audit capture) 三态, 默认 **off** (省内存). 值域与语义见
+    /// 详细日志 (audit capture) 三态, 默认 **latest** (出故障时至少有会话头部
+    /// 最新一次请求的 raw 可查, quant#307). 值域与语义见
     /// [`AuditCaptureMode`]; 运行时语义 (per-request 原子) 与切换 API 的 SSOT
     /// 见 `state::AuditCapture`.
     #[serde(default)]
@@ -927,53 +928,68 @@ pub struct DynamicState {
     pub privacy_scan_groups: std::collections::BTreeMap<String, bool>,
 }
 
-/// 详细日志 (audit capture) 的三态档位 (#273 评论需求, 2026-09-24).
+/// 详细日志 (audit capture) 的三态档位 (#273 评论需求, 2026-09-24; errors→latest
+/// 替换 + 默认开启, quant#307 / 2026-10-12).
 ///
 /// - `Off`: 不存 req_body_raw / raw_resp_body (内存最优, timeline 不受影响 —
 ///   B1 blocks 派生).
-/// - `Errors`: **在途暂存** — push 时照存 req_body_raw, 响应落地后成功请求
-///   清除、**仅错误请求保留** (req + resp 双侧). 排障场景 90% 只关心失败请求,
-///   正常请求的巨型 agent 上下文不占稳态内存. 稳态 = 在途 + 错误请求的 body.
+/// - `Latest` (**默认**): 每个会话只保留**头部 (最新) 一次**请求的 raw — 会话有新
+///   请求落地 (attach) 后, 回收同会话更早请求的 raw. 论证 (quant#307): 出错后会话
+///   不再前进, 错误请求自然成为会话头部 (排障主力场景保留); 出错重试时重试请求
+///   成为新头部, 上次 (同一个错误的) 重试 raw 被回收 — 免去同一错误存 n 遍白费
+///   内存. 语义上 latest ⊇ 旧 errors 档.
 /// - `Full`: 全量保留 (原 bool `true` 语义).
 ///
-/// 决策函数 ([`Self::capture_req`] / [`Self::retain`]) 是 push / attach 两侧的
-/// SSOT; 错误判定 (`ResponseData::is_error`) 在 dag 层.
+/// 决策函数 ([`Self::capture_req`] / [`Self::retain`] / [`Self::recycle_superseded`])
+/// 是 push / attach 两侧的 SSOT; 会话头部判定 (node == session.leaf_id) 在 dag 层.
 ///
-/// serde: 序列化输出规范 string (`"off"/"errors"/"full"`); 反序列化**兼容旧 bool**
-/// (`false` → Off, `true` → Full) — 升级前写入 state.toml 的 bool 值无缝迁移,
-/// 不炸启动 (state.toml "永远可删除重置", 但能便宜兼容就不强迫用户删).
+/// serde: 序列化输出规范 string (`"off"/"latest"/"full"`); 反序列化**兼容旧 bool**
+/// (`false` → Off, `true` → Full) 与**旧 errors 档** (`"errors"` → Latest, 显式
+/// 映射 + WARN — 语义被 latest 包含, 无排障能力损失) — 升级前写入 state.toml 的
+/// 旧值无缝迁移, 不炸启动 (state.toml "永远可删除重置", 但能便宜兼容就不强迫用户删).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AuditCaptureMode {
-    #[default]
     Off,
-    Errors,
+    #[default]
+    Latest,
     Full,
 }
 
 impl AuditCaptureMode {
-    /// push 侧决策: 请求 body 是否入存储. Off 丢弃; Errors 暂存 (成败未知);
-    /// Full 保留.
+    /// push 侧决策: 请求 body 是否入存储. Off 丢弃; Latest 暂存 (头部资格
+    /// 在 attach 时裁定); Full 保留.
     pub fn capture_req(self) -> bool {
         !matches!(self, Self::Off)
     }
 
-    /// attach 侧决策 (响应落地后): body 是否最终保留. Errors 档仅错误请求保留 —
-    /// 成功请求的在途暂存在此回收 (清空).
-    pub fn retain(self, is_error: bool) -> bool {
+    /// attach 侧决策 (响应落地后): 本请求 raw 是否最终保留. Latest 档 = 会话
+    /// 头部判定 — `is_session_head` 由调用方 (dag 层) 给出, attach 与 view
+    /// 共用 `DagInner::is_session_head` (判定 = node == session.leaf_id);
+    /// 非头部请求 (被同会话更新请求取代 / 迟到 attach) 回收. Full 恒保留,
+    /// Off 恒不保留.
+    pub fn retain(self, is_session_head: bool) -> bool {
         match self {
             Self::Off => false,
-            Self::Errors => is_error,
+            Self::Latest => is_session_head,
             Self::Full => true,
         }
     }
 
-    /// serde 输入 (state.toml / PUT /api/settings): string 三态或旧 bool.
+    /// attach 侧决策: 是否回收同会话更早请求 (祖先链) 的 raw — latest 档的
+    /// 会话级内存策略 (每会话稳态只留头部一份 raw; fork 共享前缀一并回收,
+    /// 见 `dag::attach_response` 的裁定论证).
+    pub fn recycle_superseded(self) -> bool {
+        matches!(self, Self::Latest)
+    }
+
+    /// serde 输入 (state.toml / PUT /api/settings): string 三态或旧 bool /
+    /// 旧 errors 档.
     fn parse_de<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
         struct V;
         impl serde::de::Visitor<'_> for V {
             type Value = AuditCaptureMode;
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str(r#""off" / "errors" / "full" (兼容旧 bool)"#)
+                f.write_str(r#""off" / "latest" / "full" (兼容旧 bool 与旧 "errors" 档)"#)
             }
             fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
                 Ok(if v {
@@ -985,10 +1001,21 @@ impl AuditCaptureMode {
             fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
                 match v {
                     "off" => Ok(AuditCaptureMode::Off),
-                    "errors" => Ok(AuditCaptureMode::Errors),
+                    "latest" => Ok(AuditCaptureMode::Latest),
                     "full" => Ok(AuditCaptureMode::Full),
+                    // 旧 errors 档 (quant#307): 显式迁移到 latest — 语义被
+                    // latest 包含 (错误请求 = 会话头部必保留). WARN (而非 debug):
+                    // 行为面变化值得每启动一次的可见性; state.toml 首次 PUT 后
+                    // 重写为新值, 自愈.
+                    "errors" => {
+                        tracing::warn!(
+                            "audit_capture 'errors' is superseded by 'latest' (quant#307); \
+                             migrating to latest"
+                        );
+                        Ok(AuditCaptureMode::Latest)
+                    }
                     other => Err(E::custom(format!(
-                        "unknown audit_capture mode '{other}' (expect off/errors/full)"
+                        "unknown audit_capture mode '{other}' (expect off/latest/full)"
                     ))),
                 }
             }
@@ -1001,7 +1028,7 @@ impl Serialize for AuditCaptureMode {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(match self {
             Self::Off => "off",
-            Self::Errors => "errors",
+            Self::Latest => "latest",
             Self::Full => "full",
         })
     }
@@ -2621,6 +2648,74 @@ output = 0.5
             "error should name the offending provider"
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    // ─── AuditCaptureMode: 三态决策矩阵 + serde 迁移 (quant#307) ──────────
+
+    #[test]
+    fn audit_capture_mode_default_is_latest() {
+        // quant#307: 默认 latest — 用户出故障时至少有会话头部最新一次请求可查.
+        assert_eq!(
+            AuditCaptureMode::default(),
+            AuditCaptureMode::Latest,
+            "default must be latest (quant#307)"
+        );
+        // DynamicState serde 缺省 (旧 state.toml 无字段) 同走 Default.
+        assert_eq!(
+            DynamicState::default().audit_capture,
+            AuditCaptureMode::Latest
+        );
+    }
+
+    #[test]
+    fn audit_capture_mode_decision_matrix() {
+        use AuditCaptureMode::{Full, Latest, Off};
+        // push 侧: off 丢弃, latest/full 捕获.
+        assert!(!Off.capture_req());
+        assert!(Latest.capture_req());
+        assert!(Full.capture_req());
+        // attach 侧 (会话头部判定): latest 仅头部保留, full 恒保留, off 恒不保留.
+        assert!(!Off.retain(true) && !Off.retain(false));
+        assert!(Latest.retain(true), "latest keeps session head");
+        assert!(!Latest.retain(false), "latest recycles superseded requests");
+        assert!(Full.retain(true) && Full.retain(false));
+        // 祖先回收: 仅 latest 档执行 (off 无 raw 可收, full 不回收).
+        assert!(Latest.recycle_superseded());
+        assert!(!Off.recycle_superseded() && !Full.recycle_superseded());
+    }
+
+    #[test]
+    fn audit_capture_mode_serde_roundtrip_and_legacy_migration() {
+        use AuditCaptureMode::{Full, Latest, Off};
+        // 规范 string 三态 round-trip (JSON 直测; state.toml 的 TOML 形态由
+        // state.rs 的 DynamicState round-trip 测试覆盖).
+        for (mode, wire) in [(Off, "\"off\""), (Latest, "\"latest\""), (Full, "\"full\"")] {
+            let ser = serde_json::to_string(&mode).unwrap();
+            assert_eq!(ser, wire, "serialize {wire}");
+            let de: AuditCaptureMode = serde_json::from_str(&ser).unwrap();
+            assert_eq!(de, mode, "round-trip {wire}");
+        }
+        // 旧 bool 兼容: false→off / true→full (保持既有迁移).
+        assert_eq!(
+            serde_json::from_str::<AuditCaptureMode>("false").unwrap(),
+            Off
+        );
+        assert_eq!(
+            serde_json::from_str::<AuditCaptureMode>("true").unwrap(),
+            Full
+        );
+        // 旧 errors 档: 显式迁移到 latest (quant#307 — latest ⊇ errors).
+        assert_eq!(
+            serde_json::from_str::<AuditCaptureMode>("\"errors\"").unwrap(),
+            Latest,
+            "legacy 'errors' migrates to latest"
+        );
+        // 未知值: 报错信息提示新值域.
+        let err = serde_json::from_str::<AuditCaptureMode>("\"bogus\"").unwrap_err();
+        assert!(
+            err.to_string().contains("off/latest/full"),
+            "error names new value set: {err}"
+        );
     }
 
     // ─── Config::load_or_default: secret 的 value_file 三步序列 ──────────

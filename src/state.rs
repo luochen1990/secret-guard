@@ -119,7 +119,7 @@ pub struct AppState {
 fn mode_to_u8(m: crate::config::AuditCaptureMode) -> u8 {
     match m {
         crate::config::AuditCaptureMode::Off => 0,
-        crate::config::AuditCaptureMode::Errors => 1,
+        crate::config::AuditCaptureMode::Latest => 1,
         crate::config::AuditCaptureMode::Full => 2,
     }
 }
@@ -127,7 +127,7 @@ fn mode_to_u8(m: crate::config::AuditCaptureMode) -> u8 {
 fn u8_to_mode(v: u8) -> crate::config::AuditCaptureMode {
     match v {
         2 => crate::config::AuditCaptureMode::Full,
-        1 => crate::config::AuditCaptureMode::Errors,
+        1 => crate::config::AuditCaptureMode::Latest,
         _ => crate::config::AuditCaptureMode::Off,
     }
 }
@@ -137,8 +137,8 @@ fn u8_to_mode(v: u8) -> crate::config::AuditCaptureMode {
 /// # 职责边界
 ///
 /// - 读 (`mode`): 转发链 push 路径 per-request 调用一次, 三态决策 SSOT 见
-///   `config::AuditCaptureMode` (off 不存 / errors 在途暂存仅错误保留 / full
-///   全量). 决策快照进 `CallEvent.capture_mode`, 响应侧 attach 沿用快照
+///   `config::AuditCaptureMode` (off 不存 / latest 每会话仅保留头部最新请求 /
+///   full 全量). 决策快照进 `CallEvent.capture_mode`, 响应侧 attach 沿用快照
 ///   (不重读本档位) — 保证 per-request 原子性: 请求在途时切换档位不产生
 ///   "req 空 + resp 存了" 的半捕获撕裂.
 /// - 写 (`set_mode`): WebUI `PUT /api/settings`. RMW 持久化 state.toml
@@ -386,13 +386,13 @@ mod tests {
         let sw = AuditCapture::new(M::Off, path.clone(), Arc::new(Mutex::new(())));
         assert_eq!(sw.mode(), M::Off, "initial off");
 
-        sw.set_mode(M::Errors).unwrap();
-        assert_eq!(sw.mode(), M::Errors, "memory updated after persist");
+        sw.set_mode(M::Latest).unwrap();
+        assert_eq!(sw.mode(), M::Latest, "memory updated after persist");
 
         // "重启": 从磁盘重新加载 DynamicState 构造新开关.
         let state = crate::config::DynamicState::load_or_empty(&path, "").unwrap();
         let sw2 = AuditCapture::new(state.audit_capture, path.clone(), Arc::new(Mutex::new(())));
-        assert_eq!(sw2.mode(), M::Errors, "state survives restart path");
+        assert_eq!(sw2.mode(), M::Latest, "state survives restart path");
 
         // 关回去也持久化.
         sw2.set_mode(M::Full).unwrap();
@@ -422,6 +422,20 @@ mod tests {
         .unwrap();
         let state = crate::config::DynamicState::load_or_empty(&path, "").unwrap();
         assert_eq!(state.audit_capture, M::Off);
+    }
+
+    #[test]
+    fn audit_capture_legacy_errors_state_toml_migrates_latest() {
+        // quant#307: 旧 errors 档的 state.toml 反序列化显式迁移到 latest
+        // (latest ⊇ errors — 错误请求必为会话头部而保留), 不炸启动 (CFG-7).
+        let path = tmp_path("legacy-errors");
+        crate::config::atomic_write(&path, "audit_capture = \"errors\"\n").unwrap();
+        let state = crate::config::DynamicState::load_or_empty(&path, "").unwrap();
+        assert_eq!(
+            state.audit_capture,
+            crate::config::AuditCaptureMode::Latest,
+            "legacy 'errors' migrates to latest"
+        );
     }
 
     #[test]
@@ -457,13 +471,14 @@ mod tests {
     }
 
     #[test]
-    fn audit_capture_old_state_toml_without_field_defaults_off() {
-        // 契约: 旧版 state.toml 无 audit_capture 字段 → serde default off
-        // (升级兼容: 不存在 "缺字段启动失败" 或意外开启).
+    fn audit_capture_old_state_toml_without_field_defaults_latest() {
+        // 契约 (quant#307): 旧版 state.toml 无 audit_capture 字段 → serde
+        // default latest (默认档翻转: 出故障时至少有会话头部最新一次请求可查;
+        // 不存在 "缺字段启动失败").
         let path = tmp_path("legacy");
         std::fs::write(&path, "api_keys_disabled = []\n").unwrap();
         let state = crate::config::DynamicState::load_or_empty(&path, "").unwrap();
-        assert_eq!(state.audit_capture, crate::config::AuditCaptureMode::Off);
+        assert_eq!(state.audit_capture, crate::config::AuditCaptureMode::Latest);
     }
 
     // ─── PrivacyScanGroups: 持久化 round-trip + 校验 + 回滚 ────────────────

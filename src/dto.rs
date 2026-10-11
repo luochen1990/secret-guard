@@ -156,9 +156,9 @@ pub struct NodeView {
     /// 响应是否完整 (上游错误 / 客户端断开 → false).
     pub resp_complete: bool,
     /// body 是否被详细日志保留 (三态决策的最终结果: Off 恒 false / Full 恒 true /
-    /// Errors = 错误请求 true; **在途未定**按 true — 暂存中的 body 可看).
-    /// `ForwardRecord.audit_capture_off` 的派生源; 决策 SSOT 见
-    /// `config::AuditCaptureMode::retain`.
+    /// Latest = 会话头部 true (被同会话更新请求取代的已回收); **在途未定**按
+    /// true — 暂存中的 body 可看). `ForwardRecord.audit_capture_off` 的派生源;
+    /// 决策 SSOT 见 `config::AuditCaptureMode::retain`.
     pub audit_retained: bool,
     /// 错误诊断.
     pub error: Option<String>,

@@ -260,10 +260,11 @@ pub struct CallEvent {
     /// (req_body_raw SSOT), 改写生效时两者同值.
     pub upstream_model: Option<Arc<str>>,
     /// 本轮 push 时 audit_capture 档位的快照. `Off` = 该请求未捕获 raw
-    /// (`req_body_raw` 为空串); `Errors` = 在途暂存 (响应落地后成功清除 / 错误
-    /// 保留 — attach 沿用**本快照**决策, per-request 原子, 决策 SSOT 见
-    /// `crate::config::AuditCaptureMode`). WebUI 经
-    /// `ForwardRecord.audit_capture_off` 消费 (区分 "空 body" vs "未捕获").
+    /// (`req_body_raw` 为空串); `Latest` = 捕获且按会话头部裁定去留 (attach 时
+    /// 非头部的在途暂存被回收, 同会话祖先 raw 一并回收 — attach 沿用**本快照**
+    /// 决策, per-request 原子, 决策 SSOT 见 `crate::config::AuditCaptureMode`).
+    /// WebUI 经 `ForwardRecord.audit_capture_off` 消费 (区分 "空 body" vs
+    /// "未捕获/已回收").
     pub capture_mode: crate::config::AuditCaptureMode,
 }
 
@@ -312,16 +313,18 @@ pub struct ResponseData {
 }
 
 impl ResponseData {
-    /// 错误判定 (audit_capture "errors" 档的保留判据, SSOT):
-    /// 显式 error 字段 (超时/连接失败/流中断等) 或 HTTP 状态非 2xx.
-    /// `resp_status == 0` 且无 error (理论外的空态) 按错误处理 — 偏保留
-    /// (排障语义下宁可多留一条, 与 Off 的偏丢弃不对称是有意的).
+    /// 在途判定 (audit latest 档的回收跳过 + `NodeView.audit_retained` 的
+    /// "暂存可看" 判据, SSOT): response 尚未 finalize — 含两种形态: ① 无
+    /// response (`Option::None`, 调用方自行判); ② 流式进行中
+    /// `update_parsed_response` 建的 placeholder (default + 仅填 parsed).
     ///
-    /// 隐式依赖 (调整 status=0 分支前必读): 在途 partial ResponseData
-    /// (update_parsed_response 建的 default) 走此分支 → `retain(Errors, true)`
-    /// = true — 这正是 "在途未定按保留 (暂存可看)" 语义 (NodeView.audit_retained)
-    /// 的实现载体, 改动此分支会让在途窗口的 retained 静默翻转.
-    pub fn is_error(&self) -> bool {
-        self.error.is_some() || !(200..300).contains(&self.resp_status)
+    /// 隐式依赖 (调整前必读): 任何 attach 终态必带 `resp_status != 0` (2xx /
+    /// 4xx / 5xx) 或 `error` 字段 (超时/连接失败/流中断 — `record_upstream_
+    /// failure` 恒设 error); placeholder 形态恰是 `resp_status == 0 && error
+    /// == None`. 若未来出现 status=0 且无 error 的合法终态, 本判定会让其在
+    /// view 侧按 "在途可看" 呈现并在 latest 回收中被跳过 — 改动此处需同步
+    /// 审视 attach 调用点的终态构造.
+    pub fn is_inflight(&self) -> bool {
+        self.resp_status == 0 && self.error.is_none()
     }
 }

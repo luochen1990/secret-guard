@@ -67,10 +67,11 @@ async function sendChat(
 
 /**
  * 开/关详细日志 (B2 `PUT /api/settings`)。依赖 raw body 捕获的用例在 sendChat 前
- * 开启 (B2 起默认 off — 未捕获的 record 无 req_body/resp_body 可断言)。
+ * 开启 (quant#307 起默认 latest — 会话头部请求有 raw; 未捕获占位断言的用例需显式 off)。
  */
 async function setAuditCapture(page: Page, on: boolean | string): Promise<void> {
-  // `on` 接受 bool (旧调用点, 服务端兼容反序列化) 或三态 string ("off"/"errors"/"full").
+  // `on` 接受 bool (旧调用点, 服务端兼容反序列化) 或三态 string
+  // ("off"/"latest"/"full"; 旧 "errors" 由服务端迁移 latest, 测试不再使用).
   const r = await page.request.put(`${SG_API}/settings`, {
     data: { audit_capture: on },
     headers: { "Content-Type": "application/json" },
@@ -79,11 +80,11 @@ async function setAuditCapture(page: Page, on: boolean | string): Promise<void> 
   if (!r.ok()) throw new Error(`setAuditCapture(${on}) failed: HTTP ${r.status()}`);
 }
 
-// 测试间状态卫生: 任何用例开启详细日志后, afterEach 恢复默认 off (B2 生产默认).
-// workers=1 共享同一 server 进程, 开启泄漏到后续用例会让 "off 占位" 类断言失败.
+// 测试间状态卫生: 任何用例改档位后, afterEach 恢复生产默认 latest (quant#307).
+// workers=1 共享同一 server 进程, 档位泄漏到后续用例会让 "未捕获占位" 类断言失败.
 // server 不可达时静默 (此时测试自身已失败, 卫生钩子不叠加噪音).
 test.afterEach(async ({ page }) => {
-  await setAuditCapture(page, false).catch(() => {});
+  await setAuditCapture(page, "latest").catch(() => {});
 });
 
 // SSE 静音 route (file-level 默认, rt-push T3): 前端 bootstrap 会订阅
@@ -784,7 +785,8 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
   //   4. response 窗口内只有一个 assistant 气泡 (不再因 tool_calls 拆分多个).
 
   test("info icon + raw 按钮: 弹窗展示传输层信息和原始 body", async ({ page }) => {
-    // B2 起默认 off — 本用例断言 req_body 内容, 需先开启捕获.
+    // 显式开启 full 捕获 — 本用例断言 req_body 内容 (默认 latest 对单轮会话
+    // 头部也有 raw, 但显式 full 免受默认档演进影响).
     await setAuditCapture(page, true);
     await sendChat(page, [{ role: "user", content: "info-raw-marker" }]);
     const sid = await findSessionLeafByPreview(page, "info-raw-marker");
@@ -2306,7 +2308,7 @@ test.describe("WebUI 打磨 (#161 + #164)", () => {
   });
 
   test("#164-1: raw 弹窗 Response Body 带 (LLM view) 标注", async ({ page }) => {
-    // B2 起默认 off — 标注分支只在捕获开启 (resp_body 有内容) 时出现.
+    // 显式开启 full 捕获 — 标注分支只在捕获开启 (resp_body 有内容) 时出现.
     await setAuditCapture(page, true);
     await sendChat(page, [{ role: "user", content: "raw-llm-view-marker" }]);
     const sid = await findSessionLeafByPreview(page, "raw-llm-view-marker");
@@ -2363,10 +2365,10 @@ test.describe("WebUI 打磨 (#161 + #164)", () => {
 
 // ─── B3: 详细日志开关 (audit capture) + 未捕获占位 ────────────────────────
 //
-// B2 契约: audit_capture 三态 (off/errors/full, 默认 off 省内存) — 未保留 body 的
-// 请求 req_body/resp_body 为空, record DTO 带 audit_capture_off=true; UI 三态
+// B2 契约: audit_capture 三态 (off/latest/full, 默认 latest — quant#307) — 未保留
+// body 的请求 req_body/resp_body 为空, record DTO 带 audit_capture_off=true; UI 三态
 // 下拉在 header 工具栏 (#audit-capture select, GET/PUT /api/settings). 覆盖:
-//   1. 三态切换 + 初始化同步 (GET → select 镜像服务端值)
+//   1. 三态切换 + 初始化同步 (GET → select 镜像服务端值; 默认 latest)
 //   2. off 时 raw 弹窗占位 (优先级高于 streamed 空态 — 非流式请求也占位)
 //   3. off 时 usage 审计溯源弹窗占位 (parsed view, 判据与 raw 弹窗同字段)
 test.describe("B3: 详细日志开关 (audit capture)", () => {
@@ -2379,26 +2381,26 @@ test.describe("B3: 详细日志开关 (audit capture)", () => {
     // 暂停 3s 自动刷新 (sync 成功会清空 #status) — 切换反馈是一次性文本,
     // 否则断言与轮询 tick 存在负载相关的清空竞态 (CI 慢机 ~3% flake).
     await page.locator("#auto").uncheck();
-    // 初始 off 的保证: grep 单跑 = state 全新 (mkdtemp) 默认 off; 全量跑 =
-    // 文件级 afterEach 卫生钩子恢复 off. 两种场景下 select 都镜像服务端 off.
+    // 初始 latest 的保证: grep 单跑 = state 全新 (mkdtemp) 默认 latest; 全量跑 =
+    // 文件级 afterEach 卫生钩子恢复 latest. 两种场景下 select 都镜像服务端 latest.
     const sel = page.locator("#audit-capture");
-    await expect(sel).toHaveValue("off");
-    // 切 errors → PUT 成功 → 状态更新 + #status 轻反馈 (#273 评论需求档).
-    await sel.selectOption("errors");
-    await expect(sel).toHaveValue("errors");
-    await expect(page.locator("#status")).toContainText("Audit log: Errors only");
-    // 切 full 再回 off (双向 + 全值域).
+    await expect(sel).toHaveValue("latest");
+    // 切 full → PUT 成功 → 状态更新 + #status 轻反馈 (全值域巡回).
     await sel.selectOption("full");
     await expect(sel).toHaveValue("full");
     await expect(page.locator("#status")).toContainText("Audit log: Full");
     await sel.selectOption("off");
     await expect(sel).toHaveValue("off");
     await expect(page.locator("#status")).toContainText("Audit log: Off");
+    await sel.selectOption("latest");
+    await expect(sel).toHaveValue("latest");
+    await expect(page.locator("#status")).toContainText("Audit log: Latest only");
   });
 
   test("audit_capture off 时 raw 弹窗显示未捕获占位", async ({ page }) => {
-    // 默认 off (不上 setAuditCapture) + 非流式请求 — 占位优先于 streamed 空态:
-    // 非流式下旧 UI 会显示 "(empty)", B3 起必须显示未捕获占位.
+    // 显式 off + 非流式请求 — 占位优先于 streamed 空态: 非流式下旧 UI 会显示
+    // "(empty)", B3 起必须显示未捕获占位. (quant#307 起默认 latest, off 需显式设置.)
+    await setAuditCapture(page, false);
     await sendChat(page, [{ role: "user", content: "audit-off-marker" }]);
     const sid = await findSessionLeafByPreview(page, "audit-off-marker");
     await clickSessionByLeaf(page, sid);
@@ -2418,6 +2420,8 @@ test.describe("B3: 详细日志开关 (audit capture)", () => {
   test("audit_capture off 时 usage 审计溯源弹窗同样占位", async ({ page }) => {
     // 审计弹窗 (data-audit-node) 消费 parsed view (?view=parsed) — 判据与 raw
     // 弹窗统一为 record.audit_capture_off (见 index.html 注释), 本用例守卫该分支.
+    // (quant#307 起默认 latest — off 需显式设置, 否则头部请求有 raw 不占位.)
+    await setAuditCapture(page, false);
     await sendChat(page, [
       { role: "user", content: `audit-off-recent-marker secret=${TEST_SECRET_VALUE}` },
     ]);
@@ -3488,6 +3492,7 @@ test.describe("i18n: 语言自动选择 + 切换 + 持久化 (#298)", () => {
     const label = page.locator("label:has(#audit-capture) > span");
     await expect(label).toHaveText("Audit log");
     await expect(page.locator("#audit-capture option[value='off']")).toHaveText("Off");
+    await expect(page.locator("#audit-capture option[value='latest']")).toHaveText("Latest only");
     await expect(page.locator("html")).toHaveAttribute("lang", "en");
     // 静态文案 (data-i18n): filter 按钮 + 未选会话的 detail 空态.
     // (不用 #record-list 空态 — 全量跑时前置用例已产生 session, 空 div 不存在.)
@@ -3504,8 +3509,8 @@ test.describe("i18n: 语言自动选择 + 切换 + 持久化 (#298)", () => {
     const label = page.locator("label:has(#audit-capture) > span");
     await expect(label).toHaveText("详细日志");
     await expect(page.locator("html")).toHaveAttribute("lang", "zh");
-    // select 值不受 option 文案替换影响.
-    await expect(page.locator("#audit-capture")).toHaveValue("off");
+    // select 值不受 option 文案替换影响 (服务端默认 latest, quant#307).
+    await expect(page.locator("#audit-capture")).toHaveValue("latest");
     // 刷新后持久化 (localStorage) + 仍中文.
     await page.reload();
     await page.waitForLoadState("networkidle");

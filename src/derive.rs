@@ -615,7 +615,7 @@ pub(crate) fn parsed_view(
 /// oracle 无数据源; on 的请求守卫行为不变.
 #[cfg(feature = "consistency-check")]
 pub(crate) fn assert_delta_view_matches_raw(node: &crate::dag::Node, pool: &crate::dag::BlockPool) {
-    // gate = raw 是否在场 (off 档 / errors 档成功回收后均为空串, oracle 无源).
+    // gate = raw 是否在场 (off 档 / latest 档回收后均为空串, oracle 无源).
     if node.event.ingress_protocol.is_none() || node.event.req_body_raw.is_empty() {
         return;
     }

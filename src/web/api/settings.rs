@@ -2,10 +2,12 @@
 //!
 //! # 字段语义
 //!
-//! - `audit_capture` (详细日志, 三态 `"off" / "errors" / "full"` — 反序列化兼容
-//!   旧 bool): `off` 极致省内存; `errors` 仅错误请求保留 body (在途暂存, 排障
-//!   主力档); `full` 全量. timeline 不受影响 (B1 起从 BlockPool 派生).
-//!   per-request 原子语义 + 持久化契约见 `crate::state::AuditCapture` 文档 (SSOT).
+//! - `audit_capture` (详细日志, 三态 `"off" / "latest" / "full"` — 反序列化兼容
+//!   旧 bool 与旧 `"errors"` 档): `off` 极致省内存; `latest` (默认) 每会话保留
+//!   头部最新一次请求的完整 body (会话前进后旧 raw 回收 — 出故障时至少有最新
+//!   一次请求可查, 排障主力档); `full` 全量. timeline 不受影响 (B1 起从
+//!   BlockPool 派生). per-request 原子语义 + 持久化契约见
+//!   `crate::state::AuditCapture` 文档 (SSOT).
 //!
 //! # 安全
 //!

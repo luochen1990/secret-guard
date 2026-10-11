@@ -335,11 +335,11 @@ pub(super) fn assert_redactions_match_map(
 /// 捕获的 drift: writer 改变了 messages 顺序/结构导致 IR 提取与字符串提取不一致.
 /// 详见 AGENTS.md "视图正确性确保机制".
 ///
-/// 跳过 (B2): req_body_raw 未存储 (空串) 的请求 — off 档 / errors 档成功回收,
-/// 无对照物可比; on 的请求行为不变.
+/// 跳过 (B2): req_body_raw 未存储 (空串) 的请求 — off 档 / latest 档被会话
+/// 头部裁定回收, 无对照物可比; on 的请求行为不变.
 #[cfg(feature = "consistency-check")]
 pub(super) fn assert_preview_model_match_source(event: &CallEvent) {
-    // gate = raw 是否在场 (off 档 / errors 档成功回收后均为空串, 无对照物).
+    // gate = raw 是否在场 (off 档 / latest 档回收后均为空串, 无对照物).
     if event.req_body_raw.is_empty() {
         return;
     }
@@ -693,9 +693,10 @@ pub(super) fn stream_err_label(e: &std::io::Error) -> &'static str {
 /// `[redact] redacted_headers`, SEC-4) — 与硬编码黑名单并集, 见 `helpers::redact_headers`.
 /// `capture_mode`: 详细日志三态的 per-request 快照 (调用方从
 /// `AppState::audit_capture.mode()` 读一次). `Off` 时 `req_body_raw` 存空串;
-/// `Errors` 在途暂存 (成功后由 `dag::attach_response` 回收) — preview/model
-/// 已在上方从 `req_text`/`ir` 派生完毕, 不受影响; 决策记录进
-/// `CallEvent.capture_mode`, 响应侧 attach 沿用 (per-request 原子).
+/// `Latest` 在途暂存 (去留由 `dag::attach_response` 按会话头部裁定并回收
+/// 被取代请求) — preview/model 已在上方从 `req_text`/`ir` 派生完毕, 不受
+/// 影响; 决策记录进 `CallEvent.capture_mode`, 响应侧 attach 沿用
+/// (per-request 原子).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_call_event(
     parts: &axum::http::request::Parts,
@@ -744,10 +745,10 @@ pub(super) fn build_call_event(
         round_kind: crate::dag::RoundKind::Normal,
         redactions: std::sync::Arc::from(redactions),
         // B2 audit_capture: 三态快照记录在案 — 响应侧 attach 决策
-        // (errors 回收) + WebUI "未捕获" 标记都读这个快照.
+        // (latest 会话头部裁定) + WebUI "未捕获" 标记都读这个快照.
         capture_mode,
-        // Off → 空串 (preview/model 已派生, req_text 就地丢弃); Errors → 在途
-        // 暂存 (成功后 attach 回收); Full → 完整快照. 决策 SSOT:
+        // Off → 空串 (preview/model 已派生, req_text 就地丢弃); Latest → 在途
+        // 暂存 (attach 按会话头部裁定去留); Full → 完整快照. 决策 SSOT:
         // `AuditCaptureMode::capture_req`.
         req_body_raw: if capture_mode.capture_req() {
             req_text

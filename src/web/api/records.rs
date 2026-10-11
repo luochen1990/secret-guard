@@ -91,7 +91,7 @@ fn build_forward_record(
         streamed: view.streamed,
         resp_complete: view.resp_complete,
         error: view.error,
-        // B2: 未捕获标记 (off 档 / errors 档成功请求) — 前端区分 "空 body"
+        // B2: 未捕获标记 (off 档全部 / latest 档被会话更新请求取代) — 前端区分 "空 body"
         // vs "未捕获" 的契约字段.
         audit_capture_off: !view.audit_retained,
         // ForwardRecord 持有 Vec (需 Deserialize); 此处从 NodeView 的 Arc 切片
@@ -137,7 +137,7 @@ pub(crate) struct GetRecordResponse {
 /// - codec 不支持此协议 (Gemini/Ollama) → 同上
 /// - body 不是合法 JSON → `invalid JSON: <err>`
 /// - codec reader 解析失败 → `<reader error message>`
-/// - audit_capture 未保留 (off 全部 / errors 档成功; req_body 为空) → `req_body not captured ...`
+/// - audit_capture 未保留 (off 全部 / latest 档被会话更新请求取代; req_body 为空) → `req_body not captured ...`
 ///   (B2: 显式区分 "未捕获" 与 "空 body 解析失败" 两种 None 语义)
 fn build_parsed_response(record: ForwardRecord) -> GetRecordResponse {
     // parsed_response 直接取 record 内的累积结果.

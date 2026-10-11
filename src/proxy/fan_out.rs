@@ -219,7 +219,8 @@ async fn fanout_stream_task(
     let elapsed = started.elapsed().as_millis() as u64;
     let finality = finalize_parsed(parsed_sync, &recorder);
     // raw_resp_body 照填 (finalize_body 的 move 产出零拷贝); audit_capture 三态
-    // 的去留决策统一收口在 `dag::attach_response` (errors 档成功回收 / off 丢弃).
+    // 的去留决策统一收口在 `dag::attach_response` (latest 档按会话头部裁定 /
+    // off 丢弃).
     let body = finalize_body(&recorder);
     // resp_complete 在 error_kind move 进 ResponseData 前先取 (usage 落账同用).
     let resp_complete = recorder.complete();

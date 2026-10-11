@@ -90,12 +90,19 @@ pub(super) fn node_view(inner: &DagInner, node_id: Uuid) -> Option<NodeView> {
         upstream_model: node.event.upstream_model.clone(),
         streamed: resp.as_ref().map(|r| r.streamed).unwrap_or(false),
         resp_complete: resp.as_ref().map(|r| r.resp_complete).unwrap_or(false),
-        // audit_capture 三态的最终结果 (B2/#273 errors 档): 响应已落地 →
-        // retain(mode, is_error); 在途 (response 未 attach) → 暂存可看, 按 true
-        // (errors 档的回收发生在 attach, 之前的窗口 body 在场).
-        audit_retained: resp
-            .as_ref()
-            .is_none_or(|r| node.event.capture_mode.retain(r.is_error())),
+        // audit_capture 三态的最终结果 (B2/#273, latest 档 quant#307): 响应已
+        // finalize → retain(mode, is_session_head); 在途 (无 response 或流式
+        // placeholder, `ResponseData::is_inflight`) → 暂存可看, 按 true (latest
+        // 档的回收发生在 attach, 之前的窗口 body 在场). 头部判定与 attach 侧
+        // 同一 SSOT (DagInner::is_session_head): latest 档的稳态 = 每会话恰头部
+        // 一份 raw, 其余 (被更新请求取代) 均已回收.
+        audit_retained: resp.as_ref().is_none_or(|r| {
+            r.is_inflight()
+                || node
+                    .event
+                    .capture_mode
+                    .retain(inner.is_session_head(node.session_id, node.id))
+        }),
         error: resp.as_ref().and_then(|r| r.error.clone()),
         redactions: Arc::clone(&node.event.redactions),
         // B1 双态单点 (derive::parsed_view): 流式中读 stored, finalize 后派生.

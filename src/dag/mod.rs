@@ -118,6 +118,17 @@ pub(super) struct DagInner {
     min_sessions: usize,
 }
 
+impl DagInner {
+    /// 会话头部判定 SSOT (latest 档 retain 判据): node 是否为其 session 的当前
+    /// leaf. attach 侧 (`attach_response`) 与 view 侧 (`node_view`) 共用, 保证
+    /// 两侧判定不分叉.
+    fn is_session_head(&self, session_id: SessionId, node_id: Uuid) -> bool {
+        self.sessions
+            .get(&session_id)
+            .is_some_and(|s| s.leaf_id == node_id)
+    }
+}
+
 /// push 时计算出的 node 定位结果.
 #[derive(Debug, Clone)]
 struct ParentLookup {
@@ -635,26 +646,74 @@ impl ConversationDag {
             g.blocks.release_message(old);
         }
         // Phase 2: 写入新 response.
+        // ─── audit_capture 三态决策 (SSOT 收口, #273 / quant#307 latest 档) ─────
+        //
+        // 调用方 (fan_out 家族 / cross_proto) 构造 ResponseData 时**照填**
+        // raw_resp_body (acc 累积零拷贝 move), 去留决策统一在此: 不 retain 时
+        // 清 resp raw + 回收 event.req_body_raw; latest 档额外回收同会话祖先链
+        // 的 raw (每会话只留头部最新一份). 单一决策点消除 4 条 attach 路径的
+        // 样板 if (集中式预处理), 且天然 per-request 原子 (决策输入 = push 快照
+        // mode + 会话头部判定 — 后者由本方法持写锁就地计算, 不受并发 push 漂移).
+        let (mode, session_id, parent) = {
+            let node = g.nodes.get(&node_id).expect("checked above (write lock)");
+            (node.event.capture_mode, node.session_id, node.parent)
+        };
+        let is_session_head = g.is_session_head(session_id, node_id);
         let node = g
             .nodes
             .get_mut(&node_id)
             .expect("checked above (write lock)");
-        // ─── audit_capture 三态决策 (SSOT 收口, #273 errors 档) ─────────────
-        //
-        // 调用方 (fan_out 家族 / cross_proto) 构造 ResponseData 时**照填**
-        // raw_resp_body (acc 累积零拷贝 move), 去留决策统一在此: 不 retain 时
-        // 清 resp raw + 回收 event.req_body_raw 的在途暂存 (errors 档成功请求).
-        // 单一决策点消除 4 条 attach 路径的样板 if (集中式预处理), 且天然
-        // per-request 原子 (决策输入 = push 快照 mode + 本响应 is_error).
         let mut response = response;
-        if !node.event.capture_mode.retain(response.is_error()) {
+        if !mode.retain(is_session_head) {
             response.raw_resp_body = String::new();
             node.event.req_body_raw = String::new();
         }
         *node.response.write() = Some(response);
+        // latest 档: 会话前进 → 祖先链的 raw 已被本请求取代, 回收.
+        if mode.recycle_superseded() {
+            Self::recycle_superseded_raws(&mut g, parent);
+        }
         // 内容已变更 → 通知订阅者. (node not found 的提前 return 分支不通知:
         // 数据未变, 通知会造成前端无效 sync.)
         self.notify_change();
+    }
+
+    /// latest 档会话内存策略: 回收祖先链上更早请求的 raw (quant#307).
+    ///
+    /// 从刚 attach 的 node 的 parent 沿链走向根, 清空每个祖先的
+    /// `req_body_raw` + `raw_resp_body` (**只动 raw 字符串** — req_delta /
+    /// blocks / timeline 派生链 (B1) 一律不触碰).
+    ///
+    /// # 会话分叉裁定 (quant#307, "每 session 头部" vs "每叶子链头部")
+    ///
+    /// 本仓 DAG 语义下 session 恰为**单叶子链** (fork 即新 session,
+    /// `push_messages` step 5), 二者同义 — 采用 "每 session 保留头部最新一个
+    /// node". 祖先链 walk 天然穿过 fork 共享前缀 (属于旧 session 的节点),
+    /// 这是**正确**而非误伤: fork 点必非旧 session 的 leaf (fork 仅发生在
+    /// parent ≠ leaf 时, 且 leaf 只前进), 故共享前缀节点不可能是任何会话的
+    /// 头部, 回收不损失任何会话的排障能力; 内存稳态 = 每 session 恰一份 raw
+    /// (≤ 活跃 session 数, 有界). 跨 session "误伤" 因此不可能发生 — 其他
+    /// session 的 leaf 永不在本链的祖先位置上.
+    ///
+    /// 在途祖先 (response 未 finalize — 无 response 或流式 placeholder,
+    /// `ResponseData::is_inflight`, raw 为暂存) **跳过**: 其去留在自己的
+    /// attach 处裁定 (届时非头部 → 清空), 回收窗口内保持 "在途暂存可看" 语义.
+    /// 捕获于 full 档的祖先照常回收 — 内存策略跟随会话当前前进状态, 与各
+    /// 请求捕获时的档位无关 (mode 切换 full→latest 后存量 raw 随会话前进出清).
+    fn recycle_superseded_raws(g: &mut DagInner, mut cursor: Option<Uuid>) {
+        while let Some(pid) = cursor
+            && let Some(n) = g.nodes.get_mut(&pid)
+        {
+            let parent = n.parent;
+            // 只回收已 finalize 的祖先; 在途 (含流式 placeholder) 跳过.
+            if let Some(r) = n.response.write().as_mut()
+                && !r.is_inflight()
+            {
+                r.raw_resp_body = String::new();
+                n.event.req_body_raw = String::new();
+            }
+            cursor = parent;
+        }
     }
 
     /// 把单条 IrMessage intern 进池 (B1: 响应 finalize 时 response.message 用).
@@ -1300,6 +1359,303 @@ mod tests {
         let r = dag.get_response(id).expect("response exists");
         assert_eq!(r.resp_status, 500, "second attach overwrites");
         assert_eq!(r.raw_resp_body, "second");
+    }
+
+    // ─── audit_capture latest 档: 会话头部保留 + 祖先回收 (quant#307) ──────
+    //
+    // latest 语义: 每会话只保留头部 (最新) 一次请求的 raw; 会话前进 (新请求
+    // attach) 后回收祖先链. 决策 SSOT = config::AuditCaptureMode::retain/
+    // recycle_superseded; 这里钉住 dag 层的挂点行为 (含分叉/迟到/在途边界).
+
+    /// latest 档 fixture: 带非空 req_body_raw 的事件.
+    fn latest_event(body: &str) -> CallEvent {
+        let mut ev = event_with_body("/o/test/v1/chat", body);
+        ev.capture_mode = crate::config::AuditCaptureMode::Latest;
+        ev
+    }
+
+    /// attach 一个 2xx 响应 (raw_resp_body 照填, attach 收口决策).
+    fn attach_ok(dag: &ConversationDag, id: Uuid, resp_body: &str) {
+        dag.attach_response(
+            id,
+            ResponseData {
+                resp_status: 200,
+                raw_resp_body: resp_body.to_string(),
+                resp_complete: true,
+                ..Default::default()
+            },
+        );
+    }
+
+    /// node 的 raw 现场 (req_body_raw, raw_resp_body, audit_retained).
+    fn raw_state(dag: &ConversationDag, id: Uuid) -> (String, String, bool) {
+        let req = dag.get_node_detail(id).unwrap().req_body_raw;
+        let resp = dag
+            .get_response(id)
+            .map(|r| r.raw_resp_body)
+            .unwrap_or_default();
+        let retained = dag.get_node(id).unwrap().audit_retained;
+        (req, resp, retained)
+    }
+
+    #[test]
+    fn attach_latest_mode_recycles_ancestors_keeps_head() {
+        // 三轮会话: 每轮 attach 后仅头部有 raw. 头部资格随 leaf 前移.
+        let dag = ConversationDag::new(8, 500, 1);
+        let b1 = r#"{"model":"m","messages":[{"role":"user","content":"t1"}]}"#;
+        let b2 = r#"{"model":"m","messages":[{"role":"user","content":"t1"},{"role":"user","content":"t2"}]}"#;
+        let b3 = r#"{"model":"m","messages":[{"role":"user","content":"t1"},{"role":"user","content":"t2"},{"role":"user","content":"t3"}]}"#;
+        let n1 = dag.push_messages(vec![text_msg(IrRole::User, "t1")], latest_event(b1));
+        attach_ok(&dag, n1, "r1");
+        let (q1, s1, v1) = raw_state(&dag, n1);
+        assert!(!q1.is_empty() && !s1.is_empty() && v1, "head keeps raw");
+
+        let n2 = dag.push_messages(
+            vec![text_msg(IrRole::User, "t1"), text_msg(IrRole::User, "t2")],
+            latest_event(b2),
+        );
+        attach_ok(&dag, n2, "r2");
+        let (q1, s1, v1) = raw_state(&dag, n1);
+        assert!(
+            q1.is_empty() && s1.is_empty() && !v1,
+            "superseded request recycled at next attach"
+        );
+        let (q2, s2, v2) = raw_state(&dag, n2);
+        assert!(!q2.is_empty() && !s2.is_empty() && v2, "new head keeps raw");
+
+        let n3 = dag.push_messages(
+            vec![
+                text_msg(IrRole::User, "t1"),
+                text_msg(IrRole::User, "t2"),
+                text_msg(IrRole::User, "t3"),
+            ],
+            latest_event(b3),
+        );
+        attach_ok(&dag, n3, "r3");
+        assert_eq!(raw_state(&dag, n1).0, "", "n1 still recycled");
+        let (q2, _, v2) = raw_state(&dag, n2);
+        assert!(q2.is_empty() && !v2, "n2 recycled when n3 lands");
+        let (q3, s3, v3) = raw_state(&dag, n3);
+        assert!(!q3.is_empty() && !s3.is_empty() && v3, "n3 head keeps raw");
+    }
+
+    #[test]
+    fn attach_latest_mode_recycle_spares_timeline_b1() {
+        // B1 钉子: 回收只清 raw 字符串 — timeline 轮次与气泡 (BlockPool 派生)
+        // 逐轮完好. fixture 用 OpenAI 协议 + 与 messages 一致的 wire body,
+        // 让 consistency-check 的 delta shadow 全程在场验证 (head raw 非空).
+        let dag = ConversationDag::new(8, 500, 1);
+        let b1 = r#"{"model":"m","messages":[{"role":"user","content":"t1"}]}"#;
+        let b2 = r#"{"model":"m","messages":[{"role":"user","content":"t1"},{"role":"user","content":"t2"}]}"#;
+        let mk = |body: &str| {
+            let mut ev = latest_event(body);
+            ev.ingress_protocol = Some(crate::codec::Protocol::OpenAI);
+            ev
+        };
+        let n1 = dag.push_messages(vec![text_msg(IrRole::User, "t1")], mk(b1));
+        attach_ok(&dag, n1, "r1");
+        let n2 = dag.push_messages(
+            vec![text_msg(IrRole::User, "t1"), text_msg(IrRole::User, "t2")],
+            mk(b2),
+        );
+        attach_ok(&dag, n2, "r2");
+        assert_eq!(raw_state(&dag, n1).0, "", "n1 recycled");
+
+        let sid = dag.get_node(n2).unwrap().session_id;
+        let page = dag.timeline_view(sid, None, 10).unwrap();
+        assert_eq!(
+            page.rounds.len(),
+            2,
+            "both rounds in timeline after recycle"
+        );
+        for (i, round) in page.rounds.iter().enumerate() {
+            assert!(
+                !round.req_delta_messages.is_empty(),
+                "round {i} bubbles intact (B1: raw 不是 timeline 数据源)"
+            );
+        }
+    }
+
+    #[test]
+    fn attach_latest_mode_error_head_retained() {
+        // latest ⊇ errors: 出错后会话停滞, 错误请求即头部 → raw 保留.
+        let dag = ConversationDag::new(8, 500, 1);
+        let body = r#"{"model":"m","messages":[{"role":"user","content":"boom"}]}"#;
+        let n = dag.push_messages(vec![text_msg(IrRole::User, "boom")], latest_event(body));
+        dag.attach_response(
+            n,
+            ResponseData {
+                resp_status: 500,
+                error: Some("upstream exploded".into()),
+                raw_resp_body: r#"{"error":"boom"}"#.into(),
+                ..Default::default()
+            },
+        );
+        let (q, s, v) = raw_state(&dag, n);
+        assert!(!q.is_empty() && !s.is_empty() && v, "error head retained");
+    }
+
+    #[test]
+    fn attach_latest_mode_retry_recycles_previous_attempt() {
+        // 重试 (同 messages 重发, parent=errored leaf → 同会话延续): 新重试落地
+        // 即回收上一次尝试的 raw — "同一错误存 n 遍意义有限" (quant#307).
+        let dag = ConversationDag::new(8, 500, 1);
+        let body = r#"{"model":"m","messages":[{"role":"user","content":"retry-me"}]}"#;
+        let msgs = || vec![text_msg(IrRole::User, "retry-me")];
+        let a1 = dag.push_messages(msgs(), latest_event(body));
+        dag.attach_response(
+            a1,
+            ResponseData {
+                resp_status: 502,
+                error: Some("bad gateway".into()),
+                raw_resp_body: "err-1".into(),
+                ..Default::default()
+            },
+        );
+        assert!(
+            !raw_state(&dag, a1).0.is_empty(),
+            "first attempt kept while head"
+        );
+
+        // 重试: messages 与 a1 全前缀相同 → parent=a1, delta 空 (RoundKind::Retry),
+        // a1 是 leaf → 同会话延续.
+        let a2 = dag.push_messages(msgs(), latest_event(body));
+        let v2 = dag.get_node(a2).unwrap();
+        assert_eq!(v2.parent, Some(a1), "retry extends the errored leaf");
+        assert_eq!(v2.session_id, dag.get_node(a1).unwrap().session_id);
+        attach_ok(&dag, a2, "ok");
+        let (q1, s1, v1) = raw_state(&dag, a1);
+        assert!(
+            q1.is_empty() && s1.is_empty() && !v1,
+            "previous attempt recycled when retry lands"
+        );
+        assert!(
+            !raw_state(&dag, a2).0.is_empty(),
+            "retry (new head) keeps raw"
+        );
+    }
+
+    #[test]
+    fn attach_latest_mode_fork_spares_other_session_head() {
+        // 分叉裁定钉子: fork 即新 session — S2 前进只回收自己的祖先链 (含 fork
+        // 共享前缀), S1 的 leaf raw 不受影响 (其他 session 的 leaf 不在祖先位).
+        let dag = ConversationDag::new(8, 500, 1);
+        let b1 = r#"{"model":"m","messages":[{"role":"user","content":"f1"}]}"#;
+        let b2 = r#"{"model":"m","messages":[{"role":"user","content":"f1"},{"role":"user","content":"f2"}]}"#;
+        let b3 = r#"{"model":"m","messages":[{"role":"user","content":"f1"},{"role":"user","content":"f3"}]}"#;
+        let m1 = dag.push_messages(vec![text_msg(IrRole::User, "f1")], latest_event(b1));
+        attach_ok(&dag, m1, "r1");
+        let m2 = dag.push_messages(
+            vec![text_msg(IrRole::User, "f1"), text_msg(IrRole::User, "f2")],
+            latest_event(b2),
+        );
+        attach_ok(&dag, m2, "r2"); // S1: m1→m2, 回收 m1 (共享前缀).
+        let m3 = dag.push_messages(
+            vec![text_msg(IrRole::User, "f1"), text_msg(IrRole::User, "f3")],
+            latest_event(b3),
+        );
+        let sid1 = dag.get_node(m2).unwrap().session_id;
+        let sid3 = dag.get_node(m3).unwrap().session_id;
+        assert_ne!(sid1, sid3, "fork creates new session");
+        attach_ok(&dag, m3, "r3"); // S2 前进: 回收祖先链 (m1 共享前缀).
+
+        assert!(
+            !raw_state(&dag, m2).0.is_empty(),
+            "S1's leaf (m2) untouched by S2's advance (cross-session safety)"
+        );
+        assert!(!raw_state(&dag, m3).0.is_empty(), "S2's head keeps raw");
+        assert!(
+            raw_state(&dag, m1).0.is_empty() && raw_state(&dag, m1).1.is_empty(),
+            "shared fork prefix (non-head of both sessions) recycled"
+        );
+    }
+
+    #[test]
+    fn attach_latest_mode_late_attach_and_inflight_ancestor() {
+        // 乱序窗口: n2 先 attach (成为头部) 时, 在途的 n1 (response 未落地) 跳过
+        // 回收 — 保持 "在途暂存可看"; n1 迟到 attach 时非头部 → 自身 raw 回收.
+        let dag = ConversationDag::new(8, 500, 1);
+        let b1 = r#"{"model":"m","messages":[{"role":"user","content":"late-1"}]}"#;
+        let b2 = r#"{"model":"m","messages":[{"role":"user","content":"late-1"},{"role":"user","content":"late-2"}]}"#;
+        let n1 = dag.push_messages(vec![text_msg(IrRole::User, "late-1")], latest_event(b1));
+        let n2 = dag.push_messages(
+            vec![
+                text_msg(IrRole::User, "late-1"),
+                text_msg(IrRole::User, "late-2"),
+            ],
+            latest_event(b2),
+        );
+        attach_ok(&dag, n2, "r2"); // n1 尚未 attach (在途).
+        let (q1, _, v1) = raw_state(&dag, n1);
+        assert!(
+            !q1.is_empty() && v1,
+            "in-flight ancestor skipped by recycle walk (暂存可看)"
+        );
+        attach_ok(&dag, n1, "r1-late");
+        let (q1, s1, v1) = raw_state(&dag, n1);
+        assert!(
+            q1.is_empty() && s1.is_empty() && !v1,
+            "late attach is not session head → own raw recycled"
+        );
+        assert!(!raw_state(&dag, n2).0.is_empty(), "head n2 unaffected");
+    }
+
+    #[test]
+    fn attach_latest_mode_streaming_placeholder_ancestor_spared() {
+        // 流式在途祖先的真实生产形态: update_parsed_response 建出 Some(placeholder)
+        // (default + 仅填 parsed, status=0 无 error) — 回收 walk 必须按未 finalize
+        // 跳过 (ResponseData::is_inflight), view 侧按 "在途可看" 呈现; 其自身
+        // attach (迟到) 时按非头部回收. (review 钉子: 只判 Option::None 会漏此
+        // 形态, 提前清掉流式在途请求的暂存.)
+        let dag = ConversationDag::new(8, 500, 1);
+        let b1 = r#"{"model":"m","messages":[{"role":"user","content":"str-1"}]}"#;
+        let b2 = r#"{"model":"m","messages":[{"role":"user","content":"str-1"},{"role":"user","content":"str-2"}]}"#;
+        let n1 = dag.push_messages(vec![text_msg(IrRole::User, "str-1")], latest_event(b1));
+        // 流式进行中: ParsedSync 节流写入建 placeholder.
+        dag.update_parsed_response(n1, serde_json::json!({ "choices": [] }));
+        let n2 = dag.push_messages(
+            vec![
+                text_msg(IrRole::User, "str-1"),
+                text_msg(IrRole::User, "str-2"),
+            ],
+            latest_event(b2),
+        );
+        attach_ok(&dag, n2, "r2");
+        let (q1, _, v1) = raw_state(&dag, n1);
+        assert!(
+            !q1.is_empty() && v1,
+            "streaming placeholder ancestor is in-flight: skipped + visible"
+        );
+        assert!(!raw_state(&dag, n2).0.is_empty(), "head keeps raw");
+        // 流式终态 (迟到 attach, 非头部) → 回收.
+        attach_ok(&dag, n1, "r1-final");
+        let (q1, s1, v1) = raw_state(&dag, n1);
+        assert!(
+            q1.is_empty() && s1.is_empty() && !v1,
+            "finalized non-head ancestor recycled at own attach"
+        );
+    }
+
+    #[test]
+    fn attach_full_mode_keeps_all_raws() {
+        // 对照组: full 档不回收 — 会话前进后祖先 raw 全保留.
+        let dag = ConversationDag::new(8, 500, 1);
+        let b1 = r#"{"model":"m","messages":[{"role":"user","content":"k1"}]}"#;
+        let b2 = r#"{"model":"m","messages":[{"role":"user","content":"k1"},{"role":"user","content":"k2"}]}"#;
+        let n1 = dag.push_messages(
+            vec![text_msg(IrRole::User, "k1")],
+            event_with_body("/o/t", b1),
+        );
+        let n2 = dag.push_messages(
+            vec![text_msg(IrRole::User, "k1"), text_msg(IrRole::User, "k2")],
+            event_with_body("/o/t", b2),
+        );
+        attach_ok(&dag, n1, "r1");
+        attach_ok(&dag, n2, "r2");
+        for (id, name) in [(n1, "n1"), (n2, "n2")] {
+            let (q, s, v) = raw_state(&dag, id);
+            assert!(!q.is_empty() && !s.is_empty() && v, "full keeps {name} raw");
+        }
     }
 
     #[test]

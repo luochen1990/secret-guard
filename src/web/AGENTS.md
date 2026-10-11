@@ -107,14 +107,14 @@ POST   /api/api-keys
 DELETE /api/api-keys/{id}
 PATCH  /api/api-keys/{id}/toggle
 
-GET    /api/settings                → {audit_capture: "off"|"errors"|"full"} — 全局设置当前值
-PUT    /api/settings                body {audit_capture: 同上三态 string} (兼容旧 bool) → 200 同 shape
-                                          (详细日志三态: off = 极致省内存 / errors =
-                                           仅失败请求保留 body (在途暂存, 成功回收) /
-                                           full = 全量; timeline 不受影响 (B1 blocks 派
-                                           生)。per-request 原子 (push 快照, 在途请求不
-                                           受切换影响); 原子持久化 state.toml; 非法 body
-                                           统一 400。语义 SSOT
+GET    /api/settings                → {audit_capture: "off"|"latest"|"full"} — 全局设置当前值
+PUT    /api/settings                body {audit_capture: 同上三态 string} (兼容旧 bool 与旧 "errors"→latest) → 200 同 shape
+                                          (详细日志三态: off = 极致省内存 / latest =
+                                           每会话仅保留头部最新一次请求 body (会话前进
+                                           回收旧请求; 默认档, quant#307) / full = 全量;
+                                           timeline 不受影响 (B1 blocks 派生)。per-request
+                                           原子 (push 快照, 在途请求不受切换影响); 原子
+                                           持久化 state.toml; 非法 body 统一 400。语义 SSOT
                                            见 src/state.rs::AuditCapture)
                                            前端入口 (B3): header 工具栏「详细日志」select
                                            (#audit-capture) — 服务端状态的镜像 (GET 初始化
@@ -173,7 +173,7 @@ GET    /api/privacy-scan/alerts     → {enabled, alerts[{value, pattern_id,
 `?view=parsed` 返回 `parsed_request` (从 `req_body` 按需用 ingress codec 解析) +
 `parsed_response` (直接取自 `record.resp_parsed`, 由 proxy 层的 `StreamScan` 在流过程中
 增量累积, 非流式路径在响应完成时一次性计算). Gemini/Ollama 无 codec → `parse_error` + fallback raw.
-audit_capture 未保留的请求 (off 档全部 / errors 档成功请求, B2/B3) parsed_request 恒 null + `record.audit_capture_off = true`
+audit_capture 未保留的请求 (off 档全部 / latest 档被会话更新请求取代, B2/B3) parsed_request 恒 null + `record.audit_capture_off = true`
 (`parse_error` 报 "req_body not captured...") — WebUI 审计溯源弹窗 (`data-audit-node`,
 判 `record.audit_capture_off`) 与 raw 弹窗同占位文案.
 

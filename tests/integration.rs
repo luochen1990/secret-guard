@@ -11637,11 +11637,11 @@ async fn audit_capture_off_still_forwards_and_marks_uncaptured() {
     assert!(v["parsed_response"]["choices"].is_array(), "parsed intact");
 }
 
-/// ①-bis (#273 errors 档): 在途暂存语义 — 成功请求 attach 后回收 (双侧空 +
-/// 未捕获标记), 失败请求保留 (req_body_raw 至少保留; 上游错误 body 若被记录
-/// 也保留), 决策沿用 push 快照 (在途切 off 不影响已 push 的请求).
+/// ①-bis (#273→quant#307 latest 档): 每会话仅保留**头部最新**一次请求 — 会话
+/// 前进 (第二请求 attach) 后旧请求 raw 双侧回收; 错误请求作为 (停滞) 会话头部
+/// 保留 (排障主力语义, latest ⊇ errors); timeline (B1 blocks 派生) 不受回收影响.
 #[tokio::test]
-async fn audit_capture_errors_mode_retains_only_failed_requests() {
+async fn audit_capture_latest_mode_keeps_session_head_only() {
     // 双 upstream 双 provider (免 body matcher — mockito Matcher 不入 json! 宏):
     // oa-ok 恒 200, oa-err 恒 500 (带错误响应体, 排障线索).
     let mut ok_upstream = spawn_mock_upstream().await;
@@ -11663,43 +11663,94 @@ async fn audit_capture_errors_mode_retains_only_failed_requests() {
 
     let dag = ConversationDag::new(64, 500, 1);
     let dag_probe = dag.clone();
+    // 带 secret 命中 → same_proto IR 路径 (messages 推 DAG, 第二请求才能前缀
+    // 扩展同会话; passthrough 路径推空 messages 无法扩展).
     let (proxy_url, _sp) = spawn_proxy_with_audit_capture(
-        AuditCaptureMode::Errors,
+        AuditCaptureMode::Latest,
         vec![
             openai_provider("oa-ok", &ok_upstream.url()),
             openai_provider("oa-err", &err_upstream.url()),
         ],
-        test_secret_table(),
+        test_secret_table_with(vec![secret("tok-l", "sk-live-latest99999")]),
         dag,
     )
     .await;
 
-    // 成功请求: attach 后在途暂存被回收.
+    // 会话第一请求: 头部 — raw 双侧保留.
     let (s, _, _) = proxy_request(
         &proxy_url,
         "POST",
         "/o/oa-ok/v1/chat/completions",
-        r#"{"model":"gpt-x","messages":[{"role":"user","content":"ok-marker"}]}"#,
+        r#"{"model":"gpt-x","messages":[{"role":"user","content":"latest-turn1 sk-live-latest99999"}]}"#,
         &[],
     )
     .await;
     assert_eq!(s, reqwest::StatusCode::OK);
-    let ok_id = dag_probe.list_node_ids_newest_first()[0];
-    let ok_detail = dag_probe.get_node_detail(ok_id).unwrap();
-    let ok_view = dag_probe.get_node(ok_id).unwrap();
+    let n1 = dag_probe.list_node_ids_newest_first()[0];
+    let d1 = dag_probe.get_node_detail(n1).unwrap();
     assert!(
-        ok_detail.req_body_raw.is_empty(),
-        "errors mode recycles req body of successful request at attach"
+        !d1.req_body_raw.is_empty(),
+        "session head keeps req body while head"
     );
-    assert!(!ok_view.audit_retained, "successful request not retained");
-    assert!(ok_view.preview.is_some(), "preview still derived at push");
+    assert!(
+        !dag_probe.get_response(n1).unwrap().raw_resp_body.is_empty(),
+        "session head keeps resp body while head"
+    );
 
-    // 失败请求: 保留 (排障主力场景).
+    // 会话前进: 第二请求 messages 前缀扩展第一请求 (同会话) — attach 后第一
+    // 请求 (被取代) raw 双侧回收, 第二请求 (新头部) 保留.
+    let (s, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-ok/v1/chat/completions",
+        r#"{"model":"gpt-x","messages":[{"role":"user","content":"latest-turn1 sk-live-latest99999"},{"role":"assistant","content":"mid"},{"role":"user","content":"latest-turn2"}]}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(s, reqwest::StatusCode::OK);
+    let n2 = dag_probe.list_node_ids_newest_first()[0];
+    assert_ne!(n1, n2, "turn 2 is a new node");
+    let v2 = dag_probe.get_node(n2).unwrap();
+    assert_eq!(v2.parent, Some(n1), "turn 2 extends turn 1 (same session)");
+    // 旧请求回收: raw 双侧空 + 未保留标记.
+    let d1 = dag_probe.get_node_detail(n1).unwrap();
+    let v1 = dag_probe.get_node(n1).unwrap();
+    assert!(
+        d1.req_body_raw.is_empty(),
+        "superseded request's req body recycled at next attach"
+    );
+    assert!(
+        dag_probe.get_response(n1).unwrap().raw_resp_body.is_empty(),
+        "superseded request's resp body recycled at next attach"
+    );
+    assert!(!v1.audit_retained, "superseded request not retained");
+    // 新头部保留.
+    assert!(
+        !dag_probe
+            .get_node_detail(n2)
+            .unwrap()
+            .req_body_raw
+            .is_empty(),
+        "session head keeps req body"
+    );
+    assert!(v2.audit_retained, "session head retained");
+
+    // B1 钉子: 回收只动 raw 字符串 — timeline 轮次/气泡照常 (BlockPool 派生).
+    let page = dag_probe.timeline_view(v2.session_id, None, 10).unwrap();
+    assert_eq!(page.rounds.len(), 2, "both rounds still in timeline");
+    for (i, round) in page.rounds.iter().enumerate() {
+        assert!(
+            !round.req_delta_messages.is_empty(),
+            "round {i} bubbles intact after recycle (B1)"
+        );
+    }
+
+    // 错误请求 (独立会话): 会话停滞在错误轮 — 头部保留 (latest ⊇ errors).
     let (s, _, _) = proxy_request(
         &proxy_url,
         "POST",
         "/o/oa-err/v1/chat/completions",
-        r#"{"model":"gpt-x","messages":[{"role":"user","content":"err-marker"}]}"#,
+        r#"{"model":"gpt-x","messages":[{"role":"user","content":"latest-err-marker"}]}"#,
         &[],
     )
     .await;
@@ -11709,7 +11760,7 @@ async fn audit_capture_errors_mode_retains_only_failed_requests() {
     let err_view = dag_probe.get_node(err_id).unwrap();
     assert!(
         !err_detail.req_body_raw.is_empty(),
-        "failed request keeps req body for troubleshooting"
+        "failed request (stalled session head) keeps req body for troubleshooting"
     );
     assert!(err_view.audit_retained, "failed request retained");
     // GET /records: 失败请求未带 off 标记 (有内容可看).
@@ -11829,7 +11880,7 @@ async fn wait_for_push(dag: &ConversationDag, at_least: usize) {
 async fn put_settings(proxy_url: &str, m: AuditCaptureMode) {
     let wire = match m {
         AuditCaptureMode::Off => r#""off""#,
-        AuditCaptureMode::Errors => r#""errors""#,
+        AuditCaptureMode::Latest => r#""latest""#,
         AuditCaptureMode::Full => r#""full""#,
     };
     put_settings_raw(proxy_url, wire).await;
@@ -12014,14 +12065,22 @@ async fn audit_capture_settings_api_shape_validation_and_persistence() {
     }
 
     // PUT 合法 (三态): 200 返回新值 + state.toml 持久化 (重启路径读回同值).
-    // 顺带覆盖旧 bool 输入的兼容反序列化 (true → full).
+    // 顺带覆盖旧 bool 输入的兼容反序列化 (true → full) 与旧 errors 档输入的
+    // 显式迁移 (quant#307: errors → latest, 语义被 latest 包含).
     put_settings_raw(&proxy_url, "true").await;
-    put_settings(&proxy_url, AuditCaptureMode::Errors).await;
+    put_settings(&proxy_url, AuditCaptureMode::Latest).await;
     let state = secret_guard::config::DynamicState::load_or_empty(&state_path, "").unwrap();
     assert_eq!(
         state.audit_capture,
-        AuditCaptureMode::Errors,
-        "state.toml persists audit_capture=errors"
+        AuditCaptureMode::Latest,
+        "state.toml persists audit_capture=latest"
+    );
+    put_settings_raw(&proxy_url, r#""errors""#).await;
+    let state = secret_guard::config::DynamicState::load_or_empty(&state_path, "").unwrap();
+    assert_eq!(
+        state.audit_capture,
+        AuditCaptureMode::Latest,
+        "legacy 'errors' input migrates to latest and persists"
     );
 }
 
