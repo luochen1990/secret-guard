@@ -3748,3 +3748,77 @@ test.describe("#257 S0.5: privacy scan (unregistered candidates)", () => {
     // ④ 组态恢复全开由 describe 级 afterEach 统一收口 (防中途失败泄漏共享态).
   });
 });
+
+// ─── raw 弹窗大文本分段渲染 (quant#308 性能修复的行为钉子) ──────────────────
+//
+// 性能背景: 单个巨型 <pre> 的 layout+paint 是 raw 弹窗秒级卡顿的主导项
+// (12MB body 初次渲染 ~700ms+, 弱 CPU 线性放大). 修复 = 超过阈值 (128KB) 的
+// body 按 64KB 切段, 每段 content-visibility:auto (屏外段跳过渲染).
+// 本组钉子守卫**观测语义不变**: 内容逐字符无损 (含 astral 字符跨段边界)、
+// 小 body 不走分段路径.
+
+test.describe("raw 弹窗分段渲染 (quant#308)", () => {
+  // 前置: goto + 显式切回 records tab — sidebar 会话列表只在 records tab 可见
+  // (共享 context 按声明顺序执行, 前序 describe 可能停在 secrets tab).
+  test.beforeEach(async ({ page }) => {
+    await page.goto("/");
+    await page.waitForLoadState("networkidle");
+    await page.locator('a.tab[data-tab="records"]').click();
+  });
+
+  test("大 body: 分段生效 + 内容逐字符无损 (含 astral 字符)", async ({ page }) => {
+    await setAuditCapture(page, "full");
+    // 200KB 文本, astral 字符 (🚀 = surrogate pair) 密布全文 — 任何 64KB 切点
+    // 都可能落在代理对中间; 切点回退逻辑若失效, DOM 文本会出现 U+FFFD.
+    const pad = "seg-render-marker🚀" + "x🚀y".repeat(40); // ~200B/块, astral 密布
+    const content = "seg-render-marker " + pad.repeat(1000); // ~200KB
+    await sendChat(page, [{ role: "user", content }]);
+    const sid = await findSessionLeafByPreview(page, "seg-render-marker");
+    await clickSessionByLeaf(page, sid);
+    await page.waitForTimeout(500);
+
+    // 打开 raw 弹窗.
+    await page.locator("#detail .tl-actions button[data-action='raw']").click();
+    const rawDialog = page.locator("dialog.round-dialog");
+    await expect(rawDialog).toBeVisible();
+    await expect(rawDialog.locator(".raw-seg").first()).toBeVisible({ timeout: 10_000 });
+    // Request Body (>128KB) 分段: 段数 > 1 (200KB / 64KB ≈ 4).
+    const segCount = await rawDialog.locator(".raw-pre .raw-seg").count();
+    expect(segCount).toBeGreaterThan(1);
+
+    // 内容完整性: Request Body 区 (sections 顺序固定, 第 2 个 .raw-section —
+    // 结构定位, 不依赖 i18n 文案) 的 DOM 文本 == API 返回的 req_body 原文
+    // (分段/escape/surrogate 避让零损耗).
+    const domText = await rawDialog
+      .locator(".raw-section")
+      .nth(1)
+      .locator(".raw-pre")
+      .textContent();
+    const tl = await (
+      await page.request.get(`/api/sessions/${sid}/timeline?limit=1`)
+    ).json();
+    const roundId = tl.rounds[tl.rounds.length - 1].id;
+    const rec = (await (await page.request.get(`/api/records/${roundId}`)).json()).record;
+    expect(rec.req_body.length).toBeGreaterThan(128 * 1024); // 确认走了分段路径的前提
+    expect(domText).toBe(rec.req_body);
+    // astral 完整性哨兵: DOM 文本不得出现 U+FFFD (切坏代理对的症状).
+    expect(domText.includes("\uFFFD")).toBe(false);
+    expect(domText).toContain("seg-render-marker");
+  });
+
+  test("小 body: 不分段 (原路径, 无 .raw-seg)", async ({ page }) => {
+    await setAuditCapture(page, "full");
+    await sendChat(page, [{ role: "user", content: "small-body-no-seg-marker" }]);
+    const sid = await findSessionLeafByPreview(page, "small-body-no-seg");
+    await clickSessionByLeaf(page, sid);
+    await page.waitForTimeout(500);
+    await page.locator("#detail .tl-actions button[data-action='raw']").click();
+    const rawDialog = page.locator("dialog.round-dialog");
+    await expect(rawDialog).toBeVisible();
+    await expect(rawDialog.locator("pre.raw-pre").first()).toBeVisible({ timeout: 10_000 });
+    // 小 body (<128KB) 全部走单 pre 原路径 — 零 .raw-seg.
+    await expect(rawDialog.locator(".raw-seg")).toHaveCount(0);
+    const rawText = await rawDialog.textContent();
+    expect(rawText).toContain("small-body-no-seg-marker");
+  });
+});

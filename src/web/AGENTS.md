@@ -427,7 +427,11 @@ timeline 每轮 header 含两个按钮:
   SEC-4). 流式响应的 resp_body 为空 (不保留 SSE 字节), 显示提示. audit_capture off
   期间的请求 (`record.audit_capture_off`, B2/B3) req/resp body 区段显示未捕获占位
   (文案 SSOT `NOT_CAPTURED_NOTE`, 判据统一为该结构化字段; 优先级高于 streamed 空态
-  提示 — off 下非流式 body 同样未存; headers 照常展示).
+  提示 — off 下非流式 body 同样未存; headers 照常展示). 大 body (>128KB, LLM 累积
+  对话末轮可达 MB 级) 按 64KB 切段 + `content-visibility:auto` 惰性渲染 (quant#308:
+  巨型单 `<pre>` 的 layout+paint 是 raw 弹窗秒级卡顿的主导项) — 屏外段跳过渲染,
+  textContent/复制/内容零损耗 (切段在 escape 前原文上进行 + 切点避让 surrogate
+  pair), 段边界处多一个视觉换行.
 
 ### Response 气泡渲染
 

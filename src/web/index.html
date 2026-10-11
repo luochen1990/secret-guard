@@ -1256,6 +1256,11 @@
       overscroll-behavior: contain;
       margin: 0;
     }
+    /* raw 大文本分段渲染 (quant#308): 屏外段跳过 layout/paint (Chromium 对巨型
+       单文本节点无行级虚拟化, 12MB body 单 <pre> 初次渲染 ~700ms+, 分段后 ~50ms).
+       内容/复制零损耗, 段边界处多一个视觉换行; div 嵌套是 content-visibility 的
+       块级盒子要求 (inline 上无效), 浏览器对 pre 内嵌 div 照常渲染. */
+    dialog.round-dialog .raw-pre .raw-seg { content-visibility: auto; }
     dialog.round-dialog .raw-loading { padding: 20px; text-align: center; color: var(--fg-faint); }
 
     /* ─── IM 风格 detail 布局: 上下分栏 (request 上下文 + response 打字框) ─── */
@@ -4571,6 +4576,37 @@
       dlg.querySelector('.dialog-body').innerHTML = renderRows();
     }
 
+    // 大 body 分段渲染 (quant#308): LLM 请求体是累积对话形态, 几十轮会话末轮可达
+    // 数 MB~数十 MB. 单个巨型 <pre> 的 layout+paint 是 raw 弹窗秒级卡顿的主导项
+    // (12MB 实测初次渲染 ~700ms, 弱 CPU 线性放大). 超过阈值时按 64KB 切段, 每段
+    // .raw-seg (content-visibility:auto) 让屏外段跳过渲染, 滚动时渐进真实化.
+    // 内容零损耗: 切段在 escape 之前的原文上进行 (防 HTML 实体被从中间切断),
+    // 切点避让 UTF-16 surrogate pair (防 lone surrogate 渲染成 U+FFFD).
+    const RAW_SEG_THRESHOLD = 128 * 1024; // 低于此不分段 (小 body 走原路径, 行为不变).
+    const RAW_SEG_SIZE = 64 * 1024;
+    // 段的 contain-intrinsic-size 高度估计 (屏外占位, 防滚动条巨幅跳动):
+    // ~60 chars/行 × 14px/行 的保守估 (word-break 下 11px mono 的近似下界).
+    const rawSegEstimatePx = len => Math.max(24, Math.ceil(len / 60) * 14);
+    function rawBodyPre(body) {
+      if (body.length <= RAW_SEG_THRESHOLD) {
+        return `<pre class="raw-pre">${escapeHtml(body)}</pre>`;
+      }
+      const segs = [];
+      for (let i = 0; i < body.length;) {
+        let end = Math.min(i + RAW_SEG_SIZE, body.length);
+        if (end < body.length) {
+          const c = body.charCodeAt(end - 1);
+          // 切点前一字节是高代理项 → 回退 1, 让代理对完整留在本段.
+          if (c >= 0xd800 && c <= 0xdbff) end -= 1;
+        }
+        segs.push(body.slice(i, end));
+        i = end;
+      }
+      const segHtml = segs.map(s =>
+        `<div class="raw-seg" style="contain-intrinsic-size:auto ${rawSegEstimatePx(s.length)}px;">${escapeHtml(s)}</div>`).join('');
+      return `<pre class="raw-pre">${segHtml}</pre>`;
+    }
+
     // 打开 raw view 弹窗: 按需懒拉 ForwardRecord, 展示 req_body / resp_body / headers.
     async function openRoundRaw(id) {
       openRoundDialog(t('timeline.rawTitle'), `<div class="raw-loading">${t('common.loading')}</div>`, id);
@@ -4607,7 +4643,7 @@
       const bodyHtml = sections.map(([label, note, body]) => `
         <div class="raw-section">
           <div class="raw-label">${escapeHtml(label)}${note ? `<span class="raw-note"> ${escapeHtml(note)}</span>` : ''}</div>
-          <pre class="raw-pre">${escapeHtml(body)}</pre>
+          ${rawBodyPre(body)}
         </div>`).join('');
       dlg.querySelector('.dialog-body').innerHTML = bodyHtml;
     }
