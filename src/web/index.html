@@ -2031,8 +2031,8 @@
       <textarea id="f-value" placeholder="the real secret" data-i18n-placeholder="form.valuePlaceholder"></textarea>
       <label for="f-strategy" data-i18n="form.strategy" data-i18n-title="form.strategy.tip">Strategy</label>
       <select id="f-strategy">
-        <!-- 只列已实现的三个值 (#305 批1: redact/reject, 批2: placeholder; protect
-             仍由后端 validate fail-fast, 不入库不展示 — 合入时序 T1 先于本批) -->
+        <!-- 只列已实现的三个值 (#305 批1: redact/reject, 批2: placeholder; protect 已搁置,
+             由后端 validate fail-fast 挡下, 不入库不展示) -->
         <option value="redact" data-i18n="form.strategy.redact">Redact — transparent replacement (default)</option>
         <option value="reject" data-i18n="form.strategy.reject">Reject — refuse forwarding</option>
         <option value="placeholder" data-i18n="form.strategy.placeholder">Placeholder — explicit fake value + leak detection</option>
@@ -6787,7 +6787,7 @@
     // 与后端 MockStrategy JSON shape 对齐. 省略 gen 字段让后端 infer (Auto + 无 gen).
 
     // strategy select 回填: 值在下拉词表 (redact/reject/placeholder) 外 (undefined /
-    // protect 等未实现值) 时回退 redact (serde 缺省).
+    // protect 搁置值) 时回退 redact (serde 缺省).
     function loadStrategyIntoForm(st) {
       const sel = document.getElementById('f-strategy');
       sel.value = st && [...sel.options].some(o => o.value === st) ? st : 'redact';

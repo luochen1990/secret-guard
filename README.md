@@ -46,8 +46,7 @@ Return:    local tools ◄──real Secret──  secret-guard  ◄──Mock r
   "placeholder"` to swap it for an explicit `[REDACTED:{id}]` token that is never
   restored. Every placeholder secret doubles as a canary: if its real value ever shows
   up in an LLM response, you get an alert (WARN log + WebUI timeline badge, no secret
-  values in the alert) while the response itself passes through untouched. A `protect`
-  strategy is on the way (#305).
+  values in the alert) while the response itself passes through untouched.
 
 The same request, before and after it leaves the machine (captured from a real run; only
 the token value is fictional):

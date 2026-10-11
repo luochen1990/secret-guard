@@ -32,7 +32,6 @@ claude-code / opencode / hermes-agent 这类 Agent 工具 (即本地的 Agent Ha
   本机的凭证; 或 `strategy = "placeholder"`, 命中即替换为明示假值 `[REDACTED:{id}]`
   且响应侧不还原 — 每个 placeholder secret 同时是蜜罐: 真值一旦出现在 LLM 响应中
   立即报警 (日志 WARN + WebUI 时间线徽章, 报警不含真值), 响应本身照常透传。
-  `protect` 策略在路上 (#305)。
 
 一笔真实请求出站前后的样子 (截自真实运行, 仅 token 值为虚构):
 

@@ -1,6 +1,6 @@
 //! Secret 类型定义 + 校验 + [`DynamicEntry`] 实现 + effective 视图 + 处理策略
 //! ([`SecretStrategy`]: redact 默认 / reject (RED-9) / placeholder (RED-10, 批2) /
-//! protect 预留 fail-fast).
+//! protect 搁置值 fail-fast).
 //!
 //! # 三层数据模型 (与 [`crate::provider`] 完全对称)
 //!
@@ -106,8 +106,8 @@ pub struct SecretEntry {
     /// - `placeholder` (批2): 替换为明示假值 `[REDACTED:{id}]`, 响应不还原 +
     ///   蜜罐泄露检测 (响应中出现真值 → WARN + record 打标, 不干预转发).
     ///   契约 RED-10, 实现见 [`crate::redact`] C9 段.
-    /// - `protect`: 预留值 (批3 交付), 配置即 validate 报错 fail-fast,
-    ///   见 [`SecretEntry::validate`] 的检查.
+    /// - `protect`: 搁置值 (#305 完结时用户未想清语义, 重启需新 issue), 配置即
+    ///   validate 报错 fail-fast, 见 [`SecretEntry::validate`] 的检查.
     ///
     /// 注: `strategy` 不参与 [`crate::redact::init_seed`] 的哈希 — 翻转策略不应
     /// 改变其他 secret 的 mock (C3 前缀缓存友好).
@@ -250,7 +250,7 @@ impl SecretCategory {
 ///
 /// 语义总览见 [`SecretEntry::strategy`] 字段文档; reject 行为契约 = contracts.md
 /// **RED-9**, placeholder 行为契约 = contracts.md **RED-10** (批2 交付).
-/// `protect` 已定义但行为未交付 (批3), 由 [`SecretEntry::validate`]
+/// `protect` 已定义但行为搁置 (#305 完结决策), 由 [`SecretEntry::validate`]
 /// fail-fast 拒绝 (防静默失效).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -258,7 +258,8 @@ pub enum SecretStrategy {
     /// 默认: 真值替换为 mock (既有 C1-C7 行为).
     #[default]
     Redact,
-    /// 全响应 placeholder 替换 (批3 预留, 配置即 validate 报错).
+    /// 请求侧 mock 伪装 + 全响应 mock→placeholder (当初 #305 裁决的语义, 保留作
+    /// 重启参考; 已搁置 — #305 完结时用户未想清, 配置即 validate 报错).
     Protect,
     /// 明示假值替换 + 蜜罐泄露检测 (批2, RED-10): 请求侧真值 →
     /// `[REDACTED:{id}]`, 响应不还原; 检测到真值出现于 LLM 响应则 WARN + 打标.
@@ -400,7 +401,7 @@ impl DynamicEntry for SecretEntry {
         // mock_strategy 基础校验 (Fixed 非空 / Auto+gen 配置合法). 依赖 real value 的
         // C5 检查由 validate_against_real 在 resolve 后执行, 不在这里 (兼容 value_file 模式).
         self.mock_strategy.validate()?;
-        // strategy 值域 fail-fast (#305): protect 已定义但行为未交付 (批3), 接受
+        // strategy 值域 fail-fast (#305): protect 已定义但行为搁置 (#305 完结决策), 接受
         // 该配置会静默按 redact 处理 — 显式报错. 放在本 validate 而非
         // validate_and_resolve 专属步骤: validate_and_resolve 第一步就是 self.validate(),
         // 且 upsert_dynamic (WebUI CRUD 的底层) 独立调用本方法 — 一处检查同时覆盖
@@ -408,7 +409,7 @@ impl DynamicEntry for SecretEntry {
         // placeholder 已在批2 交付 (明示假值 + 蜜罐检测, RED-10).
         if matches!(self.strategy, SecretStrategy::Protect) {
             return Err(format!(
-                "secret {}: strategy '{}' is not implemented yet (planned; see #305)",
+                "secret {}: strategy '{}' is not implemented yet (shelved; see #305)",
                 self.id,
                 self.strategy.as_str()
             ));
@@ -672,7 +673,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_unimplemented_strategy_values() {
-        // protect 已定义但行为未交付 (批3) → validate fail-fast (#305).
+        // protect 已定义但行为搁置 (#305 完结决策) → validate fail-fast (#305).
         // 两条入口路径都挡: 直接 validate() (upsert_dynamic 底层独立调用) 与
         // validate_and_resolve() (static/dynamic 加载 + WebUI handler 的 choke point).
         let bad = SecretStrategy::Protect;
@@ -684,8 +685,8 @@ mod tests {
             "validate() should reject {bad:?}: {err}"
         );
         assert!(
-            err.contains("planned; see #305"),
-            "err should point to the plan: {err}"
+            err.contains("shelved; see #305"),
+            "err should point to the shelving decision: {err}"
         );
         let mut e2 = entry("unimpl", "sk-unimplemented-strategy");
         e2.strategy = bad;

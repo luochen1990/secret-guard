@@ -491,7 +491,7 @@ in
                   "reject"
                 ];
                 default = "redact";
-                description = "per-secret 处理策略 (对齐上游 SecretStrategy): redact = 替换为 mock (默认); reject = 请求中检测到即拒绝整个请求 (503, 零上游外发). protect / placeholder 尚未实现 — nix 侧接受四值透传 (单一事实源: 值合法性由 rust validate 启动时报错挡下, 而非 eval 期), 选中会在启动时 fail-fast.";
+                description = "per-secret 处理策略 (对齐上游 SecretStrategy): redact = 替换为 mock (默认); reject = 请求中检测到即拒绝整个请求 (503, 零上游外发); placeholder = 替换为明示假值 [REDACTED:{id}] + 响应侧不还原 + 泄露蜜罐检测. protect 已搁置 (#305 完结决策) — nix 侧接受四值透传 (单一事实源: 值合法性由 rust validate 启动时报错挡下, 而非 eval 期), 选中会在启动时 fail-fast.";
               };
               valueFile = lib.mkOption {
                 type = lib.types.path;
