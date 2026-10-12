@@ -826,12 +826,12 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 ### DTO-10 audit_capture_off 标记与未捕获 body 一致性 (B2)
 
-**陈述**: `NodeView.audit_retained` (三态决策的最终结果: off 恒 false / full 恒 true / latest = 会话头部 true — 被同会话更新请求取代的为 false; 在途未定按 true — 暂存可看, 在途判定 = 无 response 或流式 placeholder (`ResponseData::is_inflight`: status=0 且无 error, SSOT)) 与 body 存储状态一致: `false` → `req_body_raw` 为空串且 `raw_resp_body` 为空串 (反向不必然 — 流式响应本就不保留 SSE 字节, 与开关正交). 已声明例外窗口: 新请求 push 已前移 leaf 而其 attach 尚未执行的一瞬, 旧头部 `audit_retained=false` 但 raw 仍在场 — latest 的回收统一发生在 attach, 窗口有界 (所有 proxy 路径含错误/断开均无条件 attach) 且错误方向安全 (提前显示占位而非泄露). `true` → `req_body_raw` 为完整快照 (半捕获撕裂被 CFG-7 的 per-request 原子性排除; latest 档在途窗口的暂存属例外 — attach 时裁定, 回收 walk 同按在途判定跳过未 finalize 祖先). 派生消费面: `ForwardRecord.audit_capture_off = !audit_retained` (WebUI raw 弹窗与 usage 审计溯源弹窗的 "未捕获" 占位判据, 优先级高于 streamed 空态提示); `GET /api/records/{id}?view=parsed` 对未保留请求恒 `parsed_request = null` + `parse_error = "req_body not captured (audit_capture not retained)"` (诚实呈现缺失, 不伪造空对象 — 尊重事实原则). timeline (req_delta_messages / tail) 内容不受档位影响 — B1 起从 BlockPool 派生 (DTO-5), raw body 不是其内容数据源 (唯一残留: `tail.length` 的末级 fallback 在 parsed 缺失场景读 `raw_resp_body.len()`, 未保留下为 0 — 仅影响 length 数字, 不影响内容渲染).
+**陈述**: `NodeView.audit_retained` (三态决策的最终结果: off 恒 false / full 恒 true / latest = 会话头部 true — 被同会话更新请求取代的为 false; 在途未定按 true — 暂存可看, 在途判定 = 无 response 或流式 placeholder (`ResponseData::is_inflight`: status=0 且无 error, SSOT)) 与 body 存储状态一致: `false` → `req_body_raw` 为空串且 `raw_resp_body` 为空串 (反向不必然 — 流式响应本就不保留 SSE 字节, 与开关正交). 已声明例外窗口: 新请求 push 已前移 leaf 而其 attach 尚未执行的一瞬, 旧头部 `audit_retained=false` 但 raw 仍在场 — latest 的回收统一发生在 attach, 窗口有界 (所有 proxy 路径含错误/断开均无条件 attach) 且错误方向安全 (提前显示占位而非泄露). `true` → `req_body_raw` 为完整快照 (半捕获撕裂被 CFG-7 的 per-request 原子性排除; latest 档在途窗口的暂存属例外 — attach 时裁定, 回收 walk 同按在途判定跳过未 finalize 祖先). 派生消费面: `ForwardRecord.audit_capture_off = !audit_retained` (WebUI 轮次详情弹窗完整数据 tab [quant#305 前为独立 raw 弹窗] 与 usage 审计溯源弹窗的 "未捕获" 占位判据, 优先级高于 streamed 空态提示); `GET /api/records/{id}?view=parsed` 对未保留请求恒 `parsed_request = null` + `parse_error = "req_body not captured (audit_capture not retained)"` (诚实呈现缺失, 不伪造空对象 — 尊重事实原则). timeline (req_delta_messages / tail) 内容不受档位影响 — B1 起从 BlockPool 派生 (DTO-5), raw body 不是其内容数据源 (唯一残留: `tail.length` 的末级 fallback 在 parsed 缺失场景读 `raw_resp_body.len()`, 未保留下为 0 — 仅影响 length 数字, 不影响内容渲染).
 
 **Properties**:
 - `prop_audit_capture_off_body_empty_and_marked`: off 请求 (同协议 / 跨协议 / 流式) 转发行为不受影响, record 两侧 body 为空 + `audit_capture_off = true`; on 请求 `audit_capture_off = false`. 🔁→`audit_capture_off_still_forwards_and_marks_uncaptured` + `audit_capture_off_streaming_still_forwards` + `audit_capture_off_cross_proto_marks_uncaptured` (`tests/integration.rs`)
 - `prop_audit_capture_off_parsed_view_reports_uncaptured`: off 请求的 parsed view 恒 `parsed_request = null` + 显式 parse_error 未捕获文案. 🔁→`audit_capture_off_still_forwards_and_marks_uncaptured` (`tests/integration.rs`)
-- `prop_audit_capture_off_ui_placeholder_shown`: WebUI raw 弹窗与 usage 审计溯源弹窗对 off 请求显示未捕获占位 (判据统一为 `audit_capture_off` 结构化字段, 非空 body 探测). 🔁→`audit_capture off 时 raw 弹窗显示未捕获占位` + `audit_capture off 时 usage 审计溯源弹窗同样占位` (`tests/webui/im-ui.spec.ts`)
+- `prop_audit_capture_off_ui_placeholder_shown`: WebUI 轮次详情弹窗完整数据 tab 与 usage 审计溯源弹窗对 off 请求显示未捕获占位 (判据统一为 `audit_capture_off` 结构化字段, 非空 body 探测). 🔁→`audit_capture off 时完整数据 tab 显示未捕获占位` + `audit_capture off 时 usage 审计溯源弹窗同样占位` (`tests/webui/im-ui.spec.ts`)
 
 ---
 
@@ -1216,6 +1216,19 @@ real 还原进去等于精准投放泄露. 故默认"偏安全", 暴露侧行为
 - `prop_sse_unavailable_degrades_to_polling`: SSE 连接持续失败 (sseHealthy 恒 false) 时兜底轮询维持 ~3s 节奏持续拉 sync (只断言 "仍在轮询", 不断言精确间隔). 🔁→`SSE 不可用时退化为轮询 (兜底 tick 持续拉 sync)` (`tests/webui/im-ui.spec.ts`)
 - `prop_sse_poke_skipped_while_dialog_open`: 弹窗开启期间到达的 poke 不触发 sync (计数冻结), 关闭后下一个 poke 恢复触发 — 证明跳过源于暂停语义而非事件流失效. 🔁→`弹窗开启时 SSE poke 不触发 sync, 关闭后恢复 (#164-3)` (`tests/webui/im-ui.spec.ts`)
 
+### UI-9 轮次详情弹窗: 概览默认 + 大数据按需 (quant#305)
+
+**陈述**: timeline 每轮的详情入口是**单一按钮** (原 info / raw 两按钮合并), 弹窗以双 tab 组织:
+- **概览 tab (打开即默认)**: 只含元数据小字段。数据面 = 本地 (TimelineRound + 末轮 tail) + `GET /api/records/{id}?view=meta` (bodies 清空的小响应, wire 保证见 `web/api/records.rs` 的 `build_forward_record`)。概览路径**禁止**发起大数据请求 (拉完整 record 即违反)。
+- **完整数据 tab**: 原 raw 弹窗内容 (req/resp headers + bodies)。**按需懒拉**: 首次激活该 tab (针对当前轮) 才 fetch 完整 `GET /api/records/{id}`; 已加载复用不重拉 (分段虚拟化行为由 quant#308 的既有钉子守卫)。
+- **"感叹号" 入口**: 轮次 header 的失败状态文本 (`.status-err`) 与 ⚠ 泄露徽章 (`.leak-badge`) 点击 → 打开同一弹窗的概览 tab (失败详情按内容归属落在概览: error 横幅 + status 行)。限定: 状态文本仅末轮 header 存在 (DTO-5 既有约束 — 非末轮 response 字段不随 timeline 传输, header 状态 span 为空), 历史失败轮经 ℹ 按钮进入; leak 徽章全轮可用。
+
+**Properties**:
+- `prop_round_dialog_merged_entry_overview_default`: 每轮仅一个详情按钮; 打开默认落概览 tab, 概览 pane 可见 / 完整数据 pane 隐藏, 且元数据 (model 等) 经 view=meta 补全. 🔁→`合并入口 + 概览默认 + 完整数据按需` (`tests/webui/im-ui.spec.ts`)
+- `prop_round_dialog_full_data_lazy_fetch`: 概览阶段只发 view=meta 请求; 完整数据 tab 首次激活才拉完整 record, 反复切换不重复拉取. 🔁→`合并入口 + 概览默认 + 完整数据按需` (`tests/webui/im-ui.spec.ts`, 网络审计断言)
+- `prop_round_dialog_err_status_click_path`: 失败轮的 header 状态文本 (status-err) 点击打开轮次详情概览, 失败状态可见. 🔁→`失败轮 ERR 状态点击 → 轮次详情概览` (`tests/webui/im-ui.spec.ts`)
+- `prop_round_dialog_meta_fail_explicit`: 概览的 meta 依赖字段在 meta 拉取失败时显示失败文案, 不停留 "(loading…)" 占位 (关闭重开可重试). 🔁→`meta 拉取失败: 概览 meta 依赖字段显示失败文案` (`tests/webui/im-ui.spec.ts`)
+
 ---
 
 ## 11. USAGE: 模型用量统计
@@ -1476,3 +1489,4 @@ chars (char boundary 安全); 其余事件字段为受控类型, 天然无 secre
 | 2026-10-11 | RED-9 (新增) | **per-secret 处理策略 (strategy) 契约化 (#305 批1)**: `[[secrets.entries]]` 新增 `strategy` 字段 (serde snake_case 枚举, 默认 redact, 旧配置零改动) — redact = 现状透明替换 (RED-1..8 管辖逐字不变, 向后兼容锚); reject = 真值命中请求 → 整请求 503 + 零上游外发 + SEC-2 同型 message, 显式策略不受 on_probe_exhausted 模式影响 (与 SEC-10 降级开关族正交); protect / placeholder 值域预留 fail-fast (validate 拒绝 "not implemented yet"), 行为契约留待批2 (placeholder, 预留 RED-10) / 批3 (protect, 预留 RED-11). 3 条 property 挂 T1 测试 (端到端 `tests/integration.rs` + 单元 `src/redact.rs` ×2) | issue #305 批1 + 用户三项裁决 (protect = 全响应 placeholder / 报警挂 record + WARN / placeholder 形式 `[REDACTED:{id}]`) |
 | 2026-10-11 | RED-9 (陈述收尾) | #305 完结: protect 值从 "计划中 (预留 RED-11)" 改为 **搁置** (用户未想清语义, 不做比做错好) — 值域保留 + validate fail-fast 行为不变 (错误文案 planned→shelved), 初裁语义保留在 `SecretStrategy::Protect` 变体 doc 供重启参考; 重启另立 issue 与新契约编号, 不预留编号. redact/reject/placeholder (RED-9/RED-10) 交付完毕不受影响 | 用户决策 (2026-10-11, issue #305 关闭): protect 语义未想清, 搁置 |
 | 2026-10-11 | RED-10 (新增) + RED-9 (微调) | **placeholder 策略 (明示假值 + 蜜罐检测) 契约化 (#305 批2)**: `strategy = "placeholder"` — 请求侧命中替换为确定性明示假值 `[REDACTED:{secret_id}]` (`placeholder_for(id)`: 同 id 恒同值不依赖 seed / id 唯一 ⇒ placeholder 唯一 / 幂等, IR 已含上轮 echo 的 placeholder 是正常态), 响应侧**不还原** (restore 投影排除 placeholder 条目); 响应 finalize 蜜罐检测 (检测面 = 该请求配置的全部 placeholder secrets (`RedactionMap.leak_watch`), 事后扫 LLM 视角文本, `attach_finality` 单点收口 + `detect_response_leaks`) — **检测不干预转发** (透传 + 报警), best-effort 漏报面 (StreamScan overflow / parse 失败 / 无 codec 跳过), 报警数据不含真值 (`leak_alerts` 只存 secret_id, SEC-1/SEC-3 同型) + WebUI timeline 徽章; RED-9 的 validate fail-fast 名单移除 placeholder (仅剩 protect, RED-9 陈述同步微调 — 编号与锚点不动). 6 条 property 按实现实名 ✅ (3 条暂态 ⏳ 合并时已拆分对齐) | issue #305 批2 + "检测不干预转发" 裁决 (2026-10-11: 真值出现在 LLM 响应意味着泄露已发生 — 正是报警要揭示的; 客户端看到真值 = 用户立即看到证据; 流式场景字节已流出, 替换会造成流式/非流式行为不一致) |
+| 2026-10-12 | UI-9 (新增) + DTO-10 (措辞) | **轮次详情弹窗契约化 (quant#305)**: timeline 每轮原 info / raw 两按钮合并为单一详情入口, 弹窗双 tab — 概览 (默认, 元数据小字段: 本地 + `?view=meta` 小响应, 禁止拉完整 record) / 完整数据 (原 raw 弹窗内容, 首次激活才懒拉, quant#308 分段虚拟化不变); "感叹号" 入口 (header `.status-err` / `.leak-badge`) 点击直达概览. 配套 wire 侧: `GET /api/records/{id}` 新增 `view=meta` 档 (bodies/headers/parsed 清空, 元数据照常, `build_forward_record` 单点构造). DTO-10 消费面措辞随合并更新 ("WebUI raw 弹窗" → "WebUI 轮次详情弹窗完整数据 tab") | 用户反馈 (lc-studio/quant#305): "传输层信息" 页名不副实 (实为轮次元数据, 非传输层) + i/raw 双入口信息架构割裂; 用户方案: 合并入口 + 概览/详情 tab + 大数据按需 |

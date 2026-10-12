@@ -1,11 +1,11 @@
-//! `GET /records/{id}` 单条 raw + parsed view (WebUI 弹窗按需拉取).
+//! `GET /records/{id}` 单条 record 的三档 view (WebUI 轮次详情弹窗按需拉取).
 //!
 //! 从 api.rs 单文件拆出 (见 #146 残留 1).
 //!
 //! 注: 旧的 `GET /api/records` (扁平分页) + `GET /api/nodes/{id}/timeline` (基于 node_id
 //! 的 timeline) 已删除, 由 session-aware sync API 替代 (POST /api/sync + GET
 //! /api/sessions/{sid}/timeline). 详见 dag 模块的 session_rounds / timeline_view /
-//! timeline_diff / sync_snapshot. 本文件只保留单条 record 的 raw + parsed view.
+//! timeline_diff / sync_snapshot. 本文件只保留单条 record 的 view 端点.
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -26,6 +26,13 @@ pub async fn get_record(
 ) -> Result<impl IntoResponse, StatusCode> {
     // 从 DAG 派生 ForwardRecord DTO.
     let view = state.dag.get_node(id).ok_or(StatusCode::NOT_FOUND)?;
+    // meta view (quant#305): 轮次详情弹窗概览 tab 的补全路径 — 只需元数据小字段
+    // (method/path/model/status/error 等), 不为几行元数据传输 MB 级 body.
+    // 早退同时跳过 get_node_detail (BlockPool resolve) 与 parsed 派生.
+    if q.view.as_deref() == Some("meta") {
+        let record = build_forward_record(view, None, None);
+        return Ok((NO_STORE, Json(GetRecordResponse::record_only(record))));
+    }
     let detail = state.dag.get_node_detail(id).ok_or(StatusCode::NOT_FOUND)?;
     let mut resp = state.dag.get_response(id);
     // B1 双态单点 (dag.derive_response_parsed → derive::parsed_view): 流式中读
@@ -35,22 +42,14 @@ pub async fn get_record(
     {
         r.parsed = state.dag.derive_response_parsed(id);
     }
-    let record = build_forward_record(view, detail, resp);
+    let record = build_forward_record(view, Some(detail), resp);
     // 我们总是返回 GetRecordResponse envelope, 让前端 shape 固定.
     // raw view: parsed_*/parse_error 全 None.
     // parsed view: parsed_response 直接从 record.resp_parsed 读取 (流式/非流式统一);
     //   parsed_request 仍需按需从 req_body 计算.
     let wants_parsed = q.view.as_deref() == Some("parsed");
     if !wants_parsed {
-        return Ok((
-            NO_STORE,
-            Json(GetRecordResponse {
-                record,
-                parsed_request: None,
-                parsed_response: None,
-                parse_error: None,
-            }),
-        ));
+        return Ok((NO_STORE, Json(GetRecordResponse::record_only(record))));
     }
     let resp = build_parsed_response(record);
     Ok((NO_STORE, Json(resp)))
@@ -59,12 +58,19 @@ pub async fn get_record(
 /// 从 DAG 视图构造 [`ForwardRecord`] DTO (Web API 的 record 字段).
 ///
 /// 拼接 NodeView (元数据) + NodeDetail (req_headers / req_body_raw) + ResponseData (响应字段).
-/// ResponseData 缺失时 (上游错误 / 尚未响应), 响应字段填默认空值 (resp_status=0 等).
+/// `detail` / `resp` 为 None 时 (= `view=meta`, quant#305) bodies / headers / parsed 全空,
+/// 元数据 (status / elapsed / model / error 等, 来自 NodeView) 照常填充 — 单一字段映射
+/// 服务 raw / meta 两档, 防两份构造漂移. ResponseData 缺失时 (上游错误 / 尚未响应),
+/// 响应字段填默认空值 (resp_status=0 等).
 fn build_forward_record(
     view: NodeView,
-    detail: NodeDetail,
+    detail: Option<NodeDetail>,
     resp: Option<ResponseData>,
 ) -> ForwardRecord {
+    // meta 档 (detail=None) 与 "详情未捕获" 共用同一空值语义: headers/bodies 全空.
+    let (req_headers, req_body_raw) = detail
+        .map(|d| (d.req_headers, d.req_body_raw))
+        .unwrap_or_default();
     ForwardRecord {
         id: view.id,
         created_at: view.created_at,
@@ -75,8 +81,8 @@ fn build_forward_record(
         model: view.model.as_deref().map(str::to_string),
         upstream_id: view.upstream_id.to_string(),
         upstream_model: view.upstream_model.as_deref().map(str::to_string),
-        req_headers: detail.req_headers,
-        req_body: detail.req_body_raw,
+        req_headers,
+        req_body: req_body_raw,
         resp_status: view.resp_status,
         resp_headers: resp
             .as_ref()
@@ -104,7 +110,9 @@ fn build_forward_record(
 
 /// `GET /api/records/{id}?view=` 的查询参数.
 ///
-/// - `view=raw` (默认 / 省略): 仅返回 record 原文.
+/// - `view=raw` (默认 / 省略): 仅返回 record 原文 (含 req/resp bodies + headers).
+/// - `view=meta`: 元数据档 (quant#305) — bodies / headers / parsed 全空, 其余字段照常.
+///   供 WebUI 轮次详情弹窗概览 tab 小字段补全 (不为元数据传输 MB 级 body).
 /// - `view=parsed`: parsed_response 直接从 record.resp_parsed 读取;
 ///   parsed_request 按需用 ingress codec 从 req_body 计算.
 #[derive(Debug, Deserialize)]
@@ -127,6 +135,18 @@ pub(crate) struct GetRecordResponse {
     pub parsed_request: Option<serde_json::Value>,
     pub parsed_response: Option<serde_json::Value>,
     pub parse_error: Option<String>,
+}
+
+impl GetRecordResponse {
+    /// raw / meta 档的 envelope: 仅 record, parsed_*/parse_error 全 None.
+    fn record_only(record: ForwardRecord) -> Self {
+        Self {
+            record,
+            parsed_request: None,
+            parsed_response: None,
+            parse_error: None,
+        }
+    }
 }
 
 /// 解析 record 的 req body 为结构化 JSON (ingress writer 投影).
@@ -223,6 +243,64 @@ mod tests {
         r.streamed = streamed;
         r.resp_complete = true;
         r
+    }
+
+    /// 构造 meta-view 测试用的 NodeView (字段值仅服务于断言, 无业务含义).
+    fn meta_test_node_view() -> NodeView {
+        use crate::codec::ir::IrRole;
+        use crate::dag::RoundKind;
+        NodeView {
+            id: Uuid::new_v4(),
+            parent: None,
+            is_orphan: false,
+            session_id: crate::dag::SessionId(Uuid::new_v4()),
+            round_role: IrRole::User,
+            round_kind: RoundKind::Normal,
+            req_delta_count: 1,
+            has_response: true,
+            created_at: chrono::Utc::now(),
+            elapsed_ms: 42,
+            method: "POST".into(),
+            path: "/o/oa-main/v1/chat/completions".into(),
+            resp_status: 502,
+            redact_seed: 0,
+            preview: Some("meta-view-test".into()),
+            model: Some("test-model-abc".into()),
+            upstream_id: "oa-main".into(),
+            upstream_model: None,
+            streamed: false,
+            resp_complete: false,
+            audit_retained: true,
+            error: Some("upstream 502".into()),
+            redactions: vec![("mock-x".into(), "secret-1".into())].into(),
+            parsed_response: None,
+            req_delta_messages: Vec::new(),
+            leak_alerts: vec!["secret-1".into()],
+        }
+    }
+
+    #[test]
+    fn meta_view_omits_bodies_but_keeps_metadata() {
+        // view=meta (quant#305): detail/resp 双 None → bodies/headers/parsed 全空,
+        // 但 NodeView 元数据 (status/elapsed/model/error/leak_alerts 等) 照常到达 —
+        // 概览 tab 依赖这些字段, 缺一个就是 "加载中…" 永久占位.
+        let rec = build_forward_record(meta_test_node_view(), None, None);
+        assert_eq!(rec.method, "POST");
+        assert_eq!(rec.path, "/o/oa-main/v1/chat/completions");
+        assert_eq!(rec.model.as_deref(), Some("test-model-abc"));
+        assert_eq!(rec.upstream_id, "oa-main");
+        assert_eq!(rec.resp_status, 502);
+        assert_eq!(rec.elapsed_ms, 42);
+        assert!(!rec.resp_complete);
+        assert_eq!(rec.error.as_deref(), Some("upstream 502"));
+        assert_eq!(rec.redactions.len(), 1);
+        assert_eq!(rec.leak_alerts, vec!["secret-1".to_string()]);
+        // 大数据面: bodies / headers / parsed 必须为空 (概览不发大数据请求的 wire 保证).
+        assert!(rec.req_headers.is_empty());
+        assert!(rec.req_body.is_empty());
+        assert!(rec.resp_headers.is_empty());
+        assert!(rec.resp_body.is_empty());
+        assert!(rec.resp_parsed.is_none());
     }
 
     #[test]

@@ -7,7 +7,7 @@
  * 后端 API (session-aware sync):
  *   - POST /api/sync           统一轮询 (sidebar sessions + expanded rounds + timeline diff).
  *   - GET  /api/sessions/{sid}/timeline?before=&limit=  初始加载 + lazy load.
- *   - GET  /api/records/{id}   单条 record raw/parsed view (弹窗用, 保留).
+ *   - GET  /api/records/{id}   单条 record view (meta/raw/parsed, 轮次详情弹窗按需拉).
  *
  * 前端行为 (相对旧版的差异, 影响测试编写):
  *   - toggleSession 不再设置 state.selectedRound; 仅点击 round-item / sub-dot / timeline
@@ -132,6 +132,18 @@ async function findSessionLeafByPreview(page: Page, previewSubstr: string): Prom
 async function clickSessionByLeaf(page: Page, sid: string): Promise<void> {
   await page.locator(`.session-item[data-sid="${sid}"]`).click();
   await page.waitForSelector("#detail .request-pane", { timeout: 3000 });
+}
+
+/**
+ * 打开轮次详情弹窗并切到完整数据 tab (quant#305: 原 raw 弹窗内容的新位置).
+ * 断言 raw 内容的用例统一走此 helper — 弹窗结构若再变只改一处.
+ */
+async function openRoundDetailTab(page: Page): Promise<Locator> {
+  await page.locator("#detail .tl-actions button[data-action='detail']").click();
+  const dlg = page.locator("dialog.round-dialog");
+  await expect(dlg).toBeVisible();
+  await dlg.locator(".dialog-tab[data-tab='detail']").click();
+  return dlg;
 }
 
 /**
@@ -776,56 +788,120 @@ test.describe("IM 风格 WebUI 回归 (会话折叠版)", () => {
     await expect(page.locator(".tl-top-hint")).toHaveCount(0);
   });
 
-  // ─── Raw view 恢复 + Info icon + Response 单气泡 ──────────────────────────
+  // ─── 轮次详情弹窗 (quant#305: i/raw 合并 + 概览/完整数据 双 tab) ──────────
   //
-  // 验证三个功能:
-  //   1. 每轮 header 有 info (ℹ) + raw 按钮.
-  //   2. info 按钮弹出传输层元数据 (method/path/status, 无需网络请求).
-  //   3. raw 按钮弹出原始 req_body / resp_body (按需懒拉 /records/{id}).
-  //   4. response 窗口内只有一个 assistant 气泡 (不再因 tool_calls 拆分多个).
+  // 验证 (UI-9):
+  //   1. 每轮 header 只剩一个详情按钮 (原 i / raw 两入口合并).
+  //   2. 打开默认落在概览 tab: 元数据小字段 (model 等), 不含大数据.
+  //   3. 概览只发 view=meta 小请求; 完整数据 tab 首次激活才拉完整 record,
+  //      反复切换不重复拉取.
+  //   4. 完整数据 tab = 原 raw 弹窗内容 (headers + bodies).
 
-  test("info icon + raw 按钮: 弹窗展示传输层信息和原始 body", async ({ page }) => {
+  test("轮次详情弹窗: i/raw 合并入口 + 概览默认 + 完整数据按需 (quant#305)", async ({ page }) => {
     // 显式开启 full 捕获 — 本用例断言 req_body 内容 (默认 latest 对单轮会话
     // 头部也有 raw, 但显式 full 免受默认档演进影响).
     await setAuditCapture(page, true);
-    await sendChat(page, [{ role: "user", content: "info-raw-marker" }]);
-    const sid = await findSessionLeafByPreview(page, "info-raw-marker");
+    // 网络审计: 记录弹窗发起的 /api/records/{id} 请求的 view 档位 (无参数 = raw).
+    const recordViews: string[] = [];
+    page.on("request", (req) => {
+      const m = req.url().match(/\/api\/records\/[0-9a-f-]+(?:\?view=(\w+))?$/);
+      if (m) recordViews.push(m[1] || "raw");
+    });
+    await sendChat(page, [{ role: "user", content: "round-detail-tabs-marker" }]);
+    const sid = await findSessionLeafByPreview(page, "round-detail-tabs-marker");
     await clickSessionByLeaf(page, sid);
     await page.waitForTimeout(500);
 
-    // 每轮 header 应有 info + raw 按钮.
-    await expect(page.locator("#detail .tl-actions button[data-action='info']")).toHaveCount(1);
-    await expect(page.locator("#detail .tl-actions button[data-action='raw']")).toHaveCount(1);
+    // 合并入口: 仅一个 detail 按钮, 原独立 info / raw 按钮不再存在.
+    await expect(page.locator("#detail .tl-actions button[data-action='detail']")).toHaveCount(1);
+    await expect(page.locator("#detail .tl-actions button[data-action='info']")).toHaveCount(0);
+    await expect(page.locator("#detail .tl-actions button[data-action='raw']")).toHaveCount(0);
 
-    // 点击 info → 弹窗含传输层元数据 (method=POST, path 含 provider).
-    await page.locator("#detail .tl-actions button[data-action='info']").click();
-    await page.waitForTimeout(300);
-    const infoDialog = page.locator("dialog.round-dialog");
-    await expect(infoDialog).toBeVisible();
-    const infoText = await infoDialog.textContent();
-    expect(infoText).toContain("POST");
-    expect(infoText).toContain("Path");
-    expect(infoText).toContain("Status");
-    expect(infoText).toContain("Elapsed");
-    // M1 走查回归: Model 行异步补全后必须是请求的 model 值 (sendChat 默认
-    // test-model-abc), 而非 "(unknown)" — 历史缺陷: ForwardRecord 无 model 字段.
-    await expect(infoDialog).toContainText("test-model-abc", { timeout: 5000 });
-    // 关闭.
-    await page.locator("dialog.round-dialog .dialog-close").click();
+    // 打开 → 概览 tab 默认激活, 完整数据 pane 隐藏.
+    await page.locator("#detail .tl-actions button[data-action='detail']").click();
+    const dlg = page.locator("dialog.round-dialog");
+    await expect(dlg).toBeVisible();
+    await expect(dlg.locator(".dialog-tab.active[data-tab='overview']")).toHaveCount(1);
+    await expect(dlg.locator(".tab-pane[data-pane='overview']")).toBeVisible();
+    await expect(dlg.locator(".tab-pane[data-pane='detail']")).toBeHidden();
 
-    // 点击 raw → 弹窗含 req_body / resp_body (按需懒拉).
-    await page.locator("#detail .tl-actions button[data-action='raw']").click();
-    await page.waitForTimeout(500);  // 等待 fetch.
-    const rawDialog = page.locator("dialog.round-dialog");
-    await expect(rawDialog).toBeVisible();
-    const rawText = await rawDialog.textContent();
-    expect(rawText).toContain("Request Body");
-    expect(rawText).toContain("Response Body");
-    expect(rawText).toContain("Request Headers");
+    // 概览补全: meta 请求到达后 Model 行是请求的 model 值 (sendChat 默认
+    // test-model-abc). M1 走查回归: 历史 "Model 恒 (unknown)" 缺陷同判.
+    await expect(dlg).toContainText("test-model-abc", { timeout: 5000 });
+    // 概览不含大数据: 请求 body marker 不出现在概览 pane (只会在完整数据 tab).
+    const overviewText = await dlg.locator(".tab-pane[data-pane='overview']").textContent();
+    expect(overviewText, "概览 tab 不应包含请求 body 大数据").not.toContain("round-detail-tabs-marker");
+    // 概览期间网络: 只有 view=meta 小请求 (拉完整 record = 违反 UI-9 按需约束).
+    expect(recordViews, "概览阶段只应发 view=meta 请求").toEqual(["meta"]);
+
+    // 切到完整数据 tab → 懒拉完整 record, 原 raw 弹窗内容 (headers + bodies).
+    await dlg.locator(".dialog-tab[data-tab='detail']").click();
+    await expect(dlg.locator(".tab-pane[data-pane='detail']")).toBeVisible();
+    await expect(dlg.locator(".tab-pane[data-pane='overview']")).toBeHidden();
+    // 懒拉是异步的: 用 auto-retry 断言等加载完成 (而非立即读 Loading… 占位).
+    await expect(dlg.locator(".tab-pane[data-pane='detail']")).toContainText("Request Body", { timeout: 5000 });
+    const detailText = await dlg.locator(".tab-pane[data-pane='detail']").textContent();
+    expect(detailText).toContain("Request Body");
+    expect(detailText).toContain("Response Body");
+    expect(detailText).toContain("Request Headers");
     // req_body 应含发送的 marker.
-    expect(rawText).toContain("info-raw-marker");
+    expect(detailText).toContain("round-detail-tabs-marker");
+    expect(recordViews).toEqual(["meta", "raw"]);
+
+    // 反复切换不重复拉取 (rawLoadedFor 复用; 仍只有一次完整拉取).
+    await dlg.locator(".dialog-tab[data-tab='overview']").click();
+    await dlg.locator(".dialog-tab[data-tab='detail']").click();
+    await expect(dlg.locator(".tab-pane[data-pane='detail']")).toBeVisible();
+    expect(recordViews, "已加载的完整数据 pane 复用, 不重复拉取").toEqual(["meta", "raw"]);
     // 关闭.
-    await page.locator("dialog.round-dialog .dialog-close").click();
+    await dlg.locator(".dialog-close").click();
+  });
+
+  // 失败轮 "感叹号" 路径 (quant#305): 轮次 header 的 ERR 状态文本 (status-err)
+  // 可点击 → 打开轮次详情概览, 失败状态 (502) 与 method/path 等元数据可见.
+  test("失败轮 ERR 状态点击 → 轮次详情概览 (quant#305 感叹号路径)", async ({ page }) => {
+    await sendChat(page, [{ role: "user", content: "err-detail-marker trigger-502" }]);
+    const sid = await findSessionLeafByPreview(page, "err-detail-marker");
+    await clickSessionByLeaf(page, sid);
+    await page.waitForTimeout(500);
+
+    // timeline 轮次 header 的 status (statusClass: resp_status>=400 → status-err).
+    const roundStatus = page.locator("#detail .tl-round-header .status-err").first();
+    await expect(roundStatus).toHaveText("502");
+
+    // 点击 ERR → 轮次详情弹窗打开且落在概览 tab.
+    await roundStatus.click();
+    const dlg = page.locator("dialog.round-dialog");
+    await expect(dlg).toBeVisible();
+    await expect(dlg.locator(".dialog-tab.active[data-tab='overview']")).toHaveCount(1);
+    // 概览展示失败轮自身的元数据: meta 补全后的状态行 (502) 与 method.
+    await expect(dlg).toContainText("502", { timeout: 5000 });
+    await expect(dlg).toContainText("POST", { timeout: 5000 });
+    await dlg.locator(".dialog-close").click();
+  });
+
+  // meta 拉取失败路径: 概览的 meta 依赖字段不得停留 "(loading…)" 占位 —
+  // 必须转为失败文案 (关闭重开可重试), 否则用户面对 "永久加载中" 的误导.
+  test("meta 拉取失败: 概览 meta 依赖字段显示失败文案 (不留永久 loading)", async ({ page }) => {
+    await sendChat(page, [{ role: "user", content: "meta-fail-marker" }]);
+    const sid = await findSessionLeafByPreview(page, "meta-fail-marker");
+    await clickSessionByLeaf(page, sid);
+    await page.waitForTimeout(500);
+
+    // 拦截 meta 请求 → 网络错误 (仅 meta 档, 完整数据档不受影响).
+    await page.route("**/api/records/*?view=meta", (route) => route.abort());
+    await page.locator("#detail .tl-actions button[data-action='detail']").click();
+    const dlg = page.locator("dialog.round-dialog");
+    await expect(dlg).toBeVisible();
+    // Method 行从 "(loading…)" 转为失败文案 (raw.failedLoad).
+    await expect(dlg.locator(".tab-pane[data-pane='overview']")).toContainText(
+      "Failed to load record.",
+      { timeout: 5000 }
+    );
+    // 本地字段照常 (role/kind 等不受 meta 失败影响).
+    await expect(dlg.locator(".tab-pane[data-pane='overview']")).toContainText("user");
+    await page.unroute("**/api/records/*?view=meta");
+    await dlg.locator(".dialog-close").click();
   });
 
   test("response 单气泡: text + tool_calls 在同一气泡内 (子区域区分)", async ({ page }) => {
@@ -2307,7 +2383,7 @@ test.describe("WebUI 打磨 (#161 + #164)", () => {
     // 还原由 afterEach 幂等执行 (断言失败中断时也能恢复).
   });
 
-  test("#164-1: raw 弹窗 Response Body 带 (LLM view) 标注", async ({ page }) => {
+  test("#164-1: 完整数据 tab Response Body 带 (LLM view) 标注", async ({ page }) => {
     // 显式开启 full 捕获 — 标注分支只在捕获开启 (resp_body 有内容) 时出现.
     await setAuditCapture(page, true);
     await sendChat(page, [{ role: "user", content: "raw-llm-view-marker" }]);
@@ -2315,21 +2391,21 @@ test.describe("WebUI 打磨 (#161 + #164)", () => {
     await clickSessionByLeaf(page, sid);
     await page.waitForTimeout(500);
 
-    await page.locator("#detail .tl-actions button[data-action='raw']").click();
+    const dlg = await openRoundDetailTab(page);
     await page.waitForTimeout(500);
-    const rawText = await page.locator("dialog.round-dialog").textContent();
+    const rawText = await dlg.textContent();
     // 非流式响应: Response Body 区段应带 LLM view 标注 (含 mock 视角提示).
     expect(rawText).toContain("Response Body (LLM view");
-    await page.locator("dialog.round-dialog .dialog-close").click();
+    await dlg.locator(".dialog-close").click();
   });
 
-  test("#164-2: info 弹窗 Time 为本地时间, title 保留 UTC RFC3339", async ({ page }) => {
+  test("#164-2: 概览 tab Time 为本地时间, title 保留 UTC RFC3339", async ({ page }) => {
     await sendChat(page, [{ role: "user", content: "info-time-marker" }]);
     const sid = await findSessionLeafByPreview(page, "info-time-marker");
     await clickSessionByLeaf(page, sid);
     await page.waitForTimeout(500);
 
-    await page.locator("#detail .tl-actions button[data-action='info']").click();
+    await page.locator("#detail .tl-actions button[data-action='detail']").click();
     await page.waitForTimeout(300);
     const timeCell = page.locator("dialog.round-dialog .info-table tr", {
       has: page.locator("td.info-key", { hasText: "Time" }),
@@ -2397,7 +2473,7 @@ test.describe("B3: 详细日志开关 (audit capture)", () => {
     await expect(page.locator("#status")).toContainText("Audit log: Latest only");
   });
 
-  test("audit_capture off 时 raw 弹窗显示未捕获占位", async ({ page }) => {
+  test("audit_capture off 时完整数据 tab 显示未捕获占位", async ({ page }) => {
     // 显式 off + 非流式请求 — 占位优先于 streamed 空态: 非流式下旧 UI 会显示
     // "(empty)", B3 起必须显示未捕获占位. (quant#307 起默认 latest, off 需显式设置.)
     await setAuditCapture(page, false);
@@ -2406,15 +2482,16 @@ test.describe("B3: 详细日志开关 (audit capture)", () => {
     await clickSessionByLeaf(page, sid);
     await page.waitForTimeout(500);
 
-    await page.locator("#detail .tl-actions button[data-action='raw']").click();
+    const dlg = await openRoundDetailTab(page);
+    // 未捕获占位在完整数据 tab (原 raw 弹窗语义, quant#305 合并).
     await page.waitForTimeout(500); // 等待懒拉 record.
-    const rawText = await page.locator("dialog.round-dialog").textContent();
+    const rawText = await dlg.textContent();
     // req + resp 两个 body 区段均占位 (headers 照常展示).
     expect(rawText).toContain("not retained by the audit log");
     expect(rawText).toContain("Request Headers");
     // 占位分支不携带 "LLM view" 标注 (那是捕获开启时的语义).
     expect(rawText).not.toContain("LLM view");
-    await page.locator("dialog.round-dialog .dialog-close").click();
+    await dlg.locator(".dialog-close").click();
   });
 
   test("audit_capture off 时 usage 审计溯源弹窗同样占位", async ({ page }) => {
@@ -3523,17 +3600,17 @@ test.describe("i18n: 语言自动选择 + 切换 + 持久化 (#298)", () => {
 
   test("切换语言后已渲染轮次的动态文案跟随 (keyed 复用不残留)", async ({ page }) => {
     // 回归守卫 (review M1): keyed reconciliation 的复用分支不重绘已有轮次内容,
-    // 若语言切换只失效 fingerprint, 轮内烙进 DOM 的文案 (raw 按钮 title 等)
+    // 若语言切换只失效 fingerprint, 轮内烙进 DOM 的文案 (详情按钮 title 等)
     // 会残留旧语言 — 契约: 切换后全量重建 timeline。
     await sendChat(page, [{ role: "user", content: "i18n-round-marker" }]);
     const sid = await findSessionLeafByPreview(page, "i18n-round-marker");
     await clickSessionByLeaf(page, sid);
-    const rawBtn = page.locator("#detail .tl-actions button[data-action='raw']").first();
-    await expect(rawBtn).toHaveAttribute("title", "Raw data");
+    const detailBtn = page.locator("#detail .tl-actions button[data-action='detail']").first();
+    await expect(detailBtn).toHaveAttribute("title", "Round details");
     await expect(page.locator("#detail > .detail-header")).toContainText("Timeline (");
     // 切 zh → 轮内按钮 title + timeline header 都换语言 (不刷新页面).
     await page.locator("#lang-switch").selectOption("zh");
-    await expect(rawBtn).toHaveAttribute("title", "原始数据");
+    await expect(detailBtn).toHaveAttribute("title", "轮次详情");
     await expect(page.locator("#detail > .detail-header")).toContainText("时间线 (");
     // 轮次内容本体 (气泡) 不受重建影响。
     await expect(page.locator("#detail .request-pane .chat-bubble")).toContainText("i18n-round-marker");
@@ -3749,15 +3826,16 @@ test.describe("#257 S0.5: privacy scan (unregistered candidates)", () => {
   });
 });
 
-// ─── raw 弹窗大文本分段渲染 (quant#308 性能修复的行为钉子) ──────────────────
+// ─── 完整数据 tab 大文本分段渲染 (quant#308 性能修复的行为钉子) ──────────────
 //
-// 性能背景: 单个巨型 <pre> 的 layout+paint 是 raw 弹窗秒级卡顿的主导项
+// 性能背景: 单个巨型 <pre> 的 layout+paint 是 raw 内容秒级卡顿的主导项
 // (12MB body 初次渲染 ~700ms+, 弱 CPU 线性放大). 修复 = 超过阈值 (128KB) 的
 // body 按 64KB 切段, 每段 content-visibility:auto (屏外段跳过渲染).
 // 本组钉子守卫**观测语义不变**: 内容逐字符无损 (含 astral 字符跨段边界)、
-// 小 body 不走分段路径.
+// 小 body 不走分段路径. (quant#305 起原 raw 弹窗内容位于轮次详情的完整数据 tab,
+// 分段虚拟化行为必须原样保留; 打开路径走共享 helper openRoundDetailTab.)
 
-test.describe("raw 弹窗分段渲染 (quant#308)", () => {
+test.describe("完整数据 tab 分段渲染 (quant#308)", () => {
   // 前置: goto + 显式切回 records tab — sidebar 会话列表只在 records tab 可见
   // (共享 context 按声明顺序执行, 前序 describe 可能停在 secrets tab).
   test.beforeEach(async ({ page }) => {
@@ -3777,10 +3855,7 @@ test.describe("raw 弹窗分段渲染 (quant#308)", () => {
     await clickSessionByLeaf(page, sid);
     await page.waitForTimeout(500);
 
-    // 打开 raw 弹窗.
-    await page.locator("#detail .tl-actions button[data-action='raw']").click();
-    const rawDialog = page.locator("dialog.round-dialog");
-    await expect(rawDialog).toBeVisible();
+    const rawDialog = await openRoundDetailTab(page);
     await expect(rawDialog.locator(".raw-seg").first()).toBeVisible({ timeout: 10_000 });
     // Request Body (>128KB) 分段: 段数 > 1 (200KB / 64KB ≈ 4).
     const segCount = await rawDialog.locator(".raw-pre .raw-seg").count();
@@ -3812,9 +3887,7 @@ test.describe("raw 弹窗分段渲染 (quant#308)", () => {
     const sid = await findSessionLeafByPreview(page, "small-body-no-seg");
     await clickSessionByLeaf(page, sid);
     await page.waitForTimeout(500);
-    await page.locator("#detail .tl-actions button[data-action='raw']").click();
-    const rawDialog = page.locator("dialog.round-dialog");
-    await expect(rawDialog).toBeVisible();
+    const rawDialog = await openRoundDetailTab(page);
     await expect(rawDialog.locator("pre.raw-pre").first()).toBeVisible({ timeout: 10_000 });
     // 小 body (<128KB) 全部走单 pre 原路径 — 零 .raw-seg.
     await expect(rawDialog.locator(".raw-seg")).toHaveCount(0);

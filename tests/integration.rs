@@ -4681,6 +4681,65 @@ async fn web_api_records_view_parsed_gemini_returns_error() {
     );
 }
 
+#[tokio::test]
+async fn web_api_records_view_meta_omits_bodies_keeps_metadata() {
+    // quant#305 / UI-9: view=meta 是轮次详情弹窗概览 tab 的补全路径 — wire 保证:
+    // bodies / headers / parsed_* 全空 (概览不发大数据请求), 元数据 (method/path/
+    // model/status/error 等) 照常到达, envelope shape 与 raw/parsed 档一致.
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", mockito::Matcher::Any)
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"1","choices":[{"message":{"role":"assistant","content":"hi"}}]}"#)
+        .create_async()
+        .await;
+
+    let provider = provider_with("oa-main", Protocol::OpenAI, &upstream.url());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+    let _ = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        r#"{"model":"meta-view-model","messages":[{"role":"user","content":"meta-view-secret-marker"}]}"#,
+        &[],
+    )
+    .await;
+    let records = wait_for_record_count(&proxy_url, 1).await;
+    let id = records[0].id;
+
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{proxy_url}/api/records/{id}?view=meta"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rec = &body["record"];
+    // envelope shape 同 raw/parsed 档 (前端按固定 shape 消费).
+    assert_eq!(rec["id"], id.to_string());
+    assert!(body["parsed_request"].is_null());
+    assert!(body["parsed_response"].is_null());
+    assert!(body["parse_error"].is_null());
+    // 元数据照常 (概览 tab 的小字段).
+    assert_eq!(rec["method"], "POST");
+    assert_eq!(rec["path"], "/o/oa-main/v1/chat/completions");
+    assert_eq!(rec["model"], "meta-view-model");
+    assert_eq!(rec["resp_status"], 200);
+    // 大数据面必须清空: body marker 不得出现在任何字段 (wire 级 "概览无大数据").
+    assert_eq!(rec["req_body"], "");
+    assert_eq!(rec["resp_body"], "");
+    assert_eq!(rec["req_headers"].as_array().unwrap().len(), 0);
+    assert_eq!(rec["resp_headers"].as_array().unwrap().len(), 0);
+    assert!(rec["resp_parsed"].is_null());
+    let raw = serde_json::to_string(&body).unwrap();
+    assert!(
+        !raw.contains("meta-view-secret-marker"),
+        "view=meta 响应不得携带请求 body 内容"
+    );
+}
+
 // ─── SEC-4: [redact] redacted_headers 自定义脱敏名单 (端到端) ────────────────
 //
 // 契约 (docs/design/contracts.md §7 SEC-4): 配置进 [redact] redacted_headers 的

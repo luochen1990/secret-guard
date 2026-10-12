@@ -838,8 +838,9 @@
 
     /* 泄露警示徽章 (#305 批2): placeholder 策略蜜罐检测命中 (leak_alerts 非空) 的
        轮次 header 渲染. 响应侧事后信号, round header 内的纯增量元素 — 不触碰
-       气泡数等式 (UI-1) 与 .tl-round 顺序/数量语义 (I2/I3). warn 色系 + help
-       光标 (原生 title tooltip 列 secret ids, 报警数据不含真值 — SEC-1 同型). */
+       气泡数等式 (UI-1) 与 .tl-round 顺序/数量语义 (I2/I3). warn 色系.
+       quant#305: 徽章可点击 → 打开轮次详情弹窗 (概览 tab 含 leak banner),
+       光标改 pointer (title tooltip 照常列 secret ids, 报警数据不含真值 — SEC-1 同型). */
     .leak-badge {
       background: var(--warn-soft);
       border: 1px solid var(--warn-line);
@@ -848,8 +849,13 @@
       border-radius: 999px;
       font-size: 10.5px;
       font-weight: 600;
-      cursor: help;
+      cursor: pointer;
     }
+
+    /* 失败轮 "感叹号" 入口 (quant#305): 轮次 header 的 ERR/4xx/5xx 状态文本
+       可点击 → 打开轮次详情弹窗 (概览 tab 含错误横幅 + 状态行). 仅限 timeline
+       header 内的 .status-err (sidebar 状态列 / drawer 错误横幅不受影响). */
+    .tl-round-header .status-err { cursor: pointer; }
 
     /* ─── F1: table cell ellipsis + hover tooltip ─────────────────────────── */
     /* 每个 td 内的内容用 .cell-ellipsis 包裹, 限制 max-width 并在溢出时显示省略号.
@@ -1195,7 +1201,7 @@
     }
     dialog.bubble-full mark.secret-hit { font-weight: 600; }
 
-    /* 轮次弹窗 (info / raw): 传输层元数据 + 原始 body. */
+    /* 轮次详情弹窗 (quant#305): 概览 (元数据小字段) + 完整数据 (raw req/resp) 双 tab. */
     dialog.round-dialog {
       max-width: 80vw;
       max-height: 85vh;
@@ -1211,11 +1217,34 @@
       font-weight: 600;
       color: var(--fg);
     }
+    /* tab 行: active 底边高亮 (下划线式, 无重背景) */
+    dialog.round-dialog .dialog-tabs {
+      display: flex;
+      gap: 4px;
+      border-bottom: 1px solid var(--border-faint);
+      margin-bottom: 8px;
+    }
+    dialog.round-dialog .dialog-tab {
+      background: none;
+      border: none;
+      border-bottom: 2px solid transparent;
+      padding: 4px 12px;
+      font-size: 12.5px;
+      color: var(--fg-muted);
+      cursor: pointer;
+    }
+    dialog.round-dialog .dialog-tab.active {
+      color: var(--fg);
+      font-weight: 600;
+      border-bottom-color: var(--accent);
+    }
     dialog.round-dialog .dialog-body {
       max-height: 72vh;
       overflow-y: auto;
       font-size: 12px;
     }
+    /* 概览顶部的 error/leak banner: 弹窗内贴顶排布 (覆盖 .banner 默认 margin) */
+    dialog.round-dialog .banner { margin: 0 0 8px; }
     /* info 表格 */
     dialog.round-dialog .info-table { border-collapse: collapse; width: 100%; }
     dialog.round-dialog .info-table td {
@@ -2329,8 +2358,9 @@
         'timeline.loadFailed': 'Failed to load timeline: {msg}',
         'timeline.header': 'Timeline ({rounds} rounds{user})',
         'timeline.headerUser': ', {n} user',
-        'timeline.infoTitle': 'Transport info',
-        'timeline.rawTitle': 'Raw data',
+        'timeline.detailTitle': 'Round details',
+        'round.tabOverview': 'Overview',
+        'round.tabDetail': 'Full data',
         'timeline.retryBadge': '↻ retry — identical messages',
         'timeline.leakBadge': '⚠ leak',
         'timeline.leakTip': 'Suspected leak: the model response contained the real value of secret(s): {ids}',
@@ -2369,12 +2399,12 @@
         'info.streamed': 'Streamed',
         'info.complete': 'Complete',
         'info.model': 'Model',
-        'info.error': 'Error',
         'info.redactions': 'Redactions',
         'info.upstream': 'Upstream',
         'info.upstreamModel': 'Upstream Model',
+        'info.usage': 'Usage',
+        'info.usageValue': 'in {i} · out {o} · cache read {r} · cache write {w}',
         'info.loadingValue': '(loading…)',
-        'info.historyRound': '(history round)',
         'info.yes': 'yes',
         'info.no': 'no',
         'info.noneValue': 'none',
@@ -2792,8 +2822,9 @@
         'timeline.loadFailed': '时间线加载失败: {msg}',
         'timeline.header': '时间线 ({rounds} 轮{user})',
         'timeline.headerUser': '，{n} 用户轮',
-        'timeline.infoTitle': '传输层信息',
-        'timeline.rawTitle': '原始数据',
+        'timeline.detailTitle': '轮次详情',
+        'round.tabOverview': '概览',
+        'round.tabDetail': '完整数据',
         'timeline.retryBadge': '↻ 重试 — 消息完全相同',
         'timeline.leakBadge': '⚠ 疑似泄露',
         'timeline.leakTip': '疑似泄露: 模型响应中出现了以下 secret 的真值: {ids}',
@@ -2832,12 +2863,12 @@
         'info.streamed': '流式',
         'info.complete': '完整',
         'info.model': '模型',
-        'info.error': '错误',
         'info.redactions': '脱敏',
         'info.upstream': '上游',
         'info.upstreamModel': '上游模型',
+        'info.usage': '用量',
+        'info.usageValue': '输入 {i} · 输出 {o} · 缓存读 {r} · 缓存写 {w}',
         'info.loadingValue': '(加载中…)',
-        'info.historyRound': '(历史轮次)',
         'info.yes': '是',
         'info.no': '否',
         'info.noneValue': '无',
@@ -3227,7 +3258,7 @@
       if (state.timelineRecords.length > 0 || state.selectedSession) {
         // timeline 走**全量重建**而非 fingerprint 失效重画: keyed reconciliation
         // 的复用分支刻意不重绘已有轮次内容 (滚动/折叠保持), 已有轮次内烙进 DOM
-        // 的文案 (expand toggle / retry 徽章 / ℹ·raw 按钮 title / role label)
+        // 的文案 (expand toggle / retry 徽章 / ℹ 详情按钮 title / role label)
         // 会残留旧语言 — 清空后由 reconcile 全新构建 (review M1)。
         state.lastTimelineFingerprint = '';
         document.getElementById('detail').innerHTML = '';
@@ -3273,8 +3304,8 @@
     // 集中管理 API URL.
     // 注: 旧的 GET /api/records (扁平分页) + GET /api/nodes/{id}/timeline 已删除,
     // 由 session-aware 的 POST /api/sync + GET /api/sessions/{sid}/timeline 替代.
-    // /api/records/{id} 保留 (raw view 弹窗按需拉). /api/sessions 保留 (首次加载 sidebar).
-    const API_RECORDS = '/api/records';        // + '/{id}' 详情 (raw view 弹窗用)
+    // /api/records/{id} 保留 (轮次详情弹窗按需拉: meta/完整数据两档 view). /api/sessions 保留 (首次加载 sidebar).
+    const API_RECORDS = '/api/records';        // + '/{id}' 详情 (轮次详情弹窗用, ?view=meta|raw|parsed)
     const API_SESSIONS = '/api/sessions';      // + '/{sid}/timeline' 分页 + 列表
     const API_SYNC = '/api/sync';              // POST 统一轮询 (sidebar + timeline diff)
     const API_SECRETS = '/api/secrets';
@@ -4459,22 +4490,30 @@
       await selectRound(records[records.length - 1].id, { scroll: 'bottom' });
     }
 
-    // 绑定每轮的 info / raw 按钮 + 轮次选中 的事件委托 (挂在稳定的 #detail 上, 全量重建后无需重绑).
+    // 绑定每轮的详情按钮 + 警示标记 + 轮次选中 的事件委托 (挂在稳定的 #detail 上, 全量重建后无需重绑).
     function bindRoundActions() {
       const detail = document.getElementById('detail');
       if (!detail || detail.dataset.roundActionsBound) return;
       detail.dataset.roundActionsBound = '1';
       detail.addEventListener('click', (ev) => {
-        // 1. info / raw 按钮 (优先处理, 阻止冒泡).
+        // 1. 详情按钮 (quant#305: 原 i / raw 两按钮合并为单入口, 优先处理, 阻止冒泡).
         const btn = ev.target.closest('.tl-actions button[data-action]');
         if (btn) {
           ev.stopPropagation();
-          const { action, rid } = btn.dataset;
-          if (action === 'info') openRoundInfo(rid);
-          else if (action === 'raw') openRoundRaw(rid);
+          openRoundDetail(btn.dataset.rid);
           return;
         }
-        // 2. 点击轮次 header 区域 → 选中该轮 (issue #36: 选中气泡/轮次设置全局高亮状态).
+        // 2. 警示标记 ("感叹号"入口, quant#305): 失败轮 ERR 状态文本 / ⚠ 泄露徽章
+        //    → 打开轮次详情 (错误横幅 / leak banner 落在概览 tab). 必须先于 header
+        //    兜底分支并 stopPropagation, 否则被 "点 header 选轮" 吞掉.
+        const warn = ev.target.closest('.tl-round-header .status-err, .tl-round-header .leak-badge');
+        if (warn) {
+          ev.stopPropagation();
+          const rid = warn.closest('.tl-round')?.dataset.rid;
+          if (rid) openRoundDetail(rid);
+          return;
+        }
+        // 3. 点击轮次 header 区域 → 选中该轮 (issue #36: 选中气泡/轮次设置全局高亮状态).
         //    不在气泡内容上触发 (避免与气泡折叠/展开/全文冲突), 仅 header 区域可选.
         const header = ev.target.closest('.tl-round-header');
         if (header) {
@@ -4491,7 +4530,7 @@
     }
 
     // 按 id 拉取完整 ForwardRecord (含 req_body / resp_body / headers).
-    // 用于 raw view + info 弹窗的 headers 展示. 失败返回 null.
+    // 用于轮次详情弹窗的完整数据 tab. 失败返回 null.
     const recordDetailCache = new Map();  // id → ForwardRecord (会话内复用)
     async function fetchRecordDetail(id) {
       if (recordDetailCache.has(id)) return recordDetailCache.get(id);
@@ -4508,72 +4547,114 @@
       }
     }
 
-    // 打开 info 弹窗: 传输层元数据.
+    // ─── 轮次详情弹窗 (quant#305: i/raw 合并, 概览/完整数据 双 tab) ─────────
     //
-    // 字段来源:
-    // - TimelineRound (本地): id / round_role / created_at / redactions.
-    // - state.tail (末轮视图, 仅当该 round 是末轮时可用): resp_status / elapsed_ms /
-    //   streamed / resp_complete / error. 非末轮显示 "(history round)" — Phase A 决策:
-    //   history round 的 response 已被下一轮 delta 消费, 不显示 ForwardRecord 的值避免误导.
-    // - GET /api/records/{id} (异步懒拉): method / path / model.
+    // 信息架构 (用户方案, quant#305):
+    // - 概览 tab (默认): 元数据小字段, 不含大数据. 本地字段 (TimelineRound + 末轮
+    //   tail) 即时渲染; `GET /api/records/{id}?view=meta` (bodies 清空的小响应)
+    //   异步补全 method/path/model + 每轮自身的 status/elapsed/streamed/complete/
+    //   error — 历史轮不再显示 "(历史轮次)" 占位: meta 来自该轮 NodeView, 是每轮
+    //   自身的权威事实 (旧 info 弹窗为拉这些字段取的是完整 record, MB 级 body 只为
+    //   读 3 个小字段 — meta view 即为此拆出).
+    // - 完整数据 tab: 原 raw 弹窗内容 (req/resp headers + bodies), 按需懒拉 —
+    //   首次激活该 tab 才 fetch 完整 record, 概览路径零大数据请求; 大 body 分段
+    //   虚拟化 (rawBodyPre, quant#308) 照常生效.
     //
-    // 即时渲染本地字段 → 异步拉 detail 补全 (renderRows upsert by label).
-    async function openRoundInfo(id) {
+    // 弹窗单例状态 (dataset): rid = 当前轮次; tab = 当前 tab; rawLoadedFor =
+    // 完整数据 pane 已渲染的 rid (换轮/重开时重置, 防串轮 + 支持失败重拉).
+
+    // 按 id 拉取 record 元数据 (view=meta, 小响应: bodies/headers 清空). 概览 tab
+    // 专用. 不缓存: 响应微小 (~1KB), 且轮次状态随时间演进 (在途轮的 status/error
+    // 会更新), 每次打开取最新值比省这个请求更重要 (对比: 完整 record 大, 才有缓存价值).
+    async function fetchRecordMeta(id) {
+      try {
+        const r = await fetch(`${API_RECORDS}/${id}?view=meta`, { cache: 'no-store' });
+        if (!r.ok) return null;
+        const data = await r.json();
+        return data.record || null;
+      } catch (e) {
+        console.error('fetchRecordMeta failed:', e);
+        return null;
+      }
+    }
+
+    // 打开轮次详情弹窗: 概览 tab 默认激活 (本地字段即时渲染) → meta 异步补全.
+    async function openRoundDetail(id) {
       const r = findRound(id);
       if (!r) return;
+      const dlg = openRoundDialog(id);
+      renderRoundOverview(dlg, r, null);
+      // 异步补全概览 (meta 小字段). 只覆写概览 pane, 不触碰完整数据 pane.
+      // 加载失败也重渲染一次 (metaFailed): meta 依赖字段从 "(加载中…)" 转为
+      // 失败文案, 不留 "永久加载中" 的误导 (关闭重开可重试).
+      const rec = await fetchRecordMeta(id);
+      if (dlg.dataset.rid !== id) return;  // 用户已切换/关闭.
+      renderRoundOverview(dlg, r, rec, !rec);
+    }
+
+    // usage 有效判据 (header 徽章与概览行共用, SSOT): 无回显或全零 = 无信息量.
+    const hasUsage = u => !!u && (u.input | u.output | u.cache_read | u.cache_write) !== 0;
+
+    // 渲染概览 tab. rec = meta 补全结果 (null = 未到达; metaFailed = meta 拉取失败,
+    // 此时 meta 依赖字段显示失败文案而非 "(加载中…)"). 末轮的 response 类字段先用
+    // state.tail 即时显示 (meta 到达前), 非 meta 依赖字段全部本地即时.
+    //
+    // 泄露警示块 (#305 批2): leak_alerts 非空 → 表格上方 warn banner 列 secret ids
+    // (报警数据不含真值, SEC-1 同型). ids 经 escapeHtml 后插值 (innerHTML 路径).
+    // 失败轮错误 (quant#305): error 非空 → 顶部红 banner — 错误是失败轮的关键信息,
+    // 混在表格行里会被淹没 (与 response drawer 的错误横幅同型). 数据源两态: 初渲染
+    // 取 tail (仅末轮), meta 到达后以 ForwardRecord 为准 (全部轮次).
+    function renderRoundOverview(dlg, r, rec, metaFailed) {
+      const ABSENT = metaFailed ? t('raw.failedLoad') : t('info.loadingValue');
       const redactionN = (r.redactions || []).length;
-      // 末轮 tail 字段: 仅当 id 是末轮时取 state.tail (round_id 匹配).
+      // 末轮 tail 字段: 仅当 r 是末轮时可用 (round_id 匹配), 作为 meta 到达前的即时值.
       // (局部变量命名 tail — t 已被 i18n 取词函数占用, 勿再缩写为 t.)
       const isLastRound = state.timelineRecords.length > 0
-        && state.timelineRecords[state.timelineRecords.length - 1].id === id;
+        && state.timelineRecords[state.timelineRecords.length - 1].id === r.id;
       const tail = isLastRound ? state.tail : null;
-      const HIST = t('info.historyRound');
-      // 泄露警示块 (#305 批2): leak_alerts 非空 → 表格上方 warn banner 列 secret ids
-      // (报警数据不含真值, SEC-1 同型). ids 经 escapeHtml 后插值 (innerHTML 路径).
-      const leakBannerHtml = ids => (ids && ids.length > 0)
-        ? `<div class="banner" style="margin: 0 0 8px 0;">${t('info.leakBanner', { ids: escapeHtml(ids.join(', ')) })}</div>`
-        : '';
-      // Time 与 sidebar/timeline 同一格式化函数 (SSOT, #164-2); 原始 UTC RFC3339
-      // 放 title tooltip (开发者向 hover 可见).
-      let rows = {
+      // 取值规则: meta 依赖字段 → 到达取值 (缺则 unknown) / 未到加载中 / 失败给失败
+      // 文案; response 类字段优先级 meta (每轮权威) > tail (末轮即时) > 未到/失败文案.
+      const metaVal = v => rec ? (v || t('common.unknown')) : ABSENT;
+      const respVal = fmt => (rec || tail) ? fmt(rec || tail) : ABSENT;
+      const rows = {
         [t('info.roundId')]: r.id,
         [t('info.role')]: r.round_role || t('common.unknown'),
         [t('info.kind')]: r.round_kind || t('info.normal'),
         [t('info.time')]: r.created_at,
-        [t('info.method')]: t('info.loadingValue'),
-        [t('info.path')]: t('info.loadingValue'),
-        [t('info.status')]: tail ? (tail.resp_status === 0 ? t('timeline.pending') : String(tail.resp_status)) : HIST,
-        [t('info.elapsed')]: tail ? `${tail.elapsed_ms} ms` : HIST,
-        [t('info.streamed')]: tail ? (tail.streamed ? t('info.yes') : t('info.no')) : HIST,
-        [t('info.complete')]: tail ? (tail.resp_complete ? t('info.yes') : t('info.no')) : HIST,
-        [t('info.model')]: t('info.loadingValue'),
-        [t('info.error')]: tail?.error || t('info.noneValue'),
+        [t('info.upstream')]: r.upstream_id || t('common.unknown'),
+        [t('info.method')]: metaVal(rec?.method),
+        [t('info.path')]: metaVal(rec?.path),
+        [t('info.model')]: metaVal(rec?.model),
+        [t('info.status')]: respVal(s => s.resp_status === 0 ? t('timeline.pending') : String(s.resp_status)),
+        [t('info.elapsed')]: respVal(s => `${s.elapsed_ms} ms`),
+        [t('info.streamed')]: respVal(s => s.streamed ? t('info.yes') : t('info.no')),
+        [t('info.complete')]: respVal(s => s.resp_complete ? t('info.yes') : t('info.no')),
         [t('info.redactions')]: redactionN > 0 ? t('info.hitsValue', { n: redactionN }) : t('info.noneValue'),
       };
-      // 泄漏 ids 数据源两态: 初渲染取 TimelineRound.leak_alerts (本地, 可能滞后),
-      // 异步补全时以 ForwardRecord.leak_alerts (实时 GET) 为准.
-      let leakIds = r.leak_alerts || [];
-      const renderRows = () => leakBannerHtml(leakIds) + `<table class="info-table">${Object.entries(rows).map(([k, v]) => {
-        // Time 行: 本地时间 (formatTime, 与 sidebar 一致) + title 保留原始 UTC.
+      // #183: 仅 override 实际改写时显示 (None = 透传, 不加行以免噪音).
+      if (rec?.upstream_model) rows[t('info.upstreamModel')] = rec.upstream_model;
+      // token 用量行 (quant#305): 判据与 usage 徽章共用 (hasUsage, 无回显/全零不渲染).
+      const u = r.usage;
+      if (hasUsage(u)) {
+        rows[t('info.usage')] = t('info.usageValue', {
+          i: fmtTokens(u.input), o: fmtTokens(u.output),
+          r: fmtTokens(u.cache_read), w: fmtTokens(u.cache_write),
+        });
+      }
+      const errText = (rec || tail)?.error || '';
+      const leakIds = (rec ? rec.leak_alerts : r.leak_alerts) || [];
+      const banners =
+        (errText ? `<div class="banner status-err">${t('timeline.errorBanner', { msg: escapeHtml(errText) })}</div>` : '')
+        + (leakIds.length > 0 ? `<div class="banner">${t('info.leakBanner', { ids: escapeHtml(leakIds.join(', ')) })}</div>` : '');
+      // Time 与 sidebar/timeline 同一格式化函数 (SSOT, #164-2); 原始 UTC RFC3339
+      // 放 title tooltip (开发者向 hover 可见).
+      const tableHtml = `<table class="info-table">${Object.entries(rows).map(([k, v]) => {
         if (k === t('info.time')) {
           return `<tr><td class="info-key">${escapeHtml(k)}</td><td class="info-val" title="${escapeHtml(v)}">${escapeHtml(formatTime(v))}</td></tr>`;
         }
         return `<tr><td class="info-key">${escapeHtml(k)}</td><td class="info-val">${escapeHtml(v)}</td></tr>`;
       }).join('')}</table>`;
-      openRoundDialog(t('timeline.infoTitle'), renderRows(), id);
-      // 异步补全 method/path/model (ForwardRecord 字段, 不在 TimelineRound 中).
-      const rec = await fetchRecordDetail(id);
-      const dlg = document.getElementById('round-dialog');
-      if (!dlg || dlg.dataset.rid !== id) return;  // 用户已切换/关闭.
-      if (!rec) return;  // 加载失败保留现有信息.
-      rows[t('info.method')] = rec.method || t('common.unknown');
-      rows[t('info.path')] = rec.path || t('common.unknown');
-      rows[t('info.upstream')] = rec.upstream_id || t('common.unknown');
-      // #183: 仅 override 实际改写时显示 (None = 透传, 不加行以免噪音).
-      if (rec.upstream_model) rows[t('info.upstreamModel')] = rec.upstream_model;
-      rows[t('info.model')] = rec.model || t('common.unknown');
-      leakIds = rec.leak_alerts || [];
-      dlg.querySelector('.dialog-body').innerHTML = renderRows();
+      dlg.querySelector('.tab-pane[data-pane="overview"]').innerHTML = banners + tableHtml;
     }
 
     // 大 body 分段渲染 (quant#308): LLM 请求体是累积对话形态, 几十轮会话末轮可达
@@ -4607,14 +4688,14 @@
       return `<pre class="raw-pre">${segHtml}</pre>`;
     }
 
-    // 打开 raw view 弹窗: 按需懒拉 ForwardRecord, 展示 req_body / resp_body / headers.
-    async function openRoundRaw(id) {
-      openRoundDialog(t('timeline.rawTitle'), `<div class="raw-loading">${t('common.loading')}</div>`, id);
-      const rec = await fetchRecordDetail(id);
-      const dlg = document.getElementById('round-dialog');
-      if (!dlg || dlg.dataset.rid !== id) return;  // 用户已切换/关闭
+    // 渲染完整数据 tab (原 raw 弹窗内容): req/resp headers + bodies.
+    // 由 switchRoundTab 首次激活时懒加载调用; rec 为 null 时渲染失败占位
+    // (rawLoadedFor 已被调用方清除 — 切走再切回该 tab 可重试; 停留原地再点
+    // 当前 tab 按钮是 no-op, 不触发重拉).
+    function renderRoundDetailPane(dlg, rec) {
+      const pane = dlg.querySelector('.tab-pane[data-pane="detail"]');
       if (!rec) {
-        dlg.querySelector('.dialog-body').innerHTML = `<div class="raw-loading">${t('raw.failedLoad')}</div>`;
+        pane.innerHTML = `<div class="raw-loading">${t('raw.failedLoad')}</div>`;
         return;
       }
       // 标注语义 (#164-1): req/resp body 存的都是 LLM 视角原文 — request 已 redact
@@ -4640,16 +4721,39 @@
         [t('raw.responseHeaders'), '', formatHeaders(rec.resp_headers)],
         [t('raw.responseBody'), ...respBody],
       ];
-      const bodyHtml = sections.map(([label, note, body]) => `
+      pane.innerHTML = sections.map(([label, note, body]) => `
         <div class="raw-section">
           <div class="raw-label">${escapeHtml(label)}${note ? `<span class="raw-note"> ${escapeHtml(note)}</span>` : ''}</div>
           ${rawBodyPre(body)}
         </div>`).join('');
-      dlg.querySelector('.dialog-body').innerHTML = bodyHtml;
     }
 
-    // 通用轮次弹窗 (info / raw 共用). 内容由 bodyHtml 决定.
-    function openRoundDialog(title, bodyHtml, rid) {
+    // 切换弹窗 tab. 完整数据 tab 首次激活 (针对当前轮) 时懒拉完整 record —
+    // 概览路径零大数据请求 (quant#305); 已加载则复用, 反复切换不重复拉取.
+    async function switchRoundTab(dlg, tab) {
+      dlg.dataset.tab = tab;
+      dlg.querySelectorAll('.dialog-tab').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+      dlg.querySelectorAll('.dialog-body .tab-pane').forEach(p => { p.hidden = p.dataset.pane !== tab; });
+      if (tab !== 'detail' || dlg.dataset.rawLoadedFor === dlg.dataset.rid) return;
+      const id = dlg.dataset.rid;
+      dlg.dataset.rawLoadedFor = id;  // 先占位防并发双击双拉; 失败时清除以允许重试.
+      dlg.querySelector('.tab-pane[data-pane="detail"]').innerHTML =
+        `<div class="raw-loading">${t('common.loading')}</div>`;
+      const rec = await fetchRecordDetail(id);
+      if (dlg.dataset.rid !== id) return;  // 弹窗已关闭/换轮 (下次打开会重置).
+      if (!rec) {
+        delete dlg.dataset.rawLoadedFor;
+        renderRoundDetailPane(dlg, null);
+        return;
+      }
+      renderRoundDetailPane(dlg, rec);
+    }
+
+    // 通用轮次详情弹窗 (概览 / 完整数据 双 tab). dialog 单例创建一次复用; 每次
+    // 打开重置到概览 tab + 清空完整数据 pane (懒加载状态随轮次重置, 防串轮).
+    // 文案每次打开随当前语言刷新 (单例长生命周期, 语言切换后重开不残留旧文案).
+    // 返回 dialog 元素 (调用方继续填充概览 pane).
+    function openRoundDialog(rid) {
       let dlg = document.getElementById('round-dialog');
       if (!dlg) {
         dlg = document.createElement('dialog');
@@ -4658,18 +4762,36 @@
         dlg.innerHTML = `
           <div class="dialog-header">
             <span class="dialog-title"></span>
-            <button type="button" class="btn dialog-close">${t('common.close')}</button>
+            <button type="button" class="btn dialog-close"></button>
           </div>
-          <div class="dialog-body"></div>
+          <div class="dialog-tabs">
+            <button type="button" class="dialog-tab" data-tab="overview"></button>
+            <button type="button" class="dialog-tab" data-tab="detail"></button>
+          </div>
+          <div class="dialog-body">
+            <div class="tab-pane" data-pane="overview"></div>
+            <div class="tab-pane" data-pane="detail" hidden></div>
+          </div>
         `;
         document.body.appendChild(dlg);
         dlg.querySelector('.dialog-close').addEventListener('click', () => dlg.close());
         dlg.addEventListener('click', (ev) => { if (ev.target === dlg) dlg.close(); });
+        dlg.querySelector('.dialog-tabs').addEventListener('click', (ev) => {
+          const tab = ev.target.closest('.dialog-tab')?.dataset.tab;
+          if (tab && tab !== dlg.dataset.tab) switchRoundTab(dlg, tab);
+        });
       }
       dlg.dataset.rid = rid;
-      dlg.querySelector('.dialog-title').textContent = title;
-      dlg.querySelector('.dialog-body').innerHTML = bodyHtml;
+      delete dlg.dataset.rawLoadedFor;
+      dlg.querySelector('.dialog-title').textContent = t('timeline.detailTitle');
+      dlg.querySelector('.dialog-close').textContent = t('common.close');
+      dlg.querySelectorAll('.dialog-tab').forEach(b => {
+        b.textContent = t(b.dataset.tab === 'overview' ? 'round.tabOverview' : 'round.tabDetail');
+      });
+      dlg.querySelector('.tab-pane[data-pane="detail"]').innerHTML = '';
+      switchRoundTab(dlg, 'overview');
       dlg.showModal();
+      return dlg;
     }
 
     // timeline header 文本 (round count + user count), renderTimelineHtml 与
@@ -4744,11 +4866,11 @@
     }
 
     /**
-     * 每轮 / 每会话的 usage 徽章 HTML. u 为 null/undefined (无回显) 或全零 → ''
-     * (全零也隐藏: 无信息量, 避免 sidebar 噪音).
+     * 每轮 / 每会话的 usage 徽章 HTML. 判据与概览行共用 (hasUsage): 无回显或全零
+     * → '' (全零也隐藏: 无信息量, 避免 sidebar 噪音).
      */
     function usageBadgeHtml(u, prefix) {
-      if (!u || (u.input | u.output | u.cache_read | u.cache_write) === 0) return '';
+      if (!hasUsage(u)) return '';
       const p = prefix || '';
       return `<span class="usage-badge" title="${usageTitle(u)}">${p}<b>↑${fmtTokens(u.input)}</b> ↓${fmtTokens(u.output)}</span>`;
     }
@@ -4772,8 +4894,7 @@
           ${upstreamChip(r, pathId)}
         </span>
         <span class="tl-actions">
-          <button type="button" data-action="info" data-rid="${escapeHtml(r.id)}" title="${escapeHtml(t('timeline.infoTitle'))}">ℹ</button>
-          <button type="button" data-action="raw" data-rid="${escapeHtml(r.id)}" title="${escapeHtml(t('timeline.rawTitle'))}">raw</button>
+          <button type="button" data-action="detail" data-rid="${escapeHtml(r.id)}" title="${escapeHtml(t('timeline.detailTitle'))}">ℹ</button>
         </span>
       </div>`;
       // request-pane: 渲染本轮完整 delta (含 assistant 作为无源气泡).

@@ -10,7 +10,7 @@
   - `mod.rs` — 模块根 + handler re-export (`web::api::<handler>` 路径稳定).
   - `error.rs` — `ApiError` 统一错误类型.
   - `crud.rs` — secrets/providers 共享的 CRUD 泛型流程 (`EffectiveItem` + `CrudTable` + create/update/delete/decision flow, 错误消息经 kind_label 参数化).
-  - `records.rs` — `GET /records/{id}` 单条 raw + parsed view (弹窗按需拉).
+  - `records.rs` — `GET /records/{id}` 单条 view 端点 (meta/raw/parsed 三档, 弹窗按需拉).
   - `sessions.rs` — `GET /sessions` + `GET /sessions/{sid}/timeline` + `POST /sync` (session-aware timeline API).
   - `secrets.rs` / `providers.rs` — 各自 CRUD (5 endpoints), handler 是 crud.rs 泛型流程的薄壳.
     providers.rs 另含 `POST /providers/probe` (协议自动探测): base_url 校验后的薄壳,
@@ -42,8 +42,11 @@
 ## API endpoints
 
 ```
-GET    /api/records/{id}[?view=parsed]   → {record, parsed_request?, parsed_response?, parse_error?}
-                                                 (单条 raw + parsed view, WebUI 弹窗按需拉)
+GET    /api/records/{id}[?view=meta|parsed]
+                                                → {record, parsed_request?, parsed_response?, parse_error?}
+                                                  (单条 record view: 缺省/raw=全文, meta=仅元数据
+                                                   (bodies 清空, quant#305), parsed=parsed view;
+                                                   WebUI 轮次详情弹窗按需拉)
 GET    /api/sessions                     → {sessions, total}  (叶子节点, latest-first)
 GET    /api/sessions/{sid}/timeline[?before=UUID&limit=N]
                                                → TimelinePage {rounds, tail, has_more}
@@ -170,12 +173,14 @@ GET    /api/privacy-scan/alerts     → {enabled, alerts[{value, pattern_id,
 
 ### Records parsed view (单条按需拉取)
 
+`?view=meta` (quant#305) 只返回元数据 (bodies/headers/parsed 清空, 其余字段照常)
+— 轮次详情弹窗概览 tab 的小字段补全路径, 不为几行元数据传输 MB 级 body.
 `?view=parsed` 返回 `parsed_request` (从 `req_body` 按需用 ingress codec 解析) +
 `parsed_response` (直接取自 `record.resp_parsed`, 由 proxy 层的 `StreamScan` 在流过程中
 增量累积, 非流式路径在响应完成时一次性计算). Gemini/Ollama 无 codec → `parse_error` + fallback raw.
 audit_capture 未保留的请求 (off 档全部 / latest 档被会话更新请求取代, B2/B3) parsed_request 恒 null + `record.audit_capture_off = true`
 (`parse_error` 报 "req_body not captured...") — WebUI 审计溯源弹窗 (`data-audit-node`,
-判 `record.audit_capture_off`) 与 raw 弹窗同占位文案.
+判 `record.audit_capture_off`) 与轮次详情弹窗的完整数据 tab 同占位文案.
 
 ### Record preview / model 提取 (push 时一次性)
 
@@ -206,7 +211,8 @@ audit_capture 未保留的请求 (off 档全部 / latest 档被会话更新请�
 **leak_alerts (placeholder 蜜罐打标, #305 批2)**: TimelineRound 携带 `leak_alerts`
 (secret ids), 前端两处消费 — timeline 轮次 header 的 ⚠ 徽章 (`updateLeakBadges`
 单点对账: 模板渲染空占位 `span[data-hdr=leak]`, 按 `state.timelineRecords` Map
-填充/清空 — reconcile 复用节点与 fingerprint 短路两条渲染路径都调用) + info 弹窗
+填充/清空 — reconcile 复用节点与 fingerprint 短路两条渲染路径都调用; quant#305
+起徽章可点击 → 轮次详情概览) + 轮次详情弹窗概览 tab
 warn banner. 时序边界: leak_alerts 随响应 finalize 填充 (晚于 push), sync diff 不
 重发既有轮次 — 复用节点场景徽章由下次 loadTimeline 数据驱动更新, 与 usage 徽章
 同型先例; 弹窗经 GET 实时. 语义契约 contracts.md RED-10.
@@ -411,27 +417,38 @@ API key CRUD **无条件挂载** (在 `web::router()`, 不依赖 `auth.enabled`)
   链首走隐式组首 fallback), preview/tooltip 加 `↻` 前缀区分 (消除与原轮的 preview
   歧义). 语义: IR 等价重发, 用户没有发新消息, 见 contracts.md DTO-9 / UI-1.
 
-### 每轮操作按钮 (info + raw)
+### 轮次详情弹窗 (概览 / 完整数据 双 tab, quant#305)
 
-timeline 每轮 header 含两个按钮:
-- `ℹ` info: 弹窗展示传输层元数据. 字段两路来源: 本地即时渲染 (TimelineRound 的
-  id/round_role/created_at/redactions/leak_alerts (placeholder 蜜罐打标非空时顶部
-  warn banner, #305 批2) + 末轮 TimelineTail 的 status/elapsed/streamed/
-  complete/error — 非末轮显示 "(history round)") + 异步懒拉补全 (`GET /api/records/{id}`
-  的 method/path/model/upstream_id/leak_alerts (实时覆盖初渲染); model 是 **egress 视角** — 路由改写生效时与
-  upstream_model 同值 (改写轮次两行显示相同值), 无改写时 = 客户端原值 — M1 走查
-  修复: record DTO 补 model 字段, 弹窗 Model 行不再恒 "(unknown)").
-- `raw`: 弹窗展示原始 req_body / resp_body / req_headers / resp_headers (按需懒拉
-  `GET /api/records/{id}`). body 是 LLM 视角 (已 redact, 安全展示); headers 已脱敏
-  (auth/cookie 等 = `<redacted>`; 名单 = 硬编码黑名单 ∪ `[redact] redacted_headers`,
-  SEC-4). 流式响应的 resp_body 为空 (不保留 SSE 字节), 显示提示. audit_capture off
-  期间的请求 (`record.audit_capture_off`, B2/B3) req/resp body 区段显示未捕获占位
-  (文案 SSOT `NOT_CAPTURED_NOTE`, 判据统一为该结构化字段; 优先级高于 streamed 空态
-  提示 — off 下非流式 body 同样未存; headers 照常展示). 大 body (>128KB, LLM 累积
-  对话末轮可达 MB 级) 按 64KB 切段 + `content-visibility:auto` 惰性渲染 (quant#308:
-  巨型单 `<pre>` 的 layout+paint 是 raw 弹窗秒级卡顿的主导项) — 屏外段跳过渲染,
-  textContent/复制/内容零损耗 (切段在 escape 前原文上进行 + 切点避让 surrogate
-  pair), 段边界处多一个视觉换行.
+timeline 每轮 header 含一个 `ℹ` 详情按钮 (原 info / raw 两按钮合并, quant#305),
+弹出双 tab 弹窗 (`openRoundDetail`, 语义契约 contracts.md UI-9):
+
+- **概览 tab (默认)**: 元数据小字段, 不含大数据. 字段三路来源: ① 本地即时渲染
+  (TimelineRound 的 id/round_role/round_kind/created_at/upstream_id/redactions/
+  usage/leak_alerts); ② 末轮 TimelineTail 的 status/elapsed/streamed/complete/
+  error (仅末轮, meta 到达前的即时值); ③ `GET /api/records/{id}?view=meta`
+  (小响应, bodies/headers 清空) 异步补全 method/path/model/upstream_model +
+  **每轮自身**的 status/elapsed/error — 历史轮不再显示 "(历史轮次)" 占位 (meta
+  来自该轮 NodeView, 是每轮权威事实). meta 不缓存 (响应微小 + 在途轮状态会演进,
+  每次打开取最新). 失败轮 error 非空 → 顶部红 banner; leak_alerts 非空 → warn
+  banner (#305 批2, 数据不含真值). model 是 **egress 视角** — 路由改写生效时与
+  upstream_model 同值 (改写轮次两行显示相同值), 无改写时 = 客户端原值 (M1 走查).
+- **完整数据 tab**: 原 raw 弹窗内容 — req/resp headers + bodies (按需懒拉完整
+  `GET /api/records/{id}`, 首次激活该 tab 才 fetch, 概览路径零大数据请求; 已加载
+  则复用不重拉, 失败可重试). body 是 LLM 视角 (已 redact, 安全展示); headers 已
+  脱敏 (auth/cookie 等 = `<redacted>`; 名单 = 硬编码黑名单 ∪ `[redact]
+  redacted_headers`, SEC-4). 流式响应的 resp_body 为空 (不保留 SSE 字节), 显示
+  提示. audit_capture off 期间的请求 (`record.audit_capture_off`, B2/B3) req/resp
+  body 区段显示未捕获占位 (文案 SSOT `NOT_CAPTURED_NOTE`, 判据统一为该结构化
+  字段; 优先级高于 streamed 空态提示 — off 下非流式 body 同样未存; headers 照常
+  展示). 大 body (>128KB, LLM 累积对话末轮可达 MB 级) 按 64KB 切段 +
+  `content-visibility:auto` 惰性渲染 (quant#308: 巨型单 `<pre>` 的 layout+paint
+  是 raw 内容秒级卡顿的主导项) — 屏外段跳过渲染, textContent/复制/内容零损耗
+  (切段在 escape 前原文上进行 + 切点避让 surrogate pair), 段边界处多一个视觉换行.
+- **"感叹号" 入口** (quant#305): 轮次 header 的失败状态文本 (`.status-err`,
+  ERR/4xx/5xx — 仅末轮 header 存在, 非末轮状态 span 为空 [DTO-5 既有约束],
+  历史失败轮经 ℹ 按钮进入) 与 ⚠ 泄露徽章 (`.leak-badge`, 全轮) 可点击 →
+  打开同一弹窗的概览 tab (错误横幅 / leak banner 落在那里); 事件委托在
+  `bindRoundActions`, 先于 "点 header 选轮" 分支并 stopPropagation.
 
 ### Response 气泡渲染
 
