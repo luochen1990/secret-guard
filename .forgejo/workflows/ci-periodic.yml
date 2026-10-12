@@ -144,9 +144,9 @@ jobs:
         run: just ci-periodic
 
       # WebUI 回归测试 (Playwright 端到端)。
-      # webServer 自动启动 mock upstream + secret-guard, binary 候选链 release > debug
-      # > llvm-cov-target/debug (playwright.config.ts), 本档上一步插桩产物命中第三候选
-      # (CARGO_TARGET_DIR 指向持久卷, playwright.config.ts 读此环境变量)。
+      # webServer 自动启动 mock upstream + secret-guard, binary 取存在候选中 mtime 最新者
+      # (playwright.config.ts, #314 — 本档上一步插桩产物恒为最新 → 天然命中;
+      # CARGO_TARGET_DIR 指向持久卷, playwright.config.ts 读此环境变量)。
       #
       # continue-on-error: true — Playwright 在 CI 环境 (无 GPU / chromium 渲染稳定性)
       # 可能有 flake, 保持非阻塞 (同旧 ci.yml 的 #86-2 观察; P2 无 PR 合入语义,

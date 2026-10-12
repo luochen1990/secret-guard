@@ -23,17 +23,24 @@ const ROOT = path.resolve(process.cwd(), "..", ".."); // 项目根 (tests/webui 
 const MOCK_PORT = 19999;
 const SG_PORT = 18790;
 const SG_URL = `http://127.0.0.1:${SG_PORT}/`;
-// secret-guard 二进制检索 (按优先级): release > debug > llvm-cov-target/debug.
+// secret-guard 二进制检索: 候选 = target 下三个常见产物位, **存在者中选 mtime 最新**.
 //   - release: 非插桩、最快, WebUI server 响应最稳 (本地 cargo build --release).
 //   - debug:   本地开发常态 (cargo build / nextest run).
 //   - llvm-cov-target/debug: CI 兜底 — `just check --coverage` 走 cargo llvm-cov nextest,
-//     产物只落此子目录; CI 在本 step 之前无 release/debug 编译, 故此候选必须存在
-//     (历史 bug: 只查 release/debug 两处, CI 永远找不到 binary).
-// CARGO_TARGET_DIR: CI 用持久卷 (/var/lib/forgejo-runner/cache/cargo-target), 本地默认 target/.
+//     产物只落此子目录.
+// 选择策略是 "mtime 最新" 而非固定优先序 (#314 review 发现): P0/P2 CI 共享持久卷
+// CARGO_TARGET_DIR, P0 的 nextest 会在卷内留下 debug/ 产物 — 固定序 (release >
+// debug > llvm-cov) 下 P2 nightly 会压过自己刚编译的 llvm-cov 插桩产物, WebUI 打在
+// 旧代码上 (改动前就存在的潜伏缺陷, freshness 门卫只是把它显性化为误拦). "选最新"
+// 让 P2 天然命中本档产物, 本地也命中最近编译的那个 — 与下方 freshness 门卫语义配套
+// (哪个新鲜测哪个). CARGO_TARGET_DIR: CI 用持久卷
+// (/var/lib/forgejo-runner/cache/cargo-target), 本地默认 target/.
 const CARGO_TARGET_DIR = process.env.CARGO_TARGET_DIR || path.join(ROOT, "target");
 
 /**
- * 返回第一个存在的 secret-guard binary 路径; 都不存在则抛错列出所有候选.
+ * 返回 mtime 最新的存在候选; 都不存在则抛错列出所有候选.
+ * statSync+try 一体 (非 existsSync 预检): 消除 "存在性检查后、stat 前候选消失" 的
+ * TOCTOU 裸栈, 消失的候选按不存在处理.
  */
 function resolveSgBin(): string {
   const candidates = [
@@ -41,20 +48,107 @@ function resolveSgBin(): string {
     path.join(CARGO_TARGET_DIR, "debug", "secret-guard"),
     path.join(CARGO_TARGET_DIR, "llvm-cov-target", "debug", "secret-guard"),
   ];
-  const found = candidates.find((p) => fs.existsSync(p));
-  if (found) return found;
-  throw new Error(
-    `secret-guard binary not found in any candidate:\n${candidates.map((p) => `  - ${p}`).join("\n")}\n` +
-      `Run 'cargo build' or 'cargo llvm-cov nextest' first.`
-  );
+  const found: { path: string; mtime: number }[] = [];
+  for (const p of candidates) {
+    // { throwIfNoEntry: false } 不抛 ENOENT, 返回 undefined.
+    const st = fs.statSync(p, { throwIfNoEntry: false });
+    if (st) found.push({ path: p, mtime: st.mtimeMs });
+  }
+  if (found.length === 0) {
+    throw new Error(
+      `secret-guard binary not found in any candidate:\n${candidates.map((p) => `  - ${p}`).join("\n")}\n` +
+        `Run 'cargo build' or 'cargo llvm-cov nextest' first.`
+    );
+  }
+  // mtime 相等时保留先者 (= release, 非插桩) — 同新鲜度下偏向更接近生产的产物.
+  return found.reduce((a, b) => (b.mtime > a.mtime ? b : a)).path;
 }
 
 const SG_BIN = resolveSgBin();
-// 打印命中路径到 stderr, 让 CI log 直接可见命中了哪个候选.
+const BIN_MTIME = fs.statSync(SG_BIN).mtimeMs;
+// 打印命中路径 + mtime 到 stderr, 让 CI log 直接可见命中了哪个候选、产物多新.
 // 动机: WebUI step 的 continue-on-error 会静默吞错, 若解析到非预期产物 (如陈旧 binary)
 // 未来复现, 维护者翻 CI log 第一行即可定位, 而非反推. console.error 走 stderr,
 // Playwright 不解析 config 加载期的输出, 无副作用.
-console.error(`[playwright.config] secret-guard binary: ${SG_BIN}`);
+console.error(`[playwright.config] secret-guard binary: ${SG_BIN} (mtime ${new Date(BIN_MTIME).toISOString()})`);
+
+// ─── freshness 门卫 (#314): 被测 binary 必须不旧于源输入 ──────────────────────
+//
+// 问题 (事故: PR #311 冲突解决时 14 个假阳性失败): spec 文件从工作区直接读
+// (永远最新), 被测服务却是 target/ 里的陈旧 binary (rebase / 改 src 后未重编)
+// → 新测试打旧服务 → 大面积假阳性, 且无任何"binary 过旧"提示.
+//
+// 判定: binary mtime < freshness 输入集的 max mtime → throw fail-fast.
+// 输入集 = 一切影响 Rust binary 内容的源输入:
+//   - src/ 全树 (含 include_str! 内嵌进 binary 的 src/web/index.html —
+//     改前端也必须重编 Rust 才生效, 事故盲点之一)
+//   - Cargo.toml / Cargo.lock / rust-toolchain.toml (依赖与工具链变更)
+// 保守方向 (只多拦不漏拦): "binary 早于某输入" ⇔ 该输入的修改未进入 binary,
+// 测试结果必然无意义; 故 walk 不筛后缀 (简单且同方向), 与降级偏安全
+// (contracts.md SEC-10) 同构 — 宁可多编, 不可假阳性.
+//
+// 声明的盲区 (可接受近似, 维护者无需处理):
+//   - `touch -t` 手动回拨 mtime (自找的场景)
+//   - toolchain 同版本号内容变更 (nixpkgs 滚动更新, mtime 不变)
+//   - walk 中消失的文件 (编辑器原子 rename 的 TOCTOU 窗口) 被 try/catch 跳过 —
+//     已删除的文件不可能影响 binary 内容, 跳过安全; broken symlink 同理
+//
+// CI (P2 ci-periodic) 零成本: checkout (输入 mtime=t₀) → coverage 编译
+// (llvm-cov 产物 mtime=t₁>t₀, 且按"选最新"策略必命中) → just check-webui →
+// 门卫比较 t₁>t₀ 通过, 不触发任何额外编译.
+//
+// 拦截路径的行为钉子: `just check-webui-freshness` (justfile, 挂 check 链,
+// 用假 binary + 隔离 CARGO_TARGET_DIR 构造场景, 秒级).
+const FRESHNESS_INPUTS = ["src", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml"];
+
+/**
+ * 返回 freshness 输入集中 mtime 最新的文件; 输入全缺失 (仓库结构变更?) 时抛错 fail-closed.
+ * statSync 统一判型 (follow symlink — 正常 symlink 的目标 mtime 被采集, 保守方向);
+ * walk 中消失的文件 (TOCTOU) 静默跳过, 理由见盲区声明.
+ */
+function newestFreshnessInput(): { file: string; mtime: number } {
+  let best: { file: string; mtime: number } | null = null;
+  const consider = (p: string, mtime: number) => {
+    if (best === null || mtime > best.mtime) best = { file: p, mtime };
+  };
+  const walk = (p: string) => {
+    try {
+      const st = fs.statSync(p); // follow symlink; 消失 (TOCTOU/broken) → catch 跳过
+      if (st.isDirectory()) {
+        for (const ent of fs.readdirSync(p)) walk(path.join(p, ent));
+      } else {
+        consider(p, st.mtimeMs);
+      }
+    } catch {
+      return; // 消失的文件/目录 (TOCTOU) — 已删除者不可能影响 binary 内容, 跳过安全
+    }
+  };
+  for (const rel of FRESHNESS_INPUTS) walk(path.join(ROOT, rel));
+  if (best === null) {
+    throw new Error(`freshness 门卫: 输入集全部缺失 (${FRESHNESS_INPUTS.join(", ")}) — 仓库结构变了?`);
+  }
+  return best;
+}
+
+{
+  const newest = newestFreshnessInput();
+  if (BIN_MTIME < newest.mtime) {
+    // 按命中候选给对应的重编指引 (llvm-cov 判定在前: 其路径含 /debug/ 但不含
+    // /release/, 唯一目录名; release 判定用 path.sep 边界防误命中任意 release 段).
+    const rebuildHint = SG_BIN.includes("llvm-cov-target")
+      ? "just check --coverage"
+      : SG_BIN.includes(`${path.sep}release${path.sep}`)
+        ? "cargo build --release --locked"
+        : "cargo build --locked";
+    throw new Error(
+      `[playwright.config] secret-guard binary 陈旧 (freshness 门卫, #314):\n` +
+        `  binary:  ${SG_BIN} (mtime ${new Date(BIN_MTIME).toISOString()})\n` +
+        `  较新输入: ${newest.file} (mtime ${new Date(newest.mtime).toISOString()})\n` +
+        `WebUI 测试会打在旧代码上 → 假阳性. 先重编再跑:\n` +
+        `  ${rebuildHint}`
+    );
+  }
+}
 
 // 孤儿进程清理不在本文件做 (Playwright 多次 require config + globalSetup 在 webServer
 // 之后执行, 时机都不对). 改由 justfile _kill-orphans recipe 在 `playwright test` 之前

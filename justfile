@@ -87,6 +87,7 @@ check *ARGS:
     cargo machete
     RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps {{ FULL_TIER }}
     just check-webui-syntax
+    just check-webui-freshness
     just check-contracts
     # cargo test --doc
     @if echo "{{ ARGS }}" | grep -q -- "--coverage"; then \
@@ -124,10 +125,65 @@ check-webui-syntax:
     node --check "$script"
     echo "webui-syntax: OK ($lines lines)"
 
+# WebUI freshness 门卫的行为钉子 (#314, 秒级, 阻塞式).
+#
+# 守护对象: tests/webui/playwright.config.ts 的 freshness 门卫与 resolveSgBin 候选选择
+# (判定语义 + 事故背景 + CI 三档分析见其头部注释, 此处不重复).
+#
+# 两个场景, 与真实 target/ 完全隔离 (假 CARGO_TARGET_DIR + 假 binary, 不触发重编):
+#   1. 拦截: 全部候选陈旧 (mtime 2000-01-01) → config 加载应 throw 且消息含 "freshness 门卫".
+#   2. 选最新: debug 新 + release 旧 → resolveSgBin 应命中 debug 且门卫通过 (回归守卫:
+#      P0/P2 共享持久卷下 P0 的 debug 旧产物不得压过更新候选 — #314 review 发现的潜伏缺陷).
+# `--list` 只加载 config 不跑测试/webServer, 秒级返回.
+check-webui-freshness:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # 前置守卫: 无 playwright CLI 时给出准确报错, 而不是 fallthrough 到误导性的
+    # "未拦截" 分支 (rc=127 场景).
+    if ! command -v playwright >/dev/null 2>&1; then
+        echo "check-webui-freshness: playwright CLI 不在 PATH (需 devShell 或 vm-nix runner)" >&2
+        exit 1
+    fi
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    # 假 binary 内容无关紧要 — 两个场景都在 config 加载期结束, binary 从未真正执行.
+    make_fake_bin() { # $1=dir $2=mtime
+        mkdir -p "$1"
+        printf '#!/bin/sh\n' > "$1/secret-guard"
+        chmod +x "$1/secret-guard"
+        touch -d "$2" "$1/secret-guard"
+    }
+    # ── 场景 1: 全部候选陈旧 → 拦截 ──
+    make_fake_bin "$tmp/release" '2000-01-01'
+    set +e
+    out=$(cd tests/webui && CARGO_TARGET_DIR="$tmp" playwright test --list 2>&1)
+    rc=$?
+    set -e
+    # fail-closed: 未拦截 (rc=0) 或拦截了但不是 freshness 原因 (关键词缺失) 都算门卫失效.
+    if [ "$rc" -eq 0 ] || ! printf '%s' "$out" | grep -q 'freshness 门卫'; then
+        echo "check-webui-freshness: FAILED — 陈旧 binary 未被拦截 (rc=$rc)" >&2
+        printf '%s\n' "$out" | tail -20 >&2
+        exit 1
+    fi
+    # ── 场景 2: debug 新 + release 旧 → 命中 debug, 门卫通过 ──
+    make_fake_bin "$tmp/debug" 'now'
+    set +e
+    out=$(cd tests/webui && CARGO_TARGET_DIR="$tmp" playwright test --list 2>&1)
+    rc=$?
+    set -e
+    if [ "$rc" -ne 0 ] || ! printf '%s' "$out" | grep -qF "$tmp/debug/secret-guard"; then
+        echo "check-webui-freshness: FAILED — 未命中最新候选 debug (rc=$rc)" >&2
+        printf '%s\n' "$out" | tail -20 >&2
+        exit 1
+    fi
+    echo "webui-freshness: OK (陈旧 binary 被拦截 + 最新候选被选中)"
+
 # WebUI 回归测试 (Playwright 端到端). 需 devShell (nix develop).
 #
 # 三道防线 (缺一不可) 详见 tests/webui/playwright.config.ts 头部注释;
 # 本 recipe 实现防线 #2: 在 playwright test 之前清掉端口 18790/19999 上的孤儿.
+# 另有 freshness 门卫 (被测 binary 新鲜度, 事故 #314): config 加载期拦截,
+# 本 recipe 无需配合 — 门卫在 playwright test 进程内自然生效.
 #
 # 为什么用 lsof + kill 而非 pkill -f 'secret-guard run --port ...':
 # pkill -f 会匹配 justfile 自己 / 父 shell / nix develop 进程 (它们的命令行也含该字串),

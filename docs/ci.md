@@ -69,7 +69,7 @@ single-job runner 上串行占位, 延迟最新 push 的反馈. workflow 级
    由 Diagnose 评论携带留痕 (CI 工具链由 VM nixpkgs 决定, 三源漂移事后可追溯)。
 8. **Quality gate (just ci-merge main)** — P0 阻塞主链: `just check` 全量档
    (`FULL_TIER` = `--features oidc,consistency-check`; fmt + clippy + machete + doc 门禁 +
-   测试 + typos + deny-offline + check-webui-syntax + check-contracts + nix-check,
+   测试 + typos + deny-offline + check-webui-syntax + check-webui-freshness + check-contracts + nix-check,
    **不带 --coverage** — 插桩与 coverage-gate 已归 P2)。
     cargo 命令均带 `--locked`。consistency-check (视图正确性断言, 详见根 AGENTS.md
     "视图正确性确保机制"; contracts.md `prop_consistency_check_feature_runs_in_ci` 的
@@ -116,7 +116,7 @@ run。skip 仅 schedule 事件查询 + `workflow_file: ci-periodic.yml` 自指 �
 Cleanup key / skip-if-passed / **Quality gate (`just ci-periodic`)** = `just check
 --coverage` (插桩测试, 测试集只跑这一次) + `just coverage-gate` (双阈值防倒退, 阻塞) /
 **WebUI regression (Playwright)** (`just check-webui`, continue-on-error — flake 由次晚
-重试自愈; binary 复用插桩产物, playwright.config.ts 候选链第三命中) / Upload Playwright
+重试自愈; binary 取 mtime 最新候选 — 本档插桩产物恒最新天然命中, playwright.config.ts) / Upload Playwright
 artifacts on failure (截图/trace/报告, retention 14 天) / Guard verify。
 
 ### 旧 ci.yml step → v3.0 去向表

@@ -297,7 +297,8 @@ jobs:
 
       # P0 质量门禁主链 — 契约层入口 (`just ci-merge`, org v3.0 必须契约).
       # ci-merge recipe 的 main 档 = 普通 check 主链 (fmt + clippy + machete + doc 门禁
-      # + 测试 + typos + deny-offline + check-webui-syntax + check-contracts + nix-check,
+      # + 测试 + typos + deny-offline + check-webui-syntax + check-webui-freshness
+      # + check-contracts + nix-check,
       # 不带 --coverage — 插桩编译与 coverage-gate 已下沉 P2 ci-periodic).
       # 主链即全量档 (oidc + consistency-check, FULL_TIER 单点切换); file-size 在本
       # workflow 独立成步 (Diagnose 表按 step 定位失败), 故 gate 只跑主链段 — recipe

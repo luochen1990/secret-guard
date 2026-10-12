@@ -436,6 +436,7 @@ nix develop --impure      # 进入 devShell (工具链全家桶; nix fmt 仅 dev
 # 验证链 (命令全集见 justfile / `just --list`, 此处只列高频入口)
 just check                # 一键 check (全量档 --features oidc,consistency-check): fmt + clippy + machete + doc + nextest + typos + deny-offline
                           #   链内含 check-webui-syntax (index.html 内嵌 JS 语法) 与
+                          #   check-webui-freshness (Playwright 被测 binary 新鲜度门卫钉子, #314) 与
                           #   check-contracts (contracts.md property 落地标注 lint, #144);
                           #   doctest 当前禁用 (唯一 doctest 被 ignored, 需要时在 justfile 取消注释)
                           #   默认档 (无 oidc) 的验证矩阵归 GitHub 镜像 CI (双宿主分工, 见 docs/ci.md)
