@@ -4,8 +4,10 @@
 //!
 //! OIDC 登录链是可选编译的 (feature `oidc`, 默认关闭 — 默认构建图收缩 ~90 crates):
 //! - **gate 范围**: `oidc` / `handlers` / `session` 三个子模块 + server.rs 的
-//!   `/login` `/oauth2/callback` `/logout` `/api/me` 路由与 AuthManagerLayer 装配
+//!   `/login` `/oauth2/callback` `/logout` 路由与 AuthManagerLayer 装配
 //!   (`AuthStack` / `build_router_with_auth`, 同样 cfg 门控).
+//!   `/api/me` 探针端点例外: 两形态恒 200 — OIDC 形态挂 `auth::handlers::me`,
+//!   单用户形态挂 server.rs 的 `me_single_user` (2026-10-13 补齐).
 //! - **不 gate**: `apikey.rs` + `ApiKeyStore` (本地 API key 路径永远在 — 静态 key
 //!   预配与 WebUI key 管理与 OIDC 无关); `middleware.rs` (require_api_key);
 //!   `AuthConfig` / `OidcConfig` 的 `[auth]` 配置段解析 (schema 保留, 手写 OIDC

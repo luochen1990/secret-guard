@@ -37,7 +37,8 @@
 - `/api/*` 未匹配子路径 —— 404, **绝不**进入 forward (否则会泄漏内部 URL 到上游).
 - OIDC 认证路由 (`/login`, `/oauth2/callback`, `/logout`, 公开的 `/api/me`) 由
   `server.rs` 装配 (不在本模块; auth 启用 **且** cargo feature `oidc` 编译时挂载,
-  #276 — 默认档无这些路由, `/login` 落 404).
+  #276 — 默认档无这些路由, `/login` 落 404). `/api/me` 探针例外: 单用户模式由
+  `server.rs::me_single_user` 兜底, 两形态恒 200 (2026-10-13 补齐).
 
 ## API endpoints
 

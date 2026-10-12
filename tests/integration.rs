@@ -14595,3 +14595,38 @@ async fn privacy_scan_settings_off_mode_behavior() {
         "off mode rejects group config (nothing can take effect)"
     );
 }
+
+/// `/api/me` 两形态探针契约 (单用户侧): 单用户模式 (`build_router`, auth 未启用)
+/// 也必须恒 200 — 该端点是外部监控 (gatus) 的公开探针, 与认证形态无关
+/// (nixos 仓 monitor.path 消费该契约; OIDC 形态侧由 tests/auth_oidc.rs 覆盖).
+/// 曾为单用户 404: `/api/me` 只挂在 oidc feature + auth.enabled 的装配分支,
+/// 无 auth 的 host 监控恒红 (2026-10-13).
+#[tokio::test]
+async fn api_me_always_200_in_single_user_mode() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"chatcmpl-1","choices":[]}"#)
+        .create_async()
+        .await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{proxy_url}/api/me"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "single-user mode must expose /api/me as an unconditional probe"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["authenticated"],
+        serde_json::json!(true),
+        "单用户模式无账号系统, 一切请求即主人"
+    );
+}

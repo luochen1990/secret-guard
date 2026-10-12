@@ -22,10 +22,11 @@
 //! - SDK 转发 (`/{proto_short}/{name}/*`, proto_short ∈ o/a/g/l/r): 本地 API key (`Authorization: Bearer sg_...`).
 //!
 //! feature `oidc` (默认关闭) 控制 OIDC 编译: 关闭时 `/login` `/oauth2/callback`
-//! `/logout` `/api/me` 路由与 AuthManagerLayer 装配 (`AuthStack` /
+//! `/logout` 路由与 AuthManagerLayer 装配 (`AuthStack` /
 //! `build_router_with_auth`) 不存在, `enabled = true` 启动即报错 (提示 rebuild
-//! with --features oidc); API key 路径与 `[auth]` 配置解析不受影响. 详见
-//! `src/auth/mod.rs` 头部.
+//! with --features oidc); API key 路径与 `[auth]` 配置解析不受影响. `/api/me`
+//! 探针端点例外 — 两形态恒 200 (OIDC 形态走 auth::handlers::me, 单用户形态走
+//! `me_single_user`). 详见 `src/auth/mod.rs` 头部.
 //!
 //! ApiKeyStore 总是构造 (与 `auth.enabled` 无关), 让 WebUI 在单用户模式下也能
 //! 管理和预配置 key. `/api/api-keys` CRUD 路由在 `web::router()` 里无条件挂载
@@ -83,11 +84,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use axum::Json;
 use axum::Router;
+use axum::http::StatusCode;
 use axum::middleware;
+use axum::response::IntoResponse;
 use axum::routing::any;
+use axum::routing::get;
 #[cfg(feature = "oidc")]
-use axum::routing::{get, post};
+use axum::routing::post;
 use parking_lot::{Mutex, RwLock};
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
@@ -101,7 +106,7 @@ use crate::provider::{Provider, ProviderTable};
 use crate::proxy::{forward, forward_no_rest};
 use crate::secrets::{SecretEntry, SecretTable};
 use crate::server_host_guard::{self, HostGuard};
-use crate::state::AppState;
+use crate::state::{AppState, NO_STORE};
 use crate::web;
 
 /// 构建 [`TraceLayer`] (SEC-3 加固: 显式限定 span 字段, 不记录 headers).
@@ -152,10 +157,24 @@ pub fn build_router(state: AppState, guard: HostGuard) -> Router {
     finish_router(
         Router::new()
             .merge(web::router())
+            .route("/api/me", get(me_single_user))
             .route("/api/{*rest}", any(web::not_found))
             .merge(forward_router())
             .with_state(state),
         guard,
+    )
+}
+
+/// `/api/me` 单用户形态: 无账号系统, 一切请求即主人 — 恒 200.
+///
+/// 该端点是外部监控 (gatus) 的公开探针, 契约为**两形态恒 200**: OIDC 形态由
+/// [`crate::auth::handlers::me`] 承接 (未登录 `authenticated:false`), 本 handler
+/// 兜住单用户形态 — 曾缺失导致无 auth 的 host 监控恒 404 (2026-10-13).
+async fn me_single_user() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        NO_STORE,
+        Json(serde_json::json!({"authenticated": true})),
     )
 }
 
