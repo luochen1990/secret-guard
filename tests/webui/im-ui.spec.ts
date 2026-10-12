@@ -3540,6 +3540,46 @@ test.describe("i18n: 语言自动选择 + 切换 + 持久化 (#298)", () => {
   });
 });
 
+// ─── header 工具栏打磨: 选择框字号统一 + 语言选择器可发现性 (quant#306) ──────
+//
+// 契约 (index.html header CSS 段):
+//   1. 原生 select 不继承页面字体 (UA 默认表单字体偏大) — header 工具栏的
+//      #audit-capture / #lang-switch 显式对齐 toolbar 控件字号基准 12.5px
+//      (基准锚点 = button.refresh, 同 bug 已修先例).
+//   2. #lang-switch 有可见标签 (与 #audit-capture 的 label 同构), 不点开即知
+//      是语言选择器 — 修复 "不知道候选框选的啥" 的可发现性问题.
+test.describe("header 工具栏打磨 (quant#306)", () => {
+  // en 默认前置显式化: 依赖 resolveLang('auto') → en 的行为, 防日后 config 级
+  // locale 设置让本 describe 静默变红.
+  test.use({ locale: "en-US" });
+
+  test.beforeEach(async ({ page }) => {
+    await page.goto("/");
+    await page.waitForLoadState("networkidle");
+  });
+
+  test("选择框 computed 字号与 toolbar 基准控件一致", async ({ page }) => {
+    // 基准锚点: button.refresh (12.5px, CSS 显式声明). 裸 select 若漏 font 修正
+    // 会落在 UA 默认表单字号 (~13.33px) — 逐 px 相等断言即可捕获回退.
+    const fontSize = (sel: string) =>
+      page.locator(sel).evaluate((el) => getComputedStyle(el).fontSize);
+    const base = await fontSize("button.refresh");
+    expect(base).toBe("12.5px");
+    expect(await fontSize("#audit-capture")).toBe(base);
+    expect(await fontSize("#lang-switch")).toBe(base);
+  });
+
+  test("语言选择器可见标签: 不点开即知选的是语言", async ({ page }) => {
+    // 可见标签 (与 #audit-capture 的 label 同构) + 隐式 label 关联提供
+    // accessible name (select 不再依赖 aria-label 标注).
+    const langLabel = page.locator("label:has(#lang-switch) > span");
+    await expect(langLabel).toHaveText("Language");
+    // 切 zh → 标签即时跟随 (data-i18n 重放).
+    await page.locator("#lang-switch").selectOption("zh");
+    await expect(langLabel).toHaveText("界面语言");
+  });
+});
+
 // ─── #257 S0.5: 隐私旁路扫描 (疑似未登记面板 + 登记预填闭环) ────────────────
 //
 // server 配置 (playwright.config.ts) 开 [privacy_scan] mode = "batch".

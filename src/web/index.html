@@ -176,6 +176,11 @@
     header .brand .brand-logo { vertical-align: middle; flex-shrink: 0; padding: 4px; background: var(--accent-soft); border-radius: var(--radius-md); }
     header .toolbar { display: flex; gap: 10px; align-items: center; }
     header .toolbar label { color: var(--fg-muted); font-size: 12.5px; }
+    /* 原生 select 不继承页面字体 (UA 默认表单控件字体偏大, quant#306 的「字体过大」
+       根因) — 显式对齐 toolbar 12.5px 控件字号基准。同 bug 先例: button.refresh /
+       select.decision-select / dialog 表单 select 均各自 font 修正过, 此处补齐
+       header 工具栏的两个漏网裸 select (#audit-capture / #lang-switch)。 */
+    header .toolbar select { font: inherit; font-size: 12.5px; padding: 3px 6px; }
     header #status { min-width: 80px; font-variant-numeric: tabular-nums; }
     nav.tabs {
       display: flex;
@@ -1756,11 +1761,13 @@
           <option value="full" data-i18n="audit.mode.full">Full</option>
         </select>
       </label>
-      <select id="lang-switch" data-i18n-aria-label="header.langAria">
-        <option value="auto" data-i18n="lang.auto">Auto (browser)</option>
-        <option value="en">English</option>
-        <option value="zh">中文</option>
-      </select>
+      <label><span data-i18n="header.langLabel">Language</span>
+        <select id="lang-switch">
+          <option value="auto" data-i18n="lang.auto">Auto (browser)</option>
+          <option value="en">English</option>
+          <option value="zh">中文</option>
+        </select>
+      </label>
       <div class="theme-switch" id="theme-switch" role="group" data-i18n-aria-label="header.themeAria">
         <button type="button" data-theme-val="auto" title="Follow system theme" data-i18n-title="header.themeAuto">🌓</button>
         <button type="button" data-theme-val="light" title="Light" data-i18n-title="header.themeLight">☀</button>
@@ -2272,7 +2279,7 @@
         'header.sessionsFiltered': 'sessions [{mode}]',
         'header.auditLog': 'Audit log',
         'header.auditLogTitle': 'Audit log: Off = minimal memory; Latest only (default) = keep the full body of the newest request per session (recycled when the session advances — failed requests are always the session head, so they are kept); Full = keep everything. Affects new requests only.',
-        'header.langAria': 'Language',
+        'header.langLabel': 'Language',
         'lang.auto': 'Auto (browser)',
         'header.themeAria': 'Theme',
         'header.themeAuto': 'Follow system theme',
@@ -2735,7 +2742,7 @@
         'header.sessionsFiltered': '会话 [{mode}]',
         'header.auditLog': '详细日志',
         'header.auditLogTitle': '详细日志: 关闭=极致省内存; 仅最新 (默认)=每个会话保留最新一次请求的完整 body (会话前进后旧请求回收 — 出错请求必为会话头部, 自然保留); 全部=全量保留。仅影响之后的新请求。',
-        'header.langAria': '语言',
+        'header.langLabel': '界面语言',
         'lang.auto': '跟随浏览器',
         'header.themeAria': '主题',
         'header.themeAuto': '跟随系统主题',

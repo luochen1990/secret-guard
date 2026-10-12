@@ -600,7 +600,10 @@ Secrets tab 内 `#privacy-scan-panel`「疑似未登记」区段 (mode=off 时�
 hover = `--bg-hover` (indigo 微染), 选中 = `--bg-selected` / `--tint-selected` (+ 左侧
 accent 色条); 徽标分两类 — 计数/未读等可扫读徽标用实心 accent, 分类 pill / 状态 badge
 用 `--*-soft` 软底 + 同色深字. 排版: Inter 优先 sans 栈 (本机装有则用,
-零外部依赖), 13.5px 基准, 数字密集区 `tabular-nums`. 三态切换: auto (跟随 OS
+零外部依赖), 13.5px 基准, 数字密集区 `tabular-nums`. 原生表单控件 (select 等)
+**不继承页面字体** (UA 默认表单字体偏大, quant#306「字体过大」根因) — 各区域控件
+须显式 `font: inherit` 或 `font-size` 对齐该区基准 (header 工具栏 12.5px / 表格行内
+12px / dialog 表单 `font: inherit`), 新增控件勿留裸 select. 三态切换: auto (跟随 OS
 `prefers-color-scheme`) / light / dark, 由 header 工具栏的 `.theme-switch` 三按钮控制,
 选择持久化在 `localStorage['sg-theme']`.
 
