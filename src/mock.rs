@@ -49,7 +49,10 @@
 //! - 其余 (含 Password/Cookie/Other) → [`SecretShape::Plain`] 平坦串 (历史行为).
 //!
 //! **归类错误无害**: 所有增强都有形状 gate, category 标错最多退化为 Plain
-//! (与历史行为一致), 不产生错误行为.
+//! (与历史行为一致), 不产生错误行为. 标注与值形状的**矛盾** (PEM 但非
+//! privatekey / JWT 但非 token / 白名单前缀但非 apikey) 由
+//! `MockStrategy::category_shape_mismatch` 在配置期 WARN (检测面与跳过条件
+//! 见其 doc).
 //!
 //! **global_prefix 裁决**: `global_mock_prefix` 非空时恒推断 Plain — 用户显式
 //! 配置辨识前缀 = 放弃结构仿真 (辨识度与仿真度互斥, 把矛盾交给配置).
@@ -796,6 +799,40 @@ pub struct MockStrategy {
     pub gen_spec: Option<GenSpec>,
 }
 
+/// category 标注与值形状的矛盾 (配置期 WARN 的检测结果, 纯数据; 语义与检测面
+/// 见 [`MockStrategy::category_shape_mismatch`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CategoryShapeMismatch {
+    /// 值是 PEM 但标注非 privatekey — 行为已按 PEM 结构化 (不受标注影响),
+    /// 提醒改标注保持所见 (WebUI category) 与所为 (mock 形状) 一致.
+    PemButNotPrivatekey,
+    /// 值是 JWT 形状但标注非 token — 退化 plain, 改标 token 可启用结构化 mock.
+    JwtButNotToken,
+    /// 值命中公开前缀白名单但标注非 apikey — 退化 plain, 改标 apikey 可启用
+    /// 前缀保留.
+    PublicPrefixButNotApiKey,
+}
+
+impl CategoryShapeMismatch {
+    /// 检测到的形状名 (WARN 结构化字段用, 非 secret 内容).
+    pub fn detected(&self) -> &'static str {
+        match self {
+            Self::PemButNotPrivatekey => "pem",
+            Self::JwtButNotToken => "jwt",
+            Self::PublicPrefixButNotApiKey => "public_prefix",
+        }
+    }
+
+    /// 建议标注 (WARN 行动建议用).
+    pub fn suggested_category(&self) -> SecretCategory {
+        match self {
+            Self::PemButNotPrivatekey => SecretCategory::PrivateKey,
+            Self::JwtButNotToken => SecretCategory::Token,
+            Self::PublicPrefixButNotApiKey => SecretCategory::ApiKey,
+        }
+    }
+}
+
 impl MockStrategy {
     /// 在 resolve 拿到 real value 后调用:
     /// 若 `gen=None` 且 `initial=Auto`, 用 real + category + `global_prefix` infer
@@ -808,6 +845,60 @@ impl MockStrategy {
         if self.gen_spec.is_none() && matches!(self.initial, InitialValue::Auto) {
             self.gen_spec = Some(GenSpec::infer_default_for(real, category, global_prefix));
         }
+    }
+
+    /// category 标注与值形状的矛盾检测 (配置期 WARN 的纯数据源, 与
+    /// [`MockStrategy::lint_candidate_space`] 同型: 纯函数不直接打日志, 由调用方
+    /// WARN — 便于单元测试). 严禁携带 secret value / mock 明文 (SEC 红线).
+    ///
+    /// # 检测面 (只报"矛盾", 不报"常态")
+    ///
+    /// - `PemButNotPrivatekey`: 值是 PEM 但标注非 privatekey — **行为已按 PEM
+    ///   结构化** (PEM 检测不 gate category, 形状自证), 标注是纯语义债, 提醒改
+    ///   标注保持 WebUI 所见与实际行为一致.
+    /// - `JwtButNotToken` / `PublicPrefixButNotApiKey`: 值的形状需要标注佐证才
+    ///   能启用结构化 mock (JWT/公开前缀 gate category), 标注不符 → **静默退化
+    ///   plain, 丢失仿真增强** — 提醒改标注可启用 (暴露映射表/手工标注错误).
+    ///
+    /// 反向不检测 (设计内常态, warn 即噪音): 标注 token/privatekey/apikey 但值
+    /// 无对应形状 (大量 token 是随机串 / WireGuard 私钥是单行 base64 / 绝大多数
+    /// api key 无已知前缀), 平坦串即正确行为.
+    ///
+    /// # 跳过条件 (用户已接管, 矛盾无行动价值)
+    ///
+    /// - `initial = Fixed` 或用户显式配置了 `gen_spec` (含 shape): mock 形态由
+    ///   用户配置决定, 标注不参与行为.
+    /// - `global_prefix` 非空: 用户显式选辨识度 = 放弃全部结构仿真 (恒推断
+    ///   plain), "改标注可启用"不成立.
+    ///
+    /// # 调用前提
+    ///
+    /// 必须在 [`MockStrategy::resolve_against`] **之前**调用 (如
+    /// `crate::secrets::SecretEntry::validate_and_resolve` 第四步前): 此时
+    /// `gen_spec.is_some()` ⟺ 用户显式配置 — resolve 之后 infer 填充与用户
+    /// 配置无法区分. real 须已 resolve (value_file 已读入).
+    pub fn category_shape_mismatch(
+        &self,
+        real: &str,
+        category: SecretCategory,
+        global_prefix: &str,
+    ) -> Option<CategoryShapeMismatch> {
+        if !matches!(self.initial, InitialValue::Auto) || self.gen_spec.is_some() {
+            return None;
+        }
+        if !global_prefix.is_empty() {
+            return None;
+        }
+        if parse_pem(real).is_some() && category != SecretCategory::PrivateKey {
+            return Some(CategoryShapeMismatch::PemButNotPrivatekey);
+        }
+        if category != SecretCategory::Token && parse_jwt(real).is_some() {
+            return Some(CategoryShapeMismatch::JwtButNotToken);
+        }
+        if category != SecretCategory::ApiKey && find_public_prefix(real).is_some() {
+            return Some(CategoryShapeMismatch::PublicPrefixButNotApiKey);
+        }
+        None
     }
 
     /// 基础校验 (不依赖 real value). 在 `crate::secrets::SecretEntry::validate` 中调用.
@@ -2132,6 +2223,104 @@ mod tests {
         );
         let err = spec.validate().unwrap_err();
         assert!(err.contains("standard PEM label form"), "{err}");
+    }
+
+    // ─── category↔形状矛盾检测 (category_shape_mismatch) ────────────────
+
+    #[test]
+    fn mismatch_detects_all_three_contradictions() {
+        let s = MockStrategy::default();
+        // PEM + 非 privatekey 标注 → 行为已按 PEM (不受标注影响), 提醒改标注.
+        assert_eq!(
+            s.category_shape_mismatch(TEST_PEM, SecretCategory::ApiKey, ""),
+            Some(CategoryShapeMismatch::PemButNotPrivatekey)
+        );
+        // JWT + 非 token 标注 → 静默丢失增强, 提醒改标注可启用.
+        assert_eq!(
+            s.category_shape_mismatch(TEST_JWT, SecretCategory::Other, ""),
+            Some(CategoryShapeMismatch::JwtButNotToken)
+        );
+        // 白名单前缀 + 非 apikey 标注 → 同上.
+        let m = s
+            .category_shape_mismatch("AKIAIOSFODNN7EXAMPLE", SecretCategory::Token, "")
+            .unwrap();
+        assert_eq!(m, CategoryShapeMismatch::PublicPrefixButNotApiKey);
+        // WARN 文案数据源映射的正确性 (写错只会产生误导性 WARN, 类型不挡).
+        assert_eq!(m.detected(), "public_prefix");
+        assert_eq!(m.suggested_category(), SecretCategory::ApiKey);
+        assert_eq!(CategoryShapeMismatch::PemButNotPrivatekey.detected(), "pem");
+        assert_eq!(
+            CategoryShapeMismatch::PemButNotPrivatekey.suggested_category(),
+            SecretCategory::PrivateKey
+        );
+        assert_eq!(CategoryShapeMismatch::JwtButNotToken.detected(), "jwt");
+        assert_eq!(
+            CategoryShapeMismatch::JwtButNotToken.suggested_category(),
+            SecretCategory::Token
+        );
+        // 标注匹配 → 无矛盾.
+        assert_eq!(
+            s.category_shape_mismatch(TEST_PEM, SecretCategory::PrivateKey, ""),
+            None
+        );
+        assert_eq!(
+            s.category_shape_mismatch(TEST_JWT, SecretCategory::Token, ""),
+            None
+        );
+        assert_eq!(
+            s.category_shape_mismatch("AKIAIOSFODNN7EXAMPLE", SecretCategory::ApiKey, ""),
+            None
+        );
+    }
+
+    #[test]
+    fn mismatch_silent_for_design_normal_cases() {
+        // 反向不检测 (设计内常态, warn 即噪音): 标注 token/privatekey/apikey 但
+        // 值无对应形状 — 平坦串即正确行为 (随机串 token / 单行 b64 私钥 /
+        // 无前缀 api key).
+        let s = MockStrategy::default();
+        assert_eq!(
+            s.category_shape_mismatch("random-access-token-xyz", SecretCategory::PrivateKey, ""),
+            None
+        );
+        assert_eq!(
+            s.category_shape_mismatch("plain-password-value", SecretCategory::Token, ""),
+            None
+        );
+        assert_eq!(
+            s.category_shape_mismatch("no-known-prefix-key", SecretCategory::ApiKey, ""),
+            None
+        );
+    }
+
+    #[test]
+    fn mismatch_skipped_when_user_took_over() {
+        // Fixed / 用户显式 gen_spec / global_prefix 非空 = 用户接管, 矛盾无行动
+        // 价值, 不检测.
+        let fixed = MockStrategy {
+            initial: InitialValue::Fixed {
+                value: "mock-x".into(),
+            },
+            gen_spec: None,
+        };
+        assert_eq!(
+            fixed.category_shape_mismatch(TEST_PEM, SecretCategory::ApiKey, ""),
+            None
+        );
+        let mut with_gen = MockStrategy::default();
+        with_gen.resolve_against("whatever-value-here", SecretCategory::Other, "");
+        assert_eq!(
+            with_gen.category_shape_mismatch(TEST_JWT, SecretCategory::Other, ""),
+            None
+        );
+        assert_eq!(
+            MockStrategy::default().category_shape_mismatch(
+                TEST_PEM,
+                SecretCategory::ApiKey,
+                "sgm_"
+            ),
+            None
+        );
     }
 
     proptest! {

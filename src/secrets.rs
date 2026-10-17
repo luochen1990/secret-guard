@@ -168,11 +168,16 @@ impl SecretEntry {
     /// 2. **resolve_value**: 从 `value_file` 读文件写入 `value` (fail-fast: 读失败 → Err).
     /// 3. **内容 validate** ([`validate_value`]): resolve 后 value 是最终 redact 用的字节,
     ///    必须满足长度 / mock prefix / PUA 约束.
-    /// 4. **mock_strategy resolve + validate** ([`MockStrategy::resolve_against`] +
+    /// 4. **category↔形状矛盾检测** ([`MockStrategy::category_shape_mismatch`]):
+    ///    标注与值形状矛盾时 WARN (PEM 矛盾 = 提醒改标注保持所见/所为一致;
+    ///    JWT/公开前缀矛盾 = 提醒改标注可启用结构化 mock). 必须在步骤 5 的
+    ///    resolve **之前**跑 — 之后 `gen_spec.is_some()` 恒真 (infer 填充与用户
+    ///    显式配置不可区分), 检测会静默失效.
+    /// 5. **mock_strategy resolve + validate** ([`MockStrategy::resolve_against`] +
     ///    [`MockStrategy::validate_against_real`]): 用 resolve 后的 real value infer
     ///    gen spec (Auto 模式) 并校验 Fixed 不含 real 子串 (C5 best-effort). 必须在 value
     ///    resolve 后跑, 因为 infer 与 C5 检查都依赖 real value.
-    /// 5. **候选空间 lint** ([`MockStrategy::lint_candidate_space`]): gen spec 定型后
+    /// 6. **候选空间 lint** ([`MockStrategy::lint_candidate_space`]): gen spec 定型后
     ///    对弱候选空间 (低于 [`crate::mock::MIN_CANDIDATE_SPACE_WARN`]) 打 WARN —
     ///    把运行时 probing 耗尽的风险前置到配置写入时. 仅 WARN 不 reject (合法但高危).
     ///
@@ -184,6 +189,26 @@ impl SecretEntry {
         self.validate()?;
         self.resolve_value()?;
         validate_value(&self.value, global_mock_prefix)?;
+        // category↔形状矛盾检测 (resolve_against **之前**: 此时 gen_spec.is_some()
+        // ⟺ 用户显式配置, infer 填充与用户配置可区分): 标注与值的形状特征矛盾时
+        // WARN — PEM 矛盾 = 行为已最优但标注是语义债 (所见非所为), JWT/公开前缀
+        // 矛盾 = 静默丢失仿真增强 (暴露映射表/标注错误). 检测面与跳过条件的
+        // 完整语义见 `category_shape_mismatch` doc.
+        if let Some(mismatch) = self.mock_strategy.category_shape_mismatch(
+            &self.value,
+            self.category,
+            global_mock_prefix,
+        ) {
+            tracing::warn!(
+                secret_id = %self.id,
+                category = self.category.as_str(),
+                detected = mismatch.detected(),
+                suggested_category = mismatch.suggested_category().as_str(),
+                "secret category label mismatches the value's detected shape; \
+                 relabel for consistency (pem: mock already structured, label is \
+                 cosmetic) or to enable structured mock (jwt/public_prefix)"
+            );
+        }
         // category 透传: shape 推断的语义 hint (PrivateKey PEM 不 gate category —
         // 形状自证; Token/ApiKey gate JWT/公开前缀判定, 见 `infer_shape`).
         self.mock_strategy

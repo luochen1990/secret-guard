@@ -425,7 +425,7 @@ services.secret-guard.providers.glm-pool = {
 |---|---|---|---|
 | `id` | string | (必填) | 唯一标识, 规则同 provider id. |
 | `name` | string | — | 可选的人类可读名称 (仅 WebUI 显示). |
-| `category` | string | `"apikey"` | 类别: `password` / `apikey` / `token` / `cookie` / `privatekey` / `other`. 参与 mock 形状推断 (2026-10 起): `privatekey` + 多行 PEM 真值 → 结构化假 PEM; `token` + JWT 形状真值 → 三段点分替身; `apikey` + 公开前缀真值 (`sk-`/`ghp_`/`AKIA`...) → 保留前缀; 其余 (含类别与真值形状不匹配) 退化为平坦等长随机串 — **归类错误无害**. `global_mock_prefix` 非空时恒用平坦串 (辨识前缀与结构仿真互斥). |
+| `category` | string | `"apikey"` | 类别: `password` / `apikey` / `token` / `cookie` / `privatekey` / `other`. 参与 mock 形状推断 (2026-10 起): `privatekey` + 多行 PEM 真值 → 结构化假 PEM; `token` + JWT 形状真值 → 三段点分替身; `apikey` + 公开前缀真值 (`sk-`/`ghp_`/`AKIA`...) → 保留前缀; 其余 (含类别与真值形状不匹配) 退化为平坦等长随机串 — **归类错误无害**. `global_mock_prefix` 非空时恒用平坦串 (辨识前缀与结构仿真互斥). 标注与真值形状矛盾时启动 WARN (PEM 矛盾 = 提醒改标注保持所见/所为一致; JWT/公开前缀矛盾 = 提醒改标注可启用结构化仿真); 标注无误但形状不符 (如随机串 token) 不告警. |
 | `value` | string | `""` | secret 明文. 最少 3 字节; 不允许包含 `global_mock_prefix`; 不允许包含 Unicode 私用区字符 (U+E000..U+F8FF). 与 `value_file` 互斥. |
 | `value_file` | path | — | 启动时一次性从文件读取 (适合 sops-nix 等外部注入), 读取失败会**拒绝启动** (fail-fast: secret 缺失会让保护静默失效, 必须在部署时暴露). 文件内容自动去首尾空白. |
 | `mock_strategy` | table | (见下) | 替身 (mock) 的生成策略. 缺省时自动按真值推断: 等长、同字符集的确定性随机值. |
