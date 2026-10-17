@@ -2906,7 +2906,8 @@ mod tests {
             mock_strategy: MockStrategy::default(),
             strategy: crate::secrets::SecretStrategy::default(),
         };
-        e.mock_strategy.resolve_against(&e.value, "");
+        e.mock_strategy
+            .resolve_against(&e.value, SecretCategory::default(), "");
         e
     }
 

@@ -184,8 +184,10 @@ impl SecretEntry {
         self.validate()?;
         self.resolve_value()?;
         validate_value(&self.value, global_mock_prefix)?;
+        // category 透传: shape 推断的语义 hint (PrivateKey PEM 不 gate category —
+        // 形状自证; Token/ApiKey gate JWT/公开前缀判定, 见 `infer_shape`).
         self.mock_strategy
-            .resolve_against(&self.value, global_mock_prefix);
+            .resolve_against(&self.value, self.category, global_mock_prefix);
         self.mock_strategy.validate_against_real(&self.value)?;
         // 配置期候选空间 lint (弱 mock 策略前置 WARN, 非 reject): resolve 之后 gen_spec
         // 已定型, 此处纯读. 所有 entry 进入系统的路径 (static 加载 / dynamic 加载 /
@@ -206,45 +208,10 @@ impl SecretEntry {
     }
 }
 
-/// Secret 类别. 用于第四步选择不同的 mock 生成器.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum SecretCategory {
-    /// 密码 (相对短, 任意可打印字符).
-    Password,
-    /// API key (通常较长, 固定前缀如 sk-/ANTHROPIC-/AKIA).
-    #[default]
-    ApiKey,
-    /// 长 bearer token (JWT 等).
-    Token,
-    /// Cookie 值.
-    Cookie,
-    /// 私钥 (PEM 等, 多行).
-    PrivateKey,
-    /// 兜底.
-    Other,
-}
-
-impl SecretCategory {
-    /// 所有变体及其字符串名 (与 `#[serde(rename_all = "lowercase")]` 同步).
-    /// 单一事实来源: `all()` 与 `as_str()` 均从这里派生.
-    pub const ALL: [(Self, &'static str); 6] = [
-        (Self::Password, "password"),
-        (Self::ApiKey, "apikey"),
-        (Self::Token, "token"),
-        (Self::Cookie, "cookie"),
-        (Self::PrivateKey, "privatekey"),
-        (Self::Other, "other"),
-    ];
-
-    pub fn as_str(self) -> &'static str {
-        Self::ALL
-            .into_iter()
-            .find(|(c, _)| *c == self)
-            .map(|(_, s)| s)
-            .expect("ALL covers every variant")
-    }
-}
+/// Secret 类别 (mock 生成器的选择参数, category-aware shape 推断见
+/// `crate::mock` 头部). 定义在 mock 模块 (依赖方向 `secrets → mock` 单向),
+/// 此处 re-export 维持既有 API (`use crate::secrets::SecretCategory` 不变).
+pub use crate::mock::SecretCategory;
 
 /// per-secret 处理策略 (#305): secret 真值命中请求时 redact pipeline 的处置方式.
 ///
@@ -903,6 +870,7 @@ mod tests {
                         ..Default::default()
                     },
                     length_range: (4, 4),
+                    shape: crate::mock::SecretShape::Plain,
                 }),
             },
             strategy: SecretStrategy::default(),

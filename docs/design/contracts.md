@@ -480,12 +480,21 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 **陈述**: mock 不含 real_secret 的 ≥ `k(L)=max(4, ⌈L/3⌉)` 字符连续子串. 阈值随 secret 长度 L 自适应 (短 secret 强保护, 长 secret 弱保护, 信息泄露率上界 ~36%).
 
+> **公开格式子串豁免 (2026-10, category-aware shape 精确化)**: SecretShape 的公开
+> 结构段 — PublicPrefixed 的白名单前缀 (sk-/ghp_/AKIA..., `src/mock.rs` 的
+> `PUBLIC_KEY_PREFIXES`) 与 Pem 的 BEGIN/END 边界行 — 是 real 中**信息量为零的公开
+> 格式串** (业界约定, 非 secret 内容), mock 复用它们不泄露任何 secret 信息. C5 检查
+> (`src/mock.rs` 的 `c5_violated`) 在窗口比较前剥离 mock 的公开段, 随机部分照常做
+> ≥k 子串窗口检查 (Auto 模式重试链语义不变). 豁免只覆盖公开段本身: 随机部分撞上
+> real 任意 ≥k 窗口仍算违反.
+
 **Properties**:
 - `prop_no_real_substring_ascii`: 对任意 ASCII secret, mock 不含其 ≥ k(L) 子串. 🔁→`prop_no_real_substring` (`src/redact.rs`) + `prop_c5_gen_candidate_auto_body_no_real_substring` (`src/mock.rs`)
 - `prop_no_real_substring_multibyte`: 对任意 UTF-8 secret (中文/emoji), 同上, char-level 而非 byte-level. ✅
 - `prop_c5_auto_mode_deterministic`: Auto 模式下, 内部重试链 (C5_INTERNAL_RETRIES=10000) 使失败概率 ~(1e-5)^10000 ≈ 0, 实质等价于确定性契约. ✅
 - `prop_c5_fixed_mode_validated_on_upsert`: Fixed 模式 / 用户 prefix 在 `validate_against_real` (upsert 时) 校验, 不合格的 secret 拒绝入库. 🔁→`mock_strategy_validate_against_real_rejects_fixed_equals_real` 等 mock.rs validate 组 (upsert 链路经 `SecretEntry::validate_and_resolve` 调用)
 - `prop_secret_with_mock_prefix_rejected`: secret value 含 `global_mock_prefix` 时被 `validate_value` 拒绝 (前缀非空时生效). 🔁→`validate_value_rejects_short_pua_and_mock_prefix` (`src/secrets.rs`) + `validate_value_rejects_mock_prefix` (`tests/integration.rs`)
+- `prop_category_shape_mock_equal_length` (2026-10, category-aware shape): 对任意 (category, real) 含定向构造的 PEM/JWT/公开前缀形态, Auto infer + `gen_candidate` 的 mock 总字符数 == real 总字符数 (等长不变量 — wire 字节量无扰动), 且 shape-aware C5 (公开段豁免后随机部分无 ≥k 子串) 成立. ✅ `src/mock.rs` (+ shape 单元组: `pem_mock_is_structured_and_equal_length` / `pem_mock_c5_exemption_covers_boundary_lines_only` / `jwt_mock_is_three_segment_and_equal_length` / `public_prefixed_mock_keeps_prefix_and_equal_length`; RED-6 交叉: `pem_secret_structured_mock_round_trip` `src/redact.rs`)
 
 ### RED-6 可逆性 (round-trip identity, 非流式)
 
@@ -1490,3 +1499,4 @@ chars (char boundary 安全); 其余事件字段为受控类型, 天然无 secre
 | 2026-10-11 | RED-9 (陈述收尾) | #305 完结: protect 值从 "计划中 (预留 RED-11)" 改为 **搁置** (用户未想清语义, 不做比做错好) — 值域保留 + validate fail-fast 行为不变 (错误文案 planned→shelved), 初裁语义保留在 `SecretStrategy::Protect` 变体 doc 供重启参考; 重启另立 issue 与新契约编号, 不预留编号. redact/reject/placeholder (RED-9/RED-10) 交付完毕不受影响 | 用户决策 (2026-10-11, issue #305 关闭): protect 语义未想清, 搁置 |
 | 2026-10-11 | RED-10 (新增) + RED-9 (微调) | **placeholder 策略 (明示假值 + 蜜罐检测) 契约化 (#305 批2)**: `strategy = "placeholder"` — 请求侧命中替换为确定性明示假值 `[REDACTED:{secret_id}]` (`placeholder_for(id)`: 同 id 恒同值不依赖 seed / id 唯一 ⇒ placeholder 唯一 / 幂等, IR 已含上轮 echo 的 placeholder 是正常态), 响应侧**不还原** (restore 投影排除 placeholder 条目); 响应 finalize 蜜罐检测 (检测面 = 该请求配置的全部 placeholder secrets (`RedactionMap.leak_watch`), 事后扫 LLM 视角文本, `attach_finality` 单点收口 + `detect_response_leaks`) — **检测不干预转发** (透传 + 报警), best-effort 漏报面 (StreamScan overflow / parse 失败 / 无 codec 跳过), 报警数据不含真值 (`leak_alerts` 只存 secret_id, SEC-1/SEC-3 同型) + WebUI timeline 徽章; RED-9 的 validate fail-fast 名单移除 placeholder (仅剩 protect, RED-9 陈述同步微调 — 编号与锚点不动). 6 条 property 按实现实名 ✅ (3 条暂态 ⏳ 合并时已拆分对齐) | issue #305 批2 + "检测不干预转发" 裁决 (2026-10-11: 真值出现在 LLM 响应意味着泄露已发生 — 正是报警要揭示的; 客户端看到真值 = 用户立即看到证据; 流式场景字节已流出, 替换会造成流式/非流式行为不一致) |
 | 2026-10-12 | UI-9 (新增) + DTO-10 (措辞) | **轮次详情弹窗契约化 (quant#305)**: timeline 每轮原 info / raw 两按钮合并为单一详情入口, 弹窗双 tab — 概览 (默认, 元数据小字段: 本地 + `?view=meta` 小响应, 禁止拉完整 record) / 完整数据 (原 raw 弹窗内容, 首次激活才懒拉, quant#308 分段虚拟化不变); "感叹号" 入口 (header `.status-err` / `.leak-badge`) 点击直达概览. 配套 wire 侧: `GET /api/records/{id}` 新增 `view=meta` 档 (bodies/headers/parsed 清空, 元数据照常, `build_forward_record` 单点构造). DTO-10 消费面措辞随合并更新 ("WebUI raw 弹窗" → "WebUI 轮次详情弹窗完整数据 tab") | 用户反馈 (lc-studio/quant#305): "传输层信息" 页名不副实 (实为轮次元数据, 非传输层) + i/raw 双入口信息架构割裂; 用户方案: 合并入口 + 概览/详情 tab + 大数据按需 |
+| 2026-10-17 | RED-5 (公开格式子串豁免, category-aware shape) | **mock 结构仿真维度落地 (兑现 SecretCategory 字段的历史承诺 — 根 AGENTS.md "后续工作" category-aware 条目关闭)**: ① `SecretCategory` 迁移至 `src/mock.rs` (它是 mock 生成器的选择参数; secrets.rs re-export 维持 API, 依赖方向 secrets→mock 单向不变); ② `GenSpec` 新增 `shape` 字段 (`SecretShape`, serde default plain 兼容旧配置): privatekey+PEM (形状自证不 gate category, 归类错误免疫) → 边界行复用+等长随机 b64 行 / token+JWT (三段点分, 每段≥10 chars, 总长≥32) → 三段等长随机 b64url / apikey+公开前缀白名单 (`PUBLIC_KEY_PREFIXES` 最长命中, body≥8) → 前缀保留; 其余 (含归类错误/形状不匹配/global_mock_prefix 非空) 退化为 plain 平坦串 — **归类错误无害**; ③ **等长不变量**: 全形状 mock 总字符数 == real 总字符数 (wire 字节量无扰动); ④ **C5 公开格式子串豁免** (RED-5 精确化): PublicPrefixed 前缀与 PEM 边界行是信息量为零的公开格式串, `c5_violated` 检查前剥离 mock 公开段、随机部分照常 ≥k 窗口检查 + 重试链语义不变; ⑤ 手动配置 shape 的 validate 约束 (shape!=plain 时 prefix 必空 + jwt/pem 的 length_range 必须是与分段结构一致的单点区间); ⑥ 已知代价: GenSpec 哈希流含新字段, 升级部署后所有 mock 一次性变化 (前缀缓存失效一次, 类比 policy 变动的既有语义). property: `prop_category_shape_mock_equal_length` + shape 单元组 + RED-6 交叉 `pem_secret_structured_mock_round_trip` | 用户任务: nixos 部署把全部 sops secret 映射为 apikey 类别 (SecretCategory 字段存在但对行为零影响 — 死字段), 盘点 sops 真实类型 (password/token/privatekey 等 ~160 key) 后补齐行为缺口; 本 PR 是 sg 侧, nixos 侧 category 推导另行提交 |

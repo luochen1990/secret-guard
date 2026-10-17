@@ -156,7 +156,8 @@ fn secret(id: &str, value: &str) -> SecretEntry {
         mock_strategy: secret_guard::mock::MockStrategy::default(),
         strategy: secret_guard::secrets::SecretStrategy::default(),
     };
-    e.mock_strategy.resolve_against(&e.value, "");
+    e.mock_strategy
+        .resolve_against(&e.value, SecretCategory::default(), "");
     e
 }
 

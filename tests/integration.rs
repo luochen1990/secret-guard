@@ -465,7 +465,8 @@ fn secret(id: &str, value: &str) -> SecretEntry {
     };
     // 模拟生产 validate_and_resolve 路径: 让 Auto 模式的 gen spec 被 infer.
     // 测试用空 global_prefix (与原固定无前缀语义对齐).
-    e.mock_strategy.resolve_against(&e.value, "");
+    e.mock_strategy
+        .resolve_against(&e.value, SecretCategory::default(), "");
     e
 }
 
@@ -6333,11 +6334,13 @@ fn weak_secret(id: &str, value: &str) -> SecretEntry {
                     ..Default::default()
                 },
                 length_range: (1, 1), // 仅 10 个可能值 "0".."9"
+                shape: secret_guard::mock::SecretShape::Plain,
             }),
         },
         strategy: secret_guard::secrets::SecretStrategy::default(),
     };
-    e.mock_strategy.resolve_against(value, "");
+    e.mock_strategy
+        .resolve_against(value, SecretCategory::default(), "");
     e
 }
 

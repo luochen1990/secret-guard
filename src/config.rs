@@ -564,7 +564,19 @@ const KNOWN_FIELDS: &[(&str, &[&str])] = &[
     // MockStrategy.gen_spec (GenSpec)
     (
         "secrets.entries.mock_strategy.gen",
-        &["prefix", "charset", "length_range"],
+        &["prefix", "charset", "length_range", "shape"],
+    ),
+    // GenSpec.shape (SecretShape; serde tag = "kind"; Plain 变体是单 tag 无需清单)
+    (
+        "secrets.entries.mock_strategy.gen.shape",
+        &[
+            "kind",
+            "public_prefix",
+            "seg_lens",
+            "header_line",
+            "footer_line",
+            "body_line_lens",
+        ],
     ),
     // GenSpec.charset (Charset)
     (
@@ -1744,6 +1756,7 @@ fn serialized_full_sample_paths() -> Vec<String> {
                             other: vec!['!'],
                         },
                         length_range: (8, 12),
+                        shape: crate::mock::SecretShape::Plain,
                     }),
                 },
                 strategy: crate::secrets::SecretStrategy::default(),

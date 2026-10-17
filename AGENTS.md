@@ -53,6 +53,8 @@
 | **Route** | 路由四元组 (`model_pattern` model 通配符 / `target` 目标 / `upstream_model` 重写 / `priority` 优先级) — model_pattern 匹配请求 model 时路由到 target, priority 越大越优先 (None = 禁用) | 规则、路由规则 | provider/proxy |
 | **Router Provider** | `ProviderKind::Router` 构造的路由端点 (`routes` 路由列表必填) — 自身不转发, 按请求 model 匹配路由链式解析到链尾实体 provider (per-request, WebUI 即席改路由, #179 多规则化; sum type 化 #187) | 虚拟 endpoint、virtual provider、路由 provider、别名 | provider/proxy |
 | **Secret** | 需要从 LLM 视野中隐藏的真实敏感值 (API key / token / 密码等) | 密钥、敏感信息、真实值、真值 | 全局 |
+| **SecretCategory** | secret 条目的类别标签 (`password`/`apikey`/`token`/`cookie`/`privatekey`/`other`, serde lowercase; 定义在 `src/mock.rs` — 它是 mock 生成器的选择参数, `src/secrets.rs` re-export 维持 API), Auto 模式 mock 形状推断 (`SecretShape`) 的语义 hint: privatekey+PEM / token+JWT / apikey+公开前缀 → 结构化仿真替身, 其余平坦串; 归类错误无害 (形状 gate 退化 plain), PEM 检测不 gate category (形状自证) | secret 类别、类别 | secrets/mock |
+| **SecretShape** | mock 的结构形状维度 (`GenSpec.shape`, `src/mock.rs`; serde tag `kind`, 缺省 `plain`): plain 平坦串 (历史形态) / public_prefixed 公开前缀保留 (白名单 `PUBLIC_KEY_PREFIXES`) / jwt 三段点分 / pem 边界行+b64 行; 等长不变量 (mock 总长 == real 总长) + C5 公开格式子串豁免 (RED-5 精确化); `global_mock_prefix` 非空时恒推断 plain (辨识度与仿真度互斥) | 形状、结构形状、仿真形状 | mock/redact |
 | **SecretStrategy** | per-secret 处理策略 (`[[secrets.entries]] strategy`, serde snake_case 枚举, 默认 redact): redact = 现状透明替换 (RED-1..8 既有管辖) \| reject = 真值命中请求 → 整请求 503 拒绝转发, 零上游外发, message 只含 id + reason (SEC-2 同型, RED-9) \| placeholder = 命中替换为明示假值 `[REDACTED:{id}]` + 响应侧不还原 + 蜜罐检测报警不拦截 (检测面 = 全部 placeholder secrets, 报警不含真值, RED-10; #305 批1/批2 已交付) \| protect = 已搁置 (#305 完结决策, 值域保留配置即 fail-fast; 重启另立 issue 与契约) | 策略、处理策略、secret 策略、蜜罐检测 | secrets/redact |
 | **Session** | 由 Merkle 前缀哈希聚类的一组 Node 链 | 会话、对话、conversation | dag/web |
 | **三通道 (exhaust signal channels)** | 耗尽信号的三条独立匹配线 (HTTP status / body 码 / response header, OR 关系), 判定 SSOT = `pool::detect_exhaustion` | 信号通道、触发线 | pool |
@@ -368,7 +370,7 @@ Pool 不进此本地终结分支 (Router 专属) — pool 入口的 /models 经 
 | `dto.rs` | WebUI 响应 DTO 中立类型层 (SessionView/NodeView/.../SyncSnapshot, 域 B → 域 C wire shape; 构造逻辑留 dag) | 文件头部 `//!` (含 "为什么是顶层中立模块" 归属论证) |
 | `error.rs` | 统一应用错误类型 `AppError` (转发链 + 鉴权层共用, 不反向依赖) | 文件头部 `//!` (含与 `web::api::ApiError` 分工 + Upstream/UpstreamTimeout message 净化回传契约) |
 | `main.rs` / `cli.rs` / `lib.rs` | 二进制入口 + CLI 参数 schema | 文件头部 `//!` |
-| `mock.rs` | MockStrategy 两维度 (初始值 + 生成策略) + 确定性 seed + `[redact] global_mock_prefix` 注入 + Auto widen 兜底 (退化 charset 候选空间 < 2^20 时逐级拓宽, Auto 永不弱配置) + GenSpec 候选空间配置期 lint (WARN, 有效对象为手动配置) | 文件头部 `//!` (C3 根基) |
+| `mock.rs` | MockStrategy 两维度 (初始值 + 生成策略) + 确定性 seed + `[redact] global_mock_prefix` 注入 + Auto widen 兜底 (退化 charset 候选空间 < 2^20 时逐级拓宽, Auto 永不弱配置) + category-aware 形状推断 (`SecretCategory` → `SecretShape`: PEM/JWT/公开前缀结构仿真替身, 2026-10) + GenSpec 候选空间配置期 lint (WARN, 有效对象为手动配置) | 文件头部 `//!` (C3 根基 + category-aware 段) |
 | `pool.rs` | Pool Provider 运行时: 成员状态机 `PoolStates` (顺序 failover pick + 耗尽闹钟 + 配置对齐重建, 内存态不持久化) + 三通道耗尽信号检测器 `detect_exhaustion` (纯函数, ROB) + `PoolWatch` 响应侧旁路检测编排 + 观察面 (member_status / reset) | 文件头部 `//!` (含内置默认信号表语义域 + "提取宽判别严" 设计依据) + contracts.md **POOL-*** |
 | `privacy.rs` | 纯模式化 PII 旁路扫描器 (#257 S0.5): 手写 pattern 表 (常见 token 形状, 零新依赖) + redact seam 旁路捕获 (pre-redact 视图) + 有界 channel 后台扫描 + 内存告警存储 (cap 256 FIFO, 已登记值双层排除) + alerts API 视图; 五条红线见文件头 | 文件头部 `//!` |
 | `provider.rs` | Provider sum type (Direct 直连·多协议端点 `endpoints` + `select_endpoint` 端点选择 \| Router 路由 \| Pool 套餐池) + Route (model_pattern 通配 / priority / 路由级 upstream_model 重写) + PoolProvider/ExhaustConfig 与内置默认信号表常量 + Effective view + api_key 两来源 (Direct 条目级, 全端点共享) + `resolve_route` 路由链解析 (per-request; Router 跳按请求 model 匹配 + model 重写 pipeline, Pool 跳经 `PoolPicker` 状态机选成员) | 文件头部 `//!` |
@@ -410,6 +412,7 @@ Secret / Provider 的两种 value 来源 (`value`/`value_file`、`api_key`/`api_
 > 才生效). 这是为了保持转发核心路径的零运行时配置开销.
 
 - `[auth]` 行为注记: `enabled = true` 时浏览器 WebUI 走 OIDC, SDK 转发走本地 API key (`Authorization: Bearer sg_...`); ApiKeyStore 与 `/api/api-keys` CRUD 无认证也总是可用 ("只认证, 不隔离" 哲学, 见 `src/auth/mod.rs` 头部); `oidc.issuer_url` 启动时 Discovery 拉取端点 (fail-fast); `oidc.client_secret_file` 可缺省 (public client + PKCE 场景); `[[auth.api_keys]]` 启动时 hash 后注入 ApiKeyStore 与 WebUI 签发 key 共用同一池, 静态 key 不可删除只能 disable/enable (`label` 唯一标识; `key`/`key_file` 二选一互斥, 语义同 `src/secrets.rs` 的 `value`/`value_file`). feature gate (#276): OIDC 登录链受 cargo feature `oidc` 门控 (默认档不编译), 默认档下 `enabled = true` 启动 fail-fast (报错含 "rebuild with --features oidc", 判定 SSOT = `AuthConfig::validate`, 测试 `tests/auth_feature_gate.rs`); release 归档保持默认档, NixOS module 默认 package 带 oidc (`nix/module.nix` package 选项).
+- `category` (`[[secrets.entries]]` 字段) / `shape` (`mock_strategy.gen` 字段): 实现指针 `src/mock.rs` (`SecretCategory` + `SecretShape` + `infer_shape`/`parse_pem`/`parse_jwt`/`find_public_prefix` + `c5_violated` 公开段豁免); category 是形状推断 hint (privatekey+PEM / token+JWT / apikey+公开前缀 → 结构化替身, 归类错误无害 — 形状 gate 退化 plain; PEM 不 gate category), shape 可手动显式配置 (validate 强制 shape!=plain 时 prefix 空 + length_range 与分段结构单点一致); 语义契约 contracts.md RED-5 "公开格式子串豁免" + `prop_category_shape_mock_equal_length`; nix 侧 category 推导 SSOT 在 ~/ws/nixos `tools/more/secret-guard-redact.libx.nix`.
 - `allowed_domains`: Host 白名单完整语义 (端口宽松规则 / 归一化 / WARN 跳过条目) 见本文 "Host / Origin 校验 (SEC-7)" 段.
 - `audit_capture`: state.toml 动态字段 (**非** `[server]` 静态段, WebUI 即时切换无需重启) — 详细日志三态 `off`/`latest`/`full` (serde 反序列化兼容旧 bool: false→off / true→full; 兼容旧 `"errors"` 档: 显式迁移 latest + WARN), 实现指针 `src/config.rs::AuditCaptureMode` (三态 + 决策函数 `capture_req`/`retain(is_session_head)`/`recycle_superseded` SSOT) + `src/state.rs::AuditCapture` (运行时档位 + RMW 持久化) + `src/web/api/settings.rs` (GET/PUT 端点); off 极致省内存 / latest (**默认**, quant#307) 每会话仅保留头部最新一次请求 raw (会话前进回收祖先链, 错误请求必为头部而保留 — 排障主力档) / full 全量; timeline 不受影响 (B1 起 blocks 派生); per-request 原子 (push 快照进 `CallEvent.capture_mode`, attach 决策统一收口在 `dag::attach_response` 含 `recycle_superseded_raws` 祖先回收 — 会话分叉裁定: fork 即新 session, 祖先链 walk 穿过共享前缀回收但不误伤他 session leaf); PUT 先持久化再更新内存 (失败回滚, 与 set_decision 同型); 重启从 state.toml 恢复; 升级注意: 旧 state.toml 无此字段 → latest (默认档翻转, 出故障时至少有最新一次请求可查; 显式 `off` 的存量值保持不变). 语义契约 contracts.md CFG-7 / DTO-10.
 - `global_mock_prefix`: Auto 模式 mock 统一前缀, 注入每个 secret 的 `gen_spec.prefix`; 详见 `src/redact.rs` C5 契约.
@@ -664,7 +667,6 @@ windows/darwin。
 
 - **更多协议**: Gemini / Ollama / Bedrock / Cohere.
   新增协议只需实现 Reader + Writer trait (~200 行), 不动 dispatch.
-- mock_secret 的 category-aware 默认生成 (Password/ApiKey/Cookie 等格式感知).
 - 配置热加载; 测试覆盖率自动上报 + fuzzing (cargo-fuzz).
 - **依赖升级**: 多版本共存快照 / 归因 / 升级等待队列的 SSOT 见 **`docs/dependency-watch.md`** —
   滞后是稳态, 触发条件满足时再升; 领取 duplicate 告警或评估升级时读它.

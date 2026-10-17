@@ -33,6 +33,27 @@
 //! `gen_spec.prefix`, 让 Auto 模式生成的 mock 带统一可辨识前缀 (如 `"sgm_"`).
 //! 空 prefix = mock 无前缀 (纯 hash body). 见 [`GenSpec::infer_default_for`].
 //!
+//! # category-aware 形状推断 (结构仿真)
+//!
+//! `SecretEntry.category` ([`SecretCategory`], 定义于本模块 — 它是 mock 生成器的
+//! 选择参数) 参与 Auto 模式的 gen spec 推断, 决定 [`SecretShape`] (结构形状维度):
+//!
+//! - **PrivateKey (形状自证, 不 gate category)**: real 匹配 PEM 结构 (首行
+//!   `-----BEGIN ...-----` / 末行 `-----END ...-----` / 中间全 b64 行) → 合成
+//!   结构完整的假 PEM (复用 real 的公开边界行 + 等长随机 b64 body 行). 归类
+//!   错误免疫: category 标错时 PEM 形状仍被识别.
+//! - **Token + JWT 形状** (三段点分 b64url, 每段 ≥10 chars, 总长 ≥32) → 三段
+//!   等长随机 b64url, 点分结构保留.
+//! - **ApiKey + 公开前缀白名单** (sk-/ghp_/AKIA/AIza/glpat-/hf_/sg_/... 见
+//!   [`PUBLIC_KEY_PREFIXES`], 最长命中, body ≥8 chars) → mock 保留公开前缀.
+//! - 其余 (含 Password/Cookie/Other) → [`SecretShape::Plain`] 平坦串 (历史行为).
+//!
+//! **归类错误无害**: 所有增强都有形状 gate, category 标错最多退化为 Plain
+//! (与历史行为一致), 不产生错误行为.
+//!
+//! **global_prefix 裁决**: `global_mock_prefix` 非空时恒推断 Plain — 用户显式
+//! 配置辨识前缀 = 放弃结构仿真 (辨识度与仿真度互斥, 把矛盾交给配置).
+//!
 //! # C5: 不含 real_secret 子串 (实质确定性契约)
 //!
 //! C5 要求 mock 不含 real_secret 的**长**子串. 阈值 [`c5_threshold_len`] 随 real 长度 L
@@ -54,6 +75,12 @@
 //! 数 (~1e80), 因此 C5 在 Auto 模式下**实质等价于确定性契约**, 仅在理论上保留 best-effort
 //! 兜底 (重试链耗尽时返回最后一次候选, 由上层 redact 的 C2/C4 probing 与下游 LLM provider
 //! 兜底). 重试链不破坏 C3 (无副作用, 不消耗外部 counter).
+//!
+//! **公开格式子串豁免 (shape-aware, RED-5 精确化)**: [`SecretShape`] 的公开结构段
+//! (PublicPrefixed 的白名单前缀 / Pem 的 BEGIN·END 边界行) 是 real 中**信息量为零的
+//! 公开格式串** (业界约定, 非 secret 内容) — mock 复用它们不泄露任何 secret 信息.
+//! C5 检查 (`c5_violated`) 在窗口比较前剥离 mock 的公开段, 随机部分照常做 ≥k
+//! 子串检查. 契约条文见 contracts.md RED-5.
 //!
 //! 本段是 C5 设计论据与概率数字的 **SSOT**, 其它位置 (如 [`c5_threshold_len`] 文档、
 //! [`crate::redact`] 模块头部 C5 段) 只指针引用, 不重述.
@@ -149,20 +176,244 @@ impl Charset {
     }
 }
 
+// ─── SecretCategory (mock 生成器的选择参数) ────────────────────────────────
+
+/// Secret 类别. Auto 模式 gen spec 推断的语义 hint (参与 [`SecretShape`] 判定,
+/// 见模块头部 "category-aware 形状推断" 段).
+///
+/// 定义于 mock.rs (而非 secrets.rs): 它是 mock 生成策略的输入, 依赖方向
+/// `secrets → mock` 保持单向 (secrets.rs re-export 维持既有 API 兼容).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SecretCategory {
+    /// 密码 (相对短, 任意可打印字符).
+    Password,
+    /// API key (通常较长, 固定前缀如 sk-/sk-ant-/AKIA).
+    #[default]
+    ApiKey,
+    /// 长 bearer token (JWT 等).
+    Token,
+    /// Cookie 值.
+    Cookie,
+    /// 私钥 (PEM 等, 多行).
+    PrivateKey,
+    /// 兜底.
+    Other,
+}
+
+impl SecretCategory {
+    /// 所有变体及其字符串名 (与 `#[serde(rename_all = "lowercase")]` 同步).
+    /// 单一事实来源: `all()` 与 `as_str()` 均从这里派生.
+    pub const ALL: [(Self, &'static str); 6] = [
+        (Self::Password, "password"),
+        (Self::ApiKey, "apikey"),
+        (Self::Token, "token"),
+        (Self::Cookie, "cookie"),
+        (Self::PrivateKey, "privatekey"),
+        (Self::Other, "other"),
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        Self::ALL
+            .into_iter()
+            .find(|(c, _)| *c == self)
+            .map(|(_, s)| s)
+            .expect("ALL covers every variant")
+    }
+}
+
+// ─── SecretShape (结构形状维度) ─────────────────────────────────────────────
+
+/// GenSpec 的结构形状: mock 的分段结构 (category-aware 推断, 见模块头部
+/// "category-aware 形状推断" 段). 用户也可经 `mock_strategy.gen.shape` 显式配置.
+///
+/// **等长不变量**: 所有形状生成的 mock 总字符数 == real 总字符数
+/// (infer 出的 `length_range` 是单点区间) — wire 字节量无扰动, 与 Plain 一致.
+///
+/// **公开格式子串与 C5**: PublicPrefixed 的 `public_prefix` 与 Pem 的边界行是
+/// real 中信息量为零的公开格式串, C5 检查豁免这些段 (见 `c5_violated` 与
+/// 模块头部 "公开格式子串豁免" 段).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SecretShape {
+    /// 平坦串: `prefix + 随机 body` (历史唯一形态; 所有形状不匹配场景的兜底).
+    #[default]
+    Plain,
+    /// 公开前缀 + 随机 body: `public_prefix` 来自 [`PUBLIC_KEY_PREFIXES`] 白名单
+    /// (精确大小写, 最长命中), C5 检查豁免该前缀段. 推断 gate: category == ApiKey
+    /// 且 body (去前缀后) ≥ 8 chars.
+    PublicPrefixed {
+        /// 公开格式前缀 (白名单精确匹配, 区分大小写).
+        public_prefix: String,
+    },
+    /// JWT 三段点分: 三段等长随机 base64url + `.` 连接. 推断 gate: category ==
+    /// Token 且 real 匹配 JWT 形状 (见 `parse_jwt`).
+    Jwt {
+        /// 三段的 body 长度 (随机字符数, 不含点分隔符).
+        seg_lens: Vec<usize>,
+    },
+    /// PEM 块: 复用 real 的公开边界行 (BEGIN/END) + 每行等长随机 b64 body.
+    /// 推断 gate: real 匹配 PEM 结构 (见 `parse_pem`) — **不 gate category**
+    /// (形状自证, 归类错误免疫).
+    Pem {
+        header_line: String,
+        footer_line: String,
+        /// 每条 body 行的长度 (随机字符数, 不含 `\n`).
+        body_line_lens: Vec<usize>,
+    },
+}
+
+/// 公开 API key 前缀白名单 (业界格式约定, 精确大小写匹配; 匹配取最长命中 —
+/// `sk-ant-` 优先于 `sk-`). 新增前缀改此表: 公开格式是业界共识而非部署特例,
+/// 不做配置化 (YAGNI).
+pub const PUBLIC_KEY_PREFIXES: &[&str] = &[
+    "github_pat_",
+    "sk-ant-",
+    "glpat-",
+    "AKIA",
+    "ASIA",
+    "AIza",
+    "xoxb-",
+    "xoxa-",
+    "xoxp-",
+    "xoxs-",
+    "xoxr-",
+    "xapp-",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "hf_",
+    "gsk_",
+    "sg_",
+    "sk_",
+    "gl_",
+    "sk-",
+];
+
+/// real 的公开 API key 前缀 (白名单最长命中). body (去前缀后) < 8 chars 时返回
+/// `None` — 短 body 前缀保留意义弱 (仿真增益小) 且 C5 随机窗口空间过窄.
+fn find_public_prefix(real: &str) -> Option<&'static str> {
+    PUBLIC_KEY_PREFIXES
+        .iter()
+        .copied()
+        .filter(|p| real.starts_with(p))
+        .max_by_key(|p| p.len())
+        .filter(|p| real.chars().count() >= p.chars().count() + 8)
+}
+
+/// real 是否 PEM 块 (手写形状判定, 零依赖): 首行 `-----BEGIN <label>-----` + 末行
+/// `-----END <label>-----` + 中间 ≥1 行全为 base64 字符 (`A-Za-z0-9+/=`).
+/// 命中返回 parse 出的形状参数 (header/footer 原样复用 — 公开格式串).
+///
+/// **label 收紧** (C5 豁免前提的结构保证): `<label>` 必须匹配 `[A-Z0-9 ]+`
+/// (RFC 7468 标准标签形态, 如 `OPENSSH PRIVATE KEY`). 非标准 label (如含用户
+/// 可控内容的 `-----BEGIN hunter2-password-----`) 不识别 — C5 豁免的合法性
+/// 前提是"被豁免段是信息量为零的公开格式串", 任意 label 不满足该前提,
+/// 保守退化 Plain (等长平坦串, 无豁免). 已知边界: CRLF / 尾随换行的 PEM 因
+/// 行尾 `\r` 不匹配 b64 字符集而静默退化 Plain (value_file 的 trim 只去首尾).
+fn parse_pem(real: &str) -> Option<SecretShape> {
+    let (header, rest) = real.split_once('\n')?;
+    let (body, footer) = rest.rsplit_once('\n')?;
+    // BEGIN/END label 一致 + 标准形态 (公开格式前提, 见 pem_boundary_label).
+    if pem_boundary_label(header, "BEGIN")? != pem_boundary_label(footer, "END")? {
+        return None;
+    }
+    let is_b64_line = |l: &str| {
+        !l.is_empty()
+            && l.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '='))
+    };
+    if !body.split('\n').all(is_b64_line) {
+        return None;
+    }
+    Some(SecretShape::Pem {
+        header_line: header.to_string(),
+        footer_line: footer.to_string(),
+        body_line_lens: body.split('\n').map(|l| l.chars().count()).collect(),
+    })
+}
+
+/// PEM 边界行的标准形态 label (`-----<which> <label>-----`, which ∈ BEGIN|END):
+/// 返回 `Some(label)` 当且仅当边界行是**公开格式** — label 匹配 `[A-Z0-9 ]{1,64}`
+/// (RFC 7468 标准标签形态, 长度上限挡住 "label 内嵌大写载荷" 的伪 PEM 自伤面).
+/// 这是 Pem 形状 C5 豁免的结构前提: 推断路径 (parse_pem) 与手动配置路径
+/// (validate) 共用 — 保证被豁免的边界行恒为信息量为零的标准形态, 杜绝
+/// "自定义 label 携带真值内容整行豁免"的绕过面.
+fn pem_boundary_label<'a>(line: &'a str, which: &str) -> Option<&'a str> {
+    let label = line
+        .strip_prefix(&format!("-----{which} "))
+        .and_then(|s| s.strip_suffix("-----"))?;
+    let public_form = !label.is_empty()
+        && label.chars().count() <= 64
+        && label
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == ' ');
+    public_form.then_some(label)
+}
+
+/// real 是否 JWT (手写形状判定): 三段点分 base64url (`A-Za-z0-9_-`), 每段
+/// ≥ 10 chars, 总长 ≥ 32. 段长下限挡掉版本号 / 主机名等三段点分误判;
+/// 与 category == Token 的 gate (infer 调用处) 双重收紧.
+fn parse_jwt(real: &str) -> Option<SecretShape> {
+    let segs: Vec<&str> = real.split('.').collect();
+    if segs.len() != 3 || real.chars().count() < 32 {
+        return None;
+    }
+    let ok = segs.iter().all(|s| {
+        s.chars().count() >= 10
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+    });
+    ok.then(|| SecretShape::Jwt {
+        seg_lens: segs.iter().map(|s| s.chars().count()).collect(),
+    })
+}
+
+/// shape 推断 (category + real 形状). `global_prefix` 非空时恒 Plain
+/// (用户显式要辨识前缀 = 放弃结构仿真, 见模块头部裁决).
+fn infer_shape(real: &str, category: SecretCategory, global_prefix: &str) -> SecretShape {
+    if !global_prefix.is_empty() {
+        return SecretShape::Plain;
+    }
+    // PEM 不 gate category: 形状自证 (BEGIN/END + b64 行), 归类错误免疫.
+    if let Some(pem) = parse_pem(real) {
+        return pem;
+    }
+    match category {
+        SecretCategory::Token => parse_jwt(real).unwrap_or_default(),
+        SecretCategory::ApiKey => find_public_prefix(real)
+            .map(|p| SecretShape::PublicPrefixed {
+                public_prefix: p.to_string(),
+            })
+            .unwrap_or_default(),
+        _ => SecretShape::Plain,
+    }
+}
+
 // ─── GenSpec ───────────────────────────────────────────────────────────────
 
-/// 生成策略 (维度三): 固定前缀 + 字符集 + 长度范围.
+/// 生成策略: 固定前缀 + 字符集 + 长度范围 + 结构形状.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct GenSpec {
     /// 固定前缀. 默认空串 (不固定任何前缀, 全部随机).
+    ///
+    /// **仅 [`SecretShape::Plain`] 使用** (等价地, PublicPrefixed 的前缀在
+    /// `shape.public_prefix`); 其他形状要求本字段为空 (validate 强制) — 结构
+    /// 分段与公开前缀统一由 shape 携带, 避免双通道歧义.
     #[serde(default)]
     pub prefix: String,
     #[serde(default)]
     pub charset: Charset,
-    /// 闭区间 `[min, max]` (char count, 非 byte count).
+    /// 闭区间 `[min, max]` (char count, 非 byte count) — **mock 总长** (含结构
+    /// 分隔符与公开段). infer 出的形状恒为单点区间 (等长不变量).
     /// `(0, 0)` = 未配置 (由 [`MockStrategy::resolve_against`] 在拿到 real 后 infer).
     #[serde(default)]
     pub length_range: (usize, usize),
+    /// 结构形状 (category-aware 推断, 见 [`SecretShape`]). 默认 Plain (兼容旧配置).
+    #[serde(default)]
+    pub shape: SecretShape,
 }
 
 impl GenSpec {
@@ -172,6 +423,14 @@ impl GenSpec {
     ///
     /// `global_prefix` 来自 `[redact] global_mock_prefix` 配置 (默认空串).
     /// 让 Auto 模式生成的 mock 带可配置的统一前缀, 便于在日志 / WebUI 中视觉辨识.
+    /// 非空时恒推断 Plain (辨识度 > 仿真度, 见模块头部 "global_prefix 裁决").
+    ///
+    /// # category-aware shape (2026-10)
+    ///
+    /// `category` 参与 `infer_shape` 判定: PrivateKey + PEM / Token + JWT /
+    /// ApiKey + 公开前缀 → 结构化 shape (等长不变量保持, 仿真度提升); 其余
+    /// Plain. charset 推断源是 real 的**随机部分** (Jwt 去点 / Pem 取 body 行 /
+    /// PublicPrefixed 去公开前缀), 结构分隔符不入 pool.
     ///
     /// # Auto widen 兜底 (2026-09, 生成器扩宽发现的老缺陷)
     ///
@@ -181,21 +440,43 @@ impl GenSpec {
     /// 候选空间 < [`MIN_CANDIDATE_SPACE_WARN`] 时逐级并入标准类
     /// (lowercase → digits → uppercase), 直到达标或全部并入.
     /// - 与 lint 阈值对齐 ⇒ Auto 模式永不落入弱配置区 (lint 只对手动配置有意义);
-    /// - widen 是 (real, prefix) 的纯函数 ⇒ C3 确定性保持;
+    /// - widen 是 (real, category, prefix) 的纯函数 ⇒ C3 确定性保持;
     /// - 空间充足的 secret 不触发 ⇒ 已生成的 mock 不变, 前缀缓存兼容;
     /// - 并入只增不减 (charset ⊇ real 字符) ⇒ 仿真度单调不降;
     /// - 极短 real (n ≤ 3: 全开标准类后 65³ ≈ 27 万仍 < 2^20) 兜到"最大可达"即停 —
     ///   等长约束下空间上限 = charset_size^n, 属物理边界 (n ≥ 4 恒可达标: 62⁴ ≈ 1480 万),
     ///   残余由 fail_closed 兜底.
-    pub fn infer_default_for(real: &str, global_prefix: &str) -> Self {
+    pub fn infer_default_for(real: &str, category: SecretCategory, global_prefix: &str) -> Self {
         let n = real.chars().count();
-        let prefix_len = global_prefix.chars().count();
-        let mut charset = Charset::infer_from(real);
-        // body 候选空间 = charset_size^n (等长, 与 candidate_space 的单区间项一致).
+        let shape = infer_shape(real, category, global_prefix);
+        // charset 推断源: real 的随机部分 (结构分隔符/公开段不入 pool, 生成器按
+        // shape 重新放置结构). Plain 的随机部分就是 real 本身 (历史行为).
+        // random_source 同时是 widen 基数 random_n 的来源 — 随机字符数, 与
+        // candidate_space / body_length_range 的口径一致 (结构段不计入空间).
+        let (random_source, prefix) = match &shape {
+            SecretShape::Plain => (real.to_string(), global_prefix.to_string()),
+            SecretShape::PublicPrefixed { public_prefix } => (
+                real.chars()
+                    .skip(public_prefix.chars().count())
+                    .collect::<String>(),
+                String::new(),
+            ),
+            SecretShape::Jwt { .. } => (real.replace('.', ""), String::new()),
+            SecretShape::Pem { .. } => {
+                // body 行 concat (去边界行与换行)
+                let lines: Vec<&str> = real.split('\n').collect();
+                (lines[1..lines.len() - 1].concat(), String::new())
+            }
+        };
+        let random_n = random_source.chars().count();
+        let prefix_len = prefix.chars().count();
+        let mut charset = Charset::infer_from(&random_source);
+        // body 候选空间 = charset_size^random_n (等长, 与 candidate_space 的单区间项一致).
         // saturating_pow: 空间封顶 u64::MAX, 溢出不 panic.
-        // 注: `n as u32` 对 >u32::MAX (≈4.3e9 chars, 需 ≥4GB secret) 截断 — 物理不可达.
+        // 注: `random_n as u32` 对 >u32::MAX (≈4.3e9 chars, 需 ≥4GB secret) 截断 — 物理不可达.
         let space_short = |cs: &Charset| {
-            (cs.enabled_chars().len() as u64).saturating_pow(n as u32) < MIN_CANDIDATE_SPACE_WARN
+            (cs.enabled_chars().len() as u64).saturating_pow(random_n as u32)
+                < MIN_CANDIDATE_SPACE_WARN
         };
         // 逐级并入: lowercase 可能已被 infer 开启 (如全小写 real) — 第一步 no-op,
         // 由 recheck 驱动向 digits 推进, 自校正无需特判.
@@ -209,9 +490,10 @@ impl GenSpec {
             charset.uppercase = true;
         }
         Self {
-            prefix: global_prefix.to_string(),
+            prefix,
             charset,
             length_range: (prefix_len + n, prefix_len + n),
+            shape,
         }
     }
 
@@ -232,6 +514,102 @@ impl GenSpec {
         }
         if self.charset.is_empty() {
             return Err("charset is empty (enable at least one character class)".into());
+        }
+        // shape 一致性: 结构形状 (非 Plain) 下 prefix 字段必须为空 (结构分段与公开
+        // 前缀统一由 shape 携带, 拒绝双通道歧义配置), 且 length_range 必须与 shape
+        // 的分段结构严格一致 (等长不变量的手动配置形态).
+        //
+        // 豁免前提的结构保证 (C5): c5_violated 豁免的固定段 (public_prefix /
+        // PEM 边界行) 在此强制其"信息量为零的公开格式"属性 — public_prefix 必须
+        // ∈ PUBLIC_KEY_PREFIXES 白名单, header/footer 必须匹配标准 PEM 标签形态.
+        // 推断路径天然满足 (find_public_prefix 白名单产出 / parse_pem 的 label
+        // 收紧), 手动配置经此拦截 — 杜绝"自定义固定段携带真值内容并整段豁免
+        // C5 检查"的绕过面.
+        if !matches!(self.shape, SecretShape::Plain) && !self.prefix.is_empty() {
+            return Err(
+                "gen.prefix must be empty when shape != plain (structure is carried by \
+                 shape; for a plain prefix+body form use shape = plain)"
+                    .into(),
+            );
+        }
+        match &self.shape {
+            SecretShape::Plain => {}
+            SecretShape::PublicPrefixed { public_prefix } => {
+                let pp_len = public_prefix.chars().count();
+                if public_prefix.is_empty() || pp_len >= min {
+                    return Err(format!(
+                        "shape.public_prefixed prefix length ({pp_len}) must be in 1..min({min})"
+                    ));
+                }
+                if !PUBLIC_KEY_PREFIXES.contains(&public_prefix.as_str()) {
+                    return Err(format!(
+                        "shape.public_prefixed prefix must be a member of the public key prefix \
+                         whitelist (C5 exemption applies only to well-known format prefixes), got \
+                         {pp_len} chars"
+                    ));
+                }
+            }
+            SecretShape::Jwt { seg_lens } => {
+                if seg_lens.len() != 3 || seg_lens.contains(&0) {
+                    return Err("shape.jwt requires exactly 3 non-empty segments".into());
+                }
+                // saturating 求和: 对抗性手动值 (WebUI upsert 可达的巨大分段) 不
+                // panic (debug) / 不回绕 (release).
+                let total: usize = seg_lens
+                    .iter()
+                    .fold(0usize, |a, &b| a.saturating_add(b))
+                    .saturating_add(seg_lens.len())
+                    .saturating_sub(1);
+                if (min, max) != (total, total) {
+                    return Err(format!(
+                        "shape.jwt segments sum to {total} chars (incl. dots); length_range must \
+                         be the single point ({total}, {total})"
+                    ));
+                }
+            }
+            SecretShape::Pem {
+                header_line,
+                footer_line,
+                body_line_lens,
+            } => {
+                if header_line.is_empty() || footer_line.is_empty() {
+                    return Err("shape.pem header/footer lines must be non-empty".into());
+                }
+                match (
+                    pem_boundary_label(header_line, "BEGIN"),
+                    pem_boundary_label(footer_line, "END"),
+                ) {
+                    (Some(h), Some(f)) if h == f => {}
+                    _ => {
+                        return Err(
+                            "shape.pem header/footer must match the standard PEM label form \
+                             (-----BEGIN/END [A-Z0-9 ]{1,64}-----, labels equal): C5 exemption \
+                             applies only to well-known format boundaries"
+                                .into(),
+                        );
+                    }
+                }
+                if body_line_lens.is_empty() || body_line_lens.contains(&0) {
+                    return Err("shape.pem requires at least one non-empty body line".into());
+                }
+                let total: usize = header_line
+                    .chars()
+                    .count()
+                    .saturating_add(footer_line.chars().count())
+                    .saturating_add(1) // header 后换行
+                    .saturating_add(
+                        body_line_lens
+                            .iter()
+                            .fold(0usize, |a, &b| a.saturating_add(b)),
+                    )
+                    .saturating_add(body_line_lens.len()); // 每行后换行
+                if (min, max) != (total, total) {
+                    return Err(format!(
+                        "shape.pem structure sums to {total} chars; length_range must be the \
+                         single point ({total}, {total})"
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -272,14 +650,44 @@ pub struct CandidateSpaceLint {
 }
 
 impl GenSpec {
-    /// body (随机部分) 的长度闭区间: 总长 `length_range` 减 prefix 字符数
-    /// (saturating). 与 `gen_one_auto_body` 的生成语义对齐 — prefix 固定不随机.
+    /// 平坦两形态 (Plain / PublicPrefixed) 的固定前缀: Plain 用 `gen.prefix`,
+    /// PublicPrefixed 用 shape 携带的白名单公开前缀. Jwt / Pem 无平坦前缀概念
+    /// (validate 强制其 prefix 为空). "哪个前缀生效" 的单一落点.
+    fn flat_fixed_prefix(&self) -> &str {
+        match &self.shape {
+            SecretShape::PublicPrefixed { public_prefix } => public_prefix,
+            _ => &self.prefix,
+        }
+    }
+
+    /// body (随机部分) 的长度闭区间 (saturating). 与 `gen_one_auto_body` 的生成
+    /// 语义对齐 — 固定结构段 (prefix / 公开前缀 / PEM 边界行 / 点分隔符) 不参与
+    /// 随机选择.
+    ///
+    /// shape-aware: 平坦两形态按 `length_range - flat_fixed_prefix()` (Plain 即
+    /// 历史行为); Jwt / Pem 的分段长度由 shape 携带 (等长, 单点区间 — infer 保证,
+    /// 手动配置由 validate 强制).
     fn body_length_range(&self) -> (usize, usize) {
-        let prefix_len = self.prefix.chars().count();
-        (
-            self.length_range.0.saturating_sub(prefix_len),
-            self.length_range.1.saturating_sub(prefix_len),
-        )
+        match &self.shape {
+            SecretShape::Plain | SecretShape::PublicPrefixed { .. } => {
+                let prefix_len = self.flat_fixed_prefix().chars().count();
+                (
+                    self.length_range.0.saturating_sub(prefix_len),
+                    self.length_range.1.saturating_sub(prefix_len),
+                )
+            }
+            SecretShape::Jwt { seg_lens } => {
+                // saturating: 与 validate 侧的对抗性保证对齐 (巨大手动分段不 panic).
+                let total: usize = seg_lens.iter().fold(0usize, |a, &b| a.saturating_add(b));
+                (total, total)
+            }
+            SecretShape::Pem { body_line_lens, .. } => {
+                let total: usize = body_line_lens
+                    .iter()
+                    .fold(0usize, |a, &b| a.saturating_add(b));
+                (total, total)
+            }
+        }
     }
 
     /// 候选空间大小: 对 body 长度区间求和 `Σ charset_size^len`, u64 saturating
@@ -390,14 +798,15 @@ pub struct MockStrategy {
 
 impl MockStrategy {
     /// 在 resolve 拿到 real value 后调用:
-    /// 若 `gen=None` 且 `initial=Auto`, 用 real + `global_prefix` infer 默认 gen spec.
+    /// 若 `gen=None` 且 `initial=Auto`, 用 real + category + `global_prefix` infer
+    /// 默认 gen spec (category-aware shape, 见 [`GenSpec::infer_default_for`]).
     /// Fixed 模式不需要 gen, 保持 None.
     ///
     /// `global_prefix` 来自 `[redact] global_mock_prefix` (默认空串), 透传给
     /// [`GenSpec::infer_default_for`] 作为 infer 出的 gen_spec.prefix.
-    pub fn resolve_against(&mut self, real: &str, global_prefix: &str) {
+    pub fn resolve_against(&mut self, real: &str, category: SecretCategory, global_prefix: &str) {
         if self.gen_spec.is_none() && matches!(self.initial, InitialValue::Auto) {
-            self.gen_spec = Some(GenSpec::infer_default_for(real, global_prefix));
+            self.gen_spec = Some(GenSpec::infer_default_for(real, category, global_prefix));
         }
     }
 
@@ -499,6 +908,45 @@ pub fn deterministic_seed(real: &str, strategy: &MockStrategy) -> u64 {
     crate::util::hash64(&(real, strategy))
 }
 
+/// mock 候选的 C5 检查 (shape-aware, RED-5 "公开格式子串豁免"):
+/// PublicPrefixed 剥离公开前缀段 / Pem 剥离边界行后, 对**随机部分**做 ≥k 窗口
+/// 检查 (real 整体作 needle — 随机部分撞上 real 任意窗口仍算违反, 重试链兜底).
+/// Plain / Jwt 无豁免段, 全串检查 (Jwt 的点分隔符是单字符, 低于任何 k ≥ 4 阈值,
+/// 天然不构成豁免需求).
+fn c5_violated(candidate: &str, real: &str, shape: &SecretShape, k: usize) -> bool {
+    match shape {
+        SecretShape::Plain | SecretShape::Jwt { .. } => {
+            contains_kchar_substring(candidate, real, k)
+        }
+        SecretShape::PublicPrefixed { public_prefix } => {
+            let stripped = candidate
+                .strip_prefix(public_prefix.as_str())
+                .unwrap_or(candidate);
+            contains_kchar_substring(stripped, real, k)
+        }
+        SecretShape::Pem {
+            header_line,
+            footer_line,
+            ..
+        } => {
+            let mut s = candidate;
+            if let Some(rest) = s
+                .strip_prefix(header_line)
+                .and_then(|r| r.strip_prefix('\n'))
+            {
+                s = rest;
+            }
+            if let Some(rest) = s
+                .strip_suffix(footer_line)
+                .and_then(|r| r.strip_suffix('\n'))
+            {
+                s = rest;
+            }
+            contains_kchar_substring(s, real, k)
+        }
+    }
+}
+
 /// 在给定 `seed + counter` 下生成单个候选 mock.
 ///
 /// 调用方 (redact) 按 probing 协议消费:
@@ -538,11 +986,12 @@ pub fn gen_candidate(real: &str, strategy: &MockStrategy, seed: u64, counter: u3
             }
             let k = c5_threshold_len(real);
             // 重试链: 第 retry 次用 hash(seed,counter,retry) 重 hash body.
-            // 找到第一个不含 real ≥k 字符子串的候选. 全失败则返回最后一次 (best-effort).
+            // 找到第一个不含 real ≥k 字符子串的候选 (shape-aware 豁免公开结构段,
+            // 见 `c5_violated`). 全失败则返回最后一次 (best-effort).
             // 上限是 safety bound (1e-50000 量级失败率, 实质等价于确定性, 见模块头部).
             for retry in 0..=C5_INTERNAL_RETRIES {
                 let candidate = gen_one_auto_body(gen_spec, &pool, seed, counter, retry);
-                if !contains_kchar_substring(&candidate, real, k) {
+                if !c5_violated(&candidate, real, &gen_spec.shape, k) {
                     return candidate;
                 }
             }
@@ -558,6 +1007,10 @@ pub fn gen_candidate(real: &str, strategy: &MockStrategy, seed: u64, counter: u3
 const C5_INTERNAL_RETRIES: u32 = 10_000;
 
 /// Auto 模式的单次 body 生成 (给定 `retry` 偏移量). 完全确定性, 无副作用.
+///
+/// shape-aware: 随机字符流由同一个 hash 序列驱动 (`{seed}{counter}{retry}{i}`,
+/// i 全局递增 — 结构段不消耗流索引, 保证各形状共享同一确定性生成语义), 再按
+/// shape 的结构放置 (点分隔符 / PEM 边界行与换行 / 公开前缀).
 fn gen_one_auto_body(
     gen_spec: &GenSpec,
     pool: &[char],
@@ -565,26 +1018,63 @@ fn gen_one_auto_body(
     counter: u32,
     retry: u32,
 ) -> String {
-    let (body_min, body_max) = gen_spec.body_length_range();
-
-    // body 长度: min==max 时固定, 否则按 hash 在 [body_min, body_max] 选.
-    // `retry` 进入 hash 输入 → 不同 retry 产出不同长度 (当 min!=max) 或不同字符.
-    let body_len = if body_min == body_max {
-        body_min
-    } else {
-        let h = crate::util::hash64(&format!("{seed}{counter}{retry}len"));
-        body_min + (h % (body_max - body_min + 1) as u64) as usize
+    // 随机字符流: 取流中第 offset..offset+len 个字符 (hash 索引连续, 段间无缝).
+    let random_chars = |offset: usize, len: usize| -> String {
+        (offset..offset + len)
+            .map(|i| {
+                let h = crate::util::hash64(&format!("{seed}{counter}{retry}{i}"));
+                pool[(h % pool.len() as u64) as usize]
+            })
+            .collect()
     };
 
-    let prefix_len = gen_spec.prefix.chars().count();
-    let mut buf = String::with_capacity(prefix_len + body_len);
-    buf.push_str(&gen_spec.prefix);
-    for i in 0..body_len {
-        let h = crate::util::hash64(&format!("{seed}{counter}{retry}{i}"));
-        let idx = (h % pool.len() as u64) as usize;
-        buf.push(pool[idx]);
+    match &gen_spec.shape {
+        SecretShape::Plain | SecretShape::PublicPrefixed { .. } => {
+            // 平坦两形态同构: 固定前缀 (flat_fixed_prefix 单源) + 随机 body
+            // (body 长度按 length_range - 前缀长).
+            let fixed_prefix = gen_spec.flat_fixed_prefix();
+            let (body_min, body_max) = gen_spec.body_length_range();
+            let body_len = if body_min == body_max {
+                body_min
+            } else {
+                let h = crate::util::hash64(&format!("{seed}{counter}{retry}len"));
+                body_min + (h % (body_max - body_min + 1) as u64) as usize
+            };
+            let mut buf = String::with_capacity(fixed_prefix.chars().count() + body_len);
+            buf.push_str(fixed_prefix);
+            buf.push_str(&random_chars(0, body_len));
+            buf
+        }
+        SecretShape::Jwt { seg_lens } => seg_lens
+            .iter()
+            .scan(0usize, |offset, &len| {
+                let seg = random_chars(*offset, len);
+                *offset += len;
+                Some(seg)
+            })
+            .collect::<Vec<_>>()
+            .join("."),
+        SecretShape::Pem {
+            header_line,
+            footer_line,
+            body_line_lens,
+        } => {
+            let mut buf = String::with_capacity(gen_spec.length_range.0);
+            buf.push_str(header_line);
+            buf.push('\n');
+            let mut offset = 0usize;
+            for (i, &line_len) in body_line_lens.iter().enumerate() {
+                if i > 0 {
+                    buf.push('\n');
+                }
+                buf.push_str(&random_chars(offset, line_len));
+                offset += line_len;
+            }
+            buf.push('\n');
+            buf.push_str(footer_line);
+            buf
+        }
     }
-    buf
 }
 
 // ─── tests ─────────────────────────────────────────────────────────────────
@@ -592,6 +1082,7 @@ fn gen_one_auto_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     // ─── Charset ──────────────────────────────────────────────────────────
 
@@ -638,7 +1129,7 @@ mod tests {
         // real = 4 个双引号: infer 出 other=['"'] 单字符, 空间 1^4 = 1.
         // 停在 lowercase+digits: (1+26+10)^4 = 37^4 ≈ 187 万 ≥ 2^20, uppercase 不开
         // (最小拓宽断言 — 防"一刀切全开"回归静默扩大缓存失效面).
-        let spec = GenSpec::infer_default_for("\"\"\"\"", "");
+        let spec = GenSpec::infer_default_for("\"\"\"\"", SecretCategory::default(), "");
         assert!(spec.candidate_space() >= MIN_CANDIDATE_SPACE_WARN);
         assert!(spec.charset.lowercase && spec.charset.digits && !spec.charset.uppercase);
         // widen 只并入标准类, real 的字符仍在池中 (仿真度: charset ⊇ real 字符).
@@ -648,17 +1139,36 @@ mod tests {
     /// 空间充足的典型 secret 不触发 widen (行为/缓存兼容: 已生成的 mock 不变).
     #[test]
     fn infer_default_no_widen_when_space_sufficient() {
-        // 32 位混合 charset API key: 62^32 >> 2^20.
+        // 32 位混合 charset API key: 62^29 >> 2^20. ApiKey + sk- 公开前缀 →
+        // PublicPrefixed shape (category-aware), charset 推断源是 body (去 sk-).
         let real = "sk-A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6";
-        let spec = GenSpec::infer_default_for(real, "");
-        assert_eq!(spec.charset, Charset::infer_from(real));
+        let spec = GenSpec::infer_default_for(real, SecretCategory::default(), "");
+        assert_eq!(
+            spec.shape,
+            SecretShape::PublicPrefixed {
+                public_prefix: "sk-".into()
+            }
+        );
+        assert_eq!(
+            spec.charset,
+            Charset::infer_from("A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6")
+        );
+        // 等长不变量: mock 总长 (含公开前缀) == real 总长.
+        assert_eq!(
+            spec.length_range,
+            (real.chars().count(), real.chars().count())
+        );
+        // 同一 real 归为 Other (归类错误场景): 退化为 Plain, charset 推断源回到 real.
+        let plain = GenSpec::infer_default_for(real, SecretCategory::Other, "");
+        assert_eq!(plain.shape, SecretShape::Plain);
+        assert_eq!(plain.charset, Charset::infer_from(real));
     }
 
     /// 短 real 的固有边界 (n ≤ 3): 全开标准类也达不到阈值 — widen 兜到
     /// "最大可达"即停 (等长约束下空间上限 = charset_size^n, 物理边界).
     #[test]
     fn infer_default_widen_stops_at_physical_limit() {
-        let spec = GenSpec::infer_default_for("a", "");
+        let spec = GenSpec::infer_default_for("a", SecretCategory::default(), "");
         // 1 字符 body 全开 (62 标准字符) 候选 62 < 2^20: widen 并完全部标准类后停止.
         assert!(spec.charset.lowercase && spec.charset.digits && spec.charset.uppercase);
     }
@@ -667,7 +1177,7 @@ mod tests {
     /// 同样走 widen — charset 处理与 ASCII 无关 (enabled_chars 按 char, 非 byte).
     #[test]
     fn infer_default_widens_unicode_degenerate_charset() {
-        let spec = GenSpec::infer_default_for("密密密密", "");
+        let spec = GenSpec::infer_default_for("密密密密", SecretCategory::default(), "");
         assert!(spec.candidate_space() >= MIN_CANDIDATE_SPACE_WARN);
         assert!(spec.charset.enabled_chars().contains(&'密'));
     }
@@ -724,7 +1234,7 @@ mod tests {
     #[test]
     fn genspec_infer_default_for_real() {
         // 默认 (空 global_prefix): prefix 空, length == real 长度.
-        let gen_spec = GenSpec::infer_default_for("sk-Abc123", "");
+        let gen_spec = GenSpec::infer_default_for("sk-Abc123", SecretCategory::default(), "");
         assert_eq!(gen_spec.prefix, "");
         assert!(gen_spec.charset.lowercase);
         assert!(gen_spec.charset.uppercase);
@@ -736,14 +1246,14 @@ mod tests {
     #[test]
     fn genspec_infer_default_with_global_prefix() {
         // 配置 global_prefix="sgm_": mock 总长 = prefix(4) + real(9) = 13.
-        let gen_spec = GenSpec::infer_default_for("sk-Abc123", "sgm_");
+        let gen_spec = GenSpec::infer_default_for("sk-Abc123", SecretCategory::default(), "sgm_");
         assert_eq!(gen_spec.prefix, "sgm_");
         assert_eq!(gen_spec.length_range, (13, 13));
     }
 
     #[test]
     fn genspec_infer_default_empty_real() {
-        let gen_spec = GenSpec::infer_default_for("", "");
+        let gen_spec = GenSpec::infer_default_for("", SecretCategory::default(), "");
         assert_eq!(gen_spec.length_range, (0, 0));
         // 空 real: n=0 时空间恒 1 < 阈值, widen 全开标准类 (空 real 在生产路径
         // 被 redact_ir_inner 的 !value.is_empty() 过滤, 此形态仅测试可达).
@@ -761,6 +1271,7 @@ mod tests {
                 ..Default::default()
             },
             length_range: (0, 0),
+            shape: SecretShape::Plain,
         };
         assert!(gen_spec.validate().is_err());
     }
@@ -774,6 +1285,7 @@ mod tests {
                 ..Default::default()
             },
             length_range: (10, 5),
+            shape: SecretShape::Plain,
         };
         assert!(gen_spec.validate().is_err());
     }
@@ -787,6 +1299,7 @@ mod tests {
                 ..Default::default()
             },
             length_range: (5, 10), // min=5 < prefix=10.
+            shape: SecretShape::Plain,
         };
         let err = gen_spec.validate().unwrap_err();
         assert!(err.contains("prefix length"), "{err}");
@@ -798,6 +1311,7 @@ mod tests {
             prefix: "".into(),
             charset: Charset::default(),
             length_range: (10, 10),
+            shape: SecretShape::Plain,
         };
         let err = gen_spec.validate().unwrap_err();
         assert!(err.contains("charset is empty"), "{err}");
@@ -813,6 +1327,7 @@ mod tests {
                 ..Default::default()
             },
             length_range: (10, 20),
+            shape: SecretShape::Plain,
         };
         assert!(gen_spec.validate().is_ok());
     }
@@ -834,6 +1349,7 @@ mod tests {
             prefix: "".into(),
             charset: charset_of("ab"),
             length_range: (4, 4),
+            shape: SecretShape::Plain,
         };
         assert_eq!(gen_spec.candidate_space(), 16);
     }
@@ -845,6 +1361,7 @@ mod tests {
             prefix: "".into(),
             charset: charset_of("ab"),
             length_range: (3, 5),
+            shape: SecretShape::Plain,
         };
         assert_eq!(gen_spec.candidate_space(), 8 + 16 + 32);
     }
@@ -856,6 +1373,7 @@ mod tests {
             prefix: "ab".into(),
             charset: charset_of("xy"),
             length_range: (4, 4),
+            shape: SecretShape::Plain,
         };
         assert_eq!(gen_spec.candidate_space(), 4);
         assert_eq!(gen_spec.body_length_range(), (2, 2));
@@ -872,6 +1390,7 @@ mod tests {
                 ..Default::default()
             },
             length_range: (64, 64),
+            shape: SecretShape::Plain,
         };
         assert_eq!(gen_spec.candidate_space(), u64::MAX);
         // 极宽区间同样封顶 (早退, 不长循环).
@@ -879,6 +1398,7 @@ mod tests {
             prefix: "".into(),
             charset: charset_of("ab"),
             length_range: (1, usize::MAX),
+            shape: SecretShape::Plain,
         };
         assert_eq!(wide.candidate_space(), u64::MAX);
     }
@@ -890,6 +1410,7 @@ mod tests {
             prefix: "".into(),
             charset: charset_of("x"),
             length_range: (4, 8),
+            shape: SecretShape::Plain,
         };
         assert_eq!(gen_spec.candidate_space(), 5);
     }
@@ -902,6 +1423,7 @@ mod tests {
             prefix: "".into(),
             charset: Charset::default(),
             length_range: (4, 4),
+            shape: SecretShape::Plain,
         };
         assert_eq!(empty_cs.candidate_space(), 0);
         // 未配置 (0,0) → 单一空 body 候选 = 1.
@@ -909,6 +1431,7 @@ mod tests {
             prefix: "".into(),
             charset: charset_of("ab"),
             length_range: (0, 0),
+            shape: SecretShape::Plain,
         };
         assert_eq!(unconfigured.candidate_space(), 1);
         // 畸形 min > max → 空集求和 = 0.
@@ -916,6 +1439,7 @@ mod tests {
             prefix: "".into(),
             charset: charset_of("ab"),
             length_range: (5, 3),
+            shape: SecretShape::Plain,
         };
         assert_eq!(malformed.candidate_space(), 0);
     }
@@ -931,6 +1455,7 @@ mod tests {
                 prefix: "".into(),
                 charset: charset_of("ab"),
                 length_range: (4, 4),
+                shape: SecretShape::Plain,
             }),
         };
         let lint = s.lint_candidate_space().expect("weak spec should lint");
@@ -954,6 +1479,7 @@ mod tests {
                     ..Default::default()
                 },
                 length_range: (12, 12),
+                shape: SecretShape::Plain,
             }),
         };
         assert!(s.lint_candidate_space().is_none());
@@ -967,18 +1493,18 @@ mod tests {
         // "aaaa": infer lowercase (26^4 = 456976 < 2^20) → widen 并入 digits →
         // 36^4 = 1679616 ≥ 2^20 → 停.
         let mut s = MockStrategy::default();
-        s.resolve_against("aaaa", "");
+        s.resolve_against("aaaa", SecretCategory::default(), "");
         assert!(s.lint_candidate_space().is_none());
         // 全 "other" 字符的退化 real: infer 单字符 '!' (空间 1) → widen 并入
         // lowercase+digits ((1+26+10)^4 = 37^4 ≈ 187 万 ≥ 2^20) → 停, uppercase 未开.
         let mut s = MockStrategy::default();
-        s.resolve_against("!!!!", "");
+        s.resolve_against("!!!!", SecretCategory::default(), "");
         assert!(s.lint_candidate_space().is_none());
         // **n=3 物理边界**: "abc" 全小写无 other, 全开后 62³ = 238,328 仍 < 2^20 —
         // (65³ ≈ 27.5 万是 n=3 含 other 的理论上界, 见 infer_default_for doc) —
         // Auto 极短 real 在全开兜底后仍 lint (边界语义钉住, 防 widen/阈值漂移).
         let mut s = MockStrategy::default();
-        s.resolve_against("abc", "");
+        s.resolve_against("abc", SecretCategory::default(), "");
         let lint = s
             .lint_candidate_space()
             .expect("n=3 real 全开仍低于阈值, 应 lint");
@@ -989,7 +1515,7 @@ mod tests {
     fn lint_auto_normal_real_is_none() {
         // Auto + 正常 real (多种字符, 足够长) → infer 空间远超 2^20.
         let mut s = MockStrategy::default();
-        s.resolve_against("sk-1234567890abcdef", "");
+        s.resolve_against("sk-1234567890abcdef", SecretCategory::default(), "");
         assert!(s.lint_candidate_space().is_none());
     }
 
@@ -1017,6 +1543,7 @@ mod tests {
                 prefix: "".into(),
                 charset: charset_of("ab"),
                 length_range: (20, 20), // 2^20 = MIN_CANDIDATE_SPACE_WARN.
+                shape: SecretShape::Plain,
             }),
         };
         assert_eq!(
@@ -1031,6 +1558,7 @@ mod tests {
                 prefix: "".into(),
                 charset: charset_of("ab"),
                 length_range: (19, 19), // 2^19 = 阈值/2 < 阈值.
+                shape: SecretShape::Plain,
             }),
         };
         assert!(
@@ -1051,7 +1579,7 @@ mod tests {
     #[test]
     fn mock_strategy_resolve_infers_gen_for_auto() {
         let mut s = MockStrategy::default();
-        s.resolve_against("sk-Abc123", "");
+        s.resolve_against("sk-Abc123", SecretCategory::default(), "");
         let gen_spec = s.gen_spec.expect("gen should be inferred");
         assert_eq!(gen_spec.length_range, (9, 9));
         assert!(gen_spec.charset.lowercase);
@@ -1066,12 +1594,13 @@ mod tests {
                 ..Default::default()
             },
             length_range: (20, 20),
+            shape: SecretShape::Plain,
         };
         let mut s = MockStrategy {
             initial: InitialValue::Auto,
             gen_spec: Some(user_gen.clone()),
         };
-        s.resolve_against("sk-Abc123", "");
+        s.resolve_against("sk-Abc123", SecretCategory::default(), "");
         // 用户设置的 gen 不被覆盖.
         assert_eq!(s.gen_spec.as_ref().unwrap(), &user_gen);
     }
@@ -1085,7 +1614,7 @@ mod tests {
             },
             gen_spec: None,
         };
-        s.resolve_against("sk-Abc123", "");
+        s.resolve_against("sk-Abc123", SecretCategory::default(), "");
         // Fixed 模式 gen 保持 None.
         assert!(s.gen_spec.is_none());
     }
@@ -1107,6 +1636,7 @@ mod tests {
                 prefix: "".into(),
                 charset: Charset::default(), // 空 charset.
                 length_range: (10, 10),
+                shape: SecretShape::Plain,
             }),
         };
         assert!(s.validate().is_err());
@@ -1243,6 +1773,7 @@ mod tests {
                     ..Default::default()
                 },
                 length_range: (20, 20),
+                shape: SecretShape::Plain,
             }),
         };
         let err = s.validate_against_real(real).unwrap_err();
@@ -1261,12 +1792,378 @@ mod tests {
                     ..Default::default()
                 },
                 length_range: (20, 20),
+                shape: SecretShape::Plain,
             }),
         };
         assert!(s.validate_against_real("sk-test-secret-value").is_ok());
     }
 
-    // ─── gen_candidate (Auto 模式) ────────────────────────────────────────
+    // ─── category-aware shape (结构仿真) ─────────────────────────────────
+
+    /// 测试用 PEM 样本 (OpenSSH format 形状: BEGIN/END 边界 + 2 行 b64 body).
+    const TEST_PEM: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABFwAAAAdzc2gtcn\nNhAAAAAwEAAQAAAQEAtc0vLB3n6e5h8xNB7FJ7dX08ZD7kWrvFarcOeSNBjSM=\n-----END OPENSSH PRIVATE KEY-----";
+    /// 测试用 JWT 样本 (三段 b64url, 段长 36/27/43).
+    const TEST_JWT: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+
+    /// resolve 辅助: Auto + 无用户 gen → infer (生产路径同型).
+    fn resolved(real: &str, category: SecretCategory) -> MockStrategy {
+        let mut s = MockStrategy::default();
+        s.resolve_against(real, category, "");
+        s
+    }
+
+    /// validate 组测试共用的 GenSpec 构造: 空前缀 + lowercase/digits charset +
+    /// 指定 shape/length_range.
+    fn shape_spec(shape: SecretShape, len: (usize, usize)) -> GenSpec {
+        GenSpec {
+            prefix: String::new(),
+            charset: Charset {
+                lowercase: true,
+                digits: true,
+                ..Default::default()
+            },
+            length_range: len,
+            shape,
+        }
+    }
+
+    #[test]
+    fn shape_infer_pem_not_gated_by_category() {
+        // 归类错误免疫: PEM 形状自证, 任意 category (含 Other/ApiKey) 都推断 Pem.
+        for cat in SecretCategory::ALL.iter().map(|(c, _)| *c) {
+            let s = resolved(TEST_PEM, cat);
+            assert!(
+                matches!(&s.gen_spec.as_ref().unwrap().shape, SecretShape::Pem { .. }),
+                "category {cat:?} should still infer Pem"
+            );
+        }
+    }
+
+    #[test]
+    fn shape_infer_jwt_gated_by_token_category() {
+        assert!(matches!(
+            resolved(TEST_JWT, SecretCategory::Token)
+                .gen_spec
+                .unwrap()
+                .shape,
+            SecretShape::Jwt { .. }
+        ));
+        // 非 Token 归类 (映射错误场景) → Plain (归类错误无害).
+        for cat in [
+            SecretCategory::ApiKey,
+            SecretCategory::Other,
+            SecretCategory::PrivateKey,
+        ] {
+            assert_eq!(
+                resolved(TEST_JWT, cat).gen_spec.unwrap().shape,
+                SecretShape::Plain
+            );
+        }
+    }
+
+    #[test]
+    fn shape_infer_public_prefix_gated_by_apikey_and_body_length() {
+        let real = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6";
+        assert!(matches!(
+            resolved(real, SecretCategory::ApiKey).gen_spec.unwrap().shape,
+            SecretShape::PublicPrefixed { public_prefix } if public_prefix == "ghp_"
+        ));
+        // 非 ApiKey → Plain.
+        assert_eq!(
+            resolved(real, SecretCategory::Token)
+                .gen_spec
+                .unwrap()
+                .shape,
+            SecretShape::Plain
+        );
+        // body < 8 chars → Plain (前缀保留意义弱).
+        assert_eq!(
+            resolved("ghp_Ab12", SecretCategory::ApiKey)
+                .gen_spec
+                .unwrap()
+                .shape,
+            SecretShape::Plain
+        );
+    }
+
+    #[test]
+    fn shape_infer_global_prefix_forces_plain() {
+        // 用户显式辨识前缀 = 放弃结构仿真 (模块头部 "global_prefix 裁决").
+        let mut s = MockStrategy::default();
+        s.resolve_against(TEST_PEM, SecretCategory::PrivateKey, "sgm_");
+        assert_eq!(s.gen_spec.unwrap().shape, SecretShape::Plain);
+    }
+
+    #[test]
+    fn pem_mock_is_structured_and_equal_length() {
+        let s = resolved(TEST_PEM, SecretCategory::PrivateKey);
+        let mock = gen_candidate(TEST_PEM, &s, 7, 0);
+        // 等长不变量.
+        assert_eq!(mock.chars().count(), TEST_PEM.chars().count());
+        let mock_lines: Vec<&str> = mock.split('\n').collect();
+        let real_lines: Vec<&str> = TEST_PEM.split('\n').collect();
+        assert_eq!(mock_lines.len(), real_lines.len());
+        // 公开边界行原样复用 (仿真: LLM 看到的是合法形状的 key).
+        assert_eq!(mock_lines[0], real_lines[0]);
+        assert_eq!(*mock_lines.last().unwrap(), *real_lines.last().unwrap());
+        // body 行: b64 字符 + 行长与 real 对应行一致.
+        for (m, r) in mock_lines[1..mock_lines.len() - 1]
+            .iter()
+            .zip(&real_lines[1..real_lines.len() - 1])
+        {
+            assert_eq!(m.chars().count(), r.chars().count());
+            assert!(
+                m.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '='))
+            );
+        }
+        // mock != real (随机 body 事实上不同).
+        assert_ne!(mock, TEST_PEM);
+        // shape-aware C5: 公开段豁免后随机部分无 real ≥k 子串.
+        let shape = s.gen_spec.unwrap().shape;
+        assert!(!c5_violated(
+            &mock,
+            TEST_PEM,
+            &shape,
+            c5_threshold_len(TEST_PEM)
+        ));
+    }
+
+    #[test]
+    fn pem_mock_c5_exemption_covers_boundary_lines_only() {
+        // 豁免只覆盖公开边界行: 把 real 的长 b64 body 行放进候选 → 仍判定违反.
+        let s = resolved(TEST_PEM, SecretCategory::PrivateKey);
+        let shape = s.gen_spec.clone().unwrap().shape;
+        let k = c5_threshold_len(TEST_PEM);
+        let real_lines: Vec<&str> = TEST_PEM.split('\n').collect();
+        let body_line = real_lines[1]; // 64 chars b64, 是 real 的 ≥k 子串
+        let evil = format!("-----BEGIN X-----\n{body_line}\n-----END X-----");
+        assert!(c5_violated(&evil, TEST_PEM, &shape, k));
+    }
+
+    #[test]
+    fn jwt_mock_is_three_segment_and_equal_length() {
+        let s = resolved(TEST_JWT, SecretCategory::Token);
+        let mock = gen_candidate(TEST_JWT, &s, 7, 0);
+        assert_eq!(mock.chars().count(), TEST_JWT.chars().count());
+        let m_segs: Vec<&str> = mock.split('.').collect();
+        let r_segs: Vec<&str> = TEST_JWT.split('.').collect();
+        assert_eq!(m_segs.len(), 3);
+        for (m, r) in m_segs.iter().zip(&r_segs) {
+            assert_eq!(m.chars().count(), r.chars().count());
+            assert!(
+                m.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+            );
+        }
+        assert_ne!(mock, TEST_JWT);
+    }
+
+    #[test]
+    fn public_prefixed_mock_keeps_prefix_and_equal_length() {
+        let real = "AKIAIOSFODNN7EXAMPLE";
+        let s = resolved(real, SecretCategory::ApiKey);
+        let mock = gen_candidate(real, &s, 7, 0);
+        assert_eq!(mock.chars().count(), real.chars().count());
+        assert!(mock.starts_with("AKIA"));
+        assert_ne!(mock, real);
+        // shape-aware C5: 豁免 AKIA 段后随机 body 无 real ≥k 子串.
+        let shape = s.gen_spec.unwrap().shape;
+        assert!(!c5_violated(&mock, real, &shape, c5_threshold_len(real)));
+    }
+
+    #[test]
+    fn find_public_prefix_longest_match_wins() {
+        // sk-ant- (Anthropic) 优先于 sk- (OpenAI 系), 防前缀截断.
+        let real = "sk-ant-api03-ABCDEFGHIJKLMNOP";
+        let s = resolved(real, SecretCategory::ApiKey);
+        assert!(matches!(
+            s.gen_spec.unwrap().shape,
+            SecretShape::PublicPrefixed { public_prefix } if public_prefix == "sk-ant-"
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_prefix_with_structural_shape() {
+        // 结构形状下 prefix 字段必须为空 (双通道歧义拒绝).
+        let spec = GenSpec {
+            prefix: "sgm_".into(),
+            ..shape_spec(
+                SecretShape::Jwt {
+                    seg_lens: vec![10, 9, 9],
+                },
+                (30, 30),
+            )
+        };
+        let err = spec.validate().unwrap_err();
+        assert!(err.contains("gen.prefix must be empty"), "{err}");
+    }
+
+    #[test]
+    fn validate_jwt_length_range_must_match_segments() {
+        // 结构总长 10+9+9+2 = 30.
+        let mk = |len: (usize, usize)| {
+            shape_spec(
+                SecretShape::Jwt {
+                    seg_lens: vec![10, 9, 9],
+                },
+                len,
+            )
+        };
+        assert!(mk((30, 30)).validate().is_ok());
+        let err = mk((29, 30)).validate().unwrap_err();
+        assert!(err.contains("single point (30, 30)"), "{err}");
+    }
+
+    #[test]
+    fn validate_pem_structure_must_match_length_range() {
+        let header = "-----BEGIN X-----";
+        let footer = "-----END X-----";
+        let total = header.chars().count() + 1 + 8 + 1 + footer.chars().count();
+        let mk = |len: (usize, usize)| {
+            shape_spec(
+                SecretShape::Pem {
+                    header_line: header.into(),
+                    footer_line: footer.into(),
+                    body_line_lens: vec![8],
+                },
+                len,
+            )
+        };
+        assert!(mk((total, total)).validate().is_ok());
+        assert!(mk((total + 1, total + 1)).validate().is_err());
+    }
+
+    // ─── 豁免前提的结构保证 (C5 信任面) ──────────────────────────────────
+
+    #[test]
+    fn validate_rejects_public_prefix_outside_whitelist() {
+        // 手动配置的 public_prefix 必须是公开格式白名单成员: 任意自定义串 (如
+        // 真值子串) 携带真实内容, 整段豁免 C5 会绕过 RED-5 — validate 拦截.
+        let spec = shape_spec(
+            SecretShape::PublicPrefixed {
+                public_prefix: "ZebraSecret12345".into(), // 真值的 16 字符逐字子串
+            },
+            (40, 40),
+        );
+        let err = spec.validate().unwrap_err();
+        assert!(err.contains("whitelist"), "{err}");
+        // 白名单成员 (同长度) 通过.
+        let ok = shape_spec(
+            SecretShape::PublicPrefixed {
+                public_prefix: "github_pat_".into(),
+            },
+            (40, 40),
+        );
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn parse_pem_rejects_non_standard_label() {
+        // 非标准 label (用户可控内容, 如 `-----BEGIN hunter2-password-----`) 不
+        // 识别为 PEM — 豁免前提是"信息量为零的公开格式串", 任意 label 不满足.
+        let evil = "-----BEGIN hunter2-password-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END hunter2-password-----";
+        for cat in SecretCategory::ALL.iter().map(|(c, _)| *c) {
+            assert_eq!(
+                resolved(evil, cat).gen_spec.unwrap().shape,
+                SecretShape::Plain,
+                "non-standard label must not infer Pem (category {cat:?})"
+            );
+        }
+        // 标准 label 形态 ([A-Z0-9 ]+, RFC 7468) 正常识别.
+        let std = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE KEY-----";
+        assert!(matches!(
+            resolved(std, SecretCategory::PrivateKey)
+                .gen_spec
+                .unwrap()
+                .shape,
+            SecretShape::Pem { .. }
+        ));
+    }
+
+    #[test]
+    fn parse_pem_rejects_mismatched_and_oversized_labels() {
+        // BEGIN/END label 不一致 → 退化 Plain (RFC 7468 要求成对; 拒绝即无豁免,
+        // fail-safe).
+        let mismatched = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END RSA PRIVATE KEY-----";
+        assert_eq!(
+            resolved(mismatched, SecretCategory::PrivateKey)
+                .gen_spec
+                .unwrap()
+                .shape,
+            SecretShape::Plain
+        );
+        // label > 64 chars (标准形态上限) → 退化 Plain — 挡 "label 内嵌大写载荷"
+        // 的伪 PEM 自伤面.
+        let long_label = "A".repeat(65);
+        let oversized = format!(
+            "-----BEGIN {long_label}-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END {long_label}-----"
+        );
+        assert_eq!(
+            resolved(&oversized, SecretCategory::PrivateKey)
+                .gen_spec
+                .unwrap()
+                .shape,
+            SecretShape::Plain
+        );
+        // validate 手动路径同款收紧: label 一致但超长 → Err.
+        let spec = shape_spec(
+            SecretShape::Pem {
+                header_line: format!("-----BEGIN {long_label}-----"),
+                footer_line: format!("-----END {long_label}-----"),
+                body_line_lens: vec![8],
+            },
+            (200, 200),
+        );
+        let err = spec.validate().unwrap_err();
+        assert!(err.contains("standard PEM label form"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_non_standard_pem_boundary() {
+        // 手动配置的 header/footer 同样必须匹配标准 PEM 标签形态.
+        let spec = shape_spec(
+            SecretShape::Pem {
+                header_line: "-----BEGIN hunter2-password-----".into(),
+                footer_line: "-----END hunter2-password-----".into(),
+                body_line_lens: vec![10],
+            },
+            (60, 60),
+        );
+        let err = spec.validate().unwrap_err();
+        assert!(err.contains("standard PEM label form"), "{err}");
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// 等长不变量 (全 category × 全形状): infer 出的 gen spec 生成的 mock
+        /// 总字符数 == real 总字符数 — 结构化形状与 Plain 同守 wire 字节量无扰动.
+        #[test]
+        fn prop_category_shape_mock_equal_length(
+            category in 0usize..6,
+            body in "[a-zA-Z0-9+/=_-]{1,64}",
+            kind in 0usize..4,
+        ) {
+            let cat = SecretCategory::ALL[category].0;
+            // kind 定向构造四类形状输入: 0 PEM / 1 JWT / 2 公开前缀 / 3 普通串.
+            let real = match kind {
+                0 => format!("-----BEGIN X-----\n{body}\n-----END X-----"),
+                1 => format!("{body}.{body}.{body}"),
+                2 => format!("sk-{body}"),
+                _ => body.clone(),
+            };
+            // 跳过 validate_value 会拒绝的过短样本 (< 3 bytes) — infer 本身不校验,
+            // 但保持与生产入口一致的前置 (validate_and_resolve 先 validate_value).
+            if real.len() < 3 { return Ok(()); }
+            let s = resolved(&real, cat);
+            let mock = gen_candidate(&real, &s, 42, 0);
+            prop_assert_eq!(mock.chars().count(), real.chars().count());
+            // shape-aware C5 恒成立 (重试链兑现, 公开段豁免).
+            let shape = s.gen_spec.unwrap().shape;
+            prop_assert!(!c5_violated(&mock, &real, &shape, c5_threshold_len(&real)));
+        }
+    }
 
     /// 构造一个 Auto 策略 (测试 helper).
     fn auto_strategy(prefix: &str, charset: Charset, length: usize) -> MockStrategy {
@@ -1276,6 +2173,7 @@ mod tests {
                 prefix: prefix.into(),
                 charset,
                 length_range: (length, length),
+                shape: SecretShape::Plain,
             }),
         }
     }
@@ -1354,6 +2252,7 @@ mod tests {
                     ..Default::default()
                 },
                 length_range: (5, 10),
+                shape: SecretShape::Plain,
             }),
         };
         for seed in 0..100u64 {
@@ -1460,7 +2359,6 @@ mod tests {
     // C5 契约、阈值公式与内部重试链的设计论据见模块头部 "C5" 段落 (SSOT).
     // 极低基数 real (如仅 2 个不同字符) 是已知 C5 边界, 不在输入域内
     // (历史 regression: proptest-regressions/redact.txt).
-    use proptest::prelude::*;
 
     /// RED-1 / RED-5 property 测试的 GenSpec 生成器: 随机 prefix / charset 类开关组合 /
     /// `other` 自定义字符 (含多字节 €, 覆盖非 ASCII 维度 — 生成器覆盖度本身是
@@ -1498,6 +2396,7 @@ mod tests {
                         prefix,
                         charset,
                         length_range: (min, max),
+                        shape: SecretShape::Plain,
                     };
                     debug_assert!(gen_spec.validate().is_ok());
                     gen_spec
@@ -1516,6 +2415,10 @@ mod tests {
 
     /// RED-1/5 property 共用的前置: Auto 策略构造 + resolve (gen_spec None → infer,
     /// prefix 注入等语义由 resolve_against 统一处理).
+    ///
+    /// category 固定 Other (域收窄 Plain): default ApiKey 会让白名单前缀 real
+    /// (AKIA/AIza 开头) 推断 PublicPrefixed, 与无豁免的 `assert_no_c5_substring`
+    /// 口径冲突 (RED-5 公开段豁免语义) — 豁免路径由 shape 专项测试覆盖.
     fn resolved_auto_strategy(
         gen_spec: Option<GenSpec>,
         real: &str,
@@ -1525,7 +2428,7 @@ mod tests {
             initial: InitialValue::Auto,
             gen_spec,
         };
-        strategy.resolve_against(real, global_prefix);
+        strategy.resolve_against(real, SecretCategory::Other, global_prefix);
         strategy
     }
 
@@ -1536,8 +2439,10 @@ mod tests {
             real in "[A-Za-z0-9]{4,64}",
             seed in any::<u64>(),
         ) {
+            // category = Other: 域收窄 Plain (resolve_against 的 PublicPrefixed
+            // 豁免与无豁免断言口径冲突, 见 resolved_auto_strategy 注释).
             let mut strategy = MockStrategy::default();
-            strategy.resolve_against(&real, "");
+            strategy.resolve_against(&real, SecretCategory::Other, "");
             let mock = gen_candidate(&real, &strategy, seed, 0);
             assert_no_c5_substring(&mock, &real);
         }
@@ -1551,8 +2456,9 @@ mod tests {
             real in "[A-Za-z0-9]{4,64}",
             seed in any::<u64>(),
         ) {
+            // category = Other: 域收窄 Plain (同上).
             let mut strategy = MockStrategy::default();
-            strategy.resolve_against(&real, "");
+            strategy.resolve_against(&real, SecretCategory::Other, "");
             for counter in 0u32..8 {
                 let mock = gen_candidate(&real, &strategy, seed, counter);
                 assert_no_c5_substring(&mock, &real);
@@ -1713,7 +2619,7 @@ mod tests {
         // 从 real infer 策略 → resolve → gen_candidate 生成的 mock 长度 == real 长度.
         let real = "sk-Abc123_XY!";
         let mut s = MockStrategy::default();
-        s.resolve_against(real, "");
+        s.resolve_against(real, SecretCategory::default(), "");
         let seed = deterministic_seed(real, &s);
         let mock = gen_candidate(real, &s, seed, 0);
         assert_eq!(mock.chars().count(), real.chars().count());
@@ -1743,6 +2649,7 @@ mod tests {
                     ..Default::default()
                 },
                 length_range: (15, 20),
+                shape: SecretShape::Plain,
             }),
         };
         let json = serde_json::to_string(&s).unwrap();
@@ -1808,6 +2715,7 @@ mod tests {
                     ..Default::default()
                 },
                 length_range: (10, 15),
+                shape: SecretShape::Plain,
             }),
         };
         // 用一个 wrapper struct 因为 TOML 顶层必须是 table.

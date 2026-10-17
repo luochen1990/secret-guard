@@ -1596,7 +1596,10 @@ fn entry(value: &str) -> SecretEntry {
     let mut e = SecretEntry {
         id: format!("id-{value}"),
         name: None,
-        category: SecretCategory::ApiKey,
+        // category = Other: redact 层 property 的 C5 断言 (assert_no_c5_substring)
+        // 是无豁免口径, 与 ApiKey 的公开前缀豁免 (RED-5 精确化) 冲突 — 域收窄
+        // Plain 保持断言语义; 豁免路径由 mock.rs shape 专项测试覆盖.
+        category: SecretCategory::Other,
         value: value.into(),
         value_file: None,
         mock_strategy: crate::mock::MockStrategy::default(),
@@ -1605,7 +1608,8 @@ fn entry(value: &str) -> SecretEntry {
     // 测试 helper 模拟生产路径: validate_and_resolve 会调用 resolve_against,
     // 让 Auto 模式的 gen spec 被 infer 出来 (否则 gen_candidate 会 panic).
     // 测试默认场景: 空 global_prefix (Auto 模式 mock 无前缀).
-    e.mock_strategy.resolve_against(&e.value, "");
+    e.mock_strategy
+        .resolve_against(&e.value, SecretCategory::Other, "");
     e
 }
 
@@ -1775,11 +1779,13 @@ mod tests {
                         ..Default::default()
                     },
                     length_range: (1, 1), // 仅 10 个可能值
+                    shape: crate::mock::SecretShape::Plain,
                 }),
             },
             strategy: crate::secrets::SecretStrategy::default(),
         };
-        e.mock_strategy.resolve_against(secret, "");
+        e.mock_strategy
+            .resolve_against(secret, SecretCategory::Other, "");
         e
     }
 
@@ -3022,6 +3028,39 @@ mod tests {
         assert_eq!(out + &tail, "a r1 b r2 c");
     }
 
+    /// PrivateKey PEM entry (category-aware 形状推断的生产同型构造, 供
+    /// 流式/非流式两个 PEM round-trip 测试共用).
+    fn pem_entry(pem: &str) -> SecretEntry {
+        let mut e = entry(pem);
+        e.category = crate::secrets::SecretCategory::PrivateKey;
+        e.mock_strategy = crate::mock::MockStrategy::default();
+        e.mock_strategy.resolve_against(&e.value, e.category, "");
+        e
+    }
+
+    #[test]
+    fn restorer_round_trip_multiline_pem_mock() {
+        // 多行 mock (category-aware 结构化假 PEM, 含 '\n'): StreamingRestorer 的
+        // find_safe_end / replace 是内容无关的字符串匹配, 但换行跨 chunk 切分
+        // 是新形态 — 显式锁定 round-trip identity (RED-7).
+        let pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE KEY-----";
+        let e = pem_entry(pem);
+        let seed = init_seed(std::slice::from_ref(&e));
+        let mock = crate::mock::gen_candidate(pem, &e.mock_strategy, seed, 0);
+        assert!(mock.contains('\n'), "structured PEM mock is multiline");
+        let mut map = RedactionMap::default();
+        map.insert(pem.to_string(), mock.clone(), &e.id).unwrap();
+        // 逐字节 chunk 切分 (最苛刻切分) 下还原.
+        let content = format!("key: {mock} done");
+        let mut r = StreamingRestorer::new(map);
+        let mut out = String::new();
+        for c in content.chars() {
+            out.push_str(&r.push(c.to_string()));
+        }
+        let (_, tail) = r.flush();
+        assert_eq!(out + &tail, format!("key: {pem} done"));
+    }
+
     #[test]
     fn restorer_caps_buffer_at_hold_when_no_mock_in_chunk() {
         // 无 mock 时尾部仍 hold (防下个 chunk 携带 mock 前缀).
@@ -4092,6 +4131,33 @@ mod tests {
         }
     } // end proptest! block (C3/C4/C2/C5/SEC-2 + RED-6/7 response-side)
 
+    /// 与 restore 中与平坦 mock 同守 round-trip identity — 形状维度不影响可逆性.
+    #[test]
+    fn pem_secret_structured_mock_round_trip() {
+        let pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABFwAAAAdzc2gtcn\nNhAAAAAwEAAQAAAQEAtc0vLB3n6e5h8xNB7FJ7dX08ZD7kWrvFarcOeSNBjSM=\n-----END OPENSSH PRIVATE KEY-----";
+        let e = pem_entry(pem);
+        // mock 是结构化假 PEM (等长 + 边界行复用), 而非平坦乱码.
+        let seed = init_seed(std::slice::from_ref(&e));
+        let mock = crate::mock::gen_candidate(&e.value, &e.mock_strategy, seed, 0);
+        assert_eq!(mock.chars().count(), pem.chars().count());
+        assert!(mock.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----"));
+        // round-trip: redact 整块替换 + restore 还原.
+        let body = format!("deploy key:\n{pem}\n(end)");
+        let mut ir = sample_ir_with_text(&body);
+        let (map, _) = redact_ir(&mut ir, &[e]);
+        let redacted_text = match &ir.messages[0].content[0] {
+            IrBlock::Text { text, .. } => text.clone(),
+            _ => panic!("expected Text"),
+        };
+        assert!(redacted_text.contains(&mock));
+        assert!(!redacted_text.contains(pem));
+        let mut restored = redacted_text;
+        for (m, real) in &map.mock_to_real {
+            restored = restored.replace(m, real);
+        }
+        assert_eq!(restored, body);
+    }
+
     // ─── SEC-3: tracing log 不输出 secret 明文 ──────────────────────────
     //
     // 契约 (docs/design/contracts.md §7 SEC-3): 任何 tracing log 消息不得包含
@@ -4362,7 +4428,7 @@ mod hit_location_tests {
             mock_strategy: crate::mock::MockStrategy::default(),
             strategy: crate::secrets::SecretStrategy::default(),
         };
-        e.mock_strategy.resolve_against(&e.value, "");
+        e.mock_strategy.resolve_against(&e.value, e.category, "");
         e
     }
 }

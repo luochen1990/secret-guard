@@ -117,7 +117,8 @@ fn make_secrets(num: usize) -> Vec<SecretEntry> {
             };
             // 与生产路径一致: resolve_against 把 Auto 模式的 gen_spec infer 出来
             // (否则 gen_candidate 会 panic). 空 global_prefix.
-            e.mock_strategy.resolve_against(&value, "");
+            e.mock_strategy
+                .resolve_against(&value, SecretCategory::default(), "");
             e
         })
         .collect()

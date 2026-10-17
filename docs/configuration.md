@@ -425,7 +425,7 @@ services.secret-guard.providers.glm-pool = {
 |---|---|---|---|
 | `id` | string | (必填) | 唯一标识, 规则同 provider id. |
 | `name` | string | — | 可选的人类可读名称 (仅 WebUI 显示). |
-| `category` | string | `"apikey"` | 类别: `password` / `apikey` / `token` / `cookie` / `privatekey` / `other`. |
+| `category` | string | `"apikey"` | 类别: `password` / `apikey` / `token` / `cookie` / `privatekey` / `other`. 参与 mock 形状推断 (2026-10 起): `privatekey` + 多行 PEM 真值 → 结构化假 PEM; `token` + JWT 形状真值 → 三段点分替身; `apikey` + 公开前缀真值 (`sk-`/`ghp_`/`AKIA`...) → 保留前缀; 其余 (含类别与真值形状不匹配) 退化为平坦等长随机串 — **归类错误无害**. `global_mock_prefix` 非空时恒用平坦串 (辨识前缀与结构仿真互斥). |
 | `value` | string | `""` | secret 明文. 最少 3 字节; 不允许包含 `global_mock_prefix`; 不允许包含 Unicode 私用区字符 (U+E000..U+F8FF). 与 `value_file` 互斥. |
 | `value_file` | path | — | 启动时一次性从文件读取 (适合 sops-nix 等外部注入), 读取失败会**拒绝启动** (fail-fast: secret 缺失会让保护静默失效, 必须在部署时暴露). 文件内容自动去首尾空白. |
 | `mock_strategy` | table | (见下) | 替身 (mock) 的生成策略. 缺省时自动按真值推断: 等长、同字符集的确定性随机值. |
@@ -458,18 +458,28 @@ value = "ghp_0123456789abcdefghijklmnopqrstuvwxyz"
 # 固定替身写法:
 # initial = { kind = "fixed", value = "ghp_FAKEplaceholder" }
 
-# 维度二: 生成策略 (仅 initial = "auto" 时生效). 缺省按真值推断.
+# 维度二: 生成策略 (仅 initial = "auto" 时生效). 缺省按真值 + category 推断
+# (含结构形状: PEM / JWT / 公开前缀的仿真替身, 见 category 字段说明).
 [secrets.entries.mock_strategy.gen]
-prefix = "ghp_mock_"                # 固定前缀
-length_range = [24, 36]             # [最小, 最大] 字符数 (闭区间)
+prefix = "ghp_mock_"                # 固定前缀 (仅 plain 形态可用)
+length_range = [24, 36]             # [最小, 最大] 字符数 (闭区间) — mock 总长 (含结构段)
+# 结构形状 shape 可省略 (缺省 plain); 显式写法是 table 形态:
+# shape = { kind = "public_prefixed", public_prefix = "ghp_" }   # 前缀须在公开格式白名单内
+# shape = { kind = "jwt", seg_lens = [36, 27, 43] }              # length_range 须为 (总长, 总长) 单点
+# shape = { kind = "pem", header_line = "-----BEGIN X-----",
+#           footer_line = "-----END X-----", body_line_lens = [64, 64, 8] }
 [secrets.entries.mock_strategy.gen.charset]
 lowercase = true
 digits = true
 # 其他开关: uppercase / underscore / hyphen / other = ['$', '#']
 ```
 
-约束: `length_range` 两个值都须 > 0 且 min ≤ max; `prefix` 长度不能超过 min; charset 至少
-开启一类. 固定替身不能等于真值, 也不能包含真值的长子串 (启动时校验).
+约束: `length_range` 两个值都须 > 0 且 min ≤ max; `prefix` 长度不能超过 min (且
+`shape` 非 plain 形态时 `prefix` 必须为空 — 结构分段由 `shape` 携带); charset 至少
+开启一类; `jwt`/`pem` 形状的 `length_range` 必须是与其分段结构一致的单点区间
+(等长不变量). 固定替身不能等于真值, 也不能包含真值的长子串 (启动时校验;
+结构形状的公开段 — 白名单前缀 / PEM 边界行 — 豁免该子串检查, 见 contracts.md
+RED-5 "公开格式子串豁免").
 
 候选空间提示: charset 与 body 长度区间 (总长减 prefix) 共同决定候选 mock 的总数
 `Σ charset大小^长度`. 候选总数低于 2^20 (运行时探测预算) 时, 配置写入时 (static 加载 /

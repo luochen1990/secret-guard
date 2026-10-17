@@ -1615,7 +1615,8 @@ fn make_secret_entry(value: &str) -> SecretEntry {
         strategy: crate::secrets::SecretStrategy::default(),
     };
     // 模拟生产: resolve_against 让 Auto 模式 infer gen spec.
-    e.mock_strategy.resolve_against(&e.value, "");
+    e.mock_strategy
+        .resolve_against(&e.value, SecretCategory::default(), "");
     e
 }
 

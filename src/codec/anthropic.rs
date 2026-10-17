@@ -2558,7 +2558,11 @@ mod tests {
         };
         // 模拟生产: resolve_against 让 Auto 模式 infer gen spec (同 fwd_property
         // 的 make_secret_entry)。
-        entry.mock_strategy.resolve_against(&entry.value, "");
+        entry.mock_strategy.resolve_against(
+            &entry.value,
+            crate::secrets::SecretCategory::default(),
+            "",
+        );
         let (map, _) = redact_ir(&mut ir, std::slice::from_ref(&entry));
         let mock = map
             .mock_for("sk-t7-extra-leaf-99")
