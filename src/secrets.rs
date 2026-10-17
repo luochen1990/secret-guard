@@ -420,6 +420,20 @@ impl DynamicEntry for SecretEntry {
     fn set_decision(d: &mut Decisions, id: &str, mode: OverrideMode) {
         d.set_secret(id, mode);
     }
+
+    /// 持久化投影: infer 填充的 gen_spec (gen_inferred 标记) 剥离 — state.toml
+    /// 只含用户声明, 每次加载 fresh infer. 用户显式配置的 gen_spec 保留.
+    /// value 的 resolve 态 (value_file 读入的明文) 按既有语义保留落盘
+    /// (state.toml 含明文 dynamic value, 见根 AGENTS.md 配置模型).
+    /// 语义与动机见 `DynamicEntry::strip_runtime_state` trait doc.
+    fn strip_runtime_state(&self) -> Self {
+        let mut e = self.clone();
+        if e.mock_strategy.gen_inferred {
+            e.mock_strategy.gen_spec = None;
+            e.mock_strategy.gen_inferred = false;
+        }
+        e
+    }
 }
 
 // ─── SecretTable 别名 + 类型特定 effective 视图 ────────────────────────────
@@ -705,6 +719,56 @@ mod tests {
     // 用 SecretEntry 作为 canonical 类型覆盖. 这里只测 EffectiveSecret 特有的
     // masked 字段映射.
 
+    /// infer 的 gen_spec 不落盘 (persist 剥离): WebUI upsert 路径 (Web 层先
+    /// validate_and_resolve 再 upsert_dynamic, 落盘 resolve 态) 与加载后继发
+    /// persist 的 state.toml 都只含用户声明 — 每次加载 fresh infer, 且
+    /// gen_spec 的存在不再被误读为用户显式配置 (mismatch 检测的接管判据).
+    #[test]
+    fn upsert_strips_inferred_gen_spec_from_state_toml() {
+        let tmp = tempfile_path();
+        let t = SecretTable::new(vec![], vec![], empty_decisions(), tmp.clone());
+        // 生产同型: Web 层先 resolve (infer 填充 + gen_inferred=true) 再 upsert.
+        let mut e = entry("web-created", "sk-A1b2C3d4E5f6G7h8I9j0");
+        e.validate_and_resolve("").unwrap();
+        assert!(e.mock_strategy.gen_inferred, "resolve must mark inferred");
+        assert!(e.mock_strategy.gen_spec.is_some());
+        t.upsert_dynamic(e).unwrap();
+        // state.toml: 无 gen 段 (infer 剥离), value 明文按既有语义保留.
+        let text = std::fs::read_to_string(&tmp).unwrap();
+        assert!(
+            !text.contains("gen"),
+            "inferred gen must not persist: {text}"
+        );
+        assert!(text.contains("web-created"));
+        // 内存态保留 infer 结果 (redact 热路径 / effective view 依赖).
+        let mem = t.get_dynamic("web-created").unwrap();
+        assert!(mem.mock_strategy.gen_spec.is_some());
+        assert!(mem.mock_strategy.gen_inferred);
+        // 用户显式 gen 保留落盘 (非 infer).
+        let mut explicit = entry("explicit-gen", "some-random-value-123456");
+        explicit.mock_strategy = crate::mock::MockStrategy {
+            initial: crate::mock::InitialValue::Auto,
+            gen_spec: Some(crate::mock::GenSpec {
+                prefix: "keep".into(),
+                charset: crate::mock::Charset {
+                    lowercase: true,
+                    ..Default::default()
+                },
+                length_range: (30, 30),
+                shape: crate::mock::SecretShape::Plain,
+            }),
+            gen_inferred: false,
+        };
+        explicit.validate_and_resolve("").unwrap();
+        assert!(!explicit.mock_strategy.gen_inferred);
+        t.upsert_dynamic(explicit).unwrap();
+        let text = std::fs::read_to_string(&tmp).unwrap();
+        assert!(
+            text.contains("keep"),
+            "explicit user gen must persist: {text}"
+        );
+    }
+
     #[test]
     fn effective_snapshot_includes_provenance_and_masks_value() {
         let tmp = tempfile_path();
@@ -897,6 +961,7 @@ mod tests {
                     length_range: (4, 4),
                     shape: crate::mock::SecretShape::Plain,
                 }),
+                gen_inferred: false,
             },
             strategy: SecretStrategy::default(),
         };

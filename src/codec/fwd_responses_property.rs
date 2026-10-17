@@ -352,6 +352,7 @@ fn redact_reasoning_summary_is_replaced() {
     let mock_strategy = MockStrategy {
         initial: InitialValue::Auto,
         gen_spec: Some(GenSpec::default()),
+        gen_inferred: false,
     };
 
     let secret = SecretEntry {

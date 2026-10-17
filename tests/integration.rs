@@ -6336,6 +6336,7 @@ fn weak_secret(id: &str, value: &str) -> SecretEntry {
                 length_range: (1, 1), // 仅 10 个可能值 "0".."9"
                 shape: secret_guard::mock::SecretShape::Plain,
             }),
+            gen_inferred: false,
         },
         strategy: secret_guard::secrets::SecretStrategy::default(),
     };

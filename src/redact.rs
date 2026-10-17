@@ -1781,6 +1781,7 @@ mod tests {
                     length_range: (1, 1), // 仅 10 个可能值
                     shape: crate::mock::SecretShape::Plain,
                 }),
+                gen_inferred: false,
             },
             strategy: crate::secrets::SecretStrategy::default(),
         };

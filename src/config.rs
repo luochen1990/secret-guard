@@ -1423,6 +1423,23 @@ pub trait DynamicEntry: Clone + Send + Sync + 'static {
     /// 仅在 "static 存在且 override 被选中" 的组合下由调用方调用 (`get_effective` /
     /// `compute_effective_*`), dynamic-only item 不适用.
     fn inherit_from_static(&mut self, _static_ver: &Self) {}
+
+    /// 持久化前的**运行时态剥离**投影 (default: identity).
+    ///
+    /// 背景: 加载路径会对 entries 做运行时 resolve (如 SecretEntry 的
+    /// `validate_and_resolve` 把 infer 出的 mock gen spec 物化进内存条目 —
+    /// redact 热路径与 effective view 依赖它), 而持久化 RMW 直接序列化内存条目,
+    /// 运行时填充物会随之落盘. 本钩子在 `persist_dynamic` 写盘前调用, 让各类型
+    /// 把 "可安全重放" 的运行时态剥回声明态.
+    ///
+    /// - `SecretEntry`: infer 填充的 gen_spec (运行时标记 `gen_inferred`) 剥离 —
+    ///   state.toml 只含用户声明, 每次加载 fresh infer (防 stale spec 固化, 也防
+    ///   "gen_spec 存在" 被误读为用户显式配置, 见 `MockStrategy::gen_inferred`).
+    ///   value 的 resolve 态 (value_file 读入的明文) 按既有语义保留落盘.
+    /// - `Provider`: 无运行时态 (api_key 每请求现读), identity.
+    fn strip_runtime_state(&self) -> Self {
+        self.clone()
+    }
 }
 
 /// 双层 (static + dynamic) + per-id decision 的泛型表.
@@ -1676,8 +1693,14 @@ impl<T: DynamicEntry> DynamicTable<T> {
     /// 重写 state.toml 中本表对应的段 (provider / secret). 调用方必须持有 persist_lock.
     fn persist_dynamic(&self, new_dynamic: &[T]) -> anyhow::Result<()> {
         // 持久化 RMW: 同 set_decision, 用空 prefix 跳过 re-validate.
+        // 落盘前经 strip_runtime_state 投影 (infer 等运行时填充物不落盘, 见
+        // trait 方法 doc).
         let mut state = DynamicState::load_or_empty(&self.state_path, "")?;
-        T::set_state_field(&mut state, new_dynamic.to_vec());
+        let stripped: Vec<T> = new_dynamic
+            .iter()
+            .map(|e| e.strip_runtime_state())
+            .collect();
+        T::set_state_field(&mut state, stripped);
         let text = state.to_toml()?;
         atomic_write(&self.state_path, &text)
     }
@@ -1758,6 +1781,7 @@ fn serialized_full_sample_paths() -> Vec<String> {
                         length_range: (8, 12),
                         shape: crate::mock::SecretShape::Plain,
                     }),
+                    gen_inferred: false,
                 },
                 strategy: crate::secrets::SecretStrategy::default(),
             }],

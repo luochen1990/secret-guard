@@ -505,6 +505,13 @@
        #305 批2). class 名与 category 值域无交集, 共用 .pill 命名空间安全. */
     .pill.reject { background: var(--err-soft); color: var(--err); }
     .pill.placeholder { background: var(--info-soft); color: var(--info); }
+    /* mock 形状徽标 (SecretShape, category-aware 推断结果): mock 列内联于
+       auto/fixed pill 之后, 非 plain 时显示. class 用 shape- 前缀避免与 category
+       值域撞名. pem 结构仿真 (err 柔底强调多行私钥) / jwt 三段 (ok) /
+       prefixed 公开前缀保留 (info). */
+    .pill.shape-pem { background: var(--err-soft); color: var(--err); font-weight: 700; }
+    .pill.shape-jwt { background: var(--ok-soft); color: var(--ok); }
+    .pill.shape-prefixed { background: var(--info-soft); color: var(--info); }
 
     /* source badge — 区分 static / dynamic / override / preferred (软底同风格). */
     .src-badge {
@@ -2510,6 +2517,11 @@
         'form.valuePlaceholder': 'the real secret',
         'form.strategy': 'Strategy',
         'form.strategy.redact': 'Redact — transparent replacement (default)',
+        'shape.desc.pem': 'mock shape: PEM — value matches PEM structure; mock is a structured fake PEM (public boundary lines + equal-length random base64 body)',
+        'shape.desc.jwt': 'mock shape: JWT — value matches the three-segment dotted shape; mock keeps the segment structure',
+        'shape.desc.public_prefixed': 'mock shape: public prefix — value starts with a well-known key prefix (sk-/ghp_/AKIA…); mock keeps it',
+        'shape.mismatch': 'category label mismatches the detected shape',
+        'shape.suggest': 'suggest',
         'form.strategy.reject': 'Reject — refuse forwarding',
         'form.strategy.placeholder': 'Placeholder — explicit fake value + leak detection',
         'form.strategy.tip': 'How this secret is handled when spotted in a request: redact replaces it with a mock (restored on the way back); reject refuses the whole request (503, zero upstream calls); placeholder replaces it with an explicit [REDACTED:id] marker (not restored) and raises a leak alert when the real value shows up in a response.',
@@ -2974,6 +2986,11 @@
         'form.valuePlaceholder': '真实 secret 值',
         'form.strategy': '策略',
         'form.strategy.redact': 'Redact — 透明替换 (默认)',
+        'shape.desc.pem': 'mock 形状: PEM — 值匹配 PEM 结构, mock 为结构化假 PEM (公开边界行 + 等长随机 base64 行)',
+        'shape.desc.jwt': 'mock 形状: JWT — 值匹配三段点分形状, mock 保留段结构',
+        'shape.desc.public_prefixed': 'mock 形状: 公开前缀 — 值以已知 key 前缀开头 (sk-/ghp_/AKIA…), mock 保留该前缀',
+        'shape.mismatch': 'category 标注与检测到的形状不符',
+        'shape.suggest': '建议',
         'form.strategy.reject': 'Reject — 拒绝转发',
         'form.strategy.placeholder': 'Placeholder — 明示假值 + 泄露检测',
         'form.strategy.tip': '在请求中发现该 secret 时的处理方式: redact 替换为 mock (响应回传时还原); reject 拒绝整个请求 (503, 零上游外发); placeholder 替换为明示假值 [REDACTED:id] (不还原), 响应中出现真值时告警。',
@@ -6526,7 +6543,7 @@
           <td class="cell-long" title="${escapeHtml(s.value_masked || '')}"><span class="cell-ellipsis"><code>${escapeHtml(s.value_masked)}</code></span></td>
           <td class="cell-short">${escapeHtml(s.value_length)}</td>
           <td class="cell-short" title="${escapeHtml(strategyTooltip(s.strategy))}"><span class="cell-ellipsis">${strategyBadge(s.strategy)}</span></td>
-          <td class="cell-short" title="${escapeHtml(mockStrategyTooltip(s.mock_strategy))}"><span class="cell-ellipsis">${mockStrategyBadge(s.mock_strategy)}</span></td>
+          <td class="cell-short" title="${escapeHtml(mockStrategyTooltip(s.mock_strategy, s.category))}"><span class="cell-ellipsis">${mockStrategyBadge(s.mock_strategy, s.category)}</span></td>
           <td>${srcBadge(s.source)}</td>
           <td>${decisionCell('secret', s.id, s.decision, !!s.static_version)}</td>
           <td class="actions">${rowActions(s)}</td>
@@ -6546,7 +6563,7 @@
           <td class="cell-long" title="${escapeHtml(s.value_masked || '')}"><span class="cell-ellipsis"><code>${escapeHtml(s.value_masked)}</code></span></td>
           <td class="cell-short">${escapeHtml(s.value_length)}</td>
           <td class="cell-short" title="${escapeHtml(strategyTooltip(s.strategy))}"><span class="cell-ellipsis">${strategyBadge(s.strategy)}</span></td>
-          <td class="cell-short" title="${escapeHtml(mockStrategyTooltip(s.mock_strategy))}"><span class="cell-ellipsis">${mockStrategyBadge(s.mock_strategy)}</span></td>
+          <td class="cell-short" title="${escapeHtml(mockStrategyTooltip(s.mock_strategy, s.category))}"><span class="cell-ellipsis">${mockStrategyBadge(s.mock_strategy, s.category)}</span></td>
           <td>${srcBadge('static')}</td>
           <td>${decisionCell('secret', s.id, 'disabled', true)}</td>
           <td class="actions"></td>
@@ -6575,13 +6592,42 @@
     //
     // 列表只显示简短摘要 (如 "auto", "fixed"); 详情悬停 tooltip.
 
-    function mockStrategyBadge(ms) {
-      if (!ms) return '<span class="pill">default</span>';
-      const initialTag = ms.initial && ms.initial.kind === 'fixed' ? 'fixed' : 'auto';
-      return `<span class="pill">${initialTag}</span>`;
+    // mock 形状徽标 (category-aware 推断结果, "所见即所为"): gen.shape 非 plain
+    // 时在 auto/fixed pill 后内联 shape pill; hover tooltip 展示形状说明 + 与
+    // category 标注的对照 (矛盾时 ⚠ + 建议改标 — 与后端 category_shape_mismatch
+    // WARN 同一检测面的 UI 呈现). shape→期望标注映射是后端
+    // CategoryShapeMismatch::suggested_category 的前端镜像 (3 条, 稳定值域).
+    const SHAPE_EXPECTED_CATEGORY = { pem: 'privatekey', jwt: 'token', public_prefixed: 'apikey' };
+
+    function shapeOf(ms) {
+      const kind = ms && ms.gen && ms.gen.shape && ms.gen.shape.kind;
+      return kind && kind !== 'plain' ? kind : null;
     }
 
-    function mockStrategyTooltip(ms) {
+    function shapeBadgeHtml(kind) {
+      const label = kind === 'public_prefixed' ? 'prefixed' : kind;
+      return `<span class="pill shape-${escapeHtml(kind)}">${escapeHtml(label)}</span>`;
+    }
+
+    function shapeTooltipLines(kind, category) {
+      const lines = [t(`shape.desc.${kind}`)];
+      const expected = SHAPE_EXPECTED_CATEGORY[kind];
+      if (category === expected) {
+        lines.push(`category=${category} ✓`);
+      } else if (expected) {
+        lines.push(`category=${category || '?'} ⚠ ${t('shape.mismatch')} (${t('shape.suggest')}: ${expected})`);
+      }
+      return lines;
+    }
+
+    function mockStrategyBadge(ms, category) {
+      if (!ms) return '<span class="pill">default</span>';
+      const initialTag = ms.initial && ms.initial.kind === 'fixed' ? 'fixed' : 'auto';
+      const shape = shapeOf(ms);
+      return `<span class="pill">${initialTag}</span>${shape ? shapeBadgeHtml(shape) : ''}`;
+    }
+
+    function mockStrategyTooltip(ms, category) {
       if (!ms) return 'default (auto + inferred gen spec)';
       const parts = [];
       parts.push(ms.initial && ms.initial.kind === 'fixed'
@@ -6600,7 +6646,9 @@
         parts.push(`charset=${csParts.join(',') || '(none)'}`);
         parts.push(`len=[${ms.gen.length_range[0]},${ms.gen.length_range[1]}]`);
       }
-      return parts.join(' | ');
+      const shape = shapeOf(ms);
+      if (shape) parts.push(...shapeTooltipLines(shape, category));
+      return parts.join('\n');
     }
 
     // ─── provider 行渲染: router 路由摘要 + per-route egress 近似 (#179) ──────

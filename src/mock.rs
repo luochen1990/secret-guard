@@ -783,13 +783,18 @@ pub enum InitialValue {
 // ─── MockStrategy ──────────────────────────────────────────────────────────
 
 /// Mock 策略: 两维度正交组合.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+///
+/// `PartialEq` / `Eq` / `Hash` 手写**只覆盖声明态** (`initial` + `gen_spec`) —
+/// `gen_inferred` 是运行时标记, 参与 equality/seed 会让 "infer 前后" 的同一
+/// 策略产生不同 seed (C3 违例) 或假性不等.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MockStrategy {
     /// 维度一: 初始值模式. 默认 `Auto`.
     #[serde(default)]
     pub initial: InitialValue,
 
-    /// 维度二: 生成策略. `None` = 未配置 (resolve 时 infer); `Some` = 用户显式设置.
+    /// 维度二: 生成策略. `None` = 未配置 (resolve 时 infer); `Some` = 已定型
+    /// (用户显式配置, 或 resolve 推断填充 — 区分见 `gen_inferred`).
     ///
     /// 仅 `initial = Auto` 时生效; `Fixed` 模式忽略此字段.
     ///
@@ -797,6 +802,32 @@ pub struct MockStrategy {
     /// wire 兼容 (用户配置仍写 `gen = ...`).
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "gen")]
     pub gen_spec: Option<GenSpec>,
+
+    /// 运行时标记: `gen_spec` 是否由 [`MockStrategy::resolve_against`] 推断填充
+    /// (非用户显式配置). `#[serde(skip)]` — 永不参与序列化, round-trip 后恒
+    /// `false`. 持久化层 (`DynamicTable::persist_dynamic` 经
+    /// [`crate::config::DynamicEntry::strip_runtime_state`]) 依此把 infer 的
+    /// gen_spec 从 state.toml 剥离 — 落盘只含用户声明, 每次加载 fresh infer
+    /// (避免 stale spec 固化, 也避免 "gen_spec 存在" 被误读为用户显式配置).
+    ///
+    /// 不参与 `PartialEq` / `Eq` / `Hash` (见 struct 级手写 impl 说明).
+    #[serde(skip)]
+    pub gen_inferred: bool,
+}
+
+impl PartialEq for MockStrategy {
+    fn eq(&self, other: &Self) -> bool {
+        self.initial == other.initial && self.gen_spec == other.gen_spec
+    }
+}
+
+impl Eq for MockStrategy {}
+
+impl std::hash::Hash for MockStrategy {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.initial.hash(state);
+        self.gen_spec.hash(state);
+    }
 }
 
 /// category 标注与值形状的矛盾 (配置期 WARN 的检测结果, 纯数据; 语义与检测面
@@ -844,6 +875,7 @@ impl MockStrategy {
     pub fn resolve_against(&mut self, real: &str, category: SecretCategory, global_prefix: &str) {
         if self.gen_spec.is_none() && matches!(self.initial, InitialValue::Auto) {
             self.gen_spec = Some(GenSpec::infer_default_for(real, category, global_prefix));
+            self.gen_inferred = true;
         }
     }
 
@@ -866,24 +898,28 @@ impl MockStrategy {
     ///
     /// # 跳过条件 (用户已接管, 矛盾无行动价值)
     ///
-    /// - `initial = Fixed` 或用户显式配置了 `gen_spec` (含 shape): mock 形态由
-    ///   用户配置决定, 标注不参与行为.
+    /// - `initial = Fixed` 或用户显式配置了 `gen_spec` (含 shape; 判据 =
+    ///   `gen_spec.is_some() && !gen_inferred` — infer 填充不算接管): mock 形态
+    ///   由用户配置决定, 标注不参与行为.
     /// - `global_prefix` 非空: 用户显式选辨识度 = 放弃全部结构仿真 (恒推断
     ///   plain), "改标注可启用"不成立.
     ///
-    /// # 调用前提
+    /// # 调用时机
     ///
-    /// 必须在 [`MockStrategy::resolve_against`] **之前**调用 (如
-    /// `crate::secrets::SecretEntry::validate_and_resolve` 第四步前): 此时
-    /// `gen_spec.is_some()` ⟺ 用户显式配置 — resolve 之后 infer 填充与用户
-    /// 配置无法区分. real 须已 resolve (value_file 已读入).
+    /// 推荐在 [`MockStrategy::resolve_against`] **之前**调用 (如
+    /// `crate::secrets::SecretEntry::validate_and_resolve` 第四步): 此时
+    /// `gen_spec.is_some()` ⟺ 用户显式配置. `gen_inferred` 标记使其在之后
+    /// (含同一 entry 重复 validate_and_resolve 的场景) 调用仍精确. real 须已
+    /// resolve (value_file 已读入).
     pub fn category_shape_mismatch(
         &self,
         real: &str,
         category: SecretCategory,
         global_prefix: &str,
     ) -> Option<CategoryShapeMismatch> {
-        if !matches!(self.initial, InitialValue::Auto) || self.gen_spec.is_some() {
+        if !matches!(self.initial, InitialValue::Auto)
+            || (self.gen_spec.is_some() && !self.gen_inferred)
+        {
             return None;
         }
         if !global_prefix.is_empty() {
@@ -1548,6 +1584,7 @@ mod tests {
                 length_range: (4, 4),
                 shape: SecretShape::Plain,
             }),
+            gen_inferred: false,
         };
         let lint = s.lint_candidate_space().expect("weak spec should lint");
         assert_eq!(lint.space, 16);
@@ -1572,6 +1609,7 @@ mod tests {
                 length_range: (12, 12),
                 shape: SecretShape::Plain,
             }),
+            gen_inferred: false,
         };
         assert!(s.lint_candidate_space().is_none());
     }
@@ -1618,6 +1656,7 @@ mod tests {
                 value: "mock-value".into(),
             },
             gen_spec: None,
+            gen_inferred: false,
         };
         assert!(fixed.lint_candidate_space().is_none());
         // Auto 未 resolve (gen None): 空间未知, 不误报.
@@ -1636,6 +1675,7 @@ mod tests {
                 length_range: (20, 20), // 2^20 = MIN_CANDIDATE_SPACE_WARN.
                 shape: SecretShape::Plain,
             }),
+            gen_inferred: false,
         };
         assert_eq!(
             at.gen_spec.as_ref().unwrap().candidate_space(),
@@ -1651,6 +1691,7 @@ mod tests {
                 length_range: (19, 19), // 2^19 = 阈值/2 < 阈值.
                 shape: SecretShape::Plain,
             }),
+            gen_inferred: false,
         };
         assert!(
             below.lint_candidate_space().is_some(),
@@ -1690,6 +1731,7 @@ mod tests {
         let mut s = MockStrategy {
             initial: InitialValue::Auto,
             gen_spec: Some(user_gen.clone()),
+            gen_inferred: false,
         };
         s.resolve_against("sk-Abc123", SecretCategory::default(), "");
         // 用户设置的 gen 不被覆盖.
@@ -1704,6 +1746,7 @@ mod tests {
                 value: "my-mock".into(),
             },
             gen_spec: None,
+            gen_inferred: false,
         };
         s.resolve_against("sk-Abc123", SecretCategory::default(), "");
         // Fixed 模式 gen 保持 None.
@@ -1715,6 +1758,7 @@ mod tests {
         let s = MockStrategy {
             initial: InitialValue::Fixed { value: "".into() },
             gen_spec: None,
+            gen_inferred: false,
         };
         assert!(s.validate().is_err());
     }
@@ -1729,6 +1773,7 @@ mod tests {
                 length_range: (10, 10),
                 shape: SecretShape::Plain,
             }),
+            gen_inferred: false,
         };
         assert!(s.validate().is_err());
     }
@@ -1740,6 +1785,7 @@ mod tests {
                 value: "secret123".into(),
             },
             gen_spec: None,
+            gen_inferred: false,
         };
         let err = s.validate_against_real("secret123").unwrap_err();
         assert!(err.contains("must not equal"), "{err}");
@@ -1756,6 +1802,7 @@ mod tests {
                 value: "ask-tzzz".into(), // 含 real 4 字符子串 "sk-t".
             },
             gen_spec: None,
+            gen_inferred: false,
         };
         let err = s_short.validate_against_real(real_short).unwrap_err();
         assert!(err.contains("≥4 char substring"), "{err}");
@@ -1774,6 +1821,7 @@ mod tests {
                 value: "Xsk-tY".into(), // 含 real 的 4 字符子串 "sk-t".
             },
             gen_spec: None,
+            gen_inferred: false,
         };
         assert!(
             s12.validate_against_real(real12).is_err(),
@@ -1787,6 +1835,7 @@ mod tests {
                 value: "Xsk-tY".into(), // 仅 4 字符子串 "sk-t".
             },
             gen_spec: None,
+            gen_inferred: false,
         };
         assert!(
             s13_clean.validate_against_real(real13).is_ok(),
@@ -1797,6 +1846,7 @@ mod tests {
                 value: "Xsk-teY".into(), // 含 real 的 5 字符子串 "sk-te".
             },
             gen_spec: None,
+            gen_inferred: false,
         };
         let err = s13_dirty.validate_against_real(real13).unwrap_err();
         assert!(err.contains("≥5 char substring"), "{err}");
@@ -1808,6 +1858,7 @@ mod tests {
                 value: "Xsk-tY".into(),
             },
             gen_spec: None,
+            gen_inferred: false,
         };
         assert!(
             s18_clean.validate_against_real(real18).is_ok(),
@@ -1818,6 +1869,7 @@ mod tests {
                 value: "Xsk-tesY".into(), // 含 real 的 6 字符子串 "sk-tes".
             },
             gen_spec: None,
+            gen_inferred: false,
         };
         let err = s18_dirty.validate_against_real(real18).unwrap_err();
         assert!(err.contains("≥6 char substring"), "{err}");
@@ -1830,6 +1882,7 @@ mod tests {
                 value: "completely-different".into(),
             },
             gen_spec: None,
+            gen_inferred: false,
         };
         assert!(s.validate_against_real("sk-test-123456").is_ok());
     }
@@ -1846,6 +1899,7 @@ mod tests {
                 value: "prefix-你好世界-suffix".into(),
             },
             gen_spec: None,
+            gen_inferred: false,
         };
         let err = s.validate_against_real(real).unwrap_err();
         assert!(err.contains("≥4 char substring"), "{err}");
@@ -1866,6 +1920,7 @@ mod tests {
                 length_range: (20, 20),
                 shape: SecretShape::Plain,
             }),
+            gen_inferred: false,
         };
         let err = s.validate_against_real(real).unwrap_err();
         assert!(err.contains("C5 violation"), "{err}");
@@ -1885,6 +1940,7 @@ mod tests {
                 length_range: (20, 20),
                 shape: SecretShape::Plain,
             }),
+            gen_inferred: false,
         };
         assert!(s.validate_against_real("sk-test-secret-value").is_ok());
     }
@@ -2225,6 +2281,31 @@ mod tests {
         assert!(err.contains("standard PEM label form"), "{err}");
     }
 
+    // ─── gen_inferred 运行时标记 (持久化剥离 + seed 不变性) ──────────────
+
+    #[test]
+    fn gen_inferred_excluded_from_equality_and_seed() {
+        // 同一策略 infer 前后 (gen_spec None → Some + gen_inferred=true) 的
+        // 声明态不同, 但 "同一声明态 ± gen_inferred" 的 eq/hash 必须一致 —
+        // gen_inferred 参与 Hash 会让 resolve 前后的 seed 漂移 (C3 违例).
+        let mut a = MockStrategy::default();
+        a.resolve_against("sk-1234567890abcdef", SecretCategory::ApiKey, "");
+        assert!(a.gen_inferred);
+        let mut b = a.clone();
+        b.gen_inferred = false;
+        assert_eq!(a, b, "gen_inferred must not affect equality");
+        assert_eq!(
+            crate::util::hash64(&a),
+            crate::util::hash64(&b),
+            "gen_inferred must not affect hash/seed"
+        );
+        // serde round-trip 后标记恒 false (#[serde(skip)]).
+        let json = serde_json::to_string(&a).unwrap();
+        let back: MockStrategy = serde_json::from_str(&json).unwrap();
+        assert!(!back.gen_inferred);
+        assert_eq!(back.gen_spec, a.gen_spec, "gen_spec itself round-trips");
+    }
+
     // ─── category↔形状矛盾检测 (category_shape_mismatch) ────────────────
 
     #[test]
@@ -2302,16 +2383,31 @@ mod tests {
                 value: "mock-x".into(),
             },
             gen_spec: None,
+            gen_inferred: false,
         };
         assert_eq!(
             fixed.category_shape_mismatch(TEST_PEM, SecretCategory::ApiKey, ""),
             None
         );
-        let mut with_gen = MockStrategy::default();
-        with_gen.resolve_against("whatever-value-here", SecretCategory::Other, "");
+        // 用户显式 gen (gen_inferred = false): mock 形态由用户配置决定, 跳过.
+        let explicit = MockStrategy {
+            initial: InitialValue::Auto,
+            gen_spec: resolved("whatever-value-here", SecretCategory::Other)
+                .gen_spec
+                .clone(),
+            gen_inferred: false,
+        };
         assert_eq!(
-            with_gen.category_shape_mismatch(TEST_JWT, SecretCategory::Other, ""),
+            explicit.category_shape_mismatch(TEST_JWT, SecretCategory::Other, ""),
             None
+        );
+        // resolve 推断填充的 gen (gen_inferred = true) 不算接管 — 同一 entry
+        // 重复 validate_and_resolve (加载后再编辑等场景) 检测仍有效.
+        let mut inferred = MockStrategy::default();
+        inferred.resolve_against("whatever-value-here", SecretCategory::Other, "");
+        assert_eq!(
+            inferred.category_shape_mismatch(TEST_JWT, SecretCategory::Other, ""),
+            Some(CategoryShapeMismatch::JwtButNotToken)
         );
         assert_eq!(
             MockStrategy::default().category_shape_mismatch(
@@ -2364,6 +2460,7 @@ mod tests {
                 length_range: (length, length),
                 shape: SecretShape::Plain,
             }),
+            gen_inferred: false,
         }
     }
 
@@ -2443,6 +2540,7 @@ mod tests {
                 length_range: (5, 10),
                 shape: SecretShape::Plain,
             }),
+            gen_inferred: false,
         };
         for seed in 0..100u64 {
             let mock = gen_candidate("real", &s, seed, 0);
@@ -2616,6 +2714,7 @@ mod tests {
         let mut strategy = MockStrategy {
             initial: InitialValue::Auto,
             gen_spec,
+            gen_inferred: false,
         };
         strategy.resolve_against(real, SecretCategory::Other, global_prefix);
         strategy
@@ -2738,6 +2837,7 @@ mod tests {
                 value: "my-mock-value".into(),
             },
             gen_spec: None,
+            gen_inferred: false,
         };
         assert_eq!(gen_candidate("real", &s, 42, 0), "my-mock-value");
     }
@@ -2749,6 +2849,7 @@ mod tests {
                 value: "my-mock".into(),
             },
             gen_spec: None,
+            gen_inferred: false,
         };
         assert_eq!(gen_candidate("real", &s, 42, 1), "my-mock_1");
         assert_eq!(gen_candidate("real", &s, 42, 2), "my-mock_2");
@@ -2763,6 +2864,7 @@ mod tests {
                 value: "fixed-val".into(),
             },
             gen_spec: None,
+            gen_inferred: false,
         };
         assert_eq!(gen_candidate("real", &s, 0, 0), "fixed-val");
         assert_eq!(gen_candidate("real", &s, 99999, 0), "fixed-val");
@@ -2840,6 +2942,7 @@ mod tests {
                 length_range: (15, 20),
                 shape: SecretShape::Plain,
             }),
+            gen_inferred: false,
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: MockStrategy = serde_json::from_str(&json).unwrap();
@@ -2853,6 +2956,7 @@ mod tests {
                 value: "my-fixed-mock".into(),
             },
             gen_spec: None,
+            gen_inferred: false,
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: MockStrategy = serde_json::from_str(&json).unwrap();
@@ -2865,6 +2969,7 @@ mod tests {
         let s = MockStrategy {
             initial: InitialValue::Auto,
             gen_spec: None,
+            gen_inferred: false,
         };
         let json = serde_json::to_string(&s).unwrap();
         assert!(!json.contains("gen"), "None gen should be omitted: {json}");
@@ -2906,6 +3011,7 @@ mod tests {
                 length_range: (10, 15),
                 shape: SecretShape::Plain,
             }),
+            gen_inferred: false,
         };
         // 用一个 wrapper struct 因为 TOML 顶层必须是 table.
         #[derive(serde::Serialize, serde::Deserialize)]
