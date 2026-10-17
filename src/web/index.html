@@ -6605,8 +6605,10 @@
     }
 
     function shapeBadgeHtml(kind) {
+      // class 用短名 (prefixed) 与 CSS 定义对齐 — kind 全名 (public_prefixed)
+      // 含下划线, class 直接用 kind 会漏配 .shape-prefixed 着色.
       const label = kind === 'public_prefixed' ? 'prefixed' : kind;
-      return `<span class="pill shape-${escapeHtml(kind)}">${escapeHtml(label)}</span>`;
+      return `<span class="pill shape-${escapeHtml(label)}">${escapeHtml(label)}</span>`;
     }
 
     function shapeTooltipLines(kind, category) {
