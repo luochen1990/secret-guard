@@ -153,7 +153,11 @@ GET    /api/privacy-scan/alerts     → {enabled, alerts[{value, pattern_id,
 > 路径前缀), 探测端点 = `{base_url}/v1/models` 等。Azure 风格路径前缀 base
 > (如 `https://xx.openai.azure.com/openai`) 的探测 URL 会拼出不存在的端点,
 > 大概率全部 `absent` / 无 recommended — 属 best-effort 已知边界, 手选 protocol
-> 即可。
+> 即可。**非阻塞原则 (UI-10)**: 检测失败/无推荐永不阻塞手动填写与保存, 失败
+> 呈现必须给肯定式逃生口 (检测是增强不是门槛); 已知盲区渐进补救 — `/anthropic`
+> 尾段 (Anthropic 兼容网关 de-facto 布局, 无 models 端点) 有启发式推荐兜底
+> (证据 > 形状推断, common_uri 恒 null), 其余盲区清单见
+> `docs/known-limitations.md` routing 节。
 
 所有响应带 `Cache-Control: no-store`, 避免浏览器对自动刷新返回缓存内容.
 
@@ -354,7 +358,11 @@ API key CRUD **无条件挂载** (在 `web::router()`, 不依赖 `auth.enabled`)
   条目级 api_key 当前值) 手动触发; recommended 只自动填入**该行**的 protocol select
   (建议非命令, 用户可手改 — 词表 = webui_protocols, 透传族动态 append), 另附模型
   chips 预览 (MVP 深度 = 浏览 + 点击复制). 每行结果回显该族全部探测 URL (`GET {url}`
-  子行 — 不黑盒, 全 404 时用户可对照调整 base_url); 无推荐时附引导 hint.
+  子行 — 不黑盒, 全 404 时用户可对照调整 base_url); 无推荐时附**肯定式**逃生口
+  hint (UI-10: 告知部分供应商无 models 端点 + 手动选协议保存即可 + 转发不依赖
+  检测, 不暗示 base_url 填错). 无 ok 证据且 base 尾段 `anthropic` 时后端启发式
+  推荐 anthropic (note 说明系 URL 形状推断). 探测结果不参与保存前置校验 —
+  失败/未探测的行照样可手填保存 (UI-10 非阻塞不变量, Playwright 守卫).
   common_uri 知识链 (per 行): detect → `row.dataset.commonUri` 暂存 (badge 以
   `+/v1` / `✓ included` 追加回显在该行 base_url 输入框后, 点击复制 base_url+
   common_uri 整体) → 保存 payload 全量携带 (null = 未探测, 前端编辑回填 effective
@@ -381,8 +389,14 @@ API key CRUD **无条件挂载** (在 `web::router()`, 不依赖 `auth.enabled`)
   `.ep-row[data-short]` 头行 = 协议名 + short chip + direct 徽章 (同协议透传, 无
   translate/unsupported 形态 — 端点行入口按定义同协议, 连 codec 都不需要) +
   Models 按钮; 次行 = upstream base_url ↤ 入口 URL 双 code 块 + Copy (复制入口
-  URL). 行列表尾部附 fallback hint (未配置端点的 ingress fallback 第一端点跨协议
-  翻译, codec 覆盖族限定).
+  URL). **入口 URL 镜像 common_uri (UI-10 配套)**: openai 族 short (`/o/` `/r/`)
+  的入口 URL 追加 effective common_uri (显式值或尾段启发式, JS 镜像
+  `effectiveCommonUriOf` ↔ Rust `heuristic_common_uri`, 两侧同步维护) — 复制即用
+  为 SDK base_url (OpenAI 系 SDK 不自动补 /v1, 裸入口对 v1 布局上游 = 404);
+  `a`/`g`/`l` short 不追加 (对应 SDK 自带版本段, 保持尾斜杠). router/pool 矩阵行
+  同理: openai 族 ingress 取服务端点 (同协议匹配 ?? 首端点, 与 `select_endpoint`
+  语义一致) 的 effective common_uri 追加. 行列表尾部附 fallback hint (未配置端点
+  的 ingress fallback 第一端点跨协议翻译, codec 覆盖族限定).
 - **router/pool 条目 = 5 协议入口矩阵** (M2 走查重设计形态保留): 每协议一张卡
   `.ep-row[data-short]` — 头行 = 协议名 + short chip + 模式徽章 (direct=info 软底 /
   translate=warn 软底 / n/a=inactive) + Models 按钮; 次行 = URL code 块 + Copy 按钮,
