@@ -159,6 +159,47 @@ protocol** and the **target provider**:
 > SDK notes: the OpenAI SDK needs the `/v1` prefix included yourself; the Anthropic SDK
 > appends `/v1/messages` on its own, so `http://.../a/<provider-id>` is enough.
 
+### Point your agent harness at it (opencode / claude-code / any SDK)
+
+The real API key lives **only** in your local `secret-guard.toml` — the harness itself holds a
+dummy value. secret-guard injects the real key when forwarding upstream, so even a fully
+compromised harness (or a breach of its cloud storage) never exposes your key.
+
+**opencode** — custom provider via the OpenAI-compatible route, in `opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "secret-guard": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "secret-guard (local)",
+      "options": {
+        "baseURL": "http://127.0.0.1:18787/o/<provider-id>/v1",
+        "apiKey": "dummy-key-harness-never-sees-the-real-one"
+      },
+      "models": {
+        "<model-id>": { "name": "<any display name>" }
+      }
+    }
+  }
+}
+```
+
+Model IDs come from the upstream list — the gateway passes `GET /v1/models` straight
+through, so `curl http://127.0.0.1:18787/o/<provider-id>/v1/models` shows what you can use.
+
+**claude-code** — two env vars, zero config:
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:18787/a/<provider-id>
+export ANTHROPIC_AUTH_TOKEN=dummy-key-harness-never-sees-the-real-one
+```
+
+Cross-protocol translation is built in (e.g. an OpenAI-form `o` route to an Anthropic
+upstream, streaming included), so pick the route that matches your harness — not your
+upstream.
+
 ### Two-layer configuration
 
 - `secret-guard.toml` — declarative config, hand-written, read-only in the process.

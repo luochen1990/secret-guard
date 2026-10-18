@@ -136,6 +136,46 @@ URL 形如 `/{proto_short}/{provider_id}/*rest`, 同时编码**入站协议**与
 > SDK 侧注意: OpenAI SDK 需自带 `/v1` 前缀; Anthropic SDK 自行拼 `/v1/messages`,
 > 配到 `/a/<provider-id>` 即可。
 
+### 把 Agent 工具接到网关上 (opencode / claude-code / 任意 SDK)
+
+真 API key 只存在**本机**的 `secret-guard.toml` 里 — Agent 工具自身只持有假值。
+secret-guard 转发上游时自动注入真 key, 因此即使 Agent 工具被完全攻破 (或其云端
+存储泄露), 真 key 也从未暴露。
+
+**opencode** — 经 OpenAI 兼容路由挂自定义 provider, 写在 `opencode.json` 里:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "secret-guard": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "secret-guard (local)",
+      "options": {
+        "baseURL": "http://127.0.0.1:18787/o/<provider-id>/v1",
+        "apiKey": "dummy-key-harness-never-sees-the-real-one"
+      },
+      "models": {
+        "<model-id>": { "name": "<any display name>" }
+      }
+    }
+  }
+}
+```
+
+模型 ID 来自上游清单 — 网关把 `GET /v1/models` 原样透传,
+`curl http://127.0.0.1:18787/o/<provider-id>/v1/models` 即可查看可用模型。
+
+**claude-code** — 两个环境变量, 零配置:
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:18787/a/<provider-id>
+export ANTHROPIC_AUTH_TOKEN=dummy-key-harness-never-sees-the-real-one
+```
+
+跨协议翻译内置 (如 OpenAI 形态的 `o` 路由打到 Anthropic 上游, 含流式),
+所以路由按你的 Agent 工具选 — 而不是按上游选。
+
 ### 配置模型: 静态 + 动态双层
 
 - `secret-guard.toml` — 声明式配置, 用户手写, 进程内只读。
