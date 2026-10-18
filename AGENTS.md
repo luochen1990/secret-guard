@@ -257,6 +257,7 @@ rationale 是不对称性: 可用性损失可重试恢复, 机密性损失不可
 > `I1=UI-1`, `I2=UI-2`, `I3=UI-3`, `I4=UI-6 的 selectedRound 子属性`, `I5=UI-6`, `I6=UI-7`.
 > contracts.md 收录并扩展为 UI-1..UI-9 (UI-8 = SSE 失效通知消费; UI-9 = 轮次详情弹窗概览默认/大数据按需, quant#305), 以 contracts.md 为 SSOT; 此处保留 I* 编号便于历史 grep.
 > UI-10 (Detect 协议探测非阻塞 — 手动填写永远是逃生口, 2026-10-18 用户裁决) 无历史 I* 前身, 直接以 UI-10 落在 contracts.md.
+> UI-11 (端点发现面板 origin 先行 — 协议作为被发现的面, #332) 直接以 UI-11 落在 contracts.md.
 ### I1 — 气泡数 == req_delta messages 长度
 
 会话详情页 (timeline) 渲染的 Bubble 数量, 必须等于该 Node 的 req_delta messages
