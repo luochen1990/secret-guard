@@ -5,7 +5,10 @@
 # (nix/pkgs/secret-guard.nix pname), 用户侧零感知差异:
 #   cargo install secret-guard-rs  →  $CARGO_HOME/bin/secret-guard
 name = "secret-guard-rs"
-version = "0.1.0"
+# version 策略 (D3 决策, 2026-10): 发版后 master 立即 bump 到下一版本的 -dev 后缀
+# (如 v0.2.0 发布后 → 0.3.0-dev), 保证源码构建自报版本可辨识 (归档用户 vs 源码
+# 用户)。发版时去掉 -dev 使 tag 与此处相等 (release.yml 的命名契约断言)。
+version = "0.2.0-dev"
 edition = "2024"
 # MSRV (issue #149-5): edition 2024 要求 rustc >= 1.85, 本项目按 devShell 实际工具链
 # (nixos-unstable, 当前 1.96) 声明下界. CI 与 devShell 不读此字段做强制 (工具链由
