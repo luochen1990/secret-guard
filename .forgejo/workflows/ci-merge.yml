@@ -295,6 +295,50 @@ jobs:
       # consistency-check 断言经 FULL_TIER 并入下方 gate 主链; 默认档 (无 oidc) 验证
       # 归 GitHub 镜像 CI — 分工与动机见 docs/ci.md "双宿主验证分工".
 
+      # Nix 语法门禁 — .nix 变更纯解析冒烟 (v3.3, nixos#1900): log-skimmer PR 曾在
+      # flake.nix 误写 packages 列表闭合 (`]);`), ci-merge 全链未拦 (vm-nix 契约禁止
+      # VM 内求值 flake — ro store), 直到人工本地 nix develop 才炸。本步用
+      # nix-instantiate --parse 补口: 纯解析零求值 (abort/throw/import 均不执行)、
+      # 零 store 写 (不连 daemon, ro store 契约兼容)、NIX_PATH 无关 (<nixpkgs> 查找
+      # 路径是求值期语义, 解析期只认字面量 — flake.nix 顶层 {…} 函数/attrset 按普通
+      # 表达式解析即可, 无需任何求值上下文)。Lix 实现附带 parse-time 名字分析:
+      # undefined variable 一并拦 (with 动态作用域不误报), 比 CppNix 多一层免费
+      # 覆盖。清单为空直通, 有失败即红并逐文件点名。
+      - name: Nix syntax gate
+        # success() 同上 (显式默认门); skip 同 SHA 已验证过则本门禁一并跳过
+        if: success() && steps.skip.outputs.should_skip != 'true'
+        env:
+          # PR 事件: base tip sha (事件 payload) — checkout 链已 fetch 其对象, 且
+          # deploy key 已清理无法再补 fetch, 只能就地取材做三点 diff
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          if [ -n "${BASE_SHA:-}" ] && git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            # 三点 diff 取本 PR 变更集; --diff-filter 去 D (已删文件无从解析),
+            # rename 旧路径由下方 -f 存在性判断兜底
+            files="$(git diff --name-only --diff-filter=ACMR "${BASE_SHA}...${GITHUB_SHA}" -- '*.nix')"
+          else
+            # 非 PR 事件 (push master / dispatch): checkout 链是 --depth 1 浅克隆,
+            # 无 HEAD~1 — 退化为全量 .nix 冒烟 (org 仓 .nix 数量级小, 成本毫秒级)
+            files="$(git ls-files -- '*.nix')"
+          fi
+          if [ -z "$files" ]; then
+            echo "无 .nix 变更, 直通"
+            exit 0
+          fi
+          echo "nix 语法门禁: ${files//$'\n'/ }"
+          status=0
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            # 纯解析: 错误定位 (文件+行列) 由 nix-instantiate 原样打到 stderr
+            if ! nix-instantiate --parse "$f" >/dev/null; then
+              echo "✗ $f: nix 语法错误"
+              status=1
+            fi
+          done <<< "$files"
+          if [ "$status" -eq 0 ]; then echo "✓ nix 语法门禁通过"; fi
+          exit "$status"
+
       # P0 质量门禁主链 — 契约层入口 (`just ci-merge`, org v3.0 必须契约).
       # ci-merge recipe 的 main 档 = 普通 check 主链 (fmt + clippy + machete + doc 门禁
       # + 测试 + typos + deny-offline + check-webui-syntax + check-webui-freshness
