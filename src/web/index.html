@@ -2642,7 +2642,7 @@
         'prov.notSupported': 'not supported',
         'prov.copyUrlTitle': 'Copy endpoint URL',
         'prov.upstreamBaseUrl': 'upstream base URL',
-        'prov.localEntryUrl': 'local entry URL',
+        'prov.localEntryUrl': 'local entry URL (paste into your SDK base_url)',
         'prov.arrowTip': 'upstream ↤ local entry URL',
         'prov.directTailHint': 'Each configured endpoint serves its own protocol via byte-exact passthrough. Ingress protocols without a configured endpoint fall back to the first endpoint (cross-protocol translation, codec-covered pairs only).',
         'prov.endpointsTitle': 'Endpoints',
@@ -2671,7 +2671,7 @@
         // ── Detect 探测 ──
         'probe.detected': 'Detected',
         'probe.noProbes': 'No probes returned',
-        'probe.noEndpointHint': "No endpoint recognized — compare the GET URLs above with your provider's documented models endpoint; its base URL prefix layout may differ.",
+        'probe.noEndpointHint': "No models endpoint recognized — some providers (especially Anthropic-compatible gateways) don't expose one. That's fine: pick the protocol for this endpoint manually and save; forwarding never depends on detection.",
         'probe.keylessHint': 'Probed without an API key — the saved key is not reused; auth_failed may just mean the probe carried no key.',
         'probe.enterUrl': 'Enter a base URL first',
         'probe.failed': 'Probe failed: {msg}',
@@ -3111,7 +3111,7 @@
         'prov.notSupported': '不支持',
         'prov.copyUrlTitle': '复制端点 URL',
         'prov.upstreamBaseUrl': '上游 base URL',
-        'prov.localEntryUrl': '本地入口 URL',
+        'prov.localEntryUrl': '本地入口 URL (可直接粘贴为 SDK base_url)',
         'prov.arrowTip': '上游 ↤ 本地入口 URL',
         'prov.directTailHint': '每个已配置端点经字节级透传服务其自身协议。无对应端点的入口协议回退到首个端点 (跨协议翻译, 仅 codec 覆盖对)。',
         'prov.endpointsTitle': '端点',
@@ -3140,7 +3140,7 @@
         // ── Detect 探测 ──
         'probe.detected': '已识别',
         'probe.noProbes': '未返回任何探测',
-        'probe.noEndpointHint': "未识别到端点 — 将上方 GET URL 与你的 provider 文档中的 models 端点对照; 其 base URL 前缀布局可能不同。",
+        'probe.noEndpointHint': "未识别到模型端点 — 部分供应商（尤其 Anthropic 兼容网关）不提供该端点。这不影响使用：手动选择该端点的协议后保存即可，转发不依赖检测结果。",
         'probe.keylessHint': '探测未携带 API key — 已保存的 key 不会被复用; auth_failed 可能只是因为探测请求没带 key。',
         'probe.enterUrl': '请先填写 base URL',
         'probe.failed': '探测失败: {msg}',
@@ -7177,6 +7177,32 @@
       return 'unsupported';
     }
 
+    // ─── common_uri 的 JS 镜像 (入口 URL 拼接用) ──────────────────────────
+    //
+    // Rust `src/provider.rs::heuristic_common_uri` + `Endpoint::effective_common_uri`
+    // 的 JS 镜像 — 仅服务 endpoints 弹窗的入口 URL 显示 (o/r 行追加布局前缀,
+    // 让复制出的 URL 可直接粘贴为 OpenAI 系 SDK base_url). 行为分叉 = 用户复制出
+    // 404 URL, 改 Rust 侧时必须同步维护此处 (镜像契约).
+    // effective common_uri: 显式合法值 ("" 或 '/' 开头) 直通; 缺省 (null/非法)
+    // 按 base 尾段启发 — 尾段 v<纯数字> → "" (版本前缀已含), 否则 "/v1".
+    function heuristicCommonUriJs(baseUrl) {
+      const lastSeg = baseUrl.split('/').pop() || '';
+      return /^v\d+$/.test(lastSeg) ? '' : '/v1';
+    }
+    function effectiveCommonUriOf(ep) {
+      const cu = ep.common_uri;
+      return typeof cu === 'string' && (cu === '' || cu.startsWith('/'))
+        ? cu
+        : heuristicCommonUriJs(ep.base_url);
+    }
+    // o/r 入口 (openai 族) 的 URL 后缀 = 服务端点的 effective common_uri (SDK 粘贴
+    // 即用 — OpenAI 系 SDK 不自动补 /v1, 缺前缀 = 404); a/g/l 对应 SDK 自带
+    // 版本段, 保持尾斜杠. direct 行与 router/pool 矩阵行共用 (键统一为 short,
+    // 协议集演进只改此一处).
+    function entryUrlSuffix(short, ep) {
+      return (short === 'o' || short === 'r') && ep ? effectiveCommonUriOf(ep) : '/';
+    }
+
     function openProviderEndpoints(id) {
       const p = state.providersList.find(x => x.id === id);
       if (!p) {
@@ -7202,7 +7228,7 @@
           // encodeURIComponent 是 defense-in-depth: 后端 validate_id 限制 [A-Za-z0-9_-].
           const idx = state.providerProtocols.indexOf(e.protocol);
           const short = idx >= 0 ? state.providerShorts[idx] : '?';
-          const url = `${origin}/${short}/${encodeURIComponent(p.id)}/`;
+          const url = `${origin}/${short}/${encodeURIComponent(p.id)}${entryUrlSuffix(short, e)}`;
           return directEndpointRow(e, short, url, p.id);
         }).join('');
         tailHint = t('prov.directTailHint');
@@ -7212,9 +7238,11 @@
         rowsHtml = state.providerShorts.map((short, i) => {
           const proto = state.providerProtocols[i];
           const mode = ingressMode(proto, tail);
+          // 服务端点选择与 select_endpoint 语义一致 (同协议匹配 ?? 首端点 fallback).
+          const svc = tail.find(e => e.protocol === proto) ?? tail[0];
           const url = mode === 'unsupported'
             ? null
-            : `${origin}/${short}/${encodeURIComponent(p.id)}/`;
+            : `${origin}/${short}/${encodeURIComponent(p.id)}${entryUrlSuffix(short, svc)}`;
           return endpointRow(proto, short, mode, url, p.id);
         }).join('');
       }
@@ -7845,10 +7873,11 @@
     // common_uri 暂存该行 dataset). 三段式 (顺序固定): 状态行 (recommended 有无
     // 二选一) / note hint / 模型 chips (有可展示 models 才出现). 契约: probes[]
     // .status ok=有 models, 其余 (auth_failed/absent/error) detail 有值;
-    // recommended null = 无 ok 命中; probes[].urls = 该族实际 GET 的完整 URL
+    // recommended null = 无 ok 命中 (或 /anthropic 尾段启发式有值 — 形状推断,
+    // 不携带 common_uri); probes[].urls = 该族实际 GET 的完整 URL
     // (不黑盒 — 全 404 时用户可对照 URL 自行调整 base_url); common_uri =
-    // recommended 族的布局知识 (detect 知识暂存 L1/M1: null = 没探出事实 → 保留
-    // 该行暂存现状不抹知识, 有值 = 覆盖, 随保存落盘). 在途响应的落地对账
+    // 仅来自 ok 探测证据的布局断言 (detect 知识暂存 L1/M1: null = 没探出事实 →
+    // 保留该行暂存现状不抹知识, 有值 = 覆盖, 随保存落盘). 在途响应的落地对账
     // (epoch / 行存活 / base_url 未变) 由调用方的 landed() 门控.
     function renderProbeResult(data, row) {
       const probes = data.probes || [];

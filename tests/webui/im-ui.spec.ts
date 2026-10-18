@@ -3321,6 +3321,7 @@ test.describe("Provider Detect 协议探测", () => {
   let fastUpstream: ProbeUpstream;
   let slowUpstream: ProbeUpstream;
   let versionedUpstream: ProbeUpstream;
+  let deadUpstream: ProbeUpstream;
 
   test.beforeAll(async () => {
     // fast: /v1/models → openai shape (3 models, chips 数断言用); 其余端点 404
@@ -3368,12 +3369,16 @@ test.describe("Provider Detect 协议探测", () => {
       }
       return { status: 404, body: "{}" };
     });
+    // dead: 所有路径恒 404 — Detect 无 recommended 的失败形态 (UI-10 用例的
+    // "检测失败不阻塞手动填写" 被测上游).
+    deadUpstream = await startProbeUpstream(() => ({ status: 404, body: "{}" }));
   });
 
   test.afterAll(async () => {
     await fastUpstream.close();
     await slowUpstream.close();
     await versionedUpstream.close();
+    await deadUpstream.close();
   });
 
   async function openNewProviderForm(page: Page): Promise<void> {
@@ -3468,6 +3473,99 @@ test.describe("Provider Detect 协议探测", () => {
     // 编辑 base_url → 探测结果对新 URL 不再成立, 徽标作废隐藏.
     await endpointRow(page).locator(".ep-base-url").fill("http://127.0.0.1:19996");
     await expect(endpointRow(page).locator(".ep-common-uri-badge")).toBeHidden();
+  });
+
+  // ─── UI-10: 检测失败不阻塞手动填写 (非阻塞不变量) ──────────────────────────
+
+  test("Detect 全 404: 肯定式逃生口 hint + 手动选协议保存不被阻塞 (UI-10)", async ({ page }) => {
+    // 小米 MiMo 案例回归: Detect 无 recommended 时, 旧文案暗示 base_url 布局有误
+    // (误导用户去改照官方文档抄的正确 URL) 且不告知手动路径可用 → 用户被卡死.
+    // UI-10 契约: 检测仅是体验增强, 失败呈现必须给肯定式逃生口, 手动填写/保存
+    // 全程可用 — 本用例把该链路整体钉进测试.
+    const uid = `detect-fail-manual-${Date.now()}`;
+    await page.goto("/");
+    await page.locator('a.tab[data-tab="providers"]').click();
+    await openNewProviderForm(page);
+    // base_url 不以版本段/协议段结尾 (裸根形态), upstream 恒 404 → 无 recommended.
+    await endpointRow(page).locator(".ep-base-url").fill(deadUpstream.url);
+    await endpointRow(page).locator(".ep-detect").click();
+    // 无 "Detected:" 行 (recommended 缺席) + 肯定式 hint 可见 (引导手动选协议;
+    // en locale 默认, 断言含 "pick the protocol" 片段).
+    await expect(endpointRow(page).locator(".ep-probe-result .probe-line-ok")).toHaveCount(0);
+    await expect(
+      page.locator(".ep-probe-result .hint", { hasText: "pick the protocol" })
+    ).toBeVisible();
+    // 手动逃生口: 该行 select 手动选 anthropic + 填 id/key + 保存 — 全程不被
+    // 检测失败阻塞, dialog 正常关闭, providers 表格出现该行.
+    await endpointRow(page).locator(".ep-protocol").selectOption("anthropic");
+    await page.locator("#p-id").fill(uid);
+    await page.locator("#p-api-key").fill("sk-detect-fail-manual");
+    await page.locator('#provider-form-el button[value="save"]').click();
+    await expect(page.locator("#provider-form")).not.toBeVisible();
+    const row = page.locator("#providers-body tr", { hasText: uid });
+    await expect(row).toBeVisible();
+
+    // 清理 (测试 server 的 state 跨用例共享).
+    autoAcceptAlerts(page);
+    await row.locator('button[data-action="delete"]').click();
+    await expect(row).not.toBeVisible();
+  });
+
+  // ─── endpoints 弹窗入口 URL 镜像 common_uri ───────────────────────────────
+
+  test("endpoints 弹窗入口 URL 镜像 common_uri (/v1 追加 + 已含不追加)", async ({ page }) => {
+    // v1 布局 (Detect 探出 common_uri="/v1"): 入口 URL = /o/<id>/v1 — 复制即
+    // OpenAI SDK base_url 可用 (旧形态 origin/o/<id>/ 缺 /v1 → SDK 404).
+    await page.goto("/");
+    await page.locator('a.tab[data-tab="providers"]').click();
+    await openNewProviderForm(page);
+    const uid1 = `entry-url-v1-${Date.now()}`;
+    await endpointRow(page).locator(".ep-base-url").fill(fastUpstream.url);
+    await endpointRow(page).locator(".ep-detect").click();
+    await expect(endpointRow(page).locator(".ep-probe-result .probe-line-ok")).toContainText("Detected: openai");
+    await page.locator("#p-id").fill(uid1);
+    await page.locator('#provider-form-el button[value="save"]').click();
+    await expect(page.locator("#provider-form")).not.toBeVisible();
+    const origin = new URL(page.url()).origin;
+    const row1 = page.locator("#providers-body tr", { hasText: uid1 });
+    await expect(row1).toBeVisible();
+    await row1.locator('button[data-action="endpoints"]').click();
+    const dlg = page.locator("#provider-endpoints");
+    await expect(dlg).toBeVisible();
+    // direct 行的入口 URL = .ep-url 的第二个 code (upstream base_url ↤ 入口);
+    // a/g/l 行 SDK 自带版本段不加前缀, o 行必须追加.
+    const entry1 = dlg.locator('.ep-row[data-short="o"] .ep-url code').last();
+    await expect(entry1).toHaveText(`${origin}/o/${uid1}/v1`);
+    // tooltip 同步声明 "可直接粘贴为 SDK base_url".
+    await expect(entry1).toHaveAttribute("title", /SDK base_url/);
+    await dlg.locator('button[value="close"]').click();
+    await expect(dlg).not.toBeVisible();
+
+    // 版本前缀已含布局 (Detect 探出 common_uri=""): 入口 URL 结尾无 /v1
+    // (不拼双版本段), 也无尾斜杠.
+    await openNewProviderForm(page);
+    const uid2 = `entry-url-bare-${Date.now()}`;
+    await endpointRow(page).locator(".ep-base-url").fill(versionedUpstream.url);
+    await endpointRow(page).locator(".ep-detect").click();
+    await expect(endpointRow(page).locator(".ep-probe-result .probe-line-ok")).toContainText("Detected: openai");
+    await page.locator("#p-id").fill(uid2);
+    await page.locator('#provider-form-el button[value="save"]').click();
+    await expect(page.locator("#provider-form")).not.toBeVisible();
+    const row2 = page.locator("#providers-body tr", { hasText: uid2 });
+    await expect(row2).toBeVisible();
+    await row2.locator('button[data-action="endpoints"]').click();
+    await expect(dlg).toBeVisible();
+    await expect(dlg.locator('.ep-row[data-short="o"] .ep-url code').last()).toHaveText(`${origin}/o/${uid2}`);
+    await dlg.locator('button[value="close"]').click();
+    await expect(dlg).not.toBeVisible();
+
+    // 清理两个动态条目.
+    autoAcceptAlerts(page);
+    for (const uid of [uid1, uid2]) {
+      const row = page.locator("#providers-body tr", { hasText: uid });
+      await row.locator('button[data-action="delete"]').click();
+      await expect(row).not.toBeVisible();
+    }
   });
 });
 
