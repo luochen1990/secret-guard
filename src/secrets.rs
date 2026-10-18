@@ -769,6 +769,66 @@ mod tests {
         );
     }
 
+    /// #319: GET DTO 必须暴露 gen 的来源标记 (`gen_inferred`) — WebUI 编辑器
+    /// 脏检查的判定源 (未触碰时: inferred → 回传省略 gen 让后端 fresh infer;
+    /// 显式 → 原样回传防丢; dynamic override 整条目替换, 省略显式 gen 会使其
+    /// 被 infer 结果遮蔽 = 数据丢失).
+    #[test]
+    fn effective_snapshot_exposes_gen_inferred_flag() {
+        let tmp = tempfile_path();
+        // inferred: PEM 值 + privatekey → resolve 填充 gen (shape=pem) + 标记.
+        let pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABFwAAAAdzc2gtcn\nNhAAAAAwEAAQAAAQEAtc0vLB3n6e5h8xNB7FJ7dX08ZD7kWrvFarcOeSNBjSM=\n-----END OPENSSH PRIVATE KEY-----";
+        let mut inferred = entry("inferred-gen", pem);
+        inferred.category = SecretCategory::PrivateKey;
+        inferred.validate_and_resolve("").unwrap();
+        assert!(inferred.mock_strategy.gen_inferred);
+        // explicit: 用户手配 gen (gen_inferred=false).
+        let mut explicit = entry("explicit-gen", "some-random-value-123456");
+        explicit.mock_strategy = crate::mock::MockStrategy {
+            initial: crate::mock::InitialValue::Auto,
+            gen_spec: Some(crate::mock::GenSpec {
+                prefix: "keep".into(),
+                charset: crate::mock::Charset {
+                    lowercase: true,
+                    ..Default::default()
+                },
+                length_range: (30, 30),
+                shape: crate::mock::SecretShape::Plain,
+            }),
+            gen_inferred: false,
+        };
+        explicit.validate_and_resolve("").unwrap();
+        assert!(!explicit.mock_strategy.gen_inferred);
+
+        let t = SecretTable::new(vec![], vec![inferred, explicit], empty_decisions(), tmp);
+        let json = serde_json::to_value(t.effective_snapshot()).unwrap();
+        let arr = json.as_array().unwrap();
+        let find = |id: &str| {
+            arr.iter()
+                .find(|e| e["id"] == serde_json::json!(id))
+                .unwrap()
+        };
+        let inf = find("inferred-gen");
+        assert_eq!(
+            inf["mock_strategy"]["gen_inferred"],
+            serde_json::json!(true)
+        );
+        // shape 一并暴露 (未触碰回传原样 gen 的 "含 shape" 前提).
+        assert_eq!(
+            inf["mock_strategy"]["gen"]["shape"]["kind"],
+            serde_json::json!("pem")
+        );
+        let exp = find("explicit-gen");
+        assert!(
+            exp["mock_strategy"].get("gen_inferred").is_none(),
+            "explicit 条目的 DTO 不带 gen_inferred (false 省略): {exp}"
+        );
+        assert_eq!(
+            exp["mock_strategy"]["gen"]["prefix"],
+            serde_json::json!("keep")
+        );
+    }
+
     #[test]
     fn effective_snapshot_includes_provenance_and_masks_value() {
         let tmp = tempfile_path();

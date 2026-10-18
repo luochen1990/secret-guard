@@ -2521,6 +2521,147 @@ test.describe("B3: 详细日志开关 (audit capture)", () => {
   });
 });
 
+// ─── #319: 编辑 secret 的 mock strategy 脏检查 ────────────────────────────
+//
+// 表单没有 shape 字段 — 编辑已有 secret 时从表单收集 gen 会丢 shape, 且把 infer
+// 结果以 "用户显式" (gen_inferred=false) 落盘: ① PEM/JWT 的结构化仿真退化为
+// 平坦串; ② infer 逻辑升级不再生效 (冻结); ③ category↔shape mismatch 检测停用.
+//
+// 修复契约 (判定矩阵, SSOT = index.html collectMockStrategyFromForm 头注释):
+//   未触碰 mock 高级区 + 原 gen 是 infer 结果 → PUT body mock_strategy === null
+//     (后端 fresh infer — shape 恢复 / infer 升级可生效 / mismatch 复活);
+//   未触碰 + 原 gen 是用户显式 → 原样回传 (含 shape; dynamic override 是整条目
+//     替换, 省略会让 static/此前的显式配置被 infer 遮蔽 = 数据丢失);
+//   触碰过 (任一输入) → 按表单收集 (shape 退化 plain 是已接受的限制, 方向 B 不做).
+const TEST_PEM_VALUE = [
+  "-----BEGIN OPENSSH PRIVATE KEY-----",
+  "b3BlbnNzaC1rZXktdjEAAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABFwAAAAdzc2gtcn",
+  "NhAAAAAwEAAQAAAQEAtc0vLB3n6e5h8xNB7FJ7dX08ZD7kWrvFarcOeSNBjSM=",
+  "-----END OPENSSH PRIVATE KEY-----",
+].join("\n");
+
+test.describe("WebUI secret mock strategy 脏检查 (#319)", () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto("/");
+    await page.waitForLoadState("networkidle");
+    await page.waitForTimeout(500);
+  });
+
+  // dynamic-only 条目 DELETE = 204; 幂等清理 (失败不阻断, 已删时 404 无害).
+  test.afterEach(async ({ request }) => {
+    for (const id of ["gen-rt-inferred", "gen-rt-explicit"]) {
+      await request.delete(`${SG_API}/secrets/${id}`);
+    }
+  });
+
+  /** 经 UI 编辑 secret (改 name + 重输 value), 捕获 PUT body 后放行. */
+  async function editSecretViaUi(page: Page, id: string, value: string): Promise<any> {
+    let captured: any = null;
+    await page.route(`**/api/secrets/${id}`, async (route) => {
+      if (route.request().method() === "PUT") {
+        captured = route.request().postDataJSON();
+      }
+      await route.continue();
+    });
+    await page.locator('a.tab[data-tab="secrets"]').click();
+    const row = page.locator(`#secrets-body tr[data-id="${id}"]`);
+    await expect(row).toBeVisible();
+    await row.locator('button[data-action="edit"]').click();
+    const dlg = page.locator("#secret-form");
+    await expect(dlg).toBeVisible();
+    await page.locator("#f-name").fill("renamed");
+    await page.locator("#f-value").fill(value);
+    await page.locator('#secret-form-el button[value="save"]').click();
+    await expect(dlg).not.toBeVisible();
+    expect(captured, "PUT 必须已发出").toBeTruthy();
+    return captured;
+  }
+
+  test("#319: 未触碰 + infer gen → mock_strategy 省略 (fresh infer, shape 恢复)", async ({
+    page,
+    request,
+  }) => {
+    // PEM 值 + privatekey → 后端 infer shape=pem (gen_inferred=true 进 DTO).
+    const r = await request.post(`${SG_API}/secrets`, {
+      data: { id: "gen-rt-inferred", name: "orig", category: "privatekey", value: TEST_PEM_VALUE },
+    });
+    expect(r.ok()).toBe(true);
+
+    const payload = await editSecretViaUi(page, "gen-rt-inferred", TEST_PEM_VALUE);
+    // 核心: 只改 name 未触碰 mock 区 → 不回传表单收集的 gen (冻结修复点).
+    expect(payload.mock_strategy).toBeNull();
+
+    // 保存后仍是 infer 态: DTO gen_inferred=true + shape=pem, 列表 shape 徽标保持
+    // (修复前: gen_inferred 消失 + shape 退化 plain → 徽标消失).
+    const after = await (await request.get(`${SG_API}/secrets`)).json();
+    const entry = after.secrets.find((s: any) => s.id === "gen-rt-inferred");
+    expect(entry.mock_strategy.gen_inferred).toBe(true);
+    expect(entry.mock_strategy.gen.shape.kind).toBe("pem");
+    await expect(
+      page.locator('#secrets-body tr[data-id="gen-rt-inferred"] .pill.shape-pem')
+    ).toBeVisible();
+  });
+
+  test("#319: 未触碰 + 显式 gen → 原样回传 (含 shape, 防丢)", async ({ page, request }) => {
+    // 用户显式配置 gen (prefix) — dynamic override 整条目替换语义下, 未触碰时
+    // 省略 gen 会让显式配置被 infer 遮蔽 (数据丢失), 必须原样回传.
+    const value = "explicit-gen-roundtrip-secret-value";
+    const r = await request.post(`${SG_API}/secrets`, {
+      data: {
+        id: "gen-rt-explicit",
+        name: "orig",
+        category: "apikey",
+        value,
+        mock_strategy: {
+          initial: { kind: "auto" },
+          gen: { prefix: "keep-", charset: { lowercase: true }, length_range: [40, 40] },
+        },
+      },
+    });
+    expect(r.ok()).toBe(true);
+    // 前置健全性: 显式条目的 DTO 不带 gen_inferred (false 省略).
+    const pre = (await (await request.get(`${SG_API}/secrets`)).json()).secrets.find(
+      (s: any) => s.id === "gen-rt-explicit"
+    );
+    expect(pre.mock_strategy.gen_inferred).toBeUndefined();
+
+    const payload = await editSecretViaUi(page, "gen-rt-explicit", value);
+    expect(payload.mock_strategy).not.toBeNull();
+    expect(payload.mock_strategy.gen.prefix).toBe("keep-");
+    // 原样回传含 shape (内部 tag 形态 {"kind":"plain"}).
+    expect(payload.mock_strategy.gen.shape.kind).toBe("plain");
+  });
+
+  test("#319: 触碰 mock 高级区 → 按表单收集 (用户显式落盘)", async ({ page, request }) => {
+    await request.post(`${SG_API}/secrets`, {
+      data: { id: "gen-rt-inferred", name: "orig", category: "apikey", value: "touch-mock-area-secret-value-123" },
+    });
+    const value = "touch-mock-area-secret-value-123";
+
+    let captured: any = null;
+    await page.route(`**/api/secrets/gen-rt-inferred`, async (route) => {
+      if (route.request().method() === "PUT") captured = route.request().postDataJSON();
+      await route.continue();
+    });
+    await page.locator('a.tab[data-tab="secrets"]').click();
+    const row = page.locator('#secrets-body tr[data-id="gen-rt-inferred"]');
+    await expect(row).toBeVisible();
+    await row.locator('button[data-action="edit"]').click();
+    const dlg = page.locator("#secret-form");
+    await expect(dlg).toBeVisible();
+    // 触碰: 改 prefix 字段 (input 事件 → 脏标记置位).
+    await page.locator("#f-ms-prefix").fill("x-");
+    await page.locator("#f-name").fill("renamed");
+    await page.locator("#f-value").fill(value);
+    await page.locator('#secret-form-el button[value="save"]').click();
+    await expect(dlg).not.toBeVisible();
+
+    // 触碰过 → 按表单收集 (prefilled 字段 + 用户改动, 显式落盘).
+    expect(captured.mock_strategy).not.toBeNull();
+    expect(captured.mock_strategy.gen.prefix).toBe("x-");
+  });
+});
+
 // ─── #181: 表单提交失败时对话框保持打开 + 字段保留 ────────────────────────
 //
 // bindFormSubmit (secret/provider 两个表单共用) 的 listener 是 async:

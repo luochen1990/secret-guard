@@ -41,6 +41,7 @@
 - static config 的 `[server]` (含 `upstream_*_timeout_secs`) / `[redact]` / `[auth]` 段仅在启动时读取一次, WebUI 改不生效 (restart 才生效; rationale = 转发核心路径零运行时配置开销, 见根 AGENTS.md 配置模型注记).
 - **static 基线下 PUT 空串 api_key 无法清空 key (#157 已知限制)**: dynamic override 的 `api_key` 落盘形态无法区分 "未记录" (PUT null → 空串, effective 继承 static) 与 "显式清空" (PUT `""` → 空串) — 两种空都会被 `inherit_from_static` 继承 static 旧 key. 停用 provider 请用 `PATCH .../decision {"mode":"disabled"}`. WebUI 编辑留空发 null (保留语义), 仅 SDK 显式发空串可见. 根治需 schema 演进 (请求字段 Option 化或 sentinel 值), 属后续工作.
 - **dynamic-only 条目 Direct ↔ Router/Pool 构造切换往返丢 api_key (#187 已知限制)**: sum type 下 Router/Pool 构造无处存放鉴权字段, 切回 Direct 时无恢复来源 (static 基线条目不受影响 — `inherit_from_static` Direct↔Direct 从 static 复原; Direct↔Pool 与 Direct↔Router 同型)。失败是静默的 (空 key 出站 → 上游 401 才暴露), WebUI 表单 placeholder 变化 ("(optional)" 而非 "unchanged") 是唯一提示。根治需虚拟构造携带被遮蔽的 Direct 字段 (违背 sum type 简洁性) 或 WebUI 本地暂存, 均不划算。
+- **WebUI secret 编辑器触碰 mock 高级区后保存 → shape 退化为 plain (#319 方向 B 不做)**: 表单无 shape 字段, 触碰过 (脏检查置位, 按表单收集) 的 gen 恒以 plain 形态落盘且视为用户显式 (infer 冻结 — 触碰即接管意图, 属预期语义); 未触碰时不收集表单 — inferred gen 回传省略 (后端 fresh infer), 显式 gen 原样回传 (含 shape), 见 `src/web/AGENTS.md` "Secret 表单" 判定矩阵。shape 的展示/编辑 (方向 B) 有需求再做 (issue #319 预裁决: 编辑器 99% 场景不关心 mock 细节)。
 
 ## dag (内容寻址存储)
 

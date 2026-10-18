@@ -2120,7 +2120,8 @@
         <option value="placeholder" data-i18n="form.strategy.placeholder">Placeholder — explicit fake value + leak detection</option>
       </select>
 
-      <fieldset style="grid-column: 1 / -1; border: 1px solid var(--border); padding: 8px; margin: 4px 0;">
+      <!-- id 供 mock strategy 脏检查监听 (#319, 见 collectMockStrategyFromForm). -->
+      <fieldset id="f-mock-fieldset" style="grid-column: 1 / -1; border: 1px solid var(--border); padding: 8px; margin: 4px 0;">
         <legend data-i18n="form.mockStrategy">Mock Strategy</legend>
         <div style="display: grid; grid-template-columns: auto 1fr; gap: 6px 10px; align-items: center;">
           <label data-i18n="form.initial">Initial</label>
@@ -7034,6 +7035,22 @@
     // ─── mock strategy form helpers ──────────────────────────────────────
     //
     // 与后端 MockStrategy JSON shape 对齐. 省略 gen 字段让后端 infer (Auto + 无 gen).
+    //
+    // #319 脏检查 (与 pool exhaust 高级区同型, 见 loadExhaustIntoForm 附近):
+    // 表单没有 shape 字段, 从表单字段收集 gen 会丢失 shape, 且把 infer 结果以
+    // "用户显式配置" (gen_inferred=false) 身份落盘 — 冻结 infer + mismatch 检测
+    // 停用. 故编辑已有条目且 mock 高级区未触碰时不收集表单, 按装载态原样回传
+    // (判定矩阵见 collectMockStrategyFromForm 头注释).
+    let mockStrategyDirty = false;
+    let loadedMockStrategy = null;
+    // 用户手动输入 (text/number/radio/checkbox 的 input 事件均冒泡) → 置脏.
+    document.getElementById('f-mock-fieldset').addEventListener('input', () => { mockStrategyDirty = true; });
+    // Infer/Generate 按钮程序化改写字段不触发 input 事件 — 点击本身即用户
+    // 接管 mock 配置的意图, 显式置脏 (含 alert 早退路径: 见过提示仍保存,
+    // 按表单收集是保守正确的方向).
+    ['f-ms-infer', 'f-ms-generate'].forEach((bid) => {
+      document.getElementById(bid).addEventListener('click', () => { mockStrategyDirty = true; });
+    });
 
     // strategy select 回填: 值在下拉词表 (redact/reject/placeholder) 外 (undefined /
     // protect 搁置值) 时回退 redact (serde 缺省).
@@ -7043,6 +7060,10 @@
     }
 
     function loadMockStrategyIntoForm(ms) {
+      // #319: 暂存装载态 (未触碰时的原样回传源) + 复位脏标记. 每次打开表单
+      // (新建 → null) 都重置, 不受上次编辑残留影响.
+      loadedMockStrategy = ms || null;
+      mockStrategyDirty = false;
       const initial = (ms && ms.initial && ms.initial.kind) || 'auto';
       document.querySelector(`input[name="f-ms-initial"][value="${initial}"]`).checked = true;
       document.getElementById('f-ms-fixed').value = (ms && ms.initial && ms.initial.value) || '';
@@ -7076,6 +7097,28 @@
     function collectMockStrategyFromForm() {
       // 从 DOM 收集表单值, 返回与后端 MockStrategy 对齐的 JS object.
       // 若用户保持所有默认 (auto + 无任何 gen 配置), 返回 null 让后端用 default.
+      //
+      // #319 判定矩阵 — 编辑已有条目且 mock 高级区未触碰 (mockStrategyDirty
+      // 为 false) 时, 不从表单字段收集, 按装载态 (loadedMockStrategy, 来自
+      // GET DTO 的 effective mock_strategy) 原样回传:
+      //   原 gen 是 infer 结果 (DTO 带 gen_inferred=true) → 回传 null
+      //     (后端 fresh infer: shape 恢复 + infer 升级可生效 + mismatch 复活);
+      //   原 gen 是用户显式 (无 gen_inferred) → 原样回传 gen (含 shape —
+      //     dynamic override 是整条目替换, 省略会让 static/此前的显式配置被
+      //     infer 结果遮蔽 = 数据丢失);
+      //   原 initial=fixed → 原样回传 initial.
+      // 触碰过 → 按表单收集 (shape 退化 plain 是已接受的限制 — 表单无 shape
+      // 编辑, issue #319 方向 B 不做; 落盘为用户显式配置).
+      if (!mockStrategyDirty && loadedMockStrategy) {
+        const ms = loadedMockStrategy;
+        if (ms.initial && ms.initial.kind === 'fixed') {
+          return { initial: { kind: 'fixed', value: ms.initial.value } };
+        }
+        if (ms.gen && !ms.gen_inferred) {
+          return { initial: { kind: 'auto' }, gen: ms.gen };
+        }
+        return null; // auto + (gen 缺失 | infer 填充) → 省略, 后端 fresh infer
+      }
       const initialKind = document.querySelector('input[name="f-ms-initial"]:checked').value;
       const prefix = document.getElementById('f-ms-prefix').value;
       const charset = collectCharsetFromForm();

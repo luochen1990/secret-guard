@@ -804,14 +804,19 @@ pub struct MockStrategy {
     pub gen_spec: Option<GenSpec>,
 
     /// 运行时标记: `gen_spec` 是否由 [`MockStrategy::resolve_against`] 推断填充
-    /// (非用户显式配置). `#[serde(skip)]` — 永不参与序列化, round-trip 后恒
-    /// `false`. 持久化层 (`DynamicTable::persist_dynamic` 经
+    /// (非用户显式配置). serde 形态: **只写不读** (`skip_deserializing` + false 时
+    /// 省略) — `true` 时序列化进 GET DTO (EffectiveSecret/SecretMasked), WebUI
+    /// 编辑器的脏检查以此区分 "gen 是 infer 结果 → 回传省略 gen 让后端 fresh
+    /// infer" 与 "用户显式 → 原样回传防丢" (#319); 永不反序列化 ⇒ 经 wire
+    /// (static/state toml / WebUI 请求) 进入的 `gen_spec` 恒为用户显式, 该
+    /// 不变量不可被客户端伪造. 持久化层 (`DynamicTable::persist_dynamic` 经
     /// [`crate::config::DynamicEntry::strip_runtime_state`]) 依此把 infer 的
-    /// gen_spec 从 state.toml 剥离 — 落盘只含用户声明, 每次加载 fresh infer
-    /// (避免 stale spec 固化, 也避免 "gen_spec 存在" 被误读为用户显式配置).
+    /// gen_spec (连同标记) 从 state.toml 剥离 — 落盘只含用户声明, 每次加载
+    /// fresh infer (避免 stale spec 固化, 也避免 "gen_spec 存在" 被误读为
+    /// 用户显式配置).
     ///
     /// 不参与 `PartialEq` / `Eq` / `Hash` (见 struct 级手写 impl 说明).
-    #[serde(skip)]
+    #[serde(skip_deserializing, skip_serializing_if = "std::ops::Not::not")]
     pub gen_inferred: bool,
 }
 
@@ -1975,6 +1980,32 @@ mod tests {
     }
 
     #[test]
+    fn gen_inferred_wire_is_serialize_only() {
+        // #319: GET DTO 需要区分 "gen 是 infer 结果" (WebUI 未触碰回传省略 →
+        // 后端 fresh infer) 与 "用户显式" (原样回传防丢) — 序列化必须带标记.
+        let s = resolved(TEST_PEM, SecretCategory::PrivateKey);
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["gen_inferred"], serde_json::json!(true));
+        // 只写不读: 反序列化忽略该字段 (恒 false) — 经 wire (toml / WebUI 请求)
+        // 供给的 gen_spec 恒为用户显式, "infer 态" 不可被客户端伪造 (免 sanitize 点).
+        let rt: MockStrategy = serde_json::from_value(json).unwrap();
+        assert!(!rt.gen_inferred);
+        assert_eq!(
+            rt.gen_spec, s.gen_spec,
+            "gen_spec 本身 wire round-trip 不变"
+        );
+        // false 时省略 — 显式配置 / 声明态的 DTO 不多带字段 (state.toml 持久化
+        // 投影 strip 后同形态, 落盘零扰动).
+        let explicit = MockStrategy::default();
+        assert!(
+            serde_json::to_value(&explicit)
+                .unwrap()
+                .get("gen_inferred")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn shape_infer_pem_not_gated_by_category() {
         // 归类错误免疫: PEM 形状自证, 任意 category (含 Other/ApiKey) 都推断 Pem.
         for cat in SecretCategory::ALL.iter().map(|(c, _)| *c) {
@@ -2299,7 +2330,7 @@ mod tests {
             crate::util::hash64(&b),
             "gen_inferred must not affect hash/seed"
         );
-        // serde round-trip 后标记恒 false (#[serde(skip)]).
+        // serde round-trip 后标记恒 false (只写不读: 序列化携带, 反序列化忽略, #319).
         let json = serde_json::to_string(&a).unwrap();
         let back: MockStrategy = serde_json::from_str(&json).unwrap();
         assert!(!back.gen_inferred);

@@ -397,6 +397,32 @@ API key CRUD **无条件挂载** (在 `web::router()`, 不依赖 `auth.enabled`)
   附该端点 base_url); URL cell 显示第一端点 base_url (声明序 = fallback 序) +
   "+N" 角标 (td title 全量 `protocol: base_url` 列表). disabled 行同型展示.
 
+### Secret 表单 (mock strategy 脏检查, #319)
+
+Secret 编辑表单的 mock 高级区 (fieldset `#f-mock-fieldset`) 走 **dirty 追踪**
+(与 pool exhaust 高级区同型): 打开表单时装载 effective `mock_strategy` 暂存
+(`loadedMockStrategy`) 并清零脏标记; 任一输入 (input 事件冒泡) 或 Infer/Generate
+按钮点击 (程序化改写不触发 input, 显式置脏) → 置脏。保存时 `collectMockStrategyFromForm`
+的**判定矩阵** (SSOT = 该函数头注释):
+
+- 未触碰 + 原 gen 是 infer 结果 (DTO `mock_strategy.gen_inferred` = true) → 回传
+  `mock_strategy: null` — 后端 fresh infer (shape 恢复 / infer 升级可生效 /
+  category↔shape mismatch 检测复活)。动机: 表单无 shape 字段, 从表单收集会把
+  PEM/JWT 结构化仿真退化为 plain, 且 infer 结果以 "用户显式" 身份落盘 (冻结)。
+- 未触碰 + 原 gen 是用户显式 (DTO 无 `gen_inferred`) → 原样回传 gen (含 shape) —
+  dynamic override 是**整条目替换** (`pick_effective`, SecretEntry 无字段级继承),
+  省略会让 static toml / 此前 WebUI 的显式配置被 infer 结果遮蔽 = 数据丢失。
+- 未触碰 + `initial=fixed` → 原样回传 initial。
+- 触碰过 → 按表单收集 (shape 退化 plain, 已接受限制 — 表单无 shape 编辑,
+  issue #319 方向 B 不做, 见 known-limitations "config" 节)。
+
+后端配套: `MockStrategy.gen_inferred` serde **只写不读** (`skip_deserializing` +
+false 省略) — true 进 GET DTO 供本判定, wire 进入恒 false ⇒ API 供给的 gen_spec
+恒为用户显式 (测试 `mock::tests::gen_inferred_wire_is_serialize_only` +
+`secrets::tests::effective_snapshot_exposes_gen_inferred_flag`)。
+回归守卫: `tests/webui/im-ui.spec.ts` "WebUI secret mock strategy 脏检查 (#319)" describe
+(三条: inferred 省略 / 显式原样 / 触碰收集)。
+
 ### Endpoints 弹窗 (direct 端点行 + router/pool 入口矩阵 + Models 预览)
 
 - **direct 条目 = per 端点行形态** (multi-endpoint): 每行 = 一个已配置端点 —
