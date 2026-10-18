@@ -331,36 +331,53 @@ API key CRUD **无条件挂载** (在 `web::router()`, 不依赖 `auth.enabled`)
   protocol select 下拉词表 = `GET /api/providers` 的 `webui_protocols` (仅 codec 覆盖族
   openai/anthropic/openai-responses, 代码侧谓词 SSOT = `Protocol::codec_covered()`);
   全量 `protocols`/`shorts` 仅供路由约定表格渲染与 endpoints 弹窗的 short 映射. 存量
-  gemini/ollama 条目编辑与 Detect 探测推荐经 `setEndpointProtocolValue` 动态 append
-  "(experimental)" 选项 (词表灌入发生在 `addEndpointRow` 物化时 — "populate 先于
-  set" 时序由行生命周期天然保证) — 后端能力保留, 只是新建不引导.
+  gemini/ollama 条目编辑与 base_url 建议 proto 预填经 `setEndpointProtocolValue` 动态
+  append "(experimental)" 选项 (词表灌入发生在 `addEndpointRow` 物化时 — "populate
+  先于 set" 时序由行生命周期天然保证) — 后端能力保留, 只是新建不引导.
 - 表单 `#p-kind` 是构造分野的唯一事实来源 (**三构造**: Direct / Router / Pool):
   **Direct** (端点行编辑器 `#p-endpoints-list` + API Key 字段) vs **Router** (路由
   编辑器字段组 `#p-router-fields`) vs **Pool** (成员编辑器 + exhaust 高级配置字段组
   `#p-pool-fields`). 切换只显隐字段组, **不清空已输入内容** — Direct↔Router↔Pool
   来回切不丢数据 (与 #181 的字段保留语义一致)。
 - **Direct 端点行编辑器** (multi-endpoint, D1-D3): 每行 = protocol select + base_url
-  input + common_uri 徽标 + Detect 按钮 + 行删除; "+ Add endpoint" 增行. 行数据
-  SSOT 是 DOM 本身 (同路由编辑器模式): common_uri 暂存存 `row.dataset.commonUri`
-  (null 态 = 无该属性), 行序 = 声明序 = fallback 序 (D2). ≥1 行约束在提交侧校验
-  (`collectEndpointsFromForm`: 0 行 / protocol 或 base_url 空 / 同 protocol 重复
-  三类前置拦截, 文案与 routes/members 同风格). 编辑回填 = `p.endpoints[]` 全量物化,
+  input + common_uri 徽标 + Detect 结果小图标 + Detect 按钮 + 行删除; "+ Add protocol"
+  (添加协议) 增行. **新建零行起步** (#332: 端点发现区块是主入口, 手动行经 "添加协议"
+  物化; 编辑既有条目仍全量回填). 行数据 SSOT 是 DOM 本身 (同路由编辑器模式):
+  common_uri 暂存存 `row.dataset.commonUri` (null 态 = 无该属性), 行序 = 声明序 =
+  fallback 序 (D2). ≥1 行约束在提交侧校验 (`collectEndpointsFromForm`: 0 行 / protocol
+  或 base_url 空 / 同 protocol 重复三类前置拦截, 文案与 routes/members 同风格).
   保存全量提交 endpoints (无 #157 null 歧义, "保留" 由回填实现). api_key 保持条目级
-  一份 (共享凭证, D3).
-- **base_url 预置清单补全** (ENDPOINT_PRESETS, 2026-10-18): 输入 ≥3 字符子串匹配
-  (label+url, case-insensitive) 出 ≤8 条建议 (行内列表, 无匹配无 DOM — UI-10 辅助
-  输入, 绝不阻塞手填/粘贴); 点选回填 url + 预填 proto (建议非命令). 清单 26 条主流
-  供应商, url 均经 models 端点 curl 实测 (证据注释见常量头). 两个正确性锚点: ①
-  程序化回填后补发 input 事件 — commonUri 作废与建议重算统一走既有 input 监听
-  (A 的布局断言不得随 B 落盘, M1 竞态; Playwright 守卫); ② focusout 关闭带
-  relatedTarget 焦点守卫 — 浏览器在 mousedown 即把焦点交给建议按钮, 朴素
-  setTimeout 关闭会在 click 落地前移除按钮致点选永久失效 (压测 --repeat-each
-  暴露), 焦点去向列表内不启动定时器. Escape 只关列表不关 dialog (preventDefault,
-  IME isComposing 让位原生; focusout 关闭定时器 id 挂 row, focusin 回焦/重渲染
-  时取消 — 150ms 窗口内回焦不得误关列表). **已知限制**: 建议列表鼠标专属 —
-  Tab 序 (select→input→Detect→Del→建议) 下 150ms 关闭窗口内键盘不可达, 亦无
-  ArrowDown/Enter 选中; 本地单用户工具 + UI-10 "辅助输入" 定位下可接受, a11y
-  combobox 模式留给未来.
+  一份 (共享凭证, D3), 且位于字段组首位 (#332: origin 检测与逐行 Detect 都取它当前值).
+- **端点发现区块** (`#p-discovery`, #332 主入口): origin 输入 + "检测" 按钮 →
+  `POST /api/providers/probe-origin` `{origin, api_key?, extra_faces?}` → 固定 5 行
+  检测矩阵 (`#p-discovery-results`, wire 契约冻结: status ok|absent|error × evidence
+  models|auth|existence; 恒 200, 探测失败是数据). ok 行右侧 **[添加]** 一键物化端点行
+  (`addEndpointRow({protocol, base_url}, {lockProtocol})` — protocol 锁定 disabled,
+  base_url 预填可改, common_uri 不设); 已有同协议行 → [添加] 禁用 "已添加"
+  (`syncDiscoveryAddButtons` 全量重算, 刷新点 = 行增/删/协议变更/矩阵渲染/dialog 重开).
+  faces 的 `responses` wire 名经 `canonicalFaceProtocol` 归一到词表名
+  `openai-responses`. `typed_face_stripped` 非空 → 面板顶部归一化提示. 失败 (网络错/
+  非 200) → 面板单行错误, 手动 "添加协议" 恒可用 (UI-10). epoch 对账复用 probeEpoch
+  (dialog 重开丢弃在途结果); origin 输入挂知识库 autocomplete (见下条).
+- **供应商端点知识库** (ENDPOINT_PRESETS, #332 升级为 `{label, origin, faces[]}`):
+  origin = 剥离面尾段的厂商源, faces = 已验证协议面 ({uri, protocol}; curl 证据史见
+  常量头). 两个消费面: ① origin **精确命中** (trim + 去尾斜杠 + 小写, `normalizeOrigin`)
+  → probe-origin 请求带该条 `extra_faces` (增测厂商已知面; 未命中省略); ② base_url
+  建议按 faces 扁平展开 (`ENDPOINT_URL_SUGGEST`, 多面条目标签补 " (Proto)" 后缀,
+  多面条目锚点与旧清单逐字一致 — 测试锚点; 单面条目标签可与新知识库不同名).
+- **输入建议通用机制** (`attachInputSuggest`, #332 从 base_url 行泛化到 origin 输入):
+  compute/apply/mountList 三注入点, per-input 监听. 交互契约 (与 base_url 补全逐条
+  等价): 输入 ≥3 字符子串匹配 (label+url/origin, case-insensitive) 出 ≤8 条建议
+  (行内列表, 无匹配无 DOM — UI-10 辅助输入, 绝不阻塞手填/粘贴); 点选回填 + 预填
+  (建议非命令, base_url 行预填 proto; origin 只回填 origin); 程序化回填后补发 input
+  事件 — commonUri 作废与建议重算统一走既有 input 监听 (A 的布局断言不得随 B 落盘,
+  M1 竞态; Playwright 守卫); focusout 关闭带 relatedTarget 焦点守卫 — 浏览器在
+  mousedown 即把焦点交给建议按钮, 朴素 setTimeout 关闭会在 click 落地前移除按钮致
+  点选永久失效 (压测 --repeat-each 暴露), 焦点去向列表内不启动定时器. Escape 只关
+  列表不关 dialog (preventDefault, IME isComposing 让位原生; focusout 关闭定时器 id
+  挂 input, focusin 回焦/重渲染时取消 — 150ms 窗口内回焦不得误关列表). **已知限制**:
+  建议列表鼠标专属 — Tab 序下 150ms 关闭窗口内键盘不可达, 亦无 ArrowDown/Enter
+  选中; 本地单用户工具 + UI-10 "辅助输入" 定位下可接受, a11y combobox 模式留给未来.
 - **Pool 构造** (spec-pool-provider §10): 成员编辑器 = 有序 Direct provider 下拉
   (行序 = failover 优先级, ↑/↓ 排序, 候选排除编辑对象自身 + 仅 Direct 条目, 悬空
   成员补 "(missing)" 选项); exhaust 三通道 + cooldown 在原生 `<details>` 高级区
@@ -386,22 +403,22 @@ API key CRUD **无条件挂载** (在 `web::router()`, 不依赖 `auth.enabled`)
 - **提交语义**: Router 分支全量发 `routes` (≥1 条; 每行 model_pattern / target 前端必填
   拦截, 不依赖后端 400). Direct 分支不发 `routes` / `members` — 构造切换的显式取消
   例外见上方 "构造切换的显式取消" 条.
-- **Detect 协议探测** (端点行内, per 行): `POST /api/providers/probe` (该行 base_url +
-  条目级 api_key 当前值) 手动触发; recommended 只自动填入**该行**的 protocol select
-  (建议非命令, 用户可手改 — 词表 = webui_protocols, 透传族动态 append), 另附模型
-  chips 预览 (MVP 深度 = 浏览 + 点击复制). 每行结果回显该族全部探测 URL (`GET {url}`
-  子行 — 不黑盒, 全 404 时用户可对照调整 base_url); 无推荐时附**肯定式**逃生口
-  hint (UI-10: 告知部分供应商无 models 端点 + 手动选协议保存即可 + 转发不依赖
-  检测, 不暗示 base_url 填错). 无 ok 证据且 base 尾段 `anthropic` 时后端启发式
-  推荐 anthropic (note 说明系 URL 形状推断). 探测结果不参与保存前置校验 —
-  失败/未探测的行照样可手填保存 (UI-10 非阻塞不变量, Playwright 守卫).
-  common_uri 知识链 (per 行): detect → `row.dataset.commonUri` 暂存 (badge 以
-  `+/v1` / `✓ included` 追加回显在该行 base_url 输入框后, 点击复制 base_url+
-  common_uri 整体) → 保存 payload 全量携带 (null = 未探测, 前端编辑回填 effective
-  原值实现"保留") → 后端 `Endpoint.common_uri` 落盘 → fetch_model_list fast path.
-  base_url 编辑作废该行暂存 (探测结果只对被探测 URL 成立). 表单值变更后旧结果不
-  自动清除 (下次点击以当前表单值覆盖); probeEpoch 代数对账沿用 (dialog 重开即
-  丢弃在途结果), 行级追加行存活 (isConnected) 与该行 base_url 未变两个落地条件.
+- **Detect 协议探测** (端点行内压缩形态, #332 步骤 4): `POST /api/providers/probe`
+  (该行 base_url + 条目级 api_key 当前值) 手动触发; 结果 = 行内小图标
+  (`.ep-probe-dot`: ok → ✓ 绿 / absent → ✗ 红 / auth_failed|error → ⚠ 琥珀) +
+  hover title 携带 detail (模型计数/note/keyless 消歧并入). 图标语义 = **该行
+  protocol** 在 probes[] 的 outcome (发起时捕获); recommended 自动改写 select 的
+  旧行为已随 #332 移除 (协议在 origin 先行流程里是用户决策 — 端点发现锁定/手动
+  选择, 自动改写会对抗显式选择; 后端 recommended/note 字段保留, note 并入 title).
+  探测结果不参与保存前置校验 — 失败/未探测的行照样可手填保存 (UI-10 非阻塞不变量,
+  Playwright 守卫; 肯定式引导移交端点发现区块常驻 hint). common_uri 知识链 (per 行):
+  detect → `row.dataset.commonUri` 暂存 (badge 以 `+/v1` / `✓ included` 追加回显在
+  该行 base_url 输入框后, 点击复制 base_url+common_uri 整体) → 保存 payload 全量携带
+  (null = 未探测, 前端编辑回填 effective 原值实现"保留") → 后端 `Endpoint.common_uri`
+  落盘 → fetch_model_list fast path. base_url 编辑作废该行暂存 (探测结果只对被探测
+  URL 成立). 表单值变更后旧结果不自动清除 (下次点击以当前表单值覆盖); probeEpoch
+  代数对账沿用 (dialog 重开即丢弃在途结果), 行级追加行存活 (isConnected) 与该行
+  base_url 未变两个落地条件.
 - **列表 router 行**: URL 列渲染路由摘要 `model_pattern → target · egress` (禁用路由主文本
   删除线; 超过 2 条折叠为首条 + "+N more", 全量在 td title). egress 是**展示近似** —
   从路由 target 出发 walk 链尾 Direct 的**端点集合** (`chainTailEndpoints`: 中间 router

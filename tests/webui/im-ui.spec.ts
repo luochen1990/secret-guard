@@ -222,6 +222,12 @@ function autoAcceptAlerts(page: Page): string[] {
   return alerts;
 }
 
+// 打开新建 provider 表单 (provider 相关 describe 共用, #332 起两 describe 复用).
+async function openNewProviderForm(page: Page): Promise<void> {
+  await page.locator("button", { hasText: "+ new provider" }).click();
+  await expect(page.locator("#provider-form")).toBeVisible();
+}
+
 // provider 表单端点行 (multi-endpoint) 快捷定位: 默认第 0 行 (Detect 用例的
 // 探测目标 / 新建表单的首行).
 function endpointRow(page: Page, n = 0): Locator {
@@ -2692,9 +2698,10 @@ test.describe("WebUI 表单失败保持 (#181)", () => {
     const dlg = page.locator("#provider-form");
     await expect(dlg).toBeVisible();
     // 已存在的 static id (playwright.config.ts 预置) → POST 409.
-    // 端点行 (multi-endpoint): 新建默认 1 行, 填第 0 行.
+    // 端点行 (#332 零行起步): "添加协议" 手动物化, 填第 0 行.
     await page.locator("#p-id").fill("mock-openai");
     await page.locator("#p-name").fill("my precious name");
+    await page.locator("#p-endpoint-add").click();
     await endpointRow(page).locator(".ep-protocol").selectOption("openai");
     await endpointRow(page).locator(".ep-base-url").fill("http://127.0.0.1:19999/v1");
     await page.locator("#p-api-key").fill("sk-user-typed-key-123");
@@ -2766,6 +2773,7 @@ test.describe("WebUI 表单失败保持 (#181)", () => {
     const dlg = page.locator("#provider-form");
     await expect(dlg).toBeVisible();
     await page.locator("#p-id").fill("net-err-provider");
+    await page.locator("#p-endpoint-add").click();
     await endpointRow(page).locator(".ep-protocol").selectOption("openai");
     await endpointRow(page).locator(".ep-base-url").fill("http://127.0.0.1:19999/v1");
 
@@ -2792,8 +2800,10 @@ test.describe("WebUI 表单失败保持 (#181)", () => {
     await page.locator("button", { hasText: "+ new provider" }).click();
     const dlg = page.locator("#provider-form");
     await expect(dlg).toBeVisible();
-    // 不填端点行 base_url (Direct 默认构造) → builder 返回 null (#180 的前端拦截分支).
+    // 物化手动行但不填 base_url → builder 返回 null (#180 的前端拦截分支;
+    // 零行起步下须先物化, 否则触发的是 "≥1 行" 拦截).
     await page.locator("#p-id").fill("no-baseurl-provider");
+    await page.locator("#p-endpoint-add").click();
     await endpointRow(page).locator(".ep-protocol").selectOption("openai");
 
     const alerts = autoAcceptAlerts(page);
@@ -2856,6 +2866,7 @@ test.describe("WebUI 表单失败保持 (#181)", () => {
     const dlg = page.locator("#provider-form");
     await expect(dlg).toBeVisible();
     await page.locator("#p-id").fill(uid);
+    await page.locator("#p-endpoint-add").click();
     await endpointRow(page).locator(".ep-protocol").selectOption("openai");
     await endpointRow(page).locator(".ep-base-url").fill("http://127.0.0.1:19999/v1");
 
@@ -2884,13 +2895,17 @@ test.describe("Provider 表单构造分野 (#190)", () => {
     const dlg = page.locator("#provider-form");
     await expect(dlg).toBeVisible();
 
-    // 默认 direct: 端点行 base_url / API Key 可见; 路由编辑器隐藏.
-    // (断言组内代表字段而非 display:contents wrapper — 后者无盒, 可见性断言依赖浏览器实现细节.)
-    await expect(page.locator(".endpoint-row .ep-base-url")).toBeVisible();
+    // 默认 direct: 端点发现区块 + API Key 可见; 路由编辑器隐藏; 端点行零行起步
+    // (#332: 端点发现是主入口). (断言组内代表字段而非 display:contents wrapper —
+    // 后者无盒, 可见性断言依赖浏览器实现细节.)
+    await expect(page.locator("#p-discovery-origin")).toBeVisible();
+    await expect(page.locator("#p-api-key")).toBeVisible();
+    await expect(page.locator(".endpoint-row")).toHaveCount(0);
     await expect(page.locator("#p-routes-list")).not.toBeVisible();
 
     const uid = `direct-${Date.now()}`;
     await page.locator("#p-id").fill(uid);
+    await page.locator("#p-endpoint-add").click();
     await endpointRow(page).locator(".ep-protocol").selectOption("openai");
     await endpointRow(page).locator(".ep-base-url").fill("http://127.0.0.1:19998");
 
@@ -2982,9 +2997,11 @@ test.describe("Provider 表单构造分野 (#190)", () => {
     await expect(page.locator(".route-row")).toHaveCount(1);
     await expect(page.locator(".route-row .route-model-pattern")).toHaveValue("*");
 
-    // 切 Direct (#187 改回实体场景): 端点行 base_url 空 → 前置校验拦截.
+    // 切 Direct (#187 改回实体场景): 物化手动行后 base_url 空 → 前置校验拦截
+    // (零行起步下不物化即保存触发的是 "≥1 行" 拦截, 非本用例目标).
     const alerts = autoAcceptAlerts(page);
     await page.locator("#p-kind").selectOption("direct");
+    await page.locator("#p-endpoint-add").click();
     await page.locator('#provider-form-el button[value="save"]').click();
     await expect
       .poll(() => alerts.length, { timeout: 3000 })
@@ -3068,20 +3085,23 @@ test.describe("Provider 多端点表单 (multi-endpoint)", () => {
     await expect(page.locator("#providers-body tr").first()).toBeVisible();
   });
 
-  // multi-endpoint 主链路冒烟: 增删行 → 双端点保存 round-trip → 列表每端点一枚
+  // multi-endpoint 主链路冒烟: 手动增删行 → 双端点保存 round-trip → 列表每端点一枚
   // pill + 第一端点 base_url (+N 角标) → 编辑回填两行协议不漂移 (声明序 = fallback
-  // 序, 数据完整性). 途中覆盖 ≥1 行 / 重复协议两条前端前置拦截.
+  // 序, 数据完整性). 途中覆盖 ≥1 行 / 重复协议两条前端前置拦截. (#332: 新建零行
+  // 起步, 行一律经 "添加协议" 手动物化.)
   test("端点行增删 + ≥1/重复协议拦截 + 保存 round-trip + 每端点 pill", async ({ page }) => {
     await page.locator("button", { hasText: "+ new provider" }).click();
     const dlg = page.locator("#provider-form");
     await expect(dlg).toBeVisible();
-    // 新建默认 1 行 (词表首项 openai 兜底).
-    await expect(page.locator(".endpoint-row")).toHaveCount(1);
+    // 新建零行起步 (#332): 端点发现是主入口, 手动行经 "添加协议" 物化.
+    await expect(page.locator(".endpoint-row")).toHaveCount(0);
     const uid = `multi-${Date.now()}`;
     await page.locator("#p-id").fill(uid);
-    // 行 1: openai (默认) + base_url.
+    // 行 1 (手动): openai (默认) + base_url.
+    await page.locator("#p-endpoint-add").click();
+    await expect(page.locator(".endpoint-row")).toHaveCount(1);
     await endpointRow(page).locator(".ep-base-url").fill("http://127.0.0.1:19999");
-    // + Add endpoint → 行 2: anthropic + base_url.
+    // 行 2 (手动): anthropic + base_url.
     await page.locator("#p-endpoint-add").click();
     await expect(page.locator(".endpoint-row")).toHaveCount(2);
     await endpointRow(page, 1).locator(".ep-protocol").selectOption("anthropic");
@@ -3133,6 +3153,8 @@ test.describe("Provider 多端点表单 (multi-endpoint)", () => {
     const dlg = page.locator("#provider-form");
     await expect(dlg).toBeVisible();
     await page.locator("#p-id").fill(`empty-eps-${Date.now()}`);
+    // 手动物化一行再删空 (零行起步下 0 行是新常态, 约束仍在提交侧拦截).
+    await page.locator("#p-endpoint-add").click();
     await endpointRow(page).locator(".ep-base-url").fill("http://127.0.0.1:19999");
     await endpointRow(page).locator(".ep-del").click();
     await expect(page.locator(".endpoint-row")).toHaveCount(0);
@@ -3152,6 +3174,7 @@ test.describe("Provider 多端点表单 (multi-endpoint)", () => {
     await page.locator("button", { hasText: "+ new provider" }).click();
     const uid = `eps-dlg-${Date.now()}`;
     await page.locator("#p-id").fill(uid);
+    await page.locator("#p-endpoint-add").click();
     await endpointRow(page).locator(".ep-base-url").fill("http://127.0.0.1:19999");
     await page.locator("#p-endpoint-add").click();
     await endpointRow(page, 1).locator(".ep-protocol").selectOption("anthropic");
@@ -3424,12 +3447,14 @@ test.describe("usage-stats (模型用量统计)", () => {
 
 type ProbeUpstream = { url: string; close: () => Promise<void> };
 
+// respond 收 (pathname, method) — origin 探测的 POST 存在性路由 (如
+// POST /anthropic/v1/messages) 需要按方法区分 (#332 mock 上游先例扩展).
 function startProbeUpstream(
-  respond: (pathname: string) => { status: number; body: string; delayMs?: number }
+  respond: (pathname: string, method: string) => { status: number; body: string; delayMs?: number }
 ): Promise<ProbeUpstream> {
   return new Promise((resolve, reject) => {
     const server = http.createServer((req, res) => {
-      const { status, body, delayMs } = respond(req.url ?? "");
+      const { status, body, delayMs } = respond(req.url ?? "", req.method ?? "GET");
       const send = () => {
         res.writeHead(status, { "Content-Type": "application/json" });
         res.end(body);
@@ -3522,23 +3547,30 @@ test.describe("Provider Detect 协议探测", () => {
     await deadUpstream.close();
   });
 
-  async function openNewProviderForm(page: Page): Promise<void> {
-    await page.locator("button", { hasText: "+ new provider" }).click();
-    await expect(page.locator("#provider-form")).toBeVisible();
-  }
-
-  test("Detect: openai shape 上游 → recommended 改写 select + Detected 行 + 3 chips", async ({ page }) => {
+  test("Detect: 该行 protocol 的 outcome 图标 (anthropic ✗ → openai ✓) + 不改写 select (#332)", async ({ page }) => {
     await page.goto("/");
     await page.locator('a.tab[data-tab="providers"]').click();
     await openNewProviderForm(page);
-    // 预先把 select 改到非推荐值: 断言 "被 recommended 改写", 排除 "本来就是
-    // openai" 的 vacuous 通过.
+    // 手动物化行 (#332 零行起步); 协议显式选 anthropic — fast 上游只有 openai 面,
+    // 逐行 Detect 的图标语义 = **所选协议** 的 outcome (recommended 自动改写已随
+    // #332 移除: 协议在 origin 先行流程里是用户决策).
+    await page.locator("#p-endpoint-add").click();
     await endpointRow(page).locator(".ep-protocol").selectOption("anthropic");
     await endpointRow(page).locator(".ep-base-url").fill(fastUpstream.url);
     await endpointRow(page).locator(".ep-detect").click();
-    await expect(endpointRow(page).locator(".ep-probe-result .probe-line-ok")).toContainText("Detected: openai");
-    await expect(endpointRow(page).locator(".ep-protocol")).toHaveValue("openai");
-    await expect(endpointRow(page).locator(".ep-probe-result .probe-chip")).toHaveCount(3);
+    // anthropic 族 absent → ✗ 红图标 (title 携带 detail); select 不被改写.
+    const dot = endpointRow(page).locator(".ep-probe-dot");
+    await expect(dot).toBeVisible();
+    await expect(dot).toHaveClass(/ep-probe-dot-err/);
+    await expect(dot).toHaveAttribute("title", /.+/);
+    await expect(endpointRow(page).locator(".ep-protocol")).toHaveValue("anthropic");
+    // 切到 openai 再探 → ✓ 绿图标 (title 含模型计数) + common_uri 徽标知识链照旧.
+    await endpointRow(page).locator(".ep-protocol").selectOption("openai");
+    await endpointRow(page).locator(".ep-detect").click();
+    await expect(dot).toHaveClass(/ep-probe-dot-ok/);
+    await expect(dot).toHaveAttribute("title", /3 models/);
+    await expect(endpointRow(page).locator(".ep-common-uri-badge")).toBeVisible();
+    await expect(endpointRow(page).locator(".ep-common-uri-badge")).toHaveText("+/v1");
     // finally 恢复: 按钮可点且文案复位.
     await expect(endpointRow(page).locator(".ep-detect")).toBeEnabled();
     await expect(endpointRow(page).locator(".ep-detect")).toHaveText("Detect");
@@ -3548,6 +3580,8 @@ test.describe("Provider Detect 协议探测", () => {
     await page.goto("/");
     await page.locator('a.tab[data-tab="providers"]').click();
     await openNewProviderForm(page);
+    // 手动物化行并挂上慢探测 (800ms 延迟给 close+reopen 留足窗口).
+    await page.locator("#p-endpoint-add").click();
     // 先挂 response 监听再点击: 稍后 await 它 = "旧响应确已回到浏览器" 成为
     // 前置断言 (替代固定 sleep, 消除 CI 慢时空转通过窗口)。
     const staleResponse = page.waitForResponse(
@@ -3555,35 +3589,33 @@ test.describe("Provider Detect 协议探测", () => {
     );
     await endpointRow(page).locator(".ep-base-url").fill(slowUpstream.url);
     await endpointRow(page).locator(".ep-detect").click();
-    // 立即关闭并重开 dialog (重开即 epoch bump; 新世界: 空 base_url, select 回
-    // 默认 openai) — 800ms 延迟给 close+reopen 留足窗口.
+    // 立即关闭并重开 dialog (重开即 epoch bump; 新世界零行起步, origin 面板清空).
     await page.locator('#provider-form-el button[value="cancel"]').click();
     await expect(page.locator("#provider-form")).not.toBeVisible();
     await openNewProviderForm(page);
     await staleResponse;
-    // 旧响应已落地浏览器: 若无 epoch 守卫, 此刻会渲染 "Detected: anthropic" 并
-    // 改写 select. 断言两者都没发生.
-    await expect(endpointRow(page).locator(".ep-probe-result .probe-line")).toHaveCount(0);
-    await expect(endpointRow(page).locator(".ep-probe-result .hint")).toHaveCount(0);
-    await expect(endpointRow(page).locator(".ep-protocol")).toHaveValue("openai");
+    // 旧响应已落地浏览器: 若无 epoch 守卫, 图标/暂存会写入新世界. 断言新世界
+    // 全新 — 零端点行 + 端点发现面板空 + 无可见探测图标.
+    await expect(page.locator("#p-endpoints-list .endpoint-row")).toHaveCount(0);
+    await expect(page.locator("#p-discovery-results")).toBeEmpty();
+    await expect(page.locator(".ep-probe-dot:not([hidden])")).toHaveCount(0);
   });
 
   // ─── 智谱式布局 (版本前缀已含): bare /models 回退 + common_uri 知识链 ────
 
-  test("Detect: versioned 上游 → bare 回退命中 + URL 回显 + common_uri 徽标 + 保存回读", async ({ page }) => {
+  test("Detect: versioned 上游 → bare 回退命中 + common_uri 徽标 + 保存回读", async ({ page }) => {
     await page.goto("/");
     await page.locator('a.tab[data-tab="providers"]').click();
     await openNewProviderForm(page);
     await page.locator("#p-id").fill("zhipu-coding");
+    await page.locator("#p-endpoint-add").click();
     await endpointRow(page).locator(".ep-base-url").fill(versionedUpstream.url);
     // 徽标初始隐藏 (未探测).
     await expect(endpointRow(page).locator(".ep-common-uri-badge")).toBeHidden();
     await endpointRow(page).locator(".ep-detect").click();
-    await expect(endpointRow(page).locator(".ep-probe-result .probe-line-ok")).toContainText("Detected: openai");
-    // URL 回显: 胜出族 (openai) 的两路 GET URL 都可见 (不黑盒).
-    await expect(endpointRow(page).locator(".ep-probe-result .probe-url")).toHaveCount(2);
-    await expect(endpointRow(page).locator(".ep-probe-result .probe-url").last()).toContainText("/models");
-    // common_uri="" 徽标: 追加在 base_url 后, 显示 included 语义 (无可视前缀).
+    // ✓ 图标 (openai ok) + common_uri="" 徽标 (智谱式布局: 版本前缀已含, bare
+    // /models 命中 — 知识链保留, URL 回显随 #332 压缩形态移除).
+    await expect(endpointRow(page).locator(".ep-probe-dot")).toHaveClass(/ep-probe-dot-ok/);
     await expect(endpointRow(page).locator(".ep-common-uri-badge")).toBeVisible();
     await expect(endpointRow(page).locator(".ep-common-uri-badge")).toHaveText("✓ included");
     // 保存 → 知识落盘 (POST 带 common_uri: "").
@@ -3602,6 +3634,7 @@ test.describe("Provider Detect 协议探测", () => {
     await page.goto("/");
     await page.locator('a.tab[data-tab="providers"]').click();
     await openNewProviderForm(page);
+    await page.locator("#p-endpoint-add").click();
     await endpointRow(page).locator(".ep-base-url").fill(fastUpstream.url);
     await endpointRow(page).locator(".ep-detect").click();
     await expect(endpointRow(page).locator(".ep-common-uri-badge")).toBeVisible();
@@ -3618,24 +3651,23 @@ test.describe("Provider Detect 协议探测", () => {
 
   // ─── UI-10: 检测失败不阻塞手动填写 (非阻塞不变量) ──────────────────────────
 
-  test("Detect 全 404: 肯定式逃生口 hint + 手动选协议保存不被阻塞 (UI-10)", async ({ page }) => {
-    // 小米 MiMo 案例回归: Detect 无 recommended 时, 旧文案暗示 base_url 布局有误
-    // (误导用户去改照官方文档抄的正确 URL) 且不告知手动路径可用 → 用户被卡死.
-    // UI-10 契约: 检测仅是体验增强, 失败呈现必须给肯定式逃生口, 手动填写/保存
-    // 全程可用 — 本用例把该链路整体钉进测试.
+  test("Detect 全 404: 失败图标仅提示 + 手动选协议保存不被阻塞 (UI-10)", async ({ page }) => {
+    // 小米 MiMo 案例回归 (UI-10 契约): 检测仅是体验增强, 失败呈现不得阻塞手动
+    // 填写/保存 — 压缩形态下失败 = ✗ 图标 + title detail (肯定式引导移交端点发现
+    // 区块的常驻 hint), 本用例把 "图标仅提示 → 手动填 → 保存成功" 链路整体钉进测试.
     const uid = `detect-fail-manual-${Date.now()}`;
     await page.goto("/");
     await page.locator('a.tab[data-tab="providers"]').click();
     await openNewProviderForm(page);
-    // base_url 不以版本段/协议段结尾 (裸根形态), upstream 恒 404 → 无 recommended.
+    await page.locator("#p-endpoint-add").click();
+    // base_url 不以版本段/协议段结尾 (裸根形态), upstream 恒 404 → 该族 absent.
     await endpointRow(page).locator(".ep-base-url").fill(deadUpstream.url);
     await endpointRow(page).locator(".ep-detect").click();
-    // 无 "Detected:" 行 (recommended 缺席) + 肯定式 hint 可见 (引导手动选协议;
-    // en locale 默认, 断言含 "pick the protocol" 片段).
-    await expect(endpointRow(page).locator(".ep-probe-result .probe-line-ok")).toHaveCount(0);
-    await expect(
-      page.locator(".ep-probe-result .hint", { hasText: "pick the protocol" })
-    ).toBeVisible();
+    // ✗ 红图标 + title 携带 detail; select 不被改写 (协议仍是用户决策).
+    const dot = endpointRow(page).locator(".ep-probe-dot");
+    await expect(dot).toHaveClass(/ep-probe-dot-err/);
+    await expect(dot).toHaveAttribute("title", /.+/);
+    await expect(endpointRow(page).locator(".ep-protocol")).toHaveValue("openai");
     // 手动逃生口: 该行 select 手动选 anthropic + 填 id/key + 保存 — 全程不被
     // 检测失败阻塞, dialog 正常关闭, providers 表格出现该行.
     await endpointRow(page).locator(".ep-protocol").selectOption("anthropic");
@@ -3661,9 +3693,12 @@ test.describe("Provider Detect 协议探测", () => {
     await page.locator('a.tab[data-tab="providers"]').click();
     await openNewProviderForm(page);
     const uid1 = `entry-url-v1-${Date.now()}`;
+    await page.locator("#p-endpoint-add").click();
     await endpointRow(page).locator(".ep-base-url").fill(fastUpstream.url);
     await endpointRow(page).locator(".ep-detect").click();
-    await expect(endpointRow(page).locator(".ep-probe-result .probe-line-ok")).toContainText("Detected: openai");
+    // 探测成功信号 = ✓ 图标 + '+/v1' 徽标 (common_uri 知识链).
+    await expect(endpointRow(page).locator(".ep-probe-dot")).toHaveClass(/ep-probe-dot-ok/);
+    await expect(endpointRow(page).locator(".ep-common-uri-badge")).toHaveText("+/v1");
     await page.locator("#p-id").fill(uid1);
     await page.locator('#provider-form-el button[value="save"]').click();
     await expect(page.locator("#provider-form")).not.toBeVisible();
@@ -3686,9 +3721,10 @@ test.describe("Provider Detect 协议探测", () => {
     // (不拼双版本段), 也无尾斜杠.
     await openNewProviderForm(page);
     const uid2 = `entry-url-bare-${Date.now()}`;
+    await page.locator("#p-endpoint-add").click();
     await endpointRow(page).locator(".ep-base-url").fill(versionedUpstream.url);
     await endpointRow(page).locator(".ep-detect").click();
-    await expect(endpointRow(page).locator(".ep-probe-result .probe-line-ok")).toContainText("Detected: openai");
+    await expect(endpointRow(page).locator(".ep-common-uri-badge")).toHaveText("✓ included");
     await page.locator("#p-id").fill(uid2);
     await page.locator('#provider-form-el button[value="save"]').click();
     await expect(page.locator("#provider-form")).not.toBeVisible();
@@ -3726,6 +3762,9 @@ test.describe("端点 base_url 补全 (autocomplete)", () => {
     await expect(page.locator("#providers-body tr").first()).toBeVisible();
     await page.locator("button", { hasText: "+ new provider" }).click();
     await expect(page.locator("#provider-form")).toBeVisible();
+    // #332 零行起步: 建议挂在端点行的 base_url 输入上, 手动物化一行再用.
+    await page.locator("#p-endpoint-add").click();
+    await expect(page.locator(".endpoint-row")).toHaveCount(1);
   });
 
   test("输入 ≥3 字符出建议 + 继续输入收窄 + 点选回填 url 与 protocol 预填", async ({ page }) => {
@@ -3794,7 +3833,7 @@ test.describe("端点 base_url 补全 (autocomplete)", () => {
     try {
       await endpointRow(page).locator(".ep-base-url").fill(upstream.url);
       await endpointRow(page).locator(".ep-detect").click();
-      await expect(endpointRow(page).locator(".ep-probe-result .probe-line-ok")).toContainText("Detected: openai");
+      await expect(endpointRow(page).locator(".ep-probe-dot")).toHaveClass(/ep-probe-dot-ok/);
       await expect(endpointRow(page).locator(".ep-common-uri-badge")).toBeVisible();
       await expect(endpointRow(page).locator(".ep-common-uri-badge")).toHaveText("+/v1");
       // 清空 (input 事件作废暂存, 徽标即隐) 再输入 → 建议出现.
@@ -3828,6 +3867,306 @@ test.describe("端点 base_url 补全 (autocomplete)", () => {
     await input.fill("groq");
     await expect(endpointRow(page).locator(".ep-url-suggest-item")).toHaveCount(1);
     await expect(endpointRow(page).locator(".ep-url-suggest-item")).toContainText("api.groq.com");
+  });
+});
+
+// ─── 端点发现 (origin 探测, #332) ────────────────────────────────────────────
+//
+// issue #332 创建 Provider 流程重设计: origin 先行 + 协议作为被发现的面.
+// POST /api/providers/probe-origin {origin, api_key?, extra_faces?} →
+// {origin, typed_face_stripped, faces[]} (永恒 200, 探测失败是数据). 覆盖:
+// MiMo 形状检测矩阵 (回归钉: anthropic 面可见 — 旧 "协议先行 + 面 URL 先行"
+// 流程下用户永远发现不了它) / [添加] 一键物化 + 已添加禁用态 / 无检测手动路径
+// (UI-10) / typed_face_stripped 归一化提示 / preset 命中 → extra_faces 随请求 /
+// 逐行二次检测压缩图标.
+//
+// mock 上游 (startProbeUpstream 扩展: respond 收 (pathname, method)): MiMo 形状
+// = GET /v1/models 200 (openai shape) + GET /anthropic/v1/models 404 +
+// POST /anthropic/v1/messages 400 (路由存在, existence 证据) + 其余 404 (含
+// 随机对照路径 — 区分 "400 = 路由真实" 与 "400 = 通用错误"; gemini/ollama 面
+// 端点同 404 → absent). 契约形状 (types 5-6) 用 page.route 在浏览器侧拦截
+// /api/providers/probe-origin 直喂冻结 wire 形状 (UI 渲染契约单测, 不依赖
+// 后端探测实现细节).
+
+test.describe("端点发现 (origin 探测)", () => {
+  let mimoUpstream: ProbeUpstream;
+
+  test.beforeAll(async () => {
+    // MiMo 形状: openai 面 (/v1, models 证据) + anthropic 面 (/anthropic,
+    // existence 证据); gemini/ollama 无路由 → absent.
+    mimoUpstream = await startProbeUpstream((pathname, method) => {
+      if (pathname === "/v1/models" && method === "GET") {
+        return {
+          status: 200,
+          body: JSON.stringify({
+            object: "list",
+            data: [
+              { id: "mimo-a", object: "model" },
+              { id: "mimo-b", object: "model" },
+            ],
+          }),
+        };
+      }
+      if (pathname === "/anthropic/v1/messages" && method === "POST") {
+        return {
+          status: 400,
+          body: JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "messages: field required" } }),
+        };
+      }
+      // /anthropic/v1/models (GET) → 404 (anthropic 无 models 端点);
+      // 随机对照 POST 路径 → 404; gemini /v1beta/models 与 ollama /api/tags → 404.
+      return { status: 404, body: "{}" };
+    });
+  });
+
+  test.afterAll(async () => {
+    await mimoUpstream.close();
+  });
+
+  async function probeOrigin(page: Page, origin: string): Promise<void> {
+    const probed = page.waitForResponse(
+      (r) => r.url().includes("/api/providers/probe-origin") && r.request().method() === "POST"
+    );
+    await page.locator("#p-discovery-origin").fill(origin);
+    await page.locator("#p-discovery-probe").click();
+    await probed;
+  }
+
+  test("MiMo 形状检测矩阵: openai ok/models + anthropic ok/existence + gemini/ollama absent (#332 回归钉)", async ({ page }) => {
+    await page.goto("/");
+    await page.locator('a.tab[data-tab="providers"]').click();
+    await openNewProviderForm(page);
+    await probeOrigin(page, mimoUpstream.url);
+
+    const results = page.locator("#p-discovery-results");
+    // openai 面: ✓ + uri 徽标 + models 证据标签 (2 个) + [添加] 可用 + 模型名预览.
+    const openaiRow = results.locator('.disc-row[data-proto="openai"]');
+    await expect(openaiRow.locator(".disc-icon-ok")).toBeVisible();
+    await expect(openaiRow).toContainText("/v1");
+    await expect(openaiRow).toContainText(/model list · 2/);
+    await expect(openaiRow.locator(".disc-add")).toBeEnabled();
+    await expect(results).toContainText("mimo-a");
+    // anthropic 面可见且 ok — issue #332 的核心痛点: 旧流程下该面永远不可见.
+    const anthropicRow = results.locator('.disc-row[data-proto="anthropic"]');
+    await expect(anthropicRow.locator(".disc-icon-ok")).toBeVisible();
+    await expect(anthropicRow).toContainText("/anthropic");
+    await expect(anthropicRow).toContainText(/route exists/);
+    await expect(anthropicRow.locator(".disc-add")).toBeEnabled();
+    // gemini / ollama: absent (圆点 + 未发现, 无 [添加]).
+    for (const proto of ["gemini", "ollama"]) {
+      const row = results.locator(`.disc-row[data-proto="${proto}"]`);
+      await expect(row.locator(".disc-dot")).toBeVisible();
+      await expect(row).toContainText("not found");
+      await expect(row.locator(".disc-add")).toHaveCount(0);
+    }
+    // 检测按钮复位.
+    await expect(page.locator("#p-discovery-probe")).toBeEnabled();
+    await expect(page.locator("#p-discovery-probe")).toHaveText("Probe");
+  });
+
+  test("anthropic 行 [添加] → 端点行物化 (protocol 锁定 + base_url 预填) → 保存成功", async ({ page }) => {
+    await page.goto("/");
+    await page.locator('a.tab[data-tab="providers"]').click();
+    await openNewProviderForm(page);
+    await probeOrigin(page, mimoUpstream.url);
+    await expect(page.locator('.disc-row[data-proto="anthropic"] .disc-add')).toBeEnabled();
+
+    // 一键物化: 走既有 addEndpointRow 路径 — protocol=anthropic 锁定 (disabled),
+    // base_url = face.base_url 预填 (可改).
+    await page.locator('.disc-row[data-proto="anthropic"] .disc-add').click();
+    await expect(page.locator(".endpoint-row")).toHaveCount(1);
+    const sel = endpointRow(page).locator(".ep-protocol");
+    await expect(sel).toHaveValue("anthropic");
+    await expect(sel).toBeDisabled();
+    await expect(endpointRow(page).locator(".ep-base-url")).toHaveValue(`${mimoUpstream.url}/anthropic`);
+
+    // 填 id + api_key → 保存成功 (端到端: 检测 → 添加 → 保存 主链路).
+    const uid = `disc-add-${Date.now()}`;
+    await page.locator("#p-id").fill(uid);
+    await page.locator("#p-api-key").fill("sk-disc-add");
+    await page.locator('#provider-form-el button[value="save"]').click();
+    await expect(page.locator("#provider-form")).not.toBeVisible();
+    const row = page.locator("#providers-body tr", { hasText: uid });
+    await expect(row).toBeVisible();
+    await expect(row.locator(".pill", { hasText: /^anthropic$/ })).toBeVisible();
+
+    autoAcceptAlerts(page);
+    await row.locator('button[data-action="delete"]').click();
+    await expect(row).not.toBeVisible();
+  });
+
+  test("[添加] 后按钮禁用「已添加」; 删行恢复可用", async ({ page }) => {
+    await page.goto("/");
+    await page.locator('a.tab[data-tab="providers"]').click();
+    await openNewProviderForm(page);
+    await probeOrigin(page, mimoUpstream.url);
+    const addBtn = page.locator('.disc-row[data-proto="openai"] .disc-add');
+    await expect(addBtn).toBeEnabled();
+
+    // 物化 openai 面 → 同协议按钮翻 "已添加" 并禁用.
+    await addBtn.click();
+    await expect(page.locator(".endpoint-row")).toHaveCount(1);
+    await expect(addBtn).toBeDisabled();
+    await expect(addBtn).toHaveText("Added");
+    // 手动物化的第二行选 openai 也触发同禁用语义 (协议集合判定, 不止锁定行).
+    await page.locator("#p-endpoint-add").click();
+    await endpointRow(page, 1).locator(".ep-protocol").selectOption("anthropic");
+    await expect(page.locator('.disc-row[data-proto="anthropic"] .disc-add')).toBeDisabled();
+
+    // 删掉 openai 行 → 按钮恢复 "Add".
+    await endpointRow(page).locator(".ep-del").click();
+    await expect(addBtn).toBeEnabled();
+    await expect(addBtn).toHaveText("Add");
+  });
+
+  test("无检测直接「添加协议」手动填 → 保存成功 (UI-10: 检测永不阻塞手填)", async ({ page }) => {
+    await page.goto("/");
+    await page.locator('a.tab[data-tab="providers"]').click();
+    await openNewProviderForm(page);
+    // 不碰 origin 检测 — 手动路径是完整逃生口 (零行起步 + 手动物化 + 保存).
+    await expect(page.locator("#p-discovery-results")).toBeEmpty();
+    await page.locator("#p-endpoint-add").click();
+    await endpointRow(page).locator(".ep-base-url").fill(`${mimoUpstream.url}/v1`);
+    const uid = `manual-no-probe-${Date.now()}`;
+    await page.locator("#p-id").fill(uid);
+    await page.locator('#provider-form-el button[value="save"]').click();
+    await expect(page.locator("#provider-form")).not.toBeVisible();
+    const row = page.locator("#providers-body tr", { hasText: uid });
+    await expect(row).toBeVisible();
+
+    autoAcceptAlerts(page);
+    await row.locator('button[data-action="delete"]').click();
+    await expect(row).not.toBeVisible();
+  });
+
+  test("typed_face_stripped 归一化提示渲染 (输入含面尾段 → 提示剥离)", async ({ page }) => {
+    // 契约形状单测: page.route 拦截 probe-origin 直喂冻结 wire 形状 (UI 渲染
+    // 契约与后端探测实现解耦).
+    await page.goto("/");
+    await page.locator('a.tab[data-tab="providers"]').click();
+    await openNewProviderForm(page);
+    await page.route("**/api/providers/probe-origin", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          origin: "https://api.example.com",
+          typed_face_stripped: "/anthropic",
+          faces: [
+            { protocol: "openai", uri: "/v1", base_url: "https://api.example.com/v1", status: "ok", evidence: "models", models: ["a"], detail: null },
+            { protocol: "anthropic", uri: "/anthropic", base_url: "https://api.example.com/anthropic", status: "ok", evidence: "existence", models: null, detail: null },
+            { protocol: "gemini", uri: null, base_url: null, status: "absent", evidence: null, models: null, detail: null },
+            { protocol: "ollama", uri: null, base_url: null, status: "absent", evidence: null, models: null, detail: null },
+            { protocol: "responses", uri: "/v1", base_url: "https://api.example.com/v1", status: "ok", evidence: "models", models: ["a"], detail: "与 OpenAI 共用 /v1, 探测无法区分" },
+          ],
+        }),
+      });
+    });
+    // 用户粘贴了带面尾段的 URL — 后端归一, 面板顶部回显归一化提示.
+    await probeOrigin(page, "https://api.example.com/anthropic");
+    const results = page.locator("#p-discovery-results");
+    await expect(results.locator(".hint").first()).toContainText("Normalized your input to https://api.example.com (stripped /anthropic)");
+    // responses 行 detail (共用注记) 追加渲染在详情子行 (与模型名并存, muted).
+    const respRow = results.locator('.disc-row[data-proto="openai-responses"]');
+    await expect(respRow.locator(".disc-icon-ok")).toBeVisible();
+    await expect(respRow.locator("~ .disc-detail").first()).toContainText("与 OpenAI 共用 /v1");
+    await page.unroute("**/api/providers/probe-origin");
+  });
+
+  test("preset origin 精确命中 → extra_faces 随请求发出; 未命中省略", async ({ page }) => {
+    await page.goto("/");
+    await page.locator('a.tab[data-tab="providers"]').click();
+    await openNewProviderForm(page);
+    const captured: string[] = [];
+    await page.route("**/api/providers/probe-origin", async (route) => {
+      captured.push(route.request().postData() ?? "");
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ origin: "https://api.xiaomimimo.com", typed_face_stripped: null, faces: [] }),
+      });
+    });
+    // 命中: 大小写不敏感 + 尾斜杠容忍 (normalizeOrigin) — 知识库 MiMo 条目的
+    // 两个已验证面作为 extra_faces 发出; origin 原样发送 (归一是后端职责).
+    await probeOrigin(page, "https://API.XiaoMiMiMo.com/");
+    expect(captured).toHaveLength(1);
+    const body1 = JSON.parse(captured[0]);
+    expect(body1.origin).toBe("https://API.XiaoMiMiMo.com/");
+    expect(body1.extra_faces).toEqual([
+      { uri: "/v1", protocol: "openai" },
+      { uri: "/anthropic", protocol: "anthropic" },
+    ]);
+    // 未命中: 未知 origin 不带 extra_faces 键 (后端按内置候选面探测).
+    await probeOrigin(page, "https://unknown-vendor.example");
+    expect(captured).toHaveLength(2);
+    const body2 = JSON.parse(captured[1]);
+    expect(body2.origin).toBe("https://unknown-vendor.example");
+    expect("extra_faces" in body2).toBe(false);
+    await page.unroute("**/api/providers/probe-origin");
+  });
+
+  test("检测: 在途探测关闭重开 dialog 后按钮恢复可用 (静态单例重置)", async ({ page }) => {
+    // 慢 origin 探测 (800ms) 给 close+reopen 留足窗口; 按钮是 dialog 内静态单例
+    // (行级 Detect 按钮随行重建无此问题), 在途 finally 恢复被 epoch 对账跳过后,
+    // openProviderForm 的重置块是唯一恢复路径 — 不还原则永久卡死 (review major).
+    const slow = await startProbeUpstream((pathname) => {
+      if (pathname === "/v1/models") {
+        return {
+          status: 200,
+          delayMs: 800,
+          body: JSON.stringify({ data: [{ type: "model", id: "slow-x", display_name: "X" }] }),
+        };
+      }
+      return { status: 404, body: "{}" };
+    });
+    try {
+      await page.goto("/");
+      await page.locator('a.tab[data-tab="providers"]').click();
+      await openNewProviderForm(page);
+      const staleResponse = page.waitForResponse(
+        (r) => r.url().includes("/api/providers/probe-origin") && r.request().method() === "POST"
+      );
+      await page.locator("#p-discovery-origin").fill(slow.url);
+      await page.locator("#p-discovery-probe").click();
+      // 在途: 按钮进入 loading 态 (disabled + Detecting…).
+      const btn = page.locator("#p-discovery-probe");
+      await expect(btn).toBeDisabled();
+      await expect(btn).toHaveText("Detecting…");
+      // 立即关闭并重开 dialog (重开即 epoch bump + 静态元素重置).
+      await page.locator('#provider-form-el button[value="cancel"]').click();
+      await expect(page.locator("#provider-form")).not.toBeVisible();
+      await openNewProviderForm(page);
+      await staleResponse;
+      // 旧响应确已回到浏览器 (finally 已被对账跳过): 按钮必须已由重置块还原.
+      await expect(btn).toBeEnabled();
+      await expect(btn).toHaveText("Probe");
+    } finally {
+      await slow.close();
+    }
+  });
+
+  test("逐行二次检测 → ✓ 图标 + 不阻塞保存 (issue #332 步骤 4)", async ({ page }) => {
+    await page.goto("/");
+    await page.locator('a.tab[data-tab="providers"]').click();
+    await openNewProviderForm(page);
+    // 手动行 (openai) + mimo 上游 (openai 面 ok) — 复用既有 POST /api/providers/probe.
+    await page.locator("#p-endpoint-add").click();
+    await endpointRow(page).locator(".ep-base-url").fill(mimoUpstream.url);
+    await endpointRow(page).locator(".ep-detect").click();
+    const dot = endpointRow(page).locator(".ep-probe-dot");
+    await expect(dot).toHaveClass(/ep-probe-dot-ok/);
+    await expect(dot).toHaveAttribute("title", /2 models/);
+    // 不阻塞保存: 图标仅提示, 保存照常成功.
+    const uid = `row-detect-save-${Date.now()}`;
+    await page.locator("#p-id").fill(uid);
+    await page.locator('#provider-form-el button[value="save"]').click();
+    await expect(page.locator("#provider-form")).not.toBeVisible();
+    const row = page.locator("#providers-body tr", { hasText: uid });
+    await expect(row).toBeVisible();
+
+    autoAcceptAlerts(page);
+    await row.locator('button[data-action="delete"]').click();
+    await expect(row).not.toBeVisible();
   });
 });
 
