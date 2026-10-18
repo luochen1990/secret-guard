@@ -92,7 +92,11 @@
 //!   解析成功 → ok; 401|403 → auth_failed; 404|405 → absent; 其余 → error.
 //! - 探测失败是**数据不是 HTTP 错误** (handler 对探测结果恒 200).
 //! - 推荐序: openai (ollama 双命中附 note) > anthropic > gemini (no-codec
-//!   note) > ollama (同 note); 无任何 ok → recommended null.
+//!   note) > ollama (同 note); 无任何 ok → /anthropic 尾段启发式兜底
+//!   (base_url 尾段精确小写 `anthropic` → 推荐 anthropic + note —
+//!   Anthropic 兼容网关 Xiaomi MiMo / Kimi / MiniMax / GLM 无 models 端点
+//!   的盲区补救; 证据 > 形状推断, 有 ok 命中时永不触发; common_uri 恒 None,
+//!   布局知识只来自真实探测), 否则 recommended null.
 //!
 //! 依赖方向: web/api/providers → 本模块 已在根 AGENTS.md "已接受的例外" 登记
 //! (probe 端点复用上游探测基建 + `provider_model_preview` 复用模型清单 fetch/合成
@@ -888,6 +892,9 @@ fn common_uri_candidates(preferred: Option<&str>) -> Vec<String> {
 const PROBE_NOTE_DUAL_OLLAMA: &str = "Ollama native endpoint also detected. The OpenAI-compatible endpoint is recommended because secret redaction requires a codec-covered protocol (OpenAI/Anthropic/Responses).";
 /// 无 codec 协议 (gemini / ollama) 被推荐时的理由 (同上, 冻结文案).
 const PROBE_NOTE_NO_CODEC: &str = "No codec for this protocol: secret redaction is unavailable, and requests hitting secrets are rejected by default (on_unsupported_protocol = fail_closed).";
+/// /anthropic 尾段启发式推荐的理由 (同上, 冻结文案): 无任何 ok 证据 + base
+/// 尾段恰为 anthropic — Anthropic 兼容网关 de-facto 布局的形状推断.
+const PROBE_NOTE_ANTHROPIC_SUFFIX: &str = "No models endpoint was found, but the base URL ends with /anthropic — the de-facto layout of Anthropic-compatible gateways (Xiaomi MiMo / Kimi / MiniMax / GLM), which typically do not expose a models endpoint; this recommendation is inferred from the URL shape only, and chat forwarding does not depend on a models endpoint.";
 
 /// 单个协议的探测结果 (wire DTO).
 #[derive(Debug, Serialize)]
@@ -953,10 +960,12 @@ pub(crate) struct ProbeResponse {
     pub recommended: Option<&'static str>,
     /// 推荐理由, 可为 null.
     pub note: Option<&'static str>,
-    /// recommended 是 openai/anthropic 时 = 胜出路的 common_uri (`"/v1"` 裸根 /
-    /// `""` 版本前缀已含) — detect 知识的载体, WebUI 暂存后随表单保存落盘到
-    /// `DirectProvider::common_uri` (fetch 侧 fast path). 其余 (gemini/ollama
-    /// 推荐 / 无推荐) null — 概念不适用或未知.
+    /// recommended 来自 ok 探测证据且为 openai/anthropic 时 = 胜出路的
+    /// common_uri (`"/v1"` 裸根 / `""` 版本前缀已含) — detect 知识的载体,
+    /// WebUI 暂存后随表单保存落盘到 `DirectProvider::common_uri` (fetch 侧
+    /// fast path). 其余 (gemini/ollama 推荐 / 无推荐 / /anthropic 尾段启发式
+    /// 推荐) null — 概念不适用或未知 (启发式只推断协议不推断布局, common_uri
+    /// 仅承载真实探测证据).
     pub common_uri: Option<String>,
 }
 
@@ -1119,7 +1128,9 @@ fn judge_v1_pair(res: &Result<(StatusCode, Vec<u8>), String>) -> (ProbeOutcome, 
 }
 
 /// 推荐序 (模块头部 "探测" 段): openai (ollama 双命中附 note) > anthropic >
-/// gemini (no-codec note) > ollama (同 note); 无任何 ok → (null, null).
+/// gemini (no-codec note) > ollama (同 note); 无任何 ok → (null, null) —
+/// /anthropic 尾段启发式兜底由调用方 [`probe_provider_upstream`] 在 None
+/// 分支应用 (纯证据判定归此函数, URL 形状推断归编排层).
 /// 按协议名查 ok 状态, 与 probes 的排列顺序解耦 (顺序本身是冻结的 wire 契约,
 /// 不应再成为推荐逻辑的隐式输入).
 fn recommend(probes: &[ProbeOutcome]) -> (Option<&'static str>, Option<&'static str>) {
@@ -1186,6 +1197,15 @@ fn merge_v1_pair(
 /// (gemini), `/api/tags` (ollama). 每路复用 `fetch_status_and_body` 防御
 /// (整体超时 + 有界 body + 错误串净化 — detail 不含 api_key).
 ///
+/// 推荐两段: ① 证据驱动 ([`recommend`]) — 任一 ok 即按推荐序选定, 并从
+/// ok-推荐派生 common_uri (胜出路的布局知识); ② /anthropic 尾段启发式兜底
+/// — 无任何 ok 且 base_url 尾段 (最后一个 path 段) 精确小写 `anthropic` →
+/// 推荐 anthropic + [`PROBE_NOTE_ANTHROPIC_SUFFIX`] (Anthropic 兼容网关
+/// Xiaomi MiMo / Kimi / MiniMax / GLM 的 de-facto 布局, 此类网关通常无
+/// models 端点, 两路 v1 探测皆 404 的结构性失明). **证据 > 形状推断**:
+/// ① 有结果时 ② 永不触发; ② 路径 common_uri 恒 None (URL 推断不冒充
+/// 探测证据).
+///
 /// 永不 Err / 永不 panic (ROB-*): 探测失败是数据不是 HTTP 错误.
 pub(crate) async fn probe_provider_upstream(
     client: &reqwest::Client,
@@ -1218,14 +1238,31 @@ pub(crate) async fn probe_provider_upstream(
     gemini.urls = vec![gemini_url];
     ollama.urls = vec![ollama_url];
     let probes = vec![openai, anthropic, gemini, ollama];
-    let (recommended, note) = recommend(&probes);
-    // common_uri = recommended 对应胜出路的布局知识 (openai/anthropic 共用
-    // v1 pair, 胜者在 merge 时判定); gemini/ollama/无推荐 → None.
-    let common_uri = match recommended {
+    let (ok_recommended, ok_note) = recommend(&probes);
+    // common_uri 只承载真实探测证据 (v1-pair ok 命中的胜出路径布局 —
+    // openai/anthropic 共用 v1 pair, 胜者在 merge 时判定); gemini/ollama/
+    // 无 ok 推荐 → None. 判定基于 ok-推荐而非最终 recommended: 启发式
+    // 覆盖后的 anthropic 推荐不得误获 v1_winner (形状推断不是布局证据).
+    let common_uri = match ok_recommended {
         Some(r) if r == Protocol::OpenAI.name() || r == Protocol::Anthropic.name() => {
             Some(v1_winner.to_string())
         }
         _ => None,
+    };
+    // /anthropic 尾段启发式兜底 (证据 > 形状推断: 有 ok 命中时本分支不可达):
+    // 无任何 ok 证据 (recommend = None) 且 base_url 尾段 (最后一个 path 段)
+    // 精确小写匹配 "anthropic" → 推荐 anthropic — Anthropic 兼容网关
+    // (Xiaomi MiMo / Kimi / MiniMax / GLM) 的 de-facto 布局, 此类网关通常
+    // 无 models 端点 (两路 v1 探测皆 404 的结构性失明). 尾段提取同款手法见
+    // `provider::heuristic_common_uri` (rsplit next — host-only URL 取到的
+    // 是 host, 天然不等于 "anthropic", 安全).
+    let (recommended, note) = match ok_recommended {
+        Some(_) => (ok_recommended, ok_note),
+        None if base_url.rsplit('/').next().unwrap_or("") == "anthropic" => (
+            Some(Protocol::Anthropic.name()),
+            Some(PROBE_NOTE_ANTHROPIC_SUFFIX),
+        ),
+        None => (None, None),
     };
     ProbeResponse {
         probes,
@@ -2398,6 +2435,91 @@ mod tests {
             Some(""),
             "智谱布局: 胜出路 = bare, detect 知识 = 版本前缀已含"
         );
+    }
+
+    /// /anthropic 尾段启发式 (无 models 端点盲区兜底): Anthropic 兼容网关
+    /// (Xiaomi MiMo / Kimi / MiniMax / GLM) 的 base_url 以 /anthropic 结尾且
+    /// 通常**没有** models 端点 (两路 v1 探测皆 404) — 全 absent 时按 URL
+    /// 形状推荐 anthropic, 但不伪造布局证据 (common_uri 恒 None), probes
+    /// 本身保持 absent (探测结果不被推荐层改写).
+    #[tokio::test]
+    async fn probe_anthropic_suffix_all_absent_recommends_anthropic() {
+        let mut server = mockito::Server::new_async().await;
+        for path in [
+            "/anthropic/v1/models",
+            "/anthropic/models",
+            "/anthropic/v1beta/models",
+            "/anthropic/api/tags",
+        ] {
+            server
+                .mock("GET", path)
+                .with_status(404)
+                .create_async()
+                .await;
+        }
+        let base = format!("{}/anthropic", server.url());
+        let resp = probe_provider_upstream(&reqwest::Client::new(), &base, "").await;
+        for p in &resp.probes {
+            assert_eq!(p.status, ProbeStatus::Absent, "探测结果不被推荐层改写");
+        }
+        assert_eq!(resp.recommended, Some("anthropic"));
+        // note 断言用冻结文案字面量 (风格同 probe_gemini_happy 的既有先例:
+        // 断言常量自身是同义反复, 文案漂移时恒绿, 起不到契约冻结作用).
+        assert_eq!(
+            resp.note,
+            Some(
+                "No models endpoint was found, but the base URL ends with /anthropic — the de-facto layout of Anthropic-compatible gateways (Xiaomi MiMo / Kimi / MiniMax / GLM), which typically do not expose a models endpoint; this recommendation is inferred from the URL shape only, and chat forwarding does not depend on a models endpoint."
+            )
+        );
+        assert_eq!(
+            resp.common_uri, None,
+            "启发式不伪造布局证据 — common_uri 只承载真实探测命中"
+        );
+    }
+
+    /// 证据 > 形状推断: base 以 /anthropic 结尾但 v1 路径有真实 openai shape
+    /// 命中 → 推荐与 common_uri 都来自探测证据, 启发式不触发.
+    #[tokio::test]
+    async fn probe_anthropic_suffix_evidence_wins() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/anthropic/v1/models")
+            .with_status(200)
+            .with_body(r#"{"object":"list","data":[{"id":"m1","object":"model"}]}"#)
+            .create_async()
+            .await;
+        for path in [
+            "/anthropic/models",
+            "/anthropic/v1beta/models",
+            "/anthropic/api/tags",
+        ] {
+            server
+                .mock("GET", path)
+                .with_status(404)
+                .create_async()
+                .await;
+        }
+        let base = format!("{}/anthropic", server.url());
+        let resp = probe_provider_upstream(&reqwest::Client::new(), &base, "").await;
+        assert_eq!(resp.probes[0].status, ProbeStatus::Ok);
+        assert_eq!(resp.recommended, Some("openai"), "真实证据压过形状推断");
+        assert_eq!(resp.common_uri.as_deref(), Some("/v1"));
+        assert!(resp.note.is_none());
+    }
+
+    /// 全 404 且 base 尾段非 anthropic (mockito 的 host:port 形态): 启发式
+    /// 不触发, 无推荐 (尾段提取对 host-only URL 天然安全 — rsplit 取到的
+    /// 是 host 而非 path 段).
+    #[tokio::test]
+    async fn probe_all_absent_without_anthropic_suffix_stays_none() {
+        let server = probe_upstream((404, ""), (404, ""), (404, ""), (404, "")).await;
+        let resp = probe(&server, "").await;
+        for p in &resp.probes {
+            assert_eq!(p.status, ProbeStatus::Absent);
+        }
+        assert_eq!(resp.recommended, None);
+        assert_eq!(resp.note, None);
+        assert_eq!(resp.common_uri, None);
     }
 
     /// 合并优先级: 无 ok 时 auth_failed (key 错, 用户可行动) 优先于 absent.
