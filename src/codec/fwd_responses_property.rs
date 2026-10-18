@@ -10,8 +10,10 @@
 //!
 //! # 生成器覆盖
 //!
-//! 生成器只覆盖 **可 round-trip 的字段子集** (MVP 范围). 已知 lossy 场景
-//! (hosted tools 丢弃 / previous_response_id 服务端状态) 由独立测试守卫;
+//! 生成器覆盖可 round-trip 的字段子集 + **混合 tools 数组** (#321: Raw 条目 /
+//! strict extra / parameters 缺席哨兵经生成器机械覆盖). 已知 lossy 场景
+//! (响应侧 hosted tool call items 丢弃 / previous_response_id 服务端状态)
+//! 由独立测试守卫;
 //! reasoning encrypted_content 已 passthrough (T7, round-trip 由
 //! `responses_reasoning_encrypted_content_roundtrip` 锁定).
 //!
@@ -29,6 +31,7 @@
 use proptest::prelude::*;
 use serde_json::{Value, json};
 
+use crate::codec::ir::IrTool;
 use crate::codec::normalize::normalize_json;
 use crate::codec::responses::{ResponsesReader, ResponsesWriter};
 use crate::codec::{Reader, Writer};
@@ -116,15 +119,53 @@ fn arb_function_call_output_item() -> impl Strategy<Value = Value> {
     })
 }
 
+/// 混合 tools 条目 (#321): Function (含可选 description/parameters/strict 的
+/// 形态矩阵) + Raw 形态 (hosted tools / tool_search / custom / 畸形 function /
+/// 非对象元素) — 同协议 round-trip property 经此机械覆盖 IrTool::Raw 与
+/// function 条目级 extra / parameters 缺席哨兵.
 fn arb_function_tool_def() -> impl Strategy<Value = Value> {
-    (arb_name(), arb_text_string()).prop_map(|(name, desc)| {
-        json!({
-            "type": "function",
-            "name": name,
-            "description": desc,
-            "parameters": {"type": "object", "properties": {}}
-        })
-    })
+    prop_oneof![
+        // Function 完整形态 (description 可缺席).
+        (arb_name(), prop::option::of(arb_text_string())).prop_map(|(name, desc)| {
+            let mut t = json!({
+                "type": "function",
+                "name": name,
+                "parameters": {"type": "object", "properties": {}}
+            });
+            if let Some(d) = desc {
+                t["description"] = json!(d);
+            }
+            t
+        }),
+        // Function 带 strict (条目级 extra 保真) + parameters 缺席 (Null 哨兵).
+        (arb_name(), any::<bool>()).prop_map(|(name, strict)| {
+            json!({
+                "type": "function",
+                "name": name,
+                "strict": strict,
+            })
+        }),
+        // Raw: hosted tools 家族 (真实形状的简化代表).
+        prop_oneof![
+            Just(json!({"type": "web_search"})),
+            Just(json!({"type": "file_search", "vector_store_ids": ["vs_x"]})),
+            Just(json!({"type": "computer_use_preview"})),
+            Just(json!({"type": "mcp", "server_label": "x", "server_url": "https://mcp.example"})),
+            Just(json!({"type": "image_generation", "size": "1024x1024"})),
+            // OpenAI Tool Search (#321 的直接对象).
+            Just(json!({"type": "tool_search", "defer_loading": true, "namespace": "search"})),
+            // custom/freeform (codex apply_patch 形态).
+            Just(
+                json!({"type": "custom", "name": "apply_patch", "format": {"type": "grammar", "syntax": "lark"}})
+            ),
+            // 畸形 function (缺 name) — Raw 保真, 上游自会拒绝.
+            Just(json!({"type": "function", "parameters": {"type": "object"}})),
+            // 未知未来 type (前向兼容: 任何新 hosted 工具自动透传).
+            Just(json!({"type": "future_tool_2030", "payload": {"nested": ["a", 1]}})),
+            // 非对象元素 (极端畸形).
+            Just(json!("junk-entry")),
+        ],
+    ]
 }
 
 fn arb_text_string() -> impl Strategy<Value = String> {
@@ -238,13 +279,14 @@ proptest! {
     }
 }
 
-// ─── 单测: lossy 字段的丢弃行为正确 (不 round-trip, 但行为可预测) ──────────
+// ─── 单测: 非 function tools 条目的保真行为 (#321) ─────────────────────────
 
-/// hosted tools (web_search/computer/mcp/...) 应被静默丢弃, 不进入 IR.tools.
+/// hosted tools (web_search/computer/mcp/tool_search/...) 收为 IrTool::Raw
+/// 原文保真, 不再丢弃; 同协议 round-trip normalize 相等 (一个字节不丢).
 #[test]
-fn responses_lossy_hosted_tools_dropped() {
+fn responses_hosted_tools_kept_as_raw_roundtrip() {
     let body = json!({
-        "model": "gpt-4o",
+        "model": "gpt-5.4",
         "input": "hi",
         "tools": [
             {"type": "function", "name": "f1", "parameters": {}},
@@ -253,14 +295,28 @@ fn responses_lossy_hosted_tools_dropped() {
             {"type": "mcp", "server_label": "x"},
             {"type": "file_search"},
             {"type": "image_generation"},
+            {"type": "tool_search", "defer_loading": true, "namespace": "search"},
         ]
     });
     let ir = responses_reader().read_request(&body).unwrap();
-    // 只剩 function 类型.
-    assert_eq!(ir.tools.len(), 1);
-    assert_eq!(ir.tools[0].name, "f1");
+    // 1 个 Function + 6 个 Raw, 顺序与位置保留.
+    assert_eq!(ir.tools.len(), 7);
+    assert!(matches!(&ir.tools[0], IrTool::Function { name, .. } if name == "f1"));
+    assert!(
+        ir.tools[1..]
+            .iter()
+            .all(|t| matches!(t, IrTool::Raw { .. }))
+    );
     // tools_present 仍为 true (wire 含 tools 字段).
     assert!(ir.tools_present);
+    // 同协议 round-trip: tools 数组 normalize 相等 (hosted 条目 verbatim 回写;
+    // 不比整个 body — input 的 string→数组展开是既有规范化, 与本断言正交).
+    let out = responses_writer().write_request(&ir);
+    assert_eq!(
+        normalize_json(&body["tools"]),
+        normalize_json(&out["tools"]),
+        "#321: hosted tools 同协议 round-trip 必须保真"
+    );
 }
 
 /// T7: reasoning item 的 encrypted_content 同协议 round-trip 完整保留
@@ -494,8 +550,10 @@ proptest! {
     }
 }
 
-/// FWD-3 已知限制守卫 (hosted tools 静默丢弃): 跨协议 Responses → Chat 时, hosted
-/// tools (web_search/file_search/computer/mcp) 不进入 IR.tools, 故不泄漏到 Chat egress.
+/// FWD-3 已知限制守卫 (#321 精确化): 跨协议 Responses → Chat 时, hosted tools
+/// 等非 function 条目 (reader 收为 `IrTool::Raw` 原文) 在 `clear_wire_fidelity`
+/// (SSOT 清空点) 丢弃 — 不泄漏到 Chat egress (同协议路径 verbatim 透传,
+/// 由 `responses_hosted_tools_kept_as_raw_roundtrip` 锁定).
 #[test]
 fn prop_responses_to_chat_hosted_tools_dropped_cross_proto() {
     let body = json!({
@@ -760,23 +818,26 @@ fn assert_responses_chat_modeled_fields_equivalent(
     }
 
     // tools: 数量 + name + input_schema (normalize 后比较).
-    prop_assert_eq!(
-        ir_in.tools.len(),
-        ir_out.tools.len(),
-        "{}: tools 数量损失",
-        direction,
-    );
-    for (i, (t_in, t_out)) in ir_in.tools.iter().zip(ir_out.tools.iter()).enumerate() {
+    // Raw 条目 (#321) 例外: 跨协议翻译在 clear_wire_fidelity 丢弃 + WARN —
+    // 本比较只看 Function 投影 (Raw 的跨协议丢弃由
+    // prop_responses_to_chat_hosted_tools_dropped_cross_proto 专项锁定).
+    // (嵌套 fn 而非闭包: 两次借用需要显式独立生命周期, 闭包推断不出)
+    fn fn_proj(t: &IrTool) -> Option<(&String, &Value)> {
+        match t {
+            IrTool::Function {
+                name, input_schema, ..
+            } => Some((name, input_schema)),
+            IrTool::Raw { .. } => None,
+        }
+    }
+    let fns_in: Vec<_> = ir_in.tools.iter().filter_map(fn_proj).collect();
+    let fns_out: Vec<_> = ir_out.tools.iter().filter_map(fn_proj).collect();
+    prop_assert_eq!(fns_in.len(), fns_out.len(), "{}: tools 数量损失", direction);
+    for (i, ((n_in, s_in), (n_out, s_out))) in fns_in.iter().zip(fns_out.iter()).enumerate() {
+        prop_assert_eq!(n_in, n_out, "{}: tools[{}].name 损失", direction, i);
         prop_assert_eq!(
-            t_in.name.clone(),
-            t_out.name.clone(),
-            "{}: tools[{}].name 损失",
-            direction,
-            i,
-        );
-        prop_assert_eq!(
-            normalize_json(&t_in.input_schema),
-            normalize_json(&t_out.input_schema),
+            normalize_json(s_in),
+            normalize_json(s_out),
             "{}: tools[{}].input_schema 语义损失",
             direction,
             i,

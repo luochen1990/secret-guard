@@ -1338,27 +1338,41 @@ fn arb_anthropic_system_block() -> impl Strategy<Value = Value> {
 }
 
 /// Anthropic 工具定义 (含 L5 工具级 extra: cache_control / defer_loading, #269).
+/// 混合 tools 条目 (#321): 自定义工具 (input_schema 可缺席 = server tools 形态,
+/// 可带 cache_control / type / max_uses 等条目级 extra) + Raw 形态 (无 name 的
+/// server tools 如 code_execution / 非对象元素) — 同协议 round-trip property
+/// 经此机械覆盖 IrTool::Raw 与 input_schema 缺席哨兵.
 fn arb_anthropic_tool_def() -> impl Strategy<Value = Value> {
-    (
-        "[a-z]{3,10}",
-        "[a-z ]{1,30}",
-        prop::option::of(arb_cache_control()),
-        prop::option::of(Just(true)),
-    )
-        .prop_map(|(name, desc, cc, defer)| {
-            let mut t = json!({
-                "name": name,
-                "description": desc,
-                "input_schema": {"type": "object", "properties": {}},
-            });
-            if let Some(cc) = cc {
-                t["cache_control"] = cc;
-            }
-            if let Some(d) = defer {
-                t["defer_loading"] = json!(d);
-            }
-            t
-        })
+    prop_oneof![
+        // 自定义工具完整形态 (cache_control / defer_loading 条目级 extra, #269).
+        (
+            "[a-z]{3,10}",
+            "[a-z ]{1,30}",
+            prop::option::of(arb_cache_control()),
+            prop::option::of(Just(true)),
+        )
+            .prop_map(|(name, desc, cc, defer)| {
+                let mut t = json!({
+                    "name": name,
+                    "description": desc,
+                    "input_schema": {"type": "object", "properties": {}},
+                });
+                if let Some(cc) = cc {
+                    t["cache_control"] = cc;
+                }
+                if let Some(d) = defer {
+                    t["defer_loading"] = json!(d);
+                }
+                t
+            }),
+        // server tools 有 name 形态 (web_search): 无 input_schema (缺席哨兵) +
+        // type / max_uses 经条目级 extra 保真.
+        Just(json!({"type": "web_search_20250305", "name": "web_search", "max_uses": 5})),
+        // Raw: server tools 无 name 形态 (code_execution).
+        Just(json!({"type": "code_execution_20250522"})),
+        // Raw: 非对象元素 (极端畸形).
+        Just(json!("junk-tool")),
+    ]
 }
 
 /// block 级 `cache_control` 的合法 wire 值 (#269): ephemeral 是当前唯一支持的 type.
@@ -1676,6 +1690,24 @@ fn arb_openai_request_with_embedded_secret() -> impl Strategy<Value = (Value, St
         // 4. user 字段注入 (OpenAI 顶层 user)
         obj.insert("user".to_string(), Value::String(format!("user-{secret}")));
 
+        // 5. tools Raw 条目注入 (#321): custom 工具 (无 function 键 → Raw 保真)
+        //    的 description 藏 secret — Raw 条目的字符串叶子必须在 redact 扫描面.
+        obj.entry("tools".to_string())
+            .and_modify(|t| {
+                if let Value::Array(arr) = t {
+                    arr.push(json!({
+                        "type": "custom",
+                        "custom": {"name": "probe", "description": format!("tok:{secret}")}
+                    }));
+                }
+            })
+            .or_insert_with(|| {
+                json!([{
+                    "type": "custom",
+                    "custom": {"name": "probe", "description": format!("tok:{secret}")}
+                }])
+            });
+
         (req, secret)
     })
 }
@@ -1725,6 +1757,24 @@ fn arb_anthropic_request_with_embedded_secret() -> impl Strategy<Value = (Value,
             json!({"user_id": format!("user-{secret}")}),
         );
 
+        // 4. tools Raw 条目注入 (#321): 无 name 的 server tool 形态 (code_execution)
+        //    → Raw 保真; description 藏 secret — Raw 字符串叶子必须在 redact 扫描面.
+        obj.entry("tools".to_string())
+            .and_modify(|t| {
+                if let Value::Array(arr) = t {
+                    arr.push(json!({
+                        "type": "code_execution_20250522",
+                        "description": format!("tok:{secret}")
+                    }));
+                }
+            })
+            .or_insert_with(|| {
+                json!([{
+                    "type": "code_execution_20250522",
+                    "description": format!("tok:{secret}")
+                }])
+            });
+
         (req, secret)
     })
 }
@@ -1773,20 +1823,41 @@ fn arb_tools_opt(count: std::ops::Range<usize>) -> impl Strategy<Value = Option<
     prop::option::of(prop::collection::vec(arb_tool_def(), count))
 }
 
+/// 混合 tools 条目 (#321): Function (description/parameters 可缺席, function
+/// 子对象可带 strict 等 extra) + Raw 形态 (custom 工具 / 畸形 function / 非对象)
+/// — 同协议 round-trip property 经此机械覆盖 IrTool::Raw 与 function 子对象级
+/// extra / parameters 缺席哨兵.
 fn arb_tool_def() -> impl Strategy<Value = Value> {
-    ("[a-z]{3,10}".prop_map(|s| s),).prop_map(|(name,)| {
-        json!({
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": "do something",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
+    prop_oneof![
+        // Function 完整形态.
+        ("[a-z]{3,10}",).prop_map(|(name,)| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": "do something",
+                    "parameters": {"type": "object", "properties": {}},
                 }
-            }
-        })
-    })
+            })
+        }),
+        // Function 最小形态: parameters / description 缺席 + strict (function
+        // 子对象级 extra 保真 — structured outputs 常见形态).
+        ("[a-z]{3,10}", any::<bool>()).prop_map(|(name, strict)| {
+            json!({
+                "type": "function",
+                "function": {"name": name, "strict": strict}
+            })
+        }),
+        // Raw: custom/freeform 工具 (无 function 键).
+        Just(json!({
+            "type": "custom",
+            "custom": {"name": "apply_patch", "format": {"type": "grammar", "syntax": "lark"}}
+        })),
+        // Raw: 畸形 function (缺 name).
+        Just(json!({"type": "function", "function": {"parameters": {"type": "object"}}})),
+        // Raw: 非对象元素 (极端畸形).
+        Just(json!("junk-tool")),
+    ]
 }
 
 fn arb_nested_json_value() -> impl Strategy<Value = Value> {

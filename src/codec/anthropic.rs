@@ -24,7 +24,7 @@ use super::{
     IrRequest, IrResponse, IrRole, IrStopReason, IrStreamEvent, IrTool, IrToolChoice, IrUsage,
     Reader, Writer, blocks_to_text, collect_extra,
     ir::{StreamDecodeState, StreamEncodeState},
-    random_base62,
+    merge_extra_into, random_base62,
 };
 
 // ─── Reader ────────────────────────────────────────────────────────────────
@@ -68,7 +68,7 @@ impl Reader for AnthropicReader {
         let tools = obj
             .get("tools")
             .and_then(Value::as_array)
-            .map(|arr| arr.iter().filter_map(read_tool_def).collect())
+            .map(|arr| arr.iter().map(read_tool_def).collect())
             .unwrap_or_default();
 
         let max_tokens = obj
@@ -1106,34 +1106,37 @@ fn merge_wire_extra(block: &mut IrBlock, extra: serde_json::Map<String, Value>) 
     }
 }
 
-/// 解析 Anthropic tool 定义 (顶层 name/description/input_schema).
-fn read_tool_def(tool: &Value) -> Option<IrTool> {
-    let name = tool
-        .get("name")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    if name.is_empty() {
-        return None;
-    }
-    let description = tool
-        .get("description")
-        .and_then(Value::as_str)
-        .map(String::from);
-    let input_schema = tool
-        .get("input_schema")
-        .cloned()
-        .unwrap_or(Value::Object(Map::new()));
-    Some(IrTool {
-        name,
-        description,
-        input_schema,
-        // 工具级未建模字段 (cache_control / defer_loading / type 等) 原样保留 (#269):
-        // claude code 常把缓存断点放在最后一个工具定义上, 丢失 = 工具段缓存失效.
-        extra: tool
-            .as_object()
-            .map(|m| collect_extra(m, &["name", "description", "input_schema"]))
-            .unwrap_or_default(),
+/// 解析 Anthropic tool 定义 → IrTool (#321: 永不返回 None / 永不丢弃条目).
+/// - 自定义工具 {name, description?, input_schema?, cache_control?, ...}
+///   → [`IrTool::Function`]; `input_schema` 缺席 (server tools 如 web_search 常缺)
+///   存 Null 哨兵 (writer 跳过, 不注入空 schema — 此前会注入 `input_schema:{}`,
+///   加字段同属 FWD-1 违约); 条目级未建模字段 (cache_control / type / max_uses /
+///   defer_loading 等) 原样保留在 extra (#269): claude code 常把缓存断点放在
+///   最后一个工具定义上, 丢失 = 工具段缓存失效.
+/// - 其余一切 (server tools 无 name 形态如 code_execution / 畸形条目 / 非对象
+///   元素) → [`IrTool::Raw`] 原文保真: 同协议 verbatim round-trip, 跨协议由
+///   `clear_wire_fidelity` 丢弃 + WARN.
+fn read_tool_def(tool: &Value) -> IrTool {
+    let parse_function = (|| {
+        let obj = tool.as_object()?;
+        let name = obj.get("name").and_then(Value::as_str)?;
+        if name.is_empty() {
+            return None;
+        }
+        let description = obj
+            .get("description")
+            .and_then(Value::as_str)
+            .map(String::from);
+        Some(IrTool::Function {
+            name: name.to_string(),
+            description,
+            // input_schema 缺席 → Null 哨兵 (不注入空对象).
+            input_schema: obj.get("input_schema").cloned().unwrap_or(Value::Null),
+            extra: collect_extra(obj, &["name", "description", "input_schema"]),
+        })
+    })();
+    parse_function.unwrap_or(IrTool::Raw {
+        entry: tool.clone(),
     })
 }
 
@@ -1381,14 +1384,6 @@ fn merge_block_extra(obj: &mut Value, extra: &serde_json::Map<String, Value>) {
     }
 }
 
-/// 把 `extra` 的键值合并进目标 Map (同名覆盖 — 回写优先级契约的唯一定义点;
-/// L4/L5/工具级 extra 的回写共用, 跨协议路径已被 `clear_wire_fidelity` 清空).
-fn merge_extra_into(target: &mut Map<String, Value>, extra: &Map<String, Value>) {
-    for (k, v) in extra {
-        target.insert(k.clone(), v.clone());
-    }
-}
-
 /// 序列化后的 wire block 是否为"裸 Text block" (恰好只含 type + text 两键).
 ///
 /// 编码 L5 折叠契约 (#269): 携带任何 block 级 extra 字段的 Text 不得折叠为裸
@@ -1400,14 +1395,30 @@ fn is_bare_text_block(v: &Value) -> bool {
 
 /// 写 tool 定义 (Anthropic 顶层 name/description/input_schema + 工具级 extra 回写).
 fn write_tool_def(tool: &IrTool) -> Value {
-    let mut obj = Map::new();
-    obj.insert("name".to_string(), Value::String(tool.name.clone()));
-    if let Some(desc) = &tool.description {
-        obj.insert("description".to_string(), Value::String(desc.clone()));
+    match tool {
+        // Raw 原文 verbatim 回写 (#321): 与 extra 的 seam 契约同型 — 跨协议路径
+        // 已被 clear_wire_fidelity 丢弃, 不会走到这里.
+        IrTool::Raw { entry } => entry.clone(),
+        IrTool::Function {
+            name,
+            description,
+            input_schema,
+            extra,
+        } => {
+            let mut obj = Map::new();
+            obj.insert("name".to_string(), Value::String(name.clone()));
+            if let Some(desc) = description {
+                obj.insert("description".to_string(), Value::String(desc.clone()));
+            }
+            // Null 哨兵 = 原始 wire 缺 input_schema 字段 (server tools 常见),
+            // 跳过 (不注入空对象).
+            if !input_schema.is_null() {
+                obj.insert("input_schema".to_string(), input_schema.clone());
+            }
+            merge_extra_into(&mut obj, extra);
+            Value::Object(obj)
+        }
     }
-    obj.insert("input_schema".to_string(), tool.input_schema.clone());
-    merge_extra_into(&mut obj, &tool.extra);
-    Value::Object(obj)
 }
 
 /// 写 tool_choice (Anthropic 风格 object).
@@ -2222,7 +2233,7 @@ mod tests {
             max_tokens: Some(50),
             parallel_tool_calls: Some(false),
             tool_choice: Some(IrToolChoice::Auto),
-            tools: vec![IrTool {
+            tools: vec![IrTool::Function {
                 name: "w".into(),
                 description: None,
                 input_schema: json!({"type": "object"}),

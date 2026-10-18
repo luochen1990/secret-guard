@@ -94,6 +94,37 @@ secret-guard 的 IR (中间表示) 有一个 `extra: Map<String, Value>` 字段�
 错误做法: 把 `thinking` 提升为 first-class 后, 在 Anthropic reader 里把 `thinking` 从 known 列表删除 → 精细控制丢失.
 正确做法: `thinking` 保留在 extra, reader 同时填 first-class (effort enum) + extra (原始 thinking object), writer 优先读 extra.
 
+### 2.5 数组条目级判定: 无法建模的条目收为 Raw 保真 (#321, 2026-10-18)
+
+> §2.1-2.4 判定的是**顶层/嵌套对象的字段归属**; 本节补充**已建模数组内的条目级**判定 —
+> issue #321 (OpenAI Tool Search) 暴露的缺口: 三协议 reader 曾对 tools 数组里无法建模为
+> Function 的条目 (hosted tools / tool_search / custom / server tools / 畸形) 直接丢弃,
+> 同协议 + redact 路径上工具定义静默消失, 特性失效 — FWD-1 违约.
+
+**判定准则** (与 §2.2 三步流程同构, 对象从"字段"换成"数组条目"):
+
+1. 条目能否建模为该数组的 first-class 形态 (Function: name + description + schema)?
+   - 能 → Function (未建模子字段按 §2.4 纪律收进条目 extra, writer 原位置回写).
+   - 不能 (无 type:name 对应关系, 如 hosted/custom/server tools) → **`IrTool::Raw { entry }` 原文**, 不丢弃.
+
+2. Raw 的跨协议语义: 目标协议无语义对应 (步骤 2 成立) → 跨协议**丢弃 + WARN**
+   (`clear_wire_fidelity` SSOT 清空点, 与 extra 清空同型) — 假翻译成空 schema
+   function 是语义伪造, 丢弃更诚实. 同协议路径 verbatim 回写.
+
+3. **红线 (先于保真性)**: Raw 条目的字符串叶子必须进 redact 扫描面
+   (`StringLeafOps` / `collect_ir_str_leaves` 双轨同覆盖) — 否则工具 description
+   里的 secret 成为 redact 洞; 命中归因 HitLocations 对应桶 (tools).
+
+**配套建模细节** (随 #321 落地):
+
+- function 条目的 parameters/input_schema 缺席以 `input_schema: Value::Null` 哨兵表示,
+  writer 据此跳过字段 — 不注入默认空 schema (加字段与丢字段同属 FWD-1 违约).
+- 条目 extra 的命名空间按来源协议 wire 形状: anthropic/responses 为条目顶层
+  (`cache_control` / `strict` / `type` / `max_uses`), openai chat 为 function 子对象级
+  (`strict` — 官方 schema 顶层仅 type/function, 条目顶层未知字段无真实形态, 残留
+  丢弃见 known-limitations codec 节).
+- 未来新增 hosted tool type 自动走 Raw 透传, 无需逐类型建模 (前向兼容).
+
 ## 3. 字段全景表 (基于官方文档)
 
 > **数据来源**: OpenAI Chat Completions / Anthropic Messages / OpenAI Responses 三家官方 API reference

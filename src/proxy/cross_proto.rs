@@ -108,10 +108,11 @@ pub(crate) async fn cross_proto_forward(
     )?;
 
     // 4. 清空 ingress-only 元数据 (联动前移的前提 — 见步骤 5 注释):
-    //    - extra: ingress-only 字段会泄漏到 egress, 一并清空. (注: Responses 的
-    //      hosted tools 不在 extra — tools 是 modeled 字段被 collect_extra 排除,
-    //      丢弃发生在 reader 读取时并在该处 WARN, 见 responses.rs read_request)
+    //    - extra: ingress-only 字段会泄漏到 egress, 一并清空.
     //    - wire_fidelity (stop_form / content_form / tools_present): ingress wire 形态
+    //    - IrTool::Raw (#321): hosted/custom/畸形 tools 条目原文 — 目标协议无法
+    //      表示, clear_wire_fidelity 内 retain 丢弃 + WARN 计数 (同协议路径不经
+    //      此函数, Raw verbatim 透传不受影响; reader 层不再丢弃任何条目)
     ir.extra.clear();
     ir.clear_wire_fidelity();
 

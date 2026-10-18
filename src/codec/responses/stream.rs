@@ -159,7 +159,8 @@ fn stream_message_start(data: &Value, state: &mut ResponsesDecodeState) -> Vec<I
 ///   `ReasoningContent` meta 区分是 writer 能力分派依据, 见 ir.rs);
 /// - hosted tool / 未知 / item 畸形 → Dropped + warn (SEC: 只记计数不记内容;
 ///   与非流式响应侧 `read_output_item` 的丢弃对称 — 非流式静默, 流式带 WARN;
-///   请求侧 `read_tool_def` 的丢弃是同族先例).
+///   响应侧 hosted tool call items 无 Raw 通道 — #321 的 Raw 保真仅覆盖请求侧
+///   tools 定义; tool_search 机制发现工具后按普通 function_call 调用 (已建模)).
 ///
 /// 假设: `output_index` 缺失或 added 重复 (病态) → 忽略, 首个登记为准.
 fn stream_item_added(data: &Value, state: &mut ResponsesDecodeState) -> Vec<IrStreamEvent> {

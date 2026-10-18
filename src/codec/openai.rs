@@ -24,7 +24,7 @@ use super::{
     IrRole, IrStopReason, IrStreamEvent, IrTool, IrToolChoice, IrUsage, Reader, Writer,
     blocks_to_text, collect_extra, current_epoch, image_source_to_url, input_to_string,
     ir::{StreamDecodeState, StreamEncodeState},
-    random_base62,
+    merge_extra_into, random_base62,
 };
 
 /// OpenAI Chat Completions stream 的 `tool_calls[].index` 字段实际上界.
@@ -200,10 +200,12 @@ impl Reader for OpenAiReader {
             .and_then(IrReasoningEffort::parse)
             .map(IrReasoning::Effort);
 
+        // 非 function 条目 (custom 工具 / 畸形 function) 收为 IrTool::Raw 原文
+        // 保真 (#321), 不再丢弃; 跨协议丢弃收口在 clear_wire_fidelity.
         let tools = obj
             .get("tools")
             .and_then(Value::as_array)
-            .map(|arr| arr.iter().filter_map(read_tool_def).collect())
+            .map(|arr| arr.iter().map(read_tool_def).collect())
             .unwrap_or_default();
         // wire 保真: 仅当 tools 是数组时才算"显式存在" (区分 "tools":[] 与缺失 / null).
         let tools_present = obj.get("tools").and_then(Value::as_array).is_some();
@@ -840,29 +842,36 @@ fn read_tool_choice(val: &Value) -> Option<IrToolChoice> {
 }
 
 /// 解析 tools 数组中的一个 tool 定义.
-fn read_tool_def(tool: &Value) -> Option<IrTool> {
-    let function = tool.get("function")?;
-    let name = function
-        .get("name")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    if name.is_empty() {
-        return None;
-    }
-    let description = function
-        .get("description")
-        .and_then(Value::as_str)
-        .map(String::from);
-    let input_schema = function
-        .get("parameters")
-        .cloned()
-        .unwrap_or(Value::Object(Map::new()));
-    Some(IrTool {
-        name,
-        description,
-        input_schema,
-        extra: Default::default(),
+/// 解析 Chat tool 定义 → IrTool (#321: 永不返回 None / 永不丢弃条目).
+/// - {type:"function", function:{name, description?, parameters?, strict?, ...}}
+///   → [`IrTool::Function`]; `parameters` 缺席存 Null 哨兵 (writer 跳过);
+///   function 子对象内其余未建模字段 (strict 等) 经 extra 保真 — extra 的
+///   命名空间是 **function 子对象级** (writer 回写进 function{}, 不是条目顶层;
+///   条目顶层的未知字段无真实 wire 形态, 见 known-limitations).
+/// - 其余一切 (custom 工具 {type:"custom",...} / 缺 function 键 / name 缺失或
+///   为空 / 非对象元素) → [`IrTool::Raw`] 原文保真: 同协议 verbatim round-trip,
+///   跨协议由 `clear_wire_fidelity` 丢弃 + WARN.
+fn read_tool_def(tool: &Value) -> IrTool {
+    let parse_function = (|| {
+        let function = tool.get("function")?.as_object()?;
+        let name = function.get("name").and_then(Value::as_str)?;
+        if name.is_empty() {
+            return None;
+        }
+        let description = function
+            .get("description")
+            .and_then(Value::as_str)
+            .map(String::from);
+        Some(IrTool::Function {
+            name: name.to_string(),
+            description,
+            // parameters 缺席 → Null 哨兵 (不注入空对象).
+            input_schema: function.get("parameters").cloned().unwrap_or(Value::Null),
+            extra: collect_extra(function, &["name", "description", "parameters"]),
+        })
+    })();
+    parse_function.unwrap_or(IrTool::Raw {
+        entry: tool.clone(),
     })
 }
 
@@ -1354,13 +1363,30 @@ fn write_user_block(b: &IrBlock) -> Option<Value> {
 
 /// 写 tool 定义.
 fn write_tool_def(tool: &IrTool) -> Value {
-    let mut function = Map::new();
-    function.insert("name".to_string(), Value::String(tool.name.clone()));
-    if let Some(desc) = &tool.description {
-        function.insert("description".to_string(), Value::String(desc.clone()));
+    match tool {
+        // Raw 原文 verbatim 回写 (#321): 与 extra 的 seam 契约同型 — 跨协议路径
+        // 已被 clear_wire_fidelity 丢弃, 不会走到这里.
+        IrTool::Raw { entry } => entry.clone(),
+        IrTool::Function {
+            name,
+            description,
+            input_schema,
+            extra,
+        } => {
+            let mut function = Map::new();
+            function.insert("name".to_string(), Value::String(name.clone()));
+            if let Some(desc) = description {
+                function.insert("description".to_string(), Value::String(desc.clone()));
+            }
+            // Null 哨兵 = 原始 wire 缺 parameters 字段, 跳过 (不注入空对象).
+            if !input_schema.is_null() {
+                function.insert("parameters".to_string(), input_schema.clone());
+            }
+            // extra 命名空间 = function 子对象级 (strict 等回到 function{} 内).
+            merge_extra_into(&mut function, extra);
+            json!({"type": "function", "function": Value::Object(function)})
+        }
     }
-    function.insert("parameters".to_string(), tool.input_schema.clone());
-    json!({"type": "function", "function": Value::Object(function)})
 }
 
 /// 写 tool_choice.
@@ -1479,12 +1505,22 @@ mod tests {
     // ─── read_tool_def: 纯函数边界覆盖 ───────────────────────────────────────
 
     #[test]
-    fn read_tool_def_returns_none_for_missing_name() {
-        // name 缺失/空 → None (覆盖 689-690 的早退).
-        assert_eq!(read_tool_def(&json!({"function":{}})), None);
-        assert_eq!(read_tool_def(&json!({"function":{"name":""}})), None);
-        // 无 function key → None (683 行 ? 早退).
-        assert_eq!(read_tool_def(&json!({"not_function":{}})), None);
+    fn read_tool_def_falls_back_to_raw_for_unmodelable_entries() {
+        // #321: 无法建模的条目不再丢弃 (None), 收为 Raw 原文保真 —
+        // 同协议 verbatim round-trip, 上游若拒绝由上游拒绝 (FWD-1).
+        let cases = [
+            json!({"function":{}}),          // name 缺失
+            json!({"function":{"name":""}}), // name 空
+            json!({"not_function":{}}),      // 无 function key
+            json!({"type":"custom","custom":{"name":"apply_patch","format":{"type":"grammar"}}}),
+            json!("junk"),
+        ];
+        for case in cases {
+            match read_tool_def(&case) {
+                IrTool::Raw { entry } => assert_eq!(entry, case),
+                other => panic!("expected Raw, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -1496,9 +1532,11 @@ mod tests {
                 "parameters": {"type": "object", "properties": {}}
             }
         }));
-        let tool = tool.expect("valid tool def");
-        assert_eq!(tool.name, "search");
-        assert_eq!(tool.description.as_deref(), Some("Search the web"));
+        assert!(matches!(
+            tool,
+            IrTool::Function { ref name, ref description, .. }
+                if name == "search" && description.as_deref() == Some("Search the web")
+        ));
     }
 
     #[test]

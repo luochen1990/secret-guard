@@ -30,16 +30,20 @@
 //!   `function_call` / `function_call_output` / `reasoning` (summary + encrypted_content,
 //!   T7 passthrough)
 //! - `instructions` → system 消息
-//! - tools: `function` 类型 (平铺 `{name, parameters, description}` ↔ Chat 嵌套
-//!   `{type:"function", function:{...}}`); 其他 type 静默丢弃
+//! - tools: `function` 类型 (平铺 `{name, parameters, description, strict?}` ↔ Chat
+//!   嵌套 `{type:"function", function:{...}}`; strict 等未建模字段经条目级 extra
+//!   保真, parameters 缺席不注入默认 schema); **非 function 条目 (hosted tools:
+//!   web_search / file_search / computer_use / mcp / tool_search / custom / ...) 收为
+//!   [`IrTool::Raw`] 原文保真 (#321)** — 同协议 round-trip verbatim 回写, 字符串
+//!   叶子进 redact 扫描面; 跨协议翻译在 `clear_wire_fidelity` 丢弃 + WARN
 //! - usage 双向映射
 //! - 非流式响应: `output[]` 中的 `message` (output_text) + `function_call` items
 //!
-//! **不覆盖** (reader 读取时丢弃 — 仅 function 工具进入 IR, 同协议 IR 重建路径
-//! 与跨协议翻译同受影响; 纯字节透传路径不受影响; 丢弃点打 WARN):
-//! - hosted tools (web_search / file_search / computer_use / mcp / image_generation)
+//! **不覆盖** (响应侧读取时丢弃 — 请求侧 tools 已全部保真, 见上):
+//! - 响应侧 hosted tool call items (web_search_call / computer_call / file_search_call /
+//!   mcp_call / ...) — 请求侧 tool_search 机制发现工具后模型按普通 `function_call`
+//!   调用 (已建模), 响应侧无新增形态需求 (#321 核实)
 //! - namespace tools flattening (留作后续)
-//! - reasoning 的 `encrypted_content` 已建模保留 (T7, 同协议 + 跨协议 a⇄r envelope)
 //! - `previous_response_id` 服务端状态 (secret-guard 是 stateless 代理)
 //!
 //! 流式: reader + writer 双侧已实现 (实现整体在 `stream.rs`) — proxy 层流式接线:
@@ -63,7 +67,8 @@ use super::ir::{
 };
 use super::{
     IrError, IrStopReason, IrTool, IrToolChoice, IrUsage, Reader, Writer, blocks_to_text,
-    collect_extra, current_epoch, image_source_to_url, input_to_string, random_base62,
+    collect_extra, current_epoch, image_source_to_url, input_to_string, merge_extra_into,
+    random_base62,
 };
 
 // ─── Reader ────────────────────────────────────────────────────────────────
@@ -151,22 +156,12 @@ impl Reader for ResponsesReader {
 
         // tools: Responses 的 tools 是平铺数组, 每个有 type.
         // function 类型: {type:"function", name, parameters, description, strict?}
-        // 其他类型 (web_search/file_search/computer/mcp/namespace/custom/...): 丢弃.
-        // 丢弃点就在这里 (reader 层, 同协议 IR 重建与跨协议翻译共用此 choke point —
-        // hosted tools 不进 IR.tools, 也不进 extra: collect_extra 的 known 列表含
-        // "tools")。只记计数不记内容 (SEC 纪律)。
+        // → IrTool::Function (strict 等未建模字段经条目级 extra 保真, #269 同型).
+        // 其他类型 (web_search/file_search/computer/mcp/tool_search/custom/...):
+        // IrTool::Raw 原文保真 (#321) — 同协议 round-trip verbatim 回写, 不再
+        // 在 reader 层丢弃; 跨协议丢弃收口在 clear_wire_fidelity (该处 WARN).
         let (tools, tools_present) = if let Some(arr) = obj.get("tools").and_then(Value::as_array) {
-            let tools: Vec<IrTool> = arr.iter().filter_map(read_tool_def).collect();
-            let hosted = arr.len().saturating_sub(tools.len());
-            if hosted > 0 {
-                tracing::warn!(
-                    count = hosted,
-                    "dropping tool definition(s) not representable in IR \
-                     (hosted tools: web_search/file_search/computer/mcp/..., or \
-                     malformed function entries); only well-formed function tools \
-                     round-trip through the codec"
-                );
-            }
+            let tools: Vec<IrTool> = arr.iter().map(read_tool_def).collect();
             (tools, true)
         } else {
             (Vec::new(), false)
@@ -693,29 +688,40 @@ fn read_reasoning_summary(summary: Option<&Value>) -> Vec<String> {
         .collect()
 }
 
-/// 解析 Responses tool 定义 → IrTool.
-/// Responses function tool: {type:"function", name, parameters, description, strict?}
+/// 解析 Responses tool 定义 → IrTool (#321: 永不返回 None / 永不丢弃条目).
+/// Responses function tool: {type:"function", name, parameters?, description?, strict?, ...}
 /// (注意: Responses 是平铺的, Chat 是嵌套在 function 子对象里).
-fn read_tool_def(tool: &Value) -> Option<IrTool> {
-    let obj = tool.as_object()?;
-    let ty = obj.get("type").and_then(Value::as_str)?;
-    if ty != "function" {
-        return None; // 非 function 类型静默丢弃 (web_search/file_search/computer/mcp/...)
-    }
-    let name = obj.get("name").and_then(Value::as_str)?.to_string();
-    let description = obj
-        .get("description")
-        .and_then(Value::as_str)
-        .map(String::from);
-    let input_schema = obj
-        .get("parameters")
-        .cloned()
-        .unwrap_or_else(|| json!({"type": "object"}));
-    Some(IrTool {
-        name,
-        description,
-        input_schema,
-        extra: Default::default(),
+/// - 合法 function 条目 → [`IrTool::Function`]; `parameters` 缺席存 Null 哨兵
+///   (writer 跳过, 不注入默认 schema — 加字段同属 FWD-1 违约); strict 等其余
+///   未建模字段经条目级 extra 保真回写.
+/// - 其余一切 (hosted tools: web_search/file_search/computer/mcp/tool_search/
+///   image_generation / custom / 未知 type / 非 function 或缺 name 的畸形条目 /
+///   非对象元素) → [`IrTool::Raw`] 原文保真: 同协议 verbatim round-trip,
+///   跨协议由 `clear_wire_fidelity` 丢弃 + WARN.
+fn read_tool_def(tool: &Value) -> IrTool {
+    let parse_function = (|| {
+        let obj = tool.as_object()?;
+        if obj.get("type").and_then(Value::as_str) != Some("function") {
+            return None;
+        }
+        let name = obj.get("name").and_then(Value::as_str)?;
+        if name.is_empty() {
+            return None;
+        }
+        let description = obj
+            .get("description")
+            .and_then(Value::as_str)
+            .map(String::from);
+        Some(IrTool::Function {
+            name: name.to_string(),
+            description,
+            // parameters 缺席 → Null 哨兵 (不注入默认 {"type":"object"}).
+            input_schema: obj.get("parameters").cloned().unwrap_or(Value::Null),
+            extra: collect_extra(obj, &["type", "name", "description", "parameters"]),
+        })
+    })();
+    parse_function.unwrap_or(IrTool::Raw {
+        entry: tool.clone(),
     })
 }
 
@@ -1132,14 +1138,31 @@ fn write_input_items(msg: &IrMessage) -> Vec<Value> {
 
 /// IR Tool → Responses tool 定义 (平铺形态).
 fn write_tool_def(tool: &IrTool) -> Value {
-    let mut obj = Map::new();
-    obj.insert("type".to_string(), json!("function"));
-    obj.insert("name".to_string(), Value::String(tool.name.clone()));
-    if let Some(desc) = &tool.description {
-        obj.insert("description".to_string(), Value::String(desc.clone()));
+    match tool {
+        // Raw 原文 verbatim 回写 (#321): reader 收的是本协议 wire 的原始条目,
+        // 同协议 round-trip 必须字节保真 (跨协议路径已被 clear_wire_fidelity
+        // 丢弃, 不会走到这里 — 与 extra 的 seam 契约同型).
+        IrTool::Raw { entry } => entry.clone(),
+        IrTool::Function {
+            name,
+            description,
+            input_schema,
+            extra,
+        } => {
+            let mut obj = Map::new();
+            obj.insert("type".to_string(), json!("function"));
+            obj.insert("name".to_string(), Value::String(name.clone()));
+            if let Some(desc) = description {
+                obj.insert("description".to_string(), Value::String(desc.clone()));
+            }
+            // Null 哨兵 = 原始 wire 缺 parameters 字段, 跳过 (不注入默认 schema).
+            if !input_schema.is_null() {
+                obj.insert("parameters".to_string(), input_schema.clone());
+            }
+            merge_extra_into(&mut obj, extra);
+            Value::Object(obj)
+        }
     }
-    obj.insert("parameters".to_string(), tool.input_schema.clone());
-    Value::Object(obj)
 }
 
 /// IR tool_choice → Responses tool_choice wire.
@@ -1384,26 +1407,90 @@ mod tests {
         });
         let ir = reader().read_request(&body).unwrap();
         assert_eq!(ir.tools.len(), 1);
-        assert_eq!(ir.tools[0].name, "search");
-        assert_eq!(ir.tools[0].description.as_deref(), Some("Search the web"));
+        assert!(matches!(
+            ir.tools[0],
+            IrTool::Function { ref name, ref description, .. }
+                if name == "search" && description.as_deref() == Some("Search the web")
+        ));
     }
 
     #[test]
-    fn read_request_drops_hosted_tools() {
-        // web_search / computer / mcp 等非 function 类型静默丢弃.
+    fn read_request_raw_tools_kept_verbatim() {
+        // web_search / computer / mcp / tool_search 等非 function 类型收为 Raw
+        // 原文保真 (#321), 不再丢弃; 混合数组的顺序与位置保留.
         let body = json!({
-            "model": "gpt-4o",
+            "model": "gpt-5.4",
             "input": "hi",
             "tools": [
                 {"type": "function", "name": "f1", "parameters": {}},
+                {"type": "tool_search", "defer_loading": true, "namespace": "search"},
                 {"type": "web_search"},
-                {"type": "computer_use_preview"},
                 {"type": "mcp", "server_label": "x"}
             ]
         });
         let ir = reader().read_request(&body).unwrap();
-        assert_eq!(ir.tools.len(), 1); // 只剩 function
-        assert_eq!(ir.tools[0].name, "f1");
+        assert_eq!(ir.tools.len(), 4);
+        assert!(matches!(ir.tools[0], IrTool::Function { ref name, .. } if name == "f1"));
+        // Raw 条目 = 原始 JSON 原样 (含 tool_search 的 defer_loading / namespace).
+        assert!(matches!(ir.tools[1], IrTool::Raw { .. }));
+        // 同协议 round-trip verbatim: normalize 相等 (hosted 条目一个字节不丢).
+        let out = writer().write_request(&ir);
+        // 只比 tools 子字段: input 的 string→数组展开是既有规范化, 与本断言正交.
+        assert_eq!(
+            crate::codec::normalize::normalize_json(&body["tools"]),
+            crate::codec::normalize::normalize_json(&out["tools"])
+        );
+    }
+
+    #[test]
+    fn read_request_malformed_function_entry_is_raw() {
+        // 畸形 function 条目 (缺 name / name 空 / 非 function type / 非对象):
+        // 不丢弃, 收为 Raw 让上游自己拒绝 (FWD-1: 网关不代客户端改写).
+        let body = json!({
+            "model": "gpt-4o",
+            "input": "hi",
+            "tools": [
+                {"type": "function", "parameters": {}},
+                {"type": "function", "name": ""},
+                "not-even-an-object",
+                {"type": "custom", "name": "apply_patch", "format": {"type": "grammar"}}
+            ]
+        });
+        let ir = reader().read_request(&body).unwrap();
+        assert_eq!(ir.tools.len(), 4);
+        assert!(ir.tools.iter().all(|t| matches!(t, IrTool::Raw { .. })));
+        let out = writer().write_request(&ir);
+        // 只比 tools 子字段: input 的 string→数组展开是既有规范化, 与本断言正交.
+        assert_eq!(
+            crate::codec::normalize::normalize_json(&body["tools"]),
+            crate::codec::normalize::normalize_json(&out["tools"])
+        );
+    }
+
+    #[test]
+    fn read_request_function_tool_unmodeled_fields_via_extra() {
+        // function 条目上的未建模字段 (strict 等) 经条目级 extra 保真回写;
+        // parameters 缺席 → writer 不注入默认 schema (Null 哨兵).
+        let body = json!({
+            "model": "gpt-5.4",
+            "input": "hi",
+            "tools": [
+                {"type": "function", "name": "strict_tool", "strict": true},
+                {"type": "function", "name": "no_params"}
+            ]
+        });
+        let ir = reader().read_request(&body).unwrap();
+        assert!(matches!(
+            ir.tools[0],
+            IrTool::Function { ref input_schema, ref extra, .. }
+                if input_schema.is_null() && extra.get("strict") == Some(&json!(true))
+        ));
+        let out = writer().write_request(&ir);
+        // 只比 tools 子字段: input 的 string→数组展开是既有规范化, 与本断言正交.
+        assert_eq!(
+            crate::codec::normalize::normalize_json(&body["tools"]),
+            crate::codec::normalize::normalize_json(&out["tools"])
+        );
     }
 
     // ─── reasoning 配置 (A1) ────────────────────────────────────────────
@@ -1806,7 +1893,7 @@ mod tests {
                 ..Default::default()
             }],
             model: "gpt-4o".into(),
-            tools: vec![IrTool {
+            tools: vec![IrTool::Function {
                 name: "search".into(),
                 description: Some("Search".into()),
                 input_schema: json!({"type": "object"}),

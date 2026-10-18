@@ -83,6 +83,7 @@
 //!
 //! **不扫描**: `IrRequest::model` (模型名不应该是 secret), `IrRequest.tools[].input_schema` 的非字符串叶子
 //! (eg JSON Schema 的 type / properties 结构).
+//! `IrTool::Raw` 条目与 Function 等覆盖 (整个 JSON 原文的字符串叶子, #321).
 //!
 //! # 流式 trade-off
 //!
@@ -1107,36 +1108,47 @@ impl StringLeafOps for IrBlock {
 
 impl StringLeafOps for IrTool {
     fn for_each_str_leaf(&self, f: &mut impl FnMut(&str)) {
-        let IrTool {
-            name,
-            description,
-            input_schema,
-            extra,
-        } = self;
-        f(name);
-        if let Some(d) = description {
-            f(d);
-        }
-        input_schema.for_each_str_leaf(f);
-        for v in extra.values() {
-            v.for_each_str_leaf(f);
+        match self {
+            IrTool::Function {
+                name,
+                description,
+                input_schema,
+                extra,
+            } => {
+                f(name);
+                if let Some(d) = description {
+                    f(d);
+                }
+                input_schema.for_each_str_leaf(f);
+                for v in extra.values() {
+                    v.for_each_str_leaf(f);
+                }
+            }
+            // Raw 条目 (#321 红线): 整个 JSON 原文的字符串叶子全部纳入扫描面 —
+            // hosted/custom 工具的 description 等字段里藏 secret 时不得成为
+            // redact 洞 (保真透传的前提是扫描面同覆盖).
+            IrTool::Raw { entry } => entry.for_each_str_leaf(f),
         }
     }
 
     fn for_each_str_leaf_mut(&mut self, f: &mut impl FnMut(&mut String)) {
-        let IrTool {
-            name,
-            description,
-            input_schema,
-            extra,
-        } = self;
-        f(name);
-        if let Some(d) = description {
-            f(d);
-        }
-        input_schema.for_each_str_leaf_mut(f);
-        for v in extra.values_mut() {
-            v.for_each_str_leaf_mut(f);
+        match self {
+            IrTool::Function {
+                name,
+                description,
+                input_schema,
+                extra,
+            } => {
+                f(name);
+                if let Some(d) = description {
+                    f(d);
+                }
+                input_schema.for_each_str_leaf_mut(f);
+                for v in extra.values_mut() {
+                    v.for_each_str_leaf_mut(f);
+                }
+            }
+            IrTool::Raw { entry } => entry.for_each_str_leaf_mut(f),
         }
     }
 }
@@ -1249,14 +1261,25 @@ fn collect_ir_str_leaves(ir: &IrRequest) -> Vec<&str> {
         }
     }
     for tool in &ir.tools {
-        leaves.push(&tool.name);
-        if let Some(d) = &tool.description {
-            leaves.push(d);
-        }
-        collect_value_leaves(&tool.input_schema, &mut leaves);
-        // 工具级 extra (#269) — 同上, 双轨覆盖一致.
-        for v in tool.extra.values() {
-            collect_value_leaves(v, &mut leaves);
+        match tool {
+            IrTool::Function {
+                name,
+                description,
+                input_schema,
+                extra,
+            } => {
+                leaves.push(name);
+                if let Some(d) = description {
+                    leaves.push(d);
+                }
+                collect_value_leaves(input_schema, &mut leaves);
+                // 工具级 extra (#269) — 同上, 双轨覆盖一致.
+                for v in extra.values() {
+                    collect_value_leaves(v, &mut leaves);
+                }
+            }
+            // Raw 条目 (#321) — 与 StringLeafOps 双轨覆盖一致 (红线: 同扫描面).
+            IrTool::Raw { entry } => collect_value_leaves(entry, &mut leaves),
         }
     }
     for s in &ir.stop {
@@ -1978,12 +2001,23 @@ mod tests {
                 extra: msg_extra,
                 ..Default::default()
             }],
-            tools: vec![IrTool {
-                name: "tool-name".to_string(),
-                description: Some("tool-desc".to_string()),
-                input_schema: serde_json::json!({"type": "object", "title": "schema-title"}),
-                extra: tool_extra,
-            }],
+            tools: vec![
+                IrTool::Function {
+                    name: "tool-name".to_string(),
+                    description: Some("tool-desc".to_string()),
+                    input_schema: serde_json::json!({"type": "object", "title": "schema-title"}),
+                    extra: tool_extra,
+                },
+                // Raw 条目 (#321): 双轨覆盖一致性 fixture 必须包含 —
+                // collect_ir_str_leaves 与 for_each_str_leaf 的 Raw 扫描面等价.
+                IrTool::Raw {
+                    entry: serde_json::json!({
+                        "type": "tool_search",
+                        "defer_loading": true,
+                        "description": "raw-tool-desc",
+                    }),
+                },
+            ],
             stop: vec!["stop1".to_string()],
             user: Some("user-id".to_string()),
             extra: {
@@ -3452,7 +3486,7 @@ mod tests {
                 text: "payload".to_string(),
                 extra: block_extra.as_object().unwrap().clone(),
             };
-            ir.tools.push(IrTool {
+            ir.tools.push(IrTool::Function {
                 name: "tool-x".to_string(),
                 description: None,
                 input_schema: serde_json::json!({"type": "object"}),
@@ -4382,7 +4416,7 @@ mod hit_location_tests {
                 ),
                 msg(IrRole::User, "tool result echoes sk-secret", false),
             ],
-            tools: vec![IrTool {
+            tools: vec![IrTool::Function {
                 name: format!("tool_{needle}"),
                 description: None,
                 input_schema: serde_json::Value::Null,
@@ -4417,6 +4451,68 @@ mod hit_location_tests {
         // sample_ir_with_text 的 fixture 未设 contains_user_text (Default false)
         // → 该位置的命中归 history; user/history 的分类判定由上方显式 fixture 测试覆盖.
         assert!(map.hits.values().all(|h| h.history == 2));
+    }
+
+    // ─── #321: IrTool::Raw 的 redact 扫描面 (红线) ─────────────────────────
+
+    /// Raw 条目 (hosted/custom 工具原文) 的字符串叶子必须纳入扫描与替换 —
+    /// 保真透传不得开 redact 洞. wire 级验证: Responses reader → redact → writer.
+    #[test]
+    fn raw_tool_entry_secret_redacted_and_roundtripped() {
+        use crate::codec::responses::{ResponsesReader, ResponsesWriter};
+        use crate::codec::{Reader, Writer};
+
+        let secret = "sk-tpl9-secret-key";
+        let body = serde_json::json!({
+            "model": "gpt-5.4",
+            "input": [{"type": "message", "role": "user",
+                       "content": [{"type": "input_text", "text": "hi"}]}],
+            "tools": [
+                {"type": "tool_search", "defer_loading": true,
+                 "description": format!("token is {secret} here")},
+                {"type": "web_search"},
+                {"type": "function", "name": "f", "parameters": {"type": "object"}},
+            ]
+        });
+        let mut ir = ResponsesReader
+            .read_request(&body)
+            .expect("合法 Responses wire");
+        let (map, _seed) = redact_ir(&mut ir, &[secret_entry("sid", secret)]);
+        // 命中归因 tools 桶 (工具定义位置), 恰好 1 次.
+        let h = map.hits.values().next().unwrap();
+        assert_eq!(h.tools, 1, "Raw 条目 description 内的 secret 归因 tools 桶");
+        let mock = map.mock_for("sk-tpl9-secret-key").expect("已建立映射");
+        let out = ResponsesWriter.write_request(&ir);
+        let out_str = serde_json::to_string(&out).unwrap();
+        assert!(
+            !out_str.contains(secret),
+            "红线: Raw 条目内的 secret 必须被替换 (redact 洞 = 泄漏)"
+        );
+        assert!(out_str.contains(mock), "mock 必须出现在 Raw 条目的原位置");
+        // 其余条目逐字节保真: 去掉含 mock 的 description 值后 normalize 相等.
+        let mut expect = body.clone();
+        expect["tools"][0]["description"] = serde_json::json!(format!("token is {mock} here"));
+        assert_eq!(
+            crate::codec::normalize::normalize_json(&expect),
+            crate::codec::normalize::normalize_json(&out),
+            "#321: 除 secret→mock 外 wire 必须保真"
+        );
+    }
+
+    /// Raw 条目命中同样计入 HitLocations.tools (count_hit_locations 归因面).
+    #[test]
+    fn raw_tool_entry_hits_counted_in_tools_bucket() {
+        let needle = "sk-raw-bucket";
+        let mut ir = sample_ir_with_text("unrelated");
+        ir.tools.push(IrTool::Raw {
+            entry: serde_json::json!({
+                "type": "tool_search",
+                "description": format!("uses {needle}"),
+            }),
+        });
+        let h = count_hit_locations(&ir, needle);
+        assert_eq!(h.tools, 1);
+        assert_eq!(h.history, 0);
     }
 
     fn secret_entry(id: &str, value: &str) -> crate::secrets::SecretEntry {

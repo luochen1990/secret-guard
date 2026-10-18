@@ -87,6 +87,10 @@ impl IrRequest {
     /// wire_fidelity 字段记录的是 **ingress 协议的 wire 形态** (如字段是 string 还是 array),
     /// 跨协议翻译时 ingress 形态对 egress 协议无意义, 必须清空, 否则会污染 egress wire.
     /// 集中在此避免新增字段时漏清.
+    ///
+    /// #321: `IrTool::Raw` 条目 (无法建模的 tools 原文) 同在此丢弃 + WARN — 目标协议
+    /// 无法表示它们. **同协议路径严禁调用本方法** (会静默丢 Raw / extra / 形态元数据),
+    /// 生产唯一调用方是 `proxy/cross_proto.rs` 的跨协议 seam.
     pub fn clear_wire_fidelity(&mut self) {
         self.stop_form = None;
         self.tools_present = false;
@@ -103,8 +107,23 @@ impl IrRequest {
             m.extra.clear();
             clear_block_extras(&mut m.content);
         }
+        // Raw 条目 (#321): 跨协议翻译无法表示 (目标协议没有对应的 hosted/custom
+        // 工具形态), 与 extra 同型在此 SSOT 清空点丢弃. WARN 只记计数不记内容
+        // (SEC 纪律); 同协议路径不经过本函数, Raw verbatim 透传不受影响.
+        let raw_before = self.tools.len();
+        self.tools.retain(|t| !matches!(t, IrTool::Raw { .. }));
+        let dropped_raw = raw_before - self.tools.len();
+        if dropped_raw > 0 {
+            tracing::warn!(
+                count = dropped_raw,
+                "dropping raw tool definition(s) not representable in target protocol \
+                 (hosted/custom/malformed tools entries)"
+            );
+        }
         for t in &mut self.tools {
-            t.extra.clear();
+            if let IrTool::Function { extra, .. } = t {
+                extra.clear();
+            }
         }
     }
 }
@@ -607,18 +626,39 @@ pub enum IrImageSource {
     Url(String),
 }
 
-/// 工具定义.
+/// 工具定义 (#321 起 enum 化: Function = 可建模形态, Raw = 保真透传容器).
 #[derive(Debug, Clone, PartialEq)]
-pub struct IrTool {
-    pub name: String,
-    pub description: Option<String>,
-    /// JSON Schema 描述工具参数.
-    pub input_schema: Value,
-    /// wire 形态元数据: 工具级未建模字段的逃生舱 (如 Anthropic 工具上的
-    /// `cache_control` / `defer_loading` / `type`). 同协议 round-trip 原样回写
-    /// (#269, claude code 常把缓存断点放在最后一个工具定义上); 跨协议翻译前
-    /// 由 `clear_wire_fidelity` 清空. 空 Map = 无.
-    pub extra: serde_json::Map<String, Value>,
+pub enum IrTool {
+    /// 标准函数工具 (三协议都能建模的形态: name + description + 参数 schema).
+    Function {
+        name: String,
+        description: Option<String>,
+        /// JSON Schema 描述工具参数. **缺省哨兵 `Value::Null`**: 原始 wire 未携带
+        /// parameters/input_schema 字段时存 Null, writer 据此跳过该字段 (不注入
+        /// 默认空 schema — 加字段与丢字段同属 FWD-1 违约).
+        input_schema: Value,
+        /// wire 形态元数据: 工具定义内未建模字段的逃生舱, 同协议 round-trip
+        /// 原样回写 (#269, claude code 常把缓存断点放在最后一个工具定义上);
+        /// 跨协议翻译前由 `clear_wire_fidelity` 清空. 空 Map = 无.
+        ///
+        /// **extra 的命名空间按来源协议的 wire 形状而定** (它是 ingress wire 的
+        /// 保真容器, 内容协议私有): anthropic / responses 为条目级 (条目顶层
+        /// 除 name/description/input_schema / type/name/description/parameters
+        /// 外的字段, 如 `cache_control` / `strict`); openai chat 为 function
+        /// 子对象级 (`function.{strict,...}`) — 各协议 writer 按同位置回写.
+        extra: serde_json::Map<String, Value>,
+    },
+    /// 无法建模为 [`IrTool::Function`] 的 tools 数组条目**原文** (#321):
+    /// hosted tools (web_search / file_search / computer / mcp / tool_search /
+    /// image_generation) / custom 工具 / anthropic server tools / 未知 type /
+    /// 畸形条目 / 非对象元素. reader 一律收为 Raw 而非丢弃 — 同协议 round-trip
+    /// **verbatim 回写** (normalize byte-exact); 字符串叶子全部纳入 redact 扫描面
+    /// (红线: 工具 description 里藏 secret 不得成为 redact 洞); 跨协议翻译在
+    /// `clear_wire_fidelity` (SSOT 清空点) 丢弃 + WARN 计数 (目标协议无法表示).
+    Raw {
+        /// tools 数组中的原始条目 (原样 clone, 不做任何改写).
+        entry: Value,
+    },
 }
 
 /// 工具选择策略. 取并集: 每个协议都能表达这 4 种.

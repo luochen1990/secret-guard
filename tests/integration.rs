@@ -10192,13 +10192,14 @@ async fn cross_proto_response_reasoning_drop_warns() {
     );
 }
 
-/// Responses 入站的 hosted tools (web_search 等非 function 类型) 不进 IR
-/// (reader 的 filter_map 丢弃, 也不进 extra — tools 是 modeled 字段) → 读取点 WARN.
-/// 该 choke point 同时覆盖同协议 IR 重建路径与跨协议路径, 故用 r→a 场景锁接线.
+/// Responses 入站的 hosted tools (web_search 等非 function 类型) 收为
+/// IrTool::Raw 原文保真 (#321) — 同协议 round-trip 不再丢弃 (见
+/// same_proto_redact_preserves_tool_search_defs_and_redacts_embedded_secret);
+/// 跨协议翻译在 clear_wire_fidelity (SSOT 清空点) 丢弃 + WARN.
+/// 用 r→a 场景锁丢弃点接线: WARN 必须发生在跨协议 seam (挪回 reader 会让
+/// 同协议路径也打 WARN — 误报; 挪到 writer 之后则恒 0 — 漏报).
 /// #260 调研补充: codex 0.146 的 custom/freeform tool (apply_patch 的
-/// `{"type":"custom",...,"format":{...}}` 形态, 仅用户自定义 model family 时发送)
-/// 与 hosted tools 共用此丢弃分支 — body 中一并锁定现状 (custom 支持需 IR
-/// 自由文本工具建模, 超出 #260 范围).
+/// `{"type":"custom",...,"format":{...}}` 形态) 与 hosted tools 共用 Raw 通道.
 #[tokio::test]
 async fn cross_proto_hosted_tools_drop_warns() {
     let mut upstream = spawn_mock_upstream().await;
@@ -10221,8 +10222,8 @@ async fn cross_proto_hosted_tools_drop_warns() {
     assert_eq!(status, reqwest::StatusCode::OK);
     let log_text = log.text();
     assert!(
-        log_text.contains("dropping tool definition(s) not representable in IR"),
-        "T5: hosted tools drop WARN missing; log: {log_text}"
+        log_text.contains("dropping raw tool definition(s) not representable in target protocol"),
+        "T5/#321: cross-proto raw tools drop WARN missing; log: {log_text}"
     );
     // 计数锁: custom + web_search 恰好 2 个被丢 (fmt subscriber 渲染结构化字段
     // 为 `count=N`) — 若 custom 开始进 IR (count=1), 该断言变红, 防止 contains-
@@ -10231,6 +10232,108 @@ async fn cross_proto_hosted_tools_drop_warns() {
         log_text.contains("count=2"),
         "custom + web_search must both be dropped; log: {log_text}"
     );
+}
+
+/// #321 (Responses 同协议 + redact): tools 数组的非 function 条目 (OpenAI Tool
+/// Search 的 `{"type":"tool_search","defer_loading":true,...}` 形态) 必须保真
+/// 透传到上游 — 修复前 reader 在 IR 重建路径静默丢弃, 特性失效 (FWD-1 违约).
+/// 同时锁定红线: Raw 条目 description 内的 secret 被 redact 为 mock.
+#[tokio::test]
+async fn same_proto_redact_preserves_tool_search_defs_and_redacts_embedded_secret() {
+    let real_secret = "sk-live-toolsearch-99";
+    let expected_mock = predict_mock(real_secret);
+    let mut upstream = spawn_mock_upstream().await;
+    // 上游收到的 tools 数组逐字段断言: tool_search 条目原样 (defer_loading /
+    // namespace / description 内 mock) + web_search 原样 + function 条目
+    // (strict 经条目级 extra 保真, parameters 缺席不注入).
+    let _m = upstream
+        .mock("POST", "/v1/responses")
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "tools": [
+                {"type": "tool_search", "defer_loading": true, "namespace": "search",
+                 "description": format!("token is {expected_mock} here")},
+                {"type": "web_search"},
+                {"type": "function", "name": "get_weather", "strict": true}
+            ]
+        })))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(RESPONSES_OK_BODY)
+        .create_async()
+        .await;
+    let provider = provider_with("resp-main", Protocol::OpenAIResponses, &upstream.url());
+    let proxy_url = spawn_proxy_static_dynamic(
+        vec![provider],
+        vec![],
+        reqwest::Client::new(),
+        ConversationDag::new(64, 500, 1),
+        test_secret_table_with(vec![secret("s1", real_secret)]),
+    )
+    .await
+    .0;
+    // secret 藏在 tool_search 条目的 description 里 — Raw 条目字符串叶子
+    // 必须在 redact 扫描面 (#321 红线).
+    let body = serde_json::json!({
+        "model": "gpt-5.4",
+        "input": [{"type": "message", "role": "user",
+                   "content": [{"type": "input_text", "text": "weather?"}]}],
+        "tools": [
+            {"type": "tool_search", "defer_loading": true, "namespace": "search",
+             "description": format!("token is {real_secret} here")},
+            {"type": "web_search"},
+            {"type": "function", "name": "get_weather", "strict": true}
+        ]
+    })
+    .to_string();
+    let (status, resp_body, _) =
+        proxy_request(&proxy_url, "POST", "/r/resp-main/v1/responses", &body, &[]).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {resp_body}");
+}
+
+/// #321 (Anthropic 同协议 + redact): server tools 条目保真透传 — 无 name 形态
+/// (code_execution) 走 IrTool::Raw verbatim; 有 name 形态 (web_search) 走
+/// Function + 条目级 extra (type/max_uses), 且不再注入 input_schema:{}.
+#[tokio::test]
+async fn same_proto_redact_preserves_anthropic_server_tools() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/messages")
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "tools": [
+                {"type": "code_execution_20250522"},
+                {"type": "web_search_20250305", "name": "web_search", "max_uses": 5}
+            ]
+        })))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"msg_x","type":"message","role":"assistant","content":[{"type":"text","text":"OK"}],"model":"claude","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
+        )
+        .create_async()
+        .await;
+    let provider = provider_with("an-main", Protocol::Anthropic, &upstream.url());
+    let proxy_url = spawn_proxy_static_dynamic(
+        vec![provider],
+        vec![],
+        reqwest::Client::new(),
+        ConversationDag::new(64, 500, 1),
+        test_secret_table_with(vec![secret("s1", "sk-live-unrelated-77")]),
+    )
+    .await
+    .0;
+    let body = serde_json::json!({
+        "model": "claude-3",
+        "max_tokens": 50,
+        "messages": [{"role": "user", "content": "hi sk-live-unrelated-77"}],
+        "tools": [
+            {"type": "code_execution_20250522"},
+            {"type": "web_search_20250305", "name": "web_search", "max_uses": 5}
+        ]
+    })
+    .to_string();
+    let (status, resp_body, _) =
+        proxy_request(&proxy_url, "POST", "/a/an-main/v1/messages", &body, &[]).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {resp_body}");
 }
 
 /// #162: provider 协议错配 (anthropic provider 指向 OpenAI shape 端点) →

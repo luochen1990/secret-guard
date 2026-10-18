@@ -59,6 +59,7 @@ use proptest::prelude::*;
 use serde_json::{Value, json};
 
 use crate::codec::anthropic::{AnthropicReader, AnthropicWriter};
+use crate::codec::ir::IrTool;
 use crate::codec::normalize::normalize_json;
 use crate::codec::openai::{OpenAiReader, OpenAiWriter};
 use crate::codec::{Reader, Writer};
@@ -279,7 +280,10 @@ fn prop_cross_proto_block_level_extra_cleared_recursively_anthropic_to_openai() 
         !ir.messages[0].content[0].block_extra().unwrap().is_empty(),
         "消息 block extra 已收集"
     );
-    assert!(!ir.tools[0].extra.is_empty(), "工具级 extra 已收集");
+    assert!(
+        matches!(&ir.tools[0], IrTool::Function { extra, .. } if !extra.is_empty()),
+        "工具级 extra 已收集"
+    );
     // 与生产 cross_proto_forward 一致: 清空 extra + wire_fidelity.
     ir.extra.clear();
     ir.clear_wire_fidelity();
@@ -485,16 +489,27 @@ fn assert_modeled_fields_equivalent(
     }
 
     // tools: 数量 + name + input_schema (normalize 后比较).
-    assert_eq!(
-        ir_in.tools.len(),
-        ir_out.tools.len(),
-        "{direction}: tools 数量损失",
-    );
-    for (i, (t_in, t_out)) in ir_in.tools.iter().zip(ir_out.tools.iter()).enumerate() {
-        assert_eq!(t_in.name, t_out.name, "{direction}: tools[{i}].name 损失");
+    // Raw 条目 (#321) 例外: 跨协议翻译在 clear_wire_fidelity 丢弃 + WARN —
+    // 本比较只看 Function 投影 (Raw 的跨协议丢弃由专项测试锁定:
+    // prop_responses_to_chat_hosted_tools_dropped_cross_proto /
+    // cross_proto_hosted_tools_drop_warns).
+    // (嵌套 fn 而非闭包: 两次借用需要显式独立生命周期, 闭包推断不出)
+    fn fn_proj(t: &IrTool) -> Option<(&String, &Value)> {
+        match t {
+            IrTool::Function {
+                name, input_schema, ..
+            } => Some((name, input_schema)),
+            IrTool::Raw { .. } => None,
+        }
+    }
+    let fns_in: Vec<_> = ir_in.tools.iter().filter_map(fn_proj).collect();
+    let fns_out: Vec<_> = ir_out.tools.iter().filter_map(fn_proj).collect();
+    assert_eq!(fns_in.len(), fns_out.len(), "{direction}: tools 数量损失");
+    for (i, ((n_in, s_in), (n_out, s_out))) in fns_in.iter().zip(fns_out.iter()).enumerate() {
+        assert_eq!(n_in, n_out, "{direction}: tools[{i}].name 损失");
         assert_eq!(
-            normalize_json(&t_in.input_schema),
-            normalize_json(&t_out.input_schema),
+            normalize_json(s_in),
+            normalize_json(s_out),
             "{direction}: tools[{i}].input_schema 语义损失",
         );
     }

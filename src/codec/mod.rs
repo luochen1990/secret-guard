@@ -292,6 +292,17 @@ pub(super) fn collect_extra(
         .collect()
 }
 
+/// 把 `extra` 的键值合并进目标 Map (同名覆盖 — 回写优先级契约的唯一定义点;
+/// L4/L5/工具级 extra 的回写共用, 跨协议路径已被 `clear_wire_fidelity` 清空).
+pub(super) fn merge_extra_into(
+    target: &mut serde_json::Map<String, Value>,
+    extra: &serde_json::Map<String, Value>,
+) {
+    for (k, v) in extra {
+        target.insert(k.clone(), v.clone());
+    }
+}
+
 /// 生成 n 字符的 base62 随机串 (LCG, 非密码学安全).
 /// 仅用于合成 id (chatcmpl-... / msg_01... / resp_...), 不需要密码学强度.
 pub(super) fn random_base62(n: usize) -> String {
