@@ -9450,6 +9450,7 @@ async fn forward_summary_logs_retry_headers_on_429() {
         .with_header("content-type", "application/json")
         .with_header("x-should-retry", "false")
         .with_header("retry-after", "60")
+        .with_header("x-ratelimit-remaining-requests", "0")
         .with_body(r#"{"error":{"message":"rate limited","type":"rate_limit_error"}}"#)
         .create_async()
         .await;
@@ -9471,8 +9472,11 @@ async fn forward_summary_logs_retry_headers_on_429() {
         .lines()
         .find(|l| l.contains("forward") && l.contains("status=429"))
         .unwrap_or_else(|| panic!("#333: no 429 forward summary line; log: {log_text}"));
+    // 精确头 (白名单序) + 前缀族 (字典序, #333 调研修订) 端到端锁定.
     assert!(
-        summary_line.contains(r#"retry_headers=Some("x-should-retry=false,retry-after=60")"#),
+        summary_line.contains(
+            r#"retry_headers=Some("x-should-retry=false,retry-after=60,x-ratelimit-remaining-requests=0")"#
+        ),
         "#333: summary line missing retry_headers; got: {summary_line}"
     );
     // 卫生: 白名单外的头不进摘要行 (不做全量透传日志, 防膨胀).

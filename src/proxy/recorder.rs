@@ -485,7 +485,8 @@ pub(super) fn warn_if_protocol_mismatch(
 /// 同构; cross_proto 的 path 带尾部 " [a → b]" 注释, 落在后续段不影响 nth(2)).
 ///
 /// 安全: 字段均来自路由/元数据, 永不含 secret 值 (redactions 只记条数;
-/// retry_headers 只投影白名单头, 值经控制符净化, 见 [`format_retry_headers`]).
+/// retry_headers 只投影白名单头 (精确 3 + 前缀 2 族, 见 [`format_retry_headers`]),
+/// 值经控制符净化).
 ///
 /// 调用点 (record 终态 choke points): fanout_stream_task (两条流式路径) /
 /// fan_out_buffered_ir / cross_proto 正常收尾 / record_upstream_failure
@@ -528,17 +529,34 @@ pub(super) fn log_forward_summary(dag: &ConversationDag, record_id: Uuid) {
 /// `helpers::is_sensitive_header` 黑名单) 语义相反、独立维护、不复用同一张表.
 /// retry 头不在脱敏黑名单内 (已核实), 值本身非敏感; 用户显式把 retry 头配进
 /// 脱敏名单时, 存储值为 `<redacted>`, 本投影照抄存储 — 以脱敏为准.
+/// 精确白名单 (决策性头: opencode `isRetryable` / `retryAfterMs` 的全部输入,
+/// 放弃/等待决策的直接依据).
 const RETRY_LOG_HEADERS: &[&str] = &["x-should-retry", "retry-after", "retry-after-ms"];
 
+/// 前缀族白名单 (信息性配额头): opencode `rateLimitDetails` 以正则前缀消费
+/// `x-ratelimit-{limit,remaining,reset}-*` 与 `anthropic-ratelimit-*` 两族,
+/// OpenAI / OpenRouter / Moonshot / Anthropic 的 429 均携带; 前缀匹配覆盖各
+/// bucket 变体 (requests/tokens/unified...), 不枚举. (#333 调研修订, 见 issue
+/// 2026-10-18 评论: 消费侧完整清单 + provider 侧各家行为.)
+///
+/// 注: `*‑tokens‑*` 形态命中脱敏黑名单的 `contains("token")` 规则, 存储值已是
+/// `<redacted>` — 投影照抄 (脱敏优先, 与精确头同语义), 配额观测以 requests/
+/// reset 族与决策头为主.
+const RETRY_LOG_HEADER_PREFIXES: &[&str] = &["x-ratelimit-", "anthropic-ratelimit-"];
+
 /// `retry_headers` 字段的字节上限 (防洪水: 异常超长头值不撑爆摘要行).
-const RETRY_LOG_HEADERS_MAX_BYTES: usize = 256;
+/// 512 = 决策头 (~60B) + 两族全量最坏 ~9 头 (~330B) 实测上界 + 余量.
+const RETRY_LOG_HEADERS_MAX_BYTES: usize = 512;
 
 /// 把 (非 2xx 的已脱敏) 响应头投影为摘要日志的 `retry_headers` 字段值 (#333).
 ///
 /// 形如 `x-should-retry=false,retry-after=60`; 同名多值用 `|` 拼接;
 /// 无任何白名单头命中 → `None`. 匹配对头名大小写容错 (存储侧 HeaderName 恒
-/// 小写, 防御深度). 净化 (防日志注入): 控制字符 (含 `\r\n`) 替换为空格, 再按
-/// 字节截断 (char boundary 安全, ROB-1 — 复用 util 截断族), 截断以 `…` 可见.
+/// 小写, 防御深度). 输出序: 精确白名单头按白名单序在前 (决策性优先, 截断
+/// 预算先喂决策头), 前缀族头按头名字典序在后 (BTreeMap 聚合, 存储序任意时
+/// 输出仍同形, 单测可断言). 净化 (防日志注入): 控制字符 (含 `\r\n`) 替换为
+/// 空格, 再按字节截断 (char boundary 安全, ROB-1 — 复用 util 截断族),
+/// 截断以 `…` 可见.
 fn format_retry_headers(headers: &[(String, String)]) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     for name in RETRY_LOG_HEADERS {
@@ -551,6 +569,27 @@ fn format_retry_headers(headers: &[(String, String)]) -> Option<String> {
             parts.push(format!("{name}={}", values.join("|")));
         }
     }
+    // 前缀族: 排除已被精确名单收编的头 (理论不重叠, 防御深度), BTreeMap 键
+    // 字典序 = 输出确定性; 同名多值聚合 join("|") 与精确头一致.
+    let mut prefixed: std::collections::BTreeMap<String, Vec<&str>> =
+        std::collections::BTreeMap::new();
+    for (n, v) in headers {
+        let lowered = n.to_ascii_lowercase();
+        if RETRY_LOG_HEADERS.iter().any(|w| *w == lowered) {
+            continue;
+        }
+        if RETRY_LOG_HEADER_PREFIXES
+            .iter()
+            .any(|p| lowered.starts_with(p))
+        {
+            prefixed.entry(lowered).or_default().push(v.as_str());
+        }
+    }
+    parts.extend(
+        prefixed
+            .into_iter()
+            .map(|(n, vs)| format!("{n}={}", vs.join("|"))),
+    );
     if parts.is_empty() {
         return None;
     }
@@ -1296,9 +1335,11 @@ mod tests {
     //
     // 契约 (issue #333): 非 2xx 上游响应的 forward 摘要行携带 retry 白名单头
     // (opencode 等客户端按 x-should-retry 决定重试但不持久化响应头, 网关摘要行
-    // 是事后可 grep 的唯一留证). 单测锁定纯函数的四个维度: 白名单选取/序、多值
-    // 拼接、控制符净化 (防日志注入)、字节截断 (防洪水). 端到端 (日志行) 由
-    // integration 的 #333 测试锁定; 2xx 门控由 dag 层单测锁定.
+    // 是事后可 grep 的唯一留证). 白名单 = 精确 3 决策头 + 2 信息性前缀族
+    // (x-ratelimit-* / anthropic-ratelimit-*, opencode rateLimitDetails 消费,
+    // #333 调研修订). 单测锁定纯函数维度: 白名单选取/序、前缀族序与聚合、
+    // 多值拼接、控制符净化 (防日志注入)、字节截断 (防洪水). 端到端 (日志行)
+    // 由 integration 的 #333 测试锁定; 2xx 门控由 dag 层单测锁定.
 
     #[test]
     fn format_retry_headers_picks_whitelist_in_whitelist_order() {
@@ -1382,6 +1423,70 @@ mod tests {
         assert_eq!(
             format_retry_headers(&headers).as_deref(),
             Some("retry-after=60")
+        );
+    }
+
+    #[test]
+    fn format_retry_headers_includes_prefix_families_after_exact() {
+        // 前缀族 (信息性配额头, #333 调研修订): 精确头 (决策性) 按白名单序在前,
+        // 前缀族按头名字典序在后 — 存储序任意时输出同形.
+        let headers = vec![
+            (
+                "x-ratelimit-remaining-requests".to_string(),
+                "0".to_string(),
+            ),
+            (
+                "anthropic-ratelimit-unified-reset".to_string(),
+                "2026-10-18T12:00:00Z".to_string(),
+            ),
+            ("x-should-retry".to_string(), "false".to_string()),
+            (
+                "x-ratelimit-remaining-tokens".to_string(),
+                "<redacted>".to_string(),
+            ),
+        ];
+        assert_eq!(
+            format_retry_headers(&headers).as_deref(),
+            Some(concat!(
+                "x-should-retry=false,",
+                "anthropic-ratelimit-unified-reset=2026-10-18T12:00:00Z,",
+                "x-ratelimit-remaining-requests=0,",
+                "x-ratelimit-remaining-tokens=<redacted>"
+            ))
+        );
+    }
+
+    #[test]
+    fn format_retry_headers_prefix_families_aggregate_and_exclude_lookalikes() {
+        // 同名多值聚合 join("|") 与精确头一致; 前缀不误中形近头
+        // (x-request-id / x-ratelimit 裸名 / x-ratelimitx-foo 均不命中).
+        let headers = vec![
+            ("x-request-id".to_string(), "req-123".to_string()),
+            ("x-ratelimit".to_string(), "10".to_string()),
+            ("x-ratelimitx-foo".to_string(), "10".to_string()),
+            (
+                "x-ratelimit-remaining-requests".to_string(),
+                "5".to_string(),
+            ),
+            (
+                "x-ratelimit-remaining-requests".to_string(),
+                "3".to_string(),
+            ),
+        ];
+        assert_eq!(
+            format_retry_headers(&headers).as_deref(),
+            Some("x-ratelimit-remaining-requests=5|3")
+        );
+    }
+
+    #[test]
+    fn format_retry_headers_prefix_family_only_still_logs() {
+        // 只带前缀族头 (无决策头) 也出 Some — "429 未带 x-should-retry/retry-after"
+        // 本身是排障证据 (#333: 空 = 排除该假设), 不能因缺精确头而丢族头.
+        let headers = vec![("x-ratelimit-reset-requests".to_string(), "12".to_string())];
+        assert_eq!(
+            format_retry_headers(&headers).as_deref(),
+            Some("x-ratelimit-reset-requests=12")
         );
     }
 
