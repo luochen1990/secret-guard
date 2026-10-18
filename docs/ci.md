@@ -68,7 +68,11 @@ single-job runner 上串行占位, 延迟最新 push 的反馈. workflow 级
    upsert 机制见下文"评论写回机制"。
 7. **Record toolchain version** (`if: always()`): 把 `rustc --version` 写入 step output,
    由 Diagnose 评论携带留痕 (CI 工具链由 VM nixpkgs 决定, 三源漂移事后可追溯)。
-8. **Quality gate (just ci-merge main)** — P0 阻塞主链: `just check` 全量档
+8. **Nix syntax gate** (v3.3, nixos#1900): `.nix` 变更纯解析冒烟 —
+   `nix-instantiate --parse` 零求值; nix 启动仍初始化 state dir (temproots), 经
+   `NIX_STATE_DIR` 重定向到 job 私有 tmp 绕过 ro `/nix/var/nix` 权限 (2026-10-18
+   PR #337 首次真实执行爆雷的修正, 机制与事故记录见 workflow step 注释)。
+9. **Quality gate (just ci-merge main)** — P0 阻塞主链: `just check` 全量档
    (`FULL_TIER` = `--features oidc,consistency-check`; fmt + clippy + machete + doc 门禁 +
    测试 + typos + deny-offline + check-webui-syntax + check-webui-freshness + check-contracts + nix-check,
    **不带 --coverage** — 插桩与 coverage-gate 已归 P2)。
@@ -77,18 +81,18 @@ single-job runner 上串行占位, 延迟最新 push 的反馈. workflow 级
     锚点) 经全量档并入主链, 一轮 codegen 同时覆盖 OIDC 登录链与断言 (tier-collapse,
     不再独立成步 — 见 "双宿主验证分工")。
     stage 机制见 justfile `ci-merge` recipe (CI 拆 step / 本地 all 档聚合, 逐段等价无重复)。
-9. **File size gate** (`just check-file-size`): `rust-diff-analyzer` 对每个 .rs 做 AST
+10. **File size gate** (`just check-file-size`): `rust-diff-analyzer` 对每个 .rs 做 AST
     分类, 只统计 prod 行数 (排除 test), 双阈值 (WARN 500 软提醒 / MAX 1600 硬阻断,
     fail-closed)。
-10. **Diagnose failure** (仅 PR + job 失败时, `continue-on-error`): 阻塞 step outcomes
+11. **Diagnose failure** (仅 PR + job 失败时, `continue-on-error`): 阻塞 step outcomes
     汇总表 + 工具链版本贴到 PR 评论 (无日志权限 contributor 的 fallback)。
-11. **Guard single-job assumption (verify)** (`if: always()`): 校验 acquire step 写入的
+12. **Guard single-job assumption (verify)** (`if: always()`): 校验 acquire step 写入的
     锁文件未被覆盖; 被覆盖则显式失败并指向 "并发互斥假设" 段的应对预案。
 
 > **流程顺序原则**: 真正非阻塞的附加检查 (diff 报告 / Diagnose) 用 `continue-on-error`
 > 兜底, 即使抽风也不影响 `check` job 状态; 阻塞门禁 (check 主链全量档
-> 含 doc/--locked/typos/deny-offline/check-contracts / file-size / lock 校验) 失败则
-> job 失败。
+> 含 doc/--locked/typos/deny-offline/check-contracts / nix 语法门禁 / file-size / lock
+> 校验) 失败则 job 失败。
 
 ### P1 ci-deploy.yml (master push + nightly `0 19 * * *` + 手动; `just ci-deploy`)
 
@@ -128,7 +132,7 @@ artifacts on failure (截图/trace/报告, retention 14 天) / Guard verify。
 | pre job (内联探针) | 删除 — 换共享本地 action (三档各自接线, workflow_file 自指) |
 | diff breakdown + Upsert 评论, toolchain 留痕, Diagnose | P0 保留 |
 | consistency-check feature guard | P0 并入主链全量档 (tier-collapse; contracts.md 锚点同步) |
-| Check + coverage data (`--coverage` 插桩) | 拆分: 普通主链留 P0 (step 8); 插桩归 P2 |
+| Check + coverage data (`--coverage` 插桩) | 拆分: 普通主链留 P0 (Quality gate); 插桩归 P2 |
 | Coverage gate | **P2** (rubric: 覆盖率防倒退 = 质量债, 不卡合入) |
 | Performance benchmark + bench PR 评论 | **P1** (compare-save 单模式; PR 评论随 PR 事件消失) |
 | WebUI regression + 评论 + artifact | **P2** (评论随 PR 事件消失 → 日志摘要 + artifact) |

@@ -299,18 +299,29 @@ jobs:
       # flake.nix 误写 packages 列表闭合 (`]);`), ci-merge 全链未拦 (vm-nix 契约禁止
       # VM 内求值 flake — ro store), 直到人工本地 nix develop 才炸。本步用
       # nix-instantiate --parse 补口: 纯解析零求值 (abort/throw/import 均不执行)、
-      # 零 store 写 (不连 daemon, ro store 契约兼容)、NIX_PATH 无关 (<nixpkgs> 查找
-      # 路径是求值期语义, 解析期只认字面量 — flake.nix 顶层 {…} 函数/attrset 按普通
-      # 表达式解析即可, 无需任何求值上下文)。Lix 实现附带 parse-time 名字分析:
-      # undefined variable 一并拦 (with 动态作用域不误报), 比 CppNix 多一层免费
-      # 覆盖。清单为空直通, 有失败即红并逐文件点名。
+      # 零 store 写 (不连 daemon, ro store 契约兼容 — 但 nix 二进制启动仍会初始化
+      # state dir 写 temproots GC 记账, ro 的 /nix/var/nix 对 forgejo-runner 用户
+      # 不可写 → 经 NIX_STATE_DIR 重定向到 job 私有 tmp, 见 env 注释)、NIX_PATH
+      # 无关 (<nixpkgs> 查找路径是求值期语义, 解析期只认字面量 — flake.nix 顶层 {…}
+      # 函数/attrset 按普通表达式解析即可, 无需任何求值上下文)。Lix 实现附带
+      # parse-time 名字分析: undefined variable 一并拦 (with 动态作用域不误报),
+      # 比 CppNix 多一层免费覆盖。清单为空直通, 有失败即红并逐文件点名。
+      # (state dir 修正: 2026-10-18 PR #337 首次真实执行爆雷 — step 合入后首个含
+      # .nix 变更的 PR, nix 启动即 `creating directory /nix/var/nix/temproots:
+      # Permission denied`, 语法正确的文件被误判语法错误。)
       - name: Nix syntax gate
+        id: nixgate
         # success() 同上 (显式默认门); skip 同 SHA 已验证过则本门禁一并跳过
         if: success() && steps.skip.outputs.should_skip != 'true'
         env:
           # PR 事件: base tip sha (事件 payload) — checkout 链已 fetch 其对象, 且
           # deploy key 已清理无法再补 fetch, 只能就地取材做三点 diff
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          # nix 启动期 state dir (temproots GC 记账) 重定向: parse 不读 state 内容,
+          # 落 /tmp 即可。run_id 后缀隔离跨 run 记账 — run_id 是 per-repo 编号,
+          # 共享 runner 下不同 repo 可能撞号同路径, re-run 亦复用同号, 撞号无害
+          # (残留 temproots 是惰性垃圾且无 GC 扫此目录)。nix 自动 mkdir, 无需预建。
+          NIX_STATE_DIR: /tmp/sg-nix-syntax-state-${{ github.run_id }}
         run: |
           set -euo pipefail
           if [ -n "${BASE_SHA:-}" ] && git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
@@ -369,7 +380,7 @@ jobs:
       # 仅 PR 事件 + job 失败时触发. continue-on-error 兜底 (评论失败不影响 job 状态).
       # 工具链版本 (issue #149-5b) 携带在此评论: 每次失败留痕 rustc 版本, 便于事后
       # 追溯 "三源漂移" 类问题 (clippy 新 lint 突然阻塞).
-      # v3.0: 表随三档结构更新 — bench/playwright/audit/nix 不再在本 job (去向
+      # v3.0: 表随三档结构更新 — bench/playwright/audit/nix build 不再在本 job (去向
       # ci-deploy / ci-periodic, 见 docs/ci.md 步骤去向表).
       - name: Diagnose failure (post step outcomes to PR)
         if: always() && failure() && github.event_name == 'pull_request'
@@ -388,10 +399,11 @@ jobs:
             echo "| Step | id | Outcome |"
             echo "|------|----|---------|"
             echo "| Guard lock | lock | ${{ steps.lock.outcome }} |"
+            echo "| Nix syntax gate (.nix 变更纯解析冒烟) | nixgate | ${{ steps.nixgate.outcome }} |"
             echo "| Quality gate (check 主链全量档 --features oidc,consistency-check: fmt/clippy/machete/doc/nextest/typos/deny-offline/check-contracts) | gate | ${{ steps.gate.outcome }} |"
             echo "| File size | filesize | ${{ steps.filesize.outcome }} |"
             echo ""
-            echo "(coverage-gate/WebUI/bench/audit/nix 不在本 job — v3.0 三档拆分后分别归"
+            echo "(coverage-gate/WebUI/bench/audit/nix build 不在本 job — v3.0 三档拆分后分别归"
             echo " ci-periodic (P2) 与 ci-deploy (P1), 各自 run 红即可见, 无 PR 评论矩阵.)"
             echo ""
             echo "**Job status**: ${{ job.status }}"

@@ -234,7 +234,7 @@ check-all: check _kill-orphans
 
 # org ci 契约 recipe (阻塞级门禁入口, 见 lc-studio/forgejo-actions README「CI 分级」)。
 # v3.0 三档: 本仓 thin 形态 (SSOT 骨架 + 本地 skip-if-passed action), 质量链拆三档 —
-#   P0 ci-merge    (ci-merge.yml)   合入时刻: check 主链 (全量档) + file-size
+#   P0 ci-merge    (ci-merge.yml)   合入时刻: check 主链 (全量档) + nix 语法门禁 + file-size
 #   P1 ci-deploy   (ci-deploy.yml)  部署时刻: audit + bench 基线 (nix build 留 workflow 层)
 #   P2 ci-periodic (ci-periodic.yml) 周期兜底: check --coverage + coverage-gate
 # stage 语义 (CI 编排与本地复现逐段等价、无重复执行):
