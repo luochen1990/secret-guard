@@ -596,7 +596,7 @@ GPL/AGPL 等 copyleft 会污染下游). 配置在 `deny.toml`, 与 `.cargo/audit
 
 ## 部署
 
-NixOS 部署两代姿势: 结构化选项 (`services.secret-guard` 的 providers/secrets.entries/redact/auth,
+NixOS 部署两代姿势: 结构化选项 (`services.secret-guard` 的 providers/secrets.entries/redact/auth/privacyScan,
 未显式设 configFile 时经 `nix/render.nix` 自动生成 toml, eval 期校验 fail-fast) + 手写
 configFile (escape hatch, 互斥). 凭据注入 (LoadCredential / sops 直接路径) 与 secret
 批量注入方案见 **`docs/deployment-nixos.md`**.

@@ -81,6 +81,9 @@ let
       ];
       # SEC-4 + cookie 旋钮的 e2e 镜像链 (assert-toml 断言渲染形态)
       redact.redactedHeaders = [ "x-my-service-key" ];
+      # [privacy_scan] batch 档的 e2e 镜像链 (assert-toml 断言; 缺省 off 不渲染
+      # 由 inline/timeouts 形态的反向断言锁定)
+      privacyScan.mode = "batch";
       auth = {
         enable = true;
         secureCookie = true;
@@ -295,6 +298,21 @@ let
     ])
   );
 
+  # privacyScan (mode) 同型: 不计入 structuredUsed 但手写 configFile 下扫描
+  # 开关会无声丢失 — 不带 providers 使 throw 只能源于 privacyScanUsed.
+  privacyScanMutualExclusionFails = fails (
+    unitOf (sgEv [
+      {
+        nixpkgs.hostPlatform = system;
+        services.secret-guard = {
+          enable = true;
+          configFile = "/etc/secret-guard.toml";
+          privacyScan.mode = "batch";
+        };
+      }
+    ])
+  );
+
   # 手写 configFile (escape hatch): 原样透传 (resolvedConfigFile = 用户路径, 非 store render)
   handWritten = sgEv [
     {
@@ -387,6 +405,10 @@ let
     {
       name = "configFile 互斥: 显式 + redact.redactedHeaders → eval throw (防脱敏名单无声丢失)";
       ok = redactMutualExclusionFails;
+    }
+    {
+      name = "configFile 互斥: 显式 + privacyScan.mode=batch → eval throw (防扫描开关无声丢失)";
+      ok = privacyScanMutualExclusionFails;
     }
     {
       name = "双缺: 无 configFile 无结构化 → eval throw";

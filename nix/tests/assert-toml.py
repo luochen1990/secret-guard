@@ -67,6 +67,10 @@ if mode == "minimal":
     rd = cfg["redact"]
     assert rd["redacted_headers"] == ["x-my-service-key"]  # SEC-4 名单渲染
 
+    # privacyScan.mode = "batch" → 段渲染 (缺省 off 不渲染由 inline/timeouts 反向锁定)
+    ps = cfg["privacy_scan"]
+    assert ps["mode"] == "batch"
+
     s = cfg["server"]
     assert s["host"] == "127.0.0.1" and s["port"] == 18787
     # 超时字段整组不渲染 (upstreamTimeouts 全默认 → serde default 兜底, 回归 #175)
@@ -119,12 +123,14 @@ elif mode == "inline":
         and rt["target"] == "b-upstream"
         and rt["priority"] == 100
     )
-    # 全默认段不渲染 (module 层 usageUsed/authUsed/redactUsed 判定 → serde default
-    # 兜底): 锁定 "nix options defaults ↔ 默认镜像 ↔ render 跳过" 的端到端一致
-    # 性 — 任一侧默认值漂移都会让本断言失败 (usage/auth/redact 段出现即漂移)
+    # 全默认段不渲染 (module 层 usageUsed/authUsed/redactUsed/privacyScanUsed 判定
+    # → serde default 兜底): 锁定 "nix options defaults ↔ 默认镜像 ↔ render 跳过"
+    # 的端到端一致性 — 任一侧默认值漂移都会让本断言失败
+    # (usage/auth/redact/privacy_scan 段出现即漂移)
     assert "usage" not in cfg
     assert "auth" not in cfg
     assert "redact" not in cfg
+    assert "privacy_scan" not in cfg
 elif mode == "timeouts":
     assert [p["id"] for p in cfg["providers"]] == ["b-upstream"], cfg["providers"]
     s = cfg["server"]
@@ -141,6 +147,7 @@ elif mode == "timeouts":
     # 其余段不受超时调参影响
     assert "usage" not in cfg and "auth" not in cfg and "secrets" not in cfg
     assert "redact" not in cfg
+    assert "privacy_scan" not in cfg
 else:
     raise SystemExit(f"unknown mode: {mode}")
 

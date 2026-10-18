@@ -5,7 +5,8 @@
 #     定义吻合 (provider sum type (direct/router/pool) / direct 的多端点
 #     endpoints[] (含 §5.2 逐字节锁定) / routes / pool 的
 #     members+exhaust+cooldown_secs / auth (含 secure_cookie) /
-#     secrets.entries / redact.redacted_headers / usage 定价覆盖段)
+#     secrets.entries / redact.redacted_headers / privacy_scan.mode /
+#     usage 定价覆盖段)
 #   - 确定性: providers 按 id 字典序输出
 #   - 转义: 字符串值经 toJSON, 引号/反斜杠 round-trip 不损
 #   - 路径直通: apiKeyFile / valueFile / clientSecretFile / keyFile 原样写入
@@ -124,6 +125,11 @@ let
           output = 4.4;
         };
       };
+    };
+    # [privacy_scan] batch 档 (非默认形态 — 验证段渲染; 缺省 null 不渲染由
+    # 专项断言覆盖)
+    privacyScan = {
+      mode = "batch";
     };
   };
 
@@ -324,6 +330,18 @@ let
           "a.example.com"
           "z.lan"
         ];
+    }
+    {
+      name = "privacy_scan: mode=batch 渲染 [privacy_scan] 段";
+      ok = parsed.privacy_scan.mode == "batch";
+    }
+    {
+      name = "privacy_scan 默认: 未传 privacyScan 时不渲染 [privacy_scan] 段 (serde default off 兜底)";
+      ok =
+        let
+          t = builtins.fromTOML (render (builtins.removeAttrs baseArgs [ "privacyScan" ]));
+        in
+        !(t ? privacy_scan);
     }
     {
       name = "SEC-4: redactedHeaders 非空渲染且按字典序 (确定性, 原样不归一化)";

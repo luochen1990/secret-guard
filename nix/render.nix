@@ -29,6 +29,8 @@
 #   - RedactConfig (src/config.rs): redacted_headers (redactedHeaders, 非空才
 #     渲染 [redact] 段; 条目空白 fail-fast — 上游 trim+lowercase 归一化后
 #     精确匹配, 与硬编码黑名单并集, SEC-4)
+#   - PrivacyScanConfig (src/config.rs): mode (privacyScan, off (serde default)
+#     → null 不渲染段; batch → 渲染 [privacy_scan] 段)
 #   - UsageConfig (src/config.rs): enabled / retention_days / pricing_url /
 #     pricing_refresh_secs / pricing_override{model → input / output /
 #     cache_read? / cache_write?} (cache 两维省略 = serde None → 上游回退
@@ -91,6 +93,9 @@
   # (serde default 空); 非空 = 渲染 [redact] 段, 按字典序保确定性 (上游匹配是
   # 集合语义, 顺序无关; 空白条目 fail-fast)
   redactedHeaders ? [ ],
+  # null = 跳过 [privacy_scan] 段 (mode=off 是 serde default); 否则
+  # { mode: "off" | "batch" } (见上方 schema)
+  privacyScan ? null,
   # null = 跳过 [usage] 段; 否则 { enable, retentionDays, pricingUrl,
   # pricingRefreshSecs, pricingOverride ? {} } (见上方 schema)
   usage ? null,
@@ -546,6 +551,15 @@ let
     "redacted_headers = [${lib.concatMapStringsSep ", " q (lib.sort (a: b: a < b) redactedHeaders)}]"
   ]);
 
+  # [privacy_scan]: null (mode=off, serde default) 不渲染段; 非 null 渲染档位行.
+  # 静态档位 — 扫描 task 在 serve() 启动时按此构造, 改档需重启服务.
+  privacyScanSection = lib.concatStringsSep "\n" [
+    "[privacy_scan]"
+    "# 隐私旁路扫描 (services.secret-guard.privacyScan, #257): 请求侧 pre-redact IR 的"
+    "# pattern 旁路扫描, 未登记 token 形状告警进 WebUI Secrets tab; 不进转发链/永不拦截."
+    "mode = ${q privacyScan.mode}"
+  ];
+
   # [server] 恒写 host/port (实际由 ExecStart --host/--port 参数覆盖, 此处仅作
   # fallback/调试参考); 超时四项仅在 upstreamTimeouts 非 null (任一字段偏离
   # serde 默认, module 层深比较判定) 时全量渲染, records_capacity 仍由上游
@@ -639,6 +653,7 @@ let
       ++ map (id: renderProvider id providers.${id}) providerIds
       ++ lib.optional (secretsEntries != [ ]) secretsSection
       ++ lib.optional (redactedHeaders != [ ]) redactSection
+      ++ lib.optional (privacyScan != null) privacyScanSection
       ++ [ serverSection ]
       ++ lib.optional (auth != null) (renderAuth auth)
       ++ lib.optional (usage != null) (renderUsage usage)

@@ -7,7 +7,7 @@
 ## 姿势 0: 结构化选项 + 自动 render (推荐)
 
 `services.secret-guard` 的结构化选项 (`providers` / `secrets.entries` / `redact` /
-`auth` / `usage` / `upstreamTimeouts`) 在未显式设 `configFile` 时自动生成
+`auth` / `usage` / `upstreamTimeouts` / `privacyScan`) 在未显式设 `configFile` 时自动生成
 `secret-guard.toml` (渲染 SSOT:
 `nix/render.nix`, 字段校验 — sum type / endpoints 端点表 (至少一条, 每协议至多一条) /
 base_url 卫生 / 路由悬空与环检测 — 全部 eval 期

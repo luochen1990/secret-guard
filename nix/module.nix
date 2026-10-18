@@ -2,7 +2,7 @@
 #
 # 职责: 把 secret-guard 二进制装成 systemd service, 并提供两代配置姿势:
 #   1. 结构化选项 (推荐): providers / secrets.entries / redact / auth / usage /
-#      upstreamTimeouts / allowedDomains — 未显式设 configFile 时自动经 ./render.nix 生成
+#      upstreamTimeouts / allowedDomains / privacyScan — 未显式设 configFile 时自动经 ./render.nix 生成
 #      secret-guard.toml (eval 期校验内置, 字段名与 src serde schema 同步
 #      契约见 render.nix 文件头);
 #   2. 手写 toml (escape hatch): 显式设 configFile 完全接管, 适配生成器覆盖不了
@@ -40,6 +40,15 @@ let
   # header 名单而无 provider/secrets/auth/usage 仍是"缺配置" — 名单只是脱敏调参,
   # 不构成网关有内容可跑的配置存在性 (与 upstreamTimeouts 同理).
   redactUsed = cfg.redact.redactedHeaders != [ ];
+
+  # [privacy_scan] 段是否被使用 (mode 偏离 serde 默认 off). 不参与 structuredUsed:
+  # 单开隐私扫描而无 provider/secrets/auth/usage 仍是"缺配置" — 扫描器只是旁路
+  # 增强, 不构成网关有内容可跑的配置存在性 (与 redactUsed 同理).
+  privacyScanUsed = cfg.privacyScan.mode != "off";
+
+  # render 的 privacy_scan 入参: off (serde default) → null (跳过 [privacy_scan]
+  # 段); 非 off → 直接透传 submodule (mode 无重命名, 与 usageArg/timeoutsArg 同型).
+  privacyScanArg = if privacyScanUsed then cfg.privacyScan else null;
 
   # usage 段的 serde 默认值 (src/config.rs UsageConfig::default 的 nix 镜像,
   # 改上游默认时同步). 用途: ① 判定 usage 是否被使用 (深比较); ② option default
@@ -119,6 +128,7 @@ let
       upstreamTimeouts = timeoutsArg;
       secretsEntries = cfg.secrets.entries;
       redactedHeaders = cfg.redact.redactedHeaders;
+      privacyScan = privacyScanArg;
       auth = authArg;
       usage = usageArg;
     }
@@ -128,11 +138,13 @@ let
   # 显式 + 结构化同设 → throw (互斥): 手写会静默胜出, 几乎肯定是迁移残留.
   # 互斥守卫涵盖 upstreamTimeouts (虽不计入 structuredUsed): 手写 configFile
   # 下超时设置会无声丢失, 与 "显式 + usage 偏离" 同属迁移残留形态. redact
-  # (redactedHeaders) 同理 — 手写接管下脱敏名单会无声丢失.
+  # (redactedHeaders) 同理 — 手写接管下脱敏名单会无声丢失; privacyScan
+  # (mode) 同理 — 手写接管下扫描开关会无声丢失.
   resolvedConfigFile =
     if cfg.configFile != null then
-      lib.throwIf (structuredUsed || timeoutsUsed || redactUsed || cfg.allowedDomains != [ ])
-        "services.secret-guard: configFile 与结构化选项 (providers/secrets.entries/redact/auth/usage/upstreamTimeouts/allowedDomains) 互斥, 二选一 — 手写 toml 是完全接管, 与自动 render 会静默竞争"
+      lib.throwIf
+        (structuredUsed || timeoutsUsed || redactUsed || privacyScanUsed || cfg.allowedDomains != [ ])
+        "services.secret-guard: configFile 与结构化选项 (providers/secrets.entries/redact/auth/usage/upstreamTimeouts/allowedDomains/privacyScan) 互斥, 二选一 — 手写 toml 是完全接管, 与自动 render 会静默竞争"
         cfg.configFile
     else if structuredUsed then
       renderedConfig
@@ -195,7 +207,7 @@ in
         指向手写 `secret-guard.toml` (声明式 static 配置) — **escape hatch, 完全接管**.
 
         与结构化选项 (providers / secrets.entries / redact / auth / usage /
-        upstreamTimeouts / allowedDomains) 互斥, 同设会在 eval 期 throw; 两者都
+        upstreamTimeouts / allowedDomains / privacyScan) 互斥, 同设会在 eval 期 throw; 两者都
         不设也 throw. 未设此选项且结构化选项有内容时,
         自动经 ./render.nix 生成 toml (结果暴露在 `services.secret-guard.resolvedConfigFile`).
 
@@ -515,6 +527,23 @@ in
           trim + lowercase 归一化后按名**精确匹配** (非子串: 配 x-my-key 不波及
           x-my-key-v2), 仅影响 record 脱敏不影响转发字节. 空 (默认) = 仅硬编码
           黑名单, 行为不变. 空白条目在 eval 期 fail-fast (笔误).
+        '';
+      };
+    };
+
+    privacyScan = {
+      mode = lib.mkOption {
+        type = lib.types.enum [
+          "off"
+          "batch"
+        ];
+        default = "off";
+        description = ''
+          隐私旁路扫描档位 ([privacy_scan] mode, #257): batch = 对请求侧 pre-redact
+          IR 做 pattern 旁路扫描, 「未被登记管理的 token 形状」告警进 WebUI Secrets
+          tab「疑似未登记」面板 (已登记值排除; 红线: 不进转发链 / 永不拦截 /
+          告警永不自动登记). off (默认) = 整段不渲染, WebUI 面板隐藏.
+          静态档位 — 改动需重启服务生效 (WebUI 只能调组开关, 不能开总闸).
         '';
       };
     };
