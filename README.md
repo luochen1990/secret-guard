@@ -106,10 +106,32 @@ cargo install --git https://github.com/luochen1990/secret-guard
 > module (its default package enables the feature). The local API-key path is always
 > compiled in. See [docs/configuration.md](docs/configuration.md) `[auth]`.
 
-### 2. Minimal configuration
+### 2. Configure
 
-Create `secret-guard.toml` somewhere (one upstream provider + one secret to protect is
-all it takes):
+#### Option B (recommended for new users) — zero-config start, set up in the WebUI
+
+Skip the config file entirely: start the gateway empty and create the two entries in
+the browser.
+
+```bash
+secret-guard run        # no config file needed — starts empty on 127.0.0.1:8787
+```
+
+Open `http://127.0.0.1:8787/` and:
+
+1. **Providers** tab → **New provider**: give it an id, add the endpoint's base_url
+   and api_key — unsure how the upstream lays out its URLs? Hit **Detect** to probe it
+   and auto-fill the protocol.
+2. **Secrets** tab → **New secret**: register the value you want protected.
+
+Entries take effect immediately and persist to `secret-guard.state.toml` — no
+hand-written TOML, no restart, and by construction none of Option A's two known TOML
+pitfalls (field order / nesting style).
+
+#### Option A — hand-written declarative config
+
+Declarative config fits version-managed setups. Create `secret-guard.toml` somewhere
+(one upstream provider + one secret to protect is all it takes):
 
 ```toml
 [[providers]]
@@ -130,6 +152,9 @@ value = "ghp_0123456789abcdefghijklmnopqrstuvwxyz"   # the secret to protect (ne
 > [docs/configuration.md](docs/configuration.md).
 
 ### 3. Start and send the first request
+
+Option A users: start the gateway with the first line below. Option B users: it's
+already running on 8787 — adjust the port in the examples accordingly.
 
 ```bash
 secret-guard run --port 18787

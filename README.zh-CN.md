@@ -85,7 +85,26 @@ cargo install --git https://github.com/luochen1990/secret-guard
 > feature)。本地 API key 路径两档都可用, 详见
 > [docs/configuration.md](docs/configuration.md) `[auth]` 段。
 
-### 2. 最小配置
+### 2. 配置
+
+#### 方式 B（推荐新用户）— 零配置启动, WebUI 内完成设置
+
+完全跳过配置文件: 网关空配置启动, 两个条目直接在浏览器里建。
+
+```bash
+secret-guard run        # 无需配置文件 — 空配置启动, 监听 127.0.0.1:8787
+```
+
+浏览器打开 `http://127.0.0.1:8787/`:
+
+1. **Providers** 标签页 → **New provider**: 填 id, 加端点的 base_url 与 api_key —
+   拿不准上游的 URL 布局就点 **Detect**, 协议自动探测填入;
+2. **Secrets** 标签页 → **New secret**: 登记要保护的值。
+
+条目即时生效并持久化到 `secret-guard.state.toml` — 免手写 TOML、免重启, 且从结构上
+绕开方式 A 的两个已知 TOML 陷阱 (字段顺序 / 嵌套风格)。
+
+#### 方式 A — 手写声明式配置, 适合纳入版本管理的部署
 
 在某个目录创建 `secret-guard.toml` (1 个上游 provider + 1 个要保护的 secret 即可跑通):
 
@@ -107,6 +126,9 @@ value = "ghp_0123456789abcdefghijklmnopqrstuvwxyz"   # 要保护的 secret (不�
 > 两套写法不一致)。全部配置字段见 [docs/configuration.md](docs/configuration.md)。
 
 ### 3. 启动并发出第一个请求
+
+方式 A 用户: 先跑下面第一行启动网关。方式 B 用户: 网关已在 8787 运行, 示例中的端口
+自行对应即可。
 
 ```bash
 secret-guard run --port 18787
