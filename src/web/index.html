@@ -2476,6 +2476,7 @@
         'stats.static': '<strong>{n}</strong> static',
         'stats.dynamic': '<strong>{n}</strong> dynamic',
         'stats.overrides': '<strong>{n}</strong> overrides',
+        'stats.builtin': '🛡 built-in: <strong>{sg}</strong> sg token · <strong>{prov}</strong> provider key',
         'source.static': 'static',
         'source.dynamic': 'dynamic',
         'source.dynamic_override': 'override',
@@ -5773,7 +5774,7 @@
         api: API_SECRETS,
         list: () => state.secretsList,
         disabledList: () => state.secretsDisabled,
-        setList: (d) => { state.secretsList = d.secrets || []; state.secretsDisabled = d.disabled || []; state.secretCategories = d.categories || []; state.secretDecisions = d.decisions || []; },
+        setList: (d) => { state.secretsList = d.secrets || []; state.secretsDisabled = d.disabled || []; state.secretCategories = d.categories || []; state.secretDecisions = d.decisions || []; state.secretsBuiltin = d.builtin_protection || null; },
         bodyId: 'secrets-body',
         statsId: 'secrets-stats',
         formDlgId: 'secret-form',
@@ -5922,9 +5923,22 @@
 
     async function refreshSecrets() {
       await refreshKind('secret');
+      // #320 内置保护徽章: renderKind 内的 renderStats 每次重写 #secrets-stats,
+      // 徽章在其后追加 (数据变化/空轮询都保持一致).
+      renderBuiltinProtection();
       // #257 S0.5: 告警与 secrets 同 tab, 顺带刷新 (登记提交后的 cfg.refresh()
       // 也走这里 → 告警行经视图过滤自然消失).
       refreshPrivacyAlerts();
+    }
+
+    // #320 内置自动保护徽章 (可见性/信任): sg token 与 provider key 免配置纳入
+    // 出站保护的计数. 纯展示 (无交互), 数据缺失/为零时静默不渲染 — 旧行为零变化.
+    function renderBuiltinProtection() {
+      const el = document.getElementById('secrets-stats');
+      const b = state.secretsBuiltin;
+      if (!el || !b) return;
+      if ((b.sg_tokens || 0) + (b.provider_keys || 0) <= 0) return;
+      el.insertAdjacentHTML('beforeend', `<span>${t('stats.builtin', { sg: b.sg_tokens || 0, prov: b.provider_keys || 0 })}</span>`);
     }
     async function refreshProviders() { await refreshKind('provider'); }
 

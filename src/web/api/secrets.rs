@@ -27,6 +27,20 @@ pub async fn list_secrets(State(state): State<AppState>) -> impl IntoResponse {
         .collect();
     let categories: Vec<&'static str> = SecretCategory::ALL.iter().map(|(_, s)| *s).collect();
     let decisions: Vec<&'static str> = OverrideMode::ALL.iter().map(|(_, s)| *s).collect();
+    // #320 内置保护计数: sg token (注册表已知明文数) + 登记了 key 的在役 provider
+    // 数. 仅计数 — 明文/mock 永不出现在响应面 (前端徽章展示用).
+    let builtin_protection = BuiltinProtection {
+        sg_tokens: state.api_keys.protected_credentials().len(),
+        provider_keys: state
+            .providers
+            .effective_raw()
+            .iter()
+            .filter(|p| {
+                matches!(&p.kind, crate::provider::ProviderKind::Direct(d)
+                    if !d.api_key.is_empty() || d.api_key_file.is_some())
+            })
+            .count(),
+    };
     (
         NO_STORE,
         Json(ListSecretsResponse {
@@ -34,6 +48,7 @@ pub async fn list_secrets(State(state): State<AppState>) -> impl IntoResponse {
             disabled,
             categories,
             decisions,
+            builtin_protection,
         }),
     )
 }
@@ -116,6 +131,22 @@ pub(crate) struct ListSecretsResponse {
     pub categories: Vec<&'static str>,
     /// 所有合法的 OverrideMode 字符串名, 供前端渲染 decision 选择器.
     pub decisions: Vec<&'static str>,
+    /// #320 内置自动保护计数 (徽章数据源; 语义见字段 doc).
+    pub builtin_protection: BuiltinProtection,
+}
+
+/// #320 内置自动保护的可见性计数 (仅计数, 不含任何明文/mock).
+///
+/// - `sg_tokens`: 进程当前已知明文的 sg API token 数 — 签发 / 静态装载 / 呈现
+///   注册的全集 (`ApiKeyStore::protected_credentials`, 排除已撤销).
+/// - `provider_keys`: 登记了 key 来源 (`api_key` 或 `api_key_file` 任一) 的在役
+///   Direct provider 数 — **配置口径** (file-mode 不探测文件当前可读性);
+///   实际 per-request 保护面另含跨 provider 的 inline key 全集与选中 provider
+///   的 file key (见 `protect::collect_credentials`), 计数是它的下界近似.
+#[derive(Serialize)]
+pub(crate) struct BuiltinProtection {
+    pub sg_tokens: usize,
+    pub provider_keys: usize,
 }
 
 /// 创建/更新 secret 的请求 body.

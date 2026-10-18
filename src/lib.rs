@@ -38,6 +38,7 @@ pub mod error;
 pub mod mock;
 pub mod pool;
 pub mod privacy;
+pub mod protect;
 pub mod provider;
 pub mod proxy;
 pub mod record;

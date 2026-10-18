@@ -1058,6 +1058,47 @@ real 还原进去等于精准投放泄露. 故默认"偏安全", 暴露侧行为
 - `prop_degradation_request_side_refused_by_default`: 默认配置下, 请求侧降级路径出站无 real secret — codec-less 协议 (gemini) + secrets → 503 + 上游零请求; probing 耗尽 → 503 + 上游零请求 (后者测试显式配 fail_closed, 默认值等价由 `prop_degradation_defaults_are_safe_side` 锁定). 🔁→`gemini_secrets_fail_closed_returns_503_zero_upstream_hits` (默认路径) + `fail_closed_mode_returns_503_when_probing_exhausted` (显式 fail_closed 行为) (`tests/integration.rs`)
 - `prop_degradation_response_side_withholds_real_by_default`: 默认配置 (withhold) 下, 响应侧降级路径 (reader-拒绝 fallback) 的客户端 body 含 Mock 不含 real (原字节透传) + mock-not-restored WARN (detail 含 opt-in 提示), 同协议 / 跨协议两路径对称. 🔁→`reader_reject_withholds_real_secret_by_default_same_proto` + `reader_reject_withholds_real_secret_by_default_cross_proto` (`tests/integration.rs`)
 
+### SEC-11 SG 自有凭证自动保护 (auto-protect overlay)
+
+**陈述**: secret-guard 自身持有的两类凭证 — ① sg API token (WebUI 动态签发 `sg_*` +
+静态 `[[auth.api_keys]]`), ② 登记的 provider key (`api_key` / `api_key_file`) —
+**免配置**自动纳入出站保护: 凭证明文出现在请求 body 的任意位置 (含非 chat 形状) 时,
+转发到上游的 body 中该明文被替换为确定性等长 mock (`protect::mock_for`, 强制 Plain
+shape). 机制是 **dispatch 层的字节层替换** (body 收集后 / 路径分叉前), 与 user-secret
+IR 机制正交:
+
+- **不参与路径选择判据**: 透传快捷分支 / `on_unsupported_protocol` 停损的判据仍是
+  *user* SecretTable 是否为空 — 自动保护对任意协议 (含 codec 未覆盖的 gemini/ollama)
+  与任意 body 形状一致生效, 不把透传路径升级成 IR 解析 (BadBody/503 回归源), 也不触发
+  codec-less 503 (保护面扩大不改变路径选择).
+- **sg token 生命周期** (注册表内存态, 磁盘仍 hash-only): 签发 (`issue`, 创建即生效) /
+  静态装载 (`new`, 含 disabled) / 呈现 (`lookup` 命中 — "呈现 ⇒ 保护", 覆盖重启后动态
+  key 明文不可恢复的缺口) 注册; 撤销 (`revoke`) 移除 (鉴权面已死, 明文保留无保护价值);
+  disable/enable 不动 (保护面跟随 "已知明文" 而非鉴权态).
+- **provider key per-request 派生** (无第二份簿记, SSOT = provider 表): 在役 Direct
+  条目的内联 `api_key` 全集 + 本次选中 provider 的 `effective_api_key` (覆盖 file-mode).
+  短于 `protect::MIN_PROTECTED_CHARS` (16) 的值不保护 (宁漏保不误替换; 真实 key 均远长).
+- **auth 关闭 + keyless provider 时**: 客户端 `Authorization: Bearer` 若 hash 命中已知
+  sg token → 剥离该 header (sg token 对任何上游都不是合法凭证, 转发无正当用途); 未命中
+  原样保留 (BYO-key 透传语义不受影响). auth 启用时 middleware 已同型剥离.
+- **只进不出**: 响应侧不还原 (这些凭证无 "本地工具从 LLM 响应读回真值" 的正当用例);
+  mock 是跨请求/跨进程确定的 (C3 前缀缓存友好同型).
+- **fail-open**: 替换永不失败 (非 UTF-8 body 跳过), 保护动作绝不阻塞转发 (best-effort
+  防护层, 与 RED 域 "用户显式登记" 的 fail-closed 语义有意不同).
+- **privacy-scan 零干扰**: mock 强制 Plain shape (无已知前缀/结构分段) ⇒ 不命中任何
+  内置 pattern (前缀/形状驱动, 无通用 high-entropy 规则) — 无排除集接线即无 "疑似
+  未登记" 误报 (由 `prop_auto_protect_mock_privacy_invisible` 守卫).
+
+**明文驻留 trade-off** (有意放宽, 见 `src/auth/apikey.rs` 头注): 内存中保留明文注册表
+(磁盘不变, 永不经 API 返回). 能读进程内存者本就有更高权限; 换取 body 泄露面 (进上游
+日志/训练语料) 的实质收窄.
+
+**Properties**:
+- `prop_auto_protect_replaces_provider_key_in_body`: 空 SecretTable (透传快捷分支) + keyed provider, body 含 ≥ 地板长度的 provider key → 上游收到的 body 含 mock 不含真值 (PartialJson 锁定); codec-less 协议 (gemini) 同型成立且不触发 503. 🔁→`auto_protect_replaces_provider_key_in_request_body` + `auto_protect_covers_codec_less_protocol_gemini` (`tests/integration.rs`)
+- `prop_auto_protect_sg_token_immediate_and_lifecycle`: WebUI 签发返回后**下一个请求**即受保护 (创建即生效); 生命周期语义 (issue 注册 / revoke 移除 / disable 保留 / 静态装载注册 / lookup 呈现注册含重启恢复) 由单元测试族锁定. 🔁→`auto_protect_sg_token_effective_immediately_after_issue` + `auto_protect_strips_sg_token_bearer_header_when_auth_disabled` (`tests/integration.rs`) + `issue_registers_plaintext_immediately` / `revoke_removes_registration` / `disable_keeps_registration` / `static_load_registers_plaintext` / `lookup_registers_presented_plaintext_across_restart` (`src/auth/apikey.rs`)
+- `prop_auto_protect_byte_layer_semantics`: 字节层替换的性质族 — 任意位置全量替换后 body 不含真值且幂等 (proptest); mock 确定性 + 等长 + 永不等于真值; 非 UTF-8 body 跳过 (fail-open); 多字节字符环绕不受扰动; 保护集地板 / 按值去重 / 长度降序. 🔁→`prop_redact_removes_real_and_is_idempotent` + `mock_is_deterministic_and_equal_length` + `redact_non_utf8_body_is_skipped` + `redact_unicode_body_untouched_around_hit` + `collect_enforces_floor_and_dedups` (`src/protect.rs`)
+- `prop_auto_protect_mock_privacy_invisible`: 对各已知前缀/结构形状的真值 (AKIA/ghp_/sk-ant-/AIza/xoxb-/JWT), 强制 Plain 的确定性 mock 永不命中 privacy-scan 的任一内置 pattern (pattern 引擎端到端断言, 防 pattern 集加入通用形状规则时静默破坏前提). 🔁→`mock_is_plain_shape_no_known_prefix` (`src/protect.rs`)
+
 ---
 
 ## 8. ROB: 鲁棒性 (best-effort 永不 panic)
@@ -1520,3 +1561,4 @@ chars (char boundary 安全); 其余事件字段为受控类型, 天然无 secre
 | 2026-10-12 | UI-9 (新增) + DTO-10 (措辞) | **轮次详情弹窗契约化 (quant#305)**: timeline 每轮原 info / raw 两按钮合并为单一详情入口, 弹窗双 tab — 概览 (默认, 元数据小字段: 本地 + `?view=meta` 小响应, 禁止拉完整 record) / 完整数据 (原 raw 弹窗内容, 首次激活才懒拉, quant#308 分段虚拟化不变); "感叹号" 入口 (header `.status-err` / `.leak-badge`) 点击直达概览. 配套 wire 侧: `GET /api/records/{id}` 新增 `view=meta` 档 (bodies/headers/parsed 清空, 元数据照常, `build_forward_record` 单点构造). DTO-10 消费面措辞随合并更新 ("WebUI raw 弹窗" → "WebUI 轮次详情弹窗完整数据 tab") | 用户反馈 (lc-studio/quant#305): "传输层信息" 页名不副实 (实为轮次元数据, 非传输层) + i/raw 双入口信息架构割裂; 用户方案: 合并入口 + 概览/详情 tab + 大数据按需 |
 | 2026-10-17 | RED-5 (公开格式子串豁免, category-aware shape) | **mock 结构仿真维度落地 (兑现 SecretCategory 字段的历史承诺 — 根 AGENTS.md "后续工作" category-aware 条目关闭)**: ① `SecretCategory` 迁移至 `src/mock.rs` (它是 mock 生成器的选择参数; secrets.rs re-export 维持 API, 依赖方向 secrets→mock 单向不变); ② `GenSpec` 新增 `shape` 字段 (`SecretShape`, serde default plain 兼容旧配置): privatekey+PEM (形状自证不 gate category, 归类错误免疫) → 边界行复用+等长随机 b64 行 / token+JWT (三段点分, 每段≥10 chars, 总长≥32) → 三段等长随机 b64url / apikey+公开前缀白名单 (`PUBLIC_KEY_PREFIXES` 最长命中, body≥8) → 前缀保留; 其余 (含归类错误/形状不匹配/global_mock_prefix 非空) 退化为 plain 平坦串 — **归类错误无害**; ③ **等长不变量**: 全形状 mock 总字符数 == real 总字符数 (wire 字节量无扰动); ④ **C5 公开格式子串豁免** (RED-5 精确化): PublicPrefixed 前缀与 PEM 边界行是信息量为零的公开格式串, `c5_violated` 检查前剥离 mock 公开段、随机部分照常 ≥k 窗口检查 + 重试链语义不变; ⑤ 手动配置 shape 的 validate 约束 (shape!=plain 时 prefix 必空 + jwt/pem 的 length_range 必须是与分段结构一致的单点区间); ⑥ 已知代价: GenSpec 哈希流含新字段, 升级部署后所有 mock 一次性变化 (前缀缓存失效一次, 类比 policy 变动的既有语义). property: `prop_category_shape_mock_equal_length` + shape 单元组 + RED-6 交叉 `pem_secret_structured_mock_round_trip` | 用户任务: nixos 部署把全部 sops secret 映射为 apikey 类别 (SecretCategory 字段存在但对行为零影响 — 死字段), 盘点 sops 真实类型 (password/token/privatekey 等 ~160 key) 后补齐行为缺口; 本 PR 是 sg 侧, nixos 侧 category 推导另行提交 |
 | 2026-10-18 | UI-10 (新增) | **Detect 协议探测非阻塞契约化 (手动填写永远是逃生口)**: 探测是体验增强不是使用门槛 — ① 非阻塞不变量: 检测失败/无推荐/未探测时表单全字段可手动填写并保存, recommended 建议非命令, 转发不依赖探测产物 (common_uri 仅承载真实探测证据); ② 失败呈现必须肯定式引导手动填写, 不得暗示用户修改本来正确的 base_url (起因: 小米 MiMo 等 Anthropic 兼容网关无 models 端点, Detect 结构性失明 + 旧文案误导, 用户被卡死); ③ 检测覆盖渐进演进不承诺全覆盖 — 首批补救: `/anthropic` 尾段启发式推荐 (证据 > 形状推断, common_uri 恒 null); ④ 配套: endpoints 弹窗入口 URL 对 openai 族 short 镜像 effective common_uri (JS 镜像 `effectiveCommonUriOf`), 复制即用. 4 条 property: 2 前端 Playwright (非阻塞保存 + URL 镜像) + 2 后端 mockito (启发式触发 + 证据优先) | 用户裁决的设计意图 (2026-10-18): "自动检测不阻塞用户手动填写覆盖 — 仅提升体验, 不应成为阻塞点和绊脚石; 检测完善是渐进过程, 不指望百分百覆盖"; 实测证据: MiMo/Kimi/MiniMax/GLM 的 `/anthropic` 面两路 models 探测皆 404 而 `/v1/messages` 存在, GET /v1/messages 信号各家 405/401/404 混杂不可靠 (否决) |
+| 2026-10-18 | SEC-11 (新增) | **SG 自有凭证自动保护 (issue #320)**: ① sg API token (动态签发 + 静态 `[[auth.api_keys]]`) 与 ② 登记的 provider key (`api_key`/`api_key_file`) 免配置纳入出站保护 — dispatch 层字节层 real→mock 替换 (等长确定性 mock, 强制 Plain shape), 与 user-secret IR 机制正交 (不参与透传/codec-less 路径判据, 对 gemini/ollama 与非 chat body 形状一致生效); sg token 生命周期 = issue/静态装载/lookup 呈现 注册, revoke 移除, disable 保留 (保护面跟随已知明文而非鉴权态); provider key per-request 从表派生 (SSOT, 无簿记); auth 关闭时命中 sg token 的 Bearer header 剥离; 响应侧不还原 (只进不出); 内存明文注册表 (磁盘仍 hash-only) 是有意放宽, 见 apikey.rs 头注 trade-off. 4 条 property: provider key 透传替换 + codec-less / sg token 创建即生效 + 生命周期 + header 剥离 / 字节层性质族 (proptest 幂等 + 地板 + 非 UTF-8) / mock 对 privacy pattern 不可见 | issue #320: "SG自己的API Token应当自动被保护. 无需用户手动配置. 并且在创建token后能立刻生效" (含两方面: sg 签发的 key + 登记的 provider key); 威胁模型 = prompt injection 诱导 agent 粘贴自身 apiKey 入对话 → 随 body 流向 LLM provider |

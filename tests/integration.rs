@@ -14737,3 +14737,167 @@ async fn api_me_always_200_in_single_user_mode() {
         "单用户模式无账号系统, 一切请求即主人"
     );
 }
+
+// ─── #320 SG 凭证自动保护 (sg token + provider key 免配置出站保护) ──────────
+//
+// 契约 SEC-11 的端到端守卫: 字节层替换挂在 dispatch (body 收集后), 对透传快捷
+// 分支 / codec-less 协议一致生效 (与 user-secret IR 机制正交). mock 预测走
+// `secret_guard::protect::mock_for` (强制 Plain 的确定性生成器, 与 user-secret
+// 的 predict_mock 是不同策略 — 不可互换).
+
+/// 经 `POST /api/api-keys` 签发一个动态 key, 返回 (id, 明文).
+async fn issue_sg_token(proxy_url: &str, label: &str) -> (String, String) {
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/api/api-keys"))
+        .json(&serde_json::json!({ "label": label }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    (
+        v["id"].as_str().unwrap().to_string(),
+        v["key"].as_str().unwrap().to_string(),
+    )
+}
+
+#[tokio::test]
+async fn auto_protect_replaces_provider_key_in_request_body() {
+    // provider key (≥ 地板长度) 出现在请求 body → 出站被替换为确定性 mock.
+    // 空 SecretTable ⇒ 走透传快捷分支 — 证明保护不依赖 IR 路径 (零 secrets 配置
+    // 的最常见形态).
+    let provider_key = "sk-live-0123456789abcdefghijklmnop";
+    let expected_mock = secret_guard::protect::mock_for(provider_key);
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "messages": [{ "role": "user", "content": format!("leak {expected_mock} here") }]
+        })))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"choices":[{"message":{"content":"ok"}}]}"#)
+        .create_async()
+        .await;
+    let proxy_url =
+        spawn_proxy_with_provider(keyed_provider("oa-keyed", &upstream.url(), provider_key)).await;
+
+    let body = format!(
+        r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"leak {provider_key} here"}}]}}"#
+    );
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-keyed/v1/chat/completions",
+        &body,
+        &[],
+    )
+    .await;
+    // PartialJson 未命中 (真值漏到上游) 时 mockito 返回 5xx/连接错 → 非 200.
+    assert_eq!(status, reqwest::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn auto_protect_sg_token_effective_immediately_after_issue() {
+    // "创建即生效": WebUI 签发返回后, 同一进程的**下一个请求**即受保护 —
+    // 无需重启 / 无需登记. (签发本身不触上游, mock 在签发后按可预知的
+    // expected_mock 建立.)
+    let mut upstream = spawn_mock_upstream().await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
+
+    let (_id, token) = issue_sg_token(&proxy_url, "leak-me").await;
+    let expected_mock = secret_guard::protect::mock_for(&token);
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "messages": [{ "role": "user", "content": format!("my key is {expected_mock}") }]
+        })))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"choices":[{"message":{"content":"ok"}}]}"#)
+        .create_async()
+        .await;
+
+    let body = format!(
+        r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"my key is {token}"}}]}}"#
+    );
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        &body,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn auto_protect_strips_sg_token_bearer_header_when_auth_disabled() {
+    // auth 关闭 + keyless provider (BYO-key 透传形态): 客户端 Authorization 若是
+    // sg token → 剥离 (sg token 对任何上游都不是合法凭证); 非 sg 值原样透传
+    // (BYO-key 语义不受影响, 正交断言见 provider_api_key_overrides_client_auth).
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .match_header("authorization", mockito::Matcher::Missing)
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"choices":[{"message":{"content":"ok"}}]}"#)
+        .create_async()
+        .await;
+    // provider_with: api_key 为空 (apply_provider_auth 空值跳过注入).
+    let proxy_url =
+        spawn_proxy_with_provider(provider_with("oa-bare", Protocol::OpenAI, &upstream.url()))
+            .await;
+
+    let (_id, token) = issue_sg_token(&proxy_url, "hdr").await;
+    let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#;
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-bare/v1/chat/completions",
+        body,
+        &[("Authorization", format!("Bearer {token}").as_str())],
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "upstream must not receive the sg token as Authorization header"
+    );
+}
+
+#[tokio::test]
+async fn auto_protect_covers_codec_less_protocol_gemini() {
+    // codec 未覆盖协议 (gemini) 的透传路径: 字节层保护照常生效, 且**不触发**
+    // on_unsupported_protocol 的 503 (overlay 不参与该判据 — 保护面扩大不改变
+    // 路径选择).
+    let provider_key = "AIzaSyGemini0123456789abcdefghijklmn";
+    let expected_mock = secret_guard::protect::mock_for(provider_key);
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", mockito::Matcher::Any)
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "contents": [{ "parts": [{ "text": format!("k={expected_mock}") }] }]
+        })))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"candidates":[]}"#)
+        .create_async()
+        .await;
+    let mut provider = provider_with("g-main", Protocol::Gemini, &upstream.url());
+    if let ProviderKind::Direct(d) = &mut provider.kind {
+        d.api_key = provider_key.into();
+    }
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+
+    let body = format!(r#"{{"contents":[{{"parts":[{{"text":"k={provider_key}"}}]}}]}}"#);
+    let (status, resp_body, _) =
+        proxy_request(&proxy_url, "POST", "/g/g-main/v1beta/x", &body, &[]).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "gemini passthrough must forward (no 503 from auto-protect); got body: {resp_body}"
+    );
+}

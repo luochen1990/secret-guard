@@ -47,6 +47,11 @@ Return:    local tools ◄──real Secret──  secret-guard  ◄──Mock r
   restored. Every placeholder secret doubles as a canary: if its real value ever shows
   up in an LLM response, you get an alert (WARN log + WebUI timeline badge, no secret
   values in the alert) while the response itself passes through untouched.
+- **Built-in protection for Secret Guard's own credentials**: the sg API tokens it
+  issues (and the provider API keys you register with it) are protected automatically —
+  zero configuration, effective the instant a token is created. If a prompt injection
+  talks your Agent into pasting its own gateway token into the conversation, the LLM
+  vendor only ever sees an equal-length Mock.
 
 The same request, before and after it leaves the machine (captured from a real run; only
 the token value is fictional):

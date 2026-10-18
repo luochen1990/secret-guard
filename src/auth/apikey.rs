@@ -5,6 +5,17 @@
 //! - 持久化复用 `crate::config::atomic_write`, 与 provider/secret 共享 `persist_lock`.
 //! - key 明文永不持久化, 只存 SHA-256 hash. 校验时对请求中的 key 做 hash 比对.
 //!
+//! # 明文驻留例外 (#320 自动保护) — 有意识的姿态放宽
+//!
+//! **磁盘**上仍永不落明文 (hash-only 持久化不变); 但**内存**中保留一份
+//! `plaintext_registry` (id → 明文), 供 [`crate::protect`] 把在役 token 免配置纳入
+//! 出站保护 (请求 body 中粘贴的 sg token 被替换为 mock). 注册时点 = 明文仅存的
+//! 三个露出瞬间: 签发 (`issue`) / 静态装载 (`new`) / 校验命中 (`lookup` — 客户端
+//! 呈现即注册, 覆盖重启后动态 key 明文不可恢复的缺口); 撤销 (`revoke`) 时移除.
+//! Trade-off: 能读进程内存的攻击者本就有更高权限 (可读 provider key / 直接读
+//! 转发流量), 换取的是 body 泄露面 (进上游日志 / 训练语料) 的实质收窄.
+//! 语义与红线详见 `src/protect.rs` 头部.
+//!
 //! # 静态 key
 //!
 //! 来自 `secret-guard.toml` 的 `[[auth.api_keys]]` 段, 启动时 resolve → hash →
@@ -111,6 +122,11 @@ pub struct ApiKeyStore {
     hash_index: Arc<RwLock<HashMap<String, ApiKeyEntry>>>,
     state_path: Arc<PathBuf>,
     persist_lock: Arc<Mutex<()>>,
+    /// #320 自动保护明文注册表 (entry id → 明文). 内存态, 永不持久化, 永不经 API
+    /// 返回; 语义见模块头 "明文驻留例外". 由 `new`/`issue`/`lookup` 写入, `revoke`
+    /// 移除; `disable/enable` 不动它 (disable 的 key 仍受粘贴泄露保护 — 保护的是
+    /// 泄露面而非鉴权面).
+    plaintext_registry: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl std::fmt::Debug for ApiKeyStore {
@@ -134,6 +150,9 @@ impl ApiKeyStore {
         persist_lock: Arc<Mutex<()>>,
     ) -> Self {
         // 合并静态 key: resolve 明文 → hash → 注入 entry.
+        // #320: 静态 key 明文在装载瞬间可得, 同步注册进保护注册表 (disabled 也注册 —
+        // 保护面跟随 "已知明文" 而非鉴权态, 见模块头).
+        let mut plaintext_registry: HashMap<String, String> = HashMap::new();
         for sk in static_keys {
             match sk.resolve(config_path) {
                 Ok(plaintext) => {
@@ -147,8 +166,10 @@ impl ApiKeyStore {
                         );
                     }
                     let disabled = static_disabled.contains(&sk.label);
+                    let id = format!("ak_static_{}", sk.label);
+                    plaintext_registry.insert(id.clone(), plaintext.clone());
                     entries.push(ApiKeyEntry {
-                        id: format!("ak_static_{}", sk.label),
+                        id,
                         key_hash: hash_key(&plaintext),
                         key_prefix: plaintext.chars().take(8).collect(),
                         tenant_id: format!("static:{}", sk.label),
@@ -174,6 +195,7 @@ impl ApiKeyStore {
             hash_index: Arc::new(RwLock::new(hash_index)),
             state_path: Arc::new(state_path),
             persist_lock,
+            plaintext_registry: Arc::new(RwLock::new(plaintext_registry)),
         }
     }
 
@@ -200,6 +222,11 @@ impl ApiKeyStore {
         let mut new_entries = self.locked_snapshot();
         new_entries.push(entry);
         self.persist_and_rebuild(&new_entries)?;
+        // #320 创建即生效: persist 成功后同步注册明文 (失败路径不注册 — 未落地的
+        // key 不存在粘贴泄露面). 先持久化再注册与 set_decision 的顺序契约同型.
+        self.plaintext_registry
+            .write()
+            .insert(id.clone(), plaintext.clone());
         Ok(IssuedApiKey {
             id,
             key: plaintext,
@@ -209,11 +236,27 @@ impl ApiKeyStore {
     }
 
     /// 按 key hash 查找 entry (校验用). 跳过 disabled 的 entry.
+    ///
+    /// #320: 命中即把明文注册进保护注册表 ("呈现 ⇒ 保护") — 客户端能用它鉴权,
+    /// 就意味着 Agent Harness 的配置里持有它, 粘贴泄露面成立. 幂等 (已注册时
+    /// 零写锁). 重启后动态 key 的明文仅能经此路径恢复 (磁盘只存 hash).
     pub fn lookup(&self, plaintext_key: &str) -> Option<ApiKeyEntry> {
-        self.hash_index
+        let hit = self
+            .hash_index
             .read()
             .get(&hash_key(plaintext_key))
-            .cloned()
+            .cloned();
+        // #320 呈现 ⇒ 保护: 命中且未注册时才拿写锁 (鉴权热路径常态零写).
+        if let Some(e) = &hit {
+            let reg = self.plaintext_registry.read();
+            if !reg.contains_key(&e.id) {
+                drop(reg);
+                self.plaintext_registry
+                    .write()
+                    .insert(e.id.clone(), plaintext_key.to_string());
+            }
+        }
+        hit
     }
 
     /// 按 id 删除 entry. 静态 key 不可删除 (只能 disable).
@@ -232,6 +275,9 @@ impl ApiKeyStore {
             .filter(|e| e.id != id)
             .collect();
         self.persist_and_rebuild(&new_entries)?;
+        // #320: 删除 = 用户意图 "遗忘此 key" (鉴权面已死, 明文保留无保护价值),
+        // 注册表同步移除. disable 不走这里 — disabled 的 key 仍受保护.
+        self.plaintext_registry.write().remove(id);
         Ok(true)
     }
 
@@ -257,6 +303,23 @@ impl ApiKeyStore {
             .read()
             .iter()
             .map(ApiKeySummary::from)
+            .collect()
+    }
+
+    /// #320: 当前已知明文的 sg token 保护集快照 (id 前缀 `sgkey_`).
+    ///
+    /// 消费方: `proxy::dispatch` 的自动保护层 (per-request) + `/api/secrets` 的
+    /// 内置保护计数 (可见性徽章). 只含注册表键值 — 明文/mock 的暴露纪律由
+    /// [`crate::protect::ProtectedCredential`] 的手写 Debug 等守住.
+    pub fn protected_credentials(&self) -> Vec<crate::protect::ProtectedCredential> {
+        self.plaintext_registry
+            .read()
+            .iter()
+            .map(|(id, value)| crate::protect::ProtectedCredential {
+                id: format!("sgkey_{id}"),
+                value: value.clone(),
+                mock: String::new(),
+            })
             .collect()
     }
 
@@ -620,5 +683,118 @@ mod tests {
         let store = make_store();
         let ret = store.set_disabled("ak_nonexistent_xyz", true).unwrap();
         assert_eq!(ret, None);
+    }
+
+    // ─── #320 自动保护注册表: 生命周期语义 ─────────────────────────────────
+
+    /// 注册表快照 → (id, value) 对 (测试断言便利; 值仅在测试进程内出现).
+    fn registry_pairs(store: &ApiKeyStore) -> Vec<(String, String)> {
+        store
+            .protected_credentials()
+            .into_iter()
+            .map(|c| (c.id, c.value))
+            .collect()
+    }
+
+    #[test]
+    fn issue_registers_plaintext_immediately() {
+        // "创建即生效" (#320 核心诉求): issue 返回前明文已入注册表 —
+        // 同步语义, 无需任何后续动作 (下一个请求即受保护).
+        let store = make_store();
+        let issued = store.issue("t", "tester", "k1").unwrap();
+        assert_eq!(
+            registry_pairs(&store),
+            vec![(format!("sgkey_{}", issued.id), issued.key.clone())]
+        );
+    }
+
+    #[test]
+    fn revoke_removes_registration() {
+        // 删除语义 (裁决): revoke = "遗忘此 key" — 鉴权面已死, 明文保留无保护
+        // 价值, 注册表同步移除.
+        let store = make_store();
+        let issued = store.issue("t", "tester", "k1").unwrap();
+        assert!(store.revoke(&issued.id).unwrap());
+        assert!(registry_pairs(&store).is_empty());
+    }
+
+    #[test]
+    fn disable_keeps_registration() {
+        // disable 语义 (裁决): 保护面跟随 "已知明文" 而非鉴权态 — disabled 的
+        // key 仍受粘贴泄露保护 (可 re-enable; 防的是泄露而非鉴权).
+        let store = make_store();
+        let issued = store.issue("t", "tester", "k1").unwrap();
+        store.set_disabled(&issued.id, true).unwrap();
+        assert_eq!(registry_pairs(&store).len(), 1);
+        store.set_disabled(&issued.id, false).unwrap();
+        assert_eq!(registry_pairs(&store).len(), 1);
+    }
+
+    #[test]
+    fn static_load_registers_plaintext() {
+        // 静态 key 装载瞬间注册 (含 disabled — known-plaintext 全集语义).
+        let statics = vec![StaticApiKey {
+            label: "lab".into(),
+            key: Some("sg_static_0123456789abcdefghijklmnop".into()),
+            key_file: None,
+        }];
+        let store = ApiKeyStore::new(
+            &statics,
+            std::path::Path::new("."),
+            vec![],
+            HashSet::from(["lab".to_string()]), // disabled
+            tmp_path("static-reg"),
+            Arc::new(Mutex::new(())),
+        );
+        let pairs = registry_pairs(&store);
+        assert_eq!(
+            pairs,
+            vec![(
+                "sgkey_ak_static_lab".to_string(),
+                "sg_static_0123456789abcdefghijklmnop".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn lookup_registers_presented_plaintext_across_restart() {
+        // 重启语义: 磁盘只存 hash, 新进程注册表为空; 客户端呈现 (lookup 命中)
+        // 即恢复注册 — "呈现 ⇒ 保护" 闭环.
+        let path = tmp_path("restart-reg");
+        let lock = Arc::new(Mutex::new(()));
+        let store = ApiKeyStore::new(
+            &[],
+            std::path::Path::new("."),
+            vec![],
+            HashSet::new(),
+            path.clone(),
+            lock.clone(),
+        );
+        let issued = store.issue("t", "tester", "k1").unwrap();
+
+        // "重启": 从同一 state.toml 重建 store (动态 entries 从盘上恢复).
+        let state = crate::config::DynamicState::load_or_empty(&path, "").unwrap();
+        let store2 = ApiKeyStore::new(
+            &[],
+            std::path::Path::new("."),
+            state.api_keys,
+            state.api_keys_disabled,
+            path,
+            lock,
+        );
+        assert!(
+            registry_pairs(&store2).is_empty(),
+            "restart starts with empty registry (hash-only persistence)"
+        );
+        // 呈现一次 (鉴权路径 / auth-off 的机会性 lookup 同一入口):
+        let hit = store2.lookup(&issued.key).unwrap();
+        assert_eq!(hit.id, issued.id);
+        assert_eq!(
+            registry_pairs(&store2),
+            vec![(format!("sgkey_{}", issued.id), issued.key.clone())]
+        );
+        // 幂等: 重复 lookup 不重复注册.
+        store2.lookup(&issued.key).unwrap();
+        assert_eq!(registry_pairs(&store2).len(), 1);
     }
 }

@@ -203,7 +203,7 @@ async fn dispatch(
     req: Request<Body>,
 ) -> Result<Response<Body>, AppError> {
     let started = Instant::now();
-    let (parts, body) = req.into_parts();
+    let (mut parts, body) = req.into_parts();
 
     // 1. 解析 ingress 协议. 合法简写清单从 Protocol::ALL 派生 (SSOT, 先例:
     //    web/api/providers.rs 同款投影), 新增协议无需同步此文案.
@@ -331,6 +331,12 @@ async fn dispatch(
              (cross-protocol translation)"
         );
     }
+    // 3.8 #320 SG 凭证自动保护: 在役 sg API token + 登记的 provider key 免配置纳入
+    //     出站保护. 字节层 (本函数 "请求 body 收集后" hook 点), 与 user-secret IR
+    //     机制正交 — 不改变下方路径选择判据 (SecretTable 是否为空), 对任意协议
+    //     (含 codec 未覆盖的 gemini/ollama) 与任意 body 形状一致生效, 永不阻塞
+    //     转发 (fail-open). 语义与接线点 SSOT 见 `src/protect.rs` 头部.
+    let req_bytes = auto_protect_request(&state, &mut parts, &provider, &upstream_id, req_bytes);
     let secrets_snapshot = state.secrets.effective_raw();
     // disabled secret 明文放行按请求 WARN (#161): 挂 dispatch 层 (raw bytes 扫描) 以
     // 覆盖透传快捷分支, 命中才告警. 挂载层级论证见 warn_disabled_secrets_in_body doc.
@@ -371,4 +377,72 @@ async fn dispatch(
         pool_watch,
     )
     .await
+}
+
+/// #320 SG 凭证自动保护 — dispatch 层收口 (body 收集后, 路径分叉前).
+///
+/// 两步:
+/// 1. **auth 关闭时**的机会性 key 注册: 客户端 Bearer 若 hash 命中已知 sg key →
+///    `ApiKeyStore::lookup` 内部注册明文 ("呈现 ⇒ 保护", 覆盖重启后动态 key 的
+///    明文恢复), 并**剥离该 Authorization header** — sg token 对任何上游 provider
+///    都不是合法凭证 (是本网关的自有凭证), 转发它没有任何正当用途; 命中才动
+///    header, 未命中 (BYO-key / 垃圾值) 原样保留 (keyless provider 的 BYO-key
+///    透传语义不受影响). auth 启用时 `require_api_key` middleware 已做同型
+///    剥离 + 注册, 此步跳过 (避免二次 hash).
+/// 2. **字节层替换**: 收集保护集 (sg 注册表 + provider 派生 key) 并在 body 上
+///    执行 real→mock 全量替换 (等长, FWD-1 唯一授权的修改类型). 命中时
+///    per-credential WARN (只含 id + 次数, SEC-2). 保护集为空 / body 无命中 /
+///    body 非 UTF-8 → 原样返回 (零拷贝, fail-open).
+///
+/// per-request 成本注记: `effective_raw` 快照 (P 个 provider 的 clone) + 选中
+/// provider 的 `effective_api_key` (api_key_file 形态多一次 page-cached 读,
+/// 与转发路径稍后的同型读成对) + K 次 `str::find` (K = 保护集大小, 典型 1-5) —
+/// 相对 JSON 解析 / LLM 往返均为噪声.
+fn auto_protect_request(
+    state: &AppState,
+    parts: &mut axum::http::request::Parts,
+    provider: &crate::provider::DirectProvider,
+    upstream_id: &str,
+    body: bytes::Bytes,
+) -> bytes::Bytes {
+    if !state.auth_enabled {
+        let bearer = parts
+            .headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "));
+        if let Some(key) = bearer
+            && state.api_keys.lookup(key).is_some()
+        {
+            parts.headers.remove(axum::http::header::AUTHORIZATION);
+            tracing::warn!(
+                "client Authorization carries a secret-guard API token; header stripped \
+                 (an sg token is never a valid upstream credential) (#320)"
+            );
+        }
+    }
+    let providers_snapshot = state.providers.effective_raw();
+    let creds = crate::protect::collect_credentials(
+        state.api_keys.protected_credentials(),
+        &providers_snapshot,
+        &provider.effective_api_key(upstream_id),
+        upstream_id,
+    );
+    if creds.is_empty() {
+        return body;
+    }
+    let (replaced, hits) = crate::protect::redact_request_body(&body, &creds);
+    for h in &hits {
+        tracing::warn!(
+            credential = %h.id,
+            occurrences = h.occurrences,
+            "auto-protected SG credential found in request body; replaced with mock (#320)"
+        );
+    }
+    match replaced {
+        Some(b) => b,
+        // None = 无命中 (最常见; 零拷贝原样) 或 body 非 UTF-8 (best-effort 跳过,
+        // 见 protect.rs 头注 — 二进制上传不在威胁模型内, 静默跳过).
+        None => body,
+    }
 }

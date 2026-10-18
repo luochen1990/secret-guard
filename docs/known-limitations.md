@@ -80,6 +80,27 @@
 - **告警 context 遮盖的同语义残余 (SEC-1, 2026-10-10)**: context 生成时登记值经 `MaskedLeaf` 先遮盖后取窗 (`[managed]` 占位), 三种形态不被覆盖: (i) 源文本含登记值的**截断片段** 与 (ii) 周期值的 tiling 残余 (v=`ab`×20 在 `ab`×25 叶中非重叠匹配后尾部周期前缀存活) — 与 redact 管道 `replace_all` 同语义, context 回显不差于 wire 侧; (iii) 登记值恰为 `[managed]` 占位符子串的病态配置 — context 侧独有 (wire 的 mock 按契约不含 secret 子串), 但占位符是公开常量, 出现不携带 secret 信息增量, 独立成立可接受.
 - **疑似值内嵌登记值时 value 列回显登记值子串 (理论 case)**: 疑似值 (pattern 命中) 整体含某登记值为子串时, 扫描侧精确等值排除不命中 (值不等), 告警 value 列按疑似值完整明文回显 (SEC-1 裁决允许疑似值) — 其中自然含登记值片段; context 字段则如实呈现占位符 (`ghp_[managed]tail` 形态, `src/privacy.rs` 测试 `context_presents_placeholder_inside_suspect_value`).
 
+## protect (SG 凭证自动保护, #320 / SEC-11)
+
+- **JSON `\uXXXX` 转义形态不命中**: 字节层替换按 UTF-8 字节匹配; SDK 把凭证转义成
+  `\u0073g_…` 形态时本层漏过 (user-secret 的 IR 层扫描可命中转义后形态 — 两层互补,
+  实际 SDK 对 ASCII 凭证不产生转义)。
+- **非 UTF-8 body 跳过**: 二进制上传体不在威胁模型内, fail-open 跳过。
+- **非选中 provider 的 `api_key_file` 不保护**: file-mode key 仅在 "本次请求选中该
+  provider" 时经 `effective_api_key` 现场解析入保护集 (零额外 IO 的边界 — 读全部
+  provider 的 key 文件会引入每请求多文件读)。内联 `api_key` 全集不受此限。
+- **重启后 disabled 动态 key 不保护 (直至 re-enable + 呈现)**: 注册表是内存态;
+  disabled key 不进 `hash_index`, `lookup` 呈现不命中。enabled 动态 key 重启后由首次
+  呈现恢复 ("呈现 ⇒ 保护"); 静态 key (含 disabled) 装载即注册。
+- **值短于 16 字符不保护 (地板)**: 宁漏保不误替换 (短串在普通文本中误命中会破坏
+  请求体); 真实 provider key / sg token 实际长度都 ≥20, 需保护短值可用
+  `[[secrets.entries]]` 显式登记。
+- **响应侧不还原 (设计决策, 非缺陷)**: sg token / provider key 无 "本地工具从 LLM
+  响应读回真值" 的正当用例; LLM echo 出的 mock 即稳定替身, 客户端看到 mock 是预期行为。
+- **record 的 redactions 列表不归因自动保护命中**: WebUI 请求详情中这些命中不出现在
+  redactions 面板 (body 中是 mock, 归因靠 WARN 日志 + secrets tab 内置保护徽章);
+  深度归因属后续增强。
+
 ## redact (Redact / Mock / 脱敏面)
 
 - **Mock probing 耗尽 (默认 fail-closed 拒绝转发, SEC-10)**: 弱配置 (charset/length 仅产生极少候选) + 对抗性 IR 可能让 `redact_ir` 的 mock probing 耗尽 (`MOCK_PROBE_LIMIT`). 两道前置防线: ① **Auto widen 兜底** (2026-09, `GenSpec::infer_default_for`): 推断 charset 候选空间 < 2^20 时逐级并入 lowercase → digits → uppercase — Auto 模式 resolve 后空间恒 ≥ 阈值 (退化 real 如全同字符 `""""` 也不再耗尽); 极短 real (n ≤ 3: 全开后 65³ ≈ 27 万仍 < 2^20) 是等长约束下的物理边界, 兜到全开即停 — 该形态 Auto resolve 后仍会触发 lint WARN; ② 配置写入时 (static 加载 / WebUI upsert) 对 GenSpec 候选空间做 lint WARN (`MockStrategy::lint_candidate_space`, 阈值 `MIN_CANDIDATE_SPACE_WARN` = 2^20, 低于即 WARN, 不拒绝) — widen 后 Auto 场景实际不触发, lint 的有效对象是**用户手动配置**的 gen_spec. 默认 `[redact] on_probe_exhausted = "fail_closed"` (**拒绝转发**, 返回 503, 防止 secret 泄露到 LLM provider, SEC-10 降级偏安全 — 2026-09 自 fail_open 翻转; 配置期 lint 已把弱配置拦截在写入时, 运行时残余正是对抗场景). 历史 fail-open 行为 (warn + 跳过该 secret 原样转发) 需显式配 `"fail_open"` opt-in. 注意 fail_closed 拒绝时返回的 503 body 不含 secret 明文 (变量部分只含 secret id + reason 枚举, 语义由 SEC-2 契约锁定).

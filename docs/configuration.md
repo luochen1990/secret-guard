@@ -188,8 +188,8 @@ egress 端点由 ingress 协议选定 — 精确匹配 → 同协议透传 (byte
 | `endpoints[].protocol` | string | (必填) | 该端点的上游协议: `openai` / `anthropic` / `gemini` / `ollama` / `openai-responses` (OpenAI Responses API)。 |
 | `endpoints[].base_url` | string | (必填) | 该端点的上游 base URL. 必须以 `http://` 或 `https://` 开头, **末尾不带 `/`** (路径由 secret-guard 拼接). 如 `https://api.openai.com`. |
 | `endpoints[].common_uri` | string | — | (per 端点) secret-guard **自建请求** (拉取上游模型清单, 用于 router `/models` 合成) 的公共 URI 前缀, 即三段式 `base_url + common_uri + request_uri` 的中段. **不影响转发** (转发路径随客户端请求原样透传). `"/v1"` = 裸根布局 (OpenAI/Anthropic 官方形态); `""` = 版本前缀已含 (智谱 GLM coding plan / DeepSeek / Moonshot 等, models 端点 = `base + /models`); 任意 `/` 开头的自定义前缀 (如智谱老接口 `/api/paas/v4`) 也合法. 缺省 = 未探测, 运行时按 `"/v1"` → `""` 顺序自动推导. 通常无需手写 — WebUI 端点行的 Detect 按钮探测后自动填充并随保存落盘 (badge 追加回显在该行 base_url 输入框后). 值域校验: `""` 或以 `/` 开头的 path 片段 (无尾斜杠, 不含 `?`/`#`/空格, ≤64 字符). **注意**: WebUI/API 的 PUT 对 `endpoints` 是**全量必填**语义 (缺失/空数组 → 400), 行内不带 `common_uri` (= null) 即清除为未探测; SDK 脚本编辑 provider 时请先读回原值再整体提交. |
-| `api_key` | string | `""` | 上游 API key 明文, **所有端点共享**. 与 `api_key_file` 互斥 (同时设置启动报错). ⚠️ **TOML 顺序陷阱**: 凭证字段属于条目级, 必须写在 `[[providers.endpoints]]` **之前** — TOML 的 `[[子表数组]]` 头会切换"当前表", 写在其后的键归属 endpoint 而非条目, 会被 unknown-field WARN 忽略 (凭证静默丢失, 上游 401). 详见双端点示例. |
-| `api_key_file` | path | — | 从文件读 API key (**所有端点共享**; 适合 sops-nix / systemd LoadCredential 等外部注入, 让 toml 本身不含敏感数据). 每次请求时读取, 读不到按空 key 处理并打 WARN. 文件内容自动去首尾空白. 顺序陷阱同 `api_key`. |
+| `api_key` | string | `""` | 上游 API key 明文, **所有端点共享**. 与 `api_key_file` 互斥 (同时设置启动报错). ⚠️ **TOML 顺序陷阱**: 凭证字段属于条目级, 必须写在 `[[providers.endpoints]]` **之前** — TOML 的 `[[子表数组]]` 头会切换"当前表", 写在其后的键归属 endpoint 而非条目, 会被 unknown-field WARN 忽略 (凭证静默丢失, 上游 401). 详见双端点示例. 内置保护 (SEC-11): 该值免配置自动纳入出站保护 — 出现在请求 body 中时被替换为等长 Mock, 无需另行登记为 secret (短于 16 字符的值除外). |
+| `api_key_file` | path | — | 从文件读 API key (**所有端点共享**; 适合 sops-nix / systemd LoadCredential 等外部注入, 让 toml 本身不含敏感数据). 每次请求时读取, 读不到按空 key 处理并打 WARN. 文件内容自动去首尾空白. 顺序陷阱同 `api_key`. 内置保护 (SEC-11) 同 `api_key`, 但仅覆盖 "本次请求选中该 provider" 的场景 (见 known-limitations "protect" 节). |
 
 双端点示例 — 智谱 GLM (同一凭证, `/o/zhipu` 与 `/a/zhipu` 两个入口各自同协议透传):
 
@@ -517,6 +517,8 @@ WebUI 保存) 会打 WARN 提示运行时探测可能耗尽 (此时由 `[redact]
 | `redirect_url` | string | 可选, 回调 URL. 只能换 scheme/host/port, path 固定为 `/oauth2/callback`. 监听地址非浏览器可达时 (如反代域名) 必须配置. |
 
 `[[auth.api_keys]]` 字段: `label` (唯一标识), `key` 或 `key_file` (二选一, 语义同上).
+静态 key 与 WebUI 签发的 `sg_*` token 一样受内置保护 (SEC-11): 免配置自动纳入出站
+保护 (粘贴进请求 body 即被替换为 Mock, 创建/装载/使用即时生效); 无需为此登记 secret.
 
 ```toml
 [auth]

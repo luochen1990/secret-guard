@@ -456,6 +456,14 @@ pub(crate) const PATTERNS: &[PatternDef] = &[
     },
 ];
 
+/// 值是否命中任一 pattern (组开关不参与 — 调用方语义是 "形状是否可被识别").
+/// 供 protect 模块 "mock 对 privacy 不可见" 前提的测试复用 (pattern 引擎端到端断言,
+/// 防 pattern 集未来加入通用形状规则时静默破坏 protect 的强制 Plain 前提).
+#[cfg(test)]
+pub(crate) fn matches_any_pattern(s: &str) -> bool {
+    PATTERNS.iter().any(|p| !(p.find)(s).is_empty())
+}
+
 // ─── 告警存储 ───────────────────────────────────────────────────────────────
 
 /// 告警处置状态 (R2 状态机, 见模块头「告警状态机」节; 序列化 wire = 小写串).

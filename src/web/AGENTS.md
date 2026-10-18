@@ -68,6 +68,9 @@ PUT    /api/secrets/{id}
 DELETE /api/secrets/{id}            → static 基线存在 (含 override) 一律 409 (#156);
                                        仅 dynamic-only 可删 (204)
 PATCH  /api/secrets/{id}/decision     body: {"mode": "default|prefer_static|disabled"}
+                                     注: GET 响应另含 builtin_protection (#320 内置
+                                     自动保护计数 {sg_tokens, provider_keys}, WebUI
+                                     secrets tab 徽章数据源; 仅计数, 无明文/mock)
 
 GET    /api/providers
 POST   /api/providers
