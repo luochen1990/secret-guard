@@ -73,7 +73,10 @@
 //!   (stream 档位 / 请求 model 提取 / usage 采集编排, 详见该文件头部).
 //! - `auth`: Provider 鉴权注入.
 //! - `models`: router GET /models 本地合成 + 上游清单缓存 (#196, FWD-7; 含
-//!   `ModelListCache` — AppState 聚合的纯数据 store, 经本模块根 re-export).
+//!   `ModelListCache` — AppState 聚合的纯数据 store, 经本模块根 re-export) +
+//!   base_url 先行的协议探测 (`probe_provider_upstream`).
+//! - `origin`: origin 先行的端点发现探测 (`probe_origin_upstream`, #332 — 与
+//!   models 的探测件同域复用, 拆分因 file-size 硬门禁).
 //! - `recorder`: DAG record 构造 + 视图守卫 + 响应累积器.
 //! - `same_proto`: 同协议转发 (字节透传 / IR redact).
 //! - `cross_proto`: 跨协议 codec 翻译.
@@ -84,6 +87,7 @@ mod cross_proto;
 mod fan_out;
 mod helpers;
 mod models;
+mod origin;
 mod recorder;
 mod same_proto;
 // derive_redactions (redactions 投影的 SSOT) 供 B1 等价性测试复用同一 join
@@ -115,6 +119,9 @@ pub use models::ModelListCache;
 pub(crate) use models::probe_provider_upstream;
 /// 模型清单预览 (WebUI endpoints 弹窗; 取数 SSOT 与 router /models 合成同乡).
 pub(crate) use models::provider_model_preview;
+// origin 发现探测端点 (web/api/providers, #332): 与 probe_provider_upstream 同族
+// 的行为借用 (依赖例外同上), 含归一化/extra_faces 解析两个纯函数.
+pub(crate) use origin::{normalize_origin, parse_extra_face, probe_origin_upstream};
 
 /// axum 路径参数: `/{proto}/{name}/{*rest}`.
 ///

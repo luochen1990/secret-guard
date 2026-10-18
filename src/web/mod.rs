@@ -19,6 +19,8 @@
 //!   `proxy::models`, 薄壳 handler 在 `api/providers.rs`).
 //! - `PUT/DELETE /api/providers/probe` —— 存量 id="probe" 条目的管理薄 wrapper
 //!   (静态段阴影 {id} 路由的 405 补齐, 见 `api::update_provider_probe`).
+//! - `POST /api/providers/probe-origin` —— origin 先行端点发现探测 (#332;
+//!   算法在 `proxy::origin`, 薄壳 handler 在 `api::providers.rs`).
 //! - `POST /api/providers/{id}/pool-reset` —— pool 条目成员闹钟清空
 //!   (两段路径与 `{id}/decision` 同型, 见 `api::pool_reset`).
 //! - `GET /api/providers/{id}/models` —— 模型清单预览 (endpoints 弹窗;
@@ -97,6 +99,14 @@ pub fn router() -> Router<AppState> {
             post(api::probe_provider)
                 .put(api::update_provider_probe)
                 .delete(api::delete_provider_probe),
+        )
+        // origin 先行端点发现探测 (#332): 静态段 "probe-origin" 同样阴影 {id}
+        // 的 PUT/DELETE — 新建该 id 在 upsert 校验层拒绝 (与 "probe" 同型),
+        // 端点与保留字同步上线故无需存量 wrapper. 算法在 proxy::origin
+        // (薄壳 handler, 见 api/providers.rs); 失败是数据不是 HTTP 错误 (恒 200).
+        .route(
+            "/api/providers/probe-origin",
+            post(api::probe_provider_origin),
         )
         .route(
             "/api/providers/{id}",

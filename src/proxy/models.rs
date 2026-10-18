@@ -721,8 +721,9 @@ async fn fetch_and_parse(
 
 /// GET 上游 + 有界累积 body, **整体**超时覆盖全程 (send → 状态行 → body 读毕).
 ///
-/// `fetch_model_list` (router /models 缓存填充) 与 `probe_provider_upstream`
-/// (协议探测) 的共享防御层: 停滞上游超时掐断 (防 fetch 永久持有缓存锁 / 探测
+/// `fetch_model_list` (router /models 缓存填充), `probe_provider_upstream`
+/// (协议探测) 与 `origin::probe_origin_upstream` (origin 发现探测的 GET 面) 的
+/// 共享防御层: 停滞上游超时掐断 (防 fetch 永久持有缓存锁 / 探测
 /// 挂起), 破损上游有界累积 (防撑爆内存, 见 MAX_MODELS_BODY), 错误串经
 /// `upstream_error_brief` 净化 (不含 key/secret). 成功返回 (status, body) —
 /// status 判定留给调用方 (缓存填充看 is_success, 探测要分 401/404 桶).
@@ -733,13 +734,32 @@ async fn fetch_and_parse(
 ///    "response body exceeds ..." 而非 "upstream returned NNN" — 仅日志面差异);
 /// ② 非 2xx 错误串统一为纯数字 code (`upstream returned 404`, 契约示例形态)
 ///    — 旧形态含 reason phrase。
-async fn fetch_status_and_body(
+pub(super) async fn fetch_status_and_body(
     client: &reqwest::Client,
     url: &str,
     headers: HeaderMap,
 ) -> Result<(StatusCode, Vec<u8>), String> {
+    send_bounded(client.get(url).headers(headers)).await
+}
+
+/// [`fetch_status_and_body`] 的 POST 变体 (origin 发现探测的 tier3 存在性主探测
+/// 专用, `src/proxy/origin.rs`): 同款防御 (整体超时 + 有界累积 + 错误串净化),
+/// 差异仅在 method 与 body. 调用方自备 content-type 等语义 header.
+pub(super) async fn post_status_and_body(
+    client: &reqwest::Client,
+    url: &str,
+    headers: HeaderMap,
+    body: &str,
+) -> Result<(StatusCode, Vec<u8>), String> {
+    send_bounded(client.post(url).headers(headers).body(body.to_string())).await
+}
+
+/// GET/POST 共用的 "send + 有界累积 + 整体超时" 核心 (两个入口的行为 SSOT,
+/// 错误串冻结: "request failed: {brief}" / "body read failed: {brief}" /
+/// "response body exceeds N bytes" / "timeout").
+async fn send_bounded(builder: reqwest::RequestBuilder) -> Result<(StatusCode, Vec<u8>), String> {
     let request = async {
-        let mut resp = client.get(url).headers(headers).send().await.map_err(|e| {
+        let mut resp = builder.send().await.map_err(|e| {
             format!(
                 "request failed: {}",
                 super::recorder::upstream_error_brief(&e)
@@ -770,21 +790,21 @@ async fn fetch_status_and_body(
 ///
 /// 薄包装: parse + 委托 [`parse_model_ids_from_value`] (单次解析双消费的
 /// 拆层, 见 `judge_v1_pair`).
-fn parse_model_ids(protocol: Protocol, body: &[u8]) -> Result<Vec<String>, String> {
+pub(super) fn parse_model_ids(protocol: Protocol, body: &[u8]) -> Result<Vec<String>, String> {
     parse_model_ids_from_value(protocol, &parse_json_value(body)?)
 }
 
 /// parse 层 SSOT: `from_slice` + 统一错误串 ("invalid JSON: {e}").
 /// `parse_model_ids` 与 `judge_v1_pair` 共用 — 错误串是 wire 可见的
 /// (`ProbeOutcome.detail`), 单一构造点防两侧漂移.
-fn parse_json_value(body: &[u8]) -> Result<serde_json::Value, String> {
+pub(super) fn parse_json_value(body: &[u8]) -> Result<serde_json::Value, String> {
     serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {e}"))
 }
 
 /// [`parse_model_ids`] 的纯逻辑层 (body 已 parse 为 Value; 调用方若还需对同一
 /// body 做其它 Value 级判别 — 如 `judge_v1_pair` 的家族判别 — 应 parse 一次
 /// 共用同一棵 Value 树, 而非各自 `from_slice` 双解析).
-fn parse_model_ids_from_value(
+pub(super) fn parse_model_ids_from_value(
     protocol: Protocol,
     value: &serde_json::Value,
 ) -> Result<Vec<String>, String> {
@@ -978,7 +998,7 @@ pub(crate) struct ProbeResponse {
 /// 上游缺失此 header 会 400, 对其他协议无害). api_key 为空 (含纯空白) 时全部
 /// auth header 跳过 (Ollama 等本地无 auth 场景); 含非法 header 字符时 warn 后
 /// 跳过该项 (同 `apply_provider_auth` 纪律: 永不 panic, 让上游自行拒绝).
-fn probe_headers(api_key: &str) -> HeaderMap {
+pub(super) fn probe_headers(api_key: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(
         "anthropic-version",
@@ -1010,7 +1030,8 @@ fn probe_headers(api_key: &str) -> HeaderMap {
 }
 
 /// /v1/models 的家族归属 (openai 与 anthropic 共用该端点, 靠 shape 判别字段分家).
-enum V1Family {
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum V1Family {
     OpenAI,
     Anthropic,
 }
@@ -1025,7 +1046,7 @@ enum V1Family {
 /// 见 `judge_v1_pair`); 缺 `data` 数组 / 非 array 形态 → OpenAI (ROB-*).
 ///
 /// 假设: 判别只看字段名存在性, 不看字段值.
-fn classify_v1_family(value: &serde_json::Value) -> V1Family {
+pub(super) fn classify_v1_family(value: &serde_json::Value) -> V1Family {
     let Some(entries) = value.get("data").and_then(|d| d.as_array()) else {
         return V1Family::OpenAI;
     };
@@ -1054,7 +1075,7 @@ fn status_probe_bucket(status: StatusCode) -> ProbeStatus {
 
 /// detail 文案: 只含数字 status code (契约示例形态 "upstream returned 401"),
 /// 不含 reason phrase (无信息量且冗长).
-fn status_detail(status: StatusCode) -> String {
+pub(super) fn status_detail(status: StatusCode) -> String {
     format!("upstream returned {}", status.as_u16())
 }
 

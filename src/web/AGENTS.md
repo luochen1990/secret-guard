@@ -17,6 +17,10 @@
     探测算法 SSOT 在 `proxy::models::probe_provider_upstream` (与上游模型清单 fetch 同乡);
     以及 `PUT/DELETE /providers/probe` — 存量 id="probe" 条目的管理薄 wrapper
     (固定 id 适配到 update/delete flow, 静态路由 405 阴影的补齐);
+    以及 `POST /providers/probe-origin` (#332 origin 先行端点发现): origin 校验 +
+    归一化 (`proxy::normalize_origin` 剥离尾部已知面段) + extra_faces best-effort
+    解析 (`proxy::parse_extra_face`) 后的薄壳, 探测矩阵/证据梯 SSOT 在
+    `proxy::origin::probe_origin_upstream` (responses 行镜像 openai, 无独立探测);
     以及 `GET /providers/{id}/models` (模型清单预览, endpoints 弹窗的 Models 按钮):
     存在性校验后的薄壳, 取数算法 SSOT 在 `proxy::models::provider_model_preview`
     (Router 走 advertised_names 本地合成 / Direct+Pool 走 resolve_route + 上游现场 fetch).
@@ -88,11 +92,22 @@ POST   /api/providers/probe          body: {base_url, api_key?} →
                                           common_uri = recommended 族的布局断言
                                           ("/v1"|"" — detect 知识, 保存落盘为
                                           Endpoint.common_uri)
+POST   /api/providers/probe-origin   body: {origin, api_key?, extra_faces?[{uri,protocol}]} →
+                                         {origin (归一化后), typed_face_stripped?,
+                                          faces[5] (openai/anthropic/gemini/ollama/responses,
+                                          status: ok|absent|error, uri?, base_url?,
+                                          evidence: models|auth|existence?, models?, detail?)}
+                                         (#332 origin 先行端点发现; 失败是数据恒 200,
+                                          仅非法 origin (validate_base_url + query/fragment
+                                          拒绝) → 400; origin 尾部已知面段剥离进
+                                          typed_face_stripped; responses 行镜像 openai;
+                                          证据梯与对照探测见 proxy::origin 头注释)
 PUT    /api/providers/probe          → 同 PUT /api/providers/{id}, 固定 id="probe"
 DELETE /api/providers/probe          → 同 DELETE /api/providers/{id}, 固定 id="probe"
                                           (静态段优先于 {id} 参数段, 该 id 的编辑/删除只能
                                            经此进 — 补齐前存量 "probe" 条目 405 不可管理;
-                                           新建该 id 仍被拒绝, 纯防混淆)
+                                           新建该 id 仍被拒绝, 纯防混淆; "probe-origin"
+                                           同型保留, 端点与保留字同步上线故无存量 wrapper)
 POST   /api/providers/{id}/pool-reset → {id, reset} — 清空该 pool 全部成员闹钟
                                           (非 pool 条目 400 / 不存在含 decision-Disabled 404;
                                            只动运行时内存态, 不触碰配置)

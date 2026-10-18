@@ -94,7 +94,7 @@ forward 路由 (`/{proto}/{name}/...`) 首段必须是 proto 简写, 由
 | `/api/sync` | WebUI 刷新统一入口 (sidebar + timeline diff; 消费节奏 = SSE 事件驱动 + 兜底轮询, 见 `/api/events`) |
 | `/api/events` | SSE 失效通知流 (DAG 变更计数 poke; 事件仅作 invalidation 信号, 数据以 `/api/sync` 为 SSOT — 契约 UI-8) |
 | `/api/secrets` [+ `/{id}` [+ `/decision`]] | secret CRUD + OverrideMode |
-| `/api/providers` [+ `/{id}` [+ `/decision`]] + `/probe` | provider CRUD + OverrideMode + 协议自动探测 (静态段优先于 `{id}`: POST = 探测; PUT/DELETE `/probe` = 以固定 id="probe" 适配的编辑/删除薄 wrapper, 存量 "probe" 条目由此可管理 — 新建该 id 仍在 upsert 校验层拒绝, 纯防混淆) |
+| `/api/providers` [+ `/{id}` [+ `/decision`]] + `/probe` + `/probe-origin` | provider CRUD + OverrideMode + 协议自动探测 (静态段优先于 `{id}`: POST `/probe` = 探测; PUT/DELETE `/probe` = 以固定 id="probe" 适配的编辑/删除薄 wrapper, 存量 "probe" 条目由此可管理 — 新建该 id 仍在 upsert 校验层拒绝, 纯防混淆) + origin 先行端点发现探测 (#332, POST `/probe-origin` = 探测, 失败是数据恒 200; id "probe-origin" 同型保留字 — 端点与保留字同步上线, 无存量条目故无 PUT/DELETE wrapper) |
 | `/api/providers/{id}/pool-reset` | pool 条目成员闹钟清空 (POST; 两段路径与 `{id}/decision` 同型, 无单段阴影) |
 | `/api/providers/{id}/models` | 模型清单预览 (GET; endpoints 弹窗的 Models 按钮 — Router 本地合成 / Direct+Pool 上游现场 fetch, 失败是数据恒 200; 取数算法与转发路径 /models 同乡 `proxy::models`) |
 | `/api/api-keys` [+ `/{id}` [+ `/toggle`]] | API key CRUD |

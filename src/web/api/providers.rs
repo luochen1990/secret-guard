@@ -1,6 +1,8 @@
 //! providers CRUD: `GET/POST/PUT/DELETE /providers[/{id}]` + `PATCH /{id}/decision`
 //! + `POST /providers/probe` (协议自动探测) + `PUT/DELETE /providers/probe`
 //!   (存量 id="probe" 条目的管理薄 wrapper, 见 [`update_provider_probe`])
+//! + `POST /providers/probe-origin` (origin 先行端点发现探测, #332, 见
+//!   [`probe_provider_origin`])
 //! + `POST /providers/{id}/pool-reset` (套餐池成员闹钟清空)
 //! + `GET /providers/{id}/models` (模型清单预览, endpoints 弹窗的 Models 按钮).
 //!
@@ -93,6 +95,10 @@ pub async fn list_providers(State(state): State<AppState>) -> impl IntoResponse 
     )
 }
 
+/// 新建保留字 id (SSOT): 与本文件静态探测端点共用 URL 前缀的 id, 新建被拒
+/// (纯防混淆; 语义详注见 create_provider 的校验闭包注释). 增加保留字只改此处.
+const RESERVED_PROVIDER_IDS: [&str; 2] = ["probe", "probe-origin"];
+
 pub async fn create_provider(
     State(state): State<AppState>,
     Json(payload): Json<UpsertProviderRequest>,
@@ -105,16 +111,19 @@ pub async fn create_provider(
         // Provider::validate 拒绝, 这里覆盖跨条目环; 悬空目标放行 — 创建顺序
         // 无关, 运行时 503 兜底).
         //
-        // id="probe" 保留字 (**仅挡新建**, 纯防混淆): 该 id 与探测端点共用
+        // id 保留字 (**仅挡新建**, 纯防混淆): 该 id 与探测端点共用
         // /api/providers/probe — PUT/DELETE 该 URL 的语义是 "管理同名条目",
         // 新建会让 "探测" 与 "编辑" 挤在同一 URL 上, 拒绝以免混淆. 存量条目
         // (保留字校验上线前创建 / 手写 toml) 不受影响: 经该端点补齐的
-        // PUT/DELETE wrapper (update_provider_probe) 完全可管理.
+        // PUT/DELETE wrapper (update_provider_probe) 完全可管理. "probe-origin"
+        // 同型 (#332): /api/providers/probe-origin 静态段阴影 PUT/DELETE
+        // /api/providers/{id}, 且无存量条目 (端点与保留字同步上线).
         |entry| {
-            if entry.id == "probe" {
-                return Err(ApiError::validation(
-                    "provider id 'probe' is reserved (conflicts with the /api/providers/probe endpoint)",
-                ));
+            if RESERVED_PROVIDER_IDS.contains(&entry.id.as_str()) {
+                return Err(ApiError::validation(format!(
+                    "provider id '{}' is reserved (conflicts with the /api/providers/{} endpoint)",
+                    entry.id, entry.id
+                )));
             }
             validate_provider_upsert(&state.providers, entry)
         },
@@ -345,6 +354,59 @@ pub(crate) struct ProbeRequest {
     /// 可选 api_key (空串 = 无 auth 探测, Ollama 等本地场景; serde default).
     #[serde(default)]
     pub api_key: String,
+}
+
+/// `POST /api/providers/probe-origin` 的请求 body (issue #332 origin 先行发现).
+#[derive(Debug, Deserialize)]
+pub(crate) struct OriginProbeRequest {
+    /// 用户输入的 origin URL (可含尾部已知面段, 归一化剥离; 规则同
+    /// `validate_base_url` + `proxy::normalize_origin`).
+    pub origin: String,
+    /// 可选 api_key (空串 = 无 auth 探测, Ollama 等本地场景; serde default).
+    #[serde(default)]
+    pub api_key: String,
+    /// 前端预置知识库的已知面 (origin 精确命中厂商时); 条目校验失败逐条丢弃
+    /// 不报错 (best-effort, ROB — 见 `proxy::parse_extra_face`).
+    #[serde(default)]
+    pub extra_faces: Vec<OriginExtraFace>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct OriginExtraFace {
+    pub uri: String,
+    /// `Protocol` serde 枚举名 + `"responses"` 别名 (与响应 faces 行 wire 名对齐).
+    pub protocol: String,
+}
+
+/// `POST /api/providers/probe-origin`: 对任意 origin 并行探测各协议族的面 URI,
+/// 返回发现矩阵 (薄壳 — 算法 SSOT 在 `crate::proxy::origin`).
+///
+/// 校验序: ① 原始 origin 先过 [`crate::provider::validate_base_url`] (归一化
+/// **前**, 与 provider 配置同规则) → 400; ② `normalize_origin` (query/fragment
+/// 拒绝 + 已知面尾段剥离) → 400; ③ extra_faces 逐条 best-effort 解析 (失败丢弃).
+/// 探测失败是**数据不是 HTTP 错误**: 恒 200 (失败落在 status=error 行), 响应
+/// 不含 api_key (detail 经 `upstream_error_brief` 净化).
+pub async fn probe_provider_origin(
+    State(state): State<AppState>,
+    Json(payload): Json<OriginProbeRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    crate::provider::validate_base_url(&payload.origin).map_err(ApiError::validation)?;
+    let (origin, typed_face_stripped) =
+        crate::proxy::normalize_origin(&payload.origin).map_err(ApiError::validation)?;
+    let extra_faces: Vec<(Protocol, String)> = payload
+        .extra_faces
+        .iter()
+        .filter_map(|f| crate::proxy::parse_extra_face(&f.protocol, &f.uri))
+        .collect();
+    let response = crate::proxy::probe_origin_upstream(
+        &state.upstream,
+        &origin,
+        typed_face_stripped,
+        &payload.api_key,
+        &extra_faces,
+    )
+    .await;
+    Ok((StatusCode::OK, NO_STORE, Json(response)))
 }
 
 /// `POST /api/providers/probe`: 对任意 base_url 探测 4 族协议端点 (薄壳 —

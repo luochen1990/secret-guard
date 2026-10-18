@@ -6127,6 +6127,156 @@ async fn providers_probe_api_all_failures_still_200() {
     assert!(body["note"].is_null());
 }
 
+// ─── providers probe-origin API (POST /api/providers/probe-origin, #332) ──
+
+/// 非法 origin → 400: validate_base_url 同规则 (无 scheme / 非 http(s) / 尾部 '/')
+/// + 归一化层的 query/fragment 拒绝 (origin 是面根定位符).
+#[tokio::test]
+async fn providers_probe_origin_api_rejects_invalid_origin() {
+    let upstream = spawn_mock_upstream().await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
+    let client = reqwest::Client::new();
+    for bad in [
+        "not-a-url",
+        "ftp://x",
+        "http://x/",
+        "https://h?x=1",
+        "https://h/p#f",
+    ] {
+        let resp = client
+            .post(format!("{proxy_url}/api/providers/probe-origin"))
+            .json(&serde_json::json!({ "origin": bad, "api_key": "" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "origin {bad:?} must be rejected"
+        );
+    }
+}
+
+/// 端到端 (MiMo 形状, #332 回归钉的 API 面): openai 面 /v1/models 200;
+/// anthropic 面 tier3 存在性 (POST 400 + 对照 404) → ok/existence; responses
+/// 镜像; 响应体不含 api_key (SEC).
+#[tokio::test]
+async fn providers_probe_origin_api_end_to_end_mimo() {
+    let mut upstream = spawn_mock_upstream().await;
+    upstream
+        .mock("GET", "/v1/models")
+        .with_status(200)
+        .with_body(r#"{"object":"list","data":[{"id":"mimo-1","object":"model"}]}"#)
+        .expect(1)
+        .create_async()
+        .await;
+    for path in [
+        "/models",
+        "/anthropic/v1/models",
+        "/v1beta/models",
+        "/api/tags",
+    ] {
+        upstream
+            .mock("GET", path)
+            .with_status(404)
+            .create_async()
+            .await;
+    }
+    upstream
+        .mock("POST", "/anthropic/v1/messages")
+        .match_header("content-type", "application/json")
+        .with_status(400)
+        .expect(1)
+        .create_async()
+        .await;
+    upstream
+        .mock(
+            "GET",
+            mockito::Matcher::Regex(r"^/anthropic/v1/__sg_nonexistent__[0-9a-f]{8}__$".to_string()),
+        )
+        .with_status(404)
+        .expect(1)
+        .create_async()
+        .await;
+    upstream
+        .mock("POST", "/v1beta/models:generateContent")
+        .with_status(404)
+        .create_async()
+        .await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
+    let api_key = "sk-origin-integration-leaky";
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/api/providers/probe-origin"))
+        .json(&serde_json::json!({ "origin": upstream.url(), "api_key": api_key }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let raw = resp.text().await.unwrap();
+    assert!(
+        !raw.contains(api_key),
+        "probe-origin response must not leak api_key: {raw}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(body["origin"], upstream.url());
+    assert!(body["typed_face_stripped"].is_null());
+    let names: Vec<&str> = body["faces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["protocol"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        ["openai", "anthropic", "gemini", "ollama", "responses"]
+    );
+    let oa = &body["faces"][0];
+    assert_eq!(oa["status"], "ok");
+    assert_eq!(oa["evidence"], "models");
+    assert_eq!(oa["uri"], "/v1");
+    assert_eq!(oa["base_url"], format!("{}/v1", upstream.url()));
+    assert_eq!(oa["models"][0], "mimo-1");
+    assert!(oa["detail"].is_null());
+    let an = &body["faces"][1];
+    assert_eq!(an["status"], "ok");
+    assert_eq!(an["evidence"], "existence");
+    assert_eq!(an["uri"], "/anthropic");
+    assert_eq!(
+        an["detail"],
+        "路由存在 (POST /anthropic/v1/messages → 400; 对照路径 404)"
+    );
+    assert_eq!(body["faces"][2]["status"], "absent");
+    assert_eq!(body["faces"][3]["status"], "absent");
+    let r = &body["faces"][4];
+    assert_eq!(r["status"], "ok");
+    assert_eq!(r["uri"], "/v1");
+    assert_eq!(r["models"][0], "mimo-1");
+    assert_eq!(r["detail"], "与 OpenAI 共用 /v1, 探测无法区分");
+}
+
+/// id 保留字: "probe-origin" 阴影 PUT/DELETE /api/providers/{id} (静态段优先),
+/// 创建时必须拒绝 (与 "probe" 同型, 端点与保留字同步上线).
+#[tokio::test]
+async fn providers_api_rejects_probe_origin_reserved_id() {
+    let upstream = spawn_mock_upstream().await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/api/providers"))
+        .json(&serde_json::json!({
+            "id": "probe-origin",
+            "endpoints": [ { "protocol": "openai", "base_url": upstream.url() } ],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("reserved"),
+        "rejection must come from the reserved-id rule: {body}"
+    );
+}
+
 /// 路由补齐 (PUT/DELETE /api/providers/probe): 存量 id="probe" 条目可编辑可删除.
 ///
 /// 存量条目在 AppState 构造期直插 (dynamic 层, 绕过 API — 模拟保留字校验上线
