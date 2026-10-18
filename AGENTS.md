@@ -651,12 +651,18 @@ windows/darwin。
 单点读取 — 归档名与 tag 的对齐由这条链路保证):
 
 1. bump `Cargo.toml` version → commit → merge master;
-2. `git tag v<ver>` (必须与 Cargo.toml version 相等 — 归档名 = tag 是命名契约);
+2. `git tag v<ver>` (必须与 Cargo.toml version 相等 — 归档名 = tag 是命名契约;
+   且必须切自 master — release workflow 含 tag commit 在 master 历史上的
+   ancestry 校验, 从 feature 分支 tip 打 tag 直推发布会被 fail-fast 拦截);
 3. `git push origin <branch+tag>` **再** `git push github <branch+tag>` —
    forgejo 侧不解析 `.github/workflows` (实例只认 `.forgejo/workflows/`,
    2026-09 实证, 见 workflow 头注), 双宿顺序仅保证 forgejo 先收不动作;
-4. GitHub Actions 自动构建发布; 提醒: website 仓 `src/data/downloads.ts` 的
-   版本/归档清单同步更新。
+4. GitHub Actions 自动构建, release 以 **draft** 创建 (D5 决策, 2026-10) →
+   维护者补写 release notes → 手动 publish 才公开; 提醒: website 仓
+   `src/data/downloads.ts` 的版本/归档清单同步更新;
+5. 发布完成后立即在 master 将 `Cargo.toml` version bump 到下一版本的 `-dev`
+   后缀 (如 v0.2.0 发布后 → `0.3.0-dev`) 并合入, 保证源码构建自报版本可辨识
+   (归档用户 vs 源码用户, 决策 D3)。
 
 ## 已知限制 (MVP)
 
