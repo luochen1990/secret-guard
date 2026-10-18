@@ -8,6 +8,8 @@
 //! - [`push_event_and_wire_usage`]: 同三路径共用的 "push DAG + usage 接线" 前置
 //!   (USAGE-7 请求侧).
 //! - [`record_upstream_failure`]: 错误路径的 incomplete 记录写入.
+//! - [`log_forward_summary`] / [`format_retry_headers`]: 转发完成 INFO 摘要行
+//!   (#160) 与其非 2xx 的 retry 白名单头投影 (#333).
 //! - [`derive_redactions`] / [`parse_request_ir`] / [`redact_and_derive`]: IR 解析
 //!   与 redact 派生 (same_proto / cross_proto 共享的前半段).
 //! - [`RecordAccumulator`]: fan_out 三路径共享的响应字节累积器 (受
@@ -474,12 +476,16 @@ pub(super) fn warn_if_protocol_mismatch(
 ///
 /// 形如 `forward method=POST path=/o/p1/v1/chat/completions status=200
 /// elapsed_ms=123 redactions=1 provider=p1 streamed=false complete=true`.
+/// 非 2xx 响应额外携带 `retry_headers=Some("x-should-retry=false,retry-after=60")`
+/// (#333, 见 [`format_retry_headers`]; 2xx 恒 `retry_headers=None`, 与
+/// `error=None` 同型 — 摘要行字段集稳定, 便于机械解析).
 /// 字段全部从 DAG node 派生 (经 [`ConversationDag::forward_summary_fields`],
 /// 只读标量不 clone parsed view — 该路径每请求执行一次, 必须轻量).
 /// provider id 从 path 第二段解析 (`/{proto}/{provider}/...`, 与 ForwardPath
 /// 同构; cross_proto 的 path 带尾部 " [a → b]" 注释, 落在后续段不影响 nth(2)).
 ///
-/// 安全: 字段均来自路由/元数据, 永不含 secret 值 (redactions 只记条数).
+/// 安全: 字段均来自路由/元数据, 永不含 secret 值 (redactions 只记条数;
+/// retry_headers 只投影白名单头, 值经控制符净化, 见 [`format_retry_headers`]).
 ///
 /// 调用点 (record 终态 choke points): fanout_stream_task (两条流式路径) /
 /// fan_out_buffered_ir / cross_proto 正常收尾 / record_upstream_failure
@@ -487,11 +493,14 @@ pub(super) fn warn_if_protocol_mismatch(
 ///
 /// 流式请求在流结束 (attach_response 最终态) 时打, 而非响应头到达时 —
 /// 保证 elapsed_ms 覆盖完整流时长, 且 record 尚未落盘的错误能带上.
+/// 流中途死亡 (client disconnect / upstream stream error) 同样到达此点:
+/// 响应头在流开始时已捕获进 ResponseData, retry 证据不丢 (#333 诉求).
 pub(super) fn log_forward_summary(dag: &ConversationDag, record_id: Uuid) {
     let Some(f) = dag.forward_summary_fields(record_id) else {
         return;
     };
     let provider = f.path.split('/').nth(2).unwrap_or("?");
+    let retry_headers = format_retry_headers(&f.non_success_resp_headers);
     info!(
         %record_id,
         method = %f.method,
@@ -503,8 +512,60 @@ pub(super) fn log_forward_summary(dag: &ConversationDag, record_id: Uuid) {
         streamed = f.streamed,
         complete = f.resp_complete,
         error = ?f.error,
+        retry_headers = ?retry_headers,
         "forward"
     );
+}
+
+// ─── #333: 非 2xx 摘要行的 retry 白名单头投影 ───────────────────────────────
+
+/// #333: retry 语义相关的响应头白名单 — 非 2xx 摘要行的 `retry_headers` 字段
+/// 只投影这些头. 背景: opencode 等客户端按 `x-should-retry` 决定是否重试但不
+/// 持久化响应头, secret-guard 作为透明代理是唯一低成本观测点. 刻意最小白名单
+/// (不做全量透传日志, 防日志膨胀); 输出按本表顺序 (确定序, 与上游头顺序解耦).
+///
+/// 名单边界: 这是**记录**名单, 与脱敏名单 (`[redact] redacted_headers` ∪
+/// `helpers::is_sensitive_header` 黑名单) 语义相反、独立维护、不复用同一张表.
+/// retry 头不在脱敏黑名单内 (已核实), 值本身非敏感; 用户显式把 retry 头配进
+/// 脱敏名单时, 存储值为 `<redacted>`, 本投影照抄存储 — 以脱敏为准.
+const RETRY_LOG_HEADERS: &[&str] = &["x-should-retry", "retry-after", "retry-after-ms"];
+
+/// `retry_headers` 字段的字节上限 (防洪水: 异常超长头值不撑爆摘要行).
+const RETRY_LOG_HEADERS_MAX_BYTES: usize = 256;
+
+/// 把 (非 2xx 的已脱敏) 响应头投影为摘要日志的 `retry_headers` 字段值 (#333).
+///
+/// 形如 `x-should-retry=false,retry-after=60`; 同名多值用 `|` 拼接;
+/// 无任何白名单头命中 → `None`. 匹配对头名大小写容错 (存储侧 HeaderName 恒
+/// 小写, 防御深度). 净化 (防日志注入): 控制字符 (含 `\r\n`) 替换为空格, 再按
+/// 字节截断 (char boundary 安全, ROB-1 — 复用 util 截断族), 截断以 `…` 可见.
+fn format_retry_headers(headers: &[(String, String)]) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    for name in RETRY_LOG_HEADERS {
+        let values: Vec<&str> = headers
+            .iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+            .collect();
+        if !values.is_empty() {
+            parts.push(format!("{name}={}", values.join("|")));
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let sanitized: String = parts
+        .join(",")
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let truncated =
+        crate::util::truncate_str_on_char_boundary(&sanitized, RETRY_LOG_HEADERS_MAX_BYTES);
+    Some(if truncated.len() < sanitized.len() {
+        format!("{truncated}…")
+    } else {
+        truncated.to_string()
+    })
 }
 
 /// 发送上游请求, 可选地对"响应头到达"加超时保护. 失败时记录到 DAG 并返回 AppError.
@@ -1228,6 +1289,99 @@ mod tests {
         assert!(
             !actual.iter().any(|(m, _)| m.contains("NOHIT")),
             "unmatched real must not project"
+        );
+    }
+
+    // ─── #333: format_retry_headers (白名单投影 + 多值 + 净化 + 截断) ──────────
+    //
+    // 契约 (issue #333): 非 2xx 上游响应的 forward 摘要行携带 retry 白名单头
+    // (opencode 等客户端按 x-should-retry 决定重试但不持久化响应头, 网关摘要行
+    // 是事后可 grep 的唯一留证). 单测锁定纯函数的四个维度: 白名单选取/序、多值
+    // 拼接、控制符净化 (防日志注入)、字节截断 (防洪水). 端到端 (日志行) 由
+    // integration 的 #333 测试锁定; 2xx 门控由 dag 层单测锁定.
+
+    #[test]
+    fn format_retry_headers_picks_whitelist_in_whitelist_order() {
+        let headers = vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            ("retry-after".to_string(), "60".to_string()),
+            ("x-should-retry".to_string(), "false".to_string()),
+        ];
+        // 输出按白名单序 (x-should-retry 在前), 与输入顺序解耦; 非白名单头不进.
+        assert_eq!(
+            format_retry_headers(&headers).as_deref(),
+            Some("x-should-retry=false,retry-after=60")
+        );
+    }
+
+    #[test]
+    fn format_retry_headers_multi_value_joins_with_pipe() {
+        // 同名多值 (HeaderMap 迭代每值一条): 用 '|' 拼接, 与 pair 间分隔符 ',' 区分.
+        let headers = vec![
+            ("retry-after".to_string(), "60".to_string()),
+            ("retry-after".to_string(), "30".to_string()),
+        ];
+        assert_eq!(
+            format_retry_headers(&headers).as_deref(),
+            Some("retry-after=60|30")
+        );
+    }
+
+    #[test]
+    fn format_retry_headers_absent_whitelist_returns_none() {
+        // 缺头: 无任何白名单头命中 → None (摘要行的 retry_headers=None, 照常打).
+        assert_eq!(format_retry_headers(&[]), None);
+        let headers = vec![("content-type".to_string(), "application/json".to_string())];
+        assert_eq!(format_retry_headers(&headers), None);
+    }
+
+    #[test]
+    fn format_retry_headers_sanitizes_control_chars() {
+        // 防日志注入: 头值中的控制字符 (含 \r\n \t) 替换为空格 — 即便上游/中间层
+        // 放行了带换行的头值, 摘要行也保持单行.
+        let headers = vec![
+            ("retry-after".to_string(), "60\r\ninjected: yes".to_string()),
+            ("x-should-retry".to_string(), "fa\tlse".to_string()),
+        ];
+        let out = format_retry_headers(&headers).expect("whitelisted headers present");
+        assert!(
+            !out.chars().any(|c| c.is_control()),
+            "output must carry no control chars: {out:?}"
+        );
+        // 每个控制字符替换为一个空格 ("\r\n" → 两个空格), 内容本身保留.
+        assert!(
+            out.contains("fa lse") && out.contains("60  injected: yes"),
+            "control chars replaced with space: {out:?}"
+        );
+    }
+
+    #[test]
+    fn format_retry_headers_truncates_on_byte_cap() {
+        // 防洪水: 超长头值按字节截断 (char boundary 安全, ROB-1) + 省略号可见.
+        let long = "a".repeat(RETRY_LOG_HEADERS_MAX_BYTES * 2);
+        let out = format_retry_headers(&[("retry-after".to_string(), long)])
+            .expect("whitelisted header present");
+        assert!(
+            out.len() <= RETRY_LOG_HEADERS_MAX_BYTES + "…".len(),
+            "truncated output must stay within cap + ellipsis: {} bytes",
+            out.len()
+        );
+        assert!(out.ends_with('…'), "truncation must be visible: {out:?}");
+        // 多字节值: 截断点 floor 到 char boundary, 不 panic (ROB-1).
+        let wide = "中".repeat(200); // 600 bytes
+        let out = format_retry_headers(&[("retry-after".to_string(), wide)])
+            .expect("whitelisted header present");
+        assert!(out.len() <= RETRY_LOG_HEADERS_MAX_BYTES + "…".len());
+    }
+
+    #[test]
+    fn format_retry_headers_matches_name_case_insensitively() {
+        // 存储侧 HeaderName 恒小写 (redact_headers 不变量), 匹配容错大写形态 —
+        // 存储不变量若变, 不静默丢头.
+        let headers = vec![("Retry-After".to_string(), "60".to_string())];
+        assert_eq!(
+            format_retry_headers(&headers).as_deref(),
+            Some("retry-after=60")
         );
     }
 

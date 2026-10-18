@@ -183,13 +183,21 @@ pub struct ForwardSummary {
     pub resp_complete: bool,
     pub error: Option<String>,
     pub redactions: usize,
+    /// 非 2xx 响应的 (已脱敏) 响应头快照; 2xx / 无响应 = 空 vec.
+    ///
+    /// 门控留在 dag 层是通用规则 ("错误响应需要更多诊断数据"), 不含任何具体
+    /// header 名知识 — 具体头的选取/格式化属 proxy 观测层 (eg #333 的 retry
+    /// 头白名单投影, 见 `proxy::recorder::format_retry_headers`). 2xx 正常流量
+    /// 零 clone 零开销 (#333 约束 ①).
+    pub non_success_resp_headers: Vec<(String, String)>,
 }
 
 impl ConversationDag {
     /// 读取摘要日志所需的标量字段 (轻量版 `get_node`, 不构造完整 NodeView).
     ///
     /// 与 `get_node` 的分工: `get_node` 服务 WebUI (需要全部字段含 parsed);
-    /// 本方法服务转发完成时的 INFO 摘要 (热路径, 只需 8 个标量).
+    /// 本方法服务转发完成时的 INFO 摘要 (热路径, 只取摘要日志需要的轻量字段;
+    /// 2xx 请求不 clone 响应头).
     pub fn forward_summary_fields(&self, node_id: Uuid) -> Option<ForwardSummary> {
         let g = self.inner.read();
         let node = g.nodes.get(&node_id)?;
@@ -203,6 +211,13 @@ impl ConversationDag {
             resp_complete: resp.as_ref().map(|r| r.resp_complete).unwrap_or(false),
             error: resp.as_ref().and_then(|r| r.error.clone()),
             redactions: node.event.redactions.len(),
+            // 非 2xx (3xx/4xx/5xx) 才携带响应头 (#333): Retry-After 语义在 3xx
+            // 同样存在, 门控取 "非 2xx" 而非 issue 字面的 "非 200"; 2xx 正常
+            // 流量零 clone (约束 ①). status=0 (无响应) 时 resp_headers 本就空.
+            non_success_resp_headers: match resp.as_ref() {
+                Some(r) if !(200..=299).contains(&r.resp_status) => r.resp_headers.clone(),
+                _ => Vec::new(),
+            },
         })
     }
 

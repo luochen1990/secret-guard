@@ -1659,6 +1659,48 @@ mod tests {
     }
 
     #[test]
+    fn forward_summary_fields_carries_headers_only_for_non_2xx() {
+        // #333 门控: 非 2xx (429/5xx/3xx) 的摘要视图携带已脱敏响应头 (供摘要日志
+        // 的诊断字段消费, 格式化在 proxy recorder 侧), 2xx 正常流量留空 (零 clone
+        // 零开销). 端到端 (日志行含 retry_headers) 由 integration #333 测试锁定.
+        let dag = ConversationDag::new(8, 500, 1);
+        let ok = dag.push_messages(vec![text_msg(IrRole::User, "u")], dummy_event());
+        let bad = dag.push_messages(vec![text_msg(IrRole::User, "u")], dummy_event());
+        dag.attach_response(
+            ok,
+            ResponseData {
+                resp_status: 200,
+                resp_headers: vec![("x-trace".into(), "abc".into())],
+                ..Default::default()
+            },
+        );
+        dag.attach_response(
+            bad,
+            ResponseData {
+                resp_status: 429,
+                resp_headers: vec![
+                    ("x-should-retry".into(), "false".into()),
+                    ("retry-after".into(), "60".into()),
+                ],
+                ..Default::default()
+            },
+        );
+        let f_ok = dag.forward_summary_fields(ok).expect("node exists");
+        assert_eq!(f_ok.resp_status, 200);
+        assert!(
+            f_ok.non_success_resp_headers.is_empty(),
+            "2xx must not carry headers"
+        );
+        let f_bad = dag.forward_summary_fields(bad).expect("node exists");
+        assert_eq!(f_bad.resp_status, 429);
+        assert_eq!(
+            f_bad.non_success_resp_headers.len(),
+            2,
+            "non-2xx must carry stored headers"
+        );
+    }
+
+    #[test]
     fn update_parsed_response_preserves_already_attached_response_fields() {
         // 已 attach 完整 ResponseData (含 resp_status / headers), update_parsed_response
         // 只改 parsed, 不丢失其他字段.

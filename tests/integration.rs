@@ -9348,6 +9348,90 @@ async fn forward_summary_for_streaming_logs_after_stream_end() {
     );
 }
 
+/// #333 对照: 2xx 正常流量的摘要行不带 retry_headers 值 (None, 零开销约束 —
+/// 白名单头只进错误流量的摘要).
+#[tokio::test]
+async fn forward_summary_2xx_has_no_retry_headers_value() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_header("x-should-retry", "true")
+        .with_header("retry-after", "60")
+        .with_body(
+            r#"{"id":"chatcmpl-1","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
+        )
+        .create_async()
+        .await;
+
+    let proxy_url = spawn_proxy(&upstream.url()).await;
+    let (log, _log_guard) = capture_tracing(tracing::Level::INFO);
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+
+    let log_text = log.text();
+    let summary_line = log_text
+        .lines()
+        .find(|l| l.contains("forward") && l.contains("status=200"))
+        .unwrap_or_else(|| panic!("#333: no 200 forward summary line; log: {log_text}"));
+    assert!(
+        !summary_line.contains("retry_headers=Some("),
+        "#333: 2xx summary must not carry retry_headers value; got: {summary_line}"
+    );
+}
+
+/// #333: 非 2xx 上游响应的 forward 摘要行携带 retry 白名单头 — opencode 等客户端
+/// 按 `x-should-retry` 决定是否重试但不持久化响应头, secret-guard 的摘要行是
+/// 事后可 grep 的唯一留证 ("零重试直接死亡"排障的原始诉求).
+#[tokio::test]
+async fn forward_summary_logs_retry_headers_on_429() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(429)
+        .with_header("content-type", "application/json")
+        .with_header("x-should-retry", "false")
+        .with_header("retry-after", "60")
+        .with_body(r#"{"error":{"message":"rate limited","type":"rate_limit_error"}}"#)
+        .create_async()
+        .await;
+
+    let proxy_url = spawn_proxy(&upstream.url()).await;
+    let (log, _log_guard) = capture_tracing(tracing::Level::INFO);
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::TOO_MANY_REQUESTS);
+
+    let log_text = log.text();
+    let summary_line = log_text
+        .lines()
+        .find(|l| l.contains("forward") && l.contains("status=429"))
+        .unwrap_or_else(|| panic!("#333: no 429 forward summary line; log: {log_text}"));
+    assert!(
+        summary_line.contains(r#"retry_headers=Some("x-should-retry=false,retry-after=60")"#),
+        "#333: summary line missing retry_headers; got: {summary_line}"
+    );
+    // 卫生: 白名单外的头不进摘要行 (不做全量透传日志, 防膨胀).
+    assert!(
+        !summary_line.contains("content-type"),
+        "#333: non-whitelisted header leaked into summary; got: {summary_line}"
+    );
+}
+
 // ─── 伪流式上游 → 合成 SSE 生命周期 (T5, 审计维度 9 前半) ────────────────────
 //
 // 场景: 客户端显式 stream=true, 上游 (伪流式中转 / 不支持流式的网关) 对 2xx 返回
