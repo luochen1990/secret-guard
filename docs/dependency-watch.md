@@ -13,6 +13,7 @@
 - 依赖升级滞后是**稳态**, 非风险: Cargo.lock 锁定保证可复现构建; 触发条件满足时再升.
 - 默认触发条件 = CVE / 解 duplicate / 需要 feature, 各子项仅标注例外.
 - 2026-09 已完成: CVE 批量 update (rustls 0.23.45, RUSTSEC-2026-0285) / rand 0.10 / criterion 0.8.
+- 2026-10 已完成: CVE update (rustls 0.23.46, RUSTSEC-2026-0346..0349 四连 — ci-deploy P1 audit 门禁触发; 0346 Debug 泄露 secrets / 0347 ECH 外泄 / 0348 Brotli 解压 DoS / 0349 ServerHello 降级).
 
 ## 当前重复清单 (2026-09-24 实测, feature `oidc` 双档后口径分层)
 

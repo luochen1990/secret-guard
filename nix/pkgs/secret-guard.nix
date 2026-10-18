@@ -1,8 +1,8 @@
 # secret-guard package: 用 rustPlatform.buildRustPackage 构建.
 #
 # 选择 buildRustPackage 而非 crane, 是为了零额外 flake input (nixos-unstable 即可).
-# 代价: 升级依赖后需手动 sync cargoHash (cargo vendor hash 变化), 但 secret-guard
-# 依赖树稳定, 这个频率很低.
+# cargoLock.lockFile 模式: vendor hash 从 lockfile 派生, 升级依赖 (改 Cargo.lock) 后
+# 零手动同步 — 仅未来引入 git dep 时才需在下方 outputHashes 追加条目.
 #
 # 无需 openssl / pkg-config: reqwest 用 rustls-tls (Cargo.toml 显式 default-features=false),
 # 整个依赖树没有 native TLS / 系统库需求.
