@@ -3569,6 +3569,127 @@ test.describe("Provider Detect 协议探测", () => {
   });
 });
 
+// ─── 端点 base_url 补全 (ENDPOINT_PRESETS autocomplete, UI-10 辅助输入) ────
+//
+// UI-10 契约: 建议是体验增强, 绝不阻塞手动填写. 覆盖: 建议出现 + 继续输入收窄 +
+// 点选回填 (url + proto 预填) / 无匹配不阻塞保存 / <3 字符与精确 url 边界 /
+// 点选作废 common_uri 暂存 (M1 竞态守卫 — 程序化回填必须补发 input 事件) /
+// Escape 只关列表不关 dialog.
+
+test.describe("端点 base_url 补全 (autocomplete)", () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto("/");
+    await page.waitForLoadState("networkidle");
+    await page.waitForTimeout(500);
+    await page.locator('a.tab[data-tab="providers"]').click();
+    await expect(page.locator("#providers-body tr").first()).toBeVisible();
+    await page.locator("button", { hasText: "+ new provider" }).click();
+    await expect(page.locator("#provider-form")).toBeVisible();
+  });
+
+  test("输入 ≥3 字符出建议 + 继续输入收窄 + 点选回填 url 与 protocol 预填", async ({ page }) => {
+    const input = endpointRow(page).locator(".ep-base-url");
+    await input.pressSequentially("mimo");
+    // 'mimo' 命中 4 条 Xiaomi MiMo 面 (api / token-plan × openai / anthropic),
+    // 无其他供应商含该子串 (minimax/mistral 均不含 'mim').
+    const items = endpointRow(page).locator(".ep-url-suggest-item");
+    await expect(items).toHaveCount(4);
+    await expect(items.filter({ hasText: "Xiaomi MiMo (Anthropic)" })).toHaveCount(1);
+    // 继续输入实时收窄: 补 ' token' → 只剩 token-plan 两条.
+    await input.pressSequentially(" token");
+    await expect(items).toHaveCount(2);
+    // 点选 anthropic 面: url 回填 + protocol 预填 (建议非命令, 走 select) +
+    // 列表消失 (值精确等于条目 url → 重算无匹配).
+    await items.filter({ hasText: "Xiaomi MiMo Token Plan (Anthropic)" }).click();
+    await expect(input).toHaveValue("https://token-plan-cn.xiaomimimo.com/anthropic");
+    await expect(endpointRow(page).locator(".ep-protocol")).toHaveValue("anthropic");
+    await expect(endpointRow(page).locator(".ep-url-suggest")).toHaveCount(0);
+  });
+
+  test("无匹配串不出列表, 手填 + 保存成功 (UI-10 不阻塞)", async ({ page }) => {
+    const uid = `nomatch-${Date.now()}`;
+    await page.locator("#p-id").fill(uid);
+    await endpointRow(page).locator(".ep-base-url").fill("https://no-such-vendor.example/v1");
+    await expect(endpointRow(page).locator(".ep-url-suggest")).toHaveCount(0);
+    // 手动填写全程不被辅助功能阻塞: 保存成功, dialog 关闭, 表格出现该行.
+    await page.locator('#provider-form-el button[value="save"]').click();
+    await expect(page.locator("#provider-form")).not.toBeVisible();
+    const row = page.locator("#providers-body tr", { hasText: uid });
+    await expect(row).toBeVisible();
+    // 清理 (dynamic-only 可删).
+    autoAcceptAlerts(page);
+    await row.locator('button[data-action="delete"]').click();
+    await expect(row).not.toBeVisible();
+  });
+
+  test("边界: <3 字符无列表, 满 3 字符出, 精确等于条目 url 无列表", async ({ page }) => {
+    const input = endpointRow(page).locator(".ep-base-url");
+    await input.pressSequentially("mi");
+    await expect(endpointRow(page).locator(".ep-url-suggest")).toHaveCount(0);
+    await input.pressSequentially("m");
+    await expect(endpointRow(page).locator(".ep-url-suggest")).toBeVisible();
+    await expect(endpointRow(page).locator(".ep-url-suggest-item")).toHaveCount(4);
+    // 手输整条 URL 到底 → 与点选回填同态, 列表不滞留.
+    await input.fill("https://api.x.ai/v1");
+    await expect(endpointRow(page).locator(".ep-url-suggest")).toHaveCount(0);
+  });
+
+  test("点选建议作废 common_uri 暂存 (M1 竞态守卫: A 的布局断言不得随 B 落盘)", async ({ page }) => {
+    // 先 Detect 拿到 common_uri 暂存 (fast 上游: /v1/models 200 openai shape →
+    // 徽标 '+/v1'), 再清空输入点选不同 URL 的建议 — 暂存必须被作废 (程序化回填
+    // 不触发 input, 实现须手动补发; 残留 = 保存时旧布局断言随新 URL 落盘).
+    const upstream = await startProbeUpstream((pathname) => {
+      if (pathname === "/v1/models") {
+        return {
+          status: 200,
+          body: JSON.stringify({
+            object: "list",
+            data: [{ id: "m1", object: "model" }],
+          }),
+        };
+      }
+      return { status: 404, body: "{}" };
+    });
+    try {
+      await endpointRow(page).locator(".ep-base-url").fill(upstream.url);
+      await endpointRow(page).locator(".ep-detect").click();
+      await expect(endpointRow(page).locator(".ep-probe-result .probe-line-ok")).toContainText("Detected: openai");
+      await expect(endpointRow(page).locator(".ep-common-uri-badge")).toBeVisible();
+      await expect(endpointRow(page).locator(".ep-common-uri-badge")).toHaveText("+/v1");
+      // 清空 (input 事件作废暂存, 徽标即隐) 再输入 → 建议出现.
+      const input = endpointRow(page).locator(".ep-base-url");
+      await input.fill("");
+      await expect(endpointRow(page).locator(".ep-common-uri-badge")).toBeHidden();
+      await input.pressSequentially("mimo");
+      await expect(endpointRow(page).locator(".ep-url-suggest-item")).toHaveCount(4);
+      // 点选不同 URL: dataset.commonUri 无 + 徽标保持隐藏.
+      await endpointRow(page)
+        .locator(".ep-url-suggest-item", { hasText: "Xiaomi MiMo (Anthropic)" })
+        .click();
+      await expect(input).toHaveValue("https://api.xiaomimimo.com/anthropic");
+      await expect(endpointRow(page)).not.toHaveAttribute("data-common-uri");
+      await expect(endpointRow(page).locator(".ep-common-uri-badge")).toBeHidden();
+    } finally {
+      await upstream.close();
+    }
+  });
+
+  test("Escape 只关建议列表, 输入框可继续输入 (dialog 不被 ESC 关闭)", async ({ page }) => {
+    const input = endpointRow(page).locator(".ep-base-url");
+    await input.pressSequentially("anthropic");
+    await expect(endpointRow(page).locator(".ep-url-suggest")).toBeVisible();
+    await input.press("Escape");
+    await expect(endpointRow(page).locator(".ep-url-suggest")).toHaveCount(0);
+    // ESC 被 preventDefault: modal dialog 未关, 值未变, 焦点仍可继续输入.
+    await expect(page.locator("#provider-form")).toBeVisible();
+    await expect(input).toHaveValue("anthropic");
+    // 继续输入: 值变化重算, 新查询的建议正常出现 (Groq 单条命中).
+    await input.fill("groq");
+    await expect(endpointRow(page).locator(".ep-url-suggest-item")).toHaveCount(1);
+    await expect(endpointRow(page).locator(".ep-url-suggest-item")).toContainText("api.groq.com");
+  });
+});
+
 // ─── SSE 失效通知消费 (rt-push T3, UI-8) ──────────────────────────────────
 //
 // 前端契约 (index.html "SSE 失效通知 + 动态兜底轮询" 段; wire 契约见

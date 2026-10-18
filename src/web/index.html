@@ -149,7 +149,7 @@
     /* 代码 / 原始字节区统一用等宽 (语义需要, 非全局风格). 集中声明, 避免下方重复. */
     pre, code, .raw-pre, .resp-body, .bubble-tool, .bubble-tool-call, .xml-block,
     .full-body, .info-val, dialog#secret-form form textarea, textarea#apikey-reveal-value,
-    .probe-chip, .probe-url, .common-uri-badge,
+    .probe-chip, .probe-url, .common-uri-badge, .ep-url-suggest-url,
     .ep-short, .ep-url > code, #privacy-scan-panel td.mono-cell {
       font-family: "SF Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
     }
@@ -801,6 +801,40 @@
     }
     .probe-chip:hover { border-color: var(--border-strong); color: var(--fg); }
     .probe-chip.copied { border-color: var(--ok); background: var(--ok-soft); color: var(--ok); }
+    /* base_url 补全建议列表 (ENDPOINT_PRESETS 子串匹配, per 行内跨整行 — 同
+       .ep-probe-result 的 grid-column 先例). 条目是裸 button (非 .btn 组合):
+       自带全套重置 (border 0 + 透明底 + font inherit), 同 .probe-chip 先例;
+       hover 用 accent (任务规格: muted url + 正常 label + hover accent). */
+    .ep-url-suggest {
+      grid-column: 1 / -1;
+      display: grid;
+      gap: 2px;
+      padding: 4px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      background: var(--bg-sunken);
+    }
+    .ep-url-suggest-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 10px;
+      padding: 3px 8px;
+      border: 0;
+      border-radius: var(--radius-sm);
+      background: transparent;
+      color: var(--fg);
+      font: inherit;
+      font-size: 12px;
+      cursor: pointer;
+      text-align: left;
+    }
+    .ep-url-suggest-item:hover { background: var(--panel-hi); color: var(--accent); }
+    .ep-url-suggest-url {
+      color: var(--fg-muted);
+      font-size: 11px;
+      word-break: break-all;
+    }
     dialog#provider-form .actions {
       grid-column: 2;
       display: flex;
@@ -7583,6 +7617,13 @@
     pEndpointsList.addEventListener('click', (ev) => {
       const row = ev.target.closest('.endpoint-row');
       if (!row) return;
+      const suggestBtn = ev.target.closest('.ep-url-suggest-item');
+      if (suggestBtn) {
+        // 建议点选 (idx 是清单序, DOM 与清单间唯一契约; 越界/NaN 静默忽略).
+        const preset = ENDPOINT_PRESETS[+suggestBtn.dataset.idx];
+        if (preset) applyEndpointPreset(row, preset);
+        return;
+      }
       if (chipCopyHandler(ev)) return;
       if (ev.target.closest('.ep-del')) {
         row.remove();
@@ -7604,7 +7645,137 @@
       if (row && ev.target.classList.contains('ep-base-url')) {
         delete row.dataset.commonUri;
         syncEndpointCommonUriBadge(row);
+        updateEndpointUrlSuggest(row);
       }
+    });
+
+    // ─── 端点 base_url 补全 (ENDPOINT_PRESETS, UI-10 辅助输入) ────────────
+    //
+    // 预置清单子串建议, 纯体验增强 (UI-10: 绝不阻塞手动填写/粘贴 — 无匹配即无
+    // DOM, 输入框行为零改变). DOM 即状态 (同表单惯例, 不进 state / probeEpoch);
+    // dialog 重开时行全量重建, 建议列表天然消失. label 是供应商专有名词, 刻意
+    // 不翻译 (同 i18n 用户数据纪律), 故零新增文案 (en/zh 双侧免维护).
+    //
+    // url 可信度: 除本地条目 (Ollama / LM Studio, 无需验证) 外均经 models 端点
+    // curl 实测 — 401/403/405/200 = 存在可用; xAI 以 400 + "Incorrect API key"
+    // 应答坏 key (伪路径对照 404 证实路由真实), 属 auth 形拒绝, 保留.
+    // proto 是点选时的协议预填 (建议非命令, 用户可改 — 走 setEndpointProtocolValue
+    // 的 experimental append 分支, 同 Detect recommended 先例). 清单序 = 截断序
+    // (≤8 条), coding-plan 类前置 (高频命中优先).
+
+    const ENDPOINT_PRESETS = Object.freeze([
+      { label: 'Xiaomi MiMo (OpenAI)', url: 'https://api.xiaomimimo.com/v1', proto: 'openai' },
+      { label: 'Xiaomi MiMo (Anthropic)', url: 'https://api.xiaomimimo.com/anthropic', proto: 'anthropic' },
+      { label: 'Xiaomi MiMo Token Plan (OpenAI)', url: 'https://token-plan-cn.xiaomimimo.com/v1', proto: 'openai' },
+      { label: 'Xiaomi MiMo Token Plan (Anthropic)', url: 'https://token-plan-cn.xiaomimimo.com/anthropic', proto: 'anthropic' },
+      { label: 'Kimi / Moonshot (Anthropic)', url: 'https://api.moonshot.ai/anthropic', proto: 'anthropic' },
+      { label: 'Moonshot Kimi (OpenAI)', url: 'https://api.moonshot.cn/v1', proto: 'openai' },
+      { label: 'Zhipu GLM Coding Plan (Anthropic)', url: 'https://open.bigmodel.cn/api/anthropic', proto: 'anthropic' },
+      { label: 'Zhipu GLM Coding Plan (OpenAI)', url: 'https://open.bigmodel.cn/api/coding/paas/v4', proto: 'openai' },
+      { label: 'MiniMax (Anthropic)', url: 'https://api.minimaxi.com/anthropic', proto: 'anthropic' },
+      { label: 'OpenAI', url: 'https://api.openai.com/v1', proto: 'openai' },
+      { label: 'Anthropic', url: 'https://api.anthropic.com', proto: 'anthropic' },
+      { label: 'Google Gemini', url: 'https://generativelanguage.googleapis.com', proto: 'gemini' },
+      { label: 'OpenRouter', url: 'https://openrouter.ai/api/v1', proto: 'openai' },
+      { label: 'DeepSeek', url: 'https://api.deepseek.com', proto: 'openai' },
+      { label: 'Groq', url: 'https://api.groq.com/openai/v1', proto: 'openai' },
+      { label: 'Mistral AI', url: 'https://api.mistral.ai/v1', proto: 'openai' },
+      { label: 'xAI Grok', url: 'https://api.x.ai/v1', proto: 'openai' },
+      { label: 'Qwen DashScope', url: 'https://dashscope.aliyuncs.com/compatible-mode/v1', proto: 'openai' },
+      { label: 'Zhipu GLM', url: 'https://open.bigmodel.cn/api/paas/v4', proto: 'openai' },
+      { label: 'SiliconFlow', url: 'https://api.siliconflow.cn/v1', proto: 'openai' },
+      { label: 'Volcengine Ark Doubao', url: 'https://ark.cn-beijing.volces.com/api/v3', proto: 'openai' },
+      { label: 'Together AI', url: 'https://api.together.xyz/v1', proto: 'openai' },
+      { label: 'Fireworks AI', url: 'https://api.fireworks.ai/inference/v1', proto: 'openai' },
+      { label: 'Perplexity', url: 'https://api.perplexity.ai', proto: 'openai' },
+      { label: 'Ollama (local)', url: 'http://localhost:11434', proto: 'ollama' },
+      { label: 'LM Studio (local)', url: 'http://localhost:1234/v1', proto: 'openai' },
+    ]);
+
+    // 匹配谓词 (纯函数): trim 后 ≥3 字符 且 当前值不完全等于某条目 url (点选
+    // 回填 / 整 URL 手输到底 → 列表自然消失, 不滞留); label 与 url 子串匹配
+    // (case-insensitive), ≤8 条按清单序.
+    function endpointUrlSuggestFor(value) {
+      const q = value.trim().toLowerCase();
+      if (q.length < 3 || ENDPOINT_PRESETS.some(p => p.url.toLowerCase() === q)) return [];
+      return ENDPOINT_PRESETS.filter(p =>
+        p.label.toLowerCase().includes(q) || p.url.toLowerCase().includes(q)).slice(0, 8);
+    }
+
+    // 重算并渲染该行的建议列表 (per 行, 插在探测结果区之前 — 就近输入行).
+    // 无匹配时移除既有列表: 收窄到零 / 清空 / 点选回填后的值变化都走这里.
+    function updateEndpointUrlSuggest(row) {
+      const input = row.querySelector('.ep-base-url');
+      if (!input) return;
+      // 重渲染 (值变化) 时取消在途关闭定时器 — 输入即聚焦, 旧 blur 定时器不得
+      // 误关新列表 (M1, review: refocus/继续输入窗口内的过期关闭).
+      clearTimeout(row._suggestCloseTimer);
+      const matches = endpointUrlSuggestFor(input.value);
+      let el = row.querySelector('.ep-url-suggest');
+      if (!matches.length) {
+        if (el) el.remove();
+        return;
+      }
+      if (!el) {
+        el = document.createElement('div');
+        el.className = 'ep-url-suggest';
+        row.insertBefore(el, row.querySelector('.ep-probe-result'));
+      }
+      el.innerHTML = matches.map(p => `
+        <button type="button" class="ep-url-suggest-item" data-idx="${ENDPOINT_PRESETS.indexOf(p)}">
+          <span class="ep-url-suggest-label">${escapeHtml(p.label)}</span>
+          <span class="ep-url-suggest-url">${escapeHtml(p.url)}</span>
+        </button>`).join('');
+    }
+
+    // 点选建议回填: proto 预填 (建议非命令) + url 填入 + 焦点还给输入框 (可继续
+    // 编辑). 程序化 .value 赋值不触发 input 事件 — 必须手动补发一枚 (bubbles),
+    // 让既有 base_url input 监听统一收口两件事:
+    // 1) common_uri 作废 — 建议 URL ≠ 被 Detect 的 URL 时, A 的布局断言不得随
+    //    B 落盘 (M1 竞态, 本任务最易错点: 残留暂存 = 保存错布局);
+    // 2) 建议重算 — 值精确等于条目 url → 列表消失 (与手输到底同态).
+    function applyEndpointPreset(row, preset) {
+      if (preset.proto) setEndpointProtocolValue(row, preset.proto);
+      const input = row.querySelector('.ep-base-url');
+      input.value = preset.url;
+      input.focus();
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    // Escape 只关建议列表: preventDefault 压掉 ESC 对 modal dialog 的 cancel
+    // 默认行为 (焦点留在输入框, 可继续输入); 无列表时不拦截 — dialog 关闭语义
+    // 保持原状. isComposing 时让 IME 原生处理 (取消候选, 不动列表/弹窗).
+    pEndpointsList.addEventListener('keydown', (ev) => {
+      if (ev.key !== 'Escape' || ev.isComposing) return;
+      const row = ev.target.closest('.endpoint-row');
+      const el = row?.querySelector('.ep-url-suggest');
+      if (!el) return;
+      ev.preventDefault();
+      el.remove();
+    });
+
+    // blur 延迟关闭 (focusout = 冒泡版 blur, 委托行容器). 焦点守卫先于定时器:
+    // 焦点移入本行建议列表内 (浏览器在 mousedown 时即把焦点交给按钮 — 先于
+    // mouseup/click; 键盘 Tab 同路) 时**不**启动关闭定时器 — 否则定时器会在
+    // click 落地前把按钮移除 (实测慢机/录 trace 时 150ms 窗口不够), 点选永久
+    // 失效 (列表重建需要新的 input 事件, 鼠标序列不产生). 焦点去向在列表外
+    // (relatedTarget 不在 .ep-url-suggest 内, 或 null = 点了不可聚焦区) 才
+    // 延迟关闭; 到点时列表可能已被 Escape/值重算移除, 存在性检查幂等.
+    pEndpointsList.addEventListener('focusout', (ev) => {
+      if (!ev.target.classList || !ev.target.classList.contains('ep-base-url')) return;
+      const row = ev.target.closest('.endpoint-row');
+      if (!row) return;
+      const sug = row.querySelector('.ep-url-suggest');
+      if (sug && ev.relatedTarget && sug.contains(ev.relatedTarget)) return;
+      // 定时器 id 挂 row (清旧启新, 叠加幂等): focusin 回焦 / 重渲染继续输入时
+      // 取消在途关闭 — 否则 150ms 窗口内回焦的列表被过期定时器误关 (M1, review).
+      clearTimeout(row._suggestCloseTimer);
+      row._suggestCloseTimer = setTimeout(() => row.querySelector('.ep-url-suggest')?.remove(), 150);
+    });
+    // M1 补面: 焦点回到输入框即取消在途关闭定时器 (blur→refocus 快速往返场景).
+    pEndpointsList.addEventListener('focusin', (ev) => {
+      if (!ev.target.classList?.contains('ep-base-url')) return;
+      clearTimeout(ev.target.closest('.endpoint-row')?._suggestCloseTimer);
     });
 
     // ─── router 路由编辑器 (#179) ─────────────────────────────────────────

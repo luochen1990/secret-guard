@@ -329,6 +329,20 @@ API key CRUD **无条件挂载** (在 `web::router()`, 不依赖 `auth.enabled`)
   三类前置拦截, 文案与 routes/members 同风格). 编辑回填 = `p.endpoints[]` 全量物化,
   保存全量提交 endpoints (无 #157 null 歧义, "保留" 由回填实现). api_key 保持条目级
   一份 (共享凭证, D3).
+- **base_url 预置清单补全** (ENDPOINT_PRESETS, 2026-10-18): 输入 ≥3 字符子串匹配
+  (label+url, case-insensitive) 出 ≤8 条建议 (行内列表, 无匹配无 DOM — UI-10 辅助
+  输入, 绝不阻塞手填/粘贴); 点选回填 url + 预填 proto (建议非命令). 清单 26 条主流
+  供应商, url 均经 models 端点 curl 实测 (证据注释见常量头). 两个正确性锚点: ①
+  程序化回填后补发 input 事件 — commonUri 作废与建议重算统一走既有 input 监听
+  (A 的布局断言不得随 B 落盘, M1 竞态; Playwright 守卫); ② focusout 关闭带
+  relatedTarget 焦点守卫 — 浏览器在 mousedown 即把焦点交给建议按钮, 朴素
+  setTimeout 关闭会在 click 落地前移除按钮致点选永久失效 (压测 --repeat-each
+  暴露), 焦点去向列表内不启动定时器. Escape 只关列表不关 dialog (preventDefault,
+  IME isComposing 让位原生; focusout 关闭定时器 id 挂 row, focusin 回焦/重渲染
+  时取消 — 150ms 窗口内回焦不得误关列表). **已知限制**: 建议列表鼠标专属 —
+  Tab 序 (select→input→Detect→Del→建议) 下 150ms 关闭窗口内键盘不可达, 亦无
+  ArrowDown/Enter 选中; 本地单用户工具 + UI-10 "辅助输入" 定位下可接受, a11y
+  combobox 模式留给未来.
 - **Pool 构造** (spec-pool-provider §10): 成员编辑器 = 有序 Direct provider 下拉
   (行序 = failover 优先级, ↑/↓ 排序, 候选排除编辑对象自身 + 仅 Direct 条目, 悬空
   成员补 "(missing)" 选项); exhaust 三通道 + cooldown 在原生 `<details>` 高级区
