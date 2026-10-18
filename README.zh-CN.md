@@ -2,6 +2,10 @@
   <img src="assets/logo.svg" width="110" alt="Secret Guard logo">
 </p>
 
+<p align="center">
+  <a href="https://codecov.io/gh/luochen1990/secret-guard"><img src="https://codecov.io/gh/luochen1990/secret-guard/graph/badge.svg" alt="codecov badge"></a>
+</p>
+
 # Secret Guard
 
 **跑在本地的轻量 LLM 网关: 出站把请求中的 Secret 替换为等长仿真 Mock, 回传响应自动还原为真值 — LLM 全程接触不到你的 Secret, Agent 工具照常工作。**

@@ -2,6 +2,10 @@
   <img src="assets/logo.svg" width="110" alt="Secret Guard logo">
 </p>
 
+<p align="center">
+  <a href="https://codecov.io/gh/luochen1990/secret-guard"><img src="https://codecov.io/gh/luochen1990/secret-guard/graph/badge.svg" alt="codecov badge"></a>
+</p>
+
 # Secret Guard
 
 **A lightweight local LLM gateway: outbound requests have their Secrets replaced with

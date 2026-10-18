@@ -475,7 +475,7 @@ v3.0 三档 (org 分级契约, 见 lc-studio/forgejo-actions README; 命名即�
 |---|---|---|---|---|
 | P0 | `ci-merge.yml` | PR + master push + 手动 | PR 合入 | check 主链全量档 `--features oidc,consistency-check` (fmt/clippy/machete/doc/测试+一致性断言/typos/deny-offline/check-contracts) + file-size; 默认档验证归 GitHub 镜像 CI (双宿主分工, 见 docs/ci.md) |
 | P1 | `ci-deploy.yml` | master push + nightly + 手动 | 部署 | audit (CVE, 阻塞) + bench compare-save + nix build cargoHash (canary 探针, runner 无 nix-daemon 恒失败) (**非超集**偏差, 见 workflow 头声明) |
-| P2 | `ci-periodic.yml` | nightly per-SHA 去重 + 手动 (无 push) | 无 | check --coverage + coverage-gate + WebUI Playwright |
+| P2 | `ci-periodic.yml` | nightly per-SHA 去重 + 手动 (无 push) | 无 | check --coverage + coverage-gate + WebUI Playwright (coverage **发布**另归 GitHub `coverage.yml` → Codecov 徽章, 非门禁, 见 docs/ci.md 双宿主段) |
 
 跳过/去重机制: 事件去重 (push 仅 master; PR 总是跑 — draft/WIP PR 除外) + 内容去重
 (skip-if-passed 共享 action, ff-merge 后同 SHA 不重跑; P2 按 SHA 去重次晚自愈) + PR
@@ -544,6 +544,7 @@ ignored 测试是"计划但搁置"的信号, 应在 `docs/known-limitations.md` 
 - `just coverage-gate`: 覆盖率门禁 (CI 用, 双阈值).
 - `just coverage-html`: HTML 报告 → `coverage/html/index.html`.
 - `just coverage-lcov`: LCOV 报告 → `coverage/lcov.info`.
+- 覆盖率徽章 (GitHub README): 数据源 = GitHub 镜像 `coverage.yml` (lcov → Codecov 上传, 需 `CODECOV_TOKEN`); 门禁仍归 forgejo P2 `coverage-gate`, 两者同口径 (全量档). 详见 `docs/ci.md` 双宿主段.
 
 产物默认写到 `target/llvm-cov-target/` 与 `coverage/` (均已 .gitignore).
 门禁阈值见 justfile (`COVERAGE_MIN_LINES` / `COVERAGE_MAX_UNCOVERED`).

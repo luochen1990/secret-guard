@@ -3,8 +3,9 @@
 > **职责**: `.forgejo/workflows/{ci-merge,ci-deploy,ci-periodic}.yml` 三档 workflow 的
 > 实现细节 SSOT (checkout 策略 / 缓存复用 / 并发假设 / 评论写回), 面向 CI 维护者.
 > **受众**: 修改 CI 配置 / 需要调整 workflow 的人.
-> GitHub 侧 workflow (`.github/workflows/`: ci.yml 镜像 + release.yml 二进制发布,
-> forgejo 不解析该目录, 2026-09 实证) 不在本文件 scope — 发布管道见根 `AGENTS.md`
+> GitHub 侧 workflow (`.github/workflows/`: ci.yml 镜像 + coverage.yml 覆盖率徽章 +
+> release.yml 二进制发布, forgejo 不解析该目录, 2026-09 实证) 不在本文件 scope —
+> 其与 forgejo 的档位分工关系见 "双宿主验证分工" 段; 发布管道见根 `AGENTS.md`
 > "发布流程" 段.
 > **接口性质的高层概述** (配置位置 / 触发条件 / CI 做了什么) 在根 `AGENTS.md`
 > "## 开发流程 → ### CI (Forgejo Actions)" 段, 改 CI 配置前先读那段了解整体定位.
@@ -237,12 +238,20 @@ failure, continue-on-error 救不了 — P0 超时会阻塞合并):
 |---|---|---|
 | forgejo P0 (ci-merge.yml) | 全量档 `oidc,consistency-check` | OIDC 登录链 + 视图正确性断言 + 全量测试, 一轮 codegen |
 | GitHub 镜像 (ci.yml) | 默认档 (无 OIDC) | feature gate 不破坏默认构建 (编译 + 全量测试; fail-fast 冒烟见 `tests/auth_feature_gate.rs`) |
+| GitHub 镜像 (coverage.yml) | 全量档 (口径例外, 见下注) | coverage **发布** (lcov → Codecov; README 徽章 + PR 覆盖率评论数据源), 非门禁 |
 | 发布归档 (release.yml → nix/release.nix) | 默认档 (与 overlay package 默认 `buildFeatures = []` 同档) | 发布二进制与 GitHub CI 同档; NixOS module 部署形态才 override 开 oidc |
 
 分工动机: 单宿主跑双档 = feature 档位翻转触发重复 codegen (实测 P0 ~20min, 其中
 ~13min 纯编译); 双宿主各跑一档 = 各一轮 codegen, P0 回到 ~8-9min。forgejo 是门禁
 SSOT (合入阻塞), GitHub 是绿勾门面 — 默认档红会阻塞 GitHub 侧绿勾而非 forgejo 合入,
 与两宿主的角色定位一致 (发布产物 = 默认档, 其验证失败理应阻塞发布门面).
+
+> coverage.yml 档位例外注记: 徽章数据源刻意选全量档 (而非镜像 CI 的默认档), 让徽章
+> 数字与 forgejo P2 门禁 (`coverage-gate`) 测同一份插桩代码集, 单一口径 —
+> 避免 "徽章 82% / 门禁 85%" 两种口径各说各话的困惑。代价是 GitHub 侧每 push 多一轮全量档
+> 编译 (免费并行 runner, 与 ci.yml 互不阻塞, 无串行代价)。CODECOV_TOKEN 是唯一人工前置 (codecov.io 启用本仓
+> + GitHub repo secret); fork PR 拿不到 secret, 上传 best-effort (fail_ci_if_error
+> 仅 push 为 true), 徽章只信任 master push 链路.
 
 > coverage 基线注记 (P2): consistency-check 并入 FULL_TIER 后, `just check --coverage`
 > 的插桩代码集随之扩大 (consistency 断言的 panic/失败分支新增少量未覆盖行)。

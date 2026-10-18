@@ -1,0 +1,63 @@
+# GitHub 镜像侧 coverage 发布 (Codecov 上传, README 徽章数据源) — 非门禁.
+#
+# 职责边界 (与 forgejo P2 ci-periodic 的分工, 详见 docs/ci.md 双宿主验证分工):
+#   - forgejo P2 = coverage **门禁** (双阈值 coverage-gate, 防倒退)
+#   - 本 workflow = coverage **发布** (lcov → Codecov; README 徽章 + PR 覆盖率
+#     变化评论的数据源) — 失败不阻塞任何合入, 只影响徽章新鲜度.
+#
+# 档位: 全量档 (oidc,consistency-check) — 例外于 "GitHub 侧默认档" 的双宿分工,
+#   rationale: 徽章与 forgejo 门禁 (coverage-gate) 测同一份插桩代码集, 单一口径;
+#   代价是 GitHub 侧多一轮全量档编译 (免费并行 runner, 无串行代价).
+#
+# 工具链: rustup llvm-tools-preview 组件提供 llvm-cov / llvm-profdata, cargo-llvm-cov
+#   自动从 sysroot 定位, 无需 env 注入 (forgejo nix 工具链无该组件才需, 见 justfile).
+#
+# fork PR 语义: 外部 fork PR 拿不到 CODECOV_TOKEN (GitHub secrets 隔离), 上传
+#   best-effort — 徽章只信任 master push 链路.
+name: coverage
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coverage-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  lcov:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+
+      # just / nextest (llvm-cov nextest 子命令) / cargo-llvm-cov: 预编译二进制安装.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-nextest,cargo-llvm-cov
+
+      # 全量档插桩测试 + lcov (SSOT recipe, 见 justfile coverage-lcov).
+      - name: coverage (lcov, full tier)
+        run: just coverage-lcov
+
+      # 上传 Codecov (公开仓免费). CODECOV_TOKEN 是唯一人工前置 (codecov.io 启用
+      # 本仓 + GitHub repo secret); 缺 token 时 master push 红 (显式暴露问题),
+      # PR 侧 best-effort 不红.
+      - name: upload to codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: coverage/lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: ${{ github.event_name == 'push' }}
