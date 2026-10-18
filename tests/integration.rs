@@ -14941,11 +14941,14 @@ async fn auto_protect_sg_token_effective_immediately_after_issue() {
 
     let (_id, token) = issue_sg_token(&proxy_url, "leak-me").await;
     let expected_mock = secret_guard::protect::mock_for(&token);
+    // N1: 完整 body 等值 (透传分支 byte-exact, 替换是唯一差异) — 同时负向锁定
+    // "真值不出现在上游 body" 与 "除 mock 替换外零扰动".
+    let expected_upstream_body = format!(
+        r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"my key is {expected_mock}"}}]}}"#
+    );
     let _m = upstream
         .mock("POST", "/v1/chat/completions")
-        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
-            "messages": [{ "role": "user", "content": format!("my key is {expected_mock}") }]
-        })))
+        .match_body(mockito::Matcher::Exact(expected_upstream_body))
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(r#"{"choices":[{"message":{"content":"ok"}}]}"#)
@@ -15033,5 +15036,158 @@ async fn auto_protect_covers_codec_less_protocol_gemini() {
         status,
         reqwest::StatusCode::OK,
         "gemini passthrough must forward (no 503 from auto-protect); got body: {resp_body}"
+    );
+}
+
+// ─── #320 复审整改: M2 (disabled key 剥离) + M3 (user-secret 优先) ──────────
+
+/// #320 fixture: 自定义 ApiKeyStore (静态 key + disabled 集合) 的 proxy —
+/// M2/M3 需要 "注册表内容已知" 的确定性起点 (静态 key 装载即注册, 见
+/// `ApiKeyStore::new`), 动态 issue 达不到 (spawn 时 token 尚不存在).
+async fn spawn_proxy_with_key_store(
+    provider: Provider,
+    statics: Vec<secret_guard::auth::StaticApiKey>,
+    static_disabled: std::collections::HashSet<String>,
+    secrets: SecretTable,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state_path = tmp_state_path("sg-keystore");
+    let decisions = std::sync::Arc::new(parking_lot::RwLock::new(
+        secret_guard::config::Decisions::default(),
+    ));
+    let persist_lock = std::sync::Arc::new(parking_lot::Mutex::new(()));
+    let provider_table = ProviderTable::with_persist_lock(
+        vec![provider],
+        vec![],
+        decisions,
+        state_path.clone(),
+        persist_lock.clone(),
+    );
+    let store = secret_guard::auth::ApiKeyStore::new(
+        &statics,
+        std::path::Path::new("."),
+        vec![],
+        static_disabled,
+        state_path,
+        persist_lock,
+    );
+    let proxy = AppState {
+        api_keys: store,
+        ..base_app_state(
+            reqwest::Client::new(),
+            provider_table,
+            ConversationDag::new(64, 500, 1),
+            secrets,
+        )
+    };
+    let app = server::build_router(
+        proxy,
+        secret_guard::server_host_guard::HostGuard::new("127.0.0.1", addr.port()),
+    );
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn auto_protect_registered_credential_defers_to_user_secret() {
+    // M3: 用户把 sg 凭证显式登记为 secret → 字节层让位 (排除精确相等值),
+    // user-secret IR 机制接管: 上游看到 user mock (predict_mock), 响应回传
+    // restore 成立 (RED-6 往返 — 客户端看到真值, 不再被字节层静默抢占).
+    const TOKEN: &str = "sg_m3_registered_0123456789abcdefghi";
+    let user_mock = predict_mock(TOKEN);
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "messages": [{ "role": "user", "content": format!("my key is {user_mock}") }]
+        })))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(format!(
+            r#"{{"choices":[{{"message":{{"content":"echo {user_mock}"}}}}]}}"#
+        ))
+        .create_async()
+        .await;
+    // 同一值同时是: 静态 sg key (→ 注册表) + 用户显式 secret (→ effective 表).
+    let proxy_url = spawn_proxy_with_key_store(
+        openai_provider("oa-main", &upstream.url()),
+        vec![secret_guard::auth::StaticApiKey {
+            label: "m3".into(),
+            key: Some(TOKEN.into()),
+            key_file: None,
+        }],
+        std::collections::HashSet::new(),
+        test_secret_table_with(vec![secret("sg-token-registered", TOKEN)]),
+    )
+    .await;
+
+    let body = format!(
+        r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"my key is {TOKEN}"}}]}}"#
+    );
+    let (status, resp_body, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        &body,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {resp_body}");
+    // RED-6 往返: 上游 echo user mock → 客户端看到真值 (restore 生效).
+    assert!(
+        resp_body.contains(TOKEN),
+        "client must see the real token restored (user-secret IR path owns it); got: {resp_body}"
+    );
+    assert!(
+        !resp_body.contains(&user_mock),
+        "client should not see the user mock; got: {resp_body}"
+    );
+}
+
+#[tokio::test]
+async fn auto_protect_strips_disabled_static_key_header_when_auth_disabled() {
+    // M2: 剥离判据 = 注册表已知明文 (含 disabled), 与 body 侧保护面同口径 —
+    // disabled 静态 key 不进 enabled-only 的 hash_index (lookup miss), 但 header
+    // 仍必须剥离. 对照: auto_protect_strips_sg_token_bearer_header_when_auth_disabled
+    // 覆盖 enabled 形态.
+    const TOKEN: &str = "sg_m2_disabled_0123456789abcdefghijk";
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .match_header("authorization", mockito::Matcher::Missing)
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"choices":[{"message":{"content":"ok"}}]}"#)
+        .create_async()
+        .await;
+    // provider_with: keyless (BYO-key 透传形态 — 剥离才可见).
+    let proxy_url = spawn_proxy_with_key_store(
+        provider_with("oa-bare", Protocol::OpenAI, &upstream.url()),
+        vec![secret_guard::auth::StaticApiKey {
+            label: "m2".into(),
+            key: Some(TOKEN.into()),
+            key_file: None,
+        }],
+        std::collections::HashSet::from(["m2".to_string()]), // disabled
+        test_secret_table(),
+    )
+    .await;
+
+    let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#;
+    let (status, resp_body, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-bare/v1/chat/completions",
+        body,
+        &[("Authorization", format!("Bearer {TOKEN}").as_str())],
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "disabled-but-known sg token must still be stripped from Authorization; got: {resp_body}"
     );
 }

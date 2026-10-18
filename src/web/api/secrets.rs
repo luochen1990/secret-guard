@@ -140,9 +140,10 @@ pub(crate) struct ListSecretsResponse {
 /// - `sg_tokens`: 进程当前已知明文的 sg API token 数 — 签发 / 静态装载 / 呈现
 ///   注册的全集 (`ApiKeyStore::protected_credentials`, 排除已撤销).
 /// - `provider_keys`: 登记了 key 来源 (`api_key` 或 `api_key_file` 任一) 的在役
-///   Direct provider 数 — **配置口径** (file-mode 不探测文件当前可读性);
-///   实际 per-request 保护面另含跨 provider 的 inline key 全集与选中 provider
-///   的 file key (见 `protect::collect_credentials`), 计数是它的下界近似.
+///   Direct provider 数 — **配置口径候选计数**: 含值短于保护地板 (<16 字符,
+///   不进 per-request 保护集) 与 `api_key_file` 当前不可读者, 也未计入 "选中
+///   provider 的 file key" 这类请求态成员, 故与 per-request 实际保护集**无严格
+///   包含关系** (既非上界也非下界) — 仅作 "SG 在保护" 的可见性提示.
 #[derive(Serialize)]
 pub(crate) struct BuiltinProtection {
     pub sg_tokens: usize,

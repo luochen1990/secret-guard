@@ -82,16 +82,22 @@
 
 ## protect (SG 凭证自动保护, #320 / SEC-11)
 
-- **JSON `\uXXXX` 转义形态不命中**: 字节层替换按 UTF-8 字节匹配; SDK 把凭证转义成
-  `\u0073g_…` 形态时本层漏过 (user-secret 的 IR 层扫描可命中转义后形态 — 两层互补,
-  实际 SDK 对 ASCII 凭证不产生转义)。
+- **JSON 转义形态不命中**: 字节层替换按 UTF-8 原文匹配; 凭证被 JSON 转义成
+  `\uXXXX` / `\"` / `\\` 形态时字节序列不同, 本层漏过 (user-secret 的 IR 层扫描
+  在 parse 后进行, 可命中转义后形态 — 两层互补; 实际 SDK 对 ASCII 凭证不产生转义)。
+- **user-secret 子串形态仍被字节层抢占**: overlay 值是 effective user secret 真值的
+  **真子串**时不让位 (仅精确相等让位) — 该子串被字节层替换后, user secret 的完整
+  真值不复存在, IR redact 零命中 + restore 不成立。方向安全 (真值不外流), 但该
+  secret 的预期 mock/restore 语义不成立 — 命中此形态时改用前缀/边界更大的登记值。
 - **非 UTF-8 body 跳过**: 二进制上传体不在威胁模型内, fail-open 跳过。
 - **非选中 provider 的 `api_key_file` 不保护**: file-mode key 仅在 "本次请求选中该
   provider" 时经 `effective_api_key` 现场解析入保护集 (零额外 IO 的边界 — 读全部
   provider 的 key 文件会引入每请求多文件读)。内联 `api_key` 全集不受此限。
-- **重启后 disabled 动态 key 不保护 (直至 re-enable + 呈现)**: 注册表是内存态;
-  disabled key 不进 `hash_index`, `lookup` 呈现不命中。enabled 动态 key 重启后由首次
-  呈现恢复 ("呈现 ⇒ 保护"); 静态 key (含 disabled) 装载即注册。
+- **重启后 disabled 动态 key 脱离保护 (直至 re-enable + 呈现)**: 注册表是内存态;
+  disabled 动态 key 重启后明文不可恢复 (磁盘 hash-only + `lookup` 跳过 disabled,
+  呈现不注册)。header 剥离判据同口径 (`known_plaintext` 查注册表): 该形态下 body
+  与 header 两通道均不受保护, 直至 re-enable 后首次呈现。enabled 动态 key 重启后由
+  首次呈现恢复; 静态 key (含 disabled) 装载即注册, 两通道全保护。
 - **值短于 16 字符不保护 (地板)**: 宁漏保不误替换 (短串在普通文本中误命中会破坏
   请求体); 真实 provider key / sg token 实际长度都 ≥20, 需保护短值可用
   `[[secrets.entries]]` 显式登记。

@@ -323,6 +323,16 @@ impl ApiKeyStore {
             .collect()
     }
 
+    /// #320 (M2): 给定明文是否在保护注册表 (含 disabled 的已知明文 — 与 body 侧
+    /// 保护面同口径, 区别于 enabled-only 的 [`Self::lookup`]).
+    ///
+    /// 消费方: auth 关闭时的 Authorization 剥离判据 (`proxy::dispatch`) — "剥离
+    /// 跟随已知明文而非鉴权态", 否则 disabled 静态 key 的 header 通道与 body
+    /// 通道保护不对称. 线性扫描, 注册表规模 = key 数, 仅在请求带 Bearer 时触发.
+    pub fn known_plaintext(&self, key: &str) -> bool {
+        self.plaintext_registry.read().values().any(|v| v == key)
+    }
+
     // ─── 内部 helper ────────────────────────────────────────────────────
 
     /// 快照当前 entries (调用方自行决定是否持锁).
@@ -754,6 +764,37 @@ mod tests {
                 "sg_static_0123456789abcdefghijklmnop".to_string()
             )]
         );
+    }
+
+    #[test]
+    fn known_plaintext_covers_disabled_static_key() {
+        // M2: 剥离判据与保护面同口径 — disabled 静态 key 不进 hash_index
+        // (lookup 跳过) 但明文已注册, known_plaintext 必须命中; 未知值不命中.
+        let statics = vec![StaticApiKey {
+            label: "lab".into(),
+            key: Some("sg_static_disabled_0123456789abcdefgh".into()),
+            key_file: None,
+        }];
+        let store = ApiKeyStore::new(
+            &statics,
+            std::path::Path::new("."),
+            vec![],
+            HashSet::from(["lab".to_string()]), // disabled
+            tmp_path("known-plaintext"),
+            Arc::new(Mutex::new(())),
+        );
+        // 对照: lookup 对 disabled key miss (enabled-only 索引).
+        assert!(
+            store
+                .lookup("sg_static_disabled_0123456789abcdefgh")
+                .is_none()
+        );
+        assert!(store.known_plaintext("sg_static_disabled_0123456789abcdefgh"));
+        assert!(!store.known_plaintext("sg_totally_unknown_0123456789abc"));
+        // 动态 key 同口径: issue 即注册, disable 后仍已知.
+        let issued = store.issue("t", "tester", "k").unwrap();
+        store.set_disabled(&issued.id, true).unwrap();
+        assert!(store.known_plaintext(&issued.key));
     }
 
     #[test]

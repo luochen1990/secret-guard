@@ -372,8 +372,17 @@ async fn dispatch(
     //     机制正交 — 不改变下方路径选择判据 (SecretTable 是否为空), 对任意协议
     //     (含 codec 未覆盖的 gemini/ollama) 与任意 body 形状一致生效, 永不阻塞
     //     转发 (fail-open). 语义与接线点 SSOT 见 `src/protect.rs` 头部.
-    let req_bytes = auto_protect_request(&state, &mut parts, &provider, &upstream_id, req_bytes);
+    //     secrets_snapshot 先取 (user-secret 优先: 精确重合的 overlay 值让位给
+    //     IR 机制, 见 auto_protect_request).
     let secrets_snapshot = state.secrets.effective_raw();
+    let req_bytes = auto_protect_request(
+        &state,
+        &mut parts,
+        &provider,
+        &upstream_id,
+        req_bytes,
+        &secrets_snapshot,
+    );
     // disabled secret 明文放行按请求 WARN (#161): 挂 dispatch 层 (raw bytes 扫描) 以
     // 覆盖透传快捷分支, 命中才告警. 挂载层级论证见 warn_disabled_secrets_in_body doc.
     let disabled_secrets = state.secrets.disabled_statics();
@@ -417,18 +426,22 @@ async fn dispatch(
 
 /// #320 SG 凭证自动保护 — dispatch 层收口 (body 收集后, 路径分叉前).
 ///
-/// 两步:
-/// 1. **auth 关闭时**的机会性 key 注册: 客户端 Bearer 若 hash 命中已知 sg key →
-///    `ApiKeyStore::lookup` 内部注册明文 ("呈现 ⇒ 保护", 覆盖重启后动态 key 的
-///    明文恢复), 并**剥离该 Authorization header** — sg token 对任何上游 provider
-///    都不是合法凭证 (是本网关的自有凭证), 转发它没有任何正当用途; 命中才动
-///    header, 未命中 (BYO-key / 垃圾值) 原样保留 (keyless provider 的 BYO-key
-///    透传语义不受影响). auth 启用时 `require_api_key` middleware 已做同型
-///    剥离 + 注册, 此步跳过 (避免二次 hash).
-/// 2. **字节层替换**: 收集保护集 (sg 注册表 + provider 派生 key) 并在 body 上
-///    执行 real→mock 全量替换 (等长, FWD-1 唯一授权的修改类型). 命中时
-///    per-credential WARN (只含 id + 次数, SEC-2). 保护集为空 / body 无命中 /
-///    body 非 UTF-8 → 原样返回 (零拷贝, fail-open).
+/// 三步:
+/// 1. **auth 关闭时**的机会性 key 注册 + header 剥离: 客户端 Bearer 若是已知
+///    sg key → 注册 (经 `ApiKeyStore::lookup` 的 "呈现 ⇒ 保护", 覆盖重启后动态
+///    key 的明文恢复) 并**剥离该 Authorization header** — sg token 对任何上游
+///    provider 都不是合法凭证 (是本网关的自有凭证), 转发它没有任何正当用途.
+///    剥离判据 = lookup 命中 **或** `known_plaintext` (M2: 注册表已知明文, 含
+///    disabled — 与 body 侧保护面同口径 "跟随已知明文而非鉴权态"). 未命中
+///    (BYO-key / 垃圾值) 原样保留 (keyless provider 的 BYO-key 透传语义不受
+///    影响). auth 启用时 `require_api_key` middleware 已做同型剥离 + 注册,
+///    此步跳过 (避免二次 hash).
+/// 2. **收集保护集** (sg 注册表 + provider 派生 key), 排除与 `secrets_snapshot`
+///    真值**精确相等**的值 (M3: user-secret 优先 — 用户显式登记的凭证由 IR
+///    机制接管 redact + RED-6 restore 全链, 字节层让位).
+/// 3. **字节层替换**: real→mock 全量替换 (等长, FWD-1 唯一授权的修改类型).
+///    命中时 per-credential WARN (只含 id + 次数, SEC-2). 保护集为空 / body
+///    无命中 / body 非 UTF-8 → 原样返回 (零拷贝, fail-open).
 ///
 /// per-request 成本注记: `effective_raw` 快照 (P 个 provider 的 clone) + 选中
 /// provider 的 `effective_api_key` (api_key_file 形态多一次 page-cached 读,
@@ -440,6 +453,7 @@ fn auto_protect_request(
     provider: &crate::provider::DirectProvider,
     upstream_id: &str,
     body: bytes::Bytes,
+    secrets_snapshot: &[crate::secrets::SecretEntry],
 ) -> bytes::Bytes {
     if !state.auth_enabled {
         let bearer = parts
@@ -448,7 +462,7 @@ fn auto_protect_request(
             .and_then(|h| h.to_str().ok())
             .and_then(|s| s.strip_prefix("Bearer "));
         if let Some(key) = bearer
-            && state.api_keys.lookup(key).is_some()
+            && (state.api_keys.lookup(key).is_some() || state.api_keys.known_plaintext(key))
         {
             parts.headers.remove(axum::http::header::AUTHORIZATION);
             tracing::warn!(
@@ -458,11 +472,13 @@ fn auto_protect_request(
         }
     }
     let providers_snapshot = state.providers.effective_raw();
+    let user_secret_values: Vec<&str> = secrets_snapshot.iter().map(|s| s.value.as_str()).collect();
     let creds = crate::protect::collect_credentials(
         state.api_keys.protected_credentials(),
         &providers_snapshot,
         &provider.effective_api_key(upstream_id),
         upstream_id,
+        &user_secret_values,
     );
     if creds.is_empty() {
         return body;

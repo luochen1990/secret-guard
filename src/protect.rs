@@ -41,8 +41,18 @@
 //! `redact_request_body` 对每个凭证做 `str::find` + 全量替换 (mock 为等长
 //! 随机串, 替换即 FWD-1 唯一授权的 real↔mock 修改). 命中时 per-credential WARN
 //! 一条 (只含 id 与次数, 永不含明文/mock, SEC-2 同型). 已知盲区 (best-effort,
-//! 见 docs/known-limitations.md): JSON `\uXXXX` 转义形态的凭证字节层不命中
-//! (user-secret 的 IR 层扫描可命中 — 两层互补).
+//! 见 docs/known-limitations.md): JSON **转义形态** (`\uXXXX` / `\"` / `\\` —
+//! 字节层按 UTF-8 原文匹配, 转义后字节序列不同) 不命中 (user-secret 的 IR 层
+//! 扫描在 parse 后进行, 可命中转义后形态 — 两层互补).
+//!
+//! # user-secret 优先 (精确重合让位)
+//!
+//! overlay 值与 effective user secret 真值**精确相等**时, `collect_credentials`
+//! 将其排除 — 用户显式登记的凭证交给 user-secret IR 机制全链接管 (redact +
+//! RED-6 restore 往返; 字节层让位, 否则会先替换导致 IR 层零命中 + restore 被
+//! 静默抢占). 残留边界: **子串形态** (overlay 值是 user secret 真值的真子串)
+//! 不排除 — 字节层仍抢占该子串 (方向安全: 真值不外流, 但该 secret 的
+//! restore 不成立), 见 known-limitations.
 //!
 //! # 保护面地板 (`MIN_PROTECTED_CHARS`)
 //!
@@ -112,6 +122,9 @@ pub fn mock_for(value: &str) -> String {
 ///   (disabled 已被 effective 视图排除 — "在役" 语义).
 /// - `selected_provider_key`: 本次请求选中 provider (`selected_id`) 的 effective
 ///   api_key (覆盖 api_key_file 形态 — dispatch 处现场解析, 与转发路径同源).
+/// - `user_secret_values`: effective user secret 真值集 — 与 overlay 值**精确
+///   相等**的凭证被排除 (user-secret 优先, IR 机制接管 redact + restore 全链;
+///   见模块头 "user-secret 优先"). 子串形态不排除 (残留边界, 同上).
 /// - 值去重 (sg 优先保留), 按 value 长度降序 (长串先替换, 与 redact_ir_inner
 ///   的排序同型 — 处理值互为子串的边角).
 /// - 短于 `MIN_PROTECTED_CHARS` 的值丢弃 (地板, 见模块头).
@@ -120,10 +133,16 @@ pub(crate) fn collect_credentials(
     providers: &[crate::provider::Provider],
     selected_provider_key: &str,
     selected_id: &str,
+    user_secret_values: &[&str],
 ) -> Vec<ProtectedCredential> {
     let mut out: Vec<ProtectedCredential> = Vec::new();
     let mut push = |c: ProtectedCredential| {
         if c.value.chars().count() < MIN_PROTECTED_CHARS {
+            return;
+        }
+        // user-secret 优先: 精确相等让位 (IR 机制接管). 比较在去重前 —
+        // 任一来源的值命中即排除.
+        if user_secret_values.contains(&c.value.as_str()) {
             return;
         }
         if out.iter().any(|e| e.value == c.value) {
@@ -288,13 +307,53 @@ mod tests {
             direct_provider("p2", "short"), // < 地板: 丢弃
             direct_provider("p3", "sk-live-0123456789abcdefghijklmnop"),
         ];
-        let out = collect_credentials(sg, &providers, "", "p-sel");
+        let out = collect_credentials(sg, &providers, "", "p-sel", &[]);
         let ids: Vec<&str> = out.iter().map(|c| c.id.as_str()).collect();
         // 长度降序: sgkey_ak_1 (35) > sgprov_p3 (34) > sgkey_ak_2 (32).
         assert_eq!(ids, vec!["sgkey_ak_1", "sgprov_p3", "sgkey_ak_2"]);
         assert!(
             out.windows(2).all(|w| w[0].value.len() >= w[1].value.len()),
             "sorted by value length descending"
+        );
+    }
+
+    #[test]
+    fn collect_excludes_user_secret_exact_values() {
+        // user-secret 优先 (M3): 与 effective user secret 真值**精确相等**的
+        // overlay 值让位 (IR 机制接管 redact + restore, 字节层零命中).
+        const TOKEN: &str = "sg_qzxwv_0123456789abcdefghijk";
+        let sg = vec![
+            cred("sgkey_exact", TOKEN),
+            cred("sgkey_other", "sk-unrelated-0123456789abcdefghij"),
+        ];
+        let out = collect_credentials(
+            sg,
+            &[],
+            "",
+            "p-sel",
+            &[TOKEN, "some-other-user-secret-value"],
+        );
+        let ids: Vec<&str> = out.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["sgkey_other"],
+            "exact-equal value defers to user secret"
+        );
+
+        // 残留边界 (方向安全): 子串形态不排除 — overlay 值是 user secret 真值的
+        // 真子串时仍被字节层抢占 (真值不外流, 但该 secret 的 restore 不成立).
+        let substring = &TOKEN[4..]; // "qzxwv_0123456789abcdefghijk" — 26 chars > 地板
+        let out2 = collect_credentials(
+            vec![cred("sgkey_sub", substring)],
+            &[],
+            "",
+            "p-sel",
+            &[TOKEN],
+        );
+        assert_eq!(
+            out2.len(),
+            1,
+            "substring overlap still protected at byte layer"
         );
     }
 
@@ -306,6 +365,7 @@ mod tests {
             &[direct_provider("p1", "sk-inline-0123456789abcdefgh")],
             file_key,
             "p1",
+            &[],
         );
         let ids: Vec<&str> = out.iter().map(|c| c.id.as_str()).collect();
         assert!(
