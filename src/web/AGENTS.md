@@ -52,7 +52,7 @@ GET    /api/sessions                     → {sessions, total}  (叶子节点, l
 GET    /api/sessions/{sid}/timeline[?before=UUID&limit=N]
                                                → TimelinePage {rounds, tail, has_more}
                                                  (session-aware timeline 分页, oldest-first)
-POST   /api/sync   body: {selected?, expanded[]}  → {sessions, rounds, timeline?}
+POST   /api/sync   body: {selected?, expanded[]}  → {sessions, rounds, timeline?, providers_present}
                                                   (WebUI 统一轮询入口: SSE poke 触发
                                                   + 动态兜底轮询 (SSE 健康 30s / 断开
                                                   3s), 见 "实时刷新" 段; sidebar +

@@ -110,12 +110,19 @@ pub(crate) struct SelectedCursor {
 /// 字段直接透传 [`crate::dag::ConversationDag::sync_snapshot`] 产出的
 /// [`crate::dto::SyncSnapshot`] (`Vec<SessionView>` + `HashMap<SessionId, Vec<RoundBrief>>` +
 /// `Option<TimelineDiffData>`). `timeline = None` 表示无 diff (前端游标已是最新, 等价 304).
+///
+/// `providers_present` 是 web 层附加字段 (dag 层快照不感知 providers — providers
+/// 属 config 域, 只有本 handler 同时持有两者): effective providers 是否非空, 口径与
+/// `GET /api/providers` 的 `providers` 数组同源 ([`crate::provider::ProviderTable::effective_snapshot`],
+/// 排除 Disabled). 消费方 = WebUI sidebar 空态占位的两档引导 (零配置新用户 →
+/// Providers tab; 已有 provider → SDK base_url 指引).
 #[derive(Serialize)]
 pub(crate) struct SyncResponse {
     pub sessions: Vec<SessionSummary>,
     pub rounds: std::collections::HashMap<crate::dag::SessionId, Vec<RoundBrief>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeline: Option<TimelineDiffData>,
+    pub providers_present: bool,
 }
 
 /// POST /api/sync handler.
@@ -131,12 +138,14 @@ pub async fn sync(
         .map(|c| (c.session_id, c.latest_round, c.response_length));
     let snap = state.dag.sync_snapshot(&req.expanded, selected);
     let sessions: Vec<SessionSummary> = snap.sessions;
+    let providers_present = !state.providers.effective_snapshot().is_empty();
     (
         NO_STORE,
         Json(SyncResponse {
             sessions,
             rounds: snap.rounds,
             timeline: snap.timeline,
+            providers_present,
         }),
     )
 }

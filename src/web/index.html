@@ -847,11 +847,17 @@
       font-size: 11px;
       flex: 1;
     }
-    .hint code {
+    .hint code, .empty code {
       background: var(--panel-hi);
       color: var(--info);
       padding: 1px 5px;
       border-radius: 4px;
+    }
+    /* 空态引导的可点击部分 (sidebar 空态 "Providers tab" 链接): 链接蓝 + 下划线. */
+    .empty a {
+      color: var(--link);
+      text-decoration: underline;
+      cursor: pointer;
     }
     .banner {
       background: var(--warn-soft);
@@ -2381,6 +2387,8 @@
         'sidebar.all': 'All',
         'sidebar.hits': 'Hits',
         'sidebar.noSessions': 'No sessions yet',
+        'sidebar.emptyNoProviders': 'No sessions yet — create a provider in the <a href="#" onclick="gotoProvidersTab(); return false">Providers tab</a> to get started.',
+        'sidebar.emptySdkHint': 'No sessions yet — point your SDK base_url at <code>/{o|a|g|l|r}/{provider-id}/…</code> and traffic will appear here.',
         'sidebar.noHitsSessions': 'No sessions with redactions',
         'sidebar.loadingRounds': 'Loading rounds…',
         'sidebar.noPreview': '(no preview)',
@@ -2851,6 +2859,8 @@
         'sidebar.all': '全部',
         'sidebar.hits': '命中',
         'sidebar.noSessions': '暂无会话',
+        'sidebar.emptyNoProviders': '暂无会话 — 先在 <a href="#" onclick="gotoProvidersTab(); return false">Providers 页</a>创建一个 provider 即可开始。',
+        'sidebar.emptySdkHint': '暂无会话 — 把 SDK base_url 指向 <code>/{o|a|g|l|r}/{provider-id}/…</code> 流量就会出现在这里。',
         'sidebar.noHitsSessions': '暂无命中的会话',
         'sidebar.loadingRounds': '轮次加载中…',
         'sidebar.noPreview': '(无预览)',
@@ -3420,6 +3430,11 @@
       sessionsList: [],
       sessionsTotal: 0,
       hitsTotal: 0,
+      // effective providers 是否非空 (三态: true/false/null). 数据源 = /api/sync
+      // 响应的 providers_present (与 GET /api/providers 的 providers 数组同口径,
+      // 排除 Disabled). null = 字段缺席 (首 sync 前的静态占位期 / 新旧端 skew 兜底),
+      // 仅驱动 sidebar 空态占位的三档文案, 不参与任何其他逻辑.
+      providersPresent: null,
       selectedSession: null,
       selectedRound: null,
       filterMode: 'all',   // 'all' | 'hits'. 客户端过滤 (后端 /api/sessions 不过滤).
@@ -3575,6 +3590,8 @@
         state.sessionsTotal = state.sessionsList.length;
         // 客户端统计 hits 维度 (redactions.length > 0 的会话数).
         state.hitsTotal = state.sessionsList.filter(s => (s.redactions || []).length > 0).length;
+        // providers 存在性 (sidebar 空态引导用): 字段非 boolean (缺席/skew) → null 兜底.
+        state.providersPresent = typeof data.providers_present === 'boolean' ? data.providers_present : null;
         updateCountDisplay();
 
         // 2. sidebar 三级 (全量替换每个 expanded 会话的 round 缓存).
@@ -3681,6 +3698,29 @@
       return state.sessionsList;
     }
 
+    // sidebar 空态占位 (两档引导 + 中性兜底). 三档判定只影响空态内部文案, 空态本身的
+    // 消失条件不变 (有 sessions 即被列表整体替换). 依据 = state.providersPresent
+    // (sync 快照的 providers_present; effective 口径见该 state 字段注释):
+    //   false (0 个 provider) → 引导去 Providers tab 创建, "Providers tab" 可点击
+    //     (词条内含 inline onclick 锚点 — 同 data-i18n-html 的作者可控富文本约定,
+    //     无用户输入插值面); 点击复用 tab click 链路 (gotoProvidersTab).
+    //   true  (有 provider)   → SDK base_url 指引.
+    //   null  (字段缺席: 首 sync 前静态占位 / 新旧端 skew) → 中性原文案, 不猜.
+    function sidebarEmptyHtml() {
+      let key;
+      if (state.filterMode === 'hits') key = 'sidebar.noHitsSessions';
+      else if (state.providersPresent === false) key = 'sidebar.emptyNoProviders';
+      else if (state.providersPresent === true) key = 'sidebar.emptySdkHint';
+      else key = 'sidebar.noSessions';
+      return `<div class="empty">${t(key)}</div>`;
+    }
+
+    // 空态引导链接的目标动作: 切到 Providers tab. 复用 tab 元素的既有 click 链路
+    // (active class 切换 + refreshProviders 拉取) — 不另写第四处切换逻辑.
+    function gotoProvidersTab() {
+      document.querySelector('nav.tabs a.tab[data-tab="providers"]')?.click();
+    }
+
     // 渲染侧栏: 两级树 (会话头 + 展开后的轮次列表).
     // 指纹优化: 会话 id 序列 + 关键字段 + state.selectedSession + expandedSessions 一致时跳过重建.
     function renderSidebar() {
@@ -3690,7 +3730,7 @@
       const list = filteredSessions();
       if (list.length === 0) {
         state.lastSidebarFingerprint = '';
-        listEl.innerHTML = `<div class="empty">${state.filterMode === 'hits' ? t('sidebar.noHitsSessions') : t('sidebar.noSessions')}</div>`;
+        listEl.innerHTML = sidebarEmptyHtml();
         return;
       }
       // 指纹: session_id + record_count + preview + status + state.selectedSession + expandedSessions.
