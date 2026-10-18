@@ -125,6 +125,27 @@ check-webui-syntax:
     node --check "$script"
     echo "webui-syntax: OK ($lines lines)"
 
+# playwright 前置守卫 (私有, check-webui-freshness / check-webui 共用的 SSOT):
+# PATH 上的 `playwright` 必须支持 `test` 子命令。存在性之外还校验**能力** —
+# 用户级 profile 常驻同名 Python 变体 (无 `test` 子命令), 未进 devShell 裸跑
+# `just check` 时会抢先解析 (2026-10-18 主工作区实证), 让 freshness 门卫以误导性
+# 的 "陈旧 binary 未被拦截" 失败。探针用顶层 help 的命令清单 grep `test` 行:
+# 不能用 `playwright test --help` 的退出码 — Python 变体对未知子命令打 stderr
+# 后**退出码仍是 0** (实测), 只有命令清单能可靠区分。准确报错 + 修复动作,
+# 同 rc=127 前置守卫的先例 (纯 CLI 解析, 不启动浏览器/测试)。
+_require-playwright-test:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! command -v playwright >/dev/null 2>&1; then
+        echo "check-webui: playwright CLI 不在 PATH (需 devShell 或 vm-nix runner)" >&2
+        exit 1
+    fi
+    if ! playwright --help 2>&1 | grep -qE '^  test '; then
+        echo "check-webui: PATH 上的 playwright 无 test 子命令 (疑似 Python 变体抢占解析): $(command -v playwright)" >&2
+        echo "  需 devShell 的 playwright-test — 用 nix develop --impure -c bash -c 'just check' 运行" >&2
+        exit 1
+    fi
+
 # WebUI freshness 门卫的行为钉子 (#314, 秒级, 阻塞式).
 #
 # 守护对象: tests/webui/playwright.config.ts 的 freshness 门卫与 resolveSgBin 候选选择
@@ -135,15 +156,11 @@ check-webui-syntax:
 #   2. 选最新: debug 新 + release 旧 → resolveSgBin 应命中 debug 且门卫通过 (回归守卫:
 #      P0/P2 共享持久卷下 P0 的 debug 旧产物不得压过更新候选 — #314 review 发现的潜伏缺陷).
 # `--list` 只加载 config 不跑测试/webServer, 秒级返回.
-check-webui-freshness:
+#
+# 前置守卫 (playwright 存在性 + test 能力) 见 `_require-playwright-test` (recipe 依赖).
+check-webui-freshness: _require-playwright-test
     #!/usr/bin/env bash
     set -euo pipefail
-    # 前置守卫: 无 playwright CLI 时给出准确报错, 而不是 fallthrough 到误导性的
-    # "未拦截" 分支 (rc=127 场景).
-    if ! command -v playwright >/dev/null 2>&1; then
-        echo "check-webui-freshness: playwright CLI 不在 PATH (需 devShell 或 vm-nix runner)" >&2
-        exit 1
-    fi
     tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"' EXIT
     # 假 binary 内容无关紧要 — 两个场景都在 config 加载期结束, binary 从未真正执行.
@@ -189,7 +206,7 @@ check-webui-freshness:
 # pkill -f 会匹配 justfile 自己 / 父 shell / nix develop 进程 (它们的命令行也含该字串),
 # 自杀卡死. lsof 按 listening socket 反查 PID, 不误伤. (CI runner microvm 不主动 kill
 # job 子进程, 上次 run 异常退出留下的孤儿会持续 listening, 触发 EADDRINUSE.)
-check-webui: _kill-orphans
+check-webui: _kill-orphans _require-playwright-test
     cd tests/webui && playwright test
 
 # 清理占用 18790/19999 端口的孤儿进程 (Playwright webServer 残留).
