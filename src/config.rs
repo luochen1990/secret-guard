@@ -865,9 +865,12 @@ impl Config {
     /// 任一步失败都返回 `Err`, 让误配在启动时就暴露, 而不是被运行时代码路径静默吞掉.
     pub fn load_or_default(path: &Path) -> anyhow::Result<Self> {
         if !path.exists() {
+            // 上手指引: 与下方 "文件存在但全空" 的组合 WARN (audit_static_config_text,
+            // 已附 WebUI 指路) 语义一致 — 冷启动零配置也能从 WARN 找到下一步.
             tracing::warn!(
                 path = %path.display(),
-                "static config file not found; using defaults"
+                "static config file not found; using defaults; configure via the WebUI \
+                 (Providers/Secrets tabs) or create this file — see README Quick Start"
             );
             return Ok(Self::default());
         }

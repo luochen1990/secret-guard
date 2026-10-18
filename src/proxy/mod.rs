@@ -101,7 +101,7 @@ use axum::{
 };
 
 use crate::error::AppError;
-use crate::provider::{Protocol, ProviderKind, ResolvedRoute};
+use crate::provider::{Protocol, ProviderKind, ProviderTable, ResolvedRoute};
 use crate::state::AppState;
 
 // AppState (crate::state) 持有 models::ModelListCache 字段: 类型是纯数据 store
@@ -197,6 +197,40 @@ pub async fn forward_no_rest(
     dispatch(state, fp, req).await
 }
 
+/// 协议简写清单 join 投影 (SSOT = [`Protocol::ALL`], 分隔符由调用方定 —
+/// URL shape 的交替段与 expected-one-of 文案共用同一派生, 新增协议零同步).
+fn protocol_shorts(sep: &str) -> String {
+    Protocol::ALL
+        .iter()
+        .map(|(_, _, s)| *s)
+        .collect::<Vec<_>>()
+        .join(sep)
+}
+
+/// forward URL 形状提示段: `/{o|a|g|l|r}/{provider-id}/*rest`.
+///
+/// 上手指引: 该类 404 最常见的触发是 SDK base_url 漏掉 `/{short}/{id}` 段.
+fn url_shape_hint() -> String {
+    format!("/{{{}}}/{{provider-id}}/*rest", protocol_shorts("|"))
+}
+
+/// unknown provider 404 的指路后缀, 按 provider 表是否为空分两档 (上手指引):
+/// 空表 (冷启动零配置) → 引导创建; 非空 → 提示 URL 形状并引导核对 id.
+/// 判空用 `effective_snapshot` — 与 WebUI Providers tab 同一视图
+/// (仅 disabled 项的表视为空: 用户打开 tab 看到的就是空列表).
+fn provider_404_hint(providers: &ProviderTable) -> String {
+    if providers.effective_snapshot().is_empty() {
+        "no providers configured — create one in the WebUI Providers tab, or via \
+         [[providers]] in secret-guard.toml"
+            .to_string()
+    } else {
+        format!(
+            "URL shape: {} — check the id in the WebUI Providers tab",
+            url_shape_hint()
+        )
+    }
+}
+
 async fn dispatch(
     state: AppState,
     fp: ForwardPath,
@@ -206,24 +240,26 @@ async fn dispatch(
     let (mut parts, body) = req.into_parts();
 
     // 1. 解析 ingress 协议. 合法简写清单从 Protocol::ALL 派生 (SSOT, 先例:
-    //    web/api/providers.rs 同款投影), 新增协议无需同步此文案.
+    //    web/api/providers.rs 同款投影), 新增协议无需同步此文案 (URL shape 的
+    //    简写交替段同源派生, 见 url_shape_hint).
     let ingress = Protocol::from_short(&fp.proto).ok_or_else(|| {
-        let shorts = Protocol::ALL
-            .iter()
-            .map(|(_, _, s)| *s)
-            .collect::<Vec<_>>()
-            .join("/");
+        let shorts = protocol_shorts("/");
         AppError::NotFound(format!(
-            "unknown protocol '/{}' (expected one of: {shorts})",
-            fp.proto
+            "unknown protocol '/{}' (expected one of: {shorts}; URL shape: {})",
+            fp.proto,
+            url_shape_hint()
         ))
     })?;
 
     // 2. 查找 effective provider (合并 static + dynamic + decision 后的生效值).
-    let provider = state
-        .providers
-        .get_effective(&fp.name)
-        .ok_or_else(|| AppError::NotFound(format!("unknown provider '/{}'", fp.name)))?;
+    //    404 文案按表空与否分档指路 (上手指引, 见 provider_404_hint).
+    let provider = state.providers.get_effective(&fp.name).ok_or_else(|| {
+        AppError::NotFound(format!(
+            "unknown provider '/{}' ({})",
+            fp.name,
+            provider_404_hint(&state.providers)
+        ))
+    })?;
     if !provider.enabled {
         return Err(AppError::Unavailable(format!(
             "provider '{}' is disabled",

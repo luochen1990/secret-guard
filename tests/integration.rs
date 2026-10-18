@@ -1094,11 +1094,19 @@ async fn unknown_protocol_returns_404() {
     let (status, body, _) = proxy_request(&proxy_url, "POST", "/x/foo/v1/chat", "{}", &[]).await;
     assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
     assert!(body.contains("not_found"));
+    // 上手指引: 合法简写清单 + URL 形状提示 (最常见触发是 SDK base_url 漏掉
+    // /{short}/{id} 段). 简写交替段与 expected-one-of 同源 (Protocol::ALL 派生).
+    assert!(body.contains("expected one of: o/a/g/l/r"), "body: {body}");
+    assert!(
+        body.contains("URL shape: /{o|a|g|l|r}/{provider-id}/*rest"),
+        "body: {body}"
+    );
 }
 
 #[tokio::test]
 async fn unknown_provider_returns_404() {
     let upstream = spawn_mock_upstream().await;
+    // spawn_proxy 注册了 "oa-main" → provider 表非空, 走 "核对 id" 档.
     let proxy_url = spawn_proxy(&upstream.url()).await;
     let (status, body, _) = proxy_request(
         &proxy_url,
@@ -1110,6 +1118,48 @@ async fn unknown_provider_returns_404() {
     .await;
     assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
     assert!(body.contains("not_found"));
+    // 上手指引 (非空表档): URL 形状 + 指路 WebUI 核对 id.
+    assert!(
+        body.contains("URL shape: /{o|a|g|l|r}/{provider-id}/*rest"),
+        "body: {body}"
+    );
+    assert!(
+        body.contains("check the id in the WebUI Providers tab"),
+        "body: {body}"
+    );
+    // 非空表不应误导用户去 "创建" (表里已有 provider, 问题是 id 对不上).
+    assert!(!body.contains("no providers configured"), "body: {body}");
+}
+
+/// 空表档 (真实冷启动形态: 零配置): unknown provider 404 指路 "创建 provider"
+/// 而非 "核对 id" — 让新用户从错误信息本身找到下一步.
+#[tokio::test]
+async fn unknown_provider_empty_table_hints_creation() {
+    // 空 provider 表 (真实冷启动形态: 零配置; 无上游可打, 也不需要 mock).
+    let proxy_url = spawn_proxy_full(
+        vec![],
+        reqwest::Client::new(),
+        ConversationDag::new(64, 500, 1),
+        test_secret_table(),
+    )
+    .await;
+    let (status, body, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/anything/v1/chat/completions",
+        "{}",
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+    assert!(body.contains("not_found"));
+    assert!(body.contains("no providers configured"), "body: {body}");
+    assert!(
+        body.contains("create one in the WebUI Providers tab, or via [[providers]]"),
+        "body: {body}"
+    );
+    // 空表档不给 "核对 id" 指引 (表里根本没有可核对的条目).
+    assert!(!body.contains("check the id"), "body: {body}");
 }
 
 #[tokio::test]
