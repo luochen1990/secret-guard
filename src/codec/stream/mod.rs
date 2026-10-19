@@ -1538,7 +1538,7 @@ mod tests {
 
     // ─── STR-5 流式 reader 多 tool_call 索引分配 (契约 §3 STR-5) ──────────────
     //
-    // 契约: docs/design/contracts.md L327-335.
+    // 契约: docs/design/contracts.md §3 STR-5 ("STR-5 流式 reader 多 tool_call 索引分配").
     // OpenAI 流式响应中 N (≥2) 个并行 tool_call 经 reader 解析后, 每个在 IR 中有独立
     // block index (用于 writer 透传到 wire 的 tool_calls[].index, 保证客户端按 index
     // 聚合时不合并).

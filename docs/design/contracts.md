@@ -131,8 +131,8 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 **⏳ 项补齐优先级** (按风险排序, 排期依据 — 剩 10 条 = 9 条 property (lint 口径) + VIEW-2 表格注记 = 2026-09-17 走查稳态集; RED-10 (#305 批2) 的 3 条暂态 ⏳ 已于 2026-10-11 合并时按 T1 实名翻转为 6 条 ✅; 原始 23 条见 2026-08-15 版变更日志):
 
 1. **待裁决 / 架构受限 (3 条)** — 补齐前需先做实现路线裁决或架构改动:
-   STR-3 `prop_non_2xx_sse_no_mock_to_client` (已知实现 gap, 见 STR-3 "理想 vs 现状" 注记,
-   出路与 SEC-10 opt-in 哲学纠缠, 需维护者拍板); DTO-6
+   STR-3 `prop_non_2xx_sse_no_mock_to_client` (已知实现 gap, 见 STR-3 "理想 vs 现状" 注记 —
+   危害定性 = 客户端混淆而非机密性, mock 经 RED-5 不可反推 real; 出路与 SEC-10 opt-in 哲学纠缠, 需维护者拍板); DTO-6
    `prop_cross_proto_delta_no_silent_misalignment` (B1 已把行为定义为 "尾部对齐,
    丢失本轮头部" 并锁定等价; 残留 ⏳ = 前端拆分场景的显式降级标记, 需 UI-1 渲染
    语义配合演进, 见 DTO-6 正文); VIEW-2 流式 `resp_parsed`
@@ -285,7 +285,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 > 当前 property (`fwd_streaming_property.rs`) 守卫**语义等价弱化形式**: no mock leak + content
 > fidelity + tool input fidelity + usage output fidelity. 完整 byte-exact 需重新设计
 > same_proto_restore 为字节级扫描替换 (避免 IR re-serialize), 作为独立架构改动.
-- `prop_proptest_generator_covers_edge_cases`: wire 生成器必须覆盖: secret 轴宽域四臂 (转义字符/CJK+emoji/长 secret, #356) 与流式 mock 转义臂 (含 `"`/`\`) 属覆盖要求. 🔁→`arb_openai_request_with_embedded_secret` + `arb_secret_for_fwd1` 等生成器组 (`src/codec/fwd_property.rs` 覆盖清单注释 + `fwd_streaming_property.rs` 的 `arb_mock_body` 与 byte_by_byte 用例)
+- `prop_proptest_generator_covers_edge_cases`: wire 生成器必须覆盖: secret 轴宽域四臂 (转义字符/CJK+emoji/长 secret, #356) 与流式 mock 转义臂 (含 `"`/`\`) 属覆盖要求. 🔁→`arb_openai_request_with_embedded_secret` + `arb_secret_for_fwd1` 等生成器组 (`src/codec/fwd_property.rs` 头部 "# 生成器覆盖" 段 + `arb_openai_request_value` doc 的场景清单 + `fwd_streaming_property.rs` 的 `arb_mock_body` 与 byte_by_byte 用例)
   - 多个并行 tool_call (≥2)        [9712c52: writer 硬编码 index=0 致 N→1 合并]
   - 空 choices 数组                 [229b2cb: 3 处独立 bug 联合丢失 usage]
   - usage chunk (terminal delta)    [229b2cb]
@@ -643,7 +643,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 **陈述**: 上游流式响应出错 (non-2xx / 断连 / 超时) 时, secret-guard 必须保证 mock 字符串**不出现**在最终返回给客户端的响应 body 中.
 
-> **理想 vs 现状**: 此契约是理想目标. 当前实现中 non-2xx SSE fallback 路径会原样返回上游字节 (含 mock), 是已知 gap.
+> **理想 vs 现状**: 此契约是理想目标. 当前实现中 non-2xx SSE fallback 路径会原样返回上游字节 (含 mock), 是已知 gap. **危害定性**: 透传泄漏的是 mock 而非 real — RED-5 保证 mock 不含 real 的长连续子串 (阈值自适应, 不可反推), 机密性未破; 实际危害 = 客户端混淆 (客户端把 mock 当真实工具输出处理, 如持假 token 发起后续调用而失败), 属可用性问题而非机密性问题. 补齐设计勿按 real 泄漏级别对待.
 
 **Properties**:
 - `prop_non_2xx_sse_no_mock_to_client`: non-2xx SSE 响应的客户端可见 body 中不含任何 mock 字符串. ⏳
@@ -665,7 +665,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 - `prop_stream_reader_assigns_distinct_block_index`: 流式响应中 N (≥2) 个并行 tool_call 经 reader 解析后, 每个 tool_call 在 IR 中有独立的 block index. ✅
 - `prop_stream_reader_mixed_text_and_tool_call_indices_correct`: 文本 + 多 tool_call 混合流的 block index 不冲突. ✅
 
-> **历史 bug**: 9712c52. 注意此契约只覆盖 reader 侧. writer 侧"把 IR block index 透传到 wire `tool_calls[].index`"由 FWD-1/FWD-2 的 byte-exact property 守卫.
+> **历史 bug**: 9712c52. 注意此契约只覆盖 reader 侧. writer 侧"把 IR block index 透传到 wire `tool_calls[].index`"由确定性单测 `openai_same_proto_multi_tool_call_preserves_distinct_indices` (`src/codec/stream/mod.rs` 端到端 reader→writer, N=2) 守卫 — FWD-1/FWD-2 的流式 property **不覆盖**此行为: 流式生成器 (`fwd_streaming_property.rs`) 只产单 tool_call, 流式 checker 只累积 arguments 不校验 index; 非流式 wire 的 tool_call 条目无 index 字段 (`src/codec/openai.rs` writer), 该行为只在流式存在.
 
 ### STR-6 流式 reasoning_content 建模与 restore
 
