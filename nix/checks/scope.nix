@@ -3,10 +3,6 @@
 # (import nixpkgs 产物的 lib, 不含 nixosSystem), 而 module-eval 需要
 # lib.nixosSystem — flake output 的 lib 才有. nixpkgs.lib 位于 mergedLib 合并
 # 链最右, 不被 flake-fhs 函数遮蔽.
-{
-  lib,
-  ...
-}:
-{
+{ lib, ... }: {
   args = { inherit lib; };
 }

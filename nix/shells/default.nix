@@ -1,9 +1,6 @@
 # 职责: 默认 devShell (flake-fhs 经 nix/shells/ 目录发现, evalContext 注入 pkgs).
 # 工具链清单的取舍理由见根 AGENTS.md "覆盖率工具" 与 "rust-diff-analyzer" 段.
-{
-  pkgs,
-  ...
-}:
+{ pkgs, ... }:
 let
   # cargo-llvm-cov 需要 llvm-cov / llvm-profdata, nix rust toolchain 不含 llvm-tools-preview.
   # 用 llvmPackages 提供: profraw 格式跨 LLVM 主版本兼容, 不要求与 rustc 内嵌 LLVM 精确对齐.

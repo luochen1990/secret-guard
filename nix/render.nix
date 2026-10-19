@@ -543,13 +543,13 @@ let
   # 并集匹配下无数据损失, 与 secrets id first-wins 不同性质, 故不拦).
   blankHeaders = lib.filter (h: lib.trim h == "") redactedHeaders;
 
-  redactSection = lib.concatStringsSep "\n" ([
+  redactSection = lib.concatStringsSep "\n" [
     "[redact]"
     "# 自定义敏感 header 名单 (services.secret-guard.redact.redactedHeaders, SEC-4):"
     "# 启动时 trim+lowercase 归一化后按名精确匹配, 与硬编码黑名单并集, 仅影响"
     "# WebUI record 脱敏, 不影响转发字节."
     "redacted_headers = [${lib.concatMapStringsSep ", " q (lib.sort (a: b: a < b) redactedHeaders)}]"
-  ]);
+  ];
 
   # [privacy_scan]: null (mode=off, serde default) 不渲染段; 非 null 渲染档位行.
   # 静态档位 — 扫描 task 在 serve() 启动时按此构造, 改档需重启服务.
