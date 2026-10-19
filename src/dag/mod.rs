@@ -2794,6 +2794,25 @@ mod tests {
         })
     }
 
+    /// fork + split_at 释放 + evict 级联组合 proptest (#362) 的操作形状.
+    ///
+    /// 生成器只产决策参数 (形状 + 骰子 + fresh message 素材), 实际的前缀解释在测试体
+    /// 内按演化的客户端 view (`chain`) 进行 — proptest 策略无状态, 状态依赖输入的
+    /// 标准建模法 (决策参数生成 → 序列解释).
+    ///
+    /// - Extend: 客户端 view 追加新消息后整体重发 (常规轮次, 覆盖 split_at 释放).
+    /// - Fork:   重放旧前缀 view[..j] + 新消息 (真分叉; j ∈ 1..len-1, fresh 文本带
+    ///   per-op 唯一后缀保证不与已有 message 撞内容).
+    /// - Retry:  恰好重放 view[..j] (j == len = 重发当前 leaf → retry 合并;
+    ///   j < len = 重发非 leaf 旧前缀 → CDAG-8 fork + RoundKind::Retry, 覆盖
+    ///   split_at == msgs.len() 的全量释放路径).
+    #[derive(Clone, Copy, Debug)]
+    enum OpKind {
+        Extend,
+        Fork,
+        Retry,
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
 
@@ -2902,6 +2921,199 @@ mod tests {
                 if dag.get_node(leaf).is_some() {
                     let _ = dag.full_request_messages(leaf);
                 }
+            }
+        }
+
+        /// 守卫 CDAG-3 (精确化: 池键集合双向对账) + CDAG-11 (结构对账, #362):
+        /// 任意 fork / split_at 释放 / evict 级联**组合**序列的末态结构不变式.
+        ///
+        /// 覆盖既有 proptest 的缺口 (issue #362): prop_dag_refcount_positive_after_push_sequence
+        /// 每 op 仅 push 单条消息 (无重放旧前缀的 fork 输入); fork + split_at 释放 +
+        /// evict 级联三者组合此前仅 3 个固定场景 #[test] 覆盖 (其中
+        /// fork_and_lru_evict_preserves_shared_parent 还绕过 evict_if_needed 走手动
+        /// gc_cascade). 本测试经真实 push_messages 路径 (内含 evict_if_needed) 触发组合.
+        ///
+        /// 操作域 = Extend / Fork / Retry (形状语义见 [`OpKind`]) + 小容量
+        /// (max_nodes ∈ 1..=4, max_sessions ∈ 2..=6) 强制 evict 真实触发; LRU victim
+        /// 选择由严格递增的 created_at 驱动 (模拟真实请求时序; 同刻时间戳会让
+        /// min_by_key 依赖 HashMap 迭代序, 断言虽不受影响但失败种子复现会漂移).
+        ///
+        /// 末态断言 (白盒访问 inner, 先例见上一测试):
+        /// - (i) 每个存活 node 的 child_count == 以它为 parent 的存活 node 数;
+        /// - (ii) 每个 session 的 leaf 存活 + 归属一致 + 无存活 child (leaf 恒为链
+        ///   tip); 且存活 node 的 parent (Some) 必存活 — 公共 API 流不可达孤儿态
+        ///   (孤儿仅由白盒直调 gc_cascade 构造, 见 prop_orphan_node_degrades_gracefully);
+        /// - (iii) BlockPool 双向对账: refcount 映射与全部存活 node 的 block 引用
+        ///   (req_delta + system_refs + response.message) 逐键逐数相等 — 既有单向
+        ///   property 只断言 refcount > 0, 泄漏方向 (虚高 > 0, block 永久滞留池中)
+        ///   恒绿; 对账断言把泄漏方向也纳入机械验证.
+        #[test]
+        fn prop_dag_state_reconciles_after_fork_evict_sequence(
+            max_nodes in 1usize..=4,
+            max_sessions in 2usize..=6,
+            ops in prop::collection::vec(
+                (
+                    prop_oneof![
+                        Just(OpKind::Extend),
+                        Just(OpKind::Fork),
+                        Just(OpKind::Retry)
+                    ],
+                    any::<u8>(),
+                    arb_role(),
+                    "[a-z0-9]{1,12}"
+                ),
+                1..24
+            )
+        ) {
+            let base = chrono::Utc::now();
+            // min_sessions=1: 允许 evict 收敛到单 session (与既有 evict 测试同型).
+            let dag = ConversationDag::new(max_nodes, max_sessions, 1);
+            // 客户端视角的当前会话 view (累积前缀序列); Fork/Retry 从中取旧前缀重放.
+            let mut chain: Vec<IrMessage> = Vec::new();
+
+            for (i, (kind, dice, role, text)) in ops.into_iter().enumerate() {
+                // fresh 文本带 per-op 唯一后缀: 保证 Fork 真分叉 / Extend 真延续
+                // (内容与已有 message 撞车时 Merkle 前缀匹配会偏离生成器意图 —
+                // 断言是结构对账不依赖意图, 但覆盖度依赖意图成立).
+                let fresh = IrMessage {
+                    role,
+                    content: vec![IrBlock::Text {
+                        text: format!("{text}#{i}"),
+                        extra: Default::default(),
+                    }],
+                    ..Default::default()
+                };
+                let msgs: Vec<IrMessage> = match kind {
+                    OpKind::Extend => {
+                        let mut m = chain.clone();
+                        m.push(fresh);
+                        m
+                    }
+                    OpKind::Fork if chain.len() >= 2 => {
+                        // j ∈ 1..=len-1: 重放严格更短的旧前缀 (parent 必非 session
+                        // leaf → 新 session; 推导见测试头注 (ii)).
+                        let j = 1 + dice as usize % (chain.len() - 1);
+                        let mut m = chain[..j].to_vec();
+                        m.push(fresh);
+                        m
+                    }
+                    // 链过短退化: 只能开新根 (退化场景同属有效 op 域).
+                    OpKind::Fork => vec![fresh],
+                    OpKind::Retry if chain.is_empty() => {
+                        // 空 body 请求: NoMessages 轮 (有效 op 域成员).
+                        Vec::new()
+                    }
+                    // j ∈ 1..=len: j == len 时重发当前 leaf (retry 合并), j < len 时
+                    // 重发旧前缀 (CDAG-8 fork + Retry 轮, split_at 全量释放).
+                    OpKind::Retry => {
+                        let j = 1 + dice as usize % chain.len();
+                        chain[..j].to_vec()
+                    }
+                };
+                let mut event = dummy_event();
+                event.created_at = base + chrono::Duration::milliseconds(i as i64 + 1);
+                // 不 panic 即最低门槛 (push 内含 evict_if_needed + gc_cascade).
+                dag.push_messages(msgs.clone(), event);
+                // 客户端 view 前移: Extend/Fork 后 view = 本次完整 messages
+                // (Fork 模拟客户端回退旧分支改写); Retry 无新内容, view 不动.
+                match kind {
+                    OpKind::Extend | OpKind::Fork => chain = msgs,
+                    OpKind::Retry => {}
+                }
+            }
+
+            // ─── 末态对账断言 (白盒) ─────────────────────────────────────────
+            let g = dag.inner.read();
+
+            // 存活 child 计数表 (一次遍历, 供 (i) 与 (ii) 复用).
+            let mut live_children: HashMap<Uuid, usize> = HashMap::new();
+            for n in g.nodes.values() {
+                if let Some(pid) = n.parent {
+                    *live_children.entry(pid).or_insert(0) += 1;
+                }
+            }
+
+            // (i) child_count == 存活 child 数 (级联 GC 的引用计数正确性;
+            // 偏高 = 悬挂引用致 fork 共享 parent 误保护/泄漏, 偏低 = 误删保护).
+            for (&id, n) in &g.nodes {
+                prop_assert_eq!(
+                    n.child_count,
+                    live_children.get(&id).copied().unwrap_or(0),
+                    "node {}: child_count != 存活 child 数 (CDAG-11)",
+                    id
+                );
+            }
+
+            // (ii-a) 连通性: 存活 node 的 parent 必存活 (evict 级联的 child_count
+            // 保护应覆盖任意组合序列; 违反 = 公共 API 流到达孤儿态).
+            for n in g.nodes.values() {
+                if let Some(pid) = n.parent {
+                    prop_assert!(
+                        g.nodes.contains_key(&pid),
+                        "存活 node 的 parent {pid} 已被删除 — 孤儿态经公共 API 不可达 (CDAG-11)"
+                    );
+                }
+            }
+
+            // (ii-b) session leaf 恒为链 tip: leaf 存活 + 归属一致 + 无存活 child
+            // (若有 node 以 leaf 为 parent, 该 push 当时必然已前移 leaf).
+            for (&sid, s) in &g.sessions {
+                prop_assert!(
+                    g.nodes.contains_key(&s.leaf_id),
+                    "session {:?} 的 leaf {} 不存活 (CDAG-11)",
+                    sid.0,
+                    s.leaf_id
+                );
+                let leaf = &g.nodes[&s.leaf_id];
+                prop_assert_eq!(
+                    leaf.session_id, sid,
+                    "leaf 归属漂移: node.session_id != 所属 session (CDAG-11)"
+                );
+                prop_assert!(
+                    !live_children.contains_key(&s.leaf_id),
+                    "session leaf {} 仍有存活 child — leaf 应恒为链 tip (CDAG-11)",
+                    s.leaf_id
+                );
+            }
+
+            // (iii) BlockPool 双向对账: 池键集合 == 存活引用键集合, 且逐键计数
+            // 精确相等 (refcount == req_delta + system_refs + response.message 的
+            // 引用重数). 覆盖既有单向 property 的泄漏盲区 (虚高 > 0 恒绿).
+            let mut live_refs: HashMap<BlockHash, usize> = HashMap::new();
+            for n in g.nodes.values() {
+                for r in n.req_delta.iter() {
+                    for &h in &r.blocks {
+                        *live_refs.entry(h).or_insert(0) += 1;
+                    }
+                }
+                for &h in n.system_refs.iter() {
+                    *live_refs.entry(h).or_insert(0) += 1;
+                }
+                // 本测试不 attach response (op 域聚焦 push/evict; attach 的 refcount
+                // 路径由 attach_response_* 固定测试覆盖), 计数仍纳入以防未来 op 域扩展.
+                if let Some(resp) = n.response.read().as_ref()
+                    && let Some(m) = &resp.message
+                {
+                    for &h in &m.blocks {
+                        *live_refs.entry(h).or_insert(0) += 1;
+                    }
+                }
+            }
+            let pool_keys: std::collections::HashSet<BlockHash> =
+                g.blocks.refcount.keys().copied().collect();
+            let live_keys: std::collections::HashSet<BlockHash> =
+                live_refs.keys().copied().collect();
+            prop_assert_eq!(
+                pool_keys, live_keys,
+                "池键集合 != 存活引用键集合 (CDAG-3 双向对账: 差集 = 泄漏或悬挂)"
+            );
+            for (&h, &want) in &live_refs {
+                prop_assert_eq!(
+                    g.blocks.refcount.get(&h).copied().unwrap_or(0),
+                    want,
+                    "block {}: refcount != 存活引用精确计数 (CDAG-3, #362)",
+                    h
+                );
             }
         }
 

@@ -699,6 +699,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 **Properties**:
 - `prop_refcount_positive_after_push_sequence`: 任意 push 序列后, 所有 block refcount ≥ 0. 🔁→`prop_dag_refcount_positive_after_push_sequence` (`src/dag/mod.rs`)
 - `prop_refcount_zero_blocks_reclaimed`: refcount=0 的 block 被回收. 🔁→`dag_prefix_block_refcount_no_leak_after_evict` + `dag_fifo_eviction_releases_blocks` (`src/dag/mod.rs`)
+- `prop_refcount_reconciles_with_live_references`: 任意 fork / split_at 释放 / evict 级联组合序列的末态, refcount 映射与存活 node 的 block 引用 (req_delta + system_refs + response.message) 逐键逐数相等 — 池键集合双向对账, 补既有单向 (仅 refcount>0) property 的泄漏盲区 (虚高 > 0 恒绿, #362). 🔁→`prop_dag_state_reconciles_after_fork_evict_sequence` (`src/dag/mod.rs`)
 
 ### CDAG-4 req_delta 不可变
 
@@ -740,6 +741,21 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 **Properties**:
 - `prop_session_id_stable_across_rounds`: 同一会话 N (≥3) 轮 push 后, session id 恒等于根 node 决定的 id. ✅
 - `prop_session_fork_creates_new_session`: fork (前缀相同但后续不同) 创建新 session. 🔁→`prop_session_fork_creates_new_session_id` (`src/dag/mod.rs`)
+
+### CDAG-11 结构对账: child_count / leaf tip / parent 连通 (任意组合序列末态)
+
+**陈述**: 任意 push (含 fork 重放旧前缀 / retry 全前缀重发, 即 split_at 释放的两种形态) + evict 级联的**组合**序列结束后, DAG 结构簿记与真实存活集合精确对账:
+
+1. 每个存活 node 的 `child_count` == 以它为 parent 的存活 node 数;
+2. 每个 session 的 leaf 恒为链 tip (leaf 存活 + `node.session_id` 归属一致 + 无存活 node 以 leaf 为 parent);
+3. 存活 node 的 parent (`Some`) 必存活 — 孤儿态经公共 API 流不可达 (CDAG-7 的孤儿仅由测试白盒直调 `gc_cascade` 构造, 见其测试注释).
+
+> **落地 (2026-10-20, #362)**: 上述三者组合 (fork + split_at 释放 + evict 级联) 此前仅 3 个固定场景 `#[test]` 覆盖, 其中 `fork_and_lru_evict_preserves_shared_parent` 还绕过 `evict_if_needed` 走手动 `gc_cascade`; 既有 proptest (`prop_dag_refcount_positive_after_push_sequence`) 每 op 仅 push 单条消息, 无 fork 输入. 组合任意序列 proptest (`prop_dag_state_reconciles_after_fork_evict_sequence`: Extend / Fork / Retry 操作域 + 小容量强制 evict, 经真实 push_messages → evict_if_needed → gc_cascade 路径) 补齐, 50000 case 冲击零失败 — 末态不变式在当前实现下全部成立, 本条为覆盖缺口补齐而非行为修复.
+
+**Properties**:
+- `prop_child_count_equals_live_children`: 每个存活 node 的 child_count == 存活 child 数 (偏高 = 悬挂引用致 fork 共享 parent 误保护 / block 泄漏, 偏低 = 误删保护). 🔁→`prop_dag_state_reconciles_after_fork_evict_sequence` (`src/dag/mod.rs`)
+- `prop_session_leaf_is_chain_tip`: 每个 session 的 leaf 存活 + 归属一致 + 无存活 child (有 node 以 leaf 为 parent 的 push 当时必然已前移 leaf). 🔁→`prop_dag_state_reconciles_after_fork_evict_sequence` (`src/dag/mod.rs`)
+- `prop_live_node_parent_alive`: 存活 node 的 parent 必存活 (公共 API 流连通性, 任意 evict 组合下 child_count 级联保护成立). 🔁→`prop_dag_state_reconciles_after_fork_evict_sequence` (`src/dag/mod.rs`)
 
 ---
 
@@ -1601,3 +1617,4 @@ chars (char boundary 安全); 其余事件字段为受控类型, 天然无 secre
 | 2026-10-19 | UI-10/UI-11 (融合) | **PR #344 × master #332 双实现语义级合并**: ① 全景探测收敛 SSOT = `POST /api/providers/probe-origin` (origin 归一化 + 面候选枚举 + 证据梯含存在性对照探测) — 吸收 PR 侧 per-outcome common_uri 为 face 行 `common_uri` 字段 (v1 族 base_url=origin, 其余族 origin+uri); ② `POST /api/providers/probe` 收敛 verify 单协议校验 (`protocol` 必填, 缺失 400 指向 probe-origin); ③ 原 `probe_provider_upstream`/`judge_v1_pair`/`recommend`/`merge_v1_pair`/`PROBE_NOTE_*`/`/anthropic` 尾段启发式推荐删除 (存在性梯以真实证据取代 URL 形状推断; 运行时 `heuristic_common_uri` 兜底不动), ProbeResponse 剥离 recommended/note/顶层 common_uri 字段; ④ UI 终态 = 检测台 (`.detect-stage`, PR #344 交互规格①-⑤: 检测台/快速添加/Verify/URI 输入/零行起步) 接线 probe-origin, 吸收 master `#p-discovery` 面板能力 (知识库 origin 直出建议 + extra_faces + typed_face_stripped 提示 + 5 行矩阵含 responses 镜像 + 证据分层呈现), 通用建议机制 `attachInputSuggest` 服务 base_url 行与检测台双宿主; ⑤ 测试融合: 创建流程 describe 11 用例 (含 mimo 存在性回归钉/归一化/extra_faces/已添加禁用); 另补 origin.rs 回归钉 probe_origin_ok_rows_materialize_to_verify_consistent_endpoints (三族分派 probe✓⇒verify✓), models.rs 全景 ~20 用例删除 (防御面经 verify 5 用例守卫), integration 全景 2 用例替换为 verify 3 用例. 删除项 git 考古: 融合 commit message 含 `probe_provider_upstream`/`judge_v1_pair`/`recommend`/`merge_v1_pair`/`PROBE_NOTE_ANTHROPIC_SUFFIX` 关键词 | 编排者裁决 (2026-10-19): UI 终态 = PR #344 检测台; master 侧能力吸收不丢失; API 层融合方向按 "重复最少 + 契约更完整" 判据择 probe-origin 吸收全景 (面候选枚举 ⊇ v1-pair 候选, 证据梯为超集能力, 反向吸收需搬迁 origin.rs 全套编排且丢校准语义) |
 | 2026-10-19 | CFG-3 (增补) | **DELETE `/{id}/override` "重置为空态" (issue #348)**: 新端点 (secrets/providers 对称) — 撤销 static id 的 dynamic 覆盖: 删除 dynamic override (若有) + 清除 decision (若有, 含 prefer_static/disabled 残留) 回 static-only 基线; 存储层新增 `DynamicTable::reset_dynamic` (单次 persist_lock 临界区 + 单次 state.toml atomic_write 同时改写 dynamic 段与 decisions 段, 无中间态 — 与分别调 delete_dynamic + set_decision 的两写方案对比选原子); 幂等 (无可删痕迹仍 204); 非 static id → 404 (纯动态条目的清空归 DELETE `/{id}` 既有管辖, 与 decision_flow 404 同型). 既有 #156 DELETE 语义零变更 (该端点是 "删 override" 的显式入口, 不是放松 409). WebUI 配套: 编辑表单 reset 按钮 (仅 static_preferred/dynamic_override 形态显示, confirm 二次确认, hover tooltip 语义说明). property: `prop_delete_override_resets_to_static_baseline` (存储层配套 `reset_dynamic_clears_override_and_decision` / `reset_dynamic_idempotent_on_baseline`) | issue #348: "编辑动态" 只有更新/取消, 无法重置为空态 (未覆盖状态); 契约增补属新操作登记 (无既有断言改写), admin review 即授权点 |
 | 2026-10-19 | UI-11 (延伸, #347) | **检测台 URL 记忆 + 存量 key 探测引用 + 术语优化 (issue #347 三点)**: ① 探测 URL per-provider localStorage 记忆 (`sg-detect-url:<id>`, UI 层辅助不进 state.toml; 写点 = 编辑态 Detect 点击 + 保存成功钩子 (create 态以生成 id 补写); 读写长度 cap 防御), 二次编辑预填优先级 记忆 > 首端点 base_url > 空; ② 两路探测 (Detect/Verify) 统一 `use_provider_key: <id>` **引用** — 服务端查 effective provider 表注入 Direct 条目 effective_api_key (api_key/api_key_file 与转发同源 — file 形态经 GET DTO 新增 `api_key_file_configured` 布尔判知 (masked 空串; 路径/内容零暴露)), key 不二次过 wire (明文永不下发, 引用是唯一通路; 修二次编辑探测 401), 优先级 显式 api_key > 引用, 未知 id/非 Direct/无 key → keyless (数据非错误), 响应永不回显 key; key 来源消歧提示 stored/keyless/null 三态; ③ 字段名 "URL" + hover 问号 tooltip ("该 URL 用于探测各具体协议端点, 并不直接请求"), 原 "端点发现 (origin 探测)"/"端点 URL" 术语废弃, i18n 键 `providers.baseUrl` → `providers.detectUrlLabel`/`detectUrlHelp`. 2 条 property (`prop_detect_url_memory_prefill` + `prop_probe_uses_provider_key_reference`): Playwright 5 用例 (鉴权墙上游黑盒断言 — 仅精确存量 key 200; 含 file 形态种子) + integration 3 用例 (mockito header matcher 断言, 含 file 形态 + DTO 布尔) | issue #347 用户反馈: ① "应该保存用户输入的探测 URL, 以便二次编辑时自动预填"; ② "二次编辑测试时应该带 key, 现在不带 key 会直接 401"; ③ "'端点发现 (origin 探测)' 字段名太绕, 直接用 'URL' + hover 问号提示 '该URL用于探测各具体协议端点, 并不直接请求'" |
+| 2026-10-20 | CDAG-3 (精确化) + CDAG-11 (新增) | **DAG 组合不变式 proptest 补齐 (#362)**: 新增 `prop_dag_state_reconciles_after_fork_evict_sequence` — 操作域 = 累积前缀序列 + 随机 fork (重放旧前缀) + retry 全前缀重发 (split_at == len 的全量释放) + 小容量 (max_nodes 1..=4) 强制 evict, 经真实 push_messages → evict_if_needed → gc_cascade 路径 (既有 proptest 每 op 仅单条消息无 fork 输入; 组合场景此前仅 3 个固定 #[test], 其一绕过 evict_if_needed 走手动 gc_cascade); 末态断言: (i) child_count == 存活 child 数 + (ii) session leaf 恒为链 tip + parent 连通 + (iii) BlockPool 池键集合 == 存活引用集合的双向对账 (逐键逐数精确相等 — 补既有单向 refcount>0 property 的泄漏方向恒绿盲区, 收纳为 CDAG-3 精确化条目). CDAG-11 (下一可用编号; 9/10 为在途 PR #368/#370 占用) 收纳结构对账. 50000 case 冲击零失败 — 末态不变式当前实现全部成立, 纯覆盖补齐非行为修复 | issue #362: 质量链走查发现组合不变式缺任意序列 proptest + "池键集合 == 存活引用集合" 对账断言全仓不存在 |
