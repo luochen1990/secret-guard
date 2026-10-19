@@ -7,6 +7,8 @@
 #   - 无 check-file-size (rust-diff-analyzer 是 devShell lazy 工具, 不进镜像 CI)
 #   - 无 coverage / WebUI Playwright (coverage 徽章数据源归 coverage.yml, 非门禁;
 #     WebUI Playwright 归 forgejo P2 ci-periodic 档)
+#   - 无 check-webui-freshness (需 playwright CLI — WebUI 工具链归 forgejo P2;
+#     #357 补列, 此前差异清单漏记)
 #   - check-fmt 降级 rust-only (treefmt 需 nix 工具链, runner 无; 降级分支是
 #     justfile 内建的预期行为, 非 hack)
 #   - 工具链: rustup stable (rust-toolchain.toml 钉 stable; MSRV 下界 SSOT =
@@ -41,11 +43,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # just / nextest / machete / deny / ripgrep (check-contracts 依赖):
-      # 预编译二进制安装, 避免 cargo install 编译耗时.
+      # just / nextest / machete / deny: 预编译二进制安装, 避免 cargo install 编译耗时.
+      # (旧注释 "ripgrep (check-contracts 依赖)" 已失实随 #357 移除 — check-contracts
+      # 刻意纯 bash+grep+sed 无 rg 依赖, 见 justfile 该 recipe 头注; rg 的消费者是
+      # check-docs, 而它不在本镜像 step 集, 故不再安装 ripgrep.)
       - uses: taiki-e/install-action@v2
         with:
-          tool: just,cargo-nextest,cargo-machete,cargo-deny,ripgrep
+          tool: just,cargo-nextest,cargo-machete,cargo-deny
 
       - name: fmt (rust-only; treefmt unavailable on this runner)
         run: just check-fmt
@@ -74,8 +78,11 @@ jobs:
       - name: doctests
         run: cargo test --doc --locked
 
+      # typos 钉 minor (#357): v1 是漂浮 major tag (月度字典更新会无声改变行为);
+      # typos 仓无 minor 滚动 tag (仅 v1 + 完整 vX.Y.Z), 故钉当前 minor 的最新
+      # patch — 升级 = 手动 bump 此处。
       - name: typos
-        uses: crate-ci/typos@v1
+        uses: crate-ci/typos@v1.51.1
 
       - name: deny (licenses / bans / sources, offline)
         # cargo deny 走 cargo metadata 解析整个 Cargo.lock (含 wasm/android 等
