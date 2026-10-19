@@ -85,8 +85,16 @@ fn arb_message_item(role: &str) -> impl Strategy<Value = Value> {
         "input_text"
     };
     let role = role.to_string();
+    // 构造器 (非 Clone 复用): impl Strategy 不泄漏 Clone, 双权重经二次构造实现.
+    let mk_text_part =
+        || arb_text_string().prop_map(move |s| json!({"type": part_type, "text": s}));
+    // #363: 未知 part type (input_file 等) → Raw 原文保真 round-trip (修复前
+    // 静默 drop 是 FWD-1/FWD-2 违约); 低权重混入.
+    let arb_unknown_part = "dHJhbnNjcmliZQ[a-z0-9]{8,20}".prop_map(|data| {
+        json!({"type": "input_file", "file": {"file_data": format!("data:text/plain;base64,{data}")}})
+    });
     prop::collection::vec(
-        arb_text_string().prop_map(move |s| json!({"type": part_type, "text": s})),
+        prop_oneof![mk_text_part(), mk_text_part(), arb_unknown_part],
         1..3,
     )
     .prop_map(move |content_parts| {

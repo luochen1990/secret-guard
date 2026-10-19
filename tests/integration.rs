@@ -11079,6 +11079,69 @@ async fn same_proto_redact_preserves_tool_search_defs_and_redacts_embedded_secre
     assert_eq!(status, reqwest::StatusCode::OK, "body: {resp_body}");
 }
 
+/// #363 (OpenAI Chat 同协议 + redact): 未知 content part 类型 (audio) 必须保真
+/// 透传到上游 — 修复前 reader 在 IR 重建路径静默 drop 整个 part (FWD-1 违约,
+/// same_proto.rs → recorder read_request → redact → writer 重序列化真实可达).
+/// 同时锁定红线: 未知 part 内嵌的 secret 被 redact 为 mock.
+#[tokio::test]
+async fn same_proto_redact_preserves_unknown_content_part_and_redacts_embedded_secret() {
+    let real_secret = "sk-live-audio-77";
+    let expected_mock = predict_mock(real_secret);
+    let mut upstream = spawn_mock_upstream().await;
+    // 上游收到的 messages.content: text part 原样 + audio part 原样 (仅 data 内
+    // secret→mock), audio part 不得从 wire 消失.
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "transcribe this"},
+                    {"type": "audio", "input_audio": {
+                        "data": format!("b64-{expected_mock}-payload"), "format": "wav"
+                    }}
+                ]
+            }]
+        })))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"chatcmpl-1","choices":[]}"#)
+        .create_async()
+        .await;
+    let provider = provider_with("oa-main", Protocol::OpenAI, &upstream.url());
+    let proxy_url = spawn_proxy_static_dynamic(
+        vec![provider],
+        vec![],
+        reqwest::Client::new(),
+        ConversationDag::new(64, 500, 1),
+        test_secret_table_with(vec![secret("s1", real_secret)]),
+    )
+    .await
+    .0;
+    let body = serde_json::json!({
+        "model": "gpt-4o",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "transcribe this"},
+                {"type": "audio", "input_audio": {
+                    "data": format!("b64-{real_secret}-payload"), "format": "wav"
+                }}
+            ]
+        }]
+    })
+    .to_string();
+    let (status, resp_body, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        &body,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {resp_body}");
+}
+
 /// #321 (Anthropic 同协议 + redact): server tools 条目保真透传 — 无 name 形态
 /// (code_execution) 走 IrTool::Raw verbatim; 有 name 形态 (web_search) 走
 /// Function + 条目级 extra (type/max_uses), 且不再注入 input_schema:{}.

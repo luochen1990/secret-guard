@@ -1115,6 +1115,11 @@ impl StringLeafOps for IrBlock {
                     v.for_each_str_leaf(f);
                 }
             }
+            // Raw 原文 (#363 红线, 与 IrTool::Raw #321 同型): 整个 JSON 原文的
+            // 字符串叶子全部纳入扫描面 — 未知 part (audio/input_file/document 等)
+            // 的嵌套字段里藏 secret 时不得成为 redact 洞 (保真透传的前提是
+            // 扫描面同覆盖).
+            IrBlock::Raw { entry } => entry.for_each_str_leaf(f),
         }
     }
 
@@ -1175,6 +1180,8 @@ impl StringLeafOps for IrBlock {
                     v.for_each_str_leaf_mut(f);
                 }
             }
+            // Raw 原文 (#363): 与 for_each_str_leaf 同覆盖 (红线: 同扫描面).
+            IrBlock::Raw { entry } => entry.for_each_str_leaf_mut(f),
         }
     }
 }
@@ -1428,6 +1435,8 @@ fn collect_block_leaves<'a>(block: &'a IrBlock, leaves: &mut Vec<&'a str>) {
                 collect_value_leaves(v, leaves);
             }
         }
+        // Raw 原文 (#363) — 与 StringLeafOps 双轨覆盖一致 (红线: 同扫描面).
+        IrBlock::Raw { entry } => collect_value_leaves(entry, leaves),
     }
 }
 
@@ -2275,10 +2284,26 @@ mod tests {
                 },
                 extra: Default::default(),
             },
+            // Raw 原文 (#363): 未知 content part 的字符串叶子必须在扫描面内.
+            IrBlock::Raw {
+                entry: serde_json::json!({
+                    "type": "audio",
+                    "input_audio": {"data": format!("b64-{marker}-payload"), "format": "wav"}
+                }),
+            },
         ];
 
-        for (i, block) in blocks.iter().take(4).enumerate() {
-            // 不可变遍历: marker 必须被发现 (前 4 个 block 含 marker).
+        // marker 检查面: 前 4 个 block + Raw (Base64 image 不含 marker, 跳过).
+        let check: Vec<&IrBlock> = blocks
+            .iter()
+            .enumerate()
+            .filter(|(i, b)| *i < 4 || matches!(b, IrBlock::Raw { .. }))
+            .map(|(_, b)| b)
+            .collect();
+        assert_eq!(check.len(), 5, "marker 注入面: 前 4 block + Raw");
+
+        for (i, block) in check.iter().enumerate() {
+            // 不可变遍历: marker 必须被发现.
             let mut found = false;
             block.for_each_str_leaf(&mut |s| {
                 if s.contains(marker) {
@@ -2288,7 +2313,7 @@ mod tests {
             assert!(found, "block #{i} leaf not visited by for_each_str_leaf");
 
             // 可变遍历: replace marker → REPLACED.
-            let mut b = block.clone();
+            let mut b = (*block).clone();
             b.for_each_str_leaf_mut(&mut |s| {
                 if s.contains(marker) {
                     *s = s.replace(marker, "REPLACED");
@@ -4709,5 +4734,135 @@ mod hit_location_tests {
         };
         e.mock_strategy.resolve_against(&e.value, e.category, "");
         e
+    }
+
+    // ─── #363: IrBlock::Raw (content part 未知类型) 的 redact 扫描面 (红线) ───
+
+    /// 未知 content part (audio 等) 必须保真透传且其字符串叶子纳入扫描与替换 —
+    /// 修复前 reader 静默 drop 整个 part (FWD-1 违约). wire 级验证: reader →
+    /// redact → writer 后除 real→mock 外逐字节保真 (normalize 相等).
+    #[test]
+    fn raw_content_part_secret_redacted_and_roundtripped_openai() {
+        use crate::codec::openai::{OpenAiReader, OpenAiWriter};
+        use crate::codec::{Reader, Writer};
+
+        let secret = "sk-audio-secret-key";
+        let body = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "transcribe this"},
+                    {"type": "audio", "input_audio": {
+                        "data": format!("b64-{secret}-payload"), "format": "wav"
+                    }}
+                ]
+            }]
+        });
+        let mut ir = OpenAiReader.read_request(&body).expect("合法 OpenAI wire");
+        let (map, _seed) = redact_ir(&mut ir, &[secret_entry("sid", secret)]);
+        let mock = map.mock_for(secret).expect("audio part 内 secret 应被命中");
+        let out = OpenAiWriter.write_request(&ir);
+        let out_str = serde_json::to_string(&out).unwrap();
+        assert!(
+            !out_str.contains(secret),
+            "红线: 未知 part 内的 secret 必须被替换 (redact 洞 = 泄漏)"
+        );
+        assert!(out_str.contains(mock), "mock 必须出现在未知 part 的原位置");
+        // wire 级保真: 除 secret→mock 外 normalize 相等 — audio part 原样在 wire 上.
+        let mut expect = body.clone();
+        expect["messages"][0]["content"][1]["input_audio"]["data"] =
+            serde_json::json!(format!("b64-{mock}-payload"));
+        assert_eq!(
+            crate::codec::normalize::normalize_json(&expect),
+            crate::codec::normalize::normalize_json(&out),
+            "#363: 除 secret→mock 外 wire 必须保真 (未知 part 不得被 drop)"
+        );
+    }
+
+    /// Responses 协议同型红线 (#363): 未知 content part 类型保真透传 + redact 覆盖.
+    #[test]
+    fn raw_content_part_secret_redacted_and_roundtripped_responses() {
+        use crate::codec::responses::{ResponsesReader, ResponsesWriter};
+        use crate::codec::{Reader, Writer};
+
+        let secret = "sk-input-file-key";
+        let body = serde_json::json!({
+            "model": "gpt-5.4",
+            "input": [{
+                "type": "message", "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "summarize"},
+                    {"type": "input_file", "file": {
+                        "file_data": format!("data:text/plain;base64,{secret}")
+                    }}
+                ]
+            }]
+        });
+        let mut ir = ResponsesReader
+            .read_request(&body)
+            .expect("合法 Responses wire");
+        let (map, _) = redact_ir(&mut ir, &[secret_entry("sid", secret)]);
+        let mock = map.mock_for(secret).expect("file part 内 secret 应被命中");
+        let out = ResponsesWriter.write_request(&ir);
+        let out_str = serde_json::to_string(&out).unwrap();
+        assert!(
+            !out_str.contains(secret),
+            "红线: 未知 part 内 secret 必须被替换"
+        );
+        assert!(out_str.contains(mock), "mock 必须出现在未知 part 的原位置");
+        let mut expect = body.clone();
+        expect["input"][0]["content"][1]["file"]["file_data"] =
+            serde_json::json!(format!("data:text/plain;base64,{mock}"));
+        assert_eq!(
+            crate::codec::normalize::normalize_json(&expect),
+            crate::codec::normalize::normalize_json(&out),
+            "#363: Responses 未知 part 不得被 drop"
+        );
+    }
+
+    /// Anthropic 协议同型红线 (#363): 未知 content block 类型 (document 等) 保真
+    /// 透传 + redact 覆盖.
+    #[test]
+    fn raw_content_part_secret_redacted_and_roundtripped_anthropic() {
+        use crate::codec::anthropic::{AnthropicReader, AnthropicWriter};
+        use crate::codec::{Reader, Writer};
+
+        let secret = "sk-doc-secret-key";
+        let body = serde_json::json!({
+            "model": "claude-sonnet-5",
+            "max_tokens": 64,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "read this"},
+                    {"type": "document", "source": {
+                        "type": "url", "url": format!("https://example.com/{secret}.pdf")
+                    }}
+                ]
+            }]
+        });
+        let mut ir = AnthropicReader
+            .read_request(&body)
+            .expect("合法 Anthropic wire");
+        let (map, _) = redact_ir(&mut ir, &[secret_entry("sid", secret)]);
+        let mock = map
+            .mock_for(secret)
+            .expect("document block 内 secret 应被命中");
+        let out = AnthropicWriter.write_request(&ir);
+        let out_str = serde_json::to_string(&out).unwrap();
+        assert!(
+            !out_str.contains(secret),
+            "红线: 未知 block 内 secret 必须被替换"
+        );
+        assert!(out_str.contains(mock), "mock 必须出现在未知 block 的原位置");
+        let mut expect = body.clone();
+        expect["messages"][0]["content"][1]["source"]["url"] =
+            serde_json::json!(format!("https://example.com/{mock}.pdf"));
+        assert_eq!(
+            crate::codec::normalize::normalize_json(&expect),
+            crate::codec::normalize::normalize_json(&out),
+            "#363: Anthropic 未知 block 不得被 drop"
+        );
     }
 }

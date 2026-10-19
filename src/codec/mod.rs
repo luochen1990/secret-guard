@@ -401,6 +401,10 @@ fn count_dropped_tool_result_blocks(
             ir::IrBlock::ToolResult { .. } => "tool_result",
             ir::IrBlock::Reasoning { .. } => "reasoning",
             ir::IrBlock::ReasoningContent { .. } => "reasoning_content",
+            // Raw (#363): 同协议 verbatim 透传不折叠 — 但计数器只服务跨协议
+            // 预检 (跨协议路径 Raw 已被 clear_wire_fidelity 丢弃, 不会到折叠点);
+            // 归 "raw" 桶保守计数, 防未来折叠行为变化时静默漏报.
+            ir::IrBlock::Raw { .. } => "raw",
         };
         *dropped.entry(kind).or_insert(0) += 1;
     }
@@ -462,6 +466,108 @@ mod tests {
             content_form: None,
             extra: Default::default(),
         }
+    }
+
+    /// #363: 未知 content part / block 三协议同协议 round-trip verbatim —
+    /// 修复前 reader 静默 drop 整个 part (FWD-1/FWD-2 违约). 畸形已知 type
+    /// (text 缺 text 字段 / image 缺 source) 同为 Raw 原文透传.
+    #[test]
+    fn raw_content_parts_round_trip_verbatim() {
+        use crate::codec::anthropic::{AnthropicReader, AnthropicWriter};
+        use crate::codec::normalize::normalize_json;
+        use crate::codec::openai::{OpenAiReader, OpenAiWriter};
+        use crate::codec::responses::{ResponsesReader, ResponsesWriter};
+        use crate::codec::{Reader, Writer};
+
+        let cases: Vec<(&str, serde_json::Value)> = vec![
+            (
+                "openai",
+                serde_json::json!({
+                    "model": "gpt-4o",
+                    "messages": [{"role": "user", "content": [
+                        {"type": "text", "text": "hi"},
+                        {"type": "audio", "input_audio": {"data": "b64x", "format": "wav"}},
+                        {"type": "text", "logprobs": {"content": ["a"]}},
+                    ]}]
+                }),
+            ),
+            (
+                "responses",
+                serde_json::json!({
+                    "model": "gpt-5.4",
+                    "input": [{"type": "message", "role": "user", "content": [
+                        {"type": "input_text", "text": "hi"},
+                        {"type": "input_file", "file": {"file_data": "data:text/plain;base64,QQ"}},
+                    ]}]
+                }),
+            ),
+            (
+                "anthropic",
+                serde_json::json!({
+                    "model": "claude-sonnet-5", "max_tokens": 8,
+                    "messages": [{"role": "user", "content": [
+                        {"type": "text", "text": "hi"},
+                        {"type": "document", "source": {"type": "url", "url": "https://x/d.pdf"}},
+                        {"type": "image"},
+                    ]}]
+                }),
+            ),
+        ];
+        for (name, body) in cases {
+            let out = match name {
+                "openai" => {
+                    let ir = OpenAiReader.read_request(&body).unwrap();
+                    OpenAiWriter.write_request(&ir)
+                }
+                "responses" => {
+                    let ir = ResponsesReader.read_request(&body).unwrap();
+                    ResponsesWriter.write_request(&ir)
+                }
+                _ => {
+                    let ir = AnthropicReader.read_request(&body).unwrap();
+                    AnthropicWriter.write_request(&ir)
+                }
+            };
+            assert_eq!(
+                normalize_json(&out),
+                normalize_json(&body),
+                "#363 {name}: 未知/畸形 part 必须 verbatim round-trip"
+            );
+        }
+    }
+
+    /// #363 响应侧变体: OpenAI Chat 响应 message.content 数组的单个未知 part
+    /// round-trip 后必须保持 array 形态 — 裸对象不是合法 content 值
+    /// (string | array), `single_or_array` 的单元素解包只对 string 语义无损.
+    #[test]
+    fn raw_content_part_response_single_part_keeps_array_form() {
+        use crate::codec::normalize::normalize_json;
+        use crate::codec::openai::{OpenAiReader, OpenAiWriter};
+        use crate::codec::{Reader, Writer};
+
+        let body = serde_json::json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "audio", "input_audio": {"data": "b64x", "format": "wav"}}]
+                },
+                // null → "stop" 是 reader 既有归一化 (与本测试无关), fixture 直接写终态.
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        });
+        let ir = OpenAiReader.read_response(&body).unwrap();
+        let out = OpenAiWriter.write_response(&ir);
+        assert_eq!(
+            normalize_json(&out),
+            normalize_json(&body),
+            "#363: 单 Raw part 响应必须保持 array 形态 round-trip"
+        );
     }
 
     /// T8 块级统计: 非 Text 块按类型计数 (WARN count/kinds 的数据源), Text 不计.

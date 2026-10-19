@@ -149,6 +149,12 @@ pub(super) fn hash_block(block: &IrBlock) -> BlockHash {
             opaque.hash(&mut h);
             hash_extra(extra, &mut h);
         }
+        // Raw 原文 (#363): serde_json::Value 不 impl Hash — 与 ToolUse input 同型,
+        // 用 canonical JSON string 做 hash (serde_json 默认 BTreeMap key 排序).
+        IrBlock::Raw { entry } => {
+            let entry_str = serde_json::to_string(entry).unwrap_or_default();
+            entry_str.hash(&mut h);
+        }
     }
     h.finish()
 }

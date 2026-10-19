@@ -205,6 +205,12 @@ fn response_to_events(resp: &IrResponse, identity: SynthIdentity) -> Vec<IrStrea
             IrBlock::ToolResult { .. } | IrBlock::Image { .. } => {
                 continue;
             }
+            // Raw 原文 (#363): 流式事件模型 (meta + delta) 无原文容器可承载 —
+            // 与 ToolResult/Image 同型按不可承载跳过. 仅影响伪流式合成 (T5) 路径,
+            // 丢失登记在 known-limitations; 非流式路径 verbatim 保真不受影响.
+            IrBlock::Raw { .. } => {
+                continue;
+            }
         };
         events.push(IrStreamEvent::BlockStart { index, block });
         for delta in deltas {

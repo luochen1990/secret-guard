@@ -515,10 +515,20 @@ impl Writer for OpenAiWriter {
                     }
                     message.insert("reasoning_content".to_string(), Value::String(text.clone()));
                 }
+                // Raw 原文 verbatim 回写 (#363): 响应侧 content array 的未知 part
+                // 同协议 round-trip 保真 (跨协议路径已被 clear_wire_fidelity 丢弃).
+                IrBlock::Raw { entry } => {
+                    content_parts.push(entry.clone());
+                }
             }
         }
-        // OpenAI content: 若只有文本, 用 string; 否则用 array.
-        let content = single_or_array(content_parts);
+        // OpenAI content: 若只有文本, 用 string; 否则用 array. 例外: 单个对象 part
+        // (Raw) 必须保持 array 形态 — 裸对象不是合法 content 值 (string | array),
+        // single_or_array 的解包只对 string 元素语义无损.
+        let content = match content_parts.as_slice() {
+            [Value::Object(_)] => Value::Array(content_parts),
+            _ => single_or_array(content_parts),
+        };
         message.insert("content".to_string(), content);
         if !tool_calls.is_empty() {
             message.insert("tool_calls".to_string(), Value::Array(tool_calls));
@@ -739,7 +749,11 @@ fn read_openai_content(content: Option<&Value>) -> Vec<IrBlock> {
 /// - `{type:"image_url",...}` 对象 (多模态)
 /// - 裸 string `"..."` (assistant 消息的多段文本, 非标准但 OpenAI 接受)
 ///
-/// 未知类型 (audio 等) 静默 drop (L5 待修: 应保留为 IrBlock::Unknown).
+/// 无法建模的元素 (未知 type (audio 等) / 结构畸形的已知 type / 非对象元素)
+/// 收为 [`IrBlock::Raw`] 原文保真 (#363, 与 IrTool::Raw #321 同型) — 同协议
+/// verbatim round-trip, 上游自会拒绝畸形形态, 网关不代改写; 唯一例外是
+/// 空文本形态 (`text:""` 与裸空串) 按既有约定视为缺席丢弃 (writer 对称跳过,
+/// FWD-2 生成器不生成该形态).
 fn read_content_part(part: &Value) -> Option<IrBlock> {
     // 裸 string 元素 (assistant content array 的非标准形态)
     if let Some(s) = part.as_str() {
@@ -751,31 +765,45 @@ fn read_content_part(part: &Value) -> Option<IrBlock> {
             extra: Default::default(),
         });
     }
-    let part = part.as_object()?;
-    let ty = part.get("type").and_then(Value::as_str)?;
+    let raw = || {
+        Some(IrBlock::Raw {
+            entry: part.clone(),
+        })
+    };
+    let Some(obj) = part.as_object() else {
+        // 非对象元素 (数字 / bool / null 等): 原文保真透传, 上游自会拒绝.
+        return raw();
+    };
+    let Some(ty) = obj.get("type").and_then(Value::as_str) else {
+        // 无 type 字段 / type 非 string: 畸形 → Raw 原文透传.
+        return raw();
+    };
     match ty {
-        "text" => {
-            let text = part.get("text").and_then(Value::as_str)?;
-            if text.is_empty() {
-                None
-            } else {
-                Some(IrBlock::Text {
-                    text: text.to_string(),
-                    extra: Default::default(),
-                })
-            }
-        }
+        "text" => match obj.get("text") {
+            Some(Value::String(text)) if text.is_empty() => None,
+            Some(Value::String(text)) => Some(IrBlock::Text {
+                text: text.clone(),
+                extra: Default::default(),
+            }),
+            // text 缺席/类型不符: 畸形已知 type → Raw 原文透传.
+            _ => raw(),
+        },
         "image_url" => {
-            let url = part
+            let url = obj
                 .get("image_url")
                 .and_then(|v| v.get("url"))
-                .and_then(Value::as_str)?;
-            Some(IrBlock::Image {
-                source: parse_image_url(url),
-                extra: Default::default(),
-            })
+                .and_then(Value::as_str);
+            match url {
+                Some(url) => Some(IrBlock::Image {
+                    source: parse_image_url(url),
+                    extra: Default::default(),
+                }),
+                // url 缺席: 畸形已知 type → Raw 原文透传.
+                None => raw(),
+            }
         }
-        _ => None, // 未知类型 (audio 等), 静默 drop.
+        // 未知类型 (audio 等) → Raw 原文保真 (#363, 修复前静默 drop 是 FWD-1 违约).
+        _ => raw(),
     }
 }
 
@@ -1203,8 +1231,19 @@ fn single_or_array(parts: Vec<Value>) -> Value {
 fn write_message(msg: &IrMessage) -> Value {
     match msg.role {
         IrRole::System => {
-            let text = blocks_to_text(&msg.content);
-            json!({"role": "system", "content": text})
+            // 纯 Text 块: 折叠为 string (既有默认形态). 含非 Text 块 (Raw 等,
+            // #363): 回退 array 形态 verbatim 保留 — 折叠为 text 会静默丢块.
+            let all_text = msg
+                .content
+                .iter()
+                .all(|b| matches!(b, IrBlock::Text { .. }));
+            if all_text {
+                let text = blocks_to_text(&msg.content);
+                json!({"role": "system", "content": text})
+            } else {
+                let parts: Vec<Value> = msg.content.iter().filter_map(write_user_block).collect();
+                json!({"role": "system", "content": Value::Array(parts)})
+            }
         }
         IrRole::User => {
             // L1 保真: 按 wire 原始形态输出 content.
@@ -1269,13 +1308,22 @@ fn write_message(msg: &IrMessage) -> Value {
                             }
                         }));
                     }
+                    // Raw 原文 verbatim 回写 (#363): assistant 历史 content array
+                    // 的未知 part 同协议 round-trip 保真 (跨协议路径已被
+                    // clear_wire_fidelity 丢弃, 不会走到这里).
+                    IrBlock::Raw { entry } => {
+                        content_parts.push(entry.clone());
+                    }
                     _ => {}
                 }
             }
             // L1 保真: content_form 决定 wire 形态 (Array / Null 强制; 其余按默认约定).
-            let content = match (msg.content_form, content_parts.len()) {
+            // 例外: 单个对象 part (Raw, #363) 保持 array 形态 — 裸对象不是合法
+            // content 值 (string | array), single_or_array 的解包只对 string 无损.
+            let content = match (msg.content_form, content_parts.as_slice()) {
                 (Some(ContentForm::Array), _) => Value::Array(content_parts),
-                (Some(ContentForm::Null), 0) => Value::Null,
+                (Some(ContentForm::Null), []) => Value::Null,
+                (_, [Value::Object(_)]) => Value::Array(content_parts),
                 _ => single_or_array(content_parts),
             };
             let mut obj = Map::new();
@@ -1358,6 +1406,10 @@ fn write_user_block(b: &IrBlock) -> Option<Value> {
         IrBlock::ToolUse { .. } => None, // user 消息里通常没有 ToolUse
         IrBlock::Reasoning { .. } => None, // user 消息里通常没有 Reasoning
         IrBlock::ReasoningContent { .. } => None, // 同上 (思考原文属 assistant 消息)
+        // Raw 原文 verbatim 回写 (#363): reader 收的是本协议 wire 的原始 part,
+        // 同协议 round-trip 必须字节保真 (跨协议路径已被 clear_wire_fidelity 丢弃,
+        // 不会走到这里).
+        IrBlock::Raw { entry } => Some(entry.clone()),
     }
 }
 

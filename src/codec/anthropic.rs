@@ -932,20 +932,20 @@ fn read_message(msg: &Value) -> Option<IrMessage> {
 /// `cache_control` 缓存断点 (thinking 族同收, T7 修复轮); 也覆盖未来新增的官方字段
 /// (防止再度静默丢失).
 fn read_block(b: &Value) -> Option<IrBlock> {
+    let raw = || Some(IrBlock::Raw { entry: b.clone() });
     let obj = b.as_object()?;
     let ty = obj.get("type").and_then(Value::as_str)?;
     match ty {
-        "text" => {
-            let text = obj.get("text").and_then(Value::as_str).unwrap_or("");
-            if text.is_empty() {
-                None
-            } else {
-                Some(IrBlock::Text {
-                    text: text.to_string(),
-                    extra: collect_extra(obj, &["type", "text"]),
-                })
-            }
-        }
+        "text" => match obj.get("text") {
+            // 空文本按既有约定视为缺席 (writer 对称跳过, FWD-2 生成器不生成该形态).
+            Some(Value::String(text)) if text.is_empty() => None,
+            Some(Value::String(text)) => Some(IrBlock::Text {
+                text: text.clone(),
+                extra: collect_extra(obj, &["type", "text"]),
+            }),
+            // text 缺席/类型不符: 畸形已知 type → Raw 原文透传 (#363).
+            _ => raw(),
+        },
         "tool_use" => {
             let id = obj
                 .get("id")
@@ -962,7 +962,9 @@ fn read_block(b: &Value) -> Option<IrBlock> {
                 .cloned()
                 .unwrap_or(Value::Object(Map::new()));
             if name.is_empty() {
-                None
+                // 畸形 tool_use (缺 name) → Raw 原文透传 (#363, #321 畸形条目同型:
+                // 上游自会拒绝, 网关不代改写).
+                raw()
             } else {
                 Some(IrBlock::ToolUse {
                     id,
@@ -1002,7 +1004,10 @@ fn read_block(b: &Value) -> Option<IrBlock> {
             })
         }
         "image" => {
-            let source = obj.get("source").and_then(Value::as_object)?;
+            let Some(source) = obj.get("source").and_then(Value::as_object) else {
+                // source 缺席/非对象: 畸形已知 type → Raw 原文透传 (#363).
+                return raw();
+            };
             let src_type = source.get("type").and_then(Value::as_str).unwrap_or("");
             let image_source = match src_type {
                 "base64" => {
@@ -1026,7 +1031,8 @@ fn read_block(b: &Value) -> Option<IrBlock> {
                         .to_string();
                     IrImageSource::Url(url)
                 }
-                _ => return None,
+                // 未知 source type: 畸形已知 type → Raw 原文透传 (#363).
+                _ => return raw(),
             };
             Some(IrBlock::Image {
                 source: image_source,
@@ -1084,7 +1090,12 @@ fn read_block(b: &Value) -> Option<IrBlock> {
                 None => None,
             }
         }
-        _ => None, // image 等未建模类型 (流式侧经 dropped_block_starts 配对跳过)
+        _ => {
+            // 未知 block type (document / search_result / 未来新增) → Raw 原文保真
+            // (#363, 修复前静默 drop 是 FWD-1 违约; 流式侧仍经 dropped_block_starts
+            // 配对跳过 — 流式损失见 known-limitations, 与本非流式路径独立).
+            Some(IrBlock::Raw { entry: b.clone() })
+        }
     }
 }
 
@@ -1374,6 +1385,11 @@ fn write_block(b: &IrBlock) -> Option<Value> {
                 None
             }
         },
+        // Raw 原文 verbatim 回写 (#363): reader 收的是本协议 wire 的原始 block
+        // (未知 type / 畸形已知 type), 同协议 round-trip 字节保真 — messages[]
+        // content 与 tool_result.content 嵌套两路共用本函数. 跨协议路径已被
+        // clear_wire_fidelity 丢弃, 不会走到这里.
+        IrBlock::Raw { entry } => Some(entry.clone()),
     }
 }
 

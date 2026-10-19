@@ -419,6 +419,18 @@ impl Writer for ResponsesWriter {
                 IrBlock::ToolResult { .. } | IrBlock::Image { .. } => {
                     // 响应里通常不出现, 跳过.
                 }
+                // Raw 原文 verbatim 回写 (#363): 响应侧 output message content 的
+                // 未知 part 同协议 round-trip 保真 — flush 累积文本后以独立
+                // message item 原样携带 (不折叠进 text_acc, 折叠会改写形态).
+                IrBlock::Raw { entry } => {
+                    flush_text(&mut text_acc, &mut output);
+                    output.push(json!({
+                        "type": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [entry.clone()],
+                    }));
+                }
             }
         }
         flush_text(&mut text_acc, &mut output);
@@ -624,51 +636,74 @@ fn read_message_content(content: Option<&Value>) -> Vec<IrBlock> {
 }
 
 /// 解析 content array 中的一个 part.
+///
+/// 无法建模的元素 (未知 type (input_file 等) / 结构畸形的已知 type / 非对象
+/// 元素) 收为 [`IrBlock::Raw`] 原文保真 (#363, 与 IrTool::Raw #321 同型) —
+/// 同协议 verbatim round-trip, 上游自会拒绝畸形形态; 唯一例外是空文本形态
+/// (`text:""` 等) 按既有约定视为缺席丢弃 (writer 对称跳过, FWD-2 生成器不
+/// 生成该形态).
 fn read_content_part(part: &Value) -> Option<IrBlock> {
-    let part = part.as_object()?;
-    let ty = part.get("type").and_then(Value::as_str)?;
+    let raw = || {
+        Some(IrBlock::Raw {
+            entry: part.clone(),
+        })
+    };
+    let Some(obj) = part.as_object() else {
+        // 非对象元素: 原文保真透传, 上游自会拒绝.
+        return raw();
+    };
+    let Some(ty) = obj.get("type").and_then(Value::as_str) else {
+        // 无 type 字段 / type 非 string: 畸形 → Raw 原文透传.
+        return raw();
+    };
     match ty {
-        "input_text" | "output_text" | "text" => {
-            let text = part.get("text").and_then(Value::as_str).unwrap_or("");
-            if text.is_empty() {
-                None
-            } else {
-                Some(IrBlock::Text {
-                    text: text.to_string(),
-                    extra: Default::default(),
-                })
-            }
-        }
-        "input_image" => part
-            .get("image_url")
-            .and_then(Value::as_str)
-            .map(|url| IrBlock::Image {
+        "input_text" | "output_text" | "text" => match obj.get("text") {
+            Some(Value::String(text)) if text.is_empty() => None,
+            Some(Value::String(text)) => Some(IrBlock::Text {
+                text: text.clone(),
+                extra: Default::default(),
+            }),
+            // text 缺席/类型不符: 畸形已知 type → Raw 原文透传.
+            _ => raw(),
+        },
+        "input_image" => match obj.get("image_url").and_then(Value::as_str) {
+            Some(url) => Some(IrBlock::Image {
                 source: IrImageSource::Url(url.to_string()),
                 extra: Default::default(),
             }),
+            // image_url 缺席: 畸形已知 type → Raw 原文透传.
+            None => raw(),
+        },
         "image_url" => {
             // OpenAI 风格 image_url (object {url: ...}).
-            part.get("image_url")
+            match obj
+                .get("image_url")
                 .and_then(|v| v.get("url"))
                 .and_then(Value::as_str)
-                .map(|url| IrBlock::Image {
+            {
+                Some(url) => Some(IrBlock::Image {
                     source: IrImageSource::Url(url.to_string()),
                     extra: Default::default(),
-                })
+                }),
+                // url 缺席: 畸形已知 type → Raw 原文透传.
+                None => raw(),
+            }
         }
         "refusal" => {
             // refusal text → Text block (语义降级, 但保留信息).
-            let text = part.get("refusal").and_then(Value::as_str).unwrap_or("");
-            if text.is_empty() {
-                None
-            } else {
-                Some(IrBlock::Text {
+            match obj.get("refusal").and_then(Value::as_str) {
+                Some("") => None,
+                Some(text) => Some(IrBlock::Text {
                     text: text.to_string(),
                     extra: Default::default(),
-                })
+                }),
+                // refusal 缺席/类型不符: 畸形已知 type → Raw 原文透传.
+                _ => raw(),
             }
         }
-        _ => None, // 未知类型静默丢弃 (ROB-1)
+        // 未知类型 → Raw 原文保真 (#363, 修复前静默 drop 是 FWD-1 违约; ROB-1
+        // 依旧成立 — Raw 是纯数据容器, 不做任何解析假设).
+        _ => raw(),
     }
 }
 
@@ -969,10 +1004,16 @@ fn write_input_items(msg: &IrMessage) -> Vec<Value> {
             let mut items = Vec::new();
             let mut content_parts: Vec<Value> = Vec::new();
             for b in &msg.content {
-                if let IrBlock::Text { text, .. } = b
-                    && !text.is_empty()
-                {
-                    content_parts.push(json!({"type": "input_text", "text": text}));
+                match b {
+                    IrBlock::Text { text, .. } if !text.is_empty() => {
+                        content_parts.push(json!({"type": "input_text", "text": text}));
+                    }
+                    // Raw 原文 verbatim 回写 (#363): 同协议 round-trip 字节保真
+                    // (跨协议路径已被 clear_wire_fidelity 丢弃, 不会走到这里).
+                    IrBlock::Raw { entry } => {
+                        content_parts.push(entry.clone());
+                    }
+                    _ => {}
                 }
             }
             // 显式空 system 消息也输出空 content item — 保位比省字节优先.
@@ -1037,6 +1078,11 @@ fn write_input_items(msg: &IrMessage) -> Vec<Value> {
                     }
                     IrBlock::ReasoningContent { .. } => {
                         // user 消息里通常不出现 (思考原文属 assistant), 跳过.
+                    }
+                    // Raw 原文 verbatim 回写 (#363): 未知/畸形 part 同协议
+                    // round-trip 保真 (跨协议路径已被 clear_wire_fidelity 丢弃).
+                    IrBlock::Raw { entry } => {
+                        content_parts.push(entry.clone());
                     }
                 }
             }
@@ -1122,6 +1168,12 @@ fn write_input_items(msg: &IrMessage) -> Vec<Value> {
                     }
                     IrBlock::ToolResult { .. } | IrBlock::Image { .. } => {
                         // assistant 消息里通常不出现, 跳过.
+                    }
+                    // Raw 原文 verbatim 回写 (#363): assistant 历史 content 的
+                    // 未知 part 同协议 round-trip 保真 (跨协议路径已被
+                    // clear_wire_fidelity 丢弃, 不会走到这里).
+                    IrBlock::Raw { entry } => {
+                        text_parts.push(entry.clone());
                     }
                 }
             }

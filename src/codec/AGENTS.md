@@ -50,6 +50,16 @@
   function 子对象级 `strict`, responses/anthropic 为条目级), parameters/input_schema
   缺席以 Null 哨兵表示 (writer 跳过, 不注入默认空 schema). 残留: chat 条目**顶层**
   未知字段丢弃 (无真实 wire 形态) — 详见 `docs/known-limitations.md` codec 节.
+- ✅ **content part / block 未知与畸形类型保真透传 (#363, 2026-10-20)**: 三协议 reader
+  对无法建模的 content 数组元素 (未知 type — OpenAI `audio` / Responses `input_file` /
+  Anthropic `document` 等; 结构畸形的已知 type — text 缺 text / image 缺 source /
+  tool_use 缺 name; 非对象元素) 一律收为 `IrBlock::Raw` 原文 (与 `IrTool::Raw` #321
+  同型) — 同协议 IR 路径 (redact) **verbatim round-trip** (字符串叶子进 redact 扫描面),
+  跨协议在 `clear_wire_fidelity` 递归丢弃 (含 ToolResult.content 嵌套) + WARN 计数;
+  修复前的静默 drop 是 FWD-1 违约 (契约红线 `prop_raw_content_part_secret_redacted`,
+  裁决依据 #321 先例). 残留 (known-limitations codec 节): 流式路径 unknown block 仍
+  配对跳过; Responses 响应侧 Raw 以独立 message item 重包装; function_call_output 的
+  array 形态 output 折叠为 string (未知 part 在 tool output 内随之折叠).
 - ✅ `reasoning_content` (思考原文, OpenAI 兼容 provider 非标字段) 同协议建模:
   请求 (assistant 历史回传) / 非流式响应 / 流式 delta 三路径 reader↔writer 对称
   (#176, 契约 STR-6). 跨协议处置见下方 T7 条 (o-origin 跨 a 仍丢弃, 跨 r 保留)。
@@ -185,12 +195,13 @@ normalize(v) == normalize(Writer(Reader(v)))
 | `IrMessage.content_form: Option<ContentForm>` | ir.rs | message content 形态 (String/Array/Null) |
 | `IrMessage.reasoning_content_form: Option<ReasoningContentForm>` | ir.rs | assistant 消息 `reasoning_content` 显式空/null 形态 (#176), 区分 `""`/`null` vs 缺失 |
 | `IrBlock::ToolResult.content_form: Option<ContentForm>` | ir.rs | tool_result 内 content 形态 (Anthropic 特有) |
-| `IrMessage.extra: Map` / `IrTool::Function.extra: Map` (命名空间按来源协议: anthropic/responses 条目级, chat function 子对象级 — `strict` 等; #321) / `IrTool::Raw { entry }` (整条目原文, #321) / 六个 wire 来源 `IrBlock` variant 的 `extra: Map` (T7 修复轮扩至 Reasoning/ReasoningContent — thinking block 的 `cache_control` 是扩展思考官方推荐断点) | ir.rs | 未建模字段逃生舱 (L4/L5, #269): 消息级 `output_config`、block 级/工具级 `cache_control`、`strict` 等原样保真; Raw = 无法建模的整个条目原文 (hosted/custom/畸形) — 字符串叶子进 redact 扫描面; 跨协议经 `clear_wire_fidelity` 清空 (extra 清空 + Raw retain 丢弃 + WARN; 含 ToolResult.content 嵌套递归); block extra 参与 dag 内容寻址 hash; sg-thinking envelope 不携带 extra (打包点在 seam 后恒空, 解包侧由 reader 现收) |
+| `IrMessage.extra: Map` / `IrTool::Function.extra: Map` (命名空间按来源协议: anthropic/responses 条目级, chat function 子对象级 — `strict` 等; #321) / `IrTool::Raw { entry }` (整条目原文, #321) / 六个 wire 来源 `IrBlock` variant 的 `extra: Map` (T7 修复轮扩至 Reasoning/ReasoningContent — thinking block 的 `cache_control` 是扩展思考官方推荐断点) / `IrBlock::Raw { entry }` (content part/block 整条原文, #363) | ir.rs | 未建模字段逃生舱 (L4/L5, #269): 消息级 `output_config`、block 级/工具级 `cache_control`、`strict` 等原样保真; Raw = 无法建模的整个条目原文 (hosted/custom/畸形/未知 part) — 字符串叶子进 redact 扫描面; 跨协议经 `clear_wire_fidelity` 清空 (extra 清空 + 两类 Raw retain 丢弃 + WARN; 含 ToolResult.content 嵌套递归); block extra 参与 dag 内容寻址 hash; sg-thinking envelope 不携带 extra (打包点在 seam 后恒空, 解包侧由 reader 现收) |
 | `IrBlock::ToolResult.is_error: Option<bool>` | ir.rs | 显式形态保真 (#269): None = 字段缺席 (API 语义 false), Some = 显式 true/false 原样回写 |
 
 **清空 SSOT**: `IrRequest::clear_wire_fidelity()` 集中清空所有 wire_fidelity 字段
-(含嵌套 ToolResult 与全部 extra, `clear_block_extras` 递归), 跨协议路径
-(`proxy/cross_proto.rs::cross_proto_forward`) 调用之. 新增 wire_fidelity 字段时只需改这一处.
+(含嵌套 ToolResult 与全部 extra, `clear_block_fidelity` 递归 + Raw block 丢弃,
+跨协议路径 (`proxy/cross_proto.rs::cross_proto_forward`) 调用之. 新增 wire_fidelity
+字段时只需改这一处.
 
 **当前覆盖与搁置**:
 
@@ -198,6 +209,8 @@ normalize(v) == normalize(Writer(Reader(v)))
   reasoning_content 三路径对称 + 显式空/null 形态 (#176, `reasoning_content_form`) /
   system 字段形态 + message/tool/block 级未建模字段 (L4/L5, #269) / is_error 显式形态 (#269) /
   max_tokens 双读别名字段名 (#283, `max_tokens_form`) /
+  未知/畸形 content part 保真 (`IrBlock::Raw`, #363 — 契约红线
+  `prop_raw_content_part_secret_redacted` + `prop_raw_content_parts_round_trip_verbatim`) /
   reasoning 配置三 wire 形态 (`reasoning_effort`/`thinking`/`reasoning`, A1 — 未知档位值与
   `display`/`summary` 子字段经 extra 兜底; first-class 注入仅在 extra 无对应 key 时发生, 无双写)
 - ⏸️ 搁置 (待后续): 多 system messages 合并 (L2, **OpenAI/Responses codec 侧仍提升** —

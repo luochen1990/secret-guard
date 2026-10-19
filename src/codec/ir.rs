@@ -96,16 +96,12 @@ impl IrRequest {
         self.tools_present = false;
         self.system_form = None;
         self.max_tokens_form = None;
-        // 顶层 system blocks 的 extra 同样清空 (#269 评审补充): Anthropic 顶层
-        // system 数组的 block 可携带 cache_control, 跨协议时不得泄漏进 egress wire.
-        clear_block_extras(&mut self.system);
         for m in &mut self.messages {
             m.content_form = None;
             m.reasoning_content_form = None;
-            // block/message 级 extra (#269): 与顶层 extra 同契约 — 同协议透传,
-            // 跨协议清空 (防止 Anthropic 独有字段如 cache_control 泄漏进 egress wire).
+            // 消息级 extra (#269): 与顶层 extra 同契约 — 同协议透传, 跨协议清空
+            // (防止 Anthropic 独有字段如 cache_control 泄漏进 egress wire).
             m.extra.clear();
-            clear_block_extras(&mut m.content);
         }
         // Raw 条目 (#321): 跨协议翻译无法表示 (目标协议没有对应的 hosted/custom
         // 工具形态), 与 extra 同型在此 SSOT 清空点丢弃. WARN 只记计数不记内容
@@ -120,6 +116,21 @@ impl IrRequest {
                  (hosted/custom/malformed tools entries)"
             );
         }
+        // block 级 extra 清空 (含顶层 system blocks, #269 评审补充: Anthropic 顶层
+        // system 数组的 block 可携带 cache_control, 跨协议时不得泄漏进 egress wire)
+        // + Raw content part / block 丢弃 (#363): 与 Raw tools 同型 — 跨协议无法
+        // 表示, 在此 SSOT 清空点递归丢弃 (含 ToolResult.content 嵌套), WARN 只记计数.
+        let mut dropped_raw_blocks = clear_block_fidelity(&mut self.system);
+        for m in &mut self.messages {
+            dropped_raw_blocks += clear_block_fidelity(&mut m.content);
+        }
+        if dropped_raw_blocks > 0 {
+            tracing::warn!(
+                count = dropped_raw_blocks,
+                "dropping raw content part(s) not representable in target protocol \
+                 (unknown/malformed content parts)"
+            );
+        }
         for t in &mut self.tools {
             if let IrTool::Function { extra, .. } = t {
                 extra.clear();
@@ -128,11 +139,20 @@ impl IrRequest {
     }
 }
 
-/// 递归清空 block 的 extra 字段 (含 ToolResult.content 嵌套块).
+/// 清空一组 block 的 wire fidelity 元数据并丢弃 Raw block (#363), 返回丢弃数.
 ///
 /// 与 [`IrRequest::clear_wire_fidelity`] 同属 SSOT 清空点: 新增带 extra 的
-/// IrBlock variant 时只需改这里.
-fn clear_block_extras(blocks: &mut [IrBlock]) {
+/// IrBlock variant 时只需改这里. Raw 递归进入 ToolResult.content 一并处理.
+fn clear_block_fidelity(blocks: &mut Vec<IrBlock>) -> usize {
+    let mut dropped = 0;
+    for b in blocks.iter_mut() {
+        if let IrBlock::ToolResult { content, .. } = b {
+            dropped += clear_block_fidelity(content);
+        }
+    }
+    let before = blocks.len();
+    blocks.retain(|b| !matches!(b, IrBlock::Raw { .. }));
+    let dropped = dropped + (before - blocks.len());
     for b in blocks {
         match b {
             IrBlock::Text { extra, .. }
@@ -141,11 +161,10 @@ fn clear_block_extras(blocks: &mut [IrBlock]) {
             | IrBlock::Image { extra, .. }
             | IrBlock::Reasoning { extra, .. }
             | IrBlock::ReasoningContent { extra, .. } => extra.clear(),
-        }
-        if let IrBlock::ToolResult { content, .. } = b {
-            clear_block_extras(content);
+            IrBlock::Raw { .. } => {}
         }
     }
+    dropped
 }
 
 /// 单条对话消息.
@@ -497,7 +516,7 @@ pub enum IrRole {
 /// 消息内容块 (chat completion 中所有协议都支持 block-based content).
 impl IrBlock {
     /// 该 block 的 wire 级 `extra` (L5, #269; T7 扩至 thinking 族 — 全部六个
-    /// wire 来源 variant 携带).
+    /// wire 来源 variant 携带; Raw 无 extra — 它本身就是整条原文).
     pub fn block_extra(&self) -> Option<&serde_json::Map<String, Value>> {
         match self {
             IrBlock::Text { extra, .. }
@@ -506,6 +525,7 @@ impl IrBlock {
             | IrBlock::Image { extra, .. }
             | IrBlock::Reasoning { extra, .. }
             | IrBlock::ReasoningContent { extra, .. } => Some(extra),
+            IrBlock::Raw { .. } => None,
         }
     }
 }
@@ -519,6 +539,8 @@ impl IrBlock {
 /// 每请求 2-4 个; 扩展思考场景官方推荐断点恰在 thinking block — T7 补齐).
 /// 同协议 round-trip 时 reader 收集 / writer 原样回写; 跨协议翻译前由
 /// `clear_wire_fidelity` 清空 (与顶层 `IrRequest.extra` 契约同型).
+/// 第七个 variant [`IrBlock::Raw`] (#363) 是未知/畸形 part 的整条原文容器,
+/// 无 extra (它本身就是原文) — 同协议 verbatim 回写, 跨协议同样在清空点丢弃.
 /// 注意: sg-thinking envelope **不携带** extra — 打包点在 writer = 跨协议 seam
 /// 之后 (extra 已被清空, 恒空 Map), 解包侧的 extra 由 reader 从 wire item 现收.
 #[derive(Debug, Clone, PartialEq)]
@@ -595,6 +617,19 @@ pub enum IrBlock {
         /// 未建模字段 (L5, T7 — 典型: thinking block 的 `cache_control` 缓存断点,
         /// 扩展思考场景官方推荐断点恰在此)。跨协议经 `clear_wire_fidelity` 清空。
         extra: serde_json::Map<String, Value>,
+    },
+    /// 无法建模为其它 variant 的 content part / content block **原文** (#363,
+    /// 与 [`IrTool::Raw`] (#321) 同型的保真透传容器): 未知 type (OpenAI `audio` /
+    /// Responses `input_file` / Anthropic `document` 等) / 结构畸形 (缺 text 字段 /
+    /// image source 无效 / tool_use 缺 name) 的已知 type / 非对象数组元素。
+    /// reader 一律收为 Raw 而非丢弃 — 同协议 round-trip **verbatim 回写**
+    /// (normalize byte-exact, 上游自会拒绝畸形形态, 网关不代改写); 字符串叶子
+    /// 全部纳入 redact 扫描面 (红线: 未知 part 内藏 secret 不得成为 redact 洞);
+    /// 跨协议翻译在 `clear_wire_fidelity` (SSOT 清空点) 丢弃 + WARN 计数
+    /// (目标协议无法表示)。
+    Raw {
+        /// content array 中的原始 part/block (原样 clone, 不做任何改写)。
+        entry: Value,
     },
 }
 

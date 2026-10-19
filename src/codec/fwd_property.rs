@@ -1099,7 +1099,13 @@ fn arb_openai_content_part() -> impl Strategy<Value = Value> {
         // image_url part
         "https://example.com/[a-z]{3,8}.png"
             .prop_map(|u| { json!({"type":"image_url","image_url":{"url":u}}) }),
-        // NOTE: 未知 part type (audio 等) 需要 IrBlock::Unknown, 暂未实现, 不放入生成器.
+        // #363: 未知 part type (audio 等) → Raw 原文保真 round-trip (修复前静默
+        // drop 是 FWD-1 违约).
+        ("b64[a-z0-9]{8,20}", "[a-z]{2,4}").prop_map(|(data, fmt)| {
+            json!({"type":"audio","input_audio":{"data":data,"format":fmt}})
+        }),
+        // #363: 畸形已知 type (text 缺 text 字段) → Raw 原文保真 (上游自会拒绝).
+        Just(json!({"type":"text","logprobs":{"content":["a"]}})),
     ]
 }
 
@@ -1465,6 +1471,11 @@ fn arb_anthropic_block() -> impl Strategy<Value = Value> {
                 }
                 b
             }),
+        // #363: 未知 block type (document / search_result / 未来新增) → Raw 原文
+        // 保真 round-trip (修复前静默 drop 是 FWD-1 违约).
+        ("https://example.com/[a-z]{3,8}.pdf", "[a-z]{2,6}").prop_map(|(url, title)| {
+            json!({"type": "document", "source": {"type": "url", "url": url}, "title": title})
+        }),
     ]
 }
 
@@ -1708,6 +1719,13 @@ fn arb_openai_request_with_embedded_secret() -> impl Strategy<Value = (Value, St
                         {
                             t.push_str(&format!(" token:{secret}"));
                         }
+                        // 6. 未知 content part 注入 (#363 红线): audio part 的嵌套
+                        //    data 字段藏 secret — Raw part 的字符串叶子必须在
+                        //    redact 扫描面 (保真透传不得开 redact 洞).
+                        parts.push(json!({
+                            "type": "audio",
+                            "input_audio": {"data": format!("tok:{secret}"), "format": "wav"}
+                        }));
                     }
                     _ => {}
                 }
@@ -1787,6 +1805,13 @@ fn arb_anthropic_request_with_embedded_secret() -> impl Strategy<Value = (Value,
                                     }
                                 }
                             }
+                            // 未知 block 注入 (#363 红线): document block 的嵌套
+                            // url 字段藏 secret — Raw block 的字符串叶子必须在
+                            // redact 扫描面.
+                            parts.push(json!({
+                                "type": "document",
+                                "source": {"type": "url", "url": format!("https://x/{secret}.pdf")}
+                            }));
                         }
                         _ => {}
                     }
