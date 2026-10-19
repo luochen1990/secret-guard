@@ -931,7 +931,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 ### CFG-4 持久化原子性
 
-**陈述**: 先写 state.toml (atomic write + fsync), 再更新内存. 写失败时内存回滚.
+**陈述**: 先写 state.toml (atomic write + fsync), 再更新内存. 写失败时内存回滚. atomic write 的崩溃持久性闭环 (#365, 2026-10-20): tmp 文件 `sync_all` → `rename` → **父目录 best-effort fsync** (失败 WARN 不失败 — rename 已成功, 文件已可达; 此处失败只弱化崩溃窗口) — 目录项变更落盘, 崩溃后 rename 结果可持久 (ext4 auto_da_alloc 通常兜底但非保证); 崩溃注入测试不做 (文件系统级故障注入成本高于收益, 以 fsync 语义 + 设计论证保证).
 
 **Properties**:
 - `prop_persist_failure_rolls_back_memory`: state.toml 写失败时, 内存层不留下半提交状态. ✅

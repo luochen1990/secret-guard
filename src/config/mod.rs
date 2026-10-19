@@ -1218,7 +1218,8 @@ pub use decisions::{Decisions, OverrideMode, prune_dangling_decisions};
 
 // ─── atomic_write 共用工具 ─────────────────────────────────────────────────
 
-/// 原子写文件: 先写带 UUID 的 `.tmp`, sync, 再 rename.
+/// 原子写文件: 先写带 UUID 的 `.tmp`, sync, 再 rename, 最后 best-effort fsync
+/// 父目录 (目录项变更落盘, CFG-4 崩溃持久性).
 ///
 /// 同时被 [`DynamicTable::persist_dynamic`] (provider / secret 共享) 调用.
 /// `pub(crate)` 暴露给 auth (api_key 写回) 等需要原子写的模块.
@@ -1251,6 +1252,17 @@ pub(crate) fn atomic_write(path: &Path, text: &str) -> anyhow::Result<()> {
         let _ = std::fs::remove_file(&tmp);
         anyhow::anyhow!("rename {} -> {} failed: {e}", tmp.display(), path.display())
     })?;
+    // CFG-4 崩溃持久性: rename 后对父目录 best-effort fsync — 目录项变更落盘,
+    // 崩溃后 rename 结果可持久 (ext4 auto_da_alloc 通常兜底但非保证). 失败只
+    // WARN 不失败: rename 已成功, 文件已可达, 此处失败只弱化崩溃窗口 (RO
+    // 文件系统上打开目录 fsync 会 EINVAL, 属正常降级).
+    if let Err(e) = std::fs::File::open(parent).and_then(|d| d.sync_all()) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "fsync parent dir after atomic rename failed (best-effort; crash durability window remains)"
+        );
+    }
     Ok(())
 }
 
