@@ -289,15 +289,18 @@ ci-periodic:
 
 # 仅 fmt: treefmt 全仓格式化 (nix/rust/toml/py; 配置 SSOT = 根 treefmt.toml).
 # 仅想格式化 rust 时手动 `cargo fmt` 亦可 (edition 一致, 输出等价).
+# --config-file 必须显式钉死: 本机系统 profile 的 treefmt 是 wrapper, 会强制注入
+# 个人全局配置 (--config-file 覆盖项目配置, 含 prettier/alejandra, 把 md/nix 重写掉);
+# 显式传参在后即胜出 (clap last-wins), 裸 shell 由此回到项目配置 (2026-10-19 事故).
 fmt:
-    treefmt
+    treefmt --config-file treefmt.toml
 
 # 格式门禁: treefmt (格式范围同上方 fmt recipe 的括注). CI runner VM 未预装
 # treefmt 时降级为 cargo fmt --check (仅 rust) + WARN — VM 预装
 # treefmt/nixfmt/taplo/ruff 后删除降级分支 (lc-studio/nixos#1048);
 # 降级窗口内 .nix/.toml/.py 的格式漂移不被 CI 拦, 记得本地跑 just fmt.
 check-fmt:
-    @if command -v treefmt >/dev/null 2>&1; then treefmt --fail-on-change; else \
+    @if command -v treefmt >/dev/null 2>&1; then treefmt --config-file treefmt.toml --fail-on-change; else \
         echo "WARN: treefmt 未安装, 降级为 cargo fmt --check (仅 rust 格式门禁; 全量门禁见 lc-studio/nixos#1048)"; \
         cargo fmt -- --check; \
     fi
