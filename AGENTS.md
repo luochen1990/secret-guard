@@ -224,6 +224,8 @@ Redact 不应无必要地改变 request body 的字节内容, 避免破坏 LLM P
    trim + 小写, 含 `:` 形态 (host:port/裸 IPv6)/IP 字面量/localhost/空串条目 WARN 跳过)。生产 `serve()` 要求
    host 可解析为 SocketAddr, 域名 host 启动即报错 (仅 Host header 侧有白名单)。
    缺 Host header 放行 (rebinding 必带域名 Host)。
+   多值 Host **全值校验** + absolute-form target 的 URI authority 同过白名单
+   (权威混淆拒绝, #356 2026-10-20 加强 — 修复前只检首个 Host 值)。
 2. **`/api/*` 非安全方法 (POST/PUT/DELETE/PATCH) 的 Origin / Sec-Fetch-Site 校验**:
    带 Origin 则其 host:port 必须在白名单 (`Origin: null` 拒绝;
    `allowed_domains` 声明域名同享且端口宽松); 带
