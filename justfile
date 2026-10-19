@@ -614,9 +614,14 @@ check-file-size:
 #      带 src/ 或 tests/ 前缀的相对仓库根也接受 (contracts.md 风格).
 #   2. docs/ci.md "CI 流程" step 清单条数 == .forgejo/workflows/ci-merge.yml 实际 `- name:` 数.
 #      (ci.md 另有若干背景性 step 提及, 不在编号清单内, 故只对齐编号清单.)
+# 扫描面: docs/research/ 不在扫描范围 — 外部仓库调研笔记 (cc-switch 等), 其
+#   `.rs::symbol` 引用指向外部代码库的文件, 对本仓恒 false positive (#357 挂宿主
+#   时划定; 调研笔记是 point-in-time 存档, 无漂移维护义务).
 # 非阻塞定位: 独立 recipe, 不进 `just check` 链 (文档漂移不拦编译, 且 symbol 字面匹配
 # 对 重命名/宏生成 有已知误报面 — 人工 triage 后再决定是否升级). 与 #144 (traceability
 # lint, property→测试) 互补: 本检查管 文档→符号/step.
+# 宿主: forgejo P2 ci-periodic 的 advisory step (continue-on-error, #357) — 此前
+# 无任何自动宿主 (inert guard), 现由 nightly 兜底可见.
 check-docs:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -641,7 +646,7 @@ check-docs:
       if ! rg -q --no-messages "\b$sym\b" "$path"; then
         fail "文档引用的 symbol 不在目标文件中: $ref"
       fi
-    done < <(rg --no-messages -o --no-filename -g '*.md' \
+    done < <(rg --no-messages -o --no-filename -g '*.md' -g '!docs/research/**' \
       '[A-Za-z0-9_/.-]+\.rs::[A-Za-z0-9_]+' AGENTS.md docs src 2>/dev/null | sort -u)
     # --- 2. ci.md step 清单 == ci.yml 实际 step 数 ---
     # grep -c 零匹配时 exit 1 + 输出 0 (pipefail 会让脚本在此非零退出, 属 fail-closed,

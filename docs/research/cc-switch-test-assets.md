@@ -234,7 +234,7 @@ cc-switch (Tauri 应用: React 前端 + Rust 后端)
 - **内容**: 防御 "网关丢弃 item_id / output_index 与 item_id 别名交叉 / delta 乱序" 的
   文本聚合状态机 — keyed (item_id) 与 unkeyed (仅 output_index) 增量的归并、别名绑定、
   交叉别名拒绝、terminal 后 unkeyed 尾巴。
-- **覆盖对照**: **未验证**。我们 `responses/stream.rs::read_responses_stream_event` 的 reader
+- **覆盖对照**: **未验证**。我们 `codec/responses/stream.rs::read_responses_stream_event` 的 reader
   状态机对同款畸形输入 (item_id 缺失、index 重排) 的行为未知 — 若我们假设官方严格帧序而
   cc-switch 的防御来自真实网关 (他们的注释明说来自实战), 则存在脆弱面。
 - **适配**: 先 POC — 用 2-3 个畸形 fixture 喂我们 reader, 观察是 panic/丢字/正确聚合;

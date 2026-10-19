@@ -321,7 +321,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
   (T7, 2026-09-29): 同协议保真 + a⇄r 经 sg-envelope 搬运 (细节见 STR-6 跨协议处置);
   剩余损失: o-origin 思考原文跨到 Anthropic 丢弃 (o 无 opaque 容器), 任何 origin 的
   thinking/opaque 跨到 OpenAI Chat 时 opaque 丢弃 (o 无容器, 正文保留为
-  reasoning_content) — 均有 WARN 计数 (`cross_proto.rs::count_reasoning_blocks`).
+  reasoning_content) — 均有 WARN 计数 (`proxy/cross_proto.rs::count_reasoning_blocks`).
 - **thinking 注入联动** (T6 用户裁决, 2026-09-30; 损失清单精确化, 不改 FWD-3 语义框架 —
   属第 1 层 "建模范围内语义保留" 的显式登记例外): 跨协议翻译**注入** thinking
   (IrReasoning 以 Effort/Budget/Adaptive 写出到 Anthropic) 时, 已建模的采样参数
@@ -1329,7 +1329,7 @@ IR 机制正交:
 
 **陈述**: Direct provider 表单的端点获取主入口是 **origin 先行**的检测台 (2026-10-18 #332 用户裁决 — 起因: 协议先行 + 面 URL 先行的旧交互把知识税转嫁给用户, MiMo 类多面网关的 anthropic 面结构性不可见; **2026-10-19 融合**: master 侧先行落地的独立 `#p-discovery` 面板已被 PR #344 的检测台 `.detect-stage` **取代/吸收** — 编号保留, 交互终态 = 检测台): 用户填 URL (origin 或含面尾段的 base) + key, 检测产出各协议面的**证据矩阵**, 协议由"用户的先验"变为"系统的发现物"。
 
-- **检测矩阵 (恒 200, 失败是数据)**: 检测台 Detect → `POST /api/providers/probe-origin {origin, api_key, extra_faces?}` (全景探测 SSOT — 原 `POST /api/providers/probe` 的全景形态已随 `probe_provider_upstream` 删除收敛, probe 端点专职 verify) → 按固定协议序 (openai/anthropic/gemini/ollama/responses) 每族一行: `ok` (evidence ∈ models|auth|existence) / `absent` / `error`; 证据强度如实分层呈现 — models 带模型清单 N, auth 提示检查 key, existence 注明 POST+对照探测; responses 镜像 openai 证据 + 共用注记 (探测无法区分)。判定梯: ① models 2xx+shape → models; ② 401/403 → auth; ③ models 全阴时 POST 面端点固定最小 JSON body (per-族常量, 见 `origin.rs` 探测体) → 状态码在路由存在枚举集 (400/401/403/405/422, SSOT = `origin.rs::route_exists`) 且**对照路径严格 404** → existence (wildcard/SPA 软-200/软-404 宿主由对照消解; 2026-10-18 mimo/bigmodel curl 校准三结论见 `src/proxy/origin.rs` 头注)。
+- **检测矩阵 (恒 200, 失败是数据)**: 检测台 Detect → `POST /api/providers/probe-origin {origin, api_key, extra_faces?}` (全景探测 SSOT — 原 `POST /api/providers/probe` 的全景形态已随 `probe_provider_upstream` 删除收敛, probe 端点专职 verify) → 按固定协议序 (openai/anthropic/gemini/ollama/responses) 每族一行: `ok` (evidence ∈ models|auth|existence) / `absent` / `error`; 证据强度如实分层呈现 — models 带模型清单 N, auth 提示检查 key, existence 注明 POST+对照探测; responses 镜像 openai 证据 + 共用注记 (探测无法区分)。判定梯: ① models 2xx+shape → models; ② 401/403 → auth; ③ models 全阴时 POST 面端点固定最小 JSON body (per-族常量, 见 `origin.rs` 探测体) → 状态码在路由存在枚举集 (400/401/403/405/422, SSOT = `proxy/origin.rs::route_exists`) 且**对照路径严格 404** → existence (wildcard/SPA 软-200/软-404 宿主由对照消解; 2026-10-18 mimo/bigmodel curl 校准三结论见 `src/proxy/origin.rs` 头注)。
 - **ok 行端点知识 (快速添加的知识源)**: ok 行携带 `base_url` + `common_uri` 端点预填值 — **v1 族** (openai/responses) base_url = 归一化 origin, 面路径经 `common_uri` (`"/v1"` / `""` / 深面前缀) 直填 `Endpoint.common_uri` 布局断言; **anthropic/ollama** base_url = origin + uri (面路径是 base 段), common_uri null; **gemini** 的 `/v1beta` 是运行时自拼版本段 (fetch/verify 恒 `GET {base}/v1beta/models`), 折叠进 models_path — 面恒 `""`, base_url = origin, common_uri null (映射目标是物化端点的 verify/fetch 复现被探测 URL, 回归钉 `probe_origin_ok_rows_materialize_to_verify_consistent_endpoints`)。verify ✓ 直填仅限 evidence=models (模型清单证据即校验证据; auth/existence 不冒充)。
 - **一键添加 = 建议非命令**: ok 行 [添加] 物化 endpoint 行 (protocol 预填可改, base_url/cu 按上条映射); 同协议已存在 → 添加禁用 (已添加), 删行恢复; 添加永不改写既有行。
 - **非阻塞 (UI-10 延伸)**: "添加协议" 手动按钮恒可用 (默认选未配置协议 + 预填检测台 URL); 不检测直接手填可保存; 端点行二次检测 Verify = ✓/✗ 图标仅提示。

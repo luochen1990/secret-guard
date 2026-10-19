@@ -122,7 +122,10 @@ run。skip 仅 schedule 事件查询 + `workflow_file: ci-periodic.yml` 自指 �
 跳过且可选任意分支 = 高风险 PR 合入前全量回归逃生舱)。step: Guard acquire / Checkout /
 Cleanup key / skip-if-passed / **Quality gate (`just ci-periodic`)** = `just check
 --coverage` (插桩测试, 测试集只跑这一次) + `just coverage-gate` (双阈值防倒退, 阻塞) /
-**WebUI regression (Playwright)** (`just check-webui`, continue-on-error — flake 由次晚
+**Docs drift lint** (`just check-docs`, advisory — continue-on-error, #147 的防漂移
+lint 首个自动宿主 (#357): 文档 `.rs::symbol` 引用与 ci.md step 计数漂移预警, 非
+硬门禁; runner 无 rg 时 WARN 跳过) / **WebUI regression (Playwright)** (`just
+check-webui`, continue-on-error — flake 由次晚
 重试自愈; binary 取 mtime 最新候选 — 本档插桩产物恒最新天然命中, playwright.config.ts) / Upload Playwright
 artifacts on failure (截图/trace/报告, retention 14 天) / Guard verify。
 
@@ -145,6 +148,10 @@ artifacts on failure (截图/trace/报告, retention 14 天) / Guard verify。
 
 - **diff 报告 / Diagnose**: 真正非阻塞 (`continue-on-error: true`), 工具/网络/API 失败
   也不影响合并, 无升级计划 (附加功能性质)。
+- **Docs drift lint (check-docs, P2)**: advisory (`continue-on-error: true`, #357 挂
+  P2) — symbol 字面匹配对 重命名/宏生成 有已知误报面, 红 = 人工 triage 提示; 误报面
+  收敛 (如重命名感知) 后可评估转阻塞。runner 无 rg 时 WARN 跳过 (宿主层降级, 同
+  check-fmt 的 treefmt 降级型)。
 - **WebUI regression (Playwright, P2)**: 保持 `continue-on-error` — P2 无 PR 合入语义,
   无 "转阻塞" 升级目标; flake 由次晚 schedule 重试自愈, 失败 tail 摘要 + artifact 可见。
 - **Performance benchmark (P1, compare-save)**: 已是 P1 阻塞信号 (退化 exit 1 → run 红);

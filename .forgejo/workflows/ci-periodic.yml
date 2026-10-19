@@ -7,6 +7,8 @@
 #   特定场景回归的兜底网。本档承接旧 ci.yml 的 coverage 防倒退 (check --coverage +
 #   coverage-gate) 与 WebUI Playwright 回归 (政策变化: 旧 = 每 PR 非阻塞 + 评论;
 #   新 = nightly 兜底, 慢内容离开 PR 反馈路径)。
+#   2026-10 (#357) 增挂 check-docs 文档漂移 lint 的 advisory 宿主 (此前 inert guard,
+#   无任何自动宿主; continue-on-error — 漂移预警非硬门禁)。
 #
 # 刻意不订阅 push (三档分级的立意所在, check-drift 负向断言): 慢内容 (插桩编译 +
 #   全量测试 + Playwright) 离开 push 关键路径 — master push 的即时验证由 ci-merge/
@@ -142,6 +144,23 @@ jobs:
         id: gate
         if: success() && steps.skip.outputs.should_skip != 'true'
         run: just ci-periodic
+
+      # Docs drift lint — check-docs (#147 防漂移 lint) 的 P2 advisory 宿主 (#357):
+      # 此前该 recipe 无任何自动宿主 (inert guard)。advisory 语义 (continue-on-error):
+      # symbol 字面匹配对 重命名/宏生成 有已知误报面, 是文档漂移预警不是硬门禁 —
+      # 红 = 人工 triage, 不阻塞本档任何后续 step, flake 由次晚 schedule 重试自愈。
+      # rg 能力探测: runner 无 rg 时 WARN 跳过 (recipe 自身对缺 rg 是 fail-closed,
+      # 宿主层降级与 check-fmt 的 treefmt 降级 / nix-check 的 daemon 探测同型 —
+      # advisory 宁可跳过不可误红)。
+      - name: Docs drift lint (advisory)
+        if: success() && steps.skip.outputs.should_skip != 'true'
+        continue-on-error: true
+        run: |
+          if command -v rg >/dev/null 2>&1; then
+            just check-docs
+          else
+            echo "::warning::rg 不在 runner — check-docs 跳过 (advisory host, #357)"
+          fi
 
       # WebUI 回归测试 (Playwright 端到端)。
       # webServer 自动启动 mock upstream + secret-guard, binary 取存在候选中 mtime 最新者
