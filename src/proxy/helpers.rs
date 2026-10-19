@@ -484,18 +484,17 @@ mod tests {
         assert_eq!(out.get("baz").unwrap(), "kept");
     }
 
-    /// FWD-4 正向保真 (#356 子项7): 任意自定义 header (非 hop-by-hop / 非
-    /// Connection-listed / 非 host·content-length) 经 sanitize 后**全数保留**
-    /// (含同名多值的顺序). 既有 sanitize_strips_* 系列全是剥离向锚 — 契约主
-    /// 断言 "除显式清单外不丢失" 的正向半面此前无 property.
-    ///
-    /// 生成器: name 两臂 (x- 自定义前缀族 / 任意小写合法 header 名, 经
-    /// prop_filter 排除剥离名单 — 名单以 [`HOP_BY_HOP`] 静态表 + host /
-    /// content-length 为准); value 任意可见 ASCII; 30% 概率同名双值 (append).
-    /// 不发 Connection header ⇒ connection_listed 恒 false (该通道的负例由
-    /// sanitize_strips_connection_listed_custom_headers 覆盖).
+    // FWD-4 正向保真 (#356 子项7): 任意自定义 header (非 hop-by-hop / 非
+    // Connection-listed / 非 host·content-length) 经 sanitize 后**全数保留**
+    // (含同名多值的顺序). 既有 sanitize_strips_* 系列全是剥离向锚 — 契约主
+    // 断言 "除显式清单外不丢失" 的正向半面此前无 property.
     //
-    // (doc 移入宏内 fn — 宏外的 /// 会触发 unused_doc_comments)
+    // 生成器: name 两臂 (x- 自定义前缀族 / 任意小写合法 header 名, 经
+    // prop_assume 排除剥离名单 — 名单以 HOP_BY_HOP 静态表 + host /
+    // content-length 为准); value 任意可见 ASCII; 可选同名双值 (append).
+    // 不发 Connection header ⇒ connection_listed 恒 false (该通道的负例由
+    // sanitize_strips_connection_listed_custom_headers 覆盖).
+    // (/// doc 放宏外会触发 unused_doc_comments — property 说明性 doc 见宏内 fn.)
     proptest! {
         #[test]
         fn prop_sanitize_preserves_arbitrary_custom_headers(

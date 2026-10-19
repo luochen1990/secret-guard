@@ -2479,6 +2479,88 @@ mod tests {
             let shape = s.gen_spec.unwrap().shape;
             prop_assert!(!c5_violated(&mock, &real, &shape, c5_threshold_len(&real)));
         }
+
+        /// 守卫 RED-1 (shape-aware charset 合规, #356 子项5): 结构化形状
+        /// (jwt / pem / public_prefixed) 下 mock 的字符域 = **随机段字符全部来自
+        /// gen_spec.charset** (用户显式配置面 — infer 的 charset 被覆盖) ∪ **结构段
+        /// 字符来自 shape 携带的固定结构** (jwt 点分隔 / PEM 边界行与换行 /
+        /// 公开前缀). 既有 `prop_mock_matches_gen_spec_charset` 经
+        /// `valid_auto_gen_spec` 硬编码 shape: Plain (:2737 注释声明有意收窄 —
+        /// RED-5 公开段豁免与 charset 断言口径冲突), 非 Plain 形状的 charset
+        /// 合规性此前零覆盖; 等长 + C5 已由 `prop_category_shape_mock_equal_length`
+        /// 互补覆盖, 本 property 补 charset 半面.
+        ///
+        /// 构造: real 定向构造四类形状 (同上) → resolve (infer 携带 shape 结构与
+        /// length_range, 保证分段单点一致) → **显式覆盖 charset** (模拟用户
+        /// "选形状 + 自选字符集" 的真实配置面) → gen_candidate.
+        #[test]
+        fn prop_shape_mock_charset_compliance(
+            kind in 0usize..4,
+            body in "[a-zA-Z0-9+/=_-]{8,64}",
+            digits in any::<bool>(),
+            lower in any::<bool>(),
+            upper in any::<bool>(),
+            under in any::<bool>(),
+            hyph in any::<bool>(),
+            other in "[@#$%€]{0,3}",
+            seed in any::<u64>(),
+            counter in 0u32..4,
+        ) {
+            let cat = match kind {
+                0 => SecretCategory::PrivateKey,
+                1 => SecretCategory::Token,
+                2 => SecretCategory::ApiKey,
+                _ => SecretCategory::Other,
+            };
+            let real = match kind {
+                0 => format!("-----BEGIN X-----\n{body}\n-----END X-----"),
+                1 => format!("{body}.{body}.{body}"),
+                2 => format!("sk-{body}"),
+                _ => body.clone(),
+            };
+            let mut s = MockStrategy::default();
+            s.resolve_against(&real, cat, "");
+            let spec = s.gen_spec.as_mut().expect("Auto after resolve has gen spec");
+            // 显式覆盖 charset (空 charset 防御: 全关 + other 空时回落 digits,
+            // 同 valid_auto_gen_spec 的处理).
+            let other_chars: Vec<char> = other.chars().collect();
+            spec.charset = Charset {
+                digits: digits || !(lower || upper || under || hyph || !other_chars.is_empty()),
+                lowercase: lower,
+                uppercase: upper,
+                underscore: under,
+                hyphen: hyph,
+                other: other_chars,
+            };
+            let pool: std::collections::HashSet<char> =
+                spec.charset.enabled_chars().into_iter().collect();
+            // 结构字符: flat_fixed_prefix (Plain=gen prefix / PublicPrefixed=公开前缀)
+            // + shape 分隔符/边界行.
+            let mut allowed: std::collections::HashSet<char> =
+                spec.flat_fixed_prefix().chars().collect();
+            match &spec.shape {
+                SecretShape::Plain => {}
+                SecretShape::PublicPrefixed { .. } => {}
+                SecretShape::Jwt { .. } => {
+                    allowed.insert('.');
+                }
+                SecretShape::Pem {
+                    header_line,
+                    footer_line,
+                    ..
+                } => {
+                    allowed.extend(header_line.chars());
+                    allowed.extend(footer_line.chars());
+                    allowed.insert('\n');
+                }
+            }
+            allowed.extend(pool);
+            let mock = gen_candidate(&real, &s, seed, counter);
+            prop_assert!(
+                mock.chars().all(|c| allowed.contains(&c)),
+                "shape mock {mock:?} has chars outside charset ∪ structure (allowed: {allowed:?})"
+            );
+        }
     }
 
     /// 构造一个 Auto 策略 (测试 helper).
