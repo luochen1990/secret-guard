@@ -78,7 +78,9 @@
 //! - `origin`: origin 先行的端点发现探测 (`probe_origin_upstream`, #332 —
 //!   **全景探测 SSOT**, 吸收了原 `probe_provider_upstream` 的全景职责; 与
 //!   models 的探测件同域复用, 拆分因 file-size 硬门禁).
-//! - `recorder`: DAG record 构造 + 视图守卫 + 响应累积器.
+//! - `recorder`: DAG record 构造 + 视图守卫 + 响应累积器 + InflightGuard (在途
+//!   record 的 finalize 兜底, #364: task/handler panic 或客户端断开取消路径收敛
+//!   error 终态 — 随 push 创建, 终态责任沿 fan_out 路径转移, 详见该模块).
 //! - `same_proto`: 同协议转发 (字节透传 / IR redact).
 //! - `cross_proto`: 跨协议 codec 翻译.
 //! - `fan_out`: 三条响应扇出路径.

@@ -122,6 +122,10 @@ struct FanoutStreamCtx {
     /// 路径由 dispatch 从 map 提取传入 — 配置了 placeholder secret 但请求未命中
     /// 时仍要检测). 空 vec = 无 placeholder 策略 → attach_finality 检测零开销短路.
     leak_watch: Vec<(String, String)>,
+    /// finalize 兜底 guard (#364 P1): 随 ctx move 进 spawn task, task panic /
+    /// 取消时 Drop 兜底 attach error 终态; 正常路径在 attach_finality 后 disarm
+    /// (终态责任由 handler 转移至此).
+    inflight: super::recorder::InflightGuard,
 }
 
 /// 两条流式扇出路径的共享骨架: spawn task 内的 chunk 循环 + 记录 + 收尾.
@@ -163,6 +167,7 @@ async fn fanout_stream_task(
         usage,
         pool_watch,
         leak_watch,
+        mut inflight,
     } = ctx;
 
     let mut stream = upstream_resp.bytes_stream();
@@ -242,6 +247,8 @@ async fn fanout_stream_task(
             ..Default::default()
         },
     );
+    // record 已到终态 → 解除兜底 (#364): 后续 usage/摘要日志 panic 不再改写终态.
+    inflight.disarm();
     // usage-stats 落账 (USAGE-5 计入判据在 ctx 内统一执行; 与 DAG 无耦合,
     // 节点被淘汰不影响).
     usage.record_response(
@@ -286,6 +293,7 @@ pub(crate) async fn fan_out_streaming(
     usage: crate::usage::UsageCtx,
     pool_watch: Option<crate::pool::PoolWatch>,
     leak_watch: Vec<(String, String)>,
+    inflight: super::recorder::InflightGuard,
 ) -> Result<Response<Body>, AppError> {
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(32);
     let resp_headers_for_record = resp_headers.clone();
@@ -312,6 +320,8 @@ pub(crate) async fn fan_out_streaming(
             usage,
             pool_watch,
             leak_watch,
+            // 终态责任转移: spawn task panic/取消由 guard Drop 兜底 (#364 P1).
+            inflight,
         },
         upstream_resp,
         tx,
@@ -429,6 +439,7 @@ pub(crate) async fn fan_out_buffered_ir(
     stream_idle_timeout: Option<std::time::Duration>,
     usage: crate::usage::UsageCtx,
     pool_watch: Option<crate::pool::PoolWatch>,
+    mut inflight: super::recorder::InflightGuard,
 ) -> Result<Response<Body>, AppError> {
     let resp_headers_for_record = resp_headers.clone();
     let status_u16 = resp_status.as_u16();
@@ -600,6 +611,9 @@ pub(crate) async fn fan_out_buffered_ir(
             ..Default::default()
         },
     );
+    // record 已到终态 → 解除兜底 (#364): 本路径 attach 是 inline 的, 此后 handler
+    // 剩余代码 (响应构造 / return) panic 不再改写终态.
+    inflight.disarm();
     // usage-stats 落账 (同 fanout_stream_task; USAGE-5 计入判据在 ctx 内统一执行).
     usage.record_response(
         status_u16,
@@ -645,6 +659,7 @@ pub(crate) async fn fan_out_streaming_with_restore(
     mut redaction_map: RedactionMap,
     stream_idle_timeout: Option<std::time::Duration>,
     usage: crate::usage::UsageCtx,
+    inflight: super::recorder::InflightGuard,
 ) -> Result<Response<Body>, AppError> {
     // 同协议 + restore 模式: ingress == egress, 但 IR re-serialize 用于 restore.
     // restore hook 由本层 (proxy) 注入 — codec::stream 不依赖 redact (解环 #145).
@@ -672,6 +687,7 @@ pub(crate) async fn fan_out_streaming_with_restore(
         stream_idle_timeout,
         usage,
         leak_watch,
+        inflight,
     )
 }
 
@@ -700,6 +716,7 @@ pub(crate) async fn fan_out_streaming_cross_proto(
     mut redaction_map: RedactionMap,
     stream_idle_timeout: Option<std::time::Duration>,
     usage: crate::usage::UsageCtx,
+    inflight: super::recorder::InflightGuard,
 ) -> Result<Response<Body>, AppError> {
     // 跨协议模式 translator: redact 场景注入 StreamingRestorerSet (hook 由本层注入,
     // codec::stream 不依赖 redact, 解环 #145 — 与同协议 restore 路径同一先例).
@@ -735,6 +752,7 @@ pub(crate) async fn fan_out_streaming_cross_proto(
         stream_idle_timeout,
         usage,
         leak_watch,
+        inflight,
     )
 }
 
@@ -756,6 +774,7 @@ fn spawn_restore_fanout(
     stream_idle_timeout: Option<std::time::Duration>,
     usage: crate::usage::UsageCtx,
     leak_watch: Vec<(String, String)>,
+    inflight: super::recorder::InflightGuard,
 ) -> Result<Response<Body>, AppError> {
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(32);
     let resp_headers_for_record = resp_headers.clone();
@@ -776,6 +795,8 @@ fn spawn_restore_fanout(
             // 响应 — 检测的 status 短路恒成立, 恒 None (不构造, 死参数).
             pool_watch: None,
             leak_watch,
+            // 终态责任转移: spawn task panic/取消由 guard Drop 兜底 (#364 P1).
+            inflight,
         },
         upstream_resp,
         tx,
@@ -862,34 +883,7 @@ mod tests {
 
         // 构造 DAG + record_id (fan_out_streaming 通过 attach_response 写 record).
         let dag = ConversationDag::new(64, 16, 4);
-        let msgs = vec![IrMessage {
-            role: IrRole::User,
-            content: vec![IrBlock::Text {
-                text: "hi".to_string(),
-                extra: Default::default(),
-            }],
-            ..Default::default()
-        }];
-        let event = CallEvent {
-            created_at: chrono::Utc::now(),
-            method: "POST".to_string(),
-            path: "/o/test/big".to_string(),
-            req_headers: vec![],
-            ingress_protocol: None,
-            redact_seed: 0,
-            req_system: vec![],
-            policy: Arc::new(PolicySnapshot::default()),
-            req_body_raw: String::new(),
-            preview: None,
-            model: None,
-            round_role: IrRole::User,
-            round_kind: crate::dag::RoundKind::Normal,
-            redactions: Arc::from(Vec::new()),
-            upstream_model: None,
-            upstream_id: Arc::from("test"),
-            capture_mode: crate::config::AuditCaptureMode::Full,
-        };
-        let record_id = dag.push_messages(msgs, event);
+        let record_id = push_test_record(&dag, "/o/test/big");
 
         let resp_headers = HeaderMap::new();
         // streamed=false: 走非流式 body 累积分支 (overflow 时 body=banner).
@@ -918,6 +912,7 @@ mod tests {
             ),
             None,       // pool_watch: 非 pool 流量 (检测短路路径)
             Vec::new(), // leak_watch: 透传测试无 placeholder 策略 (检测零开销)
+            super::super::recorder::InflightGuard::new(&dag, record_id),
         )
         .await
         .expect("fan_out_streaming must not error on large body");
@@ -977,5 +972,134 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         dag.get_response(node_id)
+    }
+
+    /// push 一个 record 并返回其 id (panic 兜底 / overflow 截断测试的共享
+    /// fixture: 最小 CallEvent 构造, 差异仅 path).
+    fn push_test_record(dag: &ConversationDag, path: &str) -> uuid::Uuid {
+        let msgs = vec![IrMessage {
+            role: IrRole::User,
+            content: vec![IrBlock::Text {
+                text: "hi".to_string(),
+                extra: Default::default(),
+            }],
+            ..Default::default()
+        }];
+        let event = CallEvent {
+            created_at: chrono::Utc::now(),
+            method: "POST".to_string(),
+            path: path.to_string(),
+            req_headers: vec![],
+            ingress_protocol: None,
+            redact_seed: 0,
+            req_system: vec![],
+            policy: Arc::new(PolicySnapshot::default()),
+            req_body_raw: String::new(),
+            preview: None,
+            model: None,
+            round_role: IrRole::User,
+            round_kind: crate::dag::RoundKind::Normal,
+            redactions: Arc::from(Vec::new()),
+            upstream_id: Arc::from("test"),
+            upstream_model: None,
+            capture_mode: crate::config::AuditCaptureMode::Full,
+        };
+        dag.push_messages(msgs, event)
+    }
+
+    // ─── #364 P1: 流式 task panic 的 finalize 兜底 ──────────────────────────
+    //
+    // fanout_stream_task 跑在两处 tokio::spawn 里且 JoinHandle 被丢弃 — task 内
+    // panic 被 tokio 在 task 边界吞掉, attach (:229 一带) 永不执行 → record 永停
+    // 在途 (WebUI 永显 "等待中" + audit latest 档 req_body_raw 永久滞留).
+    // InflightGuard (recorder) 随 FanoutStreamCtx 进入 task, unwind 时经 Drop
+    // 兜底 attach error 终态 — 本测试直接 spawn task 注入 panic 管道复现.
+
+    /// 首 chunk 即 panic 的管道 (P1 复现注入, issue #364 MRE-2).
+    struct PanicPipe;
+
+    impl ChunkPipeline for PanicPipe {
+        fn transform(&mut self, _chunk: &Bytes) -> Option<Bytes> {
+            panic!("PanicPipe: simulated stream-translate panic (#364)");
+        }
+        fn finish_tail(&mut self) -> Bytes {
+            Bytes::new()
+        }
+    }
+
+    /// #364 P1: 流式 spawn task panic 时, record 必须收敛到 error 终态
+    /// (InflightGuard 的 Drop 兜底 attach), 而非永停在途.
+    #[tokio::test]
+    async fn stream_task_panic_finalizes_record_with_error() {
+        // 上游: 单 chunk body (首 chunk 即触发 PanicPipe).
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/panic")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body("data: hi\n\n")
+            .create_async()
+            .await;
+        let client = reqwest::Client::new();
+        let upstream_resp = client
+            .post(format!("{}/panic", server.url().trim_end_matches('/')))
+            .send()
+            .await
+            .expect("upstream request must succeed");
+
+        let dag = ConversationDag::new(64, 16, 4);
+        let record_id = push_test_record(&dag, "/o/test/v1/chat");
+        let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(32);
+        let handle = tokio::spawn(fanout_stream_task(
+            FanoutStreamCtx {
+                dag: dag.clone(),
+                record_id,
+                started: std::time::Instant::now(),
+                resp_headers_for_record: HeaderMap::new(),
+                redacted_headers: Arc::from(Vec::new()),
+                status_u16: 200,
+                streamed: true,
+                stream_idle_timeout: None,
+                usage: crate::usage::UsageCtx::new(
+                    Arc::new(crate::usage::UsageStore::in_memory()),
+                    Arc::from("test"),
+                    None,
+                    "o",
+                    "POST",
+                    crate::dag::RoundKind::Normal,
+                    uuid::Uuid::new_v4(),
+                    None,
+                    Arc::from(Vec::new().into_boxed_slice()),
+                ),
+                pool_watch: None,
+                leak_watch: Vec::new(),
+                inflight: super::super::recorder::InflightGuard::new(&dag, record_id),
+            },
+            upstream_resp,
+            tx,
+            None, // parsed_sync 不参与 (panic 点在 transform)
+            PanicPipe,
+            |_ps, _acc| super::super::recorder::RespFinality::empty(),
+            |_acc| String::new(),
+        ));
+        // 消费 rx 防 channel 满阻塞 (panic 前首 chunk 已 send? 无论哪种, drop 即可).
+        drop(rx);
+
+        // panic 被 tokio 在 task 边界捕获.
+        let join_err = handle.await.expect_err("task must panic via PanicPipe");
+        assert!(join_err.is_panic(), "expected panic, got {join_err:?}");
+
+        // 兜底: unwind 中 InflightGuard Drop 已 attach error 终态 (而非永停 None).
+        let resp = poll_response_data(&dag, record_id)
+            .await
+            .expect("record must be finalized after task panic (guard attach)");
+        assert!(
+            resp.error.is_some(),
+            "panic finalization must carry an error label, got {resp:?}"
+        );
+        assert!(
+            !resp.is_inflight(),
+            "record must leave in-flight state after panic, got {resp:?}"
+        );
     }
 }

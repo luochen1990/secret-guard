@@ -4444,6 +4444,69 @@ async fn nonstream_slow_upstream_waits_with_nonstream_timeout() {
     assert_eq!(list[0].resp_status, 200);
 }
 
+// ─── #364 P3: 客户端在响应头返回前断开 — record 收敛终态 (不留永久在途) ────
+//
+// handler 停在 send_upstream_or_fail await 时客户端整体断开 → hyper/axum 取消
+// (drop) handler future → 修复前无任何 attach, record 永停在途 (WebUI 永显
+// "等待中" + audit latest 档 req_body_raw 永久滞留, 上界仅 session LRU 淘汰).
+// InflightGuard 是 handler future 的局部, 随 future drop 而 Drop → 兜底 attach
+// error 终态. 本测试用 raw TCP 表达 "发完请求即断连" (reqwest 无法在响应前断开).
+
+#[tokio::test]
+async fn client_disconnect_before_response_headers_finalizes_record() {
+    use tokio::io::AsyncWriteExt;
+
+    // 慢上游 30s 后才回响应头: 远超 3s 观察窗 (终态若来自上游必然超窗), 且默认
+    // 超时档 (全 None = 无保护) 不触发 → handler 稳定停在 send_upstream_or_fail.
+    let upstream_url = spawn_slow_upstream(Duration::from_secs(30)).await;
+    let upstream_timeouts = secret_guard::config::UpstreamTimeouts {
+        connect: None,
+        response_header: None,
+        nonstream_response_header: None,
+        stream_idle: None,
+    };
+    let (proxy_url, records_handle) =
+        spawn_proxy_with_timeouts(&upstream_url, upstream_timeouts).await;
+
+    // raw TCP: 发完整请求 → 等 node push 完成 (handler 已停在 send_upstream_or_fail
+    // await — push 是同步快路径, node 出现即证明 push 已过) → 整体断开.
+    // (立即断开时 hyper 可能在 handler 启动前就取消 — 那种形态 node 不存在,
+    // 无滞留 record, 不在本测试的关注范围.)
+    let body = r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#;
+    let addr: std::net::SocketAddr = proxy_url
+        .trim_start_matches("http://")
+        .parse()
+        .expect("proxy url is host:port");
+    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let req = format!(
+        "POST /o/oa-main/v1/chat/completions HTTP/1.1\r\nhost: {addr}\r\n\
+         content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    sock.write_all(req.as_bytes()).await.unwrap();
+    wait_until_or_timeout(&records_handle, |l| !l.is_empty(), Duration::from_secs(3)).await;
+    sock.shutdown().await.unwrap();
+    drop(sock);
+
+    // 断开后 3s 内 record 必须收敛到终态 (guard 兜底 error attach), 而非永停在途
+    // (resp_status==0 && error==None). 上游 30s 才响应 — 窗口内到达的终态
+    // 只能来自断开兜底.
+    let list = wait_until_or_timeout(
+        &records_handle,
+        |l| {
+            l.first()
+                .is_some_and(|r| r.resp_status != 0 || r.error.is_some())
+        },
+        Duration::from_secs(3),
+    )
+    .await;
+    let r = &list[0];
+    assert!(
+        r.error.is_some(),
+        "cancelled handler must leave an error terminal state, got {r:?}"
+    );
+}
+
 /// 流式请求 (显式 stream=true): 上游响应头 4s 后到 → 仍被流式档 1s 快超时杀,
 /// 504 record 的 error 消息带上**实际生效**的超时值 (可观测性, 事故排障靠它).
 #[tokio::test]

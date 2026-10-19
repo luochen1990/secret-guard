@@ -250,7 +250,7 @@ pub(crate) async fn cross_proto_forward(
         real_system,
         state.audit_capture.mode(),
     );
-    let (record_id, usage_ctx) = push_event_and_wire_usage(
+    let (record_id, usage_ctx, mut inflight) = push_event_and_wire_usage(
         &state,
         &fp,
         &parts,
@@ -356,6 +356,7 @@ pub(crate) async fn cross_proto_forward(
             redaction_map,
             state.upstream_timeouts.stream_idle,
             usage_ctx,
+            inflight,
         )
         .await;
     }
@@ -584,6 +585,8 @@ pub(crate) async fn cross_proto_forward(
             ..Default::default()
         },
     );
+    // record 已到终态 → 解除兜底 (#364): 此后剩余代码 panic 不再改写终态.
+    inflight.disarm();
     // usage-stats 落账 (USAGE-5 计入判据在 ctx 内统一执行).
     usage_ctx.record_response(
         resp_status_out.as_u16(),

@@ -242,7 +242,7 @@ pub(crate) async fn same_proto_forward(
         real_system,
         state.audit_capture.mode(),
     );
-    let (record_id, usage_ctx) = push_event_and_wire_usage(
+    let (record_id, usage_ctx, inflight) = push_event_and_wire_usage(
         &state,
         &fp,
         &parts,
@@ -325,6 +325,7 @@ pub(crate) async fn same_proto_forward(
                 redaction_map,
                 state.upstream_timeouts.stream_idle,
                 usage_ctx.clone(),
+                inflight,
             )
             .await
         } else {
@@ -346,6 +347,7 @@ pub(crate) async fn same_proto_forward(
                 state.upstream_timeouts.stream_idle,
                 usage_ctx.clone(),
                 pool_watch,
+                inflight,
             )
             .await
         }
@@ -367,6 +369,7 @@ pub(crate) async fn same_proto_forward(
             usage_ctx,
             pool_watch,
             leak_watch,
+            inflight,
         )
         .await
     }
@@ -421,7 +424,7 @@ async fn same_proto_passthrough(
     // usage 接线 (SSOT helper, 接线契约见其函数 doc). secrets_snapshot: 入口 1
     // (无 secret) 为空; 入口 2 (secrets 非空但无 codec 降级透传) 为全量快照 —
     // USAGE-6 的 SEC 扫描恰防后者的 model 字符串泄漏.
-    let (record_id, usage_ctx) = push_event_and_wire_usage(
+    let (record_id, usage_ctx, inflight) = push_event_and_wire_usage(
         &state,
         &fp,
         &parts,
@@ -477,6 +480,7 @@ async fn same_proto_passthrough(
         // → ParsedSync 不构造 → 无 message 可扫, 检测无法进行 (方案 §0.1 登记
         // 的漏报面), 故同样传空.
         Vec::new(),
+        inflight,
     )
     .await
 }

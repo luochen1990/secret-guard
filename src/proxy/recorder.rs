@@ -87,6 +87,10 @@ pub(super) const ERR_UPSTREAM_STREAM: &str = "upstream stream error";
 pub(super) const ERR_STREAM_IDLE_TIMEOUT: &str = "upstream stream idle timeout";
 /// 响应超过 record 累积上限 (MAX_RESP_BODY_RECORD).
 pub(super) const ERR_RESP_CAP_EXCEEDED: &str = "response exceeds record cap";
+/// 转发路径在 finalize 前 drop (task/handler panic 或客户端断开取消) 的兜底
+/// error label (#364 InflightGuard). record 侧专用 — 不进任何客户端响应.
+pub(super) const ERR_FORWARD_ABORTED: &str =
+    "forward aborted before response (handler dropped: panic or client disconnect)";
 
 /// 投影 `RedactionMap` + `secrets_snapshot` → `(mock_value, secret_id)` 列表.
 ///
@@ -444,6 +448,99 @@ pub(super) fn record_upstream_failure(
         },
     );
     log_forward_summary(dag, record_id);
+}
+
+// ─── #364: 在途 record 终态收敛 (finalize 兜底 guard) ────────────────────────
+
+/// 在途 record 的 finalize 兜底 Drop guard (#364, P1/P2/P3 共同修复).
+///
+/// 三类路径曾让 DAG node 永不 finalize (WebUI 永显 "等待中" + audit latest 档
+/// `req_body_raw` 永久滞留, 上界仅 session LRU 淘汰):
+/// - **P1** 流式 spawn task panic: 两处 `tokio::spawn` 的 JoinHandle 被丢弃,
+///   tokio 在 task 边界吞掉 unwind → `fanout_stream_task` 尾部的 attach 永不执行;
+/// - **P2** handler push 后 panic (buffered 家族 attach 是 inline);
+/// - **P3** 客户端在响应头返回前断开 → hyper/axum 取消 (drop) handler future →
+///   `send_upstream_or_fail` await 中无 attach (集成测试实证成立).
+///
+/// 生命周期 (单一 guard, 所有权随终态责任转移):
+/// - **创建**: [`push_event_and_wire_usage`] (三条转发路径的 push choke point)
+///   在 push 后立即创建 — 它是 handler future / spawn task 的局部, 随宿主被
+///   drop / unwind 而 Drop;
+/// - **转移**: 流式 fan_out 路径把它 move 进 spawn task (随 `FanoutStreamCtx`),
+///   终态责任随之转移给 task;
+/// - **解除** ([`Self::disarm`]): record 到达终态 (`attach_finality` / buffered
+///   attach / cross_proto attach) 后调用, 正常路径零副作用;
+/// - **兜底**: armed 状态下 Drop → 若 node 尚未终态则 attach error 终态
+///   (`resp_status=0` + `error` — `is_inflight()=false` 的合法终态形态, 见
+///   `ResponseData::is_inflight` 的隐式依赖注记).
+///
+/// 幂等保护: Drop 先查 node 当前状态, 已终态 (含 `send_upstream_or_fail` 的
+/// 502/504 error attach — handler `?` 传播后的 guard drop) 则跳过 — 兜底只补
+/// "永无终态" 的节点, 不覆盖更具体的错误信息.
+///
+/// ROB 纪律: Drop 内永不 panic — unwind 中的 Drop 再 panic = double panic →
+/// 进程 abort, 兜底路径必须比被兜底路径更强壮, attach 全程包 catch_unwind.
+pub(crate) struct InflightGuard {
+    dag: ConversationDag,
+    record_id: Uuid,
+    /// 终态责任已转移/完成 (disarm) 后 Drop 零动作.
+    armed: bool,
+    /// 兜底 elapsed 的计时起点: 构造时刻 ≈ push 时刻 (handler 的 `started` 不可
+    /// Clone 且仍被 fan_out 路径持有, guard 用自己的近似起点).
+    started: std::time::Instant,
+}
+
+impl InflightGuard {
+    pub(super) fn new(dag: &ConversationDag, record_id: Uuid) -> Self {
+        Self {
+            dag: dag.clone(),
+            record_id,
+            armed: true,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    /// 解除兜底: 终态责任已转移 (move 进 spawn task) 或 record 已到达终态.
+    /// 解除后的 Drop 是无操作的 — 正常 finalize 路径不产生任何额外写入.
+    pub(super) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let (dag, record_id, started) = (&self.dag, self.record_id, self.started);
+        // catch_unwind (ROB): Drop 再 panic = double panic → abort, 吞掉保进程.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // 幂等: 已终态 (含 send_upstream_or_fail 的 502/504) 不覆盖 —
+            // 兜底只补 "永无终态" 的节点, 保留更具体的错误信息.
+            if let Some(r) = dag.get_response(record_id)
+                && !r.is_inflight()
+            {
+                return;
+            }
+            warn!(
+                %record_id,
+                "forward path dropped before finalize (task/handler panic or client \
+                 disconnect); attaching error terminal state"
+            );
+            dag.attach_response(
+                record_id,
+                ResponseData {
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                    error: Some(ERR_FORWARD_ABORTED.to_string()),
+                    // resp_status=0 + error 是合法终态 (响应头未到达, 无真实
+                    // 上游状态码可记); 前端 statusTextOf error 优先于 status==0.
+                    ..Default::default()
+                },
+            );
+            // 错误终态的摘要 choke point (与 record_upstream_failure 对齐, #160).
+            log_forward_summary(dag, record_id);
+        }));
+    }
 }
 
 // ─── 转发可观测性: 摘要日志 (#160) + 协议错配 WARN (#162) ───────────────────
@@ -864,7 +961,8 @@ pub(super) fn build_call_event(
     event
 }
 
-/// 转发路径的 "push DAG + usage 接线" 一次性前置 (same_proto×2 / cross_proto 共享, SSOT).
+/// 转发路径的 "push DAG + usage 接线 + finalize 兜底" 一次性前置 (same_proto×2 /
+/// cross_proto 共享, SSOT).
 ///
 /// 职责边界 — 何为 "接线":
 /// 1. `event.model` 捕获 model_req (`push_messages` 消耗 event 前的最后快照点);
@@ -874,6 +972,10 @@ pub(super) fn build_call_event(
 ///    节点的 RoundKind (与 attach_response 同型的安全窗口, 详见 `dag::round_kind_of`);
 ///    auth 归因从 request parts 的 Extension 提取 (require_api_key middleware 注入,
 ///    未启用时 None — proxy → auth 是纯类型依赖, 见根 AGENTS.md 依赖图例外条目).
+/// 4. 构造 [`InflightGuard`] (#364): push 之后一切 "record 可能永停在途" 的路径
+///    (task/handler panic / 客户端断开取消 handler) 的共同兜底 — 调用方把它随
+///    终态责任转移 (流式 fan_out move 进 spawn task / buffered 路径 attach 后
+///    disarm), 详见其类型文档.
 ///
 /// 三调用点的差异全部经参数显式表达, 本函数不吞语义:
 /// - `messages`: same_proto_forward / cross_proto 传 redact 前的真实 messages 快照;
@@ -891,9 +993,10 @@ pub(super) fn push_event_and_wire_usage(
     event: CallEvent,
     secrets: &[crate::secrets::SecretEntry],
     hits: &[crate::usage::RedactHit],
-) -> (Uuid, crate::usage::UsageCtx) {
+) -> (Uuid, crate::usage::UsageCtx, InflightGuard) {
     let model_req = event.model.as_ref().map(|m| m.to_string());
     let record_id = state.dag.push_messages(messages, event);
+    let inflight = InflightGuard::new(&state.dag, record_id);
     let round_kind = state
         .dag
         .round_kind_of(record_id)
@@ -914,7 +1017,7 @@ pub(super) fn push_event_and_wire_usage(
         std::sync::Arc::from(secrets.to_vec().into_boxed_slice()),
     );
     usage_ctx.record_redactions(hits);
-    (record_id, usage_ctx)
+    (record_id, usage_ctx, inflight)
 }
 
 // ─── 响应累积器 (fan_out 三路径共享) ───────────────────────────────────────
@@ -1275,6 +1378,105 @@ pub(crate) fn assert_tail_parsed_matches_stored(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── #364: InflightGuard 兜底语义 ──────────────────────────────────────
+    //
+    // 三条性质: armed drop → error 终态; disarmed drop → 零动作; 已终态节点 →
+    // 不覆盖 (幂等保护, send_upstream_or_fail 的 502/504 error attach 不被兜底
+    // 的 generic 文案冲掉).
+
+    /// 最小 fixture: dag + 一个已 push 的 node (空 messages, passthrough 同型).
+    fn dag_with_node() -> (ConversationDag, Uuid) {
+        let dag = ConversationDag::new(8, 500, 1);
+        let event = CallEvent {
+            created_at: chrono::Utc::now(),
+            method: "POST".to_string(),
+            path: "/o/t/v1/chat".to_string(),
+            req_headers: vec![],
+            ingress_protocol: None,
+            redact_seed: 0,
+            req_system: vec![],
+            policy: std::sync::Arc::new(PolicySnapshot::default()),
+            req_body_raw: String::new(),
+            preview: None,
+            model: None,
+            round_role: crate::codec::ir::IrRole::User,
+            round_kind: crate::dag::RoundKind::Normal,
+            redactions: std::sync::Arc::from(Vec::new()),
+            upstream_id: std::sync::Arc::from("test"),
+            upstream_model: None,
+            capture_mode: crate::config::AuditCaptureMode::Full,
+        };
+        let id = dag.push_messages(vec![], event);
+        (dag, id)
+    }
+
+    #[test]
+    fn inflight_guard_drop_attaches_error_terminal() {
+        let (dag, id) = dag_with_node();
+        assert!(dag.get_response(id).is_none(), "fresh node is in-flight");
+        drop(InflightGuard::new(&dag, id));
+        let r = dag.get_response(id).expect("guard drop must finalize");
+        assert_eq!(r.error.as_deref(), Some(ERR_FORWARD_ABORTED));
+        assert!(!r.is_inflight(), "error terminal leaves in-flight state");
+        assert_eq!(r.resp_status, 0, "no upstream status to record");
+    }
+
+    #[test]
+    fn inflight_guard_disarmed_drop_is_noop() {
+        let (dag, id) = dag_with_node();
+        let mut g = InflightGuard::new(&dag, id);
+        g.disarm();
+        drop(g);
+        assert!(
+            dag.get_response(id).is_none(),
+            "disarmed guard must not attach"
+        );
+    }
+
+    #[test]
+    fn inflight_guard_replaces_streaming_placeholder() {
+        // 流式在途的真实生产形态 (issue #364 MRE-1 变体 B): ParsedSync 节流写入
+        // 建出 Some(placeholder) (default + 仅填 parsed, is_inflight=true) — 幂等
+        // 检查必须按 "在途" 处理而非 "已有 response 跳过", 兜底 attach 整体替换.
+        let (dag, id) = dag_with_node();
+        dag.update_parsed_response(id, serde_json::json!({ "choices": [] }));
+        assert!(
+            dag.get_response(id).is_some_and(|r| r.is_inflight()),
+            "placeholder is the in-flight Some(_) form"
+        );
+        drop(InflightGuard::new(&dag, id));
+        let r = dag.get_response(id).expect("guard drop must finalize");
+        assert_eq!(r.error.as_deref(), Some(ERR_FORWARD_ABORTED));
+        assert!(!r.is_inflight(), "placeholder replaced by error terminal");
+    }
+
+    #[test]
+    fn inflight_guard_skips_already_finalized_node() {
+        let (dag, id) = dag_with_node();
+        // 模拟 send_upstream_or_fail 的 error attach 已发生 (502 + 具体错误文案).
+        dag.attach_response(
+            id,
+            ResponseData {
+                resp_status: 502,
+                error: Some("upstream send error: connection refused".into()),
+                ..Default::default()
+            },
+        );
+        drop(InflightGuard::new(&dag, id));
+        let r = dag.get_response(id).expect("finalized node keeps response");
+        assert_eq!(
+            r.resp_status, 502,
+            "specific terminal state not overwritten"
+        );
+        assert!(
+            r.error
+                .as_deref()
+                .is_some_and(|e| e.contains("connection refused")),
+            "specific error message preserved, got {:?}",
+            r.error
+        );
+    }
 
     // ─── M-C4: derive_redactions / derive_redact_hits 投影一致性 ────────────
     //

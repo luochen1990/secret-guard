@@ -1738,6 +1738,45 @@ mod tests {
     }
 
     #[test]
+    fn attach_latest_mode_never_attached_ancestor_keeps_raw_documented_limit() {
+        // #364(d) known-limitation 钉子 (issue MRE-1): n1 永不 attach (历史上 =
+        // spawn task panic / handler 取消且无兜底), 同会话继续前进 4 轮 — 回收
+        // walk 对 response==None 的在途祖先恒跳过, **无年龄上限/TTL**, n1 的 raw
+        // 永久滞留 (上界仅 session LRU 淘汰).
+        //
+        // 不实现超龄回收的理由 (见 docs/known-limitations.md dag 节): 合法长流式
+        // (chunk 间隔未超 idle timeout 的思考流) 在途时长无上界, 任何固定 TTL 都
+        // 会误伤其在途暂存; InflightGuard (#364 兜底) 已让 "永不 finalize" 的生产
+        // 路径收敛, 滞留仅存于 guard 双重失效的理论窗口. 本测试钉住该已接受行为.
+        let dag = ConversationDag::new(16, 500, 1);
+        let n1 = dag.push_messages(
+            vec![text_msg(IrRole::User, "ghost-1")],
+            latest_event(r#"{"model":"m","messages":[{"role":"user","content":"ghost-1"}]}"#),
+        );
+        // 会话继续前进 4 轮 (逐轮增长前缀), n1 全程在途.
+        let mut prefix = vec![text_msg(IrRole::User, "ghost-1")];
+        for i in 2..=5 {
+            prefix.push(text_msg(IrRole::User, &format!("ghost-{i}")));
+            let body = serde_json::json!({
+                "model": "m",
+                "messages": (1..=i).map(|j| serde_json::json!({
+                    "role": "user", "content": format!("ghost-{j}")
+                })).collect::<Vec<_>>()
+            });
+            let ni = dag.push_messages(prefix.clone(), latest_event(&body.to_string()));
+            attach_ok(&dag, ni, &format!("r{i}"));
+        }
+        assert!(
+            dag.get_response(n1).is_none(),
+            "n1 never attached (in-flight characterization)"
+        );
+        assert!(
+            !raw_state(&dag, n1).0.is_empty(),
+            "never-attached ancestor raw persists (accepted, #364(d) known-limitation)"
+        );
+    }
+
+    #[test]
     fn attach_full_mode_keeps_all_raws() {
         // 对照组: full 档不回收 — 会话前进后祖先 raw 全保留.
         let dag = ConversationDag::new(8, 500, 1);
