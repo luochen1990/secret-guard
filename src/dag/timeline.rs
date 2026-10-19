@@ -47,8 +47,15 @@ fn empty_tail(round_id: Uuid) -> TimelineTail {
 /// - `limit = usize::MAX`: 回溯到链首 (parent=None).
 /// - `limit = N`: 最多取 N 个 (含 start_id), 多余的更老的 node 不取.
 ///
+/// #366 walk 限位: 有效上限 = min(调用方 limit, nodes.len()+1). DAG 无环 ⇒
+/// 链长 ≤ 节点数; 打满该上限仍有后继 ⇒ 必有重复节点 = 环 (无环不变式被打破)
+/// ⇒ warn (可诊断性) + 截断. 截断链 = 有界部分轮次 (可能含重复 node), 远好过
+/// 读侧自旋冻结 WebUI 全部数据面. 分页调用 (limit ≤ 节点数) 在无环链上行为不变.
+///
 /// `pub(super)`: timeline (rounds 视图) 与 search (会话文本搜索 #317) 共用.
 pub(super) fn walk_chain(inner: &DagInner, start_id: Uuid, limit: usize) -> Vec<Uuid> {
+    let bound = inner.nodes.len() + 1;
+    let limit = limit.min(bound);
     let mut chain: Vec<Uuid> = Vec::new();
     let mut cursor = Some(start_id);
     while let Some(id) = cursor {
@@ -57,6 +64,10 @@ pub(super) fn walk_chain(inner: &DagInner, start_id: Uuid, limit: usize) -> Vec<
         }
         chain.push(id);
         cursor = inner.nodes.get(&id).and_then(|n| n.parent);
+    }
+    // 打满 clamp 上限且仍有后继: 无环链在节点数内必达 parent=None, 只有环能解释.
+    if chain.len() == bound && cursor.is_some() {
+        tracing::warn!("walk_chain: parent chain exceeds node count (cycle?); truncating chain");
     }
     chain.reverse();
     chain

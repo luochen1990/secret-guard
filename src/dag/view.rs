@@ -134,8 +134,18 @@ pub(super) fn session_view(inner: &DagInner, sid: SessionId, s: &Session) -> Opt
     let mut usage_total = UsageView::default();
     {
         // 沿 parent 链折叠 usage (leaf → root; ROB: 节点缺失即止, 不 panic).
+        // #366 walk 限位: 无环 ⇒ 链长 ≤ 节点数; 超限 (环) ⇒ warn + break, 返回
+        // 已折叠的部分和 — usage_total 是展示聚合, 少算不谎报 (尊重事实), 不冻结.
         let mut cursor = Some(s.leaf_id);
+        let mut remaining = inner.nodes.len() + 1;
         while let Some(id) = cursor {
+            if remaining == 0 {
+                tracing::warn!(
+                    "session_view: parent chain exceeds node count (cycle?); truncating usage fold"
+                );
+                break;
+            }
+            remaining -= 1;
             let Some(node) = inner.nodes.get(&id) else {
                 break;
             };
@@ -244,18 +254,36 @@ impl ConversationDag {
     }
 
     /// 递归收集 node 的所有 req_delta MessageRef (从根到本 node).
+    ///
+    /// #366 walk 限位: 递归深度上限 nodes.len()+1 (无环 ⇒ 链长 ≤ 节点数).
+    /// 超限 (环) ⇒ warn + 返回 None — 与链断裂/孤儿同款降级 (调用方
+    /// `full_request_messages` → None): 返回部分链会让 delta 切片静默缺前缀
+    /// (数据更糟), 宁缺毋错.
     fn collect_req_delta_refs(
         &self,
         inner: &DagInner,
         node_id: Uuid,
     ) -> Option<Vec<super::pool::MessageRef>> {
-        let node = inner.nodes.get(&node_id)?;
-        let mut refs = match node.parent {
-            Some(p) => self.collect_req_delta_refs(inner, p)?,
-            None => Vec::new(),
-        };
-        refs.extend(node.req_delta.iter().cloned());
-        Some(refs)
+        fn walk(
+            inner: &DagInner,
+            node_id: Uuid,
+            remaining: usize,
+        ) -> Option<Vec<super::pool::MessageRef>> {
+            let node = inner.nodes.get(&node_id)?;
+            if remaining == 0 {
+                tracing::warn!(
+                    "collect_req_delta_refs: parent chain exceeds node count (cycle?); degrading to None"
+                );
+                return None;
+            }
+            let mut refs = match node.parent {
+                Some(p) => walk(inner, p, remaining - 1)?,
+                None => Vec::new(),
+            };
+            refs.extend(node.req_delta.iter().cloned());
+            Some(refs)
+        }
+        walk(inner, node_id, inner.nodes.len() + 1)
     }
 
     /// 取 node 的只读视图 (clone 元数据, 但不 walk).

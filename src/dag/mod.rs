@@ -22,7 +22,8 @@
 //! (沿用 proxy/ 拆分先例):
 //! - `mod` (本文件): `ConversationDag` + `DagInner` + `ParentLookup` + mutator
 //!   (push_messages / attach_response / update_parsed_response) + 内部 helper
-//!   (find_parent / gc_cascade / evict_if_needed) + 类型 re-export.
+//!   (find_parent / prefix_chain_matches / find_root_title / gc_cascade /
+//!   evict_if_needed) + 类型 re-export.
 //! - `pool`: BlockPool + MessageRef + hash_block + combine_hash (内容寻址核心).
 //! - `search`: 会话文本搜索 (#317) — 服务端扫描 + Block 级 lowercase memoize,
 //!   cap/预算双红线 (`ConversationDag::search`).
@@ -421,8 +422,21 @@ impl ConversationDag {
         // walk parent 链到链首, 暂存每个 node 的 preview, 循环结束保留最旧的.
         let mut title: Option<Arc<str>> = None;
         let mut cursor = parent;
-        // 安全限位: parent 链长度不会超过 nodes 总数 (DAG 无环).
+        // 安全限位 (#366): DAG 无环 ⇒ 链长 ≤ 节点数. 旧实现只有这条注释假设, 环一旦
+        // (因逻辑 bug) 形成, 本 walk 在 push 的写临界区内纯自旋 → 全 DAG 读写面
+        // 永久冻结 + 烧 CPU. 超限 = 环 ⇒ warn (可诊断性) + break, 返回已 walk 到的
+        // 最旧 preview (title 是展示字段, 部分降级无害 — "不 panic + 不冻结 + 数据
+        // 不更糟"). consistency-check 的 title shadow 复用本函数, 两次调用同限位,
+        // 破损态下断言仍一致.
+        let mut remaining = inner.nodes.len() + 1;
         while let Some(pid) = cursor {
+            if remaining == 0 {
+                tracing::warn!(
+                    "find_root_title: parent chain exceeds node count (cycle?); truncating walk"
+                );
+                break;
+            }
+            remaining -= 1;
             match inner.nodes.get(&pid) {
                 Some(n) => {
                     title = n.event.preview.clone();
@@ -493,20 +507,39 @@ impl ConversationDag {
         // split_at = i+1 (前 i+1 条匹配), delta = msg_refs[i+1..].
         for i in (0..cum_seq.len()).rev() {
             if let Some(ids) = inner.prefix_index.get(&cum_seq[i]) {
-                // fork 场景: 多个 node 共享同一 prefix_hash. 取最新的 (push 顺序最晚的).
-                // 这里不做内容验证 (hash collision 概率极低); 如需 defense-in-depth 可加验证.
+                // fork 场景: 多个 node 共享同一 prefix_hash (真 fork, 内容相同).
+                // 从最新 (push 序) 往旧找第一个通过内容复核的 candidate.
+                //
+                // #366 防御 (release 常开, 与 block 层 CDAG-6 assert 对称的 prefix 层
+                // 守卫): u64 prefix hash 碰撞 (不同内容同 key) 若零验证会把错误 node
+                // 静默挂为 parent → 错误 session/delta/round_kind. 命中后按 (role,
+                // blocks) 逐条复核 candidate 的完整祖先链 == msg_refs[..i+1] —
+                // BlockHash 相等即内容相等 (hash→block 双射由 intern 的 CDAG-6
+                // release assert 保证). 复核成本 O(i+1) 次指针级比较, 与上方 cum_seq
+                // 计算同数量级, 无新渐进开销, 故 release 常开而非 debug_assert
+                // (错挂是静默数据损坏, debug-only 守卫护不住生产).
+                // 复核失败 (碰撞 / 链断裂 / 环, 见 `prefix_chain_matches`) → warn +
+                // 跳过该 candidate: 不 panic (转发热路径, ROB — 与 CDAG-6 不同,
+                // 此处跳过即可自愈: prefix_index 是 u64 → Vec 多值桶, 无存储覆盖),
+                // 试更旧的 fork 兄弟 → 更浅前缀 → 新根, 数据不错挂只是可能多开 session.
                 //
                 // 持锁不变式: gc_cascade 移除 node 时会同步清理 prefix_index (retain +
-                // remove 空向量), 但作为防御性编程, 用 `last()` 的 Option 而非 expect
-                // 处理理论外的空 Vec 残留 (返回 None → 继续找更浅的匹配, 或返回新根).
-                let parent = ids.last().copied();
-                if let Some(parent) = parent {
-                    return ParentLookup {
-                        parent: Some(parent),
-                        split_at: i + 1,
-                    };
+                // remove 空向量), 但作为防御性编程, 空 Vec 残留时 (零 candidate) 继续
+                // 向更浅的 cum_seq 查找.
+                for &cand in ids.iter().rev() {
+                    if Self::prefix_chain_matches(inner, cand, msg_refs, i + 1) {
+                        return ParentLookup {
+                            parent: Some(cand),
+                            split_at: i + 1,
+                        };
+                    }
+                    tracing::warn!(
+                        candidate = %cand,
+                        split_at = i + 1,
+                        "find_parent: prefix hash hit failed content verification (collision or broken chain); skipping candidate"
+                    );
                 }
-                // 空 Vec 残留: 继续向更浅的 cum_seq 查找.
+                // 全部 candidate 复核失败 (理论外的碰撞): 继续向更浅的 cum_seq 查找.
             }
         }
 
@@ -514,6 +547,49 @@ impl ConversationDag {
             parent: None,
             split_at: 0,
         }
+    }
+
+    /// [`find_parent`] 的内容复核 (#366 防御): candidate 的完整祖先链 (root →
+    /// candidate 各 node 的 req_delta 串接) 是否与 `msg_refs[..split_at]` 逐条
+    /// 内容相等 (role + blocks 序列; wire 形态元数据 content_form/extra 不参与,
+    /// 与 prefix hash 语义一致 — 同内容不同 wire 形态视为前缀命中).
+    ///
+    /// 返回 false = "不能证明 candidate 是本请求的前缀": u64 碰撞、链断裂 (孤儿,
+    /// 公共 API 不可达)、环 (walk 限位截断) 都归此类, 由调用方 warn + 跳过
+    /// (按未命中处理 — 宁可 fork 新 session 也不错挂 parent).
+    ///
+    /// 内部 walk 有界 (#366): 步数上限 nodes.len()+1 — DAG 无环 ⇒ 链长 ≤ 节点数,
+    /// 超限必有重复节点 = 环, 判定不可复核即刻返回, 不自旋.
+    fn prefix_chain_matches(
+        inner: &DagInner,
+        candidate: Uuid,
+        msg_refs: &[MessageRef],
+        split_at: usize,
+    ) -> bool {
+        // 按 node 分组收集 (candidate→root): 每组的 req_delta 内部已是 root→leaf 序,
+        // 对齐请求前缀时需反转**组序**而非组内序 (展平后整体反转会颠倒组内消息).
+        let mut groups: Vec<&[MessageRef]> = Vec::new();
+        let mut remaining = inner.nodes.len() + 1;
+        let mut cursor = Some(candidate);
+        while let Some(id) = cursor {
+            if remaining == 0 {
+                return false; // 环: 不可复核.
+            }
+            remaining -= 1;
+            let Some(n) = inner.nodes.get(&id) else {
+                return false; // 链断裂 (孤儿态, 理论外): 不可复核.
+            };
+            groups.push(&n.req_delta);
+            cursor = n.parent;
+        }
+        groups.reverse(); // leaf→root 收集序 → root→leaf, 与请求前缀同序.
+        let total: usize = groups.iter().map(|g| g.len()).sum();
+        total == split_at
+            && groups
+                .iter()
+                .flat_map(|g| g.iter())
+                .zip(msg_refs[..split_at].iter())
+                .all(|(a, b)| a.role == b.role && a.blocks == b.blocks)
     }
 
     /// 累积 Merkle hash: 从 `init` 起, 逐条 combine 每条 message 的 hash.
@@ -565,6 +641,10 @@ impl ConversationDag {
     ///
     /// child_count 是引用计数: 只有 child_count=0 的 node (无 child 依赖) 才被删除.
     /// fork 共享的 node 天然受保护 (另一分支的 child 仍引用它, child_count > 0).
+    ///
+    /// 环安全 (#366 免限位): 每层递归先 `nodes.remove` 本 node 再沿 parent 递归,
+    /// 任一 node 至多被访问一次 ⇒ 即便 parent 链因逻辑 bug 成环也必然终止,
+    /// 无需另加 walk 限位 (与其他 parent walk 的限位守卫不同).
     fn gc_cascade(inner: &mut DagInner, node_id: Uuid) {
         let node = match inner.nodes.remove(&node_id) {
             Some(n) => n,
@@ -704,9 +784,19 @@ impl ConversationDag {
     /// 捕获于 full 档的祖先照常回收 — 内存策略跟随会话当前前进状态, 与各
     /// 请求捕获时的档位无关 (mode 切换 full→latest 后存量 raw 随会话前进出清).
     fn recycle_superseded_raws(g: &mut DagInner, mut cursor: Option<Uuid>) {
+        // #366 walk 限位: 无环 ⇒ 链长 ≤ 节点数; 超限 = 环 ⇒ warn + break.
+        // 部分回收无害 — 漏回收的祖先多留一份 raw (内存策略降级, 非数据损坏).
+        let mut remaining = g.nodes.len() + 1;
         while let Some(pid) = cursor
             && let Some(n) = g.nodes.get_mut(&pid)
         {
+            if remaining == 0 {
+                tracing::warn!(
+                    "recycle_superseded_raws: parent chain exceeds node count (cycle?); truncating walk"
+                );
+                break;
+            }
+            remaining -= 1;
             let parent = n.parent;
             // 只回收已 finalize 的祖先; 在途 (含流式 placeholder) 跳过.
             if let Some(r) = n.response.write().as_mut()
@@ -2758,6 +2848,127 @@ mod tests {
             Some(64),
             "并发写后 payload 字段应完整 (无 torn write)"
         );
+    }
+
+    // ─── #366 DAG 防御守卫: prefix 命中内容复核 + parent walk 限位 (CDAG-10) ──
+    //
+    // 白盒测试: 人为构造 u64 前缀碰撞 / parent 环 (公共 API 正常不可达, 测试内
+    // 直接改 inner 状态 — 先例见 CDAG-7 孤儿测试), 断言守卫触发时
+    // (a) 复核失败不静默错挂 parent; (b) walk 限位生效 (warn + 有界返回, 不冻结).
+
+    /// 构造单 Text block 的 synthetic MessageRef (不入池, 仅用于离线计算
+    /// Merkle 累积 hash — MessageRef::hash 只依赖 role + BlockHash 序列,
+    /// 与 intern 后的 ref 同 hash).
+    fn synthetic_msg_ref(role: IrRole, text: &str) -> MessageRef {
+        MessageRef {
+            role,
+            blocks: vec![super::pool::hash_block(&IrBlock::Text {
+                text: text.to_string(),
+                extra: Default::default(),
+            })],
+            content_form: None,
+            reasoning_content_form: None,
+            extra: None,
+        }
+    }
+
+    /// 计算 texts 序列的 Merkle 累积 hash (与 `find_parent` cum_seq 同算法).
+    fn cum_hash_of_texts(texts: &[&str]) -> u64 {
+        let mut cum = 0u64;
+        for t in texts {
+            cum = ConversationDag::combine_hash(cum, synthetic_msg_ref(IrRole::User, t).hash());
+        }
+        cum
+    }
+
+    #[test]
+    fn find_parent_skips_colliding_candidate_picks_real_fork() {
+        // 问题一: prefix 命中零内容验证 → u64 碰撞静默错挂 parent.
+        // 白盒把无关节点 D 塞进 h([m1,m2]) 桶 (等价于 D.prefix_hash 与该前缀
+        // 碰撞的现场): 桶内 = [E(真 fork), D(伪造)]. 期望: D 复核不过 → 跳过;
+        // 同桶真 fork E 复核通过 → 被选中 (fork 兄弟选择语义保持).
+        let dag = ConversationDag::new(16, 500, 1);
+        let _a = dag.push_messages(vec![text_msg(IrRole::User, "m1")], dummy_event());
+        let e = dag.push_messages(
+            vec![text_msg(IrRole::User, "m1"), text_msg(IrRole::User, "m2")],
+            dummy_event(),
+        );
+        let d = dag.push_messages(
+            vec![text_msg(IrRole::User, "z9"), text_msg(IrRole::User, "z8")],
+            dummy_event(),
+        );
+        {
+            let mut g = dag.inner.write();
+            let h12 = cum_hash_of_texts(&["m1", "m2"]);
+            g.prefix_index.entry(h12).or_default().push(d);
+        }
+        // 推送 [m1,m2,m3]: 最深命中 h([m1,m2]). 修复前静默取 last()=D 错挂
+        // (delta=[m3] 挂进 z 链 session); 修复后跳过 D 选中 E, delta 不变.
+        let r = dag.push_messages(
+            vec![
+                text_msg(IrRole::User, "m1"),
+                text_msg(IrRole::User, "m2"),
+                text_msg(IrRole::User, "m3"),
+            ],
+            dummy_event(),
+        );
+        let v = dag.get_node(r).expect("r exists");
+        assert_eq!(v.parent, Some(e), "跳过碰撞 candidate D, 选中真 fork E");
+        assert_ne!(v.parent, Some(d));
+        assert_eq!(v.req_delta_count, 1, "split_at=2 → delta=[m3]");
+    }
+
+    #[test]
+    fn parent_cycle_walks_terminate_bounded() {
+        // 问题二: parent walk 无限位 → 环 = 写临界区内纯自旋, 全 DAG 读写面冻结.
+        // 白盒构造 A ⇄ B 环, 逐一驱动全部 walk 路径, 断言有界返回 (不冻结/不 panic).
+        let dag = ConversationDag::new(16, 500, 1);
+        let a = dag.push_messages(vec![text_msg(IrRole::User, "m1")], dummy_event());
+        let b = dag.push_messages(
+            vec![text_msg(IrRole::User, "m1"), text_msg(IrRole::User, "m2")],
+            latest_event(r#"{"model":"m"}"#),
+        );
+        attach_ok(&dag, a, "ra"); // finalize a (recycle walk 的回收对象)
+        {
+            let mut g = dag.inner.write();
+            g.nodes.get_mut(&a).unwrap().parent = Some(b); // A ⇄ B (B.parent=A 原生)
+        }
+
+        // 1) find_root_title (push 写临界区内的 walk, 私有直驱): 有界返回.
+        {
+            let g = dag.inner.read();
+            let _ = ConversationDag::find_root_title(&g, Some(b), b);
+        }
+
+        // 2) push (find_parent 复核 walk 遇环): 候选不可复核 → 降级新根, 不冻结.
+        let f = dag.push_messages(
+            vec![text_msg(IrRole::User, "m1"), text_msg(IrRole::User, "fork")],
+            dummy_event(),
+        );
+        let fv = dag.get_node(f).expect("push 返回且 DAG 未冻结");
+        assert_eq!(fv.parent, None, "环链候选不可复核 → 保守新根 (不错挂)");
+        assert_eq!(dag.list_sessions().len(), 2, "f 开新 session");
+
+        // 3) list_sessions (session_view usage fold 入环): 有界返回.
+        let _ = dag.list_sessions();
+
+        // 4) full_request_messages (递归收集入环) → 保守 None (孤儿同款降级).
+        assert_eq!(dag.full_request_messages(b), None);
+
+        // 5) session_rounds / timeline_view (walk_chain usize::MAX 全量回溯点):
+        //    有界部分轮次 (len ≤ 节点数+1), 非冻结.
+        let sid = dag.get_node(b).unwrap().session_id;
+        let rounds = dag.session_rounds(sid);
+        assert!(!rounds.is_empty(), "有界部分轮次, 非冻结");
+        assert!(
+            rounds.len() <= dag.node_count() + 1,
+            "链长 clamp 在节点数+1"
+        );
+        dag.timeline_view(sid, None, 10).expect("timeline 有界返回");
+
+        // 6) attach (recycle_superseded_raws 入环): latest 档祖先回收入环, 有界返回.
+        attach_ok(&dag, b, "rb");
+        assert!(dag.get_node(b).is_some(), "attach 返回且 DAG 未冻结");
     }
 
     // ─── proptest (DAG 核心代数性质: CDAG-2/3/4/5/8) ──────────────────────

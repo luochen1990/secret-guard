@@ -151,6 +151,9 @@
 > 用 `assert!` (非 `debug_assert!`), release 也 panic. 理由: collision 属哈希函数 bug,
 > 静默覆盖会让两个不同 block 共享 hash 引发难定位的数据损坏, panic 是更优选择. 详见
 > **CDAG-6** 契约 (`docs/design/contracts.md` §4).
+> prefix 层同域防御 (#366, **CDAG-10**): `find_parent` 命中后内容复核 + 全部 parent
+> walk 限位 — 但走 warn + 跳过/截断而非 panic (跳过即自愈, 无存储覆盖; 降级语义见
+> contracts.md CDAG-10 降级取舍段).
 
 ### 视图正确性确保机制 (View-Correctness Discipline) → VIEW-* 契约
 
