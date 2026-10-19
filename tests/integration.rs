@@ -14335,6 +14335,63 @@ async fn api_post_allows_missing_or_same_origin_headers() {
     assert_eq!(resp.status(), 200, "GET must skip Origin check");
 }
 
+/// SEC-7 hyper 边界 (重复 Host / absolute-form target) — 先证明行为再定断言 (#356 子项8):
+/// 1. **重复 Host**: `HeaderMap::get` 只取首个值, 第二个值不校验 — 攻击面问题是
+///    hyper 是否会把多值 Host 传递到应用层. 实验锁定: 无论 hyper 层怎么处理
+///    (自身 400 拒绝 / 传递), **携带有非法权威的请求绝不能拿到 2xx**.
+/// 2. **absolute-form target** (`GET http://evil.com/...`): 代理请求形态, 浏览器
+///    不发, 但 SDK/工具可能; 锁定 guard 对 Host header 的校验不被绕过.
+#[tokio::test]
+async fn host_guard_duplicate_host_and_absolute_form_edges() {
+    let (_base, addr) = spawn_guarded("127.0.0.1", &[]).await;
+
+    // (1) 合法 Host 在前 + 攻击域名在后: 多值 Host 的第二值不得免检放行.
+    // 期望: 403 (guard 全值校验) 或 400 (hyper 拒绝多值 Host) — 绝不能 200.
+    let dup = raw_http_status(
+        addr,
+        &format!(
+            "GET /api/sessions HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nHost: attacker.com\r\nConnection: close\r\n\r\n",
+            addr.port()
+        ),
+    )
+    .await;
+
+    // (2) 攻击域名在前 + 合法 Host 在后 (顺序对称).
+    let dup_rev = raw_http_status(
+        addr,
+        &format!(
+            "GET /api/sessions HTTP/1.1\r\nHost: attacker.com\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+            addr.port()
+        ),
+    )
+    .await;
+
+    // (3) absolute-form target + 与 target 不一致的合法 Host: authority 以
+    // request-line 为准的语义下, evil.com 不得经 absolute-form 绕过 Host 白名单.
+    let abs = raw_http_status(
+        addr,
+        &format!(
+            "GET http://attacker.com/api/sessions HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+            addr.port()
+        ),
+    )
+    .await;
+
+    // 实验断言: 三种权威混淆形态都拿不到 2xx (403=guard 拒 / 400=hyper 拒).
+    // 用显式分支而非精确 status: hyper 版本行为差异 (拒绝 vs 传递) 不构成本
+    // 契约的断言面, "非 2xx" 才是 SEC-7 的安全下界.
+    for (label, status) in [
+        ("dup host (valid first)", dup),
+        ("dup host (evil first)", dup_rev),
+        ("absolute-form target", abs),
+    ] {
+        assert!(
+            !(200..300).contains(&status),
+            "SEC-7 violation: {label} got {status} — confused-authority request must not succeed"
+        );
+    }
+}
+
 /// SEC-7 域名白名单 (`[server] allowed_domains`): 声明的信任域名放行 (端口宽松,
 /// 反代 + 域名部署形态), 未声明域名仍 403 (rebinding 攻击域名进不了名单)。
 #[tokio::test]

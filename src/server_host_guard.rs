@@ -40,6 +40,11 @@
 //!
 //! - HTTP/1.1 以下 / 缺 Host header 的请求放行: rebinding 攻击必带域名 Host,
 //!   无 Host 的客户端 (裸 SDK / HTTP/1.0) 不在本威胁模型内。
+//! - 多值 Host (HTTP/1.1 规范上非法, hyper 仍传递) **全值校验** — 任一值不在
+//!   白名单即 403 (#356 子项8: 修复前 `HeaderMap::get` 只检首值, 第二值免检)。
+//!   非 UTF-8 畸形 Host 值同样拒绝 (RFC 要求 Host 为 ASCII, 拒绝是安全方向)。
+//! - absolute-form target (request-line 自带 authority, 显式代理形态) 的
+//!   authority 同样过白名单 — 与 Host 分裂的形态是权威混淆, 403 (#356 子项8)。
 //! - 转发路径 (`/{o|a|g|l|r}/...`) 不做 Origin 校验 (SDK 场景, Host 校验已覆盖
 //!   rebinding)。
 
@@ -226,13 +231,35 @@ fn forbidden(reason: &'static str) -> Response {
 pub async fn guard(State(guard): State<HostGuard>, req: Request, next: Next) -> Response {
     // (1) Host 白名单 — 所有请求 (SEC-7 主体, 防 DNS rebinding)。
     // 缺 Host header 放行: rebinding 攻击必带域名 Host, 无 Host 的是裸 SDK/HTTP1.0。
-    if let Some(h) = req
-        .headers()
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        && !guard.authority_allowed(h)
+    //
+    // **全值校验** (#356 子项8): `HeaderMap::get` 只取首个值 — 多值 Host
+    // (HTTP/1.1 规范上非法, 但 hyper 会把两个值都传递到应用层, 集成测试
+    // `host_guard_duplicate_host_and_absolute_form_edges` 实测) 的第二个值
+    // 曾免检放行 ("合法值在前 + 攻击域名在后" 拿到 200)。迭代 `get_all`
+    // 对每个值校验, 任一值不在白名单 (含非 UTF-8 畸形值) 即拒 — 权威
+    // 混淆请求一律 403, 安全方向收紧。
+    let hosts = req.headers().get_all(header::HOST);
+    if hosts
+        .iter()
+        .any(|v| !v.to_str().is_ok_and(|h| guard.authority_allowed(h)))
     {
         return forbidden("bad Host header");
+    }
+
+    // (1b) absolute-form target 的 authority 校验 (#356 子项8): request-line 自带
+    // authority (`GET http://host/... HTTP/1.1`, 显式代理形态) 时, RFC 7230 §5.4
+    // 要求 Host header 与之一致 — "Host 合法 + target authority 任意" 的分裂
+    // 形态是权威混淆 (实测曾拿到 200, 集成测试锁定), 拒绝。
+    // secret-guard 是 reverse gateway 而非 forward proxy, absolute-form 无合法
+    // 消费方; 一致形态下两个 authority 同过同拒, 无额外误伤。
+    if let Some(uri_host) = req.uri().host() {
+        let authority = match req.uri().port_u16() {
+            Some(p) => format!("{uri_host}:{p}"),
+            None => uri_host.to_string(),
+        };
+        if !guard.authority_allowed(&authority) {
+            return forbidden("bad absolute-form target");
+        }
     }
 
     // (2) /api/* 非安全方法: Origin / Sec-Fetch-Site 校验 (CSRF 纵深)。
@@ -262,6 +289,7 @@ pub async fn guard(State(guard): State<HostGuard>, req: Request, next: Next) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     const PORT: u16 = 18787;
 
@@ -402,5 +430,48 @@ mod tests {
         assert!(g.origin_allowed("https://sg.example.com"));
         assert!(g.origin_allowed("https://sg.example.com:8443"));
         assert!(!g.origin_allowed("https://attacker.com"));
+    }
+
+    // ─── property-based (SEC-7 任意串, #356 子项8) ─────────────────────────
+    //
+    // 全称命题: "未声明的域名形式 Host 一律拒绝" / "authority 判定永不 panic".
+    // 此前仅 10 个固定枚举 #[test] — 任意串 (畸形括号 / 超长 / unicode / 空串)
+    // 的判定面零 property 覆盖.
+
+    proptest! {
+        /// 任意 Host header 值 (含畸形括号 / 空 / 多字节 unicode / 超长) 的判定
+        /// 永不 panic — guard 在请求热路径上, 任何 panic 都是单请求 DoS.
+        #[test]
+        fn prop_authority_allowed_never_panics(authority in "[^\x00]{0,256}") {
+            let g = loopback_guard();
+            let _ = g.authority_allowed(&authority);
+        }
+
+        /// 域名形式 authority (rebinding 载体) 恒拒: 任意域名形态字符串 (非
+        /// loopback IP 字面量 / 非 localhost — prop_assume 排除白名单自然命中),
+        /// 无论是否带匹配监听口的显式 port, 一律拒绝.
+        #[test]
+        fn prop_undeclared_domain_form_always_rejected(
+            domain in r"[a-z0-9][a-z0-9-]{0,12}(\.[a-z0-9][a-z0-9-]{0,12}){1,3}",
+            with_port in any::<bool>(),
+        ) {
+            let g = loopback_guard();
+            let authority = if with_port {
+                format!("{domain}:{PORT}")
+            } else {
+                domain.clone()
+            };
+            // 白名单自然命中的排除: 生成域是域名形态, host 部分不可能等于
+            // "localhost" (含 '.'), 只需排除偶然 parse 成 IP 字面量 (如 "1.2.3.4").
+            let host = authority
+                .rsplit_once(':')
+                .map(|(h, _)| h)
+                .unwrap_or(&authority);
+            prop_assume!(parse_ip_literal(host).is_none());
+            prop_assert!(
+                !g.authority_allowed(&authority),
+                "undeclared domain-form Host must be rejected: {authority}"
+            );
+        }
     }
 }
