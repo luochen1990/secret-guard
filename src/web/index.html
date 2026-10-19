@@ -149,7 +149,7 @@
     /* 代码 / 原始字节区统一用等宽 (语义需要, 非全局风格). 集中声明, 避免下方重复. */
     pre, code, .raw-pre, .resp-body, .bubble-tool, .bubble-tool-call, .xml-block,
     .full-body, .info-val, dialog#secret-form form textarea, textarea#apikey-reveal-value,
-    .probe-chip, .common-uri-badge, .ep-url-suggest-url, .disc-uri,
+    .probe-chip, .probe-url, .common-uri-badge, .ep-url-suggest-url,
     .ep-short, .ep-url > code, #privacy-scan-panel td.mono-cell {
       font-family: "SF Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
     }
@@ -724,24 +724,32 @@
     .pm-dot.pm-on { color: var(--ok); }
     .pm-dot.pm-wait { color: var(--warn); }
     .pm-cur { color: var(--accent); font-weight: 700; }
-    /* Detect 结果 (压缩形态, #332): 行内小图标 (✓ 绿 / ✗ 红 / ⚠ 琥珀) + hover
-       title 携带 detail — 不阻塞保存仅提示 (UI-10). 取代旧 .ep-probe-result
-       大面板 (推荐/URL 回显/模型 chips 职责移交端点发现区块 #p-discovery). */
-    .ep-probe-dot { flex: none; font-size: 13px; font-weight: 700; cursor: help; }
-    .ep-probe-dot-ok { color: var(--ok); }
-    .ep-probe-dot-err { color: var(--err); }
-    .ep-probe-dot-warn { color: var(--warn); }
-    /* probe-line / probe-models / probe-chip 是 endpoints 弹窗 Models 面板与
-       端点发现区块共用的通用件 (状态行 / 可滚动 chips 容器 / 点击复制 chip). */
+    /* Detect 协议探测结果区 (per 端点行内, .ep-probe-result — 状态行 / note hint /
+       模型 chips), 清空后由 :empty 折叠 (不残留空行). 容器用 grid 而非 flex column:
+       单列隐式行堆叠等价, 且全局 .hint { flex: 1 } 对 grid item 天然无效, 免去中和
+       补偿规则. */
+    .ep-probe-result { grid-column: 1 / -1; display: grid; gap: 4px; }
+    .ep-probe-result:empty { display: none; }
+    /* probe-line / probe-models / probe-chip 是探测与 endpoints 弹窗共用的
+       通用件 (状态行 / 可滚动 chips 容器 / 点击复制 chip) — 不限定在
+       探测结果区下, endpoints 弹窗的 Models 面板复用同一套. */
     .probe-line { font-size: 12px; color: var(--fg-muted); }
     .probe-line-ok { color: var(--ok); }
     .probe-line-err { color: var(--err); }
+    /* 探测 URL 回显 (不黑盒): 每路 GET 的完整 URL, 缩进小字等宽 (字体并入上方
+       全局等宽列表), 长地址可断行. */
+    .probe-url {
+      font-size: 11px;
+      color: var(--fg-faint);
+      word-break: break-all;
+      padding-left: 12px;
+    }
     /* 端点行编辑器 (Direct 构造字段组, multi-endpoint): 骨架复用 routes-editor
-       共享规则 (见上), 行 = protocol select + base_url + common_uri 徽标 +
-       Detect 结果小图标 + Detect + 删除. */
+       共享规则 (见上), 行 = protocol select + common_uri 输入 + 徽标 + base_url +
+       Verify + 删除, 次行 = 探测/校验结果区 (跨整行). */
     #p-endpoints-list .endpoint-row {
       display: grid;
-      grid-template-columns: 140px 1fr auto auto auto auto;
+      grid-template-columns: 118px 76px auto 1fr auto auto;
       gap: 4px;
       align-items: center;
     }
@@ -754,6 +762,81 @@
       color: var(--err);
       background: var(--err-soft);
     }
+    /* 端点行 "二次检测" (#332): 按钮 + 状态 icon (✓/✗/…). 行编辑
+       (protocol/URI/base_url 任一变更) 清除状态 — 校验结果只对被验证的
+       三元组成立; 结果仅提示, 不阻塞保存 (UI-10). */
+    .ep-verify .ep-verify-icon {
+      display: inline-block;
+      min-width: 13px;
+      text-align: center;
+    }
+    .ep-verify.verifying .ep-verify-icon { color: var(--fg-faint); }
+    .ep-verify.v-ok .ep-verify-icon { color: var(--ok); font-weight: 700; }
+    .ep-verify.v-fail .ep-verify-icon { color: var(--err); font-weight: 700; }
+    /* Direct 构造的 "检测台" (#332 创建流程重设计): 用户填 端点 URL + 密钥 →
+       Detect → 检测结果. 自成一块 (跨整行 + 内部复用 100px/1fr 双列对齐表单
+       其余 label), 与下方端点确认区用虚线分隔 — 视觉上强调 "检测是增强,
+       填写与保存不依赖它" (UI-10). */
+    .detect-stage {
+      grid-column: 1 / -1;
+      display: grid;
+      grid-template-columns: 100px 1fr;
+      gap: 6px 8px;
+      align-items: center;
+      padding-bottom: 10px;
+      border-bottom: 1px dashed var(--border-faint);
+      margin-bottom: 2px;
+    }
+    .detect-stage .detect-actions {
+      grid-column: 1 / -1;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .detect-stage .detect-actions .hint { flex: 1; margin: 0; }
+    #p-detect-results {
+      grid-column: 1 / -1;
+      display: grid;
+      gap: 4px;
+    }
+    #p-detect-results:empty { display: none; }
+    /* 检测结果行 (#332): per 协议 — 状态 icon + 协议名 + 命中 URI + 摘要 +
+       快速 "添加". ok / 启发式推荐 行给添加入口; 已配置协议 → "已添加" 置灰
+       (syncDetectResultAddStates 对账). */
+    .dr-row {
+      display: grid;
+      grid-template-columns: 16px 106px 88px 1fr auto;
+      gap: 4px 8px;
+      align-items: center;
+      font-size: 12px;
+    }
+    .dr-status { text-align: center; font-weight: 700; }
+    .dr-status.st-ok { color: var(--ok); }
+    .dr-status.st-warn { color: var(--warn); }
+    .dr-status.st-err { color: var(--err); }
+    .dr-status.st-none { color: var(--fg-faint); }
+    .dr-proto { color: var(--fg); }
+    .dr-uri {
+      font-family: "SF Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      font-size: 11px;
+      color: var(--fg-muted);
+    }
+    .dr-detail {
+      color: var(--fg-faint);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    /* 详情子行 (#332 融合, 吸收自 #p-discovery 的 .disc-detail): responses 共用
+       注记 / auth 提示 / existence 的 POST+对照描述 — 缩进弱化, 不与主行抢焦点. */
+    .dr-sub {
+      padding-left: 24px;
+      font-size: 11px;
+      color: var(--fg-faint);
+      word-break: break-all;
+    }
+    .dr-item { display: grid; gap: 2px; }
+    .dr-item .probe-models { grid-column: 1 / -1; }
     /* base_url 旁的 common_uri 徽标 (per 行): detect 固化的布局知识, 绿色调区分
        输入内容, 点击复制 base_url + common_uri 整体 (cursor: copy). */
     .common-uri-badge {
@@ -793,8 +876,8 @@
     }
     .probe-chip:hover { border-color: var(--border-strong); color: var(--fg); }
     .probe-chip.copied { border-color: var(--ok); background: var(--ok-soft); color: var(--ok); }
-    /* 输入建议列表 (知识库子串匹配; 行内跨整行 — endpoint 行 grid 的隐式整行
-       同型先例). 条目是裸 button (非 .btn 组合):
+    /* base_url 补全建议列表 (ENDPOINT_PRESETS 子串匹配, per 行内跨整行 — 同
+       .ep-probe-result 的 grid-column 先例). 条目是裸 button (非 .btn 组合):
        自带全套重置 (border 0 + 透明底 + font inherit), 同 .probe-chip 先例;
        hover 用 accent (任务规格: muted url + 正常 label + hover accent). */
     .ep-url-suggest {
@@ -825,42 +908,6 @@
     .ep-url-suggest-url {
       color: var(--fg-muted);
       font-size: 11px;
-      word-break: break-all;
-    }
-    /* 端点发现区块 (#332 origin 探测): 结果面板 = 每协议一行的检测矩阵 (固定序
-       openai/anthropic/gemini/ollama/responses). 行 = 图标/圆点 + 协议名 + uri
-       徽标 + 证据标签 + 右侧 [添加]; 详情子行 (模型名预览 / 共用注记 / 错误
-       detail) 缩进弱化. 整面板失败态 (网络错/非 200) 复用 .probe-line-err. */
-    #p-discovery-results { display: grid; gap: 4px; }
-    #p-discovery-results:empty { display: none; }
-    .disc-row {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      font-size: 12px;
-      min-height: 26px;
-    }
-    .disc-icon { flex: none; font-weight: 700; }
-    .disc-icon-ok { color: var(--ok); }
-    .disc-icon-warn { color: var(--warn); }
-    .disc-dot { flex: none; color: var(--fg-faint); }
-    .disc-proto { flex: none; min-width: 72px; color: var(--fg); }
-    .disc-uri {
-      flex: none;
-      padding: 1px 6px;
-      border: 1px solid var(--border);
-      border-radius: var(--radius-sm);
-      background: var(--bg-sunken);
-      color: var(--fg-muted);
-      font-size: 11px;
-    }
-    .disc-ev { color: var(--fg-muted); }
-    .disc-note { color: var(--fg-muted); word-break: break-all; }
-    .disc-add { margin-left: auto; }
-    .disc-detail {
-      padding-left: 22px;
-      font-size: 11px;
-      color: var(--fg-faint);
       word-break: break-all;
     }
     dialog#provider-form .actions {
@@ -2268,26 +2315,26 @@
         </details>
       </div>
       <div class="kind-fields" id="p-direct-fields">
-        <!-- 顺序 (#332 origin 先行): 条目级凭证 → 端点发现 (主入口) → 端点行编辑器.
-             api_key 前置是因为 origin 检测与逐行 Detect 都取它当前值 (共享凭证 D3). -->
-        <label for="p-api-key" data-i18n="providers.apiKey">API Key</label>
-        <input type="password" id="p-api-key" placeholder="(optional for local providers like Ollama)" data-i18n-placeholder="providers.apiKeyPlaceholder">
-        <div class="routes-editor" id="p-discovery">
-          <div class="routes-head">
-            <span data-i18n="providers.discovery">Endpoint discovery (origin)</span>
-            <button type="button" class="btn" id="p-discovery-probe" data-i18n="probe.originBtn" data-i18n-title="probe.originBtnTitle">Probe</button>
+        <div class="detect-stage">
+          <label for="p-detect-url" data-i18n="providers.baseUrl">Base URL</label>
+          <input type="text" id="p-detect-url" placeholder="https://api.example.com" data-i18n-placeholder="providers.detectUrlPlaceholder">
+          <label for="p-api-key" data-i18n="providers.apiKey">API Key</label>
+          <input type="password" id="p-api-key" placeholder="(optional for local providers like Ollama)" data-i18n-placeholder="providers.apiKeyPlaceholder">
+          <div class="detect-actions">
+            <button type="button" class="btn" id="p-detect-btn" title="" data-i18n-title="providers.detectTitle" data-i18n="providers.detect">Detect</button>
+            <div class="hint" data-i18n-html="providers.detectHint">
+              Detection is optional — paste the provider URL (origin or base, known
+              protocol faces are probed for you), then add protocols from the results
+              below, or skip it and add endpoints manually. Saving never depends on
+              detection.
+            </div>
           </div>
-          <input type="text" id="p-discovery-origin" placeholder="https://api.example.com" data-i18n-placeholder="providers.discoveryOriginPlaceholder">
-          <div id="p-discovery-results"></div>
-          <div class="hint" style="margin: 0 0 4px 0;" data-i18n-html="providers.discoveryHint">
-            Paste the provider origin (scheme + host, no path). Probe lists every protocol face
-            it exposes — add the ones you need, or skip detection and add endpoints manually.
-          </div>
+          <div id="p-detect-results"></div>
         </div>
         <div class="routes-editor">
           <div class="routes-head">
             <span data-i18n="providers.endpoints">Endpoints (one per protocol, shared API key)</span>
-            <button type="button" class="btn" id="p-endpoint-add" data-i18n="providers.addEndpoint">+ Add protocol</button>
+            <button type="button" class="btn" id="p-endpoint-add" data-i18n="providers.addProtocol">+ Add protocol</button>
           </div>
           <div id="p-endpoints-list"></div>
           <div class="hint" style="margin: 0 0 4px 0;" data-i18n-html="providers.endpointsHint">
@@ -2668,11 +2715,7 @@
         'providers.exh.headersPlaceholder': 'name=value, one per line',
         'providers.exh.cooldown': 'Cooldown (s)',
         'providers.endpoints': 'Endpoints (one per protocol, shared API key)',
-        'providers.addEndpoint': '+ Add protocol',
         'providers.endpointsHint': 'Each endpoint serves its protocol via <code>/{proto-short}/{provider-id}/</code> (byte-exact passthrough). Requests whose ingress protocol has no endpoint fall back to the first endpoint (cross-protocol translation).',
-        'providers.discovery': 'Endpoint discovery (origin)',
-        'providers.discoveryOriginPlaceholder': 'https://api.example.com — just the origin, protocol faces are probed for you',
-        'providers.discoveryHint': 'Paste the provider origin (scheme + host, no path). Probe lists every protocol face it exposes — add the ones you need, or skip detection and add protocol endpoints manually.',
         'providers.apiKey': 'API Key',
         'providers.apiKeyPlaceholder': '(optional for local providers like Ollama)',
         'providers.apiKeyKeep': 'unchanged ({masked}) — leave blank to keep',
@@ -2686,19 +2729,28 @@
         'providers.removeMember': 'Remove member',
         'providers.missing': '(missing)',
         'providers.notDirect': '(not a direct provider)',
-        'providers.epProtocolTitle': 'Protocol of this endpoint — pick it manually, or add a verified face from Endpoint discovery; adjust anytime',
+        'providers.epProtocolTitle': 'Protocol of this endpoint — filled by clicking Add on a detection result row, or pick manually',
         'providers.baseUrlPlaceholder': 'https://api.openai.com (no trailing /)',
-        'providers.commonUriTitle': 'Common URI detected by Detect — the prefix secret-guard prepends to its own model-list requests. Click to copy base URL + common URI as a whole. Editing the base URL clears this.',
+        'providers.commonUriTitle': 'Common URI — the prefix between the base URL and request paths (e.g. /v1). Filled by detection; editable. Click the badge to copy base URL + common URI as a whole.',
         'providers.detect': 'Detect',
-        'providers.detectTitle': 'Verify this endpoint (chosen protocol + base URL) — the outcome shows as an icon here and never blocks saving',
+        'providers.detectTitle': 'Probe every protocol face under the URL above (origin normalization + evidence ladder; existence probing covers gateways without a models endpoint) — does not save',
         'providers.detecting': 'Detecting…',
         'providers.removeEndpoint': 'Remove endpoint',
+        'providers.addProtocol': '+ Add protocol',
+        'providers.baseUrl': 'Base URL',
+        'providers.detectHint': 'Detection is optional — paste the provider URL (origin or base, known protocol faces are probed for you), then add protocols from the results below, or skip it and add endpoints manually. Saving never depends on detection.',
+        'providers.detectUrlPlaceholder': 'https://api.example.com — origin or endpoint URL; protocol faces are probed for you',
+        'providers.uriPlaceholder': 'auto',
+        'providers.endpointUriTitle': 'Common URI — the prefix between the base URL and request paths. Blank = auto (tail heuristic at runtime), e.g. /v1',
+        'providers.verify': 'Verify',
+        'providers.verifyTitle': 'Re-check this endpoint (protocol + URL + URI) against its model-list endpoint — hint only, never blocks saving',
         'providers.commonUriIncluded': '✓ included',
         'providers.experimental': '{proto} (experimental)',
         'alert.noEndpoints': 'At least one endpoint is required for a direct provider.',
         'alert.endpointProtocolRequired': 'Endpoint #{n}: protocol is required.',
         'alert.endpointUrlRequired': 'Endpoint #{n}: Base URL is required.',
         'alert.endpointDupProtocol': 'Endpoint #{n}: duplicate protocol "{proto}" — one endpoint per protocol (extra protocols would never match).',
+        'alert.endpointCommonUriShape': 'Endpoint #{n}: common URI must be blank (auto) or start with "/" (e.g. /v1).',
         'alert.noRoutes': 'At least one route is required for a router provider.',
         'alert.routePatternRequired': 'Route #{n}: model_pattern is required (e.g. gpt-*).',
         'alert.routeTargetRequired': 'Route #{n}: route target is required (pick a provider, or create one first).',
@@ -2757,21 +2809,20 @@
         'models.failed': 'Failed to load models: {msg}',
         'models.none': 'No models reported by this endpoint.',
         'models.copyTip': 'Copy model name',
-        // ── Detect 探测 (端点发现 origin 矩阵 + 逐行压缩图标) ──
-        'probe.originBtn': 'Probe',
-        'probe.originBtnTitle': 'Probe every protocol face under this origin (does not save)',
-        'probe.enterOrigin': 'Enter an origin URL first (e.g. https://api.example.com)',
-        'probe.discoveryAdd': 'Add',
-        'probe.discoveryAdded': 'Added',
-        'probe.discoveryAddTitle': 'Add this protocol as an endpoint row (base URL prefilled, editable)',
-        'probe.faceAbsent': 'not found',
+        // ── Detect 探测 ──
+        'detect.resultsFor': 'Detection results for {url}',
+        'detect.add': 'Add',
+        'detect.added': 'Added ✓',
         'probe.evModels': 'model list · {n}',
         'probe.evAuth': 'auth wall — check your key',
         'probe.evExistence': 'route exists',
+        'probe.faceAbsent': 'not found',
         'probe.discoveryNormalized': 'Normalized your input to {origin} (stripped {stripped})',
-        'probe.dotOk': 'OK',
-        'probe.dotOkModels': 'OK — {n} models',
-        'probe.dotNoProbe': 'No probe outcome for this protocol',
+        'verify.ok': 'Verified — {n} models available',
+        'verify.fail': 'Unreachable: {status} — {detail}',
+        'verify.nonBlockingHint': 'Verification is a hint only — saving is never blocked.',
+        'probe.noProbes': 'No probes returned',
+        'probe.noEndpointHint': "No models endpoint recognized — some providers (especially Anthropic-compatible gateways) don't expose one. That's fine: pick the protocol for this endpoint manually and save; forwarding never depends on detection.",
         'probe.keylessHint': 'Probed without an API key — the saved key is not reused; auth_failed may just mean the probe carried no key.',
         'probe.enterUrl': 'Enter a base URL first',
         'probe.failed': 'Probe failed: {msg}',
@@ -3153,11 +3204,7 @@
         'providers.exh.headersPlaceholder': 'name=value, 每行一条',
         'providers.exh.cooldown': '冷却 (秒)',
         'providers.endpoints': '端点 (每协议一条, 共享 API Key)',
-        'providers.addEndpoint': '+ 添加协议',
         'providers.endpointsHint': '每个端点经 <code>/{proto-short}/{provider-id}/</code> 服务其协议 (字节级透传)。入口协议无对应端点时回退到首个端点 (跨协议翻译)。',
-        'providers.discovery': '端点发现 (origin 探测)',
-        'providers.discoveryOriginPlaceholder': 'https://api.example.com — 只填 origin, 各协议面自动探测',
-        'providers.discoveryHint': '粘贴供应商 origin (协议 + 主机, 不含路径)。检测会列出它暴露的各协议面 — 按需添加; 也可以跳过检测, 直接手动添加协议端点。',
         'providers.apiKey': 'API Key',
         'providers.apiKeyPlaceholder': '(本地 provider 如 Ollama 可留空)',
         'providers.apiKeyKeep': '不变 ({masked}) — 留空即保留',
@@ -3171,19 +3218,28 @@
         'providers.removeMember': '移除成员',
         'providers.missing': '(缺失)',
         'providers.notDirect': '(非 direct provider)',
-        'providers.epProtocolTitle': '该端点的协议 — 手动选择, 或经端点发现添加已验证的协议面; 可随时调整',
+        'providers.epProtocolTitle': '该端点的协议 — 可点检测结果行的「添加」快速填入, 也可手动选择',
         'providers.baseUrlPlaceholder': 'https://api.openai.com (末尾不加 /)',
-        'providers.commonUriTitle': 'Detect 探测到的 Common URI — secret-guard 发起自身模型清单请求时拼接的前缀。点击复制 base URL + common URI 整体。编辑 base URL 会作废该值。',
+        'providers.commonUriTitle': 'Common URI — base URL 与请求路径之间的公共前缀 (如 /v1)。检测后自动填入, 可手动修改。点击徽标复制 base URL + common URI 整体。',
         'providers.detect': '探测',
-        'providers.detectTitle': '探测验证该端点 (所选协议 + base URL) — 结果以图标提示, 不阻塞保存',
+        'providers.detectTitle': '探测该 URL 下的全部协议面 (origin 归一 + 证据梯; 无 models 端点的网关由存在性探测覆盖) — 不会保存',
         'providers.detecting': '探测中…',
         'providers.removeEndpoint': '移除端点',
+        'providers.addProtocol': '+ 添加协议',
+        'providers.baseUrl': '端点 URL',
+        'providers.detectHint': '检测是可选增强 — 填供应商 URL (origin 或端点 URL, 各协议面自动探测), 在下方结果行点「添加」快速加入协议, 也可跳过检测手动添加。保存永不依赖检测结果。',
+        'providers.detectUrlPlaceholder': 'https://api.example.com — origin 或端点 URL, 各协议面自动探测',
+        'providers.uriPlaceholder': '自动',
+        'providers.endpointUriTitle': 'Common URI — base URL 与请求路径之间的公共前缀。留空 = 自动 (运行时按尾段启发), 如 /v1',
+        'providers.verify': '校验',
+        'providers.verifyTitle': '对该端点 (协议 + URL + URI) 二次检测模型清单端点 — 仅提示, 永不阻塞保存',
         'providers.commonUriIncluded': '✓ 已含',
         'providers.experimental': '{proto} (实验性)',
         'alert.noEndpoints': 'direct provider 至少需要一个端点。',
         'alert.endpointProtocolRequired': '端点 #{n}: 协议必填。',
         'alert.endpointUrlRequired': '端点 #{n}: Base URL 必填。',
         'alert.endpointDupProtocol': '端点 #{n}: 协议 "{proto}" 重复 — 每协议至多一个端点 (多余协议永远不会匹配)。',
+        'alert.endpointCommonUriShape': '端点 #{n}: Common URI 须留空 (自动) 或以 "/" 开头 (如 /v1)。',
         'alert.noRoutes': 'router provider 至少需要一条路由。',
         'alert.routePatternRequired': '路由 #{n}: model_pattern 必填 (如 gpt-*)。',
         'alert.routeTargetRequired': '路由 #{n}: 目标必填 (选择一个 provider, 或先创建)。',
@@ -3242,21 +3298,20 @@
         'models.failed': '模型加载失败: {msg}',
         'models.none': '该端点未上报模型。',
         'models.copyTip': '复制模型名',
-        // ── Detect 探测 (端点发现 origin 矩阵 + 逐行压缩图标) ──
-        'probe.originBtn': '检测',
-        'probe.originBtnTitle': '探测该 origin 下的全部协议面 (不会保存)',
-        'probe.enterOrigin': '请先填写 origin URL (如 https://api.example.com)',
-        'probe.discoveryAdd': '添加',
-        'probe.discoveryAdded': '已添加',
-        'probe.discoveryAddTitle': '将该协议添加为端点行 (base URL 已预填, 可改)',
-        'probe.faceAbsent': '未发现',
+        // ── Detect 探测 ──
+        'detect.resultsFor': '检测结果: {url}',
+        'detect.add': '添加',
+        'detect.added': '已添加 ✓',
         'probe.evModels': '模型清单 · {n} 个',
         'probe.evAuth': '鉴权墙 (检查 key)',
         'probe.evExistence': '路由存在',
+        'probe.faceAbsent': '未发现',
         'probe.discoveryNormalized': '已将输入 URL 归一为 {origin} (剥离 {stripped})',
-        'probe.dotOk': 'OK',
-        'probe.dotOkModels': 'OK — {n} 个模型',
-        'probe.dotNoProbe': '该协议无探测结果',
+        'verify.ok': '校验通过 — {n} 个模型可用',
+        'verify.fail': '未通过: {status} — {detail}',
+        'verify.nonBlockingHint': '校验仅作提示, 不会阻塞保存。',
+        'probe.noProbes': '未返回任何探测',
+        'probe.noEndpointHint': "未识别到模型端点 — 部分供应商（尤其 Anthropic 兼容网关）不提供该端点。这不影响使用：手动选择该端点的协议后保存即可，转发不依赖检测结果。",
         'probe.keylessHint': '探测未携带 API key — 已保存的 key 不会被复用; auth_failed 可能只是因为探测请求没带 key。',
         'probe.enterUrl': '请先填写 base URL',
         'probe.failed': '探测失败: {msg}',
@@ -3486,13 +3541,20 @@
       // 在途 probe 响应落地前对账, 代数不匹配即丢弃 — 防在途旧结果写入重开后的新
       // 表单世界 (含静默改写端点行 protocol select 导致存错协议的数据级后果).
       probeEpoch: 0,
+      // provider 表单检测台最近一次成功响应快照 (#332 融合): { url, data,
+      // keylessHint } | null. url = 发起探测时的检测台输入 — 检测结果行只对它
+      // 成立; data = POST /api/providers/probe-origin 响应 (origin 归一化后的
+      // faces 矩阵, v1 族行携带 common_uri 布局证据); keylessHint = 编辑态
+      // key 留空的消歧提示 (渲染期消费). 生命周期: dialog 打开重置 null; detect
+      // 成功落地覆写; 结果区 DOM 是它的派生物 (同 probeEpoch 属 dialog 世界状态).
+      probeLastDetect: null,
       // provider 表单 common_uri 暂存 (detect 知识 → 保存落盘的通道) 是 **per 端点行**
       // 的 (multi-endpoint): 存在行的 `dataset.commonUri` 上 (行数据 SSOT 是 DOM 本身,
       // 同路由编辑器模式), null 态 = 无该属性 (保存落 null, fetch 侧现场推导);
       // '/v1' | '' = detect 确认的布局断言. 生命周期: 打开表单从 existing.endpoints
-      // 一次性物化 (编辑回填原值, 防未重跑 detect 的保存抹掉存量知识) → 该行 detect
-      // 成功覆盖 → 该行 base_url 编辑作废删除属性 (旧探测结果不适用于新 URL).
-      // 保存 payload 全量携带 (后端全量语义).
+      // 一次性物化 (编辑回填原值, 防未重跑 detect 的保存抹掉存量知识) → 该行
+      // detect 快速添加 / URI 输入框编辑覆盖 → 该行 base_url 编辑作废删除属性
+      // (旧探测结果不适用于新 URL). 保存 payload 全量携带 (后端全量语义).
       // auth tab (static preset API keys)
       apiKeysList: [],
       authEnabled: false,
@@ -7523,19 +7585,18 @@
 
     // ─── endpoints 弹窗的 Models 预览 (GET /api/providers/{id}/models) ─────
     //
-    // 模型 chips 块: 标题 = "Models (N)" + 可选来源后缀, chips 点击复制. 单一
-    // 来源: "Models (N)" 文案与 chip 形态只在此定义, renderEndpointModels 调用
-    // (Detect 探测行的大面板消费面已随 #332 压缩形态移除).
+    // 模型 chips 块 (与 Detect 探测共用同款渲染): 标题 = "Models (N)" + 可选
+    // 来源后缀, chips 点击复制. 单一来源: "Models (N)" 文案与 chip 形态只在此
+    // 定义, renderProbeResult / renderEndpointModels 两处调用.
     function modelsBlock(models, titleSuffix = '') {
       const chips = models.map(m =>
         `<button type="button" class="probe-chip" data-model="${escapeHtml(m)}" title="${escapeHtml(t('models.copyTip'))}">${escapeHtml(m)}</button>`).join('');
       return `<div class="probe-models"><div class="probe-models-title">${escapeHtml(t('models.title', { n: models.length }))}${titleSuffix}</div>${chips}</div>`;
     }
 
-    // chip 点击复制的共享委托分支 (挂载点: endpoints 弹窗 — 端点行探测结果区的
-    // 消费面已随 #332 压缩形态移除): restore 时必须同步清掉 'copied' 反转色
-    // (copyWithFlash 只加不减 — 漏清则 flash 色永久滞留, 同 common-uri-badge 的
-    // M-A 教训).
+    // chip 点击复制的共享委托分支 (endpoints 弹窗与端点行探测结果区两处挂载):
+    // restore 时必须同步清掉 'copied' 反转色 (copyWithFlash 只加不减 — 漏清则
+    // flash 色永久滞留, 同 common-uri-badge 的 M-A 教训).
     function chipCopyHandler(ev) {
       const chip = ev.target.closest('.probe-chip');
       if (!chip) return false;
@@ -7666,27 +7727,27 @@
       else addRouteRow();
       // 端点行编辑器 (multi-endpoint): 同路由编辑器模式 — 行数据 SSOT 是 DOM,
       // 打开表单时从 existing.endpoints 一次性全量物化 (声明序 = fallback 序, 编辑
-      // 回填原值 + "保存全量提交" 实现 #157 无歧义的保留语义). **新建零行起步**
-      // (#332: 端点发现区块是主入口; "添加协议" 手动增行), ≥1 行约束仍在提交侧
-      // (collectEndpointsFromForm). 构造切换只显隐字段组不清空行.
+      // 回填原值 + "保存全量提交" 实现 #157 无歧义的保留语义). #332 创建流程重设计:
+      // 新建**不预置空白协议行** — 协议选择后移到检测结果行的快速添加 / 手动
+      // "添加协议" (用户先填 URL+Key 检测, 不再一开始面对协议填写框).
+      // 构造切换只显隐字段组不清空行.
       const epsList = document.getElementById('p-endpoints-list');
       epsList.innerHTML = '';
       const eps = existing?.kind === 'direct' ? (existing.endpoints || []) : [];
       eps.forEach(e => addEndpointRow(e));
-      // 端点发现区块 (#332) 随 dialog 打开重置: origin 输入清空 + 结果面板清空
-      // (探测结论只对被探测的 origin 成立, 跨世界不残留). epoch bump 让在途
-      // probe / probe-origin 响应落地时对账丢弃 (probeEpoch 注释); [添加] 禁用态
-      // 随行物化刷新, 无跨世界残留窗口. 检测按钮是 dialog 内**静态单例** (行级
-      // Detect 按钮随行重建无此问题), 在途探测的 finally 恢复被 epoch 对账跳过
-      // 后, 重置态是它唯一的恢复路径 — disabled/文案必须在此一并还原 (review
-      // major: 否则重开 dialog 后按钮卡死 "探测中…" 且页内无解).
-      const dProbeBtn = document.getElementById('p-discovery-probe');
-      dProbeBtn.disabled = false;
-      dProbeBtn.textContent = t('probe.originBtn');
-      document.getElementById('p-discovery-origin').value = '';
-      document.getElementById('p-discovery-results').innerHTML = '';
-      document.querySelector('#p-discovery .ep-url-suggest')?.remove();
-      syncDiscoveryAddButtons();
+      // 检测台 (#332): URL 预填首端点 base_url (编辑态便利, 单端点是常态; 多端点
+      // 仅为检测起点, 不影响行数据), 结果区清空 + 快照重置 + 按钮复位 (dialog 世界
+      // 切换 — 在途探测属于旧世界, 其 finally 被 epoch 门控不复位新世界按钮, 故
+      // 此处显式还原)。
+      document.getElementById('p-detect-url').value = eps[0]?.base_url || '';
+      document.getElementById('p-detect-results').innerHTML = '';
+      document.querySelector('.detect-stage .ep-url-suggest')?.remove();
+      state.probeLastDetect = null;
+      const detectBtn = document.getElementById('p-detect-btn');
+      detectBtn.disabled = false;
+      detectBtn.textContent = t('providers.detect');
+      // epoch bump 让在途 probe 响应落地时对账丢弃 (probeEpoch 注释); 检测按钮态
+      // 随世界重置, 无跨世界残留窗口.
       state.probeEpoch++;
       const apiKeyInput = document.getElementById('p-api-key');
       apiKeyInput.value = '';
@@ -7712,39 +7773,72 @@
     // 的前置拦截风格一致 — 行删除不设下限, 保存时统一拦截).
 
     // 物化一行端点输入. ep 形如 {protocol, base_url, common_uri}; 缺省 = 一行空白
-    // (新建, protocol 兜底词表首项 / openai — 词表空即 fetch 未落地竞态).
-    // opts.lockProtocol (#332 端点发现): 该行 protocol 由检测结果面锁定 (select
-    // 置值 + 禁用 — DOM .value 对 disabled select 照常可读, 提交链无感); 解锁 =
-    // 删行后手动重加. 行尾 Detect 结果是压缩图标 (.ep-probe-dot, 仅提示不阻塞).
-    function addEndpointRow(ep, opts = {}) {
+    // (新建, protocol 兜底词表首项 / openai — 词表空即 fetch 未落地竞态), 调用方
+    // (手动添加 / 快速添加) 随后按需 set 覆盖. common_uri 暂存 = dataset.commonUri
+    // (SSOT, 保存读它) + URI 输入框镜像显示 ('' 断言也显示为空, 徽标区分 — 见
+    // syncEndpointCommonUriBadge).
+    function addEndpointRow(ep) {
       const row = document.createElement('div');
       row.className = 'endpoint-row';
       row.innerHTML = `
         <select class="ep-protocol" title="${escapeHtml(t('providers.epProtocolTitle'))}"></select>
-        <input type="text" class="ep-base-url" placeholder="${escapeHtml(t('providers.baseUrlPlaceholder'))}">
+        <input type="text" class="ep-common-uri" placeholder="${escapeHtml(t('providers.uriPlaceholder'))}"
+          title="${escapeHtml(t('providers.endpointUriTitle'))}">
         <button type="button" class="common-uri-badge ep-common-uri-badge" hidden
           title="${escapeHtml(t('providers.commonUriTitle'))}">+/v1</button>
-        <span class="ep-probe-dot" hidden aria-hidden="true"></span>
-        <button type="button" class="btn ep-detect" title="${escapeHtml(t('providers.detectTitle'))}">${escapeHtml(t('providers.detect'))}</button>
-        <button type="button" class="btn ep-del" title="${escapeHtml(t('providers.removeEndpoint'))}">✕</button>`;
+        <input type="text" class="ep-base-url" placeholder="${escapeHtml(t('providers.baseUrlPlaceholder'))}">
+        <button type="button" class="btn ep-verify" title="${escapeHtml(t('providers.verifyTitle'))}"><span class="ep-verify-icon"></span>${escapeHtml(t('providers.verify'))}</button>
+        <button type="button" class="btn ep-del" title="${escapeHtml(t('providers.removeEndpoint'))}">✕</button>
+        <div class="ep-probe-result"></div>`;
       fillEndpointProtocolOptions(row.querySelector('.ep-protocol'));
       if (ep) {
         setEndpointProtocolValue(row, ep.protocol);
         row.querySelector('.ep-base-url').value = ep.base_url || '';
+        row.querySelector('.ep-common-uri').value = ep.common_uri ?? '';
         if (ep.common_uri != null) row.dataset.commonUri = ep.common_uri;
       } else {
         setEndpointProtocolValue(row, state.providerWebuiProtocols[0] || 'openai');
       }
-      if (opts.lockProtocol) row.querySelector('.ep-protocol').disabled = true;
       syncEndpointCommonUriBadge(row);
-      // base_url 补全建议 (per 行, 通用机制 — 见 attachInputSuggest).
+      // base_url 补全建议 (per 行, 通用机制 — 见 attachInputSuggest; 行重建即重挂).
       attachInputSuggest(row.querySelector('.ep-base-url'), {
         compute: endpointUrlSuggestFor,
         apply: item => applyEndpointPreset(row, item),
         mountList: el => row.appendChild(el),
       });
-      document.getElementById('p-endpoints-list').appendChild(row);
-      syncDiscoveryAddButtons();
+      document.getElementById('p-endpoints-list').appendChild(row);      // 检测结果行的 "添加" 状态对账: 已配置协议集合变了 (新行总是占据某协议).
+      syncDetectResultAddStates();
+      return row;
+    }
+
+    // 端点行 "二次检测" 状态 icon (#332): kind = 'busy' | 'ok' | 'fail' | 'none'.
+    // 行编辑 (protocol / URI / base_url 任一变更) 时调 none 清除 — 校验结果只对
+    // 被验证的 (protocol, base_url, common_uri) 三元组成立. fail 时 title 带
+    // detail (行内 .ep-probe-result 有完整呈现, title 是 hover 快速通道).
+    function setVerifyState(row, kind, title) {
+      const btn = row.querySelector('.ep-verify');
+      if (!btn) return;
+      btn.classList.remove('verifying', 'v-ok', 'v-fail');
+      const icon = btn.querySelector('.ep-verify-icon');
+      if (kind === 'none') {
+        icon.textContent = '';
+        btn.title = t('providers.verifyTitle');
+        return;
+      }
+      btn.classList.add(kind === 'ok' ? 'v-ok' : kind === 'fail' ? 'v-fail' : 'verifying');
+      icon.textContent = kind === 'ok' ? '✓' : kind === 'fail' ? '✗' : '…';
+      if (title) btn.title = title;
+    }
+
+    // 端点行 common_uri 输入 → dataset 同步 (输入框是编辑器, dataset 是保存 SSOT):
+    // 值非空且不以 / 开头时容错前置 (blur 时归一, 避免输入中途移动光标); 空串 =
+    // 删除属性 (回落 auto). 徽标随 dataset 重渲染.
+    function setRowCommonUri(row, value) {
+      const v = value.trim();
+      if (v === '') delete row.dataset.commonUri;
+      else row.dataset.commonUri = v;
+      row.querySelector('.ep-common-uri').value = v;
+      syncEndpointCommonUriBadge(row);
     }
 
     // 行 common_uri 徽标同步 (per 行): 暂存非 null
@@ -7795,24 +7889,46 @@
           return null;
         }
         seen.add(protocol);
-        endpoints.push({ protocol, base_url, common_uri: row.dataset.commonUri ?? null });
+        // common_uri 形状前置拦截 (与后端 validate 同规则: 空串 = "版本前缀已含"
+        // 断言, 合法): dataset 是保存 SSOT, 非空必须以 / 开头 (blur 归一是主路径,
+        // 这里兜底程序化路径).
+        const cu = row.dataset.commonUri ?? null;
+        if (cu != null && cu !== '' && !cu.startsWith('/')) {
+          alert(t('alert.endpointCommonUriShape', { n: i + 1 }));
+          return null;
+        }
+        endpoints.push({ protocol, base_url, common_uri: cu });
       }
       return endpoints;
     }
 
     // 行容器与增行按钮 (兄弟节点, routes-head 模式) 各取一次, 委托挂行容器.
-    // 建议点选的 click 分支已随通用机制移入 attachInputSuggest (per 行, 见其注释).
     const pEndpointsList = document.getElementById('p-endpoints-list');
-    document.getElementById('p-endpoint-add').addEventListener('click', () => addEndpointRow());
+    // 手动 "添加协议" (#332 规格⑤): 不依赖检测结果. 默认选一个尚未配置的 codec
+    // 覆盖协议 (词表序), base_url 预填检测台 URL (非空即省一次输入, 仍可改),
+    // 焦点落 base_url 引导补齐.
+    document.getElementById('p-endpoint-add').addEventListener('click', () => {
+      const used = new Set([...document.querySelectorAll('#p-endpoints-list .endpoint-row .ep-protocol')]
+        .map(s => s.value));
+      const proto = state.providerWebuiProtocols.find(p => !used.has(p))
+        || state.providerWebuiProtocols[0] || 'openai';
+      const row = addEndpointRow();
+      setEndpointProtocolValue(row, proto);
+      const stageUrl = document.getElementById('p-detect-url').value.trim();
+      if (stageUrl) row.querySelector('.ep-base-url').value = stageUrl;
+      row.querySelector('.ep-base-url').focus();
+    });
+    // (行内 base_url 建议的点选/Escape/blur 关闭已收口到 attachInputSuggest 的
+    // per-input 监听 — 见知识库段的接线注释; 行容器委托只保留行级按钮分支.)
     pEndpointsList.addEventListener('click', (ev) => {
       const row = ev.target.closest('.endpoint-row');
       if (!row) return;
+      if (chipCopyHandler(ev)) return;
       if (ev.target.closest('.ep-del')) {
         row.remove();
-        // 行删除恢复端点发现 [添加] 的可用态 (#332: "已添加" 禁用随行集合重算).
-        syncDiscoveryAddButtons();
-      } else if (ev.target.closest('.ep-detect')) {
-        runEndpointProbe(row);
+        syncDetectResultAddStates();
+      } else if (ev.target.closest('.ep-verify')) {
+        runEndpointVerify(row);
       } else {
         const badge = ev.target.closest('.ep-common-uri-badge');
         if (badge) {
@@ -7823,18 +7939,58 @@
         }
       }
     });
-    // base_url 编辑作废该行暂存的 common_uri (探测结果只对被探测的那个 URL 成立);
-    // 建议重算在 attachInputSuggest 的 input 监听内 (同一事件两类消费).
+    // 行编辑的三类失效 (#332): base_url 编辑作废该行暂存 common_uri (探测结果只对
+    // 被探测的那个 URL 成立) + 作废 verify 状态 + 建议重算; common_uri 输入 =
+    // dataset 覆盖 (输入框是编辑器, dataset 是保存 SSOT) + verify 失效.
     pEndpointsList.addEventListener('input', (ev) => {
       const row = ev.target.closest('.endpoint-row');
-      if (row && ev.target.classList.contains('ep-base-url')) {
+      if (!row) return;
+      if (ev.target.classList.contains('ep-base-url')) {
         delete row.dataset.commonUri;
         syncEndpointCommonUriBadge(row);
+        setVerifyState(row, 'none');
+      } else if (ev.target.classList.contains('ep-common-uri')) {
+        setRowCommonUri(row, ev.target.value);
+        setVerifyState(row, 'none');
       }
     });
-    // protocol 变更 → 端点发现 [添加] 禁用态重算 (手动行改协议 = 已有协议集合变化).
+    // URI 输入 blur 归一 (change = 值变化后的失焦): 非空且不以 / 开头 → 前置 /.
+    // (不放在 input 事件: 输入中途改值会移动光标.)
     pEndpointsList.addEventListener('change', (ev) => {
-      if (ev.target.classList?.contains('ep-protocol')) syncDiscoveryAddButtons();
+      const row = ev.target.closest('.endpoint-row');
+      if (!row) return;
+      if (ev.target.classList.contains('ep-common-uri')) {
+        const v = ev.target.value.trim();
+        if (v !== '' && !v.startsWith('/')) setRowCommonUri(row, '/' + v);
+      } else if (ev.target.classList.contains('ep-protocol')) {
+        // protocol 变更: verify 结果只对被验证的三元组成立 → 失效; 检测结果行的
+        // "添加" 状态随已配置协议集合变化对账.
+        setVerifyState(row, 'none');
+        syncDetectResultAddStates();
+      }
+    });
+
+    // ─── 检测台事件接线 (#332) ────────────────────────────────────────────
+    const detectStage = document.querySelector('.detect-stage');
+    const detectUrlInput = document.getElementById('p-detect-url');
+    const detectResultsEl = document.getElementById('p-detect-results');
+    document.getElementById('p-detect-btn').addEventListener('click', runStagingDetect);
+    // Enter 在检测台 URL 输入框 = 触发检测 (键盘等价; 不拦截则 Enter 落到表单
+    // 隐式提交的默认按钮 Cancel — 关对话框, 反直觉).
+    detectUrlInput.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' && !ev.isComposing) {
+        ev.preventDefault();
+        runStagingDetect();
+      }
+    });
+    // 结果区委托: 快速添加 + chip 复制 (chipCopyHandler 与端点行结果区共享).
+    detectResultsEl.addEventListener('click', (ev) => {
+      const addBtn = ev.target.closest('.dr-add');
+      if (addBtn && !addBtn.disabled) {
+        quickAddFromDetect(addBtn.dataset.protocol);
+        return;
+      }
+      chipCopyHandler(ev);
     });
 
     // ─── 供应商端点知识库 (ENDPOINT_PRESETS, #332 升级) + 输入建议通用机制 ─────
@@ -7950,7 +8106,7 @@
     //   回焦不得误关新列表). 定时器 id 挂 input (清旧启新, 叠加幂等).
     // - 已知限制 (沿用): 列表鼠标专属, Tab 序键盘不可达; 单用户工具定位下可接受.
     function attachInputSuggest(input, { compute, apply, mountList }) {
-      const scope = () => input.closest('.endpoint-row, #p-discovery');
+      const scope = () => input.closest('.endpoint-row, .detect-stage');
       const listEl = () => scope()?.querySelector('.ep-url-suggest') ?? null;
       let matches = [];
       const update = () => {
@@ -8033,6 +8189,21 @@
     // 机制泛化收口到 attachInputSuggest 的 per-input 监听, 见其头部注释; 此处
     // 不再挂行容器委托.)
 
+
+    // 两个宿主的接线 (#332 融合): ① 端点行 base_url — 建议按 faces 扁平展开
+    // (proto 预填, 见 applyEndpointPreset), 挂载点在 addEndpointRow (行重建即
+    // 重挂); ② 检测台 URL — 知识库条目直出 origin 建议 (UI-11 吸收: 点选只回填
+    // origin, 协议选择交给检测结果的快速添加; 归一化在服务端, 已含面尾段的
+    // URL 也容忍). Enter 已被 "触发检测" 占用, 不作建议选中键.
+    attachInputSuggest(detectUrlInput, {
+      compute: originSuggestFor,
+      apply: item => {
+        detectUrlInput.value = item.origin;
+        detectUrlInput.focus();
+        detectUrlInput.dispatchEvent(new Event('input', { bubbles: true }));
+      },
+      mountList: el => detectStage.insertBefore(el, detectResultsEl),
+    });
     // ─── router 路由编辑器 (#179) ─────────────────────────────────────────
     //
     // 每行一条 Route: model_pattern / target / upstream_model / priority + 启用 checkbox.
@@ -8190,27 +8361,26 @@
       return { ok: true, exhaust: { statuses, codes: lines('p-exh-codes'), headers: lines('p-exh-headers') }, cooldown_secs: cooldown };
     }
 
-    // ─── provider Detect 协议探测 (端点行内压缩形态, #332) + 端点发现 (origin) ──
+    // ─── provider 创建流程: 检测台 Detect + 端点行 Verify (#332 融合) ──────
     //
-    // 两条探测线共用 POST 载荷惯例 (api_key 取条目级共享凭证的表单当前值, D3) 与
-    // probeEpoch 代数对账 (dialog 重开 = 换世界, 在途响应丢弃):
-    //
-    // ① 逐行 Detect (#332 步骤 4): POST /api/providers/probe {base_url, api_key} →
-    //    {probes[], recommended, note, common_uri}. 结果压缩为行内小图标
-    //    (.ep-probe-dot): 图标取**该行 protocol** 在 probes[] 的 outcome (ok → ✓
-    //    绿 / absent → ✗ 红 / auth_failed|error → ⚠ 琥珀), detail 进 native
-    //    title (hover 可读). **不阻塞保存, 仅提示** (UI-10) — recommended 自动
-    //    改写 select 的旧行为随 #332 重设计移除 (协议在 origin 先行流程里已是
-    //    用户决策: 端点发现锁定 / 手动选择, 自动改写会对抗显式选择; 后端
-    //    recommended 字段保留, note 并入 title). common_uri 暂存逻辑不动
-    //    (detect 知识 → 保存落盘的知识链, 三条件落地对账).
-    //
-    // ② 端点发现 (#332 主入口): POST /api/providers/probe-origin {origin, api_key?,
-    //    extra_faces?} → {origin, typed_face_stripped, faces[]}. 响应永恒 200
-    //    (探测失败是数据不是错误); 每协议一行 ok|absent|error 矩阵 + ok 行右侧
-    //    [添加] 一键物化端点行 (protocol 锁定 + base_url 预填可改). 失败 (网络
-    //    错/非 200) → 面板单行错误 + 手动 "添加协议" 仍可用 (UI-10: 检测永不
-    //    阻塞手填). wire 契约冻结见 issue #332 任务描述.
+    // 两路探测 (probeEpoch 代数对账, dialog 重开 = 换世界丢弃在途):
+    // - 检测台 Detect (runStagingDetect): POST /api/providers/probe-origin
+    //   {origin, api_key?, extra_faces?} → 固定 5 行发现矩阵 {origin,
+    //   typed_face_stripped, faces[]} (openai/anthropic/gemini/ollama/responses,
+    //   证据梯 models|auth|existence; #332 融合: 全景探测 SSOT 归 probe-origin,
+    //   origin 归一化 + 面候选枚举 + 存在性对照探测吸收了旧 probe 全景与
+    //   /anthropic 尾段启发式推断 — 实证优于形状推断). 结果行 ok 行带快速
+    //   「添加」; recommended 自动改写输入的旧行为不存在 (建议非命令的强形态:
+    //   用户在结果行**显式点击**才落表). 快照存 state.probeLastDetect (url 与
+    //   结果绑定, 快速添加回填 wire 的 base_url 而非检测台当前值). extra_faces:
+    //   检测台 URL 精确命中知识库条目 (findOriginPreset) → 该厂商已验证面随
+    //   请求增测 (GLM /api/** 等深面的唯一自动覆盖).
+    // - 端点行 Verify (runEndpointVerify, "二次检测"): POST /api/providers/probe
+    //   {base_url, api_key, protocol, common_uri} → 单条 probes 的单点校验;
+    //   结果 = 行内 ✓/✗ icon (setVerifyState) + .ep-probe-result 详情 (状态行 /
+    //   GET url / 模型 chips)。**仅提示不阻塞保存** (UI-10), 行编辑即失效。
+    // 模型预览深度 = 浏览 + 点击复制 (MVP, modelsBlock/chipCopyHandler 共用)。
+    // api_key 是条目级共享凭证 (D3), 两路探测输入都取表单当前值。
 
     // 复制 + 瞬时反馈 (badge 与 probe-chip 共用骨架): 文案切 "✓ copied" 900ms 后
     // 由 restore 重建 (badge 复用 syncEndpointCommonUriBadge; chip 恢复原文本).
@@ -8227,149 +8397,37 @@
       });
     }
 
-    // 行级 Detect 图标写入 (端点发现面板渲染自己的 .disc-icon, 不经此): cls ∈
-    // ok|err|warn, title = hover
-    // detail; cls null = 隐藏 (无结果/发起前/行重置).
-    function setProbeDot(dot, cls, title) {
-      dot.className = 'ep-probe-dot';
-      if (!cls) {
-        dot.hidden = true;
-        dot.removeAttribute('title');
+    // 检测台 Detect (#332 步骤②): 对检测台 URL 做 origin 发现探测 (归一化在
+    // 服务端 — 剥离尾部已知面段后按面候选矩阵探测). 落地对账: 世界没换 (epoch)
+    // 即可 — 结果区整体重渲染, 不存在部分行改写问题.
+    async function runStagingDetect() {
+      const resultsEl = document.getElementById('p-detect-results');
+      const stageUrl = document.getElementById('p-detect-url').value.trim();
+      if (!stageUrl) {
+        resultsEl.innerHTML = `<div class="probe-line">${escapeHtml(t('probe.enterUrl'))}</div>`;
         return;
       }
-      dot.hidden = false;
-      dot.classList.add(`ep-probe-dot-${cls}`);
-      dot.textContent = cls === 'ok' ? '✓' : cls === 'err' ? '✗' : '⚠';
-      if (title) dot.title = title;
-      else dot.removeAttribute('title');
-    }
-
-    async function runEndpointProbe(row) {
-      const baseUrl = row.querySelector('.ep-base-url').value.trim();
-      if (!baseUrl) {
-        alert(t('probe.enterUrl'));
-        return;
-      }
-      const btn = row.querySelector('.ep-detect');
-      const dot = row.querySelector('.ep-probe-dot');
-      // 代数捕获 (probeEpoch): 落地前对账, 世界已换 (dialog 重开) 则丢弃旧结果 —
-      // 含 finally 的按钮恢复 (防旧 finally 解除新世界 in-flight 按钮的禁用).
-      // 行级对账: 行已被删除 (isConnected) 同样丢弃.
+      const btn = document.getElementById('p-detect-btn');
       const epoch = state.probeEpoch;
       const apiKey = document.getElementById('p-api-key').value;
       // 编辑态 key 留空: probe 按表单当前值发 (masked 旧值不可逆, 不复用存量 key),
-      // 结果里的 auth_failed 未必是配置坏了 — 落地后把消歧提示并入 title.
+      // 结果里的 auth_failed 未必是配置坏了 — 落地后补一行提示消歧 (同旧 per-row
+      // Detect 语义). 前置: 编辑对象确实配置过 key (api_key_masked 非空).
       const editId = document.getElementById('provider-form').dataset.editId;
       const savedKeyMasked = [state.providersList, state.providersDisabled]
         .flat().find(x => x.id === editId)?.api_key_masked;
-      const keylessHint = editId && apiKey === '' && !!savedKeyMasked
-        ? t('probe.keylessHint') : '';
-      // 图标语义 = "被探测时的该行 protocol" 的 outcome: 在途期间用户改 select 不
-      // 追踪 (旧探测结论对新选择无意义, 落地即过时也无害 — 下次点击覆盖).
-      const probedProtocol = row.querySelector('.ep-protocol').value;
-      btn.disabled = true;
-      btn.textContent = t('providers.detecting');
-      setProbeDot(dot, null);
-      // 发起时捕获 baseUrl — 落地对账除 epoch 外再对账它: 在途期间用户改了该行
-      // base_url (input listener 已作废暂存) 时, 旧响应的 common_uri 不得写入
-      // (否则 A 的布局断言随 B 落盘 — M1 竞态).
-      const probedBaseUrl = baseUrl;
-      // 三条件落地判定: 世界没换 && 行还在 && 被探测的 URL 仍是该行当前值.
-      const landed = () =>
-        epoch === state.probeEpoch
-        && row.isConnected
-        && row.querySelector('.ep-base-url').value.trim() === probedBaseUrl;
-      try {
-        const r = await fetch(`${API_PROVIDERS}/probe`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ base_url: baseUrl, api_key: apiKey }),
-        });
-        if (!r.ok) {
-          const fallback = 'HTTP ' + r.status;
-          const err = await r.json().catch(() => ({ error: fallback }));
-          if (landed()) setProbeDot(dot, 'warn', t('probe.failed', { msg: err.error || fallback }) + (keylessHint ? `\n${keylessHint}` : ''));
-          return;
-        }
-        const data = await r.json();
-        if (landed()) {
-          // common_uri 暂存 (landed 三条件对账不动): null = 没探出事实 → 保留该行
-          // 暂存现状不抹知识, 有值 = 覆盖, 随保存落盘.
-          if (data.common_uri != null) row.dataset.commonUri = data.common_uri;
-          syncEndpointCommonUriBadge(row);
-          // 图标: 该行 protocol 的 outcome; probes 缺该族 (透传族等) → ⚠ "无探测
-          // 结果". ok 的 title 优先 detail (后端证据描述), 无则模型计数摘要.
-          const pr = (data.probes || []).find(p => p.protocol === probedProtocol);
-          let cls, title;
-          if (!pr) {
-            cls = 'warn';
-            title = t('probe.dotNoProbe');
-          } else if (pr.status === 'ok') {
-            cls = 'ok';
-            const models = pr.models || [];
-            title = pr.detail || (models.length
-              ? t('probe.dotOkModels', { n: models.length }) : t('probe.dotOk'));
-          } else if (pr.status === 'absent') {
-            cls = 'err';
-            title = pr.detail || pr.status;
-          } else {
-            cls = 'warn';
-            title = pr.detail || pr.status;
-          }
-          if (data.note) title += `\n${data.note}`;
-          if (keylessHint) title += `\n${keylessHint}`;
-          setProbeDot(dot, cls, title);
-        }
-      } catch (e) {
-        if (landed()) setProbeDot(dot, 'warn', t('probe.failed', { msg: e.message }));
-      } finally {
-        // 按钮恢复: 行被删除 (isConnected false) 时无需恢复; 世界已换 (epoch 不匹)
-        // 时该行属于旧世界, 旧 finally 不得解除新世界按钮的禁用.
-        if (epoch === state.probeEpoch && row.isConnected) {
-          btn.disabled = false;
-          btn.textContent = t('providers.detect');
-        }
-      }
-    }
-
-    // ─── 端点发现 (#332): origin 探测 → 协议面矩阵 → [添加] 物化 ──────────
-    //
-    // DOM 即状态 (同表单惯例): 结果面板 #p-discovery-results 渲染后自包含 (faces
-    // 数据不再被引用 — [添加] 所需的 protocol/base_url 全量编进行内 data-* 属性),
-    // [添加] 禁用态 ("已添加") 由 syncDiscoveryAddButtons 按当前端点行集合重算
-    // (行增删/协议变更/面板渲染三个刷新点, 简单粗暴全量刷新 — 行数 ≤5 代价可忽略).
-
-    // 面协议名归一: probe-origin 契约的 faces[].protocol 用短名 "responses", 而
-    // 端点行词表 (webui_protocols) 的 wire 名是 "openai-responses" (provider.rs
-    // serde rename) — 物化端点行前归一到 wire 名, 词表命中即免 experimental append.
-    const FACE_PROTO_ALIASES = Object.freeze({ responses: 'openai-responses' });
-    function canonicalFaceProtocol(p) {
-      return FACE_PROTO_ALIASES[p] || p;
-    }
-
-    async function runOriginDiscovery() {
-      const input = document.getElementById('p-discovery-origin');
-      const origin = input.value.trim();
-      if (!origin) {
-        alert(t('probe.enterOrigin'));
-        return;
-      }
-      const btn = document.getElementById('p-discovery-probe');
-      const panel = document.getElementById('p-discovery-results');
-      // 同 runEndpointProbe 的代数捕获: dialog 重开即丢弃在途结果.
-      const epoch = state.probeEpoch;
-      const apiKey = document.getElementById('p-api-key').value;
-      // extra_faces: origin 精确命中知识库条目 → 增测该厂商已验证面 (匹配谓词见
-      // ENDPOINT_PRESETS 段注释); 未命中省略 (后端按内置候选面探测).
-      const preset = findOriginPreset(origin);
+      const keylessHint = !!(editId && apiKey === '' && savedKeyMasked);
+      // extra_faces: origin 精确命中知识库条目 → 增测该厂商已验证面 (匹配谓词
+      // 见 ENDPOINT_PRESETS 段注释); 未命中省略 (后端按内置候选面探测).
+      const preset = findOriginPreset(stageUrl);
       const body = {
-        origin,
+        origin: stageUrl,
         ...(apiKey ? { api_key: apiKey } : {}),
         ...(preset ? { extra_faces: preset.faces } : {}),
       };
       btn.disabled = true;
       btn.textContent = t('providers.detecting');
-      panel.innerHTML = `<div class="probe-line">${escapeHtml(t('providers.detecting'))}</div>`;
+      resultsEl.innerHTML = `<div class="probe-line">${escapeHtml(t('models.loading'))}</div>`;
       const landed = () => epoch === state.probeEpoch;
       try {
         const r = await fetch(`${API_PROVIDERS}/probe-origin`, {
@@ -8380,132 +8438,241 @@
         if (!r.ok) {
           const fallback = 'HTTP ' + r.status;
           const err = await r.json().catch(() => ({ error: fallback }));
-          if (landed()) renderDiscoveryError(err.error || fallback, panel);
+          if (landed()) {
+            state.probeLastDetect = null;
+            renderProbeError(err.error || fallback, resultsEl);
+          }
           return;
         }
         const data = await r.json();
-        if (landed()) renderDiscoveryResults(data, panel);
+        if (landed()) {
+          // 快照与结果绑定: url 是**被探测的**输入 (非检测台当前值) — 用户探测后
+          // 又改检测台时, 结果行仍对快照成立, 快速添加回填 wire 的 base_url
+          // (v1 族 = 归一化 origin + cu, 其余族 = origin + uri).
+          state.probeLastDetect = { url: stageUrl, data, keylessHint };
+          renderDetectResults();
+        }
       } catch (e) {
-        if (landed()) renderDiscoveryError(e.message, panel);
+        if (landed()) renderProbeError(e.message, resultsEl);
       } finally {
         if (landed()) {
           btn.disabled = false;
-          btn.textContent = t('probe.originBtn');
+          btn.textContent = t('providers.detect');
         }
       }
     }
 
-    // 整面板失败态 (网络错/非 200): 单行错误, 手动 "添加协议" 按钮在面板外恒可用
-    // (UI-10: 检测永不阻塞手填).
-    function renderDiscoveryError(msg, panel) {
-      panel.innerHTML =
-        `<div class="probe-line probe-line-err">${escapeHtml(t('probe.failed', { msg }))}</div>`;
+    // 面协议名归一: probe-origin 契约的 faces[].protocol 用短名 "responses", 而
+    // 端点行词表 (webui_protocols) 的 wire 名是 "openai-responses" (provider.rs
+    // serde rename) — 物化端点行前归一到 wire 名, 词表命中即免 experimental append.
+    const FACE_PROTO_ALIASES = Object.freeze({ responses: 'openai-responses' });
+    function canonicalFaceProtocol(p) {
+      return FACE_PROTO_ALIASES[p] || p;
     }
 
-    // 渲染检测矩阵 (契约: faces 固定顺序 openai/anthropic/gemini/ollama/responses,
-    // 按 wire 给定序渲染; status ∈ ok|absent|error, evidence ∈ models|auth|
-    // existence|null). 顶部归一化提示 (typed_face_stripped 非空) → 底部各行.
-    function renderDiscoveryResults(data, panel) {
-      const parts = [];
-      if (data.typed_face_stripped) {
-        parts.push(`<div class="hint">${escapeHtml(t('probe.discoveryNormalized',
-          { origin: data.origin ?? '', stripped: data.typed_face_stripped }))}</div>`);
-      }
-      for (const face of (data.faces || [])) parts.push(discoveryFaceRowHtml(face));
-      panel.innerHTML = parts.join('');
-      syncDiscoveryAddButtons();
+    // 渲染检测结果区 (renderDetectResults 的单行构件): per 面一行 — 状态 icon
+    // (✓ ok / ✗ error / — absent) + 协议名 + 命中 URI (`+/v1` / `✓ included`) +
+    // 证据标签 (models → 模型清单·N / auth → 鉴权墙 / existence → 路由存在) +
+    // 快速「添加」(ok 行 — 任何证据梯级的 ok 都可加, 吸收自 #p-discovery 面板
+    // 同语义). 详情子行 (detail: responses 共用注记 / auth 提示 / existence 的
+    // POST+对照描述) + evidence=models 行的模型 chips (浏览 + 复制).
+    function detectResultItemHtml(face) {
+      const wire = face.protocol;
+      const proto = canonicalFaceProtocol(wire);
+      const disp = PROTO_DISPLAY[wire] || wire;
+      const ok = face.status === 'ok';
+      const icon = ok ? '✓' : face.status === 'error' ? '✗' : '—';
+      const cls = ok ? 'st-ok' : face.status === 'error' ? 'st-err' : 'st-none';
+      const uriLabel = ok
+        ? (face.uri === '' ? t('providers.commonUriIncluded') : `+${face.uri}`)
+        : '—';
+      const ev = ok
+        ? detectEvidenceLabel(face)
+        : face.status === 'error' ? (face.detail || face.status) : t('probe.faceAbsent');
+      const addBtn = ok
+        ? `<button type="button" class="btn dr-add" data-protocol="${escapeHtml(proto)}">${escapeHtml(t('detect.add'))}</button>`
+        : '';
+      const sub = face.detail ? `<div class="dr-sub">${escapeHtml(face.detail)}</div>` : '';
+      const models = ok && face.evidence === 'models' ? (face.models || []) : [];
+      return `<div class="dr-item" data-protocol="${escapeHtml(proto)}">
+        <div class="dr-row">
+          <span class="dr-status ${cls}">${icon}</span>
+          <span class="dr-proto">${escapeHtml(disp)}</span>
+          <code class="dr-uri">${escapeHtml(uriLabel)}</code>
+          <span class="dr-detail" title="${escapeHtml(ev)}">${escapeHtml(ev)}</span>
+          ${addBtn}
+        </div>
+        ${sub}
+        ${models.length ? modelsBlock(models) : ''}
+      </div>`;
     }
 
-    // 证据标签 (ok 行): models → "模型清单 · N 个" / auth → "鉴权墙 (检查 key)" /
-    // existence → "路由存在" / null → 空 (ok 无证据的保守降级, 不捏造).
-    function discoveryEvidenceLabel(face) {
+    // 证据标签 (ok 行, 证据梯如实分层呈现 — UI-11 内核): models → 模型清单·N 个 /
+    // auth → 鉴权墙 (检查 key) / existence → 路由存在 / 未知 → 空串 (保守降级).
+    function detectEvidenceLabel(face) {
       if (face.evidence === 'models') return t('probe.evModels', { n: (face.models || []).length });
       if (face.evidence === 'auth') return t('probe.evAuth');
       if (face.evidence === 'existence') return t('probe.evExistence');
       return '';
     }
 
-    // 单个协议面 → 主行 (+ 详情子行) HTML. [添加] 所需数据全量进 data-* (protocol
-    // 归一到 wire 名; base_url 空 → 按钮降级禁用, 无可预填值时手动行更直接).
-    function discoveryFaceRowHtml(face) {
-      const proto = canonicalFaceProtocol(face.protocol);
-      const disp = PROTO_DISPLAY[face.protocol] || face.protocol;
-      if (face.status === 'ok') {
-        const ev = discoveryEvidenceLabel(face);
-        const uriBadge = face.uri ? `<code class="disc-uri">${escapeHtml(face.uri)}</code>` : '';
-        const addable = !!face.base_url;
-        return `<div class="disc-row" data-proto="${escapeHtml(proto)}">`
-          + `<span class="disc-icon disc-icon-ok">✓</span>`
-          + `<span class="disc-proto">${escapeHtml(disp)}</span>${uriBadge}`
-          + (ev ? `<span class="disc-ev">${escapeHtml(ev)}</span>` : '')
-          + `<button type="button" class="btn disc-add" data-proto="${escapeHtml(proto)}"`
-          + ` data-base-url="${escapeHtml(face.base_url || '')}"${addable ? '' : ' disabled'}`
-          + ` title="${escapeHtml(t('probe.discoveryAddTitle'))}">${escapeHtml(t('probe.discoveryAdd'))}</button>`
-          + `</div>`
-          // 详情子行 (models 预览 + detail 并存, 见 discoveryDetailHtml).
-          + discoveryDetailHtml(face);
+    // 检测结果区整体渲染 (数据源 = state.probeLastDetect 快照): 首行声明被探测
+    // 的 URL (不黑盒 — 用户改过检测台也能对照), 归一化提示 (typed_face_stripped
+    // 非空 = 输入含面尾段被服务端剥离), 其后 per 面条目; 全军覆没时附肯定式
+    // 逃生口 hint (UI-10: 不暗示 URL 填错), keylessHint 殿后.
+    function renderDetectResults() {
+      const el = document.getElementById('p-detect-results');
+      const snap = state.probeLastDetect;
+      if (!snap) { el.innerHTML = ''; return; }
+      const faces = snap.data.faces || [];
+      const parts = [`<div class="probe-line">${escapeHtml(t('detect.resultsFor', { url: snap.url }))}</div>`];
+      if (snap.data.typed_face_stripped) {
+        parts.push(`<div class="hint">${escapeHtml(t('probe.discoveryNormalized',
+          { origin: snap.data.origin ?? '', stripped: snap.data.typed_face_stripped }))}</div>`);
       }
-      if (face.status === 'error') {
-        return `<div class="disc-row" data-proto="${escapeHtml(proto)}">`
-          + `<span class="disc-icon disc-icon-warn">⚠</span>`
-          + `<span class="disc-proto">${escapeHtml(disp)}</span>`
-          + `<span class="disc-note">${escapeHtml(face.detail || '')}</span></div>`;
+      if (faces.length === 0) {
+        parts.push(`<div class="probe-line probe-line-err">${escapeHtml(t('probe.noProbes'))}</div>`);
       }
-      // absent (及其余未知态的保守归并): 圆点 + "未发现" 弱化.
-      return `<div class="disc-row" data-proto="${escapeHtml(proto)}">`
-        + `<span class="disc-dot">·</span>`
-        + `<span class="disc-proto">${escapeHtml(disp)}</span>`
-        + `<span class="disc-note">${escapeHtml(t('probe.faceAbsent'))}</span></div>`;
+      for (const face of faces) parts.push(detectResultItemHtml(face));
+      if (!faces.some(f => f.status === 'ok')) {
+        parts.push(`<div class="hint">${escapeHtml(t('probe.noEndpointHint'))}</div>`);
+      }
+      if (snap.keylessHint) parts.push(`<div class="hint">${escapeHtml(t('probe.keylessHint'))}</div>`);
+      el.innerHTML = parts.join('');
+      syncDetectResultAddStates();
     }
 
-    // 详情子行: models 非空 → 前几个模型名 (muted); detail 非空 → 追加 (responses
-    // 共用注记等后端说明与模型名并存, 非互斥).
-    function discoveryDetailHtml(face) {
-      const models = face.models || [];
+    // 检测结果行「添加」按钮状态对账: 该协议已配置端点行 → 按钮禁用 + 文案
+    // "已添加" (每协议至多一条, 重复添加本会被保存校验拦截 — 这里把约束前移到
+    // 入口). 触发点: 结果渲染 / addEndpointRow / 行删除 / protocol 变更.
+    function syncDetectResultAddStates() {
+      const snap = state.probeLastDetect;
+      const resultsEl = document.getElementById('p-detect-results');
+      if (!snap || !resultsEl) return;
+      const used = new Set([...document.querySelectorAll('#p-endpoints-list .endpoint-row .ep-protocol')]
+        .map(s => s.value));
+      for (const btn of resultsEl.querySelectorAll('.dr-add')) {
+        const added = used.has(btn.dataset.protocol);
+        btn.disabled = added;
+        btn.textContent = added ? t('detect.added') : t('detect.add');
+      }
+    }
+
+    // 快速添加 (#332 步骤③): 检测结果行 → 一条端点行. 只接受 ok 面 (按钮渲染
+    // 即受此限, 双保险); 该协议已有端点行时拒绝 (按钮置灰是主防线, 这里防双击
+    // 竞态). 端点字段映射 (wire 契约): base_url 直接取 face.base_url — v1 族
+    // (openai/responses) = 归一化 origin, 面路径经 face.common_uri 直填 dataset
+    // (badge 回显, "" 版本前缀已含断言照填); 其余族 = origin + uri, cu 留空
+    // (auto). verify icon 仅 evidence=models 的面直填 ✓ (模型清单证据即校验
+    // 证据, 不重发请求); auth/existence 面不冒充校验 (留空, 用户可点 Verify).
+    function quickAddFromDetect(protocol) {
+      const snap = state.probeLastDetect;
+      const face = snap?.data.faces?.find(f => canonicalFaceProtocol(f.protocol) === protocol);
+      if (!snap || !face || face.status !== 'ok') return;
+      const used = new Set([...document.querySelectorAll('#p-endpoints-list .endpoint-row .ep-protocol')]
+        .map(s => s.value));
+      if (used.has(protocol)) return;
+      const row = addEndpointRow();
+      setEndpointProtocolValue(row, protocol);
+      row.querySelector('.ep-base-url').value = face.base_url || snap.data.origin || snap.url;
+      if (face.common_uri != null) {
+        row.dataset.commonUri = face.common_uri;
+        row.querySelector('.ep-common-uri').value = face.common_uri;
+        syncEndpointCommonUriBadge(row);
+      }
+      if (face.evidence === 'models') {
+        setVerifyState(row, 'ok', t('verify.ok', { n: (face.models || []).length }));
+      }
+      syncDetectResultAddStates();
+    }
+
+    // 端点行 Verify ("二次检测", #332 步骤④): 对该行 (protocol, base_url,
+    // common_uri) 单点校验. 落地对账三条件 + 行内三元组未变 (在途期间用户改了
+    // protocol/URI/base_url → 旧结果不落地, 同旧 Detect 的 M1 竞态纪律).
+    async function runEndpointVerify(row) {
+      const baseUrl = row.querySelector('.ep-base-url').value.trim();
+      const resultEl = row.querySelector('.ep-probe-result');
+      if (!baseUrl) {
+        resultEl.innerHTML = `<div class="probe-line">${escapeHtml(t('probe.enterUrl'))}</div>`;
+        return;
+      }
+      const btn = row.querySelector('.ep-verify');
+      const epoch = state.probeEpoch;
+      const apiKey = document.getElementById('p-api-key').value;
+      const protocol = row.querySelector('.ep-protocol').value;
+      // dataset 是 SSOT (null = 启发式 — 后端镜像 effective_common_uri 拼接).
+      const commonUri = row.dataset.commonUri ?? null;
+      btn.disabled = true;
+      setVerifyState(row, 'busy');
+      resultEl.innerHTML = `<div class="probe-line">${escapeHtml(t('models.loading'))}</div>`;
+      const landed = () =>
+        epoch === state.probeEpoch
+        && row.isConnected
+        && row.querySelector('.ep-base-url').value.trim() === baseUrl
+        && row.querySelector('.ep-protocol').value === protocol
+        && (row.dataset.commonUri ?? null) === commonUri;
+      try {
+        const r = await fetch(`${API_PROVIDERS}/probe`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, protocol, common_uri: commonUri }),
+        });
+        if (!r.ok) {
+          const fallback = 'HTTP ' + r.status;
+          const err = await r.json().catch(() => ({ error: fallback }));
+          if (landed()) {
+            setVerifyState(row, 'fail', err.error || fallback);
+            renderProbeError(err.error || fallback, resultEl);
+          }
+          return;
+        }
+        const data = await r.json();
+        if (landed()) renderVerifyResult(data.probes?.[0], row);
+      } catch (e) {
+        if (landed()) {
+          setVerifyState(row, 'fail', e.message);
+          renderProbeError(e.message, resultEl);
+        }
+      } finally {
+        // 按钮恢复: 世界已换 / 行已删时旧 finally 不得碰新世界.
+        if (epoch === state.probeEpoch && row.isConnected) btn.disabled = false;
+      }
+    }
+
+    // verify 结果渲染: icon (✓/✗, fail 的 title 带 detail) + 详情区 (状态行 +
+    // GET url 回显 + ok 时模型 chips; fail 时附非阻塞声明 — UI-10).
+    function renderVerifyResult(pr, row) {
+      const resultEl = row.querySelector('.ep-probe-result');
+      if (!pr) {
+        setVerifyState(row, 'fail');
+        resultEl.innerHTML = `<div class="probe-line probe-line-err">${escapeHtml(t('probe.noProbes'))}</div>`;
+        return;
+      }
       const parts = [];
-      if (models.length) {
-        parts.push(escapeHtml(models.slice(0, 3).join(', ')) + (models.length > 3 ? ' …' : ''));
+      if (pr.status === 'ok') {
+        setVerifyState(row, 'ok', t('verify.ok', { n: (pr.models || []).length }));
+        parts.push(`<div class="probe-line probe-line-ok">${escapeHtml(t('verify.ok', { n: (pr.models || []).length }))}</div>`);
+        if ((pr.models || []).length) parts.push(modelsBlock(pr.models));
+      } else {
+        const detail = pr.detail || '';
+        setVerifyState(row, 'fail', `${pr.status}: ${detail}`);
+        // 外层 escapeHtml 覆盖 detail 插值 (t() 不转义, 单点收口).
+        parts.push(`<div class="probe-line probe-line-err">${escapeHtml(t('verify.fail', { status: pr.status, detail }))}</div>`);
+        parts.push(`<div class="hint">${escapeHtml(t('verify.nonBlockingHint'))}</div>`);
       }
-      if (face.detail) parts.push(escapeHtml(face.detail));
-      return parts.length ? `<div class="disc-detail">${parts.join(' · ')}</div>` : '';
+      for (const u of (pr.urls || [])) {
+        parts.push(`<div class="probe-url">GET ${escapeHtml(u)}</div>`);
+      }
+      resultEl.innerHTML = parts.join('');
     }
 
-    // [添加] 禁用态重算 (#332): 该协议已在端点行集合 (select 值含 disabled 的锁定
-    // 行 — DOM .value 照常可读) → 按钮禁用 + 文案 "已添加". 刷新点: addEndpointRow
-    // / 行删除 / 行内协议变更 / 矩阵渲染 / dialog 重开.
-    function syncDiscoveryAddButtons() {
-      const present = new Set([...document.querySelectorAll('#p-endpoints-list .endpoint-row .ep-protocol')]
-        .map(sel => sel.value));
-      document.querySelectorAll('#p-discovery-results .disc-add').forEach(btn => {
-        const added = present.has(btn.dataset.proto);
-        btn.disabled = added || btn.dataset.baseUrl === '';
-        btn.textContent = added ? t('probe.discoveryAdded') : t('probe.discoveryAdd');
-      });
+    // 网络失败 / 非 200 → 结果区单行错误 (不弹窗打断表单填写). 外层 escapeHtml
+    // 覆盖插值 msg (t() 不转义 — i18n 纪律是调用方负责, 此处单点收口; msg 含
+    // 上游/服务端控制串).
+    function renderProbeError(msg, resultEl) {
+      resultEl.innerHTML =
+        `<div class="probe-line probe-line-err">${escapeHtml(t('probe.failed', { msg }))}</div>`;
     }
-
-    // 端点发现区块接线: origin 输入建议 (知识库条目直出, 选中回填 origin) + 检测
-    // 按钮 + [添加] 点选委托 (面板内容动态渲染, 委托挂容器).
-    attachInputSuggest(document.getElementById('p-discovery-origin'), {
-      compute: originSuggestFor,
-      apply: item => {
-        const inp = document.getElementById('p-discovery-origin');
-        inp.value = item.origin;
-        inp.focus();
-        inp.dispatchEvent(new Event('input', { bubbles: true }));
-      },
-      mountList: el => document.getElementById('p-discovery-origin').after(el),
-    });
-    document.getElementById('p-discovery-probe').addEventListener('click', runOriginDiscovery);
-    document.getElementById('p-discovery-results').addEventListener('click', (ev) => {
-      const btn = ev.target.closest('.disc-add');
-      if (!btn || btn.disabled) return;
-      // 物化: 走既有 addEndpointRow 路径 (protocol 锁定 + base_url 预填可改;
-      // common_uri 不设 — origin 矩阵不含布局断言, 留给逐行 Detect 或 fetch 现推).
-      addEndpointRow(
-        { protocol: btn.dataset.proto, base_url: btn.dataset.baseUrl },
-        { lockProtocol: true },
-      );
-    });
 
     /// 编辑 static-only id 时, 提示 "此次会创建 dynamic override".
     function toggleOverrideBanner(dlg, existing) {
