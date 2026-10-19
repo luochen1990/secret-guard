@@ -828,30 +828,90 @@ mod tests {
         );
     }
 
-    #[test]
-    fn detect_arbitrary_bytes_never_panics() {
-        // ROB-*: 非 JSON / 空body / 畸形 UTF-8 字节零 panic, 不命中即 None.
-        for body in [
-            &b""[..],
-            b"\xff\xfe not utf8 \x00\x01",
-            b"null",
-            b"[]",
-            b"{\"error\": 42}",                   // error 非对象
-            b"{\"error\":{\"code\":[\"1308\"]}}", // code 非字符串 (数组)
-        ] {
-            let _ = detect_exhaustion(
-                &ExhaustConfig::default(),
-                60,
-                status(429),
-                &HeaderMap::new(),
-                body,
-            );
-            let _ = detect_exhaustion(
-                &ExhaustConfig::default(),
-                60,
-                status(500),
-                &hdrs(&[("retry-after", "not-a-date-or-number")]),
-                body,
+    /// 任意 body 双源生成器 (#356 名副其实化): A 任意字节 (大概率非 JSON / 非
+    /// UTF-8, 触达入口 guard 与 serde parse 失败路径); B 合法 JSON error
+    /// envelope + 任意类型 code 值 + 随机截断 (触达 parse 成功后的
+    /// `collect_body_codes` 下游分支 — 字符串/数字/bool/null/数组全形态).
+    fn arb_detect_body() -> BoxedStrategy<Vec<u8>> {
+        let envelope_code = prop_oneof![
+            "[a-zA-Z0-9-]{0,12}".prop_map(serde_json::Value::String),
+            any::<bool>().prop_map(serde_json::Value::Bool),
+            (0u32..70000).prop_map(|n| serde_json::json!(n)),
+            Just(serde_json::Value::Null),
+            "[a-z]{1,8}".prop_map(|k| serde_json::json!([k, k])),
+        ];
+        let envelope = (envelope_code, 0usize..96).prop_map(|(code, cut)| {
+            let body = serde_json::json!({"error": {"code": code, "message": "boom"}});
+            let mut b = body.to_string().into_bytes();
+            b.truncate(cut.min(b.len()));
+            b
+        });
+        prop_oneof![
+            prop::collection::vec(any::<u8>(), 0..2048),
+            Just(vec![]),
+            envelope,
+        ]
+        .boxed()
+    }
+
+    /// 检测配置双臂: 内置默认表 (生产主路径) / 随机脏表 (任意 codes + 含畸形
+    /// 条目的 header 规则 + 随机 status 集 — 配置卫生问题不让检测路径 panic).
+    fn arb_exhaust_cfg() -> BoxedStrategy<ExhaustConfig> {
+        prop_oneof![
+            Just(ExhaustConfig::default()),
+            (
+                prop::collection::vec("[a-zA-Z0-9]{0,8}", 0..4),
+                prop::collection::vec(
+                    prop_oneof![
+                        "[a-z-]{1,10}".prop_map(|n| format!("{n}=blocked")),
+                        Just("no-equals-sign".to_string()),
+                        Just("bad name[]=v".to_string()),
+                    ],
+                    0..3,
+                ),
+                prop::collection::vec(400u16..600, 0..3),
+            )
+                .prop_map(|(codes, headers, statuses)| ExhaustConfig {
+                    codes,
+                    headers,
+                    statuses,
+                }),
+        ]
+        .boxed()
+    }
+
+    proptest! {
+        /// ROB-*: 任意字节 body (空 / 非 UTF-8 / 畸形 JSON / error 非对象 / code
+        /// 非字符串 / 截断损坏) × 任意 status × 任意 header 值 × 任意配置 (含脏
+        /// 条目), detect_exhaustion 永不 panic 且命中判定确定 — `is_some` 只依赖
+        /// 通道匹配 (无时钟), 两次调用必须一致; `resume_at` 的时钟抖动由上方
+        /// fixture 表的 `assert_instant_close` 覆盖.
+        ///
+        /// #356: 原实现是 6 个固定 body 的 `#[test]` 却以 arbitrary 命名 —
+        /// 平移 derive.rs 的 proptest + catch_unwind 形态, 任意输入域真覆盖.
+        #[test]
+        fn detect_arbitrary_bytes_never_panics(
+            body in arb_detect_body(),
+            cfg in arb_exhaust_cfg(),
+            status_code in 100u16..1000,
+            retry_after in "[\x20-\x7e]{0,24}",
+            cooldown in 0u64..120,
+        ) {
+            let headers = hdrs(&[("retry-after", &retry_after)]);
+            let hit1 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                detect_exhaustion(&cfg, cooldown, status(status_code), &headers, &body)
+            }))
+            .unwrap_or_else(|_| {
+                panic!(
+                    "detect_exhaustion panicked: status={status_code} body_len={}",
+                    body.len()
+                )
+            });
+            let hit2 = detect_exhaustion(&cfg, cooldown, status(status_code), &headers, &body);
+            prop_assert_eq!(
+                hit1.is_some(),
+                hit2.is_some(),
+                "hit determination must be deterministic (channel matching has no clock)"
             );
         }
     }
