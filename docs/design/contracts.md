@@ -68,7 +68,7 @@
 | `STR-*` | 流式 SSE (域 A) | codec INV-4 → STR-5 | `src/codec/stream/` (目录, 拆分见 `src/codec/AGENTS.md`) |
 | `CDAG-*` | Conversation DAG (域 B) | INV-1→CDAG-1, INV-2→CDAG-2, INV-3→CDAG-3, INV-4→CDAG-4, INV-5→CDAG-5 | `src/dag/mod.rs` 头部 + `docs/design/conversation-dag.md` |
 | `DTO-*` | WebUI DTO 派生 (域 B) | (新增) | `src/web/AGENTS.md` + `src/record.rs` 头部 |
-| `CFG-*` | 双层配置 (域 B) | (新增) | `src/config.rs` 头部 |
+| `CFG-*` | 双层配置 (域 B) | (新增) | `src/config/mod.rs` 头部 |
 | `SEC-*` | 安全姿态 (跨域) | (新增) | `src/web/AGENTS.md` + `src/secrets.rs` + `src/provider.rs` + `src/server_host_guard.rs` (SEC-7) + `src/util.rs` (SEC-8) |
 | `ROB-*` | 鲁棒性 (跨域) | (新增) | 根 `AGENTS.md` "鲁棒性原则" |
 | `VIEW-*` | 视图正确性机制 (跨域) | (新增) | 根 `AGENTS.md` "视图正确性确保机制" |
@@ -919,7 +919,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 **Properties**:
 - `prop_prune_dangling_decisions`: 任意 (id 池 × static 存活子集 × 子表归属 × mode) 组合下, prune 清除的恰是全部悬空条目 (有非 Default decision 且不在对应 static 集合), 存活 id 的 decision (mode + 归属) 原样保留. ✅
-- 场景回归: `prune_disabled_secret_id_revive_no_longer_shadowed` (`src/config.rs`) — static id 复活后查询回退 Default (未被残留条目遮蔽). ✅
+- 场景回归: `prune_disabled_secret_id_revive_no_longer_shadowed` (`src/config/mod.rs`) — static id 复活后查询回退 Default (未被残留条目遮蔽). ✅
 
 ### CFG-7 audit_capture 持久化与恢复 (B2; 三态扩展 2026-09-24 #273; errors→latest + 默认开启 2026-10-12 quant#307)
 
@@ -931,7 +931,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 **Properties**:
 - `prop_audit_capture_latest_mode_keeps_session_head_only`: latest 档每会话仅头部最新一次请求保留 raw — 会话前进 (次请求 attach) 后旧请求双侧回收 + 未保留标记; 错误请求 (停滞会话头部) 保留; timeline (B1 blocks 派生) 不受回收影响. 🔁→`audit_capture_latest_mode_keeps_session_head_only` (`tests/integration.rs`) + `attach_latest_mode_recycles_ancestors_keeps_head` / `attach_latest_mode_recycle_spares_timeline_b1` / `attach_latest_mode_error_head_retained` / `attach_latest_mode_retry_recycles_previous_attempt` (`src/dag/mod.rs`)
 - `prop_audit_capture_latest_recycle_safety_edges`: 回收边界四件套 — fork 后 S2 前进不误伤 S1 leaf (共享前缀回收) / 迟到 attach (非头部) 自身回收 / 在途祖先 (无 response 或流式 placeholder, `ResponseData::is_inflight`) 跳过回收保持暂存可看. 🔁→`attach_latest_mode_fork_spares_other_session_head` + `attach_latest_mode_late_attach_and_inflight_ancestor` + `attach_latest_mode_streaming_placeholder_ancestor_spared` (`src/dag/mod.rs`)
-- `prop_audit_capture_legacy_errors_migrates_latest`: 旧 errors 档 (state.toml 字符串 / PUT body) 显式迁移 latest, 不炸启动. 🔁→`audit_capture_legacy_errors_state_toml_migrates_latest` (`src/state.rs`) + `audit_capture_mode_serde_roundtrip_and_legacy_migration` (`src/config.rs`)
+- `prop_audit_capture_legacy_errors_migrates_latest`: 旧 errors 档 (state.toml 字符串 / PUT body) 显式迁移 latest, 不炸启动. 🔁→`audit_capture_legacy_errors_state_toml_migrates_latest` (`src/state.rs`) + `audit_capture_mode_serde_roundtrip_and_legacy_migration` (`src/config/mod.rs`)
 - `prop_audit_capture_legacy_bool_migrates`: 旧 bool 形态的 state.toml 无损迁移 (false→off / true→full), 不炸启动. 🔁→`audit_capture_legacy_bool_state_toml_migrates` (`src/state.rs`)
 - `prop_audit_capture_persist_failure_keeps_old_memory`: 持久化失败 (目录只读) 时内存保持旧值, 不留半提交状态. 🔁→`audit_capture_set_mode_failure_keeps_old_memory` (`src/state.rs`)
 - `prop_audit_capture_restart_round_trip`: set_mode 落盘后, 重启路径 (`load_or_empty` → `new`) 读回同一档位; `PUT /api/settings` 后 state.toml 含新值 (string 三态), 非法 body (非 JSON / 未知档位 / 缺字段) 统一 400. 🔁→`audit_capture_set_mode_persists_and_round_trips` (`src/state.rs`) + `audit_capture_settings_api_shape_validation_and_persistence` (`tests/integration.rs`)
@@ -1025,7 +1025,7 @@ sqlite 侧车在首个写事务时才创建 (open 处收紧追不上), 由 write
 落库后收紧 (`tighten_wal_sidecars`, 幂等). 非 unix 平台无 POSIX mode, no-op.
 
 **Properties**:
-- `prop_state_file_owner_only`: `atomic_write` 写出的文件 mode & 0o777 == 0o600 (rename 重写后不回退); 0644 残留在 `load_or_empty` 时被收紧. 🔁→`atomic_write_creates_owner_only_mode` + `load_or_empty_tightens_loose_permissions` (`src/config.rs`)
+- `prop_state_file_owner_only`: `atomic_write` 写出的文件 mode & 0o777 == 0o600 (rename 重写后不回退); 0644 残留在 `load_or_empty` 时被收紧. 🔁→`atomic_write_creates_owner_only_mode` + `load_or_empty_tightens_loose_permissions` (`src/config/mod.rs`)
 - `prop_usage_sqlite_owner_only`: `open_file_db` 创建/打开的 usage 库文件 0600 (含新建即收紧); `-wal`/`-shm` 侧车在首批写入后 0600. 🔁→`open_file_db_creates_owner_only_mode` + `wal_sidecars_tightened_after_first_write` (`src/usage/store.rs`)
 - `prop_pricing_cache_owner_only`: `write_disk` 落盘的 pricing 缓存 0600. 🔁→`write_disk_owner_only_mode` (`src/usage/pricing.rs`)
 
@@ -1056,7 +1056,7 @@ on_unsupported_protocol` / `[redact] on_fallback_restore`.
 real 还原进去等于精准投放泄露. 故默认"偏安全", 暴露侧行为一律显式 opt-in.
 
 **Properties**:
-- `prop_degradation_defaults_are_safe_side`: 三个降级开关 (`OnProbeExhausted` / `OnUnsupportedProtocol` / `OnFallbackRestore`) 的 `Default::default()` 均为安全侧 (FailClosed / FailClosed / Withhold), 且 `RedactConfig::default()` ([redact] 段缺字段时的 serde 回退) 与之一致 — 任一默认翻回暴露侧都是安全姿态回归. ✅ `src/config.rs::prop_degradation_defaults_are_safe_side`
+- `prop_degradation_defaults_are_safe_side`: 三个降级开关 (`OnProbeExhausted` / `OnUnsupportedProtocol` / `OnFallbackRestore`) 的 `Default::default()` 均为安全侧 (FailClosed / FailClosed / Withhold), 且 `RedactConfig::default()` ([redact] 段缺字段时的 serde 回退) 与之一致 — 任一默认翻回暴露侧都是安全姿态回归. ✅ `src/config/mod.rs::prop_degradation_defaults_are_safe_side`
 - `prop_degradation_request_side_refused_by_default`: 默认配置下, 请求侧降级路径出站无 real secret — codec-less 协议 (gemini) + secrets → 503 + 上游零请求; probing 耗尽 → 503 + 上游零请求 (后者测试显式配 fail_closed, 默认值等价由 `prop_degradation_defaults_are_safe_side` 锁定). 🔁→`gemini_secrets_fail_closed_returns_503_zero_upstream_hits` (默认路径) + `fail_closed_mode_returns_503_when_probing_exhausted` (显式 fail_closed 行为) (`tests/integration.rs`)
 - `prop_degradation_response_side_withholds_real_by_default`: 默认配置 (withhold) 下, 响应侧降级路径 (reader-拒绝 fallback) 的客户端 body 含 Mock 不含 real (原字节透传) + mock-not-restored WARN (detail 含 opt-in 提示), 同协议 / 跨协议两路径对称. 🔁→`reader_reject_withholds_real_secret_by_default_same_proto` + `reader_reject_withholds_real_secret_by_default_cross_proto` (`tests/integration.rs`)
 

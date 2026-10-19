@@ -1,7 +1,7 @@
 # secret-guard 配置参考 (用户向)
 
 > **读者**: 使用 / 部署 secret-guard 的最终用户. 回答 "这个字段怎么配 / 默认值是什么 / 配错了会怎样".
-> 开发者向的实现契约 (合并算法 / 持久化机制 / 泛型基础设施) 见 `src/config.rs` 头部与根目录 `AGENTS.md`.
+> 开发者向的实现契约 (合并算法 / 持久化机制 / 泛型基础设施) 见 `src/config/mod.rs` 头部与根目录 `AGENTS.md`.
 
 secret-guard 通过一个 TOML 文件启动 (默认 `secret-guard.toml`, 可用 `--config` 改路径),
 另有一个程序自动写回的状态文件 (`secret-guard.state.toml`, WebUI 编辑结果). 两者分工:
