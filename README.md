@@ -119,9 +119,10 @@ secret-guard run        # no config file needed — starts empty on 127.0.0.1:87
 
 Open `http://127.0.0.1:8787/` and:
 
-1. **Providers** tab → **New provider**: give it an id, add the endpoint's base_url
-   and api_key — unsure how the upstream lays out its URLs? Hit **Detect** to probe it
-   and auto-fill the protocol.
+1. **Providers** tab → **New provider**: give it an id, paste the provider URL
+   and api_key — unsure which protocols it speaks? Hit **Detect** to probe every
+   protocol face and add endpoints from the results (or add them manually —
+   saving never depends on detection).
 2. **Secrets** tab → **New secret**: register the value you want protected.
 
 Entries take effect immediately and persist to `secret-guard.state.toml` — no
@@ -298,7 +299,7 @@ secret-protection dimensions, including where the alternatives are stronger:
   `[redact] on_unsupported_protocol = "fail_closed"`; the error message carries a hint).
   They can still be created via hand-written config / the REST API (fine for secret-free
   pure forwarding); the WebUI creation form does not offer them, but editing an existing
-  entry or a Detect probe recommendation supports them via "(experimental)" options.
+  entry or an autocomplete preset prefill supports them via "(experimental)" options.
 - **Fail-safe degradation**: on Redact's abnormal paths (unparsable upstream responses /
   non-2xx), Mocks are passed through by default — real values never land in failure
   bodies; `on_fallback_restore = "restore"` opts into restoration. Full semantics of the

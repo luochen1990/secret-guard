@@ -31,7 +31,7 @@
 | **AuditCapture** | 详细日志的三态动态开关 (`off`/`latest`/`full`, per-request 决策; quant#307): off 不存 `req_body_raw`/`raw_resp_body`; latest (**默认**) 每会话仅保留头部最新一次请求 (会话有新请求 attach 后回收同会话祖先链 raw — 出错请求必为会话头部而自然保留, 重试落地回收上次尝试, latest ⊇ 旧 errors 档); full 全量. timeline 由 BlockPool 派生不受影响 (B1); 决策 SSOT = `config::AuditCaptureMode::capture_req/retain(is_session_head)/recycle_superseded`, push 时快照进 `CallEvent.capture_mode` 保证在途原子, attach 统一收口在 `dag::attach_response` (含祖先后收 `recycle_superseded_raws`, 分叉裁定: fork 即新 session, 共享前缀回收不误伤他 session leaf); 持久化 state.toml (反序列化兼容旧 bool 与旧 `"errors"`→latest), WebUI 经 `GET/PUT /api/settings` 即时切换 | 详细日志开关、详细日志、审计开关 | config/web |
 | **AutoProtect** | SG 自有凭证自动保护层 (#320, SEC-11): sg API token + 登记的 provider key 免配置纳入出站保护 — dispatch 层字节层 real→mock 替换 (等长确定性 mock, 强制 Plain shape), 与 user-secret IR 机制正交 (不参与路径选择判据; 真值与 user secret 精确相等时让位 — IR 机制接管 redact+restore); 明文注册表内嵌 ApiKeyStore (内存态, 磁盘 hash-only 不变) | 自动保护、内置保护、token 自动脱敏 | protect/proxy/auth |
 | **Bubble** | 前端 timeline 中渲染的单条消息气泡 (= 1 个 IR message) | 气泡、消息块、消息项 | web/index.html |
-| **Common URI** | 端点的公共 URI 前缀 — 三段式 `base_url + common_uri + request_uri` 的中段, 两个消费面: ① fetch_model_list (router /models 本地合成拉上游清单); ② 跨协议翻译的出站 URL (`Endpoint::effective_common_uri`, #260 — 显式值直通, 缺省按 base 尾段启发式). 同协议透传不受影响 (转发 rest 原样流过). 值域: `"/v1"` 裸根布局 / `""` 版本前缀已含 (智谱等国产系) / 缺省未探测 (fetch 按 `V1_COMMON_URIS` 顺序懒回退现场推导). 持久化在 `Endpoint.common_uri` (per-endpoint; Detect 探测自动填充, WebUI 端点行 badge 回显), 运行时记忆在 `CacheEntry.common_uri_hit` | common_uri、版本前缀、布局前缀 | provider/proxy |
+| **Common URI** | 端点的公共 URI 前缀 — 三段式 `base_url + common_uri + request_uri` 的中段, 两个消费面: ① fetch_model_list (router /models 本地合成拉上游清单); ② 跨协议翻译的出站 URL (`Endpoint::effective_common_uri`, #260 — 显式值直通, 缺省按 base 尾段启发式). 同协议透传不受影响 (转发 rest 原样流过). 值域: `"/v1"` 裸根布局 / `""` 版本前缀已含 (智谱等国产系) / 缺省未探测 (fetch 按 `V1_COMMON_URIS` 顺序懒回退现场推导). 持久化在 `Endpoint.common_uri` (per-endpoint; 检测台检测结果行的快速添加自动填充 — v1 族面的布局证据, WebUI 端点行 URI 输入框 + 徽标回显/可编辑, #332), 运行时记忆在 `CacheEntry.common_uri_hit` | common_uri、版本前缀、布局前缀 | provider/proxy |
 | **Effective view** | 合并 static + dynamic + decision 后的生效配置 | 生效配置、最终配置、合并视图 | config |
 | **Endpoint (端点)** | Direct provider 的一个 `(protocol, base_url, common_uri)` 三元组 (`endpoints` 有序数组, 每协议至多一条 — validate 强制; 多端点共享同一凭证)。数组序 = fallback 序: egress 端点由 ingress 经 `select_endpoint` 选定 — 精确匹配 → 同协议, 无匹配 → 首端点跨协议翻译 (multi-endpoint D2) | 协议端点、端点条目 | provider/proxy |
 | **ForwardRecord** | 一次 HTTP 转发的完整记录 (web 层 DTO, 从 DAG Node 派生) | 请求记录、record、转发记录 | web |
@@ -257,7 +257,7 @@ rationale 是不对称性: 可用性损失可重试恢复, 机密性损失不可
 > `I1=UI-1`, `I2=UI-2`, `I3=UI-3`, `I4=UI-6 的 selectedRound 子属性`, `I5=UI-6`, `I6=UI-7`.
 > contracts.md 收录并扩展为 UI-1..UI-9 (UI-8 = SSE 失效通知消费; UI-9 = 轮次详情弹窗概览默认/大数据按需, quant#305), 以 contracts.md 为 SSOT; 此处保留 I* 编号便于历史 grep.
 > UI-10 (Detect 协议探测非阻塞 — 手动填写永远是逃生口, 2026-10-18 用户裁决) 无历史 I* 前身, 直接以 UI-10 落在 contracts.md.
-> UI-11 (端点发现面板 origin 先行 — 协议作为被发现的面, #332) 直接以 UI-11 落在 contracts.md.
+> UI-11 (端点发现 origin 先行 — 协议作为被发现的面, #332; 2026-10-19 融合后终态 = 检测台吸收独立面板) 直接以 UI-11 落在 contracts.md.
 ### I1 — 气泡数 == req_delta messages 长度
 
 会话详情页 (timeline) 渲染的 Bubble 数量, 必须等于该 Node 的 req_delta messages
@@ -669,8 +669,8 @@ windows/darwin。
 
 > 完整清单的 SSOT 已下沉至 **`docs/known-limitations.md`** (按领域小节归位: auth / codec /
 > config / dag / deploy / derive / pool / redact / routing / usage; 节内条目单行, 追加至末尾).
-> **新增限制条目时同步评估**: README 协议支持矩阵 / Roadmap 与 probe note (`PROBE_NOTE_*`)
-> 是否需要联动 (呈现策略详见该文件头部).
+> **新增限制条目时同步评估**: README 协议支持矩阵 / Roadmap 是否需要联动
+> (呈现策略详见该文件头部).
 > 本段保留同名锚点 — src 代码注释 / tests / docs 中 "根 AGENTS.md '已知限制' 条目" 的
 > 引用经此跳转到该文件.
 
