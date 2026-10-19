@@ -2,12 +2,19 @@
 //!
 //! # 职责边界
 //!
-//! 与 `models::probe_provider_upstream` (base_url 先行, 逐行判 4 族) 相对, 本模块
-//! 是 **origin 先行**: 用户只给 origin (如 `https://api.xiaomimimo.com`), 对每个
-//! 协议族枚举**面候选** (face = origin + uri, 如 `/anthropic`), 并行探测所有候选,
-//! 输出固定 5 行发现矩阵 (openai / anthropic / gemini / ollama / responses —
-//! responses 无独立候选, 镜像 openai 行). handler 薄壳在 `web/api/providers.rs`
-//! (origin 校验 + 归一化 + extra_faces 解析后调 [`probe_origin_upstream`]).
+//! 本模块是**全景探测的 SSOT** (#332 融合, 2026-10-19: master 侧 origin 先行
+//! 实现吸收了 PR #344 侧 `probe_provider_upstream` 的全景职责 — 后者已删除,
+//! `POST /api/providers/probe` 收敛为 verify 单协议校验, 见 `super::models`):
+//! 用户只给 origin (如 `https://api.xiaomimimo.com`, 深路径 URL 也可 — 归一化
+//! 只剥已知面尾段, 余下整体作为探测基准), 对每个协议族枚举**面候选**
+//! (face = origin + uri, 如 `/anthropic`), 并行探测所有候选, 输出固定 5 行
+//! 发现矩阵 (openai / anthropic / gemini / ollama / responses — responses 无
+//! 独立候选, 镜像 openai 行). ok 行携带快速添加所需的端点知识:
+//! **v1 族** (openai/responses) 的面路径兼任 `common_uri` 布局断言
+//! (`""`/`"/v1"`/深面前缀), `base_url` = origin; **其余族** 面路径是 base 段
+//! (`base_url` = origin + uri, common_uri null). handler 薄壳在
+//! `web/api/providers.rs` (origin 校验 + 归一化 + extra_faces 解析后调
+//! [`probe_origin_upstream`]).
 //!
 //! 拆分为 sibling 模块而非续写在 models.rs: file-size 硬门禁
 //! (FILE_MAX_PROD_LINES = 1600, models.rs prod 已 ~1270). 判定件 (parse/classify/
@@ -46,7 +53,7 @@
 //!   `/v1/__sg_nonexistent__…__` → **200** → 无信号 → absent. 两个校准结论:
 //!   ① 非-404 4xx (含 405) 单独不足以判存在, 对照必须严格 404;
 //!   ② **2xx + shape 解析失败 → absent (而非 error)** — SPA 软 200 是 origin 扫描
-//!   的常态 (对照 base_url 探测的 `judge_v1_pair` 把它判 Error: 那里假设宿主是
+//!   的常态 (对照旧 base_url 全景探测的判定语义把它判 Error: 那里假设宿主是
 //!   API 站点, 200-垃圾是异常; origin 扫描面对任意站点, 200-非模型清单 = 该 URL
 //!   不是模型端点, 属否定证据). `error` 保留给传输层失败 (连接失败/超时/超大
 //!   body) 与 5xx.
@@ -68,7 +75,7 @@
 //!
 //! 探测失败是**数据不是 HTTP 错误** (ROB-*, 恒 200, 永不 panic); detail 经
 //! `upstream_error_brief` 姿态净化, 绝不含 api_key; 同族候选与跨族全部并行
-//! (`futures::join_all`, 参照 probe_provider_upstream 的 join 形态), tier3 是
+//! (`futures::join_all`, 并行一波 join 的形态), tier3 是
 //! 第二波 (wave1 join 后条件再 join); 相同 URL 跨族去重只发一次 (openai 候选
 //! `""` 与 anthropic 候选 `""` 的 GET `{origin}/v1/models` 共享结果 — tier3 POST
 //! URL 按族后缀天然不撞, 免去去重).
@@ -106,7 +113,11 @@ pub(crate) struct OriginFaceOutcome {
     pub protocol: &'static str,
     /// status=ok 时 = 命中面的 uri (`""` = origin 根, 版本前缀已含布局); 其余 null.
     pub uri: Option<String>,
-    /// status=ok 时 = origin + uri; 其余 null.
+    /// status=ok 时 = 快速添加预填的端点 base_url (#332 融合): **v1 族行
+    /// (openai/responses) = origin** — 面路径经 [`Self::common_uri`] 承载为
+    /// 布局断言 (base 座回退 origin, 与 `Endpoint` 三段式的语义一致); 其余族
+    /// (anthropic/gemini/ollama — 面路径是 base 段而非 common_uri) = origin +
+    /// uri. 其余 status null.
     pub base_url: Option<String>,
     pub status: OriginFaceStatus,
     /// 仅 status=ok: `models` (tier1) | `auth` (tier2) | `existence` (tier3).
@@ -116,6 +127,12 @@ pub(crate) struct OriginFaceOutcome {
     /// 人读证据/净化错误摘要: tier2/3 ok 与 error 必有; tier1 ok 与 absent 为 null
     /// (responses 镜像行恒有 — 追加共用注记). 绝不含 api_key.
     pub detail: Option<String>,
+    /// 仅 v1 族 (openai/responses) 的 ok 行非 null: = 命中面 uri, 作为快速添加
+    /// 直填 `Endpoint.common_uri` 的布局断言 (`"/v1"` 裸根 / `""` 版本前缀已含 /
+    /// 深面如 `/api/coding/paas/v4`); 其余 (非 ok / anthropic·gemini·ollama —
+    /// 无 common_uri 概念, base_url 已含面段) null. 与 `verify_endpoint_upstream`
+    /// ok outcome 的 common_uri 同源语义 (PR #344 per-outcome 证据的融合落点).
+    pub common_uri: Option<String>,
 }
 
 /// faces 行的 wire 协议名. 注意 responses 行 = `"responses"` (契约冻结) 而非
@@ -137,11 +154,15 @@ pub(crate) enum OriginFaceEvidence {
 }
 
 impl OriginFaceOutcome {
-    /// status=ok 行: uri/base_url 绑定命中面, evidence/models/detail 由 tier 分派.
+    /// status=ok 行: uri/base_url/common_uri 绑定命中面 (base_url 与 common_uri
+    /// 的族别分派见字段注释), evidence/models/detail 由 tier 分派. `cu_layout` =
+    /// 该族面路径是否兼任 common_uri (仅 openai 族 — responses 镜像其行;
+    /// anthropic 面路径是 base 段, 见 `family_outcome` 的分派注释).
     fn ok(
         protocol: &'static str,
         origin: &str,
         uri: &str,
+        cu_layout: bool,
         evidence: OriginFaceEvidence,
         models: Option<Vec<String>>,
         detail: Option<String>,
@@ -149,16 +170,21 @@ impl OriginFaceOutcome {
         Self {
             protocol,
             uri: Some(uri.to_string()),
-            base_url: Some(face_base(origin, uri)),
+            base_url: Some(if cu_layout {
+                origin.to_string()
+            } else {
+                face_base(origin, uri)
+            }),
             status: OriginFaceStatus::Ok,
             evidence: Some(evidence),
             models,
             detail,
+            common_uri: cu_layout.then(|| uri.to_string()),
         }
     }
 
     /// status=error 行 (detail 必有) / status=absent 行 (detail 必 null):
-    /// 两者 uri/base_url/evidence/models 均为 null.
+    /// 两者 uri/base_url/evidence/models/common_uri 均为 null.
     fn not_ok(protocol: &'static str, status: OriginFaceStatus, detail: Option<String>) -> Self {
         debug_assert_eq!(
             (status == OriginFaceStatus::Error),
@@ -173,6 +199,7 @@ impl OriginFaceOutcome {
             evidence: None,
             models: None,
             detail,
+            common_uri: None,
         }
     }
 }
@@ -391,7 +418,7 @@ impl CandKind {
 
 /// tier1/2 单候选判定 (GET `{face}{models_path}` 的结果 → 候选结论).
 ///
-/// 与 `models::judge_v1_pair` / `judge_single_endpoint` 的**有意**差异: 2xx +
+/// 与 `models::judge_single_endpoint` (verify 路径) 的**有意**差异: 2xx +
 /// shape 解析失败 → Absent (SPA 软 200 宿主校准, 见模块头部; base_url 探测的
 /// Error 语义假设宿主是 API 站点, origin 扫描不成立). 传输层失败 (Err) 与
 /// 5xx/其他非 2xx 仍为 Error.
@@ -401,7 +428,7 @@ fn judge_models_get(family: Family, res: &Result<(StatusCode, Vec<u8>), String>)
         Ok((status, body)) if status.is_success() => {
             let shape = match family.v1_family() {
                 // v1 族: 单次 parse, 条目解析与家族判别共用同一棵 Value 树
-                // (复用 judge_v1_pair 的手法); 非本族 shape / 解析失败均落 None.
+                // (单次 parse 双消费的手法); 非本族 shape / 解析失败均落 None.
                 Some(mine) => parse_json_value(body).ok().and_then(|value| {
                     let models = parse_model_ids_from_value(Protocol::OpenAI, &value).ok()?;
                     (classify_v1_family(&value) == mine).then_some(models)
@@ -613,11 +640,17 @@ fn family_outcome(
     origin: &str,
     existence: &HashMap<Family, (String, String, u16)>,
 ) -> OriginFaceOutcome {
+    // 端点知识映射分派: 仅 **openai 族**的面路径兼任 common_uri (base 座回退
+    // origin — 面前缀就是 `{cu}/models` 的 cu); anthropic 族虽与 openai 共用
+    // v1/models 判形 (`v1_family`), 其面路径 (`/anthropic` 类) 是 base 段而非
+    // common_uri (anthropic 的请求路径自带 `/v1` 版本段), 走 origin + uri 形态.
+    let cu_layout = w.family == Family::OpenAI;
     match &w.kind {
         CandKind::Models(models) => OriginFaceOutcome::ok(
             w.family.name(),
             origin,
             &w.uri,
+            cu_layout,
             OriginFaceEvidence::Models,
             Some(models.clone()),
             None,
@@ -626,6 +659,7 @@ fn family_outcome(
             w.family.name(),
             origin,
             &w.uri,
+            cu_layout,
             OriginFaceEvidence::Auth,
             None,
             Some(auth_detail(*code)),
@@ -640,6 +674,7 @@ fn family_outcome(
                 w.family.name(),
                 origin,
                 uri,
+                cu_layout,
                 OriginFaceEvidence::Existence,
                 None,
                 Some(existence_detail(post_path, *main_status)),
@@ -680,6 +715,7 @@ fn mirror_responses(openai: &OriginFaceOutcome) -> OriginFaceOutcome {
         evidence: openai.evidence,
         models: openai.models.clone(),
         detail: Some(detail),
+        common_uri: openai.common_uri.clone(),
     }
 }
 
@@ -865,8 +901,9 @@ mod tests {
         assert_eq!(oa.status, OriginFaceStatus::Ok);
         assert_eq!(oa.evidence, Some(OriginFaceEvidence::Models));
         assert_eq!(oa.uri.as_deref(), Some("/v1"));
-        let oa_base = format!("{}/v1", server.url());
-        assert_eq!(oa.base_url.as_deref(), Some(oa_base.as_str()));
+        // v1 族 (#332 融合): base_url = origin, 面路径经 common_uri 承载布局.
+        assert_eq!(oa.base_url.as_deref(), Some(server.url().as_str()));
+        assert_eq!(oa.common_uri.as_deref(), Some("/v1"));
         assert_eq!(oa.models.as_ref().unwrap(), &strs(&["mimo-1"]));
         assert!(oa.detail.is_none());
 
@@ -876,6 +913,7 @@ mod tests {
         assert_eq!(an.uri.as_deref(), Some("/anthropic"));
         let an_base = format!("{}/anthropic", server.url());
         assert_eq!(an.base_url.as_deref(), Some(an_base.as_str()));
+        assert_eq!(an.common_uri, None, "anthropic 面路径是 base 段, 非 cu");
         assert!(an.models.is_none());
         assert_eq!(
             an.detail.as_deref(),
@@ -885,7 +923,12 @@ mod tests {
         for i in [2, 3] {
             let f = &resp.faces[i];
             assert_eq!(f.status, OriginFaceStatus::Absent, "faces[{i}]");
-            assert!(f.uri.is_none() && f.base_url.is_none() && f.models.is_none());
+            assert!(
+                f.uri.is_none()
+                    && f.base_url.is_none()
+                    && f.common_uri.is_none()
+                    && f.models.is_none()
+            );
             assert!(f.detail.is_none());
         }
 
@@ -893,6 +936,8 @@ mod tests {
         assert_eq!(r.status, OriginFaceStatus::Ok);
         assert_eq!(r.evidence, Some(OriginFaceEvidence::Models));
         assert_eq!(r.uri.as_deref(), Some("/v1"));
+        assert_eq!(r.base_url.as_deref(), Some(server.url().as_str()));
+        assert_eq!(r.common_uri.as_deref(), Some("/v1"));
         assert_eq!(r.models.as_ref().unwrap(), &strs(&["mimo-1"]));
         assert_eq!(
             r.detail.as_deref(),
@@ -945,21 +990,29 @@ mod tests {
         assert_eq!(oa.evidence, Some(OriginFaceEvidence::Models));
         assert_eq!(oa.uri.as_deref(), Some(""), "bare 布局: 版本前缀已含");
         assert_eq!(oa.base_url.as_deref(), Some(server.url().as_str()));
+        assert_eq!(
+            oa.common_uri.as_deref(),
+            Some(""),
+            "bare 布局断言: cu \"\" = 版本前缀已含"
+        );
         assert_eq!(oa.models.as_ref().unwrap(), &strs(&["glm-4.6"]));
 
         let an = &resp.faces[1];
         assert_eq!(an.status, OriginFaceStatus::Ok);
         assert_eq!(an.uri.as_deref(), Some("/anthropic"));
+        assert_eq!(an.common_uri, None);
         assert_eq!(an.models.as_ref().unwrap(), &strs(&["claude-3-5"]));
 
         let g = &resp.faces[2];
         assert_eq!(g.status, OriginFaceStatus::Ok);
         assert_eq!(g.uri.as_deref(), Some("/v1beta"));
+        assert_eq!(g.common_uri, None, "gemini 无 common_uri 概念");
         assert_eq!(g.models.as_ref().unwrap(), &strs(&["gem-1"]));
 
         let o = &resp.faces[3];
         assert_eq!(o.status, OriginFaceStatus::Ok);
         assert_eq!(o.uri.as_deref(), Some(""));
+        assert_eq!(o.common_uri, None, "ollama 无 common_uri 概念");
         assert_eq!(o.models.as_ref().unwrap(), &strs(&["llama3:latest"]));
 
         let r = &resp.faces[4];
@@ -1121,12 +1174,14 @@ mod tests {
         let oa = &resp.faces[0];
         assert_eq!(oa.status, OriginFaceStatus::Ok);
         assert_eq!(oa.uri.as_deref(), Some("/api/coding/paas/v4"));
-        let glm_base = format!("{}/api/coding/paas/v4", server.url());
-        assert_eq!(oa.base_url.as_deref(), Some(glm_base.as_str()));
+        // v1 族深面 (#332 融合): base 座 = origin, 深面前缀作为 cu 布局断言.
+        assert_eq!(oa.base_url.as_deref(), Some(server.url().as_str()));
+        assert_eq!(oa.common_uri.as_deref(), Some("/api/coding/paas/v4"));
         assert_eq!(oa.models.as_ref().unwrap(), &strs(&["glm-4.6"]));
 
         let r = &resp.faces[4];
         assert_eq!(r.uri.as_deref(), Some("/api/coding/paas/v4"));
+        assert_eq!(r.common_uri.as_deref(), Some("/api/coding/paas/v4"));
         assert_eq!(r.models.as_ref().unwrap(), &strs(&["glm-4.6"]));
         assert_eq!(
             r.detail.as_deref(),
@@ -1156,7 +1211,12 @@ mod tests {
         for i in 0..4 {
             let f = &resp.faces[i];
             assert_eq!(f.status, OriginFaceStatus::Error, "faces[{i}]");
-            assert!(f.uri.is_none() && f.base_url.is_none() && f.models.is_none());
+            assert!(
+                f.uri.is_none()
+                    && f.base_url.is_none()
+                    && f.common_uri.is_none()
+                    && f.models.is_none()
+            );
             let d = f.detail.as_deref().unwrap();
             assert!(d.contains("request failed"), "faces[{i}] detail: {d}");
         }

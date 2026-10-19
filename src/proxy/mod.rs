@@ -74,8 +74,9 @@
 //! - `auth`: Provider 鉴权注入.
 //! - `models`: router GET /models 本地合成 + 上游清单缓存 (#196, FWD-7; 含
 //!   `ModelListCache` — AppState 聚合的纯数据 store, 经本模块根 re-export) +
-//!   base_url 先行的协议探测 (`probe_provider_upstream`).
-//! - `origin`: origin 先行的端点发现探测 (`probe_origin_upstream`, #332 — 与
+//!   单协议端点校验 (`verify_endpoint_upstream`, #332 端点行 "二次检测").
+//! - `origin`: origin 先行的端点发现探测 (`probe_origin_upstream`, #332 —
+//!   **全景探测 SSOT**, 吸收了原 `probe_provider_upstream` 的全景职责; 与
 //!   models 的探测件同域复用, 拆分因 file-size 硬门禁).
 //! - `recorder`: DAG record 构造 + 视图守卫 + 响应累积器.
 //! - `same_proto`: 同协议转发 (字节透传 / IR redact).
@@ -113,14 +114,15 @@ use crate::state::AppState;
 // (子模块保持私有, 组合根先例同 state.rs 的 api_keys 字段, #196).
 pub use models::ModelListCache;
 
-// probe 端点 (web/api/providers) 复用 models 的上游探测基建: 行为借用
-// (probe_provider_upstream 执行出站 HTTP 探测, 非纯数据/纯函数), 依赖方向
-// 例外已登记在根 AGENTS.md "已接受的例外".
-pub(crate) use models::probe_provider_upstream;
+// verify 单协议校验 (web/api/providers 的 POST /api/providers/probe, #332) 复用
+// models 的上游探测基建: 行为借用 (执行出站 HTTP 探测, 非纯数据/纯函数),
+// 依赖方向例外已登记在根 AGENTS.md "已接受的例外".
 /// 模型清单预览 (WebUI endpoints 弹窗; 取数 SSOT 与 router /models 合成同乡).
 pub(crate) use models::provider_model_preview;
-// origin 发现探测端点 (web/api/providers, #332): 与 probe_provider_upstream 同族
-// 的行为借用 (依赖例外同上), 含归一化/extra_faces 解析两个纯函数.
+pub(crate) use models::verify_endpoint_upstream;
+// origin 发现探测端点 (web/api/providers 的 POST /api/providers/probe-origin,
+// #332 全景探测 SSOT): 与 verify 同族的行为借用 (依赖例外同上), 含归一化/
+// extra_faces 解析两个纯函数.
 pub(crate) use origin::{normalize_origin, parse_extra_face, probe_origin_upstream};
 
 /// axum 路径参数: `/{proto}/{name}/{*rest}`.

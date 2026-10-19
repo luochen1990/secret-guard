@@ -1,15 +1,16 @@
 //! providers CRUD: `GET/POST/PUT/DELETE /providers[/{id}]` + `PATCH /{id}/decision`
-//! + `POST /providers/probe` (协议自动探测) + `PUT/DELETE /providers/probe`
+//! + `POST /providers/probe` (单协议端点校验 verify) + `PUT/DELETE /providers/probe`
 //!   (存量 id="probe" 条目的管理薄 wrapper, 见 [`update_provider_probe`])
-//! + `POST /providers/probe-origin` (origin 先行端点发现探测, #332, 见
-//!   [`probe_provider_origin`])
+//! + `POST /providers/probe-origin` (origin 先行端点发现探测 — **全景探测
+//!   SSOT**, #332, 见 [`probe_provider_origin`])
 //! + `POST /providers/{id}/pool-reset` (套餐池成员闹钟清空)
 //! + `GET /providers/{id}/models` (模型清单预览, endpoints 弹窗的 Models 按钮).
 //!
 //! 从 api.rs 单文件拆出 (见 #146 残留 1). CRUD 流程骨架在 [`super::crud`]
 //! (泛型, 与 secrets 共享), 本文件只承载 provider 特有的 entry 构造 / api_key
-//! 保留逻辑 / 列表附加字段 (protocols/shorts/pool 运行时状态). probe 与 models
-//! 预览都是薄壳: 校验后分别调 `crate::proxy::probe_provider_upstream` /
+//! 保留逻辑 / 列表附加字段 (protocols/shorts/pool 运行时状态). verify / 全景
+//! 发现探测 / models 预览都是薄壳: 校验后分别调 `crate::proxy::
+//! verify_endpoint_upstream` / `crate::proxy::probe_origin_upstream` /
 //! `crate::proxy::provider_model_preview` (算法 SSOT 在 proxy 层, 与上游模型
 //! 清单 fetch 同乡).
 
@@ -354,6 +355,17 @@ pub(crate) struct ProbeRequest {
     /// 可选 api_key (空串 = 无 auth 探测, Ollama 等本地场景; serde default).
     #[serde(default)]
     pub api_key: String,
+    /// 单协议校验模式 (#332, 端点行 "二次检测", **唯一形态**): 对这一个
+    /// (protocol, base_url, common_uri) 三元组单点验证 (响应 = 单条 probes).
+    /// 值必须是 `Protocol::ALL` 的完整名, 未知/缺失 → 400 (全景探测归
+    /// `/api/providers/probe-origin`, #332 融合).
+    #[serde(default)]
+    pub protocol: Option<String>,
+    /// 校验的 common_uri 显式值 (`""` 或 `/` 开头, 与 `Endpoint.common_uri`
+    /// 同一值域; 缺省 = 运行时尾段启发式 — 校验 URL 与 egress URL 拼接一致).
+    /// 非法形状 → 400.
+    #[serde(default)]
+    pub common_uri: Option<String>,
 }
 
 /// `POST /api/providers/probe-origin` 的请求 body (issue #332 origin 先行发现).
@@ -409,21 +421,46 @@ pub async fn probe_provider_origin(
     Ok((StatusCode::OK, NO_STORE, Json(response)))
 }
 
-/// `POST /api/providers/probe`: 对任意 base_url 探测 4 族协议端点 (薄壳 —
-/// 校验 base_url 后调 `crate::proxy::probe_provider_upstream`, 判定/推荐算法
-/// SSOT 在 proxy 层).
+/// `POST /api/providers/probe`: 单协议端点校验 verify (#332 端点行 "二次检测";
+/// 薄壳 — 校验 base_url 后调 `crate::proxy::verify_endpoint_upstream`, 判定
+/// 算法 SSOT 在 proxy 层). 全景探测归 `POST /api/providers/probe-origin`
+/// (#332 融合: 原 "无 protocol = 全景探测" 形态已随 `probe_provider_upstream`
+/// 删除, 语义由 `proxy::origin::probe_origin_upstream` 的面候选矩阵接管).
 ///
 /// 探测失败是**数据不是 HTTP 错误**: 恒 200 (结果落在 status=error 的 outcome),
-/// 仅 base_url 非法 (复用 [`crate::provider::validate_base_url`] 同一规则) → 400.
-/// 响应不含 api_key (探测 detail 经 `upstream_error_brief` 净化).
+/// 仅 base_url 非法 (复用 [`crate::provider::validate_base_url`] 同一规则) /
+/// `protocol` 缺失或未知名 / `common_uri` 非法形状 → 400. 响应不含 api_key
+/// (探测 detail 经 `upstream_error_brief` 净化).
 pub async fn probe_provider(
     State(state): State<AppState>,
     Json(payload): Json<ProbeRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     crate::provider::validate_base_url(&payload.base_url).map_err(ApiError::validation)?;
-    let response =
-        crate::proxy::probe_provider_upstream(&state.upstream, &payload.base_url, &payload.api_key)
-            .await;
+    let name = payload.protocol.as_deref().ok_or_else(|| {
+        ApiError::validation(
+            "protocol is required (single-endpoint verify); panorama probing moved to /api/providers/probe-origin",
+        )
+    })?;
+    let protocol = crate::provider::Protocol::from_name(name).ok_or_else(|| {
+        ApiError::validation(format!(
+            "unknown protocol {name:?} (expected one of the Protocol::ALL names)"
+        ))
+    })?;
+    if let Some(cu) = payload.common_uri.as_deref()
+        && !crate::provider::is_valid_common_uri_shape(cu)
+    {
+        return Err(ApiError::validation(
+            "common_uri must be empty or start with '/'",
+        ));
+    }
+    let response = crate::proxy::verify_endpoint_upstream(
+        &state.upstream,
+        &payload.base_url,
+        payload.common_uri.as_deref(),
+        protocol,
+        &payload.api_key,
+    )
+    .await;
     Ok((StatusCode::OK, NO_STORE, Json(response)))
 }
 

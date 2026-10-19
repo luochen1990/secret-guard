@@ -6030,10 +6030,13 @@ async fn providers_api_rejects_probe_reserved_id() {
     );
 }
 
-/// 端到端: OpenAI shape 上游 → 200 + 固定 4 项 probes + recommended; 响应体
-/// (raw text) 不含 api_key 子串 (SEC 红线, 双保险于单测的净化断言).
+/// verify 模式端到端 (#332, 端点行 "二次检测"): 携带 `protocol` → 单条
+/// probes 的单点校验 (urls 回显被验证的 GET URL + ok outcome 携带被验证的
+/// common_uri); `protocol` 缺失 / 未知名 / 非法 common_uri 形状 → 400 (全景
+/// 探测归 /api/providers/probe-origin — #332 融合). 响应体不含 api_key
+/// (SEC 红线, 双保险于单测的净化断言).
 #[tokio::test]
-async fn providers_probe_api_end_to_end_openai() {
+async fn providers_probe_api_verify_mode() {
     let mut upstream = spawn_mock_upstream().await;
     upstream
         .mock("GET", "/v1/models")
@@ -6042,18 +6045,20 @@ async fn providers_probe_api_end_to_end_openai() {
         .expect(1)
         .create_async()
         .await;
-    for path in ["/models", "/v1beta/models", "/api/tags"] {
-        upstream
-            .mock("GET", path)
-            .with_status(404)
-            .create_async()
-            .await;
-    }
     let proxy_url = spawn_proxy(&upstream.url()).await;
-    let api_key = "sk-integration-leaky";
-    let resp = reqwest::Client::new()
+    let client = reqwest::Client::new();
+    let api_key = "sk-verify-integration-leaky";
+
+    // 单协议校验: openai + cu "/v1" → 200 + 单条 ok outcome (urls 回显被验证
+    // 的 URL — 校验 URL 与运行时 egress 拼接一致).
+    let resp = client
         .post(format!("{proxy_url}/api/providers/probe"))
-        .json(&serde_json::json!({ "base_url": upstream.url(), "api_key": api_key }))
+        .json(&serde_json::json!({
+            "base_url": upstream.url(),
+            "api_key": api_key,
+            "protocol": "openai",
+            "common_uri": "/v1",
+        }))
         .send()
         .await
         .unwrap();
@@ -6061,70 +6066,86 @@ async fn providers_probe_api_end_to_end_openai() {
     let raw = resp.text().await.unwrap();
     assert!(
         !raw.contains(api_key),
-        "probe response must not leak api_key: {raw}"
+        "verify response must not leak api_key: {raw}"
     );
     let body: serde_json::Value = serde_json::from_str(&raw).unwrap();
-    let names: Vec<&str> = body["probes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|p| p["protocol"].as_str().unwrap())
-        .collect();
-    assert_eq!(names, ["openai", "anthropic", "gemini", "ollama"]);
-    assert_eq!(body["probes"][0]["status"], "ok");
-    assert_eq!(body["probes"][0]["models"][0], "gpt-4o");
-    // urls 回显: v1 pair 双路径两族共享, gemini/ollama 单路.
-    let urls: Vec<&str> = body["probes"][0]["urls"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|u| u.as_str().unwrap())
-        .collect();
+    let probes = body["probes"].as_array().unwrap();
+    assert_eq!(probes.len(), 1, "verify = 单条 outcome");
+    assert_eq!(probes[0]["protocol"], "openai");
+    assert_eq!(probes[0]["status"], "ok");
+    assert_eq!(probes[0]["models"][0], "gpt-4o");
+    assert_eq!(probes[0]["common_uri"], "/v1");
     assert_eq!(
-        urls,
-        [
-            format!("{}/v1/models", upstream.url()),
-            format!("{}/models", upstream.url())
-        ]
+        probes[0]["urls"][0],
+        format!("{}/v1/models", upstream.url())
     );
-    assert_eq!(
-        body["probes"][2]["urls"][0],
-        format!("{}/v1beta/models", upstream.url())
+
+    // protocol 缺失 (旧全景形态) → 400, message 指向 probe-origin.
+    let resp = client
+        .post(format!("{proxy_url}/api/providers/probe"))
+        .json(&serde_json::json!({ "base_url": upstream.url(), "api_key": "" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("probe-origin"),
+        "missing protocol must point to the panorama endpoint: {body}"
     );
-    assert_eq!(body["probes"][1]["status"], "absent");
-    assert_eq!(body["probes"][2]["status"], "absent");
-    assert_eq!(body["probes"][3]["status"], "absent");
-    assert_eq!(body["recommended"], "openai");
-    assert!(body["note"].is_null());
+
+    // 未知 protocol → 400.
+    let resp = client
+        .post(format!("{proxy_url}/api/providers/probe"))
+        .json(&serde_json::json!({
+            "base_url": upstream.url(),
+            "protocol": "not-a-protocol",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // 非法 common_uri 形状 (不以 / 开头且非空串) → 400.
+    let resp = client
+        .post(format!("{proxy_url}/api/providers/probe"))
+        .json(&serde_json::json!({
+            "base_url": upstream.url(),
+            "protocol": "openai",
+            "common_uri": "v1",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 }
 
-/// 探测全失败 (上游四个端点全部 500) 仍是 200 — 失败是数据不是 HTTP 错误,
-/// recommended 为 null.
+/// 校验失败 (上游 500) 仍是 200 — 失败是数据不是 HTTP 错误 (error outcome
+/// 携带 detail), 不变 verify 的非阻塞语义.
 #[tokio::test]
-async fn providers_probe_api_all_failures_still_200() {
+async fn providers_probe_api_verify_all_failures_still_200() {
     let mut upstream = spawn_mock_upstream().await;
-    for path in ["/v1/models", "/models", "/v1beta/models", "/api/tags"] {
-        upstream
-            .mock("GET", path)
-            .with_status(500)
-            .create_async()
-            .await;
-    }
+    upstream
+        .mock("GET", "/v1/models")
+        .with_status(500)
+        .create_async()
+        .await;
     let proxy_url = spawn_proxy(&upstream.url()).await;
     let resp = reqwest::Client::new()
         .post(format!("{proxy_url}/api/providers/probe"))
-        .json(&serde_json::json!({ "base_url": upstream.url() }))
+        .json(&serde_json::json!({
+            "base_url": upstream.url(),
+            "protocol": "openai",
+        }))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body: serde_json::Value = resp.json().await.unwrap();
-    for probe in body["probes"].as_array().unwrap() {
-        assert_eq!(probe["status"], "error");
-        assert!(probe["detail"].is_string(), "error 必有 detail");
-    }
-    assert!(body["recommended"].is_null());
-    assert!(body["note"].is_null());
+    let probes = body["probes"].as_array().unwrap();
+    assert_eq!(probes.len(), 1);
+    assert_eq!(probes[0]["status"], "error");
+    assert!(probes[0]["detail"].is_string(), "error 必有 detail");
 }
 
 // ─── providers probe-origin API (POST /api/providers/probe-origin, #332) ──
@@ -6234,13 +6255,17 @@ async fn providers_probe_origin_api_end_to_end_mimo() {
     assert_eq!(oa["status"], "ok");
     assert_eq!(oa["evidence"], "models");
     assert_eq!(oa["uri"], "/v1");
-    assert_eq!(oa["base_url"], format!("{}/v1", upstream.url()));
+    // v1 族 (#332 融合): base_url = origin, 面路径经 common_uri 承载布局断言.
+    assert_eq!(oa["base_url"], upstream.url());
+    assert_eq!(oa["common_uri"], "/v1");
     assert_eq!(oa["models"][0], "mimo-1");
     assert!(oa["detail"].is_null());
     let an = &body["faces"][1];
     assert_eq!(an["status"], "ok");
     assert_eq!(an["evidence"], "existence");
     assert_eq!(an["uri"], "/anthropic");
+    assert_eq!(an["base_url"], format!("{}/anthropic", upstream.url()));
+    assert!(an["common_uri"].is_null());
     assert_eq!(
         an["detail"],
         "路由存在 (POST /anthropic/v1/messages → 400; 对照路径 404)"
@@ -6250,6 +6275,8 @@ async fn providers_probe_origin_api_end_to_end_mimo() {
     let r = &body["faces"][4];
     assert_eq!(r["status"], "ok");
     assert_eq!(r["uri"], "/v1");
+    assert_eq!(r["base_url"], upstream.url());
+    assert_eq!(r["common_uri"], "/v1");
     assert_eq!(r["models"][0], "mimo-1");
     assert_eq!(r["detail"], "与 OpenAI 共用 /v1, 探测无法区分");
 }

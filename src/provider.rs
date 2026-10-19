@@ -295,8 +295,10 @@ pub(crate) fn is_valid_common_uri_shape(cu: &str) -> bool {
 /// base_url 未声明 common_uri 时的布局启发: 尾段 (最后一个 path 段) 是纯
 /// 数字版本号 (`v1` / `v4` / `v2` …) → 版本前缀已含 (`""`); 其余 (裸根 /
 /// `anthropic` / `zen` 后跟无版本 / `v1beta` 非纯数字 / 带端口 host) →
-/// 官方裸根布局 (`"/v1"`). 供 [`Endpoint::effective_common_uri`] 兜底.
-fn heuristic_common_uri(base_url: &str) -> &'static str {
+/// 官方裸根布局 (`"/v1"`). 供 [`Endpoint::effective_common_uri`] 兜底;
+/// 探测端的单协议校验 (verify, `proxy::models::verify_endpoint_upstream`)
+/// 复用同一启发 — "校验 URL 的拼接规则与运行时 egress 完全一致".
+pub(crate) fn heuristic_common_uri(base_url: &str) -> &'static str {
     let last_seg = base_url.rsplit('/').next().unwrap_or("");
     let version = last_seg.strip_prefix('v').unwrap_or("");
     if !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit()) {
