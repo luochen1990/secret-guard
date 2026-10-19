@@ -14505,18 +14505,76 @@ async fn usage_stats_cross_proto_recorded() {
 //
 // 契约: `prop_no_real_secret_in_any_json_response` /
 // `prop_no_real_api_key_in_any_json_response` (contracts.md SEC-1, P0).
-// 现状只有点状断言 (单端点单字段 mask), 穷举式扫描保证任何端点 / 任何字段
-// (含 ForwardRecord / SessionSummary / SyncSnapshot / usage 聚合) 都不含明文.
+// 穷举式扫描保证任何端点 / 任何字段 (含 ForwardRecord / SessionSummary /
+// SyncSnapshot / usage 聚合 / ModelPreview) 都不含明文; 点状断言 (单端点单字段
+// mask) 另存于各自 CRUD 测试. #358 起: needle 域生成器化 (转义敏感字符) +
+// 双形态匹配 (段首), 端点清单与 router 装配源机械对账 (段末).
 
 /// SEC-1 植入敏感值 (setup 植入与扫描 needle 同源 — 改一处即处处改, 防止
 /// needle 与植入值漂移导致扫描恒空过的 vacuous 绿).
-/// 约束: 值只含 JSON 序列化无需转义的字符 (否则响应序列化后子串形态改变会漏检).
-const SEC1_SECRET: &str = "sk-real-secret-abc123xyz";
-const SEC1_API_KEY: &str = "sk-live-provider-key-777xyz";
+/// needle 域 (#358 生成器化): 覆盖 serde_json 序列化**转义敏感**字符 — `"` /
+/// `\` / 控制字符; 旧固定 needle 只含无需转义的字符, 泄漏以转义形态 (\" \\ \n
+/// \u0001) 出现时 `body.contains(raw)` 恒不命中 (盲区一, 缺口证明见
+/// `sec1_dual_form_matching_detects_escaped_leak`). 非 ASCII 不在域内:
+/// serde_json 默认不转义非 ASCII, 原样子串可命中 (issue #358 复核驳回).
+fn sec1_secret_needles() -> Vec<(&'static str, &'static str)> {
+    vec![
+        // 历史基线 (纯字母数字) — 旧行为锚, 保证扫描对朴素形态不回退.
+        ("sec1", "sk-real-secret-abc123xyz"),
+        // 引号: wire 转义形态 \" — 盲区一主形态.
+        ("sec1-quote", "sk-real-\"quoted\"-secret"),
+        // 反斜杠: wire 转义形态 \\.
+        ("sec1-backslash", "sk-real-b\\s-secret"),
+        // 控制字符 (换行/回车/制表/U+0001): wire 转义形态 \n \r \t \u0001.
+        ("sec1-ctl", "sk-real-c\nr\rt\x01t-end"),
+    ]
+}
 
-/// SEC-1 扫描共享前置: 构造 "record / session / usage / redact 审计全有数据"
-/// 的实例 — 1 个 secret + 1 个带 api_key 的 dynamic provider (mockito 上游) +
-/// 1 次带 secret 的转发. 返回 (client, base, db) — db 供测试末尾清理.
+/// api_key 维度 needle: 单值混合全部转义敏感字符 (provider 维度一 entry 一份
+/// key, 混合值同时覆盖朴素与转义两形态 — 旧纯字母数字值是其严格子集问题).
+const SEC1_API_KEY: &str = "sk-live-\"k\\ey\"\n777xyz";
+
+/// needle 的 JSON 字符串转义形态: `serde_json::to_string(needle)` 剥两端引号 —
+/// 泄漏以"值内嵌"形态出现 (前后是其他文本), 保留两端引号反而漏检 (字段值含
+/// needle 的完整串不含 needle 自己的包裹引号).
+fn sec1_json_escaped(needle: &str) -> String {
+    let quoted = serde_json::to_string(needle).expect("&str 序列化不失败");
+    // 两端引号均为 1 字节 ASCII, 切片边界安全 (内容含多字节字符无碍).
+    quoted[1..quoted.len() - 1].to_string()
+}
+
+/// 双形态泄漏检测: body 含 needle 原样 (raw) **或** JSON 转义形态即命中
+/// (#358 盲区一修复). 纯字母数字 needle 两形态相同 (第二次 contains 冗余无害).
+fn sec1_body_contains_needle(body: &str, needle: &str) -> bool {
+    body.contains(needle) || body.contains(&sec1_json_escaped(needle))
+}
+
+/// 盲区一证明 (#358): 旧单形态扫描 (`body.contains(raw needle)`) 对以 JSON
+/// 转义形态出现的泄漏恒漏检 — 含 `"` / `\` / 控制字符的 needle 经序列化后
+/// 子串形态改变. 双断言固定该缺口: ① 旧谓词确实漏检 (缺口实锤, 前提失效
+/// 亦红 — 转义假设不成立时本测试提醒复核) ② 双形态谓词检出.
+#[test]
+fn sec1_dual_form_matching_detects_escaped_leak() {
+    let needle = "sk-real-\"q\"-b\\s\n\x01-end";
+    // 真实泄漏形态: needle 作为 JSON 字符串值的内嵌内容被序列化 (前后有文本).
+    let body = serde_json::to_string(&serde_json::json!({
+        "content": format!("leak {needle} here")
+    }))
+    .unwrap();
+    assert!(
+        !body.contains(needle),
+        "前提失效: 序列化后 raw needle 仍原样出现 (转义假设不成立, 需复核)"
+    );
+    assert!(
+        sec1_body_contains_needle(&body, needle),
+        "双形态谓词必须检出转义形态泄漏: {body:?}"
+    );
+}
+
+/// SEC-1 扫描共享前置: 构造 "record / session / usage / redact 审计 / 模型清单
+/// 全有数据" 的实例 — 全部域内 secret (sec1_secret_needles) + 1 个带 api_key 的
+/// dynamic provider (mockito 上游) + 1 次带全部 needle 的转发. 返回
+/// (client, base, db) — db 供测试末尾清理.
 async fn sec1_scan_setup(tag: &str) -> (reqwest::Client, String, std::path::PathBuf) {
     let mut upstream = spawn_mock_upstream().await;
     let chat_body = serde_json::json!({
@@ -14531,11 +14589,21 @@ async fn sec1_scan_setup(tag: &str) -> (reqwest::Client, String, std::path::Path
         .with_body(serde_json::to_string(&chat_body).unwrap())
         .create_async()
         .await;
+    // GET /api/providers/{id}/models 的上游取数面 (Direct 现场 fetch, #358 补扫):
+    // 成功路径的模型清单回显是该端点最大的实质暴露面.
+    let _models = upstream
+        .mock("GET", "/v1/models")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"object":"list","data":[{"id":"gpt-4o"},{"id":"gpt-4o-mini"}]}"#)
+        .create_async()
+        .await;
 
+    let needles = sec1_secret_needles();
     let (store, db) = usage_e2e_store(tag);
     let base = spawn_proxy_with_usage_store_and_secrets(
         store,
-        test_secret_table_with(vec![secret("sec1", SEC1_SECRET)]),
+        test_secret_table_with(needles.iter().map(|(id, v)| secret(id, v)).collect()),
     )
     .await;
     let client = reqwest::Client::new();
@@ -14554,11 +14622,16 @@ async fn sec1_scan_setup(tag: &str) -> (reqwest::Client, String, std::path::Path
         .unwrap();
     assert!(resp.status().is_success(), "create provider");
 
-    // 1 次带 secret 的转发 → record / session / usage / redact_events 均有数据.
+    // 1 次带全部 needle 的转发 → record / session / usage / redact_events 均有数据.
+    let needle_msg = needles
+        .iter()
+        .map(|(_, v)| *v)
+        .collect::<Vec<_>>()
+        .join(" and ");
     let chat = client
         .post(format!("{base}/o/oa-sec1/v1/chat/completions"))
         .json(&serde_json::json!({"model": "gpt-4", "messages": [
-            {"role": "user", "content": format!("use {SEC1_SECRET} to call api")}]}))
+            {"role": "user", "content": format!("use {needle_msg} to call api")}]}))
         .send()
         .await
         .unwrap();
@@ -14573,14 +14646,54 @@ async fn sec1_scan_setup(tag: &str) -> (reqwest::Client, String, std::path::Path
     (client, base, db)
 }
 
-/// 遍历全部 JSON API 读端点, 返回 (label, body) 列表.
+/// SSE 端点 (`/api/events`) 的受控消费: 断言 2xx + `text/event-stream` 后读
+/// 全量 body 文本.
+///
+/// 本 harness (`base_app_state`) 的 shutdown sender 立即 drop → SSE 流推完初值
+/// (WatchStream::new 语义) 即视同 shutdown 自然结束 — `text()` 可完结, 非挂死
+/// 流. 5s 超时是守卫: 未来 harness 若改持 sender (`spawn_proxy_with_events`
+/// 形态), 流只在 keepalive 帧里无限续 — 宁可显式红也不挂死 CI. 事件只携带
+/// DAG 变更计数 (u64 十进制), 无数据面载荷 (wire 契约见 `api/events.rs`),
+/// 故对流文本的扫描即对该端点数据面的全量扫描.
+async fn sec1_fetch_events(client: &reqwest::Client, base: &str, path: &str) -> (String, String) {
+    let resp = client.get(format!("{base}{path}")).send().await.unwrap();
+    assert!(
+        resp.status().is_success(),
+        "GET {path} should be 2xx, got {}",
+        resp.status()
+    );
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(
+        ct.starts_with("text/event-stream"),
+        "GET {path} content-type = {ct:?}, expect text/event-stream"
+    );
+    let body = tokio::time::timeout(Duration::from_secs(5), resp.text())
+        .await
+        .unwrap_or_else(|_| {
+            panic!("GET {path}: SSE 流 5s 未结束 — 本 harness 的 shutdown channel 应已关闭")
+        })
+        .unwrap();
+    (path.to_string(), body)
+}
+
+/// 遍历全部 JSON API 读端点, 返回 (GET 实 fetch 路径集, (label, body) 列表).
+///
+/// paths (query 剥离) 供机械对账消费 (`prop_sec1_scan_covers_all_router_get_routes`,
+/// #358 盲区二); label 保留 query 形态便于泄漏消息定位.
 ///
 /// 端点清单以 `src/web/mod.rs` 实际路由为准 (全部 GET + 数据面聚合 POST /api/sync;
 /// 无 GET /api/records 列表端点 — record 经 timeline/sync 暴露). 含路径参数的端点
 /// 从 sessions / timeline 响应派生真实 id (setup 保证 ≥1 session/round, 故用
 /// expect fail-closed — if-let 静默跳过会让扫描面收窄而测试照绿); 所有端点断言
 /// 2xx (非 2xx 的错误 body 无扫描价值, 且会静默弱化穷举).
-async fn sec1_read_all_endpoints(client: &reqwest::Client, base: &str) -> Vec<(String, String)> {
+async fn sec1_read_all_endpoints(
+    client: &reqwest::Client,
+    base: &str,
+) -> (Vec<String>, Vec<(String, String)>) {
     async fn fetch(client: &reqwest::Client, base: &str, path: &str) -> (String, String) {
         let resp = client.get(format!("{base}{path}")).send().await.unwrap();
         assert!(
@@ -14591,18 +14704,34 @@ async fn sec1_read_all_endpoints(client: &reqwest::Client, base: &str) -> Vec<(S
         (path.to_string(), resp.text().await.unwrap())
     }
 
-    let mut out: Vec<(String, String)> = vec![
-        fetch(client, base, "/api/secrets").await,
-        fetch(client, base, "/api/providers").await,
-        fetch(client, base, "/api/api-keys").await,
-        fetch(client, base, "/api/usage/summary?hours=24").await,
+    let mut paths: Vec<String> = Vec::new();
+    let mut out: Vec<(String, String)> = Vec::new();
+    for path in [
+        "/api/secrets",
+        "/api/providers",
+        "/api/api-keys",
+        // #358 补扫的 4 遗漏端点之两 (低风险机械遗漏): 全局设置回显 + 单用户
+        // 探针 (gatus 公开探针契约, 两形态恒 200).
+        "/api/settings",
+        "/api/me",
+        "/api/usage/summary?hours=24",
         // privacy-scan 两读端点 (context 遮盖面; 本测试 privacy off 档下返回
         // enabled:false 空表 — 端点进穷举网的意义是防未来回归把泄密面加进来
         // 而网不感知, context 的专项守卫在 src/privacy.rs 单测).
-        fetch(client, base, "/api/privacy-scan/alerts").await,
-        fetch(client, base, "/api/privacy-scan/settings").await,
-    ];
+        "/api/privacy-scan/alerts",
+        "/api/privacy-scan/settings",
+    ] {
+        let (label, body) = fetch(client, base, path).await;
+        paths.push(path.split('?').next().unwrap().to_string());
+        out.push((label, body));
+    }
+    // #358 补扫: SSE 失效通知流 — 受控消费 (helper 头注释), 事件只携带 DAG
+    // 变更计数, 无数据面载荷 (数据以 POST /api/sync 为 SSOT, 后者在扫描清单).
+    let (events_label, events_body) = sec1_fetch_events(client, base, "/api/events").await;
+    paths.push("/api/events".into());
+    out.push((events_label, events_body));
     let (sessions_label, sessions_body) = fetch(client, base, "/api/sessions").await;
+    paths.push("/api/sessions".into());
     let sessions: serde_json::Value = serde_json::from_str(&sessions_body).unwrap();
     out.push((sessions_label, sessions_body));
     let sid = sessions["sessions"][0]["session_id"]
@@ -14610,13 +14739,23 @@ async fn sec1_read_all_endpoints(client: &reqwest::Client, base: &str) -> Vec<(S
         .expect("setup 保证 ≥1 session (已成功转发)");
     let timeline_path = format!("/api/sessions/{sid}/timeline");
     let (timeline_label, timeline_body) = fetch(client, base, &timeline_path).await;
+    paths.push(timeline_path.split('?').next().unwrap().to_string());
     let timeline: serde_json::Value = serde_json::from_str(&timeline_body).unwrap();
     out.push((timeline_label, timeline_body));
     let rid = timeline["rounds"][0]["id"]
         .as_str()
         .expect("setup 保证 ≥1 round (已成功转发)");
-    out.push(fetch(client, base, &format!("/api/records/{rid}")).await);
-    out.push(fetch(client, base, &format!("/api/records/{rid}?view=parsed")).await);
+    let record_path = format!("/api/records/{rid}");
+    out.push(fetch(client, base, &record_path).await);
+    paths.push(record_path);
+    let parsed_label = format!("/api/records/{rid}?view=parsed");
+    let (_, parsed_body) = fetch(client, base, &parsed_label).await;
+    out.push((parsed_label, parsed_body));
+    // #358 补扫之最有实质: 模型清单预览 — 上游现场 fetch 的模型清单与 error
+    // 明细都经此端点回显 (setup 已 mock /v1/models 走成功路径).
+    let models_path = "/api/providers/oa-sec1/models";
+    out.push(fetch(client, base, models_path).await);
+    paths.push(models_path.into());
     // sync: 数据面聚合 DTO (sessions + rounds + timeline diff 一次拿全).
     let sync_resp = client
         .post(format!("{base}/api/sync"))
@@ -14635,39 +14774,215 @@ async fn sec1_read_all_endpoints(client: &reqwest::Client, base: &str) -> Vec<(S
         "POST /api/sync".to_string(),
         sync_resp.text().await.unwrap(),
     ));
-    out
+    (paths, out)
 }
 
-/// 遍历全部读端点, 返回 body 含 `needle` 明文的端点 label 列表 (空 = 通过).
-/// needle 须为 JSON 序列化后原样保留的子串 (植入值见 SEC1_* 常量约束).
-async fn sec1_scan_leaks(client: &reqwest::Client, base: &str, needle: &str) -> Vec<String> {
-    sec1_read_all_endpoints(client, base)
-        .await
-        .into_iter()
-        .filter(|(_, body)| body.contains(needle))
-        .map(|(label, _)| label)
-        .collect()
+/// 遍历全部读端点, 返回泄漏对列表 (格式 "{label} leaked {id}", 空 = 通过).
+/// 双形态匹配 (`sec1_body_contains_needle`, #358 盲区一): needle 以 raw 或 JSON
+/// 转义形态出现均命中.
+async fn sec1_scan_leaks(
+    client: &reqwest::Client,
+    base: &str,
+    needles: &[(&str, &str)],
+) -> Vec<String> {
+    let mut leaks = Vec::new();
+    let (_, bodies) = sec1_read_all_endpoints(client, base).await;
+    for (label, body) in &bodies {
+        for (id, needle) in needles {
+            if sec1_body_contains_needle(body, needle) {
+                leaks.push(format!("{label} leaked {id}"));
+            }
+        }
+    }
+    leaks
 }
 
 /// SEC-1 `prop_no_real_secret_in_any_json_response`:
-/// 任意读端点响应体不含配置的 real secret 明文 (穷举式扫描, 非点状 mask 断言).
+/// 任意读端点响应体不含配置的 real secret 明文 (穷举式扫描, 非点状 mask 断言);
+/// needle 域含转义敏感字符 (`sec1_secret_needles`), raw 与 JSON 转义双形态匹配.
 #[tokio::test]
 async fn prop_no_real_secret_in_any_json_response() {
     let (client, base, db) = sec1_scan_setup("sec1-secret").await;
-    let leaks = sec1_scan_leaks(&client, &base, SEC1_SECRET).await;
+    // 非 vacuous 守卫: 全部 needle (含转义字符变体) 必须真实流经 redact 管线
+    // (usage 的 redactions.by_secret 按 secret_id 聚合) — 植入未生效时扫描会
+    // 恒空过假绿, 该断言先行拦截.
+    let summary = client
+        .get(format!("{base}/api/usage/summary?hours=24"))
+        .send()
+        .await
+        .unwrap();
+    let s: serde_json::Value = summary.json().await.unwrap();
+    let by_secret: Vec<&str> = s["redactions"]["by_secret"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|r| r["secret_id"].as_str()).collect())
+        .unwrap_or_default();
+    for (id, _) in sec1_secret_needles() {
+        assert!(
+            by_secret.contains(&id),
+            "needle {id} 未进 redact 审计 — 植入未生效, 扫描将 vacuous 绿"
+        );
+    }
+    let leaks = sec1_scan_leaks(&client, &base, &sec1_secret_needles()).await;
     assert!(leaks.is_empty(), "SEC-1: real secret leaks via: {leaks:?}");
     let _ = std::fs::remove_file(&db);
 }
 
 /// SEC-1 `prop_no_real_api_key_in_any_json_response`:
-/// 任意读端点响应体不含 provider 的 api_key 明文 (同上, api_key 维度).
+/// 任意读端点响应体不含 provider 的 api_key 明文 (同上, api_key 维度;
+/// needle 为混合转义敏感字符的单值, 覆盖 raw 与转义两形态).
 #[tokio::test]
 async fn prop_no_real_api_key_in_any_json_response() {
     let (client, base, db) = sec1_scan_setup("sec1-apikey").await;
-    let leaks = sec1_scan_leaks(&client, &base, SEC1_API_KEY).await;
+    let leaks = sec1_scan_leaks(&client, &base, &[("api-key", SEC1_API_KEY)]).await;
     assert!(
         leaks.is_empty(),
         "SEC-1: provider api_key leaks via: {leaks:?}"
+    );
+    let _ = std::fs::remove_file(&db);
+}
+
+// ─── SEC-1 机械对账: router 装配源 → GET 路由模板 ⊆ 扫描实 fetch (#358) ─────
+//
+// axum 0.8 Router 无公开路由遍历 API (0.8.9 的 pub fn 面只有 route/merge/nest/
+// layer/with_state 等, 无枚举), 纯测试侧 Router 遍历不可行; 对账退而从**装配
+// 源码**提取 — include_str! 在编译期锁定源 (改路由必改源), `.route("path",
+// get(...))` 声明式链是本仓唯一装配方式. 已知边界: 循环/宏批量注册会绕过提取
+// (集合意外收缩, 活性断言守卫为显式红), 见 known-limitations "testing" 节.
+
+const SEC1_WEB_MOD_RS: &str = include_str!("../src/web/mod.rs");
+const SEC1_SERVER_RS: &str = include_str!("../src/server.rs");
+
+/// 剥每行首个 `//` 起的注释 (含 doc 注释; 不处理 `/* */` 块注释 — 两个装配
+/// 函数未使用, 引入时若含不平衡括号会令提取畸变 → 活性断言红).
+/// 假设: 两个装配函数体内无字符串字面量含 `//` (路由 path 不含; 若被破坏,
+/// 后续括号/花括号平衡错位 → 提取畸变 → 活性断言红, fail-loud 不静默).
+fn sec1_strip_comments(src: &str) -> String {
+    src.lines()
+        .map(|l| match l.find("//") {
+            Some(i) => &l[..i],
+            None => l,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 取 `sig` (如 "pub fn router(") 所在函数体源码: 定位签名 → 首个 `{` 起 →
+/// 花括号平衡到闭合. 输入须为**剥过行注释**的源码 (注释里的 "{id}" / "(#123)"
+/// 不参与平衡). 路径字面量中的 `{seg}` 恒成对, 不破坏平衡.
+fn sec1_fn_body<'a>(src: &'a str, sig: &str) -> &'a str {
+    let start = src
+        .find(sig)
+        .unwrap_or_else(|| panic!("签名 {sig:?} 未找到 — 装配函数结构变更?"));
+    let open = start + src[start..].find('{').expect("签名后无函数体 {");
+    let mut depth = 0usize;
+    for (i, &b) in src.as_bytes().iter().enumerate().skip(open) {
+        match b {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &src[open..=i];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("{sig:?} 函数体花括号不平衡");
+}
+
+/// 从 (剥注释后的) 装配函数体提取 GET 且以 `/api/` 开头的路由模板.
+///
+/// 扫 `.route("path", method_router)` 字面量: path = 实参区首个字符串字面量;
+/// method_router = 从 `.route(` 起括号平衡到闭合的实参区间, 含 `get(` 即 GET
+/// 路由. 实参内唯一带调用括号的形态是 method-router 构造器与链式方法
+/// (`get(`/`post(`/`put(`/`delete(`/`patch(`/`any(`; handler 以路径出现无括号),
+/// 故 `get(` 子串只可能来自 GET 构造器 — `any(...)` 兜底 (如 /api/{*rest}) 与
+/// 纯写方法路由自然排除.
+fn sec1_get_api_templates(src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = src.as_bytes();
+    let mut i = 0usize;
+    while let Some(rel) = src[i..].find(".route(") {
+        let after = i + rel + ".route(".len();
+        let q1 = src[after..].find('"').expect(".route( 后无字符串字面量") + after;
+        let q2 = src[q1 + 1..].find('"').expect("path 字面量未闭合") + q1 + 1;
+        let path = &src[q1 + 1..q2];
+        let mut depth = 1usize;
+        let mut j = after;
+        while j < bytes.len() && depth > 0 {
+            match bytes[j] {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                _ => {}
+            }
+            j += 1;
+        }
+        if depth != 0 {
+            panic!(".route({path:?} 实参括号不平衡");
+        }
+        let args = &src[after..j - 1];
+        if args.contains("get(") && path.starts_with("/api/") {
+            out.push(path.to_string());
+        }
+        i = j;
+    }
+    out
+}
+
+/// router 实际 GET `/api/*` 路由模板全集: `web::router()` (数据面) +
+/// `server::build_router` (单用户装配的 `/api/me`).
+///
+/// scope = 单用户装配 (集成测试 harness 形态): OIDC 形态的 `/login` /
+/// `/oauth2/callback` 是认证流程 HTML/重定向 handler, 无数据面载荷, 且默认档
+/// (无 oidc feature) 不编译, 不在 SEC-1 扫描域. `GET /` (WebUI 静态 HTML,
+/// 零数据) 经 `/api/` 前缀过滤排除.
+fn sec1_router_get_api_templates() -> Vec<String> {
+    let web_src = sec1_strip_comments(SEC1_WEB_MOD_RS);
+    let server_src = sec1_strip_comments(SEC1_SERVER_RS);
+    let mut t = sec1_get_api_templates(sec1_fn_body(&web_src, "pub fn router("));
+    t.extend(sec1_get_api_templates(sec1_fn_body(
+        &server_src,
+        "pub fn build_router(",
+    )));
+    t.sort();
+    t.dedup();
+    t
+}
+
+/// axum 0.8 段模板匹配: `{seg}` 单段通配. 多段通配 `{*rest}` 不出现在 GET 域
+/// (`any(` 兜底已被 `get(` 判据排除); 若未来出现, 段数等长判据保守不匹配 → 红.
+fn sec1_template_matches(template: &str, path: &str) -> bool {
+    let t: Vec<&str> = template.trim_matches('/').split('/').collect();
+    let p: Vec<&str> = path.trim_matches('/').split('/').collect();
+    t.len() == p.len() && std::iter::zip(&t, &p).all(|(t, p)| t.starts_with('{') || t == p)
+}
+
+/// SEC-1 `prop_sec1_scan_covers_all_router_get_routes` (#358 盲区二):
+/// 机械对账 — router 装配源提取的全部 GET `/api/*` 路由模板, 必须被
+/// `sec1_read_all_endpoints` 实际 fetch 的路径集合 (段模板匹配) 覆盖.
+/// 新增 GET 端点而未同步扫描清单 → 本测试红; 旧清单漂移遗漏的 4 端点
+/// (`/api/providers/{id}/models` / `/api/settings` / `/api/events` / `/api/me`)
+/// 即由本对账首次运行暴露.
+#[tokio::test]
+async fn prop_sec1_scan_covers_all_router_get_routes() {
+    let (client, base, db) = sec1_scan_setup("sec1-reconcile").await;
+    let (paths, _) = sec1_read_all_endpoints(&client, &base).await;
+    let templates = sec1_router_get_api_templates();
+    // 解析活性守卫 (fail-loud): 装配风格漂移 (如循环/宏批量注册) 会令提取集合
+    // 意外收缩 — 已知基准路由缺失即红, 不静默变窄.
+    for probe in ["/api/sessions", "/api/settings", "/api/me"] {
+        assert!(
+            templates.iter().any(|t| t == probe),
+            "对账解析活性: {probe} 应在提取集合 {templates:?}"
+        );
+    }
+    let uncovered: Vec<&String> = templates
+        .iter()
+        .filter(|t| !paths.iter().any(|p| sec1_template_matches(t, p)))
+        .collect();
+    assert!(
+        uncovered.is_empty(),
+        "SEC-1 扫描未覆盖 GET 路由 {uncovered:?} — 新增 GET 端点必须同步 sec1_read_all_endpoints (#358); 实 fetch 路径集 = {paths:?}"
     );
     let _ = std::fs::remove_file(&db);
 }

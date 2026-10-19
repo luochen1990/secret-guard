@@ -996,8 +996,9 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 **Properties**:
 - `prop_get_secret_masks_value`: GET /secrets 返回的 value 字段是 mask (如 `sk-****`), 非真实值. 🔁→`mask_value_hides_full_content` (`src/secrets.rs`) + `secrets_api_create_lists_update_delete` 内嵌 value_masked 断言 (`tests/integration.rs`)
 - `prop_get_provider_masks_api_key`: GET /providers 返回的 api_key 字段是 mask. 🔁→`effective_snapshot_includes_provenance_and_masks_api_key` (`src/provider.rs`) + `providers_api_lists_existing` 内嵌 api_key_masked 断言 (`tests/integration.rs`)
-- `prop_no_real_secret_in_any_json_response`: 任意 GET 响应 (含 ForwardRecord / EffectiveSnapshot / SessionSummary 等) 不含真实 secret value. ✅ (穷举式扫描: 遍历全部读端点, 非 2xx 即断言失败)
-- `prop_no_real_api_key_in_any_json_response`: 同上, 不含真实 api_key. ✅ (同上, api_key 维度)
+- `prop_no_real_secret_in_any_json_response`: 任意 GET 响应 (含 ForwardRecord / EffectiveSnapshot / SessionSummary / ModelPreview 等) 不含真实 secret value. ✅ (穷举式扫描: 遍历全部读端点, 非 2xx 即断言失败; #358 起 needle 域含转义敏感字符 — `"` / `\` / 控制字符 — 且 raw + JSON 转义双形态匹配, 植入非 vacuous 由 redact 审计 by_secret 守卫)
+- `prop_no_real_api_key_in_any_json_response`: 同上, 不含真实 api_key. ✅ (同上, api_key 维度; needle 为混合转义敏感字符单值)
+- `prop_sec1_scan_covers_all_router_get_routes`: 扫描端点清单 ⊇ router 装配的实际 GET `/api/*` 路由 (机械对账, #358: axum 0.8 无路由遍历 API, 从 `web::router()` + `build_router` 装配源码 include_str! 编译期锁定提取; 新增 GET 端点未同步扫描清单即红). ✅
 
 ### SEC-2 RedactError 不携带 secret 明文
 

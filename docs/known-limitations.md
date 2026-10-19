@@ -130,6 +130,10 @@
 
 - **端点检测的已知盲区 (渐进补救, 不承诺全覆盖; UI-10/UI-11 非阻塞原则兜底 — 检测失败永不阻塞手动填写)**: ① origin 检测 (probe-origin, #332) 的存在性梯已覆盖无 models 端点的 Anthropic 兼容面 (MiMo 实证: anthropic 面 models 404 / POST 400 / 对照 404 → evidence=existence; 原 `/anthropic` 尾段启发式推荐随全景探测收敛删除 — 实证探测取代 URL 形状推断); ② auth-before-router 网关 (bigmodel 形状, 一切 `/api/**` 路径 401 先于路由) 存在性梯结构性无信号 — extra_faces 知识库 (前端 ENDPOINT_PRESETS) 是唯一覆盖面, 未入库厂商需手动添加; ③ wildcard/SPA 软-200 宿主 (2xx+HTML) 由对照探测 (严格 404) 与 shape 解析消解 → absent, 不误报; ④ Azure 风格自定义路径前缀 base (如 `.../openai/deployments/xx`) 仍无自动发现 — 手选 protocol + 端点行 URI 输入框手填任意前缀 (含 custom `/api/paas/v4` 类布局) 即可, 同协议透传不受影响; ⑤ "GET /v1/messages 作统一存在性信号" 的否决史 (405/401/404 混杂) 指的是 GET 单信号 — POST+对照探测 (#332 存在性梯) 已另行采纳并实证; ⑥ 检测无推荐的 Models 预览按钮 (endpoints 弹窗) 对无 models 端点的上游恒报 upstream 错误 — 属如实呈现, 非缺陷.
 
+## testing (测试基础设施)
+
+- **SEC-1 扫描对账依赖 `.route(` 声明式装配风格 (#358)**: 机械对账 (`prop_sec1_scan_covers_all_router_get_routes`) 从 `web::router()` + `build_router` 装配源码提取 GET `/api/*` 路由模板 (axum 0.8 无 Router 路由遍历 API, include_str! 编译期锁定源) — 循环/宏批量注册路由会绕过提取 (集合意外收缩而非误报); 活性断言 (基准路由必在提取集合) 令风格漂移显式红而非静默窄, 但新增路由若恰好只经非常规注册则对账不感知. 同域注记: SSE 端点 (`/api/events`) 扫描消费到流自然结束 (本 harness shutdown 即关; 事件仅携带变更计数无数据面, 数据以 /api/sync 为 SSOT 且后者在扫描清单).
+
 ## usage (用量统计)
 
 - **OpenAI 流式请求未开 `include_usage` 时无 token 统计** (usage-stats, USAGE-5): OpenAI 流式默认不回显 usage, 需客户端设 `stream_options.include_usage = true`; 网关不代为注入 (FWD-1 未授权). 此类请求在 Usage 页只计请求数 (`requests_without_usage` / `cost_coverage` 指标可见), 页面有提示文案. Gemini / Ollama (无 codec) 同样无 usage 回显提取 (P2 浅提取). 详见 `docs/design/usage-stats.md` §5.4.
