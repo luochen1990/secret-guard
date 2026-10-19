@@ -1592,6 +1592,27 @@ fn arb_anthropic_stop_reason() -> impl Strategy<Value = Value> {
 ///
 /// `replace_leaf` = 遍历 wire JSON 的所有字符串叶子, 做 `s.replace(real, mock)`.
 /// 与生产 redact 路径的 [`crate::redact::StringLeafOps`] 在 IR 字符串叶子上的替换等价.
+/// FWD-1 期望模型的叶子替换 (精确化, #356 子项4): 生产 redact 在 **IR** 字符串
+/// 叶子上做 raw 替换, 而 wire 上 tool `arguments` 这类**内嵌 JSON 字符串叶子**
+/// (值为 JSON 文本的字段) 里的 secret 以 serde 转义形态出现 — 浅层文本替换
+/// 找不到它 (real 含 `"`/`\`/控制字符时转义不对称), 但生产路径经 reader parse
+/// (arguments → IR `ToolUse.input` Value 树, `openai.rs::read_tool_call`) 后在
+/// 内层叶子 raw 命中, 替换更深也更安全. 期望模型与该语义对齐:
+/// 叶子值是合法 JSON object/array 时, 递归对其字符串叶子替换后以
+/// `serde_json::to_string` 重新序列化 (与 writer `input_to_string` 同型);
+/// 否则 (普通文本叶子 / scalar JSON 文本) 维持文本替换 — 与生产在 Value
+/// 叶子层的文本替换等价 (不二次递归: 生产对 Value 叶子也不 parse).
+fn fwd1_replace_leaf_text(s: &str, real: &str, mock: &str) -> String {
+    match serde_json::from_str::<Value>(s).ok() {
+        Some(v @ (Value::Object(_) | Value::Array(_))) => {
+            let mut v = v;
+            v.for_each_str_leaf_mut(&mut |leaf| *leaf = leaf.replace(real, mock));
+            serde_json::to_string(&v).unwrap_or_else(|_| s.to_string())
+        }
+        _ => s.replace(real, mock),
+    }
+}
+
 fn assert_fwd1_half_segment(
     reader: &dyn Reader,
     writer: &dyn Writer,
@@ -1604,10 +1625,12 @@ fn assert_fwd1_half_segment(
     let (map, _seed) = redact_ir(&mut ir, &secrets);
     let out = writer.write_request(&ir);
 
-    // 期望: wire_out 等于把原 wire 中所有 real secret 字符串叶子替换为对应的 mock.
+    // 期望: wire_out 等于把原 wire 中所有 real secret 字符串叶子替换为对应的 mock
+    // (内嵌 JSON 叶子经 [`fwd1_replace_leaf_text`] 结构化替换).
     let mock = map.mock_for(secret_value).expect("secret 应被 redact 命中");
     let mut expected = wire.clone();
-    expected.for_each_str_leaf_mut(&mut |s| *s = s.replace(secret_value, mock));
+    expected
+        .for_each_str_leaf_mut(&mut |s| *s = fwd1_replace_leaf_text(s, secret_value, mock));
 
     assert_eq!(
         normalize_json(&expected),
@@ -1634,6 +1657,24 @@ fn make_secret_entry(value: &str) -> SecretEntry {
     e
 }
 
+/// FWD-1 secret 轴的宽域生成器 (#356 子项4): 与 `redact::tests::arb_secret_for_c5`
+/// 四臂同语义 (测试生成器内联是本目录既有惯例, 见 fwd_cross_proto_property.rs
+/// "避免跨 mod 依赖" 注释 — 改臂时两处同步):
+/// 1. ASCII alphanumeric baseline;
+/// 2. ASCII 转义字符 (`"` / `\` / `\n` / `\t`) — wire 层 real/mock **转义不对称**
+///    场景 (serde_json Value 层注入 + 叶子级替换断言, 转义由序列化器正确处理);
+/// 3. CJK / emoji 混合 — 多字节 UTF-8;
+/// 4. 长 secret (60-200 chars).
+fn arb_secret_for_fwd1() -> BoxedStrategy<String> {
+    prop_oneof![
+        "[A-Za-z0-9]{4,64}",
+        "[A-Za-z0-9\"\\\\\n\t]{4,32}",
+        "[A-Za-z0-9\\x{4e00}-\\x{9fff}\\x{1f300}-\\x{1f6ff}]{4,32}",
+        "[A-Za-z0-9]{60,200}",
+    ]
+    .boxed()
+}
+
 /// FWD-1 生成器: OpenAI wire + 注入的 secret (跨字段出现).
 ///
 /// 契约 FWD-1 `prop_proptest_generator_covers_edge_cases` 要求覆盖:
@@ -1641,8 +1682,10 @@ fn make_secret_entry(value: &str) -> SecretEntry {
 /// - 多个并行 tool_call (≥2, 验证 9712c52 修复的 index 分配)
 ///
 /// 返回 (wire, secret_value). wire 中至少 1 处含 secret_value.
+/// secret 经 [`arb_secret_for_fwd1`] 宽域生成 (#356), 注入一律走 serde_json
+/// Value 层 (任意字符安全 — 含 `"`/`\` 的 secret 由序列化器转义).
 fn arb_openai_request_with_embedded_secret() -> impl Strategy<Value = (Value, String)> {
-    ("[a-z]{8,16}", arb_openai_request_value()).prop_map(|(secret, mut req)| {
+    (arb_secret_for_fwd1(), arb_openai_request_value()).prop_map(|(secret, mut req)| {
         let obj = req.as_object_mut().unwrap();
 
         // 1. system prompt 注入 (若存在 messages[0].role=system)
@@ -1672,15 +1715,16 @@ fn arb_openai_request_with_embedded_secret() -> impl Strategy<Value = (Value, St
             }
 
             // 3. assistant tool_calls: 注入合法 JSON secret 到 arguments
-            //    (OpenAI arguments 是 JSON 字符串, 必须保持合法; redact 扫描字符串叶子命中)
+            //    (OpenAI arguments 是 JSON 字符串, 必须保持合法; redact 扫描字符串
+            //    叶子命中). 经 serde_json 构造再 to_string — secret 含 `"`/`\` 时
+            //    手工拼 JSON 会产生非法 wire, 序列化器保证转义正确 (#356).
             for msg in arr.iter_mut() {
                 if let Some(Value::Array(tcs)) = msg.get_mut("tool_calls") {
                     for tc in tcs.iter_mut() {
                         if let Some(Value::String(args)) =
                             tc.get_mut("function").and_then(|f| f.get_mut("arguments"))
                         {
-                            // 构造合法 JSON: {"secret_field":"<secret>"}
-                            *args = format!(r#"{{"secret_field":"{secret}"}}"#);
+                            *args = json!({"secret_field": secret}).to_string();
                         }
                     }
                 }
@@ -1712,9 +1756,9 @@ fn arb_openai_request_with_embedded_secret() -> impl Strategy<Value = (Value, St
     })
 }
 
-/// FWD-1 生成器: Anthropic wire + 注入的 secret.
+/// FWD-1 生成器: Anthropic wire + 注入的 secret (secret 轴同 [`arb_secret_for_fwd1`], #356).
 fn arb_anthropic_request_with_embedded_secret() -> impl Strategy<Value = (Value, String)> {
-    ("[a-z]{8,16}", arb_anthropic_request_value()).prop_map(|(secret, mut req)| {
+    (arb_secret_for_fwd1(), arb_anthropic_request_value()).prop_map(|(secret, mut req)| {
         let obj = req.as_object_mut().unwrap();
 
         // 1. 顶层 system (Anthropic 风格)
