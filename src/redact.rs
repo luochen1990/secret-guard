@@ -3253,10 +3253,53 @@ mod tests {
         leaves
     }
 
+    /// needle 在 full 中的全部出现区间 (含重叠出现, 与 `find_safe_end` 同口径).
+    fn all_occurrences(full: &str, needle: &str) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        let mut start = 0usize;
+        while let Some(off) = full[start..].find(needle) {
+            let abs = start + off;
+            out.push((abs, abs + needle.len()));
+            start = abs + 1;
+        }
+        out
+    }
+
+    /// 两个 mock 的出现区间是否存在交叠 (含嵌套).
+    fn mock_occurrences_overlap(full: &str, a: &str, b: &str) -> bool {
+        let ra = all_occurrences(full, a);
+        let rb = all_occurrences(full, b);
+        ra.iter()
+            .any(|(s1, e1)| rb.iter().any(|(s2, e2)| s1 < e2 && s2 < e1))
+    }
+
+    /// mock 自身在 full 中是否存在**重叠出现** (同 mock 的两个不同出现共享字节,
+    /// eg 周期性 mock 在同字符 run 内 — 6a mock 在 8a run 里出现 3 次).
+    fn mock_self_overlaps(full: &str, m: &str) -> bool {
+        let r = all_occurrences(full, m);
+        r.iter().enumerate().any(|(i, (s1, e1))| {
+            r.iter()
+                .enumerate()
+                .any(|(j, (s2, e2))| i != j && s1 < e2 && s2 < e1)
+        })
+    }
+
+    /// mock 重叠形态生成器 (#356 子项3): 常态基线 + 高概率互为子串 / 周期性
+    /// 形态 — 后者在弱配置下真实可达 (charset 退化产周期性 mock; RED-4
+    /// 单射性只保证 mock 两两不同, 不排除子串关系).
+    fn arb_overlapping_mock() -> BoxedStrategy<String> {
+        prop_oneof![
+            "[a-z]{6,18}",  // 常态: 互不为子串的基线
+            "[ab]{3,10}",   // 2 字符池: 周期串, 高概率互为子串
+            "a{3,9}",       // 单字符周期: self-overlap 极端形态
+            "(ab){2,6}",    // 双字符周期串
+        ]
+        .boxed()
+    }
+
     /// 把 full 切成 chunk_size 字节片喂给 r, 返回 emit + flush 拼接结果.
     /// boundary_align=true 时把 chunk 末尾对齐到 char boundary (UTF-8 测试用).
-    fn push_chunked(
-        r: &mut StreamingRestorer,
+    fn push_chunked(        r: &mut StreamingRestorer,
         full: &str,
         chunk_size: usize,
         boundary_align: bool,
@@ -3716,7 +3759,10 @@ mod tests {
         }
 
         /// 守卫 RED-7: 多 mock 同段文本的 round-trip identity (per-block isolated).
-        /// 覆盖 mock self-overlap / nested mock 等边缘情况.
+        /// 固定常量形态 (互不为子串) 的确定性锚 — mock 重叠 / 互为子串 / 周期性
+        /// 形态由 [`prop_streaming_restorer_round_trip_overlapping_mocks`] 覆盖
+        /// (#356 子项3: 本测试的生成域 [a-z ] filler + 固定 mock 结构上无法生成
+        /// 重叠形态, 旧注释自称 "覆盖 self-overlap / nested mock" 超出实际域, 已修正).
         #[test]
         fn prop_streaming_restorer_round_trip_multi_mock(
             filler in "[a-z ]{0,30}",
@@ -3741,6 +3787,68 @@ mod tests {
             prop_assert_eq!(emitted, expected);
         }
 
+        /// 守卫 RED-7 (#356 子项3): **mock 重叠可达域**的 round-trip 等价 —
+        /// 互为子串 / 周期性 / self-overlap 形态 (弱配置下真实可达: charset 退化
+        /// 产周期性 mock; RED-4 单射性只保证 mock 两两不同, 不排除子串关系) 且
+        /// 两 mock 在文本中的出现**不交叠**时:
+        ///
+        ///   streaming 分块 restore 输出 == 长度倒序逐 mock 非重叠 replace 参考
+        ///
+        /// (参考独立手写; 修复前替换序随 HashMap 迭代序未定义, 互为子串的 mock
+        /// 输出不确定.) 修复后长度倒序预排序对使序唯一 — 参考与实现共享该良
+        /// 定义序, 断言钉住它.
+        ///
+        /// **交叠/自重叠出现域排除** (prop_assume): 两 mock 出现区间交叠 (含嵌套)
+        /// 或某 mock 自身重叠出现 (周期 mock 在同字符 run 内) 时,
+        /// `find_safe_end` 的 max(出现末尾, len-hold) 可把 safe_end 推过另一 mock
+        /// 的跨 chunk 前缀起点, 劈开的前缀流走后该 mock 永久 miss — 此类输入
+        /// **不可能由 redact 产生** (real 无此形态, 无 "redact 的逆" 语义可依),
+        /// streaming 的分段替换语义属实现定义行为, 不伪造等式 (诚实呈现 —
+        /// 该输入亦不可能由 redact 产生). 互不为子串域的既有 property
+        /// (`prop_streaming_restorer_round_trip_multi_mock`) 与本 property 的
+        /// 非交叠子域共同覆盖可良定义的全域.
+        #[test]
+        fn prop_streaming_restorer_round_trip_overlapping_mocks(
+            mock1 in arb_overlapping_mock(),
+            mock2 in arb_overlapping_mock(),
+            filler in prop_oneof!["[a-z ]{0,30}", "[a]{0,12}"],
+            chunk_size in 1usize..=50,
+        ) {
+            prop_assume!(mock1 != mock2);
+            let full = format!("{filler}{mock1}{filler}{mock2}{filler}");
+            prop_assume!(
+                !mock_occurrences_overlap(&full, &mock1, &mock2)
+                    && !mock_self_overlaps(&full, &mock1)
+                    && !mock_self_overlaps(&full, &mock2),
+                "交叠/自重叠出现域: 分段替换语义实现定义, 不在本 property 断言面"
+            );
+            let (real1, real2) = ("REALONE", "REALTWO");
+            let mut map = RedactionMap::default();
+            map.insert(real1.to_string(), mock1.clone(), "id-r1")
+                .unwrap();
+            map.insert(real2.to_string(), mock2.clone(), "id-r2")
+                .unwrap();
+
+            let mut r = StreamingRestorer::new(map);
+            let emitted = push_chunked(&mut r, &full, chunk_size, false);
+
+            // 参考语义 (独立手写, 非复用生产 replace_pairs_inplace): 按 mock
+            // 长度倒序, 同长度按字典序 (与生产 ordered_restore_pairs 的稳定序
+            // 对齐), 逐 mock 非重叠 replace.
+            let mut pairs = vec![(&mock1, real1), (&mock2, real2)];
+            pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(b.0)));
+            let mut expected = full.clone();
+            for (mock, real) in &pairs {
+                if expected.contains(mock.as_str()) {
+                    expected = expected.replace(mock.as_str(), real);
+                }
+            }
+            prop_assert_eq!(
+                emitted, expected,
+                "overlapping-mock round-trip 违反 (mock1={:?} mock2={:?} chunk={})",
+                mock1, mock2, chunk_size,
+            );
+        }
         /// 守卫 RED-3: redact_ir 幂等 (同一 IR+policy → 同一 RedactionMap, 确定性, contracts.md §2).
         /// property 版: 对任意 (prefix, suffix, secret) 组合,
         /// 同一 IR + 同一 policy 的两次 redact_ir 调用必须产出逐字段相等的
