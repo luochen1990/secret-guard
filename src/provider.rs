@@ -229,9 +229,10 @@ pub struct Endpoint {
     /// 候选序列现场推导 (`proxy::models::V1_COMMON_URIS`), 翻译侧用 base 尾段
     /// 启发式 (`effective_common_uri` 的兜底分支).
     ///
-    /// 知识来源: WebUI detect 探测 (`POST /api/providers/probe` 响应的
-    /// `common_uri`) 自动填充, 随表单保存落盘; 手写 toml 可显式声明. base_url
-    /// 变更后此值可能失配 — fetch 侧遇 404 回退候选序列兜底 (WARN), 不静默.
+    /// 知识来源: WebUI 检测台快速添加 (probe-origin faces 行的布局断言直填) /
+    /// URI 输入框手填 / 端点行 Verify ok 的转正回填 (启发式经证实固化), 随表单
+    /// 保存落盘; 手写 toml 可显式声明. base_url 变更后此值可能失配 — fetch 侧
+    /// 遇 404 回退候选序列兜底 (WARN), 不静默.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub common_uri: Option<String>,
 }

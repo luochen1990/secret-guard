@@ -104,10 +104,12 @@ POST   /api/providers/probe-origin   body: {origin, api_key?, extra_faces?[{uri,
                                           query/fragment 拒绝) → 400; origin 尾部已知面段
                                           剥离进 typed_face_stripped; ok 行端点知识映射:
                                           v1 族 (openai/responses) base_url=origin +
-                                          common_uri=面路径 ("/v1"|""|深面前缀), 其余族
-                                          base_url=origin+uri 且 common_uri=null; responses
-                                          行镜像 openai; 证据梯与对照探测见 proxy::origin
-                                          头注释)
+                                          common_uri=面路径 ("/v1"|""|深面前缀),
+                                          anthropic/ollama base_url=origin+uri 且
+                                          common_uri=null; gemini 的 /v1beta 是运行时
+                                          自拼版本段 (折叠进 models_path, base_url=origin);
+                                          responses 行镜像 openai; 证据梯与对照探测见
+                                          proxy::origin 头注释)
 PUT    /api/providers/probe          → 同 PUT /api/providers/{id}, 固定 id="probe"
 DELETE /api/providers/probe          → 同 DELETE /api/providers/{id}, 固定 id="probe"
                                           (静态段优先于 {id} 参数段, 该 id 的编辑/删除只能
@@ -173,14 +175,13 @@ GET    /api/privacy-scan/alerts     → {enabled, alerts[{value, pattern_id,
                                                    头部)
 ```
 
-> **探测假设 (best-effort 已知边界)**: 探测假设 base_url 是裸 origin/base (不带
-> 路径前缀), 探测端点 = `{base_url}/v1/models` 等。Azure 风格路径前缀 base
-> (如 `https://xx.openai.azure.com/openai`) 的探测 URL 会拼出不存在的端点,
-> 大概率全部 `absent` / 无 recommended — 属 best-effort 已知边界, 手选 protocol
-> 即可。**非阻塞原则 (UI-10)**: 检测失败/无推荐永不阻塞手动填写与保存, 失败
-> 呈现必须给肯定式逃生口 (检测是增强不是门槛); 已知盲区渐进补救 — `/anthropic`
-> 尾段 (Anthropic 兼容网关 de-facto 布局, 无 models 端点) 有启发式推荐兜底
-> (证据 > 形状推断, common_uri 恒 null), 其余盲区清单见
+> **探测假设 (best-effort 已知边界)**: 端点发现 (probe-origin) 假设用户输入
+> 是 origin (深路径 URL 会被归一化剥已知面尾段后整体作为探测基准), 面候选 =
+> origin + 各族面 URI。知识库未收录的面 (Azure 风格深前缀等) 不会出现在矩阵
+> — 属 best-effort 已知边界, 手动 "添加协议" 填 base_url + URI 即可
+> (extra_faces 知识库是渐进扩展面)。**非阻塞原则 (UI-10)**: 检测失败/未发现
+> 永不阻塞手动填写与保存, 失败呈现必须给肯定式逃生口 (检测是增强不是门槛);
+> 无 models 端点的面 (MiMo 类) 由存在性证据梯覆盖, 其余盲区清单见
 > `docs/known-limitations.md` routing 节。
 
 所有响应带 `Cache-Control: no-store`, 避免浏览器对自动刷新返回缓存内容.
@@ -367,7 +368,8 @@ API key CRUD **无条件挂载** (在 `web::router()`, 不依赖 `auth.enabled`)
   注记)。首行声明被探测 URL + `typed_face_stripped` 归一化提示 (快照
   `state.probeLastDetect` 的 url — 检测台改过也能对照)。ok 行右侧 **[添加]**
   一键物化端点行 (端点知识映射: v1 族 base_url=origin + common_uri=面路径直填
-  dataset; 其余族 base_url=origin+uri, cu 留空; verify ✓ 直填仅 evidence=models —
+  dataset; anthropic/ollama base_url=origin+uri, cu 留空; gemini /v1beta 折叠进
+  models_path (base_url=origin); verify ✓ 直填仅 evidence=models —
   模型清单证据即校验证据, auth/existence 不冒充); 已有同协议行 → [添加] 禁用
   "已添加" (`syncDetectResultAddStates` 全量重算, 刷新点 = 行增/删/协议变更/
   矩阵渲染/dialog 重开)。faces 的 `responses` wire 名经 `canonicalFaceProtocol`

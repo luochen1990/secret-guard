@@ -790,20 +790,20 @@ async fn send_bounded(builder: reqwest::RequestBuilder) -> Result<(StatusCode, V
 /// 条目缺 id/name 的元素跳过; 去重保序).
 ///
 /// 薄包装: parse + 委托 [`parse_model_ids_from_value`] (单次解析双消费的
-/// 拆层, 见 `judge_v1_pair`).
+/// 拆层, 消费方见 [`verify_endpoint_upstream`] 与 origin 面探测).
 pub(super) fn parse_model_ids(protocol: Protocol, body: &[u8]) -> Result<Vec<String>, String> {
     parse_model_ids_from_value(protocol, &parse_json_value(body)?)
 }
 
 /// parse 层 SSOT: `from_slice` + 统一错误串 ("invalid JSON: {e}").
-/// `parse_model_ids` 与 `judge_v1_pair` 共用 — 错误串是 wire 可见的
+/// `parse_model_ids` 与家族判别共用 — 错误串是 wire 可见的
 /// (`ProbeOutcome.detail`), 单一构造点防两侧漂移.
 pub(super) fn parse_json_value(body: &[u8]) -> Result<serde_json::Value, String> {
     serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {e}"))
 }
 
 /// [`parse_model_ids`] 的纯逻辑层 (body 已 parse 为 Value; 调用方若还需对同一
-/// body 做其它 Value 级判别 — 如 `judge_v1_pair` 的家族判别 — 应 parse 一次
+/// body 做其它 Value 级判别 — 如 [`classify_v1_family`] 的家族判别 — 应 parse 一次
 /// 共用同一棵 Value 树, 而非各自 `from_slice` 双解析).
 pub(super) fn parse_model_ids_from_value(
     protocol: Protocol,
@@ -1036,8 +1036,8 @@ pub(super) enum V1Family {
 /// 同一条目两者兼有时 `object` 优先 (判别字段是 OpenAI 家族更显式的指纹).
 /// 全部条目无判别字段 (含 data 空) → OpenAI (该端点的历史默认方言).
 ///
-/// 入参是调用方已 parse 的 Value 树 (与 `parse_model_ids_from_value` 共用单次解析,
-/// 见 `judge_v1_pair`); 缺 `data` 数组 / 非 array 形态 → OpenAI (ROB-*).
+/// 入参是调用方已 parse 的 Value 树 (与 `parse_model_ids_from_value` 共用单次解析);
+/// 缺 `data` 数组 / 非 array 形态 → OpenAI (ROB-*).
 ///
 /// 假设: 判别只看字段名存在性, 不看字段值.
 pub(super) fn classify_v1_family(value: &serde_json::Value) -> V1Family {
@@ -1156,13 +1156,13 @@ pub(crate) async fn verify_endpoint_upstream(
     }
 }
 
-/// 单 URL 的 v1 族判定, 报告到指定协议 (verify 路径 — [`judge_v1_pair`] 的
-/// 单协议单路形态; pair 版本刻意共享单次 parse, 两函数各自独立解析, 不互调).
+/// 单 URL 的 v1 族判定, 报告到指定协议 (verify 路径; 与 origin 面探测的
+/// models GET 判形同源 — 各自独立解析, 不互调).
 ///
 /// 家族匹配: `classify_v1_family` 判别响应 shape 所属家族, 与被验证协议的
 /// 期望家族 ([`expected_v1_family`]) 一致 → ok (携带 models); 不一致 →
-/// absent (detail 指明实际家族 — 用户选错协议时的可行动信号, 文案与 pair
-/// 版本冻结一致). 非 2xx / 解析失败的桶化同 `judge_v1_pair`.
+/// absent (detail 指明实际家族 — 用户选错协议时的可行动信号). 非 2xx /
+/// 解析失败的桶化同 [`status_probe_bucket`].
 fn judge_v1_family_as(
     protocol: Protocol,
     res: &Result<(StatusCode, Vec<u8>), String>,
@@ -1186,7 +1186,7 @@ fn judge_v1_family_as(
                     if family == expected_v1_family(protocol) {
                         ProbeOutcome::ok(name, models)
                     } else {
-                        // detail 文案与 pair 版本 (judge_v1_pair) 冻结一致.
+                        // detail 文案与 origin 面判形 (judge_models_get) 一致.
                         ProbeOutcome::non_ok(
                             name,
                             ProbeStatus::Absent,

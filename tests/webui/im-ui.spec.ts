@@ -3447,8 +3447,7 @@ test.describe("usage-stats (模型用量统计)", () => {
 // → sg 后端 GET {base_url}/v1/models 等三路 — 场景由 base_url (端口) 键控:
 // fast 端口 = openai shape 即答 (结果行 openai ✓ +/v1); slow 端口 = /v1/models
 // 延迟后 anthropic shape (epoch 对账用例的在途窗口); versioned 端口 = bare
-// /models 200 (common_uri "" 断言); dead 端口 = 恒 404 (全 absent + /anthropic
-// 尾段启发式).
+// /models 200 (common_uri "" 断言); dead 端口 = 恒 404 (全 absent).
 
 type ProbeUpstream = { url: string; close: () => Promise<void> };
 

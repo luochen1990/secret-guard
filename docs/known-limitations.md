@@ -4,7 +4,7 @@
 > 以 "协议支持矩阵 (正面) + Roadmap & 贡献 (机会框架)" 呈现同一事实 (`Protocol::codec_covered()`
 > 是代码侧谓词 SSOT). WebUI 新建 provider 表单的协议词表只引导 codec 覆盖族 (`webui_protocols`,
 > gemini/ollama 后端能力保留 — 存量编辑/探测推荐经前端 append "(experimental)" 选项).
-> 新增条目时同步评估: README 矩阵 / Roadmap 与 probe note (`PROBE_NOTE_*`) 是否需要联动.
+> 新增条目时同步评估: README 矩阵 / Roadmap 与探测呈现文案是否需要联动.
 >
 > 维护约定: 条目按领域小节归位 (小节名见各 `##`, 字母序); 节内条目单行书写, 追加至末尾.
 > 根 `AGENTS.md` "已知限制 (MVP)" 段是指向本文件的冻结锚点 — src 代码注释 / tests 中的

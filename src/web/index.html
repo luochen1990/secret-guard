@@ -801,7 +801,7 @@
     }
     #p-detect-results:empty { display: none; }
     /* 检测结果行 (#332): per 协议 — 状态 icon + 协议名 + 命中 URI + 摘要 +
-       快速 "添加". ok / 启发式推荐 行给添加入口; 已配置协议 → "已添加" 置灰
+       快速 "添加". ok 行给添加入口; 已配置协议 → "已添加" 置灰
        (syncDetectResultAddStates 对账). */
     .dr-row {
       display: grid;
@@ -812,7 +812,6 @@
     }
     .dr-status { text-align: center; font-weight: 700; }
     .dr-status.st-ok { color: var(--ok); }
-    .dr-status.st-warn { color: var(--warn); }
     .dr-status.st-err { color: var(--err); }
     .dr-status.st-none { color: var(--fg-faint); }
     .dr-proto { color: var(--fg); }
@@ -7187,6 +7186,10 @@
         sel.insertAdjacentHTML('beforeend', `<option value="${escapeHtml(value)}">${label}</option>`);
       }
       sel.value = value;
+      // 程序化改协议 (select.value 赋值不发 change) 后补对账: 检测结果行 [添加]
+      // 按钮的禁用态跟随已配置协议集合 (行未 attach 时本调用无害 — attach 处
+      // addEndpointRow 尾部还会再对账一次).
+      syncDetectResultAddStates();
     }
 
     // prefill (可选): privacy scan 告警的「登记」入口 (#257 S0.5) — 预填 value +
@@ -8166,7 +8169,7 @@
 
     // origin 建议 (知识库条目直出): 同 ≥3 字符 / 精确等于条目 origin 无列表 /
     // 子串匹配 label+origin / ≤8 条; 点选回填 origin (不碰 protocol/base_url —
-    // 面的取舍交给检测结果, 见 runOriginDiscovery).
+    // 面的取舍交给检测结果, 见 runStagingDetect).
     function originSuggestFor(value) {
       const q = normalizeOrigin(value);
       if (q.length < 3 || ENDPOINT_PRESETS.some(p => normalizeOrigin(p.origin) === q)) return [];
@@ -8656,6 +8659,11 @@
       if (pr.status === 'ok') {
         setVerifyState(row, 'ok', t('verify.ok', { n: (pr.models || []).length }));
         parts.push(`<div class="probe-line probe-line-ok">${escapeHtml(t('verify.ok', { n: (pr.models || []).length }))}</div>`);
+        // verify ok → cu 转正 (知识链): 后端 ok outcome 的 common_uri = 被验证
+        // 实际生效的 cu (显式值或尾段启发式) — 回填 dataset + 输入框, 启发式
+        // 经证实固化为 Endpoint.common_uri 落盘 (fetch fast path). 落地前已有
+        // 五条件对账, 此处不再校验.
+        if (pr.common_uri != null) setRowCommonUri(row, pr.common_uri);
         if ((pr.models || []).length) parts.push(modelsBlock(pr.models));
       } else {
         const detail = pr.detail || '';

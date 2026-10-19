@@ -9,10 +9,13 @@
 //! 只剥已知面尾段, 余下整体作为探测基准), 对每个协议族枚举**面候选**
 //! (face = origin + uri, 如 `/anthropic`), 并行探测所有候选, 输出固定 5 行
 //! 发现矩阵 (openai / anthropic / gemini / ollama / responses — responses 无
-//! 独立候选, 镜像 openai 行). ok 行携带快速添加所需的端点知识:
+//! 独立候选, 镜像 openai 行). ok 行携带快速添加所需的端点知识 (映射目标是
+//! 运行时三段式拼接逐字节一致 — 物化端点的 verify/fetch 必然复现被探测 URL):
 //! **v1 族** (openai/responses) 的面路径兼任 `common_uri` 布局断言
-//! (`""`/`"/v1"`/深面前缀), `base_url` = origin; **其余族** 面路径是 base 段
-//! (`base_url` = origin + uri, common_uri null). handler 薄壳在
+//! (`""`/`"/v1"`/深面前缀), `base_url` = origin; **anthropic/ollama** 面路径是
+//! base 段 (`base_url` = origin + uri, common_uri null); **gemini** 的
+//! `/v1beta` 是运行时自拼版本段, 折叠进 models_path (面恒 `""`,
+//! `base_url` = origin, common_uri null). handler 薄壳在
 //! `web/api/providers.rs` (origin 校验 + 归一化 + extra_faces 解析后调
 //! [`probe_origin_upstream`]).
 //!
@@ -63,7 +66,7 @@
 //!
 //! # tier3 POST 路径与面候选的版本语义
 //!
-//! openai/gemini 的默认候选 (`/v1`, `/v1beta`) **自带版本前缀** — chat 端点 =
+//! openai 的默认候选 (`/v1`) **自带版本前缀** — chat 端点 =
 //! `{face}/chat/completions` / `{face}/models:generateContent` (再拼 `/v1` 会双写;
 //! GLM 实测端点形态 `open.bigmodel.cn/api/coding/paas/v4` + `/chat/completions`
 //! 佐证); anthropic 面 (`/anthropic` 类站点前缀) 的 API 路径 `/v1/messages` 不在
@@ -312,13 +315,18 @@ impl Family {
         self.protocol().name()
     }
 
-    /// tier1 模型清单端点 (相对 face 拼接). openai 与 gemini 共用 `/models` 后缀
-    /// 但面候选不同 (`/v1` vs `/v1beta`); anthropic 的 API 路径含 `/v1`.
+    /// tier1 模型清单端点 (相对 face 拼接): openai 族 `/models` (面 `/v1` 兼任
+    /// common_uri 布局), anthropic `/v1/models` (API 路径自带 `/v1`).
+    /// gemini 的 `/v1beta` 是**运行时自拼版本段** (fetch/verify 恒
+    /// `GET {base}/v1beta/models`, `models.rs` 硬编码) — 折叠进 models_path
+    /// 而非面候选: 命中行的 base 座 = origin, 快速添加物化的端点与运行时
+    /// 拼接逐字节一致 (不折叠会物化出 `{origin}/v1beta` base → 运行时
+    /// 双 `/v1beta` 404).
     fn models_path(self) -> &'static str {
         match self {
             Family::OpenAI => "/models",
             Family::Anthropic => "/v1/models",
-            Family::Gemini => "/models",
+            Family::Gemini => "/v1beta/models",
             Family::Ollama => "/api/tags",
         }
     }
@@ -328,13 +336,14 @@ impl Family {
         match self {
             Family::OpenAI => &["/v1", ""],
             Family::Anthropic => &["/anthropic", ""],
-            Family::Gemini => &["/v1beta", ""],
+            Family::Gemini => &[""],
             Family::Ollama => &[""],
         }
     }
 
     /// tier3 存在性主探测 (POST 路径相对 face 拼接, 固定 probe body).
-    /// 版本语义见模块头部: openai/gemini 的面已含版本前缀, 不再拼 `/v1`.
+    /// 版本语义见模块头部: openai 的面已含版本前缀, 不再拼 `/v1`; gemini 的
+    /// `/v1beta` 同为运行时自拼版本段 (随 models_path 折叠, 不在面内).
     fn existence_post(self) -> (&'static str, &'static str) {
         match self {
             Family::OpenAI => ("/chat/completions", r#"{"model":"probe","messages":[]}"#),
@@ -342,7 +351,7 @@ impl Family {
                 "/v1/messages",
                 r#"{"model":"probe","max_tokens":1,"messages":[]}"#,
             ),
-            Family::Gemini => ("/models:generateContent", "{}"),
+            Family::Gemini => ("/v1beta/models:generateContent", "{}"),
             Family::Ollama => ("/api/chat", "{}"),
         }
     }
@@ -1000,12 +1009,26 @@ mod tests {
         let an = &resp.faces[1];
         assert_eq!(an.status, OriginFaceStatus::Ok);
         assert_eq!(an.uri.as_deref(), Some("/anthropic"));
+        assert_eq!(
+            an.base_url.as_deref(),
+            Some(format!("{}/anthropic", server.url()).as_str()),
+            "anthropic 面路径是 base 段 (运行时 base + /v1/messages 复现被探测面)"
+        );
         assert_eq!(an.common_uri, None);
         assert_eq!(an.models.as_ref().unwrap(), &strs(&["claude-3-5"]));
 
         let g = &resp.faces[2];
         assert_eq!(g.status, OriginFaceStatus::Ok);
-        assert_eq!(g.uri.as_deref(), Some("/v1beta"));
+        assert_eq!(
+            g.uri.as_deref(),
+            Some(""),
+            "gemini /v1beta 折叠进 models_path"
+        );
+        assert_eq!(
+            g.base_url.as_deref(),
+            Some(server.url().as_str()),
+            "gemini base 座 = origin (/v1beta 是运行时自拼版本段, fetch/verify 恒 GET {{base}}/v1beta/models — 物化端点与被探测 URL 逐字节一致)"
+        );
         assert_eq!(g.common_uri, None, "gemini 无 common_uri 概念");
         assert_eq!(g.models.as_ref().unwrap(), &strs(&["gem-1"]));
 
@@ -1076,6 +1099,81 @@ mod tests {
         assert!(rd.ends_with("与 OpenAI 共用 /v1, 探测无法区分"), "{rd}");
 
         an_never.assert_async().await;
+    }
+
+    // ─── ③b 融合不变式 (probe ✓ ⇒ verify ✓) ───────────────────────────
+
+    /// 回归钉 (验收 review major-1): 发现矩阵 ok 行物化的端点三元组, 经
+    /// `verify_endpoint_upstream` 必须**复现被探测 URL** (probe ✓ ⇒ verify ✓,
+    /// 同 URL 各 GET 一次 — mockito expect 2). gemini 的 `/v1beta` 曾是面候选
+    /// (base 座 = origin+/v1beta), 而 verify/fetch 恒自拼 `/v1beta` → 双版本段
+    /// 404; 折叠进 models_path 后 base 座 = origin. v1 族 (cu 布局断言) 与
+    /// anthropic (base 段) 同型断言各一条, 锁死三族分派不变式.
+    #[tokio::test]
+    async fn probe_origin_ok_rows_materialize_to_verify_consistent_endpoints() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        // 三族 ok: openai 裸根 (GET /models, cu "") / anthropic 面 (GET
+        // /anthropic/v1/models, base=origin+/anthropic) / gemini (GET
+        // /v1beta/models, base=origin). 每个端点被 probe 与 verify 各 GET 一次.
+        mget(&mut server, "/v1/models", 404, "", 1).await;
+        mget(&mut server, "/models", 200, r#"{"data":[{"id":"oa"}]}"#, 2).await;
+        mget(
+            &mut server,
+            "/anthropic/v1/models",
+            200,
+            r#"{"data":[{"id":"an","type":"model"}]}"#,
+            2,
+        )
+        .await;
+        mget(
+            &mut server,
+            "/v1beta/models",
+            200,
+            r#"{"models":[{"name":"gem"}]}"#,
+            2,
+        )
+        .await;
+        mget(&mut server, "/api/tags", 404, "", 1).await;
+        mpost(&mut server, "/v1/chat/completions", 404, 0).await;
+        mpost(&mut server, "/anthropic/v1/messages", 404, 0).await;
+        mpost(&mut server, "/v1beta/models:generateContent", 404, 0).await;
+
+        let resp = probe(&server, "", &[]).await;
+
+        let cases = [
+            (&resp.faces[0], Protocol::OpenAI, format!("{base}/models")),
+            (
+                &resp.faces[1],
+                Protocol::Anthropic,
+                format!("{base}/anthropic/v1/models"),
+            ),
+            (
+                &resp.faces[2],
+                Protocol::Gemini,
+                format!("{base}/v1beta/models"),
+            ),
+        ];
+        for (face, proto, probed_url) in cases {
+            assert_eq!(face.status, OriginFaceStatus::Ok, "{}", face.protocol);
+            let v = super::super::models::verify_endpoint_upstream(
+                &reqwest::Client::new(),
+                face.base_url.as_deref().unwrap_or_default(),
+                face.common_uri.as_deref(),
+                proto,
+                "",
+            )
+            .await;
+            let o = &v.probes[0];
+            assert_eq!(
+                o.status,
+                super::super::models::ProbeStatus::Ok,
+                "{}: verify 必须复现被探测 URL — urls {:?} vs probed {probed_url}",
+                face.protocol,
+                o.urls
+            );
+            assert_eq!(o.urls, vec![probed_url], "{}", face.protocol);
+        }
     }
 
     // ─── ④ wildcard 宿主 (主探测与对照同状态) ──────────────────────────
