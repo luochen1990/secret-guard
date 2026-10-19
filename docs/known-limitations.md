@@ -49,6 +49,7 @@
 ## dag (内容寻址存储)
 
 - **DAG 孤儿节点降级**: parent 被 LRU 淘汰后, child 的 `full_request_messages` 返回 None (timeline 降级展示, 不 panic), timeline 截断到存活轮次 (缺失祖先被 walk_chain 跳过). 显式孤儿标记 `NodeView::is_orphan` (CDAG-7, 读时纯派生: parent 有值但在 nodes 缺席) 的 wire 传播已接通 — 判定 SSOT = `DagInner::is_orphan_node`, ForwardRecord / TimelineRound 携带同名字段, WebUI 渲染 "上文已截断" 徽章 + 详情概览横幅 (见 contracts.md CDAG-7); RoundBrief (sidebar 三级) 有意不携带.
+- **在途祖先回收无年龄上限 (#364(d) 裁决: 超龄 TTL 不做)**: `recycle_superseded_raws` 对在途祖先 (response 未 finalize — `response==None` 或流式 placeholder) 恒跳过, 无 TTL/janitor — 永不 attach 的节点 raw 会滞留到 session LRU 淘汰. 不做超龄回收的理由: ① 合法长流式 (chunk 间隔未超 idle timeout 的思考流) 在途时长**无上界**, 任何固定 TTL 都会误伤其在途暂存 (违反 "在途暂存可看" 语义); ② InflightGuard (CDAG-9, #364) 已让 "永不 finalize" 的生产路径 (task/handler panic / 客户端断开) 收敛到终态, 在途滞留的上界 = 并发活跃请求数 (自然有界), 残余风险仅 guard Drop 双重失效的理论窗口. 行为钉子: `attach_latest_mode_never_attached_ancestor_keeps_raw_documented_limit` (`src/dag/mod.rs`).
 
 ## deploy (部署与安全面)
 
