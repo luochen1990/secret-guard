@@ -1,9 +1,16 @@
-# GitHub 镜像侧 coverage 发布 (Codecov 上传, README 徽章数据源) — 非门禁.
+# GitHub 镜像侧 coverage 发布 (Codecov 上传, README 徽章数据源) + master push 后验门禁.
 #
 # 职责边界 (与 forgejo P2 ci-periodic 的分工, 详见 docs/ci.md 双宿主验证分工):
-#   - forgejo P2 = coverage **门禁** (双阈值 coverage-gate, 防倒退)
-#   - 本 workflow = coverage **发布** (lcov → Codecov; README 徽章 + PR 覆盖率
-#     变化评论的数据源) — 失败不阻塞任何合入, 只影响徽章新鲜度.
+#   - forgejo P2 = coverage 门禁的编排 SSOT (双阈值 coverage-gate, nightly 防倒退兜底)
+#   - 本 workflow = ① coverage 发布 (lcov → Codecov; README 徽章 + PR 覆盖率
+#     变化评论的数据源); ② coverage 双阈值门禁 (#359 问题二) — 复用同一 SSOT recipe
+#     `just coverage-gate` (阈值数字单点维护在 justfile, 不双写).
+#
+# ② 的语义定位 (据实, 非合入门禁): 镜像只同步 master 分支 (feature 分支与 forgejo PR
+#   事件均不达 GitHub, 实测 git ls-remote 仅 master + tags), 故 `pull_request` 触发
+#   实际不生效 — 本门禁 = **master push 后验** (镜像同步节拍 + 本 CI 运行; 快于 P2
+#   nightly 24h 兜底的最快检出). 跌破门限的合入在 GitHub 侧显红 (绿勾门面受损),
+#   不阻塞 forgejo 合入 — 覆盖率防倒退按 rubric 归质量债 (P2), 见 docs/ci.md 去向表.
 #
 # 档位: 全量档 (oidc,consistency-check) — 例外于 "GitHub 侧默认档" 的双宿分工,
 #   rationale: 徽章与 forgejo 门禁 (coverage-gate) 测同一份插桩代码集, 单一口径;
@@ -51,6 +58,13 @@ jobs:
       # 全量档插桩测试 + lcov (SSOT recipe, 见 justfile coverage-lcov).
       - name: coverage (lcov, full tier)
         run: just coverage-lcov
+
+      # 覆盖率双阈值门禁 (#359 问题二): 复用 forgejo P2 同一 SSOT recipe (阈值单点在
+      # justfile). 复用上一 step 留在 target/llvm-cov-target/ 的 profdata 只做 report,
+      # 秒级. 语义 = master push 后验 (非合入门禁, 见文件头 "语义定位" 段). 放在
+      # codecov 上传**之前**: 上传 step 失败 (如缺 token 的 master push) 不得屏蔽门禁.
+      - name: coverage gate (double threshold, SSOT = forgejo P2 recipe)
+        run: just coverage-gate
 
       # 上传 Codecov (公开仓免费). CODECOV_TOKEN 是唯一人工前置 (codecov.io 启用
       # 本仓 + GitHub repo secret); 缺 token 时 master push 红 (显式暴露问题),

@@ -135,7 +135,8 @@ run。skip 仅 schedule 事件查询 + `workflow_file: ci-periodic.yml` 自指 �
 (同代码同结果, 同 SHA 跑一次即足; 失败无 success 记录 → 次晚自愈重试; dispatch 永不
 跳过且可选任意分支 = 高风险 PR 合入前全量回归逃生舱)。step: Guard acquire / Checkout /
 Cleanup key / skip-if-passed / **Quality gate (`just ci-periodic`)** = `just check
---coverage` (插桩测试, 测试集只跑这一次) + `just coverage-gate` (双阈值防倒退, 阻塞) /
+--coverage` (插桩测试, 测试集只跑这一次) + `just coverage-gate` (双阈值防倒退, 阻塞;
+判红附 top 未覆盖文件摘要, #359 (c)) /
 **Docs drift lint** (`just check-docs`, advisory — continue-on-error, #147 的防漂移
 lint 首个自动宿主 (#357): 文档 `.rs::symbol` 引用与 ci.md step 计数漂移预警, 非
 硬门禁; runner 无 rg 时 WARN 跳过) / **WebUI regression (Playwright)** (`just
@@ -288,7 +289,7 @@ failure, continue-on-error 救不了 — P0 超时会阻塞合并):
 |---|---|---|
 | forgejo P0 (ci-merge.yml) | 全量档 `oidc,consistency-check` | OIDC 登录链 + 视图正确性断言 + 全量测试, 一轮 codegen |
 | GitHub 镜像 (ci.yml) | 默认档 (无 OIDC) | feature gate 不破坏默认构建 (编译 + 全量测试; fail-fast 冒烟见 `tests/auth_feature_gate.rs`) |
-| GitHub 镜像 (coverage.yml) | 全量档 (口径例外, 见下注) | coverage **发布** (lcov → Codecov; README 徽章 + PR 覆盖率评论数据源), 非门禁 |
+| GitHub 镜像 (coverage.yml) | 全量档 (口径例外, 见下注) | coverage **发布** (lcov → Codecov; README 徽章 + PR 覆盖率评论数据源) + **master push 后验门禁** (复用同一 `just coverage-gate` SSOT recipe, #359 — 镜像只见 master 分支, 据实定位为后验非合入门禁) |
 | 发布归档 (release.yml → nix/release.nix) | 默认档 (与 overlay package 默认 `buildFeatures = []` 同档) | 发布二进制与 GitHub CI 同档; NixOS module 部署形态才 override 开 oidc |
 
 分工动机: 单宿主跑双档 = feature 档位翻转触发重复 codegen (实测 P0 ~20min, 其中
@@ -307,6 +308,13 @@ SSOT (合入阻塞), GitHub 是绿勾门面 — 默认档红会阻塞 GitHub 侧
 > 的插桩代码集随之扩大 (consistency 断言的 panic/失败分支新增少量未覆盖行)。
 > coverage-gate 阈值若在下次 nightly 出现小幅波动, 第一排查点是此处基线漂移,
 > 而非真实的测试删减。
+
+> coverage 门禁双宿主时序 (P2 nightly ↔ GitHub 后验, #359 问题二): 跌破双阈值的
+> PR 在 forgejo 侧不卡合入 (rubric: 覆盖率防倒退 = 质量债, 见 "旧 ci.yml step →
+> v3.0 去向表"); 检出链路两条 — GitHub coverage.yml 的 master push 后验 (镜像同步
+> 节拍 + CI 运行, 实测镜像同步有滞后但量级仍远快于 nightly) + forgejo P2 nightly
+> (per-SHA 去重, 最迟 24h, 判红附 top 未覆盖文件摘要)。前者管 "合入后最快显形",
+> 后者管 "无遗漏兜底 + 定位信息"。
 
 ## commit status context (workflow name / job_id 禁改)
 

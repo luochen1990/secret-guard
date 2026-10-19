@@ -402,10 +402,30 @@ coverage:
 # 覆盖率门禁 (CI 用): 双阈值, 任一不满足则非零退出.
 # 前置: check --coverage 已产出 profdata 到 target/llvm-cov-target/. 本 recipe 只做 report.
 # 阈值语义见上方 COVERAGE_MIN_LINES / COVERAGE_MAX_UNCOVERED 注释.
+# 判红时附 top 未覆盖文件摘要 (#359 (c), 降还债定位成本): 全量 report 逐文件行按
+# Lines-Miss 降序取前 15 — 纯诊断 best-effort (report 解析失败不影响判红退出码).
 coverage-gate:
+    #!/usr/bin/env bash
+    set -uo pipefail
     cargo llvm-cov report --summary-only \
       --fail-under-lines {{ COVERAGE_MIN_LINES }} \
       --fail-uncovered-lines {{ COVERAGE_MAX_UNCOVERED }}
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        echo "coverage-gate: ✓ lines ≥ {{ COVERAGE_MIN_LINES }}% 且 uncovered ≤ {{ COVERAGE_MAX_UNCOVERED }}."
+        exit 0
+    fi
+    echo "" >&2
+    echo "coverage-gate: ✗ 双阈值未达标 — top 未覆盖文件 (Lines-Miss 降序):" >&2
+    # 表格 report 的列布局随 cargo-llvm-cov 版本漂移 (多词表头 ≠ 数据列), 改用
+    # --json 的 summary.lines (llvm-cov export schema, 跨版本稳定) + jq 计算 per-file
+    # miss = count - covered; 路径去 PWD 前缀缩日志噪音. 纯诊断 best-effort: json/jq
+    # 失败由 || true 吸收, 不影响下方判红退出码.
+    cargo llvm-cov report --json 2>/dev/null \
+      | jq -r --arg pwd "$PWD" \
+        '.data[0].files[] | [(.summary.lines.count - .summary.lines.covered), (.filename | sub("^" + $pwd + "/"; ""))] | select(.[0] > 0) | "\(.[0])\t\(.[1])"' \
+      | sort -rn | head -15 | awk -F'\t' '{printf "%6d  %s\n", $1, $2}' >&2 || true
+    exit "$rc"
 
 # HTML 报告 (浏览器打开 coverage/html/index.html). 全量档 (同 coverage).
 coverage-html:
