@@ -105,7 +105,7 @@
 | `SEC-*` | 跨 | 新增 | GET 不泄漏 / panic 不泄漏 / headers 脱敏 / 本地监听 / Host·Origin 校验 (SEC-7, 防 DNS rebinding) / 敏感落盘 owner-only (SEC-8) / API nosniff (SEC-9) / 降级偏安全 (SEC-10) / SG 自有凭证自动保护 (SEC-11) |
 | `STR-*` | A | codec INV-4 + 新增 | 流式 SSE 边界 + 累积 + 错误降级 + reader 多 tool_call 索引 |
 | `UI-*` | C | **I1-I3** + 新增 | 气泡数 / sidebar 条目数 / DOM 顺序 / reconciliation / drawer / Detect 非阻塞 |
-| `USAGE-*` | B | 新增 (usage-stats) | 回显保真 + 聚合一致性 + 成本纯函数 + 缺失显式 + 计入判据 + model SEC 扫描 |
+| `USAGE-*` | B | 新增 (usage-stats) | 回显保真 + 聚合一致性 + 成本纯函数 + 缺失显式 + 计入判据 + model SEC 扫描 + shutdown 尾批落库 |
 | `VIEW-*` | 跨 | 视图正确性机制 | 先断言后删除 + 派生字段 consistency-check 覆盖 |
 
 **核心纪律** (详见 `docs/design/contracts.md` §0.3 Property 设计原则 + §0.4 冗余覆盖原则 + §0.5 漂移处理流程):

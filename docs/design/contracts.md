@@ -1541,6 +1541,14 @@ chars (char boundary 安全); 其余事件字段为受控类型, 天然无 secre
 - `prop_usage_hit_locations_classification`: 位置分类 (system/tools/user/history/other) 与 contains_user_text 联动; 分类总和 == 替换前 needle 总出现数. 🔁→`hit_locations_classifies_system_tools_user_history_other` + `hit_locations_matches_actual_replacement_total` (`src/redact.rs`)
 - `prop_usage_redact_governance_e2e`: 端到端: secret 在 user message → summary.redactions 的 categories.user 计数 + node 非空 + mock 不泄漏. 🔁→`usage_stats_redact_audit_and_retry_round_recorded` (`tests/integration.rs`)
 
+### USAGE-8 graceful shutdown 尾批落库屏障 (#365, 2026-10-20)
+
+**陈述**: graceful shutdown drain 完成后 (FWD-8 — 在途请求的 usage / redact 事件已全部 record 进 writer channel), serve 返回前经 `UsageStore::flush` Flush 屏障等待 writer 线程把队列残余全部落库 — **进程退出不丢尾部 usage / redact 审计事件** (修复前: detached writer 线程与进程退出竞态, 尾批可丢 — 窗口窄但真实)。屏障有界 (5s) 且 best-effort: 超时 / writer 已退出 → WARN 后照常退出 (usage 是增强功能, 不阻塞关停)。无 writer 形态 (`:memory:` / spawn 失败同步直写降级) 屏障平凡满足。writer 线程 channel 关闭时的 drain 残余 (`writer_loop` Err 分支) 是防御纵深, 非主屏障。
+
+**Properties**:
+- `prop_shutdown_flushes_tail_usage_batch`: 慢上游在途请求 + SIGTERM → 客户端收到响应 (usage 事件**此刻才 record**, 即 SIGTERM 之后) → 进程 exit 0 后 SQLite `usage_events` 含该请求行 (尾批未丢) + drain 屏障日志存在 (接线证据 — "落库 vs 退出" 竞态窄, DB 断言单独可能偶绿, 日志断言对接线缺失确定性红灯)。🔁→`sigterm_flushes_tail_usage_events_before_exit` (`tests/shutdown_drain.rs`)
+- `prop_flush_ack_after_batch_persisted`: Flush 命令在批次落库后 ack (屏障语义本体, WAL 侧车收紧先于 ack — `wal_sidecars_tightened_after_first_write` 经 ack 屏障断言 flush 返回时落库已发生, 间接锁定). 🔁→`wal_sidecars_tightened_after_first_write` (`src/usage/store.rs`)
+
 ---
 
 ## 12. POOL: 套餐池 failover (Pool Provider)

@@ -198,3 +198,55 @@ async fn sigterm_drains_inflight_request_to_completion() {
     let _ = std::fs::remove_dir_all(&sg_dir);
 }
 
+/// USAGE-8: usage 事件在响应完成时才 record (即 SIGTERM **之后** 才进 writer
+/// channel) — 进程退出前经 Flush 屏障落库, SQLite 不丢该尾批事件.
+///
+/// 断言两层: ① DB 行存在 (端到端效果: SIGTERM 后才 record 的事件已落库);
+/// ② 日志含 drain 屏障行 (接线证据 — 无接线时 "落库 vs 退出" 是窄竞态, ①
+/// 单独可能偶绿, ② 对接线缺失确定性红灯).
+#[tokio::test]
+async fn sigterm_flushes_tail_usage_events_before_exit() {
+    let upstream = spawn_slow_upstream(Duration::from_secs(2)).await;
+    let mut sg = spawn_secret_guard(&upstream).await;
+
+    let inflight = sg.start_inflight_request();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    sg.sigterm();
+
+    let resp = inflight
+        .await
+        .expect("task join")
+        .expect("inflight request must complete during drain");
+    assert_eq!(resp.status().as_u16(), 200);
+    let _ = resp.text().await;
+
+    let sg_dir = sg.dir.clone();
+    let (ok, logs) = sg.wait_exit(15).await;
+    assert!(ok, "secret-guard should exit 0; logs:\n{logs}");
+    assert!(
+        logs.contains("usage store drained at shutdown"),
+        "USAGE-8 flush barrier not wired into shutdown; logs:\n{logs}"
+    );
+
+    // 进程已退出: SQLite 文件可安全打开 (WAL recover, tempdir 可写).
+    let db = sg_dir.join("usage.sqlite3");
+    let conn = rusqlite::Connection::open(&db)
+        .unwrap_or_else(|e| panic!("open usage db {}: {e} (was it created?)", db.display()));
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM usage_events", [], |r| r.get(0))
+        .unwrap_or_else(|e| panic!("count usage_events failed: {e}; logs:\n{logs}"));
+    assert!(
+        n >= 1,
+        "usage_events empty after shutdown — tail batch lost (USAGE-8); logs:\n{logs}"
+    );
+    let (provider, model): (String, String) = conn
+        .query_row(
+            "SELECT provider, model FROM usage_events LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("row exists (count asserted above)");
+    assert_eq!(provider, "up");
+    assert_eq!(model, "test-model");
+    let _ = std::fs::remove_dir_all(&sg_dir);
+}

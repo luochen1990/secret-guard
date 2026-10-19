@@ -10,6 +10,8 @@
 //! - **热路径零同步 IO**: `record` / `record_redact` 经 std mpsc 交给独立 writer
 //!   线程, 批量事务 insert (非阻塞 drain 攒批, channel 排空即 flush — 无定时
 //!   驻留窗口, 上限 64 条/批; 设计 §4, 不在 tokio worker 上做 DB IO).
+//!   graceful shutdown 在 serve 返回前经 `flush()` 屏障等尾批落库 (USAGE-8),
+//!   进程退出不丢尾部事件 (有界 5s, best-effort).
 //! - **无内存聚合双份簿记**: summary 查询直接 SQL `GROUP BY` (读连接与写连接
 //!   共享同一 `Arc<Mutex<Connection>>`, 单文件单连接 — WAL 下读写交错由 Mutex
 //!   串行化, WebUI 5s 节流轮询的频率下无竞争压力). 这是相对 JSONL 版的**架构
@@ -129,8 +131,9 @@ pub struct RedactRecentRow {
 enum Command {
     Usage(UsageEvent),
     Redact(RedactEvent),
-    /// 同步屏障: 处理完此前所有命令后 ack (`flush_for_test` / 未来 graceful
-    /// shutdown 复用; 生产热路径不使用).
+    /// 同步屏障: 处理完此前所有命令后 ack (生产消费方 = graceful shutdown
+    /// 尾批落库, server.rs::serve, USAGE-8; 测试消费方 = 断言前等待;
+    /// record 热路径不使用).
     Flush(Sender<()>),
 }
 
@@ -276,13 +279,23 @@ impl UsageStore {
         }
     }
 
-    /// 同步屏障: writer 线程处理完此前所有命令后返回 (测试断言用).
-    pub fn flush_for_test(&self) {
-        if let Some(tx) = &self.writer {
-            let (ack_tx, ack_rx) = std::sync::mpsc::channel();
-            if tx.send(Command::Flush(ack_tx)).is_ok() {
-                let _ = ack_rx.recv_timeout(Duration::from_secs(5));
-            }
+    /// 同步屏障: writer 线程处理完此前所有命令并落库后返回 (USAGE-8).
+    ///
+    /// 生产消费方 = graceful shutdown 尾批落库 (server.rs::serve drain 完成后);
+    /// 测试消费方 = 断言前等待。返回 false = 屏障未通过 (writer 已退出或 5s
+    /// 超时); 无 writer (in_memory / spawn 失败降级) 时事件本就同步直写,
+    /// 屏障平凡满足, 返回 true.
+    pub fn flush(&self) -> bool {
+        let Some(tx) = &self.writer else {
+            return true;
+        };
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        if tx.send(Command::Flush(ack_tx)).is_ok() {
+            ack_rx.recv_timeout(Duration::from_secs(5)).is_ok()
+        } else {
+            // writer 线程已退出 (仅 drop 场景); dropped 计数已在 dispatch 侧
+            // 处理, 这里如实报告屏障未通过.
+            false
         }
     }
 
@@ -736,6 +749,10 @@ impl Batch {
 
 /// writer 线程主体: recv 阻塞等首条 → 非阻塞 drain 攒批 (上限 BATCH_MAX, Flush
 /// 屏障立即收尾) → 单事务 insert; Flush 命令在批次落库后 ack.
+///
+/// 退出路径 (channel 关闭 = 全部 Sender drop): drain 队列内残余尽力而为 — 这是
+/// 防御纵深而非主屏障; 正常关停的主屏障 = server.rs::serve 返回前的 `flush()`
+/// (USAGE-8, 进程退出前确定性等 writer 落库), 到达这里时队列通常已空.
 fn writer_loop(
     conn: Arc<Mutex<Connection>>,
     rx: Receiver<Command>,
@@ -772,7 +789,7 @@ fn writer_loop(
         }
         let (expected, ok) = batch.write(&mut conn.lock());
         // SEC-8: 侧车在首个写事务才创建 — 落库后收紧, 且必须先于 Flush ack
-        // (flush_for_test 借 ack 屏障断言权限, 无竞态窗口).
+        // (flush 借 ack 屏障断言权限, 无竞态窗口).
         if expected > 0 {
             tighten_wal_sidecars(&db_path);
         }
@@ -948,7 +965,7 @@ mod tests {
         let path = tmp_db("perm-wal");
         let s = UsageStore::open(&cfg(90), &path);
         s.record(ev(0, "p1", Some("m1"), quanta(1, 1)));
-        s.flush_for_test();
+        s.flush();
         for suffix in ["-wal", "-shm"] {
             let mut p = path.as_os_str().to_os_string();
             p.push(suffix);
@@ -967,7 +984,7 @@ mod tests {
         let s = UsageStore::open(&cfg(90), &path);
         s.record(ev(0, "p1", Some("m1"), quanta(100, 50)));
         s.record(ev(0, "p1", Some("m1"), None));
-        s.flush_for_test();
+        s.flush();
         drop(s); // 进程退出等价: writer 线程随 channel 关闭退出.
         // 重开: 聚合应从 SQLite 恢复 (SQL 直查, 无重放概念 — 明细即真相).
         let s2 = UsageStore::open(&cfg(90), &path);
@@ -992,7 +1009,7 @@ mod tests {
         // DELETE FROM redact_events 分支; 白盒 COUNT 验证, 公共查询 API 只做聚合).
         s.record_redact(redact_ev(48, "sid-old")); // 48h 前 → 过期
         s.record_redact(redact_ev(1, "sid-new")); // 1h 前 → 保留
-        s.flush_for_test();
+        s.flush();
         drop(s);
         let s2 = UsageStore::open(&cfg(1), &path);
         assert_eq!(s2.total_events(), 1, "expired row must be deleted");

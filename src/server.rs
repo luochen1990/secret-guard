@@ -40,6 +40,8 @@
 //! 默认监听 SIGTERM / Ctrl-C, axum 进入 graceful shutdown 期间不再接受新连接,
 //! 已建立的连接会等到完成或超时. 信号到达时先置 shutdown flag (watch channel,
 //! 见 [`serve`] 装配) 唤醒 `/api/events` 等无限长流, 否则它们会让 drain 挂起.
+//! drain 完成后 serve 返回前, 对 usage store 做 Flush 屏障 (writer 线程尾批
+//! 落库, USAGE-8 — 契约 FWD-8 / USAGE-8 见 docs/design/contracts.md).
 //!
 //! # Socket activation (可选, #242 建议②)
 //! systemd 环境传入 `LISTEN_FDS` 时, [`serve`] 从 fd 3 接管 systemd 持有的
@@ -490,6 +492,13 @@ pub async fn serve(
         }
     };
 
+    // usage store 先独立构造 (USAGE-8): AppState 持 clone, 本函数在 drain 完成后
+    // 持原 handle 做 Flush 屏障 (writer 线程尾批落库), 防 AppState 随 router
+    // move 进 axum::serve 后失去访问点.
+    let usage_store = Arc::new(crate::usage::UsageStore::open(
+        &usage_config,
+        &state_dir_artifact(&state_path, "usage.sqlite3"),
+    ));
     let proxy = AppState {
         upstream,
         providers: provider_table,
@@ -504,10 +513,7 @@ pub async fn serve(
         redacted_headers: crate::state::normalize_redacted_headers(&redacted_headers),
         upstream_timeouts,
         model_lists: Arc::new(crate::proxy::ModelListCache::new()),
-        usage: Arc::new(crate::usage::UsageStore::open(
-            &usage_config,
-            &state_dir_artifact(&state_path, "usage.sqlite3"),
-        )),
+        usage: usage_store.clone(),
         pricing: Arc::new(crate::usage::PricingCache::new(
             usage_config.pricing_url.clone(),
             std::time::Duration::from_secs(usage_config.pricing_refresh_secs.max(60)),
@@ -652,6 +658,18 @@ pub async fn serve(
         })
         .await
         .context("axum serve failed")?;
+    // USAGE-8 尾批落库屏障: 到这里 drain 已完成 — 在途请求的 usage/redact 事件
+    // 已全部 record 进 writer channel, Flush 屏障保证 writer 落库后才返回; 否则
+    // 进程退出与 detached writer 线程竞态, 尾批可丢 (窗口窄但真实). 屏障有界
+    // (5s, 见 UsageStore::flush) 且 best-effort: 失败/超时 WARN 后照常退出 —
+    // usage 是增强功能, 不阻塞关停. spawn_blocking: flush 内部是阻塞 recv.
+    match tokio::task::spawn_blocking(move || usage_store.flush()).await {
+        Ok(true) => info!("usage store drained at shutdown"),
+        Ok(false) => tracing::warn!(
+            "usage store flush barrier not passed at shutdown (writer exited or timeout); tail events may be lost"
+        ),
+        Err(e) => tracing::warn!(error = %e, "usage store flush task failed at shutdown"),
+    }
     Ok(())
 }
 

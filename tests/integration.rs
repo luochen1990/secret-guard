@@ -14225,7 +14225,7 @@ async fn usage_stats_redact_audit_and_retry_round_recorded() {
         assert!(r.status().is_success());
         let _ = r.json::<serde_json::Value>().await;
     }
-    store.flush_for_test();
+    store.flush();
 
     let s = poll_usage_summary(&client, &base, |s| {
         s["totals"]["requests"].as_u64() == Some(2)
@@ -14354,7 +14354,7 @@ async fn usage_stats_end_to_end_records_replayed_and_served() {
 
     // 6. SQLite 持久化: flush 屏障 (writer 线程批量落库) 后, 重开同一路径的
     //    store, 明细行应恢复 (USAGE-1 持久一致性 — SQL 直查, 明细即真相).
-    store.flush_for_test();
+    store.flush();
     let store2 = secret_guard::usage::UsageStore::open(
         &secret_guard::config::UsageConfig {
             enabled: true,
