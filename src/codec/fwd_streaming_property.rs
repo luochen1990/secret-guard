@@ -381,10 +381,14 @@ fn assert_streaming_restore_fidelity(
     let client_usage = collect_usage_output_tokens(client);
 
     // 1. no mock leak (安全核心): 客户端字节中不含 mock.
+    // 双形态扫描 (#356 子项9): mock 含 `"`/`\` 时其在 wire 上以 JSON 转义形态
+    // (`\"` / `\\`) 出现 — 只扫 raw 会对转义形态假阴性 (弱化不误报, 补扫把
+    // 断言强度找齐; 修复前该断言正是靠转义形态抓到 InputJson 路径的 mock 逃逸).
     let client_str = String::from_utf8_lossy(client);
+    let mock_wire_escaped = crate::redact::json_wire_escaped(mock);
     prop_assert!(
-        !client_str.contains(mock),
-        "FWD-1 流式 no-mock-leak 违反: 客户端 SSE 含 mock={:?}\nclient={:?}",
+        !client_str.contains(mock) && !client_str.contains(mock_wire_escaped.as_str()),
+        "FWD-1 流式 no-mock-leak 违反: 客户端 SSE 含 mock={:?} (raw 或转义形态)\nclient={:?}",
         mock,
         client_str,
     );
@@ -399,8 +403,13 @@ fn assert_streaming_restore_fidelity(
         real,
     );
 
-    // 3. tool input fidelity: 客户端 input_json == 上游 input_json.replace(mock, real).
-    let expected_json = upstream_json.replace(mock, real);
+    // 3. tool input fidelity: 客户端 input_json == 上游 input_json 的转义形态替换.
+    // input_json 是**内嵌 JSON 文本** — mock/real 在其中以 JSON 转义形态出现
+    // (#356 子项9): mock 无特殊字符时转义形态 == raw, 与旧模型一致.
+    let expected_json = upstream_json.replace(
+        crate::redact::json_wire_escaped(mock).as_str(),
+        &crate::redact::json_wire_escaped(real),
+    );
     prop_assert_eq!(
         client_json,
         expected_json,
@@ -672,7 +681,7 @@ fn assert_responses_usage_presence_fidelity(
 /// - [DONE] 终止符
 fn arb_openai_sse_stream_with_mock() -> impl Strategy<Value = (Vec<u8>, String, String)> {
     (
-        "[a-z]{4,12}",       // mock 的非空主体
+        arb_mock_body(),     // mock 的非空主体 (含转义字符臂, #356 子项9)
         "[a-z]{4,12}",       // text content 前缀
         "[a-z]{3,8}",        // tool name
         "[a-z]{3,8}",        // tool_call id 主体
@@ -681,7 +690,8 @@ fn arb_openai_sse_stream_with_mock() -> impl Strategy<Value = (Vec<u8>, String, 
         any::<bool>(),       // 是否有 reasoning 阶段 (#176)
     )
         .prop_map(|(mock_body, text_prefix, tool_name, tc_id_body, has_usage, has_text, has_reasoning)| {
-            // mock 与 real 都不含 SSE / JSON 特殊字符, 避免 JSON 转义干扰.
+            // mock 主体经 arb_mock_body (可含 `"`/`\`, #356 子项9) — 帧构造
+            // 走 Value 层, restore 在 parse 后叶子, 转义由各层正确处理.
             let mock = format!("MOCK{mock_body}");
             let real = format!("sk-real-{mock_body}");
             let tc_id = format!("call_{tc_id_body}");
@@ -737,7 +747,7 @@ fn arb_openai_sse_stream_with_mock() -> impl Strategy<Value = (Vec<u8>, String, 
 
             // 帧 4: tool_call arguments delta (partial JSON, 含 mock).
             // OpenAI arguments 是 JSON 字符串, mock 注入到合法 JSON 的 string value.
-            let partial = format!(r#"{{"secret":"{mock}","x":1}}"#);
+            let partial = mock_partial_json(&mock);
             frames.push(openai_chunk_frame(&json!({
                 "id":"chatcmpl-x","object":"chat.completion.chunk","created":1700000000,
                 "model":"gpt-4o",
@@ -781,7 +791,7 @@ fn arb_openai_sse_stream_with_mock() -> impl Strategy<Value = (Vec<u8>, String, 
 /// Responses ingress 终止事件写对象; 缺席 → 写 null (诚实呈现, 2026-09-23).
 fn arb_anthropic_sse_stream_with_mock() -> impl Strategy<Value = (Vec<u8>, String, String)> {
     (
-        "[a-z]{4,12}",          // mock 的非空主体
+        arb_mock_body(),        // mock 的非空主体 (含转义字符臂, #356 子项9)
         "[a-z]{4,12}",          // text content
         "[a-z]{3,8}",           // tool name
         "toolu_[a-z0-9]{5,10}", // tool_use id
@@ -852,7 +862,7 @@ fn arb_anthropic_sse_stream_with_mock() -> impl Strategy<Value = (Vec<u8>, Strin
                 ));
 
                 // input_json_delta (含 mock, partial JSON).
-                let partial = format!(r#"{{"secret":"{mock}","x":1}}"#);
+                let partial = mock_partial_json(&mock);
                 frames.push(anthropic_frame(
                     "content_block_delta",
                     &json!({
@@ -904,6 +914,25 @@ fn anthropic_frame(event_type: &str, data: &Value) -> String {
     format!("event: {event_type}\ndata: {data}\n\n")
 }
 
+/// mock 主体轴 (#356 子项9): 常规臂 + **转义字符臂** (含 `"` / `\`) —
+/// "mock 字节跨 chunk 边界被转义序列劈开" 的最险形态此前被三协议生成器
+/// 结构性排除. 帧构造走 serde_json Value 层, 序列化器保证转义正确;
+/// restore 发生在 parse 后的 IR 叶子 (unescaped), fidelity 断言在 parse 层
+/// 比较不受转义干扰, no-mock-leak 的字节级扫描补转义形态 (见
+/// `assert_streaming_restore_fidelity`).
+fn arb_mock_body() -> impl Strategy<Value = String> {
+    prop_oneof![
+        "[a-z]{4,12}",
+        "[a-z\"\\\\]{4,12}",
+    ]
+}
+
+/// tool 参数片段 (partial JSON, 含 mock): `{"secret":"<mock>","x":1}` 经
+/// serde_json 构造 — mock 含 `"`/`\` (转义臂) 时手工拼接会产生非法 JSON.
+fn mock_partial_json(mock: &str) -> String {
+    json!({"secret": mock, "x": 1}).to_string()
+}
+
 // ─── 生成器: 含 mock 的 Responses SSE 流 (T5) ───────────────────────────────
 //
 // 形态对齐官方 Responses 流式文档 + responses/stream.rs tests 的 official_*_frames fixture
@@ -938,7 +967,7 @@ fn anthropic_frame(event_type: &str, data: &Value) -> String {
 fn arb_responses_sse_stream_with_mock()
 -> impl Strategy<Value = (Vec<u8>, String, String, IrResponse)> {
     (
-        "[a-z]{4,12}", // mock 的非空主体
+        arb_mock_body(), // mock 的非空主体 (含转义字符臂, #356 子项9)
         "[a-z]{4,12}", // text content 前缀
         "[a-z]{3,8}",  // tool name
         "[a-z]{3,8}",  // call_id 主体
@@ -956,8 +985,8 @@ fn arb_responses_sse_stream_with_mock()
                 has_text,
                 has_reasoning,
             )| {
-                // mock 与 real 都不含 SSE/JSON 特殊字符, 避免 JSON 转义干扰 (与
-                // openai/anthropic 生成器同款约束).
+                // mock 主体经 arb_mock_body (可含 `"`/`\`, #356 子项9; 与
+                // openai/anthropic 生成器同款轴).
                 let mock = format!("MOCK{mock_body}");
                 let real = format!("sk-real-{mock_body}");
                 let call_id = format!("call_{call_id_body}");
@@ -1111,7 +1140,7 @@ fn arb_responses_sse_stream_with_mock()
 
                 // function_call item (恒出现, 与 openai/anthropic 生成器对齐):
                 // added → args delta (partial JSON 含 mock) → done 族.
-                let args = format!(r#"{{"secret":"{mock}","x":1}}"#);
+                let args = mock_partial_json(&mock);
                 frames.push(responses_frame(
                     "response.output_item.added",
                     &json!({
@@ -1820,28 +1849,42 @@ fn assert_cross_proto_restore_fidelity(
     real: &str,
     mock: &str,
 ) -> Result<(), proptest::test_runner::TestCaseError> {
-    // 1. no mock leak (安全核心).
+    // 1. no mock leak (安全核心). 双形态扫描 (raw + JSON 转义, #356 子项9 —
+    // 含 `"`/`\` 的 mock 在 wire 上以转义形态出现, 同同协议版断言).
     let client_str = String::from_utf8_lossy(client);
+    let mock_wire_escaped = crate::redact::json_wire_escaped(mock);
     prop_assert!(
-        !client_str.contains(mock),
-        "跨协议流式 no-mock-leak 违反: 客户端 SSE 含 mock={:?}\nclient={:?}",
+        !client_str.contains(mock) && !client_str.contains(mock_wire_escaped.as_str()),
+        "跨协议流式 no-mock-leak 违反: 客户端 SSE 含 mock={:?} (raw 或转义形态)\nclient={:?}",
         mock,
         client_str,
     );
 
-    // 2-5. 共享断言集, 期望值经 mock→real 映射.
-    assert_cross_proto_content_fidelity_with(upstream, client, |s| s.replace(mock, real))
+    // 2-5. 共享断言集: text 维度期望经 raw 替换, tool input 维度期望经 JSON
+    // 转义形态替换 (#356 子项9 — input_json 是内嵌 JSON 文本, 其中的 mock/real
+    // 以转义形态出现; mock 无特殊字符时两种形态同串).
+    let real_escaped = crate::redact::json_wire_escaped(real);
+    assert_cross_proto_content_fidelity_with(
+        upstream,
+        client,
+        |s| s.replace(mock, real),
+        |s| s.replace(mock_wire_escaped.as_str(), real_escaped.as_str()),
+    )
 }
 
 /// 跨协议保真断言集的共享核心 (content / tool input / tool_use 身份 / usage 四维,
 /// 纯翻译与 restore 两版 property 必须协同演化的 SSOT).
 ///
-/// `expect`: 期望值的字符串映射 — 纯翻译版传 identity ([`str::to_string`]),
-/// restore 版传 `.replace(mock, real)`.
+/// `expect`: text 维度的期望值映射 — 纯翻译版传 identity ([`str::to_string`]),
+/// restore 版传 `.replace(mock, real)` (raw 形态).
+/// `expect_json`: tool input 维度的期望值映射 — input_json 是内嵌 JSON 文本,
+/// 其中的 mock/real 以 JSON 转义形态出现 (#356 子项9); mock 无特殊字符时
+/// 转义形态 == raw, 与单闭包旧模型一致.
 fn assert_cross_proto_content_fidelity_with(
     upstream: &[u8],
     client: &[u8],
     expect: impl Fn(&str) -> String,
+    expect_json: impl Fn(&str) -> String,
 ) -> Result<(), proptest::test_runner::TestCaseError> {
     // content fidelity (跨协议文本透传).
     let upstream_text = collect_text_deltas(upstream);
@@ -1869,7 +1912,7 @@ fn assert_cross_proto_content_fidelity_with(
     let client_json = collect_input_json_deltas(client);
     prop_assert_eq!(
         client_json,
-        expect(&upstream_json),
+        expect_json(&upstream_json),
         "STR-1×FWD-3 流式 tool input fidelity 违反 (跨协议 tool arguments 损失)",
     );
 
@@ -1900,7 +1943,7 @@ fn assert_cross_proto_streaming_content_fidelity(
     client_sse: &[u8],
 ) -> Result<(), proptest::test_runner::TestCaseError> {
     // 纯翻译: 期望值恒等映射 (identity).
-    assert_cross_proto_content_fidelity_with(upstream_sse, client_sse, str::to_string)
+    assert_cross_proto_content_fidelity_with(upstream_sse, client_sse, str::to_string, str::to_string)
 }
 
 /// 从 SSE 字节流中收集所有 tool_use 的 (id, name) 对, 按出现顺序.

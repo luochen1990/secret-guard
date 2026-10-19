@@ -709,8 +709,13 @@ pub use crate::codec::stream::DeltaKind;
 ///   (单 event 完整, 直接 `restore_str_inplace`).
 #[derive(Debug)]
 pub struct StreamingRestorer {
-    map: RedactionMap,
-    /// 尾部 hold 字节数 = max_mock_len - 1 (防御跨 chunk mock).
+    /// 预计算的替换对 (mock, real) 按 mock.len() 倒序 — push/flush 的 Text 与
+    /// Reasoning 路径 + find_safe_end 的 raw 扫描共用 (#356 子项3: 长度倒序).
+    pairs: Vec<(String, String)>,
+    /// InputJson 路径的替换对 (json_wire_escaped(mock), json_wire_escaped(real))
+    /// 按转义形态长度倒序 — 内嵌 JSON 文本中的 mock 以转义形态出现 (#356 子项9).
+    escaped_pairs: Vec<(String, String)>,
+    /// 尾部 hold 字节数 = max(mock 长度, 转义形态长度) - 1 (防御跨 chunk mock).
     hold: usize,
     /// 当前未 emit 的尾部 buffer.
     buffer: String,
@@ -720,19 +725,29 @@ pub struct StreamingRestorer {
 }
 
 impl StreamingRestorer {
-    /// 构造. `map` 为空时所有 push 直接透传 (zero overhead).
+    /// 构造. `map` 为空 (或仅 placeholder 条目) 时所有 push 直接透传 (zero overhead).
     ///
     /// hold 计算排除 placeholder 条目 (C9, RED-10): 它们不被 restore, 无需为
-    /// 其防跨 chunk 而缓冲尾部字节.
+    /// 其防跨 chunk 而缓冲尾部字节. hold 覆盖 **raw 与 JSON 转义两种形态** 的
+    /// 最大长度 — InputJson 路径的 mock 转义形态可能比 raw 长 (`"`/`\`/控制
+    /// 字符各 +1/+1/+5 字节), hold 按 raw 算会在转义形态跨 chunk 时提前 emit
+    /// (#356 子项9).
     pub fn new(map: RedactionMap) -> Self {
-        let max_mock_len = map
-            .restorable_entries()
-            .map(|(mock, _)| mock.len())
+        let pairs = ordered_restore_pairs(&map);
+        let escaped_pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(m, r)| (json_wire_escaped(m), json_wire_escaped(r)))
+            .collect();
+        let max_len = pairs
+            .iter()
+            .chain(escaped_pairs.iter())
+            .map(|(m, _)| m.len())
             .max()
             .unwrap_or(0);
         Self {
-            map,
-            hold: max_mock_len.saturating_sub(1),
+            pairs,
+            escaped_pairs,
+            hold: max_len.saturating_sub(1),
             buffer: String::new(),
             last_kind: DeltaKind::Text,
         }
@@ -742,8 +757,13 @@ impl StreamingRestorer {
     ///
     /// 返回可以安全 emit 的部分 (mock 已替换为 real).
     /// 末尾 hold 字节保留在 buffer 等下一个 chunk 凑齐.
+    ///
+    /// 替换形态按 [`DeltaKind`] 分流 (#356 子项9): Text/Reasoning 是纯文本叶子,
+    /// mock 以 raw 出现; InputJson 是**内嵌 JSON 文本**, mock 以 JSON 转义形态
+    /// 出现 (`json_wire_escaped`) — 含 `"`/`\` 的 mock 在两种形态下字节不同,
+    /// 按各自形态替换才能双向命中.
     pub fn push(&mut self, content: String) -> String {
-        if self.map.is_empty() {
+        if self.pairs.is_empty() {
             return content;
         }
         let mut combined = std::mem::take(&mut self.buffer);
@@ -752,7 +772,7 @@ impl StreamingRestorer {
         // split_off(safe_end) 把 combined 切成 [...safe_end) + [safe_end...).
         // self.buffer 持有 tail, combined 持有 head; 避免 clone + truncate.
         self.buffer = combined.split_off(safe_end);
-        restore_str_inplace(&mut combined, &self.map);
+        replace_pairs_inplace(&mut combined, self.replacement_pairs());
         combined
     }
 
@@ -760,6 +780,14 @@ impl StreamingRestorer {
     /// 由 StreamTranslate 在每次 BlockDelta 时同步, 确保 flush 返回正确类型.
     pub fn set_kind(&mut self, kind: DeltaKind) {
         self.last_kind = kind;
+    }
+
+    /// 当前 kind 对应的替换对 (raw / JSON 转义形态).
+    fn replacement_pairs(&self) -> &[(String, String)] {
+        match self.last_kind {
+            DeltaKind::InputJson => &self.escaped_pairs,
+            DeltaKind::Text | DeltaKind::Reasoning => &self.pairs,
+        }
     }
 
     /// Block 结束 (BlockStop) 时调用. 若上游异常未发 BlockStop,
@@ -771,8 +799,9 @@ impl StreamingRestorer {
             return (kind, String::new());
         }
         let mut remaining = std::mem::take(&mut self.buffer);
-        // buffer 非空蕴含 map 非空 (push 在 map 为空时直接返回 content, 从不写 buffer).
-        restore_str_inplace(&mut remaining, &self.map);
+        // buffer 非空蕴含 pairs 非空 (push 在 pairs 为空时直接返回 content, 从不写 buffer).
+        let pairs = self.replacement_pairs();
+        replace_pairs_inplace(&mut remaining, pairs);
         (kind, remaining)
     }
 
@@ -785,6 +814,10 @@ impl StreamingRestorer {
     ///
     /// UTF-8 安全: 返回值必然落在 char boundary 上 (回退到最近的 boundary).
     /// buffer 不变式从 `≤ hold` 放宽到 `≤ hold + 3` (UTF-8 char 最多 4 字节).
+    ///
+    /// 扫描面: raw 与 JSON 转义**两种形态**的全部 mock (#356 子项9 — InputJson
+    /// 路径按转义形态匹配; 对 Text 形态误扫转义序列的概率≈0, 不构成误伤,
+    /// 保守扫描两种).
     fn find_safe_end(&self, combined: &str) -> usize {
         let len = combined.len();
         if self.hold == 0 {
@@ -795,7 +828,12 @@ impl StreamingRestorer {
         }
         let mut max_mock_end = 0usize;
         // 只扫描可还原 mock (placeholder 条目不被 restore, 不构成 hold 依据 — C9).
-        for mock in self.map.restorable_entries().map(|(m, _)| m) {
+        for mock in self
+            .pairs
+            .iter()
+            .chain(self.escaped_pairs.iter())
+            .map(|(m, _)| m.as_str())
+        {
             if mock.len() > len {
                 continue;
             }
@@ -887,20 +925,52 @@ impl crate::codec::stream::StreamRestoreHook for StreamingRestorerSet {
     }
 }
 
+/// 字符串的 JSON wire 转义形态 (不含首尾引号): `s` 作为 JSON string 值在 wire
+/// 上的字节形态 — `"` → `\"`, `\` → `\\`, 控制字符 → `\n` / `\uXXXX` (serde_json
+/// 转义规则). 流式 tool arguments (`InputJsonDelta`) 是**内嵌 JSON 文本**, 其中的
+/// mock/real 以该形态出现 (而非 raw) — `StreamingRestorer` 的 InputJson 路径按
+/// 此形态做 mock→real 替换 (#356 子项9 修复: raw 查找对含 `"`/`\` 的 mock 恒
+/// miss, mock 曾逃逸到客户端).
+pub(crate) fn json_wire_escaped(s: &str) -> String {
+    let lit = serde_json::to_string(s).expect("str 序列化恒成功 (无非法 UTF-8)");
+    // to_string 产出带引号的 string 字面量 — 精确去首尾一对引号 (s 本身首尾
+    // 可能有引号, 不能用 trim_matches 多去).
+    lit[1..lit.len() - 1].to_string()
+}
+
 /// [`restore_str`] 的纯函数版本 (in-place), 复用同一段 find-and-replace 逻辑.
 /// 返回是否发生了至少一次替换 — 供 [`restore_json_value_fallback`] 判断
 /// "未命中则保持原字节" (避免每个叶子 clone 比对).
 ///
 /// placeholder 条目不参与 (C9, RED-10): 经 [`RedactionMap::restorable_entries`]
 /// 排除, 响应中 `[REDACTED:{id}]` 原样保留.
+///
+/// **长度倒序替换** (#356 子项3): 互为子串的 mock (弱配置下真实可达 — 如 charset
+/// 退化产周期性 mock, RED-4 单射性不排除子串关系) 必须长者先替换, 与 redact 侧
+/// 的 span 消费语义 (`redact_ir` 长度倒序) 对称 — 否则短 mock 先行破坏长 mock
+/// 的完整出现, round-trip 结果依赖 HashMap 迭代序 (未定义行为).
 pub(crate) fn restore_str_inplace(s: &mut String, map: &RedactionMap) -> bool {
     if map.is_empty() || s.is_empty() {
         return false;
     }
+    let pairs = ordered_restore_pairs(map);
+    replace_pairs_inplace(s, &pairs)
+}
+
+/// restore 替换对的稳定序: restorable (mock, real) 按 mock 长度倒序 (同长度按
+/// 字典序 — 确定性, 与 HashMap 迭代序解耦).
+fn ordered_restore_pairs(map: &RedactionMap) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = map.restorable_entries().map(|(m, r)| (m.clone(), r.clone())).collect();
+    pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
+    pairs
+}
+
+/// 按序做 find-and-replace (长度倒序对), 返回是否发生至少一次替换.
+fn replace_pairs_inplace(s: &mut String, pairs: &[(String, String)]) -> bool {
     let mut replaced = false;
-    for (mock, real) in map.restorable_entries() {
-        if s.contains(mock) {
-            *s = s.replace(mock, real);
+    for (mock, real) in pairs {
+        if s.contains(mock.as_str()) {
+            *s = s.replace(mock.as_str(), real.as_str());
             replaced = true;
         }
     }
