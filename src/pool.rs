@@ -111,6 +111,9 @@ fn align_runtime(rt: &mut PoolRuntime, members: &[String]) {
             _ => MemberSlot::Active,
         })
         .collect();
+    // 配对不变式守卫 (#360): 违反时上面的配对比较会静默落 `_ => Active` 兜底,
+    // debug 构建下显式暴露 (冷路径 — 仅重建分支执行, 快速对齐路径提前 return).
+    debug_assert_eq!(rt.member_ids.len(), rt.slots.len());
 }
 
 /// 进程级 pool 运行时状态, 聚合进 `AppState.pools` (读多写少, RwLock)。
@@ -1394,13 +1397,103 @@ mod tests {
         );
     }
 
+    // ─── 并发冒烟: pick/mark/配置快照交错 (镜像 DAG 并发测试形态) ───────────
+
+    #[test]
+    fn concurrent_pick_mark_reconfig_do_not_corrupt_or_deadlock() {
+        use std::thread;
+
+        // 行使 `PoolStates` 头注显式裁决的并发语义 ("交错暂态 + 上游 429 自愈,
+        // 不加锁"): 多线程各持**新旧不同的 members 快照**交错调用 pick/mark — 写锁 (`with_pool`) 保证
+        // 交错为暂态且不撕裂; 若写锁被降级/拆除, 本测试在负载下红 (panic/死锁/
+        // 末态不收敛). 快照族覆盖长度/顺序/重复成员变化 (交错触发 align 重建).
+        let pools = PoolStates::new();
+        let id_pool: Vec<String> = (0..4).map(|i| format!("m{i}")).collect();
+        let snapshots: Vec<Vec<String>> = vec![
+            id_pool.clone(),
+            id_pool[1..].to_vec(),
+            vec![id_pool[2].clone(), id_pool[0].clone(), id_pool[3].clone()],
+            vec![id_pool[0].clone(), id_pool[0].clone(), id_pool[2].clone()], // 重复成员
+        ];
+
+        let handles: Vec<thread::JoinHandle<()>> = (0..8usize)
+            .map(|t| {
+                let pools = pools.clone(); // 生产同型: AppState.pools 随 handler clone 共享
+                let snapshots = snapshots.clone();
+                thread::spawn(move || {
+                    // 每线程确定性序列 (交错由线程调度提供, 失败可复现归因到线程+步).
+                    for i in 0..256usize {
+                        let members = &snapshots[(i + t) % snapshots.len()];
+                        let now = Instant::now();
+                        let _ = pools.active_members("pl", members, now);
+                        // mark: 概率性越界 (上界 members.len(), ROB 并发面) +
+                        // 短闹钟 (0..60s, 在途自愈窗口).
+                        let idx = (i * 3 + t) % (members.len() + 1);
+                        let until = now + Duration::from_secs(((i * 7 + t * 13) % 60) as u64);
+                        pools.mark_member_exhausted("pl", members, idx, until);
+                        if i % 32 == 0 {
+                            // 观察面并发混入 (读锁 clone 路径, 只读无副作用).
+                            let _ = pools.member_status("pl", members);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join()
+                .expect("pool worker thread must not panic / deadlock");
+        }
+
+        // 末态收敛断言 (与 proptest 同款不变式): 远未来时刻 pick 令全部在途闹钟
+        // 过期顺带清除 → 候选 = 完整严格递增列表 (①); slots 与 canonical members
+        // 等长对齐全 Active (并发交错不残留永久 Exhausted — 闹钟自愈).
+        let far = Instant::now() + RESUME_CAP;
+        let idxs = pools
+            .active_members("pl", &id_pool, far)
+            .expect("far-future pick must recover all members");
+        assert_eq!(
+            idxs,
+            (0..id_pool.len()).collect::<Vec<_>>(),
+            "① full strictly-ordered candidate list after alarm self-heal"
+        );
+        assert_eq!(
+            slots_of(&pools, "pl"),
+            vec![MemberSlot::Active; id_pool.len()],
+            "all slots self-healed to Active, aligned with canonical members"
+        );
+    }
+
     // ─── proptest: 状态机全态空间鲁棒性 ───────────────────────────────────
 
+    /// 上一步 mutation 的记忆 (驱动 ② 闹钟语义 / ④ 对齐保留语义的确定性断言):
+    /// mark 不改 members 且是循环内最后一步状态写入 → 下一步 pick 时 slot 恰为
+    /// 该 Exhausted; reconfig 后下一步 pick 恰好完成对齐 — 两者都在确定窗口内.
+    enum LastMutation {
+        Marked {
+            idx: usize,
+            until: Instant,
+        },
+        Reconfigured {
+            pre_members: Vec<String>,
+            pre_slots: Vec<MemberSlot>,
+        },
+    }
+
     // 任意耗尽/恢复/配置变更序列下: 解析永不 panic 且返回值 sound
-    // (Ok ⇒ 非空下标列表且全部 < members.len(); Err ⇒ AllMembersExhausted 且
-    // pool_id 回显). 结构: 每步先解析 (在任意中间状态下断言 soundness), 再做
-    // 一次状态变更 (mark 闹钟, 或配置重组覆盖长度/顺序变化) — 保证解析分支
-    // 恒被覆盖 (生成器覆盖度, 历史教训: 生成器太窄致漏测).
+    // (Ok ⇒ 非空下标列表 + 全部 < members.len() + 按 members 序严格递增;
+    // Err ⇒ AllMembersExhausted + pool_id 回显 + earliest_resume == 当前对齐态
+    // 最小闹钟且仍在未来) — 并在确定窗口内断言四条核心不变式 (#360 断言补强):
+    // ① Ok 候选列表严格递增 (顺序 failover 核心承诺 — 无游标列表序);
+    // ② mark 后下一步 pick: now < until ⇒ 该位置被排除 / until <= now ⇒ 顺带
+    //    清除后回归候选 (此时不可能 Err);
+    // ③ Err 时 earliest_resume == min(slots alarms) (≠ None, > now — 任一闹钟
+    //    已过都会被顺带清除 → Ok);
+    // ④ reconfig 后下一步 pick: 同位置同 id 的 slot 期望态 = 保留 ∘ 过期清除
+    //    (Exhausted{until <= now} → Active, 其余原样) — 随机交错组合态
+    //    (reconfig→mark→reconfig 链 / 重复成员×闹钟交互) 的验证缺口由此补上.
+    // 结构: 每步先解析 (在任意中间状态下断言 soundness), 再做一次状态变更
+    // (mark 闹钟, 或配置重组覆盖长度/顺序变化) — 保证解析分支恒被覆盖
+    // (生成器覆盖度, 历史教训: 生成器太窄致漏测).
     proptest! {
         #[test]
         fn prop_pool_states_arbitrary_sequences_never_panic(
@@ -1416,17 +1509,76 @@ mod tests {
             let mut now = t0;
             let mut members = id_pool.clone();
             let mut pick_count = 0usize;
+            let mut last: Option<LastMutation> = None;
             for (op_idx, until_off, advance, reconfig) in &ops {
                 now += Duration::from_secs(*advance);
                 // 每步 pick: 任意中间状态下 sound.
-                match pools.active_members("pl", &members, now) {
+                let picked = pools.active_members("pl", &members, now);
+                match &picked {
                     Ok(idxs) => {
                         pick_count += 1;
                         prop_assert!(!idxs.is_empty(), "active list never empty on Ok");
                         prop_assert!(*idxs.last().unwrap() < members.len(), "index out of range");
+                        // ① 候选列表按 members 序严格递增 (位置序, 重复 id 不影响).
+                        prop_assert!(
+                            idxs.windows(2).all(|w| w[0] < w[1]),
+                            "① candidate list strictly increasing (sequential failover order)"
+                        );
                     }
                     Err(e) => {
-                        prop_assert_eq!(e.pool_id, "pl");
+                        prop_assert_eq!(&e.pool_id, "pl");
+                        // ③ earliest_resume == 当前对齐态的最小闹钟 (pick 调用后
+                        // 单线程读取, 与 Err 的派生源同态), 恒 Some 且 > now.
+                        let expected = slots_of(&pools, "pl")
+                            .iter()
+                            .filter_map(|s| s.alarm())
+                            .min();
+                        prop_assert_eq!(
+                            e.earliest_resume, expected,
+                            "③ earliest_resume == min(slots alarms)"
+                        );
+                        prop_assert!(
+                            e.earliest_resume.is_some_and(|t| t > now),
+                            "③ earliest alarm exists and is still in the future (else pick would have Ok'd)"
+                        );
+                    }
+                }
+                // ② 上一步是 mark (members 未变, slot 恰为该 Exhausted): 闹钟双
+                //   向语义 — 期内排除 / 过期清除回归 (回归 ⇒ 候选非空 ⇒ 不可能 Err).
+                if let Some(LastMutation::Marked { idx, until }) = last {
+                    match &picked {
+                        Ok(idxs) if now < until => prop_assert!(
+                            !idxs.contains(&idx),
+                            "② alarmed member excluded while now < until"
+                        ),
+                        Ok(idxs) => prop_assert!(
+                            idxs.contains(&idx),
+                            "② expired alarm cleared → member back in candidates"
+                        ),
+                        Err(_) => prop_assert!(
+                            now < until,
+                            "② Err impossible when the just-marked alarm already expired (clearing yields a candidate)"
+                        ),
+                    }
+                }
+                // ④ 上一步是 reconfig (本次 pick 已完成对齐): 同位置同 id 的期望态
+                //    = 保留 ∘ 过期清除; 其余位置 (id 变了) 期望 Active, 由对齐
+                //    语义确定性单测覆盖, 此处不重复.
+                if let Some(LastMutation::Reconfigured { pre_members, pre_slots }) = &last {
+                    let post = slots_of(&pools, "pl");
+                    for i in 0..pre_members.len().min(members.len()) {
+                        if pre_members[i] == members[i] {
+                            let expected = match pre_slots[i] {
+                                MemberSlot::Active => MemberSlot::Active,
+                                MemberSlot::Exhausted { until } if until > now => pre_slots[i],
+                                MemberSlot::Exhausted { .. } => MemberSlot::Active,
+                            };
+                            prop_assert_eq!(
+                                post[i], expected,
+                                "④ same-position same-id slot preserved across reconfig (pos {})",
+                                i
+                            );
+                        }
                     }
                 }
                 // 状态变更: 配置重组 (长度/顺序变化/重复成员 — validate 允许
@@ -1434,6 +1586,8 @@ mod tests {
                 let op_idx = *op_idx;
                 let idx = op_idx % members.len();
                 if *reconfig {
+                    let pre_members = members.clone();
+                    let pre_slots = slots_of(&pools, "pl");
                     members = (0..(op_idx % n_members) + 1)
                         .map(|k| id_pool[(k + idx) % n_members].clone())
                         .collect();
@@ -1443,13 +1597,11 @@ mod tests {
                         let dup = members[0].clone();
                         members.push(dup);
                     }
+                    last = Some(LastMutation::Reconfigured { pre_members, pre_slots });
                 } else {
-                    pools.mark_member_exhausted(
-                        "pl",
-                        &members,
-                        idx,
-                        now + Duration::from_secs(*until_off),
-                    );
+                    let until = now + Duration::from_secs(*until_off);
+                    pools.mark_member_exhausted("pl", &members, idx, until);
+                    last = Some(LastMutation::Marked { idx, until });
                 }
             }
             // 生成器覆盖度守卫: 非空序列必有 pick (每步都 pick).

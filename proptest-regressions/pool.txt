@@ -4,3 +4,5 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
+cc a1249b51c1d2cf2a7af8d11cc2e7e8373069f8e56346bc81bd5286a2e23bffbb # shrinks to n_members = 1, ops = [(4, 0, 0, true), (0, 0, 0, false)]
+cc b2fe9e8a9da1ac6940fb7de2eda3f8fc21fd347336c7f6828de65d97b708922f # shrinks to n_members = 2, ops = [(5, 382, 0, false), (6, 248, 0, false), (0, 0, 0, false)]
