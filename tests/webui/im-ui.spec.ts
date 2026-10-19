@@ -4593,6 +4593,110 @@ test.describe("i18n: 语言自动选择 + 切换 + 持久化 (#298)", () => {
   });
 });
 
+// ─── #346: 编辑 dialog 开启时切语言 — 状态文案不被静态重放打回通用值 ────────
+//
+// 契约 (index.html rerenderDynamicForLang 的 open-dialog 重放块):
+//   1. provider 编辑 dialog 开启时切换语言: openProviderForm 按 existing 烙印的
+//      **状态相关文案** (title "编辑 {id}" / Save "Update" / api-key "留空保留
+//      {masked}" placeholder / static override banner) 保持编辑态语义并跟随新
+//      语言 — 不被 applyI18nStaticTexts 的静态重放打回 "新建 / Create / 通用
+//      占位" (功能本就无损: submit 按 btn.value 分发; 纯文案态丢失, 关闭重开
+//      自愈, 但开启态切换不应退化)。
+//   2. 端点行 (addEndpointRow 物化) 的行模板文案 (Verify label/title, base_url
+//      placeholder 等) 跟随新语言 — 模板带 data-i18n* 标注由静态重放覆盖;
+//      verify 落地的自定义 title (detail) 经 row dataset 重放不丢。
+//   3. 构造描述 (#p-kind-hint) 与检测矩阵 (#p-detect-results 成功态) 是 JS
+//      烙印文案, 经 setter / 快照缓存在切语言时重导 (PR #341 F1 同款模式)。
+//   4. secret 编辑 dialog 同型守卫 (title / Save), 反方向 (zh → en) 覆盖。
+test.describe("编辑 dialog 语言切换状态文案 (#346)", () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto("/");
+    await page.waitForLoadState("networkidle");
+  });
+
+  test("provider 编辑 dialog: en → zh 编辑态文案保持并跟随新语言", async ({ page }) => {
+    await page.locator('a.tab[data-tab="providers"]').click();
+    // 造一个带 api key + 单端点的 provider (placeholder 断言需要 api_key_masked)。
+    const uid = `i18n-${Date.now()}`;
+    await openNewProviderForm(page);
+    await page.locator("#p-id").fill(uid);
+    await page.locator("#p-api-key").fill("sk-i18n-346");
+    const row = await addManualEndpoint(page);
+    await row.locator(".ep-base-url").fill("https://example.com");
+    await page.locator('#provider-form-el button[value="save"]').click();
+    await expect(page.locator("#provider-form")).not.toBeVisible();
+    const listRow = page.locator("#providers-body tr", { hasText: uid });
+    await expect(listRow).toBeVisible();
+
+    // 开编辑 dialog: 编辑态文案 (en 基线)。
+    await listRow.locator('button[data-action="edit"]').click();
+    await expect(page.locator("#provider-form")).toBeVisible();
+    await expect(page.locator("#provider-form-title")).toHaveText(`Edit provider ${uid}`);
+    await expect(page.locator("#p-save")).toHaveText("Update");
+    await expect(page.locator("#p-api-key")).toHaveAttribute(
+      "placeholder",
+      /leave blank to keep/
+    );
+    const epRow = endpointRow(page);
+    await expect(epRow.locator(".ep-verify")).toHaveAttribute("title", /Re-check this endpoint/);
+
+    // 切 zh: 编辑态语义保持 + 全部跟随新语言 (不整页刷新)。
+    await page.locator("#lang-switch").selectOption("zh");
+    await expect(page.locator("#provider-form-title")).toHaveText(`编辑 provider ${uid}`);
+    await expect(page.locator("#p-save")).toHaveText("更新");
+    await expect(page.locator("#p-api-key")).toHaveAttribute(
+      "placeholder",
+      /留空即保留/
+    );
+    // 端点行模板文案 (title / placeholder / label) 跟随新语言。
+    await expect(epRow.locator(".ep-verify")).toHaveAttribute("title", /二次检测/);
+    await expect(epRow.locator(".ep-verify > span[data-i18n]")).toHaveText("校验");
+    await expect(epRow.locator(".ep-base-url")).toHaveAttribute(
+      "placeholder",
+      /末尾不加/
+    );
+    // 构造描述 (JS 烙印) 重导。
+    await expect(page.locator("#p-kind-hint")).toHaveText(
+      "直接转发到真实 LLM 端点 (每协议一个端点, 共享 API key)。"
+    );
+  });
+
+  test("provider dialog: 检测矩阵 (成功态快照) 切语言重绘", async ({ page }) => {
+    // 全 404 上游 → 矩阵渲染 (全 absent + 逃生口 hint); 切语言后按快照重绘。
+    const upstream = await startProbeUpstream(() => ({ status: 404, body: "{}" }));
+    await page.locator('a.tab[data-tab="providers"]').click();
+    await openNewProviderForm(page);
+    await page.locator("#p-detect-url").fill(upstream.url);
+    await page.locator("#p-detect-btn").click();
+    await page.locator("#p-detect-results .probe-line").first().waitFor();
+    await expect(page.locator("#p-detect-results .probe-line").first()).toContainText(
+      "Detection results for"
+    );
+    await page.locator("#lang-switch").selectOption("zh");
+    await expect(page.locator("#p-detect-results .probe-line").first()).toContainText(
+      "检测结果:"
+    );
+    // 逃生口 hint (UI-10) 同步跟随 (全 absent 形态)。
+    await expect(page.locator("#p-detect-results .hint")).toContainText("未识别到模型端点");
+    await upstream.close();
+  });
+
+  test("secret 编辑 dialog: zh → en 反方向同型守卫", async ({ page }) => {
+    await page.locator("#lang-switch").selectOption("zh");
+    await page.locator('a.tab[data-tab="secrets"]').click();
+    const row = page.locator('#secrets-body tr[data-id="test-key"]');
+    await expect(row).toBeVisible();
+    await row.locator('button[data-action="edit"]').click();
+    await expect(page.locator("#secret-form")).toBeVisible();
+    await expect(page.locator("#secret-form-title")).toHaveText("编辑 secret test-key");
+    await expect(page.locator("#f-save")).toHaveText("更新");
+    // 切 en: 编辑态语义保持 ("Edit secret" 而非静态重放的 "New secret")。
+    await page.locator("#lang-switch").selectOption("en");
+    await expect(page.locator("#secret-form-title")).toHaveText("Edit secret test-key");
+    await expect(page.locator("#f-save")).toHaveText("Update");
+  });
+});
+
 // ─── header 工具栏打磨: 选择框字号统一 + 语言选择器可发现性 (quant#306) ──────
 //
 // 契约 (index.html header CSS 段):

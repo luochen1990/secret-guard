@@ -3501,6 +3501,32 @@
       updateCountDisplay();
       usageLastFetch = 0;
       refreshUsage();
+      // 编辑 dialog 开启态重放 (#346): applyI18nStaticTexts 的静态重放会把
+      // open*Form 烙印的编辑态文案 (title / Save / api-key "留空保留"
+      // placeholder / override banner) 打回通用静态值 — dialog open 时按开启
+      // 上下文 (providerFormCtx / secretFormCtx) 重导。行模板 (端点/路由/成员
+      // 行) 的静态文案已带 data-i18n* 标注 (静态重放天然覆盖), 此处只补状态位:
+      // kind hint / 检测矩阵 (probeLastDetect 快照) / 在途探测占位 / uri 徽标 /
+      // verify 自定义 title (row dataset)。关闭态无 DOM 可重绘 (重开走 open*Form
+      // 重置块); 错误/详情态不重绘 — 消息内嵌服务端原文, 瞬态自愈 (#341 F1 先例)。
+      const pDlg = document.getElementById('provider-form');
+      if (pDlg.open) {
+        syncProviderFormStateTexts();
+        syncProviderKindHint();
+        const detectBtn = document.getElementById('p-detect-btn');
+        if (detectBtn.disabled) {
+          detectBtn.textContent = t('providers.detecting');
+          document.getElementById('p-detect-results').innerHTML =
+            `<div class="probe-line">${escapeHtml(t('models.loading'))}</div>`;
+        } else if (state.probeLastDetect) {
+          renderDetectResults();
+        }
+        for (const row of document.querySelectorAll('#p-endpoints-list .endpoint-row')) {
+          syncEndpointCommonUriBadge(row);
+          if (row.dataset.verifyTitle) row.querySelector('.ep-verify').title = row.dataset.verifyTitle;
+        }
+      }
+      if (document.getElementById('secret-form').open) syncSecretFormStateTexts();
     }
 
     // 应用语言: passive (rerender=false) 用于脚本初始化 — 此时 bootstrap 渲染尚未
@@ -7236,11 +7262,21 @@
     // prefill (可选): privacy scan 告警的「登记」入口 (#257 S0.5) — 预填 value +
     // 建议 name. 仅用于新建 (existing 为 null); 编辑路径强制重输 value 的语义
     // 不变 (服务端从不回传真实值, 预填无从谈起).
+    // #346 同型守卫 (secret 编辑 dialog): 开启上下文快照 + 编辑态文案重导单点,
+    // 语义同 providerFormCtx / syncProviderFormStateTexts (title / Save /
+    // override banner; secret 无 masked-key placeholder 面)。
+    let secretFormCtx = null;
+    function syncSecretFormStateTexts() {
+      const ctx = secretFormCtx;
+      document.getElementById('secret-form-title').textContent =
+        ctx ? t('form.secret.editTitle', { id: ctx.id }) : t('form.secret.newTitle');
+      document.getElementById('f-save').textContent = ctx ? t('common.update') : t('common.create');
+      toggleOverrideBanner(document.getElementById('secret-form'), ctx);
+    }
+
     function openSecretForm(existing, prefill) {
       populateCategorySelect();
       const dlg = document.getElementById('secret-form');
-      const title = document.getElementById('secret-form-title');
-      const saveBtn = document.getElementById('f-save');
       const idInput = document.getElementById('f-id');
       idInput.value = existing?.id || '';
       // 编辑模式下 ID 不可改 (PUT 路径以 URL 中的 id 为准).
@@ -7255,11 +7291,14 @@
       loadStrategyIntoForm(existing?.strategy);
       // Mock strategy: 加载 existing 或默认值.
       loadMockStrategyIntoForm(existing?.mock_strategy);
-      title.textContent = existing ? t('form.secret.editTitle', { id: existing.id }) : t('form.secret.newTitle');
-      toggleOverrideBanner(dlg, existing);
+      // 编辑态文案 (title/Save/override banner) 单点收口 (#346), 与语言切换
+      // 重放共用.
+      secretFormCtx = existing ? { id: existing.id, source: existing.source } : null;
+      syncSecretFormStateTexts();
+      // #348 reset 按钮显隐独立于文案重放面: 纯 hidden 控制 (语言无关), 语言
+      // 切换的 applyI18nStaticTexts 不触碰 hidden, 按钮词条自带 data-i18n 静态标注.
       toggleResetAction(dlg, existing);
       dlg.dataset.editId = existing ? existing.id : '';
-      saveBtn.textContent = existing ? t('common.update') : t('common.create');
       dlg.showModal();
     }
 
@@ -7716,10 +7755,43 @@
       panel.innerHTML = modelsBlock(models, ` · ${escapeHtml(sourceLabel)}`);
     }
 
+    // 构造描述重导 (#341 F1 同款, #346 移入本谱系): openProviderForm 时 JS 写入
+    // 的动态文案, 语言切换时静态 data-i18n 重放覆盖不到 — rerenderDynamicForLang
+    // 在 dialog open 态经此函数按当前 kind select 值重导。词表现场构造 (不缓存):
+    // t() 需取切换后的新语言词条。
+    function syncProviderKindHint() {
+      const kindSel = document.getElementById('p-kind');
+      const kindHint = document.getElementById('p-kind-hint');
+      const KIND_HINTS = {
+        direct: t('providers.kindHint.direct'),
+        router: t('providers.kindHint.router'),
+        pool: t('providers.kindHint.pool'),
+      };
+      kindHint.textContent = KIND_HINTS[kindSel.value] || KIND_HINTS.direct;
+    }
+
+    // 表单开启上下文 (#346 重放源): openProviderForm 时快照 existing 的编辑态
+    // 判定字段, 语言切换经 syncProviderFormStateTexts 按新词条重导 — 静态重放
+    // 会把这些 data-i18n 标注位打回通用值 ("新建"/"Create"/通用 placeholder)。
+    // 生命周期: 每次 open 覆写; 关闭态不被消费 (重放块有 open 守卫)。
+    let providerFormCtx = null;
+
+    // 编辑态文案重导 (#346): openProviderForm 与语言切换重放共用的单点 —
+    // title / Save 按钮 / api-key placeholder (留空保留 {masked}) / static
+    // override banner。
+    function syncProviderFormStateTexts() {
+      const ctx = providerFormCtx;
+      document.getElementById('provider-form-title').textContent =
+        ctx ? t('form.provider.editTitle', { id: ctx.id }) : t('form.provider.newTitle');
+      document.getElementById('p-save').textContent = ctx ? t('common.update') : t('common.create');
+      document.getElementById('p-api-key').placeholder = ctx?.masked
+        ? t('providers.apiKeyKeep', { masked: ctx.masked })
+        : t('providers.apiKeyPlaceholder');
+      toggleOverrideBanner(document.getElementById('provider-form'), ctx);
+    }
+
     function openProviderForm(existing) {
       const dlg = document.getElementById('provider-form');
-      const title = document.getElementById('provider-form-title');
-      const saveBtn = document.getElementById('p-save');
       const idInput = document.getElementById('p-id');
       idInput.value = existing?.id || '';
       idInput.disabled = !!existing;
@@ -7730,18 +7802,12 @@
       // 发空 routes/members — 见下方 payload builder; dynamic 条目切换的丢 key
       // 限制见 AGENTS.md).
       const kindSel = document.getElementById('p-kind');
-      const kindHint = document.getElementById('p-kind-hint');
-      const KIND_HINTS = {
-        direct: t('providers.kindHint.direct'),
-        router: t('providers.kindHint.router'),
-        pool: t('providers.kindHint.pool'),
-      };
       const syncKind = () => {
         const kind = kindSel.value;
         document.getElementById('p-direct-fields').classList.toggle('hidden', kind !== 'direct');
         document.getElementById('p-router-fields').classList.toggle('hidden', kind !== 'router');
         document.getElementById('p-pool-fields').classList.toggle('hidden', kind !== 'pool');
-        kindHint.textContent = KIND_HINTS[kind] || KIND_HINTS.direct;
+        syncProviderKindHint();
       };
       kindSel.value = existing?.kind || 'direct';
       kindSel.onchange = syncKind;
@@ -7798,17 +7864,19 @@
       state.probeEpoch++;
       const apiKeyInput = document.getElementById('p-api-key');
       apiKeyInput.value = '';
-      // 编辑模式下用 masked 旧值做 placeholder, 提示"留空将保留"; 创建模式保持原提示.
-      // Router 旧值无 api_key_masked (构造上不存在) → (optional) 即 "需重新填写" 的提示.
-      apiKeyInput.placeholder = existing?.api_key_masked
-        ? t('providers.apiKeyKeep', { masked: existing.api_key_masked })
-        : t('providers.apiKeyPlaceholder');
       document.getElementById('p-enabled').checked = existing ? existing.enabled : true;
-      title.textContent = existing ? t('form.provider.editTitle', { id: existing.id }) : t('form.provider.newTitle');
-      toggleOverrideBanner(dlg, existing);
+      // 编辑态文案 (title/Save/api-key placeholder 留空保留 {masked}/override
+      // banner) 单点收口在 syncProviderFormStateTexts (#346): 表单开启与语言
+      // 切换重放共用。Router 旧值无 api_key_masked (构造上不存在) → ctx.masked
+      // 空 → (optional) 通用提示, 即 "需重新填写" 的语义。
+      providerFormCtx = existing
+        ? { id: existing.id, masked: existing.api_key_masked || '', source: existing.source }
+        : null;
+      syncProviderFormStateTexts();
+      // #348 reset 按钮显隐独立于文案重放面: 纯 hidden 控制 (语言无关), 语言
+      // 切换的 applyI18nStaticTexts 不触碰 hidden, 按钮词条自带 data-i18n 静态标注.
       toggleResetAction(dlg, existing);
       dlg.dataset.editId = existing ? existing.id : '';
-      saveBtn.textContent = existing ? t('common.update') : t('common.create');
       dlg.showModal();
     }
 
@@ -7825,18 +7893,24 @@
     // (手动添加 / 快速添加) 随后按需 set 覆盖. common_uri 暂存 = dataset.commonUri
     // (SSOT, 保存读它) + URI 输入框镜像显示 ('' 断言也显示为空, 徽标区分 — 见
     // syncEndpointCommonUriBadge).
+    // 行模板文案 (#346): 静态词条烙印时同时标注 data-i18n* — 创建即当前语言
+    // (t() 直烙), 语言切换由 applyI18nStaticTexts 静态重放覆盖 (行是动态 DOM,
+    // 标注让每行自带重放契约, 无需维护手抄清单)。状态位例外: 徽标文本 (+
+    // {cu}/✓ included) 与 verify 自定义 title 走 rerenderDynamicForLang 的
+    // dialog 重放块; verify 的 label 文本包 span — 不能标注在 button 上
+    // (data-i18n 走 textContent 整体替换, 会毁掉 .ep-verify-icon 子元素)。
     function addEndpointRow(ep) {
       const row = document.createElement('div');
       row.className = 'endpoint-row';
       row.innerHTML = `
-        <select class="ep-protocol" title="${escapeHtml(t('providers.epProtocolTitle'))}"></select>
-        <input type="text" class="ep-common-uri" placeholder="${escapeHtml(t('providers.uriPlaceholder'))}"
-          title="${escapeHtml(t('providers.endpointUriTitle'))}">
+        <select class="ep-protocol" title="${escapeHtml(t('providers.epProtocolTitle'))}" data-i18n-title="providers.epProtocolTitle"></select>
+        <input type="text" class="ep-common-uri" placeholder="${escapeHtml(t('providers.uriPlaceholder'))}" data-i18n-placeholder="providers.uriPlaceholder"
+          title="${escapeHtml(t('providers.endpointUriTitle'))}" data-i18n-title="providers.endpointUriTitle">
         <button type="button" class="common-uri-badge ep-common-uri-badge" hidden
-          title="${escapeHtml(t('providers.commonUriTitle'))}">+/v1</button>
-        <input type="text" class="ep-base-url" placeholder="${escapeHtml(t('providers.baseUrlPlaceholder'))}">
-        <button type="button" class="btn ep-verify" title="${escapeHtml(t('providers.verifyTitle'))}"><span class="ep-verify-icon"></span>${escapeHtml(t('providers.verify'))}</button>
-        <button type="button" class="btn ep-del" title="${escapeHtml(t('providers.removeEndpoint'))}">✕</button>
+          title="${escapeHtml(t('providers.commonUriTitle'))}" data-i18n-title="providers.commonUriTitle">+/v1</button>
+        <input type="text" class="ep-base-url" placeholder="${escapeHtml(t('providers.baseUrlPlaceholder'))}" data-i18n-placeholder="providers.baseUrlPlaceholder">
+        <button type="button" class="btn ep-verify" title="${escapeHtml(t('providers.verifyTitle'))}" data-i18n-title="providers.verifyTitle"><span class="ep-verify-icon"></span><span data-i18n="providers.verify">${escapeHtml(t('providers.verify'))}</span></button>
+        <button type="button" class="btn ep-del" title="${escapeHtml(t('providers.removeEndpoint'))}" data-i18n-title="providers.removeEndpoint">✕</button>
         <div class="ep-probe-result"></div>`;
       fillEndpointProtocolOptions(row.querySelector('.ep-protocol'));
       if (ep) {
@@ -7864,6 +7938,8 @@
     // 行编辑 (protocol / URI / base_url 任一变更) 时调 none 清除 — 校验结果只对
     // 被验证的 (protocol, base_url, common_uri) 三元组成立. fail 时 title 带
     // detail (行内 .ep-probe-result 有完整呈现, title 是 hover 快速通道).
+    // ok/fail 的自定义 title 落 row dataset.verifyTitle (#346): 静态重放会把
+    // data-i18n-title 打回通用值, dialog 重放块据 dataset 恢复 hover detail。
     function setVerifyState(row, kind, title) {
       const btn = row.querySelector('.ep-verify');
       if (!btn) return;
@@ -7872,11 +7948,12 @@
       if (kind === 'none') {
         icon.textContent = '';
         btn.title = t('providers.verifyTitle');
+        delete row.dataset.verifyTitle;
         return;
       }
       btn.classList.add(kind === 'ok' ? 'v-ok' : kind === 'fail' ? 'v-fail' : 'verifying');
       icon.textContent = kind === 'ok' ? '✓' : kind === 'fail' ? '✗' : '…';
-      if (title) btn.title = title;
+      if (title) { btn.title = title; row.dataset.verifyTitle = title; }
     }
 
     // 端点行 common_uri 输入 → dataset 同步 (输入框是编辑器, dataset 是保存 SSOT):
@@ -8274,17 +8351,20 @@
         : '';
       const row = document.createElement('div');
       row.className = 'route-row';
+      // 行模板文案同 addEndpointRow 的 data-i18n* 标注契约 (#346); 悬空 target
+      // 的 "(missing)" 标注 option 是状态文案 (id 前缀), 不标注 — 切语言残留
+      // 旧语言是已接受瞬态。
       row.innerHTML = `
-        <input type="checkbox" class="route-enabled" title="${escapeHtml(t('providers.col.onTitle'))}">
+        <input type="checkbox" class="route-enabled" title="${escapeHtml(t('providers.col.onTitle'))}" data-i18n-title="providers.col.onTitle">
         <input type="text" class="route-model-pattern" placeholder="gpt-*">
         <select class="route-target">
-          <option value="" ${target ? '' : 'selected'} disabled>${escapeHtml(t('providers.targetPlaceholder'))}</option>
+          <option value="" ${target ? '' : 'selected'} disabled data-i18n="providers.targetPlaceholder">${escapeHtml(t('providers.targetPlaceholder'))}</option>
           ${candidates.map(x => `<option value="${escapeHtml(x.id)}">${escapeHtml(x.id)}</option>`).join('')}
           ${missingOpt}
         </select>
-        <input type="text" class="route-upstream-model" placeholder="${escapeHtml(t('providers.upstreamModelPlaceholder'))}">
+        <input type="text" class="route-upstream-model" placeholder="${escapeHtml(t('providers.upstreamModelPlaceholder'))}" data-i18n-placeholder="providers.upstreamModelPlaceholder">
         <input type="number" class="route-priority" step="1" placeholder="0">
-        <button type="button" class="btn route-del" title="${escapeHtml(t('providers.removeRoute'))}">✕</button>`;
+        <button type="button" class="btn route-del" title="${escapeHtml(t('providers.removeRoute'))}" data-i18n-title="providers.removeRoute">✕</button>`;
       row.querySelector('.route-model-pattern').value = route.model_pattern || '';
       row.querySelector('.route-upstream-model').value = route.upstream_model || '';
       row.querySelector('.route-priority').value = route.priority ?? '';
@@ -8343,15 +8423,18 @@
         : '';
       const row = document.createElement('div');
       row.className = 'member-row';
+      // 行模板文案同 addEndpointRow 的 data-i18n* 标注契约 (#346); "(missing)"/
+      // "(not direct)" 标注 option 是状态文案 (id 前缀), 不标注 — 切语言残留
+      // 旧语言是已接受瞬态。
       row.innerHTML = `
         <select class="member-select">
-          <option value="" ${memberId ? '' : 'selected'} disabled>${escapeHtml(t('providers.memberPlaceholder'))}</option>
+          <option value="" ${memberId ? '' : 'selected'} disabled data-i18n="providers.memberPlaceholder">${escapeHtml(t('providers.memberPlaceholder'))}</option>
           ${candidates.map(x => `<option value="${escapeHtml(x.id)}">${escapeHtml(x.id)}</option>`).join('')}
           ${tagOpt}
         </select>
-        <button type="button" class="btn member-up" title="${escapeHtml(t('providers.memberUpTitle'))}">↑</button>
-        <button type="button" class="btn member-down" title="${escapeHtml(t('providers.memberDownTitle'))}">↓</button>
-        <button type="button" class="btn member-del" title="${escapeHtml(t('providers.removeMember'))}">✕</button>`;
+        <button type="button" class="btn member-up" title="${escapeHtml(t('providers.memberUpTitle'))}" data-i18n-title="providers.memberUpTitle">↑</button>
+        <button type="button" class="btn member-down" title="${escapeHtml(t('providers.memberDownTitle'))}" data-i18n-title="providers.memberDownTitle">↓</button>
+        <button type="button" class="btn member-del" title="${escapeHtml(t('providers.removeMember'))}" data-i18n-title="providers.removeMember">✕</button>`;
       if (memberId) row.querySelector('.member-select').value = memberId;
       document.getElementById('p-members-list').appendChild(row);
     }

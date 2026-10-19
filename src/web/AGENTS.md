@@ -810,6 +810,20 @@ accent 色条); 徽标分两类 — 计数/未读等可扫读徽标用实心 acc
   表格走指纹/renderedHtml 差异重画; **timeline 清空 `#detail` 后全量重建** (keyed
   reconciliation 的复用分支不重绘已有轮次, 只失效 fingerprint 会让轮内文案残留旧
   语言, review M1); usage 置节流后重拉。
+- **编辑 dialog 开启态重放 (#346)**: open*Form 按 existing 烙印的**状态文案**
+  (title "编辑 {id}" / Save / api-key "留空保留 {masked}" placeholder / static
+  override banner) 会被静态重放打回通用值 — `rerenderDynamicForLang` 的 open-dialog
+  块按开启上下文 (`providerFormCtx` / `secretFormCtx`, open 时快照) 经
+  `sync*FormStateTexts()` 重导 (提取 setter + 切语言重放, #341 F1 同款模式)。
+  行模板 (端点/路由/成员行, `add*Row`) 的静态词条烙印时**同时标注 data-i18n\***
+  (静态重放天然覆盖, 每行自带重放契约 — 不维护手抄清单; verify 按钮文本须包
+  span 标注, 直接标 button 会被 textContent 整体替换毁掉 icon 子元素); 状态位
+  (kind hint / 检测矩阵 `probeLastDetect` 快照 / 在途 detecting 占位 / uri 徽标
+  `✓ included` / verify 自定义 title 存 `row.dataset.verifyTitle`) 在重放块补齐。
+  错误/详情态 (消息内嵌服务端原文) 与状态前缀 option ("{id} (missing)" 类) 不
+  重绘 — 瞬态自愈; endpoints 查看弹窗 (`#provider-endpoints`) 的行渲染同属瞬态
+  (关闭重开自愈), 均不在重放面内。回归守卫: im-ui.spec.ts "#346" describe
+  (provider en→zh / 检测矩阵快照重绘 / secret zh→en 双方向)。
 - **刻意不翻译** (两语言同形, 勿"补全"): 品牌 "Secret Guard" / 协议·模型·id 等用户
   数据 / 与 toml 配置字段一一对应的技术标签 (`model_pattern`, `prio`, `auto`,
   `fixed`, `prefix="..."`, raw 按钮字样) / 纯符号 (↓ ✓ ERR Σ —) / `mockStrategyTooltip`
