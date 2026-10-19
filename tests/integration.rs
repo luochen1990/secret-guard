@@ -930,6 +930,37 @@ async fn strips_custom_connection_listed_header() {
     assert_eq!(status, reqwest::StatusCode::OK);
 }
 
+/// FWD-4 正向保真 (#356 子项7): 客户端发的自定义 header **全数到达上游**
+/// (mockito 精确匹配该 header 名与值 — 不匹配则 mock 失效, 请求落非 200).
+/// 既有 header 测试全是剥离向, 此处补契约主断言的正向半面 (端到端锚).
+#[tokio::test]
+async fn forwards_custom_headers_verbatim_to_upstream() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .match_header("x-custom-keep", "v-1")
+        .match_header("x-trace-id", "abc-42")
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    let proxy_url = spawn_proxy(&upstream.url()).await;
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        "{}",
+        &[("x-custom-keep", "v-1"), ("x-trace-id", "abc-42")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "custom headers must reach upstream verbatim (mockito exact-match gate)"
+    );
+}
+
 #[tokio::test]
 async fn records_request_and_response_snapshots() {
     let mut upstream = spawn_mock_upstream().await;
