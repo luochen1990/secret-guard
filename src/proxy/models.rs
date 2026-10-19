@@ -2153,10 +2153,10 @@ mod tests {
 
     // ─── verify 单协议校验的共享防御 (探测基建防御面守卫) ───────────────
     //
-    // (#332 融合: 原 panorama 探测测试 (v1-pair 判族 / recommend / merge /
-    // /anthropic 尾段启发式 / per-outcome 布局证据) 随 `probe_provider_upstream`
-    // 删除 — 同等语义由 `super::origin` 的测试矩阵接管; 此处保留经 verify
-    // 入口守卫共享防御基建 (fetch 超时/有界累积/净化 + probe_headers) 的用例.)
+    // (#332 融合: 原 panorama 探测测试删除 — v1-pair 判族/推荐/merge 的**编排层**
+    // 语义随之消亡 (无消费方); 家族判别件 `classify_v1_family` 由 origin 的
+    // 测试矩阵 + 下方 verify 用例族守卫; 共享防御基建 (fetch 超时/有界累积/
+    // 净化 + probe_headers) 经 verify 入口守卫.)
 
     /// 200 但非法 JSON (gemini 路径) → error (detail 含 invalid JSON).
     #[tokio::test]
@@ -2414,6 +2414,77 @@ mod tests {
         let resp = verify(&server.url(), Some("/v1"), Protocol::OpenAIResponses).await;
         assert_eq!(resp.probes[0].protocol, "openai-responses");
         assert_eq!(resp.probes[0].status, ProbeStatus::Ok);
+    }
+
+    /// verify anthropic 正向: Anthropic-shape 上游 (data[].type+display_name 判别)
+    /// + 显式 cu → ok + common_uri 回显 + models 解析 (judge_v1_family_as 的
+    /// family == expected 分支 — 融合后该分支唯一直接单测).
+    #[tokio::test]
+    async fn verify_anthropic_shape_ok() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v1/models")
+            .with_status(200)
+            .with_body(r#"{"data":[{"type":"model","id":"claude-x","display_name":"X"}]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let resp = verify(&server.url(), Some("/v1"), Protocol::Anthropic).await;
+        let o = &resp.probes[0];
+        assert_eq!(o.protocol, "anthropic");
+        assert_eq!(o.status, ProbeStatus::Ok);
+        assert_eq!(o.models.as_ref().unwrap(), &strs(&["claude-x"]));
+        assert_eq!(o.common_uri.as_deref(), Some("/v1"));
+        mock.assert_async().await;
+    }
+
+    /// 家族判别细粒度 ①: 同一条目 object+display_name 兼有 → **object 字段优先**
+    /// (判 OpenAI 家族) — anthropic 协议打在该形态上 → absent + "speaks OpenAI
+    /// family shape" (选错协议的可行动信号; 原 panorama 测试
+    /// `probe_v1_models_object_field_wins_over_display_name` 的 verify 移植).
+    #[tokio::test]
+    async fn verify_object_field_wins_over_display_name() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/v1/models")
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"dual","object":"model","display_name":"Dual"}]}"#)
+            .create_async()
+            .await;
+        let resp = verify(&server.url(), Some("/v1"), Protocol::Anthropic).await;
+        let o = &resp.probes[0];
+        assert_eq!(o.status, ProbeStatus::Absent);
+        assert_eq!(
+            o.detail.as_deref(),
+            Some("endpoint speaks OpenAI family shape")
+        );
+        assert_eq!(o.common_uri, None);
+    }
+
+    /// 家族判别细粒度 ②: 跨条目扫描**跳过无判别字段条目** — 首条目无判别字段
+    /// (既非 object 也非 type/display_name) 不影响家族判定, 第二条目的
+    /// type+display_name 判 Anthropic → anthropic 协议 ok (原 panorama 测试
+    /// `probe_v1_models_scan_skips_undiscriminated_entries` 的 verify 移植;
+    /// models 含全部条目 id — 条目解析与判别是两路).
+    #[tokio::test]
+    async fn verify_scan_skips_undiscriminated_entries() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/v1/models")
+            .with_status(200)
+            .with_body(
+                r#"{"data":[{"id":"plain"},{"id":"anthro-y","type":"model","display_name":"Y"}]}"#,
+            )
+            .create_async()
+            .await;
+        let resp = verify(&server.url(), Some("/v1"), Protocol::Anthropic).await;
+        let o = &resp.probes[0];
+        assert_eq!(
+            o.status,
+            ProbeStatus::Ok,
+            "无判别首条目不拖偏家族判定, 第二条目判 Anthropic"
+        );
+        assert_eq!(o.models.as_ref().unwrap(), &strs(&["plain", "anthro-y"]));
     }
 
     /// verify 404 → absent (端点不存在 — cu 填错的典型信号); 401 → auth_failed.

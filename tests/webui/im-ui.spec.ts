@@ -3631,6 +3631,19 @@ test.describe("Provider 创建流程 (#332: detect → add → verify)", () => {
     await expect(endpointRow(page).locator(".ep-common-uri-badge")).toHaveText("+/v1");
     await page.locator('#provider-form-el button[value="cancel"]').click();
 
+    // 入口 URL 镜像的 **"/v1 追加" 方向** (prop_entry_url_mirrors_effective_
+    // common_uri 双向覆盖的另一半, versioned 用例守 "" 不追加方向): 显式
+    // cu "/v1" → endpoints 弹窗入口 URL = origin/o/{id}/v1 (复制即用为 SDK
+    // base_url, 不缺 /v1).
+    await row.locator('button[data-action="endpoints"]').click();
+    const dlg = page.locator("#provider-endpoints");
+    await expect(dlg).toBeVisible();
+    const entryOrigin = new URL(page.url()).origin;
+    await expect(dlg.locator('.ep-row[data-short="o"] .ep-url code').last())
+      .toHaveText(`${entryOrigin}/o/${uid}/v1`);
+    await dlg.locator('button[value="close"]').click();
+    await expect(dlg).not.toBeVisible();
+
     autoAcceptAlerts(page);
     await row.locator('button[data-action="delete"]').click();
     await expect(row).not.toBeVisible();

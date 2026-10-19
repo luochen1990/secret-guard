@@ -378,7 +378,7 @@ Pool 不进此本地终结分支 (Router 专属) — pool 入口的 /models 经 
 | `privacy.rs` | 纯模式化 PII 旁路扫描器 (#257 S0.5): 手写 pattern 表 (常见 token 形状, 零新依赖) + redact seam 旁路捕获 (pre-redact 视图) + 有界 channel 后台扫描 + 内存告警存储 (cap 256 FIFO, 已登记值双层排除) + alerts API 视图; 五条红线见文件头 | 文件头部 `//!` |
 | `protect.rs` | SG 凭证自动保护 (#320, SEC-11): sg token + provider key 的 dispatch 层字节层 real→mock 替换 (确定性等长 mock, 强制 Plain — privacy pattern 不可见), fail-open 永不阻塞转发; 明文注册表在 `auth/apikey.rs`, provider key per-request 派生 | 文件头部 `//!` + contracts.md **SEC-11** |
 | `provider.rs` | Provider sum type (Direct 直连·多协议端点 `endpoints` + `select_endpoint` 端点选择 \| Router 路由 \| Pool 套餐池) + Route (model_pattern 通配 / priority / 路由级 upstream_model 重写) + PoolProvider/ExhaustConfig 与内置默认信号表常量 + Effective view + api_key 两来源 (Direct 条目级, 全端点共享) + `resolve_route` 路由链解析 (per-request; Router 跳按请求 model 匹配 + model 重写 pipeline, Pool 跳经 `PoolPicker` 状态机选成员) | 文件头部 `//!` |
-| `proxy/` | dispatch 路径选择 + fan_out 四路径 + Provider 鉴权 + router GET /models 本地合成 + provider 协议探测 (拆分为 mod/helpers/auth/models/recorder/same_proto/cross_proto/fan_out 子模块) | `src/proxy/mod.rs` 头部 `//!` |
+| `proxy/` | dispatch 路径选择 + fan_out 四路径 + Provider 鉴权 + router GET /models 本地合成 + provider 协议探测 (拆分为 mod/helpers/auth/models/origin/recorder/same_proto/cross_proto/fan_out 子模块; origin = 端点发现全景探测 SSOT, #332) | `src/proxy/mod.rs` 头部 `//!` |
 | `record.rs` | ForwardRecord (web 层 DTO, GET /records/{id} 响应 shape) | 文件头部 `//!` |
 | `redact.rs` | RedactionMap + redact/restore pipeline + 形式化契约 C1-C7 | 文件头部 `//!` |
 | `secrets.rs` | SecretEntry 实体 + SecretStrategy 处理策略 (RED-9/RED-10) + Effective view + value 两来源 | 文件头部 `//!` |

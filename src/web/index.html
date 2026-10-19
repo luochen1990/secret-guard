@@ -7806,7 +7806,8 @@
         apply: item => applyEndpointPreset(row, item),
         mountList: el => row.appendChild(el),
       });
-      document.getElementById('p-endpoints-list').appendChild(row);      // 检测结果行的 "添加" 状态对账: 已配置协议集合变了 (新行总是占据某协议).
+      document.getElementById('p-endpoints-list').appendChild(row);
+      // 检测结果行的 "添加" 状态对账: 已配置协议集合变了 (新行总是占据某协议).
       syncDetectResultAddStates();
       return row;
     }
@@ -8483,8 +8484,11 @@
       const ok = face.status === 'ok';
       const icon = ok ? '✓' : face.status === 'error' ? '✗' : '—';
       const cls = ok ? 'st-ok' : face.status === 'error' ? 'st-err' : 'st-none';
+      // 违约防御 (ROB): ok 行的 uri 按 wire 契约必有 ("") — null/undefined 时降级
+      // 空串而非渲染 "+null" (master 版同款防御; "" 与 null 区分: "" = 版本前缀
+      // 已含断言, 显示 included).
       const uriLabel = ok
-        ? (face.uri === '' ? t('providers.commonUriIncluded') : `+${face.uri}`)
+        ? (face.uri == null ? '' : (face.uri === '' ? t('providers.commonUriIncluded') : `+${face.uri}`))
         : '—';
       const ev = ok
         ? detectEvidenceLabel(face)
