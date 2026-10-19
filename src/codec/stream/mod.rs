@@ -1046,7 +1046,8 @@ mod tests {
     // chunk 边界都正确, 不依赖特定的切分位置.
 
     /// 构造一个覆盖多种事件类型的 OpenAI SSE 字节流 (含 text delta / tool_use /
-    /// finish_reason / include_usage / DONE), 用来做任意切分等价性测试.
+    /// finish_reason / include_usage / DONE). 消费者: byte-by-byte 极端切分测试
+    /// (切分等价 property 已参数化为 [`arb_openai_sse_with_expected`], #356).
     fn sample_openai_sse_stream() -> Vec<u8> {
         let chunks = [
             // 帧 1: text delta "Hello" (fan-out 为 MessageStart + BlockStart + BlockDelta).
@@ -1085,24 +1086,30 @@ mod tests {
         ///
         /// 核心不变式: 任意切分点序列 feed 的 snapshot == 一次性 feed 的 snapshot.
         ///
-        /// proptest 生成任意数量的切分点 (1..=16 个, 位置范围覆盖整个流长度).
-        /// 无论 TCP 把流切成什么样的 chunk 序列, reassembly buffer 必须重组出相同语义.
-        /// scan_chunked (经 [`for_each_split_chunk`]) 对切分点做 clamp + 单调化,
-        /// 容忍 proptest 生成的乱序/越界值.
+        /// 两个随机轴 (#356):
+        /// - **流轴**: 经 [`arb_openai_sse_with_expected`] 生成任意合法 OpenAI SSE
+        ///   (事件形态组合参数化 — usage 缺席 × 停止后噪声 × 思考阶段 × 跨 chunk
+        ///   text/partial JSON 累积), 不再只消费固定的 7 帧 sample (#356: 生成器
+        ///   覆盖度是契约要求, 固定样本对全称命题是伪验证).
+        /// - **切分轴**: proptest 生成任意数量的切分点 (1..=16 个, 位置范围覆盖
+        ///   整个流长度). 无论 TCP 把流切成什么样的 chunk 序列, reassembly buffer
+        ///   必须重组出相同语义. scan_chunked (经 [`for_each_split_chunk`]) 对切分点
+        ///   做 clamp + 单调化, 容忍 proptest 生成的乱序/越界值.
         #[test]
         fn prop_arbitrary_chunk_split_equivalence(
-            // 1..=16 个切分点, 位置范围 [0, 2048) 覆盖整个流长度 (~998 字节).
-            splits in proptest::collection::vec(0usize..2048, 1..=16)
+            case in arb_openai_sse_with_expected(),
+            // 1..=16 个切分点, 位置范围 [0, 4096) 覆盖生成器流的最大长度.
+            splits in proptest::collection::vec(0usize..4096, 1..=16)
         ) {
-            let full = sample_openai_sse_stream();
+            let full = case.0;
             // 一次性 feed 的 baseline.
             let mut whole = StreamScan::new(Protocol::OpenAI);
             whole.feed(&full);
             let baseline = whole.snapshot();
             // 任意切分点 feed.
             let chunked = scan_chunked(&splits, &full);
-            // IrResponse 是确定性的 (id/model 来自上游 chatcmpl-x / gpt-4o, 无合成随机),
-            // 所以可以用 assert_eq 严格比较.
+            // IrResponse 是确定性的 (id/model 由生成器固定为 chatcmpl-test/gpt-4o,
+            // 无合成随机), 所以可以用 assert_eq 严格比较.
             prop_assert_eq!(
                 baseline, chunked,
                 "chunk-boundary violation: baseline != chunked for splits {:?}",
@@ -1124,12 +1131,16 @@ mod tests {
         /// chatcmpl-<random> id 和当前 epoch (current_epoch, 取自 SystemTime::now()).
         /// 因此输出含随机 id 和时敏 created. 比较前用 normalize_sse_volatile_fields 把
         /// 这两类字段归一化 (详见函数注释), 消除差异后做字节比较.
+        ///
+        /// 流轴与切分轴均参数化 (#356): 流经 [`arb_openai_sse_with_expected`] 生成
+        /// (事件形态组合随机), 不再只消费固定 7 帧 sample.
         #[test]
         fn prop_stream_translate_chunk_split_equivalence(
-            splits in proptest::collection::vec(0usize..2048, 1..=16)
+            case in arb_openai_sse_with_expected(),
+            splits in proptest::collection::vec(0usize..4096, 1..=16)
         ) {
             use crate::redact::RedactionMap;
-            let full = sample_openai_sse_stream();
+            let full = case.0;
 
             // 一次性 feed baseline.
             let mut whole = StreamTranslate::new_same_proto_restore(
