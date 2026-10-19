@@ -20,6 +20,16 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // #364(a): panic 进 tracing (默认只写 stderr — 服务化部署的 stderr 可能被
+    // 丢弃, panic 需要与普通日志同管道可观测). 保留默认 hook (stderr + backtrace)
+    // 双写; record 关联不在此层 — 转发路径的 record finalize 兜底由
+    // `proxy::recorder::InflightGuard` (Drop guard) 承担, panic 本身经此 hook 留痕.
+    let default_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_panic_hook(info);
+        tracing::error!(target: "panic", %info, "panic");
+    }));
+
     let cli = Cli::parse();
     let args = match cli.command {
         Some(Command::Run(args)) => args,
