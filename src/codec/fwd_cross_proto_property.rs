@@ -372,7 +372,8 @@ fn assert_modeled_fields_equivalent(
         effort_of(ir_in),
         effort_of(ir_out),
         "{direction}: reasoning 配置跨协议往返语义损失\nin={:?}\nout={:?}",
-        ir_in.reasoning, ir_out.reasoning,
+        ir_in.reasoning,
+        ir_out.reasoning,
     );
 
     // system blocks (只比较 text 内容, 跨协议可能形态变化).
@@ -720,9 +721,22 @@ fn arb_anthropic_request_modeled_only() -> impl Strategy<Value = Value> {
         ]),
     )
         .prop_map(
-            |(model, messages, max_tokens, temperature, top_p, top_k, stop, tools, stream, thinking)| {
+            |(
+                model,
+                messages,
+                max_tokens,
+                temperature,
+                top_p,
+                top_k,
+                stop,
+                tools,
+                stream,
+                thinking,
+            )| {
                 let max_tokens = match &thinking {
-                    Some(Value::Object(t)) if t.get("type").and_then(Value::as_str) == Some("enabled") => {
+                    Some(Value::Object(t))
+                        if t.get("type").and_then(Value::as_str) == Some("enabled") =>
+                    {
                         max_tokens.max(32769)
                     }
                     _ => max_tokens,

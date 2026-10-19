@@ -6,3 +6,5 @@
 # everyone who runs the test benefits from these saved cases.
 cc 298e27e041747ce23e2cd5099341fb158749a91a792fef0592007163eb67c2e0 # shrinks to secret = "AaaaaAaA"
 cc 9d0d206585d139ea75703a1e6b4f211fd36bf82eb147c73aac8b2dafa4ae2306 # shrinks to secret = "\"\"\"\"", filler = ""
+cc eb0ae3f2ce4d62d8d68cec56388c83ff862d665ffa0416cb471a0e6c1adde07a # shrinks to mock1 = "aaaaaaaa", mock2 = "aaaaaa", filler = "a", chunk_size = 5
+cc f7df936866280b9046b3c7dd273a9673a91505ca053f7df45ea869d8500e6483 # shrinks to mock1 = "abab", mock2 = "aaaaaaa", filler = "aaaaaaaaaa", chunk_size = 11

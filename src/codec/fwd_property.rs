@@ -1629,8 +1629,7 @@ fn assert_fwd1_half_segment(
     // (内嵌 JSON 叶子经 [`fwd1_replace_leaf_text`] 结构化替换).
     let mock = map.mock_for(secret_value).expect("secret 应被 redact 命中");
     let mut expected = wire.clone();
-    expected
-        .for_each_str_leaf_mut(&mut |s| *s = fwd1_replace_leaf_text(s, secret_value, mock));
+    expected.for_each_str_leaf_mut(&mut |s| *s = fwd1_replace_leaf_text(s, secret_value, mock));
 
     assert_eq!(
         normalize_json(&expected),

@@ -921,10 +921,7 @@ fn anthropic_frame(event_type: &str, data: &Value) -> String {
 /// 比较不受转义干扰, no-mock-leak 的字节级扫描补转义形态 (见
 /// `assert_streaming_restore_fidelity`).
 fn arb_mock_body() -> impl Strategy<Value = String> {
-    prop_oneof![
-        "[a-z]{4,12}",
-        "[a-z\"\\\\]{4,12}",
-    ]
+    prop_oneof!["[a-z]{4,12}", "[a-z\"\\\\]{4,12}",]
 }
 
 /// tool 参数片段 (partial JSON, 含 mock): `{"secret":"<mock>","x":1}` 经
@@ -1943,7 +1940,12 @@ fn assert_cross_proto_streaming_content_fidelity(
     client_sse: &[u8],
 ) -> Result<(), proptest::test_runner::TestCaseError> {
     // 纯翻译: 期望值恒等映射 (identity).
-    assert_cross_proto_content_fidelity_with(upstream_sse, client_sse, str::to_string, str::to_string)
+    assert_cross_proto_content_fidelity_with(
+        upstream_sse,
+        client_sse,
+        str::to_string,
+        str::to_string,
+    )
 }
 
 /// 从 SSE 字节流中收集所有 tool_use 的 (id, name) 对, 按出现顺序.

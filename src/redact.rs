@@ -960,7 +960,10 @@ pub(crate) fn restore_str_inplace(s: &mut String, map: &RedactionMap) -> bool {
 /// restore 替换对的稳定序: restorable (mock, real) 按 mock 长度倒序 (同长度按
 /// 字典序 — 确定性, 与 HashMap 迭代序解耦).
 fn ordered_restore_pairs(map: &RedactionMap) -> Vec<(String, String)> {
-    let mut pairs: Vec<(String, String)> = map.restorable_entries().map(|(m, r)| (m.clone(), r.clone())).collect();
+    let mut pairs: Vec<(String, String)> = map
+        .restorable_entries()
+        .map(|(m, r)| (m.clone(), r.clone()))
+        .collect();
     pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
     pairs
 }
@@ -3289,17 +3292,18 @@ mod tests {
     /// 单射性只保证 mock 两两不同, 不排除子串关系).
     fn arb_overlapping_mock() -> BoxedStrategy<String> {
         prop_oneof![
-            "[a-z]{6,18}",  // 常态: 互不为子串的基线
-            "[ab]{3,10}",   // 2 字符池: 周期串, 高概率互为子串
-            "a{3,9}",       // 单字符周期: self-overlap 极端形态
-            "(ab){2,6}",    // 双字符周期串
+            "[a-z]{6,18}", // 常态: 互不为子串的基线
+            "[ab]{3,10}",  // 2 字符池: 周期串, 高概率互为子串
+            "a{3,9}",      // 单字符周期: self-overlap 极端形态
+            "(ab){2,6}",   // 双字符周期串
         ]
         .boxed()
     }
 
     /// 把 full 切成 chunk_size 字节片喂给 r, 返回 emit + flush 拼接结果.
     /// boundary_align=true 时把 chunk 末尾对齐到 char boundary (UTF-8 测试用).
-    fn push_chunked(        r: &mut StreamingRestorer,
+    fn push_chunked(
+        r: &mut StreamingRestorer,
         full: &str,
         chunk_size: usize,
         boundary_align: bool,
