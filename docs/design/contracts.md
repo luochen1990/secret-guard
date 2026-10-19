@@ -434,6 +434,14 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 - `prop_router_models_cache_keyed_by_egress_protocol` (multi-endpoint, 2026-09-20): 上游清单缓存条目键控 (provider id, 选定端点 egress 协议) — 不同 ingress 入口对同一 Direct provider 各自缓存各自清单: 同一入口 TTL 内重复查询零上游请求 (N4 复用), 另一入口的首次查询触发其各自端点的独立 fetch (不共享条目, 清单不串台)。🔁→`router_models_multi_endpoint_cache_per_ingress` (`tests/router_models.rs`) + `model_list_cache_keyed_by_id_and_egress_protocol` (`src/proxy/models.rs`)
 - `prop_router_models_fetch_selects_endpoint_by_ingress` (multi-endpoint, 2026-09-20): /models 的上游 fetch 端点选择与 dispatch 转发路径同一语义 (`select_endpoint(ingress)`): ingress 精确匹配 → 该端点 + 其 egress 协议方言的请求 (anthropic 端点 fetch 带 anthropic-version header); 无匹配 → 首端点 (D2)。🔁→`router_models_multi_endpoint_cache_per_ingress` (match_header 锁定 egress 方言) + `router_tail_multi_endpoint_selects_endpoint_by_ingress` + `pool_member_multi_endpoint_selects_endpoint_by_ingress` (`tests/integration.rs`, dispatch 层同型语义)
 
+### FWD-8 graceful shutdown drain 语义 (#365, 2026-10-20)
+
+**陈述**: SIGTERM / Ctrl-C 到达后: ① 停止接受新连接; ② 置 shutdown flag (watch channel) 唤醒无限长流 (`/api/events` SSE 等 — 否则 drain 挂起); ③ 已建立的在途连接 **drain 到完成** — 客户端收到完整响应后进程才退出 (exit 0)。drain 无独立超时上限: 防挂职责归上游超时体系 (FWD-4 "超时职责分工"), drain 只是等待。drain 完成后 serve 返回前执行 usage 尾批落库屏障 (USAGE-8)。实现: `server.rs::serve` (`with_graceful_shutdown` + watch flag 两段式)。
+
+**Properties**:
+- `prop_sigterm_drains_inflight_request`: 上游慢响应 (2s) 请求在途时发 SIGTERM → 客户端仍收到完整 200 响应 (body 完整) 且进程 exit 0 (非 kill 退出)。🔁→`sigterm_drains_inflight_request_to_completion` (`tests/shutdown_drain.rs`, 真实二进制端到端)
+- `prop_shutdown_flag_wakes_infinite_streams`: shutdown flag 置位 → SSE 无限长流限时结束 (drain 不被挂起的前置)。🔁→`sse_events_stream_ends_on_shutdown_flag` (`tests/integration.rs`)
+
 ---
 
 ## 2. RED: Redact / Restore

@@ -98,7 +98,7 @@
 | `CDAG-*` | B | **DAG INV-1..5** + 新增 | 内容寻址 + Merkle + refcount + 孤儿节点 + session 稳定 |
 | `CFG-*` | B | 新增 | 双层配置合并 / CRUD / 持久化 / 并发 |
 | `DTO-*` | B | 新增 | WebUI DTO 派生 (redactions / resp_parsed / preview / delta / title) |
-| `FWD-*` | A | codec INV-1/2/5, proxy DoD | 透明中继 byte-exact + codec round-trip + HTTP 透传 + 路由 + 鉴权 |
+| `FWD-*` | A | codec INV-1/2/5, proxy DoD | 透明中继 byte-exact + codec round-trip + HTTP 透传 + 路由 + 鉴权 + graceful drain |
 | `POOL-*` | A | 新增 (Pool Provider, 待人工授权) | 套餐池顺序 failover + 三通道耗尽检测 + 闹钟自愈 + 全耗尽本地 503 + 检测旁路 + 默认表语义域 |
 | `RED-*` | A | **C1-C7** (redact/mock) | Redact/Restore 可逆双射 + 不泄漏 + 前缀缓存友好 |
 | `ROB-*` | 跨 | 鲁棒性原则 | best-effort 永不 panic + 假设声明注释必备 |
