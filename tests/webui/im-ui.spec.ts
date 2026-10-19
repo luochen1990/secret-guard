@@ -2887,6 +2887,145 @@ test.describe("WebUI 表单失败保持 (#181)", () => {
   });
 });
 
+// ─── #348: 编辑动态 reset — 撤销 dynamic override 回 static 基线 ──────────
+//
+// 缺口 (issue #348): "编辑动态" 表单 (static_preferred / dynamic_override 行) 只有
+// 更新/取消, 无法 "重置为空态 (未覆盖状态)". 本 describe 守卫:
+//   1. 编辑动态表单渲染 reset 按钮 + hover title 语义说明;
+//   2. confirm 取消不改状态 / 确认后条目回 static 基线 (override 按钮 + decision=default);
+//   3. 无可重置场景 (static-only / 纯 dynamic) 不渲染 reset 按钮.
+test.describe("#348: 编辑动态 reset (撤销 dynamic override)", () => {
+  // 状态卫生: 还原被 fork 的 static 条目到基线 (reset 端点幂等, 已是基线时 no-op);
+  // 清理本 describe 创建的 dynamic-only 条目 (DELETE 幂等, 404 无害).
+  test.afterEach(async ({ request }) => {
+    await request.delete(`${SG_API}/secrets/test-key/override`);
+    await request.delete(`${SG_API}/providers/mock-gemini/override`);
+    await request.delete(`${SG_API}/secrets/dyn-only-348`);
+  });
+
+  /** fork static secret: PUT 创建 dynamic override + PATCH prefer_static → static_preferred. */
+  async function forkSecretToStaticPreferred(request: any, id: string, value: string) {
+    const put = await request.put(`${SG_API}/secrets/${id}`, { data: { value } });
+    expect(put.ok()).toBe(true);
+    const patch = await request.patch(`${SG_API}/secrets/${id}/decision`, {
+      data: { mode: "prefer_static" },
+    });
+    expect(patch.ok()).toBe(true);
+  }
+
+  test("secret: reset 可见+tooltip; confirm 取消保持, 确认后回 static 基线", async ({
+    page,
+    request,
+  }) => {
+    await forkSecretToStaticPreferred(request, "test-key", "reset-flow-override-value-348");
+    await page.goto("/");
+    await page.locator('a.tab[data-tab="secrets"]').click();
+    const row = page.locator('#secrets-body tr[data-id="test-key"]');
+    await expect(row).toBeVisible();
+    // static_preferred 行的编辑按钮文案是 "edit dyn" (en locale).
+    await expect(row.locator('button[data-action="edit"]')).toHaveText("edit dyn");
+
+    await row.locator('button[data-action="edit"]').click();
+    const dlg = page.locator("#secret-form");
+    await expect(dlg).toBeVisible();
+
+    // reset 按钮可见 + hover title 说明语义 (issue 要求: hover 说明操作语义).
+    const resetBtn = page.locator('#secret-form button.btn-reset-override');
+    await expect(resetBtn).toBeVisible();
+    const title = await resetBtn.getAttribute("title");
+    expect(title, "reset 按钮 title 必须非空 (hover 语义说明)").toBeTruthy();
+    expect(title).toContain("static");
+
+    // confirm 取消: 表单保持打开, 状态未变.
+    let sawConfirm = false;
+    let confirmMsg = "";
+    page.once("dialog", async (d) => {
+      sawConfirm = true;
+      confirmMsg = d.message();
+      await d.dismiss();
+    });
+    await resetBtn.click();
+    await page.waitForTimeout(200);
+    expect(sawConfirm, "reset 必须有 confirm 二次确认").toBe(true);
+    // confirm 文案点名目标条目 (防误重置其他条目的歧义确认).
+    expect(confirmMsg).toContain("test-key");
+    await expect(dlg).toBeVisible();
+
+    // confirm 确认: 表单关闭, 行回到 static 基线 — 按钮变 override, decision 回 default.
+    page.once("dialog", async (d) => await d.accept());
+    await resetBtn.click();
+    await expect(dlg).not.toBeVisible();
+    await expect(
+      page.locator('#secrets-body tr[data-id="test-key"] button[data-action="edit"]')
+    ).toHaveText("override");
+    await expect(
+      page.locator('#secrets-body tr[data-id="test-key"] select.decision-select')
+    ).toHaveValue("default");
+  });
+
+  test("provider: 同型 reset — 撤销 override 回 static 基线", async ({ page, request }) => {
+    // fork static provider mock-gemini (direct + gemini 端点全量回传) + prefer_static.
+    const put = await request.put(`${SG_API}/providers/mock-gemini`, {
+      data: {
+        name: "gemini-override-348",
+        endpoints: [{ protocol: "gemini", base_url: "http://127.0.0.1:19999" }],
+      },
+    });
+    expect(put.ok()).toBe(true);
+    const patch = await request.patch(`${SG_API}/providers/mock-gemini/decision`, {
+      data: { mode: "prefer_static" },
+    });
+    expect(patch.ok()).toBe(true);
+
+    await page.goto("/");
+    await page.locator('a.tab[data-tab="providers"]').click();
+    const row = page.locator('#providers-body tr[data-id="mock-gemini"]');
+    await expect(row).toBeVisible();
+    await expect(row.locator('button[data-action="edit"]')).toHaveText("edit dyn");
+
+    await row.locator('button[data-action="edit"]').click();
+    const dlg = page.locator("#provider-form");
+    await expect(dlg).toBeVisible();
+    const resetBtn = page.locator('#provider-form button.btn-reset-override');
+    await expect(resetBtn).toBeVisible();
+
+    page.once("dialog", async (d) => await d.accept());
+    await resetBtn.click();
+    await expect(dlg).not.toBeVisible();
+    await expect(
+      page.locator('#providers-body tr[data-id="mock-gemini"] button[data-action="edit"]')
+    ).toHaveText("override");
+  });
+
+  test("无可重置场景不渲染 reset (static-only / 纯 dynamic)", async ({ page, request }) => {
+    // 卫生: 确保 test-key 处于 static 基线 (前面用例的 afterEach 已还原, 双保险).
+    await request.delete(`${SG_API}/secrets/test-key/override`);
+
+    // static-only (override 按钮): 无覆盖可撤销 → reset 隐藏.
+    await page.goto("/");
+    await page.locator('a.tab[data-tab="secrets"]').click();
+    const staticRow = page.locator('#secrets-body tr[data-id="test-key"]');
+    await expect(staticRow.locator('button[data-action="edit"]')).toHaveText("override");
+    await staticRow.locator('button[data-action="edit"]').click();
+    await expect(page.locator("#secret-form")).toBeVisible();
+    await expect(page.locator('#secret-form button.btn-reset-override')).toBeHidden();
+    await page.locator('#secret-form-el button[value="cancel"]').click();
+
+    // 纯 dynamic 条目: "空态" = 行级 Delete 的既有管辖, 表单内不渲染 reset.
+    const r = await request.post(`${SG_API}/secrets`, {
+      data: { id: "dyn-only-348", value: "pure-dynamic-value-348" },
+    });
+    expect(r.ok()).toBe(true);
+    await page.locator('a.tab[data-tab="secrets"]').click(); // 显式点击 = 即时刷新
+    const dynRow = page.locator('#secrets-body tr[data-id="dyn-only-348"]');
+    await expect(dynRow).toBeVisible();
+    await dynRow.locator('button[data-action="edit"]').click();
+    await expect(page.locator("#secret-form")).toBeVisible();
+    await expect(page.locator('#secret-form button.btn-reset-override')).toBeHidden();
+    await page.locator('#secret-form-el button[value="cancel"]').click();
+  });
+});
+
 test.describe("Provider 表单构造分野 (#190)", () => {
   test.beforeEach(async ({ page }) => {
     await page.goto("/");

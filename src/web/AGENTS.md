@@ -74,6 +74,9 @@ PUT    /api/secrets/{id}
 DELETE /api/secrets/{id}            → static 基线存在 (含 override) 一律 409 (#156);
                                        仅 dynamic-only 可删 (204)
 PATCH  /api/secrets/{id}/decision     body: {"mode": "default|prefer_static|disabled"}
+DELETE /api/secrets/{id}/override   → 重置为空态 (#348): 删 dynamic override +
+                                      清 decision (单次原子 RMW), 回 static 基线;
+                                      幂等 204; 非 static id 404
                                      注: GET 响应另含 builtin_protection (#320 内置
                                      自动保护计数 {sg_tokens, provider_keys}, WebUI
                                      secrets tab 徽章数据源; 仅计数, 无明文/mock)
@@ -83,6 +86,7 @@ POST   /api/providers
 PUT    /api/providers/{id}
 DELETE /api/providers/{id}           → 同 secrets (#156)
 PATCH  /api/providers/{id}/decision
+DELETE /api/providers/{id}/override  → 重置为空态 (#348), 语义同 secrets 侧
 POST   /api/providers/probe          body: {base_url, api_key?, protocol!, common_uri?} →
                                          {probes[1] (被验证协议, status: ok|auth_failed|
                                           absent|error, models?, detail?, urls[1],
@@ -451,6 +455,18 @@ API key CRUD **无条件挂载** (在 `web::router()`, 不依赖 `auth.enabled`)
 - **列表 direct 行** (multi-endpoint): 每端点一枚 protocol pill (集合展示, tooltip
   附该端点 base_url); URL cell 显示第一端点 base_url (声明序 = fallback 序) +
   "+N" 角标 (td title 全量 `protocol: base_url` 列表). disabled 行同型展示.
+
+### 编辑表单 reset 按钮 (撤销 dynamic override, #348)
+
+secret / provider 编辑表单 (`.actions` 区, Cancel 左侧) 的 `button.btn-reset-override`
+(#348 "重置为空态"): 点击 → confirm 二次确认 (破坏性 — 丢弃 dynamic 编辑) →
+`DELETE /api/{secrets|providers}/{id}/override` (删 override + 清 decision, 后端单次
+原子 RMW) → 刷新 + 关表单。**显隐 SSOT = `toggleResetAction`**: 仅被编辑条目
+source 为 `static_preferred` | `dynamic_override` (static 基线 + dynamic override
+并存) 时显示; `static` (尚无覆盖) / `dynamic` (纯动态 — "空态" 是行级 Delete 的既有
+管辖) 不显示。hover 语义说明 = i18n `action.resetTip` (data-i18n-title 自动应用)。
+回归守卫: `tests/webui/im-ui.spec.ts` "#348: 编辑动态 reset" describe (三条: secret
+全流程含 confirm 取消/确认 / provider 同型 / 无可重置场景不渲染)。
 
 ### Secret 表单 (mock strategy 脏检查, #319)
 

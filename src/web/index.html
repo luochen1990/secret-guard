@@ -2235,6 +2235,7 @@
       </fieldset>
 
       <div class="actions">
+        <button type="button" class="btn btn-danger btn-reset-override" data-i18n="action.reset" data-i18n-title="action.resetTip" hidden>Reset</button>
         <button class="btn" value="cancel" data-i18n="common.cancel">Cancel</button>
         <button class="btn" value="save" id="f-save" data-i18n="common.create">Save</button>
       </div>
@@ -2346,6 +2347,7 @@
       <label for="p-enabled" data-i18n="providers.enabled">Enabled</label>
       <input type="checkbox" id="p-enabled" checked>
       <div class="actions">
+        <button type="button" class="btn btn-danger btn-reset-override" data-i18n="action.reset" data-i18n-title="action.resetTip" hidden>Reset</button>
         <button class="btn" value="cancel" data-i18n="common.cancel">Cancel</button>
         <button class="btn" value="save" id="p-save" data-i18n="common.create">Save</button>
       </div>
@@ -2586,6 +2588,9 @@
         'decision.warningFor': 'Warning for {id}: {msg}',
         'action.override': 'override',
         'action.editDyn': 'edit dyn',
+        'action.reset': 'reset',
+        'action.resetTip': 'Delete this dynamic override and its decision — the entry falls back to its static baseline (unoverridden state).',
+        'confirm.resetOverride': 'Reset {id} to its static baseline? The dynamic override (and any decision) will be deleted from state.toml.',
         'confirm.deleteItem': 'Delete dynamic {kind} {id}?',
         // ── secrets tab ──
         'secrets.new': '+ new dynamic secret',
@@ -3075,6 +3080,9 @@
         'decision.warningFor': '{id} 的警告: {msg}',
         'action.override': '覆盖',
         'action.editDyn': '编辑动态',
+        'action.reset': '重置',
+        'action.resetTip': '删除该条目的动态覆盖与 decision — 条目回到 static 基线 (未覆盖状态)。',
+        'confirm.resetOverride': '将 {id} 重置为 static 基线? 其动态覆盖与 decision 将从 state.toml 中删除。',
         'confirm.deleteItem': '删除动态 {kind} {id}?',
         // ── secrets tab ──
         'secrets.new': '+ 新建动态 secret',
@@ -5980,7 +5988,9 @@
 
     // 通用 actions 按钮 (source 一致 → 按钮一致). 返回 HTML 字符串.
     // 注: dynamic_override (static 基线存在) 不渲染 delete/revert — #156 后 DELETE
-    // 对其必 409; 撤销 override / 停用走 decision 选择器 (prefer_static / disabled).
+    // 对其必 409; 停用走 decision 选择器 (disabled), 撤销 override 走编辑表单内
+    // 的 reset 按钮 (DELETE /{id}/override, #348 — decision 只能遮蔽/复活覆盖,
+    // 不能清掉 dynamic 层痕迹).
     function rowActions(item) {
       const id = escapeHtml(item.id);
       const s = item.source;
@@ -7216,6 +7226,7 @@
       loadMockStrategyIntoForm(existing?.mock_strategy);
       title.textContent = existing ? t('form.secret.editTitle', { id: existing.id }) : t('form.secret.newTitle');
       toggleOverrideBanner(dlg, existing);
+      toggleResetAction(dlg, existing);
       dlg.dataset.editId = existing ? existing.id : '';
       saveBtn.textContent = existing ? t('common.update') : t('common.create');
       dlg.showModal();
@@ -7762,6 +7773,7 @@
       document.getElementById('p-enabled').checked = existing ? existing.enabled : true;
       title.textContent = existing ? t('form.provider.editTitle', { id: existing.id }) : t('form.provider.newTitle');
       toggleOverrideBanner(dlg, existing);
+      toggleResetAction(dlg, existing);
       dlg.dataset.editId = existing ? existing.id : '';
       saveBtn.textContent = existing ? t('common.update') : t('common.create');
       dlg.showModal();
@@ -8697,6 +8709,19 @@
       }
     }
 
+    /// #348 reset 按钮显隐: 仅当被编辑条目是 "static 基线 + dynamic override"
+    /// (source = static_preferred | dynamic_override) 时显示 — 这两种形态下
+    /// 重置 = 撤销 override + 清 decision, 回到未覆盖基线.
+    /// 其余 source 不显示: static (尚无覆盖可撤销) / dynamic (纯动态条目的
+    /// "空态" 是行级 Delete 的既有管辖, 表单内不放第二入口).
+    function toggleResetAction(dlg, existing) {
+      const btn = dlg.querySelector('button.btn-reset-override');
+      if (!btn) return;
+      const overlayOnStatic = !!existing
+        && (existing.source === 'static_preferred' || existing.source === 'dynamic_override');
+      btn.hidden = !overlayOnStatic;
+    }
+
     // 通用 form submit (按 dlg + payload 构造器分发, 通过 KINDS 查表避免 ternary 字符串匹配).
     function bindFormSubmit(kind, formId, buildPayload) {
       const cfg = KINDS[kind];
@@ -8734,6 +8759,34 @@
         }
       });
     }
+
+    // #348 重置: 撤销被编辑条目的 dynamic override (删 override + 清 decision,
+    // 后端单次原子 RMW), 回到 static 基线 ("重置为空态"). 破坏性操作 (丢弃
+    // dynamic 编辑) → confirm 二次确认 (与 deleteItem / decision-disable 同型).
+    // 按钮本身由 toggleResetAction 控制只在可重置形态渲染; 此处 editId 兜底.
+    function bindFormReset(kind) {
+      const cfg = KINDS[kind];
+      const dlg = document.getElementById(cfg.formDlgId);
+      dlg.querySelector('button.btn-reset-override').addEventListener('click', async () => {
+        const id = dlg.dataset.editId;
+        if (!id) return;
+        if (!confirm(t('confirm.resetOverride', { id }))) return;
+        try {
+          const r = await fetch(`${cfg.api}/${encodeURIComponent(id)}/override`, { method: 'DELETE' });
+          if (!r.ok) {
+            const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+            alert(t('common.alertFailed', { msg: err.error || r.status }));
+            return;
+          }
+          await cfg.refresh();
+          dlg.close();
+        } catch (e) {
+          alert(t('common.alertError', { msg: e.message }));
+        }
+      });
+    }
+    bindFormReset('secret');
+    bindFormReset('provider');
 
     bindFormSubmit('secret', 'secret-form-el', () => ({
       id: document.getElementById('f-id').value.trim() || null,
