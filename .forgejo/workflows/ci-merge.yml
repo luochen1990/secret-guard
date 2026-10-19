@@ -12,6 +12,8 @@
 #   三档; 本文件继承其全部 P0 层 step 与 sg 特有定制 (锁守卫 / PR 评论矩阵 / 持久卷 env /
 #   工具链留痕 / Diagnose 评论)。移出档: coverage+coverage-gate→P2, bench→P1, WebUI→P2,
 #   audit→P1, nix build→P1 (各 step 去向表见 PR 描述 / docs/ci.md)。
+#   [v3.1 #355] WebUI Playwright 以 path-filtered 阻塞子集回归 P0 (WebUI 面变更的 PR
+#   才跑, 见 "WebUI regression gate" step 注释); P2 nightly 全量非阻塞兜底不变。
 #   双 job (pre+check) 内联 jq 探针被替换为共享本地 action skip-if-passed (逻辑层机器同步,
 #   与 SSOT 逐字节 cmp): 过滤全量下沉服务端查询参数 (head_sha/status/workflow_id), 免去
 #   各仓库内联拷贝的漂移面; 单 job 形态同时消除 "pre job 级故障 → check 被静默 skip →
@@ -103,15 +105,17 @@ jobs:
     # pull_request.draft = forgejo IsWorkInProgress(), 阻塞合并的同一 SSOT;
     # 全 skip 时 run 结论 skipped 非 success, 不污染 skip-if-passed)
     if: ${{ (github.event_name != 'push' || github.ref == 'refs/heads/master') && (github.event_name != 'pull_request' || github.event.pull_request.draft != true) }}
-    # 冷启动预算 (tier-collapse 重算): P0 最坏冷链 (持久卷全清) = 一轮全量档 debug
-    # 编译 (clippy + nextest, ~20min, issue #149-1 实测) + diff/toolchain/filesize
-    # (~2min) ≈ 22min; 已不含移出档的最坏耗时 (插桩 llvm-cov 编译 / release LTO bench
-    # 编译 10-20min / playwright / audit / nix 全量 vendor ≤30min — 分摊到 ci-deploy
-    # 60min 与 ci-periodic 45min 预算).
-    # 取 40min 留 ~80% 余量 (job timeout 是硬上限, 超时算 failure 阻塞合并,
+    # 冷启动预算 (tier-collapse 重算 + #355 WebUI step): P0 最坏冷链 (持久卷全清) =
+    # 一轮全量档 debug 编译 (clippy + nextest, ~20min, issue #149-1 实测) +
+    # diff/toolchain/filesize (~2min) ≈ 22min; WebUI 面变更的 PR 再加 bin 构建
+    # ~1-2min + Playwright 3-5min + flake 重试最坏 +5min ⇒ ~34min.
+    # 仍不含其余移出档的最坏耗时 (插桩 llvm-cov 编译 / release LTO bench 编译
+    # 10-20min / audit / nix 全量 vendor ≤30min — 分摊到 ci-deploy 60min 与
+    # ci-periodic 45min 预算).
+    # 取 45min 留 ~30% 余量 (job timeout 是硬上限, 超时算 failure 阻塞合并,
     # continue-on-error 救不了). 正常热路径 ~8-9min (deps 缓存命中时一轮 crate 本体
-    # codegen ~5min + 测试执行 ~2.5min + 静态链 ~1.5min).
-    timeout-minutes: 40
+    # codegen ~5min + 测试执行 ~2.5min + 静态链 ~1.5min); WebUI 面变更 +4-7min.
+    timeout-minutes: 45
     # 不声明 permissions: (Forgejo 不支持, 见文件头) — 迁移 GitHub 恢复 actions: read + pull-requests: write
     #
     # CARGO_TARGET_DIR 指向 runner VM 的持久卷, 跨 job 复用编译产物.
@@ -375,13 +379,77 @@ jobs:
         if: success() && steps.skip.outputs.should_skip != 'true'
         run: just check-file-size
 
+      # WebUI 回归门禁 (path-filtered Playwright, 阻塞, #355) ─────────────────────
+      # 背景: 前端不变量 (UI-1..11) 的 Playwright 回归此前不在任何阻塞门禁 (唯一执行点
+      # P2 nightly 双重非阻塞: continue-on-error + run 内恒绿), index.html 选择器重构 /
+      # DTO 字段漂移 / 前端渲染回归可 P0 全绿合入 — 守卫退化为纯纪律. 本步把守卫提前到
+      # 合入时刻, 用路径过滤收窄 flake 面 (WebUI 在 CI 环境无 GPU, 渲染/timing 抖动
+      # flake 率高, 全量常开会误伤无关 PR):
+      #   - 命中面 = spec↔DOM 契约的供给侧: src/web (前端 + JSON API) / src/dag
+      #     (渲染数据源) / src/dto.rs (wire shape) / tests/webui (spec 本体 + config).
+      #   - 三点 diff 先例 = diff breakdown step (origin/<base> 已由 checkout 链 fetch,
+      #     ref 必在本地, 无 Nix gate 的 BASE_SHA 对象缺失 fallback 分支). 不加
+      #     --diff-filter: 删除 spec/前端文件同样是 WebUI 面变更, 理应触发 (Nix gate
+      #     去 D 的理由 — 已删文件无从解析 — 不适用于 "跑测试" 语义).
+      #   - 仅 pull_request 事件: PR 是合入判定时刻; push master 浅克隆无 diff base 且
+      #     同 SHA 已在 PR 时刻验证过 (merge commit 场景由 P2 nightly per-SHA 兜底);
+      #     dispatch 想跑 WebUI 的逃生舱 = ci-periodic dispatch (可选任意分支).
+      #   - 阻塞语义 + 一次性重试: 不用 continue-on-error (本步是门禁不是兜底), 单次
+      #     重试缓冲 CI flake (#86-2 观察) — 连续两次失败才判红.
+      #   - binary 就绪: cargo build 先链出 debug/secret-guard — 满足 playwright.config.ts
+      #     的 freshness 门卫 (#314: binary mtime ≥ src/ 输入集 max mtime; check 主链的
+      #     clippy 是 check-only 产物, bin 未必链出, 显式构建消除该假设). 默认档构建与
+      #     P2 的全量档插桩产物二分覆盖两种 feature 配置; 复用主链已编依赖, 仅 bin 链接
+      #     为增量开销.
+      - name: WebUI regression gate (path-filtered)
+        id: webui
+        if: success() && steps.skip.outputs.should_skip != 'true' && github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          changed="$(git diff --name-only "origin/${BASE_REF}...HEAD" -- src/web src/dag src/dto.rs tests/webui)"
+          if [ -z "$changed" ]; then
+            echo "webui: src/web / src/dag / src/dto.rs / tests/webui 无变更, 直通"
+            exit 0
+          fi
+          echo "webui: WebUI 面变更命中, 跑 Playwright 回归 (阻塞, 一次重试缓冲 flake):"
+          printf '%s\n' "$changed" | sed 's/^/  /'
+          cargo build --locked
+          if just check-webui; then
+            echo "✓ webui: OK (首次通过)"
+          else
+            echo "::warning::webui 首次失败 — 重试一次 (flake 缓冲, 连续两次失败才判红)"
+            just check-webui
+            echo "✓ webui: OK (重试通过)"
+          fi
+
+      # WebUI 门禁失败时上传 Playwright 产物 (截图/trace/报告) 供排查 — P0 是阻塞门禁,
+      # contributor 通常无日志访问权限 (Diagnose 同动机), 无 artifact 则红因不可诊断.
+      # 条件 outcome == 'failure': step 真实跑过且失败 (直通/跳过时 outcome != failure,
+      # 不上传空 artifact); continue-on-error: 上传失败不改变 job 判定 (门禁结论已定).
+      # action 用 Forgejo 官方 fork (同 ci-periodic.yml 的 P2 上传 step; GitHub 官方
+      # upload-artifact@v4 检测非 GitHub 环境直接报错).
+      - name: Upload Playwright artifacts on gate failure
+        if: always() && steps.webui.outcome == 'failure'
+        continue-on-error: true
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: playwright-p0-failure
+          # 与 P2 同路径 (just check-webui 在 repo 根执行, Playwright 默认产物路径):
+          path: |
+            tests/webui/test-results/
+            tests/webui/playwright-report/
+          retention-days: 14
+
       # 诊断 step: job 失败时把所有阻塞 step 的 outcome 汇总贴到 PR 评论,
       # 帮助无 admin 权限的 contributor 定位失败 step (无日志访问权限时的 fallback).
       # 仅 PR 事件 + job 失败时触发. continue-on-error 兜底 (评论失败不影响 job 状态).
       # 工具链版本 (issue #149-5b) 携带在此评论: 每次失败留痕 rustc 版本, 便于事后
       # 追溯 "三源漂移" 类问题 (clippy 新 lint 突然阻塞).
-      # v3.0: 表随三档结构更新 — bench/playwright/audit/nix build 不再在本 job (去向
-      # ci-deploy / ci-periodic, 见 docs/ci.md 步骤去向表).
+      # v3.0: 表随三档结构更新 — bench/audit/nix build 不在本 job (去向 ci-deploy,
+      # 见 docs/ci.md 步骤去向表); WebUI 于 #355 以 path-filtered 阻塞子集回归本 job
+      # (表格加 webui 行; 未跑 = WebUI 面无变更或非 PR 事件, 见 step 注释).
       - name: Diagnose failure (post step outcomes to PR)
         if: always() && failure() && github.event_name == 'pull_request'
         continue-on-error: true
@@ -402,9 +470,12 @@ jobs:
             echo "| Nix syntax gate (.nix 变更纯解析冒烟) | nixgate | ${{ steps.nixgate.outcome }} |"
             echo "| Quality gate (check 主链全量档 --features oidc,consistency-check: fmt/clippy/machete/doc/nextest/typos/deny-offline/check-contracts) | gate | ${{ steps.gate.outcome }} |"
             echo "| File size | filesize | ${{ steps.filesize.outcome }} |"
+            echo "| WebUI gate (path-filtered Playwright, #355) | webui | ${{ steps.webui.outcome }} |"
             echo ""
-            echo "(coverage-gate/WebUI/bench/audit/nix build 不在本 job — v3.0 三档拆分后分别归"
-            echo " ci-periodic (P2) 与 ci-deploy (P1), 各自 run 红即可见, 无 PR 评论矩阵.)"
+            echo "(coverage-gate/bench/audit/nix build 不在本 job — v3.0 三档拆分后分别归"
+            echo " ci-periodic (P2) 与 ci-deploy (P1), 各自 run 红即可见, 无 PR 评论矩阵."
+            echo " WebUI 见上方 webui 行: success 但未跑测试 = WebUI 面无变更直通,"
+            echo " skipped = 非 PR 事件或内容去重; 语义见 step 注释.)"
             echo ""
             echo "**Job status**: ${{ job.status }}"
             echo "**Run**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

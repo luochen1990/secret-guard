@@ -86,15 +86,26 @@ single-job runner 上串行占位, 延迟最新 push 的反馈. workflow 级
 10. **File size gate** (`just check-file-size`): `rust-diff-analyzer` 对每个 .rs 做 AST
     分类, 只统计 prod 行数 (排除 test), 双阈值 (WARN 500 软提醒 / MAX 1600 硬阻断,
     fail-closed)。
-11. **Diagnose failure** (仅 PR + job 失败时, `continue-on-error`): 阻塞 step outcomes
+11. **WebUI regression gate (path-filtered)** (#355, 仅 PR 事件): 三点 diff
+    (`origin/<base>...HEAD`, 同 diff breakdown step 的 base ref 先例) 命中 `src/web` /
+    `src/dag` / `src/dto.rs` / `tests/webui` 才跑 — 前端不变量 (UI-1..11) 的合入时刻
+    守卫 (此前唯一执行点 P2 nightly 双重非阻塞, 选择器重构/DTO 漂移可全绿合入)。
+    阻塞语义 + 一次性重试 (flake 缓冲, 连续两次失败才红); `cargo build --locked` 先
+    链出 debug binary 满足 freshness 门卫 (#314 — clippy 是 check-only 产物, bin 未必
+    链出); push/dispatch 不跑 (浅克隆无 diff base, 同 SHA 已在 PR 时刻验证, merge
+    commit 由 P2 nightly per-SHA 兜底)。完整设计见 workflow step 注释。
+12. **Upload Playwright artifacts on gate failure** (webui step 失败时,
+    `continue-on-error`): 截图/trace/报告 artifact (retention 14 天) — P0 门禁失败时
+    contributor 无日志权限 (Diagnose 同动机), artifact 是红因诊断的自助材料。
+13. **Diagnose failure** (仅 PR + job 失败时, `continue-on-error`): 阻塞 step outcomes
     汇总表 + 工具链版本贴到 PR 评论 (无日志权限 contributor 的 fallback)。
-12. **Guard single-job assumption (verify)** (`if: always()`): 校验 acquire step 写入的
+14. **Guard single-job assumption (verify)** (`if: always()`): 校验 acquire step 写入的
     锁文件未被覆盖; 被覆盖则显式失败并指向 "并发互斥假设" 段的应对预案。
 
-> **流程顺序原则**: 真正非阻塞的附加检查 (diff 报告 / Diagnose) 用 `continue-on-error`
-> 兜底, 即使抽风也不影响 `check` job 状态; 阻塞门禁 (check 主链全量档
-> 含 doc/--locked/typos/deny-offline/check-contracts / nix 语法门禁 / file-size / lock
-> 校验) 失败则 job 失败。
+> **流程顺序原则**: 真正非阻塞的附加检查 (diff 报告 / Diagnose / artifact 上传) 用
+> `continue-on-error` 兜底, 即使抽风也不影响 `check` job 状态; 阻塞门禁 (check 主链全量档
+> 含 doc/--locked/typos/deny-offline/check-contracts / nix 语法门禁 / file-size / WebUI
+> 门禁 (path-filtered) / lock 校验) 失败则 job 失败。
 
 ### P1 ci-deploy.yml (master push + nightly `0 19 * * *` + 手动; `just ci-deploy`)
 
@@ -116,7 +127,8 @@ runner 具备 nix 能力, 届时再转阻塞; 见 workflow step 注释) / Guard 
 ### P2 ci-periodic.yml (nightly `0 20 * * *` per-SHA 去重 + 手动; `just ci-periodic`)
 
 周期兜底档 — 红 = 欠债待还, **不阻塞任何事**。**刻意无 push 触发** (check-drift 负向
-断言): 慢内容 (插桩编译 + 全量测试 + Playwright) 离开 push 关键路径, 白天槽位留给门禁
+断言): 慢内容 (插桩编译 + 全量测试 + Playwright) 离开 push 关键路径 (#355 后 PR 关键
+路径仅对 WebUI 面变更追加 path-filtered Playwright), 白天槽位留给门禁
 run。skip 仅 schedule 事件查询 + `workflow_file: ci-periodic.yml` 自指 → 按 SHA 去重
 (同代码同结果, 同 SHA 跑一次即足; 失败无 success 记录 → 次晚自愈重试; dispatch 永不
 跳过且可选任意分支 = 高风险 PR 合入前全量回归逃生舱)。step: Guard acquire / Checkout /
@@ -129,6 +141,10 @@ check-webui`, continue-on-error — flake 由次晚
 重试自愈; binary 取 mtime 最新候选 — 本档插桩产物恒最新天然命中, playwright.config.ts) / Upload Playwright
 artifacts on failure (截图/trace/报告, retention 14 天) / Guard verify。
 
+WebUI 双落点分工 (#355): P0 的 path-filtered 阻塞 step 守 PR 合入时刻 (WebUI 面变更),
+本档全量兜底 — 覆盖 push 后的 master (含 merge commit 集成态) 与非 WebUI 面 PR 引入的
+spec↔DOM 漂移, 定位不因 P0 增兵而改变。
+
 ### 旧 ci.yml step → v3.0 去向表
 
 | 旧 step | 去向 |
@@ -140,7 +156,7 @@ artifacts on failure (截图/trace/报告, retention 14 天) / Guard verify。
 | Check + coverage data (`--coverage` 插桩) | 拆分: 普通主链留 P0 (Quality gate); 插桩归 P2 |
 | Coverage gate | **P2** (rubric: 覆盖率防倒退 = 质量债, 不卡合入) |
 | Performance benchmark + bench PR 评论 | **P1** (compare-save 单模式; PR 评论随 PR 事件消失) |
-| WebUI regression + 评论 + artifact | **P2** (评论随 PR 事件消失 → 日志摘要 + artifact) |
+| WebUI regression + 评论 + artifact | **P2** 全量兜底 (评论随 PR 事件消失 → 日志摘要 + artifact) + **P0** path-filtered 阻塞子集 (#355, 守 PR 合入时刻) |
 | cargo audit + PR 评论 | **P1** (转阻塞; 评论随 PR 事件消失) |
 | nix build (cargoHash) | **P1** (canary 探针 — runner 无 nix-daemon 恒失败, 保留待 runner 具备 nix 能力后转阻塞) |
 
@@ -152,8 +168,10 @@ artifacts on failure (截图/trace/报告, retention 14 天) / Guard verify。
   P2) — symbol 字面匹配对 重命名/宏生成 有已知误报面, 红 = 人工 triage 提示; 误报面
   收敛 (如重命名感知) 后可评估转阻塞。runner 无 rg 时 WARN 跳过 (宿主层降级, 同
   check-fmt 的 treefmt 降级型)。
-- **WebUI regression (Playwright, P2)**: 保持 `continue-on-error` — P2 无 PR 合入语义,
-  无 "转阻塞" 升级目标; flake 由次晚 schedule 重试自愈, 失败 tail 摘要 + artifact 可见。
+- **WebUI regression**: 双落点 (#355) — P0 path-filtered 阻塞门禁 (WebUI 面变更的 PR
+  合入时跑, 一次重试缓冲 flake) + P2 nightly 全量 `continue-on-error` 兜底 (flake 由
+  次晚 schedule 重试自愈, 失败 tail 摘要 + artifact 可见)。P0 侧观察期: 若 path-filtered
+  后仍高频误红, 评估收窄命中面 / 加重试次数, 勿回退门禁本身。
 - **Performance benchmark (P1, compare-save)**: 已是 P1 阻塞信号 (退化 exit 1 → run 红);
   `--quick` 10 samples 噪声大 (±15% 实测), 判定为双门槛 — med > 20% **且** p ≤ 0.05
   (显著性门槛吸收同宿主并发 CI job 的系统性膨胀: 2026-09-17 事故中姊妹 runner VM 的
@@ -234,8 +252,10 @@ concurrency=1 或 single-job mode, 配置在 nixos 仓库 `forgejo-runner-vm.mod
 旧单 workflow 75min 预算按三档重算 (issue #149-1 的冷启动实测口径; timeout 算 job
 failure, continue-on-error 救不了 — P0 超时会阻塞合并):
 
-- `ci-merge` 40min: 冷链 = 一轮全量档 debug 编译 ~20min + diff/filesize ≈ 22min,
-  正常热路径 ~8-9min (一轮 crate codegen ~5min + 测试 ~2.5min + 静态链 ~1.5min).
+- `ci-merge` 45min (#355 起含 WebUI step): 冷链 = 一轮全量档 debug 编译 ~20min +
+  diff/filesize ≈ 22min; WebUI 面变更的 PR 再加 bin 构建 ~1-2min + Playwright 3-5min +
+  flake 重试最坏 +5min ⇒ ~34min. 正常热路径 ~8-9min (一轮 crate codegen ~5min +
+  测试 ~2.5min + 静态链 ~1.5min); WebUI 面变更 +4-7min.
   (tier-collapse 前双档矩阵实测 ~20min, 动机详见 "双宿主验证分工".)
 - `ci-deploy` 60min: release LTO bench 编译 10-20min + bench 运行 + audit + nix build
   (step 自身硬上限 30min), 正常热路径 ~8-12min.

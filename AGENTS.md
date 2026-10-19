@@ -313,8 +313,9 @@ toggleSession 内触发的**主动 sync** 覆盖 (不依赖 3s 轮询 tick; auto
 不一致发 null 游标, 防止矛盾游标触发后端 "after 不属于本 session → 全链重放" 契约.
 详尽形式化见 contracts.md **UI-7**.
 
-**回归守卫**: 这些不变量由 `tests/webui/im-ui.spec.ts` 守卫. 改前端渲染逻辑或后端
-delta 切片时, 必须同步跑 `just check-webui`.
+**回归守卫**: 这些不变量由 `tests/webui/im-ui.spec.ts` 守卫 (CI 侧由 P0 path-filtered
+WebUI 门禁在合入时刻强制, #355). 改前端渲染逻辑或后端 delta 切片时, 必须同步跑
+`just check-webui`.
 
 ## 路由策略 (核心契约)
 
@@ -483,7 +484,7 @@ v3.0 三档 (org 分级契约, 见 lc-studio/forgejo-actions README; 命名即�
 
 | 档 | workflow | 触发 | 阻塞 | 内容 |
 |---|---|---|---|---|
-| P0 | `ci-merge.yml` | PR + master push + 手动 | PR 合入 | check 主链全量档 `--features oidc,consistency-check` (fmt/clippy/machete/doc/测试+doctest+一致性断言/typos/deny-offline/check-contracts) + nix 语法门禁 (.nix 变更纯解析冒烟 — 本地 nix-check 已镜像同构全量 parse, #357 闭合反例窗口; NIX_STATE_DIR 重定向见 docs/ci.md) + file-size; 默认档验证归 GitHub 镜像 CI (双宿主分工, 见 docs/ci.md) |
+| P0 | `ci-merge.yml` | PR + master push + 手动 | PR 合入 | check 主链全量档 `--features oidc,consistency-check` (fmt/clippy/machete/doc/测试+doctest+一致性断言/typos/deny-offline/check-contracts) + nix 语法门禁 (.nix 变更纯解析冒烟 — 本地 nix-check 已镜像同构全量 parse, #357 闭合反例窗口; NIX_STATE_DIR 重定向见 docs/ci.md) + file-size + WebUI Playwright path-filtered 阻塞 step (#355: src/web·src/dag·src/dto.rs·tests/webui 变更的 PR 才跑, 一次重试缓冲 flake); 默认档验证归 GitHub 镜像 CI (双宿主分工, 见 docs/ci.md) |
 | P1 | `ci-deploy.yml` | master push + nightly + 手动 | 部署 | audit (CVE, 阻塞) + bench compare-save + nix build cargoHash (canary 探针, runner 无 nix-daemon 恒失败) (**非超集**偏差, 见 workflow 头声明) |
 | P2 | `ci-periodic.yml` | nightly per-SHA 去重 + 手动 (无 push) | 无 | check --coverage + coverage-gate + check-docs (advisory, #147 防漂移 lint 首个自动宿主, #357) + WebUI Playwright (coverage **发布**另归 GitHub `coverage.yml` → Codecov 徽章, 非门禁, 见 docs/ci.md 双宿主段) |
 
@@ -492,8 +493,9 @@ v3.0 三档 (org 分级契约, 见 lc-studio/forgejo-actions README; 命名即�
 并发去旧 (concurrency). WIP 门禁 (#204): draft PR 不触发 CI, 去 WIP 前缀时经 `edited`
 事件自动补跑 (机制见 docs/ci.md "WIP 门禁")。
 
-**本地复现锚点**: `just ci-merge` = P0 全链 ("本地全绿 ⇒ CI 阻塞项必绿"); P1/P2 的
-本地近似入口见 justfile `ci-deploy` / `ci-periodic` recipe 注释。
+**本地复现锚点**: `just ci-merge` = P0 全链 ("本地全绿 ⇒ CI 阻塞项必绿"; WebUI 面变更的
+PR 加跑 `just check-webui` — #355 起 P0 含 path-filtered WebUI 门禁, 本地对应入口
+`just check-all`); P1/P2 的本地近似入口见 justfile `ci-deploy` / `ci-periodic` recipe 注释。
 
 > CI 实现细节 (checkout 策略 / 缓存复用 / 并发假设 / 评论写回 / 三档 step 明细与
 > 迁移去向表 / 各 step 升级路径) 见 **docs/ci.md**。

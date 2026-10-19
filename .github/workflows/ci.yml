@@ -6,7 +6,7 @@
 #   - 无 nix-check (toml 渲染与 module eval 契约测试归 forgejo)
 #   - 无 check-file-size (rust-diff-analyzer 是 devShell lazy 工具, 不进镜像 CI)
 #   - 无 coverage / WebUI Playwright (coverage 徽章数据源归 coverage.yml, 非门禁;
-#     WebUI Playwright 归 forgejo P2 ci-periodic 档)
+#     WebUI Playwright 归 forgejo: P0 path-filtered 阻塞 + P2 ci-periodic 全量兜底, #355)
 #   - 无 check-webui-freshness (需 playwright CLI — WebUI 工具链归 forgejo P2;
 #     #357 补列, 此前差异清单漏记)
 #   - check-fmt 降级 rust-only (treefmt 需 nix 工具链, runner 无; 降级分支是

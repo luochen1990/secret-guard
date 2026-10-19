@@ -6,7 +6,9 @@
 # 无门禁语义: ci-periodic 红 = 欠债待还, **不阻塞任何事** — 低频功能验证 /
 #   特定场景回归的兜底网。本档承接旧 ci.yml 的 coverage 防倒退 (check --coverage +
 #   coverage-gate) 与 WebUI Playwright 回归 (政策变化: 旧 = 每 PR 非阻塞 + 评论;
-#   新 = nightly 兜底, 慢内容离开 PR 反馈路径)。
+#   新 = nightly 兜底, 慢内容离开 PR 反馈路径。#355 修订: PR 合入时刻的守卫由 P0
+#   ci-merge 的 path-filtered 阻塞 step 承担, 本档保持全量非阻塞兜底 — 覆盖 push 后
+#   master / 非 WebUI 面 PR 的漏网漂移, 定位不变)。
 #   2026-10 (#357) 增挂 check-docs 文档漂移 lint 的 advisory 宿主 (此前 inert guard,
 #   无任何自动宿主; continue-on-error — 漂移预警非硬门禁)。
 #
@@ -168,8 +170,9 @@ jobs:
       # CARGO_TARGET_DIR 指向持久卷, playwright.config.ts 读此环境变量)。
       #
       # continue-on-error: true — Playwright 在 CI 环境 (无 GPU / chromium 渲染稳定性)
-      # 可能有 flake, 保持非阻塞 (同旧 ci.yml 的 #86-2 观察; P2 无 PR 合入语义,
-      # 无 "转阻塞" 升级目标, flake 由次晚 schedule 重试自愈)。
+      # 可能有 flake, 保持非阻塞 (同旧 ci.yml 的 #86-2 观察)。#355 起 PR 合入时刻的
+      # 阻塞守卫归 P0 ci-merge 的 path-filtered step (WebUI 面变更才跑, 阻塞 + 一次
+      # 重试); 本档定位 = 全量兜底 (含 push 后 master), flake 由次晚 schedule 重试自愈。
       # 结果处理 (v3.0 政策变化): 旧 = PR 评论 upsert (可见性); 新 = 无 PR 事件,
       # 失败时 tail 末尾 80 行摘要进日志 (错误摘要通常在尾部) + artifact 上传,
       # 成功贴一行摘要。真实退出码写 step output 供 artifact step 条件消费。

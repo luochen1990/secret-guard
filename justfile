@@ -105,7 +105,9 @@ check *ARGS:
 # 内嵌 JS 语法检查 (秒级, 阻塞式).
 # 从 src/web/index.html 提取 <script>...</script> 块, 用 node --check 验证语法.
 # 这类低级语法错误 (未闭合括号/函数嵌套错位) 无法被 cargo 工具链发现; check-webui
-# (Playwright) 虽能间接捕获 (页面白屏) 但重 (3 分钟) 且 CI 中非阻塞 (continue-on-error).
+# (Playwright) 虽能间接捕获 (页面白屏) 但重 (3 分钟) 且本地 check 主链不含 — CI 侧
+# 由 ci-merge.yml 的 path-filtered WebUI step 阻塞 (#355, 仅 WebUI 面变更的 PR 跑),
+# P2 nightly 非阻塞全量兜底.
 # 本 step 作为 check 的一部分, 让语法错误在秒级被阻断. devShell 已提供 node (无新依赖).
 # 历史教训: f1a89c0 的 loadUntilRound 漏闭合 } 导致 SyntaxError: Unexpected end of input.
 check-webui-syntax:
@@ -262,17 +264,19 @@ _kill-orphans:
     sleep 0.2
 
 # check + check-webui (完整验证, devShell 内).
-# 行为差异提醒: 本地 check-all 让 Playwright 阻塞 (失败即 exit 1), 但 CI 的 WebUI step
-# 用 continue-on-error (非阻塞, v3.0 起位于 ci-periodic.yml — nightly 兜底, flake 由
-# 次晚重试自愈).
-# 即 "本地全绿 → push" 不代表 CI 必绿 — 这是有意设计 (WebUI 在 CI 环境 flake 率高),
-# 详见 ci-periodic.yml 注释与 AGENTS.md "CI" 段.
+# CI 侧 WebUI 定位 (#355 后): P0 ci-merge 有 path-filtered 阻塞 step (src/web /
+# src/dag / src/dto.rs / tests/webui 变更的 PR 才跑, 一次重试缓冲 flake), P2 nightly
+# 非阻塞全量兜底 (continue-on-error, flake 次晚自愈).
+# 本地 check 主链不含 Playwright — 改动上述路径时用本 recipe 保持 "本地全绿 ⇒ CI
+# 必绿"; 其他路径的 PR 不触发 P0 WebUI step, `just check` 即与 CI 门禁面等价.
 check-all: check _kill-orphans
     cd tests/webui && playwright test
 
 # org ci 契约 recipe (阻塞级门禁入口, 见 lc-studio/forgejo-actions README「CI 分级」)。
 # v3.0 三档: 本仓 thin 形态 (SSOT 骨架 + 本地 skip-if-passed action), 质量链拆三档 —
 #   P0 ci-merge    (ci-merge.yml)   合入时刻: check 主链 (全量档) + nix 语法门禁 + file-size
+#                      + WebUI Playwright path-filtered 阻塞 step (#355, workflow 层独立
+#                      step — 本 recipe 不含, 与 file-size 的 stage 拆分同理)
 #   P1 ci-deploy   (ci-deploy.yml)  部署时刻: audit + bench 基线 (nix build 留 workflow 层)
 #   P2 ci-periodic (ci-periodic.yml) 周期兜底: check --coverage + coverage-gate
 # stage 语义 (CI 编排与本地复现逐段等价、无重复执行):
@@ -302,8 +306,9 @@ ci-deploy:
     just bench-ci compare-save
 
 # org ci 契约 P2 (周期兜底档, ci-periodic.yml 调用, 非超集): coverage 防倒退
-# (插桩测试 + 双阈值门禁)。WebUI Playwright 因 continue-on-error 语义留 workflow
-# 独立 step (flake 不打断兜底 run); 本地全量复现: just ci-periodic && just check-webui。
+# (插桩测试 + 双阈值门禁)。WebUI Playwright 留 workflow 独立 step (本档 continue-on-error,
+# flake 不打断兜底 run — 与 P0 的 path-filtered 阻塞 step (#355) 分工: P0 守 PR 合入时刻,
+# 本档全量兜底含 push 后的 master); 本地全量复现: just ci-periodic && just check-webui。
 ci-periodic:
     just check --coverage
     just coverage-gate
