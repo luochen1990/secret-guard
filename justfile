@@ -60,8 +60,9 @@ dev-test:
 # 连依赖插桩缓存也删, 实测编译时间慢 ~2.4x). report.rs 的 pkg_hash_re 只收集 workspace member
 # 的 object, 所以保留依赖插桩缓存不会污染报告 — 这是该方案能 "既保速度又准报告" 的根因.
 #
-# doctest 暂时禁用: 当前唯一的 doctest (auth::middleware) 被标为 ```ignore, 测试价值为零.
-# 需要时取消下行注释即可恢复 (增量开销 <1s, 复用 clippy 的 debug/ 产物).
+# doctest 已恢复进链 (#357): nextest 不执行 doctest, 由独立 `cargo test --doc` 补
+# (增量开销 <1s, 复用 clippy 的 debug/ 产物)。当前唯一 doctest (auth::middleware)
+# 被标为 ```ignore 不执行 — 链路保持通, 新增 doctest 即时生效, 不再静默变 "永不运行".
 #
 # consistency-check feature 守卫: 默认关闭的视图正确性断言, 经 FULL_TIER 并入
 # 本 recipe 的 clippy/test 全量档 (tier-collapse, 曾为独立 recipe + CI step —
@@ -89,7 +90,8 @@ check *ARGS:
     just check-webui-syntax
     just check-webui-freshness
     just check-contracts
-    # cargo test --doc
+    # doctest: nextest 不跑 doctest 的独立补步 (见上方头注, #357 恢复)
+    cargo test --doc --locked {{ FULL_TIER }}
     @if echo "{{ ARGS }}" | grep -q -- "--coverage"; then \
         cargo llvm-cov clean --workspace; \
         cargo llvm-cov nextest --locked {{ FULL_TIER }} --no-fail-fast --no-report; \

@@ -69,6 +69,11 @@ jobs:
       - name: tests
         run: cargo nextest run --locked --no-fail-fast
 
+      # doctests — nextest 不执行 doctest, 与 just check 主链的 `cargo test --doc`
+      # 对齐 (#357 恢复; 复用 debug/ 产物增量 <1s)
+      - name: doctests
+        run: cargo test --doc --locked
+
       - name: typos
         uses: crate-ci/typos@v1
 

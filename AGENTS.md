@@ -445,7 +445,8 @@ just check                # 一键 check (全量档 --features oidc,consistency-
                           #   链内含 check-webui-syntax (index.html 内嵌 JS 语法) 与
                           #   check-webui-freshness (Playwright 被测 binary 新鲜度门卫钉子, #314) 与
                           #   check-contracts (contracts.md property 落地标注 lint, #144);
-                          #   doctest 当前禁用 (唯一 doctest 被 ignored, 需要时在 justfile 取消注释)
+                          #   doctest 在链 (cargo test --doc, 复用 debug 产物 <1s; 唯一
+                          #   doctest 被 ```ignore 不执行但链路保持通, 新增即时生效, #357)
                           #   默认档 (无 oidc) 的验证矩阵归 GitHub 镜像 CI (双宿主分工, 见 docs/ci.md)
 just ci-merge             # 一键复现 CI P0 门禁全链 (check 主链全量档 + file-size; "本地全绿 ⇒ CI 必绿" 的锚)
 just check --coverage     # check 含覆盖率插桩 (P2 ci-periodic 档内容; 本地按需)
