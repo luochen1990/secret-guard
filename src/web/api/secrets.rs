@@ -12,7 +12,9 @@ use crate::config::OverrideMode;
 use crate::secrets::{EffectiveSecret, SecretCategory, SecretEntry, SecretMasked, SecretStrategy};
 use crate::state::{AppState, NO_STORE};
 
-use super::crud::{Created, DecisionRequest, create_flow, decision_flow, delete_flow, update_flow};
+use super::crud::{
+    Created, DecisionRequest, create_flow, decision_flow, delete_flow, reset_flow, update_flow,
+};
 use super::error::ApiError;
 
 pub async fn list_secrets(State(state): State<AppState>) -> impl IntoResponse {
@@ -99,6 +101,17 @@ pub async fn delete_secret(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     delete_flow(&state.secrets, "secret", &id)?;
+    Ok((StatusCode::NO_CONTENT, NO_STORE, ""))
+}
+
+/// `DELETE /{id}/override` (#348 "重置为空态"): 撤销 static secret 的 dynamic 覆盖
+/// (删 override + 清 decision, 单次原子 RMW), 回到 static-only 基线. 幂等 (204);
+/// 非 static id → 404. 语义细节见 [`super::crud::reset_flow`].
+pub async fn reset_secret_override(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    reset_flow(&state.secrets, "secret", &id)?;
     Ok((StatusCode::NO_CONTENT, NO_STORE, ""))
 }
 

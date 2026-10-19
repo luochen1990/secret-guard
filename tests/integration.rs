@@ -9301,6 +9301,72 @@ mod cfg3_proptests {
                 Ok(())
             })?
         }
+
+        /// CFG-3 (#348): DELETE `/{id}/override` 重置 static id 的 dynamic 层痕迹.
+        ///
+        /// 对 both id (static + dynamic override), PATCH prefer_static 后 DELETE override → 204, 且:
+        /// 1) effective 中 source 回 `static` (未覆盖基线), value_length 反映 static 值;
+        /// 2) decision 回 default (清除 prefer_static — 不残留 "复活后静默继承旧 decision" 陷阱);
+        /// 3) 幂等: 基线上再次 DELETE override → 仍 204;
+        /// 4) dynamic-only id → 404 (重置的对象是 static 基线上的覆盖; 纯动态条目的
+        ///    清空是 DELETE `/{id}` 的既有管辖).
+        #[test]
+        fn prop_delete_override_resets_to_static_baseline(scenario in arb_scenario()) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let proxy_url = spawn_with_secrets(
+                    scenario.static_entries(),
+                    scenario.dynamic_entries(),
+                ).await;
+                let client = reqwest::Client::new();
+
+                // arb_scenario 保证 both ≥1 (static + dynamic override 都存在).
+                let (target_id, sv, _dv) = scenario.both.first().unwrap().clone();
+                let sv_len = sv.chars().count();
+
+                // 构造 static_preferred (编辑动态入口场景): PATCH prefer_static.
+                let resp = client
+                    .patch(format!("{proxy_url}/api/secrets/{target_id}/decision"))
+                    .json(&serde_json::json!({"mode": "prefer_static"}))
+                    .send().await.unwrap();
+                prop_assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+                // ── 重置: 204 + 回 static 基线 ──
+                let resp = client
+                    .delete(format!("{proxy_url}/api/secrets/{target_id}/override"))
+                    .send().await.unwrap();
+                prop_assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT,
+                    "DELETE override on static+dynamic id must return 204");
+                let eff = fetch_effective_secrets(&client, &proxy_url).await;
+                let e = eff.get(&target_id)
+                    .expect("reset id must remain effective (static baseline)");
+                prop_assert_eq!(&e["source"], &"static",
+                    "reset must fall back to static-only baseline");
+                prop_assert_eq!(&e["value_length"], &sv_len,
+                    "reset must restore static value (override discarded)");
+                prop_assert_eq!(&e["decision"], &"default",
+                    "reset must clear the prefer_static decision (no stale decision trap)");
+
+                // ── 幂等: 基线上重放 → 仍 204 ──
+                let resp = client
+                    .delete(format!("{proxy_url}/api/secrets/{target_id}/override"))
+                    .send().await.unwrap();
+                prop_assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT,
+                    "DELETE override must be idempotent on baseline");
+
+                // ── dynamic-only id → 404 ──
+                let dyn_id = scenario.dynamic_only.first().unwrap().0.clone();
+                let resp = client
+                    .delete(format!("{proxy_url}/api/secrets/{dyn_id}/override"))
+                    .send().await.unwrap();
+                prop_assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND,
+                    "DELETE override on dynamic-only id must 404 (not its jurisdiction)");
+                let eff = fetch_effective_secrets(&client, &proxy_url).await;
+                prop_assert!(eff.contains_key(&dyn_id),
+                    "dynamic-only id must be untouched by override reset");
+                Ok(())
+            })?
+        }
     }
 }
 

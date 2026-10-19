@@ -28,7 +28,7 @@ use crate::provider::{
 use crate::state::{AppState, NO_STORE};
 
 use super::crud::{Created, DecisionRequest, decision_flow};
-use super::crud::{create_flow, delete_flow, update_flow};
+use super::crud::{create_flow, delete_flow, reset_flow, update_flow};
 use super::error::ApiError;
 
 /// list 响应的单个条目: [`EffectiveProvider`] + pool 条目的**运行时观察面**
@@ -258,6 +258,17 @@ pub async fn delete_provider(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     delete_flow(&state.providers, "provider", &id)?;
+    Ok((StatusCode::NO_CONTENT, NO_STORE, ""))
+}
+
+/// `DELETE /{id}/override` (#348 "重置为空态"): 撤销 static provider 的 dynamic
+/// 覆盖 (删 override + 清 decision, 单次原子 RMW), 回到 static-only 基线. 幂等
+/// (204); 非 static id → 404. 语义细节见 [`super::crud::reset_flow`].
+pub async fn reset_provider_override(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    reset_flow(&state.providers, "provider", &id)?;
     Ok((StatusCode::NO_CONTENT, NO_STORE, ""))
 }
 

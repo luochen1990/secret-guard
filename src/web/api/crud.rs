@@ -20,6 +20,8 @@
 //! - [`update_flow`]: 存在性检查 → build 钩子 → 填 id → validate 钩子 → upsert →
 //!   查回 → 200 (查回落空同上 → 409).
 //! - [`delete_flow`]: static 基线检查 (存在 → 409) → delete → 不存在 404 → 204.
+//! - [`reset_flow`]: DELETE `/{id}/override` (#348) — static 检查 (404) → 删 override
+//!   + 清 decision (单次原子 RMW) → 204 (幂等).
 //! - [`decision_flow`]: static 检查 → set_decision → ack.
 
 use serde::{Deserialize, Serialize};
@@ -84,6 +86,9 @@ pub(crate) trait CrudTable {
     fn snapshot(&self) -> Vec<Self::Effective>;
     fn upsert(&self, entry: Self::Entry) -> anyhow::Result<(Self::Entry, UpsertKind)>;
     fn delete(&self, id: &str) -> anyhow::Result<DeleteOutcome>;
+    /// 重置 static id 的 dynamic 层痕迹 (删 override + 清 decision, 单次原子 RMW;
+    /// #348). 调用方负责 has_static 前置检查.
+    fn reset_override(&self, id: &str) -> anyhow::Result<()>;
     /// 直接查 static 层, 不受 decision 影响 (decision=Disabled 的 id 也能识别).
     fn has_static(&self, id: &str) -> bool;
     fn set_decision(&self, id: &str, mode: OverrideMode) -> anyhow::Result<()>;
@@ -101,6 +106,9 @@ impl CrudTable for DynamicTable<SecretEntry> {
     }
     fn delete(&self, id: &str) -> anyhow::Result<DeleteOutcome> {
         DynamicTable::delete_dynamic(self, id)
+    }
+    fn reset_override(&self, id: &str) -> anyhow::Result<()> {
+        DynamicTable::reset_dynamic(self, id)
     }
     fn has_static(&self, id: &str) -> bool {
         DynamicTable::has_static(self, id)
@@ -122,6 +130,9 @@ impl CrudTable for DynamicTable<Provider> {
     }
     fn delete(&self, id: &str) -> anyhow::Result<DeleteOutcome> {
         DynamicTable::delete_dynamic(self, id)
+    }
+    fn reset_override(&self, id: &str) -> anyhow::Result<()> {
+        DynamicTable::reset_dynamic(self, id)
     }
     fn has_static(&self, id: &str) -> bool {
         DynamicTable::has_static(self, id)
@@ -273,6 +284,28 @@ pub(crate) fn delete_flow<T: CrudTable>(
         // static 已由上方 has_static 检查排除, NotFound 只能是真不存在.
         DeleteOutcome::NotFound => Err(ApiError::not_found(format!("{kind_label} {id} not found"))),
     }
+}
+
+/// DELETE `/{id}/override` (#348 "重置为空态"): 撤销 static id 的 dynamic 覆盖,
+/// 回到 "未覆盖" 基线 (与 decision 端点同挂 `/{id}/<尾段>` 两段路径).
+///
+/// 语义: static 基线存在 → 删除 dynamic override (若有) + 清除 decision (若有,
+/// 单次原子 RMW) → 204. **幂等**: 基线上无可删痕迹时仍 204 (重放安全). 非 static
+/// id (dynamic-only / 不存在) → 404 — "重置" 的语义对象是 static 基线上的覆盖;
+/// 纯动态条目的 "清空" 是 DELETE `/{id}` (204) 的既有管辖, 不在本端点重复 (与
+/// decision_flow 的 404 语义同型).
+pub(crate) fn reset_flow<T: CrudTable>(
+    table: &T,
+    kind_label: &str,
+    id: &str,
+) -> Result<(), ApiError> {
+    if !table.has_static(id) {
+        return Err(ApiError::not_found(format!(
+            "{kind_label} {id} is not a static id; override reset does not apply \
+             (use DELETE for dynamic-only entries)"
+        )));
+    }
+    table.reset_override(id).map_err(ApiError::from_any)
 }
 
 /// `PATCH /{id}/decision` 的请求 body (secrets / providers 共享).
@@ -480,6 +513,9 @@ mod tests {
         }
         fn delete(&self, _id: &str) -> anyhow::Result<DeleteOutcome> {
             Ok(DeleteOutcome::Deleted)
+        }
+        fn reset_override(&self, _id: &str) -> anyhow::Result<()> {
+            Ok(())
         }
         fn has_static(&self, _id: &str) -> bool {
             false

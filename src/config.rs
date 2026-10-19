@@ -1670,6 +1670,48 @@ impl<T: DynamicEntry> DynamicTable<T> {
         Ok(DeleteOutcome::Deleted)
     }
 
+    /// 重置 static id 的**全部** dynamic 层痕迹 (#348 "重置为空态"): 删除 dynamic
+    /// override (若有) + 清除 decision (设为 Default = 从 decisions map 移除条目),
+    /// 回到 "static-only 未覆盖" 状态.
+    ///
+    /// 与分别调 `delete_dynamic` + `set_decision(Default)` 的差异: 本方法在单次
+    /// persist_lock 临界区内做**单次** state.toml RMW (一次 atomic_write 同时改写
+    /// 本表 dynamic 段与共享 decisions 段), 无中间态可见 — 要么全部生效, 要么全部
+    /// 回滚 (写盘失败时内存不动, CFG-4 语义).
+    ///
+    /// 幂等: 无 override 且无 decision 时调用是 no-op (重写同内容 state.toml).
+    /// 不校验 static 存在性 — 调用方 (web `reset_flow`) 负责 has_static 前置检查.
+    pub fn reset_dynamic(&self, id: &str) -> anyhow::Result<()> {
+        let _guard = self.persist_lock.lock();
+        let new_entries = {
+            let g = self.dynamic_entries.read();
+            g.iter()
+                .filter(|e| e.id() != id)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let new_decisions = {
+            let cur = self.decisions.read().clone();
+            let mut next = cur;
+            // Default 在 set_* 钩子里是 "移除条目" (保持文件精简), 等价于清除 decision.
+            T::set_decision(&mut next, id, OverrideMode::Default);
+            next
+        };
+        // 单次 RMW: 本表 dynamic 段 (strip 投影同 persist_dynamic) + 共享 decisions 段.
+        let mut state = DynamicState::load_or_empty(&self.state_path, "")?;
+        let stripped: Vec<T> = new_entries
+            .iter()
+            .map(|e| e.strip_runtime_state())
+            .collect();
+        T::set_state_field(&mut state, stripped);
+        state.decisions = new_decisions.clone();
+        let text = state.to_toml()?;
+        atomic_write(&self.state_path, &text)?;
+        *self.dynamic_entries.write() = new_entries;
+        *self.decisions.write() = new_decisions;
+        Ok(())
+    }
+
     /// 设置对某 static id 的决策. 持久化到 state.toml.
     ///
     /// 满足"先持久化, 再更新内存"契约: 若 atomic_write 失败, 内存 decisions 保持旧值
@@ -3278,6 +3320,62 @@ mod table_tests {
         assert_eq!(t.delete_dynamic("a").unwrap(), DeleteOutcome::Deleted);
         // dynamic override 删了, static 基线仍生效.
         assert_eq!(t.effective_raw()[0].value, "static");
+    }
+
+    /// #348 reset_dynamic: static id 的 override + decision 一次清除, 回 static-only
+    /// 基线; 磁盘 state.toml 两段 (dynamic 段 + decisions 段) 同步干净.
+    #[test]
+    fn reset_dynamic_clears_override_and_decision() {
+        let tmp = tempfile_path("reset");
+        let decisions = Arc::new(RwLock::new(Decisions::default()));
+        let t = SecretTable::new(
+            vec![entry("a", "static-a"), entry("b", "static-b")],
+            vec![entry("a", "dynamic-a"), entry("d", "dyn-only")],
+            decisions.clone(),
+            tmp.clone(),
+        );
+        // 前置: a = static + dynamic override + prefer_static; d = 纯 dynamic.
+        t.set_decision("a", OverrideMode::PreferStatic).unwrap();
+        t.set_decision("b", OverrideMode::Disabled).unwrap();
+
+        t.reset_dynamic("a").unwrap();
+
+        // 内存: a 回 static 基线 (未覆盖态), d 与 b 的痕迹不受影响.
+        let eff_a = t.get_effective("a").expect("static baseline must survive");
+        assert_eq!(eff_a.value, "static-a");
+        assert_eq!(
+            decisions.read().secret("a"),
+            OverrideMode::Default,
+            "reset must clear the id's decision"
+        );
+        assert_eq!(
+            decisions.read().secret("b"),
+            OverrideMode::Disabled,
+            "other ids' decisions must be untouched"
+        );
+        assert_eq!(
+            t.get_dynamic("d").map(|e| e.value.clone()),
+            Some("dyn-only".to_string()),
+            "other dynamic entries must be untouched"
+        );
+
+        // 磁盘: dynamic 段无 a 的 override, decisions 段无 a 的条目 (b 保留).
+        let state = DynamicState::load_or_empty(&tmp, "").unwrap();
+        assert!(!state.secrets.iter().any(|e| e.id == "a"));
+        assert!(state.secrets.iter().any(|e| e.id == "d"));
+        assert_eq!(state.decisions.secret("a"), OverrideMode::Default);
+        assert_eq!(state.decisions.secret("b"), OverrideMode::Disabled);
+    }
+
+    /// #348 reset_dynamic 幂等: 基线上 (无 override 且无 decision) 调用是 no-op 成功.
+    #[test]
+    fn reset_dynamic_idempotent_on_baseline() {
+        let tmp = tempfile_path("reset-idem");
+        let t = SecretTable::new(vec![entry("a", "static-a")], vec![], empty_decisions(), tmp);
+        t.reset_dynamic("a").unwrap();
+        t.reset_dynamic("a").unwrap();
+        assert_eq!(t.effective_raw().len(), 1);
+        assert_eq!(t.effective_raw()[0].value, "static-a");
     }
 
     #[test]

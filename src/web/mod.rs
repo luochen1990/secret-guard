@@ -14,7 +14,9 @@
 //! - `PUT /api/secrets/{id}`            —— 编辑 (static 自动 fork).
 //! - `DELETE /api/secrets/{id}`         —— 删除 (仅 dynamic-only; static 基线一律 409, #156).
 //! - `PATCH /api/secrets/{id}/decision` —— 切换 OverrideMode.
-//! - `GET/POST/PUT/DELETE/PATCH /api/providers[/{id}[/decision]]` —— 同上.
+//! - `DELETE /api/secrets/{id}/override` —— 重置为空态 (删 override + 清 decision 回
+//!   static 基线, 幂等 204; #348).
+//! - `GET/POST/PUT/DELETE/PATCH /api/providers[/{id}[/decision|/override]]` —— 同上.
 //! - `POST /api/providers/probe` —— base_url 协议自动探测 (探测算法在
 //!   `proxy::models`, 薄壳 handler 在 `api/providers.rs`).
 //! - `PUT/DELETE /api/providers/probe` —— 存量 id="probe" 条目的管理薄 wrapper
@@ -85,6 +87,12 @@ pub fn router() -> Router<AppState> {
             "/api/secrets/{id}/decision",
             patch(api::set_secret_decision),
         )
+        // 撤销 dynamic override 回 static 基线 (#348 "重置为空态"): 删 override +
+        // 清 decision, 单次原子 RMW; 幂等 204, 非 static id 404 (crud::reset_flow).
+        .route(
+            "/api/secrets/{id}/override",
+            axum::routing::delete(api::reset_secret_override),
+        )
         .route(
             "/api/providers",
             get(api::list_providers).post(api::create_provider),
@@ -115,6 +123,11 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/providers/{id}/decision",
             patch(api::set_provider_decision),
+        )
+        // 撤销 dynamic override 回 static 基线 (#348): 语义同 secrets 侧.
+        .route(
+            "/api/providers/{id}/override",
+            axum::routing::delete(api::reset_provider_override),
         )
         // pool 条目成员闹钟清空 (T3; 两段路径与 {id}/decision 同型 — 静态尾段
         // 优先于任何未来单段扩展, 无 "probe" 型阴影问题).

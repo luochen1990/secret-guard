@@ -19,10 +19,10 @@
 //! - `records`: `GET /records/{id}` 单条 raw + parsed view (WebUI 弹窗按需拉).
 //! - `sessions`: `GET /sessions` + `GET /sessions/{sid}/timeline` + `POST /sync`
 //!   (session-aware timeline API).
-//! - `secrets`: secrets CRUD (5 endpoints).
-//! - `providers`: providers CRUD (5 endpoints) + `POST /providers/probe` 协议探测
-//!   (薄壳, 算法在 `proxy::models`) + `PUT/DELETE /providers/probe` 存量 "probe"
-//!   id 条目的管理薄 wrapper.
+//! - `secrets`: secrets CRUD (6 endpoints, 含 `DELETE /{id}/override` 重置 #348).
+//! - `providers`: providers CRUD (6 endpoints, 含 `DELETE /{id}/override` 重置 #348)
+//!   + `POST /providers/probe` 协议探测 (薄壳, 算法在 `proxy::models`)
+//!   + `PUT/DELETE /providers/probe` 存量 "probe" id 条目的管理薄 wrapper.
 //! - `apikeys`: API key CRUD (4 endpoints, 无条件挂载, 见该文件头注释).
 //!
 //! # 安全姿态
@@ -52,11 +52,14 @@ pub use privacy_scan::{
 };
 pub use providers::{
     create_provider, delete_provider, delete_provider_probe, list_providers, pool_reset,
-    probe_provider, probe_provider_origin, provider_models, set_provider_decision, update_provider,
-    update_provider_probe,
+    probe_provider, probe_provider_origin, provider_models, reset_provider_override,
+    set_provider_decision, update_provider, update_provider_probe,
 };
 pub use records::get_record;
-pub use secrets::{create_secret, delete_secret, list_secrets, set_secret_decision, update_secret};
+pub use secrets::{
+    create_secret, delete_secret, list_secrets, reset_secret_override, set_secret_decision,
+    update_secret,
+};
 pub use sessions::{list_sessions, session_timeline, sync};
 pub use settings::{get_settings, update_settings};
 pub use usage::usage_summary;
