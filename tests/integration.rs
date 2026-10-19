@@ -6304,6 +6304,282 @@ async fn providers_api_rejects_probe_origin_reserved_id() {
     );
 }
 
+// ─── #347: use_provider_key (编辑态探测携带存量 key, 修 401) ────────────────
+//
+// 语义: key 引用而非传值 — 请求体只带 provider id, 服务端查 effective provider
+// 表注入 Direct 条目的 effective_api_key. 动机: 编辑态 key 输入留空 = "保留旧值"
+// (PUT 语义), 探测却 keyless → 上游 401 误报; 而 GET DTO 从不回明文 (SEC-1),
+// 前端拿不到 key 明文 — 服务端引用是唯一通路, 且 key 不过 wire 二次落日志.
+// 判定断言走 mockito 的 header matcher (黑盒): 200-models mock 仅匹配携带存量
+// key 的请求, 命中与否即证明 key 是否真正抵达上游.
+
+/// 正例 ×2 (verify / probe-origin 两入口统一): api_key 空 + 引用 oa-main
+/// (spawn_proxy 种子的 Direct 条目, api_key = sk-test-key) → 探测携带存量 key
+/// (仅匹配 `Bearer sk-test-key` 的 200-models mock 命中 → ok/models); 响应体
+/// 永不回显 key (SEC).
+#[tokio::test]
+async fn providers_probe_uses_provider_key_reference_verify_and_origin() {
+    let mut upstream = spawn_mock_upstream().await;
+    // 仅存量 key 可达的 200 路径 (无 expect 计数: openai/anthropic 族共享
+    // /v1/models 候选探测, 精确计数脆; outcome 断言已足够强).
+    upstream
+        .mock("GET", "/v1/models")
+        .match_header("authorization", "Bearer sk-test-key")
+        .with_status(200)
+        .with_body(r#"{"object":"list","data":[{"id":"gpt-4o","object":"model"}]}"#)
+        .create_async()
+        .await;
+    // 其余面路径全 404 (absent; 沿 mimo e2e 用例的显式 mock 模式, 不依赖
+    // mockito 的 unmatched 默认行为).
+    for path in [
+        "/models",
+        "/anthropic/v1/models",
+        "/v1beta/models",
+        "/api/tags",
+    ] {
+        upstream
+            .mock("GET", path)
+            .with_status(404)
+            .create_async()
+            .await;
+    }
+    upstream
+        .mock("POST", "/anthropic/v1/messages")
+        .with_status(404)
+        .create_async()
+        .await;
+    let proxy_url = spawn_proxy(&upstream.url()).await;
+    let client = reqwest::Client::new();
+
+    // ① verify 入口 (端点行二次检测).
+    let resp = client
+        .post(format!("{proxy_url}/api/providers/probe"))
+        .json(&serde_json::json!({
+            "base_url": upstream.url(),
+            "api_key": "",
+            "use_provider_key": "oa-main",
+            "protocol": "openai",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let raw = resp.text().await.unwrap();
+    assert!(
+        !raw.contains("sk-test-key"),
+        "verify response must not leak the stored key: {raw}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(
+        body["probes"][0]["status"], "ok",
+        "stored key must reach upstream (models evidence): {raw}"
+    );
+    assert_eq!(body["probes"][0]["models"][0], "gpt-4o");
+
+    // ② probe-origin 全景入口 (检测台 Detect): openai 面 + responses 镜像 ok/models.
+    let resp = client
+        .post(format!("{proxy_url}/api/providers/probe-origin"))
+        .json(&serde_json::json!({
+            "origin": upstream.url(),
+            "api_key": "",
+            "use_provider_key": "oa-main",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let raw = resp.text().await.unwrap();
+    assert!(
+        !raw.contains("sk-test-key"),
+        "probe-origin response must not leak the stored key: {raw}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let faces = body["faces"].as_array().unwrap();
+    let oa = faces.iter().find(|f| f["protocol"] == "openai").unwrap();
+    assert_eq!(
+        oa["status"], "ok",
+        "stored key must reach upstream via probe-origin: {raw}"
+    );
+    assert_eq!(oa["evidence"], "models");
+    let rs = faces.iter().find(|f| f["protocol"] == "responses").unwrap();
+    assert_eq!(rs["status"], "ok", "responses mirrors openai: {raw}");
+}
+
+/// 反例 ×2: 未知 id 引用 (失败是数据不是 HTTP 错误, 探测按 keyless 进行 —
+/// authorization 缺席才命中的 401 mock 证明服务端未注入任何 key) + 显式
+/// api_key 优先于引用 (存量 key 形态是 401 鉴权墙, 显式 key 才 200 — 两 mock
+/// 结果不同使优先级可判定).
+#[tokio::test]
+async fn providers_probe_provider_key_reference_fallbacks() {
+    // 上游 A: 未知 id 用例 — keyless → 401 (鉴权墙), 携带存量 key → 200.
+    let mut upstream_a = spawn_mock_upstream().await;
+    upstream_a
+        .mock("GET", "/v1/models")
+        .match_header("authorization", mockito::Matcher::Missing)
+        .with_status(401)
+        .create_async()
+        .await;
+    upstream_a
+        .mock("GET", "/v1/models")
+        .match_header("authorization", "Bearer sk-test-key")
+        .with_status(200)
+        .with_body(r#"{"object":"list","data":[{"id":"gpt-4o","object":"model"}]}"#)
+        .create_async()
+        .await;
+    let proxy_url = spawn_proxy(&upstream_a.url()).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/api/providers/probe"))
+        .json(&serde_json::json!({
+            "base_url": upstream_a.url(),
+            "api_key": "",
+            "use_provider_key": "no-such-id",
+            "protocol": "openai",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "unknown id is data, not an HTTP error"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let p = &body["probes"][0];
+    // verify 词表: ok|auth_failed|absent|error. auth_failed ⇔ Missing-auth 401
+    // mock 命中 → 服务端未注入任何 key (存量 key 若被注入, 会命中 200 mock → ok).
+    assert_eq!(p["status"], "auth_failed");
+
+    // 上游 B: 优先级用例 — 存量 key 形态 = 401, 显式 key = 200, 结果可区分.
+    let mut upstream_b = spawn_mock_upstream().await;
+    upstream_b
+        .mock("GET", "/v1/models")
+        .match_header("authorization", "Bearer sk-test-key")
+        .with_status(401)
+        .create_async()
+        .await;
+    upstream_b
+        .mock("GET", "/v1/models")
+        .match_header("authorization", "Bearer sk-explicit-347")
+        .with_status(200)
+        .with_body(r#"{"object":"list","data":[{"id":"gpt-4o","object":"model"}]}"#)
+        .create_async()
+        .await;
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/api/providers/probe"))
+        .json(&serde_json::json!({
+            "base_url": upstream_b.url(),
+            "api_key": "sk-explicit-347",
+            "use_provider_key": "oa-main",
+            "protocol": "openai",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["probes"][0]["status"], "ok",
+        "explicit api_key must win over the reference (200 only matches it)"
+    );
+    assert_eq!(body["probes"][0]["models"][0], "gpt-4o");
+}
+
+/// api_key_file 形态的引用 (#347): file 形态条目的 `api_key_masked` 为空串,
+/// 但引用照常注入 **file 内容** (服务端 effective_api_key 解析, 含 trim) —
+/// 生产 NixOS 部署 (sops/LoadCredential) 的主形态. 同时断言 GET DTO 的
+/// `api_key_file_configured` 布尔 (前端判据的数据源; 路径/内容零暴露).
+#[tokio::test]
+async fn providers_probe_provider_key_reference_file_form() {
+    let key_file = std::env::temp_dir().join(format!(
+        "secret-guard-test-probe-key-{}.txt",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::write(&key_file, "sk-from-file\n").unwrap(); // 末尾换行经 trim 剥离
+
+    let mut upstream = spawn_mock_upstream().await;
+    upstream
+        .mock("GET", "/v1/models")
+        .match_header("authorization", "Bearer sk-from-file")
+        .with_status(200)
+        .with_body(r#"{"object":"list","data":[{"id":"gpt-4o","object":"model"}]}"#)
+        .create_async()
+        .await;
+    // keyless 对照: authorization 缺席 → 401 (引用未生效时的形态).
+    upstream
+        .mock("GET", "/v1/models")
+        .match_header("authorization", mockito::Matcher::Missing)
+        .with_status(401)
+        .create_async()
+        .await;
+
+    let provider = Provider {
+        id: "oa-file-probe".into(),
+        enabled: true,
+        name: None,
+        kind: ProviderKind::Direct(DirectProvider {
+            endpoints: vec![Endpoint {
+                protocol: Protocol::OpenAI,
+                base_url: upstream.url(),
+                common_uri: None,
+            }],
+            api_key: String::new(),
+            api_key_file: Some(key_file.clone()),
+        }),
+    };
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+
+    // GET DTO: masked 空串 + api_key_file_configured true (无路径无内容).
+    let resp = reqwest::Client::new()
+        .get(format!("{proxy_url}/api/providers"))
+        .send()
+        .await
+        .unwrap();
+    let raw = resp.text().await.unwrap();
+    assert!(
+        !raw.contains("sk-from-file"),
+        "DTO must not carry file content"
+    );
+    assert!(
+        !raw.contains(key_file.display().to_string().as_str()),
+        "DTO must not carry file path"
+    );
+    let list: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let entry = list["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == "oa-file-probe")
+        .unwrap();
+    assert_eq!(entry["api_key_masked"], "", "file form masks to empty");
+    assert_eq!(entry["api_key_file_configured"], true);
+
+    // 引用 → file 内容注入 (200-models mock 仅匹配 Bearer sk-from-file).
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/api/providers/probe"))
+        .json(&serde_json::json!({
+            "base_url": upstream.url(),
+            "api_key": "",
+            "use_provider_key": "oa-file-probe",
+            "protocol": "openai",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let raw = resp.text().await.unwrap();
+    assert!(
+        !raw.contains("sk-from-file"),
+        "probe response must not leak file key"
+    );
+    let body: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(
+        body["probes"][0]["status"], "ok",
+        "file-form key must reach upstream via reference: {raw}"
+    );
+
+    std::fs::remove_file(&key_file).ok();
+}
+
 /// 路由补齐 (PUT/DELETE /api/providers/probe): 存量 id="probe" 条目可编辑可删除.
 ///
 /// 存量条目在 AppState 构造期直插 (dynamic 层, 绕过 API — 模拟保留字校验上线

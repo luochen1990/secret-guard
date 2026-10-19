@@ -366,6 +366,13 @@ pub(crate) struct ProbeRequest {
     /// 可选 api_key (空串 = 无 auth 探测, Ollama 等本地场景; serde default).
     #[serde(default)]
     pub api_key: String,
+    /// #347 存量 key 引用 (编辑态探测): `api_key` 为空时, 用该 id 的 Direct
+    /// 条目 effective api_key (api_key / api_key_file, 服务端查表注入 — 引用
+    /// 而非传值, key 不过 wire 二次落日志; 前端 GET DTO 只有 masked 拿不到
+    /// 明文, 服务端引用是唯一通路). 显式 `api_key` 非空时本字段被忽略;
+    /// 未知 id / 非 Direct 构造 / 条目无 key → 按无 key 探测 (失败是数据).
+    #[serde(default)]
+    pub use_provider_key: Option<String>,
     /// 单协议校验模式 (#332, 端点行 "二次检测", **唯一形态**): 对这一个
     /// (protocol, base_url, common_uri) 三元组单点验证 (响应 = 单条 probes).
     /// 值必须是 `Protocol::ALL` 的完整名, 未知/缺失 → 400 (全景探测归
@@ -388,6 +395,9 @@ pub(crate) struct OriginProbeRequest {
     /// 可选 api_key (空串 = 无 auth 探测, Ollama 等本地场景; serde default).
     #[serde(default)]
     pub api_key: String,
+    /// #347 存量 key 引用 (编辑态探测): 语义同 [`ProbeRequest::use_provider_key`].
+    #[serde(default)]
+    pub use_provider_key: Option<String>,
     /// 前端预置知识库的已知面 (origin 精确命中厂商时); 条目校验失败逐条丢弃
     /// 不报错 (best-effort, ROB — 见 `proxy::parse_extra_face`).
     #[serde(default)]
@@ -399,6 +409,32 @@ pub(crate) struct OriginExtraFace {
     pub uri: String,
     /// `Protocol` serde 枚举名 + `"responses"` 别名 (与响应 faces 行 wire 名对齐).
     pub protocol: String,
+}
+
+/// 解析探测请求实际使用的 api_key (#347): 显式 `api_key` 非空优先; 否则
+/// `use_provider_key` 引用 → 查 effective provider 表取 Direct 条目的
+/// `effective_api_key` (api_key 直接值 / api_key_file, 与转发路径同源 — 编辑态
+/// key 输入留空 = "保留旧值" 的表单语义延伸到探测). 未知 id / 非 Direct 构造
+/// (Router/Pool 无条目级 key) / 条目未配置 key → 空串 = 无 auth 探测 (失败是
+/// 数据不是错误, Ollama 等本地场景合法). 引用只回传探测结果, key 永不进响应.
+fn resolve_probe_api_key(
+    state: &AppState,
+    api_key: &str,
+    use_provider_key: Option<&str>,
+) -> String {
+    if !api_key.is_empty() {
+        return api_key.to_string();
+    }
+    let Some(id) = use_provider_key else {
+        return String::new();
+    };
+    match state.providers.get_effective(id) {
+        Some(crate::provider::Provider {
+            kind: crate::provider::ProviderKind::Direct(d),
+            ..
+        }) => d.effective_api_key(id),
+        _ => String::new(),
+    }
 }
 
 /// `POST /api/providers/probe-origin`: 对任意 origin 并行探测各协议族的面 URI,
@@ -421,11 +457,16 @@ pub async fn probe_provider_origin(
         .iter()
         .filter_map(|f| crate::proxy::parse_extra_face(&f.protocol, &f.uri))
         .collect();
+    let api_key = resolve_probe_api_key(
+        &state,
+        &payload.api_key,
+        payload.use_provider_key.as_deref(),
+    );
     let response = crate::proxy::probe_origin_upstream(
         &state.upstream,
         &origin,
         typed_face_stripped,
-        &payload.api_key,
+        &api_key,
         &extra_faces,
     )
     .await;
@@ -464,12 +505,17 @@ pub async fn probe_provider(
             "common_uri must be empty or start with '/'",
         ));
     }
+    let api_key = resolve_probe_api_key(
+        &state,
+        &payload.api_key,
+        payload.use_provider_key.as_deref(),
+    );
     let response = crate::proxy::verify_endpoint_upstream(
         &state.upstream,
         &payload.base_url,
         payload.common_uri.as_deref(),
         protocol,
-        &payload.api_key,
+        &api_key,
     )
     .await;
     Ok((StatusCode::OK, NO_STORE, Json(response)))

@@ -41,7 +41,7 @@
  */
 import { test, expect, type Locator, type Page } from "@playwright/test";
 import * as http from "http";
-import { TEST_SECRET_VALUE } from "./fixtures";
+import { TEST_SECRET_VALUE, WEBUI_FILE_KEY } from "./fixtures";
 
 const SG_API = "/api";
 const FORWARD_URL = "/o/mock-openai/v1/chat/completions";
@@ -3590,14 +3590,23 @@ test.describe("usage-stats (模型用量统计)", () => {
 
 type ProbeUpstream = { url: string; close: () => Promise<void> };
 
-// respond 收 (pathname, method) — origin 探测的 POST 存在性路由 (如
-// POST /anthropic/v1/messages) 需要按方法区分 (#332 mock 上游先例).
+// respond 收 (pathname, method, auth) — origin 探测的 POST 存在性路由 (如
+// POST /anthropic/v1/messages) 需要按方法区分 (#332 mock 上游先例); auth =
+// Authorization header 值 (undefined = 缺席) 供 #347 鉴权感知上游断言.
 function startProbeUpstream(
-  respond: (pathname: string, method: string) => { status: number; body: string; delayMs?: number }
+  respond: (
+    pathname: string,
+    method: string,
+    auth: string | undefined
+  ) => { status: number; body: string; delayMs?: number }
 ): Promise<ProbeUpstream> {
   return new Promise((resolve, reject) => {
     const server = http.createServer((req, res) => {
-      const { status, body, delayMs } = respond(req.url ?? "", req.method ?? "GET");
+      const { status, body, delayMs } = respond(
+        req.url ?? "",
+        req.method ?? "GET",
+        req.headers.authorization
+      );
       const send = () => {
         res.writeHead(status, { "Content-Type": "application/json" });
         res.end(body);
@@ -4134,6 +4143,188 @@ test.describe("Provider 创建流程 (#332: detect → add → verify)", () => {
     expect(body2.origin).toBe("https://unknown-vendor.example");
     expect("extra_faces" in body2).toBe(false);
     await page.unroute("**/api/providers/probe-origin");
+  });
+});
+
+// ─── #347: 检测台 URL 记忆 + 编辑态探测携带存量 key + 术语优化 ──────────────
+//
+// 三点需求 (issue #347): ① 探测 URL per-provider localStorage 记忆, 二次编辑
+// 预填 (优先级: 记忆 > 首端点 base_url); ② 编辑态探测 (Detect/Verify) 默认
+// 携带条目存量 key (use_provider_key 引用 — GET DTO 只有 masked, 前端拿不到
+// 明文, 服务端查表注入; 修 401 误报); ③ 字段名 "URL" + hover 问号 tooltip.
+//
+// 鉴权感知上游: /v1/models 仅在 Authorization = Bearer <存量 key> 时 200,
+// 其余 (含缺席) 401 — openai 面 ok/models ⇔ 存量 key 真正抵达上游 (黑盒断言).
+test.describe("检测台 URL 记忆 + 存量 key 探测 (#347)", () => {
+  const STORED_KEY = "sk-stored-347";
+  // 鉴权墙上游: openai 面 models 端点要求精确存量 key; 其余路径 404 (absent).
+  // key 参数化 — inline 形态用例与 file 形态种子各自墙值.
+  function startAuthWallUpstream(key: string): Promise<ProbeUpstream> {
+    return startProbeUpstream((pathname, _method, auth) => {
+      if (pathname === "/v1/models" && auth === `Bearer ${key}`) {
+        return {
+          status: 200,
+          body: JSON.stringify({
+            object: "list",
+            data: [{ id: "authed-model", object: "model" }],
+          }),
+        };
+      }
+      return { status: 404, body: "{}" };
+    });
+  }
+
+  test.beforeEach(async ({ page }) => {
+    await page.goto("/");
+    await page.locator('a.tab[data-tab="providers"]').click();
+  });
+
+  test("探测 URL 记忆: 显式探测过的 URL 预填, 优先于首端点 base_url (#347 ①)", async ({ page }) => {
+    const upstream = await startProbeUpstream(() => ({ status: 404, body: "{}" }));
+    const uid = `mem-${Date.now()}`;
+    // create 态: detect 用的 URL 带面尾段 (与最终端点 base_url 不同 — 使记忆
+    // 与首端点 fallback 可区分); 探测后手动加行保存 (端点 base_url = 裸 origin).
+    await openNewProviderForm(page);
+    await page.locator("#p-id").fill(uid);
+    const probedUrl = `${upstream.url}/v1`;
+    await page.locator("#p-detect-url").fill(probedUrl);
+    await page.locator("#p-detect-btn").click();
+    await page.locator("#p-detect-results .probe-line").first().waitFor();
+    // 全 404 上游不阻塞 (UI-10): 手动加行 + 填裸 origin 保存.
+    const row0 = await addManualEndpoint(page);
+    await row0.locator(".ep-base-url").fill(upstream.url);
+    await page.locator('#provider-form-el button[value="save"]').click();
+    await expect(page.locator("#provider-form")).not.toBeVisible();
+    // 二次编辑: 预填 = 记忆的探测 URL (带 /v1 尾段), 而非首端点 base_url (裸
+    // origin) — 记忆优先; cancel 后再开仍预填 (跨 dialog 周期持久).
+    const listRow = page.locator("#providers-body tr", { hasText: uid });
+    await expect(listRow).toBeVisible();
+    for (let i = 0; i < 2; i++) {
+      await listRow.locator('button[data-action="edit"]').click();
+      await expect(page.locator("#provider-form")).toBeVisible();
+      await expect(page.locator("#p-detect-url")).toHaveValue(probedUrl);
+      await page.locator('#provider-form-el button[value="cancel"]').click();
+    }
+    // 重新探测改写记忆: 换一个 URL 探测 → 再开预填新值.
+    await listRow.locator('button[data-action="edit"]').click();
+    const probedUrl2 = `${upstream.url}/anthropic`;
+    await page.locator("#p-detect-url").fill(probedUrl2);
+    await page.locator("#p-detect-btn").click();
+    await page.locator("#p-detect-results .probe-line").first().waitFor();
+    await page.locator('#provider-form-el button[value="cancel"]').click();
+    await listRow.locator('button[data-action="edit"]').click();
+    await expect(page.locator("#p-detect-url")).toHaveValue(probedUrl2);
+    await upstream.close();
+  });
+
+  test("编辑态 Detect 携带存量 key (修 401) + 正向提示 (#347 ②)", async ({ page }) => {
+    const upstream = await startAuthWallUpstream(STORED_KEY);
+    const uid = `key-${Date.now()}`;
+    // create 态带显式 key 探测 (鉴权墙上游 200) → 添加 → 保存 (key 落进条目).
+    await openNewProviderForm(page);
+    await page.locator("#p-id").fill(uid);
+    await page.locator("#p-api-key").fill(STORED_KEY);
+    await page.locator("#p-detect-url").fill(upstream.url);
+    await page.locator("#p-detect-btn").click();
+    const oaRow = page.locator('.dr-item[data-protocol="openai"]');
+    await expect(oaRow.locator(".dr-status")).toHaveText("✓");
+    await oaRow.locator(".dr-add").click();
+    await expect(page.locator(".endpoint-row")).toHaveCount(1);
+    await page.locator('#provider-form-el button[value="save"]').click();
+    await expect(page.locator("#provider-form")).not.toBeVisible();
+
+    // 二次编辑: key 输入留空 (= "保留旧值" 语义) → Detect 默认携带存量 key
+    // (use_provider_key 引用) — 鉴权墙上游仍 ok/models (未携带则 401 → 全
+    // absent 形态, 本断言即红). 结果区附正向提示 (key 不回显).
+    const listRow = page.locator("#providers-body tr", { hasText: uid });
+    await expect(listRow).toBeVisible();
+    await listRow.locator('button[data-action="edit"]').click();
+    await expect(page.locator("#provider-form")).toBeVisible();
+    await expect(page.locator("#p-api-key")).toHaveValue("");
+    await page.locator("#p-detect-btn").click();
+    await expect(oaRow.locator(".dr-status")).toHaveText("✓");
+    await expect(oaRow.locator(".dr-detail")).toContainText("model list · 1");
+    await expect(
+      page.locator("#p-detect-results .hint", { hasText: "saved API key" })
+    ).toHaveCount(1);
+    // 端点行 Verify 同语义: key 留空 → 存量 key 抵达上游 → v-ok (keyless 则
+    // 401 → auth_failed → v-fail).
+    const epRow = endpointRow(page);
+    await epRow.locator(".ep-verify").click();
+    await expect(epRow.locator(".ep-verify")).toHaveClass(/v-ok/);
+    await page.locator('#provider-form-el button[value="cancel"]').click();
+    await upstream.close();
+  });
+
+  test("无存量 key 的编辑态探测: keyless 消歧提示 (不再误称 key 未复用)", async ({ page }) => {
+    const upstream = await startAuthWallUpstream(STORED_KEY);
+    const uid = `nokey-${Date.now()}`;
+    // create 态不填 key — 手动加行保存 (条目无存量 key).
+    await openNewProviderForm(page);
+    await page.locator("#p-id").fill(uid);
+    await page.locator("#p-detect-url").fill(upstream.url);
+    const row0 = await addManualEndpoint(page);
+    await row0.locator(".ep-base-url").fill(upstream.url);
+    await page.locator('#provider-form-el button[value="save"]').click();
+    await expect(page.locator("#provider-form")).not.toBeVisible();
+    // 编辑态 (无存量 key): 探测 keyless (keylessHint 消歧) — 无 "saved key"
+    // 正向提示 (引用仅在有存量 key 时建立).
+    const listRow = page.locator("#providers-body tr", { hasText: uid });
+    await listRow.locator('button[data-action="edit"]').click();
+    await page.locator("#p-detect-btn").click();
+    await page.locator("#p-detect-results .probe-line").first().waitFor();
+    await expect(
+      page.locator("#p-detect-results .hint", { hasText: "saved API key" })
+    ).toHaveCount(0);
+    await expect(
+      page.locator("#p-detect-results .hint", { hasText: "Probed without an API key" })
+    ).toHaveCount(1);
+    await upstream.close();
+  });
+
+  test("file 形态 key (api_key_file) 的编辑态探测同样携带存量 key (#347 ②)", async ({ page }) => {
+    // 种子条目 mock-file-key (playwright.config static 种子): masked 为空串但
+    // DTO 带 api_key_file_configured — 前端判据须据布尔建立引用 (仅判 masked 会
+    // 漏掉 file 形态 → keyless 401/absent). 鉴权墙墙值 = 文件内容.
+    const upstream = await startAuthWallUpstream(WEBUI_FILE_KEY);
+    const listRow = page.locator("#providers-body tr", { hasText: "mock-file-key" });
+    await expect(listRow).toBeVisible();
+    await listRow.locator('button[data-action="edit"]').click();
+    await expect(page.locator("#provider-form")).toBeVisible();
+    await expect(page.locator("#p-api-key")).toHaveValue("");
+    await page.locator("#p-detect-url").fill(upstream.url);
+    await page.locator("#p-detect-btn").click();
+    const oaRow = page.locator('.dr-item[data-protocol="openai"]');
+    await expect(oaRow.locator(".dr-status")).toHaveText("✓");
+    await expect(oaRow.locator(".dr-detail")).toContainText("model list · 1");
+    await expect(
+      page.locator("#p-detect-results .hint", { hasText: "saved API key" })
+    ).toHaveCount(1);
+    await page.locator('#provider-form-el button[value="cancel"]').click();
+    await upstream.close();
+  });
+
+  test("字段名 URL + hover 问号 tooltip (术语优化, #347 ③)", async ({ page }) => {
+    await openNewProviderForm(page);
+    const label = page.locator('label[for="p-detect-url"]');
+    await expect(label.locator("span[data-i18n='providers.detectUrlLabel']")).toHaveText("URL");
+    const help = label.locator(".label-help");
+    await expect(help).toHaveText("?");
+    await expect(help).toHaveAttribute(
+      "title",
+      "This URL is used to probe the concrete protocol endpoints — it is not requested directly"
+    );
+    // zh 词条存在性守卫 (缺 zh 会静默回退 en): 显式 zh 偏好重载后断言中文
+    // tooltip (重开后按钮文案已本地化, 按 data-i18n 属性定位避开文案匹配).
+    await page.evaluate(() => localStorage.setItem("sg-lang", "zh"));
+    await page.reload();
+    await page.locator('a.tab[data-tab="providers"]').click();
+    await page.locator('button[data-i18n="providers.new"]').click();
+    await expect(page.locator("#provider-form")).toBeVisible();
+    await expect(page.locator('label[for="p-detect-url"] .label-help')).toHaveAttribute(
+      "title",
+      "该 URL 用于探测各具体协议端点, 并不直接请求"
+    );
   });
 });
 

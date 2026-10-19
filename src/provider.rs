@@ -341,6 +341,12 @@ pub struct DirectProvider {
     /// 文件内容会被 `trim()` (容忍末尾换行符, 这是 sops / `echo | tee` 的常见副作用).
     /// 文件读不到时按空 key 处理 (与 `api_key` 为空时一致), 由 `apply_provider_auth`
     /// (在 `crate::proxy`) 决定是否跳过 auth header 注入.
+    ///
+    /// # SEC 注记 (#347)
+    /// 路径与内容都不进 GET DTO; 仅布尔存在性以 `api_key_file_configured`
+    /// 例外暴露 — WebUI 探测引用 (`use_provider_key`) 需要知道 "该条目有
+    /// file 形态 key" 才能发起引用 (inline 形态经 `api_key_masked` 判知,
+    /// file 形态 masked 为空串; 路径/内容零暴露).
     #[serde(default)]
     pub api_key_file: Option<std::path::PathBuf>,
 }
@@ -910,6 +916,12 @@ pub enum EffectiveProviderKind {
         /// 这里是空字符串 — 文件内容由 effective_api_key() 在转发时读取, 不进 effective 视图.
         api_key_masked: String,
         api_key_length: usize,
+        /// 是否配置了 api_key_file (#347). 与 masked 互补的 "有条目级 key" 判据:
+        /// file 形态 masked 为空串, WebUI 探测引用 (`use_provider_key`) 据此
+        /// 布尔得知可引用 (inline 形态经 masked 非空判知). 路径/内容零暴露;
+        /// false 省略 (旧客户端 wire 兼容).
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        api_key_file_configured: bool,
     },
     Router {
         routes: Vec<Route>,
@@ -940,6 +952,7 @@ impl From<Provider> for ProviderMasked {
                 endpoints: d.endpoints,
                 api_key_masked: crate::secrets::mask_value(&d.api_key),
                 api_key_length: d.api_key.chars().count(),
+                api_key_file_configured: d.api_key_file.is_some(),
             },
             ProviderKind::Router(r) => EffectiveProviderKind::Router { routes: r.routes },
             ProviderKind::Pool(p) => EffectiveProviderKind::Pool {

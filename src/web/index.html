@@ -794,6 +794,25 @@
       gap: 10px;
     }
     .detect-stage .detect-actions .hint { flex: 1; margin: 0; }
+    /* label 旁的 hover 问号 (#347 术语优化): 圆形描边小徽标, title 提示
+       语义 (鼠标 + 键盘 focus 皆可触发 — tabindex=0). */
+    .label-help {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 14px;
+      height: 14px;
+      margin-left: 4px;
+      border: 1px solid var(--border);
+      border-radius: 50%;
+      color: var(--fg-faint);
+      font-size: 10px;
+      line-height: 1;
+      cursor: help;
+      vertical-align: middle;
+      user-select: none;
+    }
+    .label-help:focus-visible { outline: 1px solid var(--accent); }
     #p-detect-results {
       grid-column: 1 / -1;
       display: grid;
@@ -2316,7 +2335,9 @@
       </div>
       <div class="kind-fields" id="p-direct-fields">
         <div class="detect-stage">
-          <label for="p-detect-url" data-i18n="providers.baseUrl">Base URL</label>
+          <!-- #347 术语优化: 字段名即 "URL" (原 "端点发现 (origin 探测)" 太绕);
+               hover 问号承载语义提示 — label 内文本节点包 span (data-i18n 纪律). -->
+          <label for="p-detect-url"><span data-i18n="providers.detectUrlLabel">URL</span><span class="label-help" tabindex="0" role="note" data-i18n-title="providers.detectUrlHelp">?</span></label>
           <input type="text" id="p-detect-url" placeholder="https://api.example.com" data-i18n-placeholder="providers.detectUrlPlaceholder">
           <label for="p-api-key" data-i18n="providers.apiKey">API Key</label>
           <input type="password" id="p-api-key" placeholder="(optional for local providers like Ollama)" data-i18n-placeholder="providers.apiKeyPlaceholder">
@@ -2741,7 +2762,9 @@
         'providers.detecting': 'Detecting…',
         'providers.removeEndpoint': 'Remove endpoint',
         'providers.addProtocol': '+ Add protocol',
-        'providers.baseUrl': 'Base URL',
+        // #347: 字段名极简为 "URL", 语义提示移到 label 旁问号 icon (title).
+        'providers.detectUrlLabel': 'URL',
+        'providers.detectUrlHelp': 'This URL is used to probe the concrete protocol endpoints — it is not requested directly',
         'providers.detectHint': 'Detection is optional — paste the provider URL (origin or base, known protocol faces are probed for you), then add protocols from the results below, or skip it and add endpoints manually. Saving never depends on detection.',
         'providers.detectUrlPlaceholder': 'https://api.example.com — origin or endpoint URL; protocol faces are probed for you',
         'providers.uriPlaceholder': 'auto',
@@ -2827,8 +2850,10 @@
         'verify.nonBlockingHint': 'Verification is a hint only — saving is never blocked.',
         'probe.noProbes': 'No probes returned',
         'probe.noEndpointHint': "No models endpoint recognized — some providers (especially Anthropic-compatible gateways) don't expose one. That's fine: pick the protocol for this endpoint manually and save; forwarding never depends on detection.",
-        'probe.keylessHint': 'Probed without an API key — the saved key is not reused; auth_failed may just mean the probe carried no key.',
-        'probe.enterUrl': 'Enter a base URL first',
+        'probe.keylessHint': 'Probed without an API key — auth_failed may just mean the probe carried no key.',
+        // #347: 编辑态探测默认携带条目存量 key (use_provider_key 引用) — 正向提示.
+        'probe.usedStoredKey': 'Probed with this provider\u2019s saved API key (the key itself is never displayed).',
+        'probe.enterUrl': 'Enter the URL first',
         'probe.failed': 'Probe failed: {msg}',
         // ── apikeys tab ──
         'apikeys.new': '+ new API key',
@@ -3233,7 +3258,9 @@
         'providers.detecting': '探测中…',
         'providers.removeEndpoint': '移除端点',
         'providers.addProtocol': '+ 添加协议',
-        'providers.baseUrl': '端点 URL',
+        // #347: 字段名极简为 "URL", 语义提示移到 label 旁问号 icon (title).
+        'providers.detectUrlLabel': 'URL',
+        'providers.detectUrlHelp': '该 URL 用于探测各具体协议端点, 并不直接请求',
         'providers.detectHint': '检测是可选增强 — 填供应商 URL (origin 或端点 URL, 各协议面自动探测), 在下方结果行点「添加」快速加入协议, 也可跳过检测手动添加。保存永不依赖检测结果。',
         'providers.detectUrlPlaceholder': 'https://api.example.com — origin 或端点 URL, 各协议面自动探测',
         'providers.uriPlaceholder': '自动',
@@ -3319,8 +3346,10 @@
         'verify.nonBlockingHint': '校验仅作提示, 不会阻塞保存。',
         'probe.noProbes': '未返回任何探测',
         'probe.noEndpointHint': "未识别到模型端点 — 部分供应商（尤其 Anthropic 兼容网关）不提供该端点。这不影响使用：手动选择该端点的协议后保存即可，转发不依赖检测结果。",
-        'probe.keylessHint': '探测未携带 API key — 已保存的 key 不会被复用; auth_failed 可能只是因为探测请求没带 key。',
-        'probe.enterUrl': '请先填写 base URL',
+        'probe.keylessHint': '探测未携带 API key — auth_failed 可能只是因为探测请求没带 key。',
+        // #347: 编辑态探测默认携带条目存量 key (use_provider_key 引用) — 正向提示.
+        'probe.usedStoredKey': '已使用该条目保存的 API key 探测 (key 本身不会回显)。',
+        'probe.enterUrl': '请先填写 URL',
         'probe.failed': '探测失败: {msg}',
         // ── apikeys tab ──
         'apikeys.new': '+ 新建 API key',
@@ -3549,11 +3578,13 @@
       // 表单世界 (含静默改写端点行 protocol select 导致存错协议的数据级后果).
       probeEpoch: 0,
       // provider 表单检测台最近一次成功响应快照 (#332 融合): { url, data,
-      // keylessHint } | null. url = 发起探测时的检测台输入 — 检测结果行只对它
+      // keyNote } | null. url = 发起探测时的检测台输入 — 检测结果行只对它
       // 成立; data = POST /api/providers/probe-origin 响应 (origin 归一化后的
-      // faces 矩阵, v1 族行携带 common_uri 布局证据); keylessHint = 编辑态
-      // key 留空的消歧提示 (渲染期消费). 生命周期: dialog 打开重置 null; detect
-      // 成功落地覆写; 结果区 DOM 是它的派生物 (同 probeEpoch 属 dialog 世界状态).
+      // faces 矩阵, v1 族行携带 common_uri 布局证据); keyNote = 探测 key 来源
+      // 消歧 (#347): 'stored' = 携带了条目存量 key (use_provider_key 引用) /
+      // 'keyless' = 真无 key (编辑态且条目无存量 key) / null = 无需提示 (显式
+      // key 或新建未填). 生命周期: dialog 打开重置 null; detect 成功落地覆写;
+      // 结果区 DOM 是它的派生物 (同 probeEpoch 属 dialog 世界状态).
       probeLastDetect: null,
       // provider 表单 common_uri 暂存 (detect 知识 → 保存落盘的通道) 是 **per 端点行**
       // 的 (multi-endpoint): 存在行的 `dataset.commonUri` 上 (行数据 SSOT 是 DOM 本身,
@@ -7749,11 +7780,13 @@
       epsList.innerHTML = '';
       const eps = existing?.kind === 'direct' ? (existing.endpoints || []) : [];
       eps.forEach(e => addEndpointRow(e));
-      // 检测台 (#332): URL 预填首端点 base_url (编辑态便利, 单端点是常态; 多端点
-      // 仅为检测起点, 不影响行数据), 结果区清空 + 快照重置 + 按钮复位 (dialog 世界
+      // 检测台 (#332): 结果区清空 + 快照重置 + 按钮复位 (dialog 世界
       // 切换 — 在途探测属于旧世界, 其 finally 被 epoch 门控不复位新世界按钮, 故
-      // 此处显式还原)。
-      document.getElementById('p-detect-url').value = eps[0]?.base_url || '';
+      // 此处显式还原)。URL 预填优先级 (#347 ①): 上次探测 URL 记忆 (per-provider
+      // localStorage, 用户显式探测过的 URL 本身) > 首端点 base_url (编辑态便利,
+      // 单端点是常态; 多端点仅为检测起点, 不影响行数据) > 空 (新建).
+      document.getElementById('p-detect-url').value =
+        recalledDetectUrl(existing?.id) ?? eps[0]?.base_url ?? '';
       document.getElementById('p-detect-results').innerHTML = '';
       document.querySelector('.detect-stage .ep-url-suggest')?.remove();
       state.probeLastDetect = null;
@@ -8413,6 +8446,55 @@
       });
     }
 
+    // ─── #347: 检测台 URL 记忆 + 编辑态探测 key 来源 ─────────────────────
+    //
+    // 两个小机制的共享落点 (都是 UI 层辅助, 不进 state.toml 配置语义):
+    //
+    // ① 探测 URL 记忆 (per-provider localStorage): 用户对某 provider 显式发起
+    //    过 Detect 的 URL (Detect 点击时) / 保存时的检测台当前值 (create 模式
+    //    id 生成后回填键), 二次编辑该 provider 时预填 — 优先级: 记忆 > 首端点
+    //    base_url (PR #344 决策的 fallback) > 空. 防御: localStorage 是外部
+    //    输入面 — 读侧长度 cap 内才认 (超长视为无记忆), 值只进 input.value
+    //    (无 HTML 注入面); 写侧 trim + cap. 配额/隐私模式异常静默 (记忆是增强).
+    const DETECT_URL_MAX_LEN = 2048;
+    const detectUrlMemoryKey = id => 'sg-detect-url:' + id;
+    function rememberDetectUrl(id, url) {
+      if (!id || !url) return;
+      try {
+        localStorage.setItem(detectUrlMemoryKey(id), url.slice(0, DETECT_URL_MAX_LEN));
+      } catch { /* 配额/隐私模式 — 记忆是增强, 失败静默 */ }
+    }
+    function recalledDetectUrl(id) {
+      if (!id) return null;
+      try {
+        const v = localStorage.getItem(detectUrlMemoryKey(id));
+        return v && v.length <= DETECT_URL_MAX_LEN ? v : null;
+      } catch { return null; }
+    }
+    // 已删除 provider 的记忆键残留是已接受限制 (仅数十字节, 无清理入口).
+    function probeKeyForRequest() {
+      // ② 编辑态探测 key 来源 (#347, 修 401): key 输入留空 = "保留旧值" 的表单
+      // 语义 (PUT api_key=null) 延伸到探测 — 引用编辑对象 id, 服务端查表注入
+      // 存量 key (引用而非传值: GET DTO 只有 masked, 前端拿不到明文 — 这是唯一
+      // 通路; 且 key 不过 wire 二次落日志). 显式输入的 key 恒优先; 编辑对象
+      // 无存量 key (inline masked 空 且无 api_key_file) 时按无 key 探测 (不发
+      // 引用, keyless 提示由调用方按 keyNote 呈现). api_key_file 形态由服务端
+      // effective_api_key 解析.
+      const apiKey = document.getElementById('p-api-key').value;
+      if (apiKey !== '') return { apiKey, useProviderKey: null, note: null };
+      const editId = document.getElementById('provider-form').dataset.editId || '';
+      if (!editId) return { apiKey, useProviderKey: null, note: null };
+      // "有条目级 key" 判据 (两形态互补, #347): inline → masked 非空;
+      // api_key_file → masked 空串但 DTO 带 api_key_file_configured (路径/内容
+      // 零暴露的服务端布尔 — file 内容由服务端 effective_api_key 现场解析).
+      const entry = [state.providersList, state.providersDisabled]
+        .flat().find(x => x.id === editId);
+      const hasStoredKey = !!(entry?.api_key_masked || entry?.api_key_file_configured);
+      return hasStoredKey
+        ? { apiKey, useProviderKey: editId, note: 'stored' }
+        : { apiKey, useProviderKey: null, note: 'keyless' };
+    }
+
     // 检测台 Detect (#332 步骤②): 对检测台 URL 做 origin 发现探测 (归一化在
     // 服务端 — 剥离尾部已知面段后按面候选矩阵探测). 落地对账: 世界没换 (epoch)
     // 即可 — 结果区整体重渲染, 不存在部分行改写问题.
@@ -8425,20 +8507,19 @@
       }
       const btn = document.getElementById('p-detect-btn');
       const epoch = state.probeEpoch;
-      const apiKey = document.getElementById('p-api-key').value;
-      // 编辑态 key 留空: probe 按表单当前值发 (masked 旧值不可逆, 不复用存量 key),
-      // 结果里的 auth_failed 未必是配置坏了 — 落地后补一行提示消歧 (同旧 per-row
-      // Detect 语义). 前置: 编辑对象确实配置过 key (api_key_masked 非空).
-      const editId = document.getElementById('provider-form').dataset.editId;
-      const savedKeyMasked = [state.providersList, state.providersDisabled]
-        .flat().find(x => x.id === editId)?.api_key_masked;
-      const keylessHint = !!(editId && apiKey === '' && savedKeyMasked);
+      // #347 ①: 记住用户对该 provider 显式探测的 URL (编辑态; create 态 id 未知,
+      // 由保存成功的 onSaved 钩子补写).
+      const editId = document.getElementById('provider-form').dataset.editId || '';
+      if (editId) rememberDetectUrl(editId, stageUrl);
+      // #347 ②: key 来源解析 (显式输入 > 存量 key 引用 > 无 key).
+      const probeKey = probeKeyForRequest();
       // extra_faces: origin 精确命中知识库条目 → 增测该厂商已验证面 (匹配谓词
       // 见 ENDPOINT_PRESETS 段注释); 未命中省略 (后端按内置候选面探测).
       const preset = findOriginPreset(stageUrl);
       const body = {
         origin: stageUrl,
-        ...(apiKey ? { api_key: apiKey } : {}),
+        ...(probeKey.apiKey ? { api_key: probeKey.apiKey } : {}),
+        ...(probeKey.useProviderKey ? { use_provider_key: probeKey.useProviderKey } : {}),
         ...(preset ? { extra_faces: preset.faces } : {}),
       };
       btn.disabled = true;
@@ -8464,8 +8545,9 @@
         if (landed()) {
           // 快照与结果绑定: url 是**被探测的**输入 (非检测台当前值) — 用户探测后
           // 又改检测台时, 结果行仍对快照成立, 快速添加回填 wire 的 base_url
-          // (v1 族 = 归一化 origin + cu, 其余族 = origin + uri).
-          state.probeLastDetect = { url: stageUrl, data, keylessHint };
+          // (v1 族 = 归一化 origin + cu, 其余族 = origin + uri). keyNote = 探测
+          // key 来源消歧 (#347: stored/keyless/null).
+          state.probeLastDetect = { url: stageUrl, data, keyNote: probeKey.note };
           renderDetectResults();
         }
       } catch (e) {
@@ -8538,7 +8620,8 @@
     // 检测结果区整体渲染 (数据源 = state.probeLastDetect 快照): 首行声明被探测
     // 的 URL (不黑盒 — 用户改过检测台也能对照), 归一化提示 (typed_face_stripped
     // 非空 = 输入含面尾段被服务端剥离), 其后 per 面条目; 全军覆没时附肯定式
-    // 逃生口 hint (UI-10: 不暗示 URL 填错), keylessHint 殿后.
+    // 逃生口 hint (UI-10: 不暗示 URL 填错), key 来源提示殿后 (#347: stored 正向
+    // 确认 / keyless 消歧 auth_failed; 显式 key 与新建未填不提示).
     function renderDetectResults() {
       const el = document.getElementById('p-detect-results');
       const snap = state.probeLastDetect;
@@ -8556,7 +8639,11 @@
       if (!faces.some(f => f.status === 'ok')) {
         parts.push(`<div class="hint">${escapeHtml(t('probe.noEndpointHint'))}</div>`);
       }
-      if (snap.keylessHint) parts.push(`<div class="hint">${escapeHtml(t('probe.keylessHint'))}</div>`);
+      if (snap.keyNote === 'stored') {
+        parts.push(`<div class="hint">${escapeHtml(t('probe.usedStoredKey'))}</div>`);
+      } else if (snap.keyNote === 'keyless') {
+        parts.push(`<div class="hint">${escapeHtml(t('probe.keylessHint'))}</div>`);
+      }
       el.innerHTML = parts.join('');
       syncDetectResultAddStates();
     }
@@ -8617,7 +8704,9 @@
       }
       const btn = row.querySelector('.ep-verify');
       const epoch = state.probeEpoch;
-      const apiKey = document.getElementById('p-api-key').value;
+      // #347 ②: key 来源与检测台统一 (probeKeyForRequest) — 编辑态 key 留空时
+      // 经 use_provider_key 引用携带条目存量 key (修 verify 的 401 误报).
+      const probeKey = probeKeyForRequest();
       const protocol = row.querySelector('.ep-protocol').value;
       // dataset 是 SSOT (null = 启发式 — 后端镜像 effective_common_uri 拼接).
       const commonUri = row.dataset.commonUri ?? null;
@@ -8634,7 +8723,13 @@
         const r = await fetch(`${API_PROVIDERS}/probe`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, protocol, common_uri: commonUri }),
+          body: JSON.stringify({
+            base_url: baseUrl,
+            api_key: probeKey.apiKey,
+            ...(probeKey.useProviderKey ? { use_provider_key: probeKey.useProviderKey } : {}),
+            protocol,
+            common_uri: commonUri,
+          }),
         });
         if (!r.ok) {
           const fallback = 'HTTP ' + r.status;
@@ -8723,7 +8818,9 @@
     }
 
     // 通用 form submit (按 dlg + payload 构造器分发, 通过 KINDS 查表避免 ternary 字符串匹配).
-    function bindFormSubmit(kind, formId, buildPayload) {
+    // onSaved (可选, #347): 保存成功后的 kind 特定钩子 (dlg.close() 前调用), 收
+    // finalId — PUT = editId; POST = 响应体回填的最终 id (显式或服务端生成).
+    function bindFormSubmit(kind, formId, buildPayload, onSaved) {
       const cfg = KINDS[kind];
       document.getElementById(formId).addEventListener('submit', async (ev) => {
         const dlg = document.getElementById(cfg.formDlgId);
@@ -8751,6 +8848,15 @@
             const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
             alert(t('common.alertFailed', { msg: err.error || r.status }));
             return;
+          }
+          if (onSaved) {
+            // create 的最终 id: 响应体 effective 视图回填 (显式传 id 或服务端生成).
+            let finalId = editId;
+            if (!finalId) {
+              const created = await r.json().catch(() => null);
+              finalId = created?.id || null;
+            }
+            onSaved(finalId);
           }
           await cfg.refresh();
           dlg.close();
@@ -8882,6 +8988,11 @@
         api_key: (editId && apiKeyInput === '') ? null : apiKeyInput,
       };
       return cancelSwitchedConstruct(payload);
+    }, finalId => {
+      // #347 ①: 保存成功时以最终 id 落记忆 (create 模式 detect 时 id 未知, 此处
+      // 才可回填键) — 记住检测台当前值 (用户最新的 URL 意图; 空 id/空 URL 由
+      // rememberDetectUrl 自身的空值守卫跳过).
+      rememberDetectUrl(finalId, document.getElementById('p-detect-url').value.trim());
     });
 
     // ─── decision PATCH ──────────────────────────────────────────────────

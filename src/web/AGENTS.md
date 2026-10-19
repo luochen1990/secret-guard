@@ -87,7 +87,7 @@ PUT    /api/providers/{id}
 DELETE /api/providers/{id}           → 同 secrets (#156)
 PATCH  /api/providers/{id}/decision
 DELETE /api/providers/{id}/override  → 重置为空态 (#348), 语义同 secrets 侧
-POST   /api/providers/probe          body: {base_url, api_key?, protocol!, common_uri?} →
+POST   /api/providers/probe          body: {base_url, api_key?, use_provider_key?, protocol!, common_uri?} →
                                          {probes[1] (被验证协议, status: ok|auth_failed|
                                           absent|error, models?, detail?, urls[1],
                                           common_uri? = 被验证 cu (ok·v1 族))}
@@ -96,8 +96,14 @@ POST   /api/providers/probe          body: {base_url, api_key?, protocol!, commo
                                           protocol 缺失或未知名 / common_uri 非法形状 → 400;
                                           算法在 proxy::models::verify_endpoint_upstream;
                                           cu 缺省按运行时同款尾段启发拼接 — 校验 URL ==
-                                          egress URL; urls = 实际 GET 的完整 URL 不黑盒)
-POST   /api/providers/probe-origin   body: {origin, api_key?, extra_faces?[{uri,protocol}]} →
+                                          egress URL; urls = 实际 GET 的完整 URL 不黑盒;
+                                          use_provider_key = #347 存量 key 引用 — api_key
+                                          空时服务端查 effective provider 表注入该 id
+                                          Direct 条目的 effective_api_key (引用而非传值,
+                                          key 不二次过 wire), 显式 api_key 优先, 未知 id /
+                                          非 Direct / 无 key → 按无 key 探测; 响应永不回显
+                                          key)
+POST   /api/providers/probe-origin   body: {origin, api_key?, use_provider_key?, extra_faces?[{uri,protocol}]} →
                                          {origin (归一化后), typed_face_stripped?,
                                           faces[5] (openai/anthropic/gemini/ollama/responses,
                                           status: ok|absent|error, uri?, base_url?,
@@ -113,7 +119,8 @@ POST   /api/providers/probe-origin   body: {origin, api_key?, extra_faces?[{uri,
                                           common_uri=null; gemini 的 /v1beta 是运行时
                                           自拼版本段 (折叠进 models_path, base_url=origin);
                                           responses 行镜像 openai; 证据梯与对照探测见
-                                          proxy::origin 头注释)
+                                          proxy::origin 头注释; use_provider_key 同
+                                          /api/providers/probe 的 #347 存量 key 引用语义)
 PUT    /api/providers/probe          → 同 PUT /api/providers/{id}, 固定 id="probe"
 DELETE /api/providers/probe          → 同 DELETE /api/providers/{id}, 固定 id="probe"
                                           (静态段优先于 {id} 参数段, 该 id 的编辑/删除只能
@@ -134,7 +141,11 @@ GET    /api/providers/{id}/models    → ModelPreview {models[], source: "router
                                           算法 SSOT 在 proxy::models::provider_model_preview.
 GET    /api/providers                → pool 条目平级附加 pool_status[] (每成员
                                           {id, active, resume_in_secs} —
-                                          PoolStates 只读派生, 非 pool 条目该字段缺席)
+                                          PoolStates 只读派生, 非 pool 条目该字段缺席);
+                                          direct 条目平级附加 api_key_file_configured
+                                          (bool, #347 — file 形态 masked 为空串,
+                                          该布尔是 WebUI 探测引用判据的数据源;
+                                          false 省略, 路径/内容零暴露)
 
 GET    /api/api-keys
 POST   /api/api-keys
@@ -364,13 +375,19 @@ API key CRUD **无条件挂载** (在 `web::router()`, 不依赖 `auth.enabled`)
   `p.endpoints[]` 全量物化 (URI 输入框/徽标回显存量知识), 保存全量提交 endpoints
   (无 #157 null 歧义, "保留" 由回填实现)。手动 "添加协议" 默认选一个尚未配置的
   codec 覆盖协议 + 预填检测台 URL。api_key 保持条目级一份 (共享凭证, D3),
-  位于检测台内 (#332: 检测与逐行 Verify 都取它当前值)。
+  位于检测台内 (#332: 检测与逐行 Verify 都取它当前值; #347: 编辑态留空时两路
+  探测统一经 `use_provider_key` 引用携带条目存量 key — 留空 = "保留旧值" 的
+  表单语义延伸到探测)。
 - **Detect 检测台** (#332 步骤①②③, 融合终态): `POST /api/providers/probe-origin`
-  (检测台 URL 作 origin + 条目级 api_key 当前值 + 知识库命中的 extra_faces) →
+  (检测台 URL 作 origin + 探测 key (`probeKeyForRequest`: 条目级 api_key 当前值
+  显式优先; 编辑态留空且条目有存量 key → `use_provider_key` 引用 #347, 服务端注入
+  effective_api_key — 修二次编辑探测 401) + 知识库命中的 extra_faces) →
   固定 5 行检测矩阵 (`#p-detect-results`, wire 契约: status ok|absent|error ×
   evidence models|auth|existence; 恒 200, 探测失败是数据; responses 镜像行带共用
   注记)。首行声明被探测 URL + `typed_face_stripped` 归一化提示 (快照
-  `state.probeLastDetect` 的 url — 检测台改过也能对照)。ok 行右侧 **[添加]**
+  `state.probeLastDetect` 的 url — 检测台改过也能对照; keyNote = key 来源消歧
+  提示: stored 正向确认 / keyless 消歧 auth_failed / 显式 key 与新建未填不提示)。
+  ok 行右侧 **[添加]**
   一键物化端点行 (端点知识映射: v1 族 base_url=origin + common_uri=面路径直填
   dataset; anthropic/ollama base_url=origin+uri, cu 留空; gemini /v1beta 折叠进
   models_path (base_url=origin); verify ✓ 直填仅 evidence=models —
@@ -381,7 +398,13 @@ API key CRUD **无条件挂载** (在 `web::router()`, 不依赖 `auth.enabled`)
   手动 "添加协议" 恒可用 (UI-10)。全 absent 时附肯定式逃生口 hint。epoch 对账
   复用 probeEpoch (dialog 重开丢弃在途结果 + 检测按钮静态单例显式复位);
   Enter 在检测台 URL 输入 = 检测键盘等价。origin 输入挂知识库 autocomplete
-  (见下条)。
+  (见下条)。**检测台 URL 字段 (#347)**: label 即 "URL" + hover 问号 tooltip
+  ("该 URL 用于探测各具体协议端点, 并不直接请求", `.label-help` + i18n
+  `providers.detectUrlHelp`); **URL 记忆** — 用户显式探测过/保存时的检测台值
+  per-provider 记忆在 localStorage (`sg-detect-url:<id>`, 读写带长度 cap 防
+  御 — UI 层辅助不进 state.toml; 写点 = 编辑态 Detect 点击 + 保存成功钩子
+  `bindFormSubmit(onSaved)` (create 态此时才知道生成 id); 已删除条目的记忆键
+  残留是已接受限制), 二次编辑预填优先级: 记忆 > 首端点 base_url > 空。
 - **供应商端点知识库** (ENDPOINT_PRESETS, #332 升级为 `{label, origin, faces[]}`):
   origin = 剥离面尾段的厂商源, faces = 已验证协议面 ({uri, protocol}; curl 证据史见
   常量头). 两个消费面: ① origin **精确命中** (trim + 去尾斜杠 + 小写, `normalizeOrigin`)
@@ -429,8 +452,9 @@ API key CRUD **无条件挂载** (在 `web::router()`, 不依赖 `auth.enabled`)
   拦截, 不依赖后端 400). Direct 分支不发 `routes` / `members` — 构造切换的显式取消
   例外见上方 "构造切换的显式取消" 条.
 - **端点行 Verify ("二次检测", #332 步骤④)**: `POST /api/providers/probe`
-  {base_url, api_key, protocol, common_uri} (dataset 是 SSOT, null = 后端镜像
-  尾段启发拼接 — 校验 URL 与运行时 egress URL 一致) → 单条 outcome; 行内 ✓/✗
+  {base_url, api_key, use_provider_key?, protocol, common_uri} (dataset 是 SSOT,
+  null = 后端镜像尾段启发拼接 — 校验 URL 与运行时 egress URL 一致; key 来源与
+  检测台统一 = `probeKeyForRequest`, #347) → 单条 outcome; 行内 ✓/✗
   icon (`setVerifyState` 的 v-ok/v-fail class) + `.ep-probe-result` 详情 (状态行 +
   GET url 回显 + ok 时模型 chips; fail 时附非阻塞声明)。**仅提示不阻塞保存**
   (UI-10, Playwright 守卫); 行编辑 (protocol/URI/base_url 任一) 即失效 icon —

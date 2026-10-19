@@ -8,3 +8,8 @@
  *  redact 命中的共享值. 长值 (64 chars) 是刻意设计: Auto mock 长度 = secret 长度,
  *  长 mock 才能决定性触发 usage 表格溢出守卫 (远超 td 列宽 180/280px). */
 export const TEST_SECRET_VALUE = "sk-test-" + "a1b2c3d4e5f6".repeat(4) + "a1b2c3d4";
+
+/** #347: config 种子 "mock-file-key" 条目的 api_key_file 内容 (含末尾换行 —
+ *  服务端 effective_api_key 的 trim 由集成测试守卫, 这里只提供值) 与 spec 的
+ *  鉴权墙上游断言共享. */
+export const WEBUI_FILE_KEY = "sk-webui-file-key";

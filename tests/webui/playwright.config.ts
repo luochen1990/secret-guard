@@ -15,7 +15,7 @@ import { defineConfig } from "@playwright/test";
 import * as path from "path";
 import * as fs from "fs";
 import * as os from "os";
-import { TEST_SECRET_VALUE } from "./fixtures";
+import { TEST_SECRET_VALUE, WEBUI_FILE_KEY } from "./fixtures";
 
 // Playwright 加载 config 时 cwd = config 所在目录 (tests/webui).
 // 不用 import.meta.url (在 CJS 模式下不可用, 在 ESM 模式下又要求 package.json type:module).
@@ -183,12 +183,24 @@ process.on("exit", () => {
 
 // 测试前的 setup: 用 Node fs 直接写配置 (避免 shell heredoc 的两层 quoting 歧义).
 // 模块加载时执行一次, webServer 启动时配置文件已就绪.
+// #347 file 形态 key 种子: api_key_file 条目 (探测引用用例的数据源 — inline 形态
+// 的存量 key 用例由用例内 WebUI 创建覆盖; file 形态经 static 种子最自然).
+fs.writeFileSync(path.join(TMP_DIR, "sg-file-key.txt"), WEBUI_FILE_KEY + "\n");
 fs.writeFileSync(
   SG_CONFIG,
   `[[providers]]
 id = "mock-openai"
 kind = "direct"
 endpoints = [ { protocol = "openai", base_url = "http://127.0.0.1:${MOCK_PORT}" } ]
+enabled = true
+
+# #347: api_key_file 形态种子 (masked 为空串 + api_key_file_configured true) —
+# 编辑态探测引用的 file 路径用例.
+[[providers]]
+id = "mock-file-key"
+kind = "direct"
+endpoints = [ { protocol = "openai", base_url = "http://127.0.0.1:${MOCK_PORT}" } ]
+api_key_file = "${path.join(TMP_DIR, "sg-file-key.txt")}"
 enabled = true
 
 # 透传族存量条目 (webui_protocols 词表外): 编辑场景用例的种子.
