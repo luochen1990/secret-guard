@@ -126,9 +126,11 @@ const MODEL_LIST_TTL: Duration = Duration::from_secs(300);
 #[cfg(test)]
 const MODEL_LIST_TTL: Duration = Duration::from_millis(500);
 
-/// 上游模型列表 fetch 的整体超时 (brief §2.2 冻结常量: **整体** 覆盖 send + body
+/// 上游模型列表 fetch 的整体超时 (**整体** 覆盖 send + body
 /// 读取全程 — `send()` 在响应头到达即完成, body 停滞若无超时会**永久持有缓存锁**,
 /// 连带所有 router 的 /models 查询挂起, 见 `snapshot_refreshing` 锁语义).
+/// 值来源: 初版设计 brief (仓库外文档) §2.2 冻结, 此后无裁决变更 — /models 是
+/// 辅助功能 (非转发链), 短超时 + serve-stale-on-error 优于让 WebUI 检测长等待.
 /// test 构建用 500ms 让 "上游停滞超时" 路径可在单测覆盖.
 #[cfg(not(test))]
 const MODEL_FETCH_TIMEOUT: Duration = Duration::from_secs(10);

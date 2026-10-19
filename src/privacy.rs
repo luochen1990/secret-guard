@@ -119,7 +119,9 @@ const SCAN_BUDGET_BYTES: usize = 1024 * 1024;
 const MAX_LEAF_BYTES: usize = 2 * 1024 * 1024;
 
 /// 上下文摘要的前后字符预算 (per 侧, char 计数, 截断走 util 族保证
-/// char-boundary 安全).
+/// char-boundary 安全). 值来源 (#257 落地定稿): 上下文只为人工辨认疑似 token 的
+/// 载体 (变量名 / 赋值语句 / 相邻代码), 前后各 40 char 已覆盖典型语境且不放大
+/// 告警回显面 (cap 256 条 × 两侧窗口); 非精确预算, 无需钉契约.
 const CONTEXT_CHARS: usize = 40;
 
 /// context 窗口内**已登记** secret 值的遮盖占位符 (SEC-1: 登记值的完整
