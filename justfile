@@ -326,7 +326,8 @@ ci-merge *stage:
     esac
 
 # org ci 契约 P1 (部署门禁档, ci-deploy.yml 调用): audit (CVE) + bench compare-save
-# (判回归 + 滚动更新基线, 退化 exit 1 → run 红)。v3.0 政策变化: audit 由旧单 workflow
+# (判回归 + 绿 run 才滚动基线 — 判红回滚快照退化不落盘, 并 best-effort 开 issue 钉住,
+# #359; 退化 exit 1 → run 红)。v3.0 政策变化: audit 由旧单 workflow
 # 的 continue-on-error 非阻塞转 P1 阻塞 ("红 = 不能部署" 是本档职责; 旧非阻塞理由
 # "不阻塞 PR 合并" 在 P1 不再适用)。
 # nix build cargoHash 验证留 workflow 层且为 canary 探针 (continue-on-error — runner
@@ -477,8 +478,23 @@ bench *ARGS:
 #     (冷启动) 时 criterion panic, 本 recipe 先检测基线目录是否存在, 缺失则
 #     fallback 到 save 模式建立首基线 (第一次跑无历史可对比, 属正常).
 #   - mode=compare-save  (CI, ci-deploy.yml 调用): `--save-baseline ci` — criterion
-#     对该 flag 的输出仍含 vs 旧基线的 change 行, 故判回归与滚动更新一步完成;
+#     对该 flag 的输出仍含 vs 旧基线的 change 行, 故判回归与测量落盘一步完成;
 #     退化 exit 1 → ci-deploy run 红 (P1 "红 = 不能部署" 信号). 冷启动 fallback 同 compare.
+#
+# 基线策略 — 判红不滚动 (#359 问题一, 2026-10):
+#   criterion `--save-baseline` 的执行序是 "先对比旧基线、后无条件覆写基线"
+#   (0.8.2 源码: analysis::common 以 <bench>/<baseline>/ 旧内容为对比基准, 收尾
+#   copy_new_dir_to_base 把 new/ 覆写回去), 而判红发生在更晚的输出解析 — 不干预
+#   则红 run 的退化已成为新基准, 下一次 run 对含退化的基线判绿 (**退化永久成为
+#   新常态**). 修复: compare-save 跑前快照基线目录 (cp 到 CARGO_TARGET_DIR 下,
+#   不进 criterion/ 树以免干扰其目录遍历), 判红 / bench 失败时回滚快照 (旧基准
+#   保留), 仅绿 run 保留滚动. 由此红信号可持续: 修复前的每个 master push /
+#   nightly 都对同一旧基准重复判红. 快照 + 回滚 = 两次目录 cp (KB 级), 零额外
+#   bench 运行 (对比 "跑两次" 方案省一倍测量时间).
+#   辅助: 判红时经 Forgejo API upsert 退化 issue 钉住 (marker
+#   `<!-- bench-regression-issue -->`), 触发门 = BENCH_CI_ISSUE=1 + GITHUB_TOKEN
+#   (ci-deploy.yml Quality gate step 显式注入, 本地不设即静默跳过), best-effort
+#   (API 失败只 WARN, 不吞 exit 1 门禁信号; 修复后人工关 issue, 绿 run 不自动关).
 #
 # 退化判定逻辑 (解析 criterion stdout):
 #   每个场景输出 `change: time:   [lo% med% hi%] (p = x.xx …)` 行. 双门槛:
@@ -518,6 +534,71 @@ bench-ci mode *extra:
         [ -d "$BENCH_DIR/redact_ir/small/$BASELINE_NAME" ]
     }
 
+    # ── 基线快照/回滚 (compare-save 专用; 语义见 recipe 头部 "基线策略" 段) ──
+    BASELINE_SNAPSHOT=""
+    trap '[ -n "$BASELINE_SNAPSHOT" ] && rm -rf "$BASELINE_SNAPSHOT" || true' EXIT
+    snapshot_baseline() {
+        # 快照到 CARGO_TARGET_DIR 下独立目录 (与 criterion/ 同层; 不进 criterion/ 树).
+        BASELINE_SNAPSHOT=$(mktemp -d "${CARGO_TARGET_DIR%/}/criterion-baseline-snapshot.XXXXXX")
+        local n=0 d rel
+        while IFS= read -r d; do
+            rel="${d#"$BENCH_DIR"/}"
+            mkdir -p "$BASELINE_SNAPSHOT/$(dirname "$rel")"
+            cp -a "$d" "$BASELINE_SNAPSHOT/$rel"
+            n=$((n+1))
+        done < <(find "$BENCH_DIR" -mindepth 3 -type d -name "$BASELINE_NAME" 2>/dev/null)
+        # fail-closed: baseline_exists 判真但 find 零命中 = 目录布局假设破裂,
+        # 不带快照裸跑会失去判红回滚保证, 必须显式失败.
+        if [ "$n" -eq 0 ]; then
+            echo "bench-ci: 基线快照失败 (baseline_exists 判真但 find 零命中 '$BASELINE_NAME' 目录) — 目录布局漂移? fail-closed 退出." >&2
+            exit 2
+        fi
+        echo "bench-ci: 已快照 $n 个基线目录 (判红/bench 失败时回滚, 退化不落盘)."
+    }
+    rollback_baseline() {
+        # 回滚: rm 整目录再拷回 (而非增量覆盖), 防 criterion 落盘文件集变化留残渣.
+        # (rm 只删叶子, 父目录必在, 无需 mkdir -p.)
+        local d rel
+        while IFS= read -r d; do
+            rel="${d#"$BASELINE_SNAPSHOT"/}"
+            rm -rf "$BENCH_DIR/$rel"
+            cp -a "$d" "$BENCH_DIR/$rel"
+        done < <(find "$BASELINE_SNAPSHOT" -mindepth 3 -type d -name "$BASELINE_NAME" 2>/dev/null)
+        echo "bench-ci: 基线已回滚 — 本次测量不落盘, 旧基准保留 (下一 run 仍对同一旧基准判红)." >&2
+    }
+    # ── 判红自动开 issue (辅助, 触发门与 best-effort 语义见 recipe 头部) ──
+    open_regression_issue() {
+        local regressions="$1"
+        if [ "${BENCH_CI_ISSUE:-}" != "1" ] || [ -z "${GITHUB_TOKEN:-}" ]; then return 0; fi
+        if [ -z "${API_BASE:-}" ] || [ -z "${GITHUB_REPOSITORY:-}" ]; then
+            echo "bench-ci: WARN 跳过退化 issue upsert (缺 API_BASE/GITHUB_REPOSITORY env)." >&2
+            return 0
+        fi
+        local MARKER='<!-- bench-regression-issue -->' API existing_id PAYLOAD
+        API="$API_BASE/repos/$GITHUB_REPOSITORY/issues"
+        # upsert (同 ci-merge.yml PR 评论机制): 找带 marker 的 open issue 则 PATCH, 否则 POST.
+        existing_id=$(curl -fsSL -H "Authorization: token $GITHUB_TOKEN" "$API?state=open&type=issues" \
+            | jq -r --arg m "$MARKER" '.[] | select(.body != null and (.body | contains($m))) | .number' | head -1) || {
+            echo "bench-ci: WARN 查询退化 issue 失败 (best-effort, 忽略)." >&2
+            return 0
+        }
+        PAYLOAD=$(jq -n \
+            --arg t "bench: 性能退化未处理 (ci-deploy 判红)" \
+            --arg b "$MARKER"$'\n\n'"## 退化场景 (med > ${THRESHOLD}% 且 p ≤ 0.05)"$'\n\n'"$(printf '%s\n' "$regressions" | sed 's/^/- /')"$'\n\n'"- run: ${RUN_URL:-未知}"$'\n'"- commit: ${GITHUB_SHA:-未知}"$'\n\n'"基线已回滚 (退化测量未落盘) — 修复前每个 master push / nightly 都会对同一旧基准重复判红. 修复后请手动关闭本 issue." \
+            '{title: $t, body: $b}')
+        if [ -n "$existing_id" ]; then
+            curl -fsSL -X PATCH -H "Authorization: token $GITHUB_TOKEN" -H "Content-Type: application/json" \
+                -d "$PAYLOAD" "$API/$existing_id" >/dev/null \
+                && echo "bench-ci: 已更新退化 issue #$existing_id (钉住)." \
+                || echo "bench-ci: WARN 更新退化 issue 失败 (best-effort, 忽略)." >&2
+        else
+            curl -fsSL -X POST -H "Authorization: token $GITHUB_TOKEN" -H "Content-Type: application/json" \
+                -d "$PAYLOAD" "$API" >/dev/null \
+                && echo "bench-ci: 已开退化 issue 钉住 (marker 认领, 重跑不刷屏)." \
+                || echo "bench-ci: WARN 开退化 issue 失败 (best-effort, 忽略)." >&2
+        fi
+    }
+
     # 选择 criterion flag.
     ACTION="{{ mode }}"
     if [ "$ACTION" = "save" ] || [ "$ACTION" = "compare-save" ]; then
@@ -527,6 +608,8 @@ bench-ci mode *extra:
             ACTION="save"
         fi
         BENCH_FLAG="--save-baseline $BASELINE_NAME"
+        # 快照时机: 进入 bench 运行前 (criterion 收尾即覆写基线). 冷启动分支无基线可快照.
+        [ "$ACTION" = "compare-save" ] && snapshot_baseline
     elif [ "$ACTION" = "compare" ]; then
         if baseline_exists; then
             BENCH_FLAG="--baseline $BASELINE_NAME"
@@ -548,6 +631,8 @@ bench-ci mode *extra:
     echo "$OUTPUT"
     if [ "$BENCH_EXIT" -ne 0 ]; then
         echo "bench-ci: cargo bench 失败 (exit $BENCH_EXIT), 非退化判定范畴." >&2
+        # 回滚: bench 中途失败时 criterion 可能已滚动部分场景的基线 (逐 bench 落盘), 回滚保完整旧基准.
+        if [ "$ACTION" = "compare-save" ]; then rollback_baseline; fi
         exit 2
     fi
 
@@ -557,9 +642,9 @@ bench-ci mode *extra:
         exit 0
     fi
 
-    # compare-save (ci-deploy): 上方 --save-baseline 已滚动更新基线, 此处只补一行
-    # 说明 (退化判定走下方公共路径, 退化时 exit 1 → run 红).
-    [ "$ACTION" = "compare-save" ] && echo "bench-ci: 基线 '$BASELINE_NAME' 已滚动更新 (compare-save)."
+    # compare-save (ci-deploy): 走到这说明 bench 成功 — 基线已被 criterion 覆写为本次测量,
+    # 是否保留 (绿) 或回滚 (红) 由下方判定决定.
+    [ "$ACTION" = "compare-save" ] && echo "bench-ci: bench 完成, 基线待判 — 退化则回滚快照."
 
     # compare 模式: 解析每个场景的 change 中位数, 判定回归.
     # criterion 输出格式 (实测): 每个场景有绝对 time 行 [lo med hi] (无 %), change 区段
@@ -590,8 +675,12 @@ bench-ci mode *extra:
         echo "" >&2
         echo "bench-ci: ⚠️ 检测到性能退化 (中位数 > ${THRESHOLD}%):" >&2
         echo "$regressions" | sed 's/^/  /' >&2
+        # 判红不滚动 (#359): 回滚快照, 退化测量不落盘 — 否则退化成为新常态 (见 recipe 头部).
+        if [ "$ACTION" = "compare-save" ]; then rollback_baseline; fi
+        open_regression_issue "$regressions"
         exit 1
     fi
+    # 绿 run: 快照由 trap 清理, criterion 已落盘的本次测量保留为新基线.
     echo "bench-ci: ✓ 无场景退化超 ${THRESHOLD}% 阈值."
     exit 0
 

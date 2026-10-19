@@ -15,7 +15,8 @@
 # [v3.0 迁移记录] 本文件承接旧 ci.yml 的 audit / bench / nix build 三个 step (去向表
 #   见 docs/ci.md)。政策变化 (相对旧单 workflow 形态):
 #   - bench: 旧 = master save / PR compare 非阻塞 + PR 评论; 新 = compare-save 单模式
-#     (判回归 + 滚动更新基线), 退化时 run 红 (P1 门禁信号)。
+#     (判回归 + 绿 run 才滚动基线 — 判红回滚快照退化不落盘并自动开 issue 钉住, #359),
+#     退化时 run 红 (P1 门禁信号)。
 #   - audit / nix build: 旧 = continue-on-error 非阻塞 (升级判据 N=20 次 master 绿,
 #     针对的是 "不阻塞 PR 合并"); 新 = audit 阻塞级 — P1 不门禁 PR 合入, 旧非阻塞理由
 #     不再适用; "红 = 不能部署" 正是本档职责 (audit 发现 CVE 是该挡下部署的真信号)。
@@ -147,10 +148,19 @@ jobs:
 
       # P1 质量门禁 — 契约层入口 (`just ci-deploy`, org v3.0 可选契约):
       # audit (CVE, 阻塞 — 旧 PR-非阻塞语义不适用本档, 见文件头政策变化注记) +
-      # bench 基线 compare-save (判回归 + 滚动更新, 退化 exit 1 → run 红)。
-      # 判定逻辑 SSOT 在 justfile (audit / bench-ci recipe)。
+      # bench 基线 compare-save (判回归 + 绿 run 才滚动基线 — 判红回滚快照退化不落盘,
+      # #359; 退化 exit 1 → run 红)。判定逻辑 SSOT 在 justfile (audit / bench-ci recipe)。
+      # env = bench 判红自动开 issue 的接线 (#359 (a) 辅助): bench-ci 在判红时经 Forgejo
+      # API upsert 退化 issue 钉住 (marker `<!-- bench-regression-issue -->`, best-effort —
+      # API 失败只 WARN 不吞 exit 1)。GITHUB_TOKEN 自动凭据与 ci-merge.yml PR 评论同源;
+      # BENCH_CI_ISSUE=1 是显式 opt-in, 本地跑 bench-ci 不带这些 env 即静默跳过。
       - name: Quality gate (just ci-deploy)
         if: success() && steps.skip.outputs.should_skip != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          API_BASE: ${{ github.api_url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          BENCH_CI_ISSUE: '1'
         run: just ci-deploy
 
       # ─── nix package 验证 (issue #149-6) ────────────────────────────────────
