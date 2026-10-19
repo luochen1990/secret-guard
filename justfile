@@ -735,21 +735,43 @@ check-docs:
 # 规则 (全部 fail-closed, 含输入侧):
 #   R0: contracts.md 缺失 / property 行数为 0 (锚点 grep 失效或行格式漂移) → 报错.
 #       property 行格式契约: 顶格 `- \`prop_...\`` (§0.6), 缩进/表格形式不被扫描.
+#   R0-b (#354): property 名基线 (docs/design/contracts.prop-baseline, 一行一名,
+#       # 开头注释行允许) 单向比对 — 基线有而扫描面无 → 报错: 曾登记的行退出扫描面
+#       (缩进/表格化/改名/删除) 须显式同步基线 (`just update-contracts-baseline`
+#       重生成后随 PR 提交). 新增方向不比对: 新增行已有 R1-R3 标注校验把关,
+#       强制登记徒增 PR 摩擦; 同名跨段引用合法 (现存 prop_internal_url_404_no_forward
+#       ×2), 基线存 sort -u 名单而非行计数.
 #   R1: property 行缺三种标注之一 → 报错.
 #   R2: ✅ 行但 property 名零命中 → 报错 (假 ✅).
-#   R3: 🔁 行但任一锚点零命中 → 报错 (指向不存在的测试 = 双重幻影).
+#   R2-b (#354): ✅ 行但 property 名在 ignored 名单 → 报错 — #[ignore] 的测试不
+#       运行, 不构成 "同名落地" (转正/换运行载体, 或改 ⏳).
+#   R3: 🔁 行但任一锚点零命中 → 报错 (指向不存在的测试 = 双重幻影). 锚点在 *.rs
+#       内的命中须为非注释行 (#354: 防 "写行注释伪造 🔁") — 豁免 `Foo::bar` 符号
+#       路径与 `#[...]` 属性字面两类锚点: 其合法命中面含 rustdoc intra-doc 链接,
+#       行级注释过滤会误伤 (现存锚点 `SecretEntry::validate_and_resolve` 仅 doc 命中).
+#   R3-b (#354): 🔁 锚点在 ignored 名单 → 报错 (指向 #[ignore] 载体 = 非运行载体);
+#       例外: 标注行含 `#[ignore` prose 声明时豁免 — 明示 "该载体未落地" 的说明形态.
+#   R4 (#354): 标注行 prose 含 `#[ignore` 声明, 但行内反引号串无一在 ignored 名单
+#       → 报错 — 声明过时 (所点载体实际已转常驻; 升格进锚点列表并清理 prose).
+#       载体日后转正常驻时本规则变红, 提示同步 — 声明与事实双向锁死.
 # 已知豁免面 (机械 lint 无法覆盖, 由 review + 计数公开兜底):
 #   - 泛串锚点 (如 `fn`) 字面可命中 — 锚点应写具体测试名, review 时核对.
 #   - ⏳ 免检 — 但计数在输出公开 + §0.6 优先级表追踪, 滥用会立刻可见 (⏳ 数暴增).
+#   - ignored 名单的识别窗口: `#[ignore` **非注释**属性行下方 3 行内的 fn 名 (常见
+#     排布 #[test]/#[ignore]/fn 与 #[tokio::test]/#[ignore]/async fn 均在窗口内;
+#     属性与 fn 间隔 >3 行的极端排布不识别 — 误收风险为零, 漏识别由 review 兜底).
+#     .ts 载体 (Playwright) 无 Rust ignore 语义, 天然不进名单.
 # 扫描范围: src/ tests/ (*.rs/*.ts) + justfile + .forgejo/workflows/ci-merge.yml
 # (后两处覆盖 CI step / recipe 类锚点, 如 VIEW-1 的 consistency-check step).
 # 工具: 纯 bash+grep+sed (runner VM corePackages, 无 rg 依赖 — 区别于 check-docs
 # 的 rg; 本检查进 `just check` 阻塞链, 必须在 CI runner 可运行).
-# 自测方式: 删任一行的标注 → 本 recipe 红; 恢复 → 绿.
+# 自测方式: 删任一行的标注 → 本 recipe 红; 恢复 → 绿. #354 各规则的红灯证明
+# 矩阵 (master 现状 R4 红 / R0-b/R2-b/R3-b/注释过滤构造红) 见对应 PR 描述.
 check-contracts:
     #!/usr/bin/env bash
     set -euo pipefail
     md=docs/design/contracts.md
+    baseline=docs/design/contracts.prop-baseline
     errors=0; n_ok=0; n_renamed=0; n_pending=0
     fail() { echo "::error::check-contracts: $*"; errors=$((errors+1)); }
     # R0 (输入侧 fail-closed): 文件缺失 / 零 property 行 = 锚点失效或格式漂移,
@@ -764,6 +786,32 @@ check-contracts:
       echo "::error::check-contracts: property 行数为 0 (^- \`prop_\` 锚点失效或行格式漂移?)."
       exit 1
     fi
+    # R0-b (#354): 基线单向比对 (基线 ⊆ 扫描面) — 单条行缩进/表格化会静默退出
+    # 扫描面而 R0 只拦 "全归零", 基线补上这个缺口. 基线文件缺失 = 门禁被物理移除,
+    # 同样 fail-closed. 比对用 sort -u 名单 (同名跨段引用合法, 行计数会误报).
+    if [ ! -f "$baseline" ]; then
+      echo "::error::check-contracts: $baseline 不存在 (基线机制被移除? 退出面防护失效, 需恢复)."
+      exit 1
+    fi
+    while IFS= read -r p; do
+      fail "R0-b: 基线有而扫描面无: $p — 行被缩进/表格化/改名/删除? 确认合法后 just update-contracts-baseline 重生成并随提交更新"
+    done < <(comm -13 \
+      <(grep -E '^- `prop_' "$md" | sed -n 's/^- `\(prop_[a-z0-9_]*\)`.*/\1/p' | LC_ALL=C sort -u) \
+      <(grep -vE '^#|^$' "$baseline" | LC_ALL=C sort))
+    # ignored 载体名清单 (#354, R2-b/R3-b/R4 共用): 全仓 `#[ignore` 非注释属性行
+    # 下方 3 行内的 fn 名. 全仓属性行仅个位数, 一次预扫描后一切 membership 判定
+    # 退化为字符串比较 — 不逐 property 再扫全仓. 注释行提及 `#[ignore` 的 (如
+    # integration.rs 的说明注释) 被非注释过滤排除, 不会误收其下方函数.
+    ignored_names=""
+    while IFS= read -r il; do
+      f=${il%%:*}; l=${il##*:}
+      fn_name=$(sed -n "$((l+1)),$((l+3))p" "$f" | grep -oE 'fn +[a-zA-Z0-9_]+' | head -1 | sed 's/fn *//')
+      [ -n "$fn_name" ] && ignored_names="$ignored_names$fn_name"$'\n'
+    done < <(grep -rn --include='*.rs' -F '#[ignore' src tests 2>/dev/null \
+      | grep -vE ':[0-9]+:[[:space:]]*//' | cut -d: -f1,2)
+    # membership 判定 (纯字符串, 零进程): 每名以 \n 结尾, "*$s\n*" 模式保证整名匹配
+    # (foo 不会命中 foobar 行).
+    in_ignored() { case "$ignored_names" in *"$1"$'\n'*) return 0 ;; *) return 1 ;; esac; }
     # grep -w 用 _ 作为 word 字符, prop_xxx 名天然是完整 word (不会被更长名误命中).
     # 测试载体过滤: 命中行须含 "fn <name>" (Rust) 或 "test(\"...<name>...\", async"
     # (Playwright 标题; name 紧跟 test( 亦可) 定义形态, 排除纯注释 (/// doc / // 行)
@@ -773,16 +821,54 @@ check-contracts:
         | grep -qE "(fn +$1|test\([^\"]*$1|$1[^\"]*\", *async)"
     }
     # 锚点固定串匹配: 不限文件类型 (justfile / ci.yml 无后缀匹配需求), grep -F 字节级.
-    hit_anchor() { grep -rqF -- "$1" src tests justfile .forgejo/workflows/ci-merge.yml 2>/dev/null; }
+    # #354 加固: *.rs 内命中须为非注释行 (防 "写行注释伪造 🔁"); 豁免 `Foo::bar`
+    # 符号路径与 `#[...]` 属性字面锚点 — 其合法命中面含 rustdoc intra-doc 链接
+    # (doc 注释形态), 行级注释过滤会误伤 (见 recipe 头注 R3). .rs 外保持 #144 语义.
+    hit_anchor() {
+      case "$1" in
+        *'::'*|'#['*)
+          grep -rqF -- "$1" src tests justfile .forgejo/workflows/ci-merge.yml 2>/dev/null
+          return
+          ;;
+      esac
+      # .rs 非注释命中判定用命令替换而非管道尾 grep -q (pipefail 下 -q 提前退出
+      # 会让上游 grep 收 SIGPIPE → exit 141 → 假阴性 flake).
+      if [ -n "$(grep -rnF --include='*.rs' -e "$1" src tests 2>/dev/null | grep -vE ':[0-9]+:[[:space:]]*//')" ]; then
+        return 0
+      fi
+      grep -rqF --exclude='*.rs' -e "$1" src tests 2>/dev/null && return 0
+      grep -qF -- "$1" justfile .forgejo/workflows/ci-merge.yml 2>/dev/null
+    }
     # 🔁 行的全部锚点: 🔁→ 起的每个反引号对, 排除 `路径` 形态 (含 / 或 . 前后缀的
     # 文件引用, 如 `src/redact.rs`); 多锚点全部校验 (L1: 第二锚点漂移也须拦截).
+    # 反引号串提取管道与 R4 载体清点共享 (bt_strings).
+    bt_strings() { grep -oE '`[^`]+`' | tr -d '`' | grep -vE '/|\.rs$|\.ts$|\.md$|\.yml$' || true; }
     anchors_of() {
-      printf '%s' "$1" | sed -n 's/.*🔁→//p' \
-        | grep -oE '`[^`]+`' | tr -d '`' | grep -vE '/|\.rs$|\.ts$|\.md$|\.yml$' || true
+      printf '%s' "$1" | sed -n 's/.*🔁→//p' | bt_strings
     }
     while IFS= read -r line; do
       prop=$(printf '%s' "$line" | sed -n 's/^- `\(prop_[a-z0-9_]*\)`.*/\1/p')
       if [ -z "$prop" ]; then continue; fi
+      # ── R4 + ignored 载体清点 (#354) ──
+      # 行内 `#[ignore` prose 声明须有事实支撑: 行内反引号串 (提取面与 anchors_of
+      # 同口径, 排除路径形态) 至少一个真实被 ignore — 否则声明过时 (master 现存
+      # 实例: FWD-2 行点名 openai 侧被 ignore, 实际 #284 起已转常驻). 载体日后转正
+      # 时本判定变红, 提示升格锚点 + 清理 prose — 声明与事实双向锁死.
+      has_ignore_decl=0
+      # 注意不能用 case glob 匹配 '#\[' — 引号内反斜杠是字面字符不构成转义;
+      # [[ ]] 的 pattern 里引号内 '[' 是字面 → 零进程字面包含判定.
+      if [[ "$line" == *"#[ignore"* ]]; then has_ignore_decl=1; fi
+      # 🔁 行额外需要载体清点 (R3-b 判定); ✅/⏳ 行只需声明核对本身.
+      if [ "$has_ignore_decl" = 1 ] || [[ "$line" == *'🔁'* ]]; then
+        n_ignored_carrier=0
+        while IFS= read -r s; do
+          case "$s" in *'::'*|'#['*) continue ;; esac
+          if in_ignored "$s"; then n_ignored_carrier=$((n_ignored_carrier+1)); fi
+        done <<< "$(printf '%s' "$line" | bt_strings)"
+        if [ "$has_ignore_decl" = 1 ] && [ "$n_ignored_carrier" -eq 0 ]; then
+          fail "$prop: R4: prose 提及 #[ignore] 但行内反引号串无一真实被忽略 — 声明过时 (载体已转常驻则升格进锚点列表并清理 prose)"
+        fi
+      fi
       case "$line" in
         *'⏳'*)
           n_pending=$((n_pending+1))
@@ -793,21 +879,32 @@ check-contracts:
           # while read 整串消费: 防 word-splitting 的 glob 意外展开 (锚点含 * ? 时
           # for-in 会展开成 cwd 文件列表) + 多词锚点保持整串校验语义.
           while IFS= read -r anchor; do
+            # R3-b (#354): 锚点指向 ignored 载体 = 非运行载体 (幻影锚点变体);
+            # 行带 #[ignore] prose 声明时豁免 — "该载体未落地"的明示说明形态
+            # (R4 已锁死声明 ↔ 事实一致, 豁免不会被滥用为假落地).
+            if in_ignored "$anchor"; then
+              if [ "$has_ignore_decl" = 1 ]; then continue; fi
+              bad_anchor="$anchor (指向 #[ignore] 载体, 非运行载体)"
+              break
+            fi
             hit_anchor "$anchor" || { bad_anchor="$anchor"; break; }
           done <<< "$anchors"
           if [ -z "$anchors" ]; then
             fail "$prop: 🔁 标注缺锚点 (格式: 🔁→\`实际测试名\`)"
           elif [ -n "$bad_anchor" ]; then
-            fail "$prop: 🔁 锚点 '$bad_anchor' 在 src/+tests/+justfile+ci.yml 零命中 (幻影锚点?)"
+            fail "$prop: 🔁 锚点 '$bad_anchor' 在 src/+tests/+justfile+ci.yml 零命中或被 #[ignore] (幻影锚点?)"
           else
             n_renamed=$((n_renamed+1))
           fi
           ;;
         *'✅'*)
-          if hit_word "$prop"; then
-            n_ok=$((n_ok+1))
-          else
+          if ! hit_word "$prop"; then
             fail "$prop: 标 ✅ 但同名测试零命中 — 改名落地应用 🔁→\`实际名\`, 真零测试用 ⏳"
+          elif in_ignored "$prop"; then
+            # R2-b (#354): #[ignore] 的测试不运行, 字面存在不等于落地.
+            fail "$prop: R2-b: 标 ✅ 但载体被 #[ignore] — 转正/换运行载体, 或改 ⏳"
+          else
+            n_ok=$((n_ok+1))
           fi
           ;;
         *)
@@ -819,7 +916,24 @@ check-contracts:
       echo "check-contracts: $errors 处标注缺失/失效 (见上方 ::error)."
       exit 1
     fi
-    echo "check-contracts: ✓ $n_lines 条全量标注有效 — ✅ 同名 $n_ok / 🔁 改名 $n_renamed / ⏳ 待补 $n_pending (优先级见 contracts.md §0.6)."
+    echo "check-contracts: ✓ $n_lines 条全量标注有效 (基线 $(grep -cvE '^#|^$' "$baseline") 名无退出) — ✅ 同名 $n_ok / 🔁 改名 $n_renamed / ⏳ 待补 $n_pending (优先级见 contracts.md §0.6)."
+
+# 重生成 contracts property 名基线 (check-contracts R0-b 消费, #354).
+# 何时运行: 故意变更 property 行集合 (删除/改名/缩进化退出扫描面) 后, 重生成并
+# 随同一提交更新 — review 时基线 diff 即 "property 集合变化" 的显式声明.
+# 新增 property 行无需动基线 (R0-b 单向比对, 见 check-contracts 头注).
+# 头注释在本 recipe 内维护 (重生成永远保留, 文件自身可解释).
+update-contracts-baseline:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {
+      echo '# contracts.md property 名基线 — check-contracts R0-b 单向比对消费 (#354)'
+      echo '# 生成: just update-contracts-baseline (从 docs/design/contracts.md 顶格 property 行提取, sort -u)'
+      echo '# 语义: 基线有而扫描面无 → lint 红 (行被缩进/表格化/改名/删除须显式同步); 新增行无需登记'
+      echo '# 允许本形态的 # 注释行; 一行一个 property 名'
+      grep -E '^- `prop_' docs/design/contracts.md | sed -n 's/^- `\(prop_[a-z0-9_]*\)`.*/\1/p' | LC_ALL=C sort -u
+    } > docs/design/contracts.prop-baseline
+    echo "baseline: $(grep -cvE '^#|^$' docs/design/contracts.prop-baseline) 名 → docs/design/contracts.prop-baseline"
 
 # nix 侧验证: ① 全量 .nix parse 冒烟 (镜像 CI Nix syntax gate) + ② render 契约测试
 # 与模块 eval 冒烟 (flake checks 的轻量子集 — runCommand/python3/writeText, 不含
