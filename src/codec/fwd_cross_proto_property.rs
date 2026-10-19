@@ -217,7 +217,8 @@ proptest! {
         ir_in.extra.clear();
         ir_in.clear_wire_fidelity();
         // 与生产一致: thinking 联动 (含缺省 max_tokens 正交预算合成, T6 裁决②;
-        // 本测试生成器无 reasoning → 恒 4096) + 必填协议通用兜底.
+        // reasoning 轴存在时 budget 档位入合成, 缺省路径恒 4096 — #356 子项6) +
+        // 必填协议通用兜底.
         crate::codec::apply_thinking_linkage(&mut ir_in, crate::codec::Protocol::Anthropic);
         if ir_in.max_tokens.is_none() {
             ir_in.max_tokens = Some(crate::codec::DEFAULT_MAX_TOKENS);
@@ -333,7 +334,12 @@ fn prop_documented_semantic_loss_list() {
 /// 断言两个 IR (跨协议 round-trip 前后) 的建模范围内字段等价.
 ///
 /// **建模范围** (契约 FWD-3 L158, L171): messages (含 text / tool_use / tool_result) +
-/// tools. 这是 FWD-3 明确列举的建模字段.
+/// tools + reasoning 配置. 这是 FWD-3 明确列举的建模字段.
+///
+/// **字段清单同步纪律** (#356 子项6): 本函数是 FWD-3 建模字段的端到端等价清单 —
+/// 新增 `IrRequest` / `IrBlock` first-class 字段 (ir-fields-roadmap 的字段提升) 时
+/// 必须同步本函数与两个 `arb_*_request_modeled_only` 生成器, 否则新字段的跨协议
+/// 保真在本 property 上不可见 (字段清单漂移正是 #356 子项6 的复发形态).
 ///
 /// 不比较 (契约 §163-168 语义损失清单外的协议差异, 不在建模范围内):
 /// - temperature: Anthropic writer clamp [0,1] (协议约束, 非建模范围).
@@ -353,6 +359,21 @@ fn assert_modeled_fields_equivalent(
     direction: &str,
 ) {
     use crate::codec::IrBlock;
+
+    // reasoning 配置 (#356 子项6): 跨协议映射已知有损 (Budget 连续→6 档离散 /
+    // Adaptive→o 投影 Medium / Disabled→o 无字段, 见 codec/AGENTS.md 支持矩阵),
+    // 等价断言用 to_effort() 投影 — 生成器域收窄到无损档 (enabled budget 取
+    // EFFORT_BUDGETS 表值, nearest 反查精确命中), 投影相等 ⇔ 无损往返.
+    // Disabled 与 None 在此投影下同象 (o wire 上两者都不写字段 — lossy-by-target,
+    // 已知可接受的映射损失).
+    let effort_of =
+        |ir: &crate::codec::IrRequest| ir.reasoning.as_ref().and_then(|r| r.to_effort());
+    assert_eq!(
+        effort_of(ir_in),
+        effort_of(ir_out),
+        "{direction}: reasoning 配置跨协议往返语义损失\nin={:?}\nout={:?}",
+        ir_in.reasoning, ir_out.reasoning,
+    );
 
     // system blocks (只比较 text 内容, 跨协议可能形态变化).
     let in_system_texts: Vec<&str> = ir_in
@@ -607,6 +628,7 @@ fn arb_anthropic_ingress_with_known_unmodeled_fields() -> impl Strategy<Value = 
 ///
 /// 不含 extra 字段 (避免 extra 干扰), 保证 reader 解析出的 IR 在建模范围内完整.
 fn arb_openai_request_modeled_only() -> impl Strategy<Value = Value> {
+    use crate::codec::IrReasoningEffort;
     (
         "[a-z0-9-]{3,15}",
         arb_openai_messages_modeled(1..4),
@@ -616,14 +638,39 @@ fn arb_openai_request_modeled_only() -> impl Strategy<Value = Value> {
         prop::collection::vec("[a-z]{2,8}", 0..3),
         arb_tools_opt_modeled(0..3),
         any::<bool>(),
+        // reasoning 轴 (#356 子项6): effort 6 档全覆盖 (wire 载体
+        // `reasoning_effort`). 与 max_tokens 轴联合收窄到 clamp-free 域:
+        // reasoning 存在时 max_tokens ≥ 32769 (> EFFORT_BUDGETS 全部表值),
+        // 避开 Anthropic writer 的 thinking budget clamp — clamp 语义由
+        // fwd_property.rs `cross_proto_reasoning_*` 专项锁定, 此处测无损域.
+        prop::option::of(prop_oneof![
+            Just(IrReasoningEffort::Minimal),
+            Just(IrReasoningEffort::Low),
+            Just(IrReasoningEffort::Medium),
+            Just(IrReasoningEffort::High),
+            Just(IrReasoningEffort::Xhigh),
+            Just(IrReasoningEffort::Max),
+        ]),
     )
         .prop_map(
-            |(model, messages, max_tokens, temperature, top_p, stop, tools, stream)| {
+            |(model, messages, max_tokens, temperature, top_p, stop, tools, stream, reasoning)| {
+                let max_tokens = match (&reasoning, max_tokens) {
+                    // clamp-free 域收窄 (见上方 reasoning 轴注释); None 保持
+                    // None — T6 缺省路径的正交预算合成 (budget+4096) 属 linkage
+                    // 语义, 由 prop_cross_proto_thinking_budget_always_below_max_tokens
+                    // 专项锁定, 不影响本 property 的 reasoning 等价断言.
+                    (Some(_), None) => None,
+                    (Some(_), Some(m)) => Some(m.max(32769)),
+                    (None, m) => m,
+                };
                 let mut req = serde_json::Map::new();
                 req.insert("model".to_string(), json!(model));
                 req.insert("messages".to_string(), Value::Array(messages));
                 if let Some(mt) = max_tokens {
                     req.insert("max_tokens".to_string(), json!(mt));
+                }
+                if let Some(e) = reasoning {
+                    req.insert("reasoning_effort".to_string(), json!(e.as_str()));
                 }
                 if let Some(t) = temperature {
                     req.insert("temperature".to_string(), json!(t));
@@ -660,13 +707,33 @@ fn arb_anthropic_request_modeled_only() -> impl Strategy<Value = Value> {
         prop::collection::vec("[a-z]{2,8}", 0..3),
         arb_tools_opt_modeled(0..3),
         any::<bool>(),
+        // thinking 轴 (#356 子项6): 三形态 disabled / adaptive / enabled+budget.
+        // budget 只从 EFFORT_BUDGETS 表值取 — 表值精确命中 nearest 反查, o writer
+        // 投影回同档, round-trip 无损; 任意连续 budget 的降维语义由 fwd_property.rs
+        // `cross_proto_reasoning_budget_nearest_projection_idempotent` 锁定.
+        // enabled 时 max_tokens ≥ 32769 (clamp-free, 联合收窄同 OpenAI 侧).
+        prop::option::of(prop_oneof![
+            Just(json!({"type": "disabled"})),
+            Just(json!({"type": "adaptive"})),
+            prop::sample::select(&[1024u32, 2048, 4096, 8192, 16384, 32768])
+                .prop_map(|n| json!({"type": "enabled", "budget_tokens": n})),
+        ]),
     )
         .prop_map(
-            |(model, messages, max_tokens, temperature, top_p, top_k, stop, tools, stream)| {
+            |(model, messages, max_tokens, temperature, top_p, top_k, stop, tools, stream, thinking)| {
+                let max_tokens = match &thinking {
+                    Some(Value::Object(t)) if t.get("type").and_then(Value::as_str) == Some("enabled") => {
+                        max_tokens.max(32769)
+                    }
+                    _ => max_tokens,
+                };
                 let mut req = serde_json::Map::new();
                 req.insert("model".to_string(), json!(model));
                 req.insert("messages".to_string(), Value::Array(messages));
                 req.insert("max_tokens".to_string(), json!(max_tokens));
+                if let Some(t) = thinking {
+                    req.insert("thinking".to_string(), t);
+                }
                 if let Some(t) = temperature {
                     req.insert("temperature".to_string(), json!(t));
                 }
