@@ -758,10 +758,22 @@ check-contracts:
     fi
     echo "check-contracts: ✓ $n_lines 条全量标注有效 — ✅ 同名 $n_ok / 🔁 改名 $n_renamed / ⏳ 待补 $n_pending (优先级见 contracts.md §0.6)."
 
-# nix 侧验证: render 契约测试 + 模块 eval 冒烟 (flake checks 的轻量子集 —
-# runCommand/python3/writeText, 不含 secret-guard 的 Rust 编译闭包, 秒级).
-# 挂在 just check 链尾; src serde schema 变更时此处先红.
-# --extra-experimental-features: 环境 (如 CI runner 的 Lix) 未启用
+# nix 侧验证: ① 全量 .nix parse 冒烟 (镜像 CI Nix syntax gate) + ② render 契约测试
+# 与模块 eval 冒烟 (flake checks 的轻量子集 — runCommand/python3/writeText, 不含
+# secret-guard 的 Rust 编译闭包, 秒级)。挂在 just check 链尾; src serde schema
+# 变更时 ② 先红。
+#
+# ① parse 冒烟 — 本地↔CI 等价性修复 (#357 反例窗口): CI 的 Nix syntax gate
+# (ci-merge.yml) 对 .nix 做 nix-instantiate --parse (PR 事件查变更集, push master
+# 全量); 而 nix/release.nix 仅被 packages.release 惰性 import, ② 的两闭包均不含 →
+# release.nix 语法错误曾是 "本地绿 / CI 红"。本地恒走全量扫描 (任何变更集的超集;
+# org 仓 .nix 数量级小, 成本毫秒级), NIX_STATE_DIR 重定向与 CI 同型 — parse 纯解析
+# 零求值零 store 写无需 daemon (CI runner ro store 也能跑), 但 nix 启动仍初始化
+# state dir 写 temproots, 重定向到私有 tmp 避免依赖 /nix/var/nix 可写; env 前缀
+# 按命令作用域限定, 不影响 ② 走真实 daemon socket。无 nix-instantiate 的环境
+# 打印 notice 跳过 (与 ② 的 daemon 探测跳过同型, fail-safe)。
+#
+# ② --extra-experimental-features: 环境 (如 CI runner 的 Lix) 未启用
 # nix-command/flakes 时自包含可跑; 本地已启用时重复传无害.
 # nix-daemon 探测跳过: CI runner VM 架构禁止 nix 求值 (无 writableStoreOverlay /
 # 无 daemon, 见 forgejo-runner-vm.mod.nix「CI 工具链规范」), 探测到无 daemon socket
@@ -770,9 +782,35 @@ check-contracts:
 nix-check:
     #!/usr/bin/env bash
     set -euo pipefail
+    # ① 全量 .nix parse 冒烟 (镜像 CI Nix syntax gate, 语义/输出同构)
+    if ! command -v nix-instantiate >/dev/null 2>&1; then
+        echo "nix-check: skip parse 冒烟 — PATH 无 nix-instantiate (环境无 nix?)"
+    else
+        state="$(mktemp -d)"
+        status=0; n=0
+        while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            n=$((n+1))
+            # stderr (错误定位: 文件+行列) 原样透传供诊断, stdout (parse AST dump) 丢弃 — 同 CI gate
+            if ! NIX_STATE_DIR="$state" nix-instantiate --parse "$f" >/dev/null; then
+                echo "✗ $f: nix 语法错误"
+                status=1
+            fi
+        done < <(git ls-files -- '*.nix')
+        rm -rf "$state"
+        # fail-closed: 0 个文件 = git ls-files 失效或锚点漂移 (本仓恒有 13+ 个 .nix),
+        # 空清单静默假绿会让本门禁形同虚设 — 同 check-docs 的 step=0 防护。
+        if [ "$n" -eq 0 ]; then
+            echo "nix-check: parse 冒烟扫到 0 个 .nix (git ls-files 失效?) — 拒绝假绿" >&2
+            exit 1
+        fi
+        if [ "$status" -ne 0 ]; then exit 1; fi
+        echo "✓ nix parse 冒烟通过 ($n 个 .nix)"
+    fi
+    # ② flake checks 两闭包 (需 daemon)
     if [ ! -S /nix/var/nix/daemon-socket/socket ]; then
-      echo "nix-check: skip — 无 nix-daemon (CI runner 架构禁止 nix 求值), 本地 just check 全量覆盖本项"
-      exit 0
+        echo "nix-check: skip checks 闭包 — 无 nix-daemon (CI runner 架构禁止 nix 求值), 本地 just check 全量覆盖本项"
+        exit 0
     fi
     system="$(uname -m)-linux"
     nix --extra-experimental-features "nix-command flakes" build ".#checks.${system}.render-test" ".#checks.${system}.module-eval" -L

@@ -74,7 +74,9 @@ single-job runner 上串行占位, 延迟最新 push 的反馈. workflow 级
    PR #337 首次真实执行爆雷的修正, 机制与事故记录见 workflow step 注释)。
 9. **Quality gate (just ci-merge main)** — P0 阻塞主链: `just check` 全量档
    (`FULL_TIER` = `--features oidc,consistency-check`; fmt + clippy + machete + doc 门禁 +
-   测试 + typos + deny-offline + check-webui-syntax + check-webui-freshness + check-contracts + nix-check,
+   测试 + doctest + typos + deny-offline + check-webui-syntax + check-webui-freshness + check-contracts + nix-check
+   (含全量 `.nix` parse 冒烟 — 与 step 8 的 Nix syntax gate 同构, #357 闭合
+   "release.nix 仅被惰性 import 不进两闭包 → 本地绿 CI 红" 的反例窗口),
    **不带 --coverage** — 插桩与 coverage-gate 已归 P2)。
     cargo 命令均带 `--locked`。consistency-check (视图正确性断言, 详见根 AGENTS.md
     "视图正确性确保机制"; contracts.md `prop_consistency_check_feature_runs_in_ci` 的
