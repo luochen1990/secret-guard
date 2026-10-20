@@ -24,6 +24,8 @@
 //!   (push_messages / attach_response / update_parsed_response) + 内部 helper
 //!   (find_parent / gc_cascade / evict_if_needed) + 类型 re-export.
 //! - `pool`: BlockPool + MessageRef + hash_block + combine_hash (内容寻址核心).
+//! - `search`: 会话文本搜索 (#317) — 服务端扫描 + Block 级 lowercase memoize,
+//!   cap/预算双红线 (`ConversationDag::search`).
 //! - `types`: Node / CallEvent / ResponseData / Session / SessionId / PolicySnapshot 实体.
 //! - `view`: node_view / session_view / list_sessions / list_page / full_request_messages
 //!   (读路径, 派生 WebUI 视图).
@@ -44,6 +46,7 @@
 //! # 详尽设计见 `docs/design/conversation-dag.md`
 
 mod pool;
+mod search;
 mod timeline;
 mod types;
 mod view;

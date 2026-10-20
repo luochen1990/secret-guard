@@ -46,7 +46,9 @@ fn empty_tail(round_id: Uuid) -> TimelineTail {
 ///
 /// - `limit = usize::MAX`: 回溯到链首 (parent=None).
 /// - `limit = N`: 最多取 N 个 (含 start_id), 多余的更老的 node 不取.
-fn walk_chain(inner: &DagInner, start_id: Uuid, limit: usize) -> Vec<Uuid> {
+///
+/// `pub(super)`: timeline (rounds 视图) 与 search (会话文本搜索 #317) 共用.
+pub(super) fn walk_chain(inner: &DagInner, start_id: Uuid, limit: usize) -> Vec<Uuid> {
     let mut chain: Vec<Uuid> = Vec::new();
     let mut cursor = Some(start_id);
     while let Some(id) = cursor {

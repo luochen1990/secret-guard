@@ -204,12 +204,23 @@ impl MessageRef {
 /// - `intern`: 把 IrBlock 放入池 (若已存在则复用), 返回 BlockHash, refcount++.
 /// - `release`: 递减 refcount, refcount=0 时删除 block.
 ///
-/// 线程安全: 内部用 `parking_lot::RwLock`. intern 需要写锁 (可能插入新 block),
-/// get 只需读锁.
+/// 线程安全: 并发访问经 [`super::ConversationDag`] 的 `inner` RwLock 串行化
+/// (intern 需要写锁; get 只需读锁). 唯一的例外是 `search_cache` — 自带内部
+/// Mutex, 让搜索查询在持有读锁时也能做 get-or-insert 记忆化 (#317).
 #[derive(Debug, Default)]
 pub struct BlockPool {
     pub(super) blocks: HashMap<BlockHash, Arc<IrBlock>>,
     pub(super) refcount: HashMap<BlockHash, usize>,
+    /// 会话文本搜索的 lowercase 叶子缓存 (#317): BlockHash → 每文本叶子的
+    /// `to_lowercase()` 结果. 惰性填充 (首次搜索触达时), **与池条目同生命周期** —
+    /// `release` 到 0 时同步清除, 防 hash 被新内容复用后命中陈旧文本.
+    ///
+    /// 内存代价上界 ≈ 池内唯一文本块总量的 1× (每叶子一份小写副本); 收益是
+    /// 稳态下每个唯一 block 只付一次 lowercase 成本 (BlockPool 去重 + 本缓存
+    /// 双层消化对话前缀复用). 内部 `Mutex` 而非依赖 DagInner 锁: 查询方持读锁,
+    /// 多并发搜索需要内部可变性; 锁只短持有 (单 block 的 get-or-insert),
+    /// 无 "先锁此处再锁 DagInner" 的反向路径 → 无死锁面.
+    pub(super) search_cache: parking_lot::Mutex<HashMap<BlockHash, Arc<Vec<String>>>>,
 }
 
 impl BlockPool {
@@ -252,6 +263,9 @@ impl BlockPool {
             if *count == 0 {
                 self.refcount.remove(&hash);
                 self.blocks.remove(&hash);
+                // 搜索缓存与池条目同生命周期 (#317): 条目删除时同步清除,
+                // 防 hash 被新内容复用后命中陈旧 lowercase 文本.
+                self.search_cache.lock().remove(&hash);
             }
         }
     }

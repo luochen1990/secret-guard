@@ -313,8 +313,8 @@ pub struct TimelineDiffData {
 /// - `rounds`: 仅 expanded session 的 RoundBrief 列表 (sidebar 三级菜单).
 /// - `timeline`: 仅 selected session 的 diff (timeline 初始加载 / 增量更新).
 ///
-/// 在单个 `inner.read()` 锁内一次性采集, 避免多次 list_sessions / timeline_view
-/// 之间数据漂移 (典型: 新 push 在两次读锁之间到达, sessions 与 rounds 不一致).
+/// 在单个 `inner.read()` 锁内一次性采集, 避免多次 list_sessions / session_rounds /
+/// timeline_diff 之间数据漂移 (典型: 新 push 在两次读锁之间到达, sessions 与 rounds 不一致).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SyncSnapshot {
     pub sessions: Vec<SessionView>,
@@ -322,6 +322,41 @@ pub struct SyncSnapshot {
     /// None = 无选中 / 无 diff (前端持有的游标已是最新, 304 等价).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeline: Option<TimelineDiffData>,
+}
+
+// ─── 会话文本搜索 (#317, GET /api/search) ────────────────────────────────────
+
+/// 单条搜索命中: (会话, 轮次) 定位 + 命中上下文.
+///
+/// 一个 Node 至多产生一条 hit (首轮命中 block 胜出) — 搜索目标是定位轮次,
+/// 不是穷举出现位置. 构造逻辑在 `dag::search` (持读锁访问私有字段), 本模块只承载
+/// wire shape (与 SessionView 同款分工).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SearchHit {
+    /// 命中归属的会话 = 扫描时走到的 session (fork 共享祖先链场景下, 同一 node 可
+    /// 在多个 session 的链上命中, 各 session 各得一条 hit — 跳转目标是 "该 session
+    /// 的 timeline", 用 walked session 而非 node.session_id).
+    pub session_id: SessionId,
+    /// 命中轮次 (timeline round id, 前端 selectRound 的目标).
+    pub node_id: Uuid,
+    /// 命中 message 的 role (wire: "user"/"assistant"/"system"/"tool").
+    pub role: IrRole,
+    /// 轮次 preview (push 时预计算, sidebar 同款 48 chars). `Arc<str>` 零拷贝.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<Arc<str>>,
+    /// 命中上下文摘要: 命中叶子原文的匹配点前后各 ~40 chars, 截断处以 "…" 标记.
+    pub snippet: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// GET /api/search 响应.
+///
+/// `truncated` = 扫描提前停止 (结果数达到 cap 或扫描预算耗尽), **可能还有更多命中**
+/// — 不是精确计数声明; 前端据此渲染 "仅显示前 N 条匹配" 提示.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SearchResponse {
+    pub hits: Vec<SearchHit>,
+    pub truncated: bool,
 }
 
 #[cfg(test)]
