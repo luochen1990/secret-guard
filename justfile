@@ -89,13 +89,25 @@ dev-test:
 #   运行时 PATH 会被系统 Python 变体 (如 /etc/profiles/.../bin/playwright) 抢占;
 #   已在 devShell 内也可能被 prepend 的坏 PATH 遮蔽。
 # - 自愈: 守卫探测将失败 + nix 可用 → 自动重入 `nix develop --impure` 再跑同一
-#   recipe (SG_CHECK_REEXEC 哨兵防循环; 重入后守卫通过即走内层)。
+#   recipe (内层守卫通过即直接走链)。
+# - 防循环哨兵 = SG_CHECK_REENTRY_DEPTH 深度计数 (仅允许重入一层)。
+#   深度语义: 裸 shell (未设/0) → 重入并置 1; 已 ≥1 → 不再重入, 落
+#   _check-body 头守卫 fail-fast (devShell 真缺 playwright-test 的准确报错)。
+#   不用 IN_NIX_SHELL 判 "已在 devShell" — 它随子 shell 下泄, agent/CI shell
+#   常带 IN_NIX_SHELL=impure 而 PATH 已被重建为裸 (2026-10-20 实证), 误判会
+#   跳过自愈。
+# - **必须 shebang recipe**: just 对无 shebang 的 recipe **逐行**起独立 shell
+#   执行 — `exec nix develop` 只替换 @if 那一行的 shell, 下一行 `just
+#   _check-body` 仍会在裸 shell 里跑 (2026-10-20 事故根因: 自愈内层全绿后,
+#   外层继续执行下一行撞死在守卫上, 整体 exit 1)。shebang 让全 recipe 共享
+#   一个 bash 进程, exec 才能真正接管并终结后续行。
 # - CI runner (vm-nix, 自带 playwright-test, nix 求值被禁): 守卫探测通过 →
 #   不重入, 行为与既有完全一致; 坏环境且无 nix → 内层头守卫 fail-fast。
 check *ARGS:
-    @if [ -z "${SG_CHECK_REEXEC:-}" ] && ! just --quiet _require-playwright-test >/dev/null 2>&1 && command -v nix >/dev/null 2>&1; then \
-        echo "check: playwright 环境受损 (PATH 抢占或 devShell 缺失) — 自动重入 nix develop --impure"; \
-        exec nix develop --impure -c bash -c 'SG_CHECK_REEXEC=1 just check {{ ARGS }}'; \
+    #!/usr/bin/env bash
+    if ! just --quiet _require-playwright-test >/dev/null 2>&1 && command -v nix >/dev/null 2>&1 && [ "${SG_CHECK_REENTRY_DEPTH:-0}" -lt 1 ]; then
+        echo "check: playwright 环境受损 (PATH 抢占或 devShell 缺失) — 自动重入 nix develop --impure"
+        exec nix develop --impure -c bash -c 'SG_CHECK_REENTRY_DEPTH=$((1+${SG_CHECK_REENTRY_DEPTH:-0})) just check {{ ARGS }}'
     fi
     just _check-body {{ ARGS }}
 
