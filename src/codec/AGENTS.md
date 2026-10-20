@@ -62,7 +62,8 @@
   array 形态 output 折叠为 string (未知 part 在 tool output 内随之折叠).
 - ✅ `reasoning_content` (思考原文, OpenAI 兼容 provider 非标字段) 同协议建模:
   请求 (assistant 历史回传) / 非流式响应 / 流式 delta 三路径 reader↔writer 对称
-  (#176, 契约 STR-6). 跨协议处置见下方 T7 条 (o-origin 跨 a 仍丢弃, 跨 r 保留)。
+  (#176, 契约 STR-6). 跨协议处置见下方 T7 条 (o-origin 跨 a 经 envelope 搬运
+  (issue #2), 跨 r 保留)。
 - ✅ reasoning **配置** (请求侧深度思考参数) 跨协议映射 (roadmap A1 批次 1, 2026-09-29):
   OpenAI `reasoning_effort` / Anthropic `thinking` / Responses `reasoning.effort` ↔ IR
   first-class `IrRequest.reasoning` (`IrReasoning`: Disabled / Effort(6档) / Budget /
@@ -95,9 +96,11 @@
   `IrBlockMeta::Thinking`/`RedactedThinking` 与 `IrDelta::SignatureDelta`/
   `ReasoningOpaqueDelta` 区分); 跨协议 a⇄r 经 sg-envelope 搬运 (`codec/thinking.rs`,
   cc-switch 模式 — 打包在 writer 侧 post-redact/restore, 解包在 reader 侧
-  pre-redact/restore, stateless tool loop 回传闭合)。剩余损失: o-origin 跨 a 丢弃 +
-  WARN (o 无 opaque 容器); 任何 opaque 跨 o 丢弃 + WARN (正文保留为 reasoning_content);
-  o→r 保留正文 (2026-09-23 "流式保留/非流式丢弃" 分叉消解)。
+  pre-redact/restore, stateless tool loop 回传闭合); **o-origin 思考正文跨到
+  Anthropic 亦经 envelope 搬运** (thinking block 的 signature 容器承载 rc 形态
+  envelope, 回传方向 reader 解包还原 — 2026-10-20 issue #2 用户裁决, 取代 T7
+  初裁的 o-origin 丢弃)。剩余损失: 任何 opaque 跨 o 丢弃 + WARN (正文保留为
+  reasoning_content); o→r 保留正文 (2026-09-23 "流式保留/非流式丢弃" 分叉消解)。
 - ❌ 不在 MVP: Bedrock / Gemini / Cohere, citations 语义建模 (响应侧 block 未知字段已按 extra 保真), logprobs,
   Bedrock eventstream 二进制流. prompt caching **跨协议归一化** (A8 first-class) 暂缓 — 跨协议
   路径 cache_control 照旧丢弃 (clear_wire_fidelity, FWD-3); 同协议保真已由 wire-fidelity extra +
@@ -114,20 +117,20 @@
   input 无独立承载. 方言归一化边界与流式 pair 累积分歧见 `docs/known-limitations.md`
   codec 节 A4 条目; 契约 USAGE-2.
 
-> **thinking/encrypted_content 跨协议搬运 rationale** (T7, 改写 #176 旧裁决): 旧裁决
+> **thinking/encrypted_content 跨协议搬运 rationale** (T7, 改写 #176 旧裁决; o-origin
+> 扩展 = issue #2, 2026-10-20 用户裁决): 旧裁决
 > "无法合法合成 signature → 跨协议丢弃" 只否定了**合成**, 未否定**搬运** — cc-switch 的
 > envelope passthrough 证明第三条路存在。secret-guard 不合成任何签名/密文, 只把己方
 > block 完整序列化 base64 (`sg-thinking-v1:` 前缀) 藏进对方协议的 opaque 容器
 > (a 的 signature / r 的 encrypted_content), 回传方向识别前缀解包还原原生块。
 > redact 安全链: envelope 是 base64(明文 JSON), 安全性由打包/解包位置保证 — 打包点
 > 全部在 writer (请求侧 post-redact / 响应侧 post-restore), 解包点全部在 reader
-> (pre-redact / pre-restore, 解包文本成为 IR 叶子必然流经扫描)。o (Chat) 无 opaque
-> 容器: o-origin 跨 a 丢弃 + WARN, opaque 跨 o 丢弃 + WARN — 不为 o 发明 envelope
-> wire 形态 (正文仍按 #176 保留为 reasoning_content)。
-> 已知次生损失: ① 跨协议流式跳过 o-origin reasoning block 后, Anthropic ingress 客户端
-> 看到的 block index 序列出现**空洞** (如首个 content_block_start 是 index=1 而非 0) —
-> Anthropic 官方流恒从 0 连续递增, 按 index 做 map key 的 SDK 无碍, 按位置预分配
-> 数组的严格客户端可能错位 (IR index 原样透传, 不做重映射; 仅 o→a + reasoning 场景)。
+> (pre-redact / pre-restore, 解包文本成为 IR 叶子必然流经扫描)。o (Chat) 无原生
+> opaque 容器, 但 issue #2 裁决 o-origin 思考正文可借 a wire thinking block 的
+> signature 字段作容器 (rc 形态 envelope — 搬运不合成, 客户端 Claude Code 因此能
+> 显示思考过程且回传闭合); opaque 跨 o 仍丢弃 + WARN (r/a 的 opaque 无 o 载体)。
+> 已知次生损失: ① (已消除, issue #2) o-origin reasoning block 曾被跳过导致
+> Anthropic ingress 的 block index 序列空洞 — 现已承载, index 恒连续。
 > ② a-origin thinking 文本被 redact mock 后 signature 可能与文本失配 (signature 覆盖
 > 原文) — 安全优先于签名有效性的已接受折衷 (常态: thinking 无 secret 时零差异);
 > ③ 同协议 a→a 的退化 signature-less thinking 流 (真实 Anthropic 不产生) 会被注入

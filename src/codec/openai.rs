@@ -3134,17 +3134,19 @@ mod tests {
         );
     }
 
-    // ─── ReasoningContent 跨协议处置 (T7: o-origin 精确化) ─────────────────
+    // ─── ReasoningContent 跨协议处置 (T7: o-origin 精确化; issue #2 扩展) ─────
     //
-    // T7 后: o→a 仍丢弃 (o 无 opaque 容器, 不发明 wire 形态 — signature 只能搬运
-    // 不能合成); o→r 经 sg-envelope 保留 (消除 "流式保留/非流式丢弃" 分叉, 契约
-    // 演进原则的精确化)。本组测试锁定 o-origin (opaque=None) 的行为; a/r-origin
-    // 的搬运由 anthropic/responses 侧的 envelope 测试锁定。
+    // T7 后: o→r 经 sg-envelope 保留 (消除 "流式保留/非流式丢弃" 分叉, 契约
+    // 演进原则的精确化); issue #2 (2026-10-20 用户裁决) 起 o→a 亦保留 — o-origin
+    // 思考正文经 a wire thinking block 的 signature 容器搬运 (rc 形态 envelope,
+    // 回传方向 a reader 解包还原)。本组测试锁定 o-origin (opaque=None) 的行为;
+    // a/r-origin 的搬运由 anthropic/responses 侧的 envelope 测试锁定。
 
     #[test]
-    fn reasoning_content_block_dropped_by_anthropic_writer() {
+    fn reasoning_content_carried_by_anthropic_writer_envelope() {
         use crate::codec::anthropic::{AnthropicReader, AnthropicWriter};
-        // 请求侧: assistant 历史含 ReasoningContent block → Anthropic wire 无 thinking.
+        // 请求侧: assistant 历史含 ReasoningContent block → thinking block,
+        // signature = rc 形态 envelope (解包还原 rc{text, None})。
         let ir = IrRequest {
             messages: vec![IrMessage {
                 role: IrRole::Assistant,
@@ -3159,55 +3161,20 @@ mod tests {
             ..Default::default()
         };
         let wire = AnthropicWriter.write_request(&ir);
-        let wire_str = serde_json::to_string(&wire).unwrap();
-        assert!(
-            !wire_str.contains("thinking") && !wire_str.contains("hidden chain"),
-            "Anthropic egress must not contain synthesized thinking block: {wire_str}"
-        );
-        // 响应侧: write_block / BlockStart meta / ReasoningDelta 全部跳过.
-        let resp = IrResponse {
-            content: vec![IrBlock::ReasoningContent {
-                text: "cot".into(),
-                opaque: None,
-                extra: Default::default(),
-            }],
-            ..Default::default()
-        };
-        let resp_wire = serde_json::to_string(&AnthropicWriter.write_response(&resp)).unwrap();
-        assert!(
-            !resp_wire.contains("thinking") && !resp_wire.contains("cot"),
-            "Anthropic response must not contain reasoning text: {resp_wire}"
-        );
-        assert!(
-            AnthropicWriter
-                .write_response_event(
-                    &IrStreamEvent::BlockStart {
-                        index: 0,
-                        block: IrBlockMeta::ReasoningContent,
-                    },
-                    &mut StreamEncodeState::default(),
-                )
-                .is_empty()
-        );
-        assert!(
-            AnthropicWriter
-                .write_response_event(
-                    &IrStreamEvent::BlockDelta {
-                        index: 0,
-                        delta: IrDelta::ReasoningDelta("cot".into()),
-                    },
-                    &mut StreamEncodeState::default(),
-                )
-                .is_empty()
-        );
-        // 丢弃后重读: Anthropic reader 不产出 ReasoningContent (round-trip 丢弃确认).
+        let block = &wire["messages"][0]["content"][0];
+        assert_eq!(block["type"], "thinking");
+        assert_eq!(block["thinking"], "hidden chain of thought");
+        let sig = block["signature"].as_str().unwrap();
+        crate::codec::thinking::assert_unpacks_rc_envelope(sig, "hidden chain of thought");
+        // 搬运后重读: a reader 见 sg- 前缀解包 → ReasoningContent 原生恢复
+        // (stateless round-trip 确认)。
         let ir2 = AnthropicReader.read_request(&wire).unwrap();
         assert!(
-            !ir2.messages.iter().any(|m| m
-                .content
-                .iter()
-                .any(|b| matches!(b, IrBlock::ReasoningContent { .. }))),
-            "ReasoningContent must not survive cross-proto round-trip"
+            ir2.messages.iter().any(|m| m.content.iter().any(
+                |b| matches!(b, IrBlock::ReasoningContent { text, opaque, .. }
+                    if text == "hidden chain of thought" && opaque.is_none())
+            )),
+            "ReasoningContent must survive cross-proto round-trip via envelope"
         );
     }
 

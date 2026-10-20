@@ -210,6 +210,34 @@ pub(crate) fn for_each_split_chunk(splits: &[usize], full: &[u8], mut f: impl Fn
 
 // ─── 测试共享: SSE de-frame 迭代 ────────────────────────────────────────────
 
+/// 测试辅助: 拼接帧序列中全部 `thinking_delta` 的文本.
+///
+/// (issue #2 精雕细琢合一: restore 滑窗会拆 chunk — chunk 划分不是契约,
+/// 断言总以拼接形态做; 与 [`iter_sse_frames`] 同型 cfg(test) 共享先例.)
+#[cfg(test)]
+pub(crate) fn join_thinking_deltas(frames: &[(String, serde_json::Value)]) -> String {
+    frames
+        .iter()
+        .filter_map(|(et, d)| {
+            if et == "content_block_delta" && d["delta"]["type"] == "thinking_delta" {
+                d["delta"]["thinking"].as_str()
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// 测试辅助: 取帧序列中首个 `signature_delta` 的 signature (无则 `None` —
+/// panic 上下文留给 call site, 保留各测试的调试全文).
+#[cfg(test)]
+pub(crate) fn find_signature_delta(frames: &[(String, serde_json::Value)]) -> Option<String> {
+    frames
+        .iter()
+        .find(|(et, d)| et == "content_block_delta" && d["delta"]["type"] == "signature_delta")
+        .map(|(_, d)| d["delta"]["signature"].as_str().unwrap().to_string())
+}
+
 /// 把完整 SSE 字节解析为 `(event_type, data JSON)` 帧序列 (测试辅助).
 ///
 /// (R3 合一: 全仓 3 份逐字重复的 de-frame 循环 — 本模块 tests 的 `parse_frames` /

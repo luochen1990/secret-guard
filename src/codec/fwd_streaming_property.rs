@@ -1501,10 +1501,11 @@ proptest! {
 
     /// STR-1 × FWD-3: Responses egress SSE → Anthropic ingress SSE (T5).
     ///
-    /// 执行到 Anthropic ingress 对 ReasoningContent 的显式丢弃路径 (STR-6 裁决:
-    /// thinking signature 无法合成 → 跳过 block 配对过滤 — reasoning 不在跨协议
-    /// 断言集内, 丢弃行为本身由 translate.rs 确定性单测锁定), text / tool / usage
-    /// 保真由断言集守卫.
+    /// o/r-origin reasoning 经 Anthropic ingress 以 thinking block + envelope
+    /// signature 搬运 (issue #2 / T7) — reasoning 不在跨协议断言集内 (断言集只
+    /// 比较 text / tool / usage 四维), 搬运行为由 translate.rs 确定性单测与
+    /// `cross_proto_streaming_r_to_a_thinking_envelope_golden` 锁定, text / tool /
+    /// usage 保真由断言集守卫.
     #[test]
     fn prop_cross_proto_stream_responses_to_anthropic(
         case in arb_responses_sse_stream_with_mock(),
@@ -1838,8 +1839,9 @@ fn run_cross_proto_restore(
 ///    (共享断言核心 [`assert_cross_proto_content_fidelity_with`], expect = restore 映射).
 ///
 /// 与同协议版 ([`assert_streaming_restore_fidelity`]) 的差异: **不比较 reasoning**
-/// — ReasoningContent 跨协议显式丢弃 (STR-6 裁决: thinking signature 无法合法合成),
-/// 上游 reasoning 拼接非空时客户端恒为空是**预期行为**.
+/// — 思考内容的跨协议搬运 (envelope / thinking block 形态) 由确定性 golden 锁定
+/// (issue #2 后 o-origin 亦经 a wire thinking block signature 搬运, 不再丢弃),
+/// property 断言集保持 text/tool/usage 四维.
 fn assert_cross_proto_restore_fidelity(
     upstream: &[u8],
     client: &[u8],
@@ -2439,24 +2441,12 @@ fn cross_proto_streaming_r_to_a_thinking_envelope_golden() {
         .unwrap_or_else(|| panic!("thinking content_block_start missing: {client_str}"));
     assert_eq!(start.1["content_block"]["thinking"], json!(""));
     // thinking_delta 拼接断言 (restore 滑窗会拆 chunk — chunk 划分不是契约)。
-    let thinking_joined = parsed
-        .iter()
-        .filter_map(|(et, d)| {
-            if et == "content_block_delta" && d["delta"]["type"] == "thinking_delta" {
-                d["delta"]["thinking"].as_str()
-            } else {
-                None
-            }
-        })
-        .collect::<String>();
+    let thinking_joined = crate::codec::stream::join_thinking_deltas(&parsed);
     assert_eq!(
         thinking_joined, "deliberation",
         "thinking_delta missing: {client_str}"
     );
-    let sig = parsed
-        .iter()
-        .find(|(et, d)| et == "content_block_delta" && d["delta"]["type"] == "signature_delta")
-        .map(|(_, d)| d["delta"]["signature"].as_str().unwrap().to_string())
+    let sig = crate::codec::stream::find_signature_delta(&parsed)
         .unwrap_or_else(|| panic!("signature_delta missing: {client_str}"));
     // envelope 解包 → Reasoning{summary, ec} (回传后 r egress 原生恢复的权威源)。
     assert!(

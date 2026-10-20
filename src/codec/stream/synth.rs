@@ -27,12 +27,13 @@
 //!
 //! # 与 StreamTranslate 的机制对齐
 //!
-//! - **跳过 block 配对过滤**: writer 对 `BlockStart` 返回空 Vec 的 index (如 Anthropic
-//!   writer 对 o-origin 的 `IrBlockMeta::ReasoningContent` — o 协议无 opaque 容器,
-//!   T7 裁决不为 o 发明 wire 形态), 其
+//! - **跳过 block 配对过滤**: writer 对 `BlockStart` 返回空 Vec 的 index, 其
 //!   `BlockStop` 一并跳过, 否则产出未配对 `content_block_stop` (协议违例, #282 同型).
 //!   与 `StreamTranslate` 跨协议模式的 `skipped_block_starts` 机制语义一致 (探测调用
 //!   的幂等性由 writer 的幂等契约保证, 见 [`crate::codec::ir::ResponsesEncodeState`]).
+//!   当前 codec 覆盖族内的空 Vec 均为 OpenAI writer 的结构性隐式 (delta 仍是内容,
+//!   其 BlockStop 本就不产帧 — 过滤为 no-op); T7 后 a writer 对 thinking 族 (含
+//!   o-origin ReasoningContent, issue #2) 均产出帧, 语义性整体跳过已无实例.
 //! - **终止符**: `emits_sse_done_terminator()` 为真的协议 (OpenAI) 在末尾追加
 //!   `data: [DONE]`, 与 `StreamTranslate::finish` 同源.
 //!
@@ -47,8 +48,9 @@
 //! - `ReasoningContent{opaque: Some(RedactedData)}`: `RedactedThinking{data}` meta
 //!   携全量数据, **无 delta** (与 Anthropic 真实流同型); o writer 跳过 (配对过滤
 //!   兜住), r writer 经 envelope.
-//! - `ReasoningContent{opaque: None}` (**o-origin**): 维持 T5 形态 (ReasoningContent
-//!   meta + ReasoningDelta); a writer 不承载 (o 无容器, 配对过滤跳过整块).
+//! - `ReasoningContent{opaque: None}` (**o-origin**): ReasoningContent meta +
+//!   ReasoningDelta 正文 (issue #2 后 a writer 经 thinking block + envelope
+//!   signature 承载, o/r writer 原生各自表达 — 本模块零协议知识)。
 //! - `Reasoning{summary, opaque}` (**r-origin** reasoning item): T5 曾整块跳过;
 //!   T7 后 r/a 流式 writer 均可承载 — Thinking meta + summary 正文 delta +
 //!   `ReasoningOpaqueDelta`(ec) (r writer verbatim 写回 done 帧; a writer 在 stop
@@ -177,7 +179,10 @@ fn response_to_events(resp: &IrResponse, identity: SynthIdentity) -> Vec<IrStrea
                     IrBlockMeta::RedactedThinking { data: data.clone() },
                     Vec::new(),
                 ),
-                // o-origin: 维持 T5 形态 (a writer 不承载 o-origin, 配对过滤跳过)。
+                // o-origin: ReasoningContent meta + 正文 delta — a writer 经
+                // thinking block + envelope signature 承载 (issue #2), o writer
+                // 原生 reasoning_content, r writer summary 形态 (T7 origin 机制
+                // 分派, 本模块只按 origin 选 meta/delta 形态)。
                 None => (
                     IrBlockMeta::ReasoningContent,
                     vec![IrDelta::ReasoningDelta(text.clone())],
@@ -450,17 +455,17 @@ mod tests {
         }
     }
 
-    /// Anthropic 跨协议身份剥离 + 不可承载 block 的配对过滤: ReasoningContent 在
-    /// Anthropic writer 被跳过 (thinking 无法合成), 其 BlockStop 不得产出孤儿帧;
-    /// message_start 必须是首帧, message_stop 是末帧.
+    /// Anthropic 跨协议身份剥离 + thinking 族承载 (issue #2): o-origin
+    /// ReasoningContent 经 thinking block + envelope signature 搬运, 生命周期
+    /// start/delta/stop 完整配对; message_start 必须是首帧, message_stop 是末帧.
     #[test]
     fn synth_anthropic_event_pairing_and_lifecycle_order() {
         let resp = IrResponse {
             content: vec![
                 IrBlock::ReasoningContent {
                     text: "thinking...".into(),
-                    // o-origin: a writer 不承载 (无 opaque 容器), 配对过滤跳过整块
-                    // — 本测试的 T5 覆盖面 (reasoning 不泄漏断言)。
+                    // o-origin: 经 a wire thinking block 的 signature 容器搬运
+                    // (issue #2) — 本测试锁定 synth 路径的完整生命周期配对。
                     opaque: None,
                     extra: Default::default(),
                 },
@@ -524,11 +529,12 @@ mod tests {
             !client.contains("msg_foreign"),
             "foreign id leaked: {client}"
         );
-        // reasoning 内容被 Anthropic writer 丢弃 (已知损失 #176), 文本保留.
-        assert!(
-            !client.contains("thinking..."),
-            "reasoning leaked: {client}"
-        );
+        // o-origin 思考正文经 envelope 搬运 (issue #2) + 文本保留.
+        let thinking_joined = super::super::join_thinking_deltas(&frames);
+        assert_eq!(thinking_joined, "thinking...", "thinking lost: {client}");
+        let sig = super::super::find_signature_delta(&frames)
+            .unwrap_or_else(|| panic!("signature_delta missing: {client}"));
+        crate::codec::thinking::assert_unpacks_rc_envelope(&sig, "thinking...");
         assert!(client.contains("answer"), "text lost: {client}");
     }
 
@@ -716,10 +722,7 @@ mod tests {
             "thinking text (from summary) missing: {client_a}"
         );
         let frames_a = super::super::iter_sse_frames(sse_a.as_slice());
-        let sig = frames_a
-            .iter()
-            .find(|(et, d)| et == "content_block_delta" && d["delta"]["type"] == "signature_delta")
-            .map(|(_, d)| d["delta"]["signature"].as_str().unwrap().to_string())
+        let sig = super::super::find_signature_delta(&frames_a)
             .unwrap_or_else(|| panic!("envelope signature_delta missing: {client_a}"));
         assert!(
             crate::codec::thinking::unpack(&sig).is_some_and(|b| matches!(

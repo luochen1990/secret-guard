@@ -651,8 +651,10 @@ fn raw_error_snippet(resp_bytes: &[u8]) -> String {
 ///
 /// # 假设声明 (egress 能力 SSOT)
 ///
-/// - egress = Anthropic: `ReasoningContent{opaque: None}` (o-origin, 思考原文无
-///   opaque 容器可搬) 丢弃; 带 opaque 的 (a/r-origin) 原生写回 / envelope 搬运。
+/// - egress = Anthropic: 无损失 — 带 opaque 的 (a/r-origin) 原生写回, o-origin
+///   (`ReasoningContent{opaque: None}`) 经 sg-envelope 搬进 thinking block 的
+///   signature 容器 (issue #2, 2026-10-20 用户裁决; 2026-09-29 T7 初裁的
+///   "o-origin 丢弃" 已被该裁决取代)。
 /// - egress = OpenAI: `Reasoning` (r summary item) 整块丢弃; `ReasoningContent`
 ///   正文保留但 opaque 丢弃 (o 无容器)。
 /// - egress = Responses: 无损失 (envelope 搬运, T7)。
@@ -669,7 +671,8 @@ fn count_reasoning_blocks(
         .iter()
         .map(|b| match b {
             IrBlock::ReasoningContent { opaque, .. } => match egress {
-                Protocol::Anthropic => usize::from(opaque.is_none()),
+                // a egress: o-origin 经 envelope 搬运 (issue #2), a/r-origin 原生 — 无损失。
+                Protocol::Anthropic => 0,
                 Protocol::OpenAI => usize::from(opaque.is_some()),
                 Protocol::OpenAIResponses => 0,
             },
@@ -782,8 +785,8 @@ mod tests {
                 content_form: None,
             },
         ];
-        // Anthropic egress: 只计 plain (o-origin 无容器) — 顶层 1 + 嵌套 1 = 2。
-        assert_eq!(count_reasoning_blocks(&blocks, Protocol::Anthropic), 2);
+        // Anthropic egress: 无损失 (o-origin 经 envelope 搬运, issue #2)。
+        assert_eq!(count_reasoning_blocks(&blocks, Protocol::Anthropic), 0);
         // OpenAI egress: Reasoning 整块 1 + opaque_rc 的 opaque 损失 1 = 2。
         assert_eq!(count_reasoning_blocks(&blocks, Protocol::OpenAI), 2);
         // Responses egress: 无损失 (envelope 搬运)。

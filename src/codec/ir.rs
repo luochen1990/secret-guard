@@ -1035,10 +1035,13 @@ pub struct StreamEncodeState {
 /// Anthropic 流式 writer 的 thinking 族 block 累积状态 (T7)。
 ///
 /// Anthropic writer 历史上无状态 (1 IR 事件 → 0/1 帧); T7 引入唯一的累积需求:
-/// 跨协议 (r|a)→a 时, 若流中未出现原生 [`IrDelta::SignatureDelta`] (a-origin 真
+/// 跨协议 (r|a|o)→a 时, 若流中未出现原生 [`IrDelta::SignatureDelta`] (a-origin 真
 /// 签名), 须在 BlockStop **合成** envelope signature (`sg-thinking-v1:` 前缀,
 /// 内容 = 打包整个 Reasoning block) — 此时需要该 block 的完整 thinking 文本,
 /// 只能从 ReasoningDelta 累积。同协议 a→a 原生签名 verbatim 直通, 不触发合成。
+/// issue #2 (2026-10-20) 起 o-origin `IrBlockMeta::ReasoningContent` 亦注册本状态
+/// (`rc_origin = true`, BlockStop 合成 rc 形态 envelope), o-origin 思考原文经 a
+/// wire thinking block 的 signature 容器搬运, 回传方向 reader 解包还原。
 ///
 /// 幂等契约: 与 [`ResponsesEncodeState`] 同型 — BlockStart 的探测重复调用只注册
 /// 一次 (only-if-absent), delta/stop 每事件至多调用一次。
@@ -1062,6 +1065,11 @@ pub struct AnthropicThinkingAccum {
     /// flush 会在 BlockStop 前补发 thinking_delta, 提前 emit signature 会把
     /// thinking 尾巴挤到 signature 之后, 违反顺序)。
     pub native_signature: Option<String>,
+    /// BlockStart 来自 `IrBlockMeta::ReasoningContent` (o-origin, issue #2):
+    /// BlockStop 合成 **rc 形态** envelope (`pack_reasoning_content`) 而非 r 形态,
+    /// 回传方向 reader 解包还原为 `ReasoningContent{text, None}`。o-origin 恒无
+    /// opaque (ReasoningOpaqueDelta 仅 r-origin 产出), signature 载荷即纯文本。
+    pub rc_origin: bool,
 }
 
 /// Responses 流式 writer 追踪的单个 output item 的累积状态 (key = IR block index,

@@ -586,12 +586,20 @@ impl Writer for AnthropicWriter {
                         "content_block": {"type": "text", "text": ""}
                     }),
                 )],
-                // T7: thinking 族完整产出。Thinking 的 opaque (signature/envelope)
-                // 经 delta 或 BlockStop 合成到达, start 帧只开空块 (与 Anthropic
-                // 官方流的 thinking start 形态一致)。幂等: 已注册 index 不覆盖
-                // (探测重复调用, 见 ir.rs AnthropicEncodeState)。
-                IrBlockMeta::Thinking => {
-                    state.anthropic.thinking.entry(*index).or_default();
+                // T7 + issue #2 扩展: thinking 族完整产出。Thinking 的 opaque
+                // (signature/envelope) 经 delta 或 BlockStop 合成到达, start 帧只开
+                // 空块 (与 Anthropic 官方流的 thinking start 形态一致)。ReasoningContent
+                // (o-origin) 的 start 帧同型空块, 仅多标记 rc_origin — 正文经
+                // ReasoningDelta → thinking_delta 流入, BlockStop 合成 rc 形态 envelope
+                // signature (回传方向 reader 见 sg- 前缀解包还原为
+                // ReasoningContent{text, None})。幂等: 已注册 index 不覆盖 (探测重复
+                // 调用, 见 ir.rs AnthropicEncodeState) — 故 rc_origin 必须 set-only
+                // 赋值, 防 "rc 先注册、Thinking 探测在后" 的病态流重置标记。
+                IrBlockMeta::Thinking | IrBlockMeta::ReasoningContent => {
+                    let accum = state.anthropic.thinking.entry(*index).or_default();
+                    if matches!(block, IrBlockMeta::ReasoningContent) {
+                        accum.rc_origin = true;
+                    }
                     vec![(
                         "content_block_start".to_string(),
                         json!({
@@ -611,15 +619,6 @@ impl Writer for AnthropicWriter {
                             "content_block": {"type": "redacted_thinking", "data": data}
                         }),
                     )]
-                }
-                IrBlockMeta::ReasoningContent => {
-                    // o-origin (reasoning_content): o 协议无 opaque 容器, 无法构造
-                    // 合法 thinking block (signature 无法合成/搬运) — 跳过。
-                    // 跨协议模式的配对一致性由 StreamTranslate 的跳过 block 配对
-                    // 过滤保证 (writer 侧 skipped_block_starts, 本分支返回空 Vec
-                    // 即触发登记); 同协议 o→o 不经本 writer。o→a 的 reasoning
-                    // 丢弃是 T7 裁决的已知损失 (known-limitations)。
-                    Vec::new()
                 }
                 IrBlockMeta::ToolUse { id, name } => vec![(
                     "content_block_start".to_string(),
@@ -646,8 +645,8 @@ impl Writer for AnthropicWriter {
                 )],
                 IrDelta::ReasoningDelta(text) => {
                     // T7: thinking 正文 — 仅对已注册的 Thinking 族 block 产出
-                    // (o-origin ReasoningContent 的 block 被跳过, 无 start 配对,
-                    // 其 delta 一并吞掉; 未注册 index = 病态流, 纵深防御跳过)。
+                    // (Thinking / RedactedThinking / ReasoningContent 三种 meta 的
+                    // BlockStart 均注册; 未注册 index = 病态流, 纵深防御跳过)。
                     // 正文同时累积进 encode state (BlockStop 合成 envelope 用)。
                     if let Some(accum) = state.anthropic.thinking.get_mut(index) {
                         accum.text.push_str(text);
@@ -702,8 +701,13 @@ impl Writer for AnthropicWriter {
                 // 一个 delta, Anthropic wire 顺序 — 延迟 emit 的理由见
                 // SignatureDelta 分支):
                 // - 原生签名 (a-origin) → verbatim (fidelity 锚点);
-                // - 无原生签名且非 redacted → 合成 envelope signature (打包整个
-                //   Reasoning block {summary: 累积正文, opaque: r-origin ec};
+                // - o-origin (rc_origin, issue #2) → 合成 rc 形态 envelope
+                //   (打包 ReasoningContent{text, None}; 回传方向 reader 解包还原,
+                //   o writer 原生恢复 reasoning_content, stateless loop 闭合)。
+                //   text 为空时跳过 (零信息, 对齐既有规则 — 否则 reader 解包
+                //   零信息 envelope 必然失配退化);
+                // - 其余 (r-origin / 无原生签名且非 redacted) → 合成 r 形态 envelope
+                //   (打包整个 Reasoning block {summary: 累积正文, opaque: r-origin ec};
                 //   回传方向 reader 解包 → r writer 原生写回, stateless loop 闭合;
                 //   a-origin 无 signature 的退化流 (真实 Anthropic 不产生) 被注入
                 //   envelope — 回传经解包还原为无 signature 形态, 可逆,
@@ -719,6 +723,11 @@ impl Writer for AnthropicWriter {
                             // item): 不合成 signature (空 envelope 零增益且回传必然
                             // 失配, 与 unpack 的退化丢弃规则对称)。
                             None
+                        }
+                        None if accum.rc_origin => {
+                            // o-origin 正文搬运 (issue #2): rc 形态 envelope。
+                            // opaque 恒 None (ReasoningOpaqueDelta 仅 r-origin 产出)。
+                            Some(super::thinking::pack_reasoning_content(&accum.text, &None))
                         }
                         None => {
                             // text 空时 summary 为空数组 (envelope 解包回 s:[] —
@@ -1374,15 +1383,23 @@ fn write_block(b: &IrBlock) -> Option<Value> {
                 merge_block_extra(&mut obj, extra);
                 Some(obj)
             }
-            // o-origin (reasoning_content, 无 opaque 容器): o 协议无载体可搬 —
-            // 丢弃 + WARN (T7 裁决: envelope 仅 a⇄r, 不为 o 发明 wire 形态;
-            // 对齐 count_reasoning_blocks 显式丢弃先例)。
+            // T7 扩展 (issue #2, 2026-10-20 用户裁决): o-origin (reasoning_content,
+            // 无原生 opaque 容器) 经 sg-envelope 搬进 thinking block 的 signature —
+            // 不合成签名只搬运 (cc-switch 模式), 回传方向 reader 见 sg- 前缀解包还原
+            // rc{text, None}, o writer 原生恢复 reasoning_content (stateless loop
+            // 闭合)。打包点在 writer = post-redact/post-restore (安全链见
+            // codec/thinking.rs)。空 text 静默丢弃: 零信息块不产出 — 否则 reader
+            // 解包零信息 envelope 必然失配, 退化为 rc{"", opaque:Some(env)} 怪形态
+            // (与 thinking.rs::unpack 的退化丢弃规则对称)。
+            None if text.is_empty() => None,
             None => {
-                tracing::warn!(
-                    "dropping reasoning_content block in translation to Anthropic: \
-                     OpenAI Chat has no opaque container for thinking signature"
-                );
-                None
+                let mut obj = json!({
+                    "type": "thinking",
+                    "thinking": text,
+                    "signature": super::thinking::pack_reasoning_content(text, &None),
+                });
+                merge_block_extra(&mut obj, extra);
+                Some(obj)
             }
         },
         // Raw 原文 verbatim 回写 (#363): reader 收的是本协议 wire 的原始 block
@@ -2796,5 +2813,138 @@ mod tests {
         let src = &v["messages"][0]["content"][0]["source"];
         assert_eq!(src["type"], "url");
         assert_eq!(src["url"], "https://example.com/img.png");
+    }
+
+    // ─── T7 扩展 (issue #2): o-origin 思考正文经 a wire signature 容器搬运 ────
+
+    /// 非流式: `ReasoningContent{text, None}` (o-origin) → thinking block, 正文
+    /// 原位 + signature = rc 形态 envelope (解包还原 rc{text, None})。空 text 的
+    /// 零信息块静默丢弃 (与 thinking.rs::unpack 退化丢弃规则对称)。
+    #[test]
+    fn write_block_carries_o_origin_reasoning_content_via_envelope() {
+        let ir = IrResponse {
+            content: vec![
+                IrBlock::ReasoningContent {
+                    text: "o-style deliberation".into(),
+                    opaque: None,
+                    extra: Default::default(),
+                },
+                IrBlock::ReasoningContent {
+                    text: String::new(),
+                    opaque: None,
+                    extra: Default::default(),
+                },
+                IrBlock::Text {
+                    text: "answer".into(),
+                    extra: Default::default(),
+                },
+            ],
+            stop_reason: Some(IrStopReason::EndTurn),
+            usage: IrUsage::default(),
+            usage_present: false,
+            model: Some("claude".into()),
+            id: Some("msg_01o2a".into()),
+            created: None,
+            stop_sequence: None,
+        };
+        let v = writer().write_response(&ir);
+        let blocks = v["content"].as_array().unwrap();
+        // 零信息 rc 不产出 → 2 blocks (thinking + text), index 无空洞。
+        assert_eq!(blocks.len(), 2, "zero-info rc must be dropped: {v}");
+        assert_eq!(blocks[0]["type"], "thinking");
+        assert_eq!(blocks[0]["thinking"], "o-style deliberation");
+        let sig = blocks[0]["signature"].as_str().unwrap();
+        crate::codec::thinking::assert_unpacks_rc_envelope(sig, "o-style deliberation");
+        assert_eq!(blocks[1]["type"], "text");
+        assert_eq!(blocks[1]["text"], "answer");
+    }
+
+    /// 流式: o reader 的事件序列 (BlockStart{ReasoningContent} → ReasoningDelta … →
+    /// BlockStop) → a wire 完整 thinking 生命周期 — content_block_start(thinking) /
+    /// thinking_delta / signature_delta(rc envelope) / content_block_stop; 零信息
+    /// rc (start 后无 delta) 不合成 signature。
+    #[test]
+    fn stream_rc_origin_thinking_lifecycle() {
+        let w = writer();
+        let mut state = crate::codec::ir::StreamEncodeState::default();
+
+        // index 0: o-origin rc, 两段 delta。
+        let frames = w.write_response_event(
+            &IrStreamEvent::BlockStart {
+                index: 0,
+                block: IrBlockMeta::ReasoningContent,
+            },
+            &mut state,
+        );
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].0, "content_block_start");
+        assert_eq!(frames[0].1["content_block"]["type"], "thinking");
+        assert_eq!(frames[0].1["index"], 0);
+        for chunk in ["deliber", "ation"] {
+            let frames = w.write_response_event(
+                &IrStreamEvent::BlockDelta {
+                    index: 0,
+                    delta: IrDelta::ReasoningDelta(chunk.into()),
+                },
+                &mut state,
+            );
+            assert_eq!(frames.len(), 1, "chunk {chunk}");
+            assert_eq!(frames[0].1["delta"]["type"], "thinking_delta");
+            assert_eq!(frames[0].1["delta"]["thinking"], chunk);
+        }
+        let frames = w.write_response_event(&IrStreamEvent::BlockStop { index: 0 }, &mut state);
+        // signature_delta (envelope) + content_block_stop, stop 前最后 delta 顺序。
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].0, "content_block_delta");
+        assert_eq!(frames[0].1["delta"]["type"], "signature_delta");
+        let sig = frames[0].1["delta"]["signature"].as_str().unwrap();
+        crate::codec::thinking::assert_unpacks_rc_envelope(sig, "deliberation");
+        assert_eq!(frames[1].0, "content_block_stop");
+
+        // index 1: 零信息 rc (start 后零 delta) — stop 仍配对, 但不合成 signature。
+        let frames = w.write_response_event(
+            &IrStreamEvent::BlockStart {
+                index: 1,
+                block: IrBlockMeta::ReasoningContent,
+            },
+            &mut state,
+        );
+        assert_eq!(frames.len(), 1);
+        let frames = w.write_response_event(&IrStreamEvent::BlockStop { index: 1 }, &mut state);
+        assert_eq!(
+            frames.len(),
+            1,
+            "zero-info rc must skip signature: {frames:?}"
+        );
+        assert_eq!(frames[0].0, "content_block_stop");
+    }
+
+    /// 回传方向 (请求侧): 客户端把我们合成的 envelope-sig thinking block 原样回传
+    /// → a reader 见 sg- 前缀解包 (envelope 权威源) → IR rc{text, None} —
+    /// o writer 原生恢复 reasoning_content 的前置 (stateless loop, 实现先于本测试
+    /// 存在, 显式锁定契约)。
+    #[test]
+    fn read_request_unpacks_envelope_rc_thinking_history() {
+        let sig = super::super::thinking::pack_reasoning_content("carried thought", &None);
+        let body = json!({
+            "model": "claude-x",
+            "max_tokens": 4096,
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "carried thought", "signature": sig},
+                ]},
+            ],
+        });
+        let ir = reader().read_request(&body).unwrap();
+        assert!(
+            matches!(
+                &ir.messages[1].content[0],
+                IrBlock::ReasoningContent { text, opaque, .. }
+                    if text == "carried thought" && opaque.is_none()
+            ),
+            "envelope rc must unpack on read-back: {:?}",
+            ir.messages[1].content
+        );
     }
 }

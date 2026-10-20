@@ -138,6 +138,21 @@ pub fn unpack(s: &str) -> Option<IrBlock> {
     }
 }
 
+/// 测试辅助: 断言 sig 是 rc 形态 envelope 且解包还原为
+/// `ReasoningContent{expected_text, None}` (issue #2 后多处同型断言合一;
+/// 与 `stream/mod.rs::iter_sse_frames` 同型的 cfg(test) 跨模块测试共享先例).
+#[cfg(test)]
+pub(crate) fn assert_unpacks_rc_envelope(sig: &str, expected_text: &str) {
+    assert!(
+        unpack(sig).is_some_and(|b| matches!(
+            &b,
+            IrBlock::ReasoningContent { text, opaque, .. }
+                if text == expected_text && opaque.is_none()
+        )),
+        "envelope must unpack to rc{{text, None}}: {sig}"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -105,12 +105,12 @@ impl DeltaKind {
 ///   跨协议模式额外启用两个 wire 合法性机制 (同协议模式**不启用**, 行为由现有
 ///   property 测试锁定):
 ///   - **跳过 block 的配对过滤**: ingress writer 对 `BlockStart` 返回空 Vec 的 index
-///     (如 Anthropic writer 对 `IrBlockMeta::ReasoningContent` — thinking block 需
-///     signature 无法合成) 记入集合, 同 index 的 `BlockStop` 一并跳过 — 否则会 emit
-///     未配对的 `content_block_stop` (协议违例). `BlockDelta` 不在过滤范围: OpenAI
+///     记入集合, 同 index 的 `BlockStop` 一并跳过 — 否则会 emit 未配对的
+///     `content_block_stop` (协议违例). `BlockDelta` 不在过滤范围: OpenAI
 ///     writer 对 Text/Reasoning 的 `BlockStart` 返回空 Vec 是**结构性隐式** (delta 仍
-///     是内容, 必须照常 emit), 语义性整体跳过只发生在 Anthropic writer 对
-///     ReasoningContent (其 `ReasoningDelta` 本就被 writer 跳过).
+///     是内容, 必须照常 emit); T7 后 a writer 对 thinking 族 (含 o-origin
+///     ReasoningContent, issue #2) 均产出帧, 语义性整体跳过在当前 codec 覆盖族内
+///     已无实例 — 机制保留给未来仍未建模的 block 类型。
 ///   - **deferred message_stop**: OpenAI egress 开 `include_usage` 时末尾 usage chunk
 ///     在 finish_reason 之后 → IR 时序 MessageStop 之后跟 MessageDelta{usage}. 但
 ///     Anthropic ingress 若在 message_stop 后再 emit message_delta 是非法 wire 顺序
@@ -354,8 +354,8 @@ impl StreamTranslate {
             // 跨协议模式的跳过 block 配对过滤 (仅对 writer 主动跳过 BlockStart 的
             // index 生效; 见结构体文档 "配对过滤" 段). BlockDelta 不在过滤范围:
             // OpenAI writer 对 Text BlockStart 返回空 Vec 是结构性隐式, delta 仍是
-            // 内容 (由 writer 自行决定 emit); 语义性整体跳过 (Anthropic 对
-            // ReasoningContent) 的 ReasoningDelta 本就被 writer 跳过.
+            // 内容 (由 writer 自行决定 emit); a writer 对 thinking 族 (含 o-origin
+            // ReasoningContent, issue #2) 已承载, 语义性整体跳过在覆盖族内已无实例.
             // 同协议模式不启用 (skipped_block_starts 恒空).
             //
             // 探测调用会传 `&mut self.encode` (writer 签名要求), 帧被丢弃:
@@ -560,12 +560,14 @@ mod tests {
         .concat()
     }
 
-    /// 1a 配对过滤: Anthropic ingress 下, writer 跳过的 ReasoningContent BlockStart
-    /// 不得产生未配对的 content_block_stop (修复前: BlockStop 无状态恒 emit).
+    /// 1a 配对过滤守卫 (issue #2 后语义翻转): Anthropic ingress 下, o-origin
+    /// ReasoningContent 经 sg-envelope 搬进 thinking block 的 signature —
+    /// start/delta/stop 完整生命周期配对, block index 无空洞 (修复前: BlockStart
+    /// 被跳过 + BlockStop 无状态恒 emit 产生未配对帧)。
     ///
     /// 不变式: 每个 content_block_stop 都有同 index 的前置 content_block_start;
-    /// 每个 content_block_delta 同理. 同时守卫 text 内容保真 (reasoning 被显式
-    /// 丢弃是 STR-6 裁决的预期行为, 不在断言范围).
+    /// 每个 content_block_delta 同理。同时守卫 thinking 原文保真 (envelope
+    /// signature 解包还原 rc{text, None}) 与 text 内容保真。
     #[test]
     fn cross_proto_reasoning_block_yields_no_unpaired_block_stop() {
         let mut t = StreamTranslate::new_cross_proto(
@@ -612,16 +614,18 @@ mod tests {
         }
         assert!(open.is_empty(), "unclosed content_block_start: {client}");
 
-        // text 内容保真: reasoning 丢弃, 但 answer 必须到达客户端.
+        // text 内容保真: answer 必须到达客户端.
         assert!(
             client.contains("\"text\":\"answer\""),
             "text lost: {client}"
         );
-        // reasoning 增量不得到达 (Anthropic 无法承载 thinking block).
-        assert!(
-            !client.contains("thinking..."),
-            "reasoning leaked: {client}"
-        );
+        // o-origin 思考原文经 thinking block 搬运 (issue #2): thinking_delta 到达 +
+        // envelope signature 解包还原 rc{text, None}.
+        let thinking_joined = super::super::join_thinking_deltas(&frames);
+        assert_eq!(thinking_joined, "thinking...", "thinking_delta: {client}");
+        let sig = super::super::find_signature_delta(&frames)
+            .unwrap_or_else(|| panic!("signature_delta missing: {client}"));
+        crate::codec::thinking::assert_unpacks_rc_envelope(&sig, "thinking...");
     }
 
     /// 1b deferred stop: OpenAI egress 开 include_usage 时, 末尾 usage chunk 在

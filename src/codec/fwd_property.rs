@@ -774,6 +774,53 @@ fn prop_envelope_packs_redacted_text_never_real(
 }
 }
 
+/// issue #2 (o→a 方向的 envelope 安全链): o 客户端 assistant 历史
+/// `reasoning_content` 含 secret → redact (叶子 mock 化) → a writer 打包 rc
+/// envelope (post-redact) — 解包后的内文本必须是 mock 而非 real。
+#[test]
+fn o_origin_envelope_packs_redacted_text_never_real() {
+    let secret = "sk-live-o2aredact99";
+    let wire = json!({
+        "model": "gpt-5",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant",
+             "reasoning_content": format!("key is {secret} here"),
+             "content": "answer"},
+        ],
+    });
+    let mut ir = OpenAiReader.read_request(&wire).unwrap();
+    let entry = make_secret_entry(secret);
+    let (map, _) = redact_ir(&mut ir, &[entry]);
+    let mock = map.mock_for(secret).unwrap().to_string();
+
+    // a writer 打包 envelope (post-redact — 文本已是 mock)。
+    let a_wire = AnthropicWriter.write_request(&ir);
+    let block = &a_wire["messages"][1]["content"][0];
+    assert_eq!(block["type"], "thinking");
+    let sig = block["signature"].as_str().expect("envelope present");
+    let a_wire_str = serde_json::to_string(&a_wire).unwrap();
+    assert!(
+        !a_wire_str.contains(secret),
+        "real secret must not reach a wire: {a_wire_str}"
+    );
+    // 解包验证: 内文本是 mock (不是 real)。
+    match crate::codec::thinking::unpack(sig).expect("envelope must unpack") {
+        crate::codec::ir::IrBlock::ReasoningContent { text, opaque, .. } => {
+            assert!(
+                text.contains(mock.as_str()),
+                "envelope text must be mock: {text}"
+            );
+            assert!(
+                !text.contains(secret),
+                "envelope text must not contain real"
+            );
+            assert!(opaque.is_none(), "o-origin envelope carries no opaque");
+        }
+        other => panic!("expected ReasoningContent, got {other:?}"),
+    }
+}
+
 /// T7 golden (a→r→a, 非流式请求): a 客户端回传 thinking+signature history →
 /// r egress (envelope 搬运) → r 客户端原样 echo 回来 → r reader 解包 → a egress
 /// 原生写回 — thinking 原文与 signature 双双恢复 (stateless tool loop 闭合)。
@@ -894,6 +941,122 @@ fn cross_proto_reasoning_response_golden_r_to_a_echo() {
     assert_eq!(item["type"], "reasoning");
     assert_eq!(item["summary"][0]["text"], "deliberation");
     assert_eq!(item["encrypted_content"], "EC-resp-golden");
+}
+
+/// T7 扩展 golden (o→a→o, 非流式请求, issue #2): o 客户端回传
+/// assistant history `reasoning_content` → a egress (envelope 搬进 thinking
+/// signature) → a 客户端 echo → a reader 解包 → o egress 原生恢复
+/// `reasoning_content` — stateless tool loop 闭合 (o-origin 方向)。
+#[test]
+fn cross_proto_thinking_golden_o_to_a_to_o() {
+    let wire = json!({
+        "model": "gpt-5",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant",
+             "reasoning_content": "o-style deliberation",
+             "content": "answer"},
+        ],
+    });
+    let mut ir = OpenAiReader.read_request(&wire).unwrap();
+    ir.extra.clear();
+    ir.clear_wire_fidelity();
+
+    // → a egress: envelope 搬进 signature (thinking 正文承载原文)。
+    let a_wire = AnthropicWriter.write_request(&ir);
+    let blocks = a_wire["messages"][1]["content"].as_array().unwrap();
+    assert_eq!(blocks[0]["type"], "thinking");
+    assert_eq!(blocks[0]["thinking"], "o-style deliberation");
+    let sig = blocks[0]["signature"].as_str().unwrap();
+    assert!(sig.starts_with(crate::codec::thinking::ENVELOPE_PREFIX));
+
+    // → a 客户端 echo (原样回传) → a reader 解包 → o egress 原生恢复。
+    let mut ir2 = AnthropicReader.read_request(&a_wire).unwrap();
+    ir2.extra.clear();
+    ir2.clear_wire_fidelity();
+    let o_wire = OpenAiWriter.write_request(&ir2);
+    let msg = &o_wire["messages"][1];
+    assert_eq!(msg["role"], "assistant");
+    assert_eq!(
+        msg["reasoning_content"], "o-style deliberation",
+        "reasoning_content must be restored on o egress: {o_wire}"
+    );
+    assert_eq!(msg["content"], "answer");
+}
+
+/// T7 扩展 golden (o→a 响应侧, 非流式, issue #2): 上游 o 响应
+/// `message.reasoning_content` → a ingress 合成 thinking block
+/// (signature=rc envelope), block 序列 index 连续无空洞; 客户端把该 block
+/// 回传进下一轮请求 history → a reader 解包 → o egress 原生恢复
+/// `reasoning_content` (全链 stateless loop 闭合)。
+#[test]
+fn cross_proto_reasoning_response_golden_o_to_a() {
+    let resp = json!({
+        "id": "chatcmpl-o2a", "object": "chat.completion", "created": 1700000000,
+        "model": "glm-5.3",
+        "choices": [{
+            "index": 0, "finish_reason": "stop",
+            "message": {"role": "assistant",
+                        "reasoning_content": "o-style deliberation",
+                        "content": "answer"},
+        }],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+    });
+    let ir = OpenAiReader.read_response(&resp).unwrap();
+    let a_resp = AnthropicWriter.write_response(&ir);
+    let blocks = a_resp["content"].as_array().unwrap();
+    assert_eq!(blocks.len(), 2, "no holes in block sequence: {a_resp}");
+    assert_eq!(blocks[0]["type"], "thinking");
+    assert_eq!(blocks[0]["thinking"], "o-style deliberation");
+    let sig = blocks[0]["signature"].as_str().unwrap();
+    crate::codec::thinking::assert_unpacks_rc_envelope(sig, "o-style deliberation");
+    assert_eq!(blocks[1]["type"], "text");
+    assert_eq!(blocks[1]["text"], "answer");
+
+    // 全链 echo: 客户端把该响应 block 回传进下一轮请求 history → a reader
+    // 解包 (envelope 权威源) → o egress 原生恢复 reasoning_content。
+    let echo_req = json!({
+        "model": "claude-x", "max_tokens": 4096,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [
+                blocks[0].clone(),
+                {"type": "text", "text": "answer"},
+            ]},
+        ],
+    });
+    let mut ir2 = AnthropicReader.read_request(&echo_req).unwrap();
+    ir2.extra.clear();
+    ir2.clear_wire_fidelity();
+    let o_wire = OpenAiWriter.write_request(&ir2);
+    let msg = &o_wire["messages"][1];
+    assert_eq!(msg["reasoning_content"], "o-style deliberation", "{o_wire}");
+    assert_eq!(msg["content"], "answer");
+}
+
+/// FWD-2 (同协议 a→a, 显式锁定): 客户端回传我们合成的 envelope-sig thinking
+/// block (o-origin rc 载荷) → reader 解包 → writer 重打包 — envelope 是确定性
+/// 序列化 (serde_json Map 默认 BTreeMap 键序), round-trip 后 normalize_json
+/// 相等, 同协议路径零形状漂移。
+#[test]
+fn anthropic_envelope_rc_thinking_same_proto_roundtrip_normalize_equal() {
+    let sig = crate::codec::thinking::pack_reasoning_content("carried thought", &None);
+    let wire = json!({
+        "model": "claude-x", "max_tokens": 4096,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "carried thought", "signature": sig},
+            ]},
+        ],
+    });
+    let ir = AnthropicReader.read_request(&wire).unwrap();
+    let out = AnthropicWriter.write_request(&ir);
+    assert_eq!(
+        normalize_json(&wire),
+        normalize_json(&out),
+        "同协议 a→a envelope rc thinking round-trip 不得漂移"
+    );
 }
 
 /// OpenAI Chat Completions 请求生成器.

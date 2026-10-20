@@ -2724,6 +2724,105 @@ async fn cross_protocol_streaming_translates_anthropic_ingress_from_openai_upstr
     assert!(!resp_body.contains("[DONE]"), "got: {resp_body}");
 }
 
+/// o→a 流式方向 (issue #2): OpenAI 上游 SSE 流 reasoning_content delta →
+/// Anthropic ingress 客户端收到 thinking block 完整生命周期 (thinking_delta 流入 +
+/// signature_delta = rc 形态 envelope, 解包可还原), block index 序列**无空洞**
+/// (连续递增 — 修复前 o-origin reasoning block 被跳过, 是 T7 已知损失④)。
+#[tokio::test]
+async fn cross_protocol_streaming_translates_anthropic_ingress_from_openai_upstream_reasoning() {
+    let mut upstream = spawn_mock_upstream().await;
+    let sse_body = concat!(
+        "data: {\"id\":\"chatcmpl-o2a\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"glm-5.3\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"o-style \"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-o2a\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"glm-5.3\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"deliberation\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-o2a\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"glm-5.3\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"answer\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-o2a\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"glm-5.3\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"id\":\"chatcmpl-o2a\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"glm-5.3\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse_body)
+        .create_async()
+        .await;
+    let provider = provider_with("oa-r", Protocol::OpenAI, &upstream.url());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+    let body = r#"{"model":"claude","messages":[{"role":"user","content":"Hello"}],"max_tokens":50,"stream":true}"#;
+    let (status, resp_body, _) =
+        proxy_request(&proxy_url, "POST", "/a/oa-r/v1/messages", body, &[]).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {resp_body}");
+    let frames = parse_sse_frames(&resp_body);
+
+    // thinking_delta 拼接 == 上游 reasoning_content 拼接 (逐 delta 保真).
+    let thinking_joined = frames
+        .iter()
+        .filter_map(|(et, d)| {
+            if et == "content_block_delta" && d["delta"]["type"] == "thinking_delta" {
+                d["delta"]["thinking"].as_str()
+            } else {
+                None
+            }
+        })
+        .collect::<String>();
+    assert_eq!(
+        thinking_joined, "o-style deliberation",
+        "thinking deltas: {resp_body}"
+    );
+    // signature_delta = rc 形态 envelope (解包还原 rc{text, None}).
+    let sig = frames
+        .iter()
+        .find(|(et, d)| et == "content_block_delta" && d["delta"]["type"] == "signature_delta")
+        .map(|(_, d)| d["delta"]["signature"].as_str().unwrap().to_string())
+        .unwrap_or_else(|| panic!("signature_delta missing: {resp_body}"));
+    assert!(
+        secret_guard::codec::thinking::unpack(&sig).is_some_and(|b| matches!(
+            &b,
+            secret_guard::codec::ir::IrBlock::ReasoningContent { text, opaque, .. }
+                if text == "o-style deliberation" && opaque.is_none()
+        )),
+        "envelope must unpack to rc{{text, None}}: {sig}"
+    );
+    // text 内容保真.
+    assert!(
+        resp_body.contains("\"text\":\"answer\""),
+        "text lost: {resp_body}"
+    );
+    // block index 序列无空洞: content_block_start 恰为 [1, 2] 连续递增。
+    // (o reader 的 next_free_block_index 恒从 1 起分配 — index 0 是该 reader 的
+    // 既有 uniform 行为, 与本改动无关; 这里断言的是序列内部连续: 修复前 o-origin
+    // reasoning block 被跳过, 客户端只见 [2] — T7 已知损失④ 的空洞形态。)
+    let start_indexes = frames
+        .iter()
+        .filter(|(et, _)| et == "content_block_start")
+        .map(|(_, d)| d["index"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        start_indexes,
+        vec![1, 2],
+        "block index holes (T7 损失④ 必须已消除): {resp_body}"
+    );
+    // 配对完整: 每个 start 有同 index 的 stop, delta 只落在 open 块上.
+    let mut open = std::collections::BTreeSet::new();
+    for (et, d) in &frames {
+        let idx = d["index"].as_u64();
+        match et.as_str() {
+            "content_block_start" => assert!(open.insert(idx.unwrap()), "{resp_body}"),
+            "content_block_delta" => {
+                assert!(
+                    open.contains(&idx.unwrap()),
+                    "delta on closed block: {resp_body}"
+                )
+            }
+            "content_block_stop" => assert!(open.remove(&idx.unwrap()), "{resp_body}"),
+            _ => {}
+        }
+    }
+    assert!(open.is_empty(), "unclosed block: {resp_body}");
+    // 流完整终止.
+    assert_eq!(resp_body.matches("event: message_stop").count(), 1);
+}
+
 #[tokio::test]
 async fn cross_protocol_streaming_redact_restores_mock_no_leak() {
     // 跨协议流式 + redact: 上游 (Anthropic SSE) 在 text 里 echo mock, 客户端
@@ -10916,10 +11015,41 @@ async fn non_json_body_with_mock_still_passes_through_when_fallback_fails() {
 // tools) 的接线守卫 — 纯函数计数已有单测, 这里锁定 "丢弃确实发生在预期路径上",
 // 防未来重构把计数挪到 clear/翻译之后 (恒 0) 而测试不红. WARN 只记计数不记内容.
 
-/// o→a: assistant 历史携带 `reasoning_content` (reader 解析为 ReasoningContent,
-/// anthropic writer 无法合成 signature 而丢弃) → 请求侧丢弃 WARN.
+/// a→o: assistant 历史携带 thinking block (reader 解析为 ReasoningContent{opaque:
+/// Some}, o writer 无法承载 opaque 而剥离) → 请求侧损失 WARN。(issue #2 前本测试
+/// 用 o→a 方向锁 o-origin 丢弃 — o→a 已改为 envelope 搬运, 无损失方向迁移见
+/// `cross_proto_o_to_a_reasoning_envelope_no_lossy_warn`。)
 #[tokio::test]
 async fn cross_proto_request_reasoning_history_drop_warns() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"chatcmpl-x","object":"chat.completion","created":1700000000,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+        )
+        .create_async()
+        .await;
+    let provider = provider_with("oa-main", Protocol::OpenAI, &upstream.url());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+
+    let (log, _log_guard) = capture_tracing(tracing::Level::WARN);
+    let body = r#"{"model":"claude-3","max_tokens":64,"messages":[{"role":"user","content":"Hi"},{"role":"assistant","content":[{"type":"thinking","thinking":"pondering deeply","signature":"SIGreq01"},{"type":"text","text":"answer"}]},{"role":"user","content":"go on"}]}"#;
+    let (status, _, _) =
+        proxy_request(&proxy_url, "POST", "/a/oa-main/v1/messages", body, &[]).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let log_text = log.text();
+    assert!(
+        log_text.contains("reasoning block(s) lossy in cross-protocol request history"),
+        "T5/T7: request-side reasoning lossy WARN missing; log: {log_text}"
+    );
+}
+
+/// o→a: assistant 历史携带 `reasoning_content` → 经 envelope 搬运 (issue #2),
+/// 请求侧**无** reasoning 损失 WARN (T7 初裁的 o-origin 丢弃已消除)。
+#[tokio::test]
+async fn cross_proto_o_to_a_reasoning_envelope_no_lossy_warn() {
     let mut upstream = spawn_mock_upstream().await;
     let _m = upstream
         .mock("POST", "/v1/messages")
@@ -10946,33 +11076,39 @@ async fn cross_proto_request_reasoning_history_drop_warns() {
     assert_eq!(status, reqwest::StatusCode::OK);
     let log_text = log.text();
     assert!(
-        log_text.contains("reasoning block(s) lossy in cross-protocol request history"),
-        "T5/T7: request-side reasoning lossy WARN missing; log: {log_text}"
+        !log_text.contains("reasoning block(s) lossy in cross-protocol request history"),
+        "issue #2: o→a reasoning 经 envelope 搬运, 不得再有损失 WARN; log: {log_text}"
     );
 }
 
-/// a→o: OpenAI 兼容上游响应携带 `message.reasoning_content` (reader 解析为
-/// ReasoningContent, anthropic ingress writer 跳过) → 响应侧丢弃 WARN.
+/// a→o: Anthropic 上游响应携带 thinking block (reader 解析为 ReasoningContent{
+/// opaque: Some}, o ingress writer 剥离 opaque, 正文保留为 reasoning_content) →
+/// 响应侧损失 WARN。(issue #2 前本测试用 o→a 方向 — 该方向已改为 envelope 搬运。)
 #[tokio::test]
 async fn cross_proto_response_reasoning_drop_warns() {
     let mut upstream = spawn_mock_upstream().await;
     let _m = upstream
-        .mock("POST", "/v1/chat/completions")
+        .mock("POST", "/v1/messages")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(
-            r#"{"id":"chatcmpl-r","object":"chat.completion","created":1700000000,"model":"glm-5.3","choices":[{"index":0,"message":{"role":"assistant","reasoning_content":"let me think","content":"final answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":5}}"#,
+            r#"{"id":"msg_r","type":"message","role":"assistant","content":[{"type":"thinking","thinking":"let me think","signature":"SIGresp01"},{"type":"text","text":"final answer"}],"model":"claude","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":3,"output_tokens":5}}"#,
         )
         .create_async()
         .await;
-    let provider = provider_with("oa-main", Protocol::OpenAI, &upstream.url());
+    let provider = provider_with("an-main", Protocol::Anthropic, &upstream.url());
     let proxy_url = spawn_proxy_with_provider(provider).await;
 
     let (log, _log_guard) = capture_tracing(tracing::Level::WARN);
-    let body =
-        r#"{"model":"claude-3","max_tokens":64,"messages":[{"role":"user","content":"Hi"}]}"#;
-    let (status, _, _) =
-        proxy_request(&proxy_url, "POST", "/a/oa-main/v1/messages", body, &[]).await;
+    let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"}]}"#;
+    let (status, _, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/an-main/v1/chat/completions",
+        body,
+        &[],
+    )
+    .await;
     assert_eq!(status, reqwest::StatusCode::OK);
     let log_text = log.text();
     assert!(
