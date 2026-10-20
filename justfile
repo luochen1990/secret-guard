@@ -795,7 +795,10 @@ check-contracts:
     fi
     while IFS= read -r p; do
       fail "R0-b: 基线有而扫描面无: $p — 行被缩进/表格化/改名/删除? 确认合法后 just update-contracts-baseline 重生成并随提交更新"
-    done < <(comm -13 \
+    # LC_ALL=C 必须显式钉在 comm 上: 两侧输入是 C-collation 排序, comm 默认用
+    # 运行环境 locale 比对 — 非 C locale (如 CI runner 的 en_US.UTF-8) 下会判
+    # "not in sorted order" 并产出假差异 (2026-10-20 #375 CI 假红实例).
+    done < <(LC_ALL=C comm -13 \
       <(grep -E '^- `prop_' "$md" | sed -n 's/^- `\(prop_[a-z0-9_]*\)`.*/\1/p' | LC_ALL=C sort -u) \
       <(grep -vE '^#|^$' "$baseline" | LC_ALL=C sort))
     # ignored 载体名清单 (#354, R2-b/R3-b/R4 共用): 全仓 `#[ignore` 非注释属性行
