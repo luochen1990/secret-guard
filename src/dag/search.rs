@@ -10,7 +10,8 @@
 //!   匹配必须落在**单个文本叶子内** — 跨叶子/跨 block 不拼接 (query "foobar"
 //!   不命中叶子 "foo" + "bar").
 //! - 文本叶子提取见 [`text_leaves`]: Text.text / ToolUse.name + input 的 JSON
-//!   字符串值 / ToolResult 嵌套 content / Reasoning.summary / ReasoningContent.text;
+//!   字符串值 / ToolResult 嵌套 content / Reasoning.summary / ReasoningContent.text
+//!   / Raw.entry 的字符串值 (#363, 与 redact 扫描面同口径);
 //!   **Image 不参与** (base64 是无语义大 blob, 进扫描面会炸预算).
 //!
 //! # 性能设计 (issue #317 红线: 不引入性能问题)
@@ -266,6 +267,9 @@ fn text_leaves(block: &IrBlock, out: &mut Vec<String>) {
             }
         }
         IrBlock::Image { .. } => {}
+        // Raw (#363 未知 content part 保真透传) 的字符串值叶子 = 用户内容,
+        // 与 redact 对 Raw 的扫描面同口径 — 键是结构元数据不取.
+        IrBlock::Raw { entry } => json_string_leaves(entry, out),
         IrBlock::Reasoning { summary, .. } => {
             out.extend(summary.iter().cloned());
         }
@@ -367,6 +371,44 @@ mod tests {
         let dag2 = ConversationDag::default();
         dag2.push_messages(vec![msg], ev());
         assert_eq!(dag2.search("NEEDLE").hits.len(), 1);
+    }
+
+    #[test]
+    fn search_hits_raw_block_string_leaves() {
+        // #363 × #317 交互: Raw (未知 content part 保真透传) 的字符串**值**叶子
+        // 进搜索面 (与 redact 对 Raw 的扫描面同口径); 键是结构元数据不取,
+        // 非字符串值 (数字等) 不参与.
+        let dag = ConversationDag::default();
+        let msg = IrMessage {
+            role: IrRole::User,
+            content: vec![IrBlock::Raw {
+                entry: serde_json::json!({
+                    "type": "audio",
+                    "zzz_keyonly_marker": "value holds RawNeedle inside",
+                    "count": 42,
+                }),
+            }],
+            ..Default::default()
+        };
+        dag.push_messages(vec![msg], ev());
+        // 值叶子可被搜到 (大小写不敏感).
+        assert_eq!(
+            dag.search("rawneedle").hits.len(),
+            1,
+            "Raw string leaf must be searchable"
+        );
+        // 键 (仅出现在键位) 不命中 — json_string_leaves 只走 values().
+        assert_eq!(
+            dag.search("zzz_keyonly_marker").hits.len(),
+            0,
+            "object keys are structural metadata, not search leaves"
+        );
+        // 非字符串值不参与.
+        assert_eq!(
+            dag.search("42").hits.len(),
+            0,
+            "non-string JSON values are not search leaves"
+        );
     }
 
     #[test]
