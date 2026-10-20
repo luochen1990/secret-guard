@@ -260,6 +260,7 @@ rationale 是不对称性: 可用性损失可重试恢复, 机密性损失不可
 > contracts.md 收录并扩展为 UI-1..UI-9 (UI-8 = SSE 失效通知消费; UI-9 = 轮次详情弹窗概览默认/大数据按需, quant#305), 以 contracts.md 为 SSOT; 此处保留 I* 编号便于历史 grep.
 > UI-10 (Detect 协议探测非阻塞 — 手动填写永远是逃生口, 2026-10-18 用户裁决) 无历史 I* 前身, 直接以 UI-10 落在 contracts.md.
 > UI-11 (端点发现 origin 先行 — 协议作为被发现的面, #332; 2026-10-19 融合后终态 = 检测台吸收独立面板) 直接以 UI-11 落在 contracts.md.
+> UI-12 (会话搜索 — 服务端扫描 + Block 级 memoize, cap/预算双红线, #317) 无历史 I* 前身, 直接以 UI-12 落在 contracts.md.
 ### I1 — 气泡数 == req_delta messages 长度
 
 会话详情页 (timeline) 渲染的 Bubble 数量, 必须等于该 Node 的 req_delta messages
@@ -370,7 +371,7 @@ Pool 不进此本地终结分支 (Router 专属) — pool 入口的 /models 经 
 | `auth/` (模块目录: mod/oidc/handlers/session/apikey/middleware) | OIDC 登录 (WebUI, **cargo feature `oidc` 门控** — oidc/handlers/session 子模块默认不编译, apikey 路径永远在) + 本地 API key (SDK 转发) + session | `auth/mod.rs` 头部 `//!` |
 | `codec/` | 跨协议 IR + Reader/Writer trait + StreamTranslate (OpenAI / Anthropic / Responses) | **`src/codec/AGENTS.md`** + `docs/design/ir-fields-roadmap.md` (IR 字段建模路线图: extra 边界 + 字段提升判定准则 + 实施批次) |
 | `config.rs` | 双层配置 schema + `DynamicTable<T>` 泛型 + 持久化 + 静态配置预检审计 (未知 section/字段 → 启动 WARN, #159) | 文件头部 `//!` (覆盖 OverrideMode / CRUD / Effective source / 跨表并发) |
-| `dag/` (模块目录: mod/pool/types/view/timeline) | ConversationDAG 内容寻址存储 (BlockPool + Node + Merkle) | `src/dag/mod.rs` 头部 `//!` + `docs/design/conversation-dag.md` |
+| `dag/` (模块目录: mod/pool/search/types/view/timeline) | ConversationDAG 内容寻址存储 (BlockPool + Node + Merkle) + 会话文本搜索 (#317, search 子模块) | `src/dag/mod.rs` 头部 `//!` + `docs/design/conversation-dag.md` |
 | `derive.rs` | 从 request body / DAG 结构化存储派生 WebUI 轻量视图: preview/model/text 字节级提取 + delta messages (B1: BlockPool 派生 `extract_delta_messages_from_blocks`, 与旧 raw 切片逐字节等价) + tail parsed 渲染派生 (`response_parsed_from_parts`) (域 B 派生链, ROB-1 永不 panic) | 文件头部 `//!` (含 "为什么不在 web::api" 归属论证) |
 | `dto.rs` | WebUI 响应 DTO 中立类型层 (SessionView/NodeView/.../SyncSnapshot, 域 B → 域 C wire shape; 构造逻辑留 dag) | 文件头部 `//!` (含 "为什么是顶层中立模块" 归属论证) |
 | `error.rs` | 统一应用错误类型 `AppError` (转发链 + 鉴权层共用, 不反向依赖) | 文件头部 `//!` (含与 `web::api::ApiError` 分工 + Upstream/UpstreamTimeout message 净化回传契约) |

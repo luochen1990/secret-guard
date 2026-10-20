@@ -3723,6 +3723,107 @@ async fn web_api_sync_returns_sessions_after_forward() {
     assert!(rounds.is_empty(), "expanded 为空 → rounds 为空");
 }
 
+// ─── 会话文本搜索 (#317) ────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn web_api_search_finds_forwarded_text_case_insensitive() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    let records = ConversationDag::new(64, 500, 1);
+    let records_handle = records.clone();
+    // 配置一个 (不命中 body 的) secret 让请求走 IR 路径 — passthrough 分支
+    // (secrets 表空) 不做 IR 解析, DAG 存空 messages, 搜索面不存在 (孤立节点).
+    let secrets = test_secret_table_with(vec![secret("sid-search", "sk-absent-not-in-body")]);
+    let proxy_url = spawn_proxy_full(
+        vec![openai_provider("oa-main", &upstream.url())],
+        reqwest::Client::new(),
+        records,
+        secrets,
+    )
+    .await;
+
+    let body = r#"{"model":"test-model-abc","messages":[{"role":"user","content":"hello search-NEEDLE-317 marker"}]}"#;
+    let _ = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        body,
+        &[],
+    )
+    .await;
+    wait_until_or_timeout(
+        &records_handle,
+        |l| l.first().map(|r| r.resp_complete).unwrap_or(false),
+        Duration::from_secs(2),
+    )
+    .await;
+
+    let client = reqwest::Client::new();
+    // 大小写不敏感命中 (query 小写, 原文大写).
+    let resp = client
+        .get(format!("{proxy_url}/api/search"))
+        .query(&[("q", "search-needle-317")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    let hits = v.get("hits").and_then(|h| h.as_array()).unwrap();
+    assert_eq!(hits.len(), 1, "exactly one matching round");
+    assert_eq!(v.get("truncated"), Some(&serde_json::json!(false)));
+    // snippet 保留原文大小写 + role/preview 元数据齐全.
+    assert!(
+        hits[0]["snippet"]
+            .as_str()
+            .unwrap()
+            .contains("search-NEEDLE-317"),
+        "snippet keeps original case: {}",
+        hits[0]["snippet"]
+    );
+    assert_eq!(hits[0]["role"], "user");
+    assert_eq!(hits[0]["preview"], "hello search-NEEDLE-317 marker");
+
+    // 无命中: 200 + 空列表 (不是错误).
+    let resp = client
+        .get(format!("{proxy_url}/api/search"))
+        .query(&[("q", "totally-absent-needle")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        v.get("hits").and_then(|h| h.as_array()).unwrap().len(),
+        0,
+        "no match → empty hits"
+    );
+
+    // 验证集中预处理: 缺 q / 空 q / 超长 q → 400.
+    for (label, query) in [
+        ("missing q", None),
+        ("empty q", Some("")),
+        ("whitespace q", Some("   ")),
+        ("oversized q", Some(&"x".repeat(600))),
+    ] {
+        let mut req = client.get(format!("{proxy_url}/api/search"));
+        if let Some(q) = query {
+            req = req.query(&[("q", q)]);
+        }
+        let resp = req.send().await.unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "{label} must 400"
+        );
+    }
+}
+
 #[tokio::test]
 async fn web_api_returns_record_by_id() {
     let mut upstream = spawn_mock_upstream().await;

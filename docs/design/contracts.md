@@ -1352,6 +1352,50 @@ IR 机制正交:
 - `prop_detect_url_memory_prefill` (#347 ①): 显式探测过的 URL 在二次编辑时预填且优先于首端点 base_url (与端点 base_url 可区分), 跨 dialog 周期持久, 重新探测改写; 字段名 "URL" + 问号 tooltip (en/zh 词条齐备). 🔁→`探测 URL 记忆: 显式探测过的 URL 预填, 优先于首端点 base_url (#347 ①)` + `字段名 URL + hover 问号 tooltip (术语优化, #347 ③)` (`tests/webui/im-ui.spec.ts`)
 - `prop_probe_uses_provider_key_reference` (#347 ②): 编辑态 key 留空 → 探测携带条目存量 key 抵达上游 (鉴权墙上游: 仅精确存量 key 200 → ok/models; keyless → 401), Detect 与 Verify 两入口一致, stored/keyless 消歧提示按 key 来源出现; API 级: 显式 api_key 优先, 未知 id → keyless (数据非错误), 响应不回显 key. 🔁→`编辑态 Detect 携带存量 key (修 401) + 正向提示 (#347 ②)` + `无存量 key 的编辑态探测: keyless 消歧提示 (不再误称 key 未复用)` (`tests/webui/im-ui.spec.ts`) + `providers_probe_uses_provider_key_reference_verify_and_origin` + `providers_probe_provider_key_reference_fallbacks` (`tests/integration.rs`)
 
+### UI-12 会话搜索 — 服务端扫描 + Block 级 memoize (#317)
+
+**陈述**: WebUI sidebar 顶部提供会话文本搜索: `GET /api/search?q=<text>` 由**服务端**扫描
+DAG 定位 (会话, 轮次), 前端零全文索引. 性能是 issue #317 的显式需求 ("需要保证性能,
+不能因此引入性能问题"), 实现遵循"服务端扫描 + Block 级 memoize (零索引冷启动)"方案
+(issue 评论草案推荐项; 暂不做倒排索引 — 数据量用不上, "滞后是稳态"):
+
+- **匹配语义** (三决策点的默认取值, PR 中显著标注待用户 review): ① 搜索范围 = 仅请求侧
+  文本 (`req_delta` messages 的文本叶子: Text / ToolUse name + input 的 JSON 字符串值 /
+  ToolResult 嵌套 content / Reasoning summary / ReasoningContent; **不含** response 与
+  根 system_refs; Image 不参与 — base64 是无语义大 blob); ② 交互 = 命中点击跳转该会话
+  timeline + 目标轮高亮; ③ 匹配 = 大小写不敏感子串 (`to_lowercase` 后 `find`),
+  **匹配必须落在单个文本叶子内** — 跨叶子/跨 block 不拼接 (query "foobar" 不命中叶子
+  "foo"+"bar").
+- **双层去重 + memoize**: BlockPool 内容寻址 (相同 block 物理一份) ×
+  `BlockPool.search_cache` (BlockHash → lowercase 叶子, 惰性填充, **与池条目同生命周期**
+  — release 到 0 时同步清除, 防 hash 复用后陈旧命中) — 稳态下每个唯一 block 只付一次
+  lowercase 成本, 对话前缀复用 (增量会话的主体) 免付; 查询期纯内存子串扫描.
+  per-query `scanned` 记忆复用**命中信息**而非跳过 — fork 共享祖先链场景每个 walked
+  session 各得 hit (跳转语义正确).
+- **cap + 预算双红线** (`dag::search` SSOT): 结果 cap = 200 (达到即停, `truncated=true`);
+  扫描预算 = 50ms deadline (逐 block 检查, 超时返回部分结果 + `truncated=true`).
+  `truncated` = "未扫描完, 可能还有更多", 不是精确计数声明. 整个扫描持 DagInner 读锁,
+  预算同时是写锁 starving 的上界 (parking_lot task-fair) — 搜索是增强 (ROB 纪律),
+  永不拖垮转发与 `/api/sync` (独立 GET 端点, 不进轮询路径).
+- **排序/去重**: 会话 latest-first (与 sync_snapshot 同序) + 会话内轮次 newest-first;
+  一个 Node 至多一条 hit (定位轮次, 不穷举位置). snippet = 命中叶子原文前后各 ~40
+  chars ("…" 标记截断, 原文大小写保留; case-folding 变长时退化为叶子头部, 永不 panic).
+- **query 集中预处理** (web 层, `api/search.rs`): 缺失 / trim 后空 / >512 chars → 400.
+
+**Properties**:
+
+- `prop_search_finds_case_flipped_substring`: 大小写翻转子串必命中其所属 node (匹配语义 = to_lowercase 域内子串). ✅
+- `prop_search_no_hit_for_absent_needle`: query 字符取自叶子生成字母表之外 (结构性不可命中) → 零命中 + 不 truncated (无假阳性). ✅
+- `prop_search_no_cross_leaf_join`: 叶子 "foo" + "bar" (同 message 两 Text block) → "foobar"/"obar" 不命中, "foo"/"bar" 命中 (匹配不跨叶子拼接). 🔁→`search_no_cross_leaf_join` (`src/dag/search.rs`)
+- `prop_search_hits_capped`: 205 个命中会话 → hits 恰为 cap (200) + truncated=true, 且 cap 序 = recency 序 (最新 200 条). 🔁→`search_hits_capped_at_max_with_truncated` (`src/dag/search.rs`)
+- `prop_search_budget_bounded`: 已过期 deadline + 非空 DAG → 首个未扫描 block 即停, truncated=true + 部分结果返回 (预算红线的确定性测试形态); 空 DAG → 不 truncated. 🔁→`search_expired_deadline_truncated_partial` (`src/dag/search.rs`)
+- `prop_search_shared_block_fork_attribution`: fork 共享祖先 node 在两个 session 的链上 → 两 session 各得一条 hit (同 node_id, 不同 session_id) — 扫描记忆复用命中而非跳过. 🔁→`search_shared_block_attributed_to_both_fork_sessions` (`src/dag/search.rs`)
+- `prop_search_cache_lifecycle`: block 被 LRU 释放 → search_cache 同步清除 (hash 复用不得命中陈旧 lowercase 文本). 🔁→`search_cache_purged_when_block_released` (`src/dag/search.rs`)
+- `prop_search_concurrent_with_push`: 搜索与 push 并行 (共享 DagInner 读锁) 无死锁/panic, 并发结束后终态可搜索 ("搜索不阻塞写入路径" 的并发形态). 🔁→`search_concurrent_with_push_completes` (`src/dag/search.rs`)
+- `prop_search_api_e2e_case_insensitive`: 经转发链 (IR 路径) 的请求文本可被搜索命中 (大小写不敏感, snippet 保留原文大小写, preview/role 元数据齐全); 无命中 = 200 空列表; 缺 q/空 q/超长 q → 400. 🔁→`web_api_search_finds_forwarded_text_case_insensitive` (`tests/integration.rs`)
+- `prop_search_hit_jump_highlight` (前端): 搜索框输入 (大小写不敏感) → 结果面板只含命中会话 (无关会话不出现, snippet 含原文); 点击命中 → sidebar active 切到目标会话 + 目标轮 `.tl-round.selected` 持续高亮 + 面板关闭. 🔁→`搜索框存在 + 输入过滤出命中会话 (不含无关会话)` + `点击命中 → 跳转该会话 timeline + 目标轮 .selected 高亮` (`tests/webui/im-ui.spec.ts`)
+- `prop_search_truncated_hint_rendered` (前端): truncated 响应 → 面板渲染 "Showing first {n} matches" hint (route 拦截假响应钉住渲染契约; cap/预算的后端红线见上). 🔁→`truncated 标志 → '仅显示前 N 条' 提示 (route 拦截假响应)` (`tests/webui/im-ui.spec.ts`)
+
 ---
 
 ## 11. USAGE: 模型用量统计
@@ -1622,3 +1666,4 @@ chars (char boundary 安全); 其余事件字段为受控类型, 天然无 secre
 | 2026-10-19 | CFG-3 (增补) | **DELETE `/{id}/override` "重置为空态" (issue #348)**: 新端点 (secrets/providers 对称) — 撤销 static id 的 dynamic 覆盖: 删除 dynamic override (若有) + 清除 decision (若有, 含 prefer_static/disabled 残留) 回 static-only 基线; 存储层新增 `DynamicTable::reset_dynamic` (单次 persist_lock 临界区 + 单次 state.toml atomic_write 同时改写 dynamic 段与 decisions 段, 无中间态 — 与分别调 delete_dynamic + set_decision 的两写方案对比选原子); 幂等 (无可删痕迹仍 204); 非 static id → 404 (纯动态条目的清空归 DELETE `/{id}` 既有管辖, 与 decision_flow 404 同型). 既有 #156 DELETE 语义零变更 (该端点是 "删 override" 的显式入口, 不是放松 409). WebUI 配套: 编辑表单 reset 按钮 (仅 static_preferred/dynamic_override 形态显示, confirm 二次确认, hover tooltip 语义说明). property: `prop_delete_override_resets_to_static_baseline` (存储层配套 `reset_dynamic_clears_override_and_decision` / `reset_dynamic_idempotent_on_baseline`) | issue #348: "编辑动态" 只有更新/取消, 无法重置为空态 (未覆盖状态); 契约增补属新操作登记 (无既有断言改写), admin review 即授权点 |
 | 2026-10-19 | UI-11 (延伸, #347) | **检测台 URL 记忆 + 存量 key 探测引用 + 术语优化 (issue #347 三点)**: ① 探测 URL per-provider localStorage 记忆 (`sg-detect-url:<id>`, UI 层辅助不进 state.toml; 写点 = 编辑态 Detect 点击 + 保存成功钩子 (create 态以生成 id 补写); 读写长度 cap 防御), 二次编辑预填优先级 记忆 > 首端点 base_url > 空; ② 两路探测 (Detect/Verify) 统一 `use_provider_key: <id>` **引用** — 服务端查 effective provider 表注入 Direct 条目 effective_api_key (api_key/api_key_file 与转发同源 — file 形态经 GET DTO 新增 `api_key_file_configured` 布尔判知 (masked 空串; 路径/内容零暴露)), key 不二次过 wire (明文永不下发, 引用是唯一通路; 修二次编辑探测 401), 优先级 显式 api_key > 引用, 未知 id/非 Direct/无 key → keyless (数据非错误), 响应永不回显 key; key 来源消歧提示 stored/keyless/null 三态; ③ 字段名 "URL" + hover 问号 tooltip ("该 URL 用于探测各具体协议端点, 并不直接请求"), 原 "端点发现 (origin 探测)"/"端点 URL" 术语废弃, i18n 键 `providers.baseUrl` → `providers.detectUrlLabel`/`detectUrlHelp`. 2 条 property (`prop_detect_url_memory_prefill` + `prop_probe_uses_provider_key_reference`): Playwright 5 用例 (鉴权墙上游黑盒断言 — 仅精确存量 key 200; 含 file 形态种子) + integration 3 用例 (mockito header matcher 断言, 含 file 形态 + DTO 布尔) | issue #347 用户反馈: ① "应该保存用户输入的探测 URL, 以便二次编辑时自动预填"; ② "二次编辑测试时应该带 key, 现在不带 key 会直接 401"; ③ "'端点发现 (origin 探测)' 字段名太绕, 直接用 'URL' + hover 问号提示 '该URL用于探测各具体协议端点, 并不直接请求'" |
 | 2026-10-20 | CDAG-3 (精确化) + CDAG-11 (新增) | **DAG 组合不变式 proptest 补齐 (#362)**: 新增 `prop_dag_state_reconciles_after_fork_evict_sequence` — 操作域 = 累积前缀序列 + 随机 fork (重放旧前缀) + retry 全前缀重发 (split_at == len 的全量释放) + 小容量 (max_nodes 1..=4) 强制 evict, 经真实 push_messages → evict_if_needed → gc_cascade 路径 (既有 proptest 每 op 仅单条消息无 fork 输入; 组合场景此前仅 3 个固定 #[test], 其一绕过 evict_if_needed 走手动 gc_cascade); 末态断言: (i) child_count == 存活 child 数 + (ii) session leaf 恒为链 tip + parent 连通 + (iii) BlockPool 池键集合 == 存活引用集合的双向对账 (逐键逐数精确相等 — 补既有单向 refcount>0 property 的泄漏方向恒绿盲区, 收纳为 CDAG-3 精确化条目). CDAG-11 (下一可用编号; 9/10 为在途 PR #368/#370 占用) 收纳结构对账. 50000 case 冲击零失败 — 末态不变式当前实现全部成立, 纯覆盖补齐非行为修复 | issue #362: 质量链走查发现组合不变式缺任意序列 proptest + "池键集合 == 存活引用集合" 对账断言全仓不存在 |
+| 2026-10-20 | UI-12 (新增) | **会话搜索 — 服务端扫描 + Block 级 memoize (issue #317)**: `GET /api/search?q=<text>` 服务端遍历 DAG `req_delta` 文本叶子做大小写不敏感子串匹配, 返回 (session, node) 命中 + snippet. 性能三层设计 (issue 显式红线 "不能因此引入性能问题"): ① BlockPool 内容寻址 × `BlockPool.search_cache` (BlockHash→lowercase 叶子, 惰性填充, release 同步清除) 双层去重 — 稳态每唯一 block 只付一次 lowercase, 前缀复用免扫; ② 结果 cap 200 (`truncated=true` 即停); ③ 扫描预算 50ms deadline (逐 block 检查, 超时部分结果 + truncated — 同时是 DagInner 读锁持锁上界, 不拖垮转发/sync). 匹配语义: 落在单个文本叶子内 (跨叶子/跨 block 不拼接); 搜索范围 = 仅请求侧 req_delta (不含 response/system; Image 不参与). 三决策点默认取值 (PR 显著标注待用户 review): 范围仅 req_delta / 跳转+高亮 / 大小写不敏感子串. 暂不做倒排索引. 11 条 property: 后端 9 (proptest 2 + cap/预算/fork 归属/缓存生命周期/并发冒烟/e2e integration) + Playwright 2 | issue #317: "Webui中, 通过文本搜索会话, 但是需要保证性能, 不能因此引入性能问题."; 方案 = issue 评论编排草案的推荐项 (服务端扫描 + Block 级 memoize), 三决策点按草案默认取值, 人工 review 拍板留 PR |

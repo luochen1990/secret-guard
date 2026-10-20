@@ -12,6 +12,7 @@
   - `crud.rs` — secrets/providers 共享的 CRUD 泛型流程 (`EffectiveItem` + `CrudTable` + create/update/delete/decision flow, 错误消息经 kind_label 参数化).
   - `records.rs` — `GET /records/{id}` 单条 view 端点 (meta/raw/parsed 三档, 弹窗按需拉).
   - `sessions.rs` — `GET /sessions` + `GET /sessions/{sid}/timeline` + `POST /sync` (session-aware timeline API).
+  - `search.rs` — `GET /search` 会话文本搜索 (#317): 集中预处理薄壳 (q 非空/≤512 chars, 否则 400), 算法 + 性能红线 (cap/预算/memoize) SSOT 在 `dag::search`.
   - `secrets.rs` / `providers.rs` — 各自 CRUD (5 endpoints), handler 是 crud.rs 泛型流程的薄壳.
     providers.rs 另含 `POST /providers/probe` (单协议端点校验 verify, #332 端点行
     "二次检测"): base_url/protocol/common_uri 校验后的薄壳, 算法 SSOT 在
@@ -68,6 +69,19 @@ GET    /api/events                      → text/event-stream, 未命名事件, 
                                                   注释帧 (不触发 onmessage); WatchStream
                                                   初值即推当前计数 — 连接建立/重连自动
                                                   对账一轮 (SSE 失效通知, rt-push)
+GET    /api/search?q=<text>            → {hits[{session_id, node_id, role, preview?,
+                                                  snippet, created_at}], truncated}
+                                                  (会话文本搜索 #317: 大小写不敏感子串,
+                                                   匹配落在单个文本叶子内 (跨叶子/跨
+                                                   block 不拼接); 搜索范围 = 请求侧
+                                                   req_delta 文本 (决策点①默认, 不含
+                                                   response 与 system); 排序 = 会话
+                                                   latest-first + 会话内轮次 newest-first,
+                                                   一轮至多一条 hit; truncated = cap(200)
+                                                   或扫描预算(50ms) 提前停止, "可能还有
+                                                   更多" 而非精确计数; q 缺失/空/超长
+                                                   (>512 chars) → 400. 算法/性能设计 SSOT
+                                                   见 `src/dag/search.rs` 头部)
 GET    /api/secrets
 POST   /api/secrets
 PUT    /api/secrets/{id}
@@ -566,6 +580,26 @@ false 省略) — true 进 GET DTO 供本判定, wire 进入恒 false ⇒ API �
   — fork 场景祖先链完整, 同型成立; 仅孤儿链 parent 被 LRU 淘汰时, Tool 重试轮作为
   链首走隐式组首 fallback), preview/tooltip 加 `↻` 前缀区分 (消除与原轮的 preview
   歧义). 语义: IR 等价重发, 用户没有发新消息, 见 contracts.md DTO-9 / UI-1.
+
+### 会话搜索 (sidebar 搜索框, #317)
+
+sidebar 顶部搜索框 (`#session-search`) + 结果面板 (`#search-results`, 文档流内,
+max-height 42vh 自滚):
+
+- **数据流**: input (250ms debounce) → `GET /api/search?q=` → 代数对账 (`searchSeq`,
+  probeEpoch 同模式 — bump 使在途响应失效) → 行渲染 (会话标题 = sidebar 数据 lookup,
+  miss 回退 hit 自带 preview; `role · 时间` + 命中 snippet 原文大小写保留).
+- **点击命中 → 跳转高亮** (`jumpToSearchHit`, UI-12): 目标会话未选中 → 复用
+  toggleSession 链路 (expandedSessions.add + loadTimeline + fire-and-forget sync);
+  随后 `selectRound(rid)` — 目标轮不在最近窗口时 loadUntilRound 自动向前翻页,
+  `.tl-round.selected` 持续高亮. 跳转后结果面板关闭 (搜索框内容保留 — 想看其他
+  命中再触发一次输入即可, 面板不常驻).
+- **红线 (UI-12)**: 搜索是独立 GET 端点, 不进 sync 轮询路径; 空结果/失败是面板内
+  hint 行 (非 alert); truncated → "仅显示前 N 条匹配" hint. Escape 清空 + 关闭
+  (IME isComposing 让位原生); 面板是瞬态 DOM (语言切换不重放, 下次输入自愈 —
+  probeLastDetect 快照同型).
+- 回归守卫: `tests/webui/im-ui.spec.ts` "会话搜索 (#317)" describe (4 用例).
+
 
 ### 轮次详情弹窗 (概览 / 完整数据 双 tab, quant#305)
 
