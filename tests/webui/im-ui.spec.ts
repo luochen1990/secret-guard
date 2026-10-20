@@ -4975,3 +4975,98 @@ test.describe("完整数据 tab 分段渲染 (quant#308)", () => {
     expect(rawText).toContain("small-body-no-seg-marker");
   });
 });
+
+test.describe("会话搜索 (#317)", () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto("/");
+    await page.waitForLoadState("networkidle");
+  });
+
+  test("搜索框存在 + 输入过滤出命中会话 (不含无关会话)", async ({ page }) => {
+    await sendChat(page, [{ role: "user", content: "srch-hit-alpha-771 the alpha question" }]);
+    await sendChat(page, [{ role: "user", content: "srch-hit-beta-772 the beta question" }]);
+    // 等 sidebar 收到两个会话 (push 已发生 ⇒ 服务端搜索面可见).
+    await findSessionLeafByPreview(page, "srch-hit-alpha-771");
+    await findSessionLeafByPreview(page, "srch-hit-beta-772");
+
+    // 搜索框常驻 sidebar 顶部.
+    const box = page.locator("#session-search");
+    await expect(box).toBeVisible();
+    await box.fill("SRCH-HIT-ALPHA");   // 大小写不敏感: query 大写, 原文小写.
+    const panel = page.locator("#search-results");
+    await expect(panel).toBeVisible();
+    const hit = panel.locator(".search-hit");
+    await expect(hit).toHaveCount(1, { timeout: 5000 });
+    // 命中行: 会话标题 + 命中 snippet (含 marker 原文).
+    await expect(hit.first().locator(".sh-snippet")).toContainText("srch-hit-alpha-771");
+    const panelText = await panel.textContent();
+    expect(panelText).not.toContain("beta", "unrelated session must not appear in results");
+  });
+
+  test("点击命中 → 跳转该会话 timeline + 目标轮 .selected 高亮", async ({ page }) => {
+    // 两个会话: 先选中 beta (制造 "当前 timeline 不是目标会话" 的跳转场景).
+    await sendChat(page, [{ role: "user", content: "srch-jump-beta-882 first" }]);
+    await sendChat(page, [{ role: "user", content: "srch-jump-alpha-881 the needle round" }]);
+    const betaSid = await findSessionLeafByPreview(page, "srch-jump-beta-882");
+    const alphaSid = await findSessionLeafByPreview(page, "srch-jump-alpha-881");
+    await clickSessionByLeaf(page, betaSid);
+    await page.waitForTimeout(300);
+
+    await page.locator("#session-search").fill("srch-jump-alpha-881");
+    const hit = page.locator("#search-results .search-hit").first();
+    await hit.waitFor({ state: "visible", timeout: 5000 });
+    const rid = await hit.getAttribute("data-rid");
+    expect(rid).toBeTruthy();
+    await hit.click();
+
+    // 跳转: sidebar active 会话切换 + timeline 目标轮持续高亮 (.selected, UI-12).
+    await expect(page.locator(`.session-item.active[data-sid="${alphaSid}"]`)).toBeVisible();
+    const selected = page.locator(`#detail .tl-round.selected[data-rid="${rid}"]`);
+    await expect(selected).toBeVisible({ timeout: 5000 });
+    // 结果面板关闭 (跳转后不再遮挡).
+    await expect(page.locator("#search-results")).toBeHidden();
+  });
+
+  test("无匹配空态 + Escape 关闭结果面板", async ({ page }) => {
+    await sendChat(page, [{ role: "user", content: "srch-empty-993 some talk" }]);
+    await findSessionLeafByPreview(page, "srch-empty-993");
+    const box = page.locator("#session-search");
+    await box.fill("definitely-absent-needle-xyz");
+    // 空态文案 (en locale 默认).
+    await expect(page.locator("#search-results .search-hint")).toHaveText("No matches");
+    // Escape 清空 + 关闭.
+    await box.press("Escape");
+    await expect(page.locator("#search-results")).toBeHidden();
+    await expect(box).toHaveValue("");
+    // 重新输入为空 → 面板不打开.
+    await box.fill("   ");
+    await page.waitForTimeout(400);
+    await expect(page.locator("#search-results")).toBeHidden();
+  });
+
+  test("truncated 标志 → '仅显示前 N 条' 提示 (route 拦截假响应)", async ({ page }) => {
+    // 后端 cap (200)/预算红线由 Rust 测试守卫; UI 侧用拦截响应钉住渲染契约.
+    await page.route("**/api/search*", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          hits: [
+            { session_id: "00000000-0000-0000-0000-000000000001", node_id: "00000000-0000-0000-0000-000000000011", role: "user", snippet: "fake hit one", created_at: "2026-10-20T00:00:00Z" },
+            { session_id: "00000000-0000-0000-0000-000000000002", node_id: "00000000-0000-0000-0000-000000000022", role: "assistant", snippet: "fake hit two", created_at: "2026-10-20T00:01:00Z" },
+          ],
+          truncated: true,
+        }),
+      });
+    });
+    try {
+      await page.locator("#session-search").fill("anything");
+      await expect(page.locator("#search-results .search-hit")).toHaveCount(2);
+      await expect(page.locator("#search-results .search-hint")).toHaveText(
+        "Showing first 2 matches — refine the query to see more",
+      );
+    } finally {
+      await page.unroute("**/api/search*");
+    }
+  });
+});

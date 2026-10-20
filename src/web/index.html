@@ -1107,6 +1107,67 @@
     }
 
     /* ─── F3: records sidebar filter bar ──────────────────────────────────── */
+    /* 会话搜索 (#317): 搜索框 + 结果面板. 结果面板在 sidebar 文档流内 (aside 整体
+       滚动), 自带上限高度防长结果把会话列表推出视口. */
+    .sidebar-search {
+      padding: 8px 8px 0;
+      background: var(--bg-sunken);
+    }
+    .sidebar-search input {
+      width: 100%;
+      box-sizing: border-box;
+      font: inherit;
+      font-size: 12.5px;
+      padding: 5px 9px;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--fg);
+    }
+    .sidebar-search input:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+    #search-results {
+      max-height: 42vh;
+      overflow-y: auto;
+      border-bottom: 1px solid var(--border-faint);
+      background: var(--bg-sunken);
+    }
+    .search-hit {
+      padding: 6px 10px;
+      cursor: pointer;
+      border-bottom: 1px solid var(--border-faint);
+    }
+    .search-hit:hover { background: var(--bg-hover); }
+    .search-hit .sh-line1 {
+      font-size: 12.5px;
+      color: var(--fg);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .search-hit .sh-meta {
+      font-size: 10.5px;
+      color: var(--fg-faint);
+      margin-top: 1px;
+    }
+    .search-hit .sh-snippet {
+      font-size: 11.5px;
+      color: var(--fg-muted);
+      margin-top: 2px;
+      overflow: hidden;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow-wrap: anywhere;
+    }
+    .search-hint {
+      padding: 6px 10px;
+      font-size: 11px;
+      color: var(--fg-faint);
+      border-bottom: 1px solid var(--border-faint);
+    }
     .filter-bar {
       display: flex;
       gap: 4px;
@@ -1962,6 +2023,12 @@
   <main>
     <section id="tab-records" class="tab-content active">
       <aside id="sidebar">
+        <div class="sidebar-search">
+          <input id="session-search" type="search" autocomplete="off" spellcheck="false"
+                 placeholder="Search conversations" data-i18n-placeholder="sidebar.searchPlaceholder"
+                 aria-label="Search conversations" data-i18n-aria-label="sidebar.searchPlaceholder">
+        </div>
+        <div id="search-results" hidden></div>
         <div class="filter-bar">
           <button id="filter-all" class="active" type="button" onclick="setFilter('all')"><span data-i18n="sidebar.all">All</span> (<span id="filter-all-count">0</span>)</button>
           <button id="filter-hits" type="button" onclick="setFilter('hits')"><span data-i18n="sidebar.hits">Hits</span> (<span id="filter-hits-count">0</span>)</button>
@@ -2503,6 +2570,10 @@
         'sidebar.noHitsSessions': 'No sessions with redactions',
         'sidebar.loadingRounds': 'Loading rounds…',
         'sidebar.noPreview': '(no preview)',
+        'sidebar.searchPlaceholder': 'Search conversations',
+        'sidebar.searchNoHits': 'No matches',
+        'sidebar.searchTruncated': 'Showing first {n} matches — refine the query to see more',
+        'sidebar.searchFailed': 'Search failed',
         'sidebar.tip.session': 'session: {id}',
         'sidebar.tip.rounds': 'rounds: {n}',
         'sidebar.tip.model': 'model: {m}',
@@ -3000,6 +3071,10 @@
         'sidebar.noHitsSessions': '暂无命中的会话',
         'sidebar.loadingRounds': '轮次加载中…',
         'sidebar.noPreview': '(无预览)',
+        'sidebar.searchPlaceholder': '搜索会话内容',
+        'sidebar.searchNoHits': '无匹配',
+        'sidebar.searchTruncated': '仅显示前 {n} 条匹配 — 收窄关键词可见更多',
+        'sidebar.searchFailed': '搜索失败',
         'sidebar.tip.session': '会话: {id}',
         'sidebar.tip.rounds': '轮数: {n}',
         'sidebar.tip.model': '模型: {m}',
@@ -3558,6 +3633,7 @@
     const API_RECORDS = '/api/records';        // + '/{id}' 详情 (轮次详情弹窗用, ?view=meta|raw|parsed)
     const API_SESSIONS = '/api/sessions';      // + '/{sid}/timeline' 分页 + 列表
     const API_SYNC = '/api/sync';              // POST 统一轮询 (sidebar + timeline diff)
+    const API_SEARCH = '/api/search';          // GET 会话文本搜索 (#317)
     const API_SECRETS = '/api/secrets';
     const API_PROVIDERS = '/api/providers';
     const API_API_KEYS = '/api/api-keys';
@@ -3717,6 +3793,9 @@
         if (tab.dataset.tab === 'usage') refreshUsage();
       });
     });
+
+    // 会话搜索 (#317): sidebar 顶部搜索框绑定.
+    bindSearchBox();
 
     function setStatus(text, cls) {
       const el = document.getElementById('status');
@@ -3892,6 +3971,112 @@
         return state.sessionsList.filter(s => (s.redactions || []).length > 0);
       }
       return state.sessionsList;
+    }
+
+    // ─── 会话搜索 (#317): 搜索框 → GET /api/search → 结果面板 → 跳转高亮 ────
+    //
+    // 数据流: input (250ms debounce) → runSearch (代数对账防在途乱序) →
+    // renderSearchResults (行 = 会话标题 + 命中 snippet) → 点击 jumpToSearchHit
+    // (切会话 timeline + selectRound 高亮, 全部复用既有入口).
+    //
+    // 红线 (UI-12): 搜索是独立 GET 端点, 不进 sync 轮询路径; 结果面板是瞬态 DOM
+    // (与 probeLastDetect 快照同型, 不入 fingerprint 体系; 语言切换不重放 — 下次
+    // 输入自然以新语言渲染).
+    const SEARCH_DEBOUNCE_MS = 250;
+    let searchSeq = 0;        // 代数 (probeEpoch 同模式): bump 使在途响应失效.
+    let searchDebounceTimer = 0;
+
+    function bindSearchBox() {
+      const input = document.getElementById('session-search');
+      input.addEventListener('input', () => {
+        clearTimeout(searchDebounceTimer);
+        const q = input.value.trim();
+        if (!q) { closeSearchResults(); return; }
+        searchDebounceTimer = setTimeout(() => runSearch(q), SEARCH_DEBOUNCE_MS);
+      });
+      // Escape 清空 + 关闭 (IME isComposing 让位原生, 与 attachInputSuggest 同约定).
+      input.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Escape' && !ev.isComposing) {
+          input.value = '';
+          closeSearchResults();
+        }
+      });
+    }
+
+    async function runSearch(q) {
+      const seq = ++searchSeq;
+      try {
+        const resp = await fetch(`${API_SEARCH}?q=${encodeURIComponent(q)}`, { cache: 'no-store' });
+        if (seq !== searchSeq) return;   // 在途期间又有输入/关闭 → 丢弃.
+        if (!resp.ok) {
+          renderSearchPanel(`<div class="search-hint">${t('sidebar.searchFailed')}</div>`);
+          return;
+        }
+        const data = await resp.json();
+        if (seq !== searchSeq) return;
+        renderSearchResults(data);
+      } catch (e) {
+        console.error(e);
+        if (seq === searchSeq) {
+          renderSearchPanel(`<div class="search-hint">${t('sidebar.searchFailed')}</div>`);
+        }
+      }
+    }
+
+    function renderSearchResults(data) {
+      const hits = data.hits || [];
+      if (hits.length === 0) {
+        renderSearchPanel(`<div class="search-hint">${t('sidebar.searchNoHits')}</div>`);
+        return;
+      }
+      const rows = hits.map(h => {
+        // 会话标题: 优先 sidebar 数据 (同步自 sync 轮询); sessionsList 尚未含该会话
+        // (sync 间隔窗口) 时回退到 hit 自带的轮次 preview.
+        const sess = state.sessionsList.find(s => s.session_id === h.session_id);
+        const title = (sess && sess.preview) || h.preview || t('sidebar.noPreview');
+        return `
+          <div class="search-hit" data-sid="${escapeHtml(h.session_id)}" data-rid="${escapeHtml(h.node_id)}"
+               title="${escapeHtml(title)}">
+            <div class="sh-line1">${escapeHtml(title)}</div>
+            <div class="sh-meta">${escapeHtml(h.role || '')} · ${escapeHtml(formatTime(h.created_at))}</div>
+            <div class="sh-snippet">${escapeHtml(h.snippet || '')}</div>
+          </div>`;
+      }).join('');
+      const trunc = data.truncated
+        ? `<div class="search-hint">${t('sidebar.searchTruncated', { n: hits.length })}</div>`
+        : '';
+      renderSearchPanel(rows + trunc);
+      document.querySelectorAll('#search-results .search-hit').forEach(el => {
+        el.addEventListener('click', () => jumpToSearchHit(el.dataset.sid, el.dataset.rid));
+      });
+    }
+
+    // 渲染结果面板 (显示 + 内联 HTML; 内容全部经 escapeHtml, 无注入面).
+    function renderSearchPanel(html) {
+      const el = document.getElementById('search-results');
+      el.innerHTML = html;
+      el.hidden = false;
+    }
+
+    function closeSearchResults() {
+      searchSeq++;   // 使在途 fetch 失效.
+      const el = document.getElementById('search-results');
+      el.hidden = true;
+      el.innerHTML = '';
+    }
+
+    // 点击命中: 跳转该会话 timeline + 高亮目标轮次 (复用 toggleSession 的展开链路 +
+    // selectRound 的定位链路 — 目标轮不在最近窗口时 loadUntilRound 自动向前翻页).
+    async function jumpToSearchHit(sid, rid) {
+      closeSearchResults();
+      if (state.selectedSession !== sid) {
+        if (!expandedSessions.has(sid)) expandedSessions.add(sid);
+        state.selectedSession = sid;
+        renderSidebar();
+        sync();   // fire-and-forget sidebar 三级回填 (toggleSession 同款).
+        await loadTimeline(sid, { scroll: 'highlight' });
+      }
+      await selectRound(rid);
     }
 
     // sidebar 空态占位 (两档引导 + 中性兜底). 三档判定只影响空态内部文案, 空态本身的
