@@ -503,16 +503,14 @@ impl Writer for OpenAiWriter {
                     // 跨协议翻译时静默丢弃 (lossy-by-target); 同协议路径不会到达 Chat writer.
                     // r→o 的 opaque (encrypted_content) 一并丢失 (T7: o 无容器)。
                 }
-                IrBlock::ReasoningContent { text, opaque, .. } => {
+                IrBlock::ReasoningContent { text, .. } => {
                     // 思考型模型的非标 reasoning_content 字段 (#176). 同协议 redact
                     // 路径 round-trip 用; 跨协议来源 (a thinking) 的正文照写,
-                    // opaque 无容器可搬 — 丢弃 + WARN (T7: envelope 仅 a⇄r, o 不发明)。
-                    if opaque.is_some() {
-                        tracing::warn!(
-                            "dropping thinking opaque (signature/redacted_data) in translation \
-                             to OpenAI Chat: protocol has no opaque container"
-                        );
-                    }
+                    // opaque 无容器可搬 — 丢弃 (T7: envelope 仅 a⇄r, o 不发明)。
+                    // 逐块计数归 cross_proto_forward 的 per-request 聚合 WARN
+                    // (请求历史 / 缓冲响应两侧先例) + 流式响应侧 ParsedSync::finalize
+                    // 收口; writer 是热路径 (ParsedSync 每 250ms 重渲染累积响应),
+                    // 不打日志 (issue #2 WARN 洪水)。
                     message.insert("reasoning_content".to_string(), Value::String(text.clone()));
                 }
                 // Raw 原文 verbatim 回写 (#363): 响应侧 content array 的未知 part
@@ -646,13 +644,11 @@ impl Writer for OpenAiWriter {
                     }]
                 }),
                 // opaque 增量 (真 signature / encrypted_content): o 无容器可搬,
-                // 丢弃 + WARN (T7 — 对齐 count_reasoning_blocks 的显式丢弃先例;
-                // 密文非明文, 丢弃无泄漏面)。
+                // 丢弃 (T7 — 对齐 count_reasoning_blocks 的显式丢弃先例; 密文非
+                // 明文, 丢弃无泄漏面)。逐 delta 计数归 per-response 聚合 WARN
+                // (cross_proto::warn_reasoning_loss_response SSOT, issue #2) —
+                // 与 write_response 侧兄弟 WARN 同批收口, writer 不打日志。
                 IrDelta::SignatureDelta(_) | IrDelta::ReasoningOpaqueDelta(_) => {
-                    tracing::warn!(
-                        "dropping thinking opaque delta in translation to OpenAI Chat stream: \
-                         protocol has no opaque container"
-                    );
                     return Vec::new();
                 }
             },

@@ -468,17 +468,8 @@ pub(crate) async fn cross_proto_forward(
                     );
                     // T5 引入 / T7 精确化: 响应侧 reasoning 族 block 的跨协议损失
                     // 按 ingress (即响应侧写出协议) 能力计数 (同请求侧, 只记计数
-                    // 不记内容).
-                    let dropped_resp_reasoning =
-                        count_reasoning_blocks(&ir_resp.content, ingress_codec);
-                    if dropped_resp_reasoning > 0 {
-                        warn!(
-                            %record_id,
-                            count = dropped_resp_reasoning,
-                            "reasoning block(s) lossy in cross-protocol response translation \
-                             (dropped or opaque-stripped by target protocol capability)"
-                        );
-                    }
+                    // 不记内容) — 消息 SSOT 见 warn_reasoning_loss_response.
+                    warn_reasoning_loss_response(record_id, &ir_resp.content, ingress_codec);
                     // record 接线走 LLM 视角 (restore 之前, 含 mock) 的 finality.
                     resp_finality = super::recorder::RespFinality::from_ir(ingress_codec, &ir_resp);
                     // restore: mock → real (跨协议 + redact 时, 客户端看到的应该是真 secret).
@@ -642,6 +633,26 @@ fn http_status_to_error_kind(status: u16) -> &'static str {
 fn raw_error_snippet(resp_bytes: &[u8]) -> String {
     let raw = std::str::from_utf8(resp_bytes).unwrap_or("");
     crate::util::truncate_str_on_char_boundary(raw, super::MAX_ERROR_MSG_LEN).to_string()
+}
+
+/// 响应侧 reasoning 族 block 的跨协议损失 per-response 聚合 WARN — 缓冲路径
+/// (`cross_proto_forward`) 与流式路径 (`ParsedSync::finalize`) 共用的消息 SSOT
+/// (integration 测试按消息前缀 grep, 双份定义是漂移隐患). 只记计数不记内容;
+/// 计数语义见 [`count_reasoning_blocks`].
+pub(super) fn warn_reasoning_loss_response(
+    record_id: uuid::Uuid,
+    blocks: &[crate::codec::ir::IrBlock],
+    ingress: crate::codec::Protocol,
+) {
+    let dropped = count_reasoning_blocks(blocks, ingress);
+    if dropped > 0 {
+        warn!(
+            %record_id,
+            count = dropped,
+            "reasoning block(s) lossy in cross-protocol response translation \
+             (dropped or opaque-stripped by target protocol capability)"
+        );
+    }
 }
 
 /// 统计 block 切片中跨协议翻译会**损失信息**的 reasoning 族 block 数 (T7 精确化:

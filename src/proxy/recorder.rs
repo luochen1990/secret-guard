@@ -997,6 +997,9 @@ impl RecordAccumulator {
 pub(super) struct ParsedSync {
     scan: crate::codec::stream::StreamScan,
     writer: Box<dyn crate::codec::Writer>,
+    /// writer 侧 (ingress) 协议 — [`Self::finalize`] 的 reasoning 损失聚合计数
+    /// 按此协议的能力计 (对齐 cross_proto 缓冲路径按 ingress_codec 计数的先例).
+    writer_proto: crate::codec::Protocol,
     dag: ConversationDag,
     record_id: Uuid,
     last_sync: Option<std::time::Instant>,
@@ -1040,6 +1043,7 @@ impl ParsedSync {
         Self {
             scan: crate::codec::stream::StreamScan::new(scan_proto),
             writer: writer_proto.writer(),
+            writer_proto,
             dag,
             record_id,
             last_sync: None,
@@ -1073,8 +1077,20 @@ impl ParsedSync {
     /// parsed Value, 改存 message ref + 元字段, parsed 在渲染时经
     /// `derive::response_parsed_from_parts` 派生. 零语义事件时 `None`
     /// (前端降级占位, 不捏造空响应对象).
+    ///
+    /// 副作用: 跨协议 reasoning 损失的 per-response 聚合 WARN (缓冲路径同款,
+    /// 消息 SSOT = `cross_proto::warn_reasoning_loss_response`).
     pub(super) fn finalize(self) -> Option<crate::codec::ir::IrResponse> {
         let ir = self.scan.snapshot();
+        // 流式期间 feed 每 250ms 调 writer.write_response 重渲染累积响应, writer
+        // 内逐块 WARN 在该热路径上是冗余放大器 (issue #2 刷屏), 已删 — 由这里在
+        // 流结束时收口. 同协议路径 (new 构造, scan == writer) 计数结构性为 0 —
+        // same-proto 不丢 reasoning 族块, 无需 cross-proto 门控.
+        super::cross_proto::warn_reasoning_loss_response(
+            self.record_id,
+            &ir.content,
+            self.writer_proto,
+        );
         (!scan_decoded_nothing(&ir)).then_some(ir)
     }
 }
@@ -1860,5 +1876,25 @@ mod tests {
                 msg
             );
         }
+    }
+
+    // ─── ParsedSync: writer_proto 字段正确性 (issue #2 聚合 WARN) ───────────
+
+    #[test]
+    fn parsed_sync_writer_proto_tracks_constructor_arg() {
+        // finalize 的 reasoning 损失计数按 writer_proto (ingress) 能力计, 字段
+        // 必须存 writer 侧协议 — new_cross_proto 第二参数, 而非 scan 侧第一参数;
+        // new (同协议) 两参一致. WARN 输出无 tracing 捕获先例, 不断言日志本身,
+        // 只锁字段; 计数语义的交叉验证归 cross_proto.rs 既有单测.
+        let dag = ConversationDag::new(8, 500, 1);
+        let cross = ParsedSync::new_cross_proto(
+            crate::codec::Protocol::OpenAIResponses, // scan (egress)
+            crate::codec::Protocol::OpenAI,          // writer (ingress)
+            dag.clone(),
+            Uuid::new_v4(),
+        );
+        assert_eq!(cross.writer_proto, crate::codec::Protocol::OpenAI);
+        let same = ParsedSync::new(crate::codec::Protocol::Anthropic, dag, Uuid::new_v4());
+        assert_eq!(same.writer_proto, crate::codec::Protocol::Anthropic);
     }
 }

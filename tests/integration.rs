@@ -11117,6 +11117,77 @@ async fn cross_proto_response_reasoning_drop_warns() {
     );
 }
 
+/// a→o **流式**: thinking block 的 signature (opaque) 剥离损失 → per-response 聚合
+/// WARN 恰出现**一次** — 锁 T2 的流式收口 (ParsedSync::finalize 单点, 消息 SSOT =
+/// cross_proto::warn_reasoning_loss_response): 防 "finalize 传错协议 / WARN 被误删 /
+/// 退化为逐块或逐 250ms 渲染刻刷屏" 三种回归 (issue #2; 缓冲路径同款由
+/// `cross_proto_response_reasoning_drop_warns` 锁定)。时序: finalize 在 fanout task
+/// 内先于 tx drop 执行, body 完整返回 ⟹ WARN 已发射 (current-thread runtime 下
+/// thread-local subscriber 捕获 fanout task 事件, 与缓冲测试同机制)。
+#[tokio::test]
+async fn cross_proto_streaming_response_reasoning_loss_warns_once() {
+    let mut upstream = spawn_mock_upstream().await;
+    let sse_body = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_st\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"let me think\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"SIGst01\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"final answer\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":5}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+    let _m = upstream
+        .mock("POST", "/v1/messages")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse_body)
+        .create_async()
+        .await;
+    let provider = provider_with("an-main", Protocol::Anthropic, &upstream.url());
+    let proxy_url = spawn_proxy_with_provider(provider).await;
+
+    let (log, _log_guard) = capture_tracing(tracing::Level::WARN);
+    let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"}],"stream":true}"#;
+    let (status, resp_body, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/an-main/v1/chat/completions",
+        body,
+        &[],
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {resp_body}");
+    // 正文保真: 思考原文保留为 reasoning_content (opaque 剥离是登记损失).
+    assert!(
+        resp_body.contains("\"reasoning_content\":\"let me think\""),
+        "reasoning text lost: {resp_body}"
+    );
+    // 聚合 WARN 恰一次 (finalize 单点; >1 = 逐块/逐渲染刻刷屏回归, 0 = 收口丢失).
+    let warn_count = log
+        .text()
+        .matches("reasoning block(s) lossy in cross-protocol response translation")
+        .count();
+    assert_eq!(
+        warn_count,
+        1,
+        "per-response aggregated WARN must fire exactly once; log: {}",
+        log.text()
+    );
+}
+
 /// Responses 入站的 hosted tools (web_search 等非 function 类型) 收为
 /// IrTool::Raw 原文保真 (#321) — 同协议 round-trip 不再丢弃 (见
 /// same_proto_redact_preserves_tool_search_defs_and_redacts_embedded_secret);
