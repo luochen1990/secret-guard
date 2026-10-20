@@ -7,6 +7,8 @@
 //! - `GET /api/sessions`                —— 会话列表 (首次加载/无选中时).
 //! - `GET /api/sessions/{sid}/timeline` —— session-aware timeline 分页.
 //! - `POST /api/sync`                   —— 统一轮询 (sessions + rounds + timeline diff).
+//! - `GET /api/search?q=<text>`         —— 会话文本搜索 (#317; 算法在 `dag::search`,
+//!   薄壳 handler 在 `api/search.rs`).
 //! - `GET /api/events`                  —— SSE 失效通知流 (DAG 变更 poke; 事件只说
 //!   "变了", 数据以 /api/sync 为 SSOT, 见 `api/events.rs`).
 //! - `GET /api/secrets`                 —— effective secret 列表.
@@ -71,6 +73,9 @@ pub fn router() -> Router<AppState> {
         .route("/api/sessions", get(api::list_sessions))
         .route("/api/sessions/{sid}/timeline", get(api::session_timeline))
         .route("/api/sync", post(api::sync))
+        // 会话文本搜索 (#317): 服务端扫描 + Block 级 memoize; cap/预算红线在
+        // dag::search, 验证薄壳在 api::search.
+        .route("/api/search", get(api::search))
         // SSE 失效通知 (rt-push): OIDC 模式下与整个 web::router() 同受
         // login_required 保护 (同源 EventSource 带 cookie, 兼容).
         .route("/api/events", get(api::events))

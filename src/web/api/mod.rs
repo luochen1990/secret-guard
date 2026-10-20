@@ -38,6 +38,7 @@ pub(crate) mod events;
 pub(crate) mod privacy_scan;
 pub(crate) mod providers;
 pub(crate) mod records;
+pub(crate) mod search;
 pub(crate) mod secrets;
 pub(crate) mod sessions;
 pub(crate) mod settings;
@@ -56,6 +57,7 @@ pub use providers::{
     set_provider_decision, update_provider, update_provider_probe,
 };
 pub use records::get_record;
+pub use search::search;
 pub use secrets::{
     create_secret, delete_secret, list_secrets, reset_secret_override, set_secret_decision,
     update_secret,
