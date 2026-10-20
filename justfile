@@ -127,7 +127,7 @@ check-webui-syntax:
     node --check "$script"
     echo "webui-syntax: OK ($lines lines)"
 
-# playwright 前置守卫 (私有, check-webui-freshness / check-webui 共用的 SSOT):
+# playwright 前置守卫 (私有, check-webui 正主使用的 SSOT):
 # PATH 上的 `playwright` 必须支持 `test` 子命令。存在性之外还校验**能力** —
 # 用户级 profile 常驻同名 Python 变体 (无 `test` 子命令), 未进 devShell 裸跑
 # `just check` 时会抢先解析 (2026-10-18 主工作区实证), 让 freshness 门卫以误导性
@@ -135,6 +135,9 @@ check-webui-syntax:
 # 不能用 `playwright test --help` 的退出码 — Python 变体对未知子命令打 stderr
 # 后**退出码仍是 0** (实测), 只有命令清单能可靠区分。准确报错 + 修复动作,
 # 同 rc=127 前置守卫的先例 (纯 CLI 解析, 不启动浏览器/测试)。
+# 注意: check-webui-freshness 不经本守卫 — 它是阻塞 check 链成员, 对裸 shell
+# 有 WARN+跳过的降级孪生判定 (见该 recipe 头注, 2026-10-20); 本守卫保持硬失败
+# (check-webui 正主的存在意义就是跑 Playwright, 裸 shell 失败给出准确指引是对的)。
 _require-playwright-test:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -159,10 +162,26 @@ _require-playwright-test:
 #      P0/P2 共享持久卷下 P0 的 debug 旧产物不得压过更新候选 — #314 review 发现的潜伏缺陷).
 # `--list` 只加载 config 不跑测试/webServer, 秒级返回.
 #
-# 前置守卫 (playwright 存在性 + test 能力) 见 `_require-playwright-test` (recipe 依赖).
-check-webui-freshness: _require-playwright-test
+# 前置能力检测与 `_require-playwright-test` 同源 (命令清单 grep — Python 变体退出码
+# 不可信), 但**不经 recipe 依赖**: 本 recipe 是阻塞 check 链成员, 裸 shell (用户 profile
+# 的 Python 变体 playwright 抢占 PATH — 2026-10-20 主工作区实证) 下 WARN+跳过而非硬失败,
+# 让裸 shell `just check` 可完整跑通 — 与 7760d3d (fmt 钉 config 防裸 shell 假失败) 和
+# check-fmt 的 runner 降级同型。CI (CI=true, vm-nix 契约 playwright-test 恒在) 与 devShell
+# 内**阻塞语义不变**: 缺失即真故障, 硬失败。check-webui 正主仍走 _require-playwright-test
+# 硬守卫 (跑 Playwright 是其存在意义)。
+check-webui-freshness:
     #!/usr/bin/env bash
     set -euo pipefail
+    if ! command -v playwright >/dev/null 2>&1 \
+       || ! playwright --help 2>&1 | grep -qE '^  test '; then
+        if [ "${CI:-}" != "true" ]; then
+            echo "check-webui-freshness: WARN — 本环境无 playwright-test ($(command -v playwright 2>/dev/null || echo 'PATH 无 playwright')), 跳过 freshness 钉子" >&2
+            echo "  (CI/devShell 内完整执行; 完整链: nix develop --impure -c bash -c 'just check')" >&2
+            exit 0
+        fi
+        echo "check-webui-freshness: FAILED — CI 环境缺 playwright-test (vm-nix 契约被破坏?)" >&2
+        exit 1
+    fi
     tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"' EXIT
     # 假 binary 内容无关紧要 — 两个场景都在 config 加载期结束, binary 从未真正执行.

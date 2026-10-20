@@ -449,7 +449,9 @@ nix develop --impure      # 进入 devShell (工具链全家桶; nix fmt 仅 dev
 # 验证链 (命令全集见 justfile / `just --list`, 此处只列高频入口)
 just check                # 一键 check (全量档 --features oidc,consistency-check): fmt + clippy + machete + doc + nextest + typos + deny-offline
                           #   链内含 check-webui-syntax (index.html 内嵌 JS 语法) 与
-                          #   check-webui-freshness (Playwright 被测 binary 新鲜度门卫钉子, #314) 与
+                          #   check-webui-freshness (Playwright 被测 binary 新鲜度门卫钉子, #314;
+                          #     裸 shell 无 playwright-test (如 Python 变体抢占 PATH) 时 WARN+跳过,
+                          #     CI/devShell 内阻塞语义不变) 与
                           #   check-contracts (contracts.md property 落地标注 lint, #144);
                           #   doctest 在链 (cargo test --doc, 复用 debug 产物 <1s; 唯一
                           #   doctest 被 ```ignore 不执行但链路保持通, 新增即时生效, #357)
