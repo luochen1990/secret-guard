@@ -16,6 +16,8 @@
 //! 同协议 restore 模式与跨协议 + redact 模式下, BlockDelta 经调用方注入的
 //! [`StreamRestoreHook`] 处理跨 chunk mock 边界 (hook 由 proxy 层注入, 让本模块
 //! 不依赖 redact — 解除 codec ⇄ redact 模块级循环, 见 #145 偏差 2).
+//! `BlockStart{ToolUse}` 的 id/name (单事件内完整到达) 经 hook 的 `restore_inline`
+//! 就地还原 — 调用点在任何 writer 调用之前 (见 `translate_event` 内时序注记).
 //!
 //! # chunk-boundary
 //!
@@ -33,7 +35,7 @@ use super::reassembler::SseReassembler;
 use super::{SSE_DONE_FRAME, reframe_sse};
 use crate::codec::{
     Protocol, Reader, Writer,
-    ir::{IrDelta, IrStreamEvent, StreamDecodeState, StreamEncodeState},
+    ir::{IrBlockMeta, IrDelta, IrStreamEvent, StreamDecodeState, StreamEncodeState},
 };
 
 // ─── StreamRestoreHook: restore 能力的接口倒置 (codec 不依赖 redact) ──────────
@@ -58,7 +60,8 @@ use crate::codec::{
 /// - [`Self::flush_all`]: 流终止 / MessageStop 兜底: 冲刷**所有** index 的残余,
 ///   按 index 升序返回 (客户端假设 delta 按 index 顺序到达).
 /// - [`Self::restore_inline`]: 就地还原完整出现在单个 event 内的字符串
-///   (MessageDelta.stop_sequence / Error message; 无跨 chunk 边界问题).
+///   (`BlockStart{ToolUse}` 的 id/name / MessageDelta.stop_sequence / Error
+///   message; 无跨 chunk 边界问题).
 pub trait StreamRestoreHook: Send {
     /// 还原一段 delta 内容 (跨 chunk 安全), 返回可安全 emit 的部分.
     fn restore_delta(&mut self, index: usize, kind: DeltaKind, s: String) -> String;
@@ -351,6 +354,28 @@ impl StreamTranslate {
                 }
             }
 
+            // ToolUse id/name restore (RED-7 范围扩展, 2026-10): 与非流式
+            // `restore_ir_response` 的叶子扫描面对齐 — 请求侧 redact 会给历史
+            // tool_use 的 id/name 换 mock, 上游回显工具调用时 mock 流回, 必须还原.
+            // id/name 在单个事件内完整到达 (SSE 帧先整帧重组才 parse, 三个 reader
+            // 均如此), 走 restore_inline (与非流式同一 matcher, 无跨 chunk 边界).
+            //
+            // 时序关键: 必须在**任何 writer 调用之前**执行 — 下方跨协议跳过过滤
+            // 探测与真正 emit 都会调用 ingress writer, Responses writer 的 encode
+            // state 首次注册即锁定 accum.call_id/name (幂等契约 = 不覆盖). 放在
+            // 探测之后会让探测注册 mock id/name, done 族帧 (output_item.done /
+            // response.completed 的 output 重建) 从 accum 合成出 mock → 增量帧
+            // real / done 帧 mock 不一致 + mock 泄漏到客户端.
+            if let IrStreamEvent::BlockStart {
+                block: IrBlockMeta::ToolUse { id, name },
+                ..
+            } = &mut ev
+                && let Some(hook) = self.restore.as_mut()
+            {
+                hook.restore_inline(id);
+                hook.restore_inline(name);
+            }
+
             // 跨协议模式的跳过 block 配对过滤 (仅对 writer 主动跳过 BlockStart 的
             // index 生效; 见结构体文档 "配对过滤" 段). BlockDelta 不在过滤范围:
             // OpenAI writer 对 Text BlockStart 返回空 Vec 是结构性隐式, delta 仍是
@@ -407,6 +432,7 @@ impl StreamTranslate {
             //   - BlockStop: 先 flush 该 block 的尾部 buffer, emit 一个同 kind 的 BlockDelta.
             //   - MessageStop: flush 所有残留 restorers (上游异常漏发 BlockStop 时的兜底).
             //   - 其它: 走 restore_event_inplace (BlockDelta 内部走 sliding window).
+            //     (BlockStart{ToolUse} 的 id/name 已在上方 writer 调用前就地还原.)
             // 跨协议模式 (hook 不存在): 不做 restore, 直接 emit.
             if let Some(hook) = self.restore.as_mut() {
                 let hook = hook.as_mut();
@@ -803,6 +829,184 @@ mod tests {
             last_content < finish_reason,
             "content chunk after finish_reason is illegal OpenAI wire order \
              (skipped-block tail must flush at BlockStop, not at finish): {client}"
+        );
+    }
+
+    /// RED-7 范围扩展 (2026-10): 同协议 restore 模式下, `BlockStart{ToolUse}` 的
+    /// id/name 含 mock 时必须还原 — 与非流式 `restore_ir_response` 的叶子扫描面
+    /// 对齐 (请求侧 redact 会给历史 tool_use 的 id/name 换 mock, 上游回显工具
+    /// 调用时 mock 流回). id/name 在单个事件内完整到达 (SSE 帧先整帧重组才
+    /// parse), 走 restore_inline 与非流式同一 matcher. 修复前: restore 只覆盖
+    /// BlockDelta 文本载荷, BlockStart 落入 `_ => {}`, mock 原样到客户端.
+    #[test]
+    fn same_proto_restore_restores_tool_use_block_start_id_name() {
+        use crate::redact::RedactionMap;
+
+        let real = "sk-real-toolu-77";
+        let mock = "MOCKtoolu";
+        let mut map = RedactionMap::default();
+        map.insert(real.to_string(), mock.to_string(), "id-toolu")
+            .expect("single mock no conflict");
+
+        let mut t = StreamTranslate::new_same_proto_restore(
+            Protocol::Anthropic,
+            Box::new(crate::redact::StreamingRestorerSet::new(map)),
+        );
+        // Anthropic egress 流: tool_use block 的 id 与 name 都嵌 mock.
+        let frame = |event: &str, data: &str| format!("event: {event}\ndata: {data}\n\n");
+        let sse = [
+            frame(
+                "message_start",
+                r#"{"type":"message_start","message":{"id":"msg_01tu","type":"message","role":"assistant","content":[],"model":"claude-3","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":5,"output_tokens":1}}}"#,
+            ),
+            frame(
+                "content_block_start",
+                &format!(
+                    r#"{{"type":"content_block_start","index":0,"content_block":{{"type":"tool_use","id":"toolu_{mock}","name":"run_{mock}","input":{{}}}}}}"#
+                ),
+            ),
+            frame(
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#,
+            ),
+            frame("content_block_stop", r#"{"type":"content_block_stop","index":0}"#),
+            frame(
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":3}}"#,
+            ),
+            frame("message_stop", r#"{"type":"message_stop"}"#),
+        ]
+        .concat();
+        let out = t.feed(sse.as_bytes());
+        let finish = t.finish();
+        let combined = [out, finish].concat();
+        let client = String::from_utf8_lossy(&combined);
+
+        assert!(
+            client.contains(&format!("\"id\":\"toolu_{real}\"")),
+            "tool_use id must be restored to real: {client}"
+        );
+        assert!(
+            client.contains(&format!("\"name\":\"run_{real}\"")),
+            "tool_use name must be restored to real: {client}"
+        );
+        assert!(!client.contains(mock), "mock must not leak: {client}");
+    }
+
+    /// RED-7 范围扩展 (2026-10): 跨协议 o→r + restore 下, `BlockStart{ToolUse}`
+    /// 的 id/name restore 必须发生在**任何 writer 调用之前** — Responses writer
+    /// 的跳过过滤探测 (translate_event 跨协议分支) 首次注册即锁定 accum.call_id/
+    /// name (幂等契约 = 不覆盖). 若 restore 放在探测之后: 探测注册 mock id/name,
+    /// done 族帧 (`output_item.done` / `response.completed` 的 output 重建) 从
+    /// accum 合成出 mock → 增量帧 real / done 帧 mock 不一致 + mock 泄漏. 本测试
+    /// 逐帧断言 added **与** done / completed 三处的 call_id/name 均为 real.
+    #[test]
+    fn cross_proto_responses_ingress_restores_tool_use_id_name_in_added_and_done() {
+        use crate::redact::RedactionMap;
+        use serde_json::json;
+
+        let real = "sk-real-fcid-88";
+        let mock = "MOCKfcid";
+        let mut map = RedactionMap::default();
+        map.insert(real.to_string(), mock.to_string(), "id-fcid")
+            .expect("single mock no conflict");
+
+        let mut t = StreamTranslate::new_cross_proto(
+            Protocol::OpenAIResponses, // ingress
+            Protocol::OpenAI,          // egress
+            Some(Box::new(crate::redact::StreamingRestorerSet::new(map))),
+        )
+        .expect("ingress != egress");
+        // OpenAI egress 流: tool_call 开始 chunk 的 id 与 name 都嵌 mock, 随后
+        // arguments delta (含 mock, 常规内容流路径) + finish.
+        let chunk = |delta: serde_json::Value, finish: serde_json::Value| {
+            format!(
+                "data: {}\n\n",
+                json!({
+                    "id":"chatcmpl-tu","object":"chat.completion.chunk","created":1700000000,
+                    "model":"gpt-4o","choices":[{"index":0,"delta":delta,"finish_reason":finish}]
+                })
+            )
+        };
+        let sse = [
+            chunk(
+                json!({"role":"assistant","tool_calls":[{"index":0,"id":format!("call_{mock}"),
+                    "type":"function","function":{"name":format!("run_{mock}"),"arguments":""}}]}),
+                serde_json::Value::Null,
+            ),
+            chunk(
+                json!({"tool_calls":[{"index":0,"function":{"arguments":format!(r#"{{"k":"{mock}"}}"#)}}]}),
+                serde_json::Value::Null,
+            ),
+            chunk(json!({}), json!("tool_calls")),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        let out = t.feed(sse.as_bytes());
+        let finish = t.finish();
+        let combined = [out, finish].concat();
+        let client = String::from_utf8_lossy(&combined);
+
+        // no mock leak (覆盖 added / delta / done / completed 全部帧).
+        assert!(!client.contains(mock), "mock must not leak: {client}");
+
+        // 三处逐帧断言: added / done / completed 的 call_id+name 均为 real.
+        let real_call_id = format!("call_{real}");
+        let real_name = format!("run_{real}");
+        let frames = parse_frames(&client);
+        let mut checked_added = false;
+        let mut checked_done = false;
+        let mut checked_completed = false;
+        for (et, data) in &frames {
+            match et.as_str() {
+                "response.output_item.added" => {
+                    let item = &data["item"];
+                    assert_eq!(
+                        item["call_id"].as_str(),
+                        Some(real_call_id.as_str()),
+                        "added frame call_id must be real: {client}"
+                    );
+                    assert_eq!(
+                        item["name"].as_str(),
+                        Some(real_name.as_str()),
+                        "added frame name must be real: {client}"
+                    );
+                    checked_added = true;
+                }
+                "response.output_item.done" => {
+                    let item = &data["item"];
+                    assert_eq!(
+                        item["call_id"].as_str(),
+                        Some(real_call_id.as_str()),
+                        "done frame call_id must be real (accum registered pre-probe): {client}"
+                    );
+                    assert_eq!(
+                        item["name"].as_str(),
+                        Some(real_name.as_str()),
+                        "done frame name must be real (accum registered pre-probe): {client}"
+                    );
+                    checked_done = true;
+                }
+                "response.completed" => {
+                    let item = &data["response"]["output"][0];
+                    assert_eq!(
+                        item["call_id"].as_str(),
+                        Some(real_call_id.as_str()),
+                        "completed output call_id must be real (rebuilt from accum): {client}"
+                    );
+                    assert_eq!(
+                        item["name"].as_str(),
+                        Some(real_name.as_str()),
+                        "completed output name must be real (rebuilt from accum): {client}"
+                    );
+                    checked_completed = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            checked_added && checked_done && checked_completed,
+            "expected added/done/completed frames all present: {client}"
         );
     }
 }

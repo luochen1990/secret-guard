@@ -58,6 +58,12 @@
 //!   [`StreamingRestorer`] 在任意 chunk 切分下保证 round-trip identity —
 //!   `concat(push(c_1), push(c_2), ..., push(c_n), flush().1)` 严格等于
 //!   `content.replace(mock, real)`. UTF-8 安全 (多字节字符不在 char boundary 中间切).
+//!   范围与非流式叶子扫描面对齐 (2026-10 扩展, RED-7): 除内容字节流 (滑窗) 外,
+//!   单事件内完整到达的字符串 — `BlockStart{ToolUse}` 的 id/name /
+//!   `MessageDelta.stop_sequence` / `Error` message — 经
+//!   [`StreamingRestorerSet`] 的 `restore_inline` (trait
+//!   `crate::codec::stream::StreamRestoreHook` 方法) 就地还原 (与非流式同一
+//!   matcher, 分派在 codec `StreamTranslate`, 见其 translate_event 时序注记).
 //! - **C8 JSON 叶子级兜底 restore (fallback restorability)**: codec 无法 parse 上游
 //!   响应时 (reader 拒绝 / 非 JSON body), [`restore_json_leaves_fallback`] 以
 //!   "parse 为 JSON Value + 字符串值叶子替换" 兜底还原 mock, 尽力不让 mock 逃逸到
@@ -703,10 +709,16 @@ pub use crate::codec::stream::DeltaKind;
 ///
 /// # Scope / Out of scope
 ///
-/// - 处理 [`IrDelta::TextDelta`](crate::codec::ir::IrDelta::TextDelta) 和
-///   [`IrDelta::InputJsonDelta`](crate::codec::ir::IrDelta::InputJsonDelta) (内容字节流).
-/// - 不处理 `MessageDelta.stop_sequence` / `IrStreamEvent::Error`
-///   (单 event 完整, 直接 `restore_str_inplace`).
+/// - 处理 [`IrDelta::TextDelta`](crate::codec::ir::IrDelta::TextDelta) /
+///   [`IrDelta::InputJsonDelta`](crate::codec::ir::IrDelta::InputJsonDelta) /
+///   [`IrDelta::ReasoningDelta`](crate::codec::ir::IrDelta::ReasoningDelta)
+///   (内容字节流, per-block 滑窗).
+/// - 单事件内完整到达的字符串 (`BlockStart{ToolUse}` 的 id/name /
+///   `MessageDelta.stop_sequence` / `IrStreamEvent::Error`) 不经过本类型的滑窗 —
+///   由集合层 [`StreamingRestorerSet`] 的 `restore_inline` (trait
+///   `crate::codec::stream::StreamRestoreHook` 方法) 直接
+///   `restore_str_inplace` (与非流式同一 matcher; 分派在 codec StreamTranslate,
+///   时序 = 任何 writer 调用之前, 见 translate_event 注记).
 #[derive(Debug)]
 pub struct StreamingRestorer {
     /// 预计算的替换对 (mock, real) 按 mock.len() 倒序 — push/flush 的 Text 与

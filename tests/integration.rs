@@ -1831,6 +1831,72 @@ async fn streaming_redact_restores_input_json_delta_in_tool_use() {
     );
 }
 
+/// RED-7 范围扩展 (2026-10): 流式 restore 覆盖 `BlockStart{ToolUse}` 的 id/name —
+/// 上游 tool_calls 开始 chunk 的 id 与 function.name 含 mock (LLM 回显曾被 redact
+/// 的工具调用), 客户端必须看到 real (与非流式 `restore_ir_response` 的叶子扫描面
+/// 行为对齐). 修复前: 流式 restore 只处理 BlockDelta 文本载荷, mock 原样到客户端.
+#[tokio::test]
+async fn streaming_redact_restores_tool_call_id_and_name() {
+    let real_secret = "sk-test-123";
+    let expected_mock = predict_mock(real_secret);
+    let mut upstream = spawn_mock_upstream().await;
+    let sse_body = format!(
+        concat!(
+            // 第 1 chunk: assistant role + tool_call 开始 (id 与 name 都嵌 mock).
+            "data: {{\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-4o\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"tool_calls\":[{{\"index\":0,\"id\":\"call_{mock}\",\"type\":\"function\",\"function\":{{\"name\":\"run_{mock}\",\"arguments\":\"{{}}\"}}}}]}},\"finish_reason\":null}}]}}\n\n",
+            // 第 2 chunk: finish.
+            "data: {{\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-4o\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}],\"usage\":{{\"prompt_tokens\":3,\"completion_tokens\":1,\"total_tokens\":4}}}}\n\n",
+            "data: [DONE]\n\n",
+        ),
+        mock = expected_mock,
+    );
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse_body)
+        .create_async()
+        .await;
+    let entries = vec![secret("api-key", real_secret)];
+    let secrets = test_secret_table_with(entries);
+    let upstream_client = reqwest::Client::new();
+    let records = ConversationDag::new(64, 500, 1);
+    let provider = openai_provider("oa-main", &upstream.url());
+    let proxy_url = spawn_proxy_full(vec![provider], upstream_client, records, secrets).await;
+
+    // 请求触发 redact map (real 出现在 user 消息中).
+    let body = format!(
+        r#"{{"model":"gpt-4o","stream":true,"messages":[{{"role":"user","content":"use {real_secret}"}}]}}"#
+    );
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy_url}/o/oa-main/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "status mismatch, body: {text}"
+    );
+    // 客户端应在 tool_call 的 id 与 function.name 中看到 real_secret.
+    assert!(
+        text.contains(&format!("\"id\":\"call_{real_secret}\"")),
+        "client should see real_secret in tool_call id; got: {text}"
+    );
+    assert!(
+        text.contains(&format!("\"name\":\"run_{real_secret}\"")),
+        "client should see real_secret in function name; got: {text}"
+    );
+    assert!(
+        !text.contains(&expected_mock),
+        "client should NOT see mock in tool_call id/name; got: {text}"
+    );
+}
+
 #[tokio::test]
 async fn streaming_redact_restores_when_upstream_skips_block_stop() {
     // 上游协议异常: 漏发 content_block_stop / finish_reason chunk, 直接发 message_stop / [DONE].
@@ -12549,6 +12615,87 @@ async fn responses_streaming_with_secret_hit_restores_mock() {
         &format!("the key is {expected_mock} indeed"),
         "resp_parsed (LLM view) should accumulate the mock-bearing text, got: {parsed}"
     );
+}
+
+/// RED-7 范围扩展 (2026-10): Responses 同协议流式 restore 覆盖 `BlockStart{ToolUse}`
+/// 的 id/name — 上游 function_call item 的 call_id 与 name 含 mock 时, 客户端在
+/// **三处** (output_item.added / output_item.done / response.completed 的 output
+/// 重建) 都必须看到 real: done 族帧由 Responses writer 从 encode state 首次注册的
+/// accum 派生, id/name 的 restore 必须先于任何 writer 调用 (探测/emit), 否则
+/// accum 注册 mock → done/completed 帧合成 mock (增量 real / done mock 分叉).
+#[tokio::test]
+async fn responses_streaming_restores_function_call_id_and_name() {
+    let real_secret = "sk-live-resp-secret";
+    let expected_mock = predict_mock(real_secret);
+    let mut upstream = spawn_mock_upstream().await;
+    let sse_body = format!(
+        concat!(
+            "event: response.created\n",
+            "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":1700000000,\"model\":\"gpt-5\",\"status\":\"in_progress\",\"output\":[],\"usage\":null}}}}\n\n",
+            "event: response.output_item.added\n",
+            "data: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{{\"id\":\"fc_1\",\"call_id\":\"call_{mock}\",\"type\":\"function_call\",\"name\":\"run_{mock}\",\"arguments\":\"\",\"status\":\"in_progress\"}}}}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {{\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"output_index\":0,\"delta\":\"{{\\\"k\\\":\\\"v\\\"}}\"}}\n\n",
+            "event: response.function_call_arguments.done\n",
+            "data: {{\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_1\",\"output_index\":0,\"arguments\":\"{{\\\"k\\\":\\\"v\\\"}}\"}}\n\n",
+            "event: response.output_item.done\n",
+            "data: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"id\":\"fc_1\",\"call_id\":\"call_{mock}\",\"type\":\"function_call\",\"name\":\"run_{mock}\",\"arguments\":\"{{\\\"k\\\":\\\"v\\\"}}\",\"status\":\"completed\"}}}}\n\n",
+            "event: response.completed\n",
+            "data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":5,\"total_tokens\":15}}}}}}\n\n",
+        ),
+        mock = expected_mock,
+    );
+    let _m = upstream
+        .mock("POST", "/v1/responses")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse_body)
+        .expect(1)
+        .create_async()
+        .await;
+    let resp = provider_with("resp-main", Protocol::OpenAIResponses, &upstream.url());
+    let proxy_url = spawn_proxy_full(
+        vec![resp],
+        reqwest::Client::new(),
+        ConversationDag::new(64, 500, 1),
+        test_secret_table_with(vec![secret("api-key", real_secret)]),
+    )
+    .await;
+    let body = format!(r#"{{"model":"gpt-4o","stream":true,"input":"key {real_secret}"}}"#);
+    let (status, text, _) =
+        proxy_request(&proxy_url, "POST", "/r/resp-main/v1/responses", &body, &[]).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "redact-hit streaming must succeed: {text}"
+    );
+
+    // 三处逐一断言: added / done / completed 的 call_id + name 均为 real, 且整流
+    // 无 mock 残留. real 形态精确匹配 writer 的紧凑 JSON 输出.
+    let real_call_id = format!("\"call_id\":\"call_{real_secret}\"");
+    let real_name = format!("\"name\":\"run_{real_secret}\"");
+    assert!(
+        text.contains(&real_call_id) && text.contains(&real_name),
+        "client should see real call_id/name in function_call frames; got: {text}"
+    );
+    // 每个值恰好出现 3 次 = output_item.added / output_item.done / response.completed
+    // 的 output 重建 (done 族从 accum 派生 — 若 restore 晚于 writer 注册, 此处
+    // 少于 3 或出现 mock).
+    assert_eq!(
+        text.matches(&real_call_id).count(),
+        3,
+        "call_id should appear in added/done/completed exactly 3 times; got: {text}"
+    );
+    assert_eq!(
+        text.matches(&real_name).count(),
+        3,
+        "name should appear in added/done/completed exactly 3 times; got: {text}"
+    );
+    assert!(
+        !text.contains(&expected_mock),
+        "client must NOT see mock {expected_mock}; got: {text}"
+    );
+    _m.assert_async().await;
 }
 
 #[tokio::test]

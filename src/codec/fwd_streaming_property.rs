@@ -63,6 +63,8 @@
 //! 生成器覆盖:
 //! - text delta (连续多 chunk, 含 mock)
 //! - tool_use input JSON 部分片段 (InputJsonDelta, 含 mock)
+//! - tool_use id/name (mock 嵌入 BlockStart 的 id 与 name, RED-7 范围扩展 2026-10 —
+//!   三个生成器对齐嵌入)
 //! - include_usage chunk (terminal usage, choices=[])
 //! - 跨字段重复 mock (mock 出现在多个 text delta + tool input)
 //! - 流式 chunk 任意切分 (1-byte 切分 + 随机切分点)
@@ -362,6 +364,9 @@ fn build_redaction_map(real: &str, mock: &str) -> RedactionMap {
 ///    .replace(mock, real) (思考原文是 secret 可能泄漏的位置, 必须与 text 同样 restore).
 /// 5. **usage output fidelity**: 客户端 usage.output_tokens == 上游 (允许 input_tokens
 ///    backfill, 故只比较 output_tokens).
+/// 6. **tool_use id/name fidelity** (RED-7 范围扩展, 2026-10): 客户端 BlockStart 的
+///    (id, name) 列表 == 上游列表逐项 .replace(mock, real) — 与非流式叶子扫描面
+///    对齐 (生成器把 mock 嵌入 tool id/name).
 ///
 /// 注: chunk 结构重组 (StreamingRestorer sliding window 拆/并 chunk) 不影响语义,
 /// 此断言用拼接后的完整文本比较, 吸收 chunk 边界差异.
@@ -433,6 +438,22 @@ fn assert_streaming_restore_fidelity(
         client_usage,
         upstream_usage,
         "FWD-1 流式 usage.output_tokens fidelity 违反",
+    );
+
+    // 6. tool_use id/name fidelity (RED-7 范围扩展): 客户端 BlockStart 的
+    //    (id, name) 列表 == 上游列表逐项 .replace(mock, real).
+    let upstream_tools = collect_tool_use_ids_names(upstream);
+    let client_tools = collect_tool_use_ids_names(client);
+    let expected_tools: Vec<(String, String)> = upstream_tools
+        .into_iter()
+        .map(|(id, name)| (id.replace(mock, real), name.replace(mock, real)))
+        .collect();
+    prop_assert_eq!(
+        client_tools,
+        expected_tools,
+        "RED-7 流式 tool_use id/name fidelity 违反\nmock={:?}, real={:?}",
+        mock,
+        real,
     );
     Ok(())
 }
@@ -694,7 +715,10 @@ fn arb_openai_sse_stream_with_mock() -> impl Strategy<Value = (Vec<u8>, String, 
             // 走 Value 层, restore 在 parse 后叶子, 转义由各层正确处理.
             let mock = format!("MOCK{mock_body}");
             let real = format!("sk-real-{mock_body}");
-            let tc_id = format!("call_{tc_id_body}");
+            // mock 嵌入 tool_call id 与 name (RED-7 范围扩展: BlockStart{ToolUse} 的
+            // id/name 经 restore_inline 还原 — LLM 回显曾被 redact 的工具调用场景).
+            let tc_id = format!("call_{tc_id_body}_{mock}");
+            let tool_name = format!("{tool_name}_{mock}");
 
             let mut frames: Vec<String> = Vec::new();
 
@@ -802,6 +826,9 @@ fn arb_anthropic_sse_stream_with_mock() -> impl Strategy<Value = (Vec<u8>, Strin
             |(mock_body, text_prefix, tool_name, tu_id, has_second_text, has_usage)| {
                 let mock = format!("MOCK{mock_body}");
                 let real = format!("sk-real-{mock_body}");
+                // mock 嵌入 tool_use id 与 name (RED-7 范围扩展, 与 openai 生成器对齐).
+                let tool_name = format!("{tool_name}_{mock}");
+                let tu_id = format!("{tu_id}_{mock}");
 
                 let mut frames: Vec<String> = Vec::new();
 
@@ -986,7 +1013,11 @@ fn arb_responses_sse_stream_with_mock()
                 // openai/anthropic 生成器同款轴).
                 let mock = format!("MOCK{mock_body}");
                 let real = format!("sk-real-{mock_body}");
-                let call_id = format!("call_{call_id_body}");
+                // mock 嵌入 call_id 与 name (RED-7 范围扩展, 与 openai/anthropic 生成器
+                // 对齐); wire 帧与 expected_scan (StreamScan 是 LLM 视角, 刻意保留
+                // mock) 共用同一值 — 两处手写漂移只会造成 STR-2 假红.
+                let call_id = format!("call_{call_id_body}_{mock}");
+                let tool_name = format!("{tool_name}_{mock}");
                 // 身份/时戳常量单一来源 (wire JSON 与 expected IrResponse 共用, 与
                 // 下方 u_in/u_out 同型 — 两处手写漂移只会造成 STR-2 假红).
                 let (resp_id, resp_model, resp_created) = ("resp_1", "gpt-5", 1700000000u64);
@@ -1896,13 +1927,18 @@ fn assert_cross_proto_content_fidelity_with(
         String::from_utf8_lossy(client),
     );
 
-    // tool_use id/name fidelity (跨协议 tool_use 身份透传).
+    // tool_use id/name fidelity (跨协议 tool_use 身份透传; RED-7 范围扩展后 restore
+    // 版经 expect 映射 — mock 嵌入 id/name 的场景由各生成器覆盖).
     // 守卫 FWD-3 建模范围内的 tool_use (id + name + input) 完整保留, 不仅是 input JSON.
     let upstream_tools = collect_tool_use_ids_names(upstream);
+    let expected_tools: Vec<(String, String)> = upstream_tools
+        .into_iter()
+        .map(|(id, name)| (expect(&id), expect(&name)))
+        .collect();
     let client_tools = collect_tool_use_ids_names(client);
     prop_assert_eq!(
         client_tools,
-        upstream_tools,
+        expected_tools,
         "STR-1×FWD-3 流式 tool_use id/name fidelity 违反 (跨协议 tool 身份损失)"
     );
 
