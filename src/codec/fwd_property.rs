@@ -157,11 +157,12 @@ proptest! {
 
     /// FWD-2 (Anthropic 响应): wire → IR → wire' 语义保留.
     ///
-    /// 当前已知失败: L8 (usage 字段位置: 顶层 input_tokens vs usage.input_tokens;
-    /// writer 多出 stop_sequence:null; tokens 归零).
-    /// 等 IrUsage 重构后启用.
+    /// L8 已解除 (2026-10-20): 搁置根因是生成器生成协议外形态 (顶层
+    /// `input_tokens`/`output_tokens` + 缺 `stop_sequence`), 而非 writer 缺陷 —
+    /// reader/writer 对真实协议形态 (usage 嵌套 + stop_sequence 恒存在) 本就
+    /// 镜像对称. 生成器收紧至真实形态 (见 `arb_anthropic_response_value`),
+    /// 与 OpenAI 半面 (#284) 同为"归一化收敛"路线, 本 property 转正常驻.
     #[test]
-    #[ignore = "L8: usage 字段位置迁移 + stop_sequence:null, 待 IrUsage 重构"]
     fn anthropic_response_preserves_wire_semantics(v in arb_anthropic_response_value()) {
         let ir = AnthropicReader.read_response(&v).unwrap();
         let out = AnthropicWriter.write_response(&ir);
@@ -1699,26 +1700,60 @@ fn arb_anthropic_thinking_block() -> impl Strategy<Value = Value> {
     ]
 }
 
+/// FWD-2 Anthropic 响应生成器 — 只生成真实协议形态 (L8 解除, 2026-10-20):
+/// - `usage` 恒嵌套于 `usage` 对象 (真实 API 响应不存在顶层 `input_tokens`/
+///   `output_tokens` 形态 — 旧生成器曾生成之, reader 忽略 + writer 归位导致
+///   property 恒红被 `#[ignore]`, 失去保护);
+/// - `stop_sequence` 恒存在 (writer 无条件写回此字段), 值 = null 或**非空**
+///   string — 空串被 reader 的 `filter(!s.is_empty())` 归一为 None 写回 null,
+///   `""` → `null` 非等价, 不生成.
 fn arb_anthropic_response_value() -> impl Strategy<Value = Value> {
     (
         "msg_[a-z0-9]{5,15}",
         "[a-z0-9-]{3,15}",
         prop::collection::vec(arb_anthropic_response_block(), 1..3),
         arb_anthropic_stop_reason(),
-        (any::<u32>(), any::<u32>()),
+        // stop_sequence: None 生成 null (writer 对 None 写 Value::Null), Some 生成非空串.
+        prop::option::of("[a-z0-9-]{1,10}"),
+        arb_anthropic_usage(),
+    )
+        .prop_map(|(id, model, content, stop_reason, stop_sequence, usage)| {
+            json!({
+                "id": id,
+                "type": "message",
+                "role": "assistant",
+                "content": content,
+                "model": model,
+                "stop_reason": stop_reason,
+                "stop_sequence": stop_sequence,
+                "usage": usage,
+            })
+        })
+}
+
+/// L8: Anthropic `usage` 对象 (嵌套形态). cache 两维度与 [`arb_openai_usage`]
+/// 同型的 presence 保真轴 (#284 review 裁决): 缺席 / 显式 0 / n>0 三形态 —
+/// writer 对 `Some(0)` 写回显式 0 值 (而非坍缩为缺席) 的行为由 round-trip
+/// 断言覆盖. input/output 恒写 (reader `unwrap_or(0)` / writer 恒写对称).
+fn arb_anthropic_usage() -> impl Strategy<Value = Value> {
+    (
+        0u32..1_000_000,
+        0u32..1_000_000,
+        prop::option::of(prop_oneof![Just(0u32), 1u32..1_000_000]),
+        prop::option::of(prop_oneof![Just(0u32), 1u32..1_000_000]),
     )
         .prop_map(
-            |(id, model, content, stop_reason, (input_tokens, output_tokens))| {
-                json!({
-                    "id": id,
-                    "type": "message",
-                    "role": "assistant",
-                    "content": content,
-                    "model": model,
-                    "stop_reason": stop_reason,
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                })
+            |(input_tokens, output_tokens, cache_creation, cache_read)| {
+                let mut usage = serde_json::Map::new();
+                usage.insert("input_tokens".to_string(), json!(input_tokens));
+                usage.insert("output_tokens".to_string(), json!(output_tokens));
+                if let Some(c) = cache_creation {
+                    usage.insert("cache_creation_input_tokens".to_string(), json!(c));
+                }
+                if let Some(c) = cache_read {
+                    usage.insert("cache_read_input_tokens".to_string(), json!(c));
+                }
+                Value::Object(usage)
             },
         )
 }
@@ -1750,6 +1785,8 @@ fn arb_anthropic_stop_reason() -> impl Strategy<Value = Value> {
         Just(json!("max_tokens")),
         Just(json!("stop_sequence")),
         Just(json!("tool_use")),
+        // refusal: reader 映射 IrStopReason::Refusal, writer 写回 "refusal", 可逆.
+        Just(json!("refusal")),
     ]
 }
 

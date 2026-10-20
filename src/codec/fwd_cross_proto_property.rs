@@ -316,8 +316,9 @@ fn prop_documented_semantic_loss_list() {
         "citations",
         "logprobs",
         "prompt caching",
-        // "搁置" 段显式列出未实现的 wire fidelity 项.
-        "L8",
+        // "搁置" 段显式列出未实现的 wire fidelity 项 (L8 已解除 2026-10-20,
+        // 现存搁置项 = L2 多 system messages 合并).
+        "L2",
     ];
 
     for keyword in documented_loss_keywords {
