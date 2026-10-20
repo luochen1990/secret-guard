@@ -82,8 +82,13 @@ GET    /api/search?q=<text>            → {hits[{session_id, node_id, role, pre
                                                    一轮至多一条 hit; truncated = cap(200)
                                                    或扫描预算(50ms) 提前停止, "可能还有
                                                    更多" 而非精确计数; q 缺失/空/超长
-                                                   (>512 chars) → 400. 算法/性能设计 SSOT
-                                                   见 `src/dag/search.rs` 头部)
+                                                   (>512 chars) → 400; **SEC-1 出站脱敏**:
+                                                   匹配在 real 侧, 但 snippet/preview 在
+                                                   dag 层 DTO 边界 apply real→mock
+                                                   (event 快照重建映射, 漂移 SEC-10 抑制),
+                                                   响应不回显 q; 搜 mock 字节不命中.
+                                                   算法/性能/脱敏 SSOT 见 `src/dag/search.rs`
+                                                   头部)
 GET    /api/secrets
 POST   /api/secrets
 PUT    /api/secrets/{id}

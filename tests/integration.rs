@@ -16328,3 +16328,103 @@ async fn auto_protect_strips_disabled_static_key_header_when_auth_disabled() {
         "disabled-but-known sg token must still be stripped from Authorization; got: {resp_body}"
     );
 }
+
+// ─── 会话文本搜索: SEC-1 出站脱敏 (#317 集成验证) ────────────────────────────
+
+/// SEC-1: /api/search 的响应字节面不得含真实 secret — BlockPool 持 real 侧明文
+/// (view.rs "内存明文存量面" 红线), snippet 若直出 real 叶子即泄漏. 匹配可以在
+/// real 侧进行 (hit 计数/定位是服务端内部行为), 但 snippet/preview 等一切回传
+/// 文本必须 apply real→mock (与 timeline delta 同款 derive+apply, 见
+/// `redact::rebuild_real_to_mock_pairs`); 响应不回显 q (搜 secret 子串本身也不
+/// 得把 secret 带回来).
+#[tokio::test]
+async fn web_api_search_never_leaks_real_secret_sec1() {
+    let mut upstream = spawn_mock_upstream().await;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    let real_secret = "sk-leak-sec1-4b7c93ae57d2f018";
+    let records = ConversationDag::new(64, 500, 1);
+    let records_handle = records.clone();
+    let secrets = test_secret_table_with(vec![secret("sid-sec1", real_secret)]);
+    let proxy_url = spawn_proxy_full(
+        vec![openai_provider("oa-main", &upstream.url())],
+        reqwest::Client::new(),
+        records,
+        secrets,
+    )
+    .await;
+
+    // marker 与 secret 同叶子: snippet 窗口必然覆盖 secret 字节 (最狠场景 —
+    // 搜 marker 也不得把 real secret 带进 snippet).
+    let body = format!(
+        r#"{{"model":"test-model-abc","messages":[{{"role":"user","content":"sec1-marker-alpha {real_secret} tail text here"}}]}}"#
+    );
+    let _ = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        &body,
+        &[],
+    )
+    .await;
+    wait_until_or_timeout(
+        &records_handle,
+        |l| l.first().map(|r| r.resp_complete).unwrap_or(false),
+        Duration::from_secs(2),
+    )
+    .await;
+
+    let client = reqwest::Client::new();
+    // ① 搜 secret 自身的子串: 命中在 real 侧发生 (hits 非空), 但响应字节面
+    // 不得含 real secret (含 q 回显路径 — 响应无 q 回显).
+    let resp = client
+        .get(format!("{proxy_url}/api/search"))
+        .query(&[("q", "leak-sec1-4b7c93ae")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let raw = resp.text().await.unwrap();
+    let v: serde_json::Value = serde_json::from_str(&raw).expect("response must be valid JSON");
+    let hits = v.get("hits").and_then(|h| h.as_array()).unwrap();
+    assert!(
+        !hits.is_empty(),
+        "matching happens real-side; hit must exist"
+    );
+    assert!(
+        !raw.contains(real_secret),
+        "SEC-1 violation: real secret in /api/search response body: {raw}"
+    );
+
+    // ② 搜 marker (与 secret 同叶子): snippet 窗口含 secret 段 → 必须呈现 mock
+    // (redact 确实发生的场景), 绝不能是 real.
+    let resp = client
+        .get(format!("{proxy_url}/api/search"))
+        .query(&[("q", "sec1-marker-alpha")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let raw2 = resp.text().await.unwrap();
+    assert!(
+        !raw2.contains(real_secret),
+        "SEC-1 violation: real secret in snippet window: {raw2}"
+    );
+    // redact 已发生 ⇒ mock (与 real 等长, MockStrategy Auto) 应出现在 snippet.
+    let v2: serde_json::Value = serde_json::from_str(&raw2).unwrap();
+    let snippet = v2["hits"][0]["snippet"].as_str().unwrap_or("");
+    let real_no_prefix = real_secret.trim_start_matches("sk-");
+    assert!(
+        !snippet.contains(real_no_prefix),
+        "SEC-1 violation: real secret (prefix-stripped) in snippet: {snippet}"
+    );
+    assert!(
+        snippet.contains("sk-"),
+        "mock must appear in snippet (equal-length Auto mock keeps 'sk-' visible): {snippet}"
+    );
+}

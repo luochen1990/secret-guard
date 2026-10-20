@@ -1598,6 +1598,16 @@ pub(crate) fn apply_real_to_mock_blocks(blocks: &mut [IrBlock], pairs: &[(String
     }
 }
 
+/// [`apply_real_to_mock_messages`] 的单字符串变体 (WebUI 派生视图的独立字符串
+/// 字段用 — 如 `dag::search` 的 snippet/preview, #317 SEC-1 出站脱敏) — 与
+/// messages/blocks 变体共享 [`replace_in_place`] 同一原语, 对相同输入产相同
+/// 替换字节 (不另写一套替换逻辑)。
+pub(crate) fn apply_real_to_mock_str(s: &mut String, pairs: &[(String, String)]) {
+    for (real, mock) in pairs {
+        replace_in_place(s, real, mock);
+    }
+}
+
 // ─── 位置统计 (redact 审计, USAGE-7 治理归因) ──────────────────────────────
 
 /// 只读统计 needle 在单个字符串叶子的出现次数.

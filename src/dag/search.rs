@@ -43,6 +43,16 @@
 //! 查询路径永不 panic: 空/超长 query 在 web 层 400 (本层对空 query 返回空
 //! 结果防御), block resolve 失败按 "无文本" 处理 (skip), snippet 提取全程
 //! char-boundary 安全.
+//!
+//! # SEC-1 出站脱敏 (红线, 集成验证 #317 修复)
+//!
+//! BlockPool 持 **real 侧明文** (view.rs "内存明文存量面" 红线) — 匹配在 real
+//! 侧进行 (hit 定位/计数是服务端内部行为), 但 **snippet/preview 等一切回传文本
+//! 在 DTO 边界 apply real→mock** (与 timeline delta 同款机制: event 快照经
+//! `redact::rebuild_real_to_mock_pairs` 重建映射 + `apply_real_to_mock_str` 替换,
+//! 不另写替换逻辑); 映射漂移降级偏安全 (SEC-10): snippet 抑制 + preview 摘除.
+//! 已知语义: 用户搜 **mock 字节** (UI 里看到的替身) 不会命中 real 内容 — 匹配
+//! 语义锚定用户记忆的真实内容.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -66,6 +76,10 @@ pub(crate) const SEARCH_BUDGET: Duration = Duration::from_millis(50);
 
 /// snippet 中命中点前后各取的字符预算.
 const SNIPPET_RADIUS: usize = 40;
+
+/// redaction 映射漂移时的 snippet 占位 (SEC-10 降级偏安全, 措辞对齐
+/// `derive::placeholder_delta_messages` 的 DRIFT_PLACEHOLDER 先例).
+const DRIFT_SNIPPET: &str = "[secret-guard] snippet 已抑制: redaction 映射漂移";
 
 /// 单个 block 内的首个命中位置 (lowercase 叶子的下标 + 字节偏移).
 #[derive(Debug, Clone, Copy)]
@@ -143,13 +157,51 @@ impl ConversationDag {
                     }
                 }
                 let Some((role, h, m)) = found else { continue };
+                // SEC-1 出站脱敏 (DTO 边界, 与 timeline delta 同款机制): BlockPool
+                // 是 real 侧明文存量面 (view.rs 红线), snippet 从 real 叶子截取 —
+                // 出站前必须 apply real→mock. 映射从 node.event 的 per-request 快照
+                // 重建 (`rebuild_real_to_mock_pairs`: redactions × policy snapshot),
+                // 复用既有 derive+apply 原语; 匹配仍在 real 侧进行 (hit 定位是服务端
+                // 内部行为, 不泄漏字节). fork 同 node 双 hit 时重建两次 — ≤2×/node,
+                // 可忽略. 漂移 (None) 降级偏安全 (SEC-10, 同 timeline delta 先例):
+                // snippet 抑制为占位 + preview 摘除, 绝不让 real 因映射缺失出站.
+                let pairs = crate::redact::rebuild_real_to_mock_pairs(
+                    &node.event.redactions,
+                    &node.event.policy.secrets,
+                );
+                let (snippet, preview) = match pairs {
+                    Some(pairs) if pairs.is_empty() => {
+                        // 常态: 本请求无 secret 命中 (redactions 空) — 零替换成本.
+                        (hit_snippet(&g, h, m, &q), node.event.preview.clone())
+                    }
+                    Some(pairs) => {
+                        let mut snippet = hit_snippet(&g, h, m, &q);
+                        crate::redact::apply_real_to_mock_str(&mut snippet, &pairs);
+                        // preview 提取自 LLM 视角 body (已 redact), 本无 real 字节;
+                        // 再 apply 一遍是防御纵深 (passthrough fail_open 语义下
+                        // preview 可能来自 real 字节 — 全量替换, 残余截断不匹配项
+                        // 与既有 timeline/sync 的 preview 暴露面同界).
+                        let preview = node.event.preview.as_ref().map(|p| {
+                            let mut s = p.to_string();
+                            crate::redact::apply_real_to_mock_str(&mut s, &pairs);
+                            Arc::from(s)
+                        });
+                        (snippet, preview)
+                    }
+                    None => {
+                        tracing::warn!(
+                            node = %nid,
+                            "redaction projection drift: search hit snippet suppressed"
+                        );
+                        (DRIFT_SNIPPET.to_string(), None)
+                    }
+                };
                 hits.push(SearchHit {
                     session_id: sid,
                     node_id: nid,
                     role,
-                    preview: node.event.preview.clone(),
-                    // snippet 只对记录的 ≤MAX_HITS 条支付原文提取成本.
-                    snippet: hit_snippet(&g, h, m, &q),
+                    preview,
+                    snippet,
                     created_at: node.event.created_at,
                 });
                 if hits.len() >= MAX_HITS {
@@ -339,6 +391,34 @@ mod tests {
 
     fn ev() -> crate::dag::CallEvent {
         ev_at(Utc::now())
+    }
+
+    /// 带 redact 快照的 event (SEC-1 出站脱敏测试用): policy 含 real secret,
+    /// redactions 含 (mock, secret_id) 投影 — 与生产 push 时 recorder 填充的同型.
+    fn ev_with_redact(real: &str, mock: &str, sid: &str) -> crate::dag::CallEvent {
+        let entry = crate::secrets::SecretEntry {
+            id: sid.to_string(),
+            name: Some(sid.to_string()),
+            category: crate::mock::SecretCategory::default(),
+            value: real.to_string(),
+            value_file: None,
+            mock_strategy: crate::mock::MockStrategy::default(),
+            strategy: crate::secrets::SecretStrategy::default(),
+        };
+        let mut e = ev();
+        e.policy = Arc::new(crate::dag::PolicySnapshot {
+            secrets: Arc::from([entry]),
+        });
+        e.redactions = Arc::from([(mock.to_string(), sid.to_string())]);
+        e
+    }
+
+    /// 漂移形态的 event: redactions 有投影但 policy 快照无对应条目
+    /// (rebuild 返回 None 的场景).
+    fn ev_with_drift(mock: &str, sid: &str) -> crate::dag::CallEvent {
+        let mut e = ev();
+        e.redactions = Arc::from([(mock.to_string(), sid.to_string())]);
+        e
     }
 
     fn ts(secs: i64) -> DateTime<Utc> {
@@ -565,6 +645,69 @@ mod tests {
         assert_ne!(sids[0], sids[1]);
         // 两条 hit 指向同一个祖先 node.
         assert_eq!(r.hits[0].node_id, r.hits[1].node_id);
+    }
+
+    // ─── SEC-1 出站脱敏 (#317 集成验证修复) ────────────────────────────────
+
+    #[test]
+    fn search_snippet_applies_real_to_mock_sec1() {
+        // real 侧匹配 + 出站 apply: snippet 必须呈现 mock, 绝不携带 real 字节.
+        let real = "sk-unit-sec1-9d8e7f6a5b4c";
+        let mock = "sk-Zz9Yy8Xx7Ww6Vv5Uu4T";
+        let dag = ConversationDag::default();
+        dag.push_messages(
+            vec![text_msg(
+                IrRole::User,
+                &format!("head ctx {real} tail ctx for the window"),
+            )],
+            ev_with_redact(real, mock, "sid-sec1-unit"),
+        );
+        // ① 搜 real 的子串: 命中 (real 侧匹配), snippet 含 mock 不含 real.
+        let r = dag.search("unit-sec1-9d8e");
+        assert_eq!(r.hits.len(), 1, "real-side match must still hit");
+        assert!(
+            !r.hits[0].snippet.contains(real),
+            "SEC-1: snippet must not carry real secret: {}",
+            r.hits[0].snippet
+        );
+        assert!(
+            r.hits[0].snippet.contains(mock),
+            "snippet must present the mock: {}",
+            r.hits[0].snippet
+        );
+        // ② 搜周边文本 (secret 在 snippet 窗口内): 同样只呈现 mock.
+        let r2 = dag.search("head ctx");
+        assert_eq!(r2.hits.len(), 1);
+        assert!(!r2.hits[0].snippet.contains(real));
+        assert!(r2.hits[0].snippet.contains(mock));
+        // ③ 搜 mock 自身不命中 (匹配锚定 real 侧 — 已知语义, 见模块头 SEC-1 节).
+        assert_eq!(dag.search("Zz9Yy8Xx7").hits.len(), 0);
+    }
+
+    #[test]
+    fn search_drift_suppresses_snippet_sec10() {
+        // 映射漂移 (redactions 有投影但 policy 快照解析不出) → SEC-10 降级偏安全:
+        // snippet 抑制为占位 + preview 摘除, 绝不让 real 因映射缺失出站.
+        let real = "sk-drift-sec1-aaaa1111bbbb";
+        let dag = ConversationDag::default();
+        dag.push_messages(
+            vec![text_msg(IrRole::User, &format!("drift ctx {real} tail"))],
+            ev_with_drift("sk-mock-unused", "sid-missing-from-policy"),
+        );
+        let r = dag.search("drift ctx");
+        assert_eq!(r.hits.len(), 1);
+        assert_eq!(
+            r.hits[0].snippet, DRIFT_SNIPPET,
+            "snippet suppressed on drift"
+        );
+        assert!(
+            r.hits[0].preview.is_none(),
+            "preview withheld on drift (defense in depth)"
+        );
+        assert!(
+            !format!("{:?}", r.hits[0]).contains(real),
+            "no real bytes anywhere in the hit"
+        );
     }
 
     #[test]
