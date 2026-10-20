@@ -82,7 +82,27 @@ dev-test:
 # advisory DB), 秒级; 全量 deny (含 advisories, 需联网) 仍由 just deny 单独提供.
 #
 # --locked: 见文件头 "约定" 段 (SSOT).
+#
+# bare-shell 自愈 + fail-fast (2026-10-20 事故, 同 2026-10-19 treefmt wrapper
+# 劫持一类; 短时两复发, 提示语不足以止血, 升级为自动修复):
+# - check 链的 check-webui-freshness 依赖 devShell 的 playwright-test, 裸 shell
+#   运行时 PATH 会被系统 Python 变体 (如 /etc/profiles/.../bin/playwright) 抢占;
+#   已在 devShell 内也可能被 prepend 的坏 PATH 遮蔽。
+# - 自愈: 守卫探测将失败 + nix 可用 → 自动重入 `nix develop --impure` 再跑同一
+#   recipe (SG_CHECK_REEXEC 哨兵防循环; 重入后守卫通过即走内层)。
+# - CI runner (vm-nix, 自带 playwright-test, nix 求值被禁): 守卫探测通过 →
+#   不重入, 行为与既有完全一致; 坏环境且无 nix → 内层头守卫 fail-fast。
 check *ARGS:
+    @if [ -z "${SG_CHECK_REEXEC:-}" ] && ! just --quiet _require-playwright-test >/dev/null 2>&1 && command -v nix >/dev/null 2>&1; then \
+        echo "check: playwright 环境受损 (PATH 抢占或 devShell 缺失) — 自动重入 nix develop --impure"; \
+        exec nix develop --impure -c bash -c 'SG_CHECK_REEXEC=1 just check {{ ARGS }}'; \
+    fi
+    just _check-body {{ ARGS }}
+
+# check 的内层链 (真正的验证步骤; 公共入口的自愈判定后到达)。
+# 前置 _require-playwright-test (fail-fast): 守卫失败时立即报环境错误,
+# 不烧 fmt/clippy/doc 数分钟才在链尾暴露。
+_check-body *ARGS: _require-playwright-test
     just check-fmt
     cargo clippy --locked --all-targets {{ FULL_TIER }} -- -D warnings
     cargo machete
