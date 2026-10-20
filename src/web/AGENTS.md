@@ -278,6 +278,16 @@ warn banner. 时序边界: leak_alerts 随响应 finalize 填充 (晚于 push), 
 重发既有轮次 — 复用节点场景徽章由下次 loadTimeline 数据驱动更新, 与 usage 徽章
 同型先例; 弹窗经 GET 实时. 语义契约 contracts.md RED-10.
 
+**is_orphan (孤儿轮 "上文已截断" 徽章, CDAG-7 wire 传播)**: TimelineRound 携带
+`is_orphan` (parent 已被淘汰 = 链在此截断, 该轮之前的上下文不再可用; 判定 SSOT =
+`DagInner::is_orphan_node`, view/timeline 两侧共用), 前端两处消费 — timeline 轮次
+header 的 ⊘ 徽章 (`updateOrphanBadges` 对账, 与 leak 徽章同型同点位: 空占位
+`span[data-hdr=orphan]` + records Map 填充/清空; 可点击 → 轮次详情概览; muted 虚线
+色系 — 数据降级通知, 区别于 leak 的 warn 实线) + 轮次详情弹窗概览 tab muted 横幅
+(双源: meta record `ForwardRecord.is_orphan` ∨ 本地 timeline round). ROB: 旧后端
+undefined → false 清空. RoundBrief (sidebar 三级) 有意不携带 — 徽章仅 timeline
+消费. 语义契约 contracts.md CDAG-7.
+
 **req_delta_messages 实现** (B1): 从 BlockPool 结构化派生 (`derive::extract_delta_messages_from_blocks`)
 — `req_delta` (MessageRef, real 视角) resolve → real→mock 替换 (`redactions` 投影重建, 不含真
 实 secret 输出) → ingress writer 序列化 + 根节点 system 注入 (system 来自根节点 `system_refs`).
@@ -609,14 +619,15 @@ timeline 每轮 header 含一个 `ℹ` 详情按钮 (原 info / raw 两按钮合
 弹出双 tab 弹窗 (`openRoundDetail`, 语义契约 contracts.md UI-9):
 
 - **概览 tab (默认)**: 元数据小字段, 不含大数据. 字段三路来源: ① 本地即时渲染
-  (TimelineRound 的 id/round_role/round_kind/created_at/upstream_id/redactions/
-  usage/leak_alerts); ② 末轮 TimelineTail 的 status/elapsed/streamed/complete/
+  (TimelineRound 的 id/round_role/round_kind/created_at/is_orphan/upstream_id/
+  redactions/usage/leak_alerts); ② 末轮 TimelineTail 的 status/elapsed/streamed/complete/
   error (仅末轮, meta 到达前的即时值); ③ `GET /api/records/{id}?view=meta`
   (小响应, bodies/headers 清空) 异步补全 method/path/model/upstream_model +
   **每轮自身**的 status/elapsed/error — 历史轮不再显示 "(历史轮次)" 占位 (meta
   来自该轮 NodeView, 是每轮权威事实). meta 不缓存 (响应微小 + 在途轮状态会演进,
   每次打开取最新). 失败轮 error 非空 → 顶部红 banner; leak_alerts 非空 → warn
-  banner (#305 批2, 数据不含真值). model 是 **egress 视角** — 路由改写生效时与
+  banner (#305 批2, 数据不含真值); is_orphan → muted 横幅 "上文已截断" (CDAG-7,
+  双源 meta ∨ timeline round). model 是 **egress 视角** — 路由改写生效时与
   upstream_model 同值 (改写轮次两行显示相同值), 无改写时 = 客户端原值 (M1 走查).
 - **完整数据 tab**: 原 raw 弹窗内容 — req/resp headers + bodies (按需懒拉完整
   `GET /api/records/{id}`, 首次激活该 tab 才 fetch, 概览路径零大数据请求; 已加载
@@ -632,8 +643,9 @@ timeline 每轮 header 含一个 `ℹ` 详情按钮 (原 info / raw 两按钮合
   (切段在 escape 前原文上进行 + 切点避让 surrogate pair), 段边界处多一个视觉换行.
 - **"感叹号" 入口** (quant#305): 轮次 header 的失败状态文本 (`.status-err`,
   ERR/4xx/5xx — 仅末轮 header 存在, 非末轮状态 span 为空 [DTO-5 既有约束],
-  历史失败轮经 ℹ 按钮进入) 与 ⚠ 泄露徽章 (`.leak-badge`, 全轮) 可点击 →
-  打开同一弹窗的概览 tab (错误横幅 / leak banner 落在那里); 事件委托在
+  历史失败轮经 ℹ 按钮进入)、⚠ 泄露徽章 (`.leak-badge`, 全轮) 与 ⊘ 孤儿徽章
+  (`.orphan-badge`, 全轮, CDAG-7) 可点击 →
+  打开同一弹窗的概览 tab (错误横幅 / leak banner / 孤儿横幅落在那里); 事件委托在
   `bindRoundActions`, 先于 "点 header 选轮" 分支并 stopPropagation.
 
 ### Response 气泡渲染

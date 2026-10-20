@@ -5070,3 +5070,56 @@ test.describe("会话搜索 (#317)", () => {
     }
   });
 });
+
+test.describe("CDAG-7: 孤儿轮徽章 (is_orphan wire 传播)", () => {
+  // 前置: goto + 切回 records tab — sidebar 会话列表只在 records tab 可见
+  // (共享 context 按声明顺序执行, 前序 describe 可能停在别的 tab).
+  test.beforeEach(async ({ page }) => {
+    await page.goto("/");
+    await page.waitForLoadState("networkidle");
+    await page.locator('a.tab[data-tab="records"]').click();
+  });
+
+  test("孤儿轮: 徽章渲染 + 点击 → 概览孤儿横幅 (双源)", async ({ page }) => {
+    await sendChat(page, [{ role: "user", content: "orphan-badge-marker" }]);
+    const sid = await findSessionLeafByPreview(page, "orphan-badge-marker");
+    // 拦截 timeline 响应注入 is_orphan=true (孤儿态在公共 eviction 路径正常
+    // 不可达 — child_count 保护, 见 dag 单测白盒构造; 此处与后端淘汰机制解耦,
+    // 直喂 wire 形状锁 UI 渲染契约, 同 probe-origin 冻结形状先例).
+    await page.route("**/api/sessions/*/timeline*", async (route) => {
+      const resp = await route.fetch();
+      const data = await resp.json();
+      for (const r of data.rounds ?? []) r.is_orphan = true;
+      await route.fulfill({
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data),
+      });
+    });
+    await clickSessionByLeaf(page, sid);
+    // 轮次 header 的孤儿徽章 (muted 虚线, "上文已截断").
+    const badge = page.locator("#detail .tl-round .orphan-badge").first();
+    await expect(badge).toBeVisible();
+    await expect(badge).toContainText("context lost");
+    // 点击徽章 → 轮次详情概览 tab, 孤儿横幅 (双源: meta rec.is_orphan=false,
+    // 本地 timeline r.is_orphan=true — 任一为真即横幅).
+    await badge.click();
+    const dlg = page.locator("dialog.round-dialog");
+    await expect(dlg).toBeVisible();
+    await expect(dlg.locator(".tab-pane[data-pane='overview'] .banner-muted")).toContainText(
+      "Context lost",
+      { timeout: 5000 }
+    );
+    await dlg.locator(".dialog-close").click();
+    await page.unroute("**/api/sessions/*/timeline*");
+  });
+
+  test("正常轮: 无孤儿徽章 (占位 span 保持空)", async ({ page }) => {
+    await sendChat(page, [{ role: "user", content: "no-orphan-badge-marker" }]);
+    const sid = await findSessionLeafByPreview(page, "no-orphan-badge-marker");
+    await clickSessionByLeaf(page, sid);
+    await page.waitForTimeout(500);
+    // 正常轮 is_orphan=false → 徽章不渲染 (占位 span 空, 误报即缺陷).
+    await expect(page.locator("#detail .orphan-badge")).toHaveCount(0);
+  });
+});

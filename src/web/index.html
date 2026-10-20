@@ -992,6 +992,31 @@
       cursor: pointer;
     }
 
+    /* 孤儿轮徽章 (CDAG-7 wire 传播): is_orphan=true 的轮次 (parent 已被淘汰, 链
+       在此截断) header 渲染 — 语义 "上文已截断" (该轮之前的上下文不再可用).
+       muted 色系 + 虚线边框 (与 retry 徽章同型: 数据降级通知, 区别于 leak 的
+       warn 实线 — 视觉层级 红=错误 / warn=安全告警 / muted=降级说明).
+       同为 round header 纯增量元素 (UI-1/I2/I3 不变); 可点击 → 轮次详情概览
+       (孤儿横幅见 .banner-muted). */
+    .orphan-badge {
+      background: var(--panel);
+      border: 1px dashed var(--border-strong);
+      color: var(--fg-muted);
+      padding: 1px 8px;
+      border-radius: 999px;
+      font-size: 10.5px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    /* 孤儿横幅 (轮次详情概览 tab, CDAG-7): 与 .orphan-badge 同色系 (muted 虚线),
+       区别于默认 .banner (warn) 与 .banner.status-err (红) — 降级说明而非告警. */
+    .banner.banner-muted {
+      background: var(--panel);
+      border: 1px dashed var(--border-strong);
+      color: var(--fg-muted);
+    }
+
     /* 失败轮 "感叹号" 入口 (quant#305): 轮次 header 的 ERR/4xx/5xx 状态文本
        可点击 → 打开轮次详情弹窗 (概览 tab 含错误横幅 + 状态行). 仅限 timeline
        header 内的 .status-err (sidebar 状态列 / drawer 错误横幅不受影响). */
@@ -2596,6 +2621,8 @@
         'timeline.retryBadge': '↻ retry — identical messages',
         'timeline.leakBadge': '⚠ leak',
         'timeline.leakTip': 'Suspected leak: the model response contained the real value of secret(s): {ids}',
+        'timeline.orphanBadge': '⊘ context lost',
+        'timeline.orphanTip': 'Context lost: earlier rounds of this conversation were evicted; the context before this round is no longer available.',
         'timeline.noContent': '(no content)',
         'timeline.streamed': 'streamed',
         'timeline.viaTip': 'actual upstream provider (router-resolved chain tail)',
@@ -2643,6 +2670,7 @@
         'info.normal': 'normal',
         'info.hitsValue': '{n} hit(s)',
         'info.leakBanner': '⚠ Suspected leak — the model response contained the real value of secret(s): {ids}',
+        'info.orphanBanner': '⊘ Context lost — earlier rounds of this conversation were evicted; the context before this round is no longer available.',
         // ── raw 弹窗 ──
         'raw.requestHeaders': 'Request Headers',
         'raw.requestBody': 'Request Body',
@@ -3097,6 +3125,8 @@
         'timeline.retryBadge': '↻ 重试 — 消息完全相同',
         'timeline.leakBadge': '⚠ 疑似泄露',
         'timeline.leakTip': '疑似泄露: 模型响应中出现了以下 secret 的真值: {ids}',
+        'timeline.orphanBadge': '⊘ 上文已截断',
+        'timeline.orphanTip': '上文已截断: 该会话更早的轮次已被淘汰, 本轮之前的对话上下文不再可用。',
         'timeline.noContent': '(无内容)',
         'timeline.streamed': '流式',
         'timeline.viaTip': '实际转发到的上游 provider (路由解析的链尾)',
@@ -3144,6 +3174,7 @@
         'info.normal': '常规',
         'info.hitsValue': '{n} 次命中',
         'info.leakBanner': '⚠ 疑似泄露 — 模型响应中出现了以下 secret 的真值: {ids}',
+        'info.orphanBanner': '⊘ 上文已截断 — 该会话更早的轮次已被淘汰, 本轮之前的对话上下文不再可用。',
         // ── raw 弹窗 ──
         'raw.requestHeaders': '请求 Headers',
         'raw.requestBody': '请求 Body',
@@ -4706,7 +4737,8 @@
     //   非末轮 header 的这些字段保持空 (TimelineRound 不含 response 字段).
     //   末轮 response 在独立的 .response-drawer 中, 不在 .tl-round 内.
     //   leak_alerts (#305 批2) 同为 push 后可变字段 (finalize 填充), 经 header 的
-    //   [data-hdr="leak"] 占位 span + updateLeakBadges() 按 records 对账刷新.
+    //   [data-hdr="leak"] 占位 span + updateLeakBadges() 按 records 对账刷新;
+    //   is_orphan (CDAG-7) 同型 — [data-hdr="orphan"] + updateOrphanBadges().
     function renderTimeline() {
       const el = document.getElementById('detail');
       if (state.timelineRecords.length === 0) {
@@ -4721,6 +4753,7 @@
         // 策略 1: fingerprint 一致 → 只刷 response body (流式渐进) + 末轮 header.
         updateTimelineResponses();
         updateLeakBadges();  // records 可能被同 session loadTimeline 原地替换 (fp 不变), 徽章需按新数据对账.
+        updateOrphanBadges();  // 同上: is_orphan 同为 records 驱动的晚到对账字段.
         return;
       }
       state.lastTimelineFingerprint = fp;
@@ -4733,6 +4766,7 @@
       renderDrawer();
       updateLastRoundHeader();
       updateLeakBadges();  // 新建/复用的轮次节点统一按 records 填充 leak 徽章 (占位 span 单点消费).
+      updateOrphanBadges();  // 孤儿徽章同点位对账 (CDAG-7).
       updateResponseDrawerLayout();
       updateScrollNavVisibility();
     }
@@ -4978,9 +5012,10 @@
           return;
         }
         // 2. 警示标记 ("感叹号"入口, quant#305): 失败轮 ERR 状态文本 / ⚠ 泄露徽章
-        //    → 打开轮次详情 (错误横幅 / leak banner 落在概览 tab). 必须先于 header
-        //    兜底分支并 stopPropagation, 否则被 "点 header 选轮" 吞掉.
-        const warn = ev.target.closest('.tl-round-header .status-err, .tl-round-header .leak-badge');
+        //    / ⊘ 孤儿徽章 (CDAG-7) → 打开轮次详情 (错误横幅 / leak banner / 孤儿
+        //    横幅落在概览 tab). 必须先于 header 兜底分支并 stopPropagation, 否则被
+        //    "点 header 选轮" 吞掉.
+        const warn = ev.target.closest('.tl-round-header .status-err, .tl-round-header .leak-badge, .tl-round-header .orphan-badge');
         if (warn) {
           ev.stopPropagation();
           const rid = warn.closest('.tl-round')?.dataset.rid;
@@ -5075,6 +5110,8 @@
     //
     // 泄露警示块 (#305 批2): leak_alerts 非空 → 表格上方 warn banner 列 secret ids
     // (报警数据不含真值, SEC-1 同型). ids 经 escapeHtml 后插值 (innerHTML 路径).
+    // 孤儿横幅 (CDAG-7): is_orphan → muted banner "上文已截断" (数据降级说明,
+    // 区别于 warn — 该轮之前的上下文已被淘汰).
     // 失败轮错误 (quant#305): error 非空 → 顶部红 banner — 错误是失败轮的关键信息,
     // 混在表格行里会被淹没 (与 response drawer 的错误横幅同型). 数据源两态: 初渲染
     // 取 tail (仅末轮), meta 到达后以 ForwardRecord 为准 (全部轮次).
@@ -5117,9 +5154,13 @@
       }
       const errText = (rec || tail)?.error || '';
       const leakIds = (rec ? rec.leak_alerts : r.leak_alerts) || [];
+      // 孤儿标记 (CDAG-7) 双源: meta record (ForwardRecord.is_orphan) 或本地
+      // TimelineRound.is_orphan, 任一为真即横幅 (ROB: 旧后端 undefined → false).
+      const isOrphan = (rec?.is_orphan || r.is_orphan) || false;
       const banners =
         (errText ? `<div class="banner status-err">${t('timeline.errorBanner', { msg: escapeHtml(errText) })}</div>` : '')
-        + (leakIds.length > 0 ? `<div class="banner">${t('info.leakBanner', { ids: escapeHtml(leakIds.join(', ')) })}</div>` : '');
+        + (leakIds.length > 0 ? `<div class="banner">${t('info.leakBanner', { ids: escapeHtml(leakIds.join(', ')) })}</div>` : '')
+        + (isOrphan ? `<div class="banner banner-muted">${t('info.orphanBanner')}</div>` : '');
       // Time 与 sidebar/timeline 同一格式化函数 (SSOT, #164-2); 原始 UTC RFC3339
       // 放 title tooltip (开发者向 hover 可见).
       const tableHtml = `<table class="info-table">${Object.entries(rows).map(([k, v]) => {
@@ -5365,6 +5406,7 @@
           <span class="meta" data-hdr="elapsed"></span>
           <span data-hdr="streamed"></span>
           <span data-hdr="leak"></span>
+          <span data-hdr="orphan"></span>
           ${upstreamChip(r, pathId)}
         </span>
         <span class="tl-actions">
@@ -5480,6 +5522,44 @@
         if (!span) return; // 防御: 非本轮次模板结构 (ROB).
         const r = byId.get(el.dataset.rid);
         setLeakBadge(span, r ? (r.leak_alerts || []) : []);
+      });
+    }
+
+    // ─── 孤儿轮徽章 (CDAG-7 wire 传播) ─────────────────────────────────────
+    //
+    // 数据源: TimelineRound.is_orphan (后端读时派生: parent 有值但已被淘汰 =
+    // 链在此截断). 语义 "上文已截断" — 该轮之前的上下文不再可用, 徽章如实
+    // 标注而非让用户面对莫名缺失的前缀. muted 色系 (数据降级通知, 非告警).
+    //
+    // 为什么不直接在 renderTimelineRound 模板里渲染: 与 leak 徽章同因 — keyed
+    // reconciliation 复用既有轮次节点不重绘 header, 且 is_orphan 是 push 后可变
+    // 字段 (false→true: parent 被后续 eviction 淘汰), 模板渲染空占位 span
+    // ([data-hdr="orphan"], 同 leak 模式), 由 updateOrphanBadges 按当前
+    // state.timelineRecords 对账刷新 — 填充逻辑单点 (SSOT).
+    //
+    // 属性赋值 (textContent/title) 而非 innerHTML: 文案全部来自 i18n 字典 (ROB).
+    // 容错: 旧后端数据 → is_orphan undefined → 按 false 清空 (ROB, || false).
+    function setOrphanBadge(span, isOrphan) {
+      if (isOrphan) {
+        span.className = 'orphan-badge';
+        span.textContent = t('timeline.orphanBadge');
+        span.title = t('timeline.orphanTip');
+      } else {
+        span.className = '';
+        span.textContent = '';
+        span.removeAttribute('title');
+      }
+    }
+
+    // 对账刷新所有轮次 header 的孤儿徽章 (renderTimeline 两条路径统一调用,
+    // 与 updateLeakBadges 同点位).
+    function updateOrphanBadges() {
+      const byId = new Map(state.timelineRecords.map(r => [r.id, r]));
+      document.querySelectorAll('#detail > .tl-round').forEach(el => {
+        const span = el.querySelector('[data-hdr="orphan"]');
+        if (!span) return; // 防御: 非本轮次模板结构 (ROB).
+        const r = byId.get(el.dataset.rid);
+        setOrphanBadge(span, r ? (r.is_orphan || false) : false);
       });
     }
 
