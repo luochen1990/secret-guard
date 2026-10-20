@@ -33,6 +33,8 @@
     SQL 聚合, 派生走 `usage::summary::build_summary` 纯函数).
   - `privacy_scan.rs` — `GET /privacy-scan/alerts` 隐私扫描告警视图 (#257 S0.5;
     enabled 标志 + 已登记值过滤, 疑似明文回显的安全语义见该文件头).
+  - `settings.rs` — `GET/PUT /api/settings` WebUI 全局设置 (当前仅 audit_capture 三态
+    切换; per-request 原子语义与持久化契约 SSOT 在 `crate::state::AuditCapture`).
 - `dto.rs` (已移至顶层 `src/dto.rs`): WebUI 响应序列化 DTO (SessionView / NodeView / RoundBrief / TimelineRound / TimelineTail / TimelinePage / TimelineDiffData / SyncSnapshot). 构造逻辑留 dag 模块 (持读锁访问私有字段). 中立化理由见 `src/dto.rs` 头部 (dag 域 B 不再反向依赖 web 域 C).
 - `index.html`: 单页 UI (IM 风格: 会话折叠 sidebar + timeline 对话流, 内嵌 CSS + vanilla JS, 零外部依赖).
 
@@ -622,7 +624,7 @@ timeline 每轮 header 含一个 `ℹ` 详情按钮 (原 info / raw 两按钮合
   脱敏 (auth/cookie 等 = `<redacted>`; 名单 = 硬编码黑名单 ∪ `[redact]
   redacted_headers`, SEC-4). 流式响应的 resp_body 为空 (不保留 SSE 字节), 显示
   提示. audit_capture off 期间的请求 (`record.audit_capture_off`, B2/B3) req/resp
-  body 区段显示未捕获占位 (文案 SSOT `NOT_CAPTURED_NOTE`, 判据统一为该结构化
+  body 区段显示未捕获占位 (文案 SSOT `audit.notCapturedNote` (i18n key, helper `notCapturedNote()`), 判据统一为该结构化
   字段; 优先级高于 streamed 空态提示 — off 下非流式 body 同样未存; headers 照常
   展示). 大 body (>128KB, LLM 累积对话末轮可达 MB 级) 按 64KB 切段 +
   `content-visibility:auto` 惰性渲染 (quant#308: 巨型单 `<pre>` 的 layout+paint

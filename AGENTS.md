@@ -68,7 +68,7 @@
 - **HTTP client**: reqwest 0.12 with rustls
 - **协议无关**: body 在字节层面流动, secret 改写在 IR 层 (基于 `src/codec/ir`)
 - **双层配置**: 声明式 `secret-guard.toml` (static, 只读) + 动态 `secret-guard.state.toml`
-  (dynamic, WebUI 写回). 详尽语义见 `src/config.rs` 头部.
+  (dynamic, WebUI 写回). 详尽语义见 `src/config/mod.rs` 头部.
 - **测试**: cargo-nextest + proptest (property-based) + mockito (集成测试) + Playwright (WebUI)
 - **覆盖率**: cargo-llvm-cov (LLVM source-based, 行级精度). 细节见"测试策略".
 - **格式化**: treefmt 全仓 (nixfmt / rustfmt / taplo / ruff-format), 配置 SSOT =
@@ -376,7 +376,7 @@ Pool 不进此本地终结分支 (Router 专属) — pool 入口的 /models 经 
 |---|---|---|
 | `auth/` (模块目录: mod/oidc/handlers/session/apikey/middleware) | OIDC 登录 (WebUI, **cargo feature `oidc` 门控** — oidc/handlers/session 子模块默认不编译, apikey 路径永远在) + 本地 API key (SDK 转发) + session | `auth/mod.rs` 头部 `//!` |
 | `codec/` | 跨协议 IR + Reader/Writer trait + StreamTranslate (OpenAI / Anthropic / Responses) | **`src/codec/AGENTS.md`** + `docs/design/ir-fields-roadmap.md` (IR 字段建模路线图: extra 边界 + 字段提升判定准则 + 实施批次) |
-| `config.rs` | 双层配置 schema + `DynamicTable<T>` 泛型 + 持久化 + 静态配置预检审计 (未知 section/字段 → 启动 WARN, #159) | 文件头部 `//!` (覆盖 OverrideMode / CRUD / Effective source / 跨表并发) |
+| `config/` (模块目录: mod/decisions) | 双层配置 schema + `DynamicTable<T>` 泛型 + 持久化 + 静态配置预检审计 (未知 section/字段 → 启动 WARN, #159); decisions — per-id override 合并判据子系统 (OverrideMode 枚举 + Decisions state.toml 存储容器 + prune_dangling_decisions 启动悬空清理, 契约 CFG-6) | `src/config/mod.rs` 头部 `//!` (覆盖 OverrideMode / CRUD / Effective source / 跨表并发) + `src/config/decisions.rs` 头部 `//!` |
 | `dag/` (模块目录: mod/pool/search/types/view/timeline) | ConversationDAG 内容寻址存储 (BlockPool + Node + Merkle) + 会话文本搜索 (#317, search 子模块) | `src/dag/mod.rs` 头部 `//!` + `docs/design/conversation-dag.md` |
 | `derive.rs` | 从 request body / DAG 结构化存储派生 WebUI 轻量视图: preview/model/text 字节级提取 + delta messages (B1: BlockPool 派生 `extract_delta_messages_from_blocks`, 与旧 raw 切片逐字节等价) + tail parsed 渲染派生 (`response_parsed_from_parts`) (域 B 派生链, ROB-1 永不 panic) | 文件头部 `//!` (含 "为什么不在 web::api" 归属论证) |
 | `dto.rs` | WebUI 响应 DTO 中立类型层 (SessionView/NodeView/.../SyncSnapshot, 域 B → 域 C wire shape; 构造逻辑留 dag) | 文件头部 `//!` (含 "为什么是顶层中立模块" 归属论证) |
@@ -399,8 +399,8 @@ Pool 不进此本地终结分支 (Router 专属) — pool 入口的 /models 经 
 | `util.rs` | 集中的哈希工具 + 文件权限收紧 (SEC-8) + 字符串截断族 (char boundary 安全, ROB-1) | 文件头部 `//!` |
 | `web/` | JSON API (`api/` 目录) + 单页 WebUI | **`src/web/AGENTS.md`** |
 
-> `ProviderTable` 与 `SecretTable` 是 `DynamicTable<T>` (`src/config.rs`) 的类型别名,
-> 通用合并 / CRUD / 持久化算法都在 config.rs; 各模块只补充类型特定的 EffectiveView
+> `ProviderTable` 与 `SecretTable` 是 `DynamicTable<T>` (`src/config/mod.rs`) 的类型别名,
+> 通用合并 / CRUD / 持久化算法都在 config/mod.rs; 各模块只补充类型特定的 EffectiveView
 > 映射与 validate 钩子.
 
 ## 配置模型 (双层: Static + Dynamic) — 概览
@@ -411,7 +411,7 @@ Pool 不进此本地终结分支 (Router 专属) — pool 入口的 /models 经 
 | `secret-guard.state.toml` | **动态 (dynamic)** 状态: WebUI 编辑结果 + 对 static 项的 decision. 删除即可重置. **含明文敏感数据** (dynamic secret value / 显式写入的 api_key), 敏感级别与 static 同级 (#157). | 程序自动 | ❌ 推荐 .gitignore |
 
 合并语义 (OverrideMode: Default / PreferStatic / Disabled)、Effective source 4 种、
-CRUD 操作语义、DynamicTable 持久化策略、跨表并发安全的详尽描述见 `src/config.rs` 头部.
+CRUD 操作语义、DynamicTable 持久化策略、跨表并发安全的详尽描述见 `src/config/mod.rs` 头部.
 
 > 配置字段表 (全部段的字段 / 类型 / 默认值 / 用户语义) 的唯一维护点是 **`docs/configuration.md`**
 > (README 已链接) — 改配置 schema (增删字段 / 改默认值) 只更新该文档, 本文件不再维护字段副本.
