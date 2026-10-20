@@ -160,8 +160,11 @@ proptest! {
     /// L8 已解除 (2026-10-20): 搁置根因是生成器生成协议外形态 (顶层
     /// `input_tokens`/`output_tokens` + 缺 `stop_sequence`), 而非 writer 缺陷 —
     /// reader/writer 对真实协议形态 (usage 嵌套 + stop_sequence 恒存在) 本就
-    /// 镜像对称. 生成器收紧至真实形态 (见 `arb_anthropic_response_value`),
-    /// 与 OpenAI 半面 (#284) 同为"归一化收敛"路线, 本 property 转正常驻.
+    /// 镜像对称. 生成器收紧至已建模字段的真实协议形态 (见
+    /// `arb_anthropic_response_value`), 与 OpenAI 半面 (#284) 同为"归一化收敛"
+    /// 路线, 本 property 转正常驻. 覆盖边界: 未建模值面 (stop_reason 官方枚举
+    /// `pause_turn` 等被改写 / usage 未建模子字段丢弃) 不在守卫面, 残余缺口
+    /// 登记 known-limitations codec 节 "L8 残余面" 条目.
     #[test]
     fn anthropic_response_preserves_wire_semantics(v in arb_anthropic_response_value()) {
         let ir = AnthropicReader.read_response(&v).unwrap();

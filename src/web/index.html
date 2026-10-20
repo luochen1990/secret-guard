@@ -4737,8 +4737,8 @@
     //   非末轮 header 的这些字段保持空 (TimelineRound 不含 response 字段).
     //   末轮 response 在独立的 .response-drawer 中, 不在 .tl-round 内.
     //   leak_alerts (#305 批2) 同为 push 后可变字段 (finalize 填充), 经 header 的
-    //   [data-hdr="leak"] 占位 span + updateLeakBadges() 按 records 对账刷新;
-    //   is_orphan (CDAG-7) 同型 — [data-hdr="orphan"] + updateOrphanBadges().
+    //   [data-hdr="leak"] 占位 span + updateRoundBadges() 按 records 对账刷新;
+    //   is_orphan (CDAG-7) 同型 — [data-hdr="orphan"], 同一对账循环统一刷新.
     function renderTimeline() {
       const el = document.getElementById('detail');
       if (state.timelineRecords.length === 0) {
@@ -4752,8 +4752,7 @@
       if (fp === state.lastTimelineFingerprint) {
         // 策略 1: fingerprint 一致 → 只刷 response body (流式渐进) + 末轮 header.
         updateTimelineResponses();
-        updateLeakBadges();  // records 可能被同 session loadTimeline 原地替换 (fp 不变), 徽章需按新数据对账.
-        updateOrphanBadges();  // 同上: is_orphan 同为 records 驱动的晚到对账字段.
+        updateRoundBadges();  // records 可能被同 session loadTimeline 原地替换 (fp 不变), 徽章需按新数据对账 (leak + orphan 同循环).
         return;
       }
       state.lastTimelineFingerprint = fp;
@@ -4765,8 +4764,7 @@
       // 填充 Response 抽屉内容 + 末轮 header + 计算布局.
       renderDrawer();
       updateLastRoundHeader();
-      updateLeakBadges();  // 新建/复用的轮次节点统一按 records 填充 leak 徽章 (占位 span 单点消费).
-      updateOrphanBadges();  // 孤儿徽章同点位对账 (CDAG-7).
+      updateRoundBadges();  // 新建/复用的轮次节点统一按 records 填充徽章 (leak + orphan, 占位 span 单点消费).
       updateResponseDrawerLayout();
       updateScrollNavVisibility();
     }
@@ -5156,7 +5154,7 @@
       const leakIds = (rec ? rec.leak_alerts : r.leak_alerts) || [];
       // 孤儿标记 (CDAG-7) 双源: meta record (ForwardRecord.is_orphan) 或本地
       // TimelineRound.is_orphan, 任一为真即横幅 (ROB: 旧后端 undefined → false).
-      const isOrphan = (rec?.is_orphan || r.is_orphan) || false;
+      const isOrphan = rec?.is_orphan || r.is_orphan;
       const banners =
         (errText ? `<div class="banner status-err">${t('timeline.errorBanner', { msg: escapeHtml(errText) })}</div>` : '')
         + (leakIds.length > 0 ? `<div class="banner">${t('info.leakBanner', { ids: escapeHtml(leakIds.join(', ')) })}</div>` : '')
@@ -5488,7 +5486,7 @@
     // 既有轮次节点不重绘 header, 而 leak_alerts 在响应 finalize 时才填充 (晚于
     // 轮次 push) — 同 session 重载 (loadTimeline 原地替换 records 但 id 序列不变,
     // fingerprint 短路) 时数据到达但节点已存在. 故模板只渲染空占位 span
-    // ([data-hdr="leak"], 同 status/elapsed/streamed 模式), 由 updateLeakBadges
+    // ([data-hdr="leak"], 同 status/elapsed/streamed 模式), 由 updateRoundBadges
     // 按当前 state.timelineRecords 对账刷新 — 填充逻辑单点 (SSOT).
     //
     // 时序边界 (与 T1 契约的协调点): sync 的 timeline diff 只 append 新 round +
@@ -5496,7 +5494,7 @@
     // loadTimeline (重进 session / 页面重载) 才随 records 到达, 徽章相应延迟出现
     // (非流式快响应无此延迟: finalize 早于下个 sync tick, new_rounds 自带数据).
     // 若后端未来提供既有轮次的 leak 更新通路 (如 tail 携带), sync 的 else 分支
-    // 补一次幂等 updateLeakBadges() 即可.
+    // 补一次幂等 updateRoundBadges() 即可.
     //
     // 属性赋值 (textContent/title) 而非 innerHTML: ids 是用户输入的 secret id,
     // 属性赋值天然免转义 (与 updateLastRoundHeader 的 status span 同型).
@@ -5514,14 +5512,17 @@
       }
     }
 
-    // 对账刷新所有轮次 header 的 leak 徽章 (renderTimeline 两条路径统一调用).
-    function updateLeakBadges() {
+    // 对账刷新所有轮次 header 的 leak + orphan 徽章 (renderTimeline 两条路径统一调用).
+    // 单循环统一刷新两类徽章 — 同点位对账从注释约定升级为结构保证 (新增徽章类
+    // 字段在此追加 setter 调用即可, 不会漏路径).
+    function updateRoundBadges() {
       const byId = new Map(state.timelineRecords.map(r => [r.id, r]));
       document.querySelectorAll('#detail > .tl-round').forEach(el => {
-        const span = el.querySelector('[data-hdr="leak"]');
-        if (!span) return; // 防御: 非本轮次模板结构 (ROB).
         const r = byId.get(el.dataset.rid);
-        setLeakBadge(span, r ? (r.leak_alerts || []) : []);
+        const leakSpan = el.querySelector('[data-hdr="leak"]');
+        if (leakSpan) setLeakBadge(leakSpan, r ? (r.leak_alerts || []) : []); // 防御: 非本轮次模板结构 (ROB).
+        const orphanSpan = el.querySelector('[data-hdr="orphan"]');
+        if (orphanSpan) setOrphanBadge(orphanSpan, r ? (r.is_orphan || false) : false);
       });
     }
 
@@ -5534,8 +5535,10 @@
     // 为什么不直接在 renderTimelineRound 模板里渲染: 与 leak 徽章同因 — keyed
     // reconciliation 复用既有轮次节点不重绘 header, 且 is_orphan 是 push 后可变
     // 字段 (false→true: parent 被后续 eviction 淘汰), 模板渲染空占位 span
-    // ([data-hdr="orphan"], 同 leak 模式), 由 updateOrphanBadges 按当前
-    // state.timelineRecords 对账刷新 — 填充逻辑单点 (SSOT).
+    // ([data-hdr="orphan"], 同 leak 模式), 由 updateRoundBadges 按当前
+    // state.timelineRecords 对账刷新 — 填充逻辑单点 (SSOT). 时序边界与 leak
+    // 同型: eviction 发生在 timeline 打开期间时, false→true 需等下次 loadTimeline
+    // 才随 records 到达 (sync 不重发既有轮次).
     //
     // 属性赋值 (textContent/title) 而非 innerHTML: 文案全部来自 i18n 字典 (ROB).
     // 容错: 旧后端数据 → is_orphan undefined → 按 false 清空 (ROB, || false).
@@ -5549,18 +5552,6 @@
         span.textContent = '';
         span.removeAttribute('title');
       }
-    }
-
-    // 对账刷新所有轮次 header 的孤儿徽章 (renderTimeline 两条路径统一调用,
-    // 与 updateLeakBadges 同点位).
-    function updateOrphanBadges() {
-      const byId = new Map(state.timelineRecords.map(r => [r.id, r]));
-      document.querySelectorAll('#detail > .tl-round').forEach(el => {
-        const span = el.querySelector('[data-hdr="orphan"]');
-        if (!span) return; // 防御: 非本轮次模板结构 (ROB).
-        const r = byId.get(el.dataset.rid);
-        setOrphanBadge(span, r ? (r.is_orphan || false) : false);
-      });
     }
 
     // 渲染本轮 request delta 的所有 messages 为独立气泡 (含 assistant).

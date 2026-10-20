@@ -218,13 +218,15 @@ normalize(v) == normalize(Writer(Reader(v)))
   `display`/`summary` 子字段经 extra 兜底; first-class 注入仅在 extra 无对应 key 时发生, 无双写)
 - ⏸️ 搁置 (待后续): 多 system messages 合并 (L2, **OpenAI/Responses codec 侧仍提升** —
   Anthropic 已按位保留)
-- ✅ L8 (response 侧 usage) 已全消除: OpenAI 半面 (#284) — usage
+- ✅ L8 (response 侧 usage **位置形态**) 已消除: OpenAI 半面 (#284) — usage
   `prompt_tokens_details.cached_tokens` 双向保真 (reader 归一化 + writer 写回),
   input 总和收敛 `openai_prompt_tokens` SSOT; Anthropic 半面 (2026-10-20) — 搁置
   根因实为生成器生成协议外形态 (顶层 `input_tokens`/`output_tokens` + 缺
   `stop_sequence`), 非 codec 缺陷; 收紧生成器至真实协议形态后 reader/writer 本就
   镜像对称 (usage 嵌套 + cache 双维度 + stop_sequence 三值), IrUsage 无需重构,
-  `anthropic_response_preserves_wire_semantics` 转正常驻
+  `anthropic_response_preserves_wire_semantics` 转正常驻. 覆盖边界 = **已建模字段**
+  的 round-trip; 未建模值面 (stop_reason 官方枚举 `pause_turn` 等被改写 / usage
+  子字段丢弃) 的残余缺口登记在 `docs/known-limitations.md` codec 节独立条目
 
 搁置项对应的 proptest 生成器分支已用 `// NOTE` 标注, 实现后恢复即可.
 
