@@ -126,6 +126,10 @@ fn build_timeline_round(inner: &DagInner, node_id: Uuid) -> Option<TimelineRound
         id: node.id,
         round_role: node.event.round_role,
         round_kind: node.event.round_kind,
+        // CDAG-7 孤儿标记: 判定 SSOT = DagInner::is_orphan_node (与 node_view 共用),
+        // 前端渲染 "上文已截断" 徽章. 孤儿轮自身仍出现在 rounds 里 (walk_chain 的
+        // filter_map 跳过缺失祖先), 徽章有数据可渲染.
+        is_orphan: inner.is_orphan_node(node),
         preview: node.event.preview.clone(),
         created_at: node.event.created_at,
         // 实际承载转发的 provider id (#179, 虚拟 endpoint 切换的可观测性).

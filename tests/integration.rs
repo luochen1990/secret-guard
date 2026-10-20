@@ -597,6 +597,7 @@ fn dag_list_forward_records(dag: &ConversationDag) -> Vec<ForwardRecord> {
                 error: view.error,
                 redactions: view.redactions.to_vec(),
                 audit_capture_off: !view.audit_retained,
+                is_orphan: view.is_orphan,
                 leak_alerts: view.leak_alerts,
             })
         })
@@ -4103,6 +4104,13 @@ async fn web_api_record_includes_client_model() {
     assert!(
         body["record"].get("upstream_model").is_none(),
         "no route rewrite → upstream_model must be absent (not null): {body}"
+    );
+    // CDAG-7 wire 传播: 正常轮 (parent 存活 / 根轮) 恒序列化 false. 孤儿态在
+    // 公共 eviction 路径正常不可达 (child_count 保护, 见 dag 单测白盒构造),
+    // 集成层只锁正常轮的 wire 契约 (字段存在且为 false).
+    assert_eq!(
+        body["record"]["is_orphan"], false,
+        "normal round must carry is_orphan=false on the wire: {body}"
     );
 }
 

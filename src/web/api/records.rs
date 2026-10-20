@@ -100,6 +100,8 @@ fn build_forward_record(
         // B2: 未捕获标记 (off 档全部 / latest 档被会话更新请求取代) — 前端区分 "空 body"
         // vs "未捕获" 的契约字段.
         audit_capture_off: !view.audit_retained,
+        // CDAG-7: 孤儿标记透传 (meta 档元数据照常 — 详情弹窗概览横幅数据源).
+        is_orphan: view.is_orphan,
         // ForwardRecord 持有 Vec (需 Deserialize); 此处从 NodeView 的 Arc 切片
         // 实化一次. build_forward_record 仅用于 GET /records/{id} 详情路径 (非高频).
         redactions: view.redactions.to_vec(),
@@ -301,6 +303,17 @@ mod tests {
         assert!(rec.resp_headers.is_empty());
         assert!(rec.resp_body.is_empty());
         assert!(rec.resp_parsed.is_none());
+    }
+
+    #[test]
+    fn orphan_flag_propagates_through_meta_view() {
+        // CDAG-7 wire 传播: NodeView.is_orphan → ForwardRecord.is_orphan.
+        // meta 档 (detail/resp 双 None) 元数据照常透传 — 详情弹窗概览的
+        // 孤儿横幅数据源, 缺失即横幅永不出现.
+        let mut view = meta_test_node_view();
+        view.is_orphan = true;
+        let rec = build_forward_record(view, None, None);
+        assert!(rec.is_orphan, "meta 档必须透传孤儿标记");
     }
 
     #[test]

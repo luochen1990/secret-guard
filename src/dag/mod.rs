@@ -131,6 +131,14 @@ impl DagInner {
             .get(&session_id)
             .is_some_and(|s| s.leaf_id == node_id)
     }
+
+    /// CDAG-7 孤儿判定 SSOT: node 的 parent 有值但在 `nodes` 中缺席 = 孤儿
+    /// (parent 已被淘汰, 链在此截断). 根节点 (parent=None) 与 parent 存活的
+    /// 正常节点均 false — 根不是孤儿. view (`node_view`) 与 timeline
+    /// (`build_timeline_round`) 两侧派生共用本方法, 防两处 3-atom 表达式漂移.
+    fn is_orphan_node(&self, node: &Node) -> bool {
+        node.parent.is_some_and(|p| !self.nodes.contains_key(&p))
+    }
 }
 
 /// push 时计算出的 node 定位结果.
@@ -1984,6 +1992,40 @@ mod tests {
         assert!(
             dag.get_node(b).expect("b 仍存活").is_orphan,
             "parent 缺席的存活 child 被标记为孤儿"
+        );
+    }
+
+    #[test]
+    fn timeline_round_carries_orphan_flag() {
+        // CDAG-7 wire 传播: TimelineRound (timeline_view / timeline_diff 的 wire DTO)
+        // 携带 is_orphan — 孤儿轮 true, 正常链轮与根轮 false. 前端徽章的数据源
+        // (孤儿轮自身仍出现在 rounds 里, 缺失祖先被 walk_chain 截断 — 见
+        // prop_orphan_node_degrades_gracefully). 白盒构造手法同上.
+        let dag = ConversationDag::new(8, 500, 1);
+        let a = dag.push_messages(vec![text_msg(IrRole::User, "m1")], dummy_event());
+        let b = dag.push_messages(
+            vec![text_msg(IrRole::User, "m1"), text_msg(IrRole::User, "m2")],
+            dummy_event(),
+        );
+        let sid = sid_of(&dag, b);
+
+        // 正常态: 根轮 a 与链上轮 b 均非孤儿.
+        let page = dag.timeline_view(sid, None, 10).expect("page exists");
+        assert_eq!(page.rounds.len(), 2);
+        assert!(!page.rounds[0].is_orphan, "根轮 (parent=None) 不是孤儿");
+        assert!(!page.rounds[1].is_orphan, "parent 存活的正常链上轮不是孤儿");
+
+        // 淘汰 parent a → b 成为孤儿轮, timeline 降级为仅剩 b 且显式携带标记.
+        {
+            let mut g = dag.inner.write();
+            super::ConversationDag::gc_cascade(&mut g, a);
+        }
+        let page = dag.timeline_view(sid, None, 10).expect("session 仍可查");
+        assert_eq!(page.rounds.len(), 1, "timeline 降级为仅存活轮次");
+        assert_eq!(page.rounds[0].id, b);
+        assert!(
+            page.rounds[0].is_orphan,
+            "parent 缺席的存活轮在 wire DTO 上被标记为孤儿"
         );
     }
 

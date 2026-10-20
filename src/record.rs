@@ -91,6 +91,11 @@ pub struct ForwardRecord {
     /// 请求/响应本身为空. 三态语义 SSOT 见 `config::AuditCaptureMode`.
     #[serde(default)]
     pub audit_capture_off: bool,
+    /// CDAG-7: 本轮是否为孤儿 (parent 已被淘汰, 链在此截断). WebUI 轮次详情
+    /// 弹窗概览的 "上文已截断" 横幅数据源; 正常轮恒 false.
+    /// serde default: 兼容旧序列化产物 (历史 JSON 无此字段).
+    #[serde(default)]
+    pub is_orphan: bool,
     /// 蜜罐泄露检测命中 (#305 批2, RED-10): 本轮 LLM 响应中出现真值的
     /// placeholder 策略 secret id 列表 (排序去重, **永不**包含真实 secret 值,
     /// 可直接序列化到 GET API 响应). 空 vec = 无命中 / 未检测 (best-effort).
@@ -126,6 +131,7 @@ impl ForwardRecord {
             redactions: Vec::new(),
             // 测试构造默认捕获 (与历史行为一致); 测试未捕获语义时显式覆盖.
             audit_capture_off: false,
+            is_orphan: false,
             leak_alerts: Vec::new(),
         }
     }
@@ -181,6 +187,11 @@ mod tests {
             rec.model.is_none(),
             "missing model field must default to None"
         );
+        // CDAG-7: is_orphan 同为后加字段, 缺省回落 false (显式锁定 default 契约).
+        assert!(
+            !rec.is_orphan,
+            "missing is_orphan field must default to false"
+        );
         // 其他字段仍正确填充.
         assert_eq!(rec.method, "POST");
         assert_eq!(rec.resp_body, "world");
@@ -201,7 +212,7 @@ mod tests {
         );
     }
 
-    // ─── ForwardRecord::new 默认值契约 (11 个默认字段) ──────────────────────
+    // ─── ForwardRecord::new 默认值契约 (12 个默认字段) ──────────────────────
     //
     // new() 是构造一条"请求已收到, 响应未到"的占位记录的标准入口, 其默认值
     // 必须与 DAG Node 的初始状态语义对齐 (resp_status=0, resp_complete=false 等).
@@ -223,7 +234,7 @@ mod tests {
             vec![("content-type".into(), "application/json".into())]
         );
         assert_eq!(rec.req_body, "hello");
-        // 11 个默认字段: 必须逐一 pin 住, 任一变化都会让前端状态判断出错.
+        // 12 个默认字段: 必须逐一 pin 住, 任一变化都会让前端状态判断出错.
         assert_eq!(rec.id, Uuid::nil(), "new record id must be nil placeholder");
         assert_eq!(rec.resp_status, 0, "pending response must have status 0");
         assert!(rec.resp_headers.is_empty(), "no response headers yet");
@@ -238,6 +249,10 @@ mod tests {
         assert!(rec.error.is_none(), "no error until one occurs");
         assert!(rec.redactions.is_empty(), "no redactions until redact runs");
         assert!(rec.model.is_none(), "model only set via DTO projection");
+        assert!(
+            !rec.is_orphan,
+            "new() 构造的占位记录默认非孤儿 (由 NodeView 派生时覆盖)"
+        );
     }
 
     // ─── resp_parsed 字段 skip_serializing_if = Option::is_none ─────────────

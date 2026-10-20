@@ -47,7 +47,7 @@
 
 ## dag (内容寻址存储)
 
-- **DAG 孤儿节点降级**: parent 被 LRU 淘汰后, child 的 `full_request_messages` 返回 None (timeline 降级展示, 不 panic). 显式孤儿标记 `NodeView::is_orphan` 已实现 (CDAG-7, 读时纯派生: parent 有值但在 nodes 缺席); wire DTO (ForwardRecord / TimelineRound) 传播与前端徽章利用留后续 — 打通前该字段仅在 NodeView 层可见.
+- **DAG 孤儿节点降级**: parent 被 LRU 淘汰后, child 的 `full_request_messages` 返回 None (timeline 降级展示, 不 panic), timeline 截断到存活轮次 (缺失祖先被 walk_chain 跳过). 显式孤儿标记 `NodeView::is_orphan` (CDAG-7, 读时纯派生: parent 有值但在 nodes 缺席) 的 wire 传播已接通 — 判定 SSOT = `DagInner::is_orphan_node`, ForwardRecord / TimelineRound 携带同名字段, WebUI 渲染 "上文已截断" 徽章 + 详情概览横幅 (见 contracts.md CDAG-7); RoundBrief (sidebar 三级) 有意不携带.
 
 ## deploy (部署与安全面)
 
