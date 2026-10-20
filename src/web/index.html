@@ -5153,7 +5153,7 @@
       const errText = (rec || tail)?.error || '';
       const leakIds = (rec ? rec.leak_alerts : r.leak_alerts) || [];
       // 孤儿标记 (CDAG-7) 双源: meta record (ForwardRecord.is_orphan) 或本地
-      // TimelineRound.is_orphan, 任一为真即横幅 (ROB: 旧后端 undefined → false).
+      // TimelineRound.is_orphan, 任一为真即横幅 (ROB: 旧后端 undefined 按失败处理).
       const isOrphan = rec?.is_orphan || r.is_orphan;
       const banners =
         (errText ? `<div class="banner status-err">${t('timeline.errorBanner', { msg: escapeHtml(errText) })}</div>` : '')
@@ -5520,9 +5520,9 @@
       document.querySelectorAll('#detail > .tl-round').forEach(el => {
         const r = byId.get(el.dataset.rid);
         const leakSpan = el.querySelector('[data-hdr="leak"]');
-        if (leakSpan) setLeakBadge(leakSpan, r ? (r.leak_alerts || []) : []); // 防御: 非本轮次模板结构 (ROB).
+        if (leakSpan) setLeakBadge(leakSpan, r?.leak_alerts || []); // 防御: 非本轮次模板结构 (ROB).
         const orphanSpan = el.querySelector('[data-hdr="orphan"]');
-        if (orphanSpan) setOrphanBadge(orphanSpan, r ? (r.is_orphan || false) : false);
+        if (orphanSpan) setOrphanBadge(orphanSpan, r?.is_orphan || false);
       });
     }
 

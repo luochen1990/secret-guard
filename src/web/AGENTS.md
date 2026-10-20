@@ -270,7 +270,7 @@ audit_capture 未保留的请求 (off 档全部 / latest 档被会话更新请�
   返回 `Option<TimelineDiffData { new_rounds, tail }>`, None = 无变化 (304 等价).
 
 **leak_alerts (placeholder 蜜罐打标, #305 批2)**: TimelineRound 携带 `leak_alerts`
-(secret ids), 前端两处消费 — timeline 轮次 header 的 ⚠ 徽章 (`updateLeakBadges`
+(secret ids), 前端两处消费 — timeline 轮次 header 的 ⚠ 徽章 (`updateRoundBadges`
 单点对账: 模板渲染空占位 `span[data-hdr=leak]`, 按 `state.timelineRecords` Map
 填充/清空 — reconcile 复用节点与 fingerprint 短路两条渲染路径都调用; quant#305
 起徽章可点击 → 轮次详情概览) + 轮次详情弹窗概览 tab
@@ -281,7 +281,7 @@ warn banner. 时序边界: leak_alerts 随响应 finalize 填充 (晚于 push), 
 **is_orphan (孤儿轮 "上文已截断" 徽章, CDAG-7 wire 传播)**: TimelineRound 携带
 `is_orphan` (parent 已被淘汰 = 链在此截断, 该轮之前的上下文不再可用; 判定 SSOT =
 `DagInner::is_orphan_node`, view/timeline 两侧共用), 前端两处消费 — timeline 轮次
-header 的 ⊘ 徽章 (`updateOrphanBadges` 对账, 与 leak 徽章同型同点位: 空占位
+header 的 ⊘ 徽章 (`updateRoundBadges` 对账, 与 leak 徽章同一对账循环: 空占位
 `span[data-hdr=orphan]` + records Map 填充/清空; 可点击 → 轮次详情概览; muted 虚线
 色系 — 数据降级通知, 区别于 leak 的 warn 实线) + 轮次详情弹窗概览 tab muted 横幅
 (双源: meta record `ForwardRecord.is_orphan` ∨ 本地 timeline round). ROB: 旧后端
