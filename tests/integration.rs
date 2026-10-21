@@ -14714,6 +14714,10 @@ async fn sec1_read_all_endpoints(
         // 探针 (gatus 公开探针契约, 两形态恒 200).
         "/api/settings",
         "/api/me",
+        // 会话搜索 (#381 引入, 本 PR 对账绊线抓住后适配): q 取 needle 子串 —
+        // 命中后 snippet 从 BlockPool real 侧截取回传, 数据面 (snippet 忘记
+        // apply real→mock 的回归) 与响应面一并进入下方 SEC-1 泄漏扫描谓词.
+        "/api/search?q=sk-real-secret-abc",
         "/api/usage/summary?hours=24",
         // privacy-scan 两读端点 (context 遮盖面; 本测试 privacy off 档下返回
         // enabled:false 空表 — 端点进穷举网的意义是防未来回归把泄密面加进来
