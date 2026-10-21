@@ -525,6 +525,8 @@ pub(crate) async fn cross_proto_forward(
                     record_id,
                     &format!("response body is not a single JSON value ({e})"),
                     &redaction_map,
+                    &resp_bytes,
+                    None,
                 );
                 (resp_status, resp_bytes.to_vec())
             }

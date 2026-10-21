@@ -10789,6 +10789,88 @@ async fn stream_request_with_non_sse_upstream_warns_mock_not_restored() {
     );
 }
 
+/// #395 (WARN 降噪 / mock 实存 gate): 上游对 stream=true 回 **429 error envelope**
+/// (真实场景: GLM Coding Plan 限流 — JSON 错误体, 无 choices, 不回显请求内容)
+/// 且 body 不含 mock → "mock not restored" WARN 不打 — 零 mock 实存, 无逃逸
+/// 可观 ("client will see mock values" 在此形态下是虚警, 降级 debug).
+/// 信号分离: same_proto 判型 WARN (non-SSE content-type) 不受影响, 照打.
+/// 对照面: body 实含 mock 的场景由上方
+/// [`stream_request_with_non_sse_upstream_warns_mock_not_restored`] 守卫.
+#[tokio::test]
+async fn stream_non_sse_error_body_without_mock_skips_mock_not_restored_warn() {
+    let real_secret = "sk-live-qq9988776655";
+    let mut upstream = spawn_mock_upstream().await;
+    // 429 error envelope: 智谱错误码族形态 (1305 = 该模型当前访问量过大),
+    // 无 choices → codec reader 拒绝, 无 mock echo → 实存 gate 零命中.
+    let err_body = r#"{"error":{"code":"1305","message":"model is overloaded, retry later"}}"#;
+    let _m = upstream
+        .mock("POST", "/v1/chat/completions")
+        .with_status(429)
+        .with_header("content-type", "application/json")
+        .with_body(err_body)
+        .create_async()
+        .await;
+
+    let entries = vec![secret("api-key", real_secret)];
+    let secrets = test_secret_table_with(entries);
+    let provider = openai_provider("oa-main", &upstream.url());
+    let proxy_url = spawn_proxy_full(
+        vec![provider],
+        reqwest::Client::new(),
+        ConversationDag::new(64, 500, 1),
+        secrets,
+    )
+    .await;
+
+    let (log, _log_guard) = capture_tracing(tracing::Level::DEBUG);
+    let body = format!(
+        r#"{{"model":"gpt-4o","stream":true,"messages":[{{"role":"user","content":"keep {real_secret}"}}]}}"#
+    );
+    let (status, text, _) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        &body,
+        &[("content-type", "application/json")],
+    )
+    .await;
+
+    // 行为不变: 429 + 原样透传 (SEC-10 withhold — parse 失败子路径原字节返回).
+    assert_eq!(status, reqwest::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        text, err_body,
+        "fallback path must pass body through verbatim"
+    );
+
+    // 降噪核心断言: mock-not-restored WARN 不打 (降级体零 mock 实存).
+    let log_text = log.text();
+    assert!(
+        !log_text.contains("mock not restored"),
+        "#395 violation: mock-not-restored WARN fired on a mock-free degraded body \
+         (false alarm); log: {log_text}"
+    );
+    // debug 降级行在场 (可观测保留) 且不带 opt-in 提示 — 零 mock 时 restore 是
+    // no-op, 提示进 debug 会误导 (review 建议落实).
+    assert!(
+        log_text.contains("no mock present in degraded body"),
+        "#395: degraded-path debug line missing; log: {log_text}"
+    );
+    assert!(
+        !log_text.contains("on_fallback_restore"),
+        "#395: opt-in hint must not appear when nothing escaped; log: {log_text}"
+    );
+    // 信号分离: 判型 WARN (上游侧信号) 照打, 不被降噪误伤.
+    assert!(
+        log_text.contains("non-SSE content-type"),
+        "#395: upstream-side signal (non-SSE content-type) must stay; log: {log_text}"
+    );
+    // 卫生: 日志不得含真实 secret.
+    assert!(
+        !log_text.contains(real_secret),
+        "#395: log must not leak real secret; log: {log_text}"
+    );
+}
+
 // ─── RED-8: JSON 叶子级 restore 兜底 (parse-失败 fallback 不让 mock 逃逸) ────
 //
 // codec 无法 parse 上游响应时 (reader 拒绝 / 非 JSON body), fan_out_buffered_ir 与

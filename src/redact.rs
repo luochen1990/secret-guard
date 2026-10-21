@@ -186,6 +186,27 @@ impl RedactionMap {
             .filter(|(_, real)| !self.placeholder_reals.contains(*real))
     }
 
+    /// 降级响应体中是否存在任一 restorable mock 的字节出现 — **mock 实存检测**.
+    /// 仅作可观测性 gate (`proxy::helpers::warn_mock_not_restored` 的降噪判据,
+    /// #395), 不参与数据流. 双形态匹配: mock 在 JSON body 字符串值中出现时,
+    /// 含 `"`/`\`/控制字符的 mock 会被 JSON 序列化转义 (dag search 侧 SEC-1
+    /// 扫描的同款考量), 故 raw 与转义形态各查一次; 仅字母数字的 mock (绝大多数)
+    /// 两形态恒等. 漏检方向 = 少打一条 WARN (观测面损失, 非安全面) — 漏面 = 非
+    /// serde_json 标准的转义变体 (如 `\/` / `\u0008` 形态的编码器).
+    pub(crate) fn contains_any_restorable_mock(&self, hay: &[u8]) -> bool {
+        fn contains_bytes(hay: &[u8], needle: &[u8]) -> bool {
+            !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
+        }
+        self.restorable_entries().any(|(m, _)| {
+            contains_bytes(hay, m.as_bytes())
+                || serde_json::to_string(m).is_ok_and(|esc| {
+                    // 剥序列化引号得转义形态; 与 raw 恒等时 (字母数字 mock) 跳过.
+                    let esc = &esc[1..esc.len() - 1];
+                    esc != m && contains_bytes(hay, esc.as_bytes())
+                })
+        })
+    }
+
     /// 插入映射. 若 mock 已映射到**不同** real (C4 单射性违反), 返回 `RedactError`
     /// (defense-in-depth; C4 保证正常路径不会触发).
     ///
@@ -2643,6 +2664,46 @@ mod tests {
         // has_restorable: placeholder 条目不算 → 响应走透传路径 (dispatch 判据).
         assert!(!map.has_restorable());
         assert!(!map.is_empty(), "map carries the placeholder mapping");
+    }
+
+    // ─── contains_any_restorable_mock (#395: WARN 降噪的 mock 实存 gate) ─────
+
+    #[test]
+    fn contains_mock_raw_and_escaped_and_miss_forms() {
+        let map = map_with("sk-live-aa11112222", "sk-MockAA99887x");
+        // raw 形态命中 (mock 原样出现在 body 字节中).
+        assert!(map.contains_any_restorable_mock(
+            br#"{"error":{"code":"1305","message":"model busy, saw sk-MockAA99887x end"}}"#
+        ));
+        // 零命中: 429 error envelope 不回显请求内容 — 降噪目标场景.
+        assert!(
+            !map.contains_any_restorable_mock(
+                r#"{"error":{"code":"1305","message":"该模型当前访问量过大，请您稍后再试"}}"#
+                    .as_bytes()
+            )
+        );
+        assert!(!map.contains_any_restorable_mock(b""));
+        // 转义形态: 含 `"` 的 mock 经 JSON 序列化后的形态也要命中 (漏检方向
+        // = 少打 WARN, 但双形态把观测面补齐).
+        let mut esc_map = RedactionMap::default();
+        esc_map
+            .insert(
+                "real\"back\\slash".into(),
+                "mock\"quote\\b".into(),
+                "api-key",
+            )
+            .unwrap();
+        let body = br#"{"echo":"mock\"quote\\b"}"#; // 序列化后的字符串值叶子
+        assert!(esc_map.contains_any_restorable_mock(body));
+        // 空 map 恒 false (has_restorable 前置的对称面).
+        assert!(!RedactionMap::default().contains_any_restorable_mock(b"sk-MockAA99887x"));
+        // placeholder-only map: marker 不在 restorable 投影中, 恒 false (C9).
+        let mut ph_map = RedactionMap::default();
+        ph_map
+            .insert("ph-real".into(), "[REDACTED:ph]".into(), "ph-one")
+            .unwrap();
+        ph_map.placeholder_reals.insert("ph-real".to_string());
+        assert!(!ph_map.contains_any_restorable_mock(b"[REDACTED:ph]"));
     }
 
     #[test]

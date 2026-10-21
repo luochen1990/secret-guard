@@ -335,21 +335,42 @@ pub(super) fn warn_mocks_restored_via_json_leaf_fallback(record_id: uuid::Uuid) 
     );
 }
 
-/// 上游响应 parse 失败且 JSON 叶子级兜底也失败 → mock 逃逸到客户端 (#158).
-/// 仅当本请求有可还原条目在途 (`map.has_restorable()`) 时打 — 无 redaction 在途
-/// 的 parse 失败只是普通透传, 无 mock 可逃; placeholder-only 命中 (RED-10) 的
-/// marker 本就不该还原, 客户端看到它是设计行为, 不构成逃逸信号.
+/// 上游响应 parse 失败且 JSON 叶子级兜底也失败/未尝试 → mock 逃逸到客户端 (#158).
+/// 两层 gate: ① `map.has_restorable()` — 无 redaction 在途的 parse 失败只是普通
+/// 透传, 无 mock 可逃; placeholder-only 命中 (RED-10) 的 marker 本就不该还原,
+/// 客户端看到它是设计行为, 不构成逃逸信号. ② **mock 实存检测** (#395 降噪):
+/// `map.contains_any_restorable_mock(body)` 命中才 WARN — "client will see mock
+/// values" 的字面真值; 零命中的常见形态是上游错误 envelope (eg 429 限流 JSON,
+/// 不回显请求内容 — GLM Coding Plan 高频场景), 无逃逸可观, 降级 debug 保持
+/// 可观测而不制造虚警. `opt_in_hint` (withhold 默认路径传入) 只拼进 WARN —
+/// 零命中时 restore 本就是 no-op, 提示进 debug 会误导.
 pub(super) fn warn_mock_not_restored(
     record_id: uuid::Uuid,
     detail: &str,
     map: &crate::redact::RedactionMap,
+    body: &[u8],
+    opt_in_hint: Option<&str>,
 ) {
-    if map.has_restorable() {
+    if !map.has_restorable() {
+        return;
+    }
+    if map.contains_any_restorable_mock(body) {
+        let full_detail = match opt_in_hint {
+            Some(h) => format!("{detail}; {h}"),
+            None => detail.to_owned(),
+        };
         tracing::warn!(
+            %record_id,
+            detail = %full_detail,
+            "response parse failed with redactions in flight; \
+             mock not restored; client will see mock values"
+        );
+    } else {
+        tracing::debug!(
             %record_id,
             detail,
             "response parse failed with redactions in flight; \
-             mock not restored; client will see mock values"
+             no mock present in degraded body; nothing escaped"
         );
     }
 }
@@ -408,10 +429,10 @@ pub(super) fn restore_via_json_leaf_fallback(
         crate::config::OnFallbackRestore::Withhold => {
             warn_mock_not_restored(
                 record_id,
-                &format!(
-                    "{reject_detail}; set [redact] on_fallback_restore = \"restore\" to opt in"
-                ),
+                reject_detail,
                 map,
+                original,
+                Some("set [redact] on_fallback_restore = \"restore\" to opt in"),
             );
             original.to_vec()
         }
@@ -420,7 +441,7 @@ pub(super) fn restore_via_json_leaf_fallback(
                 warn_mocks_restored_via_json_leaf_fallback(record_id);
                 serde_json::to_vec(v).unwrap_or_else(|_| original.to_vec())
             } else {
-                warn_mock_not_restored(record_id, reject_detail, map);
+                warn_mock_not_restored(record_id, reject_detail, map, original, None);
                 original.to_vec()
             }
         }

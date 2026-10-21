@@ -325,11 +325,13 @@ pub enum OnUnsupportedProtocol {
 ///
 /// 仅管 reader-拒绝 (body 仍是单个合法 JSON) 的 fallback 分支; 非 JSON 分支
 /// (SSE-shaped 多帧 body 等) restore 本就无意义 (叶子级兜底以单 JSON Value 为
-/// 前提), 不受本开关影响, 恒为透传 + mock-not-restored WARN.
+/// 前提), 不受本开关影响, 恒为透传 + mock-not-restored WARN (仅降级体实存
+/// mock 时, #395 降噪 gate).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OnFallbackRestore {
-    /// 保留 Mock 透传 (降级偏安全, SEC-10) + mock-not-restored WARN. 默认.
+    /// 保留 Mock 透传 (降级偏安全, SEC-10) + mock-not-restored WARN (实存
+    /// gate #395: 降级体零 mock 命中时降 debug). 默认.
     #[default]
     Withhold,
     /// JSON 叶子级 restore 兜底 (RED-8 行为, 显式 opt-in): mock 还原为 real.

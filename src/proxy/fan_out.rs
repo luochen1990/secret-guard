@@ -489,9 +489,10 @@ pub(crate) async fn fan_out_buffered_ir(
     let mut finality = super::recorder::RespFinality::empty();
     // #158 + RED-8: parse 失败 fallback 家族的可观测性 (SSOT 在 helpers, cross_proto
     // 对称使用): 兜底 restore 成功 → restored-via-fallback WARN; 兜底也失败且本请求
-    // 做过 redact (map 非空) → mock-not-restored WARN (客户端拿到假 secret, 可感知).
-    let warn_mock_not_restored = |detail: &str| {
-        super::helpers::warn_mock_not_restored(record_id, detail, &redaction_map);
+    // 做过 redact (map 非空) → mock-not-restored WARN (客户端拿到假 secret, 可感知;
+    // #395 实存 gate — 降级体零 mock 命中时降 debug).
+    let warn_mock_not_restored = |detail: &str, body: &[u8]| {
+        super::helpers::warn_mock_not_restored(record_id, detail, &redaction_map, body, None);
     };
     // T5 形态适配标志: 客户端要 SSE 却拿到单块 JSON 且 parse 成功 → 出站合成 SSE
     // (下方响应构造据此切换 content-type)。
@@ -554,10 +555,13 @@ pub(crate) async fn fan_out_buffered_ir(
                 // 非 JSON body (eg SSE-shaped 多帧): 叶子级兜底以单 JSON Value 为
                 // 前提, 对同一字节再 parse 必然同样失败 — 不再尝试, 直接透传
                 // (已知限制, 见根 AGENTS.md).
-                warn_mock_not_restored(&format!(
-                    "response body is not a single JSON value ({e}); \
-                     likely SSE-shaped body under a non-SSE content-type"
-                ));
+                warn_mock_not_restored(
+                    &format!(
+                        "response body is not a single JSON value ({e}); \
+                         likely SSE-shaped body under a non-SSE content-type"
+                    ),
+                    &recorder.acc,
+                );
                 recorder.acc.clone() // 非 JSON: 原样返回.
             }
         }
