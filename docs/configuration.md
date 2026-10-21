@@ -91,7 +91,7 @@ value = "ghp_0123456789abcdefghijklmnopqrstuvwxyz"
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `global_mock_prefix` | string | `""` | 所有 Auto 模式 mock 的统一前缀 (如 `"sgm_"`), 便于在日志 / WebUI 中一眼认出 mock. 设定后, secret 真值不允许包含该前缀. |
-| `on_probe_exhausted` | `"fail_open"` \| `"fail_closed"` | `"fail_closed"` | mock 候选探测耗尽时 (极罕见, 需对抗性构造; 配置期 lint 已前置拦截弱配置) 的策略: `fail_closed` (默认, 降级偏安全) 拒绝转发整个请求 (503), 宁可失败也不泄露; `fail_open` 跳过该 secret 照常转发 (显式 opt-in, 历史行为). |
+| `on_probe_exhausted` | `"fail_open"` \| `"fail_closed"` | `"fail_closed"` | mock 候选探测耗尽时 (极罕见, 需对抗性构造; 弱配置已被配置期校验 fail-fast 拒绝, #383) 的策略: `fail_closed` (默认, 降级偏安全) 拒绝转发整个请求 (503), 宁可失败也不泄露; `fail_open` 跳过该 secret 照常转发 (显式 opt-in, 历史行为). |
 | `on_unsupported_protocol` | `"fail_open"` \| `"fail_closed"` | `"fail_closed"` | codec 不覆盖的协议 (目前 gemini / ollama) 上配置了 secrets 时的策略: `fail_closed` (默认, 降级偏安全) 拒绝转发整个请求 (503), 停损防泄露 (message 只含协议名 + provider id, 不含 secret); `fail_open` (显式 opt-in, 历史行为) WARN + 放行透传 — secret 会**原样出站**. 只管 secret 安全性: 仅 model 重写降级 (无 secret) 时两模式都维持 WARN 透传. |
 | `on_fallback_restore` | `"withhold"` \| `"restore"` | `"withhold"` | codec 无法 parse 上游响应的 fallback 路径上 (body 仍是合法 JSON), 是否把 Mock 还原为 real 发给客户端: `withhold` (默认, 降级偏安全) 保留 Mock 透传 — 失败/降级响应体是最高概率被客户端日志系统 / 错误追踪采集的内容, 把 real 还原进去等于精准投放泄露, 而 Mock 按设计可安全暴露; `restore` (显式 opt-in) 还原 mock → real (本地工具直接可用真 secret, 但 real 可能随客户端日志扩散). 非 JSON body 的 fallback 分支不受此开关影响 (restore 本就无意义, 恒透传 + WARN). |
 | `redacted_headers` | string[] | `[]` | 追加进 WebUI record header 脱敏名单的 header 名 (SEC-4). 用于自定义 auth header (如 `x-my-service-key`) — 不在硬编码黑名单内时若不配置, 其值会原样记录到 WebUI record. 条目启动时归一化 (trim + 小写, 空串跳过) 后按小写 header 名**精确匹配** (非子串匹配: 配 `x-my-key` 不波及 `x-my-key-v2`), 与硬编码黑名单并集生效. 默认空 = 行为不变. 示例: `redacted_headers = ["x-my-service-key"]` |
@@ -426,7 +426,7 @@ services.secret-guard.providers.glm-pool = {
 | `id` | string | (必填) | 唯一标识, 规则同 provider id. |
 | `name` | string | — | 可选的人类可读名称 (仅 WebUI 显示). |
 | `category` | string | `"apikey"` | 类别: `password` / `apikey` / `token` / `cookie` / `privatekey` / `other`. 参与 mock 形状推断 (2026-10 起): `privatekey` + 多行 PEM 真值 → 结构化假 PEM; `token` + JWT 形状真值 → 三段点分替身; `apikey` + 公开前缀真值 (`sk-`/`ghp_`/`AKIA`...) → 保留前缀; 其余 (含类别与真值形状不匹配) 退化为平坦等长随机串 — **归类错误无害**. `global_mock_prefix` 非空时恒用平坦串 (辨识前缀与结构仿真互斥). 标注与真值形状矛盾时启动 WARN (PEM 矛盾 = 提醒改标注保持所见/所为一致; JWT/公开前缀矛盾 = 提醒改标注可启用结构化仿真); 标注无误但形状不符 (如随机串 token) 不告警. |
-| `value` | string | `""` | secret 明文. 最少 3 字节; 不允许包含 `global_mock_prefix`; 不允许包含 Unicode 私用区字符 (U+E000..U+F8FF). 与 `value_file` 互斥. |
+| `value` | string | `""` | secret 明文. 最少 3 字节; **`strategy = "redact"` (缺省) 时还需 ≥4 字符** — 更短的值在等长约束下候选空间物理不足 (mock 探测必耗尽), 配置直接报错并引导改用 `reject` / `placeholder` 策略; 不允许包含 `global_mock_prefix`; 不允许包含 Unicode 私用区字符 (U+E000..U+F8FF). 与 `value_file` 互斥. |
 | `value_file` | path | — | 启动时一次性从文件读取 (适合 sops-nix 等外部注入), 读取失败会**拒绝启动** (fail-fast: secret 缺失会让保护静默失效, 必须在部署时暴露). 文件内容自动去首尾空白. |
 | `mock_strategy` | table | (见下) | 替身 (mock) 的生成策略. 缺省时自动按真值推断: 等长、同字符集的确定性随机值. |
 | `strategy` | string | `"redact"` | 该 secret 命中后的处理策略, 四值语义见下. |
@@ -481,12 +481,14 @@ digits = true
 结构形状的公开段 — 白名单前缀 / PEM 边界行 — 豁免该子串检查, 见 contracts.md
 RED-5 "公开格式子串豁免").
 
-候选空间提示: charset 与 body 长度区间 (总长减 prefix) 共同决定候选 mock 的总数
-`Σ charset大小^长度`. 候选总数低于 2^20 (运行时探测预算) 时, 配置写入时 (static 加载 /
-WebUI 保存) 会打 WARN 提示运行时探测可能耗尽 (此时由 `[redact] on_probe_exhausted`
-决定跳过或拒绝) — 收到该 WARN 请加宽 `charset` 或 `length_range`. 例如 charset 仅 2
-个字符 × 固定长度 4 只有 16 个候选, 属于高危配置; 缺省 (按真值推断) 的策略对正常长度
-的 secret 通常空间充足, 但真值字符种类退化 (如 `"aaaa"` → 单字符 charset) 时同样会触发.
+候选空间约束 (#383 起为**硬校验**, 不再只是提示): charset 与 body 长度区间 (总长减
+prefix) 共同决定候选 mock 的总数 `Σ charset大小^长度`. `strategy = "redact"` (缺省)
+时, 候选总数低于 2^20 (运行时探测预算) 的配置会在写入时 (static 加载 / WebUI 保存)
+**直接报错** — 收到该错误请加宽 `charset` 或 `length_range`, 或改用 `reject` /
+`placeholder` 策略 (不做 mock 生成, 无此约束). 例如 charset 仅 2 个字符 × 固定长度 4
+只有 16 个候选, 属于会被拒绝的弱配置; 缺省 (按真值推断) 的策略对正常长度的 secret
+通常空间充足 (推断空间不足时自动逐级拓宽 charset 兜底), 真值过短 (<4 字符) 时改用
+`reject` / `placeholder`.
 
 ## `[auth]` — 认证 (默认关闭 = 单用户模式)
 

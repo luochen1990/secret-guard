@@ -484,7 +484,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 ### RED-4 单射性 + 降级 (可配置: fail_open / fail_closed)
 
-**陈述**: 一次 `redact_ir` 内不同 secret → 不同 mock. 极端弱配置下探测耗尽时的降级行为由 `[redact] on_probe_exhausted` 配置 (默认 `fail_closed`, SEC-10 降级偏安全 — 2026-09 翻转, 见 §99):
+**陈述**: 一次 `redact_ir` 内不同 secret → 不同 mock. 极端弱配置下探测耗尽时的降级行为由 `[redact] on_probe_exhausted` 配置 (默认 `fail_closed`, SEC-10 降级偏安全 — 2026-09 翻转, 见 §99). 注: 弱配置 (手动 gen_spec 候选空间 < 2^20 / redact 短 real < 4 chars) 自 2026-10-21 起在配置期被 fail-fast 拒绝 (RED-9 "配置期弱配置拒绝", #383 方案 D) — 本契约的耗尽触发面残余 = 仅空间达标但对抗构造的 IR:
 
 - **fail_closed (默认)**: **拒绝转发整个请求** (proxy 返回 503, body 的变量部分只含 secret id + reason 枚举, 不含 secret 明文), 防止 secret 泄露到 LLM provider.
 - **fail_open (显式 opt-in, 历史行为)**: **跳过该 secret** (原样发往上游) 而非 panic, 优先保进程存活.
@@ -569,10 +569,14 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 **遍历顺序边界**: reject 判定面 = 该 secret 轮次开始时刻的 IR 命中 (与 redact 同一循环, 长值优先的既定顺序). 两个已知遮蔽交互 (与 mock_strategy 的同值歧义同型, 机密性均不破 — 真值不外发): ① 同值多 entry: `sort + dedup` 先者胜出, strategy 随先者 (redact 在前则 reject 意图不生效, 该值仍被 mock 替换); ② 嵌套子串: 长 redact secret 的值包含短 reject secret 的值时, 前者先行整体替换可遮蔽后者的命中 (请求以 mock 形式放行). 配置期若需绝对 reject 语义, 避免同值/嵌套值组合.
 
+**配置期弱配置拒绝 (#383 方案 D, 2026-10-21)**: `on_probe_exhausted = "fail_open"` (显式 opt-in) 时被跳过 secret 的 record 含真值回显 (读端点族 → WebUI), 与 **SEC-1** 冲突 — 裁决从配置期源头消灭 probing 耗尽的触发面, 而非登记契约例外. `SecretEntry::validate_and_resolve` choke point (static 加载 / dynamic 加载 / WebUI upsert 三条进入路径) 对 **redact 策略**新增两道 fail-fast 拒绝 (Err message 只含 id / 数字 / 建议, 不含 secret 明文 — SEC 红线): ① 手动配置的 gen_spec 候选空间 < `mock::MIN_CANDIDATE_SPACE_WARN` (2^20, 与 `redact::MOCK_PROBE_LIMIT` 同值) — Auto 路径经 widen 兜底恒达标, 命中的必是用户手动配置 (引导: 加宽 charset/length_range 或换 strategy); ② real < 4 chars — 等长约束下候选空间物理不可达 (上界 65³ ≈ 27 万 < 2^20), Auto widen 救不了 (引导: 换 reject/placeholder). reject / placeholder 不做 mock 生成 (无 probing 触发面), 不受两道 gate 约束 — 引导目标恒可达. Auto widen 兜底与 `on_probe_exhausted` 开关语义不变; 运行时残余触发面 = 仅空间达标但对抗构造的 IR (概率天文级), fail_closed 默认拒绝, fail_open 显式 opt-in 保留 (adversarial 应急).
+
 **Properties**:
 - `prop_reject_strategy_503_zero_upstream_sec2_message`: 端到端 — reject secret 的真值出现于请求 → 客户端 503 + message 含 secret id 不含真值 (SEC-2 同型) + 上游零请求 (mockito 零命中). ✅ `tests/integration.rs::prop_reject_strategy_503_zero_upstream_sec2_message`
 - `prop_reject_strategy_hits_refuse_regardless_of_mode`: 单元 — 命中 → `Err(RedactError { reason: StrategyReject })`, 且 fail_open / fail_closed 两种 on_probe_exhausted 模式下同样拒绝 (显式策略不受降级配置影响). ✅ `src/redact.rs::prop_reject_strategy_hits_refuse_regardless_of_mode`
 - `prop_reject_strategy_miss_passes_through`: 单元 — reject secret 存在但未命中 (请求不含其真值) → 不触发拒绝, 其余 secret 正常 redact (`prop_reject_strategy_miss_preserves_other_secrets_redact`) / 请求正常转发 (集成回归 `prop_reject_strategy_unhit_forwards_normally`) (缺省路径零行为变化的回归面). ✅ `src/redact.rs::prop_reject_strategy_miss_passes_through` + `tests/integration.rs::prop_reject_strategy_unhit_forwards_normally`
+- `prop_validated_manual_gen_spec_meets_candidate_space_floor` (#383): redact 策略下, 任意手动配置的 gen_spec 经 `validate_and_resolve` 通过 ⟹ 候选空间 ≥ 2^20 (弱配置拒绝的 property 化 — 通过即强配置). ✅ `src/secrets.rs::prop_validated_manual_gen_spec_meets_candidate_space_floor`
+- `prop_short_real_redact_rejected_other_strategies_pass` (#383): 过短 real (恰 3 chars — 通过 validate_value 字节下限, 落在等长约束物理边界) — redact 恒被拒且 Err 引导 reject/placeholder 而不含真值 (SEC 红线); 引导目标 (reject/placeholder) 恒通过. ✅ `src/secrets.rs::prop_short_real_redact_rejected_other_strategies_pass`
 
 ### RED-10 placeholder 策略 (明示假值 + 蜜罐检测)
 
@@ -1120,7 +1124,9 @@ codec-less 协议 + secrets) 默认拒绝转发 (503, 上游零请求); 响应�
 暴露面 (上游 / 易被日志采集的失败响应体) 必须显式 opt-in (`on_probe_exhausted =
 "fail_open"` / `on_unsupported_protocol = "fail_open"` / `on_fallback_restore =
 "restore"`). 三个开关: `[redact] on_probe_exhausted` / `[redact]
-on_unsupported_protocol` / `[redact] on_fallback_restore`.
+on_unsupported_protocol` / `[redact] on_fallback_restore`. 注: probing 耗尽的弱配置
+触发面自 2026-10-21 起在配置期被 fail-fast 拒绝 (RED-9 "配置期弱配置拒绝", #383
+方案 D) — fail_open 的 record 真值回显冲突面 (SEC-1) 收敛至仅 adversarial 形态.
 
 **Rationale (不对称性)**: 可用性损失 (请求被拒 / 客户端看到 Mock) 可重试恢复 —
 重试 / 换协议路径 / opt-in; 机密性损失 (real 随上游请求或客户端日志扩散) 不可逆.
@@ -1745,3 +1751,4 @@ chars (char boundary 安全); 其余事件字段为受控类型, 天然无 secre
 | 2026-10-21 | FWD-2 (精确化, #388) | **Anthropic 响应 stop_reason 未建模官方值保真 + 生成器 thinking 块轴**: ① `IrStopReason` 增显式变体 `PauseTurn` / `ContextWindowExceeded` — `read_stop_reason` 显式映射 (`pause_turn` / `model_context_window_exceeded`), 同协议 writer verbatim 回写 (非流式 `write_response` + 流式 `message_delta`, redact 重序列化路径不再改写 "end_turn"; `pause_turn` 是 server-tool agentic loop 常规返回, agent harness 靠它决定 append-and-resume); 跨协议投影与 Other 一致 (o→"stop" / r→"completed") — 不引入新跨协议语义, 属 §0.5 例外① 互译精确化; ② 选型: 未采用 `Other(String)` verbatim 携带 — writer 无法区分 token 源协议, 跨协议 verbatim 会泄漏 foreign token (破坏枚举 "无 String payload 防泄漏" 不变量), 且响应侧无 `clear_wire_fidelity` 对称 seam; 未来新增官方 token 仍走 Other 改写 (残余登记 known-limitations "L8 残余面"); ③ `stop_reason: null` 防御形态维持现状 (保真需 IrResponse 形态元数据 + ResponseData/RespFinality/derive 链路携带 + consistency 守卫联动 — 真实响应恒非 null 不值该改动; 流式 message_start 的 null 由流式 writer 恒写 Value::Null 已保真, 单测守卫); ④ FWD-2 生成器两轴: `arb_anthropic_stop_reason` 补两官方值 + `arb_anthropic_response_block` 纳入 thinking 族 (复用 `arb_anthropic_thinking_block`, T7 保真随 `anthropic_response_preserves_wire_semantics` 常驻守卫, 3000 case 冲击通过) | issue #388: known-limitations "L8 残余面" review 发现 stop_reason 未建模值被静默改写是 FWD-1 "real↔mock 之外唯一合法修改" 的既有违反面, agent harness 场景影响真实 |
 | 2026-10-21 | RED-8 + SEC-10 (观测面精化) | **mock-not-restored WARN 实存 gate (#395 降噪)**: `warn_mock_not_restored` 增加第二层判据 `RedactionMap::contains_any_restorable_mock(body)` (双形态匹配: raw + JSON 转义, dag search SEC-1 扫描同款考量) — 降级体实存 mock 才 WARN ("client will see mock values" 的字面真值), 零命中降 debug (`no mock present in degraded body; nothing escaped`). **数据流零变更** (withhold/restore 决策与出站字节不变), 纯可观测性精化; SEC-10 property 陈述同步 + 🔁 落地测试追加 `stream_non_sse_error_body_without_mock_skips_mock_not_restored_warn` (既有 body-含-mock 测试原样绿 — 隐式前提显式化). 单测 `contains_mock_raw_and_escaped_and_miss_forms` | 部署实例实测: GLM Coding Plan 429 限流族 (1305 等) 对 stream=true 回 error envelope (无 choices, 不回显请求内容, 无 content-type), 触发 mock-not-restored WARN 165 次/半日 (晚高峰密集) 全为虚警 — 错误体不含 mock, "client will see mock values" 字面为假; 调研佐证 (智谱错误码表 + 社区反馈 + OpenAI SDK 错误路径源码) 见 PR 描述 |
 | 2026-10-21 | FWD-1 + FWD-7 + POOL-1..6 (授权闭环) | 三笔"待人工授权"挂账批量授权, 摘除标记: ① FWD-1 router /models 本地终结豁口 (窄范围: 仅 router provider 模型列表 GET, Direct 透传 D6 守卫不变); ② FWD-7 (N3/N4) common_uri 候选序懒回退 (仅网关自建 fetch 请求, 转发零触碰); ③ POOL-1..6 整域转正 — 契约 SSOT 从 `src/pool.rs` 头部翻转到本档 (头注降为模块级细化). **行为零变更** (三笔均已上线数周, property 全挂既有测试); 授权含义 = 此后任一笔的语义演进须重新走 §0.5 人工授权 | issue #361: 用户逐项过目意图层自评后裁决"全部同意" (自评结论: 三笔均长在网关自有功能面 — router 元数据 / 网关自建请求 / 套餐池特性, 不触碰"转发透明性"核心; POOL 的 README 用户承诺与契约草稿错位随本授权闭合) |
+| 2026-10-21 | RED-9 (增补) + RED-4 / SEC-10 / SEC-1 (触发面收窄) | **配置期弱配置拒绝 (#383 方案 D)**: `SecretEntry::validate_and_resolve` choke point 对 redact 策略新增两道 fail-fast 拒绝 — ① 手动 gen_spec 候选空间 < 2^20 (`MIN_CANDIDATE_SPACE_WARN`, 自 lint WARN 升级; Auto 路径 widen 兜底恒达标, 命中的必是手动配置); ② real < 4 chars (等长约束下空间物理不可达, 上界 65³ ≈ 27 万; 引导 reject/placeholder — 两策略不做 mock 生成, 不受 gate 约束). Err message 只含 id/数字/建议 (SEC 红线). Auto widen 兜底与 `on_probe_exhausted` 开关语义不变; RED-4 耗尽触发面残余 = 仅空间达标但对抗构造的 IR, SEC-10 fail_open 的 record 真值回显与 SEC-1 的冲突面随之收敛至 ≈ 0 — 裁决维持不登记 SEC-1 例外 (方案 C 随 D 成立而无必要). 新增 2 条 property (`prop_validated_manual_gen_spec_meets_candidate_space_floor` / `prop_short_real_redact_rejected_other_strategies_pass`) + 既有测试 `validate_and_resolve_leaves_weak_spec_lintable` 语义翻转为 `validate_and_resolve_rejects_weak_manual_gen_spec` | issue #383 用户裁决 (2026-10-21 23:11): "采纳方案D, 配置期拒绝, 对于过短的 secret, 引导用户选择其他方案" — fail_open 时被跳过 secret 的 record 含真值回显 WebUI 与 SEC-1 冲突, 从配置期源头消灭触发面优于登记契约例外 |
