@@ -224,9 +224,13 @@ normalize(v) == normalize(Writer(Reader(v)))
   根因实为生成器生成协议外形态 (顶层 `input_tokens`/`output_tokens` + 缺
   `stop_sequence`), 非 codec 缺陷; 收紧生成器至真实协议形态后 reader/writer 本就
   镜像对称 (usage 嵌套 + cache 双维度 + stop_sequence 三值), IrUsage 无需重构,
-  `anthropic_response_preserves_wire_semantics` 转正常驻. 覆盖边界 = **已建模字段**
-  的 round-trip; 未建模值面 (stop_reason 官方枚举 `pause_turn` 等被改写 / usage
-  子字段丢弃) 的残余缺口登记在 `docs/known-limitations.md` codec 节独立条目
+  `anthropic_response_preserves_wire_semantics` 转正常驻. #388 增补: 响应 stop_reason
+  已知官方枚举全覆盖 (`IrStopReason` 显式变体 PauseTurn / ContextWindowExceeded,
+  同协议 verbatim 回写 — 非流式 + 流式 message_delta; 跨协议投影与 Other 一致,
+  不引入新跨协议语义) + 响应 content 纳入 thinking 族 block 轴 (T7 保真随 property
+  常驻守卫). 覆盖边界 = **已建模字段与已建模官方值** 的 round-trip; 未建模残余
+  (stop_reason 未来新增官方 token 被改写 / `null` 防御形态 / usage 子字段丢弃) 的
+  残余缺口登记在 `docs/known-limitations.md` codec 节独立条目
 
 搁置项对应的 proptest 生成器分支已用 `// NOTE` 标注, 实现后恢复即可.
 

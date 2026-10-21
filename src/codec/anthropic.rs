@@ -1197,6 +1197,10 @@ fn read_stop_reason(s: &str) -> IrStopReason {
         "stop_sequence" => IrStopReason::StopSequence,
         "tool_use" => IrStopReason::ToolUse,
         "refusal" => IrStopReason::Refusal,
+        // #388: 官方枚举显式建模 — 同协议 (含 redact) 路径 verbatim 回写, 不再
+        // 塌缩为 Other 被 writer 改写 "end_turn" (FWD-1 非法修改面).
+        "pause_turn" => IrStopReason::PauseTurn,
+        "model_context_window_exceeded" => IrStopReason::ContextWindowExceeded,
         _ => IrStopReason::Other,
     }
 }
@@ -1473,6 +1477,13 @@ fn write_stop_reason(reason: Option<IrStopReason>) -> String {
         Some(IrStopReason::ToolUse) => "tool_use".to_string(),
         Some(IrStopReason::Safety) => "end_turn".to_string(), // Anthropic 无 safety, 用 end_turn
         Some(IrStopReason::Refusal) => "refusal".to_string(),
+        // #388: 官方枚举 verbatim 回写 (同协议 reader 镜像 — pause_turn 是
+        // server-tool loop 的常规返回, agent harness 靠它决定 append-and-resume).
+        Some(IrStopReason::PauseTurn) => "pause_turn".to_string(),
+        Some(IrStopReason::ContextWindowExceeded) => "model_context_window_exceeded".to_string(),
+        // Other (未建模 token) | None (缺席/null — 非流式真实响应恒非 null 的防御面):
+        // 兜底合成 "end_turn". 未建模 token 的改写残余与 null 形态保真的搁置理由
+        // 见 known-limitations codec 节 "L8 残余面" (#388).
         Some(IrStopReason::Other) | None => "end_turn".to_string(),
     }
 }
@@ -1643,6 +1654,12 @@ mod tests {
         );
         assert_eq!(read_stop_reason("tool_use"), IrStopReason::ToolUse);
         assert_eq!(read_stop_reason("refusal"), IrStopReason::Refusal);
+        // #388: 官方枚举显式建模 (同协议 redact 路径 verbatim 回写).
+        assert_eq!(read_stop_reason("pause_turn"), IrStopReason::PauseTurn);
+        assert_eq!(
+            read_stop_reason("model_context_window_exceeded"),
+            IrStopReason::ContextWindowExceeded
+        );
         // 未知 → Other (fallback, 覆盖 default 分支).
         assert_eq!(read_stop_reason("unknown_xyz"), IrStopReason::Other);
     }
@@ -2053,6 +2070,12 @@ mod tests {
             ("stop_sequence", IrStopReason::StopSequence),
             ("tool_use", IrStopReason::ToolUse),
             ("refusal", IrStopReason::Refusal),
+            // #388: 官方枚举显式建模.
+            ("pause_turn", IrStopReason::PauseTurn),
+            (
+                "model_context_window_exceeded",
+                IrStopReason::ContextWindowExceeded,
+            ),
             ("weird_token", IrStopReason::Other),
         ];
         for (s, expected) in cases {
@@ -2064,6 +2087,91 @@ mod tests {
             let ir = reader().read_response(&body).unwrap();
             assert_eq!(ir.stop_reason, Some(expected), "for stop_reason={s}");
         }
+    }
+
+    /// #388 (FWD-2/L8 残余修复): 已建模官方 stop_reason 值经同协议 reader→writer
+    /// round-trip (redact 重序列化路径的 codec 半段) 必须逐字保真 — `pause_turn`
+    /// 是 server-tool agentic loop 的常规返回, 被改写为 "end_turn" 会让客户端
+    /// harness 误判轮次终态 (append-and-resume 逻辑失效). 对照组 `future_token`
+    /// 锁定未建模 token 仍走 Other → "end_turn" 兜底 (残余边界不被误扩大, 见
+    /// known-limitations "L8 残余面").
+    #[test]
+    fn same_proto_stop_reason_modeled_values_round_trip_verbatim() {
+        // (输入 token, 回写期望): 已建模官方值 verbatim; 未建模 token 兜底改写.
+        let cases = [
+            ("pause_turn", "pause_turn"),
+            (
+                "model_context_window_exceeded",
+                "model_context_window_exceeded",
+            ),
+            ("future_token", "end_turn"),
+        ];
+        for (input, expected) in cases {
+            let body = json!({
+                "id": "msg_1", "type": "message", "role": "assistant",
+                "model": "claude-x",
+                "content": [{"type": "text", "text": "hi"}],
+                "stop_reason": input,
+                "stop_sequence": null,
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            });
+            let ir = reader().read_response(&body).unwrap();
+            let out = writer().write_response(&ir);
+            assert_eq!(
+                out.get("stop_reason").and_then(serde_json::Value::as_str),
+                Some(expected),
+                "stop_reason {input} must round-trip as {expected}"
+            );
+        }
+    }
+
+    /// #388 流式半面: message_delta 携带已建模官方 stop_reason 时, 同协议
+    /// restore 模式 (reader → IR 事件 → writer, 见 StreamTranslate) 的客户端
+    /// 字节 verbatim 保真; message_start 的 `stop_reason: null` 由 writer 恒写
+    /// Value::Null (既有行为, 本测试一并守卫不被回归).
+    #[test]
+    fn stream_message_delta_modeled_stop_reason_round_trips_verbatim() {
+        let mut decode = StreamDecodeState::default();
+        let events = reader().read_response_events(
+            "message_delta",
+            &json!({"type": "message_delta", "delta": {"stop_reason": "pause_turn", "stop_sequence": null}}),
+            &mut decode,
+        );
+        match &events[..] {
+            [IrStreamEvent::MessageDelta { stop_reason, .. }] => {
+                assert_eq!(*stop_reason, Some(IrStopReason::PauseTurn));
+            }
+            other => panic!("expected single MessageDelta, got: {other:?}"),
+        }
+
+        // reader 产出的事件原样喂 writer (同协议 restore 模式的事件流形状).
+        let mut encode = StreamEncodeState::default();
+        let frames = writer().write_response_event(&events[0], &mut encode);
+        let (_, delta_json) = frames
+            .iter()
+            .find(|(et, _)| et == "message_delta")
+            .expect("message_delta frame emitted");
+        assert_eq!(
+            delta_json["delta"]["stop_reason"].as_str(),
+            Some("pause_turn"),
+            "stream writer must emit verbatim stop_reason: {delta_json}"
+        );
+
+        // message_start 的 null 保真 (既有行为, #388 评估时验证).
+        let start_frames = writer().write_response_event(
+            &IrStreamEvent::MessageStart {
+                usage: None,
+                id: Some("msg_1".into()),
+                created: None,
+                model: Some("claude-x".into()),
+            },
+            &mut encode,
+        );
+        let (_, start_json) = start_frames
+            .iter()
+            .find(|(et, _)| et == "message_start")
+            .expect("message_start frame emitted");
+        assert!(start_json["message"]["stop_reason"].is_null());
     }
 
     // ─── write_request ─────────────────────────────────────────────────

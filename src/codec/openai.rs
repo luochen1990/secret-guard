@@ -1458,7 +1458,12 @@ fn write_stop_reason(reason: Option<IrStopReason>) -> Value {
         Some(IrStopReason::ToolUse) => "tool_calls",
         Some(IrStopReason::Safety) => "content_filter",
         Some(IrStopReason::Refusal) => "stop", // OpenAI 没有 refusal, 映射到 stop
-        Some(IrStopReason::Other) | None => "stop",
+        // #388: Anthropic 专属官方值 (PauseTurn / ContextWindowExceeded) 无 OpenAI
+        // 对应概念 — 跨协议投影与 Other 一致, 不引入新的跨协议语义.
+        Some(IrStopReason::PauseTurn)
+        | Some(IrStopReason::ContextWindowExceeded)
+        | Some(IrStopReason::Other)
+        | None => "stop",
     };
     Value::String(s.to_string())
 }
@@ -2584,6 +2589,32 @@ mod tests {
         assert_eq!(choices[0].get("finish_reason").unwrap(), "stop");
         let usage = chunk.get("usage").expect("usage must be present");
         assert_eq!(usage.get("prompt_tokens").unwrap(), 7);
+    }
+
+    /// #388: `write_stop_reason` 全变体投影表 — Anthropic 专属官方值
+    /// (PauseTurn / ContextWindowExceeded) 无 OpenAI 对应概念, 投影与 Other 一致
+    /// ("stop"), 不引入新的跨协议语义 (跨协议 a→o 翻译行为不变).
+    #[test]
+    fn writer_stop_reason_projects_anthropic_only_variants_like_other() {
+        let cases: &[(Option<IrStopReason>, &str)] = &[
+            (Some(IrStopReason::EndTurn), "stop"),
+            (Some(IrStopReason::StopSequence), "stop"),
+            (Some(IrStopReason::MaxTokens), "length"),
+            (Some(IrStopReason::ToolUse), "tool_calls"),
+            (Some(IrStopReason::Safety), "content_filter"),
+            (Some(IrStopReason::Refusal), "stop"),
+            (Some(IrStopReason::PauseTurn), "stop"),
+            (Some(IrStopReason::ContextWindowExceeded), "stop"),
+            (Some(IrStopReason::Other), "stop"),
+            (None, "stop"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                write_stop_reason(*input),
+                serde_json::Value::String((*expected).to_string()),
+                "for {input:?}"
+            );
+        }
     }
 
     #[test]

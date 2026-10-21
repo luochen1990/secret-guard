@@ -759,7 +759,20 @@ pub enum IrStopReason {
     Safety,
     /// 模型拒绝 (Anthropic `"refusal"`; OpenAI 无直接对应).
     Refusal,
+    /// server-tool agentic loop 的暂停返回 (Anthropic `"pause_turn"`, #388) — 客户端
+    /// (agent harness) 靠它决定 append-and-resume, 同协议 writer verbatim 回写.
+    /// 仅 Anthropic reader 产生; 跨协议投影与 [`Self::Other`] 一致 (o/r 无对应概念).
+    PauseTurn,
+    /// 上下文窗口耗尽 (Anthropic `"model_context_window_exceeded"`, #388) — 同协议
+    /// writer verbatim 回写; 跨协议投影与 [`Self::Other`] 一致 (o 侧 "length" 归
+    /// MaxTokens 专属, 此变体的 egress 语义由 Anthropic 文档定义, 不做猜测映射).
+    ContextWindowExceeded,
     /// 兜底: 任何无法识别的 native token. 防止 foreign 字符串泄漏.
+    ///
+    /// #388 选型注记: 未采用 `Other(String)` verbatim 携带 — writer 无法区分 token
+    /// 的源协议, 跨协议 verbatim 回写会泄漏 foreign token (破坏本枚举的核心不变量);
+    /// 响应侧也无 `clear_wire_fidelity` 对称 seam. 已知官方值走显式变体, 未来新增
+    /// token 仍是本变体 (残余改写面登记 known-limitations codec 节).
     Other,
 }
 

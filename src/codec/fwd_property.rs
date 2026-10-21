@@ -162,9 +162,12 @@ proptest! {
     /// reader/writer 对真实协议形态 (usage 嵌套 + stop_sequence 恒存在) 本就
     /// 镜像对称. 生成器收紧至已建模字段的真实协议形态 (见
     /// `arb_anthropic_response_value`), 与 OpenAI 半面 (#284) 同为"归一化收敛"
-    /// 路线, 本 property 转正常驻. 覆盖边界: 未建模值面 (stop_reason 官方枚举
-    /// `pause_turn` 等被改写 / usage 未建模子字段丢弃) 不在守卫面, 残余缺口
-    /// 登记 known-limitations codec 节 "L8 残余面" 条目.
+    /// 路线, 本 property 转正常驻. #388 增补两轴: ① stop_reason 官方枚举全覆盖
+    /// (`pause_turn` / `model_context_window_exceeded` 显式变体 + verbatim 回写);
+    /// ② 响应 content 的 thinking 族 block (T7 保真随本 property 常驻守卫).
+    /// 覆盖边界: 未建模残余 (stop_reason 未来新增官方 token 被改写 / `null` 防御
+    /// 形态 / usage 未建模子字段丢弃) 不在守卫面, 残余缺口登记 known-limitations
+    /// codec 节 "L8 残余面" 条目.
     #[test]
     fn anthropic_response_preserves_wire_semantics(v in arb_anthropic_response_value()) {
         let ir = AnthropicReader.read_response(&v).unwrap();
@@ -1709,7 +1712,12 @@ fn arb_anthropic_thinking_block() -> impl Strategy<Value = Value> {
 ///   property 恒红被 `#[ignore]`, 失去保护);
 /// - `stop_sequence` 恒存在 (writer 无条件写回此字段), 值 = null 或**非空**
 ///   string — 空串被 reader 的 `filter(!s.is_empty())` 归一为 None 写回 null,
-///   `""` → `null` 非等价, 不生成.
+///   `""` → `null` 非等价, 不生成;
+/// - `stop_reason` 覆盖全部已建模官方枚举 (#388, 含 `pause_turn` /
+///   `model_context_window_exceeded`); `null` 防御形态不生成 (writer 恒写
+///   string, 见 known-limitations "L8 残余面" null 子项);
+/// - `content` 含 text / tool_use / thinking 族 block (#388 — 扩展思考响应的
+///   常规形态, T7 reader/writer 对称建模).
 fn arb_anthropic_response_value() -> impl Strategy<Value = Value> {
     (
         "msg_[a-z0-9]{5,15}",
@@ -1779,6 +1787,11 @@ fn arb_anthropic_response_block() -> impl Strategy<Value = Value> {
             .prop_map(|(id, name, input)| {
                 json!({"type":"tool_use","id":id,"name":name,"input":input})
             }),
+        // #388: thinking 族 block 轴 (T7 已保真 — 扩展思考响应的常规 content 成员,
+        // 复用请求侧生成器; signature/data charset 结构性排除 sg-envelope 前缀,
+        // 见生成器注释). reader → IrBlock::ReasoningContent (opaque) → writer
+        // 原生写回, round-trip 由本 property 常驻守卫.
+        arb_anthropic_thinking_block(),
     ]
 }
 
@@ -1790,6 +1803,10 @@ fn arb_anthropic_stop_reason() -> impl Strategy<Value = Value> {
         Just(json!("tool_use")),
         // refusal: reader 映射 IrStopReason::Refusal, writer 写回 "refusal", 可逆.
         Just(json!("refusal")),
+        // #388: 官方枚举显式建模 — reader 显式变体 + writer verbatim 回写, 可逆
+        // (pause_turn 是 server-tool loop 常规返回, 改写 "end_turn" = FWD-1 违约).
+        Just(json!("pause_turn")),
+        Just(json!("model_context_window_exceeded")),
     ]
 }
 

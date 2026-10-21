@@ -2240,6 +2240,13 @@ mod tests {
             (IrStopReason::ToolUse, "response.completed", Value::Null),
             (IrStopReason::EndTurn, "response.completed", Value::Null),
             (IrStopReason::Other, "response.completed", Value::Null),
+            // #388: Anthropic 专属官方值 — 终止事件投影与 Other 一致.
+            (IrStopReason::PauseTurn, "response.completed", Value::Null),
+            (
+                IrStopReason::ContextWindowExceeded,
+                "response.completed",
+                Value::Null,
+            ),
         ] {
             let frames = write_events(&[delta(reason), IrStreamEvent::MessageStop]);
             assert_eq!(frames[0].0, event, "for reason {reason:?}");

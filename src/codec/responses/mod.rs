@@ -1250,7 +1250,11 @@ fn write_status_and_reason(reason: Option<IrStopReason>) -> (&'static str, Optio
         // 变体, 映射 failed 会触发客户端错误处理路径 (弹错/重试), 误导性强 —
         // "未知不伪装成确定错误". 读侧 "failed"→Other 保持 (read_response_status),
         // round-trip failed→Other→completed 有损, 是该折衷的已知代价.
-        Some(IrStopReason::Other) => ("completed", None),
+        // #388: Anthropic 专属官方值 (PauseTurn / ContextWindowExceeded) 同走
+        // completed — r 侧无对应概念, 跨协议投影与 Other 一致.
+        Some(IrStopReason::PauseTurn)
+        | Some(IrStopReason::ContextWindowExceeded)
+        | Some(IrStopReason::Other) => ("completed", None),
     }
 }
 
@@ -2255,6 +2259,9 @@ mod tests {
             (Some(IrStopReason::StopSequence), "completed", None),
             (Some(IrStopReason::ToolUse), "completed", None),
             (Some(IrStopReason::Other), "completed", None),
+            // #388: Anthropic 专属官方值 — 跨协议投影与 Other 一致 (r 无对应概念).
+            (Some(IrStopReason::PauseTurn), "completed", None),
+            (Some(IrStopReason::ContextWindowExceeded), "completed", None),
             (
                 Some(IrStopReason::MaxTokens),
                 "incomplete",
