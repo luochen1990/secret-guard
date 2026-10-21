@@ -448,7 +448,8 @@ impl GenSpec {
     /// - 并入只增不减 (charset ⊇ real 字符) ⇒ 仿真度单调不降;
     /// - 极短 real (n ≤ 3: 全开标准类后 65³ ≈ 27 万仍 < 2^20) 兜到"最大可达"即停 —
     ///   等长约束下空间上限 = charset_size^n, 属物理边界 (n ≥ 4 恒可达标: 62⁴ ≈ 1480 万),
-    ///   残余由 fail_closed 兜底.
+    ///   该形态由配置期 redact 短值 gate 拒绝 (#383 方案 D: validate_and_resolve 对
+    ///   redact + n<4 直接 Err 引导换策略), 运行时残余由 fail_closed 兜底.
     pub fn infer_default_for(real: &str, category: SecretCategory, global_prefix: &str) -> Self {
         let n = real.chars().count();
         let shape = infer_shape(real, category, global_prefix);
@@ -618,10 +619,12 @@ impl GenSpec {
     }
 }
 
-// ─── 候选空间 lint (配置期 WARN) ──────────────────────────────────────────
+// ─── 候选空间 lint (拒绝前的信息载体) ──────────────────────────────────────
 
-/// 配置期候选空间 lint 的 WARN 阈值: Auto 模式 gen spec 的候选空间低于此值时,
-/// [`MockStrategy::lint_candidate_space`] 返回 `Some` (由调用方 WARN).
+/// 配置期候选空间 gate 的阈值: gen spec 的候选空间低于此值时,
+/// [`MockStrategy::lint_candidate_space`] 返回 `Some` — 由调用方
+/// ([`crate::secrets::SecretEntry::validate_and_resolve`], redact 策略) 转为
+/// **fail-fast 拒绝** (#383 方案 D, 2026-10-21; 历史形态是 WARN).
 ///
 /// # rationale
 ///
@@ -629,8 +632,9 @@ impl GenSpec {
 /// `src/redact.rs`): redact 需要为每个 secret 找到**不在 IR 中且未被分配**的 mock,
 /// 有效空间还要再扣除 IR 已有内容与已分配 mock — 因此名义候选空间一旦低于探测
 /// 上限, 配合对抗性 IR 内容即可让 probing 耗尽 (触发
-/// `[redact] on_probe_exhausted` 的 fail-open/fail-closed). 本 lint 把这类弱配置
-/// 提前到配置写入时 (static 加载 / WebUI upsert) 暴露.
+/// `[redact] on_probe_exhausted` 的 fail-open/fail-closed). 本 gate 把这类弱配置
+/// 拒绝在配置写入时 (static 加载 / WebUI upsert), 从源头消灭耗尽触发面
+/// (fail_open 形态的 record 真值回显与 SEC-1 冲突 — issue #383 裁决).
 ///
 /// # 与 `redact::MOCK_PROBE_LIMIT` 的关系
 ///
@@ -639,7 +643,7 @@ impl GenSpec {
 /// 两者数值若需联动, 由人维护同步 (当前同为 2^20).
 pub const MIN_CANDIDATE_SPACE_WARN: u64 = 1 << 20;
 
-/// 弱候选空间 lint 的结果 (纯数据; 由调用方决定 WARN 文案, 便于单元测试).
+/// 弱候选空间 lint 的结果 (纯数据; 由调用方转成拒绝 message, 便于单元测试).
 /// 严禁携带 secret value 或 mock 明文 (SEC 红线).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CandidateSpaceLint {
@@ -737,13 +741,20 @@ impl GenSpec {
 
 impl MockStrategy {
     /// 配置期 lint: gen spec 的候选空间 < [`MIN_CANDIDATE_SPACE_WARN`] 时返回
-    /// `Some` (弱配置信号). **纯函数不直接打日志**, 由调用方 WARN — 便于单元测试.
+    /// `Some` (弱配置信号). **纯函数不直接打日志/返回错误**, 由调用方处理 —
+    /// 生产消费方是 `crate::secrets::SecretEntry::validate_and_resolve`: redact 策略下
+    /// 把命中转为 **fail-fast Err** (#383 方案 D, 2026-10-21 自 WARN 升级), 本函数
+    /// 是 Err message 的信息来源 (候选空间数字等).
     ///
     /// # 语义边界 (Auto widen 后)
     ///
     /// Auto 推断路径经 [`GenSpec::infer_default_for`] 的 widen 兜底, resolve 后
     /// 空间恒 ≥ 阈值 (极短 real 的物理边界除外) — Auto 场景实际不再触发本 lint;
     /// lint 的有效对象是**用户手动配置**的 gen_spec (`lint_explicit_weak_spec_is_some`).
+    /// 极短 real (n ≤ 3) 的 Auto 形态在 validate_and_resolve 被 redact 策略的
+    /// 独立短值 gate **更早拒绝** (引导换策略, 而非误导性的 "widen" 建议);
+    /// 本函数对其 resolved spec 仍返回 Some (纯函数边界语义, 由
+    /// `lint_auto_degenerate_real_widened_not_linted` 尾部钉住).
     ///
     /// # 调用前提 (无重复 resolve 副作用)
     ///

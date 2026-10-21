@@ -177,9 +177,13 @@ impl SecretEntry {
     ///    [`MockStrategy::validate_against_real`]): 用 resolve 后的 real value infer
     ///    gen spec (Auto 模式) 并校验 Fixed 不含 real 子串 (C5 best-effort). 必须在 value
     ///    resolve 后跑, 因为 infer 与 C5 检查都依赖 real value.
-    /// 6. **候选空间 lint** ([`MockStrategy::lint_candidate_space`]): gen spec 定型后
-    ///    对弱候选空间 (低于 [`crate::mock::MIN_CANDIDATE_SPACE_WARN`]) 打 WARN —
-    ///    把运行时 probing 耗尽的风险前置到配置写入时. 仅 WARN 不 reject (合法但高危).
+    /// 6. **候选空间 gate** ([`MockStrategy::lint_candidate_space`]): gen spec 定型后
+    ///    对弱候选空间 (低于 [`crate::mock::MIN_CANDIDATE_SPACE_WARN`]) **fail-fast 拒绝**
+    ///    (#383 方案 D, 2026-10-21: 自 WARN 升级 — 从配置期源头消灭 probing 耗尽的
+    ///    触发面, 见 contracts.md RED-9). 仅对 redact 策略生效 (reject/placeholder
+    ///    不做 mock 生成, 无触发面); Auto 路径经 widen 兜底恒达标, 命中的必是用户
+    ///    手动配置的弱 gen_spec. 同 gate 族还有过短 real 的 redact 拒绝
+    ///    (`MIN_REDACT_REAL_CHARS`, 物理边界 — Auto widen 救不了).
     ///
     /// # 与 Provider 的差异
     ///
@@ -189,6 +193,23 @@ impl SecretEntry {
         self.validate()?;
         self.resolve_value()?;
         validate_value(&self.value, global_mock_prefix)?;
+        // ── #383 方案 D gate ①: 过短 real + redact 策略拒绝 ──
+        // 在 resolve 之前判 (value 已 resolve): 等长 Auto 推断下 n < MIN_REDACT_REAL_CHARS
+        // 时候选空间物理上不可达 2^20 (上界 65^n — 62 标准类 + n 个 real 自带 other 字符,
+        // n=3 时 ≈ 27 万), Auto widen 兜底救不了 — 若留给 gate ② 只能得到 "widen charset"
+        // 的误导性引导 (Auto 推断结果不可配), 此处给出唯一可行动的引导: 换策略.
+        // 只挡 redact (reject/placeholder 不做 mock 生成, 短值合法); chars().count()
+        // 非 len() — 与等长约束/mock 长度的字符口径一致 (multibyte 安全).
+        if matches!(self.strategy, SecretStrategy::Redact)
+            && self.value.chars().count() < MIN_REDACT_REAL_CHARS
+        {
+            return Err(format!(
+                "secret {}: value too short for equal-length redact mock generation \
+                 (physical candidate-space boundary; use strategy 'reject' or \
+                 'placeholder' instead)",
+                self.id
+            ));
+        }
         // category↔形状矛盾检测 (resolve_against **之前**: 此时 gen_spec.is_some()
         // ⟺ 用户显式配置, infer 填充与用户配置可区分): 标注与值的形状特征矛盾时
         // WARN — PEM 矛盾 = 行为已最优但标注是语义债 (所见非所为), JWT/公开前缀
@@ -214,20 +235,24 @@ impl SecretEntry {
         self.mock_strategy
             .resolve_against(&self.value, self.category, global_mock_prefix);
         self.mock_strategy.validate_against_real(&self.value)?;
-        // 配置期候选空间 lint (弱 mock 策略前置 WARN, 非 reject): resolve 之后 gen_spec
-        // 已定型, 此处纯读. 所有 entry 进入系统的路径 (static 加载 / dynamic 加载 /
-        // WebUI upsert) 都经过本方法, 是公共 choke point. WARN 内容严禁含 secret value
-        // 或 mock (SEC 红线) — 只含 id / 数字 / 建议.
-        if let Some(lint) = self.mock_strategy.lint_candidate_space() {
-            tracing::warn!(
-                secret_id = %self.id,
-                charset_size = lint.charset_size,
-                body_length_range = ?lint.body_length_range,
-                candidate_space = lint.space,
-                min_recommended = crate::mock::MIN_CANDIDATE_SPACE_WARN,
-                "mock gen spec candidate space is below the probing budget; runtime \
-                 probing may exhaust (on_probe_exhausted); widen charset or length_range"
-            );
+        // ── #383 方案 D gate ②: 弱候选空间 gen_spec 从 WARN 升级为拒绝 ──
+        // resolve 之后 gen_spec 已定型 (Auto 路径经 widen 兜底恒 ≥ 阈值 — 此处命中的
+        // 必是用户手动配置的弱 gen_spec), 纯读. 所有 entry 进入系统的路径 (static 加载
+        // / dynamic 加载 / WebUI upsert) 都经过本方法, 是公共 choke point. 仅对 redact
+        // 策略生效 (同 gate ① 的策略边界). Err message 严禁含 secret value 或 mock
+        // (SEC 红线) — 只含 id / 数字 / 建议.
+        if matches!(self.strategy, SecretStrategy::Redact)
+            && let Some(lint) = self.mock_strategy.lint_candidate_space()
+        {
+            return Err(format!(
+                "secret {}: mock gen spec candidate space {} is below the minimum \
+                 recommended {} (runtime probing may exhaust and degrade via \
+                 on_probe_exhausted); widen charset or length_range, or switch \
+                 strategy to reject/placeholder",
+                self.id,
+                lint.space,
+                crate::mock::MIN_CANDIDATE_SPACE_WARN
+            ));
         }
         Ok(())
     }
@@ -302,6 +327,17 @@ pub fn validate_id(id: &str) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// redact 策略 real 的最小字符数 (#383 方案 D gate ①, 2026-10-21).
+///
+/// 物理边界推导: 等长 Auto 推断的候选空间上界 = charset_size^n (n = real 字符数,
+/// charset ≤ 62 标准类 + n 个 real 自带的 other 字符), n ≤ 3 时最大 65³ ≈ 27.5 万
+/// < 2^20 — widen 兜底也救不了, mock probing 耗尽是物理必然而非对抗构造.
+/// n ≥ 4 恒可达标 (62⁴ ≈ 1480 万). 另一独立理由: 极短值在 IR 子串匹配中是海量
+/// 误命中源 (替换会大面积破坏请求文本). 拒绝时引导 reject/placeholder
+/// (不做 mock 生成, 短值合法). 用 `chars().count()` 口径 — 与等长约束/mock 长度
+/// 的字符语义一致 (multibyte 安全), 区别于 [`validate_value`] 的字节下限.
+const MIN_REDACT_REAL_CHARS: usize = 4;
 
 /// 校验 secret value. 防止用户误配短 / 结构性 / 含 PUA / 与 mock prefix 冲突的 secret
 /// (避免 redact 时破坏整个请求 body 或 round-trip identity).
@@ -992,46 +1028,87 @@ mod tests {
         assert!(e.validate().is_ok());
     }
 
-    // ─── validate_and_resolve 的候选空间 lint 触发路径 ─────────────────────
+    // ─── validate_and_resolve 的弱配置拒绝 (#383 方案 D: 配置期 fail-fast) ────
     //
-    // validate_and_resolve 是 static 加载 (Config::load_or_default) / dynamic 加载
-    // (DynamicState::load_or_empty) / WebUI upsert (web::api::secrets create/update)
-    // 三条路径的公共 choke point; lint 在其内部第四步 (resolve_against) 之后执行.
-    // 日志断言不做 (tracing 测试开销大), 单元级验证: 返回值 Ok + resolve 后的
-    // entry 状态使 lint 触发/不触发.
+    // SEC-1 裁决 (issue #383): on_probe_exhausted=fail_open 时被跳过 secret 的 record
+    // 含真值回显 WebUI, 与 SEC-1 契约冲突 — 裁决从配置期源头消灭 probing 耗尽的
+    // 触发面 (弱 mock 配置直接拒绝), 而非为冲突登记契约例外. 两道 gate 都只对
+    // Redact 策略生效 (reject/placeholder 不做 mock 生成, 无触发面 — 引导目标必须
+    // 可达); Err message 严禁含 secret value 或 mock (SEC 红线) — 只含 id / 数字 / 建议.
 
     #[test]
-    fn validate_and_resolve_leaves_weak_spec_lintable() {
-        // 显式弱 mock 策略 (charset 2 × len 4 = 16 候选): 校验通过 (合法但高危),
-        // validate_and_resolve 后 lint 仍可触发 — 即 choke point 路径上 WARN 会发出.
-        let mut e = SecretEntry {
-            id: "weak-spec".into(),
-            name: None,
-            category: SecretCategory::ApiKey,
-            value: "some-real-secret-value".into(),
-            value_file: None,
-            mock_strategy: crate::mock::MockStrategy {
-                initial: crate::mock::InitialValue::Auto,
-                gen_spec: Some(crate::mock::GenSpec {
-                    prefix: "".into(),
-                    charset: crate::mock::Charset {
-                        other: vec!['a', 'b'],
-                        ..Default::default()
-                    },
-                    length_range: (4, 4),
-                    shape: crate::mock::SecretShape::Plain,
-                }),
-                gen_inferred: false,
-            },
-            strategy: SecretStrategy::default(),
+    fn validate_and_resolve_rejects_weak_manual_gen_spec() {
+        // 显式弱 mock 策略 (charset 2 × len 4 = 16 候选 << 2^20): validate_and_resolve
+        // 拒绝 (语义自 #383 起由 "通过 + WARN" 翻转为 fail-fast Err — 候选空间 lint
+        // 是 Err 的信息来源, 见 MockStrategy::lint_candidate_space).
+        let mut e = entry("weak-spec", "some-real-secret-value");
+        e.mock_strategy = crate::mock::MockStrategy {
+            initial: crate::mock::InitialValue::Auto,
+            gen_spec: Some(crate::mock::GenSpec {
+                prefix: "".into(),
+                charset: crate::mock::Charset {
+                    other: vec!['a', 'b'],
+                    ..Default::default()
+                },
+                length_range: (4, 4),
+                shape: crate::mock::SecretShape::Plain,
+            }),
+            gen_inferred: false,
         };
-        assert!(e.validate_and_resolve("").is_ok());
-        let lint = e
-            .mock_strategy
-            .lint_candidate_space()
-            .expect("weak spec should be lintable after validate_and_resolve");
-        assert_eq!(lint.space, 16);
-        // lint 结果不含 value/mock 字段是类型系统保证 (CandidateSpaceLint 只有数字).
+        let err = e.validate_and_resolve("").unwrap_err();
+        assert!(
+            err.contains("weak-spec"),
+            "err should mention secret id: {err}"
+        );
+        assert!(
+            err.contains("16") && err.contains(&format!("{}", 1 << 20)),
+            "err should carry candidate space vs min recommended: {err}"
+        );
+        assert!(
+            err.contains("reject") && err.contains("placeholder"),
+            "err should guide strategy alternatives: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_and_resolve_rejects_short_real_for_redact() {
+        // "abc" (3 chars): validate_value (≥3 字节) 通过, 但等长 Auto 推断下候选空间
+        // 物理上不可达 2^20 (上界 65³ ≈ 27 万) — 拒绝 + 引导换策略.
+        let mut e = entry("short-real", "abc");
+        let err = e.validate_and_resolve("").unwrap_err();
+        assert!(
+            err.contains("short-real"),
+            "err should mention secret id: {err}"
+        );
+        assert!(
+            err.contains("reject") && err.contains("placeholder"),
+            "err should guide strategy alternatives: {err}"
+        );
+        assert!(!err.contains("abc"), "SEC 红线: err 严禁含真值: {err}");
+        // multibyte: "密码" 2 chars (6 字节, 通过 validate_value 字节下限) — 拒绝判据
+        // 是 chars().count() (与等长约束/mock 长度口径一致), 非 len() 字节数.
+        let mut m = entry("short-multibyte", "密码");
+        assert!(
+            m.validate_and_resolve("").is_err(),
+            "multibyte 2-char value must be rejected by char count"
+        );
+        // 边界: 4 chars 恰好放行 (62⁴ ≈ 1480 万 ≥ 2^20, widen 兜底可达标).
+        let mut ok = entry("boundary-four", "abcd");
+        assert!(ok.validate_and_resolve("").is_ok());
+    }
+
+    #[test]
+    fn validate_and_resolve_allows_short_real_for_reject_and_placeholder() {
+        // 引导目标可达: reject/placeholder 不做 mock 生成 (整请求拒绝 / 固定明示
+        // 假值), 无 probing 耗尽触发面 — 短值合法, 不受两道 gate 约束.
+        for s in [SecretStrategy::Reject, SecretStrategy::Placeholder] {
+            let mut e = entry("short-ok", "abc");
+            e.strategy = s;
+            assert!(
+                e.validate_and_resolve("").is_ok(),
+                "{s:?} + short value should pass (guided target must be legal)"
+            );
+        }
     }
 
     #[test]
@@ -1077,6 +1154,79 @@ mod tests {
     use proptest::prelude::*;
 
     proptest! {
+        /// #383 方案 D: redact 策略下, 任意手动配置的 gen_spec 经 validate_and_resolve
+        /// 通过 ⟹ 候选空间 ≥ 2^20 (弱配置的配置期拒绝 property 化 — 通过即强配置).
+        ///
+        /// 条件式 (is_ok ⟹ 断言): charset 全关等形态被 GenSpec::validate 拒绝, 属于
+        /// 另一条错误路径, 不在本 property 的断言范围.
+        #[test]
+        fn prop_validated_manual_gen_spec_meets_candidate_space_floor(
+            real in "[a-z0-9]{4,24}",
+            digits in any::<bool>(),
+            lowercase in any::<bool>(),
+            uppercase in any::<bool>(),
+            body_min in 1usize..8,
+            body_extra in 0usize..8,
+        ) {
+            let mut e = entry("prop-floor", &real);
+            e.mock_strategy = crate::mock::MockStrategy {
+                initial: crate::mock::InitialValue::Auto,
+                gen_spec: Some(crate::mock::GenSpec {
+                    prefix: "".into(),
+                    charset: crate::mock::Charset {
+                        digits,
+                        lowercase,
+                        uppercase,
+                        ..Default::default()
+                    },
+                    length_range: (body_min, body_min + body_extra),
+                    shape: crate::mock::SecretShape::Plain,
+                }),
+                gen_inferred: false,
+            };
+            if e.validate_and_resolve("").is_ok() {
+                prop_assert!(
+                    e.mock_strategy.lint_candidate_space().is_none(),
+                    "通过校验的 redact gen_spec 候选空间必须 ≥ 2^20 (弱配置应被拒绝)"
+                );
+            }
+        }
+
+        /// #383 方案 D: 过短 real (恰 3 chars — 通过 validate_value 字节下限, 落在
+        /// 等长约束的物理边界): redact 恒被拒且 Err 引导 reject/placeholder 而不含
+        /// 真值; 引导目标 (reject/placeholder) 恒通过. 生成器限数字: gate ① 的 Err
+        /// 是固定模板 (无数字), 否则随机 3 字母真值可与模板子串巧合 (proptest 实证:
+        /// "tea" ⊂ "instead" 触发 SEC 断言假阳性 — 模板本不含真值).
+        #[test]
+        fn prop_short_real_redact_rejected_other_strategies_pass(
+            real in "[0-9]{3}",
+            which in 0usize..3,
+        ) {
+            let strategies = [
+                SecretStrategy::Redact,
+                SecretStrategy::Reject,
+                SecretStrategy::Placeholder,
+            ];
+            let mut e = entry("prop-short", &real);
+            e.strategy = strategies[which];
+            match strategies[which] {
+                SecretStrategy::Redact => {
+                    let err = e.validate_and_resolve("").unwrap_err();
+                    prop_assert!(
+                        err.contains("reject") && err.contains("placeholder"),
+                        "err should guide strategy alternatives: {err}"
+                    );
+                    prop_assert!(
+                        !err.contains(&real),
+                        "SEC 红线: err 严禁含真值: {err}"
+                    );
+                }
+                _ => {
+                    prop_assert!(e.validate_and_resolve("").is_ok());
+                }
+            }
+        }
+
         /// SEC-1: 任意 secret value, EffectiveSecret 序列化后的 JSON 字符串不含真实 value.
         ///
         /// 这是 GET /secrets 路径的核心安全保证 — 任何泄露都是 Critical bug.

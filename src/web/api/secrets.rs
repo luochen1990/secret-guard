@@ -183,8 +183,9 @@ pub(crate) struct CreateSecretRequest {
     #[serde(default)]
     pub mock_strategy: Option<crate::mock::MockStrategy>,
     /// 可选: per-secret 处理策略 (#305). 省略时后端用 [`SecretStrategy::default`]
-    /// (Redact). protect / placeholder 已定义但未实现, 提交会被 validate 拒绝
-    /// (fail-fast, 防止以为受保护而实际静默失效).
+    /// (Redact). protect 已定义但行为搁置, 提交会被 validate 拒绝
+    /// (fail-fast, 防止以为受保护而实际静默失效); redact 的弱 mock 配置
+    /// (gen_spec 候选空间不足 / 真值过短) 同样被 validate_and_resolve 拒绝 (#383).
     #[serde(default)]
     pub strategy: Option<SecretStrategy>,
 }
