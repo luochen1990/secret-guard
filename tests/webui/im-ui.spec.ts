@@ -4986,25 +4986,87 @@ test.describe("会话搜索 (#317)", () => {
     await page.waitForLoadState("networkidle");
   });
 
+  // GET /api/search 响应的最小形状 (仅列本 describe 断言所用字段).
+  type SearchResponse = {
+    hits: Array<{ session_id: string }>;
+    truncated: boolean;
+  };
+
+  /**
+   * 搜索直到得到 "完整且命中数精确" 的响应 (#392 flake 免疫), 返回该响应.
+   *
+   * 为什么需要: 服务端 SEARCH_BUDGET=50ms 扫描预算 (#317 红线, 截断语义正确)
+   * 对全量跑累积的大 DAG 在负载下可能超预算 — 单次响应被截断为部分/零命中;
+   * 前端 debounce 后**单发 fetch 不重试** (runSearch 无 retry 路径), 一次截断
+   * 响应会把结果面板永久钉在部分结果, `toHaveCount` 的 DOM 轮询不会重发请求.
+   * 测试侧等价 "用户重打字" 的自然重试: 每次 fill 重新触发 debounce fetch,
+   * 直到 truncated=false 且 hits 数精确 — 断言只落在完整响应上, 对累积 DAG
+   * 的扫描耗时/截断时序结构性免疫 (needle 唯一 ⇒ 完整扫描的命中集确定).
+   *
+   * 断言分工: UI 渲染契约归本文件; 预算红线行为 (截断语义) 归 Rust 侧
+   * src/dag/search.rs 单测, 此处不重复守卫. 若搜索持续截断/命中异常,
+   * 重试耗尽后响亮失败 (不静默吞).
+   */
+  async function searchUntilComplete(
+    page: Page,
+    query: string,
+    expectedHits: number,
+    attempts = 10,
+  ): Promise<SearchResponse> {
+    const box = page.locator("#session-search");
+    let last: SearchResponse = { hits: [], truncated: true };
+    for (let i = 0; i < attempts; i++) {
+      // 先 arm 再 fill: fill 触发 debounce (250ms) → 新 fetch → 响应对账.
+      // 迭代间天然 >250ms (等待响应含 debounce), 不会被 debounce 吞掉.
+      const respP = page.waitForResponse(
+        (r) =>
+          r.url().includes(`/api/search?q=${encodeURIComponent(query)}`) && r.status() === 200,
+        { timeout: 10_000 },
+      );
+      await box.fill(query);
+      const data: SearchResponse = await (await respP).json();
+      last = data;
+      if (!data.truncated && data.hits.length === expectedHits) return data;
+    }
+    // 按末次响应形态分支提示: 截断 → 查预算; 已完整但计数不符 → 查命中集本身.
+    const hint = last.truncated
+      ? "若持续截断, 检查服务端搜索预算 (issue #392)"
+      : "响应已完整但命中数不符 — 检查 needle 唯一性/服务端命中集 (非预算问题)";
+    throw new Error(
+      `search "${query}" 未在 ${attempts} 次重发内得到完整 (truncated=false) 且命中数=${expectedHits} 的响应; ` +
+        `最后一次: truncated=${last.truncated}, hits=${last.hits.length} (${hint})`,
+    );
+  }
+
   test("搜索框存在 + 输入过滤出命中会话 (不含无关会话)", async ({ page }) => {
-    await sendChat(page, [{ role: "user", content: "srch-hit-alpha-771 the alpha question" }]);
-    await sendChat(page, [{ role: "user", content: "srch-hit-beta-772 the beta question" }]);
+    // fixture: 双 needle 全局唯一 (webServer 每次全新空 state — playwright.config
+    // mkdtempSync, 无跨运行残留; 运行内全文件仅此处使用) — 命中集对累积 DAG 中
+    // 其他会话结构性不敏感 (完整扫描下不可能命中本 needle, #392).
+    const hitNeedle = "srch-hit-alpha-771";
+    const missNeedle = "srch-hit-beta-772";
+    await sendChat(page, [{ role: "user", content: `${hitNeedle} the alpha question` }]);
+    await sendChat(page, [{ role: "user", content: `${missNeedle} the beta question` }]);
     // 等 sidebar 收到两个会话 (push 已发生 ⇒ 服务端搜索面可见).
-    await findSessionLeafByPreview(page, "srch-hit-alpha-771");
-    await findSessionLeafByPreview(page, "srch-hit-beta-772");
+    const hitSid = await findSessionLeafByPreview(page, hitNeedle);
+    await findSessionLeafByPreview(page, missNeedle);
 
     // 搜索框常驻 sidebar 顶部.
-    const box = page.locator("#session-search");
-    await expect(box).toBeVisible();
-    await box.fill("SRCH-HIT-ALPHA");   // 大小写不敏感: query 大写, 原文小写.
+    await expect(page.locator("#session-search")).toBeVisible();
+    // 大小写不敏感: query 大写, 原文小写. 截断重发直至响应完整 (#392).
+    const data = await searchUntilComplete(page, "SRCH-HIT-ALPHA", 1);
+    // 完整响应恰好命中 alpha 会话 (精确计数 + 归属).
+    expect(data.hits[0].session_id).toBe(hitSid);
+
     const panel = page.locator("#search-results");
     await expect(panel).toBeVisible();
     const hit = panel.locator(".search-hit");
     await expect(hit).toHaveCount(1, { timeout: 5000 });
     // 命中行: 会话标题 + 命中 snippet (含 marker 原文).
-    await expect(hit.first().locator(".sh-snippet")).toContainText("srch-hit-alpha-771");
+    await expect(hit.first().locator(".sh-snippet")).toContainText(hitNeedle);
+    // 负断言: 唯一含 missNeedle 的会话 (beta) 不在结果面板 — needle 唯一 ⇒
+    // 对累积 DAG 中其他会话免疫 (它们不含本 needle, 结构上不可能出现在命中里).
     const panelText = await panel.textContent();
-    expect(panelText).not.toContain("beta", "unrelated session must not appear in results");
+    expect(panelText).not.toContain(missNeedle, "unrelated session must not appear in results");
   });
 
   test("点击命中 → 跳转该会话 timeline + 目标轮 .selected 高亮", async ({ page }) => {
@@ -5016,7 +5078,9 @@ test.describe("会话搜索 (#317)", () => {
     await clickSessionByLeaf(page, betaSid);
     await page.waitForTimeout(300);
 
-    await page.locator("#session-search").fill("srch-jump-alpha-881");
+    // 截断重发直至响应完整 (#392, 同首测) — 再交互 DOM 命中行.
+    const data = await searchUntilComplete(page, "srch-jump-alpha-881", 1);
+    expect(data.hits[0].session_id).toBe(alphaSid);
     const hit = page.locator("#search-results .search-hit").first();
     await hit.waitFor({ state: "visible", timeout: 5000 });
     const rid = await hit.getAttribute("data-rid");
