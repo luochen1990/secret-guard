@@ -128,10 +128,14 @@ async function findSessionLeafByPreview(page: Page, previewSubstr: string): Prom
  *
  * 注: 新版 toggleSession 只展开 + loadTimeline, 不显式 selectRound (state.selectedRound
  * 仍为 null). 需要选中态的测试用 selectLastRoundAfterToggle.
+ *
+ * timeout 默认 3s (常规用例); 大 body 用例 (如 quant#305 分段渲染的 200KB 文本) 的
+ * timeline 加载在 CI 慢机会超 3s — 该类用例显式传更大预算 (与用例自身对 .raw-seg 的
+ * 10s 容忍同口径, CI run 20817/20681 两次一致 3s 超时实证).
  */
-async function clickSessionByLeaf(page: Page, sid: string): Promise<void> {
+async function clickSessionByLeaf(page: Page, sid: string, timeout = 3000): Promise<void> {
   await page.locator(`.session-item[data-sid="${sid}"]`).click();
-  await page.waitForSelector("#detail .request-pane", { timeout: 3000 });
+  await page.waitForSelector("#detail .request-pane", { timeout });
 }
 
 /**
@@ -4932,7 +4936,7 @@ test.describe("完整数据 tab 分段渲染 (quant#308)", () => {
     const content = "seg-render-marker " + pad.repeat(1000); // ~200KB
     await sendChat(page, [{ role: "user", content }]);
     const sid = await findSessionLeafByPreview(page, "seg-render-marker");
-    await clickSessionByLeaf(page, sid);
+    await clickSessionByLeaf(page, sid, 10_000);
     await page.waitForTimeout(500);
 
     const rawDialog = await openRoundDetailTab(page);
