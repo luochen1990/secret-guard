@@ -787,7 +787,7 @@ fn root_error_cause(e: &reqwest::Error) -> String {
 /// URL → `scheme://host:port/path` (丢弃 userinfo / query / fragment).
 ///
 /// 消费方: [`upstream_error_brief`] (502 body) 与 [`safe_url_for_log`]
-/// (debug 日志脱敏, SEC-C4).
+/// (debug 日志脱敏, SEC-3).
 fn safe_url_for_client(u: &reqwest::Url) -> String {
     let mut s = format!("{}://", u.scheme());
     if let Some(host) = u.host_str() {
@@ -800,7 +800,7 @@ fn safe_url_for_client(u: &reqwest::Url) -> String {
     s
 }
 
-/// 字符串 URL 的脱敏入口 (SEC-C4): 剥离 userinfo / query / fragment 后返回
+/// 字符串 URL 的脱敏入口 (SEC-3): 剥离 userinfo / query / fragment 后返回
 /// 可安全写日志的形态. 复用 [`safe_url_for_client`] 的剥离逻辑.
 ///
 /// 用途: same_proto 两处 `debug!(url = ...)` — 上游 URL 可能携带客户端 query
@@ -1721,7 +1721,7 @@ mod tests {
         assert_eq!(stream_err_label(&other), ERR_UPSTREAM_STREAM);
     }
 
-    // ─── SEC-C4b: safe_url_for_log 的 query 剥离 ───────────────────────────
+    // ─── SEC-3: safe_url_for_log 的 query 剥离 ───────────────────────────
     //
     // debug 日志的 URL 脱敏入口 (same_proto 两处消费). 锁定 Ok 路径 (经
     // safe_url_for_client 剥 userinfo/query/fragment) 与解析失败 fallback

@@ -15449,7 +15449,7 @@ async fn webui_and_api_responses_carry_nosniff() {
     }
 }
 
-/// SEC-3 (SEC-C4a): http.request trace span 只记 path 不记 query — 用
+/// SEC-3: http.request trace span 只记 path 不记 query — 用
 /// FmtSpan::NEW 捕获 span 创建行 (渲染 span 字段), 断言敏感 query 不进日志。
 /// (server.rs 的 `trace_span_no_query_string` 单测只锁定 Uri::path() 性质,
 /// 本测试锁定 span 字段的实际接线。)

@@ -134,7 +134,7 @@ macro_rules! trace_layer {
     () => {
         TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
             // SEC-3: 字段白名单 — 见宏 doc (不在此处记 headers/body).
-            // SEC-C4a: 只记 path 不记完整 uri — query 可能携带 key/token 类敏感
+            // SEC-3: 只记 path 不记完整 uri — query 可能携带 key/token 类敏感
             // 参数, 一律丢弃 (契约边界见 contracts.md SEC-3
             // `prop_trace_span_no_query_string`).
             tracing::info_span!(
@@ -752,7 +752,7 @@ mod tests {
         );
     }
 
-    /// SEC-3 (SEC-C4a): trace span 只记 path, 不记 query — query 可能携带
+    /// SEC-3: trace span 只记 path, 不记 query — query 可能携带
     /// key/token 类敏感参数. 本测试锁定 "取 path 后不含 '?'" 的性质, 宏调用处
     /// (trace_layer!) 依赖该性质丢弃 query.
     #[test]

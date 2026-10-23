@@ -75,6 +75,7 @@
 | `UI-*` | WebUI 渲染 (域 C) | I1→UI-1, I2→UI-2, I3→UI-3, I4→UI-6 (selectedRound 子属性), I5→UI-6 | 根 `AGENTS.md` "前端不变量" |
 | `USAGE-*` | 模型用量统计 (域 B, usage-stats) | (新增) | `docs/design/usage-stats.md` + `src/usage/` 头部 |
 | `POOL-*` | 套餐池 failover (域 A, Pool Provider) | (新增) | `src/pool.rs` 头部 + `src/provider.rs` (PoolProvider / resolve_route Pool 跳) + `tests/pool_failover.rs` |
+| `PRIV-*` | 隐私旁路扫描 (跨域, PrivacyScan) | (新增, #361 收编) | `src/privacy.rs` 头部 (五条红线) + `tests/integration.rs` |
 
 **编号稳定性**: 契约编号一经分配**永不变更** (即使内容演进). 删除契约时编号作废不重用.
 
@@ -1010,6 +1011,27 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 - `prop_audit_capture_legacy_state_defaults_latest`: 旧版 state.toml 无 audit_capture 字段 → 加载为 latest (默认档, quant#307). 🔁→`audit_capture_old_state_toml_without_field_defaults_latest` (`src/state.rs`)
 - `prop_audit_capture_inflight_request_keeps_push_decision`: 在途请求的捕获行为由 push 时快照决定 — off→on 切换后, 已 push 的请求仍两侧不捕获; on→off 切换后, 已 push 的请求仍两侧完整捕获. 🔁→`audit_capture_toggle_inflight_request_keeps_push_decision` + `audit_capture_toggle_off_inflight_still_captures_both_sides` (`tests/integration.rs`)
 
+### CFG-8 privacy_scan_groups 组开关持久化 (镜像 CFG-7 模式, #361 收编)
+
+**陈述**: privacy scan pattern 语义分组 (cloud/ai/vcs/chat/crypto, 组名→bit 映射
+SSOT = `src/privacy.rs::PatternGroup`) 的组开关 map 是 DynamicState 顶层动态字段
+(state.toml `privacy_scan_groups`; **只存关掉的组** — 缺省/空 = 全组开, serde
+default 兼容旧 state.toml). 语义镜像 CFG-7 audit_capture:
+- **运行时态**: `src/state.rs::PrivacyScanGroups` (AtomicU32 位掩码); 扫描 task
+  与 alerts 视图经共享 mask 读;
+- **写序**: PUT 先持久化 state.toml (RMW, 共享 persist_lock) 再更新内存位掩码
+  (持久化失败保持旧值, 同 CFG-4 语义);
+- **API**: `GET/PUT /api/privacy-scan/settings` — PUT **全量替换** (非增量);
+  未知组名 400; static `[privacy_scan] mode = off` 档下 PUT 拒绝 (组开关不能
+  越过 static 总闸 — 只收窄 pattern 面, 不能开启扫描); alerts 响应内嵌 groups;
+- **组开关只收窄**: mask 只能从 pattern 集合中扣除整组, 不新增 pattern, 不影响
+  PRIV 红线.
+
+**Properties**:
+- `prop_privacy_groups_put_semantics`: PUT 全量替换 / 未知组名 400 / off 档拒绝; PUT 后经 reopen (state.toml 重载) 组开关保持生效. 🔁→`privacy_scan_settings_validation_and_reopen` (`tests/integration.rs`)
+- `prop_privacy_groups_mask_gates_only_narrow`: 位掩码只门控扫描与视图 (组关 → 该组 pattern 零告警); 全组关→再开恢复扫描能力; 组开关端到端生效. 🔁→`group_mask_gates_scanning_and_view` + `all_groups_off_then_reopen_recovers_view` (`src/privacy.rs`) + `privacy_scan_group_toggles_gate_patterns_end_to_end` (`tests/integration.rs`)
+- `prop_privacy_groups_off_mode_gated`: static off 档下 GET alerts/settings 返回 `enabled:false` / PUT 拒绝 400 — off 总闸优先于组开关 (与 PRIV-4 三态分发一致). 🔁→`privacy_scan_settings_off_mode_behavior` (`tests/integration.rs`)
+
 ---
 
 ## 7. SEC: 安全姿态
@@ -1027,6 +1049,10 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 - `prop_no_real_api_key_in_any_json_response`: 同上, 不含真实 api_key. ✅ (同上, api_key 维度; needle 为混合转义敏感字符单值)
 - `prop_sec1_scan_covers_all_router_get_routes`: 扫描端点清单 ⊇ router 装配的实际 GET `/api/*` 路由 (机械对账, #358: axum 0.8 无路由遍历 API, 从 `web::router()` + `build_router` 装配源码 include_str! 编译期锁定提取; 新增 GET 端点未同步扫描清单即红). ✅
 
+**已登记例外与边界注记** (2026-10-23 #361 收编, §99):
+- **privacy scan alerts 疑似明文回显** (`GET /api/privacy-scan/alerts`, #257): 告警条目回显 pattern 命中的**未登记** token 疑似明文 — 产品设计意图 (引导用户核对后登记, 人回路), 信任域与 `req_body_raw` 相同 (本地单用户进程, WebUI 本已可见原文). 先例授权 = PR #303 (R3); 本条为其正文化登记 (旧状态: 裁决仅挂 PR 描述, 读者按契约字面会误判违约).
+- **显式 `fail_open` opt-in 的回显边界 — 已裁决不登记为例外** (#383 方案 D, 裁决 2026-10-21): 被跳过脱敏的 secret 随 record `req_body_raw` / preview 回显的冲突面, 触发前提已被配置期 fail-fast 拒绝 (弱 gen_spec / 过短 real, RED-9) 消灭至仅剩 adversarial 构造形态 (默认 Auto 模式概率天文级). 边界事实记录 = `docs/known-limitations.md` "redact" 节; 安全敏感部署保持默认 `fail_closed` (SEC-10). 本档扫描测试 (`prop_no_real_secret_in_any_json_response`) 只覆盖 redact 成功路径 — 读者不应据其推断 fail_open 路径受守卫.
+
 ### SEC-2 RedactError 不携带 secret 明文
 
 **陈述**: RedactError 只携带 secret_id + reason, 类型系统级保证不含 secret value.
@@ -1042,7 +1068,8 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 **Properties**:
 - `prop_assert_messages_no_secret`: assert/panic 消息中不含 secret.value (即使用于诊断). ✅ (consistency-check feature gate, CI 全量档 `just check` 执行)
 - `prop_log_messages_no_secret`: tracing log 不输出 secret.value. ✅
-- `prop_trace_span_no_query_string`: HTTP trace span 只记 path 不记 query — query 可能携带 key/token 类敏感参数 (SEC-C4a, 2026-09 扩展边界). 🔁→`trace_span_no_query_string` + `trace_span_omits_query_string` (`src/server.rs` / `tests/integration.rs`)
+- `prop_trace_span_no_query_string`: HTTP trace span 只记 path 不记 query — query 可能携带 key/token 类敏感参数 (曾用名 SEC-C4a, 2026-10-23 #361 收编). 🔁→`trace_span_no_query_string` + `trace_span_omits_query_string` (`src/server.rs` / `tests/integration.rs`)
+- `prop_safe_url_log_strips_sensitive_components`: 字符串 URL 落 debug 日志前经 `safe_url_for_log` 剥离 userinfo / query / fragment (query 可能携带 `?key=...` 类客户端凭证, 如 Gemini); URL 解析失败的 fallback 分支也至少剥 query (曾用名 SEC-C4 / SEC-C4b, 2026-10-23 #361 收编). 🔁→`safe_url_for_log_strips_query_and_fallback_strips_query` + `safe_url_strips_userinfo_query_fragment` + `safe_url_keeps_scheme_host_port_path` (`src/proxy/recorder.rs`)
 
 ### SEC-4 headers 脱敏
 
@@ -1187,7 +1214,20 @@ IR 机制正交:
 - `prop_auto_protect_byte_layer_semantics`: 字节层替换的性质族 — 任意位置全量替换后 body 不含真值且幂等 (proptest); mock 确定性 + 等长 + 永不等于真值; 非 UTF-8 body 跳过 (fail-open); 多字节字符环绕不受扰动; 保护集地板 / 按值去重 / 长度降序. 🔁→`prop_redact_removes_real_and_is_idempotent` + `mock_is_deterministic_and_equal_length` + `redact_non_utf8_body_is_skipped` + `redact_unicode_body_untouched_around_hit` + `collect_enforces_floor_and_dedups` (`src/protect.rs`)
 - `prop_auto_protect_mock_privacy_invisible`: 对各已知前缀/结构形状的真值 (AKIA/ghp_/sk-ant-/AIza/xoxb-/JWT), 强制 Plain 的确定性 mock 永不命中 privacy-scan 的任一内置 pattern (pattern 引擎端到端断言, 防 pattern 集加入通用形状规则时静默破坏前提). 🔁→`mock_is_plain_shape_no_known_prefix` (`src/protect.rs`)
 
----
+### SEC-12 OIDC 登录链攻击面拒绝 (原 SEC-AUTH-1/2/3, #361 收编)
+
+**陈述**: OIDC 登录链 (cargo feature `oidc` 门控, 默认档不编译; 测试载体
+`tests/auth_oidc.rs` 同门控) 对三类攻击输入必须拒绝/防御:
+- **(a) 伪造/篡改的回调与验证输入** — CSRF state 不匹配 / id_token 缺失 /
+  签名错误 / PKCE 校验失败 / IdP error 参数 → 一律拒绝, 不建立会话;
+- **(b) open redirect** — `next` 参数必须是站内相对路径 (外部 URL 消毒为默认页);
+- **(c) 签名密钥轮换存活** — IdP 轮换签名密钥后, 运行中的 secret-guard 无需
+  重启仍能完成验证 (JWKS 刷新, #198); 刷新失败时返回原始验证错误 (不吞错).
+
+**Properties**:
+- `prop_oidc_callback_rejects_attack_inputs`: (a) 族 — state mismatch / idp error 参数 / 缺 session 凭证 / PKCE 失败各自被拒. 🔁→`exchange_and_verify_csrf_mismatch` + `oauth_callback_rejects_idp_error_param` + `oauth_callback_rejects_missing_session_credentials` + `oauth_callback_rejects_pkce_verification_failure` (`tests/auth_oidc.rs`)
+- `prop_oidc_next_sanitized`: (b) `next` 消毒为站内相对路径, 防 open redirect. 🔁→`login_start_sanitizes_next_url` (`tests/auth_oidc.rs`)
+- `prop_oidc_survives_jwks_rotation`: (c) 轮换免重启完成验证 + 刷新失败返回原始错误. 🔁→`exchange_and_verify_survives_jwks_rotation` + `exchange_and_verify_rotation_refresh_failure_returns_original_error` (`tests/auth_oidc.rs`)
 
 ## 8. ROB: 鲁棒性 (best-effort 永不 panic)
 
@@ -1307,7 +1347,7 @@ IR 机制正交:
 
 ### UI-5 末轮 response 独立 drawer
 
-**陈述**: response 渲染为独立的 `.response-drawer` (overlay 架构), 不在 `.tl-round` 内. `#detail` 高度必须固定 (= wrapH), 禁止改为 `height: wrapH - drawerH` 或引入 flex 分栏.
+**陈述**: response 以独立 overlay drawer (`.response-drawer`) 呈现, DOM 不在 `.tl-round` 子树内; 其开合不挤占 timeline 轮次与 `#detail` 的布局几何 — `#detail` 的可视高度恒等于 wrapH (与 drawer 状态无关). (措辞外部化 2026-10-23 #361: 契约只锁外部可观察断言; 布局实现机制 — flex 与否等 — 不进契约.)
 
 **Properties**:
 - `prop_detail_height_fixed`: `#detail` height == wrapH, 不依赖 drawerH. ✅ `im-ui.spec.ts` "UI-5 prop_detail_height_fixed".
@@ -1672,6 +1712,61 @@ chars (char boundary 安全); 其余事件字段为受控类型, 天然无 secre
 
 ---
 
+## 13. PRIV: 隐私旁路扫描 (PrivacyScan)
+
+> 状态: 已授权 (2026-10-23, issue #361 用户裁决 — §99). 模块实现契约 (pattern 表 /
+> 排除规则 / 观察面细节) 的 SSOT 是 `src/privacy.rs` 头部; 本段收录其**五条红线**
+> (#257), 是旁路扫描器存在的合法性边界 — 任何演进不得越过.
+
+### PRIV-1 旁路不进转发链 (wire 零修改)
+
+**陈述**: PrivacyScan 对 wire 的修改恒为零 — 捕获是 pre-redact IR 的只读遍历
+(clone 字符串叶子), 提交是 `try_send` (满则丢弃); FWD-1 透明中继的字节流不经过
+本模块的任何写路径. batch 档启用时, 转发行为与 off 档逐字节一致.
+
+**Properties**:
+- `prop_privacy_scan_wire_unchanged`: batch 档下含未登记 token 形状的请求原样到达上游 (mockito Exact 全文匹配), 响应正常回传. 🔁→`privacy_scan_batch_alerts_unregistered_key_in_passthrough` (`tests/integration.rs`)
+
+### PRIV-2 永不拦截
+
+**陈述**: 扫描永不 filter/拦截/改写请求 — 唯一产物是内存告警 + WARN 日志;
+误判的 worst case = 一条告警行, 可用性损失为零.
+
+**Properties**:
+- `prop_privacy_scan_never_blocks`: 触发告警的请求本身正常完成 (非 2xx 即断言失败), 与 PRIV-1 共用 e2e 载体联合守卫. 🔁→`privacy_scan_batch_alerts_unregistered_key_in_passthrough` (`tests/integration.rs`)
+
+### PRIV-3 零新依赖
+
+**陈述**: pattern 匹配为手写字节扫描 (literal prefix + charset run), 不引入
+regex 等生产依赖 (regex 仅存在于 dev-dependency 树). 结构性事实, 由
+`Cargo.toml` + `cargo deny` sources/bans 门禁守卫, 无运行时 property.
+
+### PRIV-4 默认关闭, off 零开销
+
+**陈述**: `[privacy_scan] mode = "off"` 默认; off 时扫描器是 `None` 内壳,
+capture/submit 均为 no-op, 转发热路径与无本模块时逐字节一致. off 档 API 语义:
+`GET alerts` / `GET settings` 返回 200 + `enabled:false` (alerts 恒空 / 组态照常
+回显, 前端据此隐藏面板); `PUT settings` 拒绝 (400, 组开关不能越过 static 总闸);
+动作端点 (rotated/ignored) 404.
+
+**Properties**:
+- `prop_privacy_scan_default_off`: 默认配置 enabled=false 且转发行为不变; off 档 API 语义按上述三态分发. 🔁→`privacy_scan_off_default_enabled_false_and_hot_path_unchanged` + `privacy_scan_ignored_endpoint_and_off_mode_404` (`tests/integration.rs`)
+
+### PRIV-5 告警永不自动登记
+
+**陈述**: 本模块无任何写 SecretTable 的路径; 登记只能由用户在 WebUI 预填表单
+确认提交 (人回路). 可观察面: 用户登记告警值后, 该值从 alerts 视图消失.
+
+**Properties**:
+- `prop_privacy_scan_no_auto_register`: 用户登记告警值 → 该值从 alerts 视图清除 (登记是显式人回路动作, 告警自身不产生登记副作用). 🔁→`privacy_scan_registering_alert_value_clears_it_from_view` (`tests/integration.rs`)
+
+> 观察面细节 (告警 cap 256 FIFO / 已登记值双层排除 / 捕获字节预算 / pattern
+> 分组) 属模块实现契约, SSOT = `src/privacy.rs` 头部; 其中已登记排除与 cap 有
+> 常驻单测 (`scanner_end_to_end_excludes_registered_values` /
+> `store_evicts_fifo_beyond_cap`), 需要时可升格编号.
+
+---
+
 ## 99. 变更日志
 
 记录契约的重大语义调整 (编号永不变更/重用, 仅作废).
@@ -1752,3 +1847,4 @@ chars (char boundary 安全); 其余事件字段为受控类型, 天然无 secre
 | 2026-10-21 | RED-8 + SEC-10 (观测面精化) | **mock-not-restored WARN 实存 gate (#395 降噪)**: `warn_mock_not_restored` 增加第二层判据 `RedactionMap::contains_any_restorable_mock(body)` (双形态匹配: raw + JSON 转义, dag search SEC-1 扫描同款考量) — 降级体实存 mock 才 WARN ("client will see mock values" 的字面真值), 零命中降 debug (`no mock present in degraded body; nothing escaped`). **数据流零变更** (withhold/restore 决策与出站字节不变), 纯可观测性精化; SEC-10 property 陈述同步 + 🔁 落地测试追加 `stream_non_sse_error_body_without_mock_skips_mock_not_restored_warn` (既有 body-含-mock 测试原样绿 — 隐式前提显式化). 单测 `contains_mock_raw_and_escaped_and_miss_forms` | 部署实例实测: GLM Coding Plan 429 限流族 (1305 等) 对 stream=true 回 error envelope (无 choices, 不回显请求内容, 无 content-type), 触发 mock-not-restored WARN 165 次/半日 (晚高峰密集) 全为虚警 — 错误体不含 mock, "client will see mock values" 字面为假; 调研佐证 (智谱错误码表 + 社区反馈 + OpenAI SDK 错误路径源码) 见 PR 描述 |
 | 2026-10-21 | FWD-1 + FWD-7 + POOL-1..6 (授权闭环) | 三笔"待人工授权"挂账批量授权, 摘除标记: ① FWD-1 router /models 本地终结豁口 (窄范围: 仅 router provider 模型列表 GET, Direct 透传 D6 守卫不变); ② FWD-7 (N3/N4) common_uri 候选序懒回退 (仅网关自建 fetch 请求, 转发零触碰); ③ POOL-1..6 整域转正 — 契约 SSOT 从 `src/pool.rs` 头部翻转到本档 (头注降为模块级细化). **行为零变更** (三笔均已上线数周, property 全挂既有测试); 授权含义 = 此后任一笔的语义演进须重新走 §0.5 人工授权 | issue #361: 用户逐项过目意图层自评后裁决"全部同意" (自评结论: 三笔均长在网关自有功能面 — router 元数据 / 网关自建请求 / 套餐池特性, 不触碰"转发透明性"核心; POOL 的 README 用户承诺与契约草稿错位随本授权闭合) |
 | 2026-10-21 | RED-9 (增补) + RED-4 / SEC-10 / SEC-1 (触发面收窄) | **配置期弱配置拒绝 (#383 方案 D)**: `SecretEntry::validate_and_resolve` choke point 对 redact 策略新增两道 fail-fast 拒绝 — ① 手动 gen_spec 候选空间 < 2^20 (`MIN_CANDIDATE_SPACE_WARN`, 自 lint WARN 升级; Auto 路径 widen 兜底恒达标, 命中的必是手动配置); ② real < 4 chars (等长约束下空间物理不可达, 上界 65³ ≈ 27 万; 引导 reject/placeholder — 两策略不做 mock 生成, 不受 gate 约束). Err message 只含 id/数字/建议 (SEC 红线). Auto widen 兜底与 `on_probe_exhausted` 开关语义不变; RED-4 耗尽触发面残余 = 仅空间达标但对抗构造的 IR, SEC-10 fail_open 的 record 真值回显与 SEC-1 的冲突面随之收敛至 ≈ 0 — 裁决维持不登记 SEC-1 例外 (方案 C 随 D 成立而无必要). 新增 2 条 property (`prop_validated_manual_gen_spec_meets_candidate_space_floor` / `prop_short_real_redact_rejected_other_strategies_pass`) + 既有测试 `validate_and_resolve_leaves_weak_spec_lintable` 语义翻转为 `validate_and_resolve_rejects_weak_manual_gen_spec` | issue #383 用户裁决 (2026-10-21 23:11): "采纳方案D, 配置期拒绝, 对于过短的 secret, 引导用户选择其他方案" — fail_open 时被跳过 secret 的 record 含真值回显 WebUI 与 SEC-1 冲突, 从配置期源头消灭触发面优于登记契约例外 |
+| 2026-10-23 | PRIV-1..5 + SEC-12 + SEC-3 扩充 + SEC-1 注记 + CFG-8 + UI-5 (#361 收编批) | 第 1-5 项实施: ① 增设 PRIV 域 §13 (五条红线, 原文 `src/privacy.rs` 头部正文化, 红线①挂既有 e2e); ② 幽灵编号收编 — SEC-AUTH-1/2/3 → **SEC-12** (a/b/c 子句, OIDC 登录链), SEC-C4/C4a/C4b → **SEC-3** (URL/日志脱敏族并入, 新增 `prop_safe_url_log_strips_sensitive_components`), 15 处代码注释改指; ③ SEC-1 两处边界注记 (privacy alerts 例外正文化 — 先例 PR #303; fail_open 边界按 #383 方案 D 裁决**不登记**、加指针); ④ **CFG-8** privacy_scan_groups (镜像 CFG-7: RMW + 位掩码 + PUT 语义); ⑤ UI-5 措辞外部化 (实现禁令 → 可观察断言, 量测保留). **行为零变更** (全为文档/注释级, 新增 11 条 property 全部🔁挂既有测试) | issue #361 lc90 "确认实施" (2026-10-23) |

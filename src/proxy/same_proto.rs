@@ -258,7 +258,7 @@ pub(crate) async fn same_proto_forward(
     // 与 cross_proto 同型 (统计 SSOT 在 codec::dropped_tool_result_media).
     warn_tool_result_media_drop(record_id, codec_proto, &ir);
 
-    // url 脱敏 (SEC-C4): query 可能携带客户端 key (如 Gemini ?key=...).
+    // url 脱敏 (SEC-3): query 可能携带客户端 key (如 Gemini ?key=...).
     debug!(%record_id, method = %parts.method, url = %safe_url_for_log(&upstream_url), "forwarding redacted same-proto request");
 
     // 9. 发送到上游. 响应头超时按**出站 body 的流式语义**选档 (#175): IR 的
@@ -488,7 +488,7 @@ async fn same_proto_passthrough(
 /// 同协议两路径 (forward / passthrough) 共享的上游 URL + record path 构造.
 ///
 /// - `upstream_url`: 端点 base_url + rest + query (query 可能携带客户端 key,
-///   如 Gemini `?key=...`; 落日志前经 `safe_url_for_log` 脱敏, SEC-C4).
+///   如 Gemini `?key=...`; 落日志前经 `safe_url_for_log` 脱敏, SEC-3).
 /// - `path_for_record`: 还原 ingress 侧的完整路径形态 `/{proto}/{name}/{rest}`.
 ///
 /// 刻意不合入 cross_proto: 其 URL 用三段式布局推导

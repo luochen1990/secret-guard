@@ -26,8 +26,8 @@
 //!   S256 比对 + 用 stored nonce 签发 id_token), 测试经 sg.sid cookie 逐步驱动
 //!   login → authorize → callback → /api/me 全链 (PKCE 负对照见
 //!   `oauth_callback_rejects_pkce_verification_failure`).
-//! - **SEC-AUTH-1**: CSRF state mismatch / id_token 缺失 / 签名错误 均正确拒绝.
-//! - **SEC-AUTH-3**: IdP 轮换签名密钥后, 运行中的 secret-guard 无需重启仍能完成 OIDC
+//! - **SEC-12(a)**: CSRF state mismatch / id_token 缺失 / 签名错误 均正确拒绝.
+//! - **SEC-12(c)**: IdP 轮换签名密钥后, 运行中的 secret-guard 无需重启仍能完成 OIDC
 //!   登录 (验签失败 → 刷新 JWKS → 有界重验一次). #198: rauthy 月度自动轮换后,
 //!   新 kid 的 id_token 在启动时抓取的 JWKS 快照中查无此 key, 登录永久 500.
 
@@ -94,7 +94,7 @@ use openidconnect::PrivateSigningKey;
 ///
 /// # 轮换代密钥 (`rotated_key` + `rotated_jwks_json`)
 ///
-/// `rotate_keys()` (SEC-AUTH-3, #198) 切换到的**新一代**密钥 (kid 不同), 其公钥
+/// `rotate_keys()` (SEC-12(c), #198) 切换到的**新一代**密钥 (kid 不同), 其公钥
 /// 独立序列化为 `rotated_jwks_json` (只含新代公钥 — "旧 key 立即下线"是比真实
 /// IdP 新旧并存宽限期更严格的轮换形态). 预生成在静态 IdpKeys 里, 每个测试的
 /// rotate 只是指针切换, 无重复 RSA 生成开销.
@@ -862,7 +862,7 @@ async fn exchange_and_verify_happy() {
 
 #[tokio::test]
 async fn exchange_and_verify_csrf_mismatch() {
-    // SEC-AUTH-1: CSRF state 不匹配必须拒绝 (防 CSRF 攻击).
+    // SEC-12(a): CSRF state 不匹配必须拒绝 (防 CSRF 攻击).
     let (_idp, backend) = spawn_idp_with_backend().await;
 
     let parts = backend.authorize_url();
@@ -969,7 +969,7 @@ async fn exchange_and_verify_wrong_nonce() {
 
 #[tokio::test]
 async fn exchange_and_verify_survives_jwks_rotation() {
-    // SEC-AUTH-3 (#198): IdP 轮换签名密钥后, 运行中的 secret-guard 无需重启仍能完成
+    // SEC-12(c) (#198): IdP 轮换签名密钥后, 运行中的 secret-guard 无需重启仍能完成
     // OIDC 登录. 场景复现 (2026-09-02 线上事故): rauthy 月度自动轮换签名 key, 新签
     // 发 id_token 的 kid 不在启动时抓取的 JWKS 快照里 → NoMatchingKey → 登录永久
     // 500, 直到进程重启. 期望: 验签失败触发 JWKS 刷新 (重跑 discovery) + 有界重验
@@ -990,7 +990,7 @@ async fn exchange_and_verify_survives_jwks_rotation() {
 
 #[tokio::test]
 async fn exchange_and_verify_rotation_refresh_failure_returns_original_error() {
-    // SEC-AUTH-3 边界 (#198): 签名验证失败 + JWKS 刷新也失败 (IdP discovery 故障,
+    // SEC-12(c) 边界 (#198): 签名验证失败 + JWKS 刷新也失败 (IdP discovery 故障,
     // token 端点正常) 时, 必须返回**原始**验签错误 (刷新失败不掩盖真实验签失败,
     // 也不引入新错误类别), 且旧 client 保持可用 — IdP 恢复后的下一次登录 (再次
     // 触发刷新) 能自愈, 无需重启进程.
@@ -1105,7 +1105,7 @@ async fn login_start_redirects_to_idp_with_pkce_in_session() {
 
 #[tokio::test]
 async fn login_start_sanitizes_next_url() {
-    // SEC-AUTH-2: next 参数必须是站内相对路径, 防 open redirect.
+    // SEC-12(b): next 参数必须是站内相对路径, 防 open redirect.
     // 合法 next: 存入 session (后续 callback 重定向用).
     // 非法 next: 清除旧值, 不影响流程.
     let (idp, base) = spawn_idp_with_client().await;
