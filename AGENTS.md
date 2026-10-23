@@ -548,8 +548,8 @@ ignored 测试是"计划但搁置"的信号, 应在 `docs/known-limitations.md` 
 有对应条目. ignored 测试默认不运行故不计入覆盖率, 转正后自动纳入.
 用 `cargo nextest list --run-ignored=only` 列出当前所有 ignored 测试做走查.
 与 contracts.md 的交互 (#354): ignored 测试**不构成** ✅/🔁 落地载体 (check-contracts
-R2-b/R3-b, 见 contracts.md §0.6); 转正时若其名出现在某标注行的 `#[ignore` prose
-声明里, R4 会变红提示同步 — 升格进锚点列表并清理 prose 即可.
+R2-b/R3-b, 规则定义见 justfile `check-contracts` recipe 头注释); 转正时若其名出现在
+某标注行的 `#[ignore` prose 声明里, R4 会变红提示同步 — 升格进锚点列表并清理 prose 即可.
 
 ### 覆盖率工具 (`cargo-llvm-cov`)
 

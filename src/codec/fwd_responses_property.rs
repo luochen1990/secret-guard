@@ -479,7 +479,7 @@ fn redact_reasoning_summary_is_replaced() {
 //
 // # 守卫范围
 //
-// 建模范围内字段 (契约 FWD-3 L168): messages / tools / tool_use / tool_result /
+// 建模范围内字段 (契约 §1 FWD-3): messages / tools / tool_use / tool_result /
 // stop_reason. 跨协议 round-trip 后语义保留. 已知语义损失 (reasoning summary
 // round-trip / hosted tools 丢弃 / previous_response_id 服务端状态) 由独立单测守卫.
 //
@@ -672,7 +672,7 @@ fn responses_stop_reason_tool_use_preserved_cross_proto() {
 
 /// 断言 Responses ⇄ Chat 跨协议 round-trip 前后 IR 的建模范围内字段等价.
 ///
-/// **建模范围** (契约 FWD-3 L168): messages (含 text / tool_use / tool_result) +
+/// **建模范围** (契约 §1 FWD-3): messages (含 text / tool_use / tool_result) +
 /// tools + system (instructions ↔ system message). 这与 fwd_cross_proto_property 的
 /// assert_modeled_fields_equivalent 同类, 但针对 Responses 的 item 形态特化.
 ///

@@ -2,8 +2,8 @@
 //!
 //! # 契约
 //!
-//! [`docs/design/contracts.md`] FWD-1 (L110-137, 流式响应半段式) +
-//! STR-1 (chunk 边界透明, L299-306) + STR-4 (缓冲溢出 abort, L330-335).
+//! [`docs/design/contracts.md`] §1 FWD-1 (流式响应半段式) +
+//! §3 STR-1 (chunk 边界透明) + §3 STR-4 (缓冲溢出 abort).
 //!
 //! ## FWD-1 流式响应半段式
 //!
@@ -59,7 +59,7 @@
 //!
 //! # 生成器覆盖
 //!
-//! 按契约 FWD-1 `prop_proptest_generator_covers_edge_cases` (L131-136) + §0.3 第 3 条,
+//! 按契约 §1 FWD-1 `prop_proptest_generator_covers_edge_cases` (生成器覆盖要求) + §0.3 第 3 条,
 //! 生成器覆盖:
 //! - text delta (连续多 chunk, 含 mock)
 //! - tool_use input JSON 部分片段 (InputJsonDelta, 含 mock)
@@ -691,7 +691,7 @@ fn assert_responses_usage_presence_fidelity(
 /// 生成 OpenAI SSE 流 (含 mock), 覆盖契约要求的流形态.
 ///
 /// 返回 (sse_bytes, real_secret, mock_string). sse_bytes 中的 text delta 和 tool_use
-/// input JSON 片段里都含 mock (跨字段重复, 守卫 FWD-1 L135).
+/// input JSON 片段里都含 mock (跨字段重复, 守卫 §1 FWD-1 生成器覆盖要求).
 ///
 /// 流形态覆盖:
 /// - reasoning delta (含 mock, 思考阶段; #176 STR-6)
@@ -2051,7 +2051,7 @@ fn collect_tool_use_ids_names(sse_bytes: &[u8]) -> Vec<(String, String)> {
     acc
 }
 
-// ─── STR-4 缓冲溢出 abort 降级 property (L330-335) ──────────────────────────
+// ─── STR-4 缓冲溢出 abort 降级 property (§3 STR-4) ──────────────────────────
 //
 // # 契约 STR-4
 //

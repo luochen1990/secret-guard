@@ -1204,7 +1204,7 @@ mod tests {
 
     // ─── STR-2 StreamScan 累积正确 (契约 §3 STR-2) ───────────────────────────
     //
-    // 契约: docs/design/contracts.md L298-307.
+    // 契约: docs/design/contracts.md §3 STR-2.
     // 流式 SSE 经 StreamScan 累积的 IrResponse 必须与"等价非流式语义"一致.
     // StreamScan 是 WebUI resp_parsed 字段的真相来源 (DTO-3), 累积错位 → parsed view
     // 与实际响应不一致.

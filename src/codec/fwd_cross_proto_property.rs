@@ -2,7 +2,7 @@
 //!
 //! # 契约
 //!
-//! [`docs/design/contracts.md`] FWD-3 (L154-174): 跨协议路径 (ingress != egress) 通过 IR
+//! [`docs/design/contracts.md`] §1 FWD-3: 跨协议路径 (ingress != egress) 通过 IR
 //! 中介翻译. 翻译契约分两层:
 //!
 //! 1. **建模范围内语义保留**: 在 chat completion 建模范围 (messages / tools / tool_use /
@@ -196,12 +196,12 @@ proptest! {
     /// 后保留语义.
     ///
     /// 步骤: ingress_wire → IR → egress_wire → egress_reader → IR' → 重新对照 IR.
-    /// 在建模范围内 (messages / tools / tool_use / tool_result — 契约 FWD-3 L171 明确
+    /// 在建模范围内 (messages / tools / tool_use / tool_result — 契约 §1 FWD-3 明确
     /// 列举的字段) 语义保留.
     ///
-    /// **不在建模范围** (契约 §163-168 语义损失清单外的采样参数):
+    /// **不在建模范围** (契约 §1 FWD-3 语义损失清单外的采样参数):
     /// - temperature: OpenAI 允许 [0, 2], Anthropic writer clamp 到 [0, 1] (有损转换,
-    ///   不在 FWD-3 建模范围, 也不在 §163-168 已知损失清单 — 属于协议约束差异).
+    ///   不在 FWD-3 建模范围, 也不在 §1 FWD-3 已知损失清单 — 属于协议约束差异).
     /// - max_tokens: OpenAI 可选, Anthropic 必填; 缺失时注入默认 (不算损失).
     /// - top_p / stop / stream / user: 协议共有但 wire 位置可能不同 (eg stop 在 OpenAI
     ///   是 `stop`, Anthropic 是 `stop_sequences`); 这些字段两边都建模, round-trip 后保留.
@@ -307,7 +307,7 @@ fn prop_cross_proto_block_level_extra_cleared_recursively_anthropic_to_openai() 
 fn prop_documented_semantic_loss_list() {
     let agents_md = include_str!("AGENTS.md");
 
-    // 契约 FWD-3 (L163-168) 列出的语义损失点. 每条必须在 AGENTS.md 中显式声明.
+    // 契约 §1 FWD-3 语义损失清单列出的损失点. 每条必须在 AGENTS.md 中显式声明.
     // 关键词取每条语义损失的核心名词 (允许在文档中用不同的句子表达, 只要关键词出现).
     let documented_loss_keywords: &[&str] = &[
         // 支持矩阵显式声明不支持的特性 (codec/AGENTS.md "支持矩阵" 段).
@@ -334,7 +334,7 @@ fn prop_documented_semantic_loss_list() {
 
 /// 断言两个 IR (跨协议 round-trip 前后) 的建模范围内字段等价.
 ///
-/// **建模范围** (契约 FWD-3 L158, L171): messages (含 text / tool_use / tool_result) +
+/// **建模范围** (契约 §1 FWD-3): messages (含 text / tool_use / tool_result) +
 /// tools + reasoning 配置. 这是 FWD-3 明确列举的建模字段.
 ///
 /// **字段清单同步纪律** (#356 子项6): 本函数是 FWD-3 建模字段的端到端等价清单 —
@@ -342,7 +342,7 @@ fn prop_documented_semantic_loss_list() {
 /// 必须同步本函数与两个 `arb_*_request_modeled_only` 生成器, 否则新字段的跨协议
 /// 保真在本 property 上不可见 (字段清单漂移正是 #356 子项6 的复发形态).
 ///
-/// 不比较 (契约 §163-168 语义损失清单外的协议差异, 不在建模范围内):
+/// 不比较 (契约 §1 FWD-3 语义损失清单外的协议差异, 不在建模范围内):
 /// - temperature: Anthropic writer clamp [0,1] (协议约束, 非建模范围).
 /// - top_p / stop / stream / user / model: 协议共有但 wire 形态差异 (eg stop vs
 ///   stop_sequences), 跨协议 round-trip 后保留是合理的, 但严格不在 FWD-3 建模范围
@@ -351,9 +351,9 @@ fn prop_documented_semantic_loss_list() {
 /// - top_k: Anthropic 独有, OpenAI writer drop.
 /// - extra (已 clear) / wire_fidelity 字段 (已 clear).
 /// - parallel_tool_calls: 通过 Anthropic tool_choice.disable_parallel_tool_use 载体映射,
-///   语义脆弱 (契约 §168 显式声明), 单独在集成测试验证.
-/// - tool_choice: 契约 §168 显式声明 disable_parallel_tool_use 语义脆弱; 跨协议时
-///   tool_choice 本身是 typed enum (IrToolChoice), round-trip 保留, 但避免过拟合不在此比较.
+///   语义脆弱 (契约 §1 FWD-3 语义损失清单显式声明), 单独在集成测试验证.
+/// - tool_choice: 契约 §1 FWD-3 语义损失清单显式声明 disable_parallel_tool_use 语义脆弱;
+///   跨协议时 tool_choice 本身是 typed enum (IrToolChoice), round-trip 保留, 但避免过拟合不在此比较.
 fn assert_modeled_fields_equivalent(
     ir_in: &crate::codec::IrRequest,
     ir_out: &crate::codec::IrRequest,

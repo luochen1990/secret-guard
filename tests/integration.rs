@@ -9560,7 +9560,7 @@ async fn gemini_rewrite_only_fail_closed_still_passthrough() {
 
 // ─── CFG-3: CRUD 操作语义 (HTTP 集成测试, property-based) ──────────────────
 //
-// 契约 SSOT: `docs/design/contracts.md` §6 CFG-3 (L515-527).
+// 契约 SSOT: `docs/design/contracts.md` §6 CFG-3.
 // 这些 property 本质是 HTTP 语义, 必须通过真实 router 验证 (axum::serve 启动完整 app).
 // 选用 secrets endpoint (更核心); providers 行为对称 (都用 DynamicTable), 不重复.
 //
