@@ -26,6 +26,7 @@ secrets = []
 api_keys = []             # WebUI 签发的 API key (存 hash)
 api_keys_disabled = []    # static API key 被禁用的 label 集合 (态度层, 一维)
 audit_capture = "latest"   # 详细日志三态 "off"|"latest"|"full" (WebUI「详细日志」下拉写入, 兼容旧 bool 与旧 "errors"→latest)
+privacy_scan_groups = {}  # 隐私扫描 pattern 组开关 (只存关掉的组; 空/缺省 = 全组启用, 空 map 不落盘)
 
 [decisions.providers]     # 对 static provider id 的三态决策 (态度层):
 "openai-main" = "disabled"   # default (不入表) | prefer_static | disabled
@@ -42,6 +43,13 @@ audit_capture = "latest"   # 详细日志三态 "off"|"latest"|"full" (WebUI「�
   各会话下一次前进逐步出清); full 时全量保留. 旧版 state.toml 的 bool
   形态 (`true`/`false`) 无损迁移为 full/off, 旧 `errors` 档显式迁移为 latest
   (语义被 latest 包含); 无此字段视为 latest.
+- `privacy_scan_groups` (顶层 map, 缺省空): 隐私扫描 pattern 组开关 (`cloud` / `ai` /
+  `vcs` / `chat` / `crypto`, SSOT = `src/privacy.rs::PatternGroup`) — 组名 → 是否启用.
+  **只存关掉的组** (`false` 条目); 空/缺省 = 全组启用 (缺省态与未写该字段的旧
+  state.toml 同形, 空 map 不落盘). 未知名条目加载时忽略 (state.toml 永远可丢弃
+  重置); WebUI 写侧 (`PUT /api/privacy-scan/settings`) 全量替换, 未知名返回 400.
+  仅在 `[privacy_scan] mode = "batch"` 时生效 (组开关只收窄扫描面, 不能越过
+  static 档位关闭扫描).
 - 条目**内容**与对条目的**态度**分离存储: disabled 的 static 条目不在上面的
   `providers = []` 数组里 (那里只有 dynamic 层), 它的禁用状态只记录在 `[decisions]` 表.
 - decision=disabled 的条目在 WebUI 的 Secrets / Providers 页以**灰色删除线行**显示,

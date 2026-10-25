@@ -63,7 +63,7 @@
 
 ## 关键技术决策 (SSOT)
 
-- **语言**: Rust 2024 edition (toolchain 1.96, via nixos-unstable, 与 ~/ws/nixos 共享 nixpkgs)
+- **语言**: Rust 2024 edition (toolchain 跟随 nixos-unstable, flake.lock 锁定; MSRV 见 Cargo.toml rust-version; 与 ~/ws/nixos 共享 nixpkgs)
 - **Web 框架**: axum 0.8 (不使用 rig.rs / pingora 等高级抽象)
 - **HTTP client**: reqwest 0.12 with rustls
 - **协议无关**: body 在字节层面流动, secret 改写在 IR 层 (基于 `src/codec/ir`)
@@ -78,7 +78,7 @@
 ## 数据流契约 (总览)
 
 > **本节是 normative (尺子), 不是 descriptive (描述现状)**. 定义 secret-guard 数据正确性的理想目标.
-> 完整契约 (10 个属性域, ~100 条可测 property) 见 **`docs/design/contracts.md`**.
+> 完整契约 (13 个属性域, ~370 条可测 property) 见 **`docs/design/contracts.md`**.
 
 数据流分三个信任域, 域间有单向承诺:
 
@@ -146,7 +146,9 @@
 `derive::extract_delta_messages_from_raw` (delta 切片).
 (注: 前端 `toolNameOfRound` 已删除, tool name 提取在后端分两路 — sidebar 主标题由
 `extract_preview_and_model` 处理, 工具轮次的 sub-dot preview 由 `extract_tool_use_name`
-在 `dag::push_messages` 覆盖, 两者均由 `prop_preview_never_panics` 统一守卫 ROB-1.)
+在 `dag::push_messages` 覆盖, 两者均由 `prop_preview_never_panics_arbitrary_bytes` +
+`prop_preview_never_panics_perturbed_json` (`src/derive.rs`, contracts.md property 键
+`prop_preview_never_panics`) 守卫 ROB-1.)
 
 > **例外 — DAG 核心数据结构不用 best-effort**: `dag::BlockPool::intern` 的 collision check
 > 用 `assert!` (非 `debug_assert!`), release 也 panic. 理由: collision 属哈希函数 bug,
@@ -257,7 +259,7 @@ rationale 是不对称性: 可用性损失可重试恢复, 机密性损失不可
 2026-09 起默认全部安全侧) 是本原则的配置面; 完整陈述与 property 见
 `docs/design/contracts.md` **SEC-10**.
 
-## 前端不变量 (UI Invariants) → UI-1..UI-10 契约
+## 前端不变量 (UI Invariants) → UI-1..UI-12 契约
 
 > 以下条目是**跨 web/dag/index.html 的强不变量**, 任何渲染优化或内存重构不得违反.
 >
@@ -510,7 +512,7 @@ PR 加跑 `just check-webui` — #355 起 P0 含 path-filtered WebUI 门禁, 本
 | 单元 (纯函数) | `#[test]` | `provider::tests::protocol_short_roundtrip` |
 | Property-based | `proptest` | `redact::tests::prop_round_trip_identity` |
 | 集成 (端到端) | `mockito` + `axum::serve` | `tests/integration.rs::forwards_streaming_sse` |
-| WebUI 回归 | Playwright (TypeScript) | `tests/webui/im-ui.spec.ts` (守卫前端不变量 UI-1..UI-10) |
+| WebUI 回归 | Playwright (TypeScript) | `tests/webui/im-ui.spec.ts` (守卫前端不变量 UI-1..UI-12) |
 | 性能基线 | criterion | `benches/redact.rs` (redact_ir / StreamingRestorer 3 场景) |
 | 覆盖率 | cargo-llvm-cov (LLVM source-based) | `just coverage-html` |
 
@@ -685,7 +687,8 @@ windows/darwin。
 ## 已知限制 (MVP)
 
 > 完整清单的 SSOT 已下沉至 **`docs/known-limitations.md`** (按领域小节归位: auth / codec /
-> config / dag / deploy / derive / pool / redact / routing / usage; 节内条目单行, 追加至末尾).
+> config / dag / deploy / derive / pool / privacy-scan / protect / redact / routing / testing /
+> usage; 节内条目单行, 追加至末尾).
 > **新增限制条目时同步评估**: README 协议支持矩阵 / Roadmap 是否需要联动
 > (呈现策略详见该文件头部).
 > 本段保留同名锚点 — src 代码注释 / tests / docs 中 "根 AGENTS.md '已知限制' 条目" 的
