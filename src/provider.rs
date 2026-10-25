@@ -89,11 +89,15 @@ impl Protocol {
     ];
 
     pub fn short(self) -> &'static str {
-        Self::ALL
-            .into_iter()
-            .find(|(p, _, _)| *p == self)
-            .map(|(_, _, s)| s)
-            .expect("ALL covers every variant")
+        // 穷尽性由编译器保证: 新增 variant 时本 match 编译失败会引导补齐
+        // (ALL 常量仍由 roundtrip 测试守卫).
+        match self {
+            Self::OpenAI => "o",
+            Self::Anthropic => "a",
+            Self::Gemini => "g",
+            Self::Ollama => "l",
+            Self::OpenAIResponses => "r",
+        }
     }
 
     /// 该协议族是否有完整 codec 覆盖 (Reader/Writer/IR 路径可用 — Redact 与跨协议
@@ -109,11 +113,15 @@ impl Protocol {
     }
 
     pub fn name(self) -> &'static str {
-        Self::ALL
-            .into_iter()
-            .find(|(p, _, _)| *p == self)
-            .map(|(_, n, _)| n)
-            .expect("ALL covers every variant")
+        // 穷尽性由编译器保证: 新增 variant 时本 match 编译失败会引导补齐
+        // (ALL 常量仍由 roundtrip 测试守卫).
+        match self {
+            Self::OpenAI => "openai",
+            Self::Anthropic => "anthropic",
+            Self::Gemini => "gemini",
+            Self::Ollama => "ollama",
+            Self::OpenAIResponses => "openai-responses",
+        }
     }
 
     pub fn from_short(s: &str) -> Option<Self> {

@@ -217,11 +217,16 @@ impl SecretCategory {
     ];
 
     pub fn as_str(self) -> &'static str {
-        Self::ALL
-            .into_iter()
-            .find(|(c, _)| *c == self)
-            .map(|(_, s)| s)
-            .expect("ALL covers every variant")
+        // 穷尽性由编译器保证: 新增 variant 时本 match 编译失败会引导补齐
+        // (ALL 常量仍由 roundtrip 测试守卫).
+        match self {
+            Self::Password => "password",
+            Self::ApiKey => "apikey",
+            Self::Token => "token",
+            Self::Cookie => "cookie",
+            Self::PrivateKey => "privatekey",
+            Self::Other => "other",
+        }
     }
 }
 
