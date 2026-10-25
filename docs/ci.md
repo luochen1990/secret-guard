@@ -287,6 +287,26 @@ failure, continue-on-error 救不了 — P0 超时会阻塞合并):
 - `ci-periodic` 45min: 插桩编译 20-25min + 测试 + report + Playwright ~3-5min,
   正常热路径 ~8-12min.
 
+## 本地复现环境守卫 (just check 前置 fail-fast)
+
+"本地全绿 ⇒ CI 必绿" 锚点依赖本地环境与 CI runner 等价; 环境被本机工具遮蔽时会以
+远因报错失败 (烧掉数十分钟编译后才暴露, 或更糟 — 静默用过时工具链编译)。`_check-body`
+挂两个私有守卫 recipe (fail-fast, 秒级, CI runner 上恒通过):
+
+- **`_require-playwright-test`**: PATH 上的 `playwright` 必须支持 `test` 子命令 —
+  用户级 profile 常驻同名 Python 变体 (无 `test` 子命令, 且对未知子命令退出码仍 0)
+  会抢占解析 (2026-10-18/20 实证)。`check` 公共入口另有裸 shell 自动重入 devShell 的
+  自愈 (见 justfile `check` recipe 头注)。
+- **`_require-clippy-aligned`** (2026-10-25 实证): cargo 解析外部子命令 (clippy 等)
+  时**优先查 $CARGO_HOME/bin 再查 PATH** — devShell 把工具链放 PATH 最前也防不住
+  `~/.cargo/bin` 的 rustup shim 遮蔽; shim 按仓库 rust-toolchain.toml (channel=stable)
+  解析到本机 rustup 的过时 stable (实证 clippy 0.1.79 vs devShell rustc 1.98), 静默
+  用它编译 → "rustc 1.79.0 is not supported by the following packages" 这类远因报错。
+  探测 = `cargo clippy --version` 第三段数字 (≈ rustc minor) < PATH 上 `rustc
+  --version` 的 minor → exit 1, 报错附三条修复路径 (rustup update stable / 移除改名
+  shim / 隔离 CARGO_HOME + registry 软链保缓存)。版本不可解析时放行 (守卫只针对
+  遮蔽个案); CI runner 无 rustup shim 恒通过。
+
 ## 双宿主验证分工 (forgejo 全量档 / GitHub 默认档)
 
 仓双宿 (origin = forgejo, github = GitHub 镜像), feature 验证矩阵按宿主分工

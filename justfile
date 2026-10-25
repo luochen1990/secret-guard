@@ -112,9 +112,9 @@ check *ARGS:
     just _check-body {{ ARGS }}
 
 # check 的内层链 (真正的验证步骤; 公共入口的自愈判定后到达)。
-# 前置 _require-playwright-test (fail-fast): 守卫失败时立即报环境错误,
-# 不烧 fmt/clippy/doc 数分钟才在链尾暴露。
-_check-body *ARGS: _require-playwright-test
+# 前置守卫 (fail-fast): _require-playwright-test + _require-clippy-aligned — 守卫失败时
+# 立即报环境错误, 不烧 fmt/clippy/doc 数分钟才在链中暴露。
+_check-body *ARGS: _require-playwright-test _require-clippy-aligned
     just check-fmt
     cargo clippy --locked --all-targets {{ FULL_TIER }} -- -D warnings
     cargo machete
@@ -182,6 +182,38 @@ _require-playwright-test:
     if ! playwright --help 2>&1 | grep -qE '^  test '; then
         echo "check-webui: PATH 上的 playwright 无 test 子命令 (疑似 Python 变体抢占解析): $(command -v playwright)" >&2
         echo "  需 devShell 的 playwright-test — 用 nix develop --impure -c bash -c 'just check' 运行" >&2
+        exit 1
+    fi
+
+# clippy 工具链对齐守卫 (私有, 2026-10-25 实证的环境陷阱防护, 同 _require-playwright-test
+# 的 fail-fast 前置形态):
+#   机制: cargo 解析外部子命令 (clippy 等) 时**优先查 $CARGO_HOME/bin 再查 PATH** — nix
+#   devShell 把工具链放 PATH 最前也防不住 ~/.cargo/bin 里的 rustup shim 遮蔽; shim 再按
+#   仓库 rust-toolchain.toml (channel=stable) 解析到本机 rustup 的过时 stable (实证
+#   clippy 0.1.79 vs devShell rustc 1.98), 静默用它编译 → "rustc 1.79.0 is not supported
+#   by the following packages" 这类远因报错, 破坏 "本地 just check 全绿 ⇒ CI 必绿" 锚点.
+#   探测: `cargo clippy --version` 第三段数字 (≈ rustc minor, nix 1.98.1 → clippy 0.1.98)
+#   < PATH 上 `rustc --version` 的 minor → fail-fast. 命中才失败 — 版本不可解析 / 缺 clippy
+#   时放行 (守卫只针对遮蔽个案; 缺 clippy 由 clippy step 自身报错兜底), CI runner (无
+#   rustup, CARGO_HOME 无 shim) 恒通过. 探测带 timeout 防卡死, 常态 <1s.
+_require-clippy-aligned:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    clippy_v=$(timeout 10 cargo clippy --version 2>/dev/null || true)
+    rustc_v=$(timeout 10 rustc --version 2>/dev/null || true)
+    clippy_minor=$(printf '%s\n' "$clippy_v" | sed -nE 's/^clippy [0-9]+\.[0-9]+\.([0-9]+).*/\1/p')
+    rustc_minor=$(printf '%s\n' "$rustc_v" | sed -nE 's/^rustc [0-9]+\.([0-9]+)\.[0-9]+.*/\1/p')
+    # 版本不可解析 → 放行 (见 recipe 头注: 守卫只针对 "旧 shim 遮蔽" 个案).
+    if [ -z "$clippy_minor" ] || [ -z "$rustc_minor" ]; then
+        exit 0
+    fi
+    if [ "$clippy_minor" -lt "$rustc_minor" ]; then
+        echo "clippy-aligned: ✗ clippy (0.1.$clippy_minor) 低于 PATH 上 rustc (1.$rustc_minor) — 疑似 ~/.cargo/bin 的 rustup shim 遮蔽 nix 工具链, 静默用过时 stable 编译 → 远因报错 (rustc 1.xx is not supported ...)" >&2
+        echo "  机制: cargo 解析外部子命令 (clippy 等) 时优先查 \$CARGO_HOME/bin 再查 PATH — devShell 把工具链放 PATH 最前也防不住" >&2
+        echo "  修复 (任选其一):" >&2
+        echo "    1) rustup update stable — 把本机 stable 升到与 devShell 同代" >&2
+        echo "    2) 移除/改名 ~/.cargo/bin/cargo-clippy shim — cargo 子命令解析落回 PATH (nix 工具链)" >&2
+        echo "    3) export CARGO_HOME=<隔离目录> (如 /tmp/cargo-home) — 想保留 registry 缓存可软链: ln -s ~/.cargo/registry <隔离目录>/registry" >&2
         exit 1
     fi
 
