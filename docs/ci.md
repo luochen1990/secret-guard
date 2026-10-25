@@ -88,7 +88,7 @@ single-job runner 上串行占位, 延迟最新 push 的反馈. workflow 级
     fail-closed)。
 11. **WebUI regression gate (path-filtered)** (#355, 仅 PR 事件): 三点 diff
     (`origin/<base>...HEAD`, 同 diff breakdown step 的 base ref 先例) 命中 `src/web` /
-    `src/dag` / `src/dto.rs` / `tests/webui` 才跑 — 前端不变量 (UI-1..11) 的合入时刻
+    `src/dag` / `src/dto.rs` / `tests/webui` 才跑 — 前端不变量 (UI-1..12) 的合入时刻
     守卫 (此前唯一执行点 P2 nightly 双重非阻塞, 选择器重构/DTO 漂移可全绿合入)。
     阻塞语义 + 一次性重试 (flake 缓冲, 连续两次失败才红); `cargo build --locked` 先
     链出 debug binary 满足 freshness 门卫 (#314 — clippy 是 check-only 产物, bin 未必
@@ -217,13 +217,10 @@ CI 用纯 `curl` + Forgejo API (`POST/PATCH /repos/{owner}/{repo}/issues/{n}/com
 `forgejo/upload-artifact@v4` 是例外, VM 有 nodejs 运行它).
 
 **upsert 语义**: 用 HTML 注释 marker 标记评论, 找到则 PATCH 更新 (PR 多次 push 不刷屏),
-找不到则 POST 新建. 当前四个 marker:
+找不到则 POST 新建. 当前两个 upsert marker:
 
-- `<!-- rust-diff-analyzer -->` — diff 拆解报告.
-- `<!-- bench-regression -->` — 性能回归检测结果.
-- `<!-- webui-regression -->` — WebUI 回归测试结果.
-- `<!-- cargo-audit -->` — CVE 扫描结果.
-- `<!-- bench-regression-issue -->` — bench 退化钉住 issue (P1 判红时 bench-ci recipe upsert; P1 无 PR 事件, 落在 issue 而非 PR 评论, 修复后人工关).
+- `<!-- rust-diff-analyzer -->` — diff 拆解报告 (PR 评论, ci-merge.yml).
+- `<!-- bench-regression-issue -->` — bench 退化钉住 issue (P1 判红时 bench-ci upsert — 落在 issue 而非 PR 评论, P1 无 PR 事件; 逻辑 SSOT = `scripts/bench-ci.sh`, 修复后人工关).
 
 (Diagnose failure step 用 `<!-- ci-diagnose -->` marker 但仅 POST 不 upsert — 每次失败
 独立留痕, 不覆盖历史.)
