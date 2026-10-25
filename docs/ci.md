@@ -113,9 +113,11 @@ single-job runner 上串行占位, 延迟最新 push 的反馈. workflow 级
 全链): 无部署流水线消费本检查 + P0 全链 6-9min 单槽位重跑不值; 升级路径 = ci-deploy
 recipe 头部加一行 `just ci-merge`。step: Guard acquire / Checkout (恒浅克隆) / Cleanup
 key / skip-if-passed (`workflow_file: ci-deploy.yml` 自指, 仅 push 查询 — nightly/
-dispatch 无条件) / **Quality gate (`just ci-deploy`)** = cargo audit (CVE, 阻塞) +
+dispatch 无条件) / **Bench guard selftest (`just bench-ci-selftest`, #400)** (秒级,
+守卫的守卫 — bench-ci 判红回滚逻辑自测, 见下文 "Performance benchmark" 段) /
+**Quality gate (`just ci-deploy`)** = cargo audit (CVE, 阻塞) +
 bench compare-save (判回归 + 绿 run 才滚动基线 — 判红回滚跑前快照, 退化测量不落盘
-#359, 语义见 justfile `bench-ci` 头部 "基线策略" 段; 判红时 best-effort upsert 退化
+#359, 语义见 scripts/bench-ci.sh 文件头 "基线策略" 段; 判红时 best-effort upsert 退化
 issue 钉住, marker `<!-- bench-regression-issue -->`) / **nix build (cargoHash
 validation)** (canary 探针, continue-on-error — runner 无 nix-daemon 恒失败, 转绿即
 runner 具备 nix 能力, 届时再转阻塞; 见 workflow step 注释) / Guard verify。
@@ -178,8 +180,8 @@ spec↔DOM 漂移, 定位不因 P0 增兵而改变。
 - **Performance benchmark (P1, compare-save)**: 已是 P1 阻塞信号 (退化 exit 1 → run 红);
   `--quick` 10 samples 噪声大 (±15% 实测), 判定为双门槛 — med > 20% **且** p ≤ 0.05
   (显著性门槛吸收同宿主并发 CI job 的系统性膨胀: 2026-09-17 事故中姊妹 runner VM 的
-  并发负载让 6 场景全部 +7~24% 且 p 全 > 0.05, 纯 med 判定误报红灯; 复盘见 justfile
-  `bench-ci` recipe 头注) — 只做量级级粗筛; 升级到完整 samples 后可收紧到 10%。
+  并发负载让 6 场景全部 +7~24% 且 p 全 > 0.05, 纯 med 判定误报红灯; 复盘见
+  scripts/bench-ci.sh 头注) — 只做量级级粗筛; 升级到完整 samples 后可收紧到 10%。
   **p 门槛有效性存疑 (2026-10-20 本地实证, 待复核)**: --quick 快速模式的样本量小
   (~10-20), 实测本机 +1.4% 噪声至 +9900% 偏移的对比 p 值恒 ≥ 0.07 (粒度粗), p ≤ 0.05
   几乎不可达 — AND 双门槛下的判红可能从未真正触发 (旁证: 2026-09-17 事故 6 场景
@@ -188,11 +190,16 @@ spec↔DOM 漂移, 定位不因 P0 增兵而改变。
   **基线策略 (判红不滚动, #359 问题一, 2026-10)**: compare-save 跑前快照基线目录,
   判红 / bench 失败时回滚 — 退化测量永不落盘, 修复前每个 master push / nightly 对
   同一旧基准重复判红 (红信号持续), 判红时 best-effort 自动 upsert issue 钉住
-  (修复后人工关)。**bench 覆盖面评估 (#359 问题二附注)**: 现有 bench 面仅
+  (修复后人工关)。**回滚守卫自测 (#400)**: 判红回滚逻辑自身有常驻自测 —
+  `just bench-ci-selftest` (scripts/bench-ci.sh selftest) 用假 runner 替身跑 红/绿/
+  bench失败/冷启动 四场景 (断言判红回滚 + 基线字节不变 + issue 钩子联动 / 绿滚动 /
+  失败回滚 / 冷启动建基线), 秒级; ci-deploy.yml 在 Quality gate **之前**跑 (P1 step
+  "Bench guard selftest"), 回滚逻辑损坏 (退化静默滚动基线) 时在烧 release 编译前显形。
+  **bench 覆盖面评估 (#359 问题二附注)**: 现有 bench 面仅
   `benches/redact.rs` (redact_ir + StreamingRestorer, 每字节成本最高频的热路径);
   proxy 转发 / codec 跨协议翻译路径无性能基线 — 补齐需新 `[[bench]]` target + 代表性
   IR payload fixture 设计 (中成本) 且新场景加入瞬间基线 "要么都有要么都无" 假设破裂
-  (需 master 先跑一次 save, 见 justfile `bench-ci` 头注), 评估结论 = **暂缓**, 触发
+  (需 master 先跑一次 save, 见 scripts/bench-ci.sh 头注), 评估结论 = **暂缓**, 触发
   条件 = proxy/codec 路径出现真实性能事件或计划优化时再立 (登记于此, 勿凭空新建)。
 - **cargo audit (P1)**: v3.0 起已阻塞化 (P1 语义), 无观察期。
 - **nix build (P1, canary)**: runner 无 nix-daemon 恒失败, continue-on-error 探针保留;

@@ -146,10 +146,20 @@ jobs:
         if: success() && github.event_name == 'push'
         continue-on-error: true
 
+      # ─── 守卫的守卫 (#400) ─────────────────────────────────────────────────
+      # bench-ci 的判红回滚逻辑 (判红不滚动基线) 自身无常驻自测 — 回滚损坏时性能退化
+      # 会静默滚动基线 (红信号永久丢失)。本 step 秒级跑假 runner 四场景自测 (红回滚 /
+      # 绿滚动 / 失败回滚 / 冷启动, scripts/bench-ci.sh selftest), 在烧 10-20min release
+      # 编译之前先验证守卫本身健康。
+      - name: Bench guard selftest (#400)
+        if: success() && steps.skip.outputs.should_skip != 'true'
+        run: just bench-ci-selftest
+
       # P1 质量门禁 — 契约层入口 (`just ci-deploy`, org v3.0 可选契约):
       # audit (CVE, 阻塞 — 旧 PR-非阻塞语义不适用本档, 见文件头政策变化注记) +
       # bench 基线 compare-save (判回归 + 绿 run 才滚动基线 — 判红回滚快照退化不落盘,
-      # #359; 退化 exit 1 → run 红)。判定逻辑 SSOT 在 justfile (audit / bench-ci recipe)。
+      # #359; 退化 exit 1 → run 红)。判定逻辑 SSOT: justfile audit recipe +
+      # scripts/bench-ci.sh (justfile `bench-ci` recipe 一行委托, #400)。
       # env = bench 判红自动开 issue 的接线 (#359 (a) 辅助): bench-ci 在判红时经 Forgejo
       # API upsert 退化 issue 钉住 (marker `<!-- bench-regression-issue -->`, best-effort —
       # API 失败只 WARN 不吞 exit 1)。GITHUB_TOKEN 自动凭据与 ci-merge.yml PR 评论同源;
