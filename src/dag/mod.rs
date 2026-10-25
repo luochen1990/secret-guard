@@ -23,8 +23,11 @@
 //! - `mod` (本文件): `ConversationDag` + `DagInner` + `ParentLookup` + mutator
 //!   (push_messages / attach_response / update_parsed_response) + 内部 helper
 //!   (find_parent / prefix_chain_matches / find_root_title / gc_cascade /
-//!   evict_if_needed) + 类型 re-export.
-//! - `pool`: BlockPool + MessageRef + hash_block + combine_hash (内容寻址核心).
+//!   evict_if_needed) + 类型 re-export. push_messages 为两阶段设计: hash/序列化
+//!   等纯函数量在写锁外预计算, 锁内只做纯插入 (见其函数文档, 消除并发读写被
+//!   O(history) 序列化串行化的问题).
+//! - `pool`: BlockPool + MessageRef + hash_block + combine_hash (内容寻址核心;
+//!   两阶段 intern 的锁外预计算 prehash_message / 锁内插入 intern_prehashed).
 //! - `search`: 会话文本搜索 (#317) — 服务端扫描 + Block 级 lowercase memoize,
 //!   cap/预算双红线 (`ConversationDag::search`).
 //! - `types`: Node / CallEvent / ResponseData / Session / SessionId / PolicySnapshot 实体.
@@ -218,14 +221,51 @@ impl ConversationDag {
     ///
     /// 注意: 此方法只处理 request messages (DAG 结构), 不含 response.
     /// response 由调用方在 push 后通过 `attach_response` 单独填入.
+    ///
+    /// # 两阶段设计 (perf)
+    ///
+    /// 每请求携带完整对话历史, 历史 block 命中池是常态; 旧路径在全局写锁临界区内
+    /// 做 hash_block 序列化 + 逐块 clone, O(history) 地串行化并发 push 与 WebUI 读
+    /// (sync / records). 现拆为: **阶段 1** (锁外, 借用 &msgs) — hash_block /
+    /// MessageRef 构造 / merkle prefix 序列 (cum_seq) / contains_user_text 标志
+    /// 全部预计算 (纯函数, 与池状态无依赖); **阶段 2** (写锁内) — 纯插入 (entry
+    /// match + CDAG-6 assert + refcount++) + 既有 parent 匹配/建点步骤. 锁内零
+    /// 序列化, 历史块零克隆 (新块单次存储克隆). 详见 pool.rs 模块文档 "两阶段
+    /// intern".
     pub fn push_messages(&self, msgs: Vec<IrMessage>, event: CallEvent) -> Uuid {
+        // ─── 阶段 1 (锁外, 借用 &msgs): 预计算全部纯函数量 ───────────────────
+        //
+        // hash_block 对 ToolUse input / extra / Raw 做 serde_json 序列化,
+        // O(history) 且与池状态无关 — 挪出写锁临界区 (hash 内容寻址: 并发 push
+        // 同内容必得同 hash, 锁外计算无 TOCTOU 面).
+        let pres: Vec<pool::PrehashedMessage<'_>> =
+            msgs.iter().map(pool::prehash_message).collect();
+        // merkle prefix hash 序列 (find_parent 消费): cum_seq[i] = 前 i+1 条
+        // message 的累积 hash — 同为纯函数, 一并预计算.
+        let mut cum: u64 = 0;
+        let mut cum_seq: Vec<u64> = Vec::with_capacity(pres.len());
+        for pre in &pres {
+            cum = Self::combine_hash(cum, pre.msg_ref.hash());
+            cum_seq.push(cum);
+        }
+        // contains_user_text 标志位 (round_role 判定素材, 阶段 2 按下标切片).
+        let user_text_flags: Vec<bool> = msgs.iter().map(|m| m.contains_user_text).collect();
+
+        // ─── 阶段 2 (写锁内): 纯插入 + 既有建点步骤 ───────────────────────────
         let mut g = self.inner.write();
 
-        // 1. intern 所有 message (block 入池).
-        let msg_refs: Vec<MessageRef> = msgs.iter().map(|m| g.blocks.intern_message(m)).collect();
+        // 1. intern 所有 message (block 入池): entry match + CDAG-6 assert +
+        //    refcount++ — 锁内零序列化, 历史命中块零克隆.
+        let msg_refs: Vec<MessageRef> = pres
+            .into_iter()
+            .map(|pre| {
+                g.blocks.intern_prehashed(&pre);
+                pre.msg_ref
+            })
+            .collect();
 
-        // 2. 计算 Merkle prefix hash 序列, 找 parent.
-        let lookup = Self::find_parent(&g, &msg_refs);
+        // 2. 找 parent (cum_seq 已锁外预计算, 此处只查 prefix_index + 内容复核).
+        let lookup = Self::find_parent(&g, &msg_refs, &cum_seq);
 
         // 3. req_delta = msg_refs[split_at..] (客户端发出的增量).
         //    前 split_at 条 message 的 block refcount 由本次 intern 增加, 但它们属于 parent
@@ -246,10 +286,7 @@ impl ConversationDag {
         //   delta 任一条 message contains_user_text → User (用户主动输入, sidebar 组首)
         //   否则                                    → Tool (工具循环, sidebar sub-dot)
         let mut event = event;
-        let delta_has_user_text = msgs
-            .iter()
-            .skip(lookup.split_at)
-            .any(|m| m.contains_user_text);
+        let delta_has_user_text = user_text_flags[lookup.split_at..].iter().any(|&b| b);
         // guard 基于 delta 非空 (split_at < msgs.len()), 而非 msgs 非空:
         // 全前缀重复请求 (split_at == msgs.len(), delta 实际为空) 时保留调用方传入的值.
         if lookup.split_at < msgs.len() {
@@ -489,25 +526,21 @@ impl ConversationDag {
         );
     }
 
-    /// 计算 messages 序列的 Merkle prefix hash 序列, 找到最深匹配的 parent.
+    /// 找到最深匹配的 parent (Merkle prefix hash 匹配).
+    ///
+    /// 累积 hash 序列 `cum_seq` 由调用方 (push_messages 阶段 1) 在写锁外预计算:
+    /// `cum_seq[i]` = 前 i+1 条 message 的累积 hash — 与 `msg_refs` 等长
+    /// (算法位置外移, 语义不变: hash(cum[i-1] 或 0, h(msg_refs[i]))).
     ///
     /// 返回 `(parent, split_at)`:
     /// - `parent = None, split_at = 0`: 没找到前缀匹配, 是新会话根.
     /// - `parent = Some(id), split_at = k`: 前 k 条已在 DAG 中, 后面是 delta.
-    fn find_parent(inner: &DagInner, msg_refs: &[MessageRef]) -> ParentLookup {
+    fn find_parent(inner: &DagInner, msg_refs: &[MessageRef], cum_seq: &[u64]) -> ParentLookup {
         if msg_refs.is_empty() {
             return ParentLookup {
                 parent: None,
                 split_at: 0,
             };
-        }
-
-        // 累积 hash: cum[k] = hash(cum[k-1] 或 0, h(msg_refs[k]))
-        let mut cum: u64 = 0;
-        let mut cum_seq: Vec<u64> = Vec::with_capacity(msg_refs.len());
-        for r in msg_refs {
-            cum = Self::combine_hash(cum, r.hash());
-            cum_seq.push(cum);
         }
 
         // 倒序查 prefix_index, 找最深的命中.
@@ -2953,7 +2986,8 @@ mod tests {
         }
     }
 
-    /// 计算 texts 序列的 Merkle 累积 hash (与 `find_parent` cum_seq 同算法).
+    /// 计算 texts 序列的 Merkle 累积 hash (与 push_messages 阶段 1 预计算的
+    /// cum_seq 同算法).
     fn cum_hash_of_texts(texts: &[&str]) -> u64 {
         let mut cum = 0u64;
         for t in texts {
