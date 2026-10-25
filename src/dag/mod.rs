@@ -224,20 +224,12 @@ impl ConversationDag {
     ///
     /// # 两阶段设计 (perf)
     ///
-    /// 每请求携带完整对话历史, 历史 block 命中池是常态; 旧路径在全局写锁临界区内
-    /// 做 hash_block 序列化 + 逐块 clone, O(history) 地串行化并发 push 与 WebUI 读
-    /// (sync / records). 现拆为: **阶段 1** (锁外, 借用 &msgs) — hash_block /
-    /// MessageRef 构造 / merkle prefix 序列 (cum_seq) 全部预计算 (纯函数, 与池
-    /// 状态无依赖); **阶段 2** (写锁内) — 纯插入 (entry
-    /// match + CDAG-6 assert + refcount++) + 既有 parent 匹配/建点步骤. 锁内零
-    /// 序列化, 历史块零克隆 (新块单次存储克隆). 详见 pool.rs 模块文档 "两阶段
-    /// intern".
+    /// 序列化与克隆移出写锁临界区 (锁内纯插入, 历史块零克隆) — 机制与动机的
+    /// SSOT 见 pool.rs 模块文档 "两阶段 intern".
     pub fn push_messages(&self, msgs: Vec<IrMessage>, event: CallEvent) -> Uuid {
-        // ─── 阶段 1 (锁外, 借用 &msgs): 预计算全部纯函数量 ───────────────────
-        //
-        // hash_block 对 ToolUse input / extra / Raw 做 serde_json 序列化,
-        // O(history) 且与池状态无关 — 挪出写锁临界区 (hash 内容寻址: 并发 push
-        // 同内容必得同 hash, 锁外计算无 TOCTOU 面).
+        // ─── 阶段 1 (锁外, 借用 &msgs): 纯函数量预计算 ────────────────────────
+        // (hash_block 的 serde 序列化是 O(history) 的主要锁内开销来源, 全部前置;
+        // TOCTOU 论证见 prehash_message doc.)
         let msg_refs: Vec<MessageRef> = msgs.iter().map(pool::prehash_message).collect();
         // merkle prefix hash 序列 (find_parent 消费): cum_seq[i] = 前 i+1 条
         // message 的累积 hash — 同为纯函数, 一并预计算.
@@ -251,8 +243,7 @@ impl ConversationDag {
         // ─── 阶段 2 (写锁内): 纯插入 + 既有建点步骤 ───────────────────────────
         let mut g = self.inner.write();
 
-        // 1. intern 所有 message (block 入池): entry match + CDAG-6 assert +
-        //    refcount++ — 锁内零序列化, 历史命中块零克隆.
+        // 1. intern 所有 message (block 入池): 纯插入, 语义见 pool.rs "两阶段 intern".
         for (r, m) in msg_refs.iter().zip(&msgs) {
             g.blocks.intern_prehashed(r, &m.content);
         }

@@ -2259,8 +2259,11 @@ mod tests {
     #[test]
     fn override_mode_roundtrip() {
         for (mode, name) in OverrideMode::ALL {
-            assert_eq!(mode.as_str(), name);
             assert_eq!(OverrideMode::parse(name), Some(mode));
+            // serde 字符串名与 as_str 一致 (as_str 是单源, 双编码面在 serde rename —
+            // 漂移会让 state.toml [decisions] 手写值被 serde 拒绝, 此处锁死).
+            let json = serde_json::to_string(&mode).unwrap();
+            assert_eq!(json, format!("{name:?}"));
         }
         assert_eq!(OverrideMode::parse("xxx"), None);
         assert_eq!(OverrideMode::default(), OverrideMode::Default);

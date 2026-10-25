@@ -54,7 +54,7 @@ static WARNED_API_KEY_FILE: LazyLock<Mutex<HashSet<String>>> =
 /// `OpenAIResponses` 显式 `rename` 覆盖 — lowercase 派生会得到无分隔符的
 /// `openairesponses`, 不可读; serde 名与 `name()` 的同步由 roundtrip 测试守卫
 /// (`test_serde_names_match_all`). ALL 是定长数组, 不随新增 variant 自动扩 —
-/// 完备性由 roundtrip 测试守卫.
+/// ALL 漏项无自动守卫, 需人工随新增 variant 同步.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {
@@ -1640,7 +1640,6 @@ mod tests {
     fn protocol_short_roundtrip() {
         for (proto, _, short) in Protocol::ALL {
             assert_eq!(Protocol::from_short(short), Some(proto));
-            assert_eq!(proto.short(), short);
         }
         assert_eq!(Protocol::from_short("x"), None);
     }
@@ -1649,7 +1648,6 @@ mod tests {
     fn protocol_name_roundtrip() {
         for (proto, name, _) in Protocol::ALL {
             assert_eq!(Protocol::from_name(name), Some(proto));
-            assert_eq!(proto.name(), name);
         }
         assert_eq!(Protocol::from_name("xxx"), None);
     }

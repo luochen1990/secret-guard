@@ -206,8 +206,8 @@ pub enum SecretCategory {
 
 impl SecretCategory {
     /// 所有变体及其字符串名 — 派生自 `as_str()` (const fn match 是字符串单源).
-    /// 与 `#[serde(rename_all = "lowercase")]` 的同步由 roundtrip 测试守卫;
-    /// 定长数组不随新增 variant 自动扩 — 完备性由 roundtrip 测试守卫.
+    /// serde rename 同步由 roundtrip 测试守卫; 定长数组不随新增 variant 自动扩 —
+    /// ALL 漏项无自动守卫, 需人工随新增 variant 同步.
     pub const ALL: [(Self, &'static str); 6] = [
         (Self::Password, Self::Password.as_str()),
         (Self::ApiKey, Self::ApiKey.as_str()),

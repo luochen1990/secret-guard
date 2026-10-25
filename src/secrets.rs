@@ -287,8 +287,8 @@ pub enum SecretStrategy {
 
 impl SecretStrategy {
     /// 所有变体及其字符串名 — 派生自 `as_str()` (const fn match 是字符串单源,
-    /// `#[serde(rename_all = "snake_case")]` 的同步由 roundtrip 测试守卫; 定长
-    /// 数组不随新增 variant 自动扩 — 完备性由 roundtrip 测试守卫).
+    /// serde rename 同步由 roundtrip 测试守卫; 定长数组不随新增 variant 自动扩 —
+    /// ALL 漏项无自动守卫, 需人工随新增 variant 同步).
     /// 值域 SSOT: validate 的 fail-fast 判定消费此表; 前端 strategy 选择器
     /// 硬编码已实现值 (redact/reject/placeholder), 不从本表派生.
     pub const ALL: [(Self, &'static str); 4] = [
@@ -661,7 +661,10 @@ mod tests {
     #[test]
     fn secret_category_roundtrip_str() {
         for (cat, name) in SecretCategory::ALL {
-            assert_eq!(cat.as_str(), name);
+            // serde 字符串名与 as_str 一致 (as_str 是单源, 双编码面在 serde rename —
+            // 漂移会让 WebUI 词表/用户手写 toml 的值被 serde 拒绝, 此处锁死).
+            let json = serde_json::to_string(&cat).unwrap();
+            assert_eq!(json, format!("{name:?}"));
         }
         // 其他类型转换正确.
         assert_eq!(SecretCategory::default(), SecretCategory::ApiKey);
@@ -710,8 +713,7 @@ mod tests {
     #[test]
     fn secret_strategy_all_roundtrip_str() {
         for (s, name) in SecretStrategy::ALL {
-            assert_eq!(s.as_str(), name);
-            // serde 字符串名与 as_str 一致 (ALL 是单一事实来源).
+            // serde 字符串名与 as_str 一致 (as_str 是单源, 双编码面在 serde rename).
             let json = serde_json::to_string(&s).unwrap();
             assert_eq!(json, format!("{name:?}"));
         }
