@@ -205,20 +205,20 @@ pub enum SecretCategory {
 }
 
 impl SecretCategory {
-    /// 所有变体及其字符串名 (与 `#[serde(rename_all = "lowercase")]` 同步).
-    /// 单一事实来源: `all()` 与 `as_str()` 均从这里派生.
+    /// 所有变体及其字符串名 — 派生自 `as_str()` (const fn match 是字符串单源).
+    /// 与 `#[serde(rename_all = "lowercase")]` 的同步由 roundtrip 测试守卫;
+    /// 定长数组不随新增 variant 自动扩 — 完备性由 roundtrip 测试守卫.
     pub const ALL: [(Self, &'static str); 6] = [
-        (Self::Password, "password"),
-        (Self::ApiKey, "apikey"),
-        (Self::Token, "token"),
-        (Self::Cookie, "cookie"),
-        (Self::PrivateKey, "privatekey"),
-        (Self::Other, "other"),
+        (Self::Password, Self::Password.as_str()),
+        (Self::ApiKey, Self::ApiKey.as_str()),
+        (Self::Token, Self::Token.as_str()),
+        (Self::Cookie, Self::Cookie.as_str()),
+        (Self::PrivateKey, Self::PrivateKey.as_str()),
+        (Self::Other, Self::Other.as_str()),
     ];
 
-    pub fn as_str(self) -> &'static str {
-        // 穷尽性由编译器保证: 新增 variant 时本 match 编译失败会引导补齐
-        // (ALL 常量仍由 roundtrip 测试守卫).
+    pub const fn as_str(self) -> &'static str {
+        // 穷尽 match: 新增 variant 编译期引导补齐 (本 match 是字符串单源, ALL 派生自它).
         match self {
             Self::Password => "password",
             Self::ApiKey => "apikey",

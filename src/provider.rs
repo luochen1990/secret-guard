@@ -49,10 +49,12 @@ static WARNED_API_KEY_FILE: LazyLock<Mutex<HashSet<String>>> =
 
 /// 支持的 LLM 协议.
 ///
-/// serde 名与 [`Protocol::ALL`] 中的 `name` 字段保持同步, 后者是单一事实来源
-/// (`from_name` / `from_short` 都从 `ALL` 派生). 各变体经 enum 级
-/// `rename_all = "lowercase"` 从变体名派生 serde 名, 唯 `OpenAIResponses` 显式
-/// `rename` 覆盖 — lowercase 派生会得到无分隔符的 `openairesponses`, 不可读.
+/// 字符串单源于 `name()` / `short()` 的 const fn match, [`Protocol::ALL`] 派生自
+/// 它们. 各变体经 enum 级 `rename_all = "lowercase"` 从变体名派生 serde 名, 唯
+/// `OpenAIResponses` 显式 `rename` 覆盖 — lowercase 派生会得到无分隔符的
+/// `openairesponses`, 不可读; serde 名与 `name()` 的同步由 roundtrip 测试守卫
+/// (`test_serde_names_match_all`). ALL 是定长数组, 不随新增 variant 自动扩 —
+/// 完备性由 roundtrip 测试守卫.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {
@@ -78,19 +80,28 @@ impl std::fmt::Display for Protocol {
 }
 
 impl Protocol {
-    /// 所有变体 + 完整名 (serde 名) + URL 单字母简写. 单一事实来源.
-    /// 简写映射: o=OpenAI, a=Anthropic, g=Gemini, l=oLLama, r=Responses.
+    /// 所有变体 + 完整名 (serde 名) + URL 单字母简写 — 派生自 `name()` /
+    /// `short()` (const fn match 是字符串单源). 简写映射: o=OpenAI,
+    /// a=Anthropic, g=Gemini, l=oLLama, r=Responses.
     pub const ALL: [(Self, &'static str, &'static str); 5] = [
-        (Self::OpenAI, "openai", "o"),
-        (Self::Anthropic, "anthropic", "a"),
-        (Self::Gemini, "gemini", "g"),
-        (Self::Ollama, "ollama", "l"),
-        (Self::OpenAIResponses, "openai-responses", "r"),
+        (Self::OpenAI, Self::OpenAI.name(), Self::OpenAI.short()),
+        (
+            Self::Anthropic,
+            Self::Anthropic.name(),
+            Self::Anthropic.short(),
+        ),
+        (Self::Gemini, Self::Gemini.name(), Self::Gemini.short()),
+        (Self::Ollama, Self::Ollama.name(), Self::Ollama.short()),
+        (
+            Self::OpenAIResponses,
+            Self::OpenAIResponses.name(),
+            Self::OpenAIResponses.short(),
+        ),
     ];
 
-    pub fn short(self) -> &'static str {
-        // 穷尽性由编译器保证: 新增 variant 时本 match 编译失败会引导补齐
-        // (ALL 常量仍由 roundtrip 测试守卫).
+    /// URL 单字母简写 (路由 `/{proto_short}/{name}` 的第一段).
+    pub const fn short(self) -> &'static str {
+        // 穷尽 match: 新增 variant 编译期引导补齐 (本 match 是字符串单源, ALL 派生自它).
         match self {
             Self::OpenAI => "o",
             Self::Anthropic => "a",
@@ -112,9 +123,7 @@ impl Protocol {
         matches!(self, Self::OpenAI | Self::Anthropic | Self::OpenAIResponses)
     }
 
-    pub fn name(self) -> &'static str {
-        // 穷尽性由编译器保证: 新增 variant 时本 match 编译失败会引导补齐
-        // (ALL 常量仍由 roundtrip 测试守卫).
+    pub const fn name(self) -> &'static str {
         match self {
             Self::OpenAI => "openai",
             Self::Anthropic => "anthropic",

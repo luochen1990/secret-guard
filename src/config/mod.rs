@@ -1453,7 +1453,7 @@ impl<T: DynamicEntry> DynamicTable<T> {
             let mode = T::get_decision(&decisions, s.id());
             // 探测 Some-ness 走借用的 classify_source (与 pick_effective 严格对偶,
             // 对偶性由 classify_source_dual_to_pick_effective 守卫), 省去探测臂克隆.
-            if classify_source(true, dyn_map.contains_key(s.id()), mode).is_some() {
+            if classify_source(true, dyn_opt.is_some(), mode).is_some() {
                 out.push((Some(s.clone()), dyn_opt, mode));
             }
         }

@@ -26,16 +26,17 @@ pub enum OverrideMode {
 }
 
 impl OverrideMode {
-    /// 所有变体及其字符串名. 单一事实来源.
+    /// 所有变体及其字符串名 — 派生自 `as_str()` (const fn match 是字符串单源;
+    /// serde rename_all 同步由 roundtrip 测试守卫). 定长数组不随新增 variant
+    /// 自动扩 — 完备性由 roundtrip 测试守卫.
     pub const ALL: [(Self, &'static str); 3] = [
-        (Self::Default, "default"),
-        (Self::PreferStatic, "prefer_static"),
-        (Self::Disabled, "disabled"),
+        (Self::Default, Self::Default.as_str()),
+        (Self::PreferStatic, Self::PreferStatic.as_str()),
+        (Self::Disabled, Self::Disabled.as_str()),
     ];
 
-    pub fn as_str(self) -> &'static str {
-        // 穷尽性由编译器保证: 新增 variant 时本 match 编译失败会引导补齐
-        // (ALL 常量仍由 roundtrip 测试守卫).
+    pub const fn as_str(self) -> &'static str {
+        // 穷尽 match: 新增 variant 编译期引导补齐 (本 match 是字符串单源, ALL 派生自它).
         match self {
             Self::Default => "default",
             Self::PreferStatic => "prefer_static",

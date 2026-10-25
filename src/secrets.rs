@@ -286,19 +286,20 @@ pub enum SecretStrategy {
 }
 
 impl SecretStrategy {
-    /// 所有变体及其字符串名 (与 `#[serde(rename_all = "snake_case")]` 同步).
-    /// 值域 SSOT: as_str / validate 的 fail-fast 判定消费此表; 前端 strategy
-    /// 选择器硬编码已实现值 (redact/reject), 不从本表派生 (批2/3 落地时同步).
+    /// 所有变体及其字符串名 — 派生自 `as_str()` (const fn match 是字符串单源,
+    /// `#[serde(rename_all = "snake_case")]` 的同步由 roundtrip 测试守卫; 定长
+    /// 数组不随新增 variant 自动扩 — 完备性由 roundtrip 测试守卫).
+    /// 值域 SSOT: validate 的 fail-fast 判定消费此表; 前端 strategy 选择器
+    /// 硬编码已实现值 (redact/reject/placeholder), 不从本表派生.
     pub const ALL: [(Self, &'static str); 4] = [
-        (Self::Redact, "redact"),
-        (Self::Protect, "protect"),
-        (Self::Placeholder, "placeholder"),
-        (Self::Reject, "reject"),
+        (Self::Redact, Self::Redact.as_str()),
+        (Self::Protect, Self::Protect.as_str()),
+        (Self::Placeholder, Self::Placeholder.as_str()),
+        (Self::Reject, Self::Reject.as_str()),
     ];
 
-    pub fn as_str(self) -> &'static str {
-        // 穷尽性由编译器保证: 新增 variant 时本 match 编译失败会引导补齐
-        // (ALL 常量仍由 roundtrip 测试守卫).
+    pub const fn as_str(self) -> &'static str {
+        // 穷尽 match: 新增 variant 编译期引导补齐 (本 match 是字符串单源, ALL 派生自它).
         match self {
             Self::Redact => "redact",
             Self::Protect => "protect",
