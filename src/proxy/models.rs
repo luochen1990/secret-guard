@@ -678,14 +678,19 @@ async fn fetch_model_list(
                 errs.join("; ")
             ))
         }
-        Protocol::Gemini | Protocol::Ollama => {
-            let path = match endpoint.protocol {
-                Protocol::Gemini => "/v1beta/models",
-                Protocol::Ollama => "/api/tags",
-                _ => unreachable!("matched arm excludes v1 family"),
-            };
-            let url = super::helpers::build_upstream_url(&endpoint.base_url, path);
-            let models = fetch_and_parse(client, &url, api_key, endpoint.protocol)
+        // 注: 无法用 `p @ (Gemini | Ollama)` 绑定后内层 `match p` 只列两臂 — Rust 无
+        // 细化类型, 内层 match 仍需穷尽全部 variant. 拆两臂字面化 body, 穷尽性由
+        // 编译器直接验证 (新增 protocol variant 时本 match 编译失败引导补齐).
+        Protocol::Gemini => {
+            let url = super::helpers::build_upstream_url(&endpoint.base_url, "/v1beta/models");
+            let models = fetch_and_parse(client, &url, api_key, Protocol::Gemini)
+                .await
+                .map_err(|e| e.message())?;
+            Ok((models, None))
+        }
+        Protocol::Ollama => {
+            let url = super::helpers::build_upstream_url(&endpoint.base_url, "/api/tags");
+            let models = fetch_and_parse(client, &url, api_key, Protocol::Ollama)
                 .await
                 .map_err(|e| e.message())?;
             Ok((models, None))
