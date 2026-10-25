@@ -112,7 +112,7 @@ rollback_baseline() {
     local d rel
     while IFS= read -r d; do
         rel="${d#"$BASELINE_SNAPSHOT"/}"
-        rm -rf "$BENCH_DIR/$rel"
+        rm -rf "${BENCH_DIR:?}/$rel"
         cp -a "$d" "$BENCH_DIR/$rel"
     done < <(find "$BASELINE_SNAPSHOT" -mindepth 3 -type d -name "$BASELINE_NAME" 2>/dev/null)
     echo "bench-ci: 基线已回滚 — 本次测量不落盘, 旧基准保留 (下一 run 仍对同一旧基准判红)." >&2
@@ -160,29 +160,29 @@ main() {
     local EXTRA="$*"
     local BENCH_FLAG OUTPUT BENCH_EXIT regressions
 
-    # 选择 criterion flag.
-    if [ "$ACTION" = "save" ] || [ "$ACTION" = "compare-save" ]; then
-        if [ "$ACTION" = "compare-save" ] && ! baseline_exists; then
-            # 冷启动: 无旧基线可判回归, fallback 纯建立. 不算回归.
-            echo "bench-ci: 基线 '$BASELINE_NAME' 不存在 (冷启动), 本次仅建立基线不判定回归." >&2
-            ACTION="save"
-        fi
-        BENCH_FLAG="--save-baseline $BASELINE_NAME"
-        # 快照时机: 进入 bench 运行前 (criterion 收尾即覆写基线). 冷启动分支无基线可快照.
-        [ "$ACTION" = "compare-save" ] && snapshot_baseline
-    elif [ "$ACTION" = "compare" ]; then
-        if baseline_exists; then
-            BENCH_FLAG="--baseline $BASELINE_NAME"
-        else
-            # 冷启动: 第一次跑无基线可对比, fallback 建立. 不算回归.
-            echo "bench-ci: 基线 '$BASELINE_NAME' 不存在 (冷启动), 本次仅建立基线不判定回归." >&2
-            BENCH_FLAG="--save-baseline $BASELINE_NAME"
-            ACTION="save"
-        fi
-    else
-        echo "bench-ci: 未知 mode '$ACTION' (应为 save / compare / compare-save)" >&2
-        exit 2
+    # 模式归一 + criterion flag 选择 (单一出口):
+    #   ① 非法 mode → exit 2.
+    #   ② compare / compare-save 基线缺失 (冷启动) → 统一 fallback 纯建立
+    #      (第一次跑无历史可对比/判定, 不算回归), ACTION 归一为 save.
+    #   ③ 按归一后 ACTION 一处选 flag.
+    #   ④ compare-save 跑前快照 (criterion 收尾即覆写基线; 冷启动分支无基线可快照).
+    case "$ACTION" in
+        save|compare|compare-save) ;;
+        *)
+            echo "bench-ci: 未知 mode '$ACTION' (应为 save / compare / compare-save)" >&2
+            exit 2
+            ;;
+    esac
+    if [ "$ACTION" != "save" ] && ! baseline_exists; then
+        echo "bench-ci: 基线 '$BASELINE_NAME' 不存在 (冷启动), 本次仅建立基线不判定回归." >&2
+        ACTION="save"
     fi
+    case "$ACTION" in
+        save)         BENCH_FLAG="--save-baseline $BASELINE_NAME" ;;
+        compare)      BENCH_FLAG="--baseline $BASELINE_NAME" ;;
+        compare-save) BENCH_FLAG="--save-baseline $BASELINE_NAME" ;;
+    esac
+    [ "$ACTION" = "compare-save" ] && snapshot_baseline
 
     # 跑 bench, 捕获输出. set +e: cargo bench 退化时仍 exit 0, 但编译/运行错误
     # 会 exit 非 101, 需捕获区分 (退化 vs 真失败).
@@ -332,7 +332,8 @@ st_red() {
 }
 
 # b. 绿路径: 无回归 (med +1.1% < 20%, p=0.35) → exit 0 + 基线正常滚动
-#    (runner 落盘的新测量字节存活 — save 语义未被回滚误伤).
+#    (runner 落盘的新测量字节存活 — save 语义未被回滚误伤) + issue 钩子
+#    **不被调用** (与红场景的 spy 断言对称).
 st_green() {
     local ws rc fails=0
     ws=$(st_workspace 1)
@@ -343,6 +344,8 @@ st_green() {
     [ "$(cat "$ws/criterion/redact_ir/small/ci/estimates.json" 2>/dev/null)" = 'NEW-ESTIMATES-v2' ] \
         || { echo "  ✗ 基线未滚动 (绿 run 新测量应存活)"; fails=$((fails+1)); }
     grep -q '无场景退化' "$ws/out.log" || { echo "  ✗ 缺绿判定输出"; fails=$((fails+1)); }
+    [ ! -f "$ws/spy" ] \
+        || { echo "  ✗ 绿 run 不应触发 open_regression_issue (issue 钉住仅判红联动)"; fails=$((fails+1)); }
     st_report green "$fails" "$ws"
 }
 
