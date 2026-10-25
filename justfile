@@ -196,6 +196,8 @@ _require-playwright-test:
 #   < PATH 上 `rustc --version` 的 minor → fail-fast. 命中才失败 — 版本不可解析 / 缺 clippy
 #   时放行 (守卫只针对遮蔽个案; 缺 clippy 由 clippy step 自身报错兜底), CI runner (无
 #   rustup, CARGO_HOME 无 shim) 恒通过. 探测带 timeout 防卡死, 常态 <1s.
+#   版本配对假设: clippy 0.1.N ↔ rustc 1.N; clippy 版本方案变化时本守卫需同步
+#   (误报为 fail-closed 可见, 不静默).
 _require-clippy-aligned:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -510,10 +512,10 @@ typos:
 
 # redact 性能基线 (criterion bench).
 # 详尽设计 (3 场景 + 2 目标 + 为什么手动构造 map) 见 benches/redact.rs 头部.
-# 默认 100 samples 较慢; CI 用 --quick (10 samples) 兼顾覆盖与速度, 本地完整跑用 `just bench`.
+# 本地完整基准入口 (默认 100 samples 较慢, 可 --quick 10 samples); CI 侧不走本
+# recipe — 性能回归检测走 `just bench-ci compare-save` (ci-deploy.yml, 判红不滚动).
 # 透传 criterion 参数: just bench --quick / just bench -- --quick.
 #
-# CI 调用: 被 ci.yml "Performance benchmark" step 调用 (非阻塞, 走 bench-ci 做基线对比).
 # release 缓存复用 CARGO_TARGET_DIR/release/ (与 debug/ 物理隔离).
 bench *ARGS:
     cargo bench --locked --bench redact -- {{ ARGS }}
