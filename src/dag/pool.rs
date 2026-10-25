@@ -27,9 +27,11 @@
 //! WebUI 读 (sync / records). 现拆两阶段:
 //! - 阶段 1 (锁外): [`prehash_message`] — hash_block + MessageRef 构造 (含
 //!   extra 的 Arc 化), 全部是 `&IrMessage` 上的纯函数.
-//! - 阶段 2 (锁内): [`BlockPool::intern_prehashed`] — 纯插入 (entry match +
-//!   CDAG-6 collision assert + refcount++), 零序列化; 历史命中块零克隆 (旧
-//!   `intern(b.clone())` 的调用点克隆消失), 新块仅 Vacant arm 单次存储克隆.
+//! - 阶段 2 (锁内): [`BlockPool::intern_prehashed`] — 消费 (MessageRef,
+//!   原始 content) 二元组入池: zip `msg_ref.blocks` 与 `content` 逐对纯插入
+//!   (entry match + CDAG-6 collision assert + refcount++), 零序列化; 历史命中
+//!   块零克隆 (旧 `intern(b.clone())` 的调用点克隆消失), 新块仅 Vacant arm
+//!   单次存储克隆.
 //!
 //! 单条 message 的既有调用方 (attach 侧 `ConversationDag::intern_message` /
 //! recorder) 仍走 [`BlockPool::intern_message`] — 薄包装, 内部复用同一
@@ -221,34 +223,20 @@ impl MessageRef {
     }
 }
 
-// ─── PrehashedMessage (两阶段 intern 的锁外预计算产物) ─────────────────────
-
-/// [`prehash_message`] 的产物: 两阶段 intern 中**锁外**预计算好的单条 message.
-///
-/// `msg_ref.blocks` 与 `borrowed` 是**平行数组** (同序等长): 前者持预计算 hash
-/// (锁内 entry 查找 / refcount 的 key), 后者借用原始 block (锁内新块插入 /
-/// CDAG-6 collision 复核的值). 借用生命周期绑定调用方的 `&IrMessage` —
-/// push_messages 场景 msgs 是本地 Vec, 阶段 2 持锁期间始终存活.
-pub(super) struct PrehashedMessage<'a> {
-    pub(super) msg_ref: MessageRef,
-    pub(super) borrowed: Vec<&'a IrBlock>,
-}
+// ─── 两阶段 intern 的锁外预计算 ────────────────────────────────────────────
 
 /// 两阶段 intern 的**锁外**阶段: 对单条 message 预计算 hash_block (含 serde_json
 /// 序列化) + 构造完整 MessageRef (extra 在此 Arc 化, 一次性分配).
 ///
 /// 全部是 `&IrMessage` 上的纯函数 — 不触池 / 不取锁, 与池状态无依赖, 可安全
 /// 在写锁临界区外执行 (hash 是内容寻址的, 并发 push 同内容必得同 hash).
-pub(super) fn prehash_message<'a>(msg: &'a IrMessage) -> PrehashedMessage<'a> {
-    PrehashedMessage {
-        msg_ref: MessageRef {
-            role: msg.role,
-            content_form: msg.content_form,
-            reasoning_content_form: msg.reasoning_content_form,
-            extra: (!msg.extra.is_empty()).then(|| Arc::new(msg.extra.clone())),
-            blocks: msg.content.iter().map(hash_block).collect(),
-        },
-        borrowed: msg.content.iter().collect(),
+pub(super) fn prehash_message(msg: &IrMessage) -> MessageRef {
+    MessageRef {
+        role: msg.role,
+        content_form: msg.content_form,
+        reasoning_content_form: msg.reasoning_content_form,
+        extra: (!msg.extra.is_empty()).then(|| Arc::new(msg.extra.clone())),
+        blocks: msg.content.iter().map(hash_block).collect(),
     }
 }
 
@@ -323,17 +311,13 @@ impl BlockPool {
         *self.refcount.entry(h).or_insert(0) += 1;
     }
 
-    /// 消费 [`prehash_message`] 的产物, 把预计算 hash 的全部 block 入池
-    /// (refcount++) — 两阶段 intern 的**锁内**阶段: 纯插入, 零序列化,
-    /// 历史命中块零克隆.
-    pub(super) fn intern_prehashed(&mut self, pre: &PrehashedMessage<'_>) {
-        debug_assert_eq!(
-            pre.msg_ref.blocks.len(),
-            pre.borrowed.len(),
-            "PrehashedMessage 平行数组长度不一致 (内部 bug)"
-        );
-        for (h, block) in pre.msg_ref.blocks.iter().zip(&pre.borrowed) {
-            self.intern_block_prehashed(*h, block);
+    /// 两阶段 intern 的**锁内**阶段: 把 [`prehash_message`] 的产物 (MessageRef)
+    /// 连同其来源 message 的原始 content 入池 — `msg_ref.blocks[i]` 与
+    /// `content[i]` 同序同源 (zip 配对), 逐对走 [`Self::intern_block_prehashed`].
+    /// 纯插入, 零序列化, 历史命中块零克隆.
+    pub(super) fn intern_prehashed(&mut self, msg_ref: &MessageRef, content: &[IrBlock]) {
+        for (&h, block) in msg_ref.blocks.iter().zip(content) {
+            self.intern_block_prehashed(h, block);
         }
     }
 
@@ -368,9 +352,9 @@ impl BlockPool {
     /// `ConversationDag::intern_message` / recorder) 签名与行为不变;
     /// push_messages 的批量路径在锁外自行调 `prehash_message`, 持锁后批量插入.
     pub fn intern_message(&mut self, msg: &IrMessage) -> MessageRef {
-        let pre = prehash_message(msg);
-        self.intern_prehashed(&pre);
-        pre.msg_ref
+        let r = prehash_message(msg);
+        self.intern_prehashed(&r, &msg.content);
+        r
     }
 
     /// 按 MessageRef 重建 IrMessage (从池中 deref 所有 block).

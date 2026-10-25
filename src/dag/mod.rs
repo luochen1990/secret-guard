@@ -227,8 +227,8 @@ impl ConversationDag {
     /// 每请求携带完整对话历史, 历史 block 命中池是常态; 旧路径在全局写锁临界区内
     /// 做 hash_block 序列化 + 逐块 clone, O(history) 地串行化并发 push 与 WebUI 读
     /// (sync / records). 现拆为: **阶段 1** (锁外, 借用 &msgs) — hash_block /
-    /// MessageRef 构造 / merkle prefix 序列 (cum_seq) / contains_user_text 标志
-    /// 全部预计算 (纯函数, 与池状态无依赖); **阶段 2** (写锁内) — 纯插入 (entry
+    /// MessageRef 构造 / merkle prefix 序列 (cum_seq) 全部预计算 (纯函数, 与池
+    /// 状态无依赖); **阶段 2** (写锁内) — 纯插入 (entry
     /// match + CDAG-6 assert + refcount++) + 既有 parent 匹配/建点步骤. 锁内零
     /// 序列化, 历史块零克隆 (新块单次存储克隆). 详见 pool.rs 模块文档 "两阶段
     /// intern".
@@ -238,31 +238,24 @@ impl ConversationDag {
         // hash_block 对 ToolUse input / extra / Raw 做 serde_json 序列化,
         // O(history) 且与池状态无关 — 挪出写锁临界区 (hash 内容寻址: 并发 push
         // 同内容必得同 hash, 锁外计算无 TOCTOU 面).
-        let pres: Vec<pool::PrehashedMessage<'_>> =
-            msgs.iter().map(pool::prehash_message).collect();
+        let msg_refs: Vec<MessageRef> = msgs.iter().map(pool::prehash_message).collect();
         // merkle prefix hash 序列 (find_parent 消费): cum_seq[i] = 前 i+1 条
         // message 的累积 hash — 同为纯函数, 一并预计算.
         let mut cum: u64 = 0;
-        let mut cum_seq: Vec<u64> = Vec::with_capacity(pres.len());
-        for pre in &pres {
-            cum = Self::combine_hash(cum, pre.msg_ref.hash());
+        let mut cum_seq: Vec<u64> = Vec::with_capacity(msg_refs.len());
+        for r in &msg_refs {
+            cum = Self::combine_hash(cum, r.hash());
             cum_seq.push(cum);
         }
-        // contains_user_text 标志位 (round_role 判定素材, 阶段 2 按下标切片).
-        let user_text_flags: Vec<bool> = msgs.iter().map(|m| m.contains_user_text).collect();
 
         // ─── 阶段 2 (写锁内): 纯插入 + 既有建点步骤 ───────────────────────────
         let mut g = self.inner.write();
 
         // 1. intern 所有 message (block 入池): entry match + CDAG-6 assert +
         //    refcount++ — 锁内零序列化, 历史命中块零克隆.
-        let msg_refs: Vec<MessageRef> = pres
-            .into_iter()
-            .map(|pre| {
-                g.blocks.intern_prehashed(&pre);
-                pre.msg_ref
-            })
-            .collect();
+        for (r, m) in msg_refs.iter().zip(&msgs) {
+            g.blocks.intern_prehashed(r, &m.content);
+        }
 
         // 2. 找 parent (cum_seq 已锁外预计算, 此处只查 prefix_index + 内容复核).
         let lookup = Self::find_parent(&g, &msg_refs, &cum_seq);
@@ -286,7 +279,9 @@ impl ConversationDag {
         //   delta 任一条 message contains_user_text → User (用户主动输入, sidebar 组首)
         //   否则                                    → Tool (工具循环, sidebar sub-dot)
         let mut event = event;
-        let delta_has_user_text = user_text_flags[lookup.split_at..].iter().any(|&b| b);
+        // contains_user_text 是 IrMessage 上的 bool 字段 (reader 入口预计算),
+        // 直接按 delta 切片判定, 无需序列化.
+        let delta_has_user_text = msgs[lookup.split_at..].iter().any(|m| m.contains_user_text);
         // guard 基于 delta 非空 (split_at < msgs.len()), 而非 msgs 非空:
         // 全前缀重复请求 (split_at == msgs.len(), delta 实际为空) 时保留调用方传入的值.
         if lookup.split_at < msgs.len() {
