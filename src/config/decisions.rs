@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 /// 对 static id 的 per-item 决策. 仅对 static 中已存在的 id 生效.
 ///
-/// 序列化为 lowercase 字符串, 便于在 TOML / JSON 中读写.
+/// 序列化为 snake_case 字符串 (`default`/`prefer_static`/`disabled`), 便于在 TOML / JSON 中读写.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OverrideMode {
