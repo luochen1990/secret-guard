@@ -1639,6 +1639,9 @@ mod tests {
     #[test]
     fn protocol_short_roundtrip() {
         for (proto, _, short) in Protocol::ALL {
+            // 正向断言须运行时调用 short() (非 const 上下文): ALL 派生自 short() 的
+            // 编译期求值, 只读 ALL 不执行 match arm; 运行时调用同时锁死 ALL ↔ match.
+            assert_eq!(proto.short(), short);
             assert_eq!(Protocol::from_short(short), Some(proto));
         }
         assert_eq!(Protocol::from_short("x"), None);
@@ -1647,6 +1650,8 @@ mod tests {
     #[test]
     fn protocol_name_roundtrip() {
         for (proto, name, _) in Protocol::ALL {
+            // 同 protocol_short_roundtrip: 运行时调用 name() 锁 ALL ↔ match (非 const 上下文).
+            assert_eq!(proto.name(), name);
             assert_eq!(Protocol::from_name(name), Some(proto));
         }
         assert_eq!(Protocol::from_name("xxx"), None);

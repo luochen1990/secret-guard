@@ -2259,6 +2259,9 @@ mod tests {
     #[test]
     fn override_mode_roundtrip() {
         for (mode, name) in OverrideMode::ALL {
+            // 正向断言须运行时调用 as_str() (非 const 上下文): ALL 派生自 as_str() 的
+            // 编译期求值, 只读 ALL 不执行 match arm; 运行时调用同时锁死 ALL ↔ match.
+            assert_eq!(mode.as_str(), name);
             assert_eq!(OverrideMode::parse(name), Some(mode));
             // serde 字符串名与 as_str 一致 (as_str 是单源, 双编码面在 serde rename —
             // 漂移会让 state.toml [decisions] 手写值被 serde 拒绝, 此处锁死).

@@ -661,6 +661,9 @@ mod tests {
     #[test]
     fn secret_category_roundtrip_str() {
         for (cat, name) in SecretCategory::ALL {
+            // 正向断言须运行时调用 as_str() (非 const 上下文): ALL 派生自 as_str() 的
+            // 编译期求值, 只读 ALL 不执行 match arm; 运行时调用同时锁死 ALL ↔ match.
+            assert_eq!(cat.as_str(), name);
             // serde 字符串名与 as_str 一致 (as_str 是单源, 双编码面在 serde rename —
             // 漂移会让 WebUI 词表/用户手写 toml 的值被 serde 拒绝, 此处锁死).
             let json = serde_json::to_string(&cat).unwrap();
@@ -713,6 +716,8 @@ mod tests {
     #[test]
     fn secret_strategy_all_roundtrip_str() {
         for (s, name) in SecretStrategy::ALL {
+            // 同 secret_category_roundtrip_str: 运行时调用 as_str() 锁 ALL ↔ match (非 const 上下文).
+            assert_eq!(s.as_str(), name);
             // serde 字符串名与 as_str 一致 (as_str 是单源, 双编码面在 serde rename).
             let json = serde_json::to_string(&s).unwrap();
             assert_eq!(json, format!("{name:?}"));
