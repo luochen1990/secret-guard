@@ -345,70 +345,139 @@ pub(super) fn blocks_to_text(blocks: &[ir::IrBlock]) -> String {
         .join("\n")
 }
 
-/// 请求级聚合: `req.messages` 中全部 ToolResult content 内将被文本折叠丢弃的
-/// 非 Text 块 (T8).
+/// #403: OpenAI Chat 的 `role:"tool"` 消息 content 官方仅支持 text part
+/// (`ChatCompletionToolMessageParam.content: string | array of text parts`,
+/// image part 被 API 拒收 — "Image URLs are only allowed for messages with
+/// role 'user'"), 媒体块搬到紧随 tool 批次的合成 user 消息, 原位置留此标记行
+/// (维持 tool 消息 content 非空, cc-switch `TOOL_RESULT_MEDIA_MOVED_MARKER` 同型).
+pub(crate) const TOOL_RESULT_MEDIA_MOVED_MARKER: &str =
+    "[sg: tool result media moved to the following user message]";
+
+/// #403: 合成 user 消息内的 per-call 媒体标签前缀 (拼 call_id + `]`;
+/// cc-switch `queue_chat_tool_output_media` 同型 — label text part + 媒体 parts,
+/// 模型可将图片与其 tool call 对应).
+pub(crate) const TOOL_RESULT_MEDIA_LABEL_PREFIX: &str = "[sg: media output of tool call ";
+
+/// ToolResult content 非 Text 块在 egress 写出点的处置统计 (#403, 纯函数).
 ///
-/// 返回 `(count, kinds)` — kinds 如 `"image:2,reasoning:1"` (BTreeMap 字母序稳定,
-/// 类型名用 wire 词形 snake_case); 无丢弃 → `None`. WARN 消费点是 proxy 的
-/// **egress 写出路径** (`proxy/helpers.rs::warn_tool_result_media_drop`,
-/// cross_proto / same_proto 共享).
+/// 命运判定 (与 writer 实际行为对齐, 是 WARN 文案的 SSOT):
+/// - **o egress**: User 消息内 ToolResult 的 Image → `moved` (OpenAI writer 搬运到
+///   合成 user 消息); 其余非 Text 块 (tool_use / 嵌套 tool_result / reasoning 族 /
+///   raw) 及**非 User 消息内**的一切非 Text 块 → `dropped` (退化臂无消息列表上下文,
+///   媒体无处可去; 三协议 reader 均不产出该形态, 防御性如实统计).
+/// - **r egress**: `function_call_output.output` 官方支持
+///   `string | array of (input_text|input_image|input_file)` (2025-09 起,
+///   openai-python v2 breaking change) — User 消息内 ToolResult 的 Image / Raw →
+///   原位保真 (无条目); 其余非 Text 块 → `dropped`. 例外: ToolResult 自带
+///   `content_form=Some(String|Null)` 时 output 按 string 形态回写 (writer 的
+///   `Some(_) => false` 对两者同臂), 全部非 Text 块 → `dropped` (该形态经 reader
+///   不可达 — string/null output 携带不了媒体; 仅内部构造 IR 可能出现, 统计如实).
+/// - **a egress**: writer 原样写回 blocks, 无命运变化 — 本函数返回空 (gate 的
+///   SSOT 在此单一化, WARN 消费点依赖空返回).
 ///
-/// # 为什么是纯函数 (不在 codec 内打日志)
+/// ToolResult 只出现在 messages (system 不含 — 三协议 reader 均不产出到 system);
+/// 嵌套 ToolResult 整体记 1 (`tool_result` kind, 与块级统计口径一致).
+///
+/// # 为什么是纯函数 (不在 codec writer 内打日志)
 ///
 /// codec 的 `write_request` 还被多个非 egress 消费面复用 (生产面 ≥3 处):
 /// ① cross_proto 的 ingress 视图序列化 (record body 构造, egress 可能是
 /// Anthropic — 实际无损); ② DAG timeline 派生 (`derive.rs`, WebUI 3s 轮询
 /// 反复触发); ③ records parsed view (`web/api/records.rs`). WARN 内嵌 codec
 /// 会在这些路径误报/放大 (M1/M2), 可观测化必须在真正发生丢弃的 egress 调用点.
-///
-/// # 口径假设
-///
-/// ToolResult 只出现在 messages (system 不含 — 三协议 reader 均不产出到 system);
-/// 嵌套 ToolResult 整体记 1 (`tool_result` kind, 与块级统计口径一致).
-pub(crate) fn dropped_tool_result_media(req: &ir::IrRequest) -> Option<(usize, String)> {
-    let mut dropped = std::collections::BTreeMap::new();
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct ToolResultMediaFate {
+    /// 搬运到合成 user 消息的块 (kind → count)
+    moved: std::collections::BTreeMap<&'static str, usize>,
+    /// 文本折叠丢弃的块 (kind → count)
+    dropped: std::collections::BTreeMap<&'static str, usize>,
+}
+
+impl ToolResultMediaFate {
+    /// 非空 bucket 的 (count, kinds) 汇总 (kinds 字母序稳定).
+    fn summary(map: &std::collections::BTreeMap<&'static str, usize>) -> Option<(usize, String)> {
+        let count: usize = map.values().sum();
+        (count > 0).then(|| {
+            let kinds = map
+                .iter()
+                .map(|(kind, n)| format!("{kind}:{n}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            (count, kinds)
+        })
+    }
+
+    /// moved 非空时的 (count, kinds) 汇总 (kinds 字母序稳定).
+    pub(crate) fn moved_summary(&self) -> Option<(usize, String)> {
+        Self::summary(&self.moved)
+    }
+
+    /// dropped 非空时的 (count, kinds) 汇总 (kinds 字母序稳定).
+    pub(crate) fn dropped_summary(&self) -> Option<(usize, String)> {
+        Self::summary(&self.dropped)
+    }
+}
+
+pub(crate) fn tool_result_media_fate(egress: Protocol, req: &ir::IrRequest) -> ToolResultMediaFate {
+    // gate SSOT: 非 o/r egress (a 原样写回; 未来新增 codec 协议默认无统计直至
+    // 显式判定) — WARN 消费点 (`proxy/helpers.rs`) 直接依赖此空返回.
+    if !matches!(egress, Protocol::OpenAI | Protocol::OpenAIResponses) {
+        return ToolResultMediaFate::default();
+    }
+    let mut fate = ToolResultMediaFate::default();
     for msg in &req.messages {
+        // 搬运 / 原位保真只发生在 writer 的 User 主路径臂; 非 User 消息内的
+        // ToolResult 走退化臂 (无消息列表上下文), 媒体一律 dropped.
+        let in_user = msg.role == ir::IrRole::User;
         for b in &msg.content {
-            if let ir::IrBlock::ToolResult { content, .. } = b {
-                for (kind, n) in count_dropped_tool_result_blocks(content) {
-                    *dropped.entry(kind).or_insert(0) += n;
+            if let ir::IrBlock::ToolResult {
+                content,
+                content_form,
+                ..
+            } = b
+            {
+                // r egress 的 string 形态例外: output 按原形态回写, 媒体无处承载
+                // (Null 与 String 同臂 — writer 的 `Some(_) => false` 把两者都按
+                // string 形态折叠, 统计口径须一致).
+                let string_form = egress == Protocol::OpenAIResponses
+                    && matches!(
+                        content_form,
+                        Some(ir::ContentForm::String | ir::ContentForm::Null)
+                    );
+                for cb in content {
+                    let Some(kind) = nontext_block_kind(cb) else {
+                        continue;
+                    };
+                    let bucket = match (egress, cb, in_user) {
+                        // o: User 臂的媒体搬运, 其余丢弃
+                        (Protocol::OpenAI, ir::IrBlock::Image { .. }, true) => &mut fate.moved,
+                        // r: User 臂媒体/未知 part 原位保真 (array output), 其余丢弃
+                        (
+                            Protocol::OpenAIResponses,
+                            ir::IrBlock::Image { .. } | ir::IrBlock::Raw { .. },
+                            true,
+                        ) if !string_form => continue,
+                        _ => &mut fate.dropped,
+                    };
+                    *bucket.entry(kind).or_insert(0) += 1;
                 }
             }
         }
     }
-    if dropped.is_empty() {
-        return None;
-    }
-    let count: usize = dropped.values().sum();
-    let kinds = dropped
-        .iter()
-        .map(|(kind, n)| format!("{kind}:{n}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    Some((count, kinds))
+    fate
 }
 
-/// 统计一个 ToolResult content 中将被文本折叠丢弃的非 Text 块 (类型 → 计数).
-fn count_dropped_tool_result_blocks(
-    blocks: &[ir::IrBlock],
-) -> std::collections::BTreeMap<&'static str, usize> {
-    let mut dropped = std::collections::BTreeMap::new();
-    for b in blocks {
-        let kind = match b {
-            ir::IrBlock::Text { .. } => continue,
-            ir::IrBlock::Image { .. } => "image",
-            ir::IrBlock::ToolUse { .. } => "tool_use",
-            ir::IrBlock::ToolResult { .. } => "tool_result",
-            ir::IrBlock::Reasoning { .. } => "reasoning",
-            ir::IrBlock::ReasoningContent { .. } => "reasoning_content",
-            // Raw (#363): 同协议 verbatim 透传不折叠 — 但计数器只服务跨协议
-            // 预检 (跨协议路径 Raw 已被 clear_wire_fidelity 丢弃, 不会到折叠点);
-            // 归 "raw" 桶保守计数, 防未来折叠行为变化时静默漏报.
-            ir::IrBlock::Raw { .. } => "raw",
-        };
-        *dropped.entry(kind).or_insert(0) += 1;
+/// 非 Text 块的类型标签 (Text → None, 不参与统计).
+fn nontext_block_kind(b: &ir::IrBlock) -> Option<&'static str> {
+    match b {
+        ir::IrBlock::Text { .. } => None,
+        ir::IrBlock::Image { .. } => Some("image"),
+        ir::IrBlock::ToolUse { .. } => Some("tool_use"),
+        ir::IrBlock::ToolResult { .. } => Some("tool_result"),
+        ir::IrBlock::Reasoning { .. } => Some("reasoning"),
+        ir::IrBlock::ReasoningContent { .. } => Some("reasoning_content"),
+        ir::IrBlock::Raw { .. } => Some("raw"),
     }
-    dropped
 }
 
 /// IR 图片来源 → URL 字符串 (Url 直通; Base64 → `data:<mime>;base64,<payload>`).
@@ -441,8 +510,8 @@ pub(super) fn input_to_string(input: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{count_dropped_tool_result_blocks, dropped_tool_result_media};
-    use crate::codec::ir::{IrBlock, IrImageSource, IrMessage, IrRequest, IrRole};
+    use super::{Protocol, nontext_block_kind, tool_result_media_fate};
+    use crate::codec::ir::{ContentForm, IrBlock, IrImageSource, IrMessage, IrRequest, IrRole};
 
     fn text(s: &str) -> IrBlock {
         IrBlock::Text {
@@ -570,10 +639,10 @@ mod tests {
         );
     }
 
-    /// T8 块级统计: 非 Text 块按类型计数 (WARN count/kinds 的数据源), Text 不计.
+    /// #403 块级统计: 非 Text 块按类型计数 (fate 的数据源), Text 不计.
     #[test]
-    fn count_dropped_tool_result_blocks_classifies_by_kind() {
-        let blocks = vec![
+    fn nontext_block_kind_classifies() {
+        let blocks = [
             text("screenshot saved"),
             image(),
             IrBlock::Image {
@@ -590,19 +659,15 @@ mod tests {
             },
             text("done"),
         ];
-        let dropped = count_dropped_tool_result_blocks(&blocks);
-        assert_eq!(dropped.len(), 2);
-        assert_eq!(dropped.get("image"), Some(&2));
-        assert_eq!(dropped.get("reasoning_content"), Some(&1));
-        // 纯 Text / 空输入 → 无丢弃.
-        assert!(count_dropped_tool_result_blocks(&[text("a"), text("b")]).is_empty());
-        assert!(count_dropped_tool_result_blocks(&[]).is_empty());
+        let kinds: Vec<&'static str> = blocks.iter().filter_map(nontext_block_kind).collect();
+        assert_eq!(kinds, vec!["image", "image", "reasoning_content"]);
     }
 
-    /// T8 请求级聚合: 跨 message 的 ToolResult 统计合并为 (count, kinds),
-    /// kinds 字母序稳定; 无 ToolResult / 纯 Text → None.
+    /// #403 请求级 fate 聚合: o egress — Image → moved, 其余非 Text → dropped;
+    /// r egress — Image/Raw 原位保真 (无条目), 其余 → dropped; a egress 不适用
+    /// (调用方 gate, 但纯函数对 a 返回空也是契约的一部分).
     #[test]
-    fn dropped_tool_result_media_aggregates_across_messages() {
+    fn tool_result_media_fate_per_egress() {
         let ir = IrRequest {
             messages: vec![
                 IrMessage {
@@ -624,10 +689,77 @@ mod tests {
             model: "gpt-4o".into(),
             ..Default::default()
         };
+        // o egress: 两个 image 都搬运.
+        let fate = tool_result_media_fate(Protocol::OpenAI, &ir);
+        assert_eq!(fate.moved_summary(), Some((2, "image:2".to_string())));
+        assert_eq!(fate.dropped_summary(), None);
+
+        // r egress: image 原位保真 (array output) — 无 moved 无 dropped.
+        let fate = tool_result_media_fate(Protocol::OpenAIResponses, &ir);
+        assert_eq!(fate, Default::default());
+
+        // a egress: writer 原样写回 — 恒空.
+        let fate = tool_result_media_fate(Protocol::Anthropic, &ir);
+        assert_eq!(fate, Default::default());
+    }
+
+    /// #403 fate 的 dropped 面: o egress 的非 Image 块 (reasoning_content) 仍丢弃;
+    /// r egress 的 string 形态例外 (content_form=Some(String|Null), reader 不可达
+    /// 的内部构造防御面 — writer 的 `Some(_) => false` 对两者同按 string 折叠)
+    /// 全部非 Text 丢弃.
+    #[test]
+    fn tool_result_media_fate_dropped_and_string_form_exception() {
+        let tr = |content: Vec<IrBlock>, content_form: Option<ContentForm>| IrBlock::ToolResult {
+            tool_use_id: "call_1".into(),
+            content,
+            is_error: None,
+            content_form,
+            extra: Default::default(),
+        };
+        let reasoning = IrBlock::ReasoningContent {
+            text: "thinking...".into(),
+            opaque: None,
+            extra: Default::default(),
+        };
+        let raw = IrBlock::Raw {
+            entry: serde_json::json!({"type": "input_file", "file_id": "f_1"}),
+        };
+        let ir = IrRequest {
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![
+                    tr(vec![image(), reasoning.clone()], None),
+                    // r egress 的 string 形态 (reader 不可达, 内部构造防御面):
+                    tr(vec![image()], Some(ContentForm::String)),
+                    // Null 与 String 同臂 (writer `Some(_) => false`): 媒体同样
+                    // 被折叠丢弃, 统计不得记为保真.
+                    tr(vec![image()], Some(ContentForm::Null)),
+                    // r egress 非 string 形态: raw 原位保真
+                    tr(vec![raw], Some(ContentForm::Array)),
+                ],
+                ..Default::default()
+            }],
+            model: "m".into(),
+            ..Default::default()
+        };
+        // o egress: image×3 moved; reasoning_content dropped (raw 在 o 跨协议
+        // 路径已被 clear_wire_fidelity 丢弃, 同协议 o→o 会到折叠点 — dropped).
+        let fate = tool_result_media_fate(Protocol::OpenAI, &ir);
+        assert_eq!(fate.moved_summary(), Some((3, "image:3".to_string())));
         assert_eq!(
-            dropped_tool_result_media(&ir),
-            Some((2, "image:2".to_string()))
+            fate.dropped_summary(),
+            Some((2, "raw:1,reasoning_content:1".to_string()))
         );
+
+        // r egress: 第一个 tr 的 image 保真 + reasoning dropped; string/Null 形态
+        // tr 的 image dropped (Null 与 String 同臂); array 形态 tr 的 raw 保真.
+        let fate = tool_result_media_fate(Protocol::OpenAIResponses, &ir);
+        assert_eq!(fate.moved_summary(), None);
+        assert_eq!(
+            fate.dropped_summary(),
+            Some((3, "image:2,reasoning_content:1".to_string()))
+        );
+
         // system 内的 Image 不参与 (口径假设: ToolResult 只在 messages).
         let ir_system_image = IrRequest {
             system: vec![image()],
@@ -639,8 +771,11 @@ mod tests {
             model: "gpt-4o".into(),
             ..Default::default()
         };
-        assert_eq!(dropped_tool_result_media(&ir_system_image), None);
-        // 无丢弃 → None.
+        assert_eq!(
+            tool_result_media_fate(Protocol::OpenAI, &ir_system_image),
+            Default::default()
+        );
+        // 无 ToolResult / 纯 Text → 恒空.
         let ir_plain = IrRequest {
             messages: vec![IrMessage {
                 role: IrRole::User,
@@ -650,14 +785,17 @@ mod tests {
             model: "gpt-4o".into(),
             ..Default::default()
         };
-        assert_eq!(dropped_tool_result_media(&ir_plain), None);
+        assert_eq!(
+            tool_result_media_fate(Protocol::OpenAI, &ir_plain),
+            Default::default()
+        );
     }
 
     /// M1/M2 回归守卫: codec writer 是纯序列化 — write_request 被非 egress 消费面
     /// (cross_proto 的 ingress 视图 / derive.rs 的 timeline 派生) 复用时**不得**发出
     /// 任何 tracing 事件 (首轮实现的 codec 内 WARN 在 ingress=Anthropic 方向事实性
     /// 误报、在 3s 轮询的视图路径日志放大). 丢弃可观测化在 proxy egress 写出点
-    /// (`proxy/helpers.rs::warn_tool_result_media_drop`).
+    /// (`proxy/helpers.rs::warn_tool_result_media_fate`).
     ///
     /// 捕获方式仿 `redact.rs::CapturingMakeWriter` 先例: 线程局部 fmt subscriber
     /// 写入 Mutex sink, 不引入新 dev-dependency.

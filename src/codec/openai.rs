@@ -353,6 +353,28 @@ impl Writer for OpenAiWriter {
             }
         }
 
+        // #403 媒体搬运: tool 消息 content 官方仅支持 text part (image part 被
+        // API 拒收), ToolResult 内的 Image 块搬到**紧随连续 tool 消息批次之后**
+        // 的合成 user 消息 (协议约束: tool 消息必须紧跟持有其 tool_calls 的
+        // assistant 消息, 批次中间不能插入 user 消息), 原位置留占位标记行;
+        // 批次结束 (出现非 tool 消息 / 消息列表终点) 时 flush — cc-switch
+        // `flush_pending_chat_tool_media` 同型. WARN/fate 统计在 proxy egress
+        // 写出点 (codec writer 零日志).
+        //
+        // 既有例外 (先于 #403, 顺带声明): User 消息混排 [ToolResult, Text] 时
+        // 下方分区逻辑把 non_tool 部分 (user text 消息) 先于 tool 消息输出 —
+        // 该形态下 tool 邻接性本就破坏 (a reader 语义中 user 消息内 ToolResult
+        // 前置于 Text, 拆分保语义顺序; wire 邻接修复属行为变更, 不在本改动范围).
+        let mut pending_media: Vec<Value> = Vec::new();
+        let flush_media = |messages: &mut Vec<Value>, pending: &mut Vec<Value>| {
+            if !pending.is_empty() {
+                messages.push(json!({
+                    "role": "user",
+                    "content": std::mem::take(pending),
+                }));
+            }
+        };
+
         for msg in &req.messages {
             // OpenAI 把 tool 结果放在独立的 role:"tool" 消息中 (一个 tool_use_id 一条).
             // 当 IR User 消息含 ToolResult 块时 (跨协议从 Anthropic 来, 或混合 Text + ToolResult),
@@ -383,13 +405,32 @@ impl Writer for OpenAiWriter {
                         ..
                     } = b
                     {
-                        // tool 消息 content 只承载文本 — 非 Text 块 (Image 等媒体)
-                        // 折叠丢弃, WARN 在 proxy egress 写出点 (T8).
-                        let text = if is_error.unwrap_or(false) {
-                            format!("[error] {}", blocks_to_text(content))
-                        } else {
-                            blocks_to_text(content)
-                        };
+                        // #403 position-preserving 文本行: Text → 原文行, Image →
+                        // 占位标记行 (媒体搬运, content 保持非空); 其余非 Text 块
+                        // (reasoning 族 / raw / 嵌套) 折叠丢弃.
+                        let mut text = tool_result_content_lines(content, true).join("\n");
+                        // 媒体排队: per-call label text part + image parts
+                        // (write_user_block 复用 user 消息的 image_url part 形态).
+                        let media: Vec<Value> = content
+                            .iter()
+                            .filter_map(|cb| match cb {
+                                IrBlock::Image { .. } => write_user_block(cb),
+                                _ => None,
+                            })
+                            .collect();
+                        if !media.is_empty() {
+                            pending_media.push(json!({
+                                "type": "text",
+                                "text": format!(
+                                    "{}{tool_use_id}]",
+                                    super::TOOL_RESULT_MEDIA_LABEL_PREFIX
+                                ),
+                            }));
+                            pending_media.extend(media);
+                        }
+                        if is_error.unwrap_or(false) {
+                            text = format!("[error] {text}");
+                        }
                         messages.push(json!({
                             "role": "tool",
                             "tool_call_id": tool_use_id,
@@ -398,9 +439,13 @@ impl Writer for OpenAiWriter {
                     }
                 }
             } else {
+                // 非 tool 消息: 连续 tool 批次结束 — 先 flush 搬运媒体.
+                flush_media(&mut messages, &mut pending_media);
                 messages.push(write_message(msg));
             }
         }
+        // 消息列表终点: 尾部 tool 批次的搬运媒体 flush.
+        flush_media(&mut messages, &mut pending_media);
 
         let mut out = Map::new();
         out.insert("model".to_string(), Value::String(req.model.clone()));
@@ -1345,7 +1390,9 @@ fn write_message(msg: &IrMessage) -> Value {
         }
         IrRole::Tool => {
             // 单个 ToolResult 块 → 独立 role:"tool" 消息.
-            // (这条分支只有当 IR 直接含 Tool 角色时命中; 一般 ToolResult 在 user 消息内.)
+            // (这条分支只有当 IR 直接含 Tool 角色时命中 — 三协议 reader 均把
+            // tool 结果包成 user 消息的 ToolResult 块, 生产 IR 不产 Tool 角色;
+            // 退化路径无消息列表上下文, 媒体搬运不可用, Image 不留标记行.)
             for b in &msg.content {
                 if let IrBlock::ToolResult {
                     tool_use_id,
@@ -1353,8 +1400,7 @@ fn write_message(msg: &IrMessage) -> Value {
                     ..
                 } = b
                 {
-                    // 非 Text 块折叠丢弃, WARN 在 proxy egress 写出点 (T8).
-                    let text = blocks_to_text(content);
+                    let text = tool_result_content_lines(content, false).join("\n");
                     return json!({
                         "role": "tool",
                         "tool_call_id": tool_use_id,
@@ -1365,6 +1411,22 @@ fn write_message(msg: &IrMessage) -> Value {
             json!({"role": "tool", "content": ""})
         }
     }
+}
+
+/// #403: ToolResult content → tool 消息文本行 (position-preserving):
+/// Text → 原文行; Image → `media_moved` 时的搬运占位标记行 (纯图片 tool_result
+/// 也产出非空 content), 否则跳过 (退化臂无消息列表上下文不可搬运, 留标记会
+/// 失实 — "moved to the following user message" 而无合成消息跟随); 其余非
+/// Text 块折叠丢弃 (fate 统计在 proxy egress 写出点).
+fn tool_result_content_lines(content: &[IrBlock], media_moved: bool) -> Vec<&str> {
+    content
+        .iter()
+        .filter_map(|cb| match cb {
+            IrBlock::Text { text, .. } => Some(text.as_str()),
+            IrBlock::Image { .. } if media_moved => Some(super::TOOL_RESULT_MEDIA_MOVED_MARKER),
+            _ => None,
+        })
+        .collect()
 }
 
 /// 写 user 消息的 block (text / image / tool_result).
@@ -1392,12 +1454,12 @@ fn write_user_block(b: &IrBlock) -> Option<Value> {
         } => {
             // OpenAI 的 tool 消息必须独立成一条, 但 caller 可能把它放在 user 消息内
             // (跨协议从 Anthropic 来的). 这里退化为 text 内容, 配合 write_message 的 Tool 分支
-            // 通常不会走到这里. 非 Text 块折叠丢弃, WARN 在 proxy egress 写出点 (T8).
-            let text = if is_error.unwrap_or(false) {
-                format!("[error] {}", blocks_to_text(content))
-            } else {
-                blocks_to_text(content)
-            };
+            // 通常不会走到这里. 退化路径无消息列表上下文, 媒体不可搬运也不留标记行
+            // (#403; fate 统计在 proxy egress 写出点).
+            let mut text = tool_result_content_lines(content, false).join("\n");
+            if is_error.unwrap_or(false) {
+                text = format!("[error] {text}");
+            }
             Some(json!({
                 "type": "text",
                 "text": format!("[tool_result for {}: {}]", tool_use_id, text),
@@ -1489,6 +1551,58 @@ mod tests {
     }
     fn writer() -> OpenAiWriter {
         OpenAiWriter
+    }
+
+    // ─── IR block 构造 helper (#403 测试族共用) ──────────────────────────
+
+    fn text(s: &str) -> IrBlock {
+        IrBlock::Text {
+            text: s.into(),
+            extra: Default::default(),
+        }
+    }
+    fn img(url: &str) -> IrBlock {
+        IrBlock::Image {
+            source: IrImageSource::Url(url.into()),
+            extra: Default::default(),
+        }
+    }
+    fn img_b64() -> IrBlock {
+        IrBlock::Image {
+            source: IrImageSource::Base64 {
+                media_type: "image/png".into(),
+                data: "iVBORw0KGgo=".into(),
+            },
+            extra: Default::default(),
+        }
+    }
+    fn tool_use(id: &str) -> IrBlock {
+        IrBlock::ToolUse {
+            id: id.into(),
+            name: "shot".into(),
+            input: json!({}),
+            extra: Default::default(),
+        }
+    }
+    fn tr(id: &str, content: Vec<IrBlock>, is_error: Option<bool>) -> IrBlock {
+        IrBlock::ToolResult {
+            tool_use_id: id.into(),
+            content,
+            is_error,
+            content_form: None,
+            extra: Default::default(),
+        }
+    }
+    fn user_req(content: Vec<IrBlock>) -> IrRequest {
+        IrRequest {
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content,
+                ..Default::default()
+            }],
+            model: "gpt-4o".into(),
+            ..Default::default()
+        }
     }
 
     // ─── read_request: 基础映射 ──────────────────────────────────────────
@@ -1818,69 +1932,234 @@ mod tests {
     }
 
     #[test]
-    fn write_request_tool_result_media_dropped_to_text() {
-        // T8: 跨协议 a→o 的 tool_result 折叠 — Image 块被丢弃 (无占位标记, WARN 由
-        // helper 打 — 可观测化单测见 codec::tests), Text join 保留到 tool 消息 content.
-        let image = IrBlock::Image {
-            source: IrImageSource::Url("https://example.com/cat.png".into()),
-            extra: Default::default(),
-        };
-        let ir = IrRequest {
-            messages: vec![IrMessage {
-                role: IrRole::User,
-                content: vec![IrBlock::ToolResult {
-                    tool_use_id: "call_1".into(),
-                    content: vec![
-                        IrBlock::Text {
-                            text: "screenshot saved".into(),
-                            extra: Default::default(),
-                        },
-                        image,
-                        IrBlock::Text {
-                            text: "done".into(),
-                            extra: Default::default(),
-                        },
-                    ],
-                    is_error: None,
-                    content_form: None,
-                    extra: Default::default(),
-                }],
-                ..Default::default()
-            }],
-            model: "gpt-4o".into(),
-            ..Default::default()
-        };
+    fn write_request_tool_result_media_moved_to_user_message() {
+        // #403: 跨协议 a→o / 同协议 o→o 的 tool_result 媒体搬运 — tool 消息
+        // content 官方仅支持 text part, Image 块搬到紧随 tool 批次的合成 user
+        // 消息, 原位置留占位标记行 (position-preserving), Text 行序保留.
+        let ir = user_req(vec![tr(
+            "call_1",
+            vec![
+                text("screenshot saved"),
+                img("https://example.com/cat.png"),
+                text("done"),
+            ],
+            None,
+        )]);
         let v = writer().write_request(&ir);
         let msgs = v.get("messages").unwrap().as_array().unwrap();
-        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs.len(), 2);
+        // tool 消息: 文本行序保留, Image 位置 → 占位标记行.
         assert_eq!(msgs[0].get("role").unwrap(), "tool");
         assert_eq!(msgs[0].get("tool_call_id").unwrap(), "call_1");
-        assert_eq!(msgs[0].get("content").unwrap(), "screenshot saved\ndone");
+        assert_eq!(
+            msgs[0].get("content").unwrap().as_str().unwrap(),
+            format!(
+                "screenshot saved\n{}\ndone",
+                crate::codec::TOOL_RESULT_MEDIA_MOVED_MARKER
+            )
+        );
+        // 合成 user 消息: per-call label + image_url part.
+        assert_eq!(msgs[1].get("role").unwrap(), "user");
+        let parts = msgs[1].get("content").unwrap().as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(
+            parts[0]["text"].as_str().unwrap(),
+            "[sg: media output of tool call call_1]"
+        );
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["image_url"]["url"], "https://example.com/cat.png");
 
-        // is_error=true → "[error] " 前缀拼接 (消费点拼接行为锁定).
-        let ir_err = IrRequest {
-            messages: vec![IrMessage {
-                role: IrRole::User,
-                content: vec![IrBlock::ToolResult {
-                    tool_use_id: "call_1".into(),
-                    content: vec![IrBlock::Text {
-                        text: "boom".into(),
-                        extra: Default::default(),
-                    }],
-                    is_error: Some(true),
-                    content_form: None,
-                    extra: Default::default(),
-                }],
-                ..Default::default()
-            }],
-            model: "gpt-4o".into(),
-            ..Default::default()
-        };
-        let v_err = writer().write_request(&ir_err);
+        // 纯图片 tool_result → tool 消息 content = 占位标记行 (非空, 结构合法).
+        let v_pure = writer().write_request(&user_req(vec![tr("call_1", vec![img_b64()], None)]));
+        let msgs = v_pure["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(
+            msgs[0]["content"].as_str().unwrap(),
+            crate::codec::TOOL_RESULT_MEDIA_MOVED_MARKER
+        );
+        // Base64 source → data URL (与 user 消息 Image 同型).
+        assert_eq!(
+            msgs[1]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,iVBORw0KGgo="
+        );
+
+        // is_error=true → "[error] " 前缀拼接; is_error × 媒体组合 → 前缀拼在
+        // 标记行上, 媒体照常搬运.
+        let v_err = writer().write_request(&user_req(vec![tr(
+            "call_1",
+            vec![text("boom")],
+            Some(true),
+        )]));
+        assert_eq!(
+            v_err["messages"].as_array().unwrap().len(),
+            1,
+            "无媒体不合成 user 消息"
+        );
         assert_eq!(
             v_err["messages"][0]["content"].as_str().unwrap(),
             "[error] boom"
         );
+        let v_err_media = writer().write_request(&user_req(vec![tr(
+            "call_1",
+            vec![img("https://e.com/x.png")],
+            Some(true),
+        )]));
+        let msgs = v_err_media["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(
+            msgs[0]["content"].as_str().unwrap(),
+            format!("[error] {}", crate::codec::TOOL_RESULT_MEDIA_MOVED_MARKER)
+        );
+        assert_eq!(
+            msgs[1]["content"][1]["image_url"]["url"],
+            "https://e.com/x.png"
+        );
+    }
+
+    /// #403: 不可表示块 (reasoning 族) 的 dropped 半边 — tool content 无行也
+    /// 不进媒体队列, 仅 fate 统计可见 (codec writer 零日志).
+    #[test]
+    fn write_request_tool_result_unrepresentable_blocks_drop_silently() {
+        let ir = user_req(vec![tr(
+            "call_1",
+            vec![
+                text("ok"),
+                IrBlock::ReasoningContent {
+                    text: "thinking...".into(),
+                    opaque: None,
+                    extra: Default::default(),
+                },
+            ],
+            None,
+        )]);
+        let v = writer().write_request(&ir);
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1, "无媒体不合成 user 消息");
+        assert_eq!(msgs[0]["content"].as_str().unwrap(), "ok");
+    }
+
+    /// #403: User 消息混排 [ToolResult(媒体), Text] 的拆分顺序 + flush 交互 —
+    /// non_tool 部分先于 tool 消息输出 (既有分区行为, 见 write_request 主路径
+    /// 注释 "既有例外"), 搬运媒体在批次尾 flush.
+    #[test]
+    fn write_request_mixed_tool_result_and_text_message_partition() {
+        let ir = IrRequest {
+            messages: vec![
+                IrMessage {
+                    role: IrRole::Assistant,
+                    content: vec![tool_use("call_1")],
+                    ..Default::default()
+                },
+                IrMessage {
+                    role: IrRole::User,
+                    content: vec![
+                        tr("call_1", vec![img("https://e.com/1.png")], None),
+                        text("and a note"),
+                    ],
+                    ..Default::default()
+                },
+            ],
+            model: "gpt-4o".into(),
+            ..Default::default()
+        };
+        let v = writer().write_request(&ir);
+        let msgs = v["messages"].as_array().unwrap();
+        // wire 序列: assistant(tool_call) | user(text, 分区先出) | tool(标记行)
+        // | user(搬运媒体, 尾部 flush).
+        let roles: Vec<&str> = msgs.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, vec!["assistant", "user", "tool", "user"]);
+        assert_eq!(
+            msgs[1]["content"],
+            json!("and a note"),
+            "单 Text user 消息 content 为 string 形态"
+        );
+        assert_eq!(
+            msgs[2]["content"].as_str().unwrap(),
+            crate::codec::TOOL_RESULT_MEDIA_MOVED_MARKER
+        );
+        assert_eq!(
+            msgs[3]["content"][1]["image_url"]["url"],
+            "https://e.com/1.png"
+        );
+    }
+
+    /// #403 搬运位置: 合成 user 消息必须落在**连续 tool 消息批次之后** (协议约束:
+    /// tool 消息必须紧跟持有其 tool_calls 的 assistant 消息, 批次中间不能插 user),
+    /// 且相邻批次合并 flush 为一条; 消息列表以 tool 批次结尾时也要 flush.
+    #[test]
+    fn write_request_tool_result_media_flushes_after_tool_batch() {
+        // 两个相邻 IR user 消息各含带媒体的 ToolResult (wire 上连续 tool 批次),
+        // 随后一条普通 user 文本消息, 再一条无媒体的 tool 批次作为列表结尾.
+        let ir = IrRequest {
+            messages: vec![
+                IrMessage {
+                    role: IrRole::Assistant,
+                    content: vec![tool_use("call_1"), tool_use("call_2"), tool_use("call_3")],
+                    ..Default::default()
+                },
+                IrMessage {
+                    role: IrRole::User,
+                    content: vec![tr(
+                        "call_1",
+                        vec![text("r1"), img("https://example.com/1.png")],
+                        None,
+                    )],
+                    ..Default::default()
+                },
+                IrMessage {
+                    role: IrRole::User,
+                    content: vec![tr("call_2", vec![img("https://example.com/2.png")], None)],
+                    ..Default::default()
+                },
+                IrMessage {
+                    role: IrRole::User,
+                    content: vec![text("next question")],
+                    ..Default::default()
+                },
+                IrMessage {
+                    role: IrRole::Assistant,
+                    content: vec![tool_use("call_3")],
+                    ..Default::default()
+                },
+                IrMessage {
+                    role: IrRole::User,
+                    content: vec![tr("call_3", vec![img("https://example.com/3.png")], None)],
+                    ..Default::default()
+                },
+            ],
+            model: "gpt-4o".into(),
+            ..Default::default()
+        };
+        let v = writer().write_request(&ir);
+        let msgs = v["messages"].as_array().unwrap();
+        // wire 序列: assistant(tool_calls) | tool | tool | user(媒体1+2 合并) |
+        // user(text) | assistant(tool_call) | tool | user(媒体3, 尾部 flush).
+        let roles: Vec<&str> = msgs.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(
+            roles,
+            vec![
+                "assistant", // call_1+call_2 tool_calls
+                "tool",      // call_1 (文本 + 标记行)
+                "tool",      // call_2 (纯标记行)
+                "user",      // 搬运媒体批次 1+2 合并 flush
+                "user",      // "next question"
+                "assistant", // call_3
+                "tool",      // call_3
+                "user",      // 搬运媒体 3 尾部 flush
+            ]
+        );
+        // 合并 flush 的 user 消息: 两个 per-call label + 两张图, call 序保留.
+        let batch = msgs[3]["content"].as_array().unwrap();
+        assert_eq!(batch.len(), 4);
+        assert_eq!(batch[0]["text"], "[sg: media output of tool call call_1]");
+        assert_eq!(batch[1]["image_url"]["url"], "https://example.com/1.png");
+        assert_eq!(batch[2]["text"], "[sg: media output of tool call call_2]");
+        assert_eq!(batch[3]["image_url"]["url"], "https://example.com/2.png");
+        // 尾部 flush.
+        let tail = msgs[7]["content"].as_array().unwrap();
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[1]["image_url"]["url"], "https://example.com/3.png");
     }
 
     // ─── read_response: 基础映射 ─────────────────────────────────────────

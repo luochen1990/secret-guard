@@ -60,7 +60,7 @@
 | # | 维度 | secret-guard 现状 | 评级 | 一句话 |
 |---|---|---|---|---|
 | 1 | thinking signature / reasoning 往返 | **无** (IR 无 signature/encrypted_content; Anthropic thinking reader 层丢弃) | **盲区** | 同协议 redact 也丢 thinking, 流式还产生孤儿 content_block_stop; cc-switch 的 base64 envelope 证明 passthrough 建模可行。**状态**: 孤儿帧子项已修 (#286); thinking passthrough 已实施 (#293, T7 — IR opaque 字段 + a⇄r sg-thinking envelope, 同协议/跨协议/流式全生命周期 + block 级 extra 保真) |
-| 2 | tool 媒体搬运 | **部分** (同协议无损; 跨协议 `blocks_to_text` 静默丢 Image) | **盲区** | tool_result 里的图片无占位标记无 WARN 直接消失, 连 "已知损失" 都未登记。**状态**: 最小档已实施 (#292, T8 — egress 丢弃 WARN per-request 聚合 + responses Base64 image→data URL); 完整搬运 (占位标记+搬移) 仍为 P3 待办 |
+| 2 | tool 媒体搬运 | **部分** (同协议无损; 跨协议 `blocks_to_text` 静默丢 Image) | **盲区** | tool_result 里的图片无占位标记无 WARN 直接消失, 连 "已知损失" 都未登记。**状态**: 完整档已实施 (#403, 2026-10-26 — o egress 搬运 (合成 user 消息 + 占位标记) / r egress 原位保真 (output array 媒体 part) + moved/dropped WARN; 最小档 #292 先行) |
 | 3 | reasoning effort 档位映射 | **部分** (thinking/effort 落 extra: 同协议保真, 跨协议 clear 全丢) | **盲区** (已规划) | roadmap A1 (P0) 有完整方案未实施; 跨协议时思考档位静默蒸发。**状态**: 已实施 (#290, T6 — IrReasoning first-class + effort↔budget 投影表, roadmap §A1 方案落地; 投影有损与上游交互风险见 known-limitations) |
 | 4 | o-series `max_completion_tokens` | **部分** (reader 双读, writer 恒写 `max_tokens`) | **盲区** | o-series 上游拒收 `max_tokens`; 同协议 redact round-trip 连字段名都改了。**状态**: 已修 (#287, MaxTokensForm); 跨协议恒写 max_tokens 为已裁决已知限制, o-series 嗅探待 mini-裁决 |
 | 5 | stop_reason 双向映射 | **部分** (typed enum 优; Responses writer 半截) | **盲区** | Responses writer 不写 `incomplete_details.reason`, 自己的 reader 把它读回 Other — MaxTokens round-trip 有损。**状态**: 已修 (#289, status+reason 收敛单一 SSOT) |
@@ -131,10 +131,12 @@ OpenAI 思考原文跨协议丢弃) 与 "encrypted_content 同协议 round-trip 
 
 ## 2. tool 媒体搬运
 
-> **状态 (2026-09-30)**: 最小档已实施 (PR #292, T8 — egress 侧丢弃 WARN per-request
-> 聚合 + responses Base64 image→data URL 修复 + capturing subscriber 回归守卫);
-> 完整搬运 (占位标记 + 媒体搬移到合成 user 消息, cc-switch `tool_media` 思路) 仍为
-> P3 待办。以下描述保留审计时点 (`8c8337e`) 现状。
+> **状态 (2026-10-26 更新)**: 完整档已实施 (issue #403 — o egress 搬运: 媒体搬到
+> 紧随 tool 批次的合成 user 消息 + 占位标记; r egress 原位保真:
+> `function_call_output.output` array 形态承载媒体 part, 官方 2025-09 起支持;
+> WARN 升级为 moved/dropped 双条 `warn_tool_result_media_fate`); 最小档 (PR #292,
+> T8) 是其前奏。协议调研结论 (o 官方仅 text part / r 官方 array output) 见 #403 PR
+> 描述。以下描述保留审计时点 (`8c8337e`) 现状。
 
 **(a) cc-switch 的做法**
 
@@ -455,7 +457,7 @@ JSON 形态错配**" 的客户端影响未登记。
 | T5 | **伪流式上游 → 合成 SSE 生命周期** (维度 9 前半): buffered 判型分支 (cross_proto + same_proto redact) 在 `ir.stream=true` 且翻译成功时, 把 IrResponse 重放为事件序列喂 ingress 流式 writer, 以 `text/event-stream` 返回; 失败路径回落现状 | `src/proxy/cross_proto.rs` + `src/proxy/same_proto.rs` + `src/proxy/fan_out.rs` (新 helper) | ~80-120 | ✅ **已实施** (#291, T5) | known-limitations 新条目 (形态适配行为 + same-proto 无 redact 路径仍透传的边界) |
 | T6 | **A1 reasoning 配置跨协议映射** (维度 3): 按 roadmap A1 既有方案实施 (typed enum + 投影表 + golden); 档位表可交叉验证 cc-switch 的 budget 阈值 (4000/16000) 与 adaptive→xhigh | `src/codec/ir.rs` + 三协议 reader/writer (按 roadmap §A1) | ~150 | ✅ **已实施** (#290, T6; + 用户裁决①采样联动 ②max_tokens 正交预算 = #295) | roadmap "实施进度" 章节更新 |
 | T7 | **thinking / encrypted_content passthrough 建模** (维度 1.1/1.2): 走 roadmap §2.2 判定 (boundary case, 参照 #176 先例登记); 方案 A = 新 `IrBlock::Thinking { thinking, signature_or_data }` 原样搬运 (cc-switch 证明可行, redact 需扫描 thinking 文本叶子), 方案 B = 至少同协议 redact 路径保真 (reader 收进 block 级 extra) | `docs/design/ir-fields-roadmap.md` (先登记) + `src/codec/ir.rs` + `src/codec/anthropic.rs` + `src/codec/responses/` | ~200-300 | ✅ **已合入** (#293, T7 — STR-6/FWD-1 envelope 授权已随 approve 完成; 实际 prod ~700 LOC, 三层全落地含流式 origin 分派) | roadmap 新 boundary-case 条目; known-limitations #176 条目升级 |
-| T8 | **tool_result 媒体丢弃可观测化** (维度 2): 最小 = `blocks_to_text` 丢弃非 Text 块时计数 WARN (对齐 reasoning 丢弃先例) + known-limitations 条目; 完整 = 媒体搬运到下一条 user 消息 + 占位标记 (抄 tool_media 思路, Chat/Responses user content 均可承载); 顺带修 Responses writer Base64 image 丢弃 (:884-888 → data URL) | `src/codec/mod.rs` (blocks_to_text) 或各 writer; 完整版 `src/codec/openai.rs` + `responses/mod.rs` | 最小 ~20 / 完整 ~120 | ✅ **最小档已实施** (#292, T8; 完整搬运仍 P3) | known-limitations codec 节新条目 |
+| T8 | **tool_result 媒体丢弃可观测化** (维度 2): 最小 = `blocks_to_text` 丢弃非 Text 块时计数 WARN (对齐 reasoning 丢弃先例) + known-limitations 条目; 完整 = 媒体搬运到下一条 user 消息 + 占位标记 (抄 tool_media 思路, Chat/Responses user content 均可承载); 顺带修 Responses writer Base64 image 丢弃 (:884-888 → data URL) | `src/codec/mod.rs` (blocks_to_text) 或各 writer; 完整版 `src/codec/openai.rs` + `responses/mod.rs` | 最小 ~20 / 完整 ~120 | ✅ **已完成** (最小档 #292 + 完整档 #403, 2026-10-26 — 协议调研修正: r egress 原位保真 (官方 array output) 而非搬运, 仅 o egress 搬运) | known-limitations codec 节 T8 条目 (已改写) |
 | T9 | **billing header 剥离** (维度 8): **等裁决**。若授权: a→o / a→r 翻译点的 system 折叠处剥头部首现行 + 配置开关 (默认 off); 抄 cc-switch 的 "只剥首次 + 保留后续" 边界 | `src/proxy/cross_proto.rs` (或 codec writer 层) + `src/config.rs` | ~60 | ✅ **已裁决实施** (#294, 2026-09-30 — 仅跨协议 / 无配置开关 / cc-switch 识别边界) | 裁决后 known-limitations / configuration.md 同步 |
 | T10 | **非流式请求收 SSE 的嗅探聚合** (维度 9 反向): JSON parse 失败臂先 `body_looks_like_sse` 嗅探, 命中则用 `StreamScan` 聚合成 IrResponse 再走 writer; 未命中维持透传 | `src/proxy/cross_proto.rs` + `src/codec/stream/scan.rs` 复用 | ~100 | ⏸ **2026-09-30 用户裁决: 暂不实施, 保留观察** — 遇实际案例 (真实伪流式上游对非流式请求回 SSE) 时重新决策; 当前透传行为已登记 known-limitations | known-limitations (若不做则登记透传行为) |
 
@@ -465,7 +467,7 @@ JSON 形态错配**" 的客户端影响未登记。
 
 **A. 可领取的实施项** (有明确方案, 无裁决障碍):
 
-- **T8 完整档 — tool_result 媒体搬运**: 占位标记 + 媒体搬到紧随的合成 user 消息 (cc-switch `tool_media` 思路, ~120 LOC, P3)。
+- ~~**T8 完整档 — tool_result 媒体搬运**~~ (已领取完成, #403, 2026-10-26: 占位标记 + 媒体搬到紧随的合成 user 消息 (o egress) / r egress 原位保真)。
 - **流式 block 级 extra 保真**: 流式 IR 事件流不携带 block 级 extra (全体 block 类型的既有限制) — 同协议流式 restore 路径的 `cache_control` 丢失 (T7 修复轮登记的相邻边界; 扩展思考官方推荐断点恰在 thinking block, 流式 redact 用户对此有真实缓存损失)。
 - **Responses 流式 refusal parts**: 非流式降级 Text 保留, 流式整族丢弃 (形态不对称, D5 登记)。
 

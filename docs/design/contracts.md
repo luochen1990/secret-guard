@@ -263,6 +263,28 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 > `same_proto_redact_keeps_anthropic_billing_header_verbatim` (同协议原样 round-trip);
 > 行为边界细则见 known-limitations.md codec 节 T9 条目.
 
+> **tool_result 媒体块搬运 (o egress)** (#403, 2026-10-26 登记, **授权记录 — issue #403
+> 任务本身即用户指令**): OpenAI Chat 的 `role:"tool"` 消息 content 官方仅支持 text part
+> (image part 被 API 400 拒收 — "Image URLs are only allowed for messages with role
+> 'user'"), ToolResult content 含 Image 块时 o writer 把媒体**搬运**到紧随连续 tool 消息
+> 批次之后的**合成 user 消息** (原位置留占位标记行, 合成消息内 per-call 标签 text part +
+> image parts; 协议约束 tool 消息必须紧跟 assistant tool_calls, 故 flush 只能在批次边界).
+> 该偏离登记为 "显式列举的例外" 家族: ① **o→o 同协议 redact 的 FWD-1/FWD-2 normalize
+> 等式在 image-bearing tool result 上让位于搬运** — `role:"tool"` content array 携带
+> image part 的 wire (computer-use 客户端形态) 经 reader→IR→writer 重序列化后, 消息
+> 序列多出合成 user 消息且 tool content 含标记行 (媒体不丢, 位置与形态改变); 无媒体的
+> tool result 路径等式严格成立 (不受影响). ② 依据: 搬运内容 = 客户端**已发送**的媒体
+> (搬运不合成), 上游协议约束下无原位载体 — 与 sg-thinking envelope 例外① 的 "搬运
+> 不合成" 同型, 对齐 cc-switch `tool_media` 先例. ③ **r egress 无此例外** —
+> `function_call_output.output` 官方支持 `string | array of (input_text|input_image|
+> input_file)` (2025-09 起), Responses writer 原位保真 (array 形态媒体 part 留在 output
+> 内, `content_form` 形态回写), r→r round-trip 等式严格成立. ④ a egress 无损 (blocks
+> 原样写回). 回归守卫: `src/codec/openai.rs` 的 `write_request_tool_result_media_moved_to_user_message` + `write_request_tool_result_media_flushes_after_tool_batch` + `src/codec/responses/mod.rs` 的
+> `read_request_function_call_output_form_and_media_round_trip` + FWD-2 生成器媒体轴
+> (`arb_function_call_output_item_media`, r→r 媒体 part 原位 round-trip 机械覆盖) +
+> WARN 面 `tool_result_media_fate` 单测; 行为边界细则见 known-limitations.md codec 节
+> T8 条目.
+
 `normalize` = canonical JSON (BTreeMap key 排序 + 紧凑序列化 + 无空白). 消除对语义无影响的字节差异, 剩下的差异全部是真正的信息差异.
 
 **适用范围**: 同协议路径. 非流式 wire JSON + 流式 SSE wire.

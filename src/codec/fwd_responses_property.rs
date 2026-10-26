@@ -16,6 +16,9 @@
 //! 由独立测试守卫;
 //! reasoning encrypted_content 已 passthrough (T7, round-trip 由
 //! `responses_reasoning_encrypted_content_roundtrip` 锁定).
+//! #403: 同协议 round-trip property 额外覆盖 function_call_output 的 array
+//! 形态 output (媒体 part 原位保真); 跨协议 property 保持文本轴 (o egress
+//! 搬运改变消息结构, 见 `arb_input_items_with_media` 注释).
 //!
 //! # 不覆盖
 //!
@@ -59,10 +62,23 @@ fn arb_instructions_opt() -> impl Strategy<Value = Option<String>> {
 /// 不覆盖: reasoning (encrypted_content 已 passthrough, 由专项测试锁定 — T7) /
 /// hosted tool items (computer_call 等, 静默丢弃 — 单独测).
 fn arb_input_items(count: std::ops::Range<usize>) -> impl Strategy<Value = Vec<Value>> {
-    prop::collection::vec(arb_input_item(), count)
+    prop::collection::vec(arb_input_item(arb_function_call_output_item()), count)
 }
 
-fn arb_input_item() -> impl Strategy<Value = Value> {
+/// #403: 同协议 round-trip 专用变体 — function_call_output 额外混入 array 形态
+/// output (媒体 part). 跨协议 property 不能用 (o egress 搬运改变消息结构, 会打断
+/// modeled-fields 消息数断言), 故保持 `arb_input_items` 文本轴不动.
+fn arb_input_items_with_media(count: std::ops::Range<usize>) -> impl Strategy<Value = Vec<Value>> {
+    prop::collection::vec(
+        arb_input_item(prop_oneof![
+            arb_function_call_output_item(),
+            arb_function_call_output_item_media(),
+        ]),
+        count,
+    )
+}
+
+fn arb_input_item(fco: impl Strategy<Value = Value>) -> impl Strategy<Value = Value> {
     prop_oneof![
         // user message (最常见)
         arb_message_item("user"),
@@ -70,8 +86,8 @@ fn arb_input_item() -> impl Strategy<Value = Value> {
         arb_message_item("assistant"),
         // function_call (历史工具调用)
         arb_function_call_item(),
-        // function_call_output (工具结果)
-        arb_function_call_output_item(),
+        // function_call_output (工具结果; 形态轴由调用方注入)
+        fco,
     ]
 }
 
@@ -125,6 +141,41 @@ fn arb_function_call_output_item() -> impl Strategy<Value = Value> {
             "output": output,
         })
     })
+}
+
+/// #403: array 形态 output — 官方 `string | array of (input_text|input_image|
+/// input_file)` (2025-09 起). 只生成与 writer 回写**完全一致**的 part 形态:
+/// input_text 非空文本 + **string-form** `image_url` 的 input_image + **object-form**
+/// `image_url` 的 input_image (object-form 经 reader 收为 Raw verbatim 回写, 恰
+/// 机械覆盖 tool output 内的 Raw 路径) — output_text/text 别名经 reader 收敛
+/// 改写为 input_text (写回形态变化), 破坏 normalize 相等, 不在值域内.
+fn arb_function_call_output_item_media() -> impl Strategy<Value = Value> {
+    let arb_text_part = arb_text_string().prop_map(|t| json!({"type": "input_text", "text": t}));
+    let arb_image_part =
+        arb_image_url_string().prop_map(|u| json!({"type": "input_image", "image_url": u}));
+    let arb_image_part_obj = arb_image_url_string()
+        .prop_map(|u| json!({"type": "input_image", "image_url": {"url": u}}));
+    (
+        arb_id(),
+        prop::collection::vec(
+            prop_oneof![arb_text_part, arb_image_part, arb_image_part_obj],
+            1..3,
+        ),
+    )
+        .prop_map(|(id, parts)| {
+            json!({
+                "type": "function_call_output",
+                "call_id": id,
+                "output": Value::Array(parts),
+            })
+        })
+}
+
+fn arb_image_url_string() -> impl Strategy<Value = String> {
+    prop_oneof![
+        Just("https://example.com/img.png".to_string()),
+        Just("data:image/png;base64,aGVsbG8=".to_string()),
+    ]
 }
 
 /// 混合 tools 条目 (#321): Function (含可选 description/parameters/strict 的
@@ -209,10 +260,22 @@ fn arb_tools_opt(count: std::ops::Range<usize>) -> impl Strategy<Value = Option<
 }
 
 fn arb_responses_request_value() -> impl Strategy<Value = Value> {
+    arb_responses_request_value_with(arb_input_items(1..5))
+}
+
+/// #403: 同协议 round-trip 专用 — input items 混入媒体 tool result 轴
+/// (`arb_input_items_with_media`).
+fn arb_responses_request_value_with_media() -> impl Strategy<Value = Value> {
+    arb_responses_request_value_with(arb_input_items_with_media(1..5))
+}
+
+fn arb_responses_request_value_with(
+    input_items: impl Strategy<Value = Vec<Value>>,
+) -> impl Strategy<Value = Value> {
     (
         arb_model_name(),
         arb_instructions_opt(),
-        arb_input_items(1..5),
+        input_items,
         arb_max_tokens_opt(),
         arb_temperature_opt(),
         arb_tools_opt(0..3),
@@ -275,8 +338,12 @@ fn arb_responses_request_value() -> impl Strategy<Value = Value> {
 
 proptest! {
     /// FWD-2 (Responses 非流式请求): wire → IR → wire' 语义保留.
+    ///
+    /// #403: 生成器含媒体 tool result 轴 (array 形态 output — input_text +
+    /// string-form input_image part, 见 `arb_function_call_output_item_media`),
+    /// 媒体 part 原位 round-trip 由本 property 机械覆盖.
     #[test]
-    fn responses_request_preserves_wire_semantics(v in arb_responses_request_value()) {
+    fn responses_request_preserves_wire_semantics(v in arb_responses_request_value_with_media()) {
         let ir = responses_reader().read_request(&v).expect("read_request should succeed");
         let out = responses_writer().write_request(&ir);
         prop_assert_eq!(

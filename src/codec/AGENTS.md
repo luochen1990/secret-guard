@@ -58,8 +58,21 @@
   跨协议在 `clear_wire_fidelity` 递归丢弃 (含 ToolResult.content 嵌套) + WARN 计数;
   修复前的静默 drop 是 FWD-1 违约 (契约红线 `prop_raw_content_part_secret_redacted`,
   裁决依据 #321 先例). 残留 (known-limitations codec 节): 流式路径 unknown block 仍
-  配对跳过; Responses 响应侧 Raw 以独立 message item 重包装; function_call_output 的
-  array 形态 output 折叠为 string (未知 part 在 tool output 内随之折叠).
+  配对跳过; Responses 响应侧 Raw 以独立 message item 重包装; ~~function_call_output 的
+  array 形态 output 折叠为 string~~ (已修, 见下方 #403 条目).
+- ✅ **tool_result 媒体块完整搬运 (#403, 2026-10-26)**: ToolResult content 含非 Text 块
+  (Image 等) 时按 egress 协议分派 — **o egress 搬运** (OpenAI Chat 的 `role:"tool"`
+  content 官方仅支持 text part, Image 块搬到紧随连续 tool 批次之后的合成 user 消息 +
+  占位标记 `TOOL_RESULT_MEDIA_MOVED_MARKER` / per-call 标签 `TOOL_RESULT_MEDIA_LABEL_PREFIX`,
+  flush 时机对齐协议约束 "tool 消息必须紧跟 assistant tool_calls"; cc-switch
+  `tool_media` 同型) / **r egress 原位保真** (`function_call_output.output` 官方支持
+  `string | array of (input_text|input_image|input_file)` (2025-09 起) — reader 记
+  `content_form`, writer 按原形态回写, Image → input_image part / Raw verbatim, 无搬运
+  无标记) / a egress 无损不变. 全部发生在 **writer 层** (IR 不变 → DAG/delta/preview/
+  UI-1 派生链零影响, redact 扫描面不变). moved/dropped 的 WARN 在 proxy egress 写出点
+  (`warn_tool_result_media_fate`), 统计 SSOT = `codec::tool_result_media_fate` (纯函数).
+  FWD-1 例外登记 (o egress 搬运改变消息结构) 见 contracts.md; 残余边界 (String 形态
+  例外 / reasoning 族折叠 / 文本 array 归一) 见 known-limitations codec 节 T8 条目.
 - ✅ `reasoning_content` (思考原文, OpenAI 兼容 provider 非标字段) 同协议建模:
   请求 (assistant 历史回传) / 非流式响应 / 流式 delta 三路径 reader↔writer 对称
   (#176, 契约 STR-6). 跨协议处置见下方 T7 条 (o-origin 跨 a 经 envelope 搬运
@@ -197,7 +210,7 @@ normalize(v) == normalize(Writer(Reader(v)))
 | `IrRequest.max_tokens_form: Option<MaxTokensForm>` | ir.rs | max_tokens 值来源字段名 (`max_tokens`/`max_completion_tokens` 双读别名, #283), 同协议 writer 按原字段名回写 (o-series 拒收改写); 仅 OpenAI codec 填充 |
 | `IrMessage.content_form: Option<ContentForm>` | ir.rs | message content 形态 (String/Array/Null) |
 | `IrMessage.reasoning_content_form: Option<ReasoningContentForm>` | ir.rs | assistant 消息 `reasoning_content` 显式空/null 形态 (#176), 区分 `""`/`null` vs 缺失 |
-| `IrBlock::ToolResult.content_form: Option<ContentForm>` | ir.rs | tool_result 内 content 形态 (Anthropic 特有) |
+| `IrBlock::ToolResult.content_form: Option<ContentForm>` | ir.rs | tool_result 内 content 形态 (Anthropic 与 Responses (`function_call_output.output`, #403) 的 reader 填充, writer 按原形态回写 — r 侧 array 形态承载 input_image 等媒体 part 原位保真) |
 | `IrMessage.extra: Map` / `IrTool::Function.extra: Map` (命名空间按来源协议: anthropic/responses 条目级, chat function 子对象级 — `strict` 等; #321) / `IrTool::Raw { entry }` (整条目原文, #321) / 六个 wire 来源 `IrBlock` variant 的 `extra: Map` (T7 修复轮扩至 Reasoning/ReasoningContent — thinking block 的 `cache_control` 是扩展思考官方推荐断点) / `IrBlock::Raw { entry }` (content part/block 整条原文, #363) | ir.rs | 未建模字段逃生舱 (L4/L5, #269): 消息级 `output_config`、block 级/工具级 `cache_control`、`strict` 等原样保真; Raw = 无法建模的整个条目原文 (hosted/custom/畸形/未知 part) — 字符串叶子进 redact 扫描面; 跨协议经 `clear_wire_fidelity` 清空 (extra 清空 + 两类 Raw retain 丢弃 + WARN; 含 ToolResult.content 嵌套递归); block extra 参与 dag 内容寻址 hash; sg-thinking envelope 不携带 extra (打包点在 seam 后恒空, 解包侧由 reader 现收) |
 | `IrBlock::ToolResult.is_error: Option<bool>` | ir.rs | 显式形态保真 (#269): None = 字段缺席 (API 语义 false), Some = 显式 true/false 原样回写 |
 | `IrUsage.extra: Map` (#402) | ir.rs | usage 对象内**未建模子字段** (`cache_creation` TTL 分解对象 / `server_tool_use` / `service_tier` / `speed` / `output_tokens_details` / `inference_geo` / 未来新增): 仅 a reader 收集 / 仅 a writer 回写 (`write_usage` 非流式 + 流式 message_start/delta 共用), 字符串叶子进 redact restore 扫描面; 不参与 `is_zero` (token 语义); 跨协议经 `IrResponse::clear_wire_fidelity` 清空 |

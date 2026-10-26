@@ -292,34 +292,45 @@ fn is_sensitive_header(name: &str) -> bool {
 
 // ─── parse-失败 fallback 可观测性 (#158 + RED-8, fan_out / cross_proto 共享) ──
 
-/// T8: tool_result 媒体丢弃 WARN (cross_proto / same_proto 的 **egress 写出点**
+/// #403: tool_result 媒体处置 WARN (cross_proto / same_proto 的 **egress 写出点**
 /// 共享, record_id 就位后调用 — 模式对齐 cross_proto 的 reasoning 丢弃 WARN).
 ///
-/// 丢弃语义: egress 为折叠型 (OpenAI / Responses — tool 载体只承载文本) 时,
-/// tool_result content 内的非 Text 块 (Image 等媒体) 被折叠丢弃, 无占位标记.
-/// 统计 SSOT = `codec::dropped_tool_result_media` (纯函数). WARN 只在此处打:
-/// codec 的 write_request 还被多个非 egress 消费面复用 (cross_proto 的 ingress
-/// 视图 record body / derive.rs 的 timeline 派生 / records parsed view), 内嵌
-/// WARN 会在无损方向 (egress=Anthropic, 原样写回 blocks) 误报、在轮询的视图
-/// 路径放大 (M1/M2). 只记计数不记内容.
-pub(super) fn warn_tool_result_media_drop(
+/// 处置语义 (egress 为 OpenAI / Responses 时; 其余 egress 由
+/// `tool_result_media_fate` 返回空而不触发 — Anthropic 原样写回 blocks):
+/// - **moved**: o egress 的 Image 块搬运到紧随 tool 批次的合成 user 消息
+///   (tool 消息 content 官方仅支持 text part), 原位置留占位标记行 — 信息不丢,
+///   WARN 保留可观测性 (消息结构变化是行为事实, 排障时需要看见).
+/// - **dropped**: 其余不可表示块 (reasoning 族 / 嵌套 / raw 等) 折叠丢弃.
+/// - r egress 的 Image/Raw 原位保真 (output array) — 无 WARN.
+///
+/// 统计 SSOT = `codec::tool_result_media_fate` (纯函数, gate 也在彼处单一化).
+/// WARN 只在此处打: codec 的 write_request 还被多个非 egress 消费面复用
+/// (cross_proto 的 ingress 视图 record body / derive.rs 的 timeline 派生 /
+/// records parsed view), 内嵌 WARN 会在无损方向 (egress=Anthropic, 原样写回
+/// blocks) 误报、在轮询的视图路径放大 (M1/M2). 只记计数不记内容.
+pub(super) fn warn_tool_result_media_fate(
     record_id: uuid::Uuid,
     egress: crate::codec::Protocol,
     ir: &crate::codec::IrRequest,
 ) {
-    if !matches!(
-        egress,
-        crate::codec::Protocol::OpenAI | crate::codec::Protocol::OpenAIResponses
-    ) {
-        return;
+    let fate = crate::codec::tool_result_media_fate(egress, ir);
+    if let Some((count, kinds)) = fate.moved_summary() {
+        tracing::warn!(
+            %record_id,
+            count,
+            kinds = %kinds,
+            "moving non-text media block(s) from tool_result content into a \
+             synthesized user message after the tool batch \
+             (egress tool message carries text only; placeholder marker left in place)"
+        );
     }
-    if let Some((count, kinds)) = crate::codec::dropped_tool_result_media(ir) {
+    if let Some((count, kinds)) = fate.dropped_summary() {
         tracing::warn!(
             %record_id,
             count,
             kinds = %kinds,
             "dropping non-text block(s) from tool_result content \
-             (egress tool message carries text only; no placeholder emitted)"
+             (not representable in egress protocol tool message)"
         );
     }
 }
@@ -862,5 +873,100 @@ mod tests {
                 header_name, keyword
             );
         }
+    }
+
+    /// #403: `warn_tool_result_media_fate` 的发射面 — o egress 对 moved/dropped
+    /// 各发一条 WARN (含 count/kinds/record_id), a egress 零发射 (gate 在
+    /// `codec::tool_result_media_fate` 空返回)。捕获方式仿
+    /// `codec/mod.rs::CapturingMakeWriter` 先例 (线程局部 subscriber, 零新依赖)。
+    #[test]
+    fn warn_tool_result_media_fate_emits_per_bucket() {
+        use crate::codec::ir::{ContentForm, IrBlock, IrMessage, IrRole};
+        use crate::codec::{IrRequest, Protocol};
+
+        let ir = IrRequest {
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![IrBlock::ToolResult {
+                    tool_use_id: "call_1".into(),
+                    content: vec![
+                        IrBlock::Image {
+                            source: crate::codec::ir::IrImageSource::Url(
+                                "https://e.com/s.png".into(),
+                            ),
+                            extra: Default::default(),
+                        },
+                        IrBlock::ReasoningContent {
+                            text: "thinking...".into(),
+                            opaque: None,
+                            extra: Default::default(),
+                        },
+                    ],
+                    is_error: None,
+                    content_form: Some(ContentForm::Array),
+                    extra: Default::default(),
+                }],
+                ..Default::default()
+            }],
+            model: "m".into(),
+            ..Default::default()
+        };
+
+        struct CapturingMakeWriter {
+            sink: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingMakeWriter {
+            type Writer = CapturingWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                CapturingWriter {
+                    sink: self.sink.clone(),
+                }
+            }
+        }
+        struct CapturingWriter {
+            sink: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        }
+        impl std::io::Write for CapturingWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.sink.lock().expect("sink poisoned").write(buf)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.sink.lock().expect("sink poisoned").flush()
+            }
+        }
+
+        let capture = |egress: Protocol| -> String {
+            let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+            let dispatch = tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::new("trace"))
+                .with_writer(CapturingMakeWriter { sink: sink.clone() })
+                .with_ansi(false)
+                .finish();
+            tracing::dispatcher::with_default(
+                &tracing::dispatcher::Dispatch::new(dispatch),
+                || {
+                    warn_tool_result_media_fate(uuid::Uuid::nil(), egress, &ir);
+                },
+            );
+            String::from_utf8(sink.lock().expect("sink poisoned").clone())
+                .expect("captured logs must be utf-8")
+        };
+
+        // o egress: moved (image:1) + dropped (reasoning_content:1) 两条。
+        let o_logs = capture(Protocol::OpenAI);
+        assert!(
+            o_logs.contains("moving non-text media block"),
+            "moved WARN 缺失:\n{o_logs}"
+        );
+        assert!(o_logs.contains("count=1") && o_logs.contains("image:1"));
+        assert!(
+            o_logs.contains("dropping non-text block"),
+            "dropped WARN 缺失:\n{o_logs}"
+        );
+        assert!(o_logs.contains("reasoning_content:1"));
+
+        // a egress: gate 在纯函数空返回, 零发射。
+        let a_logs = capture(Protocol::Anthropic);
+        assert!(a_logs.is_empty(), "a egress 不应发射 WARN:\n{a_logs}");
     }
 }

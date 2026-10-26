@@ -62,8 +62,8 @@ mod stream;
 use serde_json::{Map, Value, json};
 
 use super::ir::{
-    IrBlock, IrImageSource, IrMessage, IrReasoning, IrReasoningEffort, IrRequest, IrResponse,
-    IrRole, blocks_has_text,
+    ContentForm, IrBlock, IrImageSource, IrMessage, IrReasoning, IrReasoningEffort, IrRequest,
+    IrResponse, IrRole, blocks_has_text,
 };
 use super::{
     IrError, IrStopReason, IrTool, IrToolChoice, IrUsage, Reader, Writer, blocks_to_text,
@@ -588,13 +588,17 @@ fn read_input_item(item: &Value) -> Option<Vec<IrMessage>> {
                 .to_string();
             // function_call_output 的 output 字段与 message content 共享同一套 wire 形态.
             let content = read_message_content(obj.get("output"));
+            // L1 保真 (#403): 记录 output 原始形态 (string / array) — writer 按原形态
+            // 回写; array 形态承载 input_image 等媒体 part (官方 2025-09 起支持),
+            // r→r round-trip 媒体原位保真的依据.
+            let content_form = ContentForm::classify(obj.get("output"));
             Some(vec![IrMessage {
                 role: IrRole::User,
                 content: vec![IrBlock::ToolResult {
                     tool_use_id,
                     content,
                     is_error: None, // Responses 协议无 is_error 概念
-                    content_form: None,
+                    content_form,
                     extra: Default::default(),
                 }],
                 ..Default::default()
@@ -995,6 +999,54 @@ fn read_reasoning_block(obj: &Map<String, Value>) -> Option<IrBlock> {
     }
 }
 
+/// IR block → Responses content part (Text → input_text, Image → input_image
+/// (Base64 → data URL), Raw → verbatim (#363 同型)). 空 Text 跳过 (与 reader
+/// `read_content_part` 的 "空文本视为缺席" 对称); ToolUse / reasoning 族 → None
+/// (user/system 消息通常不出现, 出现即不可表示). message content 与
+/// `function_call_output.output` array 共享同一套 part 形态 (reader 侧
+/// `read_message_content` 的同一对称, #403).
+fn block_to_input_part(b: &IrBlock) -> Option<Value> {
+    match b {
+        IrBlock::Text { text, .. } if !text.is_empty() => {
+            Some(json!({"type": "input_text", "text": text}))
+        }
+        IrBlock::Image { source, .. } => Some(json!({
+            "type": "input_image",
+            "image_url": image_source_to_url(source)
+        })),
+        // Raw 原文 verbatim 回写 (#363): input_file 等未建模 part 原位保真
+        // (跨协议路径已被 clear_wire_fidelity 丢弃, 不会走到这里).
+        IrBlock::Raw { entry } => Some(entry.clone()),
+        _ => None,
+    }
+}
+
+/// #403: ToolResult content → `function_call_output.output` array 形态的 parts
+/// (官方 2025-09 起支持 `string | array of (input_text|input_image|input_file)`).
+/// part 映射共享 [`block_to_input_part`]; is_error → `[error]` 前缀: 拼进首个
+/// **Text 派生** part (Raw 条目即使 type 形似 input_text 也不可改写 — verbatim
+/// 契约), 无 text part 时独立成 part (与 string 形态的 `"[error] {text}"` 对齐).
+fn tool_result_output_parts(content: &[IrBlock], is_error: Option<bool>) -> Vec<Value> {
+    let mut parts: Vec<Value> = Vec::new();
+    let mut first_text_idx: Option<usize> = None;
+    for b in content {
+        if matches!(b, IrBlock::Text { text, .. } if !text.is_empty()) && first_text_idx.is_none() {
+            first_text_idx = Some(parts.len());
+        }
+        parts.extend(block_to_input_part(b));
+    }
+    if is_error.unwrap_or(false) {
+        match first_text_idx.and_then(|i| parts.get_mut(i)) {
+            Some(Value::Object(first)) => {
+                let prefixed = format!("[error] {}", first["text"].as_str().unwrap_or_default());
+                first.insert("text".to_string(), Value::String(prefixed));
+            }
+            _ => parts.insert(0, json!({"type": "input_text", "text": "[error]"})),
+        }
+    }
+    parts
+}
+
 /// IR message → Responses input items (一条 IR message 可能产出多个 items).
 ///
 /// 关键: OpenAI Chat 的 assistant tool_calls 数组在 Responses 里是独立的 function_call items.
@@ -1003,23 +1055,14 @@ fn write_input_items(msg: &IrMessage) -> Vec<Value> {
         IrRole::System => {
             // system 消息按原位输出为 role=system 的 message item (2026-09-23 修正,
             // 与 Anthropic reader 的位置保真对称 — 旧实现跳过, 会静默丢 Anthropic
-            // ingress 的中途 system 消息, issue #269)。Text 块 → input_text parts;
-            // 其他块类型在 system 消息中不出现, 跳过 (与 user 臂同型)。
+            // ingress 的中途 system 消息, issue #269)。part 映射共享
+            // `block_to_input_part` (#403: Image 亦回写 — IrRole::System 消息只来自
+            // a reader (原位保留的 role=system, content 可含 image block), 这是
+            // **a→r 跨协议**的保真改进; r→r 同协议的 system item 媒体仍经
+            // instructions 折叠丢弃 (reader 提升到顶层 system, L2 搁置项)).
             let mut items = Vec::new();
-            let mut content_parts: Vec<Value> = Vec::new();
-            for b in &msg.content {
-                match b {
-                    IrBlock::Text { text, .. } if !text.is_empty() => {
-                        content_parts.push(json!({"type": "input_text", "text": text}));
-                    }
-                    // Raw 原文 verbatim 回写 (#363): 同协议 round-trip 字节保真
-                    // (跨协议路径已被 clear_wire_fidelity 丢弃, 不会走到这里).
-                    IrBlock::Raw { entry } => {
-                        content_parts.push(entry.clone());
-                    }
-                    _ => {}
-                }
-            }
+            let content_parts: Vec<Value> =
+                msg.content.iter().filter_map(block_to_input_part).collect();
             // 显式空 system 消息也输出空 content item — 保位比省字节优先.
             items.push(json!({
                 "type": "message",
@@ -1035,23 +1078,11 @@ fn write_input_items(msg: &IrMessage) -> Vec<Value> {
             let mut content_parts: Vec<Value> = Vec::new();
             for b in &msg.content {
                 match b {
-                    IrBlock::Text { text, .. } => {
-                        if !text.is_empty() {
-                            content_parts.push(json!({"type": "input_text", "text": text}));
-                        }
-                    }
-                    IrBlock::Image { source, .. } => {
-                        // Url 直通; Base64 → data URL (与 OpenAI writer 共享 helper,
-                        // data URL 是 input_image 的合法值; 修复前 Base64 被静默丢弃).
-                        content_parts.push(json!({
-                            "type": "input_image",
-                            "image_url": image_source_to_url(source)
-                        }));
-                    }
                     IrBlock::ToolResult {
                         tool_use_id,
                         content,
                         is_error,
+                        content_form,
                         ..
                     } => {
                         // 先 flush 累积的 content parts 为 message item.
@@ -1063,13 +1094,34 @@ fn write_input_items(msg: &IrMessage) -> Vec<Value> {
                             }));
                             content_parts.clear();
                         }
-                        // function_call_output 的 output 只承载文本 — 非 Text 块
-                        // (Image 等媒体) 折叠丢弃, WARN 在 proxy egress 写出点 (T8).
-                        let text = blocks_to_text(content);
-                        let output_val = if is_error.unwrap_or(false) {
-                            json!(format!("[error] {text}"))
+                        // #403 媒体原位保真: `function_call_output.output` 官方支持
+                        // `string | array of (input_text|input_image|input_file)`
+                        // (2025-09 起, openai-python v2 breaking change) — 无需搬运,
+                        // 非 Text 块以原生 part 形态留在 output 内:
+                        //   - Some(Array) → array 形态 (r→r round-trip 形态保真)
+                        //   - Some(String)/Some(Null) → string 形态 (String 原形态
+                        //     回写; Null 归一为 string — 既有行为, 非"原形态";
+                        //     两者都携带不了媒体, reader 不可达防御面)
+                        //   - None (跨协议 / 内部构造) → 含非 Text 块时 array (媒体
+                        //     原位), 否则 string (与既有行为兼容)
+                        // 不可表示块 (reasoning 族 / 嵌套) 折叠丢弃, fate 统计在
+                        // proxy egress 写出点.
+                        let has_nontext =
+                            content.iter().any(|b| !matches!(b, IrBlock::Text { .. }));
+                        let use_array = match content_form {
+                            Some(ContentForm::Array) => true,
+                            Some(_) => false,
+                            None => has_nontext,
+                        };
+                        let output_val = if use_array {
+                            Value::Array(tool_result_output_parts(content, *is_error))
                         } else {
-                            Value::String(text)
+                            let text = blocks_to_text(content);
+                            if is_error.unwrap_or(false) {
+                                json!(format!("[error] {text}"))
+                            } else {
+                                Value::String(text)
+                            }
                         };
                         items.push(json!({
                             "type": "function_call_output",
@@ -1077,16 +1129,13 @@ fn write_input_items(msg: &IrMessage) -> Vec<Value> {
                             "output": output_val,
                         }));
                     }
-                    IrBlock::ToolUse { .. } | IrBlock::Reasoning { .. } => {
-                        // user 消息里通常不出现, 跳过.
-                    }
-                    IrBlock::ReasoningContent { .. } => {
-                        // user 消息里通常不出现 (思考原文属 assistant), 跳过.
-                    }
-                    // Raw 原文 verbatim 回写 (#363): 未知/畸形 part 同协议
-                    // round-trip 保真 (跨协议路径已被 clear_wire_fidelity 丢弃).
-                    IrBlock::Raw { entry } => {
-                        content_parts.push(entry.clone());
+                    // Text (非空) / Image / Raw → 原生 part (共享 `block_to_input_part`,
+                    // #403 收敛); 其余 (ToolUse / reasoning 族 / 空 Text — user 消息
+                    // 通常不出现) 跳过.
+                    _ => {
+                        if let Some(part) = block_to_input_part(b) {
+                            content_parts.push(part);
+                        }
                     }
                 }
             }
@@ -1321,6 +1370,45 @@ mod tests {
     }
     fn writer() -> ResponsesWriter {
         ResponsesWriter
+    }
+
+    // ─── IR block 构造 helper (#403 测试族共用) ──────────────────────────
+
+    fn text(s: &str) -> IrBlock {
+        IrBlock::Text {
+            text: s.into(),
+            extra: Default::default(),
+        }
+    }
+    fn img(url: &str) -> IrBlock {
+        IrBlock::Image {
+            source: IrImageSource::Url(url.into()),
+            extra: Default::default(),
+        }
+    }
+    fn tr(
+        content: Vec<IrBlock>,
+        content_form: Option<ContentForm>,
+        is_error: Option<bool>,
+    ) -> IrBlock {
+        IrBlock::ToolResult {
+            tool_use_id: "call_1".into(),
+            content,
+            is_error,
+            content_form,
+            extra: Default::default(),
+        }
+    }
+    fn user_req(content: Vec<IrBlock>) -> IrRequest {
+        IrRequest {
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content,
+                ..Default::default()
+            }],
+            model: "gpt-5.4".into(),
+            ..Default::default()
+        }
     }
 
     // ─── read_request: 基础映射 ──────────────────────────────────────────
@@ -1891,55 +1979,211 @@ mod tests {
     }
 
     #[test]
-    fn write_request_tool_result_media_dropped_to_text() {
-        // T8: tool_result 内 Image 块被丢弃 (无占位标记, WARN 由 helper 打 —
-        // 可观测化单测见 codec::tests), Text join 保留; 纯图片 → 空串.
-        let tool_result = |content: Vec<IrBlock>| IrBlock::ToolResult {
-            tool_use_id: "call_1".into(),
-            content,
-            is_error: None,
-            content_form: None,
-            extra: Default::default(),
+    fn write_request_tool_result_media_native_output_array() {
+        // #403: `function_call_output.output` 官方支持 array of (input_text|
+        // input_image|input_file) (2025-09 起) — 媒体原位保真, 无搬运无占位标记.
+        let image = img("https://example.com/cat.png");
+        // content_form=None (跨协议 a→r / 内部构造): 含非 Text 块 → array 原位.
+        let v = writer().write_request(&user_req(vec![tr(
+            vec![text("screenshot saved"), image.clone(), text("done")],
+            None,
+            None,
+        )]));
+        let input = v.get("input").unwrap().as_array().unwrap();
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0].get("type").unwrap(), "function_call_output");
+        assert_eq!(
+            input[0].get("output").unwrap(),
+            &json!([
+                {"type": "input_text", "text": "screenshot saved"},
+                {"type": "input_image", "image_url": "https://example.com/cat.png"},
+                {"type": "input_text", "text": "done"},
+            ])
+        );
+
+        // content_form=Some(Array) (r→r 同协议): array 形态保真回写.
+        let v = writer().write_request(&user_req(vec![tr(
+            vec![text("sunny"), image],
+            Some(ContentForm::Array),
+            None,
+        )]));
+        let output = v["input"][0]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[1]["type"], "input_image");
+
+        // content_form=Some(String) (r→r 同协议, string 形态): 保持 string —
+        // 媒体在该形态下不可达 (reader 不会产出, 内部构造防御面如实回写).
+        let v = writer().write_request(&user_req(vec![tr(
+            vec![text("sunny")],
+            Some(ContentForm::String),
+            None,
+        )]));
+        assert_eq!(v["input"][0]["output"], "sunny");
+
+        // 纯 Text + content_form=None: 沿用 string 形态 (与既有行为兼容).
+        let v = writer().write_request(&user_req(vec![tr(vec![text("sunny")], None, None)]));
+        assert_eq!(v["input"][0]["output"], "sunny");
+
+        // 纯图片 tool_result: array 单 part (非空, 结构合法).
+        let v = writer().write_request(&user_req(vec![tr(
+            vec![IrBlock::Image {
+                source: IrImageSource::Base64 {
+                    media_type: "image/png".into(),
+                    data: "iVBORw0KGgo=".into(),
+                },
+                extra: Default::default(),
+            }],
+            None,
+            None,
+        )]));
+        assert_eq!(
+            v["input"][0]["output"],
+            json!([{"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}])
+        );
+    }
+
+    /// #403: Raw part (input_file 等) 在 array 形态 output 内 verbatim 保真;
+    /// is_error 的 `[error]` 前缀拼进首个 **Text 派生** part (Raw 即使 type 形似
+    /// input_text 也不可改写 — verbatim 契约), 无 text part 时独立成 part.
+    #[test]
+    fn write_request_tool_result_output_array_raw_and_error() {
+        let raw = IrBlock::Raw {
+            entry: json!({"type": "input_file", "file_id": "file_1", "filename": "a.pdf"}),
         };
-        let image = IrBlock::Image {
-            source: IrImageSource::Url("https://example.com/cat.png".into()),
-            extra: Default::default(),
+        let v = writer().write_request(&user_req(vec![tr(vec![text("doc"), raw], None, None)]));
+        assert_eq!(
+            v["input"][0]["output"],
+            json!([
+                {"type": "input_text", "text": "doc"},
+                {"type": "input_file", "file_id": "file_1", "filename": "a.pdf"},
+            ])
+        );
+
+        let v = writer().write_request(&user_req(vec![tr(
+            vec![text("boom"), img("https://e.com/x.png")],
+            None,
+            Some(true),
+        )]));
+        assert_eq!(
+            v["input"][0]["output"],
+            json!([
+                {"type": "input_text", "text": "[error] boom"},
+                {"type": "input_image", "image_url": "https://e.com/x.png"},
+            ])
+        );
+
+        // 无 text part 的 is_error: 独立 [error] part.
+        let v = writer().write_request(&user_req(vec![tr(
+            vec![img("https://e.com/x.png")],
+            None,
+            Some(true),
+        )]));
+        assert_eq!(v["input"][0]["output"][0]["text"], "[error]");
+
+        // Raw 前置 + is_error: 首个 part 是 Raw (type 形似 input_text 也不可改写),
+        // [error] 前缀落不到 Raw 上 — 拼进其后首个 Text 派生 part.
+        let raw_like_text = IrBlock::Raw {
+            entry: json!({"type": "input_text", "text": 123}),
         };
-        let text = |s: &str| IrBlock::Text {
-            text: s.into(),
-            extra: Default::default(),
-        };
+        let v = writer().write_request(&user_req(vec![tr(
+            vec![raw_like_text, text("boom")],
+            None,
+            Some(true),
+        )]));
+        assert_eq!(
+            v["input"][0]["output"],
+            json!([
+                {"type": "input_text", "text": 123},
+                {"type": "input_text", "text": "[error] boom"},
+            ])
+        );
+    }
+
+    /// #403: `IrRole::System` 消息 (a reader 原位保留的 role=system, 跨协议 a→r)
+    /// 的 Image 经共享 `block_to_input_part` 回写为 input_image part — 修复前
+    /// 该臂跳过非 Text 块 (a→r 保真损失)。r→r 同协议的 system 媒体不经此臂
+    /// (reader 提升到顶层 instructions 折叠, L2 搁置项)。
+    #[test]
+    fn write_request_system_message_media_part_written() {
         let ir = IrRequest {
             messages: vec![IrMessage {
-                role: IrRole::User,
-                content: vec![tool_result(vec![
-                    text("screenshot saved"),
-                    image.clone(),
-                    text("done"),
-                ])],
+                role: IrRole::System,
+                content: vec![
+                    text("policy: verify screenshots"),
+                    img("https://e.com/s.png"),
+                ],
                 ..Default::default()
             }],
-            model: "gpt-4o".into(),
+            model: "m".into(),
             ..Default::default()
         };
         let v = writer().write_request(&ir);
-        let input = v.get("input").unwrap().as_array().unwrap();
-        assert_eq!(input[0].get("type").unwrap(), "function_call_output");
-        assert_eq!(input[0].get("output").unwrap(), "screenshot saved\ndone");
+        let input = v["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["role"], "system");
+        assert_eq!(
+            input[0]["content"],
+            json!([
+                {"type": "input_text", "text": "policy: verify screenshots"},
+                {"type": "input_image", "image_url": "https://e.com/s.png"},
+            ])
+        );
+    }
 
-        // 纯图片 tool_result → 空串 (极端场景锁定).
-        let ir_pure = IrRequest {
-            messages: vec![IrMessage {
-                role: IrRole::User,
-                content: vec![tool_result(vec![image])],
-                ..Default::default()
-            }],
-            model: "gpt-4o".into(),
-            ..Default::default()
+    /// #403 r→r round-trip: function_call_output 的 string / array 双形态 +
+    /// array 内媒体 part 经 reader→writer 原位保真 (FWD-2 normalize 相等).
+    #[test]
+    fn read_request_function_call_output_form_and_media_round_trip() {
+        let body = json!({
+            "model": "gpt-5",
+            "input": [
+                {"type": "function_call_output", "call_id": "call_1",
+                 "output": [
+                     {"type": "input_text", "text": "screenshot saved"},
+                     {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="},
+                 ]},
+                {"type": "function_call_output", "call_id": "call_2", "output": "plain text"},
+            ],
+        });
+        let ir = reader().read_request(&body).unwrap();
+        // reader: array → Image block + content_form=Some(Array).
+        let tr1 = match &ir.messages[0].content[0] {
+            IrBlock::ToolResult {
+                content,
+                content_form,
+                ..
+            } => (content.clone(), *content_form),
+            other => panic!("expected ToolResult, got {other:?}"),
         };
-        let v_pure = writer().write_request(&ir_pure);
-        let input_pure = v_pure.get("input").unwrap().as_array().unwrap();
-        assert_eq!(input_pure[0].get("output").unwrap(), "");
+        assert_eq!(tr1.1, Some(ContentForm::Array));
+        assert_eq!(tr1.0.len(), 2);
+        assert!(matches!(tr1.0[1], IrBlock::Image { .. }));
+        // string → 单 Text + content_form=Some(String).
+        match &ir.messages[1].content[0] {
+            IrBlock::ToolResult {
+                content,
+                content_form,
+                ..
+            } => {
+                assert_eq!(*content_form, Some(ContentForm::String));
+                assert_eq!(content.len(), 1);
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+        // writer 回写: 形态 + part 字节保真.
+        let v = writer().write_request(&ir);
+        assert_eq!(
+            v["input"][0],
+            json!({
+                "type": "function_call_output", "call_id": "call_1",
+                "output": [
+                    {"type": "input_text", "text": "screenshot saved"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="},
+                ]
+            })
+        );
+        assert_eq!(v["input"][1]["output"], "plain text");
     }
 
     #[test]

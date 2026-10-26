@@ -157,10 +157,20 @@ fn clear_block_fidelity(blocks: &mut Vec<IrBlock>) -> usize {
         match b {
             IrBlock::Text { extra, .. }
             | IrBlock::ToolUse { extra, .. }
-            | IrBlock::ToolResult { extra, .. }
             | IrBlock::Image { extra, .. }
             | IrBlock::Reasoning { extra, .. }
             | IrBlock::ReasoningContent { extra, .. } => extra.clear(),
+            // ToolResult: extra 清空 + content_form 清空 (#403 补实现 — 文档契约
+            // "跨协议翻译前由 caller 清空" 此前漏掉该字段; r writer 现按 content_form
+            // 决定 output 形态, 源协议 (a) 的形态元数据不得泄漏进目标协议决策).
+            IrBlock::ToolResult {
+                extra,
+                content_form,
+                ..
+            } => {
+                extra.clear();
+                *content_form = None;
+            }
             IrBlock::Raw { .. } => {}
         }
     }
