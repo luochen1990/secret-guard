@@ -313,6 +313,8 @@ impl Reader for OpenAiReader {
             model,
             id,
             created,
+            // #402: extra 是 a 协议 wire 形态容器, o/r reader 不收集 (typed-only).
+            extra: Default::default(),
         })
     }
 
@@ -958,6 +960,8 @@ fn read_usage(usage: &Value) -> IrUsage {
         output_tokens,
         cache_read_input_tokens: cached,
         cache_creation_input_tokens: None, // OpenAI 不区分 creation/read
+        // #402: extra 是 a 协议 wire 形态容器, o/r reader 不收集 (typed-only).
+        extra: Default::default(),
     }
 }
 
@@ -2162,6 +2166,7 @@ mod tests {
             id: None,
             created: None,
             stop_sequence: None,
+            extra: Default::default(),
         };
         let v = writer().write_response(&ir);
         let usage = v.get("usage").unwrap();
@@ -2629,6 +2634,7 @@ mod tests {
                 output_tokens: 10,
                 cache_read_input_tokens: Some(50),
                 cache_creation_input_tokens: Some(30),
+                extra: Default::default(),
             },
             usage_present: true,
         };
@@ -2993,6 +2999,7 @@ mod tests {
             id: Some("chatcmpl-r1".into()),
             created: Some(1),
             stop_sequence: None,
+            extra: Default::default(),
         };
         let v = writer().write_response(&ir);
         let msg = &v["choices"][0]["message"];

@@ -267,11 +267,13 @@ mod tests {
                 output_tokens: 34,
                 cache_creation_input_tokens: None,
                 cache_read_input_tokens: None,
+                extra: Default::default(),
             },
             usage_present: true,
             model: Some("test-model".into()),
             id: Some("id-src".into()),
             created: Some(1700000000),
+            extra: Default::default(),
         }
     }
 
@@ -420,6 +422,7 @@ mod tests {
             model: Some("deepseek-r".into()),
             id: Some("foreign-id-xyz".into()),
             created: Some(1700000000),
+            extra: Default::default(),
         };
         for proto in [Protocol::OpenAI, Protocol::OpenAIResponses] {
             for identity in [SynthIdentity::Keep, SynthIdentity::Synthesize] {
@@ -485,6 +488,7 @@ mod tests {
             model: Some("m".into()),
             id: Some("msg_foreign".into()),
             created: None,
+            extra: Default::default(),
         };
         let sse = synthesize_sse(Protocol::Anthropic, &resp, SynthIdentity::Synthesize);
         let client = String::from_utf8_lossy(&sse);
@@ -606,6 +610,7 @@ mod tests {
             model: Some("claude-x".into()),
             id: Some("msg_1".into()),
             created: None,
+            extra: Default::default(),
         };
         let sse = synthesize_sse(Protocol::Anthropic, &resp, SynthIdentity::Keep);
         let client = String::from_utf8_lossy(&sse);
@@ -686,6 +691,7 @@ mod tests {
             model: Some("gpt-5".into()),
             id: Some("resp_1".into()),
             created: Some(1700000000),
+            extra: Default::default(),
         };
 
         // 同协议 r: done 族帧携带 ec verbatim (T5 曾整块跳过)。

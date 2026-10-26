@@ -410,6 +410,7 @@ mod tests {
             output_tokens: 7,
             cache_read_input_tokens: None,
             cache_creation_input_tokens: None,
+            extra: Default::default(),
         });
         assert_eq!(
             u,
@@ -427,6 +428,7 @@ mod tests {
             output_tokens: u64::MAX,
             cache_read_input_tokens: Some(u64::MAX),
             cache_creation_input_tokens: Some(u64::MAX),
+            extra: Default::default(),
         });
         assert_eq!(
             extreme,

@@ -280,10 +280,25 @@ impl StreamTranslate {
             } = &mut ev
             {
                 if let Some(u) = usage {
+                    // #402: 跨协议模式剥 usage extra (源协议特有子字段不得进目标
+                    // wire, 与非流式 IrResponse::clear_wire_fidelity 对称); 同协议
+                    // restore 模式严禁剥 — usage extra 的同协议 round-trip 正是
+                    // #402 的修复目标.
+                    if self.cross_proto {
+                        u.extra.clear();
+                    }
                     self.start_usage = Some(u.clone()); // 锁定 input_tokens 用于 backfill
                 }
                 *id = None;
                 *created = None;
+            }
+
+            // #402: 跨协议模式剥 terminal delta 携带的 usage extra (同上; backfill
+            // 只回填 typed 字段, 不会经 start_usage 带回 extra).
+            if self.cross_proto
+                && let IrStreamEvent::MessageDelta { usage, .. } = &mut ev
+            {
+                usage.extra.clear();
             }
 
             // terminal usage backfill: 若 terminal delta 的 input_tokens==0, 用 start_usage 填回.
@@ -889,6 +904,137 @@ mod tests {
         assert!(
             client.contains(&format!("\"name\":\"run_{real}\"")),
             "tool_use name must be restored to real: {client}"
+        );
+        assert!(!client.contains(mock), "mock must not leak: {client}");
+    }
+
+    /// #402: 跨协议流式 (a egress → o ingress) — 源协议特有的 usage 子字段
+    /// (cache_creation / service_tier / inference_geo / ...) 不得泄漏进目标
+    /// wire; typed 计数正常翻译 (prompt_tokens 到达客户端).
+    #[test]
+    fn cross_proto_streaming_strips_usage_extra() {
+        let mut t = StreamTranslate::new_cross_proto(
+            Protocol::OpenAI,    // ingress (client)
+            Protocol::Anthropic, // egress (upstream)
+            None,
+        )
+        .expect("ingress != egress");
+        let frame = |event: &str, data: &str| format!("event: {event}\ndata: {data}\n\n");
+        let sse = [
+            frame(
+                "message_start",
+                r#"{"type":"message_start","message":{"id":"msg_01x","type":"message","role":"assistant","content":[],"model":"claude-3","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":25,"output_tokens":1,"cache_creation":{"ephemeral_5m_input_tokens":512},"service_tier":"priority"}}}"#,
+            ),
+            frame(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            ),
+            frame(
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+            ),
+            frame("content_block_stop", r#"{"type":"content_block_stop","index":0}"#),
+            frame(
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":42,"inference_geo":"us-east-1"}}"#,
+            ),
+            frame("message_stop", r#"{"type":"message_stop"}"#),
+        ]
+        .concat();
+        let out = t.feed(sse.as_bytes());
+        let finish = t.finish();
+        let combined = [out, finish].concat();
+        let client = String::from_utf8_lossy(&combined);
+
+        assert!(
+            !client.contains("service_tier"),
+            "foreign extra must not leak: {client}"
+        );
+        assert!(
+            !client.contains("cache_creation"),
+            "foreign extra must not leak: {client}"
+        );
+        assert!(
+            !client.contains("inference_geo"),
+            "foreign extra must not leak: {client}"
+        );
+        assert!(
+            !client.contains("ephemeral_5m"),
+            "foreign extra must not leak: {client}"
+        );
+        // typed 计数正常翻译 (input 25 → prompt_tokens 25; output 42 到达).
+        assert!(
+            client.contains("\"prompt_tokens\":25"),
+            "typed usage must translate: {client}"
+        );
+        assert!(
+            client.contains("\"completion_tokens\":42"),
+            "typed output tokens must translate: {client}"
+        );
+    }
+
+    /// #402: 同协议 restore 流式 (a→a + redact) — usage 未建模子字段经共用
+    /// read_usage/write_usage round-trip 保真 (跨协议的 strip 不波及本模式).
+    #[test]
+    fn same_proto_restore_stream_preserves_usage_extra() {
+        use crate::redact::RedactionMap;
+
+        let real = "sk-real-usage-77";
+        let mock = "MOCKusage77";
+        let mut map = RedactionMap::default();
+        map.insert(real.to_string(), mock.to_string(), "id-usage")
+            .expect("single mock no conflict");
+
+        let mut t = StreamTranslate::new_same_proto_restore(
+            Protocol::Anthropic,
+            Box::new(crate::redact::StreamingRestorerSet::new(map)),
+        );
+        let frame = |event: &str, data: &str| format!("event: {event}\ndata: {data}\n\n");
+        let sse = [
+            frame(
+                "message_start",
+                r#"{"type":"message_start","message":{"id":"msg_01u","type":"message","role":"assistant","content":[],"model":"claude-3","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1,"cache_creation":{"ephemeral_5m_input_tokens":512},"service_tier":"priority"}}}"#,
+            ),
+            frame(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            ),
+            frame(
+                "content_block_delta",
+                &format!(
+                    r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"note {mock}"}}}}"#
+                ),
+            ),
+            frame("content_block_stop", r#"{"type":"content_block_stop","index":0}"#),
+            frame(
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":7,"inference_geo":"eu-central-1"}}"#,
+            ),
+            frame("message_stop", r#"{"type":"message_stop"}"#),
+        ]
+        .concat();
+        let out = t.feed(sse.as_bytes());
+        let finish = t.finish();
+        let combined = [out, finish].concat();
+        let client = String::from_utf8_lossy(&combined);
+
+        // usage 子字段保真 (message_start + message_delta 两处).
+        assert!(
+            client.contains("\"service_tier\":\"priority\""),
+            "message_start usage extra must survive restore mode: {client}"
+        );
+        assert!(
+            client.contains("\"ephemeral_5m_input_tokens\":512"),
+            "message_start cache_creation must survive restore mode: {client}"
+        );
+        assert!(
+            client.contains("\"inference_geo\":\"eu-central-1\""),
+            "terminal delta usage extra must survive restore mode: {client}"
+        );
+        // restore 本职不回退: 文本叶子 mock → real.
+        assert!(
+            client.contains(&format!("note {real}")),
+            "restore must still work: {client}"
         );
         assert!(!client.contains(mock), "mock must not leak: {client}");
     }

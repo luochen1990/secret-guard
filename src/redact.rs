@@ -1331,6 +1331,15 @@ impl StringLeafOps for IrResponse {
         for block in &self.content {
             block.for_each_str_leaf(f);
         }
+        // #402: usage 未建模子字段 + 响应顶层未建模字段的字符串叶子 —
+        // 上游回显的 mock 出现在 extra 值中时 restore 覆盖 (对称性),
+        // placeholder 蜜罐检测同样扫描此面.
+        for v in self.usage.extra.values() {
+            v.for_each_str_leaf(f);
+        }
+        for v in self.extra.values() {
+            v.for_each_str_leaf(f);
+        }
     }
 
     fn for_each_str_leaf_mut(&mut self, f: &mut impl FnMut(&mut String)) {
@@ -1339,6 +1348,13 @@ impl StringLeafOps for IrResponse {
         }
         for block in &mut self.content {
             block.for_each_str_leaf_mut(f);
+        }
+        // #402: 同上, 可变臂.
+        for v in self.usage.extra.values_mut() {
+            v.for_each_str_leaf_mut(f);
+        }
+        for v in self.extra.values_mut() {
+            v.for_each_str_leaf_mut(f);
         }
     }
 }
@@ -1775,8 +1791,9 @@ fn predict_mock(real: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::ir::{IrMessage, IrResponse, IrRole};
+    use crate::codec::ir::{IrMessage, IrResponse, IrRole, IrUsage};
     use pretty_assertions::assert_eq;
+    use serde_json::json;
 
     // ─── rebuild_real_to_mock_pairs (B1: timeline blocks 派生的映射重建) ─────
 
@@ -3093,6 +3110,62 @@ mod tests {
             }
             _ => panic!("expected Text"),
         }
+    }
+
+    /// #402: restore 的叶子扫描面覆盖 usage.extra 与响应顶层 extra 的嵌套字符串
+    /// 叶子 — 上游在未建模字段值中回显 mock 时, restore 必须还原 (与 content
+    /// 叶子同面, StringLeafOps for IrResponse 的扩展锁定).
+    #[test]
+    fn restore_ir_response_swaps_mock_in_extra_leaves() {
+        let mut ir = IrResponse {
+            content: vec![],
+            stop_reason: None,
+            stop_sequence: None,
+            usage: IrUsage {
+                input_tokens: 1,
+                output_tokens: 2,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+                extra: serde_json::Map::from_iter([
+                    (
+                        "cache_creation".to_string(),
+                        json!({"note": "eph MOCKABCDEF12345"}),
+                    ),
+                    ("service_tier".to_string(), json!("standard")),
+                ]),
+            },
+            usage_present: true,
+            model: None,
+            id: None,
+            created: None,
+            extra: serde_json::Map::from_iter([(
+                "diagnostics".to_string(),
+                json!({"trace": "via MOCKABCDEF12345"}),
+            )]),
+        };
+        let mut map = RedactionMap::default();
+        map.insert(
+            "sk-real-secret".to_string(),
+            "MOCKABCDEF12345".to_string(),
+            "id-test",
+        )
+        .unwrap();
+        restore_ir_response(&mut ir, &map);
+        assert_eq!(
+            ir.usage.extra.get("cache_creation"),
+            Some(&json!({"note": "eph sk-real-secret"})),
+            "mock inside usage.extra nested leaf must be restored"
+        );
+        assert_eq!(
+            ir.usage.extra.get("service_tier"),
+            Some(&json!("standard")),
+            "unhit extra leaf must stay untouched"
+        );
+        assert_eq!(
+            ir.extra.get("diagnostics"),
+            Some(&json!({"trace": "via sk-real-secret"})),
+            "mock inside top-level extra leaf must be restored"
+        );
     }
 
     // ─── C8: restore_json_leaves_fallback (parse-失败 fallback 的 JSON 叶子级兜底) ──

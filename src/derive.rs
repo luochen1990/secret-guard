@@ -579,6 +579,9 @@ pub(crate) fn response_parsed_from_parts(
         id: resp.id.clone(),
         created: resp.created,
         model: resp.model.clone(),
+        // #402: 响应顶层未建模字段回填 (B1 派生链 — 守卫比对 stored/derived
+        // 的必要字段, 缺失时 a→a 响应的 extra 在派生侧丢失).
+        extra: resp.resp_extra.clone(),
     };
     Some(protocol.writer().write_response(&ir_resp))
 }

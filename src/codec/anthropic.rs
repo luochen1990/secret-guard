@@ -198,6 +198,22 @@ impl Reader for AnthropicReader {
             model,
             id,
             created: None,
+            // #402: 响应顶层未建模字段 (container / diagnostics / stop_details /
+            // 未来新增) 收集 — 已建模 key 不进 extra (type/role 由 writer 恒合成
+            // 常量, 真实 wire 恒为 "message"/"assistant").
+            extra: collect_extra(
+                obj,
+                &[
+                    "id",
+                    "type",
+                    "role",
+                    "content",
+                    "model",
+                    "stop_reason",
+                    "stop_sequence",
+                    "usage",
+                ],
+            ),
         })
     }
 
@@ -544,6 +560,9 @@ impl Writer for AnthropicWriter {
                 .unwrap_or(Value::Null),
         );
         out.insert("usage".to_string(), write_usage(&resp.usage));
+        // #402: 响应顶层未建模字段原样回写 (跨协议路径已被 clear_wire_fidelity
+        // 清空, 不会把 a 特有字段写到 foreign wire).
+        merge_extra_into(&mut out, &resp.extra);
         Value::Object(out)
     }
 
@@ -1206,20 +1225,37 @@ fn read_stop_reason(s: &str) -> IrStopReason {
 }
 
 /// Anthropic usage 对象 → [`IrUsage`]. Anthropic 的 input_tokens 本来就是未缓存.
+///
+/// #402: 四元组之外的子字段 (`cache_creation` TTL 分解对象 / `server_tool_use` /
+/// `service_tier` / `speed` / `output_tokens_details` / `inference_geo` / 未来新增)
+/// 收集进 `IrUsage.extra` 同协议回写 — 非流式与流式 (message_start / message_delta)
+/// 共用本函数, extra 捕获随之覆盖两路径. 已建模 key (四元组) 不进 extra, 保持
+/// typed 单源 (双源冲突 = 同一字段 reader 归 typed / writer 回 extra, 顺序敏感).
 fn read_usage(usage: &Value) -> IrUsage {
+    // ROB-1: 非 object 形态 (当前三个调用方均已 filter is_object, 防御未来调用方)
+    // 返回全默认 — 与旧实现对非 object 的 get→None→default 语义逐字段等价.
+    let Some(obj) = usage.as_object() else {
+        return IrUsage::default();
+    };
     IrUsage {
-        input_tokens: usage
-            .get("input_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        output_tokens: usage
+        input_tokens: obj.get("input_tokens").and_then(Value::as_u64).unwrap_or(0),
+        output_tokens: obj
             .get("output_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0),
-        cache_creation_input_tokens: usage
+        cache_creation_input_tokens: obj
             .get("cache_creation_input_tokens")
             .and_then(Value::as_u64),
-        cache_read_input_tokens: usage.get("cache_read_input_tokens").and_then(Value::as_u64),
+        cache_read_input_tokens: obj.get("cache_read_input_tokens").and_then(Value::as_u64),
+        extra: collect_extra(
+            obj,
+            &[
+                "input_tokens",
+                "output_tokens",
+                "cache_creation_input_tokens",
+                "cache_read_input_tokens",
+            ],
+        ),
     }
 }
 
@@ -1489,6 +1525,12 @@ fn write_stop_reason(reason: Option<IrStopReason>) -> String {
 }
 
 /// 写 usage 对象.
+///
+/// #402: 未建模子字段 (`cache_creation` / `server_tool_use` / `service_tier` /
+/// `speed` / `output_tokens_details` / `inference_geo` / ...) 经 `extra` 原样回写 —
+/// 非流式 `write_response` 与流式 message_start / message_delta 帧共用本函数,
+/// 回写随之覆盖两路径. 跨协议路径的 extra 已被 `IrResponse::clear_wire_fidelity`
+/// / StreamTranslate 跨协议模式清空, 不会把 a 特有字段写到 foreign wire.
 fn write_usage(u: &IrUsage) -> Value {
     let mut obj = Map::new();
     obj.insert("input_tokens".to_string(), json!(u.input_tokens));
@@ -1499,6 +1541,7 @@ fn write_usage(u: &IrUsage) -> Value {
     if let Some(c) = u.cache_read_input_tokens {
         obj.insert("cache_read_input_tokens".to_string(), json!(c));
     }
+    merge_extra_into(&mut obj, &u.extra);
     Value::Object(obj)
 }
 
@@ -2433,6 +2476,7 @@ mod tests {
             id: Some("msg_01x".into()),
             created: None,
             stop_sequence: None,
+            extra: Default::default(),
         };
         let v = writer().write_response(&ir);
         assert_eq!(v.get("type").unwrap(), "message");
@@ -2457,6 +2501,7 @@ mod tests {
             id: None,
             created: None,
             stop_sequence: None,
+            extra: Default::default(),
         };
         let v = writer().write_response(&ir);
         let id = v.get("id").unwrap().as_str().unwrap();
@@ -2517,6 +2562,191 @@ mod tests {
         let rewritten = writer().write_response(&ir);
         let ir2 = reader().read_response(&rewritten).unwrap();
         assert_eq!(ir, ir2);
+    }
+
+    // ─── #402: usage / 响应顶层未建模字段保真 (extra 捕获回写) ────────────
+
+    /// #402: 非流式 — usage 内未建模子字段 (cache_creation TTL 分解 / server_tool_use /
+    /// service_tier / speed / output_tokens_details / inference_geo) 同协议
+    /// read→write round-trip 保真 (wire 级 Value 相等, 键序不敏感).
+    #[test]
+    fn response_round_trip_preserves_usage_extra_subfields() {
+        let usage = json!({
+            "input_tokens": 25,
+            "output_tokens": 110,
+            "cache_creation_input_tokens": 4096,
+            "cache_read_input_tokens": 1024,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 4096,
+                "ephemeral_1h_input_tokens": 0
+            },
+            "server_tool_use": {"web_search_20250305": {"requests": 1}},
+            "service_tier": "standard",
+            "speed": "default",
+            "output_tokens_details": {"reasoning_tokens": 64},
+            "inference_geo": "us-east-1"
+        });
+        let original = json!({
+            "id": "msg_01extra",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "ok"}],
+            "model": "claude",
+            "stop_reason": "end_turn",
+            "stop_sequence": Value::Null,
+            "usage": usage,
+        });
+        let ir = reader().read_response(&original).unwrap();
+        // 捕获断言: 六个未建模子字段全部进 extra, 已建模四元组保持 typed.
+        assert_eq!(
+            ir.usage.extra.get("service_tier"),
+            Some(&json!("standard")),
+            "unmodeled subfield must be captured into usage.extra"
+        );
+        assert!(ir.usage.extra.contains_key("cache_creation"));
+        assert!(ir.usage.extra.contains_key("server_tool_use"));
+        assert!(ir.usage.extra.contains_key("speed"));
+        assert!(ir.usage.extra.contains_key("output_tokens_details"));
+        assert!(ir.usage.extra.contains_key("inference_geo"));
+        assert_eq!(ir.usage.input_tokens, 25);
+        assert_eq!(ir.usage.cache_creation_input_tokens, Some(4096));
+        // wire 级 round-trip: writer 输出与原文 Value 相等 (键序不敏感).
+        let rewritten = writer().write_response(&ir);
+        assert_eq!(rewritten, original, "usage extra subfields must round-trip");
+        let ir2 = reader().read_response(&rewritten).unwrap();
+        assert_eq!(ir, ir2);
+    }
+
+    /// #402: 非流式 — 响应顶层未建模字段 (container 代码执行容器 / diagnostics /
+    /// stop_details 拒绝策略明细 / 未来新增 key) round-trip 保真; null 形态
+    /// (真实 wire 恒携带 `"container": null` 等) verbatim 捕获回写.
+    #[test]
+    fn response_round_trip_preserves_top_level_extra() {
+        let original = json!({
+            "id": "msg_01top",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "refusing"}],
+            "model": "claude",
+            "stop_reason": "refusal",
+            "stop_sequence": Value::Null,
+            "stop_details": {"type": "refusal", "category": "sales_inquiry"},
+            "container": null,
+            "diagnostics": {"trace_id": "diag_01"},
+            "x_future_field": {"nested": [1, 2]},
+            "usage": {"input_tokens": 1, "output_tokens": 2}
+        });
+        let ir = reader().read_response(&original).unwrap();
+        assert_eq!(
+            ir.extra.get("stop_details"),
+            Some(&json!({"type": "refusal", "category": "sales_inquiry"}))
+        );
+        assert_eq!(ir.extra.get("container"), Some(&Value::Null));
+        assert!(ir.extra.contains_key("diagnostics"));
+        assert!(ir.extra.contains_key("x_future_field"));
+        let rewritten = writer().write_response(&ir);
+        assert_eq!(rewritten, original, "top-level extra must round-trip");
+        let ir2 = reader().read_response(&rewritten).unwrap();
+        assert_eq!(ir, ir2);
+    }
+
+    /// #402: 流式 — message_start / message_delta 的 usage 经共用 read_usage /
+    /// write_usage, 未建模子字段随流式事件保真 (a→a redact restore 路径的
+    /// usage 保真面).
+    #[test]
+    fn stream_usage_extra_subfields_round_trip() {
+        // message_start: 携带 cache_creation 分解 + service_tier.
+        let start = json!({
+            "type": "message_start",
+            "message": {
+                "id": "msg_01s",
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": "claude",
+                "stop_reason": Value::Null,
+                "stop_sequence": Value::Null,
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 1,
+                    "cache_creation": {"ephemeral_5m_input_tokens": 512},
+                    "service_tier": "priority"
+                }
+            }
+        });
+        let mut dec = StreamDecodeState::default();
+        let events = reader().read_response_events("message_start", &start, &mut dec);
+        match &events[0] {
+            IrStreamEvent::MessageStart { usage, .. } => {
+                let u = usage.as_ref().expect("message_start carries usage");
+                assert_eq!(u.extra.get("service_tier"), Some(&json!("priority")));
+                assert!(u.extra.contains_key("cache_creation"));
+            }
+            other => panic!("expected MessageStart, got {other:?}"),
+        }
+        // writer 回写: usage 子字段回到 wire.
+        let mut enc = StreamEncodeState::default();
+        let frames = writer().write_response_event(&events[0], &mut enc);
+        let start_usage = frames
+            .iter()
+            .find(|(ty, _)| ty == "message_start")
+            .map(|(_, v)| v.get("message").unwrap().get("usage").cloned())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            start_usage,
+            json!({
+                "input_tokens": 10,
+                "output_tokens": 1,
+                "cache_creation": {"ephemeral_5m_input_tokens": 512},
+                "service_tier": "priority"
+            }),
+            "stream message_start usage extra must round-trip"
+        );
+
+        // message_delta: terminal usage 携带 inference_geo / output_tokens_details.
+        let delta = json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": Value::Null},
+            "usage": {
+                "output_tokens": 42,
+                "inference_geo": "eu-central-1",
+                "output_tokens_details": {"reasoning_tokens": 8}
+            }
+        });
+        let events = reader().read_response_events("message_delta", &delta, &mut dec);
+        match &events[0] {
+            IrStreamEvent::MessageDelta {
+                usage,
+                usage_present,
+                ..
+            } => {
+                assert!(usage_present);
+                assert_eq!(
+                    usage.extra.get("inference_geo"),
+                    Some(&json!("eu-central-1"))
+                );
+                assert!(usage.extra.contains_key("output_tokens_details"));
+            }
+            other => panic!("expected MessageDelta, got {other:?}"),
+        }
+        let frames = writer().write_response_event(&events[0], &mut enc);
+        let delta_usage = frames
+            .iter()
+            .find(|(ty, _)| ty == "message_delta")
+            .map(|(_, v)| v.get("usage").cloned())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            delta_usage,
+            json!({
+                "input_tokens": 0,
+                "output_tokens": 42,
+                "inference_geo": "eu-central-1",
+                "output_tokens_details": {"reasoning_tokens": 8}
+            }),
+            "stream message_delta usage extra must round-trip"
+        );
     }
 
     // ─── stream 1:1 mapping ────────────────────────────────────────────
@@ -2954,6 +3184,7 @@ mod tests {
             id: Some("msg_01o2a".into()),
             created: None,
             stop_sequence: None,
+            extra: Default::default(),
         };
         let v = writer().write_response(&ir);
         let blocks = v["content"].as_array().unwrap();

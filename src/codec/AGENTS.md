@@ -200,11 +200,15 @@ normalize(v) == normalize(Writer(Reader(v)))
 | `IrBlock::ToolResult.content_form: Option<ContentForm>` | ir.rs | tool_result 内 content 形态 (Anthropic 特有) |
 | `IrMessage.extra: Map` / `IrTool::Function.extra: Map` (命名空间按来源协议: anthropic/responses 条目级, chat function 子对象级 — `strict` 等; #321) / `IrTool::Raw { entry }` (整条目原文, #321) / 六个 wire 来源 `IrBlock` variant 的 `extra: Map` (T7 修复轮扩至 Reasoning/ReasoningContent — thinking block 的 `cache_control` 是扩展思考官方推荐断点) / `IrBlock::Raw { entry }` (content part/block 整条原文, #363) | ir.rs | 未建模字段逃生舱 (L4/L5, #269): 消息级 `output_config`、block 级/工具级 `cache_control`、`strict` 等原样保真; Raw = 无法建模的整个条目原文 (hosted/custom/畸形/未知 part) — 字符串叶子进 redact 扫描面; 跨协议经 `clear_wire_fidelity` 清空 (extra 清空 + 两类 Raw retain 丢弃 + WARN; 含 ToolResult.content 嵌套递归); block extra 参与 dag 内容寻址 hash; sg-thinking envelope 不携带 extra (打包点在 seam 后恒空, 解包侧由 reader 现收) |
 | `IrBlock::ToolResult.is_error: Option<bool>` | ir.rs | 显式形态保真 (#269): None = 字段缺席 (API 语义 false), Some = 显式 true/false 原样回写 |
+| `IrUsage.extra: Map` (#402) | ir.rs | usage 对象内**未建模子字段** (`cache_creation` TTL 分解对象 / `server_tool_use` / `service_tier` / `speed` / `output_tokens_details` / `inference_geo` / 未来新增): 仅 a reader 收集 / 仅 a writer 回写 (`write_usage` 非流式 + 流式 message_start/delta 共用), 字符串叶子进 redact restore 扫描面; 不参与 `is_zero` (token 语义); 跨协议经 `IrResponse::clear_wire_fidelity` 清空 |
+| `IrResponse.extra: Map` (#402) | ir.rs | 响应**顶层未建模字段** (`container` 代码执行容器 / `diagnostics` / `stop_details` 拒绝策略明细 / 未来新增, 含 null 形态 verbatim): 仅 a reader 收集 / 仅 a writer 回写, 叶子进 restore 扫描面; B1 派生链经 `ResponseData.resp_extra` → `derive::response_parsed_from_parts` 回填 (consistency 守卫比对必要字段); 流式无顶层 extra (SSE 事件模型无原文容器); 跨协议经 `IrResponse::clear_wire_fidelity` 清空 |
 
 **清空 SSOT**: `IrRequest::clear_wire_fidelity()` 集中清空所有 wire_fidelity 字段
 (含嵌套 ToolResult 与全部 extra, `clear_block_fidelity` 递归 + Raw block 丢弃,
 跨协议路径 (`proxy/cross_proto.rs::cross_proto_forward`) 调用之. 新增 wire_fidelity
-字段时只需改这一处.
+字段时只需改这一处. 响应对称点 = `IrResponse::clear_wire_fidelity()` (#402, 清
+`IrResponse.extra` + `IrUsage.extra`; 同一 cross_proto seam 在 record 按 LLM 视角
+捕获后调用).
 
 **当前覆盖与搁置**:
 
@@ -228,9 +232,13 @@ normalize(v) == normalize(Writer(Reader(v)))
   已知官方枚举全覆盖 (`IrStopReason` 显式变体 PauseTurn / ContextWindowExceeded,
   同协议 verbatim 回写 — 非流式 + 流式 message_delta; 跨协议投影与 Other 一致,
   不引入新跨协议语义) + 响应 content 纳入 thinking 族 block 轴 (T7 保真随 property
-  常驻守卫). 覆盖边界 = **已建模字段与已建模官方值** 的 round-trip; 未建模残余
-  (stop_reason 未来新增官方 token 被改写 / `null` 防御形态 / usage 子字段丢弃) 的
-  残余缺口登记在 `docs/known-limitations.md` codec 节独立条目
+  常驻守卫). #402 增补: usage 未建模子字段 (`IrUsage.extra`) 与响应顶层未建模字段
+  (`IrResponse.extra`) 纳入捕获回写 + 生成器守卫面 (响应侧清空 seam =
+  `IrResponse::clear_wire_fidelity`, 流式跨协议对称剥离在 StreamTranslate). 覆盖边界
+  = **已建模字段与已建模官方值 + extra 容器** 的 round-trip; 未建模残余
+  (stop_reason 未来新增官方 token 被改写 / `null` 防御形态 / 流式响应顶层 extra
+  不进 IR / 跨协议 extra 显式丢弃) 的残余缺口登记在 `docs/known-limitations.md`
+  codec 节独立条目
 
 搁置项对应的 proptest 生成器分支已用 `// NOTE` 标注, 实现后恢复即可.
 

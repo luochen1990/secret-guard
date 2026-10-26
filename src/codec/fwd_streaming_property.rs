@@ -1244,6 +1244,7 @@ fn arb_responses_sse_stream_with_mock()
                     model: Some(resp_model.to_string()),
                     id: Some(resp_id.to_string()),
                     created: Some(resp_created),
+                    extra: Default::default(),
                 };
 
                 let sse: String = frames.concat();

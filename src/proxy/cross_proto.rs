@@ -473,6 +473,11 @@ pub(crate) async fn cross_proto_forward(
                     warn_reasoning_loss_response(record_id, &ir_resp.content, ingress_codec);
                     // record 接线走 LLM 视角 (restore 之前, 含 mock) 的 finality.
                     resp_finality = super::recorder::RespFinality::from_ir(ingress_codec, &ir_resp);
+                    // #402: 响应侧跨协议 seam — 源协议特有的 usage 子字段与响应顶层
+                    // 字段对目标协议无语义对应, 翻译前清空 (record 已在上一行按
+                    // LLM 视角捕获原文; 同协议 redact 路径不经过本 seam, 保真不受
+                    // 影响). 纵深防御说明见 IrResponse::clear_wire_fidelity.
+                    ir_resp.clear_wire_fidelity();
                     // restore: mock → real (跨协议 + redact 时, 客户端看到的应该是真 secret).
                     crate::redact::restore_ir_response(&mut ir_resp, &redaction_map);
                     if ir.stream {

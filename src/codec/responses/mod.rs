@@ -252,6 +252,8 @@ impl Reader for ResponsesReader {
             model,
             id,
             created,
+            // #402: extra 是 a 协议 wire 形态容器, o/r reader 不收集 (typed-only).
+            extra: Default::default(),
         })
     }
 
@@ -811,6 +813,8 @@ fn read_usage(usage: &Value) -> IrUsage {
         output_tokens,
         cache_read_input_tokens: cached,
         cache_creation_input_tokens: None, // Responses 不区分 creation/read
+        // #402: extra 是 a 协议 wire 形态容器, o/r reader 不收集 (typed-only).
+        extra: Default::default(),
     }
 }
 
@@ -1746,6 +1750,7 @@ mod tests {
             output_tokens: 10,
             cache_read_input_tokens: Some(50),
             cache_creation_input_tokens: Some(30),
+            extra: Default::default(),
         };
         let v = responses_usage_json(&u);
         assert_eq!(
@@ -1771,6 +1776,7 @@ mod tests {
             output_tokens: 10,
             cache_read_input_tokens: Some(50),
             cache_creation_input_tokens: Some(30),
+            extra: Default::default(),
         };
         let openai = u.openai_usage_json();
         let responses = responses_usage_json(&u);
@@ -1986,6 +1992,7 @@ mod tests {
             id: Some("resp_01x".into()),
             created: None,
             stop_sequence: None,
+            extra: Default::default(),
         };
         let v = writer().write_response(&ir);
         assert_eq!(v.get("id").unwrap(), "resp_01x");
@@ -2024,6 +2031,7 @@ mod tests {
             id: None,
             created: None,
             stop_sequence: None,
+            extra: Default::default(),
         };
         let v = writer().write_response(&ir);
         let output = v.get("output").unwrap().as_array().unwrap();
@@ -2053,6 +2061,7 @@ mod tests {
             id: None,
             created: None,
             stop_sequence: None,
+            extra: Default::default(),
         };
         let v = writer().write_response(&ir);
         assert_eq!(v.get("status").unwrap(), "completed");
@@ -2072,6 +2081,7 @@ mod tests {
             id: None,
             created: None,
             stop_sequence: None,
+            extra: Default::default(),
         };
         let v = writer().write_response(&ir);
         let id = v.get("id").unwrap().as_str().unwrap();

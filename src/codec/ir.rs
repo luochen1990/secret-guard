@@ -739,6 +739,36 @@ pub struct IrResponse {
     pub id: Option<String>,
     /// Unix epoch seconds (OpenAI 携带; Anthropic 不带, OpenAI writer 合成).
     pub created: Option<u64>,
+    /// wire 形态元数据 (#402): 响应**顶层未建模字段** (`container` 代码执行容器 /
+    /// `diagnostics` / `stop_details` 拒绝策略明细 — 与已建模 `stop_reason` 冗余
+    /// 共存的独立字段 / 未来新增). 同协议 (含 redact) reader 收集 / writer 回写;
+    /// 跨协议在响应侧 seam 清空 ([`Self::clear_wire_fidelity`]).
+    ///
+    /// 归属判定同 [`IrUsage::extra`] (协议特有, 仅 a reader 收集 / 仅 a writer
+    /// 回写). 流式响应的顶层未知字段不进 IR (SSE 事件模型无原文容器 — 流式
+    /// 事件只携带已建模字段, known-limitations codec 节登记边界).
+    pub extra: serde_json::Map<String, Value>,
+}
+
+impl IrResponse {
+    /// 清空响应侧 wire 形态元数据 (#402) — 响应侧 SSOT 清空点, 与请求侧
+    /// [`IrRequest::clear_wire_fidelity`] 对称.
+    ///
+    /// 跨协议翻译前调用 (生产调用方 = `proxy/cross_proto.rs` 非流式路径):
+    /// 源协议特有的 usage 子字段与响应顶层字段对目标协议无语义对应,
+    /// 不得泄漏进 egress wire. 同协议 (含 redact) 路径**严禁**调用
+    /// (会静默丢 extra). 流式跨协议的对称清空在 `StreamTranslate`
+    /// 跨协议模式的事件处理处 (usage 经 IrStreamEvent 携带).
+    ///
+    /// 纵深防御说明: 当前仅 AnthropicReader 收集这两处 extra、仅
+    /// AnthropicWriter 回写, o/r writer 从 typed 字段构造 usage — 即使
+    /// 不调用本方法, foreign extra 也到不了 o/r wire. 显式清空是对未来
+    /// "o/r reader 也开始收集 usage extra" 演进的结构性防线 (彼时
+    /// a writer 会无条件回写 extra, 无此 seam 即泄漏).
+    pub fn clear_wire_fidelity(&mut self) {
+        self.extra.clear();
+        self.usage.extra.clear();
+    }
 }
 
 /// 协议无关的终止原因. typed enum (无 String payload), 防止 foreign token 跨协议泄漏.
@@ -791,6 +821,18 @@ pub struct IrUsage {
     pub output_tokens: u64,
     pub cache_creation_input_tokens: Option<u64>,
     pub cache_read_input_tokens: Option<u64>,
+    /// wire 形态元数据 (#402): usage 对象内**未建模子字段** (`cache_creation` TTL
+    /// 分解对象 / `server_tool_use` / `service_tier` / `speed` /
+    /// `output_tokens_details` / `inference_geo` / 未来新增 — 与已建模四元组
+    /// 互斥的 key, 已建模字段保持 typed 建模防双源冲突). 同协议 (含 redact)
+    /// reader 收集 / writer 回写 (非流式 + 流式共用 read_usage/write_usage);
+    /// 跨协议在响应侧 seam 清空 ([`IrResponse::clear_wire_fidelity`]).
+    ///
+    /// 归属判定 (ir-fields-roadmap §2.2): 仅 Anthropic wire 携带且目标协议无语义
+    /// 对应 → extra (协议特有); 当前仅 AnthropicReader 收集、仅 AnthropicWriter
+    /// 回写, o/r codec 的 usage writer (`openai_usage_json` /
+    /// `responses_usage_json`) 从 typed 字段构造, 结构上不可能写出 foreign extra.
+    pub extra: serde_json::Map<String, Value>,
 }
 
 impl IrUsage {
@@ -1375,6 +1417,7 @@ mod tests {
                 output_tokens: 0,
                 cache_creation_input_tokens: None,
                 cache_read_input_tokens: None,
+                extra: Default::default(),
             }
             .is_zero()
         );
@@ -1416,6 +1459,54 @@ mod tests {
         assert!(!u.is_zero());
     }
 
+    /// #402: extra 是 wire 形态元数据 (非 token 计数), 不参与 is_zero —
+    /// 携带纯元数据子字段 (如 service_tier) 的零 usage 仍是 is_zero
+    /// (StreamTranslate post-stop guard / openai writer 的零判定语义不变).
+    #[test]
+    fn ir_usage_is_zero_when_only_extra_present() {
+        let u = IrUsage {
+            extra: serde_json::Map::from_iter([("service_tier".to_string(), json!("standard"))]),
+            ..Default::default()
+        };
+        assert!(u.is_zero());
+    }
+
+    /// #402: clear_wire_fidelity 清空响应侧两处 wire 形态容器 (resp extra +
+    /// usage.extra), typed 字段不动 — 跨协议 seam 的单点行为锁定.
+    #[test]
+    fn ir_response_clear_wire_fidelity_clears_extras_only() {
+        let mut resp = IrResponse {
+            content: vec![IrBlock::Text {
+                text: "hi".into(),
+                extra: Default::default(),
+            }],
+            stop_reason: Some(IrStopReason::EndTurn),
+            stop_sequence: Some("\n\n".into()),
+            usage: IrUsage {
+                input_tokens: 3,
+                output_tokens: 4,
+                extra: serde_json::Map::from_iter([(
+                    "cache_creation".to_string(),
+                    json!({"ephemeral_5m_input_tokens": 512}),
+                )]),
+                ..Default::default()
+            },
+            usage_present: true,
+            model: Some("claude".into()),
+            id: Some("msg_1".into()),
+            created: None,
+            extra: serde_json::Map::from_iter([("container".to_string(), Value::Null)]),
+        };
+        resp.clear_wire_fidelity();
+        assert!(resp.extra.is_empty(), "top-level extra must be cleared");
+        assert!(resp.usage.extra.is_empty(), "usage extra must be cleared");
+        // typed 字段 / content / 元字段不动.
+        assert_eq!(resp.usage.input_tokens, 3);
+        assert_eq!(resp.usage.output_tokens, 4);
+        assert_eq!(resp.stop_sequence.as_deref(), Some("\n\n"));
+        assert_eq!(resp.content.len(), 1);
+    }
+
     // ─── IrUsage::openai_usage_json: cache 归类 (#284) ──────────────────
     //
     // B3b 回归: cache_read 经 prompt_tokens_details.cached_tokens 上 wire;
@@ -1428,6 +1519,7 @@ mod tests {
             output_tokens: 10,
             cache_read_input_tokens: Some(50),
             cache_creation_input_tokens: Some(30),
+            extra: Default::default(),
         };
         let v = u.openai_usage_json();
         assert_eq!(v.get("prompt_tokens"), Some(&json!(180)));

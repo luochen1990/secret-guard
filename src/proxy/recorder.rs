@@ -1222,6 +1222,9 @@ pub(super) struct RespFinality {
     pub stop_sequence: Option<String>,
     pub id: Option<String>,
     pub created: Option<u64>,
+    /// 响应顶层未建模字段 (#402): LLM 视角原样捕获, 经 attach_finality 进
+    /// `ResponseData.resp_extra` (tail 派生回填; 详见该字段 doc).
+    pub resp_extra: serde_json::Map<String, serde_json::Value>,
     /// 旧路径将写入的 stored parsed (writer 直接序列化同一 ir). 仅
     /// consistency-check 构建计算, 供 "先断言后删除" 守卫比对, 不落存储.
     #[cfg(feature = "consistency-check")]
@@ -1239,6 +1242,7 @@ impl RespFinality {
             stop_sequence: None,
             id: None,
             created: None,
+            resp_extra: Default::default(),
             #[cfg(feature = "consistency-check")]
             stored_parsed: None,
         }
@@ -1262,6 +1266,7 @@ impl RespFinality {
             stop_sequence: ir.stop_sequence.clone(),
             id: ir.id.clone(),
             created: ir.created,
+            resp_extra: ir.extra.clone(),
             // 旧路径将写入的 stored parsed (writer 直接序列化同一 ir). 仅
             // consistency-check 构建计算, 供 "先断言后删除" 守卫比对, 不落存储.
             #[cfg(feature = "consistency-check")]
@@ -1323,6 +1328,7 @@ pub(super) fn attach_finality(
         stop_sequence: finality.stop_sequence.clone(),
         id: finality.id.clone(),
         created: finality.created,
+        resp_extra: finality.resp_extra.clone(),
         usage: finality.echo.usage.clone(),
         model: finality.echo.model.clone(),
         leak_alerts,

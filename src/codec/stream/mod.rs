@@ -1381,6 +1381,7 @@ mod tests {
                         model: Some(model),
                         id: Some(id),
                         created: Some(created),
+                        extra: Default::default(),
                     };
 
                     let sse: String = frames.concat();

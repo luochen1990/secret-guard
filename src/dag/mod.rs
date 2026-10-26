@@ -2624,6 +2624,7 @@ mod tests {
             },
             usage_present: true,
             stop_sequence: None,
+            extra: Default::default(),
         };
         let msg_ref = dag.intern_message(&crate::codec::ir::IrMessage {
             role: IrRole::Assistant,
@@ -2660,6 +2661,91 @@ mod tests {
         assert_eq!(parsed, &expected);
         assert_eq!(tail.length, parsed.to_string().len());
         assert_eq!(tail.resp_status, 200);
+    }
+
+    /// #402: tail 派生的 B1 threading — usage.extra (随 IrUsage 整体存储) 与
+    /// resp_extra (ResponseData 新字段) 都进入派生 IrResponse, 派生结果与直接
+    /// writer 序列化同一 IrResponse 相等 (a 协议: extra 是 wire 真实形态).
+    #[test]
+    fn timeline_tail_derives_parsed_with_extras() {
+        // body 需是 a 协议 wire 形态 (content 为 block 数组), 否则
+        // assert_delta_view_matches_raw 的 blocks/raw 对照会因 reader 提升形态分歧而红.
+        let body = r#"{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}"#;
+        let dag = ConversationDag::new(8, 500, 1);
+        let mut ev = event_with_body("/a/test/v1/messages", body);
+        ev.ingress_protocol = Some(crate::codec::Protocol::Anthropic);
+        let a = dag.push_messages(vec![text_msg(IrRole::User, "hello")], ev);
+
+        let ir_resp = crate::codec::ir::IrResponse {
+            content: vec![IrBlock::Text {
+                text: "Hi".into(),
+                extra: serde_json::Map::new(),
+            }],
+            stop_reason: Some(crate::codec::ir::IrStopReason::EndTurn),
+            id: Some("msg_01extra".into()),
+            created: None,
+            model: Some("claude".into()),
+            usage: crate::codec::ir::IrUsage {
+                input_tokens: 25,
+                output_tokens: 110,
+                extra: serde_json::Map::from_iter([
+                    (
+                        "cache_creation".to_string(),
+                        serde_json::json!({"ephemeral_5m_input_tokens": 4096}),
+                    ),
+                    ("service_tier".to_string(), serde_json::json!("standard")),
+                ]),
+                ..Default::default()
+            },
+            usage_present: true,
+            stop_sequence: None,
+            extra: serde_json::Map::from_iter([(
+                "stop_details".to_string(),
+                serde_json::json!({"type": "refusal", "category": "spam"}),
+            )]),
+        };
+        let msg_ref = dag.intern_message(&crate::codec::ir::IrMessage {
+            role: IrRole::Assistant,
+            content: ir_resp.content.clone(),
+            ..Default::default()
+        });
+        dag.attach_response(
+            a,
+            ResponseData {
+                resp_status: 200,
+                raw_resp_body: String::new(),
+                resp_complete: true,
+                message: Some(msg_ref),
+                stop_reason: ir_resp.stop_reason,
+                id: ir_resp.id.clone(),
+                created: ir_resp.created,
+                model: ir_resp.model.clone(),
+                usage: Some(ir_resp.usage.clone()),
+                resp_extra: ir_resp.extra.clone(),
+                ..Default::default()
+            },
+        );
+
+        let sid = sid_of(&dag, a);
+        let page = dag.timeline_view(sid, None, 10).expect("page exists");
+        let parsed = page
+            .tail
+            .parsed
+            .as_ref()
+            .expect("tail parsed derived after finalize");
+        let expected = crate::codec::Protocol::Anthropic
+            .writer()
+            .write_response(&ir_resp);
+        assert_eq!(
+            parsed, &expected,
+            "extras must flow through tail derivation"
+        );
+        // spot check: 派生 wire 上两处 extra 均在场.
+        assert_eq!(
+            parsed.get("usage").and_then(|u| u.get("service_tier")),
+            Some(&serde_json::json!("standard"))
+        );
+        assert!(parsed.get("stop_details").is_some());
     }
 
     #[test]

@@ -1037,6 +1037,7 @@ mod tests {
             output_tokens: 6,
             cache_read_input_tokens: None,
             cache_creation_input_tokens: None,
+            extra: Default::default(),
         });
         assert_eq!(
             q,

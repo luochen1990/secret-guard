@@ -176,7 +176,8 @@
 `req_delta_messages` 从 BlockPool 派生 (B1, 与旧 raw 切片等价 — 渲染点 shadow `derive.rs::assert_delta_view_matches_raw`
 + 常驻 proptest `prop_blocks_derivation_matches_raw`)、
 `resp_parsed` finalize 后从 `response.message` + 元字段渲染派生 (B1, finalize 处先断言后删除
-`proxy/recorder.rs::assert_tail_parsed_matches_stored`; 流式进行中仍读 stored 节流 parsed)、
+`proxy/recorder.rs::assert_tail_parsed_matches_stored`; #402 起元字段含 `ResponseData.resp_extra`
+— 响应顶层未建模字段的 B1 存储, derive 回填进派生 IrResponse; 流式进行中仍读 stored 节流 parsed)、
 `resp_parsed` (流式) 从 StreamScan 累积 (`proxy/fan_out.rs`, Phase A 已删除原始 SSE 字节, 派生与源物理分离, 暂不守卫).
 (AuditCapture off 的请求 `req_body_raw` 未存储为空串, latest 档被会话更新请求取代的请求同态 — `assert_preview_model_match_source` / `assert_delta_view_matches_raw` 两个 shadow 对空 raw 一律跳过, 有 raw 的请求守卫行为不变; 语义契约 contracts.md CFG-7 / DTO-10.)
 后续 Phase B 删除 parent.response 时必须走此流程.

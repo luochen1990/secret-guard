@@ -121,6 +121,9 @@ impl StreamScan {
                     self.meta.usage.input_tokens = u.input_tokens;
                     self.meta.usage.cache_creation_input_tokens = u.cache_creation_input_tokens;
                     self.meta.usage.cache_read_input_tokens = u.cache_read_input_tokens;
+                    // #402: start 臂整体替换 extra (message_start 的 usage 是全量
+                    // 对象快照, 与 typed 字段无条件覆盖同型).
+                    self.meta.usage.extra = u.extra.clone();
                 }
                 self.meta.id = id.clone().or(self.meta.id.take());
                 self.meta.created = created.or(self.meta.created);
@@ -179,6 +182,12 @@ impl StreamScan {
                 if usage.cache_creation_input_tokens.is_some() {
                     self.meta.usage.cache_creation_input_tokens = usage.cache_creation_input_tokens;
                 }
+                // #402: delta 臂 extra 非空才替换 — 与 Option 字段 is_some 才替换
+                // 同型 (terminal delta 的 usage 全量回显时非空; 翻译源事件可能
+                // 不携带 extra, 空 map 不覆盖 start 臂已累积的值).
+                if !usage.extra.is_empty() {
+                    self.meta.usage.extra = usage.extra.clone();
+                }
             }
             IrStreamEvent::MessageStop => {
                 // 不应用 post-stop guard: StreamScan 需要收集 MessageStop 之后的
@@ -208,6 +217,9 @@ impl StreamScan {
             model: self.meta.model.clone(),
             id: self.meta.id.clone(),
             created: self.meta.created,
+            // SSE 事件模型无响应顶层原文容器, 流式扫描天然无顶层 extra (#402,
+            // known-limitations codec 节登记边界).
+            extra: Default::default(),
         }
     }
 }

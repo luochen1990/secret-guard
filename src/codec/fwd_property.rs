@@ -165,9 +165,14 @@ proptest! {
     /// 路线, 本 property 转正常驻. #388 增补两轴: ① stop_reason 官方枚举全覆盖
     /// (`pause_turn` / `model_context_window_exceeded` 显式变体 + verbatim 回写);
     /// ② 响应 content 的 thinking 族 block (T7 保真随本 property 常驻守卫).
-    /// 覆盖边界: 未建模残余 (stop_reason 未来新增官方 token 被改写 / `null` 防御
-    /// 形态 / usage 未建模子字段丢弃) 不在守卫面, 残余缺口登记 known-limitations
-    /// codec 节 "L8 残余面" 条目.
+    /// #402 增补两轴: ③ usage 未建模子字段 (`cache_creation` TTL 分解 /
+    /// `server_tool_use` / `service_tier` / `speed` / `output_tokens_details` /
+    /// `inference_geo` / 未来 key) 经 `IrUsage.extra` 捕获回写; ④ 响应顶层
+    /// 未建模字段 (`container` / `stop_details` / `diagnostics` / 未来 key,
+    /// 含 null 形态) 经 `IrResponse.extra` 捕获回写.
+    /// 覆盖边界: 未建模残余 (stop_reason 未来新增官方 token 被改写 / `null`
+    /// 防御形态) 不在守卫面, 残余缺口登记 known-limitations codec 节
+    /// "L8 残余面" 条目.
     #[test]
     fn anthropic_response_preserves_wire_semantics(v in arb_anthropic_response_value()) {
         let ir = AnthropicReader.read_response(&v).unwrap();
@@ -1717,7 +1722,9 @@ fn arb_anthropic_thinking_block() -> impl Strategy<Value = Value> {
 ///   `model_context_window_exceeded`); `null` 防御形态不生成 (writer 恒写
 ///   string, 见 known-limitations "L8 残余面" null 子项);
 /// - `content` 含 text / tool_use / thinking 族 block (#388 — 扩展思考响应的
-///   常规形态, T7 reader/writer 对称建模).
+///   常规形态, T7 reader/writer 对称建模);
+/// - #402: usage 未建模子字段 + 响应顶层未建模字段 (`container`/`stop_details`/
+///   `diagnostics`/未来 key) 进入守卫面 — reader 收集进 extra / writer 回写.
 fn arb_anthropic_response_value() -> impl Strategy<Value = Value> {
     (
         "msg_[a-z0-9]{5,15}",
@@ -1727,34 +1734,41 @@ fn arb_anthropic_response_value() -> impl Strategy<Value = Value> {
         // stop_sequence: None 生成 null (writer 对 None 写 Value::Null), Some 生成非空串.
         prop::option::of("[a-z0-9-]{1,10}"),
         arb_anthropic_usage(),
+        arb_anthropic_response_extra(),
     )
-        .prop_map(|(id, model, content, stop_reason, stop_sequence, usage)| {
-            json!({
-                "id": id,
-                "type": "message",
-                "role": "assistant",
-                "content": content,
-                "model": model,
-                "stop_reason": stop_reason,
-                "stop_sequence": stop_sequence,
-                "usage": usage,
-            })
-        })
+        .prop_map(
+            |(id, model, content, stop_reason, stop_sequence, usage, extra)| {
+                let mut v = json!({
+                    "id": id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": content,
+                    "model": model,
+                    "stop_reason": stop_reason,
+                    "stop_sequence": stop_sequence,
+                    "usage": usage,
+                });
+                v.as_object_mut().expect("literal is object").extend(extra);
+                v
+            },
+        )
 }
 
 /// L8: Anthropic `usage` 对象 (嵌套形态). cache 两维度与 [`arb_openai_usage`]
 /// 同型的 presence 保真轴 (#284 review 裁决): 缺席 / 显式 0 / n>0 三形态 —
 /// writer 对 `Some(0)` 写回显式 0 值 (而非坍缩为缺席) 的行为由 round-trip
 /// 断言覆盖. input/output 恒写 (reader `unwrap_or(0)` / writer 恒写对称).
+/// #402: 未建模子字段经 [`arb_anthropic_usage_extra`] 轴进入守卫面.
 fn arb_anthropic_usage() -> impl Strategy<Value = Value> {
     (
         0u32..1_000_000,
         0u32..1_000_000,
         prop::option::of(prop_oneof![Just(0u32), 1u32..1_000_000]),
         prop::option::of(prop_oneof![Just(0u32), 1u32..1_000_000]),
+        arb_anthropic_usage_extra(),
     )
         .prop_map(
-            |(input_tokens, output_tokens, cache_creation, cache_read)| {
+            |(input_tokens, output_tokens, cache_creation, cache_read, extra)| {
                 let mut usage = serde_json::Map::new();
                 usage.insert("input_tokens".to_string(), json!(input_tokens));
                 usage.insert("output_tokens".to_string(), json!(output_tokens));
@@ -1764,9 +1778,113 @@ fn arb_anthropic_usage() -> impl Strategy<Value = Value> {
                 if let Some(c) = cache_read {
                     usage.insert("cache_read_input_tokens".to_string(), json!(c));
                 }
+                usage.extend(extra);
                 Value::Object(usage)
             },
         )
+}
+
+/// #402: usage 未建模子字段生成器 — 真实 wire 形态 (cache_creation TTL 分解 /
+/// server_tool_use / service_tier / speed / output_tokens_details / inference_geo)
+/// 以及任意未来 key (`x_future_usage_field`, 复用 [`arb_nested_json_value`]).
+/// 各字段独立 optional (缺席 / null-able 形态按真实 wire: 子字段缺席常见);
+/// key 全部固定命名, 结构性防与已建模四元组碰撞 (碰撞 = reader typed 收集 /
+/// writer extra 回写双源冲突). reader 收集进 `IrUsage.extra` / writer
+/// `merge_extra_into` 回写, round-trip 保真由
+/// `anthropic_response_preserves_wire_semantics` 常驻守卫.
+fn arb_anthropic_usage_extra() -> impl Strategy<Value = serde_json::Map<String, Value>> {
+    (
+        prop::option::of((0u32..1_000_000, 0u32..1_000_000)),
+        prop::option::of(0u32..5),
+        prop::option::of(prop_oneof![
+            Just(json!("standard")),
+            Just(json!("priority")),
+            Just(json!("batch")),
+        ]),
+        prop::option::of(prop_oneof![Just(json!("default")), Just(json!("flex")),]),
+        prop::option::of(0u32..64),
+        prop::option::of("[a-z0-9-]{4,12}"),
+        prop::option::of(arb_nested_json_value()),
+    )
+        .prop_map(
+            |(
+                cache_creation,
+                web_search,
+                service_tier,
+                speed,
+                reasoning_tokens,
+                inference_geo,
+                future,
+            )| {
+                let mut m = serde_json::Map::new();
+                if let Some((e5m, e1h)) = cache_creation {
+                    m.insert(
+                        "cache_creation".to_string(),
+                        json!({"ephemeral_5m_input_tokens": e5m, "ephemeral_1h_input_tokens": e1h}),
+                    );
+                }
+                if let Some(n) = web_search {
+                    m.insert(
+                        "server_tool_use".to_string(),
+                        json!({"web_search_20250305": {"requests": n}}),
+                    );
+                }
+                if let Some(t) = service_tier {
+                    m.insert("service_tier".to_string(), t);
+                }
+                if let Some(s) = speed {
+                    m.insert("speed".to_string(), s);
+                }
+                if let Some(rt) = reasoning_tokens {
+                    m.insert(
+                        "output_tokens_details".to_string(),
+                        json!({"reasoning_tokens": rt}),
+                    );
+                }
+                if let Some(g) = inference_geo {
+                    m.insert("inference_geo".to_string(), json!(g));
+                }
+                if let Some(v) = future {
+                    m.insert("x_future_usage_field".to_string(), v);
+                }
+                m
+            },
+        )
+}
+
+/// #402: 响应顶层未建模字段生成器 — 真实 wire 形态 (`container` 代码执行容器
+/// (真实 wire 恒携带 null 形态) / `stop_details` 拒绝策略明细 (与 stop_reason
+/// 冗余共存) / `diagnostics`) + 任意未来 key. null / 对象两形态按真实 wire
+/// 混合生成; key 固定命名防与已建模顶层字段碰撞.
+fn arb_anthropic_response_extra() -> impl Strategy<Value = serde_json::Map<String, Value>> {
+    (
+        prop::option::of(prop_oneof![
+            Just(Value::Null),
+            "cont_[a-z0-9]{4,10}".prop_map(|id| json!({"id": id})),
+        ]),
+        prop::option::of(prop_oneof![
+            Just(Value::Null),
+            "[a-z_]{3,15}".prop_map(|category| json!({"type": "refusal", "category": category})),
+        ]),
+        prop::option::of("[a-z0-9_]{3,12}".prop_map(|trace| json!({"trace_id": trace}))),
+        prop::option::of(arb_nested_json_value()),
+    )
+        .prop_map(|(container, stop_details, diagnostics, future)| {
+            let mut m = serde_json::Map::new();
+            if let Some(c) = container {
+                m.insert("container".to_string(), c);
+            }
+            if let Some(s) = stop_details {
+                m.insert("stop_details".to_string(), s);
+            }
+            if let Some(d) = diagnostics {
+                m.insert("diagnostics".to_string(), d);
+            }
+            if let Some(f) = future {
+                m.insert("x_future_resp_field".to_string(), f);
+            }
+            m
+        })
 }
 
 fn arb_anthropic_response_block() -> impl Strategy<Value = Value> {

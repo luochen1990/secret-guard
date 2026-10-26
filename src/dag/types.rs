@@ -289,6 +289,11 @@ pub struct ResponseData {
     pub id: Option<String>,
     pub created: Option<u64>,
     pub model: Option<String>,
+    /// 响应顶层未建模字段 (#402, `IrResponse.extra` 的 B1 存储投影): LLM 视角
+    /// 原样捕获, `derive::response_parsed_from_parts` 回填进派生 IrResponse —
+    /// consistency 守卫 (VIEW-2) 比对 stored/derived 的必要字段. 流式路径恒空
+    /// (SSE 事件无顶层原文容器).
+    pub resp_extra: serde_json::Map<String, serde_json::Value>,
     /// 原始上游 response wire bytes (审计/调试).
     pub raw_resp_body: String,
     pub streamed: bool,
