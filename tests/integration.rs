@@ -7826,6 +7826,294 @@ async fn prop_placeholder_and_redact_mixed_stream_roundtrip() {
     mock.assert();
 }
 
+// ─── per-secret strategy = "monitor" 端到端 (#410, RED-9) ──────────────────
+//
+// 与 reject (整请求 503) / placeholder (替换 + 蜜罐) 相对的第三态: 放行 + 审计 —
+// 真值命中请求 → IR 零改写转发 (上游见真值原样), 命中统计进 usage redacts 审计
+// 通道 (mock 字段为放行标记 "(passthrough)", 无替换值); 响应侧无 restore 交互
+// (上游 echo 真值 → 客户端原样收到 — has_restorable 只看替换映射).
+
+/// 构造 monitor 策略 secret entry (集成测试用, 与 `placeholder_secret` 同型).
+fn monitor_secret(id: &str, value: &str) -> SecretEntry {
+    let mut e = secret(id, value);
+    e.strategy = secret_guard::secrets::SecretStrategy::Monitor;
+    e
+}
+
+#[tokio::test]
+async fn monitor_strategy_upstream_sees_real_value_and_audits() {
+    let real_secret = "monitor-passthrough-secret-value-E2E";
+    let mut upstream = spawn_mock_upstream().await;
+    // 上游 echo 真值 (放行语义下 LLM 确实见过真值, 回显是常态) — 客户端应原样
+    // 收到 (无替换无还原).
+    let upstream_body = format!(
+        r#"{{"id":"chatcmpl-mon","object":"chat.completion","created":1700000000,"model":"gpt-4o","choices":[{{"index":0,"message":{{"role":"assistant","content":"echo {real_secret} back"}},"finish_reason":"stop"}}]}}"#
+    );
+    // Regex matcher 命中才算此 mock 生效: 上游收到的 body 必须含真值原样
+    // (若实现误把 monitor 当替换/拒绝处理, matcher 不命中 → 上游 404 → 测试红).
+    let mock = upstream
+        .mock("POST", "/v1/chat/completions")
+        .match_body(mockito::Matcher::Regex(real_secret.to_string()))
+        .expect(1)
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(upstream_body)
+        .create_async()
+        .await;
+
+    let secrets = test_secret_table_with(vec![monitor_secret("mon-key", real_secret)]);
+    let records = ConversationDag::new(64, 500, 1);
+    let records_handle = records.clone();
+    let proxy_url = spawn_proxy_full(
+        vec![openai_provider("oa-main", &upstream.url())],
+        reqwest::Client::new(),
+        records,
+        secrets,
+    )
+    .await;
+
+    let (status, text, _headers) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        &format!(
+            r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"use {real_secret} now"}}]}}"#
+        ),
+        &[("content-type", "application/json")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "monitor round must forward (passthrough semantics): {text}"
+    );
+    // 放行语义: 客户端响应含上游 echo 的真值 (字节透传, 无 restore 交互).
+    assert!(
+        text.contains(real_secret),
+        "client must see the real value echoed back: {text}"
+    );
+    mock.assert();
+
+    // record (req_body == 出站字节, same_proto 步骤 5 单一来源): 上游 bound body
+    // 含真值原样, 不含 "(passthrough)" 字样 (monitor 不是替换 — 该字样只允许
+    // 出现在 usage 审计的 mock 标记字段); redactions 替换投影为空.
+    let list = wait_until_or_timeout(
+        &records_handle,
+        |l| l.first().map(|r| r.resp_complete).unwrap_or(false),
+        Duration::from_secs(2),
+    )
+    .await;
+    let rec = &list[0];
+    assert!(
+        rec.req_body.contains(real_secret),
+        "upstream-bound body must carry the real value verbatim: {}",
+        rec.req_body
+    );
+    assert!(
+        !rec.req_body.contains("(passthrough)"),
+        "monitor is not a replacement — no passthrough marker on the wire: {}",
+        rec.req_body
+    );
+    assert!(
+        rec.redactions.is_empty(),
+        "monitor must not produce replacement pairs: {:?}",
+        rec.redactions
+    );
+
+    // usage 审计 (USAGE-7): GET /api/usage/summary 的 redactions 视图 — by_secret
+    // 行 mock == "(passthrough)" + hits/categories 计数; recent 明细同口径.
+    // (harness usage store 是 in_memory 同步直写 — 请求返回后立即可查.)
+    let (status, text, _headers) =
+        proxy_request(&proxy_url, "GET", "/api/usage/summary", "", &[]).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "usage summary query failed: {text}"
+    );
+    let summary: serde_json::Value =
+        serde_json::from_str(&text).expect("usage summary must be JSON");
+    let by_secret = summary["redactions"]["by_secret"]
+        .as_array()
+        .expect("by_secret array");
+    let row = by_secret
+        .iter()
+        .find(|r| r["secret_id"].as_str() == Some("mon-key"))
+        .unwrap_or_else(|| panic!("monitor row missing in by_secret: {by_secret:?}"));
+    assert_eq!(
+        row["mock"].as_str(),
+        Some("(passthrough)"),
+        "monitor audit row must carry the passthrough marker: {row}"
+    );
+    assert_eq!(row["hits"].as_u64(), Some(1), "one hit in this round");
+    assert_eq!(
+        row["categories"].get("user").and_then(|v| v.as_u64()),
+        Some(1),
+        "user-message hit categorized: {row}"
+    );
+    let recent = summary["redactions"]["recent"]
+        .as_array()
+        .expect("recent array");
+    let ev = recent
+        .iter()
+        .find(|r| r["secret_id"].as_str() == Some("mon-key"))
+        .unwrap_or_else(|| panic!("monitor event missing in recent: {recent:?}"));
+    assert_eq!(
+        ev["mock"].as_str(),
+        Some("(passthrough)"),
+        "recent event must carry the passthrough marker: {ev}"
+    );
+    assert_eq!(ev["category"].as_str(), Some("user"));
+    assert_eq!(ev["count"].as_u64(), Some(1));
+    assert_eq!(ev["provider"].as_str(), Some("oa-main"));
+}
+
+// ─── category=email 拟真 mock 端到端 (#410, RED-5) ──────────────────────────
+//
+// Email 类别 + 白名单域真值: 请求侧 mock 为拟真地址 (name-like local +
+// @白名单域, 等长不变量, real 域 ∈ EMAIL_DOMAINS 时域保留); 响应侧 restore
+// 照常 (redact 策略默认) — RED-6 round-trip 端到端.
+
+/// 构造 email 类别 secret entry: 与 `secret` helper 的差异仅 category 在 resolve
+/// **前**设置 (helper 共享不动语义; `resolve_against` 有 `gen_spec.is_none()`
+/// 幂等 gate — 复用 helper 产物再 resolve 是 no-op, 故本地从头构造).
+fn email_secret(id: &str, value: &str) -> SecretEntry {
+    let mut e = SecretEntry {
+        id: id.into(),
+        name: Some(id.into()),
+        category: SecretCategory::Email,
+        value: value.into(),
+        value_file: None,
+        mock_strategy: secret_guard::mock::MockStrategy::default(),
+        strategy: secret_guard::secrets::SecretStrategy::default(),
+    };
+    e.mock_strategy.resolve_against(&e.value, e.category, "");
+    e
+}
+
+#[tokio::test]
+async fn email_category_mock_is_realistic_upstream() {
+    let real_email = "zhangwei@qq.com";
+    // 单 secret 表 → predict_mock 与生产 init_seed 同源 (helper 头注释), 上游
+    // echo fixture 可预知 mock.
+    let expected_mock = predict_mock(real_email);
+    let mut upstream = spawn_mock_upstream().await;
+    // 上游 echo mock → 客户端应收到真值 (restore round-trip, RED-6).
+    let upstream_body = format!(
+        r#"{{"id":"chatcmpl-em","object":"chat.completion","created":1700000000,"model":"gpt-4o","choices":[{{"index":0,"message":{{"role":"assistant","content":"echo {expected_mock} back"}},"finish_reason":"stop"}}]}}"#
+    );
+    // Regex (转义 '.') 命中才算此 mock 生效: 上游收到的 body 必须含 mock email
+    // 而非真值 (若 redact 失效真值直通, matcher 不命中 → 上游 404 → 测试红).
+    let mock = upstream
+        .mock("POST", "/v1/chat/completions")
+        .match_body(mockito::Matcher::Regex(expected_mock.replace('.', r"\.")))
+        .expect(1)
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(upstream_body)
+        .create_async()
+        .await;
+
+    let secrets = test_secret_table_with(vec![email_secret("contact-email", real_email)]);
+    let records = ConversationDag::new(64, 500, 1);
+    let records_handle = records.clone();
+    let proxy_url = spawn_proxy_full(
+        vec![openai_provider("oa-main", &upstream.url())],
+        reqwest::Client::new(),
+        records,
+        secrets,
+    )
+    .await;
+
+    let (status, text, _headers) = proxy_request(
+        &proxy_url,
+        "POST",
+        "/o/oa-main/v1/chat/completions",
+        &format!(
+            r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"reach me at {real_email} anytime"}}]}}"#
+        ),
+        &[("content-type", "application/json")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "email redact round must forward: {text}"
+    );
+    // RED-6 端到端: 上游 echo mock → 客户端收到真值 (restore 生效), mock 不外泄.
+    assert!(
+        text.contains(real_email),
+        "client must see the real email restored: {text}"
+    );
+    assert!(
+        !text.contains(&expected_mock),
+        "mock email must not escape to the client: {text}"
+    );
+    mock.assert();
+
+    // 上游 bound body 的拟真结构断言 (req_body == 出站字节): 提取 '@' 所在 token
+    // (请求构造保证 content 内唯一 '@' token 即 mock email).
+    let list = wait_until_or_timeout(
+        &records_handle,
+        |l| l.first().map(|r| r.resp_complete).unwrap_or(false),
+        Duration::from_secs(2),
+    )
+    .await;
+    let rec = &list[0];
+    let upstream_json: serde_json::Value =
+        serde_json::from_str(&rec.req_body).expect("upstream-bound body must be JSON");
+    let content = upstream_json["messages"][0]["content"]
+        .as_str()
+        .expect("messages[0].content string");
+    assert!(
+        !content.contains(real_email),
+        "real email must not reach the upstream: {content}"
+    );
+    let mock_email = content
+        .split_whitespace()
+        .find(|t| t.contains('@'))
+        .unwrap_or_else(|| panic!("mock email token missing: {content}"));
+    let (local, domain) = mock_email
+        .split_once('@')
+        .unwrap_or_else(|| panic!("mock email must contain '@': {mock_email}"));
+    assert_eq!(
+        domain, "qq.com",
+        "whitelisted real domain must be reused: {mock_email}"
+    );
+    assert_eq!(
+        mock_email.matches('@').count(),
+        1,
+        "exactly one '@': {mock_email}"
+    );
+    // 等长不变量: mock 总长 == real 总长; local 段等长 (name-like pad 语义).
+    assert_eq!(
+        mock_email.chars().count(),
+        real_email.chars().count(),
+        "equal-length invariant: {mock_email}"
+    );
+    assert_eq!(
+        local.chars().count(),
+        "zhangwei".chars().count(),
+        "local part length: {mock_email}"
+    );
+    // name-like local: 以字母开头 (FIRST_NAMES 池全小写字母), 字符面 ⊆
+    // [a-z0-9.] (名字池 + sep '.' + digit pad).
+    assert!(
+        local.starts_with(|c: char| c.is_ascii_alphabetic()),
+        "local must start with a letter (name pool): {mock_email}"
+    );
+    assert!(
+        local
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.'),
+        "local charset must be name-like [a-z0-9.]: {mock_email}"
+    );
+    // 预测一致性 (C3 确定性的端到端锚): 实际出站 mock == predict_mock 预测.
+    assert_eq!(
+        mock_email, expected_mock,
+        "actual upstream-bound mock must equal the predicted mock"
+    );
+}
+
 #[tokio::test]
 async fn restore_inserts_secret_back_for_client() {
     // IR-based redact round-trip: 请求里 secret → mock → LLM, 响应里 mock → secret → client.
