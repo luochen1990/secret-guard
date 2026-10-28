@@ -1018,6 +1018,19 @@ impl GenSpec {
                          ({min}, {max}); local length = min - {domain_len} - 1"
                     ));
                 }
+                // RED-1 charset 合规的结构保证 (镜像 infer 路径的强制, phone
+                // digits-only 同型): Email 的 local 段由名字池 (小写) + sep '.'
+                // + digit pad 生成 — 不从 charset 采样, charset 必须覆盖产出面,
+                // 手动配置经此拦截 (否则 mock 字符越出声明 charset).
+                if !(self.charset.lowercase
+                    && self.charset.digits
+                    && self.charset.other.contains(&'.'))
+                {
+                    return Err("shape.email charset must cover the name-like output face: \
+                         lowercase + digits + '.' separator in other (mock chars ⊆ \
+                         charset, RED-1)"
+                        .into());
+                }
             }
             SecretShape::Phone { skeleton } => {
                 let skeleton_len = skeleton.chars().count();
@@ -1063,7 +1076,23 @@ impl GenSpec {
             }
             // Username 无结构字段 (prefix 空已由上方通用规则强制); length_range
             // 区间允许非单点 (生成器按区间 hash 选 target, 同 Plain 的 body 长度选择).
-            SecretShape::Username => {}
+            // charset 强制 (RED-1, 同 Email): 产出面 = 名字池 (小写) +
+            // USERNAME_SEPS ('_'/'.'/'-') + digit pad; '_'/'-' 可经 flag 或 other 覆盖.
+            SecretShape::Username => {
+                if !(self.charset.lowercase
+                    && self.charset.digits
+                    && self.charset.other.contains(&'.')
+                    && (self.charset.underscore || self.charset.other.contains(&'_'))
+                    && (self.charset.hyphen || self.charset.other.contains(&'-')))
+                {
+                    return Err(
+                        "shape.username charset must cover the name-like output face: \
+                         lowercase + digits + '_'/'.'/'-' separators (mock chars ⊆ \
+                         charset, RED-1)"
+                            .into(),
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -3048,27 +3077,53 @@ mod tests {
 
     #[test]
     fn validate_email_domain_must_be_whitelisted_and_single_point() {
-        // 合法: 白名单域 + 单点长度 (local = 14 - 1 - 10 = 3 ≥ 1).
-        let mk = |domain: &str, len: (usize, usize)| {
-            shape_spec(
-                SecretShape::Email {
-                    domain: domain.into(),
-                },
-                len,
-            )
+        // 合法: 白名单域 + 单点长度 (local = 14 - 1 - 10 = 3 ≥ 1). charset 需
+        // 显式覆盖 name-like 产出面 (lowercase + digits + '.'), shape_spec 默认
+        // other 为空 — 单独构造 (phone digits-only 同型的形状 charset 约束).
+        let mk = |domain: &str, len: (usize, usize), charset: Charset| GenSpec {
+            prefix: String::new(),
+            charset,
+            length_range: len,
+            shape: SecretShape::Email {
+                domain: domain.into(),
+            },
         };
-        assert!(mk("gmail.com", (14, 14)).validate().is_ok());
+        let name_face = Charset {
+            lowercase: true,
+            digits: true,
+            other: vec!['.'],
+            ..Default::default()
+        };
+        assert!(
+            mk("gmail.com", (14, 14), name_face.clone())
+                .validate()
+                .is_ok()
+        );
         // 私有域 (携带部署特例内容) → 拒绝 (C5 豁免前提的结构保证).
-        let err = mk("corp.example.internal", (34, 34))
+        let err = mk("corp.example.internal", (34, 34), name_face.clone())
             .validate()
             .unwrap_err();
         assert!(err.contains("whitelist"), "{err}");
         // 非单点区间 → 拒绝.
-        let err = mk("gmail.com", (14, 15)).validate().unwrap_err();
+        let err = mk("gmail.com", (14, 15), name_face.clone())
+            .validate()
+            .unwrap_err();
         assert!(err.contains("single-point"), "{err}");
         // local 为空 (min < domain_len + 2) → 拒绝.
-        let err = mk("protonmail.com", (14, 14)).validate().unwrap_err();
+        let err = mk("protonmail.com", (14, 14), name_face)
+            .validate()
+            .unwrap_err();
         assert!(err.contains("non-empty local"), "{err}");
+        // charset 未覆盖产出面 (digits-only — mock local 含名字池字母与 '.') →
+        // 拒绝 (RED-1: 生成不从 charset 采样, 声明面必须覆盖产出面).
+        let digits_only = Charset {
+            digits: true,
+            ..Default::default()
+        };
+        let err = mk("gmail.com", (14, 14), digits_only)
+            .validate()
+            .unwrap_err();
+        assert!(err.contains("output face"), "{err}");
     }
 
     #[test]
@@ -3127,17 +3182,41 @@ mod tests {
 
     #[test]
     fn validate_username_accepts_range_lengths() {
-        // Username 无结构字段: 区间允许非单点 (生成器按区间 hash 选 target).
-        assert!(
-            shape_spec(SecretShape::Username, (8, 16))
-                .validate()
-                .is_ok()
-        );
-        assert!(
-            shape_spec(SecretShape::Username, (10, 10))
-                .validate()
-                .is_ok()
-        );
+        // Username 无结构字段: 区间允许非单点 (生成器按区间 hash 选 target);
+        // charset 需显式覆盖 name-like 产出面 (shape_spec 默认 other 为空 —
+        // 单独构造; '_'/'-' 经 other, flag 变体见下).
+        let name_face = Charset {
+            lowercase: true,
+            digits: true,
+            other: vec!['_', '.', '-'],
+            ..Default::default()
+        };
+        let mk = |len: (usize, usize), charset: Charset| GenSpec {
+            prefix: String::new(),
+            charset,
+            length_range: len,
+            shape: SecretShape::Username,
+        };
+        assert!(mk((8, 16), name_face.clone()).validate().is_ok());
+        assert!(mk((10, 10), name_face).validate().is_ok());
+        // sep 经 flag 覆盖 ('_'/'-' flag + '.' other) 同样合法 (charset 展开等价).
+        let via_flags = Charset {
+            lowercase: true,
+            digits: true,
+            underscore: true,
+            hyphen: true,
+            other: vec!['.'],
+            ..Default::default()
+        };
+        assert!(mk((8, 16), via_flags).validate().is_ok());
+        // charset 未覆盖产出面 (digits-only — mock 含名字池字母与 seps) →
+        // 拒绝 (RED-1, 同 Email).
+        let digits_only = Charset {
+            digits: true,
+            ..Default::default()
+        };
+        let err = mk((8, 16), digits_only).validate().unwrap_err();
+        assert!(err.contains("output face"), "{err}");
     }
 
     #[test]
@@ -3465,17 +3544,22 @@ mod tests {
             name in "[a-z]{2,12}",
             phone in "[0-9]{1,16}",
             kind in 0usize..7,
+            email_wl in any::<bool>(),
         ) {
             let cat = SecretCategory::ALL[category].0;
             // kind 定向构造七类形态: 0 PEM / 1 JWT / 2 公开前缀 / 3 普通串 /
             // 4 email / 5 phone / 6 username. 短样本 (name/phone 过短) 空间不足
             // 时退化 Plain — 等长断言仍成立 (gate 语义由
-            // shape_infer_space_fallbacks_to_plain 专项钉住).
+            // shape_infer_space_fallbacks_to_plain 专项钉住). email 域双路:
+            // 白名单域 (复用) / 非白名单 corp 域 (infer_email 域交换 — fitting
+            // 挑选白名单域, local_len = total - 1 - domain_len 等长算术路径,
+            // 生成器覆盖度纪律 #0.3: 交换分支不能只有单发样本).
+            let email_domain = if email_wl { "gmail.com" } else { "corp.example.io" };
             let real = match kind {
                 0 => format!("-----BEGIN X-----\n{body}\n-----END X-----"),
                 1 => format!("{body}.{body}.{body}"),
                 2 => format!("sk-{body}"),
-                4 => format!("{name}.{name}@gmail.com"),
+                4 => format!("{name}.{name}@{email_domain}"),
                 5 => format!("+86 {phone}"),
                 6 => name.clone(),
                 _ => body.clone(),
@@ -3520,6 +3604,7 @@ mod tests {
             other in "[@#$%€]{0,3}",
             seed in any::<u64>(),
             counter in 0u32..4,
+            email_wl in any::<bool>(),
         ) {
             let cat = match kind {
                 0 => SecretCategory::PrivateKey,
@@ -3532,11 +3617,14 @@ mod tests {
             };
             // name ≥ 7 / phone ≥ 5 (总 digit ≥ 7) 保证 email/phone/username 三形态
             // 的 shape 推断稳定命中 (空间达标), 专测形状分支的 charset 合规.
+            // email 域双路 (白名单复用 / corp 非白名单 → 域交换, 同
+            // prop_category_shape_mock_equal_length 的覆盖度考量).
+            let email_domain = if email_wl { "gmail.com" } else { "corp.example.io" };
             let real = match kind {
                 0 => format!("-----BEGIN X-----\n{body}\n-----END X-----"),
                 1 => format!("{body}.{body}.{body}"),
                 2 => format!("sk-{body}"),
-                4 => format!("{name}.{name}@gmail.com"),
+                4 => format!("{name}.{name}@{email_domain}"),
                 5 => format!("+86 {phone}"),
                 6 => name.clone(),
                 _ => body.clone(),
