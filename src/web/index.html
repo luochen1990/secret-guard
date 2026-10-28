@@ -500,18 +500,29 @@
     .pill.cookie { background: var(--info-soft); color: var(--info); }
     .pill.privatekey { background: var(--err-soft); color: var(--err); font-weight: 700; }
     .pill.other { background: var(--panel-hi); color: var(--fg-muted); }
+    /* 新类别 (#410): email = info / phone = ok / username = 中性 panel-hi —
+       与既有类别错开 (同色系复用 cookie/token/other 的底, 列内文本可区分). */
+    .pill.email { background: var(--info-soft); color: var(--info); }
+    .pill.phone { background: var(--ok-soft); color: var(--ok); }
+    .pill.username { background: var(--panel-hi); color: var(--fg-muted); }
     /* strategy 徽标 (#305 批1): reject = 拒绝语义 (err 柔底); redact 用默认 pill
        (accent); placeholder = 明示假值语义 (info 柔底, 中性 — 区别 reject 的 err 底,
-       #305 批2). class 名与 category 值域无交集, 共用 .pill 命名空间安全. */
+       #305 批2). class 名与 category 值域无交集, 共用 .pill 命名空间安全.
+       monitor (#410) = 放行观察语义 — 真值原样过境不脱敏, warn 柔底提示. */
     .pill.reject { background: var(--err-soft); color: var(--err); }
     .pill.placeholder { background: var(--info-soft); color: var(--info); }
+    .pill.monitor { background: var(--warn-soft); color: var(--warn); }
     /* mock 形状徽标 (SecretShape, category-aware 推断结果): mock 列内联于
        auto/fixed pill 之后, 非 plain 时显示. class 用 shape- 前缀避免与 category
        值域撞名. pem 结构仿真 (err 柔底强调多行私钥) / jwt 三段 (ok) /
-       prefixed 公开前缀保留 (info). */
+       prefixed 公开前缀保留 (info) / email (info) / phone (ok) / username
+       (中性 panel-hi, #410). */
     .pill.shape-pem { background: var(--err-soft); color: var(--err); font-weight: 700; }
     .pill.shape-jwt { background: var(--ok-soft); color: var(--ok); }
     .pill.shape-prefixed { background: var(--info-soft); color: var(--info); }
+    .pill.shape-email { background: var(--info-soft); color: var(--info); }
+    .pill.shape-phone { background: var(--ok-soft); color: var(--ok); }
+    .pill.shape-username { background: var(--panel-hi); color: var(--fg-muted); }
 
     /* source badge — 区分 static / dynamic / override / preferred (软底同风格). */
     .src-badge {
@@ -2304,11 +2315,13 @@
       <textarea id="f-value" placeholder="the real secret" data-i18n-placeholder="form.valuePlaceholder"></textarea>
       <label for="f-strategy" data-i18n="form.strategy" data-i18n-title="form.strategy.tip">Strategy</label>
       <select id="f-strategy">
-        <!-- 只列已实现的三个值 (#305 批1: redact/reject, 批2: placeholder; protect 已搁置,
-             由后端 validate fail-fast 挡下, 不入库不展示) -->
+        <!-- 已实现的四个值 (#305 批1: redact/reject, 批2: placeholder; monitor
+             #410 Wave 2; protect 已搁置, 由后端 validate fail-fast 挡下,
+             不入库不展示) -->
         <option value="redact" data-i18n="form.strategy.redact">Redact — transparent replacement (default)</option>
         <option value="reject" data-i18n="form.strategy.reject">Reject — refuse forwarding</option>
         <option value="placeholder" data-i18n="form.strategy.placeholder">Placeholder — explicit fake value + leak detection</option>
+        <option value="monitor" data-i18n="form.strategy.monitor">Monitor — allow through + audit</option>
       </select>
 
       <!-- id 供 mock strategy 脏检查监听 (#319, 见 collectMockStrategyFromForm). -->
@@ -2777,11 +2790,15 @@
         'shape.desc.pem': 'mock shape: PEM — value matches PEM structure; mock is a structured fake PEM (public boundary lines + equal-length random base64 body)',
         'shape.desc.jwt': 'mock shape: JWT — value matches the three-segment dotted shape; mock keeps the segment structure',
         'shape.desc.public_prefixed': 'mock shape: public prefix — value starts with a well-known key prefix (sk-/ghp_/AKIA…); mock keeps it',
+        'shape.desc.email': 'mock shape: email — value matches email form; mock is a realistic name-like address with a whitelisted public domain (equal length)',
+        'shape.desc.phone': 'mock shape: phone — value looks like a phone number; mock keeps the exact separator skeleton, digits randomized',
+        'shape.desc.username': 'mock shape: username — value registered as a username; mock is a name-like handle padded to equal length',
         'shape.mismatch': 'category label mismatches the detected shape',
         'shape.suggest': 'suggest',
         'form.strategy.reject': 'Reject — refuse forwarding',
         'form.strategy.placeholder': 'Placeholder — explicit fake value + leak detection',
-        'form.strategy.tip': 'How this secret is handled when spotted in a request: redact replaces it with a mock (restored on the way back); reject refuses the whole request (503, zero upstream calls); placeholder replaces it with an explicit [REDACTED:id] marker (not restored) and raises a leak alert when the real value shows up in a response.',
+        'form.strategy.monitor': 'Monitor — allow through + audit (no redaction)',
+        'form.strategy.tip': 'How this secret is handled when spotted in a request: redact replaces it with a mock (restored on the way back); reject refuses the whole request (503, zero upstream calls); placeholder replaces it with an explicit [REDACTED:id] marker (not restored) and raises a leak alert when the real value shows up in a response. monitor lets the real value pass through unchanged and records the hit to the redactions audit (usage view shows "(passthrough)").',
         'form.mockStrategy': 'Mock Strategy',
         'form.initial': 'Initial',
         'form.autoGenerate': 'Auto (generate)',
@@ -3280,11 +3297,15 @@
         'shape.desc.pem': 'mock 形状: PEM — 值匹配 PEM 结构, mock 为结构化假 PEM (公开边界行 + 等长随机 base64 行)',
         'shape.desc.jwt': 'mock 形状: JWT — 值匹配三段点分形状, mock 保留段结构',
         'shape.desc.public_prefixed': 'mock 形状: 公开前缀 — 值以已知 key 前缀开头 (sk-/ghp_/AKIA…), mock 保留该前缀',
+        'shape.desc.email': 'mock 形状: email — 值匹配 email 形态, mock 为拟真人名地址 + 白名单公开域名 (等长)',
+        'shape.desc.phone': 'mock 形状: phone — 值为电话号码形态, mock 保持分隔符骨架原样, 数字位随机',
+        'shape.desc.username': 'mock 形状: username — 值登记为用户名, mock 为拟真名柄 + 等长补位',
         'shape.mismatch': 'category 标注与检测到的形状不符',
         'shape.suggest': '建议',
         'form.strategy.reject': 'Reject — 拒绝转发',
         'form.strategy.placeholder': 'Placeholder — 明示假值 + 泄露检测',
-        'form.strategy.tip': '在请求中发现该 secret 时的处理方式: redact 替换为 mock (响应回传时还原); reject 拒绝整个请求 (503, 零上游外发); placeholder 替换为明示假值 [REDACTED:id] (不还原), 响应中出现真值时告警。',
+        'form.strategy.monitor': 'Monitor — 放行 + 审计 (不脱敏)',
+        'form.strategy.tip': '在请求中发现该 secret 时的处理方式: redact 替换为 mock (响应回传时还原); reject 拒绝整个请求 (503, 零上游外发); placeholder 替换为明示假值 [REDACTED:id] (不还原), 响应中出现真值时告警。monitor 允许真值原样通过并记录命中到脱敏审计 (usage 视图显示 "(passthrough)")。',
         'form.mockStrategy': 'Mock 策略',
         'form.initial': '初始值',
         'form.autoGenerate': '自动 (生成)',
@@ -7117,7 +7138,9 @@
     // ─── strategy 渲染 (per-secret 处理策略, #305 批1 + 批2) ────────────────
     //
     // redact = 替换为 mock (缺省); reject = 检测到即拒绝整个请求 (503 零外发);
-    // placeholder = 替换为明示假值 [REDACTED:id] + 响应侧蜜罐泄露检测 (批2).
+    // placeholder = 替换为明示假值 [REDACTED:id] + 响应侧蜜罐泄露检测 (批2);
+    // monitor = 真值原样放行 + 命中计入 redact 审计 (#410, usage redacts 的
+    // mock 列显示 "(passthrough)").
     // 后端 strategy 字段未上线时 s.strategy 为 undefined → 容错按 redact (serde
     // 缺省值) 显示. badge 配色照 category pill 模式 (策略值作 class).
 
@@ -7126,7 +7149,7 @@
       return `<span class="pill ${escapeHtml(v)}">${escapeHtml(v)}</span>`;
     }
 
-    // tooltip 复用表单选项词条 (form.strategy.redact / reject / placeholder).
+    // tooltip 复用表单选项词条 (form.strategy.redact / reject / placeholder / monitor).
     function strategyTooltip(st) {
       return t(`form.strategy.${st || 'redact'}`);
     }
@@ -7139,8 +7162,18 @@
     // 时在 auto/fixed pill 后内联 shape pill; hover tooltip 展示形状说明 + 与
     // category 标注的对照 (矛盾时 ⚠ + 建议改标 — 与后端 category_shape_mismatch
     // WARN 同一检测面的 UI 呈现). shape→期望标注映射是后端
-    // CategoryShapeMismatch::suggested_category 的前端镜像 (3 条, 稳定值域).
-    const SHAPE_EXPECTED_CATEGORY = { pem: 'privatekey', jwt: 'token', public_prefixed: 'apikey' };
+    // CategoryShapeMismatch::suggested_category 的前端镜像 (6 条, 稳定值域 —
+    // 3 条结构形状 + #410 的 email/phone/username 三条; 后两者是 category-gated
+    // 推断, kind 出现时 category 必然匹配 → ⚠ 分支实际不可达, 保持镜像完整
+    // 与后端枚举一致).
+    const SHAPE_EXPECTED_CATEGORY = {
+      pem: 'privatekey',
+      jwt: 'token',
+      public_prefixed: 'apikey',
+      email: 'email',
+      phone: 'phone',
+      username: 'username',
+    };
 
     function shapeOf(ms) {
       const kind = ms && ms.gen && ms.gen.shape && ms.gen.shape.kind;
@@ -7543,7 +7576,7 @@
       // 预填 (privacy scan 登记): value 已在告警行明文可见, 预填无新增暴露面.
       document.getElementById('f-value').value = (!existing && prefill?.prefillValue) || '';
       // Strategy: 加载 existing 或默认 redact (下拉词表外的值回退默认 — 后端
-      // fail-fast 保证 protect/placeholder 不入库, 此处纯容错).
+      // fail-fast 保证 protect (搁置值) 不入库, 此处纯容错).
       loadStrategyIntoForm(existing?.strategy);
       // Mock strategy: 加载 existing 或默认值.
       loadMockStrategyIntoForm(existing?.mock_strategy);
@@ -7578,8 +7611,8 @@
       document.getElementById(bid).addEventListener('click', () => { mockStrategyDirty = true; });
     });
 
-    // strategy select 回填: 值在下拉词表 (redact/reject/placeholder) 外 (undefined /
-    // protect 搁置值) 时回退 redact (serde 缺省).
+    // strategy select 回填: 值在下拉词表 (redact/reject/placeholder/monitor) 外
+    // (undefined / protect 搁置值) 时回退 redact (serde 缺省).
     function loadStrategyIntoForm(st) {
       const sel = document.getElementById('f-strategy');
       sel.value = st && [...sel.options].some(o => o.value === st) ? st : 'redact';
@@ -9238,7 +9271,8 @@
       name: document.getElementById('f-name').value.trim() || null,
       category: document.getElementById('f-category').value,
       value: document.getElementById('f-value').value,
-      // strategy 值域受 select 限制 (redact/reject); 旧后端 (无该字段) 忽略未知键, 无害.
+      // strategy 值域受 select 限制 (redact/reject/placeholder/monitor); 旧后端
+      // (无该字段) 忽略未知键, 无害.
       strategy: document.getElementById('f-strategy').value,
       mock_strategy: collectMockStrategyFromForm(),
     }));

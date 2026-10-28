@@ -2679,6 +2679,88 @@ test.describe("WebUI secret mock strategy 脏检查 (#319)", () => {
   });
 });
 
+// ─── #410 Wave 2: monitor 策略 + email/phone/username 形状呈现 ─────────────
+//
+// 后端值域 (工作项1/2 已就位): SecretStrategy::monitor (真值放行 + 命中计入
+// redact 审计) + SecretShape::{Email,Phone,Username} (GET DTO 的
+// mock_strategy.gen.shape.kind 出现新 kind, gen_inferred 标记 infer 态).
+// 前端职责: strategy 下拉含 monitor 选项 (四值词表) + pill 徽标按策略值/形状
+// kind 着色 (class = 值本身 / shape-<kind>, 新 kind 无下划线免映射).
+test.describe("WebUI monitor 策略 + 新形状徽标 (#410)", () => {
+  const IDS = ["mon-strategy-rt", "shape-rt-email", "shape-rt-phone", "shape-rt-username"];
+
+  test.beforeEach(async ({ page }) => {
+    await page.goto("/");
+    await page.waitForLoadState("networkidle");
+    await page.waitForTimeout(500);
+  });
+
+  // dynamic-only 条目 DELETE = 204; 幂等清理 (失败不阻断, 已删时 404 无害).
+  test.afterEach(async ({ request }) => {
+    for (const id of IDS) {
+      await request.delete(`${SG_API}/secrets/${id}`);
+    }
+  });
+
+  test("#410: strategy select 含 monitor 选项 (四值词表)", async ({ page }) => {
+    await page.locator('a.tab[data-tab="secrets"]').click();
+    await expect(page.locator("#secrets-body tr").first()).toBeVisible();
+    await page.locator("button", { hasText: "+ new dynamic secret" }).click();
+    const dlg = page.locator("#secret-form");
+    await expect(dlg).toBeVisible();
+    // 轻量断言: 四值齐全 (protect 搁置值不得出现), 不提交.
+    for (const v of ["redact", "reject", "placeholder", "monitor"]) {
+      await expect(page.locator(`#f-strategy option[value="${v}"]`)).toHaveCount(1);
+    }
+    await expect(page.locator("#f-strategy option")).toHaveCount(4);
+    await page.locator('#secret-form-el button[value="cancel"]').click();
+    await expect(dlg).not.toBeVisible();
+  });
+
+  test("#410: monitor 策略徽标渲染 (API 注入 → .pill.monitor)", async ({ page, request }) => {
+    const r = await request.post(`${SG_API}/secrets`, {
+      data: {
+        id: "mon-strategy-rt",
+        name: "mon",
+        category: "apikey",
+        value: "monitor-strategy-secret-value-4567",
+        strategy: "monitor",
+      },
+    });
+    expect(r.ok()).toBe(true);
+    await page.locator('a.tab[data-tab="secrets"]').click();
+    // 策略 pill class = 策略值本身 (strategyBadge), monitor 自动生效.
+    await expect(page.locator('#secrets-body tr[data-id="mon-strategy-rt"] .pill.monitor')).toBeVisible();
+  });
+
+  test("#410: email/phone/username 形状徽标渲染 (shape-<kind>)", async ({ page, request }) => {
+    // 三个条目一次建齐: email 形状自证 (不 gate category, 用 other 验证该性质);
+    // phone/username 是 category-gated 推断, 必须配对应 category 才 infer 出形状.
+    const cases = [
+      { id: "shape-rt-email", category: "other", value: "jane.doe.smithson@gmail.com", shape: "email" },
+      { id: "shape-rt-phone", category: "phone", value: "+1 (555) 019-2837", shape: "phone" },
+      { id: "shape-rt-username", category: "username", value: "janesmith42", shape: "username" },
+    ];
+    for (const c of cases) {
+      const r = await request.post(`${SG_API}/secrets`, {
+        data: { id: c.id, name: c.id, category: c.category, value: c.value },
+      });
+      expect(r.ok(), `create ${c.id}`).toBe(true);
+    }
+    // 前置健全性: GET DTO 的 infer 结果带对应 shape.kind (排除 "后端没 infer 出
+    // 形状 → 徽标断言假阴性" 的误判).
+    const after = await (await request.get(`${SG_API}/secrets`)).json();
+    for (const c of cases) {
+      const e = after.secrets.find((s: any) => s.id === c.id);
+      expect(e.mock_strategy.gen.shape.kind, `${c.id} shape kind`).toBe(c.shape);
+    }
+    await page.locator('a.tab[data-tab="secrets"]').click();
+    for (const c of cases) {
+      await expect(page.locator(`#secrets-body tr[data-id="${c.id}"] .pill.shape-${c.shape}`)).toBeVisible();
+    }
+  });
+});
+
 // ─── #181: 表单提交失败时对话框保持打开 + 字段保留 ────────────────────────
 //
 // bindFormSubmit (secret/provider 两个表单共用) 的 listener 是 async:
