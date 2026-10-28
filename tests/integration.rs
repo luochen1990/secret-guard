@@ -7832,6 +7832,9 @@ async fn prop_placeholder_and_redact_mixed_stream_roundtrip() {
 // 真值命中请求 → IR 零改写转发 (上游见真值原样), 命中统计进 usage redacts 审计
 // 通道 (mock 字段为放行标记 "(passthrough)", 无替换值); 响应侧无 restore 交互
 // (上游 echo 真值 → 客户端原样收到 — has_restorable 只看替换映射).
+// 启动经 spawn_proxy_full → base_app_state 默认 gate (on_probe_exhausted =
+// fail_closed, 生产默认): monitor 是显式授权而非降级, 最严档位下仍放行 —
+// 实现误把 monitor 归入降级类 (受 on_probe_exhausted 管) 时本测试立即红灯.
 
 /// 构造 monitor 策略 secret entry (集成测试用, 与 `placeholder_secret` 同型).
 fn monitor_secret(id: &str, value: &str) -> SecretEntry {
@@ -7993,9 +7996,24 @@ fn email_secret(id: &str, value: &str) -> SecretEntry {
 #[tokio::test]
 async fn email_category_mock_is_realistic_upstream() {
     let real_email = "zhangwei@qq.com";
-    // 单 secret 表 → predict_mock 与生产 init_seed 同源 (helper 头注释), 上游
-    // echo fixture 可预知 mock.
-    let expected_mock = predict_mock(real_email);
+    let entry = email_secret("contact-email", real_email);
+    // 预测首个 mock 供上游 echo fixture 预置: 从注册条目自身的 (Email-resolved)
+    // strategy 出发 — 单 secret 表下 per-request init_seed 与 deterministic_seed
+    // 的单元素哈希序列等价 (同 predict_mock 头注释论证), C5 重试链内嵌在
+    // gen_candidate, 同 (real, strategy, seed, 0) 严格产出同一 mock.
+    // (不走共享 helper predict_mock: 它按 ApiKey category resolve, 其与注册条目
+    // 的一致性依赖 "email 形状推断不 gate category" 的实现细节 — 从注册条目
+    // 自身预测无此耦合.)
+    let expected_mock = {
+        use secret_guard::mock::{deterministic_seed, gen_candidate};
+        let seed = deterministic_seed(&entry.value, &entry.mock_strategy);
+        gen_candidate(&entry.value, &entry.mock_strategy, seed, 0)
+    };
+    // 卫生 gate: mock ≠ real (下方 Regex matcher 与提取断言才有判别力).
+    assert_ne!(
+        expected_mock, real_email,
+        "mock must differ from real (fixture sanity gate)"
+    );
     let mut upstream = spawn_mock_upstream().await;
     // 上游 echo mock → 客户端应收到真值 (restore round-trip, RED-6).
     let upstream_body = format!(
@@ -8013,7 +8031,7 @@ async fn email_category_mock_is_realistic_upstream() {
         .create_async()
         .await;
 
-    let secrets = test_secret_table_with(vec![email_secret("contact-email", real_email)]);
+    let secrets = test_secret_table_with(vec![entry]);
     let records = ConversationDag::new(64, 500, 1);
     let records_handle = records.clone();
     let proxy_url = spawn_proxy_full(

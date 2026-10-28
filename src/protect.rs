@@ -50,9 +50,12 @@
 //! overlay 值与 effective user secret 真值**精确相等**时, `collect_credentials`
 //! 将其排除 — 用户显式登记的凭证交给 user-secret IR 机制全链接管 (redact +
 //! RED-6 restore 往返; 字节层让位, 否则会先替换导致 IR 层零命中 + restore 被
-//! 静默抢占). 残留边界: **子串形态** (overlay 值是 user secret 真值的真子串)
-//! 不排除 — 字节层仍抢占该子串 (方向安全: 真值不外流, 但该 secret 的
-//! restore 不成立), 见 known-limitations.
+//! 静默抢占). 让位后的**策略终点跟随用户配置** (#410): 该 secret 配 monitor
+//! 时让位终点是真值放行 + 审计 — AutoProtect 对该值让位于显式授权 (用户登记
+//! 即知情, SEC-11 注记; 配 reject/placeholder 则终点同 #305 语义). 残留边界:
+//! **子串形态** (overlay 值是 user secret 真值的真子串) 不排除 — 字节层仍抢占
+//! 该子串 (方向安全: 真值不外流, 但该 secret 的 restore 不成立), 见
+//! known-limitations.
 //!
 //! # 保护面地板 (`MIN_PROTECTED_CHARS`)
 //!
@@ -123,8 +126,9 @@ pub fn mock_for(value: &str) -> String {
 /// - `selected_provider_key`: 本次请求选中 provider (`selected_id`) 的 effective
 ///   api_key (覆盖 api_key_file 形态 — dispatch 处现场解析, 与转发路径同源).
 /// - `user_secret_values`: effective user secret 真值集 — 与 overlay 值**精确
-///   相等**的凭证被排除 (user-secret 优先, IR 机制接管 redact + restore 全链;
-///   见模块头 "user-secret 优先"). 子串形态不排除 (残留边界, 同上).
+///   相等**的凭证被排除 (user-secret 优先, IR 机制接管 — 策略终点跟随用户配置,
+///   redact/monitor/#305 族; 见模块头 "user-secret 优先"). 子串形态不排除
+///   (残留边界, 同上).
 /// - 值去重 (sg 优先保留), 按 value 长度降序 (长串先替换, 与 redact_ir_inner
 ///   的排序同型 — 处理值互为子串的边角).
 /// - 短于 `MIN_PROTECTED_CHARS` 的值丢弃 (地板, 见模块头).

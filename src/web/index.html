@@ -7163,9 +7163,11 @@
     // category 标注的对照 (矛盾时 ⚠ + 建议改标 — 与后端 category_shape_mismatch
     // WARN 同一检测面的 UI 呈现). shape→期望标注映射是后端
     // CategoryShapeMismatch::suggested_category 的前端镜像 (6 条, 稳定值域 —
-    // 3 条结构形状 + #410 的 email/phone/username 三条; 后两者是 category-gated
-    // 推断, kind 出现时 category 必然匹配 → ⚠ 分支实际不可达, 保持镜像完整
-    // 与后端枚举一致).
+    // 3 条结构形状 + #410 的 email/phone/username 三条). phone/username 是
+    // category-gated 推断 — infer 产物 kind 与 category 必然匹配; ⚠ 分支
+    // 仅在手动显式配置 shape + 错 category 时可达 (后端 category_shape_
+    // mismatch 检测面无 phone/username 变体, 该形态静默 — 前端镜像保持
+    // 完整, 覆盖手动配置面).
     const SHAPE_EXPECTED_CATEGORY = {
       pem: 'privatekey',
       jwt: 'token',

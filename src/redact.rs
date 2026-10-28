@@ -476,8 +476,12 @@ fn redact_ir_inner(
         }
         // strategy=monitor (#410, RED-9): 真值命中 → 放行 (IR 零改写, 无 mock 生成,
         // 不入 allocated) + 位置统计进审计通道。真值对上游可见是显式授权 (非降级,
-        // on_probe_exhausted 不适用)。遮蔽边界 (同值多 entry 先者胜 / 长值嵌套遮蔽)
-        // 与 RED-9 既有登记同型。
+        // on_probe_exhausted 不适用)。遮蔽边界 (同值多 entry 先者胜 / 长 redact 值
+        // 嵌套包含 monitor 值时整体替换) 与 RED-9 既有登记同型; 注意第三方向 —
+        // **本 monitor 值内嵌更短的 redact/placeholder 值时, 后续 redact 循环仍会
+        // 替换该子串** (机密性优先于放行意图): monitor 审计照记, 但 wire 上该子串
+        // 是 mock — 审计的 "(passthrough)" 指策略处理而非逐字节原样, 见 RED-9
+        // 遍历顺序边界第三条。
         if secret.strategy == crate::secrets::SecretStrategy::Monitor {
             let locations = count_hit_locations(ir, &secret.value);
             map.monitor_hits.push((secret.id.clone(), locations));

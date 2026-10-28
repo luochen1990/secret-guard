@@ -533,7 +533,12 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 > 仍算违反. **手动配置的 Email domain 必须 ∈ 白名单** (`GenSpec::validate` 强制,
 > #410 — 防 "固定段夹带真值并整段豁免" 的绕过面, 同 PublicPrefixed 白名单约束).
 > Phone 的骨架分隔符与 Username 的名字池无需豁免 (分隔符单字符 < k 阈值; 名字池
-> 是公开常量数据, 非 real 派生).
+> 是公开常量数据, 非 real 派生). **Phone 已知边界 — 连续分隔符链 ≥ k** (#410
+> review 登记于 known-limitations): real 含 ≥k(L) 的连续分隔符 (如 `"----1234567"`)
+> 时骨架 literal 段自身是 real 的违规窗口 — 每个候选恒 C5 violated, 重试链
+> (C5_INTERNAL_RETRIES) 耗尽后按 safety-bound 语义返回最后候选 (mock 与 real
+> 共享该分隔符链 — 骨架保持本就是 Phone shape 的设计目的, 泄露面为零信息格式串);
+> 行为可接受, 代价是白跑一轮重试链 (mock.rs `c5_violated` 头注释的既有登记).
 
 **Properties**:
 - `prop_no_real_substring_ascii`: 对任意 ASCII secret, mock 不含其 ≥ k(L) 子串. 🔁→`prop_no_real_substring` (`src/redact.rs`) + `prop_c5_gen_candidate_auto_body_no_real_substring` (`src/mock.rs`)
@@ -596,7 +601,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 **向后兼容锚**: 缺省 `strategy = "redact"` 时, 全部既有 RED-* 契约 (RED-1..RED-8) 逐字不变 — 不加 strategy 的旧配置与旧请求行为零变化.
 
-**遍历顺序边界**: reject 判定面 = 该 secret 轮次开始时刻的 IR 命中 (与 redact 同一循环, 长值优先的既定顺序). 两个已知遮蔽交互 (与 mock_strategy 的同值歧义同型, 机密性均不破 — 真值不外发): ① 同值多 entry: `sort + dedup` 先者胜出, strategy 随先者 (redact 在前则 reject 意图不生效, 该值仍被 mock 替换); ② 嵌套子串: 长 redact secret 的值包含短 reject secret 的值时, 前者先行整体替换可遮蔽后者的命中 (请求以 mock 形式放行). monitor 同型遮蔽 (#410): ① 同值多 entry 先者胜 (redact 在前则 monitor 意图不生效, 该值仍被 mock 替换); ② 长 redact secret 嵌套包含 monitor 真值时先行整体替换, 遮蔽 monitor 命中 (该 span 以 mock 形态放行, monitor 零审计) — 语义与 reject 同型, 配置期若需绝对语义, 避免同值/嵌套值组合.
+**遍历顺序边界**: reject 判定面 = 该 secret 轮次开始时刻的 IR 命中 (与 redact 同一循环, 长值优先的既定顺序). 两个已知遮蔽交互 (与 mock_strategy 的同值歧义同型, 机密性均不破 — 真值不外发): ① 同值多 entry: `sort + dedup` 先者胜出, strategy 随先者 (redact 在前则 reject 意图不生效, 该值仍被 mock 替换); ② 嵌套子串: 长 redact secret 的值包含短 reject secret 的值时, 前者先行整体替换可遮蔽后者的命中 (请求以 mock 形式放行). monitor 同型遮蔽 (#410): ① 同值多 entry 先者胜 (redact 在前则 monitor 意图不生效, 该值仍被 mock 替换); ② 长 redact secret 嵌套包含 monitor 真值时先行整体替换, 遮蔽 monitor 命中 (该 span 以 mock 形态放行, monitor 零审计). **③ 长 monitor 值内嵌短 redact/placeholder 值 (#410 review 补登, 机密性优先方向)**: monitor 分支先记审计并放行本值, 但**后续 redact/placeholder 循环继续独立扫描** — 短值命中照常替换 (含发生在 monitor 值内部的子串), 故 monitor 审计照记而 wire 上该子串是 mock; "(passthrough)" 的语义是**策略处理通道** (该值未被 monitor 改写) 而非逐字节原样保证, 该配置下 agent 收到的 monitor 值已被部分脱敏. redact 的机密性优先于 monitor 的放行意图 (嵌套方向与 ② 对称, 方向安全 — 真值不外发; placeholder 子串还会改变总长). 配置期若需绝对语义, 避免同值/嵌套值组合.
 
 **配置期弱配置拒绝 (#383 方案 D, 2026-10-21)**: `on_probe_exhausted = "fail_open"` (显式 opt-in) 时被跳过 secret 的 record 含真值回显 (读端点族 → WebUI), 与 **SEC-1** 冲突 — 裁决从配置期源头消灭 probing 耗尽的触发面, 而非登记契约例外. `SecretEntry::validate_and_resolve` choke point (static 加载 / dynamic 加载 / WebUI upsert 三条进入路径) 对 **redact 策略**新增两道 fail-fast 拒绝 (Err message 只含 id / 数字 / 建议, 不含 secret 明文 — SEC 红线): ① 手动配置的 gen_spec 候选空间 < `mock::MIN_CANDIDATE_SPACE_WARN` (2^20, 与 `redact::MOCK_PROBE_LIMIT` 同值) — Auto 路径经 widen 兜底恒达标, 命中的必是用户手动配置 (引导: 加宽 charset/length_range 或换 strategy); ② real < 4 chars — 等长约束下候选空间物理不可达 (上界 65³ ≈ 27 万 < 2^20), Auto widen 救不了 (引导: 换 reject/placeholder/monitor). reject / placeholder / monitor 不做 mock 生成 (无 probing 触发面), 不受两道 gate 约束 — 引导目标恒可达. Auto widen 兜底与 `on_probe_exhausted` 开关语义不变; 运行时残余触发面 = 仅空间达标但对抗构造的 IR (概率天文级), fail_closed 默认拒绝, fail_open 显式 opt-in 保留 (adversarial 应急).
 
@@ -605,12 +610,12 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 - `prop_reject_strategy_hits_refuse_regardless_of_mode`: 单元 — 命中 → `Err(RedactError { reason: StrategyReject })`, 且 fail_open / fail_closed 两种 on_probe_exhausted 模式下同样拒绝 (显式策略不受降级配置影响). ✅ `src/redact.rs::prop_reject_strategy_hits_refuse_regardless_of_mode`
 - `prop_reject_strategy_miss_passes_through`: 单元 — reject secret 存在但未命中 (请求不含其真值) → 不触发拒绝, 其余 secret 正常 redact (`prop_reject_strategy_miss_preserves_other_secrets_redact`) / 请求正常转发 (集成回归 `prop_reject_strategy_unhit_forwards_normally`) (缺省路径零行为变化的回归面). ✅ `src/redact.rs::prop_reject_strategy_miss_passes_through` + `tests/integration.rs::prop_reject_strategy_unhit_forwards_normally`
 - `prop_validated_manual_gen_spec_meets_candidate_space_floor` (#383): redact 策略下, 任意手动配置的 gen_spec 经 `validate_and_resolve` 通过 ⟹ 候选空间 ≥ 2^20 (弱配置拒绝的 property 化 — 通过即强配置). ✅ `src/secrets.rs::prop_validated_manual_gen_spec_meets_candidate_space_floor`
-- `prop_short_real_redact_rejected_other_strategies_pass` (#383): 过短 real (恰 3 chars — 通过 validate_value 字节下限, 落在等长约束物理边界) — redact 恒被拒且 Err 引导 reject/placeholder/monitor (#410 起含 monitor) 而不含真值 (SEC 红线); 引导目标 (reject/placeholder/monitor) 恒通过. ✅ `src/secrets.rs::prop_short_real_redact_rejected_other_strategies_pass`
+- `prop_short_real_redact_rejected_other_strategies_pass` (#383): 过短 real (恰 3 chars — 通过 validate_value 字节下限, 落在等长约束物理边界) — redact 恒被拒且 Err 引导 reject/placeholder/monitor (#410 起文案含 monitor) 而不含真值 (SEC 红线); 引导目标 reject/placeholder/monitor 恒通过 (本测试枚举面 = reject/placeholder, monitor 短值面独立锁定于 `prop_monitor_short_real_exempt_from_gates`). ✅ `src/secrets.rs::prop_short_real_redact_rejected_other_strategies_pass`
 - `prop_monitor_strategy_hits_pass_through_and_audits` (#410, 单元): monitor 真值命中 → IR 逐字节不变 (放行, 无 mock 生成) + `monitor_hits` 审计 (id + 位置分类, 不含真值) + `map.real_to_mock` 空 (无 restore 数据面). 🔁→`monitor_strategy_hits_pass_through_and_audits` (`src/redact.rs`)
 - `prop_monitor_and_redact_mixed_round_trip` (#410, 单元): 混合策略 (monitor + redact 并存) 互不干扰 — redact 条目照常替换 + round-trip (RED-6 对 redact 条目保持), monitor 条目放行 + 审计 (redact 命中不混入 monitor_hits, 反之亦然). 🔁→`monitor_and_redact_mixed_round_trip` (`src/redact.rs`)
 - `prop_monitor_strategy_unhit_no_audit` (#410, 单元): monitor secret 未命中 (请求不含其真值) → `monitor_hits` 空 (零噪声审计, 缺省路径零行为变化). 🔁→`monitor_strategy_unhit_no_audit` (`src/redact.rs`)
 - `prop_monitor_hits_derive_to_usage_projection` (#410, 单元): monitor 命中进 usage 审计投影 (`derive_redact_hits` 合并通道, mock 字段 = "(passthrough)"), 不进 record.redactions (`derive_redactions` 仅含替换通道 — 两投影分野). 🔁→`monitor_hits_derive_to_usage_projection` (`src/proxy/recorder.rs`)
-- `prop_monitor_short_real_exempt_from_gates` (#410): monitor 豁免 #383 两道配置期 gate (短 real / 弱空间 — 零 mock 生成无 probing 触发面, 同 reject/placeholder; 短值如 email 恒合法, 对比 redact 同值被拒). 🔁→`validate_allows_short_real_for_monitor` (`src/secrets.rs`)
+- `prop_monitor_short_real_exempt_from_gates` (#410): monitor 豁免 #383 两道配置期 gate (短 real / 弱空间 — 两道 gate 代码侧均以 redact 策略为前提, monitor 零 mock 生成无 probing 触发面, 同 reject/placeholder; 测试锁短 real 面: monitor 短值 (如 email) 恒合法, 对比 redact 同值被拒). 🔁→`validate_allows_short_real_for_monitor` (`src/secrets.rs`)
 - `prop_monitor_strategy_upstream_sees_real_value_and_audits` (#410, 端到端): 上游收到的 body 含真值原样 (放行, 零改写) + 客户端响应透传 + usage redacts 审计落账 (by_secret 聚合含 "(passthrough)"). 🔁→`monitor_strategy_upstream_sees_real_value_and_audits` (`tests/integration.rs`)
 - `prop_email_category_mock_realistic_upstream` (#410, 端到端): email 类 secret (redact 策略) → 上游 body 见拟真等长 mock 不见真值 (白名单域名段保留), 客户端 restore 真值 (RED-6). 🔁→`email_category_mock_is_realistic_upstream` (`tests/integration.rs`)
 
@@ -1223,7 +1228,10 @@ IR 机制正交:
 - **user-secret 优先 (精确重合让位)**: overlay 值与 effective user secret 真值
   **精确相等**时排除出保护集 — 用户显式登记的凭证由 user-secret IR 机制全链接管
   (redact + RED-6 restore 往返; 字节层让位, 否则先替换会导致 IR 层零命中 + restore
-  被静默抢占). 残留: **子串形态** (overlay 值是 user secret 真值的真子串) 仍被字节层
+  被静默抢占). 让位后的**策略终点跟随该 secret 的用户配置** (#410): 配 monitor 时
+  终点 = 真值放行 + 审计 (RED-9) — AutoProtect 对该值让位于显式授权, 这是
+  "用户登记即知情" 的配置语义而非保护漏洞; 配 reject/placeholder 则终点同 #305 族.
+  残留: **子串形态** (overlay 值是 user secret 真值的真子串) 仍被字节层
   抢占 — 方向安全 (真值不外流), 但该 secret 的 restore 不成立 (known-limitations).
 - **auth 关闭 + keyless provider 时**: 客户端 `Authorization: Bearer` 若是**注册表
   已知明文**的 sg token (判据 = lookup 命中 ∨ `known_plaintext`, 含 disabled — 与
