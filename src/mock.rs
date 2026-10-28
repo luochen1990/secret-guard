@@ -42,17 +42,29 @@
 //!   `-----BEGIN ...-----` / 末行 `-----END ...-----` / 中间全 b64 行) → 合成
 //!   结构完整的假 PEM (复用 real 的公开边界行 + 等长随机 b64 body 行). 归类
 //!   错误免疫: category 标错时 PEM 形状仍被识别.
+//! - **Email (形状自证, 不 gate category, 同 PEM 先例)**: real 匹配 email 语法
+//!   (见 `parse_email`) → `local@domain` 结构: domain 复用公开邮箱域白名单成员
+//!   ([`EMAIL_DOMAINS`]), local 用名字池组合 (见 `gen_name_like`:
+//!   [`FIRST_NAMES`]/[`LAST_NAMES`] + digit pad). gate: local 的 name-like 候选
+//!   空间 ≥ [`MIN_CANDIDATE_SPACE_WARN`] — 短 local 物理空间不足时退化 Plain
+//!   (仿真与空间不可兼得, 取空间). 存量归类为 other 的 email secret 直接受益.
 //! - **Token + JWT 形状** (三段点分 b64url, 每段 ≥10 chars, 总长 ≥32) → 三段
 //!   等长随机 b64url, 点分结构保留.
 //! - **ApiKey + 公开前缀白名单** (sk-/ghp_/AKIA/AIza/glpat-/hf_/sg_/... 见
 //!   [`PUBLIC_KEY_PREFIXES`], 最长命中, body ≥8 chars) → mock 保留公开前缀.
+//! - **Phone (gate category)**: category == Phone 且 real 字符域合法 (⊆ digits
+//!   与 `+ - ( ) . 空格` 分隔符, `+` 仅首位, digit ≥ 7 — 10^7 > 2^20 是空间
+//!   物理边界, 不足退化 Plain) → 分隔符骨架保持 (见 `parse_phone`), digit 位
+//!   随机.
+//! - **Username (gate category)**: category == Username 且 name-like 候选空间
+//!   达标 (real 长度 ≥ 7) → 名字池组合 + digit pad 到等长.
 //! - 其余 (含 Password/Cookie/Other) → [`SecretShape::Plain`] 平坦串 (历史行为).
 //!
-//! **归类错误无害**: 所有增强都有形状 gate, category 标错最多退化为 Plain
-//! (与历史行为一致), 不产生错误行为. 标注与值形状的**矛盾** (PEM 但非
-//! privatekey / JWT 但非 token / 白名单前缀但非 apikey) 由
-//! `MockStrategy::category_shape_mismatch` 在配置期 WARN (检测面与跳过条件
-//! 见其 doc).
+//! **归类错误无害**: 所有增强都有形状 gate (或形状自证), category 标错最多退化
+//! 为 Plain (与历史行为一致), 不产生错误行为. 标注与值形状的**矛盾** (PEM 但非
+//! privatekey / email 形状但非 email 标注 / JWT 但非 token / 白名单前缀但非
+//! apikey) 由 `MockStrategy::category_shape_mismatch` 在配置期 WARN (检测面与
+//! 跳过条件见其 doc).
 //!
 //! **global_prefix 裁决**: `global_mock_prefix` 非空时恒推断 Plain — 用户显式
 //! 配置辨识前缀 = 放弃结构仿真 (辨识度与仿真度互斥, 把矛盾交给配置).
@@ -80,10 +92,10 @@
 //! 兜底). 重试链不破坏 C3 (无副作用, 不消耗外部 counter).
 //!
 //! **公开格式子串豁免 (shape-aware, RED-5 精确化)**: [`SecretShape`] 的公开结构段
-//! (PublicPrefixed 的白名单前缀 / Pem 的 BEGIN·END 边界行) 是 real 中**信息量为零的
-//! 公开格式串** (业界约定, 非 secret 内容) — mock 复用它们不泄露任何 secret 信息.
-//! C5 检查 (`c5_violated`) 在窗口比较前剥离 mock 的公开段, 随机部分照常做 ≥k
-//! 子串检查. 契约条文见 contracts.md RED-5.
+//! (PublicPrefixed 的白名单前缀 / Pem 的 BEGIN·END 边界行 / Email 的 `@domain`
+//! 公开邮箱域段) 是 real 中**信息量为零的公开格式串** (业界约定, 非 secret 内容)
+//! — mock 复用它们不泄露任何 secret 信息. C5 检查 (`c5_violated`) 在窗口比较前
+//! 剥离 mock 的公开段, 随机部分照常做 ≥k 子串检查. 契约条文见 contracts.md RED-5.
 //!
 //! 本段是 C5 设计论据与概率数字的 **SSOT**, 其它位置 (如 [`c5_threshold_len`] 文档、
 //! [`crate::redact`] 模块头部 C5 段) 只指针引用, 不重述.
@@ -200,6 +212,12 @@ pub enum SecretCategory {
     Cookie,
     /// 私钥 (PEM 等, 多行).
     PrivateKey,
+    /// 电子邮件地址 (`local@domain` 结构; Email 形状推断见 `infer_email`).
+    Email,
+    /// 电话号码 (分隔符骨架 + digit 位随机, 见 `parse_phone`).
+    Phone,
+    /// 用户名 (名字池组合 + digit pad, 见 `gen_name_like`).
+    Username,
     /// 兜底.
     Other,
 }
@@ -208,12 +226,15 @@ impl SecretCategory {
     /// 所有变体及其字符串名 — 派生自 `as_str()` (const fn match 是字符串单源).
     /// serde rename 同步由 roundtrip 测试守卫; 定长数组不随新增 variant 自动扩 —
     /// ALL 漏项无自动守卫, 需人工随新增 variant 同步.
-    pub const ALL: [(Self, &'static str); 6] = [
+    pub const ALL: [(Self, &'static str); 9] = [
         (Self::Password, Self::Password.as_str()),
         (Self::ApiKey, Self::ApiKey.as_str()),
         (Self::Token, Self::Token.as_str()),
         (Self::Cookie, Self::Cookie.as_str()),
         (Self::PrivateKey, Self::PrivateKey.as_str()),
+        (Self::Email, Self::Email.as_str()),
+        (Self::Phone, Self::Phone.as_str()),
+        (Self::Username, Self::Username.as_str()),
         (Self::Other, Self::Other.as_str()),
     ];
 
@@ -225,6 +246,9 @@ impl SecretCategory {
             Self::Token => "token",
             Self::Cookie => "cookie",
             Self::PrivateKey => "privatekey",
+            Self::Email => "email",
+            Self::Phone => "phone",
+            Self::Username => "username",
             Self::Other => "other",
         }
     }
@@ -238,9 +262,9 @@ impl SecretCategory {
 /// **等长不变量**: 所有形状生成的 mock 总字符数 == real 总字符数
 /// (infer 出的 `length_range` 是单点区间) — wire 字节量无扰动, 与 Plain 一致.
 ///
-/// **公开格式子串与 C5**: PublicPrefixed 的 `public_prefix` 与 Pem 的边界行是
-/// real 中信息量为零的公开格式串, C5 检查豁免这些段 (见 `c5_violated` 与
-/// 模块头部 "公开格式子串豁免" 段).
+/// **公开格式子串与 C5**: PublicPrefixed 的 `public_prefix`、Pem 的边界行与
+/// Email 的 `@domain` 公开邮箱域段是 real 中信息量为零的公开格式串, C5 检查
+/// 豁免这些段 (见 `c5_violated` 与模块头部 "公开格式子串豁免" 段).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SecretShape {
@@ -269,6 +293,24 @@ pub enum SecretShape {
         /// 每条 body 行的长度 (随机字符数, 不含 `\n`).
         body_line_lens: Vec<usize>,
     },
+    /// Email: `local@domain` — local 为 name-like 随机段 (名字池 + digit pad, 见
+    /// `gen_name_like`), domain 为白名单公开邮箱域 ([`EMAIL_DOMAINS`], shape 携带,
+    /// C5 豁免该段). 推断 gate: 形状自证 (`parse_email`, 不 gate category, 同 PEM
+    /// 先例) + 域名放得下 + local 候选空间达标 (见 `infer_email`).
+    Email {
+        /// 公开邮箱域 (白名单成员, 小写; real 的域在白名单时复用).
+        domain: String,
+    },
+    /// Phone: 分隔符骨架保持 (`#` = digit 占位, 其余字符 literal 复用 real 的
+    /// 分隔符), digit 位随机. 推断 gate: category == Phone + 字符域合法 + digit
+    /// 数 ≥ 7 (见 `parse_phone`).
+    Phone {
+        /// digit 占位骨架 (`#` = 随机 digit 位, 其余字符 literal).
+        skeleton: String,
+    },
+    /// Username: 名字池组合 + digit pad 到等长 (见 `gen_name_like`). 推断 gate:
+    /// category == Username + name-like 候选空间达标 (real 长度 ≥ 7).
+    Username,
 }
 
 /// 公开 API key 前缀白名单 (业界格式约定, 精确大小写匹配; 匹配取最长命中 —
@@ -299,6 +341,105 @@ pub const PUBLIC_KEY_PREFIXES: &[&str] = &[
     "gl_",
     "sk-",
 ];
+
+/// 公开邮箱域名白名单 (业界公共邮箱域, 小写精确匹配). Email 形状的公开段
+/// (`@domain`) 由此表供给 — C5 豁免只覆盖白名单成员: 手动配置携带私有域会被
+/// `GenSpec::validate` 拒绝 (同 `PUBLIC_KEY_PREFIXES` 哲学 — 防 "固定段夹带
+/// 真值并整段豁免 C5" 的绕过面). 新增域名改此表 (公开邮箱域是业界共识).
+pub const EMAIL_DOMAINS: &[&str] = &[
+    "gmail.com",
+    "outlook.com",
+    "hotmail.com",
+    "yahoo.com",
+    "icloud.com",
+    "proton.me",
+    "protonmail.com",
+    "live.com",
+    "aol.com",
+    "qq.com",
+    "163.com",
+    "126.com",
+    "sina.com",
+    "foxmail.com",
+    "yeah.net",
+    "example.com",
+];
+
+/// name-like 段的名字池 (西方名 + 拼音混合, 全小写 ASCII, 长度 2..=9; 供
+/// `gen_name_like` / `name_like_space`). 2..3 char 短名 20 个 (设计下限 ≥ 16,
+/// 供短 target — 短 email local / username — 的名字挑选与空间计算).
+pub const FIRST_NAMES: &[&str] = &[
+    // 2..3 char (短名, 20 个):
+    "li",
+    "bo",
+    "yu",
+    "qi",
+    "he",
+    "an",
+    "yi",
+    "ze",
+    "en",
+    "ru",
+    "wei",
+    "mei",
+    "tao",
+    "hui",
+    "jun",
+    "xia",
+    "lei",
+    "yan",
+    "tom",
+    "max",
+    // 4 char (14 个):
+    "ling",
+    "yuan",
+    "chen",
+    "jing",
+    "ming",
+    "feng",
+    "john",
+    "jane",
+    "alex",
+    "mary",
+    "lily",
+    "anna",
+    "noah",
+    "liam",
+    // 5 char (8 个):
+    "maria",
+    "sarah",
+    "david",
+    "laura",
+    "kevin",
+    "emily",
+    "chris",
+    "james",
+    // 6..9 char (9 个):
+    "robert",
+    "olivia",
+    "sophia",
+    "michael",
+    "jessica",
+    "william",
+    "matthew",
+    "jennifer",
+    "christina",
+];
+
+/// name-like 段的姓氏池 (拼音 + 西方混合, 全小写 ASCII, 长度 3..=8; 供
+/// `gen_name_like` 的 two-part 模式与 `name_like_space`).
+pub const LAST_NAMES: &[&str] = &[
+    "liu", "sun", "zhu", "lin", "gao", "luo", "han", "wang", "chen", "yang", "zhao", "zhou",
+    "feng", "tang", "deng", "zhang", "huang", "zheng", "smith", "brown", "davis", "moore", "white",
+    "taylor", "wilson", "thomas", "harris", "martin", "miller", "johnson", "jackson", "anderson",
+];
+
+/// username 形态的分隔符集 (`first + sep + last` 的 sep, 见 `gen_name_like`).
+pub const USERNAME_SEPS: &[char] = &['_', '.', '-'];
+
+/// email local 段的分隔符集 (固定 `.` — email local 的常见形态是
+/// `first.last`, 不引入 `_`/`-` 保持拟真).
+pub const EMAIL_LOCAL_SEPS: &[char] = &['.'];
 
 /// real 的公开 API key 前缀 (白名单最长命中). body (去前缀后) < 8 chars 时返回
 /// `None` — 短 body 前缀保留意义弱 (仿真增益小) 且 C5 随机窗口空间过窄.
@@ -379,16 +520,171 @@ fn parse_jwt(real: &str) -> Option<SecretShape> {
     })
 }
 
+/// real 是否 email 地址 (手写语法判定, 零依赖; **语法级检测, 不做空间判定** —
+/// 空间 gate 在 `infer_email`): 恰一个 `@`; local 1..=64 chars, 字符 ∈
+/// `[a-zA-Z0-9._%+-]`; domain ≥1 个 `.`, 每 label 1..=63 chars ∈ `[a-zA-Z0-9-]`,
+/// TLD (最后一个 label) ≥2 chars 且全 alpha. 整串无空白 (local/domain 的字符域
+/// 检查已隐含覆盖 — 两者拼回即整串).
+///
+/// 返回 `(local_len, domain)` — domain 取**小写归一**形态 (email domain 大小写
+/// 不敏感; `infer_email` 的白名单匹配依赖归一).
+fn parse_email(real: &str) -> Option<(usize, String)> {
+    let (local, domain) = real.split_once('@')?;
+    if domain.contains('@') {
+        return None; // 恰一个 '@' (split_once 已取首个, 尾部再有即非法).
+    }
+    let local_len = local.chars().count();
+    if local_len == 0 || local_len > 64 {
+        return None;
+    }
+    if !local
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '%' | '+' | '-'))
+    {
+        return None;
+    }
+    let domain = domain.to_ascii_lowercase();
+    let labels: Vec<&str> = domain.split('.').collect();
+    if labels.len() < 2 {
+        return None;
+    }
+    for label in &labels {
+        let n = label.chars().count();
+        if n == 0 || n > 63 {
+            return None;
+        }
+        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return None;
+        }
+    }
+    let tld = *labels.last().expect("labels non-empty (len ≥ 2 checked)");
+    if tld.chars().count() < 2 || !tld.chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    Some((local_len, domain))
+}
+
+/// real 是否电话号码形态 (仅在 category == Phone 时由 `infer_shape` 调用):
+/// real 非空; 字符域 ⊆ `{0-9, '+', ' ', '-', '(', ')', '.'}`; `+` 仅允许首位;
+/// digit 数 ≥ 7 (**空间物理边界**: 10^7 > 2^20, 不足返回 None 退化 Plain).
+/// 返回 digit 占位骨架: digit → `#`, 其余字符 (分隔符) → 原字符 literal 复用.
+fn parse_phone(real: &str) -> Option<String> {
+    if real.is_empty() {
+        return None;
+    }
+    let mut digit_count = 0usize;
+    for (i, c) in real.chars().enumerate() {
+        match c {
+            '0'..='9' => digit_count += 1,
+            '+' if i == 0 => {}
+            ' ' | '-' | '(' | ')' | '.' => {}
+            _ => return None,
+        }
+    }
+    if digit_count < 7 {
+        return None;
+    }
+    Some(
+        real.chars()
+            .map(|c| if c.is_ascii_digit() { '#' } else { c })
+            .collect(),
+    )
+}
+
+/// name-like 组合的诚实候选空间 (saturating u64):
+/// `Σ_{first ∈ FIRST, |f| ≤ target} 10^(target-|f|)`
+/// `+ Σ_{(first,sep,last), |f|+1+|l| ≤ target} 10^(target-|f|-1-|l|)`
+/// 若无任何 first 放得下 (target < 2, 名字池最短 2 chars): `charset_size^target`
+/// (全随机兜底分支).
+///
+/// 10^pad 与生成一致: pad 恒为 digit (`gen_name_like` 的 `hash % 10`, 拟真
+/// "john92" 而非 "johnXz"); 名字项与 charset 无关 (名字池是常量表, 不从 charset
+/// 采样 — charset 只喂兜底分支). saturating 求和/求幂: 超大空间封顶 u64::MAX,
+/// 不因溢出 panic (ROB).
+fn name_like_space(target: usize, seps: &[char], charset_size: u64) -> u64 {
+    // 10^e: e ≥ 20 恒饱和 (10^20 ≈ 1e20 > u64::MAX ≈ 1.8e19), 免 as u32 截断.
+    let pow10 = |e: usize| -> u64 {
+        if e >= 20 {
+            u64::MAX
+        } else {
+            10u64.pow(e as u32)
+        }
+    };
+    let mut total: u64 = 0;
+    // first-only: first + digit pad.
+    for f in FIRST_NAMES {
+        let fl = f.chars().count();
+        if fl <= target {
+            total = total.saturating_add(pow10(target - fl));
+        }
+    }
+    // two-part: first + sep + last + digit pad (sep ∈ seps, 每组合同空间).
+    for f in FIRST_NAMES {
+        for l in LAST_NAMES {
+            let used = f.chars().count() + 1 + l.chars().count();
+            if used > target {
+                continue;
+            }
+            let term = pow10(target - used).saturating_mul(seps.len() as u64);
+            total = total.saturating_add(term);
+        }
+    }
+    if total == 0 {
+        // 无任何 first 放得下 (target < 2): 全随机兜底分支.
+        // u32::try_from 防御 target 超宽 (物理不可达) 的 as-truncation 低估.
+        charset_size.saturating_pow(u32::try_from(target).unwrap_or(u32::MAX))
+    } else {
+        total
+    }
+}
+
+/// email 形状推断 (形状自证, 不 gate category — 同 `parse_pem` 先例, 存量
+/// other 归类的 email secret 直接受益). 语法过 (`parse_email`) 后选 domain:
+/// ① real 的 domain (小写归一) ∈ [`EMAIL_DOMAINS`] → 复用 (公开格式段复用);
+/// ② 否则从白名单筛放得下的成员 (`len ≤ total - 2`, local ≥ 1), `hash64(real)`
+/// 确定性挑一个; ③ 空 (real 过短放不下任何白名单域) → None. domain 定了后
+/// `local_len = total - 1 - domain_len`, 再 gate: `name_like_space(local_len,
+/// EMAIL_LOCAL_SEPS, 10) ≥ MIN_CANDIDATE_SPACE_WARN` — 不足 → None → Plain
+/// (短 local 物理空间不足, 仿真与空间不可兼得, 取空间; 预检 charset_size 用
+/// 10 即可: pad 恒 digit, 名字项与 charset 无关).
+fn infer_email(real: &str) -> Option<SecretShape> {
+    let (real_local_len, real_domain) = parse_email(real)?;
+    let total = real.chars().count();
+    let (domain, local_len) = if EMAIL_DOMAINS.contains(&real_domain.as_str()) {
+        (real_domain, real_local_len)
+    } else {
+        let fitting: Vec<&str> = EMAIL_DOMAINS
+            .iter()
+            .copied()
+            .filter(|d| d.chars().count() + 2 <= total)
+            .collect();
+        // fitting 可空 (real 过短放不下任何白名单域, 如 total < 8 = 最短白名单
+        // "qq.com" + local 1 + '@') → None (退化 Plain, 其 local 空间也必不足).
+        if fitting.is_empty() {
+            return None;
+        }
+        let picked = fitting[(crate::util::hash64(real) % fitting.len() as u64) as usize];
+        let local_len = total - 1 - picked.chars().count();
+        ((*picked).to_string(), local_len)
+    };
+    (name_like_space(local_len, EMAIL_LOCAL_SEPS, 10) >= MIN_CANDIDATE_SPACE_WARN)
+        .then_some(SecretShape::Email { domain })
+}
+
 /// shape 推断 (category + real 形状). `global_prefix` 非空时恒 Plain
 /// (用户显式要辨识前缀 = 放弃结构仿真, 见模块头部裁决).
 fn infer_shape(real: &str, category: SecretCategory, global_prefix: &str) -> SecretShape {
     if !global_prefix.is_empty() {
         return SecretShape::Plain;
     }
-    // PEM 不 gate category: 形状自证 (BEGIN/END + b64 行), 归类错误免疫.
+    // PEM / Email 不 gate category: 形状自证, 归类错误免疫.
     if let Some(pem) = parse_pem(real) {
         return pem;
     }
+    if let Some(email) = infer_email(real) {
+        return email;
+    }
+    let n = real.chars().count();
     match category {
         SecretCategory::Token => parse_jwt(real).unwrap_or_default(),
         SecretCategory::ApiKey => find_public_prefix(real)
@@ -396,6 +692,18 @@ fn infer_shape(real: &str, category: SecretCategory, global_prefix: &str) -> Sec
                 public_prefix: p.to_string(),
             })
             .unwrap_or_default(),
+        SecretCategory::Phone => parse_phone(real)
+            .map(|skeleton| SecretShape::Phone { skeleton })
+            .unwrap_or_default(),
+        // Username gate: name-like 候选空间达标 (real ≥ 7 — 短 username 物理空间
+        // 不足, 仿真与空间不可兼得, 取空间; 预检 charset_size 用 10, 同 infer_email).
+        SecretCategory::Username => {
+            if name_like_space(n, USERNAME_SEPS, 10) >= MIN_CANDIDATE_SPACE_WARN {
+                SecretShape::Username
+            } else {
+                SecretShape::Plain
+            }
+        }
         _ => SecretShape::Plain,
     }
 }
@@ -435,10 +743,14 @@ impl GenSpec {
     ///
     /// # category-aware shape (2026-10)
     ///
-    /// `category` 参与 `infer_shape` 判定: PrivateKey + PEM / Token + JWT /
-    /// ApiKey + 公开前缀 → 结构化 shape (等长不变量保持, 仿真度提升); 其余
-    /// Plain. charset 推断源是 real 的**随机部分** (Jwt 去点 / Pem 取 body 行 /
-    /// PublicPrefixed 去公开前缀), 结构分隔符不入 pool.
+    /// `category` 参与 `infer_shape` 判定: PrivateKey + PEM / Email 形状自证 /
+    /// Token + JWT / ApiKey + 公开前缀 / Phone 骨架 / Username 名字池 → 结构化
+    /// shape (等长不变量保持, 仿真度提升); 其余 Plain. charset 推断源是 real 的
+    /// **随机部分** (Jwt 去点 / Pem 取 body 行 / PublicPrefixed 去公开前缀 /
+    /// Email 取 local 段 / Phone 取 digit 位 / Username 取全串), 结构分隔符不入
+    /// pool; Email/Username 额外**强制** charset ⊇ 名字池 + 分隔符 + digits
+    /// (名字池生成不从 charset 采样, RED-1 前提), Phone 强制 digits-only 且跳过
+    /// widen (骨架仿真的字符域约束, 见函数体注释).
     ///
     /// # Auto widen 兜底 (2026-09, 生成器扩宽发现的老缺陷)
     ///
@@ -462,6 +774,11 @@ impl GenSpec {
         // shape 重新放置结构). Plain 的随机部分就是 real 本身 (历史行为).
         // random_source 同时是 widen 基数 random_n 的来源 — 随机字符数, 与
         // candidate_space / body_length_range 的口径一致 (结构段不计入空间).
+        // 已知偏差: Email 域交换 (非白名单域换白名单域) 时 random_n = real local
+        // 长度, 与 shape 的 local_len 可不同 (见下方 Email arm) — widen 是
+        // charset^random_n 的保守近似, 对 Email/Username 无实质作用 (name-like
+        // 生成不从 pool 采样, candidate_space 由 name_like_space 覆写), 强制项
+        // 只增不减, 最坏情况是多开 uppercase (装饰性, 不破坏 RED-1/C3).
         let (random_source, prefix) = match &shape {
             SecretShape::Plain => (real.to_string(), global_prefix.to_string()),
             SecretShape::PublicPrefixed { public_prefix } => (
@@ -476,10 +793,62 @@ impl GenSpec {
                 let lines: Vec<&str> = real.split('\n').collect();
                 (lines[1..lines.len() - 1].concat(), String::new())
             }
+            // Email: local 段 (real 的 '@' 前 — 形状自证 parse_email 已过).
+            // 注: local_len (body 长度) 由 shape 的 domain 与 total 决定, 与 real
+            // local 长度可不同 (非白名单域换白名单域时), random_source 只喂 charset.
+            SecretShape::Email { .. } => (
+                real.split_once('@')
+                    .map(|(l, _)| l)
+                    .unwrap_or("")
+                    .to_string(),
+                String::new(),
+            ),
+            // Phone: digit 字符集 (skeleton 展开的 digits = real 的 digit 位).
+            SecretShape::Phone { .. } => (
+                real.chars()
+                    .filter(|c| c.is_ascii_digit())
+                    .collect::<String>(),
+                String::new(),
+            ),
+            // Username: real 全串 (随机部分就是整个 body).
+            SecretShape::Username => (real.to_string(), String::new()),
         };
         let random_n = random_source.chars().count();
         let prefix_len = prefix.chars().count();
         let mut charset = Charset::infer_from(&random_source);
+        // 形状强制字符面 (RED-1): Email/Username 的随机段由名字池常量表 + digit
+        // pad 生成 (**不从 charset 采样**), charset 必须 ⊇ 名字池字符 (全小写) +
+        // 分隔符 + digits — infer 路径在此强制. Phone 强制 digits-only 且跳过
+        // widen (下方): mock 的随机位恒 digit (骨架仿真), 并入字母破坏 digit-only
+        // 仿真; widen 的空间兜底对 Phone 无意义 (10^n 是 digit-only 的物理空间,
+        // 推断 gate 已保证 digit ≥ 7 → 10^7 > 2^20).
+        let mut skip_widen = false;
+        match &shape {
+            SecretShape::Email { .. } => {
+                charset.lowercase = true;
+                charset.digits = true;
+                if !charset.other.contains(&'.') {
+                    charset.other.push('.');
+                }
+            }
+            SecretShape::Username => {
+                charset.lowercase = true;
+                charset.digits = true;
+                for c in ['_', '.', '-'] {
+                    if !charset.other.contains(&c) {
+                        charset.other.push(c);
+                    }
+                }
+            }
+            SecretShape::Phone { .. } => {
+                charset = Charset {
+                    digits: true,
+                    ..Default::default()
+                };
+                skip_widen = true;
+            }
+            _ => {}
+        }
         // body 候选空间 = charset_size^random_n (等长, 与 candidate_space 的单区间项一致).
         // saturating_pow: 空间封顶 u64::MAX, 溢出不 panic.
         // 注: `random_n as u32` 对 >u32::MAX (≈4.3e9 chars, 需 ≥4GB secret) 截断 — 物理不可达.
@@ -488,15 +857,18 @@ impl GenSpec {
                 < MIN_CANDIDATE_SPACE_WARN
         };
         // 逐级并入: lowercase 可能已被 infer 开启 (如全小写 real) — 第一步 no-op,
-        // 由 recheck 驱动向 digits 推进, 自校正无需特判.
-        if space_short(&charset) {
-            charset.lowercase = true;
-        }
-        if space_short(&charset) {
-            charset.digits = true;
-        }
-        if space_short(&charset) {
-            charset.uppercase = true;
+        // 由 recheck 驱动向 digits 推进, 自校正无需特判. 强制项 (上方) 只增不减,
+        // widen 不会被关掉.
+        if !skip_widen {
+            if space_short(&charset) {
+                charset.lowercase = true;
+            }
+            if space_short(&charset) {
+                charset.digits = true;
+            }
+            if space_short(&charset) {
+                charset.uppercase = true;
+            }
         }
         Self {
             prefix,
@@ -529,8 +901,9 @@ impl GenSpec {
         // 的分段结构严格一致 (等长不变量的手动配置形态).
         //
         // 豁免前提的结构保证 (C5): c5_violated 豁免的固定段 (public_prefix /
-        // PEM 边界行) 在此强制其"信息量为零的公开格式"属性 — public_prefix 必须
-        // ∈ PUBLIC_KEY_PREFIXES 白名单, header/footer 必须匹配标准 PEM 标签形态.
+        // PEM 边界行 / Email domain) 在此强制其"信息量为零的公开格式"属性 —
+        // public_prefix 必须 ∈ PUBLIC_KEY_PREFIXES 白名单, header/footer 必须匹配
+        // 标准 PEM 标签形态, domain 必须 ∈ EMAIL_DOMAINS 白名单.
         // 推断路径天然满足 (find_public_prefix 白名单产出 / parse_pem 的 label
         // 收紧), 手动配置经此拦截 — 杜绝"自定义固定段携带真值内容并整段豁免
         // C5 检查"的绕过面.
@@ -619,6 +992,78 @@ impl GenSpec {
                     ));
                 }
             }
+            SecretShape::Email { domain } => {
+                // C5 豁免前提的结构保证: domain 必须是公开邮箱域白名单成员
+                // (私有域携带部署特例内容, 整段豁免 C5 会绕过 RED-5 — 推断路径
+                // 天然满足 (EMAIL_DOMAINS 产出), 手动配置经此拦截).
+                let domain_len = domain.chars().count();
+                if !EMAIL_DOMAINS.contains(&domain.as_str()) {
+                    return Err(
+                        "shape.email domain must be a member of the public email domain \
+                         whitelist (C5 exemption applies only to well-known public domains)"
+                            .into(),
+                    );
+                }
+                // 结构总长 = local_len + 1 ('@') + domain_len, local_len ≥ 1 →
+                // min ≥ domain_len + 2 (local_len 由 length_range 反推, 单点一致).
+                if min < domain_len + 2 {
+                    return Err(format!(
+                        "shape.email requires a non-empty local part: length_range min({min}) \
+                         must be ≥ domain length ({domain_len}) + 2 (local + '@')"
+                    ));
+                }
+                if min != max {
+                    return Err(format!(
+                        "shape.email structure requires a single-point length_range, got \
+                         ({min}, {max}); local length = min - {domain_len} - 1"
+                    ));
+                }
+            }
+            SecretShape::Phone { skeleton } => {
+                let skeleton_len = skeleton.chars().count();
+                if skeleton.is_empty() {
+                    return Err("shape.phone skeleton must be non-empty".into());
+                }
+                if !skeleton
+                    .chars()
+                    .all(|c| matches!(c, '#' | '+' | ' ' | '-' | '(' | ')' | '.'))
+                {
+                    return Err(
+                        "shape.phone skeleton chars must be a subset of {'#', '+', ' ', '-', \
+                         '(', ')', '.'} (digit placeholder + phone separators)"
+                            .into(),
+                    );
+                }
+                if !skeleton.contains('#') {
+                    return Err(
+                        "shape.phone skeleton requires at least one '#' digit placeholder".into(),
+                    );
+                }
+                // charset 必须纯 digits: 随机位从 charset pool 取 (骨架仿真),
+                // 并入字母会破坏 digit-only 形态 (与 infer 路径的强制一致).
+                if !(self.charset.digits
+                    && !self.charset.lowercase
+                    && !self.charset.uppercase
+                    && !self.charset.underscore
+                    && !self.charset.hyphen
+                    && self.charset.other.is_empty())
+                {
+                    return Err(
+                        "shape.phone charset must be digits-only (random digits come from \
+                         charset; letters would break the digit skeleton simulation)"
+                            .into(),
+                    );
+                }
+                if (min, max) != (skeleton_len, skeleton_len) {
+                    return Err(format!(
+                        "shape.phone skeleton sums to {skeleton_len} chars; length_range must \
+                         be the single point ({skeleton_len}, {skeleton_len})"
+                    ));
+                }
+            }
+            // Username 无结构字段 (prefix 空已由上方通用规则强制); length_range
+            // 区间允许非单点 (生成器按区间 hash 选 target, 同 Plain 的 body 长度选择).
+            SecretShape::Username => {}
         }
         Ok(())
     }
@@ -663,8 +1108,9 @@ pub struct CandidateSpaceLint {
 
 impl GenSpec {
     /// 平坦两形态 (Plain / PublicPrefixed) 的固定前缀: Plain 用 `gen.prefix`,
-    /// PublicPrefixed 用 shape 携带的白名单公开前缀. Jwt / Pem 无平坦前缀概念
-    /// (validate 强制其 prefix 为空). "哪个前缀生效" 的单一落点.
+    /// PublicPrefixed 用 shape 携带的白名单公开前缀. 其余形状 (Jwt / Pem /
+    /// Email / Phone / Username) 无平坦前缀概念 (validate 强制其 prefix 为空).
+    /// "哪个前缀生效" 的单一落点.
     fn flat_fixed_prefix(&self) -> &str {
         match &self.shape {
             SecretShape::PublicPrefixed { public_prefix } => public_prefix,
@@ -673,12 +1119,13 @@ impl GenSpec {
     }
 
     /// body (随机部分) 的长度闭区间 (saturating). 与 `gen_one_auto_body` 的生成
-    /// 语义对齐 — 固定结构段 (prefix / 公开前缀 / PEM 边界行 / 点分隔符) 不参与
-    /// 随机选择.
+    /// 语义对齐 — 固定结构段 (prefix / 公开前缀 / PEM 边界行 / 点分隔符 /
+    /// Email 的 '@'+domain / Phone 的骨架 literal) 不参与随机选择.
     ///
     /// shape-aware: 平坦两形态按 `length_range - flat_fixed_prefix()` (Plain 即
-    /// 历史行为); Jwt / Pem 的分段长度由 shape 携带 (等长, 单点区间 — infer 保证,
-    /// 手动配置由 validate 强制).
+    /// 历史行为); Jwt / Pem / Email / Phone 的分段长度由 shape 携带 (等长, 单点
+    /// 区间 — infer 保证, 手动配置由 validate 强制); Username 的 body 即全串
+    /// (prefix 恒空, 区间原样保留 — 生成器按区间 hash 选 target).
     fn body_length_range(&self) -> (usize, usize) {
         match &self.shape {
             SecretShape::Plain | SecretShape::PublicPrefixed { .. } => {
@@ -699,6 +1146,26 @@ impl GenSpec {
                     .fold(0usize, |a, &b| a.saturating_add(b));
                 (total, total)
             }
+            SecretShape::Email { domain } => {
+                // local_len = 总长 (单点, 取 min) - '@' - domain 长.
+                let local_len = self
+                    .length_range
+                    .0
+                    .saturating_sub(1 + domain.chars().count());
+                (local_len, local_len)
+            }
+            SecretShape::Phone { skeleton } => {
+                // 随机位 = skeleton 的 '#' 占位数 (literal 分隔符不计入).
+                let digits = skeleton.chars().filter(|&c| c == '#').count();
+                (digits, digits)
+            }
+            SecretShape::Username => {
+                let prefix_len = self.flat_fixed_prefix().chars().count();
+                (
+                    self.length_range.0.saturating_sub(prefix_len),
+                    self.length_range.1.saturating_sub(prefix_len),
+                )
+            }
         }
     }
 
@@ -712,6 +1179,14 @@ impl GenSpec {
     /// - charset 为空 → `0` (无法生成任何候选; validate 已拒绝此形态);
     /// - `length_range = (0, 0)` (未配置) → `charset_size^0 = 1` (唯一空 body 候选);
     /// - `min > max` (畸形区间) → 求和为空集 → `0` (validate 已拒绝此形态).
+    ///
+    /// # name-like 形状覆写 (Email / Username)
+    ///
+    /// 随机段由名字池常量表 + digit pad 生成 (**不从 charset 采样**), 诚实空间 =
+    /// `name_like_space` 对 body 区间求和 (Email: local_len 单点 + seps =
+    /// [`EMAIL_LOCAL_SEPS`]; Username: Σ per len, seps = [`USERNAME_SEPS`]).
+    /// Phone 不覆写: 随机位从 charset pool 取, charset 恒 digits-only (validate
+    /// 强制) — 既有 `charset^body` 公式即诚实空间.
     pub fn candidate_space(&self) -> u64 {
         let charset_size = self.charset.enabled_chars().len() as u64;
         if charset_size == 0 {
@@ -720,6 +1195,22 @@ impl GenSpec {
         let (bmin, bmax) = self.body_length_range();
         if bmax < bmin {
             return 0;
+        }
+        match &self.shape {
+            SecretShape::Email { .. } => {
+                return name_like_space(bmin, EMAIL_LOCAL_SEPS, charset_size);
+            }
+            SecretShape::Username => {
+                let mut total: u64 = 0;
+                for len in bmin..=bmax {
+                    total = total.saturating_add(name_like_space(len, USERNAME_SEPS, charset_size));
+                    if total == u64::MAX {
+                        break; // 早退: 极宽区间防长循环 (同下方饱和早退).
+                    }
+                }
+                return total;
+            }
+            _ => {}
         }
         if charset_size == 1 {
             // 每个长度恰 1 个候选: 空间 = 区间宽度. 直接算, 避免对极宽区间逐长度循环.
@@ -858,6 +1349,11 @@ pub enum CategoryShapeMismatch {
     /// 值是 PEM 但标注非 privatekey — 行为已按 PEM 结构化 (不受标注影响),
     /// 提醒改标注保持所见 (WebUI category) 与所为 (mock 形状) 一致.
     PemButNotPrivatekey,
+    /// 值是 email 形状但标注非 email — 行为已按 Email 结构化 (email 检测不
+    /// gate category, 形状自证; local 空间达标时), 标注是纯语义债, 提醒改标注
+    /// 保持所见与所为一致 (同 PEM 先例 — 空间不足时行为仍 Plain, 改标注不改变
+    /// 行为, cosmetic).
+    EmailButNotEmailCategory,
     /// 值是 JWT 形状但标注非 token — 退化 plain, 改标 token 可启用结构化 mock.
     JwtButNotToken,
     /// 值命中公开前缀白名单但标注非 apikey — 退化 plain, 改标 apikey 可启用
@@ -870,6 +1366,7 @@ impl CategoryShapeMismatch {
     pub fn detected(&self) -> &'static str {
         match self {
             Self::PemButNotPrivatekey => "pem",
+            Self::EmailButNotEmailCategory => "email",
             Self::JwtButNotToken => "jwt",
             Self::PublicPrefixButNotApiKey => "public_prefix",
         }
@@ -879,6 +1376,7 @@ impl CategoryShapeMismatch {
     pub fn suggested_category(&self) -> SecretCategory {
         match self {
             Self::PemButNotPrivatekey => SecretCategory::PrivateKey,
+            Self::EmailButNotEmailCategory => SecretCategory::Email,
             Self::JwtButNotToken => SecretCategory::Token,
             Self::PublicPrefixButNotApiKey => SecretCategory::ApiKey,
         }
@@ -909,6 +1407,10 @@ impl MockStrategy {
     /// - `PemButNotPrivatekey`: 值是 PEM 但标注非 privatekey — **行为已按 PEM
     ///   结构化** (PEM 检测不 gate category, 形状自证), 标注是纯语义债, 提醒改
     ///   标注保持 WebUI 所见与实际行为一致.
+    /// - `EmailButNotEmailCategory`: 值是 email 形状 (语法级 `parse_email`, 不
+    ///   预判空间 gate) 但标注非 email — 行为已按 Email 结构化 (email 检测同样
+    ///   不 gate category), 标注是纯语义债 (同 PEM; local 空间不足时行为仍
+    ///   Plain, 改标注不改变行为).
     /// - `JwtButNotToken` / `PublicPrefixButNotApiKey`: 值的形状需要标注佐证才
     ///   能启用结构化 mock (JWT/公开前缀 gate category), 标注不符 → **静默退化
     ///   plain, 丢失仿真增强** — 提醒改标注可启用 (暴露映射表/手工标注错误).
@@ -948,6 +1450,9 @@ impl MockStrategy {
         }
         if parse_pem(real).is_some() && category != SecretCategory::PrivateKey {
             return Some(CategoryShapeMismatch::PemButNotPrivatekey);
+        }
+        if parse_email(real).is_some() && category != SecretCategory::Email {
+            return Some(CategoryShapeMismatch::EmailButNotEmailCategory);
         }
         if category != SecretCategory::Token && parse_jwt(real).is_some() {
             return Some(CategoryShapeMismatch::JwtButNotToken);
@@ -1057,18 +1562,32 @@ pub fn deterministic_seed(real: &str, strategy: &MockStrategy) -> u64 {
 }
 
 /// mock 候选的 C5 检查 (shape-aware, RED-5 "公开格式子串豁免"):
-/// PublicPrefixed 剥离公开前缀段 / Pem 剥离边界行后, 对**随机部分**做 ≥k 窗口
-/// 检查 (real 整体作 needle — 随机部分撞上 real 任意窗口仍算违反, 重试链兜底).
-/// Plain / Jwt 无豁免段, 全串检查 (Jwt 的点分隔符是单字符, 低于任何 k ≥ 4 阈值,
-/// 天然不构成豁免需求).
+/// PublicPrefixed 剥离公开前缀段 / Pem 剥离边界行 / Email 剥离 `@domain` 公开
+/// 邮箱域段后, 对**随机部分**做 ≥k 窗口检查 (real 整体作 needle — 随机部分撞上
+/// real 任意窗口仍算违反, 重试链兜底). Plain / Jwt 无豁免段, 全串检查 (Jwt 的点
+/// 分隔符是单字符, 低于任何 k ≥ 4 阈值, 天然不构成豁免需求); Phone / Username
+/// 同理全串检查 — phone 的骨架分隔符是单字符 literal (< k), username 的名字池
+/// 是常量表 (非 real 派生). 已知边界 (best-effort): phone 的**连续分隔符链**
+/// (病态 real 如长 `-` 串) 使 literal 段自身 ≥k 且不可变, C5 重试链无解时按
+/// 既有 safety-bound 语义返回最后候选.
 fn c5_violated(candidate: &str, real: &str, shape: &SecretShape, k: usize) -> bool {
     match shape {
-        SecretShape::Plain | SecretShape::Jwt { .. } => {
-            contains_kchar_substring(candidate, real, k)
-        }
+        SecretShape::Plain
+        | SecretShape::Jwt { .. }
+        | SecretShape::Phone { .. }
+        | SecretShape::Username => contains_kchar_substring(candidate, real, k),
         SecretShape::PublicPrefixed { public_prefix } => {
             let stripped = candidate
                 .strip_prefix(public_prefix.as_str())
+                .unwrap_or(candidate);
+            contains_kchar_substring(stripped, real, k)
+        }
+        SecretShape::Email { domain } => {
+            // 剥离 @domain 公开段 (白名单成员, 信息量为零; strip 失败 — 手动畸形
+            // domain 不匹配候选尾部 — 时全串检查, fail-safe).
+            let stripped = candidate
+                .strip_suffix(domain.as_str())
+                .and_then(|s| s.strip_suffix('@'))
                 .unwrap_or(candidate);
             contains_kchar_substring(stripped, real, k)
         }
@@ -1154,11 +1673,101 @@ pub fn gen_candidate(real: &str, strategy: &MockStrategy, seed: u64, counter: u3
 /// 取较大值让 C5 在 Auto 模式下实质等价于确定性契约 (见模块头部 "C5").
 const C5_INTERNAL_RETRIES: u32 = 10_000;
 
+/// name-like 随机段生成 (email local 与 username 共用): 名字池常量表
+/// ([`FIRST_NAMES`]/[`LAST_NAMES`]) 组合 + digit pad 到恰好 `target` 长.
+/// 完全确定性于 `(target, seps, seed, counter, retry, pool)`, 无副作用 (C3).
+///
+/// 模式选择: two-part (`first + sep + last + pad`) / first-only (`first + pad`)
+/// / 全随机兜底 (target < 2, 无任何 first 放得下 — 名字池物理不可用, 从 `pool`
+/// 取随机字符). two-part 在大 target (≥ 8) 下概率优先 (拟真: 长 username 通常
+/// 是姓名组合), 小 target 均匀二选一; 所选 first 配不出 last 时退化 first-only.
+///
+/// 随机流纪律 (与 `gen_one_auto_body` 一致): pad digit 与兜底字符取自
+/// `{seed}{counter}{retry}{i}` hash 流 (i 从 0 起), **名字/sep 挑选不消耗流
+/// 索引** (结构段不消耗流索引). pad 恒为 digit (`hash % 10` → '0'..='9', 拟真
+/// "john92" 而非 "johnXz" — 与 `name_like_space` 的 10^pad 口径一致).
+///
+/// # 前提 (调用方保证)
+///
+/// `pool` 非空 (`gen_one_auto_body` 入口已防御空 pool); infer 路径的 charset 恒
+/// ⊇ {lowercase, digits, sep 字符} (`infer_default_for` 强制) — 名字池字符
+/// (全小写 ASCII) 与 digit pad 都 ⊆ charset (RED-1; 名字池不从 charset 采样,
+/// 合规性由该强制保证, 手动配置同理需覆盖此面).
+fn gen_name_like(
+    target: usize,
+    seps: &[char],
+    seed: u64,
+    counter: u32,
+    retry: u32,
+    pool: &[char],
+) -> String {
+    // fitting 子集 (长度放得下, 顺序取 const 表序).
+    let firsts: Vec<&str> = FIRST_NAMES
+        .iter()
+        .copied()
+        .filter(|f| f.chars().count() <= target)
+        .collect();
+    if firsts.is_empty() {
+        // 全随机兜底 (target < 2): 从 charset pool 取 (pool 非空由调用方保证).
+        return (0..target)
+            .map(|i| {
+                let h = crate::util::hash64(&format!("{seed}{counter}{retry}{i}"));
+                pool[(h % pool.len() as u64) as usize]
+            })
+            .collect();
+    }
+    // 模式选择: two-part 可行时按 hash 二选一 (大 target 偏向 two-part).
+    let mode_h = crate::util::hash64(&format!("{seed}{counter}{retry}mode"));
+    let want_two_part = if target >= 8 {
+        mode_h % 4 != 0
+    } else {
+        mode_h % 2 == 0
+    };
+    // 名字挑选: hash 独立 tag (不消耗 pad 的流索引). 嵌套 fn (非闭包) — 显式
+    // lifetime 让 `items` 的 'static 元素引用传播到输出.
+    fn pick<'a>(seed: u64, counter: u32, retry: u32, tag: &str, items: &[&'a str]) -> &'a str {
+        let h = crate::util::hash64(&format!("{seed}{counter}{retry}{tag}"));
+        items[(h % items.len() as u64) as usize]
+    }
+    // pad digit: hash % 10 → '0'..='9' (恒 digit, 不依赖 pool).
+    let digit_at = |i: usize| -> char {
+        let h = crate::util::hash64(&format!("{seed}{counter}{retry}{i}"));
+        (b'0' + (h % 10) as u8) as char
+    };
+    let first = pick(seed, counter, retry, "first", &firsts);
+    if want_two_part && !seps.is_empty() {
+        let lasts: Vec<&str> = LAST_NAMES
+            .iter()
+            .copied()
+            .filter(|l| first.chars().count() + 1 + l.chars().count() <= target)
+            .collect();
+        if !lasts.is_empty() {
+            let last = pick(seed, counter, retry, "last", &lasts);
+            let sep_h = crate::util::hash64(&format!("{seed}{counter}{retry}sep"));
+            let sep = seps[(sep_h % seps.len() as u64) as usize];
+            let pad_len = target - first.chars().count() - 1 - last.chars().count();
+            let mut out = String::with_capacity(target);
+            out.push_str(first);
+            out.push(sep);
+            out.push_str(last);
+            out.extend((0..pad_len).map(digit_at));
+            return out;
+        }
+    }
+    // first-only.
+    let pad_len = target - first.chars().count();
+    let mut out = String::with_capacity(target);
+    out.push_str(first);
+    out.extend((0..pad_len).map(digit_at));
+    out
+}
+
 /// Auto 模式的单次 body 生成 (给定 `retry` 偏移量). 完全确定性, 无副作用.
 ///
 /// shape-aware: 随机字符流由同一个 hash 序列驱动 (`{seed}{counter}{retry}{i}`,
 /// i 全局递增 — 结构段不消耗流索引, 保证各形状共享同一确定性生成语义), 再按
-/// shape 的结构放置 (点分隔符 / PEM 边界行与换行 / 公开前缀).
+/// shape 的结构放置 (点分隔符 / PEM 边界行与换行 / 公开前缀 / email 的
+/// `@domain` / phone 的骨架 literal / username 的 name-like 名字池组合).
 fn gen_one_auto_body(
     gen_spec: &GenSpec,
     pool: &[char],
@@ -1221,6 +1830,41 @@ fn gen_one_auto_body(
             buf.push('\n');
             buf.push_str(footer_line);
             buf
+        }
+        SecretShape::Email { domain } => {
+            // local = name-like 生成, 输出 local + '@' + domain (domain 公开段
+            // 白名单复用; local_len = 总长 (单点) - '@' - domain 长).
+            let domain_len = domain.chars().count();
+            let local_len = gen_spec.length_range.0.saturating_sub(1 + domain_len);
+            let local = gen_name_like(local_len, EMAIL_LOCAL_SEPS, seed, counter, retry, pool);
+            format!("{local}@{domain}")
+        }
+        SecretShape::Phone { skeleton } => {
+            // '#' → 随机 digit (流 offset 只在 '#' 位递增), 其余字符 literal
+            // 复用 real 的分隔符骨架.
+            let mut buf = String::with_capacity(skeleton.chars().count());
+            let mut offset = 0usize;
+            for c in skeleton.chars() {
+                if c == '#' {
+                    buf.push_str(&random_chars(offset, 1));
+                    offset += 1;
+                } else {
+                    buf.push(c);
+                }
+            }
+            buf
+        }
+        SecretShape::Username => {
+            // 区间非单点 (手动配置) 时 hash 选 target 长度 (同 Plain 的 body
+            // 长度选择逻辑); infer 出恒单点.
+            let (min, max) = gen_spec.body_length_range();
+            let target = if min == max {
+                min
+            } else {
+                let h = crate::util::hash64(&format!("{seed}{counter}{retry}len"));
+                min + (h % (max - min + 1) as u64) as usize
+            };
+            gen_name_like(target, USERNAME_SEPS, seed, counter, retry, pool)
         }
     }
 }
@@ -2088,6 +2732,180 @@ mod tests {
         assert_eq!(s.gen_spec.unwrap().shape, SecretShape::Plain);
     }
 
+    // ─── category-aware shape: email / phone / username (issue #410) ──────
+
+    #[test]
+    fn shape_infer_email_not_gated_by_category() {
+        // 形状自证 (同 PEM 先例): 任意 category (含存量 Other 归类) 都推断 Email.
+        let real = "zhang.wei@gmail.com";
+        for cat in SecretCategory::ALL.iter().map(|(c, _)| *c) {
+            let s = resolved(real, cat);
+            assert!(
+                matches!(
+                    &s.gen_spec.as_ref().unwrap().shape,
+                    SecretShape::Email { domain } if domain == "gmail.com"
+                ),
+                "category {cat:?} should still infer Email (whitelisted domain reused)"
+            );
+        }
+        // 非白名单域: 确定性挑一个放得下的白名单成员 (白名单不含私有域,
+        // 挑中的必然 ≠ real 的域).
+        let s = resolved("jennifer.liu@corp.example.internal", SecretCategory::Email);
+        match &s.gen_spec.unwrap().shape {
+            SecretShape::Email { domain } => {
+                assert!(
+                    EMAIL_DOMAINS.contains(&domain.as_str()),
+                    "picked domain {domain:?} must be a whitelisted member"
+                );
+            }
+            other => panic!("expected Email shape, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shape_infer_space_fallbacks_to_plain() {
+        // ① email real 但 local 极短 (name 空间不足) → Plain.
+        assert_eq!(
+            resolved("ab@163.com", SecretCategory::Email)
+                .gen_spec
+                .unwrap()
+                .shape,
+            SecretShape::Plain
+        );
+        // ② category=Phone 但 digit 数 < 7 (空间物理边界) → Plain.
+        assert_eq!(
+            resolved("123456", SecretCategory::Phone)
+                .gen_spec
+                .unwrap()
+                .shape,
+            SecretShape::Plain
+        );
+        // ③ category=Username 但 real 长 4 (name 空间不足) → Plain.
+        assert_eq!(
+            resolved("abcd", SecretCategory::Username)
+                .gen_spec
+                .unwrap()
+                .shape,
+            SecretShape::Plain
+        );
+    }
+
+    #[test]
+    fn email_mock_is_structured_and_equal_length() {
+        // 白名单域 (复用) + 非白名单域 (确定性挑白名单成员); email 检测不 gate
+        // category — 存量 Other 归类同样受益 (第二个样本).
+        for (real, cat) in [
+            ("zhang.wei@gmail.com", SecretCategory::Email),
+            ("jennifer.liu@corp.example.internal", SecretCategory::Other),
+        ] {
+            let s = resolved(real, cat);
+            let mock = gen_candidate(real, &s, 7, 0);
+            // 等长不变量.
+            assert_eq!(mock.chars().count(), real.chars().count(), "real={real}");
+            // 恰一个 '@', domain ∈ EMAIL_DOMAINS, local 非空.
+            let parts: Vec<&str> = mock.split('@').collect();
+            assert_eq!(parts.len(), 2, "exactly one '@': {mock}");
+            assert!(!parts[0].is_empty(), "non-empty local: {mock}");
+            assert!(
+                EMAIL_DOMAINS.contains(&parts[1]),
+                "domain {:?} must be whitelisted (mock={mock})",
+                parts[1]
+            );
+            // shape-aware C5: domain 公开段豁免后 local 随机段无 real ≥k 子串.
+            let shape = s.gen_spec.clone().unwrap().shape;
+            assert!(!c5_violated(&mock, real, &shape, c5_threshold_len(real)));
+            assert_ne!(mock, real);
+        }
+    }
+
+    #[test]
+    fn email_mock_c5_exemption_covers_domain_only() {
+        // real local=3 → infer 的空间 gate 会退化 Plain; 此处手动配置 Email shape
+        // 专测 C5 豁免机制本身 (空间 gate 与 C5 豁免正交 — 同
+        // pem_mock_c5_exemption_covers_boundary_lines_only 的构造法).
+        let real = "foo@gmail.com";
+        let s = MockStrategy {
+            gen_spec: Some(GenSpec {
+                prefix: String::new(),
+                charset: Charset {
+                    lowercase: true,
+                    digits: true,
+                    other: vec!['.'],
+                    ..Default::default()
+                },
+                // real 总长 13 (local 3 + '@' + "gmail.com" 9).
+                length_range: (13, 13),
+                shape: SecretShape::Email {
+                    domain: "gmail.com".into(),
+                },
+            }),
+            ..Default::default()
+        };
+        let shape = s.gen_spec.as_ref().unwrap().shape.clone();
+        let mock = gen_candidate(real, &s, 7, 0);
+        // domain 段复用 "gmail.com" 不触发 C5; local 非空且等长.
+        assert!(mock.ends_with("@gmail.com"), "mock={mock}");
+        assert_eq!(mock.chars().count(), real.chars().count());
+        let k = c5_threshold_len(real);
+        assert!(!c5_violated(&mock, real, &shape, k));
+        // local 段不含 real 的 ≥k 子串 (豁免只覆盖 domain, local 照常检查).
+        let local = mock.strip_suffix("@gmail.com").unwrap();
+        assert!(!contains_kchar_substring(local, real, k));
+        // 反例: local 夹带 real 的 ≥k 子串 ("gmail" 是 real 的 5-char 子串,
+        // k = max(4, ⌈13/3⌉) = 5) → 判定违反 (豁免不能掩护 local).
+        let evil = "xgmail@gmail.com";
+        assert!(c5_violated(evil, real, &shape, k));
+    }
+
+    #[test]
+    fn phone_mock_preserves_skeleton_and_equal_length() {
+        let real = "+86 138-0013-8000";
+        let s = resolved(real, SecretCategory::Phone);
+        let shape = s.gen_spec.clone().unwrap().shape;
+        // 骨架 = real 的逐字符映射 (digit → '#', 分隔符 literal).
+        assert!(matches!(&shape, SecretShape::Phone { skeleton }
+            if skeleton == "+## ###-####-####"));
+        let mock = gen_candidate(real, &s, 7, 0);
+        // 等长 + literal 位置与 real 完全一致, digit 位保持 digit.
+        assert_eq!(mock.chars().count(), real.chars().count());
+        for (i, (m, r)) in mock.chars().zip(real.chars()).enumerate() {
+            if r.is_ascii_digit() {
+                assert!(m.is_ascii_digit(), "digit pos {i} must stay digit: {mock}");
+            } else {
+                assert_eq!(m, r, "literal pos {i} must be preserved: {mock}");
+            }
+        }
+        assert_ne!(mock, real);
+        // infer 路径 charset 恒 digits-only (RED-1: 随机位 ⊆ charset).
+        let spec = s.gen_spec.as_ref().unwrap();
+        let pool = spec.charset.enabled_chars();
+        assert!(pool.iter().all(|c| c.is_ascii_digit()), "pool={pool:?}");
+        assert!(!c5_violated(&mock, real, &shape, c5_threshold_len(real)));
+    }
+
+    #[test]
+    fn username_mock_is_name_like_and_equal_length() {
+        // ≥ 7: name-like 候选空间达标 (2-char 名 × 10^5 项 ≥ 2^20).
+        for real in ["chenjing8", "wei12345", "li66666"] {
+            let s = resolved(real, SecretCategory::Username);
+            let shape = s.gen_spec.clone().unwrap().shape;
+            assert!(matches!(shape, SecretShape::Username), "real={real}");
+            let mock = gen_candidate(real, &s, 7, 0);
+            assert_eq!(mock.chars().count(), real.chars().count());
+            // name-like: 以名字池成员开头 (first-only 与 two-part 都以 first 起头;
+            // target ≥ 7 时名字池恒可用, 不走全随机兜底分支).
+            assert!(
+                FIRST_NAMES.iter().any(|f| mock.starts_with(f)),
+                "mock {mock:?} is not name-like (no FIRST_NAMES prefix)"
+            );
+            // 全串字符域 = 名字池 (小写) ∪ seps ∪ digit pad (RED-1 的 infer 强制面).
+            assert!(mock.chars().all(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '.' | '-')
+            }));
+            assert!(!c5_violated(&mock, real, &shape, c5_threshold_len(real)));
+        }
+    }
+
     #[test]
     fn pem_mock_is_structured_and_equal_length() {
         let s = resolved(TEST_PEM, SecretCategory::PrivateKey);
@@ -2228,6 +3046,154 @@ mod tests {
         assert!(mk((total + 1, total + 1)).validate().is_err());
     }
 
+    #[test]
+    fn validate_email_domain_must_be_whitelisted_and_single_point() {
+        // 合法: 白名单域 + 单点长度 (local = 14 - 1 - 10 = 3 ≥ 1).
+        let mk = |domain: &str, len: (usize, usize)| {
+            shape_spec(
+                SecretShape::Email {
+                    domain: domain.into(),
+                },
+                len,
+            )
+        };
+        assert!(mk("gmail.com", (14, 14)).validate().is_ok());
+        // 私有域 (携带部署特例内容) → 拒绝 (C5 豁免前提的结构保证).
+        let err = mk("corp.example.internal", (34, 34))
+            .validate()
+            .unwrap_err();
+        assert!(err.contains("whitelist"), "{err}");
+        // 非单点区间 → 拒绝.
+        let err = mk("gmail.com", (14, 15)).validate().unwrap_err();
+        assert!(err.contains("single-point"), "{err}");
+        // local 为空 (min < domain_len + 2) → 拒绝.
+        let err = mk("protonmail.com", (14, 14)).validate().unwrap_err();
+        assert!(err.contains("non-empty local"), "{err}");
+    }
+
+    #[test]
+    fn validate_phone_skeleton_and_digits_only_charset() {
+        // 合法: 骨架 + digits-only charset + 单点长度 (charset 需显式 digits-only,
+        // shape_spec 默认 lowercase+digits 不满足 — 单独构造).
+        let mk = |skeleton: &str, charset: Charset| GenSpec {
+            prefix: String::new(),
+            charset,
+            length_range: (skeleton.chars().count(), skeleton.chars().count()),
+            shape: SecretShape::Phone {
+                skeleton: skeleton.into(),
+            },
+        };
+        let digits_only = Charset {
+            digits: true,
+            ..Default::default()
+        };
+        assert!(
+            mk("+## ###-####-####", digits_only.clone())
+                .validate()
+                .is_ok()
+        );
+        // 骨架含非法字符 (字母) → 拒绝.
+        let err = mk("+## ab#-####-####", digits_only.clone())
+            .validate()
+            .unwrap_err();
+        assert!(err.contains("subset of"), "{err}");
+        // 骨架无 '#' (纯 literal, 无随机位) → 拒绝.
+        let err = mk("+--", digits_only.clone()).validate().unwrap_err();
+        assert!(err.contains("at least one '#'"), "{err}");
+        // 骨架空 → 拒绝 (通用 length_range>0 检查先行拦截 — 单点 (0,0) 不合法;
+        // skeleton 非空检查是纵深防御).
+        let err = mk("", digits_only.clone()).validate().unwrap_err();
+        assert!(err.contains("length_range must be > 0"), "{err}");
+        // charset 非纯 digits (含字母) → 拒绝 (破坏 digit 骨架仿真).
+        let with_lower = Charset {
+            digits: true,
+            lowercase: true,
+            ..Default::default()
+        };
+        let err = mk("+## ###-####-####", with_lower).validate().unwrap_err();
+        assert!(err.contains("digits-only"), "{err}");
+        // 长度与骨架不一致 → 拒绝.
+        let bad_len = GenSpec {
+            prefix: String::new(),
+            charset: digits_only,
+            length_range: (18, 18),
+            shape: SecretShape::Phone {
+                skeleton: "+## ###-####-####".into(), // 17 chars ≠ 18.
+            },
+        };
+        let err = bad_len.validate().unwrap_err();
+        assert!(err.contains("single point (17, 17)"), "{err}");
+    }
+
+    #[test]
+    fn validate_username_accepts_range_lengths() {
+        // Username 无结构字段: 区间允许非单点 (生成器按区间 hash 选 target).
+        assert!(
+            shape_spec(SecretShape::Username, (8, 16))
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            shape_spec(SecretShape::Username, (10, 10))
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn username_mock_manual_range_length_within_bounds() {
+        // 手动配置 (区间非单点): 生成 target ∈ 区间 (同 Plain 的 body 长度选择
+        // 逻辑), 等长不变量在区间语义下保持 (mock 长 ∈ [min, max]).
+        let s = MockStrategy {
+            gen_spec: Some(GenSpec {
+                prefix: String::new(),
+                charset: Charset {
+                    lowercase: true,
+                    digits: true,
+                    other: vec!['_', '.', '-'],
+                    ..Default::default()
+                },
+                length_range: (7, 12),
+                shape: SecretShape::Username,
+            }),
+            ..Default::default()
+        };
+        for seed in 0..50u64 {
+            let mock = gen_candidate("some-user", &s, seed, 0);
+            let len = mock.chars().count();
+            assert!(
+                (7..=12).contains(&len),
+                "mock len {len} not in [7,12]: {mock}"
+            );
+        }
+    }
+
+    /// ALL 完整性 (新变体登记): 9 项 + 新变体的 as_str / serde 名一致. 运行时
+    /// as_str↔ALL↔serde 三方一致的全量守卫在 secrets.rs
+    /// `secret_category_roundtrip_str` (迭代 ALL, 自动覆盖新变体), 此处钉住
+    /// 新变体的存在性与字符串名 (ALL 漏项无编译期守卫).
+    #[test]
+    fn secret_category_all_covers_email_phone_username() {
+        assert_eq!(SecretCategory::ALL.len(), 9);
+        let names: Vec<&str> = SecretCategory::ALL.iter().map(|(_, s)| *s).collect();
+        for name in ["email", "phone", "username"] {
+            assert!(names.contains(&name), "ALL missing {name}");
+        }
+        // serde lowercase 名 (用户手写 toml / WebUI 词表的 wire 面).
+        assert_eq!(
+            serde_json::to_string(&SecretCategory::Email).unwrap(),
+            "\"email\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SecretCategory::Phone).unwrap(),
+            "\"phone\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SecretCategory::Username).unwrap(),
+            "\"username\""
+        );
+    }
+
     // ─── 豁免前提的结构保证 (C5 信任面) ──────────────────────────────────
 
     #[test]
@@ -2258,9 +3224,13 @@ mod tests {
         // 识别为 PEM — 豁免前提是"信息量为零的公开格式串", 任意 label 不满足.
         let evil = "-----BEGIN hunter2-password-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END hunter2-password-----";
         for cat in SecretCategory::ALL.iter().map(|(c, _)| *c) {
-            assert_eq!(
-                resolved(evil, cat).gen_spec.unwrap().shape,
-                SecretShape::Plain,
+            // 断言 "不识别为 PEM" (非 == Plain: category-aware 推断下非 PEM 串可
+            // 得其他形状, 如长串 + Username 标注 → Username — 与本测试意图正交).
+            assert!(
+                !matches!(
+                    resolved(evil, cat).gen_spec.unwrap().shape,
+                    SecretShape::Pem { .. }
+                ),
                 "non-standard label must not infer Pem (category {cat:?})"
             );
         }
@@ -2356,12 +3326,17 @@ mod tests {
     // ─── category↔形状矛盾检测 (category_shape_mismatch) ────────────────
 
     #[test]
-    fn mismatch_detects_all_three_contradictions() {
+    fn mismatch_detects_all_four_contradictions() {
         let s = MockStrategy::default();
         // PEM + 非 privatekey 标注 → 行为已按 PEM (不受标注影响), 提醒改标注.
         assert_eq!(
             s.category_shape_mismatch(TEST_PEM, SecretCategory::ApiKey, ""),
             Some(CategoryShapeMismatch::PemButNotPrivatekey)
+        );
+        // email 形状 + 非 email 标注 → 行为已按 Email 结构化 (形状自证), 纯语义债.
+        assert_eq!(
+            s.category_shape_mismatch("zhang.wei@gmail.com", SecretCategory::Other, ""),
+            Some(CategoryShapeMismatch::EmailButNotEmailCategory)
         );
         // JWT + 非 token 标注 → 静默丢失增强, 提醒改标注可启用.
         assert_eq!(
@@ -2381,6 +3356,14 @@ mod tests {
             CategoryShapeMismatch::PemButNotPrivatekey.suggested_category(),
             SecretCategory::PrivateKey
         );
+        assert_eq!(
+            CategoryShapeMismatch::EmailButNotEmailCategory.detected(),
+            "email"
+        );
+        assert_eq!(
+            CategoryShapeMismatch::EmailButNotEmailCategory.suggested_category(),
+            SecretCategory::Email
+        );
         assert_eq!(CategoryShapeMismatch::JwtButNotToken.detected(), "jwt");
         assert_eq!(
             CategoryShapeMismatch::JwtButNotToken.suggested_category(),
@@ -2389,6 +3372,10 @@ mod tests {
         // 标注匹配 → 无矛盾.
         assert_eq!(
             s.category_shape_mismatch(TEST_PEM, SecretCategory::PrivateKey, ""),
+            None
+        );
+        assert_eq!(
+            s.category_shape_mismatch("zhang.wei@gmail.com", SecretCategory::Email, ""),
             None
         );
         assert_eq!(
@@ -2473,16 +3460,24 @@ mod tests {
         /// 总字符数 == real 总字符数 — 结构化形状与 Plain 同守 wire 字节量无扰动.
         #[test]
         fn prop_category_shape_mock_equal_length(
-            category in 0usize..6,
+            category in 0usize..9,
             body in "[a-zA-Z0-9+/=_-]{1,64}",
-            kind in 0usize..4,
+            name in "[a-z]{2,12}",
+            phone in "[0-9]{1,16}",
+            kind in 0usize..7,
         ) {
             let cat = SecretCategory::ALL[category].0;
-            // kind 定向构造四类形状输入: 0 PEM / 1 JWT / 2 公开前缀 / 3 普通串.
+            // kind 定向构造七类形态: 0 PEM / 1 JWT / 2 公开前缀 / 3 普通串 /
+            // 4 email / 5 phone / 6 username. 短样本 (name/phone 过短) 空间不足
+            // 时退化 Plain — 等长断言仍成立 (gate 语义由
+            // shape_infer_space_fallbacks_to_plain 专项钉住).
             let real = match kind {
                 0 => format!("-----BEGIN X-----\n{body}\n-----END X-----"),
                 1 => format!("{body}.{body}.{body}"),
                 2 => format!("sk-{body}"),
+                4 => format!("{name}.{name}@gmail.com"),
+                5 => format!("+86 {phone}"),
+                6 => name.clone(),
                 _ => body.clone(),
             };
             // 跳过 validate_value 会拒绝的过短样本 (< 3 bytes) — infer 本身不校验,
@@ -2497,22 +3492,26 @@ mod tests {
         }
 
         /// 守卫 RED-1 (shape-aware charset 合规, #356 子项5): 结构化形状
-        /// (jwt / pem / public_prefixed) 下 mock 的字符域 = **随机段字符全部来自
-        /// gen_spec.charset** (用户显式配置面 — infer 的 charset 被覆盖) ∪ **结构段
-        /// 字符来自 shape 携带的固定结构** (jwt 点分隔 / PEM 边界行与换行 /
-        /// 公开前缀). 既有 `prop_mock_matches_gen_spec_charset` 经
+        /// (jwt / pem / public_prefixed / email / phone / username) 下 mock 的
+        /// 字符域 = **随机段字符全部来自 gen_spec.charset** (用户显式配置面 —
+        /// infer 的 charset 被覆盖) ∪ **结构段字符来自 shape 携带的固定结构**
+        /// (jwt 点分隔 / PEM 边界行与换行 / 公开前缀 / email 的 '@'+domain /
+        /// phone 的骨架 literal). 既有 `prop_mock_matches_gen_spec_charset` 经
         /// `valid_auto_gen_spec` 硬编码 shape: Plain (:2737 注释声明有意收窄 —
         /// RED-5 公开段豁免与 charset 断言口径冲突), 非 Plain 形状的 charset
         /// 合规性此前零覆盖; 等长 + C5 已由 `prop_category_shape_mock_equal_length`
         /// 互补覆盖, 本 property 补 charset 半面.
         ///
-        /// 构造: real 定向构造四类形状 (同上) → resolve (infer 携带 shape 结构与
+        /// 构造: real 定向构造七类形状 (同上) → resolve (infer 携带 shape 结构与
         /// length_range, 保证分段单点一致) → **显式覆盖 charset** (模拟用户
-        /// "选形状 + 自选字符集" 的真实配置面) → gen_candidate.
+        /// "选形状 + 自选字符集" 的真实配置面; email/username 强制并入名字池
+        /// 必需字符, phone 固定 digits-only — 合法配置面, 见函数体) → gen_candidate.
         #[test]
         fn prop_shape_mock_charset_compliance(
-            kind in 0usize..4,
+            kind in 0usize..7,
             body in "[a-zA-Z0-9+/=_-]{8,64}",
+            name in "[a-z]{7,12}",
+            phone in "[0-9]{5,16}",
             digits in any::<bool>(),
             lower in any::<bool>(),
             upper in any::<bool>(),
@@ -2526,32 +3525,76 @@ mod tests {
                 0 => SecretCategory::PrivateKey,
                 1 => SecretCategory::Token,
                 2 => SecretCategory::ApiKey,
+                4 => SecretCategory::Email,
+                5 => SecretCategory::Phone,
+                6 => SecretCategory::Username,
                 _ => SecretCategory::Other,
             };
+            // name ≥ 7 / phone ≥ 5 (总 digit ≥ 7) 保证 email/phone/username 三形态
+            // 的 shape 推断稳定命中 (空间达标), 专测形状分支的 charset 合规.
             let real = match kind {
                 0 => format!("-----BEGIN X-----\n{body}\n-----END X-----"),
                 1 => format!("{body}.{body}.{body}"),
                 2 => format!("sk-{body}"),
+                4 => format!("{name}.{name}@gmail.com"),
+                5 => format!("+86 {phone}"),
+                6 => name.clone(),
                 _ => body.clone(),
             };
             let mut s = MockStrategy::default();
             s.resolve_against(&real, cat, "");
             let spec = s.gen_spec.as_mut().expect("Auto after resolve has gen spec");
             // 显式覆盖 charset (空 charset 防御: 全关 + other 空时回落 digits,
-            // 同 valid_auto_gen_spec 的处理).
+            // 同 valid_auto_gen_spec 的处理). 三新形状强制并入形状必需字符 —
+            // 同 infer_default_for 的强制 (RED-1 前提: 名字池/digit pad ⊆ charset
+            // 是生成器的合规前提, 此处模拟合法手动配置面); phone 固定 digits-only
+            // (validate 强制纯 digits).
             let other_chars: Vec<char> = other.chars().collect();
-            spec.charset = Charset {
-                digits: digits || !(lower || upper || under || hyph || !other_chars.is_empty()),
-                lowercase: lower,
-                uppercase: upper,
-                underscore: under,
-                hyphen: hyph,
-                other: other_chars,
+            let force_other = |cs: &mut Charset, seps: &[char]| {
+                for &c in seps {
+                    if !cs.other.contains(&c) {
+                        cs.other.push(c);
+                    }
+                }
+            };
+            spec.charset = match kind {
+                4 => {
+                    // email local: 名字池 (小写) + '.' sep + digit pad.
+                    let mut cs = Charset {
+                        lowercase: true,
+                        digits: true,
+                        ..Default::default()
+                    };
+                    force_other(&mut cs, EMAIL_LOCAL_SEPS);
+                    cs
+                }
+                5 => Charset {
+                    digits: true,
+                    ..Default::default()
+                },
+                6 => {
+                    // username: 名字池 + seps + digit pad.
+                    let mut cs = Charset {
+                        lowercase: true,
+                        digits: true,
+                        ..Default::default()
+                    };
+                    force_other(&mut cs, USERNAME_SEPS);
+                    cs
+                }
+                _ => Charset {
+                    digits: digits || !(lower || upper || under || hyph || !other_chars.is_empty()),
+                    lowercase: lower,
+                    uppercase: upper,
+                    underscore: under,
+                    hyphen: hyph,
+                    other: other_chars,
+                },
             };
             let pool: std::collections::HashSet<char> =
                 spec.charset.enabled_chars().into_iter().collect();
             // 结构字符: flat_fixed_prefix (Plain=gen prefix / PublicPrefixed=公开前缀)
-            // + shape 分隔符/边界行.
+            // + shape 分隔符/边界行/公开段.
             let mut allowed: std::collections::HashSet<char> =
                 spec.flat_fixed_prefix().chars().collect();
             match &spec.shape {
@@ -2569,6 +3612,14 @@ mod tests {
                     allowed.extend(footer_line.chars());
                     allowed.insert('\n');
                 }
+                SecretShape::Email { domain } => {
+                    allowed.insert('@');
+                    allowed.extend(domain.chars());
+                }
+                SecretShape::Phone { skeleton } => {
+                    allowed.extend(skeleton.chars().filter(|&c| c != '#'));
+                }
+                SecretShape::Username => {}
             }
             allowed.extend(pool);
             let mock = gen_candidate(&real, &s, seed, counter);
