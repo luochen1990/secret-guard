@@ -1,6 +1,6 @@
 //! Secret 类型定义 + 校验 + [`DynamicEntry`] 实现 + effective 视图 + 处理策略
 //! ([`SecretStrategy`]: redact 默认 / reject (RED-9) / placeholder (RED-10, 批2) /
-//! protect 搁置值 fail-fast).
+//! monitor (RED-9 族, #410: 放行 + 审计) / protect 搁置值 fail-fast).
 //!
 //! # 三层数据模型 (与 [`crate::provider`] 完全对称)
 //!
@@ -106,6 +106,9 @@ pub struct SecretEntry {
     /// - `placeholder` (批2): 替换为明示假值 `[REDACTED:{id}]`, 响应不还原 +
     ///   蜜罐泄露检测 (响应中出现真值 → WARN + record 打标, 不干预转发).
     ///   契约 RED-10, 实现见 [`crate::redact`] C9 段.
+    /// - `monitor` (#410): 真值命中 → 原样放行 (零替换零 mock 生成, byte-exact),
+    ///   位置统计计入 redact audit (usage redacts, mock 字段为 "(passthrough)"
+    ///   标记)。显式授权语义 — 真值对上游可见是策略本身, 非降级 (SEC-10 不适用)。
     /// - `protect`: 搁置值 (#305 完结时用户未想清语义, 重启需新 issue), 配置即
     ///   validate 报错 fail-fast, 见 [`SecretEntry::validate`] 的检查.
     ///
@@ -180,8 +183,8 @@ impl SecretEntry {
     /// 6. **候选空间 gate** ([`MockStrategy::lint_candidate_space`]): gen spec 定型后
     ///    对弱候选空间 (低于 [`crate::mock::MIN_CANDIDATE_SPACE_WARN`]) **fail-fast 拒绝**
     ///    (#383 方案 D, 2026-10-21: 自 WARN 升级 — 从配置期源头消灭 probing 耗尽的
-    ///    触发面, 见 contracts.md RED-9). 仅对 redact 策略生效 (reject/placeholder
-    ///    不做 mock 生成, 无触发面); Auto 路径经 widen 兜底恒达标, 命中的必是用户
+    ///    触发面, 见 contracts.md RED-9). 仅对 redact 策略生效 (reject/placeholder/
+    ///    monitor 不做 mock 生成, 无触发面); Auto 路径经 widen 兜底恒达标, 命中的必是用户
     ///    手动配置的弱 gen_spec. 同 gate 族还有过短 real 的 redact 拒绝
     ///    (`MIN_REDACT_REAL_CHARS`, 物理边界 — Auto widen 救不了).
     ///
@@ -198,15 +201,15 @@ impl SecretEntry {
         // 时候选空间物理上不可达 2^20 (上界 65^n — 62 标准类 + n 个 real 自带 other 字符,
         // n=3 时 ≈ 27 万), Auto widen 兜底救不了 — 若留给 gate ② 只能得到 "widen charset"
         // 的误导性引导 (Auto 推断结果不可配), 此处给出唯一可行动的引导: 换策略.
-        // 只挡 redact (reject/placeholder 不做 mock 生成, 短值合法); chars().count()
+        // 只挡 redact (reject/placeholder/monitor 不做 mock 生成, 短值合法); chars().count()
         // 非 len() — 与等长约束/mock 长度的字符口径一致 (multibyte 安全).
         if matches!(self.strategy, SecretStrategy::Redact)
             && self.value.chars().count() < MIN_REDACT_REAL_CHARS
         {
             return Err(format!(
                 "secret {}: value too short for equal-length redact mock generation \
-                 (physical candidate-space boundary; use strategy 'reject' or \
-                 'placeholder' instead)",
+                 (physical candidate-space boundary; use strategy 'reject', \
+                 'placeholder' or 'monitor' instead)",
                 self.id
             ));
         }
@@ -248,7 +251,7 @@ impl SecretEntry {
                 "secret {}: mock gen spec candidate space {} is below the minimum \
                  recommended {} (runtime probing may exhaust and degrade via \
                  on_probe_exhausted); widen charset or length_range, or switch \
-                 strategy to reject/placeholder",
+                 strategy to reject/placeholder/monitor",
                 self.id,
                 lint.space,
                 crate::mock::MIN_CANDIDATE_SPACE_WARN
@@ -283,6 +286,10 @@ pub enum SecretStrategy {
     Placeholder,
     /// 真值出现于请求 → 整请求拒绝转发 (503, 零上游外发).
     Reject,
+    /// 放行 + 审计 (#410): 真值命中请求 → 原样通过 (零替换, 零 mock 生成),
+    /// 位置统计计入 redact audit (usage redacts, mock 字段为 "(passthrough)"
+    /// 标记)。显式授权语义 — 真值对上游可见是策略本身, 非降级 (SEC-10 不适用)。
+    Monitor,
 }
 
 impl SecretStrategy {
@@ -291,11 +298,12 @@ impl SecretStrategy {
     /// ALL 漏项无自动守卫, 需人工随新增 variant 同步).
     /// 值域 SSOT: validate 的 fail-fast 判定消费此表; 前端 strategy 选择器
     /// 硬编码已实现值 (redact/reject/placeholder), 不从本表派生.
-    pub const ALL: [(Self, &'static str); 4] = [
+    pub const ALL: [(Self, &'static str); 5] = [
         (Self::Redact, Self::Redact.as_str()),
         (Self::Protect, Self::Protect.as_str()),
         (Self::Placeholder, Self::Placeholder.as_str()),
         (Self::Reject, Self::Reject.as_str()),
+        (Self::Monitor, Self::Monitor.as_str()),
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -305,6 +313,7 @@ impl SecretStrategy {
             Self::Protect => "protect",
             Self::Placeholder => "placeholder",
             Self::Reject => "reject",
+            Self::Monitor => "monitor",
         }
     }
 }
@@ -338,7 +347,7 @@ pub fn validate_id(id: &str) -> Result<(), String> {
 /// charset ≤ 62 标准类 + n 个 real 自带的 other 字符), n ≤ 3 时最大 65³ ≈ 27.5 万
 /// < 2^20 — widen 兜底也救不了, mock probing 耗尽是物理必然而非对抗构造.
 /// n ≥ 4 恒可达标 (62⁴ ≈ 1480 万). 另一独立理由: 极短值在 IR 子串匹配中是海量
-/// 误命中源 (替换会大面积破坏请求文本). 拒绝时引导 reject/placeholder
+/// 误命中源 (替换会大面积破坏请求文本). 拒绝时引导 reject/placeholder/monitor
 /// (不做 mock 生成, 短值合法). 用 `chars().count()` 口径 — 与等长约束/mock 长度
 /// 的字符语义一致 (multibyte 安全), 区别于 [`validate_value`] 的字节下限.
 const MIN_REDACT_REAL_CHARS: usize = 4;
@@ -747,12 +756,13 @@ mod tests {
             e2.validate_and_resolve("").is_err(),
             "validate_and_resolve() must also reject {bad:?}"
         );
-        // 可用值 (redact / reject / placeholder — 批2 交付, RED-10) 不被 validate
-        // 挡 — 行为约束在 redact pipeline.
+        // 可用值 (redact / reject / placeholder — 批2 交付, RED-10; monitor —
+        // #410 放行+审计) 不被 validate 挡 — 行为约束在 redact pipeline.
         for ok in [
             SecretStrategy::Redact,
             SecretStrategy::Reject,
             SecretStrategy::Placeholder,
+            SecretStrategy::Monitor,
         ] {
             let mut e = entry("ok-strategy", "sk-usable-strategy-value");
             e.strategy = ok;
@@ -1120,6 +1130,23 @@ mod tests {
                 "{s:?} + short value should pass (guided target must be legal)"
             );
         }
+    }
+
+    #[test]
+    fn validate_allows_short_real_for_monitor() {
+        // monitor (#410) 同样豁免两道 gate: 零 mock 生成 (真值放行), 无 probing
+        // 触发面 — 短值 (如 email) 合法; 对比 redact 同值被 gate ① 拒绝.
+        let mut m = entry("short-monitor", "abc");
+        m.strategy = SecretStrategy::Monitor;
+        assert!(
+            m.validate_and_resolve("").is_ok(),
+            "monitor + short value should pass (no mock generation)"
+        );
+        let mut r = entry("short-redact", "abc");
+        assert!(
+            r.validate_and_resolve("").is_err(),
+            "redact + short value must stay rejected (contrast)"
+        );
     }
 
     #[test]

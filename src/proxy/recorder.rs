@@ -97,14 +97,17 @@ pub(super) const ERR_FORWARD_ABORTED: &str =
 /// 这是 [`CallEvent::redactions`] 的唯一派生入口. 输出**永不**包含真实 secret 值.
 /// 可以直接序列化到 GET API 响应中给 WebUI.
 ///
-/// 匹配规则与去重语义见 [`derive_redact_hits`] 的共享 join (两投影同源,
-/// mock↔secret_id 关联一致性由 `redaction_projections_agree_on_mock_secret_pairing`
-/// 测试守卫; consistency-check 守卫 [`assert_redactions_match_map`] 只覆盖本投影).
+/// **仅含替换通道** (#410): monitor 条目不是替换 (真值放行), 不进本投影 —
+/// monitor 的审计呈现走 [`derive_redact_hits`] 的 monitor 通道 (usage redacts).
+/// 匹配规则与去重语义见 [`derive_replacement_hits`] 的共享 join (替换通道内
+/// 两投影同源, mock↔secret_id 关联一致性由
+/// `redaction_projections_agree_on_mock_secret_pairing` 测试守卫;
+/// consistency-check 守卫 [`assert_redactions_match_map`] 只覆盖本投影).
 pub(crate) fn derive_redactions(
     redaction_map: &RedactionMap,
     secrets_snapshot: &[crate::secrets::SecretEntry],
 ) -> Vec<(String, String)> {
-    derive_redact_hits(redaction_map, secrets_snapshot)
+    derive_replacement_hits(redaction_map, secrets_snapshot)
         .into_iter()
         .map(|h| (h.mock, h.secret_id))
         .collect()
@@ -149,12 +152,11 @@ pub(super) fn parse_request_ir(
 /// 由于 RedactionMap 按 value 去重, 对应只有一个 mock — 这种重复配置语义上就是冗余,
 /// WebUI 只展示其中一个 id 是可接受的 (它们指向相同的 secret 内容).
 ///
-/// 本函数是该 join 的**唯一实现** ( [`derive_redactions`] 的 (mock, secret_id)
-/// 投影从本函数结果派生 — 两投影对同一 (map, snapshot) 输入的 mock↔secret_id
-/// 关联恒一致, 由 `redaction_projections_agree_on_mock_secret_pairing` 守卫).
-/// 从 RedactionMap (SSOT) 派生 usage 审计的采集单元: (secret_id, mock, 位置分布);
-/// locations 取 map.hits (redact_ir_inner 在替换前采集).
-fn derive_redact_hits(
+/// 本函数是替换通道 join 的**唯一实现** ([`derive_redactions`] 的 (mock,
+/// secret_id) 投影从本函数结果派生 — 两投影对同一 (map, snapshot) 输入的
+/// mock↔secret_id 关联恒一致, 由 `redaction_projections_agree_on_mock_secret_pairing`
+/// 守卫).
+fn derive_replacement_hits(
     redaction_map: &RedactionMap,
     secrets_snapshot: &[crate::secrets::SecretEntry],
 ) -> Vec<crate::usage::RedactHit> {
@@ -174,6 +176,30 @@ fn derive_redact_hits(
             })
         })
         .collect()
+}
+
+/// 从 RedactionMap (SSOT) 派生 usage 审计的采集单元: (secret_id, mock, 位置分布);
+/// locations 取 map.hits (redact_ir_inner 在替换前采集).
+///
+/// 两条通道合并 (#410): 替换通道 ([`derive_replacement_hits`], 同上) + monitor
+/// 通道 (`monitor_hits` — id-keyed 直通, 无需 join snapshot; mock 字段为放行
+/// 标记 [`crate::redact::MONITOR_PASSTHROUGH_MOCK`], 无替换值)。
+fn derive_redact_hits(
+    redaction_map: &RedactionMap,
+    secrets_snapshot: &[crate::secrets::SecretEntry],
+) -> Vec<crate::usage::RedactHit> {
+    let mut hits = derive_replacement_hits(redaction_map, secrets_snapshot);
+    hits.extend(
+        redaction_map
+            .monitor_hits
+            .iter()
+            .map(|(id, locations)| crate::usage::RedactHit {
+                secret_id: id.clone(),
+                mock: crate::redact::MONITOR_PASSTHROUGH_MOCK.to_string(),
+                locations: *locations,
+            }),
+    );
+    hits
 }
 
 /// `redact_and_derive` 的返回类型别名 (避免 clippy::type_complexity 误报).
@@ -201,7 +227,8 @@ type RedactOutcome = Result<
 ///
 /// 例外: strategy=reject (#305) 是显式策略, 与 mode 正交, 两种模式下都拒绝转发.
 ///
-/// 返回 `(redaction_map, redact_seed, redactions, redact_hits)`. redaction_map 非空时 debug 日志记录命中数.
+/// 返回 `(redaction_map, redact_seed, redactions, redact_hits)`. 替换映射
+/// (real_to_mock) 非空时 debug 日志记录命中数.
 ///
 /// 注: disabled secret 的明文放行 WARN (#161) 不在此层 — 挂在 dispatch (raw bytes)
 /// 以覆盖透传快捷分支, 见 [`crate::redact::warn_disabled_secrets_in_body`].
@@ -217,7 +244,9 @@ pub(super) fn redact_and_derive(
         // (两路径共用同一 log_tag, 消除调用方镜像 match 与 tag 字面量的双写漂移面).
         Err(e) => return Err(redact_refusal_error(&e, log_tag)),
     };
-    if !redaction_map.is_empty() {
+    // gate 按替换通道判 (#410: monitor 命中不算 "redacted" — 放行无替换, 审计
+    // 呈现走 usage redacts 通道; 日志字段本就计数 real_to_mock.len()).
+    if !redaction_map.real_to_mock.is_empty() {
         debug!(
             redactions = redaction_map.real_to_mock.len(),
             "redacted secrets in {log_tag} IR"
@@ -1486,10 +1515,12 @@ mod tests {
 
     // ─── M-C4: derive_redactions / derive_redact_hits 投影一致性 ────────────
     //
-    // 两投影共享 derive_redact_hits 的单次 join (M-C4 去重后 redactions 从 hits
-    // 派生). 本测试锁定关联不变式: 对同一 (map, snapshot) 输入, redactions 的
-    // (mock, secret_id) 集合与 hits 的 (mock, secret_id) 集合逐对相等 — 防未来
-    // 重构让两投影各自维护 join 再次分叉.
+    // 两投影共享替换通道 join derive_replacement_hits (M-C4 去重后 redactions
+    // 从该 join 派生; derive_redact_hits 在其上合并 monitor 通道, #410). 本测试
+    // 锁定替换通道的关联不变式: 对同一 (map, snapshot) 输入, redactions 的
+    // (mock, secret_id) 集合与 hits 替换通道的 (mock, secret_id) 集合逐对相等 —
+    // 防未来重构让两投影各自维护 join 再次分叉. monitor 通道的分野由下方
+    // monitor_hits_derive_to_usage_projection 锁定.
 
     #[test]
     fn redaction_projections_agree_on_mock_secret_pairing() {
@@ -1552,6 +1583,47 @@ mod tests {
         assert!(
             !actual.iter().any(|(m, _)| m.contains("NOHIT")),
             "unmatched real must not project"
+        );
+    }
+
+    /// #410 monitor 通道投影分野: monitor_hits 进 usage 审计投影 (mock 字段为
+    /// 放行标记 "(passthrough)"), 不进 record.redactions (monitor 不是替换).
+    #[test]
+    fn monitor_hits_derive_to_usage_projection() {
+        use crate::codec::ir::HitLocations;
+        use crate::redact::{MONITOR_PASSTHROUGH_MOCK, RedactionMap};
+        use crate::secrets::{SecretCategory, SecretEntry};
+
+        let snapshot = vec![SecretEntry {
+            id: "mon-proj".into(),
+            name: None,
+            category: SecretCategory::ApiKey,
+            value: "monitor-projection-real-value".into(),
+            value_file: None,
+            mock_strategy: crate::mock::MockStrategy::default(),
+            strategy: crate::secrets::SecretStrategy::Monitor,
+        }];
+        let mut map = RedactionMap::default();
+        map.monitor_hits.push((
+            "mon-proj".to_string(),
+            HitLocations {
+                user: 1,
+                ..Default::default()
+            },
+        ));
+
+        // usage 审计投影: 含 monitor 条目, mock 字段为放行标记。
+        let hits = derive_redact_hits(&map, &snapshot);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].secret_id, "mon-proj");
+        assert_eq!(hits[0].mock, MONITOR_PASSTHROUGH_MOCK);
+        assert_eq!(hits[0].locations.user, 1);
+
+        // record.redactions 投影: 不含 monitor 条目 (monitor 不是替换)。
+        let redactions = derive_redactions(&map, &snapshot);
+        assert!(
+            redactions.is_empty(),
+            "monitor entries must not project into record.redactions: {redactions:?}"
         );
     }
 

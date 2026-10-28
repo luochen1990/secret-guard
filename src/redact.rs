@@ -138,6 +138,10 @@ pub enum RedactReason {
     StrategyReject,
 }
 
+/// monitor 策略审计行的 mock 字段标记 (放行语义 — 无替换值; usage redacts
+/// 视图 / by_secret 聚合直接呈现该标记)。
+pub const MONITOR_PASSTHROUGH_MOCK: &str = "(passthrough)";
+
 /// 改写映射: real ↔ mock 双向索引.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RedactionMap {
@@ -162,11 +166,19 @@ pub struct RedactionMap {
     /// [`detect_response_leaks`] 消费. 含 real 明文, `#[serde(skip)]` 同上.
     #[serde(skip)]
     pub leak_watch: Vec<(String, String)>,
+    /// strategy=monitor (#410, RED-9) 的审计单元: (secret_id, 位置分布)。
+    /// 真值放行 (real_to_mock 无条目), 命中统计独立成通道 — id-keyed,
+    /// **不含真值明文**, 无需 #[serde(skip)] (对比 hits/placeholder_reals/leak_watch)。
+    /// 消费面: derive_redact_hits (usage 审计投影)。
+    pub monitor_hits: Vec<(String, crate::codec::ir::HitLocations)>,
 }
 
 impl RedactionMap {
+    /// 任意 redact 活动 (替换映射或 monitor 审计) 均非空。**不参与** restore 家族
+    /// 的快速路径判据 — restore 的数据面只有替换映射 (monitor 真值放行, 无需
+    /// 还原), 那些调用方直接用 `real_to_mock.is_empty()`。
     pub fn is_empty(&self) -> bool {
-        self.real_to_mock.is_empty()
+        self.real_to_mock.is_empty() && self.monitor_hits.is_empty()
     }
 
     /// 是否存在需要 restore 的条目 (C9, RED-10): placeholder 条目不还原, 不算.
@@ -462,6 +474,15 @@ fn redact_ir_inner(
                 reason: RedactReason::StrategyReject,
             });
         }
+        // strategy=monitor (#410, RED-9): 真值命中 → 放行 (IR 零改写, 无 mock 生成,
+        // 不入 allocated) + 位置统计进审计通道。真值对上游可见是显式授权 (非降级,
+        // on_probe_exhausted 不适用)。遮蔽边界 (同值多 entry 先者胜 / 长值嵌套遮蔽)
+        // 与 RED-9 既有登记同型。
+        if secret.strategy == crate::secrets::SecretStrategy::Monitor {
+            let locations = count_hit_locations(ir, &secret.value);
+            map.monitor_hits.push((secret.id.clone(), locations));
+            continue;
+        }
         // 位置统计 (替换前, 只读): 仅对命中的 secret 执行, 与替换遍历同阶
         // (USAGE-7 治理归因 — 哪个环节把 secret 塞进来).
         let locations = count_hit_locations(ir, &secret.value);
@@ -561,7 +582,9 @@ fn degrade_on_insert_collision(
 /// 非流式响应的 restore 路径. 遍历结构由 [`StringLeafOps for IrResponse`] 提供,
 /// 与 `ir_request_contains` / `ir_request_replace_all` 自动对齐.
 pub fn restore_ir_response(ir: &mut IrResponse, map: &RedactionMap) {
-    if map.is_empty() {
+    // restore 的数据面只有替换映射 (monitor 真值放行无 mock, placeholder 条目
+    // 在 restorable_entries 过滤) — 快速路径按 real_to_mock 判空。
+    if map.real_to_mock.is_empty() {
         return;
     }
     ir.for_each_str_leaf_mut(&mut |s| restore_str(s, map));
@@ -631,7 +654,8 @@ pub fn detect_response_leaks(message: &IrMessage, leak_watch: &[(String, String)
 /// 注: 生产调用方持有外层已 parse 的 Value, 实际走 [`restore_json_value_fallback`]
 /// (零二次 parse); 本 bytes 包装变体是契约测试面 (contracts.md RED-8) 与未来调用方的入口.
 pub fn restore_json_leaves_fallback(bytes: &[u8], map: &RedactionMap) -> Option<Vec<u8>> {
-    if map.is_empty() {
+    // 同 restore_ir_response: 按 real_to_mock 判空 (monitor 条目无还原面)。
+    if map.real_to_mock.is_empty() {
         return None;
     }
     let mut v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
@@ -643,7 +667,8 @@ pub fn restore_json_leaves_fallback(bytes: &[u8], map: &RedactionMap) -> Option<
 /// 完整 parse。原地改写 `v` 的字符串值叶子, 返回是否发生了至少一次替换;
 /// `false` 时 `v` 与传入等价 (调用方保持原字节透传, 无需重序列化)。
 pub fn restore_json_value_fallback(v: &mut serde_json::Value, map: &RedactionMap) -> bool {
-    if map.is_empty() {
+    // 同 restore_ir_response: 按 real_to_mock 判空 (monitor 条目无还原面)。
+    if map.real_to_mock.is_empty() {
         return false;
     }
     let mut replaced = false;
@@ -983,7 +1008,8 @@ pub(crate) fn json_wire_escaped(s: &str) -> String {
 /// 的 span 消费语义 (`redact_ir` 长度倒序) 对称 — 否则短 mock 先行破坏长 mock
 /// 的完整出现, round-trip 结果依赖 HashMap 迭代序 (未定义行为).
 pub(crate) fn restore_str_inplace(s: &mut String, map: &RedactionMap) -> bool {
-    if map.is_empty() || s.is_empty() {
+    // 同 restore_ir_response: 按 real_to_mock 判空 (monitor 条目无还原面)。
+    if map.real_to_mock.is_empty() || s.is_empty() {
         return false;
     }
     let pairs = ordered_restore_pairs(map);
@@ -2681,6 +2707,119 @@ mod tests {
         // has_restorable: placeholder 条目不算 → 响应走透传路径 (dispatch 判据).
         assert!(!map.has_restorable());
         assert!(!map.is_empty(), "map carries the placeholder mapping");
+    }
+
+    // ─── strategy=monitor (#410, RED-9 族): 放行 + 审计 ─────────────────────
+
+    /// 构造 monitor 策略 entry (id 用固定串, 避免 entry() 的 id-{value} 派生让
+    /// SEC 断言对 id 与真值子串假阳性 — 与 reject/placeholder 测试同型).
+    fn monitor_entry(id: &str, value: &str) -> SecretEntry {
+        let mut e = entry(value);
+        e.id = id.into();
+        e.strategy = crate::secrets::SecretStrategy::Monitor;
+        e
+    }
+
+    #[test]
+    fn monitor_strategy_hits_pass_through_and_audits() {
+        // monitor 核心 property (#410): 真值命中 → IR 逐字节不变 (零替换零 mock
+        // 生成) + 位置统计进 monitor_hits 审计通道 (id-keyed, 不含真值明文)。
+        let real = "monitor-secret-value-xyz";
+        let m_entry = monitor_entry("mon-one", real);
+        let mut ir = sample_ir_with_text(&format!("uses {real} twice: {real}"));
+        let before = ir.clone();
+        let (map, seed) = redact_ir_checked(
+            &mut ir,
+            std::slice::from_ref(&m_entry),
+            crate::config::OnProbeExhausted::FailClosed,
+        )
+        .expect("monitor strategy must not refuse");
+        // 放行 = IR 零改写 (对比 redact 前 clone 逐字节相等)。
+        assert_eq!(ir, before, "monitor must leave the IR byte-identical");
+        // 替换通道空; 审计通道恰含本 entry 的位置统计 (sample_ir_with_text 的
+        // fixture 未设 contains_user_text → history 桶, 与 count_hit_locations
+        // 既有 fixture 测试同口径)。
+        assert!(map.real_to_mock.is_empty());
+        assert!(!map.is_empty(), "monitor_hits counts toward is_empty");
+        let expected = crate::codec::ir::HitLocations {
+            history: 2,
+            ..Default::default()
+        };
+        assert_eq!(map.monitor_hits, vec![("mon-one".to_string(), expected)]);
+        // 命中算 hit_any (final_seed 语义 — 与 placeholder 命中同型)。
+        assert_ne!(seed, 0, "monitor hit counts toward final_seed");
+        // SEC 同型纪律: 审计通道只携带 id + 计数, 永不含真值明文。
+        let dbg = format!("{map:?}");
+        assert!(
+            !dbg.contains(real),
+            "monitor_hits must not carry real: {dbg}"
+        );
+    }
+
+    #[test]
+    fn monitor_and_redact_mixed_round_trip() {
+        // 混合策略: monitor 放行 + redact 照常替换, 互不干扰 — RED-6 round-trip
+        // 对 redact 条目保持, monitor 真值原样 (响应 restore 不碰它)。
+        let mon_real = "monitor-mixed-real-value";
+        let red_real = "sk-mixed-redact-456";
+        let secrets = vec![monitor_entry("mon-mixed", mon_real), entry(red_real)];
+        let mut ir = sample_ir_with_text(&format!("use {red_real} and {mon_real} now"));
+        let (map, _) = redact_ir_checked(
+            &mut ir,
+            &secrets,
+            crate::config::OnProbeExhausted::FailClosed,
+        )
+        .expect("mixed strategies must not refuse");
+        // redact 条目: 正常替换 + round-trip 还原 (RED-6)。
+        let mock = map.mock_for(red_real).expect("redact entry must be mapped");
+        let text = match &ir.messages[0].content[0] {
+            IrBlock::Text { text, .. } => text.clone(),
+            _ => panic!("expected Text block"),
+        };
+        assert!(text.contains(mock), "redact mock in place: {text}");
+        assert!(
+            text.contains(mon_real),
+            "monitor real passes through: {text}"
+        );
+        let mut resp = sample_ir_response_with_text(&text);
+        restore_ir_response(&mut resp, &map);
+        let resp_text = match &resp.content[0] {
+            IrBlock::Text { text, .. } => text.clone(),
+            _ => panic!("expected Text block"),
+        };
+        assert!(
+            resp_text.contains(red_real),
+            "redact mock restored: {resp_text}"
+        );
+        assert!(
+            resp_text.contains(mon_real),
+            "monitor real untouched by restore: {resp_text}"
+        );
+        // monitor_hits 只含 monitor 条目 (redact 命中不混入; 反之亦然)。
+        assert_eq!(map.monitor_hits.len(), 1);
+        assert_eq!(map.monitor_hits[0].0, "mon-mixed");
+        assert!(map.hits.contains_key(red_real), "redact hit stats intact");
+        assert!(
+            !map.hits.contains_key(mon_real),
+            "monitor real not in replacement hit stats"
+        );
+    }
+
+    #[test]
+    fn monitor_strategy_unhit_no_audit() {
+        // monitor secret 未命中 (请求不含真值) → 零审计条目, 请求正常放行
+        // (与 reject 未命中 passthrough 同型语义)。
+        let m_entry = monitor_entry("mon-unhit", "monitor-unhit-secret-value");
+        let mut ir = sample_ir_with_text("plain message without any secret");
+        let (map, seed) = redact_ir_checked(
+            &mut ir,
+            std::slice::from_ref(&m_entry),
+            crate::config::OnProbeExhausted::FailClosed,
+        )
+        .expect("unhit monitor secret must not affect the request");
+        assert!(map.monitor_hits.is_empty(), "unhit → no audit entry");
+        assert!(map.is_empty());
+        assert_eq!(seed, 0, "seed must be 0 when nothing was hit");
     }
 
     // ─── contains_any_restorable_mock (#395: WARN 降噪的 mock 实存 gate) ─────
